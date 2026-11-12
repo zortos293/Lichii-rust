@@ -12,4 +12,4 @@ tracing.workspace = true
 portable-atomic = "1"
 
 [dev-dependencies]
-unicorn-engine = { version = "2.1", default-features = false, features = ["arch_arm", "arch_aarch64"] }
+unicorn-engine = { version = "2.1.5", default-features = false, features = ["arch_arm", "arch_aarch64"] }

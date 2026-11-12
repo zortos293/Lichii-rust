@@ -4,10 +4,12 @@
 
 pub mod backend;
 mod bits;
+pub mod clock;
 pub mod device_memory;
 pub mod engines;
 pub mod gmmu;
 pub mod host;
 pub mod host1x;
+pub mod macros;
 pub mod nx2_memory;
 pub mod pushbuffer;
