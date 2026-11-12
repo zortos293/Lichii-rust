@@ -7,9 +7,11 @@ license.workspace = true
 [dependencies]
 lichii-common.workspace = true
 lichii-gpu.workspace = true
+lichii-memory.workspace = true
 lichii-shader.workspace = true
 lichii-texture.workspace = true
 ash.workspace = true
+bytemuck.workspace = true
 ash-window = "0.13"
 gpu-allocator = { version = "0.28", default-features = false, features = ["std", "vulkan"] }
 egui.workspace = true
@@ -17,6 +19,3 @@ parking_lot.workspace = true
 raw-window-handle.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-
-[dev-dependencies]
-lichii-memory.workspace = true
