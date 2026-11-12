@@ -17,10 +17,10 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::choices::Choice;
 use crate::cli::Cli;
+use crate::display::Display;
 use crate::game_list::GameList;
 use crate::hotkeys::{self, HotkeyMap};
 use crate::input_worker::{InputMsg, InputWorker};
-use crate::presenter::Presenter;
 use crate::session::Session;
 
 /// Events other threads send to the UI thread.
@@ -63,7 +63,7 @@ pub struct App {
     save_to: Option<PathBuf>,
     proxy: EventLoopProxy<UserEvent>,
     window: Option<Arc<Window>>,
-    presenter: Option<Presenter>,
+    display: Option<Display>,
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
     pub games: GameList,
@@ -112,7 +112,7 @@ impl App {
             save_to,
             proxy,
             window: None,
-            presenter: None,
+            display: None,
             egui_ctx: egui::Context::default(),
             egui_state: None,
             games: GameList::default(),
@@ -133,7 +133,7 @@ impl App {
     }
 
     pub fn adapter_name(&self) -> Option<&str> {
-        self.presenter.as_ref().map(Presenter::adapter_name)
+        self.display.as_ref().map(Display::adapter_name)
     }
 
     pub fn is_fullscreen(&self) -> bool {
@@ -364,6 +364,9 @@ impl App {
                 g.scaling_filter = g.scaling_filter.next();
                 let text = format!("Scaling filter: {}", g.scaling_filter.label());
                 self.toast(text);
+                if let Some(display) = &mut self.display {
+                    display.set_settings(&self.settings.graphics);
+                }
                 self.save_settings();
             }
             HotkeyAction::CycleGpuAccuracy => {
@@ -423,12 +426,22 @@ impl App {
         self.egui_state = Some(egui_state);
 
         let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
-        if let Some(presenter) = &mut self.presenter {
-            presenter.present(UiFrame {
-                primitives,
-                textures_delta: output.textures_delta,
-                pixels_per_point: output.pixels_per_point,
+        if let Some(display) = &mut self.display {
+            let size = window.inner_size();
+            let viewport = self.viewport.unwrap_or(Viewport {
+                x: 0,
+                y: 0,
+                width: size.width,
+                height: size.height,
             });
+            display.draw(
+                viewport,
+                UiFrame {
+                    primitives,
+                    textures_delta: output.textures_delta,
+                    pixels_per_point: output.pixels_per_point,
+                },
+            );
         }
         for action in actions {
             self.apply(action);
@@ -472,11 +485,7 @@ impl App {
                 .create_window(attributes)
                 .map_err(|e| format!("creating the window: {e}"))?,
         );
-        let presenter = Presenter::new(
-            window.clone(),
-            self.settings.graphics.present_mode,
-            self.perf.clone(),
-        )?;
+        let display = Display::new(window.clone(), &self.settings.graphics, self.perf.clone())?;
         self.egui_state = Some(egui_winit::State::new(
             self.egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -486,7 +495,7 @@ impl App {
             Some(8192),
         ));
         self.apply_theme();
-        self.presenter = Some(presenter);
+        self.display = Some(display);
         self.window = Some(window);
         Ok(())
     }
@@ -540,9 +549,6 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             WindowEvent::CloseRequested => self.exit_requested = true,
             WindowEvent::Resized(size) => {
-                if let Some(presenter) = &mut self.presenter {
-                    presenter.resize(size.width, size.height);
-                }
                 let ui = &mut self.settings.ui;
                 ui.window_maximized = window.is_maximized();
                 if !ui.window_maximized && window.fullscreen().is_none() {
