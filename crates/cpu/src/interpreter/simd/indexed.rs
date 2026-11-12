@@ -10,12 +10,12 @@ pub(super) fn indexed(ctx: &mut ThreadContext, inst: u32, scalar: bool) -> Optio
     let (q, u) = (bit(inst, 30), bit(inst, 29));
     let size = bits(inst, 23, 22);
     let opcode = bits(inst, 15, 12);
-    let integer = match (opcode, u) {
+    let integer = matches!(
+        (opcode, u),
         (0b0010 | 0b0110 | 0b1010 | 0b1110, _)
-        | (0b0011 | 0b0111 | 0b1011 | 0b1100 | 0b1101 | 0b1000, false) => true,
-        (0b0000 | 0b0100 | 0b1101 | 0b1111, true) => true,
-        _ => false,
-    };
+            | (0b0011 | 0b0111 | 0b1011 | 0b1100 | 0b1101 | 0b1000, false)
+            | (0b0000 | 0b0100 | 0b1101 | 0b1111, true)
+    );
     if !integer {
         return None;
     }

@@ -80,7 +80,7 @@ pub(super) fn permute(ctx: &mut ThreadContext, inst: u32) -> Exec {
     let elements = datasize(q) / esize;
     let half = elements / 2;
     let (a, b) = (ctx.v[n], ctx.v[m]);
-    let upper = (opcode >> 2) as u32;
+    let upper = opcode >> 2;
     let result = (0..elements).fold(0u128, |r, i| {
         let lane = match opcode & 0b011 {
             0b01 => {

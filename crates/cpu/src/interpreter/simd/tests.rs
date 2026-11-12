@@ -545,3 +545,20 @@ fn advsimd_indexed_integer() {
     fuzz_where(38, 0x0f00_0000, Q | random, integer_indexed);
     fuzz_where(39, 0x5f00_0000, random, integer_indexed);
 }
+
+#[test]
+fn switch2_sdk_integer_encodings_execute() {
+    let mut h = Harness::new(40);
+    for instruction in [0x4ea0_5c42, 0x0f41_3044] {
+        for _ in 0..200 {
+            let ctx = h.random_context();
+            h.check(instruction, &ctx);
+            let mut ours = ctx.clone();
+            assert_eq!(
+                execute(&mut ours, instruction),
+                Some(Ok(())),
+                "{instruction:#010x}"
+            );
+        }
+    }
+}
