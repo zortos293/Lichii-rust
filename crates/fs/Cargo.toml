@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-lichii-common.workspace = true
 lichii-crypto.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+miniz_oxide = "0.9"
