@@ -5,6 +5,7 @@
 //! and structurisation are then shared by Maxwell and Ampere.
 
 pub mod cfg;
+pub mod structure;
 #[cfg(test)]
 mod tests;
 

@@ -285,3 +285,145 @@ fn dot_renders() {
     assert!(dot.starts_with("digraph shader {"));
     assert!(dot.contains("Kill"));
 }
+
+mod structured {
+    use super::*;
+    use crate::flow::structure::{StructureOptions, structure};
+    use crate::ir::{Opcode, Program, Value};
+
+    fn run(program: Vec<FlowInst>, options: StructureOptions) -> String {
+        let cfg = build(program);
+        let mut prog = Program::new();
+        let mut translate = |prog: &mut Program, block, begin: u32, end: u32| {
+            prog.append(
+                block,
+                Opcode::Reference,
+                &[Value::U32(begin << 16 | end)],
+                0,
+            );
+            Ok(())
+        };
+        structure(&mut prog, &cfg, options, &mut translate).expect("structure");
+        prog.dump()
+    }
+
+    #[test]
+    fn forward_branch_becomes_if() {
+        let dump = run(
+            vec![
+                op(N),
+                guarded(FlowOp::Branch { target: 24 }, 0),
+                op(N),
+                op(FlowOp::Exit),
+            ],
+            StructureOptions::default(),
+        );
+        assert!(dump.contains("syntax:\n  block {0}\n  if %"), "{dump}");
+        assert!(dump.contains("Reference #0x8\n"), "{dump}");
+        assert!(dump.contains("Reference #0x100018\n"), "{dump}");
+        assert!(dump.contains("Reference #0x180020\n"), "{dump}");
+        assert!(dump.contains("  endif {"), "{dump}");
+        assert!(dump.trim_end().ends_with("return"), "{dump}");
+        assert!(dump.contains("Prologue"), "{dump}");
+        assert!(dump.contains("Epilogue"), "{dump}");
+    }
+
+    #[test]
+    fn backward_branch_becomes_loop() {
+        let dump = run(
+            vec![
+                op(N),
+                op(N),
+                guarded(FlowOp::Branch { target: 8 }, 1),
+                op(FlowOp::Exit),
+            ],
+            StructureOptions::default(),
+        );
+        assert!(dump.contains("  loop {"), "{dump}");
+        assert!(dump.contains("  repeat %"), "{dump}");
+        assert!(dump.contains("GetPred P1"), "{dump}");
+    }
+
+    #[test]
+    fn indirect_branch_compares_variable() {
+        let dump = run(
+            vec![
+                op(FlowOp::IndirectBranch { absolute: false }),
+                op(FlowOp::Exit),
+                op(N),
+                op(FlowOp::Exit),
+            ],
+            StructureOptions::default(),
+        );
+        assert!(dump.contains("SetIndirectBranchVariable"), "{dump}");
+        assert!(dump.contains("GetIndirectBranchVariable"), "{dump}");
+        assert!(dump.contains("IEqual"), "{dump}");
+    }
+
+    #[test]
+    fn kill_demotes_and_reorders_before_return() {
+        let program = vec![guarded(FlowOp::Kill, 2), op(N), op(FlowOp::Exit)];
+        let dump = run(program.clone(), StructureOptions::default());
+        assert!(dump.contains("DemoteToHelperInvocation"), "{dump}");
+        let reordered = run(
+            program,
+            StructureOptions {
+                reorder_demotes: true,
+                ..Default::default()
+            },
+        );
+        let syntax = reordered.split("syntax:").nth(1).unwrap();
+        let demote_if = syntax.rfind("  if ").unwrap();
+        let ret = syntax.rfind("return").unwrap();
+        assert!(demote_if < ret, "{reordered}");
+    }
+
+    #[test]
+    fn call_is_inlined() {
+        let dump = run(
+            vec![
+                op(FlowOp::Call { target: 24 }),
+                op(FlowOp::Exit),
+                op(N),
+                op(N),
+                op(FlowOp::Return),
+            ],
+            StructureOptions::default(),
+        );
+        assert!(dump.contains("Reference #0x180020\n"), "{dump}");
+        assert!(dump.contains("Reference #0x80010\n"), "{dump}");
+    }
+
+    #[test]
+    fn converged_exits_share_one_return() {
+        let dump = run(
+            vec![guarded(FlowOp::Exit, 0), op(N), op(FlowOp::Exit)],
+            StructureOptions {
+                converge_exits: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(dump.matches("Epilogue").count(), 1, "{dump}");
+    }
+}
+#[test]
+fn zz_print() {
+    let cfg = build(vec![
+        op(N),
+        op(N),
+        guarded(FlowOp::Branch { target: 8 }, 1),
+        op(FlowOp::Exit),
+    ]);
+    let mut prog = crate::ir::Program::new();
+    let mut translate = |prog: &mut crate::ir::Program, block, begin: u32, end: u32| {
+        prog.append(
+            block,
+            crate::ir::Opcode::Reference,
+            &[crate::ir::Value::U32(begin << 16 | end)],
+            0,
+        );
+        Ok(())
+    };
+    crate::flow::structure::structure(&mut prog, &cfg, Default::default(), &mut translate).unwrap();
+    println!("{}", prog.dump());
+}
