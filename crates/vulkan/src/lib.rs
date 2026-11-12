@@ -15,6 +15,7 @@ pub mod scheduler;
 pub mod shaders;
 pub mod staging;
 pub mod swapchain;
+pub mod texture_cache;
 
 pub use device::{Device, DeviceExtensions, DeviceFeatures, DeviceProperties, available_devices};
 pub use error::{Error, Result};
