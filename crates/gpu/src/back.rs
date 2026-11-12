@@ -8,13 +8,9 @@ use std::sync::mpsc;
 use lichii_common::DAddr;
 use lichii_texture::block_linear::GobLayout;
 
-use crate::backend::{
-    ChannelId, FenceAction, FramebufferConfig, Query, QueryKind, Rasterizer, ReleaseSize,
-};
-use crate::channel::Waiters;
+use crate::backend::{ChannelId, FenceAction, FramebufferConfig, Rasterizer, ReleaseSize};
 use crate::engines::{Engine, EngineContext, EngineFactory, EngineKind};
-use crate::gmmu::Gmmu;
-use crate::gpu::Inbox;
+use crate::gmmu::{Gmmu, RangeTarget};
 use crate::host1x::Syncpoints;
 use crate::ring::{Consumer, WRAP};
 use crate::stream::{MULTI_MAX_WORDS, REDUCTIONS, RELEASE_SIZES, tag};
@@ -57,8 +53,6 @@ pub(crate) struct Back {
     syncpoints: Arc<Syncpoints>,
     engines: EngineFactory,
     side: mpsc::Receiver<SideCommand>,
-    waiters: Arc<Waiters>,
-    inbox: Arc<Inbox>,
     channels: Vec<Option<BackChannel>>,
     current: Option<usize>,
     /// The engine the last method went to (channel index, kind index), until it is flushed.
@@ -72,16 +66,12 @@ impl Back {
         syncpoints: Arc<Syncpoints>,
         engines: EngineFactory,
         side: mpsc::Receiver<SideCommand>,
-        waiters: Arc<Waiters>,
-        inbox: Arc<Inbox>,
     ) -> Self {
         Self {
             rasterizer,
             syncpoints,
             engines,
             side,
-            waiters,
-            inbox,
             channels: Vec::new(),
             current: None,
             last: None,
@@ -212,6 +202,10 @@ impl Back {
                 self.rasterizer.flush_commands();
                 1
             }
+            tag::SYNCHRONIZE_READ => {
+                self.synchronize_read(consumer.slot(1), consumer.slot(2));
+                3
+            }
             tag::SIDE => {
                 match self.side.try_recv() {
                     Ok(command) => self.side(command),
@@ -288,6 +282,8 @@ impl Back {
         }
     }
 
+    /// A semaphore release lands once the work before it completed; the fence action that writes
+    /// it also resumes the channels its value meets.
     fn release(&mut self, address: u64, payload: u64, size: ReleaseSize) {
         let Some(index) = self.current else {
             return;
@@ -295,27 +291,30 @@ impl Back {
         let Some(channel) = self.channels[index].as_ref() else {
             return;
         };
-        let memory = &channel.setup.memory;
-        self.rasterizer.query(
-            channel.setup.id,
-            memory,
-            &Query {
-                address,
-                kind: QueryKind::Payload,
-                payload,
-                size,
-                after_work: true,
-            },
-        );
-        let value = match size {
-            ReleaseSize::Four => payload & 0xffff_ffff,
-            ReleaseSize::Eight | ReleaseSize::Sixteen => payload,
+        let Some(daddr) = channel.setup.memory.translate(address) else {
+            tracing::warn!(address, "semaphore release to unmapped GPU memory");
+            return;
         };
-        if let Some(daddr) = memory.translate(address)
-            && self.waiters.released(daddr, value)
-        {
-            self.inbox.wake();
-        }
+        self.rasterizer.signal_fence(FenceAction::WriteSemaphore {
+            address: daddr,
+            value: payload,
+            size,
+        });
+    }
+
+    /// The front is about to read `[address, address + size)`: the GPU work before it completes,
+    /// its fences and queries land, and GPU-written data in the range goes back to guest memory.
+    fn synchronize_read(&mut self, address: u64, size: u64) {
+        self.rasterizer.release_fences(true);
+        let Some(channel) = self.current.and_then(|index| self.channels[index].as_ref()) else {
+            return;
+        };
+        let rasterizer = &mut *self.rasterizer;
+        channel.setup.memory.for_each_range(address, size, |range| {
+            if let RangeTarget::Device(daddr) = range.target {
+                rasterizer.flush_region(daddr, range.size);
+            }
+        });
     }
 
     fn reduce(&mut self, address: u64, payload: u32, op: crate::host::Reduction, signed: bool) {
@@ -329,13 +328,12 @@ impl Back {
             tracing::warn!(address, "semaphore reduction on unmapped GPU memory");
             return;
         };
-        self.rasterizer
-            .signal_fence(crate::backend::FenceAction::ReduceSemaphore {
-                address: daddr,
-                op,
-                signed,
-                payload,
-            });
+        self.rasterizer.signal_fence(FenceAction::ReduceSemaphore {
+            address: daddr,
+            op,
+            signed,
+            payload,
+        });
     }
 
     fn side(&mut self, command: SideCommand) {

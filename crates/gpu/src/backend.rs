@@ -21,6 +21,7 @@ use lichii_memory::DeviceAddressSpace;
 use lichii_texture::PixelFormat;
 use lichii_texture::block_linear::GobLayout;
 
+use crate::channel::SemaphoreWaiters;
 use crate::clock::GpuTimestamp;
 use crate::engines::maxwell_3d::regs::{MAX_CONST_BUFFERS, MAX_SHADER_STAGE, PrimitiveTopology};
 use crate::engines::maxwell_3d::{DirtyState, Regs};
@@ -39,6 +40,10 @@ pub struct GpuHandles {
     pub syncpoints: Arc<Syncpoints>,
     /// The clock 16-byte releases and query reports take their timestamp from.
     pub timestamp: Arc<GpuTimestamp>,
+    /// Channels waiting on a semaphore: [`FenceAction::execute`] latches the ones a semaphore
+    /// write meets and wakes the GPU. Start with `Arc::default()` and pass the same handles to
+    /// [`Gpu::new`](crate::Gpu::new).
+    pub waiters: Arc<SemaphoreWaiters>,
 }
 
 /// A constant buffer bound to a shader stage slot.
@@ -239,7 +244,8 @@ pub enum FenceAction {
 
 impl FenceAction {
     /// Performs the action. The renderer calls this from whichever thread notices completion;
-    /// 16-byte releases take their timestamp from [`GpuHandles::timestamp`].
+    /// 16-byte releases take their timestamp from [`GpuHandles::timestamp`]. A semaphore write
+    /// resumes the channels waiting for its value ([`GpuHandles::waiters`]).
     pub fn execute(self, handles: &GpuHandles) {
         match self {
             Self::WriteSemaphore {
@@ -256,7 +262,14 @@ impl FenceAction {
                 };
                 if let Err(fault) = result {
                     tracing::warn!(?fault, "semaphore release to unmapped device memory");
+                    return;
                 }
+                let bytes = match size {
+                    ReleaseSize::Four => 4,
+                    ReleaseSize::Eight => 8,
+                    ReleaseSize::Sixteen => 16,
+                };
+                handles.waiters.written(&handles.device, address, bytes);
             }
             Self::ReduceSemaphore {
                 address,
@@ -280,6 +293,7 @@ impl FenceAction {
                 ) {
                     old = current;
                 }
+                handles.waiters.written(&handles.device, address, 4);
             }
             Self::IncrementSyncpoint(id) => {
                 if handles.syncpoints.guest().increment(id).is_err() {
@@ -386,7 +400,8 @@ pub trait Rasterizer: Send {
         });
     }
 
-    /// Writes a query result or semaphore release.
+    /// Writes a query result or semaphore release. With `after_work` the write may land after
+    /// the call returns, but before the next `release_fences(true)` returns.
     fn query(&mut self, channel: ChannelId, memory: &Gmmu, query: &Query);
 
     /// Resets a counter [`QueryKind`] reads from.
@@ -396,7 +411,8 @@ pub trait Rasterizer: Send {
     /// fences are not tracked).
     fn signal_fence(&mut self, action: FenceAction);
 
-    /// Runs the actions of finished fences; `wait` blocks until all of them finished.
+    /// Runs the actions of finished fences; `wait` blocks until all of them finished and ran,
+    /// and deferred [`Query`] writes landed.
     fn release_fences(&mut self, wait: bool);
 
     /// The guest CPU wrote `[addr, addr + size)`; drop or re-upload cached copies.
@@ -465,6 +481,7 @@ mod tests {
             device,
             syncpoints: Arc::new(Syncpoints::new()),
             timestamp: Arc::new(GpuTimestamp::new(Arc::new(Boot), false)),
+            waiters: Arc::default(),
         };
         (space, handles)
     }

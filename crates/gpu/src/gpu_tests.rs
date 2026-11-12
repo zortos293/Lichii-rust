@@ -24,6 +24,8 @@ use crate::stream::MIN_RING_SLOTS;
 
 const CPU_VA: u64 = 0x1000_0000;
 const MAPPED: u64 = 0x40_0000;
+/// Device address of GPU VA 0.
+const DEVICE_BASE: u64 = 0x4_0000_0000;
 
 mod host {
     pub const SET_OBJECT: u32 = 0x00;
@@ -61,6 +63,9 @@ enum Event {
     WaitForIdle,
     InlineWritten(u64, u64),
     Ran,
+    /// An engine finished the work it held back.
+    Flush(EngineKind),
+    FlushRegion(u64, u64),
 }
 
 type Log = Arc<Mutex<Vec<Event>>>;
@@ -90,11 +95,82 @@ impl Engine for RecordingEngine {
             self.call_method(ctx, method, argument);
         }
     }
+
+    fn flush(&mut self, _ctx: &mut EngineContext<'_>) {
+        self.log.lock().push(Event::Flush(self.engine));
+    }
+}
+
+/// When the recording renderer's host GPU completes work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Completion {
+    /// At once: fences and queries land when they are issued.
+    Immediate,
+    /// Only when the GPU waits for it (`release_fences(true)`, or a wait for idle and then
+    /// `release_fences`) or the test completes it ([`Rig::complete`]), as on a real host GPU.
+    Deferred,
+}
+
+#[derive(Clone, Copy)]
+enum Pending {
+    Fence(FenceAction),
+    Query(Query),
+}
+
+/// The recording renderer's host GPU work not completed yet.
+struct HostWork {
+    completion: Completion,
+    handles: GpuHandles,
+    memory: Arc<Gmmu>,
+    /// The pending work, and how much of it from the front finished.
+    pending: Mutex<(Vec<Pending>, usize)>,
+}
+
+impl HostWork {
+    fn submit(&self, work: Pending) {
+        match self.completion {
+            Completion::Immediate => self.run(work),
+            Completion::Deferred => self.pending.lock().0.push(work),
+        }
+    }
+
+    fn finish_all(&self) {
+        let mut pending = self.pending.lock();
+        pending.1 = pending.0.len();
+    }
+
+    /// Runs the finished work, or all of it.
+    fn run_finished(&self, all: bool) {
+        let finished: Vec<Pending> = {
+            let mut pending = self.pending.lock();
+            let count = if all { pending.0.len() } else { pending.1 };
+            pending.1 = 0;
+            pending.0.drain(..count).collect()
+        };
+        for work in finished {
+            self.run(work);
+        }
+    }
+
+    fn run(&self, work: Pending) {
+        match work {
+            Pending::Fence(action) => action.execute(&self.handles),
+            Pending::Query(query) => {
+                let memory = &self.memory;
+                let result = match query.size {
+                    ReleaseSize::Four => memory.write(query.address, query.payload as u32),
+                    ReleaseSize::Eight => memory.write(query.address, query.payload),
+                    ReleaseSize::Sixteen => memory.write(query.address, [query.payload, 0]),
+                };
+                result.unwrap();
+            }
+        }
+    }
 }
 
 struct Recorder {
     log: Log,
-    handles: GpuHandles,
+    work: Arc<HostWork>,
 }
 
 impl Rasterizer for Recorder {
@@ -105,28 +181,28 @@ impl Rasterizer for Recorder {
     fn inline_written(&mut self, _channel: ChannelId, _memory: &Gmmu, address: u64, size: u64) {
         self.log.lock().push(Event::InlineWritten(address, size));
     }
-    fn query(&mut self, _channel: ChannelId, memory: &Gmmu, query: &Query) {
+    fn query(&mut self, _channel: ChannelId, _memory: &Gmmu, query: &Query) {
         assert_eq!(query.kind, QueryKind::Payload);
-        let result = match query.size {
-            ReleaseSize::Four => memory.write(query.address, query.payload as u32),
-            ReleaseSize::Eight => memory.write(query.address, query.payload),
-            ReleaseSize::Sixteen => memory.write(query.address, [query.payload, 0]),
-        };
-        result.unwrap();
         self.log.lock().push(Event::Release {
             address: query.address,
             payload: query.payload,
         });
+        self.work.submit(Pending::Query(*query));
     }
     fn signal_fence(&mut self, action: FenceAction) {
         self.log.lock().push(Event::Fence(action));
-        action.execute(&self.handles);
+        self.work.submit(Pending::Fence(action));
     }
-    fn release_fences(&mut self, _wait: bool) {}
+    fn release_fences(&mut self, wait: bool) {
+        self.work.run_finished(wait);
+    }
     fn invalidate_region(&mut self, _addr: u64, _size: u64) {}
-    fn flush_region(&mut self, _addr: u64, _size: u64) {}
+    fn flush_region(&mut self, addr: u64, size: u64) {
+        self.log.lock().push(Event::FlushRegion(addr, size));
+    }
     fn wait_for_idle(&mut self) {
         self.log.lock().push(Event::WaitForIdle);
+        self.work.finish_all();
     }
     fn present(&mut self, _framebuffer: &FramebufferConfig) {}
 }
@@ -136,38 +212,64 @@ struct Rig {
     memory: Arc<Gmmu>,
     syncpoints: Arc<Syncpoints>,
     log: Log,
+    work: Arc<HostWork>,
     next_pushbuffer: u64,
     _space: AddressSpace,
 }
 
 impl Rig {
     fn new(threading: Threading) -> Self {
-        Self::with_ring(threading, crate::gpu::DEFAULT_RING_SLOTS)
+        Self::build(
+            threading,
+            crate::gpu::DEFAULT_RING_SLOTS,
+            Completion::Immediate,
+        )
+    }
+
+    fn deferred(threading: Threading) -> Self {
+        Self::build(
+            threading,
+            crate::gpu::DEFAULT_RING_SLOTS,
+            Completion::Deferred,
+        )
     }
 
     fn with_ring(threading: Threading, ring_slots: usize) -> Self {
+        Self::build(threading, ring_slots, Completion::Immediate)
+    }
+
+    fn build(threading: Threading, ring_slots: usize, completion: Completion) -> Self {
         let physical = Arc::new(PhysicalMemory::new(1 << 24).unwrap());
         let space = AddressSpace::new(physical.clone(), 39);
         space.map(CPU_VA, 0x10_0000, MAPPED, MemoryPermission::READ_WRITE);
         let device = Arc::new(DeviceAddressSpace::new(physical, 36));
-        let daddr = 0x4_0000_0000;
-        device.map_process(daddr, &space, CPU_VA, MAPPED).unwrap();
+        device
+            .map_process(DEVICE_BASE, &space, CPU_VA, MAPPED)
+            .unwrap();
         let memory = Arc::new(Gmmu::new(device.clone(), BigPageSize::Size64K));
-        memory.map(0, daddr, MAPPED, 0, false).unwrap();
+        memory.map(0, DEVICE_BASE, MAPPED, 0, false).unwrap();
         let syncpoints = Arc::new(Syncpoints::new());
         let log = Log::default();
         let engines_log = log.clone();
+        let handles = GpuHandles {
+            device,
+            syncpoints: syncpoints.clone(),
+            timestamp: Arc::new(GpuTimestamp::new(Arc::new(NoTime), false)),
+            waiters: Arc::default(),
+        };
+        let work = Arc::new(HostWork {
+            completion,
+            handles: handles.clone(),
+            memory: memory.clone(),
+            pending: Mutex::default(),
+        });
         let recorder = Recorder {
             log: log.clone(),
-            handles: GpuHandles {
-                device,
-                syncpoints: syncpoints.clone(),
-                timestamp: Arc::new(GpuTimestamp::new(Arc::new(NoTime), false)),
-            },
+            work: work.clone(),
         };
         let gpu = Gpu::new(
             Box::new(recorder),
-            syncpoints.clone(),
+            &handles,
             GpuOptions {
                 threading,
                 ring_slots,
@@ -185,9 +287,15 @@ impl Rig {
             memory,
             syncpoints,
             log,
+            work,
             next_pushbuffer: 0x1_0000,
             _space: space,
         }
+    }
+
+    /// The host GPU finishes the work it holds and runs its fences, on the test's thread.
+    fn complete(&self) {
+        self.work.run_finished(true);
     }
 
     fn channel(&self, host_class: HostClass) -> ChannelId {
@@ -566,7 +674,12 @@ fn acquire_released_by_the_cpu_resumes() {
 fn increments(events: &[Event]) -> Vec<Event> {
     events
         .iter()
-        .filter(|e| matches!(e, Event::Fence(_) | Event::WaitForIdle))
+        .filter(|e| {
+            matches!(
+                e,
+                Event::Fence(FenceAction::IncrementSyncpoint(_)) | Event::WaitForIdle
+            )
+        })
         .cloned()
         .collect()
 }
@@ -631,10 +744,11 @@ fn switch_2_increment_value_counts_the_fence_value() {
         );
         assert_eq!(
             events[0],
-            Event::Release {
-                address: SEMAPHORE,
-                payload: 1
-            }
+            Event::Fence(FenceAction::WriteSemaphore {
+                address: DEVICE_BASE + SEMAPHORE,
+                value: 1,
+                size: ReleaseSize::Four,
+            })
         );
         assert_eq!(rig.syncpoints.guest().value(id), Ok(4));
     });
@@ -694,7 +808,7 @@ fn wait_for_idle_and_reference_count_run_in_order() {
         let events: Vec<Event> = rig
             .events()
             .into_iter()
-            .filter(|e| !matches!(e, Event::Multi { .. }))
+            .filter(|e| !matches!(e, Event::Multi { .. } | Event::Flush(_)))
             .collect();
         assert_eq!(
             events,
@@ -878,6 +992,156 @@ fn a_small_ring_wraps_and_keeps_order() {
             .map(|(_, _, method, argument)| (method, argument))
             .collect();
         assert_eq!(methods, expected, "{threading:?}");
+    });
+}
+
+/// SEM_EXECUTE: the acquire or release compares or writes 64 bits.
+const WIDE: u32 = 1 << 24;
+
+#[test]
+fn a_waiter_resumes_only_once_its_deferred_release_lands() {
+    each_mode(|threading| {
+        let mut rig = Rig::deferred(threading);
+        let waiter = rig.channel(HostClass::Ampere);
+        let releaser = rig.channel(HostClass::Ampere);
+        let words = Pushbuffer::default()
+            .bind(0, AMPERE_3D)
+            .semaphore(SEMAPHORE, 1, 0)
+            .inc(0, 0x701, &[2]);
+        rig.submit(waiter, &words.0);
+        rig.submit(
+            releaser,
+            &Pushbuffer::default().semaphore(SEMAPHORE, 1, 1).0,
+        );
+        assert!(rig.methods().is_empty(), "{threading:?}");
+        assert_eq!(rig.read(SEMAPHORE), 0);
+        rig.complete();
+        assert_eq!(
+            rig.methods(),
+            [(waiter.0, EngineKind::Maxwell3d, 0x701, 2)],
+            "{threading:?}"
+        );
+        assert_eq!(rig.read(SEMAPHORE), 1);
+    });
+}
+
+#[test]
+fn deferred_releases_latch_a_value_overwritten_before_the_front_looks() {
+    each_mode(|threading| {
+        let mut rig = Rig::deferred(threading);
+        let waiter = rig.channel(HostClass::Ampere);
+        let releaser = rig.channel(HostClass::Ampere);
+        let words = Pushbuffer::default()
+            .bind(0, AMPERE_3D)
+            .semaphore(SEMAPHORE, 1, 0)
+            .inc(0, 0x701, &[2]);
+        rig.submit(waiter, &words.0);
+        let words = Pushbuffer::default()
+            .semaphore(SEMAPHORE, 1, 1)
+            .semaphore(SEMAPHORE, 2, 1);
+        rig.submit(releaser, &words.0);
+        assert!(rig.methods().is_empty(), "{threading:?}");
+        rig.complete();
+        assert_eq!(
+            rig.methods(),
+            [(waiter.0, EngineKind::Maxwell3d, 0x701, 2)],
+            "{threading:?}"
+        );
+        assert_eq!(rig.read(SEMAPHORE), 2);
+    });
+}
+
+#[test]
+fn a_narrow_release_does_not_meet_a_wide_acquire() {
+    each_mode(|threading| {
+        let mut rig = Rig::new(threading);
+        let waiter = rig.channel(HostClass::Ampere);
+        let releaser = rig.channel(HostClass::Ampere);
+        rig.memory.write(SEMAPHORE + 4, 5u32).unwrap();
+        let words = Pushbuffer::default()
+            .bind(0, AMPERE_3D)
+            .semaphore(SEMAPHORE, 1, WIDE)
+            .inc(0, 0x701, &[2]);
+        rig.submit(waiter, &words.0);
+        rig.submit(
+            releaser,
+            &Pushbuffer::default().semaphore(SEMAPHORE, 1, 1).0,
+        );
+        assert!(rig.methods().is_empty(), "{threading:?}");
+        assert_eq!(rig.memory.read::<u64>(SEMAPHORE).unwrap(), 0x5_0000_0001);
+        let words = Pushbuffer::default().semaphore(SEMAPHORE, 1, 1 | WIDE);
+        rig.submit(releaser, &words.0);
+        assert_eq!(
+            rig.methods(),
+            [(waiter.0, EngineKind::Maxwell3d, 0x701, 2)],
+            "{threading:?}"
+        );
+    });
+}
+
+#[test]
+fn mme_dma_read_waits_for_deferred_work_and_flushes_what_it_reads() {
+    each_mode(|threading| {
+        let mut rig = Rig::deferred(threading);
+        let channel = rig.channel(HostClass::Ampere);
+        let data = 0x24_0000;
+        let words = Pushbuffer::default()
+            .bind(0, AMPERE_3D)
+            .load_macro(0, &masm::dma_read_program(2))
+            .semaphore(data, 0x55, 1)
+            .once(0, crate::macros::MACRO_METHOD_BASE, &[0, data as u32]);
+        rig.submit(channel, &words.0);
+        let events = rig.events();
+        let read: Vec<_> = rig
+            .methods()
+            .into_iter()
+            .filter(|&(_, _, method, _)| method >= 0xc00)
+            .collect();
+        assert_eq!(
+            read,
+            [(channel.0, EngineKind::Maxwell3d, 0xc00, 0x55)],
+            "{threading:?}"
+        );
+        let flush = events
+            .iter()
+            .position(|e| *e == Event::FlushRegion(DEVICE_BASE + data, 8))
+            .expect("the read range is flushed");
+        assert_eq!(events[flush - 1], Event::Flush(EngineKind::Maxwell3d));
+        let first_read = events
+            .iter()
+            .position(|e| matches!(e, Event::Method { method: 0xc00, .. }))
+            .unwrap();
+        assert!(flush < first_read, "{threading:?}");
+    });
+}
+
+#[test]
+fn set_object_of_an_unknown_class_unbinds_the_subchannel() {
+    each_mode(|threading| {
+        let mut rig = Rig::new(threading);
+        let channel = rig.channel(HostClass::Maxwell);
+        let words = Pushbuffer::default()
+            .bind(1, 0xb1c0)
+            .inc(1, 0x200, &[1])
+            .bind(1, 0)
+            .inc(1, 0x200, &[2])
+            .bind(0, MAXWELL_3D)
+            .bind(0, 0x1234)
+            .inc(0, 0x700, &[3])
+            .bind(2, 0)
+            .upload(0x20_0000, &[0x1122_3344]);
+        rig.submit(channel, &words.0);
+        assert_eq!(
+            rig.methods(),
+            [(channel.0, EngineKind::Compute, 0x200, 1)],
+            "{threading:?}"
+        );
+        assert!(
+            !rig.events()
+                .iter()
+                .any(|e| matches!(e, Event::InlineWritten(..)))
+        );
+        assert_eq!(rig.read(0x20_0000), 0);
     });
 }
 

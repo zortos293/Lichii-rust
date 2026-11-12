@@ -17,19 +17,18 @@ use lichii_common::DAddr;
 use parking_lot::{Condvar, Mutex};
 
 use crate::back::{Back, SideCommand};
-use crate::backend::{ChannelId, FramebufferConfig, Rasterizer};
-use crate::channel::{ChannelConfig, Submission, Waiters};
+use crate::backend::{ChannelId, FramebufferConfig, GpuHandles, Rasterizer};
+use crate::channel::{ChannelConfig, Submission};
 use crate::dma_pusher::{FrontChannel, FrontShared, Work};
 use crate::engines::{EngineFactory, create_engine};
-use crate::host1x::Syncpoints;
 use crate::ring;
 use crate::stream::{Link, MIN_RING_SLOTS, Stream};
 
 /// Default ring size: 8 MiB of slots.
 pub const DEFAULT_RING_SLOTS: usize = 1 << 20;
 /// How long the front first sleeps while every channel with work waits, doubling up to
-/// [`MAX_POLL`]. A release the back executes, a syncpoint increment or [`Gpu::wake`] ends the
-/// sleep at once; the poll only catches memory the guest CPU wrote.
+/// [`MAX_POLL`]. A semaphore write that meets a waiter, a syncpoint increment or [`Gpu::wake`]
+/// ends the sleep at once; the poll only catches memory the guest CPU wrote.
 const MIN_POLL: Duration = Duration::from_micros(50);
 const MAX_POLL: Duration = Duration::from_millis(1);
 
@@ -85,7 +84,7 @@ struct InboxState {
 }
 
 impl Inbox {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(InboxState {
                 commands: VecDeque::new(),
@@ -250,23 +249,18 @@ pub struct Gpu {
 }
 
 impl Gpu {
-    /// Starts the GPU threads. `rasterizer` moves to the back thread, the only one that calls it.
-    pub fn new(
-        rasterizer: Box<dyn Rasterizer>,
-        syncpoints: Arc<Syncpoints>,
-        options: GpuOptions,
-    ) -> Self {
+    /// Starts the GPU threads. `rasterizer` moves to the back thread, the only one that calls it;
+    /// `handles` are the ones it was created with.
+    pub fn new(rasterizer: Box<dyn Rasterizer>, handles: &GpuHandles, options: GpuOptions) -> Self {
         let inbox = Arc::new(Inbox::new());
-        let waiters = Arc::new(Waiters::new());
+        handles.waiters.attach(&inbox);
         let (producer, consumer) = ring::ring(options.ring_slots, MIN_RING_SLOTS);
         let (side_sender, side_receiver) = mpsc::channel();
         let back = Back::new(
             rasterizer,
-            syncpoints.clone(),
+            handles.syncpoints.clone(),
             options.engines,
             side_receiver,
-            waiters.clone(),
-            inbox.clone(),
         );
         let (link, back) = match options.threading {
             Threading::Split => {
@@ -283,9 +277,9 @@ impl Gpu {
                 stream: Stream::new(producer, link, side_sender),
                 shared_macros: None,
                 words: Vec::new(),
-                waiters,
+                waiters: handles.waiters.clone(),
                 inbox: inbox.clone(),
-                syncpoints,
+                syncpoints: handles.syncpoints.clone(),
             },
             channels: Vec::new(),
         };

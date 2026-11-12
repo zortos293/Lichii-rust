@@ -14,7 +14,7 @@ use lichii_common::GpuVAddr;
 
 use crate::back::{BackChannelSetup, SideCommand};
 use crate::backend::{ChannelId, ReleaseSize};
-use crate::channel::{ChannelConfig, SyncpointFence, SyncpointIncrement, Waiters};
+use crate::channel::{ChannelConfig, SemaphoreWaiters, SyncpointFence, SyncpointIncrement};
 use crate::engines::EngineKind;
 use crate::engines::maxwell_3d::{MACRO_REGISTERS_START, RegisterState, Regs};
 use crate::gmmu::Gmmu;
@@ -47,7 +47,7 @@ pub(crate) struct FrontShared {
     pub shared_macros: Option<MacroEngine>,
     /// The words of the entry being parsed.
     pub words: Vec<u32>,
-    pub waiters: Arc<Waiters>,
+    pub waiters: Arc<SemaphoreWaiters>,
     pub inbox: Arc<Inbox>,
     pub syncpoints: Arc<Syncpoints>,
 }
@@ -101,10 +101,22 @@ struct ChannelState {
     calls: [MacroCall; 2],
 }
 
-#[derive(Default)]
+/// Parameters one macro call can have: the words of one command (a 13-bit count).
+const MAX_MACRO_PARAMETERS: usize = 0x1fff;
+
 struct MacroCall {
     method: u32,
+    /// Holds [`MAX_MACRO_PARAMETERS`] from the start, so collecting never allocates.
     parameters: Vec<u32>,
+}
+
+impl MacroCall {
+    fn new() -> Self {
+        Self {
+            method: 0,
+            parameters: Vec::with_capacity(MAX_MACRO_PARAMETERS),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -146,7 +158,7 @@ impl FrontChannel {
                 compute: vec![0; MACRO_METHOD_BASE as usize].into_boxed_slice(),
                 data_ram: MacroDataRam::new(),
                 macros: None,
-                calls: Default::default(),
+                calls: [MacroCall::new(), MacroCall::new()],
             },
             queue: VecDeque::new(),
             offset: 0,
@@ -351,12 +363,14 @@ impl Dispatch<'_> {
         {
             HostAction::None => {}
             HostAction::Bind { subchannel, class } => {
-                let Some(engine) = EngineKind::from_class(class) else {
-                    tracing::debug!(subchannel, class, "bind of an unknown class ignored");
-                    return Flow::Continue;
-                };
-                self.state.subchannels[subchannel as usize] = Some(engine);
-                stream.bind(engine, class);
+                let engine = EngineKind::from_class(class);
+                self.state.subchannels[subchannel as usize] = engine;
+                match engine {
+                    Some(engine) => stream.bind(engine, class),
+                    None => {
+                        tracing::debug!(subchannel, class, "unknown class unbinds a subchannel")
+                    }
+                }
             }
             HostAction::Acquire {
                 address,
@@ -395,20 +409,22 @@ impl Dispatch<'_> {
     }
 
     /// An acquire the word in memory does not meet yet may be met by a release still queued for
-    /// the back: drain it and look again, then suspend the channel (NX2_NOTES row 50).
+    /// the back: drain it and look again, then suspend the channel (NX2_NOTES row 50). The
+    /// channel waits from before the drain, so a release that lands and is overwritten before the
+    /// second look still latches it.
     fn acquire(&mut self, address: GpuVAddr, payload: u64, op: AcquireOp, wide: bool) -> Flow {
-        if semaphore_met(self.memory, address, payload, op, wide) {
-            return Flow::Continue;
-        }
-        let stream = &mut self.shared.stream;
-        stream.drain();
         if semaphore_met(self.memory, address, payload, op, wide) {
             return Flow::Continue;
         }
         if let Some(device) = self.memory.translate(address) {
             self.shared.waiters.add(self.id, device, payload, op, wide);
         }
-        stream.release_fences();
+        self.shared.stream.drain();
+        if semaphore_met(self.memory, address, payload, op, wide) {
+            self.shared.waiters.remove(self.id);
+            return Flow::Continue;
+        }
+        self.shared.stream.release_fences();
         *self.wait = Some(Wait::Semaphore {
             address,
             payload,
@@ -615,10 +631,11 @@ impl MacroHost for FrontMacroHost<'_> {
         }
     }
 
-    /// Reads memory as of the macro's position in the stream: the back executes everything sent
-    /// before it first.
+    /// Reads memory as of the macro's position in the stream: the work sent before it completes
+    /// and what the GPU wrote to the words reaches guest memory first.
     fn dma_read(&mut self, gpu_va: u64, out: &mut [u32]) {
-        self.stream.drain();
+        self.stream
+            .synchronize_read(gpu_va, size_of_val(out) as u64);
         if let Err(fault) = self
             .memory
             .read_block(gpu_va, bytemuck::cast_slice_mut(out))
@@ -626,5 +643,61 @@ impl MacroHost for FrontMacroHost<'_> {
             tracing::warn!(?fault, "MME DMA read from unmapped GPU memory");
             out.fill(0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+
+    use lichii_memory::{DeviceAddressSpace, PhysicalMemory};
+
+    use super::*;
+    use crate::back::Back;
+    use crate::engines::create_engine;
+    use crate::engines::testing::Recorder;
+    use crate::gmmu::BigPageSize;
+    use crate::pushbuffer::{CommandHeader, SubmissionMode};
+    use crate::ring;
+    use crate::stream::{Link, MIN_RING_SLOTS};
+
+    #[test]
+    fn macro_parameters_are_collected_without_allocating() {
+        let syncpoints = Arc::new(Syncpoints::new());
+        let (producer, consumer) = ring::ring(MIN_RING_SLOTS, MIN_RING_SLOTS);
+        let (side, side_receiver) = mpsc::channel();
+        let back = Back::new(
+            Box::new(Recorder::default()),
+            syncpoints.clone(),
+            Arc::new(create_engine),
+            side_receiver,
+        );
+        let mut shared = FrontShared {
+            stream: Stream::new(producer, Link::Inline(Box::new((back, consumer))), side),
+            shared_macros: None,
+            words: Vec::new(),
+            waiters: Arc::default(),
+            inbox: Arc::new(Inbox::new()),
+            syncpoints,
+        };
+        let physical = Arc::new(PhysicalMemory::new(1 << 16).unwrap());
+        let device = Arc::new(DeviceAddressSpace::new(physical, 36));
+        let config = ChannelConfig::new(
+            Arc::new(Gmmu::new(device, BigPageSize::Size64K)),
+            HostClass::Maxwell,
+        );
+        let mut channel = FrontChannel::open(ChannelId(0), &config, Arc::default(), &mut shared);
+        let count = MAX_MACRO_PARAMETERS as u32;
+        let mut words = vec![
+            CommandHeader::new(SubmissionMode::Increasing, 0, 0, 1).0,
+            0xb197,
+            CommandHeader::new(SubmissionMode::IncreaseOnce, 0, MACRO_METHOD_BASE, count).0,
+        ];
+        words.extend(0..count);
+        let storage = channel.state.calls[0].parameters.as_ptr();
+        assert_eq!(channel.dispatch_words(&words, &mut shared), words.len());
+        let parameters = &channel.state.calls[0].parameters;
+        assert!(parameters.is_empty());
+        assert_eq!(parameters.as_ptr(), storage);
     }
 }

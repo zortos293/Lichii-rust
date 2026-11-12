@@ -5,15 +5,17 @@
 //! subchannels and a queue of GPFIFO entries. Submissions go to the GPU's front thread in order
 //! (see [`crate::gpu::Gpu`]).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 
 use lichii_common::DAddr;
+use lichii_memory::DeviceAddressSpace;
 use lichii_texture::block_linear::GobLayout;
 use parking_lot::Mutex;
 
 pub use crate::backend::ChannelId;
 use crate::gmmu::Gmmu;
+use crate::gpu::Inbox;
 use crate::host::{AcquireOp, HostClass};
 pub use crate::pushbuffer::GpEntry;
 
@@ -109,12 +111,16 @@ impl Submission {
     }
 }
 
-/// Channels suspended on a semaphore acquire. The back checks each release against them and
-/// latches the ones it meets, so a waiter cannot miss a value that is overwritten before the
-/// front reads the word again (NX2_NOTES row 70).
-pub(crate) struct Waiters {
+/// Channels suspended on a semaphore acquire, shared by the GPU and the renderer through
+/// [`GpuHandles::waiters`](crate::backend::GpuHandles::waiters). Every semaphore write a
+/// [`FenceAction`](crate::backend::FenceAction) performs is checked against them, once it landed
+/// in memory: the ones it meets are latched and the GPU's front looks at them again, so a waiter
+/// cannot miss a value that is overwritten before the front reads the word (NX2_NOTES row 70).
+#[derive(Default)]
+pub struct SemaphoreWaiters {
     count: AtomicUsize,
     list: Mutex<Vec<Waiter>>,
+    front: OnceLock<Weak<Inbox>>,
 }
 
 struct Waiter {
@@ -126,11 +132,11 @@ struct Waiter {
     latched: bool,
 }
 
-impl Waiters {
-    pub(crate) fn new() -> Self {
-        Self {
-            count: AtomicUsize::new(0),
-            list: Mutex::new(Vec::new()),
+impl SemaphoreWaiters {
+    /// Wakes `inbox` whenever a write latches a waiter.
+    pub(crate) fn attach(&self, inbox: &Arc<Inbox>) {
+        if self.front.set(Arc::downgrade(inbox)).is_err() {
+            tracing::error!("semaphore waiters attached to a second GPU; it is never woken");
         }
     }
 
@@ -155,7 +161,7 @@ impl Waiters {
         self.count.store(list.len(), Ordering::Release);
     }
 
-    /// Drops `channel`'s registration; returns whether a release latched it.
+    /// Drops `channel`'s registration; returns whether a write latched it.
     pub(crate) fn remove(&self, channel: ChannelId) -> bool {
         let mut list = self.list.lock();
         let Some(index) = list.iter().position(|w| w.channel == channel) else {
@@ -166,7 +172,7 @@ impl Waiters {
         latched
     }
 
-    /// Whether a release latched `channel`.
+    /// Whether a write latched `channel`.
     pub(crate) fn latched(&self, channel: ChannelId) -> bool {
         self.list
             .lock()
@@ -174,22 +180,35 @@ impl Waiters {
             .any(|w| w.channel == channel && w.latched)
     }
 
-    /// The back wrote `value` to the word at `address`. Returns whether it latched a waiter.
+    /// `[address, address + size)` of `device` was written. Latches the waiters on a word it
+    /// overlaps that the word now meets, compared at the waiter's width: a 4-byte write never
+    /// stands in for the 64-bit word a wide acquire reads.
     #[inline]
-    pub(crate) fn released(&self, address: DAddr, value: u64) -> bool {
+    pub(crate) fn written(&self, device: &DeviceAddressSpace, address: DAddr, size: u64) {
         if self.count.load(Ordering::Acquire) == 0 {
-            return false;
+            return;
         }
         let mut latched = false;
         for waiter in self.list.lock().iter_mut() {
-            if !waiter.latched
-                && waiter.address == address
-                && waiter.op.is_met(value, waiter.payload, waiter.wide)
+            let width = if waiter.wide { 8 } else { 4 };
+            if waiter.latched
+                || waiter.address >= address.saturating_add(size)
+                || address >= waiter.address.saturating_add(width)
             {
+                continue;
+            }
+            let current = if waiter.wide {
+                device.read::<u64>(waiter.address)
+            } else {
+                device.read::<u32>(waiter.address).map(u64::from)
+            };
+            if current.is_ok_and(|current| waiter.op.is_met(current, waiter.payload, waiter.wide)) {
                 waiter.latched = true;
                 latched = true;
             }
         }
-        latched
+        if latched && let Some(front) = self.front.get().and_then(Weak::upgrade) {
+            front.wake();
+        }
     }
 }

@@ -36,6 +36,8 @@ pub(crate) mod tag {
     pub const FLUSH_COMMANDS: u8 = 12;
     /// The next [`SideCommand`](crate::back::SideCommand) in the side queue.
     pub const SIDE: u8 = 13;
+    /// Then the GPU address and the size of a range the front reads.
+    pub const SYNCHRONIZE_READ: u8 = 14;
 }
 
 /// Words of one multi-word record; longer runs are split.
@@ -208,6 +210,14 @@ impl Stream {
                 back.run(consumer);
             }
         }
+    }
+
+    /// Waits until the back executed everything sent so far, the GPU work before completed and
+    /// GPU-written data in `[address, address + size)` is in guest memory: a sync point for a
+    /// front read of memory the GPU may write.
+    pub(crate) fn synchronize_read(&mut self, address: GpuVAddr, size: u64) {
+        self.record(&[header(tag::SYNCHRONIZE_READ, 0, 0, 0), address, size]);
+        self.drain();
     }
 
     /// The front has nothing to do: hand the back everything, and run an inline back now.
