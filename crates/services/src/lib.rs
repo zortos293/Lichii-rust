@@ -42,7 +42,10 @@ mod dispatch;
 mod friend;
 mod ncm;
 mod nifm;
+mod nim;
 mod ns;
+mod sockets;
+mod ssl;
 #[cfg(test)]
 mod testing;
 
@@ -62,6 +65,9 @@ pub fn register_all(context: &Arc<ServiceContext>) -> HleResult<()> {
     friend::register(context)?;
     ncm::register(context)?;
     nifm::register(context)?;
+    nim::register(context)?;
     ns::register(context)?;
+    sockets::register(context)?;
+    ssl::register(context)?;
     Ok(())
 }
