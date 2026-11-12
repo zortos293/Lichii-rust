@@ -162,8 +162,12 @@ impl Maxwell3d {
     pub fn draw_indirect(&mut self, ctx: &mut EngineContext<'_>, draw: &IndirectDraw) {
         self.flush(ctx);
         if self.renders() {
+            let draw = IndirectDraw {
+                topology: draw::topology(&self.state.regs, draw.topology),
+                ..*draw
+            };
             ctx.rasterizer
-                .draw_indirect(&mut graphics!(self, ctx), draw);
+                .draw_indirect(&mut graphics!(self, ctx), &draw);
         }
     }
 
@@ -213,7 +217,7 @@ impl Maxwell3d {
                     ctx.rasterizer.reset_counter(kind);
                 }
             }
-            RENDER_ENABLE_MODE => self.render_enable = queries::render_enable(regs, ctx.memory),
+            RENDER_ENABLE_MODE => self.render_enable = queries::render_enable(regs, ctx),
             SYNC_INFO => {
                 let id = regs.sync_info.sync_point();
                 if ctx.syncpoints.host().increment(id).is_err() {

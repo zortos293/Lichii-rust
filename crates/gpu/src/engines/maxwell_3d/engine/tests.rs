@@ -1,4 +1,7 @@
+use std::sync::Arc;
+
 use lichii_common::{DAddr, GpuVAddr};
+use lichii_memory::DeviceAddressSpace;
 
 use super::*;
 use crate::backend::{
@@ -43,9 +46,31 @@ enum Event {
     InlineWrite(GpuVAddr, u64),
 }
 
+/// A condition result the renderer holds until a fence passes or its range is flushed.
+struct Staged {
+    daddr: DAddr,
+    value: ReportSemaphoreCompare,
+    until_fence: bool,
+}
+
 #[derive(Default)]
 struct Renderer {
     events: Vec<Event>,
+    device: Option<Arc<DeviceAddressSpace>>,
+    staged: Vec<Staged>,
+}
+
+impl Renderer {
+    fn write_back(&mut self, release: impl Fn(&Staged) -> bool) {
+        let device = self.device.as_ref().unwrap();
+        self.staged.retain(|staged| {
+            if !release(staged) {
+                return true;
+            }
+            device.write(staged.daddr, staged.value).unwrap();
+            false
+        });
+    }
 }
 
 fn consume(dirty: &mut DirtyState) -> Vec<u8> {
@@ -94,9 +119,17 @@ impl Rasterizer for Renderer {
     fn signal_fence(&mut self, action: FenceAction) {
         self.events.push(Event::Fence(action));
     }
-    fn release_fences(&mut self, _wait: bool) {}
+    fn release_fences(&mut self, wait: bool) {
+        if wait {
+            self.write_back(|staged| staged.until_fence);
+        }
+    }
     fn invalidate_region(&mut self, _addr: DAddr, _size: u64) {}
-    fn flush_region(&mut self, _addr: DAddr, _size: u64) {}
+    fn flush_region(&mut self, addr: DAddr, size: u64) {
+        self.write_back(|staged| {
+            !staged.until_fence && (addr..addr + size).contains(&staged.daddr)
+        });
+    }
     fn wait_for_idle(&mut self) {}
     fn present(&mut self, _framebuffer: &FramebufferConfig) {}
 }
@@ -109,9 +142,14 @@ struct Bench {
 
 impl Bench {
     fn new() -> Self {
+        let h = Harness::new();
+        let renderer = Renderer {
+            device: Some(h.memory.device().clone()),
+            ..Renderer::default()
+        };
         Self {
-            h: Harness::new(),
-            renderer: Renderer::default(),
+            h,
+            renderer,
             engine: Maxwell3d::new(0xc797),
         }
     }
@@ -446,6 +484,101 @@ fn render_condition_skips_draws_until_the_sequences_match() {
     b.end();
     b.flush();
     assert_eq!(b.draws(), [arrays(0, 3, 0, 1)]);
+}
+
+fn condition(current_sequence: u32) -> ReportSemaphoreCompare {
+    ReportSemaphoreCompare {
+        initial_sequence: 1,
+        initial_mode: 2,
+        unknown1: 0,
+        unknown2: 0,
+        current_sequence,
+        current_mode: 2,
+    }
+}
+
+fn staged_condition_draws(until_fence: bool) -> Vec<Drawn> {
+    let mut b = Bench::new();
+    b.h.memory.write(0x6000, condition(5)).unwrap();
+    b.renderer.staged.push(Staged {
+        daddr: b.h.memory.translate(0x6000).unwrap(),
+        value: condition(1),
+        until_fence,
+    });
+    b.call(reg_index!(Regs, render_enable) + 1, 0x6000);
+    b.call(RENDER_ENABLE_MODE, RenderEnableMode::IF_EQUAL.0);
+    b.call(draw::VERTEX_BUFFER_COUNT, 3);
+    b.begin(PrimitiveTopology::TRIANGLES, false);
+    b.end();
+    b.flush();
+    assert!(b.renderer.staged.is_empty());
+    b.draws()
+}
+
+#[test]
+fn render_condition_waits_for_results_the_renderer_still_holds() {
+    assert_eq!(staged_condition_draws(true), [arrays(0, 3, 0, 1)]);
+}
+
+#[test]
+fn render_condition_flushes_results_cached_by_the_renderer() {
+    assert_eq!(staged_condition_draws(false), [arrays(0, 3, 0, 1)]);
+}
+
+#[test]
+fn indirect_draw_applies_the_topology_override() {
+    let mut b = Bench::new();
+    let indirect = IndirectDraw {
+        topology: PrimitiveTopology::TRIANGLES,
+        indexed: true,
+        buffer: 0x7000,
+        stride: 20,
+        max_draws: 2,
+        count_buffer: None,
+    };
+    let topology_of = |b: &mut Bench| {
+        b.run(|engine, ctx| engine.draw_indirect(ctx, &indirect));
+        match b.take().as_slice() {
+            [Event::Indirect(draw)] => draw.topology,
+            events => panic!("one indirect draw expected, got {events:?}"),
+        }
+    };
+    b.call(reg_index!(Regs, topology_override), 0xe);
+    assert_eq!(topology_of(&mut b), PrimitiveTopology::TRIANGLES);
+    b.call(reg_index!(Regs, primitive_topology_control), 1);
+    assert_eq!(topology_of(&mut b), PrimitiveTopology::PATCHES);
+    b.call(reg_index!(Regs, topology_override), 0);
+    assert_eq!(topology_of(&mut b), PrimitiveTopology::TRIANGLES);
+}
+
+#[test]
+fn inline_indices_never_grow_the_buffer() {
+    let mut b = Bench::new();
+    let capacity = b.engine.draw.inline_indices.capacity();
+    assert!(capacity >= draw::MAX_INLINE_INDICES);
+
+    b.begin(PrimitiveTopology::TRIANGLES, false);
+    b.multi(draw::INLINE_INDEX_4X8, &vec![0x0302_0100; 1025]);
+    b.end();
+    let events = b.take();
+    let [Event::Draw { draw, .. }] = events.as_slice() else {
+        panic!("one draw expected, got {events:?}");
+    };
+    assert_eq!(draw.count, 4100);
+    assert_eq!(b.engine.draw.inline_indices.capacity(), capacity);
+
+    b.begin(PrimitiveTopology::TRIANGLES, false);
+    let words = vec![0x0001_0000; draw::MAX_INLINE_INDICES / 2];
+    b.multi(draw::INLINE_INDEX_2X16, &words);
+    b.multi(draw::INLINE_INDEX_2X16, &words);
+    b.multi(draw::DRAW_INLINE_INDEX, &[7; 16]);
+    b.end();
+    let events = b.take();
+    let [Event::Draw { draw, .. }] = events.as_slice() else {
+        panic!("one draw expected, got {events:?}");
+    };
+    assert_eq!(draw.count as usize, draw::MAX_INLINE_INDICES);
+    assert_eq!(b.engine.draw.inline_indices.capacity(), capacity);
 }
 
 #[test]

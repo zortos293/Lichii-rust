@@ -77,6 +77,10 @@ pub(super) fn topology(regs: &Regs, begin: PrimitiveTopology) -> PrimitiveTopolo
     }
 }
 
+/// Most inline indices one draw takes; the storage is allocated once with the engine so that
+/// uploads never allocate on the method path. Indices past it are dropped.
+pub(super) const MAX_INLINE_INDICES: usize = 1 << 18;
+
 /// Draw state between begin and end, and the draw waiting for more instances.
 pub(super) struct DrawState {
     /// Topology of the last draw.begin.
@@ -85,8 +89,8 @@ pub(super) struct DrawState {
     pub instance: u32,
     /// index_buffer.count was written since the last draw.end.
     pub indexed: bool,
-    /// Indices of the inline-index methods since the last draw.end, widened to 32 bits. The
-    /// buffer keeps its capacity across draws.
+    /// Indices of the inline-index methods since the last draw.end, widened to 32 bits. Its
+    /// capacity is [`MAX_INLINE_INDICES`] and never grows.
     pub inline_indices: Vec<u32>,
     /// The last direct draw, held until a draw that does not continue it or a state change.
     pub pending: Option<DrawParams<'static>>,
@@ -98,7 +102,7 @@ impl DrawState {
             topology: PrimitiveTopology::POINTS,
             instance: 0,
             indexed: false,
-            inline_indices: Vec::with_capacity(0x1000),
+            inline_indices: Vec::with_capacity(MAX_INLINE_INDICES),
             pending: None,
         }
     }
@@ -125,16 +129,32 @@ impl DrawState {
 
     /// Appends the indices `words` carry through inline-index method `method`.
     pub fn push_inline(&mut self, method: u32, words: &[u32]) {
-        match method {
-            INLINE_INDEX_2X16 => self
-                .inline_indices
-                .extend(words.iter().flat_map(|&w| [w & 0xffff, w >> 16])),
-            INLINE_INDEX_4X8 => self.inline_indices.extend(
-                words
-                    .iter()
-                    .flat_map(|&w| [w & 0xff, (w >> 8) & 0xff, (w >> 16) & 0xff, w >> 24]),
-            ),
-            _ => self.inline_indices.extend_from_slice(words),
+        let room = MAX_INLINE_INDICES - self.inline_indices.len();
+        let indices = &mut self.inline_indices;
+        let wanted = match method {
+            INLINE_INDEX_2X16 => {
+                indices.extend(words.iter().flat_map(|&w| [w & 0xffff, w >> 16]).take(room));
+                words.len() * 2
+            }
+            INLINE_INDEX_4X8 => {
+                indices.extend(
+                    words
+                        .iter()
+                        .flat_map(|&w| [w & 0xff, (w >> 8) & 0xff, (w >> 16) & 0xff, w >> 24])
+                        .take(room),
+                );
+                words.len() * 4
+            }
+            _ => {
+                indices.extend_from_slice(&words[..words.len().min(room)]);
+                words.len()
+            }
+        };
+        if wanted > room {
+            tracing::warn!(
+                dropped = wanted - room,
+                "inline index draw is over capacity"
+            );
         }
     }
 

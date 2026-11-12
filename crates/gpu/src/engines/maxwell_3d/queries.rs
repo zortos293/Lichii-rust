@@ -5,7 +5,8 @@ use super::regs::{
     ReportSemaphoreOperation, ReportSemaphoreReport,
 };
 use crate::backend::{Query, QueryKind, ReleaseSize};
-use crate::gmmu::Gmmu;
+use crate::engines::EngineContext;
+use crate::gmmu::RangeTarget;
 
 /// The write REPORT_SEMAPHORE.QUERY asks for. Acquires are waited on by the front thread and
 /// traps are not emulated, so both give `None`.
@@ -59,30 +60,46 @@ pub(super) fn counter(clear: ClearReport) -> Option<QueryKind> {
 
 /// Evaluates RENDER_ENABLE when its mode is written; conditional modes compare the two
 /// sequence/mode pairs at its address as they are now.
-pub(super) fn render_enable(regs: &Regs, memory: &Gmmu) -> bool {
-    let compare = || {
-        memory
-            .read::<ReportSemaphoreCompare>(regs.render_enable.address())
-            .unwrap_or_else(|fault| {
-                tracing::warn!(?fault, "render condition at unmapped GPU memory");
-                bytemuck::Zeroable::zeroed()
-            })
-    };
-    match regs.render_enable.mode {
-        RenderEnableMode::FALSE => false,
-        RenderEnableMode::CONDITIONAL => {
-            let c = compare();
-            c.initial_sequence != 0 && c.initial_mode != 0
-        }
+///
+/// The renderer may still hold the results the pair depends on (query releases waiting for a
+/// fence, GPU writes in its caches), so conditional modes submit the recorded work, wait for the
+/// fences and write the range back before reading guest memory.
+pub(super) fn render_enable(regs: &Regs, ctx: &mut EngineContext<'_>) -> bool {
+    let mode = regs.render_enable.mode;
+    if mode == RenderEnableMode::FALSE {
+        return false;
+    }
+    if mode != RenderEnableMode::CONDITIONAL
+        && mode != RenderEnableMode::IF_EQUAL
+        && mode != RenderEnableMode::IF_NOT_EQUAL
+    {
+        return true;
+    }
+    let address = regs.render_enable.address();
+    ctx.rasterizer.flush_commands();
+    ctx.rasterizer.release_fences(true);
+    ctx.memory.for_each_range(
+        address,
+        size_of::<ReportSemaphoreCompare>() as u64,
+        |range| {
+            if let RangeTarget::Device(daddr) = range.target {
+                ctx.rasterizer.flush_region(daddr, range.size);
+            }
+        },
+    );
+    let c = ctx
+        .memory
+        .read::<ReportSemaphoreCompare>(address)
+        .unwrap_or_else(|fault| {
+            tracing::warn!(?fault, "render condition at unmapped GPU memory");
+            bytemuck::Zeroable::zeroed()
+        });
+    match mode {
+        RenderEnableMode::CONDITIONAL => c.initial_sequence != 0 && c.initial_mode != 0,
         RenderEnableMode::IF_EQUAL => {
-            let c = compare();
             c.initial_sequence == c.current_sequence && c.initial_mode == c.current_mode
         }
-        RenderEnableMode::IF_NOT_EQUAL => {
-            let c = compare();
-            c.initial_sequence != c.current_sequence || c.initial_mode != c.current_mode
-        }
-        _ => true,
+        _ => c.initial_sequence != c.current_sequence || c.initial_mode != c.current_mode,
     }
 }
 
