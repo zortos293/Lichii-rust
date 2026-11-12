@@ -12,5 +12,9 @@ lichii-loader.workspace = true
 lichii-gpu.workspace = true
 lichii-input.workspace = true
 parking_lot.workspace = true
+bytemuck.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+lichii-cpu.workspace = true

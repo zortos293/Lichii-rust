@@ -1166,7 +1166,9 @@ dependencies = [
 name = "lichii-services"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "lichii-common",
+ "lichii-cpu",
  "lichii-gpu",
  "lichii-input",
  "lichii-kernel",

@@ -34,8 +34,17 @@
 //! }
 //! ```
 
+mod apm;
+mod caps;
 mod context;
 mod dispatch;
+mod erpt;
+mod eupld;
+mod lm;
+mod pctl;
+mod prepo;
+#[cfg(test)]
+mod testing;
 
 use std::sync::Arc;
 
@@ -47,6 +56,12 @@ pub use dispatch::Service;
 /// Registers every HLE service with `sm:`. Call it after the application process exists and
 /// before `Kernel::run`.
 pub fn register_all(context: &Arc<ServiceContext>) -> HleResult<()> {
-    let _ = context;
+    apm::register(context)?;
+    pctl::register(context)?;
+    prepo::register(context)?;
+    lm::register(context)?;
+    erpt::register(context)?;
+    eupld::register(context)?;
+    caps::register(context)?;
     Ok(())
 }
