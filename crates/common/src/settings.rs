@@ -78,10 +78,11 @@ impl Settings {
                 });
             }
         };
-        let (settings, warnings) = Self::from_toml(&text).map_err(|source| SettingsError::Parse {
-            path: path.to_path_buf(),
-            source: Box::new(source),
-        })?;
+        let (settings, warnings) =
+            Self::from_toml(&text).map_err(|source| SettingsError::Parse {
+                path: path.to_path_buf(),
+                source: Box::new(source),
+            })?;
         for warning in warnings {
             tracing::warn!("{}: {warning}", path.display());
         }
@@ -127,7 +128,10 @@ impl Settings {
             version: SETTINGS_VERSION,
             ..self.clone()
         })?;
-        text.insert_str(0, "# Lichii settings. Unknown or invalid fields fall back to defaults.\n");
+        text.insert_str(
+            0,
+            "# Lichii settings. Unknown or invalid fields fall back to defaults.\n",
+        );
         write_atomic(path, text.as_bytes()).map_err(|source| SettingsError::Io {
             path: path.to_path_buf(),
             source,
@@ -138,7 +142,10 @@ impl Settings {
     pub fn normalize(&mut self) {
         let g = &mut self.graphics;
         g.fsr_sharpness = g.fsr_sharpness.min(100);
-        g.speed_limit = g.speed_limit.filter(|&v| v > 0).map(|v| v.min(MAX_SPEED_LIMIT));
+        g.speed_limit = g
+            .speed_limit
+            .filter(|&v| v > 0)
+            .map(|v| v.min(MAX_SPEED_LIMIT));
 
         let fv = &mut self.frame_view;
         fv.graph_seconds = clamp_or(fv.graph_seconds, 1.0, 30.0, 5.0);
@@ -190,7 +197,10 @@ fn migrate(table: &mut toml::Table, from: u32) {
             _ => unreachable!("no migration from settings version {version}"),
         }
     }
-    table.insert("version".into(), toml::Value::Integer(SETTINGS_VERSION.into()));
+    table.insert(
+        "version".into(),
+        toml::Value::Integer(SETTINGS_VERSION.into()),
+    );
 }
 
 /// Deserializes one top-level section. When it fails as a whole, every field is tried on its own
@@ -1327,7 +1337,10 @@ mod tests {
         assert_eq!(settings.graphics.resolution_scale, ResolutionScale::X2);
         assert_eq!(settings.graphics.speed_limit, Some(150));
         assert_eq!(settings.paths.game_dirs, [PathBuf::from("/games/switch")]);
-        assert_eq!(settings.controls.players[0], PlayerInput::default_keyboard());
+        assert_eq!(
+            settings.controls.players[0],
+            PlayerInput::default_keyboard()
+        );
         assert!(matches!(
             &settings.controls.players[1].device,
             InputDevice::Gamepad { name, .. } if name == "8BitDo Pro 2"
@@ -1396,7 +1409,10 @@ mod tests {
         let text = "[ui.hotkeys.Fullscreen]\nkeys = \"Alt+Enter\"\ncontroller = []\n";
         let (settings, warnings) = load(text);
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(settings.ui.hotkeys[&HotkeyAction::Fullscreen].keys, "Alt+Enter");
+        assert_eq!(
+            settings.ui.hotkeys[&HotkeyAction::Fullscreen].keys,
+            "Alt+Enter"
+        );
         assert_eq!(settings.ui.hotkeys[&HotkeyAction::ContinuePause].keys, "F4");
     }
 

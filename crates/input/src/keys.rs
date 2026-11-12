@@ -48,7 +48,10 @@ impl Key {
     }
 
     pub fn from_name(name: &str) -> Option<Self> {
-        NAMES.iter().position(|n| *n == name).map(|i| Self(i as u16))
+        NAMES
+            .iter()
+            .position(|n| *n == name)
+            .map(|i| Self(i as u16))
     }
 
     /// The `KeyCode` name stored in settings, e.g. `KeyZ`.

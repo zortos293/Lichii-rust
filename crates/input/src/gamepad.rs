@@ -128,7 +128,10 @@ mod tests {
         assert_eq!(PadButton::from_sdl_index(1), Some(PadButton::East));
         assert_eq!(PadButton::from_name("dpup"), Some(PadButton::DPadUp));
         assert_eq!(PadButton::ALL.len(), 26);
-        assert_eq!(PadAxis::from_name("righttrigger"), Some(PadAxis::RightTrigger));
+        assert_eq!(
+            PadAxis::from_name("righttrigger"),
+            Some(PadAxis::RightTrigger)
+        );
     }
 
     #[test]
