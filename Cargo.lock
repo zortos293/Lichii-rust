@@ -925,6 +925,7 @@ version = "0.1.0"
 dependencies = [
  "lichii-common",
  "lichii-memory",
+ "portable-atomic",
  "thiserror 2.0.21",
  "tracing",
 ]
