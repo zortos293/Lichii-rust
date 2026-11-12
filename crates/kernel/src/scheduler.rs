@@ -141,8 +141,16 @@ impl Scheduler {
         if core + 1 == self.cores.len() { 63 } else { 59 }
     }
 
+    /// Installs the interrupt line of the CPU about to run on `core`. A reschedule requested
+    /// before the line existed (or while it pointed at another process's CPU) is forwarded, so
+    /// it cannot be lost: requesters set `resched` before taking this lock.
     pub(crate) fn set_interrupt(&self, core: usize, handle: InterruptHandle) {
-        *self.cores[core].interrupt.lock() = Some(handle);
+        let c = &self.cores[core];
+        let mut slot = c.interrupt.lock();
+        if c.resched.load(Ordering::Acquire) || self.shutdown.load(Ordering::Acquire) {
+            handle.signal();
+        }
+        *slot = Some(handle);
     }
 
     fn interrupt(&self, core: usize) {
@@ -321,6 +329,11 @@ impl Scheduler {
         if s.terminate_requested {
             return Preempt::Terminate;
         }
+        if self.shutdown.load(Ordering::Acquire) {
+            save();
+            self.clear_running(core);
+            return Preempt::Switch;
+        }
         if s.pause_requested {
             save();
             s.state = ThreadState::Suspended;
@@ -363,8 +376,8 @@ impl Scheduler {
     pub(crate) fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         for core in 0..self.cores.len() {
+            self.request_reschedule(core);
             self.unpark(core);
-            self.interrupt(core);
         }
     }
 

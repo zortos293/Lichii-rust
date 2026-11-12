@@ -317,3 +317,56 @@ fn arbitrated_mutex_serialises_four_cores() {
     test.run_until_exit(Duration::from_secs(30));
     assert_eq!(*last.lock(), (4 * ITERATIONS as u32, 0));
 }
+
+#[test]
+fn abandoned_wait_does_not_replay_its_result() {
+    let test = TestKernel::new(ConsoleGeneration::Switch1);
+    let heap = heap_base(&test);
+    let event = Arc::new(Event::new());
+    event.signal();
+    let results = Arc::new(Mutex::new(Vec::new()));
+    let (r1, r2) = (results.clone(), results.clone());
+    let handle = Arc::new(AtomicU64::new(0));
+    let h = handle.clone();
+    let list = heap + 0x2000;
+    let other = test.program(Script::new().exit());
+    let main = test.program(
+        Script::new()
+            .then(move |_, env| {
+                env.memory
+                    .write(list, h.load(Ordering::SeqCst) as u32)
+                    .unwrap()
+            })
+            .svc(0x08, move |ctx, _| {
+                ctx.x[1] = other;
+                ctx.x[2] = 0;
+                ctx.x[3] = heap + 0x10_0000;
+                ctx.x[4] = 44;
+                ctx.x[5] = 0;
+            })
+            .svc(0x09, |ctx, _| ctx.x[0] = ctx.x[1])
+            .svc(0x18, move |ctx, _| {
+                ctx.x[1] = list;
+                ctx.x[2] = 1;
+                ctx.x[3] = 1_000_000_000;
+            })
+            .then(move |ctx, _| {
+                r1.lock().push((ctx.x[0], ctx.x[1]));
+                ctx.x[1] = 0x1234;
+            })
+            .svc(0x0b, |ctx, _| ctx.x[0] = 0)
+            .then(move |ctx, _| r2.lock().push((ctx.x[0], ctx.x[1])))
+            .exit(),
+    );
+    let process = test.start(test.params(), main);
+    handle.store(
+        process
+            .handles()
+            .write()
+            .add(KObject::ReadableEvent(event))
+            .unwrap() as u64,
+        Ordering::SeqCst,
+    );
+    test.run_until_exit(Duration::from_secs(10));
+    assert_eq!(*results.lock(), vec![(0, 0), (0, 0x1234)]);
+}

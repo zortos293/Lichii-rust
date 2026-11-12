@@ -23,13 +23,21 @@ pub(super) fn create_thread(svc: &mut SvcContext) -> Flow {
         .create_thread(svc.process(), entry, arg, stack_top, priority, core)
     {
         Ok(thread) => {
-            let handle = svc.process().handles().write().add(KObject::Thread(thread));
+            let handle = svc
+                .process()
+                .handles()
+                .write()
+                .add(KObject::Thread(thread.clone()));
             match handle {
                 Ok(handle) => {
                     svc.set(1, handle as u64);
                     svc.finish(Ok(()))
                 }
-                Err(code) => svc.finish(Err(code)),
+                Err(code) => {
+                    svc.process().remove_thread(&thread);
+                    release_thread_resources(&thread);
+                    svc.finish(Err(code))
+                }
             }
         }
         Err(code) => svc.finish(Err(code)),

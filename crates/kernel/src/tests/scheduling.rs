@@ -223,3 +223,20 @@ fn sleep_and_yield_return() {
     test.run_until_exit(Duration::from_secs(10));
     assert!(elapsed.load(Ordering::SeqCst) >= 5_000);
 }
+
+#[test]
+fn shutdown_stops_a_spinning_core() {
+    let test = TestKernel::new(ConsoleGeneration::Switch1);
+    let main = test.program(Script::new().step(|_, _| super::Action::Stay));
+    test.start(test.params(), main);
+    test.kernel.run().unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let kernel = test.kernel.clone();
+    std::thread::spawn(move || {
+        kernel.shutdown();
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(Duration::from_secs(5))
+        .expect("shutdown hung on a spinning core");
+}

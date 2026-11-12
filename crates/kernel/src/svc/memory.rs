@@ -7,7 +7,6 @@ use super::{Flow, SvcContext};
 use crate::memory::attribute;
 use crate::memory_objects::{CodeMemory, CodeMemoryOperation, SharedMemory, TransferMemory};
 use crate::object::KObject;
-use crate::resource_limit::LimitableResource;
 use crate::result;
 
 fn permission(raw: u32) -> HleResult<MemoryPermission> {
@@ -152,18 +151,7 @@ pub(super) fn create_transfer_memory(svc: &mut SvcContext) -> Flow {
     let result = check_range(addr, size).and_then(|()| {
         let perm = permission(svc.arg32(3))?;
         let process = svc.process();
-        process
-            .resource_limit()
-            .reserve(LimitableResource::TransferMemories, 1)?;
-        let memory = match TransferMemory::new(process.clone(), addr, size, perm) {
-            Ok(memory) => memory,
-            Err(code) => {
-                process
-                    .resource_limit()
-                    .release(LimitableResource::TransferMemories, 1);
-                return Err(code);
-            }
-        };
+        let memory = TransferMemory::new(process.clone(), addr, size, perm)?;
         process
             .handles()
             .write()

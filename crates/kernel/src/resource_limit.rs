@@ -1,5 +1,6 @@
 //! Resource limits (`KResourceLimit`).
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use lichii_common::{HleResult, ResultCode};
@@ -106,5 +107,33 @@ impl ResourceLimit {
         self.counters[which as usize]
             .current
             .fetch_sub(amount, Ordering::AcqRel);
+    }
+
+    /// Reserves `amount` and returns a guard that releases it when dropped.
+    pub fn reserve_owned(
+        self: &Arc<Self>,
+        which: LimitableResource,
+        amount: i64,
+    ) -> Result<Reservation, ResultCode> {
+        self.reserve(which, amount)?;
+        Ok(Reservation {
+            limit: self.clone(),
+            which,
+            amount,
+        })
+    }
+}
+
+/// A reserved amount of one resource, released when the guard drops. Kernel objects own one for
+/// as long as they live.
+pub struct Reservation {
+    limit: Arc<ResourceLimit>,
+    which: LimitableResource,
+    amount: i64,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.limit.release(self.which, self.amount);
     }
 }

@@ -212,12 +212,16 @@ impl Thread {
         Ok(token)
     }
 
-    /// Abandons a wait that turned out not to be needed.
+    /// Abandons a wait that turned out not to be needed, together with its resume action (also
+    /// when a waker got there first), so a later context switch cannot replay it.
     pub(crate) fn cancel_wait(&self, token: u64) {
         let mut s = self.sched.lock();
         if s.wait == token {
             s.wait = 0;
             self.wait_token.store(0, Ordering::Release);
+        }
+        if s.wait == 0 {
+            s.resume = Resume::Nothing;
         }
     }
 

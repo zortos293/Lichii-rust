@@ -336,17 +336,23 @@ impl Arbiter {
         addr: VAddr,
     ) -> HleResult<()> {
         let word: &AtomicU32 = guest_word(memory, addr, true)?;
-        let Some(next) = take_best(&mut shard.mutex, pid, addr) else {
-            word.store(0, Ordering::SeqCst);
+        loop {
+            let Some(next) = take_best(&mut shard.mutex, pid, addr) else {
+                word.store(0, Ordering::SeqCst);
+                return Ok(());
+            };
+            let mut s = next.thread.sched.lock();
+            if s.wait != next.token {
+                continue;
+            }
+            let more = count_live(&shard.mutex, pid, addr) > 0;
+            word.store(
+                next.tag | if more { HANDLE_WAIT_MASK } else { 0 },
+                Ordering::SeqCst,
+            );
+            next.thread.wake_locked(&mut s, WakeResult::SUCCESS);
             return Ok(());
-        };
-        let more = count_live(&shard.mutex, pid, addr) > 0;
-        word.store(
-            next.tag | if more { HANDLE_WAIT_MASK } else { 0 },
-            Ordering::SeqCst,
-        );
-        next.thread.wake(next.token, WakeResult::SUCCESS);
-        Ok(())
+        }
     }
 
     /// `svcArbitrateUnlock`.
@@ -429,6 +435,9 @@ impl Arbiter {
     /// `svcSignalProcessWideKey`: moves up to `count` waiters of `key` (all when `count <= 0`)
     /// to their mutexes, waking those that get it at once.
     pub fn signal_condvar(&self, process: &crate::process::Process, key: VAddr, count: i32) {
+        if !key.is_multiple_of(4) {
+            return;
+        }
         let pid = process.id();
         let memory = process.memory();
         let mut moved = Vec::new();

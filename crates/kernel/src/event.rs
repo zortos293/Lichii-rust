@@ -1,5 +1,6 @@
 //! Events (`KEvent` with its readable and writable ends).
 
+use crate::resource_limit::Reservation;
 use crate::sync::SyncState;
 
 /// An event. Services hold an `Arc<Event>` and signal it from any host thread; the guest waits
@@ -7,11 +8,20 @@ use crate::sync::SyncState;
 #[derive(Default)]
 pub struct Event {
     sync: SyncState,
+    _reservation: Option<Reservation>,
 }
 
 impl Event {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An event counted against a process's resource limit until it is destroyed.
+    pub(crate) fn reserved(reservation: Reservation) -> Self {
+        Self {
+            sync: SyncState::default(),
+            _reservation: Some(reservation),
+        }
     }
 
     /// Signals the event, waking every waiter. It stays signaled until cleared.

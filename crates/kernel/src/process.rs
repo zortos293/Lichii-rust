@@ -9,6 +9,7 @@ use parking_lot::{Mutex, RwLock};
 use crate::KernelInner;
 use crate::handle_table::{DEFAULT_TABLE_SIZE, HandleTable};
 use crate::memory::{LayoutParams, MemoryState, PageTable, Pool, Region, Regions};
+use crate::memory_objects::SharedMemory;
 use crate::resource_limit::ResourceLimit;
 use crate::result;
 use crate::sync::SyncState;
@@ -162,6 +163,7 @@ pub struct Process {
     code: Region,
     main_stack: Mutex<Option<(VAddr, u64)>>,
     max_memory: u64,
+    pub(crate) shared_mappings: Mutex<Vec<(VAddr, Arc<SharedMemory>)>>,
 }
 
 pub(crate) struct NewProcess {
@@ -214,6 +216,7 @@ impl Process {
             code: new.code,
             main_stack: Mutex::new(None),
             max_memory,
+            shared_mappings: Mutex::new(Vec::new()),
         }))
     }
 
@@ -384,6 +387,7 @@ impl Process {
                 .unmap_and_free(addr, size, MemoryState::STACK);
         }
         self.page_table.release_all();
+        self.shared_mappings.lock().clear();
         self.set_state(ProcessState::Exited);
         self.sync.signal();
     }

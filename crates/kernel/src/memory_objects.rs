@@ -8,6 +8,7 @@ use parking_lot::Mutex;
 
 use crate::memory::{MemoryManager, MemoryState, PageGroup, Pool};
 use crate::process::Process;
+use crate::resource_limit::{LimitableResource, Reservation};
 use crate::result;
 
 /// Memory shared between processes or with HLE services (`KSharedMemory`). The pages are
@@ -93,9 +94,10 @@ impl SharedMemory {
         }
     }
 
-    /// `svcMapSharedMemory`.
+    /// `svcMapSharedMemory`. The process keeps the object (and so its pages) alive until the
+    /// mapping is removed or the process is destroyed.
     pub fn map(
-        &self,
+        self: &Arc<Self>,
         process: &Process,
         addr: VAddr,
         size: u64,
@@ -112,18 +114,28 @@ impl SharedMemory {
         if perm.0 & !allowed.0 != 0 || perm == MemoryPermission::NONE {
             return Err(result::INVALID_NEW_MEMORY_PERMISSION);
         }
+        let mut mappings = process.shared_mappings.lock();
         process
             .page_table()
-            .map_group(addr, &self.group(), MemoryState::SHARED, perm)
+            .map_group(addr, &self.group(), MemoryState::SHARED, perm)?;
+        mappings.push((addr, self.clone()));
+        Ok(())
     }
 
-    pub fn unmap(&self, process: &Process, addr: VAddr, size: u64) -> HleResult<()> {
+    pub fn unmap(self: &Arc<Self>, process: &Process, addr: VAddr, size: u64) -> HleResult<()> {
         if size != self.size {
             return Err(result::INVALID_SIZE);
         }
+        let mut mappings = process.shared_mappings.lock();
+        let index = mappings
+            .iter()
+            .position(|(at, shared)| *at == addr && Arc::ptr_eq(shared, self))
+            .ok_or(result::INVALID_MEMORY_REGION)?;
         process
             .page_table()
-            .unmap_group(addr, size, MemoryState::SHARED)
+            .unmap_group(addr, size, MemoryState::SHARED)?;
+        mappings.swap_remove(index);
+        Ok(())
     }
 }
 
@@ -140,10 +152,12 @@ pub struct TransferMemory {
     address: VAddr,
     size: u64,
     permission: MemoryPermission,
+    _reservation: Reservation,
 }
 
 impl TransferMemory {
-    /// `svcCreateTransferMemory`.
+    /// `svcCreateTransferMemory`. Counts against the owner's transfer memory limit until it is
+    /// destroyed.
     pub fn new(
         owner: Arc<Process>,
         address: VAddr,
@@ -159,6 +173,9 @@ impl TransferMemory {
         {
             return Err(result::INVALID_NEW_MEMORY_PERMISSION);
         }
+        let reservation = owner
+            .resource_limit()
+            .reserve_owned(LimitableResource::TransferMemories, 1)?;
         owner
             .page_table()
             .lock_for_transfer(address, size, permission)?;
@@ -167,6 +184,7 @@ impl TransferMemory {
             address,
             size,
             permission,
+            _reservation: reservation,
         })
     }
 

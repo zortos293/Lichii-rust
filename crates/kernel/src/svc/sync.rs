@@ -70,10 +70,10 @@ pub(super) fn close_handle(svc: &mut SvcContext) -> Flow {
 pub(super) fn create_event(svc: &mut SvcContext) -> Flow {
     let result = (|| {
         let process = svc.process();
-        process
+        let reservation = process
             .resource_limit()
-            .reserve(LimitableResource::Events, 1)?;
-        let event = Arc::new(Event::new());
+            .reserve_owned(LimitableResource::Events, 1)?;
+        let event = Arc::new(Event::reserved(reservation));
         let mut handles = process.handles().write();
         let writable = handles.add(KObject::WritableEvent(event.clone()))?;
         let readable = match handles.add(KObject::ReadableEvent(event)) {

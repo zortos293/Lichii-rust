@@ -792,24 +792,32 @@ impl PageTable {
     /// `MapMemory` aliases share the stack state, so the process frees its main stack itself.
     pub(crate) fn release_all(&self) {
         let mut s = self.state.lock();
-        let owned: Vec<(VAddr, u64)> = s
+        let mapped: Vec<(VAddr, u64, bool)> = s
             .blocks
             .iter_range(0, s.blocks.end())
             .filter(|(_, b)| {
-                matches!(
+                !matches!(
+                    b.state,
+                    MemoryState::FREE | MemoryState::INACCESSIBLE | MemoryState::KERNEL
+                )
+            })
+            .map(|(start, b)| {
+                let owned = matches!(
                     b.state,
                     MemoryState::NORMAL
                         | MemoryState::CODE
                         | MemoryState::CODE_DATA
                         | MemoryState::THREAD_LOCAL
-                )
+                );
+                (start, b.size, owned)
             })
-            .map(|(start, b)| (start, b.size))
             .collect();
-        for (start, size) in owned {
-            let group = self.physical_runs(start, size);
+        for (start, size, owned) in mapped {
+            if owned {
+                let group = self.physical_runs(start, size);
+                self.memory.free_group(&group);
+            }
             self.space.unmap(start, size);
-            self.memory.free_group(&group);
         }
         let end = s.blocks.end();
         s.blocks

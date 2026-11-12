@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use lichii_common::ConsoleGeneration;
@@ -7,7 +8,10 @@ use parking_lot::Mutex;
 
 use super::scheduling::heap_base;
 use super::{Script, TestKernel};
-use crate::memory::{MemoryInfo, MemoryState, attribute};
+use crate::memory::{MemoryInfo, MemoryState, Pool, attribute};
+use crate::memory_objects::SharedMemory;
+use crate::object::KObject;
+use crate::resource_limit::LimitableResource;
 use crate::result;
 
 fn info(env: &super::Env, addr: u64) -> MemoryInfo {
@@ -240,4 +244,94 @@ fn switch2_get_info_ids() {
     assert_eq!(get(33), 0x1000);
     assert_eq!(get(28), 0);
     assert!(get(6) > 0);
+}
+
+#[test]
+fn closed_events_and_transfer_memories_return_their_quota() {
+    let test = TestKernel::new(ConsoleGeneration::Switch1);
+    let heap = heap_base(&test);
+    let main = test.program(
+        Script::new()
+            .svc(0x45, |_, _| {})
+            .then(|ctx, _| {
+                assert_eq!(ctx.x[0], 0);
+                ctx.x[19] = ctx.x[1];
+                ctx.x[20] = ctx.x[2];
+            })
+            .svc(0x16, |ctx, _| ctx.x[0] = ctx.x[19])
+            .svc(0x16, |ctx, _| ctx.x[0] = ctx.x[20])
+            .svc(0x15, move |ctx, _| {
+                ctx.x[1] = heap;
+                ctx.x[2] = 0x1000;
+                ctx.x[3] = 0;
+            })
+            .then(|ctx, _| {
+                assert_eq!(ctx.x[0], 0);
+                ctx.x[19] = ctx.x[1];
+            })
+            .svc(0x16, |ctx, _| ctx.x[0] = ctx.x[19])
+            .exit(),
+    );
+    let process = test.start(test.params(), main);
+    let limit = process.resource_limit().clone();
+    test.run_until_exit(Duration::from_secs(10));
+    for which in [
+        LimitableResource::Events,
+        LimitableResource::TransferMemories,
+    ] {
+        assert_eq!(limit.current(which), 0, "{which:?}");
+        assert_eq!(limit.peak(which), 1, "{which:?}");
+    }
+}
+
+#[test]
+fn shared_memory_outlives_its_handle_while_mapped() {
+    let test = TestKernel::new(ConsoleGeneration::Switch1);
+    let heap = heap_base(&test);
+    let shared = Arc::new(
+        SharedMemory::new(
+            test.kernel.memory_manager().clone(),
+            None,
+            Pool::Application,
+            0x1000,
+            MemoryPermission::READ_WRITE,
+            MemoryPermission::READ_WRITE,
+        )
+        .unwrap(),
+    );
+    let weak = Arc::downgrade(&shared);
+    let alive = weak.clone();
+    let handle = Arc::new(AtomicU64::new(0));
+    let (h, h2) = (handle.clone(), handle.clone());
+    let addr = heap + 0x100_0000;
+    let main = test.program(
+        Script::new()
+            .svc(0x13, move |ctx, _| {
+                ctx.x[0] = h.load(Ordering::SeqCst);
+                ctx.x[1] = addr;
+                ctx.x[2] = 0x1000;
+                ctx.x[3] = 3;
+            })
+            .then(|ctx, _| assert_eq!(ctx.x[0], 0, "MapSharedMemory failed"))
+            .svc(0x16, move |ctx, _| ctx.x[0] = h2.load(Ordering::SeqCst))
+            .then(|ctx, _| assert_eq!(ctx.x[0], 0, "CloseHandle failed"))
+            .then(move |_, env| {
+                assert!(alive.upgrade().is_some(), "freed while mapped");
+                env.memory.write(addr, 0xabu32).unwrap();
+                assert_eq!(env.memory.read::<u32>(addr).unwrap(), 0xab);
+            })
+            .exit(),
+    );
+    let process = test.start(test.params(), main);
+    let raw = process
+        .handles()
+        .write()
+        .add(KObject::SharedMemory(shared))
+        .unwrap();
+    handle.store(raw as u64, Ordering::SeqCst);
+    test.run_until_exit(Duration::from_secs(10));
+    assert!(
+        weak.upgrade().is_none(),
+        "kept alive after the process exited"
+    );
 }
