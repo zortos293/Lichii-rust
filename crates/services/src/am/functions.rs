@@ -2,15 +2,13 @@
 
 use std::sync::Arc;
 
-use lichii_common::settings::Language;
-use lichii_common::{ConsoleGeneration, ResultCode};
-use lichii_kernel::ipc::HleRequestContext;
-use parking_lot::Mutex;
-
-use super::storage::Storage;
+use super::storage::{Charge, Storage, StorageData};
 use super::{Applet, NO_DATA_IN_CHANNEL, push_bool, push_event};
 use crate::dispatch::push_nx2_stub;
 use crate::{Service, ServiceContext};
+use lichii_common::settings::Language;
+use lichii_common::{ConsoleGeneration, ResultCode};
+use lichii_kernel::ipc::HleRequestContext;
 
 /// Eden's `ResultUnknown`.
 const UNKNOWN: ResultCode = ResultCode(u32::MAX);
@@ -47,7 +45,7 @@ impl Service for ApplicationFunctions {
                     None
                 };
                 match data {
-                    Some(data) => push_storage(context, ctx, data),
+                    Some(data) => push_storage(context, ctx, StorageData::new(data, None)),
                     None => {
                         tracing::warn!(kind, "no launch parameter");
                         NO_DATA_IN_CHANNEL
@@ -146,7 +144,7 @@ impl Service for ApplicationFunctions {
             130 => push_event(ctx, &applet.gpu_error_event),
             140 => push_event(ctx, &applet.friend_invitation_event),
             141 => match applet.state.lock().friend_invitations.pop() {
-                Some(data) => push_storage(context, ctx, data),
+                Some(data) => push_storage(context, ctx, StorageData::new(data, None)),
                 None => NO_DATA_IN_CHANNEL,
             },
             150 => push_event(ctx, &applet.notification_event),
@@ -171,6 +169,7 @@ impl Service for ApplicationFunctions {
 
 pub(super) struct LibraryAppletCreator {
     pub context: Arc<ServiceContext>,
+    pub applet: Arc<Applet>,
 }
 
 impl Service for LibraryAppletCreator {
@@ -186,12 +185,17 @@ impl Service for LibraryAppletCreator {
                     tracing::warn!(size, "storage size out of range");
                     return Some(UNKNOWN);
                 }
+                let size = size as usize;
+                let Some(charge) = Charge::take(&self.applet.storage_bytes, size) else {
+                    tracing::warn!(size, "live storage budget exhausted");
+                    return Some(UNKNOWN);
+                };
                 let mut data = Vec::new();
-                if data.try_reserve_exact(size as usize).is_err() {
+                if data.try_reserve_exact(size).is_err() {
                     return Some(UNKNOWN);
                 }
-                data.resize(size as usize, 0);
-                push_storage(&self.context, ctx, data)
+                data.resize(size, 0);
+                push_storage(&self.context, ctx, StorageData::new(data, Some(charge)))
             }
             _ => return None,
         })
@@ -201,11 +205,11 @@ impl Service for LibraryAppletCreator {
 fn push_storage(
     context: &Arc<ServiceContext>,
     ctx: &mut HleRequestContext,
-    data: Vec<u8>,
+    data: StorageData,
 ) -> ResultCode {
     ctx.push_interface(context.handler(Storage {
         context: context.clone(),
-        data: Arc::new(Mutex::new(data)),
+        data: Arc::new(data),
     }));
     ResultCode::SUCCESS
 }

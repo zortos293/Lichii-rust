@@ -1,6 +1,7 @@
 //! `IStorage` and `IStorageAccessor`: byte buffers passed between applets.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use lichii_common::ResultCode;
 use lichii_kernel::ipc::HleRequestContext;
@@ -11,9 +12,54 @@ use crate::{Service, ServiceContext};
 
 const INVALID_STORAGE_TYPE: ResultCode = am(511);
 
+/// Bytes of guest-created storage an applet may hold at once.
+pub(super) const LIVE_STORAGE_BUDGET: usize = 256 << 20;
+
+/// A share of an applet's live-storage budget, given back when the storage is freed.
+pub(super) struct Charge {
+    budget: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl Charge {
+    pub fn take(budget: &Arc<AtomicUsize>, bytes: usize) -> Option<Self> {
+        budget
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                live.checked_add(bytes)
+                    .filter(|&total| total <= LIVE_STORAGE_BUDGET)
+            })
+            .ok()?;
+        Some(Self {
+            budget: budget.clone(),
+            bytes,
+        })
+    }
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        self.budget.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+/// The bytes an `IStorage` and its accessors share.
+pub(super) struct StorageData {
+    bytes: Mutex<Vec<u8>>,
+    _charge: Option<Charge>,
+}
+
+impl StorageData {
+    pub fn new(bytes: Vec<u8>, charge: Option<Charge>) -> Self {
+        Self {
+            bytes: Mutex::new(bytes),
+            _charge: charge,
+        }
+    }
+}
+
 pub(super) struct Storage {
     pub context: Arc<ServiceContext>,
-    pub data: Arc<Mutex<Vec<u8>>>,
+    pub data: Arc<StorageData>,
 }
 
 impl Service for Storage {
@@ -36,7 +82,7 @@ impl Service for Storage {
 }
 
 struct StorageAccessor {
-    data: Arc<Mutex<Vec<u8>>>,
+    data: Arc<StorageData>,
 }
 
 impl Service for StorageAccessor {
@@ -47,7 +93,7 @@ impl Service for StorageAccessor {
     fn handle(&self, ctx: &mut HleRequestContext) -> Option<ResultCode> {
         Some(match ctx.command() {
             0 => {
-                ctx.push(self.data.lock().len() as i64);
+                ctx.push(self.data.bytes.lock().len() as i64);
                 ResultCode::SUCCESS
             }
             10 => {
@@ -56,7 +102,7 @@ impl Service for StorageAccessor {
                     Ok(input) => input,
                     Err(code) => return Some(code),
                 };
-                let mut data = self.data.lock();
+                let mut data = self.data.bytes.lock();
                 match range(offset, input.len(), data.len()) {
                     Some(range) => {
                         data[range].copy_from_slice(&input);
@@ -70,7 +116,7 @@ impl Service for StorageAccessor {
                 let size = ctx
                     .writable_buffer(0)
                     .map_or(0, |buffer| buffer.size as usize);
-                let data = self.data.lock();
+                let data = self.data.bytes.lock();
                 let Some(range) = range(offset, size, data.len()) else {
                     return Some(INVALID_OFFSET);
                 };

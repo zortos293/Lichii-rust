@@ -11,6 +11,7 @@ mod storage;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use lichii_common::{HleResult, ResultCode};
 use lichii_kernel::Event;
@@ -101,6 +102,7 @@ pub(crate) struct Applet {
     notification_event: Arc<Event>,
     health_warning_event: Arc<Event>,
     stub_event: Arc<Event>,
+    storage_bytes: Arc<AtomicUsize>,
 }
 
 /// Settings the application changes and reads back.
@@ -142,6 +144,7 @@ impl Applet {
             notification_event: Arc::new(Event::new()),
             health_warning_event: Arc::new(Event::new()),
             stub_event: Arc::new(Event::new()),
+            storage_bytes: Arc::default(),
         };
         applet.lifecycle.lock().sync(&applet.message_event);
         applet
