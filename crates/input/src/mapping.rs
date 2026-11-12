@@ -226,9 +226,10 @@ impl PlayerMapping {
             InputDevice::None | InputDevice::Keyboard => None,
         };
         let controller = player.controller_type;
+        let source = |b: NpadButton| player.buttons.get(&b).map_or(Source::None, Source::compile);
         let bound = |b: NpadButton| {
             if controller.has_button(b) {
-                player.buttons.get(&b).map_or(Source::None, Source::compile)
+                source(b)
             } else {
                 Source::None
             }
@@ -250,8 +251,8 @@ impl PlayerMapping {
             controller,
             gamepad,
             buttons,
-            zl: bound(NpadButton::ZL),
-            zr: bound(NpadButton::ZR),
+            zl: source(NpadButton::ZL),
+            zr: source(NpadButton::ZR),
             left: stick(controller.has_left_stick(), &player.left_stick),
             right: stick(controller.has_right_stick(), &player.right_stick),
             motion: player.motion_enabled,
@@ -526,6 +527,20 @@ mod tests {
         let state = mapping.resolve(&host, true);
         assert_eq!(state.buttons, NpadButtons::UP);
         assert_eq!(state.right_stick, StickPosition::default());
+    }
+
+    #[test]
+    fn gamecube_triggers_are_analog_only() {
+        let (mut player, mut host) = pad_player();
+        player.controller_type = ControllerType::GameCube;
+        let mapping = PlayerMapping::compile(&player, &host);
+        let pad = &mut host.gamepads[1].state;
+        pad.set_axis(PadAxis::LeftTrigger, 1.0);
+        pad.set_axis(PadAxis::RightTrigger, 0.25);
+        let state = mapping.resolve(&host, true);
+        assert_eq!(state.left_trigger, TRIGGER_MAX);
+        assert_eq!(state.right_trigger, (0.25 * TRIGGER_MAX as f32) as u32);
+        assert_eq!(state.buttons, NpadButtons::empty());
     }
 
     #[test]

@@ -121,7 +121,9 @@ pub struct NpadState {
     pub buttons: NpadButtons,
     pub left_stick: StickPosition,
     pub right_stick: StickPosition,
-    /// Analog ZL/ZR travel, `0..=TRIGGER_MAX`; a digital press reads as full travel.
+    /// Analog trigger travel from the ZL/ZR bindings, `0..=TRIGGER_MAX`; a digital press reads
+    /// as full travel. On a GameCube controller these are its L/R triggers and the ZL/ZR bits
+    /// stay clear.
     pub left_trigger: u32,
     pub right_trigger: u32,
     /// `None` when the player's device has no motion sensors or motion is disabled.

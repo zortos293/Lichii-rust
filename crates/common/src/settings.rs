@@ -690,6 +690,8 @@ pub enum ControllerType {
 }
 
 impl ControllerType {
+    /// Every controller type. The order is part of the contract: `lichii-input` packs a type
+    /// as its index here, so new types are appended.
     pub const ALL: [Self; 11] = [
         Self::ProController,
         Self::DualJoycons,
@@ -720,6 +722,7 @@ impl ControllerType {
         }
     }
 
+    /// Switch 2 controllers (C button, and GL/GR on the Pro Controller 2).
     pub fn is_switch2(self) -> bool {
         matches!(
             self,
@@ -731,19 +734,29 @@ impl ControllerType {
         )
     }
 
+    /// Joy-Cons attached to the console; hid reports these on the handheld npad id.
     pub fn is_handheld(self) -> bool {
         matches!(self, Self::Handheld | Self::Switch2Handheld)
     }
 
+    /// Whether ZL/ZR are analog triggers rather than buttons (GameCube).
+    pub fn has_analog_triggers(self) -> bool {
+        self == Self::GameCube
+    }
+
+    /// Whether the controller has a left stick (every type but a single right Joy-Con).
     pub fn has_left_stick(self) -> bool {
         !matches!(self, Self::RightJoycon | Self::Switch2RightJoycon)
     }
 
+    /// Whether the controller has a right stick (every type but a single left Joy-Con).
     pub fn has_right_stick(self) -> bool {
         !matches!(self, Self::LeftJoycon | Self::Switch2LeftJoycon)
     }
 
-    /// Whether the controller has `button`. The input mapper masks out the rest.
+    /// Whether the controller has `button` as a digital button. The input mapper masks out the
+    /// rest. A GameCube controller's ZL/ZR bindings drive its analog L/R triggers instead
+    /// (see [`Self::has_analog_triggers`]) and its Z button is R, as in Lichii.
     pub fn has_button(self, button: NpadButton) -> bool {
         use NpadButton::*;
         let left_half = matches!(
@@ -761,7 +774,7 @@ impl ControllerType {
             Self::RightJoycon => right_half || right_rail,
             Self::GameCube => matches!(
                 button,
-                A | B | X | Y | L | R | ZR | Plus | DPadLeft | DPadUp | DPadRight | DPadDown
+                A | B | X | Y | R | Plus | DPadLeft | DPadUp | DPadRight | DPadDown
             ),
             Self::Switch2ProController => left_half || right_half || matches!(button, C | GL | GR),
             Self::Switch2Handheld => left_half || right_half || button == C,
@@ -803,6 +816,7 @@ pub enum NpadButton {
 }
 
 impl NpadButton {
+    /// Every button, in `nn::hid::NpadButton` bit order followed by the Switch 2 additions.
     pub const ALL: [Self; 25] = {
         use NpadButton::*;
         [
@@ -811,6 +825,7 @@ impl NpadButton {
         ]
     };
 
+    /// The button's name as printed on a Switch controller.
     pub fn label(self) -> &'static str {
         use NpadButton::*;
         match self {
@@ -1453,6 +1468,9 @@ mod tests {
         assert!(!ControllerType::LeftJoycon.has_button(A));
         assert!(ControllerType::DualJoycons.has_button(RightSR));
         assert!(!ControllerType::RightJoycon.has_left_stick());
+        assert!(!ControllerType::GameCube.has_button(ZL));
+        assert!(!ControllerType::GameCube.has_button(ZR));
+        assert!(ControllerType::GameCube.has_analog_triggers());
     }
 
     #[test]
