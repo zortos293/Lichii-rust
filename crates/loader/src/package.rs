@@ -117,6 +117,7 @@ pub(crate) fn load(
 struct Contents {
     index: ContentIndex,
     standalone: Option<Nca>,
+    application_id: Option<u64>,
 }
 
 /// The NCAs one program of an application boots from.
@@ -143,10 +144,18 @@ impl Contents {
             TitleFormat::Nca => (ContentIndex::default(), Some(Nca::open(file, &keys)?)),
             _ => (open_container(path, &file, &mut keys)?, None),
         };
+        let application_id = index
+            .titles_of(ContentMetaType::Application)
+            .map(|t| t.title_id())
+            .min();
         for extra in &options.updates_and_dlc {
             index.merge(open_container(extra, &HostFile::open(extra)?, &mut keys)?);
         }
-        Ok(Self { index, standalone })
+        Ok(Self {
+            index,
+            standalone,
+            application_id,
+        })
     }
 
     fn select(&self, path: &Path, program_index: u8) -> LoaderResult<Selected<'_>> {
@@ -163,10 +172,11 @@ impl Contents {
                 }
             }
             None => {
+                let application_id = self.application_id.ok_or_else(missing)?;
                 let application = self
                     .index
                     .titles_of(ContentMetaType::Application)
-                    .min_by_key(|t| t.title_id())
+                    .find(|t| t.title_id() == application_id)
                     .ok_or_else(missing)?;
                 let program = application
                     .content(ContentType::Program, program_index)
@@ -841,6 +851,33 @@ mod tests {
             load(&update, &with_keys()),
             Err(LoaderError::MissingProgram(_))
         ));
+    }
+
+    #[test]
+    fn extra_packages_never_replace_the_application() {
+        const OTHER: u64 = APP - 0x1_0000;
+        let temp = TempDir::new("other-app");
+        let base = write_nsp(&temp.0, "base.nsp", base_files());
+        let mut extra = update_files();
+        extra.extend([
+            (
+                content_name(0xc1),
+                nca(NCA_PROGRAM, OTHER, vec![pfs_section(exefs(3))]),
+            ),
+            meta(OTHER, 0, 0x80, OTHER | 0x800, &[(CNMT_PROGRAM, 0xc1)], 0xc0),
+        ]);
+        let extra = write_nsp(&temp.0, "extra.nsp", extra);
+        let mut keys = (*key_set(true)).clone();
+        let index = Nsp::open(&HostFile::open(&extra).unwrap(), &mut keys)
+            .unwrap()
+            .into_index();
+        assert!(index.title(OTHER).is_some());
+        let options = LoadOptions {
+            updates_and_dlc: vec![extra],
+            ..with_keys()
+        };
+        check_updated(&load(&base, &options).unwrap());
+        assert_eq!(scan(&base, &options).unwrap().name, "Lichii Update");
     }
 
     #[test]
