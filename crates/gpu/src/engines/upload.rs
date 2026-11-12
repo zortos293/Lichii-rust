@@ -8,7 +8,7 @@
 //! leaves no written range unreported.
 
 use lichii_common::GpuVAddr;
-use lichii_texture::block_linear::{GOB_HEIGHT, Tiling};
+use lichii_texture::block_linear::Tiling;
 
 use super::EngineContext;
 pub use super::maxwell_3d::regs::{UploadRegisters, UploadRegistersDest};
@@ -122,11 +122,15 @@ impl Upload {
                     ..tiling
                 };
                 let mut done = 0;
+                let mut first = u64::MAX;
+                let mut end = 0;
                 while done < self.chunk.len() {
                     let byte_x = x + (self.column + done) as u32;
                     let len =
                         (UNIT_BYTES - byte_x as usize % UNIT_BYTES).min(self.chunk.len() - done);
                     let offset = tiling.offset(byte_x, y + self.line, z) as u64;
+                    first = first.min(offset);
+                    end = end.max(offset + len as u64);
                     if let Err(fault) = ctx
                         .memory
                         .write_block(self.address + offset, &self.chunk[done..done + len])
@@ -135,9 +139,12 @@ impl Upload {
                     }
                     done += len;
                 }
-                let (start, size) = touched_block_rows(&tiling, y + self.line, z);
-                ctx.rasterizer
-                    .inline_written(ctx.channel, ctx.memory, self.address + start, size);
+                ctx.rasterizer.inline_written(
+                    ctx.channel,
+                    ctx.memory,
+                    self.address + first,
+                    end - first,
+                );
             }
             Target::Discard => {}
         }
@@ -148,23 +155,6 @@ impl Upload {
             self.line += 1;
         }
     }
-}
-
-/// The tiled bytes holding row `y` of slice `z`: its row of blocks, or the whole level when
-/// blocks span several slices.
-fn touched_block_rows(tiling: &Tiling, y: u32, z: u32) -> (u64, u64) {
-    if tiling.depth > 1 {
-        return (0, tiling.size_bytes() as u64);
-    }
-    let rows = GOB_HEIGHT << tiling.block_height_log2;
-    let band = Tiling {
-        height: rows,
-        ..*tiling
-    };
-    (
-        tiling.offset(0, y / rows * rows, z) as u64,
-        band.size_bytes() as u64,
-    )
 }
 
 /// The surface a block-linear transfer writes, in bytes (the GOB layout does not depend on the

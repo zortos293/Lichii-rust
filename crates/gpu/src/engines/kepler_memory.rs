@@ -140,6 +140,13 @@ mod tests {
         assert_eq!(&gob[row1 + 4..row1 + 8], &1u32.to_le_bytes());
         let row2 = lichii_texture::block_linear::gob_offset(0, 2, Default::default()) as usize;
         assert_eq!(&gob[row2..row2 + 4], &16u32.to_le_bytes());
+        let spans = &h.rasterizer.inline_writes;
+        assert_eq!(spans.len(), 2);
+        assert!(
+            spans
+                .iter()
+                .all(|&(address, size)| address >= 0x20_0000 && size < 512)
+        );
     }
 
     #[test]
