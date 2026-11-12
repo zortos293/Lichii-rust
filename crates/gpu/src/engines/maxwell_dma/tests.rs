@@ -446,6 +446,70 @@ fn constant_fill_writes_the_component_size() {
 }
 
 #[test]
+fn oversized_remapped_rows_move_through_bounded_scratch() {
+    let mut rig = Rig::new(GobLayout::Tegra);
+    let length = 0x4_0001_usize;
+    let (src_pitch, dst_pitch) = (length * 4, length * 2);
+    let src = pattern(src_pitch * 2, 7);
+    rig.write(0, &src);
+    rig.addresses(0, 0x28_0000);
+    rig.pitches(src_pitch as u32, dst_pitch as u32);
+    rig.lines(length as u32, 2);
+    rig.remap(
+        [0, 0],
+        [
+            Swizzle::SRC_W,
+            Swizzle::SRC_X,
+            Swizzle::NO_WRITE,
+            Swizzle::NO_WRITE,
+        ],
+        1,
+        4,
+        2,
+    );
+    rig.launch(launch_word(PITCH, PITCH, true, true));
+    let expected: Vec<u8> = (0..2)
+        .flat_map(|row| {
+            let row = &src[row * src_pitch..][..src_pitch];
+            row.as_chunks::<4>().0.iter().flat_map(|e| [e[3], e[0]])
+        })
+        .collect();
+    assert_eq!(rig.read(0x28_0000, expected.len()), expected);
+    assert!(rig.engine.scratch.packed.capacity() <= copy::CHUNK);
+    assert!(rig.engine.scratch.converted.capacity() <= copy::CHUNK);
+}
+
+#[test]
+fn constant_fill_ignores_the_unused_source_surface() {
+    let mut rig = Rig::new(GobLayout::Tegra);
+    rig.write(0x2000, &[0xee; 256]);
+    rig.addresses(0, 0x2000);
+    rig.pitches(0, 32);
+    rig.lines(8, 4);
+    rig.remap(
+        [0x1122_3344, 0],
+        [
+            Swizzle::CONST_A,
+            Swizzle::NO_WRITE,
+            Swizzle::NO_WRITE,
+            Swizzle::NO_WRITE,
+        ],
+        4,
+        1,
+        1,
+    );
+    rig.surface(false, &Surface::new(0, 0, 1));
+    rig.launch(launch_word(BLOCK, PITCH, true, true));
+    for row in 0..4 {
+        assert_eq!(
+            rig.read(0x2000 + row * 32, 32),
+            [0x44, 0x33, 0x22, 0x11].repeat(8)
+        );
+    }
+    assert_eq!(rig.read(0x2000 + 4 * 32, 4), [0xee; 4]);
+}
+
+#[test]
 fn remap_reorders_components_and_fills_constants_across_lines() {
     let mut rig = Rig::new(GobLayout::Tegra);
     rig.write(0x1000, &[1, 2, 3, 4, 5, 6, 7, 8]);

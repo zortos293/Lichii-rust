@@ -12,7 +12,7 @@ use super::remap::Remap;
 use crate::backend::{CopySurface, ImageCopy, Rasterizer};
 use crate::engines::EngineContext;
 
-const CHUNK: usize = 1 << 20;
+pub(super) const CHUNK: usize = 1 << 20;
 const MAX_BAND_BYTES: usize = 256 << 20;
 const MAX_ROW_BYTES: u32 = 1 << 24;
 const MAX_EXTENT: u32 = 1 << 20;
@@ -25,9 +25,9 @@ const PTE_KIND_PITCH_NO_SWIZZLE: u8 = 0xfd;
 /// Buffers the software paths reuse from copy to copy.
 #[derive(Default)]
 pub(super) struct Scratch {
-    packed: Vec<u8>,
-    converted: Vec<u8>,
-    tiled: Vec<u8>,
+    pub(super) packed: Vec<u8>,
+    pub(super) converted: Vec<u8>,
+    pub(super) tiled: Vec<u8>,
 }
 
 /// How one side of a copy lies in memory.
@@ -425,7 +425,10 @@ fn copy_elements(
         let chunk = if backwards { chunks - 1 - index } else { index };
         let first = chunk * step;
         let count = step.min(elements - first);
-        let (from, to) = (src + first * src_bytes, dst + first * dst_bytes);
+        let (from, to) = (
+            src.wrapping_add(first * src_bytes),
+            dst.wrapping_add(first * dst_bytes),
+        );
         packed.resize((count * src_bytes) as usize, 0);
         if remap.is_none_or(|r| r.reads_source()) {
             read_linear(ctx, tiled, from, src_gob, packed);
@@ -564,14 +567,45 @@ pub(super) fn copy_lines(
         }
     }
     let (src_bytes, dst_bytes) = remap.map_or((1, 1), |r| (r.src_bytes(), r.dst_bytes()));
-    let (Some(mut src), Some(mut dst)) = (
-        Side::new(src, src_bytes, ctx.gob_layout, line_length),
-        Side::new(dst, dst_bytes, ctx.gob_layout, line_length),
-    ) else {
+    let reads_source = remap.is_none_or(|r| r.reads_source());
+    let row_bytes = line_length as usize * src_bytes.max(dst_bytes) as usize;
+    if let Some(remap) = remap
+        && row_bytes > CHUNK
+        && let Layout::Pitch(dst_pitch) = dst.layout
+        && (!reads_source || matches!(src.layout, Layout::Pitch(_)))
+    {
+        let src_pitch = match src.layout {
+            Layout::Pitch(pitch) => i64::from(pitch),
+            Layout::Block(_) => 0,
+        };
+        for line in 0..i64::from(lines) {
+            let from = src.address.wrapping_add_signed(line * src_pitch);
+            let to = dst.address.wrapping_add_signed(line * i64::from(dst_pitch));
+            copy_elements(
+                ctx,
+                scratch,
+                (from, false),
+                (to, false),
+                u64::from(line_length),
+                Some(remap),
+            );
+        }
+        return;
+    }
+    let mut src = if reads_source {
+        let Some(side) = Side::new(src, src_bytes, ctx.gob_layout, line_length) else {
+            return;
+        };
+        Some(side)
+    } else {
+        None
+    };
+    let Some(mut dst) = Side::new(dst, dst_bytes, ctx.gob_layout, line_length) else {
         return;
     };
-    let mut left = lines.min(src.rows_available()).min(dst.rows_available());
-    let row_bytes = line_length as usize * src_bytes.max(dst_bytes) as usize;
+    let mut left = lines
+        .min(src.as_ref().map_or(u32::MAX, Side::rows_available))
+        .min(dst.rows_available());
     let group = (CHUNK / row_bytes).max(1) as u32;
     let Scratch {
         packed,
@@ -581,7 +615,7 @@ pub(super) fn copy_lines(
     while left > 0 {
         let rows = left.min(group);
         packed.resize(rows as usize * line_length as usize * src_bytes as usize, 0);
-        if remap.is_none_or(|r| r.reads_source())
+        if let Some(src) = &src
             && !src.read(ctx, tiled, packed, rows, line_length)
         {
             return;
@@ -599,7 +633,9 @@ pub(super) fn copy_lines(
             }
         };
         dst.write(ctx, tiled, data, rows, line_length);
-        src.advance(rows);
+        if let Some(src) = &mut src {
+            src.advance(rows);
+        }
         dst.advance(rows);
         left -= rows;
     }
