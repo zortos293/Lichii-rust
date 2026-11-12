@@ -58,7 +58,7 @@ pub enum SettingsError {
     #[error("parsing {path}: {source}")]
     Parse {
         path: PathBuf,
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
     #[error("serializing settings: {0}")]
     Serialize(#[from] toml::ser::Error),
@@ -80,7 +80,7 @@ impl Settings {
         };
         let (settings, warnings) = Self::from_toml(&text).map_err(|source| SettingsError::Parse {
             path: path.to_path_buf(),
-            source,
+            source: Box::new(source),
         })?;
         for warning in warnings {
             tracing::warn!("{}: {warning}", path.display());
