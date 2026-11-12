@@ -10,6 +10,8 @@ mod crypto;
 mod fp_vector;
 mod indexed;
 mod int;
+#[cfg(test)]
+mod known_values;
 mod lanes;
 mod movement;
 mod scalar_fp;
