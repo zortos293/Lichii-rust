@@ -18,7 +18,9 @@ use std::sync::Arc;
 use lichii_common::{DAddr, GpuVAddr};
 use lichii_memory::DeviceAddressSpace;
 use lichii_texture::PixelFormat;
+use lichii_texture::block_linear::GobLayout;
 
+use crate::clock::GpuTimestamp;
 use crate::engines::maxwell_3d::regs::{MAX_CONST_BUFFERS, MAX_SHADER_STAGE, PrimitiveTopology};
 use crate::engines::maxwell_3d::{DirtyState, Regs};
 use crate::gmmu::Gmmu;
@@ -33,6 +35,8 @@ pub struct ChannelId(pub u32);
 pub struct GpuHandles {
     pub device: Arc<DeviceAddressSpace>,
     pub syncpoints: Arc<Syncpoints>,
+    /// The clock 16-byte releases and query reports take their timestamp from.
+    pub timestamp: Arc<GpuTimestamp>,
 }
 
 /// A constant buffer bound to a shader stage slot.
@@ -224,8 +228,9 @@ pub enum FenceAction {
 }
 
 impl FenceAction {
-    /// Performs the action. The renderer calls this from whichever thread notices completion.
-    pub fn execute(self, handles: &GpuHandles, timestamp: u64) {
+    /// Performs the action. The renderer calls this from whichever thread notices completion;
+    /// 16-byte releases take their timestamp from [`GpuHandles::timestamp`].
+    pub fn execute(self, handles: &GpuHandles) {
         match self {
             Self::WriteSemaphore {
                 address,
@@ -235,7 +240,9 @@ impl FenceAction {
                 let result = match size {
                     ReleaseSize::Four => handles.device.write(address, value as u32),
                     ReleaseSize::Eight => handles.device.write(address, value),
-                    ReleaseSize::Sixteen => handles.device.write(address, [value, timestamp]),
+                    ReleaseSize::Sixteen => handles
+                        .device
+                        .write(address, [value, handles.timestamp.now()]),
                 };
                 if let Err(fault) = result {
                     tracing::warn!(?fault, "semaphore release to unmapped device memory");
@@ -262,6 +269,9 @@ pub struct FramebufferConfig {
     pub format: PixelFormat,
     /// `Some(log2 block height in GOBs)` for block-linear surfaces.
     pub block_height_log2: Option<u32>,
+    /// GOB byte order of a block-linear surface (Switch 2 native surfaces swap bits 5 and 6,
+    /// NX2_NOTES row 48).
+    pub gob_layout: GobLayout,
     pub flip_vertical: bool,
     pub crop: Option<CropRect>,
 }
