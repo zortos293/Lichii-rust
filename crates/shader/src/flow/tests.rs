@@ -259,6 +259,51 @@ fn call_creates_function() {
 }
 
 #[test]
+fn predicated_call_is_guarded() {
+    let cfg = build(vec![
+        guarded(FlowOp::Call { target: 24 }, 0),
+        op(FlowOp::Exit),
+        op(N),
+        op(N),
+        op(FlowOp::Return),
+    ]);
+    assert_eq!(
+        shape(&cfg, 0),
+        vec![
+            (0, 0, true, EndClass::Branch, Some(0), Some(8)),
+            (0, 0, false, EndClass::Call, None, None),
+            (8, 16, false, EndClass::Exit, None, None),
+        ]
+    );
+    let call = cfg.functions[0].blocks().nth(1).unwrap();
+    assert_eq!(cfg.block(call).function_call, 1);
+    assert_eq!(
+        cfg.block(call).return_block.map(|r| cfg.block(r).begin),
+        Some(8)
+    );
+}
+
+#[test]
+fn pexit_exit_keeps_preceding_instructions() {
+    let cfg = build(vec![
+        op(FlowOp::Push {
+            token: Token::Pexit,
+            target: 24,
+        }),
+        op(N),
+        op(FlowOp::Exit),
+        op(FlowOp::Exit),
+    ]);
+    assert_eq!(
+        shape(&cfg, 0),
+        vec![
+            (0, 16, false, EndClass::Branch, Some(24), None),
+            (24, 32, false, EndClass::Exit, None, None),
+        ]
+    );
+}
+
+#[test]
 fn exits_to_dispatcher() {
     let cfg = build_with(
         vec![guarded(FlowOp::Exit, 0), op(N), op(FlowOp::Exit)],
@@ -392,6 +437,44 @@ mod structured {
         );
         assert!(dump.contains("Reference #0x180020\n"), "{dump}");
         assert!(dump.contains("Reference #0x80010\n"), "{dump}");
+    }
+
+    #[test]
+    fn predicated_call_is_inlined_under_its_condition() {
+        let dump = run(
+            vec![
+                guarded(FlowOp::Call { target: 24 }, 0),
+                op(FlowOp::Exit),
+                op(N),
+                op(N),
+                op(FlowOp::Return),
+            ],
+            StructureOptions::default(),
+        );
+        let syntax = dump.split("syntax:").nth(1).unwrap();
+        assert!(syntax.contains("  if %"), "{dump}");
+        assert!(dump.contains("GetPred P0"), "{dump}");
+        assert!(dump.contains("Reference #0x180020\n"), "{dump}");
+    }
+
+    #[test]
+    fn demote_inside_loop_is_not_reordered() {
+        let program = vec![
+            op(N),
+            guarded(FlowOp::Kill, 2),
+            guarded(FlowOp::Branch { target: 8 }, 1),
+            op(FlowOp::Exit),
+        ];
+        let plain = run(program.clone(), StructureOptions::default());
+        assert!(plain.contains("DemoteToHelperInvocation"), "{plain}");
+        let reordered = run(
+            program,
+            StructureOptions {
+                reorder_demotes: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(plain, reordered);
     }
 
     #[test]

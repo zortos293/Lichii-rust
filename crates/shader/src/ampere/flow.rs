@@ -115,6 +115,10 @@ impl FlowIsa for AmpereFlow {
             });
         }
         let decoded = decode(inst).ok_or_else(|| self.invalid(pc, inst))?;
+        if decoded.opcode.is_uniform() {
+            let (pred, negated) = inst.uniform_guard();
+            cond = Condition::pred(pred, negated);
+        }
         let op = match decoded.opcode {
             Opcode::Bra if inst.bits(32, 2) == BRANCH_DIVERGED => FlowOp::Normal,
             Opcode::Bra => FlowOp::Branch {
