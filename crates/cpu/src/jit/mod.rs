@@ -100,6 +100,8 @@ extern "sysv64" fn write_slow(state: &mut JitState, addr: u64, pc: u64, size: u3
     }
 }
 
+/// A [`CpuCore`] that translates guest blocks to x86-64 code and runs every instruction it does
+/// not translate on the interpreter. Uses the address space's fastmem arena when it has one.
 pub struct Jit {
     config: CpuConfig,
     interrupt: InterruptHandle,

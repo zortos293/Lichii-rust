@@ -488,3 +488,25 @@ fn vector_pressure_spills_and_reloads() {
     }
     directed(&code, &[(20, DATA + 0x200)]);
 }
+
+#[test]
+fn slow_paths_keep_live_registers_of_both_classes() {
+    let mut code = Vec::new();
+    for i in 0..9u32 {
+        code.push(0x9100_0400 | i << 5 | i);
+    }
+    for i in 0..15u32 {
+        code.push(0x3dc0_0280 | i << 10 | i);
+    }
+    for i in 0..9u32 {
+        code.push(0x8b00_0000 | (8 - i) << 16 | i << 5 | (10 + i));
+    }
+    for i in 0..15u32 {
+        code.push(0x3d80_0280 | (i + 20) << 10 | (14 - i));
+    }
+    let regs: Vec<(usize, u64)> = (0..20)
+        .map(|r| (r, 0x0101_0101_0101 * r as u64 + 3))
+        .chain([(20, DATA + 0x200)])
+        .collect();
+    directed(&code, &regs);
+}

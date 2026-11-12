@@ -764,7 +764,7 @@ impl Emitter<'_> {
                     continue;
                 };
                 let caller_saved = class == Class::Xmm || CALLER_SAVED & (1 << r) != 0;
-                if caller_saved && self.last_use[held as usize] as usize > i && dst != Some(r) {
+                if caller_saved && self.last_use[held as usize] as usize > i && held != i as u32 {
                     saved[class as usize] |= 1 << r;
                 }
             }
