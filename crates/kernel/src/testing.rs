@@ -294,14 +294,19 @@ impl Reply {
             move_handles.extend(&words[i..i + ((descriptor >> 5) & 0xf) as usize]);
             i += move_handles.len();
         }
-        let raw_end = words.len().min(2 + (words[1] & 0x3ff) as usize + i - 2);
-        let (result, start) = if tipc {
-            (ResultCode(words[i]), i + 1)
+        let raw = (words[1] & 0x3ff) as usize;
+        let (result, start, data_words) = if tipc {
+            (ResultCode(words[i]), i + 1, raw.saturating_sub(1))
         } else {
             let header = i.next_multiple_of(4);
             assert_eq!(words[header], message::SFCO, "reply without SFCO");
-            (ResultCode(words[header + 2]), header + 4)
+            (
+                ResultCode(words[header + 2]),
+                header + 4,
+                raw.saturating_sub(8),
+            )
         };
+        let raw_end = words.len().min(start + data_words);
         Self {
             result,
             copy_handles,
@@ -527,6 +532,7 @@ mod tests {
             .send(session, &Request::new(0).arg(41u32).arg(21u64))
             .unwrap();
         assert_eq!(reply.result, ResultCode::SUCCESS);
+        assert_eq!(reply.data().len(), 16);
         assert_eq!((reply.pop::<u32>(), reply.pop::<u64>()), (42, 42));
         let Some(KObject::ReadableEvent(got)) = client.object(reply.copy_handles[0]) else {
             panic!("no event handle");
