@@ -5,13 +5,16 @@
 //! Data is written as it arrives, a bounded chunk at a time, straight to the bytes the transfer
 //! covers: nothing around them is read back, and no buffer grows with the transfer size. The
 //! renderer is told about every chunk as it is written, so a transfer the guest abandons halfway
-//! leaves no written range unreported.
+//! leaves no written range unreported. A block-linear chunk's tiled span also holds bytes the
+//! chunk does not write, so that span is flushed from the renderer first: invalidating it then
+//! loses nothing.
 
 use lichii_common::GpuVAddr;
 use lichii_texture::block_linear::Tiling;
 
 use super::EngineContext;
 pub use super::maxwell_3d::regs::{UploadRegisters, UploadRegistersDest};
+use crate::gmmu::RangeTarget;
 
 /// Bytes buffered before they are written to GPU memory.
 const CHUNK_BYTES: usize = 0x1000;
@@ -121,16 +124,31 @@ impl Upload {
                     layout: ctx.gob_layout,
                     ..tiling
                 };
+                let row = y + self.line;
+                let first_x = x + self.column as u32;
+                let last_x = first_x + self.chunk.len() as u32 - 1;
+                let (first, end) = (first_x..=last_x)
+                    .step_by(UNIT_BYTES)
+                    .chain([last_x])
+                    .map(|byte_x| tiling.offset(byte_x, row, z) as u64)
+                    .fold((u64::MAX, 0), |(lo, hi), offset| {
+                        (
+                            lo.min(offset & !(UNIT_BYTES as u64 - 1)),
+                            hi.max((offset | (UNIT_BYTES as u64 - 1)) + 1),
+                        )
+                    });
+                let span = self.address + first;
+                ctx.memory.for_each_range(span, end - first, |range| {
+                    if let RangeTarget::Device(daddr) = range.target {
+                        ctx.rasterizer.flush_region(daddr, range.size);
+                    }
+                });
                 let mut done = 0;
-                let mut first = u64::MAX;
-                let mut end = 0;
                 while done < self.chunk.len() {
-                    let byte_x = x + (self.column + done) as u32;
+                    let byte_x = first_x + done as u32;
                     let len =
                         (UNIT_BYTES - byte_x as usize % UNIT_BYTES).min(self.chunk.len() - done);
-                    let offset = tiling.offset(byte_x, y + self.line, z) as u64;
-                    first = first.min(offset);
-                    end = end.max(offset + len as u64);
+                    let offset = tiling.offset(byte_x, row, z) as u64;
                     if let Err(fault) = ctx
                         .memory
                         .write_block(self.address + offset, &self.chunk[done..done + len])
@@ -139,12 +157,8 @@ impl Upload {
                     }
                     done += len;
                 }
-                ctx.rasterizer.inline_written(
-                    ctx.channel,
-                    ctx.memory,
-                    self.address + first,
-                    end - first,
-                );
+                ctx.rasterizer
+                    .inline_written(ctx.channel, ctx.memory, span, end - first);
             }
             Target::Discard => {}
         }
