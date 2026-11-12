@@ -243,8 +243,14 @@ impl UiRenderer {
         texture.sampler = sampler;
         let size = width as u64 * height as u64 * 4;
         let slice = staging.alloc(scheduler, size, 4)?;
-        for (dst, pixel) in slice.data.chunks_exact_mut(4).zip(&image.pixels) {
-            dst.copy_from_slice(&pixel.to_array());
+        for (dst, pixel) in slice
+            .data
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(&image.pixels)
+        {
+            *dst = pixel.to_array();
         }
         let (buffer, offset) = (slice.buffer, slice.offset);
         let [x, y] = delta.pos.unwrap_or([0, 0]);
@@ -373,7 +379,9 @@ impl UiRenderer {
             let vertex_bytes = &mut vertices.1
                 [vertex_base * VERTEX_SIZE..(vertex_base + mesh.vertices.len()) * VERTEX_SIZE];
             for (dst, v) in vertex_bytes
-                .chunks_exact_mut(VERTEX_SIZE)
+                .as_chunks_mut::<VERTEX_SIZE>()
+                .0
+                .iter_mut()
                 .zip(&mesh.vertices)
             {
                 dst[0..4].copy_from_slice(&v.pos.x.to_ne_bytes());
@@ -383,8 +391,13 @@ impl UiRenderer {
                 dst[16..20].copy_from_slice(&v.color.to_array());
             }
             let index_bytes = &mut indices.1[index_base * 4..(index_base + mesh.indices.len()) * 4];
-            for (dst, i) in index_bytes.chunks_exact_mut(4).zip(&mesh.indices) {
-                dst.copy_from_slice(&i.to_ne_bytes());
+            for (dst, i) in index_bytes
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(&mesh.indices)
+            {
+                *dst = i.to_ne_bytes();
             }
             let first_index = index_base;
             let base_vertex = vertex_base;

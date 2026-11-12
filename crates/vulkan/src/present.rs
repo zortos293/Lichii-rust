@@ -83,7 +83,7 @@ impl Viewport {
 
 /// A host image holding one finished guest frame, in SHADER_READ_ONLY_OPTIMAL layout.
 pub(crate) struct FrameImage {
-    pub(crate) _image: Image,
+    pub(crate) image: Image,
     pub(crate) view: ImageView,
 }
 
@@ -112,7 +112,7 @@ impl FrameMailbox {
         *self.latest.lock() = Some(frame);
     }
 
-    fn latest(&self) -> Option<GuestFrame> {
+    pub(crate) fn latest(&self) -> Option<GuestFrame> {
         self.latest.lock().clone()
     }
 }
@@ -890,10 +890,7 @@ fn upload_image(
         ImageAccess::TRANSFER_DST,
         ImageAccess::SHADER_READ,
     );
-    Ok(FrameImage {
-        _image: image,
-        view,
-    })
+    Ok(FrameImage { image, view })
 }
 
 #[cfg(test)]
@@ -921,7 +918,13 @@ mod tests {
             }
             let surface = Surface::headless(&instance).ok()?;
             let device =
-                Device::new(instance, &GraphicsSettings::default(), Some(surface.raw())).ok()?;
+                match Device::new(instance, &GraphicsSettings::default(), Some(surface.raw())) {
+                    Ok(device) => device,
+                    Err(error) => {
+                        eprintln!("skipping: {error}");
+                        return None;
+                    }
+                };
             let swapchain = Swapchain::new(
                 &device,
                 surface,
