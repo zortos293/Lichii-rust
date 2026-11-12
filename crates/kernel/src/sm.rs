@@ -141,10 +141,12 @@ impl ServiceManager {
         ResultCode::SUCCESS
     }
 
-    /// Drops every waiting request (their clients get `SessionClosed`).
-    pub(crate) fn clear_waiting(&self) {
-        let waiting = std::mem::take(&mut self.registry.lock().waiting);
-        drop(waiting);
+    /// Drops every service and waiting request (their clients get `SessionClosed`). Service
+    /// factories usually hold the services' shared state, which holds the kernel, so shutdown
+    /// breaks that cycle here.
+    pub(crate) fn clear(&self) {
+        let registry = std::mem::take(&mut *self.registry.lock());
+        drop(registry);
     }
 
     /// The handler of one `sm:` session.
