@@ -655,15 +655,16 @@ impl TextureCache {
             size,
         }]);
         let mut ids = std::mem::take(&mut self.ids);
-        let result = ids.iter().try_for_each(|&id| {
+        let mut result = Ok(());
+        for &id in &ids {
             if self.image(id).gpu_modified {
-                self.download(tx, id, Some((daddr, daddr.saturating_add(size))))?;
+                let written_back = self.download(tx, id, Some((daddr, daddr.saturating_add(size))));
+                result = result.and(written_back);
             }
             let image = self.image(id);
             image.cpu_dirty = true;
             image.gpu_modified = false;
-            Ok(())
-        });
+        }
         ids.clear();
         self.ids = ids;
         result
