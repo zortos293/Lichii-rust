@@ -10,3 +10,4 @@ lichii-fs.workspace = true
 lichii-crypto.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+lz4_flex = "0.14"

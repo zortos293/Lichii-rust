@@ -338,8 +338,7 @@ impl Exec<'_> {
             }
             Inst::SimdFp { word } => match simd::execute(self.ctx, word) {
                 Some(Ok(())) => {}
-                Some(Err(halt)) => return Err(halt),
-                None => {
+                Some(Err(_)) | None => {
                     return Err(self.fault(CpuFault::Undefined {
                         pc,
                         instruction: word,

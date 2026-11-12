@@ -14,6 +14,7 @@
 //! one flag test per group.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use lichii_common::{DAddr, GpuVAddr};
 use lichii_memory::DeviceAddressSpace;
@@ -263,13 +264,21 @@ impl FenceAction {
                 signed,
                 payload,
             } => {
-                let result = handles.device.read::<u32>(address).and_then(|old| {
-                    handles
-                        .device
-                        .write(address, op.apply(old, payload, signed))
-                });
-                if let Err(fault) = result {
-                    tracing::warn!(?fault, "semaphore reduction on unmapped device memory");
+                let Some(word) = semaphore_word(&handles.device, address) else {
+                    tracing::warn!(
+                        address,
+                        "semaphore reduction on unmapped or unaligned memory"
+                    );
+                    return;
+                };
+                let mut old = word.load(Ordering::Acquire);
+                while let Err(current) = word.compare_exchange_weak(
+                    old,
+                    op.apply(old, payload, signed),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    old = current;
                 }
             }
             Self::IncrementSyncpoint(id) => {
@@ -417,6 +426,19 @@ pub trait Rasterizer: Send {
     fn present(&mut self, framebuffer: &FramebufferConfig);
 }
 
+/// The 32-bit semaphore at `address` as an atomic, so reductions running on different threads
+/// never lose an update.
+fn semaphore_word(device: &DeviceAddressSpace, address: DAddr) -> Option<&AtomicU32> {
+    if !address.is_multiple_of(4) {
+        return None;
+    }
+    let ptr = device.translate(address)?;
+    // SAFETY: `translate` points into a mapped page of guest memory that outlives `device`; the
+    // aligned word lies inside that page, and guest memory is only accessed as plain bytes or
+    // atomics, never through Rust references.
+    Some(unsafe { AtomicU32::from_ptr(ptr.cast()) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,5 +501,26 @@ mod tests {
         }
         .execute(&h);
         assert_eq!(h.device.read::<u32>(0x10_0000).unwrap(), 15);
+    }
+
+    #[test]
+    fn concurrent_reductions_lose_no_update() {
+        let (_space, h) = handles();
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..1000 {
+                        FenceAction::ReduceSemaphore {
+                            address: 0x10_0004,
+                            op: Reduction::Add,
+                            signed: false,
+                            payload: 1,
+                        }
+                        .execute(&h);
+                    }
+                });
+            }
+        });
+        assert_eq!(h.device.read::<u32>(0x10_0004).unwrap(), 4000);
     }
 }
