@@ -9,6 +9,7 @@ use crate::info::{Interpolation, StorageBufferDescriptor, StorageWriteExtent};
 use crate::ir::{Attribute, Opcode, Program, SyntaxNode};
 use crate::maxwell::flow::MaxwellFlow;
 use crate::maxwell::header::{OutputTopology, PixelImap, ProgramHeader};
+use crate::maxwell::passthrough::{lower_geometry_passthrough, output_topology_vertices};
 use crate::maxwell::translate::translate_block;
 use crate::opt;
 use crate::profile::HostTranslateInfo;
@@ -45,9 +46,73 @@ pub fn translate(
     env: &dyn ShaderEnvironment,
     options: TranslateOptions<'_>,
 ) -> Result<TranslatedProgram, TranslateError> {
+    translate_into(env, options, Program::new())
+}
+
+/// Translates a VertexA and VertexB pair into one VertexB program in which A runs first and
+/// falls through into B. B's descriptors and storage buffers join A's, which keep their indices.
+pub fn translate_dual_vertex(
+    env_a: &dyn ShaderEnvironment,
+    env_b: &dyn ShaderEnvironment,
+    options: TranslateOptions<'_>,
+) -> Result<TranslatedProgram, TranslateError> {
+    let TranslatedProgram {
+        mut ir,
+        mut info,
+        local_memory_size,
+        ..
+    } = translate(env_a, options)?;
+    opt::vertex_a_transform(&mut ir);
+    let a_syntax = std::mem::take(&mut ir.syntax_list);
+    let a_blocks = std::mem::take(&mut ir.block_order);
+    let a_post_order = std::mem::take(&mut ir.post_order);
+    let mut b = translate_into(env_b, options, ir)?;
+    opt::vertex_b_transform(&mut b.ir);
+    for (a, b) in info.loads.0.iter_mut().zip(b.info.loads.0) {
+        *a |= b;
+    }
+    for (a, b) in info.stores.0.iter_mut().zip(b.info.stores.0) {
+        *a |= b;
+    }
+    let storage_bindings = opt::join_storage_info(
+        &mut info,
+        &b.info,
+        opt::storage_buffer_limit(options.profile),
+    )?;
+    let descriptors = opt::join_texture_info(&mut info, &b.info);
+    opt::remap_texture_descriptors(&mut b.ir, &descriptors);
+    opt::remap_storage_bindings(&mut b.ir, &storage_bindings);
+
+    let ir = &mut b.ir;
+    let mut syntax: Vec<SyntaxNode> = a_syntax
+        .into_iter()
+        .filter(|n| *n != SyntaxNode::Return)
+        .collect();
+    syntax.append(&mut ir.syntax_list);
+    ir.syntax_list = syntax;
+    let mut blocks = a_blocks;
+    blocks.append(&mut ir.block_order);
+    ir.block_order = blocks;
+    ir.post_order.extend(a_post_order);
+    opt::dead_code_elimination(ir);
+    if cfg!(debug_assertions) {
+        opt::verify(ir).map_err(TranslateError::InvalidIr)?;
+    }
+    opt::collect_shader_info(env_b, ir, &mut info);
+    b.info = info;
+    b.local_memory_size = b.local_memory_size.max(local_memory_size);
+    Ok(b)
+}
+
+/// Translates into `ir`, whose syntax list and block lists must be empty; instructions and
+/// blocks already in its arena stay untouched.
+fn translate_into(
+    env: &dyn ShaderEnvironment,
+    options: TranslateOptions<'_>,
+    mut ir: Program,
+) -> Result<TranslatedProgram, TranslateError> {
     let host = options.host.clone().with_descriptor_limits();
     let stage = env.stage();
-    let mut ir = Program::new();
     build(env, &host, &mut ir)?;
     let mut program = TranslatedProgram {
         ir,
@@ -82,6 +147,20 @@ pub fn translate(
                         .info
                         .passthrough
                         .set(Attribute(i as u16), passthrough);
+                }
+                if !host.support_geometry_shader_passthrough {
+                    let copied = Attribute::POSITION_X.0
+                        ..Attribute::GENERIC_0_X.0 + Attribute::NUM_GENERICS * 4;
+                    for i in (0..mask.len() as u16 * 32).filter(|i| !copied.contains(i)) {
+                        program.info.passthrough.set(Attribute(i), false);
+                    }
+                    program.output_vertices = output_topology_vertices(program.output_topology);
+                    lower_geometry_passthrough(
+                        &mut program.ir,
+                        &program.info,
+                        program.output_vertices,
+                        &host,
+                    );
                 }
             }
         }
@@ -325,6 +404,37 @@ mod tests {
             ..HostTranslateInfo::default()
         };
         translate(env, options(&Profile::default(), &host))
+    }
+
+    fn shared_store(offset: u64, value: u64) -> [u64; 2] {
+        [
+            encode(Sass::Mov32i, PT | (value << 20) | (0xf << 12) | 1),
+            encode(Sass::Sts, PT | (4 << 48) | (offset << 20) | (0xff << 8) | 1),
+        ]
+    }
+
+    #[test]
+    fn dual_vertex_programs_merge_with_a_first() {
+        let program = |stage, offset, value| {
+            let [mov, sts] = shared_store(offset, value);
+            let mut env = TestEnv::new(&[mov, sts, encode(Sass::Exit, PT | 0xf)]);
+            env.stage = stage;
+            env
+        };
+        let a = program(ShaderStage::VertexA, 0x10, 5);
+        let b = program(ShaderStage::VertexB, 0x20, 7);
+        let host = HostTranslateInfo::default();
+        let merged =
+            translate_dual_vertex(&a, &b, options(&Profile::default(), &host)).expect("merge");
+        let dump = merged.ir.dump();
+        let first = dump.find("WriteSharedU32 #0x10, #0x5").expect(&dump);
+        let second = dump.find("WriteSharedU32 #0x20, #0x7").expect(&dump);
+        assert!(first < second, "{dump}");
+        assert_eq!(dump.matches("Prologue").count(), 1, "{dump}");
+        assert_eq!(dump.matches("Epilogue").count(), 1, "{dump}");
+        assert_eq!(dump.matches("return").count(), 1, "{dump}");
+        assert_eq!(merged.stage, ShaderStage::VertexB);
+        opt::verify(&merged.ir).expect("valid IR");
     }
 
     #[test]
