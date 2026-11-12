@@ -375,9 +375,15 @@ impl Program {
         }
     }
 
-    /// Unlinks an instruction from its block. It must have no uses left.
+    /// Invalidates an instruction and unlinks it from its block. It must have no uses left.
     pub fn remove(&mut self, id: InstId) {
         self.invalidate(id);
+        self.unlink(id);
+    }
+
+    /// Unlinks an instruction from its block, keeping its opcode and arguments so values that
+    /// still point at it (an identity being forwarded) stay meaningful.
+    pub fn unlink(&mut self, id: InstId) {
         let Inst {
             prev, next, block, ..
         } = self.insts[id.0 as usize];

@@ -70,7 +70,7 @@ mod surface_atomic_operations;
 mod surface_load_store;
 mod tensor_mul_add;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod texture_fetch;
 mod texture_fetch_swizzled;
 mod texture_gather;
