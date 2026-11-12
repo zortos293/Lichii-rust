@@ -411,14 +411,15 @@ impl Dispatch<'_> {
 
     /// An acquire the word in memory does not meet yet may be met by a release still queued for
     /// the back: drain it and look again, then suspend the channel (NX2_NOTES row 50). The
-    /// channel waits from before the drain, so a release that lands and is overwritten before the
-    /// second look still latches it.
+    /// channel waits from before its first look, so a release that lands and is overwritten at
+    /// any point before the second look still latches it.
     fn acquire(&mut self, address: GpuVAddr, payload: u64, op: AcquireOp, wide: bool) -> Flow {
-        if semaphore_met(self.memory, address, payload, op, wide) {
-            return Flow::Continue;
-        }
         if let Some(device) = self.memory.translate(address) {
             self.shared.waiters.add(self.id, device, payload, op, wide);
+        }
+        if semaphore_met(self.memory, address, payload, op, wide) {
+            self.shared.waiters.remove(self.id);
+            return Flow::Continue;
         }
         self.shared.stream.drain();
         if semaphore_met(self.memory, address, payload, op, wide) {
