@@ -18,6 +18,13 @@ const UNKNOWN: ResultCode = ResultCode(u32::MAX);
 /// `nn::am::service::LaunchParameterKind::UserChannel`.
 const USER_CHANNEL: u32 = 1;
 
+/// `FileSys::SaveDataType` values `GetSaveDataSize` answers from the NACP.
+const ACCOUNT_SAVE: u8 = 1;
+const DEVICE_SAVE: u8 = 3;
+
+/// Largest storage `CreateStorage` makes; applet arguments are a few KiB to a few MiB.
+const MAX_STORAGE_SIZE: i64 = 64 << 20;
+
 pub(super) struct ApplicationFunctions {
     pub context: Arc<ServiceContext>,
     pub applet: Arc<Applet>,
@@ -83,10 +90,18 @@ impl Service for ApplicationFunctions {
                 ResultCode::SUCCESS
             }
             26 => {
-                ctx.push([
-                    nacp.map_or(0, |nacp| nacp.user_account_save_data_size()),
-                    nacp.map_or(0, |nacp| nacp.user_account_save_data_journal_size()),
-                ]);
+                let sizes = match (ctx.pop::<u8>(), nacp) {
+                    (ACCOUNT_SAVE, Some(nacp)) => [
+                        nacp.user_account_save_data_size(),
+                        nacp.user_account_save_data_journal_size(),
+                    ],
+                    (DEVICE_SAVE, Some(nacp)) => [
+                        nacp.device_save_data_size(),
+                        nacp.device_save_data_journal_size(),
+                    ],
+                    _ => [0, 0],
+                };
+                ctx.push(sizes);
                 ResultCode::SUCCESS
             }
             27 => {
@@ -167,10 +182,16 @@ impl Service for LibraryAppletCreator {
         Some(match ctx.command() {
             10 => {
                 let size: i64 = ctx.pop();
-                if size <= 0 {
+                if size <= 0 || size > MAX_STORAGE_SIZE {
+                    tracing::warn!(size, "storage size out of range");
                     return Some(UNKNOWN);
                 }
-                push_storage(&self.context, ctx, vec![0; size as usize])
+                let mut data = Vec::new();
+                if data.try_reserve_exact(size as usize).is_err() {
+                    return Some(UNKNOWN);
+                }
+                data.resize(size as usize, 0);
+                push_storage(&self.context, ctx, data)
             }
             _ => return None,
         })
@@ -208,9 +229,11 @@ enum ApplicationLanguage {
     TraditionalChinese = 13,
     SimplifiedChinese = 14,
     BrazilianPortuguese = 15,
+    Polish = 16,
+    Thai = 17,
 }
 
-const APPLICATION_LANGUAGES: [ApplicationLanguage; 16] = {
+const APPLICATION_LANGUAGES: [ApplicationLanguage; 18] = {
     use ApplicationLanguage::*;
     [
         AmericanEnglish,
@@ -229,6 +252,8 @@ const APPLICATION_LANGUAGES: [ApplicationLanguage; 16] = {
         TraditionalChinese,
         SimplifiedChinese,
         BrazilianPortuguese,
+        Polish,
+        Thai,
     ]
 };
 
@@ -283,6 +308,8 @@ fn language_code(language: ApplicationLanguage) -> u64 {
         A::TraditionalChinese => b"zh-Hant",
         A::SimplifiedChinese => b"zh-Hans",
         A::BrazilianPortuguese => b"pt-BR",
+        A::Polish => b"pl",
+        A::Thai => b"th",
     };
     let mut bytes = [0u8; 8];
     bytes[..code.len()].copy_from_slice(code);
@@ -312,6 +339,10 @@ mod tests {
             A::BritishEnglish
         );
         assert_eq!(desired_language(Language::French, 1 << 12), A::Korean);
+        assert_eq!(
+            desired_language(Language::AmericanEnglish, 1 << 17),
+            A::Thai
+        );
         assert_eq!(
             language_code(A::AmericanEnglish),
             u64::from_le_bytes(*b"en-US\0\0\0")

@@ -203,3 +203,16 @@ fn fatal_sections_must_balance() {
         ResultCode::SUCCESS
     );
 }
+
+#[test]
+fn lock_accessors_start_free_with_their_event_signaled() {
+    let (_context, client, proxy) = booted(SWITCH1_TITLE);
+    let state = interface(&client, proxy, 0);
+    let lock = interface(&client, state, 30);
+    let reply = client.send(lock, &Request::new(3)).unwrap();
+    assert!(event_signaled(&client, reply.copy_handles[0]));
+    let mut reply = client.send(lock, &Request::new(1).arg(0u8)).unwrap();
+    assert_eq!(reply.pop::<u8>(), 1, "acquired");
+    let mut reply = client.send(lock, &Request::new(1).arg(0u8)).unwrap();
+    assert_eq!(reply.pop::<u8>(), 0, "already held");
+}
