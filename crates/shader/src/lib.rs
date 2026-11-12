@@ -122,6 +122,15 @@ pub trait ShaderEnvironment {
     fn gp_passthrough_mask(&self) -> [u32; 8] {
         [0; 8]
     }
+    /// Draw parameter that HLE macros store in constant buffer `bank` at `offset`, if any.
+    fn replace_const_buffer(&self, _bank: u32, _offset: u32) -> Option<info::ReplaceConstant> {
+        None
+    }
+    /// Whether the host runs NVIDIA's proprietary driver, for which constant propagation folds
+    /// driver constant buffer (bank 1) reads to immediates.
+    fn is_proprietary_driver(&self) -> bool {
+        false
+    }
 }
 
 /// A translated program.

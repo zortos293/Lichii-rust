@@ -447,3 +447,11 @@ pub enum TexturePixelFormat {
     S8UintD24Unorm,
     D32FloatS8Uint,
 }
+
+/// Draw parameter a constant buffer word holds when HLE macros replaced it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReplaceConstant {
+    BaseInstance,
+    BaseVertex,
+    DrawId,
+}
