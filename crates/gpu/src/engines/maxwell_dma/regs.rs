@@ -131,6 +131,14 @@ pub struct PackedGpuvAddr {
     pub lower: u32,
 }
 
+impl PackedGpuvAddr {
+    /// The GPU virtual address the two words hold.
+    #[inline]
+    pub fn address(&self) -> u64 {
+        (u64::from(self.upper) << 32) | u64::from(self.lower)
+    }
+}
+
 const _: () = assert!(core::mem::size_of::<PackedGpuvAddr>() == 0x8);
 
 #[repr(C)]

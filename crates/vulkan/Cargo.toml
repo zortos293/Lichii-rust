@@ -19,3 +19,6 @@ parking_lot.workspace = true
 raw-window-handle.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+lichii-memory.workspace = true

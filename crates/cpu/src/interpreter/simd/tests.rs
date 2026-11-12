@@ -206,7 +206,15 @@ impl Harness {
     /// Runs `instruction` from `ctx` in Unicorn and through `execute` and panics with both
     /// states on any difference.
     pub(super) fn check(&mut self, instruction: u32, ctx: &ThreadContext) {
-        let expected = self.reference(instruction, ctx);
+        if qemu_aborts(instruction) {
+            let mut ours = ctx.clone();
+            assert!(
+                matches!(execute(&mut ours, instruction), Some(Err(_))),
+                "{instruction:#010x} is unallocated"
+            );
+            return;
+        }
+        let mut expected = self.reference(instruction, ctx);
         let mut ours = ctx.clone();
         let actual = match execute(&mut ours, instruction) {
             Some(Ok(())) => Outcome::Executed {
@@ -218,6 +226,12 @@ impl Harness {
             Some(Err(HaltReason::Fault(_))) => Outcome::Undefined,
             other => panic!("{instruction:#010x}: unexpected {other:?}"),
         };
+        if qemu_computes_hidden_lanes(instruction)
+            && let (Outcome::Executed { fpsr: theirs, .. }, Outcome::Executed { fpsr: ours, .. }) =
+                (&mut expected, &actual)
+        {
+            *theirs = *ours;
+        }
         if expected != actual {
             panic!(
                 "{}",
@@ -228,14 +242,79 @@ impl Harness {
 
     /// Checks `count` random instances of `base` with the bits in `random` filled at random.
     pub(super) fn fuzz(&mut self, base: u32, random: u32, count: usize) {
-        for _ in 0..count {
+        self.fuzz_where(base, random, count, |_| true);
+    }
+
+    /// Like [`Harness::fuzz`], skipping the instructions `keep` rejects.
+    pub(super) fn fuzz_where(
+        &mut self,
+        base: u32,
+        random: u32,
+        count: usize,
+        keep: impl Fn(u32) -> bool,
+    ) {
+        let mut checked = 0;
+        while checked < count {
             let instruction = base | (self.rng.next() as u32 & random);
+            if !keep(instruction) {
+                continue;
+            }
             let ctx = self.random_context();
             if !unicorn_deviates(instruction, &ctx) {
                 self.check(instruction, &ctx);
             }
+            checked += 1;
         }
     }
+}
+
+/// Unallocated encodings on which QEMU 5.0 hits `g_assert_not_reached` and aborts the process
+/// instead of raising an undefined-instruction exception.
+fn qemu_aborts(instruction: u32) -> bool {
+    let fp16_three_same =
+        instruction & 0x9f60_c400 == 0x0e40_0400 || instruction & 0xdf60_c400 == 0x5e40_0400;
+    let key = (
+        (instruction >> 29) & 1,
+        (instruction >> 23) & 1,
+        (instruction >> 11) & 7,
+    );
+    let three_same_unallocated = matches!(
+        key,
+        (0, 0, 0b101) | (0, 1, 0b011..=0b101) | (1, _, 0b001) | (1, 1, 0b011 | 0b111)
+    );
+    let fp16_two_misc =
+        instruction & 0x9f7e_0c00 == 0x0e78_0800 || instruction & 0xdf7e_0c00 == 0x5e78_0800;
+    let key = (
+        (instruction >> 29) & 1,
+        (instruction >> 23) & 1,
+        (instruction >> 12) & 0x1f,
+    );
+    let two_misc_allocated = if instruction & (1 << 28) == 0 {
+        matches!(
+            key,
+            (_, 0, 0b11000..=0b11101)
+                | (0, 1, 0b01100..=0b01111 | 0b11000..=0b11011 | 0b11101)
+                | (1, 1, 0b01100 | 0b01101 | 0b01111 | 0b11001..=0b11011 | 0b11101 | 0b11111)
+        )
+    } else {
+        matches!(
+            key,
+            (_, 0, 0b11010..=0b11101)
+                | (
+                    0,
+                    1,
+                    0b01100..=0b01110 | 0b11010 | 0b11011 | 0b11101 | 0b11111
+                )
+                | (1, 1, 0b01100 | 0b01101 | 0b11010 | 0b11011 | 0b11101)
+        )
+    };
+    (fp16_three_same && three_same_unallocated) || (fp16_two_misc && !two_misc_allocated)
+}
+
+/// FCMLA (by element, half precision) with Q = 0: QEMU 5 also computes the upper four lanes and
+/// raises their FPSR flags before discarding them, so only the registers are comparable.
+fn qemu_computes_hidden_lanes(instruction: u32) -> bool {
+    instruction & 0xffc0_9400 == 0x2f40_1000
 }
 
 /// Cases where Unicorn (QEMU 5.0) disagrees with the Arm ARM pseudocode, which we follow.
@@ -244,7 +323,18 @@ fn unicorn_deviates(instruction: u32, ctx: &ThreadContext) -> bool {
     let rn = ctx.v[((instruction >> 5) & 31) as usize] as u64;
     let positive_denormal = rn >> 52 == 0 && rn != 0;
     // FJCVTZS of a positive denormal under FZ: FPToFixedJS clears Z, QEMU 5 sets it.
-    instruction & 0xffff_fc00 == 0x1e7e_0000 && fz && positive_denormal
+    let fjcvtzs = instruction & 0xffff_fc00 == 0x1e7e_0000 && fz && positive_denormal;
+    // Modified immediate with op = 1, cmode = 1111, o2 = 1 is unallocated; QEMU 5 runs it as
+    // FMOV (vector, immediate) double precision.
+    let fmov_o2 = instruction & 0xbff8_fc00 == 0x2f00_fc00;
+    // Scalar FCVTZS (fixed point) to a half-precision register: QEMU 5 sign-extends the 16-bit
+    // result into 32 bits instead of clearing the rest of the register.
+    let fcvtzs_h = instruction & 0xff70_fc00 == 0x5f10_fc00;
+    // The half-precision FP reductions (U = 0) need size<0> = 0; QEMU 5 ignores it.
+    let half_reduction_sz = (instruction & 0x9f7e_0c00 == 0x0e70_0800
+        || instruction & 0xdf7e_0c00 == 0x5e70_0800)
+        && matches!((instruction >> 12) & 0x1f, 0b01100 | 0b01101 | 0b01111);
+    fjcvtzs || fmov_o2 || fcvtzs_h || half_reduction_sz
 }
 
 fn x_register(i: usize) -> i32 {
@@ -401,4 +491,201 @@ fn half_precision_conversions_are_exhaustive() {
             convert::<16, 64>(bits, Rounding::TieEven, &mut env) as u128 ^ (h.rng.below(4) as u128);
         h.check(0x1e63_c020, &ctx);
     }
+}
+
+const Q: u32 = 1 << 30;
+const U: u32 = 1 << 29;
+const SIZE: u32 = 3 << 22;
+const RM: u32 = 0x1f << 16;
+
+fn fuzz_where(seed: u64, base: u32, random: u32, keep: impl Fn(u32) -> bool) {
+    Harness::new(seed).fuzz_where(base, random, ITERATIONS, keep);
+}
+
+fn field(instruction: u32, hi: u32, lo: u32) -> u32 {
+    (instruction >> lo) & ((1 << (hi - lo + 1)) - 1)
+}
+
+fn integer_three_same(i: u32) -> bool {
+    field(i, 15, 11) < 0b11000
+}
+
+fn integer_two_misc(i: u32) -> bool {
+    let opcode = field(i, 16, 12);
+    opcode <= 0b01011 || (0b10010..=0b10100).contains(&opcode)
+}
+
+fn integer_indexed(i: u32) -> bool {
+    let u = i & U != 0;
+    matches!(
+        (field(i, 15, 12), u),
+        (0b0010 | 0b0110 | 0b1010 | 0b1110, _)
+            | (0b0011 | 0b0111 | 0b1011 | 0b1100 | 0b1101 | 0b1000, false)
+            | (0b0000 | 0b0100 | 0b1101 | 0b1111, true)
+    )
+}
+
+#[test]
+fn advsimd_three_same_integer() {
+    fuzz_where(
+        20,
+        0x0e20_0400,
+        Q | U | SIZE | RM | (0x1f << 11) | RD_RN,
+        integer_three_same,
+    );
+    fuzz_where(
+        21,
+        0x5e20_0400,
+        U | SIZE | RM | (0x1f << 11) | RD_RN,
+        integer_three_same,
+    );
+}
+
+#[test]
+fn advsimd_three_different() {
+    fuzz(22, 0x0e20_0000, Q | U | SIZE | RM | (0xf << 12) | RD_RN);
+    fuzz(23, 0x5e20_0000, U | SIZE | RM | (0xf << 12) | RD_RN);
+}
+
+#[test]
+fn advsimd_three_same_extra_integer() {
+    let keep = |i: u32| field(i, 14, 11) < 0b1000;
+    fuzz_where(
+        24,
+        0x0e00_8400,
+        Q | U | SIZE | RM | (0xf << 11) | RD_RN,
+        keep,
+    );
+    fuzz_where(25, 0x5e00_8400, U | SIZE | RM | (0xf << 11) | RD_RN, keep);
+}
+
+#[test]
+fn advsimd_two_register_misc_integer() {
+    fuzz_where(
+        26,
+        0x0e20_0800,
+        Q | U | SIZE | (0x1f << 12) | RD_RN,
+        integer_two_misc,
+    );
+    fuzz_where(
+        27,
+        0x5e20_0800,
+        U | SIZE | (0x1f << 12) | RD_RN,
+        integer_two_misc,
+    );
+}
+
+#[test]
+fn advsimd_across_lanes_and_pairwise_integer() {
+    let keep = |i: u32| !matches!(field(i, 16, 12), 0b01100 | 0b01101 | 0b01111);
+    fuzz_where(28, 0x0e30_0800, Q | U | SIZE | (0x1f << 12) | RD_RN, keep);
+    fuzz_where(29, 0x5e30_0800, U | SIZE | (0x1f << 12) | RD_RN, keep);
+}
+
+#[test]
+fn advsimd_shift_by_immediate() {
+    fuzz(30, 0x0f00_0400, Q | U | (0x7f << 16) | (0x1f << 11) | RD_RN);
+    fuzz(31, 0x5f00_0400, U | (0x7f << 16) | (0x1f << 11) | RD_RN);
+}
+
+#[test]
+fn advsimd_modified_immediate() {
+    fuzz(32, 0x0f00_0400, Q | U | (7 << 16) | (0x1f << 11) | RD_RN);
+}
+
+#[test]
+fn advsimd_copy() {
+    fuzz(33, 0x0e00_0400, Q | U | RM | (0xf << 11) | RD_RN);
+    fuzz(34, 0x5e00_0400, U | RM | (0xf << 11) | RD_RN);
+}
+
+#[test]
+fn advsimd_permute_extract_table() {
+    fuzz(35, 0x0e00_0800, Q | SIZE | RM | (7 << 12) | RD_RN);
+    fuzz(36, 0x2e00_0000, Q | SIZE | RM | (0xf << 11) | RD_RN);
+    fuzz(37, 0x0e00_0000, Q | SIZE | RM | (7 << 12) | RD_RN);
+}
+
+#[test]
+fn advsimd_indexed_integer() {
+    let random = U | SIZE | (3 << 20) | (0xf << 16) | (0xf << 12) | (1 << 11) | RD_RN;
+    fuzz_where(38, 0x0f00_0000, Q | random, integer_indexed);
+    fuzz_where(39, 0x5f00_0000, random, integer_indexed);
+}
+
+#[test]
+fn switch2_sdk_integer_encodings_execute() {
+    let mut h = Harness::new(40);
+    for instruction in [0x4ea0_5c42, 0x0f41_3044] {
+        for _ in 0..200 {
+            let ctx = h.random_context();
+            h.check(instruction, &ctx);
+            let mut ours = ctx.clone();
+            assert_eq!(
+                execute(&mut ours, instruction),
+                Some(Ok(())),
+                "{instruction:#010x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn advsimd_three_same_fp() {
+    let random = U | SIZE | RM | (7 << 11) | RD_RN;
+    fuzz(41, 0x0e20_c400, Q | random);
+    fuzz(42, 0x5e20_c400, random);
+}
+
+#[test]
+fn advsimd_three_same_fp16() {
+    let random = U | (1 << 23) | RM | (7 << 11) | RD_RN;
+    fuzz(43, 0x0e40_0400, Q | random);
+    fuzz(44, 0x5e40_0400, random);
+}
+
+#[test]
+fn advsimd_two_register_misc_fp() {
+    let fp = |i: u32| !integer_two_misc(i);
+    fuzz_where(45, 0x0e20_0800, Q | U | SIZE | (0x1f << 12) | RD_RN, fp);
+    fuzz_where(46, 0x5e20_0800, U | SIZE | (0x1f << 12) | RD_RN, fp);
+    fuzz(47, 0x0e78_0800, Q | U | (1 << 23) | (0x1f << 12) | RD_RN);
+    fuzz(48, 0x5e78_0800, U | (1 << 23) | (0x1f << 12) | RD_RN);
+}
+
+#[test]
+fn advsimd_across_lanes_and_pairwise_fp() {
+    let fp = |i: u32| matches!(field(i, 16, 12), 0b01100 | 0b01101 | 0b01111);
+    fuzz_where(49, 0x0e30_0800, Q | U | SIZE | (0x1f << 12) | RD_RN, fp);
+    fuzz_where(50, 0x5e30_0800, U | SIZE | (0x1f << 12) | RD_RN, fp);
+}
+
+#[test]
+fn advsimd_indexed_fp() {
+    let random = U | SIZE | (3 << 20) | (0xf << 16) | (0xf << 12) | (1 << 11) | RD_RN;
+    let fp = |i: u32| !integer_indexed(i);
+    fuzz_where(51, 0x0f00_0000, Q | random, fp);
+    fuzz_where(52, 0x5f00_0000, random, fp);
+}
+
+#[test]
+fn advsimd_complex() {
+    fuzz(53, 0x2e00_c400, Q | SIZE | RM | (7 << 11) | RD_RN);
+}
+
+#[test]
+fn switch2_sdk_fp16_by_element_executes() {
+    let mut h = Harness::new(54);
+    for _ in 0..200 {
+        let ctx = h.random_context();
+        h.check(0x5f11_9f9c, &ctx);
+        let mut ours = ctx.clone();
+        assert_eq!(execute(&mut ours, 0x5f11_9f9c), Some(Ok(())));
+    }
+}
+
+#[test]
+fn whole_simd_fp_group() {
+    let mut h = Harness::new(55);
+    h.fuzz(0x0e00_0000, 0xf1ff_ffff, 10 * ITERATIONS);
 }
