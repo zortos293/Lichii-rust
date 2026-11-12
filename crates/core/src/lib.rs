@@ -32,6 +32,8 @@ pub enum SystemError {
     Loader(#[from] LoaderError),
     #[error(transparent)]
     Kernel(#[from] KernelError),
+    #[error("the session has stopped")]
+    Stopped,
     #[error("{stage}: {code:?}")]
     Boot {
         stage: &'static str,
@@ -202,7 +204,8 @@ impl System {
                 tracing::info!("running");
             }
             State::Paused => self.resume(),
-            State::Running | State::Stopped => {}
+            State::Running => {}
+            State::Stopped => return Err(SystemError::Stopped),
         }
         Ok(())
     }

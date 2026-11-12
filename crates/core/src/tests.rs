@@ -83,6 +83,7 @@ fn boots_an_nso_and_runs_it_to_exit() {
         );
         system.stop();
         system.stop();
+        assert!(matches!(system.run(), Err(SystemError::Stopped)));
     }
 }
 
