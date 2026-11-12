@@ -61,6 +61,9 @@ fn pwrite(file: &std::fs::File, offset: u64, data: &[u8]) -> io::Result<usize> {
 
 impl File for HostFile {
     fn size(&self) -> u64 {
+        if self.writable {
+            return self.file.metadata().map_or(0, |meta| meta.len());
+        }
         self.size.load(Ordering::Relaxed)
     }
 
@@ -90,7 +93,6 @@ impl File for HostFile {
                 Err(error) => return Err(error),
             }
         }
-        self.size.fetch_max(offset + done as u64, Ordering::Relaxed);
         Ok(done)
     }
 
@@ -98,9 +100,7 @@ impl File for HostFile {
         if !self.writable {
             return Err(read_only());
         }
-        self.file.set_len(size)?;
-        self.size.store(size, Ordering::Relaxed);
-        Ok(())
+        self.file.set_len(size)
     }
 
     fn flush(&self) -> io::Result<()> {
@@ -173,8 +173,8 @@ impl File for LazyHostFile {
     }
 }
 
-/// A host directory. Names are checked to be single components, so a guest path can never
-/// escape the root. Files of a read-only directory are opened lazily (see [`HandleCache`]);
+/// A host directory. Names are checked to be single components and symbolic links (and Windows
+/// junctions) are neither listed nor followed, so a guest path can never escape the root. Files of a read-only directory are opened lazily (see [`HandleCache`]);
 /// files of a writable one are opened when looked up.
 pub struct HostDir {
     path: PathBuf,
@@ -245,6 +245,9 @@ impl Directory for HostDir {
                 continue;
             };
             let meta = entry.metadata()?;
+            if meta.file_type().is_symlink() {
+                continue;
+            }
             let kind = if meta.is_dir() {
                 EntryKind::Directory
             } else {
@@ -259,7 +262,8 @@ impl Directory for HostDir {
 
     fn open(&self, name: &str) -> io::Result<Option<Entry>> {
         let path = self.child(name)?;
-        let meta = match std::fs::metadata(&path) {
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => return Ok(None),
             Ok(meta) => meta,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
@@ -402,6 +406,37 @@ mod tests {
         let open = cache.open.lock().unwrap();
         assert_eq!(open.len(), OPEN_HANDLE_LIMIT);
         assert_eq!(open.front().unwrap().0, count as u64 - 1);
+    }
+
+    #[test]
+    fn writable_handles_agree_on_size() {
+        let temp = TempDir::new("size");
+        let root = HostDir::open_writable(&temp.0).unwrap();
+        let first = root.create_file("f", 4).unwrap();
+        let second = root.open_file("f").unwrap().unwrap();
+        second.set_size(8).unwrap();
+        assert_eq!(first.size(), 8);
+        assert_eq!(first.read_all().unwrap().len(), 8);
+        second.set_size(2).unwrap();
+        assert_eq!(first.read_all().unwrap().len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_not_followed() {
+        let temp = TempDir::new("links");
+        let outside = TempDir::new("links-outside");
+        std::fs::write(outside.0.join("secret"), b"x").unwrap();
+        std::os::unix::fs::symlink(&outside.0, temp.0.join("dir")).unwrap();
+        std::os::unix::fs::symlink(outside.0.join("secret"), temp.0.join("file")).unwrap();
+        for root in [
+            HostDir::open(&temp.0).unwrap(),
+            HostDir::open_writable(&temp.0).unwrap(),
+        ] {
+            assert!(root.entries().unwrap().is_empty());
+            assert!(root.open("dir").unwrap().is_none());
+            assert!(root.open("file").unwrap().is_none());
+        }
     }
 
     #[test]

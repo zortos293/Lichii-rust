@@ -188,7 +188,7 @@ impl RomFsDir {
                 return Ok(None);
             }
             let record = image.dir(next)?;
-            if record.parent == self.offset && record.name == name {
+            if next != self.offset && record.parent == self.offset && record.name == name {
                 return Ok(Some(next));
             }
             next = record.hash_next;
@@ -223,6 +223,9 @@ impl RomFsDir {
                 return Ok(None);
             }
             let record = self.image.dir(next)?;
+            if next == self.offset || record.parent != self.offset {
+                return Err(corrupt(FORMAT, "directory listed outside its parent").into());
+            }
             if stop(&record) {
                 return Ok(Some(next));
             }
@@ -238,6 +241,9 @@ impl RomFsDir {
                 return Ok(None);
             }
             let record = self.image.file(next)?;
+            if record.parent != self.offset {
+                return Err(corrupt(FORMAT, "file listed outside its directory").into());
+            }
             if stop(&record) {
                 return Ok(Some(next));
             }
@@ -576,6 +582,30 @@ mod tests {
         looping[file_meta + 4..file_meta + 8].copy_from_slice(&0u32.to_le_bytes());
         let root = open_romfs(&MemFile::from_bytes(looping)).unwrap();
         let _ = root.entries();
+    }
+
+    #[test]
+    fn directory_cycles_are_rejected() {
+        let image = build_romfs(&MemDir::new()).unwrap().read_all().unwrap();
+        let dir_meta = u64::from_le_bytes(image[0x18..0x20].try_into().unwrap()) as usize;
+        let mut cyclic = image.clone();
+        cyclic[dir_meta + 8..dir_meta + 12].copy_from_slice(&0u32.to_le_bytes());
+        let root = open_romfs(&MemFile::from_bytes(cyclic)).unwrap();
+        assert!(root.entries().is_err());
+        assert!(root.open("").unwrap().is_none());
+        assert!(build_romfs(root.as_ref()).is_err());
+
+        let nested =
+            build_romfs(&MemDir::new().with_dir("a", MemDir::new().with_dir("b", MemDir::new())))
+                .unwrap()
+                .read_all()
+                .unwrap();
+        let dir_meta = u64::from_le_bytes(nested[0x18..0x20].try_into().unwrap()) as usize;
+        let b = dir_meta + 2 * DIR_ENTRY_SIZE + 4;
+        let mut back_edge = nested.clone();
+        back_edge[b + 8..b + 12].copy_from_slice(&(DIR_ENTRY_SIZE as u32).to_le_bytes());
+        let root = open_romfs(&MemFile::from_bytes(back_edge)).unwrap();
+        assert!(build_romfs(root.as_ref()).is_err());
     }
 
     #[test]
