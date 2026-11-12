@@ -74,7 +74,6 @@ impl StagingRing {
                 data: buffer.mapped_mut().expect("staging memory is host visible"),
             });
         }
-        let tick = scheduler.tick();
         let start = loop {
             self.reclaim(scheduler);
             let aligned = self.head.next_multiple_of(align);
@@ -89,6 +88,7 @@ impl StagingRing {
             let (_, _, oldest) = *self.regions.front().expect("a full ring has regions");
             scheduler.wait(oldest)?;
         };
+        let tick = scheduler.tick();
         let end = start + size;
         match self.regions.back_mut() {
             Some(last) if last.2 == tick && last.1 <= start => last.1 = end,

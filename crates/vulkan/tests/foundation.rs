@@ -150,6 +150,15 @@ fn copies_through_the_scheduler_and_retires_after_completion() {
 
 #[test]
 fn staging_ring_wraps_and_waits_for_the_gpu() {
+    staging_round_trip(5);
+}
+
+#[test]
+fn staging_ring_wraps_within_one_submission() {
+    staging_round_trip(u64::MAX);
+}
+
+fn staging_round_trip(flush_every: u64) {
     let Some(device) = device() else { return };
     let mut scheduler = Scheduler::new(&device).unwrap();
     let mut ring = StagingRing::new(&device, 64 << 10).unwrap();
@@ -183,7 +192,7 @@ fn staging_ring_wraps_and_waits_for_the_gpu() {
                 .raw()
                 .cmd_copy_buffer(cmd, src, target.raw(), &region)
         };
-        if i % 5 == 4 {
+        if i % flush_every == flush_every - 1 {
             scheduler.flush().unwrap();
         }
     }

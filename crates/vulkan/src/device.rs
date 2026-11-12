@@ -1,6 +1,7 @@
 use std::ffi::{CStr, c_char};
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use ash::{ext, khr, vk};
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
@@ -131,6 +132,8 @@ pub struct Device {
     pub(crate) queue_family: u32,
     queue: Mutex<vk::Queue>,
     pub(crate) allocator: ManuallyDrop<Mutex<Allocator>>,
+    /// Bytes handed out by the allocator; it reports only block capacity cheaply.
+    pub(crate) allocated: AtomicU64,
     pub(crate) memory_properties: vk::PhysicalDeviceMemoryProperties,
 }
 
@@ -494,6 +497,7 @@ impl Device {
             queue_family: candidate.queue_family,
             queue: Mutex::new(queue),
             allocator: ManuallyDrop::new(Mutex::new(allocator)),
+            allocated: AtomicU64::new(0),
             memory_properties,
         }))
     }
