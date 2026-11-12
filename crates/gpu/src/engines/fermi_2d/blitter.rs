@@ -227,6 +227,9 @@ impl Placement {
     }
 }
 
+/// Bytes a scratch buffer keeps between blits: a 4K RGBA32F frame's worth.
+const KEEP_BYTES: usize = 3840 * 2160 * 16;
+
 /// The software blitter and its scratch buffers.
 #[derive(Default)]
 pub(super) struct SoftwareBlitter {
@@ -247,7 +250,15 @@ impl SoftwareBlitter {
         else {
             return;
         };
-        let neighbour = i32::from(job.linear_filter);
+        let unit = 1i64 << 32;
+        let whole = |start: i64| start & (unit - 1) == 0;
+        let sampling = &job.sampling;
+        let filter = job.linear_filter
+            && !(sampling.du_dx == unit
+                && sampling.dv_dy == unit
+                && whole(sampling.x0)
+                && whole(sampling.y0));
+        let neighbour = i32::from(filter);
         let clamp = |end: i32, extent: u32| match extent {
             0 => end,
             _ => end
@@ -305,16 +316,12 @@ impl SoftwareBlitter {
             y0: job.sampling.y0.wrapping_sub(origin(src_rect.y0)),
             ..job.sampling
         };
-        let unit = 1i64 << 32;
-        let whole = |start: i64| start & (unit - 1) == 0;
         let same_format = job.src_format == job.dst_format;
-        let one_to_one = (src_w, src_h) == (dst_w, dst_h)
-            && sampling.du_dx == unit
-            && sampling.dv_dy == unit
-            && (!job.linear_filter || (whole(sampling.x0) && whole(sampling.y0)));
+        let one_to_one =
+            (src_w, src_h) == (dst_w, dst_h) && sampling.du_dx == unit && sampling.dv_dy == unit;
         if same_format && one_to_one {
             std::mem::swap(&mut self.src, &mut self.dst);
-        } else if same_format && !job.linear_filter {
+        } else if same_format && !filter {
             nearest(
                 &self.src,
                 &mut self.dst,
@@ -327,7 +334,7 @@ impl SoftwareBlitter {
             self.ir_src.resize(src_w as usize * src_h as usize * 4, 0.0);
             self.ir_dst.resize(dst_w as usize * dst_h as usize * 4, 0.0);
             src_layout.decode(&self.src, &mut self.ir_src);
-            if job.linear_filter {
+            if filter {
                 bilinear(
                     &self.ir_src,
                     &mut self.ir_dst,
@@ -352,6 +359,22 @@ impl SoftwareBlitter {
         let (address, size) = dst_place.span();
         ctx.rasterizer
             .inline_written(ctx.channel, ctx.memory, address, size);
+        self.release_oversized();
+    }
+
+    /// Frees scratch buffers past [`KEEP_BYTES`]: full-frame blits reuse theirs, a rare
+    /// oversized blit does not pin its memory for the engine's lifetime.
+    fn release_oversized(&mut self) {
+        fn release<T>(buffer: &mut Vec<T>) {
+            if buffer.capacity() * size_of::<T>() > KEEP_BYTES {
+                *buffer = Vec::new();
+            }
+        }
+        release(&mut self.src);
+        release(&mut self.dst);
+        release(&mut self.tiled);
+        release(&mut self.ir_src);
+        release(&mut self.ir_dst);
     }
 }
 
@@ -569,5 +592,59 @@ mod tests {
         assert!(blitter.src.capacity() >= bytes);
         assert!(blitter.dst.capacity() >= bytes);
         assert_eq!(h.rasterizer.inline_writes.len(), 1);
+    }
+
+    #[test]
+    fn bilinear_one_to_one_copies_keep_32_bit_integers_exact() {
+        let mut h = Harness::new();
+        let surface = CopySurface {
+            address: 0,
+            width: 8,
+            height: 1,
+            depth: 1,
+            layer: 0,
+            pitch: 32,
+            block: None,
+            bytes_per_pixel: 4,
+        };
+        let words: Vec<u32> = (0..8).map(|i| 0x0100_0001 + i).collect();
+        h.memory
+            .write_block(0, bytemuck::cast_slice(&words))
+            .unwrap();
+        let rect = |x0, x1| Rect {
+            x0,
+            y0: 0,
+            x1,
+            y1: 1,
+        };
+        let job = Job {
+            src: surface,
+            dst: CopySurface {
+                address: 0x1000,
+                ..surface
+            },
+            src_format: F::R32Uint,
+            dst_format: F::R32Uint,
+            src_rect: rect(0, 4),
+            dst_rect: rect(0, 4),
+            sampling: sampling(0, 0, UNIT, UNIT),
+            linear_filter: true,
+        };
+        SoftwareBlitter::default().blit(&mut h.context(), &job);
+        let mut out = [0u32; 4];
+        h.memory
+            .read_block(0x1000, bytemuck::cast_slice_mut(&mut out))
+            .unwrap();
+        assert_eq!(out, words[..4]);
+    }
+
+    #[test]
+    fn oversized_scratch_is_released_after_the_blit() {
+        let mut blitter = SoftwareBlitter::default();
+        blitter.ir_src.reserve(KEEP_BYTES / 4 + 1);
+        blitter.src.reserve(1024);
+        blitter.release_oversized();
+        assert_eq!(blitter.ir_src.capacity(), 0);
+        assert!(blitter.src.capacity() >= 1024);
     }
 }
