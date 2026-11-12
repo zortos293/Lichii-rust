@@ -683,3 +683,9 @@ fn switch2_sdk_fp16_by_element_executes() {
         assert_eq!(execute(&mut ours, 0x5f11_9f9c), Some(Ok(())));
     }
 }
+
+#[test]
+fn whole_simd_fp_group() {
+    let mut h = Harness::new(55);
+    h.fuzz(0x0e00_0000, 0xf1ff_ffff, 10 * ITERATIONS);
+}
