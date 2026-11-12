@@ -8,6 +8,7 @@ license.workspace = true
 lichii-common.workspace = true
 bytemuck.workspace = true
 parking_lot.workspace = true
+portable-atomic = "1"
 thiserror.workspace = true
 
 [target.'cfg(unix)'.dependencies]
