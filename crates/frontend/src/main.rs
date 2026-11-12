@@ -1,6 +1,7 @@
 mod app;
 mod choices;
 mod cli;
+mod config;
 mod display;
 mod game_list;
 mod hotkeys;
