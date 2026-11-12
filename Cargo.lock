@@ -1635,6 +1635,7 @@ dependencies = [
  "gpu-allocator",
  "lichii-common",
  "lichii-gpu",
+ "lichii-memory",
  "lichii-shader",
  "lichii-texture",
  "parking_lot",
