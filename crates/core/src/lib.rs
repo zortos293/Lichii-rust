@@ -183,15 +183,21 @@ impl System {
     }
 
     /// Starts the main thread, the CPU cores and the service threads, or resumes a paused session.
+    /// A start that fails stops the session.
     pub fn run(&mut self) -> Result<(), SystemError> {
         match self.state {
             State::Booted => {
-                let boot = |code| SystemError::Boot {
-                    stage: "starting the main thread",
-                    code,
+                let started = match self.kernel.start_process(&self.process) {
+                    Ok(_) => self.kernel.run().map_err(SystemError::from),
+                    Err(code) => Err(SystemError::Boot {
+                        stage: "starting the main thread",
+                        code,
+                    }),
                 };
-                self.kernel.start_process(&self.process).map_err(boot)?;
-                self.kernel.run()?;
+                if let Err(err) = started {
+                    self.stop();
+                    return Err(err);
+                }
                 self.state = State::Running;
                 tracing::info!("running");
             }
@@ -212,6 +218,7 @@ impl System {
         tracing::info!("paused");
     }
 
+    /// Lets guest code and guest time run again after [`System::pause`].
     pub fn resume(&mut self) {
         if self.state != State::Paused {
             return;
@@ -232,6 +239,7 @@ impl System {
         tracing::info!("stopped");
     }
 
+    /// Whether the session is paused.
     pub fn is_paused(&self) -> bool {
         self.state == State::Paused
     }
@@ -241,38 +249,47 @@ impl System {
         self.exit.wait(timeout)
     }
 
+    /// Why the title stopped, once it has.
     pub fn exit_reason(&self) -> Option<ExitReason> {
         *self.exit.reason.lock()
     }
 
+    /// The settings the session booted with.
     pub fn settings(&self) -> &Arc<Settings> {
         &self.settings
     }
 
+    /// The console being emulated: Switch 2 for Switch 2 titles, the preferred console otherwise.
     pub fn console(&self) -> ConsoleGeneration {
         self.kernel.console()
     }
 
+    /// The session's guest clock.
     pub fn timing(&self) -> &Arc<CoreTiming> {
         &self.timing
     }
 
+    /// The HLE kernel running the title.
     pub fn kernel(&self) -> &Kernel {
         &self.kernel
     }
 
+    /// The loaded title.
     pub fn program(&self) -> &Arc<ProgramImage> {
         &self.program
     }
 
+    /// The title's process.
     pub fn process(&self) -> &Arc<Process> {
         &self.process
     }
 
+    /// State shared by every HLE service.
     pub fn services(&self) -> &Arc<ServiceContext> {
         &self.services
     }
 
+    /// The host1x device space, allocator and syncpoints.
     pub fn host1x(&self) -> &Host1x {
         &self.gpu.host1x
     }
@@ -287,6 +304,7 @@ impl System {
         &self.npad
     }
 
+    /// Frame and performance counters for the frontend overlay.
     pub fn perf(&self) -> &Arc<PerfStats> {
         &self.perf
     }

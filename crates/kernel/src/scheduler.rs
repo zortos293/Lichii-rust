@@ -342,17 +342,17 @@ impl Scheduler {
             self.clear_running(core);
             return Preempt::Switch;
         }
-        if self.paused.load(Ordering::Acquire) {
-            save();
-            self.enqueue(thread, &mut s, true);
-            self.clear_running(core);
-            return Preempt::Switch;
-        }
         if s.pause_requested {
             save();
             s.state = ThreadState::Suspended;
             self.clear_running(core);
             return Preempt::Pause;
+        }
+        if self.paused.load(Ordering::Acquire) {
+            save();
+            self.enqueue(thread, &mut s, true);
+            self.clear_running(core);
+            return Preempt::Switch;
         }
         let c = &self.cores[core];
         let rotate = c.rotate.swap(false, Ordering::AcqRel);

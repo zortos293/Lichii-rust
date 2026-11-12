@@ -314,10 +314,12 @@ impl Kernel {
         self.0.scheduler.pause();
     }
 
+    /// Lets the cores pick threads again after [`Kernel::pause`].
     pub fn resume(&self) {
         self.0.scheduler.resume();
     }
 
+    /// Whether [`Kernel::pause`] is in effect.
     pub fn is_paused(&self) -> bool {
         self.0.scheduler.is_paused()
     }
