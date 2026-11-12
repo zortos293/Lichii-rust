@@ -215,9 +215,16 @@ fn architecture_where_qemu_deviates() {
         "scalar FCVTZS to H clears the rest of the register"
     );
 
-    let ctx = run(0x2f42_1020, 0, |c| {
-        c.v[1] = 0x3555_3555_3555_3555_0000_0000_0000_0000
-    });
+    let hidden_lanes = |c: &mut ThreadContext| {
+        c.v[1] = 0x3555_3555_3555_3555_0000_0000_0000_0000;
+        c.v[2] = 0x3555_3555;
+    };
+    assert_eq!(
+        run(0x6f42_1020, 0, hidden_lanes).fpsr,
+        IXC,
+        "FCMLA .8H by element rounds the upper lanes"
+    );
+    let ctx = run(0x2f42_1020, 0, hidden_lanes);
     assert_eq!(
         (ctx.v[0], ctx.fpsr),
         (0, 0),
