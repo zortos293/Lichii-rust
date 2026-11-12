@@ -7,6 +7,8 @@ use super::softfloat::{self as sf, Fmt, FpEnv, Rounding};
 use super::{Exec, Undefined, bit, bits, commit_flags};
 use crate::ThreadContext;
 
+type BinaryOp = fn(u64, u64, &mut FpEnv) -> u64;
+
 fn regs(inst: u32) -> (usize, usize, usize) {
     (
         bits(inst, 4, 0) as usize,
@@ -96,7 +98,7 @@ fn three_same_lanes<const N: u32>(ctx: &mut ThreadContext, inst: u32, scalar: bo
     let allocated = !matches!(
         key,
         (false, false, 0b101)
-            | (false, true, 0b011 | 0b100 | 0b101)
+            | (false, true, 0b011..=0b101)
             | (true, _, 0b001)
             | (true, true, 0b011 | 0b111)
     );
@@ -382,7 +384,7 @@ fn reduce<const N: u32>(
     op(lo, hi, env)
 }
 
-fn reduction<const N: u32>(inst: u32) -> Result<fn(u64, u64, &mut FpEnv) -> u64, Undefined> {
+fn reduction<const N: u32>(inst: u32) -> Result<BinaryOp, Undefined> {
     Ok(match (bits(inst, 16, 12), bit(inst, 23)) {
         (0b01100, false) => sf::max_num::<N>,
         (0b01100, true) => sf::min_num::<N>,

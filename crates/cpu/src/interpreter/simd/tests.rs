@@ -280,7 +280,7 @@ fn qemu_aborts(instruction: u32) -> bool {
     );
     let three_same_unallocated = matches!(
         key,
-        (0, 0, 0b101) | (0, 1, 0b011 | 0b100 | 0b101) | (1, _, 0b001) | (1, 1, 0b011 | 0b111)
+        (0, 0, 0b101) | (0, 1, 0b011..=0b101) | (1, _, 0b001) | (1, 1, 0b011 | 0b111)
     );
     let fp16_two_misc =
         instruction & 0x9f7e_0c00 == 0x0e78_0800 || instruction & 0xdf7e_0c00 == 0x5e78_0800;
