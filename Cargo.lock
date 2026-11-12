@@ -464,6 +464,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98b0cc327b5bc766e7fda9c9260cc0fa81b43a8e240440422dff70788e3f9ef1"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-utils"
 version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1082,6 +1091,7 @@ name = "lichii-fs"
 version = "0.1.0"
 dependencies = [
  "lichii-crypto",
+ "lz4_flex",
  "miniz_oxide",
  "thiserror 2.0.21",
  "tracing",
@@ -1116,8 +1126,11 @@ dependencies = [
 name = "lichii-kernel"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
+ "crossbeam-channel",
  "lichii-common",
  "lichii-cpu",
+ "lichii-loader",
  "lichii-memory",
  "parking_lot",
  "thiserror 2.0.21",
@@ -1131,6 +1144,7 @@ dependencies = [
  "lichii-common",
  "lichii-crypto",
  "lichii-fs",
+ "lz4_flex",
  "thiserror 2.0.21",
  "tracing",
 ]
@@ -1232,6 +1246,15 @@ name = "log"
 version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
+
+[[package]]
+name = "lz4_flex"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
+dependencies = [
+ "twox-hash",
+]
 
 [[package]]
 name = "malloc_buf"
@@ -2383,6 +2406,12 @@ name = "ttf-parser"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
+
+[[package]]
+name = "twox-hash"
+version = "2.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
 name = "typenum"

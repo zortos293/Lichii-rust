@@ -1,14 +1,16 @@
 //! RomFS: reading an image as a directory tree, and laying out a new image over any directory
-//! tree (used by LayeredFS, so a modded RomFS is served without copying file data).
+//! tree (used by LayeredFS, so a modded RomFS is served without copying file data), with
+//! [`RomfsExt`] applying `romfs_ext` stubs and IPS patches.
 
 use std::io;
 use std::sync::Arc;
 
 use crate::bytes::{u32_at, u64_at};
 use crate::error::{FsResult, corrupt};
+use crate::ips::Ips;
 use crate::vfs::{
-    ConcatFile, DirEntry, DirRef, Directory, Entry, EntryKind, FileExt, FileRef, MemFile, ZeroFile,
-    slice,
+    ConcatFile, DirEntry, DirRef, Directory, DirectoryExt, Entry, EntryKind, FileExt, FileRef,
+    MemFile, ZeroFile, slice,
 };
 
 const FORMAT: &str = "RomFS";
@@ -292,6 +294,70 @@ impl Directory for RomFsDir {
     }
 }
 
+/// LayeredFS `romfs_ext` over a RomFS tree: an entry is hidden when the ext directory holds a
+/// `<name>.stub` file beside it, and a file is rewritten by a `<name>.ips` patch there. Ext
+/// subdirectories apply to the directories of the same name. A patch that fails to parse or
+/// apply leaves the file as it was.
+pub struct RomfsExt {
+    dir: DirRef,
+    ext: DirRef,
+}
+
+impl RomfsExt {
+    /// Wraps `dir` with the ext rules from `ext`. The result is an ordinary directory: put it
+    /// under or over a [`crate::LayeredDir`] and pass it to [`build_romfs`].
+    pub fn layer(dir: DirRef, ext: DirRef) -> DirRef {
+        Arc::new(Self { dir, ext })
+    }
+
+    fn stubbed(&self, name: &str) -> io::Result<bool> {
+        Ok(self.ext.open_file(&format!("{name}.stub"))?.is_some())
+    }
+
+    fn patched(&self, name: &str, file: FileRef) -> io::Result<FileRef> {
+        let Some(patch) = self.ext.open_file(&format!("{name}.ips"))? else {
+            return Ok(file);
+        };
+        let mut data = file.read_all()?;
+        match Ips::parse(&patch.read_all()?).and_then(|ips| ips.apply(&mut data)) {
+            Ok(()) => Ok(MemFile::from_bytes(data)),
+            Err(error) => {
+                tracing::warn!("romfs_ext: {name}.ips not applied: {error}");
+                Ok(file)
+            }
+        }
+    }
+}
+
+impl Directory for RomfsExt {
+    fn entries(&self) -> io::Result<Vec<DirEntry>> {
+        let mut entries = self.dir.entries()?;
+        let mut error = None;
+        entries.retain(|entry| match self.stubbed(&entry.name) {
+            Ok(stubbed) => !stubbed,
+            Err(e) => {
+                error.get_or_insert(e);
+                true
+            }
+        });
+        error.map_or(Ok(entries), Err)
+    }
+
+    fn open(&self, name: &str) -> io::Result<Option<Entry>> {
+        if self.stubbed(name)? {
+            return Ok(None);
+        }
+        Ok(match self.dir.open(name)? {
+            Some(Entry::Dir(dir)) => Some(Entry::Dir(match self.ext.open_dir(name)? {
+                Some(ext) => Self::layer(dir, ext),
+                None => dir,
+            })),
+            Some(Entry::File(file)) => Some(Entry::File(self.patched(name, file)?)),
+            None => None,
+        })
+    }
+}
+
 struct BuildDir {
     name: Vec<u8>,
     parent: usize,
@@ -528,6 +594,55 @@ mod tests {
         assert_eq!(bytes.len() as u64, image.size());
         let reparsed = open_romfs(&MemFile::from_bytes(bytes)).unwrap();
         assert_same_tree(&source, reparsed.as_ref());
+    }
+
+    #[test]
+    fn romfs_ext_stubs_and_patches() {
+        let mut ips = b"PATCH".to_vec();
+        ips.extend_from_slice(&[0, 0, 2, 0, 2, b'z', b'z']);
+        ips.extend_from_slice(b"EOF");
+        let base = MemDir::new()
+            .with_bytes("a.bin", vec![1; 8])
+            .with_bytes("hide.bin", vec![2; 4])
+            .with_dir(
+                "sub",
+                MemDir::new()
+                    .with_bytes("x.bin", vec![3; 4])
+                    .with_dir("gone", MemDir::new().with_bytes("y", vec![4])),
+            )
+            .into_ref();
+        let ext = MemDir::new()
+            .with_bytes("a.bin.ips", ips)
+            .with_bytes("hide.bin.stub", Vec::new())
+            .with_dir(
+                "sub",
+                MemDir::new()
+                    .with_bytes("gone.stub", Vec::new())
+                    .with_bytes("x.bin.ips", b"garbage".to_vec()),
+            )
+            .into_ref();
+        let layered = RomfsExt::layer(base, ext);
+        let rebuilt = open_romfs(&build_romfs(layered.as_ref()).unwrap()).unwrap();
+        assert_same_tree(layered.as_ref(), rebuilt.as_ref());
+        let mut names: Vec<String> = rebuilt
+            .entries()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a.bin", "sub"]);
+        let read = |path: &str| {
+            rebuilt
+                .open_file_path(path)
+                .unwrap()
+                .unwrap()
+                .read_all()
+                .unwrap()
+        };
+        assert_eq!(read("a.bin"), [1, 1, b'z', b'z', 1, 1, 1, 1]);
+        assert_eq!(read("sub/x.bin"), [3; 4]);
+        assert!(rebuilt.open_path("sub/gone").unwrap().is_none());
     }
 
     #[test]
