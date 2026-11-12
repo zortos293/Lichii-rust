@@ -1167,8 +1167,12 @@ name = "lichii-services"
 version = "0.1.0"
 dependencies = [
  "lichii-common",
+ "lichii-gpu",
+ "lichii-input",
  "lichii-kernel",
+ "lichii-loader",
  "lichii-memory",
+ "parking_lot",
  "thiserror 2.0.21",
  "tracing",
 ]
