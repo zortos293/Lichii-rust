@@ -308,7 +308,7 @@ impl Image {
     }
 
     /// A view of the whole image with the image's own format, reading channels through
-    /// `components` (identity for render targets, `HostFormat::swizzle` for guest textures).
+    /// `components` (`HostFormat::swizzle`, which is identity whenever the format is attachable).
     pub fn view(
         &self,
         view_type: vk::ImageViewType,

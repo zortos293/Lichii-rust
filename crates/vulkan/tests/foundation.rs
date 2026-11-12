@@ -383,6 +383,15 @@ fn every_guest_format_gets_a_sampleable_host_format() {
                     "{format:?}"
                 );
             }
+            if host.attachable {
+                let s = host.swizzle;
+                assert!(
+                    [s.r, s.g, s.b, s.a]
+                        .iter()
+                        .all(|&c| c == vk::ComponentSwizzle::IDENTITY),
+                    "{format:?} attachment views must be identity"
+                );
+            }
             if format.is_astc() && !device.features.texture_compression_astc_ldr {
                 let expected = match recompression {
                     AstcRecompression::Bc3 if device.features.texture_compression_bc => {

@@ -25,8 +25,9 @@ pub enum Conversion {
 pub struct HostFormat {
     pub format: vk::Format,
     pub conversion: Conversion,
-    /// Component mapping every view of the image must apply, passed to `Image::view` (composed
-    /// with the guest's own swizzle), for host formats whose bit order differs from the guest's.
+    /// Component mapping every sampled view of the image must apply, passed to `Image::view`
+    /// (composed with the guest's own swizzle), for host formats whose bit order differs from
+    /// the guest's. Attachment views must be identity, so `attachable` implies identity here.
     pub swizzle: vk::ComponentMapping,
     /// Can be a color or depth/stencil attachment.
     pub attachable: bool,
@@ -348,24 +349,36 @@ pub fn host_format(
             }
         };
     }
+    let viewable_as_attachment = |attachable: bool, swizzle: vk::ComponentMapping| {
+        !attachable
+            || [swizzle.r, swizzle.g, swizzle.b, swizzle.a]
+                .iter()
+                .all(|&c| c == vk::ComponentSwizzle::IDENTITY)
+    };
     for (attachable, storage) in [(attachable, storage), (attachable, false), (false, false)] {
-        if supports(native_format, attachable, storage) {
+        let swizzle = native_swizzle(format);
+        if viewable_as_attachment(attachable, swizzle)
+            && supports(native_format, attachable, storage)
+        {
             return HostFormat {
                 format: native_format,
                 conversion: Conversion::None,
-                swizzle: native_swizzle(format),
+                swizzle,
                 attachable,
                 storage,
             };
         }
-        if let Some(&(alternative, fallback)) = alternatives(native_format)
+        let candidate = alternatives(native_format)
             .iter()
-            .find(|(f, _)| supports(*f, attachable, false))
-        {
-            let (conversion, swizzle) = match fallback {
-                Fallback::Swizzle(swizzle) => (Conversion::None, swizzle),
-                Fallback::Convert => (Conversion::Convert, IDENTITY),
-            };
+            .find_map(|&(f, fallback)| {
+                let (conversion, swizzle) = match fallback {
+                    Fallback::Swizzle(swizzle) => (Conversion::None, swizzle),
+                    Fallback::Convert => (Conversion::Convert, IDENTITY),
+                };
+                (viewable_as_attachment(attachable, swizzle) && supports(f, attachable, false))
+                    .then_some((f, conversion, swizzle))
+            });
+        if let Some((alternative, conversion, swizzle)) = candidate {
             return HostFormat {
                 format: alternative,
                 conversion,
