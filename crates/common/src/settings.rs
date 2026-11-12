@@ -1,15 +1,25 @@
 //! The settings model. Every crate reads it; the frontend edits it and saves it as TOML.
+//!
+//! Loading is forgiving: a file from an older version is migrated, a field that no longer parses
+//! falls back to its default with a warning instead of discarding the whole file, and values out
+//! of range are clamped. Saving writes the current [`SETTINGS_VERSION`].
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::ConsoleGeneration;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+/// Version written to new files. Bump it with a step in `migrate` when a field changes shape.
+pub const SETTINGS_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Settings {
+    /// Format version of the file this was loaded from; [`SETTINGS_VERSION`] once saved.
+    pub version: u32,
     pub system: SystemSettings,
     pub cpu: CpuSettings,
     pub graphics: GraphicsSettings,
@@ -18,6 +28,24 @@ pub struct Settings {
     pub audio: AudioSettings,
     pub paths: PathSettings,
     pub debug: DebugSettings,
+    pub ui: UiSettings,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            version: SETTINGS_VERSION,
+            system: SystemSettings::default(),
+            cpu: CpuSettings::default(),
+            graphics: GraphicsSettings::default(),
+            frame_view: FrameViewSettings::default(),
+            controls: ControlSettings::default(),
+            audio: AudioSettings::default(),
+            paths: PathSettings::default(),
+            debug: DebugSettings::default(),
+            ui: UiSettings::default(),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -37,32 +65,178 @@ pub enum SettingsError {
 }
 
 impl Settings {
-    /// Loads settings from \`path\`; a missing file yields the defaults.
+    /// Loads settings from `path`; a missing file yields the defaults. Fields that fail to parse
+    /// are reset to their defaults and logged; only a file that is not TOML at all is an error.
     pub fn load(path: &Path) -> Result<Self, SettingsError> {
-        match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).map_err(|source| SettingsError::Parse {
-                path: path.to_path_buf(),
-                source,
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(source) => Err(SettingsError::Io {
-                path: path.to_path_buf(),
-                source,
-            }),
-        }
-    }
-
-    pub fn save(&self, path: &Path) -> Result<(), SettingsError> {
-        let text = toml::to_string_pretty(self)?;
-        let io = |source| SettingsError::Io {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(source) => {
+                return Err(SettingsError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        let (settings, warnings) = Self::from_toml(&text).map_err(|source| SettingsError::Parse {
             path: path.to_path_buf(),
             source,
-        };
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(io)?;
+        })?;
+        for warning in warnings {
+            tracing::warn!("{}: {warning}", path.display());
         }
-        std::fs::write(path, text).map_err(io)
+        Ok(settings)
     }
+
+    /// Parses, migrates and normalizes a settings file. The second value lists every field that
+    /// was reset to its default because it no longer parses.
+    pub fn from_toml(text: &str) -> Result<(Self, Vec<String>), toml::de::Error> {
+        let mut table: toml::Table = toml::from_str(text)?;
+        let mut warnings = Vec::new();
+        let version = table
+            .get("version")
+            .and_then(toml::Value::as_integer)
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(0);
+        if version > SETTINGS_VERSION {
+            warnings.push(format!(
+                "written by a newer Lichii (settings version {version}); unknown fields are ignored"
+            ));
+        }
+        migrate(&mut table, version);
+        let mut settings = Self {
+            version: SETTINGS_VERSION,
+            system: section(&mut table, "system", &mut warnings),
+            cpu: section(&mut table, "cpu", &mut warnings),
+            graphics: section(&mut table, "graphics", &mut warnings),
+            frame_view: section(&mut table, "frame_view", &mut warnings),
+            controls: section(&mut table, "controls", &mut warnings),
+            audio: section(&mut table, "audio", &mut warnings),
+            paths: section(&mut table, "paths", &mut warnings),
+            debug: section(&mut table, "debug", &mut warnings),
+            ui: section(&mut table, "ui", &mut warnings),
+        };
+        settings.normalize();
+        Ok((settings, warnings))
+    }
+
+    /// Saves atomically: the file is written beside `path` and renamed over it, so a crash never
+    /// leaves a half-written config.
+    pub fn save(&self, path: &Path) -> Result<(), SettingsError> {
+        let mut text = toml::to_string_pretty(&Self {
+            version: SETTINGS_VERSION,
+            ..self.clone()
+        })?;
+        text.insert_str(0, "# Lichii settings. Unknown or invalid fields fall back to defaults.\n");
+        write_atomic(path, text.as_bytes()).map_err(|source| SettingsError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    /// Clamps every value to the range the UI offers and fills in missing players and hotkeys.
+    pub fn normalize(&mut self) {
+        let g = &mut self.graphics;
+        g.fsr_sharpness = g.fsr_sharpness.min(100);
+        g.speed_limit = g.speed_limit.filter(|&v| v > 0).map(|v| v.min(MAX_SPEED_LIMIT));
+
+        let fv = &mut self.frame_view;
+        fv.graph_seconds = clamp_or(fv.graph_seconds, 1.0, 30.0, 5.0);
+        fv.opacity = clamp_or(fv.opacity, 0.1, 1.0, 0.85);
+        fv.scale = clamp_or(fv.scale, 0.5, 3.0, 1.0);
+
+        let controls = &mut self.controls;
+        controls.players.truncate(MAX_PLAYERS);
+        while controls.players.len() < MAX_PLAYERS {
+            controls.players.push(PlayerInput::default());
+        }
+        controls.mouse_panning_sensitivity =
+            clamp_or(controls.mouse_panning_sensitivity, 1.0, 100.0, 50.0);
+        for player in &mut controls.players {
+            player.vibration_strength = player.vibration_strength.min(100);
+            for stick in [&mut player.left_stick, &mut player.right_stick] {
+                stick.deadzone = clamp_or(stick.deadzone, 0.0, 0.9, 0.15);
+                stick.range = clamp_or(stick.range, 0.5, 1.5, 1.0);
+                stick.modifier_scale = clamp_or(stick.modifier_scale, 0.0, 1.0, 0.5);
+            }
+        }
+
+        self.audio.volume = self.audio.volume.min(200);
+
+        for (action, hotkey) in HotkeyAction::defaults() {
+            self.ui.hotkeys.entry(action).or_insert(hotkey);
+        }
+    }
+}
+
+/// Highest speed limit the UI offers, in percent.
+pub const MAX_SPEED_LIMIT: u16 = 1000;
+
+fn clamp_or(value: f32, min: f32, max: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        fallback
+    }
+}
+
+/// Rewrites `table` from format `from` to [`SETTINGS_VERSION`], one version at a time.
+fn migrate(table: &mut toml::Table, from: u32) {
+    for version in from..SETTINGS_VERSION {
+        match version {
+            // Version 1 writes an unlimited speed as `speed_limit = 0`; version 0 dropped the key,
+            // so those files load the default limit, which is all version 0 could express.
+            0 => {}
+            _ => unreachable!("no migration from settings version {version}"),
+        }
+    }
+    table.insert("version".into(), toml::Value::Integer(SETTINGS_VERSION.into()));
+}
+
+/// Deserializes one top-level section. When it fails as a whole, every field is tried on its own
+/// (each section is `#[serde(default)]`), the fields that fail are dropped with a warning, and the
+/// rest are kept.
+fn section<T: DeserializeOwned + Default>(
+    table: &mut toml::Table,
+    key: &str,
+    warnings: &mut Vec<String>,
+) -> T {
+    let Some(value) = table.remove(key) else {
+        return T::default();
+    };
+    let toml::Value::Table(mut fields) = value else {
+        warnings.push(format!("[{key}] is not a table; using defaults"));
+        return T::default();
+    };
+    if let Ok(parsed) = T::deserialize(toml::Value::Table(fields.clone())) {
+        return parsed;
+    }
+    fields.retain(|name, field| {
+        let single = toml::Table::from_iter([(name.to_string(), field.clone())]);
+        match T::deserialize(toml::Value::Table(single)) {
+            Ok(_) => true,
+            Err(e) => {
+                warnings.push(format!("{key}.{name}: {}; using the default", e.message()));
+                false
+            }
+        }
+    });
+    T::deserialize(toml::Value::Table(fields)).unwrap_or_else(|e| {
+        warnings.push(format!("[{key}]: {}; using defaults", e.message()));
+        T::default()
+    })
+}
+
+/// Writes `bytes` to a sibling temporary file and renames it over `path`.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -127,7 +301,7 @@ pub enum Region {
     Taiwan,
 }
 
-/// Guest DRAM size. \`Auto\` picks 4 GiB for Switch 1 and 12 GiB for Switch 2.
+/// Guest DRAM size. `Auto` picks 4 GiB for Switch 1 and 12 GiB for Switch 2.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MemoryLayout {
     #[default]
@@ -188,7 +362,7 @@ pub enum CpuAccuracy {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct GraphicsSettings {
-    /// Vulkan physical device name; \`None\` picks the first discrete GPU.
+    /// Vulkan physical device name; `None` picks the first discrete GPU.
     pub device: Option<String>,
     pub resolution_scale: ResolutionScale,
     pub scaling_filter: ScalingFilter,
@@ -198,7 +372,8 @@ pub struct GraphicsSettings {
     pub aspect_ratio: AspectRatio,
     pub present_mode: PresentMode,
     pub fullscreen: FullscreenMode,
-    /// Speed limit in percent of real time; \`None\` runs unlimited.
+    /// Speed limit in percent of real time; `None` runs unlimited (written as `0`).
+    #[serde(with = "speed_limit_serde")]
     pub speed_limit: Option<u16>,
     pub gpu_accuracy: GpuAccuracy,
     pub anisotropic_filtering: Anisotropy,
@@ -499,6 +674,92 @@ pub enum ControllerType {
     /// Switch 2 Joy-Con 2 pair (adds C and mouse sensors).
     Switch2DualJoycons,
     Switch2Handheld,
+    Switch2LeftJoycon,
+    /// Right Joy-Con 2 (has the C button).
+    Switch2RightJoycon,
+}
+
+impl ControllerType {
+    pub const ALL: [Self; 11] = [
+        Self::ProController,
+        Self::DualJoycons,
+        Self::LeftJoycon,
+        Self::RightJoycon,
+        Self::Handheld,
+        Self::GameCube,
+        Self::Switch2ProController,
+        Self::Switch2DualJoycons,
+        Self::Switch2Handheld,
+        Self::Switch2LeftJoycon,
+        Self::Switch2RightJoycon,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ProController => "Pro Controller",
+            Self::DualJoycons => "Dual Joy-Cons",
+            Self::LeftJoycon => "Left Joy-Con",
+            Self::RightJoycon => "Right Joy-Con",
+            Self::Handheld => "Handheld",
+            Self::GameCube => "GameCube Controller",
+            Self::Switch2ProController => "Switch 2 Pro Controller",
+            Self::Switch2DualJoycons => "Dual Joy-Con 2",
+            Self::Switch2Handheld => "Switch 2 Handheld",
+            Self::Switch2LeftJoycon => "Left Joy-Con 2",
+            Self::Switch2RightJoycon => "Right Joy-Con 2",
+        }
+    }
+
+    pub fn is_switch2(self) -> bool {
+        matches!(
+            self,
+            Self::Switch2ProController
+                | Self::Switch2DualJoycons
+                | Self::Switch2Handheld
+                | Self::Switch2LeftJoycon
+                | Self::Switch2RightJoycon
+        )
+    }
+
+    pub fn is_handheld(self) -> bool {
+        matches!(self, Self::Handheld | Self::Switch2Handheld)
+    }
+
+    pub fn has_left_stick(self) -> bool {
+        !matches!(self, Self::RightJoycon | Self::Switch2RightJoycon)
+    }
+
+    pub fn has_right_stick(self) -> bool {
+        !matches!(self, Self::LeftJoycon | Self::Switch2LeftJoycon)
+    }
+
+    /// Whether the controller has `button`. The input mapper masks out the rest.
+    pub fn has_button(self, button: NpadButton) -> bool {
+        use NpadButton::*;
+        let left_half = matches!(
+            button,
+            DPadLeft | DPadUp | DPadRight | DPadDown | L | ZL | Minus | LStick | Capture
+        );
+        let right_half = matches!(button, A | B | X | Y | R | ZR | Plus | RStick | Home);
+        let rails = matches!(button, LeftSL | LeftSR | RightSL | RightSR);
+        let left_rail = matches!(button, LeftSL | LeftSR);
+        let right_rail = matches!(button, RightSL | RightSR);
+        match self {
+            Self::ProController | Self::Handheld => left_half || right_half,
+            Self::DualJoycons => left_half || right_half || rails,
+            Self::LeftJoycon => left_half || left_rail,
+            Self::RightJoycon => right_half || right_rail,
+            Self::GameCube => matches!(
+                button,
+                A | B | X | Y | L | R | ZR | Plus | DPadLeft | DPadUp | DPadRight | DPadDown
+            ),
+            Self::Switch2ProController => left_half || right_half || matches!(button, C | GL | GR),
+            Self::Switch2Handheld => left_half || right_half || button == C,
+            Self::Switch2DualJoycons => left_half || right_half || rails || button == C,
+            Self::Switch2LeftJoycon => left_half || left_rail,
+            Self::Switch2RightJoycon => right_half || right_rail || button == C,
+        }
+    }
 }
 
 /// Npad buttons, including the Switch 2 additions (C, GL, GR).
@@ -531,16 +792,60 @@ pub enum NpadButton {
     GR,
 }
 
-/// One host input bound to one guest input.
+impl NpadButton {
+    pub const ALL: [Self; 25] = {
+        use NpadButton::*;
+        [
+            A, B, X, Y, LStick, RStick, L, R, ZL, ZR, Plus, Minus, DPadLeft, DPadUp, DPadRight,
+            DPadDown, LeftSL, LeftSR, RightSL, RightSR, Home, Capture, C, GL, GR,
+        ]
+    };
+
+    pub fn label(self) -> &'static str {
+        use NpadButton::*;
+        match self {
+            A => "A",
+            B => "B",
+            X => "X",
+            Y => "Y",
+            LStick => "Left Stick",
+            RStick => "Right Stick",
+            L => "L",
+            R => "R",
+            ZL => "ZL",
+            ZR => "ZR",
+            Plus => "Plus",
+            Minus => "Minus",
+            DPadLeft => "Left",
+            DPadUp => "Up",
+            DPadRight => "Right",
+            DPadDown => "Down",
+            LeftSL => "SL (Left)",
+            LeftSR => "SR (Left)",
+            RightSL => "SL (Right)",
+            RightSR => "SR (Right)",
+            Home => "Home",
+            Capture => "Capture",
+            C => "C",
+            GL => "GL",
+            GR => "GR",
+        }
+    }
+}
+
+/// One host input bound to one guest input. Keyboard and mouse bindings read the host keyboard
+/// and mouse; gamepad bindings read the player's `InputDevice`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub enum InputBinding {
     #[default]
     None,
-    /// A keyboard key, by its \`winit\` \`KeyCode\` name (e.g. \`KeyZ\`, \`ArrowUp\`).
+    /// A keyboard key, by its `winit` `KeyCode` name (e.g. `KeyZ`, `ArrowUp`).
     Key(String),
-    /// A gamepad button by SDL name (e.g. \`a\`, \`leftshoulder\`, \`dpup\`).
+    /// A gamepad button by SDL name (e.g. `a`, `leftshoulder`, `dpup`).
     GamepadButton { button: String },
-    /// A gamepad axis past \`threshold\` (0..1) in \`direction\` (+1 or -1).
+    /// A mouse button: `Left`, `Right`, `Middle`, `Back` or `Forward`.
+    MouseButton(String),
+    /// A gamepad axis past `threshold` (0..1) in `direction` (+1 or -1).
     GamepadAxis {
         axis: String,
         threshold: f32,
@@ -551,7 +856,7 @@ pub enum InputBinding {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct StickBinding {
-    /// Analog source: an SDL axis pair (\`leftx\`/\`lefty\`) on a gamepad.
+    /// Analog source: an SDL axis pair (`leftx`/`lefty`) on a gamepad.
     pub analog_x: Option<String>,
     pub analog_y: Option<String>,
     pub invert_x: bool,
@@ -561,7 +866,7 @@ pub struct StickBinding {
     pub down: InputBinding,
     pub left: InputBinding,
     pub right: InputBinding,
-    /// Held to scale digital input by \`modifier_scale\`.
+    /// Held to scale digital input by `modifier_scale`.
     pub modifier: InputBinding,
     pub modifier_scale: f32,
     /// 0..1.
@@ -594,7 +899,7 @@ pub enum InputDevice {
     #[default]
     None,
     Keyboard,
-    /// A gamepad by SDL GUID; \`index\` separates identical controllers.
+    /// A gamepad by SDL GUID; `index` separates identical controllers.
     Gamepad {
         guid: String,
         index: u32,
@@ -683,6 +988,61 @@ impl PlayerInput {
             ..Self::default()
         }
     }
+
+    /// A gamepad mapped by position, the way Lichii maps SDL controllers: Switch A is the east
+    /// face button, B south, X north, Y west.
+    pub fn default_gamepad(device: InputDevice) -> Self {
+        use NpadButton::*;
+        let pad = |b: &str| InputBinding::GamepadButton {
+            button: b.to_string(),
+        };
+        let trigger = |axis: &str| InputBinding::GamepadAxis {
+            axis: axis.to_string(),
+            threshold: 0.5,
+            direction: 1,
+        };
+        let mut buttons: BTreeMap<NpadButton, InputBinding> = [
+            (A, "b"),
+            (B, "a"),
+            (X, "y"),
+            (Y, "x"),
+            (LStick, "leftstick"),
+            (RStick, "rightstick"),
+            (L, "leftshoulder"),
+            (R, "rightshoulder"),
+            (Plus, "start"),
+            (Minus, "back"),
+            (DPadLeft, "dpleft"),
+            (DPadUp, "dpup"),
+            (DPadRight, "dpright"),
+            (DPadDown, "dpdown"),
+            (Home, "guide"),
+            (Capture, "misc1"),
+            (C, "touchpad"),
+            (GL, "leftpaddle1"),
+            (GR, "rightpaddle1"),
+            (LeftSL, "leftpaddle2"),
+            (RightSR, "rightpaddle2"),
+        ]
+        .into_iter()
+        .map(|(button, name)| (button, pad(name)))
+        .collect();
+        buttons.insert(ZL, trigger("lefttrigger"));
+        buttons.insert(ZR, trigger("righttrigger"));
+        let stick = |x: &str, y: &str| StickBinding {
+            analog_x: Some(x.to_string()),
+            analog_y: Some(y.to_string()),
+            ..StickBinding::default()
+        };
+        Self {
+            connected: true,
+            device,
+            buttons,
+            left_stick: stick("leftx", "lefty"),
+            right_stick: stick("rightx", "righty"),
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -718,11 +1078,178 @@ pub enum AudioOutput {
 #[serde(default)]
 pub struct PathSettings {
     pub game_dirs: Vec<PathBuf>,
-    /// Overrides for the profile directories; \`None\` uses \`UserPaths\`.
+    /// Overrides for the profile directories; `None` uses `UserPaths`.
     pub keys_dir: Option<PathBuf>,
     pub nand_dir: Option<PathBuf>,
     pub sdmc_dir: Option<PathBuf>,
     pub mods_dir: Option<PathBuf>,
+}
+
+/// Window, game list and hotkey preferences of the desktop frontend.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct UiSettings {
+    pub theme: Theme,
+    /// Ask before stopping a running title.
+    pub confirm_stop: bool,
+    pub pause_when_unfocused: bool,
+    pub show_status_bar: bool,
+    pub hide_cursor_when_idle: bool,
+    /// Most recently booted files, newest first.
+    pub recent_files: Vec<PathBuf>,
+    pub window_width: u32,
+    pub window_height: u32,
+    pub window_maximized: bool,
+    pub hotkeys: BTreeMap<HotkeyAction, Hotkey>,
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        Self {
+            theme: Theme::Dark,
+            confirm_stop: true,
+            pause_when_unfocused: false,
+            show_status_bar: true,
+            hide_cursor_when_idle: true,
+            recent_files: Vec::new(),
+            window_width: 1280,
+            window_height: 760,
+            window_maximized: false,
+            hotkeys: HotkeyAction::defaults().collect(),
+        }
+    }
+}
+
+/// Most recent files kept in [`UiSettings::recent_files`].
+pub const MAX_RECENT_FILES: usize = 10;
+
+impl UiSettings {
+    /// Moves `path` to the front of the recent files.
+    pub fn push_recent(&mut self, path: PathBuf) {
+        self.recent_files.retain(|p| *p != path);
+        self.recent_files.insert(0, path);
+        self.recent_files.truncate(MAX_RECENT_FILES);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Theme {
+    #[default]
+    Dark,
+    Light,
+}
+
+/// A frontend action triggered by a keyboard chord or a held controller button combination.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HotkeyAction {
+    ContinuePause,
+    Stop,
+    Restart,
+    LoadFile,
+    Configure,
+    Fullscreen,
+    ExitFullscreen,
+    ToggleDocked,
+    ToggleSpeedLimit,
+    ToggleFrameView,
+    ToggleStatusBar,
+    ToggleMousePanning,
+    CycleScalingFilter,
+    CycleGpuAccuracy,
+    Exit,
+}
+
+/// One hotkey. `keys` is a chord such as `Ctrl+Shift+F11` (modifiers `Ctrl`, `Shift`, `Alt`,
+/// `Super`, then a `winit` `KeyCode` name); empty means unbound. `controller` triggers it while
+/// every listed button is held on player 1; empty means unbound.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Hotkey {
+    pub keys: String,
+    pub controller: Vec<NpadButton>,
+}
+
+impl HotkeyAction {
+    pub const ALL: [Self; 15] = [
+        Self::ContinuePause,
+        Self::Stop,
+        Self::Restart,
+        Self::LoadFile,
+        Self::Configure,
+        Self::Fullscreen,
+        Self::ExitFullscreen,
+        Self::ToggleDocked,
+        Self::ToggleSpeedLimit,
+        Self::ToggleFrameView,
+        Self::ToggleStatusBar,
+        Self::ToggleMousePanning,
+        Self::CycleScalingFilter,
+        Self::CycleGpuAccuracy,
+        Self::Exit,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ContinuePause => "Continue/Pause Emulation",
+            Self::Stop => "Stop Emulation",
+            Self::Restart => "Restart Emulation",
+            Self::LoadFile => "Load File",
+            Self::Configure => "Configure",
+            Self::Fullscreen => "Fullscreen",
+            Self::ExitFullscreen => "Exit Fullscreen",
+            Self::ToggleDocked => "Change Docked Mode",
+            Self::ToggleSpeedLimit => "Toggle Speed Limit",
+            Self::ToggleFrameView => "Toggle Frame View",
+            Self::ToggleStatusBar => "Toggle Status Bar",
+            Self::ToggleMousePanning => "Toggle Mouse Panning",
+            Self::CycleScalingFilter => "Change Scaling Filter",
+            Self::CycleGpuAccuracy => "Change GPU Accuracy",
+            Self::Exit => "Exit Lichii",
+        }
+    }
+
+    /// Lichii's default bindings.
+    pub fn defaults() -> impl Iterator<Item = (Self, Hotkey)> {
+        use NpadButton::*;
+        Self::ALL.into_iter().map(|action| {
+            let (keys, controller): (&str, &[NpadButton]) = match action {
+                Self::ContinuePause => ("F4", &[Home, Plus]),
+                Self::Stop => ("F5", &[L, Plus, Minus]),
+                Self::Restart => ("F6", &[R, Plus, Minus]),
+                Self::LoadFile => ("Ctrl+KeyO", &[]),
+                Self::Configure => ("Ctrl+Comma", &[]),
+                Self::Fullscreen => ("F11", &[Home, B]),
+                Self::ExitFullscreen => ("Escape", &[]),
+                Self::ToggleDocked => ("F10", &[Home, X]),
+                Self::ToggleSpeedLimit => ("Ctrl+KeyU", &[Home, Y]),
+                Self::ToggleFrameView => ("Ctrl+KeyV", &[]),
+                Self::ToggleStatusBar => ("Ctrl+KeyS", &[]),
+                Self::ToggleMousePanning => ("Ctrl+F9", &[]),
+                Self::CycleScalingFilter => ("F8", &[Home, L]),
+                Self::CycleGpuAccuracy => ("F9", &[Home, R]),
+                Self::Exit => ("Ctrl+KeyQ", &[Home, Minus]),
+            };
+            (
+                action,
+                Hotkey {
+                    keys: keys.to_string(),
+                    controller: controller.to_vec(),
+                },
+            )
+        })
+    }
+}
+
+mod speed_limit_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(limit: &Option<u16>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u16(limit.unwrap_or(0))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u16>, D::Error> {
+        Ok(Some(u16::deserialize(d)?).filter(|&v| v > 0))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -754,21 +1281,161 @@ impl Default for DebugSettings {
 mod tests {
     use super::*;
 
+    fn load(text: &str) -> (Settings, Vec<String>) {
+        Settings::from_toml(text).unwrap()
+    }
+
     #[test]
     fn round_trips_through_toml() {
         let mut settings = Settings::default();
         settings.graphics.resolution_scale = ResolutionScale::X3_2;
         settings.frame_view.enabled = true;
+        settings.controls.players[3] = PlayerInput::default_gamepad(InputDevice::Gamepad {
+            guid: "abc".into(),
+            index: 1,
+            name: "Pad".into(),
+        });
+        settings.ui.push_recent("/games/a.nsp".into());
         let text = toml::to_string_pretty(&settings).unwrap();
-        let back: Settings = toml::from_str(&text).unwrap();
+        let (back, warnings) = load(&text);
+        assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(back, settings);
     }
 
     #[test]
     fn partial_file_fills_defaults() {
-        let back: Settings = toml::from_str("[graphics]\nresolution_scale = \"X2\"\n").unwrap();
+        let (back, _) = load("[graphics]\nresolution_scale = \"X2\"\n");
         assert_eq!(back.graphics.resolution_scale, ResolutionScale::X2);
         assert_eq!(back.controls.players.len(), MAX_PLAYERS);
+        assert_eq!(back.ui.hotkeys.len(), HotkeyAction::ALL.len());
+    }
+
+    #[test]
+    fn unlimited_speed_round_trips() {
+        let mut settings = Settings::default();
+        settings.graphics.speed_limit = None;
+        let text = toml::to_string_pretty(&settings).unwrap();
+        assert!(text.contains("speed_limit = 0"), "{text}");
+        assert_eq!(load(&text).0.graphics.speed_limit, None);
+    }
+
+    #[test]
+    fn migrates_version_0_files() {
+        let (settings, warnings) = load(include_str!("testdata/settings_v0.toml"));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(settings.version, SETTINGS_VERSION);
+        assert_eq!(settings.graphics.resolution_scale, ResolutionScale::X2);
+        assert_eq!(settings.graphics.speed_limit, Some(150));
+        assert_eq!(settings.paths.game_dirs, [PathBuf::from("/games/switch")]);
+        assert_eq!(settings.controls.players[0], PlayerInput::default_keyboard());
+        assert!(matches!(
+            &settings.controls.players[1].device,
+            InputDevice::Gamepad { name, .. } if name == "8BitDo Pro 2"
+        ));
+        assert_eq!(settings.ui, UiSettings::default());
+    }
+
+    #[test]
+    fn a_bad_field_keeps_the_rest_of_its_section() {
+        let text = "[graphics]\nresolution_scale = \"X9000\"\nfsr_sharpness = 70\n\
+                    [system]\ndocked = false\n";
+        let (settings, warnings) = load(text);
+        assert_eq!(settings.graphics.resolution_scale, ResolutionScale::X1);
+        assert_eq!(settings.graphics.fsr_sharpness, 70);
+        assert!(!settings.system.docked);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("graphics.resolution_scale"));
+    }
+
+    #[test]
+    fn a_section_of_the_wrong_type_is_reset() {
+        let (settings, warnings) = load("audio = 3\n[cpu]\nfastmem = false\n");
+        assert_eq!(settings.audio, AudioSettings::default());
+        assert!(!settings.cpu.fastmem);
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn newer_files_load_with_a_warning() {
+        let (settings, warnings) = load("version = 99\nfuture = 1\n[cpu]\nfastmem = false\n");
+        assert!(!settings.cpu.fastmem);
+        assert_eq!(settings.version, SETTINGS_VERSION);
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn not_toml_is_an_error() {
+        assert!(Settings::from_toml("[graphics").is_err());
+    }
+
+    #[test]
+    fn normalize_clamps_and_pads() {
+        let mut settings = Settings::default();
+        settings.controls.players.truncate(2);
+        settings.controls.players[1].left_stick.deadzone = 4.0;
+        settings.controls.players[1].right_stick.range = f32::NAN;
+        settings.controls.players[1].vibration_strength = 250;
+        settings.graphics.fsr_sharpness = 200;
+        settings.graphics.speed_limit = Some(0);
+        settings.frame_view.opacity = -1.0;
+        settings.ui.hotkeys.clear();
+        settings.normalize();
+        let p = &settings.controls.players;
+        assert_eq!(p.len(), MAX_PLAYERS);
+        assert_eq!(p[1].left_stick.deadzone, 0.9);
+        assert_eq!(p[1].right_stick.range, 1.0);
+        assert_eq!(p[1].vibration_strength, 100);
+        assert_eq!(settings.graphics.fsr_sharpness, 100);
+        assert_eq!(settings.graphics.speed_limit, None);
+        assert_eq!(settings.frame_view.opacity, 0.1);
+        assert_eq!(settings.ui.hotkeys.len(), HotkeyAction::ALL.len());
+    }
+
+    #[test]
+    fn user_hotkeys_survive_and_missing_ones_are_added() {
+        let text = "[ui.hotkeys.Fullscreen]\nkeys = \"Alt+Enter\"\ncontroller = []\n";
+        let (settings, warnings) = load(text);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(settings.ui.hotkeys[&HotkeyAction::Fullscreen].keys, "Alt+Enter");
+        assert_eq!(settings.ui.hotkeys[&HotkeyAction::ContinuePause].keys, "F4");
+    }
+
+    #[test]
+    fn save_then_load() {
+        let dir = std::env::temp_dir().join(format!("lichii-settings-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let mut settings = Settings::default();
+        settings.system.docked = false;
+        settings.graphics.speed_limit = None;
+        settings.save(&path).unwrap();
+        assert!(!dir.join("config.toml.tmp").exists());
+        assert_eq!(Settings::load(&path).unwrap(), settings);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(Settings::load(&path).unwrap(), Settings::default());
+    }
+
+    #[test]
+    fn recent_files_are_unique_and_bounded() {
+        let mut ui = UiSettings::default();
+        for i in 0..15 {
+            ui.push_recent(format!("/g/{i}.nsp").into());
+        }
+        ui.push_recent("/g/12.nsp".into());
+        assert_eq!(ui.recent_files.len(), MAX_RECENT_FILES);
+        assert_eq!(ui.recent_files[0], PathBuf::from("/g/12.nsp"));
+        assert_eq!(ui.recent_files[1], PathBuf::from("/g/14.nsp"));
+    }
+
+    #[test]
+    fn controller_buttons() {
+        use NpadButton::*;
+        assert!(ControllerType::Switch2ProController.has_button(GL));
+        assert!(!ControllerType::ProController.has_button(C));
+        assert!(ControllerType::Switch2RightJoycon.has_button(C));
+        assert!(!ControllerType::Switch2LeftJoycon.has_button(C));
+        assert!(!ControllerType::LeftJoycon.has_button(A));
+        assert!(ControllerType::DualJoycons.has_button(RightSR));
+        assert!(!ControllerType::RightJoycon.has_left_stick());
     }
 
     #[test]
