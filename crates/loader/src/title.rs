@@ -15,6 +15,7 @@ use crate::exefs::load_exefs;
 use crate::npdm::Npdm;
 use crate::nro::load_nro;
 use crate::nso::{HashCheck, load_nso};
+use crate::patch::{ModOptions, Mods};
 use crate::program::ProgramImage;
 
 const ICON_LANGUAGES: [&str; 18] = [
@@ -62,10 +63,11 @@ pub struct TitleInfo {
 }
 
 /// Options that change how a title is loaded.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct LoadOptions {
     pub hashes: HashCheck,
     pub language: NacpLanguage,
+    pub mods: ModOptions,
 }
 
 impl Default for LoadOptions {
@@ -73,6 +75,7 @@ impl Default for LoadOptions {
         Self {
             hashes: HashCheck::Skip,
             language: NacpLanguage::AmericanEnglish,
+            mods: ModOptions::default(),
         }
     }
 }
@@ -269,8 +272,18 @@ impl LooseTitle {
     /// Lays out every module and builds the RomFS view the title will mount.
     pub fn load(&self, options: &LoadOptions) -> LoaderResult<ProgramImage> {
         let exefs = HostDir::open(&self.exefs)?;
-        let (npdm, modules) = load_exefs(exefs.as_ref(), options.hashes)?;
-        Ok(ProgramImage::new(npdm, modules, self.romfs()?, self.nacp()))
+        let npdm = exefs
+            .open_file("main.npdm")?
+            .ok_or(LoaderError::MissingNpdm)?;
+        let mods = Mods::find(&options.mods, Npdm::parse(&npdm.read_all()?)?.program_id)?;
+        let (npdm, mut modules) = load_exefs(mods.layer_exefs(exefs)?.as_ref(), options.hashes)?;
+        mods.patch_modules(&mut modules)?;
+        Ok(ProgramImage::new(
+            npdm,
+            modules,
+            mods.layer_romfs(self.romfs()?)?,
+            self.nacp(),
+        ))
     }
 }
 
@@ -563,6 +576,38 @@ mod tests {
 
         std::fs::remove_file(game.join("updates/131072/exefs/main")).unwrap();
         assert!(base.load(&LoadOptions::default()).unwrap().romfs.is_none());
+    }
+
+    #[test]
+    fn loose_titles_load_mods() {
+        let temp = TempDir::new("mods");
+        let game = temp.0.join("Game");
+        write_exefs(&game.join("exefs"), 0x0100_0000_0000_2000, 1);
+        std::fs::create_dir_all(game.join("romfs")).unwrap();
+        std::fs::write(game.join("romfs/a.txt"), b"base").unwrap();
+        let mod_romfs = temp.0.join("mods/0100000000002000/HD/romfs");
+        std::fs::create_dir_all(&mod_romfs).unwrap();
+        std::fs::write(mod_romfs.join("a.txt"), b"modded").unwrap();
+        let options = |disabled: &[&str]| LoadOptions {
+            mods: ModOptions {
+                load_root: Some(temp.0.join("mods")),
+                sdmc_root: None,
+                disabled: disabled.iter().map(|s| s.to_string()).collect(),
+            },
+            ..LoadOptions::default()
+        };
+        let read = |options: &LoadOptions| {
+            let image = LooseTitle::locate(&game).unwrap().load(options).unwrap();
+            let romfs = lichii_fs::romfs::open_romfs(image.romfs.as_ref().unwrap()).unwrap();
+            romfs
+                .open_file("a.txt")
+                .unwrap()
+                .unwrap()
+                .read_all()
+                .unwrap()
+        };
+        assert_eq!(read(&options(&[])), b"modded");
+        assert_eq!(read(&options(&["HD"])), b"base");
     }
 
     #[test]
