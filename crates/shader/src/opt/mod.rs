@@ -1,9 +1,14 @@
 //! IR passes. Every pass is linear or n log n in program size.
 
+mod global_memory_to_storage_buffer;
 mod ssa_rewrite;
 #[cfg(test)]
 mod tests;
 
+pub use global_memory_to_storage_buffer::{
+    global_memory_to_storage_buffer, join_storage_info, remap_storage_bindings,
+    storage_buffer_limit,
+};
 pub use ssa_rewrite::ssa_rewrite;
 
 use crate::ir::{BlockId, Opcode, Program, SyntaxNode, Value};

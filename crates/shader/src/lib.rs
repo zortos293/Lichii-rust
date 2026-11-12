@@ -102,6 +102,22 @@ pub trait ShaderEnvironment {
     fn is_cbuf_storage_buffer_pointer(&self, _index: u32, _offset: u32) -> bool {
         true
     }
+    /// A Switch 2 native program lowered to Maxwell instructions: its storage buffer pointers
+    /// are raw 8-byte arguments in constant buffers, without the NVN descriptor layout.
+    fn is_native_program(&self) -> bool {
+        false
+    }
+    /// Native programs: whether the 8 bytes at `indirect` past the pointer at constant buffer
+    /// `index`, `offset` are a mapped GPU address (a pointer table the program loads its buffer
+    /// pointer from).
+    fn is_cbuf_indirect_storage_buffer_pointer(
+        &self,
+        _index: u32,
+        _offset: u32,
+        _indirect: u32,
+    ) -> bool {
+        true
+    }
     /// Per-pipeline geometry passthrough mask (geometry shaders).
     fn gp_passthrough_mask(&self) -> [u32; 8] {
         [0; 8]
@@ -124,4 +140,6 @@ pub enum TranslateError {
     UntrackedIndirectBranch { address: GpuVAddr },
     #[error("control flow at {address:#x} cannot be structured")]
     Unstructured { address: GpuVAddr },
+    #[error("binding {count} storage buffers to a stage that binds {limit}")]
+    TooManyStorageBuffers { count: usize, limit: usize },
 }
