@@ -1,127 +1,194 @@
 //! Inline-to-memory transfers: data words written through a method land in GPU memory, pitch-
 //! linear or block-linear. The KeplerMemory engine (A140), the 3D engine and the compute engine
 //! all carry these registers.
+//!
+//! Data is written as it arrives, a bounded chunk at a time, straight to the bytes the transfer
+//! covers: nothing around them is read back, and no buffer grows with the transfer size.
 
-use lichii_texture::block_linear::{GOB_HEIGHT, Region, Tiling, swizzle_region};
+use lichii_common::GpuVAddr;
+use lichii_texture::block_linear::{GOB_HEIGHT, Tiling};
 
 use super::EngineContext;
 pub use super::maxwell_3d::regs::{UploadRegisters, UploadRegistersDest};
 
-/// One transfer in progress. Its buffer is reused across transfers.
-#[derive(Default)]
+/// Bytes buffered before they are written to GPU memory.
+const CHUNK_BYTES: usize = 0x1000;
+/// Bytes a block-linear write covers at most: one 16-byte unit of a GOB is contiguous.
+const UNIT_BYTES: usize = 16;
+
+#[derive(Clone, Copy)]
+enum Target {
+    Linear {
+        pitch: u64,
+    },
+    BlockLinear {
+        tiling: Tiling,
+        x: u32,
+        y: u32,
+        z: u32,
+    },
+    /// Out of its surface: the data words are consumed and dropped.
+    Discard,
+}
+
+/// One transfer in progress.
 pub struct Upload {
-    regs: Option<UploadRegisters>,
-    linear: bool,
-    buffer: Vec<u8>,
-    size: usize,
-    tiled: Vec<u8>,
+    target: Target,
+    address: GpuVAddr,
+    line_length: usize,
+    line_count: u32,
+    line: u32,
+    column: usize,
+    remaining: usize,
+    chunk: Vec<u8>,
+}
+
+impl Default for Upload {
+    fn default() -> Self {
+        Self {
+            target: Target::Discard,
+            address: 0,
+            line_length: 0,
+            line_count: 0,
+            line: 0,
+            column: 0,
+            remaining: 0,
+            chunk: Vec::with_capacity(CHUNK_BYTES),
+        }
+    }
 }
 
 impl Upload {
     /// LAUNCH_DMA / EXEC: starts a transfer of `line_length_in * line_count` bytes.
     pub fn exec(&mut self, regs: &UploadRegisters, linear: bool) {
-        self.regs = Some(*regs);
-        self.linear = linear;
-        self.size = regs.line_length_in as usize * regs.line_count as usize;
-        self.buffer.clear();
+        let dest = regs.dest;
+        self.address = dest.address();
+        self.line_length = regs.line_length_in as usize;
+        self.line_count = regs.line_count;
+        self.line = 0;
+        self.column = 0;
+        self.remaining = self.line_length * regs.line_count as usize;
+        self.chunk.clear();
+        self.target = if linear {
+            Target::Linear {
+                pitch: u64::from(dest.pitch),
+            }
+        } else {
+            block_linear_target(regs).unwrap_or_else(|| {
+                tracing::warn!(?dest, "block-linear inline upload outside its surface");
+                Target::Discard
+            })
+        };
     }
 
-    /// LOAD_INLINE_DATA: one data word. The transfer is written once all its bytes arrived.
+    /// LOAD_INLINE_DATA: one data word. Its bytes past the end of the transfer are ignored.
     pub fn data(&mut self, ctx: &mut EngineContext<'_>, word: u32) {
-        let left = self.size - self.buffer.len();
-        if self.regs.is_none() || left == 0 {
-            return;
+        let bytes = word.to_le_bytes();
+        let mut bytes = &bytes[..self.remaining.min(4)];
+        self.remaining -= bytes.len();
+        while !bytes.is_empty() {
+            let line_left = self.line_length - self.column - self.chunk.len();
+            let take = bytes
+                .len()
+                .min(line_left)
+                .min(CHUNK_BYTES - self.chunk.len());
+            self.chunk.extend_from_slice(&bytes[..take]);
+            bytes = &bytes[take..];
+            if take == line_left || self.chunk.len() == CHUNK_BYTES {
+                self.write_chunk(ctx);
+            }
         }
-        self.buffer
-            .extend_from_slice(&word.to_le_bytes()[..left.min(4)]);
-        if self.buffer.len() == self.size {
+        if self.remaining == 0 && self.line_length != 0 && self.line_count != 0 {
             self.finish(ctx);
         }
     }
 
-    fn finish(&mut self, ctx: &mut EngineContext<'_>) {
-        let Some(regs) = self.regs.take() else {
-            return;
-        };
-        let dest = regs.dest;
-        let address = dest.address();
-        if self.linear {
-            let line = regs.line_length_in as usize;
-            for (i, chunk) in self.buffer.chunks(line.max(1)).enumerate() {
-                let line_address = address + i as u64 * u64::from(dest.pitch);
-                if let Err(fault) = ctx.memory.write_block(line_address, chunk) {
+    fn write_chunk(&mut self, ctx: &mut EngineContext<'_>) {
+        match self.target {
+            Target::Linear { pitch } => {
+                let address = self.address + u64::from(self.line) * pitch + self.column as u64;
+                if let Err(fault) = ctx.memory.write_block(address, &self.chunk) {
                     tracing::warn!(?fault, "inline upload to unmapped GPU memory");
                 }
             }
-            let span = u64::from(dest.pitch) * u64::from(regs.line_count.saturating_sub(1))
-                + u64::from(regs.line_length_in);
-            ctx.rasterizer
-                .inline_written(ctx.channel, ctx.memory, address, span);
-            return;
+            Target::BlockLinear { tiling, x, y, z } => {
+                let tiling = Tiling {
+                    layout: ctx.gob_layout,
+                    ..tiling
+                };
+                let mut done = 0;
+                while done < self.chunk.len() {
+                    let byte_x = x + (self.column + done) as u32;
+                    let len =
+                        (UNIT_BYTES - byte_x as usize % UNIT_BYTES).min(self.chunk.len() - done);
+                    let offset = tiling.offset(byte_x, y + self.line, z) as u64;
+                    if let Err(fault) = ctx
+                        .memory
+                        .write_block(self.address + offset, &self.chunk[done..done + len])
+                    {
+                        tracing::warn!(?fault, "block-linear inline upload to unmapped GPU memory");
+                    }
+                    done += len;
+                }
+            }
+            Target::Discard => {}
         }
-        let shift = [dest.width, regs.line_length_in, dest.x, address as u32]
-            .into_iter()
-            .fold(4, |shift, v| shift.min(v.trailing_zeros()));
-        let bytes_per_pixel = 1 << shift;
-        let block_height = dest.block_height();
-        let tiling = Tiling::new(
-            dest.width >> shift,
-            dest.height,
-            dest.depth.max(1),
-            bytes_per_pixel,
-            block_height,
-            dest.block_depth(),
-            ctx.gob_layout,
-        );
-        let region = Region {
-            x: dest.x >> shift,
-            y: dest.y,
-            z: dest.layer.min(tiling.depth - 1),
-            width: regs.line_length_in >> shift,
-            height: regs.line_count,
-            depth: 1,
-        };
-        if region.x + region.width > tiling.width || region.y + region.height > tiling.height {
-            tracing::warn!(?region, "block-linear inline upload outside its surface");
-            return;
+        self.column += self.chunk.len();
+        self.chunk.clear();
+        if self.column == self.line_length {
+            self.column = 0;
+            self.line += 1;
         }
-        let (base, band, band_region) = if tiling.depth == 1 {
-            let rows = GOB_HEIGHT << block_height;
-            let first = region.y / rows * rows;
-            let last = (region.y + region.height).div_ceil(rows) * rows;
-            let band = Tiling {
-                height: last - first,
-                ..tiling
-            };
-            let base = tiling.offset(0, first, 0) as u64;
-            (
-                base,
-                band,
-                Region {
-                    y: region.y - first,
-                    z: 0,
-                    ..region
-                },
-            )
-        } else {
-            (0, tiling, region)
-        };
-        self.tiled.resize(band.size_bytes(), 0);
-        let target = address + base;
-        if let Err(fault) = ctx.memory.read_block(target, &mut self.tiled) {
-            tracing::warn!(?fault, "block-linear inline upload to unmapped GPU memory");
-        }
-        swizzle_region(
-            &band,
-            band_region,
-            &self.buffer,
-            &mut self.tiled,
-            Some(regs.line_length_in as usize),
-        );
-        if let Err(fault) = ctx.memory.write_block(target, &self.tiled) {
-            tracing::warn!(?fault, "block-linear inline upload to unmapped GPU memory");
-        }
-        ctx.rasterizer
-            .inline_written(ctx.channel, ctx.memory, target, self.tiled.len() as u64);
     }
+
+    fn finish(&mut self, ctx: &mut EngineContext<'_>) {
+        let (start, size) = match self.target {
+            Target::Linear { pitch } => (
+                self.address,
+                pitch * u64::from(self.line_count - 1) + self.line_length as u64,
+            ),
+            Target::BlockLinear { tiling, y, z, .. } if tiling.depth == 1 => {
+                let rows = GOB_HEIGHT << tiling.block_height_log2;
+                let first = y / rows * rows;
+                let last = (y + self.line_count).div_ceil(rows) * rows;
+                let band = Tiling {
+                    height: last - first,
+                    ..tiling
+                };
+                (
+                    self.address + tiling.offset(0, first, z) as u64,
+                    band.size_bytes() as u64,
+                )
+            }
+            Target::BlockLinear { tiling, .. } => (self.address, tiling.size_bytes() as u64),
+            Target::Discard => return,
+        };
+        self.target = Target::Discard;
+        ctx.rasterizer
+            .inline_written(ctx.channel, ctx.memory, start, size);
+    }
+}
+
+/// The surface a block-linear transfer writes, in bytes (the GOB layout does not depend on the
+/// element size), or `None` when the transfer does not fit inside it.
+fn block_linear_target(regs: &UploadRegisters) -> Option<Target> {
+    let dest = regs.dest;
+    let depth = dest.depth.max(1);
+    let z = dest.layer.min(depth - 1);
+    let fits = dest.x.checked_add(regs.line_length_in)? <= dest.width
+        && dest.y.checked_add(regs.line_count)? <= dest.height;
+    fits.then(|| Target::BlockLinear {
+        tiling: Tiling::new(
+            dest.width,
+            dest.height,
+            depth,
+            1,
+            dest.block_height(),
+            dest.block_depth(),
+            Default::default(),
+        ),
+        x: dest.x,
+        y: dest.y,
+        z,
+    })
 }

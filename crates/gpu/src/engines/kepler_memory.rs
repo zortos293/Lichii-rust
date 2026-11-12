@@ -138,4 +138,39 @@ mod tests {
         let row2 = lichii_texture::block_linear::gob_offset(0, 2, Default::default()) as usize;
         assert_eq!(&gob[row2..row2 + 4], &16u32.to_le_bytes());
     }
+
+    #[test]
+    fn upload_past_the_surface_is_dropped() {
+        let mut h = Harness::new();
+        let mut engine = KeplerMemory::new();
+        setup(&mut engine, &mut h, 0x20_0000, 4, 1);
+        let dest = reg_index!(Regs, upload.dest);
+        write(&mut engine, &mut h, dest + 4, 64);
+        write(&mut engine, &mut h, dest + 5, 8);
+        write(&mut engine, &mut h, dest + 9, u32::MAX);
+        write(&mut engine, &mut h, reg_index!(Regs, exec), 0);
+        write(&mut engine, &mut h, reg_index!(Regs, data), 0xdead_beef);
+        assert!(h.rasterizer.inline_writes.is_empty());
+    }
+
+    #[test]
+    fn long_linear_upload_streams_in_chunks() {
+        let mut h = Harness::new();
+        let mut engine = KeplerMemory::new();
+        let words = 0x1800u32;
+        setup(&mut engine, &mut h, 0x30_0000, words * 4, 1);
+        write(&mut engine, &mut h, reg_index!(Regs, exec), 1);
+        for i in 0..words {
+            write(&mut engine, &mut h, reg_index!(Regs, data), i);
+        }
+        let mut out = vec![0u32; words as usize];
+        h.memory
+            .read_block(0x30_0000, bytemuck::cast_slice_mut(&mut out))
+            .unwrap();
+        assert!(out.iter().enumerate().all(|(i, &w)| w == i as u32));
+        assert_eq!(
+            h.rasterizer.inline_writes,
+            vec![(0x30_0000, u64::from(words) * 4)]
+        );
+    }
 }
