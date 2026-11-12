@@ -112,7 +112,10 @@ mod tests {
         let mut second = [0u8; 6];
         h.memory.read_block(0x10_0100, &mut second).unwrap();
         assert_eq!(second, [7, 8, 9, 10, 11, 12]);
-        assert_eq!(h.rasterizer.inline_writes, vec![(0x10_0000, 0x106)]);
+        assert_eq!(
+            h.rasterizer.inline_writes,
+            vec![(0x10_0000, 6), (0x10_0100, 6)]
+        );
     }
 
     #[test]
@@ -137,5 +140,45 @@ mod tests {
         assert_eq!(&gob[row1 + 4..row1 + 8], &1u32.to_le_bytes());
         let row2 = lichii_texture::block_linear::gob_offset(0, 2, Default::default()) as usize;
         assert_eq!(&gob[row2..row2 + 4], &16u32.to_le_bytes());
+        let spans = &h.rasterizer.inline_writes;
+        assert_eq!(spans.len(), 2);
+        assert!(
+            spans
+                .iter()
+                .all(|&(address, size)| address >= 0x20_0000 && size < 512)
+        );
+    }
+
+    #[test]
+    fn upload_past_the_surface_is_dropped() {
+        let mut h = Harness::new();
+        let mut engine = KeplerMemory::new();
+        setup(&mut engine, &mut h, 0x20_0000, 4, 1);
+        let dest = reg_index!(Regs, upload.dest);
+        write(&mut engine, &mut h, dest + 4, 64);
+        write(&mut engine, &mut h, dest + 5, 8);
+        write(&mut engine, &mut h, dest + 9, u32::MAX);
+        write(&mut engine, &mut h, reg_index!(Regs, exec), 0);
+        write(&mut engine, &mut h, reg_index!(Regs, data), 0xdead_beef);
+        assert!(h.rasterizer.inline_writes.is_empty());
+    }
+
+    #[test]
+    fn long_linear_upload_streams_in_chunks() {
+        let mut h = Harness::new();
+        let mut engine = KeplerMemory::new();
+        let words = 0x1800u32;
+        setup(&mut engine, &mut h, 0x30_0000, words * 4, 1);
+        write(&mut engine, &mut h, reg_index!(Regs, exec), 1);
+        for i in 0..words {
+            write(&mut engine, &mut h, reg_index!(Regs, data), i);
+        }
+        let mut out = vec![0u32; words as usize];
+        h.memory
+            .read_block(0x30_0000, bytemuck::cast_slice_mut(&mut out))
+            .unwrap();
+        assert!(out.iter().enumerate().all(|(i, &w)| w == i as u32));
+        let chunks: Vec<_> = (0..6).map(|i| (0x30_0000 + i * 0x1000, 0x1000)).collect();
+        assert_eq!(h.rasterizer.inline_writes, chunks);
     }
 }

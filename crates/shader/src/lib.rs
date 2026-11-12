@@ -4,6 +4,11 @@
 //! depends on, and gets back a [\`ShaderModule\`] with SPIR-V and the resource layout the
 //! pipeline needs. The shader crew owns everything here; the Vulkan crew consumes it.
 
+pub mod ampere;
+pub mod flow;
+pub mod ir;
+pub mod maxwell;
+
 use lichii_common::GpuVAddr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -54,6 +59,10 @@ pub struct ShaderModule {
 pub enum TranslateError {
     #[error("unsupported instruction {opcode:#x} at {address:#x}")]
     Unsupported { address: GpuVAddr, opcode: u128 },
+    #[error("invalid instruction encoding {raw:#x} at {address:#x}")]
+    Invalid { address: GpuVAddr, raw: u128 },
+    #[error("indirect branch at {address:#x} has no trackable jump table")]
+    UntrackedIndirectBranch { address: GpuVAddr },
     #[error("control flow at {address:#x} cannot be structured")]
     Unstructured { address: GpuVAddr },
 }

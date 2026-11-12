@@ -3,12 +3,14 @@
 //! [`vfs`] defines random-access files and directories with cheap offset views, concatenation
 //! and layering; [`host`] backs them with host directories for NAND, SD card and save data.
 //! The containers parse into those traits: PFS0/HFS0 ([`pfs`]), RomFS ([`romfs`]), and the
-//! metadata formats NACP ([`nacp`]) and CNMT ([`cnmt`]).
+//! metadata formats NACP ([`nacp`]) and CNMT ([`cnmt`]). [`ips`] applies IPS and IPSwitch
+//! patches to executables and RomFS files.
 
 mod bytes;
 pub mod cnmt;
 mod error;
 pub mod host;
+pub mod ips;
 pub mod nacp;
 pub mod pfs;
 pub mod romfs;

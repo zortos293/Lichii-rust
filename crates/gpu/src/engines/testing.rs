@@ -22,6 +22,7 @@ pub const MAPPED: u64 = 0x40_0000;
 #[derive(Default)]
 pub struct Recorder {
     pub inline_writes: Vec<(GpuVAddr, u64)>,
+    pub flushes: Vec<(DAddr, u64)>,
 }
 
 impl Rasterizer for Recorder {
@@ -42,7 +43,9 @@ impl Rasterizer for Recorder {
     fn signal_fence(&mut self, _action: FenceAction) {}
     fn release_fences(&mut self, _wait: bool) {}
     fn invalidate_region(&mut self, _addr: DAddr, _size: u64) {}
-    fn flush_region(&mut self, _addr: DAddr, _size: u64) {}
+    fn flush_region(&mut self, addr: DAddr, size: u64) {
+        self.flushes.push((addr, size));
+    }
     fn wait_for_idle(&mut self) {}
     fn present(&mut self, _framebuffer: &FramebufferConfig) {}
 }
