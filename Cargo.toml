@@ -39,6 +39,7 @@ crossbeam-channel = "0.5"
 ash = "0.38"
 egui = "0.37"
 raw-window-handle = "0.6"
+winit = "0.30"
 
 [profile.dev]
 opt-level = 1

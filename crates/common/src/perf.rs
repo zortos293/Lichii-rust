@@ -62,7 +62,7 @@ impl PerfStats {
         }
     }
 
-    /// A guest frame finished (the title queued a buffer); \`target_hz\` is its intended rate.
+    /// A guest frame finished (the title queued a buffer); `target_hz` is its intended rate.
     pub fn record_guest_frame(&self, at: Instant, target_hz: f32) {
         let mut state = self.state.lock().unwrap();
         state.guest_frames.push_back(at);
@@ -90,7 +90,7 @@ impl PerfStats {
         self.state.lock().unwrap().render_size = (width, height);
     }
 
-    /// Numbers over the last \`window\` (e.g. the frame view's graph length).
+    /// Numbers over the last `window` (e.g. the frame view's graph length).
     pub fn snapshot(&self, now: Instant, window: Duration) -> PerfSnapshot {
         let state = self.state.lock().unwrap();
         let recent: Vec<&FrameSample> = state

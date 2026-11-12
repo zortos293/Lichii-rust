@@ -8,3 +8,7 @@ license.workspace = true
 lichii-common.workspace = true
 bytemuck.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+bcdec_rs = "0.2.1"
+texture2ddecoder = "0.1.2"
