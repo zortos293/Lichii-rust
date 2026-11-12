@@ -1,0 +1,271 @@
+//! What a translated program uses, so the renderer can build descriptor set layouts, vertex
+//! input state and pipeline state. Filled by the collect-info, storage buffer and texture passes.
+
+use crate::ir::{Attribute, ImageFormat, TextureType, Type};
+
+/// One bit per attribute (indexed by `Attribute.0`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct VaryingState(pub [u64; 8]);
+
+impl VaryingState {
+    pub fn set(&mut self, attribute: Attribute, state: bool) {
+        let (word, bit) = (attribute.0 as usize / 64, attribute.0 % 64);
+        if word >= self.0.len() {
+            return;
+        }
+        if state {
+            self.0[word] |= 1 << bit;
+        } else {
+            self.0[word] &= !(1 << bit);
+        }
+    }
+
+    pub fn get(&self, attribute: Attribute) -> bool {
+        let (word, bit) = (attribute.0 as usize / 64, attribute.0 % 64);
+        self.0.get(word).is_some_and(|w| w & (1 << bit) != 0)
+    }
+
+    pub fn any_component(&self, base: Attribute) -> bool {
+        (0..4).any(|i| self.get(base.offset(i)))
+    }
+
+    pub fn all_components(&self, base: Attribute) -> bool {
+        (0..4).all(|i| self.get(base.offset(i)))
+    }
+
+    pub fn generic(&self, index: u16) -> bool {
+        self.any_component(Attribute::generic(index, 0))
+    }
+
+    pub fn generic_component(&self, index: u16, component: u16) -> bool {
+        self.get(Attribute::generic(index, component))
+    }
+
+    pub fn clip_distances(&self) -> bool {
+        self.any_component(Attribute::CLIP_DISTANCE_0)
+            || self.any_component(Attribute::CLIP_DISTANCE_0.offset(4))
+    }
+
+    pub fn fixed_function_texture(&self) -> bool {
+        (0..Attribute::NUM_FIXED_FNC_TEXTURES)
+            .any(|i| self.any_component(Attribute::FIXED_FNC_TEXTURE_0_S.offset(i * 4)))
+    }
+
+    pub fn legacy(&self) -> bool {
+        self.any_component(Attribute::COLOR_FRONT_DIFFUSE_R)
+            || self.any_component(Attribute::COLOR_FRONT_SPECULAR_R)
+            || self.any_component(Attribute::COLOR_BACK_DIFFUSE_R)
+            || self.any_component(Attribute::COLOR_BACK_SPECULAR_R)
+            || self.fixed_function_texture()
+            || self.get(Attribute::FOG_COORDINATE)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Interpolation {
+    #[default]
+    Smooth,
+    Flat,
+    NoPerspective,
+}
+
+/// A guest constant buffer bound as a uniform buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ConstantBufferDescriptor {
+    pub index: u32,
+    pub count: u32,
+}
+
+/// A guest global memory region bound as a storage buffer. Its GPU address and size are the
+/// 64-bit address and 32-bit size at `cbuf_offset` of constant buffer `cbuf_index`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StorageBufferDescriptor {
+    pub cbuf_index: u32,
+    pub cbuf_offset: u32,
+    pub count: u32,
+    pub is_written: bool,
+}
+
+/// Where a texture handle comes from: the word at `cbuf_offset` of constant buffer
+/// `cbuf_index`, shifted left by `shift_left`, ORed with an optional secondary word (separate
+/// sampler handles).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct HandleSource {
+    pub cbuf_index: u32,
+    pub cbuf_offset: u32,
+    pub shift_left: u32,
+    pub secondary: Option<(u32, u32, u32)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TextureBufferDescriptor {
+    pub handle: HandleSource,
+    /// Array length; consecutive handles are `1 << size_shift` bytes apart.
+    pub count: u32,
+    pub size_shift: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ImageBufferDescriptor {
+    pub format: ImageFormat,
+    pub is_written: bool,
+    pub is_read: bool,
+    pub is_integer: bool,
+    pub cbuf_index: u32,
+    pub cbuf_offset: u32,
+    pub count: u32,
+    pub size_shift: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TextureDescriptor {
+    pub ty: TextureType,
+    pub is_depth: bool,
+    pub is_multisample: bool,
+    pub is_integer: bool,
+    pub handle: HandleSource,
+    pub count: u32,
+    pub size_shift: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ImageDescriptor {
+    pub ty: TextureType,
+    pub format: ImageFormat,
+    pub is_written: bool,
+    pub is_read: bool,
+    pub is_integer: bool,
+    pub cbuf_index: u32,
+    pub cbuf_offset: u32,
+    pub count: u32,
+    pub size_shift: u32,
+}
+
+/// Task and mesh program layout (Switch 2 NVN task/mesh, see NX2_NOTES row 89).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MeshInfo {
+    /// Task output / mesh input region, in 32-bit words.
+    pub payload_words: u32,
+    pub max_vertices: u32,
+    pub max_primitives: u32,
+    /// SET_MESH_SHADER_A output topology (0 points, 1 lines, 4 triangles).
+    pub topology: u32,
+    pub vertex_lines: Vec<u32>,
+    pub primitive_lines: Vec<u32>,
+}
+
+impl MeshInfo {
+    pub fn primitive_vertices(&self) -> u32 {
+        match self.topology {
+            0 => 1,
+            1 => 2,
+            _ => 3,
+        }
+    }
+}
+
+/// Everything the renderer needs to know about a translated program.
+///
+/// Descriptor order is binding order: uniform buffers, storage buffers, texture buffers, image
+/// buffers, textures, images, each in the order of its vector.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ShaderInfo {
+    pub uses_workgroup_id: bool,
+    pub uses_local_invocation_id: bool,
+    pub uses_invocation_id: bool,
+    pub uses_invocation_info: bool,
+    pub uses_sample_id: bool,
+    pub uses_is_helper_invocation: bool,
+    pub uses_subgroup_invocation_id: bool,
+    pub uses_subgroup_shuffles: bool,
+    pub uses_quad_shuffles: bool,
+    pub uses_patches: [bool; 30],
+
+    pub interpolation: [Interpolation; 32],
+    pub loads: VaryingState,
+    pub stores: VaryingState,
+    pub passthrough: VaryingState,
+    /// Legacy attributes (colours, fog, fixed function textures) rewritten to generics.
+    pub legacy_stores_mapping: Vec<(Attribute, Attribute)>,
+
+    pub loads_indexed_attributes: bool,
+    pub stores_frag_color: [bool; 8],
+    pub frag_color_components: [u8; 8],
+    pub stores_sample_mask: bool,
+    pub stores_frag_depth: bool,
+    pub stores_tess_level_outer: bool,
+    pub stores_tess_level_inner: bool,
+    pub stores_indexed_attributes: bool,
+    pub stores_global_memory: bool,
+
+    pub uses_local_memory: bool,
+    pub uses_fp16: bool,
+    pub uses_fp64: bool,
+    pub uses_fp16_denorms_flush: bool,
+    pub uses_fp16_denorms_preserve: bool,
+    pub uses_fp32_denorms_flush: bool,
+    pub uses_fp32_denorms_preserve: bool,
+    pub uses_int8: bool,
+    pub uses_int16: bool,
+    pub uses_int64: bool,
+    pub uses_image_1d: bool,
+    pub uses_sampled_1d: bool,
+    pub uses_sparse_residency: bool,
+    pub uses_demote_to_helper_invocation: bool,
+    pub uses_subgroup_vote: bool,
+    pub uses_subgroup_mask: bool,
+    pub uses_fswzadd: bool,
+    pub uses_derivatives: bool,
+    pub uses_typeless_image_reads: bool,
+    pub uses_typeless_image_writes: bool,
+    pub uses_image_buffers: bool,
+    pub uses_shared_increment: bool,
+    pub uses_shared_decrement: bool,
+    pub uses_global_increment: bool,
+    pub uses_global_decrement: bool,
+    pub uses_atomic_f32_add: bool,
+    pub uses_atomic_f16x2_add: bool,
+    pub uses_atomic_f16x2_min: bool,
+    pub uses_atomic_f16x2_max: bool,
+    pub uses_atomic_f32x2_add: bool,
+    pub uses_atomic_f32x2_min: bool,
+    pub uses_atomic_f32x2_max: bool,
+    pub uses_atomic_s32_min: bool,
+    pub uses_atomic_s32_max: bool,
+    pub uses_int64_bit_atomics: bool,
+    pub uses_global_memory: bool,
+    pub uses_atomic_image_u32: bool,
+    pub uses_shadow_lod: bool,
+    pub uses_rescaling_uniform: bool,
+    pub uses_cbuf_indirect: bool,
+    pub uses_render_area: bool,
+    pub removed_conditional_barrier: bool,
+
+    pub used_constant_buffer_types: Type,
+    pub used_storage_buffer_types: Type,
+    pub used_indirect_cbuf_types: Type,
+    /// Bit `i` is set when constant buffer `i` is read.
+    pub constant_buffer_mask: u32,
+    /// Bytes read from each constant buffer, rounded up.
+    pub constant_buffer_used_sizes: [u32; ShaderInfo::MAX_CBUFS],
+    /// NVN driver storage buffer slots (constant buffer 0) the program may address.
+    pub nvn_buffer_used: u16,
+    pub requires_layer_emulation: bool,
+    pub emulated_layer: Option<Attribute>,
+    pub used_clip_distances: u32,
+
+    pub constant_buffer_descriptors: Vec<ConstantBufferDescriptor>,
+    pub storage_buffers_descriptors: Vec<StorageBufferDescriptor>,
+    pub texture_buffer_descriptors: Vec<TextureBufferDescriptor>,
+    pub image_buffer_descriptors: Vec<ImageBufferDescriptor>,
+    pub texture_descriptors: Vec<TextureDescriptor>,
+    pub image_descriptors: Vec<ImageDescriptor>,
+
+    pub mesh: MeshInfo,
+}
+
+impl ShaderInfo {
+    pub const MAX_CBUFS: usize = 18;
+    pub const MAX_INDIRECT_CBUFS: usize = 14;
+    pub const MAX_SSBOS: usize = 64;
+}

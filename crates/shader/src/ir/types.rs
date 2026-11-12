@@ -4,7 +4,7 @@ use std::fmt;
 
 bitflags::bitflags! {
     /// Type of an IR value. Opcode signatures use single flags; `OPAQUE` matches anything.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
     pub struct Type: u32 {
         const OPAQUE = 1 << 0;
         const REG = 1 << 1;

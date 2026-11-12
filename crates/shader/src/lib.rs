@@ -6,8 +6,16 @@
 
 pub mod ampere;
 pub mod flow;
+pub mod info;
 pub mod ir;
 pub mod maxwell;
+pub mod opt;
+pub mod profile;
+pub mod runtime;
+
+pub use info::ShaderInfo;
+pub use profile::Profile;
+pub use runtime::RuntimeInfo;
 
 use lichii_common::GpuVAddr;
 
