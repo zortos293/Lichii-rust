@@ -49,7 +49,8 @@ pub mod translate;
 
 pub use info::ShaderInfo;
 pub use module::{
-    DescriptorBinding, DescriptorKind, DescriptorSetLayout, ResourceLayout, ShaderModule,
+    DescriptorBinding, DescriptorKind, DescriptorSetLayout, ResourceLayout, ShaderModule, compile,
+    compile_dual_vertex,
 };
 pub use profile::Profile;
 pub use runtime::RuntimeInfo;
@@ -155,6 +156,8 @@ pub enum TranslateError {
     Unstructured { address: GpuVAddr },
     #[error("cannot lower {0}")]
     Lowering(String),
+    #[error(transparent)]
+    Emit(#[from] backend::spirv::EmitError),
     #[error("translation produced invalid IR: {0}")]
     InvalidIr(String),
     #[error("invalid program header at {address:#x}")]

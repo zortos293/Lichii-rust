@@ -1,7 +1,63 @@
 //! The translated-module contract the renderer consumes: SPIR-V, a stable cache key, and the
 //! descriptor layout the pipeline must bind.
 
-use crate::{ShaderInfo, ShaderStage};
+use std::hash::{Hash, Hasher};
+
+use crate::backend::Bindings;
+use crate::backend::spirv::emit_spirv;
+use crate::hash::StableHasher;
+use crate::translate::{TranslateOptions, TranslatedProgram, translate, translate_dual_vertex};
+use crate::{RuntimeInfo, ShaderEnvironment, ShaderInfo, ShaderStage, TranslateError};
+
+/// Translates the program `env` describes and emits it as SPIR-V. `bindings` carries the next
+/// free descriptor binding from one stage of a pipeline to the next; the layout assumes
+/// [`crate::Profile::unified_descriptor_binding`].
+pub fn compile(
+    env: &dyn ShaderEnvironment,
+    options: TranslateOptions<'_>,
+    runtime: &RuntimeInfo,
+    bindings: &mut Bindings,
+) -> Result<ShaderModule, TranslateError> {
+    finish(translate(env, options)?, options, runtime, bindings)
+}
+
+/// Like [`compile`] for a VertexA/VertexB pair, which becomes one VertexB module.
+pub fn compile_dual_vertex(
+    env_a: &dyn ShaderEnvironment,
+    env_b: &dyn ShaderEnvironment,
+    options: TranslateOptions<'_>,
+    runtime: &RuntimeInfo,
+    bindings: &mut Bindings,
+) -> Result<ShaderModule, TranslateError> {
+    finish(
+        translate_dual_vertex(env_a, env_b, options)?,
+        options,
+        runtime,
+        bindings,
+    )
+}
+
+fn finish(
+    program: TranslatedProgram,
+    options: TranslateOptions<'_>,
+    runtime: &RuntimeInfo,
+    bindings: &mut Bindings,
+) -> Result<ShaderModule, TranslateError> {
+    let first_binding = bindings.unified;
+    let spirv = emit_spirv(options.profile, runtime, &program, bindings)?;
+    let resources = ResourceLayout::for_module(&program.info, first_binding);
+    debug_assert_eq!(resources.next_binding(first_binding), bindings.unified);
+    let mut hasher = StableHasher::new();
+    program.hash.hash(&mut hasher);
+    format!("{runtime:?}").hash(&mut hasher);
+    Ok(ShaderModule {
+        spirv,
+        hash: hasher.finish(),
+        stage: program.stage,
+        resources,
+        info: program.info,
+    })
+}
 
 /// A translated program, ready to become a Vulkan shader module.
 #[derive(Clone, Debug)]
@@ -145,7 +201,40 @@ impl ResourceLayout {
 
 #[cfg(test)]
 mod tests {
+    use lichii_common::settings::ResolutionScale;
+
     use super::*;
+    use crate::Profile;
+    use crate::maxwell::opcode::Opcode as Sass;
+    use crate::maxwell::translate::tests::{TestEnv, encode};
+    use crate::profile::HostTranslateInfo;
+
+    #[test]
+    fn compile_produces_a_keyed_module() {
+        let env = TestEnv::new(&[encode(Sass::Exit, (7 << 16) | 0xf)]);
+        let profile = Profile::default();
+        let host = HostTranslateInfo::default();
+        let options = TranslateOptions {
+            profile: &profile,
+            host: &host,
+            resolution_scale: ResolutionScale::X1,
+        };
+        let module = |runtime: &RuntimeInfo| {
+            let mut bindings = Bindings::default();
+            compile(&env, options, runtime, &mut bindings).expect("compile")
+        };
+        let runtime = RuntimeInfo::default();
+        let first = module(&runtime);
+        assert_eq!(first.stage, ShaderStage::Compute);
+        assert_eq!(first.spirv[0], 0x0723_0203);
+        assert_ne!(first.hash, 0);
+        assert_eq!(first.hash, module(&runtime).hash);
+        let other = RuntimeInfo {
+            alpha_test_reference: 0.5,
+            ..RuntimeInfo::default()
+        };
+        assert_ne!(first.hash, module(&other).hash);
+    }
     use crate::info::{ConstantBufferDescriptor, StorageBufferDescriptor, TextureDescriptor};
 
     #[test]
