@@ -1,14 +1,11 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-use lichii_common::{PAGE_BITS, PAGE_MASK, PAGE_SIZE, PAddr, VAddr};
-use parking_lot::Mutex;
+use lichii_common::{PAGE_MASK, PAGE_SIZE, PAddr, VAddr};
 
 use crate::PhysicalMemory;
-
-const L2_BITS: u32 = 14;
-const L2_ENTRIES: usize = 1 << L2_BITS;
-const PERM_MASK: usize = 0xfff;
+use crate::fault::{FaultHandler, Registration};
+use crate::host::{Arena, HostProtection};
+use crate::page_table::PageTable;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct MemoryPermission(pub u8);
@@ -23,6 +20,16 @@ impl MemoryPermission {
 
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
+    }
+
+    fn host(self) -> HostProtection {
+        if self.contains(Self::WRITE) {
+            HostProtection::ReadWrite
+        } else if self.contains(Self::READ) {
+            HostProtection::Read
+        } else {
+            HostProtection::None
+        }
     }
 }
 
@@ -39,40 +46,101 @@ pub struct MemoryFault {
     pub kind: FaultKind,
 }
 
-type L2Table = [AtomicUsize; L2_ENTRIES];
+impl MemoryFault {
+    pub const fn unmapped(addr: VAddr) -> Self {
+        Self {
+            addr,
+            kind: FaultKind::Unmapped,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum FastmemError {
+    #[error("the DRAM backing cannot be mapped as views on this host")]
+    NoViews,
+    #[error("host fault handling for fastmem is unsupported on this host")]
+    NoFaultHandler,
+    #[error("reserving the fastmem arena: {0}")]
+    Reserve(std::io::Error),
+}
+
+/// A host range of `2^address_space_bits` bytes that mirrors the guest address space: guest page
+/// `va` is mapped at `base + va` with host protection matching the guest permission, and
+/// unmapped pages are inaccessible. The JIT emits direct host loads and stores against it.
+pub struct Fastmem {
+    arena: Arena,
+    registration: Registration,
+}
+
+impl Fastmem {
+    /// Host address of guest address 0.
+    pub fn base(&self) -> *mut u8 {
+        self.arena.base()
+    }
+
+    pub fn size(&self) -> usize {
+        self.arena.size()
+    }
+
+    /// Sets the handler for host faults inside this arena (unmapped or protected guest pages).
+    /// `data` is passed back to the handler. See [`FaultHandler`] for its restrictions.
+    pub fn set_fault_handler(&self, handler: Option<FaultHandler>, data: usize) {
+        self.registration.set_handler(handler, data);
+    }
+}
 
 /// A process's guest virtual address space.
 pub struct AddressSpace {
-    bits: u32,
-    l1: Box<[AtomicPtr<L2Table>]>,
-    grow: Mutex<()>,
+    table: PageTable,
     physical: Arc<PhysicalMemory>,
+    fastmem: Option<Fastmem>,
 }
 
 impl AddressSpace {
-    /// \`address_space_bits\` is 32, 36 or 39 for Horizon processes.
+    /// `address_space_bits` is 32, 36 or 39 for Horizon processes.
     pub fn new(physical: Arc<PhysicalMemory>, address_space_bits: u32) -> Self {
-        let l1_len = 1usize << address_space_bits.saturating_sub(PAGE_BITS + L2_BITS);
-        let l1 = (0..l1_len)
-            .map(|_| AtomicPtr::new(std::ptr::null_mut()))
-            .collect();
         Self {
-            bits: address_space_bits,
-            l1,
-            grow: Mutex::new(()),
+            table: PageTable::new(address_space_bits),
             physical,
+            fastmem: None,
         }
     }
 
+    /// Like [`AddressSpace::new`], with a [`Fastmem`] arena kept in sync with every map.
+    pub fn with_fastmem(
+        physical: Arc<PhysicalMemory>,
+        address_space_bits: u32,
+    ) -> Result<Self, FastmemError> {
+        if !physical.supports_views() {
+            return Err(FastmemError::NoViews);
+        }
+        let arena = Arena::reserve(1usize << address_space_bits).map_err(FastmemError::Reserve)?;
+        let registration = Registration::new(arena.base() as usize, arena.size())
+            .ok_or(FastmemError::NoFaultHandler)?;
+        Ok(Self {
+            table: PageTable::new(address_space_bits),
+            physical,
+            fastmem: Some(Fastmem {
+                arena,
+                registration,
+            }),
+        })
+    }
+
     pub fn address_space_bits(&self) -> u32 {
-        self.bits
+        self.table.bits()
     }
 
     pub fn physical(&self) -> &Arc<PhysicalMemory> {
         &self.physical
     }
 
-    /// Maps \`size\` bytes of DRAM at \`pa\` to \`va\`. Both must be page aligned.
+    pub fn fastmem(&self) -> Option<&Fastmem> {
+        self.fastmem.as_ref()
+    }
+
+    /// Maps `size` bytes of DRAM at `pa` to `va`. Both must be page aligned.
     pub fn map(&self, va: VAddr, pa: PAddr, size: u64, perm: MemoryPermission) {
         assert_eq!(
             (va | pa | size) & PAGE_MASK,
@@ -83,10 +151,24 @@ impl AddressSpace {
             pa + size <= self.physical.size(),
             "map past the end of DRAM"
         );
+        if let Err(err) = self.physical.commit(pa, size) {
+            panic!("{err}");
+        }
         for page in 0..size / PAGE_SIZE {
-            let host = self.physical.pointer(pa + page * PAGE_SIZE) as usize;
-            self.entry_for_write(va + page * PAGE_SIZE)
-                .store(host | perm.0 as usize, Ordering::Release);
+            let host = self.physical.pointer(pa + page * PAGE_SIZE);
+            self.table.set(va + page * PAGE_SIZE, host, perm);
+        }
+        if let Some(fastmem) = &self.fastmem {
+            fastmem
+                .arena
+                .map(
+                    self.physical.backing(),
+                    va as usize,
+                    pa as usize,
+                    size as usize,
+                    perm.host(),
+                )
+                .unwrap_or_else(|err| panic!("fastmem map {va:#x}+{size:#x}: {err}"));
         }
     }
 
@@ -97,34 +179,64 @@ impl AddressSpace {
             "unaligned unmap {va:#x} {size:#x}"
         );
         for page in 0..size / PAGE_SIZE {
-            if let Some(entry) = self.entry(va + page * PAGE_SIZE) {
-                entry.store(0, Ordering::Release);
-            }
+            self.table.clear(va + page * PAGE_SIZE);
+        }
+        if let Some(fastmem) = &self.fastmem {
+            fastmem
+                .arena
+                .unmap(self.physical.backing(), va as usize, size as usize)
+                .unwrap_or_else(|err| panic!("fastmem unmap {va:#x}+{size:#x}: {err}"));
         }
     }
 
     pub fn protect(&self, va: VAddr, size: u64, perm: MemoryPermission) {
-        for page in 0..size.div_ceil(PAGE_SIZE) {
-            if let Some(entry) = self.entry(va + page * PAGE_SIZE) {
-                let old = entry.load(Ordering::Acquire);
-                if old != 0 {
-                    entry.store((old & !PERM_MASK) | perm.0 as usize, Ordering::Release);
-                }
+        let start = va & !PAGE_MASK;
+        let pages = (va + size).div_ceil(PAGE_SIZE) - start / PAGE_SIZE;
+        let mut run: Option<(VAddr, u64)> = None;
+        for page in 0..pages {
+            let addr = start + page * PAGE_SIZE;
+            if self.table.set_permission(addr, perm) {
+                run = Some(run.map_or((addr, PAGE_SIZE), |(s, len)| (s, len + PAGE_SIZE)));
+                continue;
             }
+            if let Some((s, len)) = run.take() {
+                self.protect_host(s, len, perm);
+            }
+        }
+        if let Some((s, len)) = run {
+            self.protect_host(s, len, perm);
         }
     }
 
-    /// Host pointer and permission for the byte at \`va\`.
+    fn protect_host(&self, va: VAddr, size: u64, perm: MemoryPermission) {
+        if let Some(fastmem) = &self.fastmem {
+            fastmem
+                .arena
+                .protect(
+                    self.physical.backing(),
+                    va as usize,
+                    size as usize,
+                    perm.host(),
+                )
+                .unwrap_or_else(|err| panic!("fastmem protect {va:#x}+{size:#x}: {err}"));
+        }
+    }
+
+    /// Host pointer and permission for the byte at `va`.
     #[inline]
     pub fn translate(&self, va: VAddr) -> Option<(*mut u8, MemoryPermission)> {
-        let raw = self.entry(va)?.load(Ordering::Acquire);
-        if raw == 0 {
-            return None;
-        }
-        let host = (raw & !PERM_MASK) as *mut u8;
-        // SAFETY: the offset stays inside the mapped page.
-        let ptr = unsafe { host.add((va & PAGE_MASK) as usize) };
-        Some((ptr, MemoryPermission(raw as u8 & 7)))
+        self.table.translate(va)
+    }
+
+    /// Host pointer for `[va, va + size)` when it is mapped to contiguous DRAM.
+    pub fn contiguous_pointer(&self, va: VAddr, size: u64) -> Option<*mut u8> {
+        self.table.contiguous(va, size)
+    }
+
+    /// Physical address of the byte at `va`.
+    pub fn physical_address(&self, va: VAddr) -> Option<PAddr> {
+        let (ptr, _) = self.table.translate(va)?;
+        self.physical.physical_address(ptr)
     }
 
     pub fn is_mapped(&self, va: VAddr) -> bool {
@@ -133,51 +245,27 @@ impl AddressSpace {
 
     #[inline]
     pub fn read<T: bytemuck::Pod>(&self, va: VAddr) -> Result<T, MemoryFault> {
-        let size = std::mem::size_of::<T>() as u64;
-        if (va & PAGE_MASK) + size <= PAGE_SIZE {
-            let (ptr, _) = self.translate(va).ok_or(MemoryFault::unmapped(va))?;
-            // SAFETY: the whole value is inside one mapped page.
-            return Ok(unsafe { std::ptr::read_unaligned(ptr as *const T) });
-        }
-        let mut value = T::zeroed();
-        self.read_bytes(va, bytemuck::bytes_of_mut(&mut value))?;
-        Ok(value)
+        self.table.read(va)
     }
 
     #[inline]
     pub fn write<T: bytemuck::Pod>(&self, va: VAddr, value: T) -> Result<(), MemoryFault> {
-        let size = std::mem::size_of::<T>() as u64;
-        if (va & PAGE_MASK) + size <= PAGE_SIZE {
-            let (ptr, _) = self.translate(va).ok_or(MemoryFault::unmapped(va))?;
-            // SAFETY: the whole value is inside one mapped page.
-            unsafe { std::ptr::write_unaligned(ptr as *mut T, value) };
-            return Ok(());
-        }
-        self.write_bytes(va, bytemuck::bytes_of(&value))
+        self.table.write(va, value)
     }
 
     pub fn read_bytes(&self, va: VAddr, out: &mut [u8]) -> Result<(), MemoryFault> {
-        self.for_each_chunk(va, out.len() as u64, |ptr, offset, len| {
-            // SAFETY: ptr is valid for len bytes inside one mapped page.
-            unsafe { std::ptr::copy_nonoverlapping(ptr, out[offset..].as_mut_ptr(), len) };
-        })
+        self.table.read_bytes(va, out)
     }
 
     pub fn write_bytes(&self, va: VAddr, data: &[u8]) -> Result<(), MemoryFault> {
-        self.for_each_chunk(va, data.len() as u64, |ptr, offset, len| {
-            // SAFETY: ptr is valid for len bytes inside one mapped page.
-            unsafe { std::ptr::copy_nonoverlapping(data[offset..].as_ptr(), ptr, len) };
-        })
+        self.table.write_bytes(va, data)
     }
 
     pub fn fill(&self, va: VAddr, size: u64, byte: u8) -> Result<(), MemoryFault> {
-        self.for_each_chunk(va, size, |ptr, _, len| {
-            // SAFETY: ptr is valid for len bytes inside one mapped page.
-            unsafe { std::ptr::write_bytes(ptr, byte, len) };
-        })
+        self.table.fill(va, size, byte)
     }
 
-    /// Reads a NUL-terminated string of at most \`max_len\` bytes.
+    /// Reads a NUL-terminated string of at most `max_len` bytes.
     pub fn read_cstring(&self, va: VAddr, max_len: usize) -> Result<String, MemoryFault> {
         let mut bytes = Vec::new();
         for i in 0..max_len as u64 {
@@ -188,70 +276,6 @@ impl AddressSpace {
             bytes.push(b);
         }
         Ok(String::from_utf8_lossy(&bytes).into_owned())
-    }
-
-    fn for_each_chunk(
-        &self,
-        va: VAddr,
-        size: u64,
-        mut f: impl FnMut(*mut u8, usize, usize),
-    ) -> Result<(), MemoryFault> {
-        let mut done = 0u64;
-        while done < size {
-            let addr = va + done;
-            let len = (PAGE_SIZE - (addr & PAGE_MASK)).min(size - done);
-            let (ptr, _) = self.translate(addr).ok_or(MemoryFault::unmapped(addr))?;
-            f(ptr, done as usize, len as usize);
-            done += len;
-        }
-        Ok(())
-    }
-
-    #[inline]
-    fn entry(&self, va: VAddr) -> Option<&AtomicUsize> {
-        let page = (va >> PAGE_BITS) as usize;
-        let table = self.l1.get(page >> L2_BITS)?.load(Ordering::Acquire);
-        // SAFETY: tables are never freed while the address space lives.
-        unsafe { table.as_ref() }.map(|t| &t[page & (L2_ENTRIES - 1)])
-    }
-
-    fn entry_for_write(&self, va: VAddr) -> &AtomicUsize {
-        let page = (va >> PAGE_BITS) as usize;
-        let slot = self
-            .l1
-            .get(page >> L2_BITS)
-            .unwrap_or_else(|| panic!("{va:#x} outside the {}-bit address space", self.bits));
-        if slot.load(Ordering::Acquire).is_null() {
-            let _guard = self.grow.lock();
-            if slot.load(Ordering::Acquire).is_null() {
-                let table: Box<L2Table> = Box::new(std::array::from_fn(|_| AtomicUsize::new(0)));
-                slot.store(Box::into_raw(table), Ordering::Release);
-            }
-        }
-        // SAFETY: just ensured non-null; tables live as long as self.
-        let table = unsafe { &*slot.load(Ordering::Acquire) };
-        &table[page & (L2_ENTRIES - 1)]
-    }
-}
-
-impl MemoryFault {
-    pub const fn unmapped(addr: VAddr) -> Self {
-        Self {
-            addr,
-            kind: FaultKind::Unmapped,
-        }
-    }
-}
-
-impl Drop for AddressSpace {
-    fn drop(&mut self) {
-        for slot in self.l1.iter() {
-            let table = slot.load(Ordering::Acquire);
-            if !table.is_null() {
-                // SAFETY: created by Box::into_raw in entry_for_write and dropped once here.
-                drop(unsafe { Box::from_raw(table) });
-            }
-        }
     }
 }
 
@@ -288,5 +312,24 @@ mod tests {
         mem.map(0x20_0000, 0x4000, 0x1000, MemoryPermission::READ);
         mem.write(0x10_0010, 7u32).unwrap();
         assert_eq!(mem.read::<u32>(0x20_0010).unwrap(), 7);
+    }
+
+    #[test]
+    fn contiguous_pointer_needs_contiguous_dram() {
+        let mem = space();
+        mem.map(0x10_0000, 0x4000, 0x2000, MemoryPermission::READ_WRITE);
+        mem.map(0x10_2000, 0x8000, 0x1000, MemoryPermission::READ_WRITE);
+        assert!(mem.contiguous_pointer(0x10_0800, 0x1800).is_some());
+        assert!(mem.contiguous_pointer(0x10_0800, 0x2000).is_none());
+        assert_eq!(mem.physical_address(0x10_1004), Some(0x5004));
+    }
+
+    #[test]
+    fn protect_changes_only_mapped_pages() {
+        let mem = space();
+        mem.map(0x10_0000, 0, 0x2000, MemoryPermission::READ_WRITE);
+        mem.protect(0x10_0000, 0x4000, MemoryPermission::READ);
+        assert_eq!(mem.translate(0x10_1000).unwrap().1, MemoryPermission::READ);
+        assert!(!mem.is_mapped(0x10_2000));
     }
 }
