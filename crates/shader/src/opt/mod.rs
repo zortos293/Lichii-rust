@@ -1,10 +1,26 @@
 //! IR passes. Every pass is linear or n log n in program size.
 
+mod collect_shader_info;
+mod conditional_barrier;
+mod dual_vertex;
+mod geometry_compaction;
+#[cfg(test)]
+mod info_tests;
+mod layer;
+mod position;
 mod ssa_rewrite;
 #[cfg(test)]
 mod tests;
+mod vendor_workaround;
 
+pub use collect_shader_info::collect_shader_info;
+pub use conditional_barrier::conditional_barrier;
+pub use dual_vertex::{vertex_a_transform, vertex_b_transform};
+pub use geometry_compaction::geometry_compaction;
+pub use layer::layer;
+pub use position::{blit_constants, position};
 pub use ssa_rewrite::ssa_rewrite;
+pub use vendor_workaround::{has_broken_pattern, vendor_workaround};
 
 use crate::ir::{BlockId, Opcode, Program, SyntaxNode, Value};
 
