@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use crate::event::Event;
+use crate::ipc::ClientSession;
 use crate::memory_objects::{CodeMemory, SharedMemory, TransferMemory};
 use crate::process::Process;
 use crate::resource_limit::ResourceLimit;
@@ -22,6 +23,8 @@ pub enum KObject {
     TransferMemory(Arc<TransferMemory>),
     CodeMemory(Arc<CodeMemory>),
     ResourceLimit(Arc<ResourceLimit>),
+    /// The client end of a session to an HLE service.
+    ClientSession(Arc<ClientSession>),
 }
 
 impl KObject {
@@ -45,6 +48,7 @@ impl KObject {
             KObject::TransferMemory(_) => "KTransferMemory",
             KObject::CodeMemory(_) => "KCodeMemory",
             KObject::ResourceLimit(_) => "KResourceLimit",
+            KObject::ClientSession(_) => "KClientSession",
         }
     }
 }
@@ -73,3 +77,4 @@ from_object!(SharedMemory, SharedMemory);
 from_object!(TransferMemory, TransferMemory);
 from_object!(CodeMemory, CodeMemory);
 from_object!(ResourceLimit, ResourceLimit);
+from_object!(ClientSession, ClientSession);
