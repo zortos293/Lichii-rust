@@ -112,7 +112,10 @@ mod tests {
         let mut second = [0u8; 6];
         h.memory.read_block(0x10_0100, &mut second).unwrap();
         assert_eq!(second, [7, 8, 9, 10, 11, 12]);
-        assert_eq!(h.rasterizer.inline_writes, vec![(0x10_0000, 0x106)]);
+        assert_eq!(
+            h.rasterizer.inline_writes,
+            vec![(0x10_0000, 6), (0x10_0100, 6)]
+        );
     }
 
     #[test]
@@ -168,9 +171,7 @@ mod tests {
             .read_block(0x30_0000, bytemuck::cast_slice_mut(&mut out))
             .unwrap();
         assert!(out.iter().enumerate().all(|(i, &w)| w == i as u32));
-        assert_eq!(
-            h.rasterizer.inline_writes,
-            vec![(0x30_0000, u64::from(words) * 4)]
-        );
+        let chunks: Vec<_> = (0..6).map(|i| (0x30_0000 + i * 0x1000, 0x1000)).collect();
+        assert_eq!(h.rasterizer.inline_writes, chunks);
     }
 }

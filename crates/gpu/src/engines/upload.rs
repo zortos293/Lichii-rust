@@ -3,7 +3,9 @@
 //! all carry these registers.
 //!
 //! Data is written as it arrives, a bounded chunk at a time, straight to the bytes the transfer
-//! covers: nothing around them is read back, and no buffer grows with the transfer size.
+//! covers: nothing around them is read back, and no buffer grows with the transfer size. The
+//! renderer is told about every chunk as it is written, so a transfer the guest abandons halfway
+//! leaves no written range unreported.
 
 use lichii_common::GpuVAddr;
 use lichii_texture::block_linear::{GOB_HEIGHT, Tiling};
@@ -98,9 +100,6 @@ impl Upload {
                 self.write_chunk(ctx);
             }
         }
-        if self.remaining == 0 && self.line_length != 0 && self.line_count != 0 {
-            self.finish(ctx);
-        }
     }
 
     fn write_chunk(&mut self, ctx: &mut EngineContext<'_>) {
@@ -110,6 +109,12 @@ impl Upload {
                 if let Err(fault) = ctx.memory.write_block(address, &self.chunk) {
                     tracing::warn!(?fault, "inline upload to unmapped GPU memory");
                 }
+                ctx.rasterizer.inline_written(
+                    ctx.channel,
+                    ctx.memory,
+                    address,
+                    self.chunk.len() as u64,
+                );
             }
             Target::BlockLinear { tiling, x, y, z } => {
                 let tiling = Tiling {
@@ -130,6 +135,9 @@ impl Upload {
                     }
                     done += len;
                 }
+                let (start, size) = touched_block_rows(&tiling, y + self.line, z);
+                ctx.rasterizer
+                    .inline_written(ctx.channel, ctx.memory, self.address + start, size);
             }
             Target::Discard => {}
         }
@@ -140,33 +148,23 @@ impl Upload {
             self.line += 1;
         }
     }
+}
 
-    fn finish(&mut self, ctx: &mut EngineContext<'_>) {
-        let (start, size) = match self.target {
-            Target::Linear { pitch } => (
-                self.address,
-                pitch * u64::from(self.line_count - 1) + self.line_length as u64,
-            ),
-            Target::BlockLinear { tiling, y, z, .. } if tiling.depth == 1 => {
-                let rows = GOB_HEIGHT << tiling.block_height_log2;
-                let first = y / rows * rows;
-                let last = (y + self.line_count).div_ceil(rows) * rows;
-                let band = Tiling {
-                    height: last - first,
-                    ..tiling
-                };
-                (
-                    self.address + tiling.offset(0, first, z) as u64,
-                    band.size_bytes() as u64,
-                )
-            }
-            Target::BlockLinear { tiling, .. } => (self.address, tiling.size_bytes() as u64),
-            Target::Discard => return,
-        };
-        self.target = Target::Discard;
-        ctx.rasterizer
-            .inline_written(ctx.channel, ctx.memory, start, size);
+/// The tiled bytes holding row `y` of slice `z`: its row of blocks, or the whole level when
+/// blocks span several slices.
+fn touched_block_rows(tiling: &Tiling, y: u32, z: u32) -> (u64, u64) {
+    if tiling.depth > 1 {
+        return (0, tiling.size_bytes() as u64);
     }
+    let rows = GOB_HEIGHT << tiling.block_height_log2;
+    let band = Tiling {
+        height: rows,
+        ..*tiling
+    };
+    (
+        tiling.offset(0, y / rows * rows, z) as u64,
+        band.size_bytes() as u64,
+    )
 }
 
 /// The surface a block-linear transfer writes, in bytes (the GOB layout does not depend on the
