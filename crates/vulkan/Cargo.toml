@@ -10,7 +10,10 @@ lichii-gpu.workspace = true
 lichii-shader.workspace = true
 lichii-texture.workspace = true
 ash.workspace = true
+ash-window = "0.13"
+gpu-allocator = { version = "0.28", default-features = false, features = ["std", "vulkan"] }
 egui.workspace = true
+parking_lot.workspace = true
 raw-window-handle.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
