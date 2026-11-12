@@ -5,6 +5,7 @@ pub mod flow;
 pub mod header;
 pub mod instruction;
 pub mod opcode;
+pub mod translate;
 
 pub use decode::decode;
 pub use flow::MaxwellFlow;
