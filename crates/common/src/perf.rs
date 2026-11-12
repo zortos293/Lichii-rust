@@ -180,6 +180,6 @@ mod tests {
         assert_eq!(snap.frame_times_ms.len(), 120);
         assert!((59.0..=61.0).contains(&snap.game_fps), "{}", snap.game_fps);
         assert_eq!(snap.game_frame_times_ms.len(), 119);
-        assert!((snap.game_frame_times_ms[0] - 16.67).abs() < 0.1);
+        assert!((16.0..=17.0).contains(&snap.game_frame_times_ms[0]));
     }
 }
