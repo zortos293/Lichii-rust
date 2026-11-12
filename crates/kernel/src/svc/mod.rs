@@ -5,6 +5,7 @@
 //! registers are written when the thread resumes on whichever core picks it up.
 
 mod info;
+mod ipc;
 mod memory;
 mod numbers;
 mod process;
@@ -192,6 +193,9 @@ pub(crate) fn dispatch(svc: &mut SvcContext, imm: u32) -> Flow {
             svc.set(0, svc.kernel.clock.ticks());
             Flow::Continue
         }
+        0x1f => ipc::connect_to_named_port(svc),
+        0x21 => ipc::send_sync_request(svc),
+        0x22 => ipc::send_sync_request_with_user_buffer(svc),
         0x24 => process::get_process_id(svc),
         0x25 => thread::get_thread_id(svc),
         0x26 => process::break_(svc),
