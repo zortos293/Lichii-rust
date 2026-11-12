@@ -24,7 +24,7 @@ use crate::descriptors::DescriptorAllocator;
 use crate::device::Device;
 use crate::error::{Result, VkResultExt};
 use crate::memory::{Image, ImageDesc, ImageView};
-use crate::scheduler::{Scheduler, SemaphoreWait};
+use crate::scheduler::{Scheduler, SemaphoreWait, Timeline};
 use crate::staging::StagingRing;
 use crate::swapchain::Swapchain;
 use passes::{MAX_INPUTS, Pass, PassParams, Passes};
@@ -92,7 +92,7 @@ pub(crate) struct FrameImage {
 pub struct GuestFrame {
     pub(crate) image: Arc<FrameImage>,
     /// Timeline semaphore and value that complete the frame's rendering.
-    pub(crate) ready: (vk::Semaphore, u64),
+    pub(crate) ready: (Arc<Timeline>, u64),
     /// Visible part in UV space: origin and extent (negative height flips).
     pub(crate) uv_rect: [f32; 4],
     /// Size of the visible part in texels.
@@ -149,6 +149,22 @@ impl Target {
         })
     }
 }
+
+/// The intermediate targets the presenter renders passes into.
+#[derive(Clone, Copy)]
+enum Slot {
+    Aa,
+    SmaaInput,
+    SmaaEdges,
+    SmaaWeights,
+    Fsr,
+}
+
+/// An intermediate target the previous frame sampled; rendering discards its contents.
+const SAMPLED_LAST_FRAME: ImageAccess = ImageAccess {
+    layout: vk::ImageLayout::UNDEFINED,
+    ..ImageAccess::SHADER_READ
+};
 
 /// The image a frame is composed into: a swapchain image, or an offscreen target in tests.
 #[derive(Clone, Copy)]
@@ -218,6 +234,7 @@ pub struct Presenter {
     smaa_area: FrameImage,
     smaa_search: FrameImage,
     aa_target: Option<Target>,
+    smaa_input: Option<Target>,
     smaa_edges: Option<Target>,
     smaa_weights: Option<Target>,
     fsr_target: Option<Target>,
@@ -304,6 +321,7 @@ impl Presenter {
             smaa_area,
             smaa_search,
             aa_target: None,
+            smaa_input: None,
             smaa_edges: None,
             smaa_weights: None,
             fsr_target: None,
@@ -376,7 +394,7 @@ impl Presenter {
         }];
         if let Some(guest) = &guest {
             waits.push(SemaphoreWait {
-                semaphore: guest.ready.0,
+                semaphore: guest.ready.0.raw(),
                 value: guest.ready.1,
                 stage: vk::PipelineStageFlags2::FRAGMENT_SHADER,
             });
@@ -474,197 +492,185 @@ impl Presenter {
     }
 
     /// Runs anti-aliasing and the first FSR pass into intermediate targets; returns what the
-    /// final pass samples: view, sampler, UV window and its size in texels.
+    /// final pass samples: view, sampler, UV window and the bound image's size in texels.
     fn prepare_source(
         &mut self,
         cmd: vk::CommandBuffer,
         guest: &GuestFrame,
         viewport: Viewport,
     ) -> Result<(vk::ImageView, vk::Sampler, [f32; 4], [f32; 2])> {
-        let source_extent = vk::Extent2D {
+        let image = guest.image.image.desc().extent;
+        let crop = vk::Extent2D {
             width: guest.width,
             height: guest.height,
         };
-        let source_size = [guest.width as f32, guest.height as f32];
-        let mut view = guest.image.view.raw();
-        let mut uv_rect = guest.uv_rect;
+        let crop_size = [crop.width as f32, crop.height as f32];
         let full = [0.0, 0.0, 1.0, 1.0];
         let sharpness = rcas_stops(self.settings.fsr_sharpness);
-        let params = |src_rect, output: vk::Extent2D| PassParams {
+        let params = |src_rect, source_size, output: vk::Extent2D| PassParams {
             src_rect,
             source_size,
             output_size: [output.width as f32, output.height as f32],
             sharpness,
             pad: [0.0; 3],
         };
+        let mut view = guest.image.view.raw();
+        let mut uv_rect = guest.uv_rect;
+        let mut size = [image.width as f32, image.height as f32];
+        let (linear, nearest) = (self.linear, self.nearest);
         match self.settings.anti_aliasing {
             AntiAliasing::None => {}
             AntiAliasing::Fxaa => {
-                let set = self.input_set(&[(view, self.linear)])?;
-                let target = ensure_target(
-                    &self.device,
-                    &mut self.scheduler,
-                    &mut self.aa_target,
-                    source_extent,
-                    INTERMEDIATE,
-                    "fxaa",
-                )?;
-                let (target_image, target_view) = (target.image.raw(), target.view.raw());
-                render_pass(
-                    &self.device,
-                    &mut self.passes,
+                let input = [(view, linear)];
+                view = self.pass_into(
                     cmd,
                     Pass::Fxaa,
-                    set,
-                    target_image,
-                    target_view,
-                    source_extent,
-                    &params(uv_rect, source_extent),
+                    &input,
+                    Slot::Aa,
+                    crop,
+                    &params(uv_rect, size, crop),
                 )?;
-                view = target_view;
-                uv_rect = full;
+                (uv_rect, size) = (full, crop_size);
             }
             AntiAliasing::Smaa => {
-                let input = (view, self.linear);
-                let edges = ensure_target(
-                    &self.device,
-                    &mut self.scheduler,
-                    &mut self.smaa_edges,
-                    source_extent,
-                    INTERMEDIATE,
-                    "smaa edges",
-                )?;
-                let (edges_image, edges_view) = (edges.image.raw(), edges.view.raw());
-                let set = self.input_set(&[input])?;
-                render_pass(
-                    &self.device,
-                    &mut self.passes,
+                if uv_rect != full {
+                    let input = [(view, nearest)];
+                    view = self.pass_into(
+                        cmd,
+                        Pass::Copy,
+                        &input,
+                        Slot::SmaaInput,
+                        crop,
+                        &params(uv_rect, size, crop),
+                    )?;
+                }
+                let normalized = params(full, crop_size, crop);
+                let edges = self.pass_into(
                     cmd,
                     Pass::SmaaEdge,
-                    set,
-                    edges_image,
-                    edges_view,
-                    source_extent,
-                    &params(uv_rect, source_extent),
+                    &[(view, linear)],
+                    Slot::SmaaEdges,
+                    crop,
+                    &normalized,
                 )?;
-                let weights = ensure_target(
-                    &self.device,
-                    &mut self.scheduler,
-                    &mut self.smaa_weights,
-                    source_extent,
-                    INTERMEDIATE,
-                    "smaa weights",
-                )?;
-                let (weights_image, weights_view) = (weights.image.raw(), weights.view.raw());
-                let set = self.input_set(&[
-                    (edges_view, self.linear),
-                    (self.smaa_area.view.raw(), self.linear),
-                    (self.smaa_search.view.raw(), self.nearest),
-                ])?;
-                render_pass(
-                    &self.device,
-                    &mut self.passes,
+                let tables = [
+                    (edges, linear),
+                    (self.smaa_area.view.raw(), linear),
+                    (self.smaa_search.view.raw(), nearest),
+                ];
+                let weights = self.pass_into(
                     cmd,
                     Pass::SmaaBlend,
-                    set,
-                    weights_image,
-                    weights_view,
-                    source_extent,
-                    &params(full, source_extent),
+                    &tables,
+                    Slot::SmaaWeights,
+                    crop,
+                    &normalized,
                 )?;
-                let out = ensure_target(
-                    &self.device,
-                    &mut self.scheduler,
-                    &mut self.aa_target,
-                    source_extent,
-                    INTERMEDIATE,
-                    "smaa output",
-                )?;
-                let (out_image, out_view) = (out.image.raw(), out.view.raw());
-                let set = self.input_set(&[input, (weights_view, self.linear)])?;
-                render_pass(
-                    &self.device,
-                    &mut self.passes,
+                let input = [(view, linear), (weights, linear)];
+                view = self.pass_into(
                     cmd,
                     Pass::SmaaNeighborhood,
-                    set,
-                    out_image,
-                    out_view,
-                    source_extent,
-                    &params(uv_rect, source_extent),
+                    &input,
+                    Slot::Aa,
+                    crop,
+                    &normalized,
                 )?;
-                view = out_view;
-                uv_rect = full;
+                (uv_rect, size) = (full, crop_size);
             }
         }
         let sampler = match self.settings.scaling_filter {
-            ScalingFilter::NearestNeighbor | ScalingFilter::Mmpx => self.nearest,
-            _ => self.linear,
+            ScalingFilter::NearestNeighbor | ScalingFilter::Mmpx => nearest,
+            _ => linear,
         };
         if self.settings.scaling_filter != ScalingFilter::Fsr
             || viewport.width == 0
             || viewport.height == 0
         {
-            return Ok((view, sampler, uv_rect, source_size));
+            return Ok((view, sampler, uv_rect, size));
         }
         let output = vk::Extent2D {
             width: viewport.width,
             height: viewport.height,
         };
-        let set = self.input_set(&[(view, self.linear)])?;
+        let input = [(view, linear)];
+        let view = self.pass_into(
+            cmd,
+            Pass::FsrEasu,
+            &input,
+            Slot::Fsr,
+            output,
+            &params(uv_rect, size, output),
+        )?;
+        Ok((
+            view,
+            linear,
+            full,
+            [output.width as f32, output.height as f32],
+        ))
+    }
+
+    /// Renders `pass` over the whole intermediate target in `slot`, resized to `extent`, and
+    /// returns the target's view, ready to sample.
+    #[allow(clippy::too_many_arguments)]
+    fn pass_into(
+        &mut self,
+        cmd: vk::CommandBuffer,
+        pass: Pass,
+        inputs: &[(vk::ImageView, vk::Sampler)],
+        slot: Slot,
+        extent: vk::Extent2D,
+        params: &PassParams,
+    ) -> Result<vk::ImageView> {
+        let set = self.input_set(inputs)?;
+        let (target, name) = match slot {
+            Slot::Aa => (&mut self.aa_target, "aa output"),
+            Slot::SmaaInput => (&mut self.smaa_input, "smaa input"),
+            Slot::SmaaEdges => (&mut self.smaa_edges, "smaa edges"),
+            Slot::SmaaWeights => (&mut self.smaa_weights, "smaa weights"),
+            Slot::Fsr => (&mut self.fsr_target, "fsr easu"),
+        };
         let target = ensure_target(
             &self.device,
             &mut self.scheduler,
-            &mut self.fsr_target,
-            output,
+            target,
+            extent,
             INTERMEDIATE,
-            "fsr easu",
+            name,
         )?;
-        let (target_image, target_view) = (target.image.raw(), target.view.raw());
+        let (image, view) = (target.image.raw(), target.view.raw());
         render_pass(
             &self.device,
             &mut self.passes,
             cmd,
-            Pass::FsrEasu,
+            pass,
             set,
-            target_image,
-            target_view,
-            output,
-            &params(uv_rect, output),
+            image,
+            view,
+            extent,
+            params,
         )?;
-        Ok((
-            target_view,
-            self.linear,
-            full,
-            [output.width as f32, output.height as f32],
-        ))
+        Ok(view)
     }
 
     fn input_set(&mut self, inputs: &[(vk::ImageView, vk::Sampler)]) -> Result<vk::DescriptorSet> {
         let set = self
             .descriptors
             .allocate(&mut self.scheduler, self.passes.set_layout)?;
-        let infos: Vec<[vk::DescriptorImageInfo; 1]> = (0..MAX_INPUTS)
-            .map(|i| {
-                let (view, sampler) = inputs.get(i).copied().unwrap_or(inputs[0]);
-                [vk::DescriptorImageInfo {
-                    sampler,
-                    image_view: view,
-                    image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                }]
-            })
-            .collect();
-        let writes: Vec<_> = infos
-            .iter()
-            .enumerate()
-            .map(|(binding, info)| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(binding as u32)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(info)
-            })
-            .collect();
+        let infos: [[vk::DescriptorImageInfo; 1]; MAX_INPUTS] = std::array::from_fn(|i| {
+            let (view, sampler) = inputs.get(i).copied().unwrap_or(inputs[0]);
+            [vk::DescriptorImageInfo {
+                sampler,
+                image_view: view,
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            }]
+        });
+        let writes: [vk::WriteDescriptorSet; MAX_INPUTS] = std::array::from_fn(|binding| {
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(binding as u32)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&infos[binding])
+        });
         // SAFETY: the set is fresh; every view is live until this frame's tick completes.
         unsafe { self.device.raw.update_descriptor_sets(&writes, &[]) };
         Ok(set)
@@ -799,7 +805,7 @@ fn render_pass(
         cmd,
         image,
         COLOR_RANGE,
-        ImageAccess::UNDEFINED,
+        SAMPLED_LAST_FRAME,
         ImageAccess::COLOR_ATTACHMENT,
     );
     let clear = matches!(pass, Pass::SmaaEdge | Pass::SmaaBlend).then_some([0.0; 4]);
@@ -965,7 +971,7 @@ mod tests {
             let tick = p.scheduler.flush().unwrap();
             GuestFrame {
                 image: Arc::new(image),
-                ready: (p.scheduler.timeline(), tick),
+                ready: (p.scheduler.shared_timeline(), tick),
                 uv_rect: [0.0, 0.0, 1.0, 1.0],
                 width,
                 height,
@@ -1232,6 +1238,222 @@ mod tests {
             .perf
             .snapshot(Instant::now(), Duration::from_secs(60));
         assert!(snapshot.vram_budget > 0, "{snapshot:?}");
+        h.assert_no_validation_errors();
+    }
+
+    fn random_texels(width: u32, height: u32) -> Vec<u8> {
+        (0..width * height)
+            .flat_map(|i| {
+                let v = i.wrapping_mul(2_654_435_761);
+                [(v >> 24) as u8, (v >> 16) as u8, (v >> 8) as u8, 255]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn interpolating_filters_are_exact_at_native_size() {
+        let Some(mut h) = Harness::new() else { return };
+        let (width, height) = (40, 24);
+        let texels = random_texels(width, height);
+        let guest = h.guest(
+            &texels,
+            (width, height),
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ComponentMapping::default(),
+        );
+        let viewport = Viewport {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        for filter in [
+            ScalingFilter::NearestNeighbor,
+            ScalingFilter::Bilinear,
+            ScalingFilter::Bicubic,
+            ScalingFilter::Lanczos,
+            ScalingFilter::Area,
+        ] {
+            h.presenter.set_settings(&GraphicsSettings {
+                scaling_filter: filter,
+                anti_aliasing: AntiAliasing::None,
+                ..GraphicsSettings::default()
+            });
+            let pixels = h.compose(Some(&guest), viewport, no_ui(), (width, height));
+            for (i, (got, want)) in pixels
+                .chunks_exact(4)
+                .zip(texels.chunks_exact(4))
+                .enumerate()
+            {
+                let close = got.iter().zip(want).all(|(g, w)| g.abs_diff(*w) <= 1);
+                assert!(
+                    close,
+                    "{filter:?} texel {i}: got {got:?}, expected {want:?}"
+                );
+            }
+        }
+        h.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn cropped_frames_sample_the_bound_image() {
+        let Some(mut h) = Harness::new() else { return };
+        let (width, height) = (48, 32);
+        let texels = random_texels(width, height);
+        let mut guest = h.guest(
+            &texels,
+            (width, height),
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ComponentMapping::default(),
+        );
+        let (left, top, cw, ch) = (12, 8, 24, 16);
+        guest.uv_rect = [
+            left as f32 / width as f32,
+            top as f32 / height as f32,
+            cw as f32 / width as f32,
+            ch as f32 / height as f32,
+        ];
+        (guest.width, guest.height) = (cw, ch);
+        let viewport = Viewport {
+            x: 0,
+            y: 0,
+            width: cw,
+            height: ch,
+        };
+        for (filter, aa) in [
+            (ScalingFilter::Area, AntiAliasing::None),
+            (ScalingFilter::Lanczos, AntiAliasing::None),
+        ] {
+            h.presenter.set_settings(&GraphicsSettings {
+                scaling_filter: filter,
+                anti_aliasing: aa,
+                ..GraphicsSettings::default()
+            });
+            let pixels = h.compose(Some(&guest), viewport, no_ui(), (cw, ch));
+            let mismatches = (0..ch)
+                .flat_map(|y| (0..cw).map(move |x| (x, y)))
+                .filter(|&(x, y)| {
+                    let i = (((y + top) * width + x + left) * 4) as usize;
+                    let want: [u8; 4] = texels[i..i + 4].try_into().unwrap();
+                    let got = pixel(&pixels, cw, x, y);
+                    got.iter().zip(&want).any(|(g, w)| g.abs_diff(*w) > 1)
+                })
+                .count();
+            assert!(
+                mismatches == 0,
+                "{filter:?} {aa:?}: {mismatches} texels outside the crop window"
+            );
+        }
+        h.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn smaa_resolves_cropped_and_flipped_frames_in_place() {
+        let Some(mut h) = Harness::new() else { return };
+        let (width, height) = (48, 32);
+        let (left, top, cw, ch) = (12u32, 8u32, 24u32, 16u32);
+        let inside = [200, 60, 20, 255];
+        let texels: Vec<u8> = (0..height)
+            .flat_map(|y| {
+                (0..width).map(move |x| {
+                    let in_crop =
+                        (left..left + cw).contains(&x) && (top..top + ch / 2).contains(&y);
+                    if in_crop {
+                        inside
+                    } else if (left..left + cw).contains(&x) && (top..top + ch).contains(&y) {
+                        [20, 60, 200, 255]
+                    } else {
+                        [0, 255, 0, 255]
+                    }
+                })
+            })
+            .flatten()
+            .collect();
+        let mut guest = h.guest(
+            &texels,
+            (width, height),
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ComponentMapping::default(),
+        );
+        let (w, hgt) = (width as f32, height as f32);
+        guest.uv_rect = [
+            left as f32 / w,
+            (top + ch) as f32 / hgt,
+            cw as f32 / w,
+            -(ch as f32) / hgt,
+        ];
+        (guest.width, guest.height) = (cw, ch);
+        h.presenter.set_settings(&GraphicsSettings {
+            scaling_filter: ScalingFilter::NearestNeighbor,
+            anti_aliasing: AntiAliasing::Smaa,
+            ..GraphicsSettings::default()
+        });
+        let pixels = h.compose(
+            Some(&guest),
+            Viewport {
+                x: 0,
+                y: 0,
+                width: cw,
+                height: ch,
+            },
+            no_ui(),
+            (cw, ch),
+        );
+        for x in 1..cw - 1 {
+            assert_close(
+                pixel(&pixels, cw, x, 2),
+                [20, 60, 200, 255],
+                4,
+                &format!("flipped bottom half at x={x}"),
+            );
+            assert_close(
+                pixel(&pixels, cw, x, ch - 3),
+                inside,
+                4,
+                &format!("flipped top half at x={x}"),
+            );
+        }
+        h.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn frames_outlive_the_scheduler_that_rendered_them() {
+        let Some(mut h) = Harness::new() else { return };
+        let device = h.presenter.device.clone();
+        let mut producer = Scheduler::new(&device).unwrap();
+        let mut staging = StagingRing::new(&device, 1 << 20).unwrap();
+        let texels = quadrant_texels(16, 16);
+        let image = upload_image(
+            &device,
+            &mut producer,
+            &mut staging,
+            &texels,
+            (16, 16),
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ComponentMapping::default(),
+        )
+        .unwrap();
+        let tick = producer.flush().unwrap();
+        h.presenter.mailbox.publish(GuestFrame {
+            image: Arc::new(image),
+            ready: (producer.shared_timeline(), tick),
+            uv_rect: [0.0, 0.0, 1.0, 1.0],
+            width: 16,
+            height: 16,
+        });
+        drop(producer);
+        drop(staging);
+        for _ in 0..3 {
+            h.presenter
+                .draw(
+                    160,
+                    90,
+                    Viewport::fit(AspectRatio::R16x9, 0, 0, 160, 90),
+                    no_ui(),
+                )
+                .unwrap();
+        }
+        h.presenter.scheduler.finish().unwrap();
         h.assert_no_validation_errors();
     }
 

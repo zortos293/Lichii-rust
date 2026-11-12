@@ -19,20 +19,23 @@ float sinc(float x) {
     return x == 0.0 ? 1.0 : sin(PI * x) / (PI * x);
 }
 
-float lanczos(vec2 v, float a) {
-    float d = length(v);
-    return sinc(d) / sinc(d / a);
+float lanczos(float x, float a) {
+    return abs(x) >= a ? 0.0 : sinc(x) * sinc(x / a);
 }
 
-vec4 textureLanczos(vec2 p, vec2 res) {
+vec4 textureLanczos(vec2 uv, vec2 res) {
     const int r = 3;
+    vec2 pos = uv * res - 0.5;
+    vec2 base = floor(pos);
+    vec2 f = pos - base;
+    ivec2 last = ivec2(textureSize(u_source, 0)) - 1;
     vec3 c_sum = vec3(0.0);
     float w_sum = 0.0;
-    for (int y = -r; y <= r; ++y) {
-        for (int x = -r; x <= r; ++x) {
-            vec2 kp = 0.5 * (vec2(x, y) / res);
-            float w = lanczos(kp, float(r));
-            c_sum += w * texture(u_source, p + kp).rgb;
+    for (int y = 1 - r; y <= r; ++y) {
+        for (int x = 1 - r; x <= r; ++x) {
+            float w = lanczos(float(x) - f.x, float(r)) * lanczos(float(y) - f.y, float(r));
+            ivec2 texel = clamp(ivec2(base) + ivec2(x, y), ivec2(0), last);
+            c_sum += w * texelFetch(u_source, texel, 0).rgb;
             w_sum += w;
         }
     }

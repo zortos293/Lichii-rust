@@ -234,12 +234,18 @@ impl VulkanRasterizer {
         );
         let tick = self.scheduler.flush()?;
         self.unflushed = false;
-        let (left, top, right, bottom) = match fb.crop {
-            Some(c) if c.right > c.left && c.bottom > c.top => {
-                (c.left, c.top, c.right.min(width), c.bottom.min(height))
-            }
-            _ => (0, 0, width, height),
-        };
+        let (left, top, right, bottom) = fb
+            .crop
+            .map(|c| {
+                (
+                    c.left.min(width),
+                    c.top.min(height),
+                    c.right.min(width),
+                    c.bottom.min(height),
+                )
+            })
+            .filter(|&(left, top, right, bottom)| right > left && bottom > top)
+            .unwrap_or((0, 0, width, height));
         let (w, h) = (width as f32, height as f32);
         let mut uv_rect = [
             left as f32 / w,
@@ -253,7 +259,7 @@ impl VulkanRasterizer {
         }
         self.mailbox.publish(GuestFrame {
             image: frame,
-            ready: (self.scheduler.timeline(), tick),
+            ready: (self.scheduler.shared_timeline(), tick),
             uv_rect,
             width: right - left,
             height: bottom - top,
@@ -561,6 +567,40 @@ mod tests {
         f.rasterizer.present(&fb);
         f.rasterizer.present(&fb);
         assert!(f.rasterizer.frames.len() <= FRAME_POOL);
+        for crop in [
+            CropRect {
+                left: 80,
+                top: 0,
+                right: 100,
+                bottom: 20,
+            },
+            CropRect {
+                left: 0,
+                top: 30,
+                right: 33,
+                bottom: 40,
+            },
+            CropRect {
+                left: 10,
+                top: 5,
+                right: 50,
+                bottom: 50,
+            },
+        ] {
+            f.rasterizer.present(&FramebufferConfig {
+                crop: Some(crop),
+                flip_vertical: false,
+                ..fb
+            });
+            let frame = f.mailbox.latest().unwrap();
+            let [x, y, w, h] = frame.uv_rect;
+            assert!(
+                w > 0.0 && h > 0.0 && x + w <= 1.0 && y + h <= 1.0,
+                "{crop:?} -> {:?}",
+                frame.uv_rect
+            );
+            assert!(frame.width <= width && frame.height <= height);
+        }
         f.assert_no_validation_errors();
     }
 

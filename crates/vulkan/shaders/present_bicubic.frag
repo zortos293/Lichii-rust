@@ -30,7 +30,7 @@ vec4 textureBicubic(sampler2D samp, vec2 uv, vec2 tex_size) {
     vec4 c = floor(cc_tex).xxyy + vec2(-0.5, 1.5).xyxy;
     vec4 z = vec4(xcubic.yw, ycubic.yw);
     vec4 s = vec4(xcubic.xz, ycubic.xz) + z;
-    vec4 offset = (c + z / s) * (1.0 / tex_size).xxyy;
+    vec4 offset = (c + z / max(s, vec4(1e-8))) * (1.0 / tex_size).xxyy;
     vec2 n = vec2(s.x / (s.x + s.y), s.z / (s.z + s.w));
     return mix(
         mix(texture(samp, offset.yw), texture(samp, offset.xw), n.x),
