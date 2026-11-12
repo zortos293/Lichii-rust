@@ -39,6 +39,7 @@ pub mod maxwell;
 pub mod opt;
 pub mod profile;
 pub mod runtime;
+pub mod translate;
 
 pub use info::ShaderInfo;
 pub use profile::Profile;
@@ -149,6 +150,15 @@ pub enum TranslateError {
     UntrackedIndirectBranch { address: GpuVAddr },
     #[error("control flow at {address:#x} cannot be structured")]
     Unstructured { address: GpuVAddr },
+    #[error("cannot lower {0}")]
+    Lowering(String),
+    #[error("invalid program header at {address:#x}")]
+    InvalidHeader { address: GpuVAddr },
+    #[error("no {arch:?} translator for {stage:?} programs yet")]
+    UnsupportedProgram {
+        arch: ShaderArch,
+        stage: ShaderStage,
+    },
     #[error("binding {count} storage buffers to a stage that binds {limit}")]
     TooManyStorageBuffers { count: usize, limit: usize },
     #[error(transparent)]

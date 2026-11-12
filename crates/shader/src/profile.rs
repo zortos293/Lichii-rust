@@ -234,3 +234,32 @@ pub struct HostTranslateInfo {
     /// A handle read from a table at a per-invocation index may become a descriptor array.
     pub support_handle_table_arrays: bool,
 }
+
+impl HostTranslateInfo {
+    /// Descriptor limit used for a limit the host left at zero.
+    pub const DEFAULT_DESCRIPTOR_LIMIT: u32 = 1024;
+
+    /// Replaces unset (zero) limits with usable defaults, as every pass expects.
+    pub fn with_descriptor_limits(mut self) -> HostTranslateInfo {
+        self.min_ssbo_alignment = self.min_ssbo_alignment.max(1);
+        for limit in [
+            &mut self.max_per_stage_descriptor_sampled_images,
+            &mut self.max_per_stage_resources,
+            &mut self.max_per_stage_descriptor_storage_buffers,
+            &mut self.max_per_stage_descriptor_samplers,
+            &mut self.max_descriptor_set_samplers,
+            &mut self.max_descriptor_set_uniform_buffers,
+            &mut self.max_descriptor_set_uniform_buffers_dynamic,
+            &mut self.max_descriptor_set_storage_buffers,
+            &mut self.max_descriptor_set_storage_buffers_dynamic,
+            &mut self.max_descriptor_set_sampled_images,
+            &mut self.max_descriptor_set_storage_images,
+            &mut self.max_descriptor_set_input_attachements,
+        ] {
+            if *limit == 0 {
+                *limit = Self::DEFAULT_DESCRIPTOR_LIMIT;
+            }
+        }
+        self
+    }
+}
