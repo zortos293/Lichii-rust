@@ -112,7 +112,7 @@ impl Submission {
 }
 
 /// Channels suspended on a semaphore acquire, shared by the GPU and the renderer through
-/// [`GpuHandles::waiters`](crate::backend::GpuHandles::waiters). Every semaphore write a
+/// [`Syncpoints::semaphore_waiters`](crate::host1x::Syncpoints::semaphore_waiters). Every semaphore write a
 /// [`FenceAction`](crate::backend::FenceAction) performs is checked against them, once it landed
 /// in memory: the ones it meets are latched and the GPU's front looks at them again, so a waiter
 /// cannot miss a value that is overwritten before the front reads the word (NX2_NOTES row 70).
