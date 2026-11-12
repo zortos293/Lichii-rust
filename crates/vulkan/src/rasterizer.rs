@@ -7,7 +7,6 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Instant;
 
 use ash::vk;
 use lichii_common::DAddr;
@@ -18,7 +17,7 @@ use lichii_gpu::backend::{
     IndirectDraw, Query, QueryKind, Rasterizer,
 };
 use lichii_gpu::gmmu::Gmmu;
-use lichii_texture::block_linear::{GobLayout, Tiling, unswizzle};
+use lichii_texture::block_linear::{Tiling, unswizzle};
 
 use crate::commands::{COLOR_RANGE, ImageAccess, transition};
 use crate::device::Device;
@@ -40,22 +39,18 @@ pub struct VulkanRasterizer {
     scheduler: Scheduler,
     staging: StagingRing,
     mailbox: Arc<FrameMailbox>,
-    gob_layout: GobLayout,
     frames: Vec<Arc<FrameImage>>,
     tiled: Vec<u8>,
     fences: VecDeque<(u64, FenceAction)>,
     unflushed: bool,
-    epoch: Instant,
     warned_unimplemented: bool,
 }
 
 impl VulkanRasterizer {
-    /// `gob_layout` is the tiling guest framebuffers use: `Switch2` for native Switch 2 titles.
     pub fn new(
         device: &Arc<Device>,
         handles: GpuHandles,
         mailbox: Arc<FrameMailbox>,
-        gob_layout: GobLayout,
     ) -> Result<Self> {
         Ok(Self {
             device: device.clone(),
@@ -63,20 +58,12 @@ impl VulkanRasterizer {
             scheduler: Scheduler::new(device)?,
             staging: StagingRing::new(device, 32 << 20)?,
             mailbox,
-            gob_layout,
             frames: Vec::new(),
             tiled: Vec::new(),
             fences: VecDeque::new(),
             unflushed: false,
-            epoch: Instant::now(),
             warned_unimplemented: false,
         })
-    }
-
-    /// GPU timer ticks (ns x 384/625) since the renderer started, for 16-byte releases.
-    fn gpu_ticks(&self) -> u64 {
-        let ns = self.epoch.elapsed().as_nanos() as u64;
-        ns / 625 * 384 + ns % 625 * 384 / 625
     }
 
     fn unimplemented(&mut self, what: &str) {
@@ -160,7 +147,7 @@ impl VulkanRasterizer {
                     info.bytes_per_block,
                     block_height_log2,
                     0,
-                    self.gob_layout,
+                    fb.gob_layout,
                 );
                 self.tiled.resize(tiling.size_bytes(), 0);
                 let read = self.handles.device.read_bytes(fb.address, &mut self.tiled);
@@ -302,7 +289,7 @@ impl Rasterizer for VulkanRasterizer {
         if query.after_work {
             self.signal_fence(action);
         } else {
-            action.execute(&self.handles, self.gpu_ticks());
+            action.execute(&self.handles);
         }
     }
 
@@ -324,7 +311,7 @@ impl Rasterizer for VulkanRasterizer {
                 break;
             }
             self.fences.pop_front();
-            action.execute(&self.handles, self.gpu_ticks());
+            action.execute(&self.handles);
         }
     }
 
@@ -345,6 +332,7 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn present(&mut self, framebuffer: &FramebufferConfig) {
+        self.handles.timestamp.frame_presented();
         if let Err(error) = self.upload_frame(framebuffer) {
             tracing::error!(%error, "presenting a guest frame failed");
         }
@@ -362,11 +350,14 @@ impl Drop for VulkanRasterizer {
 mod tests {
     use lichii_common::settings::GraphicsSettings;
     use lichii_gpu::backend::{CropRect, ReleaseSize};
+    use std::time::Instant;
+
+    use lichii_gpu::clock::{GpuTimestamp, GuestTime};
     use lichii_gpu::gmmu::BigPageSize;
     use lichii_gpu::host1x::Syncpoints;
     use lichii_memory::{DeviceAddressSpace, PhysicalMemory};
     use lichii_texture::PixelFormat;
-    use lichii_texture::block_linear::swizzle;
+    use lichii_texture::block_linear::{GobLayout, swizzle};
 
     use super::*;
     use crate::memory::Buffer;
@@ -382,7 +373,7 @@ mod tests {
         syncpoints: Arc<Syncpoints>,
     }
 
-    fn fixture(gob_layout: GobLayout) -> Option<Fixture> {
+    fn fixture() -> Option<Fixture> {
         let instance = match Instance::new(true, SurfaceSupport::None) {
             Ok(instance) => Arc::new(instance),
             Err(error) => {
@@ -405,10 +396,10 @@ mod tests {
         let handles = GpuHandles {
             device: memory.clone(),
             syncpoints: syncpoints.clone(),
+            timestamp: Arc::new(GpuTimestamp::new(Arc::new(HostTime(Instant::now())), false)),
         };
         let mailbox = Arc::new(FrameMailbox::default());
-        let rasterizer =
-            VulkanRasterizer::new(&device, handles, mailbox.clone(), gob_layout).unwrap();
+        let rasterizer = VulkanRasterizer::new(&device, handles, mailbox.clone()).unwrap();
         Some(Fixture {
             rasterizer,
             mailbox,
@@ -491,6 +482,14 @@ mod tests {
             .collect()
     }
 
+    struct HostTime(Instant);
+
+    impl GuestTime for HostTime {
+        fn global_time_ns(&self) -> u64 {
+            self.0.elapsed().as_nanos() as u64 + 1
+        }
+    }
+
     fn framebuffer(width: u32, height: u32) -> FramebufferConfig {
         FramebufferConfig {
             address: DADDR,
@@ -501,13 +500,14 @@ mod tests {
             block_height_log2: None,
             flip_vertical: false,
             crop: None,
+            gob_layout: GobLayout::Tegra,
         }
     }
 
     #[test]
     fn presents_block_linear_framebuffers_in_both_gob_layouts() {
         for layout in [GobLayout::Tegra, GobLayout::Switch2] {
-            let Some(mut f) = fixture(layout) else { return };
+            let Some(mut f) = fixture() else { return };
             let (width, height) = (70, 40);
             let linear = pattern(width, height);
             let tiling = Tiling::new(width, height, 1, 4, 2, 0, layout);
@@ -516,6 +516,7 @@ mod tests {
             f.memory.write_bytes(DADDR, &tiled).unwrap();
             let fb = FramebufferConfig {
                 block_height_log2: Some(2),
+                gob_layout: layout,
                 ..framebuffer(width, height)
             };
             f.rasterizer.present(&fb);
@@ -529,7 +530,7 @@ mod tests {
 
     #[test]
     fn presents_pitch_linear_framebuffers_with_crop_and_flip() {
-        let Some(mut f) = fixture(GobLayout::Tegra) else {
+        let Some(mut f) = fixture() else {
             return;
         };
         let (width, height, stride) = (33, 20, 33 * 4 + 60);
@@ -606,7 +607,7 @@ mod tests {
 
     #[test]
     fn unmapped_framebuffers_are_skipped() {
-        let Some(mut f) = fixture(GobLayout::Tegra) else {
+        let Some(mut f) = fixture() else {
             return;
         };
         f.rasterizer.present(&FramebufferConfig {
@@ -618,7 +619,7 @@ mod tests {
 
     #[test]
     fn fences_and_queries_complete_after_submitted_work() {
-        let Some(mut f) = fixture(GobLayout::Tegra) else {
+        let Some(mut f) = fixture() else {
             return;
         };
         f.rasterizer
