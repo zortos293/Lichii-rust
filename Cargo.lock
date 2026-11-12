@@ -1520,6 +1520,7 @@ name = "lichii-fs"
 version = "0.1.0"
 dependencies = [
  "lichii-crypto",
+ "lz4_flex",
  "miniz_oxide 0.9.1",
  "thiserror 2.0.21",
  "tracing",
@@ -1554,8 +1555,11 @@ dependencies = [
 name = "lichii-kernel"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
+ "crossbeam-channel",
  "lichii-common",
  "lichii-cpu",
+ "lichii-loader",
  "lichii-memory",
  "parking_lot",
  "thiserror 2.0.21",
