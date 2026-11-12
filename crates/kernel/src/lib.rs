@@ -18,6 +18,7 @@ pub mod process;
 pub mod resource_limit;
 pub mod result;
 pub mod scheduler;
+pub mod sm;
 pub mod svc;
 mod sync;
 pub mod thread;
@@ -40,11 +41,13 @@ use lichii_memory::{
 use parking_lot::Mutex;
 
 use crate::arbiter::Arbiter;
+use crate::ipc::{ClientSession, ServiceThread, SessionFactory};
 use crate::memory::{MemoryManager, MemoryState, PoolLayout, Region, Regions};
 use crate::object::KObject;
 use crate::process::{NewProcess, Process, ProcessId, ProcessParams, ProcessState};
 use crate::resource_limit::{LimitableResource, ResourceLimit};
 use crate::scheduler::Scheduler;
+use crate::sm::ServiceManager;
 use crate::thread::{LOWEST_PRIORITY, NewThread, Thread};
 use crate::timer::Timer;
 use crate::util::Rng;
@@ -118,6 +121,16 @@ pub(crate) struct KernelInner {
     invalidations: Box<[Mutex<Vec<CodeRange>>]>,
     host_threads: Mutex<Vec<JoinHandle<()>>>,
     application_limit: Arc<ResourceLimit>,
+    services: Mutex<ServiceThreads>,
+    named_ports: Mutex<Vec<(String, ServiceThread, SessionFactory)>>,
+    service_manager: Arc<ServiceManager>,
+}
+
+#[derive(Default)]
+struct ServiceThreads {
+    threads: Vec<ServiceThread>,
+    joins: Vec<JoinHandle<()>>,
+    running: bool,
 }
 
 /// The kernel. Cloning it is cheap; every clone refers to the same kernel.
@@ -132,7 +145,20 @@ impl Kernel {
             .unwrap_or_else(|| PoolLayout::for_dram(config.dram_size, config.console));
         let memory = Arc::new(MemoryManager::new(physical.clone(), layout));
         let cores = config.console.core_count();
+        let service_manager = Arc::new(ServiceManager::default());
+        let sm_thread = ServiceThread::new("sm");
+        let named_ports = vec![(
+            "sm:".to_string(),
+            sm_thread.clone(),
+            service_manager.session_factory(),
+        )];
         Ok(Self(Arc::new(KernelInner {
+            services: Mutex::new(ServiceThreads {
+                threads: vec![sm_thread],
+                ..ServiceThreads::default()
+            }),
+            named_ports: Mutex::new(named_ports),
+            service_manager,
             console: config.console,
             application_limit: Arc::new(ResourceLimit::application(memory.size(Pool::Application))),
             physical,
@@ -194,8 +220,47 @@ impl Kernel {
         self.0.start_process(process)
     }
 
-    /// Starts the core threads and the timer thread.
+    /// The `sm:` registry HLE services register with.
+    pub fn service_manager(&self) -> &Arc<ServiceManager> {
+        &self.0.service_manager
+    }
+
+    /// A new host thread for HLE sessions. It starts with [`Kernel::run`] (at once when the
+    /// kernel already runs); requests queue until then.
+    pub fn create_service_thread(&self, name: &str) -> Result<ServiceThread, KernelError> {
+        let thread = ServiceThread::new(name);
+        let mut services = self.0.services.lock();
+        if services.running {
+            let join = thread.spawn().map_err(KernelError::Spawn)?;
+            services.joins.push(join);
+        }
+        services.threads.push(thread.clone());
+        Ok(thread)
+    }
+
+    /// Makes `name` reachable with `svcConnectToNamedPort`; each connection gets a new session
+    /// with a handler from `factory`, served by `thread`. `sm:` is registered by the kernel.
+    pub fn register_named_port(&self, name: &str, thread: &ServiceThread, factory: SessionFactory) {
+        let mut ports = self.0.named_ports.lock();
+        ports.retain(|(port, _, _)| port != name);
+        ports.push((name.into(), thread.clone(), factory));
+    }
+
+    /// Starts the core threads, the timer thread and the service threads.
     pub fn run(&self) -> Result<(), KernelError> {
+        {
+            let mut services = self.0.services.lock();
+            if !services.running {
+                services.running = true;
+                let joins = services
+                    .threads
+                    .iter()
+                    .map(ServiceThread::spawn)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(KernelError::Spawn)?;
+                services.joins = joins;
+            }
+        }
         let mut threads = self.0.host_threads.lock();
         let kernel = self.0.clone();
         threads.push(
@@ -224,6 +289,15 @@ impl Kernel {
         for thread in threads {
             let _ = thread.join();
         }
+        let services = std::mem::take(&mut *self.0.services.lock());
+        for thread in &services.threads {
+            thread.stop();
+        }
+        for join in services.joins {
+            let _ = join.join();
+        }
+        self.0.service_manager.clear();
+        self.0.named_ports.lock().clear();
         self.0.scheduler.clear();
         let processes = std::mem::take(&mut *self.0.processes.lock());
         for process in processes {
@@ -243,6 +317,12 @@ impl Kernel {
 impl KernelInner {
     pub(crate) fn events(&self) -> &dyn KernelEvents {
         &*self.events
+    }
+
+    pub(crate) fn connect_named_port(&self, name: &str) -> Option<Arc<ClientSession>> {
+        let ports = self.named_ports.lock();
+        let (_, thread, factory) = ports.iter().find(|(port, _, _)| port == name)?;
+        Some(thread.session(factory()))
     }
 
     fn code_address(&self, address_space_bits: u32, aslr: bool) -> VAddr {

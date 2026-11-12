@@ -312,6 +312,11 @@ impl TestKernel {
 
     pub fn run_until_exit(&self, timeout: Duration) {
         self.kernel.run().unwrap();
+        self.wait_for_exit(timeout);
+    }
+
+    /// Waits for a process of an already running kernel to exit, then shuts the kernel down.
+    pub fn wait_for_exit(&self, timeout: Duration) {
         let exited = self.exits.recv_timeout(timeout);
         self.kernel.shutdown();
         exited.expect("process did not exit in time");
@@ -325,6 +330,7 @@ pub(crate) fn word(env: &Env, addr: VAddr) -> &'static AtomicU32 {
     unsafe { &*(ptr as *const AtomicU32) }
 }
 
+mod ipc;
 mod memory;
 mod scheduling;
 mod sync;
