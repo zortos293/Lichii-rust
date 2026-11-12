@@ -44,6 +44,14 @@ pub struct RegsLaunchDescLoc {
     pub address: u32,
 }
 
+impl RegsLaunchDescLoc {
+    /// GPU address of the launch descriptor (the register holds it shifted right by 8).
+    #[inline]
+    pub fn address(&self) -> u64 {
+        u64::from(self.address) << 8
+    }
+}
+
 const _: () = assert!(core::mem::size_of::<RegsLaunchDescLoc>() == 0x4);
 
 #[repr(C)]
