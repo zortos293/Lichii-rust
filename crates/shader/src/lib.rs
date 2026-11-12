@@ -124,4 +124,6 @@ pub enum TranslateError {
     UntrackedIndirectBranch { address: GpuVAddr },
     #[error("control flow at {address:#x} cannot be structured")]
     Unstructured { address: GpuVAddr },
+    #[error(transparent)]
+    Texture(#[from] opt::TextureError),
 }

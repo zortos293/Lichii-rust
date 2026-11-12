@@ -8,9 +8,11 @@ mod geometry_compaction;
 mod info_tests;
 mod layer;
 mod position;
+mod rescaling;
 mod ssa_rewrite;
 #[cfg(test)]
 mod tests;
+mod texture;
 mod vendor_workaround;
 
 pub use collect_shader_info::collect_shader_info;
@@ -19,7 +21,9 @@ pub use dual_vertex::{vertex_a_transform, vertex_b_transform};
 pub use geometry_compaction::geometry_compaction;
 pub use layer::layer;
 pub use position::{blit_constants, position};
+pub use rescaling::rescaling;
 pub use ssa_rewrite::ssa_rewrite;
+pub use texture::{TextureError, limit_sampled_texture_arrays, texture_pass};
 pub use vendor_workaround::{has_broken_pattern, vendor_workaround};
 
 use crate::ir::{BlockId, Opcode, Program, SyntaxNode, Value};

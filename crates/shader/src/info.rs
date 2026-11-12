@@ -126,6 +126,12 @@ pub struct TextureDescriptor {
     pub handle: HandleSource,
     pub count: u32,
     pub size_shift: u32,
+    /// The shader indexes the descriptor, so the descriptor limits may shrink `count`; it stays
+    /// set when they cut the array to one element.
+    pub is_descriptor_array: bool,
+    /// The handle word only reaches the handle as the address of a memory load: a pointer, not
+    /// a texture handle, so the renderer binds no texture.
+    pub handle_is_pointer_word: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -139,6 +145,8 @@ pub struct ImageDescriptor {
     pub cbuf_offset: u32,
     pub count: u32,
     pub size_shift: u32,
+    /// Stores address X in bytes; the program writes 32-bit texels at `x >> 2`.
+    pub is_byte_addressed: bool,
 }
 
 /// Task and mesh program layout (Switch 2 NVN task/mesh, see NX2_NOTES row 89).
@@ -240,6 +248,9 @@ pub struct ShaderInfo {
     pub uses_cbuf_indirect: bool,
     pub uses_render_area: bool,
     pub removed_conditional_barrier: bool,
+    /// A texture descriptor takes a pointer word (see
+    /// [`TextureDescriptor::handle_is_pointer_word`]) that no storage buffer descriptor maps.
+    pub binds_unmapped_pointer_word: bool,
 
     pub used_constant_buffer_types: Type,
     pub used_storage_buffer_types: Type,
