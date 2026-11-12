@@ -34,21 +34,32 @@ pub struct ServiceParts {
     pub perf: Arc<PerfStats>,
 }
 
-/// Shared state of every service. Services keep an `Arc<ServiceContext>`.
+/// Shared state of every service. Services keep an `Arc<ServiceContext>`; the fields are the
+/// [`ServiceParts`] it was built from, shared with the rest of the emulator.
 pub struct ServiceContext {
+    /// The kernel the services are registered with.
     pub kernel: Kernel,
+    /// Settings as they were when the title booted.
     pub settings: Arc<Settings>,
+    /// The running title, including its RomFS and NACP.
     pub program: Arc<ProgramImage>,
+    /// The title's process.
     pub process: Arc<Process>,
+    /// SMMU, device allocator and syncpoints shared with the GPU.
     pub host1x: Host1x,
+    /// The Switch 2 GPU memory registry of the title's process; `None` for Switch 1 titles.
     pub nx2_memory: Option<Arc<Nx2GpuMemory>>,
+    /// Controller state from the frontend's input thread; hid reads it, and writes vibration.
     pub npad: Arc<NpadHub>,
+    /// Counters the overlay shows; vi/gsv record guest frames here.
     pub perf: Arc<PerfStats>,
     pub(crate) unknown: UnknownCommands,
     threads: Mutex<HashMap<String, ServiceThread>>,
 }
 
 impl ServiceContext {
+    /// Builds the shared state. `core::System` calls this once per boot, after creating the
+    /// title's process, and passes the result to [`crate::register_all`].
     pub fn new(parts: ServiceParts) -> Arc<Self> {
         Arc::new(Self {
             kernel: parts.kernel,

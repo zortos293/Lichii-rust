@@ -121,10 +121,12 @@ impl HleRequestContext {
         self.request.command
     }
 
+    /// The HIPC message type: CMIF request or control, close, or TIPC.
     pub fn command_type(&self) -> CommandType {
         self.request.ty
     }
 
+    /// Whether the request is TIPC (its reply has a one-word result and no CMIF header).
     pub fn is_tipc(&self) -> bool {
         matches!(self.request.ty, CommandType::Tipc(_))
     }
@@ -144,6 +146,7 @@ impl HleRequestContext {
         self.thread.as_ref().expect("request in progress")
     }
 
+    /// The requesting thread's process.
     pub fn process(&self) -> &Arc<Process> {
         self.thread().process()
     }
@@ -189,22 +192,27 @@ impl HleRequestContext {
         self.move_objects.get_mut(index)?.take()
     }
 
+    /// A (send) buffers: client memory the service reads.
     pub fn buffers_a(&self) -> &[BufferDescriptor] {
         &self.request.a
     }
 
+    /// B (receive) buffers: client memory the service writes.
     pub fn buffers_b(&self) -> &[BufferDescriptor] {
         &self.request.b
     }
 
+    /// W (exchange) buffers: client memory the service reads and writes.
     pub fn buffers_w(&self) -> &[BufferDescriptor] {
         &self.request.w
     }
 
+    /// X (pointer) buffers: small inputs, addressed in client memory.
     pub fn buffers_x(&self) -> &[BufferDescriptor] {
         &self.request.x
     }
 
+    /// C (receive list) buffers: small outputs, addressed in client memory.
     pub fn buffers_c(&self) -> &[BufferDescriptor] {
         &self.request.c
     }
@@ -253,6 +261,7 @@ impl HleRequestContext {
         self.out_data.extend_from_slice(bytemuck::bytes_of(&value));
     }
 
+    /// Appends raw bytes to the reply data with no alignment.
     pub fn push_bytes(&mut self, data: &[u8]) {
         self.out_data.extend_from_slice(data);
     }
@@ -287,6 +296,11 @@ impl HleRequestContext {
     /// through the session's handler again) or dropped (the client gets `SessionClosed`). The
     /// handler's return value and anything pushed are ignored.
     pub fn defer(&mut self) -> DeferredRequest {
-        DeferredRequest::new(self.pending.take().expect("request already deferred"))
+        let mut pending = self.pending.take().expect("request already deferred");
+        pending.keep_inputs(
+            std::mem::take(&mut self.copy_objects),
+            std::mem::take(&mut self.move_objects),
+        );
+        DeferredRequest::new(pending)
     }
 }
