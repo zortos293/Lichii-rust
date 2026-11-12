@@ -316,6 +316,7 @@ mod tests {
     }
 
     impl ShaderEnvironment for HeaderEnv {
+        test_gpu_state!();
         fn arch(&self) -> ShaderArch {
             ShaderArch::Maxwell
         }

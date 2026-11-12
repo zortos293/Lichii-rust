@@ -308,6 +308,22 @@ impl Kernel {
         }
     }
 
+    /// Stops running guest code: every core puts its thread back in its run queue and idles until
+    /// [`Kernel::resume`]. Service threads, waits and timers keep going.
+    pub fn pause(&self) {
+        self.0.scheduler.pause();
+    }
+
+    /// Lets the cores pick threads again after [`Kernel::pause`].
+    pub fn resume(&self) {
+        self.0.scheduler.resume();
+    }
+
+    /// Whether [`Kernel::pause`] is in effect.
+    pub fn is_paused(&self) -> bool {
+        self.0.scheduler.is_paused()
+    }
+
     /// Asks every thread of `process` to terminate.
     pub fn terminate_process(&self, process: &Arc<Process>) {
         self.0.terminate_process(process);

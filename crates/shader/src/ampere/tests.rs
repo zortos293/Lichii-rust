@@ -457,6 +457,7 @@ impl Mock {
 }
 
 impl ShaderEnvironment for Mock {
+    test_gpu_state!();
     fn arch(&self) -> ShaderArch {
         ShaderArch::Ampere
     }

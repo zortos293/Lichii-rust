@@ -240,3 +240,38 @@ fn shutdown_stops_a_spinning_core() {
     rx.recv_timeout(Duration::from_secs(5))
         .expect("shutdown hung on a spinning core");
 }
+
+#[test]
+fn pause_stops_guest_code_until_resume() {
+    let test = TestKernel::new(ConsoleGeneration::Switch2);
+    let heap = heap_base(&test);
+    let (counter, done) = (heap + 0x800, heap + 0x804);
+    let main = test.program(
+        Script::new()
+            .step(move |_, env| {
+                word(env, counter).fetch_add(1, Ordering::SeqCst);
+                if word(env, done).load(Ordering::SeqCst) == 1 {
+                    super::Action::Next
+                } else {
+                    super::Action::Stay
+                }
+            })
+            .exit(),
+    );
+    let process = test.start(test.image(), main);
+    let read = |addr| process.memory().read::<u32>(addr).unwrap();
+    test.kernel.run().unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    assert!(read(counter) > 0, "guest never ran");
+    test.kernel.pause();
+    assert!(test.kernel.is_paused());
+    std::thread::sleep(Duration::from_millis(30));
+    let paused_at = read(counter);
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(read(counter), paused_at, "guest ran while paused");
+    test.kernel.resume();
+    std::thread::sleep(Duration::from_millis(30));
+    assert!(read(counter) > paused_at, "guest did not resume");
+    process.memory().write(done, 1u32).unwrap();
+    test.wait_for_exit(Duration::from_secs(10));
+}
