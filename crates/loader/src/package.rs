@@ -2,6 +2,7 @@
 //! ExeFS and BKTR-patched RomFS, the newest control data and the title's DLC.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use lichii_common::ConsoleGeneration;
 use lichii_crypto::KeySet;
@@ -18,6 +19,7 @@ use lichii_fs::{
 
 use crate::error::{LoaderError, LoaderResult};
 use crate::exefs::load_exefs;
+use crate::patch::Mods;
 use crate::program::{AddOnContent, ProgramImage};
 use crate::title::{ICON_LANGUAGES, LoadOptions, TitleFormat, TitleInfo};
 
@@ -105,8 +107,11 @@ pub(crate) fn load(
 ) -> LoaderResult<ProgramImage> {
     let contents = Contents::open(path, format, options)?;
     let selected = contents.select(path, options.program_index)?;
-    let (npdm, modules) = load_exefs(&selected.exefs()?, options.hashes)?;
-    let romfs = selected.romfs()?;
+    let mods = Mods::find(&options.mods, selected.program_id)?;
+    let exefs = mods.layer_exefs(Arc::new(selected.exefs()?))?;
+    let (npdm, mut modules) = load_exefs(exefs.as_ref(), options.hashes)?;
+    mods.patch_modules(&mut modules)?;
+    let romfs = mods.layer_romfs(selected.romfs()?)?;
     let nacp = selected.control(options.language).nacp;
     let mut image = ProgramImage::new(npdm, modules, romfs, nacp);
     image.add_ons = add_ons(&contents.index, selected.application_id);
@@ -822,6 +827,27 @@ mod tests {
                 .unwrap()
                 .name,
             "Lichii Update"
+        );
+    }
+
+    #[test]
+    fn packaged_titles_load_mods() {
+        let temp = TempDir::new("package-mods");
+        let base = write_nsp(&temp.0, "base.nsp", base_files());
+        let romfs = temp.0.join(format!("mods/{APP:016X}/Patch/romfs"));
+        std::fs::create_dir_all(&romfs).unwrap();
+        std::fs::write(romfs.join("a_shared.bin"), b"modded").unwrap();
+        let options = LoadOptions {
+            mods: crate::patch::ModOptions {
+                load_root: Some(temp.0.join("mods")),
+                ..Default::default()
+            },
+            ..with_keys()
+        };
+        let image = load(&base, &options).unwrap();
+        assert_eq!(
+            read(image.romfs.as_ref().unwrap(), "a_shared.bin"),
+            b"modded"
         );
     }
 
