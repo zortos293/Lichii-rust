@@ -81,7 +81,7 @@ impl ServiceAccess {
     fn parse(mut data: &[u8]) -> LoaderResult<Self> {
         let mut out = Self::default();
         while let Some((&control, rest)) = data.split_first() {
-            if control == 0 {
+            if control == 0 && rest.first().is_none_or(|&byte| byte == 0) {
                 break;
             }
             let len = usize::from(control & 7) + 1;
@@ -521,6 +521,14 @@ pub(crate) mod tests {
             assert!(npdm.services.allows_client("hid:sys"));
             assert!(!npdm.services.allows_client("fsp-ldr"));
         }
+    }
+
+    #[test]
+    fn one_byte_service_names_are_entries() {
+        let sac = ServiceAccess::parse(b"\x00*\x86fsp-srv\x00\x00").unwrap();
+        assert_eq!(sac.client, ["*"]);
+        assert_eq!(sac.server, ["fsp-srv"]);
+        assert!(sac.allows_client("hid"));
     }
 
     #[test]

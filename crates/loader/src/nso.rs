@@ -53,7 +53,7 @@ pub fn load_nso(file: &dyn File, name: &str, hashes: HashCheck) -> LoaderResult<
             ));
         }
         let segment_end = u64::from(segment.memory_offset) + u64::from(segment.size);
-        if segment_end < end && segment.size != 0 {
+        if segment.size != 0 && u64::from(segment.memory_offset) < end {
             return Err(LoaderError::Corrupt(
                 "NSO",
                 "segments overlap or are out of order",
@@ -308,6 +308,16 @@ pub(crate) mod tests {
         assert!(matches!(
             load_nso(MemFile::from_bytes(lz4).as_ref(), "main", HashCheck::Skip),
             Err(LoaderError::Decompress { segment: 0, .. })
+        ));
+        let mut overlapping = build_nso(&segs, Compression::None, 0, false);
+        overlapping[0x24..0x28].copy_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            load_nso(
+                MemFile::from_bytes(overlapping).as_ref(),
+                "main",
+                HashCheck::Skip
+            ),
+            Err(LoaderError::Corrupt("NSO", _))
         ));
         let mut huge = build_nso(&segs, Compression::None, 0, false);
         huge[0x18..0x1c].copy_from_slice(&u32::MAX.to_le_bytes());

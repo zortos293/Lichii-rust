@@ -1,6 +1,7 @@
 //! Finding titles on disk, reading what the game list shows, and loading them into a
 //! [`ProgramImage`].
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use lichii_common::ConsoleGeneration;
@@ -191,7 +192,14 @@ impl LooseTitle {
             let game = parent.parent()?;
             return find_romfs_dir(game).or_else(|| find_romfs_dir(&game.join("base")));
         }
-        let main_size = |exefs: &Path| std::fs::metadata(exefs.join("main")).map(|m| m.len()).ok();
+        let main_build_id = |exefs: &Path| -> Option<[u8; 32]> {
+            let mut header = [0u8; 0x60];
+            std::fs::File::open(exefs.join("main"))
+                .ok()?
+                .read_exact(&mut header)
+                .ok()?;
+            (&header[..4] == b"NSO0").then(|| header[0x40..].try_into().unwrap())
+        };
         [title.join("updates"), parent.join("updates")].iter().find_map(|updates| {
             let newest = std::fs::read_dir(updates)
                 .ok()?
@@ -200,15 +208,15 @@ impl LooseTitle {
                 .max_by_key(|(version, _)| *version)?
                 .1;
             let romfs = find_romfs_dir(&newest)?;
-            match (main_size(&self.exefs), main_size(&newest.join("exefs"))) {
-                (Some(base), Some(update)) if base != update => {
+            match (main_build_id(&self.exefs), main_build_id(&newest.join("exefs"))) {
+                (Some(base), Some(update)) if base == update => Some(romfs),
+                _ => {
                     tracing::error!(
-                        "{}: the base has no RomFS and the newest update's is from a different build; load the update's exefs",
+                        "{}: the base has no RomFS and the newest update's main is not the same build; load the update's exefs",
                         self.exefs.display()
                     );
                     None
                 }
-                _ => Some(romfs),
             }
         })
     }
@@ -548,11 +556,12 @@ mod tests {
                 .is_none()
         );
 
-        std::fs::write(
-            game.join("updates/131072/exefs/main"),
-            build_nso(&segments(2), Compression::None, 0, false),
-        )
-        .unwrap();
+        let mut other_build = std::fs::read(game.join("base/exefs/main")).unwrap();
+        other_build[0x40] ^= 1;
+        std::fs::write(game.join("updates/131072/exefs/main"), other_build).unwrap();
+        assert!(base.load(&LoadOptions::default()).unwrap().romfs.is_none());
+
+        std::fs::remove_file(game.join("updates/131072/exefs/main")).unwrap();
         assert!(base.load(&LoadOptions::default()).unwrap().romfs.is_none());
     }
 
