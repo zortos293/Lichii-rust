@@ -262,6 +262,11 @@ pub struct ShaderInfo {
     pub image_descriptors: Vec<ImageDescriptor>,
 
     pub mesh: MeshInfo,
+
+    /// Byte offset in constant buffer 0 of the NVN storage buffer descriptors for this stage.
+    pub nvn_buffer_base: u32,
+    pub requires_coherent_global_memory: bool,
+    pub requires_coherent_image_memory: bool,
 }
 
 impl ShaderInfo {

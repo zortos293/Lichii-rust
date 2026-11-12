@@ -144,6 +144,8 @@ pub struct TextureInstInfo {
 impl TextureInstInfo {
     /// Largest descriptor index the flags word can hold.
     pub const MAX_DESCRIPTOR_INDEX: u16 = (1 << 14) - 1;
+    /// Raw flag bit, outside the fields above, marking an image access that must be coherent.
+    pub const IMAGE_COHERENT: u32 = 1 << 31;
 
     pub const fn to_flags(self) -> u32 {
         (self.descriptor_index as u32 & 0x3fff)

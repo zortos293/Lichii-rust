@@ -196,3 +196,41 @@ impl Profile {
         .fold(0, |key, (bit, &set)| key | (set as u32) << bit)
     }
 }
+
+/// Host properties that change translation, ported from `host_translate_info.h`. Keep entries
+/// to a minimum: each one can change the translated program and so the shader cache.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct HostTranslateInfo {
+    /// Minimum storage buffer offset alignment of the device.
+    pub min_ssbo_alignment: u64,
+    pub max_per_stage_descriptor_sampled_images: u32,
+    pub max_per_stage_resources: u32,
+    pub max_per_stage_descriptor_storage_buffers: u32,
+    /// Maximum samplers per stage, which a combined image sampler (a texture) counts against.
+    pub max_per_stage_descriptor_samplers: u32,
+    pub max_descriptor_set_samplers: u32,
+    pub max_descriptor_set_uniform_buffers: u32,
+    pub max_descriptor_set_uniform_buffers_dynamic: u32,
+    pub max_descriptor_set_storage_buffers: u32,
+    pub max_descriptor_set_storage_buffers_dynamic: u32,
+    pub max_descriptor_set_sampled_images: u32,
+    pub max_descriptor_set_storage_images: u32,
+    pub max_descriptor_set_input_attachements: u32,
+    pub support_float64: bool,
+    pub support_float16: bool,
+    pub support_int64: bool,
+    /// The device needs `DemoteToHelperInvocation` reordered.
+    pub needs_demote_reorder: bool,
+    pub support_snorm_render_buffer: bool,
+    /// The device can write the layer from stages before geometry.
+    pub support_viewport_index_layer: bool,
+    pub support_viewport_mask: bool,
+    pub support_geometry_shader_passthrough: bool,
+    /// The device supports barriers in conditional control flow.
+    pub support_conditional_barrier: bool,
+    /// Geometry invocations run in subgroups of one lane.
+    pub single_lane_geometry_subgroups: bool,
+    pub support_byte_addressed_r16: bool,
+    /// A handle read from a table at a per-invocation index may become a descriptor array.
+    pub support_handle_table_arrays: bool,
+}
