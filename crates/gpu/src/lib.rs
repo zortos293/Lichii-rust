@@ -9,5 +9,6 @@ pub mod engines;
 pub mod gmmu;
 pub mod host;
 pub mod host1x;
+pub mod macros;
 pub mod nx2_memory;
 pub mod pushbuffer;

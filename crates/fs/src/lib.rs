@@ -5,7 +5,7 @@
 //! The containers parse into those traits: PFS0/HFS0 ([`pfs`]), RomFS ([`romfs`]), NCA
 //! archives ([`nca`]) with BKTR update patching ([`bktr`]), NSP ([`nsp`]) and XCI ([`xci`])
 //! packages indexed into titles ([`content`]), and the metadata formats NACP ([`nacp`]) and
-//! CNMT ([`cnmt`]).
+//! CNMT ([`cnmt`]). [`ips`] applies IPS and IPSwitch patches to executables and RomFS files.
 
 pub mod bktr;
 mod bytes;
@@ -13,6 +13,7 @@ pub mod cnmt;
 pub mod content;
 mod error;
 pub mod host;
+pub mod ips;
 pub mod nacp;
 pub mod nca;
 pub mod nsp;
