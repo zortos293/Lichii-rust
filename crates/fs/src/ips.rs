@@ -40,6 +40,8 @@ pub struct Ips {
 }
 
 impl Ips {
+    /// Parses a whole IPS or IPS32 file. Fails on a missing magic, a record cut off by the end
+    /// of the data, or a missing `EOF`/`EEOF` marker.
     pub fn parse(data: &[u8]) -> FsResult<Self> {
         let (offset_len, eof): (usize, &[u8]) = match data.get(..5) {
             Some(b"PATCH") => (3, b"EOF"),
@@ -122,6 +124,8 @@ pub struct IpSwitch {
 }
 
 impl IpSwitch {
+    /// Parses IPSwitch text. Never fails: unknown flags, lines before the first block and
+    /// malformed records are skipped, as the reference parsers do.
     pub fn parse(text: &[u8]) -> Self {
         let mut out = Self {
             build_id: [0; 32],

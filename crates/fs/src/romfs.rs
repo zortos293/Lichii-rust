@@ -304,6 +304,8 @@ pub struct RomfsExt {
 }
 
 impl RomfsExt {
+    /// Wraps `dir` with the ext rules from `ext`. The result is an ordinary directory: put it
+    /// under or over a [`crate::LayeredDir`] and pass it to [`build_romfs`].
     pub fn layer(dir: DirRef, ext: DirRef) -> DirRef {
         Arc::new(Self { dir, ext })
     }
