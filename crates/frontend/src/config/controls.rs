@@ -215,9 +215,7 @@ impl ControlsPage {
                         ))
                         .color(ACCENT),
                     );
-                    if ui.button("Cancel binding").clicked() {
-                        self.capture = None;
-                    }
+                    note(ui, "Press Esc to cancel.");
                 }
                 if env.host.is_none() {
                     note(ui, "Waiting for the input thread…");
@@ -268,7 +266,7 @@ impl ControlsPage {
         let Some((source, _)) = detect_press(baseline, host, pad) else {
             return;
         };
-        if source == Source::Mouse(MouseButton::Left) {
+        if matches!(source, Source::Key(_) | Source::Mouse(_)) {
             cap.baseline = Some(host.clone());
             return;
         }
@@ -276,9 +274,28 @@ impl ControlsPage {
         self.capture = None;
     }
 
-    /// A key press the window saw while capturing. Keys come straight from the window because a
-    /// quick tap can start and end between two host-input snapshots. True when it was bound.
+    /// A key press the window saw. While capturing, Esc cancels and any other key is bound; keys
+    /// and mouse buttons come straight from the window because a quick tap can start and end
+    /// between two host-input snapshots. True when the press was used.
     pub fn on_key(&mut self, key: Key, d: &mut Settings) -> bool {
+        if key.name() == "Escape" && self.capture.is_some() {
+            self.capture = None;
+            return true;
+        }
+        self.bind_source(Source::Key(key), d)
+    }
+
+    /// A mouse press the window saw; while capturing it is bound (left button included) instead
+    /// of reaching the UI. True when it was bound.
+    pub fn on_mouse(&mut self, button: MouseButton, d: &mut Settings) -> bool {
+        self.bind_source(Source::Mouse(button), d)
+    }
+
+    pub fn cancel_capture(&mut self) {
+        self.capture = None;
+    }
+
+    fn bind_source(&mut self, source: Source, d: &mut Settings) -> bool {
         let Some(cap) = &self.capture else {
             return false;
         };
@@ -288,7 +305,7 @@ impl ControlsPage {
         bind(
             &mut d.controls.players[self.player],
             cap.target,
-            Source::Key(key).to_binding(),
+            source.to_binding(),
         );
         self.capture = None;
         true

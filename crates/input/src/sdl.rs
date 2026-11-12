@@ -12,10 +12,13 @@ use sdl3::sensor::SensorType;
 use crate::gamepad::{Gamepad, GamepadState, PadAxis, PadButton};
 use crate::mapping::HostInput;
 
+/// SDL failed to initialise its gamepad subsystem or event pump; the message is SDL's.
 #[derive(Debug, thiserror::Error)]
 #[error("SDL: {0}")]
 pub struct SdlError(String);
 
+/// SDL's gamepad subsystem and the pads it has open. Not `Send`: create, poll and rumble it on
+/// one thread, the first in the process to touch SDL.
 pub struct SdlInput {
     _sdl: sdl3::Sdl,
     subsystem: sdl3::GamepadSubsystem,
@@ -25,6 +28,9 @@ pub struct SdlInput {
 }
 
 impl SdlInput {
+    /// Sets SDL's hints (HIDAPI drivers for Switch and Switch 2 controllers, background events,
+    /// no signal handlers) and opens the gamepad subsystem. Pads already connected arrive as
+    /// hotplug events on the first [`Self::poll`].
     pub fn new() -> Result<Self, SdlError> {
         for (hint, value) in [
             ("SDL_NO_SIGNAL_HANDLERS", "1"),

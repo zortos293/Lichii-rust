@@ -459,10 +459,11 @@ impl App {
         };
         let down = event.state == ElementState::Pressed;
         self.held_keys.set(key, down);
-        if let Some(config) = &mut self.config
+        if down
+            && let Some(config) = &mut self.config
             && config.wants_chord()
         {
-            if down && let Some(chord) = KeyChord::from_press(key, &self.held_keys) {
+            if let Some(chord) = KeyChord::from_press(key, &self.held_keys) {
                 config.on_chord(chord);
             }
             return;
@@ -615,6 +616,18 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(window) = self.window.clone() else {
             return;
         };
+        if let WindowEvent::MouseInput {
+            state: ElementState::Pressed,
+            button,
+            ..
+        } = event
+            && let Some(button) = MouseButton::from_winit(button)
+            && let Some(config) = &mut self.config
+            && config.on_mouse(button)
+        {
+            window.request_redraw();
+            return;
+        }
         let response = self
             .egui_state
             .as_mut()

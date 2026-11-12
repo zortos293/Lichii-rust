@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use egui::{RichText, Ui};
 use lichii_common::paths::UserPaths;
 use lichii_common::settings::*;
-use lichii_input::{Gamepad, HostInput, Key, KeyChord};
+use lichii_input::{Gamepad, HostInput, Key, KeyChord, MouseButton};
 
 use crate::choices::Choice;
 
@@ -103,9 +103,15 @@ impl ConfigWindow {
         self.hotkey_capture.is_some()
     }
 
-    /// A key press while the window is open; true when it bound a control.
+    /// A key press while the window is open; true when the controls page used it.
     pub fn on_key(&mut self, key: Key) -> bool {
         self.page == Page::Controls && self.controls.on_key(key, &mut self.draft)
+    }
+
+    /// A mouse press while the window is open; true when it bound a control, in which case the
+    /// press must not reach the UI.
+    pub fn on_mouse(&mut self, button: MouseButton) -> bool {
+        self.page == Page::Controls && self.controls.on_mouse(button, &mut self.draft)
     }
 
     /// A key chord pressed while [`Self::wants_chord`].
@@ -147,8 +153,11 @@ impl ConfigWindow {
                             if ui
                                 .selectable_label(self.page == page, page.label())
                                 .clicked()
+                                && self.page != page
                             {
                                 self.page = page;
+                                self.hotkey_capture = None;
+                                self.controls.cancel_capture();
                             }
                         }
                     });
