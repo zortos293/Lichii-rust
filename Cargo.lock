@@ -1082,6 +1082,7 @@ name = "lichii-fs"
 version = "0.1.0"
 dependencies = [
  "lichii-crypto",
+ "lz4_flex",
  "miniz_oxide",
  "thiserror 2.0.21",
  "tracing",
