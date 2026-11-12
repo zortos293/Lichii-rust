@@ -234,6 +234,15 @@ impl Swapchain {
         if caps.max_image_count != 0 {
             image_count = image_count.min(caps.max_image_count);
         }
+        let composite_alpha = [
+            vk::CompositeAlphaFlagsKHR::OPAQUE,
+            vk::CompositeAlphaFlagsKHR::INHERIT,
+            vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED,
+            vk::CompositeAlphaFlagsKHR::POST_MULTIPLIED,
+        ]
+        .into_iter()
+        .find(|&mode| caps.supported_composite_alpha.contains(mode))
+        .unwrap_or(vk::CompositeAlphaFlagsKHR::OPAQUE);
         let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST;
         let info = vk::SwapchainCreateInfoKHR::default()
             .surface(surface)
@@ -245,7 +254,7 @@ impl Swapchain {
             .image_usage(usage & caps.supported_usage_flags)
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(caps.current_transform)
-            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+            .composite_alpha(composite_alpha)
             .present_mode(present_mode)
             .clipped(true)
             .old_swapchain(self.raw);

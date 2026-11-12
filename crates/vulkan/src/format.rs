@@ -15,17 +15,71 @@ pub enum Conversion {
     Decode,
     /// Decode ASTC, then recompress to BC1 or BC3 to save memory (NX2_NOTES rows 99, 107).
     DecodeToBc(Compression),
+    /// The host format stores texels differently (a depth fallback such as D24S8 in
+    /// D32S8): uploads and downloads convert every texel.
+    Convert,
 }
 
 /// The Vulkan format backing a guest format and what an upload must do to fill it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub struct HostFormat {
     pub format: vk::Format,
     pub conversion: Conversion,
+    /// Component mapping every sampled view of the image must apply, passed to `Image::view`
+    /// (composed with the guest's own swizzle), for host formats whose bit order differs from
+    /// the guest's. Attachment views must be identity, so `attachable` implies identity here.
+    pub swizzle: vk::ComponentMapping,
     /// Can be a color or depth/stencil attachment.
     pub attachable: bool,
     /// Can be a storage image.
     pub storage: bool,
+}
+
+const IDENTITY: vk::ComponentMapping = vk::ComponentMapping {
+    r: vk::ComponentSwizzle::IDENTITY,
+    g: vk::ComponentSwizzle::IDENTITY,
+    b: vk::ComponentSwizzle::IDENTITY,
+    a: vk::ComponentSwizzle::IDENTITY,
+};
+
+const fn mapping(
+    r: vk::ComponentSwizzle,
+    g: vk::ComponentSwizzle,
+    b: vk::ComponentSwizzle,
+    a: vk::ComponentSwizzle,
+) -> vk::ComponentMapping {
+    vk::ComponentMapping { r, g, b, a }
+}
+
+const SWAP_RED_BLUE: vk::ComponentMapping = mapping(
+    vk::ComponentSwizzle::B,
+    vk::ComponentSwizzle::G,
+    vk::ComponentSwizzle::R,
+    vk::ComponentSwizzle::A,
+);
+const SWAP_RED_GREEN: vk::ComponentMapping = mapping(
+    vk::ComponentSwizzle::G,
+    vk::ComponentSwizzle::R,
+    vk::ComponentSwizzle::B,
+    vk::ComponentSwizzle::A,
+);
+const REVERSE: vk::ComponentMapping = mapping(
+    vk::ComponentSwizzle::A,
+    vk::ComponentSwizzle::B,
+    vk::ComponentSwizzle::G,
+    vk::ComponentSwizzle::R,
+);
+
+/// The view mapping that makes a native host format read like the guest format: the guest
+/// names components from the most significant bit, so A1B5G5R5 lives in A1R5G5B5 with red and
+/// blue swapped, A5B5G5R1 in R5G5B5A1 reversed, and G4R4 in R4G4 with red and green swapped.
+const fn native_swizzle(format: PixelFormat) -> vk::ComponentMapping {
+    match format {
+        PixelFormat::A1B5G5R5Unorm => SWAP_RED_BLUE,
+        PixelFormat::A5B5G5R1Unorm => REVERSE,
+        PixelFormat::G4R4Unorm => SWAP_RED_GREEN,
+        _ => IDENTITY,
+    }
 }
 
 const A: u8 = 1;
@@ -182,20 +236,38 @@ fn required_features(attachable: bool, storage: bool, depth: bool) -> vk::Format
     features
 }
 
-/// Vulkan formats tried, in order, when a depth/stencil format is missing (D24S8 is optional
-/// on some AMD drivers) or a packed format is.
-fn alternatives(format: vk::Format) -> &'static [vk::Format] {
+/// How a fallback format holds the guest's texels.
+#[derive(Clone, Copy)]
+enum Fallback {
+    /// Same bits in another order: a view swizzle fixes it.
+    Swizzle(vk::ComponentMapping),
+    /// Different encoding: texels are converted.
+    Convert,
+}
+
+/// Formats tried, in order, when a native format is missing (D24S8 is optional on some AMD
+/// drivers; the 4- and 5-bit packed formats are optional everywhere).
+fn alternatives(format: vk::Format) -> &'static [(vk::Format, Fallback)] {
+    use Fallback::*;
     match format {
-        vk::Format::D24_UNORM_S8_UINT => &[
-            vk::Format::D32_SFLOAT_S8_UINT,
-            vk::Format::D16_UNORM_S8_UINT,
+        vk::Format::D24_UNORM_S8_UINT => &[(vk::Format::D32_SFLOAT_S8_UINT, Convert)],
+        vk::Format::X8_D24_UNORM_PACK32 => &[
+            (vk::Format::D32_SFLOAT, Convert),
+            (vk::Format::D24_UNORM_S8_UINT, Convert),
         ],
-        vk::Format::X8_D24_UNORM_PACK32 => &[vk::Format::D32_SFLOAT, vk::Format::D24_UNORM_S8_UINT],
-        vk::Format::D16_UNORM => &[vk::Format::D32_SFLOAT],
-        vk::Format::A4B4G4R4_UNORM_PACK16
-        | vk::Format::R4G4_UNORM_PACK8
-        | vk::Format::B5G6R5_UNORM_PACK16
-        | vk::Format::R5G5B5A1_UNORM_PACK16 => &[vk::Format::A8B8G8R8_UNORM_PACK32],
+        vk::Format::D16_UNORM => &[(vk::Format::D32_SFLOAT, Convert)],
+        vk::Format::A4B4G4R4_UNORM_PACK16 => &[
+            (vk::Format::R4G4B4A4_UNORM_PACK16, Swizzle(REVERSE)),
+            (vk::Format::A8B8G8R8_UNORM_PACK32, Convert),
+        ],
+        vk::Format::B5G6R5_UNORM_PACK16 => &[
+            (vk::Format::R5G6B5_UNORM_PACK16, Swizzle(SWAP_RED_BLUE)),
+            (vk::Format::A8B8G8R8_UNORM_PACK32, Convert),
+        ],
+        vk::Format::R4G4_UNORM_PACK8 => &[(vk::Format::R8G8_UNORM, Convert)],
+        vk::Format::R5G5B5A1_UNORM_PACK16 | vk::Format::A1R5G5B5_UNORM_PACK16 => {
+            &[(vk::Format::A8B8G8R8_UNORM_PACK32, Convert)]
+        }
         _ => &[],
     }
 }
@@ -227,6 +299,7 @@ pub fn host_format(
             return HostFormat {
                 format: native_format,
                 conversion: Conversion::None,
+                swizzle: IDENTITY,
                 attachable: false,
                 storage: false,
             };
@@ -249,6 +322,7 @@ pub fn host_format(
                     vk::Format::BC1_RGBA_UNORM_BLOCK
                 },
                 conversion: Conversion::DecodeToBc(Compression::Bc1),
+                swizzle: IDENTITY,
                 attachable: false,
                 storage: false,
             },
@@ -259,6 +333,7 @@ pub fn host_format(
                     vk::Format::BC3_UNORM_BLOCK
                 },
                 conversion: Conversion::DecodeToBc(Compression::Bc3),
+                swizzle: IDENTITY,
                 attachable: false,
                 storage: false,
             },
@@ -267,28 +342,47 @@ pub fn host_format(
                 HostFormat {
                     format,
                     conversion: Conversion::Decode,
+                    swizzle: IDENTITY,
                     attachable: false,
                     storage: !srgb,
                 }
             }
         };
     }
+    let viewable_as_attachment = |attachable: bool, swizzle: vk::ComponentMapping| {
+        !attachable
+            || [swizzle.r, swizzle.g, swizzle.b, swizzle.a]
+                .iter()
+                .all(|&c| c == vk::ComponentSwizzle::IDENTITY)
+    };
     for (attachable, storage) in [(attachable, storage), (attachable, false), (false, false)] {
-        if supports(native_format, attachable, storage) {
+        let swizzle = native_swizzle(format);
+        if viewable_as_attachment(attachable, swizzle)
+            && supports(native_format, attachable, storage)
+        {
             return HostFormat {
                 format: native_format,
                 conversion: Conversion::None,
+                swizzle,
                 attachable,
                 storage,
             };
         }
-        if let Some(&alternative) = alternatives(native_format)
+        let candidate = alternatives(native_format)
             .iter()
-            .find(|&&f| supports(f, attachable, false))
-        {
+            .find_map(|&(f, fallback)| {
+                let (conversion, swizzle) = match fallback {
+                    Fallback::Swizzle(swizzle) => (Conversion::None, swizzle),
+                    Fallback::Convert => (Conversion::Convert, IDENTITY),
+                };
+                (viewable_as_attachment(attachable, swizzle) && supports(f, attachable, false))
+                    .then_some((f, conversion, swizzle))
+            });
+        if let Some((alternative, conversion, swizzle)) = candidate {
             return HostFormat {
                 format: alternative,
-                conversion: Conversion::None,
+                conversion,
+                swizzle,
                 attachable,
                 storage: false,
             };
@@ -297,6 +391,7 @@ pub fn host_format(
     HostFormat {
         format: native_format,
         conversion: Conversion::None,
+        swizzle: native_swizzle(format),
         attachable: false,
         storage: false,
     }
@@ -305,6 +400,24 @@ pub fn host_format(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swizzle_fallbacks_keep_the_texel_size() {
+        let two_bytes = [
+            vk::Format::R4G4B4A4_UNORM_PACK16,
+            vk::Format::A4B4G4R4_UNORM_PACK16,
+            vk::Format::R5G6B5_UNORM_PACK16,
+            vk::Format::B5G6R5_UNORM_PACK16,
+        ];
+        for &format in PixelFormat::ALL {
+            let (native_format, _) = native(format);
+            for (alternative, fallback) in alternatives(native_format) {
+                if let Fallback::Swizzle(_) = fallback {
+                    assert!(two_bytes.contains(alternative) && two_bytes.contains(&native_format));
+                }
+            }
+        }
+    }
 
     #[test]
     fn every_format_has_a_native_mapping_of_the_same_size() {

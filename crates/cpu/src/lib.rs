@@ -4,6 +4,7 @@
 //! [\`CpuCore::run\`] executes guest code until something needs the kernel (an \`SVC\`, a fault, an
 //! interrupt request) and reports it as a [\`HaltReason\`].
 
+pub mod decoder;
 mod interpreter;
 
 use std::sync::Arc;

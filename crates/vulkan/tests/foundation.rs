@@ -150,6 +150,15 @@ fn copies_through_the_scheduler_and_retires_after_completion() {
 
 #[test]
 fn staging_ring_wraps_and_waits_for_the_gpu() {
+    staging_round_trip(5);
+}
+
+#[test]
+fn staging_ring_wraps_within_one_submission() {
+    staging_round_trip(u64::MAX);
+}
+
+fn staging_round_trip(flush_every: u64) {
     let Some(device) = device() else { return };
     let mut scheduler = Scheduler::new(&device).unwrap();
     let mut ring = StagingRing::new(&device, 64 << 10).unwrap();
@@ -183,7 +192,7 @@ fn staging_ring_wraps_and_waits_for_the_gpu() {
                 .raw()
                 .cmd_copy_buffer(cmd, src, target.raw(), &region)
         };
-        if i % 5 == 4 {
+        if i % flush_every == flush_every - 1 {
             scheduler.flush().unwrap();
         }
     }
@@ -354,10 +363,33 @@ fn every_guest_format_gets_a_sampleable_host_format() {
                 "{format:?} -> {:?} ({features:?})",
                 host.format
             );
+            let image = Image::new(
+                &device,
+                &ImageDesc::d2(
+                    host.format,
+                    16,
+                    16,
+                    vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+                ),
+                "format probe",
+            )
+            .unwrap();
+            image
+                .view(vk::ImageViewType::TYPE_2D, host.swizzle)
+                .unwrap();
             if host.attachable && format.is_color() {
                 assert!(
                     features.contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT),
                     "{format:?}"
+                );
+            }
+            if host.attachable {
+                let s = host.swizzle;
+                assert!(
+                    [s.r, s.g, s.b, s.a]
+                        .iter()
+                        .all(|&c| c == vk::ComponentSwizzle::IDENTITY),
+                    "{format:?} attachment views must be identity"
                 );
             }
             if format.is_astc() && !device.features.texture_compression_astc_ldr {
@@ -377,6 +409,7 @@ fn every_guest_format_gets_a_sampleable_host_format() {
         AstcRecompression::Uncompressed,
     );
     assert!(rt.attachable && rt.conversion == Conversion::None);
+    assert_no_validation_errors(&device);
 }
 
 #[test]

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use ash::vk;
 use gpu_allocator::MemoryLocation;
@@ -7,10 +7,6 @@ use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 
 use crate::device::Device;
 use crate::error::{Result, VkResultExt};
-
-/// Bytes currently handed out by the allocator, across all devices; the allocator itself only
-/// reports block capacity cheaply.
-static ALLOCATED: AtomicU64 = AtomicU64::new(0);
 
 /// Device memory as the texture cache's collector and the frame view see it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -41,12 +37,16 @@ fn allocate(
         linear,
         allocation_scheme: AllocationScheme::GpuAllocatorManaged,
     })?;
-    ALLOCATED.fetch_add(allocation.size(), Ordering::Relaxed);
+    device
+        .allocated
+        .fetch_add(allocation.size(), Ordering::Relaxed);
     Ok(allocation)
 }
 
 fn free(device: &Device, allocation: Allocation) {
-    ALLOCATED.fetch_sub(allocation.size(), Ordering::Relaxed);
+    device
+        .allocated
+        .fetch_sub(allocation.size(), Ordering::Relaxed);
     if let Err(error) = device.allocator.lock().free(allocation) {
         tracing::error!("freeing device memory: {error}");
     }
@@ -63,9 +63,9 @@ impl Device {
             .map(|i| heaps[i].size)
             .sum();
         let capacity = self.allocator.lock().capacity();
-        let slack = capacity.saturating_sub(ALLOCATED.load(Ordering::Relaxed));
+        let slack = capacity.saturating_sub(self.allocated.load(Ordering::Relaxed));
         if !self.features.extensions.memory_budget {
-            let used = ALLOCATED.load(Ordering::Relaxed);
+            let used = self.allocated.load(Ordering::Relaxed);
             return MemoryUsage {
                 used,
                 budget: device_local,
@@ -307,13 +307,19 @@ impl Image {
         }
     }
 
-    /// A view of the whole image with the image's own format.
-    pub fn view(&self, view_type: vk::ImageViewType) -> Result<ImageView> {
+    /// A view of the whole image with the image's own format, reading channels through
+    /// `components` (`HostFormat::swizzle`, which is identity whenever the format is attachable).
+    pub fn view(
+        &self,
+        view_type: vk::ImageViewType,
+        components: vk::ComponentMapping,
+    ) -> Result<ImageView> {
         ImageView::new(
             &self.device,
             self.raw,
             view_type,
             self.desc.format,
+            components,
             self.full_range(),
         )
     }
@@ -329,23 +335,29 @@ impl Drop for Image {
     }
 }
 
+/// An image view. It owns only the view: the image it was created from must outlive it, and
+/// the view's format and range must be compatible with that image.
 pub struct ImageView {
     device: Arc<Device>,
     raw: vk::ImageView,
 }
 
 impl ImageView {
+    /// Creates a view of `range` of `image` read as `format`, with channels remapped by
+    /// `components`.
     pub fn new(
         device: &Arc<Device>,
         image: vk::Image,
         view_type: vk::ImageViewType,
         format: vk::Format,
+        components: vk::ComponentMapping,
         range: vk::ImageSubresourceRange,
     ) -> Result<Self> {
         let info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(view_type)
             .format(format)
+            .components(components)
             .subresource_range(range);
         // SAFETY: `image` is a live image of this device compatible with the view.
         let raw = unsafe {
