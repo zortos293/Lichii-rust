@@ -11,7 +11,8 @@ pub mod regs;
 
 use super::EngineContext;
 use super::upload::Upload;
-use crate::backend::{ComputeContext, QmdVersion, Query, QueryKind, ReleaseSize};
+use crate::backend::{ComputeContext, FenceAction, QmdVersion, Query, QueryKind, ReleaseSize};
+use crate::host::Reduction;
 use crate::reg_index;
 use qmd::{QMD_WORDS, QmdV2, QmdV3, Release, ReleaseKind};
 pub use regs::Regs;
@@ -131,29 +132,28 @@ impl KeplerCompute {
     }
 }
 
-/// Writes one release after the dispatch. Reductions and max releases combine with the word in
-/// memory through the GMMU at once, because `FenceAction` can only write a fixed value.
+/// Performs one release after the dispatch. Plain releases are queries; reductions and max
+/// releases are fence actions, so they combine with the word in memory only once every earlier
+/// release and the dispatch's GPU work finished.
 fn perform_release(ctx: &mut EngineContext<'_>, release: &Release) {
     let Release {
         address,
         payload,
         kind,
     } = *release;
-    let length = if kind == ReleaseKind::WordWithTimestamp {
-        16
-    } else {
-        4
-    };
-    let mut probe = [0u8; 16];
-    if let Err(fault) = ctx.memory.read_block(address, &mut probe[..length]) {
-        tracing::warn!(?fault, address, "compute release to unmapped memory");
-        return;
-    }
-    let current = u32::from_le_bytes([probe[0], probe[1], probe[2], probe[3]]);
-    let combined = match kind {
-        ReleaseKind::Reduction { op, signed } => op.apply(current, payload, signed),
-        ReleaseKind::Max => current.max(payload),
+    let (op, signed) = match kind {
+        ReleaseKind::Reduction { op, signed } => (op, signed),
+        ReleaseKind::Max => (Reduction::Max, false),
         ReleaseKind::Word | ReleaseKind::WordWithTimestamp => {
+            let timestamped = kind == ReleaseKind::WordWithTimestamp;
+            let mut probe = [0u8; 16];
+            if let Err(fault) = ctx
+                .memory
+                .read_block(address, &mut probe[..if timestamped { 16 } else { 4 }])
+            {
+                tracing::warn!(?fault, address, "compute release to unmapped memory");
+                return;
+            }
             ctx.rasterizer.query(
                 ctx.channel,
                 ctx.memory,
@@ -161,7 +161,7 @@ fn perform_release(ctx: &mut EngineContext<'_>, release: &Release) {
                     address,
                     kind: QueryKind::Payload,
                     payload: u64::from(payload),
-                    size: if kind == ReleaseKind::WordWithTimestamp {
+                    size: if timestamped {
                         ReleaseSize::Sixteen
                     } else {
                         ReleaseSize::Four
@@ -172,9 +172,16 @@ fn perform_release(ctx: &mut EngineContext<'_>, release: &Release) {
             return;
         }
     };
-    if let Err(fault) = ctx.memory.write(address, combined) {
-        tracing::warn!(?fault, address, "compute release to unmapped memory");
-    }
+    let Some(address) = ctx.memory.translate(address) else {
+        tracing::warn!(address, "compute reduction on unmapped memory");
+        return;
+    };
+    ctx.rasterizer.signal_fence(FenceAction::ReduceSemaphore {
+        address,
+        op,
+        signed,
+        payload,
+    });
 }
 
 #[cfg(test)]
@@ -208,6 +215,7 @@ mod tests {
     struct Spy {
         dispatches: Vec<Dispatch>,
         queries: Vec<Query>,
+        fences: Vec<FenceAction>,
         inline_writes: Vec<(GpuVAddr, u64)>,
         order: Vec<&'static str>,
     }
@@ -240,7 +248,10 @@ mod tests {
             self.order.push("query");
             self.queries.push(*query);
         }
-        fn signal_fence(&mut self, _action: FenceAction) {}
+        fn signal_fence(&mut self, action: FenceAction) {
+            self.order.push("fence");
+            self.fences.push(action);
+        }
         fn release_fences(&mut self, _wait: bool) {}
         fn invalidate_region(&mut self, _addr: DAddr, _size: u64) {}
         fn flush_region(&mut self, _addr: DAddr, _size: u64) {}
@@ -499,11 +510,9 @@ mod tests {
     }
 
     #[test]
-    fn reduction_and_max_releases_combine_with_memory() {
+    fn reduction_and_max_releases_are_fences_ordered_after_the_dispatch() {
         let mut rig = Rig::new(0xc7c0);
         rig.harness.memory.write(0x2000u64, 10u32).unwrap();
-        rig.harness.memory.write(0x2100u64, 50u32).unwrap();
-        rig.harness.memory.write(0x2200u64, (-5i32) as u32).unwrap();
         let mut words = v3_words();
         words[24] = 0x2000;
         words[25] = (1 << 23) | (1 << 26) | (1 << 30);
@@ -516,10 +525,46 @@ mod tests {
         words[54] = 3;
         rig.put_qmd(QMD, &words);
         rig.launch(QMD);
-        assert_eq!(rig.word(0x2000), 15);
-        assert_eq!(rig.word(0x2100), 50);
-        assert_eq!(rig.word(0x2200), 3);
+        let device = |address| rig.harness.memory.translate(address).unwrap();
+        assert_eq!(rig.spy.order, ["dispatch", "fence", "fence", "fence"]);
+        assert_eq!(
+            rig.spy.fences,
+            vec![
+                FenceAction::ReduceSemaphore {
+                    address: device(0x2000),
+                    op: Reduction::Add,
+                    signed: false,
+                    payload: 5,
+                },
+                FenceAction::ReduceSemaphore {
+                    address: device(0x2100),
+                    op: Reduction::Max,
+                    signed: false,
+                    payload: 20,
+                },
+                FenceAction::ReduceSemaphore {
+                    address: device(0x2200),
+                    op: Reduction::Max,
+                    signed: true,
+                    payload: 3,
+                },
+            ]
+        );
+        assert_eq!(rig.word(0x2000), 10);
         assert!(rig.spy.queries.is_empty());
+    }
+
+    #[test]
+    fn reduction_on_unmapped_memory_is_skipped() {
+        let mut rig = Rig::new(0xc7c0);
+        let mut words = v3_words();
+        words[24] = 0;
+        words[25] = (1 << 23) | (1 << 26) | (1 << 30) | 0x7f;
+        words[26] = 1;
+        rig.put_qmd(QMD, &words);
+        rig.launch(QMD);
+        assert_eq!(rig.spy.dispatches.len(), 1);
+        assert!(rig.spy.fences.is_empty());
     }
 
     #[test]
