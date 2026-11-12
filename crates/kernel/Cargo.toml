@@ -10,4 +10,8 @@ lichii-memory.workspace = true
 lichii-cpu.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true
+bytemuck.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+crossbeam-channel.workspace = true
