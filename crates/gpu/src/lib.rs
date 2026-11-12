@@ -26,4 +26,4 @@ mod stream;
 #[cfg(test)]
 mod gpu_tests;
 
-pub use gpu::{Gpu, GpuOptions, Threading};
+pub use gpu::{Console, Gpu, GpuConfig, Threading};

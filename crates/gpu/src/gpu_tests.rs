@@ -2,8 +2,11 @@
 //! recording engines and a recording renderer, in both threading modes.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use lichii_memory::{AddressSpace, DeviceAddressSpace, MemoryPermission, PhysicalMemory};
+use lichii_memory::{AddressSpace, MemoryPermission, PhysicalMemory};
+use lichii_texture::PixelFormat;
+use lichii_texture::block_linear::GobLayout;
 use parking_lot::Mutex;
 
 use crate::backend::{
@@ -11,12 +14,13 @@ use crate::backend::{
     GraphicsContext, IndirectDraw, Query, QueryKind, Rasterizer, ReleaseSize,
 };
 use crate::channel::{ChannelConfig, GpEntry, Submission, SyncpointFence, SyncpointIncrement};
-use crate::clock::{GpuTimestamp, GuestTime};
+use crate::clock::{GpuClockSpeed, GuestTime};
 use crate::engines::maxwell_3d::Regs;
 use crate::engines::{Engine, EngineContext, EngineKind, create_engine};
 use crate::gmmu::{BigPageSize, Gmmu};
-use crate::gpu::{Gpu, GpuOptions, Threading};
+use crate::gpu::{Console, Gpu, GpuConfig, Threading};
 use crate::host::HostClass;
+use crate::host1x::Host1x;
 use crate::host1x::Syncpoints;
 use crate::pushbuffer::{CommandHeader, SubmissionMode};
 use crate::reg_index;
@@ -214,7 +218,8 @@ struct Rig {
     log: Log,
     work: Arc<HostWork>,
     next_pushbuffer: u64,
-    _space: AddressSpace,
+    space: AddressSpace,
+    time: Arc<TestTime>,
 }
 
 impl Rig {
@@ -239,37 +244,34 @@ impl Rig {
     }
 
     fn build(threading: Threading, ring_slots: usize, completion: Completion) -> Self {
+        Self::build_for(Console::Switch1, threading, ring_slots, completion)
+    }
+
+    fn build_for(
+        console: Console,
+        threading: Threading,
+        ring_slots: usize,
+        completion: Completion,
+    ) -> Self {
         let physical = Arc::new(PhysicalMemory::new(1 << 24).unwrap());
         let space = AddressSpace::new(physical.clone(), 39);
         space.map(CPU_VA, 0x10_0000, MAPPED, MemoryPermission::READ_WRITE);
-        let device = Arc::new(DeviceAddressSpace::new(physical, 36));
-        device
+        let host1x = Host1x::new(physical, 36);
+        host1x
+            .memory
             .map_process(DEVICE_BASE, &space, CPU_VA, MAPPED)
             .unwrap();
-        let memory = Arc::new(Gmmu::new(device.clone(), BigPageSize::Size64K));
+        let memory = Arc::new(Gmmu::new(host1x.memory.clone(), BigPageSize::Size64K));
         memory.map(0, DEVICE_BASE, MAPPED, 0, false).unwrap();
-        let syncpoints = Arc::new(Syncpoints::new());
+        let syncpoints = host1x.syncpoints.clone();
         let log = Log::default();
         let engines_log = log.clone();
-        let handles = GpuHandles {
-            device,
-            syncpoints: syncpoints.clone(),
-            timestamp: Arc::new(GpuTimestamp::new(Arc::new(NoTime), false)),
-        };
-        let work = Arc::new(HostWork {
-            completion,
-            handles: handles.clone(),
-            memory: memory.clone(),
-            pending: Mutex::default(),
-        });
-        let recorder = Recorder {
-            log: log.clone(),
-            work: work.clone(),
-        };
+        let mut work = None;
+        let time = Arc::new(TestTime::default());
         let gpu = Gpu::new(
-            Box::new(recorder),
-            &handles,
-            GpuOptions {
+            host1x,
+            time.clone(),
+            GpuConfig {
                 threading,
                 ring_slots,
                 engines: Arc::new(move |engine, class| match engine {
@@ -279,6 +281,20 @@ impl Rig {
                         log: engines_log.clone(),
                     })),
                 }),
+                ..GpuConfig::new(console)
+            },
+            |handles| {
+                let host = Arc::new(HostWork {
+                    completion,
+                    handles,
+                    memory: memory.clone(),
+                    pending: Mutex::default(),
+                });
+                work = Some(host.clone());
+                Box::new(Recorder {
+                    log: log.clone(),
+                    work: host,
+                })
             },
         );
         Self {
@@ -286,9 +302,10 @@ impl Rig {
             memory,
             syncpoints,
             log,
-            work,
+            work: work.expect("the renderer was created"),
             next_pushbuffer: 0x1_0000,
-            _space: space,
+            space,
+            time,
         }
     }
 
@@ -413,12 +430,6 @@ impl Pushbuffer {
         .inc(2, 0x6c, &[1])
         .non_inc(2, 0x6d, data)
     }
-}
-
-#[test]
-fn gpu_is_shared_between_threads() {
-    fn shared<T: Send + Sync>() {}
-    shared::<Gpu>();
 }
 
 fn each_mode(test: impl Fn(Threading)) {
@@ -1142,10 +1153,191 @@ fn set_object_of_an_unknown_class_unbinds_and_class_0_keeps_the_binding() {
     });
 }
 
-struct NoTime;
+#[derive(Default)]
+struct TestTime(AtomicU64);
 
-impl GuestTime for NoTime {
+impl GuestTime for TestTime {
     fn global_time_ns(&self) -> u64 {
-        0
+        self.0.load(Ordering::Relaxed)
     }
+}
+
+#[test]
+fn switch_2_address_spaces_get_the_identity_mappings_until_destroyed() {
+    let rig = Rig::build_for(
+        Console::Switch2,
+        Threading::Split,
+        crate::gpu::DEFAULT_RING_SLOTS,
+        Completion::Immediate,
+    );
+    let nx2 = rig.gpu.nx2_memory().expect("Switch 2 has the registry");
+    let early = rig.gpu.create_address_space(BigPageSize::Size64K);
+    let (first, _) = nx2
+        .create_gpu_accessible_memory(&rig.space, CPU_VA, 0x1_0000)
+        .unwrap();
+    let late = rig.gpu.create_address_space(BigPageSize::Size128K);
+    rig.space.write(CPU_VA + 0x120, 0x5eed_u32).unwrap();
+    let daddr = nx2.memory_info(first).unwrap().daddr;
+    for gmmu in [&early, &late] {
+        assert_eq!(gmmu.translate(CPU_VA + 0x120), Some(daddr + 0x120));
+        assert_eq!(gmmu.read::<u32>(CPU_VA + 0x120), Ok(0x5eed));
+    }
+    rig.gpu.destroy_address_space(&early);
+    nx2.create_gpu_accessible_memory(&rig.space, CPU_VA + 0x10_0000, 0x1_0000)
+        .unwrap();
+    assert_eq!(early.translate(CPU_VA + 0x10_0000), None);
+    assert!(late.translate(CPU_VA + 0x10_0000).is_some());
+    assert_eq!(early.translate(CPU_VA + 0x120), Some(daddr + 0x120));
+}
+
+#[test]
+fn switch_1_has_no_nx2_registry_and_plain_address_spaces() {
+    let rig = Rig::new(Threading::Split);
+    assert!(rig.gpu.nx2_memory().is_none());
+    let gmmu = rig.gpu.create_address_space(BigPageSize::Size64K);
+    assert_eq!(gmmu.translate(0), None);
+    rig.gpu.destroy_address_space(&gmmu);
+}
+
+#[test]
+fn channel_defaults_follow_the_console() {
+    let rig = Rig::new(Threading::Split);
+    let switch1 = ChannelConfig::for_console(rig.memory.clone(), Console::Switch1);
+    assert_eq!(switch1.host_class, HostClass::Maxwell);
+    assert_eq!(switch1.gob_layout, GobLayout::Tegra);
+    let switch2 = ChannelConfig::for_console(rig.memory.clone(), Console::Switch2);
+    assert_eq!(switch2.host_class, HostClass::Ampere);
+    assert_eq!(switch2.gob_layout, GobLayout::Switch2);
+}
+
+#[test]
+fn bind_address_space_switches_memory_for_later_work_only() {
+    each_mode(|threading| {
+        let mut rig = Rig::new(threading);
+        let other = rig.gpu.create_address_space(BigPageSize::Size64K);
+        other.map(0, DEVICE_BASE, 0x20_0000, 0, false).unwrap();
+        other
+            .map(0x20_0000, DEVICE_BASE + 0x30_0000, 0x10_0000, 0, false)
+            .unwrap();
+        let channel = rig.channel(HostClass::Maxwell);
+        let id = 9;
+        let first = rig.entry(&Pushbuffer::default().upload(0x20_0000, &[1]).0);
+        rig.gpu.submit(
+            channel,
+            Submission {
+                entries: vec![first],
+                wait: Some(SyncpointFence { id, value: 1 }),
+                increment: None,
+            },
+        );
+        rig.gpu.bind_address_space(channel, other.clone());
+        let second = Pushbuffer::default().upload(0x20_0000, &[2]).0;
+        other
+            .write_block(0x28_0000, bytemuck::cast_slice(&second))
+            .unwrap();
+        rig.gpu.submit(
+            channel,
+            Submission::new(vec![GpEntry::new(0x28_0000, second.len() as u32)]),
+        );
+        rig.gpu.synchronize();
+        assert_eq!(rig.read(0x20_0000), 0, "{threading:?}");
+        rig.syncpoints.guest().increment(id).unwrap();
+        rig.gpu.synchronize();
+        assert_eq!(rig.read(0x20_0000), 1, "{threading:?}");
+        assert_eq!(rig.read(0x30_0000), 2, "{threading:?}");
+    });
+}
+
+#[test]
+fn submit_reserves_increasing_fences_that_execution_reaches() {
+    each_mode(|threading| {
+        let rig = Rig::new(threading);
+        let channel = rig.channel(HostClass::Maxwell);
+        let id = 12;
+        let increment = |count| Submission {
+            entries: Vec::new(),
+            wait: None,
+            increment: Some(SyncpointIncrement::increment_value(id, count)),
+        };
+        assert_eq!(
+            rig.gpu.submit(channel, increment(2)),
+            Some(SyncpointFence { id, value: 2 })
+        );
+        assert_eq!(rig.gpu.submit(channel, Submission::new(Vec::new())), None);
+        assert_eq!(
+            rig.gpu.submit(channel, increment(3)),
+            Some(SyncpointFence { id, value: 5 })
+        );
+        assert_eq!(rig.syncpoints.max(id), Ok(5));
+        rig.gpu.synchronize();
+        assert_eq!(rig.syncpoints.guest().value(id), Ok(5), "{threading:?}");
+        assert_eq!(
+            rig.gpu.submit(
+                channel,
+                Submission {
+                    entries: Vec::new(),
+                    wait: None,
+                    increment: Some(SyncpointIncrement::increment_value(0x400, 1)),
+                },
+            ),
+            None
+        );
+    });
+}
+
+#[test]
+fn pause_holds_submissions_until_resumed() {
+    each_mode(|threading| {
+        let mut rig = Rig::new(threading);
+        let channel = rig.channel(HostClass::Maxwell);
+        rig.gpu.synchronize();
+        rig.gpu.pause(true);
+        let entry = rig.entry(&Pushbuffer::default().upload(0x20_0000, &[7]).0);
+        let fence = rig.gpu.submit(
+            channel,
+            Submission {
+                entries: vec![entry],
+                wait: None,
+                increment: Some(SyncpointIncrement::increment_value(3, 1)),
+            },
+        );
+        rig.gpu.wake();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(rig.read(0x20_0000), 0, "{threading:?}");
+        assert_eq!(rig.syncpoints.guest().value(3), Ok(0), "{threading:?}");
+        assert_eq!(fence, Some(SyncpointFence { id: 3, value: 1 }));
+        rig.gpu.pause(false);
+        rig.gpu.synchronize();
+        assert_eq!(rig.read(0x20_0000), 7, "{threading:?}");
+        assert_eq!(rig.syncpoints.guest().value(3), Ok(1), "{threading:?}");
+    });
+}
+
+#[test]
+fn present_restarts_the_switch_2_timestamp_frame_in_order() {
+    each_mode(|threading| {
+        let rig = Rig::build_for(
+            Console::Switch2,
+            threading,
+            crate::gpu::DEFAULT_RING_SLOTS,
+            Completion::Immediate,
+        );
+        let timestamp = rig.gpu.handles().timestamp.clone();
+        timestamp.set_speed(GpuClockSpeed::Boost);
+        rig.time.0.store(1_000, Ordering::Relaxed);
+        rig.gpu.present(FramebufferConfig {
+            address: DEVICE_BASE,
+            width: 16,
+            height: 16,
+            stride: 64,
+            format: PixelFormat::ALL[0],
+            block_height_log2: None,
+            gob_layout: GobLayout::Switch2,
+            flip_vertical: false,
+            crop: None,
+        });
+        rig.gpu.synchronize();
+        rig.time.0.store(1_400, Ordering::Relaxed);
+        assert_eq!(timestamp.now(), 1_100, "{threading:?}");
+    });
 }

@@ -18,9 +18,13 @@ use parking_lot::{Condvar, Mutex};
 
 use crate::back::{Back, SideCommand};
 use crate::backend::{ChannelId, FramebufferConfig, GpuHandles, Rasterizer};
-use crate::channel::{ChannelConfig, Submission};
+use crate::channel::{ChannelConfig, Submission, SyncpointFence};
+use crate::clock::{GpuTimestamp, GuestTime};
 use crate::dma_pusher::{FrontChannel, FrontShared, Work};
 use crate::engines::{EngineFactory, create_engine};
+use crate::gmmu::{BigPageSize, Gmmu};
+use crate::host1x::Host1x;
+use crate::nx2_memory::{AddressSpaceId, Nx2GpuMemory};
 use crate::ring;
 use crate::stream::{Link, MIN_RING_SLOTS, Stream};
 
@@ -42,9 +46,18 @@ pub enum Threading {
     Single,
 }
 
+/// The console whose GPU runs: Switch 1 (Maxwell) or Switch 2 (Ampere/NVN2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Console {
+    Switch1,
+    Switch2,
+}
+
 /// How the GPU is built.
 #[derive(Clone)]
-pub struct GpuOptions {
+pub struct GpuConfig {
+    /// Picks the timestamp clock, the Switch 2 memory registry and the channel defaults.
+    pub console: Console,
     /// Split (the default) or one GPU thread.
     pub threading: Threading,
     /// Slots of the front-to-back ring (rounded up to a power of two).
@@ -53,9 +66,11 @@ pub struct GpuOptions {
     pub engines: EngineFactory,
 }
 
-impl Default for GpuOptions {
-    fn default() -> Self {
+impl GpuConfig {
+    /// The defaults for `console`: split threads, [`DEFAULT_RING_SLOTS`], [`create_engine`].
+    pub fn new(console: Console) -> Self {
         Self {
+            console,
             threading: Threading::default(),
             ring_slots: DEFAULT_RING_SLOTS,
             engines: Arc::new(create_engine),
@@ -66,6 +81,7 @@ impl Default for GpuOptions {
 enum CpuCommand {
     CreateChannel(ChannelId, ChannelConfig, Arc<AtomicU32>),
     DestroyChannel(ChannelId),
+    BindAddressSpace(ChannelId, Arc<Gmmu>),
     Submit(ChannelId, Submission),
     Side(SideCommand),
     Synchronize(mpsc::SyncSender<()>),
@@ -80,6 +96,7 @@ pub(crate) struct Inbox {
 struct InboxState {
     commands: VecDeque<CpuCommand>,
     woken: bool,
+    paused: bool,
     closed: bool,
 }
 
@@ -89,6 +106,7 @@ impl Inbox {
             state: Mutex::new(InboxState {
                 commands: VecDeque::new(),
                 woken: false,
+                paused: false,
                 closed: false,
             }),
             cond: Condvar::new(),
@@ -117,16 +135,27 @@ impl Inbox {
         self.cond.notify_one();
     }
 
+    /// Holds the commands, and the front, while `paused`.
+    fn pause(&self, paused: bool) {
+        self.state.lock().paused = paused;
+        self.cond.notify_one();
+    }
+
     /// Moves the queued commands into `into` (empty), first sleeping until there are some, a
-    /// wake, or `timeout`. Returns whether the inbox is closed.
+    /// wake, or `timeout`, and for as long as the inbox is paused. Returns whether it is closed.
     fn take(&self, into: &mut VecDeque<CpuCommand>, timeout: Option<Duration>) -> bool {
         let mut state = self.state.lock();
-        if state.commands.is_empty() && !state.woken && !state.closed {
+        loop {
+            if state.closed || (!state.paused && (!state.commands.is_empty() || state.woken)) {
+                break;
+            }
             match timeout {
-                Some(timeout) => {
-                    self.cond.wait_for(&mut state, timeout);
+                Some(timeout) if !state.paused => {
+                    if self.cond.wait_for(&mut state, timeout).timed_out() && !state.paused {
+                        break;
+                    }
                 }
-                None => self.cond.wait(&mut state),
+                _ => self.cond.wait(&mut state),
             }
         }
         state.woken = false;
@@ -191,6 +220,18 @@ impl Front {
                     channel.close(&mut self.shared);
                 }
             }
+            CpuCommand::BindAddressSpace(id, memory) => {
+                let Some(channel) = self
+                    .channels
+                    .get_mut(id.0 as usize)
+                    .and_then(Option::as_mut)
+                else {
+                    tracing::warn!(?id, "address space bound to a channel that does not exist");
+                    return;
+                };
+                channel.push(Work::BindAddressSpace(memory));
+                channel.run(&mut self.shared);
+            }
             CpuCommand::Submit(id, submission) => {
                 let Some(channel) = self
                     .channels
@@ -238,9 +279,14 @@ impl Front {
     }
 }
 
-/// The emulated GPU. Every method may be called from any thread; work is executed in the order
-/// it was queued.
+/// The emulated GPU. Every method may be called from any thread and none waits for GPU work
+/// unless it says so; work is executed in the order it was queued.
 pub struct Gpu {
+    host1x: Host1x,
+    handles: GpuHandles,
+    nx2_memory: Option<Nx2GpuMemory>,
+    /// Switch 2 address spaces registered with `nx2_memory`.
+    address_spaces: Mutex<Vec<(Arc<Gmmu>, AddressSpaceId)>>,
     inbox: Arc<Inbox>,
     next_channel: AtomicU32,
     references: Mutex<HashMap<ChannelId, Arc<AtomicU32>>>,
@@ -248,21 +294,35 @@ pub struct Gpu {
     back: Option<JoinHandle<()>>,
 }
 
+const _: () = {
+    const fn shared<T: Send + Sync>() {}
+    shared::<Gpu>();
+};
+
 impl Gpu {
-    /// Starts the GPU threads. `rasterizer` moves to the back thread, the only one that calls it;
-    /// `handles` are the ones it was created with.
-    pub fn new(rasterizer: Box<dyn Rasterizer>, handles: &GpuHandles, options: GpuOptions) -> Self {
+    /// Starts the GPU threads for `config.console`. `renderer` is called once, on this thread,
+    /// with the handles the GPU shares with it; the rasterizer it returns moves to the back
+    /// thread, the only one that calls it.
+    pub fn new(
+        host1x: Host1x,
+        time: Arc<dyn GuestTime>,
+        config: GpuConfig,
+        renderer: impl FnOnce(GpuHandles) -> Box<dyn Rasterizer>,
+    ) -> Self {
+        let handles = GpuHandles {
+            device: host1x.memory.clone(),
+            syncpoints: host1x.syncpoints.clone(),
+            timestamp: Arc::new(GpuTimestamp::new(time, config.console == Console::Switch2)),
+        };
+        let nx2_memory = (config.console == Console::Switch2)
+            .then(|| Nx2GpuMemory::new(host1x.memory.clone(), host1x.allocator.clone()));
+        let rasterizer = renderer(handles.clone());
         let inbox = Arc::new(Inbox::new());
         handles.syncpoints.semaphore_waiters().attach(&inbox);
-        let (producer, consumer) = ring::ring(options.ring_slots, MIN_RING_SLOTS);
+        let (producer, consumer) = ring::ring(config.ring_slots, MIN_RING_SLOTS);
         let (side_sender, side_receiver) = mpsc::channel();
-        let back = Back::new(
-            rasterizer,
-            handles.syncpoints.clone(),
-            options.engines,
-            side_receiver,
-        );
-        let (link, back) = match options.threading {
+        let back = Back::new(rasterizer, &handles, config.engines, side_receiver);
+        let (link, back) = match config.threading {
             Threading::Split => {
                 let thread = std::thread::Builder::new()
                     .name("gpu-back".into())
@@ -289,11 +349,57 @@ impl Gpu {
             .spawn(move || front.run(front_inbox))
             .expect("failed to start the GPU front thread");
         Self {
+            host1x,
+            handles,
+            nx2_memory,
+            address_spaces: Mutex::new(Vec::new()),
             inbox,
             next_channel: AtomicU32::new(0),
             references: Mutex::new(HashMap::new()),
             front: Some(front),
             back,
+        }
+    }
+
+    /// The host1x the GPU was built on.
+    pub fn host1x(&self) -> &Host1x {
+        &self.host1x
+    }
+
+    /// What the GPU shares with the renderer: host1x's device memory and syncpoints, and the
+    /// console's timestamp clock.
+    pub fn handles(&self) -> &GpuHandles {
+        &self.handles
+    }
+
+    /// The Switch 2 GPU memory registry (gsv gpu sessions); `None` on Switch 1.
+    pub fn nx2_memory(&self) -> Option<&Nx2GpuMemory> {
+        self.nx2_memory.as_ref()
+    }
+
+    /// A new GPU address space on host1x's device memory. On Switch 2 it receives the mappings
+    /// of [`Gpu::nx2_memory`], the ones made before included, until it is destroyed.
+    pub fn create_address_space(&self, big_page: BigPageSize) -> Arc<Gmmu> {
+        let gmmu = Arc::new(Gmmu::new(self.host1x.memory.clone(), big_page));
+        if let Some(nx2) = &self.nx2_memory {
+            let id = nx2.register_address_space(gmmu.clone());
+            self.address_spaces.lock().push((gmmu.clone(), id));
+        }
+        gmmu
+    }
+
+    /// Stops sending [`Gpu::nx2_memory`] mappings to `gmmu`. Channels still bound to it keep
+    /// using it.
+    pub fn destroy_address_space(&self, gmmu: &Arc<Gmmu>) {
+        let Some(nx2) = &self.nx2_memory else {
+            return;
+        };
+        let mut spaces = self.address_spaces.lock();
+        if let Some(index) = spaces
+            .iter()
+            .position(|(space, _)| Arc::ptr_eq(space, gmmu))
+        {
+            nx2.unregister_address_space(spaces.swap_remove(index).1);
         }
     }
 
@@ -307,6 +413,12 @@ impl Gpu {
         id
     }
 
+    /// Makes the channel's work queued after this call use `gmmu`; work queued before keeps the
+    /// address space it was queued with, also on the back.
+    pub fn bind_address_space(&self, channel: ChannelId, gmmu: Arc<Gmmu>) {
+        self.inbox.push(CpuCommand::BindAddressSpace(channel, gmmu));
+    }
+
     /// Destroys a channel once the work queued before has run (a suspended channel's remaining
     /// work is dropped).
     pub fn destroy_channel(&self, channel: ChannelId) {
@@ -314,9 +426,28 @@ impl Gpu {
         self.inbox.push(CpuCommand::DestroyChannel(channel));
     }
 
-    /// Queues a GPFIFO submission.
-    pub fn submit(&self, channel: ChannelId, submission: Submission) {
+    /// Queues a GPFIFO submission without waiting for it. Reserves the submission's syncpoint
+    /// increments in [`Syncpoints::increase_max`](crate::host1x::Syncpoints::increase_max) and
+    /// returns the fence they reach; `None` without increments or for an invalid syncpoint.
+    pub fn submit(&self, channel: ChannelId, submission: Submission) -> Option<SyncpointFence> {
+        let fence = submission.increment.and_then(|increment| {
+            match self
+                .host1x
+                .syncpoints
+                .increase_max(increment.id, increment.count)
+            {
+                Ok(value) => Some(SyncpointFence {
+                    id: increment.id,
+                    value,
+                }),
+                Err(error) => {
+                    tracing::warn!(%error, "submission increments an invalid syncpoint");
+                    None
+                }
+            }
+        });
         self.inbox.push(CpuCommand::Submit(channel, submission));
+        fence
     }
 
     /// The channel's reference count (SET_REFERENCE), as of the work the back executed.
@@ -348,7 +479,8 @@ impl Gpu {
         self.side(SideCommand::UnmapRegion(addr, size));
     }
 
-    /// Presents a frame after the work queued before it.
+    /// Presents a frame after the work queued before it, then restarts the timestamp clock's
+    /// frame ([`GpuTimestamp::frame_presented`]).
     pub fn present(&self, framebuffer: FramebufferConfig) {
         self.side(SideCommand::Present(framebuffer));
     }
@@ -372,6 +504,13 @@ impl Gpu {
     /// next poll.
     pub fn wake(&self) {
         self.inbox.wake();
+    }
+
+    /// While `paused`, the front takes no submissions or other commands and runs no channel;
+    /// they queue until it is resumed, and calls that wait for the GPU wait that long. Work the
+    /// back already has still executes.
+    pub fn pause(&self, paused: bool) {
+        self.inbox.pause(paused);
     }
 
     fn side(&self, command: SideCommand) {

@@ -53,13 +53,14 @@ pub(crate) struct FrontShared {
 }
 
 /// A channel's queued work.
-#[derive(Clone, Copy, Debug)]
 pub(crate) enum Work {
     Entry(GpEntry),
     SyncpointWait(SyncpointFence),
     Increment(SyncpointIncrement),
     /// The renderer submits what it recorded.
     EndOfSubmission,
+    /// The channel's later work uses this GPU address space.
+    BindAddressSpace(Arc<Gmmu>),
 }
 
 /// Why a channel is suspended.
@@ -221,12 +222,21 @@ impl FrontChannel {
             return;
         }
         shared.stream.select(self.id);
-        while let Some(&work) = self.queue.front() {
-            match work {
+        while let Some(work) = self.queue.front() {
+            match *work {
                 Work::Entry(entry) => self.run_entry(entry, shared),
                 Work::SyncpointWait(fence) => {
                     self.queue.pop_front();
                     self.dispatch(shared).syncpoint_wait(fence);
+                }
+                Work::BindAddressSpace(_) => {
+                    let Some(Work::BindAddressSpace(memory)) = self.queue.pop_front() else {
+                        unreachable!("the queue's front was just matched");
+                    };
+                    shared
+                        .stream
+                        .side(SideCommand::BindAddressSpace(self.id, memory.clone()));
+                    self.memory = memory;
                 }
                 Work::Increment(increment) => {
                     self.queue.pop_front();
@@ -656,6 +666,8 @@ mod tests {
 
     use super::*;
     use crate::back::Back;
+    use crate::backend::GpuHandles;
+    use crate::clock::{GpuTimestamp, GuestTime};
     use crate::engines::create_engine;
     use crate::engines::testing::Recorder;
     use crate::gmmu::BigPageSize;
@@ -665,12 +677,25 @@ mod tests {
 
     #[test]
     fn macro_parameters_are_collected_without_allocating() {
+        struct Boot;
+        impl GuestTime for Boot {
+            fn global_time_ns(&self) -> u64 {
+                0
+            }
+        }
         let syncpoints = Arc::new(Syncpoints::new());
+        let physical = Arc::new(PhysicalMemory::new(1 << 16).unwrap());
+        let device = Arc::new(DeviceAddressSpace::new(physical, 36));
+        let handles = GpuHandles {
+            device: device.clone(),
+            syncpoints: syncpoints.clone(),
+            timestamp: Arc::new(GpuTimestamp::new(Arc::new(Boot), false)),
+        };
         let (producer, consumer) = ring::ring(MIN_RING_SLOTS, MIN_RING_SLOTS);
         let (side, side_receiver) = mpsc::channel();
         let back = Back::new(
             Box::new(Recorder::default()),
-            syncpoints.clone(),
+            &handles,
             Arc::new(create_engine),
             side_receiver,
         );
@@ -682,8 +707,6 @@ mod tests {
             inbox: Arc::new(Inbox::new()),
             syncpoints,
         };
-        let physical = Arc::new(PhysicalMemory::new(1 << 16).unwrap());
-        let device = Arc::new(DeviceAddressSpace::new(physical, 36));
         let config = ChannelConfig::new(
             Arc::new(Gmmu::new(device, BigPageSize::Size64K)),
             HostClass::Maxwell,

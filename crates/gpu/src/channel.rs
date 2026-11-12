@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 
 pub use crate::backend::ChannelId;
 use crate::gmmu::Gmmu;
-use crate::gpu::Inbox;
+use crate::gpu::{Console, Inbox};
 use crate::host::{AcquireOp, HostClass};
 pub use crate::pushbuffer::GpEntry;
 
@@ -43,6 +43,18 @@ impl ChannelConfig {
                 HostClass::Ampere => GobLayout::Switch2,
             },
         }
+    }
+
+    /// The channel a console's driver creates: Maxwell B06F with Tegra GOBs on Switch 1, Ampere
+    /// C56F with the native GOB swizzle on Switch 2 (NX2_NOTES row 48).
+    pub fn for_console(memory: Arc<Gmmu>, console: Console) -> Self {
+        Self::new(
+            memory,
+            match console {
+                Console::Switch1 => HostClass::Maxwell,
+                Console::Switch2 => HostClass::Ampere,
+            },
+        )
     }
 }
 

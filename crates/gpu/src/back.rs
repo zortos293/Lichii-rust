@@ -8,7 +8,10 @@ use std::sync::mpsc;
 use lichii_common::DAddr;
 use lichii_texture::block_linear::GobLayout;
 
-use crate::backend::{ChannelId, FenceAction, FramebufferConfig, Rasterizer, ReleaseSize};
+use crate::backend::{
+    ChannelId, FenceAction, FramebufferConfig, GpuHandles, Rasterizer, ReleaseSize,
+};
+use crate::clock::GpuTimestamp;
 use crate::engines::{Engine, EngineContext, EngineFactory, EngineKind};
 use crate::gmmu::{Gmmu, RangeTarget};
 use crate::host1x::Syncpoints;
@@ -33,6 +36,7 @@ pub(crate) type RasterizerAction = Box<dyn FnOnce(&mut dyn Rasterizer) + Send>;
 pub(crate) enum SideCommand {
     CreateChannel(BackChannelSetup),
     DestroyChannel(ChannelId),
+    BindAddressSpace(ChannelId, Arc<Gmmu>),
     InvalidateRegion(DAddr, u64),
     FlushRegion(DAddr, u64),
     UnmapRegion(DAddr, u64),
@@ -51,6 +55,7 @@ struct BackChannel {
 pub(crate) struct Back {
     rasterizer: Box<dyn Rasterizer>,
     syncpoints: Arc<Syncpoints>,
+    timestamp: Arc<GpuTimestamp>,
     engines: EngineFactory,
     side: mpsc::Receiver<SideCommand>,
     channels: Vec<Option<BackChannel>>,
@@ -63,13 +68,14 @@ pub(crate) struct Back {
 impl Back {
     pub(crate) fn new(
         rasterizer: Box<dyn Rasterizer>,
-        syncpoints: Arc<Syncpoints>,
+        handles: &GpuHandles,
         engines: EngineFactory,
         side: mpsc::Receiver<SideCommand>,
     ) -> Self {
         Self {
             rasterizer,
-            syncpoints,
+            syncpoints: handles.syncpoints.clone(),
+            timestamp: handles.timestamp.clone(),
             engines,
             side,
             channels: Vec::new(),
@@ -363,12 +369,24 @@ impl Back {
                     self.current = None;
                 }
             }
+            SideCommand::BindAddressSpace(id, memory) => {
+                if let Some(channel) = self
+                    .channels
+                    .get_mut(id.0 as usize)
+                    .and_then(Option::as_mut)
+                {
+                    channel.setup.memory = memory;
+                }
+            }
             SideCommand::InvalidateRegion(addr, size) => {
                 self.rasterizer.invalidate_region(addr, size)
             }
             SideCommand::FlushRegion(addr, size) => self.rasterizer.flush_region(addr, size),
             SideCommand::UnmapRegion(addr, size) => self.rasterizer.unmap_region(addr, size),
-            SideCommand::Present(framebuffer) => self.rasterizer.present(&framebuffer),
+            SideCommand::Present(framebuffer) => {
+                self.rasterizer.present(&framebuffer);
+                self.timestamp.frame_presented();
+            }
             SideCommand::Run(action) => action(&mut *self.rasterizer),
             SideCommand::Signal(done) => {
                 let _ = done.send(());

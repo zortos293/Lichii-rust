@@ -91,13 +91,26 @@ impl Engine for kepler_memory::KeplerMemory {
     }
 }
 
+impl Engine for kepler_compute::KeplerCompute {
+    fn call_method(&mut self, ctx: &mut EngineContext<'_>, method: u32, argument: u32) {
+        kepler_compute::KeplerCompute::call_method(self, ctx, method, argument);
+    }
+}
+
+impl Engine for maxwell_dma::MaxwellDma {
+    fn call_method(&mut self, ctx: &mut EngineContext<'_>, method: u32, argument: u32) {
+        maxwell_dma::MaxwellDma::call_method(self, ctx, method, argument);
+    }
+}
+
 /// Creates the engine a channel binds: `class` is the class id SET_OBJECT bound. The one place
 /// engines are wired in; kinds without an engine yet return `None` and their methods are dropped.
 pub fn create_engine(kind: EngineKind, class: u32) -> Option<Box<dyn Engine>> {
-    let _ = class;
     match kind {
         EngineKind::InlineToMemory => Some(Box::new(kepler_memory::KeplerMemory::new())),
-        EngineKind::Maxwell3d | EngineKind::Compute | EngineKind::Dma | EngineKind::Fermi2d => None,
+        EngineKind::Compute => Some(Box::new(kepler_compute::KeplerCompute::new(class))),
+        EngineKind::Dma => Some(Box::new(maxwell_dma::MaxwellDma::new())),
+        EngineKind::Maxwell3d | EngineKind::Fermi2d => None,
     }
 }
 
