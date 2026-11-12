@@ -1,10 +1,11 @@
 //! Host directories and files: the backing for NAND, SD card and save data, and for loose
 //! title directories on disk.
 
+use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::vfs::{DirEntry, DirRef, Directory, Entry, EntryKind, File, FileRef, read_only};
 
@@ -114,11 +115,71 @@ impl File for HostFile {
     }
 }
 
+const OPEN_HANDLE_LIMIT: usize = 256;
+
+/// Open handles of the read-only files below one [`HostDir`] root, most recently used first.
+/// A loose RomFS can hold hundreds of thousands of files; they are opened on first read and the
+/// oldest handle closes once [`OPEN_HANDLE_LIMIT`] are open, so the process never runs out.
+#[derive(Default)]
+struct HandleCache {
+    next_id: AtomicU64,
+    open: Mutex<VecDeque<(u64, Arc<std::fs::File>)>>,
+}
+
+impl HandleCache {
+    fn get(&self, id: u64, path: &Path) -> io::Result<Arc<std::fs::File>> {
+        let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = open.iter().position(|(key, _)| *key == id) {
+            let entry = open.remove(index).unwrap();
+            let file = entry.1.clone();
+            open.push_front(entry);
+            return Ok(file);
+        }
+        let file = Arc::new(std::fs::File::open(path)?);
+        if open.len() == OPEN_HANDLE_LIMIT {
+            open.pop_back();
+        }
+        open.push_front((id, file.clone()));
+        Ok(file)
+    }
+}
+
+/// A read-only host file that holds a path, not a handle, until it is read.
+struct LazyHostFile {
+    id: u64,
+    path: PathBuf,
+    size: u64,
+    cache: Arc<HandleCache>,
+}
+
+impl File for LazyHostFile {
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        let len = buf.len().min(self.size.saturating_sub(offset) as usize);
+        let file = self.cache.get(self.id, &self.path)?;
+        let mut done = 0;
+        while done < len {
+            match pread(&file, offset + done as u64, &mut buf[done..len]) {
+                Ok(0) => break,
+                Ok(n) => done += n,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(done)
+    }
+}
+
 /// A host directory. Names are checked to be single components, so a guest path can never
-/// escape the root.
+/// escape the root. Files of a read-only directory are opened lazily (see [`HandleCache`]);
+/// files of a writable one are opened when looked up.
 pub struct HostDir {
     path: PathBuf,
     writable: bool,
+    cache: Arc<HandleCache>,
 }
 
 impl HostDir {
@@ -134,13 +195,21 @@ impl HostDir {
     }
 
     fn open_with(path: PathBuf, writable: bool) -> io::Result<DirRef> {
+        Self::open_in(path, writable, Arc::default())
+    }
+
+    fn open_in(path: PathBuf, writable: bool, cache: Arc<HandleCache>) -> io::Result<DirRef> {
         if !path.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("{}: not a directory", path.display()),
             ));
         }
-        Ok(Arc::new(Self { path, writable }))
+        Ok(Arc::new(Self {
+            path,
+            writable,
+            cache,
+        }))
     }
 
     fn child(&self, name: &str) -> io::Result<PathBuf> {
@@ -196,9 +265,16 @@ impl Directory for HostDir {
             Err(error) => return Err(error),
         };
         Ok(Some(if meta.is_dir() {
-            Entry::Dir(Self::open_with(path, self.writable)?)
+            Entry::Dir(Self::open_in(path, self.writable, self.cache.clone())?)
+        } else if self.writable {
+            Entry::File(HostFile::open_with(&path, true)?)
         } else {
-            Entry::File(HostFile::open_with(&path, self.writable)?)
+            Entry::File(Arc::new(LazyHostFile {
+                id: self.cache.next_id.fetch_add(1, Ordering::Relaxed),
+                path,
+                size: meta.len(),
+                cache: self.cache.clone(),
+            }))
         }))
     }
 
@@ -292,6 +368,40 @@ mod tests {
         assert!(root.remove("save").is_err());
         root.remove_all("save").unwrap();
         assert!(root.entries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_only_trees_never_hold_more_than_the_handle_limit() {
+        let temp = TempDir::new("lazy");
+        let count = OPEN_HANDLE_LIMIT + 50;
+        for i in 0..count {
+            std::fs::write(temp.0.join(format!("{i:04}")), (i as u32).to_le_bytes()).unwrap();
+        }
+        let root = HostDir::open(&temp.0).unwrap();
+        let files: Vec<_> = (0..count)
+            .map(|i| root.open_file(&format!("{i:04}")).unwrap().unwrap())
+            .collect();
+        for _ in 0..2 {
+            for (i, file) in files.iter().enumerate() {
+                assert_eq!(file.read_all().unwrap(), (i as u32).to_le_bytes());
+            }
+        }
+        let mut buf = [0u8; 8];
+        assert_eq!(files[0].read_at(2, &mut buf).unwrap(), 2);
+        assert_eq!(files[0].read_at(9, &mut buf).unwrap(), 0);
+
+        let cache = HandleCache::default();
+        for i in 0..count {
+            cache
+                .get(i as u64, &temp.0.join(format!("{i:04}")))
+                .unwrap();
+        }
+        cache
+            .get(count as u64 - 1, &temp.0.join("missing"))
+            .unwrap();
+        let open = cache.open.lock().unwrap();
+        assert_eq!(open.len(), OPEN_HANDLE_LIMIT);
+        assert_eq!(open.front().unwrap().0, count as u64 - 1);
     }
 
     #[test]
