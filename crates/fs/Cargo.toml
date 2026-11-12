@@ -9,3 +9,4 @@ lichii-crypto.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 miniz_oxide = "0.9"
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
