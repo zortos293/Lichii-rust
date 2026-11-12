@@ -6,6 +6,7 @@
 //! render-target descriptors, through [`PixelFormat::from_texture`],
 //! [`PixelFormat::from_render_target`] and [`PixelFormat::from_depth`].
 
+pub mod block_linear;
 mod format;
 pub mod guest;
 
