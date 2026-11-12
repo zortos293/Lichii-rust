@@ -16,6 +16,11 @@ use crate::reg_index;
 /// First method number that calls a macro instead of writing a register.
 pub const MACRO_REGISTERS_START: u32 = NUM_REGS as u32;
 
+/// NVN2 root tables (Ampere): selects one of eight 64-word tables and resets its write offset.
+pub const ROOT_TABLE_SELECT: u32 = 0x504 / 4;
+/// NVN2 root tables: stores one word at the selected table's offset and advances it.
+pub const ROOT_TABLE_LOAD: u32 = 0x508 / 4;
+
 impl Regs {
     /// The register values games expect at boot.
     pub fn with_defaults() -> Box<Self> {
@@ -299,8 +304,10 @@ pub fn executable_methods() -> MethodSet {
         reg_index!(Regs, index_buffer32_first),
         reg_index!(Regs, index_buffer16_first),
         reg_index!(Regs, index_buffer8_first),
-        reg_index!(Regs, inline_index_2x16),
-        reg_index!(Regs, inline_index_4x8),
+        reg_index!(Regs, inline_index_2x16.bits1),
+        reg_index!(Regs, inline_index_4x8.bits1),
+        ROOT_TABLE_SELECT,
+        ROOT_TABLE_LOAD,
         reg_index!(Regs, vertex_array_instance_first),
         reg_index!(Regs, vertex_array_instance_subsequent),
         reg_index!(Regs, draw_texture.src_y0),
@@ -472,9 +479,16 @@ mod tests {
     #[test]
     fn executable_writes_report_even_when_unchanged() {
         let mut state = RegisterState::new();
-        let draw_end = reg_index!(Regs, draw.end);
-        assert_eq!(state.write(draw_end, 0), Some(0));
-        assert_eq!(state.write(draw_end, 0), Some(0));
+        for method in [
+            reg_index!(Regs, draw.end),
+            reg_index!(Regs, inline_index_2x16.bits1),
+            reg_index!(Regs, inline_index_4x8.bits1),
+            ROOT_TABLE_LOAD,
+        ] {
+            assert_eq!(state.write(method, 0), Some(0));
+            assert_eq!(state.write(method, 0), Some(0));
+        }
+        assert_eq!(state.write(reg_index!(Regs, inline_index_2x16), 0), None);
     }
 
     #[test]
