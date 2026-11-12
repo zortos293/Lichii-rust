@@ -25,8 +25,8 @@ pub enum Conversion {
 pub struct HostFormat {
     pub format: vk::Format,
     pub conversion: Conversion,
-    /// Component mapping every view of the image applies (composed with the guest's own
-    /// swizzle), for host formats whose bit order differs from the guest's.
+    /// Component mapping every view of the image must apply, passed to `Image::view` (composed
+    /// with the guest's own swizzle), for host formats whose bit order differs from the guest's.
     pub swizzle: vk::ComponentMapping,
     /// Can be a color or depth/stencil attachment.
     pub attachable: bool,

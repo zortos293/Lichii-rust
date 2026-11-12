@@ -307,13 +307,19 @@ impl Image {
         }
     }
 
-    /// A view of the whole image with the image's own format.
-    pub fn view(&self, view_type: vk::ImageViewType) -> Result<ImageView> {
+    /// A view of the whole image with the image's own format, reading channels through
+    /// `components` (identity for render targets, `HostFormat::swizzle` for guest textures).
+    pub fn view(
+        &self,
+        view_type: vk::ImageViewType,
+        components: vk::ComponentMapping,
+    ) -> Result<ImageView> {
         ImageView::new(
             &self.device,
             self.raw,
             view_type,
             self.desc.format,
+            components,
             self.full_range(),
         )
     }
@@ -337,18 +343,21 @@ pub struct ImageView {
 }
 
 impl ImageView {
-    /// Creates a view of `range` of `image` read as `format`.
+    /// Creates a view of `range` of `image` read as `format`, with channels remapped by
+    /// `components`.
     pub fn new(
         device: &Arc<Device>,
         image: vk::Image,
         view_type: vk::ImageViewType,
         format: vk::Format,
+        components: vk::ComponentMapping,
         range: vk::ImageSubresourceRange,
     ) -> Result<Self> {
         let info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(view_type)
             .format(format)
+            .components(components)
             .subresource_range(range);
         // SAFETY: `image` is a live image of this device compatible with the view.
         let raw = unsafe {

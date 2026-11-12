@@ -363,6 +363,20 @@ fn every_guest_format_gets_a_sampleable_host_format() {
                 "{format:?} -> {:?} ({features:?})",
                 host.format
             );
+            let image = Image::new(
+                &device,
+                &ImageDesc::d2(
+                    host.format,
+                    16,
+                    16,
+                    vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+                ),
+                "format probe",
+            )
+            .unwrap();
+            image
+                .view(vk::ImageViewType::TYPE_2D, host.swizzle)
+                .unwrap();
             if host.attachable && format.is_color() {
                 assert!(
                     features.contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT),
@@ -386,6 +400,7 @@ fn every_guest_format_gets_a_sampleable_host_format() {
         AstcRecompression::Uncompressed,
     );
     assert!(rt.attachable && rt.conversion == Conversion::None);
+    assert_no_validation_errors(&device);
 }
 
 #[test]
