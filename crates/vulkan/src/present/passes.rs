@@ -99,7 +99,12 @@ pub(crate) struct Passes {
 pub(crate) fn shader_module(device: &Device, code: &[u32]) -> Result<vk::ShaderModule> {
     let info = vk::ShaderModuleCreateInfo::default().code(code);
     // SAFETY: `code` is validated SPIR-V checked into the repository.
-    unsafe { device.raw.create_shader_module(&info, None).call("vkCreateShaderModule") }
+    unsafe {
+        device
+            .raw
+            .create_shader_module(&info, None)
+            .call("vkCreateShaderModule")
+    }
 }
 
 impl Passes {
@@ -137,7 +142,10 @@ impl Passes {
             Err(result) => {
                 // SAFETY: unused.
                 unsafe { device.raw.destroy_descriptor_set_layout(set_layout, None) };
-                return Err(crate::Error::Vulkan { call: "vkCreatePipelineLayout", result });
+                return Err(crate::Error::Vulkan {
+                    call: "vkCreatePipelineLayout",
+                    result,
+                });
             }
         };
         Ok(Self {
@@ -194,7 +202,14 @@ impl Passes {
         // SAFETY: `cmd` is inside a dynamic rendering whose color format is `format`.
         unsafe {
             raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
-            raw.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &[set], &[]);
+            raw.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.layout,
+                0,
+                &[set],
+                &[],
+            );
             raw.cmd_set_viewport(cmd, 0, &[vk_viewport]);
             raw.cmd_set_scissor(cmd, 0, &[viewport]);
             raw.cmd_push_constants(
@@ -236,7 +251,8 @@ pub(crate) fn fullscreen_pipeline(
     ];
     let empty_input = vk::PipelineVertexInputStateCreateInfo::default();
     let vertex_input = ui.as_ref().map_or(&empty_input, |(input, _)| *input);
-    let assembly = vk::PipelineInputAssemblyStateCreateInfo::default().topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+    let assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
     let viewport = vk::PipelineViewportStateCreateInfo::default()
         .viewport_count(1)
         .scissor_count(1);
@@ -245,8 +261,10 @@ pub(crate) fn fullscreen_pipeline(
         .cull_mode(vk::CullModeFlags::NONE)
         .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
         .line_width(1.0);
-    let multisample = vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(vk::SampleCountFlags::TYPE_1);
-    let mut attachment = vk::PipelineColorBlendAttachmentState::default().color_write_mask(vk::ColorComponentFlags::RGBA);
+    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let mut attachment = vk::PipelineColorBlendAttachmentState::default()
+        .color_write_mask(vk::ColorComponentFlags::RGBA);
     if ui.is_some() {
         attachment = attachment
             .blend_enable(true)
@@ -262,7 +280,8 @@ pub(crate) fn fullscreen_pipeline(
     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
     let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
     let formats = [format];
-    let mut rendering = vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&formats);
+    let mut rendering =
+        vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&formats);
     let info = vk::GraphicsPipelineCreateInfo::default()
         .stages(&stages)
         .vertex_input_state(vertex_input)
@@ -275,10 +294,17 @@ pub(crate) fn fullscreen_pipeline(
         .layout(layout)
         .push_next(&mut rendering);
     // SAFETY: every referenced object is live; the modules are valid SPIR-V.
-    let pipelines = unsafe { device.raw.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None) };
+    let pipelines = unsafe {
+        device
+            .raw
+            .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+    };
     match pipelines {
         Ok(pipelines) => Ok(pipelines[0]),
-        Err((_, result)) => Err(crate::Error::Vulkan { call: "vkCreateGraphicsPipelines", result }),
+        Err((_, result)) => Err(crate::Error::Vulkan {
+            call: "vkCreateGraphicsPipelines",
+            result,
+        }),
     }
 }
 
@@ -294,7 +320,9 @@ impl Drop for Passes {
                 self.device.raw.destroy_shader_module(module, None);
             }
             self.device.raw.destroy_pipeline_layout(self.layout, None);
-            self.device.raw.destroy_descriptor_set_layout(self.set_layout, None);
+            self.device
+                .raw
+                .destroy_descriptor_set_layout(self.set_layout, None);
         }
     }
 }

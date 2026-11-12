@@ -85,7 +85,13 @@ impl UiRenderer {
             let info = vk::PipelineLayoutCreateInfo::default()
                 .set_layouts(&layouts)
                 .push_constant_ranges(&ranges);
-            (set_layout, device.raw.create_pipeline_layout(&info, None).call("vkCreatePipelineLayout")?)
+            (
+                set_layout,
+                device
+                    .raw
+                    .create_pipeline_layout(&info, None)
+                    .call("vkCreatePipelineLayout")?,
+            )
         };
         Ok(Self {
             device: device.clone(),
@@ -115,14 +121,36 @@ impl UiRenderer {
             input_rate: vk::VertexInputRate::VERTEX,
         }];
         let attributes = [
-            vk::VertexInputAttributeDescription { location: 0, binding: 0, format: vk::Format::R32G32_SFLOAT, offset: 0 },
-            vk::VertexInputAttributeDescription { location: 1, binding: 0, format: vk::Format::R32G32_SFLOAT, offset: 8 },
-            vk::VertexInputAttributeDescription { location: 2, binding: 0, format: vk::Format::R8G8B8A8_UNORM, offset: 16 },
+            vk::VertexInputAttributeDescription {
+                location: 0,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: 0,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 1,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: 8,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 2,
+                binding: 0,
+                format: vk::Format::R8G8B8A8_UNORM,
+                offset: 16,
+            },
         ];
         let input = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&bindings)
             .vertex_attribute_descriptions(&attributes);
-        let pipeline = fullscreen_pipeline(&self.device, self.layout, self.vert, self.frag, format, Some((&input, Blend)))?;
+        let pipeline = fullscreen_pipeline(
+            &self.device,
+            self.layout,
+            self.vert,
+            self.frag,
+            format,
+            Some((&input, Blend)),
+        )?;
         self.pipelines.insert(format, pipeline);
         Ok(pipeline)
     }
@@ -146,20 +174,38 @@ impl UiRenderer {
             .address_mode_w(address)
             .max_lod(0.25);
         // SAFETY: valid create info.
-        let sampler = unsafe { self.device.raw.create_sampler(&info, None).call("vkCreateSampler")? };
+        let sampler = unsafe {
+            self.device
+                .raw
+                .create_sampler(&info, None)
+                .call("vkCreateSampler")?
+        };
         self.samplers.insert(key, sampler);
         Ok(sampler)
     }
 
     /// Applies texture uploads; call before the frame's rendering begins.
-    pub(crate) fn upload(&mut self, ui: &UiFrame, scheduler: &mut Scheduler, staging: &mut StagingRing) -> Result<()> {
-        for (&id, delta) in &ui.textures_delta.set {
-            self.apply(id, delta, scheduler, staging)?;
+    pub(crate) fn upload(
+        &mut self,
+        ui: &UiFrame,
+        scheduler: &mut Scheduler,
+        staging: &mut StagingRing,
+    ) -> Result<()> {
+        for (&id, deltas) in &ui.textures_delta.set {
+            for delta in deltas {
+                self.apply(id, delta, scheduler, staging)?;
+            }
         }
         Ok(())
     }
 
-    fn apply(&mut self, id: TextureId, delta: &ImageDelta, scheduler: &mut Scheduler, staging: &mut StagingRing) -> Result<()> {
+    fn apply(
+        &mut self,
+        id: TextureId,
+        delta: &ImageDelta,
+        scheduler: &mut Scheduler,
+        staging: &mut StagingRing,
+    ) -> Result<()> {
         let egui::ImageData::Color(image) = &delta.image;
         let [width, height] = image.size;
         let (width, height) = (width as u32, height as u32);
@@ -179,8 +225,15 @@ impl UiRenderer {
                 ),
                 "egui texture",
             )?;
-            let view = image.view(vk::ImageViewType::TYPE_2D)?;
-            if let Some(old) = self.textures.insert(id, Texture { image, view, sampler }) {
+            let view = image.view(vk::ImageViewType::TYPE_2D, vk::ComponentMapping::default())?;
+            if let Some(old) = self.textures.insert(
+                id,
+                Texture {
+                    image,
+                    view,
+                    sampler,
+                },
+            ) {
                 scheduler.retire((old.view, old.image));
             }
         }
@@ -197,8 +250,19 @@ impl UiRenderer {
         let [x, y] = delta.pos.unwrap_or([0, 0]);
         let cmd = scheduler.record()?;
         let range = texture.image.full_range();
-        let from = if fresh { ImageAccess::UNDEFINED } else { ImageAccess::SHADER_READ };
-        transition(&self.device, cmd, texture.image.raw(), range, from, ImageAccess::TRANSFER_DST);
+        let from = if fresh {
+            ImageAccess::UNDEFINED
+        } else {
+            ImageAccess::SHADER_READ
+        };
+        transition(
+            &self.device,
+            cmd,
+            texture.image.raw(),
+            range,
+            from,
+            ImageAccess::TRANSFER_DST,
+        );
         let region = [vk::BufferImageCopy {
             buffer_offset: offset,
             buffer_row_length: 0,
@@ -209,16 +273,35 @@ impl UiRenderer {
                 base_array_layer: 0,
                 layer_count: 1,
             },
-            image_offset: vk::Offset3D { x: x as i32, y: y as i32, z: 0 },
-            image_extent: vk::Extent3D { width, height, depth: 1 },
+            image_offset: vk::Offset3D {
+                x: x as i32,
+                y: y as i32,
+                z: 0,
+            },
+            image_extent: vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            },
         }];
         // SAFETY: the image is in TRANSFER_DST layout and the region lies inside it.
         unsafe {
-            self.device
-                .raw
-                .cmd_copy_buffer_to_image(cmd, buffer, texture.image.raw(), vk::ImageLayout::TRANSFER_DST_OPTIMAL, &region)
+            self.device.raw.cmd_copy_buffer_to_image(
+                cmd,
+                buffer,
+                texture.image.raw(),
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &region,
+            )
         };
-        transition(&self.device, cmd, texture.image.raw(), range, ImageAccess::TRANSFER_DST, ImageAccess::SHADER_READ);
+        transition(
+            &self.device,
+            cmd,
+            texture.image.raw(),
+            range,
+            ImageAccess::TRANSFER_DST,
+            ImageAccess::SHADER_READ,
+        );
         Ok(())
     }
 
@@ -236,9 +319,9 @@ impl UiRenderer {
             Primitive::Mesh(mesh) if !mesh.indices.is_empty() => Some((p.clip_rect, mesh)),
             _ => None,
         });
-        let (vertex_count, index_count) = meshes
-            .clone()
-            .fold((0, 0), |(v, i), (_, mesh)| (v + mesh.vertices.len(), i + mesh.indices.len()));
+        let (vertex_count, index_count) = meshes.clone().fold((0, 0), |(v, i), (_, mesh)| {
+            (v + mesh.vertices.len(), i + mesh.indices.len())
+        });
         if index_count == 0 {
             return Ok(());
         }
@@ -246,9 +329,19 @@ impl UiRenderer {
         let slot = self.frame;
         scheduler.wait(self.frames[slot].tick)?;
         self.frames[slot].tick = scheduler.tick();
-        let vertices = ensure(&self.device, &mut self.frames[slot].vertices, vertex_count * VERTEX_SIZE, vk::BufferUsageFlags::VERTEX_BUFFER)?;
-        let indices = ensure(&self.device, &mut self.frames[slot].indices, index_count * 4, vk::BufferUsageFlags::INDEX_BUFFER)?;
         let pipeline = self.pipeline(format)?;
+        let vertices = ensure(
+            &self.device,
+            &mut self.frames[slot].vertices,
+            vertex_count * VERTEX_SIZE,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+        )?;
+        let indices = ensure(
+            &self.device,
+            &mut self.frames[slot].indices,
+            index_count * 4,
+            vk::BufferUsageFlags::INDEX_BUFFER,
+        )?;
         let raw = &self.device.raw;
         let ppp = ui.pixels_per_point;
         let screen = [extent.width as f32 / ppp, extent.height as f32 / ppp];
@@ -277,8 +370,12 @@ impl UiRenderer {
         let mut sets: HashMap<TextureId, vk::DescriptorSet> = HashMap::new();
         let (mut vertex_base, mut index_base) = (0usize, 0usize);
         for (clip, mesh) in meshes {
-            let vertex_bytes = &mut vertices.1[vertex_base * VERTEX_SIZE..(vertex_base + mesh.vertices.len()) * VERTEX_SIZE];
-            for (dst, v) in vertex_bytes.chunks_exact_mut(VERTEX_SIZE).zip(&mesh.vertices) {
+            let vertex_bytes = &mut vertices.1
+                [vertex_base * VERTEX_SIZE..(vertex_base + mesh.vertices.len()) * VERTEX_SIZE];
+            for (dst, v) in vertex_bytes
+                .chunks_exact_mut(VERTEX_SIZE)
+                .zip(&mesh.vertices)
+            {
                 dst[0..4].copy_from_slice(&v.pos.x.to_ne_bytes());
                 dst[4..8].copy_from_slice(&v.pos.y.to_ne_bytes());
                 dst[8..12].copy_from_slice(&v.uv.x.to_ne_bytes());
@@ -325,26 +422,49 @@ impl UiRenderer {
                 }
             };
             let scissor = vk::Rect2D {
-                offset: vk::Offset2D { x: x0 as i32, y: y0 as i32 },
-                extent: vk::Extent2D { width: x1 - x0, height: y1 - y0 },
+                offset: vk::Offset2D {
+                    x: x0 as i32,
+                    y: y0 as i32,
+                },
+                extent: vk::Extent2D {
+                    width: x1 - x0,
+                    height: y1 - y0,
+                },
             };
             // SAFETY: as above; the index range was just written.
             unsafe {
                 raw.cmd_set_scissor(cmd, 0, &[scissor]);
-                raw.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, &[set], &[]);
-                raw.cmd_draw_indexed(cmd, mesh.indices.len() as u32, 1, first_index as u32, base_vertex as i32, 0);
+                raw.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.layout,
+                    0,
+                    &[set],
+                    &[],
+                );
+                raw.cmd_draw_indexed(
+                    cmd,
+                    mesh.indices.len() as u32,
+                    1,
+                    first_index as u32,
+                    base_vertex as i32,
+                    0,
+                );
             }
         }
         Ok(())
     }
 
     /// Frees the textures egui released; call after the frame was submitted.
-    pub(crate) fn free(&mut self, ui: &UiFrame, scheduler: &mut Scheduler) {
+    /// Frees the textures `ui` releases and marks its deltas handled; call once per frame after
+    /// the frame's submission.
+    pub(crate) fn free(&mut self, ui: &mut UiFrame, scheduler: &mut Scheduler) {
         for id in &ui.textures_delta.free {
             if let Some(texture) = self.textures.remove(id) {
                 scheduler.retire((texture.view, texture.image));
             }
         }
+        ui.textures_delta.clear();
     }
 }
 
@@ -357,7 +477,13 @@ fn ensure<'a>(
 ) -> Result<(vk::Buffer, &'a mut [u8])> {
     if slot.as_ref().is_none_or(|b| (b.size() as usize) < size) {
         let capacity = size.next_power_of_two().max(64 << 10) as u64;
-        *slot = Some(Buffer::new(device, capacity, usage, MemoryLocation::CpuToGpu, "egui geometry")?);
+        *slot = Some(Buffer::new(
+            device,
+            capacity,
+            usage,
+            MemoryLocation::CpuToGpu,
+            "egui geometry",
+        )?);
     }
     let buffer = slot.as_mut().expect("just ensured");
     let raw = buffer.raw();
@@ -379,7 +505,9 @@ impl Drop for UiRenderer {
             self.device.raw.destroy_shader_module(self.vert, None);
             self.device.raw.destroy_shader_module(self.frag, None);
             self.device.raw.destroy_pipeline_layout(self.layout, None);
-            self.device.raw.destroy_descriptor_set_layout(self.set_layout, None);
+            self.device
+                .raw
+                .destroy_descriptor_set_layout(self.set_layout, None);
         }
     }
 }
