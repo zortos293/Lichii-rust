@@ -39,7 +39,11 @@ pub use lower_int64_to_int32::lower_int64_to_int32;
 pub use position::{blit_constants, position};
 pub use rescaling::rescaling;
 pub use ssa_rewrite::ssa_rewrite;
-pub use texture::{TextureError, limit_sampled_texture_arrays, texture_pass};
+pub use texture::{
+    JoinedDescriptors, TextureError, join_texture_info, limit_pipeline_sampled_texture_arrays,
+    limit_sampled_texture_arrays, limit_shared_stage_sampled_texture_arrays,
+    remap_texture_descriptors, texture_pass,
+};
 pub use vendor_workaround::{has_broken_pattern, vendor_workaround};
 pub use verify::verify;
 
