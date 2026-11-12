@@ -4,6 +4,7 @@ mod collect_shader_info;
 mod conditional_barrier;
 mod dual_vertex;
 mod geometry_compaction;
+mod global_memory_to_storage_buffer;
 #[cfg(test)]
 mod info_tests;
 mod layer;
@@ -17,6 +18,10 @@ pub use collect_shader_info::collect_shader_info;
 pub use conditional_barrier::conditional_barrier;
 pub use dual_vertex::{vertex_a_transform, vertex_b_transform};
 pub use geometry_compaction::geometry_compaction;
+pub use global_memory_to_storage_buffer::{
+    global_memory_to_storage_buffer, join_storage_info, remap_storage_bindings,
+    storage_buffer_limit,
+};
 pub use layer::layer;
 pub use position::{blit_constants, position};
 pub use ssa_rewrite::ssa_rewrite;

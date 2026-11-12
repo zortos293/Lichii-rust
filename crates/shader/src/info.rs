@@ -84,6 +84,69 @@ pub struct StorageBufferDescriptor {
     pub cbuf_offset: u32,
     pub count: u32,
     pub is_written: bool,
+    /// Offset of the buffer pointer in the memory the constant buffer pointer points to, or
+    /// [`StorageBufferDescriptor::DIRECT`] when the constant buffer holds the pointer itself.
+    pub indirect_offset: u32,
+    /// How far the program's stores reach past the pointer; unbounded when unknown or unwritten.
+    pub write_extent: StorageWriteExtent,
+}
+
+impl StorageBufferDescriptor {
+    /// `indirect_offset` of a pointer read straight from the constant buffer.
+    pub const DIRECT: u32 = u32::MAX;
+}
+
+/// How far a program's stores and atomics to one storage buffer can reach, in bytes past the
+/// pointer it reads from its constant buffer. Every store ends at or below
+/// `const_end + sum(local_stride[i] * local_id[i]) + sum(group_stride[i] * group_id[i])` for every
+/// invocation. The bound only holds while each value the store offsets split into 16-bit halves
+/// stays below 2^16: `guard_*` bounds the largest of them in the same form.
+///
+/// A Switch 2 native program's storage pointer carries no size, so the renderer binds a large
+/// range behind it; this is what it can claim a dispatch wrote instead of all of it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StorageWriteExtent {
+    /// False: the reach is not known (or the buffer is never written); take the whole binding.
+    pub bounded: bool,
+    /// Whether the bound needs the guard.
+    pub guarded: bool,
+    pub const_end: u32,
+    pub local_stride: [u32; 3],
+    pub group_stride: [u32; 3],
+    pub guard_const: u32,
+    pub guard_local_stride: [u32; 3],
+    pub guard_group_stride: [u32; 3],
+}
+
+impl StorageWriteExtent {
+    /// Widens this extent to also cover `other`; either one unbounded leaves it unbounded.
+    pub fn merge(&mut self, other: &StorageWriteExtent) {
+        if !self.bounded || !other.bounded {
+            *self = StorageWriteExtent::default();
+            return;
+        }
+        let max3 = |lhs: &mut [u32; 3], rhs: &[u32; 3]| {
+            for (l, r) in lhs.iter_mut().zip(rhs) {
+                *l = (*l).max(*r);
+            }
+        };
+        self.const_end = self.const_end.max(other.const_end);
+        max3(&mut self.local_stride, &other.local_stride);
+        max3(&mut self.group_stride, &other.group_stride);
+        if !other.guarded {
+            return;
+        }
+        if self.guarded {
+            self.guard_const = self.guard_const.max(other.guard_const);
+            max3(&mut self.guard_local_stride, &other.guard_local_stride);
+            max3(&mut self.guard_group_stride, &other.guard_group_stride);
+        } else {
+            self.guarded = true;
+            self.guard_const = other.guard_const;
+            self.guard_local_stride = other.guard_local_stride;
+            self.guard_group_stride = other.guard_group_stride;
+        }
+    }
 }
 
 /// Where a texture handle comes from: the word at `cbuf_offset` of constant buffer
@@ -240,6 +303,9 @@ pub struct ShaderInfo {
     pub uses_cbuf_indirect: bool,
     pub uses_render_area: bool,
     pub removed_conditional_barrier: bool,
+    /// Some global accesses stayed global with several bound candidate buffers; the backend
+    /// picks the buffer at run time from the bound pointers (Switch 2 native programs).
+    pub native_global_bounds: bool,
 
     pub used_constant_buffer_types: Type,
     pub used_storage_buffer_types: Type,
