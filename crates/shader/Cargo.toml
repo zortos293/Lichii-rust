@@ -8,3 +8,6 @@ license.workspace = true
 lichii-common.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+bitflags.workspace = true
+smallvec = { version = "1", features = ["union", "const_generics"] }
+rustc-hash = "2"
