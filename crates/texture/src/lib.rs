@@ -13,6 +13,7 @@ pub mod block_linear;
 pub mod etc;
 mod format;
 pub mod guest;
+pub mod tic;
 
 pub use block::ImageSizeError;
 pub use format::{Aspect, Compression, FormatInfo, Numeric, PixelFormat};
