@@ -4,6 +4,7 @@
 
 pub mod backend;
 mod bits;
+pub mod clock;
 pub mod device_memory;
 pub mod engines;
 pub mod gmmu;
