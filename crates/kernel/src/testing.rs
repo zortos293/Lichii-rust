@@ -4,7 +4,7 @@
 //! thread's TLS, hands them to the session's service thread exactly as `svcSendSyncRequest` does,
 //! and reads the reply back, so handles and buffers go through the real kernel paths.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use bytemuck::Pod;
@@ -140,24 +140,30 @@ impl Request {
         }
     }
 
-    /// Appends a raw argument, aligned to its size like the CMIF serializer does.
+    /// Appends a raw argument, aligned like [`HleRequestContext::pop`] reads it (to its size, at
+    /// most 8 bytes).
+    ///
+    /// [`HleRequestContext::pop`]: crate::ipc::HleRequestContext::pop
     pub fn arg<T: Pod>(mut self, value: T) -> Self {
-        let align = std::mem::align_of::<T>();
+        let align = std::mem::align_of::<T>().min(8);
         self.data.resize(self.data.len().next_multiple_of(align), 0);
         self.data.extend_from_slice(bytemuck::bytes_of(&value));
         self
     }
 
+    /// Asks the kernel to pass the client's process id.
     pub fn send_pid(mut self) -> Self {
         self.send_pid = true;
         self
     }
 
+    /// Passes one of the client's handles; the client keeps it.
     pub fn copy_handle(mut self, handle: Handle) -> Self {
         self.copies.push(handle);
         self
     }
 
+    /// Passes one of the client's handles; the kernel removes it from the client's table.
     pub fn move_handle(mut self, handle: Handle) -> Self {
         self.moves.push(handle);
         self
@@ -264,8 +270,13 @@ impl Request {
 /// A decoded reply.
 #[derive(Clone, Debug)]
 pub struct Reply {
+    /// The result the service answered with (the kernel-level send error is [`IpcClient::send`]'s
+    /// `Err`).
     pub result: ResultCode,
+    /// Handles the service copied to the client, already in the client's handle table.
     pub copy_handles: Vec<Handle>,
+    /// Handles the service moved to the client (sub-interface sessions among them), already in the
+    /// client's handle table.
     pub move_handles: Vec<Handle>,
     data: Vec<u8>,
     cursor: usize,
@@ -300,9 +311,13 @@ impl Reply {
         }
     }
 
-    /// Reads the next output value, aligned to its size.
+    /// Reads the next output value, aligned like [`HleRequestContext::push`] writes it.
+    ///
+    /// [`HleRequestContext::push`]: crate::ipc::HleRequestContext::push
     pub fn pop<T: Pod>(&mut self) -> T {
-        self.cursor = self.cursor.next_multiple_of(std::mem::align_of::<T>());
+        self.cursor = self
+            .cursor
+            .next_multiple_of(std::mem::align_of::<T>().min(8));
         let size = std::mem::size_of::<T>();
         let value = bytemuck::pod_read_unaligned(&self.data[self.cursor..self.cursor + size]);
         self.cursor += size;
@@ -315,12 +330,16 @@ impl Reply {
     }
 }
 
-/// Sends requests to HLE sessions as a thread of `process`.
+/// Next free scratch address of each process, shared by every client in it.
+static SCRATCH: Mutex<Vec<(Weak<Process>, VAddr)>> = Mutex::new(Vec::new());
+
+/// Sends requests to HLE sessions as a thread of `process`. Requests from one client run one at a
+/// time.
 pub struct IpcClient {
     kernel: Kernel,
     process: Arc<Process>,
     thread: Arc<Thread>,
-    scratch: Mutex<VAddr>,
+    in_flight: Mutex<()>,
 }
 
 impl IpcClient {
@@ -336,10 +355,11 @@ impl IpcClient {
             kernel: kernel.clone(),
             process: process.clone(),
             thread,
-            scratch: Mutex::new(base + SCRATCH_OFFSET),
+            in_flight: Mutex::new(()),
         }
     }
 
+    /// The client's process.
     pub fn process(&self) -> &Arc<Process> {
         &self.process
     }
@@ -374,9 +394,19 @@ impl IpcClient {
 
     /// Copies `bytes` into fresh guest memory and returns its address.
     pub fn alloc(&self, bytes: &[u8]) -> VAddr {
-        let mut next = self.scratch.lock();
-        let address = *next;
-        *next = (address + bytes.len().max(1) as u64).next_multiple_of(0x100);
+        let mut scratch = SCRATCH.lock();
+        scratch.retain(|(owner, _)| owner.strong_count() > 0);
+        let owner = Arc::downgrade(&self.process);
+        let index = match scratch.iter().position(|(o, _)| o.ptr_eq(&owner)) {
+            Some(index) => index,
+            None => {
+                scratch.push((owner, self.process.entry() + SCRATCH_OFFSET));
+                scratch.len() - 1
+            }
+        };
+        let address = scratch[index].1;
+        scratch[index].1 = (address + bytes.len().max(1) as u64).next_multiple_of(0x100);
+        drop(scratch);
         self.process
             .memory()
             .write_bytes(address, bytes)
@@ -402,6 +432,10 @@ impl IpcClient {
             _ => return Err(crate::result::INVALID_HANDLE),
         };
         let words = request.encode();
+        if words.len() * 4 > TLS_MESSAGE_SIZE {
+            return Err(crate::result::MESSAGE_TOO_LARGE);
+        }
+        let _in_flight = self.in_flight.lock();
         let message = self.thread.tls_address();
         self.process
             .memory()
@@ -451,6 +485,10 @@ mod tests {
                     ctx.push(a + 1);
                     ctx.push(b * 2);
                     ctx.push_copy_object(KObject::ReadableEvent(self.0.clone()));
+                }
+                2 => {
+                    let (a, b): (u64, u128) = (ctx.pop(), ctx.pop());
+                    ctx.push(b + u128::from(a));
                 }
                 1 => {
                     let mut data = ctx.read_buffer(0).unwrap();
@@ -510,8 +548,24 @@ mod tests {
         assert_eq!(client.read(output, 4), b"dcba");
         assert_eq!(reply.pop::<u64>(), process.id());
 
+        let mut reply = client
+            .send(session, &Request::new(2).arg(1u64).arg(2u128))
+            .unwrap();
+        assert_eq!(reply.pop::<u128>(), 3);
+
         let reply = client.send(session, &Request::new(9)).unwrap();
         assert_eq!(reply.result, ResultCode(0x1234));
+
+        let oversized = Request::new(0).arg([0u64; 32]);
+        assert_eq!(
+            client.send(session, &oversized).unwrap_err(),
+            crate::result::MESSAGE_TOO_LARGE
+        );
+
+        let other = IpcClient::new(&kernel, &process);
+        let (first, second) = (client.alloc(b"first"), other.alloc(b"other"));
+        assert_ne!(first, second);
+        assert_eq!(client.read(first, 5), b"first");
         kernel.shutdown();
     }
 }
