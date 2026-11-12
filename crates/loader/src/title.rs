@@ -3,8 +3,10 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use lichii_common::ConsoleGeneration;
+use lichii_crypto::KeySet;
 use lichii_fs::host::{HostDir, HostFile};
 use lichii_fs::nacp::{Nacp, NacpLanguage};
 use lichii_fs::romfs::build_romfs;
@@ -15,9 +17,11 @@ use crate::exefs::load_exefs;
 use crate::npdm::Npdm;
 use crate::nro::load_nro;
 use crate::nso::{HashCheck, load_nso};
+use crate::package;
 use crate::program::ProgramImage;
 
-const ICON_LANGUAGES: [&str; 18] = [
+/// Icon file languages in NACP title order, so [`NacpLanguage`] indexes them.
+pub(crate) const ICON_LANGUAGES: [&str; 18] = [
     "AmericanEnglish",
     "BritishEnglish",
     "Japanese",
@@ -45,6 +49,12 @@ pub enum TitleFormat {
     LooseExefs,
     Nso,
     Nro,
+    /// A Nintendo Submission Package: a PFS0 of NCAs, tickets and certificates.
+    Nsp,
+    /// A game card image whose secure partition holds the NCAs.
+    Xci,
+    /// A standalone Program NCA.
+    Nca,
 }
 
 /// What the game list shows for a title.
@@ -61,11 +71,20 @@ pub struct TitleInfo {
     pub icon: Option<Vec<u8>>,
 }
 
-/// Options that change how a title is loaded.
-#[derive(Clone, Copy, Debug)]
+/// Options that change how a title is found and loaded.
+#[derive(Clone, Debug)]
 pub struct LoadOptions {
     pub hashes: HashCheck,
     pub language: NacpLanguage,
+    /// Console keys (`prod.keys`, `title.keys`) for NSP, XCI and NCA titles. Without them only
+    /// plaintext NCAs open; anything else fails with the name of the key it needs.
+    pub keys: Option<Arc<KeySet>>,
+    /// NSP or XCI packages whose updates and DLC apply to the title being loaded, merged with
+    /// the title's own package. The newest patch of the application wins.
+    pub updates_and_dlc: Vec<PathBuf>,
+    /// The program of a multi-program application to load (its CNMT id offset); 0 is the main
+    /// program.
+    pub program_index: u8,
 }
 
 impl Default for LoadOptions {
@@ -73,6 +92,9 @@ impl Default for LoadOptions {
         Self {
             hashes: HashCheck::Skip,
             language: NacpLanguage::AmericanEnglish,
+            keys: None,
+            updates_and_dlc: Vec::new(),
+            program_index: 0,
         }
     }
 }
@@ -319,8 +341,9 @@ pub fn romfs_product_version(romfs: &dyn Directory) -> Option<String> {
     Some(format!("{}.{}.{}", digits[0], digits[1], digits[2]))
 }
 
-/// Recognises a title at `path`.
-pub fn identify(path: &Path) -> Option<TitleFormat> {
+/// Recognises a title at `path` by its contents. `keys` lets an encrypted NCA be recognised by
+/// its header; without them a `.nca` file is recognised by its extension.
+pub fn identify(path: &Path, keys: Option<&KeySet>) -> Option<TitleFormat> {
     if LooseTitle::locate(path).is_some() {
         return Some(TitleFormat::LooseExefs);
     }
@@ -331,15 +354,19 @@ pub fn identify(path: &Path) -> Option<TitleFormat> {
     match (&head[..4], &head[0x10..0x14]) {
         (b"NSO0", _) => Some(TitleFormat::Nso),
         (_, b"NRO0") => Some(TitleFormat::Nro),
-        _ => None,
+        _ => package::identify(&magic.1, path, keys),
     }
 }
 
-/// Reads the game-list entry of the title at `path`.
-pub fn scan(path: &Path) -> LoaderResult<TitleInfo> {
+/// Reads the game-list entry of the title at `path`. NSP, XCI and NCA titles use the keys,
+/// language, program index and update packages in `options`.
+pub fn scan(path: &Path, options: &LoadOptions) -> LoaderResult<TitleInfo> {
     let not_a_title = || LoaderError::NotATitle(path.display().to_string());
-    match identify(path).ok_or_else(not_a_title)? {
+    match identify(path, options.keys.as_deref()).ok_or_else(not_a_title)? {
         TitleFormat::LooseExefs => LooseTitle::locate(path).ok_or_else(not_a_title)?.info(),
+        format @ (TitleFormat::Nsp | TitleFormat::Xci | TitleFormat::Nca) => {
+            package::scan(path, format, options)
+        }
         format @ (TitleFormat::Nso | TitleFormat::Nro) => {
             let (nacp, icon) = if format == TitleFormat::Nro {
                 let (_, assets) = load_nro(&HostFile::open(path)?, "nro")?;
@@ -372,7 +399,10 @@ pub fn scan(path: &Path) -> LoaderResult<TitleInfo> {
 /// Loads the title at `path` into a [`ProgramImage`].
 pub fn load(path: &Path, options: &LoadOptions) -> LoaderResult<ProgramImage> {
     let not_a_title = || LoaderError::NotATitle(path.display().to_string());
-    match identify(path).ok_or_else(not_a_title)? {
+    match identify(path, options.keys.as_deref()).ok_or_else(not_a_title)? {
+        format @ (TitleFormat::Nsp | TitleFormat::Xci | TitleFormat::Nca) => {
+            package::load(path, format, options)
+        }
         TitleFormat::LooseExefs => LooseTitle::locate(path)
             .ok_or_else(not_a_title)?
             .load(options),
@@ -403,16 +433,16 @@ pub fn load(path: &Path, options: &LoadOptions) -> LoaderResult<ProgramImage> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::npdm::AcidLayout;
     use crate::npdm::tests::{NpdmSpec, build_npdm};
     use crate::nso::tests::{Compression, build_nso, segments};
 
-    struct TempDir(PathBuf);
+    pub struct TempDir(pub PathBuf);
 
     impl TempDir {
-        fn new(tag: &str) -> Self {
+        pub fn new(tag: &str) -> Self {
             let path =
                 std::env::temp_dir().join(format!("lichii-loader-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&path);
@@ -466,9 +496,9 @@ mod tests {
         std::fs::write(game.join("romfs/data.bin"), [5u8; 33]).unwrap();
 
         let main = game.join("exefs/main");
-        assert_eq!(identify(&main), Some(TitleFormat::LooseExefs));
-        assert_eq!(identify(&game), Some(TitleFormat::LooseExefs));
-        let info = scan(&main).unwrap();
+        assert_eq!(identify(&main, None), Some(TitleFormat::LooseExefs));
+        assert_eq!(identify(&game, None), Some(TitleFormat::LooseExefs));
+        let info = scan(&main, &LoadOptions::default()).unwrap();
         assert_eq!(info.program_id, 0x0400_c3f0_0006_e000);
         assert_eq!(info.generation, ConsoleGeneration::Switch2);
         assert_eq!(info.name, "first switch game");
@@ -570,16 +600,16 @@ mod tests {
         let temp = TempDir::new("single");
         let nso = temp.0.join("app.nso");
         std::fs::write(&nso, build_nso(&segments(3), Compression::Lz4, 0, false)).unwrap();
-        assert_eq!(identify(&nso), Some(TitleFormat::Nso));
+        assert_eq!(identify(&nso, None), Some(TitleFormat::Nso));
         let image = load(&nso, &LoadOptions::default()).unwrap();
         assert_eq!(image.modules.len(), 1);
         assert!(image.capabilities.allows_svc(0x7f));
-        assert_eq!(scan(&nso).unwrap().name, "app");
+        assert_eq!(scan(&nso, &LoadOptions::default()).unwrap().name, "app");
 
         let nro = temp.0.join("hello.nro");
         std::fs::write(&nro, crate::nro::tests::build_nro(&[b"icon", b"", b""])).unwrap();
-        assert_eq!(identify(&nro), Some(TitleFormat::Nro));
-        let info = scan(&nro).unwrap();
+        assert_eq!(identify(&nro, None), Some(TitleFormat::Nro));
+        let info = scan(&nro, &LoadOptions::default()).unwrap();
         assert_eq!(
             (info.name.as_str(), info.icon.as_deref()),
             ("hello", Some(&b"icon"[..]))
@@ -591,7 +621,10 @@ mod tests {
 
         let junk = temp.0.join("junk.bin");
         std::fs::write(&junk, [0u8; 64]).unwrap();
-        assert_eq!(identify(&junk), None);
-        assert!(matches!(scan(&junk), Err(LoaderError::NotATitle(_))));
+        assert_eq!(identify(&junk, None), None);
+        assert!(matches!(
+            scan(&junk, &LoadOptions::default()),
+            Err(LoaderError::NotATitle(_))
+        ));
     }
 }

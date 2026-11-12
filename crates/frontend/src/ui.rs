@@ -8,7 +8,6 @@ use lichii_vulkan::present::Viewport;
 
 use crate::app::{Action, App};
 use crate::game_list::format_size;
-use crate::viewport;
 
 impl App {
     pub(crate) fn draw(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
@@ -251,14 +250,14 @@ impl App {
             width: (rect.width() * ppp).round().max(1.0) as u32,
             height: (rect.height() * ppp).round().max(1.0) as u32,
         };
-        let fitted = viewport::fit(area, self.settings.graphics.aspect_ratio);
+        let aspect = self.settings.graphics.aspect_ratio;
+        let fitted = Viewport::fit(aspect, area.x, area.y, area.width, area.height);
         self.viewport = Some(fitted);
         let guest = egui::Rect::from_min_size(
             egui::pos2(fitted.x as f32 / ppp, fitted.y as f32 / ppp),
             egui::vec2(fitted.width as f32 / ppp, fitted.height as f32 / ppp),
         );
         let painter = ui.painter();
-        painter.rect_filled(rect, 0.0, Color32::BLACK);
         painter.rect_stroke(
             guest,
             0.0,
