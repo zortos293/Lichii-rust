@@ -1,13 +1,12 @@
 mod app;
 mod choices;
 mod cli;
+mod display;
 mod game_list;
 mod hotkeys;
 mod input_worker;
-mod presenter;
 mod session;
 mod ui;
-mod viewport;
 
 use std::path::Path;
 use std::process::ExitCode;
