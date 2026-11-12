@@ -14,6 +14,7 @@ mod tests;
 use lichii_common::VAddr;
 
 use self::cache::BlockCache;
+pub(crate) use self::exec::condition_holds;
 use self::exec::{Exec, Flow};
 use crate::decoder::{Inst, decode};
 use crate::{CpuConfig, CpuCore, CpuFault, HaltReason, InterruptHandle, ThreadContext};
@@ -25,7 +26,7 @@ pub struct Interpreter {
 }
 
 /// How a run of instructions ended.
-enum Exit {
+pub(crate) enum Exit {
     /// `ctx.pc` holds the next instruction.
     Continue,
     Halt(HaltReason),
@@ -44,7 +45,7 @@ impl Interpreter {
 
     /// Executes `insts`, which start at `ctx.pc`, until one leaves the sequence.
     #[inline(always)]
-    fn execute(config: &CpuConfig, ctx: &mut ThreadContext, insts: &[Inst]) -> Exit {
+    pub(crate) fn execute(config: &CpuConfig, ctx: &mut ThreadContext, insts: &[Inst]) -> Exit {
         let mut exec = Exec {
             pc: ctx.pc,
             ctx,

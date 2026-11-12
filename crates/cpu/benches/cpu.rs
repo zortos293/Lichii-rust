@@ -1,12 +1,13 @@
-//! Interpreter throughput on synthetic guest loops, in guest MIPS.
+//! Interpreter and JIT throughput on synthetic guest loops, in guest MIPS.
 //!
-//! `cargo bench -p lichii-cpu --bench interpreter`; `LICHII_BENCH_ITERATIONS` sets the loop count
+//! `cargo bench -p lichii-cpu --bench cpu`; `LICHII_BENCH_ITERATIONS` sets the loop count
 //! (default 10M, zero is ignored).
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use lichii_cpu::{CpuConfig, CpuCore, GuestClock, HaltReason, Interpreter, ThreadContext};
+use lichii_common::settings::CpuBackend;
+use lichii_cpu::{CpuConfig, GuestClock, HaltReason, ThreadContext, new_core};
 use lichii_memory::{AddressSpace, ExclusiveMonitor, MemoryPermission, PhysicalMemory};
 
 const CODE: u64 = 0x10000;
@@ -65,24 +66,30 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .filter(|&n| n > 0)
         .unwrap_or(10_000_000);
-    for workload in WORKLOADS {
-        let mem = Arc::new(AddressSpace::new(
-            Arc::new(PhysicalMemory::new(1 << 20).unwrap()),
-            39,
-        ));
+    for (workload, backend) in WORKLOADS
+        .iter()
+        .flat_map(|w| [(w, CpuBackend::Interpreter), (w, CpuBackend::Jit)])
+    {
+        let mem = Arc::new(
+            AddressSpace::with_fastmem(Arc::new(PhysicalMemory::new(1 << 20).unwrap()), 39)
+                .unwrap(),
+        );
         mem.map(CODE, 0, 0x1000, MemoryPermission::READ_EXECUTE);
         mem.map(DATA, 0x1000, 0x2000, MemoryPermission::READ_WRITE);
         for (i, word) in workload.code.iter().enumerate() {
             mem.write(CODE + 4 * i as u64, *word).unwrap();
         }
-        let mut core = Interpreter::new(CpuConfig {
-            memory: mem,
-            monitor: Arc::new(ExclusiveMonitor::new(1)),
-            clock: Arc::new(Clock),
-            core_index: 0,
-            ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
-            dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
-        });
+        let mut core = new_core(
+            backend,
+            CpuConfig {
+                memory: mem,
+                monitor: Arc::new(ExclusiveMonitor::new(1)),
+                clock: Arc::new(Clock),
+                core_index: 0,
+                ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
+                dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+            },
+        );
         let mut seconds = f64::MAX;
         for _ in 0..3 {
             let mut ctx = ThreadContext {
@@ -97,8 +104,9 @@ fn main() {
         }
         let instructions = iterations * workload.per_iteration;
         println!(
-            "{:<18} {:>8.1} MIPS ({instructions} instructions in {seconds:.3} s, best of 3)",
+            "{:<18} {:<12} {:>8.1} MIPS ({instructions} instructions in {seconds:.3} s, best of 3)",
             workload.name,
+            format!("{backend:?}"),
             instructions as f64 / seconds / 1e6
         );
     }
