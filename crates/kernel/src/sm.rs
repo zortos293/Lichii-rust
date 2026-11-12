@@ -141,6 +141,14 @@ impl ServiceManager {
         ResultCode::SUCCESS
     }
 
+    /// A new session to the registered service `name`, as `GetService` would return.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn open(&self, name: &str) -> Option<Arc<ClientSession>> {
+        let registry = self.registry.lock();
+        let service = registry.services.get(&encode_name(name).ok()?)?;
+        Some(service.thread.session((service.factory)()))
+    }
+
     /// Drops every waiting request (their clients get `SessionClosed`).
     pub(crate) fn clear_waiting(&self) {
         let waiting = std::mem::take(&mut self.registry.lock().waiting);

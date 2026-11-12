@@ -25,6 +25,8 @@ pub mod thread;
 mod timer;
 mod util;
 
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 #[cfg(test)]
 mod tests;
 
@@ -248,19 +250,7 @@ impl Kernel {
 
     /// Starts the core threads, the timer thread and the service threads.
     pub fn run(&self) -> Result<(), KernelError> {
-        {
-            let mut services = self.0.services.lock();
-            if !services.running {
-                services.running = true;
-                let joins = services
-                    .threads
-                    .iter()
-                    .map(ServiceThread::spawn)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(KernelError::Spawn)?;
-                services.joins = joins;
-            }
-        }
+        self.spawn_service_threads()?;
         let mut threads = self.0.host_threads.lock();
         let kernel = self.0.clone();
         threads.push(
@@ -277,6 +267,21 @@ impl Kernel {
                     .spawn(move || cpu_manager::run_core(kernel, core))
                     .map_err(KernelError::Spawn)?,
             );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn spawn_service_threads(&self) -> Result<(), KernelError> {
+        let mut services = self.0.services.lock();
+        if !services.running {
+            services.running = true;
+            let joins = services
+                .threads
+                .iter()
+                .map(ServiceThread::spawn)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(KernelError::Spawn)?;
+            services.joins = joins;
         }
         Ok(())
     }
