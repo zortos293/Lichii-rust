@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use lichii_common::paths::UserPaths;
 use lichii_common::settings::Settings;
-use lichii_core::System;
+use lichii_core::{NullRasterizer, System};
 
 fn main() -> std::process::ExitCode {
     let mut args = std::env::args().skip(1);
@@ -32,7 +32,7 @@ fn main() -> std::process::ExitCode {
     });
     lichii_common::init_logging(&settings.debug.log_filter);
 
-    let mut system = match System::boot(Arc::new(settings), &title) {
+    let mut system = match System::boot(Arc::new(settings), &title, NullRasterizer::factory()) {
         Ok(system) => system,
         Err(e) => {
             tracing::error!("boot failed: {e}");
