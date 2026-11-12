@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use lichii_common::{DAddr, PAGE_MASK, PAGE_SIZE, PAddr, VAddr};
+use parking_lot::Mutex;
 
 use crate::page_table::PageTable;
 use crate::{AddressSpace, MemoryFault, MemoryPermission, PhysicalMemory};
@@ -14,6 +15,7 @@ use crate::{AddressSpace, MemoryFault, MemoryPermission, PhysicalMemory};
 pub struct DeviceAddressSpace {
     table: PageTable,
     physical: Arc<PhysicalMemory>,
+    update: Mutex<()>,
 }
 
 impl DeviceAddressSpace {
@@ -22,13 +24,16 @@ impl DeviceAddressSpace {
         Self {
             table: PageTable::new(address_space_bits),
             physical,
+            update: Mutex::new(()),
         }
     }
 
+    /// Width of the device address space in bits.
     pub fn address_space_bits(&self) -> u32 {
         self.table.bits()
     }
 
+    /// The DRAM this space maps.
     pub fn physical(&self) -> &Arc<PhysicalMemory> {
         &self.physical
     }
@@ -47,6 +52,7 @@ impl DeviceAddressSpace {
         if let Err(err) = self.physical.commit(pa, size) {
             panic!("{err}");
         }
+        let _update = self.update.lock();
         for page in 0..size / PAGE_SIZE {
             let host = self.physical.pointer(pa + page * PAGE_SIZE);
             self.table
@@ -55,7 +61,8 @@ impl DeviceAddressSpace {
     }
 
     /// Maps the DRAM pages behind `[va, va + size)` of `process` to `daddr`. Fails without
-    /// changing anything when a page of the range is unmapped.
+    /// changing anything when a page of the range is unmapped. `process` must use the same
+    /// [`PhysicalMemory`] as this device space.
     pub fn map_process(
         &self,
         daddr: DAddr,
@@ -68,26 +75,38 @@ impl DeviceAddressSpace {
             0,
             "unaligned device map {daddr:#x} {va:#x} {size:#x}"
         );
-        for page in 0..size / PAGE_SIZE {
-            let addr = va + page * PAGE_SIZE;
-            process.translate(addr).ok_or(MemoryFault::unmapped(addr))?;
-        }
-        for page in 0..size / PAGE_SIZE {
-            let (host, _) = process
-                .translate(va + page * PAGE_SIZE)
-                .ok_or(MemoryFault::unmapped(va + page * PAGE_SIZE))?;
-            self.table
-                .set(daddr + page * PAGE_SIZE, host, MemoryPermission::READ_WRITE);
+        assert!(
+            Arc::ptr_eq(process.physical(), &self.physical),
+            "device and process address spaces use different DRAM"
+        );
+        let hosts = (0..size / PAGE_SIZE)
+            .map(|page| {
+                let addr = va + page * PAGE_SIZE;
+                process
+                    .translate(addr)
+                    .map(|(host, _)| host)
+                    .ok_or(MemoryFault::unmapped(addr))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let _update = self.update.lock();
+        for (page, host) in hosts.into_iter().enumerate() {
+            self.table.set(
+                daddr + page as u64 * PAGE_SIZE,
+                host,
+                MemoryPermission::READ_WRITE,
+            );
         }
         Ok(())
     }
 
+    /// Removes the mappings of `[daddr, daddr + size)`.
     pub fn unmap(&self, daddr: DAddr, size: u64) {
         assert_eq!(
             (daddr | size) & PAGE_MASK,
             0,
             "unaligned device unmap {daddr:#x} {size:#x}"
         );
+        let _update = self.update.lock();
         for page in 0..size / PAGE_SIZE {
             self.table.clear(daddr + page * PAGE_SIZE);
         }
@@ -104,32 +123,41 @@ impl DeviceAddressSpace {
         self.table.contiguous(daddr, size)
     }
 
+    /// Physical address of the byte at `daddr`.
     pub fn physical_address(&self, daddr: DAddr) -> Option<PAddr> {
         self.physical.physical_address(self.translate(daddr)?)
     }
 
+    /// Whether the page holding `daddr` is mapped.
     pub fn is_mapped(&self, daddr: DAddr) -> bool {
         self.translate(daddr).is_some()
     }
 
+    /// Reads a value; it may straddle pages. Fails on the first unmapped page.
     #[inline]
     pub fn read<T: bytemuck::Pod>(&self, daddr: DAddr) -> Result<T, MemoryFault> {
         self.table.read(daddr)
     }
 
+    /// Writes a value; it may straddle pages. Fails on the first unmapped page, after writing the
+    /// bytes before it.
     #[inline]
     pub fn write<T: bytemuck::Pod>(&self, daddr: DAddr, value: T) -> Result<(), MemoryFault> {
         self.table.write(daddr, value)
     }
 
+    /// Copies `out.len()` bytes from `daddr`. Fails on the first unmapped page.
     pub fn read_bytes(&self, daddr: DAddr, out: &mut [u8]) -> Result<(), MemoryFault> {
         self.table.read_bytes(daddr, out)
     }
 
+    /// Copies `data` to `daddr`. Fails on the first unmapped page, after writing the bytes
+    /// before it.
     pub fn write_bytes(&self, daddr: DAddr, data: &[u8]) -> Result<(), MemoryFault> {
         self.table.write_bytes(daddr, data)
     }
 
+    /// Sets `size` bytes at `daddr` to `byte`. Fails on the first unmapped page.
     pub fn fill(&self, daddr: DAddr, size: u64, byte: u8) -> Result<(), MemoryFault> {
         self.table.fill(daddr, size, byte)
     }

@@ -8,7 +8,7 @@
 //! arena go to the previously installed handler.
 
 use std::sync::Once;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 
@@ -28,19 +28,25 @@ pub struct HostFault {
 
 const SLOTS: usize = 64;
 
+struct HandlerEntry {
+    handler: FaultHandler,
+    data: usize,
+}
+
+/// One registered arena. The handler and its data are published together as one immutable
+/// entry; replaced entries are leaked on purpose, because a fault on another thread may still be
+/// running the old one and a signal handler cannot take part in any reclamation protocol.
 struct Slot {
     base: AtomicUsize,
     size: AtomicUsize,
-    handler: AtomicUsize,
-    data: AtomicUsize,
+    handler: AtomicPtr<HandlerEntry>,
 }
 
 static ARENAS: [Slot; SLOTS] = [const {
     Slot {
         base: AtomicUsize::new(0),
         size: AtomicUsize::new(0),
-        handler: AtomicUsize::new(0),
-        data: AtomicUsize::new(0),
+        handler: AtomicPtr::new(std::ptr::null_mut()),
     }
 }; SLOTS];
 static REGISTRY: Mutex<()> = Mutex::new(());
@@ -64,19 +70,17 @@ impl Registration {
             .iter()
             .position(|s| s.base.load(Ordering::Acquire) == 0)?;
         let entry = &ARENAS[slot];
-        entry.handler.store(0, Ordering::Release);
+        entry.handler.store(std::ptr::null_mut(), Ordering::Release);
         entry.size.store(size, Ordering::Release);
         entry.base.store(base, Ordering::Release);
         Some(Self { slot })
     }
 
     pub(crate) fn set_handler(&self, handler: Option<FaultHandler>, data: usize) {
-        let entry = &ARENAS[self.slot];
-        entry.handler.store(0, Ordering::Release);
-        entry.data.store(data, Ordering::Release);
-        entry
-            .handler
-            .store(handler.map_or(0, |h| h as usize), Ordering::Release);
+        let entry = handler.map_or(std::ptr::null_mut(), |handler| {
+            Box::into_raw(Box::new(HandlerEntry { handler, data }))
+        });
+        ARENAS[self.slot].handler.store(entry, Ordering::Release);
     }
 }
 
@@ -85,7 +89,7 @@ impl Drop for Registration {
         let _guard = REGISTRY.lock();
         let entry = &ARENAS[self.slot];
         entry.base.store(0, Ordering::Release);
-        entry.handler.store(0, Ordering::Release);
+        entry.handler.store(std::ptr::null_mut(), Ordering::Release);
     }
 }
 
@@ -96,18 +100,15 @@ fn dispatch(addr: usize, ctx: *mut std::ffi::c_void) -> bool {
         if base == 0 || addr < base || addr - base >= entry.size.load(Ordering::Acquire) {
             continue;
         }
-        let handler = entry.handler.load(Ordering::Acquire);
-        if handler == 0 {
+        // SAFETY: handler entries are leaked, never freed, so the pointer stays valid.
+        let Some(handler) = (unsafe { entry.handler.load(Ordering::Acquire).as_ref() }) else {
             return false;
-        }
-        // SAFETY: only FaultHandler pointers are stored in the slot.
-        let handler: FaultHandler = unsafe { std::mem::transmute::<usize, FaultHandler>(handler) };
-        let data = entry.data.load(Ordering::Acquire);
+        };
         let mut fault = HostFault {
             ctx,
             host_addr: addr,
         };
-        return handler(data, (addr - base) as u64, &mut fault);
+        return (handler.handler)(handler.data, (addr - base) as u64, &mut fault);
     }
     false
 }
@@ -124,6 +125,7 @@ impl HostFault {
         unsafe { sys::pc(self.ctx) }
     }
 
+    /// Resumes the host thread at `pc` when the handler returns `true`.
     pub fn set_pc(&mut self, pc: u64) {
         // SAFETY: as above.
         unsafe { sys::set_pc(self.ctx, pc) }
@@ -136,6 +138,8 @@ impl HostFault {
         unsafe { sys::gpr(self.ctx, index) }
     }
 
+    /// Sets a host general-purpose register (numbering as in [`HostFault::gpr`]) for when the
+    /// thread resumes.
     pub fn set_gpr(&mut self, index: usize, value: u64) {
         // SAFETY: as above.
         unsafe { sys::set_gpr(self.ctx, index, value) }

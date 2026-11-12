@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use lichii_common::{PAGE_MASK, PAGE_SIZE, PAddr, VAddr};
+use parking_lot::Mutex;
 
 use crate::PhysicalMemory;
 use crate::fault::{FaultHandler, Registration};
@@ -91,10 +92,14 @@ impl Fastmem {
 }
 
 /// A process's guest virtual address space.
+///
+/// Translation and accesses are lock-free. `map`, `unmap` and `protect` are serialised so the
+/// table and the fastmem arena always agree.
 pub struct AddressSpace {
     table: PageTable,
     physical: Arc<PhysicalMemory>,
     fastmem: Option<Fastmem>,
+    update: Mutex<()>,
 }
 
 impl AddressSpace {
@@ -104,6 +109,7 @@ impl AddressSpace {
             table: PageTable::new(address_space_bits),
             physical,
             fastmem: None,
+            update: Mutex::new(()),
         }
     }
 
@@ -125,6 +131,7 @@ impl AddressSpace {
                 arena,
                 registration,
             }),
+            update: Mutex::new(()),
         })
     }
 
@@ -154,6 +161,7 @@ impl AddressSpace {
         if let Err(err) = self.physical.commit(pa, size) {
             panic!("{err}");
         }
+        let _update = self.update.lock();
         for page in 0..size / PAGE_SIZE {
             let host = self.physical.pointer(pa + page * PAGE_SIZE);
             self.table.set(va + page * PAGE_SIZE, host, perm);
@@ -178,6 +186,7 @@ impl AddressSpace {
             0,
             "unaligned unmap {va:#x} {size:#x}"
         );
+        let _update = self.update.lock();
         for page in 0..size / PAGE_SIZE {
             self.table.clear(va + page * PAGE_SIZE);
         }
@@ -190,6 +199,7 @@ impl AddressSpace {
     }
 
     pub fn protect(&self, va: VAddr, size: u64, perm: MemoryPermission) {
+        let _update = self.update.lock();
         let start = va & !PAGE_MASK;
         let pages = (va + size).div_ceil(PAGE_SIZE) - start / PAGE_SIZE;
         let mut run: Option<(VAddr, u64)> = None;
