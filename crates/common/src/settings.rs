@@ -30,7 +30,7 @@ pub enum SettingsError {
     #[error("parsing {path}: {source}")]
     Parse {
         path: PathBuf,
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
     #[error("serializing settings: {0}")]
     Serialize(#[from] toml::ser::Error),
@@ -42,7 +42,7 @@ impl Settings {
         match std::fs::read_to_string(path) {
             Ok(text) => toml::from_str(&text).map_err(|source| SettingsError::Parse {
                 path: path.to_path_buf(),
-                source,
+                source: Box::new(source),
             }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(source) => Err(SettingsError::Io {
