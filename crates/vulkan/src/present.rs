@@ -1281,8 +1281,10 @@ mod tests {
             });
             let pixels = h.compose(Some(&guest), viewport, no_ui(), (width, height));
             for (i, (got, want)) in pixels
-                .chunks_exact(4)
-                .zip(texels.chunks_exact(4))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(texels.as_chunks::<4>().0)
                 .enumerate()
             {
                 let close = got.iter().zip(want).all(|(g, w)| g.abs_diff(*w) <= 1);
