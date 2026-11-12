@@ -3,6 +3,8 @@
 use std::sync::{Arc, Weak};
 
 use lichii_common::{ConsoleGeneration, HleResult, PAGE_SIZE, VAddr, align_up};
+use lichii_loader::npdm::{AddressSpaceType, PoolPartition};
+use lichii_loader::program::{Module, Permission, ProgramImage};
 use lichii_memory::{AddressSpace, MemoryPermission};
 use parking_lot::{Mutex, RwLock};
 
@@ -17,7 +19,7 @@ use crate::thread::Thread;
 
 pub type ProcessId = u64;
 
-/// Everything the kernel needs to create a process, normally taken from the title's NPDM.
+/// What the kernel keeps of a title's NPDM for its process.
 #[derive(Clone, Debug)]
 pub struct ProcessParams {
     pub name: String,
@@ -37,33 +39,36 @@ pub struct ProcessParams {
     pub main_thread_core: u8,
     pub main_thread_stack_size: u64,
     pub system_resource_size: u64,
-    /// Raw kernel capability descriptors (ACI0/ACID kernel caps).
+    /// Raw kernel capability descriptors (ACI0).
     pub capabilities: Vec<u32>,
 }
 
-/// One loaded module (NSO/NRO): its bytes and segment layout. `data.size` includes .bss, which
-/// may extend past `memory`.
-#[derive(Clone, Debug, Default)]
-pub struct CodeSet {
-    pub memory: Vec<u8>,
-    pub text: Segment,
-    pub rodata: Segment,
-    pub data: Segment,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Segment {
-    pub offset: u64,
-    pub size: u64,
-}
-
-impl CodeSet {
-    /// Bytes the module occupies in the address space, page aligned.
-    pub fn size(&self) -> u64 {
-        align_up(
-            (self.data.offset + self.data.size).max(self.memory.len() as u64),
-            PAGE_SIZE,
-        )
+impl ProcessParams {
+    pub(crate) fn from_image(image: &ProgramImage, aslr: bool) -> HleResult<Self> {
+        let pool = match image.pool_partition {
+            PoolPartition::Application => Pool::Application,
+            PoolPartition::Applet => Pool::Applet,
+            PoolPartition::System => Pool::System,
+            PoolPartition::SystemNonSecure => Pool::SystemNonSecure,
+            PoolPartition::Unknown(_) => return Err(result::INVALID_ENUM_VALUE),
+        };
+        Ok(Self {
+            name: image.name.clone(),
+            program_id: image.program_id,
+            address_space_bits: image.address_space.width(),
+            is_64bit: image.is_64bit,
+            without_alias: image.address_space == AddressSpaceType::Is32BitNoMap,
+            aslr,
+            alias_region_extra: false,
+            pool,
+            is_application: pool == Pool::Application,
+            console: image.generation,
+            main_thread_priority: image.main_thread.priority,
+            main_thread_core: image.main_thread.core,
+            main_thread_stack_size: u64::from(image.main_thread.stack_size),
+            system_resource_size: u64::from(image.system_resource_size),
+            capabilities: image.kernel_capabilities.clone(),
+        })
     }
 }
 
@@ -129,6 +134,36 @@ impl Capabilities {
     }
 }
 
+/// Maps a module at `code.start + module.offset`, copies its image in (the rest of its size stays
+/// zero) and applies its segment permissions.
+fn map_module(table: &PageTable, code: Region, module: &Module) -> HleResult<()> {
+    let base = code.start + module.offset;
+    let size = module.size;
+    if !size.is_multiple_of(PAGE_SIZE)
+        || module.image.len() as u64 > size
+        || !code.contains(base, size)
+    {
+        return Err(result::INVALID_MEMORY_REGION);
+    }
+    table.map_new(base, size, MemoryState::CODE, MemoryPermission::READ_WRITE)?;
+    table
+        .address_space()
+        .write_bytes(base, &module.image)
+        .expect("freshly mapped module");
+    for segment in &module.segments {
+        let (state, perm) = match segment.permission {
+            Permission::ReadExecute => (MemoryState::CODE, MemoryPermission::READ_EXECUTE),
+            Permission::Read => (MemoryState::CODE, MemoryPermission::READ),
+            Permission::ReadWrite => (MemoryState::CODE_DATA, MemoryPermission::READ_WRITE),
+        };
+        let size = align_up(segment.size, PAGE_SIZE);
+        if size != 0 {
+            table.set_process_memory_permission(base + segment.offset, size, state, perm)?;
+        }
+    }
+    Ok(())
+}
+
 fn mask_range(low: u32, high: u32) -> u64 {
     let width = high - low + 1;
     let ones = if width >= 64 {
@@ -161,18 +196,21 @@ pub struct Process {
     resource_limit: Arc<ResourceLimit>,
     local_region: VAddr,
     code: Region,
+    entry: VAddr,
     main_stack: Mutex<Option<(VAddr, u64)>>,
     max_memory: u64,
     pub(crate) shared_mappings: Mutex<Vec<(VAddr, Arc<SharedMemory>)>>,
 }
 
-pub(crate) struct NewProcess {
+pub(crate) struct NewProcess<'a> {
     pub id: ProcessId,
     pub params: ProcessParams,
     pub kernel: Weak<KernelInner>,
     pub space: Arc<AddressSpace>,
     pub regions: Regions,
     pub code: Region,
+    pub entry: VAddr,
+    pub modules: &'a [Module],
     pub random_entropy: [u64; 4],
     pub resource_limit: Arc<ResourceLimit>,
     pub memory: Arc<crate::memory::MemoryManager>,
@@ -190,10 +228,23 @@ impl Process {
         }
     }
 
+    /// Maps the modules before anything else, so the thread-local pages (which share the code
+    /// region in 32- and 36-bit address spaces) land after them.
     pub(crate) fn new(new: NewProcess) -> HleResult<Arc<Self>> {
         let capabilities = Capabilities::parse(&new.params.capabilities)?;
         let page_table = PageTable::new(new.space, new.memory, new.params.pool, new.regions);
-        let local_region = page_table.allocate_tls()?;
+        let mapped = new
+            .modules
+            .iter()
+            .try_for_each(|module| map_module(&page_table, new.code, module))
+            .and_then(|()| page_table.allocate_tls());
+        let local_region = match mapped {
+            Ok(addr) => addr,
+            Err(code) => {
+                page_table.release_all();
+                return Err(code);
+            }
+        };
         let switch2 = new.params.console == ConsoleGeneration::Switch2 && new.params.is_application;
         let max_memory = if switch2 {
             new.regions.heap.size() + new.regions.alias.size()
@@ -214,6 +265,7 @@ impl Process {
             resource_limit: new.resource_limit,
             local_region,
             code: new.code,
+            entry: new.entry,
             main_stack: Mutex::new(None),
             max_memory,
             shared_mappings: Mutex::new(Vec::new()),
@@ -274,6 +326,11 @@ impl Process {
         self.local_region
     }
 
+    /// Where the main thread starts.
+    pub fn entry(&self) -> VAddr {
+        self.entry
+    }
+
     pub fn code_region(&self) -> Region {
         self.code
     }
@@ -319,44 +376,6 @@ impl Process {
         let free = self.page_table.memory_manager().free_size(pool);
         let used = self.used_memory();
         (used + free).min(self.max_memory.max(used))
-    }
-
-    /// Loads a module at `base` inside the code region and applies segment permissions:
-    /// .text RX, .rodata R, .data/.bss RW.
-    pub fn load_module(&self, base: VAddr, module: &CodeSet) -> HleResult<()> {
-        let size = module.size();
-        if !self.code.contains(base, size) {
-            return Err(result::INVALID_MEMORY_REGION);
-        }
-        let table = &self.page_table;
-        table.map_new(base, size, MemoryState::CODE, MemoryPermission::READ_WRITE)?;
-        self.memory()
-            .write_bytes(base, &module.memory)
-            .expect("freshly mapped module");
-        let segments = [
-            (
-                module.text,
-                MemoryState::CODE,
-                MemoryPermission::READ_EXECUTE,
-            ),
-            (module.rodata, MemoryState::CODE, MemoryPermission::READ),
-            (
-                Segment {
-                    offset: module.data.offset,
-                    size: size - module.data.offset,
-                },
-                MemoryState::CODE_DATA,
-                MemoryPermission::READ_WRITE,
-            ),
-        ];
-        for (segment, state, perm) in segments {
-            let size = align_up(segment.size, PAGE_SIZE);
-            if size != 0 {
-                table.set_process_memory_permission(base + segment.offset, size, state, perm)?;
-            }
-        }
-        self.invalidate_code(base, size);
-        Ok(())
     }
 
     /// Drops translated code for a range on every core.

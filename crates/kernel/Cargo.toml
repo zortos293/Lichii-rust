@@ -8,6 +8,7 @@ license.workspace = true
 lichii-common.workspace = true
 lichii-memory.workspace = true
 lichii-cpu.workspace = true
+lichii-loader.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true
 bytemuck.workspace = true

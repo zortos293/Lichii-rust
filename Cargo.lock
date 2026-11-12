@@ -1058,6 +1058,7 @@ dependencies = [
  "crossbeam-channel",
  "lichii-common",
  "lichii-cpu",
+ "lichii-loader",
  "lichii-memory",
  "parking_lot",
  "thiserror 2.0.21",

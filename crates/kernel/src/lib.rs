@@ -33,6 +33,7 @@ use std::thread::JoinHandle;
 
 use lichii_common::{ConsoleGeneration, HleResult, PAGE_SIZE, VAddr, align_up};
 use lichii_cpu::{CpuConfig, CpuCore, GuestClock};
+use lichii_loader::program::ProgramImage;
 use lichii_memory::{
     AddressSpace, ExclusiveMonitor, MemoryPermission, PhysicalMemory, PhysicalMemoryError,
 };
@@ -80,6 +81,8 @@ pub struct KernelConfig {
     pub pool_layout: Option<PoolLayout>,
     /// Give process address spaces a fastmem arena for the JIT.
     pub fastmem: bool,
+    /// Slide the code region base of new processes (ASLR).
+    pub aslr: bool,
     /// Seed for ASLR and random entropy.
     pub rng_seed: u64,
     pub clock: Arc<dyn GuestClock>,
@@ -106,6 +109,7 @@ pub(crate) struct KernelInner {
     pub clock: Arc<dyn GuestClock>,
     cpu_factory: CpuFactory,
     fastmem: bool,
+    aslr: bool,
     events: Arc<dyn KernelEvents>,
     rng: Mutex<Rng>,
     next_process_id: AtomicU64,
@@ -140,6 +144,7 @@ impl Kernel {
             clock: config.clock,
             cpu_factory: config.cpu,
             fastmem: config.fastmem,
+            aslr: config.aslr,
             events: config.events.unwrap_or_else(|| Arc::new(LogEvents)),
             rng: Mutex::new(Rng::new(config.rng_seed)),
             next_process_id: AtomicU64::new(0x51),
@@ -174,31 +179,19 @@ impl Kernel {
         self.0.processes.lock().clone()
     }
 
-    /// Creates a process whose code occupies `code` (normally right after the start of the
-    /// code region, see [`Kernel::default_code_address`]). Load its modules with
-    /// [`Process::load_module`], then call [`Kernel::start_process`].
-    pub fn create_process(&self, params: ProcessParams, code: Region) -> HleResult<Arc<Process>> {
-        self.0.create_process(params, code)
+    /// Creates the process of a title. The code region base follows `image.address_space`
+    /// (slid when [`KernelConfig::aslr`] is set); every module is mapped at `base +
+    /// module.offset` with its segment permissions, its image copied in and the rest of its size
+    /// zeroed. The raw ACI0 descriptors are validated here. Start it with
+    /// [`Kernel::start_process`].
+    pub fn create_process(&self, image: &ProgramImage) -> HleResult<Arc<Process>> {
+        self.0.create_process(image)
     }
 
-    /// Where Horizon puts the code of a process with this address-space width (plus ASLR slide
-    /// when `aslr` is set).
-    pub fn default_code_address(&self, address_space_bits: u32, aslr: bool) -> VAddr {
-        let base = match address_space_bits {
-            32 => 0x20_0000,
-            _ => 0x800_0000,
-        };
-        if aslr && address_space_bits == 39 {
-            base + self.0.rng.lock().below(0x40) * 0x20_0000
-        } else {
-            base
-        }
-    }
-
-    /// Creates the main thread (stack in the stack region, `x1` = its handle) and makes it
-    /// runnable.
-    pub fn start_process(&self, process: &Arc<Process>, entry: VAddr) -> HleResult<Arc<Thread>> {
-        self.0.start_process(process, entry)
+    /// Maps the main thread's stack (`main_thread.stack_size`) in the stack region and starts it
+    /// at `base + entry_offset` with `main_thread`'s priority and core; `x1` holds its handle.
+    pub fn start_process(&self, process: &Arc<Process>) -> HleResult<Arc<Thread>> {
+        self.0.start_process(process)
     }
 
     /// Starts the core threads and the timer thread.
@@ -252,15 +245,26 @@ impl KernelInner {
         &*self.events
     }
 
-    fn create_process(
-        self: &Arc<Self>,
-        params: ProcessParams,
-        code: Region,
-    ) -> HleResult<Arc<Process>> {
-        let code = Region {
-            start: code.start,
-            end: align_up(code.end, PAGE_SIZE),
+    fn code_address(&self, address_space_bits: u32, aslr: bool) -> VAddr {
+        let base = match address_space_bits {
+            32 => 0x20_0000,
+            _ => 0x800_0000,
         };
+        if aslr && address_space_bits == 39 {
+            base + self.rng.lock().below(0x40) * 0x20_0000
+        } else {
+            base
+        }
+    }
+
+    fn create_process(self: &Arc<Self>, image: &ProgramImage) -> HleResult<Arc<Process>> {
+        let params = ProcessParams::from_image(image, self.aslr)?;
+        let base = self.code_address(params.address_space_bits, params.aslr);
+        let code = Region::new(base, align_up(image.code_size.max(PAGE_SIZE), PAGE_SIZE));
+        let entry = base + image.entry_offset;
+        if !code.contains(entry, 4) {
+            return Err(result::INVALID_ARGUMENT);
+        }
         let regions = Regions::compute(Process::layout(&params, code), &mut self.rng.lock())?;
         if !regions.code.contains(code.start, code.size()) {
             return Err(result::INVALID_MEMORY_REGION);
@@ -292,6 +296,8 @@ impl KernelInner {
             space: Arc::new(space),
             regions,
             code,
+            entry,
+            modules: &image.modules,
             random_entropy,
             resource_limit,
             memory: self.memory.clone(),
@@ -364,7 +370,7 @@ impl KernelInner {
         Ok(thread)
     }
 
-    fn start_process(&self, process: &Arc<Process>, entry: VAddr) -> HleResult<Arc<Thread>> {
+    fn start_process(&self, process: &Arc<Process>) -> HleResult<Arc<Thread>> {
         let params = process.params().clone();
         let stack_size = align_up(params.main_thread_stack_size.max(PAGE_SIZE), PAGE_SIZE);
         let stack_region = process.page_table().regions().stack;
@@ -377,7 +383,7 @@ impl KernelInner {
         process.set_main_stack(stack, stack_size);
         let thread = self.create_thread(
             process,
-            entry,
+            process.entry(),
             0,
             stack + stack_size,
             params.main_thread_priority as u32,

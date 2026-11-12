@@ -9,11 +9,13 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender};
 use lichii_common::{ConsoleGeneration, VAddr};
 use lichii_cpu::{CpuConfig, CpuCore, GuestClock, HaltReason, InterruptHandle, ThreadContext};
+use lichii_loader::npdm::{AddressSpaceType, KernelCapabilities, PoolPartition, ServiceAccess};
+use lichii_loader::program::{MainThread, Module, Permission, ProgramImage, Segment};
 use lichii_memory::AddressSpace;
 use parking_lot::Mutex;
 
-use crate::memory::{Pool, PoolLayout, Region};
-use crate::process::{Process, ProcessParams};
+use crate::memory::PoolLayout;
+use crate::process::Process;
 use crate::{Kernel, KernelConfig, KernelEvents};
 
 pub(crate) struct Env<'a> {
@@ -192,6 +194,7 @@ impl KernelEvents for ExitEvents {
 }
 
 pub(crate) const CODE_BASE: VAddr = 0x800_0000;
+pub(crate) const CODE_SIZE: u64 = 0x100_0000;
 
 pub(crate) struct TestKernel {
     pub kernel: Kernel,
@@ -214,6 +217,7 @@ impl TestKernel {
                 system_non_secure: 16 << 20,
             }),
             fastmem: false,
+            aslr: false,
             rng_seed: 1,
             clock: Arc::new(HostClock(Instant::now())),
             cpu: Arc::new(move |config: CpuConfig| {
@@ -242,34 +246,67 @@ impl TestKernel {
         base
     }
 
-    pub fn params(&self) -> ProcessParams {
-        ProcessParams {
-            name: "test".into(),
+    /// A 64-bit application with a 39-bit address space and one 16 MiB module of zeroes at the
+    /// code base, where the test scripts live.
+    pub fn image(&self) -> ProgramImage {
+        ProgramImage {
             program_id: 0x0100_0000_0000_1000,
-            address_space_bits: 39,
+            generation: self.kernel.console(),
+            name: "test".into(),
             is_64bit: true,
-            without_alias: false,
-            aslr: false,
-            alias_region_extra: false,
-            pool: Pool::Application,
-            is_application: true,
-            console: self.kernel.console(),
-            main_thread_priority: 44,
-            main_thread_core: 0,
-            main_thread_stack_size: 0x10000,
+            address_space: AddressSpaceType::Is39Bit,
+            main_thread: MainThread {
+                priority: 44,
+                core: 0,
+                stack_size: 0x10000,
+            },
             system_resource_size: 0,
-            capabilities: Vec::new(),
+            pool_partition: PoolPartition::Application,
+            kernel_capabilities: Vec::new(),
+            capabilities: KernelCapabilities::default(),
+            services: ServiceAccess::default(),
+            filesystem_permissions: 0,
+            modules: vec![Module {
+                name: "main".into(),
+                offset: 0,
+                image: vec![0; 0x1000],
+                size: CODE_SIZE,
+                segments: [
+                    Segment {
+                        offset: 0,
+                        size: 0x1000,
+                        permission: Permission::ReadExecute,
+                    },
+                    Segment {
+                        offset: 0x1000,
+                        size: 0x1000,
+                        permission: Permission::Read,
+                    },
+                    Segment {
+                        offset: 0x2000,
+                        size: CODE_SIZE - 0x2000,
+                        permission: Permission::ReadWrite,
+                    },
+                ],
+                build_id: [0; 32],
+                mod0: None,
+            }],
+            code_size: CODE_SIZE,
+            entry_offset: 0,
+            romfs: None,
+            nacp: None,
+            pseudo_device_seed: 0,
+            add_ons: Vec::new(),
         }
     }
 
-    /// Creates a process with a 2 MiB heap and starts `main` as its main thread.
-    pub fn start(&self, params: ProcessParams, main: VAddr) -> Arc<Process> {
-        let process = self
-            .kernel
-            .create_process(params, Region::new(CODE_BASE, 0x100_0000))
-            .unwrap();
+    /// Creates the process of `image` with a 2 MiB heap and starts `main` as its main thread.
+    pub fn start(&self, mut image: ProgramImage, main: VAddr) -> Arc<Process> {
+        image.entry_offset = main - CODE_BASE;
+        let process = self.kernel.create_process(&image).unwrap();
+        assert_eq!(process.code_region().start, CODE_BASE);
         process.page_table().set_heap_size(2 << 20).unwrap();
-        self.kernel.start_process(&process, main).unwrap();
+        self.kernel.start_process(&process).unwrap();
         process
     }
 

@@ -6,14 +6,14 @@ use lichii_common::ConsoleGeneration;
 use parking_lot::Mutex;
 
 use super::{Script, TestKernel, word};
-use crate::process::Process;
+use crate::process::{Process, ProcessParams};
 use crate::util::Rng;
 
 pub(super) fn heap_base(test: &TestKernel) -> u64 {
-    let params = test.params();
+    let params = ProcessParams::from_image(&test.image(), false).unwrap();
     let layout = Process::layout(
         &params,
-        crate::memory::Region::new(super::CODE_BASE, 0x100_0000),
+        crate::memory::Region::new(super::CODE_BASE, super::CODE_SIZE),
     );
     crate::memory::Regions::compute(layout, &mut Rng::new(0))
         .unwrap()
@@ -84,7 +84,7 @@ fn switch2_runs_six_cores_natively() {
             .exit(),
     );
     let main = test.program(spawn_and_join(heap, 6, worker, |i| (40, i as u32)).exit());
-    test.start(test.params(), main);
+    test.start(test.image(), main);
     test.run_until_exit(Duration::from_secs(10));
     let mut seen = seen.lock().clone();
     seen.sort();
@@ -106,7 +106,7 @@ fn switch1_rejects_cores_four_and_five() {
             .then(move |ctx, _| r.store(ctx.x[0], Ordering::SeqCst))
             .exit(),
     );
-    test.start(test.params(), main);
+    test.start(test.image(), main);
     test.run_until_exit(Duration::from_secs(10));
     assert_eq!(
         result.load(Ordering::SeqCst),
@@ -134,7 +134,7 @@ fn higher_priority_thread_preempts_a_spinner() {
         vec![spinner, setter],
         vec![(50, 1), (30, 1)],
     ));
-    test.start(test.params(), main);
+    test.start(test.image(), main);
     test.run_until_exit(Duration::from_secs(10));
 }
 
@@ -194,7 +194,7 @@ fn preemption_priority_threads_rotate() {
             .exit(),
     );
     let main = test.program(spawn_and_join(heap, 2, worker, |_| (59, 1)).exit());
-    test.start(test.params(), main);
+    test.start(test.image(), main);
     test.run_until_exit(Duration::from_secs(10));
 }
 
@@ -219,7 +219,7 @@ fn sleep_and_yield_return() {
             })
             .exit(),
     );
-    test.start(test.params(), main);
+    test.start(test.image(), main);
     test.run_until_exit(Duration::from_secs(10));
     assert!(elapsed.load(Ordering::SeqCst) >= 5_000);
 }
@@ -228,7 +228,7 @@ fn sleep_and_yield_return() {
 fn shutdown_stops_a_spinning_core() {
     let test = TestKernel::new(ConsoleGeneration::Switch1);
     let main = test.program(Script::new().step(|_, _| super::Action::Stay));
-    test.start(test.params(), main);
+    test.start(test.image(), main);
     test.kernel.run().unwrap();
     std::thread::sleep(Duration::from_millis(50));
     let (tx, rx) = crossbeam_channel::bounded(1);

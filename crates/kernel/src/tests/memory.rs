@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use lichii_common::ConsoleGeneration;
+use lichii_loader::npdm::{AddressSpaceType, PoolPartition};
+use lichii_loader::program::{Module, Permission, Segment};
 use lichii_memory::MemoryPermission;
 use parking_lot::Mutex;
 
@@ -84,7 +86,7 @@ fn heap_alias_and_query_memory() {
             .then(l("shrink heap"))
             .exit(),
     );
-    let process = test.start(test.params(), main);
+    let process = test.start(test.image(), main);
     test.run_until_exit(Duration::from_secs(10));
     let log = log.lock().clone();
     let get = |name: &str| {
@@ -114,13 +116,7 @@ fn heap_alias_and_query_memory() {
 #[test]
 fn map_memory_and_physical_memory() {
     let test = TestKernel::new(ConsoleGeneration::Switch2);
-    let process = test
-        .kernel
-        .create_process(
-            test.params(),
-            crate::memory::Region::new(super::CODE_BASE, 0x100_0000),
-        )
-        .unwrap();
+    let process = test.kernel.create_process(&test.image()).unwrap();
     let table = process.page_table();
     let regions = *table.regions();
     let heap = table.set_heap_size(2 << 20).unwrap();
@@ -169,13 +165,7 @@ fn map_memory_and_physical_memory() {
 #[test]
 fn transfer_memory_locks_until_closed() {
     let test = TestKernel::new(ConsoleGeneration::Switch1);
-    let process = test
-        .kernel
-        .create_process(
-            test.params(),
-            crate::memory::Region::new(super::CODE_BASE, 0x100_0000),
-        )
-        .unwrap();
+    let process = test.kernel.create_process(&test.image()).unwrap();
     let heap = process.page_table().set_heap_size(2 << 20).unwrap();
     process.memory().write(heap + 8, 9u64).unwrap();
     let transfer = crate::memory_objects::TransferMemory::new(
@@ -223,9 +213,9 @@ fn switch2_get_info_ids() {
             .then(move |ctx, _| v.lock().push((id, ctx.x[0], ctx.x[1])));
     }
     let main = test.program(script.exit());
-    let mut params = test.params();
-    params.capabilities = vec![0b0111 | (59 << 4) | (28 << 10) | (5 << 24)];
-    let process = test.start(params, main);
+    let mut image = test.image();
+    image.kernel_capabilities = vec![0b0111 | (59 << 4) | (28 << 10) | (5 << 24)];
+    let process = test.start(image, main);
     let regions = *process.page_table().regions();
     test.run_until_exit(Duration::from_secs(10));
     let values = values.lock().clone();
@@ -272,7 +262,7 @@ fn closed_events_and_transfer_memories_return_their_quota() {
             .svc(0x16, |ctx, _| ctx.x[0] = ctx.x[19])
             .exit(),
     );
-    let process = test.start(test.params(), main);
+    let process = test.start(test.image(), main);
     let limit = process.resource_limit().clone();
     test.run_until_exit(Duration::from_secs(10));
     for which in [
@@ -322,7 +312,7 @@ fn shared_memory_outlives_its_handle_while_mapped() {
             })
             .exit(),
     );
-    let process = test.start(test.params(), main);
+    let process = test.start(test.image(), main);
     let raw = process
         .handles()
         .write()
@@ -333,5 +323,107 @@ fn shared_memory_outlives_its_handle_while_mapped() {
     assert!(
         weak.upgrade().is_none(),
         "kept alive after the process exited"
+    );
+}
+
+fn module(name: &str, offset: u64, fill: u8, pages: [u64; 4]) -> Module {
+    let [text, ro, data, bss] = pages.map(|p| p * 0x1000);
+    Module {
+        name: name.into(),
+        offset,
+        image: vec![fill; (text + ro + data) as usize],
+        size: text + ro + data + bss,
+        segments: [
+            Segment {
+                offset: 0,
+                size: text,
+                permission: Permission::ReadExecute,
+            },
+            Segment {
+                offset: text,
+                size: ro,
+                permission: Permission::Read,
+            },
+            Segment {
+                offset: text + ro,
+                size: data + bss,
+                permission: Permission::ReadWrite,
+            },
+        ],
+        build_id: [0; 32],
+        mod0: None,
+    }
+}
+
+#[test]
+fn program_image_modules_are_mapped_with_their_segment_permissions() {
+    let test = TestKernel::new(ConsoleGeneration::Switch2);
+    let mut image = test.image();
+    image.modules = vec![
+        module("rtld", 0, 0x11, [1, 1, 1, 1]),
+        module("main", 0x4000, 0x22, [2, 1, 1, 2]),
+    ];
+    image.code_size = 0xa000;
+    image.entry_offset = 0;
+    image.kernel_capabilities = vec![0b0111 | (59 << 4) | (28 << 10) | (5 << 24)];
+    let process = test.kernel.create_process(&image).unwrap();
+    let base = process.code_region().start;
+    assert_eq!(base, super::CODE_BASE);
+    assert_eq!(process.code_region().size(), 0xa000);
+    assert_eq!(process.entry(), base);
+    assert_eq!(process.capabilities().priority_mask, ((1 << 32) - 1) << 28);
+    let table = process.page_table();
+    let expect = [
+        (0x0000, MemoryState::CODE, 5, 0x11),
+        (0x1000, MemoryState::CODE, 1, 0x11),
+        (0x2000, MemoryState::CODE_DATA, 3, 0x11),
+        (0x3000, MemoryState::CODE_DATA, 3, 0),
+        (0x4000, MemoryState::CODE, 5, 0x22),
+        (0x6000, MemoryState::CODE, 1, 0x22),
+        (0x7000, MemoryState::CODE_DATA, 3, 0x22),
+        (0x8000, MemoryState::CODE_DATA, 3, 0),
+        (0x9fff, MemoryState::CODE_DATA, 3, 0),
+    ];
+    for (offset, state, permission, byte) in expect {
+        let info = table.query(base + offset);
+        assert_eq!(info.state, state.svc_value(), "state at {offset:#x}");
+        assert_eq!(info.permission, permission, "permission at {offset:#x}");
+        assert_eq!(
+            process.memory().read::<u8>(base + offset).unwrap(),
+            byte,
+            "byte at {offset:#x}"
+        );
+    }
+}
+
+#[test]
+fn program_image_address_space_and_validation() {
+    let test = TestKernel::new(ConsoleGeneration::Switch1);
+    let mut image = test.image();
+    image.address_space = AddressSpaceType::Is32BitNoMap;
+    image.is_64bit = false;
+    let process = test.kernel.create_process(&image).unwrap();
+    assert_eq!(process.code_region().start, 0x20_0000);
+    assert_eq!(process.params().address_space_bits, 32);
+    assert!(process.params().without_alias);
+    assert_eq!(process.page_table().regions().alias.size(), 0);
+
+    let mut image = test.image();
+    image.pool_partition = PoolPartition::Unknown(7);
+    assert_eq!(
+        test.kernel.create_process(&image).err(),
+        Some(result::INVALID_ENUM_VALUE)
+    );
+    let mut image = test.image();
+    image.entry_offset = image.code_size;
+    assert_eq!(
+        test.kernel.create_process(&image).err(),
+        Some(result::INVALID_ARGUMENT)
+    );
+    let mut image = test.image();
+    image.modules[0].size = super::CODE_SIZE + 0x1000;
+    assert_eq!(
+        test.kernel.create_process(&image).err(),
+        Some(result::INVALID_MEMORY_REGION)
     );
 }

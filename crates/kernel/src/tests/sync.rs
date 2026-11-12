@@ -38,7 +38,7 @@ fn event_signal_wakes_a_waiting_thread() {
             .exit(),
     );
     let main = test.program(spawn_and_join(heap, 1, waiter, |_| (40, 1)).exit());
-    let process = test.start(test.params(), main);
+    let process = test.start(test.image(), main);
     handle.store(
         process
             .handles()
@@ -87,7 +87,7 @@ fn wait_synchronization_times_out_and_polls() {
             .then(move |ctx, _| r2.lock().push(ctx.x[0]))
             .exit(),
     );
-    let process = test.start(test.params(), main);
+    let process = test.start(test.image(), main);
     handle.store(
         process
             .handles()
@@ -150,7 +150,7 @@ fn cancel_synchronization_interrupts_a_wait() {
             })
             .exit(),
     );
-    let process = test.start(test.params(), main);
+    let process = test.start(test.image(), main);
     handle.store(
         process
             .handles()
@@ -218,7 +218,7 @@ fn address_arbiter_ping_pong_across_cores() {
             })
             .exit(),
     );
-    test.start(test.params(), main);
+    test.start(test.image(), main);
     let started = std::time::Instant::now();
     test.run_until_exit(Duration::from_secs(30));
     eprintln!("{} arbiter round trips in {:?}", ROUNDS, started.elapsed());
@@ -313,7 +313,7 @@ fn arbitrated_mutex_serialises_four_cores() {
             })
             .exit(),
     );
-    test.start(test.params(), main);
+    test.start(test.image(), main);
     test.run_until_exit(Duration::from_secs(30));
     assert_eq!(*last.lock(), (4 * ITERATIONS as u32, 0));
 }
@@ -358,7 +358,7 @@ fn abandoned_wait_does_not_replay_its_result() {
             .then(move |ctx, _| r2.lock().push((ctx.x[0], ctx.x[1])))
             .exit(),
     );
-    let process = test.start(test.params(), main);
+    let process = test.start(test.image(), main);
     handle.store(
         process
             .handles()
