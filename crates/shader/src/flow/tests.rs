@@ -406,24 +406,3 @@ mod structured {
         assert_eq!(dump.matches("Epilogue").count(), 1, "{dump}");
     }
 }
-#[test]
-fn zz_print() {
-    let cfg = build(vec![
-        op(N),
-        op(N),
-        guarded(FlowOp::Branch { target: 8 }, 1),
-        op(FlowOp::Exit),
-    ]);
-    let mut prog = crate::ir::Program::new();
-    let mut translate = |prog: &mut crate::ir::Program, block, begin: u32, end: u32| {
-        prog.append(
-            block,
-            crate::ir::Opcode::Reference,
-            &[crate::ir::Value::U32(begin << 16 | end)],
-            0,
-        );
-        Ok(())
-    };
-    crate::flow::structure::structure(&mut prog, &cfg, Default::default(), &mut translate).unwrap();
-    println!("{}", prog.dump());
-}
