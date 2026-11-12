@@ -10,7 +10,7 @@ use lichii_common::settings::{FullscreenMode, HotkeyAction, Settings, Theme};
 use lichii_input::{Key, KeyChord, KeySet, MouseButton};
 use lichii_vulkan::present::{UiFrame, Viewport};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::PhysicalKey;
 use winit::window::{Fullscreen, Window, WindowId};
@@ -79,6 +79,8 @@ pub struct App {
     saved_speed_limit: u16,
     paused_for_focus: bool,
     exit_requested: bool,
+    /// What the input thread was last told about guest input.
+    guest_input: bool,
 }
 
 impl App {
@@ -122,6 +124,7 @@ impl App {
             start_fullscreen: cli.fullscreen,
             paused_for_focus: false,
             exit_requested: false,
+            guest_input: false,
         };
         app.refresh_games();
         app
@@ -369,10 +372,13 @@ impl App {
         }
     }
 
-    /// Whether keyboard and mouse currently drive the guest rather than the UI.
-    fn guest_has_input(&self) -> bool {
-        self.session.as_ref().is_some_and(|s| !s.is_paused())
-            && !self.egui_ctx.egui_wants_keyboard_input()
+    /// Tells the input thread whether the guest should see input: only while a title runs.
+    fn sync_guest_input(&mut self) {
+        let on = self.session.as_ref().is_some_and(|s| !s.is_paused());
+        if on != self.guest_input {
+            self.guest_input = on;
+            self.input.send(InputMsg::GuestInput(on));
+        }
     }
 
     fn on_key(&mut self, event: &KeyEvent) {
@@ -393,7 +399,7 @@ impl App {
             self.apply(Action::Hotkey(action));
             return;
         }
-        if !down || self.guest_has_input() {
+        if !down || !self.egui_ctx.egui_wants_keyboard_input() {
             self.input.send(InputMsg::Key(key, down));
         }
     }
@@ -422,6 +428,7 @@ impl App {
         for action in actions {
             self.apply(action);
         }
+        self.sync_guest_input();
 
         let running = self.session.as_ref().is_some_and(|s| !s.is_paused());
         let delay = output
@@ -429,9 +436,12 @@ impl App {
             .get(&egui::ViewportId::ROOT)
             .map_or(Duration::MAX, |v| v.repaint_delay);
         if running || delay.is_zero() {
+            event_loop.set_control_flow(ControlFlow::Wait);
             window.request_redraw();
         } else if let Some(at) = Instant::now().checked_add(delay) {
             event_loop.set_control_flow(ControlFlow::WaitUntil(at));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 
@@ -478,6 +488,15 @@ impl App {
 }
 
 impl ApplicationHandler<UserEvent> for App {
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+        if let StartCause::ResumeTimeReached { .. } = cause {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -532,7 +551,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseInput { state, button, .. } => {
                 if let Some(button) = MouseButton::from_winit(button) {
                     let down = state == ElementState::Pressed;
-                    if !down || (!consumed && self.guest_has_input()) {
+                    if !down || !consumed {
                         self.input.send(InputMsg::Mouse(button, down));
                     }
                 }
@@ -568,6 +587,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Hotkey(action) => self.apply(Action::Hotkey(action)),
             UserEvent::Wake => self.games.poll(),
         }
+        self.sync_guest_input();
         if let Some(window) = &self.window {
             window.request_redraw();
         }

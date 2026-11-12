@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{RecvTimeoutError, Sender};
 use lichii_common::settings::{ControlSettings, HotkeyAction, MAX_PLAYERS, NpadButton};
-use lichii_input::{HostInput, InputMapper, Key, MouseButton, NpadHub};
+use lichii_input::{HostInput, InputMapper, Key, MouseButton, NpadButtons, NpadHub, NpadState};
 
 /// How often the thread resolves and publishes when no event arrives (250 Hz, above hid's
 /// sampling rate).
@@ -18,6 +18,9 @@ pub enum InputMsg {
     Mouse(MouseButton, bool),
     /// Releases every key and mouse button (focus lost, input handed back to the UI).
     ReleaseAll,
+    /// Whether the guest sees input. While it doesn't, players publish as neutral, but host input
+    /// is still tracked so controller hotkeys (e.g. Home+Plus to continue) keep working.
+    GuestInput(bool),
     Configure {
         controls: Box<ControlSettings>,
         combos: Vec<(HotkeyAction, Vec<NpadButton>)>,
@@ -46,6 +49,7 @@ impl InputWorker {
                 let mut mapper = InputMapper::new(&controls, &host);
                 let mut combos = combos;
                 let mut held = vec![false; combos.len()];
+                let mut guest_input = false;
                 loop {
                     let first = match rx.recv_timeout(POLL) {
                         Ok(msg) => Some(msg),
@@ -56,6 +60,7 @@ impl InputWorker {
                         match msg {
                             InputMsg::Key(key, down) => host.keys.set(key, down),
                             InputMsg::Mouse(button, down) => host.set_mouse_button(button, down),
+                            InputMsg::GuestInput(on) => guest_input = on,
                             InputMsg::ReleaseAll => {
                                 host.keys.clear();
                                 host.mouse_buttons = 0;
@@ -70,10 +75,24 @@ impl InputWorker {
                             }
                         }
                     }
+                    let mut player_one = NpadButtons::empty();
                     for player in 0..MAX_PLAYERS {
-                        thread_hub.publish(player, &mapper.resolve(player, &host));
+                        let state = mapper.resolve(player, &host);
+                        if player == 0 {
+                            player_one = state.buttons;
+                        }
+                        let published = if guest_input {
+                            state
+                        } else {
+                            NpadState {
+                                connected: state.connected,
+                                controller: state.controller,
+                                ..NpadState::default()
+                            }
+                        };
+                        thread_hub.publish(player, &published);
                     }
-                    let buttons = thread_hub.read(0).buttons;
+                    let buttons = player_one;
                     for ((action, combo), was_held) in combos.iter().zip(&mut held) {
                         let now = buttons.holds(combo);
                         if now && !*was_held {
@@ -123,7 +142,6 @@ impl Drop for InputWorker {
 mod tests {
     use super::*;
     use lichii_common::settings::Settings;
-    use lichii_input::NpadButtons;
     use std::sync::Mutex;
     use std::time::Instant;
 
@@ -147,7 +165,13 @@ mod tests {
         );
         let key = |n| Key::from_name(n).unwrap();
         worker.send(InputMsg::Key(key("KeyC"), true));
+        std::thread::sleep(POLL * 5);
+        assert!(worker.hub().read(0).connected);
+        assert!(worker.hub().read(0).buttons.is_empty());
+        worker.send(InputMsg::GuestInput(true));
         wait_for(|| worker.hub().read(0).buttons.contains(NpadButtons::A));
+        worker.send(InputMsg::GuestInput(false));
+        wait_for(|| worker.hub().read(0).buttons.is_empty());
 
         worker.send(InputMsg::Key(key("Backspace"), true));
         worker.send(InputMsg::Key(key("KeyM"), true));

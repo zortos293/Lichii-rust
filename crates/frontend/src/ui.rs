@@ -29,7 +29,11 @@ impl App {
         self.dialogs(ui.ctx(), actions);
         if let Some((_, at)) = &self.ui.toast {
             let left = crate::app::TOAST_TIME.saturating_sub(at.elapsed());
-            ui.ctx().request_repaint_after(left);
+            if left.is_zero() {
+                self.ui.toast = None;
+            } else {
+                ui.ctx().request_repaint_after(left);
+            }
         }
     }
 

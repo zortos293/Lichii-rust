@@ -19,21 +19,27 @@ use winit::event_loop::EventLoop;
 use crate::app::{App, UserEvent};
 use crate::cli::Command;
 
-/// Reads the settings without logging, so the log filter they hold applies to their warnings.
+/// Reads the settings without logging, so the log filter they hold applies to their warnings. A
+/// file that is not TOML is copied to `<file>.bak` first, because the defaults that replace it are
+/// saved on exit.
 fn read_settings(path: &Path) -> (Settings, Vec<String>) {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Settings::default(), vec![]),
         Err(e) => {
-            return (
-                Settings::default(),
-                vec![format!("reading {}: {e}", path.display())],
-            );
+            let warning = format!("reading {}: {e}", path.display());
+            return (Settings::default(), vec![warning]);
         }
     };
     Settings::from_toml(&text).unwrap_or_else(|e| {
+        let mut backup = path.as_os_str().to_owned();
+        backup.push(".bak");
+        let kept = match std::fs::copy(path, &backup) {
+            Ok(_) => format!("the original is kept as {}", backup.to_string_lossy()),
+            Err(copy) => format!("backing it up failed ({copy})"),
+        };
         let warning = format!(
-            "{} is not valid TOML ({e}); using default settings",
+            "{} is not valid TOML ({e}); using default settings, {kept}",
             path.display()
         );
         (Settings::default(), vec![warning])

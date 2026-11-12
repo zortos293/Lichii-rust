@@ -102,12 +102,9 @@ impl Presenter {
                     .update_texture(&self.device, &self.queue, *id, delta);
             }
         }
-        let texture = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) => t,
-            wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
-                self.surface.configure(&self.device, &self.config);
-                t
-            }
+        let (texture, suboptimal) = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) => (t, false),
+            wgpu::CurrentSurfaceTexture::Suboptimal(t) => (t, true),
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.config);
                 self.free(&mut frame);
@@ -155,6 +152,9 @@ impl Presenter {
             .submit(callbacks.into_iter().chain([encoder.finish()]));
         self.queue.present(texture);
         self.free(&mut frame);
+        if suboptimal {
+            self.surface.configure(&self.device, &self.config);
+        }
 
         let now = Instant::now();
         if let Some(last) = self.last_present.replace(now) {
