@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use lichii_common::{ConsoleGeneration, ResultCode};
@@ -22,6 +22,7 @@ struct Msg {
     ty: u16,
     pid: bool,
     copy: Vec<u32>,
+    moves: Vec<u32>,
     a: Vec<(u64, u64)>,
     b: Vec<(u64, u64)>,
     domain: Option<(u32, u32)>,
@@ -52,13 +53,18 @@ impl Msg {
             u32::from(self.ty) | (self.a.len() as u32) << 20 | (self.b.len() as u32) << 24,
             0,
         ];
-        let has_handles = self.pid || !self.copy.is_empty();
+        let has_handles = self.pid || !self.copy.is_empty() || !self.moves.is_empty();
         if has_handles {
-            w.push(u32::from(self.pid) | (self.copy.len() as u32) << 1);
+            w.push(
+                u32::from(self.pid)
+                    | (self.copy.len() as u32) << 1
+                    | (self.moves.len() as u32) << 5,
+            );
             if self.pid {
                 w.extend([0, 0]);
             }
             w.extend(&self.copy);
+            w.extend(&self.moves);
         }
         for &(addr, size) in self.a.iter().chain(&self.b) {
             w.push(size as u32);
@@ -101,12 +107,22 @@ fn call(
     msg: Msg,
     stash: Option<usize>,
 ) -> Script {
+    call_with(script, replies, handle, move |_| msg.clone(), stash)
+}
+
+/// Like [`call`], with a message built from the registers at run time.
+fn call_with(
+    script: Script,
+    replies: &Replies,
+    handle: usize,
+    msg: impl Fn(&ThreadContext) -> Msg + Send + Sync + 'static,
+    stash: Option<usize>,
+) -> Script {
     let replies = replies.clone();
-    let words = msg.encode();
     script
         .then(move |ctx, env| {
             env.memory
-                .write_bytes(ctx.tpidrro_el0, bytemuck::cast_slice(&words))
+                .write_bytes(ctx.tpidrro_el0, bytemuck::cast_slice(&msg(ctx).encode()))
                 .unwrap()
         })
         .svc(0x21, move |ctx, _| ctx.x[0] = ctx.x[handle])
@@ -160,6 +176,7 @@ impl SessionHandler for Counter {
 
 struct TestService {
     event: Arc<Event>,
+    deferred_once: AtomicBool,
 }
 
 impl SessionHandler for TestService {
@@ -199,6 +216,19 @@ impl SessionHandler for TestService {
                 ctx.push(1u32);
                 ResultCode(0x1234)
             }
+            6 => {
+                if !self.deferred_once.swap(true, Ordering::SeqCst) {
+                    let request = ctx.defer();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(20));
+                        request.retry();
+                    });
+                    return ResultCode::SUCCESS;
+                }
+                let moved = ctx.take_move_object(0).map(|object| object.type_name());
+                ctx.push(u32::from(moved == Some("KEvent")));
+                ResultCode::SUCCESS
+            }
             _ => UNKNOWN_COMMAND_ID,
         }
     }
@@ -214,6 +244,7 @@ fn register_test_service(test: &TestKernel, event: Arc<Event>) {
             Arc::new(move || {
                 Arc::new(TestService {
                     event: event.clone(),
+                    deferred_once: AtomicBool::new(false),
                 }) as Arc<dyn SessionHandler>
             }),
         )
@@ -477,4 +508,96 @@ fn get_service_waits_for_a_late_registration() {
     assert_eq!(r[1].0, 0);
     assert_ne!(r[1].1[3], 0);
     assert_eq!(r[2].1[..4], [17, 3, 0, 3]);
+}
+
+#[test]
+fn user_buffers_clones_and_deferred_move_handles() {
+    let test = TestKernel::new(ConsoleGeneration::Switch2);
+    let heap = heap_base(&test);
+    register_test_service(&test, Arc::new(Event::new()));
+    let replies = Replies::default();
+    let buffer = heap + 0x8000;
+    let mut s = connect_sm(Script::new(), heap + 0x3000);
+    s = call(
+        s,
+        &replies,
+        19,
+        Msg {
+            pid: true,
+            ..Msg::cmif(0, &[0, 0])
+        },
+        None,
+    );
+    s = call(s, &replies, 19, Msg::cmif(1, &name("test:u")), Some(20));
+    let user = replies.clone();
+    s = s
+        .then(move |_, env| {
+            let words = Msg::tipc(1, &[2, 0, 3, 0]).encode();
+            env.memory
+                .write_bytes(buffer, bytemuck::cast_slice(&words))
+                .unwrap()
+        })
+        .svc(0x22, move |ctx, _| {
+            ctx.x[0] = buffer;
+            ctx.x[1] = 0x1000;
+            ctx.x[2] = ctx.x[20];
+        })
+        .then(move |ctx, env| {
+            let mut words = vec![0u32; 8];
+            env.memory
+                .read_bytes(buffer, bytemuck::cast_slice_mut(&mut words))
+                .unwrap();
+            user.lock().push((ctx.x[0], words));
+        });
+    s = call(
+        s,
+        &replies,
+        20,
+        Msg {
+            ty: 5,
+            ..Msg::cmif(2, &[])
+        },
+        Some(23),
+    );
+    s = call(
+        s,
+        &replies,
+        23,
+        Msg {
+            ty: 2,
+            ..Msg::default()
+        },
+        None,
+    );
+    s = call(s, &replies, 20, Msg::cmif(1, &[1, 0, 1, 0]), None);
+    s = call(s, &replies, 23, Msg::cmif(1, &[1, 0, 1, 0]), None);
+    s = s.svc(0x45, |_, _| {}).then(|ctx, _| {
+        assert_eq!(ctx.x[0], 0, "CreateEvent failed");
+        ctx.x[24] = ctx.x[1];
+    });
+    s = call_with(
+        s,
+        &replies,
+        20,
+        |ctx| Msg {
+            moves: vec![ctx.x[24] as u32],
+            ..Msg::cmif(6, &[])
+        },
+        None,
+    );
+    let main = test.program(s.exit());
+    test.start(test.image(), main);
+    test.run_until_exit(Duration::from_secs(10));
+    let r = replies.lock().clone();
+    // SendSyncRequestWithUserBuffer: the reply is in the buffer.
+    assert_eq!(r[2].0, 0);
+    assert_eq!(r[2].1[..5], [17, 3, 0, 5, 0]);
+    // Closing a clone leaves the original open.
+    assert_eq!(r[3].0, 0);
+    assert_eq!(r[3].1[2], 1 << 5);
+    assert_eq!(r[4].0, 0);
+    assert_eq!((r[5].0, r[5].1[8]), (0, 2));
+    assert_eq!(r[6].0, u64::from(result::SESSION_CLOSED.0));
+    // A deferred request keeps the object of its move handle for the retry.
+    assert_eq!((r[7].0, r[7].1[6], r[7].1[8]), (0, 0, 1));
 }

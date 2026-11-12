@@ -14,6 +14,8 @@ This is the API the services crate uses to serve guest IPC. Everything lives in
    `SessionHandler::handle_request` with a [`HleRequestContext`].
 4. The kernel encodes the reply in the same buffer, installs the returned handles in the client's
    handle table and wakes the client thread with `x0 = 0`. The IPC result code is in the reply.
+   This happens under the client thread's lock: a client that was cancelled or terminated while
+   the handler ran gets nothing, and a reply that cannot be written is rolled back.
 
 Each service thread handles one request at a time and reuses one context, so pops, pushes and
 descriptor lookups allocate nothing. Handlers on different service threads run in parallel with
@@ -111,7 +113,8 @@ Handles come out in the order they were pushed, copies before moves, as HIPC lay
 
 `let request = ctx.defer();` keeps the client blocked. Later, from any thread, call
 `request.retry()`: the original message runs through the same session's handler again, on its
-service thread, and that run replies. Dropping the `DeferredRequest` instead fails the client's
+service thread, and that run replies. The retry sees the same copy and move objects (move handles
+are taken from the client only once). Dropping the `DeferredRequest` instead fails the client's
 `SendSyncRequest` with `SessionClosed`. `sm:` uses this to defer `GetServiceHandle`.
 
 ### Sessions you create yourself
@@ -124,7 +127,7 @@ specially built session; `push_interface` is the usual way.
 
 - **CMIF control (type 5/7):** `ConvertCurrentObjectToDomain` (returns object id 1),
   `CopyFromCurrentDomain`, `CloneCurrentObject`/`CloneCurrentObjectEx` (the clone shares the
-  server end) and `QueryPointerBufferSize` (0x8000).
+  handler and domain but closes on its own) and `QueryPointerBufferSize` (0x8000).
 - **Domains:** `SendMessage` routes to the object id in the domain header;
   `CloseVirtualHandle` drops the object. Object ids start at 1 and freed ids are reused. Domain
   replies carry the domain header and list the new object ids after the data.

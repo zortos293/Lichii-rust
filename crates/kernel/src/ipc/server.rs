@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
 use lichii_common::{ResultCode, VAddr};
@@ -26,6 +27,18 @@ pub(crate) struct Pending {
     token: u64,
     message: VAddr,
     size: usize,
+    /// Copy and move objects already taken from the client, kept by a deferred request so a
+    /// retry does not translate the handles again.
+    inputs: Option<(InputObjects, InputObjects)>,
+}
+
+/// Objects behind a request's copy or move handles, in order (`None` for handle 0).
+type InputObjects = Vec<Option<KObject>>;
+
+impl Pending {
+    pub(crate) fn keep_inputs(&mut self, copies: InputObjects, moves: InputObjects) {
+        self.inputs = Some((copies, moves));
+    }
 }
 
 struct Queue {
@@ -63,11 +76,12 @@ impl ServiceThread {
     /// A new session served by this thread. Hand it to the guest with
     /// [`HleRequestContext::push_move_object`] or put it in a handle table.
     pub fn session(&self, handler: Arc<dyn SessionHandler>) -> Arc<ClientSession> {
+        let server = Arc::new(Server {
+            thread: self.clone(),
+            target: Mutex::new(Target::Single(handler)),
+        });
         Arc::new(ClientSession {
-            session: Arc::new(HleSession {
-                server: self.clone(),
-                target: Mutex::new(Some(Target::Single(handler))),
-            }),
+            session: HleSession::new(server),
         })
     }
 
@@ -130,16 +144,20 @@ impl ServiceThread {
         ctx.copy_objects.clear();
         ctx.move_objects.clear();
         clear_outputs(ctx);
-        match outcome {
-            Ok(true) => thread.wake(token, WakeResult::SUCCESS),
-            Ok(false) => false,
-            Err(code) => thread.wake(token, WakeResult::error(code)),
-        };
+        if let Err(code) = outcome {
+            thread.wake(token, WakeResult::error(code));
+        }
     }
 
-    /// Runs one request. `Ok(false)` when the handler deferred it.
-    fn dispatch(&self, ctx: &mut HleRequestContext, pending: Pending) -> Result<bool, ResultCode> {
+    /// Runs one request. On success the client was woken with the reply, or the handler
+    /// deferred the request.
+    fn dispatch(
+        &self,
+        ctx: &mut HleRequestContext,
+        mut pending: Pending,
+    ) -> Result<(), ResultCode> {
         let session = pending.session.clone();
+        let server = session.server.clone();
         let thread = pending.thread.clone();
         let process = thread.process().clone();
         let words = pending.size.min(MAX_MESSAGE) / 4;
@@ -153,13 +171,17 @@ impl ServiceThread {
         ctx.request.parse(&ctx.message, domain)?;
         if matches!(ctx.request.ty, CommandType::Close | CommandType::TipcClose) {
             session.close();
-            return Ok(true);
+            thread.wake(pending.token, WakeResult::SUCCESS);
+            return Ok(());
         }
         ctx.domain = domain;
         ctx.cursor = 0;
         ctx.thread = Some(thread.clone());
         ctx.server = Some(self.clone());
-        {
+        if let Some((copies, moves)) = pending.inputs.take() {
+            ctx.copy_objects = copies;
+            ctx.move_objects = moves;
+        } else {
             let mut table = process.handles().write();
             for &handle in &ctx.request.copy_handles {
                 let object = match handle {
@@ -183,24 +205,23 @@ impl ServiceThread {
             CommandType::Control | CommandType::ControlWithContext => control(ctx, &session),
             _ => match ctx.request.domain {
                 Some((DomainCommand::CloseVirtualHandle, id)) => {
-                    session.remove_object(id);
+                    drop(server.remove_object(id));
                     ResultCode::SUCCESS
                 }
-                Some((DomainCommand::SendMessage, id)) => match session.object(id) {
+                Some((DomainCommand::SendMessage, id)) => match server.object(id) {
                     Some(handler) => handler.handle_request(ctx),
                     None => result::NOT_FOUND,
                 },
-                None => match session.handler() {
+                None => match server.handler() {
                     Some(handler) => handler.handle_request(ctx),
                     None => result::SESSION_CLOSED,
                 },
             },
         };
         let Some(pending) = ctx.pending.take() else {
-            return Ok(false);
+            return Ok(());
         };
-        reply(ctx, &session, &pending, code)?;
-        Ok(true)
+        reply(ctx, &server, &pending, code)
     }
 }
 
@@ -214,7 +235,7 @@ fn clear_outputs(ctx: &mut HleRequestContext) {
 /// Session control requests (CMIF type 5): domains, cloning and the pointer buffer size.
 fn control(ctx: &mut HleRequestContext, session: &Arc<HleSession>) -> ResultCode {
     match ctx.request.command {
-        0 => match session.convert_to_domain() {
+        0 => match session.server.convert_to_domain() {
             Some(id) => {
                 ctx.push(id);
                 ResultCode::SUCCESS
@@ -223,16 +244,16 @@ fn control(ctx: &mut HleRequestContext, session: &Arc<HleSession>) -> ResultCode
         },
         1 => {
             let id: u32 = ctx.pop();
-            let Some(handler) = session.object(id) else {
+            let Some(handler) = session.server.object(id) else {
                 return result::NOT_FOUND;
             };
-            let copy = session.server.session(handler);
+            let copy = session.server.thread.session(handler);
             ctx.push_move_object(KObject::ClientSession(copy));
             ResultCode::SUCCESS
         }
         2 | 4 => {
             let clone = Arc::new(ClientSession {
-                session: session.clone(),
+                session: HleSession::new(session.server.clone()),
             });
             ctx.push_move_object(KObject::ClientSession(clone));
             ResultCode::SUCCESS
@@ -248,10 +269,12 @@ fn control(ctx: &mut HleRequestContext, session: &Arc<HleSession>) -> ResultCode
     }
 }
 
-/// Writes the reply into the client's message buffer, installing returned handles in its table.
+/// Writes the reply into the client's message buffer, installs the returned handles in its table
+/// and wakes it, all under the client thread's lock: a client that was cancelled or terminated
+/// meanwhile gets nothing, and a reply that cannot be written is rolled back.
 fn reply(
     ctx: &mut HleRequestContext,
-    session: &HleSession,
+    server: &Server,
     pending: &Pending,
     code: ResultCode,
 ) -> Result<(), ResultCode> {
@@ -286,29 +309,56 @@ fn reply(
         return Err(result::MESSAGE_TOO_LARGE);
     }
     let process = pending.thread.process();
+    let installed = HANDLES_OFFSET..HANDLES_OFFSET + copies + moves;
+    let mut undone = Vec::new();
+    let mut s = pending.thread.sched.lock();
+    if s.wait != pending.token {
+        return Ok(());
+    }
     {
         let mut table = process.handles().write();
-        let objects = ctx.out_copy.drain(..).chain(ctx.out_move.drain(..));
-        for (i, object) in objects.enumerate() {
+        let returned = ctx.out_copy.drain(..).chain(ctx.out_move.drain(..));
+        for (i, object) in returned.enumerate() {
             match table.add(object) {
                 Ok(handle) => ctx.reply[HANDLES_OFFSET + i] = handle,
                 Err(code) => {
                     for &handle in &ctx.reply[HANDLES_OFFSET..HANDLES_OFFSET + i] {
-                        table.remove(handle);
+                        undone.extend(table.remove(handle));
                     }
+                    drop(table);
+                    drop(s);
+                    drop(undone);
                     return Err(code);
                 }
             }
         }
     }
+    let object_ids = ctx.reply.len() - objects..ctx.reply.len();
     if objects != 0 {
-        let start = ctx.reply.len() - objects;
-        session.add_objects(ctx.out_objects.drain(..), &mut ctx.reply[start..]);
+        server.add_objects(
+            ctx.out_objects.drain(..),
+            &mut ctx.reply[object_ids.clone()],
+        );
     }
-    process
+    let written = process
         .memory()
-        .write_bytes(pending.message, bytemuck::cast_slice(&ctx.reply))
-        .map_err(|_| result::INVALID_CURRENT_MEMORY)
+        .write_bytes(pending.message, bytemuck::cast_slice(&ctx.reply));
+    if written.is_err() {
+        let mut table = process.handles().write();
+        for &handle in &ctx.reply[installed] {
+            undone.extend(table.remove(handle));
+        }
+        drop(table);
+        let removed: Vec<_> = ctx.reply[object_ids]
+            .iter()
+            .filter_map(|&id| server.remove_object(id))
+            .collect();
+        drop(s);
+        drop((undone, removed));
+        return Err(result::INVALID_CURRENT_MEMORY);
+    }
+    pending.thread.wake_locked(&mut s, WakeResult::SUCCESS);
+    Ok(())
 }
 
 enum Target {
@@ -317,26 +367,26 @@ enum Target {
     Domain(Vec<Option<Arc<dyn SessionHandler>>>),
 }
 
-/// The server end of an HLE session. `None` once the client closed it.
-struct HleSession {
-    server: ServiceThread,
-    target: Mutex<Option<Target>>,
+/// What the client ends of one session share: its service thread and handler (or domain).
+struct Server {
+    thread: ServiceThread,
+    target: Mutex<Target>,
 }
 
-impl HleSession {
-    fn is_domain(&self) -> Option<bool> {
-        Some(matches!(self.target.lock().as_ref()?, Target::Domain(_)))
+impl Server {
+    fn is_domain(&self) -> bool {
+        matches!(*self.target.lock(), Target::Domain(_))
     }
 
     fn handler(&self) -> Option<Arc<dyn SessionHandler>> {
-        match self.target.lock().as_ref()? {
+        match &*self.target.lock() {
             Target::Single(handler) => Some(handler.clone()),
             Target::Domain(_) => None,
         }
     }
 
     fn object(&self, id: u32) -> Option<Arc<dyn SessionHandler>> {
-        match self.target.lock().as_ref()? {
+        match &*self.target.lock() {
             Target::Domain(objects) => objects
                 .get((id as usize).checked_sub(1)?)?
                 .as_ref()
@@ -345,13 +395,11 @@ impl HleSession {
         }
     }
 
-    fn remove_object(&self, id: u32) {
-        if let Some(Target::Domain(objects)) = self.target.lock().as_mut()
-            && let Some(slot) = (id as usize)
-                .checked_sub(1)
-                .and_then(|index| objects.get_mut(index))
-        {
-            slot.take();
+    /// Removes a domain object; the caller drops it outside the lock.
+    fn remove_object(&self, id: u32) -> Option<Arc<dyn SessionHandler>> {
+        match &mut *self.target.lock() {
+            Target::Domain(objects) => objects.get_mut((id as usize).checked_sub(1)?)?.take(),
+            Target::Single(_) => None,
         }
     }
 
@@ -361,7 +409,7 @@ impl HleSession {
         ids: &mut [u32],
     ) {
         let mut target = self.target.lock();
-        let Some(Target::Domain(objects)) = target.as_mut() else {
+        let Target::Domain(objects) = &mut *target else {
             return;
         };
         for (handler, id) in handlers.zip(ids) {
@@ -381,21 +429,35 @@ impl HleSession {
 
     fn convert_to_domain(&self) -> Option<u32> {
         let mut target = self.target.lock();
-        match target.take()? {
-            Target::Single(handler) => {
-                *target = Some(Target::Domain(vec![Some(handler)]));
-                Some(1)
-            }
-            domain => {
-                *target = Some(domain);
-                None
-            }
-        }
+        let Target::Single(handler) = &*target else {
+            return None;
+        };
+        *target = Target::Domain(vec![Some(handler.clone())]);
+        Some(1)
+    }
+}
+
+/// One client end of a session. Clones share the [`Server`] but close independently.
+struct HleSession {
+    server: Arc<Server>,
+    closed: AtomicBool,
+}
+
+impl HleSession {
+    fn new(server: Arc<Server>) -> Arc<Self> {
+        Arc::new(Self {
+            server,
+            closed: AtomicBool::new(false),
+        })
+    }
+
+    /// Whether the session is a domain; `None` once this end was closed.
+    fn is_domain(&self) -> Option<bool> {
+        (!self.closed.load(Ordering::Acquire)).then(|| self.server.is_domain())
     }
 
     fn close(&self) {
-        let closed = self.target.lock().take();
-        drop(closed);
+        self.closed.store(true, Ordering::Release);
     }
 }
 
@@ -408,22 +470,22 @@ pub struct ClientSession {
 impl ClientSession {
     /// Name of the handler behind the session, for logs.
     pub fn name(&self) -> String {
-        match self.session.target.lock().as_ref() {
-            Some(Target::Single(handler)) => handler.name().into(),
-            Some(Target::Domain(_)) => "domain".into(),
-            None => "closed".into(),
+        match &*self.session.server.target.lock() {
+            Target::Single(handler) => handler.name().into(),
+            Target::Domain(_) => "domain".into(),
         }
     }
 
     /// Queues a request whose message is at `message` (`size` bytes) in `thread`'s process.
     /// The thread must be in the wait `token`; the service thread wakes it with the result.
     pub(crate) fn send(&self, thread: Arc<Thread>, token: u64, message: VAddr, size: usize) {
-        self.session.server.submit(Pending {
+        self.session.server.thread.submit(Pending {
             session: self.session.clone(),
             thread,
             token,
             message,
             size,
+            inputs: None,
         });
     }
 }
@@ -443,7 +505,7 @@ impl DeferredRequest {
     /// Runs the request through its session's handler again, on the session's service thread.
     pub fn retry(mut self) {
         if let Some(pending) = self.pending.take() {
-            pending.session.server.clone().submit(pending);
+            pending.session.server.thread.clone().submit(pending);
         }
     }
 }
