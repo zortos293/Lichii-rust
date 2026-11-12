@@ -552,10 +552,10 @@ fn indirect_draw_applies_the_topology_override() {
 }
 
 #[test]
-fn inline_indices_never_grow_the_buffer() {
+fn inline_indices_keep_their_buffer_and_draw_every_index() {
     let mut b = Bench::new();
     let capacity = b.engine.draw.inline_indices.capacity();
-    assert!(capacity >= draw::MAX_INLINE_INDICES);
+    assert!(capacity >= draw::INLINE_INDEX_CAPACITY);
 
     b.begin(PrimitiveTopology::TRIANGLES, false);
     b.multi(draw::INLINE_INDEX_4X8, &vec![0x0302_0100; 1025]);
@@ -568,17 +568,23 @@ fn inline_indices_never_grow_the_buffer() {
     assert_eq!(b.engine.draw.inline_indices.capacity(), capacity);
 
     b.begin(PrimitiveTopology::TRIANGLES, false);
-    let words = vec![0x0001_0000; draw::MAX_INLINE_INDICES / 2];
-    b.multi(draw::INLINE_INDEX_2X16, &words);
-    b.multi(draw::INLINE_INDEX_2X16, &words);
-    b.multi(draw::DRAW_INLINE_INDEX, &[7; 16]);
-    b.end();
-    let events = b.take();
-    let [Event::Draw { draw, .. }] = events.as_slice() else {
-        panic!("one draw expected, got {events:?}");
+    let words = vec![0x0001_0000; draw::INLINE_INDEX_CAPACITY / 2];
+    let large = |b: &mut Bench| {
+        b.begin(PrimitiveTopology::TRIANGLES, false);
+        b.multi(draw::INLINE_INDEX_2X16, &words);
+        b.multi(draw::INLINE_INDEX_2X16, &words);
+        b.multi(draw::DRAW_INLINE_INDEX, &[7; 16]);
+        b.end();
+        let events = b.take();
+        let [Event::Draw { draw, .. }] = events.as_slice() else {
+            panic!("one draw expected, got {events:?}");
+        };
+        assert_eq!(draw.count as usize, 2 * draw::INLINE_INDEX_CAPACITY + 16);
+        b.engine.draw.inline_indices.capacity()
     };
-    assert_eq!(draw.count as usize, draw::MAX_INLINE_INDICES);
-    assert_eq!(b.engine.draw.inline_indices.capacity(), capacity);
+    let grown = large(&mut b);
+    assert!(grown > capacity);
+    assert_eq!(large(&mut b), grown);
 }
 
 #[test]
