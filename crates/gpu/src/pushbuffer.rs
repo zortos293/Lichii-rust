@@ -1,10 +1,9 @@
 //! Pushbuffer parsing: GPFIFO entries, command headers and the method stream they encode.
 //!
 //! The parser keeps the method state of the hardware's PBDMA (current method, subchannel, words
-//! left, increment mode) across GPFIFO entries, since NVN ends entries inside a method's data and
-//! continues it in the next one (NX2_NOTES rows 51, 56, 73). An entry that does not start where
-//! the unfinished method's entry ended is a called buffer: the unfinished method is parked under
-//! the address where its data continues and resumed when an entry starts there.
+//! left, increment mode) across GPFIFO entries, wherever the next entry is: NVN ends entries
+//! inside a method's data and continues it in the next one, a subroutine entry elsewhere in
+//! memory included (NX2_NOTES rows 51, 73).
 
 use lichii_common::GpuVAddr;
 
@@ -16,12 +15,13 @@ pub struct GpEntry(pub u64);
 
 impl GpEntry {
     pub const fn new(address: GpuVAddr, words: u32) -> Self {
-        Self((address & ((1 << 40) - 1)) | (((words as u64) & 0x1f_ffff) << 42))
+        Self((address & ((1 << 40) - 4)) | (((words as u64) & 0x1f_ffff) << 42))
     }
 
+    /// GET[39:2]; bits 0 and 1 are the FETCH flags, not address bits.
     #[inline]
     pub const fn address(self) -> GpuVAddr {
-        self.0 & ((1 << 40) - 1)
+        self.0 & ((1 << 40) - 4)
     }
 
     #[inline]
@@ -127,14 +127,6 @@ struct MethodState {
     increment_once: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Parked {
-    resume_address: GpuVAddr,
-    state: MethodState,
-}
-
-const MAX_PARKED: usize = 8;
-
 /// Where a partly processed entry stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Resume {
@@ -147,43 +139,11 @@ pub struct Resume {
 #[derive(Default)]
 pub struct CommandParser {
     state: MethodState,
-    entry_end: GpuVAddr,
-    parked: Vec<Parked>,
 }
 
 impl CommandParser {
     pub fn new() -> Self {
-        Self {
-            parked: Vec::with_capacity(MAX_PARKED),
-            ..Self::default()
-        }
-    }
-
-    /// Called before the first word of an entry at `address`.
-    pub fn begin_entry(&mut self, address: GpuVAddr, words: u32) {
-        let resumed = self
-            .parked
-            .iter()
-            .position(|p| p.resume_address == address)
-            .map(|i| self.parked.remove(i).state);
-        if self.state.count != 0 && address != self.entry_end {
-            if self.parked.len() == MAX_PARKED {
-                tracing::warn!(
-                    method = self.parked[0].state.method,
-                    "dropping a parked split method"
-                );
-                self.parked.remove(0);
-            }
-            self.parked.push(Parked {
-                resume_address: self.entry_end,
-                state: self.state,
-            });
-            self.state = MethodState::default();
-        }
-        if let Some(state) = resumed {
-            self.state = state;
-        }
-        self.entry_end = address + u64::from(words) * 4;
+        Self::default()
     }
 
     /// Feeds words of the current entry. Returns how many were consumed: all of them, or fewer
@@ -290,7 +250,6 @@ mod tests {
         ];
         let mut parser = CommandParser::new();
         let mut rec = Recorder::default();
-        parser.begin_entry(0x1000, words.len() as u32);
         assert_eq!(parser.process(&words, &mut rec), words.len());
         assert_eq!(
             rec.calls,
@@ -315,7 +274,6 @@ mod tests {
             suspend_on: Some(0x11),
             ..Recorder::default()
         };
-        parser.begin_entry(0x1000, 4);
         assert_eq!(parser.process(&words, &mut rec), 3);
         assert_eq!(parser.process(&words[3..], &mut rec), 1);
         assert_eq!(rec.calls, vec![(0, 0x10, 1), (0, 0x11, 2), (0, 0x12, 3)]);
@@ -325,26 +283,21 @@ mod tests {
     fn method_data_continues_into_the_next_entry() {
         let mut parser = CommandParser::new();
         let mut rec = Recorder::default();
-        parser.begin_entry(0x1000, 2);
         parser.process(&[h(SubmissionMode::Increasing, 0, 0x10, 3), 1], &mut rec);
-        parser.begin_entry(0x1008, 2);
         parser.process(&[2, 3], &mut rec);
         assert_eq!(rec.calls, vec![(0, 0x10, 1), (0, 0x11, 2), (0, 0x12, 3)]);
     }
 
     #[test]
-    fn called_buffer_parks_the_split_method() {
+    fn method_data_continues_into_an_entry_elsewhere() {
         let mut parser = CommandParser::new();
         let mut rec = Recorder::default();
-        parser.begin_entry(0x1000, 2);
         parser.process(&[h(SubmissionMode::NonIncreasing, 0, 0x10, 3), 1], &mut rec);
-        parser.begin_entry(0x9000, 2);
-        parser.process(&[h(SubmissionMode::Increasing, 1, 0x20, 1), 7], &mut rec);
-        parser.begin_entry(0x1008, 2);
         parser.process(&[2, 3], &mut rec);
+        parser.process(&[h(SubmissionMode::Increasing, 1, 0x20, 1), 7], &mut rec);
         assert_eq!(
             rec.calls,
-            vec![(0, 0x10, 1), (1, 0x20, 7), (0, 0x10, 2), (0, 0x10, 3)]
+            vec![(0, 0x10, 1), (0, 0x10, 2), (0, 0x10, 3), (1, 0x20, 7)]
         );
         assert!(!parser.in_method());
     }
@@ -355,5 +308,12 @@ mod tests {
         assert_eq!(e.address(), 0x12_3456_7890);
         assert_eq!(e.words(), 0x400);
         assert!(!e.sync());
+    }
+
+    #[test]
+    fn gp_entry_fetch_flags_are_not_address_bits() {
+        let conditional_fetch = GpEntry(0x1000 | 1 | (8 << 42));
+        assert_eq!(conditional_fetch.address(), 0x1000);
+        assert_eq!(conditional_fetch.words(), 8);
     }
 }

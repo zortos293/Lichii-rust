@@ -1,9 +1,9 @@
 //! Host class (puller) methods: subchannel binds, semaphores, syncpoints, reference counts and
 //! wait-for-idle. Methods below 0x40 of every subchannel go here.
 //!
-//! Maxwell channels use the B06F host class (semaphores through SEMAPHOREA..D); Switch 2
-//! channels use the Ampere C56F class, which adds SEM_ADDR/SEM_PAYLOAD/SEM_EXECUTE at
-//! 0x17..0x1B (NX2_NOTES rows 50, 52).
+//! Maxwell channels use the B06F host class (semaphores through SEMAPHOREA..D, and the legacy
+//! SEMAPHORE_ACQUIRE/RELEASE at 0x1A/0x1B); Switch 2 channels use the Ampere C56F class, which
+//! puts SEM_ADDR/SEM_PAYLOAD/SEM_EXECUTE at 0x17..0x1B instead (NX2_NOTES rows 50, 52).
 
 use lichii_common::GpuVAddr;
 
@@ -23,6 +23,8 @@ mod method {
     pub const SEM_PAYLOAD_LO: u32 = 0x19;
     pub const SEM_PAYLOAD_HI: u32 = 0x1a;
     pub const SEM_EXECUTE: u32 = 0x1b;
+    pub const SEMAPHORE_ACQUIRE: u32 = 0x1a;
+    pub const SEMAPHORE_RELEASE: u32 = 0x1b;
     pub const SYNCPOINT_A: u32 = 0x1c;
     pub const SYNCPOINT_B: u32 = 0x1d;
     pub const WFI: u32 = 0x1e;
@@ -212,6 +214,17 @@ impl HostState {
             },
             method::SEMAPHORE_D => self.semaphore_d(argument),
             method::SEM_EXECUTE if self.class == HostClass::Ampere => self.sem_execute(argument),
+            method::SEMAPHORE_ACQUIRE if self.class == HostClass::Maxwell => HostAction::Acquire {
+                address: self.semaphore_address(),
+                payload: u64::from(argument),
+                op: AcquireOp::Equal,
+                wide: false,
+            },
+            method::SEMAPHORE_RELEASE if self.class == HostClass::Maxwell => HostAction::Release {
+                address: self.semaphore_address(),
+                payload: u64::from(argument),
+                kind: ReleaseKind::Four,
+            },
             method::SYNCPOINT_B => {
                 let id = (argument >> 8) & 0xfff;
                 if argument & 1 != 0 {
@@ -234,9 +247,13 @@ impl HostState {
         self.regs[method as usize]
     }
 
+    fn semaphore_address(&self) -> GpuVAddr {
+        (u64::from(self.reg(method::SEMAPHORE_A) & 0xff) << 32)
+            | u64::from(self.reg(method::SEMAPHORE_B) & !3)
+    }
+
     fn semaphore_d(&self, argument: u32) -> HostAction {
-        let address = (u64::from(self.reg(method::SEMAPHORE_A) & 0xff) << 32)
-            | u64::from(self.reg(method::SEMAPHORE_B) & !3);
+        let address = self.semaphore_address();
         let payload = self.reg(method::SEMAPHORE_C);
         let acquire = |op| HostAction::Acquire {
             address,
@@ -318,6 +335,32 @@ impl HostState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maxwell_legacy_semaphore_acquire_and_release() {
+        let mut host = HostState::new(HostClass::Maxwell);
+        host.call(0, method::SEMAPHORE_A, 0x12);
+        host.call(0, method::SEMAPHORE_B, 0x3456_7893);
+        assert_eq!(
+            host.call(0, method::SEMAPHORE_ACQUIRE, 5),
+            HostAction::Acquire {
+                address: 0x12_3456_7890,
+                payload: 5,
+                op: AcquireOp::Equal,
+                wide: false
+            }
+        );
+        assert_eq!(
+            host.call(0, method::SEMAPHORE_RELEASE, 6),
+            HostAction::Release {
+                address: 0x12_3456_7890,
+                payload: 6,
+                kind: ReleaseKind::Four
+            }
+        );
+        let mut ampere = HostState::new(HostClass::Ampere);
+        assert_eq!(ampere.call(0, method::SEM_PAYLOAD_HI, 5), HostAction::None);
+    }
 
     #[test]
     fn maxwell_semaphores() {

@@ -285,13 +285,23 @@ pub trait Rasterizer: Send {
     /// A channel was destroyed; drop its caches.
     fn release_channel(&mut self, _channel: ChannelId) {}
 
+    /// Records one direct draw with the pipeline, render targets and bindings `ctx.regs`
+    /// describes. The renderer reads only the state `ctx.dirty` flags as changed since its last
+    /// call and clears the flags it consumed; the GPU sets them again on the next writes. Guest
+    /// memory the draw reads (vertex, index, constant and texture data) is read through
+    /// `ctx.memory` during the call; nothing borrowed from `ctx` or `draw` outlives it.
     fn draw(&mut self, ctx: &mut GraphicsContext<'_>, draw: &DrawParams<'_>);
 
+    /// Records draws whose commands, and optionally whose count, the GPU reads from guest memory
+    /// when it executes them. State handling is the same as for [`Rasterizer::draw`].
     fn draw_indirect(&mut self, ctx: &mut GraphicsContext<'_>, draw: &IndirectDraw);
 
     /// Clears the render targets `regs.clear_surface` selects, over `layer_count` layers.
     fn clear(&mut self, ctx: &mut GraphicsContext<'_>, layer_count: u32);
 
+    /// Records one compute dispatch decoded from a launch descriptor. The context carries the
+    /// whole launch, so compute has no dirty tracking; the renderer caches pipelines by
+    /// `ctx.program` itself.
     fn dispatch_compute(&mut self, ctx: &ComputeContext<'_>);
 
     /// Copies `size` bytes between linear buffers on the host GPU. `false` makes the GPU copy
