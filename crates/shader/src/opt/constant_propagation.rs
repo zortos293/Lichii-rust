@@ -9,8 +9,8 @@ use rustc_hash::FxHashMap;
 use crate::ShaderEnvironment;
 use crate::info::ReplaceConstant;
 use crate::ir::{
-    Attribute, Emitter, FpControl, InstId, Opcode, Program, TextureInstInfo, TextureType, Type,
-    Value,
+    Attribute, Emitter, FmzMode, FpControl, FpRounding, InstId, Opcode, Program, TextureInstInfo,
+    TextureType, Type, Value,
 };
 
 const PSEUDO_OPS: [Opcode; 6] = [
@@ -136,7 +136,6 @@ fn fold(env: &dyn ShaderEnvironment, prog: &mut Program, memo: &mut Memo, id: In
         BitCastF32U32 => fold_bitcast(prog, id, BitCastU32F32),
         BitCastU32F32 => fold_bitcast(prog, id, BitCastF32U32),
         PackHalf2x16 => fold_inverse(prog, id, UnpackHalf2x16),
-        UnpackHalf2x16 => fold_inverse(prog, id, PackHalf2x16),
         PackFloat2x16 => fold_inverse(prog, id, UnpackFloat2x16),
         UnpackFloat2x16 => fold_inverse(prog, id, PackFloat2x16),
         SelectU1 | SelectU8 | SelectU16 | SelectU32 | SelectU64 | SelectF16 | SelectF32
@@ -503,10 +502,39 @@ fn fold_isub32(prog: &mut Program, id: InstId) {
     }
 }
 
+/// Folds an F32 operation of two immediates the way the guest computes it. Only
+/// round-to-nearest folds (host arithmetic rounds that way); under FTZ and FMZ, denormal inputs
+/// and results flush to zero, and under FMZ a zero factor gives zero.
+fn fold_f32_pair(prog: &mut Program, id: InstId, is_mul: bool) -> bool {
+    let control = FpControl::from_flags(prog.inst(id).flags);
+    if !matches!(control.rounding, FpRounding::DontCare | FpRounding::Rn) {
+        return false;
+    }
+    let flush = matches!(control.fmz_mode, FmzMode::Ftz | FmzMode::Fmz);
+    let flushed = |x: f32| {
+        if flush && x.is_subnormal() {
+            0.0f32.copysign(x)
+        } else {
+            x
+        }
+    };
+    fold_immediates(prog, id, |a| {
+        let (x, y) = (flushed(a[0].imm_f32()?), flushed(a[1].imm_f32()?));
+        let result = match is_mul {
+            true if control.fmz_mode == FmzMode::Fmz && (x == 0.0 || y == 0.0) => 0.0,
+            true => x * y,
+            false => x + y,
+        };
+        Some(Value::F32(flushed(result)))
+    })
+}
+
 fn fold_fp_add32(prog: &mut Program, id: InstId) {
-    if fold_immediates(prog, id, |a| {
-        Some(Value::F32(a[0].imm_f32()? + a[1].imm_f32()?))
-    }) {
+    if fold_f32_pair(prog, id, false) {
+        return;
+    }
+    let control = FpControl::from_flags(prog.inst(id).flags);
+    if matches!(control.fmz_mode, FmzMode::Ftz | FmzMode::Fmz) {
         return;
     }
     let neutral = |v: Value| v.is_immediate() && v.imm_f32() == Some(0.0);
@@ -522,9 +550,7 @@ fn fold_fp_add32(prog: &mut Program, id: InstId) {
 /// `(x * attr) * FPRecip32(attr)` of the same attribute is `x` (perspective interpolation).
 fn fold_fp_mul32(prog: &mut Program, id: InstId) {
     use Opcode::*;
-    if fold_immediates(prog, id, |a| {
-        Some(Value::F32(a[0].imm_f32()? * a[1].imm_f32()?))
-    }) {
+    if fold_f32_pair(prog, id, true) {
         return;
     }
     if FpControl::from_flags(prog.inst(id).flags).no_contraction {

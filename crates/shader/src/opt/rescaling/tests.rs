@@ -230,10 +230,12 @@ fn shuffled_frag_coord_scales_after_the_shuffle() {
 
     assert_eq!(prog.op(get), Opcode::GetAttribute);
     assert_eq!(prog.arg(bits, 0), Value::Inst(get));
-    let scaled = used(&prog, r);
+    let result = used(&prog, r);
+    assert_eq!(prog.op(result), Opcode::BitCastU32F32);
+    let scaled = arg_inst(&prog, result, 0);
     assert_eq!(prog.op(scaled), Opcode::FPMul32);
     let value = arg_inst(&prog, scaled, 0);
-    assert_eq!(prog.op(value), Opcode::ConvertF32U32);
+    assert_eq!(prog.op(value), Opcode::BitCastF32U32);
     let copy = arg_inst(&prog, value, 0);
     assert_eq!(prog.op(copy), Opcode::ShuffleIndex);
     assert_eq!(prog.arg(copy, 0), Value::Inst(bits));

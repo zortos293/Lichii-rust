@@ -22,8 +22,12 @@ fn shf(t: &mut Translator<'_>, shift: Value, high_bits: Value, right_shift: bool
         63
     });
     let safe_shift = if insn.bit(50) {
-        let mask = t.ir.isub(max_shift, Value::U32(1));
-        t.ir.bitwise_and(shift, mask)
+        let mask = if max_shift_mode == MAX_SHIFT_U32 {
+            31
+        } else {
+            63
+        };
+        t.ir.bitwise_and(shift, Value::U32(mask))
     } else {
         t.ir.imin(shift, max_shift, false)
     };
@@ -142,12 +146,11 @@ mod tests {
   %1 = GetRegister R1
   %2 = CompositeConstructU32x2 %1, %0
   %3 = PackUint2x32 %2
-  %4 = ISub32 #0x3f, #0x1
-  %5 = BitwiseAnd32 #0x60005, %4
-  %6 = ShiftRightArithmetic64 %3, %5
-  %7 = UnpackUint2x32 %6
-  %8 = CompositeExtractU32x2 %7, #0x0
-  SetRegister R0, %8
+  %4 = BitwiseAnd32 #0x60005, #0x3f
+  %5 = ShiftRightArithmetic64 %3, %4
+  %6 = UnpackUint2x32 %5
+  %7 = CompositeExtractU32x2 %6, #0x0
+  SetRegister R0, %7
 ";
         assert_eq!(translate(&[insn]).unwrap(), expected);
     }

@@ -244,22 +244,35 @@ fn shift64(e: &mut Emitter, op: Opcode, value: Value, shift: Value) -> Value {
 
 const TWO_POW_32: f32 = 4_294_967_296.0;
 
+/// The arithmetic runs in F64 when the destination is F64 (the host then has float64), else
+/// in F32.
 fn int64_to_float(e: &mut Emitter, value: Value, signed: bool, dst_bits: u32) -> Value {
     let control = FpControl::default();
     let (lo, hi) = unpack(e, value);
-    let low = e.convert_i_to_f(32, 32, false, lo, control);
-    let high = e.convert_i_to_f(32, 32, signed, hi, control);
-    let combined = e.fp_fma(high, Value::F32(TWO_POW_32), low, control);
+    let (bits, two_pow_32) = match dst_bits {
+        64 => (64, Value::F64(f64::from(TWO_POW_32))),
+        _ => (32, Value::F32(TWO_POW_32)),
+    };
+    let low = e.convert_i_to_f(bits, 32, false, lo, control);
+    let high = e.convert_i_to_f(bits, 32, signed, hi, control);
+    let combined = e.fp_fma(high, two_pow_32, low, control);
     e.fp_convert(dst_bits, combined, control)
 }
 
+/// The arithmetic runs in F64 for an F64 source, else in F32.
 fn float_to_int64(e: &mut Emitter, value: Value, signed: bool) -> Value {
     let control = FpControl::default();
-    let value = e.fp_convert(32, value, control);
-    let scaled = e.fp_mul(value, Value::F32(1.0 / TWO_POW_32), control);
+    let (value, two_pow_32, inv_two_pow_32) = if e.ty(value) == Type::F64 {
+        let two = f64::from(TWO_POW_32);
+        (value, Value::F64(two), Value::F64(1.0 / two))
+    } else {
+        let value = e.fp_convert(32, value, control);
+        (value, Value::F32(TWO_POW_32), Value::F32(1.0 / TWO_POW_32))
+    };
+    let scaled = e.fp_mul(value, inv_two_pow_32, control);
     let high_f = e.fp_floor(scaled, control);
     let hi = e.convert_f_to_i(32, signed, high_f);
-    let minus_two_pow_32 = e.fp_neg(Value::F32(TWO_POW_32));
+    let minus_two_pow_32 = e.fp_neg(two_pow_32);
     let low_f = e.fp_fma(high_f, minus_two_pow_32, value, control);
     let lo = e.convert_f_to_i(32, false, low_f);
     e.composite_construct(&[lo, hi])
@@ -291,6 +304,23 @@ mod tests {
             0,
         );
         Value::Inst(prog.append(b, Opcode::PackUint2x32, &[Value::Inst(pair)], 0))
+    }
+
+    #[test]
+    fn double_conversions_stay_in_double_precision() {
+        for op in [Opcode::ConvertS64F64, Opcode::ConvertF64U64] {
+            let (mut prog, b) = program();
+            let source = match op {
+                Opcode::ConvertS64F64 => Value::F64(16_777_217.0),
+                _ => operand(&mut prog, b, 16_777_217, false),
+            };
+            let conversion = prog.append(b, op, &[source], 0);
+            prog.append(b, Opcode::Reference, &[Value::Inst(conversion)], 0);
+            lower_int64_to_int32(&mut prog).unwrap();
+            let ops: Vec<Opcode> = prog.insts_of(b).map(|id| prog.op(id)).collect();
+            assert!(!ops.contains(&Opcode::ConvertF32F64), "{op:?}: {ops:?}");
+            assert!(!ops.contains(&Opcode::FPFma32), "{op:?}: {ops:?}");
+        }
     }
 
     fn run(op: Opcode, a: u64, b: Option<u64>, immediate: bool) -> u64 {

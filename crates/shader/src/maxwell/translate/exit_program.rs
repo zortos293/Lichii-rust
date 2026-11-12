@@ -63,7 +63,11 @@ pub(super) mod tests {
     }
 
     impl ShaderEnvironment for StageEnv {
-        test_gpu_state!();
+        test_gpu_state!(@shared);
+        fn local_memory_size(&self) -> u32 {
+            let sph = ProgramHeader::read(self, self.start_address() - ProgramHeader::SIZE);
+            (sph.local_memory_size() + u64::from(sph.shader_local_memory_crs_size())) as u32
+        }
         fn arch(&self) -> ShaderArch {
             self.inner.arch()
         }

@@ -113,11 +113,12 @@ fn mark_shuffled_frag_coord(prog: &mut Program, id: InstId, marked: &mut FxHashS
     let shuffle = copy_before(prog, id);
     let fp = FpControl::default();
     let mut ir = Emitter::before(prog, id);
-    let value = ir.convert_i_to_f(32, 32, false, shuffle, fp);
+    let value = ir.inst(Opcode::BitCastF32U32, &[shuffle]);
     let down_factor = ir.inst(Opcode::ResolutionDownFactor, &[]);
     let up_factor = ir.fp_recip(down_factor);
-    let converted = ir.fp_mul(value, up_factor, fp);
-    prog.replace_uses_with(id, converted);
+    let scaled = ir.fp_mul(value, up_factor, fp);
+    let bits = ir.inst(Opcode::BitCastU32F32, &[scaled]);
+    prog.replace_uses_with(id, bits);
 }
 
 fn visit(

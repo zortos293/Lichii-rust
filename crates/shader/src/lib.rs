@@ -7,6 +7,12 @@
 #[cfg(test)]
 macro_rules! test_gpu_state {
     () => {
+        test_gpu_state!(@shared);
+        fn local_memory_size(&self) -> u32 {
+            0
+        }
+    };
+    (@shared) => {
         fn texture_type(&self, _: u32) -> $crate::ir::TextureType {
             $crate::ir::TextureType::Color2D
         }
@@ -21,9 +27,6 @@ macro_rules! test_gpu_state {
         }
         fn texture_bound_buffer(&self) -> u32 {
             2
-        }
-        fn local_memory_size(&self) -> u32 {
-            0
         }
         fn has_hle_macro_state(&self) -> bool {
             false

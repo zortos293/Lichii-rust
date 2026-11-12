@@ -460,6 +460,61 @@ fn float_immediates_neutral_adds_and_interpolation_fold() {
     assert_eq!(t.folded(corrected), dy);
 }
 
+#[test]
+fn fp_folds_follow_rounding_and_denormal_controls() {
+    use Opcode::*;
+    let mut t = Test::new();
+    let a = t.attr(0);
+    let round_up = FpControl {
+        rounding: FpRounding::Rp,
+        ..FpControl::default()
+    };
+    let ftz = FpControl {
+        fmz_mode: FmzMode::Ftz,
+        ..FpControl::default()
+    };
+    let fmz = FpControl {
+        fmz_mode: FmzMode::Fmz,
+        ..FpControl::default()
+    };
+    let tiny = f32::from_bits(1);
+    let rounded_up = t.flags(
+        FPAdd32,
+        round_up.to_flags(),
+        &[Value::F32(1.0), Value::F32(2.0)],
+    );
+    let flushed = t.flags(
+        FPAdd32,
+        ftz.to_flags(),
+        &[Value::F32(tiny), Value::F32(tiny)],
+    );
+    let ftz_neutral = t.flags(FPAdd32, ftz.to_flags(), &[a, Value::F32(0.0)]);
+    let fmz_zero = t.flags(
+        FPMul32,
+        fmz.to_flags(),
+        &[Value::F32(f32::INFINITY), Value::F32(0.0)],
+    );
+    t.propagate(&Env::default());
+    assert_eq!(t.folded(rounded_up), rounded_up);
+    assert_eq!(t.folded(flushed), Value::F32(0.0));
+    assert_eq!(t.folded(ftz_neutral), ftz_neutral);
+    assert_eq!(t.folded(fmz_zero), Value::F32(0.0));
+}
+
+#[test]
+fn unpack_after_half_pack_keeps_the_rounding() {
+    use Opcode::*;
+    let mut t = Test::new();
+    let x = t.attr(0);
+    let pair = t.op(CompositeConstructF32x2, &[x, x]);
+    let packed = t.op(PackHalf2x16, &[pair]);
+    let unpacked = t.op(UnpackHalf2x16, &[packed]);
+    let repacked = t.op(PackHalf2x16, &[unpacked]);
+    t.propagate(&Env::default());
+    assert_eq!(t.folded(unpacked), unpacked);
+    assert_eq!(t.folded(repacked), packed);
+}
+
 fn swizzle_derivative(shuffle: Opcode, swizzle: u32) -> String {
     use Opcode::*;
     let mut t = Test::new();

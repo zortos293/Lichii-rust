@@ -1,6 +1,5 @@
 //! LDL, STL, LDS and STS: local and shared memory.
 
-use super::exit_program::program_header;
 use super::load_store_memory::is_aligned;
 use super::{TResult, Translator};
 use crate::TranslateError;
@@ -40,15 +39,9 @@ fn size(t: &Translator<'_>) -> Result<(u16, bool), TranslateError> {
     })
 }
 
-/// Local memory size in bytes from the program header. Compute programs take it from the
-/// launch descriptor, which the environment does not expose yet.
+/// Local memory size in bytes, from the environment (the program header or the compute launch).
 fn local_memory_size(t: &Translator<'_>) -> Result<u32, TranslateError> {
-    program_header(t)
-        .and_then(|sph| {
-            let bytes = sph.local_memory_size() + u64::from(sph.shader_local_memory_crs_size());
-            u32::try_from(bytes).ok()
-        })
-        .ok_or_else(|| t.unsupported())
+    Ok(t.env.local_memory_size())
 }
 
 /// Bit position of the byte (`mask` 24) or half word (`mask` 16) at `offset` in its word.
@@ -186,8 +179,10 @@ pub(super) fn sts(t: &mut Translator<'_>) -> TResult {
 #[cfg(test)]
 mod tests {
     use super::super::exit_program::tests::translate_stage;
-    use super::super::tests::{encode, translate};
+    use super::super::tests::{TestEnv, encode, translate};
+    use super::super::translate_block;
     use crate::ShaderStage;
+    use crate::ir::Program;
     use crate::maxwell::opcode::Opcode;
 
     /// A vertex program header with `low` bytes of local memory and `crs` bytes of CRS stack.
@@ -241,8 +236,14 @@ mod tests {
     }
 
     #[test]
-    fn ldl_in_compute_needs_local_memory_size() {
-        assert!(translate(&[encode(Opcode::Ldl, 4 << 48)]).is_err());
+    fn ldl_in_compute_takes_the_launch_local_memory_size() {
+        let mut env = TestEnv::new(&[encode(Opcode::Ldl, (4 << 48) | (0xff << 8))]);
+        env.local_memory = 0x80;
+        let mut prog = Program::new();
+        let block = prog.new_block();
+        translate_block(&mut prog, block, &env, 0, env.end()).unwrap();
+        let dump = prog.dump();
+        assert!(dump.contains("ULessThan #0x0, #0x80"), "{dump}");
     }
 
     #[test]

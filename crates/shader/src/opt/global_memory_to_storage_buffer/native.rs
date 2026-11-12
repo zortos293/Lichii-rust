@@ -19,10 +19,12 @@ type Slots = SmallVec<[(u32, u32); 4]>;
 fn dynamic_pointer_slots(prog: &Program, offset: Value) -> Option<(u32, u32)> {
     let stride_of = |value: Value| -> Option<u32> {
         let id = inst_of(prog, value)?;
-        let amount = imm_u32(prog, prog.arg(id, 1));
-        match (prog.op(id), amount) {
-            (Opcode::ShiftLeftLogical32, Some(shift)) if shift < 16 => Some(1 << shift),
-            (Opcode::IMul32, Some(stride)) => Some(stride),
+        if !matches!(prog.op(id), Opcode::ShiftLeftLogical32 | Opcode::IMul32) {
+            return None;
+        }
+        match (prog.op(id), imm_u32(prog, prog.arg(id, 1))?) {
+            (Opcode::ShiftLeftLogical32, shift) if shift < 16 => Some(1 << shift),
+            (Opcode::IMul32, stride) => Some(stride),
             _ => None,
         }
     };
@@ -316,5 +318,18 @@ fn imm_u64(prog: &Program, value: Value) -> Option<u64> {
         value.imm_u64()
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_operand_offsets_track_no_array() {
+        let mut prog = Program::new();
+        let block = prog.new_block();
+        let lane = prog.append(block, Opcode::LaneId, &[], 0);
+        assert_eq!(dynamic_pointer_slots(&prog, Value::Inst(lane)), None);
     }
 }

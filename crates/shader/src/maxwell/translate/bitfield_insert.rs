@@ -11,9 +11,9 @@ fn bfi(t: &mut Translator<'_>, src_a: Value, base: Value) -> TResult {
         t.ir.bit_field_extract(src_a, Value::U32(8), Value::U32(8), false);
     let max_size = Value::U32(32);
     let exceed_offset = t.ir.icompare(ICompare::UGreaterThanEqual, offset, max_size);
-    let exceed_count =
-        t.ir.icompare(ICompare::UGreaterThan, unsafe_count, max_size);
     let remaining_size = t.ir.isub(max_size, offset);
+    let exceed_count =
+        t.ir.icompare(ICompare::UGreaterThan, unsafe_count, remaining_size);
     let safe_count = t.ir.select(exceed_count, remaining_size, unsafe_count);
     let insert = t.x(insn.src_a_reg());
     let result = t.ir.bit_field_insert(base, insert, offset, safe_count);
@@ -69,9 +69,9 @@ mod tests {
   %2 = BitFieldUExtract %0, #0x0, #0x8
   %3 = BitFieldUExtract %0, #0x8, #0x8
   %4 = UGreaterThanEqual %2, #0x20
-  %5 = UGreaterThan %3, #0x20
-  %6 = ISub32 #0x20, %2
-  %7 = SelectU32 %5, %6, %3
+  %5 = ISub32 #0x20, %2
+  %6 = UGreaterThan %3, %5
+  %7 = SelectU32 %6, %5, %3
   %8 = GetRegister R1
   %9 = BitFieldInsert %1, %8, %2, %7
   %10 = SelectU32 %4, %1, %9
@@ -96,9 +96,9 @@ mod tests {
   %2 = BitFieldUExtract %0, #0x0, #0x8
   %3 = BitFieldUExtract %0, #0x8, #0x8
   %4 = UGreaterThanEqual %2, #0x20
-  %5 = UGreaterThan %3, #0x20
-  %6 = ISub32 #0x20, %2
-  %7 = SelectU32 %5, %6, %3
+  %5 = ISub32 #0x20, %2
+  %6 = UGreaterThan %3, %5
+  %7 = SelectU32 %6, %5, %3
   %8 = GetRegister R1
   %9 = BitFieldInsert %1, %8, %2, %7
   %10 = SelectU32 %4, %1, %9
@@ -117,9 +117,9 @@ mod tests {
   %2 = BitFieldUExtract %0, #0x0, #0x8
   %3 = BitFieldUExtract %0, #0x8, #0x8
   %4 = UGreaterThanEqual %2, #0x20
-  %5 = UGreaterThan %3, #0x20
-  %6 = ISub32 #0x20, %2
-  %7 = SelectU32 %5, %6, %3
+  %5 = ISub32 #0x20, %2
+  %6 = UGreaterThan %3, %5
+  %7 = SelectU32 %6, %5, %3
   %8 = GetRegister R1
   %9 = BitFieldInsert %1, %8, %2, %7
   %10 = SelectU32 %4, %1, %9
@@ -137,9 +137,9 @@ mod tests {
   %1 = BitFieldUExtract #0x804, #0x0, #0x8
   %2 = BitFieldUExtract #0x804, #0x8, #0x8
   %3 = UGreaterThanEqual %1, #0x20
-  %4 = UGreaterThan %2, #0x20
-  %5 = ISub32 #0x20, %1
-  %6 = SelectU32 %4, %5, %2
+  %4 = ISub32 #0x20, %1
+  %5 = UGreaterThan %2, %4
+  %6 = SelectU32 %5, %4, %2
   %7 = GetRegister R1
   %8 = BitFieldInsert %0, %7, %1, %6
   %9 = SelectU32 %3, %0, %8
