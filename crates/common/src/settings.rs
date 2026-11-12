@@ -879,9 +879,10 @@ pub struct StickBinding {
     /// Held to scale digital input by `modifier_scale`.
     pub modifier: InputBinding,
     pub modifier_scale: f32,
-    /// 0..1.
+    /// Radial deadzone, 0..=0.9 of the stick's travel.
     pub deadzone: f32,
-    /// 0..1.5, how far the output reaches before clamping.
+    /// 0.5..=1.5: the deflection that maps to full output. Below 1 lets a worn stick reach the
+    /// edge; above 1 needs more than full travel and so caps the output.
     pub range: f32,
 }
 
