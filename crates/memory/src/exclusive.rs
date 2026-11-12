@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use lichii_common::VAddr;
 use parking_lot::Mutex;
+use portable_atomic::AtomicU128;
 
 use crate::{AddressSpace, MemoryFault};
 
@@ -12,21 +13,19 @@ struct Reservation {
     size: u8,
 }
 
-/// Global exclusive monitor for LDXR/STXR across all emulated cores.
+/// Global exclusive monitor for LDXR/STXR (and LDXP/STXP) across all emulated cores.
 ///
 /// A store-exclusive succeeds when the core still holds a reservation for the address and guest
 /// memory still holds the value the load observed. The swap is a host compare-and-swap, so it is
 /// atomic against plain stores from other cores.
 pub struct ExclusiveMonitor {
     reservations: Box<[Mutex<Option<Reservation>>]>,
-    wide: Mutex<()>,
 }
 
 impl ExclusiveMonitor {
     pub fn new(core_count: usize) -> Self {
         Self {
             reservations: (0..core_count).map(|_| Mutex::new(None)).collect(),
-            wide: Mutex::new(()),
         }
     }
 
@@ -44,8 +43,10 @@ impl ExclusiveMonitor {
             4 => mem.read::<u32>(addr)? as u128,
             8 => mem.read::<u64>(addr)? as u128,
             16 => {
-                let _guard = self.wide.lock();
-                mem.read::<u128>(addr)?
+                let (ptr, _) = mem.translate(addr).ok_or(MemoryFault::unmapped(addr))?;
+                // SAFETY: exclusive pairs are 16-byte aligned, so the value is aligned and lies in
+                // one mapped page.
+                unsafe { AtomicU128::from_ptr(ptr.cast()) }.load(Ordering::SeqCst)
             }
             _ => unreachable!("exclusive size {size}"),
         };
@@ -78,15 +79,9 @@ impl ExclusiveMonitor {
                 2 => cas::<AtomicU16, u16>(ptr, expected as u16, value as u16),
                 4 => cas::<AtomicU32, u32>(ptr, expected as u32, value as u32),
                 8 => cas::<AtomicU64, u64>(ptr, expected as u64, value as u64),
-                16 => {
-                    let _guard = self.wide.lock();
-                    let current = std::ptr::read_volatile(ptr as *const u128);
-                    let ok = current == expected;
-                    if ok {
-                        std::ptr::write_volatile(ptr as *mut u128, value);
-                    }
-                    ok
-                }
+                16 => AtomicU128::from_ptr(ptr.cast())
+                    .compare_exchange(expected, value, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok(),
                 _ => unreachable!("exclusive size {size}"),
             }
         };
