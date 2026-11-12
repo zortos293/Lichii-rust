@@ -327,6 +327,7 @@ impl Exec<'_> {
         }
     }
 
+    #[inline(always)]
     pub(super) fn execute(&mut self, inst: &Inst) -> Step {
         let pc = self.pc;
         match *inst {
