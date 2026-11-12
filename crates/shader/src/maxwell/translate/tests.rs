@@ -13,6 +13,7 @@ pub struct TestEnv {
     pub stage: ShaderStage,
     pub cbuf: Vec<u32>,
     pub local_memory: u32,
+    pub base: GpuVAddr,
 }
 
 impl TestEnv {
@@ -31,6 +32,7 @@ impl TestEnv {
             stage: ShaderStage::Compute,
             cbuf: Vec::new(),
             local_memory: 0,
+            base: Self::BASE,
         }
     }
 
@@ -52,11 +54,11 @@ impl ShaderEnvironment for TestEnv {
         self.stage
     }
     fn start_address(&self) -> GpuVAddr {
-        Self::BASE
+        self.base
     }
     fn read_u64(&self, address: GpuVAddr) -> u64 {
         self.words
-            .get(((address - Self::BASE) / 8) as usize)
+            .get((address.wrapping_sub(self.base) / 8) as usize)
             .copied()
             .unwrap_or(0)
     }

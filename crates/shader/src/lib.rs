@@ -36,15 +36,20 @@ macro_rules! test_gpu_state {
 
 pub mod ampere;
 pub mod flow;
+mod hash;
 pub mod info;
 pub mod ir;
 pub mod maxwell;
+pub mod module;
 pub mod opt;
 pub mod profile;
 pub mod runtime;
 pub mod translate;
 
 pub use info::ShaderInfo;
+pub use module::{
+    DescriptorBinding, DescriptorKind, DescriptorSetLayout, ResourceLayout, ShaderModule,
+};
 pub use profile::Profile;
 pub use runtime::RuntimeInfo;
 
@@ -135,12 +140,6 @@ pub trait ShaderEnvironment {
     fn is_proprietary_driver(&self) -> bool {
         false
     }
-}
-
-/// A translated program.
-#[derive(Clone, Debug, Default)]
-pub struct ShaderModule {
-    pub spirv: Vec<u32>,
 }
 
 #[derive(Debug, thiserror::Error)]
