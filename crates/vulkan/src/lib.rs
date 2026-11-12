@@ -11,6 +11,7 @@ pub mod instance;
 pub mod memory;
 pub mod present;
 pub mod scheduler;
+pub mod shaders;
 pub mod staging;
 pub mod swapchain;
 
