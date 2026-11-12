@@ -11,9 +11,9 @@ use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use lichii_common::{DAddr, GpuVAddr, PAGE_BITS, PAGE_MASK, PAGE_SIZE};
+use lichii_memory::DeviceAddressSpace;
 use parking_lot::Mutex;
 
-use crate::device_memory::{DEVICE_ADDRESS_SPACE_SIZE, DeviceFault, DeviceMemory};
 use crate::host1x::Syncpoints;
 
 /// Width of a GPU virtual address space.
@@ -177,7 +177,7 @@ struct BigTable {
 
 /// One GPU virtual address space: 40-bit, 4 KiB small pages and 64 or 128 KiB big pages.
 pub struct Gmmu {
-    device: Arc<DeviceMemory>,
+    device: Arc<DeviceAddressSpace>,
     big_bits: u32,
     directory: Box<[AtomicPtr<BigTable>]>,
     writer: Mutex<()>,
@@ -187,7 +187,7 @@ pub struct Gmmu {
 }
 
 impl Gmmu {
-    pub fn new(device: Arc<DeviceMemory>, big_page_size: BigPageSize) -> Self {
+    pub fn new(device: Arc<DeviceAddressSpace>, big_page_size: BigPageSize) -> Self {
         let big_bits = big_page_size.bits();
         let directory = (0..1usize << (GPU_VA_BITS - big_bits - TABLE_BITS))
             .map(|_| AtomicPtr::new(std::ptr::null_mut()))
@@ -203,7 +203,7 @@ impl Gmmu {
         }
     }
 
-    pub fn device(&self) -> &Arc<DeviceMemory> {
+    pub fn device(&self) -> &Arc<DeviceAddressSpace> {
         &self.device
     }
 
@@ -235,7 +235,7 @@ impl Gmmu {
         self.check(gpu_va, size, big)?;
         let fits = daddr
             .checked_add(size)
-            .is_some_and(|end| end <= DEVICE_ADDRESS_SPACE_SIZE);
+            .is_some_and(|end| end <= 1 << self.device.address_space_bits());
         if daddr & PAGE_MASK != 0 || !fits {
             return Err(GmmuError::InvalidDeviceAddress { daddr, size });
         }
@@ -314,7 +314,7 @@ impl Gmmu {
             return self
                 .device
                 .read(daddr)
-                .map_err(|DeviceFault(d)| device_fault(gpu_va + (d - daddr)));
+                .map_err(|fault| device_fault(gpu_va + (fault.addr - daddr)));
         }
         let mut value = T::zeroed();
         self.read_block(gpu_va, bytemuck::bytes_of_mut(&mut value))?;
@@ -330,7 +330,7 @@ impl Gmmu {
             return self
                 .device
                 .write(daddr, value)
-                .map_err(|DeviceFault(d)| device_fault(gpu_va + (d - daddr)));
+                .map_err(|fault| device_fault(gpu_va + (fault.addr - daddr)));
         }
         self.write_block(gpu_va, bytemuck::bytes_of(&value))
     }
@@ -345,9 +345,8 @@ impl Gmmu {
             done += range.size as usize;
             let result = match range.target {
                 RangeTarget::Device(daddr) => self
-                    .device
-                    .read_block(daddr, chunk)
-                    .map_err(|DeviceFault(d)| device_fault(range.gpu_va + (d - daddr))),
+                    .read_device(daddr, chunk)
+                    .map_err(|d| device_fault(range.gpu_va + (d - daddr))),
                 RangeTarget::Sparse => {
                     chunk.fill(0);
                     Ok(())
@@ -381,7 +380,7 @@ impl Gmmu {
             done += range.size as usize;
             let kind = match range.target {
                 RangeTarget::Device(daddr) => {
-                    if let Err(DeviceFault(d)) = self.device.write_block(daddr, chunk) {
+                    if let Err(d) = self.write_device(daddr, chunk) {
                         fault.get_or_insert(device_fault(range.gpu_va + (d - daddr)));
                     }
                     return;
@@ -440,6 +439,50 @@ impl Gmmu {
             device &= matches!(range.target, RangeTarget::Device(_));
         });
         runs == 1 && device
+    }
+
+    /// Copies device memory a page at a time; unmapped pages read zero. Returns the first
+    /// unmapped device address.
+    fn read_device(&self, daddr: DAddr, out: &mut [u8]) -> Result<(), DAddr> {
+        let mut fault = None;
+        let mut done = 0;
+        while done < out.len() {
+            let addr = daddr + done as u64;
+            let len = ((PAGE_SIZE - (addr & PAGE_MASK)) as usize).min(out.len() - done);
+            let chunk = &mut out[done..done + len];
+            match self.device.translate(addr) {
+                // SAFETY: the pointer is valid for len bytes inside one mapped page.
+                Some(ptr) => unsafe { std::ptr::copy_nonoverlapping(ptr, chunk.as_mut_ptr(), len) },
+                None => {
+                    chunk.fill(0);
+                    fault.get_or_insert(addr);
+                }
+            }
+            done += len;
+        }
+        fault.map_or(Ok(()), Err)
+    }
+
+    /// Writes device memory a page at a time, skipping unmapped pages. Returns the first
+    /// unmapped device address.
+    fn write_device(&self, daddr: DAddr, data: &[u8]) -> Result<(), DAddr> {
+        let mut fault = None;
+        let mut done = 0;
+        while done < data.len() {
+            let addr = daddr + done as u64;
+            let len = ((PAGE_SIZE - (addr & PAGE_MASK)) as usize).min(data.len() - done);
+            match self.device.translate(addr) {
+                // SAFETY: the pointer is valid for len bytes inside one mapped page.
+                Some(ptr) => unsafe {
+                    std::ptr::copy_nonoverlapping(data[done..].as_ptr(), ptr, len)
+                },
+                None => {
+                    fault.get_or_insert(addr);
+                }
+            }
+            done += len;
+        }
+        fault.map_or(Ok(()), Err)
     }
 
     fn read_shim(&self, gpu_va: GpuVAddr, out: &mut [u8]) {
@@ -653,7 +696,7 @@ mod tests {
 
     struct Fixture {
         space: AddressSpace,
-        device: Arc<DeviceMemory>,
+        device: Arc<DeviceAddressSpace>,
         daddr: DAddr,
     }
 
@@ -661,9 +704,9 @@ mod tests {
         let physical = Arc::new(PhysicalMemory::new(1 << 24).unwrap());
         let space = AddressSpace::new(physical.clone(), 39);
         space.map(CPU_VA, 0x10_0000, CPU_SIZE, MemoryPermission::READ_WRITE);
-        let device = Arc::new(DeviceMemory::new(physical));
-        let daddr = device.allocate(CPU_SIZE, 0x2_0000).unwrap();
-        device.map(daddr, &space, CPU_VA, CPU_SIZE).unwrap();
+        let device = Arc::new(DeviceAddressSpace::new(physical, 36));
+        let daddr = 0x4_0000_0000;
+        device.map_process(daddr, &space, CPU_VA, CPU_SIZE).unwrap();
         Fixture {
             space,
             device,
@@ -875,7 +918,7 @@ mod tests {
                 size: 0x2000
             })
         );
-        f.device.unmap(f.daddr, 0x1000).unwrap();
+        f.device.unmap(f.daddr, 0x1000);
         assert_eq!(
             gmmu.read::<u32>(0x50_0010),
             Err(GpuFault {

@@ -16,10 +16,10 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use lichii_common::{DAddr, GpuVAddr, PAGE_MASK, VAddr};
-use lichii_memory::AddressSpace;
+use lichii_memory::{AddressSpace, DeviceAddressSpace};
 use parking_lot::Mutex;
 
-use crate::device_memory::{DeviceMemory, DeviceMemoryError};
+use crate::device_memory::DeviceAllocator;
 use crate::gmmu::{GPU_VA_SIZE, Gmmu, MappedRange, PTE_KIND_INVALID, PTE_KIND_PITCH};
 
 const DEVICE_ALIGN: u64 = 0x2_0000;
@@ -77,13 +77,16 @@ pub enum Nx2MemoryError {
     NoSuchRegion { va: GpuVAddr, size: u64 },
     #[error("GPU range {va:#x}+{size:#x} is not mapped")]
     NotMapped { va: GpuVAddr, size: u64 },
-    #[error(transparent)]
-    Device(#[from] DeviceMemoryError),
+    #[error("process address {va:#x} is not mapped")]
+    SourceUnmapped { va: VAddr },
+    #[error("the process address space is backed by other guest DRAM than the device")]
+    ForeignPhysicalMemory,
 }
 
 /// The Switch 2 GPU memory registry of one process.
 pub struct Nx2GpuMemory {
-    device: Arc<DeviceMemory>,
+    device: Arc<DeviceAddressSpace>,
+    allocator: Arc<DeviceAllocator>,
     state: Mutex<State>,
 }
 
@@ -123,9 +126,11 @@ impl Backing {
 }
 
 impl Nx2GpuMemory {
-    pub fn new(device: Arc<DeviceMemory>) -> Self {
+    /// A registry mapping into `device`, taking device ranges from `allocator` (shared with nvmap).
+    pub fn new(device: Arc<DeviceAddressSpace>, allocator: Arc<DeviceAllocator>) -> Self {
         Self {
             device,
+            allocator,
             state: Mutex::new(State::default()),
         }
     }
@@ -159,20 +164,23 @@ impl Nx2GpuMemory {
         size: u64,
     ) -> Result<(GpuMemoryHandle, Vec<Unmapped>), Nx2MemoryError> {
         check_range(cpu_va, size)?;
+        if !Arc::ptr_eq(space.physical(), self.device.physical()) {
+            return Err(Nx2MemoryError::ForeignPhysicalMemory);
+        }
         let mut state = self.state.lock();
         let handle = state
             .last_handle
             .checked_add(1)
             .ok_or(Nx2MemoryError::OutOfHandles)?;
         let daddr = self
-            .device
+            .allocator
             .allocate(size, DEVICE_ALIGN)
             .ok_or(Nx2MemoryError::OutOfDeviceMemory { size })?;
-        if let Err(e) = self.device.map(daddr, space, cpu_va, size) {
-            self.device
+        if let Err(fault) = self.device.map_process(daddr, space, cpu_va, size) {
+            self.allocator
                 .free(daddr, size)
                 .expect("the range was just allocated");
-            return Err(e.into());
+            return Err(Nx2MemoryError::SourceUnmapped { va: fault.addr });
         }
         state.last_handle = handle;
         state.memories.insert(
@@ -218,8 +226,10 @@ impl Nx2GpuMemory {
         for (start, size) in reaching {
             unmapped.extend(state.unmap(start, size));
         }
-        self.device.unmap(memory.daddr, memory.size)?;
-        self.device.free(memory.daddr, memory.size)?;
+        self.device.unmap(memory.daddr, memory.size);
+        self.allocator
+            .free(memory.daddr, memory.size)
+            .expect("the range was allocated at creation");
         Ok(unmapped)
     }
 
@@ -549,7 +559,8 @@ mod tests {
 
     struct Fixture {
         space: AddressSpace,
-        device: Arc<DeviceMemory>,
+        device: Arc<DeviceAddressSpace>,
+        allocator: Arc<DeviceAllocator>,
         memory: Nx2GpuMemory,
         gmmus: [Arc<Gmmu>; 2],
     }
@@ -558,15 +569,17 @@ mod tests {
         let physical = Arc::new(PhysicalMemory::new(1 << 24).unwrap());
         let space = AddressSpace::new(physical.clone(), 39);
         space.map(CPU_VA, 0, 0x20_0000, MemoryPermission::READ_WRITE);
-        let device = Arc::new(DeviceMemory::new(physical));
+        let device = Arc::new(DeviceAddressSpace::new(physical, 36));
+        let allocator = Arc::new(DeviceAllocator::new(36));
         let gmmus = [
             Arc::new(Gmmu::new(device.clone(), BigPageSize::Size64K)),
             Arc::new(Gmmu::new(device.clone(), BigPageSize::Size128K)),
         ];
         Fixture {
             space,
-            memory: Nx2GpuMemory::new(device.clone()),
+            memory: Nx2GpuMemory::new(device.clone(), allocator.clone()),
             device,
+            allocator,
             gmmus,
         }
     }
@@ -695,7 +708,7 @@ mod tests {
             assert_eq!(target(gmmu, CPU_VA + 0x4000), RangeTarget::Unmapped);
             assert_eq!(target(gmmu, SPARSE_VA), RangeTarget::Sparse);
         }
-        assert_eq!(f.device.allocated_bytes(), 0);
+        assert_eq!(f.allocator.allocated_bytes(), 0);
         assert!(f.device.translate(info.daddr).is_none());
         assert_eq!(
             f.memory.destroy(handle),
@@ -720,7 +733,7 @@ mod tests {
         f.memory
             .create_sparse_region(SPARSE_VA + size, size)
             .unwrap();
-        assert_eq!(f.device.allocated_bytes(), 0);
+        assert_eq!(f.allocator.allocated_bytes(), 0);
         for gmmu in &f.gmmus {
             assert!(gmmu.table_bytes() < 16 << 20, "{}", gmmu.table_bytes());
             assert_eq!(gmmu.read::<u64>(SPARSE_VA + 2 * size - 8), Ok(0));
@@ -814,11 +827,11 @@ mod tests {
         assert_eq!(
             f.memory
                 .create_gpu_accessible_memory(&f.space, CPU_VA + 0x30_0000, 0x1000),
-            Err(Nx2MemoryError::Device(DeviceMemoryError::SourceUnmapped {
+            Err(Nx2MemoryError::SourceUnmapped {
                 va: CPU_VA + 0x30_0000
-            }))
+            })
         );
-        assert_eq!(f.device.allocated_bytes(), 0x1_0000);
+        assert_eq!(f.allocator.allocated_bytes(), 0x1_0000);
     }
 
     #[test]
