@@ -16,7 +16,7 @@ pub mod regs;
 use lichii_texture::PixelFormat;
 use lichii_texture::guest::RenderTargetFormat;
 
-use self::blitter::{Job, Rect, SoftwareBlitter};
+use self::blitter::{Job, Rect, Sampling, SoftwareBlitter};
 use super::EngineContext;
 use crate::backend::{Blit, CopySurface};
 use crate::reg_index;
@@ -82,8 +82,8 @@ impl Fermi2d {
 
         let (mut src_x, mut src_y) = (args.src_x0, args.src_y0);
         if args.sample_mode.origin() == Origin::CORNER {
-            src_x = src_x.wrapping_sub((args.du_dx >> 33) << 32);
-            src_y = src_y.wrapping_sub((args.dv_dy >> 33) << 32);
+            src_x = src_x.wrapping_sub(args.du_dx >> 1);
+            src_y = src_y.wrapping_sub(args.dv_dy >> 1);
         }
         let end = |start: i64, step: i64, count: i32| {
             (start.wrapping_add(step.wrapping_mul(i64::from(count))) >> 32) as i32
@@ -148,6 +148,12 @@ impl Fermi2d {
                 dst_format,
                 src_rect,
                 dst_rect,
+                sampling: Sampling {
+                    x0: src_x,
+                    y0: src_y,
+                    du_dx: args.du_dx,
+                    dv_dy: args.dv_dy,
+                },
                 linear_filter,
             },
         );
@@ -608,7 +614,7 @@ mod tests {
         setup.du_dx = 1 << 31;
         setup.bilinear = true;
         run(&mut engine, &mut h.context(), &setup);
-        assert_eq!(get(&h, 0x2000, 4), [0, 85, 170, 255]);
+        assert_eq!(get(&h, 0x2000, 4), [0, 128, 255, 255]);
     }
 
     #[test]
@@ -708,6 +714,68 @@ mod tests {
         };
         run(&mut engine, &mut ctx, &setup);
         assert_eq!(accelerator.blits[0].src_x0, 3 << 32);
+    }
+
+    #[test]
+    fn corner_origin_keeps_the_fractional_half_step() {
+        let h = Harness::new();
+        let mut engine = Fermi2d::new();
+        let mut setup = Setup::copy(
+            block_surface(F::R8Unorm, 0, (8, 8), 0),
+            pitch_surface(F::R8Unorm, 0x2000, (2, 2), 2),
+            (2, 2),
+        );
+        setup.src_x0 = 4 << 32;
+        setup.src_y0 = 4 << 32;
+        setup.du_dx = 1 << 32;
+        setup.dv_dy = 3 << 31;
+        setup.corner = true;
+        let mut accelerator = Accelerator {
+            accept: true,
+            ..Default::default()
+        };
+        let mut ctx = EngineContext {
+            channel: ChannelId(0),
+            memory: &h.memory,
+            rasterizer: &mut accelerator,
+            syncpoints: &h.syncpoints,
+            gob_layout: h.gob_layout,
+        };
+        run(&mut engine, &mut ctx, &setup);
+        assert_eq!(accelerator.blits[0].src_x0, (3 << 32) | 0x8000_0000);
+        assert_eq!(accelerator.blits[0].src_y0, (3 << 32) | 0x4000_0000);
+    }
+
+    #[test]
+    fn nearest_sampling_follows_the_programmed_fractional_step() {
+        let mut h = Harness::new();
+        let mut engine = Fermi2d::new();
+        put(&h, 0x1000, &[10, 11, 12, 13]);
+        let mut setup = Setup::copy(
+            pitch_surface(F::R8Unorm, 0x1000, (4, 1), 4),
+            pitch_surface(F::R8Unorm, 0x2000, (3, 1), 3),
+            (3, 1),
+        );
+        setup.du_dx = 3 << 31;
+        run(&mut engine, &mut h.context(), &setup);
+        assert_eq!(get(&h, 0x2000, 3), [10, 11, 13]);
+    }
+
+    #[test]
+    fn bilinear_sampling_uses_the_programmed_start_and_step() {
+        let mut h = Harness::new();
+        let mut engine = Fermi2d::new();
+        put(&h, 0x1000, &[0, 100, 200, 255]);
+        let mut setup = Setup::copy(
+            pitch_surface(F::R8Unorm, 0x1000, (4, 1), 4),
+            pitch_surface(F::R8Unorm, 0x2000, (3, 1), 3),
+            (3, 1),
+        );
+        setup.src_x0 = 1 << 31;
+        setup.du_dx = 3 << 31;
+        setup.bilinear = true;
+        run(&mut engine, &mut h.context(), &setup);
+        assert_eq!(get(&h, 0x2000, 3), [50, 200, 255]);
     }
 
     #[test]

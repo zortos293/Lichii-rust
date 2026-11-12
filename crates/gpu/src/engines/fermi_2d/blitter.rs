@@ -20,8 +20,6 @@ use crate::gmmu::{Gmmu, RangeTarget};
 const MAX_BLIT_BYTES: u64 = 256 << 20;
 /// Block-linear surfaces larger than this in either direction are refused.
 const MAX_DIMENSION: u32 = 1 << 16;
-/// Scratch buffers that grew past this many bytes are released after the blit.
-const KEEP_CAPACITY: usize = 2 << 20;
 
 /// A rectangle in surface pixels; the end is exclusive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +38,16 @@ impl Rect {
     }
 }
 
+/// Where the destination pixels sample the source: 32.32 fixed-point start and step per axis, in
+/// source pixels relative to the surface origin.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Sampling {
+    pub x0: i64,
+    pub y0: i64,
+    pub du_dx: i64,
+    pub dv_dy: i64,
+}
+
 /// One blit: a source rectangle scaled into a destination rectangle.
 pub(super) struct Job {
     pub src: CopySurface,
@@ -48,6 +56,7 @@ pub(super) struct Job {
     pub dst_format: RenderTargetFormat,
     pub src_rect: Rect,
     pub dst_rect: Rect,
+    pub sampling: Sampling,
     pub linear_filter: bool,
 }
 
@@ -238,8 +247,19 @@ impl SoftwareBlitter {
         else {
             return;
         };
-        let (Some((src_w, src_h)), Some((dst_w, dst_h))) =
-            (job.src_rect.size(), job.dst_rect.size())
+        let neighbour = i32::from(job.linear_filter);
+        let clamp = |end: i32, extent: u32| match extent {
+            0 => end,
+            _ => end
+                .saturating_add(neighbour)
+                .min(extent.min(i32::MAX as u32) as i32),
+        };
+        let src_rect = Rect {
+            x1: clamp(job.src_rect.x1, job.src.width),
+            y1: clamp(job.src_rect.y1, job.src.height),
+            ..job.src_rect
+        };
+        let (Some((src_w, src_h)), Some((dst_w, dst_h))) = (src_rect.size(), job.dst_rect.size())
         else {
             tracing::debug!(?job.src_rect, ?job.dst_rect, "2D blit with an empty or flipped rectangle");
             return;
@@ -259,10 +279,10 @@ impl SoftwareBlitter {
             ..job.dst
         };
         let (Some(src_place), Some(dst_place)) = (
-            Placement::new(&src, &job.src_rect, ctx.gob_layout),
+            Placement::new(&src, &src_rect, ctx.gob_layout),
             Placement::new(&dst, &job.dst_rect, ctx.gob_layout),
         ) else {
-            tracing::warn!(?job.src_rect, ?job.dst_rect, "2D blit rectangle outside its surface");
+            tracing::warn!(?src_rect, ?job.dst_rect, "2D blit rectangle outside its surface");
             return;
         };
 
@@ -279,8 +299,20 @@ impl SoftwareBlitter {
         self.dst.resize(dst_bytes as usize, 0);
         src_place.read(ctx.memory, &mut self.tiled, &mut self.src);
 
+        let origin = |rect_start: i32| i64::from(rect_start).wrapping_shl(32);
+        let sampling = Sampling {
+            x0: job.sampling.x0.wrapping_sub(origin(src_rect.x0)),
+            y0: job.sampling.y0.wrapping_sub(origin(src_rect.y0)),
+            ..job.sampling
+        };
+        let unit = 1i64 << 32;
+        let whole = |start: i64| start & (unit - 1) == 0;
         let same_format = job.src_format == job.dst_format;
-        if same_format && (src_w, src_h) == (dst_w, dst_h) {
+        let one_to_one = (src_w, src_h) == (dst_w, dst_h)
+            && sampling.du_dx == unit
+            && sampling.dv_dy == unit
+            && (!job.linear_filter || (whole(sampling.x0) && whole(sampling.y0)));
+        if same_format && one_to_one {
             std::mem::swap(&mut self.src, &mut self.dst);
         } else if same_format && !job.linear_filter {
             nearest(
@@ -289,6 +321,7 @@ impl SoftwareBlitter {
                 dst_layout.bytes,
                 (src_w, src_h),
                 (dst_w, dst_h),
+                &sampling,
             );
         } else {
             self.ir_src.resize(src_w as usize * src_h as usize * 4, 0.0);
@@ -300,6 +333,7 @@ impl SoftwareBlitter {
                     &mut self.ir_dst,
                     (src_w, src_h),
                     (dst_w, dst_h),
+                    &sampling,
                 );
             } else {
                 nearest(
@@ -308,6 +342,7 @@ impl SoftwareBlitter {
                     4,
                     (src_w, src_h),
                     (dst_w, dst_h),
+                    &sampling,
                 );
             }
             dst_layout.encode(&self.ir_dst, &mut self.dst);
@@ -317,64 +352,59 @@ impl SoftwareBlitter {
         let (address, size) = dst_place.span();
         ctx.rasterizer
             .inline_written(ctx.channel, ctx.memory, address, size);
-        self.release_large_buffers();
-    }
-
-    fn release_large_buffers(&mut self) {
-        for buffer in [&mut self.src, &mut self.dst, &mut self.tiled] {
-            if buffer.capacity() > KEEP_CAPACITY {
-                *buffer = Vec::new();
-            }
-        }
-        for buffer in [&mut self.ir_src, &mut self.ir_dst] {
-            if buffer.capacity() * 4 > KEEP_CAPACITY {
-                *buffer = Vec::new();
-            }
-        }
     }
 }
 
-/// Source texel for destination index `index` of a nearest-neighbor scale from `from` to `to`
-/// texels: the step is the 32.32 ratio, rounded, and positions truncate.
-fn nearest_index(index: u32, step: u64, from: u32) -> usize {
-    ((u64::from(index) * step) >> 32).min(u64::from(from) - 1) as usize
+/// The source position of destination index `index` along one axis, in 32.32 source texels
+/// relative to the start of the read rectangle.
+fn position(start: i64, step: i64, index: u32) -> i64 {
+    start.wrapping_add(step.wrapping_mul(i64::from(index)))
 }
 
-/// Nearest-neighbor scale of `texel`-element texels (bytes of a pixel, or four channels).
-fn nearest<T: Copy>(src: &[T], dst: &mut [T], texel: usize, from: (u32, u32), to: (u32, u32)) {
-    let step = |from: u32, to: u32| ((u64::from(from) << 32) + u64::from(to) / 2) / u64::from(to);
-    let (step_x, step_y) = (step(from.0, to.0), step(from.1, to.1));
+/// Nearest-neighbor scale of `texel`-element texels (bytes of a pixel, or four channels): each
+/// destination pixel takes the texel its 32.32 source position falls in, clamped to the source.
+fn nearest<T: Copy>(
+    src: &[T],
+    dst: &mut [T],
+    texel: usize,
+    from: (u32, u32),
+    to: (u32, u32),
+    sampling: &Sampling,
+) {
+    let index = |start: i64, step: i64, i: usize, extent: u32| {
+        (position(start, step, i as u32) >> 32).clamp(0, i64::from(extent) - 1) as usize
+    };
     for (y, row) in dst.chunks_exact_mut(to.0 as usize * texel).enumerate() {
-        let src_row = nearest_index(y as u32, step_y, from.1) * from.0 as usize;
+        let src_row = index(sampling.y0, sampling.dv_dy, y, from.1) * from.0 as usize;
         for (x, out) in row.chunks_exact_mut(texel).enumerate() {
-            let at = (src_row + nearest_index(x as u32, step_x, from.0)) * texel;
+            let at = (src_row + index(sampling.x0, sampling.du_dx, x, from.0)) * texel;
             out.copy_from_slice(&src[at..at + texel]);
         }
     }
 }
 
-/// Bilinear scale of four-channel texels with the corner texels of both images aligned.
-fn bilinear(src: &[f32], dst: &mut [f32], from: (u32, u32), to: (u32, u32)) {
-    let scale = |from: u32, to: u32| {
-        if to > 1 {
-            (from - 1) as f32 / (to - 1) as f32
-        } else {
-            0.0
-        }
-    };
-    let (scale_x, scale_y) = (scale(from.0, to.0), scale(from.1, to.1));
+/// Bilinear scale of four-channel texels: each destination pixel blends the four texels around
+/// its 32.32 source position, with the neighbours clamped to the source.
+fn bilinear(src: &[f32], dst: &mut [f32], from: (u32, u32), to: (u32, u32), sampling: &Sampling) {
     let texel = |x: usize, y: usize| -> &[f32] {
         let at = (y * from.0 as usize + x) * 4;
         &src[at..at + 4]
     };
+    let axis = |start: i64, step: i64, i: usize, extent: u32| {
+        let position = position(start, step, i as u32);
+        let last = i64::from(extent) - 1;
+        let first = (position >> 32).clamp(0, last);
+        let weight = if position < 0 || position >> 32 > last {
+            0.0
+        } else {
+            (position & 0xffff_ffff) as f32 / 4_294_967_296.0
+        };
+        (first as usize, (first + 1).min(last) as usize, weight)
+    };
     for (y, row) in dst.chunks_exact_mut(to.0 as usize * 4).enumerate() {
-        let fy = y as f32 * scale_y;
-        let (y0, wy) = (fy.floor() as usize, fy.fract());
-        let y1 = (y0 + 1).min(from.1 as usize - 1);
+        let (y0, y1, wy) = axis(sampling.y0, sampling.dv_dy, y, from.1);
         for (x, out) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-            let fx = x as f32 * scale_x;
-            let (x0, wx) = (fx.floor() as usize, fx.fract());
-            let x1 = (x0 + 1).min(from.0 as usize - 1);
+            let (x0, x1, wx) = axis(sampling.x0, sampling.du_dx, x, from.0);
             let (p00, p10, p01, p11) = (texel(x0, y0), texel(x1, y0), texel(x0, y1), texel(x1, y1));
             for c in 0..4 {
                 let top = p00[c] + (p10[c] - p00[c]) * wx;
@@ -387,13 +417,34 @@ fn bilinear(src: &[f32], dst: &mut [f32], from: (u32, u32), to: (u32, u32)) {
 
 #[cfg(test)]
 mod tests {
+    use lichii_texture::guest::RenderTargetFormat as F;
+
     use super::*;
+    use crate::engines::testing::Harness;
+
+    const UNIT: i64 = 1 << 32;
+
+    fn sampling(x0: i64, y0: i64, du_dx: i64, dv_dy: i64) -> Sampling {
+        Sampling {
+            x0,
+            y0,
+            du_dx,
+            dv_dy,
+        }
+    }
 
     #[test]
     fn nearest_picks_every_other_texel_when_halving() {
         let src: Vec<u8> = (0..16).collect();
         let mut dst = [0u8; 4];
-        nearest(&src, &mut dst, 1, (4, 4), (2, 2));
+        nearest(
+            &src,
+            &mut dst,
+            1,
+            (4, 4),
+            (2, 2),
+            &sampling(0, 0, 2 * UNIT, 2 * UNIT),
+        );
         assert_eq!(dst, [0, 2, 8, 10]);
     }
 
@@ -401,17 +452,122 @@ mod tests {
     fn nearest_repeats_texels_when_doubling() {
         let src = [1u8, 2, 3, 4];
         let mut dst = [0u8; 16];
-        nearest(&src, &mut dst, 1, (2, 2), (4, 4));
+        nearest(
+            &src,
+            &mut dst,
+            1,
+            (2, 2),
+            (4, 4),
+            &sampling(0, 0, UNIT / 2, UNIT / 2),
+        );
         assert_eq!(dst, [1, 1, 2, 2, 1, 1, 2, 2, 3, 3, 4, 4, 3, 3, 4, 4]);
     }
 
     #[test]
-    fn bilinear_interpolates_between_aligned_corners() {
+    fn nearest_follows_a_fractional_step_instead_of_the_rectangle_ratio() {
+        let src = [0u8, 1, 2, 3];
+        let mut dst = [0u8; 3];
+        nearest(
+            &src,
+            &mut dst,
+            1,
+            (4, 1),
+            (3, 1),
+            &sampling(0, 0, UNIT * 3 / 2, UNIT),
+        );
+        assert_eq!(dst, [0, 1, 3]);
+    }
+
+    #[test]
+    fn nearest_honours_the_fractional_start() {
+        let src = [0u8, 1, 2, 3];
+        let mut dst = [0u8; 2];
+        nearest(
+            &src,
+            &mut dst,
+            1,
+            (4, 1),
+            (2, 1),
+            &sampling(UNIT / 2, 0, UNIT, UNIT),
+        );
+        assert_eq!(dst, [0, 1]);
+        nearest(
+            &src,
+            &mut dst,
+            1,
+            (4, 1),
+            (2, 1),
+            &sampling(UNIT * 3 / 4, 0, UNIT / 2, UNIT),
+        );
+        assert_eq!(dst, [0, 1]);
+    }
+
+    #[test]
+    fn bilinear_interpolates_along_the_programmed_step() {
         let src = [0.0f32, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
         let mut dst = [0.0f32; 12];
-        bilinear(&src, &mut dst, (2, 1), (3, 1));
+        bilinear(
+            &src,
+            &mut dst,
+            (2, 1),
+            (3, 1),
+            &sampling(0, 0, UNIT / 2, UNIT),
+        );
         assert_eq!(dst[0], 0.0);
         assert_eq!(dst[4], 0.5);
         assert_eq!(dst[8], 1.0);
+    }
+
+    #[test]
+    fn bilinear_clamps_neighbours_to_the_source() {
+        let src = [0.0f32, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+        let mut dst = [0.0f32; 8];
+        bilinear(
+            &src,
+            &mut dst,
+            (2, 1),
+            (2, 1),
+            &sampling(UNIT * 3 / 4, 0, UNIT / 2, UNIT),
+        );
+        assert_eq!(dst[0], 0.75);
+        assert_eq!(dst[4], 1.0);
+    }
+
+    #[test]
+    fn large_blits_keep_their_scratch_buffers() {
+        let mut h = Harness::new();
+        let (width, height) = (1024, 640);
+        let surface = CopySurface {
+            address: 0,
+            width,
+            height,
+            depth: 1,
+            layer: 0,
+            pitch: width * 4,
+            block: None,
+            bytes_per_pixel: 4,
+        };
+        let rect = Rect {
+            x0: 0,
+            y0: 0,
+            x1: width as i32,
+            y1: height as i32,
+        };
+        let job = Job {
+            src: surface,
+            dst: surface,
+            src_format: F::A8B8G8R8Unorm,
+            dst_format: F::A8B8G8R8Unorm,
+            src_rect: rect,
+            dst_rect: rect,
+            sampling: sampling(0, 0, UNIT, UNIT),
+            linear_filter: false,
+        };
+        let bytes = (width * height * 4) as usize;
+        let mut blitter = SoftwareBlitter::default();
+        blitter.blit(&mut h.context(), &job);
+        assert!(blitter.src.capacity() >= bytes);
+        assert!(blitter.dst.capacity() >= bytes);
+        assert_eq!(h.rasterizer.inline_writes.len(), 1);
     }
 }
