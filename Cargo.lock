@@ -374,6 +374,7 @@ version = "0.1.0"
 dependencies = [
  "lichii-common",
  "lichii-memory",
+ "portable-atomic",
  "thiserror",
  "tracing",
 ]
@@ -627,6 +628,12 @@ checksum = "50596ddc09eb5ad5f75cacd40209568e66df71baf86e1499a0e99c4cff12a5a6"
 dependencies = [
  "arrayvec",
 ]
+
+[[package]]
+name = "portable-atomic"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 
 [[package]]
 name = "proc-macro2"
