@@ -26,7 +26,8 @@ use crate::session::Session;
 /// Events other threads send to the UI thread.
 #[derive(Debug)]
 pub enum UserEvent {
-    /// A controller hotkey combo was pressed.
+    /// A controller hotkey combo was pressed; combos act only while a session exists, so menu
+    /// navigation on a controller never exits or toggles settings.
     Hotkey(HotkeyAction),
     /// Background work finished (game list scan); redraw.
     Wake,
@@ -58,7 +59,8 @@ pub const TOAST_TIME: Duration = Duration::from_secs(3);
 
 pub struct App {
     pub settings: Settings,
-    settings_path: PathBuf,
+    /// Where settings are saved; None when an unreadable file could not be backed up.
+    save_to: Option<PathBuf>,
     proxy: EventLoopProxy<UserEvent>,
     window: Option<Arc<Window>>,
     presenter: Option<Presenter>,
@@ -87,7 +89,7 @@ impl App {
     pub fn new(
         paths: &UserPaths,
         settings: Settings,
-        settings_path: PathBuf,
+        save_to: Option<PathBuf>,
         cli: Cli,
         proxy: EventLoopProxy<UserEvent>,
     ) -> Self {
@@ -107,7 +109,7 @@ impl App {
             hotkeys: HotkeyMap::new(&settings.ui.hotkeys),
             saved_speed_limit: settings.graphics.speed_limit.unwrap_or(100),
             settings,
-            settings_path,
+            save_to,
             proxy,
             window: None,
             presenter: None,
@@ -172,7 +174,10 @@ impl App {
     }
 
     fn save_settings(&self) {
-        if let Err(e) = self.settings.save(&self.settings_path) {
+        let Some(path) = &self.save_to else {
+            return;
+        };
+        if let Err(e) = self.settings.save(path) {
             tracing::error!("saving settings: {e}");
         }
     }
@@ -584,7 +589,10 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Hotkey(action) => self.apply(Action::Hotkey(action)),
+            UserEvent::Hotkey(action) if self.session.is_some() => {
+                self.apply(Action::Hotkey(action));
+            }
+            UserEvent::Hotkey(_) => {}
             UserEvent::Wake => self.games.poll(),
         }
         self.sync_guest_input();

@@ -20,30 +20,35 @@ use crate::app::{App, UserEvent};
 use crate::cli::Command;
 
 /// Reads the settings without logging, so the log filter they hold applies to their warnings. A
-/// file that is not TOML is copied to `<file>.bak` first, because the defaults that replace it are
-/// saved on exit.
-fn read_settings(path: &Path) -> (Settings, Vec<String>) {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Settings::default(), vec![]),
-        Err(e) => {
-            let warning = format!("reading {}: {e}", path.display());
-            return (Settings::default(), vec![warning]);
+/// file that cannot be read or is not TOML is copied to `<file>.bak`, because the defaults that
+/// replace it are saved; when that copy fails, saving is turned off (the returned `false`).
+fn read_settings(path: &Path) -> (Settings, Vec<String>, bool) {
+    let problem = match std::fs::read_to_string(path) {
+        Ok(text) => match Settings::from_toml(&text) {
+            Ok((settings, warnings)) => return (settings, warnings, true),
+            Err(e) => format!("is not valid TOML ({e})"),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (Settings::default(), vec![], true);
         }
+        Err(e) => format!("cannot be read ({e})"),
     };
-    Settings::from_toml(&text).unwrap_or_else(|e| {
-        let mut backup = path.as_os_str().to_owned();
-        backup.push(".bak");
-        let kept = match std::fs::copy(path, &backup) {
-            Ok(_) => format!("the original is kept as {}", backup.to_string_lossy()),
-            Err(copy) => format!("backing it up failed ({copy})"),
-        };
-        let warning = format!(
-            "{} is not valid TOML ({e}); using default settings, {kept}",
-            path.display()
-        );
-        (Settings::default(), vec![warning])
-    })
+    let mut backup = path.as_os_str().to_owned();
+    backup.push(".bak");
+    match std::fs::copy(path, &backup) {
+        Ok(_) => {
+            let kept = backup.to_string_lossy();
+            let warning =
+                format!("{problem}; using default settings, the original is kept as {kept}");
+            (Settings::default(), vec![warning], true)
+        }
+        Err(e) => {
+            let warning = format!(
+                "{problem}; using default settings without saving them, because backing the file up failed ({e})"
+            );
+            (Settings::default(), vec![warning], false)
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -64,7 +69,7 @@ fn main() -> ExitCode {
     };
     let paths = UserPaths::discover();
     let settings_path = cli.config.clone().unwrap_or_else(|| paths.settings_file());
-    let (settings, warnings) = read_settings(&settings_path);
+    let (settings, warnings, writable) = read_settings(&settings_path);
     lichii_common::init_logging(&settings.debug.log_filter);
     tracing::info!("Lichii {}", env!("CARGO_PKG_VERSION"));
     for warning in warnings {
@@ -81,7 +86,7 @@ fn main() -> ExitCode {
     let mut app = App::new(
         &paths,
         settings,
-        settings_path,
+        writable.then_some(settings_path),
         cli,
         event_loop.create_proxy(),
     );
@@ -91,5 +96,35 @@ fn main() -> ExitCode {
             eprintln!("lichii: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unreadable_settings_are_backed_up_or_never_saved() {
+        let dir = std::env::temp_dir().join(format!("lichii-read-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.toml");
+
+        assert!(read_settings(&path).2);
+
+        std::fs::write(&path, "not = [toml").unwrap();
+        let (_, warnings, writable) = read_settings(&path);
+        assert!(writable);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("settings.toml.bak")).unwrap(),
+            "not = [toml"
+        );
+
+        std::fs::remove_file(dir.join("settings.toml.bak")).unwrap();
+        std::fs::create_dir(dir.join("settings.toml.bak")).unwrap();
+        assert!(!read_settings(&path).2);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
