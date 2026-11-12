@@ -24,6 +24,7 @@ use crate::clock::GpuTimestamp;
 use crate::engines::maxwell_3d::regs::{MAX_CONST_BUFFERS, MAX_SHADER_STAGE, PrimitiveTopology};
 use crate::engines::maxwell_3d::{DirtyState, Regs};
 use crate::gmmu::Gmmu;
+use crate::host::Reduction;
 use crate::host1x::Syncpoints;
 
 /// A GPU channel (one per nvhost-gpu channel or NVN2 queue).
@@ -223,6 +224,14 @@ pub enum FenceAction {
         value: u64,
         size: ReleaseSize,
     },
+    /// Combine a 32-bit semaphore with `payload` (a reduction release): the old value is read
+    /// when the action runs, so the result includes every earlier release.
+    ReduceSemaphore {
+        address: DAddr,
+        op: Reduction,
+        signed: bool,
+        payload: u32,
+    },
     /// Increment a host1x syncpoint's guest-visible value (its work has finished).
     IncrementSyncpoint(u32),
 }
@@ -246,6 +255,21 @@ impl FenceAction {
                 };
                 if let Err(fault) = result {
                     tracing::warn!(?fault, "semaphore release to unmapped device memory");
+                }
+            }
+            Self::ReduceSemaphore {
+                address,
+                op,
+                signed,
+                payload,
+            } => {
+                let result = handles.device.read::<u32>(address).and_then(|old| {
+                    handles
+                        .device
+                        .write(address, op.apply(old, payload, signed))
+                });
+                if let Err(fault) = result {
+                    tracing::warn!(?fault, "semaphore reduction on unmapped device memory");
                 }
             }
             Self::IncrementSyncpoint(id) => {
@@ -391,4 +415,69 @@ pub trait Rasterizer: Send {
 
     /// Presents a guest frame (scaled, filtered and anti-aliased per settings).
     fn present(&mut self, framebuffer: &FramebufferConfig);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::GuestTime;
+    use lichii_memory::{AddressSpace, MemoryPermission, PhysicalMemory};
+
+    struct Boot;
+
+    impl GuestTime for Boot {
+        fn global_time_ns(&self) -> u64 {
+            1_000_000_000
+        }
+    }
+
+    fn handles() -> (AddressSpace, GpuHandles) {
+        let physical = Arc::new(PhysicalMemory::new(1 << 20).unwrap());
+        let space = AddressSpace::new(physical.clone(), 39);
+        space.map(0x1000_0000, 0, 0x1000, MemoryPermission::READ_WRITE);
+        let device = Arc::new(DeviceAddressSpace::new(physical, 36));
+        device
+            .map_process(0x10_0000, &space, 0x1000_0000, 0x1000)
+            .unwrap();
+        let handles = GpuHandles {
+            device,
+            syncpoints: Arc::new(Syncpoints::new()),
+            timestamp: Arc::new(GpuTimestamp::new(Arc::new(Boot), false)),
+        };
+        (space, handles)
+    }
+
+    #[test]
+    fn sixteen_byte_release_carries_the_gpu_timestamp() {
+        let (_space, h) = handles();
+        FenceAction::WriteSemaphore {
+            address: 0x10_0000,
+            value: 7,
+            size: ReleaseSize::Sixteen,
+        }
+        .execute(&h);
+        assert_eq!(
+            h.device.read::<[u64; 2]>(0x10_0000).unwrap(),
+            [7, 614_400_000]
+        );
+    }
+
+    #[test]
+    fn reduction_combines_with_the_value_at_execution() {
+        let (_space, h) = handles();
+        FenceAction::WriteSemaphore {
+            address: 0x10_0000,
+            value: 10,
+            size: ReleaseSize::Four,
+        }
+        .execute(&h);
+        FenceAction::ReduceSemaphore {
+            address: 0x10_0000,
+            op: Reduction::Add,
+            signed: false,
+            payload: 5,
+        }
+        .execute(&h);
+        assert_eq!(h.device.read::<u32>(0x10_0000).unwrap(), 15);
+    }
 }
