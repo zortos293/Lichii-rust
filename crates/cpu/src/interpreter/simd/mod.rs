@@ -6,6 +6,8 @@
 //! bit, so results and FPSR flags match hardware under every FPCR setting.
 
 mod advsimd;
+mod crypto;
+mod fp_vector;
 mod indexed;
 mod int;
 mod lanes;
@@ -33,11 +35,18 @@ pub(super) fn execute(ctx: &mut ThreadContext, instruction: u32) -> Option<Resul
     if bits(instruction, 27, 25) != 0b111 {
         return None;
     }
-    let result = match bits(instruction, 31, 28) {
-        op0 if op0 & 0b0101 == 0b0001 => scalar_fp::execute(ctx, instruction),
-        op0 if op0 & 0b1001 == 0 => advsimd::vector(ctx, instruction),
-        op0 if op0 & 0b1101 == 0b0101 => advsimd::scalar(ctx, instruction),
-        _ => Err(Undefined),
+    let op0 = bits(instruction, 31, 28);
+    let crypto = if matches!(op0, 0b0100 | 0b0101 | 0b1100) {
+        crypto::execute(ctx, instruction)
+    } else {
+        None
+    };
+    let result = match crypto {
+        Some(result) => result,
+        None if op0 & 0b0101 == 0b0001 => scalar_fp::execute(ctx, instruction),
+        None if op0 & 0b1001 == 0 => advsimd::vector(ctx, instruction),
+        None if op0 & 0b1101 == 0b0101 => advsimd::scalar(ctx, instruction),
+        None => Err(Undefined),
     };
     Some(result.map_err(|Undefined| {
         HaltReason::Fault(CpuFault::Undefined {
