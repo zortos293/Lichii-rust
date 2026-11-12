@@ -71,7 +71,7 @@ impl Source {
             InputBinding::None => return Self::None,
             InputBinding::Key(name) => Key::from_name(name).map(Self::Key),
             InputBinding::MouseButton(name) => MouseButton::from_name(name).map(Self::Mouse),
-            InputBinding::GamepadButton { button } => PadButton::from_name(button).map(Self::Pad),
+            InputBinding::GamepadButton { button } => PadButton::parse(button).map(Self::Pad),
             InputBinding::GamepadAxis {
                 axis,
                 threshold,

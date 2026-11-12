@@ -40,6 +40,7 @@ ash = "0.38"
 egui = "0.37"
 raw-window-handle = "0.6"
 winit = "0.30"
+sdl3 = { version = "0.22", features = ["build-from-source-static", "build-from-source-unix-console", "hidapi"] }
 
 [profile.dev]
 opt-level = 1

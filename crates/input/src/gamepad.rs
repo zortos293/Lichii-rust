@@ -47,16 +47,30 @@ named_enum! {
         DPadLeft => "dpleft",
         DPadRight => "dpright",
         Misc1 => "misc1",
-        RightPaddle1 => "rightpaddle1",
-        LeftPaddle1 => "leftpaddle1",
-        RightPaddle2 => "rightpaddle2",
-        LeftPaddle2 => "leftpaddle2",
+        RightPaddle1 => "paddle1",
+        LeftPaddle1 => "paddle2",
+        RightPaddle2 => "paddle3",
+        LeftPaddle2 => "paddle4",
         Touchpad => "touchpad",
         Misc2 => "misc2",
         Misc3 => "misc3",
         Misc4 => "misc4",
         Misc5 => "misc5",
         Misc6 => "misc6",
+    }
+}
+
+impl PadButton {
+    /// A stored button name, including the paddle names settings written before they matched
+    /// SDL's (`leftpaddle1` and so on).
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::from_name(name).or(match name {
+            "rightpaddle1" => Some(Self::RightPaddle1),
+            "leftpaddle1" => Some(Self::LeftPaddle1),
+            "rightpaddle2" => Some(Self::RightPaddle2),
+            "leftpaddle2" => Some(Self::LeftPaddle2),
+            _ => None,
+        })
     }
 }
 
@@ -128,6 +142,11 @@ mod tests {
         assert_eq!(PadButton::from_sdl_index(1), Some(PadButton::East));
         assert_eq!(PadButton::from_name("dpup"), Some(PadButton::DPadUp));
         assert_eq!(PadButton::ALL.len(), 26);
+        assert_eq!(PadButton::parse("paddle2"), Some(PadButton::LeftPaddle1));
+        assert_eq!(
+            PadButton::parse("leftpaddle1"),
+            Some(PadButton::LeftPaddle1)
+        );
         assert_eq!(
             PadAxis::from_name("righttrigger"),
             Some(PadAxis::RightTrigger)
