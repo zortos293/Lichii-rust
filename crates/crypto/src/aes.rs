@@ -3,6 +3,7 @@ use aes::cipher::{Array, BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 
 use crate::Key128;
 
+/// Size of one AES block in bytes.
 pub const AES_BLOCK_SIZE: usize = 16;
 
 const BATCH_BLOCKS: usize = 8;
@@ -26,6 +27,7 @@ pub struct AesEcb {
 }
 
 impl AesEcb {
+    /// Expands `key` once; the cipher can then be reused for any number of blocks.
     pub fn new(key: &Key128) -> Self {
         Self {
             cipher: cipher(key),
@@ -42,6 +44,7 @@ impl AesEcb {
         self.cipher.decrypt_blocks(blocks_mut(data));
     }
 
+    /// Decrypts one 16-byte key (or any single block) and returns it.
     pub fn decrypt_key(&self, key: &Key128) -> Key128 {
         let mut out = *key;
         self.decrypt(&mut out);
@@ -58,6 +61,7 @@ pub struct AesCtr {
 }
 
 impl AesCtr {
+    /// Expands `key` once; [`AesCtr::apply`] then needs no per-call setup.
     pub fn new(key: &Key128) -> Self {
         Self {
             cipher: cipher(key),
@@ -120,6 +124,7 @@ pub struct AesXts {
 }
 
 impl AesXts {
+    /// `key` is the 16-byte data key followed by the 16-byte tweak key.
     pub fn new(key: &[u8; 32], kind: XtsTweak) -> Self {
         let (data, tweak) = key.split_at(16);
         Self {

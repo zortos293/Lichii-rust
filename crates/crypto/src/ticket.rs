@@ -26,10 +26,11 @@ pub enum TicketError {
     Truncated,
 }
 
-const DATA_SIZE: usize = 0x2c0;
+const BODY_SIZE: usize = 0x180;
 
 impl Ticket {
-    /// Parses a ticket: a signature block followed by the 0x2C0-byte ticket body.
+    /// Parses a ticket: a signature block followed by the ticket body. Only the first 0x180 bytes
+    /// of the body (the common part every ticket has) are required.
     pub fn parse(raw: &[u8]) -> Result<Self, TicketError> {
         let sig_type = u32::from_le_bytes(
             raw.get(..4)
@@ -44,7 +45,7 @@ impl Ticket {
             other => return Err(TicketError::SignatureType(other)),
         };
         let data = raw
-            .get(body_offset..body_offset + DATA_SIZE)
+            .get(body_offset..body_offset + BODY_SIZE)
             .ok_or(TicketError::Truncated)?;
         let title_key = match data[0x141] {
             0 => TitleKey::Common(data[0x40..0x50].try_into().unwrap()),
@@ -64,7 +65,7 @@ mod tests {
     use super::*;
 
     fn ticket(sig_type: u32, body_offset: usize, key_type: u8) -> Vec<u8> {
-        let mut raw = vec![0u8; body_offset + DATA_SIZE];
+        let mut raw = vec![0u8; body_offset + BODY_SIZE];
         raw[..4].copy_from_slice(&sig_type.to_le_bytes());
         let data = &mut raw[body_offset..];
         data[0x40..0x50].fill(0x77);
@@ -76,6 +77,7 @@ mod tests {
 
     #[test]
     fn parses_every_signature_layout() {
+        assert_eq!(ticket(0x10004, 0x140, 0).len(), 0x2c0);
         for (sig, offset) in [(0x10004, 0x140), (0x10000, 0x240), (0x10005, 0x80)] {
             let parsed = Ticket::parse(&ticket(sig, offset, 0)).unwrap();
             assert_eq!(parsed.rights_id, RightsId([0x5a; 16]));
@@ -88,7 +90,7 @@ mod tests {
         );
         assert_eq!(Ticket::parse(&[0; 8]), Err(TicketError::SignatureType(0)));
         assert_eq!(
-            Ticket::parse(&ticket(0x10004, 0x140, 0)[..0x300]),
+            Ticket::parse(&ticket(0x10004, 0x140, 0)[..0x2bf]),
             Err(TicketError::Truncated)
         );
     }

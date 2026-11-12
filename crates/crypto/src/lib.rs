@@ -18,8 +18,11 @@ pub use crate::keys::{
 };
 pub use crate::ticket::{Ticket, TicketError, TitleKey};
 
+/// A 128-bit AES key.
 pub type Key128 = [u8; 16];
+/// A 256-bit key: two AES-128 keys (XTS data and tweak key, or header key halves).
 pub type Key256 = [u8; 32];
+/// A SHA-256 digest.
 pub type Sha256Hash = [u8; 32];
 
 /// SHA-256 of `data`.
@@ -33,14 +36,17 @@ pub fn sha256(data: &[u8]) -> Sha256Hash {
 pub struct Sha256(sha2::Sha256);
 
 impl Sha256 {
+    /// A hasher with no input yet.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Feeds `data` into the hash.
     pub fn update(&mut self, data: &[u8]) {
         sha2::Digest::update(&mut self.0, data);
     }
 
+    /// The digest of everything fed so far.
     pub fn finalize(self) -> Sha256Hash {
         sha2::Digest::finalize(self.0).into()
     }

@@ -24,10 +24,12 @@ pub enum KeyAreaKeyType {
 impl KeyAreaKeyType {
     pub const ALL: [Self; 3] = [Self::Application, Self::Ocean, Self::System];
 
+    /// The key type an NCA header's key index byte selects; `None` for unknown indices.
     pub fn from_index(index: u8) -> Option<Self> {
         Self::ALL.get(usize::from(index)).copied()
     }
 
+    /// The name `prod.keys` uses, as in `key_area_key_<name>_XX`.
     pub fn name(self) -> &'static str {
         match self {
             Self::Application => "application",
@@ -148,6 +150,7 @@ fn missing(name: impl Into<String>) -> KeyError {
 }
 
 impl KeySet {
+    /// An empty key set; every accessor reports its key as missing.
     pub fn new() -> Self {
         Self::default()
     }
@@ -378,6 +381,8 @@ impl KeySet {
             .ok_or_else(|| missing("header_key"))
     }
 
+    /// The master key of key `revision` (`master_key_XX`, zero-based). An NCA's key generation
+    /// maps to a revision through [`master_key_revision`].
     pub fn master_key(&self, revision: usize) -> Result<Key128, KeyError> {
         self.master_keys
             .get(revision)
@@ -395,6 +400,9 @@ impl KeySet {
             .ok_or_else(|| missing(format!("key_area_key_{}_{revision:02x}", kind.name())))
     }
 
+    /// The titlekek of key `revision` (`titlekek_XX`, zero-based), which decrypts title keys of
+    /// NCAs with that revision. An NCA's key generation maps to a revision through
+    /// [`master_key_revision`].
     pub fn titlekek(&self, revision: usize) -> Result<Key128, KeyError> {
         self.titlekeks
             .get(revision)
@@ -423,6 +431,7 @@ impl KeySet {
         self.title_keys.insert(rights_id, encrypted_key);
     }
 
+    /// The XTS key for SD card save data or NCAs, from the file or derived from `sd_seed`.
     pub fn sd_card_key(&self, kind: SdKeyType) -> Result<Key256, KeyError> {
         self.sd_card_keys[kind as usize].ok_or_else(|| match kind {
             SdKeyType::Save => missing("sd_card_save_key"),
