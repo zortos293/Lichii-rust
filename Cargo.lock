@@ -1396,10 +1396,12 @@ dependencies = [
  "lichii-common",
  "lichii-cpu",
  "lichii-gpu",
+ "lichii-input",
  "lichii-kernel",
  "lichii-loader",
  "lichii-memory",
  "lichii-services",
+ "parking_lot",
  "thiserror 2.0.21",
  "tracing",
 ]
@@ -1548,6 +1550,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "ash-window",
+ "bytemuck",
  "egui",
  "gpu-allocator",
  "lichii-common",
