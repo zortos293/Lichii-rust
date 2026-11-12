@@ -16,9 +16,9 @@
 use std::sync::Arc;
 
 use lichii_common::{DAddr, GpuVAddr};
+use lichii_memory::DeviceAddressSpace;
 use lichii_texture::PixelFormat;
 
-use crate::device_memory::DeviceMemory;
 use crate::engines::maxwell_3d::regs::{MAX_CONST_BUFFERS, MAX_SHADER_STAGE, PrimitiveTopology};
 use crate::engines::maxwell_3d::{DirtyState, Regs};
 use crate::gmmu::Gmmu;
@@ -31,7 +31,7 @@ pub struct ChannelId(pub u32);
 /// Shared GPU state the renderer needs outside individual calls.
 #[derive(Clone)]
 pub struct GpuHandles {
-    pub device: Arc<DeviceMemory>,
+    pub device: Arc<DeviceAddressSpace>,
     pub syncpoints: Arc<Syncpoints>,
 }
 
