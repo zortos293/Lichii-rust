@@ -1,10 +1,22 @@
 //! IR passes. Every pass is linear or n log n in program size.
 
+mod constant_propagation;
+#[cfg(test)]
+mod eval_tests;
+mod lower_fp16_to_fp32;
+mod lower_fp64_to_fp32;
+mod lower_int64_to_int32;
 mod ssa_rewrite;
 #[cfg(test)]
 mod tests;
+mod verify;
 
+pub use constant_propagation::constant_propagation;
+pub use lower_fp16_to_fp32::lower_fp16_to_fp32;
+pub use lower_fp64_to_fp32::lower_fp64_to_fp32;
+pub use lower_int64_to_int32::lower_int64_to_int32;
 pub use ssa_rewrite::ssa_rewrite;
+pub use verify::verify;
 
 use crate::ir::{BlockId, Opcode, Program, SyntaxNode, Value};
 
