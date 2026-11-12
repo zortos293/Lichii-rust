@@ -4,6 +4,12 @@
 //! memory and what every instruction does to control flow. The CFG, indirect branch resolution
 //! and structurisation are then shared by Maxwell and Ampere.
 
+pub mod cfg;
+#[cfg(test)]
+mod tests;
+
+pub use cfg::{Block, BlockId, Cfg, EndClass, FunctionId};
+
 use crate::ShaderEnvironment;
 use crate::TranslateError;
 use crate::ir::{Condition, Reg};
@@ -52,8 +58,9 @@ pub struct FlowInst {
 }
 
 /// A jump table read by an indirect branch: `num_entries` words at `cbuf_offset` of constant
-/// buffer `cbuf_index`. Each entry plus `branch_offset` (and the branch's own address for a
-/// relative branch) is a target offset.
+/// buffer `cbuf_index`. Each target offset is the entry plus `branch_offset`, plus the branch's
+/// own offset when the branch is relative; `branch_offset` already includes the instruction set's
+/// next-instruction bias.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IndirectBranchTable {
     pub cbuf_index: u32,
