@@ -23,6 +23,10 @@ Each crate has one owner at a time. Change another crate's public API only throu
 - `lichii_shader::{ShaderEnvironment, ShaderModule}`: shader and renderer.
 - `lichii_common::settings::Settings`: everyone.
 
+## Merging
+
+The owner granted standing permission (2026-11-12: "you can merge by yourself you have full permission"): the Captain thread may merge pull requests into main without asking, once every CI check passed, every Capy review completed with no open findings, and the branch merges cleanly. Squash-merge with a head guard. Crew threads never merge; they report ready PRs to the Captain.
+
 ## Code rules
 
 - Rust 2024, stable toolchain. `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` must pass.
