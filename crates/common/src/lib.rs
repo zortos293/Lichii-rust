@@ -1,6 +1,7 @@
 //! Types shared by every Lichii crate.
 
 pub mod paths;
+pub mod perf;
 pub mod result;
 pub mod settings;
 

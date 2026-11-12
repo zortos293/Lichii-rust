@@ -36,6 +36,9 @@ bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
 directories = "6"
 memmap2 = "0.9"
 crossbeam-channel = "0.5"
+ash = "0.38"
+egui = "0.37"
+raw-window-handle = "0.6"
 
 [profile.dev]
 opt-level = 1
