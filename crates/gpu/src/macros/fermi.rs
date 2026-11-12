@@ -236,12 +236,10 @@ impl<H: MacroHost> Machine<'_, H> {
                 let dst_bit = instruction.dst_bit;
                 (a & !(mask << dst_bit)) | (((b >> instruction.src_bit) & mask) << dst_bit)
             }
-            Operation::ExtractShiftLeftImmediate => {
-                (b.wrapping_shr(a) & mask) << instruction.dst_bit
-            }
-            Operation::ExtractShiftLeftRegister => {
-                ((b >> instruction.src_bit) & mask).wrapping_shl(a)
-            }
+            Operation::ExtractShiftLeftImmediate if a > 31 => 0,
+            Operation::ExtractShiftLeftImmediate => ((b >> a) & mask) << instruction.dst_bit,
+            Operation::ExtractShiftLeftRegister if a > 31 => 0,
+            Operation::ExtractShiftLeftRegister => ((b >> instruction.src_bit) & mask) << a,
             Operation::Read => {
                 self.record.uncacheable();
                 self.host

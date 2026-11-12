@@ -242,8 +242,8 @@ impl MacroEngine {
             code_generation: 0,
             memo: MacroMemo::new(DEFAULT_MEMO_WORDS),
             memo_enabled: true,
-            record: CallRecord::default(),
-            load_fifo: Vec::new(),
+            record: CallRecord::with_capacity(RECORD_MAX_WORDS),
+            load_fifo: Vec::with_capacity(LOAD_FIFO_MAX_WORDS),
             step_limit: DEFAULT_STEP_LIMIT,
             stats: MacroStats::default(),
         }
@@ -447,8 +447,7 @@ struct Fault {
 /// What an interpreted call did, for the memo: its method writes, the data RAM words it read
 /// before writing them itself, and its data RAM writes, each as flattened (address, value)
 /// pairs. Recording stops, and the call is not remembered, once the call reads a register or
-/// guest memory or records too much. The buffers keep their capacity between calls.
-#[derive(Default)]
+/// guest memory or records too much. The buffers are allocated at that bound up front.
 struct CallRecord {
     recording: bool,
     writes: Vec<u32>,
@@ -457,6 +456,15 @@ struct CallRecord {
 }
 
 impl CallRecord {
+    fn with_capacity(words: usize) -> Self {
+        Self {
+            recording: false,
+            writes: Vec::with_capacity(words),
+            data_ram_reads: Vec::with_capacity(words),
+            data_ram_writes: Vec::with_capacity(words),
+        }
+    }
+
     fn begin(&mut self, recording: bool) {
         self.recording = recording;
         self.writes.clear();

@@ -103,6 +103,26 @@ fn bitfield_operations() {
 }
 
 #[test]
+fn bitfield_positions_past_31_give_zero() {
+    let code = [
+        set_method(0x300, 1),
+        addi(IGNORE_FETCH, 2, 0, 0),
+        addi(MOVE, 3, 0, 32),
+        addi(MOVE, 4, 0, 33),
+        extract_shl_imm(MOVE_SEND, 0, 3, 2, 1, 0),
+        extract_shl_reg(MOVE_SEND, 0, 3, 2, 0, 1),
+        extract_shl_imm(MOVE_SEND, 0, 4, 2, 1, 0),
+        extract_shl_reg(MOVE_SEND, 0, 4, 2, 0, 1),
+        exit(nop()),
+        nop(),
+    ];
+    assert_eq!(
+        writes(&code, &[0, 1]),
+        [(0x300, 0), (0x301, 0), (0x302, 0), (0x303, 0)]
+    );
+}
+
+#[test]
 fn result_operations_set_method_and_increment() {
     let code = [
         addi(MOVE_SET_METHOD_SEND, 0, 0, 0x50A0),

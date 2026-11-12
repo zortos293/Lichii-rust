@@ -4,7 +4,8 @@
 //! words it read (no register reads, no DMA reads) is recorded: its data RAM writes and its
 //! method writes. A later call with the same start and parameters, whose recorded data RAM reads
 //! still hold, replays those writes instead of being interpreted. Records live in one bounded
-//! arena of words; the replay path reads them in place and allocates nothing.
+//! arena of words. The arena and the map are allocated at their bounds up front, so neither
+//! replaying nor storing nor compacting allocates.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -18,6 +19,10 @@ const NO_RECORD: u32 = u32::MAX;
 /// Direct-mapped slots of the last record found or stored per start address: nearly half the
 /// calls repeat the previous call of the same macro, and its record is still in the cache.
 const LAST_SLOTS: usize = 256;
+/// Arena words per map entry the memo reserves: a store that would need more entries clears
+/// the memo instead of growing the map. Small arenas get at least `MIN_ENTRIES`.
+const WORDS_PER_ENTRY: usize = 32;
+const MIN_ENTRIES: usize = 256;
 
 /// Counters of one memo.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -38,7 +43,7 @@ pub struct MemoStats {
     pub rejected: u64,
     /// Arena compactions.
     pub compactions: u64,
-    /// Arena clears (after a compaction that freed too little, or a code change).
+    /// Arena clears (after a compaction that freed too little, a full map, or a code change).
     pub clears: u64,
     /// Records currently remembered.
     pub entries: u64,
@@ -75,7 +80,7 @@ pub(super) struct Replay<'a> {
 pub(super) struct MacroMemo {
     entries: HashMap<u64, u32, BuildHasherDefault<KeyHasher>>,
     arena: Vec<u32>,
-    compacted: Vec<u32>,
+    max_entries: usize,
     last: Box<[(u32, u32); LAST_SLOTS]>,
     generation: u64,
     max_words: usize,
@@ -84,10 +89,11 @@ pub(super) struct MacroMemo {
 
 impl MacroMemo {
     pub(super) fn new(max_words: usize) -> Self {
+        let max_entries = (max_words / WORDS_PER_ENTRY).max(MIN_ENTRIES);
         Self {
-            entries: HashMap::default(),
-            arena: Vec::new(),
-            compacted: Vec::new(),
+            entries: HashMap::with_capacity_and_hasher(max_entries, BuildHasherDefault::default()),
+            arena: Vec::with_capacity(max_words),
+            max_entries,
             last: Box::new([(0, NO_RECORD); LAST_SLOTS]),
             generation: 0,
             max_words,
@@ -211,6 +217,10 @@ impl MacroMemo {
             self.stats.rejected += 1;
             return;
         }
+        if self.entries.len() >= self.max_entries {
+            self.clear();
+            self.stats.clears += 1;
+        }
         if self.arena.len() + words > self.max_words {
             self.compact(words);
         }
@@ -226,20 +236,29 @@ impl MacroMemo {
         self.stats.stores += 1;
     }
 
-    /// Copies the records still in the map to a fresh arena: a call stored again with another
-    /// shape leaves its old record behind (row 129). Clears everything when the live records
-    /// alone, plus the record about to be stored, would fill most of the arena.
+    /// Slides the records still in the map to the front of the arena: a call stored again with
+    /// another shape leaves its old record behind (row 129). Clears everything when the live
+    /// records alone, plus the record about to be stored, would fill most of the arena.
     fn compact(&mut self, incoming: usize) {
-        self.compacted.clear();
-        for offset in self.entries.values_mut() {
-            let record = &self.arena[*offset as usize..];
+        let mut read = 0;
+        let mut write = 0;
+        while read < self.arena.len() {
+            let record = &self.arena[read..];
+            let parameters = record[1] as usize;
             let len = HEADER_WORDS
-                + record[1] as usize
+                + parameters
                 + 2 * (record[2] as usize + record[3] as usize + record[4] as usize);
-            *offset = self.compacted.len() as u32;
-            self.compacted.extend_from_slice(&record[..len]);
+            let hash = key(record[0], &record[HEADER_WORDS..HEADER_WORDS + parameters]);
+            if let Some(offset) = self.entries.get_mut(&hash)
+                && *offset as usize == read
+            {
+                *offset = write as u32;
+                self.arena.copy_within(read..read + len, write);
+                write += len;
+            }
+            read += len;
         }
-        std::mem::swap(&mut self.arena, &mut self.compacted);
+        self.arena.truncate(write);
         self.last.fill((0, NO_RECORD));
         self.stats.compactions += 1;
         if self.arena.len() + incoming > self.max_words / 4 * 3 {
