@@ -282,3 +282,46 @@ fn guest_icache_maintenance_invalidates_patched_code() {
     h.ctx.pc = CODE;
     assert_eq!(h.core.run(&mut h.ctx), HaltReason::SupervisorCall(3));
 }
+#[test]
+fn narrow_signed_atomics_compare_signed_values() {
+    let mut h = harness(&[
+        0x38214062, // ldsmaxb w1, w2, [x3]
+        0x782450c5, // ldsminh w4, w5, [x6]
+        0xb8274128, // ldsmax w7, w8, [x9]
+        0xb827712a, // ldumin w7, w10, [x9]
+        0xd4200000, // brk #0
+    ]);
+    h.mem.write(DATA, 0xfeu8).unwrap();
+    h.mem.write(DATA + 2, 1u16).unwrap();
+    h.mem.write(DATA + 4, 0x8000_0000u32).unwrap();
+    h.ctx.x[3] = DATA;
+    h.ctx.x[4] = 0xffff;
+    h.ctx.x[6] = DATA + 2;
+    h.ctx.x[7] = 1;
+    h.ctx.x[9] = DATA + 4;
+    assert_eq!(h.core.run(&mut h.ctx), HaltReason::Breakpoint(0));
+    assert_eq!((h.ctx.x[2], h.mem.read::<u8>(DATA).unwrap()), (0xfe, 0));
+    assert_eq!(
+        (h.ctx.x[5], h.mem.read::<u16>(DATA + 2).unwrap()),
+        (1, 0xffff)
+    );
+    assert_eq!(h.ctx.x[8], 0x8000_0000);
+    assert_eq!((h.ctx.x[10], h.mem.read::<u32>(DATA + 4).unwrap()), (1, 1));
+}
+
+#[test]
+fn misaligned_exclusives_and_atomics_fault() {
+    for (word, addr) in [
+        (0xc85f7c20u32, DATA + 4), // ldxr x0, [x1]
+        (0xb8200022, DATA + 2),    // ldadd w0, w2, [x1]
+        (0x48227c24, DATA + 8),    // casp x2, x3, x4, x5, [x1]
+    ] {
+        let mut h = harness(&[word]);
+        h.ctx.x[1] = addr;
+        assert_eq!(
+            h.core.run(&mut h.ctx),
+            HaltReason::Fault(CpuFault::Alignment { pc: CODE, addr }),
+            "{word:#010x}"
+        );
+    }
+}
