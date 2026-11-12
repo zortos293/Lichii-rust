@@ -5,6 +5,7 @@
 //! All floating point goes through [`softfloat`], which follows the Arm ARM pseudocode bit for
 //! bit, so results and FPSR flags match hardware under every FPCR setting.
 
+mod crypto;
 mod scalar_fp;
 pub(crate) mod softfloat;
 #[cfg(test)]
@@ -27,9 +28,14 @@ pub(super) fn execute(ctx: &mut ThreadContext, instruction: u32) -> Option<Resul
     if bits(instruction, 27, 25) != 0b111 {
         return None;
     }
-    let result = match bits(instruction, 31, 28) {
-        op0 if op0 & 0b0101 == 0b0001 => scalar_fp::execute(ctx, instruction),
-        _ => Err(Undefined),
+    let op0 = bits(instruction, 31, 28);
+    let crypto = matches!(op0, 0b0100 | 0b0101 | 0b1100)
+        .then(|| crypto::execute(ctx, instruction))
+        .flatten();
+    let result = match crypto {
+        Some(result) => result,
+        None if op0 & 0b0101 == 0b0001 => scalar_fp::execute(ctx, instruction),
+        None => Err(Undefined),
     };
     Some(result.map_err(|Undefined| {
         HaltReason::Fault(CpuFault::Undefined {
