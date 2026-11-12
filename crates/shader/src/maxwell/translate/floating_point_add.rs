@@ -119,6 +119,7 @@ pub(super) mod tests {
     struct NativeEnv(TestEnv);
 
     impl ShaderEnvironment for NativeEnv {
+        test_gpu_state!();
         fn arch(&self) -> ShaderArch {
             ShaderArch::Ampere
         }

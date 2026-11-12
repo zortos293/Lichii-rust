@@ -39,6 +39,7 @@ impl TestEnv {
 }
 
 impl ShaderEnvironment for TestEnv {
+    test_gpu_state!();
     fn arch(&self) -> ShaderArch {
         ShaderArch::Maxwell
     }

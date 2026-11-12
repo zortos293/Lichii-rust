@@ -4,6 +4,33 @@
 //! depends on, and gets back a [\`ShaderModule\`] with SPIR-V and the resource layout the
 //! pipeline needs. The shader crew owns everything here; the Vulkan crew consumes it.
 
+#[cfg(test)]
+macro_rules! test_gpu_state {
+    () => {
+        fn texture_type(&self, _: u32) -> $crate::ir::TextureType {
+            $crate::ir::TextureType::Color2D
+        }
+        fn texture_pixel_format(&self, _: u32) -> $crate::info::TexturePixelFormat {
+            $crate::info::TexturePixelFormat::A8b8g8r8Unorm
+        }
+        fn is_texture_pixel_format_integer(&self, _: u32) -> bool {
+            false
+        }
+        fn viewport_transform_state(&self) -> u32 {
+            1
+        }
+        fn texture_bound_buffer(&self) -> u32 {
+            2
+        }
+        fn local_memory_size(&self) -> u32 {
+            0
+        }
+        fn has_hle_macro_state(&self) -> bool {
+            false
+        }
+    };
+}
+
 pub mod ampere;
 pub mod flow;
 pub mod info;
@@ -55,6 +82,30 @@ pub trait ShaderEnvironment {
     fn shared_memory_size(&self) -> u32;
     /// Workgroup size (compute).
     fn workgroup_size(&self) -> [u32; 3];
+    /// Type of the texture descriptor (TIC) a raw handle selects; texture instructions whose
+    /// encoding leaves the type open take it from here.
+    fn texture_type(&self, raw_handle: u32) -> ir::TextureType;
+    /// Pixel format of the texture descriptor a raw handle selects.
+    fn texture_pixel_format(&self, raw_handle: u32) -> info::TexturePixelFormat;
+    /// Whether that descriptor's pixel format is an integer format.
+    fn is_texture_pixel_format_integer(&self, raw_handle: u32) -> bool;
+    /// The viewport transform enable register (0 when the guest disabled it).
+    fn viewport_transform_state(&self) -> u32;
+    /// Constant buffer that holds bound texture handles.
+    fn texture_bound_buffer(&self) -> u32;
+    /// Local memory size in bytes the program header or launch asks for.
+    fn local_memory_size(&self) -> u32;
+    /// Whether HLE macros replaced some draw parameters, so their constant buffer reads must
+    /// become shader inputs.
+    fn has_hle_macro_state(&self) -> bool;
+    /// Whether constant buffer `index` at `offset` may hold a storage buffer pointer.
+    fn is_cbuf_storage_buffer_pointer(&self, _index: u32, _offset: u32) -> bool {
+        true
+    }
+    /// Per-pipeline geometry passthrough mask (geometry shaders).
+    fn gp_passthrough_mask(&self) -> [u32; 8] {
+        [0; 8]
+    }
 }
 
 /// A translated program.

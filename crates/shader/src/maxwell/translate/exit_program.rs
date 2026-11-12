@@ -63,6 +63,7 @@ pub(super) mod tests {
     }
 
     impl ShaderEnvironment for StageEnv {
+        test_gpu_state!();
         fn arch(&self) -> ShaderArch {
             self.inner.arch()
         }
