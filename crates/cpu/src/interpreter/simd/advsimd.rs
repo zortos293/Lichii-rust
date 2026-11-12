@@ -1,13 +1,14 @@
 //! Decoding of the Advanced SIMD vector and scalar encoding classes.
 
-use super::{Exec, Undefined, bit, bits, indexed, int, movement, shift};
+use super::{Exec, Undefined, bit, bits, fp_vector as fp, indexed, int, movement, shift};
 use crate::ThreadContext;
 
 /// Bits 31:28 are `0xx0`: an Advanced SIMD vector instruction.
 pub(super) fn vector(ctx: &mut ThreadContext, inst: u32) -> Exec {
     if bit(inst, 24) {
         if !bit(inst, 10) {
-            return indexed::indexed(ctx, inst, false).unwrap_or(Err(Undefined));
+            return indexed::indexed(ctx, inst, false)
+                .unwrap_or_else(|| fp::indexed(ctx, inst, false));
         }
         if bit(inst, 23) {
             return Err(Undefined);
@@ -21,22 +22,30 @@ pub(super) fn vector(ctx: &mut ThreadContext, inst: u32) -> Exec {
         return match bits(inst, 11, 10) {
             0b00 => int::three_different(ctx, inst, false),
             0b10 => match bits(inst, 20, 17) {
-                0b0000 => int::two_misc(ctx, inst, false).unwrap_or(Err(Undefined)),
-                0b1000 => int::across_lanes(ctx, inst).unwrap_or(Err(Undefined)),
+                0b0000 => int::two_misc(ctx, inst, false)
+                    .unwrap_or_else(|| fp::two_misc(ctx, inst, false, false)),
+                0b1000 => {
+                    int::across_lanes(ctx, inst).unwrap_or_else(|| fp::across_lanes(ctx, inst))
+                }
+                0b1100 if bit(inst, 22) => fp::two_misc(ctx, inst, false, true),
                 _ => Err(Undefined),
             },
             _ if bits(inst, 15, 11) < 0b11000 => int::three_same(ctx, inst, false),
-            _ => Err(Undefined),
+            _ => fp::three_same(ctx, inst, false, false),
         };
     }
     if bit(inst, 10) {
         if bit(inst, 15) {
+            if bits(inst, 14, 11) >= 0b1000 {
+                return fp::complex(ctx, inst, false);
+            }
             return int::three_same_extra(ctx, inst, false);
         }
-        if bits(inst, 23, 22) == 0 {
-            return movement::copy(ctx, inst, false);
-        }
-        return Err(Undefined);
+        return match bits(inst, 23, 22) {
+            0b00 => movement::copy(ctx, inst, false),
+            _ if bit(inst, 22) && !bit(inst, 14) => fp::three_same(ctx, inst, false, true),
+            _ => Err(Undefined),
+        };
     }
     if bit(inst, 15) {
         return Err(Undefined);
@@ -52,7 +61,8 @@ pub(super) fn vector(ctx: &mut ThreadContext, inst: u32) -> Exec {
 pub(super) fn scalar(ctx: &mut ThreadContext, inst: u32) -> Exec {
     if bit(inst, 24) {
         if !bit(inst, 10) {
-            return indexed::indexed(ctx, inst, true).unwrap_or(Err(Undefined));
+            return indexed::indexed(ctx, inst, true)
+                .unwrap_or_else(|| fp::indexed(ctx, inst, true));
         }
         if bit(inst, 23) {
             return Err(Undefined);
@@ -63,21 +73,26 @@ pub(super) fn scalar(ctx: &mut ThreadContext, inst: u32) -> Exec {
         return match bits(inst, 11, 10) {
             0b00 => int::three_different(ctx, inst, true),
             0b10 => match bits(inst, 20, 17) {
-                0b0000 => int::two_misc(ctx, inst, true).unwrap_or(Err(Undefined)),
-                0b1000 => int::scalar_pairwise(ctx, inst).unwrap_or(Err(Undefined)),
+                0b0000 => int::two_misc(ctx, inst, true)
+                    .unwrap_or_else(|| fp::two_misc(ctx, inst, true, false)),
+                0b1000 => int::scalar_pairwise(ctx, inst)
+                    .unwrap_or_else(|| fp::scalar_pairwise(ctx, inst)),
+                0b1100 if bit(inst, 22) => fp::two_misc(ctx, inst, true, true),
                 _ => Err(Undefined),
             },
             _ if bits(inst, 15, 11) < 0b11000 => int::three_same(ctx, inst, true),
-            _ => Err(Undefined),
+            _ => fp::three_same(ctx, inst, true, false),
         };
     }
     if bit(inst, 10) {
         if bit(inst, 15) {
             return int::three_same_extra(ctx, inst, true);
         }
-        if bits(inst, 23, 22) == 0 {
-            return movement::copy(ctx, inst, true);
-        }
+        return match bits(inst, 23, 22) {
+            0b00 => movement::copy(ctx, inst, true),
+            _ if bit(inst, 22) && !bit(inst, 14) => fp::three_same(ctx, inst, true, true),
+            _ => Err(Undefined),
+        };
     }
     Err(Undefined)
 }
