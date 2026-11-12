@@ -23,8 +23,14 @@ use crate::ir::{
 use crate::profile::HostTranslateInfo;
 use crate::{ShaderArch, ShaderEnvironment, ShaderStage};
 
+mod joins;
 #[cfg(test)]
 mod tests;
+
+pub use joins::{
+    JoinedDescriptors, join_texture_info, limit_pipeline_sampled_texture_arrays,
+    limit_shared_stage_sampled_texture_arrays, remap_texture_descriptors,
+};
 
 const DESCRIPTOR_SIZE: u32 = 8;
 const DESCRIPTOR_SIZE_SHIFT: u32 = DESCRIPTOR_SIZE.trailing_zeros();
@@ -66,6 +72,10 @@ pub enum TextureError {
         sampled: u32,
         resources: u32,
     },
+    #[error(
+        "texture arrays exceed the pipeline's descriptor limits: {samplers} samplers, {sampled} sampled"
+    )]
+    PipelineDescriptorLimits { samplers: u32, sampled: u32 },
 }
 
 /// Where a texture instruction's handle comes from.
@@ -1289,36 +1299,20 @@ fn cap_texture_arrays(prog: &mut Program, info: &mut ShaderInfo, cap: u32) {
 fn merge_texture_descriptors(prog: &mut Program, info: &mut ShaderInfo) {
     let mut merged = Vec::new();
     let mut descriptors = Descriptors::default();
-    let remap: Vec<usize> = info
+    let textures = info
         .texture_descriptors
         .iter()
-        .map(|&desc| descriptors.texture(&mut merged, desc))
+        .map(|&desc| descriptors.texture(&mut merged, desc) as u32)
         .collect();
     if merged.len() == info.texture_descriptors.len() {
         return;
     }
     info.texture_descriptors = merged;
-    let remapped = |index: usize| remap.get(index).copied().unwrap_or(index);
-    for i in 0..prog.post_order.len() {
-        let mut cur = prog.block(prog.post_order[i]).first();
-        while let Some(id) = cur {
-            cur = prog.inst(id).next();
-            let op = prog.op(id);
-            if op == Opcode::IsTextureScaled {
-                if let Some(index) = prog.arg(id, 0).imm_u32() {
-                    let index = remapped(index as usize) as u32;
-                    prog.set_arg(id, 0, Value::U32(index));
-                }
-                continue;
-            }
-            let mut flags = TextureInstInfo::from_flags(prog.inst(id).flags);
-            if !is_sampled_image(op) || flags.ty == TextureType::Buffer {
-                continue;
-            }
-            flags.descriptor_index = remapped(usize::from(flags.descriptor_index)) as u16;
-            prog.set_flags(id, flags.to_flags());
-        }
-    }
+    let joined = JoinedDescriptors {
+        textures,
+        ..JoinedDescriptors::default()
+    };
+    remap_texture_descriptors(prog, &joined);
 }
 
 /// Shrinks the program's texture arrays until its textures fit the host's per-stage and
