@@ -8,8 +8,11 @@
 
 use crate::PixelFormat;
 
+/// Width of a GOB in bytes.
 pub const GOB_WIDTH: u32 = 64;
+/// Height of a GOB in rows of blocks.
 pub const GOB_HEIGHT: u32 = 8;
+/// Bytes in one GOB.
 pub const GOB_SIZE: u32 = GOB_WIDTH * GOB_HEIGHT;
 const GOB_SIZE_LOG2: u32 = 9;
 
@@ -170,6 +173,7 @@ pub struct Region {
 }
 
 impl Region {
+    /// The whole level, every slice included.
     pub const fn whole(tiling: &Tiling) -> Self {
         Self {
             x: 0,
@@ -400,9 +404,8 @@ impl SurfaceLayout {
                     + self.block_depth_log2);
             return chain.div_ceil(align) * align;
         }
-        let tile_height = self.format.block_height();
-        let aligned_height = self.height.div_ceil(tile_height) * tile_height;
-        let block_height = shrink_block(self.block_height_log2, aligned_height, GOB_HEIGHT);
+        let block_rows = self.height.div_ceil(self.format.block_height());
+        let block_height = shrink_block(self.block_height_log2, block_rows, GOB_HEIGHT);
         let block_depth = shrink_block(self.block_depth_log2, self.depth, 1);
         let align = 1u64 << (GOB_SIZE_LOG2 + block_height + block_depth);
         chain.div_ceil(align) * align
@@ -669,6 +672,14 @@ mod tests {
         assert_eq!(a.level_tiling(0).width, 240);
         assert_eq!(a.size_bytes(), a.layer_stride() * 6);
         assert_eq!(a.subresource_offset(0, 2), a.layer_stride() * 2);
+    }
+
+    #[test]
+    fn compressed_layers_align_to_block_rows() {
+        let l = layout(PixelFormat::Bc1RgbaUnorm, (64, 64, 1), 7, 2, 4);
+        assert_eq!(l.level_offset(7), 2048 + 6 * 512);
+        assert_eq!(l.layer_stride(), 5120);
+        assert_eq!(l.subresource_offset(0, 1), 5120);
     }
 
     #[test]
