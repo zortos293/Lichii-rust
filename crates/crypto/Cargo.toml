@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-lichii-common.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+aes = "0.9"
+cmac = "0.8"
+sha2 = "0.11"
