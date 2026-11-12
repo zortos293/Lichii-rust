@@ -10,6 +10,7 @@ lichii-gpu.workspace = true
 lichii-shader.workspace = true
 lichii-texture.workspace = true
 ash.workspace = true
+bytemuck.workspace = true
 ash-window = "0.13"
 gpu-allocator = { version = "0.28", default-features = false, features = ["std", "vulkan"] }
 egui.workspace = true

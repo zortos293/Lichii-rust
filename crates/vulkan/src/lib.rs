@@ -9,6 +9,7 @@ mod error;
 pub mod format;
 pub mod instance;
 pub mod memory;
+pub mod pipeline;
 pub mod present;
 pub mod rasterizer;
 pub mod scheduler;
