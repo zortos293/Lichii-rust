@@ -9,3 +9,4 @@ lichii-common.workspace = true
 lichii-memory.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+portable-atomic = "1"
