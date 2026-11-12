@@ -257,8 +257,7 @@ mod tests {
         );
         let key = |n| Key::from_name(n).unwrap();
         worker.send(InputMsg::Key(key("KeyC"), true));
-        std::thread::sleep(POLL * 5);
-        assert!(worker.hub().read(0).connected);
+        wait_for(|| worker.hub().read(0).connected);
         assert!(worker.hub().read(0).buttons.is_empty());
         worker.send(InputMsg::GuestInput(true));
         wait_for(|| worker.hub().read(0).buttons.contains(NpadButtons::A));
