@@ -5,7 +5,13 @@
 //! All floating point goes through [`softfloat`], which follows the Arm ARM pseudocode bit for
 //! bit, so results and FPSR flags match hardware under every FPCR setting.
 
+mod advsimd;
+mod indexed;
+mod int;
+mod lanes;
+mod movement;
 mod scalar_fp;
+mod shift;
 pub(crate) mod softfloat;
 #[cfg(test)]
 mod tests;
@@ -29,6 +35,8 @@ pub(super) fn execute(ctx: &mut ThreadContext, instruction: u32) -> Option<Resul
     }
     let result = match bits(instruction, 31, 28) {
         op0 if op0 & 0b0101 == 0b0001 => scalar_fp::execute(ctx, instruction),
+        op0 if op0 & 0b1001 == 0 => advsimd::vector(ctx, instruction),
+        op0 if op0 & 0b1101 == 0b0101 => advsimd::scalar(ctx, instruction),
         _ => Err(Undefined),
     };
     Some(result.map_err(|Undefined| {
