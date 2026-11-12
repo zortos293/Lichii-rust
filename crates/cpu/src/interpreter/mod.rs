@@ -43,6 +43,7 @@ impl Interpreter {
     }
 
     /// Executes `insts`, which start at `ctx.pc`, until one leaves the sequence.
+    #[inline(always)]
     fn execute(config: &CpuConfig, ctx: &mut ThreadContext, insts: &[Inst]) -> Exit {
         let mut exec = Exec {
             pc: ctx.pc,
