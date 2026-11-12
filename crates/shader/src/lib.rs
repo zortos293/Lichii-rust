@@ -151,4 +151,6 @@ pub enum TranslateError {
     Unstructured { address: GpuVAddr },
     #[error("binding {count} storage buffers to a stage that binds {limit}")]
     TooManyStorageBuffers { count: usize, limit: usize },
+    #[error(transparent)]
+    Texture(#[from] opt::TextureError),
 }

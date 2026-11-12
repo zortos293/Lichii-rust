@@ -2,20 +2,30 @@
 
 mod collect_shader_info;
 mod conditional_barrier;
+mod constant_propagation;
 mod dual_vertex;
+#[cfg(test)]
+mod eval_tests;
 mod geometry_compaction;
 mod global_memory_to_storage_buffer;
 #[cfg(test)]
 mod info_tests;
 mod layer;
+mod lower_fp16_to_fp32;
+mod lower_fp64_to_fp32;
+mod lower_int64_to_int32;
 mod position;
+mod rescaling;
 mod ssa_rewrite;
 #[cfg(test)]
 mod tests;
+mod texture;
 mod vendor_workaround;
+mod verify;
 
 pub use collect_shader_info::collect_shader_info;
 pub use conditional_barrier::conditional_barrier;
+pub use constant_propagation::constant_propagation;
 pub use dual_vertex::{vertex_a_transform, vertex_b_transform};
 pub use geometry_compaction::geometry_compaction;
 pub use global_memory_to_storage_buffer::{
@@ -23,25 +33,14 @@ pub use global_memory_to_storage_buffer::{
     storage_buffer_limit,
 };
 pub use layer::layer;
-pub use position::{blit_constants, position};
-pub use ssa_rewrite::ssa_rewrite;
-pub use vendor_workaround::{has_broken_pattern, vendor_workaround};
-mod constant_propagation;
-#[cfg(test)]
-mod eval_tests;
-mod lower_fp16_to_fp32;
-mod lower_fp64_to_fp32;
-mod lower_int64_to_int32;
-mod ssa_rewrite;
-#[cfg(test)]
-mod tests;
-mod verify;
-
-pub use constant_propagation::constant_propagation;
 pub use lower_fp16_to_fp32::lower_fp16_to_fp32;
 pub use lower_fp64_to_fp32::lower_fp64_to_fp32;
 pub use lower_int64_to_int32::lower_int64_to_int32;
+pub use position::{blit_constants, position};
+pub use rescaling::rescaling;
 pub use ssa_rewrite::ssa_rewrite;
+pub use texture::{TextureError, limit_sampled_texture_arrays, texture_pass};
+pub use vendor_workaround::{has_broken_pattern, vendor_workaround};
 pub use verify::verify;
 
 use crate::ir::{BlockId, Opcode, Program, SyntaxNode, Value};
