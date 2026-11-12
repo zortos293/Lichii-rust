@@ -44,7 +44,7 @@ impl BlockCache {
     ) -> Result<&[Inst], CpuFault> {
         let slot = fast_slot(pc);
         let (start, index) = self.fast[slot];
-        let index = if start == pc {
+        let index = if start == pc && index != EMPTY.1 {
             index
         } else {
             let index = match self.by_start.get(&pc) {

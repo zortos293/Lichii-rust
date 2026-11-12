@@ -204,6 +204,11 @@ fn faults_leave_pc_at_the_instruction() {
             instruction: 0
         })
     );
+    h.ctx.pc = u64::MAX;
+    assert_eq!(
+        h.core.run(&mut h.ctx),
+        HaltReason::Fault(CpuFault::Prefetch { pc: u64::MAX })
+    );
     h.ctx.pc = 0x7000_0000;
     assert_eq!(
         h.core.run(&mut h.ctx),
