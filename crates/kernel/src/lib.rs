@@ -301,7 +301,7 @@ impl Kernel {
         for join in services.joins {
             let _ = join.join();
         }
-        self.0.service_manager.clear_waiting();
+        self.0.service_manager.clear();
         self.0.named_ports.lock().clear();
         self.0.scheduler.clear();
         let processes = std::mem::take(&mut *self.0.processes.lock());
