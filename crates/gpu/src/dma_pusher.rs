@@ -362,6 +362,7 @@ impl Dispatch<'_> {
             .call(call.subchannel, call.method, call.argument)
         {
             HostAction::None => {}
+            HostAction::Bind { class: 0, .. } => {}
             HostAction::Bind { subchannel, class } => {
                 let engine = EngineKind::from_class(class);
                 self.state.subchannels[subchannel as usize] = engine;

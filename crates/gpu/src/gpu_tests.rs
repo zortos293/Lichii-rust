@@ -255,7 +255,6 @@ impl Rig {
             device,
             syncpoints: syncpoints.clone(),
             timestamp: Arc::new(GpuTimestamp::new(Arc::new(NoTime), false)),
-            waiters: Arc::default(),
         };
         let work = Arc::new(HostWork {
             completion,
@@ -1116,7 +1115,7 @@ fn mme_dma_read_waits_for_deferred_work_and_flushes_what_it_reads() {
 }
 
 #[test]
-fn set_object_of_an_unknown_class_unbinds_the_subchannel() {
+fn set_object_of_an_unknown_class_unbinds_and_class_0_keeps_the_binding() {
     each_mode(|threading| {
         let mut rig = Rig::new(threading);
         let channel = rig.channel(HostClass::Maxwell);
@@ -1133,15 +1132,13 @@ fn set_object_of_an_unknown_class_unbinds_the_subchannel() {
         rig.submit(channel, &words.0);
         assert_eq!(
             rig.methods(),
-            [(channel.0, EngineKind::Compute, 0x200, 1)],
+            [
+                (channel.0, EngineKind::Compute, 0x200, 1),
+                (channel.0, EngineKind::Compute, 0x200, 2)
+            ],
             "{threading:?}"
         );
-        assert!(
-            !rig.events()
-                .iter()
-                .any(|e| matches!(e, Event::InlineWritten(..)))
-        );
-        assert_eq!(rig.read(0x20_0000), 0);
+        assert_eq!(rig.read(0x20_0000), 0x1122_3344);
     });
 }
 

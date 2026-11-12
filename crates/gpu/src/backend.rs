@@ -21,7 +21,6 @@ use lichii_memory::DeviceAddressSpace;
 use lichii_texture::PixelFormat;
 use lichii_texture::block_linear::GobLayout;
 
-use crate::channel::SemaphoreWaiters;
 use crate::clock::GpuTimestamp;
 use crate::engines::maxwell_3d::regs::{MAX_CONST_BUFFERS, MAX_SHADER_STAGE, PrimitiveTopology};
 use crate::engines::maxwell_3d::{DirtyState, Regs};
@@ -40,10 +39,6 @@ pub struct GpuHandles {
     pub syncpoints: Arc<Syncpoints>,
     /// The clock 16-byte releases and query reports take their timestamp from.
     pub timestamp: Arc<GpuTimestamp>,
-    /// Channels waiting on a semaphore: [`FenceAction::execute`] latches the ones a semaphore
-    /// write meets and wakes the GPU. Start with `Arc::default()` and pass the same handles to
-    /// [`Gpu::new`](crate::Gpu::new).
-    pub waiters: Arc<SemaphoreWaiters>,
 }
 
 /// A constant buffer bound to a shader stage slot.
@@ -245,7 +240,7 @@ pub enum FenceAction {
 impl FenceAction {
     /// Performs the action. The renderer calls this from whichever thread notices completion;
     /// 16-byte releases take their timestamp from [`GpuHandles::timestamp`]. A semaphore write
-    /// resumes the channels waiting for its value ([`GpuHandles::waiters`]).
+    /// resumes the channels waiting for its value ([`Syncpoints::semaphore_waiters`](crate::host1x::Syncpoints::semaphore_waiters)).
     pub fn execute(self, handles: &GpuHandles) {
         match self {
             Self::WriteSemaphore {
@@ -269,7 +264,10 @@ impl FenceAction {
                     ReleaseSize::Eight => 8,
                     ReleaseSize::Sixteen => 16,
                 };
-                handles.waiters.written(&handles.device, address, bytes);
+                handles
+                    .syncpoints
+                    .semaphore_waiters()
+                    .written(&handles.device, address, bytes);
             }
             Self::ReduceSemaphore {
                 address,
@@ -293,7 +291,10 @@ impl FenceAction {
                 ) {
                     old = current;
                 }
-                handles.waiters.written(&handles.device, address, 4);
+                handles
+                    .syncpoints
+                    .semaphore_waiters()
+                    .written(&handles.device, address, 4);
             }
             Self::IncrementSyncpoint(id) => {
                 if handles.syncpoints.guest().increment(id).is_err() {
@@ -481,7 +482,6 @@ mod tests {
             device,
             syncpoints: Arc::new(Syncpoints::new()),
             timestamp: Arc::new(GpuTimestamp::new(Arc::new(Boot), false)),
-            waiters: Arc::default(),
         };
         (space, handles)
     }

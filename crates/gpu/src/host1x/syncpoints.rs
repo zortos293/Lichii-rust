@@ -1,9 +1,12 @@
 //! host1x syncpoints: 32-bit counters the CPU and the GPU wait on.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
+
+use crate::channel::SemaphoreWaiters;
 
 /// Syncpoint ids per bank. Switch 2 ids are below 0x400; Switch 1 uses the first 192.
 pub const SYNCPOINT_COUNT: usize = 1024;
@@ -32,6 +35,7 @@ pub struct ActionHandle {
 pub struct Syncpoints {
     guest: SyncpointBank,
     host: SyncpointBank,
+    semaphores: Arc<SemaphoreWaiters>,
 }
 
 impl Syncpoints {
@@ -39,7 +43,14 @@ impl Syncpoints {
         Self {
             guest: SyncpointBank::new(),
             host: SyncpointBank::new(),
+            semaphores: Arc::default(),
         }
+    }
+
+    /// GPU channels waiting on semaphores in memory: semaphore writes that land through
+    /// [`FenceAction::execute`](crate::backend::FenceAction::execute) latch and wake them.
+    pub fn semaphore_waiters(&self) -> &Arc<SemaphoreWaiters> {
+        &self.semaphores
     }
 
     /// Values the guest sees: incremented once the work before an increment has completed on

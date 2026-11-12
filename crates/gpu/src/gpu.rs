@@ -253,7 +253,7 @@ impl Gpu {
     /// `handles` are the ones it was created with.
     pub fn new(rasterizer: Box<dyn Rasterizer>, handles: &GpuHandles, options: GpuOptions) -> Self {
         let inbox = Arc::new(Inbox::new());
-        handles.waiters.attach(&inbox);
+        handles.syncpoints.semaphore_waiters().attach(&inbox);
         let (producer, consumer) = ring::ring(options.ring_slots, MIN_RING_SLOTS);
         let (side_sender, side_receiver) = mpsc::channel();
         let back = Back::new(
@@ -277,7 +277,7 @@ impl Gpu {
                 stream: Stream::new(producer, link, side_sender),
                 shared_macros: None,
                 words: Vec::new(),
-                waiters: handles.waiters.clone(),
+                waiters: handles.syncpoints.semaphore_waiters().clone(),
                 inbox: inbox.clone(),
                 syncpoints: handles.syncpoints.clone(),
             },
