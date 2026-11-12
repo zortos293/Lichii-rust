@@ -6,6 +6,7 @@
 //! bit, so results and FPSR flags match hardware under every FPCR setting.
 
 mod advsimd;
+mod fp_vector;
 mod indexed;
 mod int;
 mod lanes;

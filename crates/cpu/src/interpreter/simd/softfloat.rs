@@ -432,25 +432,6 @@ fn process_nans<const N: u32>(
     None
 }
 
-fn process_nans3<const N: u32>(
-    a: &Value,
-    op1: u64,
-    b: &Value,
-    op2: u64,
-    c: &Value,
-    op3: u64,
-    env: &mut FpEnv,
-) -> Option<u64> {
-    for kind in [Kind::SNaN, Kind::QNaN] {
-        for (v, op) in [(a, op1), (b, op2), (c, op3)] {
-            if v.is(kind) {
-                return Some(process_nan::<N>(v, op, env));
-            }
-        }
-    }
-    None
-}
-
 /// Orders two non-NaN operands by value; zeros of either sign are equal.
 fn compare_values(a: &Value, b: &Value) -> Ordering {
     let signum = |v: &Value| match (v.kind, v.sign) {
@@ -502,6 +483,11 @@ fn add_sub<const N: u32>(op1: u64, op2: u64, negate: bool, env: &mut FpEnv) -> u
 
 pub(crate) fn mul<const N: u32>(op1: u64, op2: u64, env: &mut FpEnv) -> u64 {
     mul_base::<N>(op1, op2, false, env)
+}
+
+/// `FPMulX`: infinity times zero is two instead of the default NaN.
+pub(crate) fn mulx<const N: u32>(op1: u64, op2: u64, env: &mut FpEnv) -> u64 {
+    mul_base::<N>(op1, op2, true, env)
 }
 
 fn mul_base<const N: u32>(op1: u64, op2: u64, mulx: bool, env: &mut FpEnv) -> u64 {
@@ -595,12 +581,45 @@ pub(crate) fn sqrt<const N: u32>(op: u64, env: &mut FpEnv) -> u64 {
 
 /// `FPMulAdd`: `addend + op1 * op2` with a single rounding.
 pub(crate) fn mul_add<const N: u32>(addend: u64, op1: u64, op2: u64, env: &mut FpEnv) -> u64 {
+    fused::<N, N>(addend, op1, op2, env)
+}
+
+/// `FPMulAddH` (FMLAL, FMLSL): half-precision multiplicands, single-precision addend and result.
+pub(crate) fn mul_add_h(addend: u64, op1: u64, op2: u64, env: &mut FpEnv) -> u64 {
+    fused::<32, 16>(addend, op1, op2, env)
+}
+
+/// `FPConvertNaN`: keeps the sign and the most significant payload bits, and sets the quiet bit.
+fn convert_nan<const I: u32, const O: u32>(op: u64) -> u64 {
+    let payload = op & (Fmt::<I>::FRAC_MASK >> 1);
+    let payload = if Fmt::<I>::F > Fmt::<O>::F {
+        payload >> (Fmt::<I>::F - Fmt::<O>::F)
+    } else {
+        payload << (Fmt::<O>::F - Fmt::<I>::F)
+    };
+    Fmt::<O>::infinity(op & Fmt::<I>::SIGN != 0) | Fmt::<O>::QUIET | payload
+}
+
+/// `addend + op1 * op2` with an `N`-bit addend and result and `P`-bit multiplicands.
+fn fused<const N: u32, const P: u32>(addend: u64, op1: u64, op2: u64, env: &mut FpEnv) -> u64 {
     let c = unpack::<N>(addend, env);
-    let a = unpack::<N>(op1, env);
-    let b = unpack::<N>(op2, env);
+    let a = unpack::<P>(op1, env);
+    let b = unpack::<P>(op2, env);
     let (inf1, inf2) = (a.is(Kind::Infinity), b.is(Kind::Infinity));
     let (zero1, zero2) = (a.is(Kind::Zero), b.is(Kind::Zero));
-    let nan = process_nans3::<N>(&c, addend, &a, op1, &b, op2, env);
+    let mut nan = None;
+    for kind in [Kind::SNaN, Kind::QNaN] {
+        if nan.is_some() {
+            break;
+        }
+        if c.is(kind) {
+            nan = Some(process_nan::<N>(&c, addend, env));
+        } else if a.is(kind) {
+            nan = Some(convert_nan::<P, N>(process_nan::<P>(&a, op1, env)));
+        } else if b.is(kind) {
+            nan = Some(convert_nan::<P, N>(process_nan::<P>(&b, op2, env)));
+        }
+    }
     let inf_times_zero = (inf1 && zero2) || (zero1 && inf2);
     if c.is(Kind::QNaN) && inf_times_zero {
         env.raise(IOC);
@@ -627,6 +646,61 @@ pub(crate) fn mul_add<const N: u32>(addend: u64, op1: u64, op2: u64, env: &mut F
     c.exact()
         .add(Exact::product(&a, &b))
         .round::<N>(rounding, env)
+}
+
+/// `FPRecipStepFused`: `2 - op1 * op2`.
+pub(crate) fn recip_step<const N: u32>(op1: u64, op2: u64, env: &mut FpEnv) -> u64 {
+    let two = Exact {
+        sign: false,
+        x: 1 << 125,
+        e: -124,
+    };
+    step_fused::<N>(op1, op2, two, Fmt::<N>::normal(false, 1, 0), 0, env)
+}
+
+/// `FPRSqrtStepFused`: `(3 - op1 * op2) / 2`.
+pub(crate) fn rsqrt_step<const N: u32>(op1: u64, op2: u64, env: &mut FpEnv) -> u64 {
+    let three = Exact {
+        sign: false,
+        x: 3 << 124,
+        e: -124,
+    };
+    step_fused::<N>(
+        op1,
+        op2,
+        three,
+        Fmt::<N>::normal(false, 0, Fmt::<N>::QUIET),
+        1,
+        env,
+    )
+}
+
+fn step_fused<const N: u32>(
+    op1: u64,
+    op2: u64,
+    constant: Exact,
+    inf_times_zero: u64,
+    halve: i32,
+    env: &mut FpEnv,
+) -> u64 {
+    let op1 = op1 ^ Fmt::<N>::SIGN;
+    let a = unpack::<N>(op1, env);
+    let b = unpack::<N>(op2, env);
+    if let Some(nan) = process_nans::<N>(&a, op1, &b, op2, env) {
+        return nan;
+    }
+    let (inf1, inf2) = (a.is(Kind::Infinity), b.is(Kind::Infinity));
+    let (zero1, zero2) = (a.is(Kind::Zero), b.is(Kind::Zero));
+    if (inf1 && zero2) || (zero1 && inf2) {
+        return inf_times_zero;
+    }
+    if inf1 || inf2 {
+        return Fmt::<N>::infinity(a.sign ^ b.sign);
+    }
+    let mut sum = constant.add(Exact::product(&a, &b));
+    sum.e -= halve;
+    let rounding = env.rounding();
+    sum.round::<N>(rounding, env)
 }
 
 fn min_max<const N: u32>(op1: u64, op2: u64, max: bool, env: &mut FpEnv) -> u64 {
@@ -709,6 +783,24 @@ fn compare_with<const N: u32>(
         return None;
     }
     Some(compare_values(&a, &b))
+}
+
+/// `FPCompareEQ`.
+pub(crate) fn compare_eq<const N: u32>(op1: u64, op2: u64, env: &mut FpEnv) -> bool {
+    compare_with::<N>(op1, op2, false, env) == Some(Ordering::Equal)
+}
+
+/// `FPCompareGE`.
+pub(crate) fn compare_ge<const N: u32>(op1: u64, op2: u64, env: &mut FpEnv) -> bool {
+    matches!(
+        compare_with::<N>(op1, op2, true, env),
+        Some(Ordering::Greater | Ordering::Equal)
+    )
+}
+
+/// `FPCompareGT`.
+pub(crate) fn compare_gt<const N: u32>(op1: u64, op2: u64, env: &mut FpEnv) -> bool {
+    compare_with::<N>(op1, op2, true, env) == Some(Ordering::Greater)
 }
 
 /// Integer part of `|v| * 2^scale` (`u128::MAX` when it does not fit), and whether the
@@ -945,13 +1037,7 @@ pub(crate) fn convert<const I: u32, const O: u32>(
             } else if env.dn() {
                 Fmt::<O>::DEFAULT_NAN
             } else {
-                let payload = op & (Fmt::<I>::FRAC_MASK >> 1);
-                let payload = if Fmt::<I>::F > Fmt::<O>::F {
-                    payload >> (Fmt::<I>::F - Fmt::<O>::F)
-                } else {
-                    payload << (Fmt::<O>::F - Fmt::<I>::F)
-                };
-                Fmt::<O>::infinity(v.sign) | Fmt::<O>::QUIET | payload
+                convert_nan::<I, O>(op)
             };
             if v.is(Kind::SNaN) || alt_hp {
                 env.raise(IOC);
@@ -966,6 +1052,148 @@ pub(crate) fn convert<const I: u32, const O: u32>(
         Kind::Zero => Fmt::<O>::zero(v.sign),
         Kind::Finite => round_cv::<O>(v.sign, v.exp, v.mant, rounding, env),
     }
+}
+
+/// `RecipEstimate`: `a` in 256..512 is a fixed-point value in [0.5, 1).
+pub(crate) fn recip_estimate_u9(a: u64) -> u64 {
+    let a = a * 2 + 1;
+    let b = (1 << 19) / a;
+    b.div_ceil(2)
+}
+
+const fn recip_sqrt_estimate_u9(a: u64) -> u64 {
+    let a = if a < 256 {
+        a * 2 + 1
+    } else {
+        ((a >> 1) << 1) * 2 + 2
+    };
+    let mut b = 512;
+    while a * (b + 1) * (b + 1) < (1 << 28) {
+        b += 1;
+    }
+    b.div_ceil(2)
+}
+
+const RSQRT_TABLE: [u16; 384] = {
+    let mut table = [0; 384];
+    let mut i = 0;
+    while i < 384 {
+        table[i] = recip_sqrt_estimate_u9(i as u64 + 128) as u16;
+        i += 1;
+    }
+    table
+};
+
+/// `RecipSqrtEstimate`: `a` in 128..512 is a fixed-point value in [0.25, 1).
+pub(crate) fn recip_sqrt_estimate(a: u64) -> u64 {
+    RSQRT_TABLE[a as usize - 128] as u64
+}
+
+/// The operand's fraction left-aligned in 52 bits, and its biased exponent.
+fn fraction52<const N: u32>(op: u64) -> (u64, i32) {
+    let frac = (op & Fmt::<N>::FRAC_MASK) << (52 - Fmt::<N>::F);
+    (frac, ((op >> Fmt::<N>::F) & Fmt::<N>::EXP_ONES) as i32)
+}
+
+/// `FPRecipEstimate` (FRECPE).
+pub(crate) fn recip_estimate<const N: u32>(op: u64, env: &mut FpEnv) -> u64 {
+    let v = unpack::<N>(op, env);
+    match v.kind {
+        Kind::QNaN | Kind::SNaN => return process_nan::<N>(&v, op, env),
+        Kind::Infinity => return Fmt::<N>::zero(v.sign),
+        Kind::Zero => {
+            env.raise(DZC);
+            return Fmt::<N>::infinity(v.sign);
+        }
+        Kind::Finite => {}
+    }
+    if v.exp < -Fmt::<N>::BIAS - 1 {
+        let overflow_to_inf = match env.rounding() {
+            Rounding::PlusInf => !v.sign,
+            Rounding::MinusInf => v.sign,
+            Rounding::Zero => false,
+            _ => true,
+        };
+        env.raise(OFC | IXC);
+        return if overflow_to_inf {
+            Fmt::<N>::infinity(v.sign)
+        } else {
+            Fmt::<N>::max_normal(v.sign)
+        };
+    }
+    if env.fz::<N>() && v.exp >= Fmt::<N>::BIAS - 1 {
+        env.raise(UFC);
+        return Fmt::<N>::zero(v.sign);
+    }
+    let (mut fraction, mut exp) = fraction52::<N>(op);
+    if exp == 0 {
+        if fraction >> 51 == 0 {
+            exp = -1;
+            fraction = (fraction << 2) & ((1 << 52) - 1);
+        } else {
+            fraction = (fraction << 1) & ((1 << 52) - 1);
+        }
+    }
+    let scaled = (1 << 8) | (fraction >> 44);
+    let mut result_exp = 2 * Fmt::<N>::BIAS - 1 - exp;
+    let estimate = recip_estimate_u9(scaled);
+    let mut fraction = (estimate & 0xff) << 44;
+    if result_exp == 0 {
+        fraction = (1 << 51) | (fraction >> 1);
+    } else if result_exp == -1 {
+        fraction = (1 << 50) | (fraction >> 2);
+        result_exp = 0;
+    }
+    Fmt::<N>::zero(v.sign) | ((result_exp as u64) << Fmt::<N>::F) | (fraction >> (52 - Fmt::<N>::F))
+}
+
+/// `FPRSqrtEstimate` (FRSQRTE).
+pub(crate) fn rsqrt_estimate<const N: u32>(op: u64, env: &mut FpEnv) -> u64 {
+    let v = unpack::<N>(op, env);
+    match v.kind {
+        Kind::QNaN | Kind::SNaN => return process_nan::<N>(&v, op, env),
+        Kind::Zero => {
+            env.raise(DZC);
+            return Fmt::<N>::infinity(v.sign);
+        }
+        _ if v.sign => {
+            env.raise(IOC);
+            return Fmt::<N>::DEFAULT_NAN;
+        }
+        Kind::Infinity => return Fmt::<N>::zero(false),
+        Kind::Finite => {}
+    }
+    let (mut fraction, mut exp) = fraction52::<N>(op);
+    if exp == 0 {
+        while fraction >> 51 == 0 {
+            fraction <<= 1;
+            exp -= 1;
+        }
+        fraction = (fraction << 1) & ((1 << 52) - 1);
+    }
+    let scaled = if exp & 1 == 0 {
+        (1 << 8) | (fraction >> 44)
+    } else {
+        (1 << 7) | (fraction >> 45)
+    };
+    let result_exp = (3 * Fmt::<N>::BIAS - 1 - exp).div_euclid(2);
+    let estimate = recip_sqrt_estimate(scaled);
+    ((result_exp as u64) << Fmt::<N>::F) | ((estimate & 0xff) << (Fmt::<N>::F - 8))
+}
+
+/// `FPRecpX` (FRECPX).
+pub(crate) fn recip_exponent<const N: u32>(op: u64, env: &mut FpEnv) -> u64 {
+    let v = unpack::<N>(op, env);
+    if v.is_nan() {
+        return process_nan::<N>(&v, op, env);
+    }
+    let exp = (op >> Fmt::<N>::F) & Fmt::<N>::EXP_ONES;
+    let result_exp = if exp == 0 {
+        Fmt::<N>::EXP_ONES - 1
+    } else {
+        !exp & Fmt::<N>::EXP_ONES
+    };
+    Fmt::<N>::zero(v.sign) | (result_exp << Fmt::<N>::F)
 }
 
 #[cfg(test)]
@@ -985,6 +1213,14 @@ mod tests {
         assert_eq!(f32_op(mul::<32>, 3.0, -0.5), (-1.5, 0));
         assert_eq!(f32_op(div::<32>, 1.0, 3.0), (1.0 / 3.0, IXC));
         assert_eq!(f32_op(div::<32>, 1.0, 0.0), (f32::INFINITY, DZC));
+    }
+
+    #[test]
+    fn rsqrt_table_endpoints() {
+        assert_eq!(recip_sqrt_estimate(128), 511);
+        assert_eq!(recip_sqrt_estimate(511), 256);
+        assert_eq!(recip_estimate_u9(256), 511);
+        assert_eq!(recip_estimate_u9(511), 256);
     }
 
     #[test]
