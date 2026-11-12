@@ -189,7 +189,7 @@ fn optimize(
     tighten_output_vertices(program);
     let TranslatedProgram { ir, info, .. } = program;
     if cfg!(debug_assertions) {
-        opt::verify(ir).map_err(TranslateError::Lowering)?;
+        opt::verify(ir).map_err(TranslateError::InvalidIr)?;
     }
     opt::collect_shader_info(env, ir, info);
     opt::layer(ir, stage, info, host);
@@ -340,5 +340,47 @@ mod tests {
         assert!(!dump.contains("Register"), "{dump}");
         assert_eq!(program.workgroup_size, [1, 1, 1]);
         opt::verify(&program.ir).expect("valid IR");
+    }
+
+    /// Random instruction streams through the whole pipeline: every program either translates
+    /// to valid IR or fails with an error, and none panics. The host lacks fp16, fp64 and int64
+    /// so the lowering passes run too.
+    #[test]
+    fn random_programs_translate_or_fail_cleanly() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let host = HostTranslateInfo::default();
+        let profile = Profile::default();
+        let mut translated = 0;
+        for _ in 0..3000 {
+            let len = 1 + (next() % 12) as usize;
+            let mut code: Vec<u64> = (0..len)
+                .map(|_| {
+                    let op = Sass::ALL[(next() % Sass::ALL.len() as u64) as usize];
+                    let word = encode(op, next());
+                    if next() % 4 == 0 {
+                        word
+                    } else {
+                        (word & !(0xf << 16)) | PT
+                    }
+                })
+                .collect();
+            code.push(encode(Sass::Exit, PT | 0xf));
+            let env = TestEnv::new(&code);
+            match translate(&env, options(&profile, &host)) {
+                Ok(program) => {
+                    opt::verify(&program.ir).unwrap_or_else(|e| panic!("{code:x?}: {e}"));
+                    translated += 1;
+                }
+                Err(TranslateError::InvalidIr(e)) => panic!("{code:x?}: {e}"),
+                Err(_) => {}
+            }
+        }
+        assert!(translated > 50, "only {translated} programs translated");
     }
 }

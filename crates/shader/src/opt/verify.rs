@@ -2,7 +2,8 @@
 
 use crate::ir::{InstId, Opcode, Program, Type, Value};
 
-/// Checks what every pass relies on: argument types match the opcode signature, use counts
+/// Checks what every pass relies on: argument types match the opcode signature (a U64 operand
+/// may be the U32x2 pair int64 lowering leaves in its place), use counts
 /// match the arguments that name each instruction, instructions other than phis only read
 /// values defined earlier in program order, and phis lead their block.
 pub fn verify(prog: &Program) -> Result<(), String> {
@@ -30,7 +31,9 @@ pub fn verify(prog: &Program) -> Result<(), String> {
             for i in 0..inst.num_args().max(expected.len()) {
                 let arg = inst.args().get(i).copied().unwrap_or(Value::Void);
                 let want = expected.get(i).copied().unwrap_or(Type::VOID);
-                if !prog.type_of(arg).compatible(want) {
+                let ty = prog.type_of(arg);
+                let lowered_address = want == Type::U64 && ty == Type::U32X2;
+                if !ty.compatible(want) && !lowered_address {
                     return fail(&format!(
                         "argument {i} of {} is {}, expected {want}",
                         inst.op.name(),

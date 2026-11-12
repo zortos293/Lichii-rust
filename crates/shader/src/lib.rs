@@ -152,6 +152,8 @@ pub enum TranslateError {
     Unstructured { address: GpuVAddr },
     #[error("cannot lower {0}")]
     Lowering(String),
+    #[error("translation produced invalid IR: {0}")]
+    InvalidIr(String),
     #[error("invalid program header at {address:#x}")]
     InvalidHeader { address: GpuVAddr },
     #[error("no {arch:?} translator for {stage:?} programs yet")]
