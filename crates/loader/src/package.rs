@@ -107,7 +107,7 @@ pub(crate) fn load(
 ) -> LoaderResult<ProgramImage> {
     let contents = Contents::open(path, format, options)?;
     let selected = contents.select(path, options.program_index)?;
-    let mods = Mods::find(&options.mods, selected.application_id)?;
+    let mods = Mods::find(&options.mods, selected.program_id)?;
     let exefs = mods.layer_exefs(Arc::new(selected.exefs()?))?;
     let (npdm, mut modules) = load_exefs(exefs.as_ref(), options.hashes)?;
     mods.patch_modules(&mut modules)?;
