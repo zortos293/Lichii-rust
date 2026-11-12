@@ -1,0 +1,53 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+default-members = ["crates/frontend"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+lichii-common = { path = "crates/common" }
+lichii-memory = { path = "crates/memory" }
+lichii-cpu = { path = "crates/cpu" }
+lichii-crypto = { path = "crates/crypto" }
+lichii-fs = { path = "crates/fs" }
+lichii-loader = { path = "crates/loader" }
+lichii-kernel = { path = "crates/kernel" }
+lichii-services = { path = "crates/services" }
+lichii-gpu = { path = "crates/gpu" }
+lichii-shader = { path = "crates/shader" }
+lichii-vulkan = { path = "crates/vulkan" }
+lichii-audio = { path = "crates/audio" }
+lichii-input = { path = "crates/input" }
+lichii-core = { path = "crates/core" }
+lichii-texture = { path = "crates/texture" }
+
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+bitflags = { version = "2", features = ["serde"] }
+parking_lot = "0.12"
+bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
+directories = "6"
+memmap2 = "0.9"
+crossbeam-channel = "0.5"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+panic = "unwind"
+
+[profile.bench]
+debug = true

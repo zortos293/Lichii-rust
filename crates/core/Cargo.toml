@@ -1,0 +1,16 @@
+[package]
+name = "lichii-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lichii-common.workspace = true
+lichii-memory.workspace = true
+lichii-cpu.workspace = true
+lichii-kernel.workspace = true
+lichii-services.workspace = true
+lichii-loader.workspace = true
+lichii-gpu.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

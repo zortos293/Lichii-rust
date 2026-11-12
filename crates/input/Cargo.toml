@@ -1,0 +1,10 @@
+[package]
+name = "lichii-input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lichii-common.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

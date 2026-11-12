@@ -1,0 +1,10 @@
+[package]
+name = "lichii-texture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lichii-common.workspace = true
+bytemuck.workspace = true
+thiserror.workspace = true

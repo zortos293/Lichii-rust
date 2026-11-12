@@ -1,0 +1,11 @@
+[package]
+name = "lichii-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lichii-common.workspace = true
+lichii-memory.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

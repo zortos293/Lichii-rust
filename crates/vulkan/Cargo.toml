@@ -1,0 +1,13 @@
+[package]
+name = "lichii-vulkan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lichii-common.workspace = true
+lichii-gpu.workspace = true
+lichii-shader.workspace = true
+lichii-texture.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

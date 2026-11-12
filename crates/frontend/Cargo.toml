@@ -1,0 +1,14 @@
+[package]
+name = "lichii"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lichii"
+path = "src/main.rs"
+
+[dependencies]
+lichii-common.workspace = true
+lichii-core.workspace = true
+tracing.workspace = true

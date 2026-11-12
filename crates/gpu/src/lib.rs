@@ -1,0 +1,5 @@
+//! The guest GPU (Maxwell for Switch 1, Ampere/NVN2 for Switch 2): GPFIFO and the DMA pusher,
+//! the 3D/compute/DMA/2D/inline engines, Maxwell and Turing+ macros, the GMMU, host1x
+//! syncpoints, and the [\`backend\`] contract the renderer implements.
+
+pub mod backend;
