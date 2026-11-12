@@ -76,7 +76,7 @@ impl Service for CommonStateGetter {
             13 => push_event(ctx, &applet.sleep_lock_event),
             15 => push_stub_event(ctx, &applet.stub_event),
             30..=32 => {
-                ctx.push_interface(self.context.handler(LockAccessor::default()));
+                ctx.push_interface(self.context.handler(LockAccessor::new()));
                 ResultCode::SUCCESS
             }
             50 => push_bool(ctx, applet.state.lock().vr_mode),
@@ -283,11 +283,22 @@ impl Service for DisplayController {
     }
 }
 
-/// `ILockAccessor`: a lock nothing else contends for, with its event.
-#[derive(Default)]
+/// `ILockAccessor`: a lock nothing else contends for, with its event, which starts signalled
+/// because the lock starts free (libnx waits on it before `TryLock`).
 struct LockAccessor {
     locked: AtomicBool,
     event: Arc<Event>,
+}
+
+impl LockAccessor {
+    fn new() -> Self {
+        let event = Arc::new(Event::new());
+        event.signal();
+        Self {
+            locked: AtomicBool::new(false),
+            event,
+        }
+    }
 }
 
 impl Service for LockAccessor {
