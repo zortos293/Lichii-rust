@@ -490,10 +490,14 @@ impl Gmmu {
             out.fill(0);
             return;
         };
-        for (i, byte) in out.iter_mut().enumerate() {
-            let offset = (gpu_va + i as u64) & PAGE_MASK;
+        let mut done = 0;
+        while done < out.len() {
+            let offset = (gpu_va + done as u64) & PAGE_MASK;
+            let first = (offset % 4) as usize;
+            let len = (4 - first).min(out.len() - done);
             let value = syncpoints.guest().value((offset / 4) as u32).unwrap_or(0);
-            *byte = value.to_le_bytes()[(offset % 4) as usize];
+            out[done..done + len].copy_from_slice(&value.to_le_bytes()[first..first + len]);
+            done += len;
         }
     }
 
@@ -942,6 +946,7 @@ mod tests {
         assert_eq!(gmmu.read::<u32>(shim + 12), Ok(2));
         assert_eq!(gmmu.read::<u32>(shim + 16), Ok(0));
         assert_eq!(gmmu.read::<u32>(shim + 0xffc), Ok(1));
+        assert_eq!(gmmu.read::<u32>(shim + 10), Ok(2 << 16));
         syncpoints.guest().increment(3).unwrap();
         let mut words = [0u32; 4];
         gmmu.read_block(shim, bytemuck::cast_slice_mut(&mut words))
