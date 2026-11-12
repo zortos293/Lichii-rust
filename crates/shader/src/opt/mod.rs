@@ -1,0 +1,123 @@
+//! IR passes. Every pass is linear or n log n in program size.
+
+mod collect_shader_info;
+mod conditional_barrier;
+mod constant_propagation;
+mod dual_vertex;
+#[cfg(test)]
+mod eval_tests;
+mod geometry_compaction;
+mod global_memory_to_storage_buffer;
+#[cfg(test)]
+mod info_tests;
+mod layer;
+mod lower_fp16_to_fp32;
+mod lower_fp64_to_fp32;
+mod lower_int64_to_int32;
+mod position;
+mod rescaling;
+mod ssa_rewrite;
+#[cfg(test)]
+mod tests;
+mod texture;
+mod vendor_workaround;
+mod verify;
+
+pub use collect_shader_info::collect_shader_info;
+pub use conditional_barrier::conditional_barrier;
+pub use constant_propagation::constant_propagation;
+pub use dual_vertex::{vertex_a_transform, vertex_b_transform};
+pub use geometry_compaction::geometry_compaction;
+pub use global_memory_to_storage_buffer::{
+    global_memory_to_storage_buffer, join_storage_info, remap_storage_bindings,
+    storage_buffer_limit,
+};
+pub use layer::layer;
+pub use lower_fp16_to_fp32::lower_fp16_to_fp32;
+pub use lower_fp64_to_fp32::lower_fp64_to_fp32;
+pub use lower_int64_to_int32::lower_int64_to_int32;
+pub use position::{blit_constants, position};
+pub use rescaling::rescaling;
+pub use ssa_rewrite::ssa_rewrite;
+pub use texture::{
+    JoinedDescriptors, TextureError, join_texture_info, limit_pipeline_sampled_texture_arrays,
+    limit_sampled_texture_arrays, limit_shared_stage_sampled_texture_arrays,
+    remap_texture_descriptors, texture_pass,
+};
+pub use vendor_workaround::{has_broken_pattern, vendor_workaround};
+pub use verify::verify;
+
+use crate::ir::{BlockId, Opcode, Program, SyntaxNode, Value};
+
+/// Computes `Program::post_order` by a depth-first walk of the block graph from the entry.
+pub fn compute_post_order(prog: &mut Program) {
+    let Some(&SyntaxNode::Block(entry)) = prog.syntax_list.first() else {
+        prog.post_order.clear();
+        return;
+    };
+    let mut visited = vec![false; prog.num_blocks()];
+    let mut stack = vec![entry];
+    let mut post_order = Vec::with_capacity(prog.num_blocks());
+    visited[entry.0 as usize] = true;
+    while let Some(block) = stack.pop() {
+        let next = prog
+            .block(block)
+            .successors
+            .iter()
+            .copied()
+            .find(|s| !visited[s.0 as usize]);
+        match next {
+            Some(succ) => {
+                visited[succ.0 as usize] = true;
+                stack.push(block);
+                stack.push(succ);
+            }
+            None => post_order.push(block),
+        }
+    }
+    prog.post_order = post_order;
+}
+
+/// Removes instructions with no uses and no side effects, walking backwards so whole chains
+/// die in one pass.
+pub fn dead_code_elimination(prog: &mut Program) {
+    for i in 0..prog.post_order.len() {
+        let mut cur = prog.block(prog.post_order[i]).last();
+        while let Some(id) = cur {
+            cur = prog.inst(id).prev();
+            let inst = prog.inst(id);
+            if !inst.has_uses() && !inst.op.may_have_side_effects() {
+                prog.remove(id);
+            }
+        }
+    }
+}
+
+/// Points arguments that name an identity at the forwarded value, then drops identities and
+/// voided instructions.
+pub fn identity_removal(prog: &mut Program) {
+    let mut dropped = Vec::new();
+    for i in 0..prog.block_order.len() {
+        let block: BlockId = prog.block_order[i];
+        let mut cur = prog.block(block).first();
+        while let Some(id) = cur {
+            cur = prog.inst(id).next();
+            for arg in 0..prog.inst(id).num_args() {
+                let value = prog.arg(id, arg);
+                if let Value::Inst(target) = value
+                    && prog.op(target) == Opcode::Identity
+                {
+                    let resolved = prog.resolve(value);
+                    prog.set_arg(id, arg, resolved);
+                }
+            }
+            if matches!(prog.op(id), Opcode::Identity | Opcode::Void) {
+                prog.unlink(id);
+                dropped.push(id);
+            }
+        }
+    }
+    for id in dropped {
+        prog.invalidate(id);
+    }
+}

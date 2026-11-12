@@ -12,6 +12,7 @@ pub struct TestEnv {
     pub words: Vec<u64>,
     pub stage: ShaderStage,
     pub cbuf: Vec<u32>,
+    pub local_memory: u32,
 }
 
 impl TestEnv {
@@ -29,6 +30,7 @@ impl TestEnv {
             words,
             stage: ShaderStage::Compute,
             cbuf: Vec::new(),
+            local_memory: 0,
         }
     }
 
@@ -39,6 +41,10 @@ impl TestEnv {
 }
 
 impl ShaderEnvironment for TestEnv {
+    test_gpu_state!(@shared);
+    fn local_memory_size(&self) -> u32 {
+        self.local_memory
+    }
     fn arch(&self) -> ShaderArch {
         ShaderArch::Maxwell
     }
