@@ -317,8 +317,10 @@ impl SoftwareBlitter {
             ..job.sampling
         };
         let same_format = job.src_format == job.dst_format;
-        let one_to_one =
-            (src_w, src_h) == (dst_w, dst_h) && sampling.du_dx == unit && sampling.dv_dy == unit;
+        let one_to_one = !filter
+            && (src_w, src_h) == (dst_w, dst_h)
+            && sampling.du_dx == unit
+            && sampling.dv_dy == unit;
         if same_format && one_to_one {
             std::mem::swap(&mut self.src, &mut self.dst);
         } else if same_format && !filter {
@@ -636,6 +638,50 @@ mod tests {
             .read_block(0x1000, bytemuck::cast_slice_mut(&mut out))
             .unwrap();
         assert_eq!(out, words[..4]);
+    }
+
+    #[test]
+    fn bilinear_copies_with_a_fractional_start_at_the_edge_blend() {
+        let mut h = Harness::new();
+        let surface = CopySurface {
+            address: 0,
+            width: 8,
+            height: 1,
+            depth: 1,
+            layer: 0,
+            pitch: 32,
+            block: None,
+            bytes_per_pixel: 4,
+        };
+        let texels: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        h.memory
+            .write_block(0, bytemuck::cast_slice(&texels))
+            .unwrap();
+        let rect = |x0, x1| Rect {
+            x0,
+            y0: 0,
+            x1,
+            y1: 1,
+        };
+        let job = Job {
+            src: surface,
+            dst: CopySurface {
+                address: 0x1000,
+                ..surface
+            },
+            src_format: F::R32Float,
+            dst_format: F::R32Float,
+            src_rect: rect(4, 8),
+            dst_rect: rect(0, 4),
+            sampling: sampling(4 * UNIT + UNIT / 2, 0, UNIT, UNIT),
+            linear_filter: true,
+        };
+        SoftwareBlitter::default().blit(&mut h.context(), &job);
+        let mut out = [0f32; 4];
+        h.memory
+            .read_block(0x1000, bytemuck::cast_slice_mut(&mut out))
+            .unwrap();
+        assert_eq!(out[..3], [4.5, 5.5, 6.5]);
     }
 
     #[test]
