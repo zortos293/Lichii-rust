@@ -28,6 +28,10 @@ pub enum LoaderError {
     MissingNpdm,
     #[error("the ExeFS has no main")]
     MissingMain,
+    #[error("the Program NCA has no ExeFS")]
+    MissingExefs,
+    #[error("{0} has no Program NCA for its application")]
+    MissingProgram(String),
     #[error("{0} is not a title Lichii can load")]
     NotATitle(String),
 }
