@@ -1,6 +1,7 @@
 //! Interpreter throughput on synthetic guest loops, in guest MIPS.
 //!
-//! `cargo bench -p lichii-cpu --bench interpreter`
+//! `cargo bench -p lichii-cpu --bench interpreter`; `LICHII_BENCH_ITERATIONS` sets the loop count
+//! (default 10M, zero is ignored).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -62,6 +63,7 @@ fn main() {
     let iterations: u64 = std::env::var("LICHII_BENCH_ITERATIONS")
         .ok()
         .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
         .unwrap_or(10_000_000);
     for workload in WORKLOADS {
         let mem = Arc::new(AddressSpace::new(
@@ -81,15 +83,18 @@ fn main() {
             ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
             dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
         });
-        let mut ctx = ThreadContext {
-            pc: CODE,
-            ..Default::default()
-        };
-        ctx.x[1] = DATA;
-        ctx.x[5] = iterations;
-        let start = Instant::now();
-        assert_eq!(core.run(&mut ctx), HaltReason::SupervisorCall(0));
-        let seconds = start.elapsed().as_secs_f64();
+        let mut seconds = f64::MAX;
+        for _ in 0..3 {
+            let mut ctx = ThreadContext {
+                pc: CODE,
+                ..Default::default()
+            };
+            ctx.x[1] = DATA;
+            ctx.x[5] = iterations;
+            let start = Instant::now();
+            assert_eq!(core.run(&mut ctx), HaltReason::SupervisorCall(0));
+            seconds = seconds.min(start.elapsed().as_secs_f64());
+        }
         let instructions = iterations * workload.per_iteration;
         println!(
             "{:<18} {:>8.1} MIPS ({instructions} instructions in {seconds:.3} s, best of 3)",
