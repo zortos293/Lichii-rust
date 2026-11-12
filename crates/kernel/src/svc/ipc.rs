@@ -56,16 +56,16 @@ pub(super) fn send_sync_request(svc: &mut SvcContext) -> Flow {
     send(svc, svc.arg32(0), message, TLS_MESSAGE_SIZE)
 }
 
-/// `svcSendSyncRequestWithUserBuffer(buffer x1, size x2, handle w3)`.
+/// `svcSendSyncRequestWithUserBuffer(buffer x0, size x1, handle w2)`.
 pub(super) fn send_sync_request_with_user_buffer(svc: &mut SvcContext) -> Flow {
-    let (buffer, size) = (svc.arg(1), svc.arg(2));
+    let (buffer, size) = (svc.arg(0), svc.arg(1));
     if !buffer.is_multiple_of(PAGE_SIZE) {
         return svc.finish(Err(result::INVALID_ADDRESS));
     }
     if size == 0 || !size.is_multiple_of(PAGE_SIZE) || buffer.checked_add(size).is_none() {
         return svc.finish(Err(result::INVALID_SIZE));
     }
-    send(svc, svc.arg32(3), buffer, size as usize)
+    send(svc, svc.arg32(2), buffer, size as usize)
 }
 
 fn send(svc: &mut SvcContext, handle: u32, message: VAddr, size: usize) -> Flow {

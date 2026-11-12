@@ -23,7 +23,7 @@ pub struct SemaphoreWait {
 /// command recording (NX2_NOTES row 118).
 pub struct Scheduler {
     device: Arc<Device>,
-    timeline: vk::Semaphore,
+    timeline: Arc<Timeline>,
     tick: u64,
     completed: u64,
     pool: vk::CommandPool,
@@ -45,22 +45,23 @@ impl Scheduler {
                 vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER
                     | vk::CommandPoolCreateFlags::TRANSIENT,
             );
-        // SAFETY: valid create infos on a live device.
-        let (timeline, pool) = unsafe {
-            let timeline = device
+        // SAFETY: valid create info on a live device.
+        let raw = unsafe {
+            device
                 .raw
                 .create_semaphore(&semaphore_info, None)
-                .call("vkCreateSemaphore")?;
-            match device.raw.create_command_pool(&pool_info, None) {
-                Ok(pool) => (timeline, pool),
-                Err(result) => {
-                    device.raw.destroy_semaphore(timeline, None);
-                    return Err(crate::Error::Vulkan {
-                        call: "vkCreateCommandPool",
-                        result,
-                    });
-                }
-            }
+                .call("vkCreateSemaphore")?
+        };
+        let timeline = Arc::new(Timeline {
+            device: device.clone(),
+            raw,
+        });
+        // SAFETY: valid create info on a live device.
+        let pool = unsafe {
+            device
+                .raw
+                .create_command_pool(&pool_info, None)
+                .call("vkCreateCommandPool")?
         };
         Ok(Self {
             device: device.clone(),
@@ -82,7 +83,13 @@ impl Scheduler {
     /// The timeline semaphore; other queues' submissions wait on it to consume this
     /// scheduler's output.
     pub fn timeline(&self) -> vk::Semaphore {
-        self.timeline
+        self.timeline.raw
+    }
+
+    /// The timeline semaphore as a shared handle, for consumers that wait on it after this
+    /// scheduler may be gone (published guest frames).
+    pub fn shared_timeline(&self) -> Arc<Timeline> {
+        self.timeline.clone()
     }
 
     /// The value the next [`Scheduler::flush`] signals; work recorded now completes at it.
@@ -164,7 +171,7 @@ impl Scheduler {
             .collect();
         let mut signal_infos = vec![
             vk::SemaphoreSubmitInfo::default()
-                .semaphore(self.timeline)
+                .semaphore(self.timeline.raw)
                 .value(tick)
                 .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
         ];
@@ -192,7 +199,11 @@ impl Scheduler {
     /// The last tick the GPU finished, refreshed from the semaphore.
     pub fn completed(&mut self) -> u64 {
         // SAFETY: the timeline semaphore belongs to this scheduler.
-        if let Ok(value) = unsafe { self.device.raw.get_semaphore_counter_value(self.timeline) } {
+        if let Ok(value) = unsafe {
+            self.device
+                .raw
+                .get_semaphore_counter_value(self.timeline.raw)
+        } {
             self.completed = self.completed.max(value);
         }
         self.completed
@@ -211,7 +222,7 @@ impl Scheduler {
         if tick >= self.tick {
             self.flush()?;
         }
-        let semaphores = [self.timeline];
+        let semaphores = [self.timeline.raw];
         let values = [tick];
         let info = vk::SemaphoreWaitInfo::default()
             .semaphores(&semaphores)
@@ -276,7 +287,25 @@ impl Drop for Scheduler {
         // SAFETY: all submissions finished; the pool frees its command buffers.
         unsafe {
             self.device.raw.destroy_command_pool(self.pool, None);
-            self.device.raw.destroy_semaphore(self.timeline, None);
         }
+    }
+}
+
+/// A timeline semaphore, destroyed when its last holder drops it.
+pub struct Timeline {
+    device: Arc<Device>,
+    raw: vk::Semaphore,
+}
+
+impl Timeline {
+    pub fn raw(&self) -> vk::Semaphore {
+        self.raw
+    }
+}
+
+impl Drop for Timeline {
+    fn drop(&mut self) {
+        // SAFETY: no holder remains, so no pending submission waits on or signals it.
+        unsafe { self.device.raw.destroy_semaphore(self.raw, None) };
     }
 }
