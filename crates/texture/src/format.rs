@@ -193,50 +193,64 @@ pixel_formats! {
 }
 
 impl PixelFormat {
+    /// Every static fact about the format, from one table lookup.
     pub const fn info(self) -> &'static FormatInfo {
         &Self::INFO[self as usize]
     }
 
+    /// Texels per block horizontally (1 for uncompressed formats).
     pub const fn block_width(self) -> u32 {
         self.info().block_width
     }
 
+    /// Texels per block vertically (1 for uncompressed formats).
     pub const fn block_height(self) -> u32 {
         self.info().block_height
     }
 
+    /// Bytes per block, which is bytes per texel for uncompressed formats.
     pub const fn bytes_per_block(self) -> u32 {
         self.info().bytes_per_block
     }
 
+    /// Whether the format holds color, depth, stencil or both depth and stencil.
     pub const fn aspect(self) -> Aspect {
         self.info().aspect
     }
 
+    /// How shaders read the components. For combined depth/stencil formats this is the depth
+    /// component's type.
     pub const fn numeric(self) -> Numeric {
         self.info().numeric
     }
 
+    /// Whether reads convert from sRGB to linear.
     pub const fn is_srgb(self) -> bool {
         self.info().srgb
     }
 
+    /// The block compression family, `None` for uncompressed formats.
     pub const fn compression(self) -> Option<Compression> {
         self.info().compression
     }
 
+    /// Whether the format is block compressed (BCn, ETC2/EAC or ASTC).
     pub const fn is_compressed(self) -> bool {
         self.info().compression.is_some()
     }
 
+    /// Whether the format is one of the ASTC block sizes.
     pub const fn is_astc(self) -> bool {
         matches!(self.info().compression, Some(Compression::Astc))
     }
 
+    /// Whether the format is a color format read as unnormalized integers (`Uint`/`Sint`).
+    /// Stencil formats are excluded even though their numeric type is `Uint`.
     pub const fn is_integer(self) -> bool {
         matches!(self.info().numeric, Numeric::Uint | Numeric::Sint) && self.is_color()
     }
 
+    /// Whether the format holds color rather than depth and/or stencil.
     pub const fn is_color(self) -> bool {
         matches!(self.info().aspect, Aspect::Color)
     }
