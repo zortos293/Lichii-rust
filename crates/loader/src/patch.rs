@@ -117,8 +117,9 @@ impl Mods {
 
     /// Applies the `.ips` files named after a module's build id and the `.pchtxt` files whose
     /// `@nsobid` matches it, from every mod's `exefs/`. Offsets count the 0x100-byte NSO
-    /// header, as mods are written against the NSO file. A patch that fails to parse or apply
-    /// is logged and skipped.
+    /// header, as mods are written against the NSO file, and reach into .bss: a patched module's
+    /// image then covers its whole size. A patch that fails to parse or apply is logged and
+    /// skipped.
     pub fn patch_modules(&self, modules: &mut [Module]) -> LoaderResult<()> {
         let mut patches: Vec<(String, [u8; 32], ExefsPatch)> = Vec::new();
         for exefs in self.subdirs("exefs")? {
@@ -154,8 +155,8 @@ impl Mods {
             for (name, _, patch) in patches.iter().filter(|p| p.1 == module.build_id) {
                 tracing::info!("{}: applying {name}", module.name);
                 let target = target.get_or_insert_with(|| {
-                    let mut t = vec![0u8; NSO_HEADER_SIZE + module.image.len()];
-                    t[NSO_HEADER_SIZE..].copy_from_slice(&module.image);
+                    let mut t = vec![0u8; NSO_HEADER_SIZE + module.size as usize];
+                    t[NSO_HEADER_SIZE..][..module.image.len()].copy_from_slice(&module.image);
                     t
                 });
                 match patch {
@@ -167,8 +168,9 @@ impl Mods {
                     ExefsPatch::IpSwitch(patch) => patch.apply(target),
                 }
             }
-            if let Some(target) = target {
-                module.image.copy_from_slice(&target[NSO_HEADER_SIZE..]);
+            if let Some(mut target) = target {
+                target.drain(..NSO_HEADER_SIZE);
+                module.image = target;
             }
         }
         Ok(())
@@ -268,7 +270,7 @@ mod tests {
     }
 
     fn exefs() -> DirRef {
-        let mut main = build_nso(&segments(1), Compression::Lz4, 0, false);
+        let mut main = build_nso(&segments(1), Compression::Lz4, 0x2000, false);
         main[0x40..0x60].fill(0);
         main[0x40..0x43].copy_from_slice(&[0x12, 0x34, 0x50]);
         MemDir::new()
@@ -285,13 +287,19 @@ mod tests {
         let short = id.trim_end_matches('0').to_ascii_lowercase();
         assert_eq!(short, "12345");
         let temp = TempDir::new("exefs");
+        let bss = main.image.len() + 0x10;
+        assert!((bss as u64) < main.size);
         let mut ips = b"PATCH".to_vec();
         ips.extend_from_slice(&[0, 1, 0, 0, 2, 0xde, 0xad]);
         ips.extend_from_slice(b"EOF");
         temp.write(&format!("mods/{TITLE:016X}/a/exefs/{short}.ips"), &ips);
         temp.write(
             &format!("mods/{TITLE:016X}/b/ExeFS/fix.pchtxt"),
-            format!("@nsobid-{id}\n@enabled\n00000104 BEEF\n").as_bytes(),
+            format!(
+                "@nsobid-{id}\n@enabled\n00000104 BEEF\n{:08X} 77\n",
+                0x100 + bss
+            )
+            .as_bytes(),
         );
         temp.write(
             &format!("mods/{TITLE:016X}/c/exefs/other.pchtxt"),
@@ -308,9 +316,12 @@ mod tests {
             .patch_modules(&mut patched)
             .unwrap();
         let mut expected = main.image.clone();
+        expected.resize(main.size as usize, 0);
         expected[0..2].copy_from_slice(&[0xde, 0xad]);
         expected[4..6].copy_from_slice(&[0xbe, 0xef]);
+        expected[bss] = 0x77;
         assert_eq!(patched[0].image, expected);
+        assert_eq!(patched[0].size, main.size);
 
         let mut untouched = modules.clone();
         Mods::find(&options(&temp, &["a", "b", "c", "off"]), TITLE)
