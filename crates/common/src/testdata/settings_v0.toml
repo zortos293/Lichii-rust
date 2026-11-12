@@ -1,0 +1,417 @@
+[system]
+preferred_console = "Switch2"
+docked = true
+language = "AmericanEnglish"
+region = "Usa"
+memory_layout = "Auto"
+username = "lichii"
+
+[cpu]
+backend = "Jit"
+accuracy = "Auto"
+fastmem = true
+
+[graphics]
+resolution_scale = "X2"
+scaling_filter = "Fsr"
+fsr_sharpness = 25
+anti_aliasing = "None"
+aspect_ratio = "R16x9"
+present_mode = "Mailbox"
+fullscreen = "Borderless"
+speed_limit = 150
+gpu_accuracy = "Normal"
+anisotropic_filtering = "Auto"
+astc_decode = "Gpu"
+astc_recompression = "Uncompressed"
+async_shader_compilation = true
+disk_shader_cache = true
+vram_usage = "Conservative"
+validation_layers = false
+
+[frame_view]
+enabled = false
+show_fps = true
+show_frame_time = true
+show_frame_time_graph = true
+show_emulation_speed = true
+show_cpu_gpu_time = false
+show_vram_usage = false
+show_shader_compilation = true
+show_resolution = true
+position = "TopLeft"
+graph_seconds = 5.0
+opacity = 0.8500000238418579
+scale = 1.0
+
+[controls]
+keyboard_enabled = true
+mouse_panning = false
+mouse_panning_sensitivity = 50.0
+touchscreen_enabled = true
+
+[[controls.players]]
+connected = true
+controller_type = "ProController"
+device = "Keyboard"
+motion_enabled = true
+vibration_enabled = true
+vibration_strength = 100
+
+[controls.players.buttons.A]
+Key = "KeyC"
+
+[controls.players.buttons.B]
+Key = "KeyX"
+
+[controls.players.buttons.X]
+Key = "KeyV"
+
+[controls.players.buttons.Y]
+Key = "KeyZ"
+
+[controls.players.buttons.LStick]
+Key = "KeyF"
+
+[controls.players.buttons.RStick]
+Key = "KeyG"
+
+[controls.players.buttons.L]
+Key = "KeyQ"
+
+[controls.players.buttons.R]
+Key = "KeyE"
+
+[controls.players.buttons.ZL]
+Key = "KeyR"
+
+[controls.players.buttons.ZR]
+Key = "KeyT"
+
+[controls.players.buttons.Plus]
+Key = "KeyM"
+
+[controls.players.buttons.Minus]
+Key = "KeyN"
+
+[controls.players.buttons.DPadLeft]
+Key = "ArrowLeft"
+
+[controls.players.buttons.DPadUp]
+Key = "ArrowUp"
+
+[controls.players.buttons.DPadRight]
+Key = "ArrowRight"
+
+[controls.players.buttons.DPadDown]
+Key = "ArrowDown"
+
+[controls.players.buttons.Home]
+Key = "Backspace"
+
+[controls.players.buttons.Capture]
+Key = "Backslash"
+
+[controls.players.buttons.C]
+Key = "KeyB"
+
+[controls.players.left_stick]
+invert_x = false
+invert_y = false
+modifier_scale = 0.5
+deadzone = 0.15000000596046448
+range = 1.0
+
+[controls.players.left_stick.up]
+Key = "KeyW"
+
+[controls.players.left_stick.down]
+Key = "KeyS"
+
+[controls.players.left_stick.left]
+Key = "KeyA"
+
+[controls.players.left_stick.right]
+Key = "KeyD"
+
+[controls.players.left_stick.modifier]
+Key = "ShiftLeft"
+
+[controls.players.right_stick]
+invert_x = false
+invert_y = false
+modifier_scale = 0.5
+deadzone = 0.15000000596046448
+range = 1.0
+
+[controls.players.right_stick.up]
+Key = "KeyI"
+
+[controls.players.right_stick.down]
+Key = "KeyK"
+
+[controls.players.right_stick.left]
+Key = "KeyJ"
+
+[controls.players.right_stick.right]
+Key = "KeyL"
+
+[controls.players.right_stick.modifier]
+Key = "ShiftRight"
+
+[[controls.players]]
+connected = true
+controller_type = "ProController"
+motion_enabled = true
+vibration_enabled = true
+vibration_strength = 100
+
+[controls.players.device.Gamepad]
+guid = "03000000c82d00000631000014010000"
+index = 0
+name = "8BitDo Pro 2"
+
+[controls.players.buttons]
+
+[controls.players.left_stick]
+invert_x = false
+invert_y = false
+up = "None"
+down = "None"
+left = "None"
+right = "None"
+modifier = "None"
+modifier_scale = 0.5
+deadzone = 0.15000000596046448
+range = 1.0
+
+[controls.players.right_stick]
+invert_x = false
+invert_y = false
+up = "None"
+down = "None"
+left = "None"
+right = "None"
+modifier = "None"
+modifier_scale = 0.5
+deadzone = 0.15000000596046448
+range = 1.0
+
+[[controls.players]]
+connected = false
+controller_type = "ProController"
+device = "None"
+motion_enabled = true
+vibration_enabled = true
+vibration_strength = 100
+
+[controls.players.buttons]
+
+[controls.players.left_stick]
+invert_x = false
+invert_y = false
+up = "None"
+down = "None"
+left = "None"
+right = "None"
+modifier = "None"
+modifier_scale = 0.5
+deadzone = 0.15000000596046448
+range = 1.0
+
+[controls.players.right_stick]
+invert_x = false
+invert_y = false
+up = "None"
+down = "None"
+left = "None"
+right = "None"
+modifier = "None"
+modifier_scale = 0.5
+deadzone = 0.15000000596046448
+range = 1.0
+
+[[controls.players]]
+connected = false
+controller_type = "ProController"
+device = "None"
+motion_enabled = true
+vibration_enabled = true
+vibration_strength = 100
+
+[controls.players.buttons]
+
+[controls.players.left_stick]
+invert_x = false
+invert_y = false
+up = "None"
+down = "None"
+left = "None"
+right = "None"
+modifier = "None"
+modifier_scale = 0.5
+deadzone = 0.15000000596046448
+range = 1.0
+
+[controls.players.right_stick]
+invert_x = false
+invert_y = false
+up = "None"
+down = "None"
+left = "None"
+right = "None"
+modifier = "None"
+modifier_scale = 0.5
+deadzone = 0.15000000596046448
+range = 1.0
+
+[[controls.players]]
+connected = false
+controller_type = "ProController"
+device = "None"
+motion_enabled = true
+vibration_enabled = true
+vibration_strength = 100
+
+[controls.players.buttons]
+
+[controls.players.left_stick]
+invert_x = false
+invert_y = false
+up = "None"
+down = "None"
+left = "None"
+right = "None"
+modifier = "None"
+modifier_scale = 0.5
+deadzone = 0.15000000596046448
+range = 1.0
+
+[controls.players.right_stick]
+invert_x = false
+invert_y = false
+up = "None"
+down = "None"
+left = "None"
+right = "None"
+modifier = "None"
+modifier_scale = 0.5
+deadzone = 0.15000000596046448
+range = 1.0
+
+[[controls.players]]
+connected = false
+controller_type = "ProController"
+device = "None"
+motion_enabled = true
+vibration_enabled = true
+vibration_strength = 100
+
+[controls.players.buttons]
+
+[controls.players.left_stick]
+invert_x = false
+invert_y = false
+up = "None"
+down = "None"
+left = "None"
+right = "None"
+modifier = "None"
+modifier_scale = 0.5
+deadzone = 0.15000000596046448
+range = 1.0
+
+[controls.players.right_stick]
+invert_x = false
+invert_y = false
+up = "None"
+down = "None"
+left = "None"
+right = "None"
+modifier = "None"
+modifier_scale = 0.5
+deadzone = 0.15000000596046448
+range = 1.0
+
+[[controls.players]]
+connected = false
+controller_type = "ProController"
+device = "None"
+motion_enabled = true
+vibration_enabled = true
+vibration_strength = 100
+
+[controls.players.buttons]
+
+[controls.players.left_stick]
+invert_x = false
+invert_y = false
+up = "None"
+down = "None"
+left = "None"
+right = "None"
+modifier = "None"
+modifier_scale = 0.5
+deadzone = 0.15000000596046448
+range = 1.0
+
+[controls.players.right_stick]
+invert_x = false
+invert_y = false
+up = "None"
+down = "None"
+left = "None"
+right = "None"
+modifier = "None"
+modifier_scale = 0.5
+deadzone = 0.15000000596046448
+range = 1.0
+
+[[controls.players]]
+connected = false
+controller_type = "ProController"
+device = "None"
+motion_enabled = true
+vibration_enabled = true
+vibration_strength = 100
+
+[controls.players.buttons]
+
+[controls.players.left_stick]
+invert_x = false
+invert_y = false
+up = "None"
+down = "None"
+left = "None"
+right = "None"
+modifier = "None"
+modifier_scale = 0.5
+deadzone = 0.15000000596046448
+range = 1.0
+
+[controls.players.right_stick]
+invert_x = false
+invert_y = false
+up = "None"
+down = "None"
+left = "None"
+right = "None"
+modifier = "None"
+modifier_scale = 0.5
+deadzone = 0.15000000596046448
+range = 1.0
+
+[audio]
+output = "Auto"
+volume = 100
+muted = false
+
+[paths]
+game_dirs = ["/games/switch"]
+
+[debug]
+log_filter = "info"
+svc_trace = false
+ipc_trace = false
+auto_stub = false
+dump_shaders = false
