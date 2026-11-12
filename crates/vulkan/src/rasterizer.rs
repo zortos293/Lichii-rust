@@ -186,10 +186,10 @@ impl VulkanRasterizer {
                 let c = regs.clear_color;
                 let value = match info.format.numeric() {
                     Numeric::Uint => vk::ClearColorValue {
-                        uint32: c.map(|v| v as u32),
+                        uint32: c.map(f32::to_bits),
                     },
                     Numeric::Sint => vk::ClearColorValue {
-                        int32: c.map(|v| v as i32),
+                        int32: c.map(|v| v.to_bits() as i32),
                     },
                     _ => vk::ClearColorValue { float32: c },
                 };
@@ -632,7 +632,14 @@ impl Rasterizer for VulkanRasterizer {
 
     fn invalidate_region(&mut self, addr: DAddr, size: u64) {
         self.buffer_cache.invalidate(addr, size);
-        self.texture_cache.invalidate(addr, size);
+        let mut tx = Transfer {
+            scheduler: &mut self.scheduler,
+            staging: &mut self.staging,
+            memory: &self.handles.device,
+        };
+        if let Err(error) = self.texture_cache.invalidate(&mut tx, addr, size) {
+            tracing::error!(%error, "writing back GPU-modified images before a CPU write failed");
+        }
     }
 
     fn flush_region(&mut self, addr: DAddr, size: u64) {

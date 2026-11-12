@@ -399,37 +399,112 @@ fn index_size(index_type: vk::IndexType) -> usize {
     }
 }
 
+/// The `(start, end)` runs of guest indices that assemble independently: the whole range, or
+/// with `split` the runs between restart indices (`u32::MAX` after [`index_at`]).
+fn runs(
+    count: usize,
+    index: &impl Fn(usize) -> u32,
+    split: bool,
+) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let mut start = 0;
+    std::iter::from_fn(move || {
+        while start <= count {
+            let end = if split {
+                (start..count)
+                    .find(|&i| index(i) == u32::MAX)
+                    .unwrap_or(count)
+            } else {
+                count
+            };
+            let run = (start, end);
+            start = end + 1;
+            if run.1 > run.0 {
+                return Some(run);
+            }
+        }
+        None
+    })
+}
+
+/// Host indices `assembly` makes of `count` guest indices; with `restart`, each run between
+/// restart indices assembles on its own and line loops keep a restart index between runs.
+fn assembled_count(
+    assembly: Assembly,
+    count: usize,
+    index: impl Fn(usize) -> u32,
+    restart: bool,
+) -> u32 {
+    if assembly == Assembly::Direct {
+        return count as u32;
+    }
+    let (mut total, mut drawn) = (0u32, 0u32);
+    for (start, end) in runs(count, &index, restart) {
+        let n = assembly.output_count((end - start) as u32);
+        if n > 0 {
+            total += n;
+            drawn += 1;
+        }
+    }
+    if assembly == Assembly::LineLoop {
+        total += drawn.saturating_sub(1);
+    }
+    total
+}
+
 /// Writes the host indices for `count` guest indices read through `index` into `out`, as
 /// `index_type` (truncating, so a restart index stays the all-ones value of the narrower type).
+/// `out` holds [`assembled_count`] indices.
 fn assemble(
     assembly: Assembly,
     count: usize,
     index: impl Fn(usize) -> u32,
+    restart: bool,
     index_type: vk::IndexType,
     out: &mut [u8],
 ) {
     let width = index_size(index_type);
-    let mut put = |slot: usize, value: u32| {
+    let mut slot = 0;
+    let mut put = |value: u32| {
         out[slot * width..(slot + 1) * width].copy_from_slice(&value.to_le_bytes()[..width]);
+        slot += 1;
     };
-    let (stride, pattern) = match assembly {
-        Assembly::Direct | Assembly::LineLoop => {
-            for i in 0..count {
-                put(i, index(i));
-            }
-            if assembly == Assembly::LineLoop && count > 0 {
-                put(count, index(0));
-            }
-            return;
+    if assembly == Assembly::Direct {
+        for i in 0..count {
+            put(index(i));
         }
-        Assembly::Quads => (4, [0, 1, 2, 0, 2, 3]),
-        Assembly::QuadStrip => (2, [0, 3, 1, 0, 2, 3]),
-    };
-    let quads = assembly.output_count(count as u32) as usize / 6;
-    for quad in 0..quads {
-        for (k, offset) in pattern.into_iter().enumerate() {
-            put(quad * 6 + k, index(quad * stride + offset));
+        return;
+    }
+    let mut first = true;
+    for (start, end) in runs(count, &index, restart) {
+        let quads = assembly.output_count((end - start) as u32) as usize / 6;
+        match assembly {
+            Assembly::LineLoop => {
+                if !first {
+                    put(u32::MAX);
+                }
+                for i in start..end {
+                    put(index(i));
+                }
+                put(index(start));
+            }
+            Assembly::Quads | Assembly::QuadStrip => {
+                if quads == 0 {
+                    continue;
+                }
+                let (stride, pattern) = if assembly == Assembly::Quads {
+                    (4, [0, 1, 2, 0, 2, 3])
+                } else {
+                    (2, [0, 3, 1, 0, 2, 3])
+                };
+                for quad in 0..quads {
+                    for offset in pattern {
+                        put(index(start + quad * stride + offset));
+                    }
+                }
+            }
+            Assembly::Direct => unreachable!("handled above"),
         }
+        first = false;
     }
 }
 
@@ -1211,19 +1286,14 @@ impl BufferCache {
             (Assembly::Direct, InlineIndices::U16(_)) => vk::IndexType::UINT16,
             _ => vk::IndexType::UINT32,
         };
-        let index_count = assembly.output_count(count as u32);
+        let index = |i| index_at(indices, restart, i);
+        let index_count = assembled_count(assembly, count, index, restart);
         if index_count == 0 {
             return Ok(IndexBinding::EMPTY);
         }
         let size = u64::from(index_count) * index_size(index_type) as u64;
         let slice = self.stream.alloc(scheduler, size, 4)?;
-        assemble(
-            assembly,
-            count,
-            |i| index_at(indices, restart, i),
-            index_type,
-            slice.data,
-        );
+        assemble(assembly, count, index, restart, index_type, slice.data);
         let binding = IndexBinding {
             buffer: slice.buffer,
             offset: slice.offset,
@@ -1251,6 +1321,7 @@ impl BufferCache {
             Assembly::LineLoop,
             draw.count as usize,
             |i| i as u32,
+            false,
             vk::IndexType::UINT32,
             slice.data,
         );
@@ -1302,6 +1373,7 @@ impl BufferCache {
                 assembly,
                 vertices as usize,
                 |i| i as u32,
+                false,
                 vk::IndexType::UINT32,
                 slice.data,
             );
@@ -1562,13 +1634,15 @@ mod tests {
     #[test]
     fn assembles_quads_strips_and_loops() {
         let run = |assembly, indices: &[u16], restart, index_type| {
-            let count = assembly_count(assembly, indices.len());
-            let mut out = vec![0; count * index_size(index_type)];
             let source = InlineIndices::U16(indices);
+            let index = |i| index_at(source, restart, i);
+            let count = assembled_count(assembly, indices.len(), index, restart) as usize;
+            let mut out = vec![0; count * index_size(index_type)];
             assemble(
                 assembly,
                 indices.len(),
-                |i| index_at(source, restart, i),
+                index,
+                restart,
                 index_type,
                 &mut out,
             );
@@ -1576,9 +1650,6 @@ mod tests {
                 .map(|c| c.iter().rev().fold(0, |v, &b| v << 8 | u32::from(b)))
                 .collect::<Vec<u32>>()
         };
-        fn assembly_count(assembly: Assembly, n: usize) -> usize {
-            assembly.output_count(n as u32) as usize
-        }
         let u32_ = vk::IndexType::UINT32;
         assert_eq!(
             run(Assembly::Quads, &[1, 2, 3, 4, 5, 6, 7, 8, 9], false, u32_),
@@ -1592,9 +1663,32 @@ mod tests {
             run(Assembly::LineLoop, &[4, 5, 6], false, u32_),
             [4, 5, 6, 4]
         );
+        assert_eq!(run(Assembly::LineLoop, &[1, 0xffff], true, u32_), [1, 1]);
         assert_eq!(
-            run(Assembly::LineLoop, &[1, 0xffff], true, u32_),
-            [1, u32::MAX, 1]
+            run(Assembly::LineLoop, &[1, 2, 3, 0xffff, 4, 5, 6], true, u32_),
+            [1, 2, 3, 1, u32::MAX, 4, 5, 6, 4]
+        );
+        assert_eq!(
+            run(Assembly::LineLoop, &[1, 2, 3, 0xffff, 4, 5, 6], false, u32_),
+            [1, 2, 3, 0xffff, 4, 5, 6, 1]
+        );
+        assert_eq!(
+            run(
+                Assembly::Quads,
+                &[0, 1, 2, 3, 0xffff, 9, 4, 5, 6, 7],
+                true,
+                u32_
+            ),
+            [0, 1, 2, 0, 2, 3, 9, 4, 5, 9, 5, 6]
+        );
+        assert_eq!(
+            run(
+                Assembly::QuadStrip,
+                &[0, 1, 2, 3, 0xffff, 4, 5, 6, 7, 0xffff],
+                true,
+                u32_
+            ),
+            [0, 3, 1, 0, 2, 3, 4, 7, 5, 4, 6, 7]
         );
         assert_eq!(
             run(Assembly::Direct, &[1, 0xffff], false, u32_),

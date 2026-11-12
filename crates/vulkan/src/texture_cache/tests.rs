@@ -414,14 +414,20 @@ fn cpu_writes_re_upload_on_next_use() {
         "without an invalidation the cached copy stays"
     );
 
-    f.cache.invalidate(DADDR + 100, 4);
+    {
+        let (mut tx, cache, _) = f.tx();
+        cache.invalidate(&mut tx, DADDR + 100, 4).unwrap();
+    }
     assert!(f.cache.state(id).unwrap().cpu_dirty);
     let (same, _) = f.texture(&header);
     assert_eq!(same, id);
     assert!(f.read_image(id)[0] == second[0], "the image re-uploaded");
     assert!(!f.cache.state(id).unwrap().cpu_dirty);
 
-    f.cache.invalidate(DADDR + (1 << 20), 4);
+    {
+        let (mut tx, cache, _) = f.tx();
+        cache.invalidate(&mut tx, DADDR + (1 << 20), 4).unwrap();
+    }
     assert!(
         !f.cache.state(id).unwrap().cpu_dirty,
         "a write elsewhere leaves it"
@@ -469,6 +475,41 @@ fn clear_rt(f: &mut Fixture, info: &ImageInfo, color: [f32; 4], rect: Rect) -> F
         )
         .unwrap();
     target
+}
+
+#[test]
+fn cpu_writes_into_gpu_modified_images_keep_the_other_gpu_texels() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let info = rt_info(64, 64, 3, GobLayout::Tegra);
+    let target = clear_rt(&mut f, &info, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    f.memory.write_bytes(DADDR + 8, &[9; 4]).unwrap();
+    {
+        let (mut tx, cache, _) = f.tx();
+        cache.invalidate(&mut tx, DADDR + 8, 4).unwrap();
+    }
+    let state = f.cache.state(target.id).unwrap();
+    assert!(state.cpu_dirty && !state.gpu_modified);
+    let mut guest = vec![0; info.size_bytes() as usize];
+    f.memory.read_bytes(DADDR, &mut guest).unwrap();
+    for (i, texel) in guest.as_chunks::<4>().0.iter().enumerate() {
+        let expected = if i == 2 { [9; 4] } else { [255, 0, 0, 255] };
+        assert_eq!(*texel, expected, "guest texel at byte {}", i * 4);
+    }
+    let (id, _) = f.texture(&tic(0x08, GPU_VA, 64, 64, 1, 1, 3));
+    assert_eq!(id, target.id);
+    let texels = f.read_image(id);
+    assert_eq!(
+        texels[0]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|t| **t == [9; 4])
+            .count(),
+        1
+    );
+    f.assert_no_validation_errors();
 }
 
 #[test]
@@ -773,7 +814,10 @@ fn measures_upload_and_lookup_cost() {
     let rounds = 20;
     let start = Instant::now();
     for _ in 0..rounds {
-        f.cache.invalidate(DADDR, 4);
+        {
+            let (mut tx, cache, _) = f.tx();
+            cache.invalidate(&mut tx, DADDR, 4).unwrap();
+        }
         f.texture(&header);
     }
     f.scheduler.finish().unwrap();

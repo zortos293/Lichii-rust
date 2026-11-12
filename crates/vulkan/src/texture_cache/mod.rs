@@ -337,17 +337,39 @@ fn read_guest(memory: &DeviceAddressSpace, segments: &[Segment], offset: u64, ou
     }
 }
 
-/// Writes guest bytes of an image; bytes over unmapped gaps are dropped.
-fn write_guest(memory: &DeviceAddressSpace, segments: &[Segment], offset: u64, data: &[u8]) {
+/// Writes guest bytes of an image, except those at device addresses in `keep`; bytes over
+/// unmapped gaps are dropped.
+fn write_guest(
+    memory: &DeviceAddressSpace,
+    segments: &[Segment],
+    offset: u64,
+    data: &[u8],
+    keep: Option<(DAddr, DAddr)>,
+) {
     let end = offset + data.len() as u64;
+    let write = |daddr: DAddr, chunk: &[u8]| {
+        if let Err(fault) = memory.write_bytes(daddr, chunk) {
+            tracing::warn!(?fault, "texture flush to unmapped device memory");
+        }
+    };
     for s in segments {
         let (start, stop) = (s.offset.max(offset), (s.offset + s.size).min(end));
         if start >= stop {
             continue;
         }
         let chunk = &data[(start - offset) as usize..(stop - offset) as usize];
-        if let Err(fault) = memory.write_bytes(s.daddr + (start - s.offset), chunk) {
-            tracing::warn!(?fault, "texture flush to unmapped device memory");
+        let daddr = s.daddr + (start - s.offset);
+        let chunk_end = daddr + chunk.len() as u64;
+        match keep {
+            Some((k0, k1)) if k0 < chunk_end && k1 > daddr => {
+                if k0 > daddr {
+                    write(daddr, &chunk[..(k0 - daddr) as usize]);
+                }
+                if k1 < chunk_end {
+                    write(k1, &chunk[(k1 - daddr) as usize..]);
+                }
+            }
+            _ => write(daddr, chunk),
         }
     }
 }
@@ -624,18 +646,27 @@ impl TextureCache {
     }
 
     /// The guest CPU wrote `[daddr, daddr + size)`: overlapping images re-upload on next use.
-    pub fn invalidate(&mut self, daddr: DAddr, size: u64) {
+    /// GPU-modified images first write their other texels back, so only the CPU's bytes replace
+    /// GPU data.
+    pub fn invalidate(&mut self, tx: &mut Transfer<'_>, daddr: DAddr, size: u64) -> Result<()> {
         self.collect_overlaps(&[Segment {
             offset: 0,
             daddr,
             size,
         }]);
-        for i in 0..self.ids.len() {
-            let id = self.ids[i];
+        let mut ids = std::mem::take(&mut self.ids);
+        let result = ids.iter().try_for_each(|&id| {
+            if self.image(id).gpu_modified {
+                self.download(tx, id, Some((daddr, daddr.saturating_add(size))))?;
+            }
             let image = self.image(id);
             image.cpu_dirty = true;
             image.gpu_modified = false;
-        }
+            Ok(())
+        });
+        ids.clear();
+        self.ids = ids;
+        result
     }
 
     /// Writes GPU-modified images overlapping `[daddr, daddr + size)` back to guest memory.
@@ -647,7 +678,9 @@ impl TextureCache {
         }]);
         let mut modified = std::mem::take(&mut self.ids);
         modified.retain(|&id| self.get(id).is_some_and(|i| i.gpu_modified));
-        let result = modified.iter().try_for_each(|&id| self.download(tx, id));
+        let result = modified
+            .iter()
+            .try_for_each(|&id| self.download(tx, id, None));
         modified.clear();
         self.ids = modified;
         result
@@ -693,7 +726,13 @@ impl TextureCache {
                     gob: gb,
                     ..
                 },
-            ) => a == b && ga == gb,
+            ) => {
+                a == b
+                    && ga == gb
+                    && image.layout == info.layout
+                    && image.surface().level_tiling(0).row_gobs
+                        == info.surface().level_tiling(0).row_gobs
+            }
             (GuestLayout::Pitch { pitch: a }, GuestLayout::Pitch { pitch: b }) => a == b,
             _ => false,
         };
@@ -1125,7 +1164,7 @@ impl TextureCache {
                 }
                 _ => {
                     if image.gpu_modified {
-                        self.download(tx, id)?;
+                        self.download(tx, id, None)?;
                     }
                     self.remove(tx.scheduler, id);
                 }
@@ -1431,7 +1470,7 @@ impl TextureCache {
             }
         }
         let cmd = tx.scheduler.record()?;
-        image.access = ImageAccess::UNDEFINED;
+        image.access.layout = vk::ImageLayout::UNDEFINED;
         image.transition(&device, cmd, ImageAccess::TRANSFER_DST);
         // SAFETY: the image is in TRANSFER_DST layout and every region reads staged bytes the
         // host layout sized.
@@ -1447,8 +1486,14 @@ impl TextureCache {
         Ok(())
     }
 
-    /// Writes a GPU-modified image back to guest memory, at native resolution.
-    fn download(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
+    /// Writes a GPU-modified image back to guest memory, at native resolution, leaving the
+    /// device addresses in `keep` untouched.
+    fn download(
+        &mut self,
+        tx: &mut Transfer<'_>,
+        id: ImageId,
+        keep: Option<(DAddr, DAddr)>,
+    ) -> Result<()> {
         let device = self.device.clone();
         let image = self.image(id);
         let info = image.info;
@@ -1600,7 +1645,13 @@ impl TextureCache {
                         scratch.tiled.resize(tiling.size_bytes(), 0);
                         read_guest(tx.memory, &image.segments, guest_offset, &mut scratch.tiled);
                         swizzle(&tiling, &scratch.linear, &mut scratch.tiled);
-                        write_guest(tx.memory, &image.segments, guest_offset, &scratch.tiled);
+                        write_guest(
+                            tx.memory,
+                            &image.segments,
+                            guest_offset,
+                            &scratch.tiled,
+                            keep,
+                        );
                     }
                     GuestLayout::Pitch { pitch } => {
                         let rows = extent.1.div_ceil(format.block_height()).max(1) as usize;
@@ -1611,6 +1662,7 @@ impl TextureCache {
                                 &image.segments,
                                 guest_offset + y as u64 * u64::from(pitch),
                                 line,
+                                keep,
                             );
                         }
                     }
