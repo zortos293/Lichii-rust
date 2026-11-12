@@ -507,6 +507,15 @@ fn walks_sixteen_byte_instructions() {
 }
 
 #[test]
+fn uniform_instructions_are_guarded_by_uniform_predicates() {
+    let guarded = classify(Enc::op(0x890).guard(0, false));
+    assert!(matches!(guarded.op, FlowOp::Normal));
+    assert_eq!(guarded.cond, Condition::pred(Pred::up(0), false));
+    let vector = classify(Enc::op(0x810).guard(0, false));
+    assert_eq!(vector.cond, Condition::pred(Pred::p(0), false));
+}
+
+#[test]
 fn classifies_branches() {
     let forward = classify(Enc::op(0x947).guard(1, false).rel(0x20));
     assert_eq!(forward.op, FlowOp::Branch { target: 0x40 });

@@ -874,19 +874,23 @@ impl TranslatePass<'_, '_> {
         false
     }
 
-    /// Moves every top-level conditional demote to one conditional demote before the return.
+    /// Moves every top-level conditional demote outside loops to one conditional demote before
+    /// the return. A demote inside a loop stays put: its condition holds per iteration.
     fn demote_combination(&mut self) {
         let list = &self.prog.syntax_list;
         let mut demote_blocks = Vec::new();
         let mut epilogues = 0;
         let mut depth = 0u32;
+        let mut loop_depth = 0u32;
         for node in list {
             match *node {
                 SyntaxNode::If { .. } => depth += 1,
                 SyntaxNode::EndIf { .. } => depth = depth.saturating_sub(1),
+                SyntaxNode::Loop { .. } => loop_depth += 1,
+                SyntaxNode::Repeat { .. } => loop_depth = loop_depth.saturating_sub(1),
                 SyntaxNode::Block(b) => {
                     if self.block_has(b, Opcode::DemoteToHelperInvocation) {
-                        if depth <= 1 {
+                        if depth <= 1 && loop_depth == 0 {
                             demote_blocks.push(b);
                         }
                     } else if self.block_has(b, Opcode::Epilogue) {

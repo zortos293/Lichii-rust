@@ -423,6 +423,9 @@ impl Builder<'_> {
             }
             FlowOp::Exit => self.analyze_exit(block, f, pc, cond),
             FlowOp::Call { target } => {
+                if cond.is_false() {
+                    return Ok(Analysis::Continue);
+                }
                 let call = match self
                     .cfg
                     .functions
@@ -432,6 +435,18 @@ impl Builder<'_> {
                     Some(id) => id,
                     None => self.add_function(target),
                 };
+                if !cond.is_true() {
+                    if let Some(guarded) =
+                        self.analyze_cond_inst(block, f, pc, EndClass::Call, cond)
+                    {
+                        let ret = self.blk(block).branch_false;
+                        let b = self.blk(guarded);
+                        b.end = pc;
+                        b.function_call = call;
+                        b.return_block = ret;
+                    }
+                    return Ok(Analysis::Branch);
+                }
                 let ret = self.add_label(block, self.stack_of(block), self.isa.next(pc), f);
                 let b = self.blk(block);
                 b.end_class = EndClass::Call;
@@ -473,7 +488,7 @@ impl Builder<'_> {
         pc: u32,
         end_class: EndClass,
         cond: Condition,
-    ) {
+    ) -> Option<BlockId> {
         let stack = self.stack_of(block);
         if self.cfg.blocks[block as usize].begin != pc {
             let t = self.add_label(block, stack, pc, f);
@@ -482,7 +497,7 @@ impl Builder<'_> {
             b.cond = Condition::TRUE;
             b.branch_true = Some(t);
             b.branch_false = None;
-            return;
+            return None;
         }
         let mut conditional = self.cfg.blocks[block as usize].clone();
         conditional.end = self.isa.next(pc);
@@ -503,6 +518,7 @@ impl Builder<'_> {
         }
         let key = self.cfg.blocks[conditional_id as usize].key();
         self.cfg.functions[f].blocks.insert(key, conditional_id);
+        Some(conditional_id)
     }
 
     fn analyze_indirect(
@@ -585,6 +601,7 @@ impl Builder<'_> {
         if let Some(exit_pc) = stack.peek(Token::Pexit) {
             let t = self.add_label(block, stack.remove(Token::Pexit), exit_pc, f);
             let b = self.blk(block);
+            b.end = pc;
             b.cond = Condition::TRUE;
             b.branch_true = Some(t);
             b.branch_false = None;
