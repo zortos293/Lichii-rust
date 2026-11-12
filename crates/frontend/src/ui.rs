@@ -26,6 +26,7 @@ impl App {
             egui::CentralPanel::default().show(ui, |ui| self.game_list(ui, actions));
         }
         self.dialogs(ui.ctx(), actions);
+        self.show_config(ui.ctx());
         if let Some((_, at)) = &self.ui.toast {
             let left = crate::app::TOAST_TIME.saturating_sub(at.elapsed());
             if left.is_zero() {
