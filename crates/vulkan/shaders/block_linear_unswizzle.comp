@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// Untiles one 2D block-linear slice (block depth 1) into a pitch-linear buffer, one 32-bit word
+// per invocation. Mirrors lichii_texture::block_linear (Tiling::offset and GobLayout).
+
+#version 460
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Tiled { uint tiled[]; };
+layout(set = 0, binding = 1) writeonly buffer Linear { uint linear_words[]; };
+
+layout(push_constant) uniform P {
+    uint row_words;
+    uint height;
+    uint row_gobs;
+    uint block_height_log2;
+    uint pitch_words;
+    uint switch2_layout;
+    uint tiled_offset_words;
+    uint pad;
+} p;
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= p.row_words || y >= p.height) {
+        return;
+    }
+    uint bh = p.block_height_log2;
+    uint xb = x * 4u;
+    uint block_size = p.row_gobs << (9u + bh);
+    uint gob_y = y >> 3u;
+    uint base = (gob_y >> bh) * block_size + ((gob_y & ((1u << bh) - 1u)) << 9u) + ((xb >> 6u) << (9u + bh));
+    uint in_gob = ((xb & 32u) << 3u) | ((xb & 16u) << 1u) | (xb & 15u) | ((y & 6u) << 5u) | ((y & 1u) << 4u);
+    if (p.switch2_layout != 0u) {
+        uint differ = ((in_gob >> 5u) ^ (in_gob >> 6u)) & 1u;
+        in_gob ^= (differ << 5u) | (differ << 6u);
+    }
+    linear_words[y * p.pitch_words + x] = tiled[p.tiled_offset_words + ((base + in_gob) >> 2u)];
+}
