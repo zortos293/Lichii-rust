@@ -1,11 +1,11 @@
-//! The Switch 2 video decoder (\`nn::codec::video::detail::ipc\`). gsv 902, 905, 906 and 1002 hand
-//! out a [\`VideoDecoder\`], whose TIPC 1 (\`CreateVideoDecoderService\`) hands out a
-//! [\`VideoDecoderService\`].
+//! The Switch 2 video decoder (`nn::codec::video::detail::ipc`). gsv 902, 905, 906 and 1002 hand
+//! out a [`VideoDecoder`], whose TIPC 1 (`CreateVideoDecoderService`) hands out a
+//! [`VideoDecoderService`].
 //!
 //! Nothing is decoded yet: every submitted input becomes one frame without a picture, and the
 //! output image keeps what it held. The command flow is the reference's, so a movie plays at its
 //! pts pace and ends. 311 and 314 hand an output image to the decoder and reply the
-//! NativeSyncHandle \`{~syncpoint, mode 0, u64 value}\` that is reached once a frame is in it, on a
+//! NativeSyncHandle `{~syncpoint, mode 0, u64 value}` that is reached once a frame is in it, on a
 //! syncpoint the service owns. A worker thread fills the images in hand-out order (the order the
 //! client acquires them from its own ring), each frame once it is due by its pts, and increments
 //! the syncpoint; 213 then reports the frame. An end-of-stream input completes as an empty
@@ -18,15 +18,15 @@ use std::time::{Duration, Instant};
 
 use lichii_common::ResultCode;
 use lichii_gpu::host1x::Syncpoints;
-use lichii_kernel::Event;
 use lichii_kernel::ipc::HleRequestContext;
+use lichii_kernel::{Event, GuestClock};
 use parking_lot::{Condvar, Mutex};
 
 use super::{UNKNOWN, push_readable, push_session};
 use crate::nvdrv::Nvdrv;
 use crate::{Service, ServiceContext};
 
-/// \`nn::codec\` (module 111, shared with hwopus): the decoder cannot take another input now; the
+/// `nn::codec` (module 111, shared with hwopus): the decoder cannot take another input now; the
 /// client retries after the ready event.
 const BUSY: ResultCode = ResultCode::new(111, 3603);
 /// No finished frame: the code the client's own acquire uses for an empty ring.
@@ -40,11 +40,11 @@ const REFUSE_AT: usize = READY_WATERMARK * 3;
 /// The client clears the ready event after each wait, so while there is room it is signalled
 /// again this often.
 const READY_INTERVAL: Duration = Duration::from_millis(4);
-/// A frame further than this from the movie clock restarts it: a seek, a loop or a pause.
-const MAX_DRIFT: Duration = Duration::from_secs(1);
+/// A frame further than this (us) from the movie clock restarts it: a seek or a loop.
+const MAX_DRIFT: u64 = 1_000_000;
 
 /// gsv 902, 905, 906 and 1002. Without the decoder service its TIPC 1 creates,
-/// \`InitializeVp9Decoder\` fails with InvalidHandle and the movie player aborts.
+/// `InitializeVp9Decoder` fails with InvalidHandle and the movie player aborts.
 pub(super) struct VideoDecoder {
     pub context: Arc<ServiceContext>,
     pub name: &'static str,
@@ -58,11 +58,8 @@ impl Service for VideoDecoder {
     fn handle(&self, ctx: &mut HleRequestContext) -> Option<ResultCode> {
         Some(match ctx.command() {
             1 => match VideoDecoderService::new(&self.context) {
-                Some(service) => push_session(&self.context, ctx, service),
-                None => {
-                    tracing::error!("{} 1: nvdrv is not registered", self.name);
-                    UNKNOWN
-                }
+                Ok(service) => push_session(&self.context, ctx, service),
+                Err(code) => code,
             },
             _ => return None,
         })
@@ -78,6 +75,8 @@ pub(super) struct VideoDecoderService {
 
 /// What the service thread and the worker share.
 struct Shared {
+    /// The guest clock, which stands still while emulation is paused: the movie clock runs on it.
+    clock: Arc<dyn GuestClock>,
     syncpoints: Arc<Syncpoints>,
     syncpoint: u32,
     ready: Arc<Event>,
@@ -107,8 +106,9 @@ struct State {
     /// The last refused input, queued ahead of the client's next one unless that is the same
     /// input sent again: some clients retry a refused input, others ignore the result.
     held: Option<Input>,
-    /// Output images handed out and not filled yet, in the order the client acquires them.
-    free: VecDeque<u32>,
+    /// Output images handed out and not filled yet, in the order the client acquires them. `None`
+    /// is an image unregistered before it took a frame: its fence value is still counted in turn.
+    free: VecDeque<Option<u32>>,
     /// Filled images, for 213.
     outputs: VecDeque<Output>,
     clock: MovieClock,
@@ -153,18 +153,20 @@ impl State {
     }
 }
 
-/// Maps a stream's pts to host time. It is anchored at the first frame after a reset, so the
-/// frames come out at their pts pace.
+/// Maps a stream's pts to guest time (us). It is anchored at the first frame after a reset, so the
+/// frames come out at their pts pace, and stands still while emulation is paused, as the movie's
+/// audio does.
 #[derive(Default)]
-struct MovieClock(Option<(Instant, u64)>);
+struct MovieClock(Option<(u64, u64)>);
 
 impl MovieClock {
-    /// When the frame at \`pts\` (us) is due.
-    fn due(&mut self, now: Instant, pts: u64) -> Instant {
+    /// When the frame at `pts` is due, in guest us.
+    fn due(&mut self, now: u64, pts: u64) -> u64 {
         if let Some((start, base)) = self.0
-            && let Some(offset) = pts.checked_sub(base)
-            && let Some(due) = start.checked_add(Duration::from_micros(offset))
-            && due.max(now) - due.min(now) <= MAX_DRIFT
+            && let Some(due) = pts
+                .checked_sub(base)
+                .and_then(|offset| start.checked_add(offset))
+            && due.abs_diff(now) <= MAX_DRIFT
         {
             return due;
         }
@@ -174,12 +176,17 @@ impl MovieClock {
 }
 
 impl VideoDecoderService {
-    /// \`None\` until nvdrv, which allocates syncpoints, is registered.
-    fn new(context: &ServiceContext) -> Option<Self> {
-        let nvdrv = context.nvdrv.get()?.clone();
+    /// Fails until nvdrv, which allocates syncpoints, is registered, and when the worker thread
+    /// cannot start.
+    fn new(context: &ServiceContext) -> Result<Self, ResultCode> {
+        let Some(nvdrv) = context.nvdrv.get().cloned() else {
+            tracing::error!("nx2:vdec 1: nvdrv is not registered");
+            return Err(UNKNOWN);
+        };
         let syncpoint = nvdrv.allocate_syncpoint();
         tracing::info!("nx2:vdecsvc counts its frames on syncpoint {syncpoint}");
         let shared = Arc::new(Shared {
+            clock: context.kernel.clock().clone(),
             syncpoints: context.gpu.host1x().syncpoints.clone(),
             syncpoint,
             ready: Arc::new(Event::new()),
@@ -201,16 +208,21 @@ impl VideoDecoderService {
             wake: Condvar::new(),
         });
         let worker = shared.clone();
-        let worker = std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name("nx2:vdec".into())
             .spawn(move || worker.run())
-            .inspect_err(|err| tracing::error!("spawning the nx2:vdec thread: {err}"))
-            .ok();
-        Some(Self {
-            nvdrv,
-            shared,
-            worker,
-        })
+        {
+            Ok(worker) => Ok(Self {
+                nvdrv,
+                shared,
+                worker: Some(worker),
+            }),
+            Err(err) => {
+                tracing::error!("spawning the nx2:vdec thread: {err}");
+                nvdrv.retire_syncpoint(syncpoint);
+                Err(UNKNOWN)
+            }
+        }
     }
 
     /// 311(u32 image) and 314(u32 image, u32, NativeSyncHandle release): queues the image for the
@@ -224,7 +236,7 @@ impl VideoDecoderService {
             let Ok(value) = shared.syncpoints.increase_max(shared.syncpoint, 1) else {
                 return UNKNOWN;
             };
-            state.free.push_back(image);
+            state.free.push_back(Some(image));
             value
         };
         shared.wake.notify_one();
@@ -333,18 +345,33 @@ impl VideoDecoderService {
 }
 
 impl Shared {
-    /// The worker: puts each queued input, once it is due, into the next free image.
+    fn now_us(&self) -> u64 {
+        (u128::from(self.clock.ticks()) * 1_000_000 / u128::from(self.clock.frequency())) as u64
+    }
+
+    fn increment(&self) {
+        if self.syncpoints.guest().increment(self.syncpoint).is_err() {
+            tracing::warn!("nx2:vdecsvc: syncpoint {} is out of range", self.syncpoint);
+        }
+    }
+
+    /// The worker: puts each queued input, once it is due, into the next free image, and counts
+    /// unregistered images off in their turn.
     fn run(&self) {
-        let guest = self.syncpoints.guest();
         let mut state = self.state.lock();
         while !state.quit {
-            let now = Instant::now();
+            if state.free.front() == Some(&None) {
+                state.free.pop_front();
+                self.increment();
+                continue;
+            }
+            let (now, host_now) = (self.now_us(), Instant::now());
             let mut wake = None;
             let next = state
                 .inputs
                 .front()
                 .copied()
-                .zip(state.free.front().copied());
+                .zip(state.free.front().copied().flatten());
             if let Some((input, image)) = next {
                 let due = if input.end {
                     now
@@ -367,16 +394,14 @@ impl Shared {
                         state.end_queued = false;
                         state.clock = MovieClock::default();
                     }
-                    if guest.increment(self.syncpoint).is_err() {
-                        tracing::warn!("nx2:vdecsvc: syncpoint {} is out of range", self.syncpoint);
-                    }
+                    self.increment();
                     continue;
                 }
-                wake = Some(due);
+                wake = Some(host_now + Duration::from_micros(due - now));
             }
             if state.armed && state.running && state.has_room() {
                 self.ready.signal();
-                let next = now + READY_INTERVAL;
+                let next = host_now + READY_INTERVAL;
                 wake = Some(wake.map_or(next, |due: Instant| due.min(next)));
             }
             match wake {
@@ -421,7 +446,12 @@ impl Service for VideoDecoderService {
             200 | 201 | 202 | 210 => ResultCode::SUCCESS,
             212 => {
                 let image: u32 = ctx.pop();
-                self.shared.state.lock().free.retain(|&free| free != image);
+                let mut state = self.shared.state.lock();
+                for free in state.free.iter_mut().filter(|free| **free == Some(image)) {
+                    *free = None;
+                }
+                drop(state);
+                self.shared.wake.notify_one();
                 ResultCode::SUCCESS
             }
             213 => self.output_info(ctx),

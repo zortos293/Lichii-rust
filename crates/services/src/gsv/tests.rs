@@ -1224,7 +1224,7 @@ impl Vdec {
         self.client.send(self.service, request).unwrap()
     }
 
-    /// 311 or 314 for \`image\`: the NativeSyncHandle's syncpoint and value.
+    /// 311 or 314 for `image`: the NativeSyncHandle's syncpoint and value.
     fn hand_out(&self, command: u32, image: u32) -> (u32, u32) {
         let mut request = Request::tipc(command).arg(image);
         if command == 314 {
@@ -1360,6 +1360,29 @@ fn video_decoder_plays_a_movie_at_its_pts_pace_and_ends_it() {
         guest.guest().is_reached(syncpoint, value).unwrap(),
         "closing completes the fences handed out"
     );
+}
+
+#[test]
+fn video_decoder_counts_unregistered_images_off_in_turn() {
+    let vdec = Vdec::open();
+    let fences: Vec<_> = (1..=3).map(|image| vdec.hand_out(311, image)).collect();
+    let (syncpoint, last) = fences[2];
+    assert_eq!(
+        vdec.send(&Request::tipc(212).arg(2u32)).result,
+        ResultCode::SUCCESS
+    );
+    for pts in [0, 1_000] {
+        assert_eq!(vdec.submit(pts, false).result, ResultCode::SUCCESS);
+    }
+    vdec.wait(syncpoint, last);
+    assert_eq!(vdec.output(), Some((1, 1280, 0, false)));
+    assert_eq!(
+        vdec.output(),
+        Some((3, 1280, 1_000_000, false)),
+        "the unregistered image took no frame"
+    );
+    assert_eq!(vdec.output(), None);
+    vdec.close(syncpoint);
 }
 
 #[test]
