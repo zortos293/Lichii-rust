@@ -8,11 +8,10 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::time::Instant;
 
 use lichii_common::GpuVAddr;
 
-use crate::activity::Activity;
+use crate::activity::{Activity, Wait};
 use crate::back::{Back, SideCommand};
 use crate::backend::{ChannelId, ReleaseSize};
 use crate::engines::EngineKind;
@@ -271,9 +270,8 @@ impl Stream {
         self.producer.publish();
         match &mut self.link {
             Link::Thread => {
-                let start = Instant::now();
+                let _waiting = self.activity.waiting(Wait::FrontWaitingForBack);
                 self.producer.wait_consumed(self.producer.position());
-                self.activity.front_waited(start);
             }
             Link::Inline(back) => {
                 let (back, consumer) = &mut **back;
@@ -357,9 +355,8 @@ impl Stream {
             self.producer.publish();
             match &mut self.link {
                 Link::Thread => {
-                    let start = Instant::now();
+                    let _waiting = self.activity.waiting(Wait::FrontWaitingForBack);
                     self.producer.wait_for_room();
-                    self.activity.front_waited(start);
                 }
                 Link::Inline(back) => {
                     let (back, consumer) = &mut **back;

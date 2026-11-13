@@ -11,12 +11,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread::{JoinHandle, ThreadId};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use lichii_common::DAddr;
 use parking_lot::{Condvar, Mutex};
 
-use crate::activity::{Activity, Reporter};
+use crate::activity::{Activity, Wait};
 use crate::back::{Back, SideCommand};
 use crate::backend::{ChannelId, FramebufferConfig, GpuHandles, Rasterizer};
 use crate::channel::{ChannelConfig, GpEntry, Submission, SyncpointFence, SyncpointIncrement};
@@ -209,7 +209,6 @@ struct Front {
     /// fetch synchronisation, so it cannot overtake that channel's earlier entries, and every
     /// command after it waits too.
     held: VecDeque<CpuCommand>,
-    reporter: Reporter,
     activity: Arc<Activity>,
 }
 
@@ -227,10 +226,9 @@ impl Front {
         let mut fences = false;
         loop {
             let waiting = self.channels.iter().flatten().any(FrontChannel::is_waiting);
-            let idle = Instant::now();
+            let idle = self.activity.waiting(Wait::FrontIdle);
             let closed = inbox.take(&mut batch, (waiting || fences).then_some(poll));
-            self.activity.front_idle(idle);
-            self.reporter.tick();
+            drop(idle);
             let busy = !batch.is_empty();
             self.held.append(&mut batch);
             self.handle_held();
@@ -368,8 +366,10 @@ pub struct Gpu {
     inbox: Arc<Inbox>,
     next_channel: AtomicU32,
     references: Mutex<HashMap<ChannelId, Arc<AtomicU32>>>,
-    /// The front thread, then the back thread when it has one; emptied by `shutdown`.
+    /// The front thread, the back thread when it has one, and the activity reporter; emptied by
+    /// `shutdown`.
     threads: Mutex<Vec<JoinHandle<()>>>,
+    activity: Arc<Activity>,
     /// Ids of those threads, so `shutdown` recognises a GPU thread without taking `threads`.
     thread_ids: Vec<ThreadId>,
 }
@@ -443,15 +443,23 @@ impl Gpu {
             },
             channels: Vec::new(),
             held: VecDeque::new(),
-            reporter: Reporter::new(activity.clone(), config.threading == Threading::Split),
-            activity,
+            activity: activity.clone(),
         };
         let front_inbox = inbox.clone();
         let front = std::thread::Builder::new()
             .name("gpu-front".into())
             .spawn(move || front.run(front_inbox))
             .expect("failed to start the GPU front thread");
+        let threaded = config.threading == Threading::Split;
+        let reporter = std::thread::Builder::new()
+            .name("gpu-activity".into())
+            .spawn({
+                let activity = activity.clone();
+                move || activity.report_until_stopped(threaded)
+            })
+            .expect("failed to start the GPU activity thread");
         Self {
+            activity,
             host1x,
             handles,
             nx2_memory,
@@ -464,7 +472,12 @@ impl Gpu {
                 .flatten()
                 .map(|thread| thread.thread().id())
                 .collect(),
-            threads: Mutex::new([Some(front), back].into_iter().flatten().collect()),
+            threads: Mutex::new(
+                [Some(front), back, Some(reporter)]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+            ),
         }
     }
 
@@ -642,6 +655,7 @@ impl Gpu {
     /// From a GPU thread (a [`Gpu::run_in_order`] action) it closes the GPU without joining.
     pub fn shutdown(&self) {
         self.inbox.close();
+        self.activity.stop();
         if self.thread_ids.contains(&std::thread::current().id()) {
             tracing::error!("GPU shutdown from a GPU thread; not joining it");
             return;

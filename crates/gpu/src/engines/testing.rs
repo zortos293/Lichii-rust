@@ -21,7 +21,8 @@ pub const MAPPED: u64 = 0x40_0000;
 
 /// Renderer calls, recorded.
 /// The activity counters of engines under test.
-pub static ACTIVITY: crate::activity::Activity = crate::activity::Activity::new();
+pub static ACTIVITY: std::sync::LazyLock<crate::activity::Activity> =
+    std::sync::LazyLock::new(crate::activity::Activity::new);
 
 #[derive(Default)]
 pub struct Recorder {

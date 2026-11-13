@@ -10,7 +10,7 @@ use lichii_common::DAddr;
 use lichii_memory::DeviceAddressSpace;
 use lichii_texture::block_linear::GobLayout;
 
-use crate::activity::{Activity, RendererCall};
+use crate::activity::{Activity, RendererCall, Wait};
 use crate::backend::{
     ChannelId, FenceAction, FramebufferConfig, GpuHandles, GpuWrittenPages, Rasterizer, ReleaseSize,
 };
@@ -139,13 +139,14 @@ impl Back {
         let mut poll = MIN_POLL;
         loop {
             self.run(&mut consumer);
-            let idle = Instant::now();
-            let more = if self.poll_fences() {
+            let fences = self.poll_fences();
+            let idle = self.activity.waiting(Wait::BackIdle);
+            let more = if fences {
                 consumer.wait_more_for(poll)
             } else {
                 Some(consumer.wait_more())
             };
-            self.activity.back_idle(idle);
+            drop(idle);
             match more {
                 Some(true) => poll = MIN_POLL,
                 Some(false) => break,
@@ -242,9 +243,9 @@ impl Back {
                 1
             }
             tag::WAIT_FOR_IDLE => {
-                let start = Instant::now();
+                let waiting = self.activity.waiting(Wait::HostGpu);
                 self.rasterizer.wait_for_idle();
-                self.activity.host_waited(start);
+                drop(waiting);
                 self.rasterizer.release_fences(false);
                 1
             }
@@ -385,9 +386,8 @@ impl Back {
     /// The front is about to read `[address, address + size)`: the GPU work before it completes,
     /// its fences and queries land, and GPU-written data in the range goes back to guest memory.
     fn synchronize_read(&mut self, address: u64, size: u64) {
-        let start = Instant::now();
+        let _waiting = self.activity.waiting(Wait::HostGpu);
         self.rasterizer.release_fences(true);
-        self.activity.host_waited(start);
         let Some(channel) = self.current.and_then(|index| self.channels[index].as_ref()) else {
             return;
         };

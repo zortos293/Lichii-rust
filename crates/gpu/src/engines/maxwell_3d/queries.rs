@@ -1,11 +1,10 @@
 //! Report semaphores, counter resets and conditional rendering.
 
-use std::time::Instant;
-
 use super::regs::{
     ClearReport, Regs, RenderEnableMode, RenderEnableOverride, ReportSemaphoreCompare,
     ReportSemaphoreOperation, ReportSemaphoreReport,
 };
+use crate::activity::Wait;
 use crate::backend::{Query, QueryKind, ReleaseSize};
 use crate::engines::EngineContext;
 use crate::gmmu::RangeTarget;
@@ -79,9 +78,8 @@ pub(super) fn render_enable(regs: &Regs, ctx: &mut EngineContext<'_>) -> bool {
     }
     let address = regs.render_enable.address();
     ctx.rasterizer.flush_commands();
-    let start = Instant::now();
+    let waiting = ctx.activity.waiting(Wait::HostGpu);
     ctx.rasterizer.release_fences(true);
-    ctx.activity.host_waited(start);
     ctx.memory.for_each_range(
         address,
         size_of::<ReportSemaphoreCompare>() as u64,
@@ -98,6 +96,7 @@ pub(super) fn render_enable(regs: &Regs, ctx: &mut EngineContext<'_>) -> bool {
             tracing::warn!(?fault, "render condition at unmapped GPU memory");
             bytemuck::Zeroable::zeroed()
         });
+    drop(waiting);
     match mode {
         RenderEnableMode::CONDITIONAL => c.initial_sequence != 0 && c.initial_mode != 0,
         RenderEnableMode::IF_EQUAL => {
