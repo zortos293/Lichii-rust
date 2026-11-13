@@ -27,6 +27,8 @@ mod state;
 mod upsample;
 
 #[cfg(test)]
+mod command_tests;
+#[cfg(test)]
 mod tests;
 
 pub use biquad::BiquadFilterState;

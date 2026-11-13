@@ -15,10 +15,10 @@ use super::abi::{
 use super::fixed::Q15;
 use super::*;
 
-const SC: usize = 240;
+pub(super) const SC: usize = 240;
 const GOLDEN: &str = include_str!("golden/cref.txt");
 
-fn tone(i: usize, ch: usize) -> i32 {
+pub(super) fn tone(i: usize, ch: usize) -> i32 {
     (((i * 37 + ch * 101) % 211) as i32 - 105) * 1200
 }
 
@@ -54,17 +54,17 @@ impl DspClock for FixedClock {
     }
 }
 
-struct Rig {
-    processor: CommandListProcessor,
-    state: DspState,
-    memory: VecMemory,
-    mix: Vec<i32>,
-    device: Vec<i16>,
-    sample_count: usize,
+pub(super) struct Rig {
+    pub processor: CommandListProcessor,
+    pub state: DspState,
+    pub memory: VecMemory,
+    pub mix: Vec<i32>,
+    pub device: Vec<i16>,
+    pub sample_count: usize,
 }
 
 impl Rig {
-    fn new(sample_count: usize) -> Self {
+    pub fn new(sample_count: usize) -> Self {
         Self {
             processor: CommandListProcessor::new(),
             state: DspState::new(2, MAX_MIX_BUFFERS, 1, 1),
@@ -75,18 +75,18 @@ impl Rig {
         }
     }
 
-    fn buffer(&mut self, index: usize) -> &mut [i32] {
+    pub fn buffer(&mut self, index: usize) -> &mut [i32] {
         &mut self.mix[index * self.sample_count..(index + 1) * self.sample_count]
     }
 
-    fn fill_tone(&mut self, frame: usize, buffer: usize, ch: usize) {
+    pub fn fill_tone(&mut self, frame: usize, buffer: usize, ch: usize) {
         let sc = self.sample_count;
         for (i, sample) in self.buffer(buffer).iter_mut().enumerate() {
             *sample = tone(frame * sc + i, ch);
         }
     }
 
-    fn run(&mut self, commands: Vec<Command>) -> ProcessReport {
+    pub fn run(&mut self, commands: Vec<Command>) -> ProcessReport {
         let list = list(self.sample_count, commands);
         self.processor.process(
             &list,
