@@ -486,7 +486,7 @@ mod tests {
     }
 
     fn result(reply: &Reply) -> (i32, u32) {
-        (reply.at::<i32>(0), reply.at::<u32>(4))
+        (reply.get::<i32>(0), reply.get::<u32>(4))
     }
 
     fn call(guest: &Guest, handle: u32, request: Request) -> (i32, u32) {
@@ -505,8 +505,8 @@ mod tests {
         let user = guest.service("bsd:u");
         let system = guest.service("bsd:s");
         guest.service("bsd:a");
-        assert_eq!(guest.call(user, Request::new(0)).ok().at::<i32>(0), 0);
-        assert_eq!(guest.call(user, Request::new(36)).ok().at::<i32>(0), 0);
+        assert_eq!(guest.call(user, Request::new(0)).ok().get::<i32>(0), 0);
+        assert_eq!(guest.call(user, Request::new(36)).ok().get::<i32>(0), 0);
         guest.call(user, Request::new(1)).ok();
         let socket = |bsd, command, domain: u32, ty: u32, protocol: u32| {
             let request = Request::new(command).arg(domain).arg(ty).arg(protocol);
@@ -543,14 +543,14 @@ mod tests {
                 .call(user, Request::new(command).arg(fd).buffer_b(buffer, 0x10))
                 .ok();
             assert_eq!(result(&reply), (-1, BADF));
-            assert_eq!(reply.at::<u32>(8), 0x10);
+            assert_eq!(reply.get::<u32>(8), 0x10);
         }
         let recv_from = Request::new(9)
             .arg(fd)
             .buffer_b(buffer, 0x40)
             .buffer_b(buffer + 0x40, 0x10);
         let reply = guest.call(user, recv_from).ok();
-        assert_eq!((result(&reply), reply.at::<u32>(8)), ((-1, BADF), 0x10));
+        assert_eq!((result(&reply), reply.get::<u32>(8)), ((-1, BADF), 0x10));
     }
 
     #[test]
@@ -559,7 +559,7 @@ mod tests {
         let bsd = guest.service("bsd:s");
         for command in [4, 7, 19, 23, 28, 32, 35, 37, 44, 200, 201] {
             let reply = guest.call(bsd, Request::new(command)).ok();
-            assert_eq!(reply.at::<[u32; 32]>(0), [0; 32], "command {command}");
+            assert_eq!(reply.get::<[u32; 32]>(0), [0; 32], "command {command}");
         }
         let reply = guest.call(bsd, Request::new(41)).ok();
         assert_eq!(reply.copy_handles.len(), 1);

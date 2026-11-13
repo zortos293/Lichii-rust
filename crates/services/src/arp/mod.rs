@@ -264,7 +264,7 @@ mod tests {
         expected[12] = STORAGE_HOST;
         for request in [Request::new(0).arg(pid), Request::new(1).arg(PROGRAM_ID)] {
             let launch = guest.call(arp, request).ok();
-            assert_eq!(launch.at::<[u8; 16]>(0), expected);
+            assert_eq!(launch.get::<[u8; 16]>(0), expected);
         }
 
         let out = guest.heap;
@@ -324,7 +324,7 @@ mod tests {
         );
 
         let read = guest.call(reader, Request::new(0).arg(pid)).ok();
-        assert_eq!(read.at::<[u8; 16]>(0), launch);
+        assert_eq!(read.get::<[u8; 16]>(0), launch);
         let out = guest.heap + 0x1000;
         guest
             .call(reader, Request::new(2).arg(pid).buffer_b(out, 0x100))

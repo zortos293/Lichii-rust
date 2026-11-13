@@ -130,14 +130,14 @@ mod tests {
             .ok();
         guest.call(context, Request::new(1).arg(1u32)).ok();
         assert_eq!(guest.call(context, Request::new(2)).result, INTERNAL_ERROR);
-        assert_eq!(guest.call(context, Request::new(3)).ok().at::<u32>(0), 0);
+        assert_eq!(guest.call(context, Request::new(3)).ok().get::<u32>(0), 0);
         let pki = guest.heap;
         guest.write(pki, &[1; 0x10]);
         for command in [4, 5] {
             let request = Request::new(command).arg(0u32).buffer_a(pki, 0x10);
-            assert_eq!(guest.call(context, request).ok().at::<u64>(0), 0);
+            assert_eq!(guest.call(context, request).ok().get::<u64>(0), 0);
         }
-        assert_eq!(guest.call(context, Request::new(8)).ok().at::<u64>(0), 0);
+        assert_eq!(guest.call(context, Request::new(8)).ok().get::<u64>(0), 0);
         let unknown = guest.call(context, Request::new(100)).result;
         assert_ne!(unknown, INTERNAL_ERROR);
         assert_eq!(guest.call(ssl, Request::new(100)).result, unknown);
@@ -146,8 +146,8 @@ mod tests {
         let system = create_context(&guest, ssl_s, 100);
         assert_eq!(guest.call(system, Request::new(100)).result, INTERNAL_ERROR);
         create_context(&guest, ssl_s, 0);
-        assert_eq!(guest.call(ssl_s, Request::new(1)).ok().at::<u32>(0), 0);
-        assert_eq!(guest.call(ssl_s, Request::new(102)).ok().at::<u64>(0), 0);
+        assert_eq!(guest.call(ssl_s, Request::new(1)).ok().get::<u32>(0), 0);
+        assert_eq!(guest.call(ssl_s, Request::new(102)).ok().get::<u64>(0), 0);
     }
 
     #[test]
@@ -158,14 +158,14 @@ mod tests {
             let ids = guest.heap;
             guest.write(ids, &(-1i32).to_le_bytes());
             let size = guest.call(service, Request::new(3).buffer_a(ids, 4)).ok();
-            assert_eq!(size.at::<u32>(0), 0x18);
+            assert_eq!(size.get::<u32>(0), 0x18);
 
             let out = guest.heap + 0x100;
             guest.write(out, &[0xaa; 0x20]);
             let small = Request::new(2).buffer_a(ids, 4).buffer_b(out, 0x10);
             assert_eq!(guest.call(service, small).result, RESULT_UNKNOWN);
             let certificates = Request::new(2).buffer_a(ids, 4).buffer_b(out, 0x20);
-            assert_eq!(guest.call(service, certificates).ok().at::<u32>(0), 0);
+            assert_eq!(guest.call(service, certificates).ok().get::<u32>(0), 0);
             let info = guest.read(out, 0x20);
             assert_eq!(info[..0x18], CERTIFICATE_TERMINATOR);
             assert_eq!(info[0x18..], [0xaa; 8]);

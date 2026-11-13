@@ -86,14 +86,14 @@ mod tests {
                 .buffer_b(out, 0x400);
             guest.call(dns, request).ok()
         };
-        assert_eq!(lookup(2).at::<[i32; 3]>(0), [NETDB_TRY_AGAIN, 0, 0]);
-        assert_eq!(lookup(10).at::<[i32; 3]>(0), [0, NETDB_TRY_AGAIN, 0]);
-        assert_eq!(lookup(6).at::<[i32; 3]>(0), [0, GAI_AGAIN, 0]);
+        assert_eq!(lookup(2).get::<[i32; 3]>(0), [NETDB_TRY_AGAIN, 0, 0]);
+        assert_eq!(lookup(10).get::<[i32; 3]>(0), [0, NETDB_TRY_AGAIN, 0]);
+        assert_eq!(lookup(6).get::<[i32; 3]>(0), [0, GAI_AGAIN, 0]);
         assert_eq!(
-            lookup(12).at::<[i32; 4]>(0),
+            lookup(12).get::<[i32; 4]>(0),
             [0, GAI_AGAIN, NETDB_TRY_AGAIN, 0]
         );
-        assert_eq!(guest.call(dns, Request::new(14)).ok().at::<i32>(0), 0);
+        assert_eq!(guest.call(dns, Request::new(14)).ok().get::<i32>(0), 0);
 
         for (error, text) in [
             (GAI_AGAIN, &b"Temporary failure in name resolution\0"[..]),

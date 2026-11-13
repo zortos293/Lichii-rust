@@ -34,23 +34,33 @@
 //! }
 //! ```
 
+mod acc;
 mod am;
 mod aoc;
+mod apm;
 mod arp;
 mod bcat;
+mod caps;
 mod context;
 mod dispatch;
+mod erpt;
+mod eupld;
 mod friend;
 mod fs;
 mod gsv;
+mod lm;
 mod ncm;
 mod nifm;
 mod nim;
 mod ns;
+mod pctl;
+mod prepo;
+mod set;
 mod sockets;
 mod ssl;
 #[cfg(test)]
 mod testing;
+mod time;
 
 use std::sync::Arc;
 
@@ -64,6 +74,16 @@ pub use dispatch::Service;
 pub fn register_all(context: &Arc<ServiceContext>) -> HleResult<()> {
     fs::register(context)?;
     am::register(context)?;
+    apm::register(context)?;
+    pctl::register(context)?;
+    prepo::register(context)?;
+    lm::register(context)?;
+    erpt::register(context)?;
+    eupld::register(context)?;
+    caps::register(context)?;
+    set::register(context)?;
+    acc::register(context)?;
+    time::register(context)?;
     aoc::register(context)?;
     arp::register(context)?;
     bcat::register(context)?;

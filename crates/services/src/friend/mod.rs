@@ -166,16 +166,16 @@ mod tests {
         assert!(guest.is_signaled(completion));
         for command in [10101, 10400, 20100, 20101, 20105, 20108, 22010] {
             let reply = guest.call(service, Request::new(command)).ok();
-            assert_eq!(reply.at::<u32>(0), 0, "command {command}");
+            assert_eq!(reply.get::<u32>(0), 0, "command {command}");
         }
         for command in [10120, 10420] {
             let reply = guest
                 .call(service, Request::new(command).arg([0u8; 16]))
                 .ok();
-            assert_eq!(reply.at::<u8>(0), 1);
+            assert_eq!(reply.get::<u8>(0), 1);
         }
         let requests = guest.call(service, Request::new(20200).arg([0u8; 16])).ok();
-        assert_eq!([requests.at::<u32>(0), requests.at::<u32>(4)], [0, 0]);
+        assert_eq!([requests.get::<u32>(0), requests.get::<u32>(4)], [0, 0]);
         for command in [1, 10601, 10610, 10700, 20104, 20701, 20900] {
             guest.call(service, Request::new(command)).ok();
         }

@@ -171,7 +171,7 @@ mod tests {
         let guest = guest(false);
         let aoc = guest.service("aoc:u");
         let count = guest.call(aoc, Request::new(2).send_pid().arg(0u64)).ok();
-        assert_eq!(count.at::<u32>(0), 3);
+        assert_eq!(count.get::<u32>(0), 3);
 
         let out = guest.heap;
         let list = guest
@@ -185,7 +185,7 @@ mod tests {
                     .buffer_b(out, 0x100),
             )
             .ok();
-        assert_eq!(list.at::<u32>(0), 2);
+        assert_eq!(list.get::<u32>(0), 2);
         assert_eq!(guest.read(out, 8), [2, 0, 0, 0, 5, 0, 0, 0]);
 
         let past_end = guest.call(
@@ -200,13 +200,13 @@ mod tests {
         let guest = guest(true);
         let aoc = guest.service("aoc:u");
         let base = guest.call(aoc, Request::new(5).send_pid().arg(0u64)).ok();
-        assert_eq!(base.at::<u64>(0), 0x0100_0000_0000_7000);
+        assert_eq!(base.get::<u64>(0), 0x0100_0000_0000_7000);
         drop(guest);
 
         let guest = self::guest(false);
         let aoc = guest.service("aoc:u");
         let base = guest.call(aoc, Request::new(5).send_pid().arg(0u64)).ok();
-        assert_eq!(base.at::<u64>(0), PROGRAM_ID + 0x1000);
+        assert_eq!(base.get::<u64>(0), PROGRAM_ID + 0x1000);
     }
 
     #[test]

@@ -2,9 +2,10 @@
 
 use std::sync::Arc;
 
+use bytemuck::Pod;
 use lichii_common::perf::PerfStats;
 use lichii_common::settings::Settings;
-use lichii_common::{ConsoleGeneration, ResultCode, VAddr};
+use lichii_common::{ConsoleGeneration, HleResult, ResultCode, VAddr};
 use lichii_fs::nacp::Nacp;
 use lichii_gpu::backend::NullRasterizer;
 use lichii_gpu::host1x::Host1x;
@@ -59,6 +60,22 @@ pub fn context_with(program: ProgramImage, settings: Settings) -> (Arc<ServiceCo
         perf: Arc::new(PerfStats::default()),
     });
     (context, client)
+}
+
+/// An IPC client in a test title whose services `register` has registered.
+pub fn booted(
+    program_id: u64,
+    settings: Settings,
+    register: impl FnOnce(&Arc<ServiceContext>) -> HleResult<()>,
+) -> IpcClient {
+    let (context, client) = context(program_id, settings);
+    register(&context).unwrap();
+    client
+}
+
+/// Reads a value of guest memory.
+pub fn read_value<T: Pod>(client: &IpcClient, address: VAddr) -> T {
+    bytemuck::pod_read_unaligned(&client.read(address, std::mem::size_of::<T>()))
 }
 
 /// Program id of [`image`].
@@ -168,11 +185,11 @@ impl Drop for Guest {
 }
 
 /// Shorthands for checking a [`Reply`].
-pub trait ReplyExt: Sized {
+pub trait ReplyExt {
     /// Asserts the service answered success.
     fn ok(self) -> Self;
     /// The value at byte `offset` of the reply data.
-    fn at<T: bytemuck::Pod>(&self, offset: usize) -> T;
+    fn get<T: Pod>(&self, offset: usize) -> T;
     /// The reply's one sub-interface (move handle).
     fn interface(&self) -> Handle;
     /// The reply's one copy handle.
@@ -180,12 +197,13 @@ pub trait ReplyExt: Sized {
 }
 
 impl ReplyExt for Reply {
+    #[track_caller]
     fn ok(self) -> Self {
-        assert_eq!(self.result, ResultCode::SUCCESS, "request failed");
+        assert_eq!(self.result, ResultCode::SUCCESS);
         self
     }
 
-    fn at<T: bytemuck::Pod>(&self, offset: usize) -> T {
+    fn get<T: Pod>(&self, offset: usize) -> T {
         bytemuck::pod_read_unaligned(&self.data()[offset..offset + std::mem::size_of::<T>()])
     }
 

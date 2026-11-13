@@ -296,7 +296,7 @@ mod tests {
     fn requests_are_never_accepted() {
         let (guest, general) = general();
         let request = guest.call(general, Ipc::new(4)).ok().interface();
-        let state = |guest: &Guest| guest.call(request, Ipc::new(0)).ok().at::<u32>(0);
+        let state = |guest: &Guest| guest.call(request, Ipc::new(0)).ok().get::<u32>(0);
         assert_eq!(state(&guest), STATE_NOT_SUBMITTED);
         assert_eq!(
             guest.call(request, Ipc::new(1)).result,
@@ -326,14 +326,14 @@ mod tests {
         let out = guest.heap;
         guest.write(out, &[0xaa; 0x40]);
         let info = guest.call(request, Ipc::new(21).buffer_b(out, 0x40)).ok();
-        assert_eq!(info.at::<[u32; 3]>(0), [0; 3]);
+        assert_eq!(info.get::<[u32; 3]>(0), [0; 3]);
         assert!(guest.read(out, 0x40).iter().all(|&b| b == 0));
     }
 
     #[test]
     fn the_network_is_not_connected() {
         let (guest, general) = general();
-        assert_eq!(guest.call(general, Ipc::new(1)).ok().at::<u64>(0), 1);
+        assert_eq!(guest.call(general, Ipc::new(1)).ok().get::<u64>(0), 1);
         let out = guest.heap;
         for (command, size) in [
             (5, SF_NETWORK_PROFILE_SIZE),
@@ -353,23 +353,23 @@ mod tests {
             let reply = guest
                 .call(general, Ipc::new(command).buffer_b(out, 0x100))
                 .ok();
-            assert_eq!(reply.at::<u32>(0), 0, "command {command}");
+            assert_eq!(reply.get::<u32>(0), 0, "command {command}");
         }
         for command in [20, 21, 22] {
-            assert_eq!(guest.call(general, Ipc::new(command)).ok().at::<u8>(0), 0);
+            assert_eq!(guest.call(general, Ipc::new(command)).ok().get::<u8>(0), 0);
         }
         assert_eq!(
-            guest.call(general, Ipc::new(12)).ok().at::<[u8; 4]>(0),
+            guest.call(general, Ipc::new(12)).ok().get::<[u8; 4]>(0),
             [0; 4]
         );
         let config = guest.call(general, Ipc::new(15)).ok();
-        assert_eq!(config.at::<[u8; 22]>(0), [0; 22]);
+        assert_eq!(config.get::<[u8; 22]>(0), [0; 22]);
         let status = guest.call(general, Ipc::new(18)).ok();
-        assert_eq!(status.at::<[u8; 3]>(0), [1, 0, 0]);
+        assert_eq!(status.get::<[u8; 3]>(0), [1, 0, 0]);
 
-        assert_eq!(guest.call(general, Ipc::new(17)).ok().at::<u8>(0), 1);
+        assert_eq!(guest.call(general, Ipc::new(17)).ok().get::<u8>(0), 1);
         guest.call(general, Ipc::new(16).arg(0u8)).ok();
-        assert_eq!(guest.call(general, Ipc::new(17)).ok().at::<u8>(0), 0);
+        assert_eq!(guest.call(general, Ipc::new(17)).ok().get::<u8>(0), 0);
 
         let profile = guest.heap + 0x1000;
         let mut data = vec![0u8; NIFM_NETWORK_PROFILE_SIZE];
@@ -394,7 +394,7 @@ mod tests {
             )
             .ok();
         temporary.interface();
-        assert_eq!(temporary.at::<[u8; 16]>(0), [9; 16]);
+        assert_eq!(temporary.get::<[u8; 16]>(0), [9; 16]);
     }
 
     #[test]
@@ -406,7 +406,7 @@ mod tests {
         assert_eq!(guest.call(scan, Ipc::new(2)).result, PENDING_CONNECTION);
         guest.call(scan, Ipc::new(0)).ok();
         assert!(guest.is_signaled(events.copy_handles[0]));
-        assert_eq!(guest.call(scan, Ipc::new(1)).ok().at::<u8>(0), 0);
+        assert_eq!(guest.call(scan, Ipc::new(1)).ok().get::<u8>(0), 0);
         assert_eq!(guest.call(scan, Ipc::new(2)).result, PENDING_CONNECTION);
     }
 }

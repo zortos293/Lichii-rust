@@ -322,7 +322,7 @@ mod tests {
         let directories = guest
             .call(storage, Request::new(10).buffer_b(out, 0x100))
             .ok();
-        assert_eq!(directories.at::<i32>(0), 0);
+        assert_eq!(directories.get::<i32>(0), 0);
 
         let directory = guest.call(storage, Request::new(1)).ok().interface();
         let open = |text| {

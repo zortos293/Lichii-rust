@@ -213,7 +213,7 @@ mod tests {
             guest.service(name);
         }
         let eca = guest.service("nim:eca");
-        assert_eq!(guest.call(eca, Request::new(4)).ok().at::<u8>(0), 0);
+        assert_eq!(guest.call(eca, Request::new(4)).ok().get::<u8>(0), 0);
         guest.call(eca, Request::new(5)).ok().interface();
         let server = guest.call(eca, Request::new(0)).ok().interface();
         let accessor = guest.call(server, Request::new(0)).ok().interface();
@@ -222,23 +222,23 @@ mod tests {
         assert!(!guest.is_signaled(completion));
 
         guest.call(shop, Request::new(5)).ok();
-        assert_eq!(guest.call(shop, Request::new(1)).ok().at::<u64>(0), 0);
+        assert_eq!(guest.call(shop, Request::new(1)).ok().get::<u64>(0), 0);
         guest.call(shop, Request::new(4)).ok();
         assert!(guest.is_signaled(completion));
-        assert_eq!(guest.call(shop, Request::new(3)).ok().at::<u32>(0), 0);
-        assert_eq!(guest.call(shop, Request::new(1)).ok().at::<u64>(0), 2);
+        assert_eq!(guest.call(shop, Request::new(3)).ok().get::<u32>(0), 0);
+        assert_eq!(guest.call(shop, Request::new(1)).ok().get::<u64>(0), 2);
 
         let out = guest.heap;
         guest.write(out, &[0xaa; 8]);
         let read = guest
             .call(shop, Request::new(2).arg(0u64).buffer_b(out, 8))
             .ok();
-        assert_eq!(read.at::<u64>(0), 2);
+        assert_eq!(read.get::<u64>(0), 2);
         assert_eq!(guest.read(out, 3), b"{}\xaa");
         let past = guest
             .call(shop, Request::new(2).arg(5u64).buffer_b(out, 8))
             .ok();
-        assert_eq!(past.at::<u64>(0), 0);
+        assert_eq!(past.get::<u64>(0), 0);
         guest.call(shop, Request::new(0)).ok();
     }
 
@@ -254,8 +254,8 @@ mod tests {
         guest.call(service, Request::new(0)).ok();
         assert!(guest.is_signaled(finished));
         guest.call(service, Request::new(2)).ok();
-        assert_eq!(guest.call(service, Request::new(4)).ok().at::<u32>(0), 0);
-        let time = guest.call(service, Request::new(5)).ok().at::<i64>(0);
+        assert_eq!(guest.call(service, Request::new(4)).ok().get::<u32>(0), 0);
+        let time = guest.call(service, Request::new(5)).ok().get::<i64>(0);
         assert!(time > 1_700_000_000);
     }
 }

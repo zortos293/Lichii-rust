@@ -33,7 +33,7 @@ fn content_meta_database_knows_the_title_and_its_add_ons() {
     let guest = guest();
     let ncm = guest.service("ncm");
     let db = guest.call(ncm, Request::new(5).arg(5u8)).ok().interface();
-    let has = |key: [u8; 16]| guest.call(db, Request::new(8).arg(key)).ok().at::<u8>(0);
+    let has = |key: [u8; 16]| guest.call(db, Request::new(8).arg(key)).ok().get::<u8>(0);
     assert_eq!(has(key(PROGRAM_ID, 0, 0x80)), 1);
     assert_eq!(has(key(ADD_ON, 0, 0x82)), 1);
     let other = key(0x0100_0000_0009_0000, 1, 0x80);
@@ -45,9 +45,9 @@ fn content_meta_database_knows_the_title_and_its_add_ons() {
     guest.call(db, Request::new(15)).ok();
 
     let latest = guest.call(db, Request::new(6).arg(ADD_ON)).ok();
-    assert_eq!(latest.at::<[u8; 16]>(0), key(ADD_ON, 0x10000, 0x82));
+    assert_eq!(latest.get::<[u8; 16]>(0), key(ADD_ON, 0x10000, 0x82));
     let latest = guest.call(db, Request::new(6).arg(PROGRAM_ID)).ok();
-    assert_eq!(latest.at::<[u8; 16]>(0), key(PROGRAM_ID, 0, 0x80));
+    assert_eq!(latest.get::<[u8; 16]>(0), key(PROGRAM_ID, 0, 0x80));
     assert_eq!(
         guest.call(db, Request::new(6).arg(1u64)).result,
         CONTENT_META_NOT_FOUND
@@ -59,8 +59,8 @@ fn content_storage_has_no_placeholder_cache() {
     let guest = guest();
     let ncm = guest.service("ncm");
     let storage = guest.call(ncm, Request::new(4).arg(4u8)).ok().interface();
-    let first = guest.call(storage, Request::new(0)).ok().at::<[u8; 16]>(0);
-    let second = guest.call(storage, Request::new(0)).ok().at::<[u8; 16]>(0);
+    let first = guest.call(storage, Request::new(0)).ok().get::<[u8; 16]>(0);
+    let second = guest.call(storage, Request::new(0)).ok().get::<[u8; 16]>(0);
     assert_ne!(first, second);
     let create = guest.call(storage, Request::new(1).arg(first).arg(first).arg(16i64));
     assert_eq!(create.result, RESULT_UNKNOWN);
