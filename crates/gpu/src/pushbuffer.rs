@@ -102,6 +102,8 @@ pub struct MethodCall {
     pub argument: u32,
     /// Data words of the same command after this one (0 on the last).
     pub remaining: u32,
+    /// Index of the word in the slice [`CommandParser::process`] was given.
+    pub position: u32,
 }
 
 /// Whether the parser continues after a method.
@@ -161,6 +163,7 @@ impl CommandParser {
                     method: state.method,
                     argument: word,
                     remaining: state.count,
+                    position: index as u32 - 1,
                 };
                 if !state.non_incrementing {
                     state.method += 1;
@@ -183,6 +186,7 @@ impl CommandParser {
                     method: header.method(),
                     argument: header.count(),
                     remaining: 0,
+                    position: index as u32 - 1,
                 };
                 if handler.call(call) == Flow::Suspend {
                     return index;

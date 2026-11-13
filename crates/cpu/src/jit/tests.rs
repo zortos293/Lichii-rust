@@ -173,7 +173,10 @@ fn atomic(rng: &mut Rng) -> u32 {
     }
 }
 
-const FP: [&str; 5] = [
+const FP: [&str; 8] = [
+    "000111100x10000xx10000xxxxxxxxxx",
+    "000111100x1xxxxxxxxx11xxxxxxxxxx",
+    "x00111100x10011x000000xxxxxxxxxx",
     "x0x11110xx1xxxxxxxxxxxxxxxxxxxxx",
     "x0x11111xxxxxxxxxxxxxxxxxxxxxxxx",
     "01x11110xxxxxxxxxxxxxxxxxxxxxxxx",
