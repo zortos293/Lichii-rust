@@ -694,11 +694,6 @@ impl<'a> EmitContext<'a> {
         ctx.define_write_storage_cas_loop_function()?;
         ctx.define_global_memory_functions()?;
         ctx.define_rescaling_input();
-        if info.uses_rescaling_uniform && info.uses_render_area && unified {
-            return Err(EmitError::Unsupported(
-                "rescaling and render-area push constants in one module",
-            ));
-        }
         ctx.define_render_area();
         Ok(ctx)
     }
@@ -3226,6 +3221,11 @@ impl<'a> EmitContext<'a> {
             members.push(self.f32[1]);
             self.rescaling_downfactor_member_index = 2;
         }
+        let render_area = self.info.uses_render_area;
+        if render_area {
+            self.render_area_member_index = members.len() as u32;
+            members.push(self.f32[4]);
+        }
         let block = self.b.type_struct(members);
         self.decorate(block, Decoration::Block, &[]);
         self.b.name(block, "ResolutionInfo");
@@ -3252,16 +3252,34 @@ impl<'a> EmitContext<'a> {
             );
             self.b.member_name(block, 2, "down_factor");
         }
+        if render_area {
+            let member = self.render_area_member_index;
+            self.member_decorate(
+                block,
+                member,
+                Decoration::Offset,
+                &[RENDER_AREA_LAYOUT_OFFSET],
+            );
+            self.b.member_name(block, member, "render_area");
+        }
         let pointer = self.type_pointer(StorageClass::PushConstant, block);
         self.rescaling_push_constants =
             self.global_variable(pointer, StorageClass::PushConstant, None);
         self.b
             .name(self.rescaling_push_constants, "rescaling_push_constants");
         self.add_interface(self.rescaling_push_constants, StorageClass::PushConstant);
+        if render_area {
+            self.render_area_push_constant = self.rescaling_push_constants;
+        }
     }
 
+    /// A stage that also reads the rescaling words gets the render area as a member of that
+    /// block instead, since an entry point may use only one push constant block.
     fn define_render_area(&mut self) {
-        if !self.info.uses_render_area || !self.profile.unified_descriptor_binding {
+        if !self.info.uses_render_area
+            || !self.profile.unified_descriptor_binding
+            || self.info.uses_rescaling_uniform
+        {
             return;
         }
         let block = self.b.type_struct([self.f32[4]]);
