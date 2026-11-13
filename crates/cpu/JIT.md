@@ -113,8 +113,8 @@ The plan is **dynasm-rs** (`dynasmrt::VecAssembler` for x64), emitting into a `V
 ## Milestones
 
 1. **J1**: the IR, the translator for integer, branch and plain load/store `Inst`s, passes 1-4, the x64 backend with linear-scan allocation, the entry trampoline, unlinked dispatch, fastmem loads and stores with the bounds check, the fastmem fault handler and slow paths, and the interpreter fallback for everything else. Until J3 the code cache is one read-write-execute region. It must pass the JIT-vs-interpreter suite, fault paths included.
-2. **J2**: host atomics, `CAS`/`CASP`, exclusives through the monitor, `MRS CNTPCT`, `DC ZVA`.
-3. **J3**: direct linking, the RSB, the fast indirect table and the dual-mapped code cache with invalidation. This is the main throughput step.
+2. **J2**: host atomics (`LD<op>`, `SWP`, `CAS`) as single lock-prefixed instructions, `DC ZVA`, and `MRS CNTPCT` through a helper call. `CASP`, inline exclusives and the inline counter follow with the monitor-slot and `host_tsc_scale` contract PRs; until then they run on the interpreter.
+3. **J3**: direct linking, the RSB, the fast indirect table and the dual-mapped code cache with invalidation. This is the main throughput step. Part 1 lands linking, the table, the dual mapping and the interrupt check at block entry; the RSB follows, because the call/return bench already runs at table speed and its gain (no table collisions across ~115k return sites) only shows on real titles.
 4. **J4**: `CallSimd` mid-block instead of falling back, plus the flags/condition peephole (pass 5).
 5. **J5**: native lowering for the hottest SIMD/FP ops, measured on real titles, in agreement with the SIMD crew, since they own the semantics.
 

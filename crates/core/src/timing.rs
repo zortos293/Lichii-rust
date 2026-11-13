@@ -3,12 +3,12 @@
 use std::sync::atomic::{AtomicU64, Ordering, fence};
 use std::time::Instant;
 
+use lichii_common::ConsoleGeneration;
 use lichii_cpu::GuestClock;
 use lichii_gpu::clock::GuestTime;
 use parking_lot::Mutex;
 
 const RUNNING: u64 = u64::MAX;
-const COUNTER_HZ: u128 = 19_200_000;
 
 /// Nanoseconds of guest time since boot, counted from the host clock minus the time spent paused.
 ///
@@ -16,6 +16,7 @@ const COUNTER_HZ: u128 = 19_200_000;
 /// that is odd while they write, and a read that overlaps a change retries.
 pub struct CoreTiming {
     start: Instant,
+    counter_hz: u64,
     sequence: AtomicU64,
     paused_ns: AtomicU64,
     frozen_at: AtomicU64,
@@ -23,10 +24,16 @@ pub struct CoreTiming {
 }
 
 impl CoreTiming {
-    /// Starts guest time at zero, running.
-    pub fn new() -> Self {
+    /// Starts guest time at zero, running, with the system counter (`CNTPCT_EL0`) at the rate the
+    /// title's SDK converts ticks with: 19.2 MHz for Switch 1 titles, 31.25 MHz for Switch 2
+    /// titles (at 19.2 MHz every tick-based time of a Switch 2 title is off by 1.63x).
+    pub fn new(title: ConsoleGeneration) -> Self {
         Self {
             start: Instant::now(),
+            counter_hz: match title {
+                ConsoleGeneration::Switch1 => 19_200_000,
+                ConsoleGeneration::Switch2 => 31_250_000,
+            },
             sequence: AtomicU64::new(0),
             paused_ns: AtomicU64::new(0),
             frozen_at: AtomicU64::new(RUNNING),
@@ -90,12 +97,6 @@ impl CoreTiming {
     }
 }
 
-impl Default for CoreTiming {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl GuestTime for CoreTiming {
     fn global_time_ns(&self) -> u64 {
         CoreTiming::global_time_ns(self)
@@ -104,7 +105,11 @@ impl GuestTime for CoreTiming {
 
 impl GuestClock for CoreTiming {
     fn ticks(&self) -> u64 {
-        (u128::from(self.global_time_ns()) * COUNTER_HZ / 1_000_000_000) as u64
+        (u128::from(self.global_time_ns()) * u128::from(self.counter_hz) / 1_000_000_000) as u64
+    }
+
+    fn frequency(&self) -> u64 {
+        self.counter_hz
     }
 }
 
@@ -116,7 +121,7 @@ mod tests {
 
     #[test]
     fn time_stops_while_paused() {
-        let timing = CoreTiming::new();
+        let timing = CoreTiming::new(ConsoleGeneration::Switch1);
         std::thread::sleep(Duration::from_millis(5));
         let before = timing.global_time_ns();
         assert!(before >= 5_000_000);
@@ -133,8 +138,18 @@ mod tests {
     }
 
     #[test]
+    fn the_counter_rate_follows_the_title() {
+        let switch1 = CoreTiming::new(ConsoleGeneration::Switch1);
+        let switch2 = CoreTiming::new(ConsoleGeneration::Switch2);
+        assert_eq!(switch1.frequency(), 19_200_000);
+        assert_eq!(switch2.frequency(), 31_250_000);
+        switch2.pause();
+        assert_eq!(switch2.ticks(), switch2.global_time_ns() / 32);
+    }
+
+    #[test]
     fn reads_stay_monotonic_across_pause_and_resume() {
-        let timing = std::sync::Arc::new(CoreTiming::new());
+        let timing = std::sync::Arc::new(CoreTiming::new(ConsoleGeneration::Switch1));
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let readers: Vec<_> = (0..3)
             .map(|_| {

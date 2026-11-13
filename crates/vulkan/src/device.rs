@@ -368,6 +368,7 @@ impl Device {
         unsafe { raw_instance.get_physical_device_features2(physical, &mut queried) };
         let mut core = queried.features;
         if v12.timeline_semaphore == vk::FALSE
+            || v12.uniform_buffer_standard_layout == vk::FALSE
             || v13.dynamic_rendering == vk::FALSE
             || v13.synchronization2 == vk::FALSE
         {

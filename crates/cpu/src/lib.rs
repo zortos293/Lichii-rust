@@ -6,6 +6,8 @@
 
 pub mod decoder;
 mod interpreter;
+#[cfg(target_arch = "x86_64")]
+mod jit;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,6 +17,8 @@ use lichii_common::settings::CpuBackend;
 use lichii_memory::{AddressSpace, ExclusiveMonitor};
 
 pub use interpreter::Interpreter;
+#[cfg(target_arch = "x86_64")]
+pub use jit::Jit;
 
 /// Architectural state of one guest thread.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -117,6 +121,11 @@ pub trait CpuCore: Send {
 
 pub fn new_core(backend: CpuBackend, config: CpuConfig) -> Box<dyn CpuCore> {
     match backend {
-        CpuBackend::Interpreter | CpuBackend::Jit => Box::new(Interpreter::new(config)),
+        #[cfg(target_arch = "x86_64")]
+        CpuBackend::Jit => match Jit::new(config.clone()) {
+            Some(jit) => Box::new(jit),
+            None => Box::new(Interpreter::new(config)),
+        },
+        _ => Box::new(Interpreter::new(config)),
     }
 }

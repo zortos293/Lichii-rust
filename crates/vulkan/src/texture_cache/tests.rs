@@ -139,6 +139,29 @@ impl Fixture {
             .collect()
     }
 
+    /// Device memory of the live images.
+    fn image_bytes(&self) -> u64 {
+        self.cache
+            .slots
+            .iter()
+            .filter_map(|s| s.image.as_ref())
+            .map(|i| i.image.memory_size())
+            .sum()
+    }
+
+    /// Ends a frame once the GPU finished everything, the collector seeing the live images as
+    /// the device's whole memory use under `budget`.
+    fn tick(&mut self, budget: u64) {
+        self.scheduler.finish().unwrap();
+        let usage = MemoryUsage {
+            used: self.image_bytes(),
+            budget,
+            ..MemoryUsage::default()
+        };
+        let (mut tx, cache, _) = self.tx();
+        cache.tick_frame(&mut tx, || usage).unwrap();
+    }
+
     fn assert_no_validation_errors(&self) {
         assert_eq!(
             self.device.instance().validation_errors(),
@@ -459,16 +482,29 @@ fn rt_info(width: u32, height: u32, bh: u32, gob: GobLayout) -> ImageInfo {
 }
 
 fn clear_rt(f: &mut Fixture, info: &ImageInfo, color: [f32; 4], rect: Rect) -> Found {
+    clear_rt_at(f, GPU_VA, info, color, rect)
+}
+
+fn clear_rt_at(
+    f: &mut Fixture,
+    gpu_va: GpuVAddr,
+    info: &ImageInfo,
+    color: [f32; 4],
+    rect: Rect,
+) -> Found {
     let (mut tx, cache, gmmu) = f.tx();
     let target = cache
-        .render_target(&mut tx, gmmu, GPU_VA, info, rect == Rect::ALL)
+        .render_target(&mut tx, gmmu, gpu_va, info, rect == Rect::ALL)
         .unwrap()
         .unwrap();
     cache
         .clear(
             &mut tx,
             target,
-            ClearValue::Color(vk::ClearColorValue { float32: color }),
+            ClearValue::Color {
+                value: vk::ClearColorValue { float32: color },
+                mask: vk::ColorComponentFlags::RGBA,
+            },
             rect,
             0,
             1,
@@ -696,6 +732,7 @@ fn depth_targets_clear_and_flush() {
                 ClearValue::DepthStencil {
                     depth: Some(0.5),
                     stencil: Some(0x5a),
+                    stencil_mask: 0xff,
                 },
                 Rect::ALL,
                 0,
@@ -848,5 +885,214 @@ fn measures_upload_and_lookup_cost() {
         find.as_nanos() as f64 / f64::from(lookups)
     );
     assert!(f.read_image(id)[0] == data[0]);
+    f.assert_no_validation_errors();
+}
+
+const HUGE_BUDGET: u64 = 1 << 40;
+
+#[test]
+fn collector_thresholds_follow_the_budget_and_vram_setting() {
+    const GIB: u64 = 1 << 30;
+    let t = |budget, vram| Thresholds::new(budget, vram);
+    let want = |expected, critical, retain| Thresholds {
+        expected,
+        critical,
+        retain,
+    };
+    assert_eq!(
+        t(8 * GIB, VramUsage::Conservative),
+        want(4 * GIB, 5 * GIB, 7 * GIB)
+    );
+    assert_eq!(
+        t(8 * GIB, VramUsage::Aggressive),
+        want(6 * GIB, 7 * GIB, 7 * GIB)
+    );
+    assert_eq!(
+        t(12 * GIB, VramUsage::Conservative),
+        want(13 * GIB / 2, 15 * GIB / 2, 11 * GIB),
+        "large budgets collect from 5/8 of them, not from a fixed ~7 GB cap"
+    );
+    assert_eq!(
+        t(4 << 20, VramUsage::Conservative),
+        want(3 << 20, 7 << 19, 7 << 19),
+        "small budgets keep an eighth free"
+    );
+}
+
+#[test]
+fn collector_evicts_least_recently_used_images_first() {
+    let Some(mut f) = fixture(GobLayout::Switch2, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let tics: Vec<_> = (0..12)
+        .map(|i| tic(0x08, GPU_VA + i * 0x1_0000, 64, 64, 1, 1, 2))
+        .collect();
+    let ids: Vec<_> = tics.iter().map(|t| f.texture(t).0).collect();
+    let size = f.cache.get(ids[0]).unwrap().image.memory_size();
+    assert!(
+        ids.iter()
+            .all(|&id| f.cache.get(id).unwrap().image.memory_size() == size)
+    );
+    for _ in 0..OLD_AGE {
+        for t in &tics[6..] {
+            f.texture(t);
+        }
+        f.tick(HUGE_BUDGET);
+    }
+    assert_eq!(f.cache.collector_stats(), CollectorStats::default());
+
+    for t in &tics[6..] {
+        f.texture(t);
+    }
+    // 12 images under a 14-image budget: past the expected line (10.5 images), under the
+    // critical one (12.25), so only images unused for OLD_AGE frames go until use drops below
+    // the expected line.
+    f.tick(14 * size);
+    assert_eq!(
+        f.cache.collector_stats(),
+        CollectorStats {
+            evicted: 2,
+            evicted_bytes: 2 * size,
+            flushed: 0,
+        }
+    );
+    let live =
+        |f: &Fixture| -> Vec<bool> { ids.iter().map(|&id| f.cache.get(id).is_some()).collect() };
+    let mut want = vec![true; 12];
+    want[..2].fill(false);
+    assert_eq!(live(&f), want, "the two least recently used images went");
+
+    for t in &tics[6..] {
+        f.texture(t);
+    }
+    // Far past the budget: aggressive, every image unused for RECENT_AGE frames goes, and none
+    // used this frame.
+    f.tick(size);
+    assert_eq!(f.cache.collector_stats().evicted, 6);
+    assert_eq!(f.cache.collector_stats().evicted_bytes, 6 * size);
+    want[..6].fill(false);
+    assert_eq!(live(&f), want, "images bound this frame stay");
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn collector_flushes_gpu_modified_images_before_evicting_them() {
+    let gob = GobLayout::Switch2;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let info = rt_info(64, 64, 2, gob);
+    let tiling = Tiling::new(64, 64, 1, 4, 2, 0, gob);
+    let other_va = GPU_VA + 0x10_0000;
+    let evicted = clear_rt_at(&mut f, GPU_VA, &info, [0.0, 1.0, 0.0, 1.0], Rect::ALL).id;
+    let kept = clear_rt_at(&mut f, other_va, &info, [1.0, 0.0, 0.0, 1.0], Rect::ALL).id;
+    let guest = |f: &Fixture, daddr: DAddr| {
+        let mut tiled = vec![0; tiling.size_bytes()];
+        f.memory.read_bytes(daddr, &mut tiled).unwrap();
+        let mut linear = vec![0; tiling.linear_size_bytes()];
+        unswizzle(&tiling, &tiled, &mut linear);
+        linear
+    };
+    for _ in 0..RECENT_AGE {
+        f.tick(HUGE_BUDGET);
+    }
+    f.tick(1);
+    assert_eq!(f.cache.pending_downloads.len(), 2, "both readbacks queued");
+    assert_eq!(f.cache.collector_stats(), CollectorStats::default());
+    assert!(f.cache.state(evicted).is_some() && f.cache.state(kept).is_some());
+    assert!(
+        guest(&f, DADDR).iter().all(|&b| b == 0),
+        "queued, not yet written back"
+    );
+
+    let (again, _) = f.texture(&tic(0x08, other_va, 64, 64, 1, 1, 2));
+    assert_eq!(again, kept, "used again while its readback runs");
+    f.tick(1);
+    let size = info.size_bytes();
+    assert_eq!(
+        f.cache.collector_stats(),
+        CollectorStats {
+            evicted: 1,
+            evicted_bytes: f.cache.stats.evicted_bytes,
+            flushed: 1,
+        }
+    );
+    assert!(f.cache.collector_stats().evicted_bytes >= size);
+    assert!(f.cache.state(evicted).is_none());
+    assert!(
+        f.cache.state(kept).is_some_and(|s| s.gpu_modified),
+        "an image used again stays, still GPU-modified"
+    );
+    assert!(
+        guest(&f, DADDR)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|t| *t == [0, 255, 0, 255]),
+        "the evicted image reached guest memory first"
+    );
+    assert!(guest(&f, DADDR + 0x10_0000).iter().all(|&b| b == 0));
+
+    let (reloaded, _) = f.texture(&tic(0x08, GPU_VA, 64, 64, 1, 1, 2));
+    assert_ne!(reloaded, evicted);
+    assert!(
+        f.read_image(reloaded)[0]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|t| *t == [0, 255, 0, 255]),
+        "re-uploaded from guest memory"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn collector_work_per_frame_is_bounded() {
+    let gob = GobLayout::Tegra;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    for i in 0..50 {
+        f.texture(&tic(0x08, GPU_VA + i * 0x1000, 16, 16, 1, 1, 0));
+    }
+    let info = rt_info(512, 512, 4, gob);
+    assert_eq!(info.size_bytes(), 1 << 20);
+    for i in 0..24 {
+        clear_rt_at(
+            &mut f,
+            GPU_VA + (i + 1) * 0x10_0000,
+            &info,
+            [0.0, 0.0, 1.0, 1.0],
+            Rect::ALL,
+        );
+    }
+    for _ in 0..RECENT_AGE {
+        f.tick(HUGE_BUDGET);
+    }
+    let stats = |f: &Fixture| {
+        let s = f.cache.collector_stats();
+        (s.evicted, s.flushed, f.cache.pending_downloads.len())
+    };
+    f.tick(1);
+    assert_eq!(
+        stats(&f),
+        (AGGRESSIVE_EVICTIONS as u64, 0, 0),
+        "at most AGGRESSIVE_EVICTIONS images a frame"
+    );
+    f.tick(1);
+    let per_frame = (MAX_FLUSH_BYTES >> 20) as usize;
+    assert_eq!(
+        stats(&f),
+        (50, 0, per_frame),
+        "the last 10 clean images go, and MAX_FLUSH_BYTES of readbacks start"
+    );
+    f.tick(1);
+    assert_eq!(
+        stats(&f),
+        (50 + per_frame as u64, per_frame as u64, 24 - per_frame)
+    );
+    f.tick(1);
+    assert_eq!(stats(&f), (74, 24, 0));
+    assert_eq!(f.cache.len(), 0);
     f.assert_no_validation_errors();
 }
