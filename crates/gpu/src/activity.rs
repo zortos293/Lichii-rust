@@ -429,8 +429,9 @@ mod tests {
         assert_eq!(clock.take(5_000), 4_000);
         assert_eq!(clock.take(9_000), 4_000);
         clock.since.store(0, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(1));
         drop(waiting);
-        assert!(clock.take(activity.now()) > 0);
+        assert!(clock.take(activity.now()) >= 1_000_000);
         assert_eq!(
             clock.take(activity.now()),
             0,
