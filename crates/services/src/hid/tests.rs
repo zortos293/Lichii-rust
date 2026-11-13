@@ -652,10 +652,25 @@ fn joy_con_assignment_splits_a_pair_and_merges_it_back() {
     assert_eq!(hid.style(1), Style::JoyLeft.tag());
     assert_eq!(assignment(1), 1);
 
+    rumble(1, 0, strong);
     hid.send(Request::new(125).send_pid().arg(0u32).arg(1u32).arg(ARUID))
         .ok();
     assert_eq!(hid.style(0), Style::JoyDual.tag());
     assert_eq!(hid.style(1), 0);
+    let left_rumble = DeviceHandle {
+        style_index: 5,
+        npad_id: 1,
+        device_index: 0,
+        reserved: 0,
+    };
+    let actual = hid
+        .send(Request::new(202).send_pid().arg(left_rumble).arg(ARUID))
+        .ok();
+    assert_eq!(
+        actual.get::<[f32; 4]>(0),
+        [0.0, 160.0, 0.0, 320.0],
+        "a disconnected entry forgets its rumble"
+    );
     assert_eq!(assignment(0), 0);
 
     hid.send(Request::new(122).send_pid().arg(0u32).arg(ARUID))

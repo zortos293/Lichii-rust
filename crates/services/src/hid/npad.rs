@@ -841,13 +841,14 @@ fn connect(memory: &SharedMemory, index: usize, npad: &mut Npad, style: Style, h
 }
 
 /// Clears the controller from its npad entry (the reference's `DisconnectNpad`; the assignment
-/// mode stays) and signals the style-set event.
+/// mode stays), forgets its rumble and signals the style-set event.
 fn disconnect(memory: &SharedMemory, index: usize, npad: &mut Npad) {
     let entry = NpadEntry::new(index);
     clear_device(memory, entry);
     put(memory, entry.at(NpadEntry::BUTTON_PROPERTIES), 0u32);
     put(memory, entry.at(NpadEntry::SIXAXIS_PROPERTIES), [0u8; 6]);
     npad.style = None;
+    npad.vibration = [DEFAULT_VIBRATION; 2];
     npad.signal_style_change();
     write_empty_entries(memory, entry);
 }
