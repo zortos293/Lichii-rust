@@ -1,6 +1,7 @@
 //! Binds every texture and image instruction to a descriptor (texture_pass.cpp).
 //!
-//! A bound instruction's handle is an offset into the bound texture constant buffer. A bindless
+//! A bound instruction's handle is an offset into the bound texture constant buffer, or on
+//! Ampere a constant buffer slot and offset ([`TextureInstInfo::bound_handle`]). A bindless
 //! handle is tracked back to the constant buffer words it is built from: one word, a word ORed
 //! with a separate sampler word, or a word at a dynamic offset (an indexed descriptor array).
 //! Tracking and descriptor reads are memoized, so the pass is linear in the program size.
@@ -911,11 +912,13 @@ impl<'a> Tracker<'a> {
         let op = prog.op(inst);
         let handle = prog.arg(inst, 0);
         if let Some((_, false)) = indexed(op) {
-            let offset = handle
+            let handle = handle
                 .imm_u32()
                 .expect("a bound texture handle is an offset");
+            let (index, offset) = TextureInstInfo::bound_handle_slot(handle)
+                .unwrap_or((self.env.texture_bound_buffer(), handle));
             return Ok(TextureInst {
-                cbuf: CbufAddr::word(self.env.texture_bound_buffer(), offset),
+                cbuf: CbufAddr::word(index, offset),
                 inst,
                 pointer_word: false,
             });
