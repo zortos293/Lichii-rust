@@ -34,7 +34,7 @@ const MODULE: u32 = 114;
 const OPERATION_FAILED: ResultCode = ResultCode::new(MODULE, 1);
 pub(crate) const PERMISSION_DENIED: ResultCode = ResultCode::new(MODULE, 5);
 const NOT_SUPPORTED: ResultCode = ResultCode::new(MODULE, 6);
-const NOT_FOUND: ResultCode = ResultCode::new(MODULE, 7);
+pub(crate) const NOT_FOUND: ResultCode = ResultCode::new(MODULE, 7);
 
 /// The displays by id. Only "Default" is shown.
 const DISPLAYS: [&str; 5] = ["Default", "External", "Edid", "Internal", "Null"];
