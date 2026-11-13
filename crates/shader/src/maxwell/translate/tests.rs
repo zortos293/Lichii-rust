@@ -112,3 +112,11 @@ fn every_opcode_translates_or_reports_unsupported() {
         }
     }
 }
+
+#[test]
+fn ram_and_sam_translate_to_nothing() {
+    use crate::maxwell::opcode::Opcode;
+    for op in [Opcode::Ram, Opcode::Sam] {
+        assert_eq!(translate(&[encode(op, 0)]).unwrap(), "{0}:\n", "{op:?}");
+    }
+}
