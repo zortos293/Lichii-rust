@@ -555,11 +555,17 @@ fn dispatch(t: &mut Translator<'_>, opcode: Opcode) -> TResult {
         Opcode::PrmtRc => integer_byte_permute::prmt_rc(t),
         Opcode::PrmtReg => integer_byte_permute::prmt_reg(t),
         Opcode::R2pImm => move_register_to_predicate::r2p_imm(t),
-        Opcode::Ram => Err(t.unsupported()),
+        Opcode::Ram => {
+            tracing::warn!("(STUBBED) RAM");
+            Ok(())
+        }
         Opcode::Ret => Err(t.unsupported()),
         Opcode::RroImm => floating_point_range_reduction::rro_imm(t),
         Opcode::Rtt => Err(t.unsupported()),
-        Opcode::Sam => Err(t.unsupported()),
+        Opcode::Sam => {
+            tracing::warn!("(STUBBED) SAM");
+            Ok(())
+        }
         Opcode::SelImm => select_source_with_predicate::sel_imm(t),
         Opcode::Setcrsptr => Err(t.unsupported()),
         Opcode::Setlmembase => Err(t.unsupported()),

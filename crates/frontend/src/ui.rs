@@ -115,6 +115,9 @@ impl App {
             egui::CentralPanel::default().show(ui, |ui| self.game_list(ui, actions));
         }
         self.dialogs(ui.ctx(), actions);
+        if let Some(session) = &mut self.session {
+            session.show_applets(ui.ctx());
+        }
         self.show_config(ui.ctx());
         self.show_setup(ui.ctx());
         self.show_game_config(ui.ctx());
@@ -339,7 +342,7 @@ impl App {
                 } else if self.games.is_scanning() {
                     "Scanning…"
                 } else {
-                    "No NSP, XCI, NCA, NRO, NSO or ExeFS titles found in the game directories."
+                    "No NSP, XCI, NCA, NUP, NRO, NSO or ExeFS titles found in the game directories."
                 };
                 ui.label(RichText::new(text).size(16.0).weak());
             });

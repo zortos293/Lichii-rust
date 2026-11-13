@@ -1732,6 +1732,31 @@ mod tests {
         let single =
             super::super::integer::tests::compile_fragment_and_validate("ampere-txq", &[query]);
         assert!(!single.contains(&IMAGE_QUERY_SAMPLES));
+
+        let mut env = super::super::integer::tests::fragment_env(&[query]);
+        env.multisample = true;
+        let described = super::super::integer::tests::validate_fragment("ampere-txq-ms-env", &env);
+        assert!(described.contains(&IMAGE_QUERY_SAMPLES));
+    }
+
+    /// A TLD without .MS on a texture the environment calls multisampled fetches sample 0.
+    #[test]
+    fn single_sample_fetch_from_a_multisampled_texture_reads_sample_zero() {
+        const IMAGE_FETCH: u16 = 95;
+        let query = encode(
+            Opcode::Txq,
+            Form::Bound,
+            bound(3, 0x10) | (1 << 62) | mask(4) | dst(4) | rc(RZ),
+        );
+        let fetch = encode(
+            Opcode::Tld,
+            Form::Bound,
+            bound(3, 0x10) | dim(1) | lod(1) | ra(8) | rb(10) | mask(0xf) | dst(0) | NO_FAULT,
+        );
+        let mut env = super::super::integer::tests::fragment_env(&[fetch, query]);
+        env.multisample = true;
+        let ops = super::super::integer::tests::validate_fragment("ampere-tld-ms-env", &env);
+        assert!(ops.contains(&IMAGE_FETCH));
     }
 
     #[test]

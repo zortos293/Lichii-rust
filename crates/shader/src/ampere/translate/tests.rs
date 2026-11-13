@@ -31,6 +31,7 @@ pub struct TestEnv {
     pub shared_memory: u32,
     pub workgroup: [u32; 3],
     pub mesh: Option<MeshState>,
+    pub multisample: bool,
 }
 
 impl TestEnv {
@@ -47,6 +48,7 @@ impl TestEnv {
             shared_memory: 0,
             workgroup: [1, 1, 1],
             mesh: None,
+            multisample: false,
         }
     }
 
@@ -101,6 +103,9 @@ impl ShaderEnvironment for TestEnv {
     }
     fn mesh_state(&self) -> Option<MeshState> {
         self.mesh
+    }
+    fn is_texture_multisample(&self, _: u32) -> bool {
+        self.multisample
     }
 }
 

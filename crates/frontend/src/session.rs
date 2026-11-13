@@ -10,6 +10,7 @@ use lichii_core::{ExitReason, Host, System, SystemError};
 use lichii_crypto::KeyError;
 use lichii_loader::LoadOptions;
 
+use crate::applets::AppletDialogs;
 use crate::game_list::GameKind;
 
 #[derive(Debug)]
@@ -25,7 +26,7 @@ impl std::fmt::Display for BootError {
             Self::NotFound(path) => write!(f, "{} does not exist", path.display()),
             Self::Unsupported(path) => write!(
                 f,
-                "{} is not an NSP, XCI, NCA, NRO, NSO or ExeFS directory",
+                "{} is not an NSP, XCI, NCA, NUP, NRO, NSO or ExeFS directory",
                 path.display()
             ),
             Self::System(err) => err.fmt(f),
@@ -54,17 +55,22 @@ pub struct Session {
     pub title: String,
     /// The loaded program's id; 0 for homebrew and bare NSOs.
     pub program_id: u64,
+    /// Dropped before `system`, so an applet the title is waiting on answers and the title can stop.
+    applets: Option<AppletDialogs>,
     system: System,
 }
 
 impl Session {
     /// Loads the title at `path` with `options` (keys, installed updates and DLC) and starts it.
+    /// Library applets show in `applets`; without them they answer as
+    /// [`lichii_services::applets::HeadlessApplets`] does.
     /// `configure` picks the settings (a game's own configuration applies by its program id) and
     /// builds the renderer and shared state for its console generation, both known once the title
     /// is loaded.
     pub fn boot(
         path: &Path,
         options: LoadOptions,
+        applets: Option<AppletDialogs>,
         configure: impl FnOnce(u64, ConsoleGeneration) -> (Arc<Settings>, Host),
     ) -> Result<Self, BootError> {
         if !path.exists() {
@@ -76,11 +82,15 @@ impl Session {
         let program_id = image.program_id;
         let (settings, host) = configure(program_id, image.generation);
         let mut system = System::from_image(settings, image, host)?;
+        if let Some(applets) = &applets {
+            system.services().set_applet_frontend(applets.frontend());
+        }
         system.run()?;
         Ok(Self {
             path: path.to_path_buf(),
             title: title(path, kind),
             program_id,
+            applets,
             system,
         })
     }
@@ -110,6 +120,18 @@ impl Session {
     /// Applies volume and mute to the running title's audio.
     pub fn set_audio_volume(&self, audio: &AudioSettings) {
         self.system.set_audio_volume(audio);
+    }
+
+    /// Shows the library applet the title is waiting on, if any.
+    pub fn show_applets(&mut self, ctx: &egui::Context) {
+        if let Some(applets) = &mut self.applets {
+            applets.show(ctx);
+        }
+    }
+
+    /// Whether the title is waiting on a library applet dialog.
+    pub fn applet_open(&self) -> bool {
+        self.applets.as_ref().is_some_and(AppletDialogs::is_open)
     }
 
     /// Why the title stopped, once it has.
@@ -186,14 +208,14 @@ mod tests {
     fn rejects_missing_unknown_and_unloadable_titles() {
         let missing = Path::new("/definitely/not/here.nsp");
         assert!(matches!(
-            Session::boot(missing, LoadOptions::default(), |_, _| (settings(), Host::headless())),
+            Session::boot(missing, LoadOptions::default(), None, |_, _| (settings(), Host::headless())),
             Err(BootError::NotFound(path)) if path == missing
         ));
         let dir = temp_dir("reject");
         let text = dir.join("notes.txt");
         std::fs::write(&text, "x").unwrap();
         assert!(matches!(
-            Session::boot(&text, LoadOptions::default(), |_, _| (
+            Session::boot(&text, LoadOptions::default(), None, |_, _| (
                 settings(),
                 Host::headless()
             )),
@@ -202,7 +224,7 @@ mod tests {
         let broken = dir.join("Broken.nro");
         std::fs::write(&broken, "x").unwrap();
         assert!(matches!(
-            Session::boot(&broken, LoadOptions::default(), |_, _| (
+            Session::boot(&broken, LoadOptions::default(), None, |_, _| (
                 settings(),
                 Host::headless()
             )),
@@ -216,7 +238,7 @@ mod tests {
         let dir = temp_dir("keys");
         let nca = dir.join("Game.nca");
         std::fs::write(&nca, vec![0u8; 0x4000]).unwrap();
-        let error = Session::boot(&nca, LoadOptions::default(), |_, _| {
+        let error = Session::boot(&nca, LoadOptions::default(), None, |_, _| {
             (settings(), Host::headless())
         })
         .err()
@@ -226,6 +248,49 @@ mod tests {
             Some(&KeyError::Missing("header_key".into())),
             "{error}"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_nup_container_boots_its_exefs() {
+        use lichii_loader::nup::{META_TITLE_NAME, PackageKind};
+        use lichii_loader::testing::{
+            AcidLayout, Codec, NpdmSpec, NupPackage, build_npdm, build_nup, svc_mask, thread_info,
+        };
+
+        let program_id = 0x0100_0000_0001_0000;
+        let mut capabilities = vec![thread_info(63, 16, 0, 3)];
+        capabilities.extend((0..8).map(|index| svc_mask(index, 0xff_ffff)));
+        let npdm = build_npdm(&NpdmSpec {
+            program_id,
+            layout: AcidLayout::Switch1,
+            capabilities,
+            ..NpdmSpec::default()
+        });
+        let main = nso(&[0x14000000u32.to_le_bytes(), [0; 4]].concat());
+        let dir = temp_dir("nup");
+        let game = dir.join("Kart.nup");
+        std::fs::write(
+            &game,
+            build_nup(&[NupPackage::new(PackageKind::Base, program_id, 0)
+                .file("exefs/main.npdm", npdm, Codec::Zstd)
+                .file("exefs/main", main, Codec::Zstd)
+                .file("romfs/data.bin", vec![7; 0x300], Codec::Raw)
+                .meta(META_TITLE_NAME, "Synthetic Kart")]),
+        )
+        .unwrap();
+
+        let mut booted_as = None;
+        let session = Session::boot(&game, LoadOptions::default(), None, |id, generation| {
+            booted_as = Some((id, generation));
+            (settings(), Host::headless())
+        })
+        .unwrap();
+        assert_eq!(booted_as, Some((program_id, ConsoleGeneration::Switch1)));
+        assert_eq!(session.program_id, program_id);
+        assert_eq!(session.title, "Kart");
+        assert_eq!(session.exit_reason(), None);
+        drop(session);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -247,7 +312,7 @@ mod tests {
         let host = Host::headless();
         let npad = host.npad.clone();
         let mut generation = None;
-        let mut session = Session::boot(&game, LoadOptions::default(), |_, title| {
+        let mut session = Session::boot(&game, LoadOptions::default(), None, |_, title| {
             generation = Some(title);
             (settings(), host)
         })
@@ -311,7 +376,7 @@ mod tests {
                 renderer,
                 ..Host::headless()
             };
-            let session = Session::boot(&game, LoadOptions::default(), |_, _| {
+            let session = Session::boot(&game, LoadOptions::default(), None, |_, _| {
                 (Arc::new(settings), host)
             })
             .unwrap();

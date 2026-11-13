@@ -34,6 +34,7 @@ use self::file::IStorage;
 use self::filesystem::IFileSystem;
 use self::result::*;
 use self::save::{ISaveDataInfoReader, RawSaveDataAttribute, find_saves};
+use crate::dispatch::Commandless;
 use crate::{Service, ServiceContext};
 
 const THREAD: &str = "fs";
@@ -194,19 +195,6 @@ impl StorageSpace {
                 .map_or(0, |(n, _)| n.user_total_space()),
             Self::SdCard => shared.sdmc.as_ref().map_or(0, |(s, _)| s.total_space()),
         }
-    }
-}
-
-/// A service or interface the C++ registers with no commands.
-struct Commandless(&'static str);
-
-impl Service for Commandless {
-    fn name(&self) -> &str {
-        self.0
-    }
-
-    fn handle(&self, _ctx: &mut HleRequestContext) -> Option<ResultCode> {
-        None
     }
 }
 
