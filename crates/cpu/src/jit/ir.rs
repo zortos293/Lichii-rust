@@ -185,6 +185,14 @@ pub enum Op {
     Rev16(W, Value),
     /// Reverses the bytes of each word of a 64-bit value.
     Rev32(Value),
+    /// `CRC32` (`castagnoli` false) or `CRC32C` of the low `8 << size` bits of `data` into the
+    /// low 32 bits of `crc`; the result is zero-extended.
+    Crc32 {
+        castagnoli: bool,
+        size: u8,
+        crc: Value,
+        data: Value,
+    },
 
     /// `if c != 0 { a } else { b }`.
     Select(W, Value, Value, Value),
@@ -415,6 +423,9 @@ impl Op {
             | Op::SMulH(a, b)
             | Op::UDiv(_, a, b)
             | Op::SDiv(_, a, b)
+            | Op::Crc32 {
+                crc: a, data: b, ..
+            }
             | Op::Store {
                 addr: a, value: b, ..
             }

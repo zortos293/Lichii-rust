@@ -21,7 +21,7 @@ use lichii_memory::ReservationSlot;
 use super::ir::{Block, Cmp, Loc, Op, Terminal, Ty, Value, W};
 use super::{JitState, simd};
 use crate::decoder::AtomicOp;
-use crate::interpreter::condition_holds;
+use crate::interpreter::{condition_holds, crc_table};
 use crate::{ThreadContext, TscScale};
 
 type Asm = VecAssembler<X64Relocation>;
@@ -40,6 +40,26 @@ const RBX: u8 = 3;
 const CALLER_SAVED: u16 = 0b0000_1111_1100_0000;
 const XMMS: u8 = 15;
 pub(super) const SPILL_SLOTS: usize = 256;
+
+/// Slicing-by-8 tables of the reflected CRC-32 and CRC-32C polynomials: slice `k` maps a byte
+/// to its CRC followed by `k` zero bytes, so the CRC of `n` bytes is the XOR of one lookup per
+/// byte, byte `i` in slice `n - 1 - i`.
+static CRC32_SLICES: [[[u32; 256]; 8]; 2] = [crc_slices(0xedb8_8320), crc_slices(0x82f6_3b78)];
+
+const fn crc_slices(poly: u32) -> [[u32; 256]; 8] {
+    let mut slices = [crc_table(poly); 8];
+    let mut k = 1;
+    while k < 8 {
+        let mut i = 0;
+        while i < 256 {
+            let prev = slices[k - 1][i];
+            slices[k][i] = (prev >> 8) ^ slices[0][(prev & 0xff) as usize];
+            i += 1;
+        }
+        k += 1;
+    }
+    slices
+}
 
 /// Where translated code finds memory and its slow paths.
 pub(super) struct Target {
@@ -396,6 +416,54 @@ impl Emitter<'_> {
         );
     }
 
+    /// Writes the CRC of `data` folded into `crc` to `d`; clobbers `rax`, `rcx` and `rdx`.
+    /// `CRC32C` is the SSE4.2 `crc32` instruction. Plain `CRC32`, and `CRC32C` on hosts without
+    /// SSE4.2, look up every byte of `crc ^ data` in its own slice of [`CRC32_SLICES`] at once
+    /// (slicing-by-N), so the steps run in parallel instead of one after the other.
+    fn crc32(&mut self, castagnoli: bool, size: u8, crc: Src, data: Src, d: u8) {
+        mov(&mut self.asm, W::W32, 0, crc);
+        mov(&mut self.asm, W::W64, 1, data);
+        if castagnoli && self.target.sse42 {
+            match size {
+                0 => dynasm!(self.asm ; .arch x64 ; crc32 eax, cl),
+                1 => dynasm!(self.asm ; .arch x64 ; crc32 eax, cx),
+                2 => dynasm!(self.asm ; .arch x64 ; crc32 eax, ecx),
+                _ => dynasm!(self.asm ; .arch x64 ; crc32 rax, rcx),
+            }
+            dynasm!(self.asm ; .arch x64 ; mov Rd(d), eax);
+            return;
+        }
+        let slices = CRC32_SLICES[usize::from(castagnoli)].as_ptr() as i64;
+        dynasm!(self.asm ; .arch x64 ; mov rdx, QWORD slices);
+        let bytes = 1i32 << size;
+        if bytes < 4 {
+            dynasm!(self.asm
+                ; .arch x64
+                ; mov Rd(d), eax
+                ; shr Rd(d), (8 * bytes) as i8
+                ; xor eax, ecx
+            );
+        } else {
+            dynasm!(self.asm ; .arch x64 ; xor rax, rcx);
+        }
+        for i in 0..bytes {
+            let slice = (bytes - 1 - i) * 1024;
+            if i % 2 == 0 {
+                if i > 0 {
+                    dynasm!(self.asm ; .arch x64 ; shr rax, 16);
+                }
+                dynasm!(self.asm ; .arch x64 ; movzx ecx, al);
+            } else {
+                dynasm!(self.asm ; .arch x64 ; movzx ecx, ah);
+            }
+            if i == 0 && bytes >= 4 {
+                dynasm!(self.asm ; .arch x64 ; mov Rd(d), [rdx + rcx * 4 + slice]);
+            } else {
+                dynasm!(self.asm ; .arch x64 ; xor Rd(d), [rdx + rcx * 4 + slice]);
+            }
+        }
+    }
+
     /// Sets the host flags of `Compare` `v` and returns the condition code that then holds.
     pub(super) fn compare(&mut self, v: Value) -> u8 {
         let Op::Compare(kind, cond, w, a, b) = self.block.ops[v.index()] else {
@@ -681,6 +749,17 @@ impl Emitter<'_> {
                     ),
                 }
                 dynasm!(self.asm ; .arch x64 ; mov Rd(d), eax);
+            }
+            Op::Crc32 {
+                castagnoli,
+                size,
+                crc,
+                data,
+            } => {
+                let crc = self.src(crc, W::W32);
+                let data = self.src(data, W::W64);
+                let d = self.def(v);
+                self.crc32(castagnoli, size, crc, data, d);
             }
             Op::Rbit(w, a) => {
                 let a = self.reg(a);
