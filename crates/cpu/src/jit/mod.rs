@@ -21,7 +21,7 @@ use lichii_common::{PAGE_MASK, VAddr};
 use lichii_memory::{AddressSpace, ExclusiveMonitor, MemoryPermission, ReservationSlot};
 
 use self::cache::{Code, Entry, JitCache};
-use self::ir::{Block, Terminal};
+use self::ir::{Block, Cmp, Terminal};
 pub(crate) use self::passes::Passes;
 use self::translate::{Step, Translator};
 use self::x64::{EXIT_FAULT, SPILL_SLOTS, Target};
@@ -55,6 +55,13 @@ pub(super) struct JitState {
     /// The `jmp` the last block left through, for the dispatcher to link; 0 when none.
     link: usize,
     fault: Option<CpuFault>,
+    /// NZCV a block left unpacked: the [`Cmp::lazy_code`] of the flags, 0 when the context holds
+    /// them, and the operands they come from.
+    lazy_nzcv: u32,
+    lazy_a: u64,
+    lazy_b: u64,
+    /// `x64::materialize_stub` in the code cache.
+    materialize: usize,
 }
 
 // SAFETY: `memory`, `clock` and `interrupt` point into `Arc`s the owning `Jit` keeps, and all
@@ -62,6 +69,16 @@ pub(super) struct JitState {
 unsafe impl Send for JitState {}
 
 impl JitState {
+    /// Packs NZCV a block left lazy into `ctx`, so the context is exact outside translated code.
+    fn materialize_nzcv(&mut self, ctx: &mut ThreadContext) {
+        let code = std::mem::take(&mut self.lazy_nzcv);
+        if code != 0 {
+            let (kind, w) = Cmp::from_lazy_code(code);
+            let nzcv = passes::flags_of(kind, w, self.lazy_a, self.lazy_b) as u32;
+            ctx.pstate = ctx.pstate & 0x0fff_ffff | nzcv << 28;
+        }
+    }
+
     /// # Safety
     /// Only called by slow paths of translated code, while the owning `Jit` is running it.
     unsafe fn memory(&self) -> &AddressSpace {
@@ -287,6 +304,10 @@ impl Jit {
             table: cache.table(),
             link: 0,
             fault: None,
+            lazy_nzcv: 0,
+            lazy_a: 0,
+            lazy_b: 0,
+            materialize: cache.materialize(),
         });
         Some(Self {
             target: Target {
@@ -417,7 +438,9 @@ impl CpuCore for Jit {
             let enter = self.cache.trampoline();
             // SAFETY: `code` is a compiled block in this core's code memory; it only touches
             // `ctx`, the state, and the arena behind the bounds check.
-            if unsafe { enter(ctx, &mut *self.state, self.arena, code) } == EXIT_FAULT {
+            let exit = unsafe { enter(ctx, &mut *self.state, self.arena, code) };
+            self.state.materialize_nzcv(ctx);
+            if exit == EXIT_FAULT {
                 let fault = self
                     .state
                     .fault

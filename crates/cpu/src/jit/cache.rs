@@ -141,6 +141,7 @@ pub(super) fn on_fault(_data: usize, _guest_addr: u64, fault: &mut HostFault) ->
 pub(super) struct JitCache {
     memory: CodeMemory,
     trampoline: Trampoline,
+    materialize: usize,
     code_start: usize,
     entries: Vec<Entry>,
     free: Vec<u32>,
@@ -174,6 +175,7 @@ impl JitCache {
         // SAFETY: the bytes at `code` are the trampoline, which has this signature.
         let trampoline = unsafe { std::mem::transmute::<*const u8, Trampoline>(code) };
         let empty = (u64::MAX, memory.push(&x64::miss_stub())? as usize);
+        let materialize = memory.push(&x64::materialize_stub())? as usize;
         let mut sites = Box::new(SiteTable(Vec::new()));
         let region = {
             let _guard = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
@@ -194,6 +196,7 @@ impl JitCache {
             code_start: memory.used,
             memory,
             trampoline,
+            materialize,
             entries: Vec::new(),
             free: Vec::new(),
             by_start: BTreeMap::new(),
@@ -209,6 +212,11 @@ impl JitCache {
 
     pub fn trampoline(&self) -> Trampoline {
         self.trampoline
+    }
+
+    /// The address of `x64::materialize_stub`.
+    pub fn materialize(&self) -> usize {
+        self.materialize
     }
 
     pub fn table(&self) -> *const (u64, usize) {

@@ -3,6 +3,7 @@
 
 mod controller_layout;
 mod controls;
+pub mod game;
 mod hotkeys;
 
 use std::path::PathBuf;
@@ -90,13 +91,13 @@ pub struct ConfigWindow {
 }
 
 impl ConfigWindow {
-    /// The draft's graphics settings, so a change made from the main window while this window
-    /// is open is not undone by its next Apply.
-    pub fn draft_graphics(&mut self) -> &mut GraphicsSettings {
-        &mut self.draft.graphics
+    /// The draft, so a change made from the main window while this window is open is not undone
+    /// by its next Apply.
+    pub fn draft(&mut self) -> &mut Settings {
+        &mut self.draft
     }
 
-    /// The draft's folders, for the same reason as [`Self::draft_graphics`].
+    /// The draft's folders, for the same reason as [`Self::draft`].
     pub fn draft_paths(&mut self) -> &mut PathSettings {
         &mut self.draft.paths
     }

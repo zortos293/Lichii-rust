@@ -221,6 +221,7 @@ impl TestKernel {
             cpu_accuracy: CpuAccuracy::Auto,
             aslr: false,
             rng_seed: 1,
+            enforce_service_access: true,
             clock: Arc::new(HostClock(Instant::now())),
             cpu: Arc::new(move |config: CpuConfig| {
                 Box::new(MockCore {
@@ -266,7 +267,10 @@ impl TestKernel {
             pool_partition: PoolPartition::Application,
             kernel_capabilities: Vec::new(),
             capabilities: KernelCapabilities::default(),
-            services: ServiceAccess::default(),
+            services: ServiceAccess {
+                client: vec!["*".into()],
+                server: vec!["*".into()],
+            },
             filesystem_permissions: 0,
             modules: vec![Module {
                 name: "main".into(),
