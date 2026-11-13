@@ -34,20 +34,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          libavcodec=$(apt-cache pkgnames libavcodec | grep -E '^libavcodec[0-9]+(t64)?
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Fetch FFmpeg
-        if: runner.os == 'Windows'
-        uses: actions/download-artifact@v4
-        with:
-          name: ffmpeg-windows
-          path: ffmpeg
-      - run: cargo test --workspace
-        env:
-          LICHII_REQUIRE_FFMPEG: 1
-          LICHII_FFMPEG_DIR: ${{ github.workspace }}/ffmpeg
- | sort -V | tail -1)
+          libavcodec=$(apt-cache pkgnames libavcodec | grep -E '^libavcodec[0-9]+(t64)?$' | sort -V | tail -1)
           sudo apt-get install -y libvulkan-dev mesa-vulkan-drivers libudev-dev libasound2-dev "$libavcodec" libxkbcommon-dev libwayland-dev spirv-tools
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
