@@ -130,6 +130,10 @@ const RES_VALUE_HI: i32 = offset_of!(ReservationSlot, value_hi) as i32;
 const RES_ADDR: i32 = offset_of!(ReservationSlot, addr) as i32;
 const RES_SIZE: i32 = offset_of!(ReservationSlot, size) as i32;
 const ST_INTERRUPT: i32 = ctx(offset_of!(JitState, interrupt));
+const ST_LAZY_NZCV: i32 = ctx(offset_of!(JitState, lazy_nzcv));
+const ST_LAZY_A: i32 = ctx(offset_of!(JitState, lazy_a));
+const ST_LAZY_B: i32 = ctx(offset_of!(JitState, lazy_b));
+const ST_MATERIALIZE: i32 = ctx(offset_of!(JitState, materialize));
 /// Entries in the direct-mapped `guest pc -> host code` table indirect branches probe.
 pub(super) const TABLE_BITS: u32 = 16;
 
@@ -373,6 +377,19 @@ impl Emitter<'_> {
         }
     }
 
+    /// Packs NZCV that an earlier block left lazy into the context, before code that reads the
+    /// context's NZCV. Clobbers `rax`, `rcx`, `rdx` and the host flags.
+    pub(super) fn materialize_nzcv(&mut self) {
+        let done = self.asm.new_dynamic_label();
+        dynasm!(self.asm
+            ; .arch x64
+            ; cmp DWORD [r13 + ST_LAZY_NZCV], 0
+            ; je =>done
+            ; call QWORD [r13 + ST_MATERIALIZE]
+            ; =>done
+        );
+    }
+
     /// Sets the host flags of `Compare` `v` and returns the condition code that then holds.
     fn compare(&mut self, v: Value) -> u8 {
         let Op::Compare(kind, cond, w, a, b) = self.block.ops[v.index()] else {
@@ -411,6 +428,9 @@ impl Emitter<'_> {
         match op {
             Op::Nop | Op::Const(_) => return,
             Op::Get(loc) => {
+                if loc == Loc::Nzcv {
+                    self.materialize_nzcv();
+                }
                 let d = self.def(v);
                 let offset = loc_offset(loc);
                 match loc {
@@ -427,6 +447,18 @@ impl Emitter<'_> {
                 }
             }
             Op::Set(loc, x) => self.set(loc, x),
+            Op::SetLazyNzcv(kind, w, a, b) => {
+                for (x, offset) in [(a, ST_LAZY_A), (b, ST_LAZY_B)] {
+                    match self.src(x, W::W64) {
+                        Src::Imm(i) => dynasm!(self.asm ; .arch x64 ; mov QWORD [r13 + offset], i),
+                        Src::Reg(r) => {
+                            dynasm!(self.asm ; .arch x64 ; mov QWORD [r13 + offset], Rq(r))
+                        }
+                    }
+                }
+                let code = kind.lazy_code(w) as i32;
+                dynasm!(self.asm ; .arch x64 ; mov DWORD [r13 + ST_LAZY_NZCV], code);
+            }
             Op::Add(w, a, b)
             | Op::Sub(w, a, b)
             | Op::And(w, a, b)
@@ -841,7 +873,11 @@ impl Emitter<'_> {
                         );
                     }
                 }
-                dynasm!(self.asm ; .arch x64 ; mov DWORD [r15 + offset], eax);
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; mov DWORD [r15 + offset], eax
+                    ; mov DWORD [r13 + ST_LAZY_NZCV], 0
+                );
             }
             Loc::Fpcr | Loc::Fpsr => match self.src(x, W::W32) {
                 Src::Imm(i) => dynasm!(self.asm ; .arch x64 ; mov DWORD [r15 + offset], i),
@@ -917,6 +953,7 @@ impl Emitter<'_> {
     /// Calls `simd(ctx, word, state, pc) -> undefined` from the main path, leaving through the fault
     /// exit when the instruction is undefined.
     fn call_simd(&mut self, i: usize, word: u32, pc: u64) {
+        self.materialize_nzcv();
         let saved = self.live_across(i);
         self.save(saved);
         dynasm!(self.asm
@@ -1638,6 +1675,74 @@ pub(super) fn compile(block: &Block, start: u64, target: &Target) -> Compiled {
     e.exit_to(start, EXIT_CONTINUE);
     let code = e.asm.finalize().expect("every label is defined");
     Compiled { code, sites }
+}
+
+/// Called from translated code while lazy NZCV is pending: recomputes the flags from
+/// `JitState::lazy_a` and `lazy_b` with the host instruction their code names, packs them into
+/// `pstate` and clears the code. Clobbers `rax`, `rcx`, `rdx` and the host flags.
+pub(super) fn materialize_stub() -> Vec<u8> {
+    let mut asm = Asm::new(0);
+    let pack = asm.new_dynamic_label();
+    let ops: [(Cmp, W); 6] = [
+        (Cmp::Sub, W::W64),
+        (Cmp::Sub, W::W32),
+        (Cmp::Test, W::W64),
+        (Cmp::Test, W::W32),
+        (Cmp::Add, W::W64),
+        (Cmp::Add, W::W32),
+    ];
+    let labels: Vec<DynamicLabel> = ops.iter().map(|_| asm.new_dynamic_label()).collect();
+    dynasm!(asm
+        ; .arch x64
+        ; mov eax, DWORD [r13 + ST_LAZY_NZCV]
+        ; mov rcx, QWORD [r13 + ST_LAZY_A]
+        ; mov rdx, QWORD [r13 + ST_LAZY_B]
+        ; mov DWORD [r13 + ST_LAZY_NZCV], 0
+    );
+    for (&(kind, w), &label) in ops.iter().zip(&labels) {
+        let code = kind.lazy_code(w) as i32;
+        dynasm!(asm ; .arch x64 ; cmp eax, code ; je =>label);
+    }
+    dynasm!(asm ; .arch x64 ; ud2);
+    for (&(kind, w), &label) in ops.iter().zip(&labels) {
+        dynasm!(asm ; .arch x64 ; =>label);
+        match (kind, w) {
+            (Cmp::Sub, W::W64) => dynasm!(asm ; .arch x64 ; cmp rcx, rdx ; cmc),
+            (Cmp::Sub, W::W32) => dynasm!(asm ; .arch x64 ; cmp ecx, edx ; cmc),
+            (Cmp::Test, W::W64) => dynasm!(asm ; .arch x64 ; test rcx, rdx),
+            (Cmp::Test, W::W32) => dynasm!(asm ; .arch x64 ; test ecx, edx),
+            (Cmp::Add, W::W64) => dynasm!(asm ; .arch x64 ; add rcx, rdx),
+            (Cmp::Add, W::W32) => dynasm!(asm ; .arch x64 ; add ecx, edx),
+        }
+        dynasm!(asm ; .arch x64 ; jmp =>pack);
+    }
+    dynasm!(asm
+        ; .arch x64
+        ; =>pack
+        ; pushfq
+        ; pop rcx
+        ; mov eax, ecx
+        ; shr eax, 11
+        ; and eax, 1
+        ; mov edx, ecx
+        ; and edx, 1
+        ; lea eax, [rax + rdx * 2]
+        ; mov edx, ecx
+        ; shr edx, 6
+        ; and edx, 1
+        ; lea eax, [rax + rdx * 4]
+        ; shr ecx, 7
+        ; and ecx, 1
+        ; lea eax, [rax + rcx * 8]
+        ; shl eax, 28
+        ; mov ecx, DWORD [r15 + CTX_PSTATE]
+        ; and ecx, 0x0fff_ffff
+        ; or ecx, eax
+        ; mov DWORD [r15 + CTX_PSTATE], ecx
+        ; ret
+    );
+    asm.finalize()
+        .expect("every label of the materialize stub is defined")
 }
 
 /// Code empty indirect-table slots point at: returns to the dispatcher like a table miss, so a
