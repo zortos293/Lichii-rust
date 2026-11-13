@@ -555,6 +555,32 @@ alu_class!(fp_compare_vector, "0xx01110xx1xxxxx111001xxxxxxxxxx", |w| {
     matches!(w & 0xbfa0_fc00, 0x0e20_e400 | 0x2e20_e400 | 0x2ea0_e400)
         && w & 0x4040_0000 != 0x0040_0000
 });
+/// SQXTN and SQXTN2 on four registers that SSHR keeps shifting into, out of and across the
+/// narrow range, so lanes both saturate and fit.
+#[test]
+fn saturating_narrow() {
+    differential(
+        "saturating_narrow",
+        0x1234_5678 ^ line!() as u64,
+        |rng, out| {
+            for _ in 0..1 + rng.below(8) {
+                let reg = |rng: &mut Rng| rng.below(4) as u32;
+                let size = rng.below(3) as u32;
+                let word = if rng.below(2) == 0 {
+                    let shift = 1 + rng.below(16 << size) as u32;
+                    0x4f00_0400 | ((32 << size) - shift) << 16 | reg(rng) << 5 | reg(rng)
+                } else {
+                    0x0e21_4800
+                        | (rng.below(2) as u32) << 30
+                        | size << 22
+                        | reg(rng) << 5
+                        | reg(rng)
+                };
+                out.push(word);
+            }
+        },
+    );
+}
 alu_class!(ext, "0x101110000xxxxx0xxxx0xxxxxxxxxx", |w| w & 0x4000_4000
     != 0x4000);
 alu_class!(
