@@ -10,12 +10,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lichii_memory::{AddressSpace, MemoryPermission};
-use lichii_video::nvdec::VideoCodec;
 use lichii_video::nvdec::picture::H264DecoderContext;
 use lichii_video::nvdec::registers::index;
+use lichii_video::nvdec::{SurfaceOffsets, VideoCodec};
 
 use super::channel::tests::{host1x, immediate, incrementing, set_class, wait_for};
 use super::channel::{THI_INCR_SYNCPT, THI_METHOD_0};
+use super::frames::DecodedFrames;
 use super::nvdec::Nvdec;
 use super::vic::Vic;
 use super::{EngineChannel, Host1x, VideoEngine};
@@ -966,6 +967,39 @@ fn h264_decodes_through_nvdec_and_composes_through_vic_by_surface() {
     while !waiting.is_empty() {
         show(next_shown(&mut waiting));
     }
+}
+
+#[test]
+fn vic_jobs_share_a_decoded_picture_and_the_last_one_pools_it() {
+    if !ffmpeg() {
+        return;
+    }
+    let frames = DecodedFrames::new();
+    let luma = surface_luma(0);
+    let keys = SurfaceOffsets::Progressive {
+        luma,
+        chroma: surface_chroma(0),
+    };
+    let decoded = frames.spare_frame().expect("FFmpeg is loaded");
+    let address = Arc::as_ptr(&decoded);
+    frames.insert(1, keys.into(), decoded);
+
+    let first = frames.lend(luma).expect("the decoded picture");
+    let second = frames.lend(luma).expect("a lent picture stays available");
+    assert!(Arc::ptr_eq(&first, &second));
+
+    frames.close(1);
+    frames.recycle(first);
+    let filling = frames.spare_frame().expect("FFmpeg is loaded");
+    assert_ne!(
+        Arc::as_ptr(&filling),
+        address,
+        "a frame still lent was pooled"
+    );
+    frames.recycle(filling);
+    frames.recycle(second);
+    let pooled: Vec<_> = (0..2).filter_map(|_| frames.spare_frame()).collect();
+    assert!(pooled.iter().any(|frame| Arc::as_ptr(frame) == address));
 }
 
 #[test]

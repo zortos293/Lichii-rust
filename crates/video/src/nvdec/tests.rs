@@ -2,7 +2,8 @@
 //! `nx2`, src/video_core/host1x/codecs) fed the same synthetic registers and guest memory, built
 //! with the fixes this port makes: VP9 `comp_inter` default probabilities, signed `delta_q`,
 //! range coder carries, loop filter and segmentation resets on intra frames, frame size from
-//! references, and H.264 4:4:4 PPS scaling lists and wrapped scaling list deltas.
+//! references, VP9 frame contexts reset and left unsaved by error-resilient frames, and H.264
+//! 4:4:4 PPS scaling lists and wrapped scaling list deltas.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -952,13 +953,13 @@ const VP9_RESOLUTION_CHANGES_INTRA_ONLY_ERROR_RESILIENT: &[Expected] = &[
         dimensions: Some((640, 360)),
     },
     Expected {
-        header: "870102480004500000f01e3ecdb7aac2c26699e8fefc29bebec75ef5eb909a63377b676ac5820000",
+        header: "8701024800045000009019ef5587465e6fcf47cbca76e50074c10000",
         hidden: false,
         offsets: progressive(0x108000, 0x308000),
         dimensions: Some((640, 360)),
     },
     Expected {
-        header: "86008090009f805983000290000e001d3ee6104bd319a702cbc376f8e9f5516369dbc9bcf9eab1ab300000",
+        header: "86008090009f8059830002900008001d3ee018b8e0ed9be7dbd57b6f366000",
         hidden: false,
         offsets: progressive(0x10c000, 0x30c000),
         dimensions: Some((320, 180)),

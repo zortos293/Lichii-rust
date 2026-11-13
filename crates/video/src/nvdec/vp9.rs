@@ -185,7 +185,9 @@ impl Vp9Builder {
         let mut compressed = core::mem::take(&mut self.compressed);
         compressed.clear();
         write_compressed_header(&self.current, &self.frame_ctxs[ctx], &mut compressed);
-        self.frame_ctxs[ctx] = self.current.entropy;
+        if !self.current.error_resilient_mode {
+            self.frame_ctxs[ctx] = self.current.entropy;
+        }
 
         header.bits(compressed.len() as u64, 16);
         header.flush();
@@ -294,6 +296,9 @@ impl Vp9Builder {
         if !info.error_resilient_mode {
             w.bit(true);
             w.bit(true);
+        }
+        if info.error_resilient_mode {
+            self.frame_ctxs = [DEFAULT_PROBS; 4];
         }
         let ctx = usize::from(!info.show_frame);
         w.bits(ctx as u64, 2);

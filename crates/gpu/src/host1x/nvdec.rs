@@ -81,7 +81,7 @@ pub(super) struct Nvdec {
     channel: u64,
     packets: [Packet; IN_FLIGHT],
     next_pts: i64,
-    spare: Option<Frame>,
+    spare: Option<Arc<Frame>>,
 }
 
 impl Nvdec {
@@ -151,7 +151,8 @@ impl Nvdec {
         }
         let mut spare = self.spare.take();
         while let Some(mut picture) = spare.take().or_else(|| self.frames.spare_frame()) {
-            match decoder.receive(&mut picture) {
+            let unshared = Arc::get_mut(&mut picture).expect("spare frames are unshared");
+            match decoder.receive(unshared) {
                 Ok(true) => {}
                 Ok(false) => {
                     spare = Some(picture);

@@ -1028,7 +1028,7 @@ impl Vic {
             let surface = SURFACES + index * SURFACE_WORDS_PER_SLOT;
             let (luma, chroma) = (self.address(surface), self.address(surface + 1));
             let lent = self.frames.lend(luma);
-            let source = match lent.as_ref().and_then(|lent| lent.frame().picture()) {
+            let source = match lent.as_deref().and_then(lichii_video::Frame::picture) {
                 Some(picture) => Source::from_picture(picture),
                 None => slot
                     .surface
@@ -1040,7 +1040,7 @@ impl Vic {
                     .compose(&slot, &source, output.target, &mut self.rows);
             }
             if let Some(lent) = lent {
-                self.frames.restore(lent);
+                self.frames.recycle(lent);
             }
         }
         let (luma, chroma) = (

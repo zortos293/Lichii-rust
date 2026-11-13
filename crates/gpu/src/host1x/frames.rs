@@ -4,7 +4,11 @@
 //! produced it and however late the decoder returned it.
 //!
 //! The table and its pool of spare frames are sized once: a picture whose surface is decoded
-//! again replaces the older one, and the oldest picture makes room past [`CAPACITY`].
+//! again replaces the older one, and the oldest picture makes room past [`CAPACITY`]. VIC jobs
+//! share a picture rather than take it out, so any number of them can compose it at once, and a
+//! frame returns to the pool only once neither the table nor a VIC job holds it.
+
+use std::sync::Arc;
 
 use lichii_video::Frame;
 use lichii_video::nvdec::SurfaceOffsets;
@@ -53,27 +57,21 @@ struct Entry {
     keys: SurfaceKeys,
     channel: u64,
     age: u64,
-    frame: Frame,
-}
-
-/// A picture lent to a VIC job. Hand it back with [`DecodedFrames::restore`].
-pub(crate) struct Lent(Entry);
-
-impl Lent {
-    pub(crate) fn frame(&self) -> &Frame {
-        &self.0.frame
-    }
+    frame: Arc<Frame>,
 }
 
 struct Table {
     entries: Vec<Entry>,
-    spare: Vec<Frame>,
+    spare: Vec<Arc<Frame>>,
     age: u64,
 }
 
 impl Table {
-    fn recycle(&mut self, mut frame: Frame) {
-        frame.clear();
+    fn recycle(&mut self, mut frame: Arc<Frame>) {
+        let Some(unshared) = Arc::get_mut(&mut frame) else {
+            return;
+        };
+        unshared.clear();
         if self.spare.len() < CAPACITY {
             self.spare.push(frame);
         }
@@ -107,15 +105,15 @@ impl DecodedFrames {
         }
     }
 
-    /// An empty frame to decode into: a recycled one, or a new one while the pool is still
-    /// filling. `None` without FFmpeg.
-    pub(crate) fn spare_frame(&self) -> Option<Frame> {
+    /// An empty, unshared frame to decode into: a recycled one, or a new one while the pool is
+    /// still filling. `None` without FFmpeg.
+    pub(crate) fn spare_frame(&self) -> Option<Arc<Frame>> {
         let recycled = self.table.lock().spare.pop();
-        recycled.or_else(|| Frame::new().ok())
+        recycled.or_else(|| Frame::new().ok().map(Arc::new))
     }
 
     /// Keeps `frame` as the picture of the surface at `keys`, decoded by `channel`.
-    pub(crate) fn insert(&self, channel: u64, keys: SurfaceKeys, frame: Frame) {
+    pub(crate) fn insert(&self, channel: u64, keys: SurfaceKeys, frame: Arc<Frame>) {
         let mut table = self.table.lock();
         table.remove_overlapping(keys);
         if table.entries.len() == CAPACITY
@@ -133,28 +131,17 @@ impl DecodedFrames {
         });
     }
 
-    /// Takes out the picture decoded into the surface whose luma plane is at `luma`.
-    pub(crate) fn lend(&self, luma: u64) -> Option<Lent> {
-        let mut table = self.table.lock();
-        let index = table.entries.iter().position(|e| e.keys.matches(luma))?;
-        Some(Lent(table.entries.swap_remove(index)))
+    /// Shares the picture decoded into the surface whose luma plane is at `luma`. Hand it to
+    /// [`Self::recycle`] when done with it.
+    pub(crate) fn lend(&self, luma: u64) -> Option<Arc<Frame>> {
+        let table = self.table.lock();
+        let entry = table.entries.iter().find(|e| e.keys.matches(luma))?;
+        Some(entry.frame.clone())
     }
 
-    /// Puts a lent picture back, unless its surface was decoded again meanwhile.
-    pub(crate) fn restore(&self, lent: Lent) {
-        let mut table = self.table.lock();
-        let entry = lent.0;
-        if table.entries.len() < CAPACITY
-            && !table.entries.iter().any(|e| e.keys.overlaps(entry.keys))
-        {
-            table.entries.push(entry);
-        } else {
-            table.recycle(entry.frame);
-        }
-    }
-
-    /// Returns a frame that holds no picture worth keeping to the pool.
-    pub(crate) fn recycle(&self, frame: Frame) {
+    /// Lets go of `frame`: a lent picture, or one holding nothing worth keeping. It joins the
+    /// pool once nothing else holds it.
+    pub(crate) fn recycle(&self, frame: Arc<Frame>) {
         self.table.lock().recycle(frame);
     }
 
