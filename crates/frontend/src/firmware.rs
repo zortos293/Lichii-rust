@@ -42,7 +42,9 @@ impl fmt::Display for FirmwareError {
         match self {
             Self::Source(e) => f.write_str(e),
             Self::NoNcas => f.write_str("Unable to locate potential firmware NCA files"),
-            Self::FailedDelete => f.write_str("Failed to delete one or more firmware files."),
+            Self::FailedDelete => f.write_str(
+                "Failed to delete one or more firmware files. The installed firmware was kept.",
+            ),
             Self::FailedCopy => f.write_str(
                 "One or more firmware files failed to copy into NAND. The installed firmware was \
                  kept.",
@@ -161,16 +163,41 @@ pub fn install(
         let _ = std::fs::remove_dir_all(&staging);
         return Err(e);
     }
-    if registered.exists() {
-        std::fs::remove_dir_all(registered).map_err(|e| {
-            tracing::error!(dir = %registered.display(), "removing the old firmware: {e}");
-            FirmwareError::FailedDelete
-        })?;
+    swap(&staging, registered)
+}
+
+/// Moves `staging` into `registered`. The old firmware is set aside first and deleted only once
+/// the new one is in place, so a failed move puts it back.
+fn swap(staging: &Path, registered: &Path) -> Result<(), FirmwareError> {
+    let backup = registered.with_extension("old");
+    let set_aside = || {
+        if backup.exists() {
+            std::fs::remove_dir_all(&backup)?;
+        }
+        if registered.exists() {
+            std::fs::rename(registered, &backup)?;
+        }
+        Ok::<_, io::Error>(())
+    };
+    if let Err(e) = set_aside() {
+        tracing::error!(dir = %registered.display(), "setting the old firmware aside: {e}");
+        let _ = std::fs::remove_dir_all(staging);
+        return Err(FirmwareError::FailedDelete);
     }
-    std::fs::rename(&staging, registered).map_err(|e| {
+    if let Err(e) = std::fs::rename(staging, registered) {
         tracing::error!(dir = %registered.display(), "moving the new firmware in place: {e}");
-        FirmwareError::FailedCopy
-    })
+        if backup.exists() {
+            let _ = std::fs::rename(&backup, registered);
+        }
+        let _ = std::fs::remove_dir_all(staging);
+        return Err(FirmwareError::FailedCopy);
+    }
+    if backup.exists()
+        && let Err(e) = std::fs::remove_dir_all(&backup)
+    {
+        tracing::warn!(dir = %backup.display(), "removing the old firmware: {e}");
+    }
+    Ok(())
 }
 
 /// Copies the NCAs of `source` into `dest`.
@@ -359,6 +386,11 @@ mod tests {
         let progress = Progress::default();
         install(&FirmwareSource::Folder(source), &registered, &progress).unwrap();
         assert_eq!(names(&registered), ["aa.nca", "bb.NCA"]);
+        assert_eq!(
+            names(registered.parent().unwrap()),
+            ["registered"],
+            "no staging or backup left"
+        );
         assert_eq!(
             std::fs::read(registered.join("aa.nca")).unwrap(),
             vec![1u8; 3000]
