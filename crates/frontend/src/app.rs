@@ -476,18 +476,21 @@ impl App {
                 self.settings.ui.push_recent(path);
                 self.save_settings();
             }
-            Err(e) => match e.missing_key() {
-                Some(key) => {
-                    self.ui.error = Some(format!(
-                        "Lichii cannot decrypt this title: {key}.
+            Err(e) => {
+                tracing::error!(path = %path.display(), "cannot boot: {e}");
+                match e.missing_key() {
+                    Some(key) => {
+                        self.ui.error = Some(format!(
+                            "Lichii cannot decrypt this title: {key}.
 
 Dump prod.keys and title.keys \
                          from your own console, then choose them in the Keys and Firmware window."
-                    ));
-                    self.open_setup();
+                        ));
+                        self.open_setup();
+                    }
+                    None => self.ui.error = Some(format!("Cannot boot: {e}")),
                 }
-                None => self.ui.error = Some(format!("Cannot boot: {e}")),
-            },
+            }
         }
         self.input.send(InputMsg::ReleaseAll);
         self.update_title();
