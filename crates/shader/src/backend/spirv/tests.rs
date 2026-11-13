@@ -22,6 +22,7 @@ use crate::translate::{TranslateOptions, TranslatedProgram, translate};
 use crate::{Profile, RuntimeInfo, ShaderInfo, ShaderStage};
 
 mod arith;
+mod image;
 
 const PT: u64 = 7 << 16;
 

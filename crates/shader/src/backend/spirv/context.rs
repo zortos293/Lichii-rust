@@ -90,10 +90,6 @@ pub(crate) struct StorageTypeDefinition {
 }
 
 #[derive(Clone, Copy, Debug)]
-#[allow(
-    dead_code,
-    reason = "read by the image families, which are stubs in this milestone"
-)]
 pub(crate) struct TextureDefinition {
     pub id: Word,
     pub sampled_type: Word,
@@ -105,20 +101,12 @@ pub(crate) struct TextureDefinition {
 }
 
 #[derive(Clone, Copy, Debug)]
-#[allow(
-    dead_code,
-    reason = "read by the image families, which are stubs in this milestone"
-)]
 pub(crate) struct TextureBufferDefinition {
     pub id: Word,
     pub count: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
-#[allow(
-    dead_code,
-    reason = "read by the image families, which are stubs in this milestone"
-)]
 pub(crate) struct ImageBufferDefinition {
     pub id: Word,
     pub image_type: Word,
@@ -128,10 +116,6 @@ pub(crate) struct ImageBufferDefinition {
 }
 
 #[derive(Clone, Copy, Debug)]
-#[allow(
-    dead_code,
-    reason = "read by the image families, which are stubs in this milestone"
-)]
 pub(crate) struct ImageDefinition {
     pub id: Word,
     pub image_type: Word,
@@ -411,6 +395,8 @@ pub(crate) struct EmitContext<'a> {
     pub uses_nonuniform_storage_image: bool,
     pub uses_nonuniform_uniform_texel_buffer: bool,
     pub uses_nonuniform_storage_texel_buffer: bool,
+
+    sparse_result_types: FxHashMap<Word, Word>,
 }
 
 fn uses_nvn_storage_descriptor(info: &ShaderInfo, desc: &StorageBufferDescriptor) -> bool {
@@ -674,6 +660,7 @@ impl<'a> EmitContext<'a> {
             uses_nonuniform_storage_image: false,
             uses_nonuniform_uniform_texel_buffer: false,
             uses_nonuniform_storage_texel_buffer: false,
+            sparse_result_types: FxHashMap::default(),
         };
         let unified = profile.unified_descriptor_binding;
         ctx.add_capability(Capability::Shader);
@@ -940,6 +927,17 @@ impl<'a> EmitContext<'a> {
         let length_id = self.const_u32(length);
         let id = self.b.type_array(element, length_id);
         self.array_types.insert((element, length), id);
+        id
+    }
+
+    /// The result struct of a sparse image instruction: the residency code and the texel of
+    /// `ty`, cached.
+    pub fn type_sparse_result(&mut self, ty: Word) -> Word {
+        if let Some(&id) = self.sparse_result_types.get(&ty) {
+            return id;
+        }
+        let id = self.b.type_struct([self.u32[1], ty]);
+        self.sparse_result_types.insert(ty, id);
         id
     }
 
@@ -2265,10 +2263,8 @@ impl<'a> EmitContext<'a> {
         );
         let ty = self.type_pointer(StorageClass::UniformConstant, self.image_buffer_type);
         for desc in &info.texture_buffer_descriptors {
-            if desc.count != 1 {
-                return Err(EmitError::Unsupported("arrays of texture buffers"));
-            }
-            let id = self.global_variable(ty, StorageClass::UniformConstant, None);
+            let desc_type = self.descriptor_type(self.image_buffer_type, ty, desc.count);
+            let id = self.global_variable(desc_type, StorageClass::UniformConstant, None);
             self.decorate(id, Decoration::Binding, &[*binding]);
             self.decorate(id, Decoration::DescriptorSet, &[0]);
             let name = descriptor_name(
@@ -2311,7 +2307,8 @@ impl<'a> EmitContext<'a> {
                 None,
             );
             let pointer_type = self.type_pointer(StorageClass::UniformConstant, image_type);
-            let id = self.global_variable(pointer_type, StorageClass::UniformConstant, None);
+            let desc_type = self.descriptor_type(image_type, pointer_type, count);
+            let id = self.global_variable(desc_type, StorageClass::UniformConstant, None);
             self.decorate(id, Decoration::Binding, &[*binding]);
             self.decorate(id, Decoration::DescriptorSet, &[0]);
             let name = descriptor_name(self.stage, "imgbuf", cbuf_index, cbuf_offset, count);
@@ -2394,12 +2391,7 @@ impl<'a> EmitContext<'a> {
             let image_type = self.sampled_image_type(desc)?;
             let sampled_type = self.b.type_sampled_image(image_type);
             let pointer_type = self.type_pointer(StorageClass::UniformConstant, sampled_type);
-            let desc_type = if desc.count > 1 {
-                let array = self.type_array(sampled_type, desc.count);
-                self.type_pointer(StorageClass::UniformConstant, array)
-            } else {
-                pointer_type
-            };
+            let desc_type = self.descriptor_type(sampled_type, pointer_type, desc.count);
             let id = self.global_variable(desc_type, StorageClass::UniformConstant, None);
             self.decorate(id, Decoration::Binding, &[*binding]);
             self.decorate(id, Decoration::DescriptorSet, &[0]);
@@ -2439,7 +2431,8 @@ impl<'a> EmitContext<'a> {
             };
             let image_type = self.storage_image_type(desc, sampled_type)?;
             let pointer_type = self.type_pointer(StorageClass::UniformConstant, image_type);
-            let id = self.global_variable(pointer_type, StorageClass::UniformConstant, None);
+            let desc_type = self.descriptor_type(image_type, pointer_type, desc.count);
+            let id = self.global_variable(desc_type, StorageClass::UniformConstant, None);
             self.decorate(id, Decoration::Binding, &[*binding]);
             self.decorate(id, Decoration::DescriptorSet, &[0]);
             let name = descriptor_name(
@@ -2465,6 +2458,16 @@ impl<'a> EmitContext<'a> {
             *scaling_index += 1;
         }
         Ok(())
+    }
+
+    /// The variable type of a descriptor: `element_pointer`, or a pointer to an array of
+    /// `count` elements, which the image families index.
+    fn descriptor_type(&mut self, element: Word, element_pointer: Word, count: u32) -> Word {
+        if count <= 1 {
+            return element_pointer;
+        }
+        let array = self.type_array(element, count);
+        self.type_pointer(StorageClass::UniformConstant, array)
     }
 
     fn define_attribute_mem_access(&mut self) -> EmitResult<()> {
