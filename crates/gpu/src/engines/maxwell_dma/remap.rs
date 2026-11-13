@@ -58,6 +58,20 @@ impl Remap {
             .any(|swizzle| swizzle.0 >= RemapConstSwizzle::NO_WRITE.0)
     }
 
+    /// The 32-bit word every destination component gets when the remap only fills one constant.
+    pub fn fill_value(&self) -> Option<u32> {
+        let [first, rest @ ..] = self.active() else {
+            return None;
+        };
+        let constant = match *first {
+            RemapConstSwizzle::CONST_A => self.constants[0],
+            RemapConstSwizzle::CONST_B => self.constants[1],
+            _ => return None,
+        };
+        (self.component_size == 4 && rest.iter().all(|swizzle| swizzle == first))
+            .then_some(constant)
+    }
+
     /// Whether the remap moves bytes unchanged, so it is a plain copy of wider elements.
     pub fn is_identity(&self) -> bool {
         self.num_src == self.num_dst
