@@ -203,20 +203,21 @@ impl Readers {
 
     /// Samples the host's player 1; when the reader moved, signals every availability event.
     pub(crate) fn poll(&self, hub: &NpadHub) {
+        if reader_of(&hub.read(0)) == self.reader.load(Ordering::Acquire) {
+            return;
+        }
+        self.update(&mut self.availability_events.lock(), hub);
+    }
+
+    /// Records the reader and signals `events` when it moved. Callers hold the events lock, so
+    /// changes and new watches are ordered.
+    fn update(&self, events: &mut Vec<Weak<Event>>, hub: &NpadHub) {
         let reader = reader_of(&hub.read(0));
-        let old = self.reader.load(Ordering::Acquire);
-        if old == reader
-            || self
-                .reader
-                .compare_exchange(old, reader, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-        {
+        if self.reader.swap(reader, Ordering::AcqRel) == reader {
             return;
         }
         self.generation.fetch_add(1, Ordering::Release);
-        self.availability_events
-            .lock()
-            .retain(|event| event.upgrade().inspect(|event| event.signal()).is_some());
+        events.retain(|event| event.upgrade().inspect(|event| event.signal()).is_some());
     }
 
     /// The change count and the reader's npad id.
@@ -225,8 +226,11 @@ impl Readers {
         (generation, self.reader.load(Ordering::Acquire))
     }
 
-    fn watch(&self, event: &Arc<Event>) {
-        self.availability_events.lock().push(Arc::downgrade(event));
+    /// Signals `event` on every reader change after the current one, which it records first.
+    fn watch(&self, hub: &NpadHub, event: &Arc<Event>) {
+        let mut events = self.availability_events.lock();
+        self.update(&mut events, hub);
+        events.push(Arc::downgrade(event));
     }
 }
 
@@ -238,8 +242,9 @@ impl User {
     fn new(kind: UserKind, context: Arc<ServiceContext>) -> Self {
         let event = |_| Arc::new(Event::new());
         let availability_change = Arc::new(Event::new());
-        context.nfc_readers.poll(&context.npad);
-        context.nfc_readers.watch(&availability_change);
+        context
+            .nfc_readers
+            .watch(&context.npad, &availability_change);
         Self {
             kind,
             context,
