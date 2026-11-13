@@ -20,6 +20,9 @@ lichii-vulkan.workspace = true
 crossbeam-channel.workspace = true
 egui = { workspace = true, features = ["default_fonts"] }
 egui-winit = "0.37"
+image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png"] }
 rfd = "0.18"
+serde.workspace = true
+toml.workspace = true
 tracing.workspace = true
 winit.workspace = true
