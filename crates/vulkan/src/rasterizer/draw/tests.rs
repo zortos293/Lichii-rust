@@ -23,6 +23,7 @@ use lichii_texture::block_linear::{GobLayout, Tiling, swizzle};
 use super::super::tests::{DADDR, Fixture, GPU_VA, fixture, gmmu, guest_linear};
 use super::{StageSources, Warning};
 use crate::pipeline::environment::TexturePool;
+use crate::pipeline::shader_cache::{ShaderCache, ShaderCacheStats};
 use crate::rasterizer::VulkanRasterizer;
 
 const SIZE: u32 = 16;
@@ -2216,9 +2217,67 @@ fn indexed_table_sampling_program() -> Vec<u8> {
 
 #[test]
 fn per_invocation_table_handles_bind_a_texture_per_table_entry() {
-    let Some((mut f, gmmu)) = draw_fixture() else {
+    draw_per_invocation_table_handles(true, None);
+}
+
+#[test]
+fn table_handles_sample_with_explicit_gradients_without_quad_divergent_implicit_lod() {
+    draw_per_invocation_table_handles(false, None);
+}
+
+#[test]
+fn the_disk_cache_is_keyed_on_quad_divergent_implicit_lod() {
+    let dir = cache_dir("quad-divergent-lod");
+    let Some((off, _)) = draw_per_invocation_table_handles(false, Some(&dir)) else {
         return;
     };
+    assert_eq!((off.translated, off.disk_hits), (2, 0));
+    let (again, _) = draw_per_invocation_table_handles(false, Some(&dir)).unwrap();
+    assert_eq!(
+        (again.translated, again.disk_hits),
+        (0, 2),
+        "same profile: served"
+    );
+    let (on, supported) = draw_per_invocation_table_handles(true, Some(&dir)).unwrap();
+    if supported {
+        assert_eq!(
+            (on.translated, on.disk_hits),
+            (2, 0),
+            "modules translated without quadDivergentImplicitLod are not reused with it"
+        );
+    } else {
+        eprintln!("skipping the reuse check: no quadDivergentImplicitLod");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Whether `spirv` takes a screen-space derivative (OpDPdx).
+fn takes_derivatives(spirv: &[u32]) -> bool {
+    let mut words = &spirv[5..];
+    while let [first, ..] = words {
+        if first & 0xffff == 207 {
+            return true;
+        }
+        words = &words[((first >> 16) as usize).max(1)..];
+    }
+    false
+}
+
+/// Draws a fragment program that samples a texture handle table at a per-column index;
+/// `quad_divergent_implicit_lod: false` translates as for a device without that feature.
+/// With `disk`, shaders go through the disk cache there. Returns the shader cache's stats and
+/// whether the profile had quadDivergentImplicitLod; `None` when skipped.
+fn draw_per_invocation_table_handles(
+    quad_divergent_implicit_lod: bool,
+    disk: Option<&std::path::Path>,
+) -> Option<(ShaderCacheStats, bool)> {
+    let (mut f, gmmu) = draw_fixture()?;
+    if !quad_divergent_implicit_lod {
+        let mut profile = f.rasterizer.draw.shaders.profile().clone();
+        profile.support_quad_divergent_implicit_lod = false;
+        let host = f.rasterizer.device.shader_host.clone();
+        f.rasterizer.draw.shaders = ShaderCache::new(profile, host);
+    }
     if !f
         .rasterizer
         .device
@@ -2226,7 +2285,12 @@ fn per_invocation_table_handles_bind_a_texture_per_table_entry() {
         .sampled_image_array_non_uniform_indexing
     {
         eprintln!("skipping: no non-uniform sampled image indexing");
-        return;
+        return None;
+    }
+    if let Some(dir) = disk {
+        f.rasterizer
+            .open_disk_cache(dir, &GraphicsSettings::default())
+            .unwrap();
     }
     write(
         &f,
@@ -2252,7 +2316,128 @@ fn per_invocation_table_handles_bind_a_texture_per_table_entry() {
         assert_eq!(texel, want, "column {x} samples the entry its index names");
     }
     assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
+    let fragment = f.rasterizer.draw.stages[4]
+        .as_ref()
+        .expect("a fragment module");
+    assert_eq!(
+        takes_derivatives(&fragment.spirv),
+        !f.rasterizer
+            .draw
+            .shaders
+            .profile()
+            .support_quad_divergent_implicit_lod,
+        "explicit gradients only without quadDivergentImplicitLod"
+    );
     f.assert_no_validation_errors();
+    f.rasterizer.draw.shaders.flush_disk();
+    Some((
+        f.rasterizer.draw.shaders.stats(),
+        f.rasterizer
+            .draw
+            .shaders
+            .profile()
+            .support_quad_divergent_implicit_lod,
+    ))
+}
+
+fn cache_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("lichii-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+/// `draw_fixture` with the disk cache in `dir` and the fragment program `fragment`.
+fn disk_fixture(dir: &std::path::Path, fragment: [u64; 2]) -> Option<(Fixture, Gmmu)> {
+    let (mut f, gmmu) = draw_fixture()?;
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program(fragment),
+    );
+    f.rasterizer
+        .open_disk_cache(dir, &GraphicsSettings::default())
+        .unwrap();
+    Some((f, gmmu))
+}
+
+#[test]
+fn the_disk_cache_serves_programs_and_pipelines_of_an_earlier_run() {
+    let dir = cache_dir("disk-shaders");
+    let Some((mut f, gmmu)) = disk_fixture(&dir, [0, 4]) else {
+        return;
+    };
+    draw(&mut f, &gmmu, &draw_regs());
+    let stats = f.rasterizer.draw.shaders.stats();
+    assert_eq!((stats.translated, stats.disk_hits), (2, 0));
+    f.assert_no_validation_errors();
+    drop(f);
+    let file = std::fs::read(dir.join("shaders.bin")).unwrap();
+    assert!(
+        file.len() > lichii_shader::cache::HEADER_LEN,
+        "both programs were written"
+    );
+
+    let (mut f, gmmu) = disk_fixture(&dir, [0, 4]).unwrap();
+    f.rasterizer.draw.pipelines.wait_for_builds();
+    assert_eq!(
+        f.rasterizer.draw.pipelines.stats().built,
+        1,
+        "the pipeline is built from the stored modules before any draw"
+    );
+    draw(&mut f, &gmmu, &draw_regs());
+    let stats = f.rasterizer.draw.shaders.stats();
+    assert_eq!((stats.translated, stats.disk_hits), (0, 2));
+    assert_eq!(f.rasterizer.draw.pipelines.stats().built, 1);
+    assert!(target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]));
+    f.assert_no_validation_errors();
+    drop(f);
+
+    let (mut f, gmmu) = disk_fixture(&dir, [4, 0]).unwrap();
+    draw(&mut f, &gmmu, &draw_regs());
+    let stats = f.rasterizer.draw.shaders.stats();
+    assert_eq!(
+        (stats.translated, stats.disk_hits),
+        (1, 1),
+        "a changed fragment program translates again; the vertex program is reused"
+    );
+    assert!(target(&mut f).iter().all(|&t| t == [128, 255, 0, 255]));
+    f.assert_no_validation_errors();
+    drop(f);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn stale_or_damaged_shader_cache_files_are_replaced_or_cut() {
+    let dir = cache_dir("stale-shaders");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("shaders.bin");
+    std::fs::write(&path, b"not a shader cache").unwrap();
+    let Some((mut f, gmmu)) = disk_fixture(&dir, [0, 4]) else {
+        return;
+    };
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        lichii_shader::cache::header(),
+        "a stale file starts over"
+    );
+    draw(&mut f, &gmmu, &draw_regs());
+    drop(f);
+    let good = std::fs::read(&path).unwrap();
+    let mut damaged = good.clone();
+    damaged.extend_from_slice(&[0xff; 7]);
+    std::fs::write(&path, &damaged).unwrap();
+
+    let (mut f, gmmu) = disk_fixture(&dir, [0, 4]).unwrap();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        good,
+        "the damaged tail is cut"
+    );
+    draw(&mut f, &gmmu, &draw_regs());
+    assert_eq!(f.rasterizer.draw.shaders.stats().disk_hits, 2);
+    f.assert_no_validation_errors();
+    drop(f);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// An Ampere `op` in `form` with the other bits from `fields`, guarded by PT.

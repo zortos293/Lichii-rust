@@ -42,6 +42,10 @@ impl Region {
             && size <= self.end - self.start
             && addr - self.start <= self.size() - size
     }
+
+    pub const fn overlaps(self, addr: VAddr, size: u64) -> bool {
+        addr < self.end && addr + size > self.start
+    }
 }
 
 /// Inputs of the address-space layout (`KPageTableBase::InitializeForProcess`).
@@ -297,6 +301,15 @@ impl PageTable {
         Region::new(0, 1 << self.regions.address_space_bits).contains(addr, size)
     }
 
+    /// `CanContain(addr, size, AliasCode)`: inside the ASLR region and clear of the heap and
+    /// alias regions.
+    pub fn can_contain_alias_code(&self, addr: VAddr, size: u64) -> bool {
+        let r = &self.regions;
+        r.alias_code.contains(addr, size)
+            && !r.heap.overlaps(addr, size)
+            && !r.alias.overlaps(addr, size)
+    }
+
     pub fn query(&self, addr: VAddr) -> MemoryInfo {
         self.state.lock().blocks.query(addr)
     }
@@ -456,6 +469,130 @@ impl PageTable {
             .check_each(addr, size, Expect::flag(MemoryState::FLAG_MAPPED, 0, 0, 0))?;
         self.protect_space(&s.blocks, addr, size, perm);
         s.blocks.set(addr, size, state, perm, 0);
+        Ok(())
+    }
+
+    /// `MapCodeMemory` (`svcMapProcessCodeMemory`, ro): aliases the heap pages at `src` as
+    /// code at `dst` in the ASLR region. Both stay inaccessible to the process until it
+    /// reprotects `dst` with [`PageTable::set_code_permission`]; `src` stays locked until
+    /// [`PageTable::unmap_code_memory`].
+    pub fn map_code_memory(&self, dst: VAddr, src: VAddr, size: u64) -> HleResult<()> {
+        if !self.can_contain_alias_code(dst, size) {
+            return Err(result::INVALID_MEMORY_REGION);
+        }
+        self.check_args(src, size)?;
+        self.check_args(dst, size)?;
+        let mut s = self.state.lock();
+        let (src_state, _, _) = s.blocks.check(
+            src,
+            size,
+            Expect {
+                state_mask: u32::MAX,
+                state: MemoryState::NORMAL.0,
+                perm_mask: 7,
+                perm: USER_RW.0,
+                attr_mask: u32::MAX,
+                attr: 0,
+            },
+        )?;
+        s.blocks
+            .check(dst, size, Expect::state(MemoryState::FREE, u32::MAX))?;
+        let group = self.physical_runs(src, size);
+        self.protect_space(&s.blocks, src, size, MemoryPermission::NONE);
+        self.map_runs(dst, &group, MemoryPermission::NONE);
+        s.blocks.set(
+            src,
+            size,
+            src_state,
+            MemoryPermission::NONE,
+            attribute::LOCKED,
+        );
+        s.blocks.set(
+            dst,
+            size,
+            MemoryState::ALIAS_CODE,
+            MemoryPermission::NONE,
+            0,
+        );
+        Ok(())
+    }
+
+    /// `UnmapCodeMemory`: undoes [`PageTable::map_code_memory`] and gives `src` back to the
+    /// process as read-write heap.
+    pub fn unmap_code_memory(&self, dst: VAddr, src: VAddr, size: u64) -> HleResult<()> {
+        if !self.can_contain_alias_code(dst, size) {
+            return Err(result::INVALID_MEMORY_REGION);
+        }
+        self.check_args(src, size)?;
+        self.check_args(dst, size)?;
+        let mut s = self.state.lock();
+        s.blocks.check(
+            src,
+            size,
+            Expect {
+                state_mask: u32::MAX,
+                state: MemoryState::NORMAL.0,
+                perm_mask: 0,
+                perm: 0,
+                attr_mask: u32::MAX,
+                attr: attribute::LOCKED,
+            },
+        )?;
+        s.blocks.check_each(
+            dst,
+            size,
+            Expect::flag(
+                MemoryState::FLAG_CAN_CODE_ALIAS,
+                0,
+                0,
+                !attribute::PERMISSION_LOCKED,
+            ),
+        )?;
+        if self.physical_runs(dst, size) != self.physical_runs(src, size) {
+            return Err(result::INVALID_MEMORY_REGION);
+        }
+        self.unmap_space(&s.blocks, dst, size);
+        self.protect_space(&s.blocks, src, size, USER_RW);
+        s.blocks
+            .set(dst, size, MemoryState::FREE, MemoryPermission::NONE, 0);
+        s.blocks.set(src, size, MemoryState::NORMAL, USER_RW, 0);
+        Ok(())
+    }
+
+    /// `SetProcessMemoryPermission` on code: a writable permission turns `Code` into
+    /// `CodeData` (and `AliasCode` into `AliasCodeData`). Making pages executable drops the
+    /// code translated from them, so the process runs what it wrote there.
+    pub fn set_code_permission(
+        &self,
+        addr: VAddr,
+        size: u64,
+        perm: MemoryPermission,
+    ) -> HleResult<()> {
+        self.check_args(addr, size)?;
+        let mut s = self.state.lock();
+        let (old_state, old_perm, _) = s.blocks.check(
+            addr,
+            size,
+            Expect::flag(MemoryState::FLAG_CODE, 0, 0, u32::MAX),
+        )?;
+        let state = if perm.contains(MemoryPermission::WRITE) {
+            match old_state {
+                MemoryState::CODE => MemoryState::CODE_DATA,
+                MemoryState::ALIAS_CODE => MemoryState::ALIAS_CODE_DATA,
+                _ => return Err(result::INVALID_STATE),
+            }
+        } else {
+            old_state
+        };
+        if old_perm == perm && old_state == state {
+            return Ok(());
+        }
+        self.protect_space(&s.blocks, addr, size, perm);
+        s.blocks.set(addr, size, state, perm, 0);
+        if perm.contains(MemoryPermission::EXECUTE) && !old_perm.contains(MemoryPermission::EXECUTE)
+        {
+            (self.invalidate_code)(addr, size);
+        }
         Ok(())
     }
 

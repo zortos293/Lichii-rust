@@ -10,15 +10,22 @@
 //! remembered per device address and recomputed only after a guest write touched it. A hit
 //! is a page table lookup, two map lookups and the replay; it allocates nothing and takes no
 //! lock. Failed translations are cached too: their draws are skipped without translating again.
+//!
+//! With the title's disk cache open, a miss first replays the stored entries that share the
+//! program's probe key (`lichii_shader::cache`) and reuses a module whose every recorded answer
+//! still holds; new translations are appended to the file at the next flush.
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
+use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use lichii_common::settings::ResolutionScale;
 use lichii_common::{DAddr, GpuVAddr};
 use lichii_gpu::gmmu::{Gmmu, RangeTarget};
 use lichii_shader::backend::Bindings;
+use lichii_shader::cache;
 use lichii_shader::profile::HostTranslateInfo;
 use lichii_shader::translate::TranslateOptions;
 use lichii_shader::{
@@ -27,6 +34,7 @@ use lichii_shader::{
 };
 
 use super::environment::{EnvRead, ProgramEnv};
+use super::shader_disk::ShaderDisk;
 use super::{FxBuildHasher, FxHasher};
 
 /// Counts since the cache was created.
@@ -37,6 +45,8 @@ pub struct ShaderCacheStats {
     /// Translations that failed; their draws are skipped.
     pub failed: u64,
     pub hits: u64,
+    /// Programs the disk cache served instead of translating them.
+    pub disk_hits: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +84,7 @@ pub struct ShaderCache {
     segments: BTreeMap<(DAddr, DAddr), u64>,
     longest: u64,
     modules: HashMap<ModuleKey, Vec<Variant>, FxBuildHasher>,
+    disk: Option<ShaderDisk>,
     bytes: Vec<u8>,
     stats: ShaderCacheStats,
 }
@@ -88,6 +99,7 @@ impl ShaderCache {
             segments: BTreeMap::new(),
             longest: 0,
             modules: HashMap::default(),
+            disk: None,
             bytes: Vec::new(),
             stats: ShaderCacheStats::default(),
         }
@@ -99,6 +111,31 @@ impl ShaderCache {
 
     pub fn stats(&self) -> ShaderCacheStats {
         self.stats
+    }
+
+    /// Keeps translated programs in the per-title file at `path` from now on: programs it
+    /// holds are reused instead of translated, and new translations are appended at
+    /// [`Self::flush_disk`].
+    pub fn open_disk(&mut self, path: PathBuf) -> io::Result<()> {
+        self.disk = Some(ShaderDisk::open(path)?);
+        Ok(())
+    }
+
+    /// Appends the programs translated since the last call to the disk cache.
+    pub fn flush_disk(&mut self) {
+        if let Some(disk) = &mut self.disk
+            && let Err(error) = disk.flush()
+        {
+            tracing::warn!("writing the shader cache: {error}");
+        }
+    }
+
+    /// Every module the disk cache holds, by module hash.
+    pub(crate) fn disk_modules(&self) -> HashMap<u64, Arc<ShaderModule>, FxBuildHasher> {
+        self.disk
+            .as_ref()
+            .map(ShaderDisk::modules)
+            .unwrap_or_default()
     }
 
     /// Programs translate for `scale` from now on (resolution rescaling patches them).
@@ -160,18 +197,56 @@ impl ShaderCache {
             resolution_scale: self.scale,
         };
         let runtime = runtime();
-        let result = match a {
-            Some(a) => compile_dual_vertex(a, env, options, &runtime, bindings),
-            None => compile(env, options, &runtime, bindings),
-        };
-        self.stats.translated += 1;
-        let module = match result {
-            Ok(module) => Some(Arc::new(module)),
-            Err(error) => {
-                self.stats.failed += 1;
-                *bindings = first;
-                warn_failed(env, &error);
-                None
+        let a_env = a.map(|a| a as &dyn ShaderEnvironment);
+        let stored = self.disk.as_ref().and_then(|disk| {
+            let key = cache::options_key(options, &runtime, bindings);
+            let probe = cache::probe_key(a_env, env, key);
+            let forget_reads = || {
+                if let Some(a) = a {
+                    a.take_reads();
+                }
+                env.take_reads();
+            };
+            let found = disk.candidates(probe).iter().find(|entry| {
+                forget_reads();
+                entry.matches(a_env, env, key)
+            });
+            if found.is_none() {
+                forget_reads();
+            }
+            found.map(|entry| (entry.module().clone(), entry.bindings_after()))
+        });
+        let module = match stored {
+            Some((module, after)) => {
+                self.stats.disk_hits += 1;
+                *bindings = after;
+                Some(module)
+            }
+            None => {
+                let result = match (&mut self.disk, a) {
+                    (Some(disk), a) => match a {
+                        Some(a) => cache::compile_dual_vertex(a, env, options, &runtime, bindings),
+                        None => cache::compile(env, options, &runtime, bindings),
+                    }
+                    .map(|entry| {
+                        disk.append(&entry);
+                        entry.module().clone()
+                    }),
+                    (None, Some(a)) => {
+                        compile_dual_vertex(a, env, options, &runtime, bindings).map(Arc::new)
+                    }
+                    (None, None) => compile(env, options, &runtime, bindings).map(Arc::new),
+                };
+                self.stats.translated += 1;
+                match result {
+                    Ok(module) => Some(module),
+                    Err(error) => {
+                        self.stats.failed += 1;
+                        *bindings = first;
+                        warn_failed(env, &error);
+                        None
+                    }
+                }
             }
         };
         let key = ModuleKey {

@@ -14,6 +14,7 @@ pub mod key;
 pub mod maxwell_to_vk;
 pub mod sampler;
 pub mod shader_cache;
+mod shader_disk;
 
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;

@@ -60,6 +60,7 @@ mod nvdrv;
 mod pctl;
 mod pl_u;
 mod prepo;
+mod ro;
 mod set;
 mod sockets;
 mod ssl;
@@ -105,6 +106,7 @@ pub fn register_all(context: &Arc<ServiceContext>) -> HleResult<()> {
     ns::register(context)?;
     sockets::register(context)?;
     ssl::register(context)?;
+    ro::register(context)?;
     let nvdrv = nvdrv::register(context)?;
     vi::register(context, nvdrv)?;
     Ok(())
