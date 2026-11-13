@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use lichii_audio::sink::result;
 use lichii_common::ResultCode;
-use lichii_common::settings::{AudioOutput, Settings};
+use lichii_common::settings::Settings;
 use lichii_kernel::handle_table::CURRENT_PROCESS;
 use lichii_kernel::ipc::Handle;
 use lichii_kernel::object::KObject;
@@ -27,9 +27,8 @@ impl Drop for Harness {
 }
 
 fn harness() -> Harness {
-    let mut settings = Settings::default();
-    settings.audio.output = AudioOutput::Null;
-    let (context, client) = crate::testing::context(crate::testing::SWITCH1_TITLE, settings);
+    let (context, client) =
+        crate::testing::context(crate::testing::SWITCH1_TITLE, Settings::default());
     let audio = super::start(&context).unwrap();
     Harness {
         kernel: context.kernel.clone(),
@@ -518,4 +517,13 @@ fn hwopus_holds_at_most_24_decoders() {
     assert_eq!(reply.result, ResultCode::new(HWOPUS, 385));
     let reply = h.send(hwopus, Request::new(4).arg([48_000u32, 3, 0, 0]).arg(0u32));
     assert_eq!(reply.result, ResultCode::new(HWOPUS, 385));
+}
+
+#[test]
+fn audio_services_play_on_the_context_sink() {
+    let (context, _client) =
+        crate::testing::context(crate::testing::SWITCH1_TITLE, Settings::default());
+    let audio = super::start(&context).unwrap();
+    assert!(Arc::ptr_eq(&audio.sink, &context.audio));
+    context.kernel.shutdown();
 }

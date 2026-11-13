@@ -128,8 +128,9 @@ pub enum DescriptorKind {
 /// Bytes of the rescaling push constants: four words of texture scaling bits at offset 0, two
 /// words of image scaling bits at offset 16, the resolution down factor (f32) at offset 24.
 pub const RESCALING_PUSH_CONSTANT_SIZE: u32 = 32;
-/// Bytes of the render-area push constant (a vec4).
-pub const RENDER_AREA_PUSH_CONSTANT_SIZE: u32 = 16;
+/// Bytes of push constants a module that reads the render area uses: the rescaling words, then
+/// the render area vec4 at [`crate::backend::spirv::RENDER_AREA_LAYOUT_OFFSET`] (32).
+pub const RENDER_AREA_PUSH_CONSTANT_SIZE: u32 = 48;
 
 impl ResourceLayout {
     /// The layout of a module translated with `info`, in descriptor set 0 from `first_binding`
@@ -166,10 +167,10 @@ impl ResourceLayout {
         for (i, d) in info.image_descriptors.iter().enumerate() {
             push(DescriptorKind::StorageImage, d.count, i, 1);
         }
-        let push_constant_size = if info.uses_rescaling_uniform {
-            RESCALING_PUSH_CONSTANT_SIZE
-        } else if info.uses_render_area {
+        let push_constant_size = if info.uses_render_area {
             RENDER_AREA_PUSH_CONSTANT_SIZE
+        } else if info.uses_rescaling_uniform {
+            RESCALING_PUSH_CONSTANT_SIZE
         } else {
             0
         };

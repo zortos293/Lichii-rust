@@ -26,11 +26,12 @@ fn main() -> std::process::ExitCode {
     };
 
     let paths = UserPaths::discover();
-    let settings = Settings::load(&paths.settings_file()).unwrap_or_else(|e| {
+    let mut settings = Settings::load(&paths.settings_file()).unwrap_or_else(|e| {
         eprintln!("{e}; using default settings");
         Settings::default()
     });
     lichii_common::init_logging(&settings.debug.log_filter);
+    settings.audio.output = lichii_common::settings::AudioOutput::Null;
 
     let mut system = match System::boot(Arc::new(settings), &title, headless_renderer()) {
         Ok(system) => system,

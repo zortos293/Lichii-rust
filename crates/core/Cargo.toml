@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+lichii-audio.workspace = true
 lichii-common.workspace = true
 lichii-memory.workspace = true
 lichii-cpu.workspace = true

@@ -1,7 +1,7 @@
 //! Audio services that do not need the renderer: `audout:u`, `audin:u`, `audctl` and `hwopus`.
 //!
-//! They share one [`Audio`]: the host sink built from the audio settings and the audio out and
-//! audio in managers that play on it.
+//! They share one [`Audio`]: the host sink `core::System` passes in [`ServiceContext::audio`]
+//! and the audio out and audio in managers that play on it.
 
 mod audctl;
 mod audin;
@@ -34,9 +34,9 @@ pub(crate) fn register(context: &Arc<ServiceContext>) -> HleResult<()> {
     start(context).map(drop)
 }
 
-/// Builds the sink from the audio settings and registers every audio service on it.
+/// Registers every audio service on the context's sink.
 fn start(context: &Arc<ServiceContext>) -> HleResult<Arc<Audio>> {
-    let sink = Arc::new(Sink::new(&context.settings.audio));
+    let sink = context.audio.clone();
     let audio = Arc::new(Audio {
         out: out::Manager::new(sink.clone()),
         input: r#in::Manager::new(sink.clone()),

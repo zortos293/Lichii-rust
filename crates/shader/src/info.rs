@@ -457,6 +457,16 @@ pub enum TexturePixelFormat {
     D24UnormS8Uint,
     S8UintD24Unorm,
     D32FloatS8Uint,
+    Etc2RgbUnorm,
+    Etc2RgbSrgb,
+    Etc2RgbaUnorm,
+    Etc2RgbaSrgb,
+    Etc2RgbPtaUnorm,
+    Etc2RgbPtaSrgb,
+    EacR11Unorm,
+    EacR11Snorm,
+    EacR11G11Unorm,
+    EacR11G11Snorm,
 }
 
 /// Draw parameter a constant buffer word holds when HLE macros replaced it.
