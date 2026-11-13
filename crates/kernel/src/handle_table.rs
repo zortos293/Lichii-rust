@@ -98,6 +98,20 @@ impl HandleTable {
     }
 
     /// Removes every entry (process teardown).
+    /// Every live handle and its object.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (Handle, &KObject)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let entry = entry.as_ref()?;
+                Some((
+                    ((entry.linear_id as u32) << INDEX_BITS) | index as u32,
+                    &entry.object,
+                ))
+            })
+    }
+
     pub fn clear(&mut self) -> Vec<KObject> {
         let objects = self
             .entries

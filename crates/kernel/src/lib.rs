@@ -48,6 +48,7 @@ use lichii_memory::{
 use parking_lot::Mutex;
 
 use crate::arbiter::Arbiter;
+use crate::handle_table::Handle;
 use crate::ipc::{ClientSession, ServiceThread, SessionFactory};
 use crate::live_pc::LivePcs;
 use crate::memory::{MemoryManager, MemoryState, PoolLayout, Region, Regions};
@@ -432,7 +433,7 @@ impl KernelInner {
         for line in self.scheduler.describe(&running) {
             tracing::info!(target: "threads", "{line}");
         }
-        let waits: HashMap<ThreadId, String> = self.arbiter.waits().into_iter().collect();
+        let waits = self.wait_descriptions(&processes);
         for process in processes {
             for thread in process.threads() {
                 let waits_on = waits.get(&thread.id()).map(String::as_str);
@@ -447,6 +448,38 @@ impl KernelInner {
         if self.live_pc_log {
             self.log_live_pcs();
         }
+    }
+
+    /// What each waiting thread waits on: its arbiter key, or every object in a handle table of
+    /// `processes` that lists it as a live waiter.
+    fn wait_descriptions(&self, processes: &[Arc<Process>]) -> HashMap<ThreadId, String> {
+        let mut waits: HashMap<ThreadId, String> = self.arbiter.waits().into_iter().collect();
+        for process in processes {
+            let objects: Vec<(Handle, KObject)> = process
+                .handles()
+                .read()
+                .iter()
+                .filter(|(_, object)| object.sync().is_some())
+                .map(|(handle, object)| (handle, object.clone()))
+                .collect();
+            for (handle, object) in objects {
+                let state = object.sync().expect("waitable").snapshot();
+                if state.waiters.is_empty() {
+                    continue;
+                }
+                let what = object.describe_wait(handle, &state);
+                for thread in state.waiters {
+                    waits
+                        .entry(thread)
+                        .and_modify(|waits_on| {
+                            waits_on.push_str(", ");
+                            waits_on.push_str(&what);
+                        })
+                        .or_insert_with(|| what.clone());
+                }
+            }
+        }
+        waits
     }
 
     /// Samples each core running guest code at [`LIVE_PC_SAMPLES`] consecutive block boundaries

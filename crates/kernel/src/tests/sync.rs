@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lichii_common::ConsoleGeneration;
 use lichii_cpu::ThreadContext;
@@ -694,4 +694,90 @@ fn a_woken_thread_preempts_the_mutex_owner_it_outranks() {
     test.start(test.image(), root);
     test.run_until_exit(Duration::from_secs(30));
     assert_eq!(ran.load(Ordering::SeqCst), ROUNDS, "A ran every round");
+}
+
+/// The watchdog names every object a thread in WaitSynchronization waits on, where it came from,
+/// its signal state and who signalled it last.
+#[test]
+fn the_thread_log_names_the_objects_a_thread_waits_on() {
+    let test = TestKernel::new(ConsoleGeneration::Switch2);
+    let heap = heap_base(&test);
+    let list = heap + 0x2000;
+    let host_event = Arc::new(Event::new());
+    let signaller_event = host_event.clone();
+    std::thread::Builder::new()
+        .name("test-signaller".into())
+        .spawn(move || {
+            signaller_event.signal();
+            signaller_event.clear();
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    let host_handle = Arc::new(AtomicU64::new(0));
+    let guest_handles = Arc::new(Mutex::new((0, 0)));
+    let (h, g) = (host_handle.clone(), guest_handles.clone());
+    let (signal, clear) = (guest_handles.clone(), guest_handles.clone());
+    let main = test.program(
+        Script::new()
+            .svc(0x45, |_, _| {})
+            .then(move |ctx, env| {
+                *g.lock() = (ctx.x[1], ctx.x[2]);
+                env.memory.write(list, ctx.x[2] as u32).unwrap();
+                env.memory
+                    .write(list + 4, h.load(Ordering::SeqCst) as u32)
+                    .unwrap();
+            })
+            .svc(0x11, move |ctx, _| ctx.x[0] = signal.lock().0)
+            .svc(0x12, move |ctx, _| ctx.x[0] = clear.lock().0)
+            .svc(0x18, move |ctx, _| {
+                ctx.x[1] = list;
+                ctx.x[2] = 2;
+                ctx.x[3] = u64::MAX;
+            })
+            .exit(),
+    );
+    let process = test.start(test.image(), main);
+    let host = process
+        .handles()
+        .write()
+        .add(KObject::ReadableEvent(host_event.clone()))
+        .unwrap();
+    host_handle.store(host as u64, Ordering::SeqCst);
+    test.kernel.run().unwrap();
+    let thread = process.threads()[0].id();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let waits_on = loop {
+        if let Some(waits_on) = test
+            .kernel
+            .0
+            .wait_descriptions(std::slice::from_ref(&process))
+            .remove(&thread)
+        {
+            break waits_on;
+        }
+        assert!(Instant::now() < deadline, "the thread never waited");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    let readable = guest_handles.lock().1;
+    let mut objects: Vec<&str> = waits_on.split(", ").collect();
+    objects.sort();
+    let mut expected = vec![
+        format!(
+            "KReadableEvent({readable:#x} origin=svcCreateEvent by thread {thread} signaled=false signals=1 last_signal=thread {thread})"
+        ),
+        format!(
+            "KReadableEvent({host:#x} origin=- signaled=false signals=1 last_signal=host test-signaller)"
+        ),
+    ];
+    expected.sort();
+    assert_eq!(objects, expected);
+    host_event.signal();
+    test.wait_for_exit(Duration::from_secs(5));
+    assert!(
+        test.kernel
+            .0
+            .wait_descriptions(std::slice::from_ref(&process))
+            .is_empty()
+    );
 }

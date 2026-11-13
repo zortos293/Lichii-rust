@@ -312,6 +312,18 @@ fn reply(
     if ctx.reply.len() * 4 > pending.size {
         return Err(result::MESSAGE_TOO_LARGE);
     }
+    for object in ctx.out_copy.iter().chain(&ctx.out_move) {
+        if let KObject::ReadableEvent(event) = object {
+            event.note_origin(|| {
+                let handler = match ctx.request.domain {
+                    Some((_, id)) => server.object(id),
+                    None => server.handler(),
+                };
+                let name = handler.as_ref().map_or("domain", |handler| handler.name());
+                format!("{name} command {}", ctx.request.command)
+            });
+        }
+    }
     let process = pending.thread.process();
     let installed = HANDLES_OFFSET..HANDLES_OFFSET + copies + moves;
     let mut undone = Vec::new();
