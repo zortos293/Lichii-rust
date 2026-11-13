@@ -9,7 +9,9 @@
 //! for a scheduling PCAS. A QMD that runs dispatches, performs its release semaphores, then acts
 //! on its dependent QMD. SET_REPORT_SEMAPHORE_D releases a semaphore after the work before it.
 //!
-//! Inline uploads share the Kepler memory engine's registers on both classes.
+//! Inline uploads share the Kepler memory engine's registers on both classes. On B1C0, an upload
+//! that writes a descriptor's grid from command words GPU work may have written makes its
+//! dispatch indirect ([`ComputeContext::indirect_grid`]).
 
 pub mod pcas;
 pub mod qmd;
@@ -20,7 +22,7 @@ use lichii_common::GpuVAddr;
 use super::EngineContext;
 use super::upload::Upload;
 use crate::backend::{ComputeContext, FenceAction, QmdVersion, Query, QueryKind, ReleaseSize};
-use crate::gmmu::{Gmmu, GpuFault};
+use crate::gmmu::{Gmmu, GpuFault, RangeTarget};
 use crate::host::Reduction;
 use crate::reg_index;
 use pcas::{CHAIN_LIMIT, PcasAction, PcasError};
@@ -34,11 +36,33 @@ const SEND_SIGNALING_PCAS2_B: u32 = reg_index!(Regs, send_signaling_pcas2_b);
 const LOAD_INLINE_QMD_LAST: u32 = reg_index!(Regs, inline_qmd) + QMD_WORDS as u32 - 1;
 const SET_REPORT_SEMAPHORE_D: u32 = reg_index!(Regs, report_semaphore.control);
 
+/// Uploads a LAUNCH looks back at, at most.
+const MAX_UPLOADS: usize = 8;
+/// Byte offset of a version 1.x descriptor's grid.
+const QMD_V2_GRID: u64 = 0xc * 4;
+/// Words of a version 1.x grid.
+const GRID_WORDS: u32 = 2;
+
+/// An inline upload since the last LAUNCH: where it wrote, how many bytes it wrote contiguously
+/// from there (its first line, when linear), and where its first
+/// [`GRID_WORDS`] data words came from when they were contiguous in the command stream.
+#[derive(Clone, Copy)]
+struct UploadSource {
+    target: GpuVAddr,
+    contiguous: u64,
+    source: Option<GpuVAddr>,
+}
+
 /// The compute engine bound to a subchannel.
 pub struct KeplerCompute {
     pub regs: Box<Regs>,
     version: QmdVersion,
     upload: Upload,
+    /// Where the next DATA_UPLOAD word comes from, when the front said.
+    upload_next: Option<GpuVAddr>,
+    uploads: Vec<UploadSource>,
+    /// Data words the last upload received, up to [`GRID_WORDS`].
+    upload_words: u32,
 }
 
 impl KeplerCompute {
@@ -52,7 +76,21 @@ impl KeplerCompute {
                 _ => QmdVersion::V2,
             },
             upload: Upload::default(),
+            upload_next: None,
+            uploads: Vec::with_capacity(MAX_UPLOADS),
+            upload_words: GRID_WORDS,
         }
+    }
+
+    /// See [`Engine::upload_source`](super::Engine::upload_source).
+    pub fn upload_source(&mut self, address: GpuVAddr) {
+        if self.upload_words != 0
+            && self.upload_words < GRID_WORDS
+            && let Some(last) = self.uploads.last_mut()
+        {
+            last.source = None;
+        }
+        self.upload_next = Some(address);
     }
 
     /// The descriptor layout LAUNCH decodes.
@@ -69,11 +107,41 @@ impl KeplerCompute {
         };
         *word = argument;
         match (self.version, method) {
-            (_, EXEC_UPLOAD) => self
-                .upload
-                .exec(&self.regs.upload, self.regs.exec_upload.linear() != 0),
-            (_, DATA_UPLOAD) => self.upload.data(ctx, argument),
-            (QmdVersion::V2, LAUNCH) => self.launch(ctx),
+            (_, EXEC_UPLOAD) => {
+                if self.version == QmdVersion::V2 {
+                    if self.uploads.len() == MAX_UPLOADS {
+                        self.uploads.remove(0);
+                    }
+                    let upload = &self.regs.upload;
+                    let linear = self.regs.exec_upload.linear() != 0;
+                    self.uploads.push(UploadSource {
+                        target: upload.dest.address(),
+                        contiguous: if linear && upload.line_count != 0 {
+                            u64::from(upload.line_length_in)
+                        } else {
+                            0
+                        },
+                        source: None,
+                    });
+                    self.upload_words = 0;
+                }
+                self.upload
+                    .exec(&self.regs.upload, self.regs.exec_upload.linear() != 0)
+            }
+            (_, DATA_UPLOAD) => {
+                if self.upload_words == 0
+                    && let Some(last) = self.uploads.last_mut()
+                {
+                    last.source = self.upload_next;
+                }
+                self.upload_words = (self.upload_words + 1).min(GRID_WORDS);
+                self.upload_next = self.upload_next.map(|address| address + 4);
+                self.upload.data(ctx, argument)
+            }
+            (QmdVersion::V2, LAUNCH) => {
+                self.launch(ctx);
+                self.uploads.clear();
+            }
             (QmdVersion::V2, _) => {}
             (QmdVersion::V3, LAUNCH) => {
                 if let Some(action) = PcasAction::signaling(argument) {
@@ -105,7 +173,21 @@ impl KeplerCompute {
             }
         };
         let qmd = bytemuck::cast_ref::<[u32; QMD_WORDS], QmdV2>(&words);
-        self.dispatch(ctx, qmd.launch(self.regs.code_loc.address()), &words);
+        let grid = address + QMD_V2_GRID;
+        let indirect_grid = self
+            .uploads
+            .iter()
+            .rev()
+            .find(|upload| upload.target == grid)
+            .filter(|upload| upload.contiguous >= u64::from(GRID_WORDS) * 4)
+            .and_then(|upload| upload.source)
+            .filter(|&source| gpu_written(ctx, source, u64::from(GRID_WORDS) * 4));
+        self.dispatch(
+            ctx,
+            qmd.launch(self.regs.code_loc.address()),
+            &words,
+            indirect_grid,
+        );
     }
 
     /// Applies a PCAS to the QMD at `address`, then runs every QMD it makes due, following
@@ -154,7 +236,7 @@ impl KeplerCompute {
         let qmd = bytemuck::cast_ref::<[u32; QMD_WORDS], QmdV3>(&words);
         qmd.check()?;
         match qmd.launch() {
-            Ok(launch) => self.dispatch(ctx, launch, &words),
+            Ok(launch) => self.dispatch(ctx, launch, &words, None),
             Err(error) => tracing::warn!(%error, address, "compute dispatch skipped"),
         }
         for (slot, release) in qmd.release_slots().into_iter().enumerate() {
@@ -235,8 +317,14 @@ impl KeplerCompute {
         );
     }
 
-    fn dispatch(&self, ctx: &mut EngineContext<'_>, launch: qmd::Launch, words: &[u32; QMD_WORDS]) {
-        if launch.grid.contains(&0) || launch.block.contains(&0) {
+    fn dispatch(
+        &self,
+        ctx: &mut EngineContext<'_>,
+        launch: qmd::Launch,
+        words: &[u32; QMD_WORDS],
+        indirect_grid: Option<GpuVAddr>,
+    ) {
+        if launch.block.contains(&0) || (indirect_grid.is_none() && launch.grid.contains(&0)) {
             return;
         }
         let tic = &self.regs.tic;
@@ -257,8 +345,20 @@ impl KeplerCompute {
             linked_samplers: launch.linked_samplers,
             qmd_version: self.version,
             qmd: words,
+            indirect_grid,
         });
     }
+}
+
+/// Whether GPU work may have written any of [`address`, +`size`).
+fn gpu_written(ctx: &EngineContext<'_>, address: GpuVAddr, size: u64) -> bool {
+    let mut written = false;
+    ctx.memory.for_each_range(address, size, |range| {
+        if let RangeTarget::Device(device) = range.target {
+            written |= ctx.written_pages.may_be_written(device, range.size);
+        }
+    });
+    written
 }
 
 fn read_qmd(memory: &Gmmu, address: GpuVAddr) -> Result<[u32; QMD_WORDS], GpuFault> {
@@ -344,6 +444,7 @@ mod tests {
         linked_samplers: bool,
         qmd_version: QmdVersion,
         qmd: [u32; 64],
+        indirect_grid: Option<GpuVAddr>,
     }
 
     #[derive(Default)]
@@ -374,6 +475,7 @@ mod tests {
                 linked_samplers: ctx.linked_samplers,
                 qmd_version: ctx.qmd_version,
                 qmd: *ctx.qmd,
+                indirect_grid: ctx.indirect_grid,
             });
         }
         fn inline_written(&mut self, _c: ChannelId, _m: &Gmmu, address: GpuVAddr, size: u64) {
@@ -417,6 +519,7 @@ mod tests {
                 syncpoints: &self.harness.syncpoints,
                 gob_layout: self.harness.gob_layout,
                 qmd_scheduler: &mut self.harness.qmd_scheduler,
+                written_pages: &self.harness.written_pages,
             };
             self.engine.call_method(&mut ctx, method, argument);
         }
@@ -502,6 +605,136 @@ mod tests {
         w
     }
 
+    /// Uploads a version 1.x grid of 7x3x5 to `target`, its data words from `source` when given.
+    fn upload_grid(rig: &mut Rig, target: u64, source: Option<u64>) {
+        let upload = reg_index!(Regs, upload);
+        rig.call(upload, 8);
+        rig.call(upload + 1, 1);
+        rig.call(upload + 2, (target >> 32) as u32);
+        rig.call(upload + 3, target as u32);
+        rig.call(reg_index!(Regs, exec_upload), 1);
+        if let Some(source) = source {
+            rig.engine.upload_source(source);
+        }
+        rig.call(reg_index!(Regs, data_upload), 7);
+        rig.call(reg_index!(Regs, data_upload), 3 | 5 << 16);
+    }
+
+    #[test]
+    fn a_grid_uploaded_from_gpu_written_words_dispatches_indirectly() {
+        const SOURCE: u64 = 0x5000;
+        let grid = QMD + 0x30;
+        let mut rig = Rig::new(0xb1c0);
+        rig.put_qmd(QMD, &v2_words());
+        upload_grid(&mut rig, grid, Some(SOURCE));
+        rig.launch(QMD);
+        let device = rig.harness.memory.translate(SOURCE).unwrap();
+        rig.harness.written_pages.mark(device, 8);
+        upload_grid(&mut rig, grid, Some(SOURCE + 0x10));
+        rig.launch(QMD);
+        upload_grid(&mut rig, QMD + 0x40, Some(SOURCE + 0x20));
+        rig.launch(QMD);
+        let dispatches: Vec<_> = rig
+            .spy
+            .dispatches
+            .iter()
+            .map(|dispatch| (dispatch.grid, dispatch.indirect_grid))
+            .collect();
+        assert_eq!(
+            dispatches,
+            [
+                ([7, 3, 5], None),
+                ([7, 3, 5], Some(SOURCE + 0x10)),
+                ([7, 3, 5], None),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_grid_from_split_words_or_a_short_upload_stays_direct() {
+        const SOURCE: u64 = 0x5000;
+        let grid = QMD + 0x30;
+        let mut rig = Rig::new(0xb1c0);
+        rig.put_qmd(QMD, &v2_words());
+        let device = rig.harness.memory.translate(SOURCE).unwrap();
+        rig.harness.written_pages.mark(device, 0x100);
+        let upload = reg_index!(Regs, upload);
+        rig.call(upload, 8);
+        rig.call(upload + 1, 1);
+        rig.call(upload + 2, 0);
+        rig.call(upload + 3, grid as u32);
+        rig.call(reg_index!(Regs, exec_upload), 1);
+        rig.engine.upload_source(SOURCE);
+        rig.call(reg_index!(Regs, data_upload), 7);
+        rig.engine.upload_source(SOURCE + 8);
+        rig.call(reg_index!(Regs, data_upload), 3 | 5 << 16);
+        rig.launch(QMD);
+        rig.call(upload, 4);
+        rig.call(reg_index!(Regs, exec_upload), 1);
+        rig.engine.upload_source(SOURCE + 0x10);
+        rig.call(reg_index!(Regs, data_upload), 7);
+        rig.launch(QMD);
+        rig.call(upload, 4);
+        rig.call(upload + 1, 2);
+        rig.call(reg_index!(Regs, exec_upload), 1);
+        rig.engine.upload_source(SOURCE + 0x20);
+        rig.call(reg_index!(Regs, data_upload), 7);
+        rig.call(reg_index!(Regs, data_upload), 3 | 5 << 16);
+        rig.launch(QMD);
+        let indirect: Vec<_> = rig.spy.dispatches.iter().map(|d| d.indirect_grid).collect();
+        assert_eq!(indirect, [None, None, None]);
+    }
+
+    #[test]
+    fn an_indirect_grid_dispatches_even_when_the_guest_copy_is_zero() {
+        const SOURCE: u64 = 0x5000;
+        let mut rig = Rig::new(0xb1c0);
+        rig.put_qmd(QMD, &v2_words());
+        let device = rig.harness.memory.translate(SOURCE).unwrap();
+        rig.harness.written_pages.mark(device, 8);
+        let upload = reg_index!(Regs, upload);
+        rig.call(upload, 8);
+        rig.call(upload + 1, 1);
+        rig.call(upload + 2, 0);
+        rig.call(upload + 3, (QMD + 0x30) as u32);
+        rig.call(reg_index!(Regs, exec_upload), 1);
+        rig.engine.upload_source(SOURCE);
+        rig.call(reg_index!(Regs, data_upload), 0);
+        rig.call(reg_index!(Regs, data_upload), 0);
+        rig.launch(QMD);
+        rig.call(upload + 3, (QMD + 0x40) as u32);
+        rig.call(reg_index!(Regs, exec_upload), 1);
+        rig.call(reg_index!(Regs, data_upload), 0);
+        rig.call(reg_index!(Regs, data_upload), 0);
+        rig.put_qmd(QMD, &{
+            let mut words = v2_words();
+            words[12] = 0;
+            words
+        });
+        rig.launch(QMD);
+        let dispatches: Vec<_> = rig
+            .spy
+            .dispatches
+            .iter()
+            .map(|d| (d.grid, d.indirect_grid))
+            .collect();
+        assert_eq!(dispatches, [([0, 0, 0], Some(SOURCE))]);
+    }
+
+    #[test]
+    fn upload_sources_follow_the_data_words() {
+        const SOURCE: u64 = 0x5000;
+        let grid = QMD + 0x30;
+        let mut rig = Rig::new(0xb1c0);
+        rig.put_qmd(QMD, &v2_words());
+        let device = rig.harness.memory.translate(SOURCE + 0x1000).unwrap();
+        rig.harness.written_pages.mark(device, 4);
+        upload_grid(&mut rig, QMD + 0x80, Some(SOURCE + 0x1000 - 8));
+        upload_grid(&mut rig, grid, None);
+        rig.launch(QMD);
+        assert_eq!(rig.spy.dispatches[0].indirect_grid, Some(SOURCE + 0x1000));
+    }
+
     #[test]
     fn v2_launch_decodes_end_to_end() {
         let mut rig = Rig::new(0xb1c0);
@@ -547,6 +780,7 @@ mod tests {
                 linked_samplers: true,
                 qmd_version: QmdVersion::V2,
                 qmd: words,
+                indirect_grid: None,
             }]
         );
         assert!(rig.spy.queries.is_empty());
@@ -580,6 +814,7 @@ mod tests {
                 linked_samplers: false,
                 qmd_version: QmdVersion::V3,
                 qmd: words,
+                indirect_grid: None,
             }]
         );
     }

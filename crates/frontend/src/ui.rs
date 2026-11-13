@@ -3,10 +3,12 @@
 use std::time::Instant;
 
 use egui::{Align, Color32, Layout, RichText, Ui};
-use lichii_common::settings::HotkeyAction;
+use lichii_common::settings::{AntiAliasing, HotkeyAction, ScalingFilter};
+
 use lichii_vulkan::present::Viewport;
 
 use crate::app::{Action, App};
+use crate::choices::Choice;
 use crate::game_list::format_size;
 
 impl App {
@@ -17,7 +19,7 @@ impl App {
                 egui::MenuBar::new().ui(ui, |ui| self.menus(ui, actions));
             });
             if self.settings.ui.show_status_bar {
-                egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+                egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui, actions));
             }
         }
         if self.session.is_some() {
@@ -130,7 +132,7 @@ impl App {
         });
     }
 
-    fn status_bar(&self, ui: &mut Ui) {
+    fn status_bar(&self, ui: &mut Ui, actions: &mut Vec<Action>) {
         ui.horizontal(|ui| {
             let message = match (self.current_toast(), &self.session) {
                 (Some(toast), _) => toast.to_string(),
@@ -161,15 +163,41 @@ impl App {
                     None => format!("Speed: {speed:.0}%"),
                 });
                 ui.separator();
-                let (num, den) = g.resolution_scale.ratio();
-                let scale = num as f32 / den as f32;
-                ui.label(format!("Scale: {scale}x"));
-                ui.separator();
                 ui.label(if self.settings.system.docked {
                     "Docked"
                 } else {
                     "Handheld"
                 });
+                ui.separator();
+                let aa = match g.anti_aliasing {
+                    AntiAliasing::None => "NO AA".to_owned(),
+                    aa => aa.label().to_uppercase(),
+                };
+                let aa = ui
+                    .button(aa)
+                    .on_hover_text("Anti-aliasing. Click to cycle, right-click to pick.");
+                if aa.clicked() {
+                    actions.push(Action::SetAntiAliasing(g.anti_aliasing.next()));
+                }
+                pick_menu(&aa, g.anti_aliasing, actions, Action::SetAntiAliasing);
+                let filter = ui
+                    .button(match g.scaling_filter {
+                        ScalingFilter::NearestNeighbor => "NEAREST".to_owned(),
+                        ScalingFilter::Fsr => "FSR".to_owned(),
+                        filter => filter.label().to_uppercase(),
+                    })
+                    .on_hover_text("Scaling filter. Click to cycle, right-click to pick.");
+                if filter.clicked() {
+                    actions.push(Action::SetScalingFilter(g.scaling_filter.next()));
+                }
+                pick_menu(&filter, g.scaling_filter, actions, Action::SetScalingFilter);
+                let (num, den) = g.resolution_scale.ratio();
+                let scale = num as f32 / den as f32;
+                ui.menu_button(format!("Scale: {scale}x"), |ui| {
+                    pick_list(ui, g.resolution_scale, actions, Action::SetResolution);
+                })
+                .response
+                .on_hover_text("The resolution scaling multiplier; applies to the running game.");
             });
         });
     }
@@ -332,5 +360,32 @@ impl App {
                 ui.hyperlink("https://github.com/zortos293/lichii-rust");
             });
         self.ui.about = about;
+    }
+}
+
+/// A right-click menu on `response` listing every value of a setting, the current one marked.
+fn pick_menu<T: Choice>(
+    response: &egui::Response,
+    current: T,
+    actions: &mut Vec<Action>,
+    action: fn(T) -> Action,
+) {
+    response.context_menu(|ui| pick_list(ui, current, actions, action));
+}
+
+fn pick_list<T: Choice>(
+    ui: &mut Ui,
+    current: T,
+    actions: &mut Vec<Action>,
+    action: fn(T) -> Action,
+) {
+    for &value in T::ALL {
+        if ui
+            .selectable_label(value == current, value.label())
+            .clicked()
+        {
+            actions.push(action(value));
+            ui.close();
+        }
     }
 }

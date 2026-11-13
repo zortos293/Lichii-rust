@@ -591,6 +591,7 @@ fn compute_programs_key_on_their_local_memory_size() {
             linked_samplers: false,
             qmd_version: QmdVersion::V2,
             qmd: &qmd,
+            indirect_grid: None,
         });
     };
     dispatch(&mut f, 0);
