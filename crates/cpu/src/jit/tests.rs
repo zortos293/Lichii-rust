@@ -1906,7 +1906,10 @@ fn zero_factor_products_stay_native() {
     let fused_slow = u32::from(!std::arch::is_x86_feature_detected!("fma"));
     for line in [
         "native FP slow paths, FPSR.IXC clear: 1\n".to_string(),
-        format!("native FP slow paths, inputs or result: {}\n", 1 + fused_slow),
+        format!(
+            "native FP slow paths, inputs or result: {}\n",
+            1 + fused_slow
+        ),
         "FP 2-source 0x1e200800".to_string(),
     ] {
         assert!(table.contains(&line), "{line:?} in\n{table}");
