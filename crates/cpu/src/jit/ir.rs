@@ -5,6 +5,7 @@
 //! one [`Terminal`]. Values only refer to earlier ops. Passes replace the ops they remove with
 //! [`Op::Nop`] instead of renumbering.
 
+use super::simd::SimdOp;
 use crate::decoder::AtomicOp;
 
 /// The result of the op at this index in [`Block::ops`].
@@ -250,6 +251,8 @@ pub enum Op {
         word: u32,
         pc: u64,
     },
+    /// A SIMD/FP operation the JIT lowers natively, defined by `jit::simd`.
+    Simd(SimdOp),
 }
 
 impl Op {
@@ -270,6 +273,7 @@ impl Op {
             | Op::SbcFlags(..)
             | Op::LogicFlags(..) => Ty::Nzcv,
             Op::TestCond(..) | Op::IsZero(..) | Op::TestBit(..) => Ty::U1,
+            Op::Simd(s) => s.ty(),
             _ => Ty::U64,
         }
     }
@@ -308,6 +312,7 @@ impl Op {
             | Op::Fence
             | Op::High
             | Op::CallSimd { .. } => {}
+            Op::Simd(s) => s.for_each_arg(&mut f),
             Op::StoreExclusive128 {
                 addr, low, high, ..
             } => {

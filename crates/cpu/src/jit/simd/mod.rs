@@ -1,5 +1,15 @@
 //! The JIT side of the SIMD/FP data-processing group.
+//!
+//! Instructions [`lower`] recognises become [`SimdOp`]s that the backend compiles inline. Every
+//! other one becomes `Op::CallSimd`, which runs the interpreter's `simd::execute` on the live
+//! context through [`call`].
 
+mod ir;
+mod translate;
+mod x64;
+
+pub(super) use self::ir::SimdOp;
+pub(super) use self::translate::lower;
 use super::JitState;
 use crate::interpreter::simd::execute;
 use crate::{CpuFault, ThreadContext};
