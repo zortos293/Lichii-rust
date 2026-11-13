@@ -1350,3 +1350,90 @@ fn constant_buffer_banks_past_the_hardware_slots_read_zero() {
         .count();
     assert_eq!(uniforms, 0);
 }
+
+/// A compute program of `units` * 4 instructions. Each unit is a branch on P0 over the next
+/// `4 * span - 1` instructions, two moves and a store, so with a span above one the skipped
+/// ranges interleave and every branch needs goto variables.
+fn branchy(units: usize, span: usize) -> TestEnv {
+    let mut code = Vec::new();
+    let mut branches = Vec::new();
+    for u in 0..units as u64 {
+        let r = u % 14 + 1;
+        branches.push(code.len());
+        code.push(0);
+        code.push(encode(
+            Sass::Mov32i,
+            (7 << 16) | ((u & 0xfff) << 20) | (0xf << 12) | r,
+        ));
+        code.push(encode(
+            Sass::Mov32i,
+            (7 << 16) | (((u * 7) & 0xfff) << 20) | (0xf << 12) | (r % 14 + 1),
+        ));
+        code.push(encode(
+            Sass::Sts,
+            (7 << 16) | (4 << 48) | ((u % 64) << 22) | (0xff << 8) | r,
+        ));
+    }
+    code.push(encode(Sass::Exit, (7 << 16) | 0xf));
+    let addr = |i: usize| 8 * (i + i / 3 + 1) as i64;
+    for &b in &branches {
+        let target = (b + 4 * span - 1).min(code.len() - 1);
+        code[b] = encode(
+            Sass::Bra,
+            relative((addr(target) - addr(b) - 8) as i32) | 0xf,
+        );
+    }
+    TestEnv::new(&code)
+}
+
+#[test]
+fn interleaved_forward_branches_translate_in_linear_time() {
+    let env = branchy(4000, 3);
+    let start = std::time::Instant::now();
+    let program = translate_env(&env);
+    let elapsed = start.elapsed();
+    let mut bindings = Bindings::default();
+    emit_spirv(
+        &Profile::default(),
+        &RuntimeInfo::default(),
+        &program,
+        &mut bindings,
+    )
+    .unwrap();
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "16k branchy instructions took {elapsed:?}"
+    );
+}
+
+#[test]
+#[ignore = "benchmark: cargo test --release -p lichii-shader --lib bench_branchy -- --ignored --nocapture"]
+fn bench_branchy_translation() {
+    for (units, span) in [
+        (5000, 1),
+        (1000, 3),
+        (2000, 3),
+        (5000, 3),
+        (1000, 8),
+        (5000, 8),
+    ] {
+        let env = branchy(units, span);
+        let start = std::time::Instant::now();
+        let program = translate_env(&env);
+        let translated = start.elapsed();
+        let start = std::time::Instant::now();
+        let mut bindings = Bindings::default();
+        emit_spirv(
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &program,
+            &mut bindings,
+        )
+        .unwrap();
+        println!(
+            "span {span}, {} instructions: translate {translated:?}, emit {:?}",
+            units * 4,
+            start.elapsed()
+        );
+    }
+}

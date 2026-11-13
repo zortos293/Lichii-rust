@@ -66,7 +66,8 @@ impl Frame {
 
 #[derive(Default)]
 struct Pass {
-    defs: FxHashMap<(u32, u32), Def>,
+    defs: Vec<Vec<Option<Def>>>,
+    goto_defs: FxHashMap<(u32, u32), Def>,
     incomplete: FxHashMap<u32, Vec<(u32, InstId)>>,
     sealed: Vec<bool>,
     stack: Vec<Frame>,
@@ -106,8 +107,30 @@ fn try_remove_trivial_phi(prog: &mut Program, phi: InstId, block: BlockId, var: 
 }
 
 impl Pass {
+    fn def(&self, var: u32, block: BlockId) -> Option<Def> {
+        if var >= GOTO_BASE {
+            return self.goto_defs.get(&(block.0, var)).copied();
+        }
+        self.defs[var as usize]
+            .get(block.0 as usize)
+            .copied()
+            .flatten()
+    }
+
+    fn set_def(&mut self, var: u32, block: BlockId, def: Def) {
+        if var >= GOTO_BASE {
+            self.goto_defs.insert((block.0, var), def);
+            return;
+        }
+        let defs = &mut self.defs[var as usize];
+        if defs.is_empty() {
+            defs.resize(self.sealed.len(), None);
+        }
+        defs[block.0 as usize] = Some(def);
+    }
+
     fn write(&mut self, var: u32, block: BlockId, value: Value) {
-        self.defs.insert((block.0, var), Def::Value(value));
+        self.set_def(var, block, Def::Value(value));
     }
 
     fn read(&mut self, prog: &mut Program, var: u32, root: BlockId) -> Value {
@@ -118,7 +141,7 @@ impl Pass {
             let top = self.stack.len() - 1;
             let block = self.stack[top].block;
             match self.stack[top].pc {
-                Status::Start => match self.defs.get(&(block.0, var)).copied() {
+                Status::Start => match self.def(var, block) {
                     Some(Def::Value(v)) => {
                         self.stack[top].result = v;
                         self.set_value(var);
@@ -140,7 +163,7 @@ impl Pass {
                         self.stack.push(Frame::new(pred));
                     }
                     None => {
-                        self.defs.insert((block.0, var), Def::Pending);
+                        self.set_def(var, block, Def::Pending);
                         self.stack[top].operands_begin = self.pending_operands.len();
                         self.prepare_phi_operand(prog, var);
                     }
@@ -276,10 +299,19 @@ fn flag_variable(op: Opcode) -> Option<u32> {
 pub fn ssa_rewrite(prog: &mut Program) {
     let mut pass = Pass {
         sealed: vec![false; prog.num_blocks()],
+        defs: vec![Vec::new(); GOTO_BASE as usize],
         ..Pass::default()
     };
     let order: Vec<BlockId> = prog.post_order.iter().rev().copied().collect();
     for &block in &order {
+        if prog
+            .block(block)
+            .predecessors
+            .iter()
+            .all(|pred| pass.sealed[pred.0 as usize])
+        {
+            pass.seal(prog, block);
+        }
         let mut cur = prog.block(block).first();
         while let Some(id) = cur {
             cur = prog.inst(id).next();

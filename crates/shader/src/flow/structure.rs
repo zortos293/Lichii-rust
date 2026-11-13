@@ -322,6 +322,7 @@ impl<'a> GotoPass<'a> {
         for &goto_stmt in gotos.iter().rev() {
             pass.remove_goto(goto_stmt)?;
         }
+        pass.reset_goto_variables();
         Ok(pass.tree)
     }
 
@@ -352,14 +353,6 @@ impl<'a> GotoPass<'a> {
             let label = labels[&block_id];
             let ip = self.tree.s(label).next;
             let id = self.tree.label_id(label);
-            let reset = self.tree.create(
-                Kind::SetVariable {
-                    id,
-                    op: self.false_expr,
-                },
-                ROOT,
-            );
-            self.tree.push_front(ROOT, reset);
             let reset = self.tree.create(
                 Kind::SetVariable {
                     id,
@@ -434,6 +427,83 @@ impl<'a> GotoPass<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Sets every goto variable that is read to false just before its first use, in the
+    /// innermost list holding all its uses. Without gotos the tree enters a list only at its
+    /// front, so that statement dominates every use, and SSA reads of the variable stop there
+    /// instead of walking back to the entry.
+    fn reset_goto_variables(&mut self) {
+        let vars = self.label_id as usize;
+        let mut first = vec![NIL; vars];
+        let mut last = vec![NIL; vars];
+        let mut read = vec![false; vars];
+        let mut depth = vec![0u32; self.tree.stmts.len()];
+        let mut exprs = Vec::new();
+        let mut stack = vec![(self.tree.s(ROOT).first, 1u32)];
+        while let Some((stmt, level)) = stack.pop() {
+            if stmt == NIL {
+                continue;
+            }
+            stack.push((self.tree.s(stmt).next, level));
+            depth[stmt as usize] = level;
+            let kind = self.tree.s(stmt).kind;
+            match kind {
+                Kind::SetVariable { id, op } => {
+                    let id = id as usize;
+                    if first[id] == NIL {
+                        first[id] = stmt;
+                    }
+                    last[id] = stmt;
+                    exprs.push(op);
+                }
+                Kind::If { cond } | Kind::Loop { cond } | Kind::Break { cond } => exprs.push(cond),
+                _ => {}
+            }
+            while let Some(expr) = exprs.pop() {
+                match self.tree.exprs[expr as usize] {
+                    Expr::Variable(id) => {
+                        let id = id as usize;
+                        if first[id] == NIL {
+                            first[id] = stmt;
+                        }
+                        last[id] = stmt;
+                        read[id] = true;
+                    }
+                    Expr::Not(e) => exprs.push(e),
+                    Expr::Or(a, b) => exprs.extend([a, b]),
+                    Expr::Identity(_) | Expr::IndirectBranchCond(_) => {}
+                }
+            }
+            if kind.has_children() {
+                stack.push((self.tree.s(stmt).first, level + 1));
+            }
+        }
+        for id in 0..vars {
+            if !read[id] {
+                continue;
+            }
+            let (mut a, mut b) = (first[id], last[id]);
+            while depth[b as usize] > depth[a as usize] {
+                b = self.tree.s(b).up;
+            }
+            while depth[a as usize] > depth[b as usize] {
+                a = self.tree.s(a).up;
+            }
+            while self.tree.s(a).up != self.tree.s(b).up {
+                a = self.tree.s(a).up;
+                b = self.tree.s(b).up;
+            }
+            let parent = self.tree.s(a).up;
+            let reset = self.tree.create(
+                Kind::SetVariable {
+                    id: id as u32,
+                    op: self.false_expr,
+                },
+                parent,
+            );
+            self.tree.insert(parent, a, reset);
+        }
     }
 
     fn goto(&mut self, before: StmtId, cond: ExprId, label: StmtId) -> StmtId {
