@@ -11,6 +11,7 @@ use std::sync::mpsc;
 
 use lichii_common::GpuVAddr;
 
+use crate::activity::{Activity, Wait};
 use crate::back::{Back, SideCommand};
 use crate::backend::{ChannelId, ReleaseSize};
 use crate::engines::EngineKind;
@@ -117,6 +118,7 @@ pub(crate) enum Link {
 
 /// The front's end of the stream.
 pub(crate) struct Stream {
+    activity: Arc<Activity>,
     producer: Producer,
     link: Link,
     side: mpsc::Sender<SideCommand>,
@@ -135,8 +137,10 @@ impl Stream {
         link: Link,
         side: mpsc::Sender<SideCommand>,
         fetch_syncs: Arc<FetchSyncs>,
+        activity: Arc<Activity>,
     ) -> Self {
         Self {
+            activity,
             producer,
             link,
             side,
@@ -265,7 +269,10 @@ impl Stream {
         self.flush_pending();
         self.producer.publish();
         match &mut self.link {
-            Link::Thread => self.producer.wait_consumed(self.producer.position()),
+            Link::Thread => {
+                let _waiting = self.activity.waiting(Wait::FrontWaitingForBack);
+                self.producer.wait_consumed(self.producer.position());
+            }
             Link::Inline(back) => {
                 let (back, consumer) = &mut **back;
                 back.run(consumer);
@@ -347,7 +354,10 @@ impl Stream {
         while !self.producer.try_reserve(len) {
             self.producer.publish();
             match &mut self.link {
-                Link::Thread => self.producer.wait_for_room(),
+                Link::Thread => {
+                    let _waiting = self.activity.waiting(Wait::FrontWaitingForBack);
+                    self.producer.wait_for_room();
+                }
                 Link::Inline(back) => {
                     let (back, consumer) = &mut **back;
                     back.run(consumer);

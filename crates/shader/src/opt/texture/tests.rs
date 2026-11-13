@@ -970,7 +970,11 @@ fn descriptor_reads_are_memoized_per_handle() {
     let info = run(&env, &mut prog, &host(1024));
     assert_eq!(info.texture_descriptors.len(), 2);
     assert_eq!(env.type_reads.get(), 2);
-    assert_eq!(env.cbuf_reads.get(), 2);
+    assert_eq!(
+        env.cbuf_reads.get(),
+        6,
+        "the default by-words queries (type, integer, multisample) read the handle once each"
+    );
 }
 
 #[test]

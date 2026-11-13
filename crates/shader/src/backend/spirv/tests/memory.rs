@@ -206,9 +206,7 @@ fn global_loads_stores_and_atomics_call_the_routing_functions() {
     assert!(matches!(error, EmitError::Unsupported(_)), "{error}");
 
     for (op, args) in [
-        (Opcode::LoadGlobalU8, &[address][..]),
-        (Opcode::WriteGlobalS16, &[address, Value::U32(0)]),
-        (Opcode::GlobalAtomicIAdd64, &[address, Value::U64(1)]),
+        (Opcode::GlobalAtomicIAdd64, &[address, Value::U64(1)][..]),
         (
             Opcode::GlobalAtomicCompareExchange64,
             &[address, Value::U64(1), Value::U64(2)],
@@ -220,6 +218,108 @@ fn global_loads_stores_and_atomics_call_the_routing_functions() {
             "{op:?}: {error}"
         );
     }
+}
+
+#[test]
+fn narrow_global_accesses_use_narrow_views_or_their_containing_word() {
+    let mut s = Synthetic::new();
+    let (b, _) = compute_block(&mut s);
+    let address = Value::U64(0x8000_1003);
+    for (load, write) in [
+        (Opcode::LoadGlobalU8, Opcode::WriteGlobalU8),
+        (Opcode::LoadGlobalS8, Opcode::WriteGlobalS8),
+        (Opcode::LoadGlobalU16, Opcode::WriteGlobalU16),
+        (Opcode::LoadGlobalS16, Opcode::WriteGlobalS16),
+    ] {
+        let value = s.inst(b, load, &[address]);
+        s.inst(b, write, &[address, value]);
+    }
+    let base = global_memory_info(0x110);
+    let info = ShaderInfo {
+        uses_int8: true,
+        uses_int16: true,
+        uses_global_increment: false,
+        uses_global_decrement: false,
+        uses_atomic_f32_add: false,
+        used_storage_buffer_types: base.used_storage_buffer_types | Type::U8 | Type::U16,
+        ..base
+    };
+    let program = finish_compute(s, b, info);
+
+    let words = Profile {
+        support_int64: true,
+        min_ssbo_alignment: 4,
+        ..Profile::default()
+    };
+    let module = emit(
+        "global_small_words",
+        &words,
+        &RuntimeInfo::default(),
+        &program,
+    );
+    assert_eq!(count_entry_ops(&module, Op::FunctionCall), 8);
+    assert_eq!(count_ops(&module, Op::BitFieldUExtract), 2);
+    assert_eq!(count_ops(&module, Op::BitFieldSExtract), 2);
+    assert_eq!(
+        count_ops(&module, Op::AtomicCompareExchange),
+        1,
+        "narrow stores go through the compare-exchange loop"
+    );
+
+    let views = Profile {
+        support_int64: true,
+        support_int8: true,
+        support_int16: true,
+        support_storage_buffer_8bit: true,
+        support_storage_buffer_16bit: true,
+        min_ssbo_alignment: 4,
+        ..Profile::default()
+    };
+    let module = emit(
+        "global_small_views",
+        &views,
+        &RuntimeInfo::default(),
+        &program,
+    );
+    assert_eq!(count_entry_ops(&module, Op::FunctionCall), 8);
+    assert_eq!(count_ops(&module, Op::BitFieldUExtract), 0);
+    assert_eq!(count_ops(&module, Op::AtomicCompareExchange), 0);
+    assert!(module.capabilities.iter().any(|c| c.operands
+        == [Operand::Capability(
+            rspirv::spirv::Capability::StorageBuffer8BitAccess
+        )]));
+}
+
+/// Narrow integers elsewhere in a program that only makes 32-bit global accesses declare no
+/// narrow storage views, so no narrow global routing may refer to them.
+#[test]
+fn wide_global_accesses_beside_narrow_integers_stay_valid() {
+    let mut s = Synthetic::new();
+    let (b, _) = compute_block(&mut s);
+    let address = Value::U64(0x8000_1000);
+    let value = s.inst(b, Opcode::LoadGlobal32, &[address]);
+    s.inst(b, Opcode::WriteGlobal32, &[address, value]);
+    let info = ShaderInfo {
+        uses_int8: true,
+        uses_int16: true,
+        ..global_memory_info(0x110)
+    };
+    let program = finish_compute(s, b, info);
+    let views = Profile {
+        support_int64: true,
+        support_int8: true,
+        support_int16: true,
+        support_storage_buffer_8bit: true,
+        support_storage_buffer_16bit: true,
+        min_ssbo_alignment: 4,
+        ..Profile::default()
+    };
+    emit(
+        "global_wide_beside_narrow",
+        &views,
+        &RuntimeInfo::default(),
+        &program,
+    );
 }
 
 fn storage_atomic_program() -> TranslatedProgram {

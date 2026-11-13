@@ -11,11 +11,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread::{JoinHandle, ThreadId};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lichii_common::DAddr;
 use parking_lot::{Condvar, Mutex};
 
+use crate::activity::{Activity, Wait};
 use crate::back::{Back, SideCommand};
 use crate::backend::{ChannelId, FramebufferConfig, GpuHandles, Rasterizer};
 use crate::channel::{ChannelConfig, GpEntry, Submission, SyncpointFence, SyncpointIncrement};
@@ -208,6 +209,7 @@ struct Front {
     /// fetch synchronisation, so it cannot overtake that channel's earlier entries, and every
     /// command after it waits too.
     held: VecDeque<CpuCommand>,
+    activity: Arc<Activity>,
 }
 
 impl Front {
@@ -224,7 +226,9 @@ impl Front {
         let mut fences = false;
         loop {
             let waiting = self.channels.iter().flatten().any(FrontChannel::is_waiting);
+            let idle = self.activity.waiting(Wait::FrontIdle);
             let closed = inbox.take(&mut batch, (waiting || fences).then_some(poll));
+            drop(idle);
             let busy = !batch.is_empty();
             self.held.append(&mut batch);
             self.handle_held();
@@ -351,6 +355,10 @@ impl Front {
     }
 }
 
+/// How long [`Gpu::shutdown`] waits for the GPU threads, which a renderer call that never
+/// returns can hold forever.
+const STOP_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// The emulated GPU. Every method may be called from any thread and none waits for GPU work
 /// unless it says so; work is executed in the order it was queued.
 pub struct Gpu {
@@ -362,8 +370,10 @@ pub struct Gpu {
     inbox: Arc<Inbox>,
     next_channel: AtomicU32,
     references: Mutex<HashMap<ChannelId, Arc<AtomicU32>>>,
-    /// The front thread, then the back thread when it has one; emptied by `shutdown`.
+    /// The front thread, the back thread when it has one, and the activity reporter; emptied by
+    /// `shutdown`.
     threads: Mutex<Vec<JoinHandle<()>>>,
+    activity: Arc<Activity>,
     /// Ids of those threads, so `shutdown` recognises a GPU thread without taking `threads`.
     thread_ids: Vec<ThreadId>,
 }
@@ -402,14 +412,17 @@ impl Gpu {
         let inbox = Arc::new(Inbox::new());
         handles.syncpoints.semaphore_waiters().attach(&inbox);
         let (producer, consumer) = ring::ring(config.ring_slots, MIN_RING_SLOTS);
+        let back_progress = producer.progress();
         let (side_sender, side_receiver) = mpsc::channel();
         let fetch_syncs = Arc::new(FetchSyncs::new(inbox.clone()));
+        let activity = Arc::new(Activity::new());
         let back = Back::new(
             rasterizer,
             &handles,
             config.engines,
             side_receiver,
             fetch_syncs.clone(),
+            activity.clone(),
         );
         let (link, back) = match config.threading {
             Threading::Split => {
@@ -423,7 +436,7 @@ impl Gpu {
         };
         let front = Front {
             shared: FrontShared {
-                stream: Stream::new(producer, link, side_sender, fetch_syncs),
+                stream: Stream::new(producer, link, side_sender, fetch_syncs, activity.clone()),
                 shared_macros: None,
                 compute_macros: None,
                 words: Vec::new(),
@@ -435,13 +448,24 @@ impl Gpu {
             },
             channels: Vec::new(),
             held: VecDeque::new(),
+            activity: activity.clone(),
         };
         let front_inbox = inbox.clone();
         let front = std::thread::Builder::new()
             .name("gpu-front".into())
             .spawn(move || front.run(front_inbox))
             .expect("failed to start the GPU front thread");
+        let threaded = config.threading == Threading::Split;
+        let reporter = std::thread::Builder::new()
+            .name("gpu-activity".into())
+            .spawn({
+                let activity = activity.clone();
+                let syncpoints = handles.syncpoints.clone();
+                move || activity.report_until_stopped(threaded, &*back_progress, &syncpoints)
+            })
+            .expect("failed to start the GPU activity thread");
         Self {
+            activity,
             host1x,
             handles,
             nx2_memory,
@@ -454,7 +478,12 @@ impl Gpu {
                 .flatten()
                 .map(|thread| thread.thread().id())
                 .collect(),
-            threads: Mutex::new([Some(front), back].into_iter().flatten().collect()),
+            threads: Mutex::new(
+                [Some(front), back, Some(reporter)]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+            ),
         }
     }
 
@@ -632,11 +661,23 @@ impl Gpu {
     /// From a GPU thread (a [`Gpu::run_in_order`] action) it closes the GPU without joining.
     pub fn shutdown(&self) {
         self.inbox.close();
+        self.activity.stop();
         if self.thread_ids.contains(&std::thread::current().id()) {
             tracing::error!("GPU shutdown from a GPU thread; not joining it");
             return;
         }
+        let deadline = Instant::now() + STOP_TIMEOUT;
         for thread in self.threads.lock().drain(..) {
+            while !thread.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if !thread.is_finished() {
+                tracing::error!(
+                    thread = thread.thread().name(),
+                    "a GPU thread did not stop within {STOP_TIMEOUT:?}; leaving it"
+                );
+                continue;
+            }
             if thread.join().is_err() {
                 tracing::error!("a GPU thread panicked");
             }

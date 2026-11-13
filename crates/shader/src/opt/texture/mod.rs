@@ -630,7 +630,6 @@ struct Tracker<'a> {
     env: &'a dyn ShaderEnvironment,
     host: &'a HostTranslateInfo,
     words: FxHashMap<(u32, u32), u32>,
-    handles: FxHashMap<HandleSource, u32>,
     types: FxHashMap<HandleSource, TextureType>,
     integers: FxHashMap<HandleSource, bool>,
     multisamples: FxHashMap<HandleSource, bool>,
@@ -652,7 +651,6 @@ impl<'a> Tracker<'a> {
             env,
             host,
             words: FxHashMap::default(),
-            handles: FxHashMap::default(),
             types: FxHashMap::default(),
             integers: FxHashMap::default(),
             multisamples: FxHashMap::default(),
@@ -674,24 +672,6 @@ impl<'a> Tracker<'a> {
             .or_insert_with(|| env.read_cbuf(index, offset))
     }
 
-    /// The raw handle: the primary word shifted, ORed with the secondary word shifted (with no
-    /// secondary, the primary word itself, as the C++ does).
-    fn handle(&mut self, source: HandleSource) -> u32 {
-        if let Some(&handle) = self.handles.get(&source) {
-            return handle;
-        }
-        let (index, offset, shift) =
-            source
-                .secondary
-                .unwrap_or((source.cbuf_index, source.cbuf_offset, 0));
-        let lhs = self.word(source.cbuf_index, source.cbuf_offset);
-        let rhs = self.word(index, offset);
-        let handle =
-            lhs.checked_shl(source.shift_left).unwrap_or(0) | rhs.checked_shl(shift).unwrap_or(0);
-        self.handles.insert(source, handle);
-        handle
-    }
-
     /// The texture type of the descriptor a handle selects. Handle programs have no descriptor
     /// to read now: they take the type their other instructions name, else 2D.
     fn texture_type(&mut self, cbuf: &CbufAddr) -> TextureType {
@@ -703,8 +683,7 @@ impl<'a> Tracker<'a> {
         if let Some(&ty) = self.types.get(&source) {
             return ty;
         }
-        let handle = self.handle(source);
-        let ty = self.env.texture_type(handle);
+        let ty = self.env.texture_type_of(source);
         self.types.insert(source, ty);
         ty
     }
@@ -717,8 +696,7 @@ impl<'a> Tracker<'a> {
         if let Some(&multisample) = self.multisamples.get(&source) {
             return multisample;
         }
-        let handle = self.handle(source);
-        let multisample = self.env.is_texture_multisample(handle);
+        let multisample = self.env.is_texture_multisample_of(source);
         self.multisamples.insert(source, multisample);
         multisample
     }
@@ -731,8 +709,7 @@ impl<'a> Tracker<'a> {
         if let Some(&integer) = self.integers.get(&source) {
             return integer;
         }
-        let handle = self.handle(source);
-        let integer = self.env.is_texture_pixel_format_integer(handle);
+        let integer = self.env.is_texture_pixel_format_integer_of(source);
         self.integers.insert(source, integer);
         integer
     }
@@ -741,8 +718,7 @@ impl<'a> Tracker<'a> {
         if !cbuf.is_word() {
             return TexturePixelFormat::A8b8g8r8Unorm;
         }
-        let handle = self.handle(cbuf.handle);
-        self.env.texture_pixel_format(handle)
+        self.env.texture_pixel_format_of(cbuf.handle)
     }
 
     /// The type the pass gives `op`'s texture: a size or sample count query carries none and

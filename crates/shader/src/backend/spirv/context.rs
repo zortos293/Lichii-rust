@@ -361,6 +361,10 @@ pub(crate) struct EmitContext<'a> {
     pub write_global_func_u32: Word,
     pub write_global_func_u32x2: Word,
     pub write_global_func_u32x4: Word,
+    /// Untracked 8 and 16-bit global loads: U8, S8, U16, S16, each widened to 32 bits.
+    pub load_global_small_funcs: [Word; 4],
+    /// Untracked 8 and 16-bit global stores of a value's low bits.
+    pub write_global_small_funcs: [Word; 2],
     global_routing: bool,
     global_atomic_funcs: [Word; GlobalAtomic::COUNT],
     atomic_cas_global_func_u32: Word,
@@ -645,6 +649,8 @@ impl<'a> EmitContext<'a> {
             write_global_func_u32: 0,
             write_global_func_u32x2: 0,
             write_global_func_u32x4: 0,
+            load_global_small_funcs: [0; 4],
+            write_global_small_funcs: [0; 2],
             global_routing: false,
             global_atomic_funcs: [0; GlobalAtomic::COUNT],
             atomic_cas_global_func_u32: 0,
@@ -1038,6 +1044,36 @@ impl<'a> EmitContext<'a> {
 
     pub fn storage_type(&self, element: StorageElement) -> StorageTypeDefinition {
         self.storage_types[element as usize]
+    }
+
+    /// The type and storage buffer view that read `bits`-wide integers directly, or `None` when
+    /// the host needs them read from and written to their containing word.
+    pub fn small_storage_view(&self, bits: u32, signed: bool) -> Option<(Word, StorageElement)> {
+        let profile = self.profile;
+        let (supported, storage) = if bits == 8 {
+            (profile.support_int8, profile.support_storage_buffer_8bit)
+        } else {
+            (profile.support_int16, profile.support_storage_buffer_16bit)
+        };
+        if !(supported && storage && profile.support_descriptor_aliasing) {
+            return None;
+        }
+        Some(match (bits, signed) {
+            (8, false) => (self.u8, StorageElement::U8),
+            (8, true) => (self.s8, StorageElement::S8),
+            (_, false) => (self.u16, StorageElement::U16),
+            (_, true) => (self.s16, StorageElement::S16),
+        })
+    }
+
+    /// Bit offset within its word of the `bits`-wide value at global address `addr`.
+    fn global_bit_offset(&mut self, addr: Word, bits: u32) -> EmitResult<Word> {
+        let u32_t = self.u32[1];
+        let low = self.b.u_convert(u32_t, None, addr)?;
+        let mask = self.const_u32(if bits == 8 { 3 } else { 2 });
+        let byte = self.b.bitwise_and(u32_t, None, low, mask)?;
+        let three = self.const_u32(3);
+        Ok(self.b.shift_left_logical(u32_t, None, byte, three)?)
     }
 
     /// The routing function of an untracked 32-bit global atomic, or `None` when no storage
@@ -1441,7 +1477,18 @@ impl<'a> EmitContext<'a> {
                 AttributeType::SignedInt | AttributeType::UnsignedInt
             );
             if runtime.per_primitive_generics & (1 << index) != 0 {
-                return Err(EmitError::Unsupported("per-primitive fragment inputs"));
+                if profile.supported_spirv < 0x0001_0400 {
+                    return Err(EmitError::Unsupported(
+                        "per-primitive fragment inputs below SPIR-V 1.4",
+                    ));
+                }
+                self.add_extension("SPV_EXT_mesh_shader");
+                self.add_capability(Capability::MeshShadingEXT);
+                self.decorate(id, Decoration::PerPrimitiveEXT, &[]);
+                if is_integer {
+                    self.decorate(id, Decoration::Flat, &[]);
+                }
+                continue;
             }
             if is_integer {
                 self.decorate(id, Decoration::Flat, &[]);
@@ -3069,6 +3116,104 @@ impl<'a> EmitContext<'a> {
         Ok(func)
     }
 
+    fn define_global_small_load(&mut self, bits: u32, signed: bool) -> EmitResult<Word> {
+        let (u32_t, u64_t) = (self.u32[1], self.u64);
+        let function_type = self.b.type_function(u32_t, [u64_t]);
+        let func = self
+            .b
+            .begin_function(u32_t, None, FunctionControl::NONE, function_type)?;
+        let addr = self.b.function_parameter(u64_t)?;
+        if let Some((ty, element)) = self.small_storage_view(bits, signed) {
+            let element_pointer = self.storage_type(element).element;
+            let shift = bits / 16;
+            self.route_global(
+                element,
+                addr,
+                element_pointer,
+                shift,
+                &mut |ctx, pointer, _, _| {
+                    let value = ctx.b.load(ty, None, pointer, None, [])?;
+                    let wide = if signed {
+                        ctx.b.s_convert(u32_t, None, value)?
+                    } else {
+                        ctx.b.u_convert(u32_t, None, value)?
+                    };
+                    Ok(ctx.b.ret_value(wide)?)
+                },
+            )?;
+        } else {
+            let u32_element = self.storage_type(StorageElement::U32).element;
+            self.route_global(
+                StorageElement::U32,
+                addr,
+                u32_element,
+                2,
+                &mut |ctx, pointer, _, _| {
+                    let word = ctx.b.load(u32_t, None, pointer, None, [])?;
+                    let bit_offset = ctx.global_bit_offset(addr, bits)?;
+                    let count = ctx.const_u32(bits);
+                    let value = if signed {
+                        ctx.b
+                            .bit_field_s_extract(u32_t, None, word, bit_offset, count)?
+                    } else {
+                        ctx.b
+                            .bit_field_u_extract(u32_t, None, word, bit_offset, count)?
+                    };
+                    Ok(ctx.b.ret_value(value)?)
+                },
+            )?;
+        }
+        let zero = self.u32_zero_value;
+        self.b.ret_value(zero)?;
+        self.b.end_function()?;
+        Ok(func)
+    }
+
+    /// A narrow store where the host has a narrow view, else a compare-exchange loop on the
+    /// containing word so neighbouring bytes written by other invocations survive.
+    fn define_global_small_write(&mut self, bits: u32) -> EmitResult<Word> {
+        let (u32_t, u64_t, void) = (self.u32[1], self.u64, self.void_id);
+        let function_type = self.b.type_function(void, [u64_t, u32_t]);
+        let func = self
+            .b
+            .begin_function(void, None, FunctionControl::NONE, function_type)?;
+        let addr = self.b.function_parameter(u64_t)?;
+        let value = self.b.function_parameter(u32_t)?;
+        if let Some((ty, element)) = self.small_storage_view(bits, false) {
+            let element_pointer = self.storage_type(element).element;
+            self.route_global(
+                element,
+                addr,
+                element_pointer,
+                bits / 16,
+                &mut |ctx, pointer, _, _| {
+                    let narrow = ctx.b.u_convert(ty, None, value)?;
+                    ctx.b.store(pointer, narrow, None, [])?;
+                    Ok(ctx.b.ret()?)
+                },
+            )?;
+        } else {
+            let u32_element = self.storage_type(StorageElement::U32).element;
+            let cas = self.write_storage_cas_loop_func;
+            self.route_global(
+                StorageElement::U32,
+                addr,
+                u32_element,
+                2,
+                &mut |ctx, pointer, _, _| {
+                    let bit_offset = ctx.global_bit_offset(addr, bits)?;
+                    let count = ctx.const_u32(bits);
+                    ctx.b
+                        .function_call(void, None, cas, [pointer, value, bit_offset, count])?;
+                    Ok(ctx.b.ret()?)
+                },
+            )?;
+        }
+        self.b.ret()?;
+        self.b.end_function()?;
+        Ok(func)
+    }
+
     /// The functions that route untracked global loads and stores to the storage buffer
     /// holding the address at run time.
     fn define_global_memory_functions(&mut self) -> EmitResult<()> {
@@ -3092,6 +3237,20 @@ impl<'a> EmitContext<'a> {
             self.define_global_load(StorageElement::U32x4, u32x4_def.element, u32x4, 4)?;
         self.write_global_func_u32x4 =
             self.define_global_write(StorageElement::U32x4, u32x4_def.element, u32x4, 4)?;
+        let narrow = info.used_storage_buffer_types;
+        for (bits, used) in [
+            (8, info.uses_int8 && narrow.contains(Type::U8)),
+            (16, info.uses_int16 && narrow.contains(Type::U16)),
+        ] {
+            if !used {
+                continue;
+            }
+            let index = (bits / 16) as usize;
+            self.load_global_small_funcs[index * 2] = self.define_global_small_load(bits, false)?;
+            self.load_global_small_funcs[index * 2 + 1] =
+                self.define_global_small_load(bits, true)?;
+            self.write_global_small_funcs[index] = self.define_global_small_write(bits)?;
+        }
         self.global_routing = info
             .storage_buffers_descriptors
             .iter()

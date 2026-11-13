@@ -1618,6 +1618,27 @@ fn shutdown_from_a_gpu_callback_during_an_outside_shutdown_finishes() {
 }
 
 #[test]
+fn shutdown_returns_when_a_renderer_call_never_does() {
+    each_mode(|threading| {
+        let gpu = Rig::new(threading).gpu;
+        let (started, wait_started) = std::sync::mpsc::channel();
+        gpu.run_in_order(move |_| {
+            started.send(()).unwrap();
+            loop {
+                std::thread::park();
+            }
+        });
+        wait_started.recv().unwrap();
+        let start = std::time::Instant::now();
+        gpu.shutdown();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "{threading:?}"
+        );
+    });
+}
+
+#[test]
 fn pause_holds_submissions_until_resumed() {
     each_mode(|threading| {
         let mut rig = Rig::new(threading);

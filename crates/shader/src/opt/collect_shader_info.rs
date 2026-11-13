@@ -483,6 +483,15 @@ fn visit_usages(info: &mut ShaderInfo, prog: &Program, id: InstId) {
         info.used_constant_buffer_types |= Type::U32 | Type::U32X2;
         info.used_storage_buffer_types |= Type::U32 | Type::U32X2 | Type::U32X4;
     }
+    match op {
+        LoadGlobalU8 | LoadGlobalS8 | WriteGlobalU8 | WriteGlobalS8 => {
+            info.used_storage_buffer_types |= Type::U8;
+        }
+        LoadGlobalU16 | LoadGlobalS16 | WriteGlobalU16 | WriteGlobalS16 => {
+            info.used_storage_buffer_types |= Type::U16;
+        }
+        _ => {}
+    }
     if matches!(op, LoadLocal | WriteLocal) {
         info.uses_local_memory = true;
     }

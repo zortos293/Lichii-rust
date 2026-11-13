@@ -300,6 +300,48 @@ fn cached_programs_translate_again_only_after_a_guest_write() {
     f.assert_no_validation_errors();
 }
 
+/// A failing program whose translation read a constant buffer word stays skipped when the word
+/// changes between draws, as a per-material bindless handle does.
+#[test]
+fn failed_translations_ignore_the_constant_buffer_words_they_read() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let mut header = header(2, ShaderType::PIXEL);
+    header[18] = 0xf;
+    let unsupported = sass(Opcode::Ast, 2 << 8);
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &program(
+            header,
+            &[
+                sass(Opcode::ImnmxImm, (1 << 20) | 1),
+                sass(Opcode::ShlImm, (2 << 20) | (1 << 8) | 2),
+                sass(Opcode::Ldc, (4 << 48) | (0x100 << 20) | (2 << 8) | 3),
+                sass(Opcode::Brx, (3 << 8) | 0xf),
+                unsupported,
+                exit(),
+                unsupported,
+                exit(),
+            ],
+        ),
+    );
+    let regs = draw_regs();
+    for entry in [0u32, 16, 24] {
+        write(&f, FRAGMENT_CBUF + 0x100, &entry.to_le_bytes());
+        write(&f, FRAGMENT_CBUF + 0x104, &24u32.to_le_bytes());
+        draw(&mut f, &gmmu, &regs);
+    }
+    let stats = f.rasterizer.draw.shaders.stats();
+    assert_eq!(
+        (stats.translated, stats.failed),
+        (2, 1),
+        "the jump table changed, the failure still holds"
+    );
+    f.assert_no_validation_errors();
+}
+
 #[test]
 fn draws_of_untranslatable_programs_are_skipped_without_retrying() {
     let Some((mut f, gmmu)) = draw_fixture() else {
@@ -694,32 +736,42 @@ fn indirect_draws_rebind_buffers_their_commands_merged() {
 }
 
 #[test]
-fn changed_bindless_handles_translate_again() {
+fn changed_bindless_handles_translate_again_only_for_another_kind_of_texture() {
     let Some((mut f, gmmu)) = draw_fixture() else {
         return;
     };
     write(&f, PROGRAMS + u64::from(FRAGMENT), &sampling_program());
     uniform_texture(&f, 0, TEXTURE, [10, 200, 30, 255]);
     uniform_texture(&f, 1, OTHER_TEXTURE, [50, 60, 70, 255]);
-    let regs = sampling_regs();
-    draw(&mut f, &gmmu, &regs);
+    let mut rect = tic(GPU_VA + OTHER_TEXTURE, SIZE, SIZE);
+    rect[5] &= !(1 << 31);
+    write(&f, TIC + 2 * 32, bytemuck::cast_slice(&rect));
+    let mut regs = sampling_regs();
+    regs.tex_header.limit = 2;
+    let sample = |f: &mut Fixture, handle: u32| {
+        write(f, FRAGMENT_CBUF + 0x40, &handle.to_le_bytes());
+        f.rasterizer
+            .invalidate_region(DADDR + FRAGMENT_CBUF + 0x40, 4);
+        draw(f, &gmmu, &regs);
+        f.rasterizer.draw.shaders.stats().translated
+    };
+    assert_eq!(sample(&mut f, 0), 2);
     assert!(
         target(&mut f).iter().all(|&t| t == [10, 200, 30, 255]),
         "the draw samples texture 0"
     );
-    draw(&mut f, &gmmu, &regs);
-    assert_eq!(f.rasterizer.draw.shaders.stats().translated, 2);
-
-    write(&f, FRAGMENT_CBUF + 0x40, &1u32.to_le_bytes());
-    f.rasterizer
-        .invalidate_region(DADDR + FRAGMENT_CBUF + 0x40, 4);
-    draw(&mut f, &gmmu, &regs);
     assert_eq!(
-        f.rasterizer.draw.shaders.stats().translated,
-        3,
-        "the handle the translator read changed"
+        sample(&mut f, 1),
+        2,
+        "another 2D texture under the same program reuses its module"
     );
     assert!(target(&mut f).iter().all(|&t| t == [50, 60, 70, 255]));
+    assert_eq!(sample(&mut f, 0), 2);
+    assert_eq!(
+        sample(&mut f, 2),
+        3,
+        "a rectangle texture changes what the translator answered"
+    );
     f.assert_no_validation_errors();
 }
 
@@ -3122,8 +3174,11 @@ fn task_programs_launch_the_mesh_workgroups_they_count() {
 const GEOMETRY: u64 = PROGRAMS + 0x3000;
 const PRIMITIVE_FRAGMENT: u64 = PROGRAMS + 0x4000;
 
+/// The fragment program reads generic 0, which the geometry header bound with the mesh program
+/// makes per-primitive: it translates with a PerPrimitiveEXT input and the draw builds its
+/// pipeline.
 #[test]
-fn per_primitive_fragment_inputs_skip_the_draw() {
+fn per_primitive_fragment_inputs_draw() {
     let Some((mut f, gmmu)) = mesh_fixture() else {
         return;
     };
@@ -3151,12 +3206,8 @@ fn per_primitive_fragment_inputs_skip_the_draw() {
     bind_program(&mut regs, 5, ShaderType::PIXEL, PRIMITIVE_FRAGMENT);
     mesh_draw(&mut f, &gmmu, &regs, 1);
     let stats = f.rasterizer.draw.shaders.stats();
-    assert_eq!(
-        (stats.translated, stats.failed),
-        (2, 1),
-        "the fragment program reads generic 0, which the geometry header makes per-primitive"
-    );
-    assert_eq!(f.rasterizer.draw.pipelines.stats().built, 0);
+    assert_eq!((stats.translated, stats.failed), (2, 0));
+    assert_eq!(f.rasterizer.draw.pipelines.stats().built, 1);
     f.assert_no_validation_errors();
 }
 

@@ -222,6 +222,11 @@ impl Arena {
     pub(crate) fn take_exposed(&self) -> Vec<usize> {
         self.sys.take_exposed()
     }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn sys(&self) -> &sys::Arena {
+        &self.sys
+    }
 }
 
 impl Drop for Arena {
@@ -625,6 +630,28 @@ mod sys {
         views: Mutex<BTreeMap<usize, View>>,
         /// Tracked pages `place` mapped read-write again, for `take_exposed`.
         exposed: Mutex<Vec<usize>>,
+        #[cfg(test)]
+        pub calls: OsCalls,
+    }
+
+    /// Counts of the placeholder and view calls an arena made, for tests.
+    #[cfg(test)]
+    #[derive(Default)]
+    pub struct OsCalls {
+        pub map: std::sync::atomic::AtomicUsize,
+        pub unmap: std::sync::atomic::AtomicUsize,
+        pub coalesce: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(test)]
+    impl OsCalls {
+        pub fn take(&self) -> (usize, usize, usize) {
+            (
+                self.map.swap(0, Ordering::Relaxed),
+                self.unmap.swap(0, Ordering::Relaxed),
+                self.coalesce.swap(0, Ordering::Relaxed),
+            )
+        }
     }
 
     impl Arena {
@@ -649,6 +676,8 @@ mod sys {
                     size,
                     views: Mutex::new(BTreeMap::new()),
                     exposed: Mutex::default(),
+                    #[cfg(test)]
+                    calls: OsCalls::default(),
                 },
                 base.cast(),
             ))
@@ -666,6 +695,8 @@ mod sys {
         fn coalesce(&self, base: *mut u8, views: &BTreeMap<usize, View>, offset: usize) {
             let (start, end) = Self::gap_around(views, offset, self.size);
             if start < end {
+                #[cfg(test)]
+                self.calls.coalesce.fetch_add(1, Ordering::Relaxed);
                 // SAFETY: [start, end) is a run of free placeholders inside the arena; the call
                 // fails harmlessly when it already is a single placeholder.
                 unsafe {
@@ -691,6 +722,8 @@ mod sys {
             // splitting it out and replacing it with a view of our section is valid. The split
             // fails harmlessly when the range already is the whole placeholder. The view is mapped
             // read-write because its protection at map time caps what VirtualProtect may set later.
+            #[cfg(test)]
+            self.calls.map.fetch_add(1, Ordering::Relaxed);
             unsafe {
                 VirtualFree(
                     base.add(offset).cast(),
@@ -751,6 +784,13 @@ mod sys {
             std::mem::take(&mut *self.exposed.lock())
         }
 
+        #[cfg(test)]
+        pub fn view_count(&self) -> usize {
+            self.views.lock().len()
+        }
+
+        /// Unmaps the views overlapping `[offset, offset + len)`, mapping the parts outside it
+        /// again. Returns whether any view was unmapped, which leaves placeholders to coalesce.
         fn remove_range(
             &self,
             base: *mut u8,
@@ -759,15 +799,18 @@ mod sys {
             offset: usize,
             len: usize,
             tracked: &BTreeSet<usize>,
-        ) -> io::Result<()> {
+        ) -> io::Result<bool> {
             let end = offset + len;
-            let overlapping: Vec<(usize, View)> = views
+            let mut removed = false;
+            while let Some((start, view)) = views
                 .range(..end)
-                .rev()
-                .take_while(|(s, v)| *s + v.len > offset)
+                .next_back()
+                .filter(|(s, v)| **s + v.len > offset)
                 .map(|(s, v)| (*s, *v))
-                .collect();
-            for (start, view) in overlapping {
+            {
+                removed = true;
+                #[cfg(test)]
+                self.calls.unmap.fetch_add(1, Ordering::Relaxed);
                 // SAFETY: start is the base address of a view we mapped.
                 let ok = unsafe {
                     UnmapViewOfFile2(
@@ -797,7 +840,7 @@ mod sys {
                     self.place(base, backing, views, end, tail, tracked)?;
                 }
             }
-            Ok(())
+            Ok(removed)
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -812,8 +855,9 @@ mod sys {
             tracked: &BTreeSet<usize>,
         ) -> io::Result<()> {
             let mut views = self.views.lock();
-            self.remove_range(base, backing, &mut views, offset, len, tracked)?;
-            self.coalesce(base, &views, offset);
+            if self.remove_range(base, backing, &mut views, offset, len, tracked)? {
+                self.coalesce(base, &views, offset);
+            }
             let view = View {
                 len,
                 backing_offset,
@@ -831,8 +875,9 @@ mod sys {
             tracked: &BTreeSet<usize>,
         ) -> io::Result<()> {
             let mut views = self.views.lock();
-            self.remove_range(base, backing, &mut views, offset, len, tracked)?;
-            self.coalesce(base, &views, offset);
+            if self.remove_range(base, backing, &mut views, offset, len, tracked)? {
+                self.coalesce(base, &views, offset);
+            }
             Ok(())
         }
 

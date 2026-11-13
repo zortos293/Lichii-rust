@@ -796,18 +796,24 @@ impl PageTable {
             .map(|p| p.1)
             .sum();
         let group = self.memory.allocate(self.pool, free)?;
-        let mut pages = group
-            .runs
-            .iter()
-            .flat_map(|&(pa, len)| (0..len / PAGE_SIZE).map(move |i| pa + i * PAGE_SIZE));
+        let mut runs = group.runs.iter().copied();
+        let mut run = None;
         for &(start, len, st) in &parts {
             if st != MemoryState::FREE {
                 continue;
             }
-            for page in 0..len / PAGE_SIZE {
-                let pa = pages.next().expect("allocated enough pages");
-                self.space
-                    .map(start + page * PAGE_SIZE, pa, PAGE_SIZE, USER_RW);
+            let mut va = start;
+            while va < start + len {
+                let (pa, size) = run
+                    .take()
+                    .or_else(|| runs.next())
+                    .expect("allocated enough pages");
+                let take = size.min(start + len - va);
+                self.space.map(va, pa, take, USER_RW);
+                if take < size {
+                    run = Some((pa + take, size - take));
+                }
+                va += take;
             }
             s.blocks.set(start, len, MemoryState::NORMAL, USER_RW, 0);
         }

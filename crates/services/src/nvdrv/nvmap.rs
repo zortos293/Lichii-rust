@@ -147,6 +147,17 @@ impl NvMap {
         self.get(id).map(|handle| handle.state.lock().align)
     }
 
+    /// Reads `out.len()` bytes `offset` bytes into the guest memory handle `id` was allocated
+    /// from.
+    pub fn read(&self, id: u32, offset: u64, out: &mut [u8]) -> Result<(), NvResult> {
+        let handle = self.get(id).ok_or(NvResult::BadValue)?;
+        let state = handle.state.lock();
+        let memory = state.memory.as_ref().ok_or(NvResult::InvalidState)?;
+        memory
+            .read_bytes(state.address + offset, out)
+            .map_err(|_| NvResult::InvalidAddress)
+    }
+
     /// Maps the handle into device space if it is not (pins are counted) and returns its device
     /// address.
     pub fn pin(&self, id: u32) -> Result<DAddr, NvResult> {

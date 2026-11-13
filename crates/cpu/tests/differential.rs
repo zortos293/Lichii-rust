@@ -498,6 +498,93 @@ alu_class!(int_to_fp_in_simd, "01x111100x100001110110xxxxxxxxxx");
 alu_class!(fcvt_from_half, "0001111011100010x10000xxxxxxxxxx");
 alu_class!(fp_conditional_compare, "000111100x1xxxxxxxxx01xxxxxxxxxx");
 alu_class!(fnmul, "000111100x1xxxxx100010xxxxxxxxxx");
+alu_class!(scalar_dup, "01011110000xxxxx000001xxxxxxxxxx", |w| w
+    & 0xf_0000
+    != 0);
+alu_class!(faddp_vector, "0x101110x01xxxxx110101xxxxxxxxxx", |w| {
+    w & 0x4040_0000 != 0x0040_0000
+});
+alu_class!(fp_step_vector, "0x001110xx1xxxxx111111xxxxxxxxxx", |w| {
+    w & 0x4040_0000 != 0x0040_0000
+});
+alu_class!(scvtf_vector, "0x0011100x100001110110xxxxxxxxxx", |w| {
+    w & 0x4040_0000 != 0x0040_0000
+});
+
+/// Scalar FMUL, FNMUL, FDIV, the fused multiplies and FMAX/FMIN/FMAXNM/FMINNM on four registers
+/// that MOVI and FNEG keep setting to +0 and -0, so zero factors, zero dividends and pairs of
+/// equal or opposite zeros come up often.
+#[test]
+fn fp_zero_factors() {
+    const OPS: [u32; 11] = [
+        0x1e20_0800,
+        0x1e20_8800,
+        0x1e20_1800,
+        0x1e20_4800,
+        0x1e20_5800,
+        0x1e20_6800,
+        0x1e20_7800,
+        0x1f00_0000,
+        0x1f00_8000,
+        0x1f20_0000,
+        0x1f20_8000,
+    ];
+    differential(
+        "fp_zero_factors",
+        0x1234_5678 ^ line!() as u64,
+        |rng, out| {
+            for _ in 0..1 + rng.below(8) {
+                let reg = |rng: &mut Rng| rng.below(4) as u32;
+                let double = (rng.below(2) as u32) << 22;
+                let word = match rng.below(4) {
+                    0 => 0x2f00_e400 | reg(rng),
+                    1 => 0x1e21_4000 | double | reg(rng) << 5 | reg(rng),
+                    _ => {
+                        let op = OPS[rng.below(OPS.len() as u64) as usize];
+                        let ra = if op >> 24 == 0x1f { reg(rng) << 10 } else { 0 };
+                        op | double | reg(rng) << 16 | ra | reg(rng) << 5 | reg(rng)
+                    }
+                };
+                out.push(word);
+            }
+        },
+    );
+}
+alu_class!(fp_min_max, "000111100x1xxxxx01xx10xxxxxxxxxx");
+alu_class!(fp_compare_vector, "0xx01110xx1xxxxx111001xxxxxxxxxx", |w| {
+    matches!(w & 0xbfa0_fc00, 0x0e20_e400 | 0x2e20_e400 | 0x2ea0_e400)
+        && w & 0x4040_0000 != 0x0040_0000
+});
+/// SQXTN and SQXTN2 on four registers that SSHR keeps shifting into, out of and across the
+/// narrow range, so lanes both saturate and fit.
+#[test]
+fn saturating_narrow() {
+    differential(
+        "saturating_narrow",
+        0x1234_5678 ^ line!() as u64,
+        |rng, out| {
+            for _ in 0..1 + rng.below(8) {
+                let reg = |rng: &mut Rng| rng.below(4) as u32;
+                let size = rng.below(3) as u32;
+                let word = if rng.below(2) == 0 {
+                    let shift = 1 + rng.below(16 << size) as u32;
+                    0x4f00_0400 | ((32 << size) - shift) << 16 | reg(rng) << 5 | reg(rng)
+                } else {
+                    0x0e21_4800
+                        | (rng.below(2) as u32) << 30
+                        | size << 22
+                        | reg(rng) << 5
+                        | reg(rng)
+                };
+                out.push(word);
+            }
+        },
+    );
+}
+alu_class!(fp_estimate, "0xx011101x100001110110xxxxxxxxxx", |w| {
+    w & 0x4040_0000 != 0x0040_0000
+});
+alu_class!(fp_estimate_scalar, "01x111101x100001110110xxxxxxxxxx");
 alu_class!(ext, "0x101110000xxxxx0xxxx0xxxxxxxxxx", |w| w & 0x4000_4000
     != 0x4000);
 alu_class!(

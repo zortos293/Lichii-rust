@@ -399,4 +399,121 @@ mod faults {
             "every page is writable again"
         );
     }
+
+    #[test]
+    fn runs_mapped_over_single_pages_keep_every_alias_tracked() {
+        let faults = AtomicU64::new(0);
+        let Some((space, device)) = tracked_space() else {
+            return;
+        };
+        let fastmem = space.fastmem().unwrap();
+        fastmem.set_fault_handler(Some(count_store), &faults as *const AtomicU64 as usize);
+        let base = fastmem.base();
+        const PAGES: u64 = 16;
+        let (a, b, pa) = (0x4000_0000, 0x5000_0000, 0x10_0000);
+        for i in 0..PAGES {
+            space.map(
+                a + i * 0x1000,
+                pa + i * 0x1000,
+                0x1000,
+                MemoryPermission::READ_WRITE,
+            );
+        }
+        device.map(0x1_0000_0000, pa, PAGES * 0x1000);
+        let _cached = device.cache_pages(0x1_0000_0000, PAGES * 0x1000);
+        space.map(b, pa, PAGES * 0x1000, MemoryPermission::READ_WRITE);
+        let faulting = |va: u64| {
+            let before = faults.load(Ordering::SeqCst);
+            store(base, va, 1);
+            faults.load(Ordering::SeqCst) != before
+        };
+        for i in 0..PAGES {
+            assert!(
+                faulting(a + i * 0x1000),
+                "page {i} of the single-page alias"
+            );
+            assert!(faulting(b + i * 0x1000), "page {i} of the run alias");
+        }
+
+        space.unmap(a, PAGES * 0x1000);
+        space.map(a, 0x20_0000, PAGES * 0x1000, MemoryPermission::READ_WRITE);
+        space.guest_write(b + 0x5008, 2u64).unwrap();
+        for i in 0..PAGES {
+            assert!(!faulting(a + i * 0x1000), "page {i} maps other memory now");
+            assert_eq!(
+                faulting(b + i * 0x1000),
+                i != 5,
+                "page {i} after a CPU write"
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+mod placement {
+    use super::*;
+
+    #[test]
+    fn runs_take_one_view_and_gaps_coalesce_only_after_unmaps() {
+        let Some(space) = fastmem_space() else {
+            return;
+        };
+        let arena = space.fastmem().unwrap().arena().sys();
+        let rw = MemoryPermission::READ_WRITE;
+        arena.calls.take();
+
+        space.map(0x8000_0000, 0x20_0000, 0x20_0000, rw);
+        assert_eq!(arena.view_count(), 1);
+        assert_eq!(arena.calls.take(), (1, 0, 0), "a run is one placement");
+
+        for page in 0..16 {
+            space.map(
+                0x9000_0000 + page * 0x1000,
+                0x40_0000 + page * 0x1000,
+                0x1000,
+                rw,
+            );
+        }
+        assert_eq!(arena.view_count(), 17);
+        assert_eq!(
+            arena.calls.take(),
+            (16, 0, 0),
+            "placing into a free gap neither unmaps nor coalesces"
+        );
+        space.write(0x9000_3008, 0x77u8).unwrap();
+        assert_eq!(host_read::<u8>(&space, 0x9000_3008), 0x77);
+
+        space.unmap(0x9000_0000, 0x1_0000);
+        assert_eq!(arena.calls.take(), (0, 16, 1));
+        space.map(0x8fff_0000, 0x60_0000, 0x4_0000, rw);
+        assert_eq!(arena.view_count(), 2);
+        assert_eq!(
+            arena.calls.take(),
+            (1, 0, 0),
+            "the unmapped pages coalesced back into the gap around them"
+        );
+        space.write(0x9000_3008, 0x88u8).unwrap();
+        assert_eq!(host_read::<u8>(&space, 0x9000_3008), 0x88);
+
+        space.write(0x8000_2000, 0x11u8).unwrap();
+        space.map(0x8000_1000, 0x30_0000, 0x1000, rw);
+        assert_eq!(arena.view_count(), 4);
+        assert_eq!(
+            arena.calls.take(),
+            (3, 1, 1),
+            "a page replaced inside a run maps the run's head and tail again"
+        );
+        assert_eq!(host_read::<u8>(&space, 0x8000_2000), 0x11);
+
+        space.unmap(0x8000_0000, 0x20_0000);
+        space.unmap(0x8fff_0000, 0x4_0000);
+        assert_eq!(arena.view_count(), 0);
+        assert_eq!(arena.calls.take(), (0, 4, 2));
+        space.map(0x8000_0000, 0, 0x400_0000, rw);
+        assert_eq!(
+            arena.calls.take(),
+            (1, 0, 0),
+            "the whole arena is one gap again"
+        );
+    }
 }

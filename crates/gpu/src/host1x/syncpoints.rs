@@ -235,6 +235,20 @@ impl SyncpointBank {
         Ok(Some(ActionHandle { id, serial }))
     }
 
+    /// The threshold of the registered action on `id` that is nearest ahead of its value.
+    pub fn next_action_threshold(&self, id: u32) -> Result<Option<u32>, InvalidSyncpoint> {
+        let slot = self.slot(id)?;
+        if slot.interest.load(Ordering::Acquire) == 0 {
+            return Ok(None);
+        }
+        let actions = slot.actions.lock();
+        let value = slot.value.load(Ordering::Acquire);
+        Ok(actions
+            .iter()
+            .map(|a| a.threshold)
+            .min_by_key(|threshold| threshold.wrapping_sub(value)))
+    }
+
     /// Drops a registered action. False when it already ran (or is running).
     pub fn cancel(&self, handle: ActionHandle) -> bool {
         let Ok(slot) = self.slot(handle.id) else {

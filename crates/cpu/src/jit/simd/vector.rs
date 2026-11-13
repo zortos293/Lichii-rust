@@ -7,15 +7,17 @@
     reason = "dynasm! converts every register operand with into()"
 )]
 
-use dynasmrt::{DynasmApi, dynasm};
+use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
 
 use super::super::ir::{Loc, Op, Ty, Value, W};
 use super::super::translate::Translator;
-use super::super::x64::Emitter;
+use super::super::x64::{CTX_FPSR, Emitter};
 use super::ir::SimdOp;
 use crate::decoder::{Inst, PostIndex, Reg};
 
 const SCRATCH: u8 = 15;
+/// FPSR.QC.
+const QC: i32 = 1 << 27;
 
 /// Byte masks for `CNT`: `0x55`, `0x33` and `0x0f` in every byte.
 #[repr(align(16))]
@@ -101,6 +103,13 @@ pub enum VecOp {
         signed: Option<W>,
         vector: Value,
     },
+    /// Scalar `DUP` (`MOV` from an element): lane `index` of `8 << size` bits, with every other
+    /// bit zero.
+    ScalarDup {
+        size: u8,
+        index: u8,
+        vector: Value,
+    },
     /// `EXT`: bytes `index` onwards of `m:n` (with `n` in the low bytes), 16 of them when `q` is
     /// set and else 8 from the low halves.
     Ext {
@@ -132,6 +141,7 @@ impl VecOp {
                 f(b);
             }
             VecOp::Shift(_, _, _, a)
+            | VecOp::ScalarDup { vector: a, .. }
             | VecOp::Dup(_, a)
             | VecOp::Cnt(_, a)
             | VecOp::Extract { vector: a, .. } => f(a),
@@ -268,6 +278,25 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
     if word & 0x9fe0_8400 == 0x0e00_0400 {
         return copy(t, word);
     }
+    if word & 0xffe0_fc00 == 0x5e00_0400 {
+        let imm5 = field(word, 16, 5);
+        let size = imm5.trailing_zeros() as u8;
+        if size > 3 {
+            return false;
+        }
+        let vector = vec(t, rn);
+        let index = imm5 >> (size + 1);
+        let r = emit(
+            t,
+            VecOp::ScalarDup {
+                size,
+                index,
+                vector,
+            },
+        );
+        t.set(Loc::V(rd), r);
+        return true;
+    }
     if word & 0xbfe0_8400 == 0x2e00_0000 {
         let index = field(word, 11, 4);
         if !q && index >= 8 {
@@ -275,6 +304,13 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         }
         let (n, m) = (vec(t, rn), vec(t, rm));
         let r = emit(t, VecOp::Ext { q, index, n, m });
+        t.set(Loc::V(rd), r);
+        return true;
+    }
+    if word & 0xbf3f_fc00 == 0x0e21_4800 && size < 2 {
+        let n = vec(t, rn);
+        let low = q.then(|| vec(t, rd));
+        let r = t.op(Op::Simd(SimdOp::SatNarrow { size, n, low, word }));
         t.set(Loc::V(rd), r);
         return true;
     }
@@ -707,6 +743,50 @@ impl Emitter<'_> {
         }
     }
 
+    /// `SQXTN`/`SQXTN2`: packs `n` with signed saturation, and sets FPSR.QC unless sign-extending
+    /// the packed lanes again gives back every lane of `n`.
+    pub(super) fn sat_narrow(&mut self, i: usize, size: u8, n: Value, low: Option<Value>) {
+        let n = self.reg(n);
+        let low = low.map(|low| self.reg(low));
+        let d = self.def(Value(i as u32));
+        dynasm!(self.asm ; .arch x64 ; movaps xmm15, Rx(n));
+        match size {
+            0 => dynasm!(self.asm ; .arch x64 ; packsswb xmm15, xmm15),
+            _ => dynasm!(self.asm ; .arch x64 ; packssdw xmm15, xmm15),
+        }
+        match low {
+            Some(low) => dynasm!(self.asm
+                ; .arch x64
+                ; movaps Rx(d), Rx(low)
+                ; punpcklqdq Rx(d), xmm15
+            ),
+            None => dynasm!(self.asm ; .arch x64 ; movq Rx(d), xmm15),
+        }
+        match size {
+            0 => dynasm!(self.asm
+                ; .arch x64
+                ; punpcklbw xmm15, xmm15
+                ; psraw xmm15, 8
+                ; pcmpeqw xmm15, Rx(n)
+            ),
+            _ => dynasm!(self.asm
+                ; .arch x64
+                ; punpcklwd xmm15, xmm15
+                ; psrad xmm15, 16
+                ; pcmpeqd xmm15, Rx(n)
+            ),
+        }
+        let exact = self.asm.new_dynamic_label();
+        dynasm!(self.asm
+            ; .arch x64
+            ; pmovmskb eax, xmm15
+            ; cmp eax, 0xffff
+            ; je =>exact
+            ; or DWORD [r15 + CTX_FPSR], QC
+            ; =>exact
+        );
+    }
+
     pub(super) fn vector(&mut self, i: usize, op: VecOp) {
         let v = Value(i as u32);
         let (d, q) = match op {
@@ -774,6 +854,30 @@ impl Emitter<'_> {
                     (Shift::Sshr, _) => dynasm!(self.asm ; .arch x64 ; psrad Rx(d), n),
                 }
                 (d, q)
+            }
+            VecOp::ScalarDup {
+                size,
+                index,
+                vector,
+            } => {
+                let s = self.reg(vector);
+                let d = self.def(v);
+                self.copy(d, s);
+                if index != 0 {
+                    let bytes = (index << size) as i8;
+                    dynasm!(self.asm ; .arch x64 ; psrldq Rx(d), bytes);
+                }
+                match size {
+                    0 => {
+                        dynasm!(self.asm ; .arch x64 ; movd eax, Rx(d) ; movzx eax, al ; movd Rx(d), eax)
+                    }
+                    1 => {
+                        dynasm!(self.asm ; .arch x64 ; movd eax, Rx(d) ; movzx eax, ax ; movd Rx(d), eax)
+                    }
+                    2 => dynasm!(self.asm ; .arch x64 ; movd eax, Rx(d) ; movd Rx(d), eax),
+                    _ => dynasm!(self.asm ; .arch x64 ; movq Rx(d), Rx(d)),
+                }
+                return;
             }
             VecOp::Ext { q, index, n, m } => {
                 let (n, m) = (self.reg(n), self.reg(m));

@@ -13,6 +13,7 @@ pub mod upload;
 use lichii_common::GpuVAddr;
 use lichii_texture::block_linear::GobLayout;
 
+use crate::activity::Activity;
 use crate::backend::{ChannelId, GpuWrittenPages, Rasterizer};
 use crate::gmmu::Gmmu;
 use crate::host1x::Syncpoints;
@@ -161,6 +162,8 @@ pub struct EngineContext<'a> {
     pub qmd_scheduler: &'a mut kepler_compute::pcas::QmdScheduler,
     /// Device pages GPU work may have written.
     pub written_pages: &'a GpuWrittenPages,
+    /// Counts the renderer calls engines make.
+    pub activity: &'a Activity,
 }
 
 #[cfg(test)]
