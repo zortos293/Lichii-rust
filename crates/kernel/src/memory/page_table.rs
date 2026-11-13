@@ -212,10 +212,15 @@ struct State {
     tls_pages: Vec<TlsPage>,
 }
 
+/// Called with each range whose executable pages an operation unmapped or reprotected, so the
+/// cores drop the code they translated from it.
+pub type CodeInvalidator = Box<dyn Fn(VAddr, u64) + Send + Sync>;
+
 /// The process page table. Every operation validates against the block map, then updates the
 /// block map and the [`AddressSpace`] together under one lock.
 pub struct PageTable {
     space: Arc<AddressSpace>,
+    invalidate_code: CodeInvalidator,
     memory: Arc<MemoryManager>,
     pool: Pool,
     regions: Regions,
@@ -224,15 +229,23 @@ pub struct PageTable {
 
 const USER_RW: MemoryPermission = MemoryPermission::READ_WRITE;
 
+fn has_code(blocks: &BlockMap, addr: VAddr, size: u64) -> bool {
+    blocks
+        .iter_range(addr, size)
+        .any(|(_, block)| block.perm.contains(MemoryPermission::EXECUTE))
+}
+
 impl PageTable {
     pub fn new(
         space: Arc<AddressSpace>,
         memory: Arc<MemoryManager>,
         pool: Pool,
         regions: Regions,
+        invalidate_code: CodeInvalidator,
     ) -> Self {
         let heap_end = regions.heap.start;
         Self {
+            invalidate_code,
             state: Mutex::new(State {
                 blocks: BlockMap::new(space.address_space_bits()),
                 heap_end,
@@ -243,6 +256,24 @@ impl PageTable {
             memory,
             pool,
             regions,
+        }
+    }
+
+    /// Unmaps a range whose blocks `blocks` still describes, dropping translated code from it.
+    fn unmap_space(&self, blocks: &BlockMap, addr: VAddr, size: u64) {
+        let code = has_code(blocks, addr, size);
+        self.space.unmap(addr, size);
+        if code {
+            (self.invalidate_code)(addr, size);
+        }
+    }
+
+    /// Reprotects a range whose blocks `blocks` still describes, dropping translated code from it.
+    fn protect_space(&self, blocks: &BlockMap, addr: VAddr, size: u64, perm: MemoryPermission) {
+        let code = has_code(blocks, addr, size);
+        self.space.protect(addr, size, perm);
+        if code {
+            (self.invalidate_code)(addr, size);
         }
     }
 
@@ -384,7 +415,7 @@ impl PageTable {
                 attribute::LOCKED | attribute::IPC_LOCKED | attribute::DEVICE_SHARED,
             ),
         )?;
-        self.space.unmap(addr, size);
+        self.unmap_space(&s.blocks, addr, size);
         s.blocks
             .set(addr, size, MemoryState::FREE, MemoryPermission::NONE, 0);
         Ok(())
@@ -403,7 +434,7 @@ impl PageTable {
             ),
         )?;
         let group = self.physical_runs(addr, size);
-        self.space.unmap(addr, size);
+        self.unmap_space(&s.blocks, addr, size);
         self.memory.free_group(&group);
         s.blocks
             .set(addr, size, MemoryState::FREE, MemoryPermission::NONE, 0);
@@ -423,7 +454,7 @@ impl PageTable {
         let mut s = self.state.lock();
         s.blocks
             .check_each(addr, size, Expect::flag(MemoryState::FLAG_MAPPED, 0, 0, 0))?;
-        self.space.protect(addr, size, perm);
+        self.protect_space(&s.blocks, addr, size, perm);
         s.blocks.set(addr, size, state, perm, 0);
         Ok(())
     }
@@ -461,7 +492,7 @@ impl PageTable {
                 },
             )?;
             let group = self.physical_runs(shrink_start, shrink);
-            self.space.unmap(shrink_start, shrink);
+            self.unmap_space(&s.blocks, shrink_start, shrink);
             self.memory.free_group(&group);
             s.blocks.set(
                 shrink_start,
@@ -493,7 +524,7 @@ impl PageTable {
             Expect::flag(MemoryState::FLAG_CAN_REPROTECT, 0, 0, u32::MAX),
         )?;
         if old != perm {
-            self.space.protect(addr, size, perm);
+            self.protect_space(&s.blocks, addr, size, perm);
             s.blocks.set(addr, size, state, perm, attr);
         }
         Ok(())
@@ -543,7 +574,7 @@ impl PageTable {
         s.blocks
             .check(dst, size, Expect::state(MemoryState::FREE, 0))?;
         let group = self.physical_runs(src, size);
-        self.space.protect(src, size, MemoryPermission::NONE);
+        self.protect_space(&s.blocks, src, size, MemoryPermission::NONE);
         s.blocks.set(
             src,
             size,
@@ -581,10 +612,10 @@ impl PageTable {
         if self.physical_runs(src, size) != self.physical_runs(dst, size) {
             return Err(result::INVALID_MEMORY_REGION);
         }
-        self.space.unmap(dst, size);
+        self.unmap_space(&s.blocks, dst, size);
         s.blocks
             .set(dst, size, MemoryState::FREE, MemoryPermission::NONE, 0);
-        self.space.protect(src, size, USER_RW);
+        self.protect_space(&s.blocks, src, size, USER_RW);
         s.blocks.set(src, size, src_state, USER_RW, 0);
         Ok(())
     }
@@ -655,7 +686,7 @@ impl PageTable {
                 continue;
             }
             let group = self.physical_runs(start, len);
-            self.space.unmap(start, len);
+            self.unmap_space(&s.blocks, start, len);
             self.memory.free_group(&group);
             s.blocks
                 .set(start, len, MemoryState::FREE, MemoryPermission::NONE, 0);
@@ -680,7 +711,7 @@ impl PageTable {
             size,
             Expect::flag(MemoryState::FLAG_CAN_TRANSFER, 7, USER_RW.0, u32::MAX),
         )?;
-        self.space.protect(addr, size, perm);
+        self.protect_space(&s.blocks, addr, size, perm);
         s.blocks.set(addr, size, state, perm, attribute::LOCKED);
         Ok(())
     }
@@ -700,7 +731,7 @@ impl PageTable {
                 attr: attribute::LOCKED,
             },
         )?;
-        self.space.protect(addr, size, USER_RW);
+        self.protect_space(&s.blocks, addr, size, USER_RW);
         s.blocks.set(addr, size, state, USER_RW, 0);
         Ok(())
     }
@@ -715,7 +746,7 @@ impl PageTable {
             Expect::flag(MemoryState::FLAG_CAN_CODE_MEMORY, 7, USER_RW.0, u32::MAX),
         )?;
         let group = self.physical_runs(addr, size);
-        self.space.protect(addr, size, MemoryPermission::NONE);
+        self.protect_space(&s.blocks, addr, size, MemoryPermission::NONE);
         s.blocks
             .set(addr, size, state, MemoryPermission::NONE, attribute::LOCKED);
         Ok(group)
@@ -736,7 +767,7 @@ impl PageTable {
                 attr: attribute::LOCKED,
             },
         )?;
-        self.space.protect(addr, size, USER_RW);
+        self.protect_space(&s.blocks, addr, size, USER_RW);
         s.blocks.set(addr, size, state, USER_RW, 0);
         Ok(())
     }
@@ -776,7 +807,7 @@ impl PageTable {
         if s.tls_pages[index].used == 0 {
             s.tls_pages.swap_remove(index);
             let group = self.physical_runs(page_addr, PAGE_SIZE);
-            self.space.unmap(page_addr, PAGE_SIZE);
+            self.unmap_space(&s.blocks, page_addr, PAGE_SIZE);
             self.memory.free_group(&group);
             s.blocks.set(
                 page_addr,
@@ -817,7 +848,7 @@ impl PageTable {
                 let group = self.physical_runs(start, size);
                 self.memory.free_group(&group);
             }
-            self.space.unmap(start, size);
+            self.unmap_space(&s.blocks, start, size);
         }
         let end = s.blocks.end();
         s.blocks

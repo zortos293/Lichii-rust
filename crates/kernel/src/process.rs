@@ -189,7 +189,6 @@ pub struct Process {
     id: ProcessId,
     params: ProcessParams,
     capabilities: Capabilities,
-    pub(crate) kernel: Weak<KernelInner>,
     page_table: PageTable,
     pub(crate) handles: RwLock<HandleTable>,
     pub(crate) threads: Mutex<Vec<Arc<Thread>>>,
@@ -237,7 +236,19 @@ impl Process {
     /// region in 32- and 36-bit address spaces) land after them.
     pub(crate) fn new(new: NewProcess) -> HleResult<Arc<Self>> {
         let capabilities = Capabilities::parse(&new.params.capabilities)?;
-        let page_table = PageTable::new(new.space, new.memory, new.params.pool, new.regions);
+        let (id, kernel) = (new.id, new.kernel);
+        let invalidate_code = Box::new(move |addr, size| {
+            if let Some(kernel) = kernel.upgrade() {
+                kernel.invalidate_code(id, addr, size);
+            }
+        });
+        let page_table = PageTable::new(
+            new.space,
+            new.memory,
+            new.params.pool,
+            new.regions,
+            invalidate_code,
+        );
         let mapped = new
             .modules
             .iter()
@@ -261,7 +272,6 @@ impl Process {
             handles: RwLock::new(HandleTable::new(capabilities.handle_table_size)),
             capabilities,
             params: new.params,
-            kernel: new.kernel,
             page_table,
             threads: Mutex::new(Vec::new()),
             sync: SyncState::default(),
@@ -382,13 +392,6 @@ impl Process {
         let free = self.page_table.memory_manager().free_size(pool);
         let used = self.used_memory();
         (used + free).min(self.max_memory.max(used))
-    }
-
-    /// Drops translated code for a range on every core.
-    pub fn invalidate_code(&self, addr: VAddr, size: u64) {
-        if let Some(kernel) = self.kernel.upgrade() {
-            kernel.invalidate_code(self.id, addr, size);
-        }
     }
 
     pub(crate) fn add_thread(&self, thread: Arc<Thread>) {
