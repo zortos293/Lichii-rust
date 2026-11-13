@@ -75,7 +75,8 @@ fn block_linear(tile_mode: TileMode, gob: GobLayout) -> GuestLayout {
 
 impl ImageInfo {
     /// The image a texture header samples. `None` for texel buffers, which live in the buffer
-    /// cache.
+    /// cache. With Switch 2 GOBs only array headers have layers: NVN2 leaves base layer 32 in 2D
+    /// headers of render targets packed one layer apart (Mario Tennis Fever).
     pub fn from_texture(desc: &TextureDescriptor, gob: GobLayout) -> Option<Self> {
         let layout = match desc.memory {
             TextureMemory::BlockLinear {
@@ -91,14 +92,23 @@ impl ImageInfo {
             TextureMemory::Pitch { pitch } => GuestLayout::Pitch { pitch },
             TextureMemory::Buffer => return None,
         };
+        let arrayed = gob != GobLayout::Switch2 && (desc.depth > 1 || desc.base_layer != 0);
         let base = desc.base_layer;
         let (kind, height, depth, layers, mut rescaleable) = match desc.texture_type {
-            TextureType::D1 => (ImageKind::D1, 1, 1, 1, false),
-            TextureType::D1Array => (ImageKind::D1, 1, 1, base + desc.depth, false),
-            TextureType::D2 | TextureType::D2NoMipmap => (ImageKind::D2, desc.height, 1, 1, true),
-            TextureType::D2Array => (ImageKind::D2, desc.height, 1, base + desc.depth, true),
-            TextureType::Cube => (ImageKind::D2, desc.height, 1, 6, false),
-            TextureType::CubeArray => (ImageKind::D2, desc.height, 1, base + desc.depth * 6, false),
+            TextureType::D1 if !arrayed => (ImageKind::D1, 1, 1, 1, false),
+            TextureType::D1 | TextureType::D1Array => {
+                (ImageKind::D1, 1, 1, base + desc.depth, false)
+            }
+            TextureType::D2 | TextureType::D2NoMipmap if !arrayed => {
+                (ImageKind::D2, desc.height, 1, 1, true)
+            }
+            TextureType::D2 | TextureType::D2NoMipmap | TextureType::D2Array => {
+                (ImageKind::D2, desc.height, 1, base + desc.depth, true)
+            }
+            TextureType::Cube if !arrayed => (ImageKind::D2, desc.height, 1, 6, false),
+            TextureType::Cube | TextureType::CubeArray => {
+                (ImageKind::D2, desc.height, 1, base + desc.depth * 6, false)
+            }
             TextureType::D3 => (ImageKind::D3, desc.height, desc.depth, 1, false),
             TextureType::D1Buffer => return None,
         };
@@ -250,8 +260,6 @@ impl ImageInfo {
         )
     }
 
-    /// Fills `layer_stride`: the guest's own array pitch when it gives one for an array, the
-    /// hardware's rule otherwise.
     /// The first `layers` layers of the image, at most all of them. Draws and clears look up
     /// only the layers they touch, so a render target's array size alone does not size the
     /// host image: Mario Tennis Fever's targets each claim 33 layers while sitting one layer
@@ -265,6 +273,8 @@ impl ImageInfo {
         .with_stride(stride)
     }
 
+    /// Fills `layer_stride`: the guest's own array pitch when it gives one for an array, the
+    /// hardware's rule otherwise.
     fn with_stride(mut self, explicit: u64) -> Self {
         self.layer_stride = match self.layout {
             GuestLayout::BlockLinear { .. } if self.layers > 1 && explicit != 0 => explicit,
@@ -450,9 +460,18 @@ impl ViewInfo {
         };
         let base_level = desc.min_level.min(info.levels - 1);
         let last_level = desc.max_level.clamp(base_level, info.levels - 1);
+        let switch2 = matches!(
+            info.layout,
+            GuestLayout::BlockLinear {
+                gob: GobLayout::Switch2,
+                ..
+            }
+        );
         let base_layer = match desc.texture_type {
+            TextureType::D3 => 0,
             TextureType::D1Array | TextureType::D2Array | TextureType::CubeArray => desc.base_layer,
-            _ => 0,
+            _ if switch2 => 0,
+            _ => desc.base_layer,
         };
         Self {
             format: desc.format,
