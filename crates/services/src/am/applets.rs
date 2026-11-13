@@ -5,6 +5,10 @@
 //! [`crate::ServiceContext::set_applet_frontend`] and writes the answer back in the applet's
 //! layout. [`HeadlessApplets`] answers without UI and is installed by default.
 
+use std::sync::Weak;
+
+use super::library_applet::LibraryApplet;
+
 /// Answers library applets on behalf of the user. am calls it on its service thread, inside the
 /// guest's `Start` (or `PushInteractiveInData`), and the guest waits until it returns.
 pub trait AppletFrontend: Send + Sync {
@@ -21,6 +25,16 @@ pub trait AppletFrontend: Send + Sync {
     /// text and sends it back, this is called again with [`SoftwareKeyboardRequest::text_check`]
     /// set and the text as [`SoftwareKeyboardRequest::initial_text`].
     fn software_keyboard(&self, request: &SoftwareKeyboardRequest) -> SoftwareKeyboardAnswer;
+
+    /// Drives the inline software keyboard, which the title draws over its own frame while it
+    /// keeps running. am calls this for each change the title asks for and expects it to return
+    /// at once; the frontend sends what the user types later, from any thread, through
+    /// `replies` (clone it to keep it). The default cancels the keyboard as soon as it appears.
+    fn inline_keyboard(&self, event: InlineKeyboardEvent, replies: &InlineKeyboardReplies) {
+        if let InlineKeyboardEvent::Appear(_) = event {
+            replies.send(InlineKeyboardReply::DecidedCancel);
+        }
+    }
 }
 
 /// `nn::err::ErrorCode` the error applet shows, as `2XXX-YYYY`.
@@ -145,6 +159,70 @@ pub enum TextCheckPrompt {
 pub enum SoftwareKeyboardAnswer {
     Submitted(String),
     Cancelled,
+}
+
+/// What the title asked of the inline software keyboard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InlineKeyboardEvent {
+    /// Show the keyboard. It stays up until the user decides or the title makes it disappear.
+    Appear(InlineKeyboardAppear),
+    /// The title set the text or the cursor itself.
+    TextChanged { text: String, cursor: i32 },
+    /// Hide the keyboard; the title can make it appear again.
+    Disappear,
+    /// The title closed the keyboard; replies sent from now on are dropped.
+    Finalize,
+}
+
+/// How the inline keyboard appears (`SwkbdAppearArg` and the calc argument around it).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InlineKeyboardAppear {
+    /// `SwkbdType`: 0 normal, 1 number pad, 2 QWERTY, ...
+    pub kind: u32,
+    pub ok_text: String,
+    /// The text the title set, which the user edits.
+    pub text: String,
+    /// In UTF-16 units.
+    pub cursor: i32,
+    /// In UTF-16 units, 1 to 500.
+    pub max_length: u32,
+    pub min_length: u32,
+    pub cancel_disabled: bool,
+    pub return_enabled: bool,
+    pub backspace_enabled: bool,
+}
+
+/// What the user did on the inline keyboard. Texts are the whole current text and cursors
+/// count UTF-16 units.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InlineKeyboardReply {
+    ChangedString {
+        text: String,
+        cursor: i32,
+    },
+    MovedCursor {
+        text: String,
+        cursor: i32,
+    },
+    /// The user submitted the text; the keyboard hides.
+    DecidedEnter {
+        text: String,
+    },
+    /// The user cancelled; the keyboard hides.
+    DecidedCancel,
+}
+
+/// Sends the user's input on one inline keyboard back to the title.
+#[derive(Clone)]
+pub struct InlineKeyboardReplies(pub(super) Weak<LibraryApplet>);
+
+impl InlineKeyboardReplies {
+    /// Queues `reply` for the title, unless the title already closed the keyboard.
+    pub fn send(&self, reply: InlineKeyboardReply) {
+        if let Some(applet) = self.0.upgrade() {
+            applet.inline_reply(reply);
+        }
+    }
 }
 
 /// Answers every applet without UI: errors are acknowledged, the profile selector picks the

@@ -315,6 +315,154 @@ fn storages_read_and_write_within_bounds() {
     );
 }
 
+/// A 0x1000-byte transfer memory over the start of a new heap, holding "lent" at offset 0, and
+/// its handle in the title's process.
+fn lend_transfer_memory(
+    client: &IpcClient,
+) -> (
+    Handle,
+    u64,
+    Arc<lichii_kernel::memory_objects::TransferMemory>,
+) {
+    let process = client.process().clone();
+    let heap = process.page_table().set_heap_size(2 << 20).unwrap();
+    process.memory().write_bytes(heap, b"lent").unwrap();
+    let memory = Arc::new(
+        lichii_kernel::memory_objects::TransferMemory::new(
+            process.clone(),
+            heap,
+            0x1000,
+            lichii_memory::MemoryPermission::READ_WRITE,
+        )
+        .unwrap(),
+    );
+    let handle = process
+        .handles()
+        .write()
+        .add(KObject::TransferMemory(memory.clone()))
+        .unwrap();
+    (handle, heap, memory)
+}
+
+const INVALID_STORAGE_TYPE: ResultCode = ResultCode::new(128, 511);
+
+#[test]
+fn transfer_memory_storages_read_and_write_the_titles_memory_in_place() {
+    let (_context, client, proxy) = booted(SWITCH1_TITLE);
+    let creator = interface(&client, proxy, 11);
+    let (handle, heap, _memory) = lend_transfer_memory(&client);
+    let create = |writable: bool, size: i64| {
+        Request::new(11)
+            .arg(u8::from(writable))
+            .arg(size)
+            .copy_handle(handle)
+    };
+    let output = client.alloc(&[0; 4]);
+    let input = client.alloc(b"LENT");
+    for writable in [false, true] {
+        let storage = client
+            .send(creator, &create(writable, 0x100))
+            .unwrap()
+            .move_handles[0];
+        assert_eq!(
+            client.send(storage, &Request::new(1)).unwrap().result,
+            INVALID_STORAGE_TYPE
+        );
+        let accessor = interface(&client, storage, 0);
+        assert_eq!(
+            client
+                .send(accessor, &Request::new(0))
+                .unwrap()
+                .pop::<i64>(),
+            0x100
+        );
+        let read = Request::new(11).arg(0i64).buffer_b(output, 4);
+        assert_eq!(
+            client.send(accessor, &read).unwrap().result,
+            ResultCode::SUCCESS
+        );
+        assert_eq!(client.read(output, 4), b"lent");
+        let write = Request::new(10).arg(0x80i64).buffer_a(input, 4);
+        let expected = if writable {
+            ResultCode::SUCCESS
+        } else {
+            ResultCode(u32::MAX)
+        };
+        assert_eq!(client.send(accessor, &write).unwrap().result, expected);
+        let past_end = Request::new(10).arg(0xfei64).buffer_a(input, 4);
+        assert_eq!(
+            client.send(accessor, &past_end).unwrap().result,
+            INVALID_OFFSET
+        );
+    }
+    assert_eq!(client.read(heap + 0x80, 4), b"LENT", "written in place");
+
+    assert_eq!(
+        client.send(creator, &create(true, 0)).unwrap().result,
+        ResultCode(u32::MAX)
+    );
+    for size in [0x1001, i64::MAX] {
+        assert_eq!(
+            client.send(creator, &create(true, size)).unwrap().result,
+            ResultCode(u32::MAX),
+            "larger than the transfer memory"
+        );
+    }
+    assert_eq!(
+        client.send(creator, &create(true, 0x1000)).unwrap().result,
+        ResultCode::SUCCESS
+    );
+    let no_handle = Request::new(11).arg(1u8).arg(0x100i64);
+    assert_eq!(
+        client.send(creator, &no_handle).unwrap().result,
+        ResultCode(u32::MAX)
+    );
+}
+
+#[test]
+fn handle_storages_lend_their_transfer_memory() {
+    let (_context, client, proxy) = booted(SWITCH1_TITLE);
+    let creator = interface(&client, proxy, 11);
+    let (handle, _heap, memory) = lend_transfer_memory(&client);
+    let create = Request::new(12).arg(0x200i64).copy_handle(handle);
+    let storage = client.send(creator, &create).unwrap().move_handles[0];
+    assert_eq!(
+        client.send(storage, &Request::new(0)).unwrap().result,
+        INVALID_STORAGE_TYPE
+    );
+    let accessor = interface(&client, storage, 1);
+    assert_eq!(
+        client
+            .send(accessor, &Request::new(0))
+            .unwrap()
+            .pop::<i64>(),
+        0x200
+    );
+    let mut reply = client.send(accessor, &Request::new(1)).unwrap();
+    assert_eq!(reply.result, ResultCode::SUCCESS);
+    assert_eq!(reply.pop::<i64>(), 0x200);
+    assert!(matches!(
+        client.object(reply.copy_handles[0]),
+        Some(KObject::TransferMemory(lent)) if Arc::ptr_eq(&lent, &memory)
+    ));
+}
+
+#[test]
+fn create_library_applet_ex_takes_a_thread_id() {
+    let (_context, client, proxy) = booted(SWITCH1_TITLE);
+    let creator = interface(&client, proxy, 11);
+    let create = Request::new(3)
+        .arg(library_applet::SOFTWARE_KEYBOARD)
+        .arg(1u32)
+        .arg(0x1234u64);
+    let accessor = client.send(creator, &create).unwrap().move_handles[0];
+    let mut info = client.send(accessor, &Request::new(120)).unwrap();
+    assert_eq!(
+        info.pop::<[u32; 2]>(),
+        [library_applet::SOFTWARE_KEYBOARD, 1]
+    );
+}
+
 #[test]
 fn live_storage_is_charged_until_freed() {
     let budget = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -576,8 +724,94 @@ fn software_keyboard_returns_cancel() {
     assert!(out[4..].iter().all(|&byte| byte == 0));
 }
 
+/// An inline keyboard request: the `SwkbdRequestCommand` and its argument.
+fn inline_request(command: u32, argument: &[u8]) -> Vec<u8> {
+    [&command.to_le_bytes()[..], argument].concat()
+}
+
+/// An inline keyboard calc request in the old or new layout with `flags`, the input text and
+/// cursor, and an appear argument for a QWERTY keyboard with "Go" on its OK key, out-of-range
+/// text lengths, cancel disabled and the return and backspace keys enabled.
+fn inline_calc(old: bool, flags: u64, text: &str, cursor: i32) -> Vec<u8> {
+    let (size, appear, cursor_at, text_at, backspace) = if old {
+        (0x4a0, 0x8, 0x4, 0x50, 0x446)
+    } else {
+        (0x4e8, 0x0, 0x74, 0x78, 0x46e)
+    };
+    let mut argument = vec![0; size];
+    argument[4..6].copy_from_slice(&(size as u16).to_le_bytes());
+    argument[8..16].copy_from_slice(&flags.to_le_bytes());
+    let arg = &mut argument[0x18..];
+    arg[appear..appear + 4].copy_from_slice(&2u32.to_le_bytes());
+    for (index, unit) in "Go".encode_utf16().enumerate() {
+        let at = appear + 4 + index * 2;
+        arg[at..at + 2].copy_from_slice(&unit.to_le_bytes());
+    }
+    arg[appear + 0x1b] = 1;
+    arg[appear + 0x20..appear + 0x24].copy_from_slice(&600u32.to_le_bytes());
+    arg[appear + 0x24..appear + 0x28].copy_from_slice(&700u32.to_le_bytes());
+    arg[appear + 0x28] = 1;
+    arg[cursor_at..cursor_at + 4].copy_from_slice(&cursor.to_le_bytes());
+    for (index, unit) in text.encode_utf16().enumerate() {
+        let at = text_at + index * 2;
+        arg[at..at + 2].copy_from_slice(&unit.to_le_bytes());
+    }
+    arg[backspace] = 1;
+    inline_request(0xa, &argument)
+}
+
+const INITIALIZE: u64 = 1 << 0;
+const APPEAR: u64 = 1 << 2;
+const SET_INPUT_TEXT: u64 = 1 << 3;
+const SET_CURSOR_POSITION: u64 = 1 << 4;
+const SET_UTF8_MODE: u64 = 1 << 5;
+const DISAPPEAR: u64 = 1 << 7;
+
+impl Domain<'_> {
+    fn push_interactive(&self, applet: u32, data: &[u8]) {
+        let storage = self.storage(data);
+        let push = Request::new(103).input_object(storage);
+        assert_eq!(self.call(applet, push).result, ResultCode::SUCCESS);
+    }
+
+    /// Every reply the applet queued, oldest first.
+    fn inline_replies(&self, applet: u32) -> Vec<Vec<u8>> {
+        let event = self.call(applet, Request::new(106)).copy_handles[0];
+        let mut replies = Vec::new();
+        while event_signaled(self.client, event) {
+            let storage = self.object(applet, Request::new(104));
+            replies.push(self.read(storage));
+        }
+        assert_eq!(
+            self.call(applet, Request::new(104)).result,
+            NO_DATA_IN_CHANNEL
+        );
+        replies
+    }
+}
+
+/// The `SwkbdState` and `SwkbdReplyType` a reply starts with.
+fn reply_base(reply: &[u8]) -> [u32; 2] {
+    [
+        u32::from_le_bytes(reply[0..4].try_into().unwrap()),
+        u32::from_le_bytes(reply[4..8].try_into().unwrap()),
+    ]
+}
+
+fn reply_bases(replies: &[Vec<u8>]) -> Vec<[u32; 2]> {
+    replies.iter().map(|reply| reply_base(reply)).collect()
+}
+
+/// The `Default` replies that tell the title the keyboard appeared, and that it hid.
+const APPEARED: [[u32; 2]; 2] = [[2, 1], [3, 1]];
+const HID: [[u32; 2]; 2] = [[4, 1], [1, 1]];
+
+fn utf16(text: &str) -> Vec<u8> {
+    text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
 #[test]
-fn inline_software_keyboard_completes_with_decided_cancel() {
+fn headless_inline_keyboard_initializes_then_cancels_when_it_appears() {
     let (_context, client, _) = booted(SWITCH1_TITLE);
     let am = Domain::open(&client);
     let applet = am.run(
@@ -586,17 +820,242 @@ fn inline_software_keyboard_completes_with_decided_cancel() {
         KEYBOARD_VERSION,
         &[&[0; 8]],
     );
-    assert!(am.completed(applet));
-    let event = am.call(applet, Request::new(106)).copy_handles[0];
-    assert!(event_signaled(&client, event));
-    let reply = am.object(applet, Request::new(104));
-    let mut expected = 1u32.to_le_bytes().to_vec();
-    expected.extend(6u32.to_le_bytes());
-    assert_eq!(am.read(reply), expected);
+    assert!(!am.completed(applet));
+    assert!(am.inline_replies(applet).is_empty());
+
+    am.push_interactive(applet, &inline_calc(false, INITIALIZE, "", 0));
+    let replies = am.inline_replies(applet);
     assert_eq!(
-        am.call(applet, Request::new(101)).result,
-        NO_DATA_IN_CHANNEL
+        reply_bases(&replies),
+        [[1, 1], [1, 0]],
+        "Hidden, then FinishedInitialize"
     );
+    assert_eq!(replies[1].len(), 9);
+
+    for _ in 0..2 {
+        am.push_interactive(applet, &inline_calc(false, APPEAR, "", 0));
+        let replies = am.inline_replies(applet);
+        assert!(replies.iter().all(|reply| reply.len() == 8));
+        assert_eq!(
+            reply_bases(&replies),
+            [APPEARED[0], APPEARED[1], [3, 6], HID[0], HID[1]],
+            "DecidedCancel while shown"
+        );
+    }
+
+    am.push_interactive(applet, &inline_request(4, &[]));
+    assert!(am.completed(applet));
+    assert_eq!(reply_bases(&am.inline_replies(applet)), [[0, 1]]);
+}
+
+/// Records the inline keyboard events and keeps the replies for the test to type with.
+#[derive(Default)]
+struct InlineTypist {
+    events: parking_lot::Mutex<Vec<applets::InlineKeyboardEvent>>,
+    replies: parking_lot::Mutex<Option<applets::InlineKeyboardReplies>>,
+}
+
+impl InlineTypist {
+    fn take_events(&self) -> Vec<applets::InlineKeyboardEvent> {
+        std::mem::take(&mut self.events.lock())
+    }
+
+    fn send(&self, reply: applets::InlineKeyboardReply) {
+        self.replies.lock().as_ref().unwrap().send(reply);
+    }
+}
+
+impl applets::AppletFrontend for InlineTypist {
+    fn show_error(&self, _request: &applets::ErrorRequest) {}
+
+    fn select_profile(&self, _: &applets::ProfileSelectRequest) -> applets::ProfileSelectAnswer {
+        applets::ProfileSelectAnswer::Cancelled
+    }
+
+    fn configure_controllers(&self, _: &applets::ControllerRequest) -> applets::ControllerAnswer {
+        applets::ControllerAnswer::Cancelled
+    }
+
+    fn software_keyboard(
+        &self,
+        _: &applets::SoftwareKeyboardRequest,
+    ) -> applets::SoftwareKeyboardAnswer {
+        applets::SoftwareKeyboardAnswer::Cancelled
+    }
+
+    fn inline_keyboard(
+        &self,
+        event: applets::InlineKeyboardEvent,
+        replies: &applets::InlineKeyboardReplies,
+    ) {
+        self.events.lock().push(event);
+        *self.replies.lock() = Some(replies.clone());
+    }
+}
+
+fn inline_keyboard_with(typist: &Arc<InlineTypist>) -> (IpcClient, Arc<ServiceContext>) {
+    let (context, client, _) = booted(SWITCH1_TITLE);
+    context.set_applet_frontend(typist.clone());
+    (client, context)
+}
+
+#[test]
+fn inline_keyboard_appears_and_replies_what_the_user_types() {
+    use applets::{InlineKeyboardAppear, InlineKeyboardEvent, InlineKeyboardReply};
+    for old in [false, true] {
+        let typist = Arc::new(InlineTypist::default());
+        let (client, _context) = inline_keyboard_with(&typist);
+        let am = Domain::open(&client);
+        let applet = am.run(
+            library_applet::SOFTWARE_KEYBOARD,
+            3,
+            KEYBOARD_VERSION,
+            &[&[0; 8]],
+        );
+
+        let flags = INITIALIZE | APPEAR | SET_INPUT_TEXT | SET_CURSOR_POSITION;
+        am.push_interactive(applet, &inline_calc(old, flags, "ab", 2));
+        let replies = am.inline_replies(applet);
+        assert_eq!(
+            reply_bases(&replies),
+            [[1, 1], [1, 0], APPEARED[0], APPEARED[1]]
+        );
+        assert_eq!(
+            typist.take_events(),
+            [InlineKeyboardEvent::Appear(InlineKeyboardAppear {
+                kind: 2,
+                ok_text: "Go".into(),
+                text: "ab".into(),
+                cursor: 2,
+                max_length: 500,
+                min_length: 0,
+                cancel_disabled: true,
+                return_enabled: true,
+                backspace_enabled: true,
+            })],
+            "old layout: {old}"
+        );
+
+        typist.send(InlineKeyboardReply::ChangedString {
+            text: "abc".into(),
+            cursor: 3,
+        });
+        let replies = am.inline_replies(applet);
+        assert_eq!(replies.len(), 1);
+        let reply = &replies[0];
+        assert_eq!(reply.len(), 8 + 0x3ec + 0x10);
+        assert_eq!(reply_base(reply), [3, 2], "Shown, ChangedString");
+        assert_eq!(&reply[8..14], &utf16("abc")[..]);
+        assert!(reply[14..8 + 0x3ec].iter().all(|&byte| byte == 0));
+        let arg: Vec<i32> = reply[8 + 0x3ec..]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&bytes| i32::from_le_bytes(bytes))
+            .collect();
+        assert_eq!(arg, [3, -1, -1, 3]);
+
+        am.push_interactive(applet, &inline_calc(old, SET_INPUT_TEXT, "xyz", 0));
+        assert_eq!(
+            typist.take_events(),
+            [InlineKeyboardEvent::TextChanged {
+                text: "xyz".into(),
+                cursor: 3,
+            }]
+        );
+
+        typist.send(InlineKeyboardReply::DecidedEnter {
+            text: "xyz!".into(),
+        });
+        let replies = am.inline_replies(applet);
+        assert_eq!(reply_bases(&replies), [[3, 5], HID[0], HID[1]]);
+        let reply = &replies[0];
+        assert_eq!(reply.len(), 8 + 0x3ec + 4);
+        assert_eq!(&reply[8..16], &utf16("xyz!")[..]);
+        assert_eq!(&reply[8 + 0x3ec..], &4u32.to_le_bytes());
+
+        am.push_interactive(applet, &inline_calc(old, DISAPPEAR, "", 0));
+        assert!(
+            typist.take_events().is_empty(),
+            "the decided keyboard is hidden"
+        );
+        assert!(am.inline_replies(applet).is_empty());
+        am.push_interactive(applet, &inline_calc(old, APPEAR, "", 0));
+        assert!(matches!(
+            &typist.take_events()[..],
+            [InlineKeyboardEvent::Appear(_)]
+        ));
+        assert_eq!(reply_bases(&am.inline_replies(applet)), APPEARED);
+        am.push_interactive(applet, &inline_calc(old, DISAPPEAR, "", 0));
+        assert_eq!(typist.take_events(), [InlineKeyboardEvent::Disappear]);
+        assert_eq!(reply_bases(&am.inline_replies(applet)), HID);
+        assert!(!am.completed(applet));
+    }
+}
+
+#[test]
+fn inline_keyboard_replies_in_utf8_and_v2_when_the_title_asks() {
+    use applets::InlineKeyboardReply;
+    let typist = Arc::new(InlineTypist::default());
+    let (client, _context) = inline_keyboard_with(&typist);
+    let am = Domain::open(&client);
+    let applet = am.run(
+        library_applet::SOFTWARE_KEYBOARD,
+        1,
+        KEYBOARD_VERSION,
+        &[&[0; 8]],
+    );
+    am.push_interactive(applet, &inline_request(0xd, &[1]));
+    am.push_interactive(applet, &inline_request(0xe, &[1]));
+    let mut calc = inline_calc(false, INITIALIZE | APPEAR | SET_UTF8_MODE, "", 0);
+    calc[0x1c + 0x46c] = 1;
+    am.push_interactive(applet, &calc);
+    assert_eq!(am.inline_replies(applet).len(), 4);
+
+    typist.send(InlineKeyboardReply::ChangedString {
+        text: "é".into(),
+        cursor: 1,
+    });
+    typist.send(InlineKeyboardReply::MovedCursor {
+        text: "é".into(),
+        cursor: 0,
+    });
+    typist.send(InlineKeyboardReply::DecidedEnter { text: "é".into() });
+    let replies = am.inline_replies(applet);
+    assert_eq!(
+        reply_bases(&replies),
+        [[3, 0xf], [3, 0x10], [3, 9], HID[0], HID[1]]
+    );
+    assert_eq!(replies[0].len(), 8 + 0x7d4 + 0x10 + 1);
+    assert_eq!(&replies[0][8..11], "é\0".as_bytes());
+    assert_eq!(&replies[0][8 + 0x7d4..8 + 0x7d8], &1u32.to_le_bytes());
+    assert_eq!(replies[1].len(), 8 + 0x7d4 + 8 + 1);
+    assert_eq!(replies[2].len(), 8 + 0x7d4 + 4);
+}
+
+#[test]
+fn inline_keyboard_drops_replies_once_the_title_closes_it() {
+    use applets::{InlineKeyboardEvent, InlineKeyboardReply};
+    for close in [Request::new(20), Request::new(25)] {
+        let typist = Arc::new(InlineTypist::default());
+        let (client, _context) = inline_keyboard_with(&typist);
+        let am = Domain::open(&client);
+        let applet = am.run(
+            library_applet::SOFTWARE_KEYBOARD,
+            1,
+            KEYBOARD_VERSION,
+            &[&[0; 8]],
+        );
+        am.push_interactive(applet, &inline_calc(false, INITIALIZE | APPEAR, "", 0));
+        am.inline_replies(applet);
+        typist.take_events();
+
+        assert_eq!(am.call(applet, close).result, ResultCode::SUCCESS);
+        assert!(am.completed(applet));
+        assert_eq!(typist.take_events(), [InlineKeyboardEvent::Finalize]);
+        typist.send(InlineKeyboardReply::DecidedCancel);
+        assert!(am.inline_replies(applet).is_empty());
+    }
 }
 
 /// Types "Lichi", fixes it to "Lichii" when rejected, and on a confirmation submits the text
