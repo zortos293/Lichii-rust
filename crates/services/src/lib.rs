@@ -37,6 +37,7 @@
 mod am;
 mod context;
 mod dispatch;
+mod gsv;
 #[cfg(test)]
 mod testing;
 
