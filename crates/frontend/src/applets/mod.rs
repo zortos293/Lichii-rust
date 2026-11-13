@@ -3,6 +3,7 @@
 //! dropped (the session stops), every question still waiting is answered as cancelled.
 
 mod controller;
+mod error;
 mod inline;
 mod keyboard;
 mod profile;
@@ -20,18 +21,20 @@ use lichii_services::applets::{
 };
 
 use self::controller::ControllerDialog;
+use self::error::ErrorDialog;
 use self::inline::{InlineKeyboard, InlineMsg, Reply};
 use self::keyboard::KeyboardDialog;
 use self::profile::ProfileDialog;
 
 enum Request {
+    Error(ErrorRequest, Sender<()>),
     Keyboard(SoftwareKeyboardRequest, Sender<SoftwareKeyboardAnswer>),
     Profile(ProfileSelectRequest, Sender<ProfileSelectAnswer>),
     Controller(ControllerRequest, Sender<ControllerAnswer>),
 }
 
 /// The [`AppletFrontend`] a session installs: it hands each request to [`AppletDialogs`] and wakes
-/// the UI. Applets without a dialog yet answer like [`HeadlessApplets`].
+/// the UI. Errors are also logged, as [`HeadlessApplets`] logs them.
 struct UiApplets {
     requests: Sender<Request>,
     inline: Sender<InlineMsg>,
@@ -50,6 +53,7 @@ impl UiApplets {
 impl AppletFrontend for UiApplets {
     fn show_error(&self, request: &ErrorRequest) {
         HeadlessApplets.show_error(request);
+        self.ask(|reply| Request::Error(request.clone(), reply));
     }
 
     fn select_profile(&self, request: &ProfileSelectRequest) -> ProfileSelectAnswer {
@@ -85,6 +89,7 @@ pub struct ControlsChange {
 }
 
 enum Dialog {
+    Error(ErrorDialog),
     Keyboard(KeyboardDialog),
     Profile(ProfileDialog),
     Controller(ControllerDialog),
@@ -175,6 +180,7 @@ impl AppletDialogs {
         }
         if self.open.is_none() {
             self.open = self.requests.try_recv().ok().map(|request| match request {
+                Request::Error(request, reply) => Dialog::Error(ErrorDialog::new(&request, reply)),
                 Request::Keyboard(request, reply) => {
                     Dialog::Keyboard(KeyboardDialog::new(request, reply))
                 }
@@ -187,6 +193,13 @@ impl AppletDialogs {
             });
         }
         let changed = match self.open.as_mut()? {
+            Dialog::Error(dialog) => {
+                if !dialog.show(ctx) {
+                    return None;
+                }
+                let _ = dialog.reply.send(());
+                None
+            }
             Dialog::Keyboard(dialog) => {
                 let answer = dialog.show(ctx)?;
                 let _ = dialog.reply.send(answer);
