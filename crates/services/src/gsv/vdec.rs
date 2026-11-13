@@ -28,11 +28,12 @@ use lichii_gpu::host1x::Syncpoints;
 use lichii_kernel::ipc::HleRequestContext;
 use lichii_kernel::{Event, GuestClock};
 use lichii_memory::AddressSpace;
+use lichii_texture::block_linear::swizzle;
 use lichii_video::convert::{ColorOrder, write_nv12, write_rgba};
 use lichii_video::{Codec, Decoder, Frame, Latency, VideoError};
 use parking_lot::{Condvar, Mutex};
 
-use super::native::{DecoderFormat, NativeObjects};
+use super::native::{DecoderFormat, NativeObjects, relayout_decoder_image};
 use super::{UNKNOWN, push_readable, push_session};
 use crate::nvdrv::Nvdrv;
 use crate::{Service, ServiceContext};
@@ -456,6 +457,8 @@ struct Media {
     decoded: Vec<Decoded>,
     /// One output image in its guest layout, written to guest memory in one go.
     staging: Vec<u8>,
+    /// The block-linear copy of `staging` for an image the title reads on the GPU.
+    tiled: Vec<u8>,
     write_failed: bool,
     /// `LICHII_VDEC_DUMP`: a folder that gets the luma of every 120th frame, at a quarter of its
     /// size, as a PGM.
@@ -599,16 +602,35 @@ impl Shared {
                         .is_ok()
             }
             DecoderFormat::Rgba | DecoderFormat::Bgra => {
-                let order = if layout.format == DecoderFormat::Rgba {
+                let order = if layout.format == DecoderFormat::Rgba || target.block_linear {
                     ColorOrder::Rgba
                 } else {
                     ColorOrder::Bgra
                 };
-                write_rgba(&picture, staging, pitch, width, height, order)
-                    && self
+                if !write_rgba(&picture, staging, pitch, width, height, order) {
+                    false
+                } else if target.block_linear {
+                    let tiling = layout.tiling();
+                    media.tiled.resize(tiling.size_bytes(), 0);
+                    swizzle(
+                        &tiling,
+                        &staging[..tiling.linear_size_bytes()],
+                        &mut media.tiled,
+                    );
+                    self.memory
+                        .write_bytes(target.address, &media.tiled)
+                        .is_ok()
+                } else {
+                    let mut objects = self.objects.lock();
+                    let written = self
                         .memory
                         .write_bytes(target.address, &staging[..rows])
-                        .is_ok()
+                        .is_ok();
+                    if written && objects.wrote_pitch_frame(handout.image) {
+                        relayout_decoder_image(&self.memory, target.address, &layout);
+                    }
+                    written
+                }
             }
         };
         if written {
@@ -664,6 +686,7 @@ impl Shared {
             codec: None,
             decoded: Vec::new(),
             staging: Vec::new(),
+            tiled: Vec::new(),
             write_failed: false,
             dump: std::env::var_os("LICHII_VDEC_DUMP").map(Into::into),
             frames_out: 0,

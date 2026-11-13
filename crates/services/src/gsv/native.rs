@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 use lichii_common::{ResultCode, VAddr};
 use lichii_gpu::nx2_memory::GpuMemoryHandle;
 use lichii_kernel::ipc::HleRequestContext;
+use lichii_memory::AddressSpace;
+use lichii_texture::block_linear::{GobLayout, Tiling, swizzle};
 use parking_lot::Mutex;
 
 use super::{UNKNOWN, Words};
@@ -131,6 +133,20 @@ impl DecoderLayout {
         }
     }
 
+    /// The layout an RGBA or BGRA image takes once the title reads it on the GPU (426/428): RGBA
+    /// texels in Switch 2 block-linear with 16-GOB blocks, as the reference writes them.
+    pub fn tiling(&self) -> Tiling {
+        Tiling::new(
+            (self.pitch / 4) as u32,
+            self.height,
+            1,
+            4,
+            4,
+            0,
+            GobLayout::Switch2,
+        )
+    }
+
     /// The picture kind gsv 961 reports.
     pub fn kind(&self) -> u32 {
         match self.format {
@@ -146,6 +162,35 @@ impl DecoderLayout {
 pub(super) struct DecoderImage {
     pub address: VAddr,
     pub layout: DecoderLayout,
+    /// Frames go in [`DecoderLayout::tiling`]: the title reads this RGBA or BGRA image on the GPU.
+    pub block_linear: bool,
+}
+
+/// Rewrites a decoder image holding a pitch-linear RGBA or BGRA frame in [`DecoderLayout::tiling`],
+/// for a frame written before the title's first 426/428 for the image.
+pub(super) fn relayout_decoder_image(
+    memory: &AddressSpace,
+    address: VAddr,
+    layout: &DecoderLayout,
+) {
+    if matches!(layout.format, DecoderFormat::Nv12 { .. }) {
+        return;
+    }
+    let tiling = layout.tiling();
+    let mut linear = vec![0u8; tiling.linear_size_bytes()];
+    if memory.read_bytes(address, &mut linear).is_err() {
+        return;
+    }
+    if layout.format == DecoderFormat::Bgra {
+        for texel in linear.as_chunks_mut::<4>().0 {
+            texel.swap(0, 2);
+        }
+    }
+    let mut tiled = vec![0u8; tiling.size_bytes()];
+    swizzle(&tiling, &linear, &mut tiled);
+    if memory.write_bytes(address, &tiled).is_err() {
+        tracing::warn!("nx2:gsv: cannot relayout the decoder image at {address:#x}");
+    }
 }
 
 pub(super) fn bytes_per_pixel(format: u32) -> u64 {
@@ -172,6 +217,10 @@ struct Image {
     offset: u64,
     /// A video decoder output image pool (gsv 911), laid out by [`DecoderLayout`].
     decoder: bool,
+    /// A decoder image the title read on the GPU (426/428).
+    gpu_read: bool,
+    /// A decoder image holding a frame written pitch-linear, before its first 426/428.
+    pitch_frame: bool,
 }
 
 /// A native image vi2 can show.
@@ -204,10 +253,22 @@ impl NativeObjects {
     pub fn decoder_image(&self, handle: u32) -> Option<DecoderImage> {
         let (image, offset) = self.image(handle)?;
         let memory = self.memories.get(&image.memory)?;
+        let layout = DecoderLayout::of(&image.preference);
         (image.decoder && memory.address != 0).then(|| DecoderImage {
             address: memory.address + offset,
-            layout: DecoderLayout::of(&image.preference),
+            layout,
+            block_linear: image.gpu_read && !matches!(layout.format, DecoderFormat::Nv12 { .. }),
         })
+    }
+
+    /// The decoder wrote a pitch-linear frame into decoder image `handle`. True when a 426/428
+    /// came in meanwhile, so the frame needs [`relayout_decoder_image`] now.
+    pub fn wrote_pitch_frame(&mut self, handle: u32) -> bool {
+        let Some(image) = self.images.get_mut(&handle) else {
+            return false;
+        };
+        image.pitch_frame = !image.gpu_read;
+        image.gpu_read
     }
 
     pub fn presentable(&self, handle: u32) -> Option<Presentable> {
@@ -248,6 +309,8 @@ impl NativeObjects {
                 count: 1,
                 offset: 0,
                 decoder: false,
+                gpu_read: false,
+                pitch_frame: false,
             },
         );
         (objects, 1)
@@ -327,6 +390,8 @@ pub(super) fn handle(objects: &Mutex<NativeObjects>, ctx: &mut HleRequestContext
                 count,
                 offset: 0,
                 decoder,
+                gpu_read: false,
+                pitch_frame: false,
             };
             if decoder {
                 for i in 0..count {
@@ -379,11 +444,21 @@ pub(super) fn handle(objects: &Mutex<NativeObjects>, ctx: &mut HleRequestContext
         426 | 428 => {
             let handle = words.u32(2);
             let (preference, offset, address) = {
-                let objects = objects.lock();
-                match objects.image(handle) {
-                    Some((image, offset)) => {
-                        let address = objects.memories.get(&image.memory).map_or(0, |m| m.address);
-                        (image.preference, offset, address)
+                let mut objects = objects.lock();
+                let found = objects.image(handle).map(|(image, offset)| {
+                    let address = objects.memories.get(&image.memory).map_or(0, |m| m.address);
+                    (image.preference, offset, address, image.decoder)
+                });
+                match found {
+                    Some((preference, offset, address, decoder)) => {
+                        if decoder && let Some(image) = objects.images.get_mut(&handle) {
+                            image.gpu_read = true;
+                            if std::mem::take(&mut image.pitch_frame) && address != 0 {
+                                let layout = DecoderLayout::of(&preference);
+                                relayout_decoder_image(ctx.memory(), address + offset, &layout);
+                            }
+                        }
+                        (preference, offset, address)
                     }
                     None => {
                         tracing::warn!("nx2:gsv {command}: no native image {handle}");

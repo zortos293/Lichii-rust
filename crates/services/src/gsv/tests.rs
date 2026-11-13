@@ -1189,6 +1189,8 @@ fn video_decoder_sessions_hand_out_decoder_services() {
 
 /// One 64x48 NV12 decoder image: 128 rows of 64-byte pitch, luma then chroma.
 const NV12_IMAGE_SIZE: u64 = 64 * 128 * 2;
+/// One 64x48 RGBA decoder image: 128 rows of 256-byte pitch.
+const RGBA_IMAGE_SIZE: u64 = 256 * 128;
 
 struct Vdec {
     context: Arc<ServiceContext>,
@@ -1229,10 +1231,10 @@ impl Vdec {
         self.client.send(self.service, request).unwrap()
     }
 
-    /// A gsv 911 pool of three 64x48 NV12 decoder images in mapped memory, each
-    /// [`NV12_IMAGE_SIZE`] bytes: their address and the first image's handle.
-    fn nv12_pool(&self) -> (VAddr, u32) {
-        let size = 3 * NV12_IMAGE_SIZE;
+    /// A gsv 911 pool of three 64x48 decoder images of picture `code` in mapped memory, each
+    /// `image_size` bytes: their address and the first image's handle.
+    fn decoder_pool(&self, code: u32, image_size: u64) -> (VAddr, u32) {
+        let size = 3 * image_size;
         let images = self.client.alloc(&vec![0u8; size as usize]);
         let mut reply = self
             .client
@@ -1245,7 +1247,7 @@ impl Vdec {
             .send(self.gsv, &words(Request::tipc(114), &bind))
             .unwrap();
         assert_eq!(reply.result, ResultCode::SUCCESS);
-        let pool_request = [decoder_preference(1, 64, 48), vec![3, memory]].concat();
+        let pool_request = [decoder_preference(code, 64, 48), vec![3, memory]].concat();
         let mut reply = self
             .client
             .send(self.gsv, &words(Request::tipc(911), &pool_request))
@@ -1488,7 +1490,7 @@ fn video_decoder_writes_decoded_pictures_into_nv12_images() {
         return;
     }
     let vdec = Vdec::open();
-    let (images, pool) = vdec.nv12_pool();
+    let (images, pool) = vdec.decoder_pool(1, NV12_IMAGE_SIZE);
 
     let fences: Vec<_> = (0..3).map(|i| vdec.hand_out(311, pool + i)).collect();
     let stream = ivf_frames(include_bytes!(
@@ -1523,7 +1525,7 @@ fn video_decoder_writes_an_image_only_after_its_release_fence_and_never_after_st
         return;
     }
     let vdec = Vdec::open();
-    let (images, pool) = vdec.nv12_pool();
+    let (images, pool) = vdec.decoder_pool(1, NV12_IMAGE_SIZE);
     let host1x = vdec.context.gpu.host1x();
     let guest = host1x.syncpoints.guest();
     let release = vdec.context.nvdrv.get().unwrap().allocate_syncpoint();
@@ -1569,6 +1571,78 @@ fn video_decoder_writes_an_image_only_after_its_release_fence_and_never_after_st
         host1x.syncpoints.max(syncpoint).unwrap(),
         "the stopped image's fence is not counted twice"
     );
+    vdec.close(syncpoint);
+}
+
+#[test]
+fn video_decoder_writes_block_linear_rgba_into_images_the_title_reads_on_the_gpu() {
+    use lichii_texture::block_linear::{GobLayout, Tiling, unswizzle};
+
+    if !lichii_video::available() {
+        eprintln!("FFmpeg is not installed; skipping");
+        return;
+    }
+    let vdec = Vdec::open();
+    let (images, pool) = vdec.decoder_pool(3, RGBA_IMAGE_SIZE);
+    let reply = vdec
+        .client
+        .send(vdec.gsv, &Request::tipc(428).arg(pool + 1))
+        .unwrap();
+    assert_eq!(reply.result, ResultCode::SUCCESS);
+    let fences: Vec<_> = (0..2).map(|i| vdec.hand_out(311, pool + i)).collect();
+    let stream = ivf_frames(include_bytes!(
+        "../../../video/tests/data/quadrants.vp9.ivf"
+    ));
+    for (frame, data) in stream.iter().take(2).enumerate() {
+        let reply = vdec.submit_frame(data, frame as u64 * 33_333);
+        assert_eq!(reply.result, ResultCode::SUCCESS);
+    }
+    let (syncpoint, last) = fences[1];
+    vdec.wait(syncpoint, last);
+
+    let memory = vdec.context.process.memory();
+    let read = |image: u64| {
+        let mut bytes = vec![0u8; RGBA_IMAGE_SIZE as usize];
+        memory
+            .read_bytes(images + image * RGBA_IMAGE_SIZE, &mut bytes)
+            .unwrap();
+        bytes
+    };
+    let tiling = Tiling::new(64, 48, 1, 4, 4, 0, GobLayout::Switch2);
+    let untile = |tiled: &[u8]| {
+        let mut linear = vec![0u8; tiling.linear_size_bytes()];
+        unswizzle(&tiling, tiled, &mut linear);
+        linear
+    };
+    let texel = |linear: &[u8], x: usize, y: usize| -> [u8; 4] {
+        linear[(y * 64 + x) * 4..][..4].try_into().unwrap()
+    };
+    let quadrant = [(4, 4), (8, 6), (20, 16)];
+
+    let read_on_gpu = untile(&read(1));
+    let color = texel(&read_on_gpu, 16, 12);
+    assert_eq!(color[3], 255, "opaque RGBA");
+    for (x, y) in quadrant {
+        assert_eq!(
+            texel(&read_on_gpu, x, y),
+            color,
+            "a frame for an image read on the GPU is block-linear"
+        );
+    }
+
+    let pitch = read(0);
+    let reply = vdec
+        .client
+        .send(vdec.gsv, &Request::tipc(426).arg(pool))
+        .unwrap();
+    assert_eq!(reply.result, ResultCode::SUCCESS);
+    let relaid = untile(&read(0));
+    assert_eq!(
+        relaid[..],
+        pitch[..tiling.linear_size_bytes()],
+        "the first 426 relays out the frame written before it"
+    );
+    assert_ne!(texel(&relaid, 8, 6), color, "frames 0 and 1 differ");
     vdec.close(syncpoint);
 }
 
