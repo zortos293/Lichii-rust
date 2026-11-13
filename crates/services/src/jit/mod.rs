@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use lichii_common::{HleResult, ResultCode, VAddr};
 use lichii_kernel::ipc::HleRequestContext;
-use lichii_kernel::memory::MemoryState;
+use lichii_kernel::memory::{MemoryState, Regions};
 use lichii_kernel::memory_objects::{CodeMemory, CodeMemoryOperation};
 use lichii_kernel::process::Process;
 use lichii_kernel::result;
@@ -72,7 +72,8 @@ struct CodeMapping {
 }
 
 impl CodeMapping {
-    /// Maps `memory` at the first free range of `process`'s alias code region that takes it.
+    /// Maps `memory` at the first free range of `process`'s alias code region that takes it,
+    /// clear of the heap and alias regions (`CanContain(AliasCode)`).
     fn new(
         process: &Process,
         memory: Arc<CodeMemory>,
@@ -80,9 +81,15 @@ impl CodeMapping {
         permission: MemoryPermission,
     ) -> HleResult<Self> {
         let table = process.page_table();
-        let region = table.regions().alias_code;
+        let regions = table.regions();
+        let region = regions.alias_code;
         let mut address = region.start;
         while address < region.end && region.end - address >= size {
+            let clear = skip_reserved(regions, address, size);
+            if clear != address {
+                address = clear;
+                continue;
+            }
             let info = table.query(address);
             let end = (info.base_address + info.size).min(region.end);
             if info.state == MemoryState::FREE.0 && end - address >= size {
@@ -107,6 +114,18 @@ impl CodeMapping {
         }
         Err(UNKNOWN)
     }
+}
+
+/// The first address from `address` where `size` bytes stay clear of the heap and alias
+/// regions, which the alias code region contains but code may not use.
+fn skip_reserved(regions: &Regions, mut address: VAddr, size: u64) -> VAddr {
+    while let Some(reserved) = [regions.heap, regions.alias]
+        .into_iter()
+        .find(|reserved| reserved.overlaps(address, size))
+    {
+        address = reserved.end;
+    }
+    address
 }
 
 impl Drop for CodeMapping {
