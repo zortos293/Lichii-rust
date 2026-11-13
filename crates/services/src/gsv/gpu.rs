@@ -29,7 +29,7 @@ use lichii_kernel::memory::MemoryState;
 use lichii_memory::{AddressSpace, MemoryPermission};
 use parking_lot::Mutex;
 
-use super::{handshake, push_readable, push_session};
+use super::{Words, handshake, push_readable, push_session};
 use crate::{Service, ServiceContext};
 
 /// Job slot event ids are taken modulo this; 11 reports [0, `SLOTS` - 1].
@@ -407,37 +407,6 @@ fn logged(request: &str, result: Result<Vec<Unmapped>, Nx2MemoryError>) -> Vec<U
         tracing::warn!("nx2:gpu {request}: {err}");
         Vec::new()
     })
-}
-
-/// Little-endian words, indexed from `first`. Missing words read as zero.
-struct Words<'a> {
-    data: &'a [u8],
-    first: usize,
-}
-
-impl<'a> Words<'a> {
-    /// A TIPC request's data, indexed as the reference's command buffer is: from word 2.
-    fn command(ctx: &'a HleRequestContext) -> Self {
-        Self {
-            data: ctx.input(),
-            first: 2,
-        }
-    }
-
-    fn of(data: &'a [u8]) -> Self {
-        Self { data, first: 0 }
-    }
-
-    fn u32(&self, index: usize) -> u32 {
-        let at = (index - self.first) * 4;
-        self.data
-            .get(at..at + 4)
-            .map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()))
-    }
-
-    fn u64(&self, index: usize) -> u64 {
-        u64::from(self.u32(index)) | (u64::from(self.u32(index + 1)) << 32)
-    }
 }
 
 impl Service for GpuSession {
