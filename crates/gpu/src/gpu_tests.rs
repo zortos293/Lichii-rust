@@ -857,6 +857,7 @@ fn syncpoint_wait_holds_the_submission_until_reached() {
             .host(host::SYNCPOINT_B, id << 8)
             .inc(0, 0x701, &[2]);
         let entry = rig.entry(&words.0);
+        rig.syncpoints.increase_max(id, 2).unwrap();
         rig.gpu.submit(
             channel,
             Submission {
@@ -866,10 +867,10 @@ fn syncpoint_wait_holds_the_submission_until_reached() {
             },
         );
         assert!(rig.methods().is_empty());
-        rig.syncpoints.guest().increment(id).unwrap();
+        rig.syncpoints.host().increment(id).unwrap();
         let c = channel.0;
         assert_eq!(rig.methods(), [(c, EngineKind::Maxwell3d, 0x700, 1)]);
-        rig.syncpoints.guest().increment(id).unwrap();
+        rig.syncpoints.host().increment(id).unwrap();
         assert_eq!(
             rig.methods(),
             [
@@ -877,6 +878,93 @@ fn syncpoint_wait_holds_the_submission_until_reached() {
                 (c, EngineKind::Maxwell3d, 0x701, 2)
             ]
         );
+    });
+}
+
+#[test]
+fn a_syncpoint_wait_past_every_reserved_increment_does_not_hold_the_channel() {
+    each_mode(|threading| {
+        let mut rig = Rig::new(threading);
+        let channel = rig.channel(HostClass::Maxwell);
+        let id = 5;
+        let words = Pushbuffer::default()
+            .bind(0, MAXWELL_3D)
+            .inc(0, 0x700, &[1])
+            .host(host::SYNCPOINT_A, 2)
+            .host(host::SYNCPOINT_B, id << 8)
+            .inc(0, 0x701, &[2]);
+        let entry = rig.entry(&words.0);
+        rig.gpu.submit(
+            channel,
+            Submission {
+                entries: &[entry],
+                wait: Some(SyncpointFence { id: 0x40, value: 1 }),
+                increment: None,
+            },
+        );
+        let c = channel.0;
+        assert_eq!(
+            rig.methods(),
+            [
+                (c, EngineKind::Maxwell3d, 0x700, 1),
+                (c, EngineKind::Maxwell3d, 0x701, 2)
+            ],
+            "{threading:?}"
+        );
+    });
+}
+
+#[test]
+fn a_syncpoint_wait_follows_a_suspended_channels_increments_without_their_host_gpu_work() {
+    each_mode(|threading| {
+        let mut rig = Rig::deferred(threading);
+        let producer = rig.channel(HostClass::Maxwell);
+        let consumer = rig.channel(HostClass::Maxwell);
+        let id = 9;
+        let words = Pushbuffer::default()
+            .bind(0, MAXWELL_3D)
+            .host(host::SEMAPHORE_A, (SEMAPHORE >> 32) as u32)
+            .host(host::SEMAPHORE_B, SEMAPHORE as u32)
+            .host(host::SEMAPHORE_C, 1)
+            .host(host::SEMAPHORE_D, 1)
+            .inc(0, 0x700, &[1]);
+        let entry = rig.entry(&words.0);
+        let fence = rig
+            .gpu
+            .submit(
+                producer,
+                Submission {
+                    entries: &[entry],
+                    wait: None,
+                    increment: Some(SyncpointIncrement::fence_increment(id, false)),
+                },
+            )
+            .unwrap();
+        let words = Pushbuffer::default()
+            .bind(0, MAXWELL_3D)
+            .inc(0, 0x701, &[2]);
+        let entry = rig.entry(&words.0);
+        rig.gpu.submit(
+            consumer,
+            Submission {
+                entries: &[entry],
+                wait: Some(fence),
+                increment: None,
+            },
+        );
+        assert!(rig.methods().is_empty(), "{threading:?}");
+        rig.memory.write(SEMAPHORE, 1u32).unwrap();
+        rig.gpu.wake();
+        assert_eq!(
+            rig.methods(),
+            [
+                (producer.0, EngineKind::Maxwell3d, 0x700, 1),
+                (consumer.0, EngineKind::Maxwell3d, 0x701, 2)
+            ],
+            "{threading:?}"
+        );
+        assert_eq!(rig.syncpoints.host().value(id), Ok(fence.value));
+        assert_eq!(rig.syncpoints.guest().value(id), Ok(0));
     });
 }
 
@@ -1003,6 +1091,17 @@ mod masm {
             }
             [(bits >> 64) as u32, (bits >> 32) as u32, bits as u32]
         }
+    }
+
+    /// Writes `value` to `method`, then ends.
+    pub fn emit_program(method: u16, value: u16) -> Vec<u32> {
+        [
+            inst(imm(method), imm(value)).out0(IMM0, IMM1).end(),
+            inst(nop(), nop()),
+        ]
+        .iter()
+        .flat_map(Inst::encode)
+        .collect()
     }
 
     /// Reads `count` words at the address in parameters 0 (high) and 1 (low) through
@@ -1362,6 +1461,7 @@ fn bind_address_space_switches_memory_for_later_work_only() {
         let channel = rig.channel(HostClass::Maxwell);
         let id = 9;
         let first = rig.entry(&Pushbuffer::default().upload(0x20_0000, &[1]).0);
+        rig.syncpoints.increase_max(id, 1).unwrap();
         rig.gpu.submit(
             channel,
             Submission {
@@ -1381,7 +1481,7 @@ fn bind_address_space_switches_memory_for_later_work_only() {
         );
         rig.gpu.synchronize();
         assert_eq!(rig.read(0x20_0000), 0, "{threading:?}");
-        rig.syncpoints.guest().increment(id).unwrap();
+        rig.syncpoints.host().increment(id).unwrap();
         rig.gpu.synchronize();
         assert_eq!(rig.read(0x20_0000), 1, "{threading:?}");
         assert_eq!(rig.read(0x30_0000), 2, "{threading:?}");
@@ -1906,6 +2006,75 @@ fn an_idle_gpu_with_no_pending_fences_sleeps() {
             rig.work.fence_polls.load(Ordering::Relaxed),
             before,
             "{threading:?}: the GPU polls fences while none are pending"
+        );
+    });
+}
+
+#[test]
+fn switch_2_compute_macros_keep_their_own_code_beside_the_3d_macros() {
+    each_mode(|threading| {
+        let mut rig = Rig::new(threading);
+        let channel = rig.channel(HostClass::Ampere);
+        let call = |words: Pushbuffer, subchannel| {
+            words.once(subchannel, crate::macros::MACRO_METHOD_BASE, &[0])
+        };
+        let words = Pushbuffer::default()
+            .bind(0, AMPERE_3D)
+            .bind(1, 0xc7c0)
+            .load_macro(0, &masm::emit_program(0x701, 0x3d))
+            .load_macro(1, &masm::emit_program(0x200, 0xc0));
+        let words = call(call(words, 0), 1);
+        rig.submit(channel, &words.0);
+        assert_eq!(
+            rig.methods(),
+            [
+                (channel.0, EngineKind::Maxwell3d, 0x701, 0x3d),
+                (channel.0, EngineKind::Compute, 0x200, 0xc0),
+            ],
+            "{threading:?}"
+        );
+    });
+}
+
+#[test]
+fn switch_2_compute_calls_run_the_3d_macros_until_compute_uploads_its_own() {
+    each_mode(|threading| {
+        let mut rig = Rig::new(threading);
+        let channel = rig.channel(HostClass::Ampere);
+        let words = Pushbuffer::default()
+            .bind(0, AMPERE_3D)
+            .bind(1, 0xc7c0)
+            .load_macro(0, &masm::emit_program(0x200, 0x3d))
+            .once(1, crate::macros::MACRO_METHOD_BASE, &[0]);
+        rig.submit(channel, &words.0);
+        assert_eq!(
+            rig.methods(),
+            [(channel.0, EngineKind::Compute, 0x200, 0x3d)],
+            "{threading:?}"
+        );
+    });
+}
+
+#[test]
+fn one_channels_compute_upload_leaves_other_channels_on_the_3d_macros() {
+    each_mode(|threading| {
+        let mut rig = Rig::new(threading);
+        let uploader = rig.channel(HostClass::Ampere);
+        let caller = rig.channel(HostClass::Ampere);
+        let words = Pushbuffer::default()
+            .bind(1, 0xc7c0)
+            .load_macro(1, &masm::emit_program(0x200, 0xc0));
+        rig.submit(uploader, &words.0);
+        let words = Pushbuffer::default()
+            .bind(0, AMPERE_3D)
+            .bind(1, 0xc7c0)
+            .load_macro(0, &masm::emit_program(0x200, 0x3d))
+            .once(1, crate::macros::MACRO_METHOD_BASE, &[0]);
+        rig.submit(caller, &words.0);
+        assert_eq!(
+            rig.methods(),
+            [(caller.0, EngineKind::Compute, 0x200, 0x3d)],
+            "{threading:?}"
         );
     });
 }

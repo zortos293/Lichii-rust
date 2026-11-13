@@ -36,6 +36,8 @@ pub const DEFAULT_RING_SLOTS: usize = 1 << 20;
 /// the renderer's pending fences at the same pace.
 pub(crate) const MIN_POLL: Duration = Duration::from_micros(50);
 pub(crate) const MAX_POLL: Duration = Duration::from_millis(1);
+/// How long a channel stays suspended, or the front waits for the back, before it is reported.
+pub(crate) const LONG_WAIT: Duration = Duration::from_secs(2);
 
 /// Where the back half runs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -341,6 +343,8 @@ impl Front {
             if channel.is_runnable(&self.shared) {
                 channel.run(&mut self.shared);
                 resumed = true;
+            } else {
+                channel.report_long_wait(&self.shared);
             }
         }
         resumed
@@ -419,6 +423,7 @@ impl Gpu {
             shared: FrontShared {
                 stream: Stream::new(producer, link, side_sender, fetch_syncs),
                 shared_macros: None,
+                compute_macros: None,
                 words: Vec::new(),
                 waiters: handles.syncpoints.semaphore_waiters().clone(),
                 inbox: inbox.clone(),

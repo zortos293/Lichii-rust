@@ -209,6 +209,102 @@ fn empty_vertex_program_from_the_translator() {
     assert_eq!(positions, 1, "the vertex program writes Position");
 }
 
+fn relative(offset: i32) -> u64 {
+    (u64::from(offset as u32) & 0xff_ffff) << 20
+}
+
+/// Translates and validates `code` as a `stage` program.
+fn validate_maxwell(name: &str, stage: ShaderStage, code: &[u64]) {
+    let mut env = TestEnv::new(code);
+    env.stage = stage;
+    let program = translate_env(&env);
+    emit(name, &Profile::default(), &RuntimeInfo::default(), &program);
+}
+
+#[test]
+fn ssy_and_sync_reconverge_a_conditional_branch() {
+    validate_maxwell(
+        "ssy_sync",
+        ShaderStage::Compute,
+        &[
+            encode(Sass::Ssy, relative(40)),
+            encode(Sass::Nop, PT | 0xf00),
+            encode(Sass::Bra, relative(16) | 0xf),
+            encode(Sass::Sync, PT | 0xf),
+            encode(Sass::Sync, PT | 0xf),
+            encode(Sass::Exit, PT | 0xf),
+        ],
+    );
+}
+
+#[test]
+fn pbk_and_brk_leave_a_loop() {
+    validate_maxwell(
+        "pbk_brk",
+        ShaderStage::Compute,
+        &[
+            encode(Sass::Pbk, relative(32)),
+            encode(Sass::Brk, 0xf),
+            encode(Sass::Bra, PT | relative(-16) | 0xf),
+            encode(Sass::Exit, PT | 0xf),
+            encode(Sass::Exit, PT | 0xf),
+        ],
+    );
+}
+
+#[test]
+fn kil_demotes_a_fragment() {
+    validate_maxwell(
+        "kil",
+        ShaderStage::Fragment,
+        &[encode(Sass::Kil, 0xf), encode(Sass::Exit, PT | 0xf)],
+    );
+}
+
+#[test]
+fn cal_runs_a_subroutine() {
+    validate_maxwell(
+        "cal_ret",
+        ShaderStage::Compute,
+        &[
+            encode(Sass::Cal, relative(8)),
+            encode(Sass::Exit, PT | 0xf),
+            encode(Sass::Nop, PT | 0xf00),
+            encode(Sass::Ret, PT | 0xf),
+        ],
+    );
+}
+
+/// A jump table entry that points at the scheduling word opening a bundle branches to the
+/// bundle's first instruction.
+#[test]
+fn indirect_branch_to_a_bundle_start_skips_its_scheduling_word() {
+    let exit = encode(Sass::Exit, PT | 0xf);
+    let mut env = TestEnv::new(&[
+        encode(Sass::ImnmxImm, PT | (1 << 20) | 1),
+        encode(Sass::ShlImm, PT | (2 << 20) | (1 << 8) | 2),
+        encode(
+            Sass::Ldc,
+            (4 << 48) | (2 << 36) | (0x40 << 20) | PT | (2 << 8) | 3,
+        ),
+        encode(Sass::Brx, PT | (3 << 8) | 0xf),
+        exit,
+        exit,
+        exit,
+    ]);
+    env.words[8] = 0x001f_c400_fe20_07f1;
+    env.cbuf = vec![0; 18];
+    env.cbuf[16] = 16;
+    env.cbuf[17] = 8;
+    let program = translate_env(&env);
+    emit(
+        "indirect_bundle_start",
+        &Profile::default(),
+        &RuntimeInfo::default(),
+        &program,
+    );
+}
+
 #[test]
 fn compute_program_with_shared_and_local_memory() {
     let mut s = Synthetic::new();

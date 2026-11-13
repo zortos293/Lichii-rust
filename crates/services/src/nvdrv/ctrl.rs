@@ -198,9 +198,8 @@ impl Ctrl {
             .ok()
             .map(Duration::from_millis);
         match self
-            .syncpoints()
-            .guest()
-            .wait(params.id, params.threshold, timeout)
+            .nvdrv
+            .wait_syncpoint(params.id, params.threshold, timeout)
         {
             Ok(value) => {
                 params.value = value;
@@ -263,7 +262,7 @@ impl Ctrl {
             return NvResult::BadParameter;
         }
         if failing {
-            if let Err(error) = self.syncpoints().guest().wait(fence_id, target, None) {
+            if let Err(error) = self.nvdrv.wait_syncpoint(fence_id, target, None) {
                 tracing::error!(%error, "event wait fallback");
             }
             params.value = target;
@@ -452,6 +451,26 @@ mod tests {
             .unwrap()
             .event
             .clone()
+    }
+
+    #[test]
+    fn an_endless_syncpoint_wait_ends_when_the_kernel_shuts_down() {
+        let (context, _client) = context(SWITCH1_TITLE, Settings::default());
+        let ctrl = Ctrl::new(super::super::register(&context).unwrap());
+        let kernel = context.kernel.clone();
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            kernel.shutdown();
+        });
+        let mut params = SyncptWait {
+            id: 0x30,
+            threshold: 1,
+            timeout: -1,
+            value: 0,
+        };
+        assert_eq!(ctrl.syncpt_wait(&mut params), NvResult::Timeout);
+        assert_eq!(params.value, 0);
+        stopper.join().unwrap();
     }
 
     #[test]

@@ -387,12 +387,26 @@ impl PageTable {
         state: MemoryState,
         perm: MemoryPermission,
     ) -> HleResult<VAddr> {
+        self.map_new_from(self.pool, region, size, state, perm)
+    }
+
+    /// [`PageTable::map_new_in`] with pages from `pool` instead of the process pool, for memory
+    /// a service keeps in the process (the graphics server's GPU-only regions). Freeing returns
+    /// the pages to `pool`.
+    pub fn map_new_from(
+        &self,
+        pool: Pool,
+        region: Region,
+        size: u64,
+        state: MemoryState,
+        perm: MemoryPermission,
+    ) -> HleResult<VAddr> {
         let mut s = self.state.lock();
         let addr = s
             .blocks
             .find_free(region.start, region.end, size, PAGE_SIZE, PAGE_SIZE)
             .ok_or(result::OUT_OF_MEMORY)?;
-        let group = self.memory.allocate(self.pool, size)?;
+        let group = self.memory.allocate(pool, size)?;
         self.map_runs(addr, &group, perm);
         s.blocks.set(addr, size, state, perm, 0);
         Ok(addr)

@@ -5,7 +5,10 @@
 //! The front waits for the back only where it reads what the back writes: an unmet semaphore
 //! acquire, a syncpoint wait, wait-for-idle and MME DMA reads (NX2_GPU_THREAD_SPLIT.md). An acquire
 //! or syncpoint wait that still fails after that suspends the channel; the front runs other
-//! channels and resumes it at the next word once the condition holds.
+//! channels and resumes it at the next word once the condition holds. A syncpoint wait holds the
+//! channel only until the back has executed the increments it waits for, never until the host GPU
+//! finished their work, and only for increments a submission reserved: the reference GPU does not
+//! wait on syncpoints at all. A channel suspended for [`LONG_WAIT`] is reported once.
 //!
 //! A GPFIFO entry with its SYNC bit is fetched after the work before it completed, so a command
 //! list that compute or copy work wrote is read with those writes: the channel suspends until
@@ -15,6 +18,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Instant;
 
 use lichii_common::GpuVAddr;
 
@@ -24,13 +28,14 @@ use crate::channel::{ChannelConfig, SemaphoreWaiters, SyncpointFence, SyncpointI
 use crate::engines::EngineKind;
 use crate::engines::kepler_compute::Regs as ComputeRegs;
 use crate::engines::maxwell_3d::{MACRO_REGISTERS_START, RegisterState, Regs};
-use crate::gmmu::{Gmmu, RangeTarget};
-use crate::gpu::Inbox;
+use crate::gmmu::{Gmmu, GpuFault, RangeTarget};
+use crate::gpu::{Inbox, LONG_WAIT};
 use crate::host::{AcquireOp, FIRST_ENGINE_METHOD, HostAction, HostClass, HostState, ReleaseKind};
-use crate::host1x::Syncpoints;
+use crate::host1x::{Syncpoints, is_reached};
 use crate::macros::{
-    LOAD_MME_INSTRUCTION_RAM_POINTER, LOAD_MME_START_ADDRESS_RAM, MACRO_METHOD_BASE, MacroDataRam,
-    MacroEngine, MacroHost, MacroIsa,
+    LOAD_MME_INSTRUCTION_RAM_POINTER, LOAD_MME_START_ADDRESS_RAM,
+    LOAD_MME_START_ADDRESS_RAM_POINTER, MACRO_METHOD_BASE, MacroDataRam, MacroEngine, MacroHost,
+    MacroIsa,
 };
 use crate::pushbuffer::{CommandParser, Flow, GpEntry, MethodCall, MethodHandler};
 use crate::reg_index;
@@ -52,8 +57,13 @@ const SHADOW_SCRATCH_0: usize = reg_index!(Regs, shadow_scratch) as usize;
 pub(crate) struct FrontShared {
     pub stream: Stream,
     /// Switch 2: the channels of a process share one graphics context, and with it the macro
-    /// code of their 3D and compute engines (NX2_NOTES row 53). Each keeps its own data RAM.
+    /// code of their 3D engines (NX2_NOTES row 53). Each keeps its own data RAM.
     pub shared_macros: Option<MacroEngine>,
+    /// Switch 2: the compute engines' own macro code, used by the channels whose compute class
+    /// set its instruction or start-address pointer (`ChannelState::compute_macros`). The
+    /// other channels' compute uploads and calls use the 3D macros, as in the reference, and no
+    /// compute upload overwrites the 3D macros at the same code addresses.
+    pub compute_macros: Option<MacroEngine>,
     /// The words of the entry being parsed.
     pub words: Vec<u32>,
     pub waiters: Arc<SemaphoreWaiters>,
@@ -79,6 +89,8 @@ pub(crate) enum Work {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Wait {
     Semaphore {
+        /// The host method that acquired.
+        method: u32,
         address: GpuVAddr,
         payload: u64,
         op: AcquireOp,
@@ -103,6 +115,9 @@ pub(crate) struct FrontChannel {
     wait: Option<Wait>,
     /// The entry at the queue's front waited for its fetch synchronisation.
     fetch_synced: bool,
+    /// When the front first saw the current wait, and whether it reported it.
+    waiting_since: Option<Instant>,
+    wait_reported: bool,
 }
 
 /// What the method handler of a channel changes.
@@ -120,6 +135,9 @@ struct ChannelState {
     calls: [MacroCall; 2],
     /// Switch 1: GPU address the back takes the next compute DATA_UPLOAD word to come from.
     upload_next: Option<GpuVAddr>,
+    /// Switch 2: the compute class set a macro instruction or start-address pointer, so its
+    /// uploads and calls use [`FrontShared::compute_macros`] from then on.
+    compute_macros: bool,
 }
 
 /// Parameters one macro call can have: the words of one command (a 13-bit count).
@@ -181,11 +199,14 @@ impl FrontChannel {
                 macros: None,
                 calls: [MacroCall::new(), MacroCall::new()],
                 upload_next: None,
+                compute_macros: false,
             },
             queue: VecDeque::new(),
             offset: 0,
             wait: None,
             fetch_synced: false,
+            waiting_since: None,
+            wait_reported: false,
         }
     }
 
@@ -224,6 +245,7 @@ impl FrontChannel {
                 payload,
                 op,
                 wide,
+                ..
             } => {
                 shared.waiters.latched(self.id)
                     || semaphore_met(
@@ -237,10 +259,72 @@ impl FrontChannel {
             }
             Wait::Syncpoint(fence) => shared
                 .syncpoints
-                .guest()
+                .host()
                 .is_reached(fence.id, fence.value)
                 .unwrap_or(true),
             Wait::Fetch(ticket) => shared.stream.fetch_synced(ticket),
+        }
+    }
+
+    /// Reports a channel suspended for [`LONG_WAIT`], once per wait, naming what it waits on, as
+    /// the reference does for acquires: a title that stops presenting usually waits on one.
+    pub(crate) fn report_long_wait(&mut self, shared: &FrontShared) {
+        let Some(wait) = self.wait else {
+            return;
+        };
+        let now = Instant::now();
+        let since = *self.waiting_since.get_or_insert(now);
+        if self.wait_reported || now.duration_since(since) < LONG_WAIT {
+            return;
+        }
+        self.wait_reported = true;
+        let channel = self.id.0;
+        match wait {
+            Wait::Semaphore {
+                method,
+                address,
+                payload,
+                op,
+                wide,
+            } => {
+                let hex =
+                    |value: Option<u64>| value.map_or("unmapped".into(), |v| format!("{v:#x}"));
+                let current = semaphore_value(
+                    &self.memory,
+                    shared.syncpoints.semaphore_mirror(),
+                    address,
+                    wide,
+                );
+                tracing::warn!(
+                    channel,
+                    method = format_args!("{method:#x}"),
+                    address = format_args!("{address:#x}"),
+                    device = %hex(self.memory.translate(address)),
+                    ?op,
+                    payload = format_args!("{payload:#x}"),
+                    wide,
+                    current = %hex(current.ok()),
+                    latched = shared.waiters.latched(self.id),
+                    "GPU channel has waited 2 s on a semaphore acquire"
+                );
+            }
+            Wait::Syncpoint(fence) => {
+                let syncpoints = &shared.syncpoints;
+                tracing::warn!(
+                    channel,
+                    id = fence.id,
+                    value = fence.value,
+                    host = ?syncpoints.host().value(fence.id).ok(),
+                    guest = ?syncpoints.guest().value(fence.id).ok(),
+                    max = ?syncpoints.max(fence.id).ok(),
+                    "GPU channel has waited 2 s on a syncpoint"
+                );
+            }
+            Wait::Fetch(ticket) => tracing::warn!(
+                channel,
+                ticket,
+                "GPU channel has waited 2 s for the back to synchronise a GPFIFO entry's fetch"
+            ),
         }
     }
 
@@ -251,6 +335,8 @@ impl FrontChannel {
                 return;
             }
             self.wait = None;
+            self.waiting_since = None;
+            self.wait_reported = false;
             shared.waiters.remove(self.id);
         }
         if self.queue.is_empty() {
@@ -384,8 +470,26 @@ impl FrontChannel {
     }
 }
 
-/// Whether the word at `address` meets the acquire, as GPU acquires see it: a 32-bit word may
-/// hold a mirrored Switch 2 queue semaphore value kept out of memory.
+/// The semaphore at `address` as GPU acquires see it: a 32-bit word may hold a mirrored Switch 2
+/// queue semaphore value kept out of memory.
+fn semaphore_value(
+    memory: &Gmmu,
+    mirror: &SemaphoreMirror,
+    address: GpuVAddr,
+    wide: bool,
+) -> Result<u64, GpuFault> {
+    if wide {
+        return memory.read::<u64>(address);
+    }
+    let load = || memory.read::<u32>(address);
+    match memory.translate(address) {
+        Some(device) => mirror.acquire_view(device, load),
+        None => load(),
+    }
+    .map(u64::from)
+}
+
+/// Whether the semaphore at `address` meets the acquire.
 fn semaphore_met(
     memory: &Gmmu,
     mirror: &SemaphoreMirror,
@@ -394,17 +498,7 @@ fn semaphore_met(
     op: AcquireOp,
     wide: bool,
 ) -> bool {
-    let current = if wide {
-        memory.read::<u64>(address)
-    } else {
-        let load = || memory.read::<u32>(address);
-        match memory.translate(address) {
-            Some(device) => mirror.acquire_view(device, load),
-            None => load(),
-        }
-        .map(u64::from)
-    };
-    match current {
+    match semaphore_value(memory, mirror, address, wide) {
         Ok(current) => op.is_met(current, payload, wide),
         Err(fault) => {
             tracing::warn!(?fault, "semaphore acquire on unmapped GPU memory");
@@ -468,7 +562,7 @@ impl Dispatch<'_> {
                 payload,
                 op,
                 wide,
-            } => return self.acquire(address, payload, op, wide),
+            } => return self.acquire(call.method, address, payload, op, wide),
             HostAction::Release {
                 address,
                 payload,
@@ -503,7 +597,14 @@ impl Dispatch<'_> {
     /// the back: drain it and look again, then suspend the channel (NX2_NOTES row 50). The
     /// channel waits from before its first look, so a release that lands and is overwritten at
     /// any point before the second look still latches it.
-    fn acquire(&mut self, address: GpuVAddr, payload: u64, op: AcquireOp, wide: bool) -> Flow {
+    fn acquire(
+        &mut self,
+        method: u32,
+        address: GpuVAddr,
+        payload: u64,
+        op: AcquireOp,
+        wide: bool,
+    ) -> Flow {
         if let Some(device) = self.memory.translate(address) {
             self.shared.waiters.add(self.id, device, payload, op, wide);
         }
@@ -532,6 +633,7 @@ impl Dispatch<'_> {
         }
         self.shared.stream.release_fences();
         *self.wait = Some(Wait::Semaphore {
+            method,
             address,
             payload,
             op,
@@ -540,18 +642,32 @@ impl Dispatch<'_> {
         Flow::Suspend
     }
 
-    /// A syncpoint wait: increments come from finished GPU work, which the back's fences report.
+    /// A syncpoint wait holds the channel until the back has executed the increments it waits
+    /// for (the host bank), so its later work follows the work before them in the stream. A value
+    /// past every increment submissions reserved counts as reached: nothing queued reaches it.
     fn syncpoint_wait(&mut self, fence: SyncpointFence) -> Flow {
-        let bank = self.shared.syncpoints.guest();
-        match bank.is_reached(fence.id, fence.value) {
-            Ok(false) => {}
-            Ok(true) => return Flow::Continue,
-            Err(error) => {
+        let syncpoints = self.shared.syncpoints.clone();
+        let bank = syncpoints.host();
+        let max = match (
+            bank.is_reached(fence.id, fence.value),
+            syncpoints.max(fence.id),
+        ) {
+            (Ok(true), _) => return Flow::Continue,
+            (Ok(false), Ok(max)) => max,
+            (Err(error), _) | (_, Err(error)) => {
                 tracing::warn!(%error, "GPU waits on an invalid syncpoint");
                 return Flow::Continue;
             }
+        };
+        if !is_reached(max, fence.value) {
+            tracing::debug!(
+                id = fence.id,
+                value = fence.value,
+                max,
+                "GPU waits for a syncpoint value no submission reserved"
+            );
+            return Flow::Continue;
         }
-        self.shared.stream.release_fences();
         self.shared.stream.drain();
         if bank.is_reached(fence.id, fence.value).unwrap_or(true) {
             return Flow::Continue;
@@ -611,8 +727,17 @@ impl Dispatch<'_> {
         }
         if native && is_load_mme(method) {
             self.state.compute[method as usize] = call.argument;
-            self.shared
-                .shared_macros
+            let shared = &mut *self.shared;
+            self.state.compute_macros |= matches!(
+                method,
+                LOAD_MME_INSTRUCTION_RAM_POINTER | LOAD_MME_START_ADDRESS_RAM_POINTER
+            );
+            let engine = if self.state.compute_macros {
+                &mut shared.compute_macros
+            } else {
+                &mut shared.shared_macros
+            };
+            engine
                 .get_or_insert_with(|| MacroEngine::new(MacroIsa::Mme64))
                 .write_load_mme(method, call.argument);
             return;
@@ -642,6 +767,7 @@ impl Dispatch<'_> {
             data_ram,
             macros,
             calls,
+            compute_macros,
             ..
         } = &mut *self.state;
         let pending = &mut calls[target as usize];
@@ -652,16 +778,20 @@ impl Dispatch<'_> {
         if call.remaining != 0 {
             return;
         }
-        let engine = match host.class() {
-            HostClass::Maxwell => macros.as_mut(),
-            HostClass::Ampere => self.shared.shared_macros.as_mut(),
+        let shared = &mut *self.shared;
+        let engine = match (host.class(), target) {
+            (HostClass::Maxwell, _) => macros.as_mut(),
+            (HostClass::Ampere, MacroTarget::Compute) if *compute_macros => {
+                shared.compute_macros.as_mut()
+            }
+            (HostClass::Ampere, _) => shared.shared_macros.as_mut(),
         };
         if let Some(engine) = engine {
             let mut host = FrontMacroHost {
                 target,
                 graphics,
                 compute,
-                stream: &mut self.shared.stream,
+                stream: &mut shared.stream,
                 memory: self.memory,
             };
             if let Err(error) =
@@ -812,6 +942,7 @@ mod tests {
                 fetch_syncs,
             ),
             shared_macros: None,
+            compute_macros: None,
             words: Vec::new(),
             waiters: Arc::default(),
             inbox,

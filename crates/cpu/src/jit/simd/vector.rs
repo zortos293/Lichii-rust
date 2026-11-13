@@ -101,6 +101,14 @@ pub enum VecOp {
         signed: Option<W>,
         vector: Value,
     },
+    /// `EXT`: bytes `index` onwards of `m:n` (with `n` in the low bytes), 16 of them when `q` is
+    /// set and else 8 from the low halves.
+    Ext {
+        q: bool,
+        index: u8,
+        n: Value,
+        m: Value,
+    },
 }
 
 impl VecOp {
@@ -118,7 +126,8 @@ impl VecOp {
                 vector: a,
                 value: b,
                 ..
-            } => {
+            }
+            | VecOp::Ext { n: a, m: b, .. } => {
                 f(a);
                 f(b);
             }
@@ -259,6 +268,16 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
     if word & 0x9fe0_8400 == 0x0e00_0400 {
         return copy(t, word);
     }
+    if word & 0xbfe0_8400 == 0x2e00_0000 {
+        let index = field(word, 11, 4);
+        if !q && index >= 8 {
+            return false;
+        }
+        let (n, m) = (vec(t, rn), vec(t, rm));
+        let r = emit(t, VecOp::Ext { q, index, n, m });
+        t.set(Loc::V(rd), r);
+        return true;
+    }
     false
 }
 
@@ -330,23 +349,32 @@ fn copy(t: &mut Translator, word: u32) -> bool {
     true
 }
 
-/// `LD1`/`ST1` (multiple structures) of `rpt` consecutive registers, one vector access each in
-/// register order. A load writes the registers only after every access succeeded and the base is
-/// written back last, so a fault leaves the interpreter's state: no register or base written, and
-/// every byte before the faulting one stored.
-pub(in super::super) fn load_store_multiple(t: &mut Translator, inst: &Inst, pc: u64) {
+/// Emits `LD1`..`LD4`/`ST1`..`ST4` (multiple structures) and returns true, or emits nothing and
+/// returns false when an interleaved form needs SSE4.1 lane inserts the host lacks.
+///
+/// `LD1`/`ST1` make one vector access per register, in register order. `LD2`..`LD4`/`ST2`..`ST4`
+/// access the interleaved structures as 16-byte chunks (and an 8-byte tail) in address order, and
+/// move each element between its chunk lane and its register lane. Either way a load writes the
+/// registers only after every access succeeded and the base is written back last, so a fault
+/// leaves the interpreter's state: no register or base written, and every byte before the
+/// faulting one stored.
+pub(in super::super) fn load_store_multiple(t: &mut Translator, inst: &Inst, pc: u64) -> bool {
     let Inst::VecMulti {
         load,
         q,
+        size: element,
         rpt,
+        selem,
         vt,
         rn,
         post,
-        ..
     } = *inst
     else {
         unreachable!("only VecMulti reaches here");
     };
+    if selem > 1 {
+        return interleaved(t, load, q, element, selem, vt, rn, post, pc);
+    }
     let size = if q { 4 } else { 3 };
     let base = t.x(rn);
     let mut loaded = [Value(0); 4];
@@ -374,6 +402,186 @@ pub(in super::super) fn load_store_multiple(t: &mut Translator, inst: &Inst, pc:
             t.set(Loc::V((vt + r) % 32), loaded[r as usize]);
         }
     }
+    post_index(t, rn, post, base);
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn interleaved(
+    t: &mut Translator,
+    load: bool,
+    q: bool,
+    size: u8,
+    selem: u8,
+    vt: u8,
+    rn: Reg,
+    post: PostIndex,
+    pc: u64,
+) -> bool {
+    if size.is_multiple_of(2) && !t.sse41 {
+        return false;
+    }
+    let vector = |t: &mut Translator, op| t.op(Op::Simd(SimdOp::Vec(op)));
+    let move_lane =
+        |t: &mut Translator, from: Value, from_lane: usize, to: Value, to_lane: usize| {
+            let value = vector(
+                t,
+                VecOp::Extract {
+                    size,
+                    index: from_lane as u8,
+                    signed: None,
+                    vector: from,
+                },
+            );
+            vector(
+                t,
+                VecOp::Insert {
+                    size,
+                    index: to_lane as u8,
+                    vector: to,
+                    value,
+                },
+            )
+        };
+    let bytes = selem as usize * if q { 16 } else { 8 };
+    let lanes = (if q { 16 } else { 8 }) >> size;
+    let per_chunk = 16 >> size;
+    let base = t.x(rn);
+    let mut chunks = [(Value(0), Value(0)); 4];
+    for (c, chunk) in chunks.iter_mut().enumerate().take(bytes.div_ceil(16)) {
+        chunk.0 = if c == 0 {
+            base
+        } else {
+            let offset = t.op(Op::Const(16 * c as u64));
+            t.op(Op::Add(W::W64, base, offset))
+        };
+    }
+    let chunk_size = |c: usize| if 16 * c + 16 <= bytes { 4 } else { 3 };
+    let regs: [u8; 4] = std::array::from_fn(|s| (vt + s as u8) % 32);
+    if load {
+        for (c, (addr, value)) in chunks.iter_mut().enumerate().take(bytes.div_ceil(16)) {
+            *value = t.op(Op::LoadVec {
+                size: chunk_size(c),
+                addr: *addr,
+                pc,
+            });
+        }
+        let mut loaded = [Value(0); 4];
+        for (s, value) in loaded.iter_mut().enumerate().take(selem as usize) {
+            *value = (0..lanes).fold(vector(t, VecOp::Imm(0, true)), |v, e| {
+                let k = e * selem as usize + s;
+                move_lane(t, chunks[k / per_chunk].1, k % per_chunk, v, e)
+            });
+        }
+        for (s, &value) in loaded.iter().enumerate().take(selem as usize) {
+            t.set(Loc::V(regs[s]), value);
+        }
+    } else {
+        let mut source = [Value(0); 4];
+        for (s, value) in source.iter_mut().enumerate().take(selem as usize) {
+            *value = t.op(Op::Get(Loc::V(regs[s])));
+        }
+        for (c, &(addr, _)) in chunks.iter().enumerate().take(bytes.div_ceil(16)) {
+            let elements = (bytes - 16 * c).min(16) >> size;
+            let value = (0..elements).fold(vector(t, VecOp::Imm(0, true)), |v, i| {
+                let k = c * per_chunk + i;
+                move_lane(t, source[k % selem as usize], k / selem as usize, v, i)
+            });
+            t.op(Op::StoreVec {
+                size: chunk_size(c),
+                addr,
+                value,
+                pc,
+            });
+        }
+    }
+    post_index(t, rn, post, base);
+    true
+}
+
+/// Emits `LD1`..`LD4`/`ST1`..`ST4` (single structure) or `LD1R`..`LD4R` and returns true, or emits
+/// nothing and returns false when a lane insert needs SSE4.1 the host lacks. Like the
+/// interpreter, each register is written as soon as its element loads, so a fault leaves the
+/// earlier registers updated, and the base is written back last.
+pub(in super::super) fn load_store_single(t: &mut Translator, inst: &Inst, pc: u64) -> bool {
+    let (load, size, selem, lane, q, vt, rn, post) = match *inst {
+        Inst::VecSingle {
+            load,
+            size,
+            selem,
+            index,
+            vt,
+            rn,
+            post,
+        } => (load, size, selem, Some(index), false, vt, rn, post),
+        Inst::VecReplicate {
+            q,
+            size,
+            selem,
+            vt,
+            rn,
+            post,
+        } => (true, size, selem, None, q, vt, rn, post),
+        _ => unreachable!("only VecSingle and VecReplicate reach here"),
+    };
+    if load && lane.is_some() && size % 2 == 0 && !t.sse41 {
+        return false;
+    }
+    let vector = |t: &mut Translator, op| t.op(Op::Simd(SimdOp::Vec(op)));
+    let base = t.x(rn);
+    for s in 0..selem {
+        let addr = if s == 0 {
+            base
+        } else {
+            let offset = t.op(Op::Const((s as u64) << size));
+            t.op(Op::Add(W::W64, base, offset))
+        };
+        let reg = Loc::V((vt + s) % 32);
+        match lane {
+            Some(index) if !load => {
+                let v = t.op(Op::Get(reg));
+                let value = vector(
+                    t,
+                    VecOp::Extract {
+                        size,
+                        index,
+                        signed: None,
+                        vector: v,
+                    },
+                );
+                t.op(Op::Store {
+                    size,
+                    addr,
+                    value,
+                    pc,
+                });
+            }
+            Some(index) => {
+                let value = t.op(Op::Load { size, addr, pc });
+                let v = t.op(Op::Get(reg));
+                let r = vector(
+                    t,
+                    VecOp::Insert {
+                        size,
+                        index,
+                        vector: v,
+                        value,
+                    },
+                );
+                t.set(reg, r);
+            }
+            None => {
+                let value = t.op(Op::Load { size, addr, pc });
+                let r = vector(t, VecOp::Dup(Arrangement { size, q }, value));
+                t.set(reg, r);
+            }
+        }
+    }
+    post_index(t, rn, post, base);
+    true
+}
+
+fn post_index(t: &mut Translator, rn: Reg, post: PostIndex, base: Value) {
     let step = match post {
         PostIndex::None => return,
         PostIndex::Imm(n) => t.op(Op::Const(n as u64)),
@@ -564,6 +772,28 @@ impl Emitter<'_> {
                     (Shift::Ushr, _) => dynasm!(self.asm ; .arch x64 ; psrlq Rx(d), n),
                     (Shift::Sshr, 1) => dynasm!(self.asm ; .arch x64 ; psraw Rx(d), n),
                     (Shift::Sshr, _) => dynasm!(self.asm ; .arch x64 ; psrad Rx(d), n),
+                }
+                (d, q)
+            }
+            VecOp::Ext { q, index, n, m } => {
+                let (n, m) = (self.reg(n), self.reg(m));
+                let d = self.def(v);
+                let k = index as i8;
+                self.copy(d, n);
+                if q {
+                    dynasm!(self.asm
+                        ; .arch x64
+                        ; psrldq Rx(d), k
+                        ; movdqa Rx(SCRATCH), Rx(m)
+                        ; pslldq Rx(SCRATCH), 16 - k
+                        ; por Rx(d), Rx(SCRATCH)
+                    );
+                } else {
+                    dynasm!(self.asm
+                        ; .arch x64
+                        ; punpcklqdq Rx(d), Rx(m)
+                        ; psrldq Rx(d), k
+                    );
                 }
                 (d, q)
             }

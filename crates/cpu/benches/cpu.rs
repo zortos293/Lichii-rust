@@ -196,6 +196,94 @@ const WORKLOADS: &[Workload] = &[
         per_iteration: 10,
     },
     Workload {
+        name: "vector lane loop",
+        code: &[
+            0x0d409020, // 1: ld1 {v0.s}[1], [x1]
+            0x4d40c821, // ld1r {v1.4s}, [x1]
+            0x4ea18400, // add v0.4s, v0.4s, v1.4s
+            0x4d608022, // ld2 {v2.s, v3.s}[2], [x1]
+            0x6e231c42, // eor v2.16b, v2.16b, v3.16b
+            0x0d009020, // st1 {v0.s}[1], [x1]
+            0x4d004822, // st1 {v2.h}[5], [x1]
+            0xf10004a5, // subs x5, x5, #1
+            0x54ffff01, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 9,
+    },
+    Workload {
+        name: "vector fp loop",
+        code: &[
+            0x4f03f702, // fmov v2.4s, #1.5
+            0x4f03f500, // fmov v0.4s, #0.75
+            0x4fa21001, // 1: fmla v1.4s, v0.4s, v2.s[1]
+            0x4f829003, // fmul v3.4s, v0.4s, v2.s[0]
+            0x4e23d424, // fadd v4.4s, v1.4s, v3.4s
+            0x4e20cc85, // fmla v5.4s, v4.4s, v0.4s
+            0x6e22dca6, // fmul v6.4s, v5.4s, v2.4s
+            0x4ea4d4c7, // fsub v7.4s, v6.4s, v4.4s
+            0x4c007827, // st1 {v7.4s}, [x1]
+            0xf10004a5, // subs x5, x5, #1
+            0x54ffff01, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 9,
+    },
+    Workload {
+        name: "fp element loop",
+        code: &[
+            0x4f03f702, // fmov v2.4s, #1.5
+            0x4f03f500, // fmov v0.4s, #0.75
+            0x5fa29001, // 1: fmul s1, s0, v2.s[1]
+            0x5f821824, // fmla s4, s1, v2.s[2]
+            0x5fc25805, // fmls d5, d0, v2.d[1]
+            0x5e21d803, // scvtf s3, s0
+            0x1e232886, // fadd s6, s4, s3
+            0x7e61d827, // ucvtf d7, d1
+            0xbd000026, // str s6, [x1]
+            0xf10004a5, // subs x5, x5, #1
+            0x54ffff01, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 9,
+    },
+    Workload {
+        name: "vector struct loop",
+        code: &[
+            0x4c408820, // 1: ld2 {v0.4s, v1.4s}, [x1]
+            0x4ea18402, // add v2.4s, v0.4s, v1.4s
+            0x4c008821, // st2 {v1.4s, v2.4s}, [x1]
+            0x4c400424, // ld4 {v4.8h, v5.8h, v6.8h, v7.8h}, [x1]
+            0x6e271c84, // eor v4.16b, v4.16b, v7.16b
+            0x0c004024, // st3 {v4.8b, v5.8b, v6.8b}, [x1]
+            0xf10004a5, // subs x5, x5, #1
+            0x54ffff21, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 8,
+    },
+    Workload {
+        name: "vector ext loop",
+        code: &[
+            0x4c407020, // 1: ld1 {v0.16b}, [x1]
+            0x6e021801, // ext v1.16b, v0.16b, v2.16b, #3
+            0x2e002822, // ext v2.8b, v1.8b, v0.8b, #5
+            0x6e016043, // ext v3.16b, v2.16b, v1.16b, #12
+            0x6e211c60, // eor v0.16b, v3.16b, v1.16b
+            0x6e004004, // ext v4.16b, v0.16b, v0.16b, #8
+            0x4c007024, // st1 {v4.16b}, [x1]
+            0xf10004a5, // subs x5, x5, #1
+            0x54ffff01, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 9,
+    },
+    Workload {
         name: "popcount loop",
         code: &[
             0x4c407020, // 1: ld1 {v0.16b}, [x1]

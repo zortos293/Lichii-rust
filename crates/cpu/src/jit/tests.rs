@@ -58,7 +58,7 @@ impl Rng {
         }
     }
 
-    /// A vector register value: random bits, a low lane holding an edge-case S or D value, or
+    /// A vector register value: random bits, S or D lanes holding small or edge-case values, or
     /// words from a small set so lanes of every size compare equal, differ in one half, and sit
     /// on the signed and unsigned boundaries.
     fn vector(&mut self) -> u128 {
@@ -66,12 +66,18 @@ impl Rng {
         match self.below(6) {
             0 => (self.next() as u128) << 64 | self.next() as u128,
             1..=3 => {
-                let low = match self.below(3) {
-                    0 => FP_S[self.below(FP_S.len() as u64) as usize] as u64 | self.next() << 32,
-                    1 => FP_D[self.below(FP_D.len() as u64) as usize],
-                    _ => ((self.below(4096) as f32 - 2048.0) / 16.0).to_bits() as u64,
-                };
-                (self.next() as u128) << 64 | low as u128
+                let double = self.below(2) == 0;
+                let (lanes, bits) = if double { (2, 64) } else { (4, 32) };
+                (0..lanes).fold(0, |v, i| {
+                    let small = (self.below(4096) as f32 - 2048.0) / 16.0;
+                    let lane = match (double, self.below(4) == 0) {
+                        (false, true) => FP_S[self.below(FP_S.len() as u64) as usize] as u64,
+                        (false, false) => small.to_bits() as u64,
+                        (true, true) => FP_D[self.below(FP_D.len() as u64) as usize],
+                        (true, false) => (small as f64).to_bits(),
+                    };
+                    v | (lane as u128) << (bits * i)
+                })
             }
             _ => (0..4).fold(0, |v, i| {
                 let word = match self.below(8) {
@@ -240,7 +246,11 @@ fn atomic(rng: &mut Rng) -> u32 {
     }
 }
 
-const FP: [&str; 14] = [
+const FP: [&str; 18] = [
+    "01x111111xxxxxxxxx01x0xxxxxxxxxx",
+    "01x111100x100001110110xxxxxxxxxx",
+    "0xx01110xx1xxxxx110xx1xxxxxxxxxx",
+    "0xx011111xxxxxxxxx01x0xxxxxxxxxx",
     "000111100x10000xx10000xxxxxxxxxx",
     "000111100x10001xx10000xxxxxxxxxx",
     "000111100x1xxxxx00xx10xxxxxxxxxx",
@@ -275,7 +285,8 @@ fn simd(rng: &mut Rng) -> u32 {
     }
 }
 
-const VECTOR: [&str; 11] = [
+const VECTOR: [&str; 12] = [
+    "0x101110000xxxxx0xxxx0xxxxxxxxxx",
     "0xx01110xx1xxxxx100001xxxxxxxxxx",
     "0xx01110xx1xxxxx000111xxxxxxxxxx",
     "0xx01110xx1xxxxx0011x1xxxxxxxxxx",
@@ -290,7 +301,7 @@ const VECTOR: [&str; 11] = [
 ];
 
 /// An Advanced SIMD integer three-same, compare against zero, `CNT`, shift by immediate, copy or
-/// modified-immediate instruction, or an `LD1`/`ST1` of one to four registers on `X20`..`X23` or
+/// modified-immediate instruction, or an `LD1`..`LD4`/`ST1`..`ST4` of one to four registers on `X20`..`X23` or
 /// `SP`, offset or post-indexed by an immediate or `X24`/`X26`.
 fn vector(rng: &mut Rng) -> u32 {
     if rng.below(3) == 0 {
@@ -299,9 +310,25 @@ fn vector(rng: &mut Rng) -> u32 {
         } else {
             BASES + rng.below(4) as u32
         };
-        let opcode = [0b0111, 0b1010, 0b0110, 0b0010][rng.below(4) as usize];
+        let opcode =
+            [0b0111, 0b1010, 0b0110, 0b0010, 0b1000, 0b0100, 0b0000][rng.below(7) as usize];
         let post = rng.below(2) as u32;
         let rm = post * [31, 24, 26][rng.below(3) as usize];
+        if rng.below(2) == 0 {
+            loop {
+                let w = (rng.next() as u32 & (1 << 30 | 1 << 22 | 1 << 21 | 0x3f << 10 | 0x1f))
+                    | 0x0d00_0000
+                    | post << 23
+                    | rm << 16
+                    | base << 5;
+                if matches!(
+                    decode(w),
+                    Inst::VecSingle { .. } | Inst::VecReplicate { .. }
+                ) {
+                    return w;
+                }
+            }
+        }
         return (rng.next() as u32 & (1 << 30 | 1 << 22 | 3 << 10 | 0x1f))
             | 0x0c00_0000
             | post << 23
@@ -683,7 +710,7 @@ fn faults_leave_the_interpreters_state() {
 }
 
 #[test]
-fn multiple_structure_faults_leave_the_interpreters_state() {
+fn vector_structure_faults_leave_the_interpreters_state() {
     const MOV_X0_1: u32 = 0xd280_0020;
     const MOV_X0_2: u32 = 0xd280_0040;
     const LD1_16B_X4_X2_POST: u32 = 0x4cdf_2040;
@@ -692,6 +719,18 @@ fn multiple_structure_faults_leave_the_interpreters_state() {
     const ST1_2D_X2_X2: u32 = 0x4c00_ac40;
     const LD1_8B_X3_X2_POST_X3: u32 = 0x0cc3_6040;
     const ST1_8B_X3_X2_POST_X3: u32 = 0x0c83_6040;
+    const LD4_S1_X2_POST: u32 = 0x0dff_b040;
+    const ST4_S1_X2_POST: u32 = 0x0dbf_b040;
+    const LD3R_8H_X2: u32 = 0x4d40_e440;
+    const LD2_D1_X2_POST_X3: u32 = 0x4de3_8441;
+    const ST3_B13_X2_POST_X3: u32 = 0x4d83_3441;
+    const LD4R_2D_X2_POST: u32 = 0x4dff_ec41;
+    const LD4_4S_X2_POST: u32 = 0x4cdf_0840;
+    const ST4_4S_X2_POST: u32 = 0x4c9f_0840;
+    const LD3_8B_X2_POST_X3: u32 = 0x0cc3_4041;
+    const ST2_8H_X2_POST_X3: u32 = 0x4c83_8441;
+    const ST3_16B_X2: u32 = 0x4c00_4041;
+    const LD2_2D_X2: u32 = 0x4c40_8c41;
     let movi = |rd: u32, imm: u32| 0x4f00_e400 | (imm >> 5) << 16 | (imm & 31) << 5 | rd;
     for addr in [
         RODATA + 0x1000 - 1,
@@ -713,6 +752,18 @@ fn multiple_structure_faults_leave_the_interpreters_state() {
             ST1_2D_X2_X2,
             LD1_8B_X3_X2_POST_X3,
             ST1_8B_X3_X2_POST_X3,
+            LD4_S1_X2_POST,
+            ST4_S1_X2_POST,
+            LD3R_8H_X2,
+            LD2_D1_X2_POST_X3,
+            ST3_B13_X2_POST_X3,
+            LD4R_2D_X2_POST,
+            LD4_4S_X2_POST,
+            ST4_4S_X2_POST,
+            LD3_8B_X2_POST_X3,
+            ST2_8H_X2_POST_X3,
+            ST3_16B_X2,
+            LD2_2D_X2,
         ] {
             let code = [
                 movi(0, 0x11),
@@ -823,7 +874,14 @@ fn fp_edge_cases_match_the_interpreter() {
         1 << 53 | 1,
     ];
     for x in integers {
-        for op in [0x1e22_0020, 0x1e23_0020, 0x9e22_0020, 0x9e23_0020] {
+        for op in [
+            0x1e22_0020,
+            0x1e23_0020,
+            0x9e22_0020,
+            0x9e23_0020,
+            0x5e21_d820,
+            0x7e21_d820,
+        ] {
             for (fp, fpsr) in [(0, 0), (0, 0x10), (1 << 22, 0), (1 << 22, 0x10)] {
                 let mut ctx = ThreadContext {
                     pc: CODE,
@@ -831,10 +889,140 @@ fn fp_edge_cases_match_the_interpreter() {
                     ..Default::default()
                 };
                 ctx.x[1] = x;
+                ctx.v[1] = 0x5a5a_5a5a_5a5a_5a5a << 64 | x as u128;
                 compare(machines, &[op | fp, BRK], &ctx, &data);
             }
         }
     }
+}
+
+#[test]
+fn vector_fp_edge_cases_match_the_interpreter() {
+    const S_OPS: [u32; 14] = [
+        0x4e22_d420, // fadd v0.4s, v1.4s, v2.4s
+        0x4ea2_d420, // fsub v0.4s, v1.4s, v2.4s
+        0x6e22_dc20, // fmul v0.4s, v1.4s, v2.4s
+        0x4e22_cc20, // fmla v0.4s, v1.4s, v2.4s
+        0x4ea2_cc20, // fmls v0.4s, v1.4s, v2.4s
+        0x4fa2_9820, // fmul v0.4s, v1.4s, v2.s[3]
+        0x4fa2_1020, // fmla v0.4s, v1.4s, v2.s[1]
+        0x4f82_5820, // fmls v0.4s, v1.4s, v2.s[2]
+        0x0e22_d420, // fadd v0.2s, v1.2s, v2.2s
+        0x0f82_1020, // fmla v0.2s, v1.2s, v2.s[0]
+        0x0fa2_9820, // fmul v0.2s, v1.2s, v2.s[3]
+        0x5fa2_9820, // fmul s0, s1, v2.s[3]
+        0x5fa2_1020, // fmla s0, s1, v2.s[1]
+        0x5f82_5820, // fmls s0, s1, v2.s[2]
+    ];
+    const D_OPS: [u32; 9] = [
+        0x4e62_d420, // fadd v0.2d, v1.2d, v2.2d
+        0x6e62_dc20, // fmul v0.2d, v1.2d, v2.2d
+        0x4e62_cc20, // fmla v0.2d, v1.2d, v2.2d
+        0x4ee2_cc20, // fmls v0.2d, v1.2d, v2.2d
+        0x4fc2_9820, // fmul v0.2d, v1.2d, v2.d[1]
+        0x4fc2_1020, // fmla v0.2d, v1.2d, v2.d[0]
+        0x5fc2_9820, // fmul d0, d1, v2.d[1]
+        0x5fc2_1020, // fmla d0, d1, v2.d[0]
+        0x5fc2_5820, // fmls d0, d1, v2.d[1]
+    ];
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+        ("jit without fma", Machine::new(Backend::NoFma)),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    let fpcrs = [0, 1 << 24, 1 << 25, 3 << 22];
+    let s_values: Vec<u64> = FP_S.iter().map(|&s| s as u64).collect();
+    for (ops, values, bits) in [
+        (S_OPS.as_slice(), s_values.as_slice(), 32),
+        (&D_OPS, FP_D.as_slice(), 64),
+    ] {
+        let len = values.len();
+        let vector = |f: &dyn Fn(usize) -> usize| {
+            (0..128 / bits).fold(0u128, |v, k| v | (values[f(k) % len] as u128) << (bits * k))
+        };
+        for &op in ops {
+            for i in 0..len {
+                for j in 0..len {
+                    for (fpcr, fpsr) in fpcrs.into_iter().flat_map(|c| [(c, 0), (c, 0x10)]) {
+                        let mut ctx = ThreadContext {
+                            pc: CODE,
+                            fpcr,
+                            fpsr,
+                            ..Default::default()
+                        };
+                        ctx.v[0] = vector(&|k| i * 7 + j + k);
+                        ctx.v[1] = vector(&|k| i + k);
+                        ctx.v[2] = vector(&|k| j + 5 * k);
+                        compare(machines, &[op, BRK], &ctx, &data);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Enough live results to put destinations in xmm8..xmm15, which the hand-encoded
+/// FMLA/FMLS .2D reach through VEX.R.
+#[test]
+fn vector_fp_uses_high_registers() {
+    const STREAM: [u32; 17] = [
+        0x4e62_cc30,
+        0x4ee4_cc71,
+        0x4e66_ccb2,
+        0x4ee8_ccf3,
+        0x4e6a_cd34,
+        0x4eec_cd75,
+        0x4e6e_cdb6,
+        0x4ee1_cdf7,
+        0x4e63_cc58,
+        0x4ee5_cc99,
+        0x4e67_ccda,
+        0x4ee9_cd1b,
+        0x4e6b_cd5c,
+        0x4eed_cd9d,
+        0x4e6f_cdde,
+        0x4ee9_cc3f,
+        BRK,
+    ];
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+    ];
+    let mut ctx = ThreadContext {
+        pc: CODE,
+        fpsr: 0x10,
+        ..Default::default()
+    };
+    for (r, v) in ctx.v.iter_mut().enumerate() {
+        let x = (r as f64 + 1.0) * 0.375;
+        *v = ((-x).to_bits() as u128) << 64 | x.to_bits() as u128;
+    }
+    compare(machines, &STREAM, &ctx, &vec![0u8; DATA_SIZE as usize]);
+}
+
+/// A by-element product that underflows to zero must fall back, for UFC, even where the same
+/// lane of the element register is zero.
+#[test]
+fn vector_fp_underflow_to_zero_falls_back() {
+    const FMUL_V0_V1_V2_S3: u32 = 0x4fa2_9820;
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+    ];
+    let mut ctx = ThreadContext {
+        pc: CODE,
+        fpsr: 0x10,
+        ..Default::default()
+    };
+    ctx.v[1] = 0x0000_0001_0000_0001_0000_0001_0000_0001;
+    ctx.v[2] = 1 << 96;
+    compare(
+        machines,
+        &[FMUL_V0_V1_V2_S3, BRK],
+        &ctx,
+        &vec![0u8; DATA_SIZE as usize],
+    );
 }
 
 /// Inexact native ops rely on FPSR.IXC being set already: after an FPSR write clears it, or while
@@ -1586,6 +1774,7 @@ fn profile_counts_without_changing_results() {
             accuracy: CpuAccuracy::Auto,
         };
         let mut jit = Jit::build(config, Passes::ALL, profile).unwrap();
+        jit.target.sse41 = false;
         let mut ctx = ThreadContext {
             pc: CODE,
             fpcr: 1 << 24,

@@ -20,7 +20,7 @@ fn expand_imm(fp: Fp, imm8: u8) -> u64 {
 
 /// Emits `word` as native ops and returns true, or emits nothing and returns false.
 pub(in super::super) fn lower(t: &mut Translator, word: u32) -> bool {
-    if super::vector::lower(t, word) {
+    if super::vector::lower(t, word) || super::fp_vector::lower(t, word) {
         return true;
     }
     let (rd, rn, rm) = (field(word, 0, 5), field(word, 5, 5), field(word, 16, 5));
@@ -58,6 +58,21 @@ pub(in super::super) fn lower(t: &mut Translator, word: u32) -> bool {
         _ => {}
     }
     let wide = word >> 31 != 0;
+    if word & 0xdfbf_fc00 == 0x5e21_d800 {
+        let v = vec(t, rn);
+        let x = t.op(Op::Simd(SimdOp::ToGpr(fp, v)));
+        set_vec(
+            t,
+            SimdOp::FromInt {
+                fp,
+                signed: word & 1 << 29 == 0,
+                wide: fp == Fp::D,
+                x,
+                word,
+            },
+        );
+        return true;
+    }
     match word & 0x7f3f_fc00 {
         0x1e22_0000 | 0x1e23_0000 => {
             let x = t.x(Reg(rn));

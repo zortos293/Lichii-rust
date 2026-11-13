@@ -197,7 +197,16 @@ impl Translator<'_> {
                     self.op(Op::CallSimd { word, pc });
                 }
             }
-            Inst::VecMulti { selem: 1, .. } => super::simd::load_store_multiple(self, inst, pc),
+            Inst::VecMulti { .. } => {
+                if !super::simd::load_store_multiple(self, inst, pc) {
+                    return Step::Rejected;
+                }
+            }
+            Inst::VecSingle { .. } | Inst::VecReplicate { .. } => {
+                if !super::simd::load_store_single(self, inst, pc) {
+                    return Step::Rejected;
+                }
+            }
             Inst::Adr { rd, offset } => {
                 let v = self.k(target(offset));
                 self.set_x(rd, v);
