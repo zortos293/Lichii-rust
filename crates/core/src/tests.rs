@@ -64,6 +64,7 @@ fn settings(console: ConsoleGeneration) -> Arc<Settings> {
     let mut settings = Settings::default();
     settings.system.preferred_console = console;
     settings.system.rng_seed = Some(1);
+    settings.audio.output = lichii_common::settings::AudioOutput::Null;
     Arc::new(settings)
 }
 
@@ -104,11 +105,13 @@ fn pause_freezes_guest_time() {
     system.pause();
     assert!(system.is_paused());
     assert!(system.kernel().is_paused());
+    assert!(system.audio().is_paused());
     let frozen = system.timing().global_time_ns();
     std::thread::sleep(Duration::from_millis(20));
     assert_eq!(system.timing().global_time_ns(), frozen);
     system.run().unwrap();
     assert!(!system.is_paused());
+    assert!(!system.audio().is_paused());
     std::thread::sleep(Duration::from_millis(5));
     assert!(system.timing().global_time_ns() > frozen);
 }
@@ -124,4 +127,23 @@ fn missing_title_is_a_loader_error() {
         ),
         Err(SystemError::Loader(_))
     ));
+}
+
+#[test]
+fn audio_volume_reaches_the_services_sink() {
+    let file = TempFile::new("volume.nso", &nso(&exit_program()));
+    let system = System::boot(
+        settings(ConsoleGeneration::Switch1),
+        &file.0,
+        headless_renderer(),
+    )
+    .unwrap();
+    assert!(Arc::ptr_eq(system.audio(), &system.services().audio));
+    let mut audio = system.settings().audio.clone();
+    audio.volume = 150;
+    system.set_audio_volume(&audio);
+    assert_eq!(system.audio().host_volume(), 1.5);
+    audio.muted = true;
+    system.set_audio_volume(&audio);
+    assert_eq!(system.audio().host_volume(), 0.0);
 }
