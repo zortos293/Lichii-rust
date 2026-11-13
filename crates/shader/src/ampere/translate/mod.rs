@@ -1,6 +1,8 @@
 //! Ampere instruction translators: one function per operation, grouped by family. Each family
 //! file owns a `translate` entry point that the dispatcher sends its operations to.
 
+#[cfg(test)]
+mod captured;
 mod common;
 mod control;
 mod float;

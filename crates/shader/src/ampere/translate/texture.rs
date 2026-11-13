@@ -1012,7 +1012,7 @@ fn surface_atomic(t: &mut Translator<'_>, dest: Option<Reg>, op: u64) -> TResult
     let Some(ops) = atomic_ops(op, signed) else {
         return Err(t.unsupported());
     };
-    if insn.bit(72) || !insn.pred_dst0().is_true() {
+    if insn.bit(72) || (dest.is_some() && !insn.pred_dst0().is_true()) {
         return Err(t.unsupported());
     }
     let dim = SurfaceDim::decode(t)?;
