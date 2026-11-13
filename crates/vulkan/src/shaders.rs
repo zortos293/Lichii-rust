@@ -92,6 +92,8 @@ pub static EGUI_VERT: &[u32] = spirv!("egui.vert");
 pub static EGUI_FRAG: &[u32] = spirv!("egui.frag");
 /// `block_linear_unswizzle.comp`: Block-linear to pitch-linear copy of one 2D slice, one word per invocation, local size 32x8. Matches `lichii_texture::block_linear` for both GOB layouts.
 pub static BLOCK_LINEAR_UNSWIZZLE_COMP: &[u32] = spirv!("block_linear_unswizzle.comp");
+/// `indirect_assemble.comp`: Quads, quad strips and line loops of indirect draws as u32 triangle list or line strip indices and patched `VkDrawIndexedIndirectCommand`s, one 64-invocation workgroup per guest command.
+pub static INDIRECT_ASSEMBLE_COMP: &[u32] = spirv!("indirect_assemble.comp");
 /// `clear.vert`: Fullscreen triangle from `gl_VertexIndex` 0..2 with no outputs, for masked clears.
 pub static CLEAR_VERT: &[u32] = spirv!("clear.vert");
 /// `clear_float.frag`: Writes the push constant `vec4` to a float or normalized colour target at location 0.
@@ -125,6 +127,7 @@ pub static ALL: &[(&str, &[u32])] = &[
     ("egui.vert", EGUI_VERT),
     ("egui.frag", EGUI_FRAG),
     ("block_linear_unswizzle.comp", BLOCK_LINEAR_UNSWIZZLE_COMP),
+    ("indirect_assemble.comp", INDIRECT_ASSEMBLE_COMP),
     ("clear.vert", CLEAR_VERT),
     ("clear_float.frag", CLEAR_FLOAT_FRAG),
     ("clear_uint.frag", CLEAR_UINT_FRAG),

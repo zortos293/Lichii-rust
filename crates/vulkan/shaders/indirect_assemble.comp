@@ -1,0 +1,193 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// Assembles the quads, quad strips or line loops of indirect draws into u32 triangle list or
+// line strip indices plus one VkDrawIndexedIndirectCommand per guest command, one workgroup a
+// command. Matches `assemble` in buffer_cache.rs: with restart each run between restart indices
+// assembles on its own, and line loops put a restart index before every run. Commands past the
+// draw count, and commands whose indices would overflow the output, draw nothing.
+
+#version 460
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Commands { uint commands[]; };
+layout(set = 0, binding = 1) readonly buffer Count { uint draw_count[]; };
+layout(set = 0, binding = 2) readonly buffer Indices { uint guest_indices[]; };
+layout(set = 0, binding = 3) writeonly buffer HostCommands { uint host_commands[]; };
+layout(set = 0, binding = 4) writeonly buffer HostIndices { uint host_indices[]; };
+
+layout(push_constant) uniform P {
+    uint command_word;
+    uint stride_words;
+    uint max_draws;
+    // ~0 without a count buffer
+    uint count_word;
+    uint index_byte;
+    // 0 for non-indexed draws
+    uint index_width;
+    uint index_limit;
+    uint restart;
+    uint assembly;
+    uint capacity;
+} p;
+
+const uint QUADS = 0u;
+const uint QUAD_STRIP = 1u;
+const uint RESTART = 0xffffffffu;
+const uint GROUP = 64u;
+const uint QUAD[6] = uint[](0u, 1u, 2u, 0u, 2u, 3u);
+const uint STRIP[6] = uint[](0u, 3u, 1u, 0u, 2u, 3u);
+
+shared uint scan[GROUP];
+shared int last_restart[GROUP];
+
+uint command(uint draw, uint word) {
+    return commands[p.command_word + draw * p.stride_words + word];
+}
+
+// First and count of a command, clamped to the index buffer like BufferCache::index_buffer.
+uvec2 range(uint draw) {
+    uint first = command(draw, 2u);
+    uint count = command(draw, 0u);
+    if (p.index_width == 0u) {
+        return uvec2(0u, count);
+    }
+    first = min(first, p.index_limit);
+    return uvec2(first, min(count, p.index_limit - first));
+}
+
+uint value_at(uint first, uint i) {
+    if (p.index_width == 0u) {
+        return i;
+    }
+    uint byte_offset = p.index_byte + (first + i) * p.index_width;
+    uint word = guest_indices[byte_offset >> 2u];
+    if (p.index_width == 4u) {
+        return word;
+    }
+    uint mask = p.index_width == 1u ? 0xffu : 0xffffu;
+    return (word >> ((byte_offset & 3u) * 8u)) & mask;
+}
+
+bool is_restart(uint value) {
+    uint restart_value = p.index_width == 1u ? 0xffu : p.index_width == 2u ? 0xffffu : RESTART;
+    return p.restart != 0u && value == restart_value;
+}
+
+// Host indices a command of `count` guest indices may emit; past the capacity when it cannot fit.
+uint bound(uint count) {
+    if (count > p.capacity) {
+        return p.capacity + 1u;
+    }
+    if (p.assembly == QUADS) {
+        return count / 4u * 6u;
+    }
+    if (p.assembly == QUAD_STRIP) {
+        return count >= 4u ? (count - 2u) / 2u * 6u : 0u;
+    }
+    if (count == 0u) {
+        return 0u;
+    }
+    return p.restart != 0u ? count + count / 2u + 2u : count + 1u;
+}
+
+void main() {
+    uint draw = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationIndex;
+    uint draws = p.count_word == RESTART ? p.max_draws : min(draw_count[p.count_word], p.max_draws);
+    uint out_word = draw * 5u;
+    if (draw >= draws) {
+        if (t < 5u) {
+            host_commands[out_word + t] = 0u;
+        }
+        return;
+    }
+
+    uint overflow = p.capacity + 1u;
+    uint partial = 0u;
+    for (uint j = t; j < draw; j += GROUP) {
+        partial = min(partial + bound(range(j).y), overflow);
+    }
+    scan[t] = partial;
+    barrier();
+    for (uint step = GROUP / 2u; step > 0u; step >>= 1u) {
+        if (t < step) {
+            scan[t] = min(scan[t] + scan[t + step], overflow);
+        }
+        barrier();
+    }
+    uint region = scan[0];
+    uvec2 r = range(draw);
+    uint first = r.x;
+    uint count = r.y;
+    bool fits = region <= p.capacity && bound(count) <= p.capacity - region;
+
+    uint emitted = 0u;
+    int carry_restart = -1;
+    for (uint base = 0u; fits && base < count; base += GROUP) {
+        uint i = base + t;
+        bool valid = i < count;
+        uint value = valid ? value_at(first, i) : 0u;
+        bool restart = valid && is_restart(value);
+        last_restart[t] = restart ? int(i) : carry_restart;
+        barrier();
+        for (uint step = 1u; step < GROUP; step <<= 1u) {
+            int before = t >= step ? last_restart[t - step] : -1;
+            barrier();
+            last_restart[t] = max(last_restart[t], before);
+            barrier();
+        }
+        uint run_start = uint(last_restart[t] + 1);
+        uint position = i - run_start;
+        bool run_end = i + 1u >= count || is_restart(value_at(first, i + 1u));
+        bool separator = p.restart != 0u && position == 0u;
+        uint emit = 0u;
+        if (valid && !restart) {
+            if (p.assembly == QUADS) {
+                emit = position % 4u == 3u ? 6u : 0u;
+            } else if (p.assembly == QUAD_STRIP) {
+                emit = position >= 3u && position % 2u == 1u ? 6u : 0u;
+            } else {
+                emit = 1u + (run_end ? 1u : 0u) + (separator ? 1u : 0u);
+            }
+        }
+        scan[t] = emit;
+        barrier();
+        for (uint step = 1u; step < GROUP; step <<= 1u) {
+            uint before = t >= step ? scan[t - step] : 0u;
+            barrier();
+            scan[t] += before;
+            barrier();
+        }
+        uint slot = region + emitted + scan[t] - emit;
+        if (emit != 0u && p.assembly == QUADS) {
+            for (uint k = 0u; k < 6u; ++k) {
+                host_indices[slot + k] = value_at(first, i - 3u + QUAD[k]);
+            }
+        } else if (emit != 0u && p.assembly == QUAD_STRIP) {
+            for (uint k = 0u; k < 6u; ++k) {
+                host_indices[slot + k] = value_at(first, i - 3u + STRIP[k]);
+            }
+        } else if (emit != 0u) {
+            if (separator) {
+                host_indices[slot++] = RESTART;
+            }
+            host_indices[slot++] = value;
+            if (run_end) {
+                host_indices[slot] = value_at(first, run_start);
+            }
+        }
+        carry_restart = last_restart[GROUP - 1u];
+        emitted += scan[GROUP - 1u];
+        barrier();
+    }
+
+    if (t == 0u) {
+        bool indexed = p.index_width != 0u;
+        host_commands[out_word] = emitted;
+        host_commands[out_word + 1u] = command(draw, 1u);
+        host_commands[out_word + 2u] = fits ? region : 0u;
+        host_commands[out_word + 3u] = command(draw, indexed ? 3u : 2u);
+        host_commands[out_word + 4u] = command(draw, indexed ? 4u : 3u);
+    }
+}
