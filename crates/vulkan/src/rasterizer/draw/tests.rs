@@ -2394,6 +2394,11 @@ fn draw_per_invocation_table_handles(
     let indices: Vec<u32> = (0..SIZE).map(|x| x & 1).collect();
     write(&f, INDICES_TABLE, bytemuck::cast_slice(&indices));
     draw(&mut f, &gmmu, &sampling_regs());
+    assert_eq!(
+        f.rasterizer.draw.textures.len(),
+        2,
+        "64 table entries naming two textures prepare each once"
+    );
     for (i, &texel) in target(&mut f).iter().enumerate() {
         let x = i as u32 % SIZE;
         let want = if x.is_multiple_of(2) { even } else { odd };
