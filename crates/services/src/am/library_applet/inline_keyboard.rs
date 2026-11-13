@@ -5,14 +5,15 @@
 use super::{KEYBOARD_STRING_SIZE, text_lengths, u32_at, u64_at, utf16_at, write_text};
 use crate::am::applets::{InlineKeyboardAppear, InlineKeyboardEvent, InlineKeyboardReply};
 
-/// `SwkbdState`. am shows and hides the keyboard within one request, so the appearing and
-/// disappearing states are never observed.
+/// `SwkbdState`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 enum State {
     #[default]
     NotInitialized = 0,
     Hidden = 1,
+    Appearing = 2,
     Shown = 3,
+    Disappearing = 4,
 }
 
 /// `SwkbdRequestCommand`.
@@ -27,6 +28,7 @@ const SET_MOVED_CURSOR_V2_FLAG: u32 = 0xe;
 
 /// `SwkbdReplyType`.
 const FINISHED_INITIALIZE: u32 = 0x0;
+const DEFAULT: u32 = 0x1;
 const CHANGED_STRING: u32 = 0x2;
 const MOVED_CURSOR: u32 = 0x3;
 const DECIDED_ENTER: u32 = 0x5;
@@ -112,7 +114,7 @@ impl InlineKeyboard {
         let flag = || data.get(4).is_some_and(|&byte| byte != 0);
         match u32_at(data, 0) {
             FINALIZE => {
-                self.state = State::NotInitialized;
+                self.change_state(State::NotInitialized, &mut outcome.replies);
                 outcome.events.push(InlineKeyboardEvent::Finalize);
                 outcome.finalized = true;
             }
@@ -176,7 +178,7 @@ impl InlineKeyboard {
                 .push(self.reply_base(RELEASED_USER_WORD_INFO));
         }
         if self.state == State::NotInitialized && flag(SET_INITIALIZE_ARG) {
-            self.state = State::Hidden;
+            self.change_state(State::Hidden, &mut outcome.replies);
             let mut reply = self.reply_base(FINISHED_INITIALIZE);
             reply.push(0);
             outcome.replies.push(reply);
@@ -188,7 +190,8 @@ impl InlineKeyboard {
             });
         }
         if self.state == State::Hidden && flag(APPEAR) {
-            self.state = State::Shown;
+            self.change_state(State::Appearing, &mut outcome.replies);
+            self.change_state(State::Shown, &mut outcome.replies);
             let appear = &arg[layout.appear..];
             let (max_length, min_length) = text_lengths(u32_at(appear, 0x20), u32_at(appear, 0x24));
             outcome
@@ -205,14 +208,15 @@ impl InlineKeyboard {
                     backspace_enabled: arg[layout.backspace] != 0,
                 }));
         } else if self.state == State::Shown && flag(DISAPPEAR) {
-            self.state = State::Hidden;
+            self.hide(&mut outcome.replies);
             outcome.events.push(InlineKeyboardEvent::Disappear);
         }
     }
 
-    /// Encodes what the user did in the reply type the title asked for (UTF-8, V2).
-    pub fn reply(&mut self, reply: InlineKeyboardReply) -> Vec<u8> {
-        match reply {
+    /// Encodes what the user did in the reply type the title asked for (UTF-8, V2), followed by
+    /// the state changes of a keyboard the decision hides.
+    pub fn reply(&mut self, reply: InlineKeyboardReply) -> Vec<Vec<u8>> {
+        let (reply, hides) = match reply {
             InlineKeyboardReply::ChangedString { text, cursor } => {
                 self.text = text;
                 self.cursor = cursor;
@@ -230,7 +234,7 @@ impl InlineKeyboard {
                 if self.changed_string_v2 {
                     out.push(0);
                 }
-                out
+                (out, false)
             }
             InlineKeyboardReply::MovedCursor { text, cursor } => {
                 self.text = text;
@@ -247,7 +251,7 @@ impl InlineKeyboard {
                 if self.moved_cursor_v2 {
                     out.push(0);
                 }
-                out
+                (out, false)
             }
             InlineKeyboardReply::DecidedEnter { text } => {
                 self.text = text;
@@ -258,21 +262,29 @@ impl InlineKeyboard {
                 };
                 let mut out = self.reply_with_text(kind);
                 out.extend(self.text_length().to_le_bytes());
-                self.hide();
-                out
+                (out, true)
             }
-            InlineKeyboardReply::DecidedCancel => {
-                let out = self.reply_base(DECIDED_CANCEL);
-                self.hide();
-                out
-            }
+            InlineKeyboardReply::DecidedCancel => (self.reply_base(DECIDED_CANCEL), true),
+        };
+        let mut replies = vec![reply];
+        if hides {
+            self.hide(&mut replies);
+        }
+        replies
+    }
+
+    fn hide(&mut self, replies: &mut Vec<Vec<u8>>) {
+        if self.state == State::Shown {
+            self.change_state(State::Disappearing, replies);
+            self.change_state(State::Hidden, replies);
         }
     }
 
-    fn hide(&mut self) {
-        if self.state == State::Shown {
-            self.state = State::Hidden;
-        }
+    /// Moves to `state` and tells the title with a `Default` reply, which is how the guest
+    /// learns the keyboard's state.
+    fn change_state(&mut self, state: State, replies: &mut Vec<Vec<u8>>) {
+        self.state = state;
+        replies.push(self.reply_base(DEFAULT));
     }
 
     /// `SwkbdState` and `SwkbdReplyType`.

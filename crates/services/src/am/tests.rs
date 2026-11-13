@@ -519,6 +519,14 @@ fn reply_base(reply: &[u8]) -> [u32; 2] {
     ]
 }
 
+fn reply_bases(replies: &[Vec<u8>]) -> Vec<[u32; 2]> {
+    replies.iter().map(|reply| reply_base(reply)).collect()
+}
+
+/// The `Default` replies that tell the title the keyboard appeared, and that it hid.
+const APPEARED: [[u32; 2]; 2] = [[2, 1], [3, 1]];
+const HID: [[u32; 2]; 2] = [[4, 1], [1, 1]];
+
 fn utf16(text: &str) -> Vec<u8> {
     text.encode_utf16().flat_map(u16::to_le_bytes).collect()
 }
@@ -538,23 +546,27 @@ fn headless_inline_keyboard_initializes_then_cancels_when_it_appears() {
 
     am.push_interactive(applet, &inline_calc(false, INITIALIZE, "", 0));
     let replies = am.inline_replies(applet);
-    assert_eq!(replies.len(), 1);
     assert_eq!(
-        reply_base(&replies[0]),
-        [1, 0],
-        "Hidden, FinishedInitialize"
+        reply_bases(&replies),
+        [[1, 1], [1, 0]],
+        "Hidden, then FinishedInitialize"
     );
-    assert_eq!(replies[0].len(), 9);
+    assert_eq!(replies[1].len(), 9);
 
     for _ in 0..2 {
         am.push_interactive(applet, &inline_calc(false, APPEAR, "", 0));
         let replies = am.inline_replies(applet);
-        assert_eq!(replies, [[3u32.to_le_bytes(), 6u32.to_le_bytes()].concat()]);
+        assert!(replies.iter().all(|reply| reply.len() == 8));
+        assert_eq!(
+            reply_bases(&replies),
+            [APPEARED[0], APPEARED[1], [3, 6], HID[0], HID[1]],
+            "DecidedCancel while shown"
+        );
     }
 
     am.push_interactive(applet, &inline_request(4, &[]));
     assert!(am.completed(applet));
-    assert!(am.inline_replies(applet).is_empty());
+    assert_eq!(reply_bases(&am.inline_replies(applet)), [[0, 1]]);
 }
 
 /// Records the inline keyboard events and keeps the replies for the test to type with.
@@ -625,8 +637,10 @@ fn inline_keyboard_appears_and_replies_what_the_user_types() {
         let flags = INITIALIZE | APPEAR | SET_INPUT_TEXT | SET_CURSOR_POSITION;
         am.push_interactive(applet, &inline_calc(old, flags, "ab", 2));
         let replies = am.inline_replies(applet);
-        assert_eq!(replies.len(), 1);
-        assert_eq!(reply_base(&replies[0]), [1, 0], "FinishedInitialize");
+        assert_eq!(
+            reply_bases(&replies),
+            [[1, 1], [1, 0], APPEARED[0], APPEARED[1]]
+        );
         assert_eq!(
             typist.take_events(),
             [InlineKeyboardEvent::Appear(InlineKeyboardAppear {
@@ -675,10 +689,9 @@ fn inline_keyboard_appears_and_replies_what_the_user_types() {
             text: "xyz!".into(),
         });
         let replies = am.inline_replies(applet);
-        assert_eq!(replies.len(), 1);
+        assert_eq!(reply_bases(&replies), [[3, 5], HID[0], HID[1]]);
         let reply = &replies[0];
         assert_eq!(reply.len(), 8 + 0x3ec + 4);
-        assert_eq!(reply_base(reply), [3, 5], "Shown, DecidedEnter");
         assert_eq!(&reply[8..16], &utf16("xyz!")[..]);
         assert_eq!(&reply[8 + 0x3ec..], &4u32.to_le_bytes());
 
@@ -687,14 +700,16 @@ fn inline_keyboard_appears_and_replies_what_the_user_types() {
             typist.take_events().is_empty(),
             "the decided keyboard is hidden"
         );
+        assert!(am.inline_replies(applet).is_empty());
         am.push_interactive(applet, &inline_calc(old, APPEAR, "", 0));
         assert!(matches!(
             &typist.take_events()[..],
             [InlineKeyboardEvent::Appear(_)]
         ));
+        assert_eq!(reply_bases(&am.inline_replies(applet)), APPEARED);
         am.push_interactive(applet, &inline_calc(old, DISAPPEAR, "", 0));
         assert_eq!(typist.take_events(), [InlineKeyboardEvent::Disappear]);
-        assert!(am.inline_replies(applet).is_empty());
+        assert_eq!(reply_bases(&am.inline_replies(applet)), HID);
         assert!(!am.completed(applet));
     }
 }
@@ -716,7 +731,7 @@ fn inline_keyboard_replies_in_utf8_and_v2_when_the_title_asks() {
     let mut calc = inline_calc(false, INITIALIZE | APPEAR | SET_UTF8_MODE, "", 0);
     calc[0x1c + 0x46c] = 1;
     am.push_interactive(applet, &calc);
-    assert_eq!(am.inline_replies(applet).len(), 1);
+    assert_eq!(am.inline_replies(applet).len(), 4);
 
     typist.send(InlineKeyboardReply::ChangedString {
         text: "é".into(),
@@ -728,8 +743,10 @@ fn inline_keyboard_replies_in_utf8_and_v2_when_the_title_asks() {
     });
     typist.send(InlineKeyboardReply::DecidedEnter { text: "é".into() });
     let replies = am.inline_replies(applet);
-    let kinds: Vec<_> = replies.iter().map(|reply| reply_base(reply)).collect();
-    assert_eq!(kinds, [[3, 0xf], [3, 0x10], [3, 9]]);
+    assert_eq!(
+        reply_bases(&replies),
+        [[3, 0xf], [3, 0x10], [3, 9], HID[0], HID[1]]
+    );
     assert_eq!(replies[0].len(), 8 + 0x7d4 + 0x10 + 1);
     assert_eq!(&replies[0][8..11], "é\0".as_bytes());
     assert_eq!(&replies[0][8 + 0x7d4..8 + 0x7d8], &1u32.to_le_bytes());

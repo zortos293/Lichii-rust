@@ -288,10 +288,11 @@ impl LibraryApplet {
         let Some(keyboard) = state.inline.as_mut() else {
             return;
         };
-        let data = keyboard.reply(reply);
-        state
-            .interactive_out
-            .push(Arc::new(StorageData::new(data, None)));
+        for data in keyboard.reply(reply) {
+            state
+                .interactive_out
+                .push(Arc::new(StorageData::new(data, None)));
+        }
     }
 }
 
