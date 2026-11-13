@@ -27,6 +27,7 @@ use crate::engines::maxwell_3d::{DirtyState, Regs};
 use crate::gmmu::Gmmu;
 use crate::host::Reduction;
 use crate::host1x::Syncpoints;
+pub use crate::written_pages::GpuWrittenPages;
 
 /// A GPU channel (one per nvhost-gpu channel or NVN2 queue).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -39,6 +40,9 @@ pub struct GpuHandles {
     pub syncpoints: Arc<Syncpoints>,
     /// The clock 16-byte releases and query reports take their timestamp from.
     pub timestamp: Arc<GpuTimestamp>,
+    /// Device pages GPU work may have written. The renderer marks a range when it records work
+    /// that writes it; the front synchronises before fetching commands from a marked page.
+    pub written_pages: Arc<GpuWrittenPages>,
 }
 
 /// A constant buffer bound to a shader stage slot.
@@ -592,6 +596,7 @@ mod tests {
             device,
             syncpoints: Arc::new(Syncpoints::new()),
             timestamp: Arc::new(GpuTimestamp::new(Arc::new(Boot), false)),
+            written_pages: Arc::new(GpuWrittenPages::new(36)),
         };
         (space, handles)
     }

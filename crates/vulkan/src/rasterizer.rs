@@ -17,8 +17,8 @@ use lichii_common::DAddr;
 use lichii_common::settings::{AstcRecompression, GraphicsSettings, ResolutionScale};
 use lichii_gpu::backend::ChannelId;
 use lichii_gpu::backend::{
-    ComputeContext, DrawParams, FenceAction, FramebufferConfig, GpuHandles, GraphicsContext,
-    IndirectDraw, Query, QueryKind, Rasterizer,
+    ComputeContext, DrawParams, DrawTexture, FenceAction, FramebufferConfig, GpuHandles,
+    GraphicsContext, IndirectDraw, Query, QueryKind, Rasterizer,
 };
 use lichii_gpu::engines::maxwell_3d::Regs;
 use lichii_gpu::engines::maxwell_3d::regs::NUM_RENDER_TARGETS;
@@ -627,6 +627,12 @@ impl Rasterizer for VulkanRasterizer {
         }
     }
 
+    fn draw_texture(&mut self, ctx: &mut GraphicsContext<'_>, draw: &DrawTexture) {
+        if let Err(error) = self.record_draw_texture(ctx, draw) {
+            tracing::error!(%error, "recording a texture draw failed");
+        }
+    }
+
     fn clear(&mut self, ctx: &mut GraphicsContext<'_>, layer_count: u32) {
         if let Err(error) = self.clear_targets(ctx, layer_count) {
             tracing::error!(%error, "clearing render targets failed");
@@ -859,6 +865,7 @@ mod tests {
             device: memory.clone(),
             syncpoints: syncpoints.clone(),
             timestamp: Arc::new(GpuTimestamp::new(Arc::new(HostTime(Instant::now())), false)),
+            written_pages: Arc::new(lichii_gpu::backend::GpuWrittenPages::new(36)),
         };
         let mailbox = Arc::new(FrameMailbox::default());
         let rasterizer =
