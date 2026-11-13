@@ -2,7 +2,7 @@ use lichii_common::ResultCode;
 use lichii_common::settings::Settings;
 use lichii_kernel::ipc::{Handle, UNKNOWN_COMMAND_ID};
 use lichii_kernel::object::KObject;
-use lichii_kernel::testing::{IpcClient, Request};
+use lichii_kernel::testing::{IpcClient, Reply, Request};
 
 use super::*;
 use crate::testing::{SWITCH1_TITLE, SWITCH2_TITLE, context};
@@ -271,4 +271,357 @@ fn launch_parameter_preselects_the_acc_user_whose_save_ensure_save_data_creates(
         id as u64
     ));
     assert!(save.is_dir(), "{} was not created", save.display());
+}
+
+/// An `appletOE` proxy session converted to a domain, as titles use it.
+struct Domain<'a> {
+    client: &'a IpcClient,
+    session: Handle,
+    creator: u32,
+}
+
+impl<'a> Domain<'a> {
+    fn open(client: &'a IpcClient) -> Self {
+        let session = open(client, 0);
+        let mut reply = client.send(session, &Request::control(0)).unwrap();
+        assert_eq!(reply.result, ResultCode::SUCCESS);
+        let proxy = reply.pop::<u32>();
+        let mut domain = Self {
+            client,
+            session,
+            creator: 0,
+        };
+        domain.creator = domain.object(proxy, Request::new(11));
+        domain
+    }
+
+    fn call(&self, object: u32, request: Request) -> Reply {
+        self.client
+            .send(self.session, &request.to_object(object))
+            .unwrap()
+    }
+
+    #[track_caller]
+    fn object(&self, object: u32, request: Request) -> u32 {
+        let reply = self.call(object, request);
+        assert_eq!(reply.result, ResultCode::SUCCESS);
+        assert_eq!(reply.objects.len(), 1, "expected one object");
+        reply.objects[0]
+    }
+
+    fn storage(&self, data: &[u8]) -> u32 {
+        let storage = self.object(self.creator, Request::new(10).arg(data.len() as i64));
+        let accessor = self.object(storage, Request::new(0));
+        let input = self.client.alloc(data);
+        let write = Request::new(10)
+            .arg(0i64)
+            .buffer_a(input, data.len() as u64);
+        assert_eq!(self.call(accessor, write).result, ResultCode::SUCCESS);
+        storage
+    }
+
+    fn read(&self, storage: u32) -> Vec<u8> {
+        let accessor = self.object(storage, Request::new(0));
+        let size = self.call(accessor, Request::new(0)).pop::<i64>() as usize;
+        let output = self.client.alloc(&vec![0xff; size]);
+        let read = Request::new(11).arg(0i64).buffer_b(output, size as u64);
+        assert_eq!(self.call(accessor, read).result, ResultCode::SUCCESS);
+        self.client.read(output, size)
+    }
+
+    /// Creates applet `id`, pushes the common arguments and `arguments`, and starts it.
+    fn run(&self, id: u32, mode: u32, library_version: u32, arguments: &[&[u8]]) -> u32 {
+        let applet = self.object(self.creator, Request::new(0).arg(id).arg(mode));
+        for data in
+            std::iter::once(&common_arguments(library_version)[..]).chain(arguments.iter().copied())
+        {
+            let storage = self.storage(data);
+            let push = Request::new(100).input_object(storage);
+            assert_eq!(self.call(applet, push).result, ResultCode::SUCCESS);
+        }
+        assert_eq!(
+            self.call(applet, Request::new(10)).result,
+            ResultCode::SUCCESS
+        );
+        applet
+    }
+
+    fn completed(&self, applet: u32) -> bool {
+        let state_changed = self.call(applet, Request::new(0)).copy_handles[0];
+        let completed = self.call(applet, Request::new(1)).pop::<u8>() != 0;
+        assert_eq!(event_signaled(self.client, state_changed), completed);
+        completed
+    }
+
+    fn pop_out_data(&self, applet: u32) -> Vec<u8> {
+        let event = self.call(applet, Request::new(105)).copy_handles[0];
+        assert!(event_signaled(self.client, event), "pop-out-data event");
+        let storage = self.object(applet, Request::new(101));
+        assert!(
+            !event_signaled(self.client, event),
+            "out-data channel is empty"
+        );
+        self.read(storage)
+    }
+}
+
+/// `CommonArguments` version 1 with `library_version`.
+fn common_arguments(library_version: u32) -> Vec<u8> {
+    let mut data = vec![0; 0x20];
+    data[0..4].copy_from_slice(&1u32.to_le_bytes());
+    data[4..8].copy_from_slice(&0x20u32.to_le_bytes());
+    data[8..12].copy_from_slice(&library_version.to_le_bytes());
+    data
+}
+
+/// A Switch 1 8.0.0 software keyboard config (`SwkbdConfigCommon` and `SwkbdConfigNew`).
+fn keyboard_config(text_check: bool) -> Vec<u8> {
+    let mut config = vec![0; 0x4c8];
+    config[0x3ac..0x3b0].copy_from_slice(&16u32.to_le_bytes());
+    config[0x3d0] = u8::from(text_check);
+    config
+}
+
+const KEYBOARD_VERSION: u32 = 0x8000d;
+
+fn booted_with_acc() -> (crate::testing::TempDir, Arc<ServiceContext>, IpcClient) {
+    let dir = crate::testing::TempDir::new("am-applets");
+    let (context, client) = context(SWITCH1_TITLE, dir.settings());
+    crate::acc::register(&context).unwrap();
+    register(&context).unwrap();
+    (dir, context, client)
+}
+
+#[test]
+fn profile_selector_returns_the_acc_user_through_a_domain() {
+    let (_dir, context, client) = booted_with_acc();
+    let am = Domain::open(&client);
+    let user = *context.user.get().unwrap();
+
+    let applet = am.run(library_applet::PROFILE_SELECT, 0, 0x20000, &[&[0; 0xa0]]);
+    assert!(am.completed(applet));
+    let mut info = am.call(applet, Request::new(120));
+    assert_eq!(info.pop::<[u32; 2]>(), [0x10, 0]);
+    assert_eq!(
+        am.call(applet, Request::new(30)).result,
+        ResultCode::SUCCESS
+    );
+
+    let out = am.pop_out_data(applet);
+    assert_eq!(out.len(), 0x18);
+    assert_eq!(&out[..8], &0u64.to_le_bytes());
+    assert_eq!(&out[8..], &user);
+    assert_eq!(
+        am.call(applet, Request::new(101)).result,
+        NO_DATA_IN_CHANNEL
+    );
+}
+
+#[test]
+fn profile_selector_cancels_without_a_user() {
+    let (_context, client, _) = booted(SWITCH1_TITLE);
+    let am = Domain::open(&client);
+    let applet = am.run(library_applet::PROFILE_SELECT, 0, 1, &[&[0; 0x98]]);
+    let out = am.pop_out_data(applet);
+    let cancelled = u64::from(ResultCode::new(124, 1).0);
+    assert_eq!(&out[..8], &cancelled.to_le_bytes());
+    assert_eq!(&out[8..], &[0; 16]);
+}
+
+#[test]
+fn software_keyboard_returns_cancel() {
+    let (_context, client, _) = booted(SWITCH1_TITLE);
+    let am = Domain::open(&client);
+    let applet = am.run(
+        library_applet::SOFTWARE_KEYBOARD,
+        0,
+        KEYBOARD_VERSION,
+        &[&keyboard_config(false), &[0; 0x1000]],
+    );
+    assert!(am.completed(applet));
+    let out = am.pop_out_data(applet);
+    assert_eq!(out.len(), 4 + 0x7d4);
+    assert_eq!(&out[..4], &1u32.to_le_bytes(), "SwkbdResult::Cancel");
+    assert!(out[4..].iter().all(|&byte| byte == 0));
+}
+
+#[test]
+fn inline_software_keyboard_completes_with_decided_cancel() {
+    let (_context, client, _) = booted(SWITCH1_TITLE);
+    let am = Domain::open(&client);
+    let applet = am.run(
+        library_applet::SOFTWARE_KEYBOARD,
+        1,
+        KEYBOARD_VERSION,
+        &[&[0; 8]],
+    );
+    assert!(am.completed(applet));
+    let event = am.call(applet, Request::new(106)).copy_handles[0];
+    assert!(event_signaled(&client, event));
+    let reply = am.object(applet, Request::new(104));
+    let mut expected = 1u32.to_le_bytes().to_vec();
+    expected.extend(6u32.to_le_bytes());
+    assert_eq!(am.read(reply), expected);
+    assert_eq!(
+        am.call(applet, Request::new(101)).result,
+        NO_DATA_IN_CHANNEL
+    );
+}
+
+struct Typist;
+
+impl applets::AppletFrontend for Typist {
+    fn show_error(&self, _request: &applets::ErrorRequest) {}
+
+    fn select_profile(&self, _: &applets::ProfileSelectRequest) -> applets::ProfileSelectAnswer {
+        applets::ProfileSelectAnswer::Cancelled
+    }
+
+    fn configure_controllers(&self, _: &applets::ControllerRequest) -> applets::ControllerAnswer {
+        applets::ControllerAnswer::Cancelled
+    }
+
+    fn software_keyboard(
+        &self,
+        request: &applets::SoftwareKeyboardRequest,
+    ) -> applets::SoftwareKeyboardAnswer {
+        let text = match &request.text_check_message {
+            None => "Lichi",
+            Some(_) => "Lichii",
+        };
+        applets::SoftwareKeyboardAnswer::Submitted(text.into())
+    }
+}
+
+#[test]
+fn a_frontend_keyboard_goes_through_the_titles_text_check() {
+    let (context, client, _) = booted(SWITCH1_TITLE);
+    context.set_applet_frontend(Arc::new(Typist));
+    let am = Domain::open(&client);
+    let applet = am.run(
+        library_applet::SOFTWARE_KEYBOARD,
+        0,
+        KEYBOARD_VERSION,
+        &[&keyboard_config(true), &[0; 0x1000]],
+    );
+    let utf16 =
+        |text: &str| -> Vec<u8> { text.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+    let check = |result: u32, expected: &str| {
+        assert!(!am.completed(applet));
+        let request = am.read(am.object(applet, Request::new(104)));
+        let size = (expected.len() as u64 + 1) * 2;
+        assert_eq!(&request[..8], &size.to_le_bytes());
+        assert_eq!(&request[8..8 + size as usize - 2], utf16(expected));
+        let mut reply = vec![0; 0x7d8];
+        reply[..4].copy_from_slice(&result.to_le_bytes());
+        reply[4..8].copy_from_slice(&utf16("no"));
+        let push = Request::new(103).input_object(am.storage(&reply));
+        assert_eq!(am.call(applet, push).result, ResultCode::SUCCESS);
+    };
+    check(1, "Lichi");
+    check(0, "Lichii");
+    assert!(am.completed(applet));
+    let out = am.pop_out_data(applet);
+    assert_eq!(&out[..4], &0u32.to_le_bytes(), "SwkbdResult::Ok");
+    assert_eq!(&out[4..16], utf16("Lichii"));
+    assert_eq!(out[16], 0);
+}
+
+#[test]
+fn error_applet_completes_without_out_data() {
+    let (_context, client, _) = booted(SWITCH1_TITLE);
+    let am = Domain::open(&client);
+    let mut show_error = vec![0; 0x14];
+    show_error[0x10..].copy_from_slice(&ResultCode::new(2, 1).0.to_le_bytes());
+    let applet = am.run(library_applet::ERROR, 0, 0x20000, &[&show_error]);
+    assert!(am.completed(applet));
+    let event = am.call(applet, Request::new(105)).copy_handles[0];
+    assert!(!event_signaled(&client, event));
+    assert_eq!(
+        am.call(applet, Request::new(101)).result,
+        NO_DATA_IN_CHANNEL
+    );
+}
+
+#[test]
+fn controller_applet_confirms_player_one() {
+    let (_context, client, _) = booted(SWITCH1_TITLE);
+    let am = Domain::open(&client);
+    let mut private = vec![0; 0x14];
+    private[0..4].copy_from_slice(&0x14u32.to_le_bytes());
+    private[4..8].copy_from_slice(&0x430u32.to_le_bytes());
+    private[0xc..0x10].copy_from_slice(&3u32.to_le_bytes());
+    let mut argument = vec![0; 0x430];
+    argument[..2].copy_from_slice(&[1, 4]);
+    let applet = am.run(library_applet::CONTROLLER, 0, 8, &[&private, &argument]);
+    assert!(am.completed(applet));
+    let out = am.pop_out_data(applet);
+    assert_eq!(out.len(), 0xc);
+    assert_eq!(out[0], 1, "player count");
+    assert_eq!(&out[4..8], &0u32.to_le_bytes(), "player 1");
+    assert_eq!(
+        &out[8..12],
+        &0u32.to_le_bytes(),
+        "ControllerSupportResult::Success"
+    );
+}
+
+#[test]
+fn unknown_applets_exit_without_out_data() {
+    let (_context, client, _) = booted(SWITCH1_TITLE);
+    let am = Domain::open(&client);
+    let applet = am.run(0x0100_0013, 0, 0, &[]);
+    assert!(am.completed(applet));
+    let mut info = am.call(applet, Request::new(120));
+    assert_eq!(
+        info.pop::<[u32; 2]>(),
+        [0x13, 0],
+        "normalized to the low byte"
+    );
+    assert_eq!(
+        am.call(applet, Request::new(101)).result,
+        NO_DATA_IN_CHANNEL
+    );
+}
+
+#[test]
+fn push_in_data_rejects_objects_that_are_not_storage() {
+    let (_context, client, _) = booted(SWITCH1_TITLE);
+    let am = Domain::open(&client);
+    let applet = am.object(
+        am.creator,
+        Request::new(0).arg(library_applet::ERROR).arg(0u32),
+    );
+    let storage = am.storage(&[0; 0x20]);
+    let accessor = am.object(storage, Request::new(0));
+    for object in [am.creator, accessor] {
+        let push = Request::new(100).input_object(object);
+        assert_eq!(am.call(applet, push).result, UNKNOWN);
+    }
+    assert_eq!(am.call(applet, Request::new(100)).result, UNKNOWN);
+    assert!(!am.completed(applet));
+}
+
+#[test]
+fn push_in_data_takes_a_storage_moved_as_a_handle_outside_domains() {
+    let (_context, client, proxy) = booted(SWITCH1_TITLE);
+    let creator = interface(&client, proxy, 11);
+    let reply = client
+        .send(
+            creator,
+            &Request::new(0).arg(library_applet::ERROR).arg(0u32),
+        )
+        .unwrap();
+    let applet = reply.move_handles[0];
+    let storage = client
+        .send(creator, &Request::new(10).arg(0x20i64))
+        .unwrap()
+        .move_handles[0];
+    let push = Request::new(100).move_handle(storage);
+    assert_eq!(
+        client.send(applet, &push).unwrap().result,
+        ResultCode::SUCCESS
+    );
+    let push = Request::new(100).move_handle(creator);
+    assert_eq!(client.send(applet, &push).unwrap().result, UNKNOWN);
 }
