@@ -40,12 +40,15 @@ const SET_REPORT_SEMAPHORE_D: u32 = reg_index!(Regs, report_semaphore.control);
 const MAX_UPLOADS: usize = 8;
 /// Byte offset of a version 1.x descriptor's grid.
 const QMD_V2_GRID: u64 = 0xc * 4;
+/// Words of a version 1.x grid.
+const GRID_WORDS: u32 = 2;
 
-/// An inline upload since the last LAUNCH: where it wrote, and where its first data word came
-/// from.
+/// An inline upload since the last LAUNCH: where it wrote, how many bytes, and where its first
+/// [`GRID_WORDS`] data words came from when they were contiguous in the command stream.
 #[derive(Clone, Copy)]
 struct UploadSource {
     target: GpuVAddr,
+    size: u64,
     source: Option<GpuVAddr>,
 }
 
@@ -57,8 +60,8 @@ pub struct KeplerCompute {
     /// Where the next DATA_UPLOAD word comes from, when the front said.
     upload_next: Option<GpuVAddr>,
     uploads: Vec<UploadSource>,
-    /// The last upload has had no data word yet.
-    upload_started: bool,
+    /// Data words the last upload received, up to [`GRID_WORDS`].
+    upload_words: u32,
 }
 
 impl KeplerCompute {
@@ -74,12 +77,18 @@ impl KeplerCompute {
             upload: Upload::default(),
             upload_next: None,
             uploads: Vec::with_capacity(MAX_UPLOADS),
-            upload_started: true,
+            upload_words: GRID_WORDS,
         }
     }
 
     /// See [`Engine::upload_source`](super::Engine::upload_source).
     pub fn upload_source(&mut self, address: GpuVAddr) {
+        if self.upload_words != 0
+            && self.upload_words < GRID_WORDS
+            && let Some(last) = self.uploads.last_mut()
+        {
+            last.source = None;
+        }
         self.upload_next = Some(address);
     }
 
@@ -102,22 +111,24 @@ impl KeplerCompute {
                     if self.uploads.len() == MAX_UPLOADS {
                         self.uploads.remove(0);
                     }
+                    let upload = &self.regs.upload;
                     self.uploads.push(UploadSource {
-                        target: self.regs.upload.dest.address(),
+                        target: upload.dest.address(),
+                        size: u64::from(upload.line_length_in) * u64::from(upload.line_count),
                         source: None,
                     });
-                    self.upload_started = false;
+                    self.upload_words = 0;
                 }
                 self.upload
                     .exec(&self.regs.upload, self.regs.exec_upload.linear() != 0)
             }
             (_, DATA_UPLOAD) => {
-                if !self.upload_started {
-                    self.upload_started = true;
-                    if let Some(last) = self.uploads.last_mut() {
-                        last.source = self.upload_next;
-                    }
+                if self.upload_words == 0
+                    && let Some(last) = self.uploads.last_mut()
+                {
+                    last.source = self.upload_next;
                 }
+                self.upload_words = (self.upload_words + 1).min(GRID_WORDS);
                 self.upload_next = self.upload_next.map(|address| address + 4);
                 self.upload.data(ctx, argument)
             }
@@ -162,8 +173,9 @@ impl KeplerCompute {
             .iter()
             .rev()
             .find(|upload| upload.target == grid)
+            .filter(|upload| upload.size >= u64::from(GRID_WORDS) * 4)
             .and_then(|upload| upload.source)
-            .filter(|&source| gpu_written(ctx, source, 8));
+            .filter(|&source| gpu_written(ctx, source, u64::from(GRID_WORDS) * 4));
         self.dispatch(
             ctx,
             qmd.launch(self.regs.code_loc.address()),
@@ -306,7 +318,7 @@ impl KeplerCompute {
         words: &[u32; QMD_WORDS],
         indirect_grid: Option<GpuVAddr>,
     ) {
-        if launch.grid.contains(&0) || launch.block.contains(&0) {
+        if launch.block.contains(&0) || (indirect_grid.is_none() && launch.grid.contains(&0)) {
             return;
         }
         let tic = &self.regs.tic;
@@ -630,6 +642,70 @@ mod tests {
                 ([7, 3, 5], None),
             ]
         );
+    }
+
+    #[test]
+    fn a_grid_from_split_words_or_a_short_upload_stays_direct() {
+        const SOURCE: u64 = 0x5000;
+        let grid = QMD + 0x30;
+        let mut rig = Rig::new(0xb1c0);
+        rig.put_qmd(QMD, &v2_words());
+        let device = rig.harness.memory.translate(SOURCE).unwrap();
+        rig.harness.written_pages.mark(device, 0x100);
+        let upload = reg_index!(Regs, upload);
+        rig.call(upload, 8);
+        rig.call(upload + 1, 1);
+        rig.call(upload + 2, 0);
+        rig.call(upload + 3, grid as u32);
+        rig.call(reg_index!(Regs, exec_upload), 1);
+        rig.engine.upload_source(SOURCE);
+        rig.call(reg_index!(Regs, data_upload), 7);
+        rig.engine.upload_source(SOURCE + 8);
+        rig.call(reg_index!(Regs, data_upload), 3 | 5 << 16);
+        rig.launch(QMD);
+        rig.call(upload, 4);
+        rig.call(reg_index!(Regs, exec_upload), 1);
+        rig.engine.upload_source(SOURCE + 0x10);
+        rig.call(reg_index!(Regs, data_upload), 7);
+        rig.launch(QMD);
+        let indirect: Vec<_> = rig.spy.dispatches.iter().map(|d| d.indirect_grid).collect();
+        assert_eq!(indirect, [None, None]);
+    }
+
+    #[test]
+    fn an_indirect_grid_dispatches_even_when_the_guest_copy_is_zero() {
+        const SOURCE: u64 = 0x5000;
+        let mut rig = Rig::new(0xb1c0);
+        rig.put_qmd(QMD, &v2_words());
+        let device = rig.harness.memory.translate(SOURCE).unwrap();
+        rig.harness.written_pages.mark(device, 8);
+        let upload = reg_index!(Regs, upload);
+        rig.call(upload, 8);
+        rig.call(upload + 1, 1);
+        rig.call(upload + 2, 0);
+        rig.call(upload + 3, (QMD + 0x30) as u32);
+        rig.call(reg_index!(Regs, exec_upload), 1);
+        rig.engine.upload_source(SOURCE);
+        rig.call(reg_index!(Regs, data_upload), 0);
+        rig.call(reg_index!(Regs, data_upload), 0);
+        rig.launch(QMD);
+        rig.call(upload + 3, (QMD + 0x40) as u32);
+        rig.call(reg_index!(Regs, exec_upload), 1);
+        rig.call(reg_index!(Regs, data_upload), 0);
+        rig.call(reg_index!(Regs, data_upload), 0);
+        rig.put_qmd(QMD, &{
+            let mut words = v2_words();
+            words[12] = 0;
+            words
+        });
+        rig.launch(QMD);
+        let dispatches: Vec<_> = rig
+            .spy
+            .dispatches
+            .iter()
+            .map(|d| (d.grid, d.indirect_grid))
+            .collect();
+        assert_eq!(dispatches, [([0, 0, 0], Some(SOURCE))]);
     }
 
     #[test]
