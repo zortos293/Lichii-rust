@@ -4,9 +4,10 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use egui::{Color32, Pos2, Rect, RichText, Sense, Stroke, Ui, vec2};
+use egui::{Color32, Pos2, Rect, Response, RichText, Sense, Stroke, Ui, vec2};
 use lichii_common::settings::{
-    ControllerType, InputBinding, InputDevice, NpadButton, PlayerInput, Settings, StickBinding,
+    ButtonOptions, ControllerType, InputBinding, InputDevice, NpadButton, PlayerInput, Settings,
+    StickBinding,
 };
 use lichii_input::capture::{detect_press, detect_stick};
 use lichii_input::{
@@ -14,6 +15,7 @@ use lichii_input::{
     ProfileStore, STICK_MAX, Source,
 };
 
+use super::controller_layout::{self, Body};
 use super::{ConfigEnv, ConfigOutput, combo, docked_toggle, grid, note, row, section};
 
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -63,6 +65,7 @@ enum Target {
     Button(NpadButton),
     Stick { right: bool, dir: Dir },
     Analog { right: bool },
+    Motion,
 }
 
 struct Capture {
@@ -78,6 +81,16 @@ pub struct ControlsPage {
     profile_choice: String,
     message: Option<String>,
     capture: Option<Capture>,
+    preview: Option<Preview>,
+}
+
+/// The page's own compiled mapping for the live diagram, kept across frames so toggle and turbo
+/// buttons show as they will in game.
+struct Preview {
+    player: usize,
+    input: PlayerInput,
+    pad: Option<usize>,
+    mapping: PlayerMapping,
 }
 
 impl ControlsPage {
@@ -89,14 +102,22 @@ impl ControlsPage {
             profile_choice: String::new(),
             message: None,
             capture: None,
+            preview: None,
         }
     }
 
     pub fn ui(&mut self, ui: &mut Ui, d: &mut Settings, env: &ConfigEnv, out: &mut ConfigOutput) {
+        let first = &d.controls.players[0];
+        let handheld = first.connected && first.controller_type.is_handheld();
+        if handheld {
+            d.system.docked = false;
+        }
         section(ui, "Console");
         grid(ui, "console mode", |ui| {
             row(ui, "Console mode", |ui| {
-                docked_toggle(ui, &mut d.system.docked)
+                ui.add_enabled_ui(!handheld, |ui| docked_toggle(ui, &mut d.system.docked))
+                    .response
+                    .on_disabled_hover_text("Player 1 is handheld, so the console is undocked")
             });
             row(ui, "", |ui| {
                 ui.checkbox(&mut d.controls.keyboard_enabled, "Keyboard and mouse")
@@ -115,8 +136,17 @@ impl ControlsPage {
         });
 
         section(ui, "Players");
+        let mut connect = None;
         ui.horizontal_wrapped(|ui| {
             for (i, player) in d.controls.players.iter().enumerate() {
+                let mut connected = player.connected;
+                if ui
+                    .checkbox(&mut connected, "")
+                    .on_hover_text("Connected")
+                    .changed()
+                {
+                    connect = Some((i, connected));
+                }
                 let text = RichText::new(format!("Player {}", i + 1));
                 let text = if player.connected {
                     text.strong()
@@ -127,23 +157,28 @@ impl ControlsPage {
                     self.player = i;
                     self.capture = None;
                 }
+                ui.add_space(6.0);
             }
         });
         ui.separator();
 
         let keyboard = d.controls.keyboard_enabled;
         let docked = d.system.docked;
-        let player = &mut d.controls.players[self.player];
+        let index = self.player;
+        let player = &mut d.controls.players[index];
         self.poll_capture(player, env.host);
 
         ui.horizontal(|ui| {
-            ui.checkbox(&mut player.connected, "Connected");
+            let mut connected = player.connected;
+            if ui.checkbox(&mut connected, "Connected").changed() {
+                connect = Some((index, connected));
+            }
             ui.label("Controller");
             combo(ui, "controller type", &mut player.controller_type);
             ui.label("Device");
             device_combo(ui, player, env);
         });
-        if self.player == 0 && !docked && !player.controller_type.is_handheld() {
+        if index == 0 && !docked && !player.controller_type.is_handheld() {
             note(
                 ui,
                 "In handheld mode the console reads player 1 as the attached Joy-Cons; pick Handheld for player 1.",
@@ -151,12 +186,10 @@ impl ControlsPage {
         }
         self.profiles_row(ui, player);
 
-        let live = env.host.map(|host| {
-            let state = PlayerMapping::compile(player, host).resolve(host, keyboard);
-            (state, host)
-        });
-        let state = live.map(|(s, _)| s);
         let pad = pad_index(player, env.host);
+        let state = env
+            .host
+            .map(|host| self.preview(player, host, pad).resolve(host, keyboard));
 
         ui.add_space(6.0);
         ui.horizontal_top(|ui| {
@@ -177,9 +210,14 @@ impl ControlsPage {
                             m.gyro[0], m.gyro[1], m.gyro[2]
                         ),
                         None if pad.is_some() => "no motion sensors reported".into(),
-                        None => "needs a gamepad with a gyro".into(),
+                        None => "needs a gyro or a motion button".into(),
                     };
                     ui.label(RichText::new(text).weak().small());
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Motion button")
+                        .on_hover_text("Without a gyro the controller lies at rest; holding this input shakes it");
+                    self.bind_button(ui, &mut player.motion_button, None, Target::Motion);
                 });
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut player.vibration_enabled, "Vibration");
@@ -201,8 +239,10 @@ impl ControlsPage {
                     }
                     if ui.button("Clear All").clicked() {
                         player.buttons.clear();
+                        player.button_options.clear();
                         player.left_stick = StickBinding::default();
                         player.right_stick = StickBinding::default();
+                        player.motion_button = InputBinding::None;
                     }
                 });
                 if let Some(cap) = &self.capture {
@@ -222,7 +262,7 @@ impl ControlsPage {
                 }
                 note(
                     ui,
-                    "Click a button or stick to bind it, right-click to clear it.",
+                    "Click a button or stick to bind it; right-click for clear, invert, toggle, turbo and threshold.",
                 );
             });
             ui.vertical(|ui| {
@@ -231,7 +271,36 @@ impl ControlsPage {
                 self.buttons_ui(ui, player, &RIGHT_BUTTONS);
             });
         });
+        if let Some((i, connected)) = connect {
+            set_connected(&mut d.controls.players, i, connected);
+        }
         ui.ctx().request_repaint_after(Duration::from_millis(16));
+    }
+
+    /// The live diagram's mapping, compiled again only when the player's settings or device change.
+    fn preview(
+        &mut self,
+        player: &PlayerInput,
+        host: &HostInput,
+        pad: Option<usize>,
+    ) -> &mut PlayerMapping {
+        let index = self.player;
+        if self
+            .preview
+            .as_ref()
+            .is_some_and(|p| p.player != index || p.pad != pad || p.input != *player)
+        {
+            self.preview = None;
+        }
+        &mut self
+            .preview
+            .get_or_insert_with(|| Preview {
+                player: index,
+                input: player.clone(),
+                pad,
+                mapping: PlayerMapping::compile(player, host),
+            })
+            .mapping
     }
 
     fn poll_capture(&mut self, player: &mut PlayerInput, host: Option<&HostInput>) {
@@ -323,18 +392,25 @@ impl ControlsPage {
         self.capture.as_ref().is_some_and(|c| c.target == target)
     }
 
-    /// A button showing a binding; click starts capture, right-click clears. True when cleared.
-    fn bind_button(&mut self, ui: &mut Ui, binding: &InputBinding, target: Target) -> bool {
+    /// A button showing a binding: click starts capture, right-click opens Lichii's binding menu.
+    fn bind_button(
+        &mut self,
+        ui: &mut Ui,
+        binding: &mut InputBinding,
+        options: Option<&mut ButtonOptions>,
+        target: Target,
+    ) {
         let text = if self.capturing(target) {
             RichText::new("…").color(ACCENT)
         } else {
-            RichText::new(binding_label(binding))
+            let prefix = options_prefix(options.as_deref().copied().unwrap_or_default());
+            RichText::new(format!("{prefix}{}", binding_label(binding)))
         };
         let response = ui.add_sized([130.0, 20.0], egui::Button::new(text));
         if response.clicked() {
             self.start(target);
         }
-        response.secondary_clicked()
+        binding_menu(&response, binding, options);
     }
 
     fn buttons_ui(&mut self, ui: &mut Ui, player: &mut PlayerInput, buttons: &[NpadButton]) {
@@ -344,14 +420,15 @@ impl ControlsPage {
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
                 for &button in buttons {
-                    if !controller.has_button(button) && !trigger_on(controller, button) {
+                    if !controller.has_button(button)
+                        && !controller_layout::analog_trigger(controller, button)
+                    {
                         continue;
                     }
                     ui.label(button_label(controller, button));
-                    let binding = player.buttons.get(&button).cloned().unwrap_or_default();
-                    if self.bind_button(ui, &binding, Target::Button(button)) {
-                        player.buttons.remove(&button);
-                    }
+                    edit_button(player, button, |binding, options| {
+                        self.bind_button(ui, binding, Some(options), Target::Button(button));
+                    });
                     ui.end_row();
                 }
             });
@@ -382,40 +459,29 @@ impl ControlsPage {
             return;
         }
         let position = state.map(|s| if right { s.right_stick } else { s.left_stick });
-        let mut clear = None;
-        {
-            let stick = if right {
-                &player.right_stick
-            } else {
-                &player.left_stick
-            };
-            let snapshot = stick.clone();
-            ui.horizontal(|ui| {
-                stick_preview(ui, &snapshot, position.map(|p| (p.x, p.y)));
-                egui::Grid::new(("stick", right))
-                    .num_columns(2)
-                    .spacing([6.0, 3.0])
-                    .show(ui, |ui| {
-                        for dir in Dir::ALL {
-                            ui.label(dir.label());
-                            let mut copy = snapshot.clone();
-                            let binding = dir.binding(&mut copy).clone();
-                            if self.bind_button(ui, &binding, Target::Stick { right, dir }) {
-                                clear = Some(dir);
-                            }
-                            ui.end_row();
-                        }
-                    });
-            });
-        }
         let stick = if right {
             &mut player.right_stick
         } else {
             &mut player.left_stick
         };
-        if let Some(dir) = clear {
-            *dir.binding(stick) = InputBinding::None;
-        }
+        ui.horizontal(|ui| {
+            stick_preview(ui, stick, position.map(|p| (p.x, p.y)));
+            egui::Grid::new(("stick", right))
+                .num_columns(2)
+                .spacing([6.0, 3.0])
+                .show(ui, |ui| {
+                    for dir in Dir::ALL {
+                        ui.label(dir.label());
+                        self.bind_button(
+                            ui,
+                            dir.binding(stick),
+                            None,
+                            Target::Stick { right, dir },
+                        );
+                        ui.end_row();
+                    }
+                });
+        });
         ui.horizontal(|ui| {
             let analog = match (&stick.analog_x, &stick.analog_y) {
                 (Some(x), Some(y)) => format!("Analog: {x} / {y}"),
@@ -428,14 +494,17 @@ impl ControlsPage {
             };
             let response = ui
                 .button(text)
-                .on_hover_text("Click, then move the stick. Right-click clears.");
+                .on_hover_text("Click, then move the stick. Right-click to clear.");
             if response.clicked() {
                 self.start(Target::Analog { right });
             }
-            if response.secondary_clicked() {
-                stick.analog_x = None;
-                stick.analog_y = None;
-            }
+            response.context_menu(|ui| {
+                if ui.button("Clear").clicked() {
+                    stick.analog_x = None;
+                    stick.analog_y = None;
+                    ui.close();
+                }
+            });
         });
         ui.horizontal(|ui| {
             ui.checkbox(&mut stick.invert_x, "Invert X");
@@ -518,30 +587,30 @@ impl ControlsPage {
     }
 
     fn diagram(&mut self, ui: &mut Ui, player: &mut PlayerInput, state: Option<&NpadState>) {
-        let size = vec2(380.0, 250.0);
-        let (response, painter) = ui.allocate_painter(size, Sense::hover());
-        let origin = response.rect.min;
-        let at = |x: f32, y: f32| origin + vec2(x, y);
-        let visuals = ui.visuals().clone();
-        let body = visuals.widgets.inactive.bg_fill;
-        let outline = Stroke::new(1.5, visuals.widgets.inactive.fg_stroke.color);
-        painter.rect(
-            Rect::from_min_max(at(30.0, 46.0), at(350.0, 210.0)),
-            70.0,
-            body,
-            outline,
-            egui::StrokeKind::Inside,
-        );
         let controller = player.controller_type;
+        let layout = controller_layout::layout(controller);
+        let (response, painter) =
+            ui.allocate_painter(controller_layout::SIZE.into(), Sense::hover());
+        let offset = response.rect.min.to_vec2();
+        let visuals = ui.visuals().clone();
+        let outline = Stroke::new(1.5, visuals.widgets.inactive.fg_stroke.color);
+        for body in &layout.bodies {
+            let (rect, radius, fill) = match *body {
+                Body::Shell(rect, radius) => (rect, radius, visuals.widgets.inactive.bg_fill),
+                Body::Screen(rect) => (rect, 4.into(), visuals.extreme_bg_color),
+            };
+            painter.rect(
+                rect.translate(offset),
+                radius,
+                fill,
+                outline,
+                egui::StrokeKind::Inside,
+            );
+        }
         let held = state.map_or(NpadButtons::empty(), |s| s.buttons);
         let mut clicked = None;
-        let mut cleared = None;
-        for &(button, x, y, w, h) in LAYOUT {
-            let shown = controller.has_button(button) || trigger_on(controller, button);
-            if !shown {
-                continue;
-            }
-            let rect = Rect::from_center_size(at(x, y), vec2(w, h));
+        for &(button, rect) in &layout.buttons {
+            let rect = rect.translate(offset);
             let id = ui.scope_id().with(("diagram", button));
             let hit = ui.interact(rect, id, Sense::click());
             let pressed = held.contains(NpadButtons::from_button(button))
@@ -553,7 +622,11 @@ impl ControlsPage {
             } else {
                 visuals.widgets.inactive.weak_bg_fill
             };
-            let round = if w == h { w / 2.0 } else { 4.0 };
+            let round = if rect.width() == rect.height() {
+                rect.width() / 2.0
+            } else {
+                4.0
+            };
             painter.rect(rect, round, fill, outline, egui::StrokeKind::Inside);
             let ink = visuals.text_color();
             let center = rect.center();
@@ -584,29 +657,28 @@ impl ControlsPage {
                 );
             }
             let binding = player.buttons.get(&button).cloned().unwrap_or_default();
+            let options = player
+                .button_options
+                .get(&button)
+                .copied()
+                .unwrap_or_default();
             let hit = hit.on_hover_text(format!(
-                "{}: {}",
+                "{}: {}{}",
                 button_label(controller, button),
+                options_prefix(options),
                 binding_label(&binding)
             ));
             if hit.clicked() {
                 clicked = Some(Target::Button(button));
             }
-            if hit.secondary_clicked() {
-                cleared = Some(button);
-            }
+            edit_button(player, button, |binding, options| {
+                binding_menu(&hit, binding, Some(options));
+            });
         }
-        for (right, x, y) in [(false, 105.0, 95.0), (true, 245.0, 160.0)] {
-            let has = if right {
-                controller.has_right_stick()
-            } else {
-                controller.has_left_stick()
-            };
-            if !has {
-                continue;
-            }
-            let center = at(x, y);
-            let rect = Rect::from_center_size(center, vec2(56.0, 56.0));
+        for stick in &layout.sticks {
+            let right = stick.right;
+            let center = stick.center + offset;
+            let rect = Rect::from_center_size(center, vec2(stick.radius, stick.radius) * 2.0);
             let hit = ui.interact(rect, ui.scope_id().with(("stick", right)), Sense::click());
             let ring = if self.capturing(Target::Analog { right }) || hit.hovered() {
                 ACCENT
@@ -615,7 +687,7 @@ impl ControlsPage {
             };
             painter.circle(
                 center,
-                27.0,
+                stick.radius,
                 visuals.widgets.inactive.weak_bg_fill,
                 Stroke::new(1.5, ring),
             );
@@ -623,7 +695,12 @@ impl ControlsPage {
             let (dx, dy) = p.map_or((0.0, 0.0), |p| {
                 (p.x as f32 / STICK_MAX as f32, p.y as f32 / STICK_MAX as f32)
             });
-            painter.circle_filled(center + vec2(dx * 18.0, -dy * 18.0), 9.0, outline.color);
+            let travel = stick.radius * 2.0 / 3.0;
+            painter.circle_filled(
+                center + vec2(dx, -dy) * travel,
+                stick.radius / 3.0,
+                outline.color,
+            );
             let hit = hit.on_hover_text("Click, then move the stick to bind its axes");
             if hit.clicked() {
                 clicked = Some(Target::Analog { right });
@@ -631,9 +708,6 @@ impl ControlsPage {
         }
         if let Some(target) = clicked {
             self.start(target);
-        }
-        if let Some(button) = cleared {
-            player.buttons.remove(&button);
         }
     }
 }
@@ -652,38 +726,6 @@ const RIGHT_BUTTONS: [NpadButton; 13] = {
     ]
 };
 
-/// Button positions on the diagram: center x, y and size.
-const LAYOUT: &[(NpadButton, f32, f32, f32, f32)] = {
-    use NpadButton::*;
-    &[
-        (ZL, 85.0, 12.0, 70.0, 16.0),
-        (L, 85.0, 32.0, 70.0, 16.0),
-        (ZR, 295.0, 12.0, 70.0, 16.0),
-        (R, 295.0, 32.0, 70.0, 16.0),
-        (Minus, 160.0, 75.0, 18.0, 18.0),
-        (Plus, 220.0, 75.0, 18.0, 18.0),
-        (Capture, 160.0, 105.0, 16.0, 16.0),
-        (Home, 220.0, 105.0, 20.0, 20.0),
-        (C, 190.0, 135.0, 18.0, 18.0),
-        (DPadUp, 135.0, 140.0, 18.0, 18.0),
-        (DPadDown, 135.0, 180.0, 18.0, 18.0),
-        (DPadLeft, 115.0, 160.0, 18.0, 18.0),
-        (DPadRight, 155.0, 160.0, 18.0, 18.0),
-        (X, 285.0, 72.0, 22.0, 22.0),
-        (B, 285.0, 118.0, 22.0, 22.0),
-        (Y, 262.0, 95.0, 22.0, 22.0),
-        (A, 308.0, 95.0, 22.0, 22.0),
-        (LStick, 105.0, 132.0, 30.0, 10.0),
-        (RStick, 245.0, 197.0, 30.0, 10.0),
-        (LeftSL, 22.0, 100.0, 12.0, 30.0),
-        (LeftSR, 22.0, 150.0, 12.0, 30.0),
-        (RightSL, 358.0, 150.0, 12.0, 30.0),
-        (RightSR, 358.0, 100.0, 12.0, 30.0),
-        (GL, 120.0, 232.0, 44.0, 14.0),
-        (GR, 260.0, 232.0, 44.0, 14.0),
-    ]
-};
-
 /// Stores a digital binding for a button or stick direction.
 fn bind(player: &mut PlayerInput, target: Target, binding: InputBinding) {
     match target {
@@ -698,17 +740,91 @@ fn bind(player: &mut PlayerInput, target: Target, binding: InputBinding) {
             };
             *dir.binding(stick) = binding;
         }
+        Target::Motion => player.motion_button = binding,
         Target::Analog { .. } => {}
     }
 }
 
-/// GameCube ZL/ZR are analog triggers: bindable and shown, but never digital buttons.
-fn trigger_on(controller: ControllerType, button: NpadButton) -> bool {
-    controller.has_analog_triggers() && matches!(button, NpadButton::ZL | NpadButton::ZR)
+/// Edits a button's binding and options together, storing neither while it is unset.
+fn edit_button(
+    player: &mut PlayerInput,
+    button: NpadButton,
+    edit: impl FnOnce(&mut InputBinding, &mut ButtonOptions),
+) {
+    let mut binding = player.buttons.get(&button).cloned().unwrap_or_default();
+    let mut options = player
+        .button_options
+        .get(&button)
+        .copied()
+        .unwrap_or_default();
+    edit(&mut binding, &mut options);
+    if binding == InputBinding::None {
+        player.buttons.remove(&button);
+    } else if player.buttons.get(&button) != Some(&binding) {
+        player.buttons.insert(button, binding);
+    }
+    if options == ButtonOptions::default() {
+        player.button_options.remove(&button);
+    } else {
+        player.button_options.insert(button, options);
+    }
+}
+
+/// Lichii's binding context menu: clear, invert, toggle and turbo for buttons, and the press
+/// threshold of an analog axis bound as a button.
+fn binding_menu(
+    response: &Response,
+    binding: &mut InputBinding,
+    options: Option<&mut ButtonOptions>,
+) {
+    response.context_menu(|ui| {
+        let cleared = ui.button("Clear").clicked();
+        if let Some(options) = options {
+            ui.checkbox(&mut options.inverted, "Invert button");
+            ui.checkbox(&mut options.toggle, "Toggle button");
+            ui.checkbox(&mut options.turbo, "Turbo button");
+            if cleared {
+                *options = ButtonOptions::default();
+            }
+        }
+        if let InputBinding::GamepadAxis { threshold, .. } = binding {
+            ui.add(egui::Slider::new(threshold, 0.05..=0.95).text("Threshold"));
+        }
+        if cleared {
+            *binding = InputBinding::None;
+            ui.close();
+        }
+    });
+}
+
+/// Lichii's markers before a binding: `$` turbo, `~` toggle, `!` inverted.
+fn options_prefix(options: ButtonOptions) -> String {
+    [
+        (options.turbo, '$'),
+        (options.toggle, '~'),
+        (options.inverted, '!'),
+    ]
+    .into_iter()
+    .filter_map(|(on, mark)| on.then_some(mark))
+    .collect()
+}
+
+/// Lichii keeps players connected in order: connecting a player connects every player before it,
+/// and disconnecting one disconnects every player after it. Unchecking a player while later ones
+/// are connected keeps it as the last connected player.
+fn set_connected(players: &mut [PlayerInput], index: usize, connected: bool) {
+    let keep = !connected && players.get(index + 1).is_some_and(|p| p.connected);
+    for (i, player) in players.iter_mut().enumerate() {
+        if connected && i <= index {
+            player.connected = true;
+        } else if !connected && i >= index {
+            player.connected = i == index && keep;
+        }
+    }
 }
 
 fn trigger_pressed(controller: ControllerType, button: NpadButton, state: &NpadState) -> bool {
-    trigger_on(controller, button)
+    controller_layout::analog_trigger(controller, button)
         && match button {
             NpadButton::ZL => state.left_trigger > 0,
             _ => state.right_trigger > 0,
@@ -750,6 +866,7 @@ fn target_label(target: Target) -> String {
             )
         }
         Target::Analog { right } => format!("{} stick", if right { "right" } else { "left" }),
+        Target::Motion => "Motion".into(),
     }
 }
 
@@ -904,6 +1021,8 @@ fn restore_defaults(player: &mut PlayerInput) {
     player.buttons = defaults.buttons;
     player.left_stick = defaults.left_stick;
     player.right_stick = defaults.right_stick;
+    player.button_options = defaults.button_options;
+    player.motion_button = defaults.motion_button;
     player.profile = None;
 }
 
@@ -950,13 +1069,51 @@ mod tests {
     }
 
     #[test]
-    fn layout_covers_every_button() {
+    fn every_button_is_listed_on_one_side() {
         for button in NpadButton::ALL {
-            assert!(LAYOUT.iter().any(|l| l.0 == button), "{button:?}");
             assert!(
                 LEFT_BUTTONS.contains(&button) ^ RIGHT_BUTTONS.contains(&button),
                 "{button:?}"
             );
         }
+    }
+
+    #[test]
+    fn players_connect_in_order() {
+        let mut players = vec![PlayerInput::default(); 4];
+        let connected = |players: &[PlayerInput]| -> Vec<bool> {
+            players.iter().map(|p| p.connected).collect()
+        };
+        players.iter_mut().for_each(|p| p.connected = false);
+        set_connected(&mut players, 2, true);
+        assert_eq!(connected(&players), [true, true, true, false]);
+        set_connected(&mut players, 1, false);
+        assert_eq!(connected(&players), [true, true, false, false]);
+        set_connected(&mut players, 1, false);
+        assert_eq!(connected(&players), [true, false, false, false]);
+    }
+
+    #[test]
+    fn button_options_are_stored_only_while_set() {
+        let mut player = PlayerInput::default_keyboard();
+        edit_button(&mut player, NpadButton::A, |_, options| {
+            options.turbo = true
+        });
+        edit_button(&mut player, NpadButton::B, |_, options| {
+            options.toggle = true;
+            options.inverted = true;
+        });
+        assert_eq!(options_prefix(player.button_options[&NpadButton::A]), "$");
+        assert_eq!(options_prefix(player.button_options[&NpadButton::B]), "~!");
+        edit_button(&mut player, NpadButton::A, |binding, options| {
+            *binding = InputBinding::None;
+            *options = ButtonOptions::default();
+        });
+        assert!(!player.buttons.contains_key(&NpadButton::A));
+        assert!(!player.button_options.contains_key(&NpadButton::A));
+        player.motion_button = InputBinding::Key("Digit7".into());
+        restore_defaults(&mut player);
+        assert!(player.button_options.is_empty());
+        assert_eq!(player.motion_button, InputBinding::None);
     }
 }
