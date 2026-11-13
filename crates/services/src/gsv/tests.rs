@@ -522,7 +522,9 @@ fn gpu_only_regions_keep_what_the_gpu_writes() {
 }
 
 #[test]
-fn gpu_only_regions_take_system_memory_not_the_applications() {
+fn gpu_only_regions_take_system_memory_only_for_the_blocks_written() {
+    use super::reserve::READY_BLOCKS;
+    use lichii_gpu::lazy::LAZY_BLOCK_SIZE;
     let (context, client, gsv) = gsv();
     let gpu = session(&client, gsv, 497);
     let gmmu = context
@@ -532,22 +534,54 @@ fn gpu_only_regions_take_system_memory_not_the_applications() {
     let manager = process.page_table().memory_manager().clone();
     let total = process.total_memory();
     let system = manager.free_size(Pool::SystemNonSecure);
+    let ready = READY_BLOCKS as u64;
+    let settles_at = |blocks: u64, why: &str| {
+        let want = system - blocks * LAZY_BLOCK_SIZE;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while manager.free_size(Pool::SystemNonSecure) != want {
+            assert!(std::time::Instant::now() < deadline, "{why}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+
     let region = 0x81_0000_0000u64;
+    let size = 4u64 << 30;
+    assert!(
+        size > system,
+        "the region is larger than the whole carve-out"
+    );
     client
         .send(
             gpu,
-            &range_words(214, region, region + 0x20_0000 - 1, &[0, 0, 0, 0, 3]),
+            &range_words(214, region, region + size - 1, &[0, 0, 0, 0, 3]),
         )
         .unwrap();
     context.gpu.synchronize();
-    gmmu.write(region, 0x1234_5678u32).unwrap();
-    assert_eq!(gmmu.read::<u32>(region).unwrap(), 0x1234_5678);
+    settles_at(ready, "the region takes nothing beyond the ready blocks");
+    assert_eq!(gmmu.read::<u32>(region + size - 4).unwrap(), 0);
+
+    gmmu.write(region + LAZY_BLOCK_SIZE + 8, 0x1234_5678u32)
+        .unwrap();
+    assert_eq!(
+        gmmu.read::<u32>(region + LAZY_BLOCK_SIZE + 8).unwrap(),
+        0x1234_5678
+    );
+    settles_at(
+        ready + 1,
+        "the written block took a ready block, which is replaced",
+    );
     assert_eq!(
         process.total_memory(),
         total,
         "the title's memory total stays whole"
     );
-    assert_eq!(manager.free_size(Pool::SystemNonSecure), system - 0x20_0000);
+
+    client
+        .send(gpu, &range_words(215, region, region + size - 1, &[0, 5]))
+        .unwrap();
+    context.gpu.synchronize();
+    assert!(gmmu.translate(region).is_none());
+    settles_at(ready, "the destroyed region's block goes back to the pool");
 }
 
 fn sparse_request(va: u64, size: u64, handle: u32, offset: u64, kind: u8) -> Vec<u8> {
@@ -690,41 +724,9 @@ fn gpu_only_regions_that_cannot_be_mapped_are_not_backed() {
         &[split(heap), split(heap + 0xffff), [0, 0]].concat(),
     );
     let handle = client.send(gpu, &create).unwrap().pop::<u32>();
-    assert_eq!(handle, 2, "the failed region's backing took handle 1");
+    assert_eq!(handle, 1, "the failed regions took no memory");
     context.gpu.synchronize();
-    let memory = context.gpu.nx2_memory().unwrap();
-    let first = lichii_gpu::nx2_memory::GpuMemoryHandle::new(1).unwrap();
-    assert!(
-        memory.memory_info(first).is_none(),
-        "the failed region's backing is destroyed"
-    );
-}
-
-#[test]
-fn restoring_a_gpu_only_region_keeps_its_own_device_ranges() {
-    use lichii_gpu::gmmu::MappedRange;
-    use lichii_gpu::nx2_memory::{AddressSpaceId, Unmapped};
-    let range = |gpu_va, daddr, size| Unmapped {
-        space: AddressSpaceId(0),
-        range: MappedRange {
-            gpu_va,
-            daddr,
-            size,
-        },
-    };
-    let mut unmapped = vec![
-        range(0x1000_0000, 0x5000, 0x4000),
-        range(0x1000_0000, 0x9_0000, 0x4000),
-    ];
-    super::gpu::keep_changed(&mut unmapped, 0x1000_1000, 0x1000_2000, 0x6000);
-    assert_eq!(
-        unmapped,
-        [
-            range(0x1000_0000, 0x5000, 0x1000),
-            range(0x1000_2000, 0x7000, 0x2000),
-            range(0x1000_0000, 0x9_0000, 0x4000),
-        ]
-    );
+    assert!(gmmu.read::<u32>(unaligned).is_err());
 }
 
 #[test]
