@@ -98,6 +98,23 @@ Both host OSes use one ABI. The entry trampoline and every helper the JIT calls 
 
 The plan is **dynasm-rs** (`dynasmrt::VecAssembler` for x64), emitting into a `Vec<u8>` that is then copied into the code cache. It assembles at compile time with dynamic register operands, so the register allocator can choose registers at runtime. It supports Windows and has years of use. A hand-written encoder would be one more thing to debug, for no performance gain in code that runs only at translation time. If a dynasm limitation shows up, the backend is one module, and an `iced-x86` encoder can replace it without touching the IR.
 
+## SIMD and floating point
+
+Every instruction in the SIMD/FP data-processing group runs inside the block. The ones `jit/simd` lowers become `Op::Simd`, and every other one becomes `Op::CallSimd`, which calls the interpreter's `simd::execute` on the live `ThreadContext`. Get/set elimination commits pending writes before a `CallSimd` and forgets every known location after it, because the instruction can touch any guest state.
+
+The lowered FP arithmetic (`FADD`, `FSUB`, `FMUL`, `FDIV`, the fused multiply-adds, `FSQRT`, `FCVT`, `SCVTF`/`UCVTF`, `FCVTZS`/`FCVTZU`, `FCMP`) is *checked*. The host computes the result only when the host and the Arm ARM must agree on both the value and the FPSR flags:
+
+- FPCR selects round to nearest and FZ is clear. Every other rounding mode, and flush to zero, falls back.
+- FPSR.IXC is already set whenever the op can be inexact, so the op never needs to report IXC. Titles set IXC within their first few FP ops and rarely clear it. While it is clear, the op falls back, and the fallback sets IXC when the result is inexact.
+- The result is finite. Ops that can underflow also need a normal result above the smallest normal: the Arm ARM detects tininess before rounding and x86 after, and a zero or subnormal result may hide an underflow. Additions and subtractions of floats never round to a subnormal, so they accept any finite result.
+- The integer conversions also check for the host's out-of-range value and for unsigned range. `FCMP` falls back on an unordered compare.
+
+The fallback is an out-of-line slow path. It runs the original instruction through `CallSimd` and reloads the destination from the context. Because a checked op can fall back, it commits pending writes the same way an op that can exit does. The JIT never reads the MXCSR exception flags: under these conditions they would only repeat what FPSR already holds. Its control bits do matter, so `Jit::run` holds MXCSR at the default 0x1f80 (round to nearest, every exception masked, no FTZ or DAZ) while guest code runs, and restores the caller's value on exit. FZ titles need input and output denormal checks to stay native; that is future work.
+
+| Loop (`benches/cpu.rs`, 2M iterations) | Interpreter | JIT before J4 (block ends at SIMD) | JIT with `CallSimd` | JIT native |
+|---|---|---|---|---|
+| `scalar fp loop` (LDR S, FMUL, FADD, FMADD, FSUB, FCMP, FCSEL, FCVT, STR D) | 77 MIPS | 67 MIPS | 89 MIPS | ~1,450 MIPS |
+
 ## Accuracy settings
 
 `CpuConfig::accuracy` carries `Settings::cpu.accuracy` to each core. It only controls what is safe to relax. Under `Unsafe`, flags at block exits may be treated as dead and the bounds check is kept. Under `Paranoid` `Jit::new` returns `None`, so `new_core` builds the interpreter. `Accurate` and `Auto` are identical to the interpreter.
@@ -115,7 +132,7 @@ The plan is **dynasm-rs** (`dynasmrt::VecAssembler` for x64), emitting into a `V
 1. **J1**: the IR, the translator for integer, branch and plain load/store `Inst`s, passes 1-4, the x64 backend with linear-scan allocation, the entry trampoline, unlinked dispatch, fastmem loads and stores with the bounds check, the fastmem fault handler and slow paths, and the interpreter fallback for everything else. Until J3 the code cache is one read-write-execute region. It must pass the JIT-vs-interpreter suite, fault paths included.
 2. **J2**: host atomics (`LD<op>`, `SWP`, `CAS`) as single lock-prefixed instructions, `DC ZVA`, and `MRS CNTPCT` through a helper call. `CASP`, inline exclusives and the inline counter follow with the monitor-slot and `host_tsc_scale` contract PRs; until then they run on the interpreter.
 3. **J3**: direct linking, the fast indirect table, the interrupt check at block entry and the dual-mapped code cache with invalidation. This is the main throughput step. The planned RSB was measured and left out (see Indirect branches).
-4. **J4**: `CallSimd` mid-block instead of falling back, plus the flags/condition peephole (pass 5).
+4. **J4**: `CallSimd` mid-block instead of falling back, the flags/condition peephole (pass 5), and native lowering of checked scalar FP arithmetic (see SIMD and floating point).
 5. **J5**: native lowering for the hottest SIMD/FP ops, measured on real titles, in agreement with the SIMD crew, since they own the semantics.
 
 ## Contract proposals (for the Captain; not needed for J1)

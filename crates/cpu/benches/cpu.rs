@@ -142,6 +142,28 @@ const WORKLOADS: &[Workload] = &[
         per_iteration: 6,
     },
     Workload {
+        name: "scalar fp loop",
+        code: &[
+            0x1c0001a0, // 1: ldr s0, 2f
+            0x1c0001a1, // ldr s1, 3f
+            0x1e210802, // fmul s2, s0, s1
+            0x1e222863, // fadd s3, s3, s2
+            0x1f011004, // fmadd s4, s0, s1, s4
+            0x1e233885, // fsub s5, s4, s3
+            0x1e2020a0, // fcmp s5, s0
+            0x1e20cca6, // fcsel s6, s5, s0, gt
+            0x1e22c0c7, // fcvt d7, s6
+            0xfd000427, // str d7, [x1, #8]
+            0xf10004a5, // subs x5, x5, #1
+            0x54fffea1, // b.ne 1b
+            0xd4000001, // svc #0
+            0x3f8ccccd, // 2: 1.1
+            0x3e99999a, // 3: 0.3
+        ],
+        far: &[],
+        per_iteration: 12,
+    },
+    Workload {
         name: "exclusive pair loop",
         code: &[
             0xc87f1823, // 1: ldxp x3, x6, [x1]
