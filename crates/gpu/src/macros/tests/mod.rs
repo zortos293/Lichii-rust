@@ -1,5 +1,6 @@
 //! Hand-assembled macros for both ISAs against a recording host.
 
+mod bench;
 mod fermi;
 mod memo;
 mod mme64;

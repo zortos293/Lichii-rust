@@ -10,9 +10,10 @@ pub mod maxwell_3d;
 pub mod maxwell_dma;
 pub mod upload;
 
+use lichii_common::GpuVAddr;
 use lichii_texture::block_linear::GobLayout;
 
-use crate::backend::{ChannelId, Rasterizer};
+use crate::backend::{ChannelId, GpuWrittenPages, Rasterizer};
 use crate::gmmu::Gmmu;
 use crate::host1x::Syncpoints;
 
@@ -83,6 +84,11 @@ pub trait Engine: Send {
     /// pending draw). The back calls it before a method of another engine, a host action or a
     /// CPU-side command runs, and at the end of every submission.
     fn flush(&mut self, _ctx: &mut EngineContext<'_>) {}
+
+    /// The GPU address the engine's next DATA_UPLOAD word comes from in the command stream; each
+    /// word after it comes from the next address. The front sends it for compute on Switch 1, and
+    /// again wherever the words stop being contiguous.
+    fn upload_source(&mut self, _address: GpuVAddr) {}
 }
 
 impl Engine for kepler_memory::KeplerMemory {
@@ -94,6 +100,10 @@ impl Engine for kepler_memory::KeplerMemory {
 impl Engine for kepler_compute::KeplerCompute {
     fn call_method(&mut self, ctx: &mut EngineContext<'_>, method: u32, argument: u32) {
         kepler_compute::KeplerCompute::call_method(self, ctx, method, argument);
+    }
+
+    fn upload_source(&mut self, address: GpuVAddr) {
+        kepler_compute::KeplerCompute::upload_source(self, address);
     }
 }
 
@@ -149,6 +159,8 @@ pub struct EngineContext<'a> {
     pub gob_layout: GobLayout,
     /// Dependence state of native compute QMDs, one table for every channel.
     pub qmd_scheduler: &'a mut kepler_compute::pcas::QmdScheduler,
+    /// Device pages GPU work may have written.
+    pub written_pages: &'a GpuWrittenPages,
 }
 
 #[cfg(test)]

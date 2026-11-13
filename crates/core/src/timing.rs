@@ -46,12 +46,13 @@ fn scaled(tsc: u64, mul: u64) -> u64 {
     ((u128::from(tsc) * u128::from(mul)) >> SHIFT) as u64
 }
 
-/// The host TSC frequency, measured once per process; `None` unless the TSC is invariant and the
-/// OS itself keeps time with it, which is its guarantee that the TSC agrees across cores.
+/// The host TSC frequency, measured once per process; `None` unless the TSC is invariant, `rdtscp`
+/// can read it, and the OS itself keeps time with it, which is its guarantee that the TSC agrees
+/// across cores.
 fn trusted_tsc_hz() -> Option<u64> {
     static HZ: OnceLock<Option<u64>> = OnceLock::new();
     *HZ.get_or_init(|| {
-        if tsc_is_invariant() && os_clock_is_tsc() {
+        if tsc_is_usable() && os_clock_is_tsc() {
             measure_tsc_hz()
         } else {
             None
@@ -90,23 +91,32 @@ fn measure_tsc_hz() -> Option<u64> {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn tsc_is_invariant() -> bool {
+fn tsc_is_usable() -> bool {
     use std::arch::x86_64::__cpuid;
-    __cpuid(0x8000_0000).eax >= 0x8000_0007 && __cpuid(0x8000_0007).edx & (1 << 8) != 0
+    __cpuid(0x8000_0000).eax >= 0x8000_0007
+        && __cpuid(0x8000_0007).edx & (1 << 8) != 0
+        && __cpuid(0x8000_0001).edx & (1 << 27) != 0
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn tsc_is_invariant() -> bool {
+fn tsc_is_usable() -> bool {
     false
 }
 
+/// The TSC, read after every earlier instruction has finished. `lfence; rdtsc` is not enough:
+/// where LFENCE does not serialize dispatch (AMD without `LfenceAlwaysSerializing`, such as on
+/// Azure VMs), `rdtsc` can run before the seqlock loads ahead of it, and guest time steps back.
+/// `rdtscp` waits for earlier loads, and the `lfence` after it keeps later loads behind it.
 #[cfg(target_arch = "x86_64")]
 fn read_tsc() -> Option<u64> {
-    use std::arch::x86_64::{_mm_lfence, _rdtsc};
-    // SAFETY: `lfence` and `rdtsc` exist on every x86_64 CPU and touch no memory.
+    use std::arch::x86_64::{__rdtscp, _mm_lfence};
+    let mut core = 0;
+    // SAFETY: callers read the TSC only where `tsc_is_usable` holds, so `rdtscp` exists; it and
+    // `lfence` touch no memory but `core`.
     Some(unsafe {
+        let tsc = __rdtscp(&mut core);
         _mm_lfence();
-        _rdtsc()
+        tsc
     })
 }
 
@@ -294,7 +304,7 @@ mod tests {
 
     #[test]
     fn the_tsc_scale_matches_the_counter_across_pause_and_resume() {
-        let Some(tsc_hz) = tsc_is_invariant().then(measure_tsc_hz).flatten() else {
+        let Some(tsc_hz) = tsc_is_usable().then(measure_tsc_hz).flatten() else {
             return;
         };
         let timing = CoreTiming::with_tsc_hz(ConsoleGeneration::Switch1, Some(tsc_hz));
@@ -328,7 +338,19 @@ mod tests {
 
     #[test]
     fn reads_stay_monotonic_across_pause_and_resume() {
-        let timing = std::sync::Arc::new(CoreTiming::new(ConsoleGeneration::Switch1));
+        assert_monotonic_across_pause_and_resume(CoreTiming::new(ConsoleGeneration::Switch1));
+    }
+
+    #[test]
+    fn tsc_reads_stay_monotonic_across_pause_and_resume() {
+        if let Some(hz) = tsc_is_usable().then(measure_tsc_hz).flatten() {
+            let timing = CoreTiming::with_tsc_hz(ConsoleGeneration::Switch1, Some(hz));
+            assert_monotonic_across_pause_and_resume(timing);
+        }
+    }
+
+    fn assert_monotonic_across_pause_and_resume(timing: CoreTiming) {
+        let timing = std::sync::Arc::new(timing);
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let readers: Vec<_> = (0..3)
             .map(|_| {
