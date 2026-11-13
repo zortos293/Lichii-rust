@@ -189,6 +189,8 @@ pub struct EffectInfo {
     pub parameter: [u8; EFFECT_PARAMETER_SIZE],
     /// DSP state carried between frames, laid out by the effect's DSP implementation.
     pub state: [u8; EFFECT_STATE_SIZE],
+    /// Whether the last update used the revision 9+ parameter layouts.
+    pub version2: bool,
 }
 
 impl Default for EffectInfo {
@@ -213,6 +215,7 @@ impl EffectInfo {
             return_buffer: 0,
             parameter: [0; EFFECT_PARAMETER_SIZE],
             state: [0; EFFECT_STATE_SIZE],
+            version2: false,
         }
     }
 
@@ -337,6 +340,7 @@ impl EffectInfo {
         version2: bool,
     ) {
         use layout::*;
+        self.version2 = version2;
         match self.effect_type {
             EffectType::Invalid => error.set_success(),
             EffectType::Mix => {
@@ -411,16 +415,10 @@ impl EffectInfo {
                 self.parameter[LIMITER_STATE] = parameter_state::UPDATED;
                 self.parameter[LIMITER_STATISTICS_RESET_REQUIRED] = 0;
             }
-            EffectType::BiquadFilter => {
-                if self.parameter[BIQUAD_V1_STATE] <= parameter_state::UPDATED {
-                    self.parameter[BIQUAD_V1_STATE] = parameter_state::UPDATED;
-                } else if self.parameter[BIQUAD_V2_STATE] <= parameter_state::UPDATED {
-                    self.parameter[BIQUAD_V2_STATE] = parameter_state::UPDATED;
-                } else {
-                    self.parameter[BIQUAD_V1_STATE] = parameter_state::UPDATED;
-                    self.parameter[BIQUAD_V2_STATE] = parameter_state::UPDATED;
-                }
+            EffectType::BiquadFilter if self.version2 => {
+                self.parameter[BIQUAD_V2_STATE] = parameter_state::UPDATED
             }
+            EffectType::BiquadFilter => self.parameter[BIQUAD_V1_STATE] = parameter_state::UPDATED,
             _ => {}
         }
     }
@@ -537,5 +535,33 @@ impl EffectContext {
         {
             info.update_result_state(cpu, dsp);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn biquad_command_generation_marks_the_state_of_the_updated_layout() {
+        let mut v2 = EffectInfo::new(EffectType::BiquadFilter);
+        v2.version2 = true;
+        v2.parameter[layout::BIQUAD_V1_STATE] = 0;
+        v2.parameter[layout::BIQUAD_V2_STATE] = parameter_state::INITIALIZED;
+        v2.update_for_command_generation();
+        assert_eq!(
+            v2.parameter[layout::BIQUAD_V2_STATE],
+            parameter_state::UPDATED
+        );
+        assert_eq!(v2.parameter[layout::BIQUAD_V1_STATE], 0);
+
+        let mut v1 = EffectInfo::new(EffectType::BiquadFilter);
+        v1.parameter[layout::BIQUAD_V1_STATE] = parameter_state::INITIALIZED;
+        v1.update_for_command_generation();
+        assert_eq!(
+            v1.parameter[layout::BIQUAD_V1_STATE],
+            parameter_state::UPDATED
+        );
+        assert_eq!(v1.parameter[layout::BIQUAD_V2_STATE], 0);
     }
 }
