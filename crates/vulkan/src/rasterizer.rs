@@ -1138,8 +1138,8 @@ mod tests {
 
     pub(super) const GPU_VA: u64 = 0x20_0000_0000;
 
-    pub(super) fn gmmu(f: &Fixture) -> Gmmu {
-        let gmmu = Gmmu::new(f.memory.clone(), BigPageSize::Size64K);
+    pub(super) fn gmmu(f: &Fixture) -> Arc<Gmmu> {
+        let gmmu = Arc::new(Gmmu::new(f.memory.clone(), BigPageSize::Size64K));
         gmmu.map(GPU_VA, DADDR, DRAM, 0, false).unwrap();
         gmmu
     }
@@ -1163,11 +1163,11 @@ mod tests {
         regs
     }
 
-    fn clear(f: &mut Fixture, gmmu: &Gmmu, regs: &Regs) {
+    fn clear(f: &mut Fixture, gmmu: &Arc<Gmmu>, regs: &Regs) {
         clear_layers(f, gmmu, regs, 1);
     }
 
-    fn clear_layers(f: &mut Fixture, gmmu: &Gmmu, regs: &Regs, layer_count: u32) {
+    fn clear_layers(f: &mut Fixture, gmmu: &Arc<Gmmu>, regs: &Regs, layer_count: u32) {
         let mut dirty = DirtyState::new();
         let const_buffers = [[ConstBufferBinding::default(); MAX_CONST_BUFFERS]; MAX_SHADER_STAGE];
         let root_tables = [[0; 64]; 8];
