@@ -7,6 +7,7 @@
 //! format under an unchanged program translates it again.
 
 use std::cell::{Cell, RefCell};
+use std::sync::Arc;
 
 use lichii_common::GpuVAddr;
 use lichii_gpu::backend::{ComputeContext, ConstBufferBinding, GraphicsContext, QmdVersion};
@@ -325,12 +326,29 @@ fn mesh_state(ctx: &GraphicsContext<'_>, slot: usize, arch: ShaderArch) -> Optio
     })
 }
 
+/// The register state and bindings of a [`ProgramEnv`], owned; [`ProgramEnv::from_snapshot`]
+/// translates from it on another thread.
+pub struct EnvSnapshot {
+    arch: ShaderArch,
+    stage: ShaderStage,
+    start: GpuVAddr,
+    gmmu: Arc<Gmmu>,
+    const_buffers: Vec<ConstBufferBinding>,
+    pool: TexturePool,
+    viewport_transform: u32,
+    texture_bound: u32,
+    local_memory: u32,
+    shared_memory: u32,
+    workgroup: [u32; 3],
+    mesh: Option<MeshState>,
+}
+
 /// One guest program, as the translator reads it.
 pub struct ProgramEnv<'a> {
     arch: ShaderArch,
     stage: ShaderStage,
     start: GpuVAddr,
-    gmmu: &'a Gmmu,
+    gmmu: &'a Arc<Gmmu>,
     const_buffers: &'a [ConstBufferBinding],
     pool: TexturePool,
     viewport_transform: u32,
@@ -447,6 +465,49 @@ impl<'a> ProgramEnv<'a> {
 
     pub fn gmmu(&self) -> &'a Gmmu {
         self.gmmu
+    }
+
+    /// The channel's address space, to share with another thread.
+    pub fn memory(&self) -> &'a Arc<Gmmu> {
+        self.gmmu
+    }
+
+    /// What this environment reads, owned, so another thread can translate the program.
+    pub fn snapshot(&self) -> EnvSnapshot {
+        EnvSnapshot {
+            arch: self.arch,
+            stage: self.stage,
+            start: self.start,
+            gmmu: self.gmmu.clone(),
+            const_buffers: self.const_buffers.to_vec(),
+            pool: self.pool,
+            viewport_transform: self.viewport_transform,
+            texture_bound: self.texture_bound,
+            local_memory: self.local_memory,
+            shared_memory: self.shared_memory,
+            workgroup: self.workgroup,
+            mesh: self.mesh,
+        }
+    }
+
+    /// The environment `snapshot` was taken of, reading guest memory as it is now.
+    pub fn from_snapshot(snapshot: &'a EnvSnapshot) -> Self {
+        Self {
+            arch: snapshot.arch,
+            stage: snapshot.stage,
+            start: snapshot.start,
+            gmmu: &snapshot.gmmu,
+            const_buffers: &snapshot.const_buffers,
+            pool: snapshot.pool,
+            viewport_transform: snapshot.viewport_transform,
+            texture_bound: snapshot.texture_bound,
+            local_memory: snapshot.local_memory,
+            shared_memory: snapshot.shared_memory,
+            workgroup: snapshot.workgroup,
+            mesh: snapshot.mesh,
+            reads: RefCell::new(Vec::new()),
+            extent: Cell::new((snapshot.start, snapshot.start)),
+        }
     }
 
     pub fn pool(&self) -> &TexturePool {
