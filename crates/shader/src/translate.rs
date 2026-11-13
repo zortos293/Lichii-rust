@@ -18,12 +18,23 @@ use crate::opt;
 use crate::profile::HostTranslateInfo;
 use crate::{Profile, ShaderArch, ShaderEnvironment, ShaderInfo, ShaderStage, TranslateError};
 
-/// Bump when a translator change alters the output for unchanged inputs, so cached modules
-/// from older builds stop matching.
-pub const TRANSLATOR_VERSION: u32 = 1;
+/// Stable hash of the translator's sources (`build.rs`): modules translated by another build
+/// never match, with no version to bump by hand.
+pub const TRANSLATOR_ID: u64 = parse_u64(env!("LICHII_SHADER_TRANSLATOR_ID"));
+
+const fn parse_u64(digits: &str) -> u64 {
+    let bytes = digits.as_bytes();
+    let mut value = 0u64;
+    let mut i = 0;
+    while i < bytes.len() {
+        value = value * 10 + (bytes[i] - b'0') as u64;
+        i += 1;
+    }
+    value
+}
 
 /// Bytes between a graphics program's program header and its first instruction.
-fn header_size(env: &dyn ShaderEnvironment) -> u64 {
+pub(crate) fn header_size(env: &dyn ShaderEnvironment) -> u64 {
     match env.arch() {
         ShaderArch::Maxwell => 0x50,
         ShaderArch::Ampere => GRAPHICS_HEADER_SIZE,
@@ -132,7 +143,7 @@ fn translate_into(
     let recorder = Recorder::new(env);
     let mut program = translate_recorded(&recorder, options, ir)?;
     let mut hasher = recorder.hasher();
-    TRANSLATOR_VERSION.hash(&mut hasher);
+    TRANSLATOR_ID.hash(&mut hasher);
     format!(
         "{:?}{:?}{:?}",
         options.profile, options.host, options.resolution_scale

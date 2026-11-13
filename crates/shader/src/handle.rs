@@ -8,7 +8,7 @@
 
 /// One operation of a [`HandleProgram`], a stack machine over 32-bit words. Binary operations
 /// pop the right operand first; comparisons and logical operations push 1 or 0.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum HandleOp {
     /// Pushes the value.
     Immediate(u32),
@@ -91,8 +91,17 @@ impl HandleOp {
 }
 
 /// A program computing one texture handle; see the [module docs](self).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "Vec<HandleOp>")]
 pub struct HandleProgram(Vec<HandleOp>);
+
+impl TryFrom<Vec<HandleOp>> for HandleProgram {
+    type Error = &'static str;
+
+    fn try_from(ops: Vec<HandleOp>) -> Result<HandleProgram, &'static str> {
+        HandleProgram::new(ops).ok_or("invalid handle program")
+    }
+}
 
 impl HandleProgram {
     /// Values the evaluation stack holds at most.

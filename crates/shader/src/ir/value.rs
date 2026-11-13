@@ -106,7 +106,9 @@ impl fmt::Display for Pred {
 }
 
 /// An input/output attribute, identified by its guest byte address divided by four.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct Attribute(pub u16);
 
 impl Attribute {
