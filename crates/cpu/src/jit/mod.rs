@@ -292,6 +292,7 @@ impl Jit {
                 exclusive: exclusive_slow as *const () as usize,
                 zero: zero_slow as *const () as usize,
                 ticks: ticks as *const () as usize,
+                tsc_scale: config.clock.host_tsc_scale().map(std::ptr::from_ref),
                 cmpxchg16b: std::arch::is_x86_feature_detected!("cmpxchg16b"),
             },
             arena: fastmem.map_or(std::ptr::null_mut(), |f| f.base()),

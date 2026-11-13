@@ -20,9 +20,9 @@ use lichii_memory::ReservationSlot;
 
 use super::JitState;
 use super::ir::{Block, Loc, Op, Terminal, Ty, Value, W};
-use crate::ThreadContext;
 use crate::decoder::AtomicOp;
 use crate::interpreter::condition_holds;
+use crate::{ThreadContext, TscScale};
 
 type Asm = VecAssembler<X64Relocation>;
 
@@ -49,6 +49,8 @@ pub(super) struct Target {
     pub exclusive: usize,
     pub zero: usize,
     pub ticks: usize,
+    /// The clock's `TscScale`, which counter reads use inline instead of calling `ticks`.
+    pub tsc_scale: Option<*const TscScale>,
     /// The host has `cmpxchg16b`.
     pub cmpxchg16b: bool,
 }
@@ -106,6 +108,9 @@ const CTX_TPIDRRO: i32 = ctx(offset_of!(ThreadContext, tpidrro_el0));
 const ST_SCRATCH: i32 = ctx(offset_of!(JitState, scratch));
 const ST_SCRATCH2: i32 = ctx(offset_of!(JitState, scratch2));
 const ST_SAVE_GPR: i32 = ctx(offset_of!(JitState, save_gpr));
+const TSC_MUL: i32 = offset_of!(TscScale, mul) as i32;
+const TSC_SHIFT: i32 = offset_of!(TscScale, shift) as i32;
+const TSC_OFFSET: i32 = offset_of!(TscScale, offset) as i32;
 const ST_HIGH: i32 = ctx(offset_of!(JitState, high));
 const ST_CX16_SAVE: i32 = ctx(offset_of!(JitState, cx16_save));
 const ST_SAVE_XMM: i32 = ctx(offset_of!(JitState, save_xmm));
@@ -695,7 +700,25 @@ impl Emitter<'_> {
                     ; mov Rd(d), eax
                 );
             }
-            Op::Ticks => self.call(i, self.target.ticks),
+            Op::Ticks => match self.target.tsc_scale {
+                Some(scale) => {
+                    let d = self.def(v);
+                    dynasm!(self.asm
+                        ; .arch x64
+                        ; rdtsc
+                        ; shl rdx, 32
+                        ; or rax, rdx
+                        ; mov rcx, QWORD scale as i64
+                        ; mul QWORD [rcx + TSC_MUL]
+                        ; mov rcx, QWORD [rcx + TSC_SHIFT]
+                        ; shrd rax, rdx, cl
+                        ; mov rcx, QWORD scale as i64
+                        ; add rax, QWORD [rcx + TSC_OFFSET]
+                        ; mov Rq(d), rax
+                    );
+                }
+                None => self.call(i, self.target.ticks),
+            },
             Op::High => {
                 let d = self.def(v);
                 dynasm!(self.asm ; .arch x64 ; mov Rq(d), QWORD [r13 + ST_HIGH]);
