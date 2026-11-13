@@ -997,7 +997,6 @@ impl VulkanRasterizer {
     /// Appends `module`'s descriptors to the current draw's writes. `false` skips the draw.
     fn bind_resources(&mut self, module: &ShaderModule, src: &StageSources<'_>) -> Result<bool> {
         let info = &module.info;
-        let align = self.buffer_cache.storage_alignment();
         for set in &module.resources.sets {
             for b in &set.bindings {
                 let descriptor = b.descriptor as usize;
@@ -1053,7 +1052,7 @@ impl VulkanRasterizer {
                         let mut array_rescaled = None;
                         for i in 0..b.count {
                             let raw = match desc.handle_program {
-                                Some(program) => program_handle(src, info, program, i, align),
+                                Some(program) => self.program_handle(src, info, program, i)?,
                                 None => handle_word(src, desc.handle, i << desc.size_shift),
                             };
                             let readable = desc.handle_program.is_none_or(|_| {
@@ -1111,7 +1110,7 @@ impl VulkanRasterizer {
                         let desc = info.texture_buffer_descriptors[descriptor];
                         for i in 0..b.count {
                             let raw = match desc.handle_program {
-                                Some(program) => program_handle(src, info, program, i, align),
+                                Some(program) => self.program_handle(src, info, program, i)?,
                                 None => handle_word(src, desc.handle, i << desc.size_shift),
                             };
                             let view = self.texel_view(src, raw, None, false, false)?;
@@ -1123,7 +1122,7 @@ impl VulkanRasterizer {
                         let format = storage_format(desc.format);
                         for i in 0..b.count {
                             let raw = match desc.handle_program {
-                                Some(program) => program_handle(src, info, program, i, align),
+                                Some(program) => self.program_handle(src, info, program, i)?,
                                 None => read_cbuf(
                                     src.gmmu,
                                     src.cbufs,
@@ -1145,7 +1144,7 @@ impl VulkanRasterizer {
                         let mut array_rescaled = None;
                         for i in 0..b.count {
                             let raw = match desc.handle_program {
-                                Some(program) => program_handle(src, info, program, i, align),
+                                Some(program) => self.program_handle(src, info, program, i)?,
                                 None => read_cbuf(
                                     src.gmmu,
                                     src.cbufs,
@@ -2152,38 +2151,56 @@ fn handle_word(src: &StageSources<'_>, handle: HandleSource, offset: u32) -> u32
     raw
 }
 
-/// The raw handle `info`'s handle program `program` computes for descriptor array `element`.
-/// Its storage reads are relative to the binding address, the buffer's pointer aligned down to
-/// `align`; words past the buffer, and of an unbound one, read as 0.
-fn program_handle(
-    src: &StageSources<'_>,
-    info: &ShaderInfo,
-    program: u32,
-    element: u32,
-    align: u64,
-) -> u32 {
-    let read_storage = |slot: u32, offset: u32| {
-        let mut slot = slot;
-        let Some((desc, element)) = info.storage_buffers_descriptors.iter().find_map(|d| {
-            let found = (slot < d.count).then_some((d, slot));
-            slot = slot.wrapping_sub(d.count);
-            found
-        }) else {
-            return 0;
-        };
-        let (address, size) = storage_pointer(src, desc, element);
-        let base = address & !(align - 1);
-        let word = base + u64::from(offset);
-        if address == 0 || word + 4 > address + size {
-            return 0;
+impl VulkanRasterizer {
+    /// The raw handle `info`'s handle program `program` computes for descriptor array
+    /// `element`. Its storage reads are relative to the binding address, the buffer's pointer
+    /// aligned down to the storage alignment; words past the buffer, and of an unbound one,
+    /// read as 0. A word GPU work wrote is downloaded first, so no handle reads stale memory.
+    fn program_handle(
+        &mut self,
+        src: &StageSources<'_>,
+        info: &ShaderInfo,
+        program: u32,
+        element: u32,
+    ) -> Result<u32> {
+        let align = self.buffer_cache.storage_alignment();
+        loop {
+            let cache = &self.buffer_cache;
+            let mut stale = None;
+            let read_storage = |slot: u32, offset: u32| {
+                let mut slot = slot;
+                let Some((desc, element)) = info.storage_buffers_descriptors.iter().find_map(|d| {
+                    let found = (slot < d.count).then_some((d, slot));
+                    slot = slot.wrapping_sub(d.count);
+                    found
+                }) else {
+                    return 0;
+                };
+                let (address, size) = storage_pointer(src, desc, element);
+                let base = address & !(align - 1);
+                let word = base + u64::from(offset);
+                if address == 0 || word + 4 > address + size {
+                    return 0;
+                }
+                match src.gmmu.translate(word) {
+                    Some(daddr) if cache.is_gpu_written(daddr, 4) => {
+                        stale = Some(daddr);
+                        0
+                    }
+                    _ => src.gmmu.read::<u32>(word).unwrap_or(0),
+                }
+            };
+            let raw = info.handle_programs[program as usize].evaluate(
+                |index, offset| read_cbuf(src.gmmu, src.cbufs, index, offset),
+                read_storage,
+                element,
+            );
+            let Some(daddr) = stale else {
+                return Ok(raw);
+            };
+            self.buffer_cache.flush(&mut self.scheduler, daddr, 4)?;
         }
-        src.gmmu.read::<u32>(word).unwrap_or(0)
-    };
-    info.handle_programs[program as usize].evaluate(
-        |index, offset| read_cbuf(src.gmmu, src.cbufs, index, offset),
-        read_storage,
-        element,
-    )
+    }
 }
 
 /// The GPU address and size of storage buffer `element` of `desc`: 16-byte NVN descriptors in

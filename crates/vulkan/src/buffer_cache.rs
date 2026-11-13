@@ -676,6 +676,13 @@ impl BufferCache {
         self.stats
     }
 
+    /// Whether GPU work wrote bytes of `[daddr, +size)` that [`BufferCache::flush`] has not
+    /// downloaded yet.
+    pub fn is_gpu_written(&self, daddr: DAddr, size: u64) -> bool {
+        self.gpu_written
+            .intersects(daddr, daddr.saturating_add(size))
+    }
+
     /// The alignment storage bindings start at: [`BufferCache::storage_buffer`] rounds the
     /// address down to it, so shaders address the binding from that base.
     pub fn storage_alignment(&self) -> u64 {

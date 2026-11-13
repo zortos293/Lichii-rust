@@ -2048,3 +2048,72 @@ fn handle_programs_naming_an_image_of_another_kind_bind_the_null_texture() {
     assert!(target(&mut f).iter().all(|&t| t == [10, 200, 30, 255]));
     f.assert_no_validation_errors();
 }
+
+/// Stores `handle` as word 4 of the table the storage buffer c[0][0x110] points to.
+fn table_writing_program(handle: u32) -> Vec<u8> {
+    let mut header = header(2, ShaderType::PIXEL);
+    header[18] = 0xf;
+    let stg = sass(
+        Opcode::Stg,
+        (4 << 48) | (1 << 45) | (0x10 << 20) | (4 << 8) | 6,
+    );
+    program(
+        header,
+        &[
+            mov_cbuf(4, 0x110),
+            mov_cbuf(5, 0x114),
+            mov_u32(6, handle),
+            stg,
+            exit(),
+        ],
+    )
+}
+
+#[test]
+fn handle_programs_read_the_table_words_earlier_gpu_work_wrote() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &table_writing_program(1),
+    );
+    uniform_texture(&f, 0, TEXTURE, [10, 200, 30, 255]);
+    uniform_texture(&f, 1, OTHER_TEXTURE, [50, 60, 70, 255]);
+    let mut regs = sampling_regs();
+    handle_table(&mut f, 0);
+    draw(&mut f, &gmmu, &regs);
+    let downloaded = f.rasterizer.buffer_cache.stats().downloaded_bytes;
+
+    write(&f, PROGRAMS + u64::from(READER), &table_sampling_program());
+    regs.pipelines[5].offset = READER;
+    draw(&mut f, &gmmu, &regs);
+    assert!(
+        target(&mut f).iter().all(|&t| t == [50, 60, 70, 255]),
+        "the draw samples the texture the first draw stored, not the guest's"
+    );
+    assert_eq!(
+        f.rasterizer.buffer_cache.stats().downloaded_bytes,
+        downloaded + 4,
+        "only the handle word downloads"
+    );
+    let mut word = [0; 4];
+    f.memory
+        .read_bytes(DADDR + TABLE + 0x10, &mut word)
+        .unwrap();
+    assert_eq!(
+        u32::from_le_bytes(word),
+        1,
+        "guest memory holds the stored handle"
+    );
+
+    draw(&mut f, &gmmu, &regs);
+    assert_eq!(
+        f.rasterizer.buffer_cache.stats().downloaded_bytes,
+        downloaded + 4,
+        "a downloaded word is not downloaded again"
+    );
+    assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
+    f.assert_no_validation_errors();
+}
