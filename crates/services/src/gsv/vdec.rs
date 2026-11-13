@@ -297,6 +297,10 @@ impl VideoDecoderService {
             state.free.push_back(Some(Handout { image, release }));
             value
         };
+        tracing::debug!(
+            "nx2:vdecsvc {} image {image} release {release:?} -> fence {value}",
+            ctx.command()
+        );
         shared.wake.notify_one();
         ctx.push(!shared.syncpoint);
         ctx.push(0u32);
@@ -333,6 +337,7 @@ impl VideoDecoderService {
             state.submitted += 1;
             state.submitted
         };
+        tracing::debug!("nx2:vdecsvc input {id}: {size} bytes, pts {pts}, end {end}");
         self.shared.wake.notify_one();
         ctx.push(id);
         ResultCode::SUCCESS
@@ -426,6 +431,10 @@ struct Media {
     /// One output image in its guest layout, written to guest memory in one go.
     staging: Vec<u8>,
     write_failed: bool,
+    frames_out: u64,
+    pictures: u64,
+    decodes: u64,
+    decode_time: Duration,
 }
 
 impl Media {
@@ -450,7 +459,18 @@ impl Media {
             });
             return;
         };
-        let sent = input.data.is_empty() || decoder.send(&input.data, input.pts as i64).is_ok();
+        let started = Instant::now();
+        let sent = match decoder.send(&input.data, input.pts as i64) {
+            _ if input.data.is_empty() => true,
+            Ok(()) => true,
+            Err(err) => {
+                tracing::debug!(
+                    "nx2:vdecsvc: input at pts {} does not decode: {err}",
+                    input.pts
+                );
+                false
+            }
+        };
         if input.end {
             decoder.end_of_stream();
         }
@@ -470,6 +490,9 @@ impl Media {
                 end: false,
             });
         }
+        self.decodes += 1;
+        self.decode_time += started.elapsed();
+        self.pictures += self.decoded.iter().filter(|d| d.frame.is_some()).count() as u64;
         if !sent && self.decoded.is_empty() {
             self.decoded.push(Decoded {
                 frame: None,
@@ -585,6 +608,10 @@ impl Shared {
             decoded: Vec::new(),
             staging: Vec::new(),
             write_failed: false,
+            frames_out: 0,
+            pictures: 0,
+            decodes: 0,
+            decode_time: Duration::ZERO,
         };
         let mut state = self.state.lock();
         while !state.quit {
@@ -629,6 +656,20 @@ impl Shared {
                         pts: decoded.pts,
                         end: decoded.end,
                     });
+                    media.frames_out += 1;
+                    if media.frames_out == 1 || media.frames_out.is_multiple_of(600) || decoded.end
+                    {
+                        tracing::info!(
+                            "nx2:vdecsvc frame {} ({width}x{height}, pts {} us{}) in image {}, \
+                             {} decoded, {:.2} ms per decode",
+                            media.frames_out,
+                            decoded.pts,
+                            if decoded.end { ", end of stream" } else { "" },
+                            handout.image,
+                            media.pictures,
+                            media.decode_time.as_secs_f64() * 1000.0 / media.decodes.max(1) as f64,
+                        );
+                    }
                     if decoded.end {
                         state.stream_ended = true;
                         state.end_queued = false;
