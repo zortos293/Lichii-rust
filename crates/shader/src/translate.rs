@@ -5,6 +5,7 @@ use lichii_common::settings::ResolutionScale;
 
 use std::hash::{Hash, Hasher};
 
+use crate::ampere::{AmpereFlow, GRAPHICS_HEADER_SIZE};
 use crate::flow::Cfg;
 use crate::flow::structure::{StructureOptions, structure};
 use crate::hash::Recorder;
@@ -13,7 +14,6 @@ use crate::ir::{Attribute, Opcode, Program, SyntaxNode};
 use crate::maxwell::flow::MaxwellFlow;
 use crate::maxwell::header::{OutputTopology, PixelImap, ProgramHeader};
 use crate::maxwell::passthrough::{lower_geometry_passthrough, output_topology_vertices};
-use crate::maxwell::translate::translate_block;
 use crate::opt;
 use crate::profile::HostTranslateInfo;
 use crate::{Profile, ShaderArch, ShaderEnvironment, ShaderInfo, ShaderStage, TranslateError};
@@ -22,8 +22,13 @@ use crate::{Profile, ShaderArch, ShaderEnvironment, ShaderInfo, ShaderStage, Tra
 /// from older builds stop matching.
 pub const TRANSLATOR_VERSION: u32 = 1;
 
-/// Size of the Maxwell program header in front of a graphics program's first instruction.
-const HEADER_SIZE: u64 = 0x50;
+/// Bytes between a graphics program's program header and its first instruction.
+fn header_size(env: &dyn ShaderEnvironment) -> u64 {
+    match env.arch() {
+        ShaderArch::Maxwell => 0x50,
+        ShaderArch::Ampere => GRAPHICS_HEADER_SIZE,
+    }
+}
 
 /// A translated program: optimized SSA IR and what the backend needs to emit it.
 #[derive(Clone, Debug)]
@@ -166,7 +171,7 @@ fn translate_recorded(
             let sph = header(env)?;
             program.output_topology =
                 sph.output_topology().ok_or(TranslateError::InvalidHeader {
-                    address: env.start_address() - HEADER_SIZE,
+                    address: env.start_address() - header_size(env),
                 })?;
             program.output_vertices = sph.max_output_vertices();
             program.invocations = sph.threads_per_input_primitive();
@@ -215,10 +220,10 @@ fn translate_recorded(
 
 fn header(env: &dyn ShaderEnvironment) -> Result<ProgramHeader, TranslateError> {
     let start = env.start_address();
-    if start < HEADER_SIZE {
+    if start < header_size(env) {
         return Err(TranslateError::InvalidHeader { address: start });
     }
-    Ok(ProgramHeader::read(env, start - HEADER_SIZE))
+    Ok(ProgramHeader::read(env, start - header_size(env)))
 }
 
 /// Decodes, structures and translates the program into `ir`, then orders its blocks.
@@ -228,22 +233,31 @@ fn build(
     ir: &mut Program,
 ) -> Result<(), TranslateError> {
     let stage = env.stage();
-    let cfg = match env.arch() {
+    let arch = env.arch();
+    let base = env.start_address();
+    let cfg = match arch {
         ShaderArch::Maxwell => {
-            let isa = MaxwellFlow {
-                base: env.start_address(),
-            };
-            Cfg::build(&isa, env, 0, stage == ShaderStage::VertexA)?
+            Cfg::build(&MaxwellFlow { base }, env, 0, stage == ShaderStage::VertexA)?
         }
-        arch => return Err(TranslateError::UnsupportedProgram { arch, stage }),
+        ShaderArch::Ampere => Cfg::build(&AmpereFlow { base }, env, 0, false)?,
     };
     let options = StructureOptions {
         converge_exits: matches!(stage, ShaderStage::Task | ShaderStage::Mesh),
         reorder_demotes: host.needs_demote_reorder,
     };
-    structure(ir, &cfg, options, &mut |prog, block, begin, end| {
-        translate_block(prog, block, env, begin, end)
-    })?;
+    structure(
+        ir,
+        &cfg,
+        options,
+        &mut |prog, block, begin, end| match arch {
+            ShaderArch::Maxwell => {
+                crate::maxwell::translate::translate_block(prog, block, env, begin, end)
+            }
+            ShaderArch::Ampere => {
+                crate::ampere::translate::translate_block(prog, block, env, begin, end)
+            }
+        },
+    )?;
     opt::compute_post_order(ir);
     Ok(())
 }
