@@ -248,7 +248,9 @@ fn atomic(rng: &mut Rng) -> u32 {
     }
 }
 
-const FP: [&str; 25] = [
+const FP: [&str; 27] = [
+    "0xx011101x100001110110xxxxxxxxxx",
+    "01x111101x100001110110xxxxxxxxxx",
     "000111100x1xxxxx01xx10xxxxxxxxxx",
     "0xx01110xx1xxxxx111001xxxxxxxxxx",
     "0x001110xx1xxxxx111111xxxxxxxxxx",
@@ -996,7 +998,13 @@ fn conditional_compares_read_the_live_flags() {
 
 #[test]
 fn vector_fp_edge_cases_match_the_interpreter() {
-    const S_OPS: [u32; 28] = [
+    const S_OPS: [u32; 34] = [
+        0x4ea1_d820, // frecpe v0.4s, v1.4s
+        0x6ea1_d820, // frsqrte v0.4s, v1.4s
+        0x0ea1_d820, // frecpe v0.2s, v1.2s
+        0x2ea1_d820, // frsqrte v0.2s, v1.2s
+        0x5ea1_d820, // frecpe s0, s1
+        0x7ea1_d820, // frsqrte s0, s1
         0x4e22_e420, // fcmeq v0.4s, v1.4s, v2.4s
         0x6e22_e420, // fcmge v0.4s, v1.4s, v2.4s
         0x6ea2_e420, // fcmgt v0.4s, v1.4s, v2.4s
@@ -1072,6 +1080,46 @@ fn vector_fp_edge_cases_match_the_interpreter() {
                         ctx.v[0] = vector(&|k| i * 7 + j + k);
                         ctx.v[1] = vector(&|k| i + k);
                         ctx.v[2] = vector(&|k| j + 5 * k);
+                        compare(machines, &[op, BRK], &ctx, &data);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// FRECPE and FRSQRTE on every 8-bit fraction index, both signs and exponents at and around the
+/// bounds of the native range, under FZ and a directed rounding mode too.
+#[test]
+fn estimates_match_the_interpreter() {
+    const OPS: [u32; 6] = [
+        0x4ea1_d820, // frecpe v0.4s, v1.4s
+        0x6ea1_d820, // frsqrte v0.4s, v1.4s
+        0x0ea1_d820, // frecpe v0.2s, v1.2s
+        0x2ea1_d820, // frsqrte v0.2s, v1.2s
+        0x5ea1_d820, // frecpe s0, s1
+        0x7ea1_d820, // frsqrte s0, s1
+    ];
+    const EXPONENTS: [u32; 12] = [0, 1, 2, 125, 126, 127, 128, 251, 252, 253, 254, 255];
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    for op in OPS {
+        for exponent in EXPONENTS {
+            for sign in [0, 1 << 31] {
+                for i in 0..64 {
+                    let lane = |k: u32| sign | exponent << 23 | ((i * 4 + k) & 0xff) << 15 | 0x1234;
+                    let v1 = (0..4).fold(0u128, |v, k| v | (lane(k) as u128) << (32 * k));
+                    for fpcr in [0, 1 << 24, 3 << 22] {
+                        let mut ctx = ThreadContext {
+                            pc: CODE,
+                            fpcr,
+                            ..Default::default()
+                        };
+                        ctx.v[0] = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210;
+                        ctx.v[1] = v1;
                         compare(machines, &[op, BRK], &ctx, &data);
                     }
                 }

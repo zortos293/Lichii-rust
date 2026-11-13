@@ -412,6 +412,25 @@ const WORKLOADS: &[Workload] = &[
         per_iteration: 10,
     },
     Workload {
+        name: "estimate loop",
+        code: &[
+            0x4f03f700, // fmov v0.4s, #1.5
+            0x4f03f501, // fmov v1.4s, #0.75
+            0x1e211002, // fmov s2, #3.0
+            0x6ea1d803, // 1: frsqrte v3.4s, v0.4s
+            0x4ea1d824, // frecpe v4.4s, v1.4s
+            0x7ea1d845, // frsqrte s5, s2
+            0x5ea1d846, // frecpe s6, s2
+            0x2ea1d827, // frsqrte v7.2s, v1.2s
+            0x4c007823, // st1 {v3.4s}, [x1]
+            0xf10004a5, // subs x5, x5, #1
+            0x54ffff21, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 9,
+    },
+    Workload {
         name: "popcount loop",
         code: &[
             0x4c407020, // 1: ld1 {v0.16b}, [x1]

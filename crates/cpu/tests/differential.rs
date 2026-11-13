@@ -555,6 +555,10 @@ alu_class!(fp_compare_vector, "0xx01110xx1xxxxx111001xxxxxxxxxx", |w| {
     matches!(w & 0xbfa0_fc00, 0x0e20_e400 | 0x2e20_e400 | 0x2ea0_e400)
         && w & 0x4040_0000 != 0x0040_0000
 });
+alu_class!(fp_estimate, "0xx011101x100001110110xxxxxxxxxx", |w| {
+    w & 0x4040_0000 != 0x0040_0000
+});
+alu_class!(fp_estimate_scalar, "01x111101x100001110110xxxxxxxxxx");
 alu_class!(ext, "0x101110000xxxxx0xxxx0xxxxxxxxxx", |w| w & 0x4000_4000
     != 0x4000);
 alu_class!(
