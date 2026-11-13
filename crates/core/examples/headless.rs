@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use lichii_common::paths::UserPaths;
 use lichii_common::settings::Settings;
-use lichii_core::{System, headless_renderer};
+use lichii_core::{Host, System};
 
 fn main() -> std::process::ExitCode {
     let mut args = std::env::args().skip(1);
@@ -33,7 +33,7 @@ fn main() -> std::process::ExitCode {
     lichii_common::init_logging(&settings.debug.log_filter);
     settings.audio.output = lichii_common::settings::AudioOutput::Null;
 
-    let mut system = match System::boot(Arc::new(settings), &title, headless_renderer()) {
+    let mut system = match System::boot(Arc::new(settings), &title, Host::headless()) {
         Ok(system) => system,
         Err(e) => {
             tracing::error!("boot failed: {e}");

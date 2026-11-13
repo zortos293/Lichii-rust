@@ -12,6 +12,8 @@ path = "src/main.rs"
 lichii-common.workspace = true
 lichii-core.workspace = true
 lichii-input.workspace = true
+lichii-loader.workspace = true
+lichii-texture.workspace = true
 lichii-vulkan.workspace = true
 crossbeam-channel.workspace = true
 egui = { workspace = true, features = ["default_fonts"] }

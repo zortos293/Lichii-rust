@@ -1,17 +1,21 @@
-//! One emulation session: the title being run and whether it is paused.
-//!
-//! `lichii-core` has no `System` yet, so a session validates the title and tracks its run state
-//! while the renderer shows nothing. When `System` lands it is owned here and driven by
-//! `pause`, `resume` and `Drop` (stop).
+//! One emulation session: a booted [`System`] running the title, owned by the app and stopped when
+//! dropped.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use lichii_common::ConsoleGeneration;
+use lichii_common::settings::{AudioSettings, Settings};
+use lichii_core::{ExitReason, Host, System, SystemError};
+use lichii_loader::LoadOptions;
 
 use crate::game_list::GameKind;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum BootError {
     NotFound(PathBuf),
     Unsupported(PathBuf),
+    System(SystemError),
 }
 
 impl std::fmt::Display for BootError {
@@ -23,93 +27,208 @@ impl std::fmt::Display for BootError {
                 "{} is not an NSP, XCI, NCA, NRO, NSO or ExeFS directory",
                 path.display()
             ),
+            Self::System(err) => err.fmt(f),
         }
+    }
+}
+
+impl From<SystemError> for BootError {
+    fn from(err: SystemError) -> Self {
+        Self::System(err)
     }
 }
 
 pub struct Session {
     pub path: PathBuf,
     pub title: String,
-    paused: bool,
+    system: System,
 }
 
 impl Session {
-    pub fn boot(path: &Path) -> Result<Self, BootError> {
+    /// Loads the title at `path` and starts it. `host` builds the renderer and shared state for
+    /// the title's console generation, known once the title is loaded.
+    pub fn boot(
+        path: &Path,
+        settings: Arc<Settings>,
+        host: impl FnOnce(ConsoleGeneration) -> Host,
+    ) -> Result<Self, BootError> {
         if !path.exists() {
             return Err(BootError::NotFound(path.to_path_buf()));
         }
         let kind = GameKind::detect(path).ok_or_else(|| BootError::Unsupported(path.into()))?;
-        let name = if kind == GameKind::ExeFs && path.ends_with("exefs") {
-            path.parent().unwrap_or(path)
-        } else {
-            path
-        };
-        let title = match kind {
-            GameKind::ExeFs => name.file_name(),
-            _ => name.file_stem(),
-        }
-        .map_or_else(
-            || path.display().to_string(),
-            |n| n.to_string_lossy().into(),
-        );
         tracing::info!("booting {} ({})", path.display(), kind.label());
+        let image =
+            lichii_loader::load(path, &LoadOptions::default()).map_err(SystemError::from)?;
+        let host = host(image.generation);
+        let mut system = System::from_image(settings, image, host)?;
+        system.run()?;
         Ok(Self {
             path: path.to_path_buf(),
-            title,
-            paused: false,
+            title: title(path, kind),
+            system,
         })
     }
 
     pub fn is_paused(&self) -> bool {
-        self.paused
+        self.system.is_paused()
     }
 
     pub fn pause(&mut self) {
-        self.paused = true;
+        self.system.pause();
     }
 
     pub fn resume(&mut self) {
-        self.paused = false;
+        if let Err(err) = self.system.run() {
+            tracing::error!("resuming: {err}");
+        }
     }
 
     pub fn toggle_pause(&mut self) {
-        self.paused = !self.paused;
+        if self.is_paused() {
+            self.resume();
+        } else {
+            self.pause();
+        }
     }
+
+    /// Applies volume and mute to the running title's audio.
+    pub fn set_audio_volume(&self, audio: &AudioSettings) {
+        self.system.set_audio_volume(audio);
+    }
+
+    /// Why the title stopped, once it has.
+    pub fn exit_reason(&self) -> Option<ExitReason> {
+        self.system.exit_reason()
+    }
+
+    #[cfg(test)]
+    fn system(&self) -> &System {
+        &self.system
+    }
+}
+
+/// The name a title shows: its file name without extension, or for an ExeFS directory the
+/// directory name (the parent of an `exefs` folder).
+fn title(path: &Path, kind: GameKind) -> String {
+    let name = if kind == GameKind::ExeFs && path.ends_with("exefs") {
+        path.parent().unwrap_or(path)
+    } else {
+        path
+    };
+    match kind {
+        GameKind::ExeFs => name.file_name(),
+        _ => name.file_stem(),
+    }
+    .map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use lichii_common::settings::AudioOutput;
+
     use super::*;
 
+    /// An NSO whose text is `text`, with empty rodata and data.
+    fn nso(text: &[u8]) -> Vec<u8> {
+        let mut file = vec![0u8; 0x100];
+        file[..4].copy_from_slice(b"NSO0");
+        let mut file_offset = 0x100u32;
+        for (index, size) in [text.len() as u32, 0x10, 0x10].into_iter().enumerate() {
+            for (at, value) in [
+                (0x10 + index * 0x10, file_offset),
+                (0x14 + index * 0x10, index as u32 * 0x1000),
+                (0x18 + index * 0x10, size),
+                (0x60 + index * 4, size),
+            ] {
+                file[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            file_offset += size;
+        }
+        file.extend_from_slice(text);
+        file.resize(file.len() + 0x20, 0);
+        file
+    }
+
+    fn settings() -> Arc<Settings> {
+        let mut settings = Settings::default();
+        settings.system.rng_seed = Some(1);
+        settings.audio.output = AudioOutput::Null;
+        Arc::new(settings)
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("lichii-session-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
-    fn boots_only_existing_known_titles() {
+    fn rejects_missing_unknown_and_unloadable_titles() {
         let missing = Path::new("/definitely/not/here.nsp");
-        assert_eq!(
-            Session::boot(missing).err(),
-            Some(BootError::NotFound(missing.into()))
-        );
-        let dir = std::env::temp_dir().join(format!("lichii-session-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("Title/exefs")).unwrap();
+        assert!(matches!(
+            Session::boot(missing, settings(), |_| Host::headless()),
+            Err(BootError::NotFound(path)) if path == missing
+        ));
+        let dir = temp_dir("reject");
         let text = dir.join("notes.txt");
         std::fs::write(&text, "x").unwrap();
         assert!(matches!(
-            Session::boot(&text),
+            Session::boot(&text, settings(), |_| Host::headless()),
             Err(BootError::Unsupported(_))
         ));
-        let game = dir.join("Some Game.nro");
-        std::fs::write(&game, "x").unwrap();
-        let mut session = Session::boot(&game).unwrap();
-        assert_eq!(session.title, "Some Game");
+        let broken = dir.join("Broken.nro");
+        std::fs::write(&broken, "x").unwrap();
+        assert!(matches!(
+            Session::boot(&broken, settings(), |_| Host::headless()),
+            Err(BootError::System(SystemError::Loader(_)))
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn titles_come_from_file_and_exefs_directory_names() {
+        assert_eq!(
+            title(Path::new("/g/Some Game.nro"), GameKind::Nro),
+            "Some Game"
+        );
+        assert_eq!(title(Path::new("/g/Title/exefs"), GameKind::ExeFs), "Title");
+        assert_eq!(title(Path::new("/g/Other"), GameKind::ExeFs), "Other");
+    }
+
+    #[test]
+    fn pause_and_volume_reach_the_system() {
+        let dir = temp_dir("run");
+        let game = dir.join("Spin.nso");
+        std::fs::write(&game, nso(&[0x14000000u32.to_le_bytes(), [0; 4]].concat())).unwrap();
+        let host = Host::headless();
+        let npad = host.npad.clone();
+        let mut generation = None;
+        let mut session = Session::boot(&game, settings(), |title| {
+            generation = Some(title);
+            host
+        })
+        .unwrap();
+        assert_eq!(generation, Some(ConsoleGeneration::Switch1));
+        assert_eq!(session.title, "Spin");
+        assert!(Arc::ptr_eq(session.system().npad(), &npad));
+        assert!(!session.is_paused());
         session.toggle_pause();
         assert!(session.is_paused());
+        assert!(session.system().audio().is_paused());
         session.resume();
         assert!(!session.is_paused());
-        std::fs::write(dir.join("Title/exefs/main"), "x").unwrap();
-        std::fs::write(dir.join("Title/exefs/main.npdm"), "x").unwrap();
-        assert_eq!(
-            Session::boot(&dir.join("Title/exefs")).unwrap().title,
-            "Title"
-        );
+        assert!(!session.system().audio().is_paused());
+        session.set_audio_volume(&AudioSettings {
+            volume: 50,
+            ..AudioSettings::default()
+        });
+        assert_eq!(session.system().audio().host_volume(), 0.5);
+        assert_eq!(session.exit_reason(), None);
+        drop(session);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

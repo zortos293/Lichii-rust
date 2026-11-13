@@ -72,7 +72,7 @@ fn settings(console: ConsoleGeneration) -> Arc<Settings> {
 fn boots_an_nso_and_runs_it_to_exit() {
     for console in [ConsoleGeneration::Switch1, ConsoleGeneration::Switch2] {
         let file = TempFile::new("exit.nso", &nso(&exit_program()));
-        let mut system = System::boot(settings(console), &file.0, headless_renderer()).unwrap();
+        let mut system = System::boot(settings(console), &file.0, Host::headless()).unwrap();
         assert_eq!(system.console(), console);
         assert_eq!(system.kernel().core_count(), console.core_count());
         assert!(system.gpu().nx2_memory().is_none());
@@ -97,7 +97,7 @@ fn pause_freezes_guest_time() {
     let mut system = System::boot(
         settings(ConsoleGeneration::Switch1),
         &file.0,
-        headless_renderer(),
+        Host::headless(),
     )
     .unwrap();
     system.run().unwrap();
@@ -123,7 +123,7 @@ fn missing_title_is_a_loader_error() {
         System::boot(
             settings(ConsoleGeneration::Switch1),
             &missing,
-            headless_renderer()
+            Host::headless()
         ),
         Err(SystemError::Loader(_))
     ));
@@ -135,7 +135,7 @@ fn audio_volume_reaches_the_services_sink() {
     let system = System::boot(
         settings(ConsoleGeneration::Switch1),
         &file.0,
-        headless_renderer(),
+        Host::headless(),
     )
     .unwrap();
     assert!(Arc::ptr_eq(system.audio(), &system.services().audio));
