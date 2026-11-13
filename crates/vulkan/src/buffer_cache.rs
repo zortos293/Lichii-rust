@@ -24,6 +24,7 @@ use lichii_gpu::engines::maxwell_3d::regs::{IndexFormat, PrimitiveTopology};
 use lichii_gpu::gmmu::{Gmmu, GpuRange, RangeTarget};
 use lichii_gpu::lazy::LazyDeviceRanges;
 use lichii_memory::{CachedPages, DeviceAddressSpace};
+use lichii_shader::ShaderArch;
 
 use crate::commands::transfer_to_all_barrier;
 use crate::device::Device;
@@ -121,13 +122,28 @@ pub fn assembled_topology(topology: PrimitiveTopology) -> PrimitiveTopology {
     }
 }
 
-/// The GPU range vertex stream `index` reads, from its address to its (inclusive) limit; `None`
-/// when the stream is disabled or empty.
-pub fn vertex_stream_range(regs: &Regs, index: usize) -> Option<(GpuVAddr, u64)> {
+/// First register of Switch 2's per-stream byte sizes (`SET_VERTEX_STREAM_SIZE_A/B`, two words
+/// per stream: the high byte, then the low word).
+const VERTEX_STREAM_SIZE: usize = 0x600 / 4;
+
+/// The GPU range vertex stream `index` reads; `None` when the stream is disabled or empty.
+/// Switch 1 bounds a stream by its (inclusive) limit address. Switch 2's 3D class gives its byte
+/// size instead and leaves the limit registers at zero.
+pub fn vertex_stream_range(regs: &Regs, index: usize, arch: ShaderArch) -> Option<(GpuVAddr, u64)> {
     let stream = &regs.vertex_streams[index];
     let start = stream.address();
-    let end = regs.vertex_stream_limits[index].address().wrapping_add(1);
-    (stream.enable() != 0 && start != 0 && end > start).then(|| (start, end - start))
+    let size = match arch {
+        ShaderArch::Maxwell => regs.vertex_stream_limits[index]
+            .address()
+            .wrapping_add(1)
+            .saturating_sub(start),
+        ShaderArch::Ampere => {
+            let words = regs.words();
+            let at = VERTEX_STREAM_SIZE + 2 * index;
+            u64::from(words[at] & 0xff) << 32 | u64::from(words[at + 1])
+        }
+    };
+    (stream.enable() != 0 && start != 0 && size != 0).then_some((start, size))
 }
 
 struct CachedBuffer {
@@ -1754,6 +1770,48 @@ mod tests {
         set.for_each_in(8, 20, |s, e| parts.push((s, e)));
         assert_eq!(parts, [(8, 10), (12, 20)]);
         assert!(set.intersects(37, 100) && !set.intersects(10, 12) && !set.intersects(38, 60));
+    }
+
+    #[test]
+    fn switch2_vertex_streams_are_sized_by_their_size_registers() {
+        use lichii_gpu::engines::maxwell_3d::regs::VertexStreamBits;
+        const ADDRESS: u64 = 0x14_93ef_9000;
+        let mut regs = Regs::with_defaults();
+        let stream = &mut regs.vertex_streams[1];
+        stream.bits = VertexStreamBits(24 | 1 << 12);
+        stream.address_high = (ADDRESS >> 32) as u32;
+        stream.address_low = ADDRESS as u32;
+        regs.words_mut()[VERTEX_STREAM_SIZE + 3] = 96;
+        assert_eq!(
+            vertex_stream_range(&regs, 1, ShaderArch::Ampere),
+            Some((ADDRESS, 96))
+        );
+        assert_eq!(
+            vertex_stream_range(&regs, 1, ShaderArch::Maxwell),
+            None,
+            "a zero limit is below the stream"
+        );
+
+        let limit = ADDRESS + 95;
+        regs.vertex_stream_limits[1].address_high = (limit >> 32) as u32;
+        regs.vertex_stream_limits[1].address_low = limit as u32;
+        regs.words_mut()[VERTEX_STREAM_SIZE + 2] = 0x101;
+        assert_eq!(
+            vertex_stream_range(&regs, 1, ShaderArch::Maxwell),
+            Some((ADDRESS, 96))
+        );
+        assert_eq!(
+            vertex_stream_range(&regs, 1, ShaderArch::Ampere),
+            Some((ADDRESS, 1 << 32 | 96)),
+            "only the low byte of the high word counts"
+        );
+
+        regs.words_mut()[VERTEX_STREAM_SIZE + 2] = 0;
+        regs.words_mut()[VERTEX_STREAM_SIZE + 3] = 0;
+        assert_eq!(vertex_stream_range(&regs, 1, ShaderArch::Ampere), None);
+        regs.words_mut()[VERTEX_STREAM_SIZE + 3] = 96;
+        regs.vertex_streams[1].bits = VertexStreamBits(24);
+        assert_eq!(vertex_stream_range(&regs, 1, ShaderArch::Ampere), None);
     }
 
     #[test]
