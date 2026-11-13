@@ -25,6 +25,7 @@ lichii-audio = { path = "crates/audio" }
 lichii-input = { path = "crates/input" }
 lichii-core = { path = "crates/core" }
 lichii-texture = { path = "crates/texture" }
+lichii-video = { path = "crates/video" }
 
 thiserror = "2"
 tracing = "0.1"

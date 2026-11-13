@@ -1762,6 +1762,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lichii-video"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "lichii-vulkan"
 version = "0.1.0"
 dependencies = [
