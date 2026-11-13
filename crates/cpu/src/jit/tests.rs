@@ -675,3 +675,21 @@ fn invalidating_a_linked_block_unlinks_it() {
         "the return target leaves the indirect table"
     );
 }
+
+#[test]
+fn an_indirect_jump_to_the_empty_table_key_faults() {
+    const BR_X0: u32 = 0xd61f_0000;
+    for backend in [Backend::Interpreter, Backend::Jit(Passes::ALL)] {
+        let mut machine = Machine::new(backend);
+        machine.mem.write(CODE, BR_X0).unwrap();
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            x: std::array::from_fn(|r| if r == 0 { u64::MAX } else { 0 }),
+            ..Default::default()
+        };
+        assert_eq!(
+            machine.core.run(&mut ctx),
+            HaltReason::Fault(crate::CpuFault::Prefetch { pc: u64::MAX })
+        );
+    }
+}

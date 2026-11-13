@@ -150,6 +150,8 @@ pub(super) struct JitCache {
     region: Option<usize>,
     /// The table indirect branches probe, indexed like `fast` but with `TABLE_BITS` bits.
     table: Box<[(u64, usize)]>,
+    /// The value of an empty table slot: a key and the miss stub.
+    empty: (u64, usize),
     /// Host addresses of the linked `jmp`s into each guest block.
     links: HashMap<u64, Vec<usize>>,
     /// Bumped by every `clear`, which discards all code and so every pending link site.
@@ -171,6 +173,7 @@ impl JitCache {
         let code = memory.push(&x64::trampoline())?;
         // SAFETY: the bytes at `code` are the trampoline, which has this signature.
         let trampoline = unsafe { std::mem::transmute::<*const u8, Trampoline>(code) };
+        let empty = (u64::MAX, memory.push(&x64::miss_stub())? as usize);
         let mut sites = Box::new(SiteTable(Vec::new()));
         let region = {
             let _guard = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
@@ -197,7 +200,8 @@ impl JitCache {
             fast: vec![EMPTY; 1 << FAST_BITS].into_boxed_slice(),
             sites,
             region,
-            table: vec![(u64::MAX, 0); 1 << x64::TABLE_BITS].into_boxed_slice(),
+            table: vec![empty; 1 << x64::TABLE_BITS].into_boxed_slice(),
+            empty,
             links: HashMap::new(),
             generation: 0,
         })
@@ -309,7 +313,7 @@ impl JitCache {
             }
             let slot = table_slot(start);
             if self.table[slot].0 == start {
-                self.table[slot] = (u64::MAX, 0);
+                self.table[slot] = self.empty;
             }
             self.by_start.remove(&start);
             let slot = fast_slot(start);
@@ -326,7 +330,7 @@ impl JitCache {
         self.by_start.clear();
         self.fast.fill(EMPTY);
         self.sites.0.clear();
-        self.table.fill((u64::MAX, 0));
+        self.table.fill(self.empty);
         self.links.clear();
         self.generation += 1;
         self.memory.used = self.code_start;

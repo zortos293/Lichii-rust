@@ -1255,6 +1255,19 @@ pub(super) fn compile(block: &Block, start: u64, target: &Target) -> Compiled {
 
 /// `extern "sysv64" fn(ctx, state, arena base, block code) -> exit code`: saves the
 /// callee-saved registers, sets up the pinned ones and calls the block.
+/// Code empty indirect-table slots point at: returns to the dispatcher like a table miss, so a
+/// guest target equal to the empty key still reaches it.
+pub(super) fn miss_stub() -> Vec<u8> {
+    let mut asm = Asm::new(0);
+    dynasm!(asm
+        ; .arch x64
+        ; mov eax, EXIT_CONTINUE as i32
+        ; ret
+    );
+    asm.finalize()
+        .expect("the miss stub has no unresolved labels")
+}
+
 pub(super) fn trampoline() -> Vec<u8> {
     let mut asm = Asm::new(0);
     dynasm!(asm
