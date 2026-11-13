@@ -463,6 +463,22 @@ impl Translator<'_> {
                 };
                 self.set_x(rd, v);
             }
+            Inst::Crc32 {
+                castagnoli,
+                size,
+                rd,
+                rn,
+                rm,
+            } => {
+                let (crc, data) = (self.x(rn), self.x(rm));
+                let v = self.op(Op::Crc32 {
+                    castagnoli,
+                    size,
+                    crc,
+                    data,
+                });
+                self.set_x(rd, v);
+            }
             Inst::Dp2 { sf, op, rd, rn, rm } => {
                 let w = W::of(sf);
                 let (n, m) = (self.x(rn), self.x(rm));

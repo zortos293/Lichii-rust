@@ -118,6 +118,22 @@ Vector integer ops are exact on the host, so they are lowered without checks: th
 | `scalar fp loop` (LDR S, FMUL, FADD, FMADD, FSUB, FCMP, FCSEL, FCVT, STR D) | 77 MIPS | 67 MIPS | 89 MIPS | ~1,450 MIPS |
 | `vector int loop` (LD1, ADD, SUB, EOR, CMGT, USHR, DUP, UMOV, ST1) | 50 MIPS | 49 MIPS | 73 MIPS | ~2,750 MIPS |
 
+## CRC32
+
+`CRC32B/H/W/X` and `CRC32CB/H/W/X` become one `Op::Crc32`. Splatoon 3 ran 2.85M of them in 93 s of boot, 96% of all interpreter fallbacks. `CRC32C` is the SSE4.2 `crc32` instruction.
+
+Plain `CRC32` has no x86 instruction, so it uses slicing-by-N: slice `k` of a 256-entry table maps a byte to its CRC followed by `k` zero bytes. Every byte of `crc ^ data` is then looked up at once and the results are XORed. That takes 1, 2, 4 or 8 independent loads instead of a chain of byte steps. `CRC32C` uses the same tables on hosts without SSE4.2.
+
+On chained calls (latency, AMD EPYC), slicing beat a two- or three-multiply `pclmulqdq` Barrett reduction at every size:
+
+| Size | Slicing | `pclmulqdq` |
+|---|---|---|
+| H | 2.4 ns | 6.2 ns |
+| W | 2.9 ns | 5.1 ns |
+| X | 5.7 ns | 8.6 ns |
+
+A single byte-table step costs 2.2 ns for B. So slicing needs no CPU feature beyond SSE2.
+
 ## Accuracy settings
 
 `CpuConfig::accuracy` carries `Settings::cpu.accuracy` to each core. It only controls what is safe to relax. Under `Unsafe`, flags at block exits may be treated as dead and the bounds check is kept. Under `Paranoid` `Jit::new` returns `None`, so `new_core` builds the interpreter. `Accurate` and `Auto` are identical to the interpreter.
