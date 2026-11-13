@@ -1,6 +1,6 @@
 //! What one translation asked its environment, with the answers, and replaying it.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use lichii_common::GpuVAddr;
 use serde::{Deserialize, Serialize};
@@ -9,18 +9,14 @@ use crate::info::{HandleSource, ReplaceConstant, TexturePixelFormat};
 use crate::ir::TextureType;
 use crate::{MeshState, ShaderArch, ShaderEnvironment, ShaderStage};
 
-/// One question translation asked and the answer it got. Program memory is addressed relative
-/// to the program's first instruction, so the same code elsewhere gives the same record, unless
-/// translation embedded the address itself ([`Query::StartAddress`]).
+/// One question translation asked and the answer it got, other than program memory, which
+/// [`EnvRecord`] keeps as one hash. Translation may embed the program's address itself
+/// ([`Query::StartAddress`]).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 enum Query {
     Arch(ShaderArch),
     Stage(ShaderStage),
     StartAlignment(u64),
-    Code {
-        offset: i64,
-        value: u64,
-    },
     Cbuf {
         index: u32,
         offset: u32,
@@ -94,9 +90,6 @@ impl Query {
             Query::Arch(arch) => env.arch() == arch,
             Query::Stage(stage) => env.stage() == stage,
             Query::StartAlignment(alignment) => env.start_address() % 32 == alignment,
-            Query::Code { offset, value } => {
-                env.read_u64(env.start_address().wrapping_add_signed(offset)) == value
-            }
             Query::Cbuf {
                 index,
                 offset,
@@ -153,36 +146,103 @@ impl Query {
     }
 }
 
+/// The program bytes translation read and their hash. Addressed relative to the program's
+/// first instruction, so the same code elsewhere gives the same record.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct Code {
+    /// The first byte's offset from the first instruction, negative for the header.
+    offset: i64,
+    /// Up to the end of the last word read; 0 when translation read none.
+    len: u64,
+    hash: u64,
+}
+
 /// Every question one program's translation asked, in order, with its answers. Translation is
 /// deterministic, so an environment that gives the same answers in the same order translates
 /// to the same module.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub(super) struct EnvRecord(Vec<Query>);
+pub(super) struct EnvRecord {
+    queries: Vec<Query>,
+    code: Code,
+}
 
 impl EnvRecord {
-    /// Whether `env` answers every question as recorded; program memory only with `code`.
-    pub(super) fn matches(&self, env: &dyn ShaderEnvironment, code: bool) -> bool {
-        self.0
-            .iter()
-            .filter(|query| code || !matches!(query, Query::Code { .. }))
-            .all(|query| query.holds(env))
+    /// Whether `env` answers every question as recorded, program memory too unless `code` is
+    /// `None`. `side` tells VertexA (0) from the program (1) in `code`.
+    pub(super) fn matches(
+        &self,
+        env: &dyn ShaderEnvironment,
+        side: usize,
+        code: Option<&mut CodeCheck>,
+    ) -> bool {
+        let Code { offset, len, hash } = self.code;
+        let code_holds = code.is_none_or(|check| {
+            len == 0
+                || check.hash(
+                    env,
+                    side,
+                    env.start_address().wrapping_add_signed(offset),
+                    len,
+                ) == hash
+        });
+        code_holds && self.queries.iter().all(|query| query.holds(env))
     }
 
     /// The program bytes translation read: the first one's offset from the program's first
     /// instruction (negative for its header) and the length up to the last one read.
     pub(super) fn code_range(&self) -> (i64, u64) {
-        let offsets = self.0.iter().filter_map(|query| match *query {
-            Query::Code { offset, .. } => Some(offset),
-            _ => None,
-        });
-        let (first, last) = offsets.fold((i64::MAX, i64::MIN), |(first, last), offset| {
-            (first.min(offset), last.max(offset))
-        });
-        if first > last {
-            return (0, 0);
-        }
-        (first, (last - first) as u64 + 8)
+        (self.code.offset, self.code.len)
     }
+}
+
+/// Hashes of live program memory, each range hashed once while one lookup tries several
+/// entries. Clear it before a lookup on other environments.
+#[derive(Debug, Default)]
+pub struct CodeCheck {
+    /// By side, address and length.
+    hashes: Vec<(usize, GpuVAddr, u64, u64)>,
+    bytes: Vec<u8>,
+}
+
+impl CodeCheck {
+    /// Forgets every hash. Call it before a lookup on other environments or after program
+    /// memory may have changed, or a stale hash would match the old bytes.
+    pub fn clear(&mut self) {
+        self.hashes.clear();
+    }
+
+    fn hash(
+        &mut self,
+        env: &dyn ShaderEnvironment,
+        side: usize,
+        address: GpuVAddr,
+        len: u64,
+    ) -> u64 {
+        let known = self
+            .hashes
+            .iter()
+            .find(|&&(s, a, l, _)| (s, a, l) == (side, address, len));
+        if let Some(&(.., hash)) = known {
+            return hash;
+        }
+        let hash = hash_code(env, address, len, &mut self.bytes);
+        self.hashes.push((side, address, len, hash));
+        hash
+    }
+}
+
+/// A stable hash of the `len` bytes of program memory at `address`, one multiply per word.
+fn hash_code(env: &dyn ShaderEnvironment, address: GpuVAddr, len: u64, bytes: &mut Vec<u8>) -> u64 {
+    const K: u64 = 0x9e37_79b9_7f4a_7c15;
+    bytes.resize(len as usize, 0);
+    env.read_code(address, bytes);
+    let mut hash = len.wrapping_mul(K);
+    for &word in bytes.as_chunks::<8>().0 {
+        hash = (hash.rotate_left(5) ^ u64::from_le_bytes(word)).wrapping_mul(K);
+    }
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    hash ^ (hash >> 33)
 }
 
 /// Forwards every query to `env` and records the questions and answers.
@@ -190,6 +250,8 @@ pub(super) struct Logger<'a> {
     env: &'a dyn ShaderEnvironment,
     start: GpuVAddr,
     log: RefCell<Vec<Query>>,
+    /// The offsets of the first and last program word read.
+    code: Cell<Option<(i64, i64)>>,
 }
 
 impl<'a> Logger<'a> {
@@ -198,6 +260,7 @@ impl<'a> Logger<'a> {
             env,
             start: env.start_address(),
             log: RefCell::new(Vec::new()),
+            code: Cell::new(None),
         }
     }
 
@@ -207,7 +270,19 @@ impl<'a> Logger<'a> {
     }
 
     pub(super) fn into_record(self) -> EnvRecord {
-        EnvRecord(self.log.into_inner())
+        let code = self.code.get().map_or(Code::default(), |(first, last)| {
+            let len = (last - first) as u64 + 8;
+            let address = self.start.wrapping_add_signed(first);
+            Code {
+                offset: first,
+                len,
+                hash: hash_code(self.env, address, len, &mut Vec::new()),
+            }
+        });
+        EnvRecord {
+            queries: self.log.into_inner(),
+            code,
+        }
     }
 
     fn log(&self, query: Query) {
@@ -231,10 +306,12 @@ impl ShaderEnvironment for Logger<'_> {
         self.start
     }
     fn read_u64(&self, address: GpuVAddr) -> u64 {
-        let value = self.env.read_u64(address);
         let offset = address.wrapping_sub(self.start) as i64;
-        self.log(Query::Code { offset, value });
-        value
+        let range = self.code.get().map_or((offset, offset), |(first, last)| {
+            (first.min(offset), last.max(offset))
+        });
+        self.code.set(Some(range));
+        self.env.read_u64(address)
     }
     fn read_cbuf(&self, index: u32, offset: u32) -> u32 {
         let value = self.env.read_cbuf(index, offset);

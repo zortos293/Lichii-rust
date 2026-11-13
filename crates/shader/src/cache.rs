@@ -3,7 +3,8 @@
 //! them the same way (`handoffs/shader-cache.md` in the Captain's drive is the contract).
 //!
 //! A file is a [`header`] followed by records the renderer appends as it translates. Each
-//! record is a length, a checksum and a postcard payload. A header from another format or
+//! record is a length, a checksum and a postcard payload: a module, stored once whatever number
+//! of entries share it, or an entry, which names its module by hash and follows it. A header from another format or
 //! translator build makes the whole file stale. A damaged record ends the readable part, so a
 //! crash while appending loses only that record.
 
@@ -11,11 +12,13 @@ mod record;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+pub use self::record::CodeCheck;
 use self::record::{EnvRecord, Logger};
 use crate::backend::Bindings;
 use crate::hash::StableHasher;
@@ -24,7 +27,7 @@ use crate::translate::{TranslateOptions, header_size};
 use crate::{RuntimeInfo, ShaderEnvironment, ShaderModule, ShaderStage, TranslateError};
 
 /// Bump on any change to the header or record layout.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 /// Bytes of [`header`], the start of every cache file.
 pub const HEADER_LEN: usize = 32;
 const MAGIC: [u8; 8] = *b"LICHISHC";
@@ -71,13 +74,19 @@ pub fn records(file: &[u8]) -> Result<&[u8], StaleCache> {
 /// The entries of the record bytes [`records`] returned, in order, up to the first damaged
 /// record.
 pub fn entries(records: &[u8]) -> Entries<'_> {
-    Entries { records, read: 0 }
+    Entries {
+        records,
+        read: 0,
+        modules: HashMap::new(),
+    }
 }
 
 /// Iterator over the [`CacheEntry`]s of a file's records; [`entries`] makes one.
 pub struct Entries<'a> {
     records: &'a [u8],
     read: usize,
+    /// The modules read so far, by hash.
+    modules: HashMap<u64, Arc<ShaderModule>>,
 }
 
 impl Entries<'_> {
@@ -92,19 +101,37 @@ impl Iterator for Entries<'_> {
     type Item = CacheEntry;
 
     fn next(&mut self) -> Option<CacheEntry> {
-        let rest = &self.records[self.read..];
-        let (head, rest) = rest.split_at_checked(RECORD_HEADER_LEN)?;
-        let len = u32::from_le_bytes(head[..4].try_into().expect("4 bytes")) as usize;
-        let checksum = u64::from_le_bytes(head[4..].try_into().expect("8 bytes"));
-        let payload = rest.get(..len)?;
-        if checksum_of(payload) != checksum {
-            return None;
+        loop {
+            let rest = &self.records[self.read..];
+            let (head, rest) = rest.split_at_checked(RECORD_HEADER_LEN)?;
+            let len = u32::from_le_bytes(head[..4].try_into().expect("4 bytes")) as usize;
+            let checksum = u64::from_le_bytes(head[4..].try_into().expect("8 bytes"));
+            let payload = rest.get(..len)?;
+            if checksum_of(payload) != checksum {
+                return None;
+            }
+            let entry = match postcard::from_bytes(payload).ok()? {
+                Stored::Module(module) => {
+                    self.modules.insert(module.hash, Arc::from(module));
+                    None
+                }
+                Stored::Entry(stored) => {
+                    let module = self.modules.get(&stored.module)?.clone();
+                    Some(CacheEntry::from_stored(stored, module)?)
+                }
+            };
+            self.read += RECORD_HEADER_LEN + len;
+            if entry.is_some() {
+                return entry;
+            }
         }
-        let stored: Stored = postcard::from_bytes(payload).ok()?;
-        let entry = CacheEntry::from_stored(stored)?;
-        self.read += RECORD_HEADER_LEN + len;
-        Some(entry)
     }
+}
+
+fn push_record(payload: &[u8], out: &mut Vec<u8>) {
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&checksum_of(payload).to_le_bytes());
+    out.extend_from_slice(payload);
 }
 
 fn checksum_of(payload: &[u8]) -> u64 {
@@ -224,8 +251,20 @@ pub struct CacheEntry {
 }
 
 #[derive(Serialize)]
-struct StoredRef<'a> {
-    module: &'a ShaderModule,
+enum StoredRef<'a> {
+    Module(&'a ShaderModule),
+    Entry(StoredEntryRef<'a>),
+}
+
+#[derive(Deserialize)]
+enum Stored {
+    Module(Box<ShaderModule>),
+    Entry(StoredEntry),
+}
+
+#[derive(Serialize)]
+struct StoredEntryRef<'a> {
+    module: u64,
     records: &'a [EnvRecord],
     options_key: u64,
     probe_key: u64,
@@ -233,18 +272,26 @@ struct StoredRef<'a> {
 }
 
 #[derive(Deserialize)]
-struct Stored {
-    module: ShaderModule,
+struct StoredEntry {
+    /// The hash of a module stored before the entry.
+    module: u64,
     records: Vec<EnvRecord>,
     options_key: u64,
     probe_key: u64,
     bindings_after: Bindings,
 }
 
+/// Appends `module` as one record, for the entries that follow to name.
+pub fn encode_module(module: &ShaderModule, out: &mut Vec<u8>) {
+    let payload =
+        postcard::to_stdvec(&StoredRef::Module(module)).expect("serializing to a Vec cannot fail");
+    push_record(&payload, out);
+}
+
 impl CacheEntry {
-    fn from_stored(stored: Stored) -> Option<CacheEntry> {
+    fn from_stored(stored: StoredEntry, module: Arc<ShaderModule>) -> Option<CacheEntry> {
         matches!(stored.records.len(), 1 | 2).then(|| CacheEntry {
-            module: Arc::new(stored.module),
+            module,
             records: stored.records,
             options_key: stored.options_key,
             probe_key: stored.probe_key,
@@ -280,13 +327,15 @@ impl CacheEntry {
 
     /// Whether translating now would give this module: the options match and the live
     /// environments answer every recorded question, program memory included, the same way.
+    /// `code` hashes each range of live program memory once across the entries a lookup tries.
     pub fn matches(
         &self,
         a: Option<&dyn ShaderEnvironment>,
         env: &dyn ShaderEnvironment,
         options_key: u64,
+        code: &mut CodeCheck,
     ) -> bool {
-        self.replay(a, env, options_key, true)
+        self.replay(a, env, options_key, Some(code))
     }
 
     /// [`Self::matches`] without program memory, for a caller that proved the code equal
@@ -297,7 +346,7 @@ impl CacheEntry {
         env: &dyn ShaderEnvironment,
         options_key: u64,
     ) -> bool {
-        self.replay(a, env, options_key, false)
+        self.replay(a, env, options_key, None)
     }
 
     fn replay(
@@ -305,30 +354,31 @@ impl CacheEntry {
         a: Option<&dyn ShaderEnvironment>,
         env: &dyn ShaderEnvironment,
         options_key: u64,
-        code: bool,
+        mut code: Option<&mut CodeCheck>,
     ) -> bool {
         if options_key != self.options_key {
             return false;
         }
         match (self.records.as_slice(), a) {
-            ([record_a, record], Some(a)) => record_a.matches(a, code) && record.matches(env, code),
-            ([record], None) => record.matches(env, code),
+            ([record_a, record], Some(a)) => {
+                record_a.matches(a, 0, code.as_deref_mut()) && record.matches(env, 1, code)
+            }
+            ([record], None) => record.matches(env, 1, code),
             _ => false,
         }
     }
 
-    /// Appends this entry as one record.
+    /// Appends this entry as one record. Its module must be in the file already, before it:
+    /// [`encode_module`] writes it.
     pub fn encode(&self, out: &mut Vec<u8>) {
-        let payload = postcard::to_stdvec(&StoredRef {
-            module: &self.module,
+        let payload = postcard::to_stdvec(&StoredRef::Entry(StoredEntryRef {
+            module: self.module.hash,
             records: &self.records,
             options_key: self.options_key,
             probe_key: self.probe_key,
             bindings_after: self.bindings_after,
-        })
+        }))
         .expect("serializing to a Vec cannot fail");
-        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        out.extend_from_slice(&checksum_of(&payload).to_le_bytes());
-        out.extend_from_slice(&payload);
+        push_record(&payload, out);
     }
 }

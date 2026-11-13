@@ -204,6 +204,7 @@ pub struct ShaderCache {
     disk: Option<ShaderDisk>,
     bytes: Vec<u8>,
     answers: Vec<u32>,
+    code_check: cache::CodeCheck,
     stats: ShaderCacheStats,
     /// The counts the last INFO line showed, and when it was written.
     logged: (ShaderCacheStats, Option<Instant>),
@@ -222,6 +223,7 @@ impl ShaderCache {
             disk: None,
             bytes: Vec::new(),
             answers: Vec::new(),
+            code_check: cache::CodeCheck::default(),
             stats: ShaderCacheStats::default(),
             logged: (ShaderCacheStats::default(), None),
         }
@@ -350,9 +352,11 @@ impl ShaderCache {
                 }
                 env.take_reads();
             };
+            let code = &mut self.code_check;
+            code.clear();
             let found = disk.candidates(probe).iter().find(|entry| {
                 forget_reads();
-                entry.matches(a_env, env, key)
+                entry.matches(a_env, env, key, code)
             });
             if found.is_none() {
                 forget_reads();
