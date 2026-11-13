@@ -64,6 +64,14 @@ impl AppletFrontend for UiApplets {
     }
 }
 
+/// Controls the controller applet changed. The title gets its answer once input applied them,
+/// so hid already shows the new setup when the title looks.
+pub struct ControlsChange {
+    pub controls: ControlSettings,
+    /// Answers the title; call it once input uses `controls`.
+    pub applied: Box<dyn FnOnce() + Send>,
+}
+
 enum Dialog {
     Keyboard(KeyboardDialog),
     Profile(ProfileDialog),
@@ -114,7 +122,7 @@ impl AppletDialogs {
         &mut self,
         ctx: &egui::Context,
         controls: &ControlSettings,
-    ) -> Option<ControlSettings> {
+    ) -> Option<ControlsChange> {
         if self.open.is_none() {
             self.open = self.requests.try_recv().ok().map(|request| match request {
                 Request::Keyboard(request, reply) => {
@@ -141,8 +149,21 @@ impl AppletDialogs {
             }
             Dialog::Controller(dialog) => {
                 let (answer, changed) = dialog.show(ctx)?;
-                let _ = dialog.reply.send(answer);
-                changed
+                match changed {
+                    Some(controls) => {
+                        let reply = dialog.reply.clone();
+                        Some(ControlsChange {
+                            controls,
+                            applied: Box::new(move || {
+                                let _ = reply.send(answer);
+                            }),
+                        })
+                    }
+                    None => {
+                        let _ = dialog.reply.send(answer);
+                        None
+                    }
+                }
             }
         };
         self.open = None;

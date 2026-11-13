@@ -30,6 +30,8 @@ pub enum InputMsg {
     Configure {
         controls: Box<ControlSettings>,
         combos: Vec<(HotkeyAction, Vec<NpadButton>)>,
+        /// Called once the players were published with the new controls.
+        applied: Option<Box<dyn FnOnce() + Send>>,
     },
     /// Copy the full host input into [`InputShared::host`] every poll (for click-to-bind).
     Mirror(bool),
@@ -92,6 +94,7 @@ impl InputWorker {
                         Err(RecvTimeoutError::Disconnected) => break,
                     };
                     let mut reconfigure = false;
+                    let mut applied = Vec::new();
                     for msg in first.into_iter().chain(rx.try_iter()) {
                         match msg {
                             InputMsg::Key(key, down) => host.keys.set(key, down),
@@ -104,11 +107,13 @@ impl InputWorker {
                             InputMsg::Configure {
                                 controls: new_controls,
                                 combos: new_combos,
+                                applied: callback,
                             } => {
                                 controls = *new_controls;
                                 held = vec![false; new_combos.len()];
                                 combos = new_combos;
                                 reconfigure = true;
+                                applied.extend(callback);
                             }
                             InputMsg::Mirror(on) => {
                                 mirror = on;
@@ -159,6 +164,9 @@ impl InputWorker {
                             }
                         };
                         thread_hub.publish(player, &published);
+                    }
+                    for callback in applied {
+                        callback();
                     }
                     if let Some(sdl) = &mut sdl {
                         for (player, seen) in rumble_seen.iter_mut().enumerate() {

@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use lichii_common::paths::UserPaths;
 use lichii_common::perf::PerfStats;
 use lichii_common::settings::{
-    AntiAliasing, ControlSettings, FullscreenMode, GraphicsSettings, HotkeyAction, ResolutionScale,
-    ScalingFilter, Settings, Theme,
+    AntiAliasing, FullscreenMode, GraphicsSettings, HotkeyAction, ResolutionScale, ScalingFilter,
+    Settings, Theme,
 };
 use lichii_core::{ExitReason, Host};
 use lichii_crypto::KeySet as ConsoleKeys;
@@ -21,7 +21,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::PhysicalKey;
 use winit::window::{Fullscreen, Window, WindowId};
 
-use crate::applets::AppletDialogs;
+use crate::applets::{AppletDialogs, ControlsChange};
 use crate::choices::Choice;
 use crate::cli::Cli;
 use crate::config::game::GameConfigWindow;
@@ -72,8 +72,6 @@ pub enum Action {
         path: PathBuf,
         program_id: u64,
     },
-    /// The controller applet's setup, saved like the Controls page saves it.
-    SetControls(Box<ControlSettings>),
 }
 
 /// The configuration of the running game, when it has one.
@@ -384,11 +382,24 @@ impl App {
 
     /// Re-applies settings that live outside `self.settings`: input bindings and hotkeys.
     fn reconfigure_input(&mut self) {
+        self.configure_input(None);
+    }
+
+    fn configure_input(&mut self, applied: Option<Box<dyn FnOnce() + Send>>) {
         self.hotkeys = HotkeyMap::new(&self.settings.ui.hotkeys);
         self.input.send(InputMsg::Configure {
             controls: Box::new(self.settings.controls.clone()),
             combos: hotkeys::combos(&self.settings.ui.hotkeys),
+            applied,
         });
+    }
+
+    /// Saves the controller applet's setup like the Controls page does, and answers the title
+    /// once input uses it.
+    pub(crate) fn apply_controls(&mut self, change: ControlsChange) {
+        self.settings.controls = change.controls;
+        self.configure_input(Some(change.applied));
+        self.save_settings();
     }
 
     fn update_title(&self) {
@@ -545,11 +556,6 @@ Dump prod.keys and title.keys \
                     let (path, id, title) = (s.path.clone(), s.program_id, s.title.clone());
                     self.open_game_config(&path, id, title);
                 }
-            }
-            Action::SetControls(controls) => {
-                self.settings.controls = *controls;
-                self.reconfigure_input();
-                self.save_settings();
             }
             Action::RemoveGameConfig { path, program_id } => {
                 let file = GameConfig::path(&self.config_dir(), program_id, &path);

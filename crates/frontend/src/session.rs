@@ -10,7 +10,7 @@ use lichii_core::{ExitReason, Host, System, SystemError};
 use lichii_crypto::KeyError;
 use lichii_loader::LoadOptions;
 
-use crate::applets::AppletDialogs;
+use crate::applets::{AppletDialogs, ControlsChange};
 use crate::game_list::GameKind;
 
 #[derive(Debug)]
@@ -128,7 +128,7 @@ impl Session {
         &mut self,
         ctx: &egui::Context,
         controls: &ControlSettings,
-    ) -> Option<ControlSettings> {
+    ) -> Option<ControlsChange> {
         self.applets.as_mut()?.show(ctx, controls)
     }
 

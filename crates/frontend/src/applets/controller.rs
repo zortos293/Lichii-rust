@@ -7,6 +7,8 @@ use lichii_common::settings::{ControlSettings, ControllerType, MAX_PLAYERS};
 use lichii_services::applets::{ControllerAnswer, ControllerRequest, ControllerSetup};
 
 const HANDHELD_NPAD: u32 = 0x20;
+/// `ControllerSupportMode` 2; 3 is key remapping.
+const FIRMWARE_UPDATE: u8 = 2;
 const HANDHELD_STYLE: u32 = 1 << 1;
 
 /// The `NpadStyleSet` bit hid reports for `controller`.
@@ -26,8 +28,9 @@ pub(super) struct ControllerDialog {
     pub reply: Sender<ControllerAnswer>,
     original: ControlSettings,
     controls: ControlSettings,
-    /// The setup already met a single-player request, so it is confirmed without asking.
-    met_on_open: bool,
+    /// Confirmed without asking: a firmware update or key remapping, which this frontend does
+    /// not offer, or a single-player request the setup already meets.
+    confirm_on_open: bool,
 }
 
 impl ControllerDialog {
@@ -41,21 +44,23 @@ impl ControllerDialog {
             reply,
             original: controls.clone(),
             controls: controls.clone(),
-            met_on_open: false,
+            confirm_on_open: false,
         };
-        dialog.met_on_open = request.single_mode && dialog.valid();
-        if dialog.met_on_open {
+        dialog.confirm_on_open =
+            request.mode >= FIRMWARE_UPDATE || (request.single_mode && dialog.valid());
+        if dialog.confirm_on_open {
             return dialog;
         }
         let first = ControllerType::ALL
             .into_iter()
             .find(|&controller| dialog.accepts(controller));
         let shown = dialog.shown();
-        for player in dialog.controls.players.iter_mut().take(shown) {
-            if !request.keep_connected {
+        for (index, player) in dialog.controls.players.iter_mut().enumerate() {
+            if index >= shown || !request.keep_connected {
                 player.connected = false;
             }
-            if let Some(first) = first
+            if player.connected
+                && let Some(first) = first
                 && !accepts(&request, player.controller_type)
             {
                 player.controller_type = first;
@@ -97,14 +102,19 @@ impl ControllerDialog {
     /// Whether the setup has a player count the title supports, every player on a controller
     /// it accepts.
     fn valid(&self) -> bool {
-        let count = self.connected().count();
+        let count = self.setup().player_count.max(0) as usize;
         (self.min_players()..=self.shown()).contains(&count)
             && self
                 .connected()
                 .all(|(_, controller)| self.accepts(controller))
     }
 
+    /// What the title sees after the applet: hid's own view while the controls are unchanged
+    /// (it knows how the title split or merged Joy-Cons), else the edited players.
     fn setup(&self) -> ControllerSetup {
+        if self.controls == self.original {
+            return self.request.current;
+        }
         let npad_id = self.connected().next().map_or(0, |(index, controller)| {
             if style(controller) == HANDHELD_STYLE {
                 HANDHELD_NPAD
@@ -123,7 +133,7 @@ impl ControllerDialog {
         &mut self,
         ctx: &egui::Context,
     ) -> Option<(ControllerAnswer, Option<ControlSettings>)> {
-        if self.met_on_open {
+        if self.confirm_on_open {
             return Some((ControllerAnswer::Confirmed(self.setup()), None));
         }
         let (enter, escape) =
@@ -185,9 +195,6 @@ impl ControllerDialog {
         if !ok {
             return Some((ControllerAnswer::Cancelled, None));
         }
-        for player in self.controls.players.iter_mut().skip(shown) {
-            player.connected = false;
-        }
         let changed = (self.controls != self.original).then(|| self.controls.clone());
         Some((ControllerAnswer::Confirmed(self.setup()), changed))
     }
@@ -240,7 +247,16 @@ mod tests {
             (true, ControllerType::ProController),
             (true, ControllerType::ProController),
         ]);
-        let answer = configure(&ui, request(1, 4, FULL_KEY | JOY_DUAL));
+        let answer = configure(
+            &ui,
+            ControllerRequest {
+                current: ControllerSetup {
+                    player_count: 2,
+                    npad_id: 0,
+                },
+                ..request(1, 4, FULL_KEY | JOY_DUAL)
+            },
+        );
         ui.frame(Vec::new());
         ui.key(Key::Enter);
         assert_eq!(
@@ -302,6 +318,10 @@ mod tests {
             &ui,
             ControllerRequest {
                 keep_connected: false,
+                current: ControllerSetup {
+                    player_count: 1,
+                    npad_id: 0,
+                },
                 ..request(1, 2, FULL_KEY)
             },
         );
@@ -316,23 +336,94 @@ mod tests {
     #[test]
     fn a_single_player_setup_that_already_fits_is_confirmed_at_once() {
         let mut ui = harness(&[(true, ControllerType::Handheld)]);
+        let handheld = ControllerSetup {
+            player_count: 1,
+            npad_id: HANDHELD_NPAD,
+        };
         let answer = configure(
             &ui,
             ControllerRequest {
                 single_mode: true,
                 keep_connected: false,
+                current: handheld,
                 ..request(1, 4, FULL_KEY | HANDHELD_STYLE)
             },
         );
         ui.frame(Vec::new());
         assert_eq!(
             answer.join().unwrap(),
+            ControllerAnswer::Confirmed(handheld)
+        );
+        assert!(ui.applied.is_none());
+    }
+
+    #[test]
+    fn firmware_update_and_key_remapping_keep_the_setup() {
+        for mode in [2, 3] {
+            let mut ui = harness(&[(true, ControllerType::ProController)]);
+            let current = ControllerSetup {
+                player_count: 1,
+                npad_id: 0,
+            };
+            let answer = configure(
+                &ui,
+                ControllerRequest {
+                    mode,
+                    keep_connected: false,
+                    current,
+                    ..request(0, 0, 0)
+                },
+            );
+            ui.frame(Vec::new());
+            assert_eq!(answer.join().unwrap(), ControllerAnswer::Confirmed(current));
+            assert!(
+                ui.applied.is_none(),
+                "mode {mode} leaves the controls alone"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unchanged_setup_reports_what_hid_shows() {
+        let mut ui = harness(&[(true, ControllerType::DualJoycons)]);
+        let split = ControllerSetup {
+            player_count: 2,
+            npad_id: 0,
+        };
+        let answer = configure(
+            &ui,
+            ControllerRequest {
+                current: split,
+                ..request(2, 4, JOY_DUAL | (1 << 3) | (1 << 4))
+            },
+        );
+        ui.frame(Vec::new());
+        ui.key(Key::Enter);
+        assert_eq!(
+            answer.join().unwrap(),
+            ControllerAnswer::Confirmed(split),
+            "the title split the pair into two npads"
+        );
+    }
+
+    #[test]
+    fn a_changed_setup_is_answered_once_input_applied_it() {
+        let mut ui = harness(&[(true, ControllerType::DualJoycons)]);
+        ui.apply_at_once = false;
+        let answer = configure(&ui, request(1, 1, FULL_KEY));
+        ui.frame(Vec::new());
+        ui.key(Key::Enter);
+        let change = ui.pending.take().expect("the type changed");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(!answer.is_finished(), "the title waits for input");
+        (change.applied)();
+        assert_eq!(
+            answer.join().unwrap(),
             ControllerAnswer::Confirmed(ControllerSetup {
                 player_count: 1,
-                npad_id: HANDHELD_NPAD
+                npad_id: 0
             })
         );
-        assert_eq!(ui.applied, None);
     }
 
     #[test]

@@ -116,9 +116,9 @@ impl App {
         }
         self.dialogs(ui.ctx(), actions);
         if let Some(session) = &mut self.session
-            && let Some(controls) = session.show_applets(ui.ctx(), &self.settings.controls)
+            && let Some(change) = session.show_applets(ui.ctx(), &self.settings.controls)
         {
-            actions.push(Action::SetControls(Box::new(controls)));
+            self.apply_controls(change);
         }
         self.show_config(ui.ctx());
         self.show_setup(ui.ctx());

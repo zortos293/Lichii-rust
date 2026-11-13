@@ -6,7 +6,7 @@ use egui::{Event, Key, Modifiers, RawInput};
 use lichii_common::settings::ControlSettings;
 use lichii_services::applets::AppletFrontend;
 
-use super::AppletDialogs;
+use super::{AppletDialogs, ControlsChange};
 
 /// Drives [`AppletDialogs`] with headless egui frames while a second thread waits in the
 /// [`AppletFrontend`], the way am's service thread does.
@@ -15,8 +15,11 @@ pub struct Harness {
     pub dialogs: AppletDialogs,
     wakes: Arc<AtomicUsize>,
     pub controls: ControlSettings,
-    /// The controls the last frame returned, if any.
+    /// The controls the controller applet last changed.
     pub applied: Option<ControlSettings>,
+    /// Whether a change counts as applied by input at once; else it waits in `pending`.
+    pub apply_at_once: bool,
+    pub pending: Option<ControlsChange>,
 }
 
 impl Harness {
@@ -31,6 +34,8 @@ impl Harness {
             wakes,
             controls: ControlSettings::default(),
             applied: None,
+            apply_at_once: true,
+            pending: None,
         }
     }
 
@@ -58,13 +63,19 @@ impl Harness {
             ..RawInput::default()
         };
         let (dialogs, controls) = (&mut self.dialogs, &self.controls);
-        let mut applied = None;
+        let mut change = None;
         let mut output = self
             .ctx
-            .run_ui(input, |ui| applied = dialogs.show(ui.ctx(), controls));
+            .run_ui(input, |ui| change = dialogs.show(ui.ctx(), controls));
         output.textures_delta.clear();
-        if applied.is_some() {
-            self.applied = applied;
+        let Some(change) = change else {
+            return;
+        };
+        self.applied = Some(change.controls.clone());
+        if self.apply_at_once {
+            (change.applied)();
+        } else {
+            self.pending = Some(change);
         }
     }
 
