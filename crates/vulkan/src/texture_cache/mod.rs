@@ -276,6 +276,15 @@ impl CachedImage {
         self.segments[0].daddr
     }
 
+    /// Tracks the image's pages for guest CPU writes, before the cache relies on their bytes.
+    fn track(&mut self, memory: &DeviceAddressSpace) {
+        self.tracked = self
+            .segments
+            .iter()
+            .map(|s| memory.cache_pages(s.daddr, s.size))
+            .collect();
+    }
+
     /// Whether the guest format can be written back from the host image.
     fn downloadable(&self) -> bool {
         !matches!(
@@ -1776,11 +1785,7 @@ impl TextureCache {
             .image
             .as_mut()
             .expect("a live image id");
-        image.tracked = image
-            .segments
-            .iter()
-            .map(|s| tx.memory.cache_pages(s.daddr, s.size))
-            .collect();
+        image.track(tx.memory);
         let info = image.info;
         let host = image.host;
         let format = info.format;
@@ -1927,6 +1932,7 @@ impl TextureCache {
                 });
             } else {
                 image.gpu_modified = false;
+                image.track(tx.memory);
             }
         }
         let mut readback = self.readback.take();
@@ -2111,6 +2117,7 @@ impl TextureCache {
             .image
             .as_mut()
             .expect("a live image id");
+        image.track(memory);
         let info = image.info;
         let host = image.host;
         let format = info.format;

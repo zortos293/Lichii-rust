@@ -438,7 +438,7 @@ fn drain_cpu_writes(f: &mut Fixture) {
 }
 
 /// A guest CPU write beside a render target on the page holding its last texels leaves the
-/// GPU's texels alone.
+/// GPU's texels alone, and once they are written back a CPU write over them is tracked again.
 #[test]
 fn cpu_writes_beside_a_render_target_keep_its_texels() {
     const CPU_VA: u64 = 0x1000_0000;
@@ -461,6 +461,19 @@ fn cpu_writes_beside_a_render_target_keep_its_texels() {
     assert!(
         target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]),
         "the drawn texels"
+    );
+    space.write_bytes(CPU_VA, &[0x5a; 16]).unwrap();
+    assert!(
+        f.memory.has_cpu_writes(),
+        "the written-back target is tracked again"
+    );
+    drain_cpu_writes(&mut f);
+    let uploads = f.rasterizer.texture_cache.traffic().uploads;
+    draw(&mut f, &gmmu, &regs);
+    assert_eq!(
+        f.rasterizer.texture_cache.traffic().uploads,
+        uploads + 1,
+        "the target uploads the CPU's bytes"
     );
     f.assert_no_validation_errors();
 }

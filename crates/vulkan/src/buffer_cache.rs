@@ -893,14 +893,17 @@ impl BufferCache {
             gpu_written,
             ..
         } = self;
+        let memory = &self.memory;
         let buffer = buffers[id].as_mut().expect("live buffer");
         let base = buffer.daddr;
         let first = ((daddr - base) >> PAGE_BITS) as usize;
         let last = (daddr + size - base).div_ceil(PAGE_SIZE) as usize;
         uploads.clear();
+        let tracked = &mut buffer.tracked;
         buffer.dirty_pages -= drain_runs(&mut buffer.dirty, first, last, |first, last| {
             let start = base + first as u64 * PAGE_SIZE;
             let end = base + last as u64 * PAGE_SIZE;
+            tracked.push((start, end, memory.cache_pages(start, end - start)));
             let mut next = start;
             gpu_written.for_each_in(start, end, |written, written_end| {
                 if written > next {
@@ -921,9 +924,6 @@ impl BufferCache {
         copies.clear();
         let mut offset = 0;
         for &(addr, len) in uploads.iter() {
-            buffer
-                .tracked
-                .push((addr, addr + len, self.memory.cache_pages(addr, len)));
             read_guest(
                 &self.memory,
                 addr,
@@ -1900,6 +1900,36 @@ mod tests {
         expected[0x40..0x140].copy_from_slice(&0xdead_beef_u32.to_le_bytes().repeat(0x40));
         expected[0x400..0x410].copy_from_slice(&cpu);
         assert_eq!(f.guest(DADDR + 0x2000, 0x3000), expected);
+        f.assert_no_validation_errors();
+    }
+
+    /// A page GPU work wrote whole uploads nothing after a CPU write, yet stays tracked: once
+    /// flushed, the next CPU write to it reaches the buffer.
+    #[test]
+    fn fully_gpu_written_pages_stay_tracked() {
+        const CPU_VA: u64 = 0x1000_0000;
+        let Some(mut f) = fixture() else { return };
+        let space = Arc::new(AddressSpace::new(f.memory.physical().clone(), 39));
+        space.map(CPU_VA, 0, 0x10000, MemoryPermission::READ_WRITE);
+        f.memory.attach_process(space.clone());
+        let binding = f.acquire(DADDR, PAGE_SIZE);
+        f.gpu_fill(binding, 0, PAGE_SIZE, 0x0102_0304);
+        f.cache.mark_gpu_written(DADDR, PAGE_SIZE);
+        let memory = f.memory.clone();
+        for byte in [7, 9] {
+            space.write_bytes(CPU_VA + 0x10, &[byte; 8]).unwrap();
+            assert!(f.memory.has_cpu_writes(), "write of {byte} tracked");
+            memory.take_cpu_writes(|daddr, size| f.cache.cpu_written(daddr, size));
+            f.acquire(DADDR, PAGE_SIZE);
+            f.cache.flush(&mut f.scheduler, DADDR, PAGE_SIZE).unwrap();
+        }
+        let mut guest = vec![0; PAGE_SIZE as usize];
+        space.read_bytes(CPU_VA, &mut guest).unwrap();
+        assert_eq!(&guest[0x10..0x18], &[9; 8]);
+        assert!(
+            f.read_binding(binding) == guest,
+            "the buffer holds the CPU's bytes"
+        );
         f.assert_no_validation_errors();
     }
 
