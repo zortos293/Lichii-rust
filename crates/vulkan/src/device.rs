@@ -136,6 +136,9 @@ pub struct DeviceProperties {
     pub timestamp_period: f32,
     /// 0 when the queue cannot write timestamps.
     pub timestamp_valid_bits: u32,
+    /// The most groups `vkCmdDrawMeshTasksEXT` takes along X, `[without, with]` a task stage
+    /// (0 without mesh shaders).
+    pub mesh_group_limit: [u32; 2],
 }
 
 /// The logical device, its single universal queue and the memory allocator. Shared between
@@ -486,9 +489,13 @@ impl Device {
 
         let mut v11_properties = vk::PhysicalDeviceVulkan11Properties::default();
         let mut v12_properties = vk::PhysicalDeviceVulkan12Properties::default();
+        let mut mesh_properties = vk::PhysicalDeviceMeshShaderPropertiesEXT::default();
         let mut properties2 = vk::PhysicalDeviceProperties2::default()
             .push_next(&mut v11_properties)
             .push_next(&mut v12_properties);
+        if features.mesh_shader {
+            properties2 = properties2.push_next(&mut mesh_properties);
+        }
         // SAFETY: valid physical device and queue family.
         let (queue, families, memory_properties) = unsafe {
             raw_instance.get_physical_device_properties2(physical, &mut properties2);
@@ -518,6 +525,12 @@ impl Device {
             limits: base.limits,
             timestamp_period: base.limits.timestamp_period,
             timestamp_valid_bits: families[candidate.queue_family as usize].timestamp_valid_bits,
+            mesh_group_limit: [
+                mesh_properties.max_mesh_work_group_count[0]
+                    .min(mesh_properties.max_mesh_work_group_total_count),
+                mesh_properties.max_task_work_group_count[0]
+                    .min(mesh_properties.max_task_work_group_total_count),
+            ],
         };
         tracing::info!(
             "Vulkan device: {} ({:?}, driver {:?}, API {}.{}.{})",

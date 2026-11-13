@@ -2519,6 +2519,47 @@ fn task_programs_launch_the_mesh_workgroups_they_count() {
     f.assert_no_validation_errors();
 }
 
+const GEOMETRY: u64 = PROGRAMS + 0x3000;
+const PRIMITIVE_FRAGMENT: u64 = PROGRAMS + 0x4000;
+
+#[test]
+fn per_primitive_fragment_inputs_skip_the_draw() {
+    let Some((mut f, gmmu)) = mesh_fixture() else {
+        return;
+    };
+    let mut geometry = header(1, ShaderType::GEOMETRY);
+    geometry[13] |= 1 << 16;
+    write(&f, GEOMETRY, &ampere_program(geometry, &[]));
+    let mut fragment = header(2, ShaderType::PIXEL);
+    fragment[6] = 0b10;
+    fragment[18] = 0xf;
+    let ipa = ampere(
+        AmpereOpcode::Ipa,
+        Form::Fixed,
+        0xff << 32 | 0x20 << 64 | 7 << 81,
+    );
+    let code = [
+        ipa,
+        ampere_mov(1, 0),
+        ampere_mov(2, 0),
+        ampere_mov(3, 0),
+        ampere_exit(),
+    ];
+    write(&f, PRIMITIVE_FRAGMENT, &ampere_program(fragment, &code));
+    let mut regs = mesh_regs(1);
+    bind_program(&mut regs, 4, ShaderType::GEOMETRY, GEOMETRY);
+    bind_program(&mut regs, 5, ShaderType::PIXEL, PRIMITIVE_FRAGMENT);
+    mesh_draw(&mut f, &gmmu, &regs, 1);
+    let stats = f.rasterizer.draw.shaders.stats();
+    assert_eq!(
+        (stats.translated, stats.failed),
+        (2, 1),
+        "the fragment program reads generic 0, which the geometry header makes per-primitive"
+    );
+    assert_eq!(f.rasterizer.draw.pipelines.stats().built, 0);
+    f.assert_no_validation_errors();
+}
+
 #[test]
 fn indirect_mesh_draws_are_skipped() {
     let Some((mut f, gmmu)) = mesh_fixture() else {

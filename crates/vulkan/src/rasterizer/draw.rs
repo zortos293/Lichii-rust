@@ -15,11 +15,11 @@ use lichii_gpu::backend::{
     ChannelId, ComputeContext, ConstBufferBinding, DrawParams, GraphicsContext, IndirectDraw,
 };
 use lichii_gpu::engines::maxwell_3d::Regs;
-use lichii_gpu::engines::maxwell_3d::regs::MESH_CONTROL;
 use lichii_gpu::engines::maxwell_3d::regs::{
     DepthMode, IndexFormat, PrimitiveTopology, ProvokingVertex, StencilOp, VertexAttributeType,
     WindowOriginMode,
 };
+use lichii_gpu::engines::maxwell_3d::regs::{MESH_CONTROL, MESH_SHADER_A};
 use lichii_shader::backend::Bindings;
 use lichii_shader::backend::spirv::{
     NUM_IMAGE_SCALING_WORDS, NUM_TEXTURE_SCALING_WORDS, RENDER_AREA_LAYOUT_OFFSET,
@@ -27,9 +27,11 @@ use lichii_shader::backend::spirv::{
     RESCALING_LAYOUT_TEXTURES_OFFSET,
 };
 use lichii_shader::info::{HandleSource, ImageDescriptor, StorageBufferDescriptor};
-use lichii_shader::ir::{ImageFormat, TextureType};
+use lichii_shader::ir::{Attribute, ImageFormat, TextureType};
 use lichii_shader::runtime::{AttributeType, CompareFunction, InputTopology};
-use lichii_shader::{DescriptorKind, RuntimeInfo, ShaderArch, ShaderInfo, ShaderModule};
+use lichii_shader::{
+    DescriptorKind, RuntimeInfo, ShaderArch, ShaderInfo, ShaderModule, ShaderStage,
+};
 use lichii_texture::block_linear::GobLayout;
 use lichii_texture::tic::TextureMemory;
 use lichii_texture::{Numeric, PixelFormat};
@@ -84,6 +86,7 @@ enum Warning {
     StorageAndSampled = 1 << 12,
     NoMeshShader = 1 << 13,
     IndirectMesh = 1 << 14,
+    MeshGroupLimit = 1 << 15,
 }
 
 /// A descriptor write of the current draw: `count` infos from `first` of the info list for
@@ -368,6 +371,15 @@ fn is_mesh_draw(regs: &Regs, arch: ShaderArch) -> bool {
     arch == ShaderArch::Ampere && regs.words()[MESH_CONTROL] & 1 != 0
 }
 
+/// The primitives a mesh program outputs (SET_MESH_SHADER_A bits 0..4).
+fn mesh_topology(regs: &Regs) -> vk::PrimitiveTopology {
+    match regs.words()[MESH_SHADER_A] & 0xf {
+        0 => vk::PrimitiveTopology::POINT_LIST,
+        1 => vk::PrimitiveTopology::LINE_LIST,
+        _ => vk::PrimitiveTopology::TRIANGLE_LIST,
+    }
+}
+
 fn attribute_type(regs: &Regs, index: usize) -> AttributeType {
     let attribute = regs.vertex_attrib_format[index];
     if attribute.constant() != 0 {
@@ -493,6 +505,12 @@ impl StageState {
             Some(previous) => {
                 info.previous_stage_stores = previous.stores;
                 info.previous_stage_legacy_stores_mapping = previous.legacy_stores_mapping.clone();
+                info.per_primitive_generics = previous
+                    .mesh
+                    .primitive_lines
+                    .iter()
+                    .filter_map(|&line| Attribute(line as u16).generic_index())
+                    .fold(0, |mask, generic| mask | 1 << generic);
             }
             None => info.previous_stage_stores = lichii_shader::info::VaryingState([u64::MAX; 8]),
         }
@@ -572,8 +590,11 @@ impl VulkanRasterizer {
             );
             return Ok(());
         }
-        let host_topology = mvk::primitive_topology(assembled_topology(call.topology()))
-            .unwrap_or(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let host_topology = match mesh {
+            true => mesh_topology(regs),
+            false => mvk::primitive_topology(assembled_topology(call.topology()))
+                .unwrap_or(vk::PrimitiveTopology::TRIANGLE_LIST),
+        };
         if !self.graphics_stages(ctx, host_topology) {
             return Ok(());
         }
@@ -770,14 +791,23 @@ impl VulkanRasterizer {
             .any(|m| m.info.uses_render_area)
             .then(|| guest_render_area(regs));
         self.push_constants(cmd, layout_raw, push, render_area, scale);
-        self.set_dynamic_state(
-            cmd,
-            regs,
-            &features,
-            (!mesh).then_some(host_topology),
-            extent,
-            scale,
-        );
+        self.set_dynamic_state(cmd, regs, &features, host_topology, extent, scale);
+        let mesh_groups = match call {
+            DrawCall::Direct(params) if mesh => {
+                let task = self.draw.stages[0]
+                    .as_ref()
+                    .is_some_and(|m| m.stage == ShaderStage::Task);
+                let limit = self.device.properties.mesh_group_limit[usize::from(task)];
+                if params.count > limit {
+                    self.draw.warn_once(
+                        Warning::MeshGroupLimit,
+                        "a task/mesh draw has more groups than the device takes; clamping it",
+                    );
+                }
+                params.count.min(limit)
+            }
+            _ => 0,
+        };
         let raw = &self.device.raw;
         let draw = &self.draw;
         // SAFETY: as above; the pipeline's dynamic state is all set.
@@ -786,8 +816,8 @@ impl VulkanRasterizer {
                 raw.cmd_bind_index_buffer(cmd, index.buffer, index.offset, index.index_type);
             }
             match (call, indirect, index) {
-                (DrawCall::Direct(params), _, _) if mesh => {
-                    draw.mesh.cmd_draw_mesh_tasks(cmd, params.count, 1, 1)
+                (DrawCall::Direct(_), _, _) if mesh => {
+                    draw.mesh.cmd_draw_mesh_tasks(cmd, mesh_groups, 1, 1)
                 }
                 (DrawCall::Direct(params), _, Some(index)) => raw.cmd_draw_indexed(
                     cmd,
@@ -1715,10 +1745,11 @@ impl VulkanRasterizer {
         cmd: vk::CommandBuffer,
         regs: &Regs,
         features: &PipelineFeatures,
-        topology: Option<vk::PrimitiveTopology>,
+        topology: vk::PrimitiveTopology,
         extent: vk::Extent2D,
         scale: ResolutionScale,
     ) {
+        let mesh = is_mesh_draw(regs, self.draw.arch);
         let raw = &self.device.raw;
         let draw = &mut self.draw;
         let factor = {
@@ -1835,7 +1866,7 @@ impl VulkanRasterizer {
                     };
                 }
                 raw.cmd_set_front_face(cmd, face);
-                if let Some(topology) = topology {
+                if !mesh {
                     raw.cmd_set_primitive_topology(cmd, topology);
                 }
                 raw.cmd_set_depth_test_enable(cmd, regs.depth_test_enable != 0);
@@ -1873,7 +1904,7 @@ impl VulkanRasterizer {
             if features.extended_dynamic_state2 {
                 use vk::PrimitiveTopology as T;
                 raw.cmd_set_rasterizer_discard_enable(cmd, regs.rasterize_enable == 0);
-                let offset = match topology.unwrap_or(T::TRIANGLE_LIST) {
+                let offset = match topology {
                     T::POINT_LIST => regs.polygon_offset_point_enable,
                     T::LINE_LIST
                     | T::LINE_STRIP
@@ -1882,7 +1913,7 @@ impl VulkanRasterizer {
                     _ => regs.polygon_offset_fill_enable,
                 };
                 raw.cmd_set_depth_bias_enable(cmd, offset != 0);
-                if let Some(topology) = topology {
+                if !mesh {
                     let restartable = matches!(
                         topology,
                         T::LINE_STRIP
@@ -1911,7 +1942,7 @@ impl VulkanRasterizer {
                     raw.cmd_bind_vertex_buffers(cmd, 0, &draw.vertex_buffers, &draw.vertex_offsets);
                 }
             }
-            if features.dynamic_vertex_input && topology.is_some() {
+            if features.dynamic_vertex_input && !mesh {
                 draw.vertex_bindings.clear();
                 draw.vertex_attributes.clear();
                 for (location, a) in regs.vertex_attrib_format.iter().enumerate() {

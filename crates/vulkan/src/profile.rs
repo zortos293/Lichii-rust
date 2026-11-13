@@ -37,6 +37,8 @@ pub(crate) fn shader_profile(
         vk::ShaderStageFlags::GEOMETRY,
         vk::ShaderStageFlags::FRAGMENT,
         vk::ShaderStageFlags::COMPUTE,
+        vk::ShaderStageFlags::TASK_EXT,
+        vk::ShaderStageFlags::MESH_EXT,
     ]
     .iter()
     .enumerate()
