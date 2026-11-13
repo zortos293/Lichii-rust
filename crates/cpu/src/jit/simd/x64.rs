@@ -384,6 +384,7 @@ impl Emitter<'_> {
                 );
                 self.finish_checked(i, slow, word, d, Ty::Nzcv);
             }
+            SimdOp::Vec(op) => self.vector(i, op),
         }
     }
 
