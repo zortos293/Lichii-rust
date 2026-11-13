@@ -12,3 +12,6 @@ cpal.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+allocation-counter = "0.8"

@@ -145,6 +145,15 @@ fn visit(
             let downscaled = ir.fp_mul(frag_coord, down_factor, fp);
             prog.replace_uses_with(id, downscaled);
         }
+        Opcode::InterpolateAtOffset if is_fragment => {
+            let offset = [prog.arg(id, 1), prog.arg(id, 2)];
+            let mut ir = Emitter::before(prog, id);
+            let down_factor = ir.inst(Opcode::ResolutionDownFactor, &[]);
+            let up_factor = ir.fp_recip(down_factor);
+            let [x, y] = offset.map(|v| ir.fp_mul(v, up_factor, fp));
+            prog.set_arg(id, 1, x);
+            prog.set_arg(id, 2, y);
+        }
         Opcode::SetAttribute if attribute(prog, id) == Some(Attribute::POINT_SIZE) => {
             let point_size = prog.arg(id, 1);
             let mut ir = Emitter::before(prog, id);

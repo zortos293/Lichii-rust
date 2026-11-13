@@ -745,14 +745,43 @@ fn shf(t: &mut Translator<'_>) -> TResult {
     Ok(())
 }
 
-/// PRMT in the default index mode: each nibble of the selector `b` picks a byte of `c:a`, its
-/// top bit replicating the byte's sign. The other modes (72..75) are not supported.
+/// Index-mode selectors of the PRMT modes 1..=6 (F4E, B4E, RC8, ECL, ECR, RC16; NAK's
+/// `PrmtMode`), one per value of the selector's low two bits, from the PTX `prmt` tables.
+const PRMT_MODE_SELECTORS: [[u32; 4]; 6] = [
+    [0x3210, 0x4321, 0x5432, 0x6543],
+    [0x5670, 0x6701, 0x7012, 0x0123],
+    [0x0000, 0x1111, 0x2222, 0x3333],
+    [0x3210, 0x3211, 0x3222, 0x3333],
+    [0x0000, 0x1110, 0x2210, 0x3210],
+    [0x1010, 0x3232, 0x1010, 0x3232],
+];
+
+/// PRMT: in the default index mode each nibble of the selector `b` picks a byte of `c:a`, its
+/// top bit replicating the byte's sign. The other modes (72..75) pick a fixed byte pattern by
+/// the selector's low two bits, done as the equivalent index-mode selector.
 fn prmt(t: &mut Translator<'_>) -> TResult {
     let insn = t.insn;
-    if insn.bits(72, 4) != 0 || slot32_has_modifier(t) {
+    let mode = insn.bits(72, 4) as usize;
+    if mode > PRMT_MODE_SELECTORS.len() || slot32_has_modifier(t) {
         return Err(t.unsupported());
     }
     let (a, selector, c) = (t.src_a(), t.src_b()?, t.src_c()?);
+    let selector = match (mode, selector) {
+        (0, selector) => selector,
+        (mode, Value::U32(selector)) => {
+            Value::U32(PRMT_MODE_SELECTORS[mode - 1][(selector & 3) as usize])
+        }
+        (mode, selector) => {
+            let [s0, s1, s2, s3] = PRMT_MODE_SELECTORS[mode - 1].map(Value::U32);
+            let low = t.ir.bitwise_and(selector, Value::U32(1));
+            let odd = t.ir.icompare(ICompare::NotEqual, low, Value::U32(0));
+            let high = t.ir.bitwise_and(selector, Value::U32(2));
+            let upper = t.ir.icompare(ICompare::NotEqual, high, Value::U32(0));
+            let lower_pair = t.ir.select(odd, s1, s0);
+            let upper_pair = t.ir.select(odd, s3, s2);
+            t.ir.select(upper, upper_pair, lower_pair)
+        }
+    };
     let mut result = Value::U32(0);
     for byte in 0..4u32 {
         let picked = match selector {

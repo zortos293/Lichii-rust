@@ -1,5 +1,6 @@
 //! Draws of hand-assembled Maxwell programs on synthetic 3D engine state.
 
+use ash::vk;
 use lichii_common::settings::{Anisotropy, GraphicsSettings, ResolutionScale};
 use lichii_gpu::backend::{
     ChannelId, ComputeContext, ConstBufferBinding, DrawParams, DrawTexture, GraphicsConstBuffers,
@@ -23,6 +24,7 @@ use lichii_texture::block_linear::{GobLayout, Tiling, swizzle};
 use super::super::tests::{DADDR, Fixture, GPU_VA, fixture, gmmu, guest_linear};
 use super::{StageSources, Warning};
 use crate::pipeline::environment::TexturePool;
+use crate::pipeline::shader_cache::{ShaderCache, ShaderCacheStats};
 use crate::rasterizer::VulkanRasterizer;
 
 const SIZE: u32 = 16;
@@ -1945,6 +1947,12 @@ const TABLE: u64 = SSBO + 0x24;
 /// Samples at (0.5, 0.5), into render target 0, the texture whose handle is word 4 of the
 /// table the storage buffer c[0][0x110] points to.
 fn table_sampling_program() -> Vec<u8> {
+    typed_table_sampling_program(2)
+}
+
+/// `table_sampling_program` sampling as TEX texture type `ty` (2: 2D, 3: 2D array, 4: 3D,
+/// 6: cube).
+fn typed_table_sampling_program(ty: u64) -> Vec<u8> {
     let mut header = header(2, ShaderType::PIXEL);
     header[18] = 0xf;
     let ldg = sass(
@@ -1953,7 +1961,7 @@ fn table_sampling_program() -> Vec<u8> {
     );
     let tex = sass(
         Opcode::TexB,
-        (7 << 51) | (0b1111 << 31) | (2 << 28) | (6 << 20) | (2 << 8),
+        (7 << 51) | (0b1111 << 31) | (ty << 28) | (6 << 20) | (2 << 8),
     );
     program(
         header,
@@ -2053,6 +2061,77 @@ fn handle_programs_naming_an_image_of_another_kind_bind_the_null_texture() {
     f.assert_no_validation_errors();
 }
 
+#[test]
+fn null_images_exist_for_every_view_type_and_null_format() {
+    let Some((mut f, _)) = draw_fixture() else {
+        return;
+    };
+    let types = [
+        vk::ImageViewType::TYPE_1D,
+        vk::ImageViewType::TYPE_1D_ARRAY,
+        vk::ImageViewType::TYPE_2D,
+        vk::ImageViewType::TYPE_2D_ARRAY,
+        vk::ImageViewType::TYPE_3D,
+        vk::ImageViewType::CUBE,
+        vk::ImageViewType::CUBE_ARRAY,
+    ];
+    for view_type in types {
+        for format in [
+            vk::Format::R8G8B8A8_UNORM,
+            vk::Format::R8G8B8A8_UINT,
+            vk::Format::D16_UNORM,
+        ] {
+            let depth_3d =
+                format == vk::Format::D16_UNORM && view_type == vk::ImageViewType::TYPE_3D;
+            if depth_3d {
+                continue;
+            }
+            let view = f.rasterizer.null_view(view_type, format).unwrap();
+            assert!(view.is_some(), "{view_type:?} {format:?}");
+            assert_eq!(
+                f.rasterizer.null_view(view_type, format).unwrap(),
+                view,
+                "created once"
+            );
+        }
+    }
+    f.rasterizer.scheduler.finish().unwrap();
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn unbound_textures_of_every_type_read_zeros() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    uniform_texture(&f, 0, TEXTURE, [10, 200, 30, 255]);
+    let regs = sampling_regs();
+    handle_table(&mut f, 0);
+    for (ty, name) in [(3, "2D array"), (4, "3D"), (6, "cube")] {
+        write(
+            &f,
+            PROGRAMS + u64::from(FRAGMENT),
+            &fragment_program([0, 4]),
+        );
+        f.rasterizer
+            .invalidate_region(DADDR + PROGRAMS + u64::from(FRAGMENT), 0x100);
+        draw(&mut f, &gmmu, &regs);
+        assert!(target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]));
+        let program = typed_table_sampling_program(ty);
+        write(&f, PROGRAMS + u64::from(FRAGMENT), &program);
+        f.rasterizer
+            .invalidate_region(DADDR + PROGRAMS + u64::from(FRAGMENT), program.len() as u64);
+        draw(&mut f, &gmmu, &regs);
+        assert!(
+            target(&mut f).iter().all(|&t| t == [0; 4]),
+            "a {name} descriptor naming a 2D image reads the null texture"
+        );
+    }
+    assert_eq!(f.rasterizer.draw.warned & Warning::NullTexture as u32, 0);
+    assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
+    f.assert_no_validation_errors();
+}
+
 /// Stores `handle` as word 4 of the table the storage buffer c[0][0x110] points to.
 fn table_writing_program(handle: u32) -> Vec<u8> {
     let mut header = header(2, ShaderType::PIXEL);
@@ -2123,7 +2202,7 @@ fn handle_programs_read_the_table_words_earlier_gpu_work_wrote() {
 }
 
 #[test]
-fn handle_programs_skip_typeless_image_loads_of_integer_images() {
+fn handle_programs_load_zeros_for_integer_images_under_typeless_loads() {
     let Some((mut f, gmmu)) = draw_fixture() else {
         return;
     };
@@ -2160,11 +2239,17 @@ fn handle_programs_skip_typeless_image_loads_of_integer_images() {
 
     handle_table(&mut f, 1);
     draw(&mut f, &gmmu, &regs);
-    assert_ne!(
-        f.rasterizer.draw.warned & Warning::NullStorageImage as u32,
-        0,
-        "an integer image under the float declaration skips the draw"
-    );
+    let warned = f.rasterizer.draw.warned & Warning::NullStorageImage as u32 != 0;
+    if f.rasterizer.device.features.null_descriptor {
+        assert!(
+            target(&mut f).iter().all(|t| t[..3] == [0; 3]),
+            "an integer image under the float declaration loads from a null descriptor: {:?}",
+            &target(&mut f)[..2]
+        );
+        assert!(!warned);
+    } else {
+        assert!(warned, "without null descriptors the draw is skipped");
+    }
     assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
     f.assert_no_validation_errors();
 }
@@ -2216,9 +2301,67 @@ fn indexed_table_sampling_program() -> Vec<u8> {
 
 #[test]
 fn per_invocation_table_handles_bind_a_texture_per_table_entry() {
-    let Some((mut f, gmmu)) = draw_fixture() else {
+    draw_per_invocation_table_handles(true, None);
+}
+
+#[test]
+fn table_handles_sample_with_explicit_gradients_without_quad_divergent_implicit_lod() {
+    draw_per_invocation_table_handles(false, None);
+}
+
+#[test]
+fn the_disk_cache_is_keyed_on_quad_divergent_implicit_lod() {
+    let dir = cache_dir("quad-divergent-lod");
+    let Some((off, _)) = draw_per_invocation_table_handles(false, Some(&dir)) else {
         return;
     };
+    assert_eq!((off.translated, off.disk_hits), (2, 0));
+    let (again, _) = draw_per_invocation_table_handles(false, Some(&dir)).unwrap();
+    assert_eq!(
+        (again.translated, again.disk_hits),
+        (0, 2),
+        "same profile: served"
+    );
+    let (on, supported) = draw_per_invocation_table_handles(true, Some(&dir)).unwrap();
+    if supported {
+        assert_eq!(
+            (on.translated, on.disk_hits),
+            (2, 0),
+            "modules translated without quadDivergentImplicitLod are not reused with it"
+        );
+    } else {
+        eprintln!("skipping the reuse check: no quadDivergentImplicitLod");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Whether `spirv` takes a screen-space derivative (OpDPdx).
+fn takes_derivatives(spirv: &[u32]) -> bool {
+    let mut words = &spirv[5..];
+    while let [first, ..] = words {
+        if first & 0xffff == 207 {
+            return true;
+        }
+        words = &words[((first >> 16) as usize).max(1)..];
+    }
+    false
+}
+
+/// Draws a fragment program that samples a texture handle table at a per-column index;
+/// `quad_divergent_implicit_lod: false` translates as for a device without that feature.
+/// With `disk`, shaders go through the disk cache there. Returns the shader cache's stats and
+/// whether the profile had quadDivergentImplicitLod; `None` when skipped.
+fn draw_per_invocation_table_handles(
+    quad_divergent_implicit_lod: bool,
+    disk: Option<&std::path::Path>,
+) -> Option<(ShaderCacheStats, bool)> {
+    let (mut f, gmmu) = draw_fixture()?;
+    if !quad_divergent_implicit_lod {
+        let mut profile = f.rasterizer.draw.shaders.profile().clone();
+        profile.support_quad_divergent_implicit_lod = false;
+        let host = f.rasterizer.device.shader_host.clone();
+        f.rasterizer.draw.shaders = ShaderCache::new(profile, host);
+    }
     if !f
         .rasterizer
         .device
@@ -2226,7 +2369,12 @@ fn per_invocation_table_handles_bind_a_texture_per_table_entry() {
         .sampled_image_array_non_uniform_indexing
     {
         eprintln!("skipping: no non-uniform sampled image indexing");
-        return;
+        return None;
+    }
+    if let Some(dir) = disk {
+        f.rasterizer
+            .open_disk_cache(dir, &GraphicsSettings::default())
+            .unwrap();
     }
     write(
         &f,
@@ -2246,13 +2394,39 @@ fn per_invocation_table_handles_bind_a_texture_per_table_entry() {
     let indices: Vec<u32> = (0..SIZE).map(|x| x & 1).collect();
     write(&f, INDICES_TABLE, bytemuck::cast_slice(&indices));
     draw(&mut f, &gmmu, &sampling_regs());
+    assert_eq!(
+        f.rasterizer.draw.textures.len(),
+        2,
+        "64 table entries naming two textures prepare each once"
+    );
     for (i, &texel) in target(&mut f).iter().enumerate() {
         let x = i as u32 % SIZE;
         let want = if x.is_multiple_of(2) { even } else { odd };
         assert_eq!(texel, want, "column {x} samples the entry its index names");
     }
     assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
+    let fragment = f.rasterizer.draw.stages[4]
+        .as_ref()
+        .expect("a fragment module");
+    assert_eq!(
+        takes_derivatives(&fragment.spirv),
+        !f.rasterizer
+            .draw
+            .shaders
+            .profile()
+            .support_quad_divergent_implicit_lod,
+        "explicit gradients only without quadDivergentImplicitLod"
+    );
     f.assert_no_validation_errors();
+    f.rasterizer.draw.shaders.flush_disk();
+    Some((
+        f.rasterizer.draw.shaders.stats(),
+        f.rasterizer
+            .draw
+            .shaders
+            .profile()
+            .support_quad_divergent_implicit_lod,
+    ))
 }
 
 fn cache_dir(name: &str) -> std::path::PathBuf {
@@ -2658,19 +2832,32 @@ fn per_primitive_fragment_inputs_skip_the_draw() {
     f.assert_no_validation_errors();
 }
 
-#[test]
-fn indirect_mesh_draws_are_skipped() {
-    let Some((mut f, gmmu)) = mesh_fixture() else {
-        return;
-    };
-    let regs = mesh_regs(1);
+/// Draws `commands` (guest indirect commands of `stride` bytes) as an indirect task/mesh draw,
+/// with the draw count `count` when set, and returns whether the triangle covered the target.
+fn mesh_indirect_draw(
+    f: &mut Fixture,
+    gmmu: &Gmmu,
+    regs: &Regs,
+    indexed: bool,
+    stride: u32,
+    commands: &[u32],
+    count: Option<u32>,
+) -> bool {
+    write(f, COMMANDS, bytemuck::cast_slice(commands));
+    f.rasterizer
+        .invalidate_region(DADDR + COMMANDS, commands.len() as u64 * 4);
+    if let Some(count) = count {
+        write(f, COUNT, &count.to_le_bytes());
+        f.rasterizer.invalidate_region(DADDR + COUNT, 4);
+    }
+    let words = commands.len() as u32 * 4;
     let mut dirty = DirtyState::new();
     let const_buffers = const_buffers();
     let root_tables = [[0; 64]; 8];
     let mut ctx = GraphicsContext {
         channel: ChannelId(0),
-        memory: &gmmu,
-        regs: &regs,
+        memory: gmmu,
+        regs,
         dirty: &mut dirty,
         const_buffers: &const_buffers,
         root_tables: &root_tables,
@@ -2678,15 +2865,134 @@ fn indirect_mesh_draws_are_skipped() {
     f.rasterizer.draw_indirect(
         &mut ctx,
         &IndirectDraw {
-            topology: PrimitiveTopology::TRIANGLES,
-            indexed: false,
-            buffer: GPU_VA + VERTICES,
-            stride: 16,
-            max_draws: 1,
-            count_buffer: None,
+            topology: PrimitiveTopology::QUADS,
+            indexed,
+            buffer: GPU_VA + COMMANDS,
+            stride,
+            max_draws: words / stride,
+            count_buffer: count.map(|_| GPU_VA + COUNT),
         },
     );
-    assert_ne!(f.rasterizer.draw.warned & Warning::IndirectMesh as u32, 0);
-    assert_eq!(f.rasterizer.draw.shaders.stats().translated, 0);
+    let texels = switch2_target(f);
+    let covered = texels.iter().all(|&t| t == [255, 128, 0, 255]);
+    assert!(
+        covered || texels.iter().all(|&t| t == [0; 4]),
+        "all or nothing: {:?}",
+        &texels[..4]
+    );
+    covered
+}
+
+#[test]
+fn indirect_mesh_draws_launch_the_groups_their_first_word_counts() {
+    let Some((mut f, gmmu)) = mesh_fixture() else {
+        return;
+    };
+    let regs = mesh_regs(1);
+    assert!(
+        !mesh_indirect_draw(&mut f, &gmmu, &regs, false, 16, &[0, 1, 0, 0], None),
+        "no groups draw nothing"
+    );
+    assert!(
+        mesh_indirect_draw(&mut f, &gmmu, &regs, false, 16, &[1, 0, 0, 0], None),
+        "one group, whatever the instance count and first vertex words hold"
+    );
+    assert_eq!(f.rasterizer.draw.pipelines.stats().built, 1);
+    assert_eq!(
+        f.rasterizer.draw.warned & Warning::IndirectMesh as u32,
+        0,
+        "the quad topology is not assembled"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn indexed_indirect_mesh_draws_count_groups_with_the_index_count() {
+    let Some((mut f, gmmu)) = mesh_fixture() else {
+        return;
+    };
+    let regs = mesh_regs(1);
+    assert!(!mesh_indirect_draw(
+        &mut f,
+        &gmmu,
+        &regs,
+        true,
+        20,
+        &[0, 1, 0, 0, 0],
+        None
+    ));
+    assert!(mesh_indirect_draw(
+        &mut f,
+        &gmmu,
+        &regs,
+        true,
+        20,
+        &[1, 1, 0, 0, 0],
+        None
+    ));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn indirect_mesh_draws_launch_only_the_commands_the_count_buffer_names() {
+    let Some((mut f, gmmu)) = mesh_fixture() else {
+        return;
+    };
+    let regs = mesh_regs(1);
+    let commands = [0, 1, 0, 0, 1, 1, 0, 0];
+    assert!(
+        !mesh_indirect_draw(&mut f, &gmmu, &regs, false, 16, &commands, Some(1)),
+        "the second command is past the count"
+    );
+    assert!(mesh_indirect_draw(
+        &mut f,
+        &gmmu,
+        &regs,
+        false,
+        16,
+        &commands,
+        Some(2)
+    ));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn indirect_mesh_draws_launch_every_command_without_a_count() {
+    let Some((mut f, gmmu)) = mesh_fixture() else {
+        return;
+    };
+    let regs = mesh_regs(1);
+    assert!(
+        mesh_indirect_draw(
+            &mut f,
+            &gmmu,
+            &regs,
+            false,
+            16,
+            &[0, 1, 0, 0, 1, 1, 0, 0],
+            None
+        ),
+        "the second command draws"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn indirect_task_draws_launch_the_mesh_workgroups_their_tasks_count() {
+    let Some((mut f, gmmu)) = mesh_fixture() else {
+        return;
+    };
+    let mut regs = mesh_regs(3);
+    bind_program(&mut regs, 1, ShaderType::VERTEX_B, TASK);
+    assert!(mesh_indirect_draw(
+        &mut f,
+        &gmmu,
+        &regs,
+        false,
+        16,
+        &[1, 1, 0, 0],
+        None
+    ));
+    assert_eq!(mesh_stages(&f), TASK_STAGES);
     f.assert_no_validation_errors();
 }

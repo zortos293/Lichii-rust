@@ -1,18 +1,26 @@
-//! Audio services that do not need the renderer: `audout:u`, `audin:u`, `audctl` and `hwopus`.
+//! Audio services: `audout:u`, `audin:u`, `audren:u` (and the empty `audren:a` and `audren:d`),
+//! `audctl`, `hwopus`, and the Switch 2 `aud:u`, `auddmg:u` and `audsmx:u`.
 //!
 //! They share one [`Audio`]: the host sink `core::System` passes in [`ServiceContext::audio`]
-//! and the audio out and audio in managers that play on it.
+//! and the audio out, audio in, renderer and sound mixer state that play on it.
 
+mod aud;
 mod audctl;
 mod audin;
 mod audout;
+mod audren;
+mod devmgr;
 mod hwacod;
 mod hwopus;
+#[cfg(test)]
+mod nx2_tests;
+mod sysmix;
 #[cfg(test)]
 mod tests;
 
 use std::sync::Arc;
 
+use lichii_audio::renderer::render::RenderManager;
 use lichii_audio::sink::Sink;
 use lichii_audio::{r#in, out};
 use lichii_common::HleResult;
@@ -29,6 +37,8 @@ pub(crate) struct Audio {
     pub sink: Arc<Sink>,
     pub out: out::Manager,
     pub input: r#in::Manager,
+    pub renderer: RenderManager,
+    pub sysmix: Arc<sysmix::SysmixStreams>,
 }
 
 pub(crate) fn register(context: &Arc<ServiceContext>) -> HleResult<()> {
@@ -41,10 +51,15 @@ fn start(context: &Arc<ServiceContext>) -> HleResult<Arc<Audio>> {
     let audio = Arc::new(Audio {
         out: out::Manager::new(sink.clone()),
         input: r#in::Manager::new(sink.clone()),
+        renderer: RenderManager::new(sink.clone()),
+        sysmix: sysmix::SysmixStreams::new(sink.clone()),
         sink,
     });
     audout::register(context, &audio)?;
     audin::register(context, &audio)?;
+    audren::register(context, &audio)?;
+    aud::register(context, &audio)?;
+    devmgr::register(context, &audio)?;
     audctl::register(context, &audio)?;
     hwopus::register(context)?;
     Ok(audio)

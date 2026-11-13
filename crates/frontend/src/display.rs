@@ -1,9 +1,11 @@
 //! The window's Vulkan presenter with the instance, device and swapchain behind it, kept alive
 //! together with the window they present to.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use lichii_common::ConsoleGeneration;
+use lichii_common::paths::UserPaths;
 use lichii_common::perf::PerfStats;
 use lichii_common::settings::GraphicsSettings;
 use lichii_core::RendererFactory;
@@ -74,34 +76,21 @@ impl Display {
     }
 
     /// A Vulkan renderer for a title of generation `title` on this display's device, drawing
-    /// guest frames into the presenter's mailbox. If the renderer cannot be created the title
-    /// runs on the headless renderer and shows nothing.
+    /// guest frames into the presenter's mailbox and keeping its shaders in `shader_cache`.
     pub fn renderer(
         &self,
         title: ConsoleGeneration,
         settings: &GraphicsSettings,
+        shader_cache: Option<PathBuf>,
     ) -> RendererFactory {
-        let device = self.device.clone();
-        let mailbox = self.mailbox.clone();
-        let live = self.live.clone();
-        let settings = settings.clone();
-        let gob_layout = match title {
-            ConsoleGeneration::Switch1 => GobLayout::Tegra,
-            ConsoleGeneration::Switch2 => GobLayout::Switch2,
-        };
-        Box::new(move |handles| {
-            match VulkanRasterizer::new(&device, handles.clone(), mailbox, gob_layout) {
-                Ok(mut rasterizer) => {
-                    rasterizer.apply_settings(&settings);
-                    rasterizer.follow(live);
-                    Box::new(rasterizer)
-                }
-                Err(e) => {
-                    tracing::error!("creating the Vulkan renderer, drawing nothing: {e}");
-                    lichii_core::headless_renderer()(handles)
-                }
-            }
-        })
+        vulkan_renderer(
+            self.device.clone(),
+            self.mailbox.clone(),
+            self.live.clone(),
+            title,
+            settings,
+            shader_cache,
+        )
     }
 
     pub fn adapter_name(&self) -> &str {
@@ -128,4 +117,51 @@ impl Display {
             tracing::error!("presenting: {e}");
         }
     }
+}
+
+/// Where the disk shader cache of the title `program_id` lives: `shader/<TITLE ID>/` in the user
+/// data folder. Homebrew and bare NSOs have no program id to key a cache by, so they get none.
+pub fn shader_cache_dir(user: &UserPaths, program_id: u64) -> Option<PathBuf> {
+    (program_id != 0).then(|| {
+        user.data_dir
+            .join("shader")
+            .join(format!("{program_id:016X}"))
+    })
+}
+
+/// A Vulkan renderer on `device` drawing into `mailbox`. It opens the disk shader cache in
+/// `shader_cache` before the first draw, unless the settings turn the disk cache off; the cache
+/// is written back when the renderer drops with the session's GPU thread. If the renderer cannot
+/// be created the title runs on the headless renderer and shows nothing.
+pub(crate) fn vulkan_renderer(
+    device: Arc<Device>,
+    mailbox: Arc<FrameMailbox>,
+    live: Arc<LiveSettings>,
+    title: ConsoleGeneration,
+    settings: &GraphicsSettings,
+    shader_cache: Option<PathBuf>,
+) -> RendererFactory {
+    let settings = settings.clone();
+    let gob_layout = match title {
+        ConsoleGeneration::Switch1 => GobLayout::Tegra,
+        ConsoleGeneration::Switch2 => GobLayout::Switch2,
+    };
+    Box::new(move |handles| {
+        match VulkanRasterizer::new(&device, handles.clone(), mailbox, gob_layout) {
+            Ok(mut rasterizer) => {
+                rasterizer.apply_settings(&settings);
+                rasterizer.follow(live);
+                if let Some(dir) = &shader_cache
+                    && let Err(e) = rasterizer.open_disk_cache(dir, &settings)
+                {
+                    tracing::warn!("opening the shader cache in {}: {e}", dir.display());
+                }
+                Box::new(rasterizer)
+            }
+            Err(e) => {
+                tracing::error!("creating the Vulkan renderer, drawing nothing: {e}");
+                lichii_core::headless_renderer()(handles)
+            }
+        }
+    })
 }

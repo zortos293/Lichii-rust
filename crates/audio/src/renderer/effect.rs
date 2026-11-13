@@ -105,18 +105,8 @@ pub struct EffectOutStatusV1 {
 const _: () = assert!(size_of::<EffectOutStatusV1>() == 0x10);
 
 /// Result state bytes; the light limiter keeps its statistics here.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
-pub struct EffectResultState {
-    pub state: [u8; EFFECT_RESULT_STATE_SIZE],
-}
-const _: () = assert!(size_of::<EffectResultState>() == 0x80);
-
-impl Default for EffectResultState {
-    fn default() -> Self {
-        Self::zeroed()
-    }
-}
+pub use crate::dsp::abi::EffectResultState;
+const _: () = assert!(size_of::<EffectResultState>() == EFFECT_RESULT_STATE_SIZE);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -463,12 +453,12 @@ impl EffectInfo {
     }
 }
 
-/// All effects and their result states.
+/// All effects and the host copy of their result states. The DSP-shared result states live in
+/// [`DspState::effect_results`](crate::dsp::DspState::effect_results).
 #[derive(Clone, Debug, Default)]
 pub struct EffectContext {
     infos: Vec<EffectInfo>,
     result_states_cpu: Vec<EffectResultState>,
-    result_states_dsp: Vec<EffectResultState>,
 }
 
 impl EffectContext {
@@ -482,7 +472,6 @@ impl EffectContext {
         Self {
             infos: (0..count).map(|_| EffectInfo::default()).collect(),
             result_states_cpu: vec![EffectResultState::default(); states],
-            result_states_dsp: vec![EffectResultState::default(); states],
         }
     }
 
@@ -506,33 +495,13 @@ impl EffectContext {
         &self.result_states_cpu[index]
     }
 
-    /// Result states the DSP writes while rendering.
-    pub fn dsp_result_states_mut(&mut self) -> &mut [EffectResultState] {
-        &mut self.result_states_dsp
+    pub(crate) fn parts_mut(&mut self) -> (&mut [EffectInfo], &mut [EffectResultState]) {
+        (&mut self.infos, &mut self.result_states_cpu)
     }
 
-    pub(crate) fn parts_mut(
-        &mut self,
-    ) -> (
-        &mut [EffectInfo],
-        &mut [EffectResultState],
-        &mut [EffectResultState],
-    ) {
-        (
-            &mut self.infos,
-            &mut self.result_states_cpu,
-            &mut self.result_states_dsp,
-        )
-    }
-
-    /// Copies DSP result states into the host copies after a command list.
-    pub fn update_state_by_dsp_shared(&mut self) {
-        for ((info, cpu), dsp) in self
-            .infos
-            .iter()
-            .zip(&mut self.result_states_cpu)
-            .zip(&self.result_states_dsp)
-        {
+    /// Copies the DSP result states `dsp` into the host copies after a command list.
+    pub fn update_state_by_dsp_shared(&mut self, dsp: &[EffectResultState]) {
+        for ((info, cpu), dsp) in self.infos.iter().zip(&mut self.result_states_cpu).zip(dsp) {
             info.update_result_state(cpu, dsp);
         }
     }
