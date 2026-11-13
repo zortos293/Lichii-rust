@@ -387,3 +387,26 @@ fn cores_are_created_with_the_configured_cpu_accuracy() {
     let _cpu = kernel.0.new_cpu(&process, 0);
     assert_eq!(*seen.lock(), [CpuAccuracy::Paranoid]);
 }
+
+#[test]
+fn cores_drop_the_cpu_state_of_an_exited_process() {
+    let test = TestKernel::new(ConsoleGeneration::Switch1);
+    let main = test.program(Script::new().exit());
+    let first = test.start(test.image(), main);
+    let memory = Arc::downgrade(first.memory());
+    drop(first);
+    test.kernel.run().unwrap();
+    test.exits
+        .recv_timeout(Duration::from_secs(10))
+        .expect("first process exits");
+    test.start(test.image(), main);
+    test.exits
+        .recv_timeout(Duration::from_secs(10))
+        .expect("second process exits");
+    let retired = memory.upgrade().is_none();
+    test.kernel.shutdown();
+    assert!(
+        retired,
+        "a core still holds the exited process's address space"
+    );
+}
