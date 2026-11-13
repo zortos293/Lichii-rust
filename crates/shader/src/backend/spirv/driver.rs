@@ -31,7 +31,7 @@ pub(super) fn emit(
     if program.stage == ShaderStage::VertexA {
         return Err(EmitError::UnsupportedStage(program.stage));
     }
-    mesh::check_support(profile, runtime, program.stage)?;
+    mesh::check_support(profile, runtime, program.stage, &program.info.mesh)?;
     let mut ctx = EmitContext::new(profile, runtime, program, bindings)?;
     let main = define_main(&mut ctx)?;
     ctx.define_deferred_functions()?;

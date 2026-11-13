@@ -332,7 +332,8 @@ pub fn emit_mesh_emulation_vertex(
 /// The distribution pass of the mesh emulation with a task program: one invocation between
 /// the task and mesh dispatches. Set 0 holds the payload buffer (binding 0), the offsets (1:
 /// first mesh workgroup of each task), the arguments (2, [`MESH_EMULATION_ARGS_WORDS`] words)
-/// and the arena counter (3: output words allocated so far, kept counting past the arena's end),
+/// and the arena counter (3: output words allocated so far, kept counting past the arena's end
+/// and saturating at `u32::MAX` so it never wraps back into the arena),
 /// with [`MeshEmulationDistributionConstants`] as push constants. The draw's output is allocated
 /// from the arena every draw of the submission shares; mesh workgroups that do not fit are not
 /// dispatched.
@@ -414,16 +415,6 @@ pub fn emit_mesh_emulation_distribution(profile: &Profile) -> EmitResult<Vec<u32
     m.b.branch(header)?;
     m.b.begin_block(Some(merge))?;
 
-    let total = m.load(total_var)?;
-    let counter_word = m.word(buffer_u32, counter, zero)?;
-    let base = m.load(counter_word)?;
-    let allocated = m.mul(total, block_words)?;
-    let end = m.add(base, allocated)?;
-    m.b.store(counter_word, end, None, [])?;
-    let fits = m.b.u_less_than(bool_type, None, base, capacity_words)?;
-    let left = m.b.i_sub(u32_type, None, capacity_words, base)?;
-    let room = m.b.select(u32_type, None, fits, left, zero)?;
-    let room_groups = m.b.u_div(u32_type, None, room, block_words)?;
     let glsl = m.b.ext_inst_import("GLSL.std.450");
     let umin = |m: &mut Module, a: Word, b: Word| -> EmitResult<Word> {
         Ok(m.b.ext_inst(
@@ -434,6 +425,21 @@ pub fn emit_mesh_emulation_distribution(profile: &Profile) -> EmitResult<Vec<u32
             [Operand::IdRef(a), Operand::IdRef(b)],
         )?)
     };
+    let total = m.load(total_var)?;
+    let counter_word = m.word(buffer_u32, counter, zero)?;
+    let base = m.load(counter_word)?;
+    let max_word = m.constant(u32::MAX);
+    let max_groups_counted = m.b.u_div(u32_type, None, max_word, block_words)?;
+    let counted = umin(&mut m, total, max_groups_counted)?;
+    let allocated = m.mul(counted, block_words)?;
+    let headroom = m.b.i_sub(u32_type, None, max_word, base)?;
+    let allocated = umin(&mut m, allocated, headroom)?;
+    let end = m.add(base, allocated)?;
+    m.b.store(counter_word, end, None, [])?;
+    let fits = m.b.u_less_than(bool_type, None, base, capacity_words)?;
+    let left = m.b.i_sub(u32_type, None, capacity_words, base)?;
+    let room = m.b.select(u32_type, None, fits, left, zero)?;
+    let room_groups = m.b.u_div(u32_type, None, room, block_words)?;
     let dispatched = umin(&mut m, total, room_groups)?;
     let dispatched = umin(&mut m, dispatched, max_groups)?;
     let draw = MESH_EMULATION_DRAW_ARGS_OFFSET / 4;

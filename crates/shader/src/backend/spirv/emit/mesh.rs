@@ -20,6 +20,7 @@ use crate::backend::spirv::mesh_emulation::{
     MESH_EMULATION_ARGS_BASE, MESH_EMULATION_ARGS_TASKS, mesh_emulation_block_words,
 };
 use crate::backend::spirv::{EmitError, EmitResult};
+use crate::info::MeshInfo;
 use crate::ir::{Attribute, InstId, Opcode};
 use crate::runtime::MeshEmulationTask;
 use crate::{Profile, RuntimeInfo, ShaderStage};
@@ -73,14 +74,22 @@ pub(crate) fn check_support(
     profile: &Profile,
     runtime: &RuntimeInfo,
     stage: ShaderStage,
+    mesh: &MeshInfo,
 ) -> EmitResult<()> {
     if !is_mesh_stage(stage) {
         return Ok(());
     }
+    let is_mesh = stage == ShaderStage::Mesh;
     match runtime.mesh_emulation {
         Some(emulation) if stage == ShaderStage::Task && emulation.task.is_none() => Err(
             EmitError::Unsupported("task program emulation without task buffers"),
         ),
+        Some(_) if is_mesh && mesh.primitive_vertices() != 3 => Err(EmitError::Unsupported(
+            "mesh emulation of point and line topologies",
+        )),
+        Some(_) if is_mesh && !mesh.primitive_lines.is_empty() => Err(EmitError::Unsupported(
+            "mesh emulation of per-primitive outputs",
+        )),
         Some(_) => Ok(()),
         None if !profile.support_mesh_shader => Err(EmitError::UnsupportedStage(stage)),
         None if profile.supported_spirv < 0x0001_0400 => {

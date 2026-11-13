@@ -378,7 +378,9 @@ fn emulated_mesh_program_with_and_without_a_task() {
             convert_depth_mode: true,
             ..RuntimeInfo::default()
         };
-        let mut program = mesh_program(mesh_info(TOPOLOGY_TRIANGLES));
+        let mut info = mesh_info(TOPOLOGY_TRIANGLES);
+        info.primitive_lines.clear();
+        let mut program = mesh_program(info);
         program.info.storage_buffers_descriptors = vec![StorageBufferDescriptor {
             cbuf_index: 0,
             cbuf_offset: 0x10,
@@ -404,6 +406,22 @@ fn emulated_mesh_program_with_and_without_a_task() {
             })
             .count();
         assert_eq!(buffers, if task { 5 } else { 2 }, "{name}");
+    }
+}
+
+#[test]
+fn mesh_emulation_rejects_layouts_it_cannot_draw() {
+    let runtime = RuntimeInfo {
+        mesh_emulation: Some(emulation(false)),
+        ..RuntimeInfo::default()
+    };
+    let mut lines = mesh_info(TOPOLOGY_LINES);
+    lines.primitive_lines.clear();
+    let per_primitive = mesh_info(TOPOLOGY_TRIANGLES);
+    assert!(!per_primitive.primitive_lines.is_empty());
+    for info in [lines, per_primitive] {
+        let error = emit_error(&emulation_profile(), &runtime, &mesh_program(info));
+        assert!(matches!(error, EmitError::Unsupported(_)), "{error}");
     }
 }
 

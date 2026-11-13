@@ -12,7 +12,7 @@ use crate::hash::Recorder;
 use crate::info::{Interpolation, StorageBufferDescriptor, StorageWriteExtent};
 use crate::ir::{Attribute, Opcode, Program, SyntaxNode};
 use crate::maxwell::flow::MaxwellFlow;
-use crate::maxwell::header::{OutputTopology, PixelImap, ProgramHeader};
+use crate::maxwell::header::{OutputTopology, PixelImap, ProgramHeader, SystemValuesC};
 use crate::maxwell::passthrough::{lower_geometry_passthrough, output_topology_vertices};
 use crate::opt;
 use crate::profile::HostTranslateInfo;
@@ -205,6 +205,31 @@ fn translate_recorded(
             program.workgroup_size = env.workgroup_size();
             program.shared_memory_size = env.shared_memory_size();
         }
+        ShaderStage::Task | ShaderStage::Mesh => {
+            let state = env
+                .mesh_state()
+                .ok_or(TranslateError::MissingMeshState { stage })?;
+            let init = state.init_shader;
+            let lines = ((init >> 12) & 0x1ff).max((init >> 22) & 0x1ff);
+            let mesh = &mut program.info.mesh;
+            mesh.payload_words = lines.max(1) * 32;
+            mesh.topology = state.shader_a & 0xf;
+            mesh.max_vertices = (state.shader_a >> 4) & 0x1ff;
+            mesh.max_primitives = (state.shader_a >> 13) & 0x3ff;
+            let threads = if stage == ShaderStage::Task {
+                init & 0x3f
+            } else {
+                (state.shader_b >> 20) & 0x3f
+            };
+            program.workgroup_size = [threads.max(1), 1, 1];
+            if stage == ShaderStage::Mesh {
+                if !matches!(mesh.topology, 0 | 1 | 4) {
+                    return Err(TranslateError::UnsupportedMesh("output topology"));
+                }
+                mesh.vertex_lines = mesh_lines(&header(env)?)?;
+                mesh.primitive_lines = mesh_lines(&state.primitive_header)?;
+            }
+        }
         _ => {}
     }
     remove_unreachable_blocks(&mut program.ir);
@@ -216,6 +241,28 @@ fn translate_recorded(
         &mut program,
     )?;
     Ok(program)
+}
+
+/// The attributes a mesh program's stage buffer lines hold, in line order: the system values
+/// from PrimitiveId on, then the generic components, as `header`'s output map lists them.
+fn mesh_lines(header: &ProgramHeader) -> Result<Vec<u32>, TranslateError> {
+    let vtg = header.vtg();
+    if vtg.omap_system_c().intersects(SystemValuesC::all()) {
+        return Err(TranslateError::UnsupportedMesh(
+            "outputs past the generic attributes",
+        ));
+    }
+    let system = vtg.omap_system_b().bits();
+    let system_lines = (0..8)
+        .filter(|bit| system >> bit & 1 != 0)
+        .map(|bit| u32::from(Attribute::PRIMITIVE_ID.0) + bit);
+    let generic_lines = (0..Attribute::NUM_GENERICS as usize).flat_map(|generic| {
+        let mask = vtg.output_generic(generic);
+        (0..4u16)
+            .filter(move |&element| mask[element as usize])
+            .map(move |element| u32::from(Attribute::generic(generic as u16, element).0))
+    });
+    Ok(system_lines.chain(generic_lines).collect())
 }
 
 fn header(env: &dyn ShaderEnvironment) -> Result<ProgramHeader, TranslateError> {
@@ -317,6 +364,16 @@ fn optimize(
         opt::verify(ir).map_err(TranslateError::InvalidIr)?;
     }
     opt::collect_shader_info(env, ir, info);
+    if stage == ShaderStage::Mesh {
+        for &line in info
+            .mesh
+            .vertex_lines
+            .iter()
+            .chain(&info.mesh.primitive_lines)
+        {
+            info.stores.set(Attribute(line as u16), true);
+        }
+    }
     opt::layer(ir, stage, info, host);
     opt::vendor_workaround(ir);
     collect_interpolation_info(env, info)?;
