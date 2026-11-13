@@ -201,6 +201,10 @@ impl Inbox {
 struct Front {
     shared: FrontShared,
     channels: Vec<Option<FrontChannel>>,
+    /// Commands not handled yet. A side command waits here while a channel is parked on a
+    /// fetch synchronisation, so it cannot overtake that channel's earlier entries, and every
+    /// command after it waits too.
+    held: VecDeque<CpuCommand>,
 }
 
 impl Front {
@@ -218,10 +222,12 @@ impl Front {
             let waiting = self.channels.iter().flatten().any(FrontChannel::is_waiting);
             let closed = inbox.take(&mut batch, waiting.then_some(poll));
             let busy = !batch.is_empty();
-            for command in batch.drain(..) {
-                self.handle(command);
-            }
+            self.held.append(&mut batch);
+            self.handle_held();
             let resumed = self.resume();
+            if resumed {
+                self.handle_held();
+            }
             self.shared.stream.idle();
             if closed {
                 break;
@@ -307,6 +313,22 @@ impl Front {
     }
 
     /// Runs the channels whose wait is over. Returns whether any ran.
+    fn handle_held(&mut self) {
+        while let Some(command) = self.held.pop_front() {
+            if matches!(command, CpuCommand::Side(_))
+                && self
+                    .channels
+                    .iter()
+                    .flatten()
+                    .any(FrontChannel::waits_for_fetch)
+            {
+                self.held.push_front(command);
+                return;
+            }
+            self.handle(command);
+        }
+    }
+
     fn resume(&mut self) -> bool {
         let mut resumed = false;
         for channel in self.channels.iter_mut().flatten() {
@@ -391,6 +413,7 @@ impl Gpu {
                 syncpoints: handles.syncpoints.clone(),
             },
             channels: Vec::new(),
+            held: VecDeque::new(),
         };
         let front_inbox = inbox.clone();
         let front = std::thread::Builder::new()

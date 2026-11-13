@@ -192,6 +192,11 @@ impl FrontChannel {
         self.wait.is_some()
     }
 
+    /// Whether the channel is parked until the back synchronised an entry's fetch.
+    pub(crate) fn waits_for_fetch(&self) -> bool {
+        matches!(self.wait, Some(Wait::Fetch(_)))
+    }
+
     /// Whether the channel has work it can run now.
     pub(crate) fn is_runnable(&self, shared: &FrontShared) -> bool {
         match self.wait {

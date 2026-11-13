@@ -1575,6 +1575,31 @@ fn entries_without_sync_are_fetched_without_waiting() {
 }
 
 #[test]
+fn side_commands_wait_behind_a_sync_entry_queued_before_them() {
+    each_mode(|threading| {
+        let mut rig = Rig::deferred(threading);
+        let waiter = rig.channel(HostClass::Ampere);
+        let (writer, list) = list_written_by_a_release(&mut rig);
+        rig.gpu.pause(true);
+        rig.gpu
+            .submit(waiter, Submission::new(&[writer, sync(list)]));
+        let log = rig.log.clone();
+        rig.gpu.run_in_order(move |_| log.lock().push(Event::Ran));
+        rig.gpu.pause(false);
+        rig.gpu.synchronize();
+        let order: Vec<_> = rig
+            .events()
+            .into_iter()
+            .filter(|event| matches!(event, Event::Ran | Event::Method { method: 0x701, .. }))
+            .collect();
+        assert!(
+            matches!(order[..], [Event::Method { .. }, Event::Ran]),
+            "{threading:?}: {order:?}"
+        );
+    });
+}
+
+#[test]
 fn a_sync_entry_suspends_only_its_channel() {
     each_mode(|threading| {
         let mut rig = Rig::deferred(threading);
