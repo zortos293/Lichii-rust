@@ -390,14 +390,33 @@ mod tests {
         let hz = measure_tsc_hz();
         let mut tsc = (0, 0, 0);
         let mut instant = (0, 0, 0);
-        for _ in 0..100 {
+        let spin = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let load: Vec<_> = (0..4)
+            .map(|_| {
+                let spin = spin.clone();
+                std::thread::spawn(move || {
+                    let mut x = 0u64;
+                    while !spin.load(Ordering::Relaxed) {
+                        x = std::hint::black_box(x.wrapping_mul(31).wrapping_add(1));
+                    }
+                })
+            })
+            .collect();
+        for _ in 0..600 {
             let (b, w) = run(CoreTiming::with_tsc_hz(ConsoleGeneration::Switch1, hz));
             tsc = (tsc.0 + (b > 0) as u64, tsc.1 + b, tsc.2.max(w));
             let (b, w) = run(CoreTiming::with_tsc_hz(ConsoleGeneration::Switch1, None));
             instant = (instant.0 + (b > 0) as u64, instant.1 + b, instant.2.max(w));
         }
+        spin.store(true, Ordering::Relaxed);
+        load.into_iter().for_each(|t| t.join().unwrap());
+        let lfence = {
+            use std::arch::x86_64::__cpuid;
+            let max = __cpuid(0x8000_0000).eax;
+            (max >= 0x8000_0021).then(|| __cpuid(0x8000_0021).eax >> 2 & 1)
+        };
         panic!(
-            "PROBE2 hz={hz:?} trusted={:?} tsc(runs,backs,worst_ns)={tsc:?} instant={instant:?}",
+            "PROBE3 hz={hz:?} trusted={:?} lfence_always_serializing={lfence:?} tsc(runs,backs,worst_ns)={tsc:?} instant={instant:?}",
             trusted_tsc_hz()
         );
     }
