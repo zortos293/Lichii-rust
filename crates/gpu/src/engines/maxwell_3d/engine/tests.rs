@@ -5,8 +5,8 @@ use lichii_memory::DeviceAddressSpace;
 
 use super::*;
 use crate::backend::{
-    ChannelId, ComputeContext, ConstBufferBinding, FramebufferConfig, Query, QueryKind, Rasterizer,
-    ReleaseSize, RootTables,
+    ChannelId, ComputeContext, ConstBufferBinding, DrawTexture, FramebufferConfig, Query,
+    QueryKind, Rasterizer, ReleaseSize, RootTables,
 };
 use crate::engines::maxwell_3d::DirtyState;
 use crate::engines::maxwell_3d::regs::{
@@ -41,6 +41,7 @@ enum Event {
         surface: u32,
     },
     Indirect(IndirectDraw),
+    DrawTexture(DrawTexture),
     Query(Query),
     Fence(FenceAction),
     InlineWrite(GpuVAddr, u64),
@@ -108,6 +109,9 @@ impl Rasterizer for Renderer {
             layers: layer_count,
             surface: ctx.regs.clear_surface.0,
         });
+    }
+    fn draw_texture(&mut self, _ctx: &mut GraphicsContext<'_>, draw: &DrawTexture) {
+        self.events.push(Event::DrawTexture(*draw));
     }
     fn dispatch_compute(&mut self, _ctx: &ComputeContext<'_>) {}
     fn inline_written(&mut self, _: ChannelId, _: &Gmmu, address: GpuVAddr, size: u64) {
@@ -458,6 +462,59 @@ fn clear_runs_after_the_pending_draw_unless_rendering_is_disabled() {
     );
     b.call(CLEAR_SURFACE, surface);
     assert!(b.take().is_empty());
+}
+
+#[test]
+fn draw_texture_decodes_fixed_point_after_the_pending_draw() {
+    let mut b = Bench::new();
+    b.call(draw::VERTEX_BUFFER_COUNT, 3);
+    b.begin(PrimitiveTopology::TRIANGLES, false);
+    b.end();
+    let base = reg_index!(Regs, draw_texture);
+    let words = [
+        16 << 12,
+        8 << 12,
+        64 << 12,
+        32 << 12,
+        1 << 31,
+        0,
+        0,
+        2,
+        5,
+        3,
+        1 << 12,
+        2 << 12,
+    ];
+    for (offset, word) in words.into_iter().enumerate() {
+        b.call(base + offset as u32, word);
+    }
+    let events = b.take();
+    assert!(matches!(events[0], Event::Draw { .. }));
+    assert_eq!(
+        events[1],
+        Event::DrawTexture(DrawTexture {
+            dst_x0: 16.0,
+            dst_y0: 8.0,
+            dst_x1: 80.0,
+            dst_y1: 40.0,
+            src_x0: 1.0,
+            src_y0: 2.0,
+            src_x1: 33.0,
+            src_y1: 66.0,
+            texture: 3,
+            sampler: 5,
+        })
+    );
+    b.call(base + 11, 2 << 12);
+    assert!(matches!(b.take()[..], [Event::DrawTexture(_)]));
+
+    b.call(reg_index!(Regs, surface_clip) + 1, 100 << 16);
+    b.call(reg_index!(Regs, window_origin), 1);
+    b.call(base + 11, 2 << 12);
+    let [Event::DrawTexture(flipped)] = b.take()[..] else {
+        panic!("one textured draw expected");
+    };
+    assert_eq!((flipped.dst_y0, flipped.dst_y1), (92.0, 124.0));
 }
 
 #[test]
