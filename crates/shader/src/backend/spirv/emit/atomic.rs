@@ -117,6 +117,28 @@ fn shared_cas(ctx: &mut EmitContext<'_>, inst: InstId, func: Word) -> EmitResult
         .function_call(u32_t, None, defined(func)?, [index, value])?)
 }
 
+/// Pointer to the u64 shared memory word at byte `offset`, when the host has shared int64
+/// atomics and the explicit workgroup layout declared the u64 view.
+fn shared_u64_pointer(ctx: &mut EmitContext<'_>, offset: Word) -> EmitResult<Option<Word>> {
+    if !(ctx.profile.support_shared_int64_atomics
+        && ctx.uses_explicit_workgroup_layout
+        && ctx.shared_memory_u64 != 0)
+    {
+        return Ok(None);
+    }
+    let u32_t = ctx.u32[1];
+    let three = ctx.const_u32(3);
+    let index = ctx.b.shift_right_arithmetic(u32_t, None, offset, three)?;
+    let zero = ctx.u32_zero_value;
+    let (pointer_type, array) = (ctx.shared_u64, ctx.shared_memory_u64);
+    Ok(Some(ctx.b.access_chain(
+        pointer_type,
+        None,
+        array,
+        [zero, index],
+    )?))
+}
+
 /// Swaps the two shared memory words at the offset non-atomically, returning the old pair.
 fn shared_exchange_words(ctx: &mut EmitContext<'_>, offset: Word, value: Word) -> EmitResult<Word> {
     let u32_t = ctx.u32[1];
@@ -296,18 +318,7 @@ pub(super) fn shared_atomic_exchange64(
     let offset = ctx.def_arg(inst, 0)?;
     let value = ctx.def_arg(inst, 1)?;
     let u64_t = ctx.u64;
-    if ctx.profile.support_shared_int64_atomics
-        && ctx.uses_explicit_workgroup_layout
-        && ctx.shared_memory_u64 != 0
-    {
-        let u32_t = ctx.u32[1];
-        let three = ctx.const_u32(3);
-        let index = ctx.b.shift_right_arithmetic(u32_t, None, offset, three)?;
-        let zero = ctx.u32_zero_value;
-        let (pointer_type, array) = (ctx.shared_u64, ctx.shared_memory_u64);
-        let pointer = ctx
-            .b
-            .access_chain(pointer_type, None, array, [zero, index])?;
+    if let Some(pointer) = shared_u64_pointer(ctx, offset)? {
         return AtomicOp::Exchange.atomic(ctx, u64_t, pointer, value);
     }
     tracing::warn!("shared int64 atomics not supported, falling back to non-atomic");
@@ -341,6 +352,42 @@ pub(super) fn shared_atomic_compare_exchange32(
     Ok(ctx.b.atomic_compare_exchange(
         u32_t, None, pointer, scope, semantics, semantics, value, comparator,
     )?)
+}
+
+/// `OpAtomicCompareExchange` on the u64 view of shared memory under the same conditions as
+/// `shared_atomic_exchange64`; otherwise a non-atomic compare and store of the two words.
+pub(super) fn shared_atomic_compare_exchange64(
+    ctx: &mut EmitContext<'_>,
+    inst: InstId,
+) -> EmitResult<Word> {
+    let offset = ctx.def_arg(inst, 0)?;
+    let comparator = ctx.def_arg(inst, 1)?;
+    let value = ctx.def_arg(inst, 2)?;
+    let (u1, u32_t, u32x2, u64_t) = (ctx.u1, ctx.u32[1], ctx.u32[2], ctx.u64);
+    if let Some(pointer) = shared_u64_pointer(ctx, offset)? {
+        let scope = ctx.const_u32(Scope::Device as u32);
+        let semantics = ctx.u32_zero_value;
+        return Ok(ctx.b.atomic_compare_exchange(
+            u64_t, None, pointer, scope, semantics, semantics, value, comparator,
+        )?);
+    }
+    tracing::warn!("shared int64 atomics not supported, falling back to non-atomic");
+    let low = shared_pointer(ctx, offset, 0)?;
+    let high = shared_pointer(ctx, offset, 1)?;
+    let old_low = ctx.b.load(u32_t, None, low, None, [])?;
+    let old_high = ctx.b.load(u32_t, None, high, None, [])?;
+    let old_words = ctx
+        .b
+        .composite_construct(u32x2, None, [old_low, old_high])?;
+    let old = ctx.b.bitcast(u64_t, None, old_words)?;
+    let equal = ctx.b.i_equal(u1, None, old, comparator)?;
+    let new = ctx.b.select(u64_t, None, equal, value, old)?;
+    let new_words = ctx.b.bitcast(u32x2, None, new)?;
+    let new_low = ctx.b.composite_extract(u32_t, None, new_words, [0])?;
+    let new_high = ctx.b.composite_extract(u32_t, None, new_words, [1])?;
+    ctx.b.store(low, new_low, None, [])?;
+    ctx.b.store(high, new_high, None, [])?;
+    Ok(old)
 }
 
 pub(super) fn global_atomic_i_add32(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
@@ -442,6 +489,13 @@ pub(super) fn global_atomic_xor64(_ctx: &mut EmitContext<'_>, _inst: InstId) -> 
 }
 
 pub(super) fn global_atomic_exchange64(
+    _ctx: &mut EmitContext<'_>,
+    _inst: InstId,
+) -> EmitResult<Word> {
+    Err(UNTRACKED_WIDE_GLOBAL_ATOMIC)
+}
+
+pub(super) fn global_atomic_compare_exchange64(
     _ctx: &mut EmitContext<'_>,
     _inst: InstId,
 ) -> EmitResult<Word> {
@@ -649,6 +703,39 @@ pub(super) fn storage_atomic_exchange64(
     inst: InstId,
 ) -> EmitResult<Word> {
     storage_atomic64(ctx, inst, AtomicOp::Exchange)
+}
+
+/// `OpAtomicCompareExchange` on the u64 view with `Int64Atomics`; without it a plain
+/// load, compare and store, as `storage_atomic64` falls back.
+pub(super) fn storage_atomic_compare_exchange64(
+    ctx: &mut EmitContext<'_>,
+    inst: InstId,
+) -> EmitResult<Word> {
+    let u64_t = ctx.u64;
+    if !ctx.profile.support_descriptor_aliasing {
+        tracing::warn!("descriptor aliasing not supported, 64-bit storage atomic ignored");
+        return Ok(ctx.const_null(u64_t));
+    }
+    let comparator = ctx.def_arg(inst, 2)?;
+    let value = ctx.def_arg(inst, 3)?;
+    if ctx.profile.support_int64_atomics {
+        let pointer = storage_pointer(ctx, inst, StorageElement::U64, 8, 0)?;
+        let scope = ctx.const_u32(Scope::Device as u32);
+        let semantics = ctx.u32_zero_value;
+        return Ok(ctx.b.atomic_compare_exchange(
+            u64_t, None, pointer, scope, semantics, semantics, value, comparator,
+        )?);
+    }
+    tracing::warn!("int64 atomics not supported, falling back to non-atomic");
+    let (u1, u32x2) = (ctx.u1, ctx.u32[2]);
+    let pointer = storage_pointer(ctx, inst, StorageElement::U32x2, 8, 0)?;
+    let words = ctx.b.load(u32x2, None, pointer, None, [])?;
+    let old = ctx.b.bitcast(u64_t, None, words)?;
+    let equal = ctx.b.i_equal(u1, None, old, comparator)?;
+    let new = ctx.b.select(u64_t, None, equal, value, old)?;
+    let new_words = ctx.b.bitcast(u32x2, None, new)?;
+    ctx.b.store(pointer, new_words, None, [])?;
+    Ok(old)
 }
 
 pub(super) fn storage_atomic_i_add32x2(

@@ -209,6 +209,10 @@ fn global_loads_stores_and_atomics_call_the_routing_functions() {
         (Opcode::LoadGlobalU8, &[address][..]),
         (Opcode::WriteGlobalS16, &[address, Value::U32(0)]),
         (Opcode::GlobalAtomicIAdd64, &[address, Value::U64(1)]),
+        (
+            Opcode::GlobalAtomicCompareExchange64,
+            &[address, Value::U64(1), Value::U64(2)],
+        ),
     ] {
         let error = emit_single(op, args);
         assert!(
@@ -354,6 +358,87 @@ fn storage_atomics_with_and_without_int64_atomics() {
         &RuntimeInfo::default(),
         &program,
     );
+}
+
+/// A 64-bit shared and a 64-bit storage compare-exchange, each at a dynamic and a constant
+/// offset.
+fn wide_compare_exchange_program() -> TranslatedProgram {
+    let mut s = Synthetic::new();
+    let (b, x) = compute_block(&mut s);
+    let wide = s.inst(b, Opcode::ConvertU64U32, &[x]);
+    for offset in [x, Value::U32(8)] {
+        s.inst(
+            b,
+            Opcode::SharedAtomicCompareExchange64,
+            &[offset, Value::U64(0), wide],
+        );
+        s.inst(
+            b,
+            Opcode::StorageAtomicCompareExchange64,
+            &[Value::U32(0), offset, Value::U64(0), wide],
+        );
+    }
+    let info = ShaderInfo {
+        uses_int64: true,
+        uses_int64_bit_atomics: true,
+        used_storage_buffer_types: Type::U64 | Type::U32X2,
+        storage_buffers_descriptors: vec![storage_descriptor(0x110)],
+        ..ShaderInfo::default()
+    };
+    let mut program = finish_compute(s, b, info);
+    program.shared_memory_size = 1024;
+    program
+}
+
+#[test]
+fn wide_compare_exchanges_with_and_without_int64_atomics() {
+    let program = wide_compare_exchange_program();
+    let native = Profile {
+        supported_spirv: 0x0001_0400,
+        support_int64: true,
+        support_int64_atomics: true,
+        support_shared_int64_atomics: true,
+        support_explicit_workgroup_layout: true,
+        ..Profile::default()
+    };
+    let module = emit(
+        "wide_cas_native",
+        &native,
+        &RuntimeInfo::default(),
+        &program,
+    );
+    assert_eq!(count_ops(&module, Op::AtomicCompareExchange), 2 + 2);
+    assert_eq!(count_ops(&module, Op::Select), 0);
+
+    let no_explicit_layout = Profile {
+        support_explicit_workgroup_layout: false,
+        ..native
+    };
+    let module = emit(
+        "wide_cas_no_explicit_layout",
+        &no_explicit_layout,
+        &RuntimeInfo::default(),
+        &program,
+    );
+    assert_eq!(
+        count_ops(&module, Op::AtomicCompareExchange),
+        2,
+        "only the storage compare-exchanges stay atomic"
+    );
+    assert_eq!(count_ops(&module, Op::Select), 2);
+
+    let plain64 = Profile {
+        support_int64: true,
+        ..Profile::default()
+    };
+    let module = emit(
+        "wide_cas_no_int64_atomics",
+        &plain64,
+        &RuntimeInfo::default(),
+        &program,
+    );
+    assert_eq!(count_ops(&module, Op::AtomicCompareExchange), 0);
+    assert_eq!(count_ops(&module, Op::Select), 2 + 2);
 }
 
 fn shared_memory_program() -> TranslatedProgram {

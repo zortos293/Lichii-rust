@@ -39,6 +39,7 @@ pub fn eval(prog: &Program, value: Value) -> u64 {
         INotEqual => u32::from(w(0) != w(1)),
         UGreaterThan => u32::from(w(0) > w(1)),
         SGreaterThanEqual => u32::from(w(0) as i32 >= w(1) as i32),
+        LogicalAnd => u32::from(a(0) != 0 && a(1) != 0),
         SelectU32 => {
             if a(0) != 0 {
                 w(1)

@@ -159,6 +159,32 @@ fn emulate(prog: &mut Program, id: InstId, op: Opcode) {
             let a = arg(0);
             with(prog, id, |e| int64_to_float(e, a, false, float_bits(op)))
         }
+        SharedAtomicCompareExchange64 => {
+            tracing::warn!(
+                "int64 not supported, {} falls back to non-atomic",
+                op.name()
+            );
+            let (offset, compare, value) = (arg(0), arg(1), arg(2));
+            with(prog, id, |e| {
+                let old = e.inst(LoadSharedU64, &[offset]);
+                let new = compare_exchange_value(e, old, compare, value);
+                e.inst(WriteSharedU64, &[offset, new]);
+                old
+            })
+        }
+        GlobalAtomicCompareExchange64 => {
+            tracing::warn!(
+                "int64 not supported, {} falls back to non-atomic",
+                op.name()
+            );
+            let (address, compare, value) = (arg(0), arg(1), arg(2));
+            with(prog, id, |e| {
+                let old = e.inst(LoadGlobal64, &[address]);
+                let new = compare_exchange_value(e, old, compare, value);
+                e.inst(WriteGlobal64, &[address, new]);
+                old
+            })
+        }
         _ => return,
     };
     prog.replace_uses_with(id, value);
@@ -184,6 +210,19 @@ fn unpack(e: &mut Emitter, packed: Value) -> (Value, Value) {
             e.composite_extract(packed, 1),
         ),
     }
+}
+
+/// `value` where the pair `old` equals `compare`, else `old`.
+fn compare_exchange_value(e: &mut Emitter, old: Value, compare: Value, value: Value) -> Value {
+    let (old_lo, old_hi) = unpack(e, old);
+    let (compare_lo, compare_hi) = unpack(e, compare);
+    let (lo, hi) = unpack(e, value);
+    let lo_equal = e.icompare(ICompare::Equal, old_lo, compare_lo);
+    let hi_equal = e.icompare(ICompare::Equal, old_hi, compare_hi);
+    let equal = e.logical_and(lo_equal, hi_equal);
+    let lo = e.select(equal, lo, old_lo);
+    let hi = e.select(equal, hi, old_hi);
+    e.composite_construct(&[lo, hi])
 }
 
 fn carry_bit(e: &mut Emitter, sum: Value) -> Value {
@@ -421,6 +460,78 @@ mod tests {
         assert_eq!(prog.type_of(Value::Inst(float)), Type::F32);
         assert_eq!(prog.op(unrelated), Opcode::IAdd32);
         assert_eq!(crate::opt::verify(&prog), Ok(()));
+    }
+
+    fn pair(prog: &mut Program, b: BlockId, v: u64) -> Value {
+        Value::Inst(prog.append(
+            b,
+            Opcode::CompositeConstructU32x2,
+            &[Value::U32(v as u32), Value::U32((v >> 32) as u32)],
+            0,
+        ))
+    }
+
+    #[test]
+    fn compare_exchange_fallback_stores_only_on_a_full_match() {
+        const VALUE: u64 = 0x0123_4567_89ab_cdef;
+        for &old in &VALUES {
+            for (&compare, &immediate) in VALUES.iter().zip([true, false].iter().cycle()) {
+                let (mut prog, blk) = program();
+                let old_pair = pair(&mut prog, blk, old);
+                let compare_value = if immediate {
+                    Value::U64(compare)
+                } else {
+                    pair(&mut prog, blk, compare)
+                };
+                let anchor = prog.append(blk, Opcode::Reference, &[old_pair], 0);
+                let new = compare_exchange_value(
+                    &mut Emitter::before(&mut prog, anchor),
+                    old_pair,
+                    compare_value,
+                    Value::U64(VALUE),
+                );
+                let expected = if old == compare { VALUE } else { old };
+                assert_eq!(eval(&prog, new), expected, "{old:#x} {compare:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn wide_compare_exchanges_become_loads_and_stores() {
+        let (mut prog, b) = program();
+        let value = operand(&mut prog, b, 0xdead_beef_cafe_f00d, false);
+        let address = operand(&mut prog, b, 0x1000, false);
+        let shared = prog.append(
+            b,
+            Opcode::SharedAtomicCompareExchange64,
+            &[Value::U32(8), Value::U64(1), value],
+            0,
+        );
+        let global = prog.append(
+            b,
+            Opcode::GlobalAtomicCompareExchange64,
+            &[address, Value::U64(1), value],
+            0,
+        );
+        prog.append(b, Opcode::Reference, &[Value::Inst(shared)], 0);
+        prog.append(b, Opcode::Reference, &[Value::Inst(global)], 0);
+        lower_int64_to_int32(&mut prog).unwrap();
+        assert_eq!(crate::opt::verify(&prog), Ok(()));
+        let ops: Vec<Opcode> = prog.insts_of(b).map(|id| prog.op(id)).collect();
+        for op in [
+            Opcode::LoadSharedU64,
+            Opcode::WriteSharedU64,
+            Opcode::LoadGlobal64,
+            Opcode::WriteGlobal64,
+        ] {
+            assert!(ops.contains(&op), "{op:?}: {ops:?}");
+        }
+        for op in [
+            Opcode::SharedAtomicCompareExchange64,
+            Opcode::GlobalAtomicCompareExchange64,
+        ] {
+            assert!(!ops.contains(&op), "{op:?}: {ops:?}");
+        }
     }
 
     #[test]

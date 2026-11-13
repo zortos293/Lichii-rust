@@ -783,13 +783,26 @@ fn red(t: &mut Translator<'_>) -> TResult {
 }
 
 /// `ATOMG.CAS Rd, [Ra + imm], Rb, Rc`: stores `Rc` where the word equals `Rb`; `Rd`
-/// receives the old word. Only 32-bit words have an IR operation.
+/// receives the old word. 64-bit words take the compare and the data as register pairs, the
+/// compare in `Rb` (32..40) and the data in `Rc` (64..72), as Mesa NAK's SM70 encoder places
+/// `OpAtom`'s `cmpr` and `data` for `AtomOp::CmpExch`.
 fn atomg_cas(t: &mut Translator<'_>) -> TResult {
-    if !matches!(AtomType::decode(t)?, AtomType::U32 | AtomType::S32) {
-        return Err(t.unsupported());
-    }
+    let wide = match AtomType::decode(t)? {
+        AtomType::U32 | AtomType::S32 => false,
+        AtomType::U64 | AtomType::S64 => true,
+        _ => return Err(t.unsupported()),
+    };
     let operands = global_operands(t, 64, 70)?;
     let address = global_address(t, operands, t.insn.sbits(40, 24))?;
+    if wide {
+        let compare = t.l(t.insn.src1())?;
+        let value = t.l(t.insn.src2())?;
+        let old = t.ir.inst(
+            Op::GlobalAtomicCompareExchange64,
+            &[address, compare, value],
+        );
+        return t.set_l(t.insn.dst(), old);
+    }
     let compare = t.x(t.insn.src1());
     let value = t.x(t.insn.src2());
     let old = t.ir.inst(
@@ -806,8 +819,9 @@ fn atoms(t: &mut Translator<'_>) -> TResult {
     let ty = AtomType::decode(t)?;
     let op = AtomOp::decode(t, 4)?;
     let signed = ty == AtomType::S32;
+    let wide = matches!(ty, AtomType::U64 | AtomType::S64);
     let opcode = match (ty, op) {
-        (AtomType::U64, Exch) => Op::SharedAtomicExchange64,
+        (AtomType::U64 | AtomType::S64, Exch) => Op::SharedAtomicExchange64,
         (AtomType::U32 | AtomType::S32, _) => match op {
             Add => Op::SharedAtomicIAdd32,
             Min if signed => Op::SharedAtomicSMin32,
@@ -826,7 +840,7 @@ fn atoms(t: &mut Translator<'_>) -> TResult {
     let ureg = address_ureg(t, 64);
     let address = byte_address(t, ureg, true);
     let (dest, data) = (t.insn.dst(), t.insn.src1());
-    if ty == AtomType::U64 {
+    if wide {
         let value = t.l(data)?;
         let old = t.ir.inst(opcode, &[address, value]);
         return t.set_l(dest, old);
@@ -837,12 +851,25 @@ fn atoms(t: &mut Translator<'_>) -> TResult {
     Ok(())
 }
 
-/// `ATOMS.CAS Rd, [Ra.Xn + imm], Rb, Rc` on 32-bit words.
+/// `ATOMS.CAS Rd, [Ra.Xn + imm], Rb, Rc`. 64-bit words take the compare and the data as
+/// register pairs, the compare in `Rb` (32..40) and the data in `Rc` (64..72), as Mesa
+/// NAK's SM70 encoder places `OpAtom`'s `cmpr` and `data` for a shared `AtomOp::CmpExch`.
 fn atoms_cas(t: &mut Translator<'_>) -> TResult {
-    if !matches!(AtomType::decode(t)?, AtomType::U32 | AtomType::S32) {
-        return Err(t.unsupported());
-    }
+    let wide = match AtomType::decode(t)? {
+        AtomType::U32 | AtomType::S32 => false,
+        AtomType::U64 | AtomType::S64 => true,
+        _ => return Err(t.unsupported()),
+    };
     let address = byte_address(t, Reg::URZ, true);
+    if wide {
+        let compare = t.l(t.insn.src1())?;
+        let value = t.l(t.insn.src2())?;
+        let old = t.ir.inst(
+            Op::SharedAtomicCompareExchange64,
+            &[address, compare, value],
+        );
+        return t.set_l(t.insn.dst(), old);
+    }
     let compare = t.x(t.insn.src1());
     let value = t.x(t.insn.src2());
     let old = t.ir.inst(
@@ -1481,6 +1508,52 @@ mod tests {
     }
 
     #[test]
+    fn atomg_cas_u64_takes_the_compare_and_data_pairs() {
+        let insn = encode(
+            Opcode::AtomgCas,
+            Form::Fixed,
+            f(16, 2) | f(24, 4) | f(32, 6) | f(64, 8) | f(72, 1) | f(73, 2),
+        );
+        assert_eq!(
+            translate(&[insn]).unwrap(),
+            "{0}:\n\
+             \x20 %0 = GetRegister R4\n\
+             \x20 %1 = GetRegister R5\n\
+             \x20 %2 = CompositeConstructU32x2 %0, %1\n\
+             \x20 %3 = PackUint2x32 %2\n\
+             \x20 %4 = GetRegister R6\n\
+             \x20 %5 = GetRegister R7\n\
+             \x20 %6 = CompositeConstructU32x2 %4, %5\n\
+             \x20 %7 = PackUint2x32 %6\n\
+             \x20 %8 = GetRegister R8\n\
+             \x20 %9 = GetRegister R9\n\
+             \x20 %10 = CompositeConstructU32x2 %8, %9\n\
+             \x20 %11 = PackUint2x32 %10\n\
+             \x20 %12 = GlobalAtomicCompareExchange64 %3, %7, %11\n\
+             \x20 %13 = UnpackUint2x32 %12\n\
+             \x20 %14 = CompositeExtractU32x2 %13, #0x0\n\
+             \x20 SetRegister R2, %14\n\
+             \x20 %15 = CompositeExtractU32x2 %13, #0x1\n\
+             \x20 SetRegister R3, %15\n"
+        );
+    }
+
+    #[test]
+    fn atom_cas_s64_is_the_same_compare_exchange() {
+        let insn = encode(
+            Opcode::AtomCas,
+            Form::Fixed,
+            f(16, 2) | f(24, 4) | f(32, 6) | f(40, 0x10) | f(64, 8) | f(72, 1) | f(73, 5),
+        );
+        let dump = translate(&[insn]).unwrap();
+        assert!(dump.contains("  %4 = IAdd64 %3, #0x10u64\n"), "{dump}");
+        assert!(
+            dump.contains("  %13 = GlobalAtomicCompareExchange64 %4, %8, %12\n"),
+            "{dump}"
+        );
+    }
+
+    #[test]
     fn red_or_s32() {
         let insn = encode(
             Opcode::Red,
@@ -1551,6 +1624,36 @@ mod tests {
     }
 
     #[test]
+    fn atoms_exch_s64() {
+        let insn = encode(
+            Opcode::Atoms,
+            Form::Fixed,
+            f(16, 2) | f(24, 255) | f(32, 4) | f(40, 8) | f(73, 5) | f(87, 8),
+        );
+        let dump = translate(&[insn]).unwrap();
+        assert!(
+            dump.contains("  %4 = SharedAtomicExchange64 #0x8, %3\n"),
+            "{dump}"
+        );
+    }
+
+    /// Mesa NAK's SM70 encoder asserts "64-bit Shared atomics only support CmpExch or Exch",
+    /// so ATOMS has no 64-bit arithmetic form to translate.
+    #[test]
+    fn atoms_arithmetic_64_is_rejected() {
+        for ty in [2, 5] {
+            for op in 0..8 {
+                let insn = encode(
+                    Opcode::Atoms,
+                    Form::Fixed,
+                    f(16, 2) | f(24, 255) | f(32, 4) | f(73, ty) | f(87, op),
+                );
+                assert!(translate(&[insn]).is_err(), "type {ty} op {op}");
+            }
+        }
+    }
+
+    #[test]
     fn atoms_inc_uniform_base() {
         let insn = encode(
             Opcode::Atoms,
@@ -1584,6 +1687,35 @@ mod tests {
              \x20 %2 = GetRegister R4\n\
              \x20 %3 = SharedAtomicCompareExchange32 %0, %1, %2\n\
              \x20 SetRegister R1, %3\n"
+        );
+    }
+
+    #[test]
+    fn atoms_cas_u64_takes_the_compare_and_data_pairs() {
+        let insn = encode(
+            Opcode::AtomsCas,
+            Form::Fixed,
+            f(16, 2) | f(24, 6) | f(32, 4) | f(64, 8) | f(73, 2) | f(78, 2),
+        );
+        assert_eq!(
+            translate(&[insn]).unwrap(),
+            "{0}:\n\
+             \x20 %0 = GetRegister R6\n\
+             \x20 %1 = ShiftLeftLogical32 %0, #0x3\n\
+             \x20 %2 = GetRegister R4\n\
+             \x20 %3 = GetRegister R5\n\
+             \x20 %4 = CompositeConstructU32x2 %2, %3\n\
+             \x20 %5 = PackUint2x32 %4\n\
+             \x20 %6 = GetRegister R8\n\
+             \x20 %7 = GetRegister R9\n\
+             \x20 %8 = CompositeConstructU32x2 %6, %7\n\
+             \x20 %9 = PackUint2x32 %8\n\
+             \x20 %10 = SharedAtomicCompareExchange64 %1, %5, %9\n\
+             \x20 %11 = UnpackUint2x32 %10\n\
+             \x20 %12 = CompositeExtractU32x2 %11, #0x0\n\
+             \x20 SetRegister R2, %12\n\
+             \x20 %13 = CompositeExtractU32x2 %11, #0x1\n\
+             \x20 SetRegister R3, %13\n"
         );
     }
 
@@ -1770,10 +1902,26 @@ mod tests {
             encode(Atomg, Fixed, f(73, 2) | f(87, 3)),
             encode(Atomg, Fixed, f(87, 9)),
             encode(Atomg, Fixed, f(73, 3) | f(87, 1)),
-            encode(AtomgCas, Fixed, f(73, 2)),
+            encode(Atomg, Fixed, f(73, 2) | f(87, 4)),
+            encode(Atomg, Fixed, f(73, 5) | f(87, 3)),
+            encode(Atomg, Fixed, f(73, 5) | f(87, 4)),
+            encode(AtomgCas, Fixed, f(73, 3)),
+            encode(AtomgCas, Fixed, f(73, 6)),
+            encode(AtomgCas, Fixed, f(32, 5) | f(73, 2)),
+            encode(AtomgCas, Fixed, f(64, 5) | f(73, 2)),
             encode(Atoms, Fixed, f(73, 2)),
+            encode(Atoms, Fixed, f(73, 2) | f(87, 3)),
+            encode(Atoms, Fixed, f(73, 2) | f(87, 4)),
+            encode(Atoms, Fixed, f(73, 5) | f(87, 3)),
+            encode(Atoms, Fixed, f(73, 5) | f(87, 4)),
             encode(Atoms, Fixed, f(73, 3)),
-            encode(AtomsCas, Fixed, f(73, 2)),
+            encode(Atoms, Fixed, f(73, 3) | f(87, 8)),
+            encode(Atoms, Fixed, f(73, 6)),
+            encode(Atoms, Fixed, f(32, 5) | f(73, 2)),
+            encode(AtomsCas, Fixed, f(73, 3)),
+            encode(AtomsCas, Fixed, f(73, 6)),
+            encode(AtomsCas, Fixed, f(32, 5) | f(73, 2)),
+            encode(AtomsCas, Fixed, f(64, 5) | f(73, 5)),
             encode(AtomsPopcInc, Fixed, f(16, 1)),
             encode(Ldsm, UniformAddress, f(72, 3)),
             encode(Ldsm, UniformAddress, f(74, 1)),
@@ -1816,6 +1964,144 @@ mod tests {
         let module =
             crate::module::compile(&env, options, &RuntimeInfo::default(), &mut bindings).unwrap();
         crate::backend::spirv::tests::validate(name, &profile, &module.spirv);
+    }
+
+    /// The LDC that loads the storage buffer pointer at c[0][0x210] into R2:R3.
+    fn ldc_storage_pointer() -> Instruction {
+        encode(
+            Opcode::Ldc,
+            Form::Bound,
+            f(16, 2) | f(24, 255) | f(38, 0x210) | f(73, 5),
+        )
+    }
+
+    /// Compiles a compute program with 0x100 bytes of shared memory whose global accesses
+    /// all go through the storage buffer at c[0][0x210], validates the module and returns its
+    /// atomic compare-exchange and exchange counts.
+    fn compile_atomics(
+        name: &str,
+        code: &[Instruction],
+        profile: &Profile,
+        host: &HostTranslateInfo,
+    ) -> [usize; 2] {
+        let mut env = TestEnv::new(code);
+        env.shared_memory = 0x100;
+        let options = TranslateOptions {
+            profile,
+            host,
+            resolution_scale: ResolutionScale::X1,
+        };
+        let program = crate::translate::translate(&env, options).unwrap();
+        let buffers: Vec<_> = program
+            .info
+            .storage_buffers_descriptors
+            .iter()
+            .map(|d| (d.cbuf_index, d.cbuf_offset, d.is_written))
+            .collect();
+        assert_eq!(buffers, [(0, 0x210, true)], "{name}");
+        let dump = program.ir.dump();
+        assert!(!dump.contains("Global"), "{name}: {dump}");
+        let mut bindings = Bindings::default();
+        let module =
+            crate::module::compile(&env, options, &RuntimeInfo::default(), &mut bindings).unwrap();
+        crate::backend::spirv::tests::validate(name, profile, &module.spirv);
+        let module = rspirv::dr::load_words(&module.spirv).unwrap();
+        [
+            rspirv::spirv::Op::AtomicCompareExchange,
+            rspirv::spirv::Op::AtomicExchange,
+        ]
+        .map(|op| {
+            module
+                .functions
+                .iter()
+                .flat_map(|f| &f.blocks)
+                .flat_map(|b| &b.instructions)
+                .filter(|i| i.class.opcode == op)
+                .count()
+        })
+    }
+
+    /// ATOMG.CAS.64 on the storage buffer, then ATOMS.CAS.64 of the old value into shared
+    /// memory.
+    fn global_and_shared_cas64() -> [Instruction; 4] {
+        [
+            ldc_storage_pointer(),
+            encode(
+                Opcode::AtomgCas,
+                Form::Fixed,
+                f(16, 8) | f(24, 2) | f(32, 4) | f(40, 0x10) | f(64, 6) | f(72, 1) | f(73, 2),
+            ),
+            encode(
+                Opcode::AtomsCas,
+                Form::Fixed,
+                f(16, 10) | f(24, 255) | f(32, 4) | f(40, 8) | f(64, 8) | f(73, 2),
+            ),
+            encode(Opcode::Exit, Form::Fixed, f(87, 7)),
+        ]
+    }
+
+    #[test]
+    fn atomg_cas_64_and_atoms_cas_64_compile_natively_and_as_fallbacks() {
+        let code = global_and_shared_cas64();
+        let int64 = HostTranslateInfo {
+            support_int64: true,
+            ..HostTranslateInfo::default()
+        };
+        let native = Profile {
+            supported_spirv: 0x0001_0400,
+            support_int64: true,
+            support_int64_atomics: true,
+            support_shared_int64_atomics: true,
+            support_explicit_workgroup_layout: true,
+            ..Profile::default()
+        };
+        assert_eq!(
+            compile_atomics("ampere-wide-cas-native", &code, &native, &int64),
+            [2, 0]
+        );
+        let plain64 = Profile {
+            support_int64: true,
+            ..Profile::default()
+        };
+        assert_eq!(
+            compile_atomics("ampere-wide-cas-plain", &code, &plain64, &int64),
+            [0, 0]
+        );
+        assert_eq!(
+            compile_atomics(
+                "ampere-wide-cas-no-int64",
+                &code,
+                &Profile::default(),
+                &HostTranslateInfo::default(),
+            ),
+            [0, 0]
+        );
+    }
+
+    #[test]
+    fn atomg_exch_64_alone_declares_the_u64_storage_view() {
+        let code = [
+            ldc_storage_pointer(),
+            encode(
+                Opcode::Atomg,
+                Form::Fixed,
+                f(16, 8) | f(24, 2) | f(32, 4) | f(40, 0x10) | f(72, 1) | f(73, 2) | f(87, 8),
+            ),
+            encode(Opcode::Exit, Form::Fixed, f(87, 7)),
+        ];
+        let profile = Profile {
+            support_int64: true,
+            support_int64_atomics: true,
+            ..Profile::default()
+        };
+        let host = HostTranslateInfo {
+            support_int64: true,
+            ..HostTranslateInfo::default()
+        };
+        assert_eq!(
+            compile_atomics("ampere-atomg-exch-64", &code, &profile, &host),
+            [0, 1]
+        );
     }
 
     #[test]
