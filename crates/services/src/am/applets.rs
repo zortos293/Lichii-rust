@@ -18,8 +18,8 @@ pub trait AppletFrontend: Send + Sync {
     fn configure_controllers(&self, request: &ControllerRequest) -> ControllerAnswer;
 
     /// Lets the user type text in the full-screen software keyboard. When the title checks the
-    /// text and rejects it, this is called again with
-    /// [`SoftwareKeyboardRequest::text_check_message`] set.
+    /// text and sends it back, this is called again with [`SoftwareKeyboardRequest::text_check`]
+    /// set and the text as [`SoftwareKeyboardRequest::initial_text`].
     fn software_keyboard(&self, request: &SoftwareKeyboardRequest) -> SoftwareKeyboardAnswer;
 }
 
@@ -79,7 +79,7 @@ pub enum ProfileSelectAnswer {
     Cancelled,
 }
 
-/// The controller setup a title sees: how many players and which npad comes first.
+/// The controller setup a title sees: how many npads are connected and which comes first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ControllerSetup {
     pub player_count: i8,
@@ -100,7 +100,7 @@ pub struct ControllerRequest {
     pub style_set: u32,
     /// Controllers already connected stay connected.
     pub keep_connected: bool,
-    /// The setup as the controls settings have it now.
+    /// The npads hid shows the title as connected now.
     pub current: ControllerSetup,
 }
 
@@ -126,8 +126,18 @@ pub struct SoftwareKeyboardRequest {
     pub min_length: u32,
     pub password: bool,
     pub cancel_disabled: bool,
-    /// Why the title rejected the previous text, when this is a retry.
-    pub text_check_message: Option<String>,
+    /// What the title said about the previous text, when this is a retry.
+    pub text_check: Option<TextCheckPrompt>,
+}
+
+/// What a title's text check said about the submitted text, with the title's message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TextCheckPrompt {
+    /// The text was rejected; whatever the user submits next is checked again.
+    Rejected(String),
+    /// The user must confirm the text: submitting it unchanged confirms it, and edited text is
+    /// checked again.
+    Confirm(String),
 }
 
 /// What the user did in the software keyboard.

@@ -61,6 +61,8 @@ pub struct ServiceContext {
     pub(crate) unknown: UnknownCommands,
     /// The nvdrv state, once nvdrv registered: gsv opens `nx2:nvsrv` sessions with it.
     pub(crate) nvdrv: OnceLock<Arc<crate::nvdrv::Nvdrv>>,
+    /// The hid state, once hid registered: am's controller applet reports its connected npads.
+    pub(crate) hid: OnceLock<Arc<crate::hid::Hid>>,
     /// The selected user's id, once acc registered: am's preselected-user launch parameter names
     /// it.
     pub(crate) user: OnceLock<[u8; 16]>,
@@ -87,6 +89,7 @@ impl ServiceContext {
             audio: parts.audio,
             unknown: UnknownCommands::default(),
             nvdrv: OnceLock::new(),
+            hid: OnceLock::new(),
             user: OnceLock::new(),
             vi: OnceLock::new(),
             installed_content: OnceLock::new(),

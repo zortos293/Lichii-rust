@@ -10,6 +10,8 @@ use lichii_input::{NpadButtons, NpadHub, NpadState, VibrationValue};
 use lichii_kernel::Event;
 use lichii_kernel::memory_objects::SharedMemory;
 
+use crate::applets::ControllerSetup;
+
 use super::shared_memory::{
     self as layout, CAPTURE_BUTTON, DEBUG_PAD, GcTriggerState, HOME_BUTTON, KEYBOARD, MOUSE,
     NO_CONTROLLER, NPAD_COUNT, NpadEntry, NpadGenericState, PadLifo, SLEEP_BUTTON, SixAxisLifo,
@@ -889,9 +891,31 @@ fn write_empty_entries(memory: &SharedMemory, entry: NpadEntry) {
 }
 
 /// The hid state shared by every hid session, and the npad hub it samples.
-pub(super) struct Hid {
-    pub hub: Arc<NpadHub>,
-    pub state: parking_lot::Mutex<HidState>,
+pub(crate) struct Hid {
+    pub(super) hub: Arc<NpadHub>,
+    pub(super) state: parking_lot::Mutex<HidState>,
+}
+
+impl Hid {
+    /// The npads the title sees connected, as the controller applet reports them: how many of
+    /// players 1-8 and handheld are connected, and the first connected npad (player 1 when none
+    /// is).
+    pub(crate) fn controller_setup(&self) -> ControllerSetup {
+        let state = self.state.lock();
+        let connected = |index: &usize| state.npads[*index].style.is_some();
+        let npad_id = |index: usize| match index {
+            OTHER => 0x10,
+            HANDHELD => 0x20,
+            player => player as u32,
+        };
+        ControllerSetup {
+            player_count: (0..NPAD_COUNT)
+                .filter(|&index| index != OTHER)
+                .filter(connected)
+                .count() as i8,
+            npad_id: (0..NPAD_COUNT).find(connected).map_or(0, npad_id),
+        }
+    }
 }
 
 /// Runs the updater on its own host thread until the last `Hid` reference is gone.

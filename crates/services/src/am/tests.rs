@@ -468,7 +468,11 @@ fn inline_software_keyboard_completes_with_decided_cancel() {
     );
 }
 
-struct Typist;
+/// Types "Lichi", fixes it to "Lichii" when rejected, and on a confirmation submits the text
+/// unchanged, or "Lichii!" when it edits.
+struct Typist {
+    edits_on_confirm: bool,
+}
 
 impl applets::AppletFrontend for Typist {
     fn show_error(&self, _request: &applets::ErrorRequest) {}
@@ -485,18 +489,24 @@ impl applets::AppletFrontend for Typist {
         &self,
         request: &applets::SoftwareKeyboardRequest,
     ) -> applets::SoftwareKeyboardAnswer {
-        let text = match &request.text_check_message {
+        let text = match &request.text_check {
             None => "Lichi",
-            Some(_) => "Lichii",
+            Some(applets::TextCheckPrompt::Rejected(message)) => {
+                assert_eq!(message, "no");
+                "Lichii"
+            }
+            Some(applets::TextCheckPrompt::Confirm(_)) if self.edits_on_confirm => "Lichii!",
+            Some(applets::TextCheckPrompt::Confirm(_)) => &request.initial_text,
         };
         applets::SoftwareKeyboardAnswer::Submitted(text.into())
     }
 }
 
-#[test]
-fn a_frontend_keyboard_goes_through_the_titles_text_check() {
+/// Runs the keyboard with `Typist` and a text check, answers each text the keyboard sends for
+/// checking with the given `SwkbdTextCheckResult`, and returns the text the applet exits with.
+fn type_with_text_check(edits_on_confirm: bool, checks: &[(u32, &str)]) -> String {
     let (context, client, _) = booted(SWITCH1_TITLE);
-    context.set_applet_frontend(Arc::new(Typist));
+    context.set_applet_frontend(Arc::new(Typist { edits_on_confirm }));
     let am = Domain::open(&client);
     let applet = am.run(
         library_applet::SOFTWARE_KEYBOARD,
@@ -506,7 +516,7 @@ fn a_frontend_keyboard_goes_through_the_titles_text_check() {
     );
     let utf16 =
         |text: &str| -> Vec<u8> { text.encode_utf16().flat_map(u16::to_le_bytes).collect() };
-    let check = |result: u32, expected: &str| {
+    for &(result, expected) in checks {
         assert!(!am.completed(applet));
         let request = am.read(am.object(applet, Request::new(104)));
         let size = (expected.len() as u64 + 1) * 2;
@@ -517,14 +527,37 @@ fn a_frontend_keyboard_goes_through_the_titles_text_check() {
         reply[4..8].copy_from_slice(&utf16("no"));
         let push = Request::new(103).input_object(am.storage(&reply));
         assert_eq!(am.call(applet, push).result, ResultCode::SUCCESS);
-    };
-    check(1, "Lichi");
-    check(0, "Lichii");
+    }
     assert!(am.completed(applet));
+    assert_eq!(
+        am.call(applet, Request::new(104)).result,
+        NO_DATA_IN_CHANNEL
+    );
     let out = am.pop_out_data(applet);
     assert_eq!(&out[..4], &0u32.to_le_bytes(), "SwkbdResult::Ok");
-    assert_eq!(&out[4..16], utf16("Lichii"));
-    assert_eq!(out[16], 0);
+    let units: Vec<u16> = out[4..]
+        .chunks(2)
+        .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+        .take_while(|&unit| unit != 0)
+        .collect();
+    String::from_utf16(&units).unwrap()
+}
+
+#[test]
+fn a_frontend_keyboard_goes_through_the_titles_text_check() {
+    assert_eq!(
+        type_with_text_check(false, &[(1, "Lichi"), (0, "Lichii")]),
+        "Lichii"
+    );
+}
+
+#[test]
+fn confirmed_text_exits_but_edited_text_is_checked_again() {
+    assert_eq!(type_with_text_check(false, &[(2, "Lichi")]), "Lichi");
+    assert_eq!(
+        type_with_text_check(true, &[(2, "Lichi"), (0, "Lichii!")]),
+        "Lichii!"
+    );
 }
 
 #[test]
@@ -542,10 +575,9 @@ fn error_applet_completes_with_zeroed_out_data() {
     );
 }
 
-#[test]
-fn controller_applet_confirms_player_one() {
-    let (_context, client, _) = booted(SWITCH1_TITLE);
-    let am = Domain::open(&client);
+/// Runs the controller applet for a Switch 1 11.0.0 title and returns its
+/// `ControllerSupportResultInfo`.
+fn configure_controllers(am: &Domain) -> Vec<u8> {
     let mut private = vec![0; 0x14];
     private[0..4].copy_from_slice(&0x14u32.to_le_bytes());
     private[4..8].copy_from_slice(&0x430u32.to_le_bytes());
@@ -556,12 +588,59 @@ fn controller_applet_confirms_player_one() {
     assert!(am.completed(applet));
     let out = am.pop_out_data(applet);
     assert_eq!(out.len(), 0xc);
-    assert_eq!(out[0], 1, "player count");
-    assert_eq!(&out[4..8], &0u32.to_le_bytes(), "player 1");
     assert_eq!(
         &out[8..12],
         &0u32.to_le_bytes(),
         "ControllerSupportResult::Success"
+    );
+    out
+}
+
+#[test]
+fn controller_applet_reports_the_npads_hid_connected() {
+    let (context, client, _) = booted(SWITCH1_TITLE);
+    crate::hid::register(&context).unwrap();
+    let am = Domain::open(&client);
+    let out = configure_controllers(&am);
+    assert_eq!(
+        out[0], 0,
+        "no npad is connected before the title starts hid"
+    );
+    assert_eq!(&out[4..8], &0u32.to_le_bytes(), "player 1");
+
+    const ARUID: u64 = 0x51;
+    const FULL_KEY: u32 = 1;
+    let hid = client.connect("hid").unwrap();
+    for request in [
+        Request::new(0).send_pid().arg(ARUID),
+        Request::new(103).send_pid().arg(ARUID),
+        Request::new(100).send_pid().arg(FULL_KEY).arg(ARUID),
+    ] {
+        assert_eq!(
+            client.send(hid, &request).unwrap().result,
+            ResultCode::SUCCESS
+        );
+    }
+    let handheld = lichii_input::NpadState {
+        connected: true,
+        controller: lichii_common::settings::ControllerType::Handheld,
+        ..context.npad.read(0)
+    };
+    context.npad.publish(0, &handheld);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while context.hid.get().unwrap().controller_setup().player_count == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "player 1 never connected"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let out = configure_controllers(&am);
+    assert_eq!(out[0], 1, "player count");
+    assert_eq!(
+        &out[4..8],
+        &0u32.to_le_bytes(),
+        "a handheld the title does not accept is player 1"
     );
 }
 

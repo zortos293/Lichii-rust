@@ -19,8 +19,9 @@ use lichii_memory::MemoryPermission;
 use parking_lot::Mutex;
 
 use crate::{Service, ServiceContext};
+pub(crate) use npad::Hid;
 use npad::{
-    DEFAULT_FUSION_PARAMETERS, DEFAULT_VIBRATION, HANDHELD, Halves, Hid, HidState, OTHER,
+    DEFAULT_FUSION_PARAMETERS, DEFAULT_VIBRATION, HANDHELD, Halves, HidState, OTHER,
     STANDARD_DRIFT_MODE, npad_index,
 };
 use shared_memory::NPAD_COUNT;
@@ -47,6 +48,7 @@ pub(crate) fn register(context: &Arc<ServiceContext>) -> HleResult<()> {
         hub: context.npad.clone(),
         state: Mutex::new(HidState::default()),
     });
+    let _ = context.hid.set(hid.clone());
     context.register("hid", "hid", move |context| HidServer {
         context: context.clone(),
         hid: hid.clone(),

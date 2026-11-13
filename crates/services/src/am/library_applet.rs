@@ -8,7 +8,6 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use lichii_common::ResultCode;
-use lichii_common::settings::{ControllerType, Settings};
 use lichii_kernel::Event;
 use lichii_kernel::ipc::HleRequestContext;
 use parking_lot::Mutex;
@@ -16,6 +15,7 @@ use parking_lot::Mutex;
 use super::applets::{
     AppletFrontend, ControllerAnswer, ControllerRequest, ControllerSetup, ErrorCode, ErrorRequest,
     ProfileSelectAnswer, ProfileSelectRequest, SoftwareKeyboardAnswer, SoftwareKeyboardRequest,
+    TextCheckPrompt,
 };
 use super::functions::push_storage;
 use super::storage::{Storage, StorageData};
@@ -43,8 +43,6 @@ const ACCOUNT_CANCELLED_BY_USER: ResultCode = ResultCode::new(124, 1);
 /// `ControllerSupportResult`.
 const CONTROLLER_SUCCESS: u32 = 0;
 const CONTROLLER_CANCEL: u32 = 2;
-/// `NpadIdType::Handheld`.
-const HANDHELD_NPAD: u32 = 0x20;
 
 /// `SwkbdResult`.
 const KEYBOARD_OK: u32 = 0;
@@ -169,7 +167,11 @@ impl LibraryApplet {
                 Step::exit(profile_answer(frontend.select_profile(&request)))
             }
             CONTROLLER => {
-                let request = controller_request(argument(1), argument(2), &context.settings);
+                let current = context
+                    .hid
+                    .get()
+                    .map_or_else(ControllerSetup::default, |hid| hid.controller_setup());
+                let request = controller_request(argument(1), argument(2), current);
                 Step::exit(controller_answer(
                     frontend.configure_controllers(&request),
                     request.current,
@@ -391,7 +393,11 @@ fn profile_answer(answer: ProfileSelectAnswer) -> Vec<u8> {
 }
 
 /// `ControllerSupportArgPrivate` and the header of the mode's argument.
-fn controller_request(private: &[u8], argument: &[u8], settings: &Settings) -> ControllerRequest {
+fn controller_request(
+    private: &[u8],
+    argument: &[u8],
+    mut current: ControllerSetup,
+) -> ControllerRequest {
     let mode = match private.get(0xa).copied().unwrap_or_default() {
         mode @ 0..=3 => mode,
         _ => match u32_at(private, 4) {
@@ -405,7 +411,6 @@ fn controller_request(private: &[u8], argument: &[u8], settings: &Settings) -> C
         _ => 0,
     };
     let single_mode = header(5) != 0;
-    let mut current = controller_setup(settings);
     if single_mode {
         current.player_count = 1;
     }
@@ -417,41 +422,6 @@ fn controller_request(private: &[u8], argument: &[u8], settings: &Settings) -> C
         style_set: u32_at(private, 0xc),
         keep_connected: header(2) != 0,
         current,
-    }
-}
-
-/// Connected players among players 1-8, and the first of them; player 1 in handheld mode is the
-/// handheld npad.
-fn controller_setup(settings: &Settings) -> ControllerSetup {
-    let mut connected = settings
-        .controls
-        .players
-        .iter()
-        .take(8)
-        .enumerate()
-        .filter(|(_, player)| player.connected);
-    let npad_id = match connected.next() {
-        Some((0, player))
-            if matches!(
-                player.controller_type,
-                ControllerType::Handheld | ControllerType::Switch2Handheld
-            ) =>
-        {
-            HANDHELD_NPAD
-        }
-        Some((index, _)) => index as u32,
-        None => 0,
-    };
-    let player_count = settings
-        .controls
-        .players
-        .iter()
-        .take(8)
-        .filter(|player| player.connected)
-        .count() as i8;
-    ControllerSetup {
-        player_count,
-        npad_id,
     }
 }
 
@@ -532,7 +502,7 @@ fn keyboard_config(version: u32, config: &[u8], work: &[u8]) -> Option<KeyboardC
             min_length,
             password: u32_at(config, 0x3b4) != 0,
             cancel_disabled: layout.cancel_disabled.is_some_and(flag),
-            text_check_message: None,
+            text_check: None,
         },
         utf8: version == KEYBOARD_UTF8_VERSION || flag(layout.utf8),
         text_check: flag(layout.text_check),
@@ -540,7 +510,12 @@ fn keyboard_config(version: u32, config: &[u8], work: &[u8]) -> Option<KeyboardC
 }
 
 fn keyboard_step(frontend: &dyn AppletFrontend, config: KeyboardConfig) -> Step {
-    match frontend.software_keyboard(&config.request) {
+    let answer = frontend.software_keyboard(&config.request);
+    keyboard_answer(config, answer)
+}
+
+fn keyboard_answer(config: KeyboardConfig, answer: SoftwareKeyboardAnswer) -> Step {
+    match answer {
         SoftwareKeyboardAnswer::Cancelled => {
             Step::exit(keyboard_output(KEYBOARD_CANCEL, "", config.utf8))
         }
@@ -555,26 +530,37 @@ fn keyboard_step(frontend: &dyn AppletFrontend, config: KeyboardConfig) -> Step 
     }
 }
 
-/// Handles the title's `SwkbdTextCheck`: success exits with the text, a rejection reopens the
-/// keyboard with the title's message, and text submitted after a confirmation is accepted.
+/// Handles the title's `SwkbdTextCheck`: success exits with the text. Otherwise the keyboard
+/// reopens on the text with the title's message; text confirmed unchanged exits, and anything
+/// else submitted goes back to the title's check.
 fn text_checked(frontend: &dyn AppletFrontend, check: TextCheck, data: &[u8]) -> Step {
     let TextCheck { mut config, text } = check;
     let result = u32_at(data, 0);
     if result == TEXT_CHECK_SUCCESS {
         return Step::exit(keyboard_output(KEYBOARD_OK, &text, config.utf8));
     }
-    config.request.text_check_message = matches!(result, TEXT_CHECK_FAILURE | TEXT_CHECK_CONFIRM)
-        .then(|| {
-            if config.utf8 {
-                utf8_at(data, 4, KEYBOARD_STRING_SIZE).into()
-            } else {
-                utf16_at(data, 4, KEYBOARD_STRING_SIZE / 2)
-            }
-        });
-    if result == TEXT_CHECK_CONFIRM {
-        config.text_check = false;
+    let message = || {
+        if config.utf8 {
+            utf8_at(data, 4, KEYBOARD_STRING_SIZE).into()
+        } else {
+            utf16_at(data, 4, KEYBOARD_STRING_SIZE / 2)
+        }
+    };
+    let prompt = match result {
+        TEXT_CHECK_FAILURE => Some(TextCheckPrompt::Rejected(message())),
+        TEXT_CHECK_CONFIRM => Some(TextCheckPrompt::Confirm(message())),
+        _ => None,
+    };
+    config.request.text_check = prompt;
+    config.request.initial_text.clone_from(&text);
+    match frontend.software_keyboard(&config.request) {
+        SoftwareKeyboardAnswer::Submitted(submitted)
+            if result == TEXT_CHECK_CONFIRM && submitted == text =>
+        {
+            Step::exit(keyboard_output(KEYBOARD_OK, &text, config.utf8))
+        }
+        answer => keyboard_answer(config, answer),
     }
-    keyboard_step(frontend, config)
 }
 
 /// The full-screen keyboard's out-data: `SwkbdResult` and the text.
