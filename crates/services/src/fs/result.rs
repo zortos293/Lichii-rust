@@ -19,6 +19,7 @@ pub const OUT_OF_RANGE: ResultCode = fs(3005);
 pub const INVALID_ARGUMENT: ResultCode = fs(6001);
 pub const INVALID_PATH: ResultCode = fs(6002);
 pub const INVALID_CHARACTER: ResultCode = fs(6004);
+pub const DIRECTORY_NOT_RENAMABLE: ResultCode = fs(6032);
 pub const INVALID_OFFSET: ResultCode = fs(6061);
 pub const INVALID_SIZE: ResultCode = fs(6062);
 pub const NULLPTR_ARGUMENT: ResultCode = fs(6063);

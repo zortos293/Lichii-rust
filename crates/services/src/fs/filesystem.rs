@@ -202,8 +202,19 @@ impl IFileSystem {
         if dst_parent.open(dst_name).map_err(io)?.is_some() {
             return Err(PATH_ALREADY_EXISTS);
         }
+        let to_len = to.components().count();
+        if directory
+            && to_len > from.components().count()
+            && from.components().zip(to.components()).all(|(a, b)| a == b)
+        {
+            return Err(DIRECTORY_NOT_RENAMABLE);
+        }
         if from.parent_components().eq(to.parent_components()) {
             return src_parent.rename(src_name, dst_name).map_err(io);
+        }
+        if let Some(host) = &self.host {
+            let host_path = |p: &GuestPath| p.components().fold(host.clone(), |acc, c| acc.join(c));
+            return std::fs::rename(host_path(&from), host_path(&to)).map_err(io);
         }
         match source {
             Some(Entry::File(file)) => {

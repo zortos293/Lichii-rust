@@ -32,6 +32,7 @@ impl Nand {
         })
     }
 
+    /// The NAND root, writable.
     pub fn root(&self) -> &DirRef {
         &self.root
     }
@@ -46,6 +47,7 @@ impl Nand {
         create_dir_path(&self.root, "user/Contents/registered")
     }
 
+    /// The size of the system partition.
     pub fn system_total_space(&self) -> u64 {
         NAND_SYSTEM_SIZE
     }
@@ -59,6 +61,7 @@ impl Nand {
         NAND_SYSTEM_SIZE.saturating_sub(used)
     }
 
+    /// The size of the user partition.
     pub fn user_total_space(&self) -> u64 {
         NAND_USER_SIZE
     }
@@ -68,6 +71,7 @@ impl Nand {
         NAND_USER_SIZE - 0x10_0000
     }
 
+    /// The size of the whole NAND.
     pub fn full_total_space(&self) -> u64 {
         NAND_TOTAL_SIZE
     }
@@ -86,6 +90,7 @@ impl SdCard {
         })
     }
 
+    /// The SD card root, writable.
     pub fn root(&self) -> &DirRef {
         &self.root
     }
@@ -96,6 +101,7 @@ impl SdCard {
         total_for(dir_size(self.root.as_ref()).unwrap_or(0))
     }
 
+    /// [`SdCard::total_space`] minus what the card holds.
     pub fn free_space(&self) -> u64 {
         let used = dir_size(self.root.as_ref()).unwrap_or(0);
         total_for(used) - used
@@ -120,6 +126,7 @@ pub enum SaveDataSpaceId {
 }
 
 impl SaveDataSpaceId {
+    /// Decodes the guest's raw value; unknown values are kept as `Other`.
     pub fn from_raw(raw: u8) -> Self {
         match raw {
             0 => Self::System,
@@ -133,6 +140,7 @@ impl SaveDataSpaceId {
         }
     }
 
+    /// The guest's raw value.
     pub fn raw(self) -> u8 {
         match self {
             Self::System => 0,
@@ -170,6 +178,7 @@ pub enum SaveDataType {
 }
 
 impl SaveDataType {
+    /// Decodes the guest's raw value; unknown values are kept as `Other`.
     pub fn from_raw(raw: u8) -> Self {
         match raw {
             0 => Self::System,
@@ -183,6 +192,7 @@ impl SaveDataType {
         }
     }
 
+    /// The guest's raw value.
     pub fn raw(self) -> u8 {
         match self {
             Self::System => 0,
@@ -217,6 +227,8 @@ pub struct SaveDataFactory {
 }
 
 impl SaveDataFactory {
+    /// Saves live under `root` (the NAND root). `program_id` is the running program, which
+    /// account and device saves with program id 0 belong to.
     pub fn new(root: DirRef, program_id: u64) -> Self {
         Self {
             root,

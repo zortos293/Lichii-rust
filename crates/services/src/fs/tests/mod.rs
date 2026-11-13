@@ -432,6 +432,53 @@ fn sd_card_file_system() {
 }
 
 #[test]
+fn renames_keep_open_files_and_refuse_descendants() {
+    let guest = switch2_title();
+    let fsp = guest.service("fsp-srv");
+    let fs = guest.call(fsp, Request::new(18)).handle();
+    let sd = guest.root.join("sdmc");
+    let path1 =
+        |command: u32, path: &str| guest.call(fs, Request::new(command).x(guest.path(0, path)));
+    let path2 = |command: u32, from: &str, to: &str| {
+        guest.call(
+            fs,
+            Request::new(command)
+                .x(guest.path(0, from))
+                .x(guest.path(1, to)),
+        )
+    };
+    path1(2, "/a").ok();
+    path1(2, "/b").ok();
+    guest
+        .call(
+            fs,
+            Request::new(0)
+                .x(guest.path(0, "/a/save.bin"))
+                .arg(0i32)
+                .arg(4i64),
+        )
+        .ok();
+    let file = guest
+        .call(
+            fs,
+            Request::new(8).x(guest.path(0, "/a/save.bin")).arg(3u32),
+        )
+        .handle();
+    path2(5, "/a/save.bin", "/b/save.bin").ok();
+    let data = guest.put(0x2000, b"wxyz");
+    guest
+        .call(file, Request::new(1).arg(0u32).arg(0i64).arg(4i64).a(data))
+        .ok();
+    assert_eq!(std::fs::read(sd.join("b/save.bin")).unwrap(), b"wxyz");
+    assert!(!sd.join("a/save.bin").exists());
+
+    assert_eq!(path2(6, "/a", "/a/inner").result, DIRECTORY_NOT_RENAMABLE);
+    assert!(!sd.join("a/inner").exists());
+    path2(6, "/a", "/b/moved").ok();
+    assert!(sd.join("b/moved").is_dir() && !sd.join("a").exists());
+}
+
+#[test]
 fn save_data_file_systems() {
     let guest = switch2_title();
     let fsp = guest.service("fsp-srv");

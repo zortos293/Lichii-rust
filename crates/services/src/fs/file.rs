@@ -115,6 +115,18 @@ impl IFile {
     }
 }
 
+/// Closing a writable file flushes it, so a later `Commit` covers writes made through handles
+/// that are already gone.
+impl Drop for IFile {
+    fn drop(&mut self) {
+        if self.mode & OPEN_WRITE != 0
+            && let Err(error) = self.file.flush()
+        {
+            tracing::warn!("fsp-srv: flushing a closed file failed: {error}");
+        }
+    }
+}
+
 impl Service for IFile {
     fn name(&self) -> &str {
         "IFile"
