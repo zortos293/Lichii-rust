@@ -7,7 +7,7 @@ use lichii_cpu::ThreadContext;
 use lichii_memory::DeviceAddressSpace;
 use parking_lot::Mutex;
 
-use super::scheduling::{heap_base, spawn_and_join};
+use super::scheduling::{heap_base, spawn_and_join, spawn_and_join_entries};
 use super::{Script, TestKernel, word};
 use crate::arbiter::{HANDLE_WAIT_MASK, SignalType};
 use crate::event::Event;
@@ -567,4 +567,131 @@ fn signal_to_address_writes_are_tracked() {
         drop(cached);
     }
     assert_eq!(memory.read::<u32>(word).unwrap(), 9);
+}
+
+/// Splatoon 3's handoff on core 1: the owner (B, 0x31) of a mutex the main thread (0x2c, core 0)
+/// waits for unlocks it and then busy-waits for A (0x30, also core 1), which the main thread
+/// wakes with `SignalToAddress`. A outranks B, so it must take core 1 away from the spinning B.
+#[test]
+fn a_woken_thread_preempts_the_mutex_owner_it_outranks() {
+    const ROUNDS: u64 = 2000;
+    const MAIN_TAG: u32 = 0x7777;
+    let test = TestKernel::new(ConsoleGeneration::Switch1);
+    let heap = heap_base(&test);
+    let handles = heap + 0x1000;
+    let mutex = heap + 0x4000;
+    let go_a = heap + 0x4004;
+    let a_done = heap + 0x4008;
+    let b_locked = heap + 0x400c;
+    let ran = Arc::new(AtomicU64::new(0));
+    let ran_a = ran.clone();
+    let a = test.program(
+        Script::new()
+            .then(|ctx, _| ctx.x[20] = 0)
+            .svc(0x34, move |ctx, _| {
+                ctx.x[0] = go_a;
+                ctx.x[1] = 2;
+                ctx.x[2] = ctx.x[20];
+                ctx.x[3] = u64::MAX;
+            })
+            .then(move |ctx, env| {
+                ctx.x[20] += 1;
+                word(env, a_done).store(ctx.x[20] as u32, Ordering::SeqCst);
+                ran_a.store(ctx.x[20], Ordering::SeqCst);
+            })
+            .jump_if(1, |ctx, _| ctx.x[20] < ROUNDS)
+            .exit(),
+    );
+    let b = test.program(
+        Script::new()
+            .then(move |ctx, env| {
+                ctx.x[20] = 0;
+                ctx.x[22] = word(env, handles + 4).load(Ordering::SeqCst) as u64;
+            })
+            .spin_until(move |ctx, env| {
+                word(env, mutex)
+                    .compare_exchange(0, ctx.x[22] as u32, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            })
+            .then(move |ctx, env| word(env, b_locked).store(ctx.x[20] as u32 + 1, Ordering::SeqCst))
+            .spin_until(move |_, env| {
+                word(env, mutex).load(Ordering::SeqCst) & HANDLE_WAIT_MASK != 0
+            })
+            .svc(0x1b, move |ctx, _| ctx.x[0] = mutex)
+            .spin_until(move |ctx, env| {
+                word(env, a_done).load(Ordering::SeqCst) == ctx.x[20] as u32 + 1
+            })
+            .then(|ctx, _| ctx.x[20] += 1)
+            .jump_if(1, |ctx, _| ctx.x[20] < ROUNDS)
+            .exit(),
+    );
+    let main = test.program(
+        Script::new()
+            .then(|ctx, _| ctx.x[20] = 0)
+            .spin_until(move |ctx, env| {
+                word(env, b_locked).load(Ordering::SeqCst) == ctx.x[20] as u32 + 1
+            })
+            .jump_if(7, move |_, env| {
+                word(env, mutex)
+                    .compare_exchange(0, MAIN_TAG, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            })
+            .jump_if(7, move |_, env| {
+                word(env, mutex).load(Ordering::SeqCst) & !HANDLE_WAIT_MASK == MAIN_TAG
+            })
+            .jump_if(2, move |ctx, env| {
+                let w = word(env, mutex);
+                let current = w.load(Ordering::SeqCst);
+                let owner = current & !HANDLE_WAIT_MASK;
+                if owner == 0
+                    || w.compare_exchange(
+                        current,
+                        current | HANDLE_WAIT_MASK,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    )
+                    .is_err()
+                {
+                    return true;
+                }
+                ctx.x[23] = u64::from(owner);
+                false
+            })
+            .svc(0x1a, move |ctx, _| {
+                ctx.x[0] = ctx.x[23];
+                ctx.x[1] = mutex;
+                ctx.x[2] = u64::from(MAIN_TAG);
+            })
+            .jump_if(2, |_, _| true)
+            .then(move |_, env| {
+                assert_eq!(
+                    word(env, mutex).swap(0, Ordering::SeqCst),
+                    MAIN_TAG,
+                    "the main thread owns the mutex"
+                );
+            })
+            .svc(0x35, move |ctx, _| {
+                ctx.x[0] = go_a;
+                ctx.x[1] = 1;
+                ctx.x[2] = ctx.x[20];
+                ctx.x[3] = u32::MAX as u64;
+            })
+            .then(|ctx, _| {
+                assert_eq!(ctx.x[0], 0, "SignalToAddress failed");
+                ctx.x[20] += 1;
+            })
+            .jump_if(1, |ctx, _| ctx.x[20] < ROUNDS)
+            .exit(),
+    );
+    let root = test.program(
+        spawn_and_join_entries(
+            heap,
+            vec![a, b, main],
+            vec![(0x30, 1), (0x31, 1), (0x2c, 0)],
+        )
+        .exit(),
+    );
+    test.start(test.image(), root);
+    test.run_until_exit(Duration::from_secs(30));
+    assert_eq!(ran.load(Ordering::SeqCst), ROUNDS, "A ran every round");
 }

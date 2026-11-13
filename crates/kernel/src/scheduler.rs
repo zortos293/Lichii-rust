@@ -16,7 +16,7 @@ use std::time::Duration;
 use lichii_cpu::InterruptHandle;
 use parking_lot::{Condvar, Mutex};
 
-use crate::thread::{Resume, Sched, Thread, ThreadState, WakeResult};
+use crate::thread::{Resume, Sched, Thread, ThreadId, ThreadState, WakeResult};
 
 const LEVELS: usize = 64;
 const IDLE_PRIORITY: u32 = LEVELS as u32;
@@ -449,6 +449,50 @@ impl Scheduler {
             self.request_reschedule(core);
             self.unpark(core);
         }
+    }
+
+    /// Cores whose best queued thread outranks the thread they run, or that idle with a queued
+    /// thread. A core is in this state only for the moment a preemption takes, so the kernel
+    /// watchdog treats one that stays in it as stalled. Contended queues are skipped: a core
+    /// holding its queue is making progress.
+    pub(crate) fn outranked_cores(&self) -> u64 {
+        let mut cores = 0;
+        for (index, core) in self.cores.iter().enumerate() {
+            let Some(queue) = core.queue.try_lock() else {
+                continue;
+            };
+            if queue.top() < core.running_priority.load(Ordering::Acquire) {
+                cores |= 1 << index;
+            }
+        }
+        cores
+    }
+
+    /// Each core's running thread and priority and its queued threads, for the kernel watchdog's
+    /// log.
+    pub(crate) fn describe(&self, running: &[Vec<ThreadId>]) -> Vec<String> {
+        self.cores
+            .iter()
+            .enumerate()
+            .map(|(index, core)| {
+                let queue = core.queue.lock();
+                let queued: Vec<(usize, Vec<u64>)> = (0..LEVELS)
+                    .filter(|&priority| !queue.levels[priority].is_empty())
+                    .map(|priority| {
+                        let ids = queue.levels[priority].iter().map(|t| t.id()).collect();
+                        (priority, ids)
+                    })
+                    .collect();
+                format!(
+                    "core={index} running={:?} running_priority={} in_guest={} resched={} idle={} queued={queued:?}",
+                    running[index],
+                    core.running_priority.load(Ordering::Acquire),
+                    core.in_guest.load(Ordering::Acquire),
+                    core.resched.load(Ordering::Acquire),
+                    self.idle.load(Ordering::Acquire) & (1 << index) != 0,
+                )
+            })
+            .collect()
     }
 
     /// Drops every queued thread (on shutdown, to break thread/scheduler reference cycles).
