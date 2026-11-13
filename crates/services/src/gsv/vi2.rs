@@ -224,7 +224,13 @@ impl Vi2 {
         if let Some((id, value)) = presents.previous_fence.replace(fence) {
             let guest = self.context.gpu.host1x().syncpoints.guest();
             if let Err(err @ SyncpointWaitError::TimedOut { .. }) =
-                guest.wait(id, value, Some(FENCE_TIMEOUT))
+                crate::context::wait_guest_syncpoint(
+                    &self.context.kernel,
+                    guest,
+                    id,
+                    value,
+                    Some(FENCE_TIMEOUT),
+                )
                 && presents.timeouts < 16
             {
                 presents.timeouts += 1;

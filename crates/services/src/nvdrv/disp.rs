@@ -26,7 +26,13 @@ impl Nvdrv {
         const FENCE_TIMEOUT: Duration = Duration::from_secs(1);
         let guest = self.syncpoints.syncpoints().guest();
         for fence in fences.iter().filter(|fence| fence.id >= 0) {
-            if let Err(error) = guest.wait(fence.id as u32, fence.value, Some(FENCE_TIMEOUT)) {
+            if let Err(error) = crate::context::wait_guest_syncpoint(
+                &self.kernel,
+                guest,
+                fence.id as u32,
+                fence.value,
+                Some(FENCE_TIMEOUT),
+            ) {
                 tracing::warn!(%error, "presenting before an acquire fence");
             }
         }
