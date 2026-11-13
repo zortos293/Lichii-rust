@@ -271,4 +271,69 @@ mod tests {
         drop(session);
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn the_disk_shader_cache_opens_per_title_and_is_written_when_the_session_stops() {
+        use lichii_vulkan::{Device, Instance, SurfaceSupport};
+
+        let device = match Instance::new(false, SurfaceSupport::None)
+            .and_then(|instance| Device::new(Arc::new(instance), &Default::default(), None))
+        {
+            Ok(device) => device,
+            Err(error) => {
+                eprintln!("skipping: {error}");
+                return;
+            }
+        };
+        let dir = temp_dir("shader-cache");
+        let game = dir.join("Spin.nso");
+        std::fs::write(&game, nso(&[0x14000000u32.to_le_bytes(), [0; 4]].concat())).unwrap();
+        let user = lichii_common::paths::UserPaths {
+            config_dir: dir.join("config"),
+            data_dir: dir.clone(),
+            cache_dir: dir.join("cache"),
+        };
+        assert_eq!(crate::display::shader_cache_dir(&user, 0), None);
+        let cache = crate::display::shader_cache_dir(&user, 0x0100_0000_0000_1000).unwrap();
+        assert_eq!(cache, dir.join("shader").join("0100000000001000"));
+        let boot = |disk_shader_cache: bool| {
+            let mut settings = (*settings()).clone();
+            settings.graphics.disk_shader_cache = disk_shader_cache;
+            let renderer = crate::display::vulkan_renderer(
+                device.clone(),
+                Arc::default(),
+                Arc::default(),
+                ConsoleGeneration::Switch1,
+                &settings.graphics,
+                Some(cache.clone()),
+            );
+            let host = Host {
+                renderer,
+                ..Host::headless()
+            };
+            let session = Session::boot(&game, LoadOptions::default(), |_, _| {
+                (Arc::new(settings), host)
+            })
+            .unwrap();
+            drop(session);
+        };
+
+        boot(false);
+        assert!(!cache.exists(), "a disabled disk cache writes nothing");
+        boot(true);
+        let mut files: Vec<_> = std::fs::read_dir(&cache)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        files.sort();
+        assert_eq!(files, ["pipelines.bin", "shaders.bin"]);
+        let written = std::fs::read(cache.join("pipelines.bin")).unwrap();
+        boot(true);
+        assert_eq!(
+            std::fs::read(cache.join("pipelines.bin")).unwrap(),
+            written,
+            "a second boot with nothing new to cache keeps the file it found"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
