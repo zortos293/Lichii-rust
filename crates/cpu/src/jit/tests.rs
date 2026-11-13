@@ -884,7 +884,13 @@ fn host_mxcsr_does_not_leak_into_guest_fp() {
     ctx.v[5] = 0x4330_0000_0000_0000;
     ctx.v[7] = 1;
     ctx.v[9] = 0x0080_0000;
-    let code = [FADD_S0_S1_S2, FMUL_D3_D4_D5, FADD_S6_S7_S7, FADD_S8_S9_S7, BRK];
+    let code = [
+        FADD_S0_S1_S2,
+        FMUL_D3_D4_D5,
+        FADD_S6_S7_S7,
+        FADD_S8_S9_S7,
+        BRK,
+    ];
     let data = vec![0u8; DATA_SIZE as usize];
     let mut interpreter = Machine::new(Backend::Interpreter);
     let mut jit = Machine::new(Backend::Jit(Passes::ALL));
