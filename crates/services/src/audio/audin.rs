@@ -18,10 +18,15 @@ use crate::{Service, ServiceContext};
 
 pub(super) fn register(context: &Arc<ServiceContext>, audio: &Arc<Audio>) -> HleResult<()> {
     let audio = audio.clone();
-    context.register("audin:u", "audio", move |context| AudInU {
+    context.register("audin:u", "audio", move |context| manager(context, &audio))
+}
+
+/// `IAudioInManager`, also reached through `aud:u` command 0.
+pub(super) fn manager(context: &Arc<ServiceContext>, audio: &Arc<Audio>) -> impl Service + use<> {
+    AudInU {
         context: context.clone(),
         audio: audio.clone(),
-    })
+    }
 }
 
 struct AudInU {
