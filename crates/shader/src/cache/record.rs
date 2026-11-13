@@ -188,6 +188,25 @@ impl EnvRecord {
         code_holds && self.queries.iter().all(|query| query.holds(env))
     }
 
+    pub(super) fn explain(&self, env: &dyn ShaderEnvironment) -> Option<String> {
+        let Code { offset, len, hash } = self.code;
+        if len != 0 {
+            let address = env.start_address().wrapping_add_signed(offset);
+            if hash_code(env, address, len, &mut Vec::new()) != hash {
+                return Some(format!(
+                    "code offset {offset} len {len} start {:#x}",
+                    env.start_address()
+                ));
+            }
+        }
+        let failing = self.queries.iter().position(|q| !q.holds(env))?;
+        Some(format!(
+            "query {failing}/{} {:?}",
+            self.queries.len(),
+            self.queries[failing]
+        ))
+    }
+
     /// The program bytes translation read: the first one's offset from the program's first
     /// instruction (negative for its header) and the length up to the last one read.
     pub(super) fn code_range(&self) -> (i64, u64) {

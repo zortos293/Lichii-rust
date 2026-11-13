@@ -368,6 +368,33 @@ impl CacheEntry {
         }
     }
 
+    pub fn options_key(&self) -> u64 {
+        self.options_key
+    }
+
+    /// Diagnostic: why this entry does not match, or None when it does.
+    pub fn explain_mismatch(
+        &self,
+        a: Option<&dyn ShaderEnvironment>,
+        env: &dyn ShaderEnvironment,
+        options_key: u64,
+    ) -> Option<String> {
+        if options_key != self.options_key {
+            return Some("options key".into());
+        }
+        let envs: Vec<&dyn ShaderEnvironment> = match (self.records.as_slice(), a) {
+            ([_, _], Some(a)) => vec![a, env],
+            ([_], None) => vec![env],
+            _ => return Some("vertex A presence".into()),
+        };
+        for (side, (record, env)) in self.records.iter().zip(envs).enumerate() {
+            if let Some(reason) = record.explain(env) {
+                return Some(format!("side {side}: {reason}"));
+            }
+        }
+        None
+    }
+
     /// Appends this entry as one record. Its module must be in the file already, before it:
     /// [`encode_module`] writes it.
     pub fn encode(&self, out: &mut Vec<u8>) {

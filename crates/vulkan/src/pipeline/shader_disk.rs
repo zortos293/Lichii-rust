@@ -62,6 +62,13 @@ impl ShaderDisk {
                 HEADER_LEN
             }
         };
+        let mut keys: HashMap<u64, usize> = HashMap::new();
+        for entry in entries.values().flatten() {
+            *keys.entry(entry.options_key()).or_default() += 1;
+        }
+        let mut keys: Vec<_> = keys.into_iter().collect();
+        keys.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+        tracing::info!(target: "diag", distinct = keys.len(), "disk options keys {:x?}", &keys[..keys.len().min(40)]);
         let count: usize = entries.values().map(Vec::len).sum();
         if count > 0 {
             tracing::info!("shader cache: {count} translated programs");

@@ -372,6 +372,30 @@ impl ShaderCache {
                 entry.matches(a_env, env, key, code)
             });
             if found.is_none() {
+                static MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let candidates = disk.candidates(probe);
+                let n = MISSES.fetch_add(1, Ordering::Relaxed);
+                if n < 60 || n.is_multiple_of(200) {
+                    let reasons: Vec<String> = candidates
+                        .iter()
+                        .take(3)
+                        .map(|entry| {
+                            forget_reads();
+                            entry
+                                .explain_mismatch(a_env, env, key)
+                                .unwrap_or_else(|| "matches?".into())
+                        })
+                        .collect();
+                    tracing::info!(
+                        target: "diag",
+                        n,
+                        stage = ?env.stage(),
+                        start = format_args!("{:#x}", env.start_address()),
+                        candidates = candidates.len(),
+                        key = format_args!("{key:x}"),
+                        "disk miss {reasons:?}"
+                    );
+                }
                 forget_reads();
             }
             found.map(|entry| (entry.module().clone(), entry.bindings_after()))

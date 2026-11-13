@@ -3043,6 +3043,38 @@ fn the_disk_cache_serves_programs_and_pipelines_of_an_earlier_run() {
 }
 
 #[test]
+fn the_disk_cache_serves_programs_the_workers_translated_in_an_earlier_run() {
+    let dir = cache_dir("disk-async-shaders");
+    let Some((mut f, gmmu)) = disk_fixture(&dir, [0, 4]) else {
+        return;
+    };
+    f.rasterizer.draw.shaders.set_async(true);
+    let regs = draw_regs();
+    let mut rounds = 0;
+    while target(&mut f).iter().any(|&t| t != [255, 128, 0, 255]) {
+        rounds += 1;
+        assert!(rounds <= 4, "the vertex then the fragment program land");
+        draw(&mut f, &gmmu, &regs);
+        f.rasterizer.draw.shaders.finish_translations();
+    }
+    drop(f);
+
+    let (mut f, gmmu) = disk_fixture(&dir, [0, 4]).unwrap();
+    f.rasterizer.draw.shaders.set_async(true);
+    draw(&mut f, &gmmu, &regs);
+    let stats = f.rasterizer.draw.shaders.stats();
+    assert_eq!(
+        (stats.translated, stats.disk_hits),
+        (0, 2),
+        "a second run finds both programs on disk"
+    );
+    assert!(target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]));
+    f.assert_no_validation_errors();
+    drop(f);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn stale_or_damaged_shader_cache_files_are_replaced_or_cut() {
     let dir = cache_dir("stale-shaders");
     std::fs::create_dir_all(&dir).unwrap();
