@@ -411,3 +411,22 @@ fn cores_drop_the_cpu_state_of_an_exited_process() {
         "a core still holds the exited process's address space"
     );
 }
+
+#[test]
+fn exited_processes_give_back_their_fastmem_arenas() {
+    let test = TestKernel::with_fastmem(ConsoleGeneration::Switch1, true);
+    let main = test.program(Script::new().exit());
+    test.kernel.run().unwrap();
+    for round in 0..300 {
+        let process = test.start(test.image(), main);
+        assert!(
+            process.memory().fastmem().is_some(),
+            "process {round} got no fastmem arena"
+        );
+        drop(process);
+        test.exits
+            .recv_timeout(Duration::from_secs(10))
+            .expect("process exits");
+    }
+    test.kernel.shutdown();
+}
