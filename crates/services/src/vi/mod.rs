@@ -272,13 +272,16 @@ impl Vi {
                 continue;
             };
             if Some(index) == top {
-                self.flip(&item);
+                let queue = queue.clone();
+                self.flip(&item, move || queue.release(&item));
+            } else {
+                queue.release(&item);
             }
-            queue.release(&item);
         }
     }
 
-    fn flip(&self, item: &Item) {
+    /// Shows `item` once its fence is reached; `presented` gives its buffer back after that.
+    fn flip(&self, item: &Item, presented: impl FnOnce() + Send + 'static) {
         let buffer = &item.buffer;
         let format = match buffer.external_format {
             4 => PixelFormat::R5G6B5Unorm,
@@ -321,6 +324,7 @@ impl Vi {
             u64::from(buffer.offset),
             framebuffer,
             item.fence.active(),
+            presented,
         );
     }
 }
