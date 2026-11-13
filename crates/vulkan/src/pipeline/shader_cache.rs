@@ -2,14 +2,16 @@
 //!
 //! A module is keyed by the bytes of its program (the header and every instruction the
 //! translator read), the register and pipeline state it was translated for, and the descriptor
-//! bindings it starts at; the texture queries the translator made are replayed on every hit, so
-//! a texture changing type under an unchanged program translates it again. Never by the module
-//! hash, which costs a full translation to compute.
+//! bindings it starts at; the queries the translator made of other guest state are asked again
+//! on every hit, so a texture changing type under an unchanged program translates it again.
+//! Never by the module hash, which costs a full translation to compute.
 //!
 //! Hashing a program's bytes on every draw would cost more than the draw, so the hash is
-//! remembered per device address and recomputed only after a guest write touched it. A hit
-//! is a page table lookup, two map lookups and the replay; it allocates nothing and takes no
-//! lock. Failed translations are cached too: their draws are skipped without translating again.
+//! remembered per device address and recomputed only after a guest write touched it. A key's
+//! variants are grouped by the questions they asked (nearly always one group) and found by
+//! their answers in a map, so a hit asks each question once however many variants the key
+//! holds: a page table lookup, the questions and three map lookups. It allocates nothing and
+//! takes no lock. Failed translations are cached too: their draws are skipped without translating again.
 //! A failure no texture header can have caused ([`TranslateError::depends_on_textures`]) is
 //! remembered without the reads that led to it, so a constant buffer word that changes from
 //! draw to draw (a per-material bindless handle) does not translate the failing program again
@@ -84,9 +86,107 @@ const STATS_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_VARIANTS: usize = 32;
 
 struct Variant {
-    reads: [Vec<EnvRead>; 2],
     bindings: Bindings,
     module: Option<Arc<ShaderModule>>,
+    /// Insertion order within the key, for eviction.
+    age: u64,
+}
+
+/// Variants of one key whose translations asked the same questions, by their answers.
+struct Shape {
+    /// The VertexA program's questions and the program's, with the first variant's answers.
+    questions: [Vec<EnvRead>; 2],
+    by_answers: HashMap<Box<[u32]>, Variant, FxBuildHasher>,
+}
+
+#[derive(Default)]
+struct Variants {
+    shapes: Vec<Shape>,
+    len: usize,
+    next_age: u64,
+}
+
+impl Variants {
+    /// The variant whose recorded answers `answer` gives now, asking each question once.
+    /// `answer` takes 0 for a VertexA question and 1 for the program's. `answers` is scratch.
+    fn find(
+        &self,
+        answers: &mut Vec<u32>,
+        mut answer: impl FnMut(usize, &EnvRead) -> u32,
+    ) -> Option<&Variant> {
+        self.shapes.iter().find_map(|shape| {
+            answers.clear();
+            for (side, questions) in shape.questions.iter().enumerate() {
+                answers.extend(questions.iter().map(|read| answer(side, read)));
+            }
+            shape.by_answers.get(answers.as_slice())
+        })
+    }
+
+    /// Adds a variant translated after `reads`, dropping the oldest when the key is full.
+    fn insert(
+        &mut self,
+        reads: [Vec<EnvRead>; 2],
+        bindings: Bindings,
+        module: Option<Arc<ShaderModule>>,
+    ) {
+        let answers = reads
+            .iter()
+            .flatten()
+            .map(EnvRead::answer)
+            .collect::<Box<[u32]>>();
+        let variant = Variant {
+            bindings,
+            module,
+            age: self.next_age,
+        };
+        self.next_age += 1;
+        let same = |shape: &&mut Shape| {
+            shape
+                .questions
+                .iter()
+                .zip(&reads)
+                .all(|(questions, reads)| {
+                    questions.len() == reads.len()
+                        && questions.iter().zip(reads).all(|(q, r)| q.same_question(r))
+                })
+        };
+        let replaced = match self.shapes.iter_mut().find(same) {
+            Some(shape) => shape.by_answers.insert(answers, variant).is_some(),
+            None => {
+                let mut by_answers = HashMap::default();
+                by_answers.insert(answers, variant);
+                self.shapes.push(Shape {
+                    questions: reads,
+                    by_answers,
+                });
+                false
+            }
+        };
+        if replaced {
+            return;
+        }
+        self.len += 1;
+        if self.len > MAX_VARIANTS {
+            self.evict_oldest();
+        }
+    }
+
+    fn evict_oldest(&mut self) {
+        let oldest = self
+            .shapes
+            .iter()
+            .enumerate()
+            .flat_map(|(i, shape)| shape.by_answers.iter().map(move |(k, v)| (v.age, i, k)))
+            .min_by_key(|&(age, ..)| age)
+            .map(|(_, i, k)| (i, k.clone()));
+        let Some((i, answers)) = oldest else { return };
+        self.shapes[i].by_answers.remove(&answers);
+        if self.shapes[i].by_answers.is_empty() {
+            self.shapes.remove(i);
+        }
+        self.len -= 1;
+    }
 }
 
 /// The renderer's translated modules, owned by its GPU thread.
@@ -100,9 +200,10 @@ pub struct ShaderCache {
     /// its length.
     segments: BTreeMap<(DAddr, DAddr), u64>,
     longest: u64,
-    modules: HashMap<ModuleKey, Vec<Variant>, FxBuildHasher>,
+    modules: HashMap<ModuleKey, Variants, FxBuildHasher>,
     disk: Option<ShaderDisk>,
     bytes: Vec<u8>,
+    answers: Vec<u32>,
     stats: ShaderCacheStats,
     /// The counts the last INFO line showed, and when it was written.
     logged: (ShaderCacheStats, Option<Instant>),
@@ -120,6 +221,7 @@ impl ShaderCache {
             modules: HashMap::default(),
             disk: None,
             bytes: Vec::new(),
+            answers: Vec::new(),
             stats: ShaderCacheStats::default(),
             logged: (ShaderCacheStats::default(), None),
         }
@@ -218,9 +320,10 @@ impl ShaderCache {
                 state,
             };
             let found = self.modules.get(&key).and_then(|variants| {
-                variants
-                    .iter()
-                    .find(|v| a.is_none_or(|a| a.replay(&v.reads[0])) && env.replay(&v.reads[1]))
+                variants.find(&mut self.answers, |side, read| match (side, a) {
+                    (0, Some(a)) => a.answer(read),
+                    _ => env.answer(read),
+                })
             });
             if let Some(variant) = found {
                 self.stats.hits += 1;
@@ -301,15 +404,12 @@ impl ShaderCache {
         if wildcard {
             reads = Default::default();
         }
-        let variants = self.modules.entry(key).or_default();
-        if variants.len() == MAX_VARIANTS {
-            variants.remove(0);
-        }
-        variants.push(Variant {
-            reads,
-            bindings: *bindings,
-            module: module.clone(),
-        });
+        self.answers.clear();
+        self.answers.reserve(reads[0].len() + reads[1].len());
+        self.modules
+            .entry(key)
+            .or_default()
+            .insert(reads, *bindings, module.clone());
         self.log_stats(Instant::now());
         module
     }
@@ -411,6 +511,83 @@ mod tests {
         assert!(
             !cache.log_stats(start + Duration::from_secs(60)),
             "nothing changed since"
+        );
+    }
+
+    fn word(offset: u32, value: u32) -> EnvRead {
+        EnvRead::Cbuf {
+            index: 3,
+            offset,
+            value,
+        }
+    }
+
+    fn reads(values: [u32; 2]) -> [Vec<EnvRead>; 2] {
+        [Vec::new(), vec![word(0, values[0]), word(4, values[1])]]
+    }
+
+    fn insert(variants: &mut Variants, values: [u32; 2]) {
+        let bindings = Bindings {
+            uniform_buffer: values[0],
+            ..Bindings::default()
+        };
+        variants.insert(reads(values), bindings, None);
+    }
+
+    fn find(variants: &Variants, words: [u32; 2]) -> (Option<u32>, usize) {
+        let mut asked = 0;
+        let found = variants.find(&mut Vec::new(), |side, read| {
+            assert_eq!(side, 1);
+            asked += 1;
+            let EnvRead::Cbuf { offset, .. } = *read else {
+                unreachable!()
+            };
+            words[offset as usize / 4]
+        });
+        (found.map(|v| v.bindings.uniform_buffer), asked)
+    }
+
+    #[test]
+    fn a_hit_asks_each_question_once_however_many_variants_the_key_holds() {
+        let mut variants = Variants::default();
+        for value in 0..MAX_VARIANTS as u32 {
+            insert(&mut variants, [value, 7]);
+        }
+        assert_eq!(variants.shapes.len(), 1);
+        assert_eq!(find(&variants, [31, 7]), (Some(31), 2));
+        assert_eq!(find(&variants, [0, 7]), (Some(0), 2));
+        assert_eq!(find(&variants, [5, 8]), (None, 2));
+    }
+
+    #[test]
+    fn a_full_key_drops_its_oldest_variant() {
+        let mut variants = Variants::default();
+        for value in 0..MAX_VARIANTS as u32 {
+            insert(&mut variants, [value, 7]);
+        }
+        insert(&mut variants, [0, 7]);
+        assert_eq!(
+            variants.len, MAX_VARIANTS,
+            "the same answers replace a variant"
+        );
+        insert(&mut variants, [100, 7]);
+        assert_eq!(variants.len, MAX_VARIANTS);
+        assert_eq!(find(&variants, [1, 7]).0, None, "the oldest went");
+        assert_eq!(find(&variants, [0, 7]).0, Some(0), "replaced, so younger");
+        assert_eq!(find(&variants, [100, 7]).0, Some(100));
+    }
+
+    #[test]
+    fn variants_that_asked_other_questions_are_found_too() {
+        let mut variants = Variants::default();
+        insert(&mut variants, [1, 2]);
+        variants.insert(Default::default(), Bindings::default(), None);
+        assert_eq!(variants.shapes.len(), 2);
+        assert_eq!(find(&variants, [1, 2]), (Some(1), 2));
+        assert_eq!(
+            find(&variants, [9, 9]),
+            (Some(0), 2),
+            "a variant without questions matches anything"
         );
     }
 }
