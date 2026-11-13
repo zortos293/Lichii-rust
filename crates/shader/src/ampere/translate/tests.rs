@@ -152,3 +152,130 @@ fn compute_exit_translates_to_nothing() {
     let exit = encode(Opcode::Exit, Form::Fixed, 0);
     assert_eq!(translate(&[exit]).unwrap(), "{0}:\n");
 }
+
+/// Random Ampere programs with random program headers, through translation and `compile`,
+/// for every stage: each either fails with an error or yields a module that passes spirv-val.
+#[test]
+fn random_programs_compile_to_valid_spirv_for_every_stage() {
+    use crate::backend::Bindings;
+    use crate::backend::spirv::EmitError;
+    use crate::profile::HostTranslateInfo;
+    use crate::translate::TranslateOptions;
+    use crate::{Profile, RuntimeInfo, TranslateError};
+    use lichii_common::settings::ResolutionScale;
+
+    let mut state = 0x6a09_e667_f3bc_c908u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let encodings: Vec<u128> = (0..4096u128)
+        .filter(|&bits| {
+            decode(Instruction(bits)).is_some_and(|d| {
+                !matches!(
+                    d.opcode,
+                    Opcode::Bra
+                        | Opcode::Brx
+                        | Opcode::Brxu
+                        | Opcode::Jmp
+                        | Opcode::Jmx
+                        | Opcode::Jmxu
+                        | Opcode::CallAbs
+                        | Opcode::CallRel
+                        | Opcode::Ret
+                        | Opcode::Exit
+                        | Opcode::Kill
+                        | Opcode::Break
+                )
+            })
+        })
+        .collect();
+    let native_host = HostTranslateInfo {
+        support_float64: true,
+        support_float16: true,
+        support_int64: true,
+        ..HostTranslateInfo::default()
+    };
+    let minimal_host = HostTranslateInfo::default();
+    let native = Profile {
+        support_int8: true,
+        support_int16: true,
+        support_int64: true,
+        support_float16: true,
+        support_float64: true,
+        ..Profile::default()
+    };
+    let exit = encode(Opcode::Exit, Form::Fixed, 7 << 87);
+    let stages = [
+        ShaderStage::Compute,
+        ShaderStage::VertexB,
+        ShaderStage::TessellationControl,
+        ShaderStage::TessellationEval,
+        ShaderStage::Geometry,
+        ShaderStage::Fragment,
+    ];
+    for stage in stages {
+        let mut compiled = 0;
+        for i in 0..1200 {
+            let len = 1 + (next() % 4) as usize;
+            let mut code: Vec<Instruction> = (0..len)
+                .map(|_| {
+                    let bits = encodings[(next() % encodings.len() as u64) as usize];
+                    let mut fields = u128::from(next()) | (u128::from(next()) << 64);
+                    if next() % 4 != 0 {
+                        let plain_modifiers = (7 << 81) | (7 << 84) | (7 << 87);
+                        fields = (fields & ((1 << 72) - 1)) | plain_modifiers;
+                    }
+                    Instruction((fields & !0xffff) | (7 << 12) | bits)
+                })
+                .collect();
+            code.push(exit);
+            let mut env = TestEnv::new(&code);
+            env.stage = stage;
+            for word in &mut env.header {
+                *word = next() as u32;
+            }
+            let topology = [1, 6, 7][(next() % 3) as usize];
+            env.header[3] = (env.header[3] & !(0xf << 24)) | (topology << 24);
+            env.header[2] = (env.header[2] & 0x00ff_ffff) | ((1 + next() as u32 % 4) << 24);
+            env.header[4] = (env.header[4] & !0xfff) | (1 + next() as u32 % 16);
+            for byte in 0x18..0x38 {
+                let mode = (next() % 4) as u32 * 0x55;
+                let shift = byte % 4 * 8;
+                env.header[byte / 4] = (env.header[byte / 4] & !(0xff << shift)) | (mode << shift);
+            }
+            let (profile, host) = if i % 2 == 0 {
+                (&native, &native_host)
+            } else {
+                (&Profile::default(), &minimal_host)
+            };
+            let options = TranslateOptions {
+                profile,
+                host,
+                resolution_scale: ResolutionScale::X1,
+            };
+            let mut bindings = Bindings::default();
+            match crate::module::compile(&env, options, &RuntimeInfo::default(), &mut bindings) {
+                Ok(module) => {
+                    crate::backend::spirv::tests::validate(
+                        &format!("ampere-random-{stage:?}-{i}"),
+                        profile,
+                        &module.spirv,
+                    );
+                    compiled += 1;
+                }
+                Err(TranslateError::InvalidIr(e)) => panic!("{stage:?} {code:x?}: {e}"),
+                Err(TranslateError::Emit(EmitError::InvalidIr(e))) => {
+                    panic!("{stage:?} {code:x?}: {e}")
+                }
+                Err(_) => {}
+            }
+        }
+        assert!(
+            compiled > 100,
+            "{stage:?}: only {compiled} programs compiled"
+        );
+    }
+}
