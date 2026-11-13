@@ -272,9 +272,9 @@ impl Device {
             "/dev/nvhost-ctrl-gpu" => Self::CtrlGpu(ctrl_gpu::CtrlGpu::new(nvdrv.clone())),
             "/dev/nvhost-as-gpu" => Self::AsGpu(as_gpu::AsGpu::new(nvdrv.clone())),
             "/dev/nvhost-gpu" => Self::Channel(gpu_channel::GpuChannel::new(nvdrv.clone(), client)),
-            "/dev/nvhost-nvdec" | "/dev/nvhost-vic" | "/dev/nvhost-nvjpg" => {
-                Self::Host1x(host1x_client::Host1xClient::new(nvdrv.clone(), path))
-            }
+            "/dev/nvhost-nvdec" | "/dev/nvhost-vic" | "/dev/nvhost-nvjpg" => Self::Host1x(
+                host1x_client::Host1xClient::new(nvdrv.clone(), client, path),
+            ),
             "/dev/nvdisp_disp0" => Self::Disp,
             _ if path.starts_with("/dev/nvhost-") => Self::Stub(stub::Stub::new(path)),
             _ => return None,

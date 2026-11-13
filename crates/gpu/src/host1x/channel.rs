@@ -2,17 +2,21 @@
 //! buffers submitted to it in order on a thread of its own, as the channel DMA does: a syncpoint
 //! increment lands when the stream reaches it, and a host wait holds only its own channel.
 //!
-//! Nothing is decoded yet. An NVDEC job takes a frame's worth of time and leaves its output
-//! surface as it is, and a VIC job composes nothing, so a title's video waits complete and it moves
-//! on past them.
+//! An NVDEC job decodes its frame and a VIC job composes its output surface, both on the channel
+//! thread. Without FFmpeg an NVDEC job only takes [`DECODE_TIME`] and a VIC job writes nothing, so
+//! a title's video waits still complete and it moves on past them.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use super::{SyncpointWaitError, Syncpoints};
+use lichii_memory::AddressSpace;
+
+use super::nvdec::Nvdec;
+use super::vic::Vic;
+use super::{Host1x, SyncpointWaitError, Syncpoints};
 
 /// A video engine behind a host1x channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,19 +49,45 @@ impl VideoEngine {
 pub const DECODE_TIME: Duration = Duration::from_millis(8);
 /// How often a host wait checks whether its channel is closing.
 const WAIT_SLICE: Duration = Duration::from_millis(50);
+/// A host wait blocked this long is logged, so a hang names the syncpoint it stopped on.
+const STALL_WARNING: Duration = Duration::from_secs(2);
 
 /// The host1x class whose methods wait on syncpoints.
-const CLASS_CONTROL: u32 = 0x1;
+pub(super) const CLASS_CONTROL: u32 = 0x1;
 const CONTROL_WAIT_SYNCPT: u32 = 0x8;
 const CONTROL_LOAD_SYNCPT_PAYLOAD_32: u32 = 0x4e;
 const CONTROL_WAIT_SYNCPT_32: u32 = 0x50;
 /// Methods every engine class takes through its THI block.
-const THI_INCR_SYNCPT: u32 = 0x0;
-const THI_METHOD_0: u32 = 0x10;
-const THI_METHOD_1: u32 = 0x11;
-/// The engine method that runs a job: NVDEC's registers are 8 bytes wide and VIC's 4, so both sit
-/// at index 0xc0.
-const ENGINE_EXECUTE: u32 = 0xc0;
+pub(super) const THI_INCR_SYNCPT: u32 = 0x0;
+pub(super) const THI_METHOD_0: u32 = 0x10;
+pub(super) const THI_METHOD_1: u32 = 0x11;
+
+/// The engine behind a channel's THI block, which takes the engine method writes.
+enum Engine {
+    NvDec(Box<Nvdec>),
+    Vic(Box<Vic>),
+    NvJpg,
+}
+
+impl Engine {
+    fn new(engine: VideoEngine, host1x: &Host1x, process: Option<Arc<AddressSpace>>) -> Self {
+        let memory = host1x.memory.clone();
+        let frames = host1x.decoded_frames.clone();
+        match engine {
+            VideoEngine::NvDec => Self::NvDec(Box::new(Nvdec::new(memory, frames))),
+            VideoEngine::Vic => Self::Vic(Box::new(Vic::new(memory, process, frames))),
+            VideoEngine::NvJpg => Self::NvJpg,
+        }
+    }
+
+    fn write(&mut self, method: u32, argument: u32) {
+        match self {
+            Self::NvDec(nvdec) => nvdec.write(method, argument),
+            Self::Vic(vic) => vic.write(method, argument),
+            Self::NvJpg => {}
+        }
+    }
+}
 
 /// An open video engine channel. Closing or dropping it stops the channel once its current command
 /// returns.
@@ -68,10 +98,25 @@ pub struct EngineChannel {
 }
 
 impl EngineChannel {
-    pub fn open(engine: VideoEngine, syncpoints: Arc<Syncpoints>) -> Self {
+    /// Opens a channel of `engine` over `host1x`'s device memory. VIC output is reported to the
+    /// write tracking of `process`, the process attached to the device address space, so GPU
+    /// caches holding an output surface reload it.
+    pub fn open(engine: VideoEngine, host1x: &Host1x, process: Option<Arc<AddressSpace>>) -> Self {
         let (submits, received) = mpsc::channel::<Vec<u32>>();
         let closing = Arc::new(AtomicBool::new(false));
-        let mut stream = CommandStream::new(engine, syncpoints, closing.clone());
+        let mut stream = CommandStream {
+            kind: engine,
+            engine: Engine::new(engine, host1x, process),
+            syncpoints: host1x.syncpoints.clone(),
+            closing: closing.clone(),
+            class: engine.class(),
+            method: 0,
+            count: 0,
+            mask: 0,
+            incrementing: false,
+            payload: 0,
+            engine_method: 0,
+        };
         let thread = std::thread::Builder::new()
             .name(format!("host1x-{}", engine.name()))
             .spawn(move || {
@@ -113,7 +158,8 @@ impl Drop for EngineChannel {
 
 /// The channel's command processor. Its state carries over from one command buffer to the next.
 struct CommandStream {
-    engine: VideoEngine,
+    kind: VideoEngine,
+    engine: Engine,
     syncpoints: Arc<Syncpoints>,
     closing: Arc<AtomicBool>,
     class: u32,
@@ -126,21 +172,6 @@ struct CommandStream {
 }
 
 impl CommandStream {
-    fn new(engine: VideoEngine, syncpoints: Arc<Syncpoints>, closing: Arc<AtomicBool>) -> Self {
-        Self {
-            engine,
-            syncpoints,
-            closing,
-            class: engine.class(),
-            method: 0,
-            count: 0,
-            mask: 0,
-            incrementing: false,
-            payload: 0,
-            engine_method: 0,
-        }
-    }
-
     fn run(&mut self, words: &[u32]) {
         for &word in words {
             if self.closing.load(Ordering::Relaxed) {
@@ -179,7 +210,7 @@ impl CommandStream {
                 }
                 4 => self.execute(method, value & 0xfff),
                 mode => tracing::warn!(
-                    engine = self.engine.name(),
+                    engine = self.kind.name(),
                     mode,
                     "unsupported host1x command mode"
                 ),
@@ -203,49 +234,75 @@ impl CommandStream {
                 let _ = self.syncpoints.host().increment(id);
             }
             THI_METHOD_0 => self.engine_method = argument,
-            THI_METHOD_1 if self.engine_method == ENGINE_EXECUTE => self.run_job(),
+            THI_METHOD_1 => self.engine.write(self.engine_method, argument),
             _ => {}
-        }
-    }
-
-    fn run_job(&self) {
-        match self.engine {
-            VideoEngine::NvDec => std::thread::sleep(DECODE_TIME),
-            VideoEngine::Vic | VideoEngine::NvJpg => {}
         }
     }
 
     /// Holds the channel until syncpoint `id` reaches `threshold` or the channel closes.
     fn wait(&self, id: u32, threshold: u32) {
+        let started = Instant::now();
+        let mut stalled = false;
         loop {
             match self.syncpoints.host().wait(id, threshold, Some(WAIT_SLICE)) {
-                Err(SyncpointWaitError::TimedOut { .. })
-                    if !self.closing.load(Ordering::Relaxed) => {}
-                _ => return,
+                Err(SyncpointWaitError::TimedOut { value })
+                    if !self.closing.load(Ordering::Relaxed) =>
+                {
+                    if !stalled && started.elapsed() >= STALL_WARNING {
+                        stalled = true;
+                        tracing::warn!(
+                            engine = self.kind.name(),
+                            syncpoint = id,
+                            threshold,
+                            value,
+                            "host1x channel wait blocked for over 2 s"
+                        );
+                    }
+                }
+                _ => break,
             }
+        }
+        if stalled {
+            tracing::warn!(
+                engine = self.kind.name(),
+                syncpoint = id,
+                threshold,
+                waited_ms = started.elapsed().as_millis() as u64,
+                "host1x channel wait resumed"
+            );
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::time::Instant;
+
+    use lichii_memory::PhysicalMemory;
 
     use super::*;
 
-    fn set_class(class: u32, method: u32, mask: u32) -> u32 {
+    /// The engine method that runs a job: NVDEC's registers are 8 bytes wide and VIC's 4, so both
+    /// sit at index 0xc0.
+    pub(in crate::host1x) const ENGINE_EXECUTE: u32 = 0xc0;
+
+    pub(in crate::host1x) fn host1x() -> Host1x {
+        Host1x::new(Arc::new(PhysicalMemory::new(1 << 26).unwrap()), 34)
+    }
+
+    pub(in crate::host1x) fn set_class(class: u32, method: u32, mask: u32) -> u32 {
         (method << 16) | (class << 6) | mask
     }
 
-    fn incrementing(method: u32, count: u32) -> u32 {
+    pub(in crate::host1x) fn incrementing(method: u32, count: u32) -> u32 {
         (1 << 28) | (method << 16) | count
     }
 
-    fn immediate(method: u32, value: u32) -> u32 {
+    pub(in crate::host1x) fn immediate(method: u32, value: u32) -> u32 {
         (4 << 28) | (method << 16) | value
     }
 
-    fn wait_for(syncpoints: &Syncpoints, id: u32, value: u32) {
+    pub(in crate::host1x) fn wait_for(syncpoints: &Syncpoints, id: u32, value: u32) {
         syncpoints
             .host()
             .wait(id, value, Some(Duration::from_secs(5)))
@@ -254,8 +311,9 @@ mod tests {
 
     #[test]
     fn nvdec_jobs_increment_their_syncpoint_after_the_decode_time() {
-        let syncpoints = Arc::new(Syncpoints::new());
-        let channel = EngineChannel::open(VideoEngine::NvDec, syncpoints.clone());
+        let host1x = host1x();
+        let syncpoints = host1x.syncpoints.clone();
+        let channel = EngineChannel::open(VideoEngine::NvDec, &host1x, None);
         let started = Instant::now();
         channel.submit(vec![
             incrementing(THI_METHOD_0, 2),
@@ -273,8 +331,9 @@ mod tests {
 
     #[test]
     fn control_waits_hold_the_channel_until_the_syncpoint() {
-        let syncpoints = Arc::new(Syncpoints::new());
-        let channel = EngineChannel::open(VideoEngine::Vic, syncpoints.clone());
+        let host1x = host1x();
+        let syncpoints = host1x.syncpoints.clone();
+        let channel = EngineChannel::open(VideoEngine::Vic, &host1x, None);
         channel.submit(vec![
             set_class(CLASS_CONTROL, 0, 0),
             immediate(CONTROL_LOAD_SYNCPT_PAYLOAD_32, 2),
@@ -294,8 +353,9 @@ mod tests {
 
     #[test]
     fn closing_a_channel_abandons_its_wait() {
-        let syncpoints = Arc::new(Syncpoints::new());
-        let channel = EngineChannel::open(VideoEngine::NvJpg, syncpoints.clone());
+        let host1x = host1x();
+        let syncpoints = host1x.syncpoints.clone();
+        let channel = EngineChannel::open(VideoEngine::NvJpg, &host1x, None);
         channel.submit(vec![
             set_class(CLASS_CONTROL, 0, 0),
             immediate(CONTROL_LOAD_SYNCPT_PAYLOAD_32, 1),
