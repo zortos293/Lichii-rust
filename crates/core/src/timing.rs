@@ -209,8 +209,9 @@ impl CoreTiming {
     /// Restarts guest time from where [`CoreTiming::pause`] froze it.
     ///
     /// The TSC scale stays running while paused, because no core runs guest code then. Resuming
-    /// moves only its offset, with one store, so a core that still runs guest code reads either
-    /// the old or the new mapping, never a mix.
+    /// moves only its offset, with one store, so a core reads either the old or the new mapping,
+    /// never a mix of fields. A core that read the counter after `pause` but before it stopped saw
+    /// it run past the frozen value, so its counter steps back by at most that stop window.
     pub fn resume(&self) {
         self.update(|| {
             let frozen = self.frozen_at.load(Ordering::Relaxed);
