@@ -581,6 +581,10 @@ fn saturating_narrow() {
         },
     );
 }
+alu_class!(fp_estimate, "0xx011101x100001110110xxxxxxxxxx", |w| {
+    w & 0x4040_0000 != 0x0040_0000
+});
+alu_class!(fp_estimate_scalar, "01x111101x100001110110xxxxxxxxxx");
 alu_class!(ext, "0x101110000xxxxx0xxxx0xxxxxxxxxx", |w| w & 0x4000_4000
     != 0x4000);
 alu_class!(

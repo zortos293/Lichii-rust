@@ -1055,13 +1055,14 @@ pub(crate) fn convert<const I: u32, const O: u32>(
 }
 
 /// `RecipEstimate`: `a` in 256..512 is a fixed-point value in [0.5, 1).
-pub(crate) fn recip_estimate_u9(a: u64) -> u64 {
+pub(crate) const fn recip_estimate_u9(a: u64) -> u64 {
     let a = a * 2 + 1;
     let b = (1 << 19) / a;
     b.div_ceil(2)
 }
 
-const fn recip_sqrt_estimate_u9(a: u64) -> u64 {
+/// `RecipSqrtEstimate`: `a` in 128..512 is a fixed-point value in [0.25, 1).
+pub(crate) const fn recip_sqrt_estimate_u9(a: u64) -> u64 {
     let a = if a < 256 {
         a * 2 + 1
     } else {
