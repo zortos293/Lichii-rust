@@ -367,6 +367,9 @@ impl Scheduler {
             self.clear_running(core);
             return Preempt::Switch;
         }
+        if s.pinned {
+            return Preempt::Stay;
+        }
         let c = &self.cores[core];
         let rotate = c.rotate.swap(false, Ordering::AcqRel);
         let top = c.queue.lock().top();

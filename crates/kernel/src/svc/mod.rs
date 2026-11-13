@@ -246,7 +246,7 @@ fn call(svc: &mut SvcContext, imm: u32) -> Flow {
         0x33 => thread::get_thread_context3(svc),
         0x34 => sync::wait_for_address(svc),
         0x35 => sync::signal_to_address(svc),
-        0x36 => svc.finish(Ok(())),
+        0x36 => thread::synchronize_preemption_state(svc),
         0x45 => sync::create_event(svc),
         0x4b => memory::create_code_memory(svc),
         0x4c => memory::control_code_memory(svc),

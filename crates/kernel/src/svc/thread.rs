@@ -60,6 +60,15 @@ pub(super) fn start_thread(svc: &mut SvcContext) -> Flow {
     svc.finish(result)
 }
 
+/// `svcSynchronizePreemptionState`: the guest enabled preemption again after an interrupt pinned
+/// the thread. Unpins it and lets its core pick again. Writes no register.
+pub(super) fn synchronize_preemption_state(svc: &mut SvcContext) -> Flow {
+    if svc.thread.unpin() {
+        svc.kernel.scheduler.request_reschedule(svc.core);
+    }
+    Flow::Continue
+}
+
 /// `svcSleepThread(ns x0)`: 0, -1 and -2 are the three yield flavours.
 pub(super) fn sleep_thread(svc: &mut SvcContext) -> Flow {
     let ns = svc.arg(0) as i64;
