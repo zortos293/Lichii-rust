@@ -952,9 +952,11 @@ impl TextureCache {
     }
 
     /// A storage image view of `view`'s first level with the identity swizzle, as storage
-    /// descriptors need. `None` when the image or `view.format` cannot be stored to as is.
+    /// descriptors need. sRGB formats are stored through their linear twin, as the guest
+    /// stores raw texels. `None` when the image or `view.format` cannot be stored to as is.
     pub fn storage_view(&mut self, id: ImageId, view: &ViewInfo) -> Result<Option<vk::ImageView>> {
-        let host = self.host(view.format);
+        let format = view.format.to_linear();
+        let host = self.host(format);
         let image_storage = self.get(id).is_some_and(|i| i.host.storage);
         if !image_storage
             || !host.storage
@@ -978,6 +980,7 @@ impl TextureCache {
                 SwizzleSource::A,
             ],
             levels: 1,
+            format,
             ..*view
         };
         self.view(id, &view)
@@ -1018,6 +1021,7 @@ impl TextureCache {
                 base_array_layer: key.base_layer,
                 layer_count: key.layers,
             },
+            image.image.view_usage(format),
         )?;
         let raw = view.raw();
         image.views.push((key, view));
@@ -1537,10 +1541,13 @@ impl TextureCache {
                 vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
             };
         }
+        let mut flags = vk::ImageCreateFlags::empty();
         if host.storage {
             usage |= vk::ImageUsageFlags::STORAGE;
+            if info.format.is_srgb() {
+                flags |= vk::ImageCreateFlags::EXTENDED_USAGE;
+            }
         }
-        let mut flags = vk::ImageCreateFlags::empty();
         if color && host.conversion == Conversion::None {
             flags |= vk::ImageCreateFlags::MUTABLE_FORMAT;
         }

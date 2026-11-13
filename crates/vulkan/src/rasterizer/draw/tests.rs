@@ -1812,6 +1812,34 @@ fn draws_store_storage_images_for_sampling_and_flushes() {
 }
 
 #[test]
+fn draws_store_srgb_storage_images_through_their_linear_twin() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let mut header = tic(GPU_VA + STORAGE_IMAGE, SIZE, SIZE);
+    header[4] |= 1 << 22;
+    write(&f, TIC, bytemuck::cast_slice(&header));
+    let code = pixel_program(&[
+        mov_u32(4, 3),
+        mov_u32(5, 5),
+        mov_u32(6, 0xff40_ff00),
+        sust_r32(3),
+    ]);
+    read_with(&mut f, &gmmu, &mut sampling_regs(), &code, 0);
+    assert_marked(&f, STORAGE_IMAGE, 1, "the sRGB storage image");
+    let image = read_target(&mut f, STORAGE_IMAGE, (SIZE, SIZE));
+    for (i, &texel) in image.iter().enumerate() {
+        let want = if i == 5 * SIZE as usize + 3 {
+            [0x00, 0xff, 0x40, 0xff]
+        } else {
+            [0; 4]
+        };
+        assert_eq!(texel, want, "flushed texel {i}");
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
 fn storage_writes_to_rescaled_images_scale_them_down() {
     let Some((mut f, gmmu)) = rescaled_fixture() else {
         return;
