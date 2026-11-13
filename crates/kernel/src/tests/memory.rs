@@ -76,6 +76,13 @@ fn heap_alias_and_query_memory() {
             })
             .then(l("gpu accessible"))
             .svc(0x80, move |ctx, _| {
+                ctx.x[0] = heap + 0x1000;
+                ctx.x[1] = 0x2000;
+                ctx.x[2] = attribute::GPU_ACCESSIBLE as u64;
+                ctx.x[3] = attribute::GPU_ACCESSIBLE as u64;
+            })
+            .then(l("gpu accessible over a partly accessible range"))
+            .svc(0x80, move |ctx, _| {
                 ctx.x[0] = heap;
                 ctx.x[1] = 0x1000;
                 ctx.x[2] = attribute::UNCACHED as u64;
@@ -105,6 +112,7 @@ fn heap_alias_and_query_memory() {
     assert_eq!(get("protect read-only"), 0);
     assert_eq!(get("uncached"), 0);
     assert_eq!(get("gpu accessible"), 0);
+    assert_eq!(get("gpu accessible over a partly accessible range"), 0);
     assert_eq!(
         get("gpu attr rejects other bits"),
         result::INVALID_COMBINATION.0 as u64

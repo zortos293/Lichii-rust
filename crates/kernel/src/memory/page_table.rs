@@ -677,8 +677,8 @@ impl PageTable {
     ) -> HleResult<()> {
         self.check_args(addr, size)?;
         let mut s = self.state.lock();
-        let ignore = attribute::IPC_LOCKED | attribute::DEVICE_SHARED | mask;
-        s.blocks.check(
+        let ignore = attribute::SET_MASK | attribute::DEVICE_SHARED;
+        s.blocks.check_ignoring(
             addr,
             size,
             Expect {
@@ -689,6 +689,7 @@ impl PageTable {
                 attr_mask: !ignore,
                 attr: 0,
             },
+            ignore,
         )?;
         s.blocks
             .update(addr, size, |b| b.attr = (b.attr & !mask) | (attr & mask));
