@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use lichii_common::paths::UserPaths;
 use lichii_common::perf::PerfStats;
 use lichii_common::settings::{
-    AntiAliasing, FullscreenMode, GraphicsSettings, HotkeyAction, ResolutionScale, ScalingFilter,
-    Settings, Theme,
+    AntiAliasing, ControlSettings, FullscreenMode, GraphicsSettings, HotkeyAction, ResolutionScale,
+    ScalingFilter, Settings, Theme,
 };
 use lichii_core::{ExitReason, Host};
 use lichii_crypto::KeySet as ConsoleKeys;
@@ -72,6 +72,8 @@ pub enum Action {
         path: PathBuf,
         program_id: u64,
     },
+    /// The controller applet's setup, saved like the Controls page saves it.
+    SetControls(Box<ControlSettings>),
 }
 
 /// The configuration of the running game, when it has one.
@@ -453,7 +455,7 @@ impl App {
             ..LoadOptions::default()
         };
         let proxy = self.proxy.clone();
-        let applets = AppletDialogs::new(move || {
+        let applets = AppletDialogs::new(self.settings.system.username.clone(), move || {
             let _ = proxy.send_event(UserEvent::Wake);
         });
         match Session::boot(&path, options, Some(applets), configure) {
@@ -543,6 +545,11 @@ Dump prod.keys and title.keys \
                     let (path, id, title) = (s.path.clone(), s.program_id, s.title.clone());
                     self.open_game_config(&path, id, title);
                 }
+            }
+            Action::SetControls(controls) => {
+                self.settings.controls = *controls;
+                self.reconfigure_input();
+                self.save_settings();
             }
             Action::RemoveGameConfig { path, program_id } => {
                 let file = GameConfig::path(&self.config_dir(), program_id, &path);
