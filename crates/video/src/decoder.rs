@@ -15,6 +15,7 @@ use crate::ffmpeg::{
 /// A compressed video format the video engines decode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Codec {
+    /// H.264 (AVC), Annex B byte stream.
     H264,
     Vp8,
     Vp9,
@@ -56,14 +57,19 @@ pub enum Latency {
     Buffered,
 }
 
+/// Why a decoder call failed.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum VideoError {
+    /// No supported FFmpeg is installed; callers show black frames.
     #[error("FFmpeg is not available")]
     Unavailable,
+    /// The installed FFmpeg was built without this codec's decoder.
     #[error("FFmpeg has no {0:?} decoder")]
     NoDecoder(Codec),
+    /// [`Decoder::send`] while decoded pictures wait; take them with [`Decoder::receive`] first.
     #[error("the decoder has output waiting; receive it before sending more")]
     Full,
+    /// An FFmpeg call failed with this AVERROR code: corrupt input, or out of memory.
     #[error("FFmpeg error {0}")]
     Ffmpeg(i32),
 }
@@ -94,6 +100,8 @@ pub struct Decoder {
 unsafe impl Send for Decoder {}
 
 impl Decoder {
+    /// Opens a decoder for `codec`. Fails with [`VideoError::Unavailable`] when FFmpeg is not
+    /// installed (logged once per process) and [`VideoError::NoDecoder`] when it lacks the codec.
     pub fn new(codec: Codec, latency: Latency) -> Result<Self, VideoError> {
         let api = ffmpeg::api().ok_or(VideoError::Unavailable)?;
         // SAFETY: plain FFmpeg allocation calls; every pointer is checked before use and owned by
@@ -130,6 +138,7 @@ impl Decoder {
         }
     }
 
+    /// The codec this decoder was opened for.
     pub fn codec(&self) -> Codec {
         self.codec
     }
@@ -253,6 +262,7 @@ pub enum Matrix {
 pub struct Color {
     /// `None` when the stream does not say.
     pub matrix: Option<Matrix>,
+    /// Samples use the full 0-255 range rather than 16-235 (luma) and 16-240 (chroma).
     pub full_range: bool,
 }
 
@@ -267,6 +277,7 @@ pub struct Frame {
 unsafe impl Send for Frame {}
 
 impl Frame {
+    /// An empty frame. Fails with [`VideoError::Unavailable`] when FFmpeg is not installed.
     pub fn new() -> Result<Self, VideoError> {
         let api = ffmpeg::api().ok_or(VideoError::Unavailable)?;
         // SAFETY: a plain allocation, checked.
@@ -356,7 +367,9 @@ pub enum PixelFormat {
 /// One plane of a picture: rows `stride` bytes apart.
 #[derive(Clone, Copy, Debug)]
 pub struct Plane<'a> {
+    /// `stride` bytes for each of the plane's rows.
     pub data: &'a [u8],
+    /// Bytes from one row to the next.
     pub stride: usize,
 }
 
@@ -366,6 +379,8 @@ impl Plane<'_> {
         stride: 0,
     };
 
+    /// Row `y`, `stride` bytes including padding past the picture's width. Panics when `y` is
+    /// at or past the plane's height.
     pub fn row(&self, y: usize) -> &[u8] {
         &self.data[y * self.stride..(y + 1) * self.stride]
     }
@@ -374,7 +389,9 @@ impl Plane<'_> {
 /// A decoded picture.
 #[derive(Clone, Copy, Debug)]
 pub struct Picture<'a> {
+    /// Displayed width in pixels.
     pub width: u32,
+    /// Displayed height in pixels.
     pub height: u32,
     /// The pts the frame was sent with.
     pub pts: i64,

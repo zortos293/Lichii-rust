@@ -81,13 +81,19 @@ pub fn write_nv12(
     height: u32,
 ) -> bool {
     let (w, h) = (width as usize, height as usize);
+    if w == 0 || h == 0 {
+        return false;
+    }
     let chroma_width = w.div_ceil(2) * 2;
     let chroma_rows = h.div_ceil(2);
-    let fits = w > 0
-        && h > 0
-        && pitch >= chroma_width
-        && chroma_offset >= pitch * (h - 1) + w
-        && out.len() >= chroma_offset + pitch * (chroma_rows - 1) + chroma_width;
+    let luma_end = pitch.checked_mul(h - 1).and_then(|end| end.checked_add(w));
+    let chroma_end = pitch
+        .checked_mul(chroma_rows - 1)
+        .and_then(|end| end.checked_add(chroma_width))
+        .and_then(|end| end.checked_add(chroma_offset));
+    let fits = pitch >= chroma_width
+        && luma_end.is_some_and(|end| end <= chroma_offset)
+        && chroma_end.is_some_and(|end| end <= out.len());
     if !fits {
         return false;
     }
@@ -195,7 +201,12 @@ pub fn write_rgba(
     order: ColorOrder,
 ) -> bool {
     let (w, h) = (width as usize, height as usize);
-    if w == 0 || h == 0 || pitch < w * 4 || out.len() < pitch * (h - 1) + w * 4 {
+    if w == 0 || h == 0 {
+        return false;
+    }
+    let row = w.checked_mul(4);
+    let end = row.and_then(|row| pitch.checked_mul(h - 1)?.checked_add(row));
+    if row.is_none_or(|row| pitch < row) || end.is_none_or(|end| end > out.len()) {
         return false;
     }
     let coefficients = Coefficients::new(picture);
@@ -298,6 +309,23 @@ mod tests {
         assert!(!write_nv12(&picture, &mut out, 3, 16, 4, 2));
         assert!(!write_nv12(&picture, &mut out, 8, 4, 4, 2));
         assert!(!write_nv12(&picture, &mut out[..19], 8, 16, 4, 2));
+        assert!(!write_nv12(&picture, &mut out, 1 << 63, 2, 2, 5));
+        assert!(!write_rgba(
+            &picture,
+            &mut out,
+            1 << 63,
+            2,
+            5,
+            ColorOrder::Rgba
+        ));
+        assert!(!write_rgba(
+            &picture,
+            &mut out,
+            usize::MAX,
+            usize::MAX as u32,
+            2,
+            ColorOrder::Rgba
+        ));
         assert!(out.iter().all(|&byte| byte == 0xee));
     }
 
