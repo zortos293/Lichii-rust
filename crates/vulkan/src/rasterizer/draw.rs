@@ -170,6 +170,9 @@ pub(super) struct DrawState {
     texture_scaling: ScalingBits<{ NUM_TEXTURE_SCALING_WORDS as usize }>,
     /// Storage images of the current draw and whether it writes them.
     storage_images: Vec<(ImageId, bool)>,
+    /// The raw handles of the texture array elements bound so far, in element order: an
+    /// element whose handle an earlier one has reuses its descriptor.
+    element_handles: Vec<u32>,
     /// A storage image was scaled down while binding, so views collected before it are stale.
     rebind: bool,
     image_scaling: ScalingBits<{ NUM_IMAGE_SCALING_WORDS as usize }>,
@@ -254,6 +257,7 @@ impl DrawState {
             textures: Vec::new(),
             texture_scaling: ScalingBits::default(),
             storage_images: Vec::new(),
+            element_handles: Vec::new(),
             rebind: false,
             image_scaling: ScalingBits::default(),
             texel_views: Vec::new(),
@@ -1110,11 +1114,20 @@ impl VulkanRasterizer {
                     DescriptorKind::CombinedImageSampler => {
                         let desc = info.texture_descriptors[descriptor];
                         let mut array_rescaled = None;
+                        let start = self.draw.image_infos.len();
+                        self.draw.element_handles.clear();
                         for i in 0..b.count {
                             let raw = match desc.handle_program {
                                 Some(program) => self.program_handle(src, info, program, i)?,
                                 None => handle_word(src, desc.handle, i << desc.size_shift),
                             };
+                            let earlier = self.draw.element_handles.iter().position(|&h| h == raw);
+                            self.draw.element_handles.push(raw);
+                            if let Some(earlier) = earlier {
+                                let info = self.draw.image_infos[start + earlier];
+                                self.draw.image_infos.push(info);
+                                continue;
+                            }
                             let readable = desc.handle_program.is_none_or(|_| {
                                 let header = src.pool.header(src.gmmu, raw);
                                 texture_type(&header) == desc.ty
