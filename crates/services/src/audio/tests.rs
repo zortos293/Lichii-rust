@@ -4,19 +4,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lichii_audio::sink::result;
-use lichii_common::perf::PerfStats;
 use lichii_common::settings::{AudioOutput, Settings};
-use lichii_common::{ConsoleGeneration, ResultCode};
-use lichii_gpu::host1x::Host1x;
-use lichii_input::NpadHub;
+use lichii_common::ResultCode;
 use lichii_kernel::handle_table::CURRENT_PROCESS;
 use lichii_kernel::ipc::Handle;
 use lichii_kernel::object::KObject;
-use lichii_kernel::testing::{IpcClient, Reply, Request, kernel, program_image};
+use lichii_kernel::testing::{IpcClient, Reply, Request};
 use lichii_kernel::{Event, Kernel};
 
 use super::{Audio, DEVICE_NAME_SIZE};
-use crate::{ServiceContext, ServiceParts};
 
 struct Harness {
     kernel: Kernel,
@@ -31,25 +27,12 @@ impl Drop for Harness {
 }
 
 fn harness() -> Harness {
-    let kernel = kernel(ConsoleGeneration::Switch1);
-    let program = Arc::new(program_image(0x0100_0000_0000_1000));
-    let process = kernel.create_process(&program).unwrap();
     let mut settings = Settings::default();
     settings.audio.output = AudioOutput::Null;
-    let context = ServiceContext::new(ServiceParts {
-        kernel: kernel.clone(),
-        settings: Arc::new(settings),
-        program,
-        process: process.clone(),
-        host1x: Host1x::new(kernel.physical_memory().clone(), 34),
-        nx2_memory: None,
-        npad: Arc::new(NpadHub::default()),
-        perf: Arc::new(PerfStats::default()),
-    });
+    let (context, client) = crate::testing::context(crate::testing::SWITCH1_TITLE, settings);
     let audio = super::start(&context).unwrap();
-    let client = IpcClient::new(&kernel, &process);
     Harness {
-        kernel,
+        kernel: context.kernel.clone(),
         audio,
         client,
     }
