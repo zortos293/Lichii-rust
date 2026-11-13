@@ -109,22 +109,23 @@ impl ControllerDialog {
                 .all(|(_, controller)| self.accepts(controller))
     }
 
-    /// What the title sees after the applet: hid's own view while the controls are unchanged
-    /// (it knows how the title split or merged Joy-Cons), else the edited players.
+    /// What the title sees after the applet. hid's own count knows how the title split Joy-Con
+    /// pairs, so it is kept and moved by the players the user connected or disconnected. In
+    /// single-player mode am reports one player whatever hid shows, so only the controls count.
     fn setup(&self) -> ControllerSetup {
-        if self.controls == self.original {
-            return self.request.current;
+        let (before, after) = (host_setup(&self.original), host_setup(&self.controls));
+        if self.request.single_mode || after.player_count == 0 {
+            return after;
         }
-        let npad_id = self.connected().next().map_or(0, |(index, controller)| {
-            if style(controller) == HANDHELD_STYLE {
-                HANDHELD_NPAD
-            } else {
-                index as u32
-            }
-        });
+        let current = self.request.current;
         ControllerSetup {
-            player_count: self.connected().count() as i8,
-            npad_id,
+            player_count: (current.player_count + after.player_count - before.player_count)
+                .max(after.player_count),
+            npad_id: if before.player_count > 0 && before.npad_id == after.npad_id {
+                current.npad_id
+            } else {
+                after.npad_id
+            },
         }
     }
 
@@ -133,6 +134,9 @@ impl ControllerDialog {
         &mut self,
         ctx: &egui::Context,
     ) -> Option<(ControllerAnswer, Option<ControlSettings>)> {
+        if self.request.mode >= FIRMWARE_UPDATE {
+            return Some((ControllerAnswer::Confirmed(self.request.current), None));
+        }
         if self.confirm_on_open {
             return Some((ControllerAnswer::Confirmed(self.setup()), None));
         }
@@ -197,6 +201,26 @@ impl ControllerDialog {
         }
         let changed = (self.controls != self.original).then(|| self.controls.clone());
         Some((ControllerAnswer::Confirmed(self.setup()), changed))
+    }
+}
+
+/// The npads `controls` connect: how many players, and the first one (`0x20` for handheld).
+fn host_setup(controls: &ControlSettings) -> ControllerSetup {
+    let mut connected = controls
+        .players
+        .iter()
+        .enumerate()
+        .filter(|(_, player)| player.connected);
+    let npad_id = connected.clone().next().map_or(0, |(index, player)| {
+        if style(player.controller_type) == HANDHELD_STYLE {
+            HANDHELD_NPAD
+        } else {
+            index as u32
+        }
+    });
+    ControllerSetup {
+        player_count: connected.by_ref().count() as i8,
+        npad_id,
     }
 }
 
@@ -423,6 +447,59 @@ mod tests {
                 player_count: 1,
                 npad_id: 0
             })
+        );
+    }
+
+    #[test]
+    fn single_player_mode_opens_the_dialog_when_no_player_is_connected() {
+        let mut ui = harness(&[(false, ControllerType::ProController)]);
+        let answer = configure(
+            &ui,
+            ControllerRequest {
+                single_mode: true,
+                current: ControllerSetup {
+                    player_count: 1,
+                    npad_id: 0,
+                },
+                ..request(1, 4, FULL_KEY)
+            },
+        );
+        ui.frame(Vec::new());
+        ui.key(Key::Enter);
+        assert!(
+            ui.dialogs.is_open(),
+            "am's forced count of one is not a player"
+        );
+        ui.key(Key::Escape);
+        assert_eq!(answer.join().unwrap(), ControllerAnswer::Cancelled);
+    }
+
+    #[test]
+    fn an_edited_setup_keeps_the_npads_hid_split() {
+        let mut ui = harness(&[
+            (true, ControllerType::DualJoycons),
+            (false, ControllerType::ProController),
+            (true, ControllerType::ProController),
+        ]);
+        let answer = configure(
+            &ui,
+            ControllerRequest {
+                current: ControllerSetup {
+                    player_count: 3,
+                    npad_id: 0,
+                },
+                ..request(1, 2, FULL_KEY | JOY_DUAL)
+            },
+        );
+        ui.frame(Vec::new());
+        ui.key(Key::Enter);
+        assert_eq!(
+            answer.join().unwrap(),
+            ControllerAnswer::Confirmed(ControllerSetup {
+                player_count: 2,
+                npad_id: 0
+            }),
+            "the split pair stays two npads once player 3 is disconnected"
         );
     }
 
