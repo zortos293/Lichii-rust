@@ -20,6 +20,9 @@ use lichii_gpu::engines::maxwell_3d::regs::{
     WindowOriginMode,
 };
 use lichii_shader::backend::Bindings;
+use lichii_shader::backend::spirv::{
+    RENDER_AREA_LAYOUT_OFFSET, RESCALING_LAYOUT_DOWN_FACTOR_OFFSET,
+};
 use lichii_shader::info::StorageBufferDescriptor;
 use lichii_shader::ir::TextureType;
 use lichii_shader::runtime::{AttributeType, CompareFunction, InputTopology};
@@ -61,7 +64,6 @@ enum Warning {
     IndirectAssembly = 1 << 2,
     IndirectScattered = 1 << 3,
     NoIndirectCount = 1 << 4,
-    PushConstantOverlap = 1 << 5,
     RescaledTexture = 1 << 6,
 }
 
@@ -1239,21 +1241,17 @@ impl VulkanRasterizer {
         if size == 0 {
             return;
         }
-        let mut bytes = [0u8; 32];
+        let mut bytes = [0u8; RENDER_AREA_LAYOUT_OFFSET as usize + 16];
         if rescaling {
             let (num, den) = scale.ratio();
             let down = den as f32 / num as f32;
-            bytes[24..28].copy_from_slice(&down.to_le_bytes());
+            let at = RESCALING_LAYOUT_DOWN_FACTOR_OFFSET as usize;
+            bytes[at..at + 4].copy_from_slice(&down.to_le_bytes());
         }
         if let Some((width, height)) = render_area {
-            if rescaling && scale != ResolutionScale::X1 {
-                self.draw.warn_once(
-                    Warning::PushConstantOverlap,
-                    "a draw needs the render area and rescaling push constants at one offset; rescaled texture reads may be wrong",
-                );
-            }
-            bytes[0..4].copy_from_slice(&width.to_le_bytes());
-            bytes[4..8].copy_from_slice(&height.to_le_bytes());
+            let at = RENDER_AREA_LAYOUT_OFFSET as usize;
+            bytes[at..at + 4].copy_from_slice(&width.to_le_bytes());
+            bytes[at + 4..at + 8].copy_from_slice(&height.to_le_bytes());
         }
         // SAFETY: `stages` and `size` are the layout's one push constant range at offset 0.
         unsafe {
@@ -1262,7 +1260,7 @@ impl VulkanRasterizer {
                 layout,
                 stages,
                 0,
-                &bytes[..(size as usize).min(32)],
+                &bytes[..(size as usize).min(bytes.len())],
             );
         }
     }

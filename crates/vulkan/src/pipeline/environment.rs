@@ -215,12 +215,16 @@ pub fn shader_pixel_format(format: PixelFormat) -> TexturePixelFormat {
         P::D24UnormS8Uint => T::D24UnormS8Uint,
         P::S8UintD24Unorm => T::S8UintD24Unorm,
         P::D32FloatS8Uint => T::D32FloatS8Uint,
-        P::Etc2RgbUnorm | P::Etc2RgbaUnorm | P::Etc2RgbPtaUnorm => T::A8b8g8r8Unorm,
-        P::Etc2RgbSrgb | P::Etc2RgbaSrgb | P::Etc2RgbPtaSrgb => T::A8b8g8r8Srgb,
-        P::EacR11Unorm => T::R16Unorm,
-        P::EacR11Snorm => T::R16Snorm,
-        P::EacR11G11Unorm => T::R16g16Unorm,
-        P::EacR11G11Snorm => T::R16g16Snorm,
+        P::Etc2RgbUnorm => T::Etc2RgbUnorm,
+        P::Etc2RgbSrgb => T::Etc2RgbSrgb,
+        P::Etc2RgbaUnorm => T::Etc2RgbaUnorm,
+        P::Etc2RgbaSrgb => T::Etc2RgbaSrgb,
+        P::Etc2RgbPtaUnorm => T::Etc2RgbPtaUnorm,
+        P::Etc2RgbPtaSrgb => T::Etc2RgbPtaSrgb,
+        P::EacR11Unorm => T::EacR11Unorm,
+        P::EacR11Snorm => T::EacR11Snorm,
+        P::EacR11G11Unorm => T::EacR11G11Unorm,
+        P::EacR11G11Snorm => T::EacR11G11Snorm,
     }
 }
 
