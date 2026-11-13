@@ -103,22 +103,48 @@ pub struct GuestFrame {
 /// The newest guest frame, handed from the GPU thread to the presenter.
 #[derive(Default)]
 pub struct FrameMailbox {
-    latest: Mutex<Option<GuestFrame>>,
+    latest: Mutex<Latest>,
+    wake: Option<Box<dyn Fn() + Send + Sync>>,
+}
+
+#[derive(Default)]
+struct Latest {
+    frame: Option<GuestFrame>,
+    undrawn: bool,
 }
 
 impl FrameMailbox {
+    /// A mailbox that calls `wake`, on the publishing thread, when a frame arrives and the
+    /// presenter has drawn every earlier one: at most once per draw. The frontend redraws on it
+    /// instead of drawing in a loop while no guest frame arrives.
+    pub fn with_wake(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            latest: Mutex::default(),
+            wake: Some(Box::new(wake)),
+        }
+    }
+
     /// Replaces the frame the presenter draws next.
     pub fn publish(&self, frame: GuestFrame) {
-        *self.latest.lock() = Some(frame);
+        let first = {
+            let mut latest = self.latest.lock();
+            latest.frame = Some(frame);
+            !std::mem::replace(&mut latest.undrawn, true)
+        };
+        if first && let Some(wake) = &self.wake {
+            wake();
+        }
     }
 
     /// Drops the frame, so the presenter shows nothing until the next one is published.
     pub fn clear(&self) {
-        *self.latest.lock() = None;
+        self.latest.lock().frame = None;
     }
 
     pub(crate) fn latest(&self) -> Option<GuestFrame> {
-        self.latest.lock().clone()
+        let mut latest = self.latest.lock();
+        latest.undrawn = false;
+        latest.frame.clone()
     }
 }
 
@@ -906,6 +932,8 @@ fn upload_image(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     struct Harness {
@@ -914,6 +942,10 @@ mod tests {
 
     impl Harness {
         fn new() -> Option<Self> {
+            Self::with_mailbox(Arc::new(FrameMailbox::default()))
+        }
+
+        fn with_mailbox(mailbox: Arc<FrameMailbox>) -> Option<Self> {
             use crate::swapchain::Surface;
             use crate::{Instance, SurfaceSupport};
             let instance = match Instance::new(true, SurfaceSupport::Headless) {
@@ -948,7 +980,7 @@ mod tests {
                 &device,
                 swapchain,
                 &GraphicsSettings::default(),
-                Arc::new(FrameMailbox::default()),
+                mailbox,
                 Arc::new(PerfStats::default()),
             )
             .ok()?;
@@ -1243,6 +1275,42 @@ mod tests {
             .perf
             .snapshot(Instant::now(), Duration::from_secs(60));
         assert!(snapshot.vram_budget > 0, "{snapshot:?}");
+        h.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn the_mailbox_wakes_once_for_frames_the_presenter_has_not_drawn() {
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counter = wakes.clone();
+        let mailbox = Arc::new(FrameMailbox::with_wake(move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }));
+        let Some(mut h) = Harness::with_mailbox(mailbox.clone()) else {
+            return;
+        };
+        let draw = |h: &mut Harness| {
+            let viewport = Viewport::fit(AspectRatio::R16x9, 0, 0, 160, 90);
+            h.presenter.draw(160, 90, viewport, no_ui()).unwrap();
+        };
+        let woken = || wakes.load(Ordering::Relaxed);
+        draw(&mut h);
+        draw(&mut h);
+        assert_eq!(woken(), 0, "no guest frame, no wake");
+        let guest = h.guest(
+            &quadrant_texels(64, 36),
+            (64, 36),
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ComponentMapping::default(),
+        );
+        mailbox.publish(guest.clone());
+        mailbox.publish(guest.clone());
+        assert_eq!(woken(), 1, "one wake until the presenter draws");
+        draw(&mut h);
+        draw(&mut h);
+        assert_eq!(woken(), 1, "redrawing the same frame wakes nobody");
+        mailbox.publish(guest);
+        assert_eq!(woken(), 2, "a frame after the draw wakes again");
+        h.presenter.scheduler.finish().unwrap();
         h.assert_no_validation_errors();
     }
 
