@@ -19,9 +19,10 @@ use crate::{
     MeshState, Profile, RuntimeInfo, ShaderArch, ShaderEnvironment, ShaderStage, TranslateError,
 };
 
-/// A synthetic Ampere program: instructions from `BASE`, a program header 0x80 bytes before it
-/// and one constant buffer.
+/// A synthetic Ampere program: instructions from `base` (`BASE` unless moved), a program header
+/// 0x80 bytes before it and one constant buffer.
 pub struct TestEnv {
+    pub base: GpuVAddr,
     pub code: Vec<Instruction>,
     pub stage: ShaderStage,
     pub header: [u32; 20],
@@ -37,6 +38,7 @@ impl TestEnv {
 
     pub fn new(code: &[Instruction]) -> TestEnv {
         TestEnv {
+            base: Self::BASE,
             code: code.to_vec(),
             stage: ShaderStage::Compute,
             header: [0; 20],
@@ -66,10 +68,10 @@ impl ShaderEnvironment for TestEnv {
         self.stage
     }
     fn start_address(&self) -> GpuVAddr {
-        Self::BASE
+        self.base
     }
     fn read_u64(&self, address: GpuVAddr) -> u64 {
-        if let Some(offset) = address.checked_sub(Self::BASE) {
+        if let Some(offset) = address.checked_sub(self.base) {
             let index = (offset / u64::from(INSTRUCTION_SIZE)) as usize;
             return self.code.get(index).map_or(0, |inst| {
                 if offset % 16 == 0 {
@@ -79,7 +81,7 @@ impl ShaderEnvironment for TestEnv {
                 }
             });
         }
-        let header = Self::BASE - crate::ampere::GRAPHICS_HEADER_SIZE;
+        let header = self.base - crate::ampere::GRAPHICS_HEADER_SIZE;
         match address.checked_sub(header) {
             Some(offset) if offset < 0x50 => {
                 let word = (offset / 4) as usize;

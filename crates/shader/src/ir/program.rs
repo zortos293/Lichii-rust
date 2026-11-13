@@ -256,6 +256,9 @@ pub struct Program {
     /// Blocks in post order of the structured control flow.
     pub post_order: Vec<BlockId>,
     pub syntax_list: Vec<SyntaxNode>,
+    /// Translation wrote the program's absolute address into the code, so the result is only
+    /// valid at that address.
+    pub reads_start_address: bool,
 }
 
 impl Program {

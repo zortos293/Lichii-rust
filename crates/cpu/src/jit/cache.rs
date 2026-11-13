@@ -169,13 +169,14 @@ fn fast_slot(pc: u64) -> usize {
 }
 
 impl JitCache {
-    pub fn new() -> Option<Self> {
+    /// `profile` builds the materialize stub that counts its write-backs.
+    pub fn new(profile: bool) -> Option<Self> {
         let mut memory = CodeMemory::new()?;
         let code = memory.push(&x64::trampoline())?;
         // SAFETY: the bytes at `code` are the trampoline, which has this signature.
         let trampoline = unsafe { std::mem::transmute::<*const u8, Trampoline>(code) };
         let empty = (u64::MAX, memory.push(&x64::miss_stub())? as usize);
-        let materialize = memory.push(&x64::materialize_stub())? as usize;
+        let materialize = memory.push(&x64::materialize_stub(profile))? as usize;
         let mut sites = Box::new(SiteTable(Vec::new()));
         let region = {
             let _guard = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());

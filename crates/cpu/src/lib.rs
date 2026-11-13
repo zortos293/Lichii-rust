@@ -20,6 +20,15 @@ pub use interpreter::Interpreter;
 #[cfg(target_arch = "x86_64")]
 pub use jit::Jit;
 
+/// The JIT profile's rates over the last second, for the frame view; `None` unless
+/// `LICHII_JIT_PROFILE` is set. See `crates/cpu/JIT.md`.
+pub fn jit_profile_summary() -> Option<String> {
+    #[cfg(target_arch = "x86_64")]
+    return jit::profile::summary();
+    #[cfg(not(target_arch = "x86_64"))]
+    None
+}
+
 /// Architectural state of one guest thread.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
