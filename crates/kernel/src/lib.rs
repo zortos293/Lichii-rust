@@ -321,8 +321,19 @@ impl Kernel {
     /// Stops every core and kernel thread and releases all processes. A thread still running
     /// after [`SLOW_JOIN`] is named in a warning, so a shutdown that hangs says what it waits for.
     pub fn shutdown(&self) {
+        let mut lap = Instant::now();
+        let mut mark = |step: &str| {
+            tracing::warn!(
+                step,
+                ms = lap.elapsed().as_secs_f64() * 1e3,
+                "shutdown timing"
+            );
+            lap = Instant::now();
+        };
         self.0.scheduler.shutdown();
+        mark("scheduler");
         self.0.timer.shutdown();
+        mark("timer");
         let threads = std::mem::take(&mut *self.0.host_threads.lock());
         for thread in &threads {
             thread.thread().unpark();
@@ -330,6 +341,7 @@ impl Kernel {
         for thread in threads {
             join_noting_slow(thread);
         }
+        mark("host threads");
         let services = std::mem::take(&mut *self.0.services.lock());
         for thread in &services.threads {
             thread.stop();
@@ -337,9 +349,11 @@ impl Kernel {
         for join in services.joins {
             join_noting_slow(join);
         }
+        mark("service threads");
         self.0.service_manager.clear();
         self.0.named_ports.lock().clear();
         self.0.scheduler.clear();
+        mark("service sessions");
         let processes = std::mem::take(&mut *self.0.processes.lock());
         for process in processes {
             process.threads.lock().clear();
@@ -347,6 +361,7 @@ impl Kernel {
                 process.finalize();
             }
         }
+        mark("releasing processes");
     }
 
     /// Stops running guest code: every core puts its thread back in its run queue and idles until

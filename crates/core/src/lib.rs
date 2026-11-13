@@ -293,9 +293,16 @@ impl System {
         if self.state == State::Stopped {
             return;
         }
+        let t = std::time::Instant::now();
         noting_slow("stopping the GPU", || self.gpu.shutdown());
+        let gpu_ms = t.elapsed().as_secs_f64() * 1e3;
         self.audio.set_paused(true);
         noting_slow("stopping the kernel", || self.kernel.shutdown());
+        tracing::warn!(
+            gpu_ms,
+            total_ms = t.elapsed().as_secs_f64() * 1e3,
+            "stop timing"
+        );
         self.state = State::Stopped;
         tracing::info!("stopped");
     }

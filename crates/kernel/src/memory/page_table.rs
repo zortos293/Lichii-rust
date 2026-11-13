@@ -1001,13 +1001,30 @@ impl PageTable {
                 (start, b.size, owned)
             })
             .collect();
+        let (mut runs_t, mut free_t, mut unmap_t, mut bytes) = (0.0, 0.0, 0.0, 0u64);
+        let blocks = mapped.len();
         for (start, size, owned) in mapped {
             if owned {
+                let t = std::time::Instant::now();
                 let group = self.physical_runs(start, size);
+                runs_t += t.elapsed().as_secs_f64();
+                let t = std::time::Instant::now();
                 self.memory.free_group(&group);
+                free_t += t.elapsed().as_secs_f64();
+                bytes += size;
             }
+            let t = std::time::Instant::now();
             self.unmap_space(&s.blocks, start, size);
+            unmap_t += t.elapsed().as_secs_f64();
         }
+        tracing::warn!(
+            blocks,
+            owned_mib = bytes >> 20,
+            runs_ms = runs_t * 1e3,
+            free_ms = free_t * 1e3,
+            unmap_ms = unmap_t * 1e3,
+            "shutdown timing: release_all"
+        );
         let end = s.blocks.end();
         s.blocks
             .set(0, end, MemoryState::FREE, MemoryPermission::NONE, 0);
