@@ -870,6 +870,8 @@ fn ixc_follows_fpsr_writes() {
 fn host_mxcsr_does_not_leak_into_guest_fp() {
     const FADD_S0_S1_S2: u32 = 0x1e22_2820;
     const FMUL_D3_D4_D5: u32 = 0x1e65_0883;
+    const FADD_S6_S7_S7: u32 = 0x1e27_28e6;
+    const FADD_S8_S9_S7: u32 = 0x1e27_2928;
     const ROUND_UP_FTZ_DAZ: u32 = 0x1f80 | 2 << 13 | 1 << 15 | 1 << 6;
     let mut ctx = ThreadContext {
         pc: CODE,
@@ -880,7 +882,9 @@ fn host_mxcsr_does_not_leak_into_guest_fp() {
     ctx.v[2] = 0x3380_0000;
     ctx.v[4] = 1;
     ctx.v[5] = 0x4330_0000_0000_0000;
-    let code = [FADD_S0_S1_S2, FMUL_D3_D4_D5, BRK];
+    ctx.v[7] = 1;
+    ctx.v[9] = 0x0080_0000;
+    let code = [FADD_S0_S1_S2, FMUL_D3_D4_D5, FADD_S6_S7_S7, FADD_S8_S9_S7, BRK];
     let data = vec![0u8; DATA_SIZE as usize];
     let mut interpreter = Machine::new(Backend::Interpreter);
     let mut jit = Machine::new(Backend::Jit(Passes::ALL));
@@ -892,6 +896,8 @@ fn host_mxcsr_does_not_leak_into_guest_fp() {
     simd::set_mxcsr(saved);
     assert_eq!(actual.ctx.v[0], expected.ctx.v[0]);
     assert_eq!(actual.ctx.v[3], expected.ctx.v[3]);
+    assert_eq!(actual.ctx.v[6], expected.ctx.v[6]);
+    assert_eq!(actual.ctx.v[8], expected.ctx.v[8]);
     assert_eq!(actual.ctx.fpsr, expected.ctx.fpsr);
     assert_eq!(after, ROUND_UP_FTZ_DAZ);
 }
