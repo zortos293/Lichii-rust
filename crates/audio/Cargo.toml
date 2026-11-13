@@ -6,5 +6,6 @@ license.workspace = true
 
 [dependencies]
 lichii-common.workspace = true
+bytemuck.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
