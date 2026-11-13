@@ -1,11 +1,16 @@
 //! The content index NSP, XCI and loose NCA directories all produce: the titles their CNMTs
 //! describe (applications, patches, add-ons) and the NCAs each title lists.
 
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
 use lichii_crypto::{KeySet, Ticket, TitleKey};
 
 use crate::cnmt::{Cnmt, ContentMetaType, ContentRecord, ContentType, ExtendedHeader};
 use crate::error::{FsResult, corrupt};
+use crate::host::HostDir;
 use crate::nca::{FsType, Nca, NcaContentType};
+use crate::pfs::PartitionFs;
 use crate::vfs::{ConcatFile, Directory, DirectoryExt, EntryKind, FileExt, FileRef, not_found};
 
 const MAX_SMALL_FILE: u64 = 16 << 20;
@@ -234,6 +239,181 @@ impl ContentIndex {
     }
 }
 
+/// What installing one title into registered content did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstallOutcome {
+    /// The title was not installed before.
+    New,
+    /// The same title was installed; its files were replaced.
+    Overwrote { old_version: u32 },
+    /// A newer version is installed already and stays.
+    KeptNewer { installed: u32 },
+}
+
+/// One patch or add-on title [`install_registered`] found in a package, and what it did with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InstalledTitle {
+    pub title_id: u64,
+    pub meta_type: ContentMetaType,
+    pub version: u32,
+    pub outcome: InstallOutcome,
+}
+
+const INSTALL_CHUNK: u64 = 4 << 20;
+
+/// Installs the patches and add-ons `index` found in `package` into the host folder `registered`
+/// (a NAND's `user/Contents/registered`), in the flat layout [`ContentIndex::from_registered`] reads:
+/// each title's Meta NCA, the NCAs its CNMT lists, and the package's tickets. Applications are
+/// not installed. An older installed version of a title is replaced and its files removed; a
+/// newer one stays. Every file is written to a `.tmp` beside its destination and renamed into
+/// place, so an interrupted install never leaves a partial NCA or ticket that indexing would pick
+/// up, and a title's Meta NCA goes in after its contents, so a failed install keeps the version
+/// that was there. Delta fragments are not copied. A package that lacks a content its CNMT lists,
+/// or whose file names are not plain names (a path, `..`), installs nothing. `progress` gets the bytes written after each chunk.
+pub fn install_registered(
+    package: &PartitionFs,
+    index: &ContentIndex,
+    registered: &Path,
+    keys: &mut KeySet,
+    mut progress: impl FnMut(u64),
+) -> FsResult<Vec<InstalledTitle>> {
+    std::fs::create_dir_all(registered)?;
+    let existing = ContentIndex::from_registered(HostDir::open(registered)?.as_ref(), keys)?;
+    let mut copies: Vec<String> = package
+        .entries()
+        .iter()
+        .map(|e| e.name.clone())
+        .filter(|name| name.ends_with(".tik"))
+        .collect();
+    let mut stale = Vec::new();
+    let mut installed = Vec::new();
+    let titles = index.titles().iter().filter(|t| {
+        matches!(
+            t.meta_type(),
+            ContentMetaType::Patch | ContentMetaType::AddOnContent
+        )
+    });
+    for title in titles {
+        let old = existing.title(title.title_id());
+        let outcome = match old {
+            Some(old) if old.version() > title.version() => InstallOutcome::KeptNewer {
+                installed: old.version(),
+            },
+            Some(old) => InstallOutcome::Overwrote {
+                old_version: old.version(),
+            },
+            None => InstallOutcome::New,
+        };
+        if !matches!(outcome, InstallOutcome::KeptNewer { .. }) {
+            if let Some(missing) = title.cnmt.contents.iter().find(|record| {
+                record.content_type != ContentType::DeltaFragment
+                    && !title
+                        .contents
+                        .iter()
+                        .any(|c| c.record.content_id == record.content_id)
+            }) {
+                return Err(corrupt(
+                    "NSP",
+                    format!(
+                        "{:016x} lists {} but the package lacks it",
+                        title.title_id(),
+                        missing.content_id.file_name()
+                    ),
+                ));
+            }
+            copies.extend(index.file_names(title));
+            if let Some(old) = old {
+                stale.extend(existing.file_names(old));
+            }
+        }
+        installed.push(InstalledTitle {
+            title_id: title.title_id(),
+            meta_type: title.meta_type(),
+            version: title.version(),
+            outcome,
+        });
+    }
+    if installed.is_empty() {
+        return Ok(installed);
+    }
+    if let Some(name) = copies.iter().find(|name| !is_plain_file_name(name)) {
+        return Err(corrupt("NSP", format!("{name:?} is not a plain file name")));
+    }
+    let files = copies
+        .iter()
+        .map(|name| {
+            package
+                .file(name)
+                .map(|file| (name, file))
+                .ok_or_else(|| corrupt("NSP", format!("{name} is listed but not in the package")))
+        })
+        .collect::<FsResult<Vec<_>>>()?;
+    for (name, file) in files {
+        write_atomically(&registered.join(name), &file, &mut progress)?;
+    }
+    for name in stale.iter().filter(|name| !copies.contains(name)) {
+        let path = registered.join(name);
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    Ok(installed)
+}
+
+impl ContentIndex {
+    /// The file names of the NCAs `title`'s CNMT lists that are present, then of its Meta NCA.
+    fn file_names(&self, title: &Title) -> Vec<String> {
+        let meta = self.ncas.iter().find(|(_, nca)| {
+            let header = nca.header();
+            header.content_type == NcaContentType::Meta && header.program_id == title.title_id()
+        });
+        title
+            .contents
+            .iter()
+            .map(|c| c.record.content_id.file_name())
+            .chain(meta.map(|(name, _)| name.clone()))
+            .collect()
+    }
+}
+
+/// Whether `name` names a file inside a folder on every host: no separator, drive or parent.
+fn is_plain_file_name(name: &str) -> bool {
+    !matches!(name, "" | "." | "..") && !name.contains(['/', '\\', ':'])
+}
+
+/// Copies `file` to a `.tmp` beside `destination` and renames it into place.
+fn write_atomically(
+    destination: &Path,
+    file: &FileRef,
+    progress: &mut impl FnMut(u64),
+) -> FsResult<()> {
+    let mut tmp = destination.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let written = (|| -> FsResult<()> {
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        let mut offset = 0;
+        while offset < file.size() {
+            let len = INSTALL_CHUNK.min(file.size() - offset);
+            out.write_all(&file.read_vec(offset, len as usize)?)?;
+            offset += len;
+            progress(len);
+        }
+        out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+        if destination.is_dir() {
+            std::fs::remove_dir_all(destination)?;
+        }
+        std::fs::rename(&tmp, destination)?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
 /// A split NCA: a directory of `00`, `01`, ... parts in order.
 fn open_split(dir: &dyn Directory, name: &str) -> FsResult<FileRef> {
     let parts_dir = dir.open_dir(name)?.ok_or_else(|| not_found(name))?;
@@ -278,6 +458,7 @@ fn read_cnmt(meta: &Nca) -> FsResult<Cnmt> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::cnmt::ContentId;
     use crate::nacp::{Nacp, NacpLanguage};
     use crate::nsp::Nsp;
     use crate::pfs::{PartitionKind, build_partition};
@@ -406,6 +587,320 @@ pub(crate) mod tests {
             bytes(0x900, 23)
         );
         assert!(index.data_romfs(APP + 0x2001).unwrap().is_none());
+    }
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("lichii-fs-install-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn open_package(files: &[(String, FileRef)], keys: &mut KeySet) -> Nsp {
+        Nsp::open(&nsp(files), keys).unwrap()
+    }
+
+    /// A patch for [`APP`] older than the one in [`update_package`], with its own content ids.
+    fn old_patch_package() -> Vec<(String, FileRef)> {
+        let program = NcaSpec::new(PROGRAM, APP, vec![pfs_section(&exefs())]).build();
+        let patch = cnmt(
+            APP | 0x800,
+            0x8000,
+            ExtendedHeader::Patch {
+                application_id: APP,
+                required_system_version: 0,
+            },
+            vec![record(ContentType::Program, 0xd1, &program)],
+        );
+        vec![content_file(0xd1, program), meta_nca(&patch, 0xd0)]
+    }
+
+    fn install(package: &Nsp, registered: &Path) -> Vec<InstalledTitle> {
+        let mut keys = key_set();
+        let mut written = 0;
+        let result = install_registered(
+            package.partition(),
+            package.index(),
+            registered,
+            &mut keys,
+            |n| written += n,
+        )
+        .unwrap();
+        let copied = result
+            .iter()
+            .any(|t| !matches!(t.outcome, InstallOutcome::KeptNewer { .. }));
+        assert_eq!(copied, written > 0, "progress counts the bytes written");
+        result
+    }
+
+    fn outcomes(installed: &[InstalledTitle]) -> Vec<(u64, u32, InstallOutcome)> {
+        installed
+            .iter()
+            .map(|t| (t.title_id, t.version, t.outcome))
+            .collect()
+    }
+
+    #[test]
+    fn installs_patches_and_add_ons_into_registered_content() {
+        let temp = TempDir::new("update");
+        let registered = temp.0.join("user/Contents/registered");
+        let mut keys = key_set();
+        let mut files = update_package();
+        let rights = control_rights();
+        files.push((format!("{rights}.tik"), file(ticket(rights))));
+        let package = open_package(&files, &mut keys);
+
+        let installed = install(&package, &registered);
+        assert_eq!(
+            outcomes(&installed),
+            [
+                (APP | 0x800, 0x10000, InstallOutcome::New),
+                (APP + 0x1001, 0, InstallOutcome::New),
+            ]
+        );
+        let mut names: Vec<String> = std::fs::read_dir(&registered)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        let mut expected: Vec<String> = files.iter().map(|(name, _)| name.clone()).collect();
+        expected.sort();
+        assert_eq!(
+            names, expected,
+            "every NCA and the ticket, and no temporary files"
+        );
+
+        let dir = HostDir::open(&registered).unwrap();
+        let index = ContentIndex::from_registered(dir.as_ref(), &mut key_set()).unwrap();
+        assert_eq!(index.patch_for(APP).unwrap().version(), 0x10000);
+        assert_eq!(index.add_ons_for(APP).count(), 1);
+        assert_eq!(index.tickets().len(), 1);
+
+        assert_eq!(
+            outcomes(&install(&package, &registered)),
+            [
+                (
+                    APP | 0x800,
+                    0x10000,
+                    InstallOutcome::Overwrote {
+                        old_version: 0x10000
+                    }
+                ),
+                (
+                    APP + 0x1001,
+                    0,
+                    InstallOutcome::Overwrote { old_version: 0 }
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_newer_patch_replaces_an_older_one_and_never_the_reverse() {
+        let temp = TempDir::new("versions");
+        let registered = temp.0.join("registered");
+        let mut keys = key_set();
+        let old = open_package(&old_patch_package(), &mut keys);
+        let new = open_package(&update_package(), &mut keys);
+
+        install(&old, &registered);
+        assert!(registered.join(ContentId([0xd1; 16]).file_name()).exists());
+        let installed = install(&new, &registered);
+        assert_eq!(
+            installed[0].outcome,
+            InstallOutcome::Overwrote {
+                old_version: 0x8000
+            }
+        );
+        assert!(
+            !registered.join(ContentId([0xd1; 16]).file_name()).exists(),
+            "the replaced patch's files are removed"
+        );
+
+        let installed = install(&old, &registered);
+        assert_eq!(
+            outcomes(&installed),
+            [(
+                APP | 0x800,
+                0x8000,
+                InstallOutcome::KeptNewer { installed: 0x10000 }
+            )]
+        );
+        assert!(!registered.join(ContentId([0xd1; 16]).file_name()).exists());
+        let dir = HostDir::open(&registered).unwrap();
+        let index = ContentIndex::from_registered(dir.as_ref(), &mut key_set()).unwrap();
+        assert_eq!(index.patch_for(APP).unwrap().version(), 0x10000);
+    }
+
+    #[test]
+    fn an_interrupted_install_is_invisible_and_the_next_one_replaces_it() {
+        let temp = TempDir::new("interrupted");
+        let complete = temp.0.join("complete");
+        let registered = temp.0.join("registered");
+        let mut keys = key_set();
+        let package = open_package(&update_package(), &mut keys);
+        install(&package, &complete);
+
+        std::fs::create_dir_all(&registered).unwrap();
+        let mut names: Vec<_> = std::fs::read_dir(&complete)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        for name in &names {
+            let full = std::fs::read(complete.join(name)).unwrap();
+            std::fs::write(
+                registered.join(format!("{name}.tmp")),
+                &full[..full.len() / 2],
+            )
+            .unwrap();
+        }
+        let dir = HostDir::open(&registered).unwrap();
+        let index = ContentIndex::from_registered(dir.as_ref(), &mut key_set()).unwrap();
+        assert!(index.patch_for(APP).is_none());
+
+        install(&package, &registered);
+        let mut left: Vec<_> = std::fs::read_dir(&registered)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, names, "no temp file survives a completed install");
+        let dir = HostDir::open(&registered).unwrap();
+        let index = ContentIndex::from_registered(dir.as_ref(), &mut key_set()).unwrap();
+        assert_eq!(index.patch_for(APP).unwrap().version(), 0x10000);
+    }
+
+    #[test]
+    fn names_that_leave_the_folder_install_nothing() {
+        let temp = TempDir::new("escape");
+        let registered = temp.0.join("nand/registered");
+        let rights = control_rights();
+        let mut escaping_meta = update_package();
+        let meta = escaping_meta
+            .iter_mut()
+            .find(|(name, _)| name.ends_with(".cnmt.nca"))
+            .unwrap();
+        meta.0 = format!("../../{}", meta.0);
+        let mut escaping_ticket = update_package();
+        escaping_ticket.push((format!("../{rights}.tik"), file(ticket(rights))));
+        for files in [escaping_meta, escaping_ticket] {
+            let mut keys = key_set();
+            let package = open_package(&files, &mut keys);
+            let result = install_registered(
+                package.partition(),
+                package.index(),
+                &registered,
+                &mut keys,
+                |_| {},
+            );
+            assert!(result.is_err());
+            let written: Vec<_> = walk(&temp.0);
+            assert!(written.is_empty(), "nothing is written: {written:?}");
+        }
+    }
+
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flat_map(|e| {
+                let path = e.unwrap().path();
+                if path.is_dir() {
+                    walk(&path)
+                } else {
+                    vec![path]
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_failed_update_keeps_the_installed_one() {
+        let temp = TempDir::new("failed");
+        let registered = temp.0.join("registered");
+        let mut keys = key_set();
+        install(&open_package(&old_patch_package(), &mut keys), &registered);
+        let blocked = registered.join(format!("{}.tmp", ContentId([0xb1; 16]).file_name()));
+        std::fs::create_dir(&blocked).unwrap();
+
+        let new = open_package(&update_package(), &mut keys);
+        let result =
+            install_registered(new.partition(), new.index(), &registered, &mut keys, |_| {});
+        assert!(result.is_err());
+        let dir = HostDir::open(&registered).unwrap();
+        let index = ContentIndex::from_registered(dir.as_ref(), &mut key_set()).unwrap();
+        let patch = index.patch_for(APP).unwrap();
+        assert_eq!(patch.version(), 0x8000, "the old update still applies");
+        assert!(registered.join(ContentId([0xd1; 16]).file_name()).exists());
+
+        std::fs::remove_dir(&blocked).unwrap();
+        install(&new, &registered);
+        let dir = HostDir::open(&registered).unwrap();
+        let index = ContentIndex::from_registered(dir.as_ref(), &mut key_set()).unwrap();
+        assert_eq!(index.patch_for(APP).unwrap().version(), 0x10000);
+    }
+
+    #[test]
+    fn a_title_missing_a_listed_content_installs_nothing_and_delta_fragments_are_skipped() {
+        let temp = TempDir::new("missing");
+        let registered = temp.0.join("registered");
+        let program = NcaSpec::new(PROGRAM, APP, vec![pfs_section(&exefs())]).build();
+        let patch = cnmt(
+            APP | 0x800,
+            0x10000,
+            ExtendedHeader::Patch {
+                application_id: APP,
+                required_system_version: 0,
+            },
+            vec![
+                record(ContentType::Program, 0xe1, &program),
+                record(ContentType::DeltaFragment, 0xe9, b"delta"),
+            ],
+        );
+        let mut keys = key_set();
+        let missing = open_package(&[meta_nca(&patch, 0xe0)], &mut keys);
+        let result = install_registered(
+            missing.partition(),
+            missing.index(),
+            &registered,
+            &mut keys,
+            |_| {},
+        );
+        assert!(result.is_err());
+        assert!(walk(&temp.0).is_empty());
+
+        let complete = open_package(
+            &[content_file(0xe1, program), meta_nca(&patch, 0xe0)],
+            &mut keys,
+        );
+        install(&complete, &registered);
+        assert!(registered.join(ContentId([0xe1; 16]).file_name()).exists());
+        assert!(!registered.join(ContentId([0xe9; 16]).file_name()).exists());
+        let dir = HostDir::open(&registered).unwrap();
+        let index = ContentIndex::from_registered(dir.as_ref(), &mut key_set()).unwrap();
+        assert_eq!(index.patch_for(APP).unwrap().version(), 0x10000);
+    }
+
+    #[test]
+    fn applications_are_not_installed() {
+        let temp = TempDir::new("base");
+        let registered = temp.0.join("registered");
+        let mut keys = key_set();
+        let base = open_package(&application_package(true), &mut keys);
+        assert!(install(&base, &registered).is_empty());
+        let dir = HostDir::open(&registered).unwrap();
+        assert!(dir.entries().unwrap().is_empty());
     }
 
     fn dir_has_split(dir: &MemDir) -> bool {
