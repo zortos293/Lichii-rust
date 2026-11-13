@@ -1133,3 +1133,20 @@ fn gsv_hands_out_initialized_nvsrv_sessions() {
     assert!(fd > 0, "opened without Initialize");
     assert_eq!(error, 0);
 }
+
+#[test]
+fn video_decoder_sessions_hand_out_decoder_services() {
+    let (_context, client, gsv) = gsv();
+    for command in [902, 905, 906, 1002] {
+        let decoder = session(&client, gsv, command);
+        let service = session(&client, decoder, 1);
+        let ready = session(&client, service, 3);
+        assert!(event(&client, ready).is_signaled(), "gsv {command}");
+        let reply = client.send(service, &Request::tipc(200)).unwrap();
+        assert_eq!(
+            reply.result,
+            ResultCode::SUCCESS,
+            "initialize falls to the auto-stub"
+        );
+    }
+}
