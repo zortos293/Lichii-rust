@@ -556,65 +556,68 @@ fn copy_lines(
     index: Word,
     base: u32,
     per_primitive: bool,
+    convert_depth: bool,
 ) -> EmitResult<()> {
-    let num_lines = if per_primitive {
-        ctx.mesh.primitive_targets.len()
+    let targets = if per_primitive {
+        ctx.mesh.primitive_targets.clone()
     } else {
-        ctx.mesh.vertex_targets.len()
-    } as u32;
-    let first = first_line_word(ctx, index, base, num_lines)?;
-    for line in 0..num_lines {
-        let targets = if per_primitive {
-            &ctx.mesh.primitive_targets
-        } else {
-            &ctx.mesh.vertex_targets
-        };
-        let Some(target) = targets[line as usize] else {
+        ctx.mesh.vertex_targets.clone()
+    };
+    let first = first_line_word(ctx, index, base, targets.len() as u32)?;
+    let mut vectors: Vec<(Word, [Option<Word>; 4])> = Vec::new();
+    for (line, target) in targets.iter().enumerate() {
+        let Some(target) = *target else {
             continue;
         };
-        let word = load_line(ctx, first, line)?;
-        let (value, pointer_type) = if target.is_float {
-            (ctx.b.bitcast(ctx.f32[1], None, word)?, ctx.output_f32)
+        let word = load_line(ctx, first, line as u32)?;
+        let value = if target.is_float {
+            ctx.b.bitcast(ctx.f32[1], None, word)?
         } else {
-            (word, ctx.output_u32)
+            word
         };
-        let pointer = match target.element {
-            None => ctx
+        let Some(element) = target.element else {
+            let pointer_type = if target.is_float {
+                ctx.output_f32
+            } else {
+                ctx.output_u32
+            };
+            let pointer = ctx
                 .b
-                .access_chain(pointer_type, None, target.variable, [index])?,
-            Some(element) => {
-                let element = ctx.const_u32(element);
-                ctx.b
-                    .access_chain(pointer_type, None, target.variable, [index, element])?
+                .access_chain(pointer_type, None, target.variable, [index])?;
+            store(ctx, pointer, value)?;
+            continue;
+        };
+        let at = match vectors.iter().position(|(v, _)| *v == target.variable) {
+            Some(at) => at,
+            None => {
+                vectors.push((target.variable, [None; 4]));
+                vectors.len() - 1
             }
         };
+        vectors[at].1[element as usize] = Some(value);
+    }
+    let f32x4 = ctx.f32[4];
+    let pointer_type = ctx.type_pointer(StorageClass::Output, f32x4);
+    for (variable, mut components) in vectors {
+        if convert_depth
+            && variable == ctx.mesh.position
+            && let [_, _, Some(z), Some(w)] = components
+        {
+            let sum = ctx.b.f_add(ctx.f32[1], None, z, w)?;
+            let half = ctx.const_f32(0.5);
+            components[2] = Some(ctx.b.f_mul(ctx.f32[1], None, sum, half)?);
+        }
+        let pointer = ctx.b.access_chain(pointer_type, None, variable, [index])?;
+        let (zero, one) = (ctx.const_f32(0.0), ctx.const_f32(1.0));
+        let defaults = [zero, zero, zero, one];
+        let value = ctx.b.composite_construct(
+            f32x4,
+            None,
+            [0, 1, 2, 3].map(|i| components[i].unwrap_or(defaults[i])),
+        )?;
         store(ctx, pointer, value)?;
     }
     Ok(())
-}
-
-/// OpenGL-style clip space, `z = (z + w) / 2`, from the stage buffer's position lines.
-fn convert_depth(ctx: &mut EmitContext<'_>, vertex: Word) -> EmitResult<()> {
-    let lines = &ctx.info.mesh.vertex_lines;
-    let find = |attribute: Attribute| lines.iter().position(|&l| l == u32::from(attribute.0));
-    let (Some(z_line), Some(w_line)) = (find(Attribute::POSITION_Z), find(Attribute::POSITION_W))
-    else {
-        return Ok(());
-    };
-    let first = first_line_word(ctx, vertex, 0, lines.len() as u32)?;
-    let f32_t = ctx.f32[1];
-    let z = load_line(ctx, first, z_line as u32)?;
-    let z = ctx.b.bitcast(f32_t, None, z)?;
-    let w = load_line(ctx, first, w_line as u32)?;
-    let w = ctx.b.bitcast(f32_t, None, w)?;
-    let sum = ctx.b.f_add(f32_t, None, z, w)?;
-    let half = ctx.const_f32(0.5);
-    let depth = ctx.b.f_mul(f32_t, None, sum, half)?;
-    let two = ctx.const_u32(2);
-    let pointer = ctx
-        .b
-        .access_chain(ctx.output_f32, None, ctx.mesh.position, [vertex, two])?;
-    store(ctx, pointer, depth)
 }
 
 /// Hands the stage buffer to Vulkan: a task program's mesh workgroup count and payload, a
@@ -665,11 +668,7 @@ fn mesh_epilogue(ctx: &mut EmitContext<'_>) -> EmitResult<()> {
                     .access_chain(ctx.output_f32, None, ctx.mesh.point_size, [vertex])?;
             store(ctx, pointer, point_size)?;
         }
-        copy_lines(ctx, vertex, 0, false)?;
-        if convert {
-            convert_depth(ctx, vertex)?;
-        }
-        Ok(())
+        copy_lines(ctx, vertex, 0, false, convert)
     })?;
 
     let primitive_vertices = mesh.primitive_vertices();
@@ -705,7 +704,7 @@ fn mesh_epilogue(ctx: &mut EmitContext<'_>) -> EmitResult<()> {
                 ctx.b
                     .access_chain(index_pointer, None, ctx.mesh.primitive_indices, [primitive])?;
             store(ctx, pointer, value)?;
-            copy_lines(ctx, primitive, ctx.mesh.primitive_base, true)
+            copy_lines(ctx, primitive, ctx.mesh.primitive_base, true, false)
         })?;
     }
     Ok(())
