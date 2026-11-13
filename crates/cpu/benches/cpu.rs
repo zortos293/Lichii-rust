@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use lichii_common::settings::CpuBackend;
+use lichii_common::settings::{CpuAccuracy, CpuBackend};
 use lichii_cpu::{CpuConfig, GuestClock, HaltReason, ThreadContext, TscScale, new_core};
 use lichii_memory::{AddressSpace, ExclusiveMonitor, MemoryPermission, PhysicalMemory};
 
@@ -174,6 +174,7 @@ fn main() {
                 core_index: 0,
                 ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
                 dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+                accuracy: CpuAccuracy::Auto,
             },
         );
         let mut seconds = f64::MAX;

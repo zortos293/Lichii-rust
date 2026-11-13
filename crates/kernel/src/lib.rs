@@ -34,6 +34,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
+use lichii_common::settings::CpuAccuracy;
 use lichii_common::{ConsoleGeneration, HleResult, PAGE_SIZE, VAddr, align_up};
 use lichii_cpu::{CpuConfig, CpuCore};
 use lichii_loader::program::ProgramImage;
@@ -540,6 +541,7 @@ impl KernelInner {
             core_index: core,
             ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
             dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+            accuracy: CpuAccuracy::Auto,
         })
     }
 

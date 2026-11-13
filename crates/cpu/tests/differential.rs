@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use lichii_common::settings::CpuBackend;
+use lichii_common::settings::{CpuAccuracy, CpuBackend};
 use lichii_cpu::decoder::{Inst, decode};
 use lichii_cpu::{CpuConfig, CpuCore, GuestClock, HaltReason, ThreadContext, new_core};
 use lichii_memory::{AddressSpace, ExclusiveMonitor, MemoryPermission, PhysicalMemory};
@@ -201,6 +201,7 @@ impl Ours {
                 core_index: 0,
                 ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
                 dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+                accuracy: CpuAccuracy::Auto,
             },
         );
         let name = match backend {
