@@ -54,7 +54,7 @@ Each pass is a function `fn(&mut Block)`. They run in this order:
 2. **Constant folding and propagation**: folds pure ops on immediates, `ADRP + ADD` address chains, `MOVZ/MOVK` sequences and conditions on known flags. A `Branch` with a known condition becomes `Jump`.
 3. **Flag liveness**: removes the `Nzcv` outputs nobody reads before the next full write. Within a block that is the common case. Flags are live at every exit, including the barrier ops of pass 1, so this is the NZCV case of pass 1 followed by DCE. At block ends flags stay live unless the successor is known to overwrite them; that refinement comes later.
 4. **Dead code elimination**: drops pure ops with no users. Memory ops, atomics, calls and terminals are roots.
-5. **Peepholes for the backend**: fuses `SUBS`/`ADDS`/`ANDS` with the `TestCond` that consumes its flags into one x86 `cmp`/`test` + `jcc`/`setcc`/`cmovcc`, skipping the packed `Nzcv` value.
+5. **Peepholes for the backend**: fuses `SUBS`/`ADDS`/`ANDS` with the `TestCond` that consumes its flags into one x86 `cmp`/`test` + `jcc`/`setcc`/`cmovcc`, skipping the packed `Nzcv` value. The pass rewrites the `TestCond` into a `Compare` on the flag op's operands; the backend emits a `Compare` whose only user is a `Select` or the `Branch` right at that user and consumes the host flags there. `HI` and `LS` after an add or a test have no single x86 condition code, so they keep the packed path.
 
 Pass tests run each block both with and without each pass, through the backend, and compare results. That turns every pass into its own differential test.
 
