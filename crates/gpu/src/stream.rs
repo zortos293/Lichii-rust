@@ -284,12 +284,18 @@ impl Stream {
     }
 
     /// The front has nothing to do: hand the back everything, and run an inline back now.
-    pub(crate) fn idle(&mut self) {
+    /// Whether an inline back still holds fences whose host GPU work has not finished, so the
+    /// front should idle again soon; a back on its own thread polls them itself.
+    pub(crate) fn idle(&mut self) -> bool {
         self.flush_pending();
         self.producer.publish();
-        if let Link::Inline(back) = &mut self.link {
-            let (back, consumer) = &mut **back;
-            back.run(consumer);
+        match &mut self.link {
+            Link::Inline(back) => {
+                let (back, consumer) = &mut **back;
+                back.run(consumer);
+                back.poll_fences()
+            }
+            Link::Thread => false,
         }
     }
 
