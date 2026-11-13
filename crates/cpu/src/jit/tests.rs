@@ -1355,3 +1355,42 @@ fn lazy_flags_cross_linked_blocks() {
         directed(&FCCMP_LOOP, &[(0, a), (1, b), (9, 4)]);
     }
 }
+
+#[test]
+fn guest_stores_to_read_only_pages_fault_on_every_backend() {
+    const STR_X1_X2: u32 = 0xf900_0041;
+    const STADD_W1_X2: u32 = 0xb821_005f;
+    const DC_ZVA_X2: u32 = 0xd50b_7422;
+    let backends = [
+        ("interpreter", Backend::Interpreter),
+        ("jit", Backend::Jit(Passes::ALL)),
+        ("jit without fastmem", Backend::SlowJit),
+    ];
+    let data = vec![0; DATA_SIZE as usize];
+    for (name, backend) in backends {
+        let mut machine = Machine::new(backend);
+        for store in [STR_X1_X2, STADD_W1_X2, DC_ZVA_X2] {
+            let mut ctx = ThreadContext {
+                pc: CODE,
+                ..Default::default()
+            };
+            ctx.x[1] = 7;
+            ctx.x[2] = RODATA;
+            let outcome = machine.run(&[store, BRK], &ctx, &data);
+            assert_eq!(
+                outcome.halt,
+                HaltReason::Fault(crate::CpuFault::Data {
+                    pc: CODE,
+                    addr: RODATA,
+                    write: true
+                }),
+                "{name}: {store:#010x}"
+            );
+            assert_eq!(
+                machine.mem.read::<u64>(RODATA).unwrap(),
+                0,
+                "{name}: {store:#010x}"
+            );
+        }
+    }
+}

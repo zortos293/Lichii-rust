@@ -275,6 +275,7 @@ fn guest_icache_maintenance_invalidates_patched_code() {
         0xd5033fdf, // isb
         0xd61f0140, // br x10
     ]);
+    h.mem.protect(CODE, 0x1000, MemoryPermission(7));
     h.mem.write(target, 0xd4000041u32).unwrap(); // svc #2
     h.mem.write(target + 4, 0xd4000061u32).unwrap(); // svc #3
     h.ctx.pc = target;

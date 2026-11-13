@@ -200,6 +200,8 @@ pub struct Process {
     main_stack: Mutex<Option<(VAddr, u64)>>,
     max_memory: u64,
     pub(crate) shared_mappings: Mutex<Vec<(VAddr, Arc<SharedMemory>)>>,
+    /// Serializes mutex priority inheritance between the process's threads.
+    pub(crate) inheritance: Mutex<()>,
 }
 
 pub(crate) struct NewProcess<'a> {
@@ -269,6 +271,7 @@ impl Process {
             main_stack: Mutex::new(None),
             max_memory,
             shared_mappings: Mutex::new(Vec::new()),
+            inheritance: Mutex::new(()),
         }))
     }
 
