@@ -337,15 +337,13 @@ pub enum Terminal {
         taken: u64,
         not_taken: u64,
     },
-    /// The instruction at this address is not translated; the interpreter runs it next.
-    Interpret(u64),
 }
 
 impl Terminal {
     pub fn for_each_arg(&mut self, mut f: impl FnMut(&mut Value)) {
         match self {
             Terminal::JumpIndirect(v) | Terminal::Branch { cond: v, .. } => f(v),
-            Terminal::Jump(_) | Terminal::Interpret(_) => {}
+            Terminal::Jump(_) => {}
         }
     }
 }
