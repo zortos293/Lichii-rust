@@ -37,6 +37,9 @@ pub enum InputMsg {
     Mirror(bool),
     /// Rumble player `n`'s pad briefly at its configured strength.
     TestRumble(usize),
+    /// Answered at the end of the pass that handled every message sent before it.
+    #[cfg(test)]
+    Sync(Sender<()>),
 }
 
 /// What the input thread reports back.
@@ -95,6 +98,8 @@ impl InputWorker {
                     };
                     let mut reconfigure = false;
                     let mut applied = Vec::new();
+                    #[cfg(test)]
+                    let mut synced = Vec::new();
                     for msg in first.into_iter().chain(rx.try_iter()) {
                         match msg {
                             InputMsg::Key(key, down) => host.keys.set(key, down),
@@ -129,6 +134,8 @@ impl InputWorker {
                                     sdl.rumble(pad, motor, motor, TEST_RUMBLE_MS);
                                 }
                             }
+                            #[cfg(test)]
+                            InputMsg::Sync(done) => synced.push(done),
                         }
                     }
                     if let Some(sdl) = &mut sdl
@@ -193,6 +200,10 @@ impl InputWorker {
                         }
                         *was_held = now;
                     }
+                    #[cfg(test)]
+                    for done in synced {
+                        let _ = done.send(());
+                    }
                 }
             })
             .expect("spawning the input thread");
@@ -233,13 +244,15 @@ impl Drop for InputWorker {
 mod tests {
     use super::*;
     use lichii_common::settings::Settings;
-    use std::time::Instant;
 
-    fn wait_for(mut done: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !done() {
-            assert!(Instant::now() < deadline, "timed out");
-            std::thread::sleep(Duration::from_millis(2));
+    impl InputWorker {
+        /// Returns once the input thread finished a whole pass over everything sent before:
+        /// published the players, mirrored the host input and fired the combos.
+        fn sync(&self) {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            self.send(InputMsg::Sync(tx));
+            rx.recv_timeout(Duration::from_secs(60))
+                .expect("the input thread stopped answering");
         }
     }
 
@@ -259,31 +272,34 @@ mod tests {
         );
         let key = |n| Key::from_name(n).unwrap();
         worker.send(InputMsg::Key(key("KeyC"), true));
-        wait_for(|| worker.hub().read(0).connected);
+        worker.sync();
+        assert!(worker.hub().read(0).connected);
         assert!(worker.hub().read(0).buttons.is_empty());
         worker.send(InputMsg::GuestInput(true));
-        wait_for(|| worker.hub().read(0).buttons.contains(NpadButtons::A));
+        worker.sync();
+        assert!(worker.hub().read(0).buttons.contains(NpadButtons::A));
         worker.send(InputMsg::GuestInput(false));
-        wait_for(|| worker.hub().read(0).buttons.is_empty());
+        worker.sync();
+        assert!(worker.hub().read(0).buttons.is_empty());
 
         worker.send(InputMsg::Key(key("Backspace"), true));
         worker.send(InputMsg::Key(key("KeyM"), true));
-        wait_for(|| !fired.lock().unwrap().is_empty());
-        std::thread::sleep(POLL * 5);
+        worker.sync();
         assert_eq!(*fired.lock().unwrap(), [HotkeyAction::ContinuePause]);
+        worker.sync();
+        assert_eq!(
+            *fired.lock().unwrap(),
+            [HotkeyAction::ContinuePause],
+            "a combo still held does not fire again"
+        );
 
         worker.send(InputMsg::Mirror(true));
-        wait_for(|| {
-            worker
-                .shared()
-                .lock()
-                .unwrap()
-                .host
-                .as_ref()
-                .is_some_and(|h| h.keys.is_down(key("KeyC")))
-        });
+        worker.sync();
+        let mirrored = worker.shared().lock().unwrap().host.clone();
+        assert!(mirrored.is_some_and(|h| h.keys.is_down(key("KeyC"))));
         worker.send(InputMsg::ReleaseAll);
-        wait_for(|| worker.hub().read(0).buttons.is_empty());
+        worker.sync();
+        assert!(worker.hub().read(0).buttons.is_empty());
         assert!(!worker.hub().read(1).connected);
     }
 }
