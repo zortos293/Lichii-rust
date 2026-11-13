@@ -3164,8 +3164,11 @@ fn task_programs_launch_the_mesh_workgroups_they_count() {
 const GEOMETRY: u64 = PROGRAMS + 0x3000;
 const PRIMITIVE_FRAGMENT: u64 = PROGRAMS + 0x4000;
 
+/// The fragment program reads generic 0, which the geometry header bound with the mesh program
+/// makes per-primitive: it translates with a PerPrimitiveEXT input and the draw builds its
+/// pipeline.
 #[test]
-fn per_primitive_fragment_inputs_skip_the_draw() {
+fn per_primitive_fragment_inputs_draw() {
     let Some((mut f, gmmu)) = mesh_fixture() else {
         return;
     };
@@ -3193,12 +3196,8 @@ fn per_primitive_fragment_inputs_skip_the_draw() {
     bind_program(&mut regs, 5, ShaderType::PIXEL, PRIMITIVE_FRAGMENT);
     mesh_draw(&mut f, &gmmu, &regs, 1);
     let stats = f.rasterizer.draw.shaders.stats();
-    assert_eq!(
-        (stats.translated, stats.failed),
-        (2, 1),
-        "the fragment program reads generic 0, which the geometry header makes per-primitive"
-    );
-    assert_eq!(f.rasterizer.draw.pipelines.stats().built, 0);
+    assert_eq!((stats.translated, stats.failed), (2, 0));
+    assert_eq!(f.rasterizer.draw.pipelines.stats().built, 1);
     f.assert_no_validation_errors();
 }
 
