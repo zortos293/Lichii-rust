@@ -49,7 +49,7 @@ impl PageSlot {
     fn mirror(&self, id: u32) {
         let page = self.0.lock().clone();
         if let Some(page) = page {
-            page.mirror(id);
+            page.slot_mirror(id);
         }
     }
 }
@@ -99,13 +99,14 @@ struct Page {
     watches: Mutex<Watches>,
 }
 
-/// Syncpoints with an action registered for their next increment, and those whose watched
-/// increment came: a slot signal may have mirrored the value already, so the page value alone
-/// cannot tell that the wait is answered.
+/// Syncpoints with an action registered for their next increment, and those whose page value
+/// changed since a wait on them was last answered (a watched increment, or a slot signal that
+/// mirrored first). A wait on a fresh id is answered even when the page value looks current: the
+/// client may have read it before the change.
 #[derive(Default)]
 struct Watches {
     watching: [u64; WORDS],
-    incremented: [u64; WORDS],
+    fresh: [u64; WORDS],
     handles: HashMap<u32, ActionHandle>,
 }
 
@@ -180,6 +181,15 @@ impl Page {
         Some((value, changed))
     }
 
+    /// Mirrors a syncpoint a slot request reached, and marks it fresh so a wait on it that the
+    /// server has not seen yet is answered.
+    fn slot_mirror(&self, id: u32) {
+        let mut watches = self.watches.lock();
+        if let Some((_, true)) = self.mirror(id) {
+            watches.fresh[id as usize / 64] |= 1 << (id % 64);
+        }
+    }
+
     /// Answers every armed wait whose page value is stale, and watches the rest.
     fn serve(self: &Arc<Self>) {
         self.request.clear();
@@ -188,14 +198,12 @@ impl Page {
         {
             let mut watches = self.watches.lock();
             let Watches {
-                watching,
-                incremented,
-                ..
+                watching, fresh, ..
             } = &mut *watches;
             let words = self.count.div_ceil(64) as usize;
-            for (word, (watching, incremented)) in watching
+            for (word, (watching, fresh)) in watching
                 .iter_mut()
-                .zip(incremented.iter_mut())
+                .zip(fresh.iter_mut())
                 .enumerate()
                 .take(words)
             {
@@ -209,7 +217,7 @@ impl Page {
                     pending &= !bit;
                     let id = word as u32 * 64 + bit.trailing_zeros();
                     match self.mirror(id) {
-                        Some((value, false)) if *incremented & bit == 0 => {
+                        Some((value, false)) if *fresh & bit == 0 => {
                             if *watching & bit == 0 {
                                 *watching |= bit;
                                 watch.push((id, value));
@@ -218,7 +226,7 @@ impl Page {
                         _ => answer |= bit,
                     }
                 }
-                *incremented = 0;
+                *fresh &= !answer;
                 if answer != 0 {
                     self.write(acknowledged_at, acknowledged ^ answer);
                     answered = true;
@@ -254,7 +262,7 @@ impl Page {
             let mut watches = self.watches.lock();
             let (word, bit) = (id as usize / 64, 1u64 << (id % 64));
             watches.watching[word] &= !bit;
-            watches.incremented[word] |= bit;
+            watches.fresh[word] |= bit;
             watches.handles.remove(&id);
         }
         self.serve();

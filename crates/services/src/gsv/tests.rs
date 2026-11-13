@@ -271,3 +271,21 @@ fn slots_past_the_page_count_leave_the_page_alone() {
     guest.increment(600).unwrap();
     assert_eq!(page.value(600), 0);
 }
+
+#[test]
+fn a_wait_armed_before_a_slot_mirrors_is_answered_when_the_request_comes() {
+    let (context, page) = syncpt_page();
+    let guest = context.gpu.host1x().syncpoints.guest();
+    let syncpt = session(&page.client, page.gsv, 202);
+    let request = Request::tipc(201).arg(0u32).arg(!9u32).arg(1u64).arg(0u32);
+    page.client.send(syncpt, &request).unwrap();
+    let address = page.rw + 0x100;
+    let memory = page.client.process().memory();
+    let bits: u64 = memory.read(address).unwrap();
+    memory.write(address, bits ^ (1 << 9)).unwrap();
+    guest.increment(9).unwrap();
+    assert_eq!(page.value(9), 1, "the slot mirrored the value");
+    page.request.signal();
+    assert!(page.acknowledged(9));
+    assert!(page.notify.is_signaled());
+}
