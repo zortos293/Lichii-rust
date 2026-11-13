@@ -3,7 +3,7 @@
 //! they type it, and Enter or OK submits it.
 
 use egui::text::{CCursor, CCursorRange};
-use egui::{Align2, Key, RichText};
+use egui::{Align2, Event, Key, RichText};
 use lichii_services::applets::{InlineKeyboardAppear, InlineKeyboardEvent, InlineKeyboardReply};
 
 /// Sends one reply to the title.
@@ -81,32 +81,51 @@ impl InlineKeyboard {
         utf16_len(&self.text) >= self.appear.min_length as usize
     }
 
-    /// Keeps what the title accepts: digits on the number pad and at most `max_length` units.
-    fn accept(&self, mut text: String) -> String {
-        if self.appear.kind == NUMBER_PAD {
-            text.retain(|c| c.is_ascii_digit());
+    /// Keeps what the title accepts from `raw`: digits on the number pad, newlines only with
+    /// return, and at most `max_length` units. The char cursor `at` moves with the kept text.
+    fn accept(&self, raw: &str, at: usize) -> (String, usize) {
+        let max = self.appear.max_length.max(1) as usize;
+        let (mut text, mut cursor, mut units) = (String::new(), 0, 0);
+        for (index, c) in raw.chars().enumerate() {
+            let allowed = (self.appear.kind != NUMBER_PAD || c.is_ascii_digit())
+                && (self.appear.return_enabled || c != '\n');
+            if !allowed || units + c.len_utf16() > max {
+                continue;
+            }
+            text.push(c);
+            units += c.len_utf16();
+            if index < at {
+                cursor += 1;
+            }
         }
-        if !self.appear.return_enabled {
-            text.retain(|c| c != '\n');
-        }
-        let max = self.appear.max_length.max(1) as i32;
-        text.truncate(
-            text.char_indices()
-                .nth(char_at(&text, max))
-                .map_or(text.len(), |(i, _)| i),
-        );
-        text
+        (text, cursor)
     }
 
     /// Draws the keyboard. Returns whether the user submitted or cancelled, which hides it.
     pub fn show(&mut self, ctx: &egui::Context) -> bool {
         let id = egui::Id::unique("inline keyboard text");
-        let focus = std::mem::take(&mut self.place_cursor);
-        if focus {
+        let set_cursor = |ctx: &egui::Context, at: usize| {
             let mut state = egui::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
-            let at = CCursor::new(char_at(&self.text, self.cursor));
-            state.cursor.set_char_range(Some(CCursorRange::one(at)));
+            state
+                .cursor
+                .set_char_range(Some(CCursorRange::one(CCursor::new(at))));
             state.store(ctx, id);
+        };
+        if std::mem::take(&mut self.place_cursor) {
+            set_cursor(ctx, char_at(&self.text, self.cursor));
+        }
+        if !self.appear.backspace_enabled {
+            ctx.input_mut(|i| {
+                i.events.retain(|e| {
+                    !matches!(
+                        e,
+                        Event::Key {
+                            key: Key::Backspace,
+                            ..
+                        }
+                    )
+                });
+            });
         }
         let (enter, escape) =
             ctx.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
@@ -123,24 +142,28 @@ impl InlineKeyboard {
                         egui::TextEdit::singleline(&mut text)
                     };
                     let output = edit.id(id).desired_width(f32::INFINITY).show(ui);
-                    if focus {
-                        output.response.request_focus();
-                    }
-                    let cursor = output
+                    let at = output
                         .cursor_range
-                        .map_or(self.cursor, |range| utf16_at(&text, range.primary.index.0));
-                    if output.response.changed() {
-                        self.text = self.accept(text);
-                        self.cursor = cursor.min(utf16_len(&self.text) as i32);
-                        (self.reply)(InlineKeyboardReply::ChangedString {
-                            text: self.text.clone(),
-                            cursor: self.cursor,
+                        .map_or(char_at(&self.text, self.cursor), |range| {
+                            range.primary.index.0
                         });
-                    } else if cursor != self.cursor {
-                        self.cursor = cursor;
+                    if output.response.changed() {
+                        let (accepted, at) = self.accept(&text, at);
+                        set_cursor(ui.ctx(), at);
+                        let cursor = utf16_at(&accepted, at);
+                        if accepted != self.text || cursor != self.cursor {
+                            self.text = accepted;
+                            self.cursor = cursor;
+                            (self.reply)(InlineKeyboardReply::ChangedString {
+                                text: self.text.clone(),
+                                cursor,
+                            });
+                        }
+                    } else if utf16_at(&text, at) != self.cursor {
+                        self.cursor = utf16_at(&text, at);
                         (self.reply)(InlineKeyboardReply::MovedCursor {
                             text: self.text.clone(),
-                            cursor,
+                            cursor: self.cursor,
                         });
                     }
                     ui.horizontal(|ui| {
@@ -165,7 +188,7 @@ impl InlineKeyboard {
                         let max = self.appear.max_length.max(1);
                         ui.label(RichText::new(format!("{}/{max}", utf16_len(&self.text))).weak());
                     });
-                    if decided.is_none() && output.response.lost_focus() {
+                    if decided.is_none() && !output.response.has_focus() {
                         output.response.request_focus();
                     }
                 });
@@ -305,6 +328,65 @@ mod tests {
             replies.try_recv().is_err(),
             "a hidden keyboard sends nothing"
         );
+    }
+
+    #[test]
+    fn the_keyboard_takes_focus_back_after_a_dialog() {
+        let mut ui = Harness::new();
+        let replies = open(&mut ui, appear("ab"));
+        let answer = ui.ask(|frontend| {
+            frontend.select_profile(&lichii_services::applets::ProfileSelectRequest::default())
+        });
+        for _ in 0..3 {
+            ui.frame(Vec::new());
+        }
+        ui.key(Key::Escape);
+        assert_eq!(
+            answer.join().unwrap(),
+            lichii_services::applets::ProfileSelectAnswer::Cancelled
+        );
+        assert!(replies.try_recv().is_err(), "Escape went to the dialog");
+        ui.frame(Vec::new());
+        ui.typed("c");
+        assert_eq!(replies.try_recv(), Ok(changed("abc", 3)));
+    }
+
+    #[test]
+    fn backspace_works_only_when_the_title_allows_it() {
+        let mut ui = Harness::new();
+        let replies = open(&mut ui, appear("ab"));
+        ui.key(Key::Backspace);
+        assert!(replies.try_recv().is_err());
+        let mut ui = Harness::new();
+        let replies = open(
+            &mut ui,
+            InlineKeyboardAppear {
+                backspace_enabled: true,
+                ..appear("ab")
+            },
+        );
+        ui.key(Key::Backspace);
+        assert_eq!(replies.try_recv(), Ok(changed("a", 1)));
+    }
+
+    #[test]
+    fn a_rejected_character_leaves_the_cursor_in_place() {
+        let mut ui = Harness::new();
+        let replies = open(
+            &mut ui,
+            InlineKeyboardAppear {
+                kind: NUMBER_PAD,
+                cursor: 1,
+                ..appear("12")
+            },
+        );
+        ui.typed("a");
+        assert!(
+            replies.try_recv().is_err(),
+            "nothing the title accepts changed"
+        );
+        ui.typed("3");
+        assert_eq!(replies.try_recv(), Ok(changed("132", 2)));
     }
 
     #[test]
