@@ -15,19 +15,25 @@
 //! written back to guest memory when a flush asks. Render targets that may scale (Lichii's
 //! rules: 2D, one level, taller than 288 rows, or 512 for downscaling) render at the configured
 //! resolution scale and are scaled back down on flush.
+//!
+//! Once per presented frame [`TextureCache::tick_frame`] runs the collector: past thresholds
+//! from the driver's memory budget and the VRAM usage setting, it evicts the least recently
+//! used images with bounded work per frame. GPU-modified ones are read back without a GPU wait
+//! and reach guest memory before they go.
 
+mod clear;
 mod convert;
 mod info;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
 use ash::vk;
 use gpu_allocator::MemoryLocation;
-use lichii_common::settings::{AstcRecompression, ResolutionScale};
+use lichii_common::settings::{AstcRecompression, ResolutionScale, VramUsage};
 use lichii_common::{DAddr, GpuVAddr};
 use lichii_gpu::backend::FramebufferConfig;
 use lichii_gpu::gmmu::{Gmmu, RangeTarget};
@@ -42,9 +48,10 @@ use crate::commands::{ImageAccess, transfer_to_all_barrier, transition};
 use crate::device::Device;
 use crate::error::Result;
 use crate::format::{Conversion, HostFormat, host_format};
-use crate::memory::{Buffer, Image, ImageDesc, ImageView, aspect_of};
+use crate::memory::{Buffer, Image, ImageDesc, ImageView, MemoryUsage, aspect_of};
 use crate::scheduler::Scheduler;
 use crate::staging::StagingRing;
+use clear::ClearPipelines;
 
 /// Device memory is indexed in pages of this many bits (Lichii's texture cache uses 1 MiB).
 const PAGE_BITS: u32 = 20;
@@ -53,6 +60,21 @@ const PAGE_BITS: u32 = 20;
 const MAX_TEXELS: u64 = 1 << 28;
 /// The lookup table is emptied when it grows past this many entries.
 const MAX_LOOKUPS: usize = 1 << 16;
+
+/// No neighbour in the LRU list.
+const NIL: u32 = u32::MAX;
+/// Frames an image must go unused before the collector may evict it, while device memory use
+/// is under the retention line (images of the last few seconds stay) and past it.
+const OLD_AGE: u64 = 150;
+const RECENT_AGE: u64 = 10;
+/// Images the collector evicts per frame at most, in normal and aggressive mode; it looks at
+/// [`VISITS_PER_EVICTION`] times as many at most.
+const NORMAL_EVICTIONS: u32 = 20;
+const AGGRESSIVE_EVICTIONS: u32 = 40;
+const VISITS_PER_EVICTION: u32 = 8;
+/// Readback bytes of GPU-modified images the collector starts flushing per frame (always at
+/// least one image).
+const MAX_FLUSH_BYTES: u64 = 16 << 20;
 
 /// Depth/stencil attachment access for clears through dynamic rendering.
 const DEPTH_ATTACHMENT: ImageAccess = ImageAccess {
@@ -112,11 +134,17 @@ impl Rect {
 /// What a clear writes.
 #[derive(Clone, Copy)]
 pub enum ClearValue {
-    Color(vk::ClearColorValue),
-    /// Depth and stencil values; `None` keeps that aspect.
+    /// A colour in the target's numeric type, written to the components in `mask`.
+    Color {
+        value: vk::ClearColorValue,
+        mask: vk::ColorComponentFlags,
+    },
+    /// Depth and stencil values; `None` keeps that aspect, and only the stencil bits set in
+    /// `stencil_mask` are written.
     DepthStencil {
         depth: Option<f32>,
         stencil: Option<u8>,
+        stencil_mask: u8,
     },
 }
 
@@ -130,6 +158,63 @@ pub struct ImageState {
     pub scale: ResolutionScale,
     pub gpu_modified: bool,
     pub cpu_dirty: bool,
+}
+
+/// What the collector did since the cache was created.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CollectorStats {
+    /// Images evicted, and the device memory they held.
+    pub evicted: u64,
+    pub evicted_bytes: u64,
+    /// Evicted images that were GPU-modified and written back to guest memory first.
+    pub flushed: u64,
+}
+
+/// Device memory use past which the collector runs (`expected`), turns aggressive
+/// (`critical`), and also evicts images used in the last [`OLD_AGE`] frames (`retain`). All
+/// follow the driver's budget (NX2_NOTES row 119) less a margin of an eighth of it, at most
+/// 1 GiB. Conservative VRAM use also caps the critical line at 5/8 of the budget or 5 GiB,
+/// whichever is more, as Lichii does: past what a frame needs, more memory only keeps earlier
+/// scenes' textures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Thresholds {
+    expected: u64,
+    critical: u64,
+    retain: u64,
+}
+
+impl Thresholds {
+    fn new(budget: u64, vram_usage: VramUsage) -> Self {
+        let margin = (budget / 8).min(1 << 30);
+        let retain = budget - margin;
+        let critical = match vram_usage {
+            VramUsage::Conservative => retain.min((budget / 8 * 5).max(5 << 30)),
+            VramUsage::Aggressive => retain,
+        };
+        Self {
+            expected: critical - margin.min(critical / 2),
+            critical,
+            retain,
+        }
+    }
+}
+
+/// A copy of an image into a readback buffer at `offset`; `modified` is the image's last GPU
+/// write when it was recorded.
+#[derive(Clone, Copy)]
+struct Download {
+    id: ImageId,
+    offset: u64,
+    modified: u64,
+}
+
+/// The collector's readback of GPU-modified images, submitted at `tick` in frame `frame`,
+/// holding `bytes` of device memory.
+#[derive(Clone, Copy)]
+struct PendingEvictions {
+    tick: u64,
+    frame: u64,
+    bytes: u64,
 }
 
 /// A run of the image's guest bytes that is contiguous in device memory.
@@ -167,11 +252,36 @@ struct CachedImage {
     /// Order of the last GPU write, for aliasing.
     modified: u64,
     visit: u64,
+    /// Frame of the last use, for the collector.
+    last_use: u64,
 }
 
 impl CachedImage {
     fn base(&self) -> DAddr {
         self.segments[0].daddr
+    }
+
+    /// Whether the guest format can be written back from the host image.
+    fn downloadable(&self) -> bool {
+        !matches!(
+            self.host.conversion,
+            Conversion::Decode | Conversion::DecodeToBc(_)
+        )
+    }
+
+    /// Bytes a native-resolution readback of the image takes, and their alignment.
+    fn readback_size(&self) -> (u64, u64) {
+        let format = self.info.format;
+        let align = alignment(&self.host, format);
+        let mut total = 0u64;
+        for _ in 0..self.info.layers {
+            for level in 0..self.image.desc().mip_levels {
+                let layout =
+                    convert::host_layout(format, &self.host, self.info.level_extent(level));
+                total = total.next_multiple_of(align) + layout.total() as u64;
+            }
+        }
+        (total, align)
     }
 
     fn contiguous(&self) -> bool {
@@ -265,6 +375,9 @@ struct LookupEntry {
 struct Slot {
     generation: u32,
     image: Option<CachedImage>,
+    /// Neighbours in the LRU list, least recently used first.
+    prev: u32,
+    next: u32,
 }
 
 /// Scratch memory kept between calls, so steady-state uploads and downloads allocate nothing.
@@ -294,6 +407,20 @@ pub struct TextureCache {
     segments: Vec<Segment>,
     scratch: Scratch,
     readback: Option<Buffer>,
+    downloads: Vec<Download>,
+    clear_pipelines: Option<ClearPipelines>,
+    vram_usage: VramUsage,
+    /// Frames presented so far.
+    frame: u64,
+    lru_head: u32,
+    lru_tail: u32,
+    /// Device memory of evicted images the GPU may still use, by the tick that frees it.
+    sentenced: VecDeque<(u64, u64)>,
+    sentenced_bytes: u64,
+    pending: Option<PendingEvictions>,
+    pending_downloads: Vec<Download>,
+    eviction_readback: Option<Buffer>,
+    stats: CollectorStats,
 }
 
 fn components(swizzle: [SwizzleSource; 4], host: vk::ComponentMapping) -> vk::ComponentMapping {
@@ -424,6 +551,18 @@ impl TextureCache {
             segments: Vec::new(),
             scratch: Scratch::default(),
             readback: None,
+            downloads: Vec::new(),
+            clear_pipelines: None,
+            vram_usage: VramUsage::default(),
+            frame: 0,
+            lru_head: NIL,
+            lru_tail: NIL,
+            sentenced: VecDeque::new(),
+            sentenced_bytes: 0,
+            pending: None,
+            pending_downloads: Vec::new(),
+            eviction_readback: None,
+            stats: CollectorStats::default(),
         }
     }
 
@@ -445,6 +584,15 @@ impl TextureCache {
     pub fn set_astc_recompression(&mut self, recompression: AstcRecompression) {
         self.recompression = recompression;
         self.host_formats.fill(None);
+    }
+
+    /// How much of the device budget the collector lets images use.
+    pub fn set_vram_usage(&mut self, vram_usage: VramUsage) {
+        self.vram_usage = vram_usage;
+    }
+
+    pub fn collector_stats(&self) -> CollectorStats {
+        self.stats
     }
 
     /// The host format of a guest format, queried from the device once.
@@ -630,6 +778,7 @@ impl TextureCache {
         access: ImageAccess,
     ) -> vk::Image {
         let device = self.device.clone();
+        self.touch(id);
         let image = self.image(id);
         image.transition(&device, cmd, access);
         image.image.raw()
@@ -658,7 +807,8 @@ impl TextureCache {
         let mut result = Ok(());
         for &id in &ids {
             if self.image(id).gpu_modified {
-                let written_back = self.download(tx, id, Some((daddr, daddr.saturating_add(size))));
+                let written_back =
+                    self.download(tx, &[id], Some((daddr, daddr.saturating_add(size))));
                 result = result.and(written_back);
             }
             let image = self.image(id);
@@ -679,9 +829,7 @@ impl TextureCache {
         }]);
         let mut modified = std::mem::take(&mut self.ids);
         modified.retain(|&id| self.get(id).is_some_and(|i| i.gpu_modified));
-        let result = modified
-            .iter()
-            .try_for_each(|&id| self.download(tx, id, None));
+        let result = self.download(tx, &modified, None);
         modified.clear();
         self.ids = modified;
         result
@@ -755,8 +903,10 @@ impl TextureCache {
             .max_by_key(|&id| self.get(id).map_or(0, |i| i.modified))
     }
 
-    /// Clears a render target (level `target.level`, layers `target.layer + base_layer` on)
-    /// inside `rect`, and marks it GPU-modified.
+    /// Clears a render target (level `target.level`, layers or 3D slices `target.layer +
+    /// base_layer` on) inside `rect`, writing only what `value` masks in, and marks it
+    /// GPU-modified. Whole unmasked clears are transfer clears; partial ones render into the
+    /// target, through a masked-clear pipeline when channels or stencil bits are masked.
     pub fn clear(
         &mut self,
         tx: &mut Transfer<'_>,
@@ -767,6 +917,7 @@ impl TextureCache {
         layer_count: u32,
     ) -> Result<()> {
         let device = self.device.clone();
+        self.touch(target.id);
         let image = self.image(target.id);
         let level = target.level;
         let extent = image.host_extent(level);
@@ -778,16 +929,31 @@ impl TextureCache {
         let y0 = scale(rect.y).min(extent.height);
         let x1 = scale(rect.x.saturating_add(rect.width)).min(extent.width);
         let y1 = scale(rect.y.saturating_add(rect.height)).min(extent.height);
-        let layers = image.image.desc().array_layers;
-        let first_layer = (target.layer + base_layer).min(layers);
-        let layer_count = layer_count.min(layers - first_layer);
-        if x1 <= x0 || y1 <= y0 || layer_count == 0 {
+        let volume = image.info.kind == ImageKind::D3;
+        let slices = if volume {
+            extent.depth
+        } else {
+            image.image.desc().array_layers
+        };
+        let first = (target.layer + base_layer).min(slices);
+        let count = layer_count.min(slices - first);
+        if x1 <= x0 || y1 <= y0 || count == 0 {
             return Ok(());
         }
-        let image_aspects = aspect_of(image.host.format);
-        let aspects = match value {
-            ClearValue::Color(_) => vk::ImageAspectFlags::COLOR,
-            ClearValue::DepthStencil { depth, stencil } => {
+        let format = image.host.format;
+        let numeric = image.info.format.numeric();
+        let attachable = image.host.attachable;
+        let image_aspects = aspect_of(format);
+        let (aspects, masked) = match value {
+            ClearValue::Color { mask, .. } => (
+                vk::ImageAspectFlags::COLOR,
+                mask != vk::ColorComponentFlags::RGBA,
+            ),
+            ClearValue::DepthStencil {
+                depth,
+                stencil,
+                stencil_mask,
+            } => {
                 let mut a = vk::ImageAspectFlags::empty();
                 if depth.is_some() {
                     a |= vk::ImageAspectFlags::DEPTH;
@@ -795,24 +961,32 @@ impl TextureCache {
                 if stencil.is_some() {
                     a |= vk::ImageAspectFlags::STENCIL;
                 }
-                a & image_aspects
+                let a = a & image_aspects;
+                (
+                    a,
+                    a.contains(vk::ImageAspectFlags::STENCIL) && stencil_mask != 0xff,
+                )
             }
         };
         if aspects.is_empty() {
             return Ok(());
         }
-        let whole = x0 == 0 && y0 == 0 && x1 == extent.width && y1 == extent.height;
+        let whole = x0 == 0
+            && y0 == 0
+            && x1 == extent.width
+            && y1 == extent.height
+            && (!volume || count == slices);
+        if !(whole && !masked) && !attachable {
+            tracing::warn!(
+                format = ?image.info.format,
+                "partial clear of an image that cannot be an attachment; dropped"
+            );
+            return Ok(());
+        }
         let cmd = tx.scheduler.record()?;
-        let range = vk::ImageSubresourceRange {
-            aspect_mask: aspects,
-            base_mip_level: level,
-            level_count: 1,
-            base_array_layer: first_layer,
-            layer_count,
-        };
         let (color, depth_stencil) = match value {
-            ClearValue::Color(color) => (color, vk::ClearDepthStencilValue::default()),
-            ClearValue::DepthStencil { depth, stencil } => (
+            ClearValue::Color { value, .. } => (value, vk::ClearDepthStencilValue::default()),
+            ClearValue::DepthStencil { depth, stencil, .. } => (
                 vk::ClearColorValue::default(),
                 vk::ClearDepthStencilValue {
                     depth: depth.unwrap_or(0.0),
@@ -820,11 +994,19 @@ impl TextureCache {
                 },
             ),
         };
-        if whole {
+        let color_target = aspects == vk::ImageAspectFlags::COLOR;
+        if whole && !masked {
+            let range = vk::ImageSubresourceRange {
+                aspect_mask: aspects,
+                base_mip_level: level,
+                level_count: 1,
+                base_array_layer: if volume { 0 } else { first },
+                layer_count: if volume { 1 } else { count },
+            };
             image.transition(&device, cmd, ImageAccess::TRANSFER_DST);
             // SAFETY: the image is in TRANSFER_DST layout and the range lies inside it.
             unsafe {
-                if aspects == vk::ImageAspectFlags::COLOR {
+                if color_target {
                     device.raw.cmd_clear_color_image(
                         cmd,
                         image.image.raw(),
@@ -842,49 +1024,106 @@ impl TextureCache {
                     );
                 }
             }
-        } else if image.host.attachable && image.info.kind != ImageKind::D3 {
-            let format = image.host.format;
+            self.mark_modified(target.id);
+            return Ok(());
+        }
+        image.transition(
+            &device,
+            cmd,
+            if color_target {
+                ImageAccess::COLOR_ATTACHMENT
+            } else {
+                DEPTH_ATTACHMENT
+            },
+        );
+        let layout = image.access.layout;
+        let pipeline = if masked {
+            if self.clear_pipelines.is_none() {
+                self.clear_pipelines = Some(ClearPipelines::new(&device)?);
+            }
+            let pipelines = self.clear_pipelines.as_mut().expect("just created");
+            Some(match value {
+                ClearValue::Color { mask, .. } => pipelines.color(format, numeric, mask)?,
+                ClearValue::DepthStencil {
+                    depth,
+                    stencil_mask,
+                    ..
+                } => pipelines.depth_stencil(
+                    format,
+                    depth.is_some() && image_aspects.contains(vk::ImageAspectFlags::DEPTH),
+                    stencil_mask,
+                )?,
+            })
+        } else {
+            None
+        };
+        let words = match value {
+            // SAFETY: every field of the union is four 32-bit words.
+            ClearValue::Color { value, .. } => unsafe { value.uint32 },
+            ClearValue::DepthStencil { depth, .. } => [depth.unwrap_or(0.0).to_bits(), 0, 0, 0],
+        };
+        let stencil_reference = match value {
+            ClearValue::Color { .. } => None,
+            ClearValue::DepthStencil { stencil, .. } => stencil,
+        };
+        let area = vk::Rect2D {
+            offset: vk::Offset2D {
+                x: x0 as i32,
+                y: y0 as i32,
+            },
+            extent: vk::Extent2D {
+                width: x1 - x0,
+                height: y1 - y0,
+            },
+        };
+        let render_area = vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent: vk::Extent2D {
+                width: extent.width,
+                height: extent.height,
+            },
+        };
+        let clear = [vk::ClearAttachment {
+            aspect_mask: aspects,
+            color_attachment: 0,
+            clear_value: if color_target {
+                vk::ClearValue { color }
+            } else {
+                vk::ClearValue { depth_stencil }
+            },
+        }];
+        let per_pass = if masked || volume { 1 } else { count };
+        let view_type = if per_pass == 1 {
+            vk::ImageViewType::TYPE_2D
+        } else {
+            vk::ImageViewType::TYPE_2D_ARRAY
+        };
+        let mut layer = first;
+        while layer < first + count {
+            let layers = per_pass.min(first + count - layer);
             let key = ViewKey {
                 format: format.as_raw(),
-                view_type: vk::ImageViewType::TYPE_2D_ARRAY.as_raw(),
+                view_type: view_type.as_raw(),
                 components: [0; 4],
                 aspect: image_aspects.as_raw(),
                 base_level: level,
                 levels: 1,
-                base_layer: 0,
+                base_layer: layer,
                 layers,
             };
             let view = self.view_for(
                 target.id,
                 key,
                 format,
-                vk::ImageViewType::TYPE_2D_ARRAY,
+                view_type,
                 vk::ComponentMapping::default(),
             )?;
-            let image = self.image(target.id);
-            let color_target = aspects == vk::ImageAspectFlags::COLOR;
-            image.transition(
-                &device,
-                cmd,
-                if color_target {
-                    ImageAccess::COLOR_ATTACHMENT
-                } else {
-                    DEPTH_ATTACHMENT
-                },
-            );
             let attachment = vk::RenderingAttachmentInfo::default()
                 .image_view(view)
-                .image_layout(image.access.layout)
+                .image_layout(layout)
                 .load_op(vk::AttachmentLoadOp::LOAD)
                 .store_op(vk::AttachmentStoreOp::STORE);
             let colors = [attachment];
-            let render_area = vk::Rect2D {
-                offset: vk::Offset2D::default(),
-                extent: vk::Extent2D {
-                    width: extent.width,
-                    height: extent.height,
-                },
-            };
             let mut info = vk::RenderingInfo::default()
                 .render_area(render_area)
                 .layer_count(layers);
@@ -898,42 +1137,26 @@ impl TextureCache {
                     info = info.stencil_attachment(&attachment);
                 }
             }
-            let clear = [vk::ClearAttachment {
-                aspect_mask: aspects,
-                color_attachment: 0,
-                clear_value: if color_target {
-                    vk::ClearValue { color }
-                } else {
-                    vk::ClearValue { depth_stencil }
-                },
-            }];
-            let rects = [vk::ClearRect {
-                rect: vk::Rect2D {
-                    offset: vk::Offset2D {
-                        x: x0 as i32,
-                        y: y0 as i32,
-                    },
-                    extent: vk::Extent2D {
-                        width: x1 - x0,
-                        height: y1 - y0,
-                    },
-                },
-                base_array_layer: first_layer,
-                layer_count,
-            }];
-            // SAFETY: the view is a live attachment view of the image, which is in the matching
-            // attachment layout; the rectangle and layers lie inside the render area.
-            unsafe {
-                device.raw.cmd_begin_rendering(cmd, &info);
-                device.raw.cmd_clear_attachments(cmd, &clear, &rects);
-                device.raw.cmd_end_rendering(cmd);
+            // SAFETY: the view is a live single-level attachment view of the image, which is in
+            // the matching attachment layout; the area and layers lie inside the render area.
+            unsafe { device.raw.cmd_begin_rendering(cmd, &info) };
+            match (pipeline, &self.clear_pipelines) {
+                (Some(pipeline), Some(pipelines)) => {
+                    pipelines.draw(cmd, pipeline, area, words, stencil_reference);
+                }
+                _ => {
+                    let rects = [vk::ClearRect {
+                        rect: area,
+                        base_array_layer: 0,
+                        layer_count: layers,
+                    }];
+                    // SAFETY: inside the rendering begun above; the rectangle lies in its area.
+                    unsafe { device.raw.cmd_clear_attachments(cmd, &clear, &rects) };
+                }
             }
-        } else {
-            tracing::warn!(
-                format = ?image.info.format,
-                "partial clear of an image that cannot be an attachment; dropped"
-            );
-            return Ok(());
+            // SAFETY: ends the rendering begun above.
+            unsafe { device.raw.cmd_end_rendering(cmd) };
+            layer += layers;
         }
         self.mark_modified(target.id);
         Ok(())
@@ -1016,6 +1239,9 @@ impl TextureCache {
             ImageKind::D1 => (info.width, 1),
             ImageKind::D3 => (info.width, info.height),
         };
+        if info.kind == ImageKind::D3 && host.attachable {
+            flags |= vk::ImageCreateFlags::TYPE_2D_ARRAY_COMPATIBLE;
+        }
         if info.kind == ImageKind::D2 && info.layers >= 6 && width == height {
             flags |= vk::ImageCreateFlags::CUBE_COMPATIBLE;
         }
@@ -1057,10 +1283,13 @@ impl TextureCache {
             && entry.generation == generation
             && self.get(entry.found.id).is_some()
         {
-            return Ok(Some(entry.found));
+            let found = entry.found;
+            self.touch(found.id);
+            return Ok(Some(found));
         }
         let found = self.find_slow(tx, gmmu, gpu_va, info)?;
         if let Some(found) = found {
+            self.touch(found.id);
             if self.lookup.len() >= MAX_LOOKUPS {
                 self.lookup.clear();
             }
@@ -1165,7 +1394,7 @@ impl TextureCache {
                 }
                 _ => {
                     if image.gpu_modified {
-                        self.download(tx, id, None)?;
+                        self.download(tx, &[id], None)?;
                     }
                     self.remove(tx.scheduler, id);
                 }
@@ -1269,6 +1498,7 @@ impl TextureCache {
             gpu_modified: false,
             modified: 0,
             visit: 0,
+            last_use: self.frame,
         };
         let index = match self.free.pop() {
             Some(index) => index,
@@ -1276,6 +1506,8 @@ impl TextureCache {
                 self.slots.push(Slot {
                     generation: 0,
                     image: None,
+                    prev: NIL,
+                    next: NIL,
                 });
                 self.slots.len() as u32 - 1
             }
@@ -1291,6 +1523,7 @@ impl TextureCache {
             }
         }
         slot.image = Some(cached);
+        self.lru_push(index);
         Ok(id)
     }
 
@@ -1316,6 +1549,7 @@ impl TextureCache {
                 }
             }
         }
+        self.lru_unlink(id.index);
         scheduler.retire((image.views, image.image));
     }
 
@@ -1487,49 +1721,109 @@ impl TextureCache {
         Ok(())
     }
 
-    /// Writes a GPU-modified image back to guest memory, at native resolution, leaving the
-    /// device addresses in `keep` untouched.
+    /// Writes GPU-modified images back to guest memory at native resolution, with one GPU wait
+    /// for all of them, leaving the device addresses in `keep` untouched.
     fn download(
         &mut self,
         tx: &mut Transfer<'_>,
-        id: ImageId,
+        ids: &[ImageId],
         keep: Option<(DAddr, DAddr)>,
+    ) -> Result<()> {
+        let mut downloads = std::mem::take(&mut self.downloads);
+        downloads.clear();
+        for &id in ids {
+            let image = self.image(id);
+            if image.downloadable() {
+                downloads.push(Download {
+                    id,
+                    offset: 0,
+                    modified: image.modified,
+                });
+            } else {
+                image.gpu_modified = false;
+            }
+        }
+        let mut readback = self.readback.take();
+        let result = if downloads.is_empty() {
+            Ok(())
+        } else {
+            self.record_downloads(tx, &mut downloads, &mut readback)
+                .and_then(|()| tx.scheduler.finish())
+        };
+        if result.is_ok()
+            && let Some(data) = readback.as_ref().and_then(Buffer::mapped)
+        {
+            for download in &downloads {
+                self.write_back(
+                    tx.memory,
+                    download.id,
+                    &data[download.offset as usize..],
+                    keep,
+                );
+                self.image(download.id).gpu_modified = false;
+            }
+        }
+        self.readback = readback;
+        self.downloads = downloads;
+        result
+    }
+
+    /// Records copies of the images in `downloads` into `readback` (grown when too small), and
+    /// sets each one's offset there. The copies are visible to the host once they complete.
+    fn record_downloads(
+        &mut self,
+        tx: &mut Transfer<'_>,
+        downloads: &mut [Download],
+        readback: &mut Option<Buffer>,
+    ) -> Result<()> {
+        let mut total = 0u64;
+        for download in downloads.iter_mut() {
+            let (size, align) = self
+                .get(download.id)
+                .expect("a live image id")
+                .readback_size();
+            download.offset = total.next_multiple_of(align);
+            total = download.offset + size;
+        }
+        let size = total.max(16);
+        if readback.as_ref().is_none_or(|b| b.size() < size) {
+            let buffer = Buffer::new(
+                &self.device,
+                size.next_power_of_two(),
+                vk::BufferUsageFlags::TRANSFER_DST,
+                MemoryLocation::GpuToCpu,
+                "texture readback",
+            )?;
+            if let Some(old) = readback.replace(buffer) {
+                tx.scheduler.retire(old);
+            }
+        }
+        let buffer = readback.as_ref().expect("just created").raw();
+        let cmd = tx.scheduler.record()?;
+        for download in downloads.iter() {
+            self.record_download(tx, cmd, download.id, buffer, download.offset)?;
+        }
+        transfer_to_all_barrier(&self.device, cmd);
+        Ok(())
+    }
+
+    /// Records the copy of one image, at native resolution, into `buffer` from `base` on, laid
+    /// out as [`TextureCache::write_back`] reads it.
+    fn record_download(
+        &mut self,
+        tx: &mut Transfer<'_>,
+        cmd: vk::CommandBuffer,
+        id: ImageId,
+        buffer: vk::Buffer,
+        base: u64,
     ) -> Result<()> {
         let device = self.device.clone();
         let image = self.image(id);
         let info = image.info;
         let host = image.host;
         let format = info.format;
-        if matches!(
-            host.conversion,
-            Conversion::Decode | Conversion::DecodeToBc(_)
-        ) {
-            image.gpu_modified = false;
-            return Ok(());
-        }
         let levels = image.image.desc().mip_levels;
         let align = alignment(&host, format);
-        let mut layouts_total = 0u64;
-        for _ in 0..info.layers {
-            for level in 0..levels {
-                let layout = convert::host_layout(format, &host, info.level_extent(level));
-                layouts_total = layouts_total.next_multiple_of(align) + layout.total() as u64;
-            }
-        }
-        let size = layouts_total.next_multiple_of(align).max(align);
-        if self.readback.as_ref().is_none_or(|b| b.size() < size) {
-            let buffer = Buffer::new(
-                &device,
-                size.next_power_of_two(),
-                vk::BufferUsageFlags::TRANSFER_DST,
-                MemoryLocation::GpuToCpu,
-                "texture readback",
-            )?;
-            if let Some(old) = self.readback.replace(buffer) {
-                tx.scheduler.retire(old);
-            }
-        }
-        let readback = self.readback.as_ref().expect("just created").raw();
         let [main_aspect, stencil_aspect] = aspects_of(host.format);
         let mut regions = std::mem::take(&mut self.scratch.regions);
         regions.clear();
@@ -1540,7 +1834,7 @@ impl TextureCache {
                 let layout = convert::host_layout(format, &host, (w, h, d));
                 offset = offset.next_multiple_of(align as usize);
                 let copy = |buffer_offset: usize, aspect_mask| vk::BufferImageCopy {
-                    buffer_offset: buffer_offset as u64,
+                    buffer_offset: base + buffer_offset as u64,
                     image_subresource: vk::ImageSubresourceLayers {
                         aspect_mask,
                         mip_level: level,
@@ -1563,7 +1857,6 @@ impl TextureCache {
                 offset += layout.total();
             }
         }
-        let cmd = tx.scheduler.record()?;
         let image = self.image(id);
         image.transition(&device, cmd, ImageAccess::TRANSFER_SRC);
         let native = if image.scale == ResolutionScale::X1 {
@@ -1591,37 +1884,43 @@ impl TextureCache {
             Some(native)
         };
         let source = native.as_ref().unwrap_or(&image.image).raw();
-        // SAFETY: the source is in TRANSFER_SRC layout and the regions fit the readback buffer.
+        // SAFETY: the source is in TRANSFER_SRC layout and the regions fit the buffer, which
+        // record_downloads sized for them.
         unsafe {
             device.raw.cmd_copy_image_to_buffer(
                 cmd,
                 source,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                readback,
+                buffer,
                 &regions,
             )
         };
         self.scratch.regions = regions;
-        transfer_to_all_barrier(&device, cmd);
-        let tick = tx.scheduler.flush()?;
-        tx.scheduler.wait(tick)?;
         if let Some(native) = native {
             tx.scheduler.retire(native);
         }
-        let Self {
-            slots,
-            scratch,
-            readback,
-            ..
-        } = self;
+        Ok(())
+    }
+
+    /// Converts the host texels `data` holds for an image (as [`TextureCache::record_download`]
+    /// laid them out) and writes them to guest memory.
+    fn write_back(
+        &mut self,
+        memory: &DeviceAddressSpace,
+        id: ImageId,
+        data: &[u8],
+        keep: Option<(DAddr, DAddr)>,
+    ) {
+        let Self { slots, scratch, .. } = self;
         let image = slots[id.index as usize]
             .image
             .as_mut()
             .expect("a live image id");
-        let data = readback
-            .as_ref()
-            .and_then(Buffer::mapped)
-            .expect("readback memory is host visible");
+        let info = image.info;
+        let host = image.host;
+        let format = info.format;
+        let levels = image.image.desc().mip_levels;
+        let align = alignment(&host, format);
         let mut offset = 0usize;
         for layer in 0..info.layers {
             for level in 0..levels {
@@ -1644,22 +1943,16 @@ impl TextureCache {
                     GuestLayout::BlockLinear { .. } => {
                         let tiling = info.surface().level_tiling(level);
                         scratch.tiled.resize(tiling.size_bytes(), 0);
-                        read_guest(tx.memory, &image.segments, guest_offset, &mut scratch.tiled);
+                        read_guest(memory, &image.segments, guest_offset, &mut scratch.tiled);
                         swizzle(&tiling, &scratch.linear, &mut scratch.tiled);
-                        write_guest(
-                            tx.memory,
-                            &image.segments,
-                            guest_offset,
-                            &scratch.tiled,
-                            keep,
-                        );
+                        write_guest(memory, &image.segments, guest_offset, &scratch.tiled, keep);
                     }
                     GuestLayout::Pitch { pitch } => {
                         let rows = extent.1.div_ceil(format.block_height()).max(1) as usize;
                         let row = scratch.linear.len() / rows;
                         for (y, line) in scratch.linear.chunks_exact(row).enumerate() {
                             write_guest(
-                                tx.memory,
+                                memory,
                                 &image.segments,
                                 guest_offset + y as u64 * u64::from(pitch),
                                 line,
@@ -1670,8 +1963,207 @@ impl TextureCache {
                 }
             }
         }
-        image.gpu_modified = false;
+    }
+
+    /// Runs the collector, once per presented frame. `usage` reads device memory use; it is
+    /// called after the scheduler released what the GPU finished, so evicted images are no
+    /// longer counted. Past thresholds from the driver's budget and the VRAM usage setting, it
+    /// evicts images unused for a while, least recently used first, with bounded work per call;
+    /// images used this frame always stay. GPU-modified images are read back without a wait
+    /// and written to guest memory on a later call, once the copy finished and only if nothing
+    /// used them in between.
+    pub fn tick_frame(
+        &mut self,
+        tx: &mut Transfer<'_>,
+        usage: impl FnOnce() -> MemoryUsage,
+    ) -> Result<()> {
+        let freed = tx.scheduler.collect();
+        while let Some(&(tick, bytes)) = self.sentenced.front()
+            && tick <= freed
+        {
+            self.sentenced.pop_front();
+            self.sentenced_bytes -= bytes;
+        }
+        self.finish_evictions(tx);
+        let result = self.collect_garbage(tx, usage());
+        self.frame += 1;
+        result
+    }
+
+    /// Evicts the images of the pending readback once the GPU finished it.
+    fn finish_evictions(&mut self, tx: &mut Transfer<'_>) {
+        let Some(pending) = self.pending else {
+            return;
+        };
+        if !tx.scheduler.is_complete(pending.tick) {
+            return;
+        }
+        self.pending = None;
+        let downloads = std::mem::take(&mut self.pending_downloads);
+        let readback = self.eviction_readback.take();
+        let data = readback
+            .as_ref()
+            .and_then(Buffer::mapped)
+            .expect("readback memory is host visible");
+        for download in &downloads {
+            let Some(image) = self.get(download.id) else {
+                continue;
+            };
+            if image.last_use > pending.frame || image.modified != download.modified {
+                continue;
+            }
+            if image.gpu_modified {
+                self.write_back(
+                    tx.memory,
+                    download.id,
+                    &data[download.offset as usize..],
+                    None,
+                );
+                self.stats.flushed += 1;
+            }
+            self.evict(tx.scheduler, download.id);
+        }
+        self.eviction_readback = readback;
+        self.pending_downloads = downloads;
+    }
+
+    fn collect_garbage(&mut self, tx: &mut Transfer<'_>, usage: MemoryUsage) -> Result<()> {
+        if usage.budget == 0 {
+            return Ok(());
+        }
+        let can_flush = self.pending.is_none();
+        if can_flush {
+            self.pending_downloads.clear();
+        }
+        let pending_bytes = self.pending.map_or(0, |p| p.bytes);
+        let mut used = usage
+            .used
+            .saturating_sub(self.sentenced_bytes + pending_bytes);
+        let limits = Thresholds::new(usage.budget, self.vram_usage);
+        if used < limits.expected {
+            return Ok(());
+        }
+        let mut aggressive = used >= limits.critical;
+        let age = if used >= limits.retain {
+            RECENT_AGE
+        } else {
+            OLD_AGE
+        };
+        let mut evictions = if aggressive {
+            AGGRESSIVE_EVICTIONS
+        } else {
+            NORMAL_EVICTIONS
+        };
+        let mut visits = evictions * VISITS_PER_EVICTION;
+        let (mut flush_bytes, mut queued_bytes) = (0, 0);
+        let mut cursor = self.lru_head;
+        while cursor != NIL && evictions > 0 && visits > 0 {
+            visits -= 1;
+            let slot = &self.slots[cursor as usize];
+            let id = ImageId {
+                index: cursor,
+                generation: slot.generation,
+            };
+            cursor = slot.next;
+            let image = slot.image.as_ref().expect("listed slots hold images");
+            if image.last_use + age > self.frame {
+                break;
+            }
+            let bytes = image.image.memory_size();
+            if image.gpu_modified && image.downloadable() {
+                let (size, _) = image.readback_size();
+                if !aggressive
+                    || !can_flush
+                    || (flush_bytes > 0 && flush_bytes + size > MAX_FLUSH_BYTES)
+                {
+                    continue;
+                }
+                flush_bytes += size;
+                queued_bytes += bytes;
+                self.pending_downloads.push(Download {
+                    id,
+                    offset: 0,
+                    modified: image.modified,
+                });
+            } else {
+                self.evict(tx.scheduler, id);
+            }
+            used = used.saturating_sub(bytes);
+            evictions -= 1;
+            if aggressive && used < limits.critical {
+                aggressive = false;
+                evictions >>= 2;
+            }
+            if used < limits.expected {
+                break;
+            }
+        }
+        if !can_flush || self.pending_downloads.is_empty() {
+            return Ok(());
+        }
+        let mut downloads = std::mem::take(&mut self.pending_downloads);
+        let mut readback = self.eviction_readback.take();
+        let recorded = self.record_downloads(tx, &mut downloads, &mut readback);
+        self.eviction_readback = readback;
+        self.pending_downloads = downloads;
+        recorded?;
+        let tick = tx.scheduler.flush()?;
+        self.pending = Some(PendingEvictions {
+            tick,
+            frame: self.frame,
+            bytes: queued_bytes,
+        });
         Ok(())
+    }
+
+    fn evict(&mut self, scheduler: &mut Scheduler, id: ImageId) {
+        let bytes = self.get(id).map_or(0, |i| i.image.memory_size());
+        self.remove(scheduler, id);
+        self.sentenced.push_back((scheduler.tick(), bytes));
+        self.sentenced_bytes += bytes;
+        self.stats.evicted += 1;
+        self.stats.evicted_bytes += bytes;
+    }
+
+    /// Marks an image used this frame, moving it to the recent end of the LRU list.
+    fn touch(&mut self, id: ImageId) {
+        let frame = self.frame;
+        let Some(image) = self.get_mut(id) else {
+            return;
+        };
+        if image.last_use == frame {
+            return;
+        }
+        image.last_use = frame;
+        self.lru_unlink(id.index);
+        self.lru_push(id.index);
+    }
+
+    fn lru_unlink(&mut self, index: u32) {
+        let slot = &mut self.slots[index as usize];
+        let (prev, next) = (slot.prev, slot.next);
+        slot.prev = NIL;
+        slot.next = NIL;
+        match prev {
+            NIL => self.lru_head = next,
+            prev => self.slots[prev as usize].next = next,
+        }
+        match next {
+            NIL => self.lru_tail = prev,
+            next => self.slots[next as usize].prev = prev,
+        }
+    }
+
+    fn lru_push(&mut self, index: u32) {
+        let tail = self.lru_tail;
+        let slot = &mut self.slots[index as usize];
+        slot.prev = tail;
+        slot.next = NIL;
+        match tail {
+            NIL => self.lru_head = index,
+            tail => self.slots[tail as usize].next = index,
+        }
+        self.lru_tail = index;
     }
 }
 

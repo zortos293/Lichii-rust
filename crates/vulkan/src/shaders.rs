@@ -16,6 +16,8 @@
 //!
 //! Fragment passes read `set = 0, binding = 0` as a combined image sampler, take `v_uv` at
 //! location 0 and write location 0.
+//!
+//! The clear shaders take one 16-byte fragment push constant block holding the clear value.
 
 use ash::vk;
 
@@ -90,6 +92,16 @@ pub static EGUI_VERT: &[u32] = spirv!("egui.vert");
 pub static EGUI_FRAG: &[u32] = spirv!("egui.frag");
 /// `block_linear_unswizzle.comp`: Block-linear to pitch-linear copy of one 2D slice, one word per invocation, local size 32x8. Matches `lichii_texture::block_linear` for both GOB layouts.
 pub static BLOCK_LINEAR_UNSWIZZLE_COMP: &[u32] = spirv!("block_linear_unswizzle.comp");
+/// `clear.vert`: Fullscreen triangle from `gl_VertexIndex` 0..2 with no outputs, for masked clears.
+pub static CLEAR_VERT: &[u32] = spirv!("clear.vert");
+/// `clear_float.frag`: Writes the push constant `vec4` to a float or normalized colour target at location 0.
+pub static CLEAR_FLOAT_FRAG: &[u32] = spirv!("clear_float.frag");
+/// `clear_uint.frag`: Writes the push constant `uvec4` to an unsigned integer colour target at location 0.
+pub static CLEAR_UINT_FRAG: &[u32] = spirv!("clear_uint.frag");
+/// `clear_sint.frag`: Writes the push constant `ivec4` to a signed integer colour target at location 0.
+pub static CLEAR_SINT_FRAG: &[u32] = spirv!("clear_sint.frag");
+/// `clear_depth.frag`: Writes the push constant `float` as fragment depth; stencil comes from the pipeline's reference.
+pub static CLEAR_DEPTH_FRAG: &[u32] = spirv!("clear_depth.frag");
 
 /// Every shader by source file name, for module creation and the consistency checks.
 pub static ALL: &[(&str, &[u32])] = &[
@@ -113,6 +125,11 @@ pub static ALL: &[(&str, &[u32])] = &[
     ("egui.vert", EGUI_VERT),
     ("egui.frag", EGUI_FRAG),
     ("block_linear_unswizzle.comp", BLOCK_LINEAR_UNSWIZZLE_COMP),
+    ("clear.vert", CLEAR_VERT),
+    ("clear_float.frag", CLEAR_FLOAT_FRAG),
+    ("clear_uint.frag", CLEAR_UINT_FRAG),
+    ("clear_sint.frag", CLEAR_SINT_FRAG),
+    ("clear_depth.frag", CLEAR_DEPTH_FRAG),
 ];
 
 /// SMAA area lookup table: 160x560 texels of `R8G8_UNORM`, rows top to bottom, 320 bytes per row.
