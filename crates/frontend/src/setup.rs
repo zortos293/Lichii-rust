@@ -85,7 +85,8 @@ pub enum FirmwareStatus {
 
 impl FirmwareStatus {
     /// Reads the SystemVersion archive from the NAND's registered system content. Opens the
-    /// folder read-only, so checking a wrong folder changes nothing in it.
+    /// folder read-only, so checking a wrong folder changes nothing in it. Content that cannot
+    /// be opened (a missing key, a damaged file) makes the firmware unreadable, not missing.
     pub fn check(nand: &Path, keys: &KeySet) -> Self {
         let registered = nand.join("system/Contents/registered");
         if !registered.is_dir() {
@@ -104,6 +105,7 @@ fn read_system_version(registered: &Path, keys: &KeySet) -> Result<Option<Vec<u8
     let dir = HostDir::open(registered)?;
     let index = ContentIndex::from_registered(dir.as_ref(), &mut keys.clone())?;
     let Some(romfs) = index.data_romfs(SYSTEM_VERSION)? else {
+        ContentIndex::from_dir(dir.as_ref(), &mut keys.clone())?;
         return Ok(None);
     };
     let root = open_romfs(&romfs)?;
@@ -421,6 +423,18 @@ mod tests {
             !dir.0.join("system").exists(),
             "the check must not create folders"
         );
+    }
+
+    #[test]
+    fn firmware_that_cannot_be_opened_is_unreadable() {
+        let dir = TempDir::new("locked");
+        let registered = dir.0.join("system/Contents/registered");
+        std::fs::create_dir_all(&registered).unwrap();
+        std::fs::write(registered.join("0123.nca"), vec![0u8; 0x4000]).unwrap();
+        assert!(matches!(
+            FirmwareStatus::check(&dir.0, &KeySet::new()),
+            FirmwareStatus::Unreadable(_)
+        ));
     }
 
     #[test]

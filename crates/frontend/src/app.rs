@@ -420,7 +420,9 @@ Dump prod.keys and title.keys \
         let out = window.show(ctx, &mut self.settings.paths, &self.paths);
         if out.changed {
             if let Some(config) = &mut self.config {
-                *config.draft_paths() = self.settings.paths.clone();
+                let draft = config.draft_paths();
+                draft.keys_dir.clone_from(&self.settings.paths.keys_dir);
+                draft.nand_dir.clone_from(&self.settings.paths.nand_dir);
             }
             self.save_settings();
         }
