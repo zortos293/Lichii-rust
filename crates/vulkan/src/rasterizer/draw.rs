@@ -19,6 +19,7 @@ use lichii_gpu::engines::maxwell_3d::regs::{
     DepthMode, IndexFormat, PrimitiveTopology, ProvokingVertex, StencilOp, VertexAttributeType,
     WindowOriginMode,
 };
+use lichii_gpu::engines::maxwell_3d::regs::{MESH_CONTROL, MESH_SHADER_A};
 use lichii_shader::backend::Bindings;
 use lichii_shader::backend::spirv::{
     NUM_IMAGE_SCALING_WORDS, NUM_TEXTURE_SCALING_WORDS, RENDER_AREA_LAYOUT_OFFSET,
@@ -26,9 +27,11 @@ use lichii_shader::backend::spirv::{
     RESCALING_LAYOUT_TEXTURES_OFFSET,
 };
 use lichii_shader::info::{HandleSource, ImageDescriptor, StorageBufferDescriptor};
-use lichii_shader::ir::{ImageFormat, TextureType};
+use lichii_shader::ir::{Attribute, ImageFormat, TextureType};
 use lichii_shader::runtime::{AttributeType, CompareFunction, InputTopology};
-use lichii_shader::{DescriptorKind, RuntimeInfo, ShaderArch, ShaderInfo, ShaderModule};
+use lichii_shader::{
+    DescriptorKind, RuntimeInfo, ShaderArch, ShaderInfo, ShaderModule, ShaderStage,
+};
 use lichii_texture::block_linear::GobLayout;
 use lichii_texture::tic::TextureMemory;
 use lichii_texture::{Numeric, PixelFormat};
@@ -81,6 +84,9 @@ enum Warning {
     TexelBufferFormat = 1 << 10,
     NullStorageImage = 1 << 11,
     StorageAndSampled = 1 << 12,
+    NoMeshShader = 1 << 13,
+    IndirectMesh = 1 << 14,
+    MeshGroupLimit = 1 << 15,
 }
 
 /// A descriptor write of the current draw: `count` infos from `first` of the info list for
@@ -151,6 +157,7 @@ pub(super) struct DrawState {
     anisotropy: Anisotropy,
     eds3: ash::ext::extended_dynamic_state3::Device,
     vertex_input: ash::ext::vertex_input_dynamic_state::Device,
+    mesh: ash::ext::mesh_shader::Device,
     null_buffer: Buffer,
     null_view: ImageView,
     _null_image: Image,
@@ -267,6 +274,7 @@ impl DrawState {
                 &device.instance.raw,
                 &device.raw,
             ),
+            mesh: ash::ext::mesh_shader::Device::new(&device.instance.raw, &device.raw),
             null_buffer,
             null_view,
             _null_image: null_image,
@@ -356,6 +364,21 @@ impl DrawCall<'_> {
 /// Maxwell program slots in host stage order: `(slot, host stage index)`; VertexA (slot 0)
 /// joins VertexB.
 const GRAPHICS_SLOTS: [(usize, usize); 5] = [(1, 0), (2, 1), (3, 2), (4, 3), (5, 4)];
+
+/// Whether the draw runs task and mesh programs (SET_MESH_CONTROL, NVN2 only), whose
+/// workgroup count is the draw's vertex count.
+fn is_mesh_draw(regs: &Regs, arch: ShaderArch) -> bool {
+    arch == ShaderArch::Ampere && regs.words()[MESH_CONTROL] & 1 != 0
+}
+
+/// The primitives a mesh program outputs (SET_MESH_SHADER_A bits 0..4).
+fn mesh_topology(regs: &Regs) -> vk::PrimitiveTopology {
+    match regs.words()[MESH_SHADER_A] & 0xf {
+        0 => vk::PrimitiveTopology::POINT_LIST,
+        1 => vk::PrimitiveTopology::LINE_LIST,
+        _ => vk::PrimitiveTopology::TRIANGLE_LIST,
+    }
+}
 
 fn attribute_type(regs: &Regs, index: usize) -> AttributeType {
     let attribute = regs.vertex_attrib_format[index];
@@ -482,6 +505,12 @@ impl StageState {
             Some(previous) => {
                 info.previous_stage_stores = previous.stores;
                 info.previous_stage_legacy_stores_mapping = previous.legacy_stores_mapping.clone();
+                info.per_primitive_generics = previous
+                    .mesh
+                    .primitive_lines
+                    .iter()
+                    .filter_map(|&line| Attribute(line as u16).generic_index())
+                    .fold(0, |mask, generic| mask | 1 << generic);
             }
             None => info.previous_stage_stores = lichii_shader::info::VaryingState([u64::MAX; 8]),
         }
@@ -553,8 +582,19 @@ impl VulkanRasterizer {
             FixedStateTracker::register_dirty_flags(ctx.dirty);
         }
         let regs = ctx.regs;
-        let host_topology = mvk::primitive_topology(assembled_topology(call.topology()))
-            .unwrap_or(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let mesh = is_mesh_draw(regs, self.draw.arch);
+        if mesh && matches!(call, DrawCall::Indirect(_)) {
+            self.draw.warn_once(
+                Warning::IndirectMesh,
+                "indirect task/mesh draws are not supported; skipping them",
+            );
+            return Ok(());
+        }
+        let host_topology = match mesh {
+            true => mesh_topology(regs),
+            false => mvk::primitive_topology(assembled_topology(call.topology()))
+                .unwrap_or(vk::PrimitiveTopology::TRIANGLE_LIST),
+        };
         if !self.graphics_stages(ctx, host_topology) {
             return Ok(());
         }
@@ -620,8 +660,15 @@ impl VulkanRasterizer {
                     return Ok(());
                 }
             }
-            self.vertex_buffers(gmmu, regs)?;
+            if mesh {
+                self.draw.vertex_buffers.clear();
+                self.draw.vertex_offsets.clear();
+                self.draw.vertex_strides.clear();
+            } else {
+                self.vertex_buffers(gmmu, regs)?;
+            }
             let index = match call {
+                DrawCall::Direct(_) if mesh => None,
                 DrawCall::Direct(params) => self.buffer_cache.index_buffer(
                     &mut self.scheduler,
                     &mut self.staging,
@@ -745,6 +792,22 @@ impl VulkanRasterizer {
             .then(|| guest_render_area(regs));
         self.push_constants(cmd, layout_raw, push, render_area, scale);
         self.set_dynamic_state(cmd, regs, &features, host_topology, extent, scale);
+        let mesh_groups = match call {
+            DrawCall::Direct(params) if mesh => {
+                let task = self.draw.stages[0]
+                    .as_ref()
+                    .is_some_and(|m| m.stage == ShaderStage::Task);
+                let limit = self.device.properties.mesh_group_limit[usize::from(task)];
+                if params.count > limit {
+                    self.draw.warn_once(
+                        Warning::MeshGroupLimit,
+                        "a task/mesh draw has more groups than the device takes; clamping it",
+                    );
+                }
+                params.count.min(limit)
+            }
+            _ => 0,
+        };
         let raw = &self.device.raw;
         let draw = &self.draw;
         // SAFETY: as above; the pipeline's dynamic state is all set.
@@ -753,6 +816,9 @@ impl VulkanRasterizer {
                 raw.cmd_bind_index_buffer(cmd, index.buffer, index.offset, index.index_type);
             }
             match (call, indirect, index) {
+                (DrawCall::Direct(_), _, _) if mesh => {
+                    draw.mesh.cmd_draw_mesh_tasks(cmd, mesh_groups, 1, 1)
+                }
                 (DrawCall::Direct(params), _, Some(index)) => raw.cmd_draw_indexed(
                     cmd,
                     index.index_count,
@@ -839,7 +905,22 @@ impl VulkanRasterizer {
         topology: vk::PrimitiveTopology,
     ) -> bool {
         let regs = ctx.regs;
-        let enabled = |slot: usize| slot == 1 || regs.pipelines[slot].enable() != 0;
+        let mesh = is_mesh_draw(regs, self.draw.arch);
+        if mesh && !self.device.features.mesh_shader {
+            self.draw.warn_once(
+                Warning::NoMeshShader,
+                "a task/mesh draw on a device without VK_EXT_mesh_shader; skipping it",
+            );
+            return false;
+        }
+        let enabled = |slot: usize| match mesh {
+            true => {
+                slot == 1
+                    || (slot == 3 && regs.pipelines[3].enable() != 0)
+                    || (slot == 5 && regs.pipelines[5].enable() != 0)
+            }
+            false => slot == 1 || regs.pipelines[slot].enable() != 0,
+        };
         let last_pre_raster = (1..5).rev().find(|&s| enabled(s)).unwrap_or(1);
         let color_outputs: [AttributeType; 8] = std::array::from_fn(|i| {
             let count = (regs.rt_control.count() as usize).min(8);
@@ -865,7 +946,7 @@ impl VulkanRasterizer {
                 continue;
             }
             let env = ProgramEnv::graphics(ctx, slot, arch);
-            let vertex_a = (slot == 1 && regs.pipelines[0].enable() != 0)
+            let vertex_a = (slot == 1 && !mesh && regs.pipelines[0].enable() != 0)
                 .then(|| ProgramEnv::graphics(ctx, 0, arch));
             let state = StageState::new(
                 regs,
@@ -1668,6 +1749,7 @@ impl VulkanRasterizer {
         extent: vk::Extent2D,
         scale: ResolutionScale,
     ) {
+        let mesh = is_mesh_draw(regs, self.draw.arch);
         let raw = &self.device.raw;
         let draw = &mut self.draw;
         let factor = {
@@ -1784,7 +1866,9 @@ impl VulkanRasterizer {
                     };
                 }
                 raw.cmd_set_front_face(cmd, face);
-                raw.cmd_set_primitive_topology(cmd, topology);
+                if !mesh {
+                    raw.cmd_set_primitive_topology(cmd, topology);
+                }
                 raw.cmd_set_depth_test_enable(cmd, regs.depth_test_enable != 0);
                 raw.cmd_set_depth_write_enable(cmd, regs.depth_write_enabled != 0);
                 raw.cmd_set_depth_compare_op(
@@ -1829,18 +1913,20 @@ impl VulkanRasterizer {
                     _ => regs.polygon_offset_fill_enable,
                 };
                 raw.cmd_set_depth_bias_enable(cmd, offset != 0);
-                let restartable = matches!(
-                    topology,
-                    T::LINE_STRIP
-                        | T::TRIANGLE_STRIP
-                        | T::TRIANGLE_FAN
-                        | T::LINE_STRIP_WITH_ADJACENCY
-                        | T::TRIANGLE_STRIP_WITH_ADJACENCY
-                );
-                raw.cmd_set_primitive_restart_enable(
-                    cmd,
-                    restartable && regs.primitive_restart.enabled != 0,
-                );
+                if !mesh {
+                    let restartable = matches!(
+                        topology,
+                        T::LINE_STRIP
+                            | T::TRIANGLE_STRIP
+                            | T::TRIANGLE_FAN
+                            | T::LINE_STRIP_WITH_ADJACENCY
+                            | T::TRIANGLE_STRIP_WITH_ADJACENCY
+                    );
+                    raw.cmd_set_primitive_restart_enable(
+                        cmd,
+                        restartable && regs.primitive_restart.enabled != 0,
+                    );
+                }
             }
             if !draw.vertex_buffers.is_empty() {
                 if features.extended_dynamic_state && !features.dynamic_vertex_input {
@@ -1856,7 +1942,7 @@ impl VulkanRasterizer {
                     raw.cmd_bind_vertex_buffers(cmd, 0, &draw.vertex_buffers, &draw.vertex_offsets);
                 }
             }
-            if features.dynamic_vertex_input {
+            if features.dynamic_vertex_input && !mesh {
                 draw.vertex_bindings.clear();
                 draw.vertex_attributes.clear();
                 for (location, a) in regs.vertex_attrib_format.iter().enumerate() {

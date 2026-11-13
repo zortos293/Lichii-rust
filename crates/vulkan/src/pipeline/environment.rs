@@ -10,16 +10,39 @@ use std::cell::{Cell, RefCell};
 
 use lichii_common::GpuVAddr;
 use lichii_gpu::backend::{ComputeContext, ConstBufferBinding, GraphicsContext, QmdVersion};
-use lichii_gpu::engines::maxwell_3d::regs::SamplerBinding;
+use lichii_gpu::engines::maxwell_3d::Regs;
+use lichii_gpu::engines::maxwell_3d::regs::{
+    MESH_CONTROL, MESH_INIT_SHADER, MESH_SHADER_A, MESH_SHADER_B, SamplerBinding,
+};
 use lichii_gpu::gmmu::Gmmu;
+use lichii_shader::ampere::{GRAPHICS_HEADER_SIZE, graphics_header_address};
 use lichii_shader::info::TexturePixelFormat;
 use lichii_shader::ir::TextureType;
-use lichii_shader::{ShaderArch, ShaderEnvironment, ShaderStage};
+use lichii_shader::maxwell::header::ProgramHeader;
+use lichii_shader::{MeshState, ShaderArch, ShaderEnvironment, ShaderStage};
 use lichii_texture::tic::{self, TextureDescriptor, TicEntry};
 use lichii_texture::{Numeric, PixelFormat};
 
 /// Size of the Maxwell program header in front of a graphics program's first instruction.
 pub const HEADER_SIZE: u64 = 0x50;
+
+/// Bytes from a graphics program's header to its first instruction.
+fn header_size(arch: ShaderArch) -> u64 {
+    match arch {
+        ShaderArch::Maxwell => HEADER_SIZE,
+        ShaderArch::Ampere => GRAPHICS_HEADER_SIZE,
+    }
+}
+
+/// GPU address of the header of graphics program `slot`: an offset into the program region
+/// on Maxwell, a full address in the pipeline register's reserved words on NVN2.
+fn graphics_header(regs: &Regs, slot: usize, arch: ShaderArch) -> GpuVAddr {
+    let pipeline = &regs.pipelines[slot];
+    match arch {
+        ShaderArch::Maxwell => regs.program_region.address() + u64::from(pipeline.offset),
+        ShaderArch::Ampere => graphics_header_address(pipeline.reserved[0], pipeline.reserved[1]),
+    }
+}
 
 /// A query the translator made of guest state outside the program bytes, and the answer it
 /// got: texture header queries by raw handle, and constant buffer words (bindless handles,
@@ -229,6 +252,36 @@ pub fn shader_pixel_format(format: PixelFormat) -> TexturePixelFormat {
     }
 }
 
+/// The task and mesh draw state of program `slot`, when mesh control is on (NVN2 only) and the
+/// slot holds a task or mesh program. A mesh program's per-primitive outputs come from the header of the
+/// pass-through geometry program bound beside it, whose address the geometry pipeline's
+/// reserved words hold.
+fn mesh_state(ctx: &GraphicsContext<'_>, slot: usize, arch: ShaderArch) -> Option<MeshState> {
+    let regs = ctx.regs;
+    let words = regs.words();
+    let has_task = regs.pipelines[3].enable() != 0;
+    let holds_mesh = slot == 1 || (slot == 3 && has_task);
+    if arch != ShaderArch::Ampere || words[MESH_CONTROL] & 1 == 0 || !holds_mesh {
+        return None;
+    }
+    let primitive_header = if (slot == 3 || !has_task) && regs.pipelines[4].enable() != 0 {
+        ProgramHeader {
+            words: ctx
+                .memory
+                .read::<[u32; 20]>(graphics_header(regs, 4, ShaderArch::Ampere))
+                .unwrap_or_default(),
+        }
+    } else {
+        ProgramHeader::default()
+    };
+    Some(MeshState {
+        shader_a: words[MESH_SHADER_A],
+        shader_b: words[MESH_SHADER_B],
+        init_shader: words[MESH_INIT_SHADER],
+        primitive_header,
+    })
+}
+
 /// One guest program, as the translator reads it.
 pub struct ProgramEnv<'a> {
     arch: ShaderArch,
@@ -242,6 +295,7 @@ pub struct ProgramEnv<'a> {
     local_memory: u32,
     shared_memory: u32,
     workgroup: [u32; 3],
+    mesh: Option<MeshState>,
     /// Texture queries of the translation running on this environment.
     reads: RefCell<Vec<EnvRead>>,
     /// Lowest and one past the highest program byte the translator read.
@@ -249,19 +303,26 @@ pub struct ProgramEnv<'a> {
 }
 
 impl<'a> ProgramEnv<'a> {
-    /// Maxwell program `slot` (0 VertexA ... 5 Pixel) of the 3D engine state in `ctx`.
+    /// Maxwell program `slot` (0 VertexA ... 5 Pixel) of the 3D engine state in `ctx`. While
+    /// mesh control is on, the VertexB slot holds the task program (the mesh program without
+    /// one) and the tessellation slot the mesh program.
     pub fn graphics(ctx: &'a GraphicsContext<'_>, slot: usize, arch: ShaderArch) -> Self {
         let regs = ctx.regs;
-        let stage = [
-            ShaderStage::VertexA,
-            ShaderStage::VertexB,
-            ShaderStage::TessellationControl,
-            ShaderStage::TessellationEval,
-            ShaderStage::Geometry,
-            ShaderStage::Fragment,
-        ][slot];
-        let start =
-            regs.program_region.address() + u64::from(regs.pipelines[slot].offset) + HEADER_SIZE;
+        let mesh = mesh_state(ctx, slot, arch);
+        let stage = match mesh {
+            Some(_) if slot == 1 && regs.pipelines[3].enable() != 0 => ShaderStage::Task,
+            Some(_) => ShaderStage::Mesh,
+            None => [
+                ShaderStage::VertexA,
+                ShaderStage::VertexB,
+                ShaderStage::TessellationControl,
+                ShaderStage::TessellationEval,
+                ShaderStage::Geometry,
+                ShaderStage::Fragment,
+            ][slot],
+        };
+        let header = graphics_header(regs, slot, arch);
+        let start = header + header_size(arch);
         let mut env = Self {
             arch,
             stage,
@@ -279,10 +340,11 @@ impl<'a> ProgramEnv<'a> {
             local_memory: 0,
             shared_memory: 0,
             workgroup: [1; 3],
+            mesh,
             reads: RefCell::new(Vec::new()),
             extent: Cell::new((start, start)),
         };
-        let word = |index: u64| env.word(start - HEADER_SIZE + index * 4);
+        let word = |index: u64| env.word(header + index * 4);
         let low = word(1) & 0xff_ffff;
         let high = word(2) & 0xff_ffff;
         let crs = word(3) & 0xff_ffff;
@@ -313,6 +375,7 @@ impl<'a> ProgramEnv<'a> {
             local_memory: ctx.local_memory_size,
             shared_memory: ctx.shared_memory_size,
             workgroup: ctx.block,
+            mesh: None,
             reads: RefCell::new(Vec::new()),
             extent: Cell::new((ctx.program, ctx.program)),
         }
@@ -328,7 +391,7 @@ impl<'a> ProgramEnv<'a> {
         if self.stage == ShaderStage::Compute {
             self.start
         } else {
-            self.start - HEADER_SIZE
+            self.start - header_size(self.arch)
         }
     }
 
@@ -353,9 +416,9 @@ impl<'a> ProgramEnv<'a> {
 
     /// The register state that keys every program of this environment, besides its recorded
     /// reads.
-    pub fn state_words(&self) -> [u32; 7] {
+    pub fn state_words(&self) -> ([u32; 7], ShaderStage, Option<MeshState>) {
         let [x, y, z] = self.workgroup;
-        [
+        let words = [
             self.viewport_transform,
             self.texture_bound,
             self.shared_memory,
@@ -363,7 +426,8 @@ impl<'a> ProgramEnv<'a> {
             x,
             y,
             z,
-        ]
+        ];
+        (words, self.stage, self.mesh)
     }
 
     /// Takes the queries of the last translation.
@@ -471,6 +535,10 @@ impl ShaderEnvironment for ProgramEnv<'_> {
         let integer = self.query_integer(raw_handle);
         self.record(EnvRead::Integer(raw_handle, integer));
         integer
+    }
+
+    fn mesh_state(&self) -> Option<MeshState> {
+        self.mesh
     }
 
     fn viewport_transform_state(&self) -> u32 {
