@@ -166,6 +166,7 @@ impl Pass {
                     }
                     None if prog.block(block).predecessors.len() > 1
                         && self.idom[block.0 as usize] != u32::MAX
+                        && self.idom[block.0 as usize] != block.0
                         && !self.may_need_phi(var, block) =>
                     {
                         let idom = BlockId(self.idom[block.0 as usize]);

@@ -106,6 +106,22 @@ fn a_merge_reached_from_an_unreachable_join_still_merges_the_reachable_writes() 
 }
 
 #[test]
+fn an_unwritten_read_in_an_entry_block_with_a_back_edge_resolves_in_that_block() {
+    let mut prog = Program::new();
+    let b = blocks(&mut prog, 3);
+    prog.add_branch(b[0], b[1]);
+    prog.add_branch(b[1], b[0]);
+    prog.add_branch(b[1], b[2]);
+    prog.add_branch(b[2], b[0]);
+    let r = use_r1(&mut prog, b[0]);
+    optimize(&mut prog);
+    let Value::Inst(value) = prog.arg(r, 0) else {
+        panic!("{:?}", prog.arg(r, 0));
+    };
+    assert!(prog.insts_of(b[0]).any(|id| id == value), "{}", prog.dump());
+}
+
+#[test]
 fn same_value_on_both_paths_needs_no_phi() {
     let mut prog = Program::new();
     let b = blocks(&mut prog, 4);
