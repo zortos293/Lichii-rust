@@ -1422,3 +1422,43 @@ fn presented_targets_take_their_aliases_texels() {
     }
     f.assert_no_validation_errors();
 }
+
+#[test]
+fn handed_off_aliases_keep_newer_writes_in_other_aliases() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let wide = pitch_target(256, 8);
+    let strip = ImageInfo {
+        width: 60,
+        height: 2,
+        ..wide
+    };
+    clear_rt(&mut f, &wide, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    let top = clear_rt(&mut f, &strip, [0.0, 1.0, 0.0, 1.0], Rect::ALL).id;
+    let bottom = clear_rt_at(
+        &mut f,
+        GPU_VA + 4 * 256,
+        &strip,
+        [0.0, 0.0, 1.0, 1.0],
+        Rect::ALL,
+    )
+    .id;
+    {
+        let (tx, cache, _) = f.tx();
+        cache.remove(tx.scheduler, bottom);
+    }
+    let found = {
+        let (mut tx, cache, gmmu) = f.tx();
+        cache
+            .render_target(&mut tx, gmmu, GPU_VA, &strip, false)
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(found.id, top);
+    assert!(
+        all_texels(&f.read_image(top)[0], [0, 255, 0, 255]),
+        "the top strip keeps its own newer texels"
+    );
+    f.assert_no_validation_errors();
+}

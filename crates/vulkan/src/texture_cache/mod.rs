@@ -276,7 +276,7 @@ struct CachedImage {
 }
 
 /// A live image that shares a rectangle of texels with another, at level 0 of layer 0:
-/// `at` in the alias, `own` in the image that lists it. `synced` is the alias's `modified`
+/// `at` in the alias, `own` in the image that lists it. `synced` is the alias's `written`
 /// tick when the rectangle last took its texels.
 #[derive(Clone, Copy, Debug)]
 struct Alias {
@@ -1873,8 +1873,9 @@ impl TextureCache {
         self.take_from_aliases(tx.scheduler, id)
     }
 
-    /// Copies in, oldest first, the rectangles GPU-modified aliases changed since this image
-    /// last took them or wrote itself.
+    /// Copies in, oldest first, the rectangles of GPU-modified aliases that wrote themselves
+    /// since this image last took them or wrote itself. Texels an alias only copied in come
+    /// straight from the alias that wrote them, which shares them too.
     fn take_from_aliases(&mut self, scheduler: &mut Scheduler, id: ImageId) -> Result<()> {
         let mut newer = std::mem::take(&mut self.alias_scratch);
         newer.clear();
@@ -1883,45 +1884,45 @@ impl TextureCache {
         newer.extend(image.aliases.iter().copied());
         newer.retain(|a| {
             self.get(a.id)
-                .is_some_and(|other| other.gpu_modified && other.modified > a.synced.max(written))
+                .is_some_and(|other| other.gpu_modified && other.written > a.synced.max(written))
         });
-        newer.sort_by_key(|a| self.get(a.id).map_or(0, |other| other.modified));
+        newer.sort_by_key(|a| self.get(a.id).map_or(0, |other| other.written));
         let mut result = Ok(());
         for alias in &newer {
             result = self.copy_texels(scheduler, alias.id, alias.at, id, alias.own, alias.extent);
             if result.is_err() {
                 break;
             }
-            let tick = self.get(alias.id).map_or(0, |other| other.modified);
+            let other = self.image(alias.id);
+            let (tick, modified) = (other.written, other.modified);
+            Self::set_synced(other, id, written);
             let image = self.image(id);
-            image.modified = image.modified.max(tick);
+            image.modified = image.modified.max(modified);
             image.gpu_modified = true;
-            let modified = image.modified;
             Self::set_synced(image, alias.id, tick);
-            Self::set_synced(self.image(alias.id), id, modified);
         }
         self.alias_scratch = newer;
         result
     }
 
-    /// Copies a GPU-modified image's shared texels into each alias whose rectangle neither took
-    /// them yet nor was written since, so its data outlives its write-back or removal without
+    /// Copies what a GPU-modified image wrote itself into each alias whose rectangle neither
+    /// took it yet nor was written since, so its data outlives its write-back or removal without
     /// another guest round trip. Aliases also take its pending write-back when guest memory does
     /// not hold its texels yet.
     fn hand_off(&mut self, scheduler: &mut Scheduler, id: ImageId) {
         let mut older = std::mem::take(&mut self.alias_scratch);
         older.clear();
         let image = self.get(id).expect("a live image id");
-        let modified = image.modified;
+        let (written, modified) = (image.written, image.modified);
         let unwritten = image.gpu_modified;
         older.extend(image.aliases.iter().copied());
         older.retain(|a| {
             self.get(a.id).is_some_and(|other| {
-                other.written < modified
+                other.written < written
                     && other
                         .aliases
                         .iter()
-                        .any(|back| back.id == id && back.synced < modified)
+                        .any(|back| back.id == id && back.synced < written)
             })
         });
         for alias in &older {
@@ -1934,7 +1935,7 @@ impl TextureCache {
             let other = self.image(alias.id);
             other.modified = other.modified.max(modified);
             other.gpu_modified |= unwritten;
-            Self::set_synced(other, id, modified);
+            Self::set_synced(other, id, written);
         }
         self.alias_scratch = older;
     }
