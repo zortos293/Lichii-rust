@@ -6,8 +6,8 @@ use std::path::PathBuf;
 pub const USAGE: &str = "\
 Usage: lichii [OPTIONS] [GAME]
 
-Boots GAME (an NSP, XCI, NCA, NRO, NSO or a loose ExeFS directory) when given, otherwise opens
-the game list.
+Boots GAME (an NSP, XCI, NCA, NUP, NRO, NSO or a loose ExeFS directory) when given, otherwise
+opens the game list.
 
 Options:
   -f, --fullscreen     Start in fullscreen

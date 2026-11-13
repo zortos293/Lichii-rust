@@ -22,6 +22,7 @@ parking_lot.workspace = true
 iana-time-zone.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+tzdb_data.workspace = true
 
 [dev-dependencies]
 lichii-cpu.workspace = true

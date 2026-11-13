@@ -27,6 +27,7 @@ pub enum GameKind {
     Nca,
     Nro,
     Nso,
+    Nup,
     /// A directory holding `main` and `main.npdm` (or an `exefs/` subdirectory with them).
     ExeFs,
 }
@@ -39,6 +40,7 @@ impl GameKind {
             Self::Nca => "NCA",
             Self::Nro => "NRO",
             Self::Nso => "NSO",
+            Self::Nup => "NUP",
             Self::ExeFs => "ExeFS",
         }
     }
@@ -55,6 +57,7 @@ impl GameKind {
             "nca" => Some(Self::Nca),
             "nro" => Some(Self::Nro),
             "nso" => Some(Self::Nso),
+            "nup" => Some(Self::Nup),
             _ => None,
         }
     }
@@ -741,6 +744,62 @@ mod tests {
             ("Synthetic Game II", "2.0.0")
         );
         assert!(icon.is_none());
+    }
+
+    #[test]
+    fn nup_containers_are_listed_read_and_cached() {
+        use lichii_loader::nup::{
+            META_DISPLAY_VERSION, META_ICON, META_PUBLISHER, META_TITLE_NAME, PackageKind,
+        };
+        use lichii_loader::testing::{Codec, NupPackage, build_nup};
+
+        let tmp = TempDir::new("nup");
+        let path = tmp.0.join("racing/Kart.NUP");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let nup = build_nup(
+            &[NupPackage::new(PackageKind::Base, 0x0100_0000_0001_0000, 0)
+                .file("exefs/main", b"main".to_vec(), Codec::Raw)
+                .file("exefs/main.npdm", b"npdm".to_vec(), Codec::Zstd)
+                .meta(META_TITLE_NAME, "Synthetic Kart")
+                .meta(META_PUBLISHER, "Lichii Tests")
+                .meta(META_DISPLAY_VERSION, "1.2.3")
+                .meta(META_ICON, png_icon())],
+        );
+        std::fs::write(&path, &nup).unwrap();
+
+        let games = scan(std::slice::from_ref(&tmp.0));
+        let summary: Vec<_> = games
+            .iter()
+            .map(|g| (g.name.as_str(), g.kind, g.size))
+            .collect();
+        assert_eq!(summary, [("Kart", GameKind::Nup, nup.len() as u64)]);
+        assert_eq!(GameKind::Nup.label(), "NUP");
+
+        let cache = MetadataCache::new(tmp.0.join("cache"), &tmp.0.join("keys"), &[]);
+        let (meta, icon) = read_metadata(&games[0], &LoadOptions::default(), Some(&cache)).unwrap();
+        assert_eq!(
+            meta,
+            Metadata {
+                title: "Synthetic Kart".into(),
+                publisher: "Lichii Tests".into(),
+                version: "1.2.3".into(),
+                program_id: 0x0100_0000_0001_0000,
+                generation: ConsoleGeneration::Switch1,
+            }
+        );
+        assert_eq!(&icon.expect("the icon decodes").0[..4], [200, 30, 30, 255]);
+
+        let record = std::fs::read_dir(&cache.dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "toml"))
+            .unwrap();
+        let text = std::fs::read_to_string(&record).unwrap();
+        std::fs::write(&record, text.replace("Synthetic Kart", "From Cache")).unwrap();
+        let (cached, icon) =
+            read_metadata(&games[0], &LoadOptions::default(), Some(&cache)).unwrap();
+        assert_eq!(cached.title, "From Cache");
+        assert!(icon.is_some(), "the cached icon is used");
     }
 
     #[test]

@@ -87,6 +87,20 @@ pub(crate) fn push_stub_zeroes(ctx: &mut HleRequestContext) {
     ctx.push_bytes(&[0; STUB_WORDS * 4]);
 }
 
+/// A service or interface the reference registers with no command handlers: unknown commands
+/// get the auto-stub reply for Switch 2 titles and fail for Switch 1 titles.
+pub(crate) struct Commandless(pub &'static str);
+
+impl Service for Commandless {
+    fn name(&self) -> &str {
+        self.0
+    }
+
+    fn handle(&self, _ctx: &mut HleRequestContext) -> Option<ResultCode> {
+        None
+    }
+}
+
 /// A Switch 2 interface nobody has implemented: every command gets the auto-stub reply.
 pub(crate) struct Nx2Stub(pub String);
 

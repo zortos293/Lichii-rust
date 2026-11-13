@@ -3,7 +3,9 @@
 //!
 //! Gaps: the shared fonts (0x810..0x814) are open-source fonts the C++ embeds; they are not
 //! synthesised here, so those ids fail until real system data or host font files are wired
-//! in. The time zone binary holds UTC only (the C++ embeds the full tzdb).
+//! in. The time zone binary holds every zone of the tz database, which the C++ embeds too.
+
+use std::collections::BTreeMap;
 
 use lichii_fs::romfs::build_romfs;
 use lichii_fs::{FileRef, MemDir};
@@ -15,8 +17,8 @@ const PLATFORM_STRING: &str = "NX";
 const VERSION_HASH: &str = "c2663accb7490a6ccfe9bc4dfd120ca215490525";
 const DISPLAY_VERSION: &str = "23.0.0";
 const DISPLAY_TITLE: &str = "NintendoSDK Firmware for NX 23.0.0-4.0";
-const TIME_ZONE_RULE_VERSION: &str = "2025b\n";
-const UTC_ZONES: [&str; 4] = ["Etc/GMT", "Etc/UTC", "GMT", "UTC"];
+/// The longest location name a `nn::time::LocationName` holds with its terminator.
+const LOCATION_NAME_MAX: usize = 0x23;
 
 /// The system data archive `title_id` as a RomFS image, when it can be synthesised.
 pub(super) fn synthesize(title_id: u64) -> Option<FileRef> {
@@ -114,36 +116,56 @@ fn system_version() -> MemDir {
     MemDir::new().with_bytes("file", file)
 }
 
-/// A TZif version 2 file for UTC: one zero-offset type and no transitions.
-fn utc_tzif() -> Vec<u8> {
-    let mut block = Vec::new();
-    block.extend_from_slice(b"TZif2");
-    block.extend_from_slice(&[0; 15]);
-    for count in [0u32, 0, 0, 0, 1, 4] {
-        block.extend_from_slice(&count.to_be_bytes());
-    }
-    block.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
-    block.extend_from_slice(b"UTC\0");
-    let mut out = block.clone();
-    out.extend_from_slice(&block);
-    out.extend_from_slice(b"\nUTC0\n");
-    out
-}
-
+/// The tz database's zones as `zoneinfo/<name>` TZif files, every name in `binaryList.txt`
+/// and the release in `version.txt`.
 fn time_zone_binary() -> MemDir {
-    let tzif = utc_tzif();
-    let list: String = UTC_ZONES.iter().map(|z| format!("{z}\n")).collect();
-    let etc = MemDir::new()
-        .with_bytes("GMT", tzif.clone())
-        .with_bytes("UTC", tzif.clone());
-    let zoneinfo = MemDir::new()
-        .with_dir("Etc", etc)
-        .with_bytes("GMT", tzif.clone())
-        .with_bytes("UTC", tzif);
+    enum Node {
+        File(&'static [u8]),
+        Dir(BTreeMap<&'static str, Node>),
+    }
+    fn into_dir(entries: BTreeMap<&'static str, Node>) -> MemDir {
+        entries
+            .into_iter()
+            .fold(MemDir::new(), |dir, (name, node)| match node {
+                Node::File(data) => dir.with_bytes(name, data),
+                Node::Dir(entries) => dir.with_dir(name, into_dir(entries)),
+            })
+    }
+
+    let names: Vec<&'static str> = tzdb_data::TZ_NAMES
+        .iter()
+        .copied()
+        .filter(|name| name.len() <= LOCATION_NAME_MAX)
+        .collect();
+    let mut zoneinfo = BTreeMap::new();
+    for &name in &names {
+        let Some(data) = tzdb_data::find_raw(name.as_bytes()) else {
+            continue;
+        };
+        let mut parts = name.split('/').peekable();
+        let mut dir = &mut zoneinfo;
+        while let Some(part) = parts.next() {
+            if parts.peek().is_none() {
+                dir.insert(part, Node::File(data));
+                break;
+            }
+            let Node::Dir(entries) = dir
+                .entry(part)
+                .or_insert_with(|| Node::Dir(BTreeMap::new()))
+            else {
+                unreachable!("tz database zone names never nest under another zone");
+            };
+            dir = entries;
+        }
+    }
+    let list: String = names.iter().map(|name| format!("{name}\n")).collect();
     MemDir::new()
         .with_bytes("binaryList.txt", list.into_bytes())
-        .with_bytes("version.txt", TIME_ZONE_RULE_VERSION.as_bytes().to_vec())
-        .with_dir("zoneinfo", zoneinfo)
+        .with_bytes(
+            "version.txt",
+            format!("{}\n", tzdb_data::VERSION).into_bytes(),
+        )
+        .with_dir("zoneinfo", into_dir(zoneinfo))
 }
 
 #[cfg(test)]
@@ -171,13 +193,18 @@ mod tests {
         assert_eq!(&version[0x68..0x6e], b"23.0.0");
 
         let utc = read(0x0100_0000_0000_080E, "zoneinfo/Etc/UTC");
-        assert_eq!(&utc[..5], b"TZif2");
+        assert_eq!(&utc[..4], b"TZif");
         assert!(utc.ends_with(b"\nUTC0\n"));
+        let amsterdam = read(0x0100_0000_0000_080E, "zoneinfo/Europe/Amsterdam");
+        assert!(amsterdam.ends_with(b"\nCET-1CEST,M3.5.0,M10.5.0/3\n"));
+        let list = String::from_utf8(read(0x0100_0000_0000_080E, "binaryList.txt")).unwrap();
+        let names: Vec<&str> = list.lines().collect();
+        assert_eq!(names.len(), tzdb_data::TZ_NAMES.len());
+        assert!(names.contains(&"Europe/Amsterdam") && names.contains(&"UTC"));
         assert_eq!(
-            read(0x0100_0000_0000_080E, "binaryList.txt"),
-            b"Etc/GMT\nEtc/UTC\nGMT\nUTC\n"
+            read(0x0100_0000_0000_080E, "version.txt"),
+            format!("{}\n", tzdb_data::VERSION).into_bytes()
         );
-        assert_eq!(read(0x0100_0000_0000_080E, "version.txt"), b"2025b\n");
 
         assert_eq!(
             read(0x0100_0000_0000_0802, "ShapeMid.dat")[..5],

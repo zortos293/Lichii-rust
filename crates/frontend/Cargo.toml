@@ -29,3 +29,6 @@ serde.workspace = true
 toml.workspace = true
 tracing.workspace = true
 winit.workspace = true
+
+[dev-dependencies]
+lichii-loader = { workspace = true, features = ["testing"] }
