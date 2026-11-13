@@ -89,6 +89,14 @@ pub trait ShaderEnvironment {
     fn start_address(&self) -> GpuVAddr;
     /// Reads one 64-bit word of program memory at `address`.
     fn read_u64(&self, address: GpuVAddr) -> u64;
+    /// Reads program memory from `address` into `out`, whose length is a multiple of 8, as
+    /// [`Self::read_u64`] would word by word. Override it where a block read is cheaper.
+    fn read_code(&self, address: GpuVAddr, out: &mut [u8]) {
+        for (i, word) in out.chunks_exact_mut(8).enumerate() {
+            let value = self.read_u64(address.wrapping_add(i as u64 * 8));
+            word.copy_from_slice(&value.to_le_bytes());
+        }
+    }
     /// Value of constant buffer `index` at byte `offset`, for bindless handle tracking.
     fn read_cbuf(&self, index: u32, offset: u32) -> u32;
     /// Shared memory size in bytes (compute).

@@ -549,6 +549,18 @@ impl ShaderEnvironment for ProgramEnv<'_> {
         self.gmmu.read::<u64>(address).unwrap_or(0)
     }
 
+    fn read_code(&self, address: GpuVAddr, out: &mut [u8]) {
+        let (low, high) = self.extent.get();
+        let end = address.saturating_add(out.len() as u64);
+        self.extent.set((low.min(address), high.max(end)));
+        if self.gmmu.read_block(address, out).is_err() {
+            for (i, word) in out.chunks_exact_mut(8).enumerate() {
+                let value = self.gmmu.read::<u64>(address + i as u64 * 8).unwrap_or(0);
+                word.copy_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
+
     fn read_cbuf(&self, index: u32, offset: u32) -> u32 {
         let value = self.cbuf_word(index, offset);
         self.record(EnvRead::Cbuf {

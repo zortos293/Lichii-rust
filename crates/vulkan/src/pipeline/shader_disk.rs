@@ -1,8 +1,8 @@
 //! The per-title file of translated shaders (`lichii_shader::cache`): every entry loaded at
 //! start-up and indexed by its probe key, and the entries translated since, appended in a
-//! batch.
+//! batch. A module goes into the file once, before the first entry that uses it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -18,8 +18,10 @@ pub(crate) struct ShaderDisk {
     entries: HashMap<u64, Vec<CacheEntry>, FxBuildHasher>,
     /// Bytes of the file up to its last complete record.
     len: u64,
-    /// Encoded entries not written yet.
+    /// Encoded records not written yet.
     pending: Vec<u8>,
+    /// Hashes of the modules in the file or in `pending`.
+    stored: HashSet<u64, FxBuildHasher>,
 }
 
 impl ShaderDisk {
@@ -64,11 +66,17 @@ impl ShaderDisk {
         if count > 0 {
             tracing::info!("shader cache: {count} translated programs");
         }
+        let stored = entries
+            .values()
+            .flatten()
+            .map(|entry| entry.module().hash)
+            .collect();
         Ok(Self {
             path,
             entries,
             len: len as u64,
             pending: Vec::new(),
+            stored,
         })
     }
 
@@ -89,6 +97,9 @@ impl ShaderDisk {
 
     /// Queues `entry` for the next [`Self::flush`].
     pub(crate) fn append(&mut self, entry: &CacheEntry) {
+        if self.stored.insert(entry.module().hash) {
+            cache::encode_module(entry.module(), &mut self.pending);
+        }
         entry.encode(&mut self.pending);
     }
 
