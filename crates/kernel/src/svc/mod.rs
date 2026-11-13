@@ -156,11 +156,28 @@ pub(crate) fn dispatch(svc: &mut SvcContext, imm: u32) -> Flow {
         target: "svc",
         thread = svc.thread.id(),
         svc = format_args!("{imm:#04x}"),
-        args = format_args!("{args:#x?}"),
-        out = format_args!("{:#x?}", &svc.ctx.x[..4]),
+        args = %Registers(&args),
+        out = %Registers(&svc.ctx.x[..4]),
         blocked = flow == Flow::Switch,
     );
     flow
+}
+
+/// Registers in a `debug.svc_trace` line: bare hex words between brackets, so each call stays
+/// on one short line.
+struct Registers<'a>(&'a [u64]);
+
+impl std::fmt::Display for Registers<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[")?;
+        for (i, value) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(" ")?;
+            }
+            write!(f, "{value:x}")?;
+        }
+        f.write_str("]")
+    }
 }
 
 fn call(svc: &mut SvcContext, imm: u32) -> Flow {
@@ -243,5 +260,17 @@ fn call(svc: &mut SvcContext, imm: u32) -> Flow {
             svc.set_result(result::NOT_IMPLEMENTED);
             Flow::Continue
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Registers;
+
+    #[test]
+    fn trace_registers_are_one_compact_line() {
+        let line = Registers(&[0x20_b3e0_ca94, 2, 0, u64::MAX]).to_string();
+        assert_eq!(line, "[20b3e0ca94 2 0 ffffffffffffffff]");
+        assert_eq!(Registers(&[]).to_string(), "[]");
     }
 }
