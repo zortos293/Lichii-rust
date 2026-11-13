@@ -495,6 +495,7 @@ alu_class!(
     }
 );
 alu_class!(int_to_fp_in_simd, "01x111100x100001110110xxxxxxxxxx");
+alu_class!(fcvt_from_half, "0001111011100010x10000xxxxxxxxxx");
 alu_class!(ext, "0x101110000xxxxx0xxxx0xxxxxxxxxx", |w| w & 0x4000_4000
     != 0x4000);
 alu_class!(
