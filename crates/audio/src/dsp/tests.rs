@@ -582,7 +582,7 @@ fn mix_helpers_match_cpp() {
     mix::apply_linear_envelope::<23>(&mut rig.mix, SC, 0, 0.1, 0.0025, SC);
     rig.report(&mut out, "envelope23", 0, &[1]);
 
-    let decay = Q15::from_f32(0.96218872);
+    let decay = Q15::from_f32(0.9621887);
     rig.buffer(1).fill(5);
     rig.state.depop[1] = -12345;
     rig.run(vec![Command::DepopForMixBuffers(
