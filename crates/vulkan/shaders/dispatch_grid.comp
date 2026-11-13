@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// Unpacks the grid of a version 1.x compute launch descriptor (words 0xc and 0xd: the width in
-// bits 0..30, then the height and depth as 16-bit halves) into a VkDispatchIndirectCommand,
-// clamped to the device's workgroup count limits.
+// Unpacks the grid of a compute launch descriptor into a VkDispatchIndirectCommand, clamped to
+// the device's workgroup count limits. Version 1.x (words 0xc and 0xd): the width in bits 0..30,
+// then the height and depth as 16-bit halves. Version 3.0 (words 12 to 14): the width is the
+// whole first word, the height and depth the low 16 bits of the second and third.
 
 #version 460
 
@@ -14,11 +15,18 @@ layout(set = 0, binding = 1) writeonly buffer Command { uint command[]; };
 layout(push_constant) uniform P {
     uvec3 limit;
     uint grid_word;
+    uint v3;
 } p;
 
 void main() {
+    uint width = grid[p.grid_word];
     uint height_depth = grid[p.grid_word + 1u];
-    uvec3 size = uvec3(grid[p.grid_word] & 0x7fffffffu, height_depth & 0xffffu, height_depth >> 16u);
+    uvec3 size;
+    if (p.v3 != 0u) {
+        size = uvec3(width, height_depth & 0xffffu, grid[p.grid_word + 2u] & 0xffffu);
+    } else {
+        size = uvec3(width & 0x7fffffffu, height_depth & 0xffffu, height_depth >> 16u);
+    }
     uvec3 clamped = min(size, p.limit);
     command[0] = clamped.x;
     command[1] = clamped.y;
