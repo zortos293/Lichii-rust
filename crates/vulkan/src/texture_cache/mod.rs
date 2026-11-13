@@ -959,6 +959,26 @@ impl TextureCache {
         result
     }
 
+    /// Write tracking saw guest CPU writes in the pages of `[daddr, daddr + size)`: images
+    /// that hold only guest data re-upload on next use. GPU-modified images keep their texels,
+    /// which a write beside them on a shared page must not replace.
+    pub fn cpu_written(&mut self, daddr: DAddr, size: u64) {
+        self.collect_overlaps(&[Segment {
+            offset: 0,
+            daddr,
+            size,
+        }]);
+        let ids = std::mem::take(&mut self.ids);
+        for &id in &ids {
+            let image = self.image(id);
+            if !image.gpu_modified {
+                image.cpu_dirty = true;
+                image.tracked.clear();
+            }
+        }
+        self.ids = ids;
+    }
+
     /// Writes GPU-modified images overlapping `[daddr, daddr + size)` back to guest memory.
     pub fn flush(&mut self, tx: &mut Transfer<'_>, daddr: DAddr, size: u64) -> Result<()> {
         self.collect_overlaps(&[Segment {

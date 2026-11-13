@@ -743,6 +743,17 @@ impl BufferCache {
         if self.gpu_written.intersects(daddr, end) {
             self.gpu_written.subtract(daddr, end);
         }
+        self.cpu_written(daddr, size);
+    }
+
+    /// Write tracking saw guest CPU writes in the pages of `[daddr, +size)`: they upload
+    /// again before their next use, except bytes GPU work wrote. Those may lie beside the
+    /// CPU's bytes on a page, so they stay until [`BufferCache::flush`] downloads them.
+    pub fn cpu_written(&mut self, daddr: DAddr, size: u64) {
+        let end = daddr.saturating_add(size).min(self.limit);
+        if daddr >= end {
+            return;
+        }
         let mut page = daddr >> CACHING_PAGE_BITS;
         while page < end.div_ceil(CACHING_PAGE_SIZE) {
             let Some(id) = Self::lookup(&self.page_table, page << CACHING_PAGE_BITS) else {
@@ -1843,7 +1854,7 @@ mod tests {
                 "{offset:#x}: the write was tracked"
             );
             let memory = f.memory.clone();
-            memory.take_cpu_writes(|daddr, size| f.cache.invalidate(daddr, size));
+            memory.take_cpu_writes(|daddr, size| f.cache.cpu_written(daddr, size));
             f.acquire(DADDR, 0x10000);
         }
         assert_eq!(
@@ -1857,6 +1868,38 @@ mod tests {
             f.read_binding(binding) == guest,
             "the buffer holds the CPU's bytes"
         );
+        f.assert_no_validation_errors();
+    }
+
+    /// A guest CPU write beside GPU-written bytes on one page, seen by write tracking for the
+    /// whole page, keeps both.
+    #[test]
+    fn cpu_writes_beside_gpu_writes_keep_both() {
+        const CPU_VA: u64 = 0x1000_0000;
+        let Some(mut f) = fixture() else { return };
+        let space = Arc::new(AddressSpace::new(f.memory.physical().clone(), 39));
+        space.map(CPU_VA, 0, 0x10000, MemoryPermission::READ_WRITE);
+        f.memory.attach_process(space.clone());
+        let original = pattern(0x3000, 4);
+        space.write_bytes(CPU_VA + 0x2000, &original).unwrap();
+        let binding = f.acquire(DADDR + 0x2000, 0x3000);
+        f.gpu_fill(binding, 0x40, 0x100, 0xdead_beef);
+        f.cache.mark_gpu_written(DADDR + 0x2040, 0x100);
+        let cpu = [0x5a; 16];
+        space.write_bytes(CPU_VA + 0x2400, &cpu).unwrap();
+        let memory = f.memory.clone();
+        let mut drained = Vec::new();
+        memory.take_cpu_writes(|daddr, size| {
+            drained.push((daddr, size));
+            f.cache.cpu_written(daddr, size);
+        });
+        assert_eq!(drained, [(DADDR + 0x2000, PAGE_SIZE)]);
+        f.acquire(DADDR + 0x2000, 0x3000);
+        f.cache.flush(&mut f.scheduler, DADDR, 0x10000).unwrap();
+        let mut expected = original;
+        expected[0x40..0x140].copy_from_slice(&0xdead_beef_u32.to_le_bytes().repeat(0x40));
+        expected[0x400..0x410].copy_from_slice(&cpu);
+        assert_eq!(f.guest(DADDR + 0x2000, 0x3000), expected);
         f.assert_no_validation_errors();
     }
 

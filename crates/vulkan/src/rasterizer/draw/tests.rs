@@ -434,7 +434,35 @@ fn cpu_space(f: &Fixture, maps: &[(u64, u64)], size: u64) -> Arc<AddressSpace> {
 /// Hands the guest CPU writes write tracking saw to the renderer, as the GPU back does.
 fn drain_cpu_writes(f: &mut Fixture) {
     let memory = f.memory.clone();
-    memory.take_cpu_writes(|daddr, size| f.rasterizer.invalidate_region(daddr, size));
+    memory.take_cpu_writes(|daddr, size| f.rasterizer.cpu_written(daddr, size));
+}
+
+/// A guest CPU write beside a render target on the page holding its last texels leaves the
+/// GPU's texels alone.
+#[test]
+fn cpu_writes_beside_a_render_target_keep_its_texels() {
+    const CPU_VA: u64 = 0x1000_0000;
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let space = cpu_space(&f, &[(CPU_VA, 0)], 0x1_0000);
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    let regs = draw_regs();
+    draw(&mut f, &gmmu, &regs);
+    let end = Tiling::new(SIZE, SIZE, 1, 4, 1, 0, GobLayout::Tegra).size_bytes() as u64;
+    assert_ne!(end % 0x1000, 0, "the target ends inside a page");
+    space.write_bytes(CPU_VA + end, &[0x5a; 16]).unwrap();
+    assert!(f.memory.has_cpu_writes(), "the target's pages are tracked");
+    drain_cpu_writes(&mut f);
+    assert!(
+        target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]),
+        "the drawn texels"
+    );
+    f.assert_no_validation_errors();
 }
 
 /// A guest CPU write to a program's bytes comes back through write tracking and translates the
