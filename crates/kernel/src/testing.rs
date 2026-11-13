@@ -25,15 +25,23 @@ use crate::{Kernel, KernelConfig};
 const CODE_SIZE: u64 = 0x100_0000;
 const SCRATCH_OFFSET: u64 = 0x10_0000;
 
-struct HostClock(Instant);
+struct HostClock {
+    start: Instant,
+    hz: u64,
+}
 
 impl GuestClock for HostClock {
     fn ticks(&self) -> u64 {
-        (self.0.elapsed().as_nanos() * 192 / 10_000) as u64
+        (self.start.elapsed().as_nanos() * u128::from(self.hz) / 1_000_000_000) as u64
+    }
+
+    fn frequency(&self) -> u64 {
+        self.hz
     }
 }
 
-/// A kernel with 256 MiB of DRAM whose cores never run (tests drive it from the host).
+/// A kernel with 256 MiB of DRAM whose cores never run (tests drive it from the host). Its clock
+/// ticks at the generation's counter rate, as `core::System` sets it for a title.
 pub fn kernel(console: ConsoleGeneration) -> Kernel {
     Kernel::new(KernelConfig {
         console,
@@ -46,7 +54,13 @@ pub fn kernel(console: ConsoleGeneration) -> Kernel {
         fastmem: false,
         aslr: false,
         rng_seed: 1,
-        clock: Arc::new(HostClock(Instant::now())),
+        clock: Arc::new(HostClock {
+            start: Instant::now(),
+            hz: match console {
+                ConsoleGeneration::Switch1 => 19_200_000,
+                ConsoleGeneration::Switch2 => 31_250_000,
+            },
+        }),
         cpu: Arc::new(|config| lichii_cpu::new_core(CpuBackend::Interpreter, config)),
         events: None,
     })
@@ -102,6 +116,8 @@ pub fn program_image(program_id: u64) -> ProgramImage {
         entry_offset: 0,
         romfs: None,
         nacp: None,
+        icon: None,
+        version: 0,
         pseudo_device_seed: program_id,
         add_ons: Vec::new(),
     }

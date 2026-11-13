@@ -170,6 +170,13 @@ impl Settings {
 
         self.audio.volume = self.audio.volume.min(200);
 
+        let zone = self.system.time_zone.trim();
+        self.system.time_zone = if zone.is_empty() || zone.eq_ignore_ascii_case(TIME_ZONE_AUTO) {
+            TIME_ZONE_AUTO.into()
+        } else {
+            zone.into()
+        };
+
         for (action, hotkey) in HotkeyAction::defaults() {
             self.ui.hotkeys.entry(action).or_insert(hotkey);
         }
@@ -260,7 +267,15 @@ pub struct SystemSettings {
     pub memory_layout: MemoryLayout,
     pub username: String,
     pub rng_seed: Option<u32>,
+    /// The console's time zone: [`TIME_ZONE_AUTO`] follows the host, anything else is an IANA
+    /// name such as `Europe/Amsterdam`.
+    pub time_zone: String,
+    /// Whether titles may go online; when false the network services report no connection.
+    pub network_enabled: bool,
 }
+
+/// The [`SystemSettings::time_zone`] value that follows the host's time zone.
+pub const TIME_ZONE_AUTO: &str = "auto";
 
 impl Default for SystemSettings {
     fn default() -> Self {
@@ -272,6 +287,8 @@ impl Default for SystemSettings {
             memory_layout: MemoryLayout::Auto,
             username: "lichii".into(),
             rng_seed: None,
+            time_zone: TIME_ZONE_AUTO.into(),
+            network_enabled: false,
         }
     }
 }
@@ -1309,6 +1326,20 @@ mod tests {
 
     fn load(text: &str) -> (Settings, Vec<String>) {
         Settings::from_toml(text).unwrap()
+    }
+
+    #[test]
+    fn time_zone_and_network() {
+        let (settings, _) = load("");
+        assert_eq!(settings.system.time_zone, TIME_ZONE_AUTO);
+        assert!(!settings.system.network_enabled);
+        let text = "[system]\ntime_zone = \" Europe/Amsterdam \"\nnetwork_enabled = true\n";
+        let (settings, _) = load(text);
+        assert_eq!(settings.system.time_zone, "Europe/Amsterdam");
+        assert!(settings.system.network_enabled);
+        let zone = |text: &str| load(text).0.system.time_zone;
+        assert_eq!(zone("[system]\ntime_zone = \"\"\n"), TIME_ZONE_AUTO);
+        assert_eq!(zone("[system]\ntime_zone = \"AUTO\"\n"), TIME_ZONE_AUTO);
     }
 
     #[test]
