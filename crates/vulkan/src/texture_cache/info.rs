@@ -3,7 +3,7 @@
 //! there.
 
 use ash::vk;
-use lichii_gpu::backend::FramebufferConfig;
+use lichii_gpu::backend::{CopySurface, FramebufferConfig};
 use lichii_gpu::engines::maxwell_3d::regs::{
     RenderTargetConfig, TileMode, TileModeDimensionControl, Zeta, ZetaSize,
     ZetaSizeDimensionControl,
@@ -221,6 +221,52 @@ impl ImageInfo {
             downscaleable: !volume && height > DOWNSCALE_HEIGHT_THRESHOLD,
         };
         Some(Self::with_stride(info, u64::from(zeta.array_pitch) * 4))
+    }
+
+    /// The image one side of a 2D engine blit reads or writes, laid out as a render target of
+    /// that surface would be. `None` for what blits there do not cover: volume surfaces, a layer
+    /// other than the first, and blocks wider or deeper than one GOB.
+    pub fn from_copy_surface(
+        surface: &CopySurface,
+        format: PixelFormat,
+        gob: GobLayout,
+    ) -> Option<Self> {
+        if surface.address == 0
+            || surface.width == 0
+            || surface.height == 0
+            || surface.depth > 1
+            || surface.layer != 0
+        {
+            return None;
+        }
+        let Some((block_width, block_height_log2, block_depth_log2)) = surface.block else {
+            return (surface.pitch != 0)
+                .then(|| Self::pitch(format, surface.pitch, surface.height));
+        };
+        if block_width != 0 || block_depth_log2 != 0 {
+            return None;
+        }
+        let layout = GuestLayout::BlockLinear {
+            block_height_log2,
+            block_depth_log2: 0,
+            tile_width_spacing: 0,
+            gob,
+        };
+        let info = Self {
+            format,
+            kind: ImageKind::D2,
+            layout,
+            width: surface.width,
+            height: surface.height,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            layer_stride: 0,
+            rescaleable: surface.height > RESCALE_HEIGHT_THRESHOLD,
+            downscaleable: surface.height > DOWNSCALE_HEIGHT_THRESHOLD,
+        };
+        Some(Self::with_stride(info, 0))
     }
 
     /// The image a presented framebuffer reads.

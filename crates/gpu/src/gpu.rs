@@ -399,6 +399,7 @@ impl Gpu {
             timestamp: Arc::new(GpuTimestamp::new(time, config.console == Console::Switch2)),
             written_pages: host1x.written_pages.clone(),
             lazy: host1x.lazy.clone(),
+            activity: Arc::new(Activity::new()),
         };
         let nx2_memory = (config.console == Console::Switch2).then(|| {
             Nx2GpuMemory::new(
@@ -415,7 +416,7 @@ impl Gpu {
         let back_progress = producer.progress();
         let (side_sender, side_receiver) = mpsc::channel();
         let fetch_syncs = Arc::new(FetchSyncs::new(inbox.clone()));
-        let activity = Arc::new(Activity::new());
+        let activity = handles.activity.clone();
         let back = Back::new(
             rasterizer,
             &handles,

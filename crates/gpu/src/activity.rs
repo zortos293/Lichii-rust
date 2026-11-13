@@ -102,14 +102,19 @@ impl Default for Activity {
     }
 }
 
-/// Times a [`Wait`] until it is dropped.
+/// Times a [`Wait`] until it is dropped. A guard taken while the same wait is already timed
+/// times nothing: the outer guard covers it.
 pub struct Waiting<'a> {
     activity: &'a Activity,
     wait: Wait,
+    nested: bool,
 }
 
 impl Drop for Waiting<'_> {
     fn drop(&mut self) {
+        if self.nested {
+            return;
+        }
         let clock = &self.activity.waits[self.wait as usize];
         let since = clock.since.swap(NOT_WAITING, Ordering::AcqRel);
         if since != NOT_WAITING {
@@ -162,12 +167,14 @@ impl Activity {
     /// Starts timing a `wait`, which lasts until the returned guard is dropped.
     #[must_use]
     pub fn waiting(&self, wait: Wait) -> Waiting<'_> {
-        self.waits[wait as usize]
+        let nested = self.waits[wait as usize]
             .since
-            .store(self.now(), Ordering::Release);
+            .compare_exchange(NOT_WAITING, self.now(), Ordering::AcqRel, Ordering::Acquire)
+            .is_err();
         Waiting {
             activity: self,
             wait,
+            nested,
         }
     }
 
@@ -436,6 +443,22 @@ mod tests {
             0,
             "an ended wait is counted once"
         );
+    }
+
+    #[test]
+    fn a_nested_wait_is_timed_by_the_outer_guard_only() {
+        let activity = Activity::new();
+        let clock = &activity.waits[Wait::HostGpu as usize];
+        let outer = activity.waiting(Wait::HostGpu);
+        clock.since.store(1_000, Ordering::Relaxed);
+        drop(activity.waiting(Wait::HostGpu));
+        assert_eq!(clock.since.load(Ordering::Relaxed), 1_000);
+        assert_eq!(clock.take(5_000), 4_000);
+        clock.since.store(0, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(1));
+        drop(outer);
+        assert_eq!(clock.since.load(Ordering::Relaxed), NOT_WAITING);
+        assert!(clock.take(activity.now()) >= 1_000_000);
     }
 
     #[test]
