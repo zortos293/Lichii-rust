@@ -20,7 +20,7 @@ use gpu_allocator::MemoryLocation;
 use lichii_common::{DAddr, GpuVAddr, PAGE_BITS, PAGE_SIZE};
 use lichii_gpu::backend::{DrawParams, GpuWrittenPages, InlineIndices};
 use lichii_gpu::engines::maxwell_3d::Regs;
-use lichii_gpu::engines::maxwell_3d::regs::{IndexFormat, PrimitiveTopology};
+use lichii_gpu::engines::maxwell_3d::regs::{IndexBuffer, IndexFormat, PrimitiveTopology};
 use lichii_gpu::gmmu::{Gmmu, GpuRange, RangeTarget};
 use lichii_gpu::lazy::LazyDeviceRanges;
 use lichii_memory::{CachedPages, DeviceAddressSpace};
@@ -1338,11 +1338,7 @@ impl BufferCache {
             _ => return Ok(Some(IndexBinding::EMPTY)),
         };
         let start = index_buffer.start_addr();
-        let available = index_buffer
-            .limit_addr()
-            .wrapping_add(1)
-            .saturating_sub(start)
-            / width;
+        let available = index_capacity(index_buffer, width);
         let first = u64::from(draw.first).min(available);
         let count = u64::from(draw.count).min(available - first) as u32;
         if start == 0 || count == 0 {
@@ -1519,6 +1515,16 @@ impl BufferCache {
             index_count,
             vertex_offset: draw.first as i32,
         })
+    }
+}
+
+/// Indices of `width` bytes the guest index buffer holds: up to its inclusive limit, or
+/// `u32::MAX` when the limit lies below the start, where the reference (which takes the span
+/// as a wrapping `u32`) does not clamp the draw either.
+pub(crate) fn index_capacity(buffer: &IndexBuffer, width: u64) -> u64 {
+    match buffer.limit_addr().checked_sub(buffer.start_addr()) {
+        Some(span) => (span + 1) / width,
+        None => u64::from(u32::MAX),
     }
 }
 
@@ -2290,6 +2296,31 @@ mod tests {
         };
         let binding = f.index_buffer(&r, &inline_draw).unwrap();
         assert_eq!(f.read_indices(binding), [3, 4, 5, 3, 5, 6]);
+        f.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn index_buffers_with_a_limit_below_their_start_draw_every_index() {
+        let Some(mut f) = fixture() else { return };
+        f.gmmu.map(GPU_VA, DADDR, 0x10000, 0, false).unwrap();
+        let indices = [4u16, 5, 6, 7, 8, 9];
+        let bytes: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+        f.memory.write_bytes(DADDR + 0x3000, &bytes).unwrap();
+        f.cache.invalidate(DADDR + 0x3000, bytes.len() as u64);
+        let mut regs = bytemuck::zeroed_box::<Regs>();
+        regs.index_buffer.start_addr_low = (GPU_VA + 0x3000) as u32;
+        regs.index_buffer.format = IndexFormat::UNSIGNED_SHORT;
+        for (limit, case) in [
+            (0, "a limit never programmed"),
+            (GPU_VA + 0x1000, "a stale limit"),
+        ] {
+            regs.index_buffer.limit_addr_low = limit as u32;
+            let binding = f
+                .index_buffer(&regs, &draw(PrimitiveTopology::TRIANGLES, true, 1, 3))
+                .unwrap();
+            assert_eq!((binding.first_index, binding.index_count), (1, 3), "{case}");
+            assert_eq!(f.read_indices(binding), [5, 6, 7], "{case}");
+        }
         f.assert_no_validation_errors();
     }
 

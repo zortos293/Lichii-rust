@@ -1651,11 +1651,7 @@ impl VulkanRasterizer {
             _ => 4,
         };
         let buffer = &regs.index_buffer;
-        let count = buffer
-            .limit_addr()
-            .wrapping_add(1)
-            .saturating_sub(buffer.start_addr())
-            / width;
+        let count = crate::buffer_cache::index_capacity(buffer, width);
         let params = DrawParams {
             topology: draw.topology,
             indexed: true,
