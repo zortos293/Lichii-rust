@@ -29,6 +29,7 @@ impl App {
         }
         self.dialogs(ui.ctx(), actions);
         self.show_config(ui.ctx());
+        self.show_setup(ui.ctx());
         if let Some((_, at)) = &self.ui.toast {
             let left = crate::app::TOAST_TIME.saturating_sub(at.elapsed());
             if left.is_zero() {
@@ -73,6 +74,10 @@ impl App {
                     actions.push(Action::ClearRecent);
                 }
             });
+            ui.separator();
+            if ui.button("Keys and Firmware…").clicked() {
+                actions.push(Action::KeysAndFirmware);
+            }
             ui.separator();
             if self.menu_item(ui, "Exit", HotkeyAction::Exit, true) {
                 actions.push(Action::Hotkey(HotkeyAction::Exit));

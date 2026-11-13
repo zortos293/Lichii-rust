@@ -1029,12 +1029,21 @@ fn bind(
     let raw_flags = prog.inst(id).flags;
     let mut flags = TextureInstInfo::from_flags(raw_flags);
     let mut is_multisample = false;
-    let mut is_rect_sample = false;
+    let is_rect_sample = flags.ty == TextureType::Color2D
+        && matches!(
+            op,
+            Opcode::ImageSampleImplicitLod
+                | Opcode::ImageSampleExplicitLod
+                | Opcode::ImageSampleDrefImplicitLod
+                | Opcode::ImageSampleDrefExplicitLod
+                | Opcode::ImageGather
+                | Opcode::ImageGatherDref
+                | Opcode::ImageGradient
+                | Opcode::ImageQueryLod
+        )
+        && tracker.texture_type(cbuf.handle) == TextureType::Color2DRect;
     match op {
         Opcode::ImageQueryDimensions => flags.ty = tracker.resolved_type(op, flags.ty, &cbuf),
-        Opcode::ImageSampleImplicitLod if flags.ty == TextureType::Color2D => {
-            is_rect_sample = tracker.texture_type(cbuf.handle) == TextureType::Color2DRect;
-        }
         Opcode::ImageFetch => {
             if matches!(
                 flags.ty,
@@ -1209,11 +1218,14 @@ fn byte_address_to_texel(
     Ok(())
 }
 
-/// Divides the coordinates of a sample from a rectangle texture by its size: the guest samples
-/// it with normalized coordinates the host reads as texels. Expects the descriptor assigned.
+/// Divides the coordinates of a sample, gather or LOD query from a rectangle texture by its
+/// size, and the explicit gradients of a gradient sample with them: the guest addresses a
+/// rectangle texture in texels in every sample, the host only with normalized coordinates.
+/// Expects the descriptor assigned.
 fn normalize_rect_coords(prog: &mut Program, id: InstId) {
-    let flags = prog.inst(id).flags;
+    let (op, flags) = (prog.op(id), prog.inst(id).flags);
     let coords = prog.arg(id, 1);
+    let derivatives = (op == Opcode::ImageGradient).then(|| prog.arg(id, 2));
     let handle = match prog.arg(id, 0) {
         Value::Void => Value::U32(0),
         handle => handle,
@@ -1225,17 +1237,27 @@ fn normalize_rect_coords(prog: &mut Program, id: InstId) {
         flags,
         &[handle, Value::U32(0), Value::U1(true)],
     );
-    let axis = |ir: &mut Emitter<'_>, component| {
-        let coord = ir.composite_extract(coords, component);
+    let recip = |ir: &mut Emitter<'_>, component| {
         let extent = ir.composite_extract(size, component);
         let extent = ir.convert_i_to_f(32, 32, false, extent, fp);
-        let recip = ir.fp_recip(extent);
-        ir.fp_mul(coord, recip, fp)
+        ir.fp_recip(extent)
     };
-    let x = axis(&mut ir, 0);
-    let y = axis(&mut ir, 1);
-    let normalized = ir.composite_construct(&[x, y]);
+    let recips = [recip(&mut ir, 0), recip(&mut ir, 1)];
+    let scale = |ir: &mut Emitter<'_>, vector: Value, components: usize| {
+        let scaled: Vec<Value> = (0..components)
+            .map(|component| {
+                let value = ir.composite_extract(vector, component as u32);
+                ir.fp_mul(value, recips[component * 2 / components], fp)
+            })
+            .collect();
+        ir.composite_construct(&scaled)
+    };
+    let normalized = scale(&mut ir, coords, 2);
+    let derivatives = derivatives.map(|derivatives| scale(&mut ir, derivatives, 4));
     prog.set_arg(id, 1, normalized);
+    if let Some(derivatives) = derivatives {
+        prog.set_arg(id, 2, derivatives);
+    }
 }
 
 /// Hosts without SNORM texel buffers read them as integers: converts each component.

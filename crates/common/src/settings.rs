@@ -1163,6 +1163,8 @@ pub struct UiSettings {
     pub window_height: u32,
     pub window_maximized: bool,
     pub hotkeys: BTreeMap<HotkeyAction, Hotkey>,
+    /// The keys and firmware setup was closed once; it no longer opens by itself at startup.
+    pub setup_done: bool,
 }
 
 impl Default for UiSettings {
@@ -1178,6 +1180,7 @@ impl Default for UiSettings {
             window_height: 760,
             window_maximized: false,
             hotkeys: HotkeyAction::defaults().collect(),
+            setup_done: false,
         }
     }
 }
