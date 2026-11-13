@@ -377,6 +377,50 @@ fn draws_skip_while_workers_translate_their_programs() {
 }
 
 #[test]
+fn a_fragment_program_after_another_vertex_program_with_the_same_outputs_is_not_translated_again() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    let mut header = header(1, ShaderType::VERTEX_B);
+    header[6] = 0b11;
+    let ald = sass(
+        Opcode::Ald,
+        (1 << 47) | (RZ << 39) | (0x80 << 20) | (RZ << 8),
+    );
+    let ast = sass(
+        Opcode::Ast,
+        (3 << 47) | (RZ << 39) | (0x70 << 20) | (RZ << 8),
+    );
+    let reordered = [ald, mov_cbuf(3, 4), mov_cbuf(2, 0), ast, exit()];
+    const OTHER_VERTEX: u32 = 0x400;
+    write(
+        &f,
+        PROGRAMS + u64::from(OTHER_VERTEX),
+        &program(header, &reordered),
+    );
+    let mut regs = draw_regs();
+    draw(&mut f, &gmmu, &regs);
+    let fragment = |f: &Fixture| f.rasterizer.draw.stages[4].clone().unwrap();
+    let (first, vertex) = (fragment(&f), f.rasterizer.draw.stages[0].clone().unwrap());
+    regs.pipelines[1].offset = OTHER_VERTEX;
+    draw(&mut f, &gmmu, &regs);
+    let other_vertex = f.rasterizer.draw.stages[0].clone().unwrap();
+    assert_ne!(vertex.hash, other_vertex.hash, "another vertex module");
+    assert!(
+        Arc::ptr_eq(&first, &fragment(&f)),
+        "the fragment module reads the same outputs"
+    );
+    assert_eq!(f.rasterizer.draw.shaders.stats().translated, 3);
+    assert!(target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]));
+    f.assert_no_validation_errors();
+}
+
+#[test]
 fn draws_of_untranslatable_programs_are_skipped_without_retrying() {
     let Some((mut f, gmmu)) = draw_fixture() else {
         return;

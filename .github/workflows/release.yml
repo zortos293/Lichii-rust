@@ -1,0 +1,30 @@
+name: Release
+
+# A Windows build of the desktop app with the FFmpeg DLLs it loads next to lichii.exe.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  ffmpeg-windows:
+    uses: ./.github/workflows/ffmpeg-windows.yml
+
+  windows:
+    needs: ffmpeg-windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: ffmpeg-windows
+          path: dist
+      - run: cargo build --release -p lichii
+      - run: Copy-Item target/release/lichii.exe dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lichii-windows-x64
+          path: dist

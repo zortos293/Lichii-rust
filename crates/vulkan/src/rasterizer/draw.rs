@@ -399,7 +399,8 @@ fn input_topology(topology: vk::PrimitiveTopology) -> InputTopology {
 /// from the draw, so hashing it keys the module and `runtime` rebuilds the info on a miss.
 #[derive(Clone, Copy, Hash)]
 struct StageState {
-    /// Module hash of the previous stage, whose outputs this one reads (0 for vertex).
+    /// What `runtime` takes from the previous stage, whose outputs this one reads (0 for
+    /// vertex): the module hash would key every pairing with another program apart.
     previous: u64,
     generic_inputs: [AttributeType; 32],
     convert_depth_mode: bool,
@@ -422,7 +423,7 @@ impl StageState {
     ) -> Self {
         let fragment = slot == 5;
         let mut state = Self {
-            previous: previous.map_or(0, |m| m.hash),
+            previous: previous.map_or(0, |m| previous_outputs(&m.info)),
             generic_inputs: [AttributeType::Float; 32],
             convert_depth_mode: false,
             y_negate: regs.window_origin.mode() != WindowOriginMode::UPPER_LEFT,
@@ -480,17 +481,34 @@ impl StageState {
             Some(previous) => {
                 info.previous_stage_stores = previous.stores;
                 info.previous_stage_legacy_stores_mapping = previous.legacy_stores_mapping.clone();
-                info.per_primitive_generics = previous
-                    .mesh
-                    .primitive_lines
-                    .iter()
-                    .filter_map(|&line| Attribute(line as u16).generic_index())
-                    .fold(0, |mask, generic| mask | 1 << generic);
+                info.per_primitive_generics = per_primitive_generics(previous);
             }
             None => info.previous_stage_stores = lichii_shader::info::VaryingState([u64::MAX; 8]),
         }
         info
     }
+}
+
+/// The hash of what [`StageState::runtime`] takes from the previous stage's `info`.
+fn previous_outputs(info: &ShaderInfo) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = crate::pipeline::FxHasher::default();
+    (
+        info.stores,
+        &info.legacy_stores_mapping,
+        per_primitive_generics(info),
+    )
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The generic outputs the previous stage writes per primitive, as a mask.
+fn per_primitive_generics(info: &ShaderInfo) -> u32 {
+    info.mesh
+        .primitive_lines
+        .iter()
+        .filter_map(|&line| Attribute(line as u16).generic_index())
+        .fold(0, |mask, generic| mask | 1 << generic)
 }
 
 /// The guest render area in pixels: the surface clip, or render target 0 without one.

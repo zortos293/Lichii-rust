@@ -25,6 +25,7 @@ lichii-audio = { path = "crates/audio" }
 lichii-input = { path = "crates/input" }
 lichii-core = { path = "crates/core" }
 lichii-texture = { path = "crates/texture" }
+lichii-video = { path = "crates/video" }
 
 thiserror = "2"
 tracing = "0.1"
@@ -39,6 +40,7 @@ iana-time-zone = "0.1"
 tzdb_data = "0.2"
 memmap2 = "0.9"
 crossbeam-channel = "0.5"
+libloading = "0.8"
 ash = "0.38"
 egui = "0.37"
 raw-window-handle = "0.6"
