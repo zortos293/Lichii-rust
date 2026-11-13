@@ -6,6 +6,7 @@
 //! emulated core (4 for Switch 1, 6 for Switch 2), each running [`lichii_cpu::CpuCore::run`] and
 //! handling what it halts for.
 
+mod alarm;
 pub mod arbiter;
 mod cpu_manager;
 pub mod event;

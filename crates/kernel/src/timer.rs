@@ -5,8 +5,9 @@ use std::collections::BinaryHeap;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 
+use crate::alarm::Alarm;
 use crate::result;
 use crate::scheduler::Scheduler;
 use crate::thread::{Thread, WakeResult};
@@ -51,7 +52,7 @@ struct State {
 #[derive(Default)]
 pub(crate) struct Timer {
     state: Mutex<State>,
-    cv: Condvar,
+    alarm: Alarm,
 }
 
 impl Timer {
@@ -86,7 +87,7 @@ impl Timer {
             wake,
         }));
         if earliest {
-            self.cv.notify_one();
+            self.alarm.notify();
         }
     }
 
@@ -115,7 +116,7 @@ impl Timer {
                         .heap
                         .peek()
                         .map_or(next_tick, |Reverse(e)| e.deadline.min(next_tick));
-                    self.cv.wait_until(&mut state, wake_at);
+                    self.alarm.wait_until(&mut state, wake_at);
                 }
             }
             for entry in due.drain(..) {
@@ -138,6 +139,6 @@ impl Timer {
         let mut state = self.state.lock();
         state.shutdown = true;
         state.heap.clear();
-        self.cv.notify_all();
+        self.alarm.notify();
     }
 }
