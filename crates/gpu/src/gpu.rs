@@ -26,7 +26,7 @@ use crate::gmmu::{BigPageSize, Gmmu};
 use crate::host1x::Host1x;
 use crate::nx2_memory::{AddressSpaceId, Nx2GpuMemory};
 use crate::ring;
-use crate::stream::{Link, MIN_RING_SLOTS, Stream};
+use crate::stream::{FetchSyncs, Link, MIN_RING_SLOTS, Stream};
 
 /// Default ring size: 8 MiB of slots.
 pub const DEFAULT_RING_SLOTS: usize = 1 << 20;
@@ -363,7 +363,14 @@ impl Gpu {
         handles.syncpoints.semaphore_waiters().attach(&inbox);
         let (producer, consumer) = ring::ring(config.ring_slots, MIN_RING_SLOTS);
         let (side_sender, side_receiver) = mpsc::channel();
-        let back = Back::new(rasterizer, &handles, config.engines, side_receiver);
+        let fetch_syncs = Arc::new(FetchSyncs::new(inbox.clone()));
+        let back = Back::new(
+            rasterizer,
+            &handles,
+            config.engines,
+            side_receiver,
+            fetch_syncs.clone(),
+        );
         let (link, back) = match config.threading {
             Threading::Split => {
                 let thread = std::thread::Builder::new()
@@ -376,7 +383,7 @@ impl Gpu {
         };
         let front = Front {
             shared: FrontShared {
-                stream: Stream::new(producer, link, side_sender),
+                stream: Stream::new(producer, link, side_sender, fetch_syncs),
                 shared_macros: None,
                 words: Vec::new(),
                 waiters: handles.syncpoints.semaphore_waiters().clone(),

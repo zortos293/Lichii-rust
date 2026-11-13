@@ -6,6 +6,10 @@
 //! acquire, a syncpoint wait, wait-for-idle and MME DMA reads (NX2_GPU_THREAD_SPLIT.md). An acquire
 //! or syncpoint wait that still fails after that suspends the channel; the front runs other
 //! channels and resumes it at the next word once the condition holds.
+//!
+//! A GPFIFO entry with its SYNC bit is fetched after the work before it completed, so a command
+//! list that compute or copy work wrote is read with those writes: the channel suspends until
+//! the back synchronized the entry's words, without the front waiting for it.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -73,6 +77,9 @@ pub(crate) enum Wait {
         wide: bool,
     },
     Syncpoint(SyncpointFence),
+    /// The fetch of the entry at the queue's front, which has its SYNC bit, until
+    /// [`Stream::fetch_synced`] holds for this ticket.
+    Fetch(u64),
 }
 
 /// One channel on the front.
@@ -85,6 +92,8 @@ pub(crate) struct FrontChannel {
     /// Words of the entry at the queue's front already processed.
     offset: u32,
     wait: Option<Wait>,
+    /// The entry at the queue's front waited for its SYNC fetch.
+    fetch_synced: bool,
 }
 
 /// What the method handler of a channel changes.
@@ -164,6 +173,7 @@ impl FrontChannel {
             queue: VecDeque::new(),
             offset: 0,
             wait: None,
+            fetch_synced: false,
         }
     }
 
@@ -206,6 +216,7 @@ impl FrontChannel {
                 .guest()
                 .is_reached(fence.id, fence.value)
                 .unwrap_or(true),
+            Wait::Fetch(ticket) => shared.stream.fetch_synced(ticket),
         }
     }
 
@@ -268,6 +279,15 @@ impl FrontChannel {
             self.offset = 0;
             return;
         }
+        if start == 0 && entry.sync() && !self.fetch_synced {
+            let ticket = shared
+                .stream
+                .synchronize_fetch(entry.address(), u64::from(length) * 4);
+            self.fetch_synced = true;
+            self.wait = Some(Wait::Fetch(ticket));
+            return;
+        }
+        self.fetch_synced = false;
         let mut words = std::mem::take(&mut shared.words);
         words.clear();
         words.resize((length - start) as usize, 0);
@@ -673,7 +693,7 @@ mod tests {
     use crate::gmmu::BigPageSize;
     use crate::pushbuffer::{CommandHeader, SubmissionMode};
     use crate::ring;
-    use crate::stream::{Link, MIN_RING_SLOTS};
+    use crate::stream::{FetchSyncs, Link, MIN_RING_SLOTS};
 
     #[test]
     fn macro_parameters_are_collected_without_allocating() {
@@ -693,18 +713,26 @@ mod tests {
         };
         let (producer, consumer) = ring::ring(MIN_RING_SLOTS, MIN_RING_SLOTS);
         let (side, side_receiver) = mpsc::channel();
+        let inbox = Arc::new(Inbox::new());
+        let fetch_syncs = Arc::new(FetchSyncs::new(inbox.clone()));
         let back = Back::new(
             Box::new(Recorder::default()),
             &handles,
             Arc::new(create_engine),
             side_receiver,
+            fetch_syncs.clone(),
         );
         let mut shared = FrontShared {
-            stream: Stream::new(producer, Link::Inline(Box::new((back, consumer))), side),
+            stream: Stream::new(
+                producer,
+                Link::Inline(Box::new((back, consumer))),
+                side,
+                fetch_syncs,
+            ),
             shared_macros: None,
             words: Vec::new(),
             waiters: Arc::default(),
-            inbox: Arc::new(Inbox::new()),
+            inbox,
             syncpoints,
         };
         let config = ChannelConfig::new(
