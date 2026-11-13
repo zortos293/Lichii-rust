@@ -549,12 +549,13 @@ pub trait Rasterizer: Send {
     /// and deferred [`Query`] writes landed.
     fn release_fences(&mut self, wait: bool);
 
-    /// Whether fences signalled earlier may still wait for their host GPU work. While this holds,
-    /// an idle GPU calls [`flush_commands`](Self::flush_commands) and then
-    /// [`release_fences(false)`](Self::release_fences) about every millisecond, so a syncpoint or
-    /// semaphore the guest CPU waits on lands without more GPU work behind it. The default, true,
-    /// suits any renderer that defers fences; a renderer that knows its queue is empty can return
-    /// false and idle without polling.
+    /// Whether fences signalled earlier may still wait for their host GPU work, or recorded work
+    /// is not submitted yet. While this holds, an idle GPU calls
+    /// [`flush_commands`](Self::flush_commands) and then
+    /// [`release_fences(false)`](Self::release_fences) about every millisecond, so recorded work
+    /// reaches the host GPU and a syncpoint or semaphore the guest CPU waits on lands without more
+    /// GPU work behind it. The default, true, suits any renderer that defers work; a renderer that
+    /// knows it has nothing recorded or queued can return false and idle without polling.
     fn has_pending_fences(&self) -> bool {
         true
     }

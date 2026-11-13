@@ -723,7 +723,7 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn has_pending_fences(&self) -> bool {
-        !self.fences.is_empty()
+        self.unflushed || !self.fences.is_empty()
     }
 
     fn release_channel(&mut self, _channel: ChannelId) {
@@ -1319,10 +1319,18 @@ mod tests {
     }
 
     #[test]
-    fn pending_fences_follow_the_fence_queue() {
+    fn pending_work_follows_the_fence_queue_and_unsubmitted_commands() {
         let Some(mut f) = fixture(GobLayout::Tegra) else {
             return;
         };
+        f.rasterizer.flush_commands();
+        assert!(!f.rasterizer.has_pending_fences());
+        f.rasterizer.barrier();
+        assert!(
+            f.rasterizer.has_pending_fences(),
+            "recorded work is not submitted yet"
+        );
+        f.rasterizer.flush_commands();
         assert!(!f.rasterizer.has_pending_fences());
         f.rasterizer
             .signal_fence(FenceAction::IncrementSyncpoint(4));
