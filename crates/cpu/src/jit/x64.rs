@@ -19,6 +19,7 @@ use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, VecAssembler, dynasm};
 use super::JitState;
 use super::ir::{Block, Loc, Op, Terminal, Ty, Value, W};
 use crate::ThreadContext;
+use crate::decoder::AtomicOp;
 use crate::interpreter::condition_holds;
 
 type Asm = VecAssembler<X64Relocation>;
@@ -26,6 +27,8 @@ type Asm = VecAssembler<X64Relocation>;
 pub(super) const EXIT_CONTINUE: u64 = 0;
 pub(super) const EXIT_INTERPRET: u64 = 1;
 pub(super) const EXIT_FAULT: u64 = 2;
+/// The `info` operation code of a `CAS` slow path; `LD<op>` uses the `AtomicOp` discriminant.
+pub(super) const ATOMIC_CAS: i32 = 15;
 
 /// Allocatable general-purpose registers, callee-saved ones first so slow paths save less.
 const GPRS: [u8; 9] = [3, 5, 12, 6, 7, 8, 9, 10, 11];
@@ -40,6 +43,9 @@ pub(super) struct Target {
     pub arena_size: Option<u64>,
     pub read: usize,
     pub write: usize,
+    pub atomic: usize,
+    pub zero: usize,
+    pub ticks: usize,
 }
 
 /// Machine code for one block and its fastmem access sites as `(access, slow path)` offsets.
@@ -60,16 +66,19 @@ enum Src {
     Imm(i32),
 }
 
+/// The out-of-line slow path of one memory access: calls
+/// `helper(state, addr, pc, info) -> faulted` with the operands in `scratch` and `scratch2`.
 struct Stub {
     label: DynamicLabel,
     resume: DynamicLabel,
-    site: Option<u32>,
+    sites: Vec<u32>,
     addr: u8,
-    size: u8,
     pc: u64,
+    helper: usize,
+    info: i32,
     vec: bool,
     dst: Option<u8>,
-    value: Option<Src>,
+    values: [Option<Src>; 2],
     saved: [u16; 2],
 }
 
@@ -87,6 +96,7 @@ const CTX_V: i32 = ctx(offset_of!(ThreadContext, v));
 const CTX_TPIDR: i32 = ctx(offset_of!(ThreadContext, tpidr_el0));
 const CTX_TPIDRRO: i32 = ctx(offset_of!(ThreadContext, tpidrro_el0));
 const ST_SCRATCH: i32 = ctx(offset_of!(JitState, scratch));
+const ST_SCRATCH2: i32 = ctx(offset_of!(JitState, scratch2));
 const ST_SAVE_GPR: i32 = ctx(offset_of!(JitState, save_gpr));
 const ST_SAVE_XMM: i32 = ctx(offset_of!(JitState, save_xmm));
 const ST_SPILL: i32 = ctx(offset_of!(JitState, spill));
@@ -665,10 +675,9 @@ impl Emitter<'_> {
                     ; mov Rd(d), eax
                 );
             }
-            Op::Load { .. } | Op::LoadVec { .. } | Op::Store { .. } | Op::StoreVec { .. } => {
-                self.memory(i, op)
-            }
+            Op::Ticks => self.call(i, self.target.ticks),
             Op::Fence => dynasm!(self.asm ; .arch x64 ; mfence),
+            _ => self.memory(i, op),
         }
         self.finish(i, &op);
     }
@@ -711,52 +720,8 @@ impl Emitter<'_> {
         }
     }
 
-    fn memory(&mut self, i: usize, op: Op) {
-        let (size, addr, value, pc, vec) = match op {
-            Op::Load { size, addr, pc } => (size, addr, None, pc, false),
-            Op::LoadVec { size, addr, pc } => (size, addr, None, pc, true),
-            Op::Store {
-                size,
-                addr,
-                value,
-                pc,
-            } => (size, addr, Some(value), pc, false),
-            Op::StoreVec {
-                size,
-                addr,
-                value,
-                pc,
-            } => (size, addr, Some(value), pc, true),
-            _ => unreachable!(),
-        };
-        let a = self.reg(addr);
-        let value = value.map(|x| {
-            if vec {
-                Src::Reg(self.reg(x))
-            } else {
-                self.src(x, W::W64)
-            }
-        });
-        let dst = value.is_none().then(|| self.def(Value(i as u32)));
-        let label = self.asm.new_dynamic_label();
-        let resume = self.asm.new_dynamic_label();
-        let site = match self.target.arena_size {
-            Some(arena) => {
-                let limit = (arena - (1u64 << size)) as i64;
-                dynasm!(self.asm
-                    ; .arch x64
-                    ; mov rax, QWORD limit
-                    ; cmp Rq(a), rax
-                    ; ja =>label
-                );
-                Some(self.access(a, size, vec, dst, value))
-            }
-            None => {
-                dynasm!(self.asm ; .arch x64 ; jmp =>label);
-                None
-            }
-        };
-        dynasm!(self.asm ; .arch x64 ; =>resume);
+    /// Caller-saved registers holding a value that is still needed after op `i`.
+    fn live_across(&self, i: usize) -> [u16; 2] {
         let mut saved = [0u16; 2];
         for class in [Class::Gpr, Class::Xmm] {
             for r in 0..16u8 {
@@ -769,26 +734,135 @@ impl Emitter<'_> {
                 }
             }
         }
+        saved
+    }
+
+    fn save(&mut self, saved: [u16; 2]) {
+        for r in 0..16u8 {
+            if saved[0] & (1 << r) != 0 {
+                let offset = ST_SAVE_GPR + 8 * r as i32;
+                dynasm!(self.asm ; .arch x64 ; mov QWORD [r13 + offset], Rq(r));
+            }
+            if saved[1] & (1 << r) != 0 {
+                let offset = ST_SAVE_XMM + 16 * r as i32;
+                dynasm!(self.asm ; .arch x64 ; movdqu [r13 + offset], Rx(r));
+            }
+        }
+    }
+
+    fn restore(&mut self, saved: [u16; 2]) {
+        for r in 0..16u8 {
+            if saved[0] & (1 << r) != 0 {
+                let offset = ST_SAVE_GPR + 8 * r as i32;
+                dynasm!(self.asm ; .arch x64 ; mov Rq(r), QWORD [r13 + offset]);
+            }
+            if saved[1] & (1 << r) != 0 {
+                let offset = ST_SAVE_XMM + 16 * r as i32;
+                dynasm!(self.asm ; .arch x64 ; movdqu Rx(r), [r13 + offset]);
+            }
+        }
+    }
+
+    /// Calls `helper(state)` from the main path and puts its `u64` result in op `i`'s register.
+    fn call(&mut self, i: usize, helper: usize) {
+        let d = self.def(Value(i as u32));
+        let saved = self.live_across(i);
+        self.save(saved);
+        dynasm!(self.asm
+            ; .arch x64
+            ; mov rdi, r13
+            ; mov rax, QWORD helper as i64
+            ; sub rsp, 8
+            ; call rax
+            ; add rsp, 8
+        );
+        self.restore(saved);
+        dynasm!(self.asm ; .arch x64 ; mov Rq(d), rax);
+    }
+
+    fn memory(&mut self, i: usize, op: Op) {
+        let (size, addr, pc) = match op {
+            Op::Load { size, addr, pc }
+            | Op::LoadVec { size, addr, pc }
+            | Op::Store { size, addr, pc, .. }
+            | Op::StoreVec { size, addr, pc, .. }
+            | Op::AtomicRmw { size, addr, pc, .. }
+            | Op::Cas { size, addr, pc, .. } => (size, addr, pc),
+            Op::ZeroBlock { addr, pc } => (6, addr, pc),
+            _ => unreachable!(),
+        };
+        let vec = matches!(op, Op::LoadVec { .. } | Op::StoreVec { .. });
+        let a = self.reg(addr);
+        let values = match op {
+            Op::Store { value, .. } => [Some(self.src(value, W::W64)), None],
+            Op::StoreVec { value, .. } | Op::AtomicRmw { value, .. } => {
+                [Some(Src::Reg(self.reg(value))), None]
+            }
+            Op::Cas { expected, new, .. } => [
+                Some(Src::Reg(self.reg(expected))),
+                Some(Src::Reg(self.reg(new))),
+            ],
+            _ => [None, None],
+        };
+        let dst = (op.ty() != Ty::Void).then(|| self.def(Value(i as u32)));
+        let label = self.asm.new_dynamic_label();
+        let resume = self.asm.new_dynamic_label();
+        let sites = match self.target.arena_size {
+            Some(arena) => {
+                if matches!(op, Op::AtomicRmw { .. } | Op::Cas { .. }) && size > 0 {
+                    let misaligned = (1i32 << size) - 1;
+                    dynasm!(self.asm ; .arch x64 ; test Rd(a), misaligned ; jnz =>label);
+                }
+                let limit = (arena - (1u64 << size)) as i64;
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; mov rax, QWORD limit
+                    ; cmp Rq(a), rax
+                    ; ja =>label
+                );
+                self.access(op, a, dst, values)
+            }
+            None => {
+                dynasm!(self.asm ; .arch x64 ; jmp =>label);
+                Vec::new()
+            }
+        };
+        dynasm!(self.asm ; .arch x64 ; =>resume);
+        let (helper, info) = match op {
+            Op::Load { .. } | Op::LoadVec { .. } => (self.target.read, size as i32),
+            Op::Store { .. } | Op::StoreVec { .. } => (self.target.write, size as i32),
+            Op::AtomicRmw { op, .. } => (self.target.atomic, size as i32 | (op as i32) << 8),
+            Op::Cas { .. } => (self.target.atomic, size as i32 | ATOMIC_CAS << 8),
+            _ => (self.target.zero, size as i32),
+        };
+        let saved = self.live_across(i);
         self.stubs.push(Stub {
             label,
             resume,
-            site,
+            sites,
             addr: a,
-            size,
             pc,
+            helper,
+            info,
             vec,
             dst,
-            value,
+            values,
             saved,
         });
     }
 
-    /// Emits the fastmem access itself and returns the offset of the instruction that can fault.
-    fn access(&mut self, a: u8, size: u8, vec: bool, dst: Option<u8>, value: Option<Src>) -> u32 {
+    /// Emits the fastmem access itself and returns the offsets of the instructions that can
+    /// fault.
+    fn access(&mut self, op: Op, a: u8, dst: Option<u8>, values: [Option<Src>; 2]) -> Vec<u32> {
         let at = |asm: &Asm| asm.offset().0 as u32;
+        let reg = |src: Option<Src>| match src {
+            Some(Src::Reg(r)) => r,
+            _ => unreachable!("this operand is always in a register"),
+        };
         let site;
-        match (dst, value, vec) {
-            (Some(d), _, false) => {
+        match op {
+            Op::Load { size, .. } => {
+                let d = dst.unwrap();
                 site = at(&self.asm);
                 match size {
                     0 => dynasm!(self.asm ; .arch x64 ; movzx Rd(d), BYTE [r14 + Rq(a)]),
@@ -797,7 +871,8 @@ impl Emitter<'_> {
                     _ => dynasm!(self.asm ; .arch x64 ; mov Rq(d), QWORD [r14 + Rq(a)]),
                 }
             }
-            (Some(d), _, true) => {
+            Op::LoadVec { size, .. } => {
+                let d = dst.unwrap();
                 site = at(&self.asm);
                 match size {
                     0 => {
@@ -811,7 +886,8 @@ impl Emitter<'_> {
                     _ => dynasm!(self.asm ; .arch x64 ; movdqu Rx(d), [r14 + Rq(a)]),
                 }
             }
-            (None, Some(Src::Reg(r)), true) => {
+            Op::StoreVec { size, .. } => {
+                let r = reg(values[0]);
                 if size < 2 {
                     dynasm!(self.asm ; .arch x64 ; movd eax, Rx(r));
                 }
@@ -824,27 +900,180 @@ impl Emitter<'_> {
                     _ => dynasm!(self.asm ; .arch x64 ; movdqu [r14 + Rq(a)], Rx(r)),
                 }
             }
-            (None, Some(Src::Reg(r)), false) => {
+            Op::Store { size, .. } => {
                 site = at(&self.asm);
-                match size {
-                    0 => dynasm!(self.asm ; .arch x64 ; mov BYTE [r14 + Rq(a)], Rb(r)),
-                    1 => dynasm!(self.asm ; .arch x64 ; mov WORD [r14 + Rq(a)], Rw(r)),
-                    2 => dynasm!(self.asm ; .arch x64 ; mov DWORD [r14 + Rq(a)], Rd(r)),
-                    _ => dynasm!(self.asm ; .arch x64 ; mov QWORD [r14 + Rq(a)], Rq(r)),
+                match (values[0], size) {
+                    (Some(Src::Reg(r)), 0) => {
+                        dynasm!(self.asm ; .arch x64 ; mov BYTE [r14 + Rq(a)], Rb(r))
+                    }
+                    (Some(Src::Reg(r)), 1) => {
+                        dynasm!(self.asm ; .arch x64 ; mov WORD [r14 + Rq(a)], Rw(r))
+                    }
+                    (Some(Src::Reg(r)), 2) => {
+                        dynasm!(self.asm ; .arch x64 ; mov DWORD [r14 + Rq(a)], Rd(r))
+                    }
+                    (Some(Src::Reg(r)), _) => {
+                        dynasm!(self.asm ; .arch x64 ; mov QWORD [r14 + Rq(a)], Rq(r))
+                    }
+                    (Some(Src::Imm(i)), 0) => {
+                        dynasm!(self.asm ; .arch x64 ; mov BYTE [r14 + Rq(a)], i as i8)
+                    }
+                    (Some(Src::Imm(i)), 1) => {
+                        dynasm!(self.asm ; .arch x64 ; mov WORD [r14 + Rq(a)], i as i16)
+                    }
+                    (Some(Src::Imm(i)), 2) => {
+                        dynasm!(self.asm ; .arch x64 ; mov DWORD [r14 + Rq(a)], i)
+                    }
+                    (Some(Src::Imm(i)), _) => {
+                        dynasm!(self.asm ; .arch x64 ; mov QWORD [r14 + Rq(a)], i)
+                    }
+                    (None, _) => unreachable!("a store always has a value"),
                 }
             }
-            (None, Some(Src::Imm(imm)), _) => {
+            Op::AtomicRmw {
+                op: AtomicOp::Add | AtomicOp::Swp,
+                size,
+                ..
+            } => {
+                let (v, d) = (reg(values[0]), dst.unwrap());
+                dynasm!(self.asm ; .arch x64 ; mov Rq(d), Rq(v));
                 site = at(&self.asm);
-                match size {
-                    0 => dynasm!(self.asm ; .arch x64 ; mov BYTE [r14 + Rq(a)], imm as i8),
-                    1 => dynasm!(self.asm ; .arch x64 ; mov WORD [r14 + Rq(a)], imm as i16),
-                    2 => dynasm!(self.asm ; .arch x64 ; mov DWORD [r14 + Rq(a)], imm),
-                    _ => dynasm!(self.asm ; .arch x64 ; mov QWORD [r14 + Rq(a)], imm),
+                match (op, size) {
+                    (
+                        Op::AtomicRmw {
+                            op: AtomicOp::Add, ..
+                        },
+                        0,
+                    ) => {
+                        dynasm!(self.asm ; .arch x64 ; lock xadd BYTE [r14 + Rq(a)], Rb(d) ; movzx Rd(d), Rb(d))
+                    }
+                    (
+                        Op::AtomicRmw {
+                            op: AtomicOp::Add, ..
+                        },
+                        1,
+                    ) => {
+                        dynasm!(self.asm ; .arch x64 ; lock xadd WORD [r14 + Rq(a)], Rw(d) ; movzx Rd(d), Rw(d))
+                    }
+                    (
+                        Op::AtomicRmw {
+                            op: AtomicOp::Add, ..
+                        },
+                        2,
+                    ) => dynasm!(self.asm ; .arch x64 ; lock xadd DWORD [r14 + Rq(a)], Rd(d)),
+                    (
+                        Op::AtomicRmw {
+                            op: AtomicOp::Add, ..
+                        },
+                        _,
+                    ) => dynasm!(self.asm ; .arch x64 ; lock xadd QWORD [r14 + Rq(a)], Rq(d)),
+                    (_, 0) => {
+                        dynasm!(self.asm ; .arch x64 ; xchg BYTE [r14 + Rq(a)], Rb(d) ; movzx Rd(d), Rb(d))
+                    }
+                    (_, 1) => {
+                        dynasm!(self.asm ; .arch x64 ; xchg WORD [r14 + Rq(a)], Rw(d) ; movzx Rd(d), Rw(d))
+                    }
+                    (_, 2) => dynasm!(self.asm ; .arch x64 ; xchg DWORD [r14 + Rq(a)], Rd(d)),
+                    (_, _) => dynasm!(self.asm ; .arch x64 ; xchg QWORD [r14 + Rq(a)], Rq(d)),
                 }
             }
-            (None, None, _) => unreachable!("a store always has a value"),
+            Op::AtomicRmw { op: rmw, size, .. } => {
+                let (v, d) = (reg(values[0]), dst.unwrap());
+                let first = at(&self.asm);
+                match size {
+                    0 => dynasm!(self.asm ; .arch x64 ; movzx eax, BYTE [r14 + Rq(a)]),
+                    1 => dynasm!(self.asm ; .arch x64 ; movzx eax, WORD [r14 + Rq(a)]),
+                    2 => dynasm!(self.asm ; .arch x64 ; mov eax, DWORD [r14 + Rq(a)]),
+                    _ => dynasm!(self.asm ; .arch x64 ; mov rax, QWORD [r14 + Rq(a)]),
+                }
+                let retry = self.asm.new_dynamic_label();
+                dynasm!(self.asm ; .arch x64 ; =>retry);
+                let signed = matches!(rmw, AtomicOp::Smax | AtomicOp::Smin);
+                match rmw {
+                    AtomicOp::Clr => {
+                        dynasm!(self.asm ; .arch x64 ; mov rcx, Rq(v) ; not rcx ; and rcx, rax)
+                    }
+                    AtomicOp::Eor => dynasm!(self.asm ; .arch x64 ; mov rcx, rax ; xor rcx, Rq(v)),
+                    AtomicOp::Set => dynasm!(self.asm ; .arch x64 ; mov rcx, rax ; or rcx, Rq(v)),
+                    _ => {
+                        match (signed, size) {
+                            (true, 0) => {
+                                dynasm!(self.asm ; .arch x64 ; movsx rcx, al ; movsx rdx, Rb(v))
+                            }
+                            (true, 1) => {
+                                dynasm!(self.asm ; .arch x64 ; movsx rcx, ax ; movsx rdx, Rw(v))
+                            }
+                            (true, 2) => {
+                                dynasm!(self.asm ; .arch x64 ; movsxd rcx, eax ; movsxd rdx, Rd(v))
+                            }
+                            (false, 0) => {
+                                dynasm!(self.asm ; .arch x64 ; movzx ecx, al ; movzx edx, Rb(v))
+                            }
+                            (false, 1) => {
+                                dynasm!(self.asm ; .arch x64 ; movzx ecx, ax ; movzx edx, Rw(v))
+                            }
+                            (false, 2) => {
+                                dynasm!(self.asm ; .arch x64 ; mov ecx, eax ; mov edx, Rd(v))
+                            }
+                            _ => dynasm!(self.asm ; .arch x64 ; mov rcx, rax ; mov rdx, Rq(v)),
+                        }
+                        dynasm!(self.asm ; .arch x64 ; cmp rcx, rdx);
+                        match rmw {
+                            AtomicOp::Smax => dynasm!(self.asm ; .arch x64 ; cmovl rcx, rdx),
+                            AtomicOp::Smin => dynasm!(self.asm ; .arch x64 ; cmovg rcx, rdx),
+                            AtomicOp::Umax => dynasm!(self.asm ; .arch x64 ; cmovb rcx, rdx),
+                            _ => dynasm!(self.asm ; .arch x64 ; cmova rcx, rdx),
+                        }
+                    }
+                }
+                let second = at(&self.asm);
+                match size {
+                    0 => {
+                        dynasm!(self.asm ; .arch x64 ; lock cmpxchg BYTE [r14 + Rq(a)], cl ; jnz =>retry ; movzx Rd(d), al)
+                    }
+                    1 => {
+                        dynasm!(self.asm ; .arch x64 ; lock cmpxchg WORD [r14 + Rq(a)], cx ; jnz =>retry ; movzx Rd(d), ax)
+                    }
+                    2 => {
+                        dynasm!(self.asm ; .arch x64 ; lock cmpxchg DWORD [r14 + Rq(a)], ecx ; jnz =>retry ; mov Rd(d), eax)
+                    }
+                    _ => {
+                        dynasm!(self.asm ; .arch x64 ; lock cmpxchg QWORD [r14 + Rq(a)], rcx ; jnz =>retry ; mov Rq(d), rax)
+                    }
+                }
+                return vec![first, second];
+            }
+            Op::Cas { size, .. } => {
+                let (e, n, d) = (reg(values[0]), reg(values[1]), dst.unwrap());
+                dynasm!(self.asm ; .arch x64 ; mov rax, Rq(e));
+                site = at(&self.asm);
+                match size {
+                    0 => {
+                        dynasm!(self.asm ; .arch x64 ; lock cmpxchg BYTE [r14 + Rq(a)], Rb(n) ; movzx Rd(d), al)
+                    }
+                    1 => {
+                        dynasm!(self.asm ; .arch x64 ; lock cmpxchg WORD [r14 + Rq(a)], Rw(n) ; movzx Rd(d), ax)
+                    }
+                    2 => {
+                        dynasm!(self.asm ; .arch x64 ; lock cmpxchg DWORD [r14 + Rq(a)], Rd(n) ; mov Rd(d), eax)
+                    }
+                    _ => {
+                        dynasm!(self.asm ; .arch x64 ; lock cmpxchg QWORD [r14 + Rq(a)], Rq(n) ; mov Rq(d), rax)
+                    }
+                }
+            }
+            Op::ZeroBlock { .. } => {
+                dynasm!(self.asm ; .arch x64 ; pxor xmm15, xmm15);
+                let mut sites = Vec::new();
+                for offset in [0, 16, 32, 48] {
+                    sites.push(at(&self.asm));
+                    dynasm!(self.asm ; .arch x64 ; movdqu [r14 + Rq(a) + offset], xmm15);
+                }
+                return sites;
+            }
+            _ => unreachable!(),
         }
-        site
+        vec![site]
     }
 
     fn terminal(&mut self) {
@@ -891,55 +1120,35 @@ impl Emitter<'_> {
     fn stub(&mut self, stub: &Stub) -> u32 {
         let start = self.asm.offset().0 as u32;
         dynasm!(self.asm ; .arch x64 ; =>stub.label);
-        for r in 0..16u8 {
-            if stub.saved[0] & (1 << r) != 0 {
-                let offset = ST_SAVE_GPR + 8 * r as i32;
-                dynasm!(self.asm ; .arch x64 ; mov QWORD [r13 + offset], Rq(r));
-            }
-            if stub.saved[1] & (1 << r) != 0 {
-                let offset = ST_SAVE_XMM + 16 * r as i32;
-                dynasm!(self.asm ; .arch x64 ; movdqu [r13 + offset], Rx(r));
+        self.save(stub.saved);
+        for (value, offset) in stub.values.iter().zip([ST_SCRATCH, ST_SCRATCH2]) {
+            match *value {
+                Some(Src::Reg(r)) if stub.vec => {
+                    dynasm!(self.asm ; .arch x64 ; movdqu [r13 + offset], Rx(r))
+                }
+                Some(Src::Reg(r)) => {
+                    dynasm!(self.asm ; .arch x64 ; mov QWORD [r13 + offset], Rq(r))
+                }
+                Some(Src::Imm(imm)) => {
+                    dynasm!(self.asm ; .arch x64 ; mov QWORD [r13 + offset], imm)
+                }
+                None => {}
             }
         }
-        let helper = match stub.value {
-            Some(Src::Reg(r)) if stub.vec => {
-                dynasm!(self.asm ; .arch x64 ; movdqu [r13 + ST_SCRATCH], Rx(r));
-                self.target.write
-            }
-            Some(Src::Reg(r)) => {
-                dynasm!(self.asm ; .arch x64 ; mov QWORD [r13 + ST_SCRATCH], Rq(r));
-                self.target.write
-            }
-            Some(Src::Imm(imm)) => {
-                dynasm!(self.asm ; .arch x64 ; mov QWORD [r13 + ST_SCRATCH], imm);
-                self.target.write
-            }
-            None => self.target.read,
-        };
-        let size = stub.size as i32;
         dynasm!(self.asm
             ; .arch x64
             ; mov rsi, Rq(stub.addr)
             ; mov rdi, r13
             ; mov rdx, QWORD stub.pc as i64
-            ; mov ecx, size
-            ; mov rax, QWORD helper as i64
+            ; mov ecx, stub.info
+            ; mov rax, QWORD stub.helper as i64
             ; sub rsp, 8
             ; call rax
             ; add rsp, 8
             ; test al, al
             ; jnz =>self.fault_exit
         );
-        for r in 0..16u8 {
-            if stub.saved[0] & (1 << r) != 0 {
-                let offset = ST_SAVE_GPR + 8 * r as i32;
-                dynasm!(self.asm ; .arch x64 ; mov Rq(r), QWORD [r13 + offset]);
-            }
-            if stub.saved[1] & (1 << r) != 0 {
-                let offset = ST_SAVE_XMM + 16 * r as i32;
-                dynasm!(self.asm ; .arch x64 ; movdqu Rx(r), [r13 + offset]);
-            }
-        }
+        self.restore(stub.saved);
         match stub.dst {
             Some(d) if stub.vec => dynasm!(self.asm ; .arch x64 ; movdqu Rx(d), [r13 + ST_SCRATCH]),
             Some(d) => dynasm!(self.asm ; .arch x64 ; mov Rq(d), QWORD [r13 + ST_SCRATCH]),
@@ -985,9 +1194,7 @@ pub(super) fn compile(block: &Block, target: &Target) -> Compiled {
     let mut sites = Vec::new();
     for stub in &stubs {
         let start = e.stub(stub);
-        if let Some(site) = stub.site {
-            sites.push((site, start));
-        }
+        sites.extend(stub.sites.iter().map(|&site| (site, start)));
     }
     dynasm!(e.asm
         ; .arch x64
