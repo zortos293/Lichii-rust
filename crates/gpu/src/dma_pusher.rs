@@ -918,6 +918,7 @@ mod tests {
         let physical = Arc::new(PhysicalMemory::new(1 << 16).unwrap());
         let device = Arc::new(DeviceAddressSpace::new(physical, 36));
         let handles = GpuHandles {
+            lazy: Arc::new(crate::lazy::LazyDeviceRanges::new(device.clone())),
             device: device.clone(),
             syncpoints: syncpoints.clone(),
             timestamp: Arc::new(GpuTimestamp::new(Arc::new(Boot), false)),

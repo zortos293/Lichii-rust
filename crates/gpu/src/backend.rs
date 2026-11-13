@@ -27,6 +27,7 @@ use crate::engines::maxwell_3d::{DirtyState, Regs};
 use crate::gmmu::Gmmu;
 use crate::host::Reduction;
 use crate::host1x::Syncpoints;
+use crate::lazy::LazyDeviceRanges;
 use crate::semaphore_mirror::{self, FirstPage};
 pub use crate::written_pages::GpuWrittenPages;
 
@@ -44,6 +45,9 @@ pub struct GpuHandles {
     /// Device pages GPU work may have written. The renderer marks a range when it records work
     /// that writes it; the front synchronises before fetching commands from a marked page.
     pub written_pages: Arc<GpuWrittenPages>,
+    /// Device ranges that get memory as they are written: write GPU results to device memory
+    /// through [`LazyDeviceRanges::write`].
+    pub lazy: Arc<LazyDeviceRanges>,
 }
 
 /// A constant buffer bound to a shader stage slot.
@@ -350,10 +354,7 @@ impl FenceAction {
                 let mirror = handles.syncpoints.semaphore_mirror();
                 let mut page = mirror.first_page(address);
                 let mirrored = mirror.mirror_of(address);
-                if let Err(fault) = handles
-                    .device
-                    .write_bytes(address, bytemuck::cast_slice(words))
-                {
+                if let Err(fault) = handles.lazy.write(address, bytemuck::cast_slice(words)) {
                     tracing::warn!(?fault, "semaphore release to unmapped device memory");
                     return;
                 }
@@ -378,7 +379,7 @@ impl FenceAction {
                 let mirror = handles.syncpoints.semaphore_mirror();
                 let mut page = mirror.first_page(address);
                 let mirrored = mirror.mirror_of(address);
-                let Some(word) = semaphore_word(&handles.device, address) else {
+                let Some(word) = semaphore_word(handles, address) else {
                     tracing::warn!(
                         address,
                         "semaphore reduction on unmapped or unaligned memory"
@@ -661,7 +662,7 @@ fn mirror_release(handles: &GpuHandles, mut page: FirstPage<'_>, target: DAddr, 
             break;
         }
         if !page.diverts(address) {
-            if let Err(fault) = handles.device.write(address, word) {
+            if let Err(fault) = handles.lazy.write(address, &word.to_le_bytes()) {
                 tracing::warn!(
                     ?fault,
                     "mirrored semaphore release to unmapped device memory"
@@ -684,11 +685,15 @@ fn mirror_release(handles: &GpuHandles, mut page: FirstPage<'_>, target: DAddr, 
     }
 }
 
-fn semaphore_word(device: &DeviceAddressSpace, address: DAddr) -> Option<&AtomicU32> {
+fn semaphore_word(handles: &GpuHandles, address: DAddr) -> Option<&AtomicU32> {
     if !address.is_multiple_of(4) {
         return None;
     }
-    let ptr = device.translate(address)?;
+    let ptr = match handles.device.translate(address) {
+        Some(ptr) => ptr,
+        None if handles.lazy.back(address, 4) => handles.device.translate(address)?,
+        None => return None,
+    };
     // SAFETY: `translate` points into a mapped page of guest memory that outlives `device`; the
     // aligned word lies inside that page, and guest memory is only accessed as plain bytes or
     // atomics, never through Rust references.
@@ -718,6 +723,7 @@ mod tests {
             .map_process(0x10_0000, &space, 0x1000_0000, 0x1000)
             .unwrap();
         let handles = GpuHandles {
+            lazy: Arc::new(LazyDeviceRanges::new(device.clone())),
             device,
             syncpoints: Arc::new(Syncpoints::new()),
             timestamp: Arc::new(GpuTimestamp::new(Arc::new(Boot), false)),
