@@ -1490,6 +1490,19 @@ impl VulkanRasterizer {
         if let Some(format) = storage_format(desc.format) {
             view.format = format;
         }
+        if desc.is_written {
+            let mut tx = Transfer {
+                scheduler: &mut self.scheduler,
+                staging: &mut self.staging,
+                memory: &self.handles.device,
+            };
+            self.texture_cache.bind_written(
+                &mut tx,
+                id,
+                view.base_level,
+                view.base_layer..view.base_layer + view.layers,
+            )?;
+        }
         Ok(self
             .texture_cache
             .storage_view(id, &view)?

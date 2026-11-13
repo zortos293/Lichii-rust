@@ -7,6 +7,7 @@ use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 
 use crate::device::Device;
 use crate::error::{Result, VkResultExt};
+use crate::scheduler::Scheduler;
 
 /// Device memory as the texture cache's collector and the frame view see it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -238,6 +239,21 @@ pub struct Image {
     raw: vk::Image,
     allocation: Option<Allocation>,
     desc: ImageDesc,
+    sparse: Option<Box<SparseMemory>>,
+}
+
+/// Device memory of a sparse image, bound subresource by subresource as they are written.
+struct SparseMemory {
+    /// Bytes per sparse block, and the memory types blocks may come from.
+    requirements: vk::MemoryRequirements,
+    /// Per aspect: block shape and mip tail.
+    aspects: Vec<vk::SparseImageMemoryRequirements>,
+    /// Bound subresources, `level * layers + layer`.
+    bound: Vec<bool>,
+    /// Layers whose mip tail is bound (only the first entry with a single mip tail).
+    tails: Vec<bool>,
+    allocations: Vec<Allocation>,
+    bytes: u64,
 }
 
 impl Image {
@@ -279,8 +295,183 @@ impl Image {
             raw,
             allocation: Some(allocation),
             desc: *desc,
+            sparse: None,
         };
         bound.map(|()| image)
+    }
+
+    /// An image with sparse residency and no memory: reads of unbound blocks return zero (or
+    /// undefined values without `residencyNonResidentStrict`) and writes to them are dropped.
+    /// [`Image::bind`] gives subresources memory. The caller checks the device supports it.
+    pub fn new_sparse(device: &Arc<Device>, desc: &ImageDesc) -> Result<Self> {
+        let info = vk::ImageCreateInfo::default()
+            .flags(
+                desc.flags
+                    | vk::ImageCreateFlags::SPARSE_BINDING
+                    | vk::ImageCreateFlags::SPARSE_RESIDENCY,
+            )
+            .image_type(desc.image_type)
+            .format(desc.format)
+            .extent(desc.extent)
+            .mip_levels(desc.mip_levels)
+            .array_layers(desc.array_layers)
+            .samples(desc.samples)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(desc.usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        // SAFETY: valid create info on a device with sparse residency.
+        let raw = unsafe { device.raw.create_image(&info, None).call("vkCreateImage")? };
+        // SAFETY: `raw` was just created on this device.
+        let (requirements, aspects) = unsafe {
+            (
+                device.raw.get_image_memory_requirements(raw),
+                device.raw.get_image_sparse_memory_requirements(raw),
+            )
+        };
+        let single_tail = aspects.iter().any(|a| {
+            a.format_properties
+                .flags
+                .contains(vk::SparseImageFormatFlags::SINGLE_MIPTAIL)
+        });
+        Ok(Self {
+            device: device.clone(),
+            raw,
+            allocation: None,
+            desc: *desc,
+            sparse: Some(Box::new(SparseMemory {
+                requirements,
+                aspects,
+                bound: vec![false; (desc.mip_levels * desc.array_layers) as usize],
+                tails: vec![
+                    false;
+                    if single_tail {
+                        1
+                    } else {
+                        desc.array_layers as usize
+                    }
+                ],
+                allocations: Vec::new(),
+                bytes: 0,
+            })),
+        })
+    }
+
+    pub fn is_sparse(&self) -> bool {
+        self.sparse.is_some()
+    }
+
+    /// Gives memory to the unbound subresources of `level` in `layers` of a sparse image, as
+    /// long as the image stays within `cap` bytes; returns the layers newly bound, whose
+    /// contents are undefined until written. A non-sparse image has nothing to bind.
+    pub fn bind(
+        &mut self,
+        scheduler: &mut Scheduler,
+        level: u32,
+        layers: std::ops::Range<u32>,
+        cap: u64,
+    ) -> Result<std::ops::Range<u32>> {
+        let Some(sparse) = self.sparse.as_deref_mut() else {
+            return Ok(0..0);
+        };
+        let block = sparse.requirements.alignment.max(1);
+        let mut image_binds = Vec::new();
+        let mut opaque_binds = Vec::new();
+        let mut newly = layers.end..layers.start;
+        for layer in layers {
+            let index = (level * self.desc.array_layers + layer) as usize;
+            if sparse.bound[index] {
+                continue;
+            }
+            let mut binds = Vec::new();
+            let mut tails = Vec::new();
+            let mut bytes = 0;
+            for aspect in &sparse.aspects {
+                let shape = aspect.format_properties.image_granularity;
+                if level >= aspect.image_mip_tail_first_lod {
+                    let tail = if sparse.tails.len() == 1 {
+                        0
+                    } else {
+                        layer as usize
+                    };
+                    if !sparse.tails[tail] {
+                        let offset = aspect.image_mip_tail_offset
+                            + tail as u64 * aspect.image_mip_tail_stride;
+                        tails.push((tail, offset, aspect.image_mip_tail_size));
+                        bytes += aspect.image_mip_tail_size;
+                    }
+                    continue;
+                }
+                let extent = vk::Extent3D {
+                    width: (self.desc.extent.width >> level).max(1),
+                    height: (self.desc.extent.height >> level).max(1),
+                    depth: (self.desc.extent.depth >> level).max(1),
+                };
+                let size = u64::from(extent.width.div_ceil(shape.width))
+                    * u64::from(extent.height.div_ceil(shape.height))
+                    * u64::from(extent.depth.div_ceil(shape.depth))
+                    * block;
+                binds.push((aspect.format_properties.aspect_mask, extent, size));
+                bytes += size;
+            }
+            if sparse.bytes + bytes > cap {
+                break;
+            }
+            for (aspect_mask, extent, size) in binds {
+                let allocation = allocate(
+                    &self.device,
+                    "sparse image block",
+                    vk::MemoryRequirements {
+                        size,
+                        ..sparse.requirements
+                    },
+                    MemoryLocation::GpuOnly,
+                    false,
+                )?;
+                image_binds.push(
+                    vk::SparseImageMemoryBind::default()
+                        .subresource(vk::ImageSubresource {
+                            aspect_mask,
+                            mip_level: level,
+                            array_layer: layer,
+                        })
+                        .extent(extent)
+                        // SAFETY: the allocation lives as long as the image (freed on drop).
+                        .memory(unsafe { allocation.memory() })
+                        .memory_offset(allocation.offset()),
+                );
+                sparse.allocations.push(allocation);
+            }
+            for (tail, offset, size) in tails {
+                let allocation = allocate(
+                    &self.device,
+                    "sparse image mip tail",
+                    vk::MemoryRequirements {
+                        size,
+                        ..sparse.requirements
+                    },
+                    MemoryLocation::GpuOnly,
+                    false,
+                )?;
+                opaque_binds.push(
+                    vk::SparseMemoryBind::default()
+                        .resource_offset(offset)
+                        .size(size)
+                        // SAFETY: as above.
+                        .memory(unsafe { allocation.memory() })
+                        .memory_offset(allocation.offset()),
+                );
+                sparse.allocations.push(allocation);
+                sparse.tails[tail] = true;
+            }
+            sparse.bytes += bytes;
+            sparse.bound[index] = true;
+            newly = newly.start.min(layer)..newly.end.max(layer + 1);
+        }
+        if !image_binds.is_empty() || !opaque_binds.is_empty() {
+            scheduler.bind_sparse(self.raw, &image_binds, &opaque_binds)?;
+        }
+        Ok(if newly.is_empty() { 0..0 } else { newly })
     }
 
     pub fn raw(&self) -> vk::Image {
@@ -294,6 +485,7 @@ impl Image {
     /// Bytes of device memory backing the image.
     pub fn memory_size(&self) -> u64 {
         self.allocation.as_ref().map_or(0, Allocation::size)
+            + self.sparse.as_ref().map_or(0, |s| s.bytes)
     }
 
     /// Every level and layer of the image.
@@ -362,6 +554,11 @@ impl Drop for Image {
         unsafe { self.device.raw.destroy_image(self.raw, None) };
         if let Some(allocation) = self.allocation.take() {
             free(&self.device, allocation);
+        }
+        if let Some(sparse) = self.sparse.take() {
+            for allocation in sparse.allocations {
+                free(&self.device, allocation);
+            }
         }
     }
 }
