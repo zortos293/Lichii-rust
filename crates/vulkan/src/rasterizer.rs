@@ -246,6 +246,9 @@ impl VulkanRasterizer {
             .set_async_compilation(settings.async_shader_compilation);
         self.draw
             .shaders
+            .set_async(settings.async_shader_compilation);
+        self.draw
+            .shaders
             .set_resolution_scale(settings.resolution_scale);
         self.texture_cache.set_vram_usage(settings.vram_usage);
         self.texture_cache
@@ -955,12 +958,17 @@ impl Rasterizer for VulkanRasterizer {
         self.handles.timestamp.frame_presented();
         self.draw.shaders.flush_disk();
         self.draw.shaders.log_stats(Instant::now());
+        self.draw.shaders.end_frame();
         for pipeline in self.draw.pipelines.replaced() {
             self.scheduler.retire(pipeline);
         }
-        let cached = match self.texture_cache.presentable(framebuffer) {
-            Some(id) => self.present_cached(framebuffer, id),
-            None => Ok(false),
+        let cached = match self
+            .texture_cache
+            .presentable(&mut self.scheduler, framebuffer)
+        {
+            Ok(Some(id)) => self.present_cached(framebuffer, id),
+            Ok(None) => Ok(false),
+            Err(error) => Err(error),
         };
         let result = match cached {
             Ok(true) => Ok(()),

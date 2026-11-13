@@ -81,6 +81,9 @@ impl PoolLayout {
 struct FreeList {
     ranges: BTreeMap<PAddr, u64>,
     free: u64,
+    /// Freed ranges that still hold their old contents. They are zeroed when allocated again,
+    /// so memory nobody reuses (a whole process at shutdown) is never written.
+    dirty: BTreeMap<PAddr, u64>,
 }
 
 impl FreeList {
@@ -102,20 +105,46 @@ impl FreeList {
         self.free -= size;
     }
 
-    fn give(&mut self, mut start: PAddr, mut size: u64) {
-        if let Some((&prev, &prev_size)) = self.ranges.range(..start).next_back()
-            && prev + prev_size == start
-        {
-            self.ranges.remove(&prev);
-            start = prev;
-            size += prev_size;
-        }
-        if let Some(&next_size) = self.ranges.get(&(start + size)) {
-            self.ranges.remove(&(start + size));
-            size += next_size;
-        }
-        self.ranges.insert(start, size);
+    fn give(&mut self, start: PAddr, size: u64) {
+        insert_coalescing(&mut self.ranges, start, size);
+        insert_coalescing(&mut self.dirty, start, size);
+        self.free += size;
     }
+
+    /// Removes the dirty parts of `[start, start + size)` and appends them to `out`.
+    fn take_dirty(&mut self, start: PAddr, size: u64, out: &mut Vec<(PAddr, u64)>) {
+        let end = start + size;
+        while let Some((&run, &len)) = self
+            .dirty
+            .range(..end)
+            .next_back()
+            .filter(|&(&run, &len)| run + len > start)
+        {
+            self.dirty.remove(&run);
+            if run < start {
+                self.dirty.insert(run, start - run);
+            }
+            if run + len > end {
+                self.dirty.insert(end, run + len - end);
+            }
+            let from = run.max(start);
+            out.push((from, (run + len).min(end) - from));
+        }
+    }
+}
+
+fn insert_coalescing(ranges: &mut BTreeMap<PAddr, u64>, mut start: PAddr, mut size: u64) {
+    if let Some((&prev, &prev_size)) = ranges.range(..start).next_back()
+        && prev + prev_size == start
+    {
+        ranges.remove(&prev);
+        start = prev;
+        size += prev_size;
+    }
+    if let Some(next_size) = ranges.remove(&(start + size)) {
+        size += next_size;
+    }
+    ranges.insert(start, size);
 }
 
 struct PoolAllocator {
@@ -161,7 +190,11 @@ impl MemoryManager {
             let pool = PoolAllocator {
                 start,
                 size,
-                free: Mutex::new(FreeList { ranges, free: size }),
+                free: Mutex::new(FreeList {
+                    ranges,
+                    free: size,
+                    dirty: BTreeMap::new(),
+                }),
             };
             start += size;
             pool
@@ -202,11 +235,14 @@ impl MemoryManager {
                 }
             }
         }
+        let mut dirty = Vec::new();
         for &(start, run) in &runs {
             list.take(start, run);
+            list.take_dirty(start, run, &mut dirty);
         }
         drop(list);
         self.commit(&runs)?;
+        self.zero(&dirty);
         Ok(PageGroup { runs })
     }
 
@@ -221,8 +257,11 @@ impl MemoryManager {
         });
         let start = found.ok_or(result::OUT_OF_MEMORY)?;
         list.take(start, size);
+        let mut dirty = Vec::new();
+        list.take_dirty(start, size, &mut dirty);
         drop(list);
         self.commit(&[(start, size)])?;
+        self.zero(&dirty);
         Ok(start)
     }
 
@@ -239,20 +278,23 @@ impl MemoryManager {
         Ok(())
     }
 
-    /// Returns pages to their pool, zeroed.
+    fn zero(&self, runs: &[(PAddr, u64)]) {
+        for &(start, size) in runs {
+            self.physical.discard(start, size);
+        }
+    }
+
+    /// Returns pages to their pool. They are zeroed when allocated again.
     pub fn free(&self, start: PAddr, size: u64) {
         if size == 0 {
             return;
         }
-        self.physical.discard(start, size);
         let pool = self
             .pools
             .iter()
             .find(|p| start >= p.start && start + size <= p.start + p.size)
             .unwrap_or_else(|| panic!("freeing {start:#x}+{size:#x} outside every pool"));
-        let mut list = pool.free.lock();
-        list.give(start, size);
-        list.free += size;
+        pool.free.lock().give(start, size);
     }
 
     pub fn free_group(&self, group: &PageGroup) {
@@ -312,6 +354,42 @@ mod tests {
             .allocate_contiguous(Pool::System, 0x2000, 0x10000)
             .unwrap();
         assert_eq!(sys, 40 * MIB);
+    }
+
+    fn fill(mm: &MemoryManager, pa: PAddr, size: u64, byte: u8) {
+        // SAFETY: the range is allocated and committed DRAM inside the backing.
+        unsafe { std::ptr::write_bytes(mm.physical().pointer(pa), byte, size as usize) };
+    }
+
+    fn byte_at(mm: &MemoryManager, pa: PAddr) -> u8 {
+        // SAFETY: pa is committed DRAM inside the backing.
+        unsafe { *mm.physical().pointer(pa) }
+    }
+
+    #[test]
+    fn freed_pages_are_zeroed_only_when_allocated_again() {
+        let mm = manager();
+        let a = mm.allocate(Pool::Application, 0x3000).unwrap();
+        fill(&mm, 0, 0x3000, 0xaa);
+        mm.free_group(&a);
+        assert_eq!(byte_at(&mm, 0x2fff), 0xaa);
+        assert_eq!(
+            mm.allocate(Pool::Application, 0x1000).unwrap().runs,
+            vec![(0, 0x1000)]
+        );
+        assert_eq!(byte_at(&mm, 0), 0);
+        assert_eq!(byte_at(&mm, 0x1000), 0xaa);
+        let sys = mm
+            .allocate_contiguous(Pool::Application, 0x1000, 0x2000)
+            .unwrap();
+        assert_eq!(sys, 0x2000);
+        assert_eq!(byte_at(&mm, 0x2fff), 0);
+        assert_eq!(byte_at(&mm, 0x1000), 0xaa);
+        assert_eq!(
+            mm.allocate(Pool::Application, 0x1000).unwrap().runs,
+            vec![(0x1000, 0x1000)]
+        );
+        assert_eq!(byte_at(&mm, 0x1fff), 0);
     }
 
     #[test]
