@@ -8,6 +8,8 @@ use crate::{FaultKind, MemoryFault, MemoryPermission};
 const L2_BITS: u32 = 14;
 const L2_ENTRIES: usize = 1 << L2_BITS;
 const PERM_MASK: usize = 0xfff;
+/// Set on process pages whose physical page a GPU cache holds ([`crate::tracking`]).
+const TRACKED: usize = 0x800;
 
 type L2Table = [AtomicUsize; L2_ENTRIES];
 
@@ -60,8 +62,28 @@ impl PageTable {
         if old == 0 {
             return false;
         }
-        entry.store((old & !PERM_MASK) | perm.0 as usize, Ordering::Release);
+        entry.store(
+            (old & (!PERM_MASK | TRACKED)) | perm.0 as usize,
+            Ordering::Release,
+        );
         true
+    }
+
+    /// Sets or clears the tracked flag of a mapped page. Returns the page's permission when the
+    /// flag changed.
+    pub(crate) fn set_tracked(&self, addr: u64, tracked: bool) -> Option<MemoryPermission> {
+        let entry = self.entry(addr)?;
+        let old = entry.load(Ordering::Acquire);
+        if old == 0 || (old & TRACKED != 0) == tracked {
+            return None;
+        }
+        entry.store(old ^ TRACKED, Ordering::Release);
+        Some(MemoryPermission(old as u8 & 7))
+    }
+
+    pub(crate) fn is_tracked(&self, addr: u64) -> bool {
+        self.entry(addr)
+            .is_some_and(|entry| entry.load(Ordering::Acquire) & TRACKED != 0)
     }
 
     #[inline]

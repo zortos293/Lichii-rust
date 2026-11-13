@@ -1,12 +1,14 @@
 use std::sync::Arc;
+use std::sync::atomic::{Ordering, fence};
 
-use lichii_common::{PAGE_MASK, PAGE_SIZE, PAddr, VAddr};
+use lichii_common::{PAGE_BITS, PAGE_MASK, PAGE_SIZE, PAddr, VAddr};
 use parking_lot::Mutex;
 
 use crate::PhysicalMemory;
 use crate::fault::{FaultHandler, Registration};
 use crate::host::{Arena, HostProtection};
 use crate::page_table::PageTable;
+use crate::tracking::{DirtyPages, ReverseMap};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct MemoryPermission(pub u8);
@@ -96,13 +98,33 @@ impl Fastmem {
 
 /// A process's guest virtual address space.
 ///
-/// Translation and accesses are lock-free. `map`, `unmap` and `protect` are serialised so the
-/// table and the fastmem arena always agree.
+/// Translation and accesses are lock-free. `map`, `unmap`, `protect` and write tracking
+/// ([`crate::tracking`]) are serialised so the table, the fastmem arena and the reverse map always
+/// agree. Writes from host code report themselves to write tracking: use the write methods here,
+/// or [`AddressSpace::write_with`] for a write through a host pointer.
 pub struct AddressSpace {
     table: PageTable,
     physical: Arc<PhysicalMemory>,
     fastmem: Option<Fastmem>,
-    update: Mutex<()>,
+    update: Mutex<Tracking>,
+    dirty: DirtyPages,
+}
+
+/// Write-tracking state that changes with the mappings.
+struct Tracking {
+    /// The virtual pages mapping each physical page.
+    reverse: ReverseMap,
+    /// How many [`crate::CachedPages`] guards hold each physical page.
+    cached: Box<[u16]>,
+}
+
+impl Tracking {
+    fn new(physical_size: u64) -> Self {
+        Self {
+            reverse: ReverseMap::new(physical_size),
+            cached: vec![0; (physical_size / PAGE_SIZE) as usize].into_boxed_slice(),
+        }
+    }
 }
 
 impl AddressSpace {
@@ -110,9 +132,10 @@ impl AddressSpace {
     pub fn new(physical: Arc<PhysicalMemory>, address_space_bits: u32) -> Self {
         Self {
             table: PageTable::new(address_space_bits),
+            update: Mutex::new(Tracking::new(physical.size())),
+            dirty: DirtyPages::new(physical.size()),
             physical,
             fastmem: None,
-            update: Mutex::new(()),
         }
     }
 
@@ -129,12 +152,13 @@ impl AddressSpace {
             .ok_or(FastmemError::NoFaultHandler)?;
         Ok(Self {
             table: PageTable::new(address_space_bits),
+            update: Mutex::new(Tracking::new(physical.size())),
+            dirty: DirtyPages::new(physical.size()),
             physical,
             fastmem: Some(Fastmem {
                 registration,
                 arena,
             }),
-            update: Mutex::new(()),
         })
     }
 
@@ -164,10 +188,14 @@ impl AddressSpace {
         if let Err(err) = self.physical.commit(pa, size) {
             panic!("{err}");
         }
-        let _update = self.update.lock();
+        let mut tracking = self.update.lock();
         for page in 0..size / PAGE_SIZE {
-            let host = self.physical.pointer(pa + page * PAGE_SIZE);
-            self.table.set(va + page * PAGE_SIZE, host, perm);
+            let (addr, page_pa) = (va + page * PAGE_SIZE, pa + page * PAGE_SIZE);
+            if let Some(old) = self.physical_address(addr) {
+                tracking.reverse.remove(old, addr);
+            }
+            self.table.set(addr, self.physical.pointer(page_pa), perm);
+            tracking.reverse.insert(page_pa, addr);
         }
         if let Some(fastmem) = &self.fastmem {
             fastmem
@@ -181,6 +209,11 @@ impl AddressSpace {
                 )
                 .unwrap_or_else(|err| panic!("fastmem map {va:#x}+{size:#x}: {err}"));
         }
+        let mut aliases: Vec<VAddr> = (0..size / PAGE_SIZE)
+            .filter(|page| tracking.cached[((pa >> PAGE_BITS) + page) as usize] != 0)
+            .map(|page| va + page * PAGE_SIZE)
+            .collect();
+        self.set_tracked(&mut aliases, true);
     }
 
     pub fn unmap(&self, va: VAddr, size: u64) {
@@ -189,9 +222,13 @@ impl AddressSpace {
             0,
             "unaligned unmap {va:#x} {size:#x}"
         );
-        let _update = self.update.lock();
+        let mut tracking = self.update.lock();
         for page in 0..size / PAGE_SIZE {
-            self.table.clear(va + page * PAGE_SIZE);
+            let addr = va + page * PAGE_SIZE;
+            if let Some(old) = self.physical_address(addr) {
+                tracking.reverse.remove(old, addr);
+            }
+            self.table.clear(addr);
         }
         if let Some(fastmem) = &self.fastmem {
             fastmem
@@ -201,6 +238,8 @@ impl AddressSpace {
         }
     }
 
+    /// Changes the permission of the mapped pages of `[va, va + size)`. Write-tracked pages
+    /// stay write-protected in the fastmem arena.
     pub fn protect(&self, va: VAddr, size: u64, perm: MemoryPermission) {
         let _update = self.update.lock();
         let start = va & !PAGE_MASK;
@@ -219,6 +258,115 @@ impl AddressSpace {
         if let Some((s, len)) = run {
             self.protect_host(s, len, perm);
         }
+    }
+
+    /// Sets or clears the tracked flag of `pages` and write-protects or releases their fastmem
+    /// views, in runs. Called with `update` held.
+    fn set_tracked(&self, pages: &mut [VAddr], tracked: bool) {
+        pages.sort_unstable();
+        let mut run: Option<(VAddr, u64, MemoryPermission)> = None;
+        let flush = |run: Option<(VAddr, u64, MemoryPermission)>| {
+            if let (Some((va, size, perm)), Some(fastmem)) = (run, &self.fastmem) {
+                fastmem
+                    .arena
+                    .track(va as usize, size as usize, perm.host(), tracked)
+                    .unwrap_or_else(|err| panic!("fastmem tracking {va:#x}+{size:#x}: {err}"));
+            }
+        };
+        for &va in pages.iter() {
+            let Some(perm) = self.table.set_tracked(va, tracked) else {
+                continue;
+            };
+            match &mut run {
+                Some((start, size, p)) if *start + *size == va && *p == perm => *size += PAGE_SIZE,
+                _ => {
+                    flush(run.take());
+                    run = Some((va, PAGE_SIZE, perm));
+                }
+            }
+        }
+        flush(run);
+    }
+
+    /// Adds a cache hold to every physical page of `runs` and tracks every virtual page that maps
+    /// one, including pages a CPU write untracked since an earlier hold.
+    pub(crate) fn cache_physical(&self, runs: &[(PAddr, u64)]) {
+        let mut tracking = self.update.lock();
+        let mut pages = Vec::new();
+        for &(pa, size) in runs {
+            for page in (pa..pa + size).step_by(PAGE_SIZE as usize) {
+                let count = &mut tracking.cached[(page >> PAGE_BITS) as usize];
+                *count = count
+                    .checked_add(1)
+                    .expect("too many cache holds on one page");
+                tracking.reverse.for_each(page, |va| pages.push(va));
+            }
+        }
+        self.set_tracked(&mut pages, true);
+        drop(tracking);
+        fence(Ordering::SeqCst);
+    }
+
+    /// Releases a hold [`AddressSpace::cache_physical`] added; pages nothing holds any more stop
+    /// being tracked.
+    pub(crate) fn uncache_physical(&self, runs: &[(PAddr, u64)]) {
+        let mut tracking = self.update.lock();
+        let mut pages = Vec::new();
+        for &(pa, size) in runs {
+            for page in (pa..pa + size).step_by(PAGE_SIZE as usize) {
+                let count = &mut tracking.cached[(page >> PAGE_BITS) as usize];
+                *count = count.checked_sub(1).expect("cache hold released twice");
+                if *count == 0 {
+                    tracking.reverse.for_each(page, |va| pages.push(va));
+                }
+            }
+        }
+        self.set_tracked(&mut pages, false);
+    }
+
+    /// Reports a write host code made to `[va, va + size)` after its bytes landed: a tracked page
+    /// is untracked everywhere and published dirty.
+    fn note_write(&self, va: VAddr, size: u64) {
+        if size == 0 {
+            return;
+        }
+        fence(Ordering::SeqCst);
+        let last = va.saturating_add(size - 1) & !PAGE_MASK;
+        let mut page = va & !PAGE_MASK;
+        loop {
+            if self.table.is_tracked(page) {
+                self.cpu_wrote(page);
+            }
+            if page >= last {
+                break;
+            }
+            page += PAGE_SIZE;
+        }
+    }
+
+    #[cold]
+    fn cpu_wrote(&self, va: VAddr) {
+        let Some(pa) = self.physical_address(va) else {
+            return;
+        };
+        let pa = pa & !PAGE_MASK;
+        let tracking = self.update.lock();
+        let mut pages = Vec::new();
+        tracking.reverse.for_each(pa, |alias| pages.push(alias));
+        self.set_tracked(&mut pages, false);
+        drop(tracking);
+        self.dirty.mark(pa);
+    }
+
+    /// Whether a CPU write to a tracked page is waiting for [`AddressSpace::take_cpu_writes`].
+    pub(crate) fn has_cpu_writes(&self) -> bool {
+        self.dirty.pending()
+    }
+
+    /// Calls `f` with each run of physical pages the CPU wrote while they were tracked, as
+    /// (address, size), and forgets them.
+    pub(crate) fn take_cpu_writes(&self, f: impl FnMut(PAddr, u64)) {
+        self.dirty.take(f);
     }
 
     fn protect_host(&self, va: VAddr, size: u64, perm: MemoryPermission) {
@@ -272,7 +420,9 @@ impl AddressSpace {
     /// Writes a value, whatever the page permissions (loading code, HLE writes).
     #[inline]
     pub fn write<T: bytemuck::Pod>(&self, va: VAddr, value: T) -> Result<(), MemoryFault> {
-        self.table.write(va, value, MemoryPermission::NONE)
+        let result = self.table.write(va, value, MemoryPermission::NONE);
+        self.note_write(va, std::mem::size_of::<T>() as u64);
+        result
     }
 
     pub fn read_bytes(&self, va: VAddr, out: &mut [u8]) -> Result<(), MemoryFault> {
@@ -280,11 +430,29 @@ impl AddressSpace {
     }
 
     pub fn write_bytes(&self, va: VAddr, data: &[u8]) -> Result<(), MemoryFault> {
-        self.table.write_bytes(va, data, MemoryPermission::NONE)
+        let result = self.table.write_bytes(va, data, MemoryPermission::NONE);
+        self.note_write(va, data.len() as u64);
+        result
     }
 
     pub fn fill(&self, va: VAddr, size: u64, byte: u8) -> Result<(), MemoryFault> {
-        self.table.fill(va, size, byte, MemoryPermission::NONE)
+        let result = self.table.fill(va, size, byte, MemoryPermission::NONE);
+        self.note_write(va, size);
+        result
+    }
+
+    /// Runs `write` on the host pointer for `va`, which needs `need`, then reports the write
+    /// to write tracking. For atomics, exclusive stores and other writes through a host pointer;
+    /// `write` must stay inside the page of `va`.
+    pub fn write_with<R>(
+        &self,
+        va: VAddr,
+        need: MemoryPermission,
+        write: impl FnOnce(*mut u8) -> R,
+    ) -> Result<R, MemoryFault> {
+        let result = write(self.table.access(va, need)?);
+        self.note_write(va, 1);
+        Ok(result)
     }
 
     /// A guest load: the page must be readable, else a permission fault.
@@ -298,13 +466,17 @@ impl AddressSpace {
     /// stores fault into its slow path, which stores through here.
     #[inline]
     pub fn guest_write<T: bytemuck::Pod>(&self, va: VAddr, value: T) -> Result<(), MemoryFault> {
-        self.table.write(va, value, MemoryPermission::WRITE)
+        let result = self.table.write(va, value, MemoryPermission::WRITE);
+        self.note_write(va, std::mem::size_of::<T>() as u64);
+        result
     }
 
     /// A guest store of `size` copies of `byte` (`DC ZVA`), checked like
     /// [`AddressSpace::guest_write`]; pages before a faulting one are written.
     pub fn guest_fill(&self, va: VAddr, size: u64, byte: u8) -> Result<(), MemoryFault> {
-        self.table.fill(va, size, byte, MemoryPermission::WRITE)
+        let result = self.table.fill(va, size, byte, MemoryPermission::WRITE);
+        self.note_write(va, size);
+        result
     }
 
     /// Reads a NUL-terminated string of at most `max_len` bytes.

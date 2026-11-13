@@ -4,7 +4,8 @@
 //! [`PhysicalMemory`] reserves guest DRAM as a shareable host object and commits it on demand.
 //! [`AddressSpace`] translates guest virtual addresses through a lock-free two-level table of
 //! host pointers and can mirror the guest layout into a [`Fastmem`] arena for the JIT.
-//! [`DeviceAddressSpace`] is the same table keyed by device address, for the GPU.
+//! [`DeviceAddressSpace`] is the same table keyed by device address, for the GPU. GPU caches
+//! learn about CPU writes to what they copied through write tracking ([`tracking`]).
 
 mod address_space;
 mod device;
@@ -13,6 +14,7 @@ mod fault;
 mod host;
 mod page_table;
 mod physical;
+pub mod tracking;
 
 pub use address_space::{
     AddressSpace, Fastmem, FastmemError, FaultKind, MemoryFault, MemoryPermission,
@@ -21,6 +23,7 @@ pub use device::DeviceAddressSpace;
 pub use exclusive::{ExclusiveMonitor, ReservationSlot};
 pub use fault::{FaultHandler, HostFault};
 pub use physical::{PhysicalMemory, PhysicalMemoryError};
+pub use tracking::CachedPages;
 
 #[cfg(test)]
 mod fastmem_tests;

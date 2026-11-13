@@ -1,9 +1,10 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use lichii_common::{DAddr, PAGE_MASK, PAGE_SIZE, PAddr, VAddr};
 use parking_lot::Mutex;
 
 use crate::page_table::PageTable;
+use crate::tracking::{CachedPages, ReverseMap};
 use crate::{AddressSpace, MemoryFault, MemoryPermission, PhysicalMemory};
 
 /// A device (SMMU) address space: guest memory as the GPU and other DMA engines see it.
@@ -11,11 +12,13 @@ use crate::{AddressSpace, MemoryFault, MemoryPermission, PhysicalMemory};
 /// Device addresses map to DRAM pages, usually pinned from a process address space
 /// ([`DeviceAddressSpace::map_process`]). Translation is a lock-free table walk, safe to call from
 /// the GPU thread while a service thread maps or unmaps; there is no translation cache to
-/// invalidate.
+/// invalidate. GPU caches learn about CPU writes through it ([`crate::tracking`]).
 pub struct DeviceAddressSpace {
     table: PageTable,
     physical: Arc<PhysicalMemory>,
-    update: Mutex<()>,
+    /// Serialises map and unmap; the device pages mapping each physical page.
+    update: Mutex<ReverseMap>,
+    process: OnceLock<Arc<AddressSpace>>,
 }
 
 impl DeviceAddressSpace {
@@ -23,8 +26,79 @@ impl DeviceAddressSpace {
     pub fn new(physical: Arc<PhysicalMemory>, address_space_bits: u32) -> Self {
         Self {
             table: PageTable::new(address_space_bits),
+            update: Mutex::new(ReverseMap::new(physical.size())),
             physical,
-            update: Mutex::new(()),
+            process: OnceLock::new(),
+        }
+    }
+
+    /// Names the process whose CPU writes GPU caches over this space must see. Called once.
+    pub fn attach_process(&self, process: Arc<AddressSpace>) {
+        assert!(
+            Arc::ptr_eq(process.physical(), &self.physical),
+            "device and process address spaces use different DRAM"
+        );
+        assert!(
+            self.process.set(process).is_ok(),
+            "a process is already attached to this device address space"
+        );
+    }
+
+    /// Tracks the physical pages behind the mapped pages of `[daddr, daddr + size)` for CPU writes
+    /// until the guard is dropped. A cache takes it before it reads the bytes it copies, and a
+    /// new one for every upload; without an attached process nothing is tracked.
+    pub fn cache_pages(&self, daddr: DAddr, size: u64) -> CachedPages {
+        let mut runs: Vec<(PAddr, u64)> = Vec::new();
+        let end = daddr.saturating_add(size);
+        let mut page = daddr & !PAGE_MASK;
+        while page < end {
+            if let Some(pa) = self.physical_address(page) {
+                match runs.last_mut() {
+                    Some((start, len)) if *start + *len == pa => *len += PAGE_SIZE,
+                    _ => runs.push((pa, PAGE_SIZE)),
+                }
+            }
+            page += PAGE_SIZE;
+        }
+        CachedPages::new(self.process.get().cloned(), runs)
+    }
+
+    /// Whether the attached process wrote a tracked page since the last
+    /// [`DeviceAddressSpace::take_cpu_writes`]. One atomic load.
+    #[inline]
+    pub fn has_cpu_writes(&self) -> bool {
+        self.process.get().is_some_and(|p| p.has_cpu_writes())
+    }
+
+    /// Calls `f` with each device range (address, size) the attached process wrote while it was
+    /// tracked, and forgets them. Pages no device address maps are left out.
+    pub fn take_cpu_writes(&self, mut f: impl FnMut(DAddr, u64)) {
+        let Some(process) = self.process.get() else {
+            return;
+        };
+        let mut pages: Vec<DAddr> = Vec::new();
+        process.take_cpu_writes(|pa, size| {
+            let reverse = self.update.lock();
+            for page in (pa..pa + size).step_by(PAGE_SIZE as usize) {
+                reverse.for_each(page, |daddr| pages.push(daddr));
+            }
+        });
+        pages.sort_unstable();
+        pages.dedup();
+        let mut run: Option<(DAddr, u64)> = None;
+        for daddr in pages {
+            match &mut run {
+                Some((start, len)) if *start + *len == daddr => *len += PAGE_SIZE,
+                _ => {
+                    if let Some((start, len)) = run.take() {
+                        f(start, len);
+                    }
+                    run = Some((daddr, PAGE_SIZE));
+                }
+            }
+        }
+        if let Some((start, len)) = run {
+            f(start, len);
         }
     }
 
@@ -52,12 +126,26 @@ impl DeviceAddressSpace {
         if let Err(err) = self.physical.commit(pa, size) {
             panic!("{err}");
         }
-        let _update = self.update.lock();
+        let mut reverse = self.update.lock();
         for page in 0..size / PAGE_SIZE {
-            let host = self.physical.pointer(pa + page * PAGE_SIZE);
-            self.table
-                .set(daddr + page * PAGE_SIZE, host, MemoryPermission::READ_WRITE);
+            self.set_page(
+                &mut reverse,
+                daddr + page * PAGE_SIZE,
+                pa + page * PAGE_SIZE,
+            );
         }
+    }
+
+    fn set_page(&self, reverse: &mut ReverseMap, daddr: DAddr, pa: PAddr) {
+        if let Some(old) = self.physical_address(daddr) {
+            reverse.remove(old, daddr);
+        }
+        self.table.set(
+            daddr,
+            self.physical.pointer(pa),
+            MemoryPermission::READ_WRITE,
+        );
+        reverse.insert(pa, daddr);
     }
 
     /// Maps the DRAM pages behind `[va, va + size)` of `process` to `daddr`. Fails without
@@ -79,22 +167,17 @@ impl DeviceAddressSpace {
             Arc::ptr_eq(process.physical(), &self.physical),
             "device and process address spaces use different DRAM"
         );
-        let hosts = (0..size / PAGE_SIZE)
+        let pages = (0..size / PAGE_SIZE)
             .map(|page| {
                 let addr = va + page * PAGE_SIZE;
                 process
-                    .translate(addr)
-                    .map(|(host, _)| host)
+                    .physical_address(addr)
                     .ok_or(MemoryFault::unmapped(addr))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let _update = self.update.lock();
-        for (page, host) in hosts.into_iter().enumerate() {
-            self.table.set(
-                daddr + page as u64 * PAGE_SIZE,
-                host,
-                MemoryPermission::READ_WRITE,
-            );
+        let mut reverse = self.update.lock();
+        for (page, pa) in pages.into_iter().enumerate() {
+            self.set_page(&mut reverse, daddr + page as u64 * PAGE_SIZE, pa);
         }
         Ok(())
     }
@@ -106,9 +189,13 @@ impl DeviceAddressSpace {
             0,
             "unaligned device unmap {daddr:#x} {size:#x}"
         );
-        let _update = self.update.lock();
+        let mut reverse = self.update.lock();
         for page in 0..size / PAGE_SIZE {
-            self.table.clear(daddr + page * PAGE_SIZE);
+            let addr = daddr + page * PAGE_SIZE;
+            if let Some(old) = self.physical_address(addr) {
+                reverse.remove(old, addr);
+            }
+            self.table.clear(addr);
         }
     }
 
