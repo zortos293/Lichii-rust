@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use lichii_common::settings::CpuAccuracy;
 use lichii_memory::{AddressSpace, ExclusiveMonitor, MemoryPermission, PhysicalMemory};
 
-use super::{Jit, Passes};
+use super::{Jit, Passes, simd};
 use crate::decoder::{Inst, decode};
 use crate::{CpuConfig, CpuCore, GuestClock, HaltReason, Interpreter, ThreadContext, TscScale};
 
@@ -749,6 +749,38 @@ fn ixc_follows_fpsr_writes() {
         ctx.v[4] = 0x3f80_0000;
         compare(machines, code, &ctx, &data);
     }
+}
+
+/// Native FP must not inherit the caller's rounding, flush-to-zero or denormals-are-zero
+/// controls, and the caller gets its MXCSR back.
+#[test]
+fn host_mxcsr_does_not_leak_into_guest_fp() {
+    const FADD_S0_S1_S2: u32 = 0x1e22_2820;
+    const FMUL_D3_D4_D5: u32 = 0x1e65_0883;
+    const ROUND_UP_FTZ_DAZ: u32 = 0x1f80 | 2 << 13 | 1 << 15 | 1 << 6;
+    let mut ctx = ThreadContext {
+        pc: CODE,
+        fpsr: 0x10,
+        ..Default::default()
+    };
+    ctx.v[1] = 0x3f80_0000;
+    ctx.v[2] = 0x3380_0000;
+    ctx.v[4] = 1;
+    ctx.v[5] = 0x4330_0000_0000_0000;
+    let code = [FADD_S0_S1_S2, FMUL_D3_D4_D5, BRK];
+    let data = vec![0u8; DATA_SIZE as usize];
+    let mut interpreter = Machine::new(Backend::Interpreter);
+    let mut jit = Machine::new(Backend::Jit(Passes::ALL));
+    let expected = interpreter.run(&code, &ctx, &data);
+    let saved = simd::mxcsr();
+    simd::set_mxcsr(ROUND_UP_FTZ_DAZ);
+    let actual = jit.run(&code, &ctx, &data);
+    let after = simd::mxcsr();
+    simd::set_mxcsr(saved);
+    assert_eq!(actual.ctx.v[0], expected.ctx.v[0]);
+    assert_eq!(actual.ctx.v[3], expected.ctx.v[3]);
+    assert_eq!(actual.ctx.fpsr, expected.ctx.fpsr);
+    assert_eq!(after, ROUND_UP_FTZ_DAZ);
 }
 
 #[test]
