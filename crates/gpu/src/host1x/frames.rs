@@ -64,6 +64,8 @@ struct Table {
     entries: Vec<Entry>,
     spare: Vec<Arc<Frame>>,
     age: u64,
+    /// Channels whose decoder was abandoned while still decoding; their pictures are not kept.
+    revoked: Vec<u64>,
 }
 
 impl Table {
@@ -101,6 +103,7 @@ impl DecodedFrames {
                 entries: Vec::with_capacity(CAPACITY),
                 spare: Vec::with_capacity(CAPACITY),
                 age: 0,
+                revoked: Vec::new(),
             }),
         }
     }
@@ -112,9 +115,14 @@ impl DecodedFrames {
         recycled.or_else(|| Frame::new().ok().map(Arc::new))
     }
 
-    /// Keeps `frame` as the picture of the surface at `keys`, decoded by `channel`.
+    /// Keeps `frame` as the picture of the surface at `keys`, decoded by `channel`, unless the
+    /// channel's decoder was revoked.
     pub(crate) fn insert(&self, channel: u64, keys: SurfaceKeys, frame: Arc<Frame>) {
         let mut table = self.table.lock();
+        if table.revoked.contains(&channel) {
+            table.recycle(frame);
+            return;
+        }
         table.remove_overlapping(keys);
         if table.entries.len() == CAPACITY
             && let Some(oldest) = (0..table.entries.len()).min_by_key(|&i| table.entries[i].age)
@@ -145,9 +153,20 @@ impl DecodedFrames {
         self.table.lock().recycle(frame);
     }
 
+    /// Drops the pictures of `channel` and keeps none it decodes from now on: its decoder was
+    /// abandoned and may still finish a picture whose surface the guest has reused since.
+    pub(crate) fn revoke(&self, channel: u64) {
+        let mut table = self.table.lock();
+        table.revoked.push(channel);
+        while let Some(index) = table.entries.iter().position(|e| e.channel == channel) {
+            table.remove(index);
+        }
+    }
+
     /// Drops the pictures of a closing NVDEC channel.
     pub(crate) fn close(&self, channel: u64) {
         let mut table = self.table.lock();
+        table.revoked.retain(|&revoked| revoked != channel);
         while let Some(index) = table.entries.iter().position(|e| e.channel == channel) {
             table.remove(index);
         }
@@ -156,5 +175,38 @@ impl DecodedFrames {
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.table.lock().entries.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys(luma: u64) -> SurfaceKeys {
+        SurfaceKeys {
+            top: luma,
+            bottom: luma,
+        }
+    }
+
+    #[test]
+    fn a_revoked_channel_keeps_no_pictures_until_it_closes() {
+        if !lichii_video::available() {
+            return;
+        }
+        let frames = DecodedFrames::new();
+        frames.insert(1, keys(0x1000), frames.spare_frame().unwrap());
+        frames.insert(2, keys(0x2000), frames.spare_frame().unwrap());
+        frames.revoke(1);
+        assert!(frames.lend(0x1000).is_none());
+        frames.insert(1, keys(0x2000), frames.spare_frame().unwrap());
+        let kept = frames
+            .lend(0x2000)
+            .expect("the other channel's picture stays");
+        frames.recycle(kept);
+        assert_eq!(frames.len(), 1);
+        frames.close(1);
+        frames.insert(1, keys(0x1000), frames.spare_frame().unwrap());
+        assert_eq!(frames.len(), 2);
     }
 }
