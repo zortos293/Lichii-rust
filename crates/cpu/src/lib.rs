@@ -83,12 +83,17 @@ pub trait GuestClock: Send + Sync {
 #[derive(Debug, Default)]
 #[repr(C)]
 pub struct TscScale {
+    /// Multiplier applied to the TSC value.
     pub mul: AtomicU64,
+    /// Right shift of the 128-bit product, below 64.
     pub shift: AtomicU64,
+    /// Ticks added after scaling, wrapping.
     pub offset: AtomicU64,
 }
 
 impl TscScale {
+    /// A scale for `offset + ((tsc * mul) >> shift)`. Panics unless `shift < 64`. Once a clock returns it
+    /// from [`GuestClock::host_tsc_scale`], its fields may change only while no core runs guest code.
     pub fn new(mul: u64, shift: u32, offset: u64) -> Self {
         assert!(shift < 64, "TSC scale shift {shift}");
         Self {
