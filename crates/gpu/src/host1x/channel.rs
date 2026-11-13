@@ -2,9 +2,10 @@
 //! buffers submitted to it in order on a thread of its own, as the channel DMA does: a syncpoint
 //! increment lands when the stream reaches it, and a host wait holds only its own channel.
 //!
-//! An NVDEC job decodes its frame and a VIC job composes its output surface, both on the channel
-//! thread. Without FFmpeg an NVDEC job only takes [`DECODE_TIME`] and a VIC job writes nothing, so
-//! a title's video waits still complete and it moves on past them.
+//! An NVDEC job decodes its frame and a VIC job composes its output surface for the channel.
+//! Every NVDEC job takes at least [`DECODE_TIME`], decoded or not. Without FFmpeg it only takes
+//! that and a VIC job writes nothing, so a title's video waits still complete and it moves on
+//! past them.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,8 +45,9 @@ impl VideoEngine {
     }
 }
 
-/// How long an NVDEC job takes without a decoder: half a 60 FPS frame, as the reference sleeps with
-/// decoding off, because titles stall when a decode completes in well under a millisecond.
+/// The least time an NVDEC job takes, and all it takes without a decoder: half a 60 FPS frame, as
+/// the reference sleeps with decoding off, because titles stall when a decode completes in well
+/// under a millisecond.
 pub const DECODE_TIME: Duration = Duration::from_millis(8);
 /// How often a host wait checks whether its channel is closing.
 const WAIT_SLICE: Duration = Duration::from_millis(50);
@@ -82,7 +84,14 @@ impl Engine {
 
     fn write(&mut self, method: u32, argument: u32) {
         match self {
-            Self::NvDec(nvdec) => nvdec.write(method, argument),
+            Self::NvDec(nvdec) => {
+                let started = Instant::now();
+                if nvdec.write(method, argument)
+                    && let Some(rest) = DECODE_TIME.checked_sub(started.elapsed())
+                {
+                    std::thread::sleep(rest);
+                }
+            }
             Self::Vic(vic) => vic.write(method, argument),
             Self::NvJpg => {}
         }
