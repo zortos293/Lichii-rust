@@ -296,6 +296,8 @@ impl TestKernel {
             romfs: None,
             nacp: None,
             pseudo_device_seed: 0,
+            icon: None,
+            version: 0,
             add_ons: Vec::new(),
         }
     }

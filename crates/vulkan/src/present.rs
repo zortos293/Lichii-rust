@@ -8,7 +8,7 @@
 //! each finished frame with the timeline value that completes it, and the presenter's submission
 //! waits on that value on the GPU, so neither thread blocks the other.
 
-mod passes;
+pub(crate) mod passes;
 mod ui;
 
 use std::sync::Arc;

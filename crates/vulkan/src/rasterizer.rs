@@ -2,9 +2,9 @@
 //!
 //! This milestone implements presentation (guest framebuffers read from device memory, deswizzled
 //! and handed to the [`Presenter`](crate::present::Presenter), or taken from the texture cache
-//! when the GPU rendered them), the fence and query protocol, and clears through the
-//! [`TextureCache`]. Draws and compute dispatches are accepted and dropped until the buffer and
-//! pipeline caches land.
+//! when the GPU rendered them), the fence and query protocol, clears (masked ones included)
+//! through the [`TextureCache`], and its collector once per presented frame. Draws and compute
+//! dispatches are accepted and dropped until the buffer and pipeline caches land.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -32,7 +32,9 @@ use crate::memory::{Image, ImageDesc};
 use crate::present::{FrameImage, FrameMailbox, GuestFrame};
 use crate::scheduler::Scheduler;
 use crate::staging::StagingRing;
-use crate::texture_cache::{ClearValue, ImageId, ImageInfo, Rect, TextureCache, Transfer};
+use crate::texture_cache::{
+    ClearValue, ImageId, ImageInfo, ImageKind, Rect, TextureCache, Transfer,
+};
 
 /// Frame images kept for reuse; one is being written while the presenter holds up to two.
 const FRAME_POOL: usize = 4;
@@ -51,7 +53,6 @@ pub struct VulkanRasterizer {
     fences: VecDeque<(u64, FenceAction)>,
     unflushed: bool,
     warned_unimplemented: bool,
-    warned_partial_clear: bool,
     texture_cache: TextureCache,
     buffer_cache: BufferCache,
 }
@@ -99,8 +100,20 @@ fn sample_rect(rect: Rect, info: &ImageInfo, width: u32, height: u32) -> Rect {
     }
 }
 
-fn covers(rect: Rect, info: &ImageInfo) -> bool {
-    rect.x == 0 && rect.y == 0 && rect.width >= info.width && rect.height >= info.height
+/// Whether a clear of `layer_count` layers (3D slices) from `base_layer` inside `rect` writes
+/// all of `info`.
+fn covers(rect: Rect, base_layer: u32, layer_count: u32, info: &ImageInfo) -> bool {
+    let layers = if info.kind == ImageKind::D3 {
+        info.depth
+    } else {
+        info.layers
+    };
+    rect.x == 0
+        && rect.y == 0
+        && rect.width >= info.width
+        && rect.height >= info.height
+        && base_layer == 0
+        && layer_count >= layers
 }
 
 impl VulkanRasterizer {
@@ -126,25 +139,19 @@ impl VulkanRasterizer {
             fences: VecDeque::new(),
             unflushed: false,
             warned_unimplemented: false,
-            warned_partial_clear: false,
             texture_cache: TextureCache::new(device, gob_layout, AstcRecompression::Uncompressed),
         })
     }
 
     /// Applies the settings the renderer reads while running: the resolution scale render
-    /// targets use from their next binding on, and the ASTC fallback format of new textures.
+    /// targets use from their next binding on, the ASTC fallback format of new textures, and
+    /// how much device memory the texture cache may fill.
     pub fn apply_settings(&mut self, settings: &GraphicsSettings) {
+        self.texture_cache.set_vram_usage(settings.vram_usage);
         self.texture_cache
             .set_resolution_scale(settings.resolution_scale);
         self.texture_cache
             .set_astc_recompression(settings.astc_recompression);
-    }
-
-    fn partial_clear(&mut self, what: &str) {
-        if !self.warned_partial_clear {
-            self.warned_partial_clear = true;
-            tracing::warn!("{what} clears are not implemented yet; dropping them");
-        }
     }
 
     fn clear_targets(&mut self, ctx: &GraphicsContext<'_>, layer_count: u32) -> Result<()> {
@@ -175,14 +182,17 @@ impl VulkanRasterizer {
                 index
             }];
             let enabled = [mask.r(), mask.g(), mask.b(), mask.a()];
-            let written = channels
-                .iter()
-                .zip(enabled)
-                .filter(|&(&c, m)| c & m != 0)
-                .count();
-            if written > 0 && written < 4 {
-                self.partial_clear("colour-masked");
-            } else if written == 4 {
+            let written = channels.iter().zip(enabled).enumerate().fold(
+                vk::ColorComponentFlags::empty(),
+                |written, (i, (&c, m))| {
+                    if c & m != 0 {
+                        written | vk::ColorComponentFlags::from_raw(1 << i)
+                    } else {
+                        written
+                    }
+                },
+            );
+            if !written.is_empty() {
                 let c = regs.clear_color;
                 let value = match info.format.numeric() {
                     Numeric::Uint => vk::ClearColorValue {
@@ -194,7 +204,8 @@ impl VulkanRasterizer {
                     _ => vk::ClearColorValue { float32: c },
                 };
                 let rect = sample_rect(rect, &info, width, height);
-                let discard = covers(rect, &info) && base_layer == 0 && layer_count >= info.layers;
+                let discard = written == vk::ColorComponentFlags::RGBA
+                    && covers(rect, base_layer, layer_count, &info);
                 let mut tx = Transfer {
                     scheduler: &mut self.scheduler,
                     staging: &mut self.staging,
@@ -207,7 +218,10 @@ impl VulkanRasterizer {
                     self.texture_cache.clear(
                         &mut tx,
                         target,
-                        ClearValue::Color(value),
+                        ClearValue::Color {
+                            value,
+                            mask: written,
+                        },
                         rect,
                         base_layer,
                         layer_count,
@@ -224,23 +238,18 @@ impl VulkanRasterizer {
             } else {
                 0xff
             };
-            if use_stencil && stencil_mask != 0 && stencil_mask != 0xff {
-                self.partial_clear("stencil-masked");
-            }
             let depth = use_depth.then_some(regs.clear_depth);
-            let stencil = (use_stencil && stencil_mask == 0xff).then_some(regs.clear_stencil as u8);
+            let stencil = (use_stencil && stencil_mask != 0).then_some(regs.clear_stencil as u8);
+            let full_stencil = stencil.is_some() && stencil_mask == 0xff;
             let aspects_covered = match info.format.aspect() {
-                Aspect::DepthStencil => depth.is_some() && stencil.is_some(),
+                Aspect::DepthStencil => depth.is_some() && full_stencil,
                 Aspect::Depth => depth.is_some(),
-                Aspect::Stencil => stencil.is_some(),
+                Aspect::Stencil => full_stencil,
                 Aspect::Color => false,
             };
             if depth.is_some() || stencil.is_some() {
                 let rect = sample_rect(rect, &info, regs.zeta_size.width, regs.zeta_size.height);
-                let discard = aspects_covered
-                    && covers(rect, &info)
-                    && base_layer == 0
-                    && layer_count >= info.layers;
+                let discard = aspects_covered && covers(rect, base_layer, layer_count, &info);
                 let mut tx = Transfer {
                     scheduler: &mut self.scheduler,
                     staging: &mut self.staging,
@@ -256,7 +265,11 @@ impl VulkanRasterizer {
                     self.texture_cache.clear(
                         &mut tx,
                         target,
-                        ClearValue::DepthStencil { depth, stencil },
+                        ClearValue::DepthStencil {
+                            depth,
+                            stencil,
+                            stencil_mask: stencil_mask as u8,
+                        },
                         rect,
                         base_layer,
                         layer_count,
@@ -696,6 +709,18 @@ impl Rasterizer for VulkanRasterizer {
             tracing::error!(%error, "presenting a guest frame failed");
         }
         self.release_fences(false);
+        let mut tx = Transfer {
+            scheduler: &mut self.scheduler,
+            staging: &mut self.staging,
+            memory: &self.handles.device,
+        };
+        let device = &self.device;
+        if let Err(error) = self
+            .texture_cache
+            .tick_frame(&mut tx, || device.memory_usage())
+        {
+            tracing::error!(%error, "collecting cached images failed");
+        }
     }
 }
 
@@ -870,6 +895,10 @@ mod tests {
     }
 
     fn clear(f: &mut Fixture, gmmu: &Gmmu, regs: &Regs) {
+        clear_layers(f, gmmu, regs, 1);
+    }
+
+    fn clear_layers(f: &mut Fixture, gmmu: &Gmmu, regs: &Regs, layer_count: u32) {
         let mut dirty = DirtyState::new();
         let const_buffers = [[ConstBufferBinding::default(); MAX_CONST_BUFFERS]; MAX_SHADER_STAGE];
         let root_tables = [[0; 64]; 8];
@@ -881,7 +910,15 @@ mod tests {
             const_buffers: &const_buffers,
             root_tables: &root_tables,
         };
-        f.rasterizer.clear(&mut ctx, 1);
+        f.rasterizer.clear(&mut ctx, layer_count);
+    }
+
+    /// Clears use the first scissor, set to `[x0, x1) x [y0, y1)`.
+    fn scissor(regs: &mut Regs, x0: u32, x1: u32, y0: u32, y1: u32) {
+        regs.clear_control = ClearControl(regs.clear_control.0 | 1 << 8);
+        regs.scissor_test[0].enable = 1;
+        regs.scissor_test[0].bits = ScissorTestBits(x0 | x1 << 16);
+        regs.scissor_test[0].bits1 = ScissorTestBits1(y0 | y1 << 16);
     }
 
     fn guest_linear(f: &Fixture, address: DAddr, tiling: &Tiling) -> Vec<u8> {
@@ -1069,7 +1106,7 @@ mod tests {
             let want: [u8; 4] = if inside {
                 [0, 0, 255, 255]
             } else {
-                [255, 128, 64, 0]
+                [0, 128, 255, 255]
             };
             assert_eq!(*texel, want, "texel ({x}, {y})");
         }
@@ -1195,6 +1232,169 @@ mod tests {
             f.memory.read::<u64>(DADDR + 0x80_0008).unwrap() > 0,
             "a GPU timestamp follows the value"
         );
+        f.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn masked_colour_clears_keep_the_unwritten_channels() {
+        // G and A written, through the colour mask (UNORM) and through the clear's own channel
+        // selection (UINT, integer outputs).
+        let cases = [
+            (
+                0xd5,
+                ColorMask(0x1010),
+                ClearSurface(0b1111 << 2),
+                [1.0, 0.5, 0.25, 0.0],
+                [0.0, 0.2, 1.0, 1.0],
+                [255, 128, 64, 0],
+                [255, 51, 64, 255],
+            ),
+            (
+                0xd9,
+                ColorMask(0x1111),
+                ClearSurface(1 << 3 | 1 << 5),
+                [10, 20, 30, 40].map(f32::from_bits),
+                [1, 2, 3, 4].map(f32::from_bits),
+                [10, 20, 30, 40],
+                [10, 2, 30, 4],
+            ),
+        ];
+        for (format, mask, surface, first, second, outside, inside) in cases {
+            let Some(mut f) = fixture(GobLayout::Switch2) else {
+                return;
+            };
+            let gmmu = gmmu(&f);
+            let (width, height) = (64, 32);
+            let mut regs = clear_regs(width, height, 2, first);
+            regs.rt[0].format = format;
+            clear(&mut f, &gmmu, &regs);
+            regs.clear_color = second;
+            regs.color_mask[0] = mask;
+            regs.clear_surface = surface;
+            scissor(&mut regs, 8, 40, 4, 20);
+            clear(&mut f, &gmmu, &regs);
+            let tiling = Tiling::new(width, height, 1, 4, 2, 0, GobLayout::Switch2);
+            f.rasterizer.flush_region(DADDR, tiling.size_bytes() as u64);
+            for (i, texel) in guest_linear(&f, DADDR, &tiling)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .enumerate()
+            {
+                let (x, y) = (i as u32 % width, i as u32 / width);
+                let want = if (8..40).contains(&x) && (4..20).contains(&y) {
+                    inside
+                } else {
+                    outside
+                };
+                assert_eq!(*texel, want, "format {format:#x}, texel ({x}, {y})");
+            }
+            f.assert_no_validation_errors();
+        }
+    }
+
+    #[test]
+    fn stencil_masked_clears_keep_the_masked_bits() {
+        let Some(mut f) = fixture(GobLayout::Tegra) else {
+            return;
+        };
+        let gmmu = gmmu(&f);
+        let (width, height) = (32, 16);
+        let mut regs = clear_regs(width, height, 1, [0.0; 4]);
+        regs.rt_control = RtControl(0);
+        regs.zeta_enable = 1;
+        regs.zeta.address_high = (GPU_VA >> 32) as u32;
+        regs.zeta.address_low = GPU_VA as u32;
+        regs.zeta.format = 0x14;
+        regs.zeta.tile_mode = TileMode(1 << 4);
+        regs.zeta_size.width = width;
+        regs.zeta_size.height = height;
+        regs.zeta_size.bits = ZetaSizeBits(1 | 1 << 16);
+        regs.clear_surface = ClearSurface(0b11);
+        regs.clear_depth = 0.5;
+        regs.clear_stencil = 0xa5;
+        clear(&mut f, &gmmu, &regs);
+        let tiling = Tiling::new(width, height, 1, 4, 1, 0, GobLayout::Tegra);
+        let read = |f: &mut Fixture| -> Vec<u32> {
+            f.rasterizer.flush_region(DADDR, tiling.size_bytes() as u64);
+            guest_linear(f, DADDR, &tiling)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&t| u32::from_le_bytes(t))
+                .collect()
+        };
+        let before = read(&mut f);
+        assert!(before.iter().all(|&t| t & 0xff == 0xa5));
+
+        regs.clear_surface = ClearSurface(0b10);
+        regs.clear_control = ClearControl(1);
+        regs.stencil_front_mask = 0x0f;
+        regs.clear_stencil = 0x5a;
+        clear(&mut f, &gmmu, &regs);
+        let after = read(&mut f);
+        for (i, (&old, &new)) in before.iter().zip(&after).enumerate() {
+            assert_eq!(new & 0xff, 0xaa, "texel {i}: low stencil bits from 0x5a");
+            assert_eq!(new >> 8, old >> 8, "texel {i}: depth kept");
+        }
+
+        regs.clear_surface = ClearSurface(0b11);
+        regs.stencil_front_mask = 0xf0;
+        regs.clear_stencil = 0x0f;
+        regs.clear_depth = 1.0;
+        scissor(&mut regs, 4, 20, 2, 10);
+        clear(&mut f, &gmmu, &regs);
+        for (i, (&old, &new)) in before.iter().zip(&read(&mut f)).enumerate() {
+            let (x, y) = (i as u32 % width, i as u32 / width);
+            let want = if (4..20).contains(&x) && (2..10).contains(&y) {
+                0xff_ffff << 8 | 0x0a
+            } else {
+                old & !0xff | 0xaa
+            };
+            assert_eq!(new, want, "texel ({x}, {y})");
+        }
+        f.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn partial_3d_clears_write_only_their_slices() {
+        let Some(mut f) = fixture(GobLayout::Switch2) else {
+            return;
+        };
+        let gmmu = gmmu(&f);
+        let (width, height, depth) = (32, 16, 4);
+        let tiling = Tiling::new(width, height, depth, 4, 1, 0, GobLayout::Switch2);
+        let linear = pattern(width, height * depth);
+        let mut tiled = vec![0; tiling.size_bytes()];
+        swizzle(&tiling, &linear, &mut tiled);
+        f.memory.write_bytes(DADDR, &tiled).unwrap();
+        let mut regs = clear_regs(width, height, 1, [0.0, 1.0, 0.0, 1.0]);
+        regs.rt[0].tile_mode = TileMode(1 << 4 | 1 << 16);
+        regs.rt[0].bits = RenderTargetConfigBits(depth);
+        regs.clear_surface = ClearSurface(0b1111 << 2 | 1 << 10);
+        clear_layers(&mut f, &gmmu, &regs, 2);
+        regs.clear_surface = ClearSurface(0b0001 << 2 | 3 << 10);
+        regs.clear_color = [1.0, 0.0, 0.0, 0.0];
+        scissor(&mut regs, 4, 12, 2, 6);
+        clear_layers(&mut f, &gmmu, &regs, 1);
+        f.rasterizer.flush_region(DADDR, tiling.size_bytes() as u64);
+        let got = guest_linear(&f, DADDR, &tiling);
+        for (i, (texel, old)) in got
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(linear.as_chunks::<4>().0)
+            .enumerate()
+        {
+            let i = i as u32;
+            let (x, y, z) = (i % width, i / width % height, i / (width * height));
+            let want = match z {
+                1 | 2 => [0, 255, 0, 255],
+                3 if (4..12).contains(&x) && (2..6).contains(&y) => [255, old[1], old[2], old[3]],
+                _ => *old,
+            };
+            assert_eq!(*texel, want, "texel ({x}, {y}, {z})");
+        }
         f.assert_no_validation_errors();
     }
 }

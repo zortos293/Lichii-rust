@@ -14,8 +14,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use lichii_common::settings::Settings;
 use lichii_common::{ConsoleGeneration, ResultCode, VAddr};
+use lichii_gpu::backend::{GpuHandles, NullRasterizer, Rasterizer};
 use lichii_gpu::host1x::Host1x;
-use lichii_gpu::nx2_memory::Nx2GpuMemory;
+use lichii_gpu::{Console, Gpu, GpuConfig};
 use lichii_input::hub::NpadHub;
 use lichii_kernel::process::Process;
 use lichii_kernel::{Kernel, KernelConfig, KernelError, KernelEvents};
@@ -58,11 +59,13 @@ enum State {
     Stopped,
 }
 
-/// The GPU-side pieces the services share. The GPU orchestrator will own these and its
-/// front/back threads; [`System::start_gpu`] is where it gets built.
-struct GpuParts {
-    host1x: Host1x,
-    nx2_memory: Option<Arc<Nx2GpuMemory>>,
+/// Builds the renderer once the GPU knows the handles fences and queries need. The frontend
+/// passes its Vulkan renderer here; headless runs pass [`headless_renderer`].
+pub type RendererFactory = Box<dyn FnOnce(GpuHandles) -> Box<dyn Rasterizer> + Send>;
+
+/// A [`RendererFactory`] that draws nothing: [`NullRasterizer`] runs fences and releases at once.
+pub fn headless_renderer() -> RendererFactory {
+    Box::new(|handles| Box::new(NullRasterizer::new(handles)))
 }
 
 /// One emulation session: a booted title and every subsystem it runs on.
@@ -73,7 +76,7 @@ pub struct System {
     program: Arc<ProgramImage>,
     process: Arc<Process>,
     services: Arc<ServiceContext>,
-    gpu: GpuParts,
+    gpu: Arc<Gpu>,
     npad: Arc<NpadHub>,
     perf: Arc<PerfStats>,
     exit: Arc<ExitSignal>,
@@ -82,14 +85,22 @@ pub struct System {
 
 impl System {
     /// Loads the title at `path` and boots it up to the point where [`System::run`] starts it.
-    pub fn boot(settings: Arc<Settings>, path: &Path) -> Result<Self, SystemError> {
+    pub fn boot(
+        settings: Arc<Settings>,
+        path: &Path,
+        renderer: RendererFactory,
+    ) -> Result<Self, SystemError> {
         tracing::info!(path = %path.display(), "loading title");
         let image = lichii_loader::load(path, &LoadOptions::default())?;
-        Self::from_image(settings, image)
+        Self::from_image(settings, image, renderer)
     }
 
     /// Boots an already loaded title.
-    pub fn from_image(settings: Arc<Settings>, image: ProgramImage) -> Result<Self, SystemError> {
+    pub fn from_image(
+        settings: Arc<Settings>,
+        image: ProgramImage,
+        renderer: RendererFactory,
+    ) -> Result<Self, SystemError> {
         let program = Arc::new(image);
         let console = match program.generation {
             ConsoleGeneration::Switch2 => ConsoleGeneration::Switch2,
@@ -106,7 +117,7 @@ impl System {
             "booting"
         );
 
-        let timing = Arc::new(CoreTiming::new());
+        let timing = Arc::new(CoreTiming::new(program.generation));
         let exit = Arc::new(ExitSignal::default());
         let backend = settings.cpu.backend;
         let kernel = Kernel::new(KernelConfig {
@@ -132,7 +143,7 @@ impl System {
             "process created"
         );
 
-        let gpu = Self::start_gpu(&kernel, &program);
+        let gpu = Self::start_gpu(&kernel, &program, &timing, renderer);
         let npad = Arc::new(NpadHub::default());
         let perf = Arc::new(PerfStats::default());
         let services = ServiceContext::new(ServiceParts {
@@ -140,8 +151,7 @@ impl System {
             settings: settings.clone(),
             program: program.clone(),
             process: process.clone(),
-            host1x: gpu.host1x.clone(),
-            nx2_memory: gpu.nx2_memory.clone(),
+            gpu: gpu.clone(),
             npad: npad.clone(),
             perf: perf.clone(),
         });
@@ -166,22 +176,24 @@ impl System {
         })
     }
 
-    /// Builds the GPU for the title: the host1x device space (34-bit SMMU on Switch 1, 36-bit on
-    /// Switch 2) and, for Switch 2 titles, the GPU memory registry the gsv sessions share.
-    fn start_gpu(kernel: &Kernel, program: &ProgramImage) -> GpuParts {
-        let address_space_bits = match kernel.console() {
-            ConsoleGeneration::Switch1 => 34,
-            ConsoleGeneration::Switch2 => 36,
+    /// Builds the GPU for the title, with its front and back threads: the host1x device space
+    /// (34-bit SMMU for Switch 1 titles, 36-bit for Switch 2 titles), the console's channel classes
+    /// and, for Switch 2 titles, the GPU memory registry the gsv sessions share. The GPU follows the
+    /// title, not the emulated console: a Switch 1 title on a Switch 2 console still gets Maxwell.
+    fn start_gpu(
+        kernel: &Kernel,
+        program: &ProgramImage,
+        timing: &Arc<CoreTiming>,
+        renderer: RendererFactory,
+    ) -> Arc<Gpu> {
+        let (console, address_space_bits) = match program.generation {
+            ConsoleGeneration::Switch1 => (Console::Switch1, 34),
+            ConsoleGeneration::Switch2 => (Console::Switch2, 36),
         };
         let host1x = Host1x::new(kernel.physical_memory().clone(), address_space_bits);
-        let nx2_memory = (program.generation == ConsoleGeneration::Switch2).then(|| {
-            Arc::new(Nx2GpuMemory::new(
-                host1x.memory.clone(),
-                host1x.allocator.clone(),
-            ))
-        });
-        tracing::info!(address_space_bits, nx2 = nx2_memory.is_some(), "gpu up");
-        GpuParts { host1x, nx2_memory }
+        let gpu = Gpu::new(host1x, timing.clone(), GpuConfig::new(console), renderer);
+        tracing::info!(?console, address_space_bits, "gpu up");
+        Arc::new(gpu)
     }
 
     /// Starts the main thread, the CPU cores and the service threads, or resumes a paused session.
@@ -216,6 +228,7 @@ impl System {
             return;
         }
         self.kernel.pause();
+        self.gpu.pause(true);
         self.timing.pause();
         self.state = State::Paused;
         tracing::info!("paused");
@@ -227,6 +240,7 @@ impl System {
             return;
         }
         self.timing.resume();
+        self.gpu.pause(false);
         self.kernel.resume();
         self.state = State::Running;
         tracing::info!("resumed");
@@ -237,6 +251,7 @@ impl System {
         if self.state == State::Stopped {
             return;
         }
+        self.gpu.pause(true);
         self.kernel.shutdown();
         self.state = State::Stopped;
         tracing::info!("stopped");
@@ -292,14 +307,9 @@ impl System {
         &self.services
     }
 
-    /// The host1x device space, allocator and syncpoints.
-    pub fn host1x(&self) -> &Host1x {
-        &self.gpu.host1x
-    }
-
-    /// The Switch 2 GPU memory registry; `None` for Switch 1 titles.
-    pub fn nx2_memory(&self) -> Option<&Arc<Nx2GpuMemory>> {
-        self.gpu.nx2_memory.as_ref()
+    /// The GPU, with host1x and (for Switch 2 titles) the GPU memory registry.
+    pub fn gpu(&self) -> &Arc<Gpu> {
+        &self.gpu
     }
 
     /// The input state the frontend publishes and hid reads.

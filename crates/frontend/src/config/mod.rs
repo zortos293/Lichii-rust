@@ -227,6 +227,10 @@ impl ConfigWindow {
                     row(ui, "RNG seed", |ui| {
                         optional_number(ui, &mut d.system.rng_seed, 0)
                     });
+                    row(ui, "Time zone", |ui| time_zone(ui, &mut d.system.time_zone));
+                    row(ui, "Network", |ui| {
+                        ui.checkbox(&mut d.system.network_enabled, "Allow titles to go online")
+                    });
                 });
                 note(
                     ui,
@@ -553,6 +557,21 @@ fn optional_number<T: egui::emath::Numeric>(ui: &mut Ui, value: &mut Option<T>, 
     }
     if let Some(v) = value {
         ui.add(egui::DragValue::new(v));
+    }
+}
+
+/// "Host" or a free IANA name; the services fall back to the host zone for names they don't know.
+fn time_zone(ui: &mut Ui, zone: &mut String) {
+    let mut host = zone == TIME_ZONE_AUTO;
+    if ui.checkbox(&mut host, "Host").changed() {
+        *zone = if host {
+            TIME_ZONE_AUTO.into()
+        } else {
+            "UTC".into()
+        };
+    }
+    if !host {
+        ui.add(egui::TextEdit::singleline(zone).hint_text("Europe/Amsterdam"));
     }
 }
 

@@ -5,6 +5,8 @@
 //! one [`Terminal`]. Values only refer to earlier ops. Passes replace the ops they remove with
 //! [`Op::Nop`] instead of renumbering.
 
+use crate::decoder::AtomicOp;
+
 /// The result of the op at this index in [`Block::ops`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Value(pub u32);
@@ -179,6 +181,30 @@ pub enum Op {
         value: Value,
         pc: u64,
     },
+    /// LSE `LD<op>`/`SWP` of `1 << size` bytes: the zero-extended old value. Faults with
+    /// `CpuFault::Alignment` unless `addr` is aligned to the size.
+    AtomicRmw {
+        op: AtomicOp,
+        size: u8,
+        addr: Value,
+        value: Value,
+        pc: u64,
+    },
+    /// `CAS`: the zero-extended old value, aligned like `AtomicRmw`.
+    Cas {
+        size: u8,
+        addr: Value,
+        expected: Value,
+        new: Value,
+        pc: u64,
+    },
+    /// `DC ZVA`: zeroes the 64 bytes at `addr`, which is 64-byte aligned.
+    ZeroBlock {
+        addr: Value,
+        pc: u64,
+    },
+    /// `CNTPCT_EL0`.
+    Ticks,
     /// `DMB`/`DSB`.
     Fence,
 }
@@ -186,7 +212,12 @@ pub enum Op {
 impl Op {
     pub fn ty(&self) -> Ty {
         match *self {
-            Op::Nop | Op::Set(..) | Op::Store { .. } | Op::StoreVec { .. } | Op::Fence => Ty::Void,
+            Op::Nop
+            | Op::Set(..)
+            | Op::Store { .. }
+            | Op::StoreVec { .. }
+            | Op::ZeroBlock { .. }
+            | Op::Fence => Ty::Void,
             Op::Get(loc) => loc.ty(),
             Op::LoadVec { .. } => Ty::U128,
             Op::AddFlags(..)
@@ -203,7 +234,13 @@ impl Op {
     pub fn may_exit(&self) -> bool {
         matches!(
             self,
-            Op::Load { .. } | Op::LoadVec { .. } | Op::Store { .. } | Op::StoreVec { .. }
+            Op::Load { .. }
+                | Op::LoadVec { .. }
+                | Op::Store { .. }
+                | Op::StoreVec { .. }
+                | Op::AtomicRmw { .. }
+                | Op::Cas { .. }
+                | Op::ZeroBlock { .. }
         )
     }
 
@@ -215,7 +252,7 @@ impl Op {
     /// Calls `f` on every operand.
     pub fn for_each_arg(&mut self, mut f: impl FnMut(&mut Value)) {
         match self {
-            Op::Nop | Op::Const(_) | Op::Get(_) | Op::Fence => {}
+            Op::Nop | Op::Const(_) | Op::Get(_) | Op::Ticks | Op::Fence => {}
             Op::Set(_, a)
             | Op::LogicFlags(_, a)
             | Op::Not(_, a)
@@ -230,7 +267,8 @@ impl Op {
             | Op::IsZero(_, a)
             | Op::TestBit(a, _)
             | Op::Load { addr: a, .. }
-            | Op::LoadVec { addr: a, .. } => f(a),
+            | Op::LoadVec { addr: a, .. }
+            | Op::ZeroBlock { addr: a, .. } => f(a),
             Op::Add(_, a, b)
             | Op::Sub(_, a, b)
             | Op::AddFlags(_, a, b)
@@ -252,6 +290,9 @@ impl Op {
             }
             | Op::StoreVec {
                 addr: a, value: b, ..
+            }
+            | Op::AtomicRmw {
+                addr: a, value: b, ..
             } => {
                 f(a);
                 f(b);
@@ -260,7 +301,13 @@ impl Op {
             | Op::Sbc(_, a, b, c)
             | Op::AdcFlags(_, a, b, c)
             | Op::SbcFlags(_, a, b, c)
-            | Op::Select(_, a, b, c) => {
+            | Op::Select(_, a, b, c)
+            | Op::Cas {
+                addr: a,
+                expected: b,
+                new: c,
+                ..
+            } => {
                 f(a);
                 f(b);
                 f(c);

@@ -112,8 +112,10 @@ pub(crate) fn load(
     let (npdm, mut modules) = load_exefs(exefs.as_ref(), options.hashes)?;
     mods.patch_modules(&mut modules)?;
     let romfs = mods.layer_romfs(selected.romfs()?)?;
-    let nacp = selected.control(options.language).nacp;
-    let mut image = ProgramImage::new(npdm, modules, romfs, nacp);
+    let control = selected.control(options.language);
+    let mut image = ProgramImage::new(npdm, modules, romfs, control.nacp);
+    image.icon = control.icon;
+    image.version = selected.version;
     image.add_ons = add_ons(&contents.index, selected.application_id);
     Ok(image)
 }
@@ -129,6 +131,7 @@ struct Contents {
 struct Selected<'a> {
     application_id: u64,
     program_id: u64,
+    version: u32,
     program: &'a Nca,
     control: Option<&'a Nca>,
     update_program: Option<&'a Nca>,
@@ -189,15 +192,16 @@ impl Contents {
                 (application.title_id(), program_index, program)
             }
         };
-        let control = self
+        let application = self
             .index
             .titles_of(ContentMetaType::Application)
-            .find(|t| t.title_id() == application_id)
-            .and_then(|t| t.content(ContentType::Control, 0));
+            .find(|t| t.title_id() == application_id);
+        let control = application.and_then(|t| t.content(ContentType::Control, 0));
         let update = self.index.patch_for(application_id);
         Ok(Selected {
             application_id,
             program_id: application_id + u64::from(program_index),
+            version: update.or(application).map_or(0, Title::version),
             program,
             control,
             update_program: update.and_then(|t| t.content(ContentType::Program, program_index)),
@@ -753,6 +757,8 @@ mod tests {
         let romfs = image.romfs.as_ref().unwrap();
         assert_eq!(read(romfs, "z_level.bin"), vec![1; 0x800]);
         assert!(image.add_ons.is_empty());
+        assert_eq!(image.icon.as_deref(), Some(&b"english icon"[..]));
+        assert_eq!(image.version, 0);
     }
 
     #[test]
@@ -812,6 +818,8 @@ mod tests {
 
     fn check_updated(image: &ProgramImage) {
         assert_eq!(image.module("main").unwrap().image, main_image(2));
+        assert_eq!(image.version, 0x10000);
+        assert_eq!(image.icon.as_deref(), Some(&b"update icon"[..]));
         assert_ne!(main_image(1), main_image(2));
         let romfs = image.romfs.as_ref().unwrap();
         assert_eq!(read(romfs, "z_level.bin"), vec![2; 0x800]);

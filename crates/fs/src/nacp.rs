@@ -117,6 +117,11 @@ impl Nacp {
         self.raw[0x3025]
     }
 
+    /// Whether the title forbids switching the user account while it runs (non-zero locks it).
+    pub fn user_account_switch_lock(&self) -> u8 {
+        self.raw[0x3026]
+    }
+
     pub fn supported_languages(&self) -> u32 {
         u32_at(&self.raw[..], 0x302c)
     }
