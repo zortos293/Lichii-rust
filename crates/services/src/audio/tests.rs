@@ -527,3 +527,17 @@ fn audio_services_play_on_the_context_sink() {
     assert!(Arc::ptr_eq(&audio.sink, &context.audio));
     context.kernel.shutdown();
 }
+
+#[test]
+fn audrec_connects_and_leaves_its_commands_unimplemented() {
+    let h = harness();
+    for name in ["audrec:a", "audrec:d"] {
+        h.connect(name);
+    }
+    let audrec = h.connect("audrec:u");
+    assert_eq!(
+        h.send(audrec, Request::new(0)).result,
+        lichii_kernel::ipc::UNKNOWN_COMMAND_ID,
+        "OpenFinalOutputRecorder has no handler in the reference either"
+    );
+}
