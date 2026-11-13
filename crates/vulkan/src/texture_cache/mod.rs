@@ -671,6 +671,15 @@ impl TextureCache {
         let Some(found) = self.find(tx, gmmu, desc.address, &info)? else {
             return Ok(None);
         };
+        let scale = self.image(found.id).scale;
+        if scale != ResolutionScale::X1 && scale != self.scale {
+            let target = if self.can_rescale(found.id) {
+                self.scale
+            } else {
+                ResolutionScale::X1
+            };
+            self.rescale(tx, found.id, target, true)?;
+        }
         let mut view = ViewInfo::from_texture(desc, &info);
         view.base_level += found.level;
         view.base_layer += found.layer;
