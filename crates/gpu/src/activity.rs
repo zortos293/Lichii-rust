@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
+use crate::host1x::{SYNCPOINT_COUNT, Syncpoints, is_reached};
+
 const REPORT_PERIOD: Duration = Duration::from_secs(5);
 /// How often the reporter looks for a back that stopped making progress.
 const STALL_CHECK: Duration = Duration::from_secs(1);
@@ -172,16 +174,25 @@ impl Activity {
     /// Logs a report every [`REPORT_PERIOD`], and a back that stopped making progress, until
     /// [`Activity::stop`]. `threaded`: whether the back has a thread of its own; otherwise its
     /// time is the front's.
-    pub(crate) fn report_until_stopped(&self, threaded: bool, back: &dyn BackView) {
+    pub(crate) fn report_until_stopped(
+        &self,
+        threaded: bool,
+        back: &dyn BackView,
+        syncpoints: &Syncpoints,
+    ) {
         let mut since = Instant::now();
         let mut watch = StallWatch::default();
+        let mut syncpoint_watch = SyncpointWatch::default();
         let mut stopped = self.stopped.lock();
         while !*stopped {
             self.stop.wait_for(&mut stopped, STALL_CHECK);
             if *stopped {
                 return;
             }
-            watch.check(self, back.snapshot());
+            let snapshot = back.snapshot();
+            watch.check(self, snapshot);
+            let idle = snapshot.published == snapshot.consumed && self.current_call().is_none();
+            syncpoint_watch.check(syncpoints, idle);
             if since.elapsed() >= REPORT_PERIOD {
                 let elapsed = since.elapsed();
                 since = Instant::now();
@@ -299,6 +310,83 @@ impl StallWatch {
     }
 }
 
+/// Finds syncpoints a guest fence can wait on forever while the back has nothing to do: one
+/// with a registered action (an nvhost-ctrl event wait) it does not reach, or one below the
+/// maximum its reserved increments reach (host value behind: an increment never executed; guest
+/// value behind: host GPU work that never completed).
+#[derive(Default)]
+struct SyncpointWatch {
+    stuck: Vec<StuckSyncpoint>,
+    since: Option<Instant>,
+    reported: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StuckSyncpoint {
+    id: u32,
+    guest: u32,
+    host: u32,
+    max: u32,
+    waited_for: Option<u32>,
+}
+
+impl SyncpointWatch {
+    fn check(&mut self, syncpoints: &Syncpoints, back_idle: bool) {
+        let stuck: Vec<_> = if back_idle {
+            (0..SYNCPOINT_COUNT as u32)
+                .filter_map(|id| {
+                    let guest = syncpoints.guest().value(id).ok()?;
+                    let max = syncpoints.max(id).ok()?;
+                    let waited_for = syncpoints.guest().next_action_threshold(id).ok()?;
+                    let waits = waited_for.is_some_and(|threshold| !is_reached(guest, threshold));
+                    (waits || !is_reached(guest, max)).then(|| StuckSyncpoint {
+                        id,
+                        guest,
+                        host: syncpoints.host().value(id).unwrap_or(0),
+                        max,
+                        waited_for,
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if stuck.is_empty() || stuck != self.stuck {
+            self.stuck = stuck;
+            self.since = Some(Instant::now());
+            self.reported = None;
+            return;
+        }
+        let for_ = self.since.map_or(Duration::ZERO, |at| at.elapsed());
+        if for_ < STALL || self.reported.is_some_and(|at| at.elapsed() < STALL_REPEAT) {
+            return;
+        }
+        self.reported = Some(Instant::now());
+        let list = self
+            .stuck
+            .iter()
+            .take(8)
+            .map(|s| {
+                let waited = s
+                    .waited_for
+                    .map(|t| format!(", waited for {t:#x}"))
+                    .unwrap_or_default();
+                format!(
+                    "{}: guest {:#x}, host {:#x}, max {:#x}{waited}",
+                    s.id, s.guest, s.host, s.max
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        tracing::warn!(
+            ?for_,
+            count = self.stuck.len(),
+            syncpoints = list,
+            "syncpoints a guest fence may wait on stay unreached while the GPU back has nothing to do"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,7 +453,7 @@ mod tests {
         }
         let reporter = std::thread::spawn({
             let activity = activity.clone();
-            move || activity.report_until_stopped(true, &Idle)
+            move || activity.report_until_stopped(true, &Idle, &Syncpoints::new())
         });
         activity.stop();
         reporter.join().unwrap();
@@ -410,5 +498,54 @@ mod tests {
         assert_eq!(activity.current_call(), Some(RendererCall::Present));
         activity.renderer_call(RendererCall::Present, start);
         assert_eq!(activity.current_call(), None);
+    }
+
+    #[test]
+    fn a_syncpoint_left_below_its_maximum_with_an_idle_back_is_found() {
+        let syncpoints = Syncpoints::new();
+        let mut watch = SyncpointWatch::default();
+        watch.check(&syncpoints, true);
+        assert!(watch.stuck.is_empty());
+        syncpoints.increase_max(7, 2).unwrap();
+        syncpoints.host().increment(7).unwrap();
+        watch.check(&syncpoints, true);
+        let stuck = StuckSyncpoint {
+            id: 7,
+            guest: 0,
+            host: 1,
+            max: 2,
+            waited_for: None,
+        };
+        assert_eq!(watch.stuck, [stuck]);
+        watch.since = Some(Instant::now() - STALL);
+        watch.check(&syncpoints, true);
+        assert!(watch.reported.is_some());
+        watch.check(&syncpoints, false);
+        assert!(watch.stuck.is_empty(), "a busy back is still working on it");
+        syncpoints.guest().increment(7).unwrap();
+        syncpoints.guest().increment(7).unwrap();
+        watch.check(&syncpoints, true);
+        assert!(watch.stuck.is_empty());
+    }
+
+    #[test]
+    fn an_unreached_event_wait_is_found_and_a_reached_one_is_not() {
+        let syncpoints = Syncpoints::new();
+        let mut watch = SyncpointWatch::default();
+        let _wait = syncpoints.guest().register_action(3, 5, || {}).unwrap();
+        syncpoints.guest().register_action(3, 9, || {}).unwrap();
+        watch.check(&syncpoints, true);
+        assert_eq!(watch.stuck.len(), 1);
+        assert_eq!(watch.stuck[0].waited_for, Some(5));
+        for _ in 0..5 {
+            syncpoints.guest().increment(3).unwrap();
+        }
+        watch.check(&syncpoints, true);
+        assert_eq!(watch.stuck[0].waited_for, Some(9));
+        for _ in 0..4 {
+            syncpoints.guest().increment(3).unwrap();
+        }
+        watch.check(&syncpoints, true);
+        assert!(watch.stuck.is_empty());
     }
 }
