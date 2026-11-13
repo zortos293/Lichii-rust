@@ -4,6 +4,7 @@
 //! other one becomes `Op::CallSimd`, which runs the interpreter's `simd::execute` on the live
 //! context through [`call`].
 
+mod fp_vector;
 mod ir;
 mod translate;
 mod vector;

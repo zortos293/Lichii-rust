@@ -1,6 +1,7 @@
 //! The SIMD/FP operations carried by `Op::Simd`.
 
 use super::super::ir::{Ty, Value};
+use super::fp_vector::Lanes;
 use super::vector::VecOp;
 
 /// Scalar floating-point element size.
@@ -104,6 +105,8 @@ pub enum SimdOp {
     },
     /// Advanced SIMD integer and element-move ops.
     Vec(VecOp),
+    /// Advanced SIMD FP arithmetic on S or D lanes, checked like the scalar ops.
+    Lanes(Lanes),
 }
 
 impl SimdOp {
@@ -130,6 +133,7 @@ impl SimdOp {
             | SimdOp::FromInt { word, .. }
             | SimdOp::ToInt { word, .. }
             | SimdOp::Compare { word, .. } => Some(word),
+            SimdOp::Lanes(lanes) => Some(lanes.word),
             _ => None,
         }
     }
@@ -170,6 +174,7 @@ impl SimdOp {
                 f(a);
             }
             SimdOp::Vec(op) => op.for_each_arg(f),
+            SimdOp::Lanes(lanes) => lanes.for_each_arg(f),
         }
     }
 }
