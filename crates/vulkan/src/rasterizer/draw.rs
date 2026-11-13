@@ -21,15 +21,17 @@ use lichii_gpu::engines::maxwell_3d::regs::{
 };
 use lichii_shader::backend::Bindings;
 use lichii_shader::backend::spirv::{
-    NUM_TEXTURE_SCALING_WORDS, RENDER_AREA_LAYOUT_OFFSET, RESCALING_LAYOUT_DOWN_FACTOR_OFFSET,
+    NUM_IMAGE_SCALING_WORDS, NUM_TEXTURE_SCALING_WORDS, RENDER_AREA_LAYOUT_OFFSET,
+    RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, RESCALING_LAYOUT_IMAGES_OFFSET,
     RESCALING_LAYOUT_TEXTURES_OFFSET,
 };
-use lichii_shader::info::StorageBufferDescriptor;
-use lichii_shader::ir::TextureType;
+use lichii_shader::info::{HandleSource, ImageDescriptor, StorageBufferDescriptor};
+use lichii_shader::ir::{ImageFormat, TextureType};
 use lichii_shader::runtime::{AttributeType, CompareFunction, InputTopology};
 use lichii_shader::{DescriptorKind, RuntimeInfo, ShaderArch, ShaderInfo, ShaderModule};
-use lichii_texture::Numeric;
 use lichii_texture::block_linear::GobLayout;
+use lichii_texture::tic::TextureMemory;
+use lichii_texture::{Numeric, PixelFormat};
 
 use super::VulkanRasterizer;
 use crate::buffer_cache::{IndexBinding, assembled_topology, vertex_stream_range};
@@ -37,7 +39,7 @@ use crate::commands::{COLOR_RANGE, ImageAccess, transition};
 use crate::descriptors::DescriptorAllocator;
 use crate::device::Device;
 use crate::error::Result;
-use crate::memory::{Buffer, Image, ImageDesc, ImageView};
+use crate::memory::{Buffer, BufferView, Image, ImageDesc, ImageView};
 use crate::pipeline::environment::{ProgramEnv, TexturePool};
 use crate::pipeline::fixed_state::flags;
 use crate::pipeline::maxwell_to_vk as mvk;
@@ -57,10 +59,18 @@ const SHADER_SAMPLED: ImageAccess = ImageAccess {
     access: vk::AccessFlags2::SHADER_SAMPLED_READ,
 };
 
+const SHADER_STORAGE: ImageAccess = ImageAccess {
+    layout: vk::ImageLayout::GENERAL,
+    stage: vk::PipelineStageFlags2::ALL_COMMANDS,
+    access: vk::AccessFlags2::from_raw(
+        vk::AccessFlags2::SHADER_STORAGE_READ.as_raw()
+            | vk::AccessFlags2::SHADER_STORAGE_WRITE.as_raw(),
+    ),
+};
+
 /// Warnings each logged once per renderer.
 #[derive(Clone, Copy)]
 enum Warning {
-    UnsupportedBinding = 1,
     NullTexture = 1 << 1,
     IndirectAssembly = 1 << 2,
     IndirectScattered = 1 << 3,
@@ -68,6 +78,9 @@ enum Warning {
     DrawTextureTarget = 1 << 7,
     DrawTextureSource = 1 << 8,
     MixedScaleArray = 1 << 9,
+    TexelBufferFormat = 1 << 10,
+    NullStorageImage = 1 << 11,
+    StorageAndSampled = 1 << 12,
 }
 
 /// A descriptor write of the current draw: `count` infos from `first` of the info list for
@@ -80,20 +93,30 @@ struct Write {
     count: u32,
 }
 
-/// The texture rescaling words of the push constant block, as Lichii's
-/// `RescalingPushConstant`: bit `n` is set when the texture descriptor with scaling index `n`
-/// samples a rescaled image, so the shader scales its texel fetches and size queries to it.
-/// Scaling indices number the texture descriptors of the draw's stages in stage order, one per
-/// descriptor however many elements it has, as `Bindings::texture_scaling_index` counts them
-/// when the stages translate.
-#[derive(Clone, Copy, Default)]
-struct TextureScaling {
-    words: [u32; NUM_TEXTURE_SCALING_WORDS as usize],
+/// Rescaling words of the push constant block, as Lichii's `RescalingPushConstant`, for
+/// texture descriptors (`N` = `NUM_TEXTURE_SCALING_WORDS`) or storage image descriptors
+/// (`NUM_IMAGE_SCALING_WORDS`): bit `n` is set when the descriptor with scaling index `n` reads
+/// a rescaled image, so the shader scales its texel coordinates and size queries to it.
+/// Scaling indices number the descriptors of the draw's stages in stage order, one per
+/// descriptor however many elements it has, as `Bindings::texture_scaling_index` and
+/// `image_scaling_index` count them when the stages translate.
+#[derive(Clone, Copy)]
+struct ScalingBits<const N: usize> {
+    words: [u32; N],
     stage_base: u32,
 }
 
-impl TextureScaling {
-    /// Marks texture descriptor `descriptor` of the current stage as sampling a rescaled image.
+impl<const N: usize> Default for ScalingBits<N> {
+    fn default() -> Self {
+        Self {
+            words: [0; N],
+            stage_base: 0,
+        }
+    }
+}
+
+impl<const N: usize> ScalingBits<N> {
+    /// Marks descriptor `descriptor` of the current stage as reading a rescaled image.
     fn set(&mut self, descriptor: u32) {
         let index = self.stage_base + descriptor;
         if let Some(word) = self.words.get_mut((index / 32) as usize) {
@@ -101,7 +124,7 @@ impl TextureScaling {
         }
     }
 
-    /// Moves past the current stage's `count` texture descriptors.
+    /// Moves past the current stage's `count` descriptors.
     fn next_stage(&mut self, count: usize) {
         self.stage_base += count as u32;
     }
@@ -138,7 +161,18 @@ pub(super) struct DrawState {
     colors: [Option<Target>; 8],
     depth: Option<Target>,
     textures: Vec<ImageId>,
-    texture_scaling: TextureScaling,
+    texture_scaling: ScalingBits<{ NUM_TEXTURE_SCALING_WORDS as usize }>,
+    /// Storage images of the current draw and whether it writes them.
+    storage_images: Vec<(ImageId, bool)>,
+    /// A storage image was scaled down while binding, so views collected before it are stale.
+    rebind: bool,
+    image_scaling: ScalingBits<{ NUM_IMAGE_SCALING_WORDS as usize }>,
+    texel_views: Vec<vk::BufferView>,
+    /// Texel buffer formats by `PixelFormat`: the host format and whether uniform and storage
+    /// texel buffers support it, `None` when no host format views it as is.
+    texel_formats: Vec<Option<Option<TexelFormat>>>,
+    /// Views of the null buffer for unbound texel buffers, by host format.
+    null_texel_views: Vec<(vk::Format, BufferView)>,
     buffer_infos: Vec<vk::DescriptorBufferInfo>,
     image_infos: Vec<vk::DescriptorImageInfo>,
     writes: Vec<Write>,
@@ -168,6 +202,8 @@ impl DrawState {
             vk::BufferUsageFlags::UNIFORM_BUFFER
                 | vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::VERTEX_BUFFER
+                | vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER
+                | vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_DST,
             gpu_allocator::MemoryLocation::GpuOnly,
             "null buffer",
@@ -243,7 +279,13 @@ impl DrawState {
             colors: [None; 8],
             depth: None,
             textures: Vec::new(),
-            texture_scaling: TextureScaling::default(),
+            texture_scaling: ScalingBits::default(),
+            storage_images: Vec::new(),
+            rebind: false,
+            image_scaling: ScalingBits::default(),
+            texel_views: Vec::new(),
+            texel_formats: vec![None; PixelFormat::ALL.len()],
+            null_texel_views: Vec::new(),
             buffer_infos: Vec::new(),
             image_infos: Vec::new(),
             writes: Vec::new(),
@@ -533,11 +575,15 @@ impl VulkanRasterizer {
         let gmmu = ctx.memory;
         let (index, indirect) = loop {
             let merged = self.buffer_cache.stats().merged_buffers;
+            self.draw.rebind = false;
             self.draw.buffer_infos.clear();
             self.draw.image_infos.clear();
             self.draw.writes.clear();
             self.draw.textures.clear();
-            self.draw.texture_scaling = TextureScaling::default();
+            self.draw.texture_scaling = ScalingBits::default();
+            self.draw.image_scaling = ScalingBits::default();
+            self.draw.storage_images.clear();
+            self.draw.texel_views.clear();
             for &(slot, host) in &GRAPHICS_SLOTS {
                 let Some(module) = self.draw.stages[host].clone() else {
                     continue;
@@ -577,7 +623,7 @@ impl VulkanRasterizer {
                 },
                 DrawCall::Direct(_) => None,
             };
-            if self.buffer_cache.stats().merged_buffers == merged {
+            if self.buffer_cache.stats().merged_buffers == merged && !self.draw.rebind {
                 break (index, indirect);
             }
         };
@@ -597,6 +643,9 @@ impl VulkanRasterizer {
         }
         for &id in &draw.textures {
             self.texture_cache.prepare(cmd, id, SHADER_SAMPLED);
+        }
+        for &(id, _) in &draw.storage_images {
+            self.texture_cache.prepare(cmd, id, SHADER_STORAGE);
         }
         let extent = self.render_area(regs);
         let scale = self.target_scale();
@@ -742,6 +791,11 @@ impl VulkanRasterizer {
         });
         for id in written.into_iter().flatten() {
             self.texture_cache.mark_modified(id);
+        }
+        for &(id, written) in &self.draw.storage_images {
+            if written {
+                self.texture_cache.mark_modified(id);
+            }
         }
         self.unflushed = true;
         Ok(())
@@ -920,6 +974,9 @@ impl VulkanRasterizer {
                     DescriptorKind::UniformBuffer | DescriptorKind::StorageBuffer => {
                         self.draw.buffer_infos.len()
                     }
+                    DescriptorKind::UniformTexelBuffer | DescriptorKind::StorageTexelBuffer => {
+                        self.draw.texel_views.len()
+                    }
                     _ => self.draw.image_infos.len(),
                 };
                 match b.kind {
@@ -964,15 +1021,7 @@ impl VulkanRasterizer {
                         let desc = info.texture_descriptors[descriptor];
                         let mut array_rescaled = None;
                         for i in 0..b.count {
-                            let h = desc.handle;
-                            let offset = h.cbuf_offset + (i << desc.size_shift);
-                            let mut raw =
-                                read_cbuf::<u32>(src.gmmu, src.cbufs, h.cbuf_index, offset)
-                                    << h.shift_left;
-                            if let Some((index, offset, shift)) = h.secondary {
-                                raw |=
-                                    read_cbuf::<u32>(src.gmmu, src.cbufs, index, offset) << shift;
-                            }
+                            let raw = handle_word(src, desc.handle, i << desc.size_shift);
                             let texture = if desc.handle_is_pointer_word {
                                 None
                             } else {
@@ -1019,14 +1068,65 @@ impl VulkanRasterizer {
                             });
                         }
                     }
-                    DescriptorKind::UniformTexelBuffer
-                    | DescriptorKind::StorageTexelBuffer
-                    | DescriptorKind::StorageImage => {
-                        self.draw.warn_once(
-                            Warning::UnsupportedBinding,
-                            "texel buffers and storage images are not bound yet; skipping draws that use them",
-                        );
-                        return Ok(false);
+                    DescriptorKind::UniformTexelBuffer => {
+                        let desc = info.texture_buffer_descriptors[descriptor];
+                        for i in 0..b.count {
+                            let raw = handle_word(src, desc.handle, i << desc.size_shift);
+                            let view = self.texel_view(src, raw, None, false, false)?;
+                            self.push_texel_view(view, vk::Format::R8G8B8A8_UNORM)?;
+                        }
+                    }
+                    DescriptorKind::StorageTexelBuffer => {
+                        let desc = info.image_buffer_descriptors[descriptor];
+                        let format = storage_format(desc.format);
+                        for i in 0..b.count {
+                            let offset = desc.cbuf_offset + (i << desc.size_shift);
+                            let raw =
+                                read_cbuf::<u32>(src.gmmu, src.cbufs, desc.cbuf_index, offset);
+                            let view = self.texel_view(src, raw, format, true, desc.is_written)?;
+                            let null = match format.and_then(|f| self.texel_format(f)) {
+                                Some(texel) => texel.format,
+                                None if desc.is_integer || format.is_some() => vk::Format::R32_UINT,
+                                None => vk::Format::R32_SFLOAT,
+                            };
+                            self.push_texel_view(view, null)?;
+                        }
+                    }
+                    DescriptorKind::StorageImage => {
+                        let desc = info.image_descriptors[descriptor];
+                        let mut array_rescaled = None;
+                        for i in 0..b.count {
+                            let offset = desc.cbuf_offset + (i << desc.size_shift);
+                            let raw =
+                                read_cbuf::<u32>(src.gmmu, src.cbufs, desc.cbuf_index, offset);
+                            let Some((id, view)) = self.storage_view(src, raw, &desc)? else {
+                                self.draw.warn_once(
+                                    Warning::NullStorageImage,
+                                    "a draw binds an unbound or unstorable storage image; skipping it",
+                                );
+                                return Ok(false);
+                            };
+                            let rescaled = self
+                                .texture_cache
+                                .state(id)
+                                .is_some_and(|s| s.scale != ResolutionScale::X1);
+                            if *array_rescaled.get_or_insert(rescaled) != rescaled {
+                                self.draw.warn_once(
+                                    Warning::MixedScaleArray,
+                                    "a draw binds a storage image array mixing rescaled and native images; skipping it",
+                                );
+                                return Ok(false);
+                            }
+                            self.draw.storage_images.push((id, desc.is_written));
+                            self.draw.image_infos.push(vk::DescriptorImageInfo {
+                                sampler: vk::Sampler::null(),
+                                image_view: view,
+                                image_layout: vk::ImageLayout::GENERAL,
+                            });
+                        }
+                        if array_rescaled == Some(true) {
+                            self.draw.image_scaling.set(b.descriptor);
+                        }
                     }
                 }
                 self.draw.writes.push(Write {
@@ -1040,7 +1140,149 @@ impl VulkanRasterizer {
         self.draw
             .texture_scaling
             .next_stage(info.texture_descriptors.len());
+        self.draw
+            .image_scaling
+            .next_stage(info.image_descriptors.len());
+        let draw = &mut self.draw;
+        if draw
+            .storage_images
+            .iter()
+            .any(|(id, _)| draw.textures.contains(id))
+        {
+            draw.warn_once(
+                Warning::StorageAndSampled,
+                "a draw reads an image as a texture and a storage image at once; skipping it",
+            );
+            return Ok(false);
+        }
         Ok(true)
+    }
+
+    /// The host format texel buffers view `format` with, looked up once per format.
+    fn texel_format(&mut self, format: PixelFormat) -> Option<TexelFormat> {
+        if let Some(known) = self.draw.texel_formats[format as usize] {
+            return known;
+        }
+        let host = self.texture_cache.host(format);
+        let identity = [
+            host.swizzle.r,
+            host.swizzle.g,
+            host.swizzle.b,
+            host.swizzle.a,
+        ]
+        .iter()
+        .all(|&c| c == vk::ComponentSwizzle::IDENTITY);
+        let found = (host.conversion == crate::format::Conversion::None && identity).then(|| {
+            let features = self.device.buffer_features(host.format);
+            TexelFormat {
+                format: host.format,
+                texel: u64::from(format.bytes_per_block()),
+                uniform: features.contains(vk::FormatFeatureFlags::UNIFORM_TEXEL_BUFFER),
+                storage: features.contains(vk::FormatFeatureFlags::STORAGE_TEXEL_BUFFER),
+            }
+        });
+        self.draw.texel_formats[format as usize] = Some(found);
+        found
+    }
+
+    /// The texel buffer view of the buffer texture `raw` selects, read as `explicit` when the
+    /// shader names a format and as the header's otherwise (Lichii's texture buffer binding).
+    /// `None` when no buffer texture or device memory backs it.
+    fn texel_view(
+        &mut self,
+        src: &StageSources<'_>,
+        raw: u32,
+        explicit: Option<PixelFormat>,
+        storage: bool,
+        written: bool,
+    ) -> Result<Option<vk::BufferView>> {
+        let (index, _) = src.pool.split(raw);
+        if index > src.pool.limit {
+            return Ok(None);
+        }
+        let header = src.pool.header(src.gmmu, raw);
+        if header.address == 0 || header.memory != TextureMemory::Buffer {
+            return Ok(None);
+        }
+        let format = explicit.unwrap_or(header.format);
+        let Some(texel) = self
+            .texel_format(format)
+            .filter(|f| if storage { f.storage } else { f.uniform })
+        else {
+            self.draw.warn_once(
+                Warning::TexelBufferFormat,
+                "a texel buffer format the device cannot view; binding the null buffer",
+            );
+            return Ok(None);
+        };
+        self.buffer_cache.texel_buffer(
+            &mut self.scheduler,
+            &mut self.staging,
+            src.gmmu,
+            header.address,
+            u64::from(header.width) * texel.texel,
+            (texel.format, texel.texel),
+            written,
+        )
+    }
+
+    /// Appends `view`, or a view of the null buffer as `null` without one.
+    fn push_texel_view(&mut self, view: Option<vk::BufferView>, null: vk::Format) -> Result<()> {
+        let view = match view {
+            Some(view) => view,
+            None => match self.draw.null_texel_views.iter().find(|(f, _)| *f == null) {
+                Some((_, view)) => view.raw(),
+                None => {
+                    let view = BufferView::new(
+                        &self.device,
+                        self.draw.null_buffer.raw(),
+                        null,
+                        0,
+                        NULL_BUFFER_SIZE,
+                    )?;
+                    let raw = view.raw();
+                    self.draw.null_texel_views.push((null, view));
+                    raw
+                }
+            },
+        };
+        self.draw.texel_views.push(view);
+        Ok(())
+    }
+
+    /// The image and storage view of the storage image `raw` selects for `desc`: in the
+    /// shader's format when it names one, the header's otherwise. A rescaled image the shader
+    /// writes is scaled down first, as Lichii's `FillImageViews` does for blacklisted views.
+    fn storage_view(
+        &mut self,
+        src: &StageSources<'_>,
+        raw: u32,
+        desc: &ImageDescriptor,
+    ) -> Result<Option<(ImageId, vk::ImageView)>> {
+        let Some((id, mut view)) = self.texture_info(src, raw, desc.ty)? else {
+            return Ok(None);
+        };
+        if desc.is_written
+            && self
+                .texture_cache
+                .state(id)
+                .is_some_and(|s| s.scale != ResolutionScale::X1)
+        {
+            let mut tx = Transfer {
+                scheduler: &mut self.scheduler,
+                staging: &mut self.staging,
+                memory: &self.handles.device,
+            };
+            self.texture_cache.scale_down(&mut tx, id)?;
+            self.draw.rebind = true;
+        }
+        if let Some(format) = storage_format(desc.format) {
+            view.format = format;
+        }
+        Ok(self
+            .texture_cache
+            .storage_view(id, &view)?
+            .map(|raw| (id, raw)))
     }
 
     fn push_buffer(&mut self, binding: Option<crate::buffer_cache::BufferBinding>) {
@@ -1067,6 +1309,20 @@ impl VulkanRasterizer {
         raw: u32,
         ty: TextureType,
     ) -> Result<Option<(ImageId, vk::ImageView)>> {
+        let Some((id, view)) = self.texture_info(src, raw, ty)? else {
+            return Ok(None);
+        };
+        Ok(self.texture_cache.view(id, &view)?.map(|raw| (id, raw)))
+    }
+
+    /// The image the texture header `raw` selects and the view of it `ty` reads; `None` when
+    /// nothing backs it or the image's layers cannot form the view.
+    fn texture_info(
+        &mut self,
+        src: &StageSources<'_>,
+        raw: u32,
+        ty: TextureType,
+    ) -> Result<Option<(ImageId, ViewInfo)>> {
         let (index, _) = src.pool.split(raw);
         if index > src.pool.limit {
             return Ok(None);
@@ -1093,7 +1349,7 @@ impl VulkanRasterizer {
             vk::ImageViewType::CUBE | vk::ImageViewType::CUBE_ARRAY => return Ok(None),
             _ => view.layers,
         };
-        Ok(self.texture_cache.view(id, &view)?.map(|raw| (id, raw)))
+        Ok(Some((id, view)))
     }
 
     /// The host sampler for sampler header `index`, created on first use.
@@ -1268,6 +1524,9 @@ impl VulkanRasterizer {
                 DescriptorKind::UniformBuffer | DescriptorKind::StorageBuffer => {
                     vk_write.p_buffer_info = draw.buffer_infos[write.first..].as_ptr();
                 }
+                DescriptorKind::UniformTexelBuffer | DescriptorKind::StorageTexelBuffer => {
+                    vk_write.p_texel_buffer_view = draw.texel_views[write.first..].as_ptr();
+                }
                 _ => vk_write.p_image_info = draw.image_infos[write.first..].as_ptr(),
             }
             draw.vk_writes.push(vk_write);
@@ -1296,6 +1555,9 @@ impl VulkanRasterizer {
         let mut bytes = [0u8; RENDER_AREA_LAYOUT_OFFSET as usize + 16];
         let words: &[u8] = bytemuck::cast_slice(&self.draw.texture_scaling.words);
         let at = RESCALING_LAYOUT_TEXTURES_OFFSET as usize;
+        bytes[at..at + words.len()].copy_from_slice(words);
+        let words: &[u8] = bytemuck::cast_slice(&self.draw.image_scaling.words);
+        let at = RESCALING_LAYOUT_IMAGES_OFFSET as usize;
         bytes[at..at + words.len()].copy_from_slice(words);
         let (num, den) = scale.ratio();
         let down = den as f32 / num as f32;
@@ -1704,15 +1966,19 @@ impl VulkanRasterizer {
         };
         loop {
             let merged = self.buffer_cache.stats().merged_buffers;
+            self.draw.rebind = false;
             self.draw.buffer_infos.clear();
             self.draw.image_infos.clear();
             self.draw.writes.clear();
             self.draw.textures.clear();
-            self.draw.texture_scaling = TextureScaling::default();
+            self.draw.texture_scaling = ScalingBits::default();
+            self.draw.image_scaling = ScalingBits::default();
+            self.draw.storage_images.clear();
+            self.draw.texel_views.clear();
             if !self.bind_resources(&module, &sources)? {
                 return Ok(());
             }
-            if self.buffer_cache.stats().merged_buffers == merged {
+            if self.buffer_cache.stats().merged_buffers == merged && !self.draw.rebind {
                 break;
             }
         }
@@ -1720,6 +1986,9 @@ impl VulkanRasterizer {
         let cmd = self.scheduler.record()?;
         for &id in &self.draw.textures {
             self.texture_cache.prepare(cmd, id, SHADER_SAMPLED);
+        }
+        for &(id, _) in &self.draw.storage_images {
+            self.texture_cache.prepare(cmd, id, SHADER_STORAGE);
         }
         let raw = &self.device.raw;
         let [x, y, z] = ctx.grid;
@@ -1753,9 +2022,52 @@ impl VulkanRasterizer {
                 &vk::DependencyInfo::default().memory_barriers(&[barrier]),
             );
         }
+        for &(id, written) in &self.draw.storage_images {
+            if written {
+                self.texture_cache.mark_modified(id);
+            }
+        }
         self.unflushed = true;
         Ok(())
     }
+}
+
+/// How texel buffers view a guest format.
+#[derive(Clone, Copy)]
+struct TexelFormat {
+    format: vk::Format,
+    texel: u64,
+    uniform: bool,
+    storage: bool,
+}
+
+/// The guest format of a typed storage image or image buffer access; `None` for typeless
+/// accesses, which take the header's.
+fn storage_format(format: ImageFormat) -> Option<PixelFormat> {
+    Some(match format {
+        ImageFormat::Typeless => return None,
+        ImageFormat::R8Uint => PixelFormat::R8Uint,
+        ImageFormat::R8Sint => PixelFormat::R8Sint,
+        ImageFormat::R16Uint => PixelFormat::R16Uint,
+        ImageFormat::R16Sint => PixelFormat::R16Sint,
+        ImageFormat::R32Uint => PixelFormat::R32Uint,
+        ImageFormat::R32G32Uint => PixelFormat::R32G32Uint,
+        ImageFormat::R32G32B32A32Uint => PixelFormat::R32G32B32A32Uint,
+    })
+}
+
+/// The handle word `handle` names, `offset` bytes into its array.
+fn handle_word(src: &StageSources<'_>, handle: HandleSource, offset: u32) -> u32 {
+    let mut raw = read_cbuf::<u32>(
+        src.gmmu,
+        src.cbufs,
+        handle.cbuf_index,
+        handle.cbuf_offset + offset,
+    ) << handle.shift_left;
+    if let Some((index, offset, shift)) = handle.secondary {
+        raw |= read_cbuf::<u32>(src.gmmu, src.cbufs, index, offset) << shift;
+    }
+    raw
 }
 
 /// The GPU address and size of storage buffer `element` of `desc`: 16-byte NVN descriptors in

@@ -600,7 +600,7 @@ impl TextureCache {
     }
 
     /// The host format of a guest format, queried from the device once.
-    fn host(&mut self, format: PixelFormat) -> HostFormat {
+    pub(crate) fn host(&mut self, format: PixelFormat) -> HostFormat {
         let slot = &mut self.host_formats[format as usize];
         *slot.get_or_insert_with(|| host_format(&self.device, format, self.recompression))
     }
@@ -749,6 +749,44 @@ impl TextureCache {
         };
         self.view_for(id, key, host.format, view.view_type, mapping)
             .map(Some)
+    }
+
+    /// A storage image view of `view`'s first level with the identity swizzle, as storage
+    /// descriptors need. `None` when the image or `view.format` cannot be stored to as is.
+    pub fn storage_view(&mut self, id: ImageId, view: &ViewInfo) -> Result<Option<vk::ImageView>> {
+        let host = self.host(view.format);
+        let image_storage = self.get(id).is_some_and(|i| i.host.storage);
+        if !image_storage
+            || !host.storage
+            || host.conversion != Conversion::None
+            || [
+                host.swizzle.r,
+                host.swizzle.g,
+                host.swizzle.b,
+                host.swizzle.a,
+            ]
+            .iter()
+            .any(|&c| c != vk::ComponentSwizzle::IDENTITY)
+        {
+            return Ok(None);
+        }
+        let view = ViewInfo {
+            swizzle: [
+                SwizzleSource::R,
+                SwizzleSource::G,
+                SwizzleSource::B,
+                SwizzleSource::A,
+            ],
+            levels: 1,
+            ..*view
+        };
+        self.view(id, &view)
+    }
+
+    /// Scales `id` back to native resolution, keeping its contents: Lichii does so for images a
+    /// shader writes as storage images, which the shader cannot address at a scale.
+    pub fn scale_down(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
+        self.rescale(tx, id, ResolutionScale::X1, true)
     }
 
     fn view_for(
