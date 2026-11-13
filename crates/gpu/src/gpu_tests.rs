@@ -1495,3 +1495,159 @@ fn present_restarts_the_switch_2_timestamp_frame_in_order() {
         assert_eq!(timestamp.now(), 1_100, "{threading:?}");
     });
 }
+
+/// Sets the entry's SYNC bit.
+fn sync(entry: GpEntry) -> GpEntry {
+    GpEntry(entry.0 | 1 << 63)
+}
+
+/// A command list and the entry before it, whose release overwrites the list's argument word
+/// 0xdead with 0x1234, as compute or copy work writes a command list: (writer, list).
+fn list_written_by_a_release(rig: &mut Rig) -> (GpEntry, GpEntry) {
+    let list = rig.entry(&Pushbuffer::default().inc(0, 0x701, &[0xdead]).0);
+    let writer = rig.entry(
+        &Pushbuffer::default()
+            .bind(0, AMPERE_3D)
+            .semaphore(list.address() + 4, 0x1234, 1)
+            .0,
+    );
+    (writer, list)
+}
+
+#[test]
+fn a_sync_entry_is_fetched_after_the_deferred_work_before_it() {
+    each_mode(|threading| {
+        let mut rig = Rig::deferred(threading);
+        let channel = rig.channel(HostClass::Ampere);
+        let (writer, list) = list_written_by_a_release(&mut rig);
+        rig.gpu
+            .submit(channel, Submission::new(&[writer, sync(list)]));
+        let events = rig.events();
+        let read = events
+            .iter()
+            .position(|e| {
+                *e == Event::Method {
+                    channel: channel.0,
+                    engine: EngineKind::Maxwell3d,
+                    method: 0x701,
+                    argument: 0x1234,
+                }
+            })
+            .unwrap_or_else(|| panic!("{threading:?}: the list is read with the released word"));
+        let release = events
+            .iter()
+            .position(|e| {
+                matches!(e, Event::Fence(FenceAction::WriteSemaphore { address, value: 0x1234, .. })
+                    if *address == DEVICE_BASE + list.address() + 4)
+            })
+            .unwrap();
+        let flush = events
+            .iter()
+            .position(|e| *e == Event::FlushRegion(DEVICE_BASE + list.address(), 8))
+            .unwrap_or_else(|| panic!("{threading:?}: the list's words are flushed"));
+        assert!(release < flush && flush < read, "{threading:?}");
+        assert_eq!(rig.read(list.address() + 4), 0x1234);
+    });
+}
+
+#[test]
+fn entries_without_sync_are_fetched_without_waiting() {
+    each_mode(|threading| {
+        let mut rig = Rig::deferred(threading);
+        let channel = rig.channel(HostClass::Ampere);
+        let (writer, list) = list_written_by_a_release(&mut rig);
+        rig.gpu.submit(channel, Submission::new(&[writer, list]));
+        assert_eq!(
+            rig.methods(),
+            [(channel.0, EngineKind::Maxwell3d, 0x701, 0xdead)],
+            "{threading:?}"
+        );
+        assert!(
+            !rig.events()
+                .iter()
+                .any(|e| matches!(e, Event::FlushRegion(..))),
+            "{threading:?}"
+        );
+        assert_eq!(rig.read(list.address() + 4), 0xdead);
+        rig.complete();
+        assert_eq!(rig.read(list.address() + 4), 0x1234);
+    });
+}
+
+#[test]
+fn side_commands_wait_behind_a_sync_entry_queued_before_them() {
+    each_mode(|threading| {
+        let mut rig = Rig::deferred(threading);
+        let waiter = rig.channel(HostClass::Ampere);
+        let (writer, list) = list_written_by_a_release(&mut rig);
+        rig.gpu.pause(true);
+        rig.gpu
+            .submit(waiter, Submission::new(&[writer, sync(list)]));
+        let log = rig.log.clone();
+        rig.gpu.run_in_order(move |_| log.lock().push(Event::Ran));
+        rig.gpu.pause(false);
+        rig.gpu.synchronize();
+        let order: Vec<_> = rig
+            .events()
+            .into_iter()
+            .filter(|event| matches!(event, Event::Ran | Event::Method { method: 0x701, .. }))
+            .collect();
+        assert!(
+            matches!(order[..], [Event::Method { .. }, Event::Ran]),
+            "{threading:?}: {order:?}"
+        );
+    });
+}
+
+#[test]
+fn submissions_after_a_held_side_command_keep_their_place() {
+    each_mode(|threading| {
+        let mut rig = Rig::deferred(threading);
+        let waiter = rig.channel(HostClass::Ampere);
+        let other = rig.channel(HostClass::Ampere);
+        let (writer, list) = list_written_by_a_release(&mut rig);
+        let words = Pushbuffer::default().bind(0, AMPERE_3D).inc(0, 0x702, &[2]);
+        rig.gpu.pause(true);
+        rig.gpu
+            .submit(waiter, Submission::new(&[writer, sync(list)]));
+        let log = rig.log.clone();
+        rig.gpu.run_in_order(move |_| log.lock().push(Event::Ran));
+        rig.submit(other, &words.0);
+        rig.gpu.pause(false);
+        rig.gpu.synchronize();
+        let order: Vec<_> = rig
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Ran => Some(0),
+                Event::Method { method, .. } if method == 0x701 || method == 0x702 => Some(method),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, [0x701, 0, 0x702], "{threading:?}");
+    });
+}
+
+#[test]
+fn a_sync_entry_suspends_only_its_channel() {
+    each_mode(|threading| {
+        let mut rig = Rig::deferred(threading);
+        let waiter = rig.channel(HostClass::Ampere);
+        let other = rig.channel(HostClass::Ampere);
+        let (writer, list) = list_written_by_a_release(&mut rig);
+        let words = Pushbuffer::default().bind(0, AMPERE_3D).inc(0, 0x702, &[2]);
+        rig.gpu.pause(true);
+        rig.gpu
+            .submit(waiter, Submission::new(&[writer, sync(list)]));
+        rig.submit(other, &words.0);
+        rig.gpu.pause(false);
+        assert_eq!(
+            rig.methods(),
+            [
+                (other.0, EngineKind::Maxwell3d, 0x702, 2),
+                (waiter.0, EngineKind::Maxwell3d, 0x701, 0x1234),
+            ],
+            "{threading:?}"
+        );
+    });
+}

@@ -9,8 +9,12 @@ use gpu_allocator::{AllocationSizes, AllocatorDebugSettings};
 use lichii_common::settings::GraphicsSettings;
 use parking_lot::Mutex;
 
+use lichii_shader::Profile;
+use lichii_shader::profile::HostTranslateInfo;
+
 use crate::error::{Error, Result, VkResultExt};
 use crate::instance::Instance;
+use crate::profile::{ShaderQueries, shader_profile};
 
 /// Device memory blocks are 64 MiB: with 256 MiB blocks ~38% of device memory sat empty in
 /// half-used blocks and evictions never lowered the driver's usage (NX2_NOTES row 114).
@@ -103,6 +107,11 @@ pub struct DeviceFeatures {
     pub depth_clip_control: bool,
     pub transform_feedback: bool,
     pub conditional_rendering: bool,
+    pub storage_buffer_8bit: bool,
+    pub uniform_and_storage_buffer_8bit: bool,
+    pub storage_buffer_16bit: bool,
+    pub uniform_and_storage_buffer_16bit: bool,
+    pub demote_to_helper_invocation: bool,
 }
 
 /// Facts about the physical device the renderer needs at run time.
@@ -135,6 +144,9 @@ pub struct Device {
     /// Bytes handed out by the allocator; it reports only block capacity cheaply.
     pub(crate) allocated: AtomicU64,
     pub(crate) memory_properties: vk::PhysicalDeviceMemoryProperties,
+    /// What the shader translator may emit for this device.
+    pub shader_profile: Profile,
+    pub shader_host: HostTranslateInfo,
 }
 
 struct Candidate {
@@ -420,6 +432,11 @@ impl Device {
             transform_feedback: extensions.transform_feedback && on(xfb.transform_feedback),
             conditional_rendering: extensions.conditional_rendering
                 && on(conditional.conditional_rendering),
+            storage_buffer_8bit: on(v12.storage_buffer8_bit_access),
+            uniform_and_storage_buffer_8bit: on(v12.uniform_and_storage_buffer8_bit_access),
+            storage_buffer_16bit: on(v11.storage_buffer16_bit_access),
+            uniform_and_storage_buffer_16bit: on(v11.uniform_and_storage_buffer16_bit_access),
+            demote_to_helper_invocation: on(v13.shader_demote_to_helper_invocation),
         };
 
         let priorities = [1.0];
@@ -438,9 +455,11 @@ impl Device {
                 .call("vkCreateDevice")?
         };
 
+        let mut v11_properties = vk::PhysicalDeviceVulkan11Properties::default();
         let mut v12_properties = vk::PhysicalDeviceVulkan12Properties::default();
-        let mut properties2 =
-            vk::PhysicalDeviceProperties2::default().push_next(&mut v12_properties);
+        let mut properties2 = vk::PhysicalDeviceProperties2::default()
+            .push_next(&mut v11_properties)
+            .push_next(&mut v12_properties);
         // SAFETY: valid physical device and queue family.
         let (queue, families, memory_properties) = unsafe {
             raw_instance.get_physical_device_properties2(physical, &mut properties2);
@@ -451,6 +470,15 @@ impl Device {
             )
         };
         let base = properties2.properties;
+        let (shader_profile, shader_host) = shader_profile(
+            &features,
+            &ShaderQueries {
+                api_version: base.api_version,
+                limits: &base.limits,
+                vulkan11: &v11_properties,
+                vulkan12: &v12_properties,
+            },
+        );
         let properties = DeviceProperties {
             name: candidate.name,
             device_type: base.device_type,
@@ -500,6 +528,8 @@ impl Device {
             allocator: ManuallyDrop::new(Mutex::new(allocator)),
             allocated: AtomicU64::new(0),
             memory_properties,
+            shader_profile,
+            shader_host,
         }))
     }
 

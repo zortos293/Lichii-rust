@@ -63,7 +63,7 @@ impl AttachmentState {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct GraphicsPipelineKey {
-    /// [`ShaderProgram::hash`](super::ShaderProgram::hash) per [`GRAPHICS_STAGES`](super::GRAPHICS_STAGES) entry, 0 when absent.
+    /// [`ShaderModule::hash`](lichii_shader::ShaderModule::hash) per [`GRAPHICS_STAGES`](super::GRAPHICS_STAGES) entry, 0 when absent.
     pub(crate) shaders: [u64; 5],
     pub(crate) attachments: AttachmentState,
     pub(crate) fixed: FixedPipelineState,

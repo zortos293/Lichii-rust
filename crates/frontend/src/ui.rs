@@ -272,18 +272,13 @@ impl App {
             let snap = self.perf.snapshot(Instant::now(), window);
             crate::frame_view::draw(painter, guest, fv, &snap, &self.settings.graphics);
         }
-        let text = if session.is_paused() {
-            format!("{}\nPaused", session.title)
-        } else {
-            format!(
-                "{}\nThe emulation core cannot run titles yet, so nothing is drawn here.",
-                session.title
-            )
-        };
+        if !session.is_paused() {
+            return;
+        }
         painter.text(
             guest.center(),
             egui::Align2::CENTER_CENTER,
-            text,
+            format!("{}\nPaused", session.title),
             egui::FontId::proportional(18.0),
             Color32::from_gray(150),
         );

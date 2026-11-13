@@ -1,9 +1,16 @@
 //! `acc:u0`, `acc:u1`, `acc:su`, `acc:aa`, `acc:e*` and `dauth:0`: one user profile, named by
 //! `settings.system.username`, opened when the title boots. No Nintendo Account is linked.
+//!
+//! Profiles are kept in the NAND's `profiles.dat`, as the C++ ProfileManager keeps them: the
+//! user whose id or nickname matches the username is opened, else one is added; profile edits
+//! are saved, and the other users in the file are kept as they are.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use bytemuck::{Pod, Zeroable};
+use lichii_common::settings::write_atomic;
 use lichii_common::{HleResult, ResultCode};
 use lichii_kernel::Event;
 use lichii_kernel::ipc::HleRequestContext;
@@ -25,6 +32,7 @@ const THUMBNAIL_SIZE: u64 = 0x24000;
 const ID_TOKEN_CACHE_SIZE: usize = 0x100;
 const NAS_USER_BASE_SIZE: usize = 0x68;
 const NACP_USER_ACCOUNT_SWITCH_LOCK: usize = 0x3026;
+const PROFILES_PATH: &str = "system/save/8000000000000010/su/avators/profiles.dat";
 
 /// The avatar every profile shows: a 256x256 JPEG.
 const AVATAR: &[u8] = include_bytes!("backup_avatar.jpg");
@@ -53,27 +61,136 @@ fn account_id(uid: &Uid) -> u64 {
     upper ^ lower.rotate_left(1)
 }
 
-/// The profile all `acc` interfaces share.
+/// A user of `profiles.dat` (`UserRaw`); an all-zero uuid is a free slot.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct UserRaw {
+    uuid: Uid,
+    uuid2: Uid,
+    timestamp: u64,
+    nickname: [u8; 32],
+    user_data: [u8; USER_DATA_SIZE],
+}
+
+/// `profiles.dat` (`ProfileDataRaw`).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ProfileData {
+    reserved: [u8; 0x10],
+    users: [UserRaw; MAX_USERS],
+}
+
+const _: () = assert!(size_of::<ProfileData>() == 0x650);
+
+/// The users of the file at `path`; none when it is missing or short. An error is a file
+/// that exists but cannot be read.
+fn read_profiles(path: &Path) -> std::io::Result<ProfileData> {
+    let data = match std::fs::read(path) {
+        Ok(data) => data,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    Ok(match data.get(..size_of::<ProfileData>()) {
+        Some(data) => bytemuck::pod_read_unaligned(data),
+        None => {
+            if !data.is_empty() {
+                tracing::warn!("{} is too short; starting without users", path.display());
+            }
+            ProfileData::zeroed()
+        }
+    })
+}
+
+/// The profile all `acc` interfaces share, and the file it is saved in.
 struct Profile {
     uid: Uid,
     /// `nn::account::profile::ProfileBase`: uid, timestamp, 32-byte nickname.
     base: [u8; 0x38],
     user_data: [u8; USER_DATA_SIZE],
     open_context_stored: bool,
+    path: PathBuf,
+    data: ProfileData,
+    /// The profile's user in `data`; none when all eight slots belong to other users.
+    slot: Option<usize>,
 }
 
 impl Profile {
-    fn new(username: &str) -> Self {
+    /// Opens `username`'s user in `profiles.dat` under `nand`: the user with its id, else the
+    /// first with its nickname, else a new one added and saved. A file that exists but cannot
+    /// be read is never written.
+    fn open(username: &str, nand: &Path) -> Self {
+        let path = nand.join(PROFILES_PATH);
+        let (data, writable) = match read_profiles(&path) {
+            Ok(data) => (data, true),
+            Err(e) => {
+                tracing::error!("reading {}: {e}; the profile is not saved", path.display());
+                (ProfileData::zeroed(), false)
+            }
+        };
         let uid = user_id(username);
-        let mut base = [0; 0x38];
-        base[..16].copy_from_slice(&uid);
+        let mut nickname = [0; 32];
         let name = &username.as_bytes()[..username.len().min(32)];
-        base[0x18..0x18 + name.len()].copy_from_slice(name);
-        Self {
-            uid,
+        nickname[..name.len()].copy_from_slice(name);
+        let in_use = |user: &UserRaw| user.uuid != [0; 16];
+        let found = data
+            .users
+            .iter()
+            .position(|user| in_use(user) && user.uuid == uid)
+            .or_else(|| {
+                data.users
+                    .iter()
+                    .position(|user| in_use(user) && user.nickname == nickname)
+            });
+        let free = || data.users.iter().position(|user| !in_use(user));
+        let slot = found.or_else(free).filter(|_| writable);
+        let user = match found {
+            Some(slot) => data.users[slot],
+            None => UserRaw {
+                uuid: uid,
+                uuid2: uid,
+                timestamp: 0,
+                nickname,
+                user_data: [0; USER_DATA_SIZE],
+            },
+        };
+        let mut base = [0; 0x38];
+        base[..16].copy_from_slice(&user.uuid);
+        base[0x10..0x18].copy_from_slice(&user.timestamp.to_le_bytes());
+        base[0x18..].copy_from_slice(&user.nickname);
+        let mut profile = Self {
+            uid: user.uuid,
             base,
-            user_data: [0; USER_DATA_SIZE],
+            user_data: user.user_data,
             open_context_stored: false,
+            path,
+            data,
+            slot,
+        };
+        match (found, slot) {
+            (Some(_), _) => {}
+            (None, Some(_)) => profile.save(),
+            (None, None) if writable => {
+                tracing::warn!("profiles.dat has no free slot; {username} is not saved")
+            }
+            (None, None) => {}
+        }
+        profile
+    }
+
+    /// Writes the profile into its slot and saves `profiles.dat`.
+    fn save(&mut self) {
+        let Some(slot) = self.slot else {
+            return;
+        };
+        self.data.users[slot] = UserRaw {
+            uuid: self.uid,
+            uuid2: self.uid,
+            timestamp: u64::from_le_bytes(self.base[0x10..0x18].try_into().unwrap()),
+            nickname: self.base[0x18..].try_into().unwrap(),
+            user_data: self.user_data,
+        };
+        if let Err(e) = write_atomic(&self.path, bytemuck::bytes_of(&self.data)) {
+            tracing::error!("saving {}: {e}", self.path.display());
         }
     }
 
@@ -98,7 +215,11 @@ enum Interface {
 }
 
 pub(crate) fn register(context: &Arc<ServiceContext>) -> HleResult<()> {
-    let profile = Arc::new(Mutex::new(Profile::new(&context.settings.system.username)));
+    let profile = Profile::open(
+        &context.settings.system.username,
+        &crate::fs::nand_dir(&context.settings),
+    );
+    let profile = Arc::new(Mutex::new(profile));
     let services = [
         ("acc:u0", Interface::Application),
         ("acc:u1", Interface::System),
@@ -252,6 +373,7 @@ impl ProfileService {
         }
         profile.base = base;
         profile.user_data = *user_data;
+        profile.save();
         ResultCode::SUCCESS
     }
 }
