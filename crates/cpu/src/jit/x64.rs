@@ -16,6 +16,8 @@ use std::mem::offset_of;
 use dynasmrt::x64::X64Relocation;
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, VecAssembler, dynasm};
 
+use lichii_memory::ReservationSlot;
+
 use super::JitState;
 use super::ir::{Block, Loc, Op, Terminal, Ty, Value, W};
 use crate::ThreadContext;
@@ -43,6 +45,7 @@ pub(super) struct Target {
     pub read: usize,
     pub write: usize,
     pub atomic: usize,
+    pub exclusive: usize,
     pub zero: usize,
     pub ticks: usize,
 }
@@ -101,6 +104,11 @@ const ST_SAVE_XMM: i32 = ctx(offset_of!(JitState, save_xmm));
 const ST_SPILL: i32 = ctx(offset_of!(JitState, spill));
 const ST_LINK: i32 = ctx(offset_of!(JitState, link));
 const ST_TABLE: i32 = ctx(offset_of!(JitState, table));
+const ST_RESERVATION: i32 = ctx(offset_of!(JitState, reservation));
+const RES_VALUE_LO: i32 = offset_of!(ReservationSlot, value_lo) as i32;
+const RES_VALUE_HI: i32 = offset_of!(ReservationSlot, value_hi) as i32;
+const RES_ADDR: i32 = offset_of!(ReservationSlot, addr) as i32;
+const RES_SIZE: i32 = offset_of!(ReservationSlot, size) as i32;
 const ST_INTERRUPT: i32 = ctx(offset_of!(JitState, interrupt));
 /// Entries in the direct-mapped `guest pc -> host code` table indirect branches probe.
 pub(super) const TABLE_BITS: u32 = 16;
@@ -791,7 +799,9 @@ impl Emitter<'_> {
             | Op::Store { size, addr, pc, .. }
             | Op::StoreVec { size, addr, pc, .. }
             | Op::AtomicRmw { size, addr, pc, .. }
-            | Op::Cas { size, addr, pc, .. } => (size, addr, pc),
+            | Op::Cas { size, addr, pc, .. }
+            | Op::LoadExclusive { size, addr, pc }
+            | Op::StoreExclusive { size, addr, pc, .. } => (size, addr, pc),
             Op::ZeroBlock { addr, pc } => (6, addr, pc),
             _ => unreachable!(),
         };
@@ -799,9 +809,9 @@ impl Emitter<'_> {
         let a = self.reg(addr);
         let values = match op {
             Op::Store { value, .. } => [Some(self.src(value, W::W64)), None],
-            Op::StoreVec { value, .. } | Op::AtomicRmw { value, .. } => {
-                [Some(Src::Reg(self.reg(value))), None]
-            }
+            Op::StoreVec { value, .. }
+            | Op::AtomicRmw { value, .. }
+            | Op::StoreExclusive { value, .. } => [Some(Src::Reg(self.reg(value))), None],
             Op::Cas { expected, new, .. } => [
                 Some(Src::Reg(self.reg(expected))),
                 Some(Src::Reg(self.reg(new))),
@@ -813,7 +823,14 @@ impl Emitter<'_> {
         let resume = self.asm.new_dynamic_label();
         let sites = match self.target.arena_size {
             Some(arena) => {
-                if matches!(op, Op::AtomicRmw { .. } | Op::Cas { .. }) && size > 0 {
+                let aligned = matches!(
+                    op,
+                    Op::AtomicRmw { .. }
+                        | Op::Cas { .. }
+                        | Op::LoadExclusive { .. }
+                        | Op::StoreExclusive { .. }
+                );
+                if aligned && size > 0 {
                     let misaligned = (1i32 << size) - 1;
                     dynasm!(self.asm ; .arch x64 ; test Rd(a), misaligned ; jnz =>label);
                 }
@@ -837,6 +854,8 @@ impl Emitter<'_> {
             Op::Store { .. } | Op::StoreVec { .. } => (self.target.write, size as i32),
             Op::AtomicRmw { op, .. } => (self.target.atomic, size as i32 | (op as i32) << 8),
             Op::Cas { .. } => (self.target.atomic, size as i32 | ATOMIC_CAS << 8),
+            Op::LoadExclusive { .. } => (self.target.exclusive, size as i32),
+            Op::StoreExclusive { .. } => (self.target.exclusive, size as i32 | 1 << 8),
             _ => (self.target.zero, size as i32),
         };
         let saved = self.live_across(i);
@@ -1065,6 +1084,56 @@ impl Emitter<'_> {
                         dynasm!(self.asm ; .arch x64 ; lock cmpxchg QWORD [r14 + Rq(a)], Rq(n) ; mov Rq(d), rax)
                     }
                 }
+            }
+            Op::LoadExclusive { size, .. } => {
+                let d = dst.unwrap();
+                site = at(&self.asm);
+                match size {
+                    0 => dynasm!(self.asm ; .arch x64 ; movzx Rd(d), BYTE [r14 + Rq(a)]),
+                    1 => dynasm!(self.asm ; .arch x64 ; movzx Rd(d), WORD [r14 + Rq(a)]),
+                    2 => dynasm!(self.asm ; .arch x64 ; mov Rd(d), DWORD [r14 + Rq(a)]),
+                    _ => dynasm!(self.asm ; .arch x64 ; mov Rq(d), QWORD [r14 + Rq(a)]),
+                }
+                let bytes = 1i32 << size;
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; mov rcx, QWORD [r13 + ST_RESERVATION]
+                    ; mov QWORD [rcx + RES_VALUE_LO], Rq(d)
+                    ; mov QWORD [rcx + RES_VALUE_HI], 0
+                    ; mov QWORD [rcx + RES_ADDR], Rq(a)
+                    ; mov QWORD [rcx + RES_SIZE], bytes
+                );
+            }
+            Op::StoreExclusive { size, .. } => {
+                let (n, d) = (reg(values[0]), dst.unwrap());
+                let (lost, done) = (self.asm.new_dynamic_label(), self.asm.new_dynamic_label());
+                let bytes = 1i32 << size;
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; mov rcx, QWORD [r13 + ST_RESERVATION]
+                    ; cmp QWORD [rcx + RES_SIZE], bytes
+                    ; jne =>lost
+                    ; cmp QWORD [rcx + RES_ADDR], Rq(a)
+                    ; jne =>lost
+                    ; mov rax, QWORD [rcx + RES_VALUE_LO]
+                );
+                site = at(&self.asm);
+                match size {
+                    0 => dynasm!(self.asm ; .arch x64 ; lock cmpxchg BYTE [r14 + Rq(a)], Rb(n)),
+                    1 => dynasm!(self.asm ; .arch x64 ; lock cmpxchg WORD [r14 + Rq(a)], Rw(n)),
+                    2 => dynasm!(self.asm ; .arch x64 ; lock cmpxchg DWORD [r14 + Rq(a)], Rd(n)),
+                    _ => dynasm!(self.asm ; .arch x64 ; lock cmpxchg QWORD [r14 + Rq(a)], Rq(n)),
+                }
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; setne al
+                    ; movzx Rd(d), al
+                    ; jmp =>done
+                    ; =>lost
+                    ; mov Rd(d), 1
+                    ; =>done
+                    ; mov QWORD [rcx + RES_SIZE], 0
+                );
             }
             Op::ZeroBlock { .. } => {
                 dynasm!(self.asm ; .arch x64 ; pxor xmm15, xmm15);

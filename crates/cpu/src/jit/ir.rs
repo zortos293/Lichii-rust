@@ -190,6 +190,23 @@ pub enum Op {
         value: Value,
         pc: u64,
     },
+    /// `LDXR` and the 32-bit `LDXP` of `1 << size` bytes (at most 8): the zero-extended value,
+    /// with a reservation for it in this core's `ExclusiveMonitor` slot. Aligned like
+    /// `AtomicRmw`.
+    LoadExclusive {
+        size: u8,
+        addr: Value,
+        pc: u64,
+    },
+    /// `STXR` and the 32-bit `STXP`: stores `value` when the reservation still covers `addr`
+    /// and memory still holds the loaded value, and always drops the reservation. 0 when the store
+    /// happened, 1 otherwise.
+    StoreExclusive {
+        size: u8,
+        addr: Value,
+        value: Value,
+        pc: u64,
+    },
     /// `CAS`: the zero-extended old value, aligned like `AtomicRmw`.
     Cas {
         size: u8,
@@ -240,6 +257,8 @@ impl Op {
                 | Op::StoreVec { .. }
                 | Op::AtomicRmw { .. }
                 | Op::Cas { .. }
+                | Op::LoadExclusive { .. }
+                | Op::StoreExclusive { .. }
                 | Op::ZeroBlock { .. }
         )
     }
@@ -268,6 +287,7 @@ impl Op {
             | Op::TestBit(a, _)
             | Op::Load { addr: a, .. }
             | Op::LoadVec { addr: a, .. }
+            | Op::LoadExclusive { addr: a, .. }
             | Op::ZeroBlock { addr: a, .. } => f(a),
             Op::Add(_, a, b)
             | Op::Sub(_, a, b)
@@ -292,6 +312,9 @@ impl Op {
                 addr: a, value: b, ..
             }
             | Op::AtomicRmw {
+                addr: a, value: b, ..
+            }
+            | Op::StoreExclusive {
                 addr: a, value: b, ..
             } => {
                 f(a);
