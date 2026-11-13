@@ -140,7 +140,7 @@ specially built session; `push_interface` is the usual way.
   names). 2/3 (guest `RegisterService`/`UnregisterService`) return `sm::NOT_ALLOWED`, because
   only HLE services register.
   `GetServiceHandle` for a name the client's NPDM service list does not match (`*` ends a
-  prefix) fails with `sm::NOT_ALLOWED`; a program without an NPDM may open any service.
+  prefix) fails with `sm::NOT_ALLOWED`. Homebrew without an NPDM gets the loader's `*` list.
 
 ## Not supported yet
 

@@ -86,7 +86,10 @@ pub fn program_image(program_id: u64) -> ProgramImage {
         pool_partition: PoolPartition::Application,
         kernel_capabilities: Vec::new(),
         capabilities: KernelCapabilities::default(),
-        services: ServiceAccess::default(),
+        services: ServiceAccess {
+            client: vec!["*".into()],
+            server: vec!["*".into()],
+        },
         filesystem_permissions: 0,
         modules: vec![Module {
             name: "main".into(),

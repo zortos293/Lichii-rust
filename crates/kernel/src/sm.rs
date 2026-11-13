@@ -3,15 +3,13 @@
 //! Both the CMIF and the TIPC flavours (firmware 12+, every Switch 2 title) use the same command
 //! ids. `GetServiceHandle` for a name nobody registered yet is deferred until it is registered,
 //! as Horizon's sm does; the client thread stays blocked meanwhile (NX2_NOTES row 123).
-//! A client whose NPDM lists services may open only those; a program without an NPDM may open
-//! any.
+//! A client may open only the services its NPDM lists (homebrew gets the loader's `*`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use lichii_common::{HleResult, ResultCode};
-use lichii_loader::npdm::ServiceAccess;
 use parking_lot::Mutex;
 
 use crate::ipc::{
@@ -132,7 +130,7 @@ impl ServiceManager {
     /// Connects to `name` or, when it is not registered, defers the request until it is.
     fn get_service(&self, ctx: &mut HleRequestContext, name: u64) -> ResultCode {
         let access = &ctx.process().params().services;
-        if access != &ServiceAccess::default() && !access.allows_client(&display_name(name)) {
+        if !access.allows_client(&display_name(name)) {
             tracing::warn!(
                 service = display_name(name),
                 process = ctx.process().name(),
@@ -226,6 +224,8 @@ impl SessionHandler for SmSession {
 
 #[cfg(test)]
 mod tests {
+    use lichii_loader::npdm::ServiceAccess;
+
     use super::*;
 
     #[test]
@@ -280,10 +280,13 @@ mod tests {
             client: vec!["fsp-srv".into(), "vi:*".into()],
             server: Vec::new(),
         };
-        let unrestricted = program_image(0x0100_0000_0000_3000);
+        let mut empty = program_image(0x0100_0000_0000_3000);
+        empty.services = ServiceAccess::default();
+        let homebrew = program_image(0x0100_0000_0000_4000);
         for (image, allowed) in [
             (restricted, [true, true, false]),
-            (unrestricted, [true, true, true]),
+            (empty, [false, false, false]),
+            (homebrew, [true, true, true]),
         ] {
             let process = kernel.create_process(&image).unwrap();
             let client = IpcClient::new(&kernel, &process);
