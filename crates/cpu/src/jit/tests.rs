@@ -5,6 +5,7 @@
 //! `LICHII_JIT_CASES` sets the number of streams (default 400).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use lichii_memory::{AddressSpace, ExclusiveMonitor, MemoryPermission, PhysicalMemory};
 
@@ -148,6 +149,22 @@ fn memory(rng: &mut Rng) -> u32 {
     }
 }
 
+/// An LSE `LD<op>`/`SWP` or `CAS` on `X20`..`X23`.
+fn atomic(rng: &mut Rng) -> u32 {
+    loop {
+        let class = if rng.below(4) == 0 {
+            "xx0010001x1xxxxxx11111xxxxxxxxxx"
+        } else {
+            "xx111000xx1xxxxxxxxx00xxxxxxxxxx"
+        };
+        let base = BASES + rng.below(4) as u32;
+        let w = (rng.pattern(class) & !0x3f0) | base << 5;
+        if matches!(decode(w), Inst::AtomicRmw { .. } | Inst::Cas { .. }) {
+            return w;
+        }
+    }
+}
+
 fn simd(rng: &mut Rng) -> u32 {
     rng.pattern("0x00111x0xxxxxxxxxxxx1xxxxxxxxxx")
 }
@@ -175,6 +192,7 @@ fn stream(rng: &mut Rng) -> Vec<u32> {
             0..=7 => alu(rng),
             8..=11 => memory(rng),
             12 => simd(rng),
+            14 => atomic(rng),
             13 => {
                 let to = i + 1 + rng.below((len - i) as u64) as usize;
                 branch(rng, i, to)
@@ -185,11 +203,13 @@ fn stream(rng: &mut Rng) -> Vec<u32> {
         .collect()
 }
 
-struct Clock;
+/// Counts reads, so every `CNTPCT` read returns a new value in program order.
+#[derive(Default)]
+struct Clock(AtomicU64);
 
 impl GuestClock for Clock {
     fn ticks(&self) -> u64 {
-        0
+        self.0.fetch_add(1, Ordering::Relaxed)
     }
 }
 
@@ -219,7 +239,7 @@ impl Machine {
         let config = CpuConfig {
             memory: mem.clone(),
             monitor: Arc::new(ExclusiveMonitor::new(1)),
-            clock: Arc::new(Clock),
+            clock: Arc::new(Clock::default()),
             core_index: 0,
             ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
             dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
@@ -262,8 +282,9 @@ fn initial(rng: &mut Rng) -> ThreadContext {
         tpidr_el0: rng.next(),
         ..Default::default()
     };
+    let align = if rng.below(2) == 0 { !15 } else { !0 };
     for b in 0..4 {
-        ctx.x[(BASES + b) as usize] = DATA + 0x2000 + rng.below(0x4000);
+        ctx.x[(BASES + b) as usize] = (DATA + 0x2000 + rng.below(0x4000)) & align;
     }
     if rng.below(16) == 0 {
         ctx.x[BASES as usize] = match rng.below(4) {
@@ -509,4 +530,55 @@ fn slow_paths_keep_live_registers_of_both_classes() {
         .chain([(20, DATA + 0x200)])
         .collect();
     directed(&code, &regs);
+}
+
+#[test]
+fn zeroing_a_block_matches_the_interpreter() {
+    const DC_ZVA_X2: u32 = 0xd50b_7422;
+    for addr in [
+        DATA + 0x100,
+        DATA + 0x13f,
+        RODATA + 0x40,
+        RODATA + 0x1000,
+        1 << 39,
+        u64::MAX,
+    ] {
+        directed(&[0xd280_0020, DC_ZVA_X2, 0xd280_0040], &[(2, addr)]);
+    }
+}
+
+#[test]
+fn counter_reads_call_the_clock_in_order() {
+    const MRS_X0_CNTPCT: u32 = 0xd53b_e020;
+    const MRS_X1_CNTVCT: u32 = 0xd53b_e041;
+    const LDR_X3_X20: u32 = 0xf940_0283;
+    directed(
+        &[MRS_X0_CNTPCT, LDR_X3_X20, MRS_X1_CNTVCT, 0x8b01_0002],
+        &[(20, DATA + 0x80), (9, 7), (10, 8)],
+    );
+}
+
+#[test]
+fn atomics_fault_like_the_interpreter() {
+    const LDADD_X1_X3_X20: u32 = 0xf821_0283;
+    const CAS_W1_W3_X20: u32 = 0x88a1_7e83;
+    const LDSMAXAB_W1_W3_X20: u32 = 0x38a1_4283;
+    const SWPLH_W1_W3_X20: u32 = 0x7861_8283;
+    for addr in [
+        DATA + 0x100,
+        DATA + 0x101,
+        DATA + 0x104,
+        RODATA + 0x10,
+        RODATA + 0x1000,
+        1 << 39,
+    ] {
+        for access in [
+            LDADD_X1_X3_X20,
+            CAS_W1_W3_X20,
+            LDSMAXAB_W1_W3_X20,
+            SWPLH_W1_W3_X20,
+        ] {
+            directed(&[access], &[(20, addr), (1, 0x8000_0081)]);
+        }
+    }
 }
