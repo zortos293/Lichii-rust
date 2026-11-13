@@ -1,5 +1,6 @@
 //! Draws of hand-assembled Maxwell programs on synthetic 3D engine state.
 
+use ash::vk;
 use lichii_common::settings::{Anisotropy, GraphicsSettings, ResolutionScale};
 use lichii_gpu::backend::{
     ChannelId, ComputeContext, ConstBufferBinding, DrawParams, DrawTexture, GraphicsConstBuffers,
@@ -1946,6 +1947,12 @@ const TABLE: u64 = SSBO + 0x24;
 /// Samples at (0.5, 0.5), into render target 0, the texture whose handle is word 4 of the
 /// table the storage buffer c[0][0x110] points to.
 fn table_sampling_program() -> Vec<u8> {
+    typed_table_sampling_program(2)
+}
+
+/// `table_sampling_program` sampling as TEX texture type `ty` (2: 2D, 3: 2D array, 4: 3D,
+/// 6: cube).
+fn typed_table_sampling_program(ty: u64) -> Vec<u8> {
     let mut header = header(2, ShaderType::PIXEL);
     header[18] = 0xf;
     let ldg = sass(
@@ -1954,7 +1961,7 @@ fn table_sampling_program() -> Vec<u8> {
     );
     let tex = sass(
         Opcode::TexB,
-        (7 << 51) | (0b1111 << 31) | (2 << 28) | (6 << 20) | (2 << 8),
+        (7 << 51) | (0b1111 << 31) | (ty << 28) | (6 << 20) | (2 << 8),
     );
     program(
         header,
@@ -2054,6 +2061,77 @@ fn handle_programs_naming_an_image_of_another_kind_bind_the_null_texture() {
     f.assert_no_validation_errors();
 }
 
+#[test]
+fn null_images_exist_for_every_view_type_and_null_format() {
+    let Some((mut f, _)) = draw_fixture() else {
+        return;
+    };
+    let types = [
+        vk::ImageViewType::TYPE_1D,
+        vk::ImageViewType::TYPE_1D_ARRAY,
+        vk::ImageViewType::TYPE_2D,
+        vk::ImageViewType::TYPE_2D_ARRAY,
+        vk::ImageViewType::TYPE_3D,
+        vk::ImageViewType::CUBE,
+        vk::ImageViewType::CUBE_ARRAY,
+    ];
+    for view_type in types {
+        for format in [
+            vk::Format::R8G8B8A8_UNORM,
+            vk::Format::R8G8B8A8_UINT,
+            vk::Format::D16_UNORM,
+        ] {
+            let depth_3d =
+                format == vk::Format::D16_UNORM && view_type == vk::ImageViewType::TYPE_3D;
+            if depth_3d {
+                continue;
+            }
+            let view = f.rasterizer.null_view(view_type, format).unwrap();
+            assert!(view.is_some(), "{view_type:?} {format:?}");
+            assert_eq!(
+                f.rasterizer.null_view(view_type, format).unwrap(),
+                view,
+                "created once"
+            );
+        }
+    }
+    f.rasterizer.scheduler.finish().unwrap();
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn unbound_textures_of_every_type_read_zeros() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    uniform_texture(&f, 0, TEXTURE, [10, 200, 30, 255]);
+    let regs = sampling_regs();
+    handle_table(&mut f, 0);
+    for (ty, name) in [(3, "2D array"), (4, "3D"), (6, "cube")] {
+        write(
+            &f,
+            PROGRAMS + u64::from(FRAGMENT),
+            &fragment_program([0, 4]),
+        );
+        f.rasterizer
+            .invalidate_region(DADDR + PROGRAMS + u64::from(FRAGMENT), 0x100);
+        draw(&mut f, &gmmu, &regs);
+        assert!(target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]));
+        let program = typed_table_sampling_program(ty);
+        write(&f, PROGRAMS + u64::from(FRAGMENT), &program);
+        f.rasterizer
+            .invalidate_region(DADDR + PROGRAMS + u64::from(FRAGMENT), program.len() as u64);
+        draw(&mut f, &gmmu, &regs);
+        assert!(
+            target(&mut f).iter().all(|&t| t == [0; 4]),
+            "a {name} descriptor naming a 2D image reads the null texture"
+        );
+    }
+    assert_eq!(f.rasterizer.draw.warned & Warning::NullTexture as u32, 0);
+    assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
+    f.assert_no_validation_errors();
+}
+
 /// Stores `handle` as word 4 of the table the storage buffer c[0][0x110] points to.
 fn table_writing_program(handle: u32) -> Vec<u8> {
     let mut header = header(2, ShaderType::PIXEL);
@@ -2124,7 +2202,7 @@ fn handle_programs_read_the_table_words_earlier_gpu_work_wrote() {
 }
 
 #[test]
-fn handle_programs_skip_typeless_image_loads_of_integer_images() {
+fn handle_programs_load_zeros_for_integer_images_under_typeless_loads() {
     let Some((mut f, gmmu)) = draw_fixture() else {
         return;
     };
@@ -2161,11 +2239,17 @@ fn handle_programs_skip_typeless_image_loads_of_integer_images() {
 
     handle_table(&mut f, 1);
     draw(&mut f, &gmmu, &regs);
-    assert_ne!(
-        f.rasterizer.draw.warned & Warning::NullStorageImage as u32,
-        0,
-        "an integer image under the float declaration skips the draw"
-    );
+    let warned = f.rasterizer.draw.warned & Warning::NullStorageImage as u32 != 0;
+    if f.rasterizer.device.features.null_descriptor {
+        assert!(
+            target(&mut f).iter().all(|t| t[..3] == [0; 3]),
+            "an integer image under the float declaration loads from a null descriptor: {:?}",
+            &target(&mut f)[..2]
+        );
+        assert!(!warned);
+    } else {
+        assert!(warned, "without null descriptors the draw is skipped");
+    }
     assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
     f.assert_no_validation_errors();
 }
