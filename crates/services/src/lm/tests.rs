@@ -54,22 +54,30 @@ fn log_packets_parse_into_fields() {
 fn split_messages_are_reassembled() {
     let guest = Guest::new(ConsoleGeneration::Switch2, settings(), super::register);
     let lm = guest.connect("lm");
-    let logger = guest.call(lm, &Request::new(0).arg(0u64).pid()).ok().interface();
+    let logger = guest
+        .call(lm, &Request::new(0).arg(0u64).pid())
+        .ok()
+        .interface();
     guest.call(logger, &Request::new(1).arg(3u32)).ok();
     let text = chunk(2, b"split message");
     for (flags, part) in [(1u8, &text[..5]), (0, &text[5..9]), (2, &text[9..])] {
         let bytes = packet(flags, part);
         let buffer = guest.buffer_with(&bytes);
-        guest.call(logger, &Request::new(0).a(buffer, bytes.len() as u64)).ok();
+        guest
+            .call(logger, &Request::new(0).a(buffer, bytes.len() as u64))
+            .ok();
     }
     assert!(logger_is_idle(&guest, logger));
     let orphan = packet(2, &chunk(2, b"x"));
     let buffer = guest.buffer_with(&orphan);
-    guest.call(logger, &Request::new(0).x(buffer, orphan.len() as u64)).ok();
+    guest
+        .call(logger, &Request::new(0).x(buffer, orphan.len() as u64))
+        .ok();
     let short = guest.buffer_with(&[0; 4]);
     guest.call(logger, &Request::new(0).a(short, 4)).ok();
 }
 
 fn logger_is_idle(guest: &Guest, logger: u32) -> bool {
-    guest.call(logger, &Request::new(2)).result == 0 && guest.call(logger, &Request::new(3)).result == 0
+    guest.call(logger, &Request::new(2)).result == 0
+        && guest.call(logger, &Request::new(3)).result == 0
 }

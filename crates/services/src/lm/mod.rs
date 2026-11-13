@@ -80,10 +80,14 @@ impl Default for Logger {
 impl Logger {
     fn log(&self, packet: &[u8]) {
         let Some((header, payload)) = packet.split_at_checked(HEADER_SIZE) else {
-            tracing::error!(size = packet.len(), "lm: log packet shorter than its header");
+            tracing::error!(
+                size = packet.len(),
+                "lm: log packet shorter than its header"
+            );
             return;
         };
-        let u64_at = |offset: usize| u64::from_le_bytes(header[offset..offset + 8].try_into().unwrap());
+        let u64_at =
+            |offset: usize| u64::from_le_bytes(header[offset..offset + 8].try_into().unwrap());
         let flags = header[0x10];
         let sender = Sender {
             pid: u64_at(0),
@@ -103,7 +107,11 @@ impl Logger {
         if flags & TAIL != 0
             && let Some(message) = pending.remove(&sender)
         {
-            emit(sender, self.destination.load(Ordering::Relaxed), &parse(&message));
+            emit(
+                sender,
+                self.destination.load(Ordering::Relaxed),
+                &parse(&message),
+            );
         }
     }
 }
@@ -117,7 +125,10 @@ impl Service for Logger {
         match ctx.command() {
             0 => match ctx.read_buffer(0) {
                 Ok(packet) => self.log(&packet),
-                Err(code) => tracing::error!(code = format_args!("{:#x}", code.0), "lm: unreadable log packet"),
+                Err(code) => tracing::error!(
+                    code = format_args!("{:#x}", code.0),
+                    "lm: unreadable log packet"
+                ),
             },
             1 => self.destination.store(ctx.pop(), Ordering::Relaxed),
             2 | 3 => {}

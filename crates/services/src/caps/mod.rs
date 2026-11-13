@@ -101,17 +101,29 @@ mod tests {
         let count = |request: Request| guest.call(a, &request.b(list, 0x100)).ok().get::<u64>(0);
         assert_eq!(count(Request::new(1).arg(1u8)), 0);
         assert_eq!(count(Request::new(101).arg(1u8).arg(0u8)), 0);
-        assert_eq!(guest.call(a, &Request::new(5).arg(1u8)).ok().get::<u8>(0), 1);
+        assert_eq!(
+            guest.call(a, &Request::new(5).arg(1u8)).ok().get::<u8>(0),
+            1
+        );
         let nand_and_sd = guest.call(a, &Request::new(5).arg(0u8)).ok();
         assert_eq!(nand_and_sd.get::<u8>(0), 1);
-        assert_eq!(guest.call(a, &Request::new(5).arg(2u8)).result, INVALID_STORAGE.0);
+        assert_eq!(
+            guest.call(a, &Request::new(5).arg(2u8)).result,
+            INVALID_STORAGE.0
+        );
         assert_eq!(guest.call(a, &Request::new(18)).ok().get::<u32>(0), 0);
         assert_eq!(guest.call(a, &Request::new(401)).ok().get::<u8>(0), 0);
         assert_eq!(guest.call(a, &Request::new(50011)).ok().get::<u32>(0), 0);
         assert_eq!(guest.call(a, &Request::new(3)).result, FILE_NOT_FOUND.0);
         let u = guest.connect("caps:u");
         guest.call(u, &Request::new(32).arg(1u64).pid()).ok();
-        assert_eq!(guest.call(u, &Request::new(142).b(list, 0x100)).ok().get::<u64>(0), 0);
+        assert_eq!(
+            guest
+                .call(u, &Request::new(142).b(list, 0x100))
+                .ok()
+                .get::<u64>(0),
+            0
+        );
         assert_eq!(guest.call(u, &Request::new(104)).ok().data, [0; 128]);
         guest.call(guest.connect("caps:c"), &Request::new(33)).ok();
         guest.connect("caps:sc");
@@ -121,9 +133,16 @@ mod tests {
     fn screenshots_are_accepted() {
         let guest = Guest::new(ConsoleGeneration::Switch2, settings(), super::register);
         let image = guest.buffer(0x1000);
-        for (service, command) in [("caps:su", 203), ("caps:su", 205), ("caps:ss", 203), ("caps:ss", 206)] {
+        for (service, command) in [
+            ("caps:su", 203),
+            ("caps:su", 205),
+            ("caps:ss", 203),
+            ("caps:ss", 206),
+        ] {
             let handle = guest.connect(service);
-            let entry = guest.call(handle, &Request::new(command).a(image, 0x1000)).ok();
+            let entry = guest
+                .call(handle, &Request::new(command).a(image, 0x1000))
+                .ok();
             assert_eq!(entry.data, [0; 0x20]);
         }
         let su = guest.connect("caps:su");

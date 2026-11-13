@@ -34,6 +34,7 @@
 //! }
 //! ```
 
+mod acc;
 mod apm;
 mod caps;
 mod context;
@@ -43,8 +44,10 @@ mod eupld;
 mod lm;
 mod pctl;
 mod prepo;
+mod set;
 #[cfg(test)]
 mod testing;
+mod time;
 
 use std::sync::Arc;
 
@@ -63,5 +66,8 @@ pub fn register_all(context: &Arc<ServiceContext>) -> HleResult<()> {
     erpt::register(context)?;
     eupld::register(context)?;
     caps::register(context)?;
+    set::register(context)?;
+    acc::register(context)?;
+    time::register(context)?;
     Ok(())
 }

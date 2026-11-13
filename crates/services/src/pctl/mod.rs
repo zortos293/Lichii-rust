@@ -54,7 +54,9 @@ impl Service for Factory {
 
     fn handle(&self, ctx: &mut HleRequestContext) -> Option<ResultCode> {
         match ctx.command() {
-            0 | 1 => ctx.push_interface(self.context.handler(ParentalControl::new(self.capability))),
+            0 | 1 => {
+                ctx.push_interface(self.context.handler(ParentalControl::new(self.capability)))
+            }
             _ => return None,
         }
         Some(ResultCode::SUCCESS)

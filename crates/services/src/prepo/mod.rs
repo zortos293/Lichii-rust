@@ -28,14 +28,24 @@ impl PlayReport {
             .buffers_a()
             .first()
             .filter(|buffer| buffer.size != 0)
-            .and_then(|buffer| ctx.memory().read_cstring(buffer.address, buffer.size.min(0x40) as usize).ok())
+            .and_then(|buffer| {
+                ctx.memory()
+                    .read_cstring(buffer.address, buffer.size.min(0x40) as usize)
+                    .ok()
+            })
             .unwrap_or_default();
-        let size = |buffers: &[lichii_kernel::ipc::BufferDescriptor]| buffers.first().map_or(0, |b| b.size);
+        let size = |buffers: &[lichii_kernel::ipc::BufferDescriptor]| {
+            buffers.first().map_or(0, |b| b.size)
+        };
         tracing::debug!(
             service = self.name,
             kind,
             event,
-            user = format_args!("{:016x}{:016x}", user.unwrap_or_default()[1], user.unwrap_or_default()[0]),
+            user = format_args!(
+                "{:016x}{:016x}",
+                user.unwrap_or_default()[1],
+                user.unwrap_or_default()[0]
+            ),
             id = format_args!("{id:#x}"),
             a = size(ctx.buffers_a()),
             x = size(ctx.buffers_x()),
@@ -102,14 +112,34 @@ mod tests {
         let event = guest.buffer_with(b"test_event\0");
         let data = guest.buffer_with(&[0x80]);
         for command in [10100, 10102, 10104, 10106] {
-            let request = Request::new(command).arg(0u64).pid().a(event, 11).x(data, 1);
+            let request = Request::new(command)
+                .arg(0u64)
+                .pid()
+                .a(event, 11)
+                .x(data, 1);
             guest.call(prepo, &request).ok();
         }
-        let with_user = Request::new(10107).arg([1u64, 2]).arg(0u64).pid().a(event, 11).x(data, 1);
+        let with_user = Request::new(10107)
+            .arg([1u64, 2])
+            .arg(0u64)
+            .pid()
+            .a(event, 11)
+            .x(data, 1);
         guest.call(prepo, &with_user).ok();
-        guest.call(prepo, &Request::new(20103).arg(0u64).arg([1u64, 2]).arg(0x0100u64)).ok();
+        guest
+            .call(
+                prepo,
+                &Request::new(20103).arg(0u64).arg([1u64, 2]).arg(0x0100u64),
+            )
+            .ok();
         guest.call(prepo, &Request::new(10200)).ok();
-        assert_eq!(guest.call(prepo, &Request::new(10300)).ok().get::<i32>(0), 0);
-        assert_eq!(guest.call(prepo, &Request::new(10400)).ok().get::<u64>(0), 0);
+        assert_eq!(
+            guest.call(prepo, &Request::new(10300)).ok().get::<i32>(0),
+            0
+        );
+        assert_eq!(
+            guest.call(prepo, &Request::new(10400)).ok().get::<u64>(0),
+            0
+        );
     }
 }

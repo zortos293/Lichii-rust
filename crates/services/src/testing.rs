@@ -43,7 +43,9 @@ impl CpuCore for MockCore {
                         return HaltReason::SupervisorCall(svc);
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => std::thread::sleep(Duration::from_millis(1)),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    std::thread::sleep(Duration::from_millis(1))
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
         }
@@ -124,7 +126,9 @@ impl Request {
 
     fn encode(&self) -> Vec<u32> {
         let mut w = vec![
-            4 | (self.x.len() as u32) << 16 | (self.a.len() as u32) << 20 | (self.b.len() as u32) << 24,
+            4 | (self.x.len() as u32) << 16
+                | (self.a.len() as u32) << 20
+                | (self.b.len() as u32) << 24,
             0,
         ];
         if self.pid {
@@ -154,7 +158,12 @@ impl Request {
         w.extend([SFCI, 0, self.command, 0]);
         let mut data = self.data.clone();
         data.resize(data.len().next_multiple_of(4), 0);
-        w.extend(data.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)));
+        w.extend(
+            data.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c)),
+        );
         w[1] = (w.len() - raw_start) as u32 | u32::from(self.pid) << 31;
         w
     }
@@ -185,7 +194,8 @@ impl Reply {
         }
         let header = at.next_multiple_of(4);
         let data_words = raw - 8;
-        let data = bytemuck::cast_slice::<u32, u8>(&words[header + 4..header + 4 + data_words]).to_vec();
+        let data =
+            bytemuck::cast_slice::<u32, u8>(&words[header + 4..header + 4 + data_words]).to_vec();
         Self {
             result: words[header + 2],
             data,
@@ -313,7 +323,9 @@ impl Guest {
 
     pub fn write(&self, address: VAddr, data: &[u8]) {
         let data = data.to_vec();
-        self.on_guest(None, move |_, memory| memory.write_bytes(address, &data).unwrap());
+        self.on_guest(None, move |_, memory| {
+            memory.write_bytes(address, &data).unwrap()
+        });
     }
 
     pub fn read(&self, address: VAddr, len: usize) -> Vec<u8> {

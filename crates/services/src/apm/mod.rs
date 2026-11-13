@@ -69,7 +69,10 @@ impl Controller {
             return;
         };
         if !CONFIGURATIONS.contains(&configuration) {
-            tracing::warn!(configuration = format_args!("{configuration:#x}"), "apm: unknown performance configuration");
+            tracing::warn!(
+                configuration = format_args!("{configuration:#x}"),
+                "apm: unknown performance configuration"
+            );
             return;
         }
         self.configurations.lock()[slot] = configuration;
