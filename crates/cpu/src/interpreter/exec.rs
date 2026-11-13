@@ -1146,7 +1146,7 @@ pub(crate) unsafe fn atomic_cas(ptr: *mut u8, size: u8, expected: u64, new: u64)
 
 /// # Safety
 /// `ptr` must be valid for 16 bytes and 16-byte aligned.
-unsafe fn cas128(ptr: *mut u8, expected: u128, new: u128) -> u128 {
+pub(crate) unsafe fn cas128(ptr: *mut u8, expected: u128, new: u128) -> u128 {
     // SAFETY: guaranteed by the caller.
     let a = unsafe { portable_atomic::AtomicU128::from_ptr(ptr.cast()) };
     a.compare_exchange(expected, new, Ordering::SeqCst, Ordering::SeqCst)
