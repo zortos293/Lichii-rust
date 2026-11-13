@@ -96,6 +96,8 @@ pub static BLOCK_LINEAR_UNSWIZZLE_COMP: &[u32] = spirv!("block_linear_unswizzle.
 pub static INDIRECT_ASSEMBLE_COMP: &[u32] = spirv!("indirect_assemble.comp");
 /// `dispatch_grid.comp`: The packed grid words of a version 1.x launch descriptor as a `VkDispatchIndirectCommand`, clamped to the device's workgroup count limits; one invocation.
 pub static DISPATCH_GRID_COMP: &[u32] = spirv!("dispatch_grid.comp");
+/// `mesh_indirect.comp`: The guest commands of an indirect task/mesh draw as `VkDrawMeshTasksIndirectCommandEXT`s launching their first word's groups, clamped to the device's limit; one invocation a command.
+pub static MESH_INDIRECT_COMP: &[u32] = spirv!("mesh_indirect.comp");
 /// `clear.vert`: Fullscreen triangle from `gl_VertexIndex` 0..2 with no outputs, for masked clears.
 pub static CLEAR_VERT: &[u32] = spirv!("clear.vert");
 /// `clear_float.frag`: Writes the push constant `vec4` to a float or normalized colour target at location 0.
@@ -131,6 +133,7 @@ pub static ALL: &[(&str, &[u32])] = &[
     ("block_linear_unswizzle.comp", BLOCK_LINEAR_UNSWIZZLE_COMP),
     ("indirect_assemble.comp", INDIRECT_ASSEMBLE_COMP),
     ("dispatch_grid.comp", DISPATCH_GRID_COMP),
+    ("mesh_indirect.comp", MESH_INDIRECT_COMP),
     ("clear.vert", CLEAR_VERT),
     ("clear_float.frag", CLEAR_FLOAT_FRAG),
     ("clear_uint.frag", CLEAR_UINT_FRAG),
