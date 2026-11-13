@@ -43,6 +43,10 @@ pub(super) struct JitState {
     save_gpr: [u64; 16],
     /// The high half of the last 128-bit exclusive load or compare-and-swap.
     high: u64,
+    /// The highest counter an inline read on this core returned. Host cores' TSCs can disagree
+    /// by a few cycles, so after the OS moves this core's thread to a lagging one, reads stay here
+    /// until the counter passes it instead of stepping back.
+    counter_floor: u64,
     /// The registers a `cmpxchg16b` borrows while it runs.
     cx16_save: [u64; 2],
     spill: [u128; SPILL_SLOTS],
@@ -319,6 +323,7 @@ impl Jit {
             save_xmm: [0; 16],
             save_gpr: [0; 16],
             high: 0,
+            counter_floor: 0,
             cx16_save: [0; 2],
             spill: [0; SPILL_SLOTS],
             memory: &*config.memory,

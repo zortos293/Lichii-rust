@@ -1,4 +1,4 @@
-//! bsd and sfdnsres with no host network.
+//! bsd, sfdnsres and nsd with no host network.
 
 use std::sync::{Arc, Mutex};
 
@@ -8,6 +8,7 @@ use lichii_kernel::Event;
 use crate::ServiceContext;
 
 mod bsd;
+mod nsd;
 mod sfdnsres;
 
 pub(crate) fn register(context: &Arc<ServiceContext>) -> HleResult<()> {
@@ -20,6 +21,9 @@ pub(crate) fn register(context: &Arc<ServiceContext>) -> HleResult<()> {
             descriptors: descriptors.clone(),
             stub_event: stub_event.clone(),
         })?;
+    }
+    for name in ["nsd:u", "nsd:a"] {
+        context.register(name, "bsdsocket", move |_| nsd::Nsd { name })?;
     }
     context.register("sfdnsres", "bsdsocket", |_| sfdnsres::Sfdnsres)
 }

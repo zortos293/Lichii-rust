@@ -553,6 +553,7 @@ fn visit_usages(info: &mut ShaderInfo, prog: &Program, id: InstId) {
         | BindlessImageFetch
         | BindlessImageQueryDimensions
         | BindlessImageQueryLod
+        | BindlessImageQuerySamples
         | BindlessImageGradient
         | BoundImageSampleImplicitLod
         | BoundImageSampleExplicitLod
@@ -563,11 +564,13 @@ fn visit_usages(info: &mut ShaderInfo, prog: &Program, id: InstId) {
         | BoundImageFetch
         | BoundImageQueryDimensions
         | BoundImageQueryLod
+        | BoundImageQuerySamples
         | BoundImageGradient
         | ImageGather
         | ImageGatherDref
         | ImageFetch
         | ImageQueryDimensions
+        | ImageQuerySamples
         | ImageGradient => {
             info.uses_sampled_1d |= is_1d(texture.ty);
             info.uses_sparse_residency |= sparse();
