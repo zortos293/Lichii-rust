@@ -1,8 +1,9 @@
 //! Finding the shared fonts on the host and laying them out the way `pl:u` serves them. Fonts
-//! are never bundled: they come from the user's NAND system archives (with their keys) or from
-//! font files in `<data>/fonts`, where `<data>` is the parent of the NAND directory.
+//! come from the user's NAND system archives (with their keys) or from font files in
+//! `<data>/fonts`, where `<data>` is the parent of the NAND directory. When neither has any,
+//! `pl:u` serves the open-source stand-ins the reference synthesizes (`fallback/README.md`).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use lichii_common::paths::UserPaths;
 use lichii_common::settings::Settings;
@@ -30,11 +31,24 @@ const DECRYPTED_MAGIC: u32 = 0x7f9a_0218;
 /// The key BFTTF files are XORed with: `BFTTF_MAGIC ^ DECRYPTED_MAGIC`.
 pub(super) const FONT_KEY: u32 = BFTTF_MAGIC ^ DECRYPTED_MAGIC;
 
+/// Each font type's stand-in: Open Sans, Source Sans Pro and yuzu's button icon font. They draw
+/// Latin text and the button icons, so titles that wait for their fonts keep going.
+pub(super) const STAND_INS: [&[u8]; FONT_COUNT] = [
+    include_bytes!("fallback/standard.ttf"),
+    include_bytes!("fallback/chinese_simplified_korean.ttf"),
+    include_bytes!("fallback/extended_chinese_simplified.ttf"),
+    include_bytes!("fallback/chinese_traditional.ttf"),
+    include_bytes!("fallback/chinese_simplified_korean.ttf"),
+    include_bytes!("fallback/nintendo_extended.ttf"),
+    include_bytes!("fallback/nintendo_extended.ttf"),
+];
+
 /// Plain TrueType/OpenType data of each font type, `None` when the font was not found.
 pub(super) type FontData = [Option<Vec<u8>>; FONT_COUNT];
 
-/// Looks for every font: first in the NAND system archives, then in the fonts directory.
-pub(super) fn find(settings: &Settings) -> (FontData, Vec<PathBuf>) {
+/// Looks for every font: first in the NAND system archives, then in the fonts directory. Without
+/// any font in either, every type gets its stand-in.
+pub(super) fn find(settings: &Settings) -> FontData {
     let nand = settings
         .paths
         .nand_dir
@@ -50,7 +64,14 @@ pub(super) fn find(settings: &Settings) -> (FontData, Vec<PathBuf>) {
     let mut fonts: FontData = Default::default();
     from_system_archives(&registered, &keys, &mut fonts);
     from_font_files(&fonts_dir, &mut fonts);
-    (fonts, vec![registered, fonts_dir])
+    if fonts.iter().all(Option::is_none) {
+        tracing::warn!(
+            searched = ?[registered, fonts_dir],
+            "no shared fonts found: pl:u serves open-source stand-ins"
+        );
+        return STAND_INS.map(|font| Some(font.to_vec()));
+    }
+    fonts
 }
 
 fn from_system_archives(registered: &Path, keys_dir: &Path, fonts: &mut FontData) {

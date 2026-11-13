@@ -8,7 +8,7 @@ use lichii_kernel::object::KObject;
 use lichii_kernel::testing::{IpcClient, Reply, Request};
 use lichii_memory::MemoryPermission;
 
-use super::fonts::{FONT_KEY, decrypt_bfttf};
+use super::fonts::{FONT_KEY, STAND_INS, decrypt_bfttf};
 use super::*;
 use crate::testing::{SWITCH1_TITLE, SWITCH2_TITLE, context};
 
@@ -303,25 +303,25 @@ fn switch_2_standard_font_gets_the_button_icons() {
 }
 
 #[test]
-fn without_fonts_serves_empty_well_formed_memory() {
-    let dir = TempDir::new("empty");
-    let (_context, client, pl) = boot(SWITCH1_TITLE, &dir);
-    for font_type in 0..7u32 {
-        let size: u32 = get(&send(&client, pl, Request::new(2).arg(font_type)), 0);
-        assert_eq!(size, 0);
+fn without_fonts_serves_the_open_source_stand_ins() {
+    let dir = TempDir::new("stand-ins");
+    let (_context, client, pl) = boot(SWITCH2_TITLE, &dir);
+    for (font_type, font) in STAND_INS.iter().enumerate() {
+        let size: u32 = get(&send(&client, pl, Request::new(2).arg(font_type as u32)), 0);
+        assert_eq!(size, font.len() as u32);
     }
     let handle = send(&client, pl, Request::new(4)).copy_handles[0];
     let memory = shared_memory(&client, handle);
-    assert_eq!(memory.size(), SHARED_FONT_MEMORY_SIZE);
-    assert_eq!(read(&memory, 0, 32), [0; 32]);
+    let header: Vec<u32> = bytemuck::pod_collect_to_vec(&read(&memory, 0, 8));
+    assert_eq!(header, [0x1802_9a7f, STAND_INS[0].len() as u32 ^ FONT_KEY]);
+    assert_eq!(read(&memory, 8, STAND_INS[0].len()), STAND_INS[0]);
 
-    let (loaded, count, _) = priority_list(&client, pl);
-    assert_eq!((loaded, count), (1, 0));
-    assert_eq!(
-        font_data(&client, pl, Request::new(2010).arg(0u32)),
-        (0, 0, 0)
-    );
-    let reply = send(&client, pl, Request::new(2000));
-    assert_eq!(get::<u32>(&reply, 0), 0x1000);
-    assert_eq!(shared_memory(&client, reply.copy_handles[0]).size(), 0x1000);
+    let (loaded, count, [codes, ..]) = priority_list(&client, pl);
+    assert_eq!((loaded, count), (1, 6));
+    assert_eq!(codes, [0, 1, 2, 3, 4, 5]);
+    for font_type in 0..7u32 {
+        let (found, _, size) = font_data(&client, pl, Request::new(2010).arg(font_type));
+        assert_eq!(found, 1, "font type {font_type} is found");
+        assert_ne!(size, 0);
+    }
 }
