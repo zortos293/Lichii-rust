@@ -23,7 +23,7 @@ use crate::choices::Choice;
 use crate::cli::Cli;
 use crate::config::{ConfigEnv, ConfigWindow};
 use crate::display::Display;
-use crate::game_list::GameList;
+use crate::game_list::{self, GameList, ScanSources};
 use crate::hotkeys::{self, HotkeyMap};
 use crate::input_worker::{InputEvent, InputMsg, InputWorker};
 use crate::session::Session;
@@ -194,10 +194,15 @@ impl App {
 
     fn refresh_games(&mut self) {
         let proxy = self.proxy.clone();
-        self.games
-            .refresh(self.settings.paths.game_dirs.clone(), move || {
-                let _ = proxy.send_event(UserEvent::Wake);
-            });
+        let sources = ScanSources {
+            dirs: self.settings.paths.game_dirs.clone(),
+            keys_dir: setup::keys_dir(&self.settings.paths, &self.paths),
+            cache_dir: self.paths.cache_dir.join("game_list"),
+            language: game_list::nacp_language(self.settings.system.language),
+        };
+        self.games.refresh(sources, move || {
+            let _ = proxy.send_event(UserEvent::Wake);
+        });
     }
 
     fn save_settings(&self) {
@@ -412,7 +417,8 @@ Dump prod.keys and title.keys \
     }
 
     /// Draws the keys and firmware window when it is open; a changed folder is saved, and
-    /// follows into an open configuration window's draft.
+    /// follows into an open configuration window's draft. New keys rescan the game list, since
+    /// encrypted titles only show their names once they can be opened.
     pub(crate) fn show_setup(&mut self, ctx: &egui::Context) {
         let Some(window) = &mut self.setup else {
             return;
@@ -429,6 +435,9 @@ Dump prod.keys and title.keys \
                 }
             }
             self.save_settings();
+        }
+        if out.keys_changed {
+            self.refresh_games();
         }
         if out.closed {
             self.setup = None;
