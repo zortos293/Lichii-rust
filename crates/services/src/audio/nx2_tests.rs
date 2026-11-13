@@ -26,7 +26,7 @@ use lichii_kernel::memory_objects::TransferMemory;
 use lichii_kernel::object::KObject;
 use lichii_kernel::testing::{IpcClient, Reply, Request};
 use lichii_kernel::{Event, Kernel};
-use lichii_memory::MemoryPermission;
+use lichii_memory::{DeviceAddressSpace, MemoryPermission};
 
 use super::{Audio, DEVICE_NAME_SIZE};
 
@@ -46,6 +46,7 @@ struct Harness {
     kernel: Kernel,
     audio: Arc<Audio>,
     client: IpcClient,
+    device: Arc<DeviceAddressSpace>,
     heap: u64,
     transfer_end: AtomicU64,
 }
@@ -68,6 +69,7 @@ fn harness() -> Harness {
     Harness {
         kernel: context.kernel.clone(),
         audio,
+        device: context.gpu.host1x().memory.clone(),
         client,
         heap,
         transfer_end: AtomicU64::new(0),
@@ -440,6 +442,11 @@ fn sysmix_pumps_a_stereo_s16_ring_into_the_host_stream() {
     h.write(ring + 0x1004, &QUEUED.to_le_bytes());
     assert_eq!(open_stream(&h, stream, 2, 2), ResultCode::SUCCESS);
     assert_eq!(h.ok(stream, Request::new(2)).pop::<u32>(), 1, "open");
+    const DADDR: u64 = 0x1_0000_0000;
+    h.device
+        .map_process(DADDR, h.client.process().memory(), ring, 0x1000)
+        .unwrap();
+    let cursors = h.device.cache_pages(DADDR, 0x1000);
 
     let threshold = 480i32;
     let reply = h.ok(stream, Request::new(7).arg(2u32).arg(threshold));
@@ -479,6 +486,11 @@ fn sysmix_pumps_a_stereo_s16_ring_into_the_host_stream() {
         QUEUED,
         "the service moved the read cursor"
     );
+    let mut reported = Vec::new();
+    h.device
+        .take_cpu_writes(|daddr, size| reported.push((daddr, size)));
+    assert_eq!(reported, [(DADDR, 0x1000)], "the cursor write was tracked");
+    drop(cursors);
     assert!(data.is_signaled(), "the free space reached the threshold");
 
     assert_eq!(

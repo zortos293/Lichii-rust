@@ -940,14 +940,16 @@ impl Manager {
                     .write_bytes(entry, bytemuck::bytes_of(&completion))
                     .is_ok()
                 && guest_word(memory, self.ring + RING_PRODUCER).is_ok_and(|producer| {
-                    producer
+                    let swapped = producer
                         .compare_exchange(
                             current,
                             (current + 1) % capacity,
                             Ordering::Release,
                             Ordering::Relaxed,
                         )
-                        .is_ok()
+                        .is_ok();
+                    memory.report_write(producer.as_ptr().cast());
+                    swapped
                 });
             if !published {
                 state.faulted = true;

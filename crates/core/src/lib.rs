@@ -181,6 +181,7 @@ impl System {
         );
 
         let gpu = Self::start_gpu(&kernel, &program, &timing, renderer);
+        gpu.host1x().memory.attach_process(process.memory().clone());
         let audio = Arc::new(Sink::new(&settings.audio));
         let services = ServiceContext::new(ServiceParts {
             kernel: kernel.clone(),
