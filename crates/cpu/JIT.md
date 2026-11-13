@@ -111,9 +111,12 @@ The lowered FP arithmetic (`FADD`, `FSUB`, `FMUL`, `FDIV`, the fused multiply-ad
 
 The fallback is an out-of-line slow path. It runs the original instruction through `CallSimd` and reloads the destination from the context. Because a checked op can fall back, it commits pending writes the same way an op that can exit does. The JIT never reads the MXCSR exception flags: under these conditions they would only repeat what FPSR already holds. Its control bits do matter, so `Jit::run` holds MXCSR at the default 0x1f80 (round to nearest, every exception masked, no FTZ or DAZ) while guest code runs, and restores the caller's value on exit. FZ titles need input and output denormal checks to stay native; that is future work.
 
+Vector integer ops are exact on the host, so they are lowered without checks: three-same `ADD`, `SUB`, the bitwise ops, `CMEQ`/`CMGT`/`CMGE`/`CMHI`/`CMHS`, `MUL` on H and S, compares against zero, shifts by immediate, `MOVI`/`MVNI` and the `ORR`/`BIC` immediates, `DUP`, `INS`, `UMOV` and `SMOV`. Forms that need SSE4.1 or SSE4.2 (D compares, unsigned H/S compares, `MUL` on S, `INS` on B and S) are chosen at translate time and stay on `CallSimd` when the host lacks them; byte shifts, `SSHR .2D` and `CMHI`/`CMHS` on D always do. `LD1`/`ST1` with one to four registers become plain vector loads and stores. All loads come before any register write and the base writeback comes last, which matches the interpreter on a fault because `AddressSpace` splits a page-crossing access at the page and reports the first bad byte.
+
 | Loop (`benches/cpu.rs`, 2M iterations) | Interpreter | JIT before J4 (block ends at SIMD) | JIT with `CallSimd` | JIT native |
 |---|---|---|---|---|
 | `scalar fp loop` (LDR S, FMUL, FADD, FMADD, FSUB, FCMP, FCSEL, FCVT, STR D) | 77 MIPS | 67 MIPS | 89 MIPS | ~1,450 MIPS |
+| `vector int loop` (LD1, ADD, SUB, EOR, CMGT, USHR, DUP, UMOV, ST1) | 50 MIPS | 49 MIPS | 73 MIPS | ~2,750 MIPS |
 
 ## Accuracy settings
 
@@ -132,7 +135,7 @@ The fallback is an out-of-line slow path. It runs the original instruction throu
 1. **J1**: the IR, the translator for integer, branch and plain load/store `Inst`s, passes 1-4, the x64 backend with linear-scan allocation, the entry trampoline, unlinked dispatch, fastmem loads and stores with the bounds check, the fastmem fault handler and slow paths, and the interpreter fallback for everything else. Until J3 the code cache is one read-write-execute region. It must pass the JIT-vs-interpreter suite, fault paths included.
 2. **J2**: host atomics (`LD<op>`, `SWP`, `CAS`) as single lock-prefixed instructions, `DC ZVA`, and `MRS CNTPCT` through a helper call. `CASP`, inline exclusives and the inline counter follow with the monitor-slot and `host_tsc_scale` contract PRs; until then they run on the interpreter.
 3. **J3**: direct linking, the fast indirect table, the interrupt check at block entry and the dual-mapped code cache with invalidation. This is the main throughput step. The planned RSB was measured and left out (see Indirect branches).
-4. **J4**: `CallSimd` mid-block instead of falling back, the flags/condition peephole (pass 5), and native lowering of checked scalar FP arithmetic (see SIMD and floating point).
+4. **J4**: `CallSimd` mid-block instead of falling back, the flags/condition peephole (pass 5), native lowering of checked scalar FP arithmetic, and native vector integer ops, element moves and `LD1`/`ST1` (see SIMD and floating point).
 5. **J5**: native lowering for the hottest SIMD/FP ops, measured on real titles, in agreement with the SIMD crew, since they own the semantics.
 
 ## Contract proposals (for the Captain; not needed for J1)
