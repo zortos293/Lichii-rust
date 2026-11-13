@@ -221,7 +221,7 @@ pub struct MetadataCache {
 impl MetadataCache {
     pub fn new(dir: PathBuf, keys_dir: &Path) -> Self {
         let mut bytes = keys_dir.to_string_lossy().into_owned().into_bytes();
-        for name in ["prod.keys", "title.keys"] {
+        for name in ["prod.keys", "console.keys", "title.keys"] {
             let (size, modified) = file_time(&keys_dir.join(name)).unwrap_or_default();
             bytes.extend(size.to_le_bytes());
             bytes.extend(modified.to_le_bytes());
