@@ -401,6 +401,17 @@ fn transfer_memory_storages_read_and_write_the_titles_memory_in_place() {
         client.send(creator, &create(true, 0)).unwrap().result,
         ResultCode(u32::MAX)
     );
+    for size in [0x1001, i64::MAX] {
+        assert_eq!(
+            client.send(creator, &create(true, size)).unwrap().result,
+            ResultCode(u32::MAX),
+            "larger than the transfer memory"
+        );
+    }
+    assert_eq!(
+        client.send(creator, &create(true, 0x1000)).unwrap().result,
+        ResultCode::SUCCESS
+    );
     let no_handle = Request::new(11).arg(1u8).arg(0x100i64);
     assert_eq!(
         client.send(creator, &no_handle).unwrap().result,

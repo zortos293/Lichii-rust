@@ -259,6 +259,14 @@ impl Service for LibraryAppletCreator {
                 let Ok(memory) = ctx.copy_handle::<TransferMemory>(0) else {
                     return Some(UNKNOWN);
                 };
+                if size as u64 > memory.size() {
+                    tracing::warn!(
+                        size,
+                        lent = memory.size(),
+                        "storage larger than its transfer memory"
+                    );
+                    return Some(UNKNOWN);
+                }
                 let data = StorageData::transfer_memory(
                     memory,
                     size as usize,
