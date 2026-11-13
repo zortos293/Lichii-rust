@@ -1,5 +1,6 @@
 //! Guest time for one session: the CPU's system counter, frozen while the session is paused.
 
+use std::cell::Cell;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering, fence};
 use std::time::{Duration, Instant};
@@ -11,6 +12,13 @@ use parking_lot::Mutex;
 
 const RUNNING: u64 = u64::MAX;
 const SHIFT: u32 = 63;
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    /// The id of the [`CoreTiming`] this thread last read and the guest time it returned.
+    static LATEST: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+}
 
 /// Guest time counted from a host TSC the OS keeps synchronized across cores, so the JIT can
 /// read the counter inline.
@@ -113,11 +121,14 @@ fn read_tsc() -> Option<u64> {
     let mut core = 0;
     // SAFETY: callers read the TSC only where `tsc_is_usable` holds, so `rdtscp` exists; it and
     // `lfence` touch no memory but `core`.
-    Some(unsafe {
+    let tsc = unsafe {
         let tsc = __rdtscp(&mut core);
         _mm_lfence();
         tsc
-    })
+    };
+    #[cfg(test)]
+    let tsc = tsc + tests::SKEW.get();
+    Some(tsc)
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -132,6 +143,7 @@ fn read_tsc() -> Option<u64> {
 /// with an invariant TSC, the host clock is the TSC, so the JIT's inline counter reads through
 /// [`GuestClock::host_tsc_scale`] agree with [`GuestClock::ticks`].
 pub struct CoreTiming {
+    id: u64,
     start: Instant,
     tsc: Option<TscClock>,
     counter_hz: u64,
@@ -155,6 +167,7 @@ impl CoreTiming {
             ConsoleGeneration::Switch2 => 31_250_000,
         };
         Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             start: Instant::now(),
             tsc: tsc_hz.and_then(|hz| TscClock::new(counter_hz, hz)),
             counter_hz,
@@ -176,8 +189,23 @@ impl CoreTiming {
         (u128::from(ns) * u128::from(self.counter_hz) / 1_000_000_000) as u64
     }
 
-    /// Guest nanoseconds since boot.
+    /// Guest nanoseconds since boot, never less than what this thread read before. Host cores'
+    /// TSCs can disagree by a few cycles, so after the thread moves to a core whose TSC lags, or
+    /// after `pause` freezes time at another core's reading, the clock can sit just behind a time
+    /// this thread already returned.
     pub fn global_time_ns(&self) -> u64 {
+        let now = self.read_ns();
+        LATEST.with(|latest| {
+            let now = match latest.get() {
+                (id, time) if id == self.id => now.max(time),
+                _ => now,
+            };
+            latest.set((self.id, now));
+            now
+        })
+    }
+
+    fn read_ns(&self) -> u64 {
         loop {
             let before = self.sequence.load(Ordering::Acquire);
             if before & 1 == 0 {
@@ -274,6 +302,11 @@ mod tests {
 
     use super::*;
 
+    thread_local! {
+        /// Cycles this thread's TSC reads run ahead, standing in for a core whose TSC is skewed.
+        pub(super) static SKEW: Cell<u64> = const { Cell::new(0) };
+    }
+
     #[test]
     fn time_stops_while_paused() {
         let timing = CoreTiming::new(ConsoleGeneration::Switch1);
@@ -347,6 +380,28 @@ mod tests {
             let timing = CoreTiming::with_tsc_hz(ConsoleGeneration::Switch1, Some(hz));
             assert_monotonic_across_pause_and_resume(timing);
         }
+    }
+
+    #[test]
+    fn tsc_reads_stay_monotonic_when_cores_disagree() {
+        let Some(hz) = tsc_is_usable().then(measure_tsc_hz).flatten() else {
+            return;
+        };
+        let timing = CoreTiming::with_tsc_hz(ConsoleGeneration::Switch1, Some(hz));
+        let read_on_core = |skew| {
+            SKEW.set(skew);
+            timing.global_time_ns()
+        };
+        let ahead = read_on_core(hz / 1000);
+        assert!(read_on_core(0) >= ahead);
+        SKEW.set(0);
+        timing.pause();
+        assert!(read_on_core(hz / 1000) >= ahead);
+        SKEW.set(0);
+        timing.resume();
+        let resumed = read_on_core(0);
+        assert!(resumed >= ahead);
+        assert!(read_on_core(hz / 1000) >= resumed);
     }
 
     fn assert_monotonic_across_pause_and_resume(timing: CoreTiming) {
