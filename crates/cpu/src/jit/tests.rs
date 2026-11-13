@@ -57,15 +57,29 @@ impl Rng {
         }
     }
 
-    /// A vector register value whose low lanes are often an edge-case S or D value.
+    /// A vector register value: random bits, a low lane holding an edge-case S or D value, or
+    /// words from a small set so lanes of every size compare equal, differ in one half, and sit
+    /// on the signed and unsigned boundaries.
     fn vector(&mut self) -> u128 {
-        let low = match self.below(4) {
-            0 => self.next(),
-            1 => FP_S[self.below(FP_S.len() as u64) as usize] as u64 | self.next() << 32,
-            2 => FP_D[self.below(FP_D.len() as u64) as usize],
-            _ => ((self.below(4096) as f32 - 2048.0) / 16.0).to_bits() as u64,
-        };
-        (self.next() as u128) << 64 | low as u128
+        const WORDS: [u32; 6] = [0, 1, u32::MAX, 0x8000_0000, 0x7fff_ffff, 0xffff];
+        match self.below(6) {
+            0 => (self.next() as u128) << 64 | self.next() as u128,
+            1..=3 => {
+                let low = match self.below(3) {
+                    0 => FP_S[self.below(FP_S.len() as u64) as usize] as u64 | self.next() << 32,
+                    1 => FP_D[self.below(FP_D.len() as u64) as usize],
+                    _ => ((self.below(4096) as f32 - 2048.0) / 16.0).to_bits() as u64,
+                };
+                (self.next() as u128) << 64 | low as u128
+            }
+            _ => (0..4).fold(0, |v, i| {
+                let word = match self.below(8) {
+                    0..=5 => WORDS[self.below(WORDS.len() as u64) as usize],
+                    _ => self.next() as u32,
+                };
+                v | (word as u128) << (32 * i)
+            }),
+        }
     }
 
     fn pattern(&mut self, bits: &str) -> u32 {
@@ -260,6 +274,50 @@ fn simd(rng: &mut Rng) -> u32 {
     }
 }
 
+const VECTOR: [&str; 9] = [
+    "0xx01110xx1xxxxx100001xxxxxxxxxx",
+    "0xx01110xx1xxxxx000111xxxxxxxxxx",
+    "0xx01110xx1xxxxx0011x1xxxxxxxxxx",
+    "0xx01110xx1xxxxx100011xxxxxxxxxx",
+    "0xx01110xx1xxxxx100111xxxxxxxxxx",
+    "0xx01110xx100000100x10xxxxxxxxxx",
+    "0xx011110xxxxxxx0x0x01xxxxxxxxxx",
+    "0xx01110000xxxxx0xxxx1xxxxxxxxxx",
+    "0xx0111100000xxxxxxx01xxxxxxxxxx",
+];
+
+/// An Advanced SIMD integer three-same, compare against zero, shift by immediate, copy or
+/// modified-immediate instruction, or an `LD1`/`ST1` of one to four registers on `X20`..`X23` or
+/// `SP`, offset or post-indexed by an immediate or `X24`/`X26`.
+fn vector(rng: &mut Rng) -> u32 {
+    if rng.below(3) == 0 {
+        let base = if rng.below(6) == 0 {
+            31
+        } else {
+            BASES + rng.below(4) as u32
+        };
+        let opcode = [0b0111, 0b1010, 0b0110, 0b0010][rng.below(4) as usize];
+        let post = rng.below(2) as u32;
+        let rm = post * [31, 24, 26][rng.below(3) as usize];
+        return (rng.next() as u32 & (1 << 30 | 1 << 22 | 3 << 10 | 0x1f))
+            | 0x0c00_0000
+            | post << 23
+            | rm << 16
+            | opcode << 12
+            | base << 5;
+    }
+    loop {
+        let class = VECTOR[rng.below(VECTOR.len() as u64) as usize];
+        let mut w = rng.pattern(class);
+        if rng.below(8) != 0 {
+            w &= !0x10;
+        }
+        if crate::interpreter::simd::execute(&mut ThreadContext::default(), w) == Some(Ok(())) {
+            return w;
+        }
+    }
+}
+
 /// A forward branch from `from` to `to` (word indices).
 fn branch(rng: &mut Rng, from: usize, to: usize) -> u32 {
     let words = (to - from) as u32;
@@ -282,7 +340,8 @@ fn stream(rng: &mut Rng) -> Vec<u32> {
         .map(|i| match kinds[i] {
             0..=7 => alu(rng),
             8..=11 => memory(rng),
-            12 | 15 => simd(rng),
+            12 => simd(rng),
+            15 => vector(rng),
             14 => atomic(rng),
             13 => {
                 let to = i + 1 + rng.below((len - i) as u64) as usize;
@@ -314,6 +373,8 @@ enum Backend {
     NoCmpxchg16b,
     /// The JIT as on a host without FMA3.
     NoFma,
+    /// The JIT as on a host with SSE2 but neither SSE4.1 nor SSE4.2.
+    NoSse4,
 }
 
 struct Machine {
@@ -354,6 +415,12 @@ impl Machine {
                 jit.target.fma = false;
                 Box::new(jit)
             }
+            Backend::NoSse4 => {
+                let mut jit = Jit::new(config).unwrap();
+                jit.target.sse41 = false;
+                jit.target.sse42 = false;
+                Box::new(jit)
+            }
         };
         Self { mem, core }
     }
@@ -365,7 +432,7 @@ impl Machine {
         self.core.clear_code_cache();
         let mut ctx = ctx.clone();
         let halt = self.core.run(&mut ctx);
-        let mut data = vec![0; DATA_SIZE as usize];
+        let mut data = vec![0; (DATA_SIZE + 0x1000) as usize];
         self.mem.read_bytes(DATA, &mut data).unwrap();
         Outcome { halt, ctx, data }
     }
@@ -404,10 +471,11 @@ fn initial(rng: &mut Rng) -> ThreadContext {
         ctx.x[(BASES + b) as usize] = (DATA + 0x2000 + rng.below(0x4000)) & align;
     }
     if rng.below(16) == 0 {
-        ctx.x[BASES as usize] = match rng.below(4) {
+        ctx.x[BASES as usize] = match rng.below(5) {
             0 => RODATA + rng.below(0x1000),
             1 => RODATA + 0x1000 - rng.below(8),
-            2 => 1 << 39,
+            2 => RODATA + 0x1000 - rng.below(72),
+            3 => 1 << 39,
             _ => rng.next(),
         };
     }
@@ -509,6 +577,7 @@ fn random_streams_match_the_interpreter() {
     machines.push(("jit", Machine::new(Backend::Jit(Passes::ALL))));
     machines.push(("jit without fastmem", Machine::new(Backend::SlowJit)));
     machines.push(("jit without fma", Machine::new(Backend::NoFma)));
+    machines.push(("jit without sse4", Machine::new(Backend::NoSse4)));
     for (i, passes) in ABLATIONS.iter().enumerate() {
         let name = [
             "jit without passes",
@@ -551,6 +620,7 @@ fn directed(code: &[u32], regs: &[(usize, u64)]) {
             "jit without cmpxchg16b",
             Machine::new(Backend::NoCmpxchg16b),
         ),
+        ("jit without sse4", Machine::new(Backend::NoSse4)),
     ];
     compare(&mut machines, &code, &ctx, &data);
 }
@@ -599,6 +669,52 @@ fn faults_leave_the_interpreters_state() {
     ] {
         for access in [LDR_X1_X2, STR_X1_X2, LDR_Q0_X2, STR_W1_X2] {
             directed(&[MOV_X0_1, access, MOV_X0_2], &[(2, addr)]);
+        }
+    }
+}
+
+#[test]
+fn multiple_structure_faults_leave_the_interpreters_state() {
+    const MOV_X0_1: u32 = 0xd280_0020;
+    const MOV_X0_2: u32 = 0xd280_0040;
+    const LD1_16B_X4_X2_POST: u32 = 0x4cdf_2040;
+    const ST1_16B_X4_X2_POST: u32 = 0x4c9f_2040;
+    const LD1_2D_X2_X2: u32 = 0x4c40_ac40;
+    const ST1_2D_X2_X2: u32 = 0x4c00_ac40;
+    const LD1_8B_X3_X2_POST_X3: u32 = 0x0cc3_6040;
+    const ST1_8B_X3_X2_POST_X3: u32 = 0x0c83_6040;
+    let movi = |rd: u32, imm: u32| 0x4f00_e400 | (imm >> 5) << 16 | (imm & 31) << 5 | rd;
+    for addr in [
+        RODATA + 0x1000 - 1,
+        RODATA + 0x1000 - 16,
+        RODATA + 0x1000 - 24,
+        RODATA + 0x1000 - 40,
+        RODATA + 0x1000 - 63,
+        RODATA - 8,
+        RODATA - 24,
+        RODATA - 40,
+        DATA - 8,
+        (1 << 39) - 32,
+        u64::MAX - 15,
+    ] {
+        for access in [
+            LD1_16B_X4_X2_POST,
+            ST1_16B_X4_X2_POST,
+            LD1_2D_X2_X2,
+            ST1_2D_X2_X2,
+            LD1_8B_X3_X2_POST_X3,
+            ST1_8B_X3_X2_POST_X3,
+        ] {
+            let code = [
+                movi(0, 0x11),
+                movi(1, 0x22),
+                movi(2, 0x33),
+                movi(3, 0x44),
+                MOV_X0_1,
+                access,
+                MOV_X0_2,
+            ];
+            directed(&code, &[(2, addr), (3, 8)]);
         }
     }
 }

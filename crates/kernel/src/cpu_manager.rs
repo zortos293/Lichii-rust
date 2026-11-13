@@ -2,6 +2,7 @@
 //! the core halts for.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use lichii_cpu::{CpuCore, HaltReason, ThreadContext};
 
@@ -16,6 +17,7 @@ struct Core {
     index: usize,
     cpus: Vec<(ProcessId, Box<dyn CpuCore>)>,
     current_cpu: Option<ProcessId>,
+    seen_exits: u64,
     ctx: ThreadContext,
 }
 
@@ -25,9 +27,11 @@ pub(crate) fn run_core(kernel: Arc<KernelInner>, index: usize) {
         index,
         cpus: Vec::new(),
         current_cpu: None,
+        seen_exits: 0,
         ctx: ThreadContext::default(),
     };
     while let Some(picked) = core.kernel.scheduler.next(index) {
+        core.retire_exited_processes();
         let thread = picked.thread;
         if picked.terminate {
             core.kernel.exit_thread(index, &thread);
@@ -40,6 +44,24 @@ pub(crate) fn run_core(kernel: Arc<KernelInner>, index: usize) {
 }
 
 impl Core {
+    /// Drops the CPU state (code cache, address space) kept for processes that exited.
+    fn retire_exited_processes(&mut self) {
+        let exits = self.kernel.process_exits.load(Ordering::Acquire);
+        if exits == self.seen_exits {
+            return;
+        }
+        self.seen_exits = exits;
+        let live = self.kernel.processes.lock();
+        self.cpus
+            .retain(|(pid, _)| live.iter().any(|process| process.id() == *pid));
+        if self
+            .current_cpu
+            .is_some_and(|current| !self.cpus.iter().any(|(pid, _)| *pid == current))
+        {
+            self.current_cpu = None;
+        }
+    }
+
     fn cpu_slot(&mut self, thread: &Thread) -> usize {
         let pid = thread.process().id();
         let slot = match self.cpus.iter().position(|(id, _)| *id == pid) {

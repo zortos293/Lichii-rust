@@ -20,6 +20,9 @@ fn expand_imm(fp: Fp, imm8: u8) -> u64 {
 
 /// Emits `word` as native ops and returns true, or emits nothing and returns false.
 pub(in super::super) fn lower(t: &mut Translator, word: u32) -> bool {
+    if super::vector::lower(t, word) {
+        return true;
+    }
     let (rd, rn, rm) = (field(word, 0, 5), field(word, 5, 5), field(word, 16, 5));
     let fp = match field(word, 22, 2) {
         0 => Fp::S,

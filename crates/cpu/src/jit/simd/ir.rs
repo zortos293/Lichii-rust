@@ -1,6 +1,7 @@
 //! The SIMD/FP operations carried by `Op::Simd`.
 
 use super::super::ir::{Ty, Value};
+use super::vector::VecOp;
 
 /// Scalar floating-point element size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,6 +102,8 @@ pub enum SimdOp {
         b: Option<Value>,
         word: u32,
     },
+    /// Advanced SIMD integer and element-move ops.
+    Vec(VecOp),
 }
 
 impl SimdOp {
@@ -108,6 +111,7 @@ impl SimdOp {
         match self {
             SimdOp::ToGpr(..) | SimdOp::ToInt { .. } => Ty::U64,
             SimdOp::Compare { .. } => Ty::Nzcv,
+            SimdOp::Vec(op) => op.ty(),
             _ => Ty::U128,
         }
     }
@@ -165,6 +169,7 @@ impl SimdOp {
                 f(m);
                 f(a);
             }
+            SimdOp::Vec(op) => op.for_each_arg(f),
         }
     }
 }
