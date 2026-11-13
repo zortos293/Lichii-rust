@@ -733,16 +733,15 @@ mod sys {
                 views.insert(offset, view);
             }
             let reduced = view.prot.without_write();
-            if reduced == view.prot {
-                return Ok(());
-            }
             let mut exposed = self.exposed.lock();
             for (start, len) in tracked_runs(tracked, offset, offset + view.len) {
-                let mut old = 0;
-                // SAFETY: [start, start + len) lies inside the view at offset.
-                check(unsafe {
-                    VirtualProtect(base.add(start).cast(), len, page_flags(reduced), &mut old)
-                })?;
+                if reduced != view.prot {
+                    let mut old = 0;
+                    // SAFETY: [start, start + len) lies inside the view at offset.
+                    check(unsafe {
+                        VirtualProtect(base.add(start).cast(), len, page_flags(reduced), &mut old)
+                    })?;
+                }
                 exposed.extend((start..start + len).step_by(super::PAGE));
             }
             Ok(())
