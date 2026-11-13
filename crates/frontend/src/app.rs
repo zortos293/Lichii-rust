@@ -27,6 +27,7 @@ use crate::cli::Cli;
 use crate::config::game::GameConfigWindow;
 use crate::config::{ConfigEnv, ConfigWindow};
 use crate::display::Display;
+use crate::firmware::{self, FirmwareJob, FirmwareSource};
 use crate::game_list::{self, GameList, ScanSources};
 use crate::hotkeys::{self, HotkeyMap};
 use crate::input_worker::{InputEvent, InputMsg, InputWorker};
@@ -60,6 +61,11 @@ pub enum Action {
     SetAntiAliasing(AntiAliasing),
     KeysAndFirmware,
     InstallFiles,
+    /// File → Install Firmware, from a folder of NCAs or from a ZIP.
+    InstallFirmware {
+        zip: bool,
+    },
+    CancelFirmwareInstall,
     /// Lichii's "Start Game without Custom Configuration".
     BootWithoutCustom(PathBuf),
     GameProperties {
@@ -124,6 +130,8 @@ pub struct App {
     without_custom: bool,
     /// File → Install Files to NAND while it runs.
     pub install: Option<InstallJob>,
+    /// File → Install Firmware while it runs.
+    pub firmware: Option<FirmwareJob>,
     /// Where the renderer draws the guest frame, in physical pixels.
     pub viewport: Option<Viewport>,
     pending_boot: Option<PathBuf>,
@@ -182,6 +190,7 @@ impl App {
             running: None,
             without_custom: false,
             install: None,
+            firmware: None,
             viewport: None,
             pending_boot: cli.game,
             start_fullscreen: cli.fullscreen,
@@ -336,6 +345,59 @@ impl App {
                 let _ = proxy.send_event(UserEvent::Wake);
             },
         ));
+    }
+
+    /// File → Install Firmware: replaces the NAND's system content in the background. Like
+    /// Lichii, it needs the keys first, which read the installed firmware back.
+    fn install_firmware(&mut self, zip: bool) {
+        if self.session.is_some() || self.install.is_some() || self.firmware.is_some() {
+            return;
+        }
+        let keys = setup::KeyStatus::check(setup::keys_dir(&self.settings.paths, &self.paths));
+        if !keys.usable() {
+            self.ui.info = Some((
+                "Keys not installed".into(),
+                "Install decryption keys before attempting to install firmware.".into(),
+            ));
+            return;
+        }
+        let source = if zip {
+            rfd::FileDialog::new()
+                .set_title("Select Dumped Firmware ZIP")
+                .add_filter("Zipped Archives", &["zip"])
+                .pick_file()
+                .map(FirmwareSource::Zip)
+        } else {
+            rfd::FileDialog::new()
+                .set_title("Select Dumped Firmware Source Location")
+                .pick_folder()
+                .map(FirmwareSource::Folder)
+        };
+        let Some(source) = source else {
+            return;
+        };
+        let proxy = self.proxy.clone();
+        self.firmware = Some(FirmwareJob::start(
+            source,
+            setup::nand_dir(&self.settings.paths, &self.paths),
+            keys.keys,
+            move || {
+                let _ = proxy.send_event(UserEvent::Wake);
+            },
+        ));
+    }
+
+    /// Takes a finished firmware install: shows its result and refreshes an open keys and
+    /// firmware window.
+    fn poll_firmware(&mut self) {
+        let Some(result) = self.firmware.as_ref().and_then(FirmwareJob::poll) else {
+            return;
+        };
+        self.firmware = None;
+        self.ui.info = Some(firmware::result_message(&result));
+        if self.setup.is_some() {
+            self.open_setup();
+        }
     }
 
     /// Takes a finished install: shows its results and rescans the game list, whose versions
@@ -585,6 +647,12 @@ Dump prod.keys and title.keys \
             Action::About => self.ui.about = true,
             Action::KeysAndFirmware => self.open_setup(),
             Action::InstallFiles => self.install_files(),
+            Action::InstallFirmware { zip } => self.install_firmware(zip),
+            Action::CancelFirmwareInstall => {
+                if let Some(job) = &self.firmware {
+                    job.progress().cancel();
+                }
+            }
             Action::SetResolution(scale) => {
                 self.set_graphics(|g| g.resolution_scale = scale);
                 self.toast(format!("Resolution: {}", scale.label()));
@@ -885,6 +953,7 @@ Dump prod.keys and title.keys \
         };
         self.games.poll();
         self.poll_install();
+        self.poll_firmware();
         self.check_exit();
         let raw = egui_state.take_egui_input(&window);
         let ctx = self.egui_ctx.clone();
@@ -1082,6 +1151,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Wake => {
                 self.games.poll();
                 self.poll_install();
+                self.poll_firmware();
             }
         }
         self.sync_guest_input();
