@@ -35,11 +35,6 @@ impl TscClock {
             scale: TscScale::new(tick_mul, SHIFT, offset),
         })
     }
-
-    fn host_ns(&self) -> u64 {
-        let tsc = read_tsc().unwrap_or(self.start);
-        scaled(tsc.saturating_sub(self.start), self.ns_mul)
-    }
 }
 
 fn scaled(tsc: u64, mul: u64) -> u64 {
@@ -166,10 +161,38 @@ impl CoreTiming {
     }
 
     fn host_ns(&self) -> u64 {
+        self.host_ns_and_tsc().0
+    }
+
+    /// The host clock in nanoseconds, and the TSC value it was read from (zero without a TSC).
+    fn host_ns_and_tsc(&self) -> (u64, u64) {
         match &self.tsc {
-            Some(tsc) => tsc.host_ns(),
-            None => self.start.elapsed().as_nanos() as u64,
+            Some(clock) => {
+                let tsc = read_tsc().unwrap_or(clock.start);
+                (scaled(tsc.saturating_sub(clock.start), clock.ns_mul), tsc)
+            }
+            None => (self.start.elapsed().as_nanos() as u64, 0),
         }
+    }
+
+    /// Loads `sequence` through an address computed from `tsc`, so the CPU cannot issue the load
+    /// before the TSC read that produced it. The `lfence` after `rdtscp` does not hold it back where
+    /// LFENCE does not serialize dispatch, and a seqlock check that runs ahead of the TSC read
+    /// accepts a time sampled after a `pause` froze the clock behind it.
+    #[cfg(target_arch = "x86_64")]
+    fn sequence_after(&self, tsc: u64) -> u64 {
+        let mut zero = tsc;
+        // SAFETY: `and` with zero only clears a register.
+        unsafe { std::arch::asm!("and {0}, 0", inout(reg) zero, options(pure, nomem, nostack)) };
+        // SAFETY: `zero` is zero, so the pointer is `sequence`'s own address.
+        let sequence =
+            unsafe { &*std::ptr::from_ref(&self.sequence).wrapping_byte_add(zero as usize) };
+        sequence.load(Ordering::Relaxed)
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn sequence_after(&self, _tsc: u64) -> u64 {
+        self.sequence.load(Ordering::Relaxed)
     }
 
     fn ticks_at(&self, ns: u64) -> u64 {
@@ -183,13 +206,14 @@ impl CoreTiming {
             if before & 1 == 0 {
                 let frozen = self.frozen_at.load(Ordering::Acquire);
                 let paused = self.paused_ns.load(Ordering::Acquire);
-                let now = if frozen == RUNNING {
-                    self.host_ns().saturating_sub(paused)
+                let (now, tsc) = if frozen == RUNNING {
+                    let (host, tsc) = self.host_ns_and_tsc();
+                    (host.saturating_sub(paused), tsc)
                 } else {
-                    frozen
+                    (frozen, 0)
                 };
                 fence(Ordering::Acquire);
-                if self.sequence.load(Ordering::Relaxed) == before {
+                if self.sequence_after(tsc) == before {
                     return now;
                 }
             }
