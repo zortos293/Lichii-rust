@@ -157,6 +157,12 @@ pub struct ComputeContext<'a> {
     pub qmd_version: QmdVersion,
     /// The raw descriptor, for the shader environment.
     pub qmd: &'a [u32; 64],
+    /// Version 1.x descriptors: GPU work may have written the grid the guest uploaded into the
+    /// descriptor after the guest's copy of it was read, so `grid` may be stale. The grid's
+    /// current words are at this GPU address, in the descriptor's layout (words 0xc and 0xd: the
+    /// width in bits 0..31, then the height and depth as 16-bit halves); dispatch indirectly from
+    /// them.
+    pub indirect_grid: Option<GpuVAddr>,
 }
 
 /// A surface as the copy and blit engines describe it.

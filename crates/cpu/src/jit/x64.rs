@@ -241,8 +241,8 @@ fn flags_to_nzcv(a: &mut Asm, inverted_carry: bool) {
     );
 }
 
-struct Emitter<'a> {
-    asm: Asm,
+pub(super) struct Emitter<'a> {
+    pub(super) asm: Asm,
     block: &'a Block,
     target: &'a Target,
     holder: [[Option<u32>; 16]; 2],
@@ -321,7 +321,7 @@ impl Emitter<'_> {
     }
 
     /// `v` in a register, locked until the current op is finished.
-    fn reg(&mut self, v: Value) -> u8 {
+    pub(super) fn reg(&mut self, v: Value) -> u8 {
         let class = self.class(v);
         if let Some(r) = self.reg[v.index()] {
             self.locked[class as usize] |= 1 << r;
@@ -351,7 +351,7 @@ impl Emitter<'_> {
         }
     }
 
-    fn def(&mut self, v: Value) -> u8 {
+    pub(super) fn def(&mut self, v: Value) -> u8 {
         let class = self.class(v);
         let r = self.alloc(class);
         self.take(v, class, r);
@@ -804,6 +804,7 @@ impl Emitter<'_> {
             }
             Op::Fence => dynasm!(self.asm ; .arch x64 ; mfence),
             Op::CallSimd { word, pc } => self.call_simd(i, word, pc),
+            Op::Simd(s) => self.simd(i, s),
             _ => self.memory(i, op),
         }
         self.finish(i, &op);

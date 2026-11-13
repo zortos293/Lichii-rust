@@ -22,7 +22,7 @@ pub(super) struct Translator<'a> {
 }
 
 impl Translator<'_> {
-    fn op(&mut self, op: Op) -> Value {
+    pub(super) fn op(&mut self, op: Op) -> Value {
         self.block.push(op)
     }
 
@@ -30,7 +30,7 @@ impl Translator<'_> {
         self.op(Op::Const(value))
     }
 
-    fn x(&mut self, r: Reg) -> Value {
+    pub(super) fn x(&mut self, r: Reg) -> Value {
         match r.0 {
             31 => self.k(0),
             32 => self.op(Op::Get(Loc::Sp)),
@@ -57,7 +57,7 @@ impl Translator<'_> {
         self.set_x(high, high_word);
     }
 
-    fn set_x(&mut self, r: Reg, value: Value) {
+    pub(super) fn set_x(&mut self, r: Reg, value: Value) {
         match r.0 {
             31 => {}
             32 => {
@@ -69,7 +69,7 @@ impl Translator<'_> {
         }
     }
 
-    fn set(&mut self, loc: Loc, value: Value) {
+    pub(super) fn set(&mut self, loc: Loc, value: Value) {
         self.op(Op::Set(loc, value));
     }
 
@@ -77,7 +77,7 @@ impl Translator<'_> {
         self.op(Op::Get(Loc::Nzcv))
     }
 
-    fn cond(&mut self, cond: u8) -> Value {
+    pub(super) fn cond(&mut self, cond: u8) -> Value {
         if cond >= 14 {
             return self.k(1);
         }
@@ -190,7 +190,9 @@ impl Translator<'_> {
         match *inst {
             Inst::Nop | Inst::Hint { .. } => {}
             Inst::SimdFp { word } => {
-                self.op(Op::CallSimd { word, pc });
+                if !super::simd::lower(self, word) {
+                    self.op(Op::CallSimd { word, pc });
+                }
             }
             Inst::Adr { rd, offset } => {
                 let v = self.k(target(offset));

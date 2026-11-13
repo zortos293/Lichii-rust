@@ -15,6 +15,11 @@ const UNKNOWN: ResultCode = ResultCode(u32::MAX);
 
 /// `nn::am::service::LaunchParameterKind::UserChannel`.
 const USER_CHANNEL: u32 = 1;
+/// `LaunchParameterKind::AccountPreselectedUser`.
+const PRESELECTED_USER: u32 = 2;
+/// `LaunchParameterAccountPreselectedUser::magic`.
+const PRESELECTED_USER_MAGIC: u32 = 0xc794_97ca;
+const PRESELECTED_USER_SIZE: usize = 0x88;
 
 /// `FileSys::SaveDataType` values `GetSaveDataSize` answers from the NACP.
 const ACCOUNT_SAVE: u8 = 1;
@@ -39,10 +44,10 @@ impl Service for ApplicationFunctions {
         Some(match ctx.command() {
             1 => {
                 let kind: u32 = ctx.pop();
-                let data = if kind == USER_CHANNEL {
-                    applet.state.lock().user_channel.pop()
-                } else {
-                    None
+                let data = match kind {
+                    USER_CHANNEL => applet.state.lock().user_channel.pop(),
+                    PRESELECTED_USER => preselected_user(context, applet),
+                    _ => None,
                 };
                 match data {
                     Some(data) => push_storage(context, ctx, StorageData::new(data, None)),
@@ -53,6 +58,11 @@ impl Service for ApplicationFunctions {
                 }
             }
             20 => {
+                let user = u128::from_le_bytes(ctx.pop());
+                if let Err(e) = crate::fs::ensure_account_save(context, user) {
+                    tracing::error!("EnsureSaveData for user {user:032x}: {e}");
+                    return Some(UNKNOWN);
+                }
                 ctx.push(0u64);
                 ResultCode::SUCCESS
             }
@@ -200,6 +210,20 @@ impl Service for LibraryAppletCreator {
             _ => return None,
         })
     }
+}
+
+/// `LaunchParameterAccountPreselectedUser` naming acc's user, the first time it is asked for.
+fn preselected_user(context: &ServiceContext, applet: &Applet) -> Option<Vec<u8>> {
+    let user = context.user.get()?;
+    let mut state = applet.state.lock();
+    if std::mem::replace(&mut state.preselected_user_popped, true) {
+        return None;
+    }
+    let mut data = vec![0; PRESELECTED_USER_SIZE];
+    data[0..4].copy_from_slice(&PRESELECTED_USER_MAGIC.to_le_bytes());
+    data[4..8].copy_from_slice(&1u32.to_le_bytes());
+    data[8..24].copy_from_slice(user);
+    Some(data)
 }
 
 fn push_storage(

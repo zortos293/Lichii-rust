@@ -22,6 +22,7 @@ use crate::back::{BackChannelSetup, SideCommand};
 use crate::backend::{ChannelId, GpuWrittenPages, ReleaseSize};
 use crate::channel::{ChannelConfig, SemaphoreWaiters, SyncpointFence, SyncpointIncrement};
 use crate::engines::EngineKind;
+use crate::engines::kepler_compute::Regs as ComputeRegs;
 use crate::engines::maxwell_3d::{MACRO_REGISTERS_START, RegisterState, Regs};
 use crate::gmmu::{Gmmu, RangeTarget};
 use crate::gpu::Inbox;
@@ -44,6 +45,7 @@ const DEFAULT_SUBCHANNELS: [(usize, EngineKind, u32); 1] =
 const CONST_BUFFER_DATA: u32 = reg_index!(Regs, const_buffer.buffer);
 const CONST_BUFFER_OFFSET: usize = reg_index!(Regs, const_buffer.offset) as usize;
 const FALCON_4: u32 = reg_index!(Regs, falcon) + 4;
+const COMPUTE_DATA_UPLOAD: u32 = reg_index!(ComputeRegs, data_upload);
 const SHADOW_SCRATCH_0: usize = reg_index!(Regs, shadow_scratch) as usize;
 
 /// What the front's channels share.
@@ -116,6 +118,8 @@ struct ChannelState {
     macros: Option<MacroEngine>,
     /// Parameters of the macro call being received, for the 3D and the compute engine.
     calls: [MacroCall; 2],
+    /// Switch 1: GPU address the back takes the next compute DATA_UPLOAD word to come from.
+    upload_next: Option<GpuVAddr>,
 }
 
 /// Parameters one macro call can have: the words of one command (a 13-bit count).
@@ -176,6 +180,7 @@ impl FrontChannel {
                 data_ram: MacroDataRam::new(),
                 macros: None,
                 calls: [MacroCall::new(), MacroCall::new()],
+                upload_next: None,
             },
             queue: VecDeque::new(),
             offset: 0,
@@ -318,7 +323,7 @@ impl FrontChannel {
             .memory
             .read_block(address, bytemuck::cast_slice_mut(&mut words))
         {
-            Ok(()) => self.dispatch_words(&words, shared),
+            Ok(()) => self.dispatch_words(&words, address, shared),
             Err(fault) => {
                 tracing::warn!(?fault, ?entry, "GPFIFO entry in unmapped GPU memory");
                 words.len()
@@ -349,13 +354,20 @@ impl FrontChannel {
         written
     }
 
-    fn dispatch_words(&mut self, words: &[u32], shared: &mut FrontShared) -> usize {
+    /// Parses `words`, read from GPU address `address`.
+    fn dispatch_words(
+        &mut self,
+        words: &[u32],
+        address: GpuVAddr,
+        shared: &mut FrontShared,
+    ) -> usize {
         let mut dispatch = Dispatch {
             id: self.id,
             memory: &self.memory,
             state: &mut self.state,
             shared,
             wait: &mut self.wait,
+            words_address: address,
         };
         self.parser.process(words, &mut dispatch)
     }
@@ -367,6 +379,7 @@ impl FrontChannel {
             state: &mut self.state,
             shared,
             wait: &mut self.wait,
+            words_address: 0,
         }
     }
 }
@@ -407,6 +420,8 @@ struct Dispatch<'a> {
     state: &'a mut ChannelState,
     shared: &'a mut FrontShared,
     wait: &'a mut Option<Wait>,
+    /// GPU address of the first word being parsed.
+    words_address: GpuVAddr,
 }
 
 impl MethodHandler for Dispatch<'_> {
@@ -601,6 +616,13 @@ impl Dispatch<'_> {
                 .get_or_insert_with(|| MacroEngine::new(MacroIsa::Mme64))
                 .write_load_mme(method, call.argument);
             return;
+        }
+        if !native && method == COMPUTE_DATA_UPLOAD {
+            let address = self.words_address + u64::from(call.position) * 4;
+            if self.state.upload_next != Some(address) {
+                self.shared.stream.upload_source(address);
+            }
+            self.state.upload_next = Some(address + 4);
         }
         send_compute(
             &mut self.state.compute,
@@ -809,7 +831,7 @@ mod tests {
         ];
         words.extend(0..count);
         let storage = channel.state.calls[0].parameters.as_ptr();
-        assert_eq!(channel.dispatch_words(&words, &mut shared), words.len());
+        assert_eq!(channel.dispatch_words(&words, 0, &mut shared), words.len());
         let parameters = &channel.state.calls[0].parameters;
         assert!(parameters.is_empty());
         assert_eq!(parameters.as_ptr(), storage);
