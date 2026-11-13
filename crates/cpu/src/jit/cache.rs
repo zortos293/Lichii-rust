@@ -1,6 +1,6 @@
 //! Translated code and the fault-site tables the fastmem fault handler searches.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
@@ -20,14 +20,20 @@ const REGIONS: usize = 256;
 pub(super) type Trampoline =
     unsafe extern "sysv64" fn(*mut ThreadContext, *mut JitState, *mut u8, *const u8) -> u64;
 
+/// How the dispatcher runs the guest code at a block's start.
+#[derive(Clone, Copy)]
+pub(super) enum Code {
+    /// Compiled host code.
+    Native(*const u8),
+    /// A lone instruction the translator rejects, for the interpreter.
+    Interpret(Inst),
+}
+
 /// One translated guest block.
 #[derive(Clone, Copy)]
 pub(super) struct Entry {
-    /// Host code, or null when the block's first instruction is not translated.
-    pub code: *const u8,
-    /// The untranslated instruction the block exits to with `EXIT_INTERPRET`.
-    pub fallback: Option<Inst>,
-    /// Guest bytes covered, the fallback included.
+    pub code: Code,
+    /// Guest bytes covered.
     len: u64,
 }
 
@@ -117,6 +123,27 @@ pub(super) struct JitCache {
     fast: Box<[(u64, u32)]>,
     sites: Box<SiteTable>,
     region: Option<usize>,
+    /// The table indirect branches probe, indexed like `fast` but with `TABLE_BITS` bits.
+    table: Box<[(u64, usize)]>,
+    /// Host addresses of the linked `jmp`s into each guest block.
+    links: HashMap<u64, Vec<usize>>,
+    /// Bumped by every `clear`, which discards all code and so every pending link site.
+    generation: u64,
+}
+
+fn table_slot(pc: u64) -> usize {
+    ((pc >> 2) as usize) & ((1 << x64::TABLE_BITS) - 1)
+}
+
+/// Points the `jmp rel32` at `site` to `target`.
+///
+/// # Safety
+/// `site` must be a link site in live code memory, and none of this cache's code may be running
+/// on another thread.
+unsafe fn patch(site: usize, target: usize) {
+    let rel = target.wrapping_sub(site + 5) as i32;
+    // SAFETY: guaranteed by the caller; the operand follows the one-byte opcode.
+    unsafe { std::ptr::write_unaligned((site + 1) as *mut i32, rel) };
 }
 
 #[inline]
@@ -156,11 +183,37 @@ impl JitCache {
             fast: vec![EMPTY; 1 << FAST_BITS].into_boxed_slice(),
             sites,
             region,
+            table: vec![(u64::MAX, 0); 1 << x64::TABLE_BITS].into_boxed_slice(),
+            links: HashMap::new(),
+            generation: 0,
         })
     }
 
     pub fn trampoline(&self) -> Trampoline {
         self.trampoline
+    }
+
+    pub fn table(&self) -> *const (u64, usize) {
+        self.table.as_ptr()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Makes `code`, the block at guest `pc`, reachable from indirect branches.
+    #[inline]
+    pub fn publish(&mut self, pc: u64, code: *const u8) {
+        self.table[table_slot(pc)] = (pc, code as usize);
+    }
+
+    /// Points the link `site`, recorded by a block exit in this generation, at `code`, the block
+    /// at guest `target`.
+    pub fn link(&mut self, site: usize, target: u64, code: *const u8) {
+        // SAFETY: the site belongs to code of the current generation, and this core's code only
+        // runs on the thread that owns the cache.
+        unsafe { patch(site, code as usize) };
+        self.links.entry(target).or_default().push(site);
     }
 
     /// Whether the fault handler can find this cache's sites, so its code may use fastmem.
@@ -181,16 +234,10 @@ impl JitCache {
     }
 
     /// Adds a block covering guest `[start, start + len)`.
-    pub fn insert(
-        &mut self,
-        start: u64,
-        len: u64,
-        compiled: Option<Compiled>,
-        fallback: Option<Inst>,
-    ) -> Entry {
-        let code = match compiled {
-            None => std::ptr::null(),
-            Some(compiled) => {
+    pub fn insert(&mut self, start: u64, len: u64, body: Result<Compiled, Inst>) -> Entry {
+        let code = match body {
+            Err(inst) => Code::Interpret(inst),
+            Ok(compiled) => {
                 let code = match self.memory.push(&compiled.code) {
                     Some(code) => code,
                     None => {
@@ -207,14 +254,10 @@ impl JitCache {
                         .iter()
                         .map(|&(site, stub)| (base + site as usize, base + stub as usize)),
                 );
-                code
+                Code::Native(code)
             }
         };
-        let entry = Entry {
-            code,
-            fallback,
-            len,
-        };
+        let entry = Entry { code, len };
         let index = match self.free.pop() {
             Some(index) => {
                 self.entries[index as usize] = entry;
@@ -245,6 +288,15 @@ impl JitCache {
             .map(|(&start, &index)| (start, index))
             .collect();
         for (start, index) in doomed {
+            for site in self.links.remove(&start).unwrap_or_default() {
+                // SAFETY: link sites stay in code memory until the next `clear`, which forgets
+                // them, and no code of this cache runs while it is changed.
+                unsafe { patch(site, site + 5) };
+            }
+            let slot = table_slot(start);
+            if self.table[slot].0 == start {
+                self.table[slot] = (u64::MAX, 0);
+            }
             self.by_start.remove(&start);
             let slot = fast_slot(start);
             if self.fast[slot].0 == start {
@@ -260,6 +312,9 @@ impl JitCache {
         self.by_start.clear();
         self.fast.fill(EMPTY);
         self.sites.0.clear();
+        self.table.fill((u64::MAX, 0));
+        self.links.clear();
+        self.generation += 1;
         self.memory.used = self.code_start;
     }
 }

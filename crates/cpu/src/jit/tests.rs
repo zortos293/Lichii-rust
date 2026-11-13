@@ -582,3 +582,96 @@ fn atomics_fault_like_the_interpreter() {
         }
     }
 }
+
+/// Words of a loop that calls a leaf §X5§ times, counting in §X2§: the call, the return and the
+/// backward branch all go through linked or table exits.
+const CALL_LOOP: [u32; 8] = [
+    0x9400_0004,
+    0xf100_04a5,
+    0x54ff_ffc1,
+    BRK,
+    0x9100_0442,
+    0xb400_0042,
+    0xd65f_03c0,
+    0xd65f_03c0,
+];
+
+#[test]
+fn linked_loops_match_the_interpreter() {
+    directed(&CALL_LOOP[..3], &[(5, 1000)]);
+    let mut machines = [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+    ];
+    let ctx = ThreadContext {
+        pc: CODE,
+        x: std::array::from_fn(|r| if r == 5 { 5000 } else { 0 }),
+        ..Default::default()
+    };
+    compare(
+        &mut machines,
+        &CALL_LOOP,
+        &ctx,
+        &vec![0; DATA_SIZE as usize],
+    );
+}
+
+#[test]
+fn a_linked_infinite_loop_stops_on_interrupt() {
+    let mut machine = Machine::new(Backend::Jit(Passes::ALL));
+    machine.mem.write(CODE, 0x1400_0000u32).unwrap();
+    let interrupt = machine.core.interrupt_handle();
+    let signaller = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        interrupt.signal();
+    });
+    let mut ctx = ThreadContext {
+        pc: CODE,
+        ..Default::default()
+    };
+    assert_eq!(machine.core.run(&mut ctx), HaltReason::Interrupted);
+    assert_eq!(ctx.pc, CODE);
+    signaller.join().unwrap();
+}
+
+#[test]
+fn invalidating_a_linked_block_unlinks_it() {
+    const BL_LEAF: u32 = 0x9400_0003;
+    const MOV_X1_1: u32 = 0xd280_0021;
+    const MOV_X1_2: u32 = 0xd280_0041;
+    const MOV_X0_1: u32 = 0xd280_0020;
+    const MOV_X0_2: u32 = 0xd280_0040;
+    const RET: u32 = 0xd65f_03c0;
+    let mut machine = Machine::new(Backend::Jit(Passes::ALL));
+    let code = [BL_LEAF, MOV_X1_1, BRK, MOV_X0_1, RET];
+    let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+    machine.mem.write_bytes(CODE, &bytes).unwrap();
+    let run = |machine: &mut Machine| {
+        let mut ctx = ThreadContext::default();
+        for _ in 0..3 {
+            ctx.pc = CODE;
+            assert_eq!(machine.core.run(&mut ctx), HaltReason::Breakpoint(0));
+        }
+        (ctx.x[0], ctx.x[1])
+    };
+    assert_eq!(run(&mut machine), (1, 1));
+    machine.mem.write(CODE + 12, MOV_X0_2).unwrap();
+    machine.mem.write(CODE + 4, MOV_X1_2).unwrap();
+    assert_eq!(
+        run(&mut machine),
+        (1, 1),
+        "stale code runs until it is invalidated"
+    );
+    machine.core.invalidate_code(CODE + 12, 4);
+    assert_eq!(
+        run(&mut machine),
+        (2, 1),
+        "the linked call target is retranslated"
+    );
+    machine.core.invalidate_code(CODE + 4, 4);
+    assert_eq!(
+        run(&mut machine),
+        (2, 2),
+        "the return target leaves the indirect table"
+    );
+}

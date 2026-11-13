@@ -25,7 +25,6 @@ use crate::interpreter::condition_holds;
 type Asm = VecAssembler<X64Relocation>;
 
 pub(super) const EXIT_CONTINUE: u64 = 0;
-pub(super) const EXIT_INTERPRET: u64 = 1;
 pub(super) const EXIT_FAULT: u64 = 2;
 /// The `info` operation code of a `CAS` slow path; `LD<op>` uses the `AtomicOp` discriminant.
 pub(super) const ATOMIC_CAS: i32 = 15;
@@ -100,6 +99,11 @@ const ST_SCRATCH2: i32 = ctx(offset_of!(JitState, scratch2));
 const ST_SAVE_GPR: i32 = ctx(offset_of!(JitState, save_gpr));
 const ST_SAVE_XMM: i32 = ctx(offset_of!(JitState, save_xmm));
 const ST_SPILL: i32 = ctx(offset_of!(JitState, spill));
+const ST_LINK: i32 = ctx(offset_of!(JitState, link));
+const ST_TABLE: i32 = ctx(offset_of!(JitState, table));
+const ST_INTERRUPT: i32 = ctx(offset_of!(JitState, interrupt));
+/// Entries in the direct-mapped `guest pc -> host code` table indirect branches probe.
+pub(super) const TABLE_BITS: u32 = 16;
 
 fn loc_offset(loc: Loc) -> i32 {
     match loc {
@@ -1078,14 +1082,29 @@ impl Emitter<'_> {
 
     fn terminal(&mut self) {
         match self.block.terminal {
-            Terminal::Jump(target) => self.exit_to(target, EXIT_CONTINUE),
-            Terminal::Interpret(pc) => self.exit_to(pc, EXIT_INTERPRET),
+            Terminal::Jump(target) => self.link(target),
             Terminal::JumpIndirect(t) => {
                 match self.src(t, W::W64) {
-                    Src::Imm(i) => dynasm!(self.asm ; .arch x64 ; mov QWORD [r15 + CTX_PC], i),
-                    Src::Reg(r) => dynasm!(self.asm ; .arch x64 ; mov QWORD [r15 + CTX_PC], Rq(r)),
+                    Src::Imm(i) => dynasm!(self.asm ; .arch x64 ; mov rax, i),
+                    Src::Reg(r) => dynasm!(self.asm ; .arch x64 ; mov rax, Rq(r)),
                 }
-                dynasm!(self.asm ; .arch x64 ; xor eax, eax ; ret);
+                let miss = self.asm.new_dynamic_label();
+                let mask = (1i32 << TABLE_BITS) - 1;
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; mov QWORD [r15 + CTX_PC], rax
+                    ; mov ecx, eax
+                    ; shr ecx, 2
+                    ; and ecx, mask
+                    ; shl ecx, 4
+                    ; mov rdx, QWORD [r13 + ST_TABLE]
+                    ; cmp QWORD [rdx + rcx], rax
+                    ; jne =>miss
+                    ; jmp QWORD [rdx + rcx + 8]
+                    ; =>miss
+                    ; xor eax, eax
+                    ; ret
+                );
             }
             Terminal::Branch {
                 cond,
@@ -1093,18 +1112,36 @@ impl Emitter<'_> {
                 not_taken,
             } => {
                 let c = self.reg(cond);
-                mov_imm64(&mut self.asm, 0, not_taken);
-                mov_imm64(&mut self.asm, 1, taken);
-                dynasm!(self.asm
-                    ; .arch x64
-                    ; test Rd(c), Rd(c)
-                    ; cmovnz rax, rcx
-                    ; mov QWORD [r15 + CTX_PC], rax
-                    ; xor eax, eax
-                    ; ret
-                );
+                let other = self.asm.new_dynamic_label();
+                dynasm!(self.asm ; .arch x64 ; test Rd(c), Rd(c) ; jz =>other);
+                self.link(taken);
+                dynasm!(self.asm ; .arch x64 ; =>other);
+                self.link(not_taken);
             }
         }
+    }
+
+    /// A linkable exit to `target`: a `jmp rel32` that starts out jumping to the code right after
+    /// it, which leaves to the dispatcher with the jump's address in `JitState::link`. Linking
+    /// points the `jmp` at the target block; unlinking sets its offset back to zero.
+    fn link(&mut self, target: u64) {
+        let site = self.asm.new_dynamic_label();
+        let unlinked = self.asm.new_dynamic_label();
+        dynasm!(self.asm
+            ; .arch x64
+            ; =>site
+            ; jmp =>unlinked
+            ; =>unlinked
+        );
+        mov_imm64(&mut self.asm, 0, target);
+        dynasm!(self.asm
+            ; .arch x64
+            ; mov QWORD [r15 + CTX_PC], rax
+            ; lea rcx, [=>site]
+            ; mov QWORD [r13 + ST_LINK], rcx
+            ; xor eax, eax
+            ; ret
+        );
     }
 
     fn exit_to(&mut self, pc: u64, code: u64) {
@@ -1159,8 +1196,9 @@ impl Emitter<'_> {
     }
 }
 
-/// Compiles a block that the passes have already run on.
-pub(super) fn compile(block: &Block, target: &Target) -> Compiled {
+/// Compiles a block that the passes have already run on and that starts at guest `start`.
+/// Every block first checks the interrupt flag, so linked blocks that loop still stop.
+pub(super) fn compile(block: &Block, start: u64, target: &Target) -> Compiled {
     let n = block.ops.len();
     let mut last_use: Vec<u32> = (0..n as u32).collect();
     for (i, op) in block.ops.iter().enumerate() {
@@ -1186,6 +1224,13 @@ pub(super) fn compile(block: &Block, target: &Target) -> Compiled {
         stubs: Vec::new(),
         fault_exit,
     };
+    let interrupted = e.asm.new_dynamic_label();
+    dynasm!(e.asm
+        ; .arch x64
+        ; mov rax, QWORD [r13 + ST_INTERRUPT]
+        ; cmp BYTE [rax], 0
+        ; jne =>interrupted
+    );
     for i in 0..n {
         e.emit(i);
     }
@@ -1201,7 +1246,9 @@ pub(super) fn compile(block: &Block, target: &Target) -> Compiled {
         ; =>fault_exit
         ; mov eax, EXIT_FAULT as i32
         ; ret
+        ; =>interrupted
     );
+    e.exit_to(start, EXIT_CONTINUE);
     let code = e.asm.finalize().expect("every label is defined");
     Compiled { code, sites }
 }

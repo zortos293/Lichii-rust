@@ -13,14 +13,16 @@ mod tests;
 mod translate;
 mod x64;
 
+use std::sync::atomic::AtomicBool;
+
 use lichii_common::{PAGE_MASK, VAddr};
 use lichii_memory::AddressSpace;
 
-use self::cache::{Entry, JitCache};
+use self::cache::{Code, Entry, JitCache};
 use self::ir::{Block, Terminal};
 pub(crate) use self::passes::Passes;
 use self::translate::{Step, Translator};
-use self::x64::{EXIT_CONTINUE, EXIT_FAULT, SPILL_SLOTS, Target};
+use self::x64::{EXIT_FAULT, SPILL_SLOTS, Target};
 use crate::decoder::{AtomicOp, decode};
 use crate::interpreter::{Exit, Interpreter, atomic_cas, atomic_rmw};
 use crate::{CpuConfig, CpuCore, CpuFault, GuestClock, HaltReason, InterruptHandle, ThreadContext};
@@ -36,11 +38,17 @@ pub(super) struct JitState {
     spill: [u128; SPILL_SLOTS],
     memory: *const AddressSpace,
     clock: *const dyn GuestClock,
+    /// The interrupt flag every block checks on entry.
+    interrupt: *const AtomicBool,
+    /// The indirect-branch table of the cache.
+    table: *const (u64, usize),
+    /// The `jmp` the last block left through, for the dispatcher to link; 0 when none.
+    link: usize,
     fault: Option<CpuFault>,
 }
 
-// SAFETY: `memory` and `clock` point into the `Arc`s the owning `Jit` keeps in its config, and
-// both are `Sync`.
+// SAFETY: `memory`, `clock` and `interrupt` point into `Arc`s the owning `Jit` keeps, and all
+// three are `Sync`; `table` is owned by its cache.
 unsafe impl Send for JitState {}
 
 impl JitState {
@@ -192,6 +200,7 @@ impl Jit {
 
     pub(crate) fn with_passes(config: CpuConfig, passes: Passes) -> Option<Self> {
         let cache = JitCache::new()?;
+        let interrupt = InterruptHandle::default();
         let fastmem = config.memory.fastmem().filter(|_| {
             if !cache.handles_faults() {
                 tracing::warn!("the JIT fault-site table is full; this core runs without fastmem");
@@ -209,6 +218,9 @@ impl Jit {
             spill: [0; SPILL_SLOTS],
             memory: &*config.memory,
             clock: &*config.clock,
+            interrupt: &*interrupt.0,
+            table: cache.table(),
+            link: 0,
             fault: None,
         });
         Some(Self {
@@ -222,7 +234,7 @@ impl Jit {
             },
             arena: fastmem.map_or(std::ptr::null_mut(), |f| f.base()),
             config,
-            interrupt: InterruptHandle::default(),
+            interrupt,
             cache,
             state,
             passes,
@@ -236,12 +248,11 @@ impl Jit {
         let mut t = Translator {
             block: Block {
                 ops: Vec::new(),
-                terminal: Terminal::Interpret(start),
+                terminal: Terminal::Jump(start),
             },
             config: &self.config,
         };
         let mut pc = start;
-        let mut fallback = None;
         loop {
             let word = self
                 .config
@@ -256,10 +267,13 @@ impl Jit {
                     t.block.terminal = terminal;
                     break;
                 }
+                Step::Rejected if pc == start => {
+                    return Ok(self.cache.insert(start, 4, Err(inst)));
+                }
                 Step::Rejected => {
                     t.block.ops.truncate(mark);
-                    t.block.terminal = Terminal::Interpret(pc);
-                    fallback = Some(inst);
+                    t.block.terminal = Terminal::Jump(pc);
+                    pc -= 4;
                     break;
                 }
             }
@@ -271,12 +285,9 @@ impl Jit {
         }
         let mut block = t.block;
         let len = pc + 4 - start;
-        if block.terminal == Terminal::Interpret(start) {
-            return Ok(self.cache.insert(start, len, None, fallback));
-        }
         self.passes.run(&mut block);
-        let compiled = x64::compile(&block, &self.target);
-        Ok(self.cache.insert(start, len, Some(compiled), fallback))
+        let compiled = x64::compile(&block, start, &self.target);
+        Ok(self.cache.insert(start, len, Ok(compiled)))
     }
 
     fn apply(&mut self, exit: Exit) -> Option<HaltReason> {
@@ -298,9 +309,11 @@ impl Jit {
 impl CpuCore for Jit {
     fn run(&mut self, ctx: &mut ThreadContext) -> HaltReason {
         loop {
+            let link = std::mem::take(&mut self.state.link);
             if self.interrupt.is_signaled() && self.interrupt.take() {
                 return HaltReason::Interrupted;
             }
+            let generation = self.cache.generation();
             let entry = match self.cache.lookup(ctx.pc) {
                 Some(entry) => entry,
                 None => match self.translate(ctx.pc) {
@@ -308,36 +321,36 @@ impl CpuCore for Jit {
                     Err(fault) => return HaltReason::Fault(fault),
                 },
             };
-            if !entry.code.is_null() {
-                let enter = self.cache.trampoline();
-                // SAFETY: `entry.code` is a compiled block in this core's code memory; it only
-                // touches `ctx`, the state, and the arena behind the bounds check.
-                let exit = unsafe { enter(ctx, &mut *self.state, self.arena, entry.code) };
-                match exit {
-                    EXIT_CONTINUE => continue,
-                    EXIT_FAULT => {
-                        let fault = self
-                            .state
-                            .fault
-                            .take()
-                            .expect("a slow path recorded the fault");
-                        ctx.pc = match fault {
-                            CpuFault::Data { pc, .. }
-                            | CpuFault::Alignment { pc, .. }
-                            | CpuFault::Prefetch { pc }
-                            | CpuFault::Undefined { pc, .. } => pc,
-                        };
-                        return HaltReason::Fault(fault);
+            let code = match entry.code {
+                Code::Native(code) => code,
+                Code::Interpret(inst) => {
+                    let exit = Interpreter::execute(&self.config, ctx, &[inst]);
+                    if let Some(halt) = self.apply(exit) {
+                        return halt;
                     }
-                    _ => {}
+                    continue;
                 }
+            };
+            if link != 0 && self.cache.generation() == generation {
+                self.cache.link(link, ctx.pc, code);
             }
-            let inst = entry
-                .fallback
-                .expect("only blocks with a fallback exit to the interpreter");
-            let exit = Interpreter::execute(&self.config, ctx, &[inst]);
-            if let Some(halt) = self.apply(exit) {
-                return halt;
+            self.cache.publish(ctx.pc, code);
+            let enter = self.cache.trampoline();
+            // SAFETY: `code` is a compiled block in this core's code memory; it only touches
+            // `ctx`, the state, and the arena behind the bounds check.
+            if unsafe { enter(ctx, &mut *self.state, self.arena, code) } == EXIT_FAULT {
+                let fault = self
+                    .state
+                    .fault
+                    .take()
+                    .expect("a slow path recorded the fault");
+                ctx.pc = match fault {
+                    CpuFault::Data { pc, .. }
+                    | CpuFault::Alignment { pc, .. }
+                    | CpuFault::Prefetch { pc }
+                    | CpuFault::Undefined { pc, .. } => pc,
+                };
+                return HaltReason::Fault(fault);
             }
         }
     }
