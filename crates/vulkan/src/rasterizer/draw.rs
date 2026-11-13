@@ -564,9 +564,11 @@ impl VulkanRasterizer {
                 .unwrap_or(vk::PrimitiveTopology::TRIANGLE_LIST),
         };
         if !self.graphics_stages(ctx, host_topology) {
+            crate::rasterizer::frame_diag::with(|f| f.skips[0] += 1);
             return Ok(());
         }
         if !self.render_targets(ctx)? {
+            crate::rasterizer::frame_diag::with(|f| f.skips[1] += 1);
             return Ok(());
         }
 
@@ -586,6 +588,7 @@ impl VulkanRasterizer {
         );
         let key = GraphicsPipelineKey::new(&draw.stages, attachments, &fixed);
         let Some(pipeline) = draw.pipelines.graphics(&key, &draw.stages) else {
+            crate::rasterizer::frame_diag::with(|f| f.skips[2] += 1);
             return Ok(());
         };
         let pipeline_raw = pipeline.raw();
@@ -1001,6 +1004,15 @@ impl VulkanRasterizer {
                 continue;
             };
             let info = info.with_layers(1);
+            let daddr = ctx.memory.translate(rt.address()).unwrap_or(0);
+            crate::rasterizer::frame_diag::with(|f| {
+                f.rts
+                    .entry((
+                        daddr,
+                        crate::rasterizer::frame_diag::key(&info, rt.width, rt.height),
+                    ))
+                    .or_default()[0] += 1
+            });
             let Some(found) = self.texture_cache.render_target(
                 &mut tx,
                 ctx.memory,

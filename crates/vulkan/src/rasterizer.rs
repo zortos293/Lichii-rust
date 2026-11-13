@@ -113,6 +113,28 @@ pub struct VulkanRasterizer {
 
 /// The rectangle a clear covers: the first scissor and the clear rectangle when
 /// `clear_control` asks for them, in pixels.
+pub(crate) mod frame_diag {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    #[derive(Default)]
+    pub struct Frame {
+        pub rts: HashMap<(u64, String), [u32; 2]>,
+        pub skips: [u32; 3],
+        pub presents: u64,
+    }
+    pub static F: Mutex<Option<Frame>> = Mutex::new(None);
+    pub fn with<R>(f: impl FnOnce(&mut Frame) -> R) -> R {
+        let mut g = F.lock().unwrap();
+        f(g.get_or_insert_with(Default::default))
+    }
+    pub fn key(info: &crate::texture_cache::ImageInfo, w: u32, h: u32) -> String {
+        format!(
+            "{:?} {}x{} reg={}x{} {:?}",
+            info.format, info.width, info.height, w, h, info.layout
+        )
+    }
+}
+
 fn clear_rect(regs: &Regs) -> Rect {
     let (mut x0, mut y0, mut x1, mut y1) = (0, 0, u32::MAX, u32::MAX);
     let mut clip = |min_x: u32, max_x: u32, min_y: u32, max_y: u32| {
@@ -283,6 +305,12 @@ impl VulkanRasterizer {
         })
         .flatten();
         if let Some((address, info, width, height)) = color_target {
+            let daddr = ctx.memory.translate(address).unwrap_or(0);
+            frame_diag::with(|f| {
+                f.rts
+                    .entry((daddr, frame_diag::key(&info, width, height)))
+                    .or_default()[1] += 1
+            });
             let mask = regs.color_mask[if regs.color_mask_common != 0 {
                 0
             } else {
@@ -958,7 +986,22 @@ impl Rasterizer for VulkanRasterizer {
         for pipeline in self.draw.pipelines.replaced() {
             self.scheduler.retire(pipeline);
         }
-        let cached = match self.texture_cache.presentable(framebuffer) {
+        let found = self.texture_cache.presentable(framebuffer);
+        let state = found.and_then(|id| self.texture_cache.state(id));
+        frame_diag::with(|f| {
+            f.presents += 1;
+            if f.presents <= 12 || f.presents % 30 == 0 {
+                let mut rts: Vec<_> = f.rts.iter().collect();
+                rts.sort_by_key(|(_, c)| std::cmp::Reverse(c[0] + c[1]));
+                tracing::warn!(target: "diag", "DIAG present #{} fb={:x?} found={found:?} state={:?} skips(stages,targets,pipeline)={:?}", f.presents, framebuffer, state.map(|s| (s.info, s.format, s.extent, s.gpu_modified, s.cpu_dirty)), f.skips);
+                for ((daddr, k), c) in rts.iter().take(12) {
+                    tracing::warn!(target: "diag", "DIAG   rt daddr={daddr:#x} draws={} clears={} {k}{}", c[0], c[1], if *daddr == framebuffer.address { "  <== FB" } else { "" });
+                }
+            }
+            f.rts.clear();
+            f.skips = [0; 3];
+        });
+        let cached = match found {
             Some(id) => self.present_cached(framebuffer, id),
             None => Ok(false),
         };
