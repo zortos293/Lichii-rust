@@ -1611,7 +1611,7 @@ impl VulkanRasterizer {
         let count = 32 - used.leading_zeros() as usize;
         for stream in 0..count {
             let range = (used & 1 << stream != 0)
-                .then(|| vertex_stream_range(regs, stream))
+                .then(|| vertex_stream_range(regs, stream, self.draw.arch))
                 .flatten();
             let binding = match range {
                 Some((address, size)) => self.buffer_cache.vertex_buffer(
