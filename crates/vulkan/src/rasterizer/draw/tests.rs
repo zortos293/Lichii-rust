@@ -23,6 +23,7 @@ use lichii_texture::block_linear::{GobLayout, Tiling, swizzle};
 use super::super::tests::{DADDR, Fixture, GPU_VA, fixture, gmmu, guest_linear};
 use super::{StageSources, Warning};
 use crate::pipeline::environment::TexturePool;
+use crate::pipeline::shader_cache::ShaderCache;
 use crate::rasterizer::VulkanRasterizer;
 
 const SIZE: u32 = 16;
@@ -2216,9 +2217,38 @@ fn indexed_table_sampling_program() -> Vec<u8> {
 
 #[test]
 fn per_invocation_table_handles_bind_a_texture_per_table_entry() {
+    draw_per_invocation_table_handles(true);
+}
+
+#[test]
+fn table_handles_sample_with_explicit_gradients_without_quad_divergent_implicit_lod() {
+    draw_per_invocation_table_handles(false);
+}
+
+/// Whether `spirv` takes a screen-space derivative (OpDPdx).
+fn takes_derivatives(spirv: &[u32]) -> bool {
+    let mut words = &spirv[5..];
+    while let [first, ..] = words {
+        if first & 0xffff == 207 {
+            return true;
+        }
+        words = &words[((first >> 16) as usize).max(1)..];
+    }
+    false
+}
+
+/// Draws a fragment program that samples a texture handle table at a per-column index;
+/// `quad_divergent_implicit_lod: false` translates as for a device without that feature.
+fn draw_per_invocation_table_handles(quad_divergent_implicit_lod: bool) {
     let Some((mut f, gmmu)) = draw_fixture() else {
         return;
     };
+    if !quad_divergent_implicit_lod {
+        let mut profile = f.rasterizer.draw.shaders.profile().clone();
+        profile.support_quad_divergent_implicit_lod = false;
+        let host = f.rasterizer.device.shader_host.clone();
+        f.rasterizer.draw.shaders = ShaderCache::new(profile, host);
+    }
     if !f
         .rasterizer
         .device
@@ -2252,6 +2282,14 @@ fn per_invocation_table_handles_bind_a_texture_per_table_entry() {
         assert_eq!(texel, want, "column {x} samples the entry its index names");
     }
     assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
+    let fragment = f.rasterizer.draw.stages[4]
+        .as_ref()
+        .expect("a fragment module");
+    assert_eq!(
+        takes_derivatives(&fragment.spirv),
+        !quad_divergent_implicit_lod,
+        "explicit gradients only without quadDivergentImplicitLod"
+    );
     f.assert_no_validation_errors();
 }
 
