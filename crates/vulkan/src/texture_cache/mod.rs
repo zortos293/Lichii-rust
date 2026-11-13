@@ -40,7 +40,7 @@ use lichii_gpu::gmmu::{Gmmu, RangeTarget};
 use lichii_gpu::lazy::LazyDeviceRanges;
 use lichii_memory::{CachedPages, DeviceAddressSpace};
 use lichii_texture::PixelFormat;
-use lichii_texture::block_linear::{GobLayout, swizzle, unswizzle};
+use lichii_texture::block_linear::{GOB_HEIGHT, GOB_SIZE, GobLayout, Tiling, swizzle, unswizzle};
 use lichii_texture::tic::{SwizzleSource, TextureDescriptor};
 
 pub use info::{GuestLayout, ImageInfo, ImageKind, ViewInfo};
@@ -259,6 +259,9 @@ struct CachedImage {
     views: Vec<(ViewKey, ImageView)>,
     /// Guest memory changed since the last upload.
     cpu_dirty: bool,
+    /// Device ranges the guest CPU wrote since the last upload; empty while `cpu_dirty` means
+    /// all of the image.
+    dirty: Vec<(DAddr, DAddr)>,
     /// Write tracking over the segments the last upload read, so a guest CPU write to them
     /// invalidates the image. Empty before the first upload and after an invalidation.
     tracked: Vec<CachedPages>,
@@ -278,11 +281,55 @@ impl CachedImage {
 
     /// Tracks the image's pages for guest CPU writes, before the cache relies on their bytes.
     fn track(&mut self, memory: &DeviceAddressSpace) {
-        self.tracked = self
-            .segments
-            .iter()
-            .map(|s| memory.cache_pages(s.daddr, s.size))
-            .collect();
+        self.tracked.clear();
+        self.tracked.extend(
+            self.segments
+                .iter()
+                .map(|s| memory.cache_pages(s.daddr, s.size)),
+        );
+    }
+
+    /// The guest CPU wrote `[daddr, daddr + size)`: the next upload takes those bytes, or all
+    /// of the image when it was already dirty everywhere or too many ranges pile up.
+    fn cpu_wrote(&mut self, daddr: DAddr, size: u64) {
+        let (start, end) = (daddr, daddr.saturating_add(size));
+        if !self.cpu_dirty {
+            self.cpu_dirty = true;
+            self.dirty.clear();
+            self.dirty.push((start, end));
+            return;
+        }
+        if self.dirty.is_empty() || self.dirty.iter().any(|&(a, b)| a <= start && end <= b) {
+            return;
+        }
+        if let Some(last) = self.dirty.last_mut()
+            && last.1 == start
+        {
+            last.1 = end;
+        } else if self.dirty.len() < MAX_DIRTY_RANGES {
+            self.dirty.push((start, end));
+        } else {
+            self.dirty.clear();
+        }
+    }
+
+    /// Whether an upload can take some rows of blocks and keep the rest of the image.
+    fn partial_uploads(&self) -> bool {
+        let info = &self.info;
+        let flat = match info.layout {
+            GuestLayout::BlockLinear { .. } => info.surface().level_tiling(0).block_depth_log2 == 0,
+            GuestLayout::Pitch { .. } => true,
+        };
+        flat && info.kind == ImageKind::D2
+            && info.levels == 1
+            && info.layers == 1
+            && info.depth == 1
+            && info.samples == 1
+            && self.scale == ResolutionScale::X1
+            && !matches!(
+                self.host.conversion,
+                Conversion::Decode | Conversion::DecodeToBc(_)
+            )
     }
 
     /// Whether the guest format can be written back from the host image.
@@ -411,6 +458,73 @@ struct Scratch {
     linear: Vec<u8>,
     convert: Vec<u8>,
     regions: Vec<vk::BufferImageCopy>,
+    bands: Vec<Band>,
+}
+
+/// Rows of blocks `[rows.0, rows.1)` of one level and layer an upload takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Band {
+    layer: u32,
+    level: u32,
+    rows: (u32, u32),
+}
+
+/// Most dirty ranges an image keeps; past it the next upload takes all of it.
+const MAX_DIRTY_RANGES: usize = 32;
+
+/// The bands of a single-level 2D image that hold the device ranges in `dirty`, merged: whole
+/// rows of GOB blocks for block-linear images and rows of texel blocks for pitch-linear ones.
+fn dirty_rows(
+    info: &ImageInfo,
+    segments: &[Segment],
+    dirty: &[(DAddr, DAddr)],
+    bands: &mut Vec<Band>,
+) {
+    let (row_bytes, step, height) = match info.layout {
+        GuestLayout::BlockLinear { .. } => {
+            let tiling = info.surface().level_tiling(0);
+            (
+                (u64::from(tiling.row_gobs) * u64::from(GOB_SIZE)) << tiling.block_height_log2,
+                GOB_HEIGHT << tiling.block_height_log2,
+                tiling.height,
+            )
+        }
+        GuestLayout::Pitch { pitch } => (
+            u64::from(pitch),
+            1,
+            info.height.div_ceil(info.format.block_height()),
+        ),
+    };
+    let row = |offset: u64| u32::try_from(offset / row_bytes).unwrap_or(u32::MAX);
+    for &(d0, d1) in dirty {
+        for s in segments {
+            let (a, b) = (d0.max(s.daddr), d1.min(s.daddr + s.size));
+            if a >= b {
+                continue;
+            }
+            let (o0, o1) = (s.offset + (a - s.daddr), s.offset + (b - s.daddr));
+            let first = row(o0).saturating_mul(step).min(height);
+            let end = row(o1 + row_bytes - 1).saturating_mul(step).min(height);
+            if first < end {
+                bands.push(Band {
+                    layer: 0,
+                    level: 0,
+                    rows: (first, end),
+                });
+            }
+        }
+    }
+    bands.sort_unstable();
+    let mut merged = 0;
+    for i in 0..bands.len() {
+        if merged > 0 && bands[i].rows.0 <= bands[merged - 1].rows.1 {
+            bands[merged - 1].rows.1 = bands[merged - 1].rows.1.max(bands[i].rows.1);
+        } else {
+            bands[merged] = bands[i];
+            merged += 1;
+        }
+    }
+    bands.truncate(merged);
 }
 
 /// Host images for guest images. Owned by the rasterizer on the GPU thread.
@@ -959,7 +1073,7 @@ impl TextureCache {
                 result = result.and(written_back);
             }
             let image = self.image(id);
-            image.cpu_dirty = true;
+            image.cpu_wrote(daddr, size);
             image.gpu_modified = false;
             image.tracked.clear();
         }
@@ -981,7 +1095,7 @@ impl TextureCache {
         for &id in &ids {
             let image = self.image(id);
             if !image.gpu_modified {
-                image.cpu_dirty = true;
+                image.cpu_wrote(daddr, size);
                 image.tracked.clear();
             }
         }
@@ -1663,6 +1777,7 @@ impl TextureCache {
             segments,
             views: Vec::new(),
             cpu_dirty: true,
+            dirty: Vec::new(),
             tracked: Vec::new(),
             gpu_modified: false,
             modified: 0,
@@ -1761,17 +1876,26 @@ impl TextureCache {
         Ok(())
     }
 
-    /// Uploads guest memory into the image when the guest CPU wrote it since the last upload.
+    /// Uploads guest memory into the image when the guest CPU wrote it since the last upload:
+    /// only the rows of blocks it wrote when the image keeps the rest.
     fn refresh(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
-        if !self.image(id).cpu_dirty {
+        let image = self.image(id);
+        if !image.cpu_dirty {
             return Ok(());
         }
-        self.rescale(tx, id, ResolutionScale::X1, false)?;
+        if !image.partial_uploads() {
+            image.dirty.clear();
+            self.rescale(tx, id, ResolutionScale::X1, false)?;
+        }
         self.upload(tx, id)?;
-        self.image(id).cpu_dirty = false;
+        let image = self.image(id);
+        image.cpu_dirty = false;
+        image.dirty.clear();
         Ok(())
     }
 
+    /// Uploads guest memory into the image: the rows of blocks that hold its dirty ranges when
+    /// it has some, else every level and layer.
     fn upload(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
         let device = self.device.clone();
         let Self {
@@ -1791,13 +1915,37 @@ impl TextureCache {
         let format = info.format;
         let levels = image.image.desc().mip_levels;
         let align = alignment(&host, format);
-        let mut total = 0u64;
-        for _ in 0..info.layers {
-            for level in 0..levels {
-                let layout = convert::host_layout(format, &host, info.level_extent(level));
-                total = total.next_multiple_of(align) + layout.total() as u64;
-                total = total.next_multiple_of(align);
+        let block_height = format.block_height();
+        let whole = image.dirty.is_empty();
+        scratch.bands.clear();
+        if whole {
+            for layer in 0..info.layers {
+                for level in 0..levels {
+                    let rows = info.level_extent(level).1.div_ceil(block_height);
+                    scratch.bands.push(Band {
+                        layer,
+                        level,
+                        rows: (0, rows),
+                    });
+                }
             }
+        } else {
+            dirty_rows(&info, &image.segments, &image.dirty, &mut scratch.bands);
+        }
+        let band_extent = |band: &Band| {
+            let (w, h, d) = info.level_extent(band.level);
+            let (first, end) = band.rows;
+            (
+                w,
+                ((end - first) * block_height).min(h - first * block_height),
+                d,
+            )
+        };
+        let mut total = 0u64;
+        for band in &scratch.bands {
+            let layout = convert::host_layout(format, &host, band_extent(band));
+            total = total.next_multiple_of(align) + layout.total() as u64;
+            total = total.next_multiple_of(align);
         }
         traffic.uploads += 1;
         traffic.upload_bytes += total;
@@ -1808,95 +1956,108 @@ impl TextureCache {
         let [main_aspect, stencil_aspect] = aspects_of(host.format);
         let direct =
             host.conversion == Conversion::None && convert::depth_planes(host.format).is_none();
-        for layer in 0..info.layers {
-            for level in 0..levels {
-                let extent = info.level_extent(level);
-                let layout = convert::host_layout(format, &host, extent);
-                offset = offset.next_multiple_of(align as usize);
-                let out = &mut slice.data[offset..offset + layout.total()];
-                let guest_offset = info.subresource_offset(level, layer);
-                let linear_len = convert::guest_level_bytes(format, extent);
-                match info.layout {
-                    GuestLayout::BlockLinear { .. } => {
-                        let tiling = info.surface().level_tiling(level);
-                        scratch.tiled.resize(tiling.size_bytes(), 0);
-                        read_guest(
-                            tx.memory,
-                            lazy,
-                            &image.segments,
-                            guest_offset,
-                            &mut scratch.tiled,
-                        );
-                        if direct {
-                            unswizzle(&tiling, &scratch.tiled, out);
-                        } else {
-                            scratch.linear.resize(linear_len, 0);
-                            unswizzle(&tiling, &scratch.tiled, &mut scratch.linear);
-                        }
-                    }
-                    GuestLayout::Pitch { pitch } => {
-                        let rows = extent.1.div_ceil(format.block_height()) as usize;
-                        let row = linear_len / rows.max(1);
-                        scratch.tiled.resize(pitch as usize * rows, 0);
-                        read_guest(
-                            tx.memory,
-                            lazy,
-                            &image.segments,
-                            guest_offset,
-                            &mut scratch.tiled,
-                        );
+        for band in &scratch.bands {
+            let (layer, level, (first, end)) = (band.layer, band.level, band.rows);
+            let extent = band_extent(band);
+            let layout = convert::host_layout(format, &host, extent);
+            offset = offset.next_multiple_of(align as usize);
+            let out = &mut slice.data[offset..offset + layout.total()];
+            let guest_offset = info.subresource_offset(level, layer);
+            let linear_len = convert::guest_level_bytes(format, extent);
+            match info.layout {
+                GuestLayout::BlockLinear { .. } => {
+                    let level_tiling = info.surface().level_tiling(level);
+                    let tiling = Tiling {
+                        height: end - first,
+                        ..level_tiling
+                    };
+                    let block_rows = first / (GOB_HEIGHT << level_tiling.block_height_log2);
+                    let block_row_bytes = (u64::from(level_tiling.row_gobs) * u64::from(GOB_SIZE))
+                        << level_tiling.block_height_log2;
+                    scratch.tiled.resize(tiling.size_bytes(), 0);
+                    read_guest(
+                        tx.memory,
+                        lazy,
+                        &image.segments,
+                        guest_offset + u64::from(block_rows) * block_row_bytes,
+                        &mut scratch.tiled,
+                    );
+                    if direct {
+                        unswizzle(&tiling, &scratch.tiled, out);
+                    } else {
                         scratch.linear.resize(linear_len, 0);
-                        for (dst, src) in scratch
-                            .linear
-                            .chunks_exact_mut(row)
-                            .zip(scratch.tiled.chunks(pitch as usize))
-                        {
-                            dst.copy_from_slice(&src[..row]);
-                        }
-                        if direct {
-                            out.copy_from_slice(&scratch.linear[..out.len()]);
-                        }
+                        unswizzle(&tiling, &scratch.tiled, &mut scratch.linear);
                     }
                 }
-                if !direct
-                    && let Err(error) = convert::to_host(
-                        format,
-                        &host,
-                        extent,
-                        &scratch.linear,
-                        out,
-                        &mut scratch.convert,
-                    )
-                {
-                    tracing::warn!(%error, "texture upload conversion failed");
+                GuestLayout::Pitch { pitch } => {
+                    let rows = (end - first) as usize;
+                    let row = linear_len / rows.max(1);
+                    scratch.tiled.resize(pitch as usize * rows, 0);
+                    read_guest(
+                        tx.memory,
+                        lazy,
+                        &image.segments,
+                        guest_offset + u64::from(first) * u64::from(pitch),
+                        &mut scratch.tiled,
+                    );
+                    scratch.linear.resize(linear_len, 0);
+                    for (dst, src) in scratch
+                        .linear
+                        .chunks_exact_mut(row)
+                        .zip(scratch.tiled.chunks(pitch as usize))
+                    {
+                        dst.copy_from_slice(&src[..row]);
+                    }
+                    if direct {
+                        out.copy_from_slice(&scratch.linear[..out.len()]);
+                    }
                 }
-                let (w, h, d) = extent;
-                let copy = |buffer_offset: usize, aspect_mask| vk::BufferImageCopy {
-                    buffer_offset: base_offset + buffer_offset as u64,
-                    image_subresource: vk::ImageSubresourceLayers {
-                        aspect_mask,
-                        mip_level: level,
-                        base_array_layer: layer,
-                        layer_count: 1,
-                    },
-                    image_extent: vk::Extent3D {
-                        width: w,
-                        height: h,
-                        depth: d,
-                    },
-                    ..Default::default()
-                };
-                if let Some(aspect) = main_aspect {
-                    scratch.regions.push(copy(offset, aspect));
-                }
-                if let Some(aspect) = stencil_aspect {
-                    scratch.regions.push(copy(offset + layout.main, aspect));
-                }
-                offset += layout.total();
             }
+            if !direct
+                && let Err(error) = convert::to_host(
+                    format,
+                    &host,
+                    extent,
+                    &scratch.linear,
+                    out,
+                    &mut scratch.convert,
+                )
+            {
+                tracing::warn!(%error, "texture upload conversion failed");
+            }
+            let (w, h, d) = extent;
+            let copy = |buffer_offset: usize, aspect_mask| vk::BufferImageCopy {
+                buffer_offset: base_offset + buffer_offset as u64,
+                image_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask,
+                    mip_level: level,
+                    base_array_layer: layer,
+                    layer_count: 1,
+                },
+                image_offset: vk::Offset3D {
+                    x: 0,
+                    y: (first * block_height) as i32,
+                    z: 0,
+                },
+                image_extent: vk::Extent3D {
+                    width: w,
+                    height: h,
+                    depth: d,
+                },
+                ..Default::default()
+            };
+            if let Some(aspect) = main_aspect {
+                scratch.regions.push(copy(offset, aspect));
+            }
+            if let Some(aspect) = stencil_aspect {
+                scratch.regions.push(copy(offset + layout.main, aspect));
+            }
+            offset += layout.total();
         }
         let cmd = tx.scheduler.record()?;
-        image.access.layout = vk::ImageLayout::UNDEFINED;
+        if whole {
+            image.access.layout = vk::ImageLayout::UNDEFINED;
+        }
         image.transition(&device, cmd, ImageAccess::TRANSFER_DST);
         // SAFETY: the image is in TRANSFER_DST layout and every region reads staged bytes the
         // host layout sized.

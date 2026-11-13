@@ -481,6 +481,89 @@ fn cpu_writes_re_upload_on_next_use() {
     f.assert_no_validation_errors();
 }
 
+#[test]
+fn cpu_writes_re_upload_only_the_block_rows_they_touch() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+            return;
+        };
+        let s = surface(PixelFormat::A8B8G8R8Unorm, 64, 256, 1, 1, 3, gob);
+        let first = level_data(&s, 1);
+        write_surface(&f.memory, &s, &first);
+        let header = tic(0x08, GPU_VA, 64, 256, 1, 1, 3);
+        let (id, _) = f.texture(&header);
+        let second = level_data(&s, 2);
+        write_surface(&f.memory, &s, &second);
+        let before = f.cache.traffic();
+        {
+            let (mut tx, cache, _) = f.tx();
+            cache
+                .invalidate(&mut tx, DADDR + (16 << 10) + 100, 4)
+                .unwrap();
+        }
+        let (same, _) = f.texture(&header);
+        assert_eq!(same, id);
+        assert_eq!(
+            f.cache.traffic().upload_bytes - before.upload_bytes,
+            16 << 10,
+            "one row of 64-texel-tall blocks"
+        );
+        let read = &f.read_image(id)[0];
+        let rows = |a: usize, b: usize| a * 256..b * 256;
+        assert!(read[rows(0, 64)] == first[0][rows(0, 64)]);
+        assert!(read[rows(64, 128)] == second[0][rows(64, 128)], "{gob:?}");
+        assert!(read[rows(128, 256)] == first[0][rows(128, 256)]);
+        f.assert_no_validation_errors();
+    }
+}
+
+/// A pitch-linear 2D A8B8G8R8 texture header with identity swizzle.
+fn pitch_tic(gpu_va: GpuVAddr, width: u32, height: u32, pitch: u32) -> TicEntry {
+    let mut w = tic(0x08, gpu_va, width, height, 1, 1, 0).0;
+    w[2] = (gpu_va >> 32) as u32 | 2 << 21;
+    w[3] = pitch >> 5;
+    TicEntry(w)
+}
+
+#[test]
+fn cpu_writes_re_upload_only_the_pitch_rows_they_touch() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let first = pattern(512 * 64, 1);
+    f.memory.write_bytes(DADDR, &first).unwrap();
+    let header = pitch_tic(GPU_VA, 64, 64, 512);
+    let (id, _) = f.texture(&header);
+    let second = pattern(512 * 64, 2);
+    f.memory.write_bytes(DADDR, &second).unwrap();
+    let before = f.cache.traffic();
+    {
+        let (mut tx, cache, _) = f.tx();
+        cache.invalidate(&mut tx, DADDR + 10 * 512 + 8, 4).unwrap();
+        cache.cpu_written(DADDR + 40 * 512, 512 + 4);
+    }
+    let (same, _) = f.texture(&header);
+    assert_eq!(same, id);
+    assert_eq!(
+        f.cache.traffic().upload_bytes - before.upload_bytes,
+        3 * 256,
+        "rows 10, 40 and 41"
+    );
+    let read = &f.read_image(id)[0];
+    for y in 0..64 {
+        let source = if matches!(y, 10 | 40 | 41) {
+            &second
+        } else {
+            &first
+        };
+        assert!(
+            read[y * 256..(y + 1) * 256] == source[y * 512..y * 512 + 256],
+            "row {y}"
+        );
+    }
+    f.assert_no_validation_errors();
+}
+
 fn rt_info(width: u32, height: u32, bh: u32, gob: GobLayout) -> ImageInfo {
     let s = surface(PixelFormat::A8B8G8R8Unorm, width, height, 1, 1, bh, gob);
     ImageInfo {
