@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use bytemuck::Pod;
 use lichii_common::settings::{CpuAccuracy, CpuBackend};
 use lichii_common::{ConsoleGeneration, ResultCode, VAddr};
-use lichii_cpu::GuestClock;
+use lichii_cpu::{CpuConfig, CpuCore, GuestClock, HaltReason, ThreadContext};
 use lichii_loader::npdm::{AddressSpaceType, KernelCapabilities, PoolPartition, ServiceAccess};
 use lichii_loader::{MainThread, Module, Permission, ProgramImage, Segment};
 use parking_lot::Mutex;
@@ -538,6 +538,51 @@ impl IpcClient {
             request.tipc,
             request.object.is_some(),
         ))
+    }
+}
+
+/// A JIT core that runs a process's code from the host. Like the kernel's cores, it drops the code
+/// the kernel invalidated before every run.
+pub struct JitCore {
+    kernel: Kernel,
+    process: Arc<Process>,
+    cpu: Box<dyn CpuCore>,
+}
+
+impl JitCore {
+    pub fn new(kernel: &Kernel, process: &Arc<Process>) -> Self {
+        let cpu = lichii_cpu::new_core(
+            CpuBackend::Jit,
+            CpuConfig {
+                memory: process.memory().clone(),
+                monitor: kernel.0.monitor.clone(),
+                clock: kernel.0.clock.clone(),
+                core_index: 0,
+                ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
+                dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+                accuracy: kernel.0.cpu_accuracy,
+            },
+        );
+        Self {
+            kernel: kernel.clone(),
+            process: process.clone(),
+            cpu,
+        }
+    }
+
+    /// Runs from `pc` until the core halts, and returns why with `x0`.
+    pub fn run(&mut self, pc: VAddr) -> (HaltReason, u64) {
+        for (pid, start, size) in self.kernel.0.take_invalidations(0) {
+            if pid == self.process.id() {
+                self.cpu.invalidate_code(start, size);
+            }
+        }
+        let mut ctx = ThreadContext {
+            pc,
+            ..Default::default()
+        };
+        let halt = self.cpu.run(&mut ctx);
+        (halt, ctx.x[0])
     }
 }
 

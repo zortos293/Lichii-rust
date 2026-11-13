@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
-use lichii_common::{HleResult, PAGE_SIZE};
+use lichii_common::{HleResult, PAGE_SIZE, VAddr};
 use lichii_memory::MemoryPermission;
 
 use super::{Flow, SvcContext};
 use crate::memory::attribute;
 use crate::memory_objects::{CodeMemory, CodeMemoryOperation, SharedMemory, TransferMemory};
 use crate::object::KObject;
+use crate::process::Process;
 use crate::result;
 
 fn permission(raw: u32) -> HleResult<MemoryPermission> {
@@ -193,6 +194,56 @@ pub(super) fn control_code_memory(svc: &mut SvcContext) -> Flow {
         let perm = permission(svc.arg32(4))?;
         let memory = svc.typed::<CodeMemory>(svc.arg32(0))?;
         memory.control(op, addr, size, perm)
+    });
+    svc.finish(result)
+}
+
+/// `svcSetProcessMemoryPermission(process w0, addr x1, size x2, perm w3)`.
+pub(super) fn set_process_memory_permission(svc: &mut SvcContext) -> Flow {
+    let (addr, size) = (svc.arg(1), svc.arg(2));
+    let result = check_range(addr, size).and_then(|()| {
+        let perm = permission(svc.arg32(3))?;
+        let process = svc.typed::<Process>(svc.arg32(0))?;
+        if !process.page_table().contains(addr, size) {
+            return Err(result::INVALID_CURRENT_MEMORY);
+        }
+        process.page_table().set_code_permission(addr, size, perm)
+    });
+    svc.finish(result)
+}
+
+/// The process and ranges of `svcMapProcessCodeMemory` and `svcUnmapProcessCodeMemory`
+/// (`process w0, dst x1, src x2, size x3`), checked in Horizon's order.
+fn process_code_memory_args(svc: &SvcContext) -> HleResult<(Arc<Process>, VAddr, VAddr, u64)> {
+    let (dst, src, size) = (svc.arg(1), svc.arg(2), svc.arg(3));
+    if !dst.is_multiple_of(PAGE_SIZE) || !src.is_multiple_of(PAGE_SIZE) {
+        return Err(result::INVALID_ADDRESS);
+    }
+    if size == 0 || !size.is_multiple_of(PAGE_SIZE) {
+        return Err(result::INVALID_SIZE);
+    }
+    if dst.checked_add(size).is_none() || src.checked_add(size).is_none() {
+        return Err(result::INVALID_CURRENT_MEMORY);
+    }
+    let process = svc.typed::<Process>(svc.arg32(0))?;
+    let table = process.page_table();
+    if !table.contains(src, size) || !table.can_contain_alias_code(dst, size) {
+        return Err(result::INVALID_CURRENT_MEMORY);
+    }
+    Ok((process, dst, src, size))
+}
+
+/// `svcMapProcessCodeMemory(process w0, dst x1, src x2, size x3)`.
+pub(super) fn map_process_code_memory(svc: &mut SvcContext) -> Flow {
+    let result = process_code_memory_args(svc)
+        .and_then(|(process, dst, src, size)| process.page_table().map_code_memory(dst, src, size));
+    svc.finish(result)
+}
+
+/// `svcUnmapProcessCodeMemory(process w0, dst x1, src x2, size x3)`.
+pub(super) fn unmap_process_code_memory(svc: &mut SvcContext) -> Flow {
+    let result = process_code_memory_args(svc).and_then(|(process, dst, src, size)| {
+        process.page_table().unmap_code_memory(dst, src, size)
     });
     svc.finish(result)
 }
