@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use lichii_common::settings::CpuBackend;
-use lichii_cpu::{CpuConfig, GuestClock, HaltReason, ThreadContext, new_core};
+use lichii_cpu::{CpuConfig, GuestClock, HaltReason, ThreadContext, TscScale, new_core};
 use lichii_memory::{AddressSpace, ExclusiveMonitor, MemoryPermission, PhysicalMemory};
 
 const CODE: u64 = 0x10000;
@@ -15,11 +15,20 @@ const DATA: u64 = 0x100000;
 /// Where `far` code goes: its addresses share indirect-table slots with `CODE`'s.
 const FAR: u64 = CODE + 0x40000;
 
-struct Clock;
+/// A 19.2 MHz counter whose `ticks` costs what `CoreTiming`'s does (an `Instant` read and a 128-bit
+/// divide), with a TSC scale that lets the JIT read it inline instead.
+struct Clock {
+    start: Instant,
+    scale: TscScale,
+}
 
 impl GuestClock for Clock {
     fn ticks(&self) -> u64 {
-        0
+        (self.start.elapsed().as_nanos() * 19_200_000 / 1_000_000_000) as u64
+    }
+
+    fn host_tsc_scale(&self) -> Option<&TscScale> {
+        Some(&self.scale)
     }
 }
 
@@ -91,11 +100,36 @@ const WORKLOADS: &[Workload] = &[
         per_iteration: 9,
     },
     Workload {
+        name: "counter read loop",
+        code: &[
+            0xd53be020, // 1: mrs x0, cntpct_el0
+            0xf10004a5, // subs x5, x5, #1
+            0x54ffffc1, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 3,
+    },
+    Workload {
         name: "exclusive add loop",
         code: &[
             0xc85f7c23, // 1: ldxr x3, [x1]
             0x91000463, // add x3, x3, #1
             0xc8047c23, // stxr w4, x3, [x1]
+            0x35ffffa4, // cbnz w4, 1b
+            0xf10004a5, // subs x5, x5, #1
+            0x54ffff61, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 6,
+    },
+    Workload {
+        name: "exclusive pair loop",
+        code: &[
+            0xc87f1823, // 1: ldxp x3, x6, [x1]
+            0x91000463, // add x3, x3, #1
+            0xc8241823, // stxp w4, x3, x6, [x1]
             0x35ffffa4, // cbnz w4, 1b
             0xf10004a5, // subs x5, x5, #1
             0x54ffff61, // b.ne 1b
@@ -133,7 +167,10 @@ fn main() {
             CpuConfig {
                 memory: mem,
                 monitor: Arc::new(ExclusiveMonitor::new(1)),
-                clock: Arc::new(Clock),
+                clock: Arc::new(Clock {
+                    start: Instant::now(),
+                    scale: TscScale::new(1 << 31, 32, 0),
+                }),
                 core_index: 0,
                 ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
                 dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,

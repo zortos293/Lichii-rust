@@ -24,7 +24,7 @@ pub(crate) use self::passes::Passes;
 use self::translate::{Step, Translator};
 use self::x64::{EXIT_FAULT, SPILL_SLOTS, Target};
 use crate::decoder::{AtomicOp, decode};
-use crate::interpreter::{Exit, Interpreter, atomic_cas, atomic_rmw};
+use crate::interpreter::{Exit, Interpreter, atomic_cas, atomic_rmw, cas128};
 use crate::{CpuConfig, CpuCore, CpuFault, GuestClock, HaltReason, InterruptHandle, ThreadContext};
 
 /// Runtime state translated code reaches through `r13`.
@@ -35,6 +35,10 @@ pub(super) struct JitState {
     scratch2: u128,
     save_xmm: [u128; 16],
     save_gpr: [u64; 16],
+    /// The high half of the last 128-bit exclusive load or compare-and-swap.
+    high: u64,
+    /// The registers a `cmpxchg16b` borrows while it runs.
+    cx16_save: [u64; 2],
     spill: [u128; SPILL_SLOTS],
     memory: *const AddressSpace,
     clock: *const dyn GuestClock,
@@ -120,6 +124,13 @@ extern "sysv64" fn atomic_slow(state: &mut JitState, addr: u64, pc: u64, info: u
         });
         return true;
     };
+    if size == 4 {
+        // SAFETY: the pair is 16-byte aligned, so it lies in the one page `translate` returned.
+        let old = unsafe { cas128(ptr, state.scratch, state.scratch2) };
+        state.scratch = old;
+        state.high = (old >> 64) as u64;
+        return false;
+    }
     let (operand, second) = (state.scratch as u64, state.scratch2 as u64);
     let op = (info >> 8) as i32;
     // SAFETY: the access is naturally aligned, so it stays inside the one mapped guest page that
@@ -147,7 +158,11 @@ extern "sysv64" fn exclusive_slow(state: &mut JitState, addr: u64, pc: u64, info
     // SAFETY: called from a slow path; see the `Send` impl.
     let (memory, monitor) = unsafe { (state.memory(), &*state.monitor) };
     let result = if store {
-        let value = state.scratch as u64 as u128;
+        let value = if bytes == 16 {
+            state.scratch
+        } else {
+            state.scratch as u64 as u128
+        };
         monitor
             .write(state.core_index, memory, addr, bytes, value)
             .map(|stored| u128::from(!stored))
@@ -157,6 +172,7 @@ extern "sysv64" fn exclusive_slow(state: &mut JitState, addr: u64, pc: u64, info
     match result {
         Ok(value) => {
             state.scratch = value;
+            state.high = (value >> 64) as u64;
             false
         }
         Err(f) => {
@@ -254,6 +270,8 @@ impl Jit {
             scratch2: 0,
             save_xmm: [0; 16],
             save_gpr: [0; 16],
+            high: 0,
+            cx16_save: [0; 2],
             spill: [0; SPILL_SLOTS],
             memory: &*config.memory,
             clock: &*config.clock,
@@ -274,6 +292,8 @@ impl Jit {
                 exclusive: exclusive_slow as *const () as usize,
                 zero: zero_slow as *const () as usize,
                 ticks: ticks as *const () as usize,
+                tsc_scale: config.clock.host_tsc_scale().map(std::ptr::from_ref),
+                cmpxchg16b: std::arch::is_x86_feature_detected!("cmpxchg16b"),
             },
             arena: fastmem.map_or(std::ptr::null_mut(), |f| f.base()),
             config,
@@ -294,6 +314,7 @@ impl Jit {
                 terminal: Terminal::Jump(start),
             },
             config: &self.config,
+            cmpxchg16b: self.target.cmpxchg16b,
         };
         let mut pc = start;
         loop {

@@ -17,6 +17,7 @@ use std::thread::JoinHandle;
 use ash::vk;
 use lichii_common::perf::PerfStats;
 use lichii_common::settings::GraphicsSettings;
+use lichii_shader::{DescriptorKind, ShaderModule};
 use parking_lot::{Condvar, Mutex};
 
 use super::disk::{self, Contents, DeviceIdentity};
@@ -28,7 +29,7 @@ use super::fixed_state::{
 };
 use super::{
     ComputePipelineKey, FxBuildHasher, GraphicsPipelineKey, GraphicsShaders, PipelineFeatures,
-    ResourceBinding, ShaderProgram,
+    descriptor_type, stage_flags,
 };
 use crate::device::Device;
 use crate::error::{Result, VkResultExt};
@@ -36,13 +37,23 @@ use crate::error::{Result, VkResultExt};
 const FILE_NAME: &str = "pipelines.bin";
 const ENTRY: &CStr = c"main";
 
+/// One binding of a pipeline layout, with the stages of the pipeline that declare it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LayoutBinding {
+    pub set: u32,
+    pub binding: u32,
+    pub kind: DescriptorKind,
+    pub count: u32,
+    pub stages: vk::ShaderStageFlags,
+}
+
 /// Descriptor set layouts and the pipeline layout shared by pipelines whose stages bind the
 /// same resources.
 pub struct PipelineLayout {
     device: Arc<Device>,
     raw: vk::PipelineLayout,
     set_layouts: Vec<vk::DescriptorSetLayout>,
-    bindings: Vec<(ResourceBinding, vk::ShaderStageFlags)>,
+    bindings: Vec<LayoutBinding>,
     push_constants: (vk::ShaderStageFlags, u32),
 }
 
@@ -56,12 +67,14 @@ impl PipelineLayout {
         &self.set_layouts
     }
 
-    /// Every binding, sorted by set and binding, with the stages that use it.
-    pub fn bindings(&self) -> &[(ResourceBinding, vk::ShaderStageFlags)] {
+    /// Every binding, sorted by set and binding.
+    pub fn bindings(&self) -> &[LayoutBinding] {
         &self.bindings
     }
 
-    /// Stages and size of the push constant range at offset 0.
+    /// The one push constant range: from offset 0, every stage that reads push constants, as
+    /// large as the largest block. Pushes must name all of these stages, since a range per stage
+    /// at the same offset would overlap.
     pub fn push_constants(&self) -> (vk::ShaderStageFlags, u32) {
         self.push_constants
     }
@@ -81,37 +94,49 @@ impl Drop for PipelineLayout {
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct LayoutDesc {
-    bindings: Vec<(ResourceBinding, vk::ShaderStageFlags)>,
+    bindings: Vec<LayoutBinding>,
     push_constants: (vk::ShaderStageFlags, u32),
 }
 
 impl LayoutDesc {
     fn merge<'a>(
-        programs: impl IntoIterator<Item = &'a ShaderProgram>,
+        modules: impl IntoIterator<Item = &'a ShaderModule>,
     ) -> std::result::Result<Self, String> {
-        let mut bindings: Vec<(ResourceBinding, vk::ShaderStageFlags)> = Vec::new();
+        let mut bindings: Vec<LayoutBinding> = Vec::new();
         let mut push_constants = (vk::ShaderStageFlags::empty(), 0);
-        for program in programs {
-            for binding in &program.resources.bindings {
-                match bindings
-                    .iter_mut()
-                    .find(|(b, _)| (b.set, b.binding) == (binding.set, binding.binding))
-                {
-                    Some((existing, stages)) if existing == binding => *stages |= program.stage,
-                    Some((existing, _)) => {
-                        return Err(format!(
-                            "stages disagree on binding {existing:?} and {binding:?}"
-                        ));
+        for module in modules {
+            let stage = stage_flags(module.stage);
+            for set in &module.resources.sets {
+                for b in &set.bindings {
+                    match bindings
+                        .iter_mut()
+                        .find(|l| (l.set, l.binding) == (set.set, b.binding))
+                    {
+                        Some(existing) if (existing.kind, existing.count) == (b.kind, b.count) => {
+                            existing.stages |= stage;
+                        }
+                        Some(existing) => {
+                            return Err(format!(
+                                "stages disagree on binding {existing:?} and {b:?} of set {}",
+                                set.set
+                            ));
+                        }
+                        None => bindings.push(LayoutBinding {
+                            set: set.set,
+                            binding: b.binding,
+                            kind: b.kind,
+                            count: b.count,
+                            stages: stage,
+                        }),
                     }
-                    None => bindings.push((*binding, program.stage)),
                 }
             }
-            if program.resources.push_constant_size > 0 {
-                push_constants.0 |= program.stage;
-                push_constants.1 = push_constants.1.max(program.resources.push_constant_size);
+            let size = module.resources.push_constant_size;
+            if size > 0 {
+                push_constants = (push_constants.0 | stage, push_constants.1.max(size));
             }
         }
-        bindings.sort_by_key(|(b, _)| (b.set, b.binding));
+        bindings.sort_by_key(|b| (b.set, b.binding));
         Ok(Self {
             bindings,
             push_constants,
@@ -126,23 +151,18 @@ impl LayoutDesc {
             bindings: self.bindings,
             push_constants: self.push_constants,
         };
-        let sets = layout
-            .bindings
-            .iter()
-            .map(|(b, _)| b.set + 1)
-            .max()
-            .unwrap_or(0);
+        let sets = layout.bindings.iter().map(|b| b.set + 1).max().unwrap_or(0);
         for set in 0..sets {
             let bindings: Vec<_> = layout
                 .bindings
                 .iter()
-                .filter(|(b, _)| b.set == set)
-                .map(|(b, stages)| {
+                .filter(|b| b.set == set)
+                .map(|b| {
                     vk::DescriptorSetLayoutBinding::default()
                         .binding(b.binding)
-                        .descriptor_type(b.kind.descriptor_type())
+                        .descriptor_type(descriptor_type(b.kind))
                         .descriptor_count(b.count)
-                        .stage_flags(*stages)
+                        .stage_flags(b.stages)
                 })
                 .collect();
             let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
@@ -254,7 +274,7 @@ enum Build {
     },
     Compute {
         key: ComputePipelineKey,
-        program: Arc<ShaderProgram>,
+        program: Arc<ShaderModule>,
         layout: Arc<PipelineLayout>,
     },
 }
@@ -291,7 +311,7 @@ impl Context {
 
     fn modules<'a>(
         &'a self,
-        programs: impl IntoIterator<Item = &'a ShaderProgram>,
+        programs: impl IntoIterator<Item = &'a ShaderModule>,
     ) -> std::result::Result<Modules<'a>, String> {
         let mut modules = Modules {
             device: &self.device,
@@ -303,7 +323,7 @@ impl Context {
             let module = unsafe { self.device.raw.create_shader_module(&info, None) }
                 .call("vkCreateShaderModule")
                 .map_err(|e| e.to_string())?;
-            modules.stages.push((program.stage, module));
+            modules.stages.push((stage_flags(program.stage), module));
         }
         Ok(modules)
     }
@@ -550,7 +570,7 @@ impl Context {
     fn build_compute(
         &self,
         key: &ComputePipelineKey,
-        program: &ShaderProgram,
+        program: &ShaderModule,
         layout: &PipelineLayout,
     ) -> std::result::Result<(vk::Pipeline, bool), String> {
         let limits = &self.device.properties.limits;
@@ -815,7 +835,7 @@ impl PipelineCache {
     pub fn compute(
         &mut self,
         key: &ComputePipelineKey,
-        shader: &Arc<ShaderProgram>,
+        shader: &Arc<ShaderModule>,
     ) -> Option<&Pipeline> {
         let index = match self.compute.get(key) {
             Some(&index) => index,
@@ -852,7 +872,7 @@ impl PipelineCache {
         index
     }
 
-    fn insert_compute(&mut self, key: &ComputePipelineKey, shader: &Arc<ShaderProgram>) -> usize {
+    fn insert_compute(&mut self, key: &ComputePipelineKey, shader: &Arc<ShaderModule>) -> usize {
         debug_assert_eq!(key.shader, shader.hash, "the key names another shader");
         let index = self.slots.len();
         self.compute.insert(*key, index);
@@ -867,7 +887,7 @@ impl PipelineCache {
 
     fn layout<'a>(
         &mut self,
-        programs: impl IntoIterator<Item = &'a ShaderProgram>,
+        programs: impl IntoIterator<Item = &'a ShaderModule>,
     ) -> Option<Arc<PipelineLayout>> {
         let desc = LayoutDesc::merge(programs)
             .map_err(|error| tracing::error!("pipeline layout: {error}"))
@@ -948,10 +968,7 @@ impl PipelineCache {
 
     /// Queues every pipeline the disk cache named whose shaders `resolve` returns, asynchronously
     /// when asynchronous compilation is on; returns how many were queued.
-    pub fn prebuild(
-        &mut self,
-        mut resolve: impl FnMut(u64) -> Option<Arc<ShaderProgram>>,
-    ) -> usize {
+    pub fn prebuild(&mut self, mut resolve: impl FnMut(u64) -> Option<Arc<ShaderModule>>) -> usize {
         let stored = std::mem::take(&mut self.stored);
         let mut queued = 0;
         for key in &stored.graphics {
@@ -1060,11 +1077,12 @@ mod tests {
     use super::*;
     use crate::commands::{COLOR_RANGE, ImageAccess, transition};
     use crate::memory::{Buffer, Image, ImageDesc};
-    use crate::pipeline::{
-        AttachmentState, DescriptorKind, FixedStateTracker, ResourceBinding, ShaderResources,
-    };
+    use crate::pipeline::{AttachmentState, FixedStateTracker};
     use crate::scheduler::Scheduler;
     use crate::{Instance, SurfaceSupport, shaders};
+    use lichii_shader::{
+        DescriptorBinding, DescriptorSetLayout, ResourceLayout, ShaderInfo, ShaderStage,
+    };
 
     const VERTEX_HASH: u64 = 0x1111;
     const FRAGMENT_HASH: u64 = 0x2222;
@@ -1096,30 +1114,50 @@ mod tests {
         }
     }
 
+    /// A module of the renderer's own SPIR-V declaring `bindings` (binding, kind) in set 0.
+    fn module(
+        hash: u64,
+        stage: ShaderStage,
+        spirv: &[u32],
+        bindings: &[(u32, DescriptorKind)],
+        push_constant_size: u32,
+    ) -> ShaderModule {
+        let bindings: Vec<_> = bindings
+            .iter()
+            .map(|&(binding, kind)| DescriptorBinding {
+                binding,
+                kind,
+                count: 1,
+                descriptor: 0,
+            })
+            .collect();
+        ShaderModule {
+            spirv: spirv.to_vec(),
+            hash,
+            stage,
+            resources: ResourceLayout {
+                sets: vec![DescriptorSetLayout { set: 0, bindings }],
+                push_constant_size,
+            },
+            info: ShaderInfo::default(),
+        }
+    }
+
     fn present_shaders() -> GraphicsShaders {
-        let vertex = ShaderProgram {
-            hash: VERTEX_HASH,
-            stage: vk::ShaderStageFlags::VERTEX,
-            spirv: shaders::FULLSCREEN_VERT.to_vec(),
-            resources: ShaderResources {
-                bindings: Vec::new(),
-                push_constant_size: 48,
-            },
-        };
-        let fragment = ShaderProgram {
-            hash: FRAGMENT_HASH,
-            stage: vk::ShaderStageFlags::FRAGMENT,
-            spirv: shaders::PRESENT_COPY_FRAG.to_vec(),
-            resources: ShaderResources {
-                bindings: vec![ResourceBinding {
-                    set: 0,
-                    binding: 0,
-                    kind: DescriptorKind::SampledImage,
-                    count: 1,
-                }],
-                push_constant_size: 48,
-            },
-        };
+        let vertex = module(
+            VERTEX_HASH,
+            ShaderStage::VertexB,
+            shaders::FULLSCREEN_VERT,
+            &[],
+            48,
+        );
+        let fragment = module(
+            FRAGMENT_HASH,
+            ShaderStage::Fragment,
+            shaders::PRESENT_COPY_FRAG,
+            &[(0, DescriptorKind::CombinedImageSampler)],
+            48,
+        );
         [
             Some(Arc::new(vertex)),
             None,
@@ -1129,22 +1167,17 @@ mod tests {
         ]
     }
 
-    fn compute_shader() -> Arc<ShaderProgram> {
-        let storage = |binding| ResourceBinding {
-            set: 0,
-            binding,
-            kind: DescriptorKind::StorageBuffer,
-            count: 1,
-        };
-        Arc::new(ShaderProgram {
-            hash: COMPUTE_HASH,
-            stage: vk::ShaderStageFlags::COMPUTE,
-            spirv: shaders::BLOCK_LINEAR_UNSWIZZLE_COMP.to_vec(),
-            resources: ShaderResources {
-                bindings: vec![storage(0), storage(1)],
-                push_constant_size: 32,
-            },
-        })
+    fn compute_shader() -> Arc<ShaderModule> {
+        Arc::new(module(
+            COMPUTE_HASH,
+            ShaderStage::Compute,
+            shaders::BLOCK_LINEAR_UNSWIZZLE_COMP,
+            &[
+                (0, DescriptorKind::StorageBuffer),
+                (1, DescriptorKind::StorageBuffer),
+            ],
+            32,
+        ))
     }
 
     fn compute_key() -> ComputePipelineKey {
@@ -1155,7 +1188,7 @@ mod tests {
         }
     }
 
-    fn resolve(hash: u64) -> Option<Arc<ShaderProgram>> {
+    fn resolve(hash: u64) -> Option<Arc<ShaderModule>> {
         let [vertex, _, _, _, fragment] = present_shaders();
         match hash {
             VERTEX_HASH => vertex,
@@ -1512,7 +1545,7 @@ mod tests {
             let layout = pipeline.layout();
             assert_eq!(layout.set_layouts().len(), 1);
             assert_eq!(layout.bindings().len(), 1);
-            assert_eq!(layout.bindings()[0].1, vk::ShaderStageFlags::FRAGMENT);
+            assert_eq!(layout.bindings()[0].stages, vk::ShaderStageFlags::FRAGMENT);
             assert_eq!(
                 layout.push_constants(),
                 (
@@ -1713,13 +1746,13 @@ mod tests {
         let mut conflicting = present_shaders();
         let mut fragment = (*conflicting[4].take().unwrap()).clone();
         fragment.hash = 0x4444;
-        fragment.resources.bindings[0].kind = DescriptorKind::StorageBuffer;
+        fragment.resources.sets[0].bindings[0].kind = DescriptorKind::StorageBuffer;
         let mut vertex = (*conflicting[0].take().unwrap()).clone();
-        vertex.resources.bindings = vec![ResourceBinding {
-            set: 0,
+        vertex.resources.sets[0].bindings = vec![DescriptorBinding {
             binding: 0,
             kind: DescriptorKind::UniformBuffer,
             count: 1,
+            descriptor: 0,
         }];
         let conflicting: GraphicsShaders = [
             Some(Arc::new(vertex)),

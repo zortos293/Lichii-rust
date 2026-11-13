@@ -112,6 +112,11 @@ impl FrameMailbox {
         *self.latest.lock() = Some(frame);
     }
 
+    /// Drops the frame, so the presenter shows nothing until the next one is published.
+    pub fn clear(&self) {
+        *self.latest.lock() = None;
+    }
+
     pub(crate) fn latest(&self) -> Option<GuestFrame> {
         self.latest.lock().clone()
     }

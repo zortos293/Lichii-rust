@@ -26,7 +26,7 @@ use crate::gmmu::{BigPageSize, Gmmu};
 use crate::host1x::Host1x;
 use crate::nx2_memory::{AddressSpaceId, Nx2GpuMemory};
 use crate::ring;
-use crate::stream::{Link, MIN_RING_SLOTS, Stream};
+use crate::stream::{FetchSyncs, Link, MIN_RING_SLOTS, Stream};
 
 /// Default ring size: 8 MiB of slots.
 pub const DEFAULT_RING_SLOTS: usize = 1 << 20;
@@ -201,6 +201,10 @@ impl Inbox {
 struct Front {
     shared: FrontShared,
     channels: Vec<Option<FrontChannel>>,
+    /// Commands not handled yet. A side command waits here while a channel is parked on a
+    /// fetch synchronisation, so it cannot overtake that channel's earlier entries, and every
+    /// command after it waits too.
+    held: VecDeque<CpuCommand>,
 }
 
 impl Front {
@@ -218,10 +222,12 @@ impl Front {
             let waiting = self.channels.iter().flatten().any(FrontChannel::is_waiting);
             let closed = inbox.take(&mut batch, waiting.then_some(poll));
             let busy = !batch.is_empty();
-            for command in batch.drain(..) {
-                self.handle(command);
-            }
+            self.held.append(&mut batch);
+            self.handle_held();
             let resumed = self.resume();
+            if resumed {
+                self.handle_held();
+            }
             self.shared.stream.idle();
             if closed {
                 break;
@@ -306,6 +312,26 @@ impl Front {
         }
     }
 
+    /// Handles the held commands in queue order. A side command stops the queue while a channel
+    /// is parked on a fetch synchronisation, because it must follow that channel's earlier
+    /// entries; the commands after it wait too, so that a later submission cannot land before
+    /// it. The wait ends once the back reaches the synchronisation.
+    fn handle_held(&mut self) {
+        while let Some(command) = self.held.pop_front() {
+            if matches!(command, CpuCommand::Side(_))
+                && self
+                    .channels
+                    .iter()
+                    .flatten()
+                    .any(FrontChannel::waits_for_fetch)
+            {
+                self.held.push_front(command);
+                return;
+            }
+            self.handle(command);
+        }
+    }
+
     /// Runs the channels whose wait is over. Returns whether any ran.
     fn resume(&mut self) -> bool {
         let mut resumed = false;
@@ -363,7 +389,14 @@ impl Gpu {
         handles.syncpoints.semaphore_waiters().attach(&inbox);
         let (producer, consumer) = ring::ring(config.ring_slots, MIN_RING_SLOTS);
         let (side_sender, side_receiver) = mpsc::channel();
-        let back = Back::new(rasterizer, &handles, config.engines, side_receiver);
+        let fetch_syncs = Arc::new(FetchSyncs::new(inbox.clone()));
+        let back = Back::new(
+            rasterizer,
+            &handles,
+            config.engines,
+            side_receiver,
+            fetch_syncs.clone(),
+        );
         let (link, back) = match config.threading {
             Threading::Split => {
                 let thread = std::thread::Builder::new()
@@ -376,7 +409,7 @@ impl Gpu {
         };
         let front = Front {
             shared: FrontShared {
-                stream: Stream::new(producer, link, side_sender),
+                stream: Stream::new(producer, link, side_sender, fetch_syncs),
                 shared_macros: None,
                 words: Vec::new(),
                 waiters: handles.syncpoints.semaphore_waiters().clone(),
@@ -384,6 +417,7 @@ impl Gpu {
                 syncpoints: handles.syncpoints.clone(),
             },
             channels: Vec::new(),
+            held: VecDeque::new(),
         };
         let front_inbox = inbox.clone();
         let front = std::thread::Builder::new()
