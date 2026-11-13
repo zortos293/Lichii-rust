@@ -726,6 +726,20 @@ impl<'a> EmitContext<'a> {
         self.profile.supports_subgroup_stage(self.stage)
     }
 
+    /// The SubgroupLocalInvocationId input, defined on first use when the shader info flags did
+    /// not declare it (quad shuffles emulated with plain shuffles).
+    pub fn subgroup_invocation_id(&mut self) -> Word {
+        if self.subgroup_local_invocation_id == 0 {
+            self.add_capability(Capability::GroupNonUniform);
+            self.subgroup_local_invocation_id =
+                self.define_input(self.u32[1], false, Some(BuiltIn::SubgroupLocalInvocationId));
+            if self.stage == ShaderStage::Fragment {
+                self.decorate(self.subgroup_local_invocation_id, Decoration::Flat, &[]);
+            }
+        }
+        self.subgroup_local_invocation_id
+    }
+
     /// Label of an IR block.
     pub fn label(&self, block: BlockId) -> Word {
         self.labels[block.0 as usize]
@@ -2119,11 +2133,15 @@ impl<'a> EmitContext<'a> {
         };
         used |= Type::U32;
         if profile.support_int8 && profile.support_storage_buffer_8bit && used.contains(Type::U8) {
+            self.add_extension("SPV_KHR_8bit_storage");
+            self.add_capability(Capability::StorageBuffer8BitAccess);
             self.define_ssbos(StorageElement::U8, *binding, self.u8, 1);
             self.define_ssbos(StorageElement::S8, *binding, self.s8, 1);
         }
         if profile.support_int16 && profile.support_storage_buffer_16bit && used.contains(Type::U16)
         {
+            self.add_extension("SPV_KHR_16bit_storage");
+            self.add_capability(Capability::StorageBuffer16BitAccess);
             self.define_ssbos(StorageElement::U16, *binding, self.u16, 2);
             self.define_ssbos(StorageElement::S16, *binding, self.s16, 2);
         }
