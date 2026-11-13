@@ -260,6 +260,16 @@ impl VideoDecoderService {
                 return BUSY;
             }
             state.submitted += 1;
+            if state.submitted <= 3 || state.submitted % 60 == 0 || input.end {
+                tracing::info!(
+                    "diag vdec submit #{} pts={} size={} end={} queued={}",
+                    state.submitted,
+                    input.pts,
+                    input.size,
+                    input.end,
+                    state.inputs.len()
+                );
+            }
             state.submitted
         };
         self.shared.wake.notify_one();
@@ -289,6 +299,9 @@ impl VideoDecoderService {
         let Some(output) = self.shared.state.lock().outputs.pop_front() else {
             return NO_OUTPUT;
         };
+        if output.end || output.pts % 1_000_000 < 17_000 {
+            tracing::info!("diag vdec output pts={} end={}", output.pts, output.end);
+        }
         for word in [
             output.image,
             output.width,
