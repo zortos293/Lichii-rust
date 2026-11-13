@@ -1012,7 +1012,7 @@ fn surface_atomic(t: &mut Translator<'_>, dest: Option<Reg>, op: u64) -> TResult
     let Some(ops) = atomic_ops(op, signed) else {
         return Err(t.unsupported());
     };
-    if insn.bit(72) || !insn.pred_dst0().is_true() {
+    if insn.bit(72) || (dest.is_some() && !insn.pred_dst0().is_true()) {
         return Err(t.unsupported());
     }
     let dim = SurfaceDim::decode(t)?;
@@ -1750,6 +1750,20 @@ mod tests {
   %5 = BoundImageAtomicIAdd32 #0x800200c0, %3, %4 (flags 0x14010000)
 "
         );
+    }
+
+    #[test]
+    fn sured_has_no_fault_predicate() {
+        let strong_gpu = 7 << 77;
+        let ignore_out_of_bounds = 1 << 84;
+        let or = 6 << 87;
+        let insn = encode(
+            Opcode::Sured,
+            Form::Bound,
+            bound(2, 0x30) | dim(3) | ra(0) | rb(4) | strong_gpu | ignore_out_of_bounds | or,
+        );
+        let ir = translate(&[insn]).unwrap();
+        assert!(ir.contains("BoundImageAtomicOr32 #0x800200c0"), "{ir}");
     }
 
     #[test]
