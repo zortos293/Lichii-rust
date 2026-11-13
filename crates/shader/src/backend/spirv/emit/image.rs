@@ -1088,7 +1088,10 @@ pub(super) fn image_fetch(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult
     let result_type = color_type(ctx, is_integer);
     let coords = ctx.def_arg(inst, 1)?;
     let offset = ctx.def_opt(ctx.arg(inst, 2))?;
-    let ms = ctx.def_opt(ctx.arg(inst, 4))?;
+    let ms = match ctx.def_opt(ctx.arg(inst, 4))? {
+        None if is_texture_msaa(ctx, info)? => Some(ctx.u32_zero_value),
+        ms => ms,
+    };
     let lod = if info.ty == TextureType::Buffer || ms.is_some() {
         None
     } else {

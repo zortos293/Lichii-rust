@@ -150,6 +150,135 @@ fn application_functions_answer_from_the_title_and_settings() {
 }
 
 #[test]
+fn later_firmware_state_and_controller_commands_answer_like_the_reference() {
+    let (_context, client, proxy) = booted(SWITCH1_TITLE);
+    let call = |session: Handle, request: Request| {
+        let reply = client.send(session, &request).unwrap();
+        assert_eq!(reply.result, ResultCode::SUCCESS);
+        reply
+    };
+    let state = interface(&client, proxy, 0);
+    call(state, Request::new(610).arg(0u64));
+    call(state, Request::new(611).arg(1u8));
+    assert_eq!(call(state, Request::new(1002)).pop::<u8>(), 0);
+    call(state, Request::new(1000));
+    assert_eq!(
+        call(state, Request::new(1002)).pop::<u8>(),
+        1,
+        "3D VR mode on"
+    );
+    call(state, Request::new(1001));
+    assert_eq!(call(state, Request::new(1002)).pop::<u8>(), 0);
+    assert_eq!(
+        call(state, Request::new(1003)).pop::<[i32; 4]>(),
+        [0, 0, 1280, 720]
+    );
+    assert_eq!(
+        call(state, Request::new(1004)).pop::<[f32; 2]>(),
+        [137.25, 77.2]
+    );
+    assert_eq!(
+        call(state, Request::new(1005)).pop::<[i32; 2]>(),
+        [1280, 720]
+    );
+
+    let controller = interface(&client, proxy, 1);
+    assert_eq!(
+        call(controller, Request::new(230).arg(7u32)).pop::<u16>(),
+        0
+    );
+    call(controller, Request::new(240).arg(7u32));
+}
+
+#[test]
+fn an_unpopped_storage_is_the_next_launch_parameter() {
+    let (_context, client, proxy) = booted(SWITCH1_TITLE);
+    let creator = interface(&client, proxy, 11);
+    let functions = interface(&client, proxy, 20);
+    let storage = |data: &[u8]| {
+        let request = Request::new(10).arg(data.len() as i64);
+        let storage = client.send(creator, &request).unwrap().move_handles[0];
+        let accessor = interface(&client, storage, 0);
+        let input = client.alloc(data);
+        let write = Request::new(10)
+            .arg(0i64)
+            .buffer_a(input, data.len() as u64);
+        assert_eq!(
+            client.send(accessor, &write).unwrap().result,
+            ResultCode::SUCCESS
+        );
+        storage
+    };
+
+    let unpop = Request::new(122).move_handle(storage(b"launch"));
+    assert_eq!(
+        client.send(functions, &unpop).unwrap().result,
+        ResultCode::SUCCESS
+    );
+    let popped = client
+        .send(functions, &Request::new(1).arg(1u32))
+        .unwrap()
+        .move_handles[0];
+    let accessor = interface(&client, popped, 0);
+    let output = client.alloc(&[0; 6]);
+    let read = Request::new(11).arg(0i64).buffer_b(output, 6);
+    assert_eq!(
+        client.send(accessor, &read).unwrap().result,
+        ResultCode::SUCCESS
+    );
+    assert_eq!(client.read(output, 6), b"launch");
+    let reply = client.send(functions, &Request::new(1).arg(1u32)).unwrap();
+    assert_eq!(reply.result, NO_DATA_IN_CHANNEL);
+    assert_eq!(
+        client.send(functions, &Request::new(122)).unwrap().result,
+        UNKNOWN
+    );
+
+    let state = interface(&client, proxy, 0);
+    let push = Request::new(20).move_handle(storage(b"general"));
+    assert_eq!(
+        client.send(state, &push).unwrap().result,
+        ResultCode::SUCCESS
+    );
+}
+
+#[test]
+fn unpopped_storages_are_charged_to_the_live_storage_budget() {
+    let (_context, client, _) = booted(SWITCH1_TITLE);
+    let am = Domain::open(&client);
+    let functions = am.object(am.proxy, Request::new(20));
+    let quarter = storage::LIVE_STORAGE_BUDGET / 4;
+    let storage = am.object(am.creator, Request::new(10).arg(quarter as i64));
+    let unpop = || {
+        am.call(functions, Request::new(122).input_object(storage))
+            .result
+    };
+    for copy in 1..=3 {
+        assert_eq!(unpop(), ResultCode::SUCCESS, "copy {copy}");
+    }
+    assert_eq!(
+        unpop(),
+        UNKNOWN,
+        "the original and three copies fill the budget"
+    );
+}
+
+#[test]
+fn cache_storage_limits_come_from_the_nacp() {
+    let mut image = crate::testing::image();
+    let mut raw = crate::testing::nacp("Cache", 1, 0).raw().to_vec();
+    raw[0x3180..0x3188].copy_from_slice(&0x40_0000u64.to_le_bytes());
+    raw[0x3188..0x318a].copy_from_slice(&3u16.to_le_bytes());
+    image.nacp = Some(lichii_fs::nacp::Nacp::parse(&raw).unwrap());
+    let (context, client) = crate::testing::context_with(image, Settings::default());
+    register(&context).unwrap();
+    let functions = interface(&client, open(&client, 0), 20);
+    let mut reply = client.send(functions, &Request::new(29)).unwrap();
+    assert_eq!(reply.result, ResultCode::SUCCESS);
+    assert_eq!((reply.pop::<u32>(), reply.pop::<u64>()), (3, 0x40_0000));
+}
+
+#[test]
 fn storages_read_and_write_within_bounds() {
     let (_context, client, proxy) = booted(SWITCH1_TITLE);
     let creator = interface(&client, proxy, 11);
@@ -277,6 +406,7 @@ fn launch_parameter_preselects_the_acc_user_whose_save_ensure_save_data_creates(
 struct Domain<'a> {
     client: &'a IpcClient,
     session: Handle,
+    proxy: u32,
     creator: u32,
 }
 
@@ -289,6 +419,7 @@ impl<'a> Domain<'a> {
         let mut domain = Self {
             client,
             session,
+            proxy,
             creator: 0,
         };
         domain.creator = domain.object(proxy, Request::new(11));

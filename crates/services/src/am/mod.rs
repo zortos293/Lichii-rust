@@ -114,13 +114,15 @@ pub(crate) struct Applet {
 struct AppletState {
     fatal_sections: u32,
     vr_mode: bool,
+    vr_mode_3d: bool,
     auto_sleep_disabled: bool,
     idle_time_detection_extension: u32,
     home_button_short_blocked: bool,
     home_button_long_blocked: bool,
     main_volume: f32,
     library_volume: f32,
-    user_channel: Vec<Vec<u8>>,
+    /// Storages for the next title, each charged to the live-storage budget until freed.
+    user_channel: Vec<Arc<storage::StorageData>>,
     /// The preselected-user launch parameter was popped; it is there once per boot.
     preselected_user_popped: bool,
     friend_invitations: Vec<Vec<u8>>,

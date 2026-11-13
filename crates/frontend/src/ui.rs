@@ -115,6 +115,9 @@ impl App {
             egui::CentralPanel::default().show(ui, |ui| self.game_list(ui, actions));
         }
         self.dialogs(ui.ctx(), actions);
+        if let Some(session) = &mut self.session {
+            session.show_applets(ui.ctx());
+        }
         self.show_config(ui.ctx());
         self.show_setup(ui.ctx());
         self.show_game_config(ui.ctx());

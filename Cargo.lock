@@ -1540,6 +1540,7 @@ dependencies = [
  "lichii-fs",
  "lichii-input",
  "lichii-loader",
+ "lichii-services",
  "lichii-texture",
  "lichii-vulkan",
  "rfd",

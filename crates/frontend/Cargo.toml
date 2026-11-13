@@ -17,6 +17,7 @@ lichii-crypto.workspace = true
 lichii-fs.workspace = true
 lichii-input.workspace = true
 lichii-loader.workspace = true
+lichii-services.workspace = true
 lichii-texture.workspace = true
 lichii-vulkan.workspace = true
 crossbeam-channel.workspace = true

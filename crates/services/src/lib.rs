@@ -53,7 +53,9 @@ mod fs;
 mod gsv;
 mod hid;
 mod lm;
+mod mm;
 mod ncm;
+mod ngc;
 mod nifm;
 mod nim;
 mod ns;
@@ -112,6 +114,8 @@ pub fn register_all(context: &Arc<ServiceContext>) -> HleResult<()> {
     spl::register(context)?;
     ptm::register(context)?;
     fatal::register(context)?;
+    mm::register(context)?;
+    ngc::register(context)?;
     ro::register(context)?;
     let nvdrv = nvdrv::register(context)?;
     vi::register(context, nvdrv)?;
