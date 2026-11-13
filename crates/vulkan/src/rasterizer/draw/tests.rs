@@ -1859,7 +1859,7 @@ fn launch(
     program: u64,
     cbuf: u64,
     grid: [u32; 3],
-    indirect_grid: Option<u64>,
+    indirect: Option<(u64, QmdVersion)>,
 ) {
     let mut const_buffers = [ConstBufferBinding::default(); 8];
     const_buffers[0] = ConstBufferBinding {
@@ -1884,10 +1884,12 @@ fn launch(
         linked_samplers: false,
         qmd_version: QmdVersion::V2,
         qmd: &qmd,
-        indirect_grid: indirect_grid.map(|offset| GPU_VA + offset),
-        indirect: indirect_grid.map(|offset| IndirectGrid {
+        indirect_grid: indirect
+            .filter(|&(_, layout)| layout == QmdVersion::V2)
+            .map(|(offset, _)| GPU_VA + offset),
+        indirect: indirect.map(|(offset, layout)| IndirectGrid {
             address: GPU_VA + offset,
-            layout: QmdVersion::V2,
+            layout,
         }),
     });
 }
@@ -1913,7 +1915,14 @@ fn indirect_dispatches_unpack_the_descriptor_grid() {
     let packed = [3 | 1 << 31, 4 | 5 << 16, 7];
     let grid = GRID + 0x24;
     write(&f, grid, bytemuck::cast_slice(&packed));
-    launch(&mut f, &gmmu, COUNTING, COUNTER_CBUF, [1; 3], Some(grid));
+    launch(
+        &mut f,
+        &gmmu,
+        COUNTING,
+        COUNTER_CBUF,
+        [1; 3],
+        Some((grid, QmdVersion::V2)),
+    );
     assert_eq!(
         counted(&mut f),
         [3 * 4 * 5, 3 * 5 * (1 + 2 + 3)],
@@ -1935,11 +1944,64 @@ fn indirect_dispatches_read_the_grid_earlier_gpu_work_wrote() {
     write(&f, COUNTER, &[0; 8]);
     write(&f, GRID, bytemuck::cast_slice(&[1u32, 1 | 1 << 16]));
     launch(&mut f, &gmmu, GRID_WRITER, GRID_CBUF, [1; 3], None);
-    launch(&mut f, &gmmu, COUNTING, COUNTER_CBUF, [1; 3], Some(GRID));
+    launch(
+        &mut f,
+        &gmmu,
+        COUNTING,
+        COUNTER_CBUF,
+        [1; 3],
+        Some((GRID, QmdVersion::V2)),
+    );
     assert_eq!(
         counted(&mut f),
         [2 * 3 * 4, 2 * 4 * (1 + 2)],
         "the 2x3x4 grid the first dispatch stored, not the guest's 1x1x1"
+    );
+    assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn v2_and_v3_indirect_grids_unpack_in_their_own_layout() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(&f, COUNTING, &counting_program());
+    storage_binding(&f, COUNTER_CBUF, COUNTER);
+    write(&f, COUNTER, &[0; 8]);
+    let packed = [3, 4 | 5 << 16, 2 | 7 << 16];
+    let (v2, v3) = (GRID + 0x24, GRID + 0x134);
+    write(&f, v2, bytemuck::cast_slice(&packed));
+    write(&f, v3, bytemuck::cast_slice(&packed));
+    let v2_counted = [3 * 4 * 5, 3 * 5 * (1 + 2 + 3)];
+    launch(
+        &mut f,
+        &gmmu,
+        COUNTING,
+        COUNTER_CBUF,
+        [1; 3],
+        Some((v2, QmdVersion::V2)),
+    );
+    assert_eq!(
+        counted(&mut f),
+        v2_counted,
+        "version 1.x: depth 5 from the high half of the second word"
+    );
+    launch(
+        &mut f,
+        &gmmu,
+        COUNTING,
+        COUNTER_CBUF,
+        [1; 3],
+        Some((v3, QmdVersion::V3)),
+    );
+    assert_eq!(
+        counted(&mut f),
+        [
+            v2_counted[0] + 3 * 4 * 2,
+            v2_counted[1] + 3 * 2 * (1 + 2 + 3)
+        ],
+        "version 3.0: depth 2 from the low half of the third word"
     );
     assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
     f.assert_no_validation_errors();
