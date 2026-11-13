@@ -186,10 +186,17 @@ fn swap(staging: &Path, registered: &Path) -> Result<(), FirmwareError> {
     }
     if let Err(e) = std::fs::rename(staging, registered) {
         tracing::error!(dir = %registered.display(), "moving the new firmware in place: {e}");
-        if backup.exists() {
-            let _ = std::fs::rename(&backup, registered);
-        }
         let _ = std::fs::remove_dir_all(staging);
+        if backup.exists()
+            && let Err(e) = std::fs::rename(&backup, registered)
+        {
+            tracing::error!(dir = %backup.display(), "putting the old firmware back: {e}");
+            return Err(FirmwareError::Source(format!(
+                "The new firmware could not be moved into NAND, and the old firmware could not be \
+                 put back. It is in {}; rename that folder to \"registered\" to restore it.",
+                backup.display()
+            )));
+        }
         return Err(FirmwareError::FailedCopy);
     }
     if backup.exists()
