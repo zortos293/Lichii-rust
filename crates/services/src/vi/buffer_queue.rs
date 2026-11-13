@@ -106,6 +106,8 @@ const _: () = assert!(std::mem::size_of::<QueueBufferInput>() == 84);
 #[derive(Clone, Copy)]
 pub(super) struct Item {
     slot: usize,
+    /// The queue's frame number, which tells this frame from a later one in the same slot.
+    frame: u64,
     pub buffer: GraphicBuffer,
     /// left, top, right, bottom; empty for the whole buffer.
     pub crop: [i32; 4],
@@ -407,6 +409,7 @@ impl BufferQueue {
         entry.frame = state.frames;
         state.queue.push_back(Item {
             slot: index,
+            frame: state.frames,
             buffer,
             crop: input.crop,
             transform: input.transform,
@@ -441,11 +444,12 @@ impl BufferQueue {
         state.shown || !state.queue.is_empty()
     }
 
-    /// Gives a shown frame's buffer back to the producer.
+    /// Gives a shown frame's buffer back to the producer, unless the slot has moved on to another
+    /// frame since (a disconnect or a new buffer reset it while the present waited for its fence).
     pub fn release(&self, item: &Item) {
         let mut state = self.state.lock();
         let slot = &mut state.slots[item.slot];
-        if slot.state == SlotState::Acquired {
+        if slot.state == SlotState::Acquired && slot.frame == item.frame {
             slot.state = SlotState::Free;
             slot.fence = Fence::NONE;
         }
