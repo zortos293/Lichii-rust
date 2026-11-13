@@ -65,7 +65,7 @@ fn logic_flags(sf: bool, r: u64) -> u32 {
 
 /// `ConditionHolds` for a 4-bit condition and the NZCV nibble.
 #[inline]
-pub(super) const fn condition_holds(cond: u8, flags: u32) -> bool {
+pub(crate) const fn condition_holds(cond: u8, flags: u32) -> bool {
     let (n, z, c, v) = (
         flags & 8 != 0,
         flags & 4 != 0,
@@ -1114,7 +1114,7 @@ macro_rules! rmw {
 
 /// # Safety
 /// `ptr` must be valid for `1 << size` bytes and aligned to them.
-unsafe fn atomic_rmw(ptr: *mut u8, size: u8, op: AtomicOp, operand: u64) -> u64 {
+pub(crate) unsafe fn atomic_rmw(ptr: *mut u8, size: u8, op: AtomicOp, operand: u64) -> u64 {
     match size {
         0 => rmw!(AtomicU8, AtomicI8, u8, i8, ptr, op, operand),
         1 => rmw!(AtomicU16, AtomicI16, u16, i16, ptr, op, operand),
@@ -1127,7 +1127,7 @@ unsafe fn atomic_rmw(ptr: *mut u8, size: u8, op: AtomicOp, operand: u64) -> u64 
 ///
 /// # Safety
 /// `ptr` must be valid for `1 << size` bytes and aligned to them.
-unsafe fn atomic_cas(ptr: *mut u8, size: u8, expected: u64, new: u64) -> u64 {
+pub(crate) unsafe fn atomic_cas(ptr: *mut u8, size: u8, expected: u64, new: u64) -> u64 {
     macro_rules! cas {
         ($atomic:ty) => {{
             // SAFETY: guaranteed by the caller.

@@ -1,9 +1,12 @@
 //! host1x syncpoints: 32-bit counters the CPU and the GPU wait on.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
+
+use crate::channel::SemaphoreWaiters;
 
 /// Syncpoint ids per bank. Switch 2 ids are below 0x400; Switch 1 uses the first 192.
 pub const SYNCPOINT_COUNT: usize = 1024;
@@ -28,10 +31,14 @@ pub struct ActionHandle {
     serial: u64,
 }
 
-/// Both syncpoint banks, as yuzu's SyncpointManager keeps them.
+/// Both syncpoint banks, as yuzu's SyncpointManager keeps them, and the maximum value each id is
+/// expected to reach: the one record nvhost-ctrl, nvhost-gpu submits and the Switch 2 syncpoint
+/// sessions share.
 pub struct Syncpoints {
     guest: SyncpointBank,
     host: SyncpointBank,
+    max: Box<[AtomicU32]>,
+    semaphores: Arc<SemaphoreWaiters>,
 }
 
 impl Syncpoints {
@@ -39,7 +46,35 @@ impl Syncpoints {
         Self {
             guest: SyncpointBank::new(),
             host: SyncpointBank::new(),
+            max: (0..SYNCPOINT_COUNT).map(|_| AtomicU32::new(0)).collect(),
+            semaphores: Arc::default(),
         }
+    }
+
+    /// The value `id` reaches once every increment reserved so far ran.
+    #[inline]
+    pub fn max(&self, id: u32) -> Result<u32, InvalidSyncpoint> {
+        Ok(self.max_slot(id)?.load(Ordering::Acquire))
+    }
+
+    /// Reserves `count` increments of `id` and returns the new maximum (wrapping), the value a
+    /// fence for them waits for.
+    #[inline]
+    pub fn increase_max(&self, id: u32, count: u32) -> Result<u32, InvalidSyncpoint> {
+        Ok(self
+            .max_slot(id)?
+            .fetch_add(count, Ordering::AcqRel)
+            .wrapping_add(count))
+    }
+
+    fn max_slot(&self, id: u32) -> Result<&AtomicU32, InvalidSyncpoint> {
+        self.max.get(id as usize).ok_or(InvalidSyncpoint(id))
+    }
+
+    /// GPU channels waiting on semaphores in memory: semaphore writes that land through
+    /// [`FenceAction::execute`](crate::backend::FenceAction::execute) latch and wake them.
+    pub fn semaphore_waiters(&self) -> &Arc<SemaphoreWaiters> {
+        &self.semaphores
     }
 
     /// Values the guest sees: incremented once the work before an increment has completed on
@@ -247,6 +282,21 @@ mod tests {
             syncpoints.guest().increment(0x400),
             Err(InvalidSyncpoint(0x400))
         );
+    }
+
+    #[test]
+    fn max_values_are_reserved_per_id() {
+        let syncpoints = Syncpoints::new();
+        assert_eq!(syncpoints.increase_max(3, 2), Ok(2));
+        assert_eq!(syncpoints.increase_max(3, 1), Ok(3));
+        assert_eq!(syncpoints.max(3), Ok(3));
+        assert_eq!(syncpoints.max(4), Ok(0));
+        assert_eq!(syncpoints.guest().value(3), Ok(0));
+        assert_eq!(
+            syncpoints.increase_max(0x400, 1),
+            Err(InvalidSyncpoint(0x400))
+        );
+        assert_eq!(syncpoints.max(0x400), Err(InvalidSyncpoint(0x400)));
     }
 
     #[test]

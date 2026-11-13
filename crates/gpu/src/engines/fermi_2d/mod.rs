@@ -3,10 +3,10 @@
 //! The only method that does work is the high word of `pixels_from_memory.src_y0`: it blits the
 //! source surface into the destination surface. The engine builds the backend's [`Blit`] from
 //! the registers and offers it to the renderer; when the renderer declines it runs the blit in
-//! software ([`blitter`]) through the GMMU.
+//! software (`blitter`) through the GMMU.
 //!
 //! Supported as in the reference: `SRC_COPY` blits without clipping, through the render-target
-//! formats in [`converter`]. Other operations, clipping, the pixels-from-CPU path and solid
+//! formats in `converter`. Other operations, clipping, the pixels-from-CPU path and solid
 //! primitives are not executed; the software path ignores the operation, as the reference does.
 
 mod blitter;

@@ -1,0 +1,584 @@
+//! The JIT against the interpreter: random instruction streams run on both, with every pass
+//! combination, and every register, the flags, the vector registers, the halt reason and the
+//! data region must match.
+//!
+//! `LICHII_JIT_CASES` sets the number of streams (default 400).
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use lichii_memory::{AddressSpace, ExclusiveMonitor, MemoryPermission, PhysicalMemory};
+
+use super::{Jit, Passes};
+use crate::decoder::{Inst, decode};
+use crate::{CpuConfig, CpuCore, GuestClock, HaltReason, Interpreter, ThreadContext};
+
+const CODE: u64 = 0x10000;
+const CODE_SIZE: u64 = 0x4000;
+const DATA: u64 = 0x100000;
+const DATA_SIZE: u64 = 0x8000;
+/// Read-only data right after `DATA`; the page after it is unmapped.
+const RODATA: u64 = DATA + DATA_SIZE;
+const BRK: u32 = 0xd420_0000;
+const BASES: u32 = 20;
+
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+
+    fn interesting(&mut self) -> u64 {
+        const VALUES: [u64; 10] = [
+            0,
+            1,
+            u64::MAX,
+            0x7fff_ffff,
+            0x8000_0000,
+            0xffff_ffff,
+            0x1_0000_0000,
+            0x7fff_ffff_ffff_ffff,
+            0x8000_0000_0000_0000,
+            63,
+        ];
+        match self.below(4) {
+            0 => VALUES[self.below(VALUES.len() as u64) as usize],
+            1 => self.below(64),
+            _ => self.next(),
+        }
+    }
+
+    fn pattern(&mut self, bits: &str) -> u32 {
+        let random = self.next() as u32;
+        bits.bytes().enumerate().fold(0, |w, (i, c)| {
+            let bit = 1 << (31 - i);
+            match c {
+                b'1' => w | bit,
+                b'0' => w,
+                _ => w | (random & bit),
+            }
+        })
+    }
+}
+
+const ALU: [&str; 17] = [
+    "xxx10000xxxxxxxxxxxxxxxxxxxxxxxx",
+    "xxx100010xxxxxxxxxxxxxxxxxxxxxxx",
+    "xxx100100xxxxxxxxxxxxxxxxxxxxxxx",
+    "xxx100101xxxxxxxxxxxxxxxxxxxxxxx",
+    "xxx100110xxxxxxxxxxxxxxxxxxxxxxx",
+    "xxx100111xxxxxxxxxxxxxxxxxxxxxxx",
+    "xxx01011xx0xxxxxxxxxxxxxxxxxxxxx",
+    "xxx01011xx1xxxxxxxxxxxxxxxxxxxxx",
+    "xxx11010000xxxxx000000xxxxxxxxxx",
+    "xxx01010xxxxxxxxxxxxxxxxxxxxxxxx",
+    "xx111010010xxxxxxxxxx0xxxxx0xxxx",
+    "xx011010100xxxxxxxxxxxxxxxxxxxxx",
+    "x1011010110000000000xxxxxxxxxxxx",
+    "x0011010110xxxxxxxxxxxxxxxxxxxxx",
+    "xxx11011xxxxxxxxxxxxxxxxxxxxxxxx",
+    "11010101000x1011010000100000xxxx",
+    "1101010100x1101111010000010xxxxx",
+];
+
+fn alu(rng: &mut Rng) -> u32 {
+    loop {
+        let class = ALU[rng.below(ALU.len() as u64) as usize];
+        let mut w = rng.pattern(class);
+        if rng.below(8) != 0 && w >> 22 != 0b1101010100 {
+            w &= !0x10;
+        }
+        if !matches!(decode(w), Inst::Undefined { .. }) {
+            return w;
+        }
+    }
+}
+
+/// A load or store of one register or a pair, based on `X20`..`X23` or `SP`, with data
+/// registers `X0`..`X15` or any vector register.
+fn memory(rng: &mut Rng) -> u32 {
+    loop {
+        let base = if rng.below(6) == 0 {
+            31
+        } else {
+            BASES + rng.below(4) as u32
+        };
+        let rt = rng.below(16) as u32;
+        let rt2 = rng.below(16) as u32;
+        let vector = rng.below(4) == 0;
+        let w = match rng.below(4) {
+            0 => {
+                let imm = rng.below(32) as u32;
+                rng.pattern("xx111x01xx000000000000xxxxxxxxxx") | imm << 10
+            }
+            1 => {
+                let imm = (rng.below(64) as i32 - 32) as u32 & 0x1ff;
+                rng.pattern("xx111x00xx0000000000xxxxxxxxxxxx") | imm << 12
+            }
+            2 => {
+                let index = if rng.below(2) == 0 { 24 } else { 26 };
+                rng.pattern("xx111x00xx1xxxxxxxxx10xxxxxxxxxx") & !(0x1f << 16) | index << 16
+            }
+            _ => {
+                let imm = (rng.below(16) as i32 - 8) as u32 & 0x7f;
+                rng.pattern("xx101x0xxx0000000xxxxxxxxxxxxxxx") & !(0x1f << 10)
+                    | imm << 15
+                    | rt2 << 10
+            }
+        };
+        let w = (w & !(1 << 26)) | (vector as u32) << 26;
+        let w = (w & !0x3ff) | base << 5 | rt;
+        if !matches!(
+            decode(w),
+            Inst::Undefined { .. }
+                | Inst::Nop
+                | Inst::StoreTag { .. }
+                | Inst::LoadExclusive { .. }
+                | Inst::StoreExclusive { .. }
+        ) {
+            return w;
+        }
+    }
+}
+
+/// An LSE `LD<op>`/`SWP` or `CAS` on `X20`..`X23`.
+fn atomic(rng: &mut Rng) -> u32 {
+    loop {
+        let class = if rng.below(4) == 0 {
+            "xx0010001x1xxxxxx11111xxxxxxxxxx"
+        } else {
+            "xx111000xx1xxxxxxxxx00xxxxxxxxxx"
+        };
+        let base = BASES + rng.below(4) as u32;
+        let w = (rng.pattern(class) & !0x3f0) | base << 5;
+        if matches!(decode(w), Inst::AtomicRmw { .. } | Inst::Cas { .. }) {
+            return w;
+        }
+    }
+}
+
+fn simd(rng: &mut Rng) -> u32 {
+    rng.pattern("0x00111x0xxxxxxxxxxxx1xxxxxxxxxx")
+}
+
+/// A forward branch from `from` to `to` (word indices).
+fn branch(rng: &mut Rng, from: usize, to: usize) -> u32 {
+    let words = (to - from) as u32;
+    let rt = rng.below(16) as u32;
+    match rng.below(4) {
+        0 => 0x5400_0000 | (words & 0x7ffff) << 5 | rng.below(16) as u32,
+        1 => rng.pattern("x011010x000000000000000000000000") | (words & 0x7ffff) << 5 | rt,
+        2 => rng.pattern("x011011xxxxxx0000000000000000000") | (words & 0x3fff) << 5 | rt,
+        _ => 0x1400_0000 | (words & 0x3ff_ffff),
+    }
+}
+
+fn stream(rng: &mut Rng) -> Vec<u32> {
+    let len = 1 + rng.below(40) as usize;
+    let mut kinds: Vec<u64> = (0..len).map(|_| rng.below(16)).collect();
+    if rng.below(4) == 0 {
+        kinds.iter_mut().for_each(|k| *k %= 8);
+    }
+    (0..len)
+        .map(|i| match kinds[i] {
+            0..=7 => alu(rng),
+            8..=11 => memory(rng),
+            12 => simd(rng),
+            14 => atomic(rng),
+            13 => {
+                let to = i + 1 + rng.below((len - i) as u64) as usize;
+                branch(rng, i, to)
+            }
+            _ => alu(rng),
+        })
+        .chain([BRK])
+        .collect()
+}
+
+/// Counts reads, so every `CNTPCT` read returns a new value in program order.
+#[derive(Default)]
+struct Clock(AtomicU64);
+
+impl GuestClock for Clock {
+    fn ticks(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Backend {
+    Interpreter,
+    Jit(Passes),
+    /// The JIT on an address space without a fastmem arena.
+    SlowJit,
+}
+
+struct Machine {
+    mem: Arc<AddressSpace>,
+    core: Box<dyn CpuCore>,
+}
+
+impl Machine {
+    fn new(backend: Backend) -> Self {
+        let physical = Arc::new(PhysicalMemory::new(1 << 20).unwrap());
+        let mem = Arc::new(match backend {
+            Backend::SlowJit => AddressSpace::new(physical, 39),
+            _ => AddressSpace::with_fastmem(physical, 39).unwrap(),
+        });
+        mem.map(CODE, 0, CODE_SIZE, MemoryPermission::READ_EXECUTE);
+        mem.map(DATA, 0x10000, DATA_SIZE, MemoryPermission::READ_WRITE);
+        mem.map(RODATA, 0x20000, 0x1000, MemoryPermission::READ);
+        let config = CpuConfig {
+            memory: mem.clone(),
+            monitor: Arc::new(ExclusiveMonitor::new(1)),
+            clock: Arc::new(Clock::default()),
+            core_index: 0,
+            ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
+            dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+        };
+        let core: Box<dyn CpuCore> = match backend {
+            Backend::Interpreter => Box::new(Interpreter::new(config)),
+            Backend::Jit(passes) => Box::new(Jit::with_passes(config, passes).unwrap()),
+            Backend::SlowJit => Box::new(Jit::new(config).unwrap()),
+        };
+        Self { mem, core }
+    }
+
+    fn run(&mut self, code: &[u32], ctx: &ThreadContext, data: &[u8]) -> Outcome {
+        let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+        self.mem.write_bytes(CODE, &bytes).unwrap();
+        self.mem.write_bytes(DATA, data).unwrap();
+        self.core.clear_code_cache();
+        let mut ctx = ctx.clone();
+        let halt = self.core.run(&mut ctx);
+        let mut data = vec![0; DATA_SIZE as usize];
+        self.mem.read_bytes(DATA, &mut data).unwrap();
+        Outcome { halt, ctx, data }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct Outcome {
+    halt: HaltReason,
+    ctx: ThreadContext,
+    data: Vec<u8>,
+}
+
+fn initial(rng: &mut Rng) -> ThreadContext {
+    let mut ctx = ThreadContext {
+        x: std::array::from_fn(|_| rng.interesting()),
+        sp: DATA + 0x4000 + 16 * rng.below(64),
+        pc: CODE,
+        pstate: (rng.below(16) as u32) << 28,
+        v: std::array::from_fn(|_| (rng.next() as u128) << 64 | rng.next() as u128),
+        tpidr_el0: rng.next(),
+        ..Default::default()
+    };
+    let align = if rng.below(2) == 0 { !15 } else { !0 };
+    for b in 0..4 {
+        ctx.x[(BASES + b) as usize] = (DATA + 0x2000 + rng.below(0x4000)) & align;
+    }
+    if rng.below(16) == 0 {
+        ctx.x[BASES as usize] = match rng.below(4) {
+            0 => RODATA + rng.below(0x1000),
+            1 => RODATA + 0x1000 - rng.below(8),
+            2 => 1 << 39,
+            _ => rng.next(),
+        };
+    }
+    ctx.x[24] = rng.below(64);
+    ctx.x[26] = rng.below(64).wrapping_neg();
+    ctx
+}
+
+fn describe(code: &[u32], expected: &Outcome, actual: &Outcome) -> String {
+    let words: Vec<String> = code.iter().map(|w| format!("{w:08x}")).collect();
+    let mut lines = vec![words.join(" ")];
+    if expected.halt != actual.halt {
+        lines.push(format!(
+            "halt: interpreter {:?}, jit {:?}",
+            expected.halt, actual.halt
+        ));
+    }
+    let (e, a) = (&expected.ctx, &actual.ctx);
+    for i in 0..31 {
+        if e.x[i] != a.x[i] {
+            lines.push(format!(
+                "x{i}: interpreter {:#x}, jit {:#x}",
+                e.x[i], a.x[i]
+            ));
+        }
+    }
+    for (name, e, a) in [
+        ("sp", e.sp, a.sp),
+        ("pc", e.pc, a.pc),
+        ("tpidr", e.tpidr_el0, a.tpidr_el0),
+    ] {
+        if e != a {
+            lines.push(format!("{name}: interpreter {e:#x}, jit {a:#x}"));
+        }
+    }
+    if e.pstate != a.pstate || e.fpcr != a.fpcr || e.fpsr != a.fpsr {
+        lines.push(format!(
+            "pstate/fpcr/fpsr: interpreter {:#x}/{:#x}/{:#x}, jit {:#x}/{:#x}/{:#x}",
+            e.pstate, e.fpcr, e.fpsr, a.pstate, a.fpcr, a.fpsr
+        ));
+    }
+    for i in 0..32 {
+        if e.v[i] != a.v[i] {
+            lines.push(format!(
+                "v{i}: interpreter {:#x}, jit {:#x}",
+                e.v[i], a.v[i]
+            ));
+        }
+    }
+    if let Some(i) = (0..expected.data.len()).find(|&i| expected.data[i] != actual.data[i]) {
+        lines.push(format!("memory differs first at {:#x}", DATA + i as u64));
+    }
+    lines.join("\n")
+}
+
+const ABLATIONS: [Passes; 4] = [
+    Passes {
+        get_set: false,
+        fold: false,
+        dce: false,
+    },
+    Passes {
+        get_set: false,
+        ..Passes::ALL
+    },
+    Passes {
+        fold: false,
+        ..Passes::ALL
+    },
+    Passes {
+        dce: false,
+        ..Passes::ALL
+    },
+];
+
+fn compare(machines: &mut [(&str, Machine)], code: &[u32], ctx: &ThreadContext, data: &[u8]) {
+    let (reference, rest) = machines.split_first_mut().unwrap();
+    let expected = reference.1.run(code, ctx, data);
+    for (name, machine) in rest {
+        let actual = machine.run(code, ctx, data);
+        if actual != expected {
+            panic!("{name}\n{}", describe(code, &expected, &actual));
+        }
+    }
+}
+
+#[test]
+fn random_streams_match_the_interpreter() {
+    let cases = std::env::var("LICHII_JIT_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(400);
+    let mut machines = vec![("interpreter", Machine::new(Backend::Interpreter))];
+    machines.push(("jit", Machine::new(Backend::Jit(Passes::ALL))));
+    machines.push(("jit without fastmem", Machine::new(Backend::SlowJit)));
+    for (i, passes) in ABLATIONS.iter().enumerate() {
+        let name = [
+            "jit without passes",
+            "jit without get/set",
+            "jit without folding",
+            "jit without dce",
+        ][i];
+        machines.push((name, Machine::new(Backend::Jit(*passes))));
+    }
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    let mut data = vec![0u8; DATA_SIZE as usize];
+    for _ in 0..cases {
+        let code = stream(&mut rng);
+        for chunk in data.chunks_mut(8) {
+            chunk.copy_from_slice(&rng.next().to_le_bytes());
+        }
+        let ctx = initial(&mut rng);
+        compare(&mut machines, &code, &ctx, &data);
+    }
+}
+
+fn directed(code: &[u32], regs: &[(usize, u64)]) {
+    let mut ctx = ThreadContext {
+        pc: CODE,
+        sp: DATA + 0x4000,
+        ..Default::default()
+    };
+    for &(r, value) in regs {
+        ctx.x[r] = value;
+    }
+    let mut code = code.to_vec();
+    code.push(BRK);
+    let data = vec![0x5a; DATA_SIZE as usize];
+    let mut machines = vec![
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+        ("jit without fastmem", Machine::new(Backend::SlowJit)),
+    ];
+    compare(&mut machines, &code, &ctx, &data);
+}
+
+#[test]
+fn faults_leave_the_interpreters_state() {
+    const MOV_X0_1: u32 = 0xd280_0020;
+    const MOV_X0_2: u32 = 0xd280_0040;
+    const LDR_X1_X2: u32 = 0xf940_0041;
+    const STR_X1_X2: u32 = 0xf900_0041;
+    const LDR_Q0_X2: u32 = 0x3dc0_0040;
+    const STR_W1_X2: u32 = 0xb900_0041;
+    for addr in [
+        0x5000_0000,
+        RODATA + 0x1000,
+        RODATA + 0x1000 - 4,
+        1 << 39,
+        (1 << 39) - 4,
+        u64::MAX - 3,
+        CODE,
+    ] {
+        for access in [LDR_X1_X2, STR_X1_X2, LDR_Q0_X2, STR_W1_X2] {
+            directed(&[MOV_X0_1, access, MOV_X0_2], &[(2, addr)]);
+        }
+    }
+}
+
+#[test]
+fn stores_to_read_only_pages_fault_through_the_handler() {
+    const STRB_W1_X2: u32 = 0x3900_0041;
+    const STP_X1_X3_X2: u32 = 0xa900_0c41;
+    directed(&[STRB_W1_X2], &[(1, 7), (2, RODATA + 5)]);
+    directed(&[STP_X1_X3_X2], &[(2, RODATA - 8)]);
+}
+
+#[test]
+fn invalidation_retranslates_changed_code() {
+    let mut machine = Machine::new(Backend::Jit(Passes::ALL));
+    let ctx = ThreadContext {
+        pc: CODE,
+        ..Default::default()
+    };
+    let data = vec![0; DATA_SIZE as usize];
+    let first = machine.run(&[0xd280_0020, BRK], &ctx, &data);
+    assert_eq!(first.ctx.x[0], 1);
+    machine.mem.write(CODE, 0xd280_0040u32).unwrap();
+    let mut again = ctx.clone();
+    machine.core.run(&mut again);
+    assert_eq!(
+        again.x[0], 1,
+        "the stale block still runs before invalidation"
+    );
+    machine.core.invalidate_code(CODE, 4);
+    let mut fresh = ctx.clone();
+    machine.core.run(&mut fresh);
+    assert_eq!(fresh.x[0], 2);
+}
+
+#[test]
+fn register_pressure_spills_and_reloads() {
+    let mut code = Vec::new();
+    for i in 0..15u32 {
+        code.push(0x9100_0400 | i << 5 | i);
+    }
+    code.push(0xf940_0281);
+    for i in 0..15u32 {
+        code.push(0x8b00_0000 | (14 - i) << 16 | i << 5 | (15 + i));
+    }
+    let regs: Vec<(usize, u64)> = (0..31)
+        .map(|r| (r, 0x1111_0000_0000 * r as u64 + r as u64))
+        .chain([(20, DATA + 0x100)])
+        .collect();
+    directed(&code, &regs);
+}
+
+#[test]
+fn vector_pressure_spills_and_reloads() {
+    let mut code = Vec::new();
+    for i in 0..20u32 {
+        code.push(0x3dc0_0280 | i << 10 | i);
+    }
+    for i in 0..20u32 {
+        code.push(0x3d80_0280 | (i + 20) << 10 | (19 - i));
+    }
+    directed(&code, &[(20, DATA + 0x200)]);
+}
+
+#[test]
+fn slow_paths_keep_live_registers_of_both_classes() {
+    let mut code = Vec::new();
+    for i in 0..9u32 {
+        code.push(0x9100_0400 | i << 5 | i);
+    }
+    for i in 0..15u32 {
+        code.push(0x3dc0_0280 | i << 10 | i);
+    }
+    for i in 0..9u32 {
+        code.push(0x8b00_0000 | (8 - i) << 16 | i << 5 | (10 + i));
+    }
+    for i in 0..15u32 {
+        code.push(0x3d80_0280 | (i + 20) << 10 | (14 - i));
+    }
+    let regs: Vec<(usize, u64)> = (0..20)
+        .map(|r| (r, 0x0101_0101_0101 * r as u64 + 3))
+        .chain([(20, DATA + 0x200)])
+        .collect();
+    directed(&code, &regs);
+}
+
+#[test]
+fn zeroing_a_block_matches_the_interpreter() {
+    const DC_ZVA_X2: u32 = 0xd50b_7422;
+    for addr in [
+        DATA + 0x100,
+        DATA + 0x13f,
+        RODATA + 0x40,
+        RODATA + 0x1000,
+        1 << 39,
+        u64::MAX,
+    ] {
+        directed(&[0xd280_0020, DC_ZVA_X2, 0xd280_0040], &[(2, addr)]);
+    }
+}
+
+#[test]
+fn counter_reads_call_the_clock_in_order() {
+    const MRS_X0_CNTPCT: u32 = 0xd53b_e020;
+    const MRS_X1_CNTVCT: u32 = 0xd53b_e041;
+    const LDR_X3_X20: u32 = 0xf940_0283;
+    directed(
+        &[MRS_X0_CNTPCT, LDR_X3_X20, MRS_X1_CNTVCT, 0x8b01_0002],
+        &[(20, DATA + 0x80), (9, 7), (10, 8)],
+    );
+}
+
+#[test]
+fn atomics_fault_like_the_interpreter() {
+    const LDADD_X1_X3_X20: u32 = 0xf821_0283;
+    const CAS_W1_W3_X20: u32 = 0x88a1_7e83;
+    const LDSMAXAB_W1_W3_X20: u32 = 0x38a1_4283;
+    const SWPLH_W1_W3_X20: u32 = 0x7861_8283;
+    for addr in [
+        DATA + 0x100,
+        DATA + 0x101,
+        DATA + 0x104,
+        RODATA + 0x10,
+        RODATA + 0x1000,
+        1 << 39,
+    ] {
+        for access in [
+            LDADD_X1_X3_X20,
+            CAS_W1_W3_X20,
+            LDSMAXAB_W1_W3_X20,
+            SWPLH_W1_W3_X20,
+        ] {
+            directed(&[access], &[(20, addr), (1, 0x8000_0081)]);
+        }
+    }
+}
