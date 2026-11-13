@@ -608,10 +608,13 @@ fn copy_lines(
             components[2] = Some(ctx.b.f_mul(ctx.f32[1], None, sum, half)?);
         }
         let pointer = ctx.b.access_chain(pointer_type, None, variable, [index])?;
-        let zero = ctx.const_f32(0.0);
-        let value =
-            ctx.b
-                .composite_construct(f32x4, None, components.map(|c| c.unwrap_or(zero)))?;
+        let (zero, one) = (ctx.const_f32(0.0), ctx.const_f32(1.0));
+        let defaults = [zero, zero, zero, one];
+        let value = ctx.b.composite_construct(
+            f32x4,
+            None,
+            [0, 1, 2, 3].map(|i| components[i].unwrap_or(defaults[i])),
+        )?;
         store(ctx, pointer, value)?;
     }
     Ok(())
