@@ -71,7 +71,8 @@ fn validate(name: &str, profile: &Profile, code: &[u32]) {
     );
 }
 
-fn emit(
+/// Emits `program` and validates the module with spirv-val.
+pub(crate) fn emit(
     name: &str,
     profile: &Profile,
     runtime: &RuntimeInfo,

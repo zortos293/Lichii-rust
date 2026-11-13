@@ -174,3 +174,175 @@ impl Translator<'_> {
         })
     }
 }
+
+/// Where an ALU source operand lives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Operand {
+    Reg(Reg),
+    Imm(u32),
+    /// The instruction's constant-buffer operand.
+    Cbuf,
+}
+
+/// An ALU source with the float modifiers and the packed-half swizzle its slot encodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AluSrc {
+    pub operand: Operand,
+    pub abs: bool,
+    pub neg: bool,
+    /// The 2-bit swizzle of a packed-half or F16 source (zero for immediates).
+    pub swizzle: u64,
+}
+
+impl Translator<'_> {
+    /// The first ALU source: absolute value at bit 73, negation at 72, swizzle at 74..76.
+    pub fn alu_a(&self) -> AluSrc {
+        AluSrc {
+            operand: Operand::Reg(self.reg_a()),
+            abs: self.insn.bit(73),
+            neg: self.insn.bit(72),
+            swizzle: self.insn.bits(74, 2),
+        }
+    }
+
+    /// The second ALU source with its modifiers, wherever the form puts it. `half` selects the
+    /// packed-half layout, which moves the modifiers of a register at 64..72 to bits 83 and 84
+    /// and gives it a swizzle at 81..83.
+    pub fn alu_b(&self, half: bool) -> Result<AluSrc, TranslateError> {
+        Ok(match self.form {
+            Form::RegReg | Form::Fixed => {
+                let reg = if self.is_uniform_datapath() {
+                    self.insn.usrc1()
+                } else {
+                    self.insn.src1()
+                };
+                self.wide_src(Operand::Reg(reg))
+            }
+            Form::RegImm | Form::RegCbuf | Form::RegUreg => self.high_src(half),
+            Form::ImmReg => self.wide_src(Operand::Imm(self.insn.imm32())),
+            Form::CbufReg => self.wide_src(Operand::Cbuf),
+            Form::UregReg => self.wide_src(Operand::Reg(self.insn.usrc1())),
+            _ => return Err(self.unsupported()),
+        })
+    }
+
+    /// The third ALU source with its modifiers; `half` as for [`Translator::alu_b`].
+    pub fn alu_c(&self, half: bool) -> Result<AluSrc, TranslateError> {
+        Ok(match self.form {
+            Form::RegReg | Form::ImmReg | Form::CbufReg | Form::UregReg | Form::Fixed => {
+                self.high_src(half)
+            }
+            Form::RegImm => self.wide_src(Operand::Imm(self.insn.imm32())),
+            Form::RegCbuf => self.wide_src(Operand::Cbuf),
+            Form::RegUreg => self.wide_src(Operand::Reg(self.insn.usrc1())),
+            _ => return Err(self.unsupported()),
+        })
+    }
+
+    /// An operand at bit 32: modifiers at 62 and 63 and swizzle at 60..62, none for immediates.
+    fn wide_src(&self, operand: Operand) -> AluSrc {
+        if let Operand::Imm(_) = operand {
+            return AluSrc {
+                operand,
+                abs: false,
+                neg: false,
+                swizzle: 0,
+            };
+        }
+        AluSrc {
+            operand,
+            abs: self.insn.bit(62),
+            neg: self.insn.bit(63),
+            swizzle: self.insn.bits(60, 2),
+        }
+    }
+
+    /// The register at 64..72.
+    fn high_src(&self, half: bool) -> AluSrc {
+        let reg = if self.is_uniform_datapath() {
+            self.insn.usrc2()
+        } else {
+            self.insn.src2()
+        };
+        let (abs, neg, swizzle) = if half {
+            (self.insn.bit(83), self.insn.bit(84), self.insn.bits(81, 2))
+        } else {
+            (self.insn.bit(74), self.insn.bit(75), 0)
+        };
+        AluSrc {
+            operand: Operand::Reg(reg),
+            abs,
+            neg,
+            swizzle,
+        }
+    }
+
+    /// The bound buffer and byte offset of the constant-buffer operand.
+    fn cbuf_slot(&self) -> Result<(u32, u32), TranslateError> {
+        let operand = self.insn.cbuf();
+        let CbufBank::Index(index) = operand.bank else {
+            return Err(self.unsupported());
+        };
+        Ok((index, operand.offset))
+    }
+
+    /// The two words of a 64-bit constant-buffer operand, as a vector.
+    fn cbuf_pair(&mut self) -> Result<Value, TranslateError> {
+        let (index, offset) = self.cbuf_slot()?;
+        let lo = self.ir.get_cbuf(Value::U32(index), Value::U32(offset));
+        let hi = self
+            .ir
+            .get_cbuf(Value::U32(index), Value::U32(offset.wrapping_add(4)));
+        Ok(self.ir.composite_construct(&[lo, hi]))
+    }
+
+    /// The 32 bits of a source, without its modifiers.
+    pub fn read_u32(&mut self, src: AluSrc) -> Result<Value, TranslateError> {
+        Ok(match src.operand {
+            Operand::Reg(reg) => self.x(reg),
+            Operand::Imm(imm) => Value::U32(imm),
+            Operand::Cbuf => self.cbuf_u32()?,
+        })
+    }
+
+    /// A source as an F32 with its absolute value and negation applied.
+    pub fn read_f32(&mut self, src: AluSrc) -> Result<Value, TranslateError> {
+        let value = match src.operand {
+            Operand::Reg(reg) => self.f(reg),
+            Operand::Imm(imm) => Value::F32(f32::from_bits(imm)),
+            Operand::Cbuf => {
+                let (index, offset) = self.cbuf_slot()?;
+                self.ir
+                    .get_float_cbuf(Value::U32(index), Value::U32(offset))
+            }
+        };
+        Ok(self.ir.fp_abs_neg(value, src.abs, src.neg))
+    }
+
+    /// A source as an F64 with its modifiers: an aligned register pair, two constant-buffer
+    /// words, or an immediate holding the high word.
+    pub fn read_f64(&mut self, src: AluSrc) -> Result<Value, TranslateError> {
+        let value = match src.operand {
+            Operand::Reg(reg) => self.d(reg)?,
+            Operand::Imm(imm) => Value::F64(f64::from_bits(u64::from(imm) << 32)),
+            Operand::Cbuf => {
+                let pair = self.cbuf_pair()?;
+                self.ir.pack_double_2x32(pair)
+            }
+        };
+        Ok(self.ir.fp_abs_neg(value, src.abs, src.neg))
+    }
+
+    /// A source as a U64: an aligned register pair or two constant-buffer words. Immediates have
+    /// no 64-bit form.
+    pub fn read_u64(&mut self, src: AluSrc) -> Result<Value, TranslateError> {
+        match src.operand {
+            Operand::Reg(reg) => self.l(reg),
+            Operand::Imm(_) => Err(self.unsupported()),
+            Operand::Cbuf => {
+                let pair = self.cbuf_pair()?;
+                Ok(self.ir.pack_uint_2x32(pair))
+            }
+        }
+    }
+}

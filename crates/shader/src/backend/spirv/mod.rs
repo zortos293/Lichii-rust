@@ -9,7 +9,7 @@ mod context;
 mod driver;
 mod emit;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use rspirv::dr;
 
