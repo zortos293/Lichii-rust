@@ -1,10 +1,12 @@
 //! Context reads and writes: constant buffers, attributes, patches, fragment outputs, system
 //! values and local memory, from the C++ `emit_spirv_context_get_set.cpp`.
 
-use rspirv::spirv::{StorageClass, Word};
+use rspirv::spirv::{Capability, GlslStd450Op, StorageClass, Word};
 use smallvec::SmallVec;
 
-use crate::backend::spirv::context::{CbufElement, EmitContext, is_arrayed_input_stage};
+use crate::backend::spirv::context::{
+    CbufElement, EmitContext, InputGenericLoadOp, is_arrayed_input_stage,
+};
 use crate::backend::spirv::{EmitError, EmitResult};
 use crate::ir::{Attribute, InstId, Patch, Value};
 use crate::runtime::AttributeType;
@@ -414,6 +416,41 @@ fn load_vertex_id(ctx: &mut EmitContext<'_>) -> EmitResult<Word> {
         ctx.vertex_index
     };
     Ok(ctx.b.load(ctx.u32[1], None, variable, None, [])?)
+}
+
+/// A fragment program's generic input component interpolated at an offset from the pixel centre.
+/// Inputs declared with integer components are flat, so they load unchanged.
+pub(super) fn interpolate_at_offset(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
+    if ctx.stage != ShaderStage::Fragment {
+        return Err(EmitError::UnsupportedStage(ctx.stage));
+    }
+    let attr = attribute_arg(ctx, inst)?;
+    let Some(index) = attr.generic_index() else {
+        return Err(EmitError::UnsupportedAttribute(attr));
+    };
+    let generic = ctx.input_generics[index as usize];
+    let element = u32::from(attr.component());
+    if generic.id == 0 {
+        return Ok(ctx.const_f32(if element == 3 { 1.0 } else { 0.0 }));
+    }
+    let element = ctx.const_u32(element);
+    let pointer = ctx
+        .b
+        .access_chain(generic.pointer_type, None, generic.id, [element])?;
+    if generic.load_op != InputGenericLoadOp::None {
+        let value = ctx
+            .b
+            .load(generic.component_type, None, pointer, None, [])?;
+        return ctx.input_to_f32(generic.load_op, value);
+    }
+    let (x, y) = (ctx.def_arg(inst, 1)?, ctx.def_arg(inst, 2)?);
+    let offset = ctx.b.composite_construct(ctx.f32[2], None, [x, y])?;
+    ctx.add_capability(Capability::InterpolationFunction);
+    ctx.glsl_inst(
+        ctx.f32[1],
+        GlslStd450Op::InterpolateAtOffset,
+        &[pointer, offset],
+    )
 }
 
 pub(super) fn get_attribute(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {

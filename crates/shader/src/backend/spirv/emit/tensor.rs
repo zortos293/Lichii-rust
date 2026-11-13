@@ -2,7 +2,8 @@
 //! (depth 16) and HMMA.1688.F16 (depth 8) of a 32-lane warp, each lane holding its share of A
 //! (four words), B and C (two words each) as packed halves. The lanes trade operands with
 //! subgroup shuffles and accumulate in f32, rounding to half after every K=8 group as the
-//! hardware does.
+//! hardware does. TENSOR_MUL_ADD_F32 is the .F32 form: C and D are four f32 words each, and
+//! nothing rounds to half.
 
 use rspirv::spirv::{
     Capability, Decoration, FunctionControl, GlslStd450Op, LoopControl, Scope, StorageClass, Word,
@@ -12,19 +13,27 @@ use crate::backend::spirv::context::EmitContext;
 use crate::backend::spirv::{EmitError, EmitResult};
 use crate::ir::InstId;
 
-/// The function index of a multiply depth: 0 for K=8, 1 for K=16.
-fn variant(depth: u32) -> EmitResult<usize> {
-    match depth {
-        8 => Ok(0),
-        16 => Ok(1),
-        _ => Err(EmitError::Unsupported(
-            "matrix multiply depth other than 8 or 16",
-        )),
-    }
+/// The function index of a multiply depth: 0 for K=8, 1 for K=16; 2 and 3 with F32
+/// accumulators.
+fn variant(depth: u32, f32_accumulators: bool) -> EmitResult<usize> {
+    let depth = match depth {
+        8 => 0,
+        16 => 1,
+        _ => {
+            return Err(EmitError::Unsupported(
+                "matrix multiply depth other than 8 or 16",
+            ));
+        }
+    };
+    Ok(depth + 2 * usize::from(f32_accumulators))
 }
 
-pub(super) fn tensor_mul_add(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
-    let variant = variant(ctx.flags(inst))?;
+pub(super) fn tensor_mul_add(
+    ctx: &mut EmitContext<'_>,
+    inst: InstId,
+    f32_accumulators: bool,
+) -> EmitResult<Word> {
+    let variant = variant(ctx.flags(inst), f32_accumulators)?;
     if !ctx.supports_subgroups() || ctx.profile.has_broken_spirv_subgroup_shuffle {
         return Err(EmitError::Unsupported(
             "software HMMA without subgroup shuffles",
@@ -39,15 +48,18 @@ pub(super) fn tensor_mul_add(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitRes
     let a = ctx.def_arg(inst, 0)?;
     let b = ctx.def_arg(inst, 1)?;
     let c = ctx.def_arg(inst, 2)?;
-    Ok(ctx.b.function_call(ctx.u32[2], None, function, [a, b, c])?)
+    let result_type = ctx.u32[if f32_accumulators { 4 } else { 2 }];
+    Ok(ctx
+        .b
+        .function_call(result_type, None, function, [a, b, c])?)
 }
 
 /// Emits the bodies of the multiply-add functions [`tensor_mul_add`] called.
 pub(crate) fn define_functions(ctx: &mut EmitContext<'_>) -> EmitResult<()> {
-    for variant in 0..2 {
+    for variant in 0..4 {
         let function = ctx.tensor_functions[variant];
         if function != 0 {
-            define_function(ctx, function, variant == 1)?;
+            define_function(ctx, function, variant % 2 == 1, variant >= 2)?;
         }
     }
     Ok(())
@@ -138,9 +150,10 @@ struct Lanes {
 fn emit_group(
     ctx: &mut EmitContext<'_>,
     lanes: &Lanes,
-    inputs: &[Word; 8],
+    inputs: &[Word; 6],
     accumulators: &[Word; 4],
     half: Half,
+    round: bool,
 ) -> EmitResult<()> {
     let (u32_t, f32_t) = (ctx.u32[1], ctx.f32[1]);
     for component in 0..4 {
@@ -173,6 +186,9 @@ fn emit_group(
             }
         }
     }
+    if !round {
+        return Ok(());
+    }
     for &accumulator in accumulators {
         let value = ctx.b.load(f32_t, None, accumulator, None, [])?;
         let value = round_half(ctx, value)?;
@@ -181,19 +197,27 @@ fn emit_group(
     Ok(())
 }
 
-fn define_function(ctx: &mut EmitContext<'_>, function: Word, full_depth: bool) -> EmitResult<()> {
+fn define_function(
+    ctx: &mut EmitContext<'_>,
+    function: Word,
+    full_depth: bool,
+    f32_accumulators: bool,
+) -> EmitResult<()> {
     let (u1, u32_t, u32x2, u32x4) = (ctx.u1, ctx.u32[1], ctx.u32[2], ctx.u32[4]);
     let (f32_t, f32x2) = (ctx.f32[1], ctx.f32[2]);
-    let function_type = ctx.b.type_function(u32x2, [u32x4, u32x2, u32x2]);
+    let accumulator_type = if f32_accumulators { u32x4 } else { u32x2 };
+    let function_type = ctx
+        .b
+        .type_function(accumulator_type, [u32x4, u32x2, accumulator_type]);
     ctx.b.begin_function(
-        u32x2,
+        accumulator_type,
         Some(function),
         FunctionControl::DONT_INLINE,
         function_type,
     )?;
     let matrix_a = ctx.b.function_parameter(u32x4)?;
     let matrix_b = ctx.b.function_parameter(u32x2)?;
-    let matrix_c = ctx.b.function_parameter(u32x2)?;
+    let matrix_c = ctx.b.function_parameter(accumulator_type)?;
     ctx.b.begin_block(None)?;
     let function_u32 = ctx.type_pointer(StorageClass::Function, u32_t);
     let function_f32 = ctx.type_pointer(StorageClass::Function, f32_t);
@@ -204,20 +228,24 @@ fn define_function(ctx: &mut EmitContext<'_>, function: Word, full_depth: bool) 
         ctx.b
             .variable(function_f32, None, StorageClass::Function, None)
     });
-    let mut inputs = [0; 8];
+    let mut inputs = [0; 6];
     for (i, input) in inputs[..4].iter_mut().enumerate() {
         *input = ctx.b.composite_extract(u32_t, None, matrix_a, [i as u32])?;
     }
     for i in 0..2 {
         inputs[4 + i] = ctx.b.composite_extract(u32_t, None, matrix_b, [i as u32])?;
-        inputs[6 + i] = ctx.b.composite_extract(u32_t, None, matrix_c, [i as u32])?;
     }
-    for row in 0..2 {
-        let c = unpack(ctx, inputs[6 + row])?;
-        for col in 0..2 {
-            let value = ctx.b.composite_extract(f32_t, None, c, [col as u32])?;
-            ctx.b.store(accumulators[row * 2 + col], value, None, [])?;
-        }
+    for (i, &accumulator) in accumulators.iter().enumerate() {
+        let (row, col) = (i as u32 / 2, i as u32 % 2);
+        let value = if f32_accumulators {
+            let word = ctx.b.composite_extract(u32_t, None, matrix_c, [i as u32])?;
+            ctx.b.bitcast(f32_t, None, word)?
+        } else {
+            let word = ctx.b.composite_extract(u32_t, None, matrix_c, [row])?;
+            let pair = unpack(ctx, word)?;
+            ctx.b.composite_extract(f32_t, None, pair, [col])?
+        };
+        ctx.b.store(accumulator, value, None, [])?;
     }
     ctx.b.store(counter, ctx.u32_zero_value, None, [])?;
     let lane = ctx
@@ -248,7 +276,14 @@ fn define_function(ctx: &mut EmitContext<'_>, function: Word, full_depth: bool) 
         ctx.b.begin_block(Some(body))?;
         let one = ctx.const_u32(1);
         let upper = ctx.b.i_equal(u1, None, group, one)?;
-        emit_group(ctx, &lanes, &inputs, &accumulators, Half::Select(upper))?;
+        emit_group(
+            ctx,
+            &lanes,
+            &inputs,
+            &accumulators,
+            Half::Select(upper),
+            !f32_accumulators,
+        )?;
         ctx.b.branch(next)?;
         ctx.b.begin_block(Some(next))?;
         let incremented = add(ctx, group, one)?;
@@ -256,7 +291,25 @@ fn define_function(ctx: &mut EmitContext<'_>, function: Word, full_depth: bool) 
         ctx.b.branch(header)?;
         ctx.b.begin_block(Some(end))?;
     } else {
-        emit_group(ctx, &lanes, &inputs, &accumulators, Half::Low)?;
+        emit_group(
+            ctx,
+            &lanes,
+            &inputs,
+            &accumulators,
+            Half::Low,
+            !f32_accumulators,
+        )?;
+    }
+    if f32_accumulators {
+        let mut words = [0; 4];
+        for (word, &accumulator) in words.iter_mut().zip(&accumulators) {
+            let value = ctx.b.load(f32_t, None, accumulator, None, [])?;
+            *word = ctx.b.bitcast(u32_t, None, value)?;
+        }
+        let result = ctx.b.composite_construct(u32x4, None, words)?;
+        ctx.b.ret_value(result)?;
+        ctx.b.end_function()?;
+        return Ok(());
     }
     let mut packed = [0; 2];
     for (row, slot) in packed.iter_mut().enumerate() {

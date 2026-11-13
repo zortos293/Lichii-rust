@@ -196,6 +196,7 @@ pub(super) struct DrawState {
     texture_pipelines: Option<texture::TexturePipelines>,
     assembly: Option<assembly::AssemblyPass>,
     grid: Option<dispatch_grid::GridPass>,
+    mesh_indirect: Option<mesh_indirect::MeshIndirectPass>,
 }
 
 impl DrawState {
@@ -312,6 +313,7 @@ impl DrawState {
             texture_pipelines: None,
             assembly: None,
             grid: None,
+            mesh_indirect: None,
         })
     }
 
@@ -583,13 +585,6 @@ impl VulkanRasterizer {
         }
         let regs = ctx.regs;
         let mesh = is_mesh_draw(regs, self.draw.arch);
-        if mesh && matches!(call, DrawCall::Indirect(_)) {
-            self.draw.warn_once(
-                Warning::IndirectMesh,
-                "indirect task/mesh draws are not supported; skipping them",
-            );
-            return Ok(());
-        }
         let host_topology = match mesh {
             true => mesh_topology(regs),
             false => mvk::primitive_topology(assembled_topology(call.topology()))
@@ -668,7 +663,7 @@ impl VulkanRasterizer {
                 self.vertex_buffers(gmmu, regs)?;
             }
             let index = match call {
-                DrawCall::Direct(_) if mesh => None,
+                _ if mesh => None,
                 DrawCall::Direct(params) => self.buffer_cache.index_buffer(
                     &mut self.scheduler,
                     &mut self.staging,
@@ -679,7 +674,7 @@ impl VulkanRasterizer {
                 DrawCall::Indirect(indirect) => self.indirect_index_buffer(gmmu, regs, indirect)?,
             };
             let indirect = match call {
-                DrawCall::Indirect(draw) => match self.indirect_buffers(gmmu, regs, draw)? {
+                DrawCall::Indirect(draw) => match self.indirect_buffers(gmmu, regs, draw, mesh)? {
                     Some(buffers) => Some(buffers),
                     None => return Ok(()),
                 },
@@ -694,8 +689,16 @@ impl VulkanRasterizer {
         }
         let set = self.descriptor_set(set_layout)?;
 
+        let task = self.draw.stages[0]
+            .as_ref()
+            .is_some_and(|m| m.stage == ShaderStage::Task);
+        let mesh_limit = self.device.properties.mesh_group_limit[usize::from(task)];
         let cmd = self.scheduler.record()?;
         let (index, indirect) = match (call, indirect) {
+            (DrawCall::Indirect(draw), Some(inputs)) if mesh => {
+                let commands = self.rewrite_mesh_indirect(cmd, draw, &inputs, mesh_limit)?;
+                (None, Some(commands))
+            }
             (DrawCall::Indirect(draw), Some(inputs))
                 if assembled_topology(draw.topology) != draw.topology =>
             {
@@ -794,17 +797,13 @@ impl VulkanRasterizer {
         self.set_dynamic_state(cmd, regs, &features, host_topology, extent, scale);
         let mesh_groups = match call {
             DrawCall::Direct(params) if mesh => {
-                let task = self.draw.stages[0]
-                    .as_ref()
-                    .is_some_and(|m| m.stage == ShaderStage::Task);
-                let limit = self.device.properties.mesh_group_limit[usize::from(task)];
-                if params.count > limit {
+                if params.count > mesh_limit {
                     self.draw.warn_once(
                         Warning::MeshGroupLimit,
                         "a task/mesh draw has more groups than the device takes; clamping it",
                     );
                 }
-                params.count.min(limit)
+                params.count.min(mesh_limit)
             }
             _ => 0,
         };
@@ -834,6 +833,24 @@ impl VulkanRasterizer {
                     params.first,
                     params.base_instance,
                 ),
+                (DrawCall::Indirect(_), Some(buffers), _) if mesh => match buffers.count {
+                    Some(count) => draw.mesh.cmd_draw_mesh_tasks_indirect_count(
+                        cmd,
+                        buffers.commands.buffer,
+                        buffers.commands.offset,
+                        count.buffer,
+                        count.offset,
+                        buffers.max_draws,
+                        buffers.stride,
+                    ),
+                    None => draw.mesh.cmd_draw_mesh_tasks_indirect(
+                        cmd,
+                        buffers.commands.buffer,
+                        buffers.commands.offset,
+                        buffers.max_draws,
+                        buffers.stride,
+                    ),
+                },
                 (DrawCall::Indirect(_), Some(buffers), index) => {
                     let IndirectBuffers {
                         commands,
@@ -1598,15 +1615,20 @@ impl VulkanRasterizer {
             .index_buffer(&mut self.scheduler, &mut self.staging, gmmu, regs, &params)
     }
 
-    /// The buffers an indirect draw reads. `None` skips the draw.
+    /// The buffers an indirect draw (a task/mesh one with `mesh`) reads. `None` skips the draw.
     fn indirect_buffers(
         &mut self,
         gmmu: &lichii_gpu::gmmu::Gmmu,
         regs: &Regs,
         draw: &IndirectDraw,
+        mesh: bool,
     ) -> Result<Option<IndirectBuffers>> {
-        let assembled = assembled_topology(draw.topology) != draw.topology;
-        if !assembled && draw.count_buffer.is_some() && !self.device.features.draw_indirect_count {
+        let assembled = !mesh && assembled_topology(draw.topology) != draw.topology;
+        if !assembled
+            && !mesh
+            && draw.count_buffer.is_some()
+            && !self.device.features.draw_indirect_count
+        {
             self.draw.warn_once(
                 Warning::NoIndirectCount,
                 "the device cannot take indirect draw counts; skipping those draws",
@@ -2349,6 +2371,7 @@ fn storage_pointer(
 mod assembly;
 mod dispatch_grid;
 mod host_compute;
+mod mesh_indirect;
 mod texture;
 
 #[cfg(test)]

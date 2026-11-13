@@ -24,7 +24,6 @@ use lichii_kernel::ipc::HleRequestContext;
 use lichii_kernel::object::KObject;
 use parking_lot::Mutex;
 
-use crate::dispatch::Nx2Stub;
 use crate::{Service, ServiceContext};
 
 /// The service thread every gsv session runs on, except vi2.
@@ -163,17 +162,26 @@ impl Service for GraphicsSystem {
             ),
             497 => push_session(context, ctx, gpu::GpuSession::new(context)),
             1402 => open_nvsrv(context, ctx),
-            111 | 112 | 114 | 423 | 426 | 428 | 429 | 430 | 435 | 1211 | 1291 | 1510 => {
-                native::handle(&self.objects, ctx)
-            }
+            111 | 112 | 114 | 423 | 426 | 428 | 429 | 430 | 435 | 911 | 912 | 961 | 991 | 1211
+            | 1291 | 1510 => native::handle(&self.objects, ctx),
             434 => {
                 let id: u32 = ctx.pop();
                 self.state.lock().address_spaces.insert(id);
                 ResultCode::SUCCESS
             }
             602 => push_session(context, ctx, sessions::Camera::default()),
-            902 | 905 | 906 => push_session(context, ctx, Nx2Stub("nx2:vdec".into())),
-            1002 => push_session(context, ctx, Nx2Stub("nx2:vdec2".into())),
+            902 | 905 | 906 | 1002 => {
+                let name = if ctx.command() == 1002 {
+                    "nx2:vdec2"
+                } else {
+                    "nx2:vdec"
+                };
+                let decoder = sessions::VideoDecoder {
+                    context: context.clone(),
+                    name,
+                };
+                push_session(context, ctx, decoder)
+            }
             1111 => {
                 let version: u32 = ctx.pop();
                 tracing::info!("nx2:gsv 1111: feature version {version:#x}");

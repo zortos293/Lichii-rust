@@ -12,7 +12,8 @@ use lichii_common::HleResult;
 
 use super::behavior::{BehaviorInParameter, BehaviorInfo, BehaviorOutStatus, ErrorInfo};
 use super::effect::{
-    EffectContext, EffectInParameter, EffectInfo, EffectOutStatusV1, EffectOutStatusV2, EffectType,
+    EffectContext, EffectInParameter, EffectInfo, EffectOutStatusV1, EffectOutStatusV2,
+    EffectResultState, EffectType,
 };
 use super::memory::{MemoryPoolInParameter, MemoryPoolInfo, MemoryPoolOutStatus, PoolMapper};
 use super::mix::{MixContext, MixInDirtyParameter, MixInParameter};
@@ -309,6 +310,7 @@ impl<'a> InfoUpdater<'a> {
     pub fn update_effects(
         &mut self,
         effects: &mut EffectContext,
+        dsp_states: &mut [EffectResultState],
         renderer_active: bool,
         pools: &[MemoryPoolInfo],
         behavior: &mut BehaviorInfo,
@@ -324,7 +326,7 @@ impl<'a> InfoUpdater<'a> {
         let count = effects.count() as usize;
         self.ensure_output(count * out_size)?;
 
-        let (infos, cpu_states, dsp_states) = effects.parts_mut();
+        let (infos, cpu_states) = effects.parts_mut();
         for (i, info) in infos.iter_mut().enumerate() {
             let params: EffectInParameter = self.read(i * in_size)?;
             let effect_type = EffectType::from_raw(params.effect_type);
