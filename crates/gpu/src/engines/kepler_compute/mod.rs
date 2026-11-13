@@ -11,7 +11,9 @@
 //!
 //! Inline uploads share the Kepler memory engine's registers on both classes. On B1C0, an upload
 //! that writes a descriptor's grid from command words GPU work may have written makes its
-//! dispatch indirect ([`ComputeContext::indirect_grid`]).
+//! dispatch indirect ([`ComputeContext::indirect`]). On C7C0 the front already synchronises
+//! before fetching such words, so a QMD's grid is stale only when GPU work wrote the QMD itself:
+//! a QMD whose grid words may be GPU-written dispatches indirectly from them.
 
 pub mod pcas;
 pub mod qmd;
@@ -21,7 +23,9 @@ use lichii_common::GpuVAddr;
 
 use super::EngineContext;
 use super::upload::Upload;
-use crate::backend::{ComputeContext, FenceAction, QmdVersion, Query, QueryKind, ReleaseSize};
+use crate::backend::{
+    ComputeContext, FenceAction, IndirectGrid, QmdVersion, Query, QueryKind, ReleaseSize,
+};
 use crate::gmmu::{Gmmu, GpuFault, RangeTarget};
 use crate::host::Reduction;
 use crate::reg_index;
@@ -39,7 +43,9 @@ const SET_REPORT_SEMAPHORE_D: u32 = reg_index!(Regs, report_semaphore.control);
 /// Uploads a LAUNCH looks back at, at most.
 const MAX_UPLOADS: usize = 8;
 /// Byte offset of a version 1.x descriptor's grid.
-const QMD_V2_GRID: u64 = 0xc * 4;
+const QMD_V2_GRID: u64 = core::mem::offset_of!(QmdV2, grid_x) as u64;
+/// Byte offset of a version 3.0 descriptor's grid.
+const QMD_V3_GRID: u64 = core::mem::offset_of!(QmdV3, grid_width) as u64;
 /// Words of a version 1.x grid.
 const GRID_WORDS: u32 = 2;
 
@@ -174,19 +180,23 @@ impl KeplerCompute {
         };
         let qmd = bytemuck::cast_ref::<[u32; QMD_WORDS], QmdV2>(&words);
         let grid = address + QMD_V2_GRID;
-        let indirect_grid = self
+        let indirect = self
             .uploads
             .iter()
             .rev()
             .find(|upload| upload.target == grid)
             .filter(|upload| upload.contiguous >= u64::from(GRID_WORDS) * 4)
             .and_then(|upload| upload.source)
-            .filter(|&source| gpu_written(ctx, source, u64::from(GRID_WORDS) * 4));
+            .filter(|&source| gpu_written(ctx, source, u64::from(GRID_WORDS) * 4))
+            .map(|address| IndirectGrid {
+                address,
+                layout: QmdVersion::V2,
+            });
         self.dispatch(
             ctx,
             qmd.launch(self.regs.code_loc.address()),
             &words,
-            indirect_grid,
+            indirect,
         );
     }
 
@@ -235,8 +245,13 @@ impl KeplerCompute {
         let words = read_qmd(ctx.memory, address).map_err(|_| PcasError::Unmapped(address))?;
         let qmd = bytemuck::cast_ref::<[u32; QMD_WORDS], QmdV3>(&words);
         qmd.check()?;
+        let grid = IndirectGrid {
+            address: address + QMD_V3_GRID,
+            layout: QmdVersion::V3,
+        };
+        let indirect = gpu_written(ctx, grid.address, grid.size()).then_some(grid);
         match qmd.launch() {
-            Ok(launch) => self.dispatch(ctx, launch, &words, None),
+            Ok(launch) => self.dispatch(ctx, launch, &words, indirect),
             Err(error) => tracing::warn!(%error, address, "compute dispatch skipped"),
         }
         for (slot, release) in qmd.release_slots().into_iter().enumerate() {
@@ -322,9 +337,9 @@ impl KeplerCompute {
         ctx: &mut EngineContext<'_>,
         launch: qmd::Launch,
         words: &[u32; QMD_WORDS],
-        indirect_grid: Option<GpuVAddr>,
+        indirect: Option<IndirectGrid>,
     ) {
-        if launch.block.contains(&0) || (indirect_grid.is_none() && launch.grid.contains(&0)) {
+        if launch.block.contains(&0) || (indirect.is_none() && launch.grid.contains(&0)) {
             return;
         }
         let tic = &self.regs.tic;
@@ -345,7 +360,10 @@ impl KeplerCompute {
             linked_samplers: launch.linked_samplers,
             qmd_version: self.version,
             qmd: words,
-            indirect_grid,
+            indirect_grid: indirect
+                .filter(|grid| grid.layout == QmdVersion::V2)
+                .map(|grid| grid.address),
+            indirect,
         });
     }
 }
@@ -445,6 +463,7 @@ mod tests {
         qmd_version: QmdVersion,
         qmd: [u32; 64],
         indirect_grid: Option<GpuVAddr>,
+        indirect: Option<IndirectGrid>,
     }
 
     #[derive(Default)]
@@ -476,6 +495,7 @@ mod tests {
                 qmd_version: ctx.qmd_version,
                 qmd: *ctx.qmd,
                 indirect_grid: ctx.indirect_grid,
+                indirect: ctx.indirect,
             });
         }
         fn inline_written(&mut self, _c: ChannelId, _m: &Gmmu, address: GpuVAddr, size: u64) {
@@ -735,6 +755,92 @@ mod tests {
         assert_eq!(rig.spy.dispatches[0].indirect_grid, Some(SOURCE + 0x1000));
     }
 
+    /// The grid the renderer dispatches: the indirect words as GPU memory holds them now, or the
+    /// descriptor's grid.
+    fn resolved_grid(rig: &Rig, dispatch: &Dispatch) -> [u32; 3] {
+        match dispatch.indirect {
+            Some(grid) => grid.unpack(rig.harness.memory.read(grid.address).unwrap()),
+            None => dispatch.grid,
+        }
+    }
+
+    #[test]
+    fn v2_and_v3_indirect_grids_resolve_in_their_own_layout() {
+        const SOURCE: u64 = 0x5000;
+        let packed = [1 << 31 | 11, 0xabcd << 16 | 6, 0x1234 << 16 | 2];
+
+        let mut v2 = Rig::new(0xb1c0);
+        v2.put_qmd(QMD, &v2_words());
+        let device = v2.harness.memory.translate(SOURCE).unwrap();
+        v2.harness.written_pages.mark(device, 8);
+        upload_grid(&mut v2, QMD + 0x30, Some(SOURCE));
+        v2.launch(QMD);
+        v2.harness
+            .memory
+            .write_block(SOURCE, bytemuck::bytes_of(&packed))
+            .unwrap();
+        let dispatch = &v2.spy.dispatches[0];
+        let grid = IndirectGrid {
+            address: SOURCE,
+            layout: QmdVersion::V2,
+        };
+        assert_eq!(
+            (dispatch.indirect, dispatch.indirect_grid),
+            (Some(grid), Some(SOURCE))
+        );
+        assert_eq!(resolved_grid(&v2, dispatch), [11, 6, 0xabcd]);
+
+        let mut v3 = Rig::new(0xc7c0);
+        v3.put_qmd(QMD, &v3_words());
+        let device = v3.harness.memory.translate(QMD + QMD_V3_GRID).unwrap();
+        v3.harness.written_pages.mark(device, 12);
+        v3.launch(QMD);
+        v3.harness
+            .memory
+            .write_block(QMD + QMD_V3_GRID, bytemuck::bytes_of(&packed))
+            .unwrap();
+        let dispatch = &v3.spy.dispatches[0];
+        let grid = IndirectGrid {
+            address: QMD + 0x30,
+            layout: QmdVersion::V3,
+        };
+        assert_eq!(dispatch.grid, [9, 4, 2]);
+        assert_eq!(
+            (dispatch.indirect, dispatch.indirect_grid),
+            (Some(grid), None)
+        );
+        assert_eq!(resolved_grid(&v3, dispatch), [1 << 31 | 11, 6, 2]);
+    }
+
+    #[test]
+    fn a_v3_qmd_dispatches_indirectly_only_while_its_grid_may_be_gpu_written() {
+        const OTHER_PAGE: u64 = QMD + 0x1000;
+        let mut rig = Rig::new(0xc7c0);
+        rig.put_qmd(QMD, &v3_words());
+        rig.put_qmd(OTHER_PAGE, &v3_words());
+        rig.launch(QMD);
+        let device = rig.harness.memory.translate(QMD + QMD_V3_GRID).unwrap();
+        rig.harness.written_pages.mark(device, 4);
+        let mut zero_grid = v3_words();
+        zero_grid[12] = 0;
+        rig.load_inline(QMD, &zero_grid);
+        rig.launch(OTHER_PAGE);
+        let indirect = Some(IndirectGrid {
+            address: QMD + QMD_V3_GRID,
+            layout: QmdVersion::V3,
+        });
+        let dispatches: Vec<_> = rig
+            .spy
+            .dispatches
+            .iter()
+            .map(|d| (d.grid, d.indirect))
+            .collect();
+        assert_eq!(
+            dispatches,
+            [([9, 4, 2], None), ([0, 4, 2], indirect), ([9, 4, 2], None)]
+        );
+    }
+
     #[test]
     fn v2_launch_decodes_end_to_end() {
         let mut rig = Rig::new(0xb1c0);
@@ -781,6 +887,7 @@ mod tests {
                 qmd_version: QmdVersion::V2,
                 qmd: words,
                 indirect_grid: None,
+                indirect: None,
             }]
         );
         assert!(rig.spy.queries.is_empty());
@@ -815,6 +922,7 @@ mod tests {
                 qmd_version: QmdVersion::V3,
                 qmd: words,
                 indirect_grid: None,
+                indirect: None,
             }]
         );
     }

@@ -136,6 +136,38 @@ pub enum QmdVersion {
     V3,
 }
 
+/// Where a dispatch's grid words are in GPU memory, in the layout of the descriptor they belong
+/// to. GPU work may have written them after the guest's copy was read
+/// ([`ComputeContext::indirect`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndirectGrid {
+    /// GPU address of the first grid word.
+    pub address: GpuVAddr,
+    pub layout: QmdVersion,
+}
+
+impl IndirectGrid {
+    /// Bytes of grid words from [`address`](Self::address). Version 1.x: 8 (descriptor words 0xc
+    /// and 0xd). Version 3.0: 12 (words 12 to 14).
+    pub const fn size(self) -> u64 {
+        match self.layout {
+            QmdVersion::V2 => 8,
+            QmdVersion::V3 => 12,
+        }
+    }
+
+    /// The grid that the words from [`address`](Self::address) describe. Version 1.x: the width
+    /// in bits 0..31 of the first word, then the height and depth as 16-bit halves of the second;
+    /// the third word is not read. Version 3.0: the width is the whole first word, the height and
+    /// depth the low 16 bits of the second and third.
+    pub const fn unpack(self, words: [u32; 3]) -> [u32; 3] {
+        match self.layout {
+            QmdVersion::V2 => [words[0] & 0x7fff_ffff, words[1] & 0xffff, words[1] >> 16],
+            QmdVersion::V3 => [words[0], words[1] & 0xffff, words[2] & 0xffff],
+        }
+    }
+}
+
 /// A compute dispatch, decoded from its launch descriptor (QMD).
 pub struct ComputeContext<'a> {
     pub channel: ChannelId,
@@ -158,12 +190,15 @@ pub struct ComputeContext<'a> {
     pub qmd_version: QmdVersion,
     /// The raw descriptor, for the shader environment.
     pub qmd: &'a [u32; 64],
-    /// Version 1.x descriptors: GPU work may have written the grid the guest uploaded into the
-    /// descriptor after the guest's copy of it was read, so `grid` may be stale. The grid's
-    /// current words are at this GPU address, in the descriptor's layout (words 0xc and 0xd: the
-    /// width in bits 0..31, then the height and depth as 16-bit halves); dispatch indirectly from
-    /// them.
+    /// [`indirect`](Self::indirect)'s address when its layout is version 1.x (words 0xc and 0xd:
+    /// the width in bits 0..31, then the height and depth as 16-bit halves), and `None` for
+    /// version 3.0. It stays for renderers that only unpack version 1.x grids.
     pub indirect_grid: Option<GpuVAddr>,
+    /// GPU work may have written the grid after the guest's copy was read, so `grid` may be
+    /// stale: dispatch indirectly from these words. Version 1.x: the grid was uploaded into the
+    /// descriptor from GPU-written command words. Version 3.0: the descriptor's own grid words
+    /// may be GPU-written.
+    pub indirect: Option<IndirectGrid>,
 }
 
 /// A surface as the copy and blit engines describe it.
