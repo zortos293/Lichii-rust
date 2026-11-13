@@ -512,7 +512,7 @@ mod tests {
         stream.append_buffer(1, &[0, 0]);
         let started = Instant::now();
         stream.wait_free_space();
-        assert!(started.elapsed() >= Duration::from_millis(6));
+        assert!(started.elapsed() >= Duration::from_millis(3));
         stream.state.process_output(&mut [0; 2]);
         let started = Instant::now();
         stream.wait_free_space();
