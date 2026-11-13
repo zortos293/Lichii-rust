@@ -8,17 +8,20 @@ impl Nvdrv {
     /// Presents nvmap buffer `handle`, from `offset` bytes in, once the guest reached `fences`
     /// (ids below zero are unused slots), without waiting for them: the compositor thread that
     /// calls it also ticks vsync. `framebuffer.address` is replaced by the buffer's device
-    /// address; the buffer must be pinned, as a buffer the title rendered to is.
+    /// address; the buffer must be pinned, as a buffer the title rendered to is. `presented` runs
+    /// once the present is queued, or at once when the flip fails.
     pub(crate) fn flip(
         &self,
         handle: u32,
         offset: u64,
         mut framebuffer: FramebufferConfig,
         fences: &[NvFence],
+        presented: impl FnOnce() + Send + 'static,
     ) -> NvResult {
         let daddr = self.nvmap.device_address(handle);
         if daddr == 0 {
             tracing::error!(handle, "flip of an nvmap buffer that is not pinned");
+            presented();
             return NvResult::BadValue;
         }
         framebuffer.address = daddr + offset;
@@ -29,6 +32,7 @@ impl Nvdrv {
                 .filter(|fence| fence.id >= 0)
                 .map(|fence| (fence.id as u32, fence.value)),
             framebuffer,
+            presented,
         );
         NvResult::Success
     }

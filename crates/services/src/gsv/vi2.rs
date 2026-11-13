@@ -253,7 +253,7 @@ impl Vi2 {
         let Some(framebuffer) = self.framebuffer(handle, drawn) else {
             return;
         };
-        crate::context::present_when_reached(&self.context.gpu, [fence], framebuffer);
+        crate::context::present_when_reached(&self.context.gpu, [fence], framebuffer, || {});
     }
 
     /// How native image `handle` is shown. `drawn` is ((height - 1) << 16) | (width - 1) of the

@@ -222,15 +222,17 @@ pub(crate) fn wait_guest_syncpoint(
 
 /// Presents `framebuffer` once the guest reached every fence `(syncpoint, value)`, on whichever thread
 /// increments the last one, as the reference's composite does: the caller never waits for the
-/// GPU. A fence on an invalid syncpoint counts as reached.
-pub(crate) fn present_when_reached(
+/// GPU. `presented` runs once the present is queued, so the frame's buffer can go back to its
+/// producer only after the GPU took it. A fence on an invalid syncpoint counts as reached.
+pub(crate) fn present_when_reached<F: FnOnce() + Send + 'static>(
     gpu: &Arc<Gpu>,
     fences: impl IntoIterator<Item = (u32, u32)>,
     framebuffer: FramebufferConfig,
+    presented: F,
 ) {
     let pending = Arc::new(PendingPresent {
         left: AtomicUsize::new(1),
-        framebuffer: Mutex::new(Some(framebuffer)),
+        frame: Mutex::new(Some((framebuffer, presented))),
         gpu: Arc::downgrade(gpu),
     });
     let bank = gpu.host1x().syncpoints.guest();
@@ -248,20 +250,23 @@ pub(crate) fn present_when_reached(
 }
 
 /// A frame waiting for its fences: the last fence to arrive presents it.
-struct PendingPresent {
+struct PendingPresent<F> {
     left: AtomicUsize,
-    framebuffer: Mutex<Option<FramebufferConfig>>,
+    frame: Mutex<Option<(FramebufferConfig, F)>>,
     gpu: Weak<Gpu>,
 }
 
-impl PendingPresent {
+impl<F: FnOnce()> PendingPresent<F> {
     fn arrive(&self) {
         if self.left.fetch_sub(1, Ordering::AcqRel) != 1 {
             return;
         }
-        if let (Some(framebuffer), Some(gpu)) = (self.framebuffer.lock().take(), self.gpu.upgrade())
-        {
+        let Some((framebuffer, presented)) = self.frame.lock().take() else {
+            return;
+        };
+        if let Some(gpu) = self.gpu.upgrade() {
             gpu.present(framebuffer);
         }
+        presented();
     }
 }

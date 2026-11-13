@@ -1117,13 +1117,13 @@ fn flips_present_pinned_nvmap_buffers() {
     };
     let unused = NvFence { id: -1, value: 0 };
     assert_eq!(
-        nv.nvdrv.flip(handle, 0, framebuffer, &[unused]),
+        nv.nvdrv.flip(handle, 0, framebuffer, &[unused], || {}),
         NvResult::BadValue
     );
     let as_fd = nv.address_space();
     nv.map(as_fd, handle);
     assert_eq!(
-        nv.nvdrv.flip(handle, 0, framebuffer, &[unused]),
+        nv.nvdrv.flip(handle, 0, framebuffer, &[unused], || {}),
         NvResult::Success
     );
     assert!(nv.open("/dev/nvdisp_disp0") > 0);
@@ -1157,9 +1157,13 @@ fn a_flip_waits_for_its_acquire_fence_on_the_syncpoint_not_in_the_caller() {
         id: syncpoint as i32,
         value: guest.value(syncpoint).unwrap() + 1,
     };
+    let presented = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = presented.clone();
     let started = std::time::Instant::now();
     assert_eq!(
-        nv.nvdrv.flip(handle, 0, framebuffer, &[fence]),
+        nv.nvdrv.flip(handle, 0, framebuffer, &[fence], move || {
+            seen.store(true, std::sync::atomic::Ordering::SeqCst)
+        }),
         NvResult::Success
     );
     assert!(
@@ -1172,12 +1176,17 @@ fn a_flip_waits_for_its_acquire_fence_on_the_syncpoint_not_in_the_caller() {
         Ok(Some(fence.value)),
         "the present waits on the syncpoint"
     );
+    assert!(
+        !presented.load(std::sync::atomic::Ordering::SeqCst),
+        "the buffer stays with the display until the present is queued"
+    );
     guest.increment(syncpoint).unwrap();
     assert_eq!(
         guest.next_action_threshold(syncpoint),
         Ok(None),
         "reaching the fence presents the frame"
     );
+    assert!(presented.load(std::sync::atomic::Ordering::SeqCst));
 }
 
 #[test]
