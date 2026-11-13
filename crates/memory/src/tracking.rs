@@ -2,21 +2,26 @@
 //!
 //! A GPU cache that copies guest memory (a texture, a vertex buffer, shader code) takes a
 //! [`CachedPages`] guard over it with [`DeviceAddressSpace::cache_pages`] before it reads the
-//! bytes. Every physical page under a guard is *tracked* in the attached process: its page table
-//! entries carry a tracked flag and its fastmem views are write-protected. The first CPU write to a
-//! tracked page untracks it on every virtual address that maps it, lands, and only then marks the
-//! physical page dirty. The GPU thread drains the dirty pages with
+//! bytes. Every physical page under a guard is *tracked* in the attached process: a per-physical
+//! page flag is set, and the fastmem views of every virtual page mapping it are write-protected.
+//! The first CPU write to a tracked page lands, clears the flag, releases the views on every
+//! alias, and only then marks the physical page dirty. The GPU thread drains the dirty pages with
 //! [`DeviceAddressSpace::take_cpu_writes`] and invalidates what it cached there; a cache that
 //! uploads again takes a new guard, which tracks the pages again.
 //!
 //! Invariant: every CPU write to a page that was tracked when the write began is either seen by
 //! the upload that follows the tracking, or published as dirty after its bytes landed.
 //! - Writes from host code go through the page table to the DRAM backing's own view, which is
-//!   never protected, so they never fault. Each one issues a sequentially consistent fence after
-//!   its bytes and then reads the tracked flags; tracking sets the flag and issues the same fence
-//!   before the cache reads. Either the cache sees the bytes or the writer sees the flag.
+//!   never protected, so they never fault. After each page's bytes they issue a sequentially
+//!   consistent fence and read the flag of the physical page they wrote, found from the host
+//!   pointer, never by translating the address again, so a concurrent remap cannot hide it.
+//!   Tracking sets the flag and issues the same fence before the cache reads. Either the cache
+//!   sees the bytes or the writer sees the flag.
 //! - JIT stores to a write-protected fastmem view fault into their slow path, which writes
-//!   through the page table as above.
+//!   through the page table as above. Protection changes never raise a tracked page's view, not
+//!   even briefly; where a view has to be mapped again (a new alias of a held page, a Windows
+//!   view split), the view is writable for a moment, so those pages are published as dirty once
+//!   they are protected again.
 //! - The dirty bit is set with release ordering after the write and read with acquire ordering,
 //!   so a drain that sees it also sees the bytes.
 //!
@@ -102,6 +107,37 @@ impl ReverseMap {
             "page {addr:#x} too high to track"
         );
         ((pa >> PAGE_BITS) as usize, page as u32)
+    }
+}
+
+/// One flag per physical page, set and read with sequentially consistent ordering.
+pub(crate) struct PageFlags(Box<[AtomicU64]>);
+
+impl PageFlags {
+    pub(crate) fn new(physical_size: u64) -> Self {
+        let words = (physical_size / PAGE_SIZE).div_ceil(64);
+        Self((0..words).map(|_| AtomicU64::new(0)).collect())
+    }
+
+    fn word(&self, pa: PAddr) -> (&AtomicU64, u64) {
+        let page = pa >> PAGE_BITS;
+        (&self.0[(page / 64) as usize], 1 << (page % 64))
+    }
+
+    pub(crate) fn set(&self, pa: PAddr) {
+        let (word, bit) = self.word(pa);
+        word.fetch_or(bit, Ordering::SeqCst);
+    }
+
+    pub(crate) fn clear(&self, pa: PAddr) {
+        let (word, bit) = self.word(pa);
+        word.fetch_and(!bit, Ordering::SeqCst);
+    }
+
+    #[inline]
+    pub(crate) fn test(&self, pa: PAddr) -> bool {
+        let (word, bit) = self.word(pa);
+        word.load(Ordering::SeqCst) & bit != 0
     }
 }
 
@@ -333,6 +369,24 @@ mod tests {
         );
         process.unmap(0xa000_0000, 0x1000);
         process.unmap(0x9000_0000, 0x1000);
+    }
+
+    #[test]
+    fn a_write_reports_the_physical_page_it_wrote_even_after_a_remap() {
+        let (process, device) = spaces();
+        let _cached = device.cache_pages(DADDR, 0x1000);
+        let (ptr, _) = process.translate(VA).unwrap();
+        process.unmap(VA, 0x1000);
+        process.map(VA, 0x20_0000, 0x1000, MemoryPermission::READ_WRITE);
+        // SAFETY: the DRAM page behind ptr stays valid after its mapping is gone.
+        unsafe { ptr.write(7) };
+        process.report_write(ptr);
+        assert_eq!(writes(&device), [(DADDR, 0x1000)]);
+        process.write(VA, 1u8).unwrap();
+        assert!(
+            writes(&device).is_empty(),
+            "the page mapped there now is not cached"
+        );
     }
 
     #[test]

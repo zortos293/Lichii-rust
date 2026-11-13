@@ -81,11 +81,6 @@ impl PageTable {
         Some(MemoryPermission(old as u8 & 7))
     }
 
-    pub(crate) fn is_tracked(&self, addr: u64) -> bool {
-        self.entry(addr)
-            .is_some_and(|entry| entry.load(Ordering::Acquire) & TRACKED != 0)
-    }
-
     #[inline]
     pub(crate) fn translate(&self, addr: u64) -> Option<(*mut u8, MemoryPermission)> {
         let raw = self.entry(addr)?.load(Ordering::Acquire);
@@ -204,7 +199,7 @@ impl PageTable {
         })
     }
 
-    fn for_each_chunk(
+    pub(crate) fn for_each_chunk(
         &self,
         addr: u64,
         size: u64,

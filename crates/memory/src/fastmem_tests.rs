@@ -292,6 +292,52 @@ mod faults {
     }
 
     #[test]
+    fn views_mapped_again_over_tracked_pages_publish_them() {
+        let faults = AtomicU64::new(0);
+        let Some((space, device)) = tracked_space() else {
+            return;
+        };
+        let fastmem = space.fastmem().unwrap();
+        fastmem.set_fault_handler(Some(count_store), &faults as *const AtomicU64 as usize);
+        let base = fastmem.base();
+        space.map(0x4000_0000, 0x10_0000, 0x4000, MemoryPermission::READ_WRITE);
+        device
+            .map_process(0x1_0000_0000, &space, 0x4000_0000, 0x4000)
+            .unwrap();
+        let _cached = device.cache_pages(0x1_0000_1000, 0x1000);
+
+        space.protect(0x4000_0000, 0x4000, MemoryPermission::READ_WRITE);
+        assert!(
+            !device.has_cpu_writes(),
+            "protecting a whole view never exposes it"
+        );
+        space.protect(0x4000_3000, 0x1000, MemoryPermission::READ);
+        let mut found = Vec::new();
+        device.take_cpu_writes(|daddr, size| found.push((daddr, size)));
+        assert_eq!(
+            !found.is_empty(),
+            cfg!(windows),
+            "only a Windows view split maps the tracked page again"
+        );
+        store(base, 0x4000_1000, 1);
+        assert_eq!(
+            faults.load(Ordering::SeqCst),
+            1,
+            "the page is still write-protected"
+        );
+
+        space.map(0x5000_0000, 0x10_1000, 0x1000, MemoryPermission::READ_WRITE);
+        let mut found = Vec::new();
+        device.take_cpu_writes(|daddr, size| found.push((daddr, size)));
+        assert_eq!(
+            found,
+            [(0x1_0000_1000, 0x1000)],
+            "a new alias was briefly writable"
+        );
+        space.unmap(0x5000_0000, 0x1000);
+    }
+
+    #[test]
     fn many_scattered_pages_track_and_untrack() {
         let faults = AtomicU64::new(0);
         let Some((space, device)) = tracked_space() else {

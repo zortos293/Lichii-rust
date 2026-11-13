@@ -43,6 +43,33 @@ fn tracked_runs(tracked: &BTreeSet<usize>, start: usize, end: usize) -> Vec<(usi
     runs
 }
 
+/// `[start, end)` split into runs that get `prot` and runs of write-tracked pages that get it
+/// without write, so a protection change never makes a tracked page writable, even briefly.
+fn protection_runs(
+    tracked: &BTreeSet<usize>,
+    start: usize,
+    end: usize,
+    prot: HostProtection,
+) -> Vec<(usize, usize, HostProtection)> {
+    let reduced = prot.without_write();
+    if reduced == prot {
+        return vec![(start, end - start, prot)];
+    }
+    let mut runs = Vec::new();
+    let mut at = start;
+    for (first, len) in tracked_runs(tracked, start, end) {
+        if first > at {
+            runs.push((at, first - at, prot));
+        }
+        runs.push((first, len, reduced));
+        at = first + len;
+    }
+    if at < end {
+        runs.push((at, end - at, prot));
+    }
+    runs
+}
+
 /// The DRAM backing object and its main read-write view.
 pub(crate) struct Backing {
     ptr: *mut u8,
@@ -188,6 +215,13 @@ impl Arena {
         }
         self.sys.track(self.base, offset, len, prot, tracked)
     }
+
+    /// Offsets of write-tracked pages whose views had to be mapped again since the last call.
+    /// A view is mapped read-write before it is protected, so a store may have landed there
+    /// unseen; the caller publishes those pages as written.
+    pub(crate) fn take_exposed(&self) -> Vec<usize> {
+        self.sys.take_exposed()
+    }
 }
 
 impl Drop for Arena {
@@ -208,7 +242,7 @@ mod sys {
     use std::collections::BTreeSet;
     use std::io;
 
-    use super::{HostProtection, tracked_runs};
+    use super::{HostProtection, protection_runs};
 
     fn check(ret: libc::c_int) -> io::Result<()> {
         if ret == 0 {
@@ -403,14 +437,15 @@ mod sys {
             prot: HostProtection,
             tracked: &BTreeSet<usize>,
         ) -> io::Result<()> {
-            // SAFETY: the range lies inside the arena reservation.
-            check(unsafe { libc::mprotect(base.add(offset).cast(), len, prot_flags(prot)) })?;
-            if prot.without_write() != prot {
-                for (start, run) in tracked_runs(tracked, offset, offset + len) {
-                    self.track(base, start, run, prot, true)?;
-                }
+            for (start, run, prot) in protection_runs(tracked, offset, offset + len, prot) {
+                // SAFETY: the run lies inside the arena reservation.
+                check(unsafe { libc::mprotect(base.add(start).cast(), run, prot_flags(prot)) })?;
             }
             Ok(())
+        }
+
+        pub fn take_exposed(&self) -> Vec<usize> {
+            Vec::new()
         }
 
         pub fn track(
@@ -450,7 +485,7 @@ mod sys {
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-    use super::{HostProtection, tracked_runs};
+    use super::{HostProtection, protection_runs, tracked_runs};
 
     const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
     const MEM_SPLIT_PLACEHOLDER: u32 = 0x2;
@@ -588,6 +623,8 @@ mod sys {
     pub struct Arena {
         size: usize,
         views: Mutex<BTreeMap<usize, View>>,
+        /// Tracked pages `place` mapped read-write again, for `take_exposed`.
+        exposed: Mutex<Vec<usize>>,
     }
 
     impl Arena {
@@ -611,6 +648,7 @@ mod sys {
                 Self {
                     size,
                     views: Mutex::new(BTreeMap::new()),
+                    exposed: Mutex::default(),
                 },
                 base.cast(),
             ))
@@ -641,6 +679,7 @@ mod sys {
         }
 
         fn place(
+            &self,
             base: *mut u8,
             backing: &Backing,
             views: &mut BTreeMap<usize, View>,
@@ -693,29 +732,24 @@ mod sys {
                 })?;
                 views.insert(offset, view);
             }
-            Self::protect_tracked(base, offset, view, tracked)
-        }
-
-        /// Write-protects the tracked pages of the view at `offset` again, after the whole view
-        /// got `view.prot`. Sub-ranges of one view, so VirtualProtect accepts them.
-        fn protect_tracked(
-            base: *mut u8,
-            offset: usize,
-            view: View,
-            tracked: &BTreeSet<usize>,
-        ) -> io::Result<()> {
             let reduced = view.prot.without_write();
             if reduced == view.prot {
                 return Ok(());
             }
+            let mut exposed = self.exposed.lock();
             for (start, len) in tracked_runs(tracked, offset, offset + view.len) {
                 let mut old = 0;
                 // SAFETY: [start, start + len) lies inside the view at offset.
                 check(unsafe {
                     VirtualProtect(base.add(start).cast(), len, page_flags(reduced), &mut old)
                 })?;
+                exposed.extend((start..start + len).step_by(super::PAGE));
             }
             Ok(())
+        }
+
+        pub fn take_exposed(&self) -> Vec<usize> {
+            std::mem::take(&mut *self.exposed.lock())
         }
 
         fn remove_range(
@@ -752,7 +786,7 @@ mod sys {
                         len: offset - start,
                         ..view
                     };
-                    Self::place(base, backing, views, start, head, tracked)?;
+                    self.place(base, backing, views, start, head, tracked)?;
                 }
                 let view_end = start + view.len;
                 if view_end > end {
@@ -761,7 +795,7 @@ mod sys {
                         backing_offset: view.backing_offset + (end - start),
                         prot: view.prot,
                     };
-                    Self::place(base, backing, views, end, tail, tracked)?;
+                    self.place(base, backing, views, end, tail, tracked)?;
                 }
             }
             Ok(())
@@ -786,7 +820,7 @@ mod sys {
                 backing_offset,
                 prot,
             };
-            Self::place(base, backing, &mut views, offset, view, tracked)
+            self.place(base, backing, &mut views, offset, view, tracked)
         }
 
         pub fn unmap(
@@ -824,13 +858,14 @@ mod sys {
                 let a = start.max(offset);
                 let b = (start + view.len).min(end);
                 if a == start && b == start + view.len {
-                    let mut old = 0;
-                    // SAFETY: [start, start + len) is exactly one of our views.
-                    check(unsafe {
-                        VirtualProtect(base.add(start).cast(), view.len, page_flags(prot), &mut old)
-                    })?;
+                    for (run, len, prot) in protection_runs(tracked, a, b, prot) {
+                        let mut old = 0;
+                        // SAFETY: [run, run + len) lies inside the view at start.
+                        check(unsafe {
+                            VirtualProtect(base.add(run).cast(), len, page_flags(prot), &mut old)
+                        })?;
+                    }
                     views.insert(start, View { prot, ..view });
-                    Self::protect_tracked(base, start, View { prot, ..view }, tracked)?;
                 } else {
                     self.remove_range(base, backing, &mut views, a, b - a, tracked)?;
                     let part = View {
@@ -838,7 +873,7 @@ mod sys {
                         backing_offset: view.backing_offset + (a - start),
                         prot,
                     };
-                    Self::place(base, backing, &mut views, a, part, tracked)?;
+                    self.place(base, backing, &mut views, a, part, tracked)?;
                 }
             }
             Ok(())
