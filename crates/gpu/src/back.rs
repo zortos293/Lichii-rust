@@ -18,7 +18,7 @@ use crate::gmmu::{Gmmu, RangeTarget};
 use crate::gpu::{MAX_POLL, MIN_POLL};
 use crate::host1x::Syncpoints;
 use crate::ring::{Consumer, WRAP};
-use crate::stream::{FetchSyncs, MULTI_MAX_WORDS, REDUCTIONS, RELEASE_SIZES, tag};
+use crate::stream::{FetchSync, FetchSyncs, MULTI_MAX_WORDS, REDUCTIONS, RELEASE_SIZES, tag};
 
 /// The back reports progress at least this often while it executes.
 const RELEASE_SLOTS: u64 = 1024;
@@ -248,7 +248,15 @@ impl Back {
                 3
             }
             tag::SYNCHRONIZE_FETCH => {
-                self.synchronize_read(consumer.slot(1), consumer.slot(2));
+                let (address, size) = (consumer.slot(1), consumer.slot(2));
+                let host = match method {
+                    m if m == FetchSync::Host as u32 => true,
+                    m if m == FetchSync::HostIfWritten as u32 => self.written(address, size),
+                    _ => false,
+                };
+                if host {
+                    self.synchronize_read(address, size);
+                }
                 self.fetch_syncs.complete();
                 3
             }
@@ -363,6 +371,20 @@ impl Back {
                 rasterizer.flush_region(daddr, range.size);
             }
         });
+    }
+
+    /// Whether GPU work may have written a page of the current channel's `[address, +size)`.
+    fn written(&self, address: u64, size: u64) -> bool {
+        let Some(channel) = self.current.and_then(|index| self.channels[index].as_ref()) else {
+            return false;
+        };
+        let mut written = false;
+        channel.setup.memory.for_each_range(address, size, |range| {
+            if let RangeTarget::Device(daddr) = range.target {
+                written |= self.written_pages.may_be_written(daddr, range.size);
+            }
+        });
+        written
     }
 
     fn reduce(&mut self, address: u64, payload: u32, op: crate::host::Reduction, signed: bool) {

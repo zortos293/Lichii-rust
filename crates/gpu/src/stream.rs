@@ -41,10 +41,24 @@ pub(crate) mod tag {
     pub const SIDE: u8 = 13;
     /// Then the GPU address and the size of a range the front reads.
     pub const SYNCHRONIZE_READ: u8 = 14;
-    /// Then the GPU address and the size of the GPFIFO entry a channel fetches next.
+    /// Method: a [`FetchSync`]; then the GPU address and the size of the GPFIFO entry a channel
+    /// fetches next.
     pub const SYNCHRONIZE_FETCH: u8 = 15;
     /// Then the GPU address the engine's next DATA_UPLOAD word comes from.
     pub const UPLOAD_SOURCE: u8 = 16;
+}
+
+/// How far the fetch of a GPFIFO entry waits for the work before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FetchSync {
+    /// Until the back executed it.
+    Order = 0,
+    /// Until it also completed on the host GPU and GPU-written data in the entry reached guest
+    /// memory.
+    Host = 1,
+    /// As [`FetchSync::Host`] when GPU work wrote a page of the entry by the time the back executed
+    /// the work before it, else as [`FetchSync::Order`].
+    HostIfWritten = 2,
 }
 
 /// Words of one multi-word record; longer runs are split.
@@ -267,12 +281,19 @@ impl Stream {
         self.drain();
     }
 
-    /// Has the back synchronize the fetch of `[address, address + size)` as
-    /// [`Stream::synchronize_read`] does, without waiting for it: the GPU work before completes,
-    /// its fences land and GPU-written data in the range reaches guest memory. Returns the ticket
-    /// [`Stream::fetch_synced`] takes.
-    pub(crate) fn synchronize_fetch(&mut self, address: GpuVAddr, size: u64) -> u64 {
-        self.record(&[header(tag::SYNCHRONIZE_FETCH, 0, 0, 0), address, size]);
+    /// Has the back synchronize the fetch of `[address, address + size)` as `sync` says, without
+    /// waiting for it. Returns the ticket [`Stream::fetch_synced`] takes.
+    pub(crate) fn synchronize_fetch(
+        &mut self,
+        address: GpuVAddr,
+        size: u64,
+        sync: FetchSync,
+    ) -> u64 {
+        self.record(&[
+            header(tag::SYNCHRONIZE_FETCH, 0, sync as u32, 0),
+            address,
+            size,
+        ]);
         self.producer.publish();
         self.fetch_syncs_sent += 1;
         self.fetch_syncs_sent
