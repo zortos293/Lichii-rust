@@ -60,57 +60,61 @@ fn loop_macro() -> Vec<Inst> {
     ]
 }
 
-/// Calls whose parameters repeat one of `pool` recent calls `repeat_percent` of the
-/// time and are new otherwise.
-fn calls(
+/// A call stream: `warmup` holds every call of the starting working set once, and `timed`
+/// repeats a call of the working set `repeat_percent` of the time and makes a new one, which
+/// replaces a random member, otherwise.
+struct Stream {
+    warmup: Vec<Vec<u32>>,
+    timed: Vec<Vec<u32>>,
+}
+
+fn stream(
     count: usize,
-    words: usize,
     pool: usize,
     repeat_percent: u32,
     rng: &mut Rng,
-) -> Vec<Vec<u32>> {
-    let mut recent: Vec<Vec<u32>> = Vec::new();
-    (0..count)
+    mut make: impl FnMut(&mut Rng) -> Vec<u32>,
+) -> Stream {
+    let mut recent: Vec<Vec<u32>> = (0..pool).map(|_| make(rng)).collect();
+    let warmup = recent.clone();
+    let timed = (0..count)
         .map(|_| {
-            if !recent.is_empty() && rng.below(100) < repeat_percent {
-                return recent[rng.below(recent.len() as u32) as usize].clone();
+            if rng.below(100) < repeat_percent {
+                return recent[rng.below(pool as u32) as usize].clone();
             }
-            let call: Vec<u32> = (0..words).map(|_| rng.next()).collect();
-            if recent.len() == pool {
-                let slot = rng.below(pool as u32) as usize;
-                recent[slot] = call.clone();
-            } else {
-                recent.push(call.clone());
-            }
+            let call = make(rng);
+            recent[rng.below(pool as u32) as usize] = call.clone();
             call
         })
-        .collect()
+        .collect();
+    Stream { warmup, timed }
 }
 
-fn measure(name: &str, mut engine: MacroEngine, calls: &[Vec<u32>]) {
+fn measure(name: &str, mut engine: MacroEngine, stream: &Stream) {
     let mut host = BenchHost {
         registers: Box::new([0; 0x1000]),
         sum: 0,
     };
     let mut data_ram = MacroDataRam::new();
-    for parameters in &calls[..calls.len() / 10] {
+    for parameters in &stream.warmup {
         engine
             .call(0, parameters, &mut data_ram, &mut host)
             .unwrap();
     }
+    let warm = engine.stats();
     let start = Instant::now();
-    for parameters in calls {
+    for parameters in &stream.timed {
         engine
             .call(0, parameters, &mut data_ram, &mut host)
             .unwrap();
     }
-    let ns = start.elapsed().as_nanos() as f64 / calls.len() as f64;
+    let ns = start.elapsed().as_nanos() as f64 / stream.timed.len() as f64;
     let stats = engine.stats();
     println!(
         "{name:<28} {ns:>7.1} ns/call  {:>5.1}% of a thread at 1M calls/s  replayed {}/{}  (sum {})",
         ns / 10.0,
-        stats.replayed,
-        stats.calls,
+        stats.replayed - warm.replayed,
+        stats.calls - warm.calls,
         host.sum
     );
 }
@@ -122,12 +126,14 @@ fn bench() {
     let mut rng = Rng(0x2545_f491_4f6c_dd1d);
     let state = assemble(&state_macro());
     let looped = assemble(&loop_macro());
-    let state_calls = calls(CALLS, 2, 32, 96, &mut rng);
-    let mut loop_calls = calls(CALLS / 4, 17, 32, 96, &mut rng);
-    for call in &mut loop_calls {
+    let words = |count: usize| move |rng: &mut Rng| (0..count).map(|_| rng.next()).collect();
+    let state_calls = stream(CALLS, 32, 96, &mut rng, words(2));
+    let wide_calls = stream(CALLS, 65536, 96, &mut rng, words(2));
+    let loop_calls = stream(CALLS / 4, 32, 96, &mut rng, |rng| {
+        let mut call = words(17)(rng);
         call[0] = 16;
-    }
-    let wide_calls = calls(CALLS, 2, 65536, 96, &mut rng);
+        call
+    });
     for (name, code, calls) in [
         ("state, 7 instructions", &state, &state_calls),
         ("state, 64k recent calls", &state, &wide_calls),
