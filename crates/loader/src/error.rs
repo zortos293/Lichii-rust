@@ -34,6 +34,10 @@ pub enum LoaderError {
     MissingProgram(String),
     #[error("{0} is not a title Lichii can load")]
     NotATitle(String),
+    #[error("{0} has no package with an ExeFS")]
+    MissingNupProgram(String),
+    #[error("{0} does not match its SHA-256")]
+    FileHashMismatch(String),
 }
 
 pub type LoaderResult<T> = Result<T, LoaderError>;
