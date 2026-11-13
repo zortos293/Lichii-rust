@@ -77,6 +77,8 @@ pub(crate) struct Sched {
     pub ideal_core: i32,
     pub active_core: usize,
     pub next_token: u64,
+    /// How many times a core picked the thread, so the watchdog can tell one left waiting.
+    pub runs: u64,
     /// Token of the wait in progress, 0 when none.
     pub wait: u64,
     pub cancellable: bool,
@@ -158,6 +160,7 @@ impl Thread {
                 ideal_core: new.ideal_core,
                 active_core: new.ideal_core.max(0) as usize,
                 next_token: 1,
+                runs: 0,
                 wait: 0,
                 cancellable: false,
                 wake: WakeResult::SUCCESS,
@@ -340,7 +343,7 @@ impl Thread {
 
     /// The thread's scheduling state on one line, for the `debug.svc_trace` dump at shutdown. The
     /// saved `pc` is stale while the thread runs.
-    pub(crate) fn describe(&self) -> String {
+    pub(crate) fn describe(&self, waits_on: Option<&str>) -> String {
         let lock_owner = self
             .lock_owner
             .lock()
@@ -356,14 +359,16 @@ impl Thread {
         let s = self.sched.lock();
         let ctx = self.context.lock();
         format!(
-            "thread={} state={:?} priority={} base={} core={} affinity={:#x} wait={} pc={:#x} lr={:#x} lock_owner={lock_owner:?} lenders={lenders:?}",
+            "thread={} state={:?} priority={} base={} core={} affinity={:#x} runs={} wait={} waits_on={} pc={:#x} lr={:#x} lock_owner={lock_owner:?} lenders={lenders:?}",
             self.id,
             s.state,
             s.priority,
             s.base_priority,
             s.active_core,
             s.affinity,
+            s.runs,
             s.wait,
+            waits_on.unwrap_or("-"),
             ctx.pc,
             ctx.x[30],
         )

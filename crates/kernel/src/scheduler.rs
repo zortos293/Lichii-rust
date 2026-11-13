@@ -313,6 +313,7 @@ impl Scheduler {
                 }
                 s.state = ThreadState::Running(core);
                 s.active_core = core;
+                s.runs += 1;
                 let picked = Picked {
                     thread: thread.clone(),
                     resume: std::mem::take(&mut s.resume),
@@ -449,6 +450,17 @@ impl Scheduler {
             self.request_reschedule(core);
             self.unpark(core);
         }
+    }
+
+    /// Every thread in a run queue.
+    pub(crate) fn queued_threads(&self) -> Vec<Arc<Thread>> {
+        self.cores
+            .iter()
+            .flat_map(|core| {
+                let queue = core.queue.lock();
+                queue.levels.iter().flatten().cloned().collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     /// Each core's running priority and queued threads, for the `debug.svc_trace` dump at

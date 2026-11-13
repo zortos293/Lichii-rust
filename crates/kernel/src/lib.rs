@@ -31,6 +31,7 @@ pub mod testing;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
@@ -53,7 +54,7 @@ use crate::process::{NewProcess, Process, ProcessId, ProcessParams, ProcessState
 use crate::resource_limit::{LimitableResource, ResourceLimit};
 use crate::scheduler::Scheduler;
 use crate::sm::ServiceManager;
-use crate::thread::{LOWEST_PRIORITY, NewThread, Thread};
+use crate::thread::{LOWEST_PRIORITY, NewThread, Thread, ThreadId, ThreadState};
 use crate::timer::Timer;
 use crate::util::Rng;
 
@@ -283,6 +284,13 @@ impl Kernel {
                 .spawn(move || kernel.timer.run(&kernel.scheduler))
                 .map_err(KernelError::Spawn)?,
         );
+        let kernel = self.0.clone();
+        threads.push(
+            std::thread::Builder::new()
+                .name("kernel watchdog".into())
+                .spawn(move || kernel.watch())
+                .map_err(KernelError::Spawn)?,
+        );
         for core in 0..self.core_count() {
             let kernel = self.0.clone();
             threads.push(
@@ -313,12 +321,12 @@ impl Kernel {
     /// Stops every core and kernel thread and releases all processes. A thread still running
     /// after [`SLOW_JOIN`] is named in a warning, so a shutdown that hangs says what it waits for.
     pub fn shutdown(&self) {
-        if self.0.svc_trace {
-            self.0.log_thread_states();
-        }
         self.0.scheduler.shutdown();
         self.0.timer.shutdown();
         let threads = std::mem::take(&mut *self.0.host_threads.lock());
+        for thread in &threads {
+            thread.thread().unpark();
+        }
         for thread in threads {
             join_noting_slow(thread);
         }
@@ -371,6 +379,13 @@ impl Kernel {
     }
 }
 
+/// How often the kernel watchdog looks at the run queues.
+const WATCH_PERIOD: Duration = Duration::from_millis(250);
+/// How long a runnable thread may go without running before the watchdog logs every thread.
+const STARVED_AFTER: Duration = Duration::from_secs(2);
+/// How often the watchdog logs every thread under `debug.svc_trace`.
+const TRACE_LOG_PERIOD: Duration = Duration::from_secs(5);
+
 /// How long [`Kernel::shutdown`] waits for a thread before naming it.
 const SLOW_JOIN: Duration = Duration::from_secs(2);
 
@@ -397,12 +412,67 @@ impl KernelInner {
     /// a title that stalls ends with what each thread was left waiting on.
     fn log_thread_states(&self) {
         for line in self.scheduler.describe() {
-            tracing::info!(target: "svc", "{line}");
+            tracing::info!(target: "threads", "{line}");
         }
+        let waits: HashMap<ThreadId, String> = self.arbiter.waits().into_iter().collect();
         let processes = self.processes.lock().clone();
         for process in processes {
             for thread in process.threads() {
-                tracing::info!(target: "svc", process = process.name(), "{}", thread.describe());
+                let waits_on = waits.get(&thread.id()).map(String::as_str);
+                tracing::info!(
+                    target: "threads",
+                    process = process.name(),
+                    "{}",
+                    thread.describe(waits_on)
+                );
+            }
+        }
+    }
+
+    /// The kernel watchdog: logs every thread once when a runnable thread has not run for
+    /// [`STARVED_AFTER`], and every [`TRACE_LOG_PERIOD`] under `debug.svc_trace`, so a title
+    /// that goes quiet shows what each thread is left waiting on.
+    fn watch(&self) {
+        let mut queued_since: HashMap<ThreadId, (u64, Instant)> = HashMap::new();
+        let mut warned = false;
+        let mut logged = Instant::now();
+        while !self.scheduler.is_shut_down() {
+            std::thread::park_timeout(WATCH_PERIOD);
+            let now = Instant::now();
+            if self.scheduler.is_paused() {
+                queued_since.clear();
+                continue;
+            }
+            let runnable: HashMap<ThreadId, u64> = self
+                .scheduler
+                .queued_threads()
+                .into_iter()
+                .filter_map(|thread| {
+                    let s = thread.sched.lock();
+                    (s.state == ThreadState::Runnable).then_some((thread.id(), s.runs))
+                })
+                .collect();
+            queued_since.retain(|id, (runs, _)| runnable.get(id) == Some(runs));
+            let mut starved = None;
+            for (id, runs) in runnable {
+                let (_, since) = *queued_since.entry(id).or_insert((runs, now));
+                if now.duration_since(since) >= STARVED_AFTER {
+                    starved = Some(id);
+                }
+            }
+            if let Some(thread) = starved
+                && !warned
+            {
+                warned = true;
+                tracing::warn!(
+                    thread,
+                    "a runnable thread has not run for {STARVED_AFTER:?}; logging every thread"
+                );
+                self.log_thread_states();
+            }
+            if self.svc_trace && now.duration_since(logged) >= TRACE_LOG_PERIOD {
+                logged = now;
+                self.log_thread_states();
             }
         }
     }
