@@ -65,6 +65,7 @@ enum Warning {
     IndirectScattered = 1 << 3,
     NoIndirectCount = 1 << 4,
     RescaledTexture = 1 << 6,
+    DrawTextureTarget = 1 << 7,
 }
 
 /// A descriptor write of the current draw: `count` infos from `first` of the info list for
@@ -121,6 +122,7 @@ pub(super) struct DrawState {
     blend_enables: Vec<vk::Bool32>,
     blend_equations: Vec<vk::ColorBlendEquationEXT>,
     write_masks: Vec<vk::ColorComponentFlags>,
+    texture_pipelines: Option<texture::TexturePipelines>,
 }
 
 impl DrawState {
@@ -224,6 +226,7 @@ impl DrawState {
             blend_enables: Vec::new(),
             blend_equations: Vec::new(),
             write_masks: Vec::new(),
+            texture_pipelines: None,
         })
     }
 
@@ -1722,6 +1725,8 @@ fn storage_pointer(
         .unwrap_or(0);
     (address, 64 << 10)
 }
+
+mod texture;
 
 #[cfg(test)]
 mod tests;

@@ -16,8 +16,8 @@ use lichii_common::DAddr;
 use lichii_common::settings::{AstcRecompression, GraphicsSettings, ResolutionScale};
 use lichii_gpu::backend::ChannelId;
 use lichii_gpu::backend::{
-    ComputeContext, DrawParams, FenceAction, FramebufferConfig, GpuHandles, GraphicsContext,
-    IndirectDraw, Query, QueryKind, Rasterizer,
+    ComputeContext, DrawParams, DrawTexture, FenceAction, FramebufferConfig, GpuHandles,
+    GraphicsContext, IndirectDraw, Query, QueryKind, Rasterizer,
 };
 use lichii_gpu::engines::maxwell_3d::Regs;
 use lichii_gpu::engines::maxwell_3d::regs::NUM_RENDER_TARGETS;
@@ -594,6 +594,12 @@ impl Rasterizer for VulkanRasterizer {
     fn draw_indirect(&mut self, ctx: &mut GraphicsContext<'_>, draw: &IndirectDraw) {
         if let Err(error) = self.draw_graphics(ctx, draw::DrawCall::Indirect(draw)) {
             tracing::error!(%error, "recording an indirect draw failed");
+        }
+    }
+
+    fn draw_texture(&mut self, ctx: &mut GraphicsContext<'_>, draw: &DrawTexture) {
+        if let Err(error) = self.record_draw_texture(ctx, draw) {
+            tracing::error!(%error, "recording a texture draw failed");
         }
     }
 
