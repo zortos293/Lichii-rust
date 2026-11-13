@@ -3,6 +3,8 @@
 //! 16. There the wait runs on a high-resolution waitable timer beside an event that
 //! [`Alarm::notify`] signals, as the reference does.
 
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use parking_lot::{Condvar, MutexGuard};
@@ -11,6 +13,8 @@ pub(crate) struct Alarm {
     cv: Condvar,
     #[cfg(windows)]
     precise: Option<windows::PreciseWait>,
+    #[cfg(windows)]
+    precise_failed: AtomicBool,
 }
 
 impl Default for Alarm {
@@ -19,6 +23,8 @@ impl Default for Alarm {
             cv: Condvar::new(),
             #[cfg(windows)]
             precise: windows::PreciseWait::new(),
+            #[cfg(windows)]
+            precise_failed: AtomicBool::new(false),
         }
     }
 }
@@ -37,8 +43,12 @@ impl Alarm {
     pub fn wait_until<T>(&self, guard: &mut MutexGuard<'_, T>, deadline: Instant) {
         #[cfg(windows)]
         if let Some(precise) = &self.precise
-            && MutexGuard::unlocked(guard, || precise.wait_until(deadline))
+            && !self.precise_failed.load(Ordering::Relaxed)
         {
+            if !MutexGuard::unlocked(guard, || precise.wait_until(deadline)) {
+                tracing::warn!("high-resolution timer wait failed; using the condvar from now on");
+                self.precise_failed.store(true, Ordering::Relaxed);
+            }
             return;
         }
         self.cv.wait_until(guard, deadline);
