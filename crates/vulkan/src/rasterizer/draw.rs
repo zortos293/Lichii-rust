@@ -38,11 +38,11 @@ use lichii_texture::{Numeric, PixelFormat};
 
 use super::VulkanRasterizer;
 use crate::buffer_cache::{BufferBinding, IndexBinding, assembled_topology, vertex_stream_range};
-use crate::commands::{COLOR_RANGE, ImageAccess, transition};
+use crate::commands::ImageAccess;
 use crate::descriptors::DescriptorAllocator;
 use crate::device::Device;
 use crate::error::Result;
-use crate::memory::{Buffer, BufferView, Image, ImageDesc, ImageView};
+use crate::memory::{Buffer, BufferView};
 use crate::pipeline::environment::{ProgramEnv, TexturePool, texture_type};
 use crate::pipeline::fixed_state::flags;
 use crate::pipeline::maxwell_to_vk as mvk;
@@ -159,8 +159,7 @@ pub(super) struct DrawState {
     vertex_input: ash::ext::vertex_input_dynamic_state::Device,
     mesh: ash::ext::mesh_shader::Device,
     null_buffer: Buffer,
-    null_view: ImageView,
-    _null_image: Image,
+    null_images: null::NullImages,
     arch: ShaderArch,
     channel: Option<ChannelId>,
     warned: u32,
@@ -217,48 +216,12 @@ impl DrawState {
             gpu_allocator::MemoryLocation::GpuOnly,
             "null buffer",
         )?;
-        let null_image = Image::new(
-            device,
-            &ImageDesc::d2(
-                vk::Format::R8G8B8A8_UNORM,
-                1,
-                1,
-                vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
-            ),
-            "null texture",
-        )?;
-        let null_view =
-            null_image.view(vk::ImageViewType::TYPE_2D, vk::ComponentMapping::default())?;
-        transition(
-            device,
-            cmd,
-            null_image.raw(),
-            COLOR_RANGE,
-            ImageAccess::UNDEFINED,
-            ImageAccess::TRANSFER_DST,
-        );
-        // SAFETY: `cmd` is recording; the buffer and image are transfer destinations in the
-        // layouts given.
+        // SAFETY: `cmd` is recording; the buffer is a transfer destination.
         unsafe {
             device
                 .raw
                 .cmd_fill_buffer(cmd, null_buffer.raw(), 0, NULL_BUFFER_SIZE, 0);
-            device.raw.cmd_clear_color_image(
-                cmd,
-                null_image.raw(),
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &vk::ClearColorValue::default(),
-                &[COLOR_RANGE],
-            );
         }
-        transition(
-            device,
-            cmd,
-            null_image.raw(),
-            COLOR_RANGE,
-            ImageAccess::TRANSFER_DST,
-            SHADER_SAMPLED,
-        );
         crate::commands::transfer_to_all_barrier(device, cmd);
         let features = *pipelines.features();
         Ok(Self {
@@ -276,8 +239,7 @@ impl DrawState {
             ),
             mesh: ash::ext::mesh_shader::Device::new(&device.instance.raw, &device.raw),
             null_buffer,
-            null_view,
-            _null_image: null_image,
+            null_images: null::NullImages::default(),
             arch: if gob_layout == GobLayout::Switch2 {
                 ShaderArch::Ampere
             } else {
@@ -1162,20 +1124,31 @@ impl VulkanRasterizer {
                             if rescaled {
                                 self.draw.texture_scaling.set(b.descriptor);
                             }
-                            let view = match texture {
+                            let (view, layout) = match texture {
                                 Some((id, view)) => {
                                     self.draw.textures.push(id);
-                                    view
-                                }
-                                None if desc.ty == TextureType::Color2D && !desc.is_depth => {
-                                    self.draw.null_view.raw()
+                                    (view, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                                 }
                                 None => {
-                                    self.draw.warn_once(
-                                        Warning::NullTexture,
-                                        "a draw samples an unbound non-2D texture; skipping it",
-                                    );
-                                    return Ok(false);
+                                    let format = match (desc.is_depth, desc.is_integer) {
+                                        (true, _) => vk::Format::D16_UNORM,
+                                        (false, true) => vk::Format::R8G8B8A8_UINT,
+                                        (false, false) => vk::Format::R8G8B8A8_UNORM,
+                                    };
+                                    let null = match desc.is_multisample {
+                                        true => None,
+                                        false => {
+                                            self.null_view(view_type(desc.ty), format, false)?
+                                        }
+                                    };
+                                    let Some(view) = null else {
+                                        self.draw.warn_once(
+                                            Warning::NullTexture,
+                                            "a draw samples an unbound multisampled texture; skipping it",
+                                        );
+                                        return Ok(false);
+                                    };
+                                    (view, null::NULL_LAYOUT)
                                 }
                             };
                             let (_, sampler_index) = src.pool.split(raw);
@@ -1183,7 +1156,7 @@ impl VulkanRasterizer {
                             self.draw.image_infos.push(vk::DescriptorImageInfo {
                                 sampler,
                                 image_view: view,
-                                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                                image_layout: layout,
                             });
                         }
                     }
@@ -1255,11 +1228,26 @@ impl VulkanRasterizer {
                                 self.storage_view(src, raw, &desc)?
                             };
                             let Some((id, view)) = found else {
-                                self.draw.warn_once(
-                                    Warning::NullStorageImage,
-                                    "a draw binds an unbound or unstorable storage image; skipping it",
-                                );
-                                return Ok(false);
+                                let format = match storage_format(desc.format) {
+                                    Some(format) => self.texture_cache.host(format).format,
+                                    None if desc.is_integer => vk::Format::R32_UINT,
+                                    None => vk::Format::R32_SFLOAT,
+                                };
+                                let Some(view) =
+                                    self.null_view(view_type(desc.ty), format, true)?
+                                else {
+                                    self.draw.warn_once(
+                                        Warning::NullStorageImage,
+                                        "a draw binds an unbound storage image of a format the device cannot store; skipping it",
+                                    );
+                                    return Ok(false);
+                                };
+                                self.draw.image_infos.push(vk::DescriptorImageInfo {
+                                    sampler: vk::Sampler::null(),
+                                    image_view: view,
+                                    image_layout: null::NULL_LAYOUT,
+                                });
+                                continue;
                             };
                             let rescaled = self
                                 .texture_cache
@@ -1438,6 +1426,24 @@ impl VulkanRasterizer {
             .texture_cache
             .storage_view(id, &view)?
             .map(|raw| (id, raw)))
+    }
+
+    /// A view of `view_type` and `format` reading zeros, for an unbound texture or (with
+    /// `storage`) storage image; `None` when the device cannot sample or store the format.
+    fn null_view(
+        &mut self,
+        view_type: vk::ImageViewType,
+        format: vk::Format,
+        storage: bool,
+    ) -> Result<Option<vk::ImageView>> {
+        let scheduler = &mut self.scheduler;
+        self.draw.null_images.view(
+            &self.device,
+            || scheduler.record(),
+            view_type,
+            format,
+            storage,
+        )
     }
 
     fn push_buffer(&mut self, binding: Option<crate::buffer_cache::BufferBinding>) {
@@ -2349,6 +2355,7 @@ fn storage_pointer(
 mod assembly;
 mod dispatch_grid;
 mod host_compute;
+mod null;
 mod texture;
 
 #[cfg(test)]
