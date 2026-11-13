@@ -10,7 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
-use std::thread::JoinHandle;
+use std::thread::{JoinHandle, ThreadId};
 use std::time::Duration;
 
 use lichii_common::DAddr;
@@ -18,7 +18,7 @@ use parking_lot::{Condvar, Mutex};
 
 use crate::back::{Back, SideCommand};
 use crate::backend::{ChannelId, FramebufferConfig, GpuHandles, Rasterizer};
-use crate::channel::{ChannelConfig, Submission, SyncpointFence};
+use crate::channel::{ChannelConfig, GpEntry, Submission, SyncpointFence, SyncpointIncrement};
 use crate::clock::{GpuTimestamp, GuestTime};
 use crate::dma_pusher::{FrontChannel, FrontShared, Work};
 use crate::engines::{EngineFactory, create_engine};
@@ -82,10 +82,22 @@ enum CpuCommand {
     CreateChannel(ChannelId, ChannelConfig, Arc<AtomicU32>),
     DestroyChannel(ChannelId),
     BindAddressSpace(ChannelId, Arc<Gmmu>),
-    Submit(ChannelId, Submission),
+    Submit(ChannelId, QueuedSubmission),
     Side(SideCommand),
     Synchronize(mpsc::SyncSender<()>),
 }
+
+/// A [`Submission`] on its way to the front, its entries copied into a buffer of the inbox's
+/// pool.
+struct QueuedSubmission {
+    entries: Vec<GpEntry>,
+    wait: Option<SyncpointFence>,
+    increment: Option<SyncpointIncrement>,
+}
+
+/// Entry buffers the inbox keeps for later submissions; more are dropped once the front is done
+/// with them.
+const POOLED_ENTRY_BUFFERS: usize = 16;
 
 /// The CPU side's queue to the front, and the front's wake-up.
 pub(crate) struct Inbox {
@@ -98,6 +110,7 @@ struct InboxState {
     woken: bool,
     paused: bool,
     closed: bool,
+    entry_buffers: Vec<Vec<GpEntry>>,
 }
 
 impl Inbox {
@@ -108,25 +121,36 @@ impl Inbox {
                 woken: false,
                 paused: false,
                 closed: false,
+                entry_buffers: Vec::with_capacity(POOLED_ENTRY_BUFFERS),
             }),
             cond: Condvar::new(),
         }
     }
 
     fn push(&self, command: CpuCommand) {
-        self.push_with(|| Some(command));
+        self.push_with(|_| Some(command));
     }
 
     /// Queues the command `make` returns, if any. `make` runs under the inbox lock, so what it
-    /// does is ordered like the queue; it does not run once the inbox is closed.
-    fn push_with(&self, make: impl FnOnce() -> Option<CpuCommand>) {
+    /// does is ordered like the queue, and may take a buffer from the entry pool; it does not run
+    /// once the inbox is closed.
+    fn push_with(&self, make: impl FnOnce(&mut Vec<Vec<GpEntry>>) -> Option<CpuCommand>) {
         let mut state = self.state.lock();
         if state.closed {
             return;
         }
-        if let Some(command) = make() {
+        if let Some(command) = make(&mut state.entry_buffers) {
             state.commands.push_back(command);
             self.cond.notify_one();
+        }
+    }
+
+    /// Returns a submission's entry buffer to the pool.
+    fn recycle(&self, mut entries: Vec<GpEntry>) {
+        let mut state = self.state.lock();
+        if state.entry_buffers.len() < POOLED_ENTRY_BUFFERS {
+            entries.clear();
+            state.entry_buffers.push(entries);
         }
     }
 
@@ -242,21 +266,28 @@ impl Front {
                 channel.run(&mut self.shared);
             }
             CpuCommand::Submit(id, submission) => {
+                let QueuedSubmission {
+                    entries,
+                    wait,
+                    increment,
+                } = submission;
                 let Some(channel) = self
                     .channels
                     .get_mut(id.0 as usize)
                     .and_then(Option::as_mut)
                 else {
                     tracing::warn!(?id, "submission to a channel that does not exist");
+                    self.shared.inbox.recycle(entries);
                     return;
                 };
-                if let Some(fence) = submission.wait {
+                if let Some(fence) = wait {
                     channel.push(Work::SyncpointWait(fence));
                 }
-                for entry in submission.entries {
+                for &entry in &entries {
                     channel.push(Work::Entry(entry));
                 }
-                if let Some(increment) = submission.increment {
+                self.shared.inbox.recycle(entries);
+                if let Some(increment) = increment {
                     channel.push(Work::Increment(increment));
                 }
                 channel.push(Work::EndOfSubmission);
@@ -299,8 +330,10 @@ pub struct Gpu {
     inbox: Arc<Inbox>,
     next_channel: AtomicU32,
     references: Mutex<HashMap<ChannelId, Arc<AtomicU32>>>,
-    front: Option<JoinHandle<()>>,
-    back: Option<JoinHandle<()>>,
+    /// The front thread, then the back thread when it has one; emptied by `shutdown`.
+    threads: Mutex<Vec<JoinHandle<()>>>,
+    /// Ids of those threads, so `shutdown` recognises a GPU thread without taking `threads`.
+    thread_ids: Vec<ThreadId>,
 }
 
 const _: () = {
@@ -365,8 +398,12 @@ impl Gpu {
             inbox,
             next_channel: AtomicU32::new(0),
             references: Mutex::new(HashMap::new()),
-            front: Some(front),
-            back,
+            thread_ids: [Some(&front), back.as_ref()]
+                .into_iter()
+                .flatten()
+                .map(|thread| thread.thread().id())
+                .collect(),
+            threads: Mutex::new([Some(front), back].into_iter().flatten().collect()),
         }
     }
 
@@ -431,7 +468,7 @@ impl Gpu {
     /// Destroys a channel once the work queued before has run (a suspended channel's remaining
     /// work is dropped).
     pub fn destroy_channel(&self, channel: ChannelId) {
-        self.inbox.push_with(|| {
+        self.inbox.push_with(|_| {
             self.references.lock().remove(&channel);
             Some(CpuCommand::DestroyChannel(channel))
         });
@@ -441,10 +478,11 @@ impl Gpu {
     /// increments in [`Syncpoints::increase_max`](crate::host1x::Syncpoints::increase_max), in
     /// the order submissions are queued, and returns the fence they reach; `None` without
     /// increments or for an invalid syncpoint. A submission to a destroyed channel is dropped
-    /// and reserves nothing.
-    pub fn submit(&self, channel: ChannelId, submission: Submission) -> Option<SyncpointFence> {
+    /// and reserves nothing. The entries are copied into a buffer the GPU reuses, so a submit
+    /// allocates nothing once the pool is warm.
+    pub fn submit(&self, channel: ChannelId, submission: Submission<'_>) -> Option<SyncpointFence> {
         let mut fence = None;
-        self.inbox.push_with(|| {
+        self.inbox.push_with(|pool| {
             if !self.references.lock().contains_key(&channel) {
                 tracing::warn!(?channel, "submission to a channel that does not exist");
                 return None;
@@ -465,7 +503,16 @@ impl Gpu {
                     }
                 }
             });
-            Some(CpuCommand::Submit(channel, submission))
+            let mut entries = pool.pop().unwrap_or_default();
+            entries.extend_from_slice(submission.entries);
+            Some(CpuCommand::Submit(
+                channel,
+                QueuedSubmission {
+                    entries,
+                    wait: submission.wait,
+                    increment: submission.increment,
+                },
+            ))
         });
         fence
     }
@@ -533,6 +580,29 @@ impl Gpu {
         self.inbox.pause(paused);
     }
 
+    /// Stops the GPU: commands still queued are dropped, and the threads finish what they hold
+    /// and are joined before this returns. Calling it again, or from several threads, is safe;
+    /// commands sent afterwards are dropped, and calls that wait for the GPU return at once.
+    /// From a GPU thread (a [`Gpu::run_in_order`] action) it closes the GPU without joining.
+    pub fn shutdown(&self) {
+        self.inbox.close();
+        if self.thread_ids.contains(&std::thread::current().id()) {
+            tracing::error!("GPU shutdown from a GPU thread; not joining it");
+            return;
+        }
+        for thread in self.threads.lock().drain(..) {
+            if thread.join().is_err() {
+                tracing::error!("a GPU thread panicked");
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pooled_entry_buffers(&self) -> Vec<usize> {
+        let state = self.inbox.state.lock();
+        state.entry_buffers.iter().map(Vec::capacity).collect()
+    }
+
     fn side(&self, command: SideCommand) {
         self.inbox.push(CpuCommand::Side(command));
     }
@@ -540,11 +610,6 @@ impl Gpu {
 
 impl Drop for Gpu {
     fn drop(&mut self) {
-        self.inbox.close();
-        for thread in [self.front.take(), self.back.take()].into_iter().flatten() {
-            if thread.join().is_err() {
-                tracing::error!("a GPU thread panicked");
-            }
-        }
+        self.shutdown();
     }
 }

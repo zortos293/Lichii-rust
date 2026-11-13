@@ -251,7 +251,7 @@ impl System {
         if self.state == State::Stopped {
             return;
         }
-        self.gpu.pause(true);
+        self.gpu.shutdown();
         self.kernel.shutdown();
         self.state = State::Stopped;
         tracing::info!("stopped");

@@ -60,7 +60,7 @@ Pass tests run each block both with and without each pass, through the backend, 
 
 ## Guest state and host registers
 
-The JIT works directly on the existing `ThreadContext`, which is `#[repr(C)]`, plus a small `JitState` next to it: the halt flag, the return stack buffer and the scratch spill area. No copy is made on entry or exit.
+The JIT works directly on the existing `ThreadContext`, which is `#[repr(C)]`, plus a small `JitState` next to it: pointers to the interrupt flag and the indirect-branch table, the pending link site and the scratch spill area. No copy is made on entry or exit.
 
 | Host register | Use |
 |---|---|
@@ -90,9 +90,9 @@ Both host OSes use one ABI. The entry trampoline and every helper the JIT calls 
 - **Entry**: `CpuCore::run` calls the entry trampoline with the host code for `ctx.pc`. Translated code returns a `HaltReason` code in `rax`, so leaving for an SVC is just a store to `pc` and a `ret`.
 - **Interrupts**: `InterruptHandle::signal` sets an `AtomicBool` that the JIT state points at. Every block entry does `cmp byte [flag], 0; jne exit`. That is one predicted branch, and it gives the interpreter's block-boundary latency without needing to patch code from another thread.
 - **Direct linking**: `Jump` and `Branch` targets start as jumps to a stub that looks up or translates the target and patches the `jmp rel32` in place. Each block records its incoming links, so invalidating it re-points them at the stub.
-- **Indirect branches**: `BL`/`BLR` push `(guest return pc, host code)` onto a 16-entry return stack buffer in `JitState`. `RET`, which also covers all the folded `RETAA`/`RETAB` (~115k sites in title 1), compares against the top entry and jumps straight there on a hit. Other indirect jumps probe a 64K-entry direct-mapped `guest pc -> host code` table inline, then fall back to the dispatcher.
+- **Indirect branches**: `BR`, `BLR` and `RET` (which also covers all the folded `RETAA`/`RETAB`, ~115k sites in title 1) probe a 64K-entry direct-mapped `guest pc -> host code` table inline, then fall back to the dispatcher. There is no return stack buffer. One was built and measured (branch `cpu/jit-rsb-experiment`): pushing on every call cost about 0.6 ns (10-20% on the call/return bench loop), and avoiding a table miss saved about 1 ns, because the dispatcher round trip is cheap. So it pays off only when more than half of all returns miss the table, which needs hot return addresses colliding in the 64K slots. Revisit it with traces from real titles; the `colliding returns` bench loop is the worst case.
 - **Code cache**: one per `CpuCore`, because `invalidate_code` is per core. One type owns the code memory, the block map and the fault-site table, so a cache shared by all cores of a process (six cores translating the same Switch 2 code) can replace it without touching the translator or the backend, once translation time is measured on real titles. From J3 it is a 64 MiB region mapped twice from one shared-memory object, read-write for the emitter and read-execute for running (`memfd` on Linux, `CreateFileMapping` on Windows), so linking and patching never need `mprotect`. When the region is full the cache is cleared and refilled.
-- **Invalidation**: `invalidate_code`, `clear_code_cache`, `IC IVAU` and `IC IALLU` behave as in the interpreter. Blocks never cross a page, so a range lookup in the block map finds every overlapping block, and each one is unlinked and removed from the fast table and the RSB.
+- **Invalidation**: `invalidate_code`, `clear_code_cache`, `IC IVAU` and `IC IALLU` behave as in the interpreter. Blocks never cross a page, so a range lookup in the block map finds every overlapping block, and each one is unlinked and removed from the fast table and the indirect-branch table.
 
 ## Backend
 
@@ -114,7 +114,7 @@ The plan is **dynasm-rs** (`dynasmrt::VecAssembler` for x64), emitting into a `V
 
 1. **J1**: the IR, the translator for integer, branch and plain load/store `Inst`s, passes 1-4, the x64 backend with linear-scan allocation, the entry trampoline, unlinked dispatch, fastmem loads and stores with the bounds check, the fastmem fault handler and slow paths, and the interpreter fallback for everything else. Until J3 the code cache is one read-write-execute region. It must pass the JIT-vs-interpreter suite, fault paths included.
 2. **J2**: host atomics (`LD<op>`, `SWP`, `CAS`) as single lock-prefixed instructions, `DC ZVA`, and `MRS CNTPCT` through a helper call. `CASP`, inline exclusives and the inline counter follow with the monitor-slot and `host_tsc_scale` contract PRs; until then they run on the interpreter.
-3. **J3**: direct linking, the RSB, the fast indirect table and the dual-mapped code cache with invalidation. This is the main throughput step. Part 1 lands linking, the table, the dual mapping and the interrupt check at block entry; the RSB follows, because the call/return bench already runs at table speed and its gain (no table collisions across ~115k return sites) only shows on real titles.
+3. **J3**: direct linking, the fast indirect table, the interrupt check at block entry and the dual-mapped code cache with invalidation. This is the main throughput step. The planned RSB was measured and left out (see Indirect branches).
 4. **J4**: `CallSimd` mid-block instead of falling back, plus the flags/condition peephole (pass 5).
 5. **J5**: native lowering for the hottest SIMD/FP ops, measured on real titles, in agreement with the SIMD crew, since they own the semantics.
 

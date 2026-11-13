@@ -5,7 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bytemuck.workspace = true
 lichii-common.workspace = true
+lichii-audio.workspace = true
 lichii-crypto.workspace = true
 lichii-memory.workspace = true
 lichii-kernel.workspace = true
@@ -13,8 +15,8 @@ lichii-loader.workspace = true
 lichii-fs.workspace = true
 lichii-gpu.workspace = true
 lichii-input.workspace = true
+opus1.workspace = true
 parking_lot.workspace = true
-bytemuck.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
@@ -22,3 +24,4 @@ tracing.workspace = true
 bytemuck.workspace = true
 lichii-fs.workspace = true
 lichii-kernel = { workspace = true, features = ["testing"] }
+lichii-texture.workspace = true

@@ -7,5 +7,8 @@ license.workspace = true
 [dependencies]
 bytemuck.workspace = true
 lichii-common.workspace = true
+lichii-memory.workspace = true
+cpal.workspace = true
+parking_lot.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

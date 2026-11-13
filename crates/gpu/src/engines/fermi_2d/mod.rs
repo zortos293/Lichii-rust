@@ -629,7 +629,7 @@ mod tests {
 
     #[test]
     fn an_accelerating_renderer_suppresses_the_software_path() {
-        let h = Harness::new();
+        let mut h = Harness::new();
         let mut engine = Fermi2d::new();
         put(&h, 0x1000, &[9; 64]);
         put(&h, 0x2000, &[1; 64]);
@@ -652,6 +652,7 @@ mod tests {
             rasterizer: &mut accelerator,
             syncpoints: &h.syncpoints,
             gob_layout: h.gob_layout,
+            qmd_scheduler: &mut h.qmd_scheduler,
         };
         write(
             &mut engine,
@@ -683,7 +684,7 @@ mod tests {
 
     #[test]
     fn a_declining_renderer_gets_the_blit_then_the_software_path_runs() {
-        let h = Harness::new();
+        let mut h = Harness::new();
         let mut engine = Fermi2d::new();
         put(&h, 0x1000, &[9; 16]);
         let setup = Setup::copy(
@@ -698,6 +699,7 @@ mod tests {
             rasterizer: &mut accelerator,
             syncpoints: &h.syncpoints,
             gob_layout: h.gob_layout,
+            qmd_scheduler: &mut h.qmd_scheduler,
         };
         run(&mut engine, &mut ctx, &setup);
         assert_eq!(accelerator.blits.len(), 1);
@@ -708,7 +710,7 @@ mod tests {
 
     #[test]
     fn corner_origin_moves_the_source_back_by_half_the_step() {
-        let h = Harness::new();
+        let mut h = Harness::new();
         let mut engine = Fermi2d::new();
         let mut setup = Setup::copy(
             block_surface(F::R8Unorm, 0, (8, 8), 0),
@@ -728,6 +730,7 @@ mod tests {
             rasterizer: &mut accelerator,
             syncpoints: &h.syncpoints,
             gob_layout: h.gob_layout,
+            qmd_scheduler: &mut h.qmd_scheduler,
         };
         run(&mut engine, &mut ctx, &setup);
         assert_eq!(accelerator.blits[0].src_x0, 3 << 32);
@@ -735,7 +738,7 @@ mod tests {
 
     #[test]
     fn corner_origin_keeps_the_fractional_half_step() {
-        let h = Harness::new();
+        let mut h = Harness::new();
         let mut engine = Fermi2d::new();
         let mut setup = Setup::copy(
             block_surface(F::R8Unorm, 0, (8, 8), 0),
@@ -757,6 +760,7 @@ mod tests {
             rasterizer: &mut accelerator,
             syncpoints: &h.syncpoints,
             gob_layout: h.gob_layout,
+            qmd_scheduler: &mut h.qmd_scheduler,
         };
         run(&mut engine, &mut ctx, &setup);
         assert_eq!(accelerator.blits[0].src_x0, (3 << 32) | 0x8000_0000);
