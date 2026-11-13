@@ -321,7 +321,10 @@ impl Service for DisplayController {
 
     fn handle(&self, ctx: &mut HleRequestContext) -> Option<ResultCode> {
         Some(match ctx.command() {
+            5 | 7 => push_bool(ctx, true),
+            8 | 23 | 25 | 27 => ResultCode::SUCCESS,
             10 | 12 | 14 | 16..=18 => push_stub_event(ctx, &self.applet.stub_event),
+            20 | 22 | 24 | 26 => crate::vi::PERMISSION_DENIED,
             _ => return None,
         })
     }

@@ -4,6 +4,7 @@ mod choices;
 mod cli;
 mod config;
 mod display;
+mod firmware;
 mod frame_view;
 mod game_list;
 mod hotkeys;
