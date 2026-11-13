@@ -411,11 +411,17 @@ impl KernelInner {
     /// Logs every core's queue and every thread's scheduling state, so a `debug.svc_trace` run of
     /// a title that stalls ends with what each thread was left waiting on.
     fn log_thread_states(&self) {
-        for line in self.scheduler.describe() {
+        let processes = self.processes.lock().clone();
+        let mut running = vec![Vec::new(); self.scheduler.core_count()];
+        for thread in processes.iter().flat_map(|process| process.threads()) {
+            if let ThreadState::Running(core) = thread.sched.lock().state {
+                running[core].push(thread.id());
+            }
+        }
+        for line in self.scheduler.describe(&running) {
             tracing::info!(target: "threads", "{line}");
         }
         let waits: HashMap<ThreadId, String> = self.arbiter.waits().into_iter().collect();
-        let processes = self.processes.lock().clone();
         for process in processes {
             for thread in process.threads() {
                 let waits_on = waits.get(&thread.id()).map(String::as_str);

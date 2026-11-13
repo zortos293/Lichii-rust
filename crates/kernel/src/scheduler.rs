@@ -16,7 +16,7 @@ use std::time::Duration;
 use lichii_cpu::InterruptHandle;
 use parking_lot::{Condvar, Mutex};
 
-use crate::thread::{Resume, Sched, Thread, ThreadState, WakeResult};
+use crate::thread::{Resume, Sched, Thread, ThreadId, ThreadState, WakeResult};
 
 const LEVELS: usize = 64;
 const IDLE_PRIORITY: u32 = LEVELS as u32;
@@ -465,7 +465,7 @@ impl Scheduler {
 
     /// Each core's running priority and queued threads, for the `debug.svc_trace` dump at
     /// shutdown.
-    pub(crate) fn describe(&self) -> Vec<String> {
+    pub(crate) fn describe(&self, running: &[Vec<ThreadId>]) -> Vec<String> {
         self.cores
             .iter()
             .enumerate()
@@ -479,7 +479,8 @@ impl Scheduler {
                     })
                     .collect();
                 format!(
-                    "core={index} running_priority={} resched={} idle={} queued={queued:?}",
+                    "core={index} running={:?} running_priority={} resched={} idle={} queued={queued:?}",
+                    running[index],
                     core.running_priority.load(Ordering::Acquire),
                     core.resched.load(Ordering::Acquire),
                     self.idle.load(Ordering::Acquire) & (1 << index) != 0,
