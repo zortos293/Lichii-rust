@@ -3,7 +3,7 @@ use std::fmt;
 use std::path::Path;
 
 use crate::aes::AesEcb;
-use crate::hex::parse_hex;
+use crate::hex::parse_hex_prefix;
 use crate::{Key128, Key256};
 
 /// Number of key revisions (`master_key_00` .. `master_key_1f`) a key set can hold.
@@ -178,6 +178,9 @@ impl KeySet {
             if !report.malformed.is_empty() {
                 tracing::warn!(file, malformed = ?report.malformed, "unusable key lines");
             }
+            if !report.ignored.is_empty() {
+                tracing::debug!(file, ignored = ?report.ignored, "key names lichii does not use");
+            }
             reports.push((file.to_owned(), report));
         }
         keys.derive();
@@ -195,9 +198,9 @@ impl KeySet {
                 continue;
             };
             let stored = match slot {
-                Slot::Key128(key) => parse_hex(value).map(|v| *key = Some(v)),
-                Slot::Key256(key) => parse_hex(value).map(|v| *key = Some(v)),
-                Slot::Split(halves) => parse_hex::<32>(value).map(|v| {
+                Slot::Key128(key) => parse_hex_prefix(value).map(|v| *key = Some(v)),
+                Slot::Key256(key) => parse_hex_prefix(value).map(|v| *key = Some(v)),
+                Slot::Split(halves) => parse_hex_prefix::<32>(value).map(|v| {
                     halves[0] = Some(v[..16].try_into().unwrap());
                     halves[1] = Some(v[16..].try_into().unwrap());
                 }),
@@ -207,7 +210,7 @@ impl KeySet {
                 None => report.malformed.push(MalformedLine {
                     line: index + 1,
                     name,
-                    reason: "value is not hex of the key's length",
+                    reason: "value is shorter than the key or not hex",
                 }),
             }
         }
@@ -218,7 +221,7 @@ impl KeySet {
     pub fn load_title_keys(&mut self, text: &str) -> LoadReport {
         let mut report = LoadReport::default();
         for (index, name, value) in key_lines(text) {
-            match (parse_hex::<16>(name), parse_hex::<16>(value)) {
+            match (parse_hex_prefix::<16>(name), parse_hex_prefix::<16>(value)) {
                 (Some(rights_id), Some(key)) => {
                     self.title_keys.insert(RightsId(rights_id), key);
                     report.loaded += 1;
@@ -646,6 +649,71 @@ mod tests {
         header[16..].fill(0xa2);
         AesEcb::new(&header_kek).decrypt(&mut header);
         assert_eq!(keys.header_key().unwrap(), &header);
+    }
+
+    #[test]
+    fn accepts_the_line_shapes_of_real_dumps() {
+        let text = format!(
+            "master_key_source = {}\nmariko_kek = {}\ntsec_root_key_00 = {}\n\
+             bis_kek_source = {}\neticket_rsa_kek_source = {}\nssl_rsa_kekek_source = {}\n\
+             master_kek_source_06 = {}00\nMASTER_KEK_SOURCE_0F = {}ff\n\
+             mariko_master_kek_source_05 = {}00\nmariko_master_kek_source_15 = {}01\n\
+             titlekek_source = {}\nmaster_kek_source_07 = 1234\n",
+            h(0x30),
+            h(0x20),
+            h(0x21),
+            h(1),
+            h(2),
+            h(3),
+            h(0x66),
+            h(0x6f),
+            h(0x55),
+            h(0x75),
+            h(0x80),
+        );
+        let mut keys = KeySet::new();
+        let report = keys.load_prod_keys(&text);
+        assert_eq!(report.loaded, 8);
+        assert_eq!(
+            report.ignored,
+            [
+                "bis_kek_source",
+                "eticket_rsa_kek_source",
+                "ssl_rsa_kekek_source"
+            ]
+        );
+        assert_eq!(
+            report.malformed,
+            [MalformedLine {
+                line: 12,
+                name: "master_kek_source_07".into(),
+                reason: "value is shorter than the key or not hex",
+            }]
+        );
+        assert_eq!(keys.master_kek_sources[0x0f], Some([0x6f; 16]));
+        assert_eq!(keys.mariko_master_kek_sources[0x05], Some([0x55; 16]));
+
+        keys.derive();
+        let dec = |key: &Key128, value: &Key128| AesEcb::new(key).decrypt_key(value);
+        assert_eq!(
+            keys.master_key(6).unwrap(),
+            dec(&dec(&[0x21; 16], &[0x66; 16]), &[0x30; 16])
+        );
+        assert_eq!(
+            keys.master_key(0x15).unwrap(),
+            dec(&dec(&[0x20; 16], &[0x75; 16]), &[0x30; 16])
+        );
+    }
+
+    #[test]
+    fn title_keys_ignore_what_follows_the_key() {
+        let mut keys = KeySet::new();
+        let report = keys.load_title_keys(&format!("{}00 = {}0000\n", h(0x01), h(0x02)));
+        assert_eq!((report.loaded, report.malformed.len()), (1, 0));
+        assert_eq!(
+            keys.encrypted_title_key(&RightsId([0x01; 16])).unwrap(),
+            [0x02; 16]
+        );
     }
 
     #[test]
