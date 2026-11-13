@@ -251,6 +251,22 @@ const WORKLOADS: &[Workload] = &[
         per_iteration: 9,
     },
     Workload {
+        name: "vector struct loop",
+        code: &[
+            0x4c408820, // 1: ld2 {v0.4s, v1.4s}, [x1]
+            0x4ea18402, // add v2.4s, v0.4s, v1.4s
+            0x4c008821, // st2 {v1.4s, v2.4s}, [x1]
+            0x4c400424, // ld4 {v4.8h, v5.8h, v6.8h, v7.8h}, [x1]
+            0x6e271c84, // eor v4.16b, v4.16b, v7.16b
+            0x0c004024, // st3 {v4.8b, v5.8b, v6.8b}, [x1]
+            0xf10004a5, // subs x5, x5, #1
+            0x54ffff21, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 8,
+    },
+    Workload {
         name: "popcount loop",
         code: &[
             0x4c407020, // 1: ld1 {v0.16b}, [x1]
