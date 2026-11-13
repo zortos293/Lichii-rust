@@ -28,13 +28,13 @@ pub enum LaneOp {
     Mls,
 }
 
-/// A lane-wise op on `n` and `m`, or on `n` and lane `index` of `m` for the by-element forms. Only
-/// the low 64 bits are written when `q` is clear.
+/// A lane-wise op on `n` and `m`, or on `n` and lane `index` of `m` for the by-element forms. It
+/// writes the low `lanes` lanes and zeroes the rest; one lane is the scalar by-element form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lanes {
     pub op: LaneOp,
     pub fp: Fp,
-    pub q: bool,
+    pub lanes: u8,
     pub n: Value,
     pub m: Value,
     pub index: Option<u8>,
@@ -91,32 +91,47 @@ const fn field(word: u32, low: u32, bits: u32) -> u8 {
 /// Emits the vector FP instruction `word` as a checked op and returns true, or emits nothing and
 /// returns false.
 pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
-    let q = word >> 30 & 1 != 0;
     let fp = if word >> 22 & 1 != 0 { Fp::D } else { Fp::S };
-    if fp == Fp::D && !q {
+    let vector_lanes = match (fp, word >> 30 & 1 != 0) {
+        (Fp::S, true) => 4,
+        (Fp::S, false) | (Fp::D, true) => 2,
+        (Fp::D, false) => 0,
+    };
+    let three_same = match word & 0xbfa0_fc00 {
+        0x0e20_d400 => Some(LaneOp::Add),
+        0x0ea0_d400 => Some(LaneOp::Sub),
+        0x2e20_dc00 => Some(LaneOp::Mul),
+        0x0e20_cc00 => Some(LaneOp::Mla),
+        0x0ea0_cc00 => Some(LaneOp::Mls),
+        _ => None,
+    };
+    let by_element = |masked: u32| match masked {
+        0x0f80_1000 => Some(LaneOp::Mla),
+        0x0f80_5000 => Some(LaneOp::Mls),
+        0x0f80_9000 => Some(LaneOp::Mul),
+        _ => None,
+    };
+    let (op, element, lanes) = if let Some(op) = three_same {
+        (op, false, vector_lanes)
+    } else if let Some(op) = by_element(word & 0xbf80_f400) {
+        (op, true, vector_lanes)
+    } else if let Some(op) = by_element(word & 0xff80_f400 ^ 0x5000_0000) {
+        (op, true, 1)
+    } else {
+        return false;
+    };
+    if lanes == 0 {
         return false;
     }
-    let (op, index) = match word & 0xbfa0_fc00 {
-        0x0e20_d400 => (LaneOp::Add, None),
-        0x0ea0_d400 => (LaneOp::Sub, None),
-        0x2e20_dc00 => (LaneOp::Mul, None),
-        0x0e20_cc00 => (LaneOp::Mla, None),
-        0x0ea0_cc00 => (LaneOp::Mls, None),
-        _ => {
-            let op = match word & 0xbf80_f400 {
-                0x0f80_1000 => LaneOp::Mla,
-                0x0f80_5000 => LaneOp::Mls,
-                0x0f80_9000 => LaneOp::Mul,
-                _ => return false,
-            };
-            let (h, l) = (field(word, 11, 1), field(word, 21, 1));
-            let index = match fp {
-                Fp::S => h << 1 | l,
-                Fp::D if l == 0 => h,
-                Fp::D => return false,
-            };
-            (op, Some(index))
+    let index = if element {
+        let (h, l) = (field(word, 11, 1), field(word, 21, 1));
+        match fp {
+            Fp::S => Some(h << 1 | l),
+            Fp::D if l == 0 => Some(h),
+            Fp::D => return false,
         }
+    } else {
+        None
     };
     let (rd, rn, rm) = (field(word, 0, 5), field(word, 5, 5), field(word, 16, 5));
     let vec = |t: &mut Translator, r: u8| t.op(Op::Get(Loc::V(r)));
@@ -126,7 +141,7 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
     let r = t.op(Op::Simd(SimdOp::Lanes(Lanes {
         op,
         fp,
-        q,
+        lanes,
         n,
         m,
         index,
@@ -142,7 +157,7 @@ impl Emitter<'_> {
         let Lanes {
             op,
             fp,
-            q,
+            lanes,
             n,
             m,
             index,
@@ -187,9 +202,11 @@ impl Emitter<'_> {
             }
             (LaneOp::Mls, Fp::D) => self.fma231pd(0xbc, d, n, b),
         }
-        self.check_lanes(op, fp, q, d, n, m, index, slow);
-        if !q {
-            dynasm!(self.asm ; .arch x64 ; movq Rx(d), Rx(d));
+        self.check_lanes(op, fp, lanes, d, n, m, index, slow);
+        match (fp, lanes) {
+            (Fp::S, 4) | (Fp::D, 2) => {}
+            (Fp::S, 1) => dynasm!(self.asm ; .arch x64 ; movd eax, Rx(d) ; movd Rx(d), eax),
+            _ => dynasm!(self.asm ; .arch x64 ; movq Rx(d), Rx(d)),
         }
         self.finish_checked(i, slow, word, d, Ty::U128);
     }
@@ -202,7 +219,7 @@ impl Emitter<'_> {
         &mut self,
         op: LaneOp,
         fp: Fp,
-        q: bool,
+        lanes: u8,
         d: u8,
         n: u8,
         m: u8,
@@ -210,10 +227,7 @@ impl Emitter<'_> {
         slow: dynasmrt::DynamicLabel,
     ) {
         let bounds = BOUNDS.0.as_ptr() as i64 + if fp == Fp::D { 48 } else { 0 };
-        let written: i32 = match (fp, q) {
-            (Fp::S, true) => 0xf,
-            _ => 0x3,
-        };
+        let written = (1i32 << lanes) - 1;
         const LT: i8 = 1;
         const NLE: i8 = 6;
         const RAX: u8 = 0;

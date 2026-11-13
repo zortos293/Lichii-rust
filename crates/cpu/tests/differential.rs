@@ -487,6 +487,15 @@ alu_class!(vector_fp_arith, "0xx01110xx1xxxxx110xx1xxxxxxxxxx", |w| {
     ) && w & 0x4040_0000 != 0x0040_0000
 });
 alu_class!(
+    scalar_fp_by_element,
+    "01x111111xxxxxxxxx01x0xxxxxxxxxx",
+    |w| {
+        matches!(w & 0xff80_f400, 0x5f80_1000 | 0x5f80_5000 | 0x5f80_9000)
+            && w & 0x0060_0000 != 0x0060_0000
+    }
+);
+alu_class!(int_to_fp_in_simd, "01x111100x100001110110xxxxxxxxxx");
+alu_class!(
     vector_fp_by_element,
     "0xx011111xxxxxxxxx01x0xxxxxxxxxx",
     |w| {
