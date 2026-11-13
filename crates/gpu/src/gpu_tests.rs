@@ -226,6 +226,9 @@ impl Rasterizer for Recorder {
     fn release_fences(&mut self, wait: bool) {
         self.work.run_finished(wait);
     }
+    fn has_pending_fences(&self) -> bool {
+        !self.work.pending.lock().0.is_empty()
+    }
     fn invalidate_region(&mut self, _addr: u64, _size: u64) {}
     fn flush_region(&mut self, addr: u64, size: u64) {
         self.log.lock().push(Event::FlushRegion(addr, size));
@@ -1851,5 +1854,30 @@ fn a_sync_entry_suspends_only_its_channel() {
             ],
             "{threading:?}"
         );
+    });
+}
+
+#[test]
+fn a_syncpoint_increment_lands_once_the_host_gpu_finishes_without_more_work() {
+    each_mode(|threading| {
+        let mut rig = Rig::deferred(threading);
+        let channel = rig.channel(HostClass::Maxwell);
+        let id = 9;
+        let words = Pushbuffer::default()
+            .host(host::SYNCPOINT_A, 0)
+            .host(host::SYNCPOINT_B, id << 8 | 1);
+        let entry = rig.entry(&words.0);
+        rig.gpu.submit(channel, Submission::new(&[entry]));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let landed = loop {
+            rig.work.finish_all();
+            let poll = Some(std::time::Duration::from_millis(1));
+            match rig.syncpoints.guest().wait(id, 1, poll) {
+                Ok(value) => break Ok(value),
+                Err(error) if std::time::Instant::now() >= deadline => break Err(error),
+                Err(_) => {}
+            }
+        };
+        assert_eq!(landed, Ok(1), "{threading:?}");
     });
 }
