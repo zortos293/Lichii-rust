@@ -47,7 +47,12 @@ fn fixture(gob: GobLayout, recompression: AstcRecompression) -> Option<Fixture> 
     Some(Fixture {
         scheduler: Scheduler::new(&device).unwrap(),
         staging: StagingRing::new(&device, 32 << 20).unwrap(),
-        cache: TextureCache::new(&device, gob, recompression),
+        cache: TextureCache::new(
+            &device,
+            Arc::new(GpuWrittenPages::new(36)),
+            gob,
+            recompression,
+        ),
         device,
         memory,
         gmmu,
