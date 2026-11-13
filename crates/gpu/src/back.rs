@@ -248,7 +248,9 @@ impl Back {
                 3
             }
             tag::SYNCHRONIZE_FETCH => {
-                self.synchronize_read(consumer.slot(1), consumer.slot(2));
+                if method != 0 {
+                    self.synchronize_read(consumer.slot(1), consumer.slot(2));
+                }
                 self.fetch_syncs.complete();
                 3
             }

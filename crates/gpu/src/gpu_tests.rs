@@ -1769,39 +1769,60 @@ fn list_written_by_a_release(rig: &mut Rig) -> (GpEntry, GpEntry) {
     (writer, list)
 }
 
+/// A rig whose channels fetch the entries of [`list_written_by_a_release`] after the work before
+/// them completed on the host GPU: Switch 2, with the list's words on a page GPU work wrote.
+fn rig_with_written_list(threading: Threading) -> (Rig, GpEntry, GpEntry) {
+    let mut rig = Rig::build_for(
+        Console::Switch2,
+        threading,
+        crate::gpu::DEFAULT_RING_SLOTS,
+        Completion::Deferred,
+        Engines::Recording,
+    );
+    let (writer, list) = list_written_by_a_release(&mut rig);
+    rig.gpu
+        .handles()
+        .written_pages
+        .mark(DEVICE_BASE + list.address() + 4, 4);
+    (rig, writer, list)
+}
+
 #[test]
-fn a_sync_entry_is_fetched_after_the_deferred_work_before_it() {
+fn a_sync_entry_is_fetched_after_the_back_ran_the_work_before_it_but_not_the_host_gpu() {
     each_mode(|threading| {
         let mut rig = Rig::deferred(threading);
-        let channel = rig.channel(HostClass::Ampere);
-        let (writer, list) = list_written_by_a_release(&mut rig);
+        let channel = rig.channel(HostClass::Maxwell);
+        let list = rig.entry(&Pushbuffer::default().inc(0, 0x701, &[0xdead]).0);
+        let writer = rig.entry(
+            &Pushbuffer::default()
+                .bind(0, MAXWELL_3D)
+                .host(host::SEMAPHORE_A, (SEMAPHORE >> 32) as u32)
+                .host(host::SEMAPHORE_B, SEMAPHORE as u32)
+                .host(host::SEMAPHORE_C, 7)
+                .host(host::SEMAPHORE_D, 2 | 1 << 24)
+                .upload(list.address() + 4, &[0x1234])
+                .0,
+        );
         rig.gpu
             .submit(channel, Submission::new(&[writer, sync(list)]));
-        let events = rig.events();
-        let read = events
-            .iter()
-            .position(|e| {
-                *e == Event::Method {
-                    channel: channel.0,
-                    engine: EngineKind::Maxwell3d,
-                    method: 0x701,
-                    argument: 0x1234,
-                }
-            })
-            .unwrap_or_else(|| panic!("{threading:?}: the list is read with the released word"));
-        let release = events
-            .iter()
-            .position(|e| {
-                matches!(e, Event::Fence(FenceAction::WriteSemaphore { address, value: 0x1234, .. })
-                    if *address == DEVICE_BASE + list.address() + 4)
-            })
-            .unwrap();
-        let flush = events
-            .iter()
-            .position(|e| *e == Event::FlushRegion(DEVICE_BASE + list.address(), 8))
-            .unwrap_or_else(|| panic!("{threading:?}: the list's words are flushed"));
-        assert!(release < flush && flush < read, "{threading:?}");
-        assert_eq!(rig.read(list.address() + 4), 0x1234);
+        assert_eq!(
+            rig.methods(),
+            [(channel.0, EngineKind::Maxwell3d, 0x701, 0x1234)],
+            "{threading:?}: the list is read after the back wrote it"
+        );
+        assert!(
+            !rig.events()
+                .iter()
+                .any(|e| matches!(e, Event::FlushRegion(..))),
+            "{threading:?}"
+        );
+        assert_eq!(
+            rig.read(SEMAPHORE),
+            0,
+            "{threading:?}: the fetch did not wait for the host GPU"
+        );
+        rig.complete();
+        assert_eq!(rig.read(SEMAPHORE), 7);
     });
 }
 
@@ -1886,9 +1907,8 @@ fn switch_1_ignores_gpu_written_pages() {
 #[test]
 fn side_commands_wait_behind_a_sync_entry_queued_before_them() {
     each_mode(|threading| {
-        let mut rig = Rig::deferred(threading);
+        let (rig, writer, list) = rig_with_written_list(threading);
         let waiter = rig.channel(HostClass::Ampere);
-        let (writer, list) = list_written_by_a_release(&mut rig);
         rig.gpu.pause(true);
         rig.gpu
             .submit(waiter, Submission::new(&[writer, sync(list)]));
@@ -1911,10 +1931,9 @@ fn side_commands_wait_behind_a_sync_entry_queued_before_them() {
 #[test]
 fn submissions_after_a_held_side_command_keep_their_place() {
     each_mode(|threading| {
-        let mut rig = Rig::deferred(threading);
+        let (mut rig, writer, list) = rig_with_written_list(threading);
         let waiter = rig.channel(HostClass::Ampere);
         let other = rig.channel(HostClass::Ampere);
-        let (writer, list) = list_written_by_a_release(&mut rig);
         let words = Pushbuffer::default().bind(0, AMPERE_3D).inc(0, 0x702, &[2]);
         rig.gpu.pause(true);
         rig.gpu
@@ -1940,10 +1959,9 @@ fn submissions_after_a_held_side_command_keep_their_place() {
 #[test]
 fn a_sync_entry_suspends_only_its_channel() {
     each_mode(|threading| {
-        let mut rig = Rig::deferred(threading);
+        let (mut rig, writer, list) = rig_with_written_list(threading);
         let waiter = rig.channel(HostClass::Ampere);
         let other = rig.channel(HostClass::Ampere);
-        let (writer, list) = list_written_by_a_release(&mut rig);
         let words = Pushbuffer::default().bind(0, AMPERE_3D).inc(0, 0x702, &[2]);
         rig.gpu.pause(true);
         rig.gpu

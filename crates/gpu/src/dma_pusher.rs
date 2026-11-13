@@ -10,11 +10,14 @@
 //! finished their work, and only for increments a submission reserved: the reference GPU does not
 //! wait on syncpoints at all. A channel suspended for [`LONG_WAIT`] is reported once.
 //!
-//! A GPFIFO entry with its SYNC bit is fetched after the work before it completed, so a command
-//! list that compute or copy work wrote is read with those writes: the channel suspends until
-//! the back synchronized the entry's words, without the front waiting for it. On Switch 2 an entry
-//! on a page GPU work may have written is fetched the same way: titles fetch command lists their
-//! own compute writes each frame.
+//! A GPFIFO entry with its SYNC bit is fetched once the back executed the work before it, as the
+//! host waits for the methods before such an entry to be processed: the channel suspends until
+//! the back reached it, without the front waiting. It does not wait for that work to finish on
+//! the host GPU; the reference ignores the bit on Switch 1 and only orders it behind the back on
+//! Switch 2, and a wait for the host GPU there kept every frame's commands behind the previous
+//! frame's rendering. On Switch 2 an entry on a page GPU work may have written is fetched after
+//! that work completed and its words reached guest memory: titles fetch command lists their own
+//! compute writes each frame.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -389,16 +392,18 @@ impl FrontChannel {
             self.offset = 0;
             return;
         }
-        if start == 0
-            && !self.fetch_synced
-            && (entry.sync() || self.on_written_pages(entry, shared))
-        {
-            let ticket = shared
-                .stream
-                .synchronize_fetch(entry.address(), u64::from(length) * 4);
-            self.fetch_synced = true;
-            self.wait = Some(Wait::Fetch(ticket));
-            return;
+        if start == 0 && !self.fetch_synced {
+            let written = self.on_written_pages(entry, shared);
+            if written || entry.sync() {
+                let ticket = shared.stream.synchronize_fetch(
+                    entry.address(),
+                    u64::from(length) * 4,
+                    written,
+                );
+                self.fetch_synced = true;
+                self.wait = Some(Wait::Fetch(ticket));
+                return;
+            }
         }
         self.fetch_synced = false;
         let mut words = std::mem::take(&mut shared.words);
