@@ -1,8 +1,8 @@
 //! `System`: owns every subsystem for one emulation session and boots a title.
 //!
 //! Boot order: settings, then the loader's [`ProgramImage`], then the kernel (DRAM sized by
-//! [`MemoryLayout`], 4 or 6 cores), then the title's process, then the HLE services, then the
-//! GPU, then the main thread.
+//! [`MemoryLayout`], 4 or 6 cores), then the title's process, then the GPU and the audio sink,
+//! then the HLE services, then the main thread.
 //!
 //! [`MemoryLayout`]: lichii_common::settings::MemoryLayout
 
@@ -12,7 +12,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use lichii_common::settings::Settings;
+use lichii_audio::sink::Sink;
+use lichii_common::settings::{AudioSettings, Settings};
 use lichii_common::{ConsoleGeneration, ResultCode, VAddr};
 use lichii_gpu::backend::{GpuHandles, NullRasterizer, Rasterizer};
 use lichii_gpu::host1x::Host1x;
@@ -79,6 +80,7 @@ pub struct System {
     gpu: Arc<Gpu>,
     npad: Arc<NpadHub>,
     perf: Arc<PerfStats>,
+    audio: Arc<Sink>,
     exit: Arc<ExitSignal>,
     state: State,
 }
@@ -146,6 +148,7 @@ impl System {
         let gpu = Self::start_gpu(&kernel, &program, &timing, renderer);
         let npad = Arc::new(NpadHub::default());
         let perf = Arc::new(PerfStats::default());
+        let audio = Arc::new(Sink::new(&settings.audio));
         let services = ServiceContext::new(ServiceParts {
             kernel: kernel.clone(),
             settings: settings.clone(),
@@ -154,6 +157,7 @@ impl System {
             gpu: gpu.clone(),
             npad: npad.clone(),
             perf: perf.clone(),
+            audio: audio.clone(),
         });
         if let Err(code) = lichii_services::register_all(&services) {
             kernel.shutdown();
@@ -171,6 +175,7 @@ impl System {
             gpu,
             npad,
             perf,
+            audio,
             exit,
             state: State::Booted,
         })
@@ -222,13 +227,14 @@ impl System {
         Ok(())
     }
 
-    /// Stops guest code and guest time until [`System::resume`].
+    /// Stops guest code, guest time and audio output until [`System::resume`].
     pub fn pause(&mut self) {
         if self.state != State::Running {
             return;
         }
         self.kernel.pause();
         self.gpu.pause(true);
+        self.audio.set_paused(true);
         self.timing.pause();
         self.state = State::Paused;
         tracing::info!("paused");
@@ -240,6 +246,7 @@ impl System {
             return;
         }
         self.timing.resume();
+        self.audio.set_paused(false);
         self.gpu.pause(false);
         self.kernel.resume();
         self.state = State::Running;
@@ -252,6 +259,7 @@ impl System {
             return;
         }
         self.gpu.shutdown();
+        self.audio.set_paused(true);
         self.kernel.shutdown();
         self.state = State::Stopped;
         tracing::info!("stopped");
@@ -313,6 +321,17 @@ impl System {
     }
 
     /// The input state the frontend publishes and hid reads.
+    /// The host audio sink the audio services play on.
+    pub fn audio(&self) -> &Arc<Sink> {
+        &self.audio
+    }
+
+    /// Applies the volume and mute of `audio` to every stream at once. The output device is
+    /// chosen at boot, so changing it takes a new session.
+    pub fn set_audio_volume(&self, audio: &AudioSettings) {
+        self.audio.set_host_volume(audio.volume, audio.muted);
+    }
+
     pub fn npad(&self) -> &Arc<NpadHub> {
         &self.npad
     }
