@@ -96,6 +96,11 @@ impl ConfigWindow {
         &mut self.draft.graphics
     }
 
+    /// The draft's folders, for the same reason as [`Self::draft_graphics`].
+    pub fn draft_paths(&mut self) -> &mut PathSettings {
+        &mut self.draft.paths
+    }
+
     pub fn new(settings: &Settings, paths: &UserPaths) -> Self {
         Self {
             draft: settings.clone(),

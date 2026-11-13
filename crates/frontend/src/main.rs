@@ -8,6 +8,7 @@ mod game_list;
 mod hotkeys;
 mod input_worker;
 mod session;
+mod setup;
 mod ui;
 
 use std::path::Path;
