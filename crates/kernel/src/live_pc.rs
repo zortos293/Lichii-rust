@@ -23,6 +23,7 @@ pub(crate) struct LivePc {
     pub pc: VAddr,
     pub lr: VAddr,
     pub sp: VAddr,
+    pub ctx: ThreadContext,
 }
 
 pub(crate) struct LivePcs {
@@ -52,6 +53,7 @@ impl LivePcs {
             pc: ctx.pc,
             lr: ctx.x[30],
             sp: ctx.sp,
+            ctx: ctx.clone(),
         });
         self.recorded.notify_all();
     }
