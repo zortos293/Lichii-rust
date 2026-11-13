@@ -106,6 +106,7 @@ pub(super) fn emit_inst(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<(
         Opcode::GetAttributeU32 => context_get_set::get_attribute_u32(ctx, inst)?,
         Opcode::SetAttribute => return context_get_set::set_attribute(ctx, inst),
         Opcode::GetAttributeIndexed => context_get_set::get_attribute_indexed(ctx, inst)?,
+        Opcode::InterpolateAtOffset => context_get_set::interpolate_at_offset(ctx, inst)?,
         Opcode::SetAttributeIndexed => return context_get_set::set_attribute_indexed(ctx, inst),
         Opcode::GetPatch => context_get_set::get_patch(ctx, inst)?,
         Opcode::SetPatch => return context_get_set::set_patch(ctx, inst),

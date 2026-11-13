@@ -485,7 +485,7 @@ fn visit_usages(info: &mut ShaderInfo, prog: &Program, id: InstId) {
 
     match op {
         DemoteToHelperInvocation => info.uses_demote_to_helper_invocation = true,
-        GetAttribute | GetAttributeU32 => {
+        GetAttribute | GetAttributeU32 | InterpolateAtOffset => {
             if let Value::Attribute(attribute) = inst.arg(0) {
                 info.loads.set(attribute, true);
             }
