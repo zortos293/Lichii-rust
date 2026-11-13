@@ -17,6 +17,7 @@ use dynasmrt::x64::X64Relocation;
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, VecAssembler, dynasm};
 
 use super::JitState;
+use super::cache::{ReturnStack, Slot};
 use super::ir::{Block, Loc, Op, Terminal, Ty, Value, W};
 use crate::ThreadContext;
 use crate::decoder::AtomicOp;
@@ -51,6 +52,8 @@ pub(super) struct Target {
 pub(super) struct Compiled {
     pub code: Vec<u8>,
     pub sites: Vec<(u32, u32)>,
+    /// Offsets of the code immediates pushed with each return address.
+    pub returns: Vec<(u32, u64)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -104,6 +107,13 @@ const ST_TABLE: i32 = ctx(offset_of!(JitState, table));
 const ST_INTERRUPT: i32 = ctx(offset_of!(JitState, interrupt));
 /// Entries in the direct-mapped `guest pc -> host code` table indirect branches probe.
 pub(super) const TABLE_BITS: u32 = 16;
+const ST_RSB: i32 = ctx(offset_of!(JitState, rsb));
+/// Entries in the return stack buffer.
+pub(super) const RSB_SIZE: usize = 16;
+const RSB_TOP: i32 = offset_of!(ReturnStack, top) as i32;
+const RSB_SLOTS: i32 = offset_of!(ReturnStack, slots) as i32;
+const SLOT_CODE: i32 = offset_of!(Slot, code) as i32;
+const _: () = assert!(size_of::<Slot>() == 16 && RSB_SIZE.is_power_of_two());
 
 fn loc_offset(loc: Loc) -> i32 {
     match loc {
@@ -196,6 +206,7 @@ struct Emitter<'a> {
     last_use: Vec<u32>,
     stubs: Vec<Stub>,
     fault_exit: DynamicLabel,
+    returns: Vec<(u32, u64)>,
 }
 
 impl Emitter<'_> {
@@ -1083,28 +1094,23 @@ impl Emitter<'_> {
     fn terminal(&mut self) {
         match self.block.terminal {
             Terminal::Jump(target) => self.link(target),
-            Terminal::JumpIndirect(t) => {
-                match self.src(t, W::W64) {
-                    Src::Imm(i) => dynasm!(self.asm ; .arch x64 ; mov rax, i),
-                    Src::Reg(r) => dynasm!(self.asm ; .arch x64 ; mov rax, Rq(r)),
-                }
-                let miss = self.asm.new_dynamic_label();
-                let mask = (1i32 << TABLE_BITS) - 1;
-                dynasm!(self.asm
-                    ; .arch x64
-                    ; mov QWORD [r15 + CTX_PC], rax
-                    ; mov ecx, eax
-                    ; shr ecx, 2
-                    ; and ecx, mask
-                    ; shl ecx, 4
-                    ; mov rdx, QWORD [r13 + ST_TABLE]
-                    ; cmp QWORD [rdx + rcx], rax
-                    ; jne =>miss
-                    ; jmp QWORD [rdx + rcx + 8]
-                    ; =>miss
-                    ; xor eax, eax
-                    ; ret
-                );
+            Terminal::Call { target, ret } => {
+                self.push_return(ret);
+                self.link(target);
+            }
+            Terminal::JumpIndirect(target) => {
+                self.load_target(target);
+                self.probe_table();
+            }
+            Terminal::CallIndirect { target, ret } => {
+                self.load_target(target);
+                self.push_return(ret);
+                self.probe_table();
+            }
+            Terminal::Return(target) => {
+                self.load_target(target);
+                self.pop_return();
+                self.probe_table();
             }
             Terminal::Branch {
                 cond,
@@ -1119,6 +1125,80 @@ impl Emitter<'_> {
                 self.link(not_taken);
             }
         }
+    }
+
+    /// Puts the indirect target in `rax` and `ctx.pc`.
+    fn load_target(&mut self, target: Value) {
+        match self.src(target, W::W64) {
+            Src::Imm(i) => dynasm!(self.asm ; .arch x64 ; mov rax, i),
+            Src::Reg(r) => dynasm!(self.asm ; .arch x64 ; mov rax, Rq(r)),
+        }
+        dynasm!(self.asm ; .arch x64 ; mov QWORD [r15 + CTX_PC], rax);
+    }
+
+    /// Jumps to the block at `rax` through the indirect-branch table, or leaves to the
+    /// dispatcher when it is not there.
+    fn probe_table(&mut self) {
+        let miss = self.asm.new_dynamic_label();
+        let mask = (1i32 << TABLE_BITS) - 1;
+        dynasm!(self.asm
+            ; .arch x64
+            ; mov ecx, eax
+            ; shr ecx, 2
+            ; and ecx, mask
+            ; shl ecx, 4
+            ; mov rdx, QWORD [r13 + ST_TABLE]
+            ; cmp QWORD [rdx + rcx], rax
+            ; jne =>miss
+            ; jmp QWORD [rdx + rcx + SLOT_CODE]
+            ; =>miss
+            ; xor eax, eax
+            ; ret
+        );
+    }
+
+    /// Pushes `ret` and the code of its block onto the return stack buffer, keeping `rax`.
+    /// The code is a patched immediate, recorded in `returns`.
+    fn push_return(&mut self, ret: u64) {
+        let mask = RSB_SIZE as i32 - 1;
+        dynasm!(self.asm
+            ; .arch x64
+            ; mov rdx, QWORD [r13 + ST_RSB]
+            ; mov rcx, QWORD [rdx + RSB_TOP]
+            ; add ecx, 1
+            ; and ecx, mask
+            ; mov QWORD [rdx + RSB_TOP], rcx
+            ; shl ecx, 4
+            ; add rdx, rcx
+        );
+        mov_imm64(&mut self.asm, 1, ret);
+        dynasm!(self.asm
+            ; .arch x64
+            ; mov QWORD [rdx + RSB_SLOTS], rcx
+            ; mov rcx, QWORD 0
+        );
+        self.returns.push((self.asm.offset().0 as u32 - 8, ret));
+        dynasm!(self.asm ; .arch x64 ; mov QWORD [rdx + RSB_SLOTS + SLOT_CODE], rcx);
+    }
+
+    /// Jumps to the top of the return stack buffer and pops it when its address is `rax`;
+    /// falls through otherwise.
+    fn pop_return(&mut self) {
+        let miss = self.asm.new_dynamic_label();
+        let mask = RSB_SIZE as i32 - 1;
+        dynasm!(self.asm
+            ; .arch x64
+            ; mov rdx, QWORD [r13 + ST_RSB]
+            ; mov rcx, QWORD [rdx + RSB_TOP]
+            ; shl ecx, 4
+            ; cmp QWORD [rdx + rcx + RSB_SLOTS], rax
+            ; jne =>miss
+            ; mov rcx, QWORD [rdx + rcx + RSB_SLOTS + SLOT_CODE]
+            ; sub QWORD [rdx + RSB_TOP], 1
+            ; and QWORD [rdx + RSB_TOP], mask
+            ; jmp rcx
+            ; =>miss
+        );
     }
 
     /// A linkable exit to `target`: a `jmp rel32` that starts out jumping to the code right after
@@ -1223,6 +1303,7 @@ pub(super) fn compile(block: &Block, start: u64, target: &Target) -> Compiled {
         last_use,
         stubs: Vec::new(),
         fault_exit,
+        returns: Vec::new(),
     };
     let interrupted = e.asm.new_dynamic_label();
     dynasm!(e.asm
@@ -1250,7 +1331,11 @@ pub(super) fn compile(block: &Block, start: u64, target: &Target) -> Compiled {
     );
     e.exit_to(start, EXIT_CONTINUE);
     let code = e.asm.finalize().expect("every label is defined");
-    Compiled { code, sites }
+    Compiled {
+        code,
+        sites,
+        returns: e.returns,
+    }
 }
 
 /// Code empty indirect-table slots point at: returns to the dispatcher like a table miss, so a

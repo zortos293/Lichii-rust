@@ -182,6 +182,10 @@ pub(super) fn fold_constants(block: &mut Block) {
             Some(target) => Terminal::Jump(target),
             None => block.terminal,
         },
+        Terminal::CallIndirect { target, ret } => match block.constant(target) {
+            Some(target) => Terminal::Call { target, ret },
+            None => block.terminal,
+        },
         Terminal::Branch {
             cond,
             taken,

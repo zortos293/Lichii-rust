@@ -501,7 +501,10 @@ impl Translator<'_> {
             Inst::Bl { offset } => {
                 let ret = self.k(next);
                 self.set_x(Reg::LR, ret);
-                return Step::End(Terminal::Jump(target(offset)));
+                return Step::End(Terminal::Call {
+                    target: target(offset),
+                    ret: next,
+                });
             }
             Inst::BCond { cond, offset } => {
                 if cond >= 14 {
@@ -552,15 +555,22 @@ impl Translator<'_> {
                     not_taken,
                 });
             }
-            Inst::Br { rn } | Inst::Ret { rn } => {
+            Inst::Br { rn } => {
                 let t = self.x(rn);
                 return Step::End(Terminal::JumpIndirect(t));
+            }
+            Inst::Ret { rn } => {
+                let t = self.x(rn);
+                return Step::End(Terminal::Return(t));
             }
             Inst::Blr { rn } => {
                 let t = self.x(rn);
                 let ret = self.k(next);
                 self.set_x(Reg::LR, ret);
-                return Step::End(Terminal::JumpIndirect(t));
+                return Step::End(Terminal::CallIndirect {
+                    target: t,
+                    ret: next,
+                });
             }
 
             Inst::Barrier {

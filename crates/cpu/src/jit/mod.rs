@@ -18,7 +18,7 @@ use std::sync::atomic::AtomicBool;
 use lichii_common::{PAGE_MASK, VAddr};
 use lichii_memory::AddressSpace;
 
-use self::cache::{Code, Entry, JitCache};
+use self::cache::{Code, Entry, JitCache, ReturnStack, Slot};
 use self::ir::{Block, Terminal};
 pub(crate) use self::passes::Passes;
 use self::translate::{Step, Translator};
@@ -41,14 +41,16 @@ pub(super) struct JitState {
     /// The interrupt flag every block checks on entry.
     interrupt: *const AtomicBool,
     /// The indirect-branch table of the cache.
-    table: *const (u64, usize),
+    table: *const Slot,
+    /// The return stack buffer of the cache.
+    rsb: *mut ReturnStack,
     /// The `jmp` the last block left through, for the dispatcher to link; 0 when none.
     link: usize,
     fault: Option<CpuFault>,
 }
 
 // SAFETY: `memory`, `clock` and `interrupt` point into `Arc`s the owning `Jit` keeps, and all
-// three are `Sync`; `table` is owned by its cache.
+// three are `Sync`; `table` and `rsb` are owned by its cache.
 unsafe impl Send for JitState {}
 
 impl JitState {
@@ -199,7 +201,7 @@ impl Jit {
     }
 
     pub(crate) fn with_passes(config: CpuConfig, passes: Passes) -> Option<Self> {
-        let cache = JitCache::new()?;
+        let mut cache = JitCache::new()?;
         let interrupt = InterruptHandle::default();
         let fastmem = config.memory.fastmem().filter(|_| {
             if !cache.handles_faults() {
@@ -220,6 +222,7 @@ impl Jit {
             clock: &*config.clock,
             interrupt: &*interrupt.0,
             table: cache.table(),
+            rsb: cache.rsb(),
             link: 0,
             fault: None,
         });

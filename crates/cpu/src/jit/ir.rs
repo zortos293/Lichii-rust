@@ -331,6 +331,17 @@ impl Op {
 pub enum Terminal {
     Jump(u64),
     JumpIndirect(Value),
+    /// A jump that pushes `ret` onto the return stack buffer.
+    Call {
+        target: u64,
+        ret: u64,
+    },
+    CallIndirect {
+        target: Value,
+        ret: u64,
+    },
+    /// An indirect jump predicted by the top of the return stack buffer.
+    Return(Value),
     /// `if cond != 0 { taken } else { not_taken }`.
     Branch {
         cond: Value,
@@ -342,8 +353,11 @@ pub enum Terminal {
 impl Terminal {
     pub fn for_each_arg(&mut self, mut f: impl FnMut(&mut Value)) {
         match self {
-            Terminal::JumpIndirect(v) | Terminal::Branch { cond: v, .. } => f(v),
-            Terminal::Jump(_) => {}
+            Terminal::JumpIndirect(v)
+            | Terminal::Return(v)
+            | Terminal::CallIndirect { target: v, .. }
+            | Terminal::Branch { cond: v, .. } => f(v),
+            Terminal::Jump(_) | Terminal::Call { .. } => {}
         }
     }
 }
