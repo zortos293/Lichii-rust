@@ -27,6 +27,9 @@ use lichii_texture::{Numeric, PixelFormat};
 /// Size of the Maxwell program header in front of a graphics program's first instruction.
 pub const HEADER_SIZE: u64 = 0x50;
 
+/// Bytes the 3D and compute engines let one constant buffer binding cover.
+const MAX_CONST_BUFFER_SIZE: u32 = 0x1_0000;
+
 /// Bytes from a graphics program's header to its first instruction.
 fn header_size(arch: ShaderArch) -> u64 {
     match arch {
@@ -334,6 +337,9 @@ pub struct EnvSnapshot {
     start: GpuVAddr,
     gmmu: Arc<Gmmu>,
     const_buffers: Vec<ConstBufferBinding>,
+    /// The bytes of each enabled constant buffer when the snapshot was taken: the guest
+    /// rewrites them between draws, before a worker translates.
+    const_data: Vec<Box<[u8]>>,
     pool: TexturePool,
     viewport_transform: u32,
     texture_bound: u32,
@@ -350,6 +356,8 @@ pub struct ProgramEnv<'a> {
     start: GpuVAddr,
     gmmu: &'a Arc<Gmmu>,
     const_buffers: &'a [ConstBufferBinding],
+    /// Constant buffer contents captured by [`Self::snapshot`]; empty reads guest memory.
+    const_data: &'a [Box<[u8]>],
     pool: TexturePool,
     viewport_transform: u32,
     texture_bound: u32,
@@ -393,6 +401,7 @@ impl<'a> ProgramEnv<'a> {
             start,
             gmmu: ctx.memory,
             const_buffers: &ctx.const_buffers[slot.saturating_sub(1)],
+            const_data: &[],
             pool: TexturePool {
                 address: regs.tex_header.address(),
                 limit: regs.tex_header.limit,
@@ -429,6 +438,7 @@ impl<'a> ProgramEnv<'a> {
             start: ctx.program,
             gmmu: ctx.memory,
             const_buffers: ctx.const_buffers,
+            const_data: &[],
             pool: TexturePool {
                 address: ctx.texture_headers,
                 limit: ctx.texture_header_limit,
@@ -498,6 +508,11 @@ impl<'a> ProgramEnv<'a> {
             start: self.start,
             gmmu: self.gmmu.clone(),
             const_buffers: self.const_buffers.to_vec(),
+            const_data: self
+                .const_buffers
+                .iter()
+                .map(|cbuf| self.const_bytes(cbuf))
+                .collect(),
             pool: self.pool,
             viewport_transform: self.viewport_transform,
             texture_bound: self.texture_bound,
@@ -516,6 +531,7 @@ impl<'a> ProgramEnv<'a> {
             start: snapshot.start,
             gmmu: &snapshot.gmmu,
             const_buffers: &snapshot.const_buffers,
+            const_data: &snapshot.const_data,
             pool: snapshot.pool,
             viewport_transform: snapshot.viewport_transform,
             texture_bound: snapshot.texture_bound,
@@ -595,10 +611,33 @@ impl<'a> ProgramEnv<'a> {
     fn cbuf_word(&self, index: u32, offset: u32) -> u32 {
         match self.const_buffers.get(index as usize) {
             Some(cbuf) if cbuf.enabled && offset < cbuf.size => {
-                self.word(cbuf.address + u64::from(offset))
+                match self.const_data.get(index as usize) {
+                    Some(bytes) => {
+                        let offset = offset as usize;
+                        bytes
+                            .get(offset..offset + 4)
+                            .map_or(0, |word| u32::from_le_bytes(word.try_into().unwrap()))
+                    }
+                    None => self.word(cbuf.address + u64::from(offset)),
+                }
             }
             _ => 0,
         }
+    }
+
+    /// The bytes `cbuf_word` can read from `cbuf`: its size and the word that starts at its
+    /// last byte.
+    fn const_bytes(&self, cbuf: &ConstBufferBinding) -> Box<[u8]> {
+        if !cbuf.enabled {
+            return Box::default();
+        }
+        let mut bytes = vec![0; cbuf.size.min(MAX_CONST_BUFFER_SIZE) as usize + 3];
+        if self.gmmu.read_block(cbuf.address, &mut bytes).is_err() {
+            for (i, byte) in bytes.iter_mut().enumerate() {
+                *byte = self.gmmu.read::<u8>(cbuf.address + i as u64).unwrap_or(0);
+            }
+        }
+        bytes.into_boxed_slice()
     }
 
     fn record(&self, read: EnvRead) {
@@ -721,5 +760,63 @@ impl ShaderEnvironment for ProgramEnv<'_> {
 
     fn has_hle_macro_state(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use lichii_gpu::gmmu::BigPageSize;
+    use lichii_memory::{DeviceAddressSpace, PhysicalMemory};
+
+    use super::*;
+
+    const SIZE: u64 = 2 << 20;
+    const DADDR: u64 = 0x1_0000_0000;
+    const GPU_VA: GpuVAddr = 0x4_0000_0000;
+    const CBUF: GpuVAddr = GPU_VA + 0x1000;
+
+    #[test]
+    fn a_snapshot_reads_constant_buffers_as_the_draw_saw_them() {
+        let physical = Arc::new(PhysicalMemory::new(SIZE).unwrap());
+        physical.commit(0, SIZE).unwrap();
+        let memory = Arc::new(DeviceAddressSpace::new(physical, 36));
+        memory.map(DADDR, 0, SIZE);
+        let gmmu = Arc::new(Gmmu::new(memory, BigPageSize::Size64K));
+        gmmu.map(GPU_VA, DADDR, SIZE, 0, false).unwrap();
+        gmmu.write(CBUF + 8, 0x1234_u32).unwrap();
+        let const_buffers = [ConstBufferBinding {
+            address: CBUF,
+            size: 0x10,
+            enabled: true,
+        }];
+        let draw = ProgramEnv {
+            arch: ShaderArch::Maxwell,
+            stage: ShaderStage::Fragment,
+            start: GPU_VA,
+            gmmu: &gmmu,
+            const_buffers: &const_buffers,
+            const_data: &[],
+            pool: TexturePool {
+                address: 0,
+                limit: 0,
+                via_header_index: false,
+                switch2: false,
+            },
+            viewport_transform: 0,
+            texture_bound: 0,
+            local_memory: 0,
+            shared_memory: 0,
+            workgroup: [1; 3],
+            mesh: None,
+            reads: RefCell::new(Vec::new()),
+            extent: Cell::new((GPU_VA, GPU_VA)),
+            code_log: None,
+        };
+        let snapshot = draw.snapshot();
+        gmmu.write(CBUF + 8, 0x5678_u32).unwrap();
+        let worker = ProgramEnv::from_snapshot(&snapshot);
+        assert_eq!(worker.read_cbuf(0, 8), 0x1234);
+        assert_eq!(worker.read_cbuf(0, 0x10), 0, "past the binding");
+        assert_eq!(draw.read_cbuf(0, 8), 0x5678);
     }
 }
