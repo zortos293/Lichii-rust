@@ -91,7 +91,9 @@ struct Preview {
     input: PlayerInput,
     pad: Option<usize>,
     mapping: PlayerMapping,
+    state: NpadState,
     started: Instant,
+    /// Input-thread updates resolved so far, counted from `started`.
     updates: u64,
 }
 
@@ -296,22 +298,24 @@ impl ControlsPage {
         {
             self.preview = None;
         }
-        let preview = self.preview.get_or_insert_with(|| Preview {
-            player: index,
-            input: player.clone(),
-            pad,
-            mapping: PlayerMapping::compile(player, host),
-            started: Instant::now(),
-            updates: 0,
+        let preview = self.preview.get_or_insert_with(|| {
+            let mut mapping = PlayerMapping::compile(player, host);
+            Preview {
+                player: index,
+                input: player.clone(),
+                pad,
+                state: mapping.resolve(host, keyboard),
+                mapping,
+                started: Instant::now(),
+                updates: 0,
+            }
         });
         let due = (preview.started.elapsed().as_nanos() / UPDATE_PERIOD.as_nanos()) as u64;
-        let steps = due.saturating_sub(preview.updates).clamp(1, 64);
-        preview.updates = due.max(preview.updates + 1);
-        let mut state = preview.mapping.resolve(host, keyboard);
-        for _ in 1..steps {
-            state = preview.mapping.resolve(host, keyboard);
+        for _ in 0..due.saturating_sub(preview.updates).min(64) {
+            preview.state = preview.mapping.resolve(host, keyboard);
         }
-        state
+        preview.updates = due;
+        preview.state
     }
 
     fn poll_capture(&mut self, player: &mut PlayerInput, host: Option<&HostInput>) {
