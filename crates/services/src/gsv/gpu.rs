@@ -3,12 +3,12 @@
 //! [`Nx2GpuMemory`] registry.
 //!
 //! Requests name their memory by inclusive [first, last] ranges and complete through a job slot:
-//! the SDK waits on the slot's event (12) after the reply. Every request except 101 changes the
-//! registry on the GPU's back thread, so it keeps its order both with the other requests and with
-//! the GPU work: work queued before it still sees the old mappings, work queued after it the new
-//! ones. An unmap or destroy completes its slot once the host GPU finished the work before it,
-//! because the title reuses the memory right after. 101 runs at once, since its reply names the
-//! new memory; it only adds a mapping at the memory's own address.
+//! the SDK waits on the slot's event (12) after the reply. Every request changes the registry on
+//! the GPU's back thread, so it keeps its order both with the other requests and with the GPU
+//! work: work queued before it still sees the old mappings, work queued after it the new ones.
+//! An unmap or destroy completes its slot once the host GPU finished the work before it, because
+//! the title reuses the memory right after. 101's reply names the new memory, so it waits for the
+//! back thread to reach it.
 //!
 //! A region 214 creates without the sparse flag is GPU-only storage the client renders into
 //! (NX2_NOTES row 57): the server backs it with memory of its own in the alias code region, made
@@ -16,7 +16,7 @@
 //! memory again.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Weak, mpsc};
 
 use lichii_common::{DAddr, GpuVAddr, PAGE_MASK, ResultCode, VAddr};
 use lichii_gpu::Gpu;
@@ -55,9 +55,9 @@ struct State {
     devices: Mutex<[bool; DEVICES]>,
     /// GPU-only regions by GPU address, and the memory backing each.
     gpu_only: Mutex<BTreeMap<GpuVAddr, Backing>>,
-    /// Backings no GPU range reaches any more, once the GPU is past them. The service thread
-    /// frees them: kernel memory calls never run on a GPU thread.
-    released: Mutex<Vec<Backing>>,
+    /// Server memory (address, size) of GPU-only regions no GPU range reaches any more, once the
+    /// GPU is past it. The service thread frees it: kernel memory calls never run on a GPU thread.
+    released: Mutex<Vec<(VAddr, u64)>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -186,21 +186,16 @@ impl GpuSession {
     fn free_released(&self) {
         let released = std::mem::take(&mut *self.state.released.lock());
         let page_table = self.context.process.page_table();
-        for backing in released {
-            if let Err(code) =
-                page_table.unmap_and_free(backing.cpu_va, backing.size, MemoryState::IO_MEMORY)
-            {
-                tracing::warn!(
-                    "nx2:gpu: freeing GPU-only memory at {:#x}: {code:?}",
-                    backing.cpu_va
-                );
+        for (cpu_va, size) in released {
+            if let Err(code) = page_table.unmap_and_free(cpu_va, size, MemoryState::IO_MEMORY) {
+                tracing::warn!("nx2:gpu: freeing GPU-only memory at {cpu_va:#x}: {code:?}");
             }
         }
     }
 
     /// 214 without the sparse flag: backs [`start`, +`size`) with server memory. The memory is
     /// new, so it is made GPU accessible at once; the region is mapped in order.
-    fn create_gpu_only(&self, memory: &Nx2GpuMemory, start: GpuVAddr, size: u64, slot: u32) {
+    fn create_gpu_only(&self, start: GpuVAddr, size: u64, slot: u32) {
         let page_table = self.context.process.page_table();
         let region = page_table.regions().alias_code;
         let cpu_va = match page_table.map_new_in(
@@ -218,25 +213,25 @@ impl GpuSession {
                 return;
             }
         };
-        let space: &AddressSpace = self.context.process.memory();
-        let handle = match memory.create_gpu_accessible_memory(space, cpu_va, size) {
-            Ok((handle, unmapped)) => {
-                unmap(&self.context.gpu, &unmapped);
-                handle
-            }
-            Err(err) => {
-                tracing::error!("nx2:gpu 214: GPU-only region {start:#x}+{size:#x}: {err}");
-                let _ = page_table.unmap_and_free(cpu_va, size, MemoryState::IO_MEMORY);
-                self.slot(slot).signal();
-                return;
-            }
-        };
-        let backing = Backing {
-            handle,
-            cpu_va,
-            size,
-        };
+        let process = self.context.process.clone();
         self.in_order(slot, false, move |memory, state, done| {
+            let space: &AddressSpace = process.memory();
+            let handle = match memory.create_gpu_accessible_memory(space, cpu_va, size) {
+                Ok((handle, unmapped)) => {
+                    done.unmapped.extend(unmapped);
+                    handle
+                }
+                Err(err) => {
+                    tracing::error!("nx2:gpu 214: GPU-only region {start:#x}+{size:#x}: {err}");
+                    done.released.push((cpu_va, size));
+                    return;
+                }
+            };
+            let backing = Backing {
+                handle,
+                cpu_va,
+                size,
+            };
             match memory.normal_map_4k(start, start + size - 1, handle, 0) {
                 Ok(replaced) => done.unmapped.extend(replaced),
                 Err(err) => {
@@ -266,23 +261,45 @@ impl GpuSession {
     }
 
     /// 101(first u64, last u64, flags): makes process memory GPU accessible at GPU VA == CPU VA.
-    /// Reply word 3 is the GpuMemoryHandle later requests name, so this one runs at once.
-    fn create_memory(&self, ctx: &mut HleRequestContext, memory: &Nx2GpuMemory) -> ResultCode {
+    /// Reply word 3 is the GpuMemoryHandle later requests name, so the reply waits until the back
+    /// thread reached the request and made the memory.
+    fn create_memory(&self, ctx: &mut HleRequestContext) -> ResultCode {
         let words = Words::command(ctx);
         let (first, last) = (words.u64(2), words.u64(4));
         let Some(size) = last.checked_sub(first).map(|n| n + 1) else {
             tracing::warn!("nx2:gpu 101: empty range [{first:#x}, {last:#x}]");
             return lichii_kernel::result::INVALID_SIZE;
         };
-        let space: &AddressSpace = self.context.process.memory();
-        match memory.create_gpu_accessible_memory(space, first, size) {
-            Ok((handle, unmapped)) => {
-                unmap(&self.context.gpu, &unmapped);
+        let (sender, created) = mpsc::sync_channel(1);
+        let context = self.context.clone();
+        self.context
+            .gpu
+            .run_in_order(move |rasterizer: &mut dyn Rasterizer| {
+                let Some(memory) = context.gpu.nx2_memory() else {
+                    return;
+                };
+                let space: &AddressSpace = context.process.memory();
+                let result = memory.create_gpu_accessible_memory(space, first, size).map(
+                    |(handle, unmapped)| {
+                        for range in &unmapped {
+                            rasterizer.unmap_region(range.range.daddr, range.range.size);
+                        }
+                        handle
+                    },
+                );
+                let _ = sender.send(result);
+            });
+        match created.recv() {
+            Ok(Ok(handle)) => {
                 ctx.push(handle.raw());
                 ResultCode::SUCCESS
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 tracing::warn!("nx2:gpu 101 [{first:#x}, {last:#x}]: {err}");
+                lichii_kernel::result::OUT_OF_RESOURCE
+            }
+            Err(_) => {
+                tracing::warn!("nx2:gpu 101: the GPU stopped");
                 lichii_kernel::result::OUT_OF_RESOURCE
             }
         }
@@ -355,8 +372,8 @@ impl GpuSession {
 #[derive(Default)]
 struct Change {
     unmapped: Vec<Unmapped>,
-    /// GPU-only backings to free once the host GPU is past them.
-    released: Vec<Backing>,
+    /// GPU-only server memory to free once the host GPU is past it.
+    released: Vec<(VAddr, u64)>,
 }
 
 impl Change {
@@ -365,7 +382,7 @@ impl Change {
             "releasing GPU-only memory",
             memory.destroy(backing.handle),
         ));
-        self.released.push(backing);
+        self.released.push((backing.cpu_va, backing.size));
     }
 }
 
@@ -385,12 +402,6 @@ fn logged(request: &str, result: Result<Vec<Unmapped>, Nx2MemoryError>) -> Vec<U
         tracing::warn!("nx2:gpu {request}: {err}");
         Vec::new()
     })
-}
-
-fn unmap(gpu: &Gpu, unmapped: &[Unmapped]) {
-    for range in unmapped {
-        gpu.unmap_region(range.range.daddr, range.range.size);
-    }
 }
 
 /// Little-endian words, indexed from `first`. Missing words read as zero.
@@ -481,14 +492,14 @@ impl Service for GpuSession {
                 ResultCode::SUCCESS
             }
             101 | 102 | 211..=216 => {
-                let Some(memory) = self.memory() else {
+                if self.memory().is_none() {
                     tracing::warn!("nx2:gpu {command}: no Switch 2 GPU memory for this title");
                     return Some(lichii_kernel::result::NOT_FOUND);
-                };
+                }
                 self.free_released();
                 let range = (words.u64(3), words.u64(5));
                 match command {
-                    101 => self.create_memory(ctx, memory),
+                    101 => self.create_memory(ctx),
                     102 => {
                         let handle = GpuMemoryHandle::new(words.u32(2));
                         self.in_order(words.u32(3), true, move |memory, state, done| {
@@ -558,7 +569,7 @@ impl Service for GpuSession {
                                     logged("214", memory.create_sparse_region(first, size));
                             });
                         } else if last > first && (first | size) & PAGE_MASK == 0 {
-                            self.create_gpu_only(memory, first, size, slot);
+                            self.create_gpu_only(first, size, slot);
                         } else {
                             tracing::warn!(
                                 "nx2:gpu 214: unexpected region [{first:#x}, {last:#x}]"

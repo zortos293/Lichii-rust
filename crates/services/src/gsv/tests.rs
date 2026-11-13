@@ -737,3 +737,41 @@ fn an_unmap_waits_for_the_gpu_work_queued_before_it() {
     assert!(gmmu.read::<u32>(heap).is_err());
     assert!(slot.is_signaled());
 }
+
+#[test]
+fn memory_made_after_an_unmap_stays_mapped() {
+    let (context, client, gsv) = gsv();
+    let gpu = session(&client, gsv, 497);
+    let gmmu = context
+        .gpu
+        .create_address_space(lichii_gpu::gmmu::BigPageSize::Size64K);
+    let process = client.process().clone();
+    let heap = process.page_table().set_heap_size(2 << 20).unwrap();
+    process.memory().write(heap, 0x1111_1111u32).unwrap();
+    let create = words(
+        Request::tipc(101),
+        &[split(heap), split(heap + 0xffff), [0, 0]].concat(),
+    );
+    client.send(gpu, &create).unwrap();
+
+    let (release, queued_work) = std::sync::mpsc::channel::<()>();
+    context
+        .gpu
+        .run_in_order(move |_| queued_work.recv().unwrap());
+    client
+        .send(gpu, &range_words(213, heap, heap + 0xffff, &[0, 2]))
+        .unwrap();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        release.send(()).unwrap();
+    });
+    let reply = client.send(gpu, &create).unwrap();
+    assert_eq!(reply.result, ResultCode::SUCCESS);
+    releaser.join().unwrap();
+    context.gpu.synchronize();
+    assert_eq!(
+        gmmu.read::<u32>(heap).unwrap(),
+        0x1111_1111,
+        "the unmap sent before the memory was made does not remove it"
+    );
+}
