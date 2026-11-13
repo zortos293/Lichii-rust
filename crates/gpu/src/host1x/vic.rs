@@ -963,6 +963,8 @@ pub(super) struct Vic {
     rows: Rows,
     guest: GuestSurface,
     warned: bool,
+    /// Whether jobs compose their output; without, they write nothing.
+    compose: bool,
 }
 
 impl Vic {
@@ -970,6 +972,7 @@ impl Vic {
         memory: Arc<DeviceAddressSpace>,
         process: Option<Arc<AddressSpace>>,
         frames: Arc<DecodedFrames>,
+        compose: bool,
     ) -> Self {
         Self {
             regs: Box::new([0; REGISTER_COUNT]),
@@ -981,6 +984,7 @@ impl Vic {
             rows: Rows::default(),
             guest: GuestSurface::default(),
             warned: false,
+            compose,
         }
     }
 
@@ -999,7 +1003,7 @@ impl Vic {
     }
 
     fn execute(&mut self) {
-        if !lichii_video::available() {
+        if !self.compose {
             return;
         }
         let config = self.address(CONFIG_STRUCT_OFFSET);

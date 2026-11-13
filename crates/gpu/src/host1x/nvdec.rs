@@ -238,16 +238,21 @@ impl Drop for Decoding {
 
 pub(super) struct Nvdec {
     regs: Box<NvdecRegisters>,
-    /// `None` without FFmpeg: jobs complete without decoding.
+    /// `None` without decoding: jobs complete without decoding.
     worker: Option<DecodeWorker>,
     frames: Arc<DecodedFrames>,
     channel: u64,
 }
 
 impl Nvdec {
-    pub(super) fn new(memory: Arc<DeviceAddressSpace>, frames: Arc<DecodedFrames>) -> Self {
+    /// With `decode` false, jobs complete without decoding.
+    pub(super) fn new(
+        memory: Arc<DeviceAddressSpace>,
+        frames: Arc<DecodedFrames>,
+        decode: bool,
+    ) -> Self {
         let channel = NEXT_CHANNEL.fetch_add(1, Ordering::Relaxed);
-        let worker = lichii_video::available().then(|| {
+        let worker = decode.then(|| {
             let mut decoding = Decoding {
                 builder: None,
                 backend: Backend::Closed,

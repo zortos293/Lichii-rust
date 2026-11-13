@@ -413,6 +413,10 @@ pub struct GraphicsSettings {
     pub disk_shader_cache: bool,
     pub vram_usage: VramUsage,
     pub validation_layers: bool,
+    /// Decode Switch 1 titles' NVDEC video with FFmpeg and compose it through VIC. Off by default:
+    /// the engines then only complete their jobs, as without FFmpeg, because Mario Strikers
+    /// hangs at match load with decoding on. Switch 2 video decodes either way.
+    pub switch1_video_decoding: bool,
 }
 
 impl Default for GraphicsSettings {
@@ -435,6 +439,7 @@ impl Default for GraphicsSettings {
             disk_shader_cache: true,
             vram_usage: VramUsage::Conservative,
             validation_layers: false,
+            switch1_video_decoding: false,
         }
     }
 }

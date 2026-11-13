@@ -331,7 +331,12 @@ impl Nv12 {
 
 fn run_vic(host1x: &Host1x, config: &VicConfig, slots: &[(usize, u64, u64)]) {
     host1x.memory.write_bytes(CONFIG, config.bytes()).unwrap();
-    let mut vic = Vic::new(host1x.memory.clone(), None, host1x.decoded_frames.clone());
+    let mut vic = Vic::new(
+        host1x.memory.clone(),
+        None,
+        host1x.decoded_frames.clone(),
+        true,
+    );
     for (method, value) in vic_methods(slots) {
         vic.write(method, value);
     }
@@ -385,6 +390,25 @@ fn vic_converts_nv12_with_the_slot_matrix_into_pitch_rgb() {
             }
         }
     }
+}
+
+#[test]
+fn channels_opened_without_decoding_write_nothing() {
+    let host1x = mapped_host1x();
+    let picture = Nv12::quadrants(32, 16);
+    picture.store_pitch(&host1x);
+    let mut config = VicConfig::new(rgba_output(32, 16, A8B8G8R8, None));
+    config.slot(0, Slot::whole(picture.surface(), Some(BT601)));
+    host1x.memory.write_bytes(CONFIG, config.bytes()).unwrap();
+    let vic = EngineChannel::open(VideoEngine::Vic, &host1x, None, false);
+    let methods = vic_methods(&[(0, SOURCE_LUMA, SOURCE_CHROMA)]);
+    vic.submit(command_buffer(VideoEngine::Vic, &methods, 22));
+    wait_for(&host1x.syncpoints, 22, 1);
+    assert!(
+        read(&host1x, OUTPUT_LUMA, 32 * 16 * 4)
+            .iter()
+            .all(|&b| b == 0)
+    );
 }
 
 /// Byte offset of byte `x` of row `y` in a Tegra block-linear surface `row_bytes` wide, with
@@ -561,6 +585,7 @@ fn vic_output_is_reported_to_write_tracking() {
         host1x.memory.clone(),
         Some(process),
         host1x.decoded_frames.clone(),
+        true,
     );
     for (method, value) in vic_methods(&[(0, SOURCE_LUMA, SOURCE_CHROMA)]) {
         vic.write(method, value);
@@ -904,8 +929,8 @@ fn h264_decodes_through_nvdec_and_composes_through_vic_by_surface() {
     let display = display_order(&frames);
     assert_ne!(display, [0, 1, 2, 3, 4, 5], "the stream reorders B-frames");
     let host1x = mapped_host1x();
-    let nvdec = EngineChannel::open(VideoEngine::NvDec, &host1x, None);
-    let vic = EngineChannel::open(VideoEngine::Vic, &host1x, None);
+    let nvdec = EngineChannel::open(VideoEngine::NvDec, &host1x, None, true);
+    let vic = EngineChannel::open(VideoEngine::Vic, &host1x, None, true);
     let (nvdec_done, vic_done) = (20, 21);
     let (width, height) = (64u64, 48u64);
     let mut config = VicConfig::new(rgba_output(width, height, A8B8G8R8, None));
@@ -1009,8 +1034,13 @@ fn steady_state_nvdec_and_vic_jobs_do_not_allocate() {
     }
     let (params, frames) = h264::parse(QUADRANTS_H264);
     let host1x = mapped_host1x();
-    let mut nvdec = Nvdec::new(host1x.memory.clone(), host1x.decoded_frames.clone());
-    let mut vic = Vic::new(host1x.memory.clone(), None, host1x.decoded_frames.clone());
+    let mut nvdec = Nvdec::new(host1x.memory.clone(), host1x.decoded_frames.clone(), true);
+    let mut vic = Vic::new(
+        host1x.memory.clone(),
+        None,
+        host1x.decoded_frames.clone(),
+        true,
+    );
     let mut config = VicConfig::new(rgba_output(64, 48, A8B8G8R8, Some(1)));
     config.slot(
         0,
@@ -1098,8 +1128,13 @@ fn nvdec_vic_720p_frame_time() {
     let _ = std::fs::remove_file(&path);
     let (params, frames) = h264::parse(&bytes);
     let host1x = mapped_host1x();
-    let mut nvdec = Nvdec::new(host1x.memory.clone(), host1x.decoded_frames.clone());
-    let mut vic = Vic::new(host1x.memory.clone(), None, host1x.decoded_frames.clone());
+    let mut nvdec = Nvdec::new(host1x.memory.clone(), host1x.decoded_frames.clone(), true);
+    let mut vic = Vic::new(
+        host1x.memory.clone(),
+        None,
+        host1x.decoded_frames.clone(),
+        true,
+    );
     let mut config = VicConfig::new(rgba_output(1280, 720, A8B8G8R8, Some(4)));
     config.slot(
         0,

@@ -75,7 +75,12 @@ impl Host1xClient {
         tracing::info!(device = name, "host1x engine channel opened");
         Self {
             syncpoint: nvdrv.syncpoints.allocate(),
-            channel: EngineChannel::open(engine, nvdrv.gpu.host1x(), Some(client.memory().clone())),
+            channel: EngineChannel::open(
+                engine,
+                nvdrv.gpu.host1x(),
+                Some(client.memory().clone()),
+                nvdrv.video_decoding,
+            ),
             nvdrv,
             name,
             pinned: Mutex::default(),

@@ -85,6 +85,8 @@ pub(crate) struct Nvdrv {
     next_session: AtomicU64,
     /// `debug.ipc_trace`: log every ioctl with its device and result.
     ipc_trace: bool,
+    /// `graphics.switch1_video_decoding`: NVDEC and VIC channels decode and compose video.
+    video_decoding: bool,
 }
 
 impl Nvdrv {
@@ -97,6 +99,7 @@ impl Nvdrv {
             nx2: context.program.generation == ConsoleGeneration::Switch2,
             next_session: AtomicU64::new(1),
             ipc_trace: context.settings.debug.ipc_trace,
+            video_decoding: context.settings.graphics.switch1_video_decoding,
             gpu,
         }
     }

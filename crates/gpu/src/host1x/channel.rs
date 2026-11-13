@@ -3,9 +3,9 @@
 //! increment lands when the stream reaches it, and a host wait holds only its own channel.
 //!
 //! An NVDEC job decodes its frame and a VIC job composes its output surface for the channel.
-//! Every NVDEC job takes at least [`DECODE_TIME`], decoded or not. Without FFmpeg it only takes
-//! that and a VIC job writes nothing, so a title's video waits still complete and it moves on
-//! past them.
+//! Every NVDEC job takes at least [`DECODE_TIME`], decoded or not. On a channel opened without
+//! decoding, or without FFmpeg, it only takes that and a VIC job writes nothing, so a title's
+//! video waits still complete and it moves on past them.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -72,12 +72,18 @@ enum Engine {
 }
 
 impl Engine {
-    fn new(engine: VideoEngine, host1x: &Host1x, process: Option<Arc<AddressSpace>>) -> Self {
+    fn new(
+        engine: VideoEngine,
+        host1x: &Host1x,
+        process: Option<Arc<AddressSpace>>,
+        decode: bool,
+    ) -> Self {
         let memory = host1x.memory.clone();
         let frames = host1x.decoded_frames.clone();
+        let decode = decode && lichii_video::available();
         match engine {
-            VideoEngine::NvDec => Self::NvDec(Box::new(Nvdec::new(memory, frames))),
-            VideoEngine::Vic => Self::Vic(Box::new(Vic::new(memory, process, frames))),
+            VideoEngine::NvDec => Self::NvDec(Box::new(Nvdec::new(memory, frames, decode))),
+            VideoEngine::Vic => Self::Vic(Box::new(Vic::new(memory, process, frames, decode))),
             VideoEngine::NvJpg => Self::NvJpg,
         }
     }
@@ -109,13 +115,19 @@ pub struct EngineChannel {
 impl EngineChannel {
     /// Opens a channel of `engine` over `host1x`'s device memory. VIC output is reported to the
     /// write tracking of `process`, the process attached to the device address space, so GPU
-    /// caches holding an output surface reload it.
-    pub fn open(engine: VideoEngine, host1x: &Host1x, process: Option<Arc<AddressSpace>>) -> Self {
+    /// caches holding an output surface reload it. With `decode` false, NVDEC jobs only take
+    /// [`DECODE_TIME`] and VIC jobs write nothing, as without FFmpeg.
+    pub fn open(
+        engine: VideoEngine,
+        host1x: &Host1x,
+        process: Option<Arc<AddressSpace>>,
+        decode: bool,
+    ) -> Self {
         let (submits, received) = mpsc::channel::<Vec<u32>>();
         let closing = Arc::new(AtomicBool::new(false));
         let mut stream = CommandStream {
             kind: engine,
-            engine: Engine::new(engine, host1x, process),
+            engine: Engine::new(engine, host1x, process, decode),
             syncpoints: host1x.syncpoints.clone(),
             closing: closing.clone(),
             class: engine.class(),
@@ -322,7 +334,7 @@ pub(super) mod tests {
     fn nvdec_jobs_increment_their_syncpoint_after_the_decode_time() {
         let host1x = host1x();
         let syncpoints = host1x.syncpoints.clone();
-        let channel = EngineChannel::open(VideoEngine::NvDec, &host1x, None);
+        let channel = EngineChannel::open(VideoEngine::NvDec, &host1x, None, true);
         let started = Instant::now();
         channel.submit(vec![
             incrementing(THI_METHOD_0, 2),
@@ -342,7 +354,7 @@ pub(super) mod tests {
     fn control_waits_hold_the_channel_until_the_syncpoint() {
         let host1x = host1x();
         let syncpoints = host1x.syncpoints.clone();
-        let channel = EngineChannel::open(VideoEngine::Vic, &host1x, None);
+        let channel = EngineChannel::open(VideoEngine::Vic, &host1x, None, true);
         channel.submit(vec![
             set_class(CLASS_CONTROL, 0, 0),
             immediate(CONTROL_LOAD_SYNCPT_PAYLOAD_32, 2),
@@ -364,7 +376,7 @@ pub(super) mod tests {
     fn closing_a_channel_abandons_its_wait() {
         let host1x = host1x();
         let syncpoints = host1x.syncpoints.clone();
-        let channel = EngineChannel::open(VideoEngine::NvJpg, &host1x, None);
+        let channel = EngineChannel::open(VideoEngine::NvJpg, &host1x, None, true);
         channel.submit(vec![
             set_class(CLASS_CONTROL, 0, 0),
             immediate(CONTROL_LOAD_SYNCPT_PAYLOAD_32, 1),

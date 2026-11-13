@@ -367,6 +367,12 @@ impl ConfigWindow {
                     });
                     row(ui, "", |ui| {
                         ui.checkbox(
+                            &mut d.graphics.switch1_video_decoding,
+                            "Decode Switch 1 video (experimental)",
+                        )
+                    });
+                    row(ui, "", |ui| {
+                        ui.checkbox(
                             &mut d.graphics.validation_layers,
                             "Vulkan validation layers (slow)",
                         )
