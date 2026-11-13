@@ -261,9 +261,9 @@ pub(super) struct Emitter<'a> {
     next_slot: u16,
     locked: [u16; 2],
     last_use: Vec<u32>,
-    /// `Compare`s emitted by their only user, a `Select` or the `Branch`, which consumes the
-    /// host flags directly.
-    fused: Vec<bool>,
+    /// `Compare`s emitted by their only user, a `Select`, an FP select or the `Branch`, which
+    /// consumes the host flags directly.
+    pub(super) fused: Vec<bool>,
     stubs: Vec<Stub>,
     fault_exit: DynamicLabel,
     pub(super) simd: simd::State,
@@ -391,7 +391,7 @@ impl Emitter<'_> {
     }
 
     /// Sets the host flags of `Compare` `v` and returns the condition code that then holds.
-    fn compare(&mut self, v: Value) -> u8 {
+    pub(super) fn compare(&mut self, v: Value) -> u8 {
         let Op::Compare(kind, cond, w, a, b) = self.block.ops[v.index()] else {
             unreachable!("only a Compare sets host flags for its user");
         };
@@ -1613,7 +1613,7 @@ pub(super) fn compile(block: &Block, start: u64, target: &Target) -> Compiled {
         .iter()
         .enumerate()
         .filter_map(|(i, op)| match *op {
-            Op::Select(_, c, ..) => Some((c, i as u32)),
+            Op::Select(_, c, ..) | Op::Simd(simd::SimdOp::Select(_, c, ..)) => Some((c, i as u32)),
             _ => None,
         });
     let branch = match terminal {

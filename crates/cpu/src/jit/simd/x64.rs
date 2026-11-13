@@ -170,6 +170,18 @@ impl Emitter<'_> {
                 }
                 self.rax_to_low(fp, d);
             }
+            SimdOp::Select(fp, c, a, b) if self.fused[c.index()] => {
+                let (a, b) = (self.reg(a), self.reg(b));
+                let d = self.def(v);
+                let cc = self.compare(c);
+                self.low_to_rax(fp, b);
+                match fp {
+                    Fp::S => dynasm!(self.asm ; .arch x64 ; movd ecx, Rx(a)),
+                    Fp::D => dynasm!(self.asm ; .arch x64 ; movq rcx, Rx(a)),
+                }
+                self.asm.extend([0x48, 0x0f, 0x40 | cc, 0xc1]);
+                self.rax_to_low(fp, d);
+            }
             SimdOp::Select(fp, c, a, b) => {
                 let (c, a, b) = (self.reg(c), self.reg(a), self.reg(b));
                 let d = self.def(v);
