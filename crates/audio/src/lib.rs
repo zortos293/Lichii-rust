@@ -2,4 +2,5 @@
 
 pub mod r#in;
 pub mod out;
+pub mod renderer;
 pub mod sink;
