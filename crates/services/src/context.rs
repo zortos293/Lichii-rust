@@ -1,8 +1,9 @@
-//! What services share: the kernel, settings, the title, the GPU and input.
+//! What services share: the kernel, settings, the title, the GPU, input and the audio sink.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use lichii_audio::sink::Sink;
 use lichii_common::HleResult;
 use lichii_common::perf::PerfStats;
 use lichii_common::settings::Settings;
@@ -30,6 +31,8 @@ pub struct ServiceParts {
     pub gpu: Arc<Gpu>,
     pub npad: Arc<NpadHub>,
     pub perf: Arc<PerfStats>,
+    /// The host audio sink, built by `core::System` from the audio settings.
+    pub audio: Arc<Sink>,
 }
 
 /// Shared state of every service. Services keep an `Arc<ServiceContext>`; the fields are the
@@ -50,6 +53,9 @@ pub struct ServiceContext {
     pub npad: Arc<NpadHub>,
     /// Counters the overlay shows; vi/gsv record guest frames here.
     pub perf: Arc<PerfStats>,
+    /// The host audio sink every audio service plays on. `core::System` owns it and pauses it
+    /// and sets its host volume; the services set the device volume.
+    pub audio: Arc<Sink>,
     pub(crate) unknown: UnknownCommands,
     threads: Mutex<HashMap<String, ServiceThread>>,
 }
@@ -66,6 +72,7 @@ impl ServiceContext {
             gpu: parts.gpu,
             npad: parts.npad,
             perf: parts.perf,
+            audio: parts.audio,
             unknown: UnknownCommands::default(),
             threads: Mutex::new(HashMap::new()),
         })

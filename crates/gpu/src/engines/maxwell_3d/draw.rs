@@ -9,9 +9,9 @@
 
 use super::regs::{
     DrawBegin, DrawInstanceId, PrimitiveTopology, PrimitiveTopologyControl,
-    PrimitiveTopologyOverride, Regs,
+    PrimitiveTopologyOverride, Regs, WindowOriginMode,
 };
-use crate::backend::DrawParams;
+use crate::backend::{DrawParams, DrawTexture};
 use crate::reg_index;
 
 pub(super) const DRAW_END: u32 = reg_index!(Regs, draw.end);
@@ -60,6 +60,37 @@ pub(super) fn is_loop_method(method: u32) -> bool {
             | VERTEX_ARRAY_INSTANCE_FIRST
             | VERTEX_ARRAY_INSTANCE_SUBSEQUENT
     )
+}
+
+pub(super) const DRAW_TEXTURE: u32 = reg_index!(Regs, draw_texture.src_y0);
+
+/// The DRAW_TEXTURE the registers describe, its trigger being the write to src_y0. Destination
+/// positions and sizes are 20.12 fixed point and the source steps 32.32; a lower-left window
+/// origin flips the destination start, as the reference does.
+pub(super) fn texture(regs: &Regs) -> DrawTexture {
+    let args = &regs.draw_texture;
+    let fixed = |value: i32| value as f32 / 4096.0;
+    let step = |words: [u32; 2]| {
+        ((u64::from(words[1]) << 32) | u64::from(words[0])) as i64 as f32 / 4_294_967_296.0
+    };
+    let (width, height) = (fixed(args.dst_width), fixed(args.dst_height));
+    let mut dst_y0 = fixed(args.dst_y0);
+    if regs.window_origin.mode() != WindowOriginMode::UPPER_LEFT {
+        dst_y0 = regs.surface_clip.bits1.height() as f32 - dst_y0;
+    }
+    let (dst_x0, src_x0, src_y0) = (fixed(args.dst_x0), fixed(args.src_x0), fixed(args.src_y0));
+    DrawTexture {
+        dst_x0,
+        dst_y0,
+        dst_x1: dst_x0 + width,
+        dst_y1: dst_y0 + height,
+        src_x0,
+        src_y0,
+        src_x1: src_x0 + step(args.dx_du) * width,
+        src_y1: src_y0 + step(args.dy_dv) * height,
+        texture: args.src_texture,
+        sampler: args.src_sampler,
+    }
 }
 
 /// The topology a draw uses: the one its begin method names, unless the separate topology

@@ -103,6 +103,25 @@ pub struct IndirectDraw {
     pub count_buffer: Option<GpuVAddr>,
 }
 
+/// A DRAW_TEXTURE: one texture of the bound pool drawn over a rectangle of the render targets,
+/// outside the pipeline. Destination coordinates are render-target pixels and source coordinates
+/// texels of `texture`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DrawTexture {
+    pub dst_x0: f32,
+    pub dst_y0: f32,
+    pub dst_x1: f32,
+    pub dst_y1: f32,
+    pub src_x0: f32,
+    pub src_y0: f32,
+    pub src_x1: f32,
+    pub src_y1: f32,
+    /// Texture header index.
+    pub texture: u32,
+    /// Sampler index.
+    pub sampler: u32,
+}
+
 /// Which compute launch descriptor layout a dispatch carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QmdVersion {
@@ -371,6 +390,10 @@ pub trait Rasterizer: Send {
     /// Records draws whose commands, and optionally whose count, the GPU reads from guest memory
     /// when it executes them. State handling is the same as for [`Rasterizer::draw`].
     fn draw_indirect(&mut self, ctx: &mut GraphicsContext<'_>, draw: &IndirectDraw);
+
+    /// Draws `draw` into the render targets `ctx.regs` describes, sampling the texture and
+    /// sampler pools it binds. State handling is the same as for [`Rasterizer::draw`].
+    fn draw_texture(&mut self, _ctx: &mut GraphicsContext<'_>, _draw: &DrawTexture) {}
 
     /// Clears the render targets `regs.clear_surface` selects, over `layer_count` layers.
     fn clear(&mut self, ctx: &mut GraphicsContext<'_>, layer_count: u32);

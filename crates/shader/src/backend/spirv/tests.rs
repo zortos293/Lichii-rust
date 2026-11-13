@@ -989,3 +989,63 @@ fn tessellation_indexed_attributes_and_signed_narrow_constant_buffers() {
         }
     }
 }
+
+#[test]
+fn render_area_follows_the_rescaling_words_in_one_push_constant_block() {
+    for rescaling in [false, true] {
+        let mut s = Synthetic::new();
+        let b = s.block();
+        s.inst(b, Opcode::Prologue, &[]);
+        let area = s.inst(b, Opcode::RenderArea, &[]);
+        let mut x = s.inst(b, Opcode::CompositeExtractF32x4, &[area, Value::U32(0)]);
+        if rescaling {
+            let factor = s.inst(b, Opcode::ResolutionDownFactor, &[]);
+            x = s.inst(b, Opcode::FPMul32, &[x, factor]);
+        }
+        s.inst(
+            b,
+            Opcode::SetAttribute,
+            &[Value::Attribute(Attribute::POSITION_X), x, Value::U32(0)],
+        );
+        s.inst(b, Opcode::Epilogue, &[]);
+        let info = ShaderInfo {
+            stores: varying(&[Attribute::POSITION_X]),
+            uses_render_area: true,
+            uses_rescaling_uniform: rescaling,
+            ..ShaderInfo::default()
+        };
+        let program = s.finish(
+            vec![SyntaxNode::Block(b), SyntaxNode::Return],
+            ShaderStage::VertexB,
+            info,
+        );
+        let name = format!("render_area_rescaling_{rescaling}");
+        let module = emit(
+            &name,
+            &Profile::default(),
+            &RuntimeInfo::default(),
+            &program,
+        );
+        let push_constants = module
+            .types_global_values
+            .iter()
+            .filter(|i| {
+                i.class.opcode == Op::Variable
+                    && i.operands.first()
+                        == Some(&Operand::StorageClass(StorageClass::PushConstant))
+            })
+            .count();
+        assert_eq!(push_constants, 1, "{name}");
+        assert!(
+            module.annotations.iter().any(|i| {
+                i.class.opcode == Op::MemberDecorate
+                    && i.operands.get(2) == Some(&Operand::Decoration(Decoration::Offset))
+                    && i.operands.get(3)
+                        == Some(&Operand::LiteralBit32(super::RENDER_AREA_LAYOUT_OFFSET))
+            }),
+            "{name}"
+        );
+        let layout = ResourceLayout::for_module(&program.info, 0);
+        assert_eq!(layout.push_constant_size, 48, "{name}");
+    }
+}

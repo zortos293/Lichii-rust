@@ -101,20 +101,21 @@ impl SyncpointIncrement {
     }
 }
 
-/// One GPFIFO submission.
-#[derive(Clone, Debug, Default)]
-pub struct Submission {
+/// One GPFIFO submission. [`Gpu::submit`](crate::gpu::Gpu::submit) copies the entries, so the
+/// caller keeps and reuses its buffer.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Submission<'a> {
     /// Pushbuffer segments, read from GPU memory when the front thread reaches them.
-    pub entries: Vec<GpEntry>,
+    pub entries: &'a [GpEntry],
     /// `fence_wait`: hold the entries until this syncpoint value is reached.
     pub wait: Option<SyncpointFence>,
     /// Increments after the entries.
     pub increment: Option<SyncpointIncrement>,
 }
 
-impl Submission {
+impl<'a> Submission<'a> {
     /// A submission of `entries` without fences.
-    pub fn new(entries: Vec<GpEntry>) -> Self {
+    pub fn new(entries: &'a [GpEntry]) -> Self {
         Self {
             entries,
             wait: None,

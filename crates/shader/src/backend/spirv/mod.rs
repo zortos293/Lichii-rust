@@ -30,8 +30,9 @@ pub const RESCALING_LAYOUT_TEXTURES_OFFSET: u32 = 0;
 pub const RESCALING_LAYOUT_IMAGES_OFFSET: u32 = 16;
 /// Byte offset of the resolution down factor (graphics stages) in the rescaling block.
 pub const RESCALING_LAYOUT_DOWN_FACTOR_OFFSET: u32 = 24;
-/// Byte offset of the render area vector in the render area push constant block.
-pub const RENDER_AREA_LAYOUT_OFFSET: u32 = 0;
+/// Byte offset of the render area vector in the push constants, after the rescaling words so
+/// both fit one push constant range.
+pub const RENDER_AREA_LAYOUT_OFFSET: u32 = 32;
 
 /// Why a program could not be emitted.
 #[derive(Debug, thiserror::Error)]

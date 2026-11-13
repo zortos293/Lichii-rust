@@ -41,7 +41,6 @@ const INLINE_DATA: u32 = reg_index!(Regs, inline_data);
 const FRAGMENT_BARRIER: u32 = reg_index!(Regs, fragment_barrier);
 const INVALIDATE_TEXTURE_DATA_CACHE: u32 = reg_index!(Regs, invalidate_texture_data_cache);
 const TILED_CACHE_BARRIER: u32 = reg_index!(Regs, tiled_cache_barrier);
-const DRAW_TEXTURE: u32 = reg_index!(Regs, draw_texture.src_y0);
 
 /// The renderer's view of the engine for one call, borrowing fields one by one so that draw
 /// parameters can borrow the engine's index buffer at the same time.
@@ -207,6 +206,13 @@ impl Maxwell3d {
                     ctx.rasterizer.clear(&mut graphics!(self, ctx), 1);
                 }
             }
+            draw::DRAW_TEXTURE => {
+                if self.renders() {
+                    let texture = draw::texture(regs);
+                    ctx.rasterizer
+                        .draw_texture(&mut graphics!(self, ctx), &texture);
+                }
+            }
             REPORT_SEMAPHORE_QUERY => {
                 if let Some(query) = queries::report(regs) {
                     ctx.rasterizer.query(ctx.channel, ctx.memory, &query);
@@ -238,7 +244,6 @@ impl Maxwell3d {
                 ctx.rasterizer.invalidate_gpu_caches();
                 ctx.rasterizer.barrier();
             }
-            DRAW_TEXTURE => tracing::debug!("DRAW_TEXTURE is not supported by the renderer"),
             _ => {}
         }
     }

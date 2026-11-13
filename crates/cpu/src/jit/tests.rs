@@ -149,17 +149,24 @@ fn memory(rng: &mut Rng) -> u32 {
     }
 }
 
-/// An LSE `LD<op>`/`SWP` or `CAS` on `X20`..`X23`.
+/// An LSE `LD<op>`/`SWP`, a `CAS` or a load/store-exclusive on `X20`..`X23`.
 fn atomic(rng: &mut Rng) -> u32 {
     loop {
-        let class = if rng.below(4) == 0 {
-            "xx0010001x1xxxxxx11111xxxxxxxxxx"
-        } else {
-            "xx111000xx1xxxxxxxxx00xxxxxxxxxx"
+        let class = match rng.below(8) {
+            0 | 1 => "xx0010001x1xxxxxx11111xxxxxxxxxx",
+            2..=4 => "xx0010000xxxxxxxxxxxxxxxxxxxxxxx",
+            _ => "xx111000xx1xxxxxxxxx00xxxxxxxxxx",
         };
         let base = BASES + rng.below(4) as u32;
         let w = (rng.pattern(class) & !0x3f0) | base << 5;
-        if matches!(decode(w), Inst::AtomicRmw { .. } | Inst::Cas { .. }) {
+        if matches!(
+            decode(w),
+            Inst::AtomicRmw { .. }
+                | Inst::Cas { .. }
+                | Inst::Casp { .. }
+                | Inst::LoadExclusive { .. }
+                | Inst::StoreExclusive { .. }
+        ) {
             return w;
         }
     }
@@ -579,6 +586,80 @@ fn atomics_fault_like_the_interpreter() {
             SWPLH_W1_W3_X20,
         ] {
             directed(&[access], &[(20, addr), (1, 0x8000_0081)]);
+        }
+    }
+}
+
+#[test]
+fn exclusives_match_the_interpreter() {
+    const LDXR_X1_X20: u32 = 0xc85f_7e81;
+    const LDAXRB_W1_X20: u32 = 0x085f_fe81;
+    const LDXP_W1_W2_X20: u32 = 0x887f_0a81;
+    const STXR_W3_X4_X20: u32 = 0xc803_7e84;
+    const STLXRB_W3_W4_X20: u32 = 0x0803_fe84;
+    const STXP_W3_W4_W5_X20: u32 = 0x8823_1684;
+    const STXR_W3_X4_X21: u32 = 0xc803_7ea4;
+    const STR_X6_X20: u32 = 0xf900_0286;
+    const CLREX: u32 = 0xd503_3f5f;
+    let sequences: &[&[u32]] = &[
+        &[LDXR_X1_X20, STXR_W3_X4_X20],
+        &[LDXR_X1_X20, STXR_W3_X4_X20, STXR_W3_X4_X20],
+        &[STXR_W3_X4_X20],
+        &[LDXR_X1_X20, STXR_W3_X4_X21],
+        &[LDXR_X1_X20, STR_X6_X20, STXR_W3_X4_X20],
+        &[LDXR_X1_X20, CLREX, STXR_W3_X4_X20],
+        &[LDAXRB_W1_X20, STLXRB_W3_W4_X20],
+        &[LDAXRB_W1_X20, STXR_W3_X4_X20],
+        &[LDXP_W1_W2_X20, STXP_W3_W4_W5_X20],
+        &[LDXP_W1_W2_X20, STXR_W3_X4_X20],
+    ];
+    for code in sequences {
+        for addr in [
+            DATA + 0x100,
+            DATA + 0x101,
+            DATA + 0x104,
+            RODATA + 0x10,
+            1 << 39,
+        ] {
+            directed(
+                code,
+                &[
+                    (20, addr),
+                    (21, addr + 8),
+                    (4, 0x1234_5678_9abc_def0),
+                    (5, 7),
+                    (6, 9),
+                ],
+            );
+        }
+    }
+}
+
+#[test]
+fn casp_matches_the_interpreter() {
+    const CASP_W2_W6_X20: u32 = 0x0822_7e86;
+    const CASPAL_W2_W6_X20: u32 = 0x0862_fe86;
+    const CASP_X2_X6_X20: u32 = 0x4822_7e86;
+    for code in [CASP_W2_W6_X20, CASPAL_W2_W6_X20, CASP_X2_X6_X20] {
+        for addr in [
+            DATA + 0x100,
+            DATA + 0x104,
+            DATA + 0x108,
+            RODATA + 0x10,
+            1 << 39,
+        ] {
+            for expected in [0x5a5a_5a5a, 0x5a5a_5a5b] {
+                directed(
+                    &[code],
+                    &[
+                        (20, addr),
+                        (2, expected),
+                        (3, 0x5a5a_5a5a),
+                        (6, 0x1111),
+                        (7, 0x2222),
+                    ],
+                );
+            }
         }
     }
 }
