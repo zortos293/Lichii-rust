@@ -79,13 +79,7 @@ pub(super) fn attach(
         return lichii_kernel::result::INVALID_SIZE;
     }
     tracing::info!("nx2:gsv 204: syncpt page version {version}, {count} syncpoints");
-    let page = Page::new(
-        ro.owner().memory().clone(),
-        rw.address(),
-        ro.address(),
-        count,
-        context.gpu.host1x().syncpoints.clone(),
-    );
+    let page = Page::new(rw, ro, count, context.gpu.host1x().syncpoints.clone());
     ctx.push_copy_object(KObject::WritableEvent(page.request.clone()));
     ctx.push_copy_object(KObject::ReadableEvent(page.notify.clone()));
     *slot.0.lock() = Some(page);
@@ -96,6 +90,8 @@ struct Page {
     memory: Arc<AddressSpace>,
     rw: VAddr,
     ro: VAddr,
+    /// Held so the client cannot unlock, shrink or remap the page while it is attached.
+    _transfer: [Arc<TransferMemory>; 2],
     count: u32,
     syncpoints: Arc<Syncpoints>,
     request: Arc<Event>,
@@ -103,27 +99,30 @@ struct Page {
     watches: Mutex<Watches>,
 }
 
-/// Syncpoints with an action registered for their next increment.
+/// Syncpoints with an action registered for their next increment, and those whose watched
+/// increment came: a slot signal may have mirrored the value already, so the page value alone
+/// cannot tell that the wait is answered.
 #[derive(Default)]
 struct Watches {
     watching: [u64; WORDS],
+    incremented: [u64; WORDS],
     handles: HashMap<u32, ActionHandle>,
 }
 
 impl Page {
     fn new(
-        memory: Arc<AddressSpace>,
-        rw: VAddr,
-        ro: VAddr,
+        rw: Arc<TransferMemory>,
+        ro: Arc<TransferMemory>,
         count: u32,
         syncpoints: Arc<Syncpoints>,
     ) -> Arc<Self> {
         let page = Arc::new_cyclic(|this: &Weak<Page>| {
             let this = this.clone();
             Self {
-                memory,
-                rw,
-                ro,
+                memory: ro.owner().memory().clone(),
+                rw: rw.address(),
+                ro: ro.address(),
+                _transfer: [rw, ro],
                 count,
                 syncpoints,
                 request: Arc::new(Event::observed(move || {
@@ -166,17 +165,19 @@ impl Page {
         }
     }
 
-    /// Copies a syncpoint's value into the page; true if the page held an older one.
-    fn mirror(&self, id: u32) -> bool {
-        let Ok(value) = self.syncpoints.guest().value(id) else {
-            return false;
-        };
+    /// Copies a syncpoint's value into the page and returns it, with whether the page held an
+    /// older one. `None` for ids the page has no slot for.
+    fn mirror(&self, id: u32) -> Option<(u32, bool)> {
+        if id >= self.count {
+            return None;
+        }
+        let value = self.syncpoints.guest().value(id).ok()?;
         let address = self.ro + VALUES + u64::from(id) * 8;
         let changed = self.read(address) != u64::from(value);
         if changed {
             self.write(address, u64::from(value));
         }
-        changed
+        Some((value, changed))
     }
 
     /// Answers every armed wait whose page value is stale, and watches the rest.
@@ -186,8 +187,18 @@ impl Page {
         let mut answered = false;
         {
             let mut watches = self.watches.lock();
+            let Watches {
+                watching,
+                incremented,
+                ..
+            } = &mut *watches;
             let words = self.count.div_ceil(64) as usize;
-            for (word, watching) in watches.watching.iter_mut().enumerate().take(words) {
+            for (word, (watching, incremented)) in watching
+                .iter_mut()
+                .zip(incremented.iter_mut())
+                .enumerate()
+                .take(words)
+            {
                 let armed = self.read(self.rw + RW_BITS + word as u64 * 8);
                 let acknowledged_at = self.ro + RO_BITS + word as u64 * 8;
                 let acknowledged = self.read(acknowledged_at);
@@ -197,13 +208,17 @@ impl Page {
                     let bit = 1u64 << pending.trailing_zeros();
                     pending &= !bit;
                     let id = word as u32 * 64 + bit.trailing_zeros();
-                    if id >= self.count || self.mirror(id) {
-                        answer |= bit;
-                    } else if *watching & bit == 0 {
-                        *watching |= bit;
-                        watch.push(id);
+                    match self.mirror(id) {
+                        Some((value, false)) if *incremented & bit == 0 => {
+                            if *watching & bit == 0 {
+                                *watching |= bit;
+                                watch.push((id, value));
+                            }
+                        }
+                        _ => answer |= bit,
                     }
                 }
+                *incremented = 0;
                 if answer != 0 {
                     self.write(acknowledged_at, acknowledged ^ answer);
                     answered = true;
@@ -214,16 +229,15 @@ impl Page {
         if answered {
             self.notify.signal();
         }
-        for id in watch {
-            self.watch(id);
+        for (id, value) in watch {
+            self.watch(id, value);
         }
     }
 
-    fn watch(self: &Arc<Self>, id: u32) {
+    /// Watches for the increment after `value`, the value the wait was checked against, so an
+    /// increment since then runs the action at once.
+    fn watch(self: &Arc<Self>, id: u32, value: u32) {
         let guest = self.syncpoints.guest();
-        let Ok(value) = guest.value(id) else {
-            return;
-        };
         let this = Arc::downgrade(self);
         let registered = guest.register_action(id, value.wrapping_add(1), move || {
             if let Some(page) = this.upgrade() {
@@ -238,7 +252,9 @@ impl Page {
     fn incremented(self: &Arc<Self>, id: u32) {
         {
             let mut watches = self.watches.lock();
-            watches.watching[id as usize / 64] &= !(1 << (id % 64));
+            let (word, bit) = (id as usize / 64, 1u64 << (id % 64));
+            watches.watching[word] &= !bit;
+            watches.incremented[word] |= bit;
             watches.handles.remove(&id);
         }
         self.serve();

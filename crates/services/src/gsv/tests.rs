@@ -242,3 +242,32 @@ fn syncpt_slots_mirror_the_value_into_the_page_before_signalling() {
     assert!(slot.is_signaled());
     assert_eq!(page.value(9), 2);
 }
+
+#[test]
+fn a_slot_signal_does_not_swallow_a_page_wait_on_the_same_syncpoint() {
+    let (context, page) = syncpt_page();
+    let guest = context.gpu.host1x().syncpoints.guest();
+    let syncpt = session(&page.client, page.gsv, 202);
+    let request = Request::tipc(201).arg(0u32).arg(!9u32).arg(1u64).arg(0u32);
+    page.client.send(syncpt, &request).unwrap();
+    page.arm(9);
+    guest.increment(9).unwrap();
+    assert_eq!(page.value(9), 1);
+    assert!(page.acknowledged(9));
+    assert!(page.notify.is_signaled());
+}
+
+#[test]
+fn slots_past_the_page_count_leave_the_page_alone() {
+    let (context, page) = syncpt_page();
+    let guest = context.gpu.host1x().syncpoints.guest();
+    let syncpt = session(&page.client, page.gsv, 202);
+    let request = Request::tipc(201)
+        .arg(0u32)
+        .arg(!600u32)
+        .arg(1u64)
+        .arg(0u32);
+    page.client.send(syncpt, &request).unwrap();
+    guest.increment(600).unwrap();
+    assert_eq!(page.value(600), 0);
+}
