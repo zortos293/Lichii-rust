@@ -94,6 +94,8 @@ pub struct UiState {
 }
 
 pub const TOAST_TIME: Duration = Duration::from_secs(3);
+/// How often the window redraws a running title that presents no frames, for its status bar.
+const RUNNING_REDRAW: Duration = Duration::from_millis(250);
 /// How often a minimized window still polls the game list, installs and the title's exit.
 const MINIMIZED_POLL: Duration = Duration::from_millis(100);
 
@@ -956,7 +958,12 @@ Dump prod.keys and title.keys \
             .viewport_output
             .get(&egui::ViewportId::ROOT)
             .map_or(Duration::MAX, |v| v.repaint_delay);
-        if running || delay.is_zero() {
+        let delay = if running {
+            delay.min(RUNNING_REDRAW)
+        } else {
+            delay
+        };
+        if delay.is_zero() {
             event_loop.set_control_flow(ControlFlow::Wait);
             window.request_redraw();
         } else if let Some(at) = Instant::now().checked_add(delay) {
@@ -988,7 +995,15 @@ Dump prod.keys and title.keys \
                 .create_window(attributes)
                 .map_err(|e| format!("creating the window: {e}"))?,
         );
-        let display = Display::new(window.clone(), &self.settings.graphics, self.perf.clone())?;
+        let proxy = self.proxy.clone();
+        let display = Display::new(
+            window.clone(),
+            &self.settings.graphics,
+            self.perf.clone(),
+            move || {
+                let _ = proxy.send_event(UserEvent::Wake);
+            },
+        )?;
         self.egui_state = Some(egui_winit::State::new(
             self.egui_ctx.clone(),
             egui::ViewportId::ROOT,

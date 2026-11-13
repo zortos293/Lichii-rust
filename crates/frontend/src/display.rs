@@ -27,10 +27,12 @@ pub struct Display {
 }
 
 impl Display {
+    /// Calls `wake` from the GPU thread when a guest frame arrives that has not been drawn yet.
     pub fn new(
         window: Arc<Window>,
         settings: &GraphicsSettings,
         perf: Arc<PerfStats>,
+        wake: impl Fn() + Send + Sync + 'static,
     ) -> Result<Self, String> {
         let display = window
             .display_handle()
@@ -63,7 +65,7 @@ impl Display {
             swapchain.format(),
             settings.present_mode
         );
-        let mailbox = Arc::new(FrameMailbox::default());
+        let mailbox = Arc::new(FrameMailbox::with_wake(wake));
         let presenter = Presenter::new(&device, swapchain, settings, mailbox.clone(), perf)
             .map_err(|e| format!("creating the presenter: {e}"))?;
         Ok(Self {
