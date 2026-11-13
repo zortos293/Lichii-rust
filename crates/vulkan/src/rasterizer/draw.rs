@@ -1130,7 +1130,17 @@ impl VulkanRasterizer {
                                     desc.cbuf_offset + (i << desc.size_shift),
                                 ),
                             };
-                            let view = self.texel_view(src, raw, format, true, desc.is_written)?;
+                            let view = if numeric_mismatch(
+                                src,
+                                desc.handle_program,
+                                desc.format,
+                                desc.is_integer,
+                                raw,
+                            ) {
+                                None
+                            } else {
+                                self.texel_view(src, raw, format, true, desc.is_written)?
+                            };
                             let null = match format.and_then(|f| self.texel_format(f)) {
                                 Some(texel) => texel.format,
                                 None if desc.is_integer || format.is_some() => vk::Format::R32_UINT,
@@ -1152,7 +1162,18 @@ impl VulkanRasterizer {
                                     desc.cbuf_offset + (i << desc.size_shift),
                                 ),
                             };
-                            let Some((id, view)) = self.storage_view(src, raw, &desc)? else {
+                            let found = if numeric_mismatch(
+                                src,
+                                desc.handle_program,
+                                desc.format,
+                                desc.is_integer,
+                                raw,
+                            ) {
+                                None
+                            } else {
+                                self.storage_view(src, raw, &desc)?
+                            };
+                            let Some((id, view)) = found else {
                                 self.draw.warn_once(
                                     Warning::NullStorageImage,
                                     "a draw binds an unbound or unstorable storage image; skipping it",
@@ -2201,6 +2222,20 @@ impl VulkanRasterizer {
             self.buffer_cache.flush(&mut self.scheduler, daddr, 4)?;
         }
     }
+}
+
+/// Whether the image `raw` selects has another numeric type than the typeless access a handle
+/// program feeds was compiled for: with no header to read, the shader declared `is_integer`.
+fn numeric_mismatch(
+    src: &StageSources<'_>,
+    program: Option<u32>,
+    format: ImageFormat,
+    is_integer: bool,
+    raw: u32,
+) -> bool {
+    program.is_some()
+        && format == ImageFormat::Typeless
+        && src.pool.header(src.gmmu, raw).format.is_integer() != is_integer
 }
 
 /// The GPU address and size of storage buffer `element` of `desc`: 16-byte NVN descriptors in

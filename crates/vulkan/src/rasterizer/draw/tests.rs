@@ -2117,3 +2117,50 @@ fn handle_programs_read_the_table_words_earlier_gpu_work_wrote() {
     assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
     f.assert_no_validation_errors();
 }
+
+#[test]
+fn handle_programs_skip_typeless_image_loads_of_integer_images() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let suld = sass(Opcode::Suld, (0xf << 20) | (6 << 39) | (3 << 33) | (4 << 8));
+    let ldg = sass(
+        Opcode::Ldg,
+        (4 << 48) | (1 << 45) | (0x10 << 20) | (4 << 8) | 6,
+    );
+    let code = pixel_program(&[
+        mov_cbuf(4, 0x110),
+        mov_cbuf(5, 0x114),
+        ldg,
+        mov_u32(4, 3),
+        mov_u32(5, 5),
+        suld,
+    ]);
+    write(&f, PROGRAMS + u64::from(FRAGMENT), &code);
+    uniform_texture(&f, 0, TEXTURE, [10, 200, 30, 255]);
+    let mut integer = tic(GPU_VA + OTHER_TEXTURE, SIZE, SIZE);
+    integer[0] =
+        0x08 | 4 << 7 | 4 << 10 | 4 << 13 | 4 << 16 | 2 << 19 | 3 << 22 | 4 << 25 | 5 << 28;
+    write(&f, TIC + 32, bytemuck::cast_slice(&integer));
+    let regs = sampling_regs();
+    handle_table(&mut f, 0);
+    draw(&mut f, &gmmu, &regs);
+    assert!(
+        target(&mut f).iter().all(|&t| t == [10, 200, 30, 255]),
+        "the typeless load reads the float image the table names"
+    );
+    assert_eq!(
+        f.rasterizer.draw.warned & Warning::NullStorageImage as u32,
+        0
+    );
+
+    handle_table(&mut f, 1);
+    draw(&mut f, &gmmu, &regs);
+    assert_ne!(
+        f.rasterizer.draw.warned & Warning::NullStorageImage as u32,
+        0,
+        "an integer image under the float declaration skips the draw"
+    );
+    assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
+    f.assert_no_validation_errors();
+}
