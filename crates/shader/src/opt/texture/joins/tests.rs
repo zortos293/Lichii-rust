@@ -33,6 +33,7 @@ fn texture(cbuf_offset: u32, count: u32) -> TextureDescriptor {
         size_shift: 3,
         is_descriptor_array: count > 1,
         handle_is_pointer_word: false,
+        handle_program: None,
     }
 }
 
@@ -41,6 +42,7 @@ fn texture_buffer(cbuf_offset: u32) -> TextureBufferDescriptor {
         handle: source(cbuf_offset),
         count: 1,
         size_shift: 3,
+        handle_program: None,
     }
 }
 
@@ -56,6 +58,7 @@ fn image(cbuf_offset: u32) -> ImageDescriptor {
         count: 1,
         size_shift: 3,
         is_byte_addressed: false,
+        handle_program: None,
     }
 }
 
@@ -69,6 +72,7 @@ fn image_buffer(cbuf_offset: u32) -> ImageBufferDescriptor {
         cbuf_offset,
         count: 1,
         size_shift: 3,
+        handle_program: None,
     }
 }
 
@@ -377,4 +381,36 @@ fn shared_stage_limits_count_other_resources_of_every_program() {
     .unwrap();
     assert_eq!(task_info.texture_descriptors[0].count, 3);
     assert_eq!(mesh_info.texture_descriptors[0].count, 3);
+}
+
+#[test]
+fn joined_handle_programs_are_shared_or_appended() {
+    use crate::handle::{HandleOp, HandleProgram};
+
+    let storage = |binding| {
+        HandleProgram::new(vec![
+            HandleOp::Immediate(0x10),
+            HandleOp::Storage { binding },
+        ])
+        .unwrap()
+    };
+    let with_program = |program| TextureDescriptor {
+        handle: HandleSource::default(),
+        handle_program: Some(program),
+        ..texture(0, 1)
+    };
+    let mut base = ShaderInfo {
+        texture_descriptors: vec![with_program(0)],
+        handle_programs: vec![storage(0)],
+        ..ShaderInfo::default()
+    };
+    let second = ShaderInfo {
+        texture_descriptors: vec![with_program(0), with_program(1)],
+        handle_programs: vec![storage(1), storage(0)],
+        ..ShaderInfo::default()
+    };
+    let joined = join_texture_info(&mut base, &second);
+    assert_eq!(base.handle_programs, [storage(0), storage(1)]);
+    assert_eq!(joined.textures, [1, 0]);
+    assert_eq!(base.texture_descriptors[1].handle_program, Some(1));
 }

@@ -1,6 +1,7 @@
 //! What a translated program uses, so the renderer can build descriptor set layouts, vertex
 //! input state and pipeline state. Filled by the collect-info, storage buffer and texture passes.
 
+use crate::handle::HandleProgram;
 use crate::ir::{Attribute, ImageFormat, TextureType, Type};
 
 /// One bit per attribute (indexed by `Attribute.0`).
@@ -166,6 +167,10 @@ pub struct TextureBufferDescriptor {
     /// Array length; consecutive handles are `1 << size_shift` bytes apart.
     pub count: u32,
     pub size_shift: u32,
+    /// Index in [`ShaderInfo::handle_programs`] of the program computing the handle for each
+    /// draw (a handle read from a storage buffer); `None` when the handle is the constant buffer
+    /// word above.
+    pub handle_program: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -178,6 +183,10 @@ pub struct ImageBufferDescriptor {
     pub cbuf_offset: u32,
     pub count: u32,
     pub size_shift: u32,
+    /// Index in [`ShaderInfo::handle_programs`] of the program computing the handle for each
+    /// draw (a handle read from a storage buffer); `None` when the handle is the constant buffer
+    /// word above.
+    pub handle_program: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -192,9 +201,14 @@ pub struct TextureDescriptor {
     /// The shader indexes the descriptor, so the descriptor limits may shrink `count`; it stays
     /// set when they cut the array to one element.
     pub is_descriptor_array: bool,
-    /// The handle word only reaches the handle as the address of a memory load: a pointer, not
-    /// a texture handle, so the renderer binds no texture.
+    /// The renderer binds no texture: the handle has no value a draw can compute (the shader
+    /// changes it in a loop, or reads it per invocation from memory no table describes).
     pub handle_is_pointer_word: bool,
+    /// Index in [`ShaderInfo::handle_programs`] of the program computing the handle for each
+    /// draw (a handle read from a storage buffer); `None` when the handle is the constant buffer
+    /// word above. With a `count` above 1 the program computes the handle of each element
+    /// ([`crate::handle::HandleOp::Index`]): a table entry the shader picks per invocation.
+    pub handle_program: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -210,6 +224,10 @@ pub struct ImageDescriptor {
     pub size_shift: u32,
     /// Stores address X in bytes; the program writes 32-bit texels at `x >> 2`.
     pub is_byte_addressed: bool,
+    /// Index in [`ShaderInfo::handle_programs`] of the program computing the handle for each
+    /// draw (a handle read from a storage buffer); `None` when the handle is the constant buffer
+    /// word above.
+    pub handle_program: Option<u32>,
 }
 
 /// Task and mesh program layout (Switch 2 NVN task/mesh, see NX2_NOTES row 89).
@@ -314,9 +332,6 @@ pub struct ShaderInfo {
     /// Some global accesses stayed global with several bound candidate buffers; the backend
     /// picks the buffer at run time from the bound pointers (Switch 2 native programs).
     pub native_global_bounds: bool,
-    /// A texture descriptor takes a pointer word (see
-    /// [`TextureDescriptor::handle_is_pointer_word`]) that no storage buffer descriptor maps.
-    pub binds_unmapped_pointer_word: bool,
 
     pub used_constant_buffer_types: Type,
     pub used_storage_buffer_types: Type,
@@ -336,6 +351,9 @@ pub struct ShaderInfo {
     pub texture_buffer_descriptors: Vec<TextureBufferDescriptor>,
     pub image_buffer_descriptors: Vec<ImageBufferDescriptor>,
     pub texture_descriptors: Vec<TextureDescriptor>,
+    /// Texture handles the shader reads from storage buffers, computed for each draw; the
+    /// descriptors name them by index.
+    pub handle_programs: Vec<HandleProgram>,
     pub image_descriptors: Vec<ImageDescriptor>,
 
     pub mesh: MeshInfo,

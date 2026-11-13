@@ -4,7 +4,6 @@ use lichii_common::GpuVAddr;
 use rustc_hash::FxHashMap;
 
 use super::*;
-use crate::info::StorageBufferDescriptor;
 use crate::ir::SyntaxNode;
 use crate::opt::compute_post_order;
 
@@ -598,10 +597,31 @@ fn snorm_texel_buffer_fetch_converts_its_components() {
 }
 
 #[test]
-fn untracked_bindless_handle_is_an_error() {
+fn handle_without_a_per_draw_value_binds_no_texture() {
     let (mut prog, b) = program(1);
     let handle = lane(&mut prog, b[0]);
-    sample(&mut prog, b[0], handle);
+    let id = sample(&mut prog, b[0], handle);
+    let shader = run(&Env::default(), &mut prog, &host(1024));
+    let desc = shader.texture_descriptors[0];
+    assert!(desc.handle_is_pointer_word);
+    assert_eq!(desc.handle_program, None);
+    assert!(shader.handle_programs.is_empty());
+    assert_eq!(prog.op(id), Opcode::ImageSampleImplicitLod);
+
+    let (mut prog, b) = program(1);
+    let handle = lane(&mut prog, b[0]);
+    let coords = prog.append(
+        b[0],
+        Opcode::CompositeConstructU32x2,
+        &[Value::U32(1), Value::U32(2)],
+        0,
+    );
+    prog.append(
+        b[0],
+        Opcode::BindlessImageRead,
+        &[handle, Value::Inst(coords)],
+        info(TextureType::Color2D).to_flags(),
+    );
     compute_post_order(&mut prog);
     let result = texture_pass(
         &Env::default(),
@@ -611,44 +631,203 @@ fn untracked_bindless_handle_is_an_error() {
     );
     assert_eq!(
         result,
-        Err(TextureError::UntrackedHandle(
-            Opcode::BindlessImageSampleImplicitLod
-        ))
+        Err(TextureError::UntrackedHandle(Opcode::BindlessImageRead))
     );
 }
 
-fn loaded_handle(prog: &mut Program, block: BlockId) {
-    let address = cbuf(prog, block, 1, Value::U32(0x30));
-    let handle = prog.append(block, Opcode::LoadStorage32, &[Value::U32(0), address], 0);
-    sample(prog, block, Value::Inst(handle));
+/// A handle read from storage buffer 0 at the byte offset c[1][0x30] + 0x10.
+fn table_handle(prog: &mut Program, block: BlockId) -> Value {
+    let base = cbuf(prog, block, 1, Value::U32(0x30));
+    let address = prog.append(block, Opcode::IAdd32, &[base, Value::U32(0x10)], 0);
+    Value::Inst(prog.append(
+        block,
+        Opcode::LoadStorage32,
+        &[Value::U32(0), Value::Inst(address)],
+        0,
+    ))
 }
 
 #[test]
-fn handle_loaded_through_a_pointer_binds_no_texture() {
-    let (mut prog, b) = program(1);
-    loaded_handle(&mut prog, b[0]);
-    let info = run(&Env::default(), &mut prog, &host(1024));
-    let desc = info.texture_descriptors[0];
-    assert_eq!(desc.handle, word_source(1, 0x30));
-    assert!(desc.handle_is_pointer_word);
-    assert!(info.binds_unmapped_pointer_word);
+fn handle_read_from_a_storage_buffer_becomes_a_handle_program() {
+    use crate::handle::HandleOp;
 
     let (mut prog, b) = program(1);
-    loaded_handle(&mut prog, b[0]);
-    let mut info = ShaderInfo::default();
-    info.storage_buffers_descriptors
-        .push(StorageBufferDescriptor {
-            cbuf_index: 1,
-            cbuf_offset: 0x30,
-            count: 1,
-            is_written: false,
-            indirect_offset: StorageBufferDescriptor::DIRECT,
-            write_extent: Default::default(),
-        });
-    compute_post_order(&mut prog);
-    texture_pass(&Env::default(), &mut prog, &mut info, &host(1024)).unwrap();
+    let handle = table_handle(&mut prog, b[0]);
+    let first = sample(&mut prog, b[0], handle);
+    let second = sample(&mut prog, b[0], handle);
+    let env = Env::default();
+    let info = run(&env, &mut prog, &host(1024));
+
+    assert_eq!(info.texture_descriptors.len(), 1);
+    let desc = info.texture_descriptors[0];
+    assert_eq!(desc.handle_program, Some(0));
+    assert!(!desc.handle_is_pointer_word);
+    assert_eq!(desc.count, 1);
+    assert_eq!(
+        info.handle_programs[0].ops(),
+        [
+            HandleOp::Cbuf {
+                index: 1,
+                offset: 0x30
+            },
+            HandleOp::Immediate(0x10),
+            HandleOp::Add,
+            HandleOp::Storage { binding: 0 },
+        ]
+    );
+    for id in [first, second] {
+        assert_eq!(flags_of(&prog, id).descriptor_index, 0);
+        assert_eq!(prog.arg(id, 0), Value::Void);
+    }
+    assert_eq!(
+        env.type_reads.get(),
+        0,
+        "a handle program reads no descriptor now"
+    );
+
+    let memory = |offset: u32| if offset == 0x110 { 0x0004_0003 } else { 0 };
+    let handle = info.handle_programs[0].evaluate(
+        |index, offset| {
+            if (index, offset) == (1, 0x30) {
+                0x100
+            } else {
+                0
+            }
+        },
+        |binding, offset| if binding == 0 { memory(offset) } else { 0 },
+        0,
+    );
+    assert_eq!(handle, 0x0004_0003);
+}
+
+#[test]
+fn shared_subexpressions_are_kept_in_slots() {
+    use crate::handle::HandleOp;
+
+    let (mut prog, b) = program(1);
+    let word = cbuf(&mut prog, b[0], 1, Value::U32(0x30));
+    let doubled = prog.append(b[0], Opcode::IAdd32, &[word, word], 0);
+    let handle = prog.append(
+        b[0],
+        Opcode::LoadStorage32,
+        &[Value::U32(0), Value::Inst(doubled)],
+        0,
+    );
+    sample(&mut prog, b[0], Value::Inst(handle));
+    let info = run(&Env::default(), &mut prog, &host(1024));
+    assert_eq!(
+        info.handle_programs[0].ops(),
+        [
+            HandleOp::Cbuf {
+                index: 1,
+                offset: 0x30
+            },
+            HandleOp::Tee(0),
+            HandleOp::Load(0),
+            HandleOp::Add,
+            HandleOp::Storage { binding: 0 },
+        ]
+    );
+}
+
+/// A handle read from storage buffer 1 at an index each invocation reads from storage buffer 0,
+/// scaled to 8-byte entries.
+fn indexed_table_handle(prog: &mut Program, block: BlockId) -> (Value, InstId) {
+    let lane = lane(prog, block);
+    let slot = prog.append(block, Opcode::ShiftLeftLogical32, &[lane, Value::U32(2)], 0);
+    let index = prog.append(
+        block,
+        Opcode::LoadStorage32,
+        &[Value::U32(0), Value::Inst(slot)],
+        0,
+    );
+    let entry = prog.append(
+        block,
+        Opcode::ShiftLeftLogical32,
+        &[Value::Inst(index), Value::U32(3)],
+        0,
+    );
+    let handle = prog.append(
+        block,
+        Opcode::LoadStorage32,
+        &[Value::U32(1), Value::Inst(entry)],
+        0,
+    );
+    (Value::Inst(handle), index)
+}
+
+#[test]
+fn per_invocation_table_index_becomes_a_descriptor_array() {
+    use crate::handle::HandleOp;
+
+    let tables = HostTranslateInfo {
+        support_handle_table_arrays: true,
+        ..host(1024)
+    };
+    let (mut prog, b) = program(1);
+    let (handle, index) = indexed_table_handle(&mut prog, b[0]);
+    let id = sample(&mut prog, b[0], handle);
+    let info = run(&Env::default(), &mut prog, &tables);
+    let desc = info.texture_descriptors[0];
+    assert_eq!(desc.handle_program, Some(0));
+    assert_eq!((desc.count, desc.size_shift), (64, 0));
+    assert!(desc.is_descriptor_array);
+    assert_eq!(
+        info.handle_programs[0].ops(),
+        [
+            HandleOp::Index,
+            HandleOp::Immediate(3),
+            HandleOp::Shl,
+            HandleOp::Storage { binding: 1 },
+        ]
+    );
+    let element = inst_of(&prog, prog.arg(id, 0));
+    assert_eq!(prog.op(element), Opcode::UMin32);
+    assert_eq!(prog.arg(element, 0), Value::Inst(index));
+    assert_eq!(prog.arg(element, 1), Value::U32(63));
+
+    let (mut prog, b) = program(1);
+    let (handle, _) = indexed_table_handle(&mut prog, b[0]);
+    sample(&mut prog, b[0], handle);
+    let info = run(&Env::default(), &mut prog, &host(1024));
     assert!(info.texture_descriptors[0].handle_is_pointer_word);
-    assert!(!info.binds_unmapped_pointer_word);
+    assert!(info.handle_programs.is_empty());
+}
+
+#[test]
+fn handle_carried_by_a_loop_binds_no_texture() {
+    let (mut prog, b) = program(2);
+    prog.add_branch(b[0], b[1]);
+    prog.add_branch(b[1], b[1]);
+    let phi = prog.append(b[1], Opcode::Phi, &[], 0);
+    let start = cbuf(&mut prog, b[0], 1, Value::U32(0x30));
+    let next = prog.append(
+        b[1],
+        Opcode::LoadStorage32,
+        &[Value::U32(0), Value::Inst(phi)],
+        0,
+    );
+    prog.add_phi_operand(phi, b[0], start);
+    prog.add_phi_operand(phi, b[1], Value::Inst(next));
+    sample(&mut prog, b[1], Value::Inst(next));
+    let info = run(&Env::default(), &mut prog, &host(1024));
+    assert!(info.texture_descriptors[0].handle_is_pointer_word);
+    assert!(info.handle_programs.is_empty());
+}
+
+#[test]
+fn loop_invariant_handle_builds_from_its_entry_value() {
+    let (mut prog, b) = program(2);
+    prog.add_branch(b[0], b[1]);
+    prog.add_branch(b[1], b[1]);
+    let phi = prog.append(b[1], Opcode::Phi, &[], 0);
+    let start = table_handle(&mut prog, b[0]);
+    prog.add_phi_operand(phi, b[0], start);
+    prog.add_phi_operand(phi, b[1], Value::Inst(phi));
+    sample(&mut prog, b[1], Value::Inst(phi));
+    let info = run(&Env::default(), &mut prog, &host(1024));
+    assert_eq!(info.texture_descriptors[0].handle_program, Some(0));
+    assert_eq!(info.handle_programs.len(), 1);
 }
 
 #[test]
@@ -764,6 +943,7 @@ fn texture(count: u32, is_descriptor_array: bool) -> TextureDescriptor {
         size_shift: 3,
         is_descriptor_array,
         handle_is_pointer_word: false,
+        handle_program: None,
     }
 }
 

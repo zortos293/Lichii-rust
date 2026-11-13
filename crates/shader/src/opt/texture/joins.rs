@@ -5,7 +5,9 @@ use super::{
     Descriptors, TextureError, cap_texture_arrays, is_sampled_image, is_storage_image,
     is_texture_array, other_resource_count, texture_buffer_count, texture_count,
 };
-use crate::info::ShaderInfo;
+use crate::info::{
+    ImageBufferDescriptor, ImageDescriptor, ShaderInfo, TextureBufferDescriptor, TextureDescriptor,
+};
 use crate::ir::{Opcode, Program, TextureInstInfo, TextureType, Value};
 use crate::profile::HostTranslateInfo;
 
@@ -29,28 +31,63 @@ pub struct JoinedDescriptors {
 /// Point the source program's instructions at them with [`remap_texture_descriptors`].
 pub fn join_texture_info(base: &mut ShaderInfo, source: &ShaderInfo) -> JoinedDescriptors {
     base.requires_coherent_image_memory |= source.requires_coherent_image_memory;
-    base.binds_unmapped_pointer_word |= source.binds_unmapped_pointer_word;
+    let programs: Vec<u32> = source
+        .handle_programs
+        .iter()
+        .map(|program| {
+            let index = base.handle_programs.iter().position(|p| p == program);
+            index.unwrap_or_else(|| {
+                base.handle_programs.push(program.clone());
+                base.handle_programs.len() - 1
+            }) as u32
+        })
+        .collect();
+    let program = |index: Option<u32>| index.map(|i| programs[i as usize]);
     let mut descriptors = Descriptors::new(base);
     JoinedDescriptors {
         texture_buffers: source
             .texture_buffer_descriptors
             .iter()
-            .map(|&d| descriptors.texture_buffer(&mut base.texture_buffer_descriptors, d) as u32)
+            .map(|&d| {
+                let d = TextureBufferDescriptor {
+                    handle_program: program(d.handle_program),
+                    ..d
+                };
+                descriptors.texture_buffer(&mut base.texture_buffer_descriptors, d) as u32
+            })
             .collect(),
         image_buffers: source
             .image_buffer_descriptors
             .iter()
-            .map(|&d| descriptors.image_buffer(&mut base.image_buffer_descriptors, d) as u32)
+            .map(|&d| {
+                let d = ImageBufferDescriptor {
+                    handle_program: program(d.handle_program),
+                    ..d
+                };
+                descriptors.image_buffer(&mut base.image_buffer_descriptors, d) as u32
+            })
             .collect(),
         textures: source
             .texture_descriptors
             .iter()
-            .map(|&d| descriptors.texture(&mut base.texture_descriptors, d) as u32)
+            .map(|&d| {
+                let d = TextureDescriptor {
+                    handle_program: program(d.handle_program),
+                    ..d
+                };
+                descriptors.texture(&mut base.texture_descriptors, d) as u32
+            })
             .collect(),
         images: source
             .image_descriptors
             .iter()
-            .map(|&d| descriptors.image(&mut base.image_descriptors, d) as u32)
+            .map(|&d| {
+                let d = ImageDescriptor {
+                    handle_program: program(d.handle_program),
+                    ..d
+                };
+                descriptors.image(&mut base.image_descriptors, d) as u32
+            })
             .collect(),
     }
 }

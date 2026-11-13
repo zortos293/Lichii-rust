@@ -4,7 +4,10 @@
 //! Ampere a constant buffer slot and offset ([`TextureInstInfo::bound_handle`]). A bindless
 //! handle is tracked back to the constant buffer words it is built from: one word, a word ORed
 //! with a separate sampler word, or a word at a dynamic offset (an indexed descriptor array).
-//! Tracking and descriptor reads are memoized, so the pass is linear in the program size.
+//! A handle no constant buffer word gives (read from a storage buffer table, NVN2's usual
+//! layout) becomes a handle program the renderer evaluates for each draw ([`handle`]); one
+//! with no per-draw value binds no texture. Tracking, program building and descriptor reads
+//! are memoized, so the pass is linear in the program size.
 
 use std::collections::VecDeque;
 use std::hash::Hash;
@@ -13,6 +16,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
+use crate::handle::HandleProgram;
 use crate::info::{
     HandleSource, ImageBufferDescriptor, ImageDescriptor, ShaderInfo, TextureBufferDescriptor,
     TextureDescriptor, TexturePixelFormat,
@@ -24,6 +28,7 @@ use crate::ir::{
 use crate::profile::HostTranslateInfo;
 use crate::{ShaderArch, ShaderEnvironment, ShaderStage};
 
+mod handle;
 mod joins;
 #[cfg(test)]
 mod tests;
@@ -36,6 +41,9 @@ pub use joins::{
 const DESCRIPTOR_SIZE: u32 = 8;
 const DESCRIPTOR_SIZE_SHIFT: u32 = DESCRIPTOR_SIZE.trailing_zeros();
 const DESCRIPTOR_MAX_COUNT: u32 = 1024;
+/// Elements of the descriptor array of a handle read from a table at a per-invocation index:
+/// the table entries a draw binds, larger indices taking the last one.
+const HANDLE_TABLE_SIZE: u32 = 64;
 const FLOAT_TYPES: Type = Type::F16
     .union(Type::F32)
     .union(Type::F64)
@@ -83,6 +91,10 @@ pub enum TextureError {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct CbufAddr {
     handle: HandleSource,
+    /// Index of the handle program computing the handle, which then reads no word.
+    program: Option<u32>,
+    /// The handle has no per-draw value: the descriptor binds no texture.
+    unbound: bool,
     /// Byte offset added to `handle.cbuf_offset` by each invocation; `Void` for one handle.
     dynamic_offset: Value,
     /// Handles the dynamic offset may select.
@@ -97,17 +109,22 @@ impl CbufAddr {
                 cbuf_offset,
                 ..HandleSource::default()
             },
+            program: None,
+            unbound: false,
             dynamic_offset: Value::Void,
             count: 1,
         }
+    }
+
+    /// Whether the handle is constant buffer words the translator can read now.
+    fn is_word(&self) -> bool {
+        self.program.is_none() && !self.unbound
     }
 }
 
 struct TextureInst {
     cbuf: CbufAddr,
     inst: InstId,
-    /// The handle word reaches the handle only as the address of a load.
-    pointer_word: bool,
 }
 
 /// The block of a texture instruction, for conditional phi resolution. `key` is `None` when
@@ -392,6 +409,8 @@ fn dynamic_descriptor_count(base_offset: u32, size_shift: u32, max_descriptors: 
 fn descriptor_size_shift(prog: &Program, cbuf: &CbufAddr) -> u32 {
     if cbuf.count <= 1 {
         DESCRIPTOR_SIZE_SHIFT
+    } else if cbuf.program.is_some() {
+        0
     } else {
         dynamic_descriptor_size_shift(prog, cbuf.dynamic_offset)
     }
@@ -480,12 +499,19 @@ fn dynamic_sampled_texture_cap(
         .max(1)
 }
 
-type ImageBufferKey = (ImageFormat, u32, u32, u32, u32);
-type TextureKey = (TextureType, bool, HandleSource, u32, u32, bool);
-type ImageKey = (TextureType, ImageFormat, u32, u32, u32, u32);
+type ImageBufferKey = (ImageFormat, u32, u32, u32, u32, Option<u32>);
+type TextureKey = (TextureType, bool, HandleSource, u32, u32, bool, Option<u32>);
+type ImageKey = (TextureType, ImageFormat, u32, u32, u32, u32, Option<u32>);
 
 fn image_buffer_key(d: &ImageBufferDescriptor) -> ImageBufferKey {
-    (d.format, d.cbuf_index, d.cbuf_offset, d.count, d.size_shift)
+    (
+        d.format,
+        d.cbuf_index,
+        d.cbuf_offset,
+        d.count,
+        d.size_shift,
+        d.handle_program,
+    )
 }
 
 fn texture_key(d: &TextureDescriptor) -> TextureKey {
@@ -496,6 +522,7 @@ fn texture_key(d: &TextureDescriptor) -> TextureKey {
         d.count,
         d.size_shift,
         d.handle_is_pointer_word,
+        d.handle_program,
     )
 }
 
@@ -507,6 +534,7 @@ fn image_key(d: &ImageDescriptor) -> ImageKey {
         d.cbuf_offset,
         d.count,
         d.size_shift,
+        d.handle_program,
     )
 }
 
@@ -604,7 +632,14 @@ struct Tracker<'a> {
     integers: FxHashMap<HandleSource, bool>,
     phis: FxHashMap<(InstId, BlockId), Value>,
     tracked: FxHashMap<TrackKey, Option<CbufAddr>>,
-    fallbacks: FxHashMap<TrackKey, Option<(CbufAddr, bool)>>,
+    /// The handle program and table index word built for a search start.
+    built: FxHashMap<TrackKey, Option<(u32, Option<InstId>)>>,
+    programs: Vec<HandleProgram>,
+    program_indices: FxHashMap<HandleProgram, u32>,
+    /// The texture type of each handle program's instructions, for size queries, which name
+    /// none.
+    program_types: FxHashMap<u32, TextureType>,
+    dominance: Option<handle::Dominance>,
 }
 
 impl<'a> Tracker<'a> {
@@ -618,7 +653,11 @@ impl<'a> Tracker<'a> {
             integers: FxHashMap::default(),
             phis: FxHashMap::default(),
             tracked: FxHashMap::default(),
-            fallbacks: FxHashMap::default(),
+            built: FxHashMap::default(),
+            programs: Vec::new(),
+            program_indices: FxHashMap::default(),
+            program_types: FxHashMap::default(),
+            dominance: None,
         }
     }
 
@@ -648,7 +687,14 @@ impl<'a> Tracker<'a> {
         handle
     }
 
-    fn texture_type(&mut self, source: HandleSource) -> TextureType {
+    /// The texture type of the descriptor a handle selects. Handle programs have no descriptor
+    /// to read now: they take the type their other instructions name, else 2D.
+    fn texture_type(&mut self, cbuf: &CbufAddr) -> TextureType {
+        if !cbuf.is_word() {
+            let program = cbuf.program.and_then(|p| self.program_types.get(&p));
+            return program.copied().unwrap_or(TextureType::Color2D);
+        }
+        let source = cbuf.handle;
         if let Some(&ty) = self.types.get(&source) {
             return ty;
         }
@@ -658,7 +704,11 @@ impl<'a> Tracker<'a> {
         ty
     }
 
-    fn is_integer(&mut self, source: HandleSource) -> bool {
+    fn is_integer(&mut self, cbuf: &CbufAddr) -> bool {
+        if !cbuf.is_word() {
+            return false;
+        }
+        let source = cbuf.handle;
         if let Some(&integer) = self.integers.get(&source) {
             return integer;
         }
@@ -668,8 +718,11 @@ impl<'a> Tracker<'a> {
         integer
     }
 
-    fn pixel_format(&mut self, source: HandleSource) -> TexturePixelFormat {
-        let handle = self.handle(source);
+    fn pixel_format(&mut self, cbuf: &CbufAddr) -> TexturePixelFormat {
+        if !cbuf.is_word() {
+            return TexturePixelFormat::A8b8g8r8Unorm;
+        }
+        let handle = self.handle(cbuf.handle);
         self.env.texture_pixel_format(handle)
     }
 
@@ -677,10 +730,9 @@ impl<'a> Tracker<'a> {
     /// descriptor's; a 1D fetch from a texture buffer becomes a buffer fetch.
     fn resolved_type(&mut self, op: Opcode, ty: TextureType, cbuf: &CbufAddr) -> TextureType {
         match op {
-            Opcode::ImageQueryDimensions => self.texture_type(cbuf.handle),
+            Opcode::ImageQueryDimensions => self.texture_type(cbuf),
             Opcode::ImageFetch
-                if ty == TextureType::Color1D
-                    && self.texture_type(cbuf.handle) == TextureType::Buffer =>
+                if ty == TextureType::Color1D && self.texture_type(cbuf) == TextureType::Buffer =>
             {
                 TextureType::Buffer
             }
@@ -717,72 +769,29 @@ impl<'a> Tracker<'a> {
             return found;
         }
         self.tracked.insert(key, None);
-        let found = self.search(prog, start, ctx, false).map(|(cbuf, _)| cbuf);
+        let found = self.search(prog, start, ctx);
         self.tracked.insert(key, found);
         found
     }
 
-    /// The search for handles [`Self::track`] misses, through every operation, loads included,
-    /// and whether the word it finds only addresses a load (a pointer word).
-    fn fallback(&mut self, prog: &Program, value: Value, ctx: Ctx) -> Option<(CbufAddr, bool)> {
-        let start = self.start(prog, value, ctx)?;
-        let key = (start, ctx.key);
-        if let Some(&found) = self.fallbacks.get(&key) {
-            return found;
-        }
-        let found = self
-            .search(prog, start, ctx, true)
-            .map(|(cbuf, word)| (cbuf, !self.reaches_outside_loads(prog, start, word, ctx)));
-        self.fallbacks.insert(key, found);
-        found
-    }
-
-    fn search(
-        &mut self,
-        prog: &Program,
-        start: InstId,
-        ctx: Ctx,
-        through_loads: bool,
-    ) -> Option<(CbufAddr, InstId)> {
+    fn search(&mut self, prog: &Program, start: InstId, ctx: Ctx) -> Option<CbufAddr> {
         let mut visited = FxHashSet::default();
         visited.insert(start);
         let mut queue = VecDeque::from([start]);
         while let Some(inst) = queue.pop_front() {
             if let Some(found) = self.try_get_const_buffer(prog, inst, ctx) {
-                return Some((found, inst));
+                return Some(found);
             }
             let op = prog.op(inst);
-            if !through_loads
-                && (is_memory_load(op)
-                    || indexed(op).is_some()
-                    || prog.type_of(Value::Inst(inst)).intersects(FLOAT_TYPES))
+            if is_memory_load(op)
+                || indexed(op).is_some()
+                || prog.type_of(Value::Inst(inst)).intersects(FLOAT_TYPES)
             {
                 continue;
             }
             self.queue_args(prog, inst, ctx, &mut visited, &mut queue);
         }
         None
-    }
-
-    fn reaches_outside_loads(
-        &mut self,
-        prog: &Program,
-        start: InstId,
-        target: InstId,
-        ctx: Ctx,
-    ) -> bool {
-        let mut visited = FxHashSet::default();
-        visited.insert(start);
-        let mut queue = VecDeque::from([start]);
-        while let Some(inst) = queue.pop_front() {
-            if inst == target {
-                return true;
-            }
-            if !is_memory_load(prog.op(inst)) {
-                self.queue_args(prog, inst, ctx, &mut visited, &mut queue);
-            }
-        }
-        false
     }
 
     fn queue_args(
@@ -898,6 +907,8 @@ impl<'a> Tracker<'a> {
                 cbuf_offset: base_offset,
                 ..HandleSource::default()
             },
+            program: None,
+            unbound: false,
             dynamic_offset,
             count: dynamic_descriptor_count(base_offset, size_shift, max_descriptors),
         })
@@ -920,37 +931,94 @@ impl<'a> Tracker<'a> {
             return Ok(TextureInst {
                 cbuf: CbufAddr::word(index, offset),
                 inst,
-                pointer_word: false,
             });
         }
-        if let Some(cbuf) = self.track(prog, handle, ctx) {
-            return Ok(TextureInst {
-                cbuf,
-                inst,
-                pointer_word: false,
-            });
+        if let Some(cbuf) = self
+            .track(prog, handle, ctx)
+            .or_else(|| self.handle_program(prog, inst, ctx))
+        {
+            return Ok(TextureInst { cbuf, inst });
         }
-        let (cbuf, pointer_word) = self
-            .fallback(prog, handle, ctx)
-            .ok_or(TextureError::UntrackedHandle(op))?;
+        let (image_op, _) = indexed(op).expect("collected texture instruction");
+        let flags = TextureInstInfo::from_flags(prog.inst(inst).flags);
+        if is_storage_image(image_op) || flags.ty == TextureType::Buffer {
+            return Err(TextureError::UntrackedHandle(op));
+        }
         static WARNINGS: AtomicU32 = AtomicU32::new(0);
         if WARNINGS.fetch_add(1, Ordering::Relaxed) < 32 {
-            tracing::warn!(
-                "bindless {op:?} handle is no constant buffer word: taking cbuf{}+{:#x}{}",
-                cbuf.handle.cbuf_index,
-                cbuf.handle.cbuf_offset,
-                if pointer_word {
-                    ", a pointer: no texture"
-                } else {
-                    ", likely not the texture the shader reads"
-                }
-            );
+            tracing::warn!("bindless {op:?} handle has no per-draw value: binding no texture");
         }
-        Ok(TextureInst {
-            cbuf,
-            inst,
-            pointer_word,
+        let cbuf = CbufAddr {
+            unbound: true,
+            ..CbufAddr::word(0, 0)
+        };
+        Ok(TextureInst { cbuf, inst })
+    }
+
+    /// The handle program computing `inst`'s handle from constant buffer and storage buffer
+    /// words. A sampled texture whose handle comes from a table at a per-invocation index
+    /// becomes a descriptor array of the table's entries, when the host binds such arrays and
+    /// the index is defined wherever `inst` runs.
+    fn handle_program(&mut self, prog: &Program, inst: InstId, ctx: Ctx) -> Option<CbufAddr> {
+        let handle = prog.arg(inst, 0);
+        let key = (self.start(prog, handle, ctx)?, ctx.key);
+        let built = match self.built.get(&key) {
+            Some(&built) => built,
+            None => {
+                let (image_op, _) = indexed(prog.op(inst)).expect("collected texture instruction");
+                let ty = TextureInstInfo::from_flags(prog.inst(inst).flags).ty;
+                let tables = self.host.support_handle_table_arrays
+                    && !is_storage_image(image_op)
+                    && ty != TextureType::Buffer;
+                let dominance = &*self
+                    .dominance
+                    .get_or_insert_with(|| handle::Dominance::new(prog));
+                let result =
+                    handle::build(prog, dominance, handle, ctx, false).or_else(|failure| {
+                        if tables {
+                            handle::build(prog, dominance, handle, ctx, true)
+                        } else {
+                            Err(failure)
+                        }
+                    });
+                let built = match result {
+                    Ok(built) => Some((self.intern(built.program), built.index)),
+                    Err(failure) => {
+                        tracing::debug!("handle program stopped at {failure:?}");
+                        None
+                    }
+                };
+                self.built.insert(key, built);
+                built
+            }
+        };
+        let (program, index) = built?;
+        let index = index.filter(|&index| {
+            self.dominance
+                .get_or_insert_with(|| handle::Dominance::new(prog))
+                .dominates(prog, index, inst)
+        });
+        Some(CbufAddr {
+            handle: HandleSource::default(),
+            program: Some(program),
+            unbound: false,
+            dynamic_offset: index.map_or(Value::Void, Value::Inst),
+            count: if index.is_some() {
+                HANDLE_TABLE_SIZE
+            } else {
+                1
+            },
         })
+    }
+
+    fn intern(&mut self, program: HandleProgram) -> u32 {
+        if let Some(&index) = self.program_indices.get(&program) {
+            return index;
+        }
+        let index = self.programs.len() as u32;
+        self.programs.push(program.clone());
+        self.program_indices.insert(program, index);
+        index
     }
 }
 
@@ -961,10 +1029,10 @@ impl<'a> Tracker<'a> {
 /// Texture types an instruction leaves open come from [`ShaderEnvironment::texture_type`].
 /// `host` limits must be set: the C++ replaces unset (zero) ones with 1024 first.
 ///
-/// Handles computed per draw from storage buffer words (the C++ handle programs) are not
-/// supported: such a handle binds the constant buffer word a search through loads finds, and a
-/// word that only addresses a load binds no texture
-/// ([`TextureDescriptor::handle_is_pointer_word`]).
+/// A bindless handle no constant buffer word gives becomes a handle program in
+/// [`ShaderInfo::handle_programs`] when it is computable for a whole draw. A sampled texture
+/// whose handle is not binds no texture ([`TextureDescriptor::handle_is_pointer_word`]);
+/// a storage image or texel buffer whose handle is not is an error.
 pub fn texture_pass(
     env: &dyn ShaderEnvironment,
     prog: &mut Program,
@@ -972,6 +1040,9 @@ pub fn texture_pass(
     host: &HostTranslateInfo,
 ) -> Result<(), TextureError> {
     let mut tracker = Tracker::new(env, host);
+    for program in std::mem::take(&mut info.handle_programs) {
+        tracker.intern(program);
+    }
     let mut textures = Vec::new();
     for &block in &prog.post_order {
         let ctx = Ctx {
@@ -985,6 +1056,15 @@ pub fn texture_pass(
         }
     }
     textures.sort_by_key(|t| (t.cbuf.handle.cbuf_index, t.cbuf.handle.cbuf_offset));
+    for texture in &textures {
+        let op = prog.op(texture.inst);
+        if let Some(program) = texture.cbuf.program
+            && op != Opcode::BindlessImageQueryDimensions
+        {
+            let ty = TextureInstInfo::from_flags(prog.inst(texture.inst).flags).ty;
+            tracker.program_types.entry(program).or_insert(ty);
+        }
+    }
 
     let mut arrays = FxHashSet::default();
     for texture in &textures {
@@ -996,7 +1076,8 @@ pub fn texture_pass(
         let ty = tracker.resolved_type(op, flags.ty, &texture.cbuf);
         if ty != TextureType::Buffer {
             let size_shift = descriptor_size_shift(prog, &texture.cbuf);
-            arrays.insert((texture.cbuf.handle, size_shift, ty, flags.is_depth));
+            let source = (texture.cbuf.handle, texture.cbuf.program);
+            arrays.insert((source, size_shift, ty, flags.is_depth));
         }
     }
     let sampled_cap = dynamic_sampled_texture_cap(info, host, arrays.len() as u32);
@@ -1012,6 +1093,7 @@ pub fn texture_pass(
             sampled_cap,
         )?;
     }
+    info.handle_programs = tracker.programs;
     Ok(())
 }
 
@@ -1041,7 +1123,7 @@ fn bind(
                 | Opcode::ImageGradient
                 | Opcode::ImageQueryLod
         )
-        && tracker.texture_type(cbuf.handle) == TextureType::Color2DRect;
+        && tracker.texture_type(&cbuf) == TextureType::Color2DRect;
     match op {
         Opcode::ImageQueryDimensions => flags.ty = tracker.resolved_type(op, flags.ty, &cbuf),
         Opcode::ImageFetch => {
@@ -1073,7 +1155,7 @@ fn bind(
         let is_integer = byte_address
             || flags.image_format != ImageFormat::Typeless
             || !matches!(op, Opcode::ImageRead | Opcode::ImageWrite)
-            || tracker.is_integer(cbuf.handle);
+            || tracker.is_integer(&cbuf);
         let (cbuf_index, cbuf_offset) = (cbuf.handle.cbuf_index, cbuf.handle.cbuf_offset);
         if flags.ty == TextureType::Buffer {
             let desc = ImageBufferDescriptor {
@@ -1085,6 +1167,7 @@ fn bind(
                 cbuf_offset,
                 count,
                 size_shift,
+                handle_program: cbuf.program,
             };
             descriptors.image_buffer(&mut info.image_buffer_descriptors, desc)
         } else {
@@ -1099,6 +1182,7 @@ fn bind(
                 count,
                 size_shift,
                 is_byte_addressed: byte_address,
+                handle_program: cbuf.program,
             };
             descriptors.image(&mut info.image_descriptors, desc)
         }
@@ -1107,11 +1191,12 @@ fn bind(
             handle: cbuf.handle,
             count,
             size_shift,
+            handle_program: cbuf.program,
         };
         descriptors.texture_buffer(&mut info.texture_buffer_descriptors, desc)
     } else {
         count = count.min(sampled_cap);
-        let is_integer = !flags.is_depth && tracker.is_integer(cbuf.handle);
+        let is_integer = !flags.is_depth && tracker.is_integer(&cbuf);
         let desc = TextureDescriptor {
             ty: flags.ty,
             is_depth: flags.is_depth,
@@ -1125,18 +1210,10 @@ fn bind(
                 DESCRIPTOR_SIZE_SHIFT
             },
             is_descriptor_array: cbuf.count > 1,
-            handle_is_pointer_word: texture.pointer_word,
+            handle_is_pointer_word: cbuf.unbound,
+            handle_program: cbuf.program,
         };
         let index = descriptors.texture(&mut info.texture_descriptors, desc);
-        let (word_index, word_offset) = (cbuf.handle.cbuf_index, cbuf.handle.cbuf_offset);
-        let mapped = info.storage_buffers_descriptors.iter().any(|ssbo| {
-            ssbo.cbuf_index == word_index
-                && word_offset >= ssbo.cbuf_offset
-                && word_offset - ssbo.cbuf_offset < 8
-        });
-        if texture.pointer_word && !mapped {
-            info.binds_unmapped_pointer_word = true;
-        }
         flags.is_integer = is_integer;
         index
     };
@@ -1168,7 +1245,7 @@ fn bind(
     if !tracker.host.support_snorm_render_buffer
         && op == Opcode::ImageFetch
         && flags.ty == TextureType::Buffer
-        && let Some(scale) = snorm_scale(tracker.pixel_format(cbuf.handle))
+        && let Some(scale) = snorm_scale(tracker.pixel_format(&cbuf))
     {
         convert_snorm_fetch(prog, id, scale);
     }
@@ -1191,8 +1268,8 @@ fn byte_address_to_texel(
     {
         return Err(TextureError::ByteAddressedMode(op));
     }
-    let format = tracker.pixel_format(cbuf.handle);
-    let ty = tracker.texture_type(cbuf.handle);
+    let format = tracker.pixel_format(&cbuf);
+    let ty = tracker.texture_type(&cbuf);
     let env = tracker.env;
     let packed_r16 = tracker.host.support_byte_addressed_r16
         && format == TexturePixelFormat::R16Float
