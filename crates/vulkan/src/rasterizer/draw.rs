@@ -1225,10 +1225,9 @@ impl VulkanRasterizer {
         Ok(Some(set))
     }
 
-    /// Pushes the one block every stage of `layout` shares (`push` is its range): the
-    /// rescaling block (no texture or image rescaled, the down factor of `scale`) and the render
-    /// area over its first 16 bytes. The shader crate puts both at offset 0; when one draw needs
-    /// both at a scale other than 1, the render area wins and the rescaling masks read garbage.
+    /// Pushes the one range every stage of `layout` shares (`push` is its stages and size): the
+    /// rescaling words at 0 (no texture or image rescaled) with the down factor of `scale` at 24,
+    /// and the render area at `RENDER_AREA_LAYOUT_OFFSET` (32), so a 48-byte range holds both.
     fn push_constants(
         &mut self,
         cmd: vk::CommandBuffer,
