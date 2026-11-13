@@ -845,6 +845,36 @@ fn paint_source(f: &mut Fixture, gmmu: &Gmmu) {
     write(f, TIC, bytemuck::cast_slice(&header));
 }
 
+#[test]
+fn draws_survive_a_texture_lookup_replacing_their_render_target() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let regs = target_regs(TEXTURE, (SIZE, SIZE));
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    draw(&mut f, &gmmu, &regs);
+    let header = tic(GPU_VA + TEXTURE, 2 * SIZE, SIZE / 2);
+    write(&f, TIC, bytemuck::cast_slice(&header));
+    write(&f, PROGRAMS + u64::from(FRAGMENT), &sampling_program());
+    write(&f, FRAGMENT_CBUF + 0x40, &0u32.to_le_bytes());
+    f.rasterizer
+        .invalidate_region(DADDR + PROGRAMS + u64::from(FRAGMENT), 0x200);
+    f.rasterizer
+        .invalidate_region(DADDR + FRAGMENT_CBUF + 0x40, 4);
+    draw(&mut f, &gmmu, &regs);
+    draw(&mut f, &gmmu, &regs);
+    assert_ne!(
+        f.rasterizer.draw.warned & super::Warning::ImageChurn as u32,
+        0,
+        "the 32x8 texture and the 16x16 target over the same memory replace each other, so the draw is skipped"
+    );
+    f.assert_no_validation_errors();
+}
+
 /// Draws the 16x16 target with `code` as the fragment program and the texture handle
 /// `handle` in c[0][0x40].
 fn read_with(f: &mut Fixture, gmmu: &Gmmu, regs: &mut Regs, code: &[u8], handle: u32) {

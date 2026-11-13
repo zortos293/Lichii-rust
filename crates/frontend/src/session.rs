@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use lichii_common::ConsoleGeneration;
 use lichii_common::settings::{AudioSettings, ControlSettings, Settings};
-use lichii_core::{ExitReason, Host, System, SystemError};
+use lichii_core::{ExitReason, Handover, Host, PROGRAM_INDEX_MASK, System, SystemError};
 use lichii_crypto::KeyError;
 use lichii_loader::LoadOptions;
 
@@ -17,6 +17,9 @@ use crate::game_list::GameKind;
 pub enum BootError {
     NotFound(PathBuf),
     Unsupported(PathBuf),
+    /// The title asked to start a program its file does not hold, or that its format cannot
+    /// select.
+    NoProgram(u8),
     System(SystemError),
 }
 
@@ -29,6 +32,7 @@ impl std::fmt::Display for BootError {
                 "{} is not an NSP, XCI, NCA, NUP, NRO, NSO or ExeFS directory",
                 path.display()
             ),
+            Self::NoProgram(index) => write!(f, "the title has no program {index} to start"),
             Self::System(err) => err.fmt(f),
         }
     }
@@ -73,6 +77,35 @@ impl Session {
         applets: Option<AppletDialogs>,
         configure: impl FnOnce(u64, ConsoleGeneration) -> (Arc<Settings>, Host),
     ) -> Result<Self, BootError> {
+        Self::start(path, options, None, applets, configure)
+    }
+
+    /// Stops this session and boots program `program_index` of the same title in its place,
+    /// handing it the user channel this title left, as its `ExecuteProgram` asked.
+    pub fn execute_program(
+        self,
+        program_index: u8,
+        options: LoadOptions,
+        applets: Option<AppletDialogs>,
+        configure: impl FnOnce(u64, ConsoleGeneration) -> (Arc<Settings>, Host),
+    ) -> Result<Self, BootError> {
+        let path = self.path.clone();
+        let handover = self.system.take_handover();
+        drop(self);
+        let options = LoadOptions {
+            program_index,
+            ..options
+        };
+        Self::start(&path, options, Some(handover), applets, configure)
+    }
+
+    fn start(
+        path: &Path,
+        options: LoadOptions,
+        handover: Option<Handover>,
+        applets: Option<AppletDialogs>,
+        configure: impl FnOnce(u64, ConsoleGeneration) -> (Arc<Settings>, Host),
+    ) -> Result<Self, BootError> {
         if !path.exists() {
             return Err(BootError::NotFound(path.to_path_buf()));
         }
@@ -80,10 +113,17 @@ impl Session {
         tracing::info!("booting {} ({})", path.display(), kind.label());
         let image = lichii_loader::load(path, &options).map_err(SystemError::from)?;
         let program_id = image.program_id;
+        if handover.is_some() && program_id & PROGRAM_INDEX_MASK != u64::from(options.program_index)
+        {
+            return Err(BootError::NoProgram(options.program_index));
+        }
         let (settings, host) = configure(program_id, image.generation);
         let mut system = System::from_image(settings, image, host)?;
         if let Some(applets) = &applets {
             system.services().set_applet_frontend(applets.frontend());
+        }
+        if let Some(handover) = handover {
+            system.set_handover(handover);
         }
         system.run()?;
         Ok(Self {
@@ -294,6 +334,117 @@ mod tests {
         assert_eq!(session.title, "Kart");
         assert_eq!(session.exit_reason(), None);
         drop(session);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn execute_program_restarts_at_the_new_program_with_the_user_channel() {
+        use lichii_kernel::testing::{IpcClient, Request};
+        use lichii_loader::testing::{
+            AcidLayout, NpdmSpec, build_npdm, multi_program_nsp, pfs0, svc_mask, thread_info,
+        };
+
+        const APPLICATION: u64 = 0x0100_0000_0002_0000;
+        const CURRENT_PROCESS: u32 = 0xffff_8001;
+        let exefs = |index: u64| {
+            let mut capabilities = vec![thread_info(63, 16, 0, 3)];
+            capabilities.extend((0..8).map(|index| svc_mask(index, 0xff_ffff)));
+            let npdm = build_npdm(&NpdmSpec {
+                program_id: APPLICATION + index,
+                layout: AcidLayout::Switch1,
+                capabilities,
+                ..NpdmSpec::default()
+            });
+            let main = nso(&[0x14000000u32.to_le_bytes(), [0; 4]].concat());
+            pfs0(&[("main", main), ("main.npdm", npdm)])
+        };
+        let dir = temp_dir("execute-program");
+        let game = dir.join("Multi.nsp");
+        std::fs::write(&game, multi_program_nsp(APPLICATION, &[exefs(0), exefs(1)])).unwrap();
+        let configure = |_, _| (settings(), Host::headless());
+
+        let application = |session: &Session| {
+            let system = session.system();
+            let client = IpcClient::new(system.kernel(), system.process());
+            let service = client.connect("appletOE").unwrap();
+            let open = Request::new(0)
+                .send_pid()
+                .arg(0u64)
+                .copy_handle(CURRENT_PROCESS);
+            let proxy = client.send(service, &open).unwrap().move_handles[0];
+            let interface = |command| {
+                client
+                    .send(proxy, &Request::new(command))
+                    .unwrap()
+                    .move_handles[0]
+            };
+            let (functions, creator) = (interface(20), interface(11));
+            (client, functions, creator)
+        };
+
+        let session = Session::boot(&game, LoadOptions::default(), None, configure).unwrap();
+        assert_eq!(session.program_id, APPLICATION);
+        let (client, functions, creator) = application(&session);
+        let storage = client
+            .send(creator, &Request::new(10).arg(8i64))
+            .unwrap()
+            .move_handles[0];
+        let accessor = client.send(storage, &Request::new(0)).unwrap().move_handles[0];
+        let process = session.system().process();
+        let input = process.page_table().set_heap_size(0x20_0000).unwrap();
+        process.memory().write_bytes(input, b"handover").unwrap();
+        client
+            .send(accessor, &Request::new(10).arg(0i64).buffer_a(input, 8))
+            .unwrap();
+        let push = Request::new(122).move_handle(storage);
+        assert_eq!(client.send(functions, &push).unwrap().result.0, 0);
+        let execute = Request::new(120).arg(0u32).arg(1u64);
+        assert_eq!(client.send(functions, &execute).unwrap().result.0, 0);
+        assert_eq!(
+            session.exit_reason(),
+            Some(ExitReason::ExecuteProgram { program_index: 1 })
+        );
+        drop(client);
+
+        let session = session
+            .execute_program(1, LoadOptions::default(), None, configure)
+            .unwrap();
+        assert_eq!(session.program_id, APPLICATION + 1);
+        assert_eq!(session.exit_reason(), None);
+        let (client, functions, _) = application(&session);
+        let popped = client.send(functions, &Request::new(1).arg(1u32)).unwrap();
+        assert_eq!(popped.result.0, 0, "the user channel came along");
+        let accessor = client
+            .send(popped.move_handles[0], &Request::new(0))
+            .unwrap()
+            .move_handles[0];
+        let process = session.system().process();
+        let output = process.page_table().set_heap_size(0x20_0000).unwrap();
+        client
+            .send(accessor, &Request::new(11).arg(0i64).buffer_b(output, 8))
+            .unwrap();
+        let mut read = [0; 8];
+        process.memory().read_bytes(output, &mut read).unwrap();
+        assert_eq!(&read, b"handover");
+        let mut previous = client.send(functions, &Request::new(123)).unwrap();
+        assert_eq!(previous.pop::<i32>(), 0, "started by program 0");
+        drop(client);
+        drop(session);
+
+        let single = dir.join("Single.nso");
+        std::fs::write(
+            &single,
+            nso(&[0x14000000u32.to_le_bytes(), [0; 4]].concat()),
+        )
+        .unwrap();
+        let session = Session::boot(&single, LoadOptions::default(), None, configure).unwrap();
+        let (client, functions, _) = application(&session);
+        assert_eq!(client.send(functions, &execute).unwrap().result.0, 0);
+        drop(client);
+        assert!(matches!(
+            session.execute_program(1, LoadOptions::default(), None, configure),
+            Err(BootError::NoProgram(1))
+        ));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

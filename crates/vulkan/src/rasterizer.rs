@@ -379,9 +379,12 @@ impl VulkanRasterizer {
         let height = scale.scale(fb.height).min(state.extent.height);
         let frame = self.frame_image(width, height, &host)?;
         let cmd = self.scheduler.record()?;
-        let source = self
+        let Some(source) = self
             .texture_cache
-            .prepare(cmd, id, ImageAccess::TRANSFER_SRC);
+            .prepare(cmd, id, ImageAccess::TRANSFER_SRC)
+        else {
+            return Ok(false);
+        };
         let image = frame.image.raw();
         transition(
             &self.device,

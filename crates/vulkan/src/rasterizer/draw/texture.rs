@@ -242,6 +242,13 @@ impl VulkanRasterizer {
             );
             return Ok(());
         }
+        if self.texture_cache.state(target.id).is_none() {
+            self.draw.warn_once(
+                Warning::ImageChurn,
+                "a texture draw's source replaced its render target in the texture cache; skipping it",
+            );
+            return Ok(());
+        }
         let src_scale = match self.texture_cache.state(texture) {
             Some(s) if dst_scale != ResolutionScale::X1 => s.scale,
             _ => ResolutionScale::X1,

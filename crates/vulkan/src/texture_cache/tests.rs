@@ -110,7 +110,10 @@ impl Fixture {
         )
         .unwrap();
         let cmd = self.scheduler.record().unwrap();
-        let raw = self.cache.prepare(cmd, id, ImageAccess::TRANSFER_SRC);
+        let raw = self
+            .cache
+            .prepare(cmd, id, ImageAccess::TRANSFER_SRC)
+            .expect("a live image");
         let regions: Vec<_> = subresources
             .iter()
             .map(|&(layer, level, extent, offset, _)| vk::BufferImageCopy {

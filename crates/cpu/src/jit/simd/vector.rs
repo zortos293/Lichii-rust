@@ -374,6 +374,92 @@ pub(in super::super) fn load_store_multiple(t: &mut Translator, inst: &Inst, pc:
             t.set(Loc::V((vt + r) % 32), loaded[r as usize]);
         }
     }
+    post_index(t, rn, post, base);
+}
+
+/// Emits `LD1`..`LD4`/`ST1`..`ST4` (single structure) or `LD1R`..`LD4R` and returns true, or emits
+/// nothing and returns false when a lane insert needs SSE4.1 the host lacks. Like the
+/// interpreter, each register is written as soon as its element loads, so a fault leaves the
+/// earlier registers updated, and the base is written back last.
+pub(in super::super) fn load_store_single(t: &mut Translator, inst: &Inst, pc: u64) -> bool {
+    let (load, size, selem, lane, q, vt, rn, post) = match *inst {
+        Inst::VecSingle {
+            load,
+            size,
+            selem,
+            index,
+            vt,
+            rn,
+            post,
+        } => (load, size, selem, Some(index), false, vt, rn, post),
+        Inst::VecReplicate {
+            q,
+            size,
+            selem,
+            vt,
+            rn,
+            post,
+        } => (true, size, selem, None, q, vt, rn, post),
+        _ => unreachable!("only VecSingle and VecReplicate reach here"),
+    };
+    if load && lane.is_some() && size % 2 == 0 && !t.sse41 {
+        return false;
+    }
+    let vector = |t: &mut Translator, op| t.op(Op::Simd(SimdOp::Vec(op)));
+    let base = t.x(rn);
+    for s in 0..selem {
+        let addr = if s == 0 {
+            base
+        } else {
+            let offset = t.op(Op::Const((s as u64) << size));
+            t.op(Op::Add(W::W64, base, offset))
+        };
+        let reg = Loc::V((vt + s) % 32);
+        match lane {
+            Some(index) if !load => {
+                let v = t.op(Op::Get(reg));
+                let value = vector(
+                    t,
+                    VecOp::Extract {
+                        size,
+                        index,
+                        signed: None,
+                        vector: v,
+                    },
+                );
+                t.op(Op::Store {
+                    size,
+                    addr,
+                    value,
+                    pc,
+                });
+            }
+            Some(index) => {
+                let value = t.op(Op::Load { size, addr, pc });
+                let v = t.op(Op::Get(reg));
+                let r = vector(
+                    t,
+                    VecOp::Insert {
+                        size,
+                        index,
+                        vector: v,
+                        value,
+                    },
+                );
+                t.set(reg, r);
+            }
+            None => {
+                let value = t.op(Op::Load { size, addr, pc });
+                let r = vector(t, VecOp::Dup(Arrangement { size, q }, value));
+                t.set(reg, r);
+            }
+        }
+    }
+    post_index(t, rn, post, base);
+    true
+}
+
+fn post_index(t: &mut Translator, rn: Reg, post: PostIndex, base: Value) {
     let step = match post {
         PostIndex::None => return,
         PostIndex::Imm(n) => t.op(Op::Const(n as u64)),

@@ -196,6 +196,23 @@ const WORKLOADS: &[Workload] = &[
         per_iteration: 10,
     },
     Workload {
+        name: "vector lane loop",
+        code: &[
+            0x0d409020, // 1: ld1 {v0.s}[1], [x1]
+            0x4d40c821, // ld1r {v1.4s}, [x1]
+            0x4ea18400, // add v0.4s, v0.4s, v1.4s
+            0x4d608022, // ld2 {v2.s, v3.s}[2], [x1]
+            0x6e231c42, // eor v2.16b, v2.16b, v3.16b
+            0x0d009020, // st1 {v0.s}[1], [x1]
+            0x4d004822, // st1 {v2.h}[5], [x1]
+            0xf10004a5, // subs x5, x5, #1
+            0x54ffff01, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 9,
+    },
+    Workload {
         name: "popcount loop",
         code: &[
             0x4c407020, // 1: ld1 {v0.16b}, [x1]

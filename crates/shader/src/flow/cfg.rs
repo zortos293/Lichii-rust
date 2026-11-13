@@ -553,7 +553,10 @@ impl Builder<'_> {
         let stack = self.stack_of(block);
         let branches: Vec<(BlockId, u32)> = targets
             .into_iter()
-            .map(|target| (self.add_label(block, stack.clone(), target, f), target))
+            .map(|target| {
+                let label = self.isa.align(target);
+                (self.add_label(block, stack.clone(), label, f), target)
+            })
             .collect();
         let next = self.isa.next(pc);
         let b = self.blk(block);

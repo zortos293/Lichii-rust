@@ -35,6 +35,23 @@ pub struct ServiceParts {
     pub perf: Arc<PerfStats>,
     /// The host audio sink, built by `core::System` from the audio settings.
     pub audio: Arc<Sink>,
+    /// What the title asks of the session that runs it.
+    pub session: Arc<dyn SessionEvents>,
+}
+
+/// What a program leaves the program it starts: its own index, which `GetPreviousProgramIndex`
+/// returns, and its user channel.
+pub struct Handover {
+    pub previous_program_index: u8,
+    pub user_channel: Vec<Vec<u8>>,
+}
+
+/// Requests from the title that only the session running it can carry out.
+pub trait SessionEvents: Send + Sync {
+    /// The title asked to stop and start program `program_index` of its application
+    /// (`ExecuteProgram`, `CreateApplicationAndRequestToStart`), handing `user_channel`
+    /// over to it.
+    fn execute_program(&self, program_index: u8, user_channel: Vec<Vec<u8>>);
 }
 
 /// Shared state of every service. Services keep an `Arc<ServiceContext>`; the fields are the
@@ -58,7 +75,11 @@ pub struct ServiceContext {
     /// The host audio sink every audio service plays on. `core::System` owns it and pauses it
     /// and sets its host volume; the services set the device volume.
     pub audio: Arc<Sink>,
+    pub(crate) session: Arc<dyn SessionEvents>,
     pub(crate) unknown: UnknownCommands,
+    /// The application's applet state, once am registered: a restarted program's user channel
+    /// goes there.
+    pub(crate) am: OnceLock<Arc<crate::am::Applet>>,
     /// The nvdrv state, once nvdrv registered: gsv opens `nx2:nvsrv` sessions with it.
     pub(crate) nvdrv: OnceLock<Arc<crate::nvdrv::Nvdrv>>,
     /// The hid state, once hid registered: am's controller applet reports its connected npads.
@@ -92,7 +113,9 @@ impl ServiceContext {
             npad: parts.npad,
             perf: parts.perf,
             audio: parts.audio,
+            session: parts.session,
             unknown: UnknownCommands::default(),
+            am: OnceLock::new(),
             nvdrv: OnceLock::new(),
             hid: OnceLock::new(),
             user: OnceLock::new(),
@@ -109,6 +132,14 @@ impl ServiceContext {
     /// `frontend` from now on, instead of [`HeadlessApplets`].
     pub fn set_applet_frontend(&self, frontend: Arc<dyn AppletFrontend>) {
         *self.applets.write() = frontend;
+    }
+
+    /// Gives the title what the program before it handed over, before the title starts.
+    pub fn receive_handover(&self, handover: Handover) {
+        match self.am.get() {
+            Some(applet) => applet.receive_handover(handover),
+            None => tracing::warn!("am is not registered; the handover is lost"),
+        }
     }
 
     /// The frontend that answers library applets.
