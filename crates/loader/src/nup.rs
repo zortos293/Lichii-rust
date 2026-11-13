@@ -34,6 +34,7 @@ use crate::program::{AddOnContent, ProgramImage};
 use crate::title::{LoadOptions, TitleFormat, TitleInfo};
 use crate::zstd::{FrameStream, Input, Variant, ZstdError};
 
+/// The first four bytes of every NUP container.
 pub const MAGIC: [u8; 4] = *b"NUP\x01";
 pub(crate) const TOC_MAGIC: [u8; 4] = *b"TOC\x01";
 pub(crate) const SUPERBLOCK_SIZE: usize = 0x80;
@@ -52,18 +53,30 @@ const MAX_TOC_SIZE: u64 = 64 << 20;
 const MAX_META_SIZE: u32 = 64 << 20;
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 
-/// Types of the records in a package's metadata block.
+/// Metadata record holding the package's `main.npdm` bytes.
 pub const META_NPDM: u16 = 0x0001;
+/// Metadata record holding the default icon, a JPEG.
 pub const META_ICON: u16 = 0x0003;
+/// Metadata record holding the display version as UTF-8, such as `1.2.0`.
 pub const META_DISPLAY_VERSION: u16 = 0x0004;
+/// Metadata record holding the default title as UTF-8.
 pub const META_TITLE_NAME: u16 = 0x0005;
+/// Metadata record holding the publisher as UTF-8.
 pub const META_PUBLISHER: u16 = 0x0006;
+/// Metadata record holding the name of the dump the package was packed from, as UTF-8.
 pub const META_SOURCE_DUMP: u16 = 0x0008;
+/// Metadata record holding titles per language: for each, a one-byte tag length, the BCP-47
+/// tag, a 32-bit little-endian length and the UTF-8 title.
 pub const META_LOCALIZED_TITLES: u16 = 0x0009;
+/// Metadata record holding icons per language, laid out like [`META_LOCALIZED_TITLES`] with a
+/// JPEG in place of each title.
 pub const META_LOCALIZED_ICONS: u16 = 0x000a;
 
 /// Decoded zstd files a container keeps in memory at once; the least recently read go first.
 const DECODE_BUDGET: u64 = 512 << 20;
+/// What a partly decoded file holds besides its output: the decoder's literals buffer and
+/// entropy tables, and the compressed input buffer. Charged until the file is decoded.
+const STREAM_CHARGE: u64 = 512 << 10;
 /// Zstd files larger than this are refused. The reference packer stores every file above
 /// 256 MiB raw.
 const MAX_ZSTD_FILE: u64 = DECODE_BUDGET / 2;
@@ -83,6 +96,7 @@ const LANGUAGE_TAGS: [&str; 18] = [
 /// Language slots of the uncompressed NACP title area.
 const NACP_LANGUAGES: usize = 16;
 
+/// What a package holds: the program as released, an update to it, or add-on content.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PackageKind {
     Base,
@@ -106,9 +120,11 @@ pub struct PackageMeta {
     pub display_version: String,
 }
 
+/// One program, update or add-on in a container, with its metadata.
 #[derive(Clone, Debug)]
 pub struct Package {
     pub title_id: u64,
+    /// The title version, `major << 16 | minor << 8 | micro` for the display fallback.
     pub version: u32,
     pub kind: PackageKind,
     /// An update that carries the complete patched tree and boots without its base.
@@ -172,6 +188,8 @@ impl Nup {
         file.size() >= SUPERBLOCK_SIZE as u64 && file.read_array::<4>(0).is_ok_and(|m| m == MAGIC)
     }
 
+    /// Parses the superblock, table of contents and package metadata of `file`; file contents
+    /// are read only when a file is.
     pub fn open(file: FileRef) -> LoaderResult<Self> {
         let superblock: [u8; SUPERBLOCK_SIZE] = file
             .read_array(0)
@@ -379,9 +397,23 @@ impl Nup {
         &self.children[node.first_child as usize..][..node.child_count as usize]
     }
 
-    /// Directories have at most one parent, and every tree a package names is at most
-    /// `MAX_DIR_DEPTH` deep, so a cycle reachable from one is caught too.
+    /// Directories own disjoint child slices and have at most one parent, so the trees below
+    /// them never share a node; every tree a package names is at most `MAX_DIR_DEPTH` deep, so
+    /// a cycle reachable from one is caught too.
     fn validate_tree(&self) -> LoaderResult<()> {
+        let mut slices: Vec<(u32, u32)> = self
+            .dirs
+            .iter()
+            .filter(|d| d.child_count > 0)
+            .map(|d| (d.first_child, d.child_count))
+            .collect();
+        slices.sort_unstable();
+        if slices
+            .windows(2)
+            .any(|pair| u64::from(pair[0].0) + u64::from(pair[0].1) > u64::from(pair[1].0))
+        {
+            return Err(corrupt("two directories share child slots"));
+        }
         let mut has_parent = vec![false; self.dirs.len()];
         for &child in &self.children {
             if let Some(seen) = has_parent.get_mut(child as usize)
@@ -453,6 +485,8 @@ impl Nup {
         Ok(meta)
     }
 
+    /// Packages in the order the table of contents lists them; the other methods take an index
+    /// into this slice.
     pub fn packages(&self) -> &[Package] {
         &self.packages
     }
@@ -790,8 +824,9 @@ fn put_c_string(raw: &mut [u8], at: usize, capacity: usize, text: &str) {
 }
 
 /// A NACP holding what the metadata says: titles per language (the default title in American
-/// English when it has no localized one), the publisher, the display version and the save data
-/// owner. Nothing when the metadata has none of them.
+/// English when it has no localized one), the publisher and the display version, with the save
+/// data owner and the add-on content base id derived from the title id. Nothing when the
+/// metadata has none of them.
 fn build_nacp(meta: &PackageMeta, title_id: u64, version: &str) -> Option<Nacp> {
     let title = if meta.title_name.is_empty() {
         &meta.source_dump
@@ -824,6 +859,7 @@ fn build_nacp(meta: &PackageMeta, title_id: u64, version: &str) -> Option<Nacp> 
     }
     put_c_string(&mut raw, 0x3060, 0x10, version);
     raw[0x302c..0x3030].copy_from_slice(&0x3_ffffu32.to_le_bytes());
+    raw[0x3070..0x3078].copy_from_slice(&((title_id & !0x1fff) + 0x1000).to_le_bytes());
     raw[0x3078..0x3080].copy_from_slice(&title_id.to_le_bytes());
     Nacp::parse(&raw).ok()
 }
@@ -961,8 +997,8 @@ impl File for ZstdFile {
         }
         let len = buf.len().min((self.size - offset) as usize);
         let end = offset + len as u64;
-        let member = self.cache.member(self.index, self.size);
-        let mut member = member.lock().unwrap_or_else(PoisonError::into_inner);
+        let shared = self.cache.member(self.index, self.size);
+        let mut member = shared.lock().unwrap_or_else(PoisonError::into_inner);
         let decoded = member.decoded as u64;
         if decoded < end {
             let target = if end - decoded <= NEAR_DECODE {
@@ -970,9 +1006,15 @@ impl File for ZstdFile {
             } else {
                 self.size
             };
-            if let Err(error) = self.decode(&mut member, target as usize) {
+            let result = self.decode(&mut member, target as usize);
+            if result.is_err() {
                 member.failed = true;
                 member.stream = None;
+            }
+            if member.stream.is_none() {
+                self.cache.release_stream(self.index, &shared);
+            }
+            if let Err(error) = result {
                 tracing::error!("NUP: decoding {} failed: {error}", self.name);
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -994,9 +1036,9 @@ struct Member {
     failed: bool,
 }
 
-/// The zstd files of one container that were read recently, charged their full size against
-/// `DECODE_BUDGET`. An evicted file stays alive while a read holds it and decodes again on
-/// its next read.
+/// The zstd files of one container that were read recently, charged their full size, plus
+/// `STREAM_CHARGE` while partly decoded, against `DECODE_BUDGET`. An evicted file stays alive
+/// while a read holds it and decodes again on its next read.
 #[derive(Default)]
 struct DecodeCache {
     state: Mutex<CacheState>,
@@ -1012,8 +1054,9 @@ struct CacheState {
 
 struct Cached {
     member: Arc<Mutex<Member>>,
-    size: u64,
+    charge: u64,
     used: u64,
+    streaming: bool,
 }
 
 impl DecodeCache {
@@ -1028,25 +1071,41 @@ impl DecodeCache {
             state.by_use.insert(clock, index);
             return cached.member.clone();
         }
-        while state.bytes + size > DECODE_BUDGET
+        while state.bytes + size + STREAM_CHARGE > DECODE_BUDGET
             && let Some((_, victim)) = state.by_use.pop_first()
         {
             if let Some(evicted) = state.members.remove(&victim) {
-                state.bytes -= evicted.size;
+                state.bytes -= evicted.charge;
             }
         }
         let member = Arc::<Mutex<Member>>::default();
-        state.bytes += size;
+        let charge = size + STREAM_CHARGE;
+        state.bytes += charge;
         state.by_use.insert(clock, index);
         state.members.insert(
             index,
             Cached {
                 member: member.clone(),
-                size,
+                charge,
                 used: clock,
+                streaming: true,
             },
         );
         member
+    }
+
+    /// Stops charging a file's decoder once it is decoded or has failed. A file evicted and
+    /// cached again since is charged separately and left alone.
+    fn release_stream(&self, index: usize, member: &Arc<Mutex<Member>>) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = &mut *state;
+        if let Some(cached) = state.members.get_mut(&index)
+            && Arc::ptr_eq(&cached.member, member)
+            && std::mem::take(&mut cached.streaming)
+        {
+            cached.charge -= STREAM_CHARGE;
+            state.bytes -= STREAM_CHARGE;
+        }
     }
 }
 
@@ -1281,6 +1340,22 @@ mod tests {
             matches!(nup.verify(), Err(LoaderError::FileHashMismatch(name)) if name == "a.bin")
         );
 
+        let mut shared = bytes.clone();
+        let dir_records = SUPERBLOCK_SIZE + TOC_HEADER_SIZE + PACKAGE_RECORD_SIZE;
+        let romfs_slice = dir_records + DIR_RECORD_SIZE + 8;
+        let slice: [u8; 8] = shared[romfs_slice..romfs_slice + 8].try_into().unwrap();
+        shared[dir_records + 8..dir_records + 16].copy_from_slice(&slice);
+        let toc_size = u64_at(&shared, 0x10) as usize;
+        let hash = sha256(&shared[SUPERBLOCK_SIZE..SUPERBLOCK_SIZE + toc_size]);
+        shared[0x18..0x38].copy_from_slice(&hash);
+        assert!(matches!(
+            open(shared),
+            Err(LoaderError::Corrupt(
+                "NUP",
+                "two directories share child slots"
+            ))
+        ));
+
         let mut truncated = bytes.clone();
         truncated.truncate(bytes.len() - 1);
         assert!(open(truncated).is_err());
@@ -1316,6 +1391,8 @@ mod tests {
             ZSTD_TEST_BLOCK,
             "a short read decodes one block"
         );
+        let charged = || nup.cache.state.lock().unwrap().bytes;
+        assert_eq!(charged(), zipped.len() as u64 + STREAM_CHARGE);
         check(&file, &zipped, BLOCK - 3, 2 * ZSTD_TEST_BLOCK);
         assert_eq!(decoded(&nup, "z.bin"), 3 * ZSTD_TEST_BLOCK);
         check(&file, &zipped, 30 * BLOCK - 1, 2);
@@ -1324,6 +1401,13 @@ mod tests {
             zipped.len(),
             "a far read decodes the rest"
         );
+        assert_eq!(
+            charged(),
+            zipped.len() as u64,
+            "a decoded file frees its decoder"
+        );
+        check(&file, &zipped, 5, 5);
+        assert_eq!(charged(), zipped.len() as u64);
 
         let mut seed = 0x1234_5678u64;
         let mut next = move |bound: u64| {
@@ -1506,6 +1590,7 @@ mod tests {
         let nacp = image.nacp.as_ref().unwrap();
         assert_eq!(nacp.display_version(), "1.0.0");
         assert_eq!(nacp.save_data_owner_id(), BASE_ID);
+        assert_eq!(nacp.add_on_content_base_id(), BASE_ID + 0x1000);
         assert_eq!(image.icon.as_deref(), Some(&b"JPEG icon"[..]));
         let romfs = open_romfs(image.romfs.as_ref().unwrap()).unwrap();
         assert_eq!(read(&romfs, "a.txt"), b"base a");

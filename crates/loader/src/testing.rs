@@ -36,6 +36,7 @@ pub struct NupPackage {
 }
 
 impl NupPackage {
+    /// A package with no files or metadata.
     pub fn new(kind: PackageKind, title_id: u64, version: u32) -> Self {
         Self {
             kind,
@@ -47,11 +48,16 @@ impl NupPackage {
         }
     }
 
+    /// Adds a file at `path`, `/`-separated below the package root. Its parent directories are
+    /// created as needed; `exefs/` and `romfs/` at the root become the package's ExeFS and
+    /// RomFS.
     pub fn file(mut self, path: &str, data: impl Into<Vec<u8>>, codec: Codec) -> Self {
         self.files.push((path.into(), data.into(), codec));
         self
     }
 
+    /// Adds a metadata record of `kind` (one of the `nup::META_*` types) holding `payload` as
+    /// is.
     pub fn meta(mut self, kind: u16, payload: impl Into<Vec<u8>>) -> Self {
         self.meta.push((kind, payload.into()));
         self
