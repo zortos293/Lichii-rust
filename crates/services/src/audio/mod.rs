@@ -1,5 +1,6 @@
 //! Audio services: `audout:u`, `audin:u`, `audren:u` (and the empty `audren:a` and `audren:d`),
-//! `audctl`, `hwopus`, and the Switch 2 `aud:u`, `auddmg:u` and `audsmx:u`.
+//! `audctl`, `hwopus`, the Switch 2 `aud:u`, `auddmg:u` and `audsmx:u`, and the final output
+//! recorder `audrec:u`, `audrec:a` and `audrec:d`, which have no commands, as in the reference.
 //!
 //! They share one [`Audio`]: the host sink `core::System` passes in [`ServiceContext::audio`]
 //! and the audio out, audio in, renderer and sound mixer state that play on it.
@@ -28,6 +29,7 @@ use lichii_kernel::Event;
 use lichii_kernel::ipc::HleRequestContext;
 
 use crate::ServiceContext;
+use crate::dispatch::Nx2Stub;
 
 /// Size of `nn::audio::AudioDeviceName`.
 const DEVICE_NAME_SIZE: usize = 0x100;
@@ -62,6 +64,9 @@ fn start(context: &Arc<ServiceContext>) -> HleResult<Arc<Audio>> {
     devmgr::register(context, &audio)?;
     audctl::register(context, &audio)?;
     hwopus::register(context)?;
+    for name in ["audrec:u", "audrec:a", "audrec:d"] {
+        context.register(name, "audio", move |_| Nx2Stub(name.into()))?;
+    }
     Ok(audio)
 }
 
