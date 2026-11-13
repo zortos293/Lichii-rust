@@ -99,6 +99,7 @@ impl Maxwell3d {
         if method >= MACRO_REGISTERS_START {
             return;
         }
+        crate::diag_ring::note(b'3', method, argument);
         if self.draw.pending.is_some()
             && !draw::is_loop_method(method)
             && self.state.would_change(method, argument)
@@ -222,6 +223,11 @@ impl Maxwell3d {
             }
             REPORT_SEMAPHORE_QUERY => {
                 if let Some(query) = queries::report(regs) {
+                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if ctx.memory.translate(query.address).is_none() && crate::diag_ring::first(&N, 12) {
+                        let s = &regs.report_semaphore;
+                        tracing::warn!("DIAG a0 3d report hi={:#x} lo={:#x} payload={:#x} query={:#x} shadow_mode={:?} shadow_hi={:#x} shadow_lo={:#x} ring: {}", s.address_high, s.address_low, s.payload, s.query.0, self.state.shadow_ram_control(), self.state.shadow(reg_index!(Regs, report_semaphore)), self.state.shadow(reg_index!(Regs, report_semaphore) + 1), crate::diag_ring::dump());
+                    }
                     ctx.rasterizer.query(ctx.channel, ctx.memory, &query);
                 }
             }

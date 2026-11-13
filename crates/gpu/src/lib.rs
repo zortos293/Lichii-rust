@@ -6,6 +6,7 @@
 //! thread executes the engines and drives the renderer.
 
 pub mod activity;
+pub mod diag_ring;
 mod back;
 pub mod backend;
 mod bits;
