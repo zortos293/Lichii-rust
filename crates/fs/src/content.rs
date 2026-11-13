@@ -242,17 +242,15 @@ impl ContentIndex {
 /// What installing one title into registered content did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstallOutcome {
+    /// The title was not installed before.
     New,
     /// The same title was installed; its files were replaced.
-    Overwrote {
-        old_version: u32,
-    },
+    Overwrote { old_version: u32 },
     /// A newer version is installed already and stays.
-    KeptNewer {
-        installed: u32,
-    },
+    KeptNewer { installed: u32 },
 }
 
+/// One patch or add-on title [`install_registered`] found in a package, and what it did with it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InstalledTitle {
     pub title_id: u64,
@@ -269,7 +267,9 @@ const INSTALL_CHUNK: u64 = 4 << 20;
 /// not installed. An older installed version of a title is replaced and its files removed; a
 /// newer one stays. Every file is written to a `.tmp` beside its destination and renamed into
 /// place, so an interrupted install never leaves a partial NCA or ticket that indexing would pick
-/// up. `progress` gets the bytes written after each chunk.
+/// up, and a title's Meta NCA goes in after its contents, so a failed install keeps the version
+/// that was there. A package whose file names are not plain names (a path, `..`) installs
+/// nothing. `progress` gets the bytes written after each chunk.
 pub fn install_registered(
     package: &PartitionFs,
     index: &ContentIndex,
@@ -320,6 +320,9 @@ pub fn install_registered(
     if installed.is_empty() {
         return Ok(installed);
     }
+    if let Some(name) = copies.iter().find(|name| !is_plain_file_name(name)) {
+        return Err(corrupt("NSP", format!("{name:?} is not a plain file name")));
+    }
     for name in &copies {
         if let Some(file) = package.file(name) {
             write_atomically(&registered.join(name), &file, &mut progress)?;
@@ -337,22 +340,24 @@ pub fn install_registered(
 }
 
 impl ContentIndex {
-    /// The file names of `title`'s Meta NCA and of the NCAs its CNMT lists that are present.
+    /// The file names of the NCAs `title`'s CNMT lists, then of its Meta NCA.
     fn file_names(&self, title: &Title) -> Vec<String> {
         let meta = self.ncas.iter().find(|(_, nca)| {
             let header = nca.header();
             header.content_type == NcaContentType::Meta && header.program_id == title.title_id()
         });
-        meta.map(|(name, _)| name.clone())
-            .into_iter()
-            .chain(
-                title
-                    .contents
-                    .iter()
-                    .map(|c| c.record.content_id.file_name()),
-            )
+        title
+            .contents
+            .iter()
+            .map(|c| c.record.content_id.file_name())
+            .chain(meta.map(|(name, _)| name.clone()))
             .collect()
     }
+}
+
+/// Whether `name` names a file inside a folder on every host: no separator, drive or parent.
+fn is_plain_file_name(name: &str) -> bool {
+    !matches!(name, "" | "." | "..") && !name.contains(['/', '\\', ':'])
 }
 
 /// Copies `file` to a `.tmp` beside `destination` and renames it into place.
@@ -749,6 +754,75 @@ pub(crate) mod tests {
             .collect();
         left.sort();
         assert_eq!(left, names, "no temp file survives a completed install");
+        let dir = HostDir::open(&registered).unwrap();
+        let index = ContentIndex::from_registered(dir.as_ref(), &mut key_set()).unwrap();
+        assert_eq!(index.patch_for(APP).unwrap().version(), 0x10000);
+    }
+
+    #[test]
+    fn names_that_leave_the_folder_install_nothing() {
+        let temp = TempDir::new("escape");
+        let registered = temp.0.join("nand/registered");
+        let rights = control_rights();
+        let mut escaping_meta = update_package();
+        let meta = escaping_meta
+            .iter_mut()
+            .find(|(name, _)| name.ends_with(".cnmt.nca"))
+            .unwrap();
+        meta.0 = format!("../../{}", meta.0);
+        let mut escaping_ticket = update_package();
+        escaping_ticket.push((format!("../{rights}.tik"), file(ticket(rights))));
+        for files in [escaping_meta, escaping_ticket] {
+            let mut keys = key_set();
+            let package = open_package(&files, &mut keys);
+            let result = install_registered(
+                package.partition(),
+                package.index(),
+                &registered,
+                &mut keys,
+                |_| {},
+            );
+            assert!(result.is_err());
+            let written: Vec<_> = walk(&temp.0);
+            assert!(written.is_empty(), "nothing is written: {written:?}");
+        }
+    }
+
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flat_map(|e| {
+                let path = e.unwrap().path();
+                if path.is_dir() {
+                    walk(&path)
+                } else {
+                    vec![path]
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_failed_update_keeps_the_installed_one() {
+        let temp = TempDir::new("failed");
+        let registered = temp.0.join("registered");
+        let mut keys = key_set();
+        install(&open_package(&old_patch_package(), &mut keys), &registered);
+        let blocked = registered.join(format!("{}.tmp", ContentId([0xb1; 16]).file_name()));
+        std::fs::create_dir(&blocked).unwrap();
+
+        let new = open_package(&update_package(), &mut keys);
+        let result =
+            install_registered(new.partition(), new.index(), &registered, &mut keys, |_| {});
+        assert!(result.is_err());
+        let dir = HostDir::open(&registered).unwrap();
+        let index = ContentIndex::from_registered(dir.as_ref(), &mut key_set()).unwrap();
+        let patch = index.patch_for(APP).unwrap();
+        assert_eq!(patch.version(), 0x8000, "the old update still applies");
+        assert!(registered.join(ContentId([0xd1; 16]).file_name()).exists());
+
+        std::fs::remove_dir(&blocked).unwrap();
+        install(&new, &registered);
         let dir = HostDir::open(&registered).unwrap();
         let index = ContentIndex::from_registered(dir.as_ref(), &mut key_set()).unwrap();
         assert_eq!(index.patch_for(APP).unwrap().version(), 0x10000);
