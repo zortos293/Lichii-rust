@@ -699,7 +699,7 @@ impl Npad {
 }
 
 /// Writes a newly connected controller into its npad entry (the reference's
-/// `InitNewlyAddedController`) and signals the style-set event.
+/// `InitNewlyAddedController`), starting with its rumble off, and signals the style-set event.
 fn connect(memory: &SharedMemory, index: usize, npad: &mut Npad, style: Style, halves: Halves) {
     let entry = NpadEntry::new(index);
     clear_device(memory, entry);
@@ -834,6 +834,7 @@ fn connect(memory: &SharedMemory, index: usize, npad: &mut Npad, style: Style, h
     );
     npad.style = Some(style);
     npad.halves = halves;
+    npad.vibration = [DEFAULT_VIBRATION; 2];
     npad.orientation = [1.0, 0.0, 0.0, 0.0];
     npad.rotation = [0.0; 3];
     npad.signal_style_change();

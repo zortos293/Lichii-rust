@@ -673,10 +673,17 @@ fn joy_con_assignment_splits_a_pair_and_merges_it_back() {
     );
     assert_eq!(assignment(0), 0);
 
+    rumble(1, 0, strong);
     hid.send(Request::new(122).send_pid().arg(0u32).arg(ARUID))
         .ok();
     assert_eq!(hid.style(0), Style::JoyLeft.tag());
     assert_eq!(hid.style(1), Style::JoyDual.tag());
+    rumble(0, 0, DEFAULT_VIBRATION);
+    assert_eq!(
+        hid.context.npad.take_vibration(0, &mut seen),
+        Some(DEFAULT_VIBRATION),
+        "rumble sent while an entry was off does not come back with it"
+    );
     hid.send(Request::new(124).send_pid().arg(0u32).arg(ARUID))
         .ok();
     assert_eq!(hid.style(0), Style::JoyDual.tag());
