@@ -1,7 +1,7 @@
 //! Guest shader translation: Maxwell (SM5x) and Ampere (NVN2) SASS -> IR -> SPIR-V.
 //!
-//! The renderer supplies a [\`ShaderEnvironment\`] that reads the program and the GPU state it
-//! depends on, and gets back a [\`ShaderModule\`] with SPIR-V and the resource layout the
+//! The renderer supplies a [`ShaderEnvironment`] that reads the program and the GPU state it
+//! depends on, and gets back a [`ShaderModule`] with SPIR-V and the resource layout the
 //! pipeline needs. The shader crew owns everything here; the Vulkan crew consumes it.
 
 #[cfg(test)]
@@ -37,6 +37,7 @@ macro_rules! test_gpu_state {
 pub mod ampere;
 pub mod backend;
 pub mod flow;
+pub mod handle;
 mod hash;
 pub mod info;
 pub mod ir;
@@ -85,9 +86,9 @@ pub trait ShaderEnvironment {
     fn stage(&self) -> ShaderStage;
     /// GPU address of the program's first instruction.
     fn start_address(&self) -> GpuVAddr;
-    /// Reads one 64-bit word of program memory at \`address\`.
+    /// Reads one 64-bit word of program memory at `address`.
     fn read_u64(&self, address: GpuVAddr) -> u64;
-    /// Value of constant buffer \`index\` at byte \`offset\`, for bindless handle tracking.
+    /// Value of constant buffer `index` at byte `offset`, for bindless handle tracking.
     fn read_cbuf(&self, index: u32, offset: u32) -> u32;
     /// Shared memory size in bytes (compute).
     fn shared_memory_size(&self) -> u32;

@@ -179,10 +179,7 @@ pub(super) fn arbitrate_lock(svc: &mut SvcContext) -> Flow {
 
 /// `svcArbitrateUnlock(addr x0)`.
 pub(super) fn arbitrate_unlock(svc: &mut SvcContext) -> Flow {
-    let result = svc
-        .kernel
-        .arbiter
-        .arbitrate_unlock(svc.process(), svc.arg(0));
+    let result = svc.kernel.arbiter.arbitrate_unlock(svc.thread, svc.arg(0));
     svc.finish(result)
 }
 

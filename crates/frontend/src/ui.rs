@@ -9,7 +9,47 @@ use lichii_vulkan::present::Viewport;
 
 use crate::app::{Action, App};
 use crate::choices::Choice;
-use crate::game_list::format_size;
+use crate::game_list::{GameEntry, format_size};
+
+/// The game list's icon size, in points.
+const GAME_ICON: f32 = 40.0;
+
+/// A game list cell, centred on the icon's height.
+fn centered_cell(ui: &mut Ui, text: egui::WidgetText) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.allocate_exact_size(egui::vec2(0.0, GAME_ICON), egui::Sense::hover());
+        ui.add(egui::Label::new(text).extend());
+    });
+}
+
+/// The title, with the publisher and program id below it, as Lichii's game list shows them.
+fn game_name(ui: &Ui, entry: &GameEntry) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let format = |size: f32, color: Color32| egui::TextFormat {
+        font_id: egui::FontId::proportional(size),
+        color,
+        ..Default::default()
+    };
+    job.append(entry.title(), 0.0, format(14.0, ui.visuals().text_color()));
+    let Some(meta) = &entry.meta else {
+        return job;
+    };
+    let id = (meta.program_id != 0).then(|| format!("{:016X}", meta.program_id));
+    let details: Vec<&str> = [Some(meta.publisher.as_str()), id.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !details.is_empty() {
+        job.append(
+            &format!("\n{}", details.join("  \u{b7}  ")),
+            0.0,
+            format(11.5, ui.visuals().weak_text_color()),
+        );
+    }
+    job
+}
 
 impl App {
     pub(crate) fn draw(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
@@ -212,7 +252,7 @@ impl App {
             ui.label("Filter:");
             ui.add(
                 egui::TextEdit::singleline(&mut self.games.filter)
-                    .hint_text("Name or path")
+                    .hint_text("Name, publisher, title ID or path")
                     .desired_width(260.0),
             );
             if ui.button("Add Game Directory…").clicked() {
@@ -242,33 +282,57 @@ impl App {
             });
             return;
         }
+        self.games.upload_icons(ui.ctx());
         egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
             egui::Grid::new("games")
-                .num_columns(4)
+                .num_columns(6)
                 .striped(true)
                 .spacing([24.0, 6.0])
                 .show(ui, |ui| {
-                    for heading in ["Name", "Type", "Size", "Path"] {
+                    for heading in ["Name", "System", "Type", "Version", "Size", "Path"] {
                         ui.label(RichText::new(heading).strong());
                     }
                     ui.end_row();
                     for entry in self.games.visible() {
                         let selected = self.ui.selected.as_ref() == Some(&entry.path);
-                        let row = ui.selectable_label(selected, &entry.name);
-                        if row.clicked() {
-                            self.ui.selected = Some(entry.path.clone());
-                        }
-                        if row.double_clicked() {
-                            actions.push(Action::Boot(entry.path.clone()));
-                        }
-                        row.on_hover_text("Double-click to boot");
-                        ui.label(entry.kind.label());
-                        ui.label(if entry.size > 0 {
+                        ui.horizontal(|ui| {
+                            let size = egui::vec2(GAME_ICON, GAME_ICON);
+                            match self.games.icons.get(&entry.path) {
+                                Some(icon) => {
+                                    ui.add(egui::Image::new((icon.id(), size)).corner_radius(6));
+                                }
+                                None => {
+                                    let (rect, _) =
+                                        ui.allocate_exact_size(size, egui::Sense::hover());
+                                    ui.painter()
+                                        .rect_filled(rect, 6, ui.visuals().faint_bg_color);
+                                }
+                            }
+                            let row = ui.selectable_label(selected, game_name(ui, entry));
+                            if row.clicked() {
+                                self.ui.selected = Some(entry.path.clone());
+                            }
+                            if row.double_clicked() {
+                                actions.push(Action::Boot(entry.path.clone()));
+                            }
+                            row.on_hover_text("Double-click to boot");
+                        });
+                        let meta = entry.meta.as_ref();
+                        let size = if entry.size > 0 {
                             format_size(entry.size)
                         } else {
                             String::new()
-                        });
-                        ui.label(RichText::new(entry.path.display().to_string()).weak());
+                        };
+                        let path = RichText::new(entry.path.display().to_string()).weak();
+                        for text in [
+                            meta.map_or("", |m| m.system_label()).into(),
+                            entry.kind.label().into(),
+                            meta.map_or("", |m| m.version.as_str()).into(),
+                            size.into(),
+                            path.into(),
+                        ] {
+                            centered_cell(ui, text);
+                        }
                         ui.end_row();
                     }
                 });

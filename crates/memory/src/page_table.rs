@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use lichii_common::{PAGE_BITS, PAGE_MASK, PAGE_SIZE};
 use parking_lot::Mutex;
 
-use crate::{MemoryFault, MemoryPermission};
+use crate::{FaultKind, MemoryFault, MemoryPermission};
 
 const L2_BITS: u32 = 14;
 const L2_ENTRIES: usize = 1 << L2_BITS;
@@ -78,6 +78,19 @@ impl PageTable {
 
     /// Host pointer for `[addr, addr + size)` when every page is mapped and the host pages are
     /// contiguous, so the whole range can be accessed as one slice.
+    /// Host pointer for an access to `addr` that needs `need`.
+    #[inline]
+    pub(crate) fn access(&self, addr: u64, need: MemoryPermission) -> Result<*mut u8, MemoryFault> {
+        let (ptr, perm) = self.translate(addr).ok_or(MemoryFault::unmapped(addr))?;
+        if !perm.contains(need) {
+            return Err(MemoryFault {
+                addr,
+                kind: FaultKind::Permission,
+            });
+        }
+        Ok(ptr)
+    }
+
     pub(crate) fn contiguous(&self, addr: u64, size: u64) -> Option<*mut u8> {
         let (first, _) = self.translate(addr)?;
         if size == 0 {
@@ -99,46 +112,71 @@ impl PageTable {
     }
 
     #[inline]
-    pub(crate) fn read<T: bytemuck::Pod>(&self, addr: u64) -> Result<T, MemoryFault> {
+    pub(crate) fn read<T: bytemuck::Pod>(
+        &self,
+        addr: u64,
+        need: MemoryPermission,
+    ) -> Result<T, MemoryFault> {
         let size = std::mem::size_of::<T>() as u64;
         if (addr & PAGE_MASK) + size <= PAGE_SIZE {
-            let (ptr, _) = self.translate(addr).ok_or(MemoryFault::unmapped(addr))?;
+            let ptr = self.access(addr, need)?;
             // SAFETY: the whole value is inside one mapped page.
             return Ok(unsafe { std::ptr::read_unaligned(ptr as *const T) });
         }
         let mut value = T::zeroed();
-        self.read_bytes(addr, bytemuck::bytes_of_mut(&mut value))?;
+        self.read_bytes(addr, bytemuck::bytes_of_mut(&mut value), need)?;
         Ok(value)
     }
 
     #[inline]
-    pub(crate) fn write<T: bytemuck::Pod>(&self, addr: u64, value: T) -> Result<(), MemoryFault> {
+    pub(crate) fn write<T: bytemuck::Pod>(
+        &self,
+        addr: u64,
+        value: T,
+        need: MemoryPermission,
+    ) -> Result<(), MemoryFault> {
         let size = std::mem::size_of::<T>() as u64;
         if (addr & PAGE_MASK) + size <= PAGE_SIZE {
-            let (ptr, _) = self.translate(addr).ok_or(MemoryFault::unmapped(addr))?;
+            let ptr = self.access(addr, need)?;
             // SAFETY: the whole value is inside one mapped page.
             unsafe { std::ptr::write_unaligned(ptr as *mut T, value) };
             return Ok(());
         }
-        self.write_bytes(addr, bytemuck::bytes_of(&value))
+        self.write_bytes(addr, bytemuck::bytes_of(&value), need)
     }
 
-    pub(crate) fn read_bytes(&self, addr: u64, out: &mut [u8]) -> Result<(), MemoryFault> {
-        self.for_each_chunk(addr, out.len() as u64, |ptr, offset, len| {
+    pub(crate) fn read_bytes(
+        &self,
+        addr: u64,
+        out: &mut [u8],
+        need: MemoryPermission,
+    ) -> Result<(), MemoryFault> {
+        self.for_each_chunk(addr, out.len() as u64, need, |ptr, offset, len| {
             // SAFETY: ptr is valid for len bytes inside one mapped page.
             unsafe { std::ptr::copy_nonoverlapping(ptr, out[offset..].as_mut_ptr(), len) };
         })
     }
 
-    pub(crate) fn write_bytes(&self, addr: u64, data: &[u8]) -> Result<(), MemoryFault> {
-        self.for_each_chunk(addr, data.len() as u64, |ptr, offset, len| {
+    pub(crate) fn write_bytes(
+        &self,
+        addr: u64,
+        data: &[u8],
+        need: MemoryPermission,
+    ) -> Result<(), MemoryFault> {
+        self.for_each_chunk(addr, data.len() as u64, need, |ptr, offset, len| {
             // SAFETY: ptr is valid for len bytes inside one mapped page.
             unsafe { std::ptr::copy_nonoverlapping(data[offset..].as_ptr(), ptr, len) };
         })
     }
 
-    pub(crate) fn fill(&self, addr: u64, size: u64, byte: u8) -> Result<(), MemoryFault> {
-        self.for_each_chunk(addr, size, |ptr, _, len| {
+    pub(crate) fn fill(
+        &self,
+        addr: u64,
+        size: u64,
+        byte: u8,
+        need: MemoryPermission,
+    ) -> Result<(), MemoryFault> {
+        self.for_each_chunk(addr, size, need, |ptr, _, len| {
             // SAFETY: ptr is valid for len bytes inside one mapped page.
             unsafe { std::ptr::write_bytes(ptr, byte, len) };
         })
@@ -148,14 +186,14 @@ impl PageTable {
         &self,
         addr: u64,
         size: u64,
+        need: MemoryPermission,
         mut f: impl FnMut(*mut u8, usize, usize),
     ) -> Result<(), MemoryFault> {
         let mut done = 0u64;
         while done < size {
             let at = addr + done;
             let len = (PAGE_SIZE - (at & PAGE_MASK)).min(size - done);
-            let (ptr, _) = self.translate(at).ok_or(MemoryFault::unmapped(at))?;
-            f(ptr, done as usize, len as usize);
+            f(self.access(at, need)?, done as usize, len as usize);
             done += len;
         }
         Ok(())

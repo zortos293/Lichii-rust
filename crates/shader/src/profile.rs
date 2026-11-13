@@ -236,7 +236,12 @@ pub struct HostTranslateInfo {
     /// Geometry invocations run in subgroups of one lane.
     pub single_lane_geometry_subgroups: bool,
     pub support_byte_addressed_r16: bool,
+    /// The renderer evaluates [`crate::handle::HandleProgram`]s for each draw, so a bindless
+    /// handle read from a storage buffer binds the texture the program computes. Without it,
+    /// such a sampled texture binds nothing and such an image fails to translate.
+    pub support_handle_programs: bool,
     /// A handle read from a table at a per-invocation index may become a descriptor array.
+    /// Takes effect only with `support_handle_programs`.
     pub support_handle_table_arrays: bool,
 }
 

@@ -290,6 +290,7 @@ mod tests {
                 size_shift: 3,
                 is_descriptor_array: true,
                 handle_is_pointer_word: false,
+                handle_program: None,
             }],
             uses_rescaling_uniform: true,
             ..ShaderInfo::default()
