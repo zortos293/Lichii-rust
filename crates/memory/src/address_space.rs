@@ -80,6 +80,11 @@ pub struct Fastmem {
 }
 
 impl Fastmem {
+    #[cfg(all(test, windows))]
+    pub(crate) fn arena(&self) -> &Arena {
+        &self.arena
+    }
+
     /// Host address of guest address 0.
     pub fn base(&self) -> *mut u8 {
         self.arena.base()
