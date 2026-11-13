@@ -100,14 +100,22 @@ static std::unique_ptr<ICommandProcessingTimeEstimator> MakeEstimator(const Beha
                                                                     mix_buffer_count);
 }
 
-// System::DropVoices.
+// System::DropVoices, starting at the first command of the voice that owns the first data source
+// or performance command. The reference starts at that command itself, which skips the first
+// voice's depop prepares when performance entries are off; the port fixes that.
 static u32 DropVoices(Golden& g, Session& s, CommandBuffer& command_buffer,
                       u32 estimated_process_time, u32 time_limit) {
     u32 i{0};
     auto command_list{command_buffer.command_list.data() + sizeof(CommandListHeader)};
     ICommand* cmd{nullptr};
+    auto voice_start{command_list};
+    u32 voice_start_index{0};
     while (i < command_buffer.count) {
         cmd = reinterpret_cast<ICommand*>(command_list);
+        if (cmd->node_id != reinterpret_cast<ICommand*>(voice_start)->node_id) {
+            voice_start = command_list;
+            voice_start_index = i;
+        }
         if (cmd->type == CommandId::Performance ||
             cmd->type == CommandId::DataSourcePcmInt16Version1 ||
             cmd->type == CommandId::DataSourcePcmInt16Version2 ||
@@ -121,6 +129,9 @@ static u32 DropVoices(Golden& g, Session& s, CommandBuffer& command_buffer,
         i++;
     }
     if (cmd == nullptr || command_buffer.count == 0 || i >= command_buffer.count) return 0;
+    command_list = voice_start;
+    i = voice_start_index;
+    cmd = reinterpret_cast<ICommand*>(command_list);
 
     u32 voices_dropped{0};
     while (i < command_buffer.count) {

@@ -295,13 +295,19 @@ fn fields(command: &Command) -> Vec<u32> {
     w.0
 }
 
-/// One command as `[id, node id, enabled, estimate, field count, fields...]`.
+/// One command as `[id, node id, enabled, estimate, field count, fields...]`. The reference
+/// stores the compressor effect's enable in the command's enabled flag; the port keeps the command
+/// enabled and carries the effect's enable in `effect_enabled`, so the flag folds that back in.
 fn command_words(entry: &CommandEntry) -> Vec<u32> {
     let fields = fields(&entry.command);
+    let enabled = match &entry.command {
+        Command::Compressor(c) => entry.enabled && c.effect_enabled,
+        _ => entry.enabled,
+    };
     let mut words = vec![
         entry.command.id() as u32,
         entry.node_id,
-        entry.enabled as u32,
+        enabled as u32,
         entry.estimated_process_time,
         fields.len() as u32,
     ];
@@ -538,6 +544,29 @@ fn generated_list_plays_a_pcm16_sine_on_the_device_sink() {
     assert!(peak > 1000, "device peak {peak} is too quiet for the sine");
 }
 
+/// A disabled compressor stays executable with `effect_enabled` clear, so the DSP copies its
+/// inputs to its outputs instead of skipping the command.
+#[test]
+fn a_disabled_compressor_keeps_its_bypass_copy() {
+    let data = fixture("commands_rev15_current");
+    let mut reader = Reader { data, offset: 0 };
+    let case = Case::read(&mut reader);
+    let steps: Vec<Step<'_>> = (0..reader.u32()).map(|_| Step::read(&mut reader)).collect();
+    let mut system = case.open();
+    let mut effect_enabled = Vec::new();
+    for step in &steps {
+        step.update(&mut system);
+        system.generate_command(case.channels);
+        for entry in &system.command_list.commands {
+            if let Command::Compressor(command) = &entry.command {
+                assert!(entry.enabled);
+                effect_enabled.push(command.effect_enabled);
+            }
+        }
+    }
+    assert_eq!(effect_enabled, [true, true, false]);
+}
+
 /// The fixture's playing voices from lowest to highest priority; voice 3 has the highest
 /// priority and is never dropped.
 const DROP_ORDER: [usize; 3] = [0, 1, 2];
@@ -598,49 +627,10 @@ fn voice_drop_removes_lowest_priority_voices_first() {
     );
 }
 
-/// Counts the allocations of the thread that armed it, so tests running alongside on other
-/// threads do not add to the count.
-struct CountingAllocator;
-
-thread_local! {
-    static COUNTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static ALLOCATIONS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
-
-// SAFETY: forwards every call to the system allocator unchanged; the counter is a const
-// initialized thread local, which does not allocate.
-unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        if COUNTING.get() {
-            ALLOCATIONS.set(ALLOCATIONS.get() + 1);
-        }
-        // SAFETY: the caller upholds alloc's contract, which System shares.
-        unsafe { std::alloc::System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
-        // SAFETY: ptr came from System.alloc with this layout.
-        unsafe { std::alloc::System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
-        if COUNTING.get() {
-            ALLOCATIONS.set(ALLOCATIONS.get() + 1);
-        }
-        // SAFETY: the caller upholds realloc's contract, which System shares.
-        unsafe { std::alloc::System.realloc(ptr, layout, size) }
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
-
-fn allocations_of(f: impl FnOnce()) -> u32 {
-    ALLOCATIONS.set(0);
-    COUNTING.set(true);
-    f();
-    COUNTING.set(false);
-    ALLOCATIONS.get()
+/// Allocations the current thread makes while `f` runs; tests running alongside on other threads
+/// do not add to the count.
+fn allocations_of(f: impl FnOnce()) -> u64 {
+    allocation_counter::measure(f).count_total
 }
 
 /// Generation reuses the command list, so once a frame has sized it, later frames allocate

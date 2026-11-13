@@ -48,7 +48,8 @@ impl ProcessingTimeEstimator {
     }
 
     /// The estimate for `entry`. Like the reference, it reads the entry's `enabled` flag, not the
-    /// effect's.
+    /// effect's, except for the compressor: the reference stores the compressor effect's enable
+    /// in that flag, which the port carries in `effect_enabled`.
     pub fn estimate(&self, entry: &CommandEntry) -> u32 {
         match self.version {
             EstimatorVersion::V1 => self.estimate_v1(entry),
