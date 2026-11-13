@@ -70,6 +70,10 @@ pub struct Profile {
     /// (`quadDivergentImplicitLod`). Without it, a fragment program that samples a descriptor
     /// array at an index not provably uniform across the draw samples with explicit gradients.
     pub support_quad_divergent_implicit_lod: bool,
+    /// The `SampleRateShading` and `InterpolationFunction` capabilities
+    /// (`sampleRateShading`). Without them a fragment program runs once per pixel: the sample
+    /// index reads as 0 and IPA.OFFSET interpolates generic inputs at the pixel centre.
+    pub support_sample_rate_shading: bool,
 
     pub lower_left_origin_mode: bool,
     /// Declare every fragment colour output even when unwritten.
@@ -158,6 +162,7 @@ impl Default for Profile {
             support_uniform_texel_buffer_array_nonuniform_indexing: false,
             support_storage_texel_buffer_array_nonuniform_indexing: false,
             support_quad_divergent_implicit_lod: false,
+            support_sample_rate_shading: true,
             lower_left_origin_mode: false,
             need_declared_frag_colors: false,
             need_fastmath_off: false,

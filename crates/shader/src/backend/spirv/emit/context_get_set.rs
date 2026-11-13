@@ -419,7 +419,8 @@ fn load_vertex_id(ctx: &mut EmitContext<'_>) -> EmitResult<Word> {
 }
 
 /// A fragment program's generic input component interpolated at an offset from the pixel centre.
-/// Inputs declared with integer components are flat, so they load unchanged.
+/// Inputs declared with integer components are flat, so they load unchanged, as does every input
+/// on a host without sample rate shading.
 pub(super) fn interpolate_at_offset(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
     if ctx.stage != ShaderStage::Fragment {
         return Err(EmitError::UnsupportedStage(ctx.stage));
@@ -437,7 +438,7 @@ pub(super) fn interpolate_at_offset(ctx: &mut EmitContext<'_>, inst: InstId) -> 
     let pointer = ctx
         .b
         .access_chain(generic.pointer_type, None, generic.id, [element])?;
-    if generic.load_op != InputGenericLoadOp::None {
+    if generic.load_op != InputGenericLoadOp::None || !ctx.profile.support_sample_rate_shading {
         let value = ctx
             .b
             .load(generic.component_type, None, pointer, None, [])?;
@@ -724,6 +725,9 @@ pub(super) fn invocation_info(ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitR
 }
 
 pub(super) fn sample_id(ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<Word> {
+    if !ctx.profile.support_sample_rate_shading {
+        return Ok(ctx.u32_zero_value);
+    }
     Ok(ctx.b.load(ctx.u32[1], None, ctx.sample_id, None, [])?)
 }
 

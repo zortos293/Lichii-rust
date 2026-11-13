@@ -428,7 +428,7 @@ fn setup_capabilities(ctx: &mut EmitContext<'_>) {
     if info.uses_typeless_image_writes {
         ctx.add_capability(Capability::StorageImageWriteWithoutFormat);
     }
-    if info.uses_sample_id {
+    if info.uses_sample_id && profile.support_sample_rate_shading {
         ctx.add_capability(Capability::SampleRateShading);
     }
     if info.uses_derivatives {
