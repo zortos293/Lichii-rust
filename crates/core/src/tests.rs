@@ -71,10 +71,10 @@ fn settings(console: ConsoleGeneration) -> Arc<Settings> {
 fn boots_an_nso_and_runs_it_to_exit() {
     for console in [ConsoleGeneration::Switch1, ConsoleGeneration::Switch2] {
         let file = TempFile::new("exit.nso", &nso(&exit_program()));
-        let mut system = System::boot(settings(console), &file.0).unwrap();
+        let mut system = System::boot(settings(console), &file.0, headless_renderer()).unwrap();
         assert_eq!(system.console(), console);
         assert_eq!(system.kernel().core_count(), console.core_count());
-        assert!(system.nx2_memory().is_none());
+        assert!(system.gpu().nx2_memory().is_none());
         assert_eq!(system.wait_for_exit(Some(Duration::ZERO)), None);
         system.run().unwrap();
         assert_eq!(
@@ -93,7 +93,12 @@ fn pause_freezes_guest_time() {
         "pause.nso",
         &nso(&[0x14000000u32.to_le_bytes(), [0; 4]].concat()),
     );
-    let mut system = System::boot(settings(ConsoleGeneration::Switch1), &file.0).unwrap();
+    let mut system = System::boot(
+        settings(ConsoleGeneration::Switch1),
+        &file.0,
+        headless_renderer(),
+    )
+    .unwrap();
     system.run().unwrap();
     assert_eq!(system.wait_for_exit(Some(Duration::from_millis(20))), None);
     system.pause();
@@ -112,7 +117,11 @@ fn pause_freezes_guest_time() {
 fn missing_title_is_a_loader_error() {
     let missing = std::env::temp_dir().join("lichii-core-no-such-title.nso");
     assert!(matches!(
-        System::boot(settings(ConsoleGeneration::Switch1), &missing),
+        System::boot(
+            settings(ConsoleGeneration::Switch1),
+            &missing,
+            headless_renderer()
+        ),
         Err(SystemError::Loader(_))
     ));
 }

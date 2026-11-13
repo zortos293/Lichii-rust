@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 use lichii_common::{ConsoleGeneration, HleResult, PAGE_SIZE, VAddr, align_up};
-use lichii_cpu::{CpuConfig, CpuCore, GuestClock};
+use lichii_cpu::{CpuConfig, CpuCore};
 use lichii_loader::program::ProgramImage;
 use lichii_memory::{
     AddressSpace, ExclusiveMonitor, MemoryPermission, PhysicalMemory, PhysicalMemoryError,
@@ -56,6 +56,7 @@ use crate::util::Rng;
 
 pub use crate::event::Event;
 pub use crate::memory::Pool;
+pub use lichii_cpu::GuestClock;
 
 /// A range of translated code to drop: `(process, address, size)`.
 pub(crate) type CodeRange = (ProcessId, VAddr, u64);
@@ -189,6 +190,12 @@ impl Kernel {
 
     pub fn core_count(&self) -> usize {
         self.0.scheduler.core_count()
+    }
+
+    /// The guest system counter the cores read (`CNTPCT_EL0`, `CNTFRQ_EL0`); services take guest
+    /// ticks and time from it.
+    pub fn clock(&self) -> &Arc<dyn GuestClock> {
+        &self.0.clock
     }
 
     pub fn physical_memory(&self) -> &Arc<PhysicalMemory> {
