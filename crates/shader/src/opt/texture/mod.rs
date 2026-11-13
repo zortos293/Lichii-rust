@@ -158,6 +158,8 @@ fn indexed(op: Opcode) -> Option<(Opcode, bool)> {
         BindlessImageQueryDimensions => (ImageQueryDimensions, true),
         BoundImageQueryLod => (ImageQueryLod, false),
         BindlessImageQueryLod => (ImageQueryLod, true),
+        BoundImageQuerySamples => (ImageQuerySamples, false),
+        BindlessImageQuerySamples => (ImageQuerySamples, true),
         BoundImageGradient => (ImageGradient, false),
         BindlessImageGradient => (ImageGradient, true),
         BoundImageRead => (ImageRead, false),
@@ -223,6 +225,7 @@ fn is_sampled_image(op: Opcode) -> bool {
             | ImageFetch
             | ImageQueryDimensions
             | ImageQueryLod
+            | ImageQuerySamples
             | ImageGradient
     )
 }
@@ -630,6 +633,7 @@ struct Tracker<'a> {
     handles: FxHashMap<HandleSource, u32>,
     types: FxHashMap<HandleSource, TextureType>,
     integers: FxHashMap<HandleSource, bool>,
+    multisamples: FxHashMap<HandleSource, bool>,
     phis: FxHashMap<(InstId, BlockId), Value>,
     tracked: FxHashMap<TrackKey, Option<CbufAddr>>,
     /// The handle program and table index word built for a search start.
@@ -651,6 +655,7 @@ impl<'a> Tracker<'a> {
             handles: FxHashMap::default(),
             types: FxHashMap::default(),
             integers: FxHashMap::default(),
+            multisamples: FxHashMap::default(),
             phis: FxHashMap::default(),
             tracked: FxHashMap::default(),
             built: FxHashMap::default(),
@@ -704,6 +709,20 @@ impl<'a> Tracker<'a> {
         ty
     }
 
+    fn is_multisample(&mut self, cbuf: &CbufAddr) -> bool {
+        if !cbuf.is_word() {
+            return false;
+        }
+        let source = cbuf.handle;
+        if let Some(&multisample) = self.multisamples.get(&source) {
+            return multisample;
+        }
+        let handle = self.handle(source);
+        let multisample = self.env.is_texture_multisample(handle);
+        self.multisamples.insert(source, multisample);
+        multisample
+    }
+
     fn is_integer(&mut self, cbuf: &CbufAddr) -> bool {
         if !cbuf.is_word() {
             return false;
@@ -726,11 +745,11 @@ impl<'a> Tracker<'a> {
         self.env.texture_pixel_format(handle)
     }
 
-    /// The type the pass gives `op`'s texture: a size query carries none and takes the
-    /// descriptor's; a 1D fetch from a texture buffer becomes a buffer fetch.
+    /// The type the pass gives `op`'s texture: a size or sample count query carries none and
+    /// takes the descriptor's; a 1D fetch from a texture buffer becomes a buffer fetch.
     fn resolved_type(&mut self, op: Opcode, ty: TextureType, cbuf: &CbufAddr) -> TextureType {
         match op {
-            Opcode::ImageQueryDimensions => self.texture_type(cbuf),
+            Opcode::ImageQueryDimensions | Opcode::ImageQuerySamples => self.texture_type(cbuf),
             Opcode::ImageFetch
                 if ty == TextureType::Color1D && self.texture_type(cbuf) == TextureType::Buffer =>
             {
@@ -1062,7 +1081,10 @@ pub fn texture_pass(
     for texture in &textures {
         let op = prog.op(texture.inst);
         if let Some(program) = texture.cbuf.program
-            && op != Opcode::BindlessImageQueryDimensions
+            && !matches!(
+                op,
+                Opcode::BindlessImageQueryDimensions | Opcode::BindlessImageQuerySamples
+            )
         {
             let ty = TextureInstInfo::from_flags(prog.inst(texture.inst).flags).ty;
             tracker.program_types.entry(program).or_insert(ty);
@@ -1128,7 +1150,11 @@ fn bind(
         )
         && tracker.texture_type(&cbuf) == TextureType::Color2DRect;
     match op {
-        Opcode::ImageQueryDimensions => flags.ty = tracker.resolved_type(op, flags.ty, &cbuf),
+        Opcode::ImageQueryDimensions | Opcode::ImageQuerySamples => {
+            flags.ty = tracker.resolved_type(op, flags.ty, &cbuf);
+            is_multisample = matches!(flags.ty, TextureType::Color2D | TextureType::ColorArray2D)
+                && tracker.is_multisample(&cbuf);
+        }
         Opcode::ImageFetch => {
             if matches!(
                 flags.ty,

@@ -40,6 +40,10 @@ enum Query {
         handle: u32,
         integer: bool,
     },
+    Multisample {
+        handle: u32,
+        multisample: bool,
+    },
     ViewportTransform(u32),
     TextureBoundBuffer(u32),
     LocalMemorySize(u32),
@@ -89,6 +93,10 @@ impl Query {
             Query::IntegerFormat { handle, integer } => {
                 env.is_texture_pixel_format_integer(handle) == integer
             }
+            Query::Multisample {
+                handle,
+                multisample,
+            } => env.is_texture_multisample(handle) == multisample,
             Query::ViewportTransform(state) => env.viewport_transform_state() == state,
             Query::TextureBoundBuffer(buffer) => env.texture_bound_buffer() == buffer,
             Query::LocalMemorySize(size) => env.local_memory_size() == size,
@@ -234,6 +242,14 @@ impl ShaderEnvironment for Logger<'_> {
         let integer = self.env.is_texture_pixel_format_integer(handle);
         self.log(Query::IntegerFormat { handle, integer });
         integer
+    }
+    fn is_texture_multisample(&self, handle: u32) -> bool {
+        let multisample = self.env.is_texture_multisample(handle);
+        self.log(Query::Multisample {
+            handle,
+            multisample,
+        });
+        multisample
     }
     fn viewport_transform_state(&self) -> u32 {
         let state = self.env.viewport_transform_state();

@@ -1711,6 +1711,15 @@ fn lea_shifts_and_adds() {
     assert_eq!(translate(&[inst]).unwrap(), expected);
 }
 
+/// Without .HI only the low word of `a << s` is added, which the sign of `a` never reaches.
+#[test]
+fn lea_sx32_low_form_is_the_plain_lea() {
+    let fields = dst(0) | a(1) | b(2) | c(RZ) | (3 << 75) | pred(81, PT);
+    let plain = translate(&[encode(Opcode::Lea, Form::RegReg, fields)]).unwrap();
+    let sign_extended = translate(&[encode(Opcode::Lea, Form::RegReg, fields | bit(73))]).unwrap();
+    assert_eq!(sign_extended, plain);
+}
+
 #[test]
 fn ulea_hi_of_uniform_registers() {
     let inst = encode(
@@ -1961,12 +1970,22 @@ pub(crate) fn spirv_opcodes(code: &[u32]) -> Vec<u16> {
 /// Compiles `code` and an EXIT as a fragment program writing R0..R11 to three render
 /// targets, checks the module with spirv-val, and returns its opcodes.
 pub(crate) fn compile_fragment_and_validate(name: &str, code: &[Instruction]) -> Vec<u16> {
+    validate_fragment(name, &fragment_env(code))
+}
+
+/// A fragment program running `code` then EXIT, with every output written.
+pub(crate) fn fragment_env(code: &[Instruction]) -> TestEnv {
     let mut code = code.to_vec();
     code.push(encode(Opcode::Exit, Form::Fixed, pred(87, PT)));
     let mut env = TestEnv::new(&code);
     env.stage = ShaderStage::Fragment;
     env.header[18] = 0xfff;
     env.cbuf = (0..64).map(|i| i * 0x0101_0101).collect();
+    env
+}
+
+/// Compiles `env`, validates the SPIR-V and returns its opcodes.
+pub(crate) fn validate_fragment(name: &str, env: &TestEnv) -> Vec<u16> {
     let profile = crate::Profile::default();
     let options = crate::translate::TranslateOptions {
         profile: &profile,
@@ -1974,7 +1993,7 @@ pub(crate) fn compile_fragment_and_validate(name: &str, code: &[Instruction]) ->
         resolution_scale: lichii_common::settings::ResolutionScale::X1,
     };
     let module = crate::module::compile(
-        &env,
+        env,
         options,
         &crate::RuntimeInfo::default(),
         &mut crate::backend::Bindings::default(),

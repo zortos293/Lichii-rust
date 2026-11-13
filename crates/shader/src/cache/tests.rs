@@ -26,6 +26,7 @@ struct Answers {
     texture_type: TextureType,
     pixel_format: TexturePixelFormat,
     integer: bool,
+    multisample: bool,
     viewport: u32,
     bound_buffer: u32,
     local_memory: u32,
@@ -52,6 +53,7 @@ impl Default for Answers {
             texture_type: TextureType::Color2D,
             pixel_format: TexturePixelFormat::A8b8g8r8Unorm,
             integer: false,
+            multisample: false,
             viewport: 1,
             bound_buffer: 2,
             local_memory: 0,
@@ -101,6 +103,9 @@ impl ShaderEnvironment for Answers {
     fn is_texture_pixel_format_integer(&self, _: u32) -> bool {
         self.integer
     }
+    fn is_texture_multisample(&self, _: u32) -> bool {
+        self.multisample
+    }
     fn viewport_transform_state(&self) -> u32 {
         self.viewport
     }
@@ -141,7 +146,7 @@ type Change = fn(&mut Answers);
 
 #[test]
 fn a_record_matches_only_the_answers_it_saw() {
-    let cases: [(Ask, Change); 21] = [
+    let cases: [(Ask, Change); 22] = [
         (
             |e| format!("{:?}", e.arch()),
             |a| a.arch = ShaderArch::Ampere,
@@ -175,6 +180,10 @@ fn a_record_matches_only_the_answers_it_saw() {
         (
             |e| format!("{:?}", e.is_texture_pixel_format_integer(7)),
             |a| a.integer = true,
+        ),
+        (
+            |e| format!("{:?}", e.is_texture_multisample(7)),
+            |a| a.multisample = true,
         ),
         (
             |e| format!("{:?}", e.viewport_transform_state()),

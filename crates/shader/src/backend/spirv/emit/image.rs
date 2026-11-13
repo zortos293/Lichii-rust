@@ -1088,7 +1088,10 @@ pub(super) fn image_fetch(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult
     let result_type = color_type(ctx, is_integer);
     let coords = ctx.def_arg(inst, 1)?;
     let offset = ctx.def_opt(ctx.arg(inst, 2))?;
-    let ms = ctx.def_opt(ctx.arg(inst, 4))?;
+    let ms = match ctx.def_opt(ctx.arg(inst, 4))? {
+        None if is_texture_msaa(ctx, info)? => Some(ctx.u32_zero_value),
+        ms => ms,
+    };
     let lod = if info.ty == TextureType::Buffer || ms.is_some() {
         None
     } else {
@@ -1144,6 +1147,16 @@ pub(super) fn image_query_dimensions(ctx: &mut EmitContext<'_>, inst: InstId) ->
     constituents.extend(std::iter::repeat_n(zero, 3 - components));
     constituents.push(mips);
     Ok(ctx.b.composite_construct(ctx.u32[4], None, constituents)?)
+}
+
+/// `OpImageQuerySamples` on a multisampled texture; every other texture has one sample.
+pub(super) fn image_query_samples(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
+    let info = TextureInstInfo::from_flags(ctx.flags(inst));
+    if !is_texture_msaa(ctx, info)? {
+        return Ok(ctx.const_u32(1));
+    }
+    let image = texture_image(ctx, inst, info)?;
+    Ok(ctx.b.image_query_samples(ctx.u32[1], None, image)?)
 }
 
 pub(super) fn image_query_lod(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {

@@ -148,4 +148,8 @@ impl ShaderEnvironment for Recorder<'_> {
     fn mesh_state(&self) -> Option<MeshState> {
         self.record(20, self.env.mesh_state())
     }
+    fn is_texture_multisample(&self, raw_handle: u32) -> bool {
+        self.record(21, raw_handle);
+        self.record(21, self.env.is_texture_multisample(raw_handle))
+    }
 }

@@ -2172,16 +2172,16 @@ impl VulkanRasterizer {
             if !self.bind_resources(&module, &sources)? {
                 return Ok(());
             }
-            let grid = match ctx.indirect_grid {
-                Some(address) => match self.buffer_cache.storage_buffer(
+            let grid = match ctx.indirect {
+                Some(grid) => match self.buffer_cache.storage_buffer(
                     &mut self.scheduler,
                     &mut self.staging,
                     ctx.memory,
-                    address,
-                    8,
+                    grid.address,
+                    grid.size(),
                     false,
                 )? {
-                    Some(binding) => Some((binding, address)),
+                    Some(binding) => Some((binding, grid)),
                     None => return Ok(()),
                 },
                 None => None,
@@ -2194,9 +2194,12 @@ impl VulkanRasterizer {
         let cmd = self.scheduler.record()?;
         let align = self.buffer_cache.storage_alignment();
         let grid = match grid {
-            Some((binding, address)) => {
-                Some(self.unpack_grid(cmd, binding, (address & (align - 1)) as u32)?)
-            }
+            Some((binding, grid)) => Some(self.unpack_grid(
+                cmd,
+                binding,
+                (grid.address & (align - 1)) as u32,
+                grid.layout,
+            )?),
             None => None,
         };
         for &id in &self.draw.textures {
