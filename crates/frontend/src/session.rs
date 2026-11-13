@@ -56,6 +56,8 @@ impl From<SystemError> for BootError {
 
 pub struct Session {
     pub path: PathBuf,
+    /// The title's name: its NACP name in the configured language, else the name the game list
+    /// shows (a loose dump's game folder), else the file name.
     pub title: String,
     /// The loaded program's id; 0 for homebrew and bare NSOs.
     pub program_id: u64,
@@ -113,6 +115,19 @@ impl Session {
         tracing::info!("booting {} ({})", path.display(), kind.label());
         let image = lichii_loader::load(path, &options).map_err(SystemError::from)?;
         let program_id = image.program_id;
+        let title = image
+            .nacp
+            .as_ref()
+            .and_then(|nacp| nacp.preferred_title(options.language))
+            .map(|entry| entry.name.clone())
+            .filter(|name| !name.is_empty())
+            .or_else(|| {
+                lichii_loader::scan(path, &options)
+                    .ok()
+                    .map(|info| info.name)
+                    .filter(|name| !name.is_empty())
+            })
+            .unwrap_or_else(|| file_title(path, kind));
         if handover.is_some() && program_id & PROGRAM_INDEX_MASK != u64::from(options.program_index)
         {
             return Err(BootError::NoProgram(options.program_index));
@@ -128,11 +143,19 @@ impl Session {
         system.run()?;
         Ok(Self {
             path: path.to_path_buf(),
-            title: title(path, kind),
+            title,
             program_id,
             applets,
             system,
         })
+    }
+
+    /// The title's name with its program id, as the window title shows it.
+    pub fn display_title(&self) -> String {
+        match self.program_id {
+            0 => self.title.clone(),
+            id => format!("{} [{id:016X}]", self.title),
+        }
     }
 
     pub fn is_paused(&self) -> bool {
@@ -190,7 +213,7 @@ impl Session {
 
 /// The name a title shows: its file name without extension, or for an ExeFS directory the
 /// directory name (the parent of an `exefs` folder).
-fn title(path: &Path, kind: GameKind) -> String {
+fn file_title(path: &Path, kind: GameKind) -> String {
     let name = if kind == GameKind::ExeFs && path.ends_with("exefs") {
         path.parent().unwrap_or(path)
     } else {
@@ -331,9 +354,75 @@ mod tests {
         .unwrap();
         assert_eq!(booted_as, Some((program_id, ConsoleGeneration::Switch1)));
         assert_eq!(session.program_id, program_id);
-        assert_eq!(session.title, "Kart");
+        assert_eq!(session.title, "Synthetic Kart");
+        assert_eq!(session.display_title(), "Synthetic Kart [0100000000010000]");
         assert_eq!(session.exit_reason(), None);
         drop(session);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_loose_dump_is_named_by_its_nacp_else_its_game_folder() {
+        use lichii_fs::nacp::NacpLanguage;
+        use lichii_loader::testing::{AcidLayout, NpdmSpec, build_npdm, svc_mask, thread_info};
+
+        let program_id = 0x0400_0000_0003_0000;
+        let mut capabilities = vec![thread_info(63, 16, 0, 3)];
+        capabilities.extend((0..8).map(|index| svc_mask(index, 0xff_ffff)));
+        let npdm = build_npdm(&NpdmSpec {
+            program_id,
+            layout: AcidLayout::Switch2,
+            capabilities,
+            ..NpdmSpec::default()
+        });
+        let dir = temp_dir("loose");
+        let game = dir.join("SyntheticTennis_v1.1.1");
+        let exefs = game.join("base/exefs");
+        std::fs::create_dir_all(&exefs).unwrap();
+        std::fs::write(exefs.join("main.npdm"), npdm).unwrap();
+        std::fs::write(
+            exefs.join("main"),
+            nso(&[0x14000000u32.to_le_bytes(), [0; 4]].concat()),
+        )
+        .unwrap();
+        let boot = |language| {
+            let options = LoadOptions {
+                language,
+                ..LoadOptions::default()
+            };
+            Session::boot(&exefs, options, None, |_, _| (settings(), Host::headless())).unwrap()
+        };
+
+        let session = boot(NacpLanguage::AmericanEnglish);
+        assert_eq!(
+            session.title, "SyntheticTennis_v1.1.1",
+            "not the storage folder"
+        );
+        assert_eq!(
+            session.display_title(),
+            "SyntheticTennis_v1.1.1 [0400000000030000]"
+        );
+        drop(session);
+
+        let mut nacp = vec![0u8; lichii_fs::nacp::NACP_SIZE];
+        for (language, name) in [
+            (NacpLanguage::AmericanEnglish, "Synthetic Tennis"),
+            (NacpLanguage::Japanese, "Gousei Tenisu"),
+        ] {
+            let at = language as usize * 0x300;
+            nacp[at..at + name.len()].copy_from_slice(name.as_bytes());
+        }
+        std::fs::write(game.join("base/control.nacp"), nacp).unwrap();
+        assert_eq!(
+            boot(NacpLanguage::AmericanEnglish).title,
+            "Synthetic Tennis"
+        );
+        assert_eq!(boot(NacpLanguage::Japanese).title, "Gousei Tenisu");
+        assert_eq!(
+            boot(NacpLanguage::German).display_title(),
+            "Synthetic Tennis [0400000000030000]",
+            "a language without a name falls back to American English"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -451,11 +540,14 @@ mod tests {
     #[test]
     fn titles_come_from_file_and_exefs_directory_names() {
         assert_eq!(
-            title(Path::new("/g/Some Game.nro"), GameKind::Nro),
+            file_title(Path::new("/g/Some Game.nro"), GameKind::Nro),
             "Some Game"
         );
-        assert_eq!(title(Path::new("/g/Title/exefs"), GameKind::ExeFs), "Title");
-        assert_eq!(title(Path::new("/g/Other"), GameKind::ExeFs), "Other");
+        assert_eq!(
+            file_title(Path::new("/g/Title/exefs"), GameKind::ExeFs),
+            "Title"
+        );
+        assert_eq!(file_title(Path::new("/g/Other"), GameKind::ExeFs), "Other");
     }
 
     #[test]
