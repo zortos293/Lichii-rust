@@ -87,6 +87,7 @@ pub(crate) fn shader_profile(
         support_demote_to_helper_invocation: features.demote_to_helper_invocation,
         support_derivative_control: true,
         support_mesh_shader: features.mesh_shader,
+        support_quad_divergent_implicit_lod: on(v12.quad_divergent_implicit_lod),
         support_sampled_image_array_nonuniform_indexing: features
             .sampled_image_array_non_uniform_indexing,
         support_storage_image_array_nonuniform_indexing: features
@@ -125,8 +126,7 @@ pub(crate) fn shader_profile(
         support_int64: features.shader_int64,
         support_viewport_index_layer: profile.support_viewport_index_layer_non_geometry,
         support_handle_programs: true,
-        support_handle_table_arrays: features.sampled_image_array_non_uniform_indexing
-            && on(v12.quad_divergent_implicit_lod),
+        support_handle_table_arrays: features.sampled_image_array_non_uniform_indexing,
         ..HostTranslateInfo::default()
     };
     (profile, host)
