@@ -1,13 +1,14 @@
 //! Differential tests against Unicorn (QEMU's A64 translator): random instruction streams per
 //! encoding class run on both, then every general register, SP, NZCV, every vector register and
-//! the whole data region are compared.
+//! the whole data region are compared. Both the interpreter and the JIT run every stream.
 //!
 //! `LICHII_DIFF_CASES` sets the number of streams per class (default 300).
 
 use std::sync::Arc;
 
+use lichii_common::settings::CpuBackend;
 use lichii_cpu::decoder::{Inst, decode};
-use lichii_cpu::{CpuConfig, CpuCore, GuestClock, HaltReason, Interpreter, ThreadContext};
+use lichii_cpu::{CpuConfig, CpuCore, GuestClock, HaltReason, ThreadContext, new_core};
 use lichii_memory::{AddressSpace, ExclusiveMonitor, MemoryPermission, PhysicalMemory};
 use unicorn_engine::{Arch, Arm64CpuModel, Mode, Prot, RegisterARM64, Unicorn};
 
@@ -169,16 +170,17 @@ impl GuestClock for Clock {
 }
 
 struct Ours {
-    core: Interpreter,
+    name: &'static str,
+    core: Box<dyn CpuCore>,
     mem: Arc<AddressSpace>,
 }
 
 impl Ours {
-    fn new() -> Self {
-        let mem = Arc::new(AddressSpace::new(
-            Arc::new(PhysicalMemory::new(1 << 20).unwrap()),
-            39,
-        ));
+    fn new(backend: CpuBackend) -> Self {
+        let mem = Arc::new(
+            AddressSpace::with_fastmem(Arc::new(PhysicalMemory::new(1 << 20).unwrap()), 39)
+                .unwrap(),
+        );
         mem.map(CODE, 0, CODE_SIZE, MemoryPermission::READ_EXECUTE);
         let pages = DATA_SIZE / 0x1000;
         for page in 0..pages {
@@ -190,15 +192,22 @@ impl Ours {
                 MemoryPermission::READ_WRITE,
             );
         }
-        let core = Interpreter::new(CpuConfig {
-            memory: mem.clone(),
-            monitor: Arc::new(ExclusiveMonitor::new(1)),
-            clock: Arc::new(Clock),
-            core_index: 0,
-            ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
-            dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
-        });
-        Self { core, mem }
+        let core = new_core(
+            backend,
+            CpuConfig {
+                memory: mem.clone(),
+                monitor: Arc::new(ExclusiveMonitor::new(1)),
+                clock: Arc::new(Clock),
+                core_index: 0,
+                ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
+                dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+            },
+        );
+        let name = match backend {
+            CpuBackend::Interpreter => "interpreter",
+            CpuBackend::Jit => "jit",
+        };
+        Self { name, core, mem }
     }
 
     fn run(&mut self, code: &[u8], state: &State, data: &[u8]) -> Result<(State, Vec<u8>), String> {
@@ -231,7 +240,7 @@ impl Ours {
         self.core.interrupt_handle().take();
         let end = CODE + code.len() as u64 - 4;
         if halt != HaltReason::Breakpoint(0) || ctx.pc != end {
-            return Err(format!("interpreter: {halt:?} at {:#x}", ctx.pc));
+            return Err(format!("{}: {halt:?} at {:#x}", self.name, ctx.pc));
         }
         let mut data = vec![0; DATA_SIZE as usize];
         self.mem.read_bytes(DATA, &mut data).unwrap();
@@ -316,7 +325,7 @@ fn initial_state(rng: &mut Rng) -> State {
 fn differential(name: &str, seed: u64, generate: Generator) {
     let mut rng = Rng(seed);
     let mut oracle = Oracle::new();
-    let mut ours = Ours::new();
+    let mut ours = backends();
     let mut data = vec![0u8; DATA_SIZE as usize];
     let mut stream = Vec::new();
     for case in 0..cases() {
@@ -337,10 +346,11 @@ fn differential(name: &str, seed: u64, generate: Generator) {
     }
 }
 
-/// Runs `stream` followed by `BRK #0` on both and panics on any difference.
+/// Runs `stream` followed by `BRK #0` on Unicorn and on each of `ours`, and panics on any
+/// difference.
 fn compare(
     oracle: &mut Oracle,
-    ours: &mut Ours,
+    ours: &mut [Ours],
     name: &str,
     stream: &[u32],
     state: &State,
@@ -352,29 +362,38 @@ fn compare(
         .flat_map(|w| w.to_le_bytes())
         .collect();
     let expected = oracle.run(&code, state, data);
-    let actual = ours.run(&code, state, data);
     let words: Vec<String> = stream.iter().map(|w| format!("{w:08x}")).collect();
-    let context = format!("{name}: {}", words.join(" "));
-    match (expected, actual) {
-        (Ok((es, em)), Ok((as_, am))) => {
-            if as_ != es {
-                panic!("{context}\n{}", describe(state, &es, &as_));
+    for ours in ours {
+        let actual = ours.run(&code, state, data);
+        let context = format!("{name} ({}): {}", ours.name, words.join(" "));
+        match (&expected, actual) {
+            (Ok((es, em)), Ok((as_, am))) => {
+                if as_ != *es {
+                    panic!("{context}\n{}", describe(state, es, &as_));
+                }
+                if let Some(i) = (0..em.len()).find(|&i| em[i] != am[i]) {
+                    panic!(
+                        "{context}\nmemory differs at {:#x}: unicorn {:#x}, ours {:#x}",
+                        DATA + i as u64,
+                        em[i],
+                        am[i]
+                    );
+                }
             }
-            if let Some(i) = (0..em.len()).find(|&i| em[i] != am[i]) {
-                panic!(
-                    "{context}\nmemory differs at {:#x}: unicorn {:#x}, ours {:#x}",
-                    DATA + i as u64,
-                    em[i],
-                    am[i]
-                );
-            }
+            (e, a) => panic!(
+                "{context}\nunicorn {:?}\nours {:?}",
+                e.as_ref().map(|_| ()),
+                a.map(|_| ())
+            ),
         }
-        (e, a) => panic!(
-            "{context}\nunicorn {:?}\nours {:?}",
-            e.map(|_| ()),
-            a.map(|_| ())
-        ),
     }
+}
+
+fn backends() -> [Ours; 2] {
+    [
+        Ours::new(CpuBackend::Interpreter),
+        Ours::new(CpuBackend::Jit),
+    ]
 }
 
 /// Runs `stream` on both from a state where `regs` override the zeroed general registers.
@@ -392,7 +411,7 @@ fn directed(stream: &[u32], regs: &[(usize, u64)]) {
     let data = vec![0u8; DATA_SIZE as usize];
     compare(
         &mut Oracle::new(),
-        &mut Ours::new(),
+        &mut backends(),
         "directed",
         stream,
         &state,

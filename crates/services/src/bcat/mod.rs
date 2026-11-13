@@ -241,7 +241,7 @@ mod tests {
     use lichii_common::settings::Settings;
 
     use super::*;
-    use crate::testing::{self, Guest, PROGRAM_ID, Request};
+    use crate::testing::{self, Guest, PROGRAM_ID, ReplyExt, Request};
 
     fn name(text: &str) -> [u8; NAME_SIZE] {
         let mut name = [0u8; NAME_SIZE];
@@ -263,7 +263,7 @@ mod tests {
         }
         let creator = guest.service("bcat:u");
         let bcat = guest
-            .call(creator, Request::new(0).pid().arg(0u64))
+            .call(creator, Request::new(0).send_pid().arg(0u64))
             .ok()
             .interface();
         let out = guest.heap;
@@ -273,7 +273,10 @@ mod tests {
             assert!(guest.is_signaled(event));
             guest.write(out, &[0xaa; PROGRESS_SIZE]);
             guest
-                .call(progress, Request::new(1).output(out, PROGRESS_SIZE as u64))
+                .call(
+                    progress,
+                    Request::new(1).buffer_b(out, PROGRESS_SIZE as u64),
+                )
                 .ok();
             let state = guest.read(out, PROGRESS_SIZE);
             assert_eq!(state[..4], STATUS_DONE.to_le_bytes());
@@ -284,12 +287,20 @@ mod tests {
         guest
             .call(
                 bcat,
-                Request::new(30100).arg(PROGRAM_ID).input(passphrase, 0x40),
+                Request::new(30100)
+                    .arg(PROGRAM_ID)
+                    .buffer_a(passphrase, 0x40),
             )
             .ok();
-        let empty_id = guest.call(bcat, Request::new(30100).arg(0u64).input(passphrase, 0x40));
+        let empty_id = guest.call(
+            bcat,
+            Request::new(30100).arg(0u64).buffer_a(passphrase, 0x40),
+        );
         assert_eq!(empty_id.result, INVALID_ARGUMENT);
-        let long = guest.call(bcat, Request::new(30100).arg(1u64).input(passphrase, 0x41));
+        let long = guest.call(
+            bcat,
+            Request::new(30100).arg(1u64).buffer_a(passphrase, 0x41),
+        );
         assert_eq!(long.result, INVALID_ARGUMENT);
         guest.call(bcat, Request::new(30300)).ok();
         guest.call(bcat, Request::new(90201).arg(PROGRAM_ID)).ok();
@@ -309,7 +320,7 @@ mod tests {
             .interface();
         let out = guest.heap;
         let directories = guest
-            .call(storage, Request::new(10).output(out, 0x100))
+            .call(storage, Request::new(10).buffer_b(out, 0x100))
             .ok();
         assert_eq!(directories.at::<i32>(0), 0);
 
@@ -335,7 +346,7 @@ mod tests {
         assert_eq!(guest.call(file, Request::new(2)).result, NO_OPEN_ENTRY);
 
         let storage = guest
-            .call(creator, Request::new(1).pid().arg(0u64))
+            .call(creator, Request::new(1).send_pid().arg(0u64))
             .ok()
             .interface();
         guest.call(storage, Request::new(10)).ok();

@@ -244,7 +244,7 @@ mod tests {
     use lichii_common::settings::Settings;
 
     use super::*;
-    use crate::testing::{self, Guest, PROGRAM_ID, Request};
+    use crate::testing::{self, Guest, PROGRAM_ID, ReplyExt, Request};
 
     fn guest() -> Guest {
         let mut image = testing::image();
@@ -270,7 +270,7 @@ mod tests {
         let out = guest.heap;
         for request in [Request::new(2).arg(pid), Request::new(3).arg(PROGRAM_ID)] {
             guest.write(out, &[0; 4]);
-            guest.call(arp, request.output(out, 0x4000)).ok();
+            guest.call(arp, request.buffer_b(out, 0x4000)).ok();
             assert_eq!(&guest.read(out, 3), b"Arp");
         }
 
@@ -311,7 +311,7 @@ mod tests {
         let control = guest.heap;
         guest.write(control, b"control");
         guest
-            .call(registrar, Request::new(2).input(control, 7))
+            .call(registrar, Request::new(2).buffer_a(control, 7))
             .ok();
         assert_eq!(
             guest.call(registrar, Request::new(0).arg(0u64)).result,
@@ -327,7 +327,7 @@ mod tests {
         assert_eq!(read.at::<[u8; 16]>(0), launch);
         let out = guest.heap + 0x1000;
         guest
-            .call(reader, Request::new(2).arg(pid).output(out, 0x100))
+            .call(reader, Request::new(2).arg(pid).buffer_b(out, 0x100))
             .ok();
         assert_eq!(&guest.read(out, 7), b"control");
     }

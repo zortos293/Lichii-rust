@@ -106,7 +106,7 @@ mod tests {
     use lichii_common::settings::Settings;
 
     use super::*;
-    use crate::testing::{self, Guest, Request};
+    use crate::testing::{self, Guest, ReplyExt, Request};
 
     fn guest() -> Guest {
         Guest::new(testing::image(), Settings::default(), |context| {
@@ -134,7 +134,7 @@ mod tests {
         let pki = guest.heap;
         guest.write(pki, &[1; 0x10]);
         for command in [4, 5] {
-            let request = Request::new(command).arg(0u32).input(pki, 0x10);
+            let request = Request::new(command).arg(0u32).buffer_a(pki, 0x10);
             assert_eq!(guest.call(context, request).ok().at::<u64>(0), 0);
         }
         assert_eq!(guest.call(context, Request::new(8)).ok().at::<u64>(0), 0);
@@ -157,14 +157,14 @@ mod tests {
             let service = guest.service(name);
             let ids = guest.heap;
             guest.write(ids, &(-1i32).to_le_bytes());
-            let size = guest.call(service, Request::new(3).input(ids, 4)).ok();
+            let size = guest.call(service, Request::new(3).buffer_a(ids, 4)).ok();
             assert_eq!(size.at::<u32>(0), 0x18);
 
             let out = guest.heap + 0x100;
             guest.write(out, &[0xaa; 0x20]);
-            let small = Request::new(2).input(ids, 4).output(out, 0x10);
+            let small = Request::new(2).buffer_a(ids, 4).buffer_b(out, 0x10);
             assert_eq!(guest.call(service, small).result, RESULT_UNKNOWN);
-            let certificates = Request::new(2).input(ids, 4).output(out, 0x20);
+            let certificates = Request::new(2).buffer_a(ids, 4).buffer_b(out, 0x20);
             assert_eq!(guest.call(service, certificates).ok().at::<u32>(0), 0);
             let info = guest.read(out, 0x20);
             assert_eq!(info[..0x18], CERTIFICATE_TERMINATOR);

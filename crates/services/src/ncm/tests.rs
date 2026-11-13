@@ -4,7 +4,7 @@ use lichii_loader::program::AddOnContent;
 
 use super::lr;
 use super::*;
-use crate::testing::{self, Guest, PROGRAM_ID, Request};
+use crate::testing::{self, Guest, PROGRAM_ID, ReplyExt, Request};
 
 const ADD_ON: u64 = PROGRAM_ID + 0x1001;
 
@@ -80,7 +80,7 @@ fn location_resolver_resolves_and_redirects() {
     let resolver = guest.call(lr, Request::new(0).arg(1u8)).ok().interface();
     let out = guest.heap;
     let resolve = |command: u32, id: u64| {
-        guest.call(resolver, Request::new(command).arg(id).output(out, 0x300))
+        guest.call(resolver, Request::new(command).arg(id).buffer_b(out, 0x300))
     };
     for (command, file) in [
         (0, "program"),
@@ -103,7 +103,7 @@ fn location_resolver_resolves_and_redirects() {
     let input = guest.heap + 0x1000;
     guest.write(input, b"@Sd:/moved\0");
     guest
-        .call(resolver, Request::new(1).arg(7u64).input(input, 0x300))
+        .call(resolver, Request::new(1).arg(7u64).buffer_a(input, 0x300))
         .ok();
     resolve(0, 7).ok();
     assert_eq!(path(&guest, out), "@Sd:/moved");
@@ -112,7 +112,7 @@ fn location_resolver_resolves_and_redirects() {
     guest
         .call(
             resolver,
-            Request::new(5).arg(PROGRAM_ID).input(input, 0x300),
+            Request::new(5).arg(PROGRAM_ID).buffer_a(input, 0x300),
         )
         .ok();
     resolve(2, PROGRAM_ID).ok();
@@ -135,7 +135,7 @@ fn registered_and_add_on_resolvers() {
     let resolve = |command| {
         guest.call(
             registered,
-            Request::new(command).arg(PROGRAM_ID).output(out, 0x300),
+            Request::new(command).arg(PROGRAM_ID).buffer_b(out, 0x300),
         )
     };
     assert_eq!(resolve(0).result, lr::PROGRAM_NOT_FOUND);
@@ -144,7 +144,7 @@ fn registered_and_add_on_resolvers() {
     guest
         .call(
             registered,
-            Request::new(1).arg(PROGRAM_ID).input(input, 0x300),
+            Request::new(1).arg(PROGRAM_ID).buffer_a(input, 0x300),
         )
         .ok();
     resolve(0).ok();
@@ -154,9 +154,12 @@ fn registered_and_add_on_resolvers() {
 
     let add_ons = guest.call(lr, Request::new(3)).ok().interface();
     guest
-        .call(add_ons, Request::new(0).arg(ADD_ON).output(out, 0x300))
+        .call(add_ons, Request::new(0).arg(ADD_ON).buffer_b(out, 0x300))
         .ok();
     assert_eq!(path(&guest, out), format!("@Host:/{ADD_ON:016X}/data"));
-    let missing = guest.call(add_ons, Request::new(0).arg(PROGRAM_ID).output(out, 0x300));
+    let missing = guest.call(
+        add_ons,
+        Request::new(0).arg(PROGRAM_ID).buffer_b(out, 0x300),
+    );
     assert_eq!(missing.result, lr::ADD_ON_CONTENT_NOT_FOUND);
 }

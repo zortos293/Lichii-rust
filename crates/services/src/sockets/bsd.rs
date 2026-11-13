@@ -431,7 +431,7 @@ mod tests {
     use lichii_common::settings::Settings;
 
     use super::*;
-    use crate::testing::{self, Guest, Reply, Request};
+    use crate::testing::{self, Guest, Reply, ReplyExt, Request};
 
     fn guest() -> Guest {
         Guest::new(testing::image(), Settings::default(), |context| {
@@ -482,24 +482,27 @@ mod tests {
         let fd = event_fd(&guest, user, 0, 0);
         let buffer = guest.heap;
         for command in [13, 14, 18, 21, 22] {
-            let request = Request::new(command).arg(fd).arg(0u32).input(buffer, 0x10);
+            let request = Request::new(command)
+                .arg(fd)
+                .arg(0u32)
+                .buffer_a(buffer, 0x10);
             assert_eq!(call(&guest, user, request), (-1, BADF), "command {command}");
         }
         for command in [8, 10, 11, 29, 30] {
-            let request = Request::new(command).arg(fd).input(buffer, 0x10);
+            let request = Request::new(command).arg(fd).buffer_a(buffer, 0x10);
             assert_eq!(call(&guest, user, request), (-1, BADF), "command {command}");
         }
         for command in [12, 15, 16, 17] {
             let reply = guest
-                .call(user, Request::new(command).arg(fd).output(buffer, 0x10))
+                .call(user, Request::new(command).arg(fd).buffer_b(buffer, 0x10))
                 .ok();
             assert_eq!(result(&reply), (-1, BADF));
             assert_eq!(reply.at::<u32>(8), 0x10);
         }
         let recv_from = Request::new(9)
             .arg(fd)
-            .output(buffer, 0x40)
-            .output(buffer + 0x40, 0x10);
+            .buffer_b(buffer, 0x40)
+            .buffer_b(buffer + 0x40, 0x10);
         let reply = guest.call(user, recv_from).ok();
         assert_eq!((result(&reply), reply.at::<u32>(8)), ((-1, BADF), 0x10));
     }
@@ -513,7 +516,7 @@ mod tests {
             assert_eq!(reply.at::<[u32; 32]>(0), [0; 32], "command {command}");
         }
         let reply = guest.call(bsd, Request::new(41)).ok();
-        assert_eq!(reply.copy.len(), 1);
+        assert_eq!(reply.copy_handles.len(), 1);
     }
 
     #[test]
@@ -524,7 +527,7 @@ mod tests {
         let input = guest.heap + 0x100;
         let read = |fd: i32, len| {
             let reply = guest
-                .call(bsd, Request::new(25).arg(fd).output(out, len))
+                .call(bsd, Request::new(25).arg(fd).buffer_b(out, len))
                 .ok();
             (
                 result(&reply),
@@ -533,7 +536,7 @@ mod tests {
         };
         let write = |fd: i32, value: u64| {
             guest.write(input, &value.to_le_bytes());
-            call(&guest, bsd, Request::new(24).arg(fd).input(input, 8))
+            call(&guest, bsd, Request::new(24).arg(fd).buffer_a(input, 8))
         };
 
         let counter = event_fd(&guest, bsd, EVENTFD_NONBLOCK, 2);
@@ -608,8 +611,8 @@ mod tests {
             let request = Request::new(6)
                 .arg(nfds)
                 .arg(timeout)
-                .input(fds, 24)
-                .output(out, 24);
+                .buffer_a(fds, 24)
+                .buffer_b(out, 24);
             call(&guest, bsd, request)
         };
         let revents = |index: usize| {
@@ -622,7 +625,7 @@ mod tests {
             [POLL_OUT, 0, POLL_NVAL]
         );
         guest.write(guest.heap + 0x200, &1u64.to_le_bytes());
-        let write = Request::new(24).arg(fd).input(guest.heap + 0x200, 8);
+        let write = Request::new(24).arg(fd).buffer_a(guest.heap + 0x200, 8);
         assert_eq!(call(&guest, bsd, write), (8, SUCCESS));
         assert_eq!(poll(1, 10), (1, SUCCESS));
         assert_eq!(revents(0), POLL_IN | POLL_OUT);
@@ -644,10 +647,10 @@ mod tests {
                 .arg(timeout.1)
                 .arg(timeout.2);
             for index in 0..3 {
-                request = request.input(sets + index * 0x20, 8);
+                request = request.buffer_a(sets + index * 0x20, 8);
             }
             for index in 0..3 {
-                request = request.output(outs + index * 0x20, 8);
+                request = request.buffer_b(outs + index * 0x20, 8);
             }
             call(&guest, bsd, request)
         };
@@ -660,5 +663,51 @@ mod tests {
         assert_eq!(out_set(0), 0);
         assert_eq!(select(1, [1, 0, 0], (0, 1_000_000, 0)), (-1, INVAL));
         assert_eq!(select(-1, [0, 0, 0], (0, 0, 1)), (-1, INVAL));
+    }
+    #[test]
+    fn blocking_reads_and_polls_wait_for_a_write() {
+        let guest = guest();
+        let bsd = guest.service("bsd:s");
+        let fd = event_fd(&guest, bsd, EVENTFD_SEMAPHORE, 0);
+        let (out, fds, polled, input) = (
+            guest.heap,
+            guest.heap + 0x100,
+            guest.heap + 0x200,
+            guest.heap + 0x300,
+        );
+        let mut pollfd = fd.to_le_bytes().to_vec();
+        pollfd.extend_from_slice(&POLL_IN.to_le_bytes());
+        pollfd.extend_from_slice(&0u16.to_le_bytes());
+        guest.write(fds, &pollfd);
+        guest.write(input, &2u64.to_le_bytes());
+        let (poller, writer) = (guest.other_client(), guest.other_client());
+
+        std::thread::scope(|scope| {
+            let read = scope.spawn(|| {
+                let request = Request::new(25).arg(fd).buffer_b(out, 8);
+                result(&guest.call(bsd, request).ok())
+            });
+            let poll = scope.spawn(|| {
+                let request = Request::new(6)
+                    .arg(1i32)
+                    .arg(-1i32)
+                    .buffer_a(fds, 8)
+                    .buffer_b(polled, 8);
+                result(&poller.send(bsd, &request).unwrap().ok())
+            });
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert!(
+                !read.is_finished() && !poll.is_finished(),
+                "nothing to read yet"
+            );
+
+            let write = Request::new(24).arg(fd).buffer_a(input, 8);
+            let written = result(&writer.send(bsd, &write).unwrap().ok());
+            assert_eq!(written, (8, SUCCESS));
+            assert_eq!(read.join().unwrap(), (8, SUCCESS));
+            assert_eq!(poll.join().unwrap(), (1, SUCCESS));
+        });
+        assert_eq!(guest.read(out, 8), 1u64.to_le_bytes());
+        assert_eq!(guest.read(polled + 6, 2), POLL_IN.to_le_bytes());
     }
 }

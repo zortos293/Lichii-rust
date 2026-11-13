@@ -66,7 +66,7 @@ mod tests {
     use lichii_common::settings::Settings;
 
     use super::*;
-    use crate::testing::{self, Guest, Request};
+    use crate::testing::{self, Guest, ReplyExt, Request};
 
     #[test]
     fn lookups_fail_and_errors_have_text() {
@@ -82,8 +82,8 @@ mod tests {
                 .arg(0u8)
                 .arg(0u32)
                 .arg(0u64)
-                .input(host, 12)
-                .output(out, 0x400);
+                .buffer_a(host, 12)
+                .buffer_b(out, 0x400);
             guest.call(dns, request).ok()
         };
         assert_eq!(lookup(2).at::<[i32; 3]>(0), [NETDB_TRY_AGAIN, 0, 0]);
@@ -100,7 +100,7 @@ mod tests {
             (99, b"Unknown error\0"),
         ] {
             guest.write(out, &[0xaa; 0x40]);
-            let request = Request::new(5).arg(error).output(out, 0x40);
+            let request = Request::new(5).arg(error).buffer_b(out, 0x40);
             guest.call(dns, request).ok();
             assert_eq!(guest.read(out, text.len()), text);
         }

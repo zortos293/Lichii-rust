@@ -144,7 +144,7 @@ mod tests {
     use lichii_common::settings::Settings;
 
     use super::*;
-    use crate::testing::{self, Guest, Request};
+    use crate::testing::{self, Guest, ReplyExt, Request};
 
     fn guest() -> Guest {
         Guest::new(testing::image(), Settings::default(), |context| {
@@ -185,14 +185,14 @@ mod tests {
         guest
             .call(
                 service,
-                Request::new(20601).arg([0u8; 16]).output(out, 0xe0),
+                Request::new(20601).arg([0u8; 16]).buffer_b(out, 0xe0),
             )
             .ok();
         assert!(guest.read(out, 0xe0).iter().all(|&b| b == 0));
 
         let uid = [7u8; 16];
         guest
-            .call(service, Request::new(20802).arg(uid).output(out, 0x800))
+            .call(service, Request::new(20802).arg(uid).buffer_b(out, 0x800))
             .ok();
         let setting = guest.read(out, 0x800);
         assert_eq!(setting[..16], uid);

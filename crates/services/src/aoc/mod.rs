@@ -140,7 +140,7 @@ mod tests {
     use lichii_loader::program::AddOnContent;
 
     use super::*;
-    use crate::testing::{self, Guest, PROGRAM_ID, Request};
+    use crate::testing::{self, Guest, PROGRAM_ID, ReplyExt, Request};
 
     fn add_on(title_id: u64) -> AddOnContent {
         AddOnContent {
@@ -170,7 +170,7 @@ mod tests {
     fn counts_and_lists_the_titles_add_ons() {
         let guest = guest(false);
         let aoc = guest.service("aoc:u");
-        let count = guest.call(aoc, Request::new(2).pid().arg(0u64)).ok();
+        let count = guest.call(aoc, Request::new(2).send_pid().arg(0u64)).ok();
         assert_eq!(count.at::<u32>(0), 3);
 
         let out = guest.heap;
@@ -178,17 +178,20 @@ mod tests {
             .call(
                 aoc,
                 Request::new(3)
-                    .pid()
+                    .send_pid()
                     .arg(1u32)
                     .arg(8u32)
                     .arg(0u64)
-                    .output(out, 0x100),
+                    .buffer_b(out, 0x100),
             )
             .ok();
         assert_eq!(list.at::<u32>(0), 2);
         assert_eq!(guest.read(out, 8), [2, 0, 0, 0, 5, 0, 0, 0]);
 
-        let past_end = guest.call(aoc, Request::new(3).pid().arg(4u32).arg(1u32).arg(0u64));
+        let past_end = guest.call(
+            aoc,
+            Request::new(3).send_pid().arg(4u32).arg(1u32).arg(0u64),
+        );
         assert_eq!(past_end.result, APPLICATION_RECORD_NOT_FOUND);
     }
 
@@ -196,13 +199,13 @@ mod tests {
     fn base_id_comes_from_the_nacp_or_the_program_id() {
         let guest = guest(true);
         let aoc = guest.service("aoc:u");
-        let base = guest.call(aoc, Request::new(5).pid().arg(0u64)).ok();
+        let base = guest.call(aoc, Request::new(5).send_pid().arg(0u64)).ok();
         assert_eq!(base.at::<u64>(0), 0x0100_0000_0000_7000);
         drop(guest);
 
         let guest = self::guest(false);
         let aoc = guest.service("aoc:u");
-        let base = guest.call(aoc, Request::new(5).pid().arg(0u64)).ok();
+        let base = guest.call(aoc, Request::new(5).send_pid().arg(0u64)).ok();
         assert_eq!(base.at::<u64>(0), PROGRAM_ID + 0x1000);
     }
 
@@ -211,12 +214,12 @@ mod tests {
         let guest = guest(false);
         let aoc = guest.service("aoc:u");
         guest
-            .call(aoc, Request::new(7).pid().arg(0u32).arg(0u64))
+            .call(aoc, Request::new(7).send_pid().arg(0u32).arg(0u64))
             .ok();
         let event = guest.call(aoc, Request::new(8)).ok().handle();
         assert!(!guest.is_signaled(event));
         guest
-            .call(aoc, Request::new(10).pid().arg(0u64))
+            .call(aoc, Request::new(10).send_pid().arg(0u64))
             .ok()
             .handle();
 

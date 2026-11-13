@@ -65,7 +65,7 @@ fn logic_flags(sf: bool, r: u64) -> u32 {
 
 /// `ConditionHolds` for a 4-bit condition and the NZCV nibble.
 #[inline]
-pub(super) const fn condition_holds(cond: u8, flags: u32) -> bool {
+pub(crate) const fn condition_holds(cond: u8, flags: u32) -> bool {
     let (n, z, c, v) = (
         flags & 8 != 0,
         flags & 4 != 0,

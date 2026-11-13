@@ -2,7 +2,7 @@ use lichii_common::settings::{Language, Settings};
 
 use super::control::{APPLICATION_LANGUAGE_NOT_FOUND, RESULT_UNKNOWN};
 use super::*;
-use crate::testing::{self, Guest, PROGRAM_ID, Request};
+use crate::testing::{self, Guest, PROGRAM_ID, ReplyExt, Request};
 
 /// Supports American English (0), French (3) and German (4).
 const SUPPORTED: u32 = 1 | 1 << 3 | 1 << 4;
@@ -44,7 +44,10 @@ fn control_data_is_the_nacp() {
     let reply = guest
         .call(
             control,
-            Request::new(0).arg(1u8).arg(PROGRAM_ID).output(out, 0x4100),
+            Request::new(0)
+                .arg(1u8)
+                .arg(PROGRAM_ID)
+                .buffer_b(out, 0x4100),
         )
         .ok();
     assert_eq!(reply.at::<u32>(0), 0x4000);
@@ -55,7 +58,10 @@ fn control_data_is_the_nacp() {
 
     let small = guest.call(
         control,
-        Request::new(0).arg(1u8).arg(PROGRAM_ID).output(out, 0x100),
+        Request::new(0)
+            .arg(1u8)
+            .arg(PROGRAM_ID)
+            .buffer_b(out, 0x100),
     );
     assert_eq!(small.result, RESULT_UNKNOWN);
 
@@ -66,7 +72,7 @@ fn control_data_is_the_nacp() {
             Request::new(0)
                 .arg(1u8)
                 .arg(0x0100_0000_0009_0000u64)
-                .output(out, 0x4000),
+                .buffer_b(out, 0x4000),
         )
         .ok();
     assert!(guest.read(out, 0x4000).iter().all(|&b| b == 0));
@@ -85,7 +91,7 @@ fn control_data_with_flags() {
                 .arg(1u8)
                 .arg(0u8)
                 .arg(PROGRAM_ID)
-                .output(out, 0x4000),
+                .buffer_b(out, 0x4000),
         )
         .ok();
     assert_eq!(packed.at::<u64>(0), 0x4000 << 32 | 1);
@@ -99,7 +105,7 @@ fn control_data_with_flags() {
                     .arg(0u8)
                     .arg(0u8)
                     .arg(PROGRAM_ID)
-                    .output(out, 0x4000),
+                    .buffer_b(out, 0x4000),
             )
             .ok();
         assert_eq!(
@@ -136,18 +142,19 @@ fn list_titles_and_icons_into_transfer_memory() {
         ids,
         &[PROGRAM_ID.to_le_bytes(), 7u64.to_le_bytes()].concat(),
     );
-    let (result, handle) = guest.svc(0x15, [0, memory, 0x1000, 0]);
-    assert_eq!(result, 0, "CreateTransferMemory");
-    let handle = handle as u32;
+    let handle = guest.transfer_memory(memory, 0x1000);
 
     let titles = guest
-        .call(control, Request::new(13).copy(handle).input(ids, 16))
+        .call(
+            control,
+            Request::new(13).copy_handle(handle).buffer_a(ids, 16),
+        )
         .ok();
     assert!(guest.is_signaled(titles.handle()));
     let value = titles.interface();
     assert_eq!(guest.call(value, Request::new(0)).ok().at::<i64>(0), 0x600);
     let out = guest.heap + 0x3000;
-    guest.call(value, Request::new(1).output(out, 4)).ok();
+    guest.call(value, Request::new(1).buffer_b(out, 4)).ok();
     assert_eq!(guest.read(out, 4), [0; 4]);
     let entries = guest.read(memory, 0x600);
     assert_eq!(&entries[..11], b"Lichii Test");
@@ -155,7 +162,10 @@ fn list_titles_and_icons_into_transfer_memory() {
     assert!(entries[0x300..].iter().all(|&b| b == 0));
 
     let icons = guest
-        .call(control, Request::new(10).copy(handle).input(ids, 16))
+        .call(
+            control,
+            Request::new(10).copy_handle(handle).buffer_a(ids, 16),
+        )
         .ok();
     let value = icons.interface();
     assert_eq!(guest.call(value, Request::new(0)).ok().at::<i64>(0), 24);
@@ -169,14 +179,14 @@ fn application_manager() {
     let out = guest.heap;
 
     let records = guest
-        .call(manager, Request::new(0).arg(0i32).output(out, 0x30))
+        .call(manager, Request::new(0).arg(0i32).buffer_b(out, 0x30))
         .ok();
     assert_eq!(records.at::<i32>(0), 1);
     let record = guest.read(out, 0x18);
     assert_eq!(record[..8], PROGRAM_ID.to_le_bytes());
     assert_eq!(record[8], 3);
     let past = guest
-        .call(manager, Request::new(0).arg(1i32).output(out, 0x30))
+        .call(manager, Request::new(0).arg(1i32).buffer_b(out, 0x30))
         .ok();
     assert_eq!(past.at::<i32>(0), 0);
 
@@ -203,7 +213,7 @@ fn application_manager() {
             Request::new(400)
                 .arg(0u8)
                 .arg(PROGRAM_ID)
-                .output(out, 0x4000),
+                .buffer_b(out, 0x4000),
         )
         .ok();
     assert_eq!(control.at::<u32>(0), 0x4000);
@@ -252,7 +262,7 @@ fn application_views_and_rights() {
         guest
             .call(
                 manager,
-                Request::new(command).input(ids, 16).output(out, 0x100),
+                Request::new(command).buffer_a(ids, 16).buffer_b(out, 0x100),
             )
             .ok();
         let views = guest.read(out, 2 * size);
@@ -264,7 +274,7 @@ fn application_views_and_rights() {
     let promoted = guest
         .call(
             manager,
-            Request::new(1704).input(ids, 16).output(out, 0x100),
+            Request::new(1704).buffer_a(ids, 16).buffer_b(out, 0x100),
         )
         .ok();
     assert_eq!(promoted.at::<u32>(0), 2);
@@ -277,7 +287,7 @@ fn application_views_and_rights() {
                 .arg(0u32)
                 .arg(PROGRAM_ID)
                 .arg(uid)
-                .output(out, 0x20),
+                .buffer_b(out, 0x20),
         )
         .ok();
     assert_eq!(rights.at::<u32>(0), 1);
@@ -306,7 +316,7 @@ fn records_documents_rights_and_content() {
     );
     let out = guest.heap;
     let list = guest
-        .call(record, Request::new(3).arg(0i32).output(out, 0x18))
+        .call(record, Request::new(3).arg(0i32).buffer_b(out, 0x18))
         .ok();
     assert_eq!(list.at::<i32>(0), 1);
 

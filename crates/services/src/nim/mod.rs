@@ -198,7 +198,7 @@ mod tests {
     use lichii_common::settings::Settings;
 
     use super::*;
-    use crate::testing::{self, Guest, Request};
+    use crate::testing::{self, Guest, ReplyExt, Request};
 
     fn guest() -> Guest {
         Guest::new(testing::image(), Settings::default(), |context| {
@@ -218,7 +218,7 @@ mod tests {
         let server = guest.call(eca, Request::new(0)).ok().interface();
         let accessor = guest.call(server, Request::new(0)).ok().interface();
         let created = guest.call(accessor, Request::new(0)).ok();
-        let (completion, shop) = (created.copy[0], created.interface());
+        let (completion, shop) = (created.copy_handles[0], created.interface());
         assert!(!guest.is_signaled(completion));
 
         guest.call(shop, Request::new(5)).ok();
@@ -231,12 +231,12 @@ mod tests {
         let out = guest.heap;
         guest.write(out, &[0xaa; 8]);
         let read = guest
-            .call(shop, Request::new(2).arg(0u64).output(out, 8))
+            .call(shop, Request::new(2).arg(0u64).buffer_b(out, 8))
             .ok();
         assert_eq!(read.at::<u64>(0), 2);
         assert_eq!(guest.read(out, 3), b"{}\xaa");
         let past = guest
-            .call(shop, Request::new(2).arg(5u64).output(out, 8))
+            .call(shop, Request::new(2).arg(5u64).buffer_b(out, 8))
             .ok();
         assert_eq!(past.at::<u64>(0), 0);
         guest.call(shop, Request::new(0)).ok();

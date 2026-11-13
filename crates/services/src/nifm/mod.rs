@@ -278,7 +278,7 @@ mod tests {
     use lichii_common::settings::Settings;
 
     use super::*;
-    use crate::testing::{self, Guest, Request as Ipc};
+    use crate::testing::{self, Guest, ReplyExt, Request as Ipc};
 
     fn general() -> (Guest, u32) {
         let guest = Guest::new(testing::image(), Settings::default(), |context| {
@@ -303,10 +303,10 @@ mod tests {
             NETWORK_COMMUNICATION_DISABLED
         );
         let events = guest.call(request, Ipc::new(2)).ok();
-        assert_eq!(events.copy.len(), 2);
+        assert_eq!(events.copy_handles.len(), 2);
         guest.call(request, Ipc::new(6).arg(0x2000u32)).ok();
         guest.call(request, Ipc::new(4)).ok();
-        assert!(guest.is_signaled(events.copy[0]));
+        assert!(guest.is_signaled(events.copy_handles[0]));
         assert_eq!(state(&guest), STATE_ON_HOLD);
         assert_eq!(guest.call(request, Ipc::new(1)).result, PENDING_CONNECTION);
         assert_eq!(state(&guest), STATE_NOT_SUBMITTED);
@@ -325,7 +325,7 @@ mod tests {
 
         let out = guest.heap;
         guest.write(out, &[0xaa; 0x40]);
-        let info = guest.call(request, Ipc::new(21).output(out, 0x40)).ok();
+        let info = guest.call(request, Ipc::new(21).buffer_b(out, 0x40)).ok();
         assert_eq!(info.at::<[u32; 3]>(0), [0; 3]);
         assert!(guest.read(out, 0x40).iter().all(|&b| b == 0));
     }
@@ -342,7 +342,7 @@ mod tests {
         ] {
             guest.write(out, &[0xaa; 0x200]);
             guest
-                .call(general, Ipc::new(command).output(out, size as u64))
+                .call(general, Ipc::new(command).buffer_b(out, size as u64))
                 .ok();
             assert!(
                 guest.read(out, size).iter().all(|&b| b == 0),
@@ -351,7 +351,7 @@ mod tests {
         }
         for command in [6, 7, 11, 25, 35, 47] {
             let reply = guest
-                .call(general, Ipc::new(command).output(out, 0x100))
+                .call(general, Ipc::new(command).buffer_b(out, 0x100))
                 .ok();
             assert_eq!(reply.at::<u32>(0), 0, "command {command}");
         }
@@ -377,20 +377,20 @@ mod tests {
         guest.write(profile, &data);
         assert_eq!(
             guest
-                .call(general, Ipc::new(9).input(profile, 0x100))
+                .call(general, Ipc::new(9).buffer_a(profile, 0x100))
                 .result,
             INVALID_INPUT
         );
         guest
             .call(
                 general,
-                Ipc::new(9).input(profile, NIFM_NETWORK_PROFILE_SIZE as u64),
+                Ipc::new(9).buffer_a(profile, NIFM_NETWORK_PROFILE_SIZE as u64),
             )
             .ok();
         let temporary = guest
             .call(
                 general,
-                Ipc::new(14).input(profile, SF_NETWORK_PROFILE_SIZE as u64),
+                Ipc::new(14).buffer_a(profile, SF_NETWORK_PROFILE_SIZE as u64),
             )
             .ok();
         temporary.interface();
@@ -402,10 +402,10 @@ mod tests {
         let (guest, general) = general();
         let scan = guest.call(general, Ipc::new(2)).ok().interface();
         let events = guest.call(scan, Ipc::new(3)).ok();
-        assert_eq!(events.copy.len(), 2);
+        assert_eq!(events.copy_handles.len(), 2);
         assert_eq!(guest.call(scan, Ipc::new(2)).result, PENDING_CONNECTION);
         guest.call(scan, Ipc::new(0)).ok();
-        assert!(guest.is_signaled(events.copy[0]));
+        assert!(guest.is_signaled(events.copy_handles[0]));
         assert_eq!(guest.call(scan, Ipc::new(1)).ok().at::<u8>(0), 0);
         assert_eq!(guest.call(scan, Ipc::new(2)).result, PENDING_CONNECTION);
     }

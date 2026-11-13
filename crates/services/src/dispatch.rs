@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use lichii_common::ResultCode;
+use lichii_common::{ConsoleGeneration, ResultCode};
 use lichii_kernel::ipc::{HleRequestContext, SessionHandler, UNKNOWN_COMMAND_ID};
 use parking_lot::Mutex;
 
@@ -33,16 +33,22 @@ impl<S: Service> SessionHandler for Dispatch<S> {
         let flags = &self.context.settings.debug;
         let result = self.service.handle(ctx).unwrap_or_else(|| {
             let (name, command) = (self.service.name(), ctx.command());
+            let stubbed = auto_stub(flags.auto_stub, name, self.context.program.generation);
             if self.context.unknown.first(name, command) {
                 tracing::warn!(
                     service = name,
                     command,
                     tipc = ctx.is_tipc(),
-                    stubbed = flags.auto_stub,
+                    stubbed,
                     "unimplemented service command"
                 );
             }
-            stub_result(flags.auto_stub)
+            if stubbed {
+                push_stub_zeroes(ctx);
+                ResultCode::SUCCESS
+            } else {
+                UNKNOWN_COMMAND_ID
+            }
         });
         if flags.ipc_trace {
             tracing::info!(
@@ -57,14 +63,50 @@ impl<S: Service> SessionHandler for Dispatch<S> {
     }
 }
 
-/// What an unimplemented command answers: an empty success with `debug.auto_stub` (like
-/// `EDEN_NX2_AUTO_STUB`), otherwise `UnknownCommandId`.
-fn stub_result(auto_stub: bool) -> ResultCode {
-    if auto_stub {
-        ResultCode::SUCCESS
-    } else {
-        UNKNOWN_COMMAND_ID
+/// Prefix of Switch 2 interfaces whose commands are not known yet; their unknown commands are
+/// always auto-stubbed.
+pub(crate) const NX2_PREFIX: &str = "nx2:";
+
+/// Words of zeroes an auto-stubbed reply carries, so a caller that expects output reads zeroes
+/// rather than stale message words.
+const STUB_WORDS: usize = 32;
+
+/// Whether an unimplemented command answers success with zeroes instead of `UnknownCommandId`:
+/// with `debug.auto_stub` (like `EDEN_NX2_AUTO_STUB`), on `nx2:` interfaces, and for Switch 2
+/// titles, which still call many commands nobody has implemented.
+fn auto_stub(setting: bool, service: &str, title: ConsoleGeneration) -> bool {
+    setting || service.starts_with(NX2_PREFIX) || title == ConsoleGeneration::Switch2
+}
+
+/// Pushes the zeroes of an auto-stubbed reply.
+pub(crate) fn push_stub_zeroes(ctx: &mut HleRequestContext) {
+    ctx.push_bytes(&[0; STUB_WORDS * 4]);
+}
+
+/// A Switch 2 interface nobody has implemented: every command gets the auto-stub reply.
+pub(crate) struct Nx2Stub(pub String);
+
+impl Service for Nx2Stub {
+    fn name(&self) -> &str {
+        &self.0
     }
+
+    fn handle(&self, _ctx: &mut HleRequestContext) -> Option<ResultCode> {
+        None
+    }
+}
+
+/// Answers with a new [`Nx2Stub`] named after `owner` and the command, for Switch 2 getters whose
+/// interface is unknown.
+pub(crate) fn push_nx2_stub(
+    context: &Arc<ServiceContext>,
+    ctx: &mut HleRequestContext,
+    owner: &str,
+) -> ResultCode {
+    let name = format!("{NX2_PREFIX}{owner}::{}", ctx.command());
+    tracing::warn!(interface = %name, "returning a Switch 2 stub interface");
+    ctx.push_interface(context.handler(Nx2Stub(name)));
+    ResultCode::SUCCESS
 }
 
 /// The (service, command) pairs already reported, so each is logged once.
@@ -102,8 +144,11 @@ mod tests {
     }
 
     #[test]
-    fn auto_stub_answers_success() {
-        assert_eq!(stub_result(true), ResultCode::SUCCESS);
-        assert_eq!(stub_result(false), UNKNOWN_COMMAND_ID);
+    fn auto_stub_covers_the_setting_nx2_interfaces_and_switch2_titles() {
+        use ConsoleGeneration::{Switch1, Switch2};
+        assert!(auto_stub(true, "hid", Switch1));
+        assert!(!auto_stub(false, "hid", Switch1));
+        assert!(auto_stub(false, "nx2:IGraphicsScaleController", Switch1));
+        assert!(auto_stub(false, "hid", Switch2));
     }
 }
