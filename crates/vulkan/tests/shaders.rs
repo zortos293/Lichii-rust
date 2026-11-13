@@ -14,6 +14,16 @@ use lichii_vulkan::scheduler::Scheduler;
 use lichii_vulkan::shaders;
 use lichii_vulkan::{Device, Instance, SurfaceSupport};
 
+/// Tests in this binary run one at a time: the Vulkan loader and the validation layer are not
+/// safe when several threads create and destroy instances and devices at once (see
+/// `Instance`'s unit-test serialisation).
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn device() -> Option<Arc<Device>> {
     let instance = match Instance::new(true, SurfaceSupport::None) {
         Ok(instance) => Arc::new(instance),
@@ -82,6 +92,7 @@ fn pipeline_layout(
 
 #[test]
 fn every_shader_module_builds() {
+    let _serial = serial();
     let Some(device) = device() else { return };
     for (name, code) in shaders::ALL {
         eprintln!("{name}");
@@ -110,6 +121,7 @@ const fn pass(vert: &'static [u32], frag: &'static [u32], samplers: u32) -> Grap
 
 #[test]
 fn every_graphics_pass_links_into_a_pipeline() {
+    let _serial = serial();
     let Some(device) = device() else { return };
     let passes = [
         pass(shaders::FULLSCREEN_VERT, shaders::PRESENT_COPY_FRAG, 1),
@@ -304,6 +316,7 @@ fn random_bytes(len: usize, mut state: u64) -> Vec<u8> {
 
 #[test]
 fn unswizzle_compute_matches_the_cpu_reference() {
+    let _serial = serial();
     let Some(device) = device() else { return };
     let raw = device.raw();
     let mut scheduler = Scheduler::new(&device).unwrap();

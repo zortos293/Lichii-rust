@@ -39,6 +39,7 @@ mod am;
 mod aoc;
 mod apm;
 mod arp;
+mod audio;
 mod bcat;
 mod caps;
 mod chat;
@@ -78,6 +79,7 @@ pub use dispatch::Service;
 pub fn register_all(context: &Arc<ServiceContext>) -> HleResult<()> {
     fs::register(context)?;
     am::register(context)?;
+    audio::register(context)?;
     apm::register(context)?;
     pctl::register(context)?;
     prepo::register(context)?;

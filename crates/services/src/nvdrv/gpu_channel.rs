@@ -91,6 +91,8 @@ struct ChannelState {
     gmmu: Option<Arc<Gmmu>>,
     gpfifo: bool,
     channel: Option<ChannelId>,
+    /// The entries of the submission being built, kept to be reused by the next one.
+    entries: Vec<GpEntry>,
 }
 
 pub(crate) struct GpuChannel {
@@ -224,44 +226,66 @@ impl GpuChannel {
     fn submit(&self, args: &mut Args, entries: Option<&[u8]>) -> NvResult {
         let mut params: SubmitGpfifo = read_struct(args.input);
         let count = params.num_entries as usize;
-        let entries: Vec<GpEntry> = match entries {
+        let mut state = self.state.lock();
+        let mut buffer = std::mem::take(&mut state.entries);
+        buffer.clear();
+        let read = match entries {
             Some(bytes) if bytes.len() / size_of::<u64>() < count => {
                 tracing::error!(count, "GPFIFO submission with fewer entries than it claims");
-                return NvResult::InvalidSize;
+                Err(NvResult::InvalidSize)
             }
-            Some(bytes) => items::<u64>(bytes).take(count).map(GpEntry).collect(),
-            None => {
-                let mut entries = Vec::with_capacity(count);
-                let mut chunk = [0u64; 64];
-                let mut address = params.address;
-                while entries.len() < count {
-                    let words = &mut chunk[..(count - entries.len()).min(64)];
-                    if let Err(fault) = self
-                        .memory
-                        .read_bytes(address, bytemuck::cast_slice_mut(words))
-                    {
-                        tracing::error!(%fault, "GPFIFO entries are not readable");
-                        return NvResult::InvalidAddress;
-                    }
-                    address += size_of_val(words) as u64;
-                    entries.extend(words.iter().copied().map(GpEntry));
-                }
-                entries
+            Some(bytes) => {
+                buffer.extend(items::<u64>(bytes).take(count).map(GpEntry));
+                Ok(())
             }
+            None => self.read_entries(params.address, count, &mut buffer),
         };
-        let result = self.submit_entries(&mut params, entries);
+        if let Err(result) = read {
+            state.entries = buffer;
+            return result;
+        }
+        let result = self.submit_entries(&mut state, &mut params, &buffer);
+        state.entries = buffer;
+        drop(state);
         args.echo();
         write_struct(args.output, &params);
         result
     }
 
-    fn submit_entries(&self, params: &mut SubmitGpfifo, entries: Vec<GpEntry>) -> NvResult {
+    /// Reads `count` GPFIFO entries from the client's memory at `address` into `entries`.
+    fn read_entries(
+        &self,
+        mut address: u64,
+        count: usize,
+        entries: &mut Vec<GpEntry>,
+    ) -> Result<(), NvResult> {
+        let mut chunk = [0u64; 64];
+        while entries.len() < count {
+            let words = &mut chunk[..(count - entries.len()).min(64)];
+            if let Err(fault) = self
+                .memory
+                .read_bytes(address, bytemuck::cast_slice_mut(words))
+            {
+                tracing::error!(%fault, "GPFIFO entries are not readable");
+                return Err(NvResult::InvalidAddress);
+            }
+            address += size_of_val(words) as u64;
+            entries.extend(words.iter().copied().map(GpEntry));
+        }
+        Ok(())
+    }
+
+    fn submit_entries(
+        &self,
+        state: &mut ChannelState,
+        params: &mut SubmitGpfifo,
+        entries: &[GpEntry],
+    ) -> NvResult {
         let table = &self.nvdrv.syncpoints;
         let flags = params.flags;
         let increment_value = flags & FLAG_INCREMENT_VALUE != 0;
         let fence_increment = flags & FLAG_FENCE_INCREMENT != 0;
-        let mut state = self.state.lock();
-        let Some(channel) = self.channel(&mut state) else {
+        let Some(channel) = self.channel(state) else {
             tracing::error!("GPFIFO submission before an address space was bound");
             return NvResult::InvalidState;
         };

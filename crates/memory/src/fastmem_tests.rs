@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::{AddressSpace, FastmemError, HostFault, MemoryPermission, PhysicalMemory};
 
@@ -59,6 +59,11 @@ mod faults {
 
     fn skip_load(data: usize, guest_addr: u64, fault: &mut HostFault) -> bool {
         LAST_FAULT.store(guest_addr, Ordering::SeqCst);
+        skip_load_quietly(data, guest_addr, fault)
+    }
+
+    /// Like `skip_load`, without touching `LAST_FAULT`, which another test asserts on.
+    fn skip_load_quietly(data: usize, _guest_addr: u64, fault: &mut HostFault) -> bool {
         fault.set_gpr(0, data as u64);
         fault.set_pc(fault.pc() + 3);
         true
@@ -96,5 +101,31 @@ mod faults {
         space.unmap(0x4000_0000, 0x1000);
         assert_eq!(load(fastmem.base(), 0x4000_0000), 0xdead);
         assert_eq!(LAST_FAULT.load(Ordering::SeqCst), 0x4000_0000);
+    }
+
+    #[test]
+    fn a_new_arena_at_a_dropped_arenas_range_gets_its_own_faults() {
+        if fastmem_space().is_none() {
+            return;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let churn = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let physical = Arc::new(PhysicalMemory::new(1 << 26).unwrap());
+                    drop(AddressSpace::with_fastmem(physical, 36));
+                }
+            })
+        };
+        for _ in 0..20_000 {
+            let physical = Arc::new(PhysicalMemory::new(1 << 26).unwrap());
+            let space = AddressSpace::with_fastmem(physical, 36).unwrap();
+            let fastmem = space.fastmem().unwrap();
+            fastmem.set_fault_handler(Some(skip_load_quietly), 0xdead);
+            assert_eq!(load(fastmem.base(), 0x1000), 0xdead);
+        }
+        stop.store(true, Ordering::Relaxed);
+        churn.join().unwrap();
     }
 }
