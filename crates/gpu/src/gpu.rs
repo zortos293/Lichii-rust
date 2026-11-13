@@ -576,11 +576,6 @@ impl Gpu {
             .map(|reference| reference.load(Ordering::Acquire))
     }
 
-    /// The guest CPU wrote device memory: cached copies are stale.
-    pub fn invalidate_region(&self, addr: DAddr, size: u64) {
-        self.side(SideCommand::InvalidateRegion(addr, size));
-    }
-
     /// Writes data the GPU modified in `[addr, addr + size)` back to guest memory; returns once
     /// it is there.
     pub fn flush_region(&self, addr: DAddr, size: u64) {

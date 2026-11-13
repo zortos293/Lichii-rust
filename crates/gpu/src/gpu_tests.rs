@@ -67,6 +67,7 @@ enum Event {
     Fence(FenceAction),
     WaitForIdle,
     InlineWritten(u64, u64),
+    Invalidate(u64, u64),
     Ran,
     /// An engine finished the work it held back.
     Flush(EngineKind),
@@ -232,7 +233,9 @@ impl Rasterizer for Recorder {
         self.work.fence_polls.fetch_add(1, Ordering::Relaxed);
         !self.work.pending.lock().0.is_empty()
     }
-    fn invalidate_region(&mut self, _addr: u64, _size: u64) {}
+    fn invalidate_region(&mut self, addr: u64, size: u64) {
+        self.log.lock().push(Event::Invalidate(addr, size));
+    }
     fn flush_region(&mut self, addr: u64, size: u64) {
         self.log.lock().push(Event::FlushRegion(addr, size));
     }
@@ -250,7 +253,7 @@ struct Rig {
     log: Log,
     work: Arc<HostWork>,
     next_pushbuffer: u64,
-    space: AddressSpace,
+    space: Arc<AddressSpace>,
     time: Arc<TestTime>,
 }
 
@@ -293,9 +296,10 @@ impl Rig {
         engines: Engines,
     ) -> Self {
         let physical = Arc::new(PhysicalMemory::new(1 << 24).unwrap());
-        let space = AddressSpace::new(physical.clone(), 39);
+        let space = Arc::new(AddressSpace::new(physical.clone(), 39));
         space.map(CPU_VA, 0x10_0000, MAPPED, MemoryPermission::READ_WRITE);
         let host1x = Host1x::new(physical, 36);
+        host1x.memory.attach_process(space.clone());
         host1x
             .memory
             .map_process(DEVICE_BASE, &space, CPU_VA, MAPPED)
@@ -2122,6 +2126,47 @@ fn one_channels_compute_upload_leaves_other_channels_on_the_3d_macros() {
         assert_eq!(
             rig.methods(),
             [(caller.0, EngineKind::Compute, 0x200, 0x3d)],
+            "{threading:?}"
+        );
+    });
+}
+
+/// A CPU write to a page a GPU cache holds reaches the renderer's `invalidate_region` ahead of
+/// the work submitted after it, again once the cache takes the page anew, and not at all once the
+/// cache let it go.
+#[test]
+fn cpu_writes_to_cached_pages_invalidate_before_later_work() {
+    each_mode(|threading| {
+        let rig = Rig::new(threading);
+        let device = rig.gpu.handles().device.clone();
+        let ran = |rig: &Rig| {
+            let log = rig.log.clone();
+            rig.gpu.run_in_order(move |_| log.lock().push(Event::Ran));
+            rig.gpu.synchronize();
+        };
+        for round in 0..2u32 {
+            let cached = device.cache_pages(DEVICE_BASE + 0x8000, 0x1000);
+            rig.space.write(CPU_VA + 0x8010, round).unwrap();
+            ran(&rig);
+            drop(cached);
+        }
+        rig.space.write(CPU_VA + 0x8010, 2u32).unwrap();
+        ran(&rig);
+        let events: Vec<Event> = rig
+            .events()
+            .into_iter()
+            .filter(|event| matches!(event, Event::Invalidate(..) | Event::Ran))
+            .collect();
+        let invalidate = Event::Invalidate(DEVICE_BASE + 0x8000, 0x1000);
+        assert_eq!(
+            events,
+            [
+                invalidate.clone(),
+                Event::Ran,
+                invalidate,
+                Event::Ran,
+                Event::Ran
+            ],
             "{threading:?}"
         );
     });
