@@ -38,11 +38,11 @@ use lichii_texture::{Numeric, PixelFormat};
 
 use super::VulkanRasterizer;
 use crate::buffer_cache::{BufferBinding, IndexBinding, assembled_topology, vertex_stream_range};
-use crate::commands::{COLOR_RANGE, ImageAccess, transition};
+use crate::commands::ImageAccess;
 use crate::descriptors::DescriptorAllocator;
 use crate::device::Device;
 use crate::error::Result;
-use crate::memory::{Buffer, BufferView, Image, ImageDesc, ImageView};
+use crate::memory::{Buffer, BufferView};
 use crate::pipeline::environment::{ProgramEnv, TexturePool, texture_type};
 use crate::pipeline::fixed_state::flags;
 use crate::pipeline::maxwell_to_vk as mvk;
@@ -159,8 +159,7 @@ pub(super) struct DrawState {
     vertex_input: ash::ext::vertex_input_dynamic_state::Device,
     mesh: ash::ext::mesh_shader::Device,
     null_buffer: Buffer,
-    null_view: ImageView,
-    _null_image: Image,
+    null_images: null::NullImages,
     arch: ShaderArch,
     channel: Option<ChannelId>,
     warned: u32,
@@ -196,6 +195,7 @@ pub(super) struct DrawState {
     texture_pipelines: Option<texture::TexturePipelines>,
     assembly: Option<assembly::AssemblyPass>,
     grid: Option<dispatch_grid::GridPass>,
+    mesh_indirect: Option<mesh_indirect::MeshIndirectPass>,
 }
 
 impl DrawState {
@@ -217,48 +217,12 @@ impl DrawState {
             gpu_allocator::MemoryLocation::GpuOnly,
             "null buffer",
         )?;
-        let null_image = Image::new(
-            device,
-            &ImageDesc::d2(
-                vk::Format::R8G8B8A8_UNORM,
-                1,
-                1,
-                vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
-            ),
-            "null texture",
-        )?;
-        let null_view =
-            null_image.view(vk::ImageViewType::TYPE_2D, vk::ComponentMapping::default())?;
-        transition(
-            device,
-            cmd,
-            null_image.raw(),
-            COLOR_RANGE,
-            ImageAccess::UNDEFINED,
-            ImageAccess::TRANSFER_DST,
-        );
-        // SAFETY: `cmd` is recording; the buffer and image are transfer destinations in the
-        // layouts given.
+        // SAFETY: `cmd` is recording; the buffer is a transfer destination.
         unsafe {
             device
                 .raw
                 .cmd_fill_buffer(cmd, null_buffer.raw(), 0, NULL_BUFFER_SIZE, 0);
-            device.raw.cmd_clear_color_image(
-                cmd,
-                null_image.raw(),
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &vk::ClearColorValue::default(),
-                &[COLOR_RANGE],
-            );
         }
-        transition(
-            device,
-            cmd,
-            null_image.raw(),
-            COLOR_RANGE,
-            ImageAccess::TRANSFER_DST,
-            SHADER_SAMPLED,
-        );
         crate::commands::transfer_to_all_barrier(device, cmd);
         let features = *pipelines.features();
         Ok(Self {
@@ -276,8 +240,7 @@ impl DrawState {
             ),
             mesh: ash::ext::mesh_shader::Device::new(&device.instance.raw, &device.raw),
             null_buffer,
-            null_view,
-            _null_image: null_image,
+            null_images: null::NullImages::default(),
             arch: if gob_layout == GobLayout::Switch2 {
                 ShaderArch::Ampere
             } else {
@@ -312,6 +275,7 @@ impl DrawState {
             texture_pipelines: None,
             assembly: None,
             grid: None,
+            mesh_indirect: None,
         })
     }
 
@@ -583,13 +547,6 @@ impl VulkanRasterizer {
         }
         let regs = ctx.regs;
         let mesh = is_mesh_draw(regs, self.draw.arch);
-        if mesh && matches!(call, DrawCall::Indirect(_)) {
-            self.draw.warn_once(
-                Warning::IndirectMesh,
-                "indirect task/mesh draws are not supported; skipping them",
-            );
-            return Ok(());
-        }
         let host_topology = match mesh {
             true => mesh_topology(regs),
             false => mvk::primitive_topology(assembled_topology(call.topology()))
@@ -668,7 +625,7 @@ impl VulkanRasterizer {
                 self.vertex_buffers(gmmu, regs)?;
             }
             let index = match call {
-                DrawCall::Direct(_) if mesh => None,
+                _ if mesh => None,
                 DrawCall::Direct(params) => self.buffer_cache.index_buffer(
                     &mut self.scheduler,
                     &mut self.staging,
@@ -679,7 +636,7 @@ impl VulkanRasterizer {
                 DrawCall::Indirect(indirect) => self.indirect_index_buffer(gmmu, regs, indirect)?,
             };
             let indirect = match call {
-                DrawCall::Indirect(draw) => match self.indirect_buffers(gmmu, regs, draw)? {
+                DrawCall::Indirect(draw) => match self.indirect_buffers(gmmu, regs, draw, mesh)? {
                     Some(buffers) => Some(buffers),
                     None => return Ok(()),
                 },
@@ -694,8 +651,16 @@ impl VulkanRasterizer {
         }
         let set = self.descriptor_set(set_layout)?;
 
+        let task = self.draw.stages[0]
+            .as_ref()
+            .is_some_and(|m| m.stage == ShaderStage::Task);
+        let mesh_limit = self.device.properties.mesh_group_limit[usize::from(task)];
         let cmd = self.scheduler.record()?;
         let (index, indirect) = match (call, indirect) {
+            (DrawCall::Indirect(draw), Some(inputs)) if mesh => {
+                let commands = self.rewrite_mesh_indirect(cmd, draw, &inputs, mesh_limit)?;
+                (None, Some(commands))
+            }
             (DrawCall::Indirect(draw), Some(inputs))
                 if assembled_topology(draw.topology) != draw.topology =>
             {
@@ -794,17 +759,13 @@ impl VulkanRasterizer {
         self.set_dynamic_state(cmd, regs, &features, host_topology, extent, scale);
         let mesh_groups = match call {
             DrawCall::Direct(params) if mesh => {
-                let task = self.draw.stages[0]
-                    .as_ref()
-                    .is_some_and(|m| m.stage == ShaderStage::Task);
-                let limit = self.device.properties.mesh_group_limit[usize::from(task)];
-                if params.count > limit {
+                if params.count > mesh_limit {
                     self.draw.warn_once(
                         Warning::MeshGroupLimit,
                         "a task/mesh draw has more groups than the device takes; clamping it",
                     );
                 }
-                params.count.min(limit)
+                params.count.min(mesh_limit)
             }
             _ => 0,
         };
@@ -834,6 +795,24 @@ impl VulkanRasterizer {
                     params.first,
                     params.base_instance,
                 ),
+                (DrawCall::Indirect(_), Some(buffers), _) if mesh => match buffers.count {
+                    Some(count) => draw.mesh.cmd_draw_mesh_tasks_indirect_count(
+                        cmd,
+                        buffers.commands.buffer,
+                        buffers.commands.offset,
+                        count.buffer,
+                        count.offset,
+                        buffers.max_draws,
+                        buffers.stride,
+                    ),
+                    None => draw.mesh.cmd_draw_mesh_tasks_indirect(
+                        cmd,
+                        buffers.commands.buffer,
+                        buffers.commands.offset,
+                        buffers.max_draws,
+                        buffers.stride,
+                    ),
+                },
                 (DrawCall::Indirect(_), Some(buffers), index) => {
                     let IndirectBuffers {
                         commands,
@@ -1162,20 +1141,32 @@ impl VulkanRasterizer {
                             if rescaled {
                                 self.draw.texture_scaling.set(b.descriptor);
                             }
-                            let view = match texture {
+                            let (view, layout) = match texture {
                                 Some((id, view)) => {
                                     self.draw.textures.push(id);
-                                    view
-                                }
-                                None if desc.ty == TextureType::Color2D && !desc.is_depth => {
-                                    self.draw.null_view.raw()
+                                    (view, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                                 }
                                 None => {
-                                    self.draw.warn_once(
-                                        Warning::NullTexture,
-                                        "a draw samples an unbound non-2D texture; skipping it",
-                                    );
-                                    return Ok(false);
+                                    let format = match (desc.is_depth, desc.is_integer) {
+                                        (true, _) => vk::Format::D16_UNORM,
+                                        (false, true) => vk::Format::R8G8B8A8_UINT,
+                                        (false, false) => vk::Format::R8G8B8A8_UNORM,
+                                    };
+                                    let null = match desc.is_multisample {
+                                        _ if self.device.features.null_descriptor => {
+                                            Some(vk::ImageView::null())
+                                        }
+                                        true => None,
+                                        false => self.null_view(view_type(desc.ty), format)?,
+                                    };
+                                    let Some(view) = null else {
+                                        self.draw.warn_once(
+                                            Warning::NullTexture,
+                                            "a draw samples an unbound multisampled texture; skipping it",
+                                        );
+                                        return Ok(false);
+                                    };
+                                    (view, null::NULL_LAYOUT)
                                 }
                             };
                             let (_, sampler_index) = src.pool.split(raw);
@@ -1183,7 +1174,7 @@ impl VulkanRasterizer {
                             self.draw.image_infos.push(vk::DescriptorImageInfo {
                                 sampler,
                                 image_view: view,
-                                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                                image_layout: layout,
                             });
                         }
                     }
@@ -1255,11 +1246,19 @@ impl VulkanRasterizer {
                                 self.storage_view(src, raw, &desc)?
                             };
                             let Some((id, view)) = found else {
-                                self.draw.warn_once(
-                                    Warning::NullStorageImage,
-                                    "a draw binds an unbound or unstorable storage image; skipping it",
-                                );
-                                return Ok(false);
+                                if !self.device.features.null_descriptor {
+                                    self.draw.warn_once(
+                                        Warning::NullStorageImage,
+                                        "a draw binds an unbound storage image without null descriptors; skipping it",
+                                    );
+                                    return Ok(false);
+                                }
+                                self.draw.image_infos.push(vk::DescriptorImageInfo {
+                                    sampler: vk::Sampler::null(),
+                                    image_view: vk::ImageView::null(),
+                                    image_layout: vk::ImageLayout::GENERAL,
+                                });
+                                continue;
                             };
                             let rescaled = self
                                 .texture_cache
@@ -1440,6 +1439,19 @@ impl VulkanRasterizer {
             .map(|raw| (id, raw)))
     }
 
+    /// A view of `view_type` and `format` reading zeros, for an unbound texture on a device
+    /// without null descriptors; `None` when the device cannot sample the format.
+    fn null_view(
+        &mut self,
+        view_type: vk::ImageViewType,
+        format: vk::Format,
+    ) -> Result<Option<vk::ImageView>> {
+        let scheduler = &mut self.scheduler;
+        self.draw
+            .null_images
+            .view(&self.device, || scheduler.record(), view_type, format)
+    }
+
     fn push_buffer(&mut self, binding: Option<crate::buffer_cache::BufferBinding>) {
         let info = match binding {
             Some(b) => vk::DescriptorBufferInfo {
@@ -1598,15 +1610,20 @@ impl VulkanRasterizer {
             .index_buffer(&mut self.scheduler, &mut self.staging, gmmu, regs, &params)
     }
 
-    /// The buffers an indirect draw reads. `None` skips the draw.
+    /// The buffers an indirect draw (a task/mesh one with `mesh`) reads. `None` skips the draw.
     fn indirect_buffers(
         &mut self,
         gmmu: &lichii_gpu::gmmu::Gmmu,
         regs: &Regs,
         draw: &IndirectDraw,
+        mesh: bool,
     ) -> Result<Option<IndirectBuffers>> {
-        let assembled = assembled_topology(draw.topology) != draw.topology;
-        if !assembled && draw.count_buffer.is_some() && !self.device.features.draw_indirect_count {
+        let assembled = !mesh && assembled_topology(draw.topology) != draw.topology;
+        if !assembled
+            && !mesh
+            && draw.count_buffer.is_some()
+            && !self.device.features.draw_indirect_count
+        {
             self.draw.warn_once(
                 Warning::NoIndirectCount,
                 "the device cannot take indirect draw counts; skipping those draws",
@@ -2349,6 +2366,8 @@ fn storage_pointer(
 mod assembly;
 mod dispatch_grid;
 mod host_compute;
+mod mesh_indirect;
+mod null;
 mod texture;
 
 #[cfg(test)]

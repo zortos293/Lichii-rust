@@ -485,7 +485,7 @@ fn visit_usages(info: &mut ShaderInfo, prog: &Program, id: InstId) {
 
     match op {
         DemoteToHelperInvocation => info.uses_demote_to_helper_invocation = true,
-        GetAttribute | GetAttributeU32 => {
+        GetAttribute | GetAttributeU32 | InterpolateAtOffset => {
             if let Value::Attribute(attribute) = inst.arg(0) {
                 info.loads.set(attribute, true);
             }
@@ -528,7 +528,7 @@ fn visit_usages(info: &mut ShaderInfo, prog: &Program, id: InstId) {
         ResolutionDownFactor | IsTextureScaled | IsImageScaled => {
             info.uses_rescaling_uniform = true;
         }
-        TensorMulAdd => {
+        TensorMulAdd | TensorMulAddF32 => {
             info.uses_subgroup_shuffles = true;
             info.uses_fp32_denorms_preserve = true;
             info.uses_subgroup_invocation_id = true;

@@ -7,6 +7,7 @@
 //! [`system::RendererSystem`] through the accessors each context exposes.
 
 pub mod behavior;
+pub mod command;
 pub mod device;
 pub mod effect;
 pub mod memory;
@@ -14,6 +15,7 @@ pub mod mix;
 pub mod nodes;
 pub mod parameter;
 pub mod performance;
+pub mod render;
 pub mod result;
 pub mod revision;
 pub mod sink;

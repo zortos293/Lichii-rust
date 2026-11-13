@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// Rewrites the guest commands of an indirect task/mesh draw as VkDrawMeshTasksIndirectCommandEXTs,
+// one invocation a command. As for direct mesh draws, the first word of a guest command (its
+// vertex or index count) is the group count; it is clamped to the device's limit and launched
+// as (count, 1, 1). Commands past the draw count launch nothing.
+
+#version 460
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Commands { uint commands[]; };
+layout(set = 0, binding = 1) readonly buffer Count { uint draw_count[]; };
+layout(set = 0, binding = 2) writeonly buffer HostCommands { uint host_commands[]; };
+
+layout(push_constant) uniform P {
+    uint command_word;
+    uint stride_words;
+    uint max_draws;
+    // ~0 without a count buffer
+    uint count_word;
+    uint limit;
+} p;
+
+void main() {
+    uint draw = gl_GlobalInvocationID.x;
+    if (draw >= p.max_draws) {
+        return;
+    }
+    uint draws = p.count_word == 0xffffffffu ? p.max_draws : min(draw_count[p.count_word], p.max_draws);
+    uint groups = draw < draws ? min(commands[p.command_word + draw * p.stride_words], p.limit) : 0u;
+    host_commands[draw * 3u] = groups;
+    host_commands[draw * 3u + 1u] = 1u;
+    host_commands[draw * 3u + 2u] = 1u;
+}

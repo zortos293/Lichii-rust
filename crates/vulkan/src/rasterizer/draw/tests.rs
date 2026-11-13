@@ -1,5 +1,6 @@
 //! Draws of hand-assembled Maxwell programs on synthetic 3D engine state.
 
+use ash::vk;
 use lichii_common::settings::{Anisotropy, GraphicsSettings, ResolutionScale};
 use lichii_gpu::backend::{
     ChannelId, ComputeContext, ConstBufferBinding, DrawParams, DrawTexture, GraphicsConstBuffers,
@@ -1946,6 +1947,12 @@ const TABLE: u64 = SSBO + 0x24;
 /// Samples at (0.5, 0.5), into render target 0, the texture whose handle is word 4 of the
 /// table the storage buffer c[0][0x110] points to.
 fn table_sampling_program() -> Vec<u8> {
+    typed_table_sampling_program(2)
+}
+
+/// `table_sampling_program` sampling as TEX texture type `ty` (2: 2D, 3: 2D array, 4: 3D,
+/// 6: cube).
+fn typed_table_sampling_program(ty: u64) -> Vec<u8> {
     let mut header = header(2, ShaderType::PIXEL);
     header[18] = 0xf;
     let ldg = sass(
@@ -1954,7 +1961,7 @@ fn table_sampling_program() -> Vec<u8> {
     );
     let tex = sass(
         Opcode::TexB,
-        (7 << 51) | (0b1111 << 31) | (2 << 28) | (6 << 20) | (2 << 8),
+        (7 << 51) | (0b1111 << 31) | (ty << 28) | (6 << 20) | (2 << 8),
     );
     program(
         header,
@@ -2054,6 +2061,77 @@ fn handle_programs_naming_an_image_of_another_kind_bind_the_null_texture() {
     f.assert_no_validation_errors();
 }
 
+#[test]
+fn null_images_exist_for_every_view_type_and_null_format() {
+    let Some((mut f, _)) = draw_fixture() else {
+        return;
+    };
+    let types = [
+        vk::ImageViewType::TYPE_1D,
+        vk::ImageViewType::TYPE_1D_ARRAY,
+        vk::ImageViewType::TYPE_2D,
+        vk::ImageViewType::TYPE_2D_ARRAY,
+        vk::ImageViewType::TYPE_3D,
+        vk::ImageViewType::CUBE,
+        vk::ImageViewType::CUBE_ARRAY,
+    ];
+    for view_type in types {
+        for format in [
+            vk::Format::R8G8B8A8_UNORM,
+            vk::Format::R8G8B8A8_UINT,
+            vk::Format::D16_UNORM,
+        ] {
+            let depth_3d =
+                format == vk::Format::D16_UNORM && view_type == vk::ImageViewType::TYPE_3D;
+            if depth_3d {
+                continue;
+            }
+            let view = f.rasterizer.null_view(view_type, format).unwrap();
+            assert!(view.is_some(), "{view_type:?} {format:?}");
+            assert_eq!(
+                f.rasterizer.null_view(view_type, format).unwrap(),
+                view,
+                "created once"
+            );
+        }
+    }
+    f.rasterizer.scheduler.finish().unwrap();
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn unbound_textures_of_every_type_read_zeros() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    uniform_texture(&f, 0, TEXTURE, [10, 200, 30, 255]);
+    let regs = sampling_regs();
+    handle_table(&mut f, 0);
+    for (ty, name) in [(3, "2D array"), (4, "3D"), (6, "cube")] {
+        write(
+            &f,
+            PROGRAMS + u64::from(FRAGMENT),
+            &fragment_program([0, 4]),
+        );
+        f.rasterizer
+            .invalidate_region(DADDR + PROGRAMS + u64::from(FRAGMENT), 0x100);
+        draw(&mut f, &gmmu, &regs);
+        assert!(target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]));
+        let program = typed_table_sampling_program(ty);
+        write(&f, PROGRAMS + u64::from(FRAGMENT), &program);
+        f.rasterizer
+            .invalidate_region(DADDR + PROGRAMS + u64::from(FRAGMENT), program.len() as u64);
+        draw(&mut f, &gmmu, &regs);
+        assert!(
+            target(&mut f).iter().all(|&t| t == [0; 4]),
+            "a {name} descriptor naming a 2D image reads the null texture"
+        );
+    }
+    assert_eq!(f.rasterizer.draw.warned & Warning::NullTexture as u32, 0);
+    assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
+    f.assert_no_validation_errors();
+}
+
 /// Stores `handle` as word 4 of the table the storage buffer c[0][0x110] points to.
 fn table_writing_program(handle: u32) -> Vec<u8> {
     let mut header = header(2, ShaderType::PIXEL);
@@ -2124,7 +2202,7 @@ fn handle_programs_read_the_table_words_earlier_gpu_work_wrote() {
 }
 
 #[test]
-fn handle_programs_skip_typeless_image_loads_of_integer_images() {
+fn handle_programs_load_zeros_for_integer_images_under_typeless_loads() {
     let Some((mut f, gmmu)) = draw_fixture() else {
         return;
     };
@@ -2161,11 +2239,17 @@ fn handle_programs_skip_typeless_image_loads_of_integer_images() {
 
     handle_table(&mut f, 1);
     draw(&mut f, &gmmu, &regs);
-    assert_ne!(
-        f.rasterizer.draw.warned & Warning::NullStorageImage as u32,
-        0,
-        "an integer image under the float declaration skips the draw"
-    );
+    let warned = f.rasterizer.draw.warned & Warning::NullStorageImage as u32 != 0;
+    if f.rasterizer.device.features.null_descriptor {
+        assert!(
+            target(&mut f).iter().all(|t| t[..3] == [0; 3]),
+            "an integer image under the float declaration loads from a null descriptor: {:?}",
+            &target(&mut f)[..2]
+        );
+        assert!(!warned);
+    } else {
+        assert!(warned, "without null descriptors the draw is skipped");
+    }
     assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
     f.assert_no_validation_errors();
 }
@@ -2743,19 +2827,32 @@ fn per_primitive_fragment_inputs_skip_the_draw() {
     f.assert_no_validation_errors();
 }
 
-#[test]
-fn indirect_mesh_draws_are_skipped() {
-    let Some((mut f, gmmu)) = mesh_fixture() else {
-        return;
-    };
-    let regs = mesh_regs(1);
+/// Draws `commands` (guest indirect commands of `stride` bytes) as an indirect task/mesh draw,
+/// with the draw count `count` when set, and returns whether the triangle covered the target.
+fn mesh_indirect_draw(
+    f: &mut Fixture,
+    gmmu: &Gmmu,
+    regs: &Regs,
+    indexed: bool,
+    stride: u32,
+    commands: &[u32],
+    count: Option<u32>,
+) -> bool {
+    write(f, COMMANDS, bytemuck::cast_slice(commands));
+    f.rasterizer
+        .invalidate_region(DADDR + COMMANDS, commands.len() as u64 * 4);
+    if let Some(count) = count {
+        write(f, COUNT, &count.to_le_bytes());
+        f.rasterizer.invalidate_region(DADDR + COUNT, 4);
+    }
+    let words = commands.len() as u32 * 4;
     let mut dirty = DirtyState::new();
     let const_buffers = const_buffers();
     let root_tables = [[0; 64]; 8];
     let mut ctx = GraphicsContext {
         channel: ChannelId(0),
-        memory: &gmmu,
-        regs: &regs,
+        memory: gmmu,
+        regs,
         dirty: &mut dirty,
         const_buffers: &const_buffers,
         root_tables: &root_tables,
@@ -2763,15 +2860,134 @@ fn indirect_mesh_draws_are_skipped() {
     f.rasterizer.draw_indirect(
         &mut ctx,
         &IndirectDraw {
-            topology: PrimitiveTopology::TRIANGLES,
-            indexed: false,
-            buffer: GPU_VA + VERTICES,
-            stride: 16,
-            max_draws: 1,
-            count_buffer: None,
+            topology: PrimitiveTopology::QUADS,
+            indexed,
+            buffer: GPU_VA + COMMANDS,
+            stride,
+            max_draws: words / stride,
+            count_buffer: count.map(|_| GPU_VA + COUNT),
         },
     );
-    assert_ne!(f.rasterizer.draw.warned & Warning::IndirectMesh as u32, 0);
-    assert_eq!(f.rasterizer.draw.shaders.stats().translated, 0);
+    let texels = switch2_target(f);
+    let covered = texels.iter().all(|&t| t == [255, 128, 0, 255]);
+    assert!(
+        covered || texels.iter().all(|&t| t == [0; 4]),
+        "all or nothing: {:?}",
+        &texels[..4]
+    );
+    covered
+}
+
+#[test]
+fn indirect_mesh_draws_launch_the_groups_their_first_word_counts() {
+    let Some((mut f, gmmu)) = mesh_fixture() else {
+        return;
+    };
+    let regs = mesh_regs(1);
+    assert!(
+        !mesh_indirect_draw(&mut f, &gmmu, &regs, false, 16, &[0, 1, 0, 0], None),
+        "no groups draw nothing"
+    );
+    assert!(
+        mesh_indirect_draw(&mut f, &gmmu, &regs, false, 16, &[1, 0, 0, 0], None),
+        "one group, whatever the instance count and first vertex words hold"
+    );
+    assert_eq!(f.rasterizer.draw.pipelines.stats().built, 1);
+    assert_eq!(
+        f.rasterizer.draw.warned & Warning::IndirectMesh as u32,
+        0,
+        "the quad topology is not assembled"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn indexed_indirect_mesh_draws_count_groups_with_the_index_count() {
+    let Some((mut f, gmmu)) = mesh_fixture() else {
+        return;
+    };
+    let regs = mesh_regs(1);
+    assert!(!mesh_indirect_draw(
+        &mut f,
+        &gmmu,
+        &regs,
+        true,
+        20,
+        &[0, 1, 0, 0, 0],
+        None
+    ));
+    assert!(mesh_indirect_draw(
+        &mut f,
+        &gmmu,
+        &regs,
+        true,
+        20,
+        &[1, 1, 0, 0, 0],
+        None
+    ));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn indirect_mesh_draws_launch_only_the_commands_the_count_buffer_names() {
+    let Some((mut f, gmmu)) = mesh_fixture() else {
+        return;
+    };
+    let regs = mesh_regs(1);
+    let commands = [0, 1, 0, 0, 1, 1, 0, 0];
+    assert!(
+        !mesh_indirect_draw(&mut f, &gmmu, &regs, false, 16, &commands, Some(1)),
+        "the second command is past the count"
+    );
+    assert!(mesh_indirect_draw(
+        &mut f,
+        &gmmu,
+        &regs,
+        false,
+        16,
+        &commands,
+        Some(2)
+    ));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn indirect_mesh_draws_launch_every_command_without_a_count() {
+    let Some((mut f, gmmu)) = mesh_fixture() else {
+        return;
+    };
+    let regs = mesh_regs(1);
+    assert!(
+        mesh_indirect_draw(
+            &mut f,
+            &gmmu,
+            &regs,
+            false,
+            16,
+            &[0, 1, 0, 0, 1, 1, 0, 0],
+            None
+        ),
+        "the second command draws"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn indirect_task_draws_launch_the_mesh_workgroups_their_tasks_count() {
+    let Some((mut f, gmmu)) = mesh_fixture() else {
+        return;
+    };
+    let mut regs = mesh_regs(3);
+    bind_program(&mut regs, 1, ShaderType::VERTEX_B, TASK);
+    assert!(mesh_indirect_draw(
+        &mut f,
+        &gmmu,
+        &regs,
+        false,
+        16,
+        &[1, 1, 0, 0],
+        None
+    ));
+    assert_eq!(mesh_stages(&f), TASK_STAGES);
     f.assert_no_validation_errors();
 }

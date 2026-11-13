@@ -434,7 +434,11 @@ impl App {
             let settings = running.as_ref().map_or(&self.settings, |r| &r.settings);
             let host = Host {
                 renderer: match &self.display {
-                    Some(display) => display.renderer(title, &settings.graphics),
+                    Some(display) => display.renderer(
+                        title,
+                        &settings.graphics,
+                        crate::display::shader_cache_dir(&self.paths, program_id),
+                    ),
                     None => lichii_core::headless_renderer(),
                 },
                 npad: self.input.hub().clone(),

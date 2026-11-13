@@ -183,6 +183,17 @@ pub type CaptureParameterV1 = AuxParameterV1;
 /// The capture effect reuses the aux parameter layout.
 pub type CaptureParameterV2 = AuxParameterV1;
 
+/// `BufferMixerInfo::ParameterVersion1`: the mix effect, which the generator turns into mix
+/// commands.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+#[repr(C)]
+pub struct BufferMixerParameterV1 {
+    pub inputs: [i8; 24],
+    pub outputs: [i8; 24],
+    pub volumes: [f32; 24],
+    pub mix_count: u32,
+}
+
 /// `LightLimiterInfo::ProcessingMode`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LimiterProcessingMode {
@@ -412,6 +423,9 @@ const _: () = {
     assert!(offset_of!(I3dl2ReverbParameterV1, dry_gain) == 0x44);
     assert!(offset_of!(I3dl2ReverbParameterV1, state) == 0x48);
     assert!(offset_of!(I3dl2ReverbParameterV1, unk49) == 0x49);
+    assert!(size_of::<BufferMixerParameterV1>() == 0x94);
+    assert!(offset_of!(BufferMixerParameterV1, volumes) == 0x30);
+    assert!(offset_of!(BufferMixerParameterV1, mix_count) == 0x90);
     assert!(offset_of!(AuxParameterV1, inputs) == 0x00);
     assert!(offset_of!(AuxParameterV1, outputs) == 0x18);
     assert!(offset_of!(AuxParameterV1, mix_buffer_count) == 0x30);
