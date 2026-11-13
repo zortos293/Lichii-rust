@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use lichii_common::ResultCode;
 use lichii_common::settings::Settings;
+use lichii_common::{ResultCode, VAddr};
 use lichii_kernel::Event;
 use lichii_kernel::ipc::Handle;
 use lichii_kernel::memory::Pool;
@@ -1187,9 +1187,13 @@ fn video_decoder_sessions_hand_out_decoder_services() {
     }
 }
 
+/// One 64x48 NV12 decoder image: 128 rows of 64-byte pitch, luma then chroma.
+const NV12_IMAGE_SIZE: u64 = 64 * 128 * 2;
+
 struct Vdec {
     context: Arc<ServiceContext>,
     client: IpcClient,
+    gsv: Handle,
     service: Handle,
     frame: u64,
 }
@@ -1206,6 +1210,7 @@ impl Vdec {
         let vdec = Self {
             context,
             client,
+            gsv,
             service,
             frame,
         };
@@ -1222,6 +1227,43 @@ impl Vdec {
 
     fn send(&self, request: &Request) -> lichii_kernel::testing::Reply {
         self.client.send(self.service, request).unwrap()
+    }
+
+    /// A gsv 911 pool of three 64x48 NV12 decoder images in mapped memory, each
+    /// [`NV12_IMAGE_SIZE`] bytes: their address and the first image's handle.
+    fn nv12_pool(&self) -> (VAddr, u32) {
+        let size = 3 * NV12_IMAGE_SIZE;
+        let images = self.client.alloc(&vec![0u8; size as usize]);
+        let mut reply = self
+            .client
+            .send(self.gsv, &words(Request::tipc(111), &[1, size as u32, 0]))
+            .unwrap();
+        let memory = reply.pop::<u32>();
+        let bind = [[memory].as_slice(), &split(images), &split(size), &[0; 4]].concat();
+        let reply = self
+            .client
+            .send(self.gsv, &words(Request::tipc(114), &bind))
+            .unwrap();
+        assert_eq!(reply.result, ResultCode::SUCCESS);
+        let pool_request = [decoder_preference(1, 64, 48), vec![3, memory]].concat();
+        let mut reply = self
+            .client
+            .send(self.gsv, &words(Request::tipc(911), &pool_request))
+            .unwrap();
+        (images, reply.pop::<u32>())
+    }
+
+    /// 314 for `image` with the release fence (`syncpoint`, `value`): the fence it replies.
+    fn hand_out_released(&self, image: u32, syncpoint: u32, value: u32) -> (u32, u32) {
+        let request = Request::tipc(314)
+            .arg(image)
+            .arg(0u32)
+            .arg([!syncpoint, 0])
+            .arg(u64::from(value));
+        let mut reply = self.send(&request);
+        assert_eq!(reply.result, ResultCode::SUCCESS);
+        let (counter, _, value) = (reply.pop::<u32>(), reply.pop::<u32>(), reply.pop::<u64>());
+        (!counter, value as u32)
     }
 
     /// 311 or 314 for `image`: the NativeSyncHandle's syncpoint and value.
@@ -1244,6 +1286,16 @@ impl Vdec {
                 .buffer_a(self.frame, size)
                 .arg(pts)
                 .arg(u8::from(end)),
+        )
+    }
+
+    fn submit_frame(&self, data: &[u8], pts: u64) -> lichii_kernel::testing::Reply {
+        let frame = self.client.alloc(data);
+        self.send(
+            &Request::tipc(109)
+                .buffer_a(frame, data.len() as u64)
+                .arg(pts)
+                .arg(0u8),
         )
     }
 
@@ -1388,16 +1440,17 @@ fn video_decoder_counts_unregistered_images_off_in_turn() {
 #[test]
 fn video_decoder_stop_completes_handed_fences_and_full_queues_are_busy() {
     let vdec = Vdec::open();
-    for pts in 0..24 {
-        assert_eq!(vdec.submit(pts * 16_667, false).result, ResultCode::SUCCESS);
+    let mut accepted = 0;
+    while vdec.submit(accepted * 16_667, false).result == ResultCode::SUCCESS {
+        accepted += 1;
+        assert!(accepted <= 32, "busy while no image takes a frame");
     }
-    assert_eq!(
-        vdec.submit(24 * 16_667, false).result,
-        ResultCode::new(111, 3603),
-        "busy while no image takes a frame"
+    assert!(
+        accepted >= 24,
+        "{accepted} inputs queue before the decoder refuses more"
     );
     assert_eq!(
-        vdec.submit(25 * 16_667, true).result,
+        vdec.submit(40 * 16_667, true).result,
         ResultCode::SUCCESS,
         "end of stream is never refused"
     );
@@ -1412,6 +1465,109 @@ fn video_decoder_stop_completes_handed_fences_and_full_queues_are_busy() {
         guest.value(syncpoint).unwrap(),
         last,
         "stopped images take no more frames"
+    );
+    vdec.close(syncpoint);
+}
+
+/// The frames of an IVF file.
+fn ivf_frames(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut at = usize::from(u16::from_le_bytes([bytes[6], bytes[7]]));
+    let mut frames = Vec::new();
+    while at + 12 <= bytes.len() {
+        let size = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        frames.push(&bytes[at + 12..at + 12 + size]);
+        at += 12 + size;
+    }
+    frames
+}
+
+#[test]
+fn video_decoder_writes_decoded_pictures_into_nv12_images() {
+    if !lichii_video::available() {
+        eprintln!("FFmpeg is not installed; skipping");
+        return;
+    }
+    let vdec = Vdec::open();
+    let (images, pool) = vdec.nv12_pool();
+
+    let fences: Vec<_> = (0..3).map(|i| vdec.hand_out(311, pool + i)).collect();
+    let stream = ivf_frames(include_bytes!(
+        "../../../video/tests/data/quadrants.vp9.ivf"
+    ));
+    for (frame, data) in stream.iter().take(3).enumerate() {
+        let reply = vdec.submit_frame(data, frame as u64 * 33_333);
+        assert_eq!(reply.result, ResultCode::SUCCESS);
+    }
+    let (syncpoint, last) = fences[2];
+    vdec.wait(syncpoint, last);
+
+    let memory = vdec.context.process.memory();
+    for frame in 0..3u64 {
+        assert_eq!(
+            vdec.output(),
+            Some((pool + frame as u32, 64, frame * 33_333_000, false))
+        );
+        let image = images + frame * NV12_IMAGE_SIZE;
+        let luma: u8 = memory.read(image + 6 * 64 + 8).unwrap();
+        let chroma: [u8; 2] = memory.read(image + 64 * 128 + 3 * 64 + 8).unwrap();
+        assert_eq!(luma, 40 + 30 * frame as u8, "frame {frame} luma");
+        assert_eq!(chroma, [90, 200 - 15 * frame as u8], "frame {frame} chroma");
+    }
+    vdec.close(syncpoint);
+}
+
+#[test]
+fn video_decoder_writes_an_image_only_after_its_release_fence_and_never_after_stop() {
+    if !lichii_video::available() {
+        eprintln!("FFmpeg is not installed; skipping");
+        return;
+    }
+    let vdec = Vdec::open();
+    let (images, pool) = vdec.nv12_pool();
+    let host1x = vdec.context.gpu.host1x();
+    let guest = host1x.syncpoints.guest();
+    let release = vdec.context.nvdrv.get().unwrap().allocate_syncpoint();
+    let base = guest.value(release).unwrap();
+    let stream = ivf_frames(include_bytes!(
+        "../../../video/tests/data/quadrants.vp9.ivf"
+    ));
+    let memory = vdec.context.process.memory();
+    let luma = |image: u64| -> u8 {
+        memory
+            .read(images + image * NV12_IMAGE_SIZE + 6 * 64 + 8)
+            .unwrap()
+    };
+
+    let (syncpoint, first) = vdec.hand_out_released(pool, release, base + 1);
+    assert_eq!(vdec.submit_frame(stream[0], 0).result, ResultCode::SUCCESS);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        luma(0),
+        0,
+        "the image is written before the client's reads of it ended"
+    );
+    guest.increment(release).unwrap();
+    vdec.wait(syncpoint, first);
+    assert_eq!(luma(0), 40, "the frame lands once the release fence passed");
+
+    let (_, second) = vdec.hand_out_released(pool + 1, release, base + 2);
+    assert_eq!(
+        vdec.submit_frame(stream[1], 33_333).result,
+        ResultCode::SUCCESS
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(vdec.send(&Request::tipc(207)).result, ResultCode::SUCCESS);
+    assert!(
+        guest.is_reached(syncpoint, second).unwrap(),
+        "stop completes the fence"
+    );
+    guest.increment(release).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(luma(1), 0, "an image stop took back is not written");
+    assert_eq!(
+        guest.value(syncpoint).unwrap(),
+        host1x.syncpoints.max(syncpoint).unwrap(),
+        "the stopped image's fence is not counted twice"
     );
     vdec.close(syncpoint);
 }

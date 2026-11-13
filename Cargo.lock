@@ -1729,6 +1729,7 @@ dependencies = [
  "lichii-loader",
  "lichii-memory",
  "lichii-texture",
+ "lichii-video",
  "opus1",
  "parking_lot",
  "thiserror 2.0.21",
