@@ -320,6 +320,9 @@ fn is_voice_drop_start(id: CommandId) -> bool {
 /// command, lowest priority first, disabling whole voices until the estimate fits `time_limit`.
 /// Depop prepares stay enabled so a dropped voice fades out. Returns the voices dropped.
 ///
+/// The walk starts at the first command of that voice. The reference starts at the data source
+/// itself, which skips the first voice's depop prepares when performance entries are off.
+///
 /// The reference advances its loop counter once more than its command cursor per dropped voice,
 /// so the pass stops that many commands before the end of the list; this keeps that bound.
 fn drop_voices(
@@ -331,12 +334,16 @@ fn drop_voices(
 ) -> u32 {
     let commands = &mut list.commands;
     let count = commands.len();
-    let Some(mut cursor) = commands
+    let Some(start) = commands
         .iter()
         .position(|entry| is_voice_drop_start(entry.command.id()))
     else {
         return 0;
     };
+    let mut cursor = commands[..start]
+        .iter()
+        .rposition(|entry| entry.node_id != commands[start].node_id)
+        .map_or(0, |index| index + 1);
     let mut counter = cursor;
     let mut dropped = 0;
     while counter < count {

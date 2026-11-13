@@ -880,7 +880,6 @@ impl<'a> CommandGenerator<'a> {
             EffectType::Compressor => {
                 let parameter: CompressorParameterV2 = parameter(effect);
                 let mut command = CompressorCommand::default();
-                let mut enabled = true;
                 if is_channel_count_valid(parameter.channel_count as u16) {
                     (command.inputs, command.outputs) = route(
                         offset,
@@ -891,10 +890,8 @@ impl<'a> CommandGenerator<'a> {
                     command.parameter = parameter;
                     command.state = state;
                     command.effect_enabled = effect.enabled;
-                    enabled = effect.enabled;
                 }
-                out.buffer
-                    .push_with(node_id, enabled, Command::Compressor(command));
+                out.push(node_id, Command::Compressor(command));
             }
             EffectType::Invalid => {}
         }

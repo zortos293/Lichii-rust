@@ -3563,7 +3563,7 @@ impl ProcessingTimeEstimator {
                 }
             },
             Command::Compressor(command) => {
-                if entry.enabled {
+                if command.effect_enabled {
                     match command.parameter.channel_count {
                         1 => match self.sample_count {
                             160 => {
