@@ -23,6 +23,7 @@ const IDLE_PRIORITY: u32 = LEVELS as u32;
 const PARK_TIMEOUT: Duration = Duration::from_millis(10);
 /// How often a pause looks again for cores still in guest code, should a wakeup be missed.
 const GUEST_EXIT_POLL: Duration = Duration::from_millis(1);
+const NO_SVC: u32 = u32::MAX;
 
 struct RunQueue {
     levels: [VecDeque<Arc<Thread>>; LEVELS],
@@ -88,6 +89,8 @@ struct Core {
     rotate: AtomicBool,
     /// The core is running guest code (inside `CpuCore::run`).
     in_guest: AtomicBool,
+    /// The SVC the core is handling, or [`NO_SVC`].
+    svc: AtomicU32,
 }
 
 /// A thread taken from a run queue to run on a core.
@@ -130,6 +133,7 @@ impl Scheduler {
                     resched: AtomicBool::new(false),
                     rotate: AtomicBool::new(false),
                     in_guest: AtomicBool::new(false),
+                    svc: AtomicU32::new(NO_SVC),
                 })
                 .collect(),
             idle: AtomicU64::new(0),
@@ -421,6 +425,13 @@ impl Scheduler {
         true
     }
 
+    /// Records the SVC `core` is handling (`None` when done), for the thread dump.
+    pub(crate) fn set_svc(&self, core: usize, svc: Option<u32>) {
+        self.cores[core]
+            .svc
+            .store(svc.unwrap_or(NO_SVC), Ordering::Relaxed);
+    }
+
     pub(crate) fn leave_guest(&self, core: usize) {
         self.cores[core].in_guest.store(false, Ordering::SeqCst);
         if self.paused.load(Ordering::SeqCst) {
@@ -479,9 +490,14 @@ impl Scheduler {
                     })
                     .collect();
                 format!(
-                    "core={index} running={:?} running_priority={} resched={} idle={} queued={queued:?}",
+                    "core={index} running={:?} running_priority={} in_guest={} svc={} resched={} idle={} queued={queued:?}",
                     running[index],
                     core.running_priority.load(Ordering::Acquire),
+                    core.in_guest.load(Ordering::Acquire),
+                    match core.svc.load(Ordering::Relaxed) {
+                        NO_SVC => "-".to_string(),
+                        svc => format!("{svc:#04x}"),
+                    },
                     core.resched.load(Ordering::Acquire),
                     self.idle.load(Ordering::Acquire) & (1 << index) != 0,
                 )

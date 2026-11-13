@@ -109,7 +109,10 @@ impl Core {
                         thread,
                         ctx: &mut self.ctx,
                     };
-                    svc::dispatch(&mut svc, imm)
+                    self.kernel.scheduler.set_svc(self.index, Some(imm));
+                    let flow = svc::dispatch(&mut svc, imm);
+                    self.kernel.scheduler.set_svc(self.index, None);
+                    flow
                 }
                 HaltReason::InvalidateCode { addr, size } => {
                     self.kernel

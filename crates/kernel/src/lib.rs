@@ -328,7 +328,7 @@ impl Kernel {
             thread.thread().unpark();
         }
         for thread in threads {
-            join_noting_slow(thread);
+            join_noting_slow(thread, || self.0.log_thread_states());
         }
         let services = std::mem::take(&mut *self.0.services.lock());
         step_noting_slow("stopping the service threads", || {
@@ -337,7 +337,7 @@ impl Kernel {
             }
         });
         for join in services.joins {
-            join_noting_slow(join);
+            join_noting_slow(join, || self.0.log_thread_states());
         }
         step_noting_slow("closing service sessions", || {
             self.0.service_manager.clear();
@@ -415,16 +415,18 @@ fn step_noting_slow(step: &'static str, run: impl FnOnce()) {
     }
 }
 
-fn join_noting_slow(thread: JoinHandle<()>) {
+fn join_noting_slow(thread: JoinHandle<()>, on_slow: impl FnOnce()) {
     let started = Instant::now();
-    let mut warned = false;
+    let mut on_slow = Some(on_slow);
     while !thread.is_finished() {
-        if !warned && started.elapsed() >= SLOW_JOIN {
-            warned = true;
+        if started.elapsed() >= SLOW_JOIN
+            && let Some(on_slow) = on_slow.take()
+        {
             tracing::warn!(
                 thread = thread.thread().name().unwrap_or("unnamed"),
                 "shutdown: still waiting for a thread"
             );
+            on_slow();
         }
         std::thread::sleep(Duration::from_millis(2));
     }
