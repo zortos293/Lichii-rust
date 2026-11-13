@@ -211,11 +211,15 @@ fn capture_commands_answer_without_a_shared_capture_buffer() {
     let clear = Request::new(20).arg(0u8).arg(0i32).arg(0xff00_00ffu32);
     assert_eq!(
         client.send(display, &clear).unwrap().result,
-        crate::vi::NOT_FOUND
+        crate::vi::PERMISSION_DENIED
     );
     for (acquire, release) in [(22, 23), (24, 25), (26, 27)] {
         let reply = client.send(display, &Request::new(acquire)).unwrap();
-        assert_eq!(reply.result, crate::vi::NOT_FOUND, "command {acquire}");
+        assert_eq!(
+            reply.result,
+            crate::vi::PERMISSION_DENIED,
+            "command {acquire}"
+        );
         let reply = client.send(display, &Request::new(release)).unwrap();
         assert_eq!(reply.result, ResultCode::SUCCESS, "command {release}");
     }
