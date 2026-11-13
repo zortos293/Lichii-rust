@@ -17,19 +17,20 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::choices::Choice;
 use crate::cli::Cli;
+use crate::config::{ConfigEnv, ConfigWindow};
 use crate::display::Display;
 use crate::game_list::GameList;
 use crate::hotkeys::{self, HotkeyMap};
-use crate::input_worker::{InputMsg, InputWorker};
+use crate::input_worker::{InputEvent, InputMsg, InputWorker};
 use crate::session::Session;
 
 /// Events other threads send to the UI thread.
 #[derive(Debug)]
 pub enum UserEvent {
-    /// A controller hotkey combo was pressed; combos act only while a session exists, so menu
-    /// navigation on a controller never exits or toggles settings.
+    /// A controller hotkey combo was pressed; combos act only while a session exists and the
+    /// configuration window is closed, so menu navigation and binding never exit or toggle.
     Hotkey(HotkeyAction),
-    /// Background work finished (game list scan); redraw.
+    /// Background work finished (game list scan) or gamepads changed; redraw.
     Wake,
 }
 
@@ -73,6 +74,9 @@ pub struct App {
     held_keys: KeySet,
     pub perf: Arc<PerfStats>,
     pub ui: UiState,
+    paths: UserPaths,
+    /// The configuration window while it is open.
+    config: Option<ConfigWindow>,
     /// Where the renderer draws the guest frame, in physical pixels.
     pub viewport: Option<Viewport>,
     pending_boot: Option<PathBuf>,
@@ -97,8 +101,11 @@ impl App {
         let input = InputWorker::spawn(
             settings.controls.clone(),
             hotkeys::combos(&settings.ui.hotkeys),
-            move |action| {
-                let _ = hotkey_proxy.send_event(UserEvent::Hotkey(action));
+            move |event| {
+                let _ = hotkey_proxy.send_event(match event {
+                    InputEvent::Hotkey(action) => UserEvent::Hotkey(action),
+                    InputEvent::DevicesChanged => UserEvent::Wake,
+                });
             },
         );
         tracing::debug!(
@@ -121,6 +128,8 @@ impl App {
             held_keys: KeySet::default(),
             perf: Arc::new(PerfStats::default()),
             ui: UiState::default(),
+            paths: paths.clone(),
+            config: None,
             viewport: None,
             pending_boot: cli.game,
             start_fullscreen: cli.fullscreen,
@@ -180,6 +189,54 @@ impl App {
         if let Err(e) = self.settings.save(path) {
             tracing::error!("saving settings: {e}");
         }
+    }
+
+    /// Draws the configuration window when it is open and applies what it returns.
+    pub(crate) fn show_config(&mut self, ctx: &egui::Context) {
+        let Some(config) = &mut self.config else {
+            return;
+        };
+        let (devices, host) = {
+            let shared = self
+                .input
+                .shared()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            (shared.devices.clone(), shared.host.clone())
+        };
+        let env = ConfigEnv {
+            devices: &devices,
+            host: host.as_ref(),
+            adapter: self.display.as_ref().map(Display::adapter_name),
+            paths: &self.paths,
+            running: self.session.is_some(),
+        };
+        let out = config.show(ctx, &env);
+        if let Some(player) = out.test_rumble {
+            self.input.send(InputMsg::TestRumble(player));
+        }
+        if let Some(settings) = out.apply {
+            self.apply_settings(settings);
+        }
+        if out.close {
+            self.config = None;
+            self.input.send(InputMsg::Mirror(false));
+        }
+    }
+
+    /// Replaces every setting (the configuration window's OK or Apply) and saves.
+    fn apply_settings(&mut self, settings: Settings) {
+        let dirs_changed = settings.paths.game_dirs != self.settings.paths.game_dirs;
+        self.settings = settings;
+        self.reconfigure_input();
+        if let Some(display) = &mut self.display {
+            display.set_settings(&self.settings.graphics);
+        }
+        self.apply_theme();
+        if dirs_changed {
+            self.refresh_games();
+        }
+        self.save_settings();
     }
 
     /// Re-applies settings that live outside `self.settings`: input bindings and hotkeys.
@@ -306,7 +363,10 @@ impl App {
                 }
             }
             HotkeyAction::Configure => {
-                self.toast("The configuration window is not built yet");
+                if self.config.is_none() {
+                    self.config = Some(ConfigWindow::new(&self.settings, &self.paths));
+                    self.input.send(InputMsg::Mirror(true));
+                }
             }
             HotkeyAction::Fullscreen => self.set_fullscreen(!self.is_fullscreen()),
             HotkeyAction::ExitFullscreen => {
@@ -380,9 +440,10 @@ impl App {
         }
     }
 
-    /// Tells the input thread whether the guest should see input: only while a title runs.
+    /// Tells the input thread whether the guest should see input: only while a title runs and
+    /// the configuration window is closed (its keys bind controls, not play).
     fn sync_guest_input(&mut self) {
-        let on = self.session.as_ref().is_some_and(|s| !s.is_paused());
+        let on = self.config.is_none() && self.session.as_ref().is_some_and(|s| !s.is_paused());
         if on != self.guest_input {
             self.guest_input = on;
             self.input.send(InputMsg::GuestInput(on));
@@ -399,7 +460,24 @@ impl App {
         let down = event.state == ElementState::Pressed;
         self.held_keys.set(key, down);
         if down
+            && let Some(config) = &mut self.config
+            && config.wants_chord()
+        {
+            if let Some(chord) = KeyChord::from_press(key, &self.held_keys) {
+                config.on_chord(chord);
+            }
+            return;
+        }
+        if down
             && !event.repeat
+            && let Some(config) = &mut self.config
+            && config.on_key(key)
+        {
+            return;
+        }
+        if down
+            && !event.repeat
+            && self.config.is_none()
             && !self.egui_ctx.egui_wants_keyboard_input()
             && let Some(chord) = KeyChord::from_press(key, &self.held_keys)
             && let Some(action) = self.hotkeys.action(chord)
@@ -407,7 +485,7 @@ impl App {
             self.apply(Action::Hotkey(action));
             return;
         }
-        if !down || !self.egui_ctx.egui_wants_keyboard_input() {
+        if !down || self.config.is_some() || !self.egui_ctx.egui_wants_keyboard_input() {
             self.input.send(InputMsg::Key(key, down));
         }
     }
@@ -538,6 +616,18 @@ impl ApplicationHandler<UserEvent> for App {
         let Some(window) = self.window.clone() else {
             return;
         };
+        if let WindowEvent::MouseInput {
+            state: ElementState::Pressed,
+            button,
+            ..
+        } = event
+            && let Some(button) = MouseButton::from_winit(button)
+            && let Some(config) = &mut self.config
+            && config.on_mouse(button)
+        {
+            window.request_redraw();
+            return;
+        }
         let response = self
             .egui_state
             .as_mut()
@@ -595,7 +685,7 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Hotkey(action) if self.session.is_some() => {
+            UserEvent::Hotkey(action) if self.session.is_some() && self.config.is_none() => {
                 self.apply(Action::Hotkey(action));
             }
             UserEvent::Hotkey(_) => {}
