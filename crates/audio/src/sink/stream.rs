@@ -345,7 +345,9 @@ impl SinkStream {
     /// the buffer will have finished playing. Only frames `samples` holds are queued, and a
     /// buffer too large for the stream's ring is cut short. The samples are scaled by the stream, device and
     /// host volumes and converted to the device's channel count: 6 to 2 channels downmixes as
-    /// Eden does, fewer channels than the device fill the first ones. Allocates nothing.
+    /// Eden does, fewer channels than the device fill the first ones. Allocates only when a
+    /// buffer outgrows the ring, which doubles it under the stream lock (so the host callback
+    /// waits for the copy); that happens a few times per stream at most.
     pub fn append_buffer(&self, frames: u64, samples: &[i16]) -> u64 {
         let state = &self.state;
         let mut inner = state.inner.lock();
