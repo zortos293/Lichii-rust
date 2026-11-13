@@ -43,7 +43,8 @@ pub(crate) struct Job {
     pub disk: bool,
 }
 
-/// A finished job: `translated` is `None` when it went stale before a worker took it.
+/// A finished job: `translated` is `None` when it went stale before a worker took it, or the
+/// guest rewrote the program while it translated.
 pub(crate) struct Done {
     pub key: u64,
     pub state: u64,
@@ -175,7 +176,11 @@ fn work(shared: &Shared, done: &mpsc::Sender<Done>, profile: &Profile, host: &Ho
                 shared.ready.wait(&mut queue);
             }
         };
-        let translated = (!stale).then(|| translate(&job, profile, host));
+        let translated = if stale {
+            None
+        } else {
+            translate(&job, profile, host)
+        };
         let finished = Done {
             key: job.key,
             state: job.state,
@@ -187,7 +192,9 @@ fn work(shared: &Shared, done: &mpsc::Sender<Done>, profile: &Profile, host: &Ho
     }
 }
 
-fn translate(job: &Job, profile: &Profile, host: &HostTranslateInfo) -> Translated {
+/// `None` when the guest rewrote program words translation had read: the module would not
+/// match the bytes now there.
+fn translate(job: &Job, profile: &Profile, host: &HostTranslateInfo) -> Option<Translated> {
     let options = TranslateOptions {
         profile,
         host,
@@ -211,14 +218,19 @@ fn translate(job: &Job, profile: &Profile, host: &HostTranslateInfo) -> Translat
     let mut bytes = Vec::new();
     let mut code = |env: &ProgramEnv<'_>| {
         let (start, len) = env.code_range();
-        ProgramCode {
+        let hash = hash_program(env.gmmu(), start, len, &mut bytes);
+        env.consumed_unchanged(start, &bytes).then(|| ProgramCode {
             gmmu: env.memory().clone(),
             start,
             len,
-            hash: hash_program(env.gmmu(), start, len, &mut bytes),
-        }
+            hash,
+        })
     };
-    let code = [a.as_ref().map(&mut code), Some(code(&env))];
+    let vertex_a = match &a {
+        Some(a) => Some(code(a)?),
+        None => None,
+    };
+    let code = [vertex_a, Some(code(&env)?)];
     let mut reads = [
         a.as_ref().map(ProgramEnv::take_reads).unwrap_or_default(),
         env.take_reads(),
@@ -234,13 +246,13 @@ fn translate(job: &Job, profile: &Profile, host: &HostTranslateInfo) -> Translat
             (Err(error), None)
         }
     };
-    Translated {
+    Some(Translated {
         module,
         entry,
         reads,
         code,
         bindings,
-    }
+    })
 }
 
 #[cfg(test)]

@@ -361,6 +361,9 @@ pub struct ProgramEnv<'a> {
     reads: RefCell<Vec<EnvRead>>,
     /// Lowest and one past the highest program byte the translator read.
     extent: Cell<(GpuVAddr, GpuVAddr)>,
+    /// Every program word the translator read, kept on a worker's environment, where the guest
+    /// may rewrite the program while it translates.
+    code_log: Option<RefCell<Vec<(GpuVAddr, u64)>>>,
 }
 
 impl<'a> ProgramEnv<'a> {
@@ -404,6 +407,7 @@ impl<'a> ProgramEnv<'a> {
             mesh,
             reads: RefCell::new(Vec::new()),
             extent: Cell::new((start, start)),
+            code_log: None,
         };
         let word = |index: u64| env.word(header + index * 4);
         let low = word(1) & 0xff_ffff;
@@ -439,6 +443,7 @@ impl<'a> ProgramEnv<'a> {
             mesh: None,
             reads: RefCell::new(Vec::new()),
             extent: Cell::new((ctx.program, ctx.program)),
+            code_log: None,
         }
     }
 
@@ -465,6 +470,19 @@ impl<'a> ProgramEnv<'a> {
 
     pub fn gmmu(&self) -> &'a Gmmu {
         self.gmmu
+    }
+
+    /// Whether `bytes`, program memory from `start`, still hold every word the translator read
+    /// from a snapshot. Always true off a snapshot, where nothing else runs during translation.
+    pub fn consumed_unchanged(&self, start: GpuVAddr, bytes: &[u8]) -> bool {
+        self.code_log.as_ref().is_none_or(|log| {
+            log.borrow().iter().all(|&(address, value)| {
+                let offset = address.wrapping_sub(start) as usize;
+                bytes
+                    .get(offset..offset + 8)
+                    .is_some_and(|word| word == value.to_le_bytes())
+            })
+        })
     }
 
     /// The channel's address space, to share with another thread.
@@ -507,6 +525,7 @@ impl<'a> ProgramEnv<'a> {
             mesh: snapshot.mesh,
             reads: RefCell::new(Vec::new()),
             extent: Cell::new((snapshot.start, snapshot.start)),
+            code_log: Some(RefCell::new(Vec::new())),
         }
     }
 
@@ -607,7 +626,11 @@ impl ShaderEnvironment for ProgramEnv<'_> {
         let (low, high) = self.extent.get();
         self.extent
             .set((low.min(address), high.max(address.saturating_add(8))));
-        self.gmmu.read::<u64>(address).unwrap_or(0)
+        let value = self.gmmu.read::<u64>(address).unwrap_or(0);
+        if let Some(log) = &self.code_log {
+            log.borrow_mut().push((address, value));
+        }
+        value
     }
 
     fn read_code(&self, address: GpuVAddr, out: &mut [u8]) {
