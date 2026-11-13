@@ -483,6 +483,10 @@ impl App {
 
     /// Boots the title at `path`, with its custom configuration unless `without_custom`.
     fn boot(&mut self, path: PathBuf, without_custom: bool) {
+        if self.firmware.is_some() {
+            self.toast("Wait for the firmware install to finish");
+            return;
+        }
         self.end_session();
         let config_dir = self.config_dir();
         let mut running = None;

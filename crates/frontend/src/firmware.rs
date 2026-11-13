@@ -2,6 +2,7 @@
 //! folder or a ZIP, replace the NAND's system content (`system/Contents/registered`), which
 //! holds the system archives Switch 1 titles need.
 
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -42,11 +43,13 @@ impl fmt::Display for FirmwareError {
             Self::Source(e) => f.write_str(e),
             Self::NoNcas => f.write_str("Unable to locate potential firmware NCA files"),
             Self::FailedDelete => f.write_str("Failed to delete one or more firmware files."),
-            Self::FailedCopy => f.write_str("One or more firmware files failed to copy into NAND."),
-            Self::Cancelled => f.write_str(
-                "Firmware installation cancelled, firmware may be in a bad state or corrupted. \
-                 Re-install firmware.",
+            Self::FailedCopy => f.write_str(
+                "One or more firmware files failed to copy into NAND. The installed firmware was \
+                 kept.",
             ),
+            Self::Cancelled => {
+                f.write_str("Firmware installation cancelled. The installed firmware was kept.")
+            }
             Self::Unreadable => f.write_str(
                 "Firmware reported as present, but was unable to be read. Check for decryption \
                  keys and redump firmware if necessary.",
@@ -107,45 +110,75 @@ fn copy_nca(reader: &mut dyn Read, dest: &Path, progress: &Progress) -> Result<(
     }
 }
 
-/// Notes a failed copy and goes on with the next NCA, as Lichii does; a cancel ends the install.
-fn record(
-    result: Result<(), CopyError>,
-    name: &str,
-    failed: &mut bool,
-) -> Result<(), FirmwareError> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(CopyError::Cancelled) => Err(FirmwareError::Cancelled),
-        Err(CopyError::Io(e)) => {
-            tracing::error!(file = name, "copying firmware into NAND: {e}");
-            *failed = true;
-            Ok(())
+/// The install's error for a failed copy; any failure ends the install, which keeps the old
+/// firmware.
+fn copied(result: Result<(), CopyError>, name: &OsStr) -> Result<(), FirmwareError> {
+    result.map_err(|e| match e {
+        CopyError::Cancelled => FirmwareError::Cancelled,
+        CopyError::Io(e) => {
+            tracing::error!(file = %name.to_string_lossy(), "copying firmware into NAND: {e}");
+            FirmwareError::FailedCopy
         }
+    })
+}
+
+/// Whether `path` is `dir` or inside it, once both are resolved.
+fn inside(path: &Path, dir: &Path) -> bool {
+    match (path.canonicalize(), dir.canonicalize()) {
+        (Ok(path), Ok(dir)) => path.starts_with(dir),
+        _ => false,
     }
 }
 
-/// Empties `registered` for the new firmware, once the source is known to hold NCAs.
-fn clean(registered: &Path) -> Result<(), FirmwareError> {
+/// Replaces the NCAs in `registered` with those of `source`. The NCAs are copied into a staging
+/// folder beside it first, so the installed firmware is kept unless every NCA was read and
+/// written, and a cancel or a damaged source changes nothing.
+pub fn install(
+    source: &FirmwareSource,
+    registered: &Path,
+    progress: &Progress,
+) -> Result<(), FirmwareError> {
+    let (FirmwareSource::Folder(path) | FirmwareSource::Zip(path)) = source;
+    if inside(path, registered) {
+        return Err(FirmwareError::Source(
+            "The firmware source is inside the NAND's system content folder, which the install \
+             replaces. Choose a dump outside it."
+                .into(),
+        ));
+    }
+    let staging = registered.with_extension("installing");
+    let fresh = || {
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging)?;
+        }
+        std::fs::create_dir_all(&staging)
+    };
+    fresh().map_err(|e| {
+        tracing::error!(dir = %staging.display(), "creating the firmware staging folder: {e}");
+        FirmwareError::FailedCopy
+    })?;
+    if let Err(e) = copy_source(source, &staging, progress) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
+    }
     if registered.exists() {
         std::fs::remove_dir_all(registered).map_err(|e| {
             tracing::error!(dir = %registered.display(), "removing the old firmware: {e}");
             FirmwareError::FailedDelete
         })?;
     }
-    std::fs::create_dir_all(registered).map_err(|e| {
-        tracing::error!(dir = %registered.display(), "creating the system content folder: {e}");
+    std::fs::rename(&staging, registered).map_err(|e| {
+        tracing::error!(dir = %registered.display(), "moving the new firmware in place: {e}");
         FirmwareError::FailedCopy
     })
 }
 
-/// Replaces the NCAs in `registered` with those of `source`. Nothing is removed when the source
-/// cannot be read or holds no NCA.
-pub fn install(
+/// Copies the NCAs of `source` into `dest`.
+fn copy_source(
     source: &FirmwareSource,
-    registered: &Path,
+    dest: &Path,
     progress: &Progress,
 ) -> Result<(), FirmwareError> {
-    let mut failed = false;
     match source {
         FirmwareSource::Folder(dir) => {
             let read =
@@ -165,12 +198,11 @@ pub fn install(
                 ncas.iter().map(|(_, _, size)| size).sum(),
                 Ordering::Relaxed,
             );
-            clean(registered)?;
             for (path, name, _) in ncas {
                 let result = File::open(&path)
                     .map_err(CopyError::Io)
-                    .and_then(|mut file| copy_nca(&mut file, &registered.join(&name), progress));
-                record(result, &name.to_string_lossy(), &mut failed)?;
+                    .and_then(|mut file| copy_nca(&mut file, &dest.join(&name), progress));
+                copied(result, &name)?;
             }
         }
         FirmwareSource::Zip(path) => {
@@ -200,18 +232,14 @@ pub fn install(
                 ncas.iter().map(|(_, _, size)| size).sum(),
                 Ordering::Relaxed,
             );
-            clean(registered)?;
             for (index, name, _) in ncas {
                 let result = match archive.by_index(index) {
-                    Ok(mut entry) => copy_nca(&mut entry, &registered.join(&name), progress),
+                    Ok(mut entry) => copy_nca(&mut entry, &dest.join(&name), progress),
                     Err(e) => Err(CopyError::Io(io::Error::other(e))),
                 };
-                record(result, &name.to_string_lossy(), &mut failed)?;
+                copied(result, &name)?;
             }
         }
-    }
-    if failed {
-        return Err(FirmwareError::FailedCopy);
     }
     Ok(())
 }
@@ -396,19 +424,68 @@ mod tests {
     }
 
     #[test]
+    fn a_source_inside_the_nand_is_refused() {
+        let dir = TempDir::new("inside");
+        let registered = dir.0.join("registered");
+        old_firmware(&registered);
+        let dump = registered.join("dump");
+        std::fs::create_dir_all(&dump).unwrap();
+        std::fs::write(dump.join("aa.nca"), b"new").unwrap();
+        for source in [
+            FirmwareSource::Folder(registered.clone()),
+            FirmwareSource::Folder(dump.clone()),
+        ] {
+            let result = install(&source, &registered, &Progress::default());
+            assert!(
+                matches!(result, Err(FirmwareError::Source(_))),
+                "{result:?}"
+            );
+        }
+        assert_eq!(names(&registered), ["dump", "old.nca"]);
+        assert!(dump.join("aa.nca").is_file());
+    }
+
+    #[test]
+    fn a_damaged_zip_entry_keeps_the_installed_firmware() {
+        let dir = TempDir::new("crc");
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let stored =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("aa.nca", stored).unwrap();
+        writer.write_all(&[0x5a; 64]).unwrap();
+        let mut bytes = writer.finish().unwrap().into_inner();
+        let payload = bytes.windows(64).position(|w| w == [0x5a; 64]).unwrap();
+        bytes[payload + 10] ^= 0xff;
+        let zip = dir.0.join("firmware.zip");
+        std::fs::write(&zip, bytes).unwrap();
+        let registered = dir.0.join("registered");
+        old_firmware(&registered);
+        let result = install(&FirmwareSource::Zip(zip), &registered, &Progress::default());
+        assert!(
+            matches!(result, Err(FirmwareError::FailedCopy)),
+            "{result:?}"
+        );
+        assert_eq!(names(&registered), ["old.nca"]);
+        assert!(!dir.0.join("registered.installing").exists());
+    }
+
+    #[test]
     fn cancelling_stops_the_copy() {
         let dir = TempDir::new("cancel");
         let source = dir.0.join("dump");
         std::fs::create_dir_all(&source).unwrap();
         std::fs::write(source.join("aa.nca"), vec![1u8; 100]).unwrap();
+        let registered = dir.0.join("registered");
+        old_firmware(&registered);
         let progress = Progress::default();
         progress.cancel();
-        let result = install(
-            &FirmwareSource::Folder(source),
-            &dir.0.join("registered"),
-            &progress,
-        );
+        let result = install(&FirmwareSource::Folder(source), &registered, &progress);
         assert!(matches!(result, Err(FirmwareError::Cancelled)));
+        assert_eq!(
+            names(&registered),
+            ["old.nca"],
+            "a cancel keeps the old firmware"
+        );
         assert!(
             result
                 .unwrap_err()
