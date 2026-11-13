@@ -164,7 +164,9 @@ struct GlobalAddress {
 /// Uniform-address forms in UGPR mode (bit 91) add the uniform register at `ureg_at`, 64-bit
 /// with bit 72, and read the width of `Ra` from `wide_bit`; with bit 76 the uniform register
 /// is a memory descriptor (`desc[URb][Ra.64]`) and takes no part in the address. Without UGPR
-/// mode bit 72 is the width of `Ra`, and only URZ is accepted.
+/// mode bit 72 is the width of `Ra` and the uniform register field holds no operand: it must be
+/// URZ, as NAK writes it, or zero, as NVN2 does (the reference's register-address RED and STG
+/// modes require zero there).
 fn global_operands(
     t: &Translator<'_>,
     ureg_at: u32,
@@ -174,7 +176,7 @@ fn global_operands(
     let reg = insn.src0();
     let ureg = insn.ureg_at(ureg_at);
     if t.form == Form::Fixed || !insn.bit(91) {
-        if t.form != Form::Fixed && !ureg.is_zero() {
+        if t.form != Form::Fixed && !ureg.is_zero() && insn.bits(ureg_at, 6) != 0 {
             return Err(t.unsupported());
         }
         return Ok(GlobalAddress {
@@ -1178,6 +1180,44 @@ mod tests {
              \x20 %4 = LoadGlobal32 %3\n\
              \x20 SetRegister R1, %4\n"
         );
+    }
+
+    /// RED.E.ADD.STRONG.GPU [R4.64], R3 exactly as an NVN2 compute program in Mario Kart World
+    /// encodes it: no UGPR mode and a zero uniform register field.
+    #[test]
+    fn red_without_ugpr_mode_takes_a_zero_uniform_field() {
+        let insn = Instruction(0x002f_e800_0010_e100_0000_0003_0400_798e);
+        assert_eq!(
+            translate(&[insn]).unwrap(),
+            "{0}:\n\
+             \x20 %0 = GetRegister R4\n\
+             \x20 %1 = GetRegister R5\n\
+             \x20 %2 = CompositeConstructU32x2 %0, %1\n\
+             \x20 %3 = PackUint2x32 %2\n\
+             \x20 %4 = GetRegister R3\n\
+             \x20 %5 = GlobalAtomicIAdd32 %3, %4\n"
+        );
+        let pointer = encode(
+            Opcode::Ldc,
+            Form::Bound,
+            f(16, 4) | f(24, 255) | f(38, 0x210) | f(73, 5),
+        );
+        let exit = encode(Opcode::Exit, Form::Fixed, 7 << 87);
+        compile_atomics(
+            "ampere-red-register-address",
+            &[pointer, insn, exit],
+            &Profile::default(),
+            &HostTranslateInfo::default(),
+        );
+        let other = encode(
+            Opcode::Red,
+            Form::UniformAddress,
+            f(24, 4) | f(64, 5) | f(72, 1),
+        );
+        assert!(matches!(
+            translate(&[other]),
+            Err(crate::TranslateError::Unsupported { .. })
+        ));
     }
 
     #[test]

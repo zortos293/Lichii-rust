@@ -344,6 +344,91 @@ const WORKLOADS: &[Workload] = &[
         per_iteration: 9,
     },
     Workload {
+        name: "estimate step loop",
+        code: &[
+            0x4f03f700, // fmov v0.4s, #1.5
+            0x4f03f687, // fmov v7.4s, #1.25
+            0x4f000461, // movi v1.4s, #3
+            0x1e2e1008, // fmov s8, #1.0
+            0x1e201909, // fdiv s9, s8, s0
+            0x4f03f502, // 1: fmov v2.4s, #0.75
+            0x6e22dc43, // fmul v3.4s, v2.4s, v2.4s
+            0x4ea0fc63, // frsqrts v3.4s, v3.4s, v0.4s
+            0x4e22fce4, // frecps v4.4s, v7.4s, v2.4s
+            0x4e21d825, // scvtf v5.4s, v1.4s
+            0x6e25dc86, // fmul v6.4s, v4.4s, v5.4s
+            0x4ea3fcc6, // frsqrts v6.4s, v6.4s, v3.4s
+            0x4c007826, // st1 {v6.4s}, [x1]
+            0xf10004a5, // subs x5, x5, #1
+            0x54fffee1, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 10,
+    },
+    Workload {
+        name: "zero product loop",
+        code: &[
+            0x1e2703e0, // fmov s0, wzr
+            0x1e2f1002, // fmov s2, #1.5
+            0x1e2e1007, // fmov s7, #1.0
+            0x1e211008, // fmov s8, #3.0
+            0x1e2818e9, // fdiv s9, s7, s8
+            0x1e220801, // 1: fmul s1, s0, s2
+            0x1f020403, // fmadd s3, s0, s2, s1
+            0x1e290844, // fmul s4, s2, s9
+            0x1f000c85, // fmadd s5, s4, s0, s3
+            0x1e248806, // fnmul s6, s0, s4
+            0x1e22180a, // fdiv s10, s0, s2
+            0x1f09184b, // fmadd s11, s2, s9, s6
+            0xbd00002b, // str s11, [x1]
+            0xf10004a5, // subs x5, x5, #1
+            0x54fffee1, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 10,
+    },
+    Workload {
+        name: "fp min max loop",
+        code: &[
+            0x4f03f700, // fmov v0.4s, #1.5
+            0x4f03f501, // fmov v1.4s, #0.75
+            0x1e2e1002, // fmov s2, #1.0
+            0x1e211003, // fmov s3, #3.0
+            0x1e236844, // 1: fmaxnm s4, s2, s3
+            0x1e227885, // fminnm s5, s4, s2
+            0x1e2348a6, // fmax s6, s5, s3
+            0x1e2458c7, // fmin s7, s6, s4
+            0x6e21e408, // fcmge v8.4s, v0.4s, v1.4s
+            0x6ea0e429, // fcmgt v9.4s, v1.4s, v0.4s
+            0x4e21e40a, // fcmeq v10.4s, v0.4s, v1.4s
+            0x4c007828, // st1 {v8.4s}, [x1]
+            0xf10004a5, // subs x5, x5, #1
+            0x54fffee1, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 10,
+    },
+    Workload {
+        name: "saturating narrow loop",
+        code: &[
+            0x4f000460, // movi v0.4s, #3
+            0x4f0367e1, // movi v1.4s, #0x7f, lsl #24
+            0x0e614802, // 1: sqxtn v2.4h, v0.4s
+            0x4e614822, // sqxtn2 v2.8h, v1.4s
+            0x0e214843, // sqxtn v3.8b, v2.8h
+            0x4e214843, // sqxtn2 v3.16b, v2.8h
+            0x4c007023, // st1 {v3.16b}, [x1]
+            0xf10004a5, // subs x5, x5, #1
+            0x54ffff41, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 7,
+    },
+    Workload {
         name: "popcount loop",
         code: &[
             0x4c407020, // 1: ld1 {v0.16b}, [x1]

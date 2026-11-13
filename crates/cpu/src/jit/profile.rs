@@ -132,6 +132,7 @@ pub(super) struct Profile {
     fallbacks: Counts,
     simd_calls: Counts,
     slow_fpcr: Counts,
+    slow_ixc: Counts,
     slow_inputs: Counts,
     exits: [u64; 4],
     /// Lazy NZCV written back by the native stub and by the dispatcher.
@@ -177,11 +178,14 @@ impl Profile {
             .add(Class::Simd(simd_key(word)), || simd_name(word));
     }
 
-    /// A natively lowered SIMD/FP op that took its slow path, because FPCR selects a mode the
-    /// host does not provide (`fpcr`) or because of its inputs or a clear FPSR.IXC.
-    pub(super) fn simd_slow(&mut self, word: u32, fpcr: bool) {
+    /// A natively lowered SIMD/FP op that took its slow path: because FPCR selects a mode the
+    /// host does not provide (`fpcr`), else while FPSR.IXC is clear (`ixc_clear`), which sends
+    /// every op that can be inexact there, else because of its inputs or result.
+    pub(super) fn simd_slow(&mut self, word: u32, fpcr: bool, ixc_clear: bool) {
         let counts = if fpcr {
             &mut self.slow_fpcr
+        } else if ixc_clear {
+            &mut self.slow_ixc
         } else {
             &mut self.slow_inputs
         };
@@ -215,6 +219,7 @@ impl Profile {
         self.fallbacks.merge(other.fallbacks);
         self.simd_calls.merge(other.simd_calls);
         self.slow_fpcr.merge(other.slow_fpcr);
+        self.slow_ixc.merge(other.slow_ixc);
         self.slow_inputs.merge(other.slow_inputs);
         let add = |a: &mut [u64], b: &[u64]| a.iter_mut().zip(b).for_each(|(a, b)| *a += b);
         add(&mut self.exits, &other.exits);
@@ -232,7 +237,10 @@ impl Profile {
         [
             self.translate.as_micros() as u64,
             self.fallbacks.total(),
-            self.simd_calls.total() + self.slow_fpcr.total() + self.slow_inputs.total(),
+            self.simd_calls.total()
+                + self.slow_fpcr.total()
+                + self.slow_ixc.total()
+                + self.slow_inputs.total(),
         ]
     }
 
@@ -275,8 +283,10 @@ impl Profile {
         self.simd_calls.section(&mut out, "CallSimd calls");
         self.slow_fpcr
             .section(&mut out, "native FP slow paths, FPCR mode");
+        self.slow_ixc
+            .section(&mut out, "native FP slow paths, FPSR.IXC clear");
         self.slow_inputs
-            .section(&mut out, "native FP slow paths, inputs or FPSR.IXC");
+            .section(&mut out, "native FP slow paths, inputs or result");
         out
     }
 }

@@ -23,6 +23,7 @@ use lichii_common::GpuVAddr;
 
 use super::EngineContext;
 use super::upload::Upload;
+use crate::activity::RendererCall;
 use crate::backend::{
     ComputeContext, FenceAction, IndirectGrid, QmdVersion, Query, QueryKind, ReleaseSize,
 };
@@ -344,6 +345,7 @@ impl KeplerCompute {
         }
         let tic = &self.regs.tic;
         let tsc = &self.regs.tsc;
+        let start = ctx.activity.begin_call(RendererCall::Dispatch);
         ctx.rasterizer.dispatch_compute(&ComputeContext {
             channel: ctx.channel,
             memory: ctx.memory,
@@ -365,6 +367,7 @@ impl KeplerCompute {
                 .map(|grid| grid.address),
             indirect,
         });
+        ctx.activity.renderer_call(RendererCall::Dispatch, start);
     }
 }
 
@@ -540,6 +543,7 @@ mod tests {
                 gob_layout: self.harness.gob_layout,
                 qmd_scheduler: &mut self.harness.qmd_scheduler,
                 written_pages: &self.harness.written_pages,
+                activity: &crate::engines::testing::ACTIVITY,
             };
             self.engine.call_method(&mut ctx, method, argument);
         }

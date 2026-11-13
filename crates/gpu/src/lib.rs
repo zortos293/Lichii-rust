@@ -5,6 +5,7 @@
 //! [`gpu::Gpu`] runs it: a front thread parses channels' command streams and runs macros, a back
 //! thread executes the engines and drives the renderer.
 
+pub mod activity;
 mod back;
 pub mod backend;
 mod bits;

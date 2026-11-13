@@ -80,7 +80,11 @@ pub(super) extern "sysv64" fn slow_profiled(
     pc: u64,
 ) -> bool {
     if let Some(p) = state.profile.as_deref_mut() {
-        p.simd_slow(word, ctx.fpcr & x64::HOST_FPCR as u32 != 0);
+        p.simd_slow(
+            word,
+            ctx.fpcr & x64::HOST_FPCR as u32 != 0,
+            ctx.fpsr & x64::IXC as u32 == 0,
+        );
     }
     call(ctx, word, state, pc)
 }

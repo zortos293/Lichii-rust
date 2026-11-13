@@ -747,3 +747,66 @@ fn decoding_depends_only_on_the_opcode_field() {
         }
     }
 }
+
+/// KILL !P0 and BRX R6 exactly as an NVN2 program in Mario Kart World encodes them.
+const NATIVE_KILL: u128 = 0x000f_ea00_0380_0000_0000_0000_0000_895b;
+const NATIVE_BRX: u128 = 0x000f_ea00_0383_ffff_ffff_ffbd_0600_7949;
+
+#[test]
+fn indirect_branches_and_fragment_kills_emit_nothing() {
+    use translate::tests::translate_stage;
+    let kill = Instruction(NATIVE_KILL);
+    assert_eq!(
+        translate_stage(ShaderStage::Fragment, &[kill]).unwrap(),
+        "{0}:\n"
+    );
+    assert!(matches!(
+        translate_stage(ShaderStage::Compute, &[kill]),
+        Err(TranslateError::Unsupported { .. })
+    ));
+    let brx = Instruction(NATIVE_BRX);
+    assert_eq!(
+        translate_stage(ShaderStage::VertexB, &[brx]).unwrap(),
+        "{0}:\n"
+    );
+    for code in [0x958, 0x94c, 0x959] {
+        let inst = Enc::op(code).inst();
+        assert_eq!(
+            translate_stage(ShaderStage::Compute, &[inst]).unwrap(),
+            "{0}:\n"
+        );
+    }
+}
+
+/// A fragment program switching through a jump table to a block that kills or one that exits
+/// compiles to a module that passes spirv-val.
+#[test]
+fn fragment_jump_tables_and_kills_compile_to_valid_spirv() {
+    use translate::tests::TestEnv;
+    let shf = Enc::op(0x819).dst(2).a(1).imm(2).c(RZ).set(73, 2, 3);
+    let mut code: Vec<Instruction> = vector_switch(shf)[1..]
+        .iter()
+        .map(|enc| enc.inst())
+        .collect();
+    code[3] = Enc::op(0x949).a(3).rel(-0x40).inst();
+    code.push(Enc::op(0x95b).guard(0, true).inst());
+    code.push(Enc::op(0x94d).inst());
+    let mut env = TestEnv::new(&code);
+    env.stage = ShaderStage::Fragment;
+    env.cbuf = vec![0; 0x40 / 4];
+    env.cbuf.extend([0x40, 0x50, 0x50, 0x40, 0x50, 0x50]);
+    let profile = crate::Profile::default();
+    let options = crate::translate::TranslateOptions {
+        profile: &profile,
+        host: &crate::profile::HostTranslateInfo::default(),
+        resolution_scale: lichii_common::settings::ResolutionScale::X1,
+    };
+    let module = crate::module::compile(
+        &env,
+        options,
+        &crate::RuntimeInfo::default(),
+        &mut crate::backend::Bindings::default(),
+    )
+    .unwrap();
+    crate::backend::spirv::tests::validate("ampere-jump-table-kill", &profile, &module.spirv);
+}
