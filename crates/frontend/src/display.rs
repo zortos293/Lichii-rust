@@ -9,7 +9,7 @@ use lichii_common::settings::GraphicsSettings;
 use lichii_core::RendererFactory;
 use lichii_texture::block_linear::GobLayout;
 use lichii_vulkan::present::{FrameMailbox, Presenter, UiFrame, Viewport};
-use lichii_vulkan::rasterizer::VulkanRasterizer;
+use lichii_vulkan::rasterizer::{LiveSettings, VulkanRasterizer};
 use lichii_vulkan::swapchain::{Surface, Swapchain};
 use lichii_vulkan::{Device, Instance, SurfaceSupport};
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -20,6 +20,7 @@ pub struct Display {
     presenter: Presenter,
     device: Arc<Device>,
     mailbox: Arc<FrameMailbox>,
+    live: Arc<LiveSettings>,
     window: Arc<Window>,
 }
 
@@ -67,6 +68,7 @@ impl Display {
             presenter,
             device,
             mailbox,
+            live: Arc::new(LiveSettings::default()),
             window,
         })
     }
@@ -81,6 +83,7 @@ impl Display {
     ) -> RendererFactory {
         let device = self.device.clone();
         let mailbox = self.mailbox.clone();
+        let live = self.live.clone();
         let settings = settings.clone();
         let gob_layout = match title {
             ConsoleGeneration::Switch1 => GobLayout::Tegra,
@@ -90,6 +93,7 @@ impl Display {
             match VulkanRasterizer::new(&device, handles.clone(), mailbox, gob_layout) {
                 Ok(mut rasterizer) => {
                     rasterizer.apply_settings(&settings);
+                    rasterizer.follow(live);
                     Box::new(rasterizer)
                 }
                 Err(e) => {
@@ -104,9 +108,17 @@ impl Display {
         &self.device.properties.name
     }
 
-    /// Applies filter, anti-aliasing, sharpness and present mode from the next frame.
+    /// Applies filter, anti-aliasing, sharpness and present mode from the next frame, and
+    /// resolution scale, ASTC recompression and VRAM usage to a running renderer at its next
+    /// command flush.
     pub fn set_settings(&mut self, settings: &GraphicsSettings) {
         self.presenter.set_settings(settings);
+        self.live.set(settings);
+    }
+
+    /// Forgets the last guest frame, once the session that drew it has stopped.
+    pub fn clear_frame(&self) {
+        self.mailbox.clear();
     }
 
     /// Draws the newest guest frame into `viewport`, the UI over the whole window, and presents.

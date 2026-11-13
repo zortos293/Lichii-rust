@@ -8,6 +8,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ash::vk;
 use lichii_common::DAddr;
@@ -36,6 +37,28 @@ use crate::texture_cache::{
     ClearValue, ImageId, ImageInfo, ImageKind, Rect, TextureCache, Transfer,
 };
 
+/// Graphics settings the frontend changes while a renderer runs. A renderer that
+/// [follows](VulkanRasterizer::follow) them applies the newest at its next command flush.
+#[derive(Default)]
+pub struct LiveSettings {
+    changed: AtomicBool,
+    pending: parking_lot::Mutex<Option<GraphicsSettings>>,
+}
+
+impl LiveSettings {
+    pub fn set(&self, settings: &GraphicsSettings) {
+        *self.pending.lock() = Some(settings.clone());
+        self.changed.store(true, Ordering::Release);
+    }
+
+    fn take(&self) -> Option<GraphicsSettings> {
+        if !self.changed.swap(false, Ordering::Acquire) {
+            return None;
+        }
+        self.pending.lock().take()
+    }
+}
+
 /// Frame images kept for reuse; one is being written while the presenter holds up to two.
 const FRAME_POOL: usize = 4;
 
@@ -55,6 +78,7 @@ pub struct VulkanRasterizer {
     warned_unimplemented: bool,
     texture_cache: TextureCache,
     buffer_cache: BufferCache,
+    live: Option<Arc<LiveSettings>>,
 }
 
 /// The rectangle a clear covers: the first scissor and the clear rectangle when
@@ -140,6 +164,7 @@ impl VulkanRasterizer {
             unflushed: false,
             warned_unimplemented: false,
             texture_cache: TextureCache::new(device, gob_layout, AstcRecompression::Uncompressed),
+            live: None,
         })
     }
 
@@ -152,6 +177,11 @@ impl VulkanRasterizer {
             .set_resolution_scale(settings.resolution_scale);
         self.texture_cache
             .set_astc_recompression(settings.astc_recompression);
+    }
+
+    /// Applies the settings `live` receives from now on, at each command flush.
+    pub fn follow(&mut self, live: Arc<LiveSettings>) {
+        self.live = Some(live);
     }
 
     fn clear_targets(&mut self, ctx: &GraphicsContext<'_>, layer_count: u32) -> Result<()> {
@@ -680,6 +710,9 @@ impl Rasterizer for VulkanRasterizer {
 
     fn flush_commands(&mut self) {
         self.flush();
+        if let Some(settings) = self.live.as_ref().and_then(|live| live.take()) {
+            self.apply_settings(&settings);
+        }
     }
 
     fn wait_for_idle(&mut self) {
@@ -955,6 +988,21 @@ mod tests {
             crop: None,
             gob_layout: GobLayout::Tegra,
         }
+    }
+
+    #[test]
+    fn live_settings_hand_over_the_newest_change_once() {
+        let live = LiveSettings::default();
+        assert!(live.take().is_none());
+        let mut settings = GraphicsSettings::default();
+        live.set(&settings);
+        settings.resolution_scale = ResolutionScale::X2;
+        live.set(&settings);
+        assert_eq!(
+            live.take().map(|s| s.resolution_scale),
+            Some(ResolutionScale::X2)
+        );
+        assert!(live.take().is_none());
     }
 
     #[test]

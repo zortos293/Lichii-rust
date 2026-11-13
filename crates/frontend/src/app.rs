@@ -283,7 +283,7 @@ impl App {
     }
 
     fn boot(&mut self, path: PathBuf) {
-        self.session = None;
+        self.end_session();
         let settings = Arc::new(self.settings.clone());
         let host = |title| Host {
             renderer: match &self.display {
@@ -321,8 +321,16 @@ impl App {
         self.stop();
     }
 
-    fn stop(&mut self) {
+    /// Drops the session, which stops its System, then the frame it last drew.
+    fn end_session(&mut self) {
         self.session = None;
+        if let Some(display) = &self.display {
+            display.clear_frame();
+        }
+    }
+
+    fn stop(&mut self) {
+        self.end_session();
         self.viewport = None;
         self.input.send(InputMsg::ReleaseAll);
         if self.is_fullscreen() {
