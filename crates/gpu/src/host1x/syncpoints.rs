@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use parking_lot::{Condvar, Mutex};
 
 use crate::channel::SemaphoreWaiters;
+use crate::semaphore_mirror::SemaphoreMirror;
 
 /// Syncpoint ids per bank. Switch 2 ids are below 0x400; Switch 1 uses the first 192.
 pub const SYNCPOINT_COUNT: usize = 1024;
@@ -39,6 +40,7 @@ pub struct Syncpoints {
     host: SyncpointBank,
     max: Box<[AtomicU32]>,
     semaphores: Arc<SemaphoreWaiters>,
+    mirror: Arc<SemaphoreMirror>,
 }
 
 impl Syncpoints {
@@ -48,6 +50,7 @@ impl Syncpoints {
             host: SyncpointBank::new(),
             max: (0..SYNCPOINT_COUNT).map(|_| AtomicU32::new(0)).collect(),
             semaphores: Arc::default(),
+            mirror: Arc::default(),
         }
     }
 
@@ -75,6 +78,11 @@ impl Syncpoints {
     /// [`FenceAction::execute`](crate::backend::FenceAction::execute) latch and wake them.
     pub fn semaphore_waiters(&self) -> &Arc<SemaphoreWaiters> {
         &self.semaphores
+    }
+
+    /// Switch 2 queue semaphore regions, whose second-page releases also land in the first page.
+    pub fn semaphore_mirror(&self) -> &Arc<SemaphoreMirror> {
+        &self.mirror
     }
 
     /// Values the guest sees: incremented once the work before an increment has completed on

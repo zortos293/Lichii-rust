@@ -1264,6 +1264,65 @@ fn switch_2_address_spaces_get_the_identity_mappings_until_destroyed() {
     assert_eq!(early.translate(CPU_VA + 0x120), Some(daddr + 0x120));
 }
 
+/// A Switch 2 rig with a two-page queue semaphore memory mapped at [`REGION_VA`, +0x2000).
+const REGION_VA: u64 = 0x100_0000;
+
+fn rig_with_semaphore_region(threading: Threading) -> Rig {
+    let rig = Rig::build_for(
+        Console::Switch2,
+        threading,
+        crate::gpu::DEFAULT_RING_SLOTS,
+        Completion::Immediate,
+        Engines::Recording,
+    );
+    let nx2 = rig.gpu.nx2_memory().expect("Switch 2 has the registry");
+    let (handle, _) = nx2
+        .create_gpu_accessible_memory(&rig.space, CPU_VA + 0x20_0000, 0x2000)
+        .unwrap();
+    let daddr = nx2.memory_info(handle).unwrap().daddr;
+    rig.memory.map(REGION_VA, daddr, 0x2000, 0, false).unwrap();
+    rig
+}
+
+#[test]
+fn switch_2_queue_semaphore_releases_reach_the_first_page() {
+    each_mode(|threading| {
+        let mut rig = rig_with_semaphore_region(threading);
+        let channel = rig.channel(HostClass::Ampere);
+        let words = Pushbuffer::default().semaphore(REGION_VA + 0x1010, 5, 1);
+        rig.submit(channel, &words.0);
+        rig.gpu.synchronize();
+        assert_eq!(rig.read(REGION_VA + 0x1010), 5, "{threading:?}");
+        assert_eq!(rig.read(REGION_VA + 0x10), 5, "{threading:?}");
+        assert_eq!(rig.read(0x1010), 0, "{threading:?}");
+    });
+}
+
+#[test]
+fn a_mirrored_value_stays_beside_a_word_with_releases_of_its_own() {
+    each_mode(|threading| {
+        let mut rig = rig_with_semaphore_region(threading);
+        let releaser = rig.channel(HostClass::Ampere);
+        let waiter = rig.channel(HostClass::Ampere);
+        let words = Pushbuffer::default()
+            .semaphore(REGION_VA + 0x20, 9, 1)
+            .semaphore(REGION_VA + 0x1020, 6, 1);
+        rig.submit(releaser, &words.0);
+        rig.gpu.synchronize();
+        assert_eq!(rig.read(REGION_VA + 0x20), 9, "{threading:?}");
+        let words = Pushbuffer::default()
+            .bind(0, AMPERE_3D)
+            .semaphore(REGION_VA + 0x20, 6, 0)
+            .inc(0, 0x701, &[2]);
+        rig.submit(waiter, &words.0);
+        assert_eq!(
+            rig.methods(),
+            [(waiter.0, EngineKind::Maxwell3d, 0x701, 2)],
+            "{threading:?}"
+        );
+    });
+}
+
 #[test]
 fn switch_1_has_no_nx2_registry_and_plain_address_spaces() {
     let rig = Rig::new(Threading::Split);

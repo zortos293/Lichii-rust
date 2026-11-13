@@ -6,6 +6,7 @@ use std::sync::atomic::{
 };
 
 use lichii_common::VAddr;
+use lichii_memory::MemoryPermission;
 
 use super::simd;
 use crate::decoder::*;
@@ -234,10 +235,10 @@ impl Exec<'_> {
     fn read(&self, addr: VAddr, size: u8) -> Result<u64, HaltReason> {
         let mem = &*self.cfg.memory;
         match size {
-            0 => mem.read::<u8>(addr).map(u64::from),
-            1 => mem.read::<u16>(addr).map(u64::from),
-            2 => mem.read::<u32>(addr).map(u64::from),
-            _ => mem.read::<u64>(addr),
+            0 => mem.guest_read::<u8>(addr).map(u64::from),
+            1 => mem.guest_read::<u16>(addr).map(u64::from),
+            2 => mem.guest_read::<u32>(addr).map(u64::from),
+            _ => mem.guest_read::<u64>(addr),
         }
         .map_err(|f| self.data_fault(f.addr, false))
     }
@@ -245,10 +246,10 @@ impl Exec<'_> {
     fn write(&self, addr: VAddr, size: u8, value: u64) -> Result<(), HaltReason> {
         let mem = &*self.cfg.memory;
         match size {
-            0 => mem.write(addr, value as u8),
-            1 => mem.write(addr, value as u16),
-            2 => mem.write(addr, value as u32),
-            _ => mem.write(addr, value),
+            0 => mem.guest_write(addr, value as u8),
+            1 => mem.guest_write(addr, value as u16),
+            2 => mem.guest_write(addr, value as u32),
+            _ => mem.guest_write(addr, value),
         }
         .map_err(|f| self.data_fault(f.addr, true))
     }
@@ -259,7 +260,7 @@ impl Exec<'_> {
         }
         self.cfg
             .memory
-            .read::<u128>(addr)
+            .guest_read::<u128>(addr)
             .map_err(|f| self.data_fault(f.addr, false))
     }
 
@@ -269,7 +270,7 @@ impl Exec<'_> {
         }
         self.cfg
             .memory
-            .write(addr, value)
+            .guest_write(addr, value)
             .map_err(|f| self.data_fault(f.addr, true))
     }
 
@@ -304,12 +305,10 @@ impl Exec<'_> {
         if addr & (bytes - 1) != 0 {
             return Err(self.fault(CpuFault::Alignment { pc: self.pc, addr }));
         }
-        let (ptr, _) = self
-            .cfg
+        self.cfg
             .memory
-            .translate(addr)
-            .ok_or_else(|| self.data_fault(addr, true))?;
-        Ok(ptr)
+            .access(addr, MemoryPermission::READ_WRITE)
+            .map_err(|_| self.data_fault(addr, true))
     }
 
     fn check_exclusive_alignment(&self, addr: VAddr, bytes: u64) -> Result<(), HaltReason> {
@@ -713,7 +712,7 @@ impl Exec<'_> {
                 let addr = self.x(rt) & !(size - 1);
                 self.cfg
                     .memory
-                    .fill(addr, size, 0)
+                    .guest_fill(addr, size, 0)
                     .map_err(|f| self.data_fault(f.addr, true))?;
             }
             Inst::IcIvau { rt } => {
@@ -841,7 +840,7 @@ impl Exec<'_> {
                 if zero_granules != 0 {
                     self.cfg
                         .memory
-                        .fill(address, 16 * zero_granules as u64, 0)
+                        .guest_fill(address, 16 * zero_granules as u64, 0)
                         .map_err(|f| self.data_fault(f.addr, true))?;
                 }
                 self.writeback(rn, wb);

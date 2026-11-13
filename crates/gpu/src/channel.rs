@@ -193,6 +193,28 @@ impl SemaphoreWaiters {
             .any(|w| w.channel == channel && w.latched)
     }
 
+    /// An acquire of the 32-bit word at `address` now sees `value`, which memory does not hold
+    /// (a mirrored Switch 2 queue semaphore value kept aside). Latches the narrow waiters on that
+    /// word it meets.
+    pub(crate) fn met_by(&self, address: DAddr, value: u32) {
+        if self.count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let mut latched = false;
+        for waiter in self.list.lock().iter_mut() {
+            if waiter.latched || waiter.wide || waiter.address & !3 != address & !3 {
+                continue;
+            }
+            if waiter.op.is_met(u64::from(value), waiter.payload, false) {
+                waiter.latched = true;
+                latched = true;
+            }
+        }
+        if latched && let Some(front) = self.front.get().and_then(Weak::upgrade) {
+            front.wake();
+        }
+    }
+
     /// `[address, address + size)` of `device` was written. Latches the waiters on a word it
     /// overlaps that the word now meets, compared at the waiter's width: a 4-byte write never
     /// stands in for the 64-bit word a wide acquire reads.
