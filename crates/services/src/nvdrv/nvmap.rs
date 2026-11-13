@@ -52,7 +52,6 @@ struct HandleState {
     flags: u32,
     address: VAddr,
     memory: Option<Arc<AddressSpace>>,
-    session: u64,
     allocated: bool,
     dupes: i32,
     internal_dupes: i32,
@@ -75,6 +74,8 @@ pub(crate) struct NvMap {
     handles: RwLock<HashMap<u32, Arc<Handle>>>,
     next_id: AtomicU32,
     unmap_queue: Mutex<VecDeque<Arc<Handle>>>,
+    /// The references each session holds through Create and FromId, by handle.
+    session_refs: Mutex<HashMap<u64, HashMap<u32, u32>>>,
 }
 
 impl NvMap {
@@ -84,6 +85,7 @@ impl NvMap {
             handles: RwLock::new(HashMap::new()),
             next_id: AtomicU32::new(HANDLE_ID_STEP),
             unmap_queue: Mutex::new(VecDeque::new()),
+            session_refs: Mutex::default(),
         }
     }
 
@@ -104,7 +106,6 @@ impl NvMap {
                 flags: 0,
                 address: 0,
                 memory: None,
-                session: 0,
                 allocated: false,
                 dupes: 1,
                 internal_dupes: 0,
@@ -129,6 +130,16 @@ impl NvMap {
     /// The size the handle was created with.
     pub fn size(&self, id: u32) -> Option<u64> {
         self.get(id).map(|handle| handle.state.lock().orig_size)
+    }
+
+    /// The size aligned to the handle's alignment: how far into the handle a mapping may reach.
+    pub fn aligned_size(&self, id: u32) -> Option<u64> {
+        self.get(id).map(|handle| handle.state.lock().aligned_size)
+    }
+
+    #[cfg(test)]
+    pub fn pins(&self, id: u32) -> i64 {
+        self.get(id).map_or(0, |handle| handle.state.lock().pins)
     }
 
     /// The alignment the handle was allocated with.
@@ -276,20 +287,38 @@ impl NvMap {
         })
     }
 
-    /// Frees the handles a closing session allocated.
+    fn add_session_ref(&self, session: u64, id: u32) {
+        *self
+            .session_refs
+            .lock()
+            .entry(session)
+            .or_default()
+            .entry(id)
+            .or_default() += 1;
+    }
+
+    /// Drops one reference `session` holds and the handle reference behind it.
+    fn free_session_ref(&self, session: u64, id: u32) -> Option<FreeInfo> {
+        if let Some(refs) = self.session_refs.lock().get_mut(&session)
+            && let Some(count) = refs.get_mut(&id)
+        {
+            *count -= 1;
+            if *count == 0 {
+                refs.remove(&id);
+            }
+        }
+        self.free(id)
+    }
+
+    /// Drops every reference a closing session still holds, allocated or not.
     pub fn release_session(&self, session: u64) {
-        let owned: Vec<u32> = self
-            .handles
-            .read()
-            .values()
-            .filter(|handle| {
-                let state = handle.state.lock();
-                state.session == session && state.dupes > 0
-            })
-            .map(|handle| handle.id)
-            .collect();
-        for id in owned {
-            self.free(id);
+        let Some(refs) = self.session_refs.lock().remove(&session) else {
+            return;
+        };
+        for (id, count) in refs {
+            for _ in 0..count {
+                self.free(id);
+            }
         }
     }
 }
@@ -388,6 +417,7 @@ impl NvMapDevice {
     fn create(&self, params: &mut CreateParams) -> NvResult {
         match self.nvmap().create(u64::from(params.size)) {
             Ok(id) => {
+                self.nvmap().add_session_ref(self.session, id);
                 params.handle = id;
                 NvResult::Success
             }
@@ -407,6 +437,8 @@ impl NvMapDevice {
             return NvResult::BadValue;
         }
         state.dupes += 1;
+        drop(state);
+        self.nvmap().add_session_ref(self.session, handle.id);
         params.handle = handle.id;
         NvResult::Success
     }
@@ -437,7 +469,6 @@ impl NvMapDevice {
         state.aligned_size = align_up(state.size, align);
         state.address = params.address;
         state.memory = Some(self.memory.clone());
-        state.session = self.session;
         state.allocated = true;
         params.align = align as u32;
         NvResult::Success
@@ -447,7 +478,7 @@ impl NvMapDevice {
         if params.handle == 0 {
             return NvResult::Success;
         }
-        if let Some(info) = self.nvmap().free(params.handle) {
+        if let Some(info) = self.nvmap().free_session_ref(self.session, params.handle) {
             params.address = info.address;
             params.size = info.size as u32;
             params.flags = if info.was_uncached {

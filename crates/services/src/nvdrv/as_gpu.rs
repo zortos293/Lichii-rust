@@ -140,12 +140,20 @@ struct Allocation {
     big_pages: bool,
 }
 
+/// A GMMU range mapped to an nvmap handle, holding one pin of it.
+struct Pin {
+    size: u64,
+    handle: u32,
+}
+
 #[derive(Default)]
 struct AsState {
     vm: Option<Vm>,
     gmmu: Option<Arc<Gmmu>>,
     mappings: BTreeMap<u64, Mapping>,
     allocations: BTreeMap<u64, Allocation>,
+    /// Disjoint, by GPU address. Every GMMU change drops the pins of the ranges it replaced.
+    pins: BTreeMap<u64, Pin>,
     shim: Option<GpuVAddr>,
 }
 
@@ -278,7 +286,6 @@ impl AsGpu {
         let mut va_range_start = u64::from(DEFAULT_BIG_PAGE_SIZE) << VA_START_SHIFT;
         let mut va_range_split = DEFAULT_VA_SPLIT;
         let mut va_range_end = DEFAULT_VA_RANGE;
-        let mut absolute_big_page_limit = false;
         if params.big_page_size != 0 {
             if !params.big_page_size.is_power_of_two()
                 || params.big_page_size & SUPPORTED_BIG_PAGE_SIZES == 0
@@ -296,7 +303,6 @@ impl AsGpu {
             if va_range_split == 0 {
                 va_range_split = va_range_end;
                 va_range_end += NX2_BIG_PAGE_TAIL;
-                absolute_big_page_limit = true;
                 tracing::warn!(
                     split = format_args!("{va_range_split:#x}"),
                     "no VA split given; small pages up to the end"
@@ -304,11 +310,6 @@ impl AsGpu {
             }
         }
         let big_page_bits = big_page_size.trailing_zeros();
-        let big_limit = if absolute_big_page_limit {
-            va_range_end
-        } else {
-            va_range_end.saturating_sub(va_range_split)
-        };
         let big_page = if big_page_size == 0x10000 {
             BigPageSize::Size64K
         } else {
@@ -319,7 +320,10 @@ impl AsGpu {
             big_page_bits,
             va_range_end,
             small: VaAllocator::new(va_range_start >> PAGE_BITS, va_range_split >> PAGE_BITS),
-            big: VaAllocator::new(va_range_split >> big_page_bits, big_limit >> big_page_bits),
+            big: VaAllocator::new(
+                va_range_split >> big_page_bits,
+                va_range_end >> big_page_bits,
+            ),
         });
         state.gmmu = Some(self.nvdrv.gpu.create_address_space(big_page));
         tracing::info!(
@@ -337,6 +341,7 @@ impl AsGpu {
             vm: Some(vm),
             gmmu: Some(gmmu),
             allocations,
+            pins,
             ..
         } = &mut *state
         else {
@@ -367,6 +372,7 @@ impl AsGpu {
         if sparse {
             let replaced = gmmu.map_sparse(params.offset, size, true);
             self.forget(replaced);
+            self.release_pins(pins, params.offset, size);
         }
         allocations.insert(
             params.offset,
@@ -388,6 +394,7 @@ impl AsGpu {
             gmmu: Some(gmmu),
             allocations,
             mappings,
+            pins,
             ..
         } = &mut *state
         else {
@@ -404,11 +411,12 @@ impl AsGpu {
         let allocation = allocations.remove(&params.offset).expect("looked up above");
         for offset in allocation.mappings {
             if let Some(mapping) = mappings.remove(&offset) {
-                self.release_mapping(vm, gmmu, offset, mapping);
+                self.release_mapping(vm, gmmu, pins, offset, mapping);
             }
         }
         if allocation.sparse {
             self.forget(gmmu.unmap(params.offset, allocation.size));
+            self.release_pins(pins, params.offset, allocation.size);
         }
         let (_, bits) = vm.page(allocation.big_pages);
         vm.allocator(allocation.big_pages)
@@ -416,8 +424,15 @@ impl AsGpu {
         NvResult::Success
     }
 
-    /// Frees a mapping's VA (unless it was fixed) and pin, returning a sparse range to sparse.
-    fn release_mapping(&self, vm: &mut Vm, gmmu: &Gmmu, offset: u64, mapping: Mapping) {
+    /// Frees a mapping's VA (unless it was fixed) and pins, returning a sparse range to sparse.
+    fn release_mapping(
+        &self,
+        vm: &mut Vm,
+        gmmu: &Gmmu,
+        pins: &mut BTreeMap<u64, Pin>,
+        offset: u64,
+        mapping: Mapping,
+    ) {
         let (page_size, bits) = vm.page(mapping.big_page);
         if !mapping.fixed {
             vm.allocator(mapping.big_page)
@@ -430,7 +445,7 @@ impl AsGpu {
             gmmu.unmap(offset, size)
         };
         self.forget(removed);
-        self.nvdrv.nvmap.unpin(mapping.handle);
+        self.release_pins(pins, offset, size);
     }
 
     fn map_buffer_ex(&self, params: &mut MapBufferEx) -> NvResult {
@@ -440,72 +455,91 @@ impl AsGpu {
             gmmu: Some(gmmu),
             allocations,
             mappings,
+            pins,
             ..
         } = &mut *state
         else {
             return NvResult::BadValue;
         };
-        let buffer_offset = params.buffer_offset as u64;
+        let Ok(buffer_offset) = u64::try_from(params.buffer_offset) else {
+            tracing::error!(offset = params.buffer_offset, "negative buffer offset");
+            return NvResult::BadValue;
+        };
+        let nvmap = &self.nvdrv.nvmap;
         if params.flags & MAPPING_REMAP != 0 {
             let offset = params.offset as u64;
-            let Some(mapping) = mappings.get(&offset) else {
+            let Some(mapping) = mappings.get(&offset).copied() else {
                 tracing::warn!(offset, "remap of an unmapped GPU range");
                 return NvResult::BadValue;
             };
-            if mapping.size < params.mapping_size {
+            if !fits(buffer_offset, params.mapping_size, mapping.size) {
                 tracing::warn!(offset, "remap of a partly mapped GPU range");
                 return NvResult::BadValue;
             }
+            if let Err(result) = nvmap.pin(mapping.handle) {
+                return result;
+            }
             return self.map(
                 gmmu,
+                pins,
                 offset + buffer_offset,
                 mapping.daddr + buffer_offset,
                 params.mapping_size,
                 params.kind as u8,
                 mapping.big_page.then_some(vm.big_page_size),
+                mapping.handle,
             );
         }
 
-        let nvmap = &self.nvdrv.nvmap;
-        let (Some(orig_size), Some(align)) =
-            (nvmap.size(params.handle), nvmap.align(params.handle))
-        else {
+        let (Some(orig_size), Some(handle_size), Some(align)) = (
+            nvmap.size(params.handle),
+            nvmap.aligned_size(params.handle),
+            nvmap.align(params.handle),
+        ) else {
             return NvResult::BadValue;
-        };
-        let daddr = match nvmap.pin(params.handle) {
-            Ok(daddr) => daddr + buffer_offset,
-            Err(result) => return result,
         };
         let size = if params.mapping_size != 0 {
             params.mapping_size
         } else {
             orig_size
         };
+        if !fits(buffer_offset, size, handle_size) {
+            tracing::error!(
+                handle = params.handle,
+                buffer_offset,
+                size,
+                "mapping reaches past its nvmap handle"
+            );
+            return NvResult::BadValue;
+        }
         let big_page = align % vm.big_page_size == 0;
         let kind = params.kind as u8;
 
         if params.flags & MAPPING_FIXED != 0 {
             let offset = params.offset as u64;
             let Some((&base, allocation)) = allocations.range_mut(..=offset).next_back() else {
-                nvmap.unpin(params.handle);
                 return NvResult::BadValue;
             };
             if offset - base + size > allocation.size {
                 tracing::error!(offset, "fixed mapping outside an allocated region");
-                nvmap.unpin(params.handle);
                 return NvResult::BadValue;
             }
+            let daddr = match nvmap.pin(params.handle) {
+                Ok(daddr) => daddr + buffer_offset,
+                Err(result) => return result,
+            };
             let use_big = allocation.big_pages && big_page;
             let result = self.map(
                 gmmu,
+                pins,
                 offset,
                 daddr,
                 size,
                 kind,
                 use_big.then_some(vm.big_page_size),
+                params.handle,
             );
             if result != NvResult::Success {
-                nvmap.unpin(params.handle);
                 return result;
             }
             allocation.mappings.push(offset);
@@ -530,22 +564,30 @@ impl AsGpu {
             .allocate(align_up(size, page_size) >> bits)
         else {
             tracing::error!(size, "GPU address space exhausted");
-            nvmap.unpin(params.handle);
             return NvResult::InsufficientMemory;
+        };
+        let daddr = match nvmap.pin(params.handle) {
+            Ok(daddr) => daddr + buffer_offset,
+            Err(result) => {
+                vm.allocator(big_page)
+                    .free(page, align_up(size, page_size) >> bits);
+                return result;
+            }
         };
         let offset = page << bits;
         let result = self.map(
             gmmu,
+            pins,
             offset,
             daddr,
             size,
             kind,
             big_page.then_some(vm.big_page_size),
+            params.handle,
         );
         if result != NvResult::Success {
             vm.allocator(big_page)
                 .free(page, align_up(size, page_size) >> bits);
-            nvmap.unpin(params.handle);
             return result;
         }
         params.offset = offset as i64;
@@ -570,26 +612,35 @@ impl AsGpu {
             vm: Some(vm),
             gmmu: Some(gmmu),
             mappings,
+            pins,
             ..
         } = &mut *state
         else {
             return NvResult::Success;
         };
         if let Some(mapping) = mappings.remove(&offset) {
-            self.release_mapping(vm, gmmu, offset, mapping);
+            self.release_mapping(vm, gmmu, pins, offset, mapping);
         }
         NvResult::Success
     }
 
     fn remap(&self, input: &[u8]) -> NvResult {
-        let state = self.state.lock();
-        let (Some(vm), Some(gmmu)) = (&state.vm, &state.gmmu) else {
+        let mut state = self.state.lock();
+        let AsState {
+            vm: Some(vm),
+            gmmu: Some(gmmu),
+            allocations,
+            pins,
+            ..
+        } = &mut *state
+        else {
             return NvResult::BadValue;
         };
+        let nvmap = &self.nvdrv.nvmap;
         for entry in items::<RemapEntry>(input) {
             let va = u64::from(entry.as_offset_big_pages) << vm.big_page_bits;
             let size = u64::from(entry.big_pages) << vm.big_page_bits;
-            let Some((&base, allocation)) = state.allocations.range(..=va).next_back() else {
+            let Some((&base, allocation)) = allocations.range(..=va).next_back() else {
                 tracing::warn!(va, "remap into an unallocated region");
                 return NvResult::BadValue;
             };
@@ -607,15 +658,37 @@ impl AsGpu {
                     tracing::warn!(%error, "remap to sparse");
                     return NvResult::BadValue;
                 }
+                self.release_pins(pins, va, size);
                 continue;
             }
-            let base = match self.nvdrv.nvmap.pin(entry.handle) {
+            let handle_offset = u64::from(entry.handle_offset_big_pages) << vm.big_page_bits;
+            let Some(handle_size) = nvmap.aligned_size(entry.handle) else {
+                return NvResult::BadValue;
+            };
+            if !fits(handle_offset, size, handle_size) {
+                tracing::warn!(
+                    handle = entry.handle,
+                    handle_offset,
+                    size,
+                    "remap reaches past its nvmap handle"
+                );
+                return NvResult::BadValue;
+            }
+            let base = match nvmap.pin(entry.handle) {
                 Ok(daddr) => daddr,
                 Err(result) => return result,
             };
-            let daddr = base + (u64::from(entry.handle_offset_big_pages) << vm.big_page_bits);
             let big_page = big.then_some(vm.big_page_size);
-            let result = self.map(gmmu, va, daddr, size, entry.kind as u8, big_page);
+            let result = self.map(
+                gmmu,
+                pins,
+                va,
+                base + handle_offset,
+                size,
+                entry.kind as u8,
+                big_page,
+                entry.handle,
+            );
             if result != NvResult::Success {
                 return result;
             }
@@ -668,6 +741,7 @@ impl AsGpu {
         let AsState {
             vm: Some(vm),
             gmmu: Some(gmmu),
+            pins,
             shim,
             ..
         } = &mut *state
@@ -681,6 +755,7 @@ impl AsGpu {
                 tracing::error!(%error, "mapping the syncpoint shim");
                 return NvResult::InsufficientMemory;
             }
+            self.release_pins(pins, address, PAGE_SIZE);
             let bits = vm.big_page_bits;
             vm.big.allocate_fixed(address >> bits, 1);
             *shim = Some(address);
@@ -696,27 +771,79 @@ impl AsGpu {
     }
 
     /// Maps `[gpu_va, +size)` (rounded up to pages) to `daddr`, with pages of `big_page` when
-    /// `gpu_va` is aligned to them.
+    /// `gpu_va` is aligned to them. Takes over one pin of `handle` the caller holds: the new range
+    /// keeps it, or it is dropped when the map fails.
+    #[expect(clippy::too_many_arguments)]
     fn map(
         &self,
         gmmu: &Gmmu,
+        pins: &mut BTreeMap<u64, Pin>,
         gpu_va: GpuVAddr,
         daddr: DAddr,
         size: u64,
         kind: u8,
         big_page: Option<u64>,
+        handle: u32,
     ) -> NvResult {
         let page = big_page
             .filter(|&big| gpu_va.is_multiple_of(big))
             .unwrap_or(PAGE_SIZE);
-        match gmmu.map(gpu_va, daddr, align_up(size, page), kind, page != PAGE_SIZE) {
+        let size = align_up(size, page);
+        match gmmu.map(gpu_va, daddr, size, kind, page != PAGE_SIZE) {
             Ok(replaced) => {
                 self.forget(Ok(replaced));
+                self.release_pins(pins, gpu_va, size);
+                pins.insert(gpu_va, Pin { size, handle });
                 NvResult::Success
             }
             Err(error) => {
                 tracing::error!(%error, "GPU map");
+                self.nvdrv.nvmap.unpin(handle);
                 NvResult::BadValue
+            }
+        }
+    }
+
+    /// Drops the pins of the GMMU ranges in `[va, va + size)`. A range partly outside keeps its
+    /// outside parts, each holding a pin.
+    fn release_pins(&self, pins: &mut BTreeMap<u64, Pin>, va: u64, size: u64) {
+        let end = va.saturating_add(size);
+        let nvmap = &self.nvdrv.nvmap;
+        let overlapping: Vec<u64> = pins
+            .range(..end)
+            .rev()
+            .take_while(|&(&start, pin)| start + pin.size > va)
+            .map(|(&start, _)| start)
+            .collect();
+        for start in overlapping {
+            let Pin { size, handle } = pins.remove(&start).expect("collected above");
+            let mut kept = false;
+            if start < va {
+                pins.insert(
+                    start,
+                    Pin {
+                        size: va - start,
+                        handle,
+                    },
+                );
+                kept = true;
+            }
+            if start + size > end {
+                if kept && let Err(result) = nvmap.pin(handle) {
+                    tracing::error!(handle, ?result, "pinning the rest of a split GPU mapping");
+                    continue;
+                }
+                pins.insert(
+                    end,
+                    Pin {
+                        size: start + size - end,
+                        handle,
+                    },
+                );
+                kept = true;
+            }
+            if !kept {
+                nvmap.unpin(handle);
             }
         }
     }
@@ -734,9 +861,18 @@ impl AsGpu {
     }
 }
 
+/// Whether `[offset, offset + size)` lies within `limit` bytes.
+fn fits(offset: u64, size: u64, limit: u64) -> bool {
+    offset.checked_add(size).is_some_and(|end| end <= limit)
+}
+
 impl Drop for AsGpu {
     fn drop(&mut self) {
-        if let Some(gmmu) = &self.state.get_mut().gmmu {
+        let state = self.state.get_mut();
+        for pin in std::mem::take(&mut state.pins).into_values() {
+            self.nvdrv.nvmap.unpin(pin.handle);
+        }
+        if let Some(gmmu) = &state.gmmu {
             self.nvdrv.gpu.destroy_address_space(gmmu);
         }
     }

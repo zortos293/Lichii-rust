@@ -111,7 +111,11 @@ impl Nv {
     }
 
     fn call(&self, request: Request, outputs: &[(VAddr, usize)]) -> Reply {
-        let mut reply = self.client.send(self.session, &request).unwrap();
+        self.call_on(self.session, request, outputs)
+    }
+
+    fn call_on(&self, session: Handle, request: Request, outputs: &[(VAddr, usize)]) -> Reply {
+        let mut reply = self.client.send(session, &request).unwrap();
         assert_eq!(reply.result, ResultCode::SUCCESS);
         let result = reply.pop::<u32>();
         let mut read = outputs.iter().map(|&(at, len)| self.client.read(at, len));
@@ -123,6 +127,17 @@ impl Nv {
     }
 
     fn ioctl(&self, fd: i32, ioctl: u32, input: &[u8], out_len: usize) -> Reply {
+        self.ioctl_on(self.session, fd, ioctl, input, out_len)
+    }
+
+    fn ioctl_on(
+        &self,
+        session: Handle,
+        fd: i32,
+        ioctl: u32,
+        input: &[u8],
+        out_len: usize,
+    ) -> Reply {
         let input_at = self.client.alloc(input);
         let output_at = self.client.alloc(&vec![0xAA; out_len]);
         let request = Request::new(1)
@@ -130,7 +145,7 @@ impl Nv {
             .arg(ioctl)
             .buffer_a(input_at, input.len() as u64)
             .buffer_b(output_at, out_len as u64);
-        self.call(request, &[(output_at, out_len)])
+        self.call_on(session, request, &[(output_at, out_len)])
     }
 
     fn ioctl2(&self, fd: i32, ioctl: u32, input: &[u8], inline: &[u8], out_len: usize) -> Reply {
@@ -259,6 +274,57 @@ impl Nv {
             .u32(fence.0)
             .u32(fence.1);
         self.ioctl2(gpu, iowr(b'H', 0x1b, 24), &params.0, &inline.0, 24)
+    }
+
+    /// MapBufferEx; returns the result and the GPU address.
+    fn map_ex(
+        &self,
+        as_fd: i32,
+        flags: u32,
+        handle: u32,
+        buffer_offset: i64,
+        mapping_size: u64,
+        offset: u64,
+    ) -> (u32, u64) {
+        let map = Bytes::default()
+            .u32(flags)
+            .u32(0)
+            .u32(handle)
+            .u32(0)
+            .u64(buffer_offset as u64)
+            .u64(mapping_size)
+            .u64(offset);
+        let reply = self.ioctl(as_fd, iowr(b'A', 0x6, 40), &map.0, 40);
+        (reply.result, u64_at(&reply.output, 32))
+    }
+
+    /// AllocSpace of `pages` pages of `page_size`; returns the GPU address.
+    fn alloc_space(&self, as_fd: i32, pages: u32, page_size: u32, flags: u32) -> u64 {
+        let input = Bytes::default()
+            .u32(pages)
+            .u32(page_size)
+            .u32(flags)
+            .u32(0)
+            .u64(0);
+        let reply = self.ioctl(as_fd, iowr(b'A', 0x2, 24), &input.0, 24);
+        assert_eq!(reply.result, 0);
+        u64_at(&reply.output, 16)
+    }
+
+    fn free_space(&self, as_fd: i32, offset: u64, pages: u32, page_size: u32) -> u32 {
+        let input = Bytes::default().u64(offset).u32(pages).u32(page_size);
+        self.ioctl(as_fd, iowr(b'A', 0x3, 16), &input.0, 16).result
+    }
+
+    /// Remaps one 64 KiB-page range of a sparse allocation.
+    fn remap(&self, as_fd: i32, handle: u32, handle_offset: u32, va: u64, pages: u32) -> u32 {
+        let input = Bytes::default()
+            .u32(0)
+            .u32(handle)
+            .u32(handle_offset)
+            .u32((va >> 16) as u32)
+            .u32(pages);
+        self.ioctl(as_fd, iowr(b'A', 0x14, 20), &input.0, 20).result
     }
 
     fn syncpoints(&self) -> &lichii_gpu::host1x::Syncpoints {
@@ -405,6 +471,66 @@ fn nvmap_handles_pin_guest_memory_into_device_space() {
 }
 
 #[test]
+fn a_closing_session_drops_every_nvmap_reference_it_holds() {
+    let nv = Nv::new(SWITCH1_TITLE, "nvdrv");
+    let nvmap = nv.open("/dev/nvmap");
+    let (shared, _) = nv.nvmap_buffer(nvmap, &[1; 0x1000], 0x1000);
+
+    let other = nv.client.connect("nvdrv").unwrap();
+    nv.initialize(other);
+    let (other_nvmap, _) = nv.open_on(other, "/dev/nvmap");
+    let create = nv.ioctl_on(
+        other,
+        other_nvmap,
+        iowr(1, 0x1, 8),
+        &Bytes::default().u32(0x2000).u32(0).0,
+        8,
+    );
+    assert_eq!(create.result, 0);
+    let unallocated = u32_at(&create.output, 4);
+    for _ in 0..2 {
+        let from_id = nv.ioctl_on(
+            other,
+            other_nvmap,
+            iowr(1, 0x3, 8),
+            &Bytes::default().u32(shared).u32(0).0,
+            8,
+        );
+        assert_eq!(from_id.result, 0);
+    }
+    assert_eq!(nv.nvdrv.nvmap.size(unallocated), Some(0x2000));
+
+    let session = nv.client.process().handles().write().remove(other);
+    drop(session);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while nv.nvdrv.nvmap.size(unallocated).is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the session never released its handles"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        nv.nvdrv.nvmap.size(shared),
+        Some(0x1000),
+        "this session's reference stays"
+    );
+
+    let free = nv.ioctl(
+        nvmap,
+        iowr(1, 0x5, 24),
+        &Bytes::default().u32(shared).zeroes(20).0,
+        24,
+    );
+    assert_eq!(free.result, 0);
+    assert_eq!(
+        nv.nvdrv.nvmap.size(shared),
+        None,
+        "the last reference is gone"
+    );
+}
+
+#[test]
 fn ctrl_reads_increments_and_waits_on_syncpoints() {
     let nv = Nv::new(SWITCH1_TITLE, "nvdrv");
     let ctrl = nv.open("/dev/nvhost-ctrl");
@@ -499,6 +625,42 @@ fn gpfifo_fences_follow_host1x_and_ctrl_events_signal() {
 }
 
 #[test]
+fn a_closed_channel_retires_the_increments_of_its_dropped_work() {
+    let nv = Nv::new(SWITCH1_TITLE, "nvdrv");
+    let as_fd = nv.address_space();
+    let (gpu, syncpoint) = nv.channel(as_fd);
+    let guest = nv.syncpoints().guest();
+
+    let reply = nv.submit(gpu, &[], 1 << 0 | 1 << 1, (26, 1));
+    assert_eq!(reply.result, 0);
+    let fence = u32_at(&reply.output, 20);
+    assert_eq!(fence, 2);
+    nv.context.gpu.synchronize();
+    assert_eq!(
+        guest.value(syncpoint),
+        Ok(0),
+        "suspended on vblank syncpoint 26"
+    );
+
+    assert_eq!(nv.close(gpu), 0);
+    nv.context.gpu.synchronize();
+    assert_eq!(guest.value(syncpoint), Ok(fence));
+    assert_eq!(nv.syncpoints().host().value(syncpoint), Ok(fence));
+    assert!(!nv.nvdrv.syncpoints.is_allocated(syncpoint));
+
+    let (reused, id) = nv.channel(as_fd);
+    assert_eq!(id, syncpoint);
+    let reply = nv.submit(reused, &[], 1 << 1, (0, 0));
+    assert_eq!(reply.result, 0);
+    let fence = u32_at(&reply.output, 20);
+    assert_eq!(fence, 4);
+    assert_eq!(
+        guest.wait(syncpoint, fence, Some(Duration::from_secs(5))),
+        Ok(fence)
+    );
+}
+
+#[test]
 fn gpfifo_runs_a_pushbuffer_mapped_through_nvmap_and_the_gmmu() {
     let nv = Nv::new(SWITCH1_TITLE, "nvdrv");
     let nvmap = nv.open("/dev/nvmap");
@@ -531,6 +693,118 @@ fn gpfifo_runs_a_pushbuffer_mapped_through_nvmap_and_the_gmmu() {
 
     let fence_wait = nv.submit(gpu, &[], 1 << 0 | 1 << 8, (syncpoint, 3));
     assert_eq!(fence_wait.result, NvResult::BadParameter as u32);
+}
+
+#[test]
+fn mappings_stay_inside_their_nvmap_handle() {
+    const BAD: u32 = NvResult::BadValue as u32;
+    let nv = Nv::new(SWITCH1_TITLE, "nvdrv");
+    let nvmap = nv.open("/dev/nvmap");
+    let as_fd = nv.address_space();
+    let (handle, _) = nv.nvmap_buffer(nvmap, &[7; 0x3000], 0x1000);
+    let pins = || nv.nvdrv.nvmap.pins(handle);
+
+    assert_eq!(nv.map_ex(as_fd, 0, handle, 0x2000, 0x2000, 0).0, BAD);
+    assert_eq!(nv.map_ex(as_fd, 0, handle, -0x1000, 0x1000, 0).0, BAD);
+    assert_eq!(nv.map_ex(as_fd, 0, handle, i64::MAX, u64::MAX, 0).0, BAD);
+    assert_eq!(nv.map_ex(as_fd, 0, handle, 0x3000, 0, 0).0, BAD);
+    assert_eq!(pins(), 0, "rejected before pinning");
+    let (result, gpu_va) = nv.map_ex(as_fd, 0, handle, 0, 0, 0);
+    assert_eq!((result, pins()), (0, 1));
+
+    let remap = 1 << 8;
+    assert_eq!(
+        nv.map_ex(as_fd, remap, handle, 0x2000, 0x2000, gpu_va).0,
+        BAD
+    );
+    assert_eq!(nv.map_ex(as_fd, remap, handle, -1, 0x1000, gpu_va).0, BAD);
+    assert_eq!(nv.map_ex(as_fd, remap, handle, 0x1000, 0x2000, gpu_va).0, 0);
+    assert_eq!(pins(), 2, "the remapped range holds its own pin");
+
+    let (big, _) = nv.nvmap_buffer(nvmap, &[9; 0x10000], 0x10000);
+    let sparse = nv.alloc_space(as_fd, 4, 0x10000, 1 << 1);
+    assert_eq!(nv.remap(as_fd, big, 1, sparse, 1), BAD);
+    assert_eq!(nv.remap(as_fd, handle, 0, sparse, 1), BAD);
+    assert_eq!(nv.remap(as_fd, big, u32::MAX, sparse, 1), BAD);
+    assert_eq!(nv.nvdrv.nvmap.pins(big), 0);
+    assert_eq!(nv.remap(as_fd, big, 0, sparse, 1), 0);
+    assert_eq!(nv.nvdrv.nvmap.pins(big), 1);
+}
+
+#[test]
+fn every_gmmu_range_holding_a_pin_unpins_once() {
+    let nv = Nv::new(SWITCH1_TITLE, "nvdrv");
+    let nvmap = nv.open("/dev/nvmap");
+    let as_fd = nv.address_space();
+    let (a, _) = nv.nvmap_buffer(nvmap, &[1; 0x3000], 0x1000);
+    let (b, _) = nv.nvmap_buffer(nvmap, &[2; 0x1000], 0x1000);
+    let pins = |handle| nv.nvdrv.nvmap.pins(handle);
+
+    let space = nv.alloc_space(as_fd, 16, 0x1000, 0);
+    assert_eq!(nv.map_ex(as_fd, 1, a, 0, 0, space).0, 0);
+    assert_eq!(pins(a), 1);
+    assert_eq!(nv.map_ex(as_fd, 1, b, 0, 0, space + 0x1000).0, 0);
+    assert_eq!((pins(a), pins(b)), (2, 1), "a keeps both ends");
+    assert_eq!(nv.map_ex(as_fd, 1 << 8, a, 0x1000, 0x1000, space).0, 0);
+    assert_eq!((pins(a), pins(b)), (3, 0), "the remap replaced b");
+    let unmap = nv.ioctl(
+        as_fd,
+        iowr(b'A', 0x5, 8),
+        &(space + 0x1000).to_le_bytes(),
+        8,
+    );
+    assert_eq!(unmap.result, 0);
+    assert_eq!(pins(a), 2);
+    assert_eq!(nv.free_space(as_fd, space, 16, 0x1000), 0);
+    assert_eq!((pins(a), pins(b)), (0, 0));
+
+    let (big, _) = nv.nvmap_buffer(nvmap, &[3; 0x20000], 0x10000);
+    let sparse = nv.alloc_space(as_fd, 4, 0x10000, 1 << 1);
+    assert_eq!(nv.remap(as_fd, big, 0, sparse, 2), 0);
+    assert_eq!(nv.remap(as_fd, big, 0, sparse, 2), 0);
+    assert_eq!(pins(big), 1, "a remap over a remap replaces its pin");
+    assert_eq!(nv.remap(as_fd, big, 1, sparse + 0x20000, 1), 0);
+    assert_eq!(nv.remap(as_fd, 0, 0, sparse + 0x10000, 1), 0);
+    assert_eq!(pins(big), 2, "back to sparse in the middle keeps both ends");
+    assert_eq!(nv.free_space(as_fd, sparse, 4, 0x10000), 0);
+    assert_eq!(pins(big), 0);
+
+    nv.map(as_fd, a);
+    nv.map(as_fd, big);
+    nv.alloc_space(as_fd, 2, 0x10000, 1 << 1);
+    let sparse = nv.alloc_space(as_fd, 2, 0x10000, 1 << 1);
+    assert_eq!(nv.remap(as_fd, big, 0, sparse, 2), 0);
+    assert_eq!((pins(a), pins(big)), (1, 2));
+    assert_eq!(nv.close(as_fd), 0);
+    assert_eq!(
+        (pins(a), pins(big)),
+        (0, 0),
+        "dropping the address space unpins"
+    );
+}
+
+#[test]
+fn big_pages_reach_the_end_of_an_address_space_with_a_split() {
+    let nv = Nv::new(SWITCH1_TITLE, "nvdrv");
+    let as_fd = nv.open("/dev/nvhost-as-gpu");
+    let (start, split, end) = (0x400_0000u64, 0x1_0000_0000u64, 0x10_0000_0000u64);
+    let init = Bytes::default()
+        .u32(1)
+        .u32(0)
+        .u32(0x10000)
+        .u32(0)
+        .u64(start)
+        .u64(end)
+        .u64(split);
+    assert_eq!(nv.ioctl(as_fd, iowr(b'A', 0x9, 40), &init.0, 40).result, 0);
+    let regions = nv.ioctl(as_fd, iowr(b'A', 0x8, 64), &[0; 64], 64);
+    assert_eq!(regions.result, 0);
+    assert_eq!(u64_at(&regions.output, 16), start);
+    assert_eq!(u64_at(&regions.output, 32), (split - start) >> 12);
+    assert_eq!(u64_at(&regions.output, 40), split);
+    assert_eq!(u64_at(&regions.output, 56), (end - split) >> 16);
+    let pages = ((end - split) >> 16) as u32;
+    assert_eq!(nv.alloc_space(as_fd, pages, 0x10000, 0), split);
 }
 
 #[test]

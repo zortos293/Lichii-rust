@@ -387,10 +387,20 @@ fn slot(class: u32) -> Option<usize> {
 }
 
 impl Drop for GpuChannel {
+    /// The syncpoint goes back to the pool after the GPU destroyed the channel, so increments its
+    /// dropped work reserved can be counted first.
     fn drop(&mut self) {
-        if let Some(channel) = self.state.get_mut().channel {
-            self.nvdrv.gpu.destroy_channel(channel);
-        }
-        self.nvdrv.syncpoints.free(self.syncpoint);
+        let id = self.syncpoint;
+        let Some(channel) = self.state.get_mut().channel else {
+            self.nvdrv.syncpoints.retire(id);
+            return;
+        };
+        self.nvdrv.gpu.destroy_channel(channel);
+        let nvdrv = Arc::downgrade(&self.nvdrv);
+        self.nvdrv.gpu.run_in_order(move |_| {
+            if let Some(nvdrv) = nvdrv.upgrade() {
+                nvdrv.syncpoints.retire(id);
+            }
+        });
     }
 }

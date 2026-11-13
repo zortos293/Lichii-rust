@@ -63,6 +63,18 @@ impl SyncpointTable {
         id
     }
 
+    /// Frees a channel's syncpoint once nothing will run its reserved increments: both banks are
+    /// counted up to the maximum, so fences of the next owner wait for its own work only.
+    pub fn retire(&self, id: u32) {
+        let max = self.max(id);
+        for bank in [self.syncpoints.host(), self.syncpoints.guest()] {
+            while bank.is_reached(id, max).is_ok_and(|reached| !reached) {
+                let _ = bank.increment(id);
+            }
+        }
+        self.free(id);
+    }
+
     pub fn free(&self, id: u32) {
         if let Some(reserved) = self.reserved.get(id as usize) {
             reserved.store(false, Ordering::Release);

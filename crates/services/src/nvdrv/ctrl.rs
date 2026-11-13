@@ -5,7 +5,6 @@
 //! guest value gets there, and the guest waits on the event's readable end.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use bytemuck::{Pod, Zeroable};
@@ -19,28 +18,55 @@ use super::{NvFence, NvResult, Nvdrv};
 
 const MAX_EVENTS: u32 = 64;
 
-const AVAILABLE: u8 = 0;
-const WAITING: u8 = 1;
-const CANCELLING: u8 = 2;
-const SIGNALLING: u8 = 3;
-const SIGNALLED: u8 = 4;
-const CANCELLED: u8 = 5;
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum Status {
+    #[default]
+    Available,
+    Waiting,
+    Signalled,
+    Cancelled,
+}
 
 /// Event waits that failed this often in a row wait on the host instead.
 const MAX_FAILS: u32 = 2;
 
 /// The part of an event a host1x action touches.
+#[derive(Default)]
 struct EventSlot {
-    status: AtomicU8,
+    state: Mutex<SlotState>,
     event: Arc<Event>,
+}
+
+/// Every arm, clear and rearm bumps `generation`; an action armed under an older generation, even
+/// one host1x is already running, changes nothing.
+#[derive(Default)]
+struct SlotState {
+    status: Status,
+    generation: u64,
 }
 
 impl EventSlot {
     fn in_use(&self) -> bool {
-        matches!(
-            self.status.load(Ordering::Acquire),
-            WAITING | CANCELLING | SIGNALLING
-        )
+        self.state.lock().status == Status::Waiting
+    }
+
+    /// Starts a wait and returns the generation its action must match.
+    fn arm(&self) -> u64 {
+        let mut state = self.state.lock();
+        state.generation += 1;
+        state.status = Status::Waiting;
+        state.generation
+    }
+
+    fn signal(&self, generation: u64) {
+        let mut state = self.state.lock();
+        if state.generation != generation {
+            return;
+        }
+        if state.status == Status::Waiting {
+            self.event.signal();
+        }
+        state.status = Status::Signalled;
     }
 }
 
@@ -89,9 +115,20 @@ struct EventWait {
     value: u32,
 }
 
-/// The event id an event wait returns and `QueryEvent` takes: the slot in the low bits, then the
-/// syncpoint (bits 4.. for plain waits, bits 16..28 with bit 28 set for allocating waits).
+/// Set in the event ids allocating waits return (`SyncpointEventValue::event_allocated`).
 const ALLOCATED_BIT: u32 = 1 << 28;
+
+/// The event id an event wait returns and `QueryEvent` takes (`SyncpointEventValue`). An
+/// allocating wait puts the slot in bits 0..16 and the syncpoint in bits 16..28 and sets bit 28.
+/// A plain wait ORs the slot over the syncpoint shifted to bit 4; only its low four bits (the
+/// partial slot) have bits of their own.
+fn encode_event_id(slot: u32, syncpoint: u32, allocated: bool) -> u32 {
+    if allocated {
+        (syncpoint & 0xfff) << 16 | ALLOCATED_BIT | slot
+    } else {
+        syncpoint << 4 | slot
+    }
+}
 
 impl Ctrl {
     pub fn new(nvdrv: Arc<Nvdrv>) -> Self {
@@ -235,23 +272,14 @@ impl Ctrl {
         }
 
         let shared = event.slot.clone().expect("registered events have a slot");
-        shared.status.store(WAITING, Ordering::Release);
+        let generation = shared.arm();
         event.syncpoint = fence_id;
         event.value = target;
-        params.value = if allocation {
-            (fence_id & 0xfff) << 16 | ALLOCATED_BIT
-        } else {
-            fence_id << 4
-        } | slot;
+        params.value = encode_event_id(slot, fence_id, allocation);
         let action = self
             .syncpoints()
             .guest()
-            .register_action(fence_id, target, move || {
-                if shared.status.swap(SIGNALLING, Ordering::AcqRel) == WAITING {
-                    shared.event.signal();
-                }
-                shared.status.store(SIGNALLED, Ordering::Release);
-            });
+            .register_action(fence_id, target, move || shared.signal(generation));
         event.wait = action.ok().flatten();
         NvResult::Timeout
     }
@@ -286,10 +314,7 @@ impl Ctrl {
 
     fn create_event(event: &mut NvEvent) {
         *event = NvEvent {
-            slot: Some(Arc::new(EventSlot {
-                status: AtomicU8::new(AVAILABLE),
-                event: Arc::new(Event::new()),
-            })),
+            slot: Some(Arc::default()),
             ..NvEvent::default()
         };
     }
@@ -350,33 +375,45 @@ impl Ctrl {
         let Some(shared) = event.slot.clone() else {
             return NvResult::BadParameter;
         };
-        if shared.status.swap(CANCELLING, Ordering::AcqRel) == WAITING
-            && let Some(wait) = event.wait.take()
-        {
+        let mut state = shared.state.lock();
+        state.generation += 1;
+        if let Some(wait) = event.wait.take() {
             self.syncpoints().guest().cancel(wait);
         }
         event.fails += 1;
-        shared.status.store(CANCELLED, Ordering::Release);
+        state.status = Status::Cancelled;
         shared.event.clear();
         NvResult::Success
     }
 
+    /// The event behind an id an event wait returned. A plain wait's id names every registered
+    /// slot with its partial slot whose id it re-encodes to; the lowest wins when slots 16 apart
+    /// on syncpoints whose low bits collide encode alike.
     pub fn query_event(&self, id: u32) -> Option<Arc<Event>> {
         let allocated = id & ALLOCATED_BIT != 0;
-        let (slot, syncpoint) = if allocated {
-            (id & 0xf, (id >> 16) & 0xfff)
-        } else {
-            (id & 0xffff, id >> 4)
-        };
         let events = self.events.lock();
-        let event = events.get(slot as usize)?;
-        match &event.slot {
-            Some(shared) if event.syncpoint == syncpoint => Some(shared.event.clone()),
-            _ => {
-                tracing::error!(slot, syncpoint, "query of an event that is not armed");
-                None
-            }
-        }
+        let matches = |slot: u32| {
+            let event = &events[slot as usize];
+            event.slot.is_some() && encode_event_id(slot, event.syncpoint, allocated) == id
+        };
+        let slot = if allocated {
+            Some(id & 0xffff).filter(|&slot| slot < MAX_EVENTS && matches(slot))
+        } else {
+            (id & 0xf..MAX_EVENTS)
+                .step_by(16)
+                .find(|&slot| matches(slot))
+        };
+        let Some(slot) = slot else {
+            tracing::error!(
+                id = format_args!("{id:#x}"),
+                "query of an event that is not armed"
+            );
+            return None;
+        };
+        events[slot as usize]
+            .slot
+            .as_ref()
+            .map(|shared| shared.event.clone())
     }
 }
 
@@ -388,5 +425,90 @@ impl Drop for Ctrl {
                 guest.cancel(wait);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use lichii_common::settings::Settings;
+
+    use super::*;
+    use crate::testing::{SWITCH1_TITLE, context};
+
+    fn ctrl() -> (Arc<Nvdrv>, Ctrl) {
+        let (context, _client) = context(SWITCH1_TITLE, Settings::default());
+        let nvdrv = super::super::register(&context).unwrap();
+        (nvdrv.clone(), Ctrl::new(nvdrv))
+    }
+
+    fn wait(ctrl: &Ctrl, syncpoint: u32, value: u32, allocation: bool) -> u32 {
+        let mut params = EventWait {
+            fence: NvFence {
+                id: syncpoint as i32,
+                value: 1,
+            },
+            timeout: 100,
+            value,
+        };
+        assert_eq!(ctrl.event_wait(&mut params, allocation), NvResult::Timeout);
+        params.value
+    }
+
+    fn slot_event(ctrl: &Ctrl, slot: u32) -> Arc<Event> {
+        ctrl.events.lock()[slot as usize]
+            .slot
+            .as_ref()
+            .unwrap()
+            .event
+            .clone()
+    }
+
+    #[test]
+    fn allocating_wait_ids_round_trip_for_every_slot() {
+        let (_nvdrv, ctrl) = ctrl();
+        for slot in 0..MAX_EVENTS {
+            let syncpoint = 0x40 + slot % 3;
+            let id = wait(&ctrl, syncpoint, 0, true);
+            assert_eq!(id, syncpoint << 16 | ALLOCATED_BIT | slot);
+            let event = ctrl.query_event(id).expect("armed");
+            assert!(Arc::ptr_eq(&event, &slot_event(&ctrl, slot)));
+        }
+        assert!(ctrl.query_event(0x41 << 16 | ALLOCATED_BIT).is_none());
+    }
+
+    #[test]
+    fn plain_wait_ids_round_trip_for_every_slot() {
+        let (_nvdrv, ctrl) = ctrl();
+        for slot in 0..MAX_EVENTS {
+            assert_eq!(ctrl.register_event(slot), NvResult::Success);
+            let syncpoint = 0x20 + 4 * (slot % 3);
+            let id = wait(&ctrl, syncpoint, slot, false);
+            assert_eq!(id, syncpoint << 4 | slot);
+            let event = ctrl.query_event(id).expect("armed");
+            assert!(Arc::ptr_eq(&event, &slot_event(&ctrl, slot)));
+        }
+        assert!(ctrl.query_event(0x30 << 4).is_none());
+    }
+
+    #[test]
+    fn a_cleared_wait_never_signals_the_rearmed_slot() {
+        let (nvdrv, ctrl) = ctrl();
+        let guest = nvdrv.syncpoints.syncpoints().guest();
+        assert_eq!(ctrl.register_event(3), NvResult::Success);
+        wait(&ctrl, 0x21, 3, false);
+        let shared = ctrl.events.lock()[3].slot.clone().unwrap();
+        let stale = shared.state.lock().generation;
+        assert_eq!(ctrl.clear_event_wait(3), NvResult::Success);
+        wait(&ctrl, 0x22, 3, false);
+
+        shared.signal(stale);
+        assert!(!shared.event.is_signaled(), "the cancelled action is stale");
+        assert!(shared.in_use());
+
+        guest.increment(0x21).unwrap();
+        assert!(!shared.event.is_signaled());
+        guest.increment(0x22).unwrap();
+        assert!(shared.event.is_signaled());
+        assert!(!shared.in_use());
     }
 }
