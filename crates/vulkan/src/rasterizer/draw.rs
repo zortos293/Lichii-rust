@@ -66,6 +66,7 @@ enum Warning {
     NoIndirectCount = 1 << 4,
     RescaledTexture = 1 << 6,
     DrawTextureTarget = 1 << 7,
+    DrawTextureSource = 1 << 8,
 }
 
 /// A descriptor write of the current draw: `count` infos from `first` of the info list for
@@ -1043,6 +1044,15 @@ impl VulkanRasterizer {
             return Ok(None);
         };
         view.view_type = view_type(ty);
+        view.layers = match view.view_type {
+            vk::ImageViewType::TYPE_1D
+            | vk::ImageViewType::TYPE_2D
+            | vk::ImageViewType::TYPE_3D => 1,
+            vk::ImageViewType::CUBE if view.layers >= 6 => 6,
+            vk::ImageViewType::CUBE_ARRAY if view.layers >= 6 => view.layers / 6 * 6,
+            vk::ImageViewType::CUBE | vk::ImageViewType::CUBE_ARRAY => return Ok(None),
+            _ => view.layers,
+        };
         Ok(self.texture_cache.view(id, &view)?.map(|raw| (id, raw)))
     }
 

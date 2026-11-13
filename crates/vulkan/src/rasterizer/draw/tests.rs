@@ -821,3 +821,65 @@ fn draw_texture_skips_rescaled_sources() {
     );
     f.assert_no_validation_errors();
 }
+
+#[test]
+fn draw_texture_skips_integer_sources() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let mut header = tic(GPU_VA + TEXTURE, 8, 8);
+    header[0] = (header[0] & !(0xfff << 7)) | 4 << 7 | 4 << 10 | 4 << 13 | 4 << 16;
+    write(&f, TIC, bytemuck::cast_slice(&header));
+    draw_texture(&mut f, &gmmu, &sampling_regs(), full_rect(8.0));
+    assert_ne!(
+        f.rasterizer.draw.warned & Warning::DrawTextureSource as u32,
+        0
+    );
+    assert!(
+        target(&mut f).iter().all(|&t| t == [0; 4]),
+        "nothing was drawn"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn draw_texture_reads_layer_zero_of_array_sources() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let tiling = Tiling::new(8, 8, 1, 4, 1, 0, GobLayout::Tegra);
+    let linear: Vec<u8> = (0..64).flat_map(|i| source_texel(i % 8, i / 8)).collect();
+    let mut tiled = vec![0; tiling.size_bytes()];
+    swizzle(&tiling, &linear, &mut tiled);
+    write(&f, TEXTURE, &tiled);
+    let mut header = tic(GPU_VA + TEXTURE, 8, 8);
+    header[4] = (header[4] & !(0xf << 23)) | 5 << 23;
+    header[5] |= 1 << 16;
+    write(&f, TIC, bytemuck::cast_slice(&header));
+    draw_texture(&mut f, &gmmu, &sampling_regs(), full_rect(8.0));
+    for (i, &texel) in target(&mut f).iter().enumerate() {
+        let (x, y) = (i as u32 % SIZE, i as u32 / SIZE);
+        let want = if x < 8 && y < 8 {
+            source_texel(x, y)
+        } else {
+            [0; 4]
+        };
+        assert_eq!(texel, want, "texel ({x}, {y})");
+    }
+    f.assert_no_validation_errors();
+}
+
+fn full_rect(size: f32) -> DrawTexture {
+    DrawTexture {
+        dst_x0: 0.0,
+        dst_y0: 0.0,
+        dst_x1: size,
+        dst_y1: size,
+        src_x0: 0.0,
+        src_y0: 0.0,
+        src_x1: size,
+        src_y1: size,
+        texture: 0,
+        sampler: 0,
+    }
+}

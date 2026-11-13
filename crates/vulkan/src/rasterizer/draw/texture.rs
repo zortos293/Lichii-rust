@@ -221,6 +221,13 @@ impl VulkanRasterizer {
             sampler_limit: regs.tex_sampler.limit,
         };
         let header = src.pool.header(ctx.memory, draw.texture);
+        if matches!(header.format.numeric(), Numeric::Uint | Numeric::Sint) {
+            self.draw.warn_once(
+                Warning::DrawTextureSource,
+                "texture draws from integer textures are not supported; skipping them",
+            );
+            return Ok(());
+        }
         let Some((texture, view)) = self.texture_view(&src, draw.texture, TextureType::Color2D)?
         else {
             return Ok(());
