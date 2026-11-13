@@ -397,8 +397,6 @@ pub(crate) struct EmitContext<'a> {
 
     /// Variables listed on the entry point.
     pub interfaces: Vec<Word>,
-    /// Result ids of shuffles whose opcode is rewritten after assembly (see the warp family).
-    pub opcode_rewrites: Vec<(Word, spirv::Op)>,
 
     pub load_const_func_u8: Word,
     pub load_const_func_u16: Word,
@@ -665,7 +663,6 @@ impl<'a> EmitContext<'a> {
             sample_mask: 0,
             frag_depth: 0,
             interfaces: Vec::new(),
-            opcode_rewrites: Vec::new(),
             load_const_func_u8: 0,
             load_const_func_u16: 0,
             load_const_func_u32: 0,

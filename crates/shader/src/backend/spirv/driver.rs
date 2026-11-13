@@ -49,10 +49,7 @@ pub(super) fn emit(
         ctx.b.execution_mode(main, ExecutionMode::Xfb, []);
     }
     patch_phis(&mut ctx)?;
-    let rewrites = std::mem::take(&mut ctx.opcode_rewrites);
-    let mut code = ctx.b.module().assemble();
-    rewrite_opcodes(&mut code, &rewrites);
-    Ok(code)
+    Ok(ctx.b.module().assemble())
 }
 
 fn define_main(ctx: &mut EmitContext<'_>) -> EmitResult<Word> {
@@ -424,7 +421,9 @@ fn setup_capabilities(ctx: &mut EmitContext<'_>) {
         }
         ctx.add_capability(Capability::GroupNonUniformShuffle);
     }
-    if info.uses_int64_bit_atomics && profile.support_int64_atomics {
+    if info.uses_int64_bit_atomics
+        && (profile.support_int64_atomics || profile.support_shared_int64_atomics)
+    {
         ctx.add_capability(Capability::Int64Atomics);
     }
     if info.uses_typeless_image_reads && profile.support_typeless_image_loads {
@@ -462,29 +461,5 @@ fn setup_capabilities(ctx: &mut EmitContext<'_>) {
         if ctx.uses_nonuniform_storage_texel_buffer {
             ctx.add_capability(Capability::StorageTexelBufferArrayNonUniformIndexing);
         }
-    }
-}
-
-/// Swaps the opcode of the shuffles the warp family asked for, after assembly.
-fn rewrite_opcodes(code: &mut [u32], rewrites: &[(Word, Op)]) {
-    if rewrites.is_empty() {
-        return;
-    }
-    let mut offset = 5;
-    while offset + 2 < code.len() {
-        let word_count = (code[offset] >> 16) as usize;
-        if word_count == 0 {
-            return;
-        }
-        let opcode = code[offset] & 0xffff;
-        if opcode == Op::GroupNonUniformShuffleXor as u32
-            || opcode == Op::GroupNonUniformQuadBroadcast as u32
-        {
-            let result = code[offset + 2];
-            if let Some(&(_, op)) = rewrites.iter().find(|(id, _)| *id == result) {
-                code[offset] = (code[offset] & 0xffff_0000) | op as u32;
-            }
-        }
-        offset += word_count;
     }
 }
