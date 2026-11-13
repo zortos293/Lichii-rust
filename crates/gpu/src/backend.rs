@@ -121,6 +121,9 @@ pub struct ComputeContext<'a> {
     pub grid: [u32; 3],
     pub block: [u32; 3],
     pub shared_memory_size: u32,
+    /// Local memory each thread uses, in bytes: the descriptor's positive and call-return-stack
+    /// allocations.
+    pub local_memory_size: u32,
     pub const_buffers: &'a [ConstBufferBinding; 8],
     pub texture_headers: GpuVAddr,
     pub texture_header_limit: u32,
@@ -159,6 +162,20 @@ pub struct ImageCopy {
     pub height: u32,
 }
 
+/// How a 2D blit combines the source with the destination. The software path performs every
+/// operation as [`BlitOperation::SrcCopy`], as the reference does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlitOperation {
+    SrcCopyAnd,
+    RopAnd,
+    Blend,
+    SrcCopy,
+    Rop,
+    SrcCopyPremult,
+    BlendPremult,
+    SrcCopySrgbToLinear,
+}
+
 /// A 2D engine blit with scaling.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Blit {
@@ -177,6 +194,7 @@ pub struct Blit {
     pub dst_width: i32,
     pub dst_height: i32,
     pub linear_filter: bool,
+    pub operation: BlitOperation,
 }
 
 /// What a query or semaphore release writes.
@@ -375,6 +393,19 @@ pub trait Rasterizer: Send {
         false
     }
 
+    /// Fills `size` bytes of a linear buffer at `dst` with the 32-bit `value` repeated (a copy
+    /// engine constant fill). `false` makes the GPU write guest memory itself.
+    fn accelerate_buffer_clear(
+        &mut self,
+        _channel: ChannelId,
+        _memory: &Gmmu,
+        _dst: GpuVAddr,
+        _size: u64,
+        _value: u32,
+    ) -> bool {
+        false
+    }
+
     /// A copy engine transfer between surfaces (tiling or untiling). `false` makes the GPU
     /// do it in software.
     fn accelerate_image_copy(
@@ -430,7 +461,8 @@ pub trait Rasterizer: Send {
     /// Texture and shader caches must not use stale guest data (cache invalidation methods).
     fn invalidate_gpu_caches(&mut self) {}
 
-    /// The guest asked for a fragment or tiled cache barrier.
+    /// The guest asked for a fragment or tiled cache barrier. Treat it as a full pipeline
+    /// barrier: later draws and dispatches may read anything earlier work wrote.
     fn barrier(&mut self) {}
 
     /// Submits recorded host GPU work (end of a GPFIFO submission).

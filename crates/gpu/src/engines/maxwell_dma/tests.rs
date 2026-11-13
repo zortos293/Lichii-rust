@@ -16,7 +16,9 @@ use crate::gmmu::Gmmu;
 struct Double {
     accept_buffer: bool,
     accept_image: bool,
+    accept_clear: bool,
     buffer_copies: Vec<(GpuVAddr, GpuVAddr, u64)>,
+    buffer_clears: Vec<(GpuVAddr, u64, u32)>,
     image_copies: Vec<ImageCopy>,
     queries: Vec<Query>,
     flushed: Vec<(DAddr, u64)>,
@@ -38,6 +40,17 @@ impl Rasterizer for Double {
     ) -> bool {
         self.buffer_copies.push((src, dst, size));
         self.accept_buffer
+    }
+    fn accelerate_buffer_clear(
+        &mut self,
+        _channel: ChannelId,
+        _memory: &Gmmu,
+        dst: GpuVAddr,
+        size: u64,
+        value: u32,
+    ) -> bool {
+        self.buffer_clears.push((dst, size, value));
+        self.accept_clear
     }
     fn accelerate_image_copy(
         &mut self,
@@ -442,7 +455,37 @@ fn constant_fill_writes_the_component_size() {
             rig.double.invalidated,
             [(rig.daddr(0x2000), written as u64)]
         );
+        let offered: &[_] = if size == 4 {
+            &[(0x2000, 32, 0x1122_3344)]
+        } else {
+            &[]
+        };
+        assert_eq!(rig.double.buffer_clears, offered);
     }
+}
+
+#[test]
+fn an_accepted_buffer_clear_skips_the_software_fill() {
+    let mut rig = Rig::new(GobLayout::Tegra);
+    rig.double.accept_clear = true;
+    rig.write(0x2000, &[0xee; 64]);
+    rig.addresses(0, 0x2000);
+    rig.lines(4, 1);
+    rig.remap(
+        [0, 0xdead_beef],
+        [
+            Swizzle::CONST_B,
+            Swizzle::CONST_B,
+            Swizzle::NO_WRITE,
+            Swizzle::NO_WRITE,
+        ],
+        4,
+        1,
+        2,
+    );
+    rig.launch(launch_word(PITCH, PITCH, false, true));
+    assert_eq!(rig.double.buffer_clears, [(0x2000, 32, 0xdead_beef)]);
+    assert_eq!(rig.read(0x2000, 64), [0xee; 64]);
 }
 
 #[test]
