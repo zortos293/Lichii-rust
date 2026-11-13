@@ -1753,6 +1753,20 @@ mod tests {
     }
 
     #[test]
+    fn sured_has_no_fault_predicate() {
+        let strong_gpu = 7 << 77;
+        let ignore_out_of_bounds = 1 << 84;
+        let or = 6 << 87;
+        let insn = encode(
+            Opcode::Sured,
+            Form::Bound,
+            bound(2, 0x30) | dim(3) | ra(0) | rb(4) | strong_gpu | ignore_out_of_bounds | or,
+        );
+        let ir = translate(&[insn]).unwrap();
+        assert!(ir.contains("BoundImageAtomicOr32 #0x800200c0"), "{ir}");
+    }
+
+    #[test]
     fn tex_lod_modes() {
         let tex = |l| {
             encode(
