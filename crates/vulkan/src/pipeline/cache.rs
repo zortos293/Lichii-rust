@@ -717,6 +717,40 @@ fn identity(device: &Device) -> DeviceIdentity {
     }
 }
 
+/// The disk cache at `path`, empty when it is missing, unreadable or from another device.
+fn load(path: &Path, identity: &DeviceIdentity) -> Contents {
+    let stored = match std::fs::read(path) {
+        Ok(bytes) => disk::decode(&bytes, identity),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            tracing::warn!("reading {}: {error}", path.display());
+            None
+        }
+    }
+    .unwrap_or_default();
+    if !stored.graphics.is_empty() || !stored.compute.is_empty() {
+        tracing::info!(
+            "pipeline cache: {} graphics and {} compute pipelines, {} KiB of driver cache",
+            stored.graphics.len(),
+            stored.compute.len(),
+            stored.blob.len() / 1024
+        );
+    }
+    stored
+}
+
+fn create_vk_cache(device: &Device, blob: &[u8]) -> Result<vk::PipelineCache> {
+    let info = vk::PipelineCacheCreateInfo::default().initial_data(blob);
+    // SAFETY: the blob came from this device and driver (checked by the header); drivers
+    // validate it again and start empty when they reject it.
+    unsafe {
+        device
+            .raw
+            .create_pipeline_cache(&info, None)
+            .call("vkCreatePipelineCache")
+    }
+}
+
 impl PipelineCache {
     /// Honours `settings.async_shader_compilation` and `settings.disk_shader_cache`; the disk
     /// cache lives in `disk_dir` (per title), and is off without one. `perf` receives the
@@ -733,32 +767,9 @@ impl PipelineCache {
             .map(|dir| dir.join(FILE_NAME));
         let stored = path
             .as_deref()
-            .and_then(|path| match std::fs::read(path) {
-                Ok(bytes) => disk::decode(&bytes, &identity),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                Err(error) => {
-                    tracing::warn!("reading {}: {error}", path.display());
-                    None
-                }
-            })
+            .map(|path| load(path, &identity))
             .unwrap_or_default();
-        let info = vk::PipelineCacheCreateInfo::default().initial_data(&stored.blob);
-        // SAFETY: the blob came from this device and driver (checked by the header); drivers
-        // validate it again and start empty when they reject it.
-        let vk_cache = unsafe {
-            device
-                .raw
-                .create_pipeline_cache(&info, None)
-                .call("vkCreatePipelineCache")?
-        };
-        if !stored.graphics.is_empty() || !stored.compute.is_empty() {
-            tracing::info!(
-                "pipeline cache: {} graphics and {} compute pipelines, {} KiB of driver cache",
-                stored.graphics.len(),
-                stored.compute.len(),
-                stored.blob.len() / 1024
-            );
-        }
+        let vk_cache = create_vk_cache(device, &stored.blob)?;
         let worker_count = std::thread::available_parallelism()
             .map_or(1, |n| n.get().saturating_sub(1))
             .max(1);
@@ -959,6 +970,37 @@ impl PipelineCache {
             cache_hits: shared.cache_hits.load(Ordering::Relaxed),
             loaded_bytes: self.loaded_blob_bytes,
         }
+    }
+
+    /// Opens the disk cache in `dir` (per title) for a cache created without one: merges its
+    /// driver cache into the `VkPipelineCache` and keeps its keys for [`Self::prebuild`] and
+    /// [`Self::save`]. Honours `settings.disk_shader_cache`.
+    pub fn open_disk(&mut self, dir: &Path, settings: &GraphicsSettings) -> Result<()> {
+        if !settings.disk_shader_cache {
+            return Ok(());
+        }
+        let path = dir.join(FILE_NAME);
+        let stored = load(&path, &self.identity);
+        if !stored.blob.is_empty() {
+            self.wait_for_builds();
+            let source = create_vk_cache(&self.ctx.device, &stored.blob)?;
+            // SAFETY: no build runs, so nothing else uses the destination cache; the source
+            // cache is ours and destroyed right after the merge.
+            let merged = unsafe {
+                let raw = &self.ctx.device.raw;
+                let merged = raw.merge_pipeline_caches(self.ctx.vk_cache, &[source]);
+                raw.destroy_pipeline_cache(source, None);
+                merged
+            };
+            merged.call("vkMergePipelineCaches")?;
+        }
+        self.loaded_blob_bytes = stored.blob.len();
+        self.stored = Contents {
+            blob: Vec::new(),
+            ..stored
+        };
+        self.path = Some(path);
+        Ok(())
     }
 
     /// Pipelines the disk cache named at start-up.
