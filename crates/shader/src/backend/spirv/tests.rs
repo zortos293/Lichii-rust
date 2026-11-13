@@ -209,6 +209,36 @@ fn empty_vertex_program_from_the_translator() {
     assert_eq!(positions, 1, "the vertex program writes Position");
 }
 
+/// A jump table entry that points at the scheduling word opening a bundle branches to the
+/// bundle's first instruction.
+#[test]
+fn indirect_branch_to_a_bundle_start_skips_its_scheduling_word() {
+    let exit = encode(Sass::Exit, PT | 0xf);
+    let mut env = TestEnv::new(&[
+        encode(Sass::ImnmxImm, PT | (1 << 20) | 1),
+        encode(Sass::ShlImm, PT | (2 << 20) | (1 << 8) | 2),
+        encode(
+            Sass::Ldc,
+            (4 << 48) | (2 << 36) | (0x40 << 20) | PT | (2 << 8) | 3,
+        ),
+        encode(Sass::Brx, PT | (3 << 8) | 0xf),
+        exit,
+        exit,
+        exit,
+    ]);
+    env.words[8] = 0x001f_c400_fe20_07f1;
+    env.cbuf = vec![0; 18];
+    env.cbuf[16] = 16;
+    env.cbuf[17] = 8;
+    let program = translate_env(&env);
+    emit(
+        "indirect_bundle_start",
+        &Profile::default(),
+        &RuntimeInfo::default(),
+        &program,
+    );
+}
+
 #[test]
 fn compute_program_with_shared_and_local_memory() {
     let mut s = Synthetic::new();
