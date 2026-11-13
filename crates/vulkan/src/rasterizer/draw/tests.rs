@@ -6,9 +6,9 @@ use lichii_gpu::backend::{
     GraphicsContext, IndirectDraw, QmdVersion, Rasterizer,
 };
 use lichii_gpu::engines::maxwell_3d::regs::{
-    ClearSurface, DepthMode, MAX_CONST_BUFFERS, MAX_SHADER_STAGE, PipelineBits, PrimitiveTopology,
-    RenderTargetConfigBits, RtControl, ShaderType, SurfaceClipBits, SurfaceClipBits1, TileMode,
-    VertexAttribute, VertexStreamBits,
+    DepthMode, MAX_CONST_BUFFERS, MAX_SHADER_STAGE, PipelineBits, PrimitiveTopology,
+    RenderTargetConfigBits, RtControl, ScissorTestBits, ScissorTestBits1, ShaderType,
+    SurfaceClipBits, SurfaceClipBits1, TileMode, VertexAttribute, VertexStreamBits,
 };
 use lichii_gpu::engines::maxwell_3d::{DirtyState, Regs};
 use lichii_gpu::gmmu::Gmmu;
@@ -337,11 +337,15 @@ fn tic(gpu_va: u64, width: u32, height: u32) -> [u32; 8] {
 }
 
 /// MOV32I `dest`, `value`.
-fn mov_f32(dest: u64, value: f32) -> u64 {
+fn mov_u32(dest: u64, value: u32) -> u64 {
     sass(
         Opcode::Mov32i,
-        (u64::from(value.to_bits()) << 20) | (0xf << 12) | dest,
+        (u64::from(value) << 20) | (0xf << 12) | dest,
     )
+}
+
+fn mov_f32(dest: u64, value: f32) -> u64 {
+    mov_u32(dest, value.to_bits())
 }
 
 /// Samples the texture whose handle is c[0][0x40] at (0.5, 0.5) into render target 0.
@@ -478,58 +482,6 @@ fn changed_bindless_handles_translate_again() {
         "the handle the translator read changed"
     );
     assert!(target(&mut f).iter().all(|&t| t == [50, 60, 70, 255]));
-    f.assert_no_validation_errors();
-}
-
-#[test]
-fn draws_sampling_rescaled_images_are_skipped() {
-    let Some((mut f, gmmu)) = draw_fixture() else {
-        return;
-    };
-    f.rasterizer.apply_settings(&GraphicsSettings {
-        resolution_scale: ResolutionScale::X2,
-        async_shader_compilation: false,
-        ..GraphicsSettings::default()
-    });
-    let (width, height) = (64, 320);
-    let mut clear_regs = Regs::with_defaults();
-    let rt = &mut clear_regs.rt[0];
-    rt.address_high = ((GPU_VA + TEXTURE) >> 32) as u32;
-    rt.address_low = (GPU_VA + TEXTURE) as u32;
-    rt.width = width;
-    rt.height = height;
-    rt.format = 0xd5;
-    rt.tile_mode = TileMode(1 << 4);
-    rt.bits = RenderTargetConfigBits(1);
-    clear_regs.rt_control = RtControl(1);
-    clear_regs.clear_surface = ClearSurface(0b1111 << 2);
-    clear_regs.clear_color = [0.0, 1.0, 0.0, 1.0];
-    let mut dirty = DirtyState::new();
-    let const_buffers = const_buffers();
-    let root_tables = [[0; 64]; 8];
-    let mut ctx = GraphicsContext {
-        channel: ChannelId(0),
-        memory: &gmmu,
-        regs: &clear_regs,
-        dirty: &mut dirty,
-        const_buffers: &const_buffers,
-        root_tables: &root_tables,
-    };
-    f.rasterizer.clear(&mut ctx, 1);
-
-    write(&f, PROGRAMS + u64::from(FRAGMENT), &sampling_program());
-    let header = tic(GPU_VA + TEXTURE, width, height);
-    write(&f, TIC, bytemuck::cast_slice(&header));
-    draw(&mut f, &gmmu, &sampling_regs());
-    assert_ne!(
-        f.rasterizer.draw.warned & Warning::RescaledTexture as u32,
-        0,
-        "the rescaled texture was refused"
-    );
-    assert!(
-        target(&mut f).iter().all(|&t| t == [0; 4]),
-        "nothing was drawn"
-    );
     f.assert_no_validation_errors();
 }
 
@@ -759,70 +711,6 @@ fn draw_texture_maps_sub_rects_with_the_sampler_filter() {
 }
 
 #[test]
-fn draw_texture_skips_rescaled_sources() {
-    let Some((mut f, gmmu)) = draw_fixture() else {
-        return;
-    };
-    f.rasterizer.apply_settings(&GraphicsSettings {
-        resolution_scale: ResolutionScale::X2,
-        async_shader_compilation: false,
-        ..GraphicsSettings::default()
-    });
-    let (width, height) = (64, 320);
-    let mut clear_regs = Regs::with_defaults();
-    let rt = &mut clear_regs.rt[0];
-    rt.address_high = ((GPU_VA + TEXTURE) >> 32) as u32;
-    rt.address_low = (GPU_VA + TEXTURE) as u32;
-    rt.width = width;
-    rt.height = height;
-    rt.format = 0xd5;
-    rt.tile_mode = TileMode(1 << 4);
-    rt.bits = RenderTargetConfigBits(1);
-    clear_regs.rt_control = RtControl(1);
-    clear_regs.clear_surface = ClearSurface(0b1111 << 2);
-    clear_regs.clear_color = [0.0, 1.0, 0.0, 1.0];
-    let mut dirty = DirtyState::new();
-    let const_buffers = const_buffers();
-    let root_tables = [[0; 64]; 8];
-    let mut ctx = GraphicsContext {
-        channel: ChannelId(0),
-        memory: &gmmu,
-        regs: &clear_regs,
-        dirty: &mut dirty,
-        const_buffers: &const_buffers,
-        root_tables: &root_tables,
-    };
-    f.rasterizer.clear(&mut ctx, 1);
-    write(
-        &f,
-        TIC,
-        bytemuck::cast_slice(&tic(GPU_VA + TEXTURE, width, height)),
-    );
-    let draw = DrawTexture {
-        dst_x0: 0.0,
-        dst_y0: 0.0,
-        dst_x1: 16.0,
-        dst_y1: 16.0,
-        src_x0: 0.0,
-        src_y0: 0.0,
-        src_x1: 16.0,
-        src_y1: 16.0,
-        texture: 0,
-        sampler: 0,
-    };
-    draw_texture(&mut f, &gmmu, &sampling_regs(), draw);
-    assert_ne!(
-        f.rasterizer.draw.warned & Warning::RescaledTexture as u32,
-        0
-    );
-    assert!(
-        target(&mut f).iter().all(|&t| t == [0; 4]),
-        "nothing was drawn"
-    );
-    f.assert_no_validation_errors();
-}
-
-#[test]
 fn draw_texture_skips_integer_sources() {
     let Some((mut f, gmmu)) = draw_fixture() else {
         return;
@@ -882,4 +770,389 @@ fn full_rect(size: f32) -> DrawTexture {
         texture: 0,
         sampler: 0,
     }
+}
+
+/// The guest size of the render target at `TEXTURE` the rescaling tests render at 2x: tall
+/// enough to rescale.
+const SOURCE: (u32, u32) = (64, 320);
+const GREEN: [u8; 4] = [0, 255, 0, 255];
+const BLUE: [u8; 4] = [0, 0, 255, 255];
+/// Where the rescaling tests place the fragment programs that read the source.
+const READER: u32 = 0x400;
+
+/// `draw_fixture` at 2x resolution scale.
+fn rescaled_fixture() -> Option<(Fixture, Gmmu)> {
+    let (mut f, gmmu) = draw_fixture()?;
+    f.rasterizer.apply_settings(&GraphicsSettings {
+        resolution_scale: ResolutionScale::X2,
+        async_shader_compilation: false,
+        ..GraphicsSettings::default()
+    });
+    Some((f, gmmu))
+}
+
+/// `draw_regs` rendering into the `width`x`height` A8B8G8R8 target at `offset`.
+fn target_regs(offset: u64, (width, height): (u32, u32)) -> Box<Regs> {
+    let mut regs = sampling_regs();
+    let rt = &mut regs.rt[0];
+    rt.address_high = ((GPU_VA + offset) >> 32) as u32;
+    rt.address_low = (GPU_VA + offset) as u32;
+    rt.width = width;
+    rt.height = height;
+    regs.surface_clip.bits = SurfaceClipBits(width << 16);
+    regs.surface_clip.bits1 = SurfaceClipBits1(height << 16);
+    let viewport = &mut regs.viewport_transform[0];
+    viewport.scale_x = width as f32 / 2.0;
+    viewport.translate_x = width as f32 / 2.0;
+    viewport.scale_y = height as f32 / 2.0;
+    viewport.translate_y = height as f32 / 2.0;
+    regs
+}
+
+/// Renders `color` into guest texels [x0, x1) x [y0, y1) of the source target, under a
+/// scissor.
+fn paint(f: &mut Fixture, gmmu: &Gmmu, [x0, y0, x1, y1]: [u32; 4], color: [u8; 4]) {
+    let mut regs = target_regs(TEXTURE, SOURCE);
+    let scissor = &mut regs.scissor_test[0];
+    scissor.enable = 1;
+    scissor.bits = ScissorTestBits(x0 | x1 << 16);
+    scissor.bits1 = ScissorTestBits1(y0 | y1 << 16);
+    write(f, PROGRAMS + u64::from(FRAGMENT), &fragment_program([0, 4]));
+    write(
+        f,
+        FRAGMENT_CBUF,
+        &f32_bytes(&color.map(|c| f32::from(c) / 255.0)),
+    );
+    f.rasterizer.invalidate_region(DADDR + FRAGMENT_CBUF, 16);
+    draw(f, gmmu, &regs);
+}
+
+/// The source target painted green with its top-left quarter, [0, 32) x [0, 160), blue, bound
+/// as texture header 0.
+fn paint_source(f: &mut Fixture, gmmu: &Gmmu) {
+    paint(f, gmmu, [0, 0, SOURCE.0, SOURCE.1], GREEN);
+    paint(f, gmmu, [0, 0, 32, 160], BLUE);
+    let header = tic(GPU_VA + TEXTURE, SOURCE.0, SOURCE.1);
+    write(f, TIC, bytemuck::cast_slice(&header));
+}
+
+/// Draws the 16x16 target with `code` as the fragment program and the texture handle
+/// `handle` in c[0][0x40].
+fn read_with(f: &mut Fixture, gmmu: &Gmmu, regs: &mut Regs, code: &[u8], handle: u32) {
+    let at = PROGRAMS + u64::from(READER);
+    write(f, at, code);
+    f.rasterizer
+        .invalidate_region(DADDR + at, code.len() as u64);
+    write(f, FRAGMENT_CBUF + 0x40, &handle.to_le_bytes());
+    f.rasterizer
+        .invalidate_region(DADDR + FRAGMENT_CBUF + 0x40, 4);
+    regs.pipelines[5].offset = READER;
+    regs.tex_sampler.limit = 1;
+    draw(f, gmmu, regs);
+}
+
+/// TLDS.LZ of the 2D texture whose handle is c[0][`handle`] at integer texel (R`x`, R`y`),
+/// storing the components `swizzle` selects as F32 from R`dest` (and R`dest_b`).
+fn tlds(handle: u64, (x, y): (u64, u64), dest: u64, dest_b: u64, swizzle: u64) -> u64 {
+    sass(
+        Opcode::Tlds,
+        (1 << 59)
+            | (2 << 53)
+            | (swizzle << 50)
+            | (handle / 4) << 36
+            | dest_b << 28
+            | y << 20
+            | x << 8
+            | dest,
+    )
+}
+
+/// Fetches texel (`x`, `y`) of the texture c[0][0x40] into render target 0.
+fn fetch_program(x: u32, y: u32) -> Vec<u8> {
+    let mut header = header(2, ShaderType::PIXEL);
+    header[18] = 0xf;
+    let fetch = tlds(0x40, (4, 5), 0, 2, 4);
+    program(header, &[mov_u32(4, x), mov_u32(5, y), fetch, exit()])
+}
+
+/// Samples level 0 of the texture whose handle is c[0][0x40] at (`u`, `v`) into render target 0
+/// (TEX.LZ).
+fn filter_program(u: f32, v: f32) -> Vec<u8> {
+    let mut header = header(2, ShaderType::PIXEL);
+    header[18] = 0xf;
+    let tex = sass(
+        Opcode::Tex,
+        (1 << 55) | (0x10 << 36) | (7 << 51) | (0b1111 << 31) | (2 << 28) | (2 << 8),
+    );
+    program(header, &[mov_f32(2, u), mov_f32(3, v), tex, exit()])
+}
+
+/// Writes size component `component` (0 width, 1 height) of the texture c[0][0x40], as TXQ
+/// returns it, to render target 0.
+fn query_program(component: u32) -> Vec<u8> {
+    let mut header = header(2, ShaderType::PIXEL);
+    header[18] = 0xf;
+    let txq = sass(
+        Opcode::Txq,
+        (0x10 << 36) | (1 << (31 + component)) | (1 << 22) | (RZ << 8),
+    );
+    program(header, &[txq, exit()])
+}
+
+#[test]
+fn texture_scaling_bits_number_descriptors_across_stages() {
+    let mut scaling = super::TextureScaling::default();
+    scaling.set(1);
+    scaling.next_stage(3);
+    scaling.set(0);
+    scaling.next_stage(1);
+    scaling.next_stage(30);
+    scaling.set(0);
+    scaling.set(2);
+    scaling.set(200);
+    assert_eq!(
+        scaling.words,
+        [1 << 1 | 1 << 3, 1 << (34 - 32) | 1 << (36 - 32), 0, 0],
+        "bit 1 + 3 * 0, then 3 + 0, then 34 + 0 and 34 + 2; past 128 bits nothing"
+    );
+}
+
+#[test]
+fn draws_fetch_texels_of_rescaled_targets_at_guest_coordinates() {
+    let Some((mut f, gmmu)) = rescaled_fixture() else {
+        return;
+    };
+    paint_source(&mut f, &gmmu);
+    for (x, y, want) in [
+        (0, 0, BLUE),
+        (31, 159, BLUE),
+        (32, 159, GREEN),
+        (31, 160, GREEN),
+        (63, 319, GREEN),
+    ] {
+        read_with(&mut f, &gmmu, &mut sampling_regs(), &fetch_program(x, y), 0);
+        assert!(
+            target(&mut f).iter().all(|&t| t == want),
+            "texel ({x}, {y}) is {want:?}: {:?}",
+            target(&mut f)[0]
+        );
+    }
+    let source = f.rasterizer.draw.textures[0];
+    let scale = |f: &Fixture, id| f.rasterizer.texture_cache.state(id).map(|s| s.scale);
+    assert!(
+        scale(&f, source) == Some(ResolutionScale::X2),
+        "the source renders at 2x"
+    );
+    let target_id = f.rasterizer.draw.colors[0].expect("a bound target").id;
+    assert!(
+        scale(&f, target_id) == Some(ResolutionScale::X1),
+        "the 16x16 target is too small to rescale, so scales differ"
+    );
+    assert_eq!(f.rasterizer.draw.texture_scaling.words, [1, 0, 0, 0]);
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn draws_query_rescaled_textures_at_their_guest_size() {
+    let Some((mut f, gmmu)) = rescaled_fixture() else {
+        return;
+    };
+    paint_source(&mut f, &gmmu);
+    let mut regs = sampling_regs();
+    regs.rt[0].format = 0xe4;
+    for (component, want) in [(0, SOURCE.0), (1, SOURCE.1)] {
+        read_with(&mut f, &gmmu, &mut regs, &query_program(component), 0);
+        let texels = target(&mut f);
+        assert!(
+            texels.iter().all(|&t| u32::from_le_bytes(t) == want),
+            "size component {component} is {want}: {}",
+            u32::from_le_bytes(texels[0])
+        );
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn draws_sample_images_rescaled_at_an_earlier_scale_at_the_new_scale() {
+    let Some((mut f, gmmu)) = rescaled_fixture() else {
+        return;
+    };
+    paint_source(&mut f, &gmmu);
+    f.rasterizer.apply_settings(&GraphicsSettings {
+        resolution_scale: ResolutionScale::X3,
+        async_shader_compilation: false,
+        ..GraphicsSettings::default()
+    });
+    let mut regs = sampling_regs();
+    regs.rt[0].format = 0xe4;
+    for (component, want) in [(0, SOURCE.0), (1, SOURCE.1)] {
+        read_with(&mut f, &gmmu, &mut regs, &query_program(component), 0);
+        assert!(
+            target(&mut f)
+                .iter()
+                .all(|&t| u32::from_le_bytes(t) == want),
+            "size component {component} is {want} after the scale change"
+        );
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn draws_filter_rescaled_textures_at_guest_coordinates() {
+    let Some((mut f, gmmu)) = rescaled_fixture() else {
+        return;
+    };
+    paint_source(&mut f, &gmmu);
+    let mut linear_tsc = [0u32; 8];
+    linear_tsc[1] = 2 | 2 << 4;
+    write(&f, TSC + 32, bytemuck::cast_slice(&linear_tsc));
+    let half = [0, 128, 128, 255];
+    let (w, h) = (SOURCE.0 as f32, SOURCE.1 as f32);
+    for (u, v, want) in [
+        (31.5 / w, 0.5 / h, BLUE),
+        (32.5 / w, 0.5 / h, GREEN),
+        (32.0 / w, 0.5 / h, half),
+        (0.5 / w, 160.0 / h, half),
+        (0.5 / w, 160.5 / h, GREEN),
+    ] {
+        read_with(
+            &mut f,
+            &gmmu,
+            &mut sampling_regs(),
+            &filter_program(u, v),
+            1 << 20,
+        );
+        let texels = target(&mut f);
+        assert!(
+            texels
+                .iter()
+                .all(|&t| (0..4).all(|c| t[c].abs_diff(want[c]) <= 1)),
+            "({u}, {v}) filters to {want:?}: {:?}",
+            texels[0]
+        );
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn draws_set_the_scaling_bit_of_each_rescaled_descriptor() {
+    let Some((mut f, gmmu)) = rescaled_fixture() else {
+        return;
+    };
+    paint_source(&mut f, &gmmu);
+    uniform_texture(&f, 1, OTHER_TEXTURE, [10, 200, 30, 255]);
+    write(&f, FRAGMENT_CBUF + 0x44, &0u32.to_le_bytes());
+    let mut header = header(2, ShaderType::PIXEL);
+    header[18] = 0xf;
+    let code = program(
+        header,
+        &[
+            mov_u32(4, 3),
+            mov_u32(5, 3),
+            mov_u32(6, 32),
+            mov_u32(7, 159),
+            tlds(0x40, (4, 5), 0, RZ, 4),
+            tlds(0x44, (6, 7), 2, RZ, 7),
+            exit(),
+        ],
+    );
+    read_with(&mut f, &gmmu, &mut sampling_regs(), &code, 1);
+    assert_eq!(
+        f.rasterizer.draw.texture_scaling.words,
+        [0b10, 0, 0, 0],
+        "c[0][0x40] is the unscaled texture 1, c[0][0x44] the 2x source"
+    );
+    assert!(
+        target(&mut f)
+            .iter()
+            .all(|&t| t == [10, 200, GREEN[2], GREEN[3]]),
+        "red and green of the unscaled texture, blue and alpha of source texel (32, 159): {:?}",
+        target(&mut f)[0]
+    );
+    f.assert_no_validation_errors();
+}
+
+/// Renders source texel (x, y) of [0, 4) x [0, 4) as `source_texel` into the green source.
+fn paint_texels(f: &mut Fixture, gmmu: &Gmmu) {
+    paint(f, gmmu, [0, 0, SOURCE.0, SOURCE.1], GREEN);
+    for y in 0..4 {
+        for x in 0..4 {
+            paint(f, gmmu, [x, y, x + 1, y + 1], source_texel(x, y));
+        }
+    }
+    let header = tic(GPU_VA + TEXTURE, SOURCE.0, SOURCE.1);
+    write(f, TIC, bytemuck::cast_slice(&header));
+}
+
+/// The painted source at guest texel (x, y).
+fn painted(x: u32, y: u32) -> [u8; 4] {
+    if x < 4 && y < 4 {
+        source_texel(x, y)
+    } else {
+        GREEN
+    }
+}
+
+/// The `width`x`height` target at `offset` after writing it back to guest memory.
+fn read_target(f: &mut Fixture, offset: u64, (width, height): (u32, u32)) -> Vec<[u8; 4]> {
+    let tiling = Tiling::new(width, height, 1, 4, 1, 0, GobLayout::Tegra);
+    f.rasterizer
+        .flush_region(DADDR + offset, tiling.size_bytes() as u64);
+    guest_linear(f, DADDR + offset, &tiling)
+        .as_chunks::<4>()
+        .0
+        .to_vec()
+}
+
+#[test]
+fn draw_texture_reads_rescaled_sources_exactly() {
+    let Some((mut f, gmmu)) = rescaled_fixture() else {
+        return;
+    };
+    paint_texels(&mut f, &gmmu);
+    let rect = |dst: [f32; 4], src: [f32; 4]| DrawTexture {
+        dst_x0: dst[0],
+        dst_y0: dst[1],
+        dst_x1: dst[2],
+        dst_y1: dst[3],
+        src_x0: src[0],
+        src_y0: src[1],
+        src_x1: src[2],
+        src_y1: src[3],
+        texture: 0,
+        sampler: 0,
+    };
+    let draws = [
+        rect([0.0, 0.0, 4.0, 4.0], [0.0, 0.0, 4.0, 4.0]),
+        rect([8.0, 8.0, 16.0, 16.0], [0.0, 0.0, 4.0, 4.0]),
+        rect([0.0, 8.0, 4.0, 12.0], [2.0, 2.0, 6.0, 6.0]),
+    ];
+    let want = |x: u32, y: u32| {
+        if x < 4 && y < 4 {
+            painted(x, y)
+        } else if x >= 8 && (8..16).contains(&y) && x < 16 {
+            painted((x - 8) / 2, (y - 8) / 2)
+        } else if x < 4 && (8..12).contains(&y) {
+            painted(x + 2, y - 6)
+        } else {
+            [0; 4]
+        }
+    };
+    // Into the 16x16 target, too small to rescale, then into a 64x320 one rendered at 2x.
+    let targets = [(0, (SIZE, SIZE)), (OTHER_TEXTURE, SOURCE)];
+    for (offset, size) in targets {
+        let regs = target_regs(offset, size);
+        for draw in draws {
+            draw_texture(&mut f, &gmmu, &regs, draw);
+        }
+        let texels = read_target(&mut f, offset, size);
+        for (i, &texel) in texels.iter().enumerate() {
+            let (x, y) = (i as u32 % size.0, i as u32 / size.0);
+            assert_eq!(texel, want(x, y), "texel ({x}, {y}) of the {size:?} target");
+        }
+    }
+    let scale = |f: &Fixture, id| f.rasterizer.texture_cache.state(id).map(|s| s.scale);
+    let target_id = f.rasterizer.draw.colors[0].expect("a bound target").id;
+    assert!(scale(&f, target_id) == Some(ResolutionScale::X2));
+    f.assert_no_validation_errors();
 }
