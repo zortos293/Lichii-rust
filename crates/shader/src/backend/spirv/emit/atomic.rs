@@ -327,6 +327,22 @@ pub(super) fn shared_atomic_exchange32x2(
     shared_exchange_words(ctx, offset, value)
 }
 
+pub(super) fn shared_atomic_compare_exchange32(
+    ctx: &mut EmitContext<'_>,
+    inst: InstId,
+) -> EmitResult<Word> {
+    let offset = ctx.def_arg(inst, 0)?;
+    let comparator = ctx.def_arg(inst, 1)?;
+    let value = ctx.def_arg(inst, 2)?;
+    let pointer = shared_pointer(ctx, offset, 0)?;
+    let u32_t = ctx.u32[1];
+    let scope = ctx.const_u32(Scope::Device as u32);
+    let semantics = ctx.u32_zero_value;
+    Ok(ctx.b.atomic_compare_exchange(
+        u32_t, None, pointer, scope, semantics, semantics, value, comparator,
+    )?)
+}
+
 pub(super) fn global_atomic_i_add32(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
     global_atomic(ctx, inst, GlobalAtomic::IAdd)
 }
