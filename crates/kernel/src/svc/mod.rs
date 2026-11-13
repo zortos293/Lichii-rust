@@ -217,6 +217,9 @@ pub(crate) fn dispatch(svc: &mut SvcContext, imm: u32) -> Flow {
         0x4b => memory::create_code_memory(svc),
         0x4c => memory::control_code_memory(svc),
         0x6f => info::get_system_info(svc),
+        0x73 => memory::set_process_memory_permission(svc),
+        0x77 => memory::map_process_code_memory(svc),
+        0x78 => memory::unmap_process_code_memory(svc),
         0x80 => memory::set_gpu_memory_attribute(svc),
         _ => {
             tracing::warn!(svc = imm, "unimplemented supervisor call");

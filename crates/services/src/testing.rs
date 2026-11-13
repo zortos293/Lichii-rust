@@ -162,6 +162,10 @@ impl Guest {
         }
     }
 
+    pub fn kernel(&self) -> &lichii_kernel::Kernel {
+        &self.context.kernel
+    }
+
     /// Another client thread in the title's process; it shares the process's handles.
     pub fn other_client(&self) -> IpcClient {
         IpcClient::new(&self.context.kernel, &self.process)

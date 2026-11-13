@@ -2297,6 +2297,106 @@ fn draw_per_invocation_table_handles(quad_divergent_implicit_lod: bool) {
     f.assert_no_validation_errors();
 }
 
+fn cache_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("lichii-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+/// `draw_fixture` with the disk cache in `dir` and the fragment program `fragment`.
+fn disk_fixture(dir: &std::path::Path, fragment: [u64; 2]) -> Option<(Fixture, Gmmu)> {
+    let (mut f, gmmu) = draw_fixture()?;
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program(fragment),
+    );
+    f.rasterizer
+        .open_disk_cache(dir, &GraphicsSettings::default())
+        .unwrap();
+    Some((f, gmmu))
+}
+
+#[test]
+fn the_disk_cache_serves_programs_and_pipelines_of_an_earlier_run() {
+    let dir = cache_dir("disk-shaders");
+    let Some((mut f, gmmu)) = disk_fixture(&dir, [0, 4]) else {
+        return;
+    };
+    draw(&mut f, &gmmu, &draw_regs());
+    let stats = f.rasterizer.draw.shaders.stats();
+    assert_eq!((stats.translated, stats.disk_hits), (2, 0));
+    f.assert_no_validation_errors();
+    drop(f);
+    let file = std::fs::read(dir.join("shaders.bin")).unwrap();
+    assert!(
+        file.len() > lichii_shader::cache::HEADER_LEN,
+        "both programs were written"
+    );
+
+    let (mut f, gmmu) = disk_fixture(&dir, [0, 4]).unwrap();
+    f.rasterizer.draw.pipelines.wait_for_builds();
+    assert_eq!(
+        f.rasterizer.draw.pipelines.stats().built,
+        1,
+        "the pipeline is built from the stored modules before any draw"
+    );
+    draw(&mut f, &gmmu, &draw_regs());
+    let stats = f.rasterizer.draw.shaders.stats();
+    assert_eq!((stats.translated, stats.disk_hits), (0, 2));
+    assert_eq!(f.rasterizer.draw.pipelines.stats().built, 1);
+    assert!(target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]));
+    f.assert_no_validation_errors();
+    drop(f);
+
+    let (mut f, gmmu) = disk_fixture(&dir, [4, 0]).unwrap();
+    draw(&mut f, &gmmu, &draw_regs());
+    let stats = f.rasterizer.draw.shaders.stats();
+    assert_eq!(
+        (stats.translated, stats.disk_hits),
+        (1, 1),
+        "a changed fragment program translates again; the vertex program is reused"
+    );
+    assert!(target(&mut f).iter().all(|&t| t == [128, 255, 0, 255]));
+    f.assert_no_validation_errors();
+    drop(f);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn stale_or_damaged_shader_cache_files_are_replaced_or_cut() {
+    let dir = cache_dir("stale-shaders");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("shaders.bin");
+    std::fs::write(&path, b"not a shader cache").unwrap();
+    let Some((mut f, gmmu)) = disk_fixture(&dir, [0, 4]) else {
+        return;
+    };
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        lichii_shader::cache::header(),
+        "a stale file starts over"
+    );
+    draw(&mut f, &gmmu, &draw_regs());
+    drop(f);
+    let good = std::fs::read(&path).unwrap();
+    let mut damaged = good.clone();
+    damaged.extend_from_slice(&[0xff; 7]);
+    std::fs::write(&path, &damaged).unwrap();
+
+    let (mut f, gmmu) = disk_fixture(&dir, [0, 4]).unwrap();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        good,
+        "the damaged tail is cut"
+    );
+    draw(&mut f, &gmmu, &draw_regs());
+    assert_eq!(f.rasterizer.draw.shaders.stats().disk_hits, 2);
+    f.assert_no_validation_errors();
+    drop(f);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// An Ampere `op` in `form` with the other bits from `fields`, guarded by PT.
 fn ampere(op: AmpereOpcode, form: Form, fields: u128) -> u128 {
     let opcode = (0..4096u128)
