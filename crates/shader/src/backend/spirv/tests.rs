@@ -23,6 +23,7 @@ use crate::{Profile, RuntimeInfo, ShaderInfo, ShaderStage};
 
 mod arith;
 mod image;
+mod mesh;
 
 const PT: u64 = 7 << 16;
 
@@ -37,7 +38,7 @@ fn target_env(profile: &Profile) -> &'static str {
 
 /// Runs spirv-val on `code`; a machine without it prints a skip line and passes. Constant
 /// buffers are word arrays, so validation assumes `uniformBufferStandardLayout` (Vulkan 1.2 core).
-fn validate(name: &str, profile: &Profile, code: &[u32]) {
+pub(crate) fn validate(name: &str, profile: &Profile, code: &[u32]) {
     let path: PathBuf =
         std::env::temp_dir().join(format!("lichii-spirv-{name}-{}.spv", std::process::id()));
     let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -71,7 +72,8 @@ fn validate(name: &str, profile: &Profile, code: &[u32]) {
     );
 }
 
-fn emit(
+/// Emits `program` and validates the module with spirv-val.
+pub(crate) fn emit(
     name: &str,
     profile: &Profile,
     runtime: &RuntimeInfo,

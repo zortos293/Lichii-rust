@@ -5,15 +5,15 @@ use lichii_common::settings::ResolutionScale;
 
 use std::hash::{Hash, Hasher};
 
+use crate::ampere::{AmpereFlow, GRAPHICS_HEADER_SIZE};
 use crate::flow::Cfg;
 use crate::flow::structure::{StructureOptions, structure};
 use crate::hash::Recorder;
 use crate::info::{Interpolation, StorageBufferDescriptor, StorageWriteExtent};
 use crate::ir::{Attribute, Opcode, Program, SyntaxNode};
 use crate::maxwell::flow::MaxwellFlow;
-use crate::maxwell::header::{OutputTopology, PixelImap, ProgramHeader};
+use crate::maxwell::header::{OutputTopology, PixelImap, ProgramHeader, SystemValuesC};
 use crate::maxwell::passthrough::{lower_geometry_passthrough, output_topology_vertices};
-use crate::maxwell::translate::translate_block;
 use crate::opt;
 use crate::profile::HostTranslateInfo;
 use crate::{Profile, ShaderArch, ShaderEnvironment, ShaderInfo, ShaderStage, TranslateError};
@@ -22,8 +22,13 @@ use crate::{Profile, ShaderArch, ShaderEnvironment, ShaderInfo, ShaderStage, Tra
 /// from older builds stop matching.
 pub const TRANSLATOR_VERSION: u32 = 1;
 
-/// Size of the Maxwell program header in front of a graphics program's first instruction.
-const HEADER_SIZE: u64 = 0x50;
+/// Bytes between a graphics program's program header and its first instruction.
+fn header_size(env: &dyn ShaderEnvironment) -> u64 {
+    match env.arch() {
+        ShaderArch::Maxwell => 0x50,
+        ShaderArch::Ampere => GRAPHICS_HEADER_SIZE,
+    }
+}
 
 /// A translated program: optimized SSA IR and what the backend needs to emit it.
 #[derive(Clone, Debug)]
@@ -166,7 +171,7 @@ fn translate_recorded(
             let sph = header(env)?;
             program.output_topology =
                 sph.output_topology().ok_or(TranslateError::InvalidHeader {
-                    address: env.start_address() - HEADER_SIZE,
+                    address: env.start_address() - header_size(env),
                 })?;
             program.output_vertices = sph.max_output_vertices();
             program.invocations = sph.threads_per_input_primitive();
@@ -200,6 +205,31 @@ fn translate_recorded(
             program.workgroup_size = env.workgroup_size();
             program.shared_memory_size = env.shared_memory_size();
         }
+        ShaderStage::Task | ShaderStage::Mesh => {
+            let state = env
+                .mesh_state()
+                .ok_or(TranslateError::MissingMeshState { stage })?;
+            let init = state.init_shader;
+            let lines = ((init >> 12) & 0x1ff).max((init >> 22) & 0x1ff);
+            let mesh = &mut program.info.mesh;
+            mesh.payload_words = lines.max(1) * 32;
+            mesh.topology = state.shader_a & 0xf;
+            mesh.max_vertices = (state.shader_a >> 4) & 0x1ff;
+            mesh.max_primitives = (state.shader_a >> 13) & 0x3ff;
+            let threads = if stage == ShaderStage::Task {
+                init & 0x3f
+            } else {
+                (state.shader_b >> 20) & 0x3f
+            };
+            program.workgroup_size = [threads.max(1), 1, 1];
+            if stage == ShaderStage::Mesh {
+                if !matches!(mesh.topology, 0 | 1 | 4) {
+                    return Err(TranslateError::UnsupportedMesh("output topology"));
+                }
+                mesh.vertex_lines = mesh_lines(&header(env)?)?;
+                mesh.primitive_lines = mesh_lines(&state.primitive_header)?;
+            }
+        }
         _ => {}
     }
     remove_unreachable_blocks(&mut program.ir);
@@ -213,12 +243,34 @@ fn translate_recorded(
     Ok(program)
 }
 
+/// The attributes a mesh program's stage buffer lines hold, in line order: the system values
+/// from PrimitiveId on, then the generic components, as `header`'s output map lists them.
+fn mesh_lines(header: &ProgramHeader) -> Result<Vec<u32>, TranslateError> {
+    let vtg = header.vtg();
+    if vtg.omap_system_c().intersects(SystemValuesC::all()) {
+        return Err(TranslateError::UnsupportedMesh(
+            "outputs past the generic attributes",
+        ));
+    }
+    let system = vtg.omap_system_b().bits();
+    let system_lines = (0..8)
+        .filter(|bit| system >> bit & 1 != 0)
+        .map(|bit| u32::from(Attribute::PRIMITIVE_ID.0) + bit);
+    let generic_lines = (0..Attribute::NUM_GENERICS as usize).flat_map(|generic| {
+        let mask = vtg.output_generic(generic);
+        (0..4u16)
+            .filter(move |&element| mask[element as usize])
+            .map(move |element| u32::from(Attribute::generic(generic as u16, element).0))
+    });
+    Ok(system_lines.chain(generic_lines).collect())
+}
+
 fn header(env: &dyn ShaderEnvironment) -> Result<ProgramHeader, TranslateError> {
     let start = env.start_address();
-    if start < HEADER_SIZE {
+    if start < header_size(env) {
         return Err(TranslateError::InvalidHeader { address: start });
     }
-    Ok(ProgramHeader::read(env, start - HEADER_SIZE))
+    Ok(ProgramHeader::read(env, start - header_size(env)))
 }
 
 /// Decodes, structures and translates the program into `ir`, then orders its blocks.
@@ -228,22 +280,31 @@ fn build(
     ir: &mut Program,
 ) -> Result<(), TranslateError> {
     let stage = env.stage();
-    let cfg = match env.arch() {
+    let arch = env.arch();
+    let base = env.start_address();
+    let cfg = match arch {
         ShaderArch::Maxwell => {
-            let isa = MaxwellFlow {
-                base: env.start_address(),
-            };
-            Cfg::build(&isa, env, 0, stage == ShaderStage::VertexA)?
+            Cfg::build(&MaxwellFlow { base }, env, 0, stage == ShaderStage::VertexA)?
         }
-        arch => return Err(TranslateError::UnsupportedProgram { arch, stage }),
+        ShaderArch::Ampere => Cfg::build(&AmpereFlow { base }, env, 0, false)?,
     };
     let options = StructureOptions {
         converge_exits: matches!(stage, ShaderStage::Task | ShaderStage::Mesh),
         reorder_demotes: host.needs_demote_reorder,
     };
-    structure(ir, &cfg, options, &mut |prog, block, begin, end| {
-        translate_block(prog, block, env, begin, end)
-    })?;
+    structure(
+        ir,
+        &cfg,
+        options,
+        &mut |prog, block, begin, end| match arch {
+            ShaderArch::Maxwell => {
+                crate::maxwell::translate::translate_block(prog, block, env, begin, end)
+            }
+            ShaderArch::Ampere => {
+                crate::ampere::translate::translate_block(prog, block, env, begin, end)
+            }
+        },
+    )?;
     opt::compute_post_order(ir);
     Ok(())
 }
@@ -303,6 +364,16 @@ fn optimize(
         opt::verify(ir).map_err(TranslateError::InvalidIr)?;
     }
     opt::collect_shader_info(env, ir, info);
+    if stage == ShaderStage::Mesh {
+        for &line in info
+            .mesh
+            .vertex_lines
+            .iter()
+            .chain(&info.mesh.primitive_lines)
+        {
+            info.stores.set(Attribute(line as u16), true);
+        }
+    }
     opt::layer(ir, stage, info, host);
     opt::vendor_workaround(ir);
     collect_interpolation_info(env, info)?;

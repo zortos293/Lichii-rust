@@ -6,7 +6,7 @@ use crate::ir::{Emitter, FmzMode, FpCompare, FpControl, FpRounding, Value};
 
 /// Maxwell's 2-bit denormal field of FFMA and FMUL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum DenormMode {
+pub(crate) enum DenormMode {
     Keep,
     Ftz,
     /// D3D9 multiply: FTZ plus `x * 0 == 0` for every x, emulated with a select.
@@ -14,7 +14,7 @@ pub(super) enum DenormMode {
 }
 
 impl DenormMode {
-    pub(super) const fn from_bits(bits: u64) -> Option<DenormMode> {
+    pub(crate) const fn from_bits(bits: u64) -> Option<DenormMode> {
         match bits & 3 {
             0 => Some(DenormMode::Keep),
             1 => Some(DenormMode::Ftz),
@@ -23,7 +23,7 @@ impl DenormMode {
         }
     }
 
-    pub(super) const fn ir_mode(self) -> FmzMode {
+    pub(crate) const fn ir_mode(self) -> FmzMode {
         match self {
             DenormMode::Keep => FmzMode::None,
             DenormMode::Ftz | DenormMode::Fmz => FmzMode::Ftz,
@@ -32,7 +32,7 @@ impl DenormMode {
 }
 
 /// Whether either factor compares (ordered) equal to zero, for the FMZ emulation.
-pub(super) fn any_zero(ir: &mut Emitter<'_>, a: Value, b: Value, zero: Value) -> Value {
+pub(crate) fn any_zero(ir: &mut Emitter<'_>, a: Value, b: Value, zero: Value) -> Value {
     let zero_a = ir.fp_compare(FpCompare::Equal, a, zero, true, FpControl::default());
     let zero_b = ir.fp_compare(FpCompare::Equal, b, zero, true, FpControl::default());
     ir.logical_or(zero_a, zero_b)

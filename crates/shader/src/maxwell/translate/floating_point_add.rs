@@ -4,7 +4,7 @@ use super::{TResult, Translator};
 use crate::ir::{FmzMode, FpControl, FpRounding, Value};
 
 /// Maxwell's 2-bit rounding field (RN, RM, RP, RZ).
-pub(super) const fn fp_rounding(bits: u64) -> FpRounding {
+pub(crate) const fn fp_rounding(bits: u64) -> FpRounding {
     match bits & 3 {
         0 => FpRounding::Rn,
         1 => FpRounding::Rm,
@@ -13,7 +13,7 @@ pub(super) const fn fp_rounding(bits: u64) -> FpRounding {
     }
 }
 
-pub(super) const fn ftz_mode(ftz: bool) -> FmzMode {
+pub(crate) const fn ftz_mode(ftz: bool) -> FmzMode {
     if ftz { FmzMode::Ftz } else { FmzMode::None }
 }
 
