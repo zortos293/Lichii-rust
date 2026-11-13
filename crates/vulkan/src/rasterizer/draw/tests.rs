@@ -973,7 +973,7 @@ fn draws_query_rescaled_textures_at_their_guest_size() {
 }
 
 #[test]
-fn draws_skip_images_rescaled_at_an_earlier_scale() {
+fn draws_sample_images_rescaled_at_an_earlier_scale_at_the_new_scale() {
     let Some((mut f, gmmu)) = rescaled_fixture() else {
         return;
     };
@@ -985,14 +985,15 @@ fn draws_skip_images_rescaled_at_an_earlier_scale() {
     });
     let mut regs = sampling_regs();
     regs.rt[0].format = 0xe4;
-    read_with(&mut f, &gmmu, &mut regs, &query_program(0), 0);
-    assert_ne!(f.rasterizer.draw.warned & Warning::StaleScale as u32, 0);
-    assert!(
-        target(&mut f)
-            .iter()
-            .all(|&t| u32::from_le_bytes(t) != SOURCE.0),
-        "the stale image was not sampled"
-    );
+    for (component, want) in [(0, SOURCE.0), (1, SOURCE.1)] {
+        read_with(&mut f, &gmmu, &mut regs, &query_program(component), 0);
+        assert!(
+            target(&mut f)
+                .iter()
+                .all(|&t| u32::from_le_bytes(t) == want),
+            "size component {component} is {want} after the scale change"
+        );
+    }
     f.assert_no_validation_errors();
 }
 

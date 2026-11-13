@@ -67,7 +67,6 @@ enum Warning {
     NoIndirectCount = 1 << 4,
     DrawTextureTarget = 1 << 7,
     DrawTextureSource = 1 << 8,
-    StaleScale = 1 << 6,
     MixedScaleArray = 1 << 9,
 }
 
@@ -983,14 +982,9 @@ impl VulkanRasterizer {
                                 .and_then(|(id, _)| self.texture_cache.state(id))
                                 .map_or(ResolutionScale::X1, |s| s.scale);
                             let rescaled = scale != ResolutionScale::X1;
-                            if rescaled && scale != self.texture_cache.resolution_scale() {
-                                self.draw.warn_once(
-                                    Warning::StaleScale,
-                                    "a draw samples an image rendered at an earlier resolution scale; skipping it until the image renders again",
-                                );
-                                return Ok(false);
-                            }
-                            if *array_rescaled.get_or_insert(rescaled) != rescaled {
+                            if texture.is_some()
+                                && *array_rescaled.get_or_insert(rescaled) != rescaled
+                            {
                                 self.draw.warn_once(
                                     Warning::MixedScaleArray,
                                     "a draw samples a texture array mixing rescaled and native images; skipping it",
