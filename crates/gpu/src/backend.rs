@@ -564,6 +564,13 @@ pub trait Rasterizer: Send {
     /// The guest CPU wrote `[addr, addr + size)`; drop or re-upload cached copies.
     fn invalidate_region(&mut self, addr: DAddr, size: u64);
 
+    /// Write tracking saw guest CPU writes somewhere in the pages `[addr, addr + size)`.
+    /// Unlike [`invalidate_region`](Self::invalidate_region) the range is whole pages and
+    /// may hold bytes the CPU did not write, so data only the GPU holds must survive it.
+    fn cpu_written(&mut self, addr: DAddr, size: u64) {
+        self.invalidate_region(addr, size);
+    }
+
     /// Write GPU-modified data in `[addr, addr + size)` back to guest memory.
     fn flush_region(&mut self, addr: DAddr, size: u64);
 

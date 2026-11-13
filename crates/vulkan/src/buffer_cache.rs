@@ -23,7 +23,7 @@ use lichii_gpu::engines::maxwell_3d::Regs;
 use lichii_gpu::engines::maxwell_3d::regs::{IndexFormat, PrimitiveTopology};
 use lichii_gpu::gmmu::{Gmmu, GpuRange, RangeTarget};
 use lichii_gpu::lazy::LazyDeviceRanges;
-use lichii_memory::DeviceAddressSpace;
+use lichii_memory::{CachedPages, DeviceAddressSpace};
 
 use crate::commands::transfer_to_all_barrier;
 use crate::device::Device;
@@ -140,6 +140,9 @@ struct CachedBuffer {
     stream_score: u32,
     /// Texel buffer views by offset, range and format, dropped with the buffer.
     views: Vec<((u64, u64, i32), BufferView)>,
+    /// Write tracking over each uploaded range (start, end), so a guest CPU write to it marks
+    /// the pages dirty.
+    tracked: Vec<(DAddr, DAddr, CachedPages)>,
 }
 
 impl CachedBuffer {
@@ -160,6 +163,28 @@ impl CachedBuffer {
                 self.dirty[word] |= bit;
                 self.dirty_pages += 1;
             }
+        }
+    }
+
+    /// Stops tracking the pages of `[start, end)`, which upload again and are tracked anew.
+    /// The rest of each range tracked with them keeps a guard of its own, taken before the old
+    /// one is dropped, so it never goes untracked.
+    fn untrack(&mut self, memory: &DeviceAddressSpace, start: DAddr, end: DAddr) {
+        let (start, end) = (start & !(PAGE_SIZE - 1), end.next_multiple_of(PAGE_SIZE));
+        let mut i = 0;
+        while i < self.tracked.len() {
+            let (s, e) = (self.tracked[i].0, self.tracked[i].1);
+            if s >= end || e <= start {
+                i += 1;
+                continue;
+            }
+            let (_, _, old) = self.tracked.swap_remove(i);
+            for (a, b) in [(s, start), (end, e)] {
+                if a < b {
+                    self.tracked.push((a, b, memory.cache_pages(a, b - a)));
+                }
+            }
+            drop(old);
         }
     }
 }
@@ -718,6 +743,17 @@ impl BufferCache {
         if self.gpu_written.intersects(daddr, end) {
             self.gpu_written.subtract(daddr, end);
         }
+        self.cpu_written(daddr, size);
+    }
+
+    /// Write tracking saw guest CPU writes in the pages of `[daddr, +size)`: they upload
+    /// again before their next use, except bytes GPU work wrote. Those may lie beside the
+    /// CPU's bytes on a page, so they stay until [`BufferCache::flush`] downloads them.
+    pub fn cpu_written(&mut self, daddr: DAddr, size: u64) {
+        let end = daddr.saturating_add(size).min(self.limit);
+        if daddr >= end {
+            return;
+        }
         let mut page = daddr >> CACHING_PAGE_BITS;
         while page < end.div_ceil(CACHING_PAGE_SIZE) {
             let Some(id) = Self::lookup(&self.page_table, page << CACHING_PAGE_BITS) else {
@@ -725,7 +761,9 @@ impl BufferCache {
                 continue;
             };
             let buffer = self.buffers[id].as_mut().expect("live buffer");
-            buffer.mark_dirty(daddr.max(buffer.daddr), end.min(buffer.end()));
+            let (start, stop) = (daddr.max(buffer.daddr), end.min(buffer.end()));
+            buffer.mark_dirty(start, stop);
+            buffer.untrack(&self.memory, start, stop);
             page = buffer.end() >> CACHING_PAGE_BITS;
         }
     }
@@ -855,14 +893,17 @@ impl BufferCache {
             gpu_written,
             ..
         } = self;
+        let memory = &self.memory;
         let buffer = buffers[id].as_mut().expect("live buffer");
         let base = buffer.daddr;
         let first = ((daddr - base) >> PAGE_BITS) as usize;
         let last = (daddr + size - base).div_ceil(PAGE_SIZE) as usize;
         uploads.clear();
+        let tracked = &mut buffer.tracked;
         buffer.dirty_pages -= drain_runs(&mut buffer.dirty, first, last, |first, last| {
             let start = base + first as u64 * PAGE_SIZE;
             let end = base + last as u64 * PAGE_SIZE;
+            tracked.push((start, end, memory.cache_pages(start, end - start)));
             let mut next = start;
             gpu_written.for_each_in(start, end, |written, written_end| {
                 if written > next {
@@ -959,13 +1000,15 @@ impl BufferCache {
             dirty_pages: pages as u64,
             stream_score: 0,
             views: Vec::new(),
+            tracked: Vec::new(),
         };
         if !self.overlaps.is_empty() {
             let cmd = scheduler.record()?;
             before_transfer(&self.device, cmd);
             for i in 0..self.overlaps.len() {
                 let id = self.overlaps[i];
-                let old = self.buffers[id].take().expect("live buffer");
+                let mut old = self.buffers[id].take().expect("live buffer");
+                new.tracked.append(&mut old.tracked);
                 self.free_slots.push(id);
                 let offset = old.daddr - begin;
                 let region = [vk::BufferCopy {
@@ -1487,7 +1530,7 @@ mod tests {
 
     use lichii_common::settings::GraphicsSettings;
     use lichii_gpu::gmmu::BigPageSize;
-    use lichii_memory::PhysicalMemory;
+    use lichii_memory::{AddressSpace, MemoryPermission, PhysicalMemory};
 
     use super::*;
     use crate::{Instance, SurfaceSupport};
@@ -1790,6 +1833,103 @@ mod tests {
         let stats = f.cache.stats();
         assert_eq!(stats.uploaded_bytes, 6 * PAGE_SIZE, "pages 1 to 6 upload");
         assert_eq!(stats.created_buffers, 1);
+        f.assert_no_validation_errors();
+    }
+
+    /// Guest CPU writes to uploaded pages come back through write tracking: only the written
+    /// pages upload again, the rest stay tracked, and a page uploaded anew is tracked anew.
+    #[test]
+    fn cpu_writes_to_uploaded_pages_are_tracked() {
+        const CPU_VA: u64 = 0x1000_0000;
+        let Some(mut f) = fixture() else { return };
+        let space = Arc::new(AddressSpace::new(f.memory.physical().clone(), 39));
+        space.map(CPU_VA, 0, 0x10000, MemoryPermission::READ_WRITE);
+        f.memory.attach_process(space.clone());
+        space.write_bytes(CPU_VA, &pattern(0x10000, 2)).unwrap();
+        let binding = f.acquire(DADDR, 0x10000);
+        for (offset, byte) in [(0x5010, 7), (0x9ffc, 8), (0x5010, 9)] {
+            space.write_bytes(CPU_VA + offset, &[byte; 8]).unwrap();
+            assert!(
+                f.memory.has_cpu_writes(),
+                "{offset:#x}: the write was tracked"
+            );
+            let memory = f.memory.clone();
+            memory.take_cpu_writes(|daddr, size| f.cache.cpu_written(daddr, size));
+            f.acquire(DADDR, 0x10000);
+        }
+        assert_eq!(
+            f.cache.stats().uploaded_bytes,
+            0x10000 + 4 * PAGE_SIZE,
+            "pages 5, 9, 10 and 5 again"
+        );
+        let mut guest = vec![0; 0x10000];
+        space.read_bytes(CPU_VA, &mut guest).unwrap();
+        assert!(
+            f.read_binding(binding) == guest,
+            "the buffer holds the CPU's bytes"
+        );
+        f.assert_no_validation_errors();
+    }
+
+    /// A guest CPU write beside GPU-written bytes on one page, seen by write tracking for the
+    /// whole page, keeps both.
+    #[test]
+    fn cpu_writes_beside_gpu_writes_keep_both() {
+        const CPU_VA: u64 = 0x1000_0000;
+        let Some(mut f) = fixture() else { return };
+        let space = Arc::new(AddressSpace::new(f.memory.physical().clone(), 39));
+        space.map(CPU_VA, 0, 0x10000, MemoryPermission::READ_WRITE);
+        f.memory.attach_process(space.clone());
+        let original = pattern(0x3000, 4);
+        space.write_bytes(CPU_VA + 0x2000, &original).unwrap();
+        let binding = f.acquire(DADDR + 0x2000, 0x3000);
+        f.gpu_fill(binding, 0x40, 0x100, 0xdead_beef);
+        f.cache.mark_gpu_written(DADDR + 0x2040, 0x100);
+        let cpu = [0x5a; 16];
+        space.write_bytes(CPU_VA + 0x2400, &cpu).unwrap();
+        let memory = f.memory.clone();
+        let mut drained = Vec::new();
+        memory.take_cpu_writes(|daddr, size| {
+            drained.push((daddr, size));
+            f.cache.cpu_written(daddr, size);
+        });
+        assert_eq!(drained, [(DADDR + 0x2000, PAGE_SIZE)]);
+        f.acquire(DADDR + 0x2000, 0x3000);
+        f.cache.flush(&mut f.scheduler, DADDR, 0x10000).unwrap();
+        let mut expected = original;
+        expected[0x40..0x140].copy_from_slice(&0xdead_beef_u32.to_le_bytes().repeat(0x40));
+        expected[0x400..0x410].copy_from_slice(&cpu);
+        assert_eq!(f.guest(DADDR + 0x2000, 0x3000), expected);
+        f.assert_no_validation_errors();
+    }
+
+    /// A page GPU work wrote whole uploads nothing after a CPU write, yet stays tracked: once
+    /// flushed, the next CPU write to it reaches the buffer.
+    #[test]
+    fn fully_gpu_written_pages_stay_tracked() {
+        const CPU_VA: u64 = 0x1000_0000;
+        let Some(mut f) = fixture() else { return };
+        let space = Arc::new(AddressSpace::new(f.memory.physical().clone(), 39));
+        space.map(CPU_VA, 0, 0x10000, MemoryPermission::READ_WRITE);
+        f.memory.attach_process(space.clone());
+        let binding = f.acquire(DADDR, PAGE_SIZE);
+        f.gpu_fill(binding, 0, PAGE_SIZE, 0x0102_0304);
+        f.cache.mark_gpu_written(DADDR, PAGE_SIZE);
+        let memory = f.memory.clone();
+        for byte in [7, 9] {
+            space.write_bytes(CPU_VA + 0x10, &[byte; 8]).unwrap();
+            assert!(f.memory.has_cpu_writes(), "write of {byte} tracked");
+            memory.take_cpu_writes(|daddr, size| f.cache.cpu_written(daddr, size));
+            f.acquire(DADDR, PAGE_SIZE);
+            f.cache.flush(&mut f.scheduler, DADDR, PAGE_SIZE).unwrap();
+        }
+        let mut guest = vec![0; PAGE_SIZE as usize];
+        space.read_bytes(CPU_VA, &mut guest).unwrap();
+        assert_eq!(&guest[0x10..0x18], &[9; 8]);
+        assert!(
+            f.read_binding(binding) == guest,
+            "the buffer holds the CPU's bytes"
+        );
         f.assert_no_validation_errors();
     }
 

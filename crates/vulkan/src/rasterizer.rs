@@ -829,6 +829,12 @@ impl Rasterizer for VulkanRasterizer {
         }
     }
 
+    fn cpu_written(&mut self, addr: DAddr, size: u64) {
+        self.buffer_cache.cpu_written(addr, size);
+        self.draw.shaders.invalidate(addr, size);
+        self.texture_cache.cpu_written(addr, size);
+    }
+
     fn flush_region(&mut self, addr: DAddr, size: u64) {
         if let Err(error) = self.buffer_cache.flush(&mut self.scheduler, addr, size) {
             tracing::error!(%error, "flushing GPU-written buffers failed");
