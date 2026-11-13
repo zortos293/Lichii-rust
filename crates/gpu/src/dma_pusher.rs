@@ -666,7 +666,7 @@ mod tests {
 
     use super::*;
     use crate::back::Back;
-    use crate::backend::GpuHandles;
+    use crate::backend::{GpuHandles, GpuWrittenPages};
     use crate::clock::{GpuTimestamp, GuestTime};
     use crate::engines::create_engine;
     use crate::engines::testing::Recorder;
@@ -690,6 +690,7 @@ mod tests {
             device: device.clone(),
             syncpoints: syncpoints.clone(),
             timestamp: Arc::new(GpuTimestamp::new(Arc::new(Boot), false)),
+            written_pages: Arc::new(GpuWrittenPages::new(36)),
         };
         let (producer, consumer) = ring::ring(MIN_RING_SLOTS, MIN_RING_SLOTS);
         let (side, side_receiver) = mpsc::channel();
