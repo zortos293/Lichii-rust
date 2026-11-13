@@ -820,18 +820,41 @@ impl Translator<'_> {
                 rt2,
                 rn,
                 ..
-            } if size + pair as u8 <= 3 => {
+            } => {
                 let addr = self.x(rn);
                 let value = self.op(Op::LoadExclusive {
                     size: size + pair as u8,
                     addr,
                     pc,
                 });
-                if pair {
+                if pair && size == 3 {
+                    let high = self.op(Op::High);
+                    self.set_x(rt, value);
+                    self.set_x(rt2, high);
+                } else if pair {
                     self.split32(value, rt, rt2);
                 } else {
                     self.set_x(rt, value);
                 }
+            }
+            Inst::StoreExclusive {
+                size: 3,
+                pair: true,
+                rs,
+                rt,
+                rt2,
+                rn,
+                ..
+            } => {
+                let addr = self.x(rn);
+                let (low, high) = (self.x(rt), self.x(rt2));
+                let status = self.op(Op::StoreExclusive128 {
+                    addr,
+                    low,
+                    high,
+                    pc,
+                });
+                self.set_x(rs, status);
             }
             Inst::StoreExclusive {
                 size,
@@ -841,7 +864,7 @@ impl Translator<'_> {
                 rt2,
                 rn,
                 ..
-            } if size + pair as u8 <= 3 => {
+            } => {
                 let addr = self.x(rn);
                 let value = if pair {
                     self.join32(rt, rt2)
@@ -874,6 +897,28 @@ impl Translator<'_> {
                     pc,
                 });
                 self.split32(old, Reg(rs), Reg(rs + 1));
+            }
+            Inst::Casp {
+                size: 3,
+                rs,
+                rt,
+                rn,
+                ..
+            } => {
+                let addr = self.x(rn);
+                let (expected_low, expected_high) = (self.x(Reg(rs)), self.x(Reg(rs + 1)));
+                let (new_low, new_high) = (self.x(Reg(rt)), self.x(Reg(rt + 1)));
+                let low = self.op(Op::Cas128 {
+                    addr,
+                    expected_low,
+                    expected_high,
+                    new_low,
+                    new_high,
+                    pc,
+                });
+                let high = self.op(Op::High);
+                self.set_x(Reg(rs), low);
+                self.set_x(Reg(rs + 1), high);
             }
             Inst::DcZva { rt } if 4 << (self.config.dczid_el0 & 0xf) == 64 => {
                 let t = self.x(rt);
