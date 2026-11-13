@@ -315,6 +315,143 @@ fn storages_read_and_write_within_bounds() {
     );
 }
 
+/// A 0x1000-byte transfer memory over the start of a new heap, holding "lent" at offset 0, and
+/// its handle in the title's process.
+fn lend_transfer_memory(
+    client: &IpcClient,
+) -> (
+    Handle,
+    u64,
+    Arc<lichii_kernel::memory_objects::TransferMemory>,
+) {
+    let process = client.process().clone();
+    let heap = process.page_table().set_heap_size(2 << 20).unwrap();
+    process.memory().write_bytes(heap, b"lent").unwrap();
+    let memory = Arc::new(
+        lichii_kernel::memory_objects::TransferMemory::new(
+            process.clone(),
+            heap,
+            0x1000,
+            lichii_memory::MemoryPermission::READ_WRITE,
+        )
+        .unwrap(),
+    );
+    let handle = process
+        .handles()
+        .write()
+        .add(KObject::TransferMemory(memory.clone()))
+        .unwrap();
+    (handle, heap, memory)
+}
+
+const INVALID_STORAGE_TYPE: ResultCode = ResultCode::new(128, 511);
+
+#[test]
+fn transfer_memory_storages_read_and_write_the_titles_memory_in_place() {
+    let (_context, client, proxy) = booted(SWITCH1_TITLE);
+    let creator = interface(&client, proxy, 11);
+    let (handle, heap, _memory) = lend_transfer_memory(&client);
+    let create = |writable: bool, size: i64| {
+        Request::new(11)
+            .arg(u8::from(writable))
+            .arg(size)
+            .copy_handle(handle)
+    };
+    let output = client.alloc(&[0; 4]);
+    let input = client.alloc(b"LENT");
+    for writable in [false, true] {
+        let storage = client
+            .send(creator, &create(writable, 0x100))
+            .unwrap()
+            .move_handles[0];
+        assert_eq!(
+            client.send(storage, &Request::new(1)).unwrap().result,
+            INVALID_STORAGE_TYPE
+        );
+        let accessor = interface(&client, storage, 0);
+        assert_eq!(
+            client
+                .send(accessor, &Request::new(0))
+                .unwrap()
+                .pop::<i64>(),
+            0x100
+        );
+        let read = Request::new(11).arg(0i64).buffer_b(output, 4);
+        assert_eq!(
+            client.send(accessor, &read).unwrap().result,
+            ResultCode::SUCCESS
+        );
+        assert_eq!(client.read(output, 4), b"lent");
+        let write = Request::new(10).arg(0x80i64).buffer_a(input, 4);
+        let expected = if writable {
+            ResultCode::SUCCESS
+        } else {
+            ResultCode(u32::MAX)
+        };
+        assert_eq!(client.send(accessor, &write).unwrap().result, expected);
+        let past_end = Request::new(10).arg(0xfei64).buffer_a(input, 4);
+        assert_eq!(
+            client.send(accessor, &past_end).unwrap().result,
+            INVALID_OFFSET
+        );
+    }
+    assert_eq!(client.read(heap + 0x80, 4), b"LENT", "written in place");
+
+    assert_eq!(
+        client.send(creator, &create(true, 0)).unwrap().result,
+        ResultCode(u32::MAX)
+    );
+    let no_handle = Request::new(11).arg(1u8).arg(0x100i64);
+    assert_eq!(
+        client.send(creator, &no_handle).unwrap().result,
+        ResultCode(u32::MAX)
+    );
+}
+
+#[test]
+fn handle_storages_lend_their_transfer_memory() {
+    let (_context, client, proxy) = booted(SWITCH1_TITLE);
+    let creator = interface(&client, proxy, 11);
+    let (handle, _heap, memory) = lend_transfer_memory(&client);
+    let create = Request::new(12).arg(0x200i64).copy_handle(handle);
+    let storage = client.send(creator, &create).unwrap().move_handles[0];
+    assert_eq!(
+        client.send(storage, &Request::new(0)).unwrap().result,
+        INVALID_STORAGE_TYPE
+    );
+    let accessor = interface(&client, storage, 1);
+    assert_eq!(
+        client
+            .send(accessor, &Request::new(0))
+            .unwrap()
+            .pop::<i64>(),
+        0x200
+    );
+    let mut reply = client.send(accessor, &Request::new(1)).unwrap();
+    assert_eq!(reply.result, ResultCode::SUCCESS);
+    assert_eq!(reply.pop::<i64>(), 0x200);
+    assert!(matches!(
+        client.object(reply.copy_handles[0]),
+        Some(KObject::TransferMemory(lent)) if Arc::ptr_eq(&lent, &memory)
+    ));
+}
+
+#[test]
+fn create_library_applet_ex_takes_a_thread_id() {
+    let (_context, client, proxy) = booted(SWITCH1_TITLE);
+    let creator = interface(&client, proxy, 11);
+    let create = Request::new(3)
+        .arg(library_applet::SOFTWARE_KEYBOARD)
+        .arg(1u32)
+        .arg(0x1234u64);
+    let accessor = client.send(creator, &create).unwrap().move_handles[0];
+    let mut info = client.send(accessor, &Request::new(120)).unwrap();
+    assert_eq!(
+        info.pop::<[u32; 2]>(),
+        [library_applet::SOFTWARE_KEYBOARD, 1]
+    );
+}
+
 #[test]
 fn live_storage_is_charged_until_freed() {
     let budget = Arc::new(std::sync::atomic::AtomicUsize::new(0));
