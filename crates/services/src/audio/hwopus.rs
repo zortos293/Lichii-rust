@@ -382,8 +382,15 @@ impl DecoderState {
     }
 
     /// Decodes one packet from `input` (an 8-byte big-endian size and final range header, then
-    /// the packet). Returns the bytes consumed and the frames decoded into `self.output`.
-    fn decode(&mut self, input: &[u8], multi_stream: bool, reset: bool) -> HleResult<(u32, usize)> {
+    /// the packet) into at most `max_frames` frames. Returns the bytes consumed and the frames
+    /// decoded into `self.output`.
+    fn decode(
+        &mut self,
+        input: &[u8],
+        max_frames: usize,
+        multi_stream: bool,
+        reset: bool,
+    ) -> HleResult<(u32, usize)> {
         if input.len() <= 8 {
             return Err(INPUT_DATA_TOO_SMALL);
         }
@@ -392,18 +399,22 @@ impl DecoderState {
             return Err(BUFFER_TOO_SMALL);
         }
         let packet = &input[8..8 + size];
+        let max_frames = max_frames.min(self.max_frames);
+        if max_frames == 0 {
+            return Err(BUFFER_TOO_SMALL);
+        }
         let frames = match (&mut self.decoder, multi_stream) {
             (Decoder::Single(decoder), false) => {
                 if reset {
                     decoder.reset_state();
                 }
-                decoder.decode_i16(packet, self.max_frames, &mut self.output)
+                decoder.decode_i16(packet, max_frames, &mut self.output)
             }
             (Decoder::Multi(decoder), true) => {
                 if reset {
                     decoder.reset_state();
                 }
-                decoder.decode_i16(packet, self.max_frames, &mut self.output)
+                decoder.decode_i16(packet, max_frames, &mut self.output)
             }
             _ => return Err(LIB_OPUS_INVALID_STATE),
         }
@@ -439,7 +450,8 @@ impl Service for IHardwareOpusDecoder {
 
 impl IHardwareOpusDecoder {
     /// Every `DecodeInterleaved` variant: out `u32` bytes consumed, `u32` frames decoded and,
-    /// with `perf`, `u64` microseconds taken.
+    /// with `perf`, `u64` microseconds taken. The packet must fit the receive buffer, else the
+    /// call fails with `BUFFER_TOO_SMALL` and decodes nothing.
     fn decode(
         &self,
         ctx: &mut HleRequestContext,
@@ -448,14 +460,16 @@ impl IHardwareOpusDecoder {
         reset: bool,
     ) -> HleResult<()> {
         let input = ctx.read_buffer(0)?;
+        let output_size = ctx
+            .writable_buffer(0)
+            .map_or(0, |buffer| buffer.size as usize);
         let mut state = self.state.lock();
+        let max_frames = output_size / (size_of::<i16>() * state.channels);
         let started = Instant::now();
-        let (consumed, frames) = state.decode(&input, multi_stream, reset)?;
+        let (consumed, frames) = state.decode(&input, max_frames, multi_stream, reset)?;
         let taken = started.elapsed().as_micros() as u64;
         let samples = &state.output[..frames * state.channels];
-        if ctx.writable_buffer(0).is_some() {
-            ctx.write_buffer(0, bytemuck::cast_slice(samples))?;
-        }
+        ctx.write_buffer(0, bytemuck::cast_slice(samples))?;
         ctx.push(consumed);
         ctx.push(frames as u32);
         if perf {

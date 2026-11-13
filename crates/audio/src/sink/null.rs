@@ -44,7 +44,21 @@ impl Pacer {
     }
 
     pub(super) fn add(&self, stream: &Arc<StreamState>) {
-        self.shared.streams.lock().push(Arc::downgrade(stream));
+        self.handle().add(stream);
+    }
+
+    pub(super) fn handle(&self) -> PacerHandle {
+        PacerHandle(self.shared.clone())
+    }
+}
+
+/// Adds streams to a running [`Pacer`] later, as a host stream that fails to start does.
+#[derive(Clone)]
+pub(crate) struct PacerHandle(Arc<PacerShared>);
+
+impl PacerHandle {
+    pub(crate) fn add(&self, stream: &Arc<StreamState>) {
+        self.0.streams.lock().push(Arc::downgrade(stream));
     }
 }
 

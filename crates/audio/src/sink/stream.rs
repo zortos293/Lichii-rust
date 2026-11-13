@@ -7,10 +7,17 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
-use super::{MAX_CHANNELS, SAMPLE_RATE, SinkShared, TARGET_SAMPLE_COUNT, load_f32, store_f32};
+use super::{
+    MAX_CHANNELS, SAMPLE_RATE, SinkShared, TARGET_SAMPLE_COUNT, load_f32, null, store_f32,
+};
 
-/// Samples (across all channels) a stream's ring holds: four 6-channel buffers of 10k frames.
+/// Samples (across all channels) a stream's ring starts with: four 6-channel buffers of 10k
+/// frames. Larger buffers grow it, up to [`MAX_RING_CAPACITY`].
 const RING_CAPACITY: usize = 1 << 18;
+
+/// The most samples a ring grows to (32 MiB). A buffer that does not fit is cut short, and only
+/// the frames kept are queued, so play positions stay in step with the samples.
+const MAX_RING_CAPACITY: usize = 1 << 24;
 
 /// Buffers a stream may queue before `append_buffer` drops the oldest one.
 const QUEUE_CAPACITY: usize = 64;
@@ -53,14 +60,26 @@ impl SampleRing {
         }
     }
 
-    fn push(&mut self, sample: i16) -> bool {
-        if self.len == self.data.len() {
-            return false;
+    /// Grows the ring so `additional` more samples fit, within [`MAX_RING_CAPACITY`], and
+    /// returns how many fit now. Allocates only when a buffer outgrows the ring.
+    fn reserve(&mut self, additional: usize) -> usize {
+        let needed = self.len + additional;
+        if needed > self.data.len() && self.data.len() < MAX_RING_CAPACITY {
+            let mut data = vec![0; needed.next_power_of_two().min(MAX_RING_CAPACITY)];
+            let len = self.len;
+            self.pop_into(&mut data[..len]);
+            self.data = data.into_boxed_slice();
+            self.read = 0;
+            self.len = len;
         }
+        self.data.len() - self.len
+    }
+
+    fn push(&mut self, sample: i16) {
+        debug_assert!(self.len < self.data.len());
         let write = (self.read + self.len) % self.data.len();
         self.data[write] = sample;
         self.len += 1;
-        true
     }
 
     /// Fills `out` from the ring; samples the ring does not have read as silence.
@@ -92,6 +111,12 @@ struct StreamInner {
     overflow_logged: bool,
 }
 
+/// A host stream and the null clock it falls back to when the device refuses to start.
+pub(crate) struct HostStream {
+    pub(crate) stream: cpal::Stream,
+    pub(crate) fallback: null::PacerHandle,
+}
+
 pub(crate) struct StreamState {
     ty: StreamType,
     name: String,
@@ -102,6 +127,7 @@ pub(crate) struct StreamState {
     queued_buffers: AtomicU32,
     max_queue_size: AtomicU32,
     system_volume: AtomicU32,
+    host_failed: AtomicBool,
     inner: Mutex<StreamInner>,
     released: Condvar,
 }
@@ -124,6 +150,7 @@ impl StreamState {
             queued_buffers: AtomicU32::new(0),
             max_queue_size: AtomicU32::new(0),
             system_volume: AtomicU32::new(1.0f32.to_bits()),
+            host_failed: AtomicBool::new(false),
             inner: Mutex::new(StreamInner {
                 ring: SampleRing::new(),
                 queue: VecDeque::with_capacity(QUEUE_CAPACITY),
@@ -224,7 +251,7 @@ impl StreamState {
 /// sink's real-time clock) plays them in order. Dropping the stream closes it.
 pub struct SinkStream {
     pub(crate) state: Arc<StreamState>,
-    pub(crate) host: Option<cpal::Stream>,
+    pub(crate) host: Option<HostStream>,
 }
 
 impl SinkStream {
@@ -250,23 +277,31 @@ impl SinkStream {
 
     /// Whether a host device plays the stream (otherwise the null sink's clock consumes it).
     pub fn is_host_stream(&self) -> bool {
-        self.host.is_some()
+        self.host.is_some() && !self.state.host_failed.load(Ordering::Acquire)
     }
 
-    /// Starts (or resumes) playback.
+    /// Starts (or resumes) playback. A host stream the device refuses to start moves to the
+    /// null sink's clock for good, so its buffers still play out and get released.
     pub fn start(&self) {
         self.state.paused.store(false, Ordering::Release);
-        if let Some(host) = &self.host
-            && let Err(err) = cpal::traits::StreamTrait::play(host)
-        {
-            tracing::warn!(stream = %self.state.name, "starting the host stream: {err}");
+        let Some(host) = &self.host else {
+            return;
+        };
+        if self.state.host_failed.load(Ordering::Acquire) {
+            return;
+        }
+        if let Err(err) = cpal::traits::StreamTrait::play(&host.stream) {
+            tracing::warn!(stream = %self.state.name, "starting the host stream, using the null clock: {err}");
+            self.state.host_failed.store(true, Ordering::Release);
+            host.fallback.add(&self.state);
         }
     }
 
     /// Pauses playback; queued buffers stay queued.
     pub fn stop(&self) {
         if let Some(host) = &self.host
-            && let Err(err) = cpal::traits::StreamTrait::pause(host)
+            && !self.state.host_failed.load(Ordering::Acquire)
+            && let Err(err) = cpal::traits::StreamTrait::pause(&host.stream)
         {
             tracing::warn!(stream = %self.state.name, "pausing the host stream: {err}");
         }
@@ -275,6 +310,7 @@ impl SinkStream {
         self.state.released.notify_all();
     }
 
+    /// Whether the stream is stopped (it starts stopped).
     pub fn is_paused(&self) -> bool {
         self.state.is_paused()
     }
@@ -284,6 +320,7 @@ impl SinkStream {
         load_f32(&self.state.system_volume)
     }
 
+    /// Sets the system volume, applied to samples appended from now on.
     pub fn set_system_volume(&self, volume: f32) {
         store_f32(&self.state.system_volume, volume);
     }
@@ -305,7 +342,8 @@ impl SinkStream {
 
     /// Queues `frames` frames of `samples` (interleaved, `system_channels` per frame) to play
     /// after the buffers already queued, and returns the stream position (in frames) at which
-    /// the buffer will have finished playing. The samples are scaled by the stream, device and
+    /// the buffer will have finished playing. Only frames `samples` holds are queued, and a
+    /// buffer too large for the stream's ring is cut short. The samples are scaled by the stream, device and
     /// host volumes and converted to the device's channel count: 6 to 2 channels downmixes as
     /// Eden does, fewer channels than the device fill the first ones. Allocates nothing.
     pub fn append_buffer(&self, frames: u64, samples: &[i16]) -> u64 {
@@ -319,8 +357,14 @@ impl SinkStream {
             * load_f32(&state.sink.device_volume)
             * load_f32(&state.sink.host_volume);
         let (system, device) = (state.system_channels, state.device_channels);
-        let samples = &samples[..(frames as usize * system).min(samples.len())];
-        let mut pushed = true;
+        let wanted = (frames as usize).min(samples.len() / system);
+        let fits = inner.ring.reserve(wanted * device) / device;
+        if fits < wanted && !inner.overflow_logged {
+            inner.overflow_logged = true;
+            tracing::warn!(stream = %state.name, "sample ring full, cutting a buffer short");
+        }
+        let frames = wanted.min(fits);
+        let samples = &samples[..frames * system];
         if system > device {
             const MIX: [f32; 4] = [1.0, 0.596, 0.354, 0.707];
             for frame in samples.chunks_exact(system) {
@@ -331,23 +375,20 @@ impl SinkStream {
                 let [fl, fr, center, lfe, bl, br] = c;
                 let left = fl * MIX[0] + center * MIX[1] + lfe * MIX[2] + bl * MIX[3];
                 let right = fr * MIX[0] + center * MIX[1] + lfe * MIX[2] + br * MIX[3];
-                pushed &= inner.ring.push(scale(left, volume));
-                pushed &= inner.ring.push(scale(right, volume));
+                inner.ring.push(scale(left, volume));
+                inner.ring.push(scale(right, volume));
             }
         } else {
             for frame in samples.chunks_exact(system) {
                 for &sample in frame {
-                    pushed &= inner.ring.push(scale(f32::from(sample), volume));
+                    inner.ring.push(scale(f32::from(sample), volume));
                 }
                 for _ in system..device {
-                    pushed &= inner.ring.push(0);
+                    inner.ring.push(0);
                 }
             }
         }
-        if !pushed && !inner.overflow_logged {
-            inner.overflow_logged = true;
-            tracing::warn!(stream = %state.name, "sample ring full, dropping samples");
-        }
+        let frames = frames as u64;
         if inner.queue.len() == QUEUE_CAPACITY {
             tracing::warn!(stream = %state.name, "buffer queue full, dropping the oldest buffer");
             inner.queue.pop_front();
@@ -523,10 +564,45 @@ mod tests {
     fn ring_wraps_and_pads_missing_samples() {
         let mut ring = SampleRing::new();
         ring.read = RING_CAPACITY - 1;
-        assert!(ring.push(1) && ring.push(2));
+        ring.push(1);
+        ring.push(2);
         let mut out = [9; 3];
         ring.pop_into(&mut out);
         assert_eq!(out, [1, 2, 0]);
         assert_eq!(ring.len, 0);
+    }
+
+    #[test]
+    fn buffers_larger_than_the_ring_play_in_full() {
+        let stream = stream(6, 6);
+        let frames = 48_000u64;
+        let samples: Vec<i16> = (0..frames as usize * 6)
+            .map(|i| (i % 6) as i16 + 1)
+            .collect();
+        assert_eq!(stream.append_buffer(frames, &samples), frames);
+        assert_eq!(stream.append_buffer(frames, &samples), 2 * frames);
+        let mut out = vec![0i16; 1024 * 6];
+        for _ in 0..(2 * frames as usize).div_ceil(1024) - 1 {
+            stream.state.process_output(&mut out);
+            assert!(
+                out.as_chunks::<6>()
+                    .0
+                    .iter()
+                    .all(|f| *f == [1, 2, 3, 4, 5, 6])
+            );
+        }
+        assert!(stream.has_pending_audio());
+        stream.state.process_output(&mut out);
+        assert!(!stream.has_pending_audio());
+        assert_eq!(stream.queue_size(), 0);
+    }
+
+    #[test]
+    fn buffers_past_the_ring_limit_queue_only_the_frames_kept() {
+        let stream = stream(2, 2);
+        let frames = MAX_RING_CAPACITY as u64 / 2 + 100;
+        let end = stream.append_buffer(frames, &vec![1; frames as usize * 2]);
+        assert_eq!(end, MAX_RING_CAPACITY as u64 / 2);
+        assert_eq!(stream.append_buffer(10, &[1; 20]), end);
     }
 }

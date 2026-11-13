@@ -87,6 +87,7 @@ impl Sink {
         })
     }
 
+    /// Whether a host device or the null clock plays this sink's output streams.
     pub fn kind(&self) -> SinkKind {
         match self.host {
             Some(_) => SinkKind::Cpal,
@@ -112,7 +113,12 @@ impl Sink {
             self.shared.clone(),
         ));
         let host = match (&self.host, ty) {
-            (Some(host), StreamType::Out | StreamType::Render) => host.build_stream(&state),
+            (Some(host), StreamType::Out | StreamType::Render) => {
+                host.build_stream(&state).map(|stream| stream::HostStream {
+                    stream,
+                    fallback: self.pacer.handle(),
+                })
+            }
             _ => None,
         };
         if host.is_none() {
@@ -126,6 +132,7 @@ impl Sink {
         load_f32(&self.shared.device_volume)
     }
 
+    /// Sets the device volume, applied to samples appended from now on.
     pub fn set_device_volume(&self, volume: f32) {
         store_f32(&self.shared.device_volume, volume);
     }
@@ -143,6 +150,7 @@ impl Sink {
         );
     }
 
+    /// The host-side gain: 0.0 when muted, else the settings volume divided by 100.
     pub fn host_volume(&self) -> f32 {
         load_f32(&self.shared.host_volume)
     }
@@ -153,6 +161,7 @@ impl Sink {
         self.shared.paused.store(paused, Ordering::Release);
     }
 
+    /// Whether [`set_paused`](Self::set_paused) paused every stream.
     pub fn is_paused(&self) -> bool {
         self.shared.paused.load(Ordering::Acquire)
     }

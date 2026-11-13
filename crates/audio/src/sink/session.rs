@@ -124,10 +124,12 @@ impl SessionManager {
         }
     }
 
+    /// The sink every session of this manager plays on.
     pub fn sink(&self) -> &Arc<Sink> {
         &self.shared.sink
     }
 
+    /// How many more sessions [`open`](Self::open) can open.
     pub fn free_sessions(&self) -> usize {
         self.shared.sessions.lock().ids.available
     }
@@ -246,6 +248,7 @@ pub struct Session {
 }
 
 impl Session {
+    /// The session's number within its manager, reused once the session closes.
     pub fn id(&self) -> usize {
         self.id
     }
@@ -255,14 +258,17 @@ impl Session {
         &self.name
     }
 
+    /// Channels of the guest's buffers (2 or 6).
     pub fn channel_count(&self) -> u16 {
         self.channel_count
     }
 
+    /// The applet resource user id the guest opened the session with.
     pub fn applet_resource_user_id(&self) -> u64 {
         self.applet_resource_user_id
     }
 
+    /// Whether the session is started or stopped.
     pub fn state(&self) -> State {
         self.system.lock().state
     }
@@ -336,18 +342,21 @@ impl Session {
         self.system.lock().buffers.take_released(tags)
     }
 
-    /// Releases every queued buffer unplayed. `false` when stopped.
+    /// Releases every queued buffer unplayed and drops their samples from the stream, so the
+    /// next buffer appended plays at once. `false` when stopped.
     pub fn flush(&self) -> bool {
         let mut system = self.system.lock();
         if system.state != State::Started {
             return false;
         }
         if system.buffers.flush() > 0 {
+            system.session.clear_buffers();
             (self.event)();
         }
         true
     }
 
+    /// Whether a buffer tagged `tag` is appended or registered and not yet released.
     pub fn contains_buffer(&self, tag: u64) -> bool {
         self.system.lock().buffers.contains(tag)
     }
@@ -357,14 +366,19 @@ impl Session {
         self.system.lock().buffers.active() as u32
     }
 
+    /// Frames the session's stream has played since it first started, counting frames dropped
+    /// by a stop or a flush as played (`GetAudioOutPlayedSampleCount`).
     pub fn played_sample_count(&self) -> u64 {
         self.system.lock().session.played_sample_count()
     }
 
+    /// The session volume (`GetAudioOutVolume`), 1.0 for unity gain.
     pub fn volume(&self) -> f32 {
         self.system.lock().volume
     }
 
+    /// Sets the session volume. It scales samples as they are appended, so buffers already
+    /// queued keep the volume they were appended with.
     pub fn set_volume(&self, volume: f32) {
         let mut system = self.system.lock();
         system.volume = volume;

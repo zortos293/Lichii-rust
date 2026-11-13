@@ -193,10 +193,12 @@ impl DeviceSession {
         }
     }
 
+    /// The guest memory the session's buffers live in.
     pub fn memory(&self) -> &Arc<AddressSpace> {
         &self.memory
     }
 
+    /// The session's stream, opened on the first start.
     pub fn stream(&self) -> Option<&SinkStream> {
         self.stream.as_ref()
     }
@@ -208,24 +210,28 @@ impl DeviceSession {
             .start();
     }
 
+    /// Pauses the stream; queued samples stay queued.
     pub fn stop(&self) {
         if let Some(stream) = &self.stream {
             stream.stop();
         }
     }
 
+    /// Drops every sample queued on the stream, counting it as played.
     pub fn clear_buffers(&self) {
         if let Some(stream) = &self.stream {
             stream.clear_queue();
         }
     }
 
+    /// Sets the stream's system volume, applied to buffers appended from now on.
     pub fn set_volume(&self, volume: f32) {
         if let Some(stream) = &self.stream {
             stream.set_system_volume(volume);
         }
     }
 
+    /// How many buffers the stream lets its producer queue before it blocks.
     pub fn set_ring_size(&self, buffers: usize) {
         if let Some(stream) = &self.stream {
             stream.set_ring_size(buffers as u32);

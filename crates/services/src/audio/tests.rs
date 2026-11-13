@@ -223,6 +223,7 @@ fn audout_plays_buffers_and_releases_them_in_real_time() {
     let (third, _) = h.audio_buffer(&vec![0i16; 48_000 * 2]);
     h.ok(out, Request::new(3).arg(third).buffer_a(third, 0x28));
     assert_eq!(h.ok(out, Request::new(11)).pop::<u8>(), 1);
+    assert!(h.ok(out, Request::new(10)).pop::<u64>() >= 960 + 4800 + 48_000);
     let mut reply = h.ok(out, Request::new(8).buffer_c(tags, 8 * 4));
     assert_eq!(reply.pop::<u32>(), 1);
     assert_eq!(h.read_u64s(tags, 1), [third]);
@@ -455,6 +456,17 @@ fn hwopus_decodes_a_synthetic_packet() {
             .buffer_a(input, 20)
             .buffer_b(output, 960 * 4),
     );
+    assert_eq!(reply.result, ResultCode::new(HWOPUS, 3));
+    let input = h.client.alloc(&packets[1]);
+    let size = packets[1].len() as u64;
+    let reply = h.send(
+        decoder,
+        Request::new(0)
+            .buffer_a(input, size)
+            .buffer_b(output, 960 * 4 - 4),
+    );
+    assert_eq!(reply.result, ResultCode::new(HWOPUS, 3));
+    let reply = h.send(decoder, Request::new(0).buffer_a(input, size));
     assert_eq!(reply.result, ResultCode::new(HWOPUS, 3));
     h.ok(decoder, Request::new(1).buffer_a(input, 0));
 }
