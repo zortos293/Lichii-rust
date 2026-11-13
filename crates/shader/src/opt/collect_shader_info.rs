@@ -380,6 +380,10 @@ fn visit_usages(info: &mut ShaderInfo, prog: &Program, id: InstId) {
             | ConvertS64F16
             | ConvertS64F32
             | ConvertS64F64
+            | ConvertF16S64
+            | ConvertF32S64
+            | ConvertF64S64
+            | IAbs64
             | ConvertU64F16
             | ConvertU64F32
             | ConvertU64F64
