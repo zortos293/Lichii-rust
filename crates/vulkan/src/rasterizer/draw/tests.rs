@@ -2287,7 +2287,11 @@ fn draw_per_invocation_table_handles(quad_divergent_implicit_lod: bool) {
         .expect("a fragment module");
     assert_eq!(
         takes_derivatives(&fragment.spirv),
-        !quad_divergent_implicit_lod,
+        !f.rasterizer
+            .draw
+            .shaders
+            .profile()
+            .support_quad_divergent_implicit_lod,
         "explicit gradients only without quadDivergentImplicitLod"
     );
     f.assert_no_validation_errors();
