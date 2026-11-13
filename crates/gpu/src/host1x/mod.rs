@@ -2,7 +2,13 @@
 //! of the video engines.
 
 mod channel;
+mod frames;
+mod nvdec;
 mod syncpoints;
+mod vic;
+
+#[cfg(test)]
+mod tests;
 
 use std::sync::Arc;
 
@@ -17,6 +23,7 @@ pub use syncpoints::{
 use crate::backend::GpuWrittenPages;
 use crate::device_memory::DeviceAllocator;
 use crate::lazy::LazyDeviceRanges;
+use frames::DecodedFrames;
 
 /// What every host1x client shares: the device address space, its allocator and syncpoints.
 #[derive(Clone)]
@@ -27,6 +34,8 @@ pub struct Host1x {
     pub written_pages: Arc<GpuWrittenPages>,
     /// Device ranges that get memory as they are written (Switch 2 GPU-only regions).
     pub lazy: Arc<LazyDeviceRanges>,
+    /// Pictures the NVDEC channels decoded, for the VIC channels to compose.
+    pub(crate) decoded_frames: Arc<DecodedFrames>,
 }
 
 impl Host1x {
@@ -40,6 +49,7 @@ impl Host1x {
             allocator: Arc::new(DeviceAllocator::new(address_space_bits)),
             syncpoints: Arc::new(Syncpoints::new()),
             written_pages: Arc::new(GpuWrittenPages::new(address_space_bits)),
+            decoded_frames: Arc::new(DecodedFrames::new()),
         }
     }
 }

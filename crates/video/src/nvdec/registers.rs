@@ -178,16 +178,23 @@ impl NvdecRegisters {
         self.address(index::H264_LAST_SURFACE_CHROMA_OFFSET)
     }
 
-    /// Device address of the luma plane of surface `surface` (`< SURFACE_COUNT`).
+    /// Device address of the luma plane of surface `surface`; 0 past [`SURFACE_COUNT`], as the
+    /// index comes from guest picture parameters.
     pub fn surface_luma_address(&self, surface: usize) -> u64 {
-        assert!(surface < SURFACE_COUNT);
-        self.address(index::SURFACE_LUMA_OFFSETS + surface)
+        self.surface_address(index::SURFACE_LUMA_OFFSETS, surface)
     }
 
-    /// Device address of the chroma plane of surface `surface` (`< SURFACE_COUNT`).
+    /// Device address of the chroma plane of surface `surface`; 0 past [`SURFACE_COUNT`].
     pub fn surface_chroma_address(&self, surface: usize) -> u64 {
-        assert!(surface < SURFACE_COUNT);
-        self.address(index::SURFACE_CHROMA_OFFSETS + surface)
+        self.surface_address(index::SURFACE_CHROMA_OFFSETS, surface)
+    }
+
+    fn surface_address(&self, first: usize, surface: usize) -> u64 {
+        if surface < SURFACE_COUNT {
+            self.address(first + surface)
+        } else {
+            0
+        }
     }
 
     pub fn pic_scratch_buf_address(&self) -> u64 {
@@ -271,6 +278,7 @@ mod tests {
         assert_eq!(regs.picture_info_address(), 0x1234_5600);
         assert_eq!(regs.surface_luma_address(16), 0x7700);
         assert_eq!(regs.surface_chroma_address(3), 0x8800);
+        assert_eq!(regs.surface_luma_address(SURFACE_COUNT), 0);
         assert_eq!(regs.vp9_filter_buffer_address(), 0x100);
     }
 
