@@ -322,6 +322,8 @@ impl Jit {
                 tsc_scale: config.clock.host_tsc_scale().map(std::ptr::from_ref),
                 cmpxchg16b: std::arch::is_x86_feature_detected!("cmpxchg16b"),
                 fma: std::arch::is_x86_feature_detected!("fma"),
+                sse41: std::arch::is_x86_feature_detected!("sse4.1"),
+                sse42: std::arch::is_x86_feature_detected!("sse4.2"),
             },
             arena: fastmem.map_or(std::ptr::null_mut(), |f| f.base()),
             config,
@@ -343,6 +345,8 @@ impl Jit {
             },
             config: &self.config,
             cmpxchg16b: self.target.cmpxchg16b,
+            sse41: self.target.sse41,
+            sse42: self.target.sse42,
         };
         let mut pc = start;
         loop {
