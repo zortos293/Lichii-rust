@@ -55,6 +55,10 @@ use crate::pipeline::{
 use crate::texture_cache::{DEPTH_ATTACHMENT, ImageId, ImageInfo, Transfer, ViewInfo};
 
 const NULL_BUFFER_SIZE: u64 = 64 << 10;
+/// How often a draw or dispatch looks its images up again after a lookup removed one it held,
+/// before it gives up: a render target and a texture over the same memory in layouts the
+/// texture cache cannot share replace each other on every lookup.
+const MAX_RETARGETS: u32 = 2;
 
 const SHADER_SAMPLED: ImageAccess = ImageAccess {
     layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
@@ -87,6 +91,7 @@ enum Warning {
     NoMeshShader = 1 << 13,
     IndirectMesh = 1 << 14,
     MeshGroupLimit = 1 << 15,
+    ImageChurn = 1 << 16,
 }
 
 /// A descriptor write of the current draw: `count` infos from `first` of the info list for
@@ -589,6 +594,8 @@ impl VulkanRasterizer {
         let features = *draw.pipelines.features();
 
         let gmmu = ctx.memory;
+        let mut removals = self.texture_cache.removals();
+        let mut retargets = 0;
         let (index, indirect) = loop {
             let merged = self.buffer_cache.stats().merged_buffers;
             self.draw.rebind = false;
@@ -646,8 +653,23 @@ impl VulkanRasterizer {
                 },
                 DrawCall::Direct(_) => None,
             };
-            if self.buffer_cache.stats().merged_buffers == merged && !self.draw.rebind {
+            let removed = self.texture_cache.removals() != removals;
+            if self.buffer_cache.stats().merged_buffers == merged && !self.draw.rebind && !removed {
                 break (index, indirect);
+            }
+            if removed {
+                retargets += 1;
+                if retargets > MAX_RETARGETS {
+                    self.draw.warn_once(
+                        Warning::ImageChurn,
+                        "a draw's render targets and textures keep replacing each other in the texture cache; skipping it",
+                    );
+                    return Ok(());
+                }
+                if !self.render_targets(ctx)? {
+                    return Ok(());
+                }
+                removals = self.texture_cache.removals();
             }
         };
         if index.is_some_and(|i: IndexBinding| i.index_count == 0) {
@@ -2158,6 +2180,8 @@ impl VulkanRasterizer {
             samplers: ctx.samplers,
             sampler_limit: ctx.sampler_limit,
         };
+        let mut removals = self.texture_cache.removals();
+        let mut retargets = 0;
         let grid = loop {
             let merged = self.buffer_cache.stats().merged_buffers;
             self.draw.rebind = false;
@@ -2186,8 +2210,20 @@ impl VulkanRasterizer {
                 },
                 None => None,
             };
-            if self.buffer_cache.stats().merged_buffers == merged && !self.draw.rebind {
+            let removed = self.texture_cache.removals() != removals;
+            if self.buffer_cache.stats().merged_buffers == merged && !self.draw.rebind && !removed {
                 break grid;
+            }
+            if removed {
+                retargets += 1;
+                if retargets > MAX_RETARGETS {
+                    self.draw.warn_once(
+                        Warning::ImageChurn,
+                        "a dispatch's images keep replacing each other in the texture cache; skipping it",
+                    );
+                    return Ok(());
+                }
+                removals = self.texture_cache.removals();
             }
         };
         let set = self.descriptor_set(set_layout)?;
