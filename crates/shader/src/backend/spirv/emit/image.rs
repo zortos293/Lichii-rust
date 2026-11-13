@@ -5,12 +5,14 @@
 //! `Image*` opcodes reach emission.
 
 use rspirv::dr::{InsertPoint, Instruction, Operand};
-use rspirv::spirv::{Capability, Decoration, ImageOperands as Mask, Op, StorageClass, Word};
+use rspirv::spirv::{
+    Capability, Decoration, GlslStd450Op, ImageOperands as Mask, Op, StorageClass, Word,
+};
 use smallvec::SmallVec;
 
 use crate::backend::spirv::context::EmitContext;
 use crate::backend::spirv::{EmitError, EmitResult};
-use crate::ir::{ImageFormat, InstId, Opcode, TextureInstInfo, TextureType, Value};
+use crate::ir::{ImageFormat, InstId, Opcode, Program, TextureInstInfo, TextureType, Value};
 use crate::{Profile, ShaderStage};
 
 #[derive(Clone, Copy)]
@@ -272,31 +274,60 @@ impl ImageOperands {
         offset: Value,
     ) -> EmitResult<ImageOperands> {
         let mut operands = ImageOperands::new();
-        let bias_lc = match bias_lc {
-            Some(id) => id,
-            None if !info.has_bias && !info.has_lod_clamp => 0,
-            None => {
-                return Err(EmitError::InvalidIr(
-                    "sample with bias or lod clamp but no bias_lc operand".into(),
-                ));
-            }
-        };
-        let both = info.has_bias && info.has_lod_clamp;
-        if info.has_bias {
-            let bias = if both {
-                ctx.b.composite_extract(ctx.f32[1], None, bias_lc, [0])?
-            } else {
-                bias_lc
-            };
+        let (bias, clamp) = bias_and_clamp(ctx, info, bias_lc)?;
+        if let Some(bias) = bias {
             operands.add(ctx, Mask::BIAS, &[bias]);
         }
         operands.add_offset(ctx, offset, false)?;
-        if info.has_lod_clamp {
-            let clamp = if both {
-                ctx.b.composite_extract(ctx.f32[1], None, bias_lc, [1])?
+        if let Some(clamp) = clamp {
+            operands.add(ctx, Mask::MIN_LOD, &[clamp]);
+        }
+        Ok(operands)
+    }
+
+    /// An implicit lod as explicit gradients: the screen-space derivatives of `coords`
+    /// without the array layer, scaled by 2^bias, keeping the lod clamp.
+    fn implicit_gradient(
+        ctx: &mut EmitContext<'_>,
+        info: TextureInstInfo,
+        coords: Word,
+        bias_lc: Option<Word>,
+        offset: Value,
+    ) -> EmitResult<ImageOperands> {
+        let (bias, clamp) = bias_and_clamp(ctx, info, bias_lc)?;
+        let (count, total) = match info.ty {
+            TextureType::Color1D | TextureType::Buffer => (1, 1),
+            TextureType::ColorArray1D => (1, 2),
+            TextureType::Color2D | TextureType::Color2DRect => (2, 2),
+            TextureType::ColorArray2D => (2, 3),
+            TextureType::Color3D | TextureType::ColorCube => (3, 3),
+            TextureType::ColorArrayCube => (3, 4),
+        };
+        let f32_t = ctx.f32[1];
+        let ty = ctx.f32[count];
+        let position = match count {
+            _ if count == total => coords,
+            1 => ctx.b.composite_extract(f32_t, None, coords, [0])?,
+            _ => ctx
+                .b
+                .vector_shuffle(ty, None, coords, coords, 0..count as u32)?,
+        };
+        let mut dx = ctx.b.d_pdx(ty, None, position)?;
+        let mut dy = ctx.b.d_pdy(ty, None, position)?;
+        if let Some(bias) = bias {
+            let scale = ctx.glsl_inst(f32_t, GlslStd450Op::Exp2, &[bias])?;
+            if count == 1 {
+                dx = ctx.b.f_mul(ty, None, dx, scale)?;
+                dy = ctx.b.f_mul(ty, None, dy, scale)?;
             } else {
-                bias_lc
-            };
+                dx = ctx.b.vector_times_scalar(ty, None, dx, scale)?;
+                dy = ctx.b.vector_times_scalar(ty, None, dy, scale)?;
+            }
+        }
+        let mut operands = ImageOperands::new();
+        operands.add(ctx, Mask::GRAD, &[dx, dy]);
+        operands.add_offset(ctx, offset, false)?;
+        if let Some(clamp) = clamp {
             operands.add(ctx, Mask::MIN_LOD, &[clamp]);
         }
         Ok(operands)
@@ -626,6 +657,124 @@ fn add_offset_to_coordinates(
     Ok(ctx.b.i_add(ty, None, coords, offset)?)
 }
 
+/// The bias and lod clamp `bias_lc` holds for `info`: an F32x2 of both, or the one present.
+fn bias_and_clamp(
+    ctx: &mut EmitContext<'_>,
+    info: TextureInstInfo,
+    bias_lc: Option<Word>,
+) -> EmitResult<(Option<Word>, Option<Word>)> {
+    let Some(bias_lc) = bias_lc else {
+        if info.has_bias || info.has_lod_clamp {
+            return Err(EmitError::InvalidIr(
+                "sample with bias or lod clamp but no bias_lc operand".into(),
+            ));
+        }
+        return Ok((None, None));
+    };
+    if !(info.has_bias && info.has_lod_clamp) {
+        return Ok((
+            info.has_bias.then_some(bias_lc),
+            info.has_lod_clamp.then_some(bias_lc),
+        ));
+    }
+    let f32_t = ctx.f32[1];
+    Ok((
+        Some(ctx.b.composite_extract(f32_t, None, bias_lc, [0])?),
+        Some(ctx.b.composite_extract(f32_t, None, bias_lc, [1])?),
+    ))
+}
+
+/// Whether a fragment sample of `inst` must use explicit gradients: it reads an element of a
+/// descriptor array at an index that may differ within a quad, and the device leaves implicit
+/// lods undefined then.
+fn needs_explicit_gradients(
+    ctx: &EmitContext<'_>,
+    inst: InstId,
+    info: TextureInstInfo,
+) -> EmitResult<bool> {
+    if ctx.profile.support_quad_divergent_implicit_lod {
+        return Ok(false);
+    }
+    Ok(definition(&ctx.textures, info)?.count > 1
+        && !is_draw_uniform(ctx.program, ctx.arg(inst, 0)))
+}
+
+/// Whether `value` is the same in every invocation of a draw: built only from constants and
+/// constant buffer reads by integer arithmetic. Anything else, or a chain longer than a few
+/// dozen instructions, counts as varying.
+fn is_draw_uniform(prog: &Program, value: Value) -> bool {
+    let mut pending = vec![value];
+    let mut visited = 0;
+    while let Some(value) = pending.pop() {
+        let inst = match value {
+            Value::Inst(inst) => inst,
+            Value::Void
+            | Value::U1(_)
+            | Value::U8(_)
+            | Value::U16(_)
+            | Value::U32(_)
+            | Value::U64(_) => continue,
+            Value::F32(_) | Value::F64(_) => continue,
+            _ => return false,
+        };
+        visited += 1;
+        if visited > 64 {
+            return false;
+        }
+        let uniform_op = matches!(
+            prog.op(inst),
+            Opcode::Identity
+                | Opcode::GetCbufU8
+                | Opcode::GetCbufS8
+                | Opcode::GetCbufU16
+                | Opcode::GetCbufS16
+                | Opcode::GetCbufU32
+                | Opcode::GetCbufF32
+                | Opcode::GetCbufU32x2
+                | Opcode::CompositeExtractU32x2
+                | Opcode::BitCastU32F32
+                | Opcode::BitCastF32U32
+                | Opcode::SelectU32
+                | Opcode::IAdd32
+                | Opcode::ISub32
+                | Opcode::IMul32
+                | Opcode::INeg32
+                | Opcode::IAbs32
+                | Opcode::ShiftLeftLogical32
+                | Opcode::ShiftRightLogical32
+                | Opcode::ShiftRightArithmetic32
+                | Opcode::BitwiseAnd32
+                | Opcode::BitwiseOr32
+                | Opcode::BitwiseXor32
+                | Opcode::BitwiseNot32
+                | Opcode::BitFieldInsert
+                | Opcode::BitFieldSExtract
+                | Opcode::BitFieldUExtract
+                | Opcode::SMin32
+                | Opcode::UMin32
+                | Opcode::SMax32
+                | Opcode::UMax32
+                | Opcode::SClamp32
+                | Opcode::UClamp32
+                | Opcode::SLessThan
+                | Opcode::ULessThan
+                | Opcode::IEqual
+                | Opcode::SLessThanEqual
+                | Opcode::ULessThanEqual
+                | Opcode::SGreaterThan
+                | Opcode::UGreaterThan
+                | Opcode::INotEqual
+                | Opcode::SGreaterThanEqual
+                | Opcode::UGreaterThanEqual
+        );
+        if !uniform_op {
+            return false;
+        }
+        pending.extend((0..prog.op(inst).num_args()).map(|i| prog.arg(inst, i)));
+    }
+    true
+}
+
 fn explicit_ops(dref: Option<Word>) -> (Op, Op) {
     match dref {
         Some(_) => (
@@ -649,21 +798,25 @@ fn sample_implicit(
 ) -> EmitResult<Word> {
     let info = TextureInstInfo::from_flags(ctx.flags(inst));
     let coords = ctx.def_arg(inst, 1)?;
-    let (ops, operands) = if ctx.stage == ShaderStage::Fragment {
-        let operands = ImageOperands::implicit_lod(ctx, info, bias_lc, offset)?;
-        let ops = match dref {
-            Some(_) => (
-                Op::ImageSampleDrefImplicitLod,
-                Op::ImageSparseSampleDrefImplicitLod,
-            ),
-            None => (Op::ImageSampleImplicitLod, Op::ImageSparseSampleImplicitLod),
+    let (ops, operands) =
+        if ctx.stage == ShaderStage::Fragment && needs_explicit_gradients(ctx, inst, info)? {
+            let operands = ImageOperands::implicit_gradient(ctx, info, coords, bias_lc, offset)?;
+            (explicit_ops(dref), operands)
+        } else if ctx.stage == ShaderStage::Fragment {
+            let operands = ImageOperands::implicit_lod(ctx, info, bias_lc, offset)?;
+            let ops = match dref {
+                Some(_) => (
+                    Op::ImageSampleDrefImplicitLod,
+                    Op::ImageSparseSampleDrefImplicitLod,
+                ),
+                None => (Op::ImageSampleImplicitLod, Op::ImageSparseSampleImplicitLod),
+            };
+            (ops, operands)
+        } else {
+            let lod = ctx.f32_zero_value;
+            let operands = ImageOperands::explicit_lod(ctx, lod, offset)?;
+            (explicit_ops(dref), operands)
         };
-        (ops, operands)
-    } else {
-        let lod = ctx.f32_zero_value;
-        let operands = ImageOperands::explicit_lod(ctx, lod, offset)?;
-        (explicit_ops(dref), operands)
-    };
     let texture = texture(ctx, inst, info)?;
     let mut fixed = SmallVec::<[Word; 3]>::from_slice(&[texture, coords]);
     fixed.extend(dref);

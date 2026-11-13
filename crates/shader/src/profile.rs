@@ -66,6 +66,10 @@ pub struct Profile {
     pub support_storage_image_array_nonuniform_indexing: bool,
     pub support_uniform_texel_buffer_array_nonuniform_indexing: bool,
     pub support_storage_texel_buffer_array_nonuniform_indexing: bool,
+    /// Implicit-lod samples are defined when the descriptor differs within a quad
+    /// (`quadDivergentImplicitLod`). Without it, a fragment program that samples a descriptor
+    /// array at an index not provably uniform across the draw samples with explicit gradients.
+    pub support_quad_divergent_implicit_lod: bool,
 
     pub lower_left_origin_mode: bool,
     /// Declare every fragment colour output even when unwritten.
@@ -153,6 +157,7 @@ impl Default for Profile {
             support_storage_image_array_nonuniform_indexing: false,
             support_uniform_texel_buffer_array_nonuniform_indexing: false,
             support_storage_texel_buffer_array_nonuniform_indexing: false,
+            support_quad_divergent_implicit_lod: false,
             lower_left_origin_mode: false,
             need_declared_frag_colors: false,
             need_fastmath_off: false,
