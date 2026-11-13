@@ -126,6 +126,7 @@ pub fn translate_dual_vertex(
     }
     opt::collect_shader_info(env_b, ir, &mut info);
     b.info = info;
+    b.info.reads_start_address = b.ir.reads_start_address;
     b.local_memory_size = b.local_memory_size.max(local_memory_size);
     let mut hasher = crate::hash::StableHasher::new();
     (a_hash, b.hash).hash(&mut hasher);
@@ -143,6 +144,10 @@ fn translate_into(
     let recorder = Recorder::new(env);
     let mut program = translate_recorded(&recorder, options, ir)?;
     let mut hasher = recorder.hasher();
+    if program.ir.reads_start_address {
+        program.info.reads_start_address = true;
+        env.start_address().hash(&mut hasher);
+    }
     TRANSLATOR_ID.hash(&mut hasher);
     format!(
         "{:?}{:?}{:?}",

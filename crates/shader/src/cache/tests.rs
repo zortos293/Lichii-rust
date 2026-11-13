@@ -3,6 +3,8 @@ use lichii_common::settings::ResolutionScale;
 
 use super::record::Logger;
 use super::*;
+use crate::ampere::translate::tests::{TestEnv as AmpereEnv, encode as ampere};
+use crate::ampere::{Form, Opcode as Ampere};
 use crate::info::{ReplaceConstant, TexturePixelFormat};
 use crate::ir::TextureType;
 use crate::maxwell::opcode::Opcode as Sass;
@@ -317,6 +319,45 @@ fn an_entry_survives_the_file_and_matches_only_its_program() {
         [(0, 0), (8, 24)],
         "three instructions after a control word"
     );
+}
+
+/// An Ampere compute program at `base` storing its own address (LEPC) to shared memory.
+fn store_own_address(base: GpuVAddr) -> AmpereEnv {
+    let mut env = AmpereEnv::new(&[
+        ampere(Ampere::Lepc, Form::Fixed, 4 << 16),
+        ampere(
+            Ampere::Sts,
+            Form::Fixed,
+            (255 << 24) | (4 << 32) | (0x10 << 40) | (5 << 73),
+        ),
+        ampere(Ampere::Exit, Form::Fixed, 7 << 87),
+    ]);
+    env.base = base;
+    env.shared_memory = 0x100;
+    env
+}
+
+#[test]
+fn an_entry_holding_its_address_does_not_move() {
+    let (profile, host) = (Profile::default(), HostTranslateInfo::default());
+    let options = options(&profile, &host);
+    let runtime = RuntimeInfo::default();
+    let key = options_key(options, &runtime, &Bindings::default());
+    let env = store_own_address(AmpereEnv::BASE);
+    let entry = compile(&env, options, &runtime, &mut Bindings::default()).expect("translate");
+    assert!(entry.module().info.reads_start_address);
+    let mut file = header().to_vec();
+    entry.encode(&mut file);
+    let loaded = entries(records(&file).unwrap()).next().expect("entry");
+    assert!(loaded.matches(None, &env, key));
+
+    let moved = store_own_address(AmpereEnv::BASE + 0x1000);
+    assert_eq!(moved.base % 32, env.base % 32);
+    assert!(!loaded.matches(None, &moved, key));
+    assert!(!loaded.matches_state(None, &moved, key));
+    let recompiled = crate::compile(&moved, options, &runtime, &mut Bindings::default()).unwrap();
+    assert_ne!(recompiled.spirv, loaded.module().spirv);
+    assert_ne!(recompiled.hash, loaded.module().hash);
 }
 
 #[test]

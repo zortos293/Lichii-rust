@@ -25,6 +25,7 @@ use crate::{RuntimeInfo, ShaderEnvironment, ShaderModule, ShaderStage, Translate
 
 /// Bump on any change to the header or record layout.
 pub const FORMAT_VERSION: u32 = 1;
+/// Bytes of [`header`], the start of every cache file.
 pub const HEADER_LEN: usize = 32;
 const MAGIC: [u8; 8] = *b"LICHISHC";
 const RECORD_HEADER_LEN: usize = 12;
@@ -73,6 +74,7 @@ pub fn entries(records: &[u8]) -> Entries<'_> {
     Entries { records, read: 0 }
 }
 
+/// Iterator over the [`CacheEntry`]s of a file's records; [`entries`] makes one.
 pub struct Entries<'a> {
     records: &'a [u8],
     read: usize,
@@ -173,6 +175,9 @@ pub fn compile(
     let probe = probe_key(None, env, key);
     let logger = Logger::new(env);
     let module = crate::compile(&logger, options, runtime, bindings)?;
+    if module.info.reads_start_address {
+        logger.pin_start_address();
+    }
     Ok(CacheEntry {
         module: Arc::new(module),
         records: vec![logger.into_record()],
@@ -194,6 +199,10 @@ pub fn compile_dual_vertex(
     let probe = probe_key(Some(env_a), env_b, key);
     let (logger_a, logger_b) = (Logger::new(env_a), Logger::new(env_b));
     let module = crate::compile_dual_vertex(&logger_a, &logger_b, options, runtime, bindings)?;
+    if module.info.reads_start_address {
+        logger_a.pin_start_address();
+        logger_b.pin_start_address();
+    }
     Ok(CacheEntry {
         module: Arc::new(module),
         records: vec![logger_a.into_record(), logger_b.into_record()],
@@ -243,10 +252,12 @@ impl CacheEntry {
         })
     }
 
+    /// The translated module to use on a hit.
     pub fn module(&self) -> &Arc<ShaderModule> {
         &self.module
     }
 
+    /// The [`probe_key`] of the live state this entry was translated from, to index entries by.
     pub fn probe_key(&self) -> u64 {
         self.probe_key
     }

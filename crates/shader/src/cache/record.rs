@@ -10,7 +10,8 @@ use crate::ir::TextureType;
 use crate::{MeshState, ShaderArch, ShaderEnvironment, ShaderStage};
 
 /// One question translation asked and the answer it got. Program memory is addressed relative
-/// to the program's first instruction, so the same code elsewhere gives the same record.
+/// to the program's first instruction, so the same code elsewhere gives the same record, unless
+/// translation embedded the address itself ([`Query::StartAddress`]).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 enum Query {
     Arch(ShaderArch),
@@ -63,6 +64,7 @@ enum Query {
     },
     ProprietaryDriver(bool),
     Mesh(Option<MeshState>),
+    StartAddress(GpuVAddr),
 }
 
 impl Query {
@@ -111,6 +113,7 @@ impl Query {
             } => env.replace_const_buffer(bank, offset) == answer,
             Query::ProprietaryDriver(proprietary) => env.is_proprietary_driver() == proprietary,
             Query::Mesh(state) => env.mesh_state() == state,
+            Query::StartAddress(address) => env.start_address() == address,
         }
     }
 }
@@ -161,6 +164,11 @@ impl<'a> Logger<'a> {
             start: env.start_address(),
             log: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Pins the record to the program's address, for a module that holds it.
+    pub(super) fn pin_start_address(&self) {
+        self.log(Query::StartAddress(self.start));
     }
 
     pub(super) fn into_record(self) -> EnvRecord {

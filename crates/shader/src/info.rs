@@ -294,6 +294,9 @@ impl MeshInfo {
 /// buffers, textures, images, each in the order of its vector.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderInfo {
+    /// The module holds the program's absolute address (Ampere LEPC), so it must not be reused
+    /// for the same code at another address; [`crate::ShaderModule::hash`] covers the address.
+    pub reads_start_address: bool,
     pub uses_workgroup_id: bool,
     pub uses_local_invocation_id: bool,
     pub uses_invocation_id: bool,
