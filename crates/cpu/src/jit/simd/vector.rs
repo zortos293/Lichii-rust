@@ -101,6 +101,14 @@ pub enum VecOp {
         signed: Option<W>,
         vector: Value,
     },
+    /// `EXT`: bytes `index` onwards of `m:n` (with `n` in the low bytes), 16 of them when `q` is
+    /// set and else 8 from the low halves.
+    Ext {
+        q: bool,
+        index: u8,
+        n: Value,
+        m: Value,
+    },
 }
 
 impl VecOp {
@@ -118,7 +126,8 @@ impl VecOp {
                 vector: a,
                 value: b,
                 ..
-            } => {
+            }
+            | VecOp::Ext { n: a, m: b, .. } => {
                 f(a);
                 f(b);
             }
@@ -258,6 +267,16 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
     }
     if word & 0x9fe0_8400 == 0x0e00_0400 {
         return copy(t, word);
+    }
+    if word & 0xbfe0_8400 == 0x2e00_0000 {
+        let index = field(word, 11, 4);
+        if !q && index >= 8 {
+            return false;
+        }
+        let (n, m) = (vec(t, rn), vec(t, rm));
+        let r = emit(t, VecOp::Ext { q, index, n, m });
+        t.set(Loc::V(rd), r);
+        return true;
     }
     false
 }
@@ -753,6 +772,28 @@ impl Emitter<'_> {
                     (Shift::Ushr, _) => dynasm!(self.asm ; .arch x64 ; psrlq Rx(d), n),
                     (Shift::Sshr, 1) => dynasm!(self.asm ; .arch x64 ; psraw Rx(d), n),
                     (Shift::Sshr, _) => dynasm!(self.asm ; .arch x64 ; psrad Rx(d), n),
+                }
+                (d, q)
+            }
+            VecOp::Ext { q, index, n, m } => {
+                let (n, m) = (self.reg(n), self.reg(m));
+                let d = self.def(v);
+                let k = index as i8;
+                self.copy(d, n);
+                if q {
+                    dynasm!(self.asm
+                        ; .arch x64
+                        ; psrldq Rx(d), k
+                        ; movdqa Rx(SCRATCH), Rx(m)
+                        ; pslldq Rx(SCRATCH), 16 - k
+                        ; por Rx(d), Rx(SCRATCH)
+                    );
+                } else {
+                    dynasm!(self.asm
+                        ; .arch x64
+                        ; punpcklqdq Rx(d), Rx(m)
+                        ; psrldq Rx(d), k
+                    );
                 }
                 (d, q)
             }

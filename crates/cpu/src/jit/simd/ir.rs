@@ -73,6 +73,12 @@ pub enum SimdOp {
         a: Value,
         word: u32,
     },
+    /// `FCVT` from H to S or D; `fp` is the destination size.
+    FromHalf {
+        fp: Fp,
+        a: Value,
+        word: u32,
+    },
     /// `FCVT` between S and D; `fp` is the source size.
     Convert {
         fp: Fp,
@@ -130,6 +136,7 @@ impl SimdOp {
             | SimdOp::Fused { word, .. }
             | SimdOp::Sqrt { word, .. }
             | SimdOp::Convert { word, .. }
+            | SimdOp::FromHalf { word, .. }
             | SimdOp::FromInt { word, .. }
             | SimdOp::ToInt { word, .. }
             | SimdOp::Compare { word, .. } => Some(word),
@@ -151,6 +158,7 @@ impl SimdOp {
             | SimdOp::Neg(_, a)
             | SimdOp::Sqrt { a, .. }
             | SimdOp::Convert { a, .. }
+            | SimdOp::FromHalf { a, .. }
             | SimdOp::FromInt { x: a, .. }
             | SimdOp::ToInt { a, .. } => f(a),
             SimdOp::Arith { a, b, .. } => {

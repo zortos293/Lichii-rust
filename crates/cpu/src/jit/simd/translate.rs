@@ -24,6 +24,13 @@ pub(in super::super) fn lower(t: &mut Translator, word: u32) -> bool {
         return true;
     }
     let (rd, rn, rm) = (field(word, 0, 5), field(word, 5, 5), field(word, 16, 5));
+    if word & 0xffff_7c00 == 0x1ee2_4000 {
+        let a = t.op(Op::Get(Loc::V(rn)));
+        let fp = if word & 0x8000 != 0 { Fp::D } else { Fp::S };
+        let r = t.op(Op::Simd(SimdOp::FromHalf { fp, a, word }));
+        t.set(Loc::V(rd), r);
+        return true;
+    }
     let fp = match field(word, 22, 2) {
         0 => Fp::S,
         1 => Fp::D,

@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
+use crate::gpu::LONG_WAIT;
+
 /// Slot value that sends the consumer back to the start of the ring.
 pub(crate) const WRAP: u64 = 0;
 
@@ -106,6 +108,9 @@ struct Shared {
     progress: Signal,
     closed: AtomicBool,
     consumer_alive: AtomicBool,
+    /// Header of the record the consumer executes, for the producer's report of a stalled
+    /// consumer.
+    executing: Padded<AtomicU64>,
 }
 
 /// Creates a ring of `slots` slots (a power of two of at least `min_slots`).
@@ -120,6 +125,7 @@ pub(crate) fn ring(slots: usize, min_slots: usize) -> (Producer, Consumer) {
         progress: Signal::new(),
         closed: AtomicBool::new(false),
         consumer_alive: AtomicBool::new(true),
+        executing: Padded(AtomicU64::new(WRAP)),
     });
     (
         Producer {
@@ -210,7 +216,7 @@ impl Producer {
     /// published). Panics when the consumer thread is gone.
     pub(crate) fn wait_consumed(&self, position: u64) {
         let shared = &*self.shared;
-        shared.progress.wait_until(|| {
+        self.wait_progress(|| {
             shared.consumed.0.load(Ordering::Acquire) >= position
                 || !shared.consumer_alive.load(Ordering::Acquire)
         });
@@ -224,7 +230,7 @@ impl Producer {
     pub(crate) fn wait_for_room(&mut self) {
         let seen = self.consumed;
         let shared = &*self.shared;
-        shared.progress.wait_until(|| {
+        self.wait_progress(|| {
             shared.consumed.0.load(Ordering::Acquire) != seen
                 || !shared.consumer_alive.load(Ordering::Acquire)
         });
@@ -232,6 +238,30 @@ impl Producer {
             shared.consumer_alive.load(Ordering::Acquire),
             "the GPU back thread stopped before it executed the stream"
         );
+    }
+
+    /// Waits on the consumer's progress until `ready` holds, and reports a consumer that has
+    /// executed one record for [`LONG_WAIT`]: the front then waits with it, and every channel
+    /// stops.
+    fn wait_progress(&self, mut ready: impl FnMut() -> bool) {
+        let shared = &*self.shared;
+        if shared
+            .progress
+            .wait_until_deadline(&mut ready, Some(Instant::now() + LONG_WAIT))
+        {
+            return;
+        }
+        let header = shared.executing.0.load(Ordering::Relaxed);
+        tracing::warn!(
+            record = header as u8,
+            engine = (header >> 8) as u8,
+            method = format_args!("{:#x}", (header >> 16) & 0xffff),
+            argument = format_args!("{:#x}", header >> 32),
+            published = shared.published.0.load(Ordering::Relaxed),
+            consumed = shared.consumed.0.load(Ordering::Relaxed),
+            "the GPU front has waited 2 s for the back; this is the record the back executes"
+        );
+        shared.progress.wait_until(ready);
     }
 
     /// Publishes and tells the consumer that nothing more comes.
@@ -269,6 +299,13 @@ impl Consumer {
     pub(crate) fn slot(&self, index: usize) -> u64 {
         self.shared.slots[((self.read + index as u64) & self.shared.mask) as usize]
             .load(Ordering::Relaxed)
+    }
+
+    /// Notes the header of the record about to execute, which a producer waiting on a stalled
+    /// consumer reports.
+    #[inline]
+    pub(crate) fn begin(&self, header: u64) {
+        self.shared.executing.0.store(header, Ordering::Relaxed);
     }
 
     /// Moves past a record of `len` slots.

@@ -246,7 +246,8 @@ fn atomic(rng: &mut Rng) -> u32 {
     }
 }
 
-const FP: [&str; 18] = [
+const FP: [&str; 19] = [
+    "0001111011100010x10000xxxxxxxxxx",
     "01x111111xxxxxxxxx01x0xxxxxxxxxx",
     "01x111100x100001110110xxxxxxxxxx",
     "0xx01110xx1xxxxx110xx1xxxxxxxxxx",
@@ -285,7 +286,8 @@ fn simd(rng: &mut Rng) -> u32 {
     }
 }
 
-const VECTOR: [&str; 11] = [
+const VECTOR: [&str; 12] = [
+    "0x101110000xxxxx0xxxx0xxxxxxxxxx",
     "0xx01110xx1xxxxx100001xxxxxxxxxx",
     "0xx01110xx1xxxxx000111xxxxxxxxxx",
     "0xx01110xx1xxxxx0011x1xxxxxxxxxx",
@@ -890,6 +892,37 @@ fn fp_edge_cases_match_the_interpreter() {
                 ctx.x[1] = x;
                 ctx.v[1] = 0x5a5a_5a5a_5a5a_5a5a << 64 | x as u128;
                 compare(machines, &[op | fp, BRK], &ctx, &data);
+            }
+        }
+    }
+}
+
+/// Every exponent of H, with mantissas at the ends, the middle and the quiet bit, converted to S and
+/// D under the FPCR controls that matter: AHP, DN, FZ and FZ16.
+#[test]
+fn half_conversions_match_the_interpreter() {
+    const FCVT_S0_H1: u32 = 0x1ee2_4020;
+    const FCVT_D0_H1: u32 = 0x1ee2_c020;
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    for sign in [0, 0x8000] {
+        for exponent in 0..32 {
+            for mantissa in [0, 1, 0x155, 0x200, 0x3ff] {
+                let half = sign | exponent << 10 | mantissa;
+                for fpcr in [0, 1 << 26, 1 << 25, 1 << 24, 1 << 19, 3 << 22] {
+                    for op in [FCVT_S0_H1, FCVT_D0_H1] {
+                        let mut ctx = ThreadContext {
+                            pc: CODE,
+                            fpcr,
+                            ..Default::default()
+                        };
+                        ctx.v[1] = 0x5a5a_5a5a_5a5a_5a5a_5a5a_5a5a_5a5a << 16 | half as u128;
+                        compare(machines, &[op, BRK], &ctx, &data);
+                    }
+                }
             }
         }
     }

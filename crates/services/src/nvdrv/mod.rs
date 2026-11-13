@@ -26,14 +26,16 @@ mod tests;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
 use lichii_common::{ConsoleGeneration, HleResult, ResultCode};
+use lichii_gpu::host1x::SyncpointWaitError;
 use lichii_gpu::{Console, Gpu};
-use lichii_kernel::Event;
 use lichii_kernel::ipc::{HleRequestContext, SessionHandler};
 use lichii_kernel::object::KObject;
 use lichii_kernel::process::Process;
+use lichii_kernel::{Event, Kernel};
 use lichii_memory::AddressSpace;
 use parking_lot::Mutex;
 
@@ -74,6 +76,7 @@ pub(crate) struct NvFence {
 
 /// What every nvdrv session shares: the GPU, nvmap handles and syncpoint reservations.
 pub(crate) struct Nvdrv {
+    kernel: Kernel,
     gpu: Arc<Gpu>,
     /// The title is a Switch 2 title: its NvRm gets the Ampere device and Switch 2 behaviour.
     nx2: bool,
@@ -88,12 +91,39 @@ impl Nvdrv {
     fn new(context: &ServiceContext) -> Self {
         let gpu = context.gpu.clone();
         Self {
+            kernel: context.kernel.clone(),
             nvmap: NvMap::new(gpu.clone()),
             syncpoints: SyncpointTable::new(gpu.host1x().syncpoints.clone()),
             nx2: context.program.generation == ConsoleGeneration::Switch2,
             next_session: AtomicU64::new(1),
             ipc_trace: context.settings.debug.ipc_trace,
             gpu,
+        }
+    }
+
+    /// Waits until guest syncpoint `id` reaches `threshold` or `timeout` passes, like
+    /// [`lichii_gpu::host1x::Syncpoints::wait`], and times out once the kernel shuts down: the GPU
+    /// stops first, so the value may never come, and a service thread still waiting would keep
+    /// the session from stopping.
+    fn wait_syncpoint(
+        &self,
+        id: u32,
+        threshold: u32,
+        timeout: Option<Duration>,
+    ) -> Result<u32, SyncpointWaitError> {
+        const SHUTDOWN_CHECK: Duration = Duration::from_millis(100);
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let guest = self.syncpoints.syncpoints().guest();
+        loop {
+            let left = deadline.map_or(SHUTDOWN_CHECK, |deadline| {
+                deadline.saturating_duration_since(Instant::now())
+            });
+            match guest.wait(id, threshold, Some(left.min(SHUTDOWN_CHECK))) {
+                Err(SyncpointWaitError::TimedOut { .. })
+                    if !self.kernel.is_shutting_down()
+                        && deadline.is_none_or(|deadline| Instant::now() < deadline) => {}
+                result => return result,
+            }
         }
     }
 

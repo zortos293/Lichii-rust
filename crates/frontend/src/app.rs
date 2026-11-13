@@ -1173,7 +1173,9 @@ impl ApplicationHandler<UserEvent> for App {
             .egui_state
             .as_mut()
             .map(|s| s.on_window_event(&window, &event));
-        if response.as_ref().is_some_and(|r| r.repaint) {
+        if response.as_ref().is_some_and(|r| r.repaint)
+            && !matches!(event, WindowEvent::RedrawRequested)
+        {
             window.request_redraw();
         }
         let consumed = response.is_some_and(|r| r.consumed);

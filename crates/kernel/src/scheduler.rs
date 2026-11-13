@@ -439,6 +439,10 @@ impl Scheduler {
         self.paused.load(Ordering::Acquire)
     }
 
+    pub(crate) fn is_shut_down(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
+    }
+
     pub(crate) fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         for core in 0..self.cores.len() {
