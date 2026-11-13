@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use lichii_audio::sink::Sink;
 use lichii_common::HleResult;
@@ -9,6 +10,7 @@ use lichii_common::perf::PerfStats;
 use lichii_common::settings::Settings;
 use lichii_fs::ContentIndex;
 use lichii_gpu::Gpu;
+use lichii_gpu::host1x::{SyncpointBank, SyncpointWaitError};
 use lichii_input::NpadHub;
 use lichii_kernel::Kernel;
 use lichii_kernel::ipc::{ServiceThread, SessionHandler};
@@ -188,5 +190,30 @@ impl ServiceContext {
             &thread,
             Arc::new(move || context.handler(make(&context))),
         )
+    }
+}
+
+/// Waits until guest syncpoint `id` reaches `threshold` or `timeout` passes, like
+/// [`SyncpointBank::wait`], and times out once the kernel shuts down: the GPU stops first, so the
+/// value may never come, and a service thread still waiting would hold up the shutdown.
+pub(crate) fn wait_guest_syncpoint(
+    kernel: &Kernel,
+    bank: &SyncpointBank,
+    id: u32,
+    threshold: u32,
+    timeout: Option<Duration>,
+) -> Result<u32, SyncpointWaitError> {
+    const SHUTDOWN_CHECK: Duration = Duration::from_millis(100);
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    loop {
+        let left = deadline.map_or(SHUTDOWN_CHECK, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        });
+        match bank.wait(id, threshold, Some(left.min(SHUTDOWN_CHECK))) {
+            Err(SyncpointWaitError::TimedOut { .. })
+                if !kernel.is_shutting_down()
+                    && deadline.is_none_or(|deadline| Instant::now() < deadline) => {}
+            result => return result,
+        }
     }
 }
