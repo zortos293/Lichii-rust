@@ -35,16 +35,23 @@ macro_rules! test_gpu_state {
 }
 
 pub mod ampere;
+pub mod backend;
 pub mod flow;
+mod hash;
 pub mod info;
 pub mod ir;
 pub mod maxwell;
+pub mod module;
 pub mod opt;
 pub mod profile;
 pub mod runtime;
 pub mod translate;
 
 pub use info::ShaderInfo;
+pub use module::{
+    DescriptorBinding, DescriptorKind, DescriptorSetLayout, ResourceLayout, ShaderModule, compile,
+    compile_dual_vertex,
+};
 pub use profile::Profile;
 pub use runtime::RuntimeInfo;
 
@@ -137,12 +144,6 @@ pub trait ShaderEnvironment {
     }
 }
 
-/// A translated program.
-#[derive(Clone, Debug, Default)]
-pub struct ShaderModule {
-    pub spirv: Vec<u32>,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum TranslateError {
     #[error("unsupported instruction {opcode:#x} at {address:#x}")]
@@ -155,6 +156,8 @@ pub enum TranslateError {
     Unstructured { address: GpuVAddr },
     #[error("cannot lower {0}")]
     Lowering(String),
+    #[error(transparent)]
+    Emit(#[from] backend::spirv::EmitError),
     #[error("translation produced invalid IR: {0}")]
     InvalidIr(String),
     #[error("invalid program header at {address:#x}")]

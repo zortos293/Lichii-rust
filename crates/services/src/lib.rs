@@ -54,6 +54,7 @@ mod ncm;
 mod nifm;
 mod nim;
 mod ns;
+mod nvdrv;
 mod pctl;
 mod prepo;
 mod set;
@@ -96,5 +97,6 @@ pub fn register_all(context: &Arc<ServiceContext>) -> HleResult<()> {
     ns::register(context)?;
     sockets::register(context)?;
     ssl::register(context)?;
+    nvdrv::register(context)?;
     Ok(())
 }

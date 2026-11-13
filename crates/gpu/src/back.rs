@@ -12,6 +12,7 @@ use crate::backend::{
     ChannelId, FenceAction, FramebufferConfig, GpuHandles, Rasterizer, ReleaseSize,
 };
 use crate::clock::GpuTimestamp;
+use crate::engines::kepler_compute::pcas::QmdScheduler;
 use crate::engines::{Engine, EngineContext, EngineFactory, EngineKind};
 use crate::gmmu::{Gmmu, RangeTarget};
 use crate::host1x::Syncpoints;
@@ -63,6 +64,7 @@ pub(crate) struct Back {
     /// The engine the last method went to (channel index, kind index), until it is flushed.
     last: Option<(usize, u8)>,
     words: Vec<u32>,
+    qmd_scheduler: QmdScheduler,
 }
 
 impl Back {
@@ -82,6 +84,7 @@ impl Back {
             current: None,
             last: None,
             words: Vec::with_capacity(MULTI_MAX_WORDS + 1),
+            qmd_scheduler: QmdScheduler::new(),
         }
     }
 
@@ -261,6 +264,7 @@ impl Back {
             rasterizer: &mut *self.rasterizer,
             syncpoints: &self.syncpoints,
             gob_layout: channel.setup.gob_layout,
+            qmd_scheduler: &mut self.qmd_scheduler,
         };
         call(instance, &mut ctx);
     }
