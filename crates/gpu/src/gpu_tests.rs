@@ -2,7 +2,7 @@
 //! recording engines and a recording renderer, in both threading modes.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use lichii_memory::{AddressSpace, MemoryPermission, PhysicalMemory};
 use lichii_texture::PixelFormat;
@@ -144,6 +144,8 @@ struct HostWork {
     memory: Arc<Gmmu>,
     /// The pending work, and how much of it from the front finished.
     pending: Mutex<(Vec<Pending>, usize)>,
+    /// How often the GPU asked whether fences are pending.
+    fence_polls: AtomicUsize,
 }
 
 impl HostWork {
@@ -227,6 +229,7 @@ impl Rasterizer for Recorder {
         self.work.run_finished(wait);
     }
     fn has_pending_fences(&self) -> bool {
+        self.work.fence_polls.fetch_add(1, Ordering::Relaxed);
         !self.work.pending.lock().0.is_empty()
     }
     fn invalidate_region(&mut self, _addr: u64, _size: u64) {}
@@ -327,6 +330,7 @@ impl Rig {
                     handles,
                     memory: memory.clone(),
                     pending: Mutex::default(),
+                    fence_polls: AtomicUsize::new(0),
                 });
                 work = Some(host.clone());
                 Box::new(Recorder {
@@ -1879,5 +1883,29 @@ fn a_syncpoint_increment_lands_once_the_host_gpu_finishes_without_more_work() {
             }
         };
         assert_eq!(landed, Ok(1), "{threading:?}");
+    });
+}
+
+#[test]
+fn an_idle_gpu_with_no_pending_fences_sleeps() {
+    each_mode(|threading| {
+        let mut rig = Rig::new(threading);
+        let channel = rig.channel(HostClass::Maxwell);
+        let id = 10;
+        let words = Pushbuffer::default()
+            .host(host::SYNCPOINT_A, 0)
+            .host(host::SYNCPOINT_B, id << 8 | 1);
+        let entry = rig.entry(&words.0);
+        rig.gpu.submit(channel, Submission::new(&[entry]));
+        rig.gpu.synchronize();
+        assert_eq!(rig.syncpoints.guest().value(id), Ok(1), "{threading:?}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let before = rig.work.fence_polls.load(Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            rig.work.fence_polls.load(Ordering::Relaxed),
+            before,
+            "{threading:?}: the GPU polls fences while none are pending"
+        );
     });
 }

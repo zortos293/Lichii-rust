@@ -722,6 +722,10 @@ impl Rasterizer for VulkanRasterizer {
         }
     }
 
+    fn has_pending_fences(&self) -> bool {
+        !self.fences.is_empty()
+    }
+
     fn release_channel(&mut self, _channel: ChannelId) {
         self.texture_cache.invalidate_lookups();
     }
@@ -1312,6 +1316,21 @@ mod tests {
             );
             f.assert_no_validation_errors();
         }
+    }
+
+    #[test]
+    fn pending_fences_follow_the_fence_queue() {
+        let Some(mut f) = fixture(GobLayout::Tegra) else {
+            return;
+        };
+        assert!(!f.rasterizer.has_pending_fences());
+        f.rasterizer
+            .signal_fence(FenceAction::IncrementSyncpoint(4));
+        assert!(f.rasterizer.has_pending_fences());
+        f.rasterizer.flush_commands();
+        f.rasterizer.release_fences(true);
+        assert!(!f.rasterizer.has_pending_fences());
+        assert_eq!(f.syncpoints.guest().value(4).unwrap(), 1);
     }
 
     #[test]
