@@ -10,7 +10,6 @@ use std::cell::{Cell, RefCell};
 
 use lichii_common::GpuVAddr;
 use lichii_gpu::backend::{ComputeContext, ConstBufferBinding, GraphicsContext, QmdVersion};
-use lichii_gpu::engines::kepler_compute::qmd::{QmdV2, QmdV3};
 use lichii_gpu::engines::maxwell_3d::regs::SamplerBinding;
 use lichii_gpu::gmmu::Gmmu;
 use lichii_shader::info::TexturePixelFormat;
@@ -22,12 +21,15 @@ use lichii_texture::{Numeric, PixelFormat};
 /// Size of the Maxwell program header in front of a graphics program's first instruction.
 pub const HEADER_SIZE: u64 = 0x50;
 
-/// A texture query the translator made and the answer it got.
+/// A query the translator made of guest state outside the program bytes, and the answer it
+/// got: texture header queries by raw handle, and constant buffer words (bindless handles,
+/// indirect branch tables) by binding and offset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TextureRead {
+pub enum EnvRead {
     Type(u32, TextureType),
     PixelFormat(u32, TexturePixelFormat),
     Integer(u32, bool),
+    Cbuf { index: u32, offset: u32, value: u32 },
 }
 
 /// The texture header pool texture handles index.
@@ -236,7 +238,7 @@ pub struct ProgramEnv<'a> {
     shared_memory: u32,
     workgroup: [u32; 3],
     /// Texture queries of the translation running on this environment.
-    reads: RefCell<Vec<TextureRead>>,
+    reads: RefCell<Vec<EnvRead>>,
     /// Lowest and one past the highest program byte the translator read.
     extent: Cell<(GpuVAddr, GpuVAddr)>,
 }
@@ -285,19 +287,9 @@ impl<'a> ProgramEnv<'a> {
 
     /// The program a compute dispatch launches.
     pub fn compute(ctx: &'a ComputeContext<'_>) -> Self {
-        let qmd = bytemuck::cast_slice::<u32, u8>(ctx.qmd);
-        let (arch, local_memory) = match ctx.qmd_version {
-            QmdVersion::V2 => {
-                let qmd: QmdV2 = bytemuck::pod_read_unaligned(qmd);
-                (
-                    ShaderArch::Maxwell,
-                    qmd.local_pos_alloc.saturating_add(qmd.local_crs_alloc),
-                )
-            }
-            QmdVersion::V3 => {
-                let qmd: QmdV3 = bytemuck::pod_read_unaligned(qmd);
-                (ShaderArch::Ampere, qmd.local_crs_alloc)
-            }
+        let arch = match ctx.qmd_version {
+            QmdVersion::V2 => ShaderArch::Maxwell,
+            QmdVersion::V3 => ShaderArch::Ampere,
         };
         Self {
             arch,
@@ -313,7 +305,7 @@ impl<'a> ProgramEnv<'a> {
             },
             viewport_transform: 0,
             texture_bound: 0,
-            local_memory,
+            local_memory: ctx.local_memory_size,
             shared_memory: ctx.shared_memory_size,
             workgroup: ctx.block,
             reads: RefCell::new(Vec::new()),
@@ -354,31 +346,37 @@ impl<'a> ProgramEnv<'a> {
         self.const_buffers
     }
 
-    /// The register state that keys every program of this environment, besides its texture
+    /// The register state that keys every program of this environment, besides its recorded
     /// reads.
-    pub fn state_words(&self) -> [u32; 6] {
+    pub fn state_words(&self) -> [u32; 7] {
         let [x, y, z] = self.workgroup;
         [
             self.viewport_transform,
             self.texture_bound,
             self.shared_memory,
+            self.local_memory,
             x,
             y,
             z,
         ]
     }
 
-    /// Takes the texture queries of the last translation.
-    pub fn take_reads(&self) -> Vec<TextureRead> {
+    /// Takes the queries of the last translation.
+    pub fn take_reads(&self) -> Vec<EnvRead> {
         self.reads.take()
     }
 
     /// Whether every recorded query still gives its recorded answer.
-    pub fn replay(&self, reads: &[TextureRead]) -> bool {
+    pub fn replay(&self, reads: &[EnvRead]) -> bool {
         reads.iter().all(|read| match *read {
-            TextureRead::Type(handle, ty) => self.query_type(handle) == ty,
-            TextureRead::PixelFormat(handle, format) => self.query_format(handle) == format,
-            TextureRead::Integer(handle, integer) => self.query_integer(handle) == integer,
+            EnvRead::Type(handle, ty) => self.query_type(handle) == ty,
+            EnvRead::PixelFormat(handle, format) => self.query_format(handle) == format,
+            EnvRead::Integer(handle, integer) => self.query_integer(handle) == integer,
+            EnvRead::Cbuf {
+                index,
+                offset,
+                value,
+            } => self.cbuf_word(index, offset) == value,
         })
     }
 
@@ -397,7 +395,16 @@ impl<'a> ProgramEnv<'a> {
         )
     }
 
-    fn record(&self, read: TextureRead) {
+    fn cbuf_word(&self, index: u32, offset: u32) -> u32 {
+        match self.const_buffers.get(index as usize) {
+            Some(cbuf) if cbuf.enabled && offset < cbuf.size => {
+                self.word(cbuf.address + u64::from(offset))
+            }
+            _ => 0,
+        }
+    }
+
+    fn record(&self, read: EnvRead) {
         let mut reads = self.reads.borrow_mut();
         if !reads.contains(&read) {
             reads.push(read);
@@ -426,13 +433,13 @@ impl ShaderEnvironment for ProgramEnv<'_> {
     }
 
     fn read_cbuf(&self, index: u32, offset: u32) -> u32 {
-        let Some(cbuf) = self.const_buffers.get(index as usize) else {
-            return 0;
-        };
-        if !cbuf.enabled || offset >= cbuf.size {
-            return 0;
-        }
-        self.word(cbuf.address + u64::from(offset))
+        let value = self.cbuf_word(index, offset);
+        self.record(EnvRead::Cbuf {
+            index,
+            offset,
+            value,
+        });
+        value
     }
 
     fn shared_memory_size(&self) -> u32 {
@@ -445,19 +452,19 @@ impl ShaderEnvironment for ProgramEnv<'_> {
 
     fn texture_type(&self, raw_handle: u32) -> TextureType {
         let ty = self.query_type(raw_handle);
-        self.record(TextureRead::Type(raw_handle, ty));
+        self.record(EnvRead::Type(raw_handle, ty));
         ty
     }
 
     fn texture_pixel_format(&self, raw_handle: u32) -> TexturePixelFormat {
         let format = self.query_format(raw_handle);
-        self.record(TextureRead::PixelFormat(raw_handle, format));
+        self.record(EnvRead::PixelFormat(raw_handle, format));
         format
     }
 
     fn is_texture_pixel_format_integer(&self, raw_handle: u32) -> bool {
         let integer = self.query_integer(raw_handle);
-        self.record(TextureRead::Integer(raw_handle, integer));
+        self.record(EnvRead::Integer(raw_handle, integer));
         integer
     }
 

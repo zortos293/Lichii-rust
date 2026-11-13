@@ -15,8 +15,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use lichii_common::DAddr;
 use lichii_common::settings::ResolutionScale;
+use lichii_common::{DAddr, GpuVAddr};
+use lichii_gpu::gmmu::{Gmmu, RangeTarget};
 use lichii_shader::backend::Bindings;
 use lichii_shader::profile::HostTranslateInfo;
 use lichii_shader::translate::TranslateOptions;
@@ -25,7 +26,7 @@ use lichii_shader::{
     compile_dual_vertex,
 };
 
-use super::environment::{ProgramEnv, TextureRead};
+use super::environment::{EnvRead, ProgramEnv};
 use super::{FxBuildHasher, FxHasher};
 
 /// Counts since the cache was created.
@@ -38,12 +39,14 @@ pub struct ShaderCacheStats {
     pub hits: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct ProgramBytes {
     len: u64,
     hash: u64,
     /// A guest write touched the bytes since they were hashed.
     stale: bool,
+    /// The device ranges backing the bytes, which need not be contiguous.
+    segments: Vec<(DAddr, u64)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -54,7 +57,7 @@ struct ModuleKey {
 }
 
 struct Variant {
-    reads: [Vec<TextureRead>; 2],
+    reads: [Vec<EnvRead>; 2],
     bindings: Bindings,
     module: Option<Arc<ShaderModule>>,
 }
@@ -64,7 +67,11 @@ pub struct ShaderCache {
     profile: Profile,
     host: HostTranslateInfo,
     scale: ResolutionScale,
-    programs: BTreeMap<DAddr, ProgramBytes>,
+    /// By the device address of the program's first byte.
+    programs: HashMap<DAddr, ProgramBytes, FxBuildHasher>,
+    /// Every device range backing a program, keyed by its start and the program's key, to
+    /// its length.
+    segments: BTreeMap<(DAddr, DAddr), u64>,
     longest: u64,
     modules: HashMap<ModuleKey, Vec<Variant>, FxBuildHasher>,
     bytes: Vec<u8>,
@@ -77,7 +84,8 @@ impl ShaderCache {
             profile,
             host,
             scale: ResolutionScale::X1,
-            programs: BTreeMap::new(),
+            programs: HashMap::default(),
+            segments: BTreeMap::new(),
             longest: 0,
             modules: HashMap::default(),
             bytes: Vec::new(),
@@ -98,14 +106,15 @@ impl ShaderCache {
         self.scale = scale;
     }
 
-    /// The guest wrote `[daddr, +size)`: programs there are hashed again before their next use.
+    /// The guest wrote `[daddr, +size)`: programs any of whose device ranges it touches are
+    /// hashed again before their next use.
     pub fn invalidate(&mut self, daddr: DAddr, size: u64) {
         let end = daddr.saturating_add(size);
-        for (&start, program) in self
-            .programs
-            .range_mut(daddr.saturating_sub(self.longest)..end)
-        {
-            if start + program.len > daddr {
+        let from = (daddr.saturating_sub(self.longest), 0);
+        for (&(start, key), &len) in self.segments.range(from..(end, 0)) {
+            if start + len > daddr
+                && let Some(program) = self.programs.get_mut(&key)
+            {
                 program.stale = true;
             }
         }
@@ -183,14 +192,10 @@ impl ShaderCache {
     /// The hash of the program at `env`'s address, when its extent is known.
     fn known(&mut self, env: &ProgramEnv<'_>) -> Option<u64> {
         let daddr = env.gmmu().translate(env.code_start())?;
-        let program = self.programs.get_mut(&daddr)?;
+        let program = self.programs.get(&daddr)?;
         if program.stale {
-            self.bytes.resize(program.len as usize, 0);
-            env.gmmu()
-                .read_block(env.code_start(), &mut self.bytes)
-                .ok()?;
-            program.hash = hash_code(&self.bytes);
-            program.stale = false;
+            let len = program.len;
+            return Some(self.track(env.gmmu(), env.code_start(), len, daddr));
         }
         Some(program.hash)
     }
@@ -198,21 +203,47 @@ impl ShaderCache {
     /// Hashes the bytes the last translation on `env` read and remembers them by address.
     fn learn(&mut self, env: &ProgramEnv<'_>) -> u64 {
         let (start, len) = env.code_range();
-        self.bytes.resize(len as usize, 0);
-        let _ = env.gmmu().read_block(start, &mut self.bytes);
-        let hash = hash_code(&self.bytes);
-        if let Some(daddr) = env.gmmu().translate(start) {
-            self.longest = self.longest.max(len);
-            self.programs.insert(
-                daddr,
-                ProgramBytes {
-                    len,
-                    hash,
-                    stale: false,
-                },
-            );
+        match env.gmmu().translate(start) {
+            Some(daddr) => self.track(env.gmmu(), start, len, daddr),
+            None => self.hash_bytes(env.gmmu(), start, len),
+        }
+    }
+
+    /// Hashes the `len` program bytes at `start` (device address `key`) and registers every
+    /// device range now backing them.
+    fn track(&mut self, gmmu: &Gmmu, start: GpuVAddr, len: u64, key: DAddr) -> u64 {
+        let hash = self.hash_bytes(gmmu, start, len);
+        let mut segments = Vec::new();
+        gmmu.for_each_range(start, len, |range| {
+            if let RangeTarget::Device(daddr) = range.target {
+                segments.push((daddr, range.size));
+            }
+        });
+        for &(daddr, size) in &segments {
+            self.longest = self.longest.max(size);
+            self.segments.insert((daddr, key), size);
+        }
+        let program = ProgramBytes {
+            len,
+            hash,
+            stale: false,
+            segments,
+        };
+        if let Some(old) = self.programs.insert(key, program) {
+            let current = &self.programs[&key].segments;
+            for &(daddr, _) in &old.segments {
+                if !current.iter().any(|&(d, _)| d == daddr) {
+                    self.segments.remove(&(daddr, key));
+                }
+            }
         }
         hash
+    }
+
+    fn hash_bytes(&mut self, gmmu: &Gmmu, start: GpuVAddr, len: u64) -> u64 {
+        self.bytes.resize(len as usize, 0);
+        let _ = gmmu.read_block(start, &mut self.bytes);
+        hash_code(&self.bytes)
     }
 }
 

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use ash::vk;
 use lichii_common::GpuVAddr;
-use lichii_common::settings::Anisotropy;
+use lichii_common::settings::{Anisotropy, ResolutionScale};
 use lichii_gpu::backend::{
     ChannelId, ComputeContext, ConstBufferBinding, DrawParams, GraphicsContext, IndirectDraw,
 };
@@ -62,6 +62,7 @@ enum Warning {
     IndirectScattered = 1 << 3,
     NoIndirectCount = 1 << 4,
     PushConstantOverlap = 1 << 5,
+    RescaledTexture = 1 << 6,
 }
 
 /// A descriptor write of the current draw: `count` infos from `first` of the info list for
@@ -89,7 +90,8 @@ pub(super) struct DrawState {
     pub(super) shaders: ShaderCache,
     fixed: FixedStateTracker,
     descriptors: DescriptorAllocator,
-    samplers: HashMap<[u32; 8], vk::Sampler, FxBuildHasher>,
+    /// By sampler header words and the anisotropy setting they were created with.
+    samplers: HashMap<([u32; 8], u8), vk::Sampler, FxBuildHasher>,
     sampler_caps: SamplerCaps,
     anisotropy: Anisotropy,
     eds3: ash::ext::extended_dynamic_state3::Device,
@@ -493,8 +495,7 @@ impl VulkanRasterizer {
         let features = *draw.pipelines.features();
 
         let gmmu = ctx.memory;
-        let mut index = None;
-        for _ in 0..2 {
+        let (index, indirect) = loop {
             let merged = self.buffer_cache.stats().merged_buffers;
             self.draw.buffer_infos.clear();
             self.draw.image_infos.clear();
@@ -522,7 +523,7 @@ impl VulkanRasterizer {
                 }
             }
             self.vertex_buffers(gmmu, regs)?;
-            index = match call {
+            let index = match call {
                 DrawCall::Direct(params) => self.buffer_cache.index_buffer(
                     &mut self.scheduler,
                     &mut self.staging,
@@ -532,20 +533,20 @@ impl VulkanRasterizer {
                 )?,
                 DrawCall::Indirect(indirect) => self.indirect_index_buffer(gmmu, regs, indirect)?,
             };
+            let indirect = match call {
+                DrawCall::Indirect(draw) => match self.indirect_buffers(gmmu, draw)? {
+                    Some(buffers) => Some(buffers),
+                    None => return Ok(()),
+                },
+                DrawCall::Direct(_) => None,
+            };
             if self.buffer_cache.stats().merged_buffers == merged {
-                break;
+                break (index, indirect);
             }
-        }
+        };
         if index.is_some_and(|i: IndexBinding| i.index_count == 0) {
             return Ok(());
         }
-        let indirect = match call {
-            DrawCall::Indirect(indirect) => match self.indirect_buffers(gmmu, indirect)? {
-                Some(buffers) => Some(buffers),
-                None => return Ok(()),
-            },
-            DrawCall::Direct(_) => None,
-        };
         let set = self.descriptor_set(set_layout)?;
 
         let cmd = self.scheduler.record()?;
@@ -861,14 +862,14 @@ impl VulkanRasterizer {
             })
     }
 
-    fn target_scale(&self) -> lichii_common::settings::ResolutionScale {
+    fn target_scale(&self) -> ResolutionScale {
         let draw = &self.draw;
         draw.colors
             .iter()
             .flatten()
             .chain(draw.depth.iter())
             .find_map(|t| self.texture_cache.state(t.id))
-            .map_or(lichii_common::settings::ResolutionScale::X1, |s| s.scale)
+            .map_or(ResolutionScale::X1, |s| s.scale)
     }
 
     /// Appends `module`'s descriptors to the current draw's writes. `false` skips the draw.
@@ -938,8 +939,23 @@ impl VulkanRasterizer {
                             } else {
                                 self.texture_view(src, raw, desc.ty)?
                             };
+                            if let Some((id, _)) = texture
+                                && self
+                                    .texture_cache
+                                    .state(id)
+                                    .is_some_and(|s| s.scale != ResolutionScale::X1)
+                            {
+                                self.draw.warn_once(
+                                    Warning::RescaledTexture,
+                                    "a draw samples a rescaled image, which needs per-binding scale bits; skipping it",
+                                );
+                                return Ok(false);
+                            }
                             let view = match texture {
-                                Some(view) => view,
+                                Some((id, view)) => {
+                                    self.draw.textures.push(id);
+                                    view
+                                }
                                 None if desc.ty == TextureType::Color2D && !desc.is_depth => {
                                     self.draw.null_view.raw()
                                 }
@@ -997,13 +1013,14 @@ impl VulkanRasterizer {
         self.draw.buffer_infos.push(info);
     }
 
-    /// The view of the texture `raw` selects, read as `ty`; `None` when nothing backs it.
+    /// The image and view of the texture `raw` selects, read as `ty`; `None` when nothing
+    /// backs it.
     fn texture_view(
         &mut self,
         src: &StageSources<'_>,
         raw: u32,
         ty: TextureType,
-    ) -> Result<Option<vk::ImageView>> {
+    ) -> Result<Option<(ImageId, vk::ImageView)>> {
         let (index, _) = src.pool.split(raw);
         if index > src.pool.limit {
             return Ok(None);
@@ -1021,11 +1038,7 @@ impl VulkanRasterizer {
             return Ok(None);
         };
         view.view_type = view_type(ty);
-        let raw = self.texture_cache.view(id, &view)?;
-        if raw.is_some() {
-            self.draw.textures.push(id);
-        }
-        Ok(raw)
+        Ok(self.texture_cache.view(id, &view)?.map(|raw| (id, raw)))
     }
 
     /// The host sampler for sampler header `index`, created on first use.
@@ -1037,12 +1050,13 @@ impl VulkanRasterizer {
         } else {
             [0; 8]
         };
-        if let Some(&sampler) = self.draw.samplers.get(&words) {
+        let key = (words, self.draw.anisotropy as u8);
+        if let Some(&sampler) = self.draw.samplers.get(&key) {
             return Ok(sampler);
         }
         let params = SamplerParams::new(&Tsc(words), self.draw.anisotropy, &self.draw.sampler_caps);
         let sampler = params.create(&self.device)?;
-        self.draw.samplers.insert(words, sampler);
+        self.draw.samplers.insert(key, sampler);
         Ok(sampler)
     }
 
@@ -1220,7 +1234,7 @@ impl VulkanRasterizer {
         (stages, size): (vk::ShaderStageFlags, u32),
         rescaling: bool,
         render_area: Option<(f32, f32)>,
-        scale: lichii_common::settings::ResolutionScale,
+        scale: ResolutionScale,
     ) {
         if size == 0 {
             return;
@@ -1232,7 +1246,7 @@ impl VulkanRasterizer {
             bytes[24..28].copy_from_slice(&down.to_le_bytes());
         }
         if let Some((width, height)) = render_area {
-            if rescaling && scale != lichii_common::settings::ResolutionScale::X1 {
+            if rescaling && scale != ResolutionScale::X1 {
                 self.draw.warn_once(
                     Warning::PushConstantOverlap,
                     "a draw needs the render area and rescaling push constants at one offset; rescaled texture reads may be wrong",
@@ -1261,7 +1275,7 @@ impl VulkanRasterizer {
         features: &PipelineFeatures,
         topology: vk::PrimitiveTopology,
         extent: vk::Extent2D,
-        scale: lichii_common::settings::ResolutionScale,
+        scale: ResolutionScale,
     ) {
         let raw = &self.device.raw;
         let draw = &mut self.draw;
@@ -1637,7 +1651,7 @@ impl VulkanRasterizer {
             samplers: ctx.samplers,
             sampler_limit: ctx.sampler_limit,
         };
-        for _ in 0..2 {
+        loop {
             let merged = self.buffer_cache.stats().merged_buffers;
             self.draw.buffer_infos.clear();
             self.draw.image_infos.clear();
@@ -1672,14 +1686,7 @@ impl VulkanRasterizer {
                 );
             }
         }
-        self.push_constants(
-            cmd,
-            layout_raw,
-            push,
-            false,
-            None,
-            lichii_common::settings::ResolutionScale::X1,
-        );
+        self.push_constants(cmd, layout_raw, push, false, None, ResolutionScale::X1);
         let barrier = vk::MemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
             .src_access_mask(vk::AccessFlags2::SHADER_WRITE)

@@ -693,6 +693,29 @@ impl Rasterizer for VulkanRasterizer {
         self.texture_cache.invalidate_lookups();
     }
 
+    fn barrier(&mut self) {
+        let cmd = match self.scheduler.record() {
+            Ok(cmd) => cmd,
+            Err(error) => {
+                tracing::error!(%error, "recording a guest barrier failed");
+                return;
+            }
+        };
+        let barrier = vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE);
+        // SAFETY: `cmd` is recording outside any rendering; draws begin and end theirs.
+        unsafe {
+            self.device.raw.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().memory_barriers(&[barrier]),
+            );
+        }
+        self.unflushed = true;
+    }
+
     fn flush_commands(&mut self) {
         self.flush();
     }

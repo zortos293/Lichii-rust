@@ -1,9 +1,12 @@
 //! Draws of hand-assembled Maxwell programs on synthetic 3D engine state.
 
-use lichii_gpu::backend::{ChannelId, Rasterizer};
-use lichii_gpu::backend::{ConstBufferBinding, DrawParams, GraphicsContext};
+use lichii_common::settings::{Anisotropy, GraphicsSettings, ResolutionScale};
+use lichii_gpu::backend::{
+    ChannelId, ComputeContext, ConstBufferBinding, DrawParams, GraphicsConstBuffers,
+    GraphicsContext, IndirectDraw, QmdVersion, Rasterizer,
+};
 use lichii_gpu::engines::maxwell_3d::regs::{
-    DepthMode, MAX_CONST_BUFFERS, MAX_SHADER_STAGE, PipelineBits, PrimitiveTopology,
+    ClearSurface, DepthMode, MAX_CONST_BUFFERS, MAX_SHADER_STAGE, PipelineBits, PrimitiveTopology,
     RenderTargetConfigBits, RtControl, ShaderType, SurfaceClipBits, SurfaceClipBits1, TileMode,
     VertexAttribute, VertexStreamBits,
 };
@@ -14,6 +17,8 @@ use lichii_shader::maxwell::opcode::Opcode;
 use lichii_texture::block_linear::{GobLayout, Tiling};
 
 use super::super::tests::{DADDR, Fixture, GPU_VA, fixture, gmmu, guest_linear};
+use super::{StageSources, Warning};
+use crate::pipeline::environment::TexturePool;
 
 const SIZE: u32 = 16;
 const PROGRAMS: u64 = 0x10_0000;
@@ -161,8 +166,7 @@ fn draw_fixture() -> Option<(Fixture, Gmmu)> {
     Some((f, gmmu))
 }
 
-fn draw(f: &mut Fixture, gmmu: &Gmmu, regs: &Regs) {
-    let mut dirty = DirtyState::new();
+fn const_buffers() -> GraphicsConstBuffers {
     let mut const_buffers = [[ConstBufferBinding::default(); MAX_CONST_BUFFERS]; MAX_SHADER_STAGE];
     const_buffers[0][0] = ConstBufferBinding {
         address: GPU_VA + VERTEX_CBUF,
@@ -174,6 +178,12 @@ fn draw(f: &mut Fixture, gmmu: &Gmmu, regs: &Regs) {
         size: 0x100,
         enabled: true,
     };
+    const_buffers
+}
+
+fn draw(f: &mut Fixture, gmmu: &Gmmu, regs: &Regs) {
+    let mut dirty = DirtyState::new();
+    let const_buffers = const_buffers();
     let root_tables = [[0; 64]; 8];
     let mut ctx = GraphicsContext {
         channel: ChannelId(0),
@@ -304,5 +314,343 @@ fn draws_of_untranslatable_programs_are_skipped_without_retrying() {
         target(&mut f).iter().all(|&t| t == [0; 4]),
         "nothing was drawn"
     );
+    f.assert_no_validation_errors();
+}
+
+const TIC: u64 = 0x40_0000;
+const TSC: u64 = 0x40_1000;
+const TEXTURE: u64 = 0x50_0000;
+const OTHER_TEXTURE: u64 = 0x58_0000;
+
+/// A block-linear 2D A8B8G8R8 texture header (block height 2 GOBs) with identity swizzle.
+fn tic(gpu_va: u64, width: u32, height: u32) -> [u32; 8] {
+    [
+        0x08 | 2 << 7 | 2 << 10 | 2 << 13 | 2 << 16 | 2 << 19 | 3 << 22 | 4 << 25 | 5 << 28,
+        gpu_va as u32,
+        (gpu_va >> 32) as u32 | 3 << 21,
+        1 << 3,
+        (width - 1) | 1 << 23,
+        height - 1,
+        0,
+        0,
+    ]
+}
+
+/// MOV32I `dest`, `value`.
+fn mov_f32(dest: u64, value: f32) -> u64 {
+    sass(
+        Opcode::Mov32i,
+        (u64::from(value.to_bits()) << 20) | (0xf << 12) | dest,
+    )
+}
+
+/// Samples the texture whose handle is c[0][0x40] at (0.5, 0.5) into render target 0.
+fn sampling_program() -> Vec<u8> {
+    let mut header = header(2, ShaderType::PIXEL);
+    header[18] = 0xf;
+    let tex = sass(
+        Opcode::Tex,
+        (0x10 << 36) | (7 << 51) | (0b1111 << 31) | (2 << 28) | (2 << 8),
+    );
+    program(header, &[mov_f32(2, 0.5), mov_f32(3, 0.5), tex, exit()])
+}
+
+/// `draw_regs` with texture headers at `TIC` (two entries), samplers at `TSC` and bound
+/// textures in constant buffer 0.
+fn sampling_regs() -> Box<Regs> {
+    let mut regs = draw_regs();
+    let (tic, tsc) = (GPU_VA + TIC, GPU_VA + TSC);
+    regs.tex_header.address_high = (tic >> 32) as u32;
+    regs.tex_header.address_low = tic as u32;
+    regs.tex_header.limit = 1;
+    regs.tex_sampler.address_high = (tsc >> 32) as u32;
+    regs.tex_sampler.address_low = tsc as u32;
+    regs.tex_sampler.limit = 0;
+    regs.bindless_texture_const_buffer_slot = 0;
+    regs
+}
+
+/// Fills the 16x16 texture at `offset` with `texel` and points texture header `index` at it.
+fn uniform_texture(f: &Fixture, index: u64, offset: u64, texel: [u8; 4]) {
+    let tiling = Tiling::new(SIZE, SIZE, 1, 4, 1, 0, GobLayout::Tegra);
+    write(f, offset, &texel.repeat(tiling.size_bytes() / 4));
+    let header = tic(GPU_VA + offset, SIZE, SIZE);
+    write(f, TIC + index * 32, bytemuck::cast_slice(&header));
+}
+
+#[test]
+fn guest_barriers_record_between_draws() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    let regs = draw_regs();
+    draw(&mut f, &gmmu, &regs);
+    f.rasterizer.barrier();
+    draw(&mut f, &gmmu, &regs);
+    f.rasterizer.barrier();
+    assert!(target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn indirect_draws_rebind_buffers_their_commands_merged() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    let commands = VERTICES + (64 << 10) - 8;
+    write(&f, commands, bytemuck::cast_slice(&[3u32, 1, 0, 0]));
+    let regs = draw_regs();
+    let merged = f.rasterizer.buffer_cache.stats().merged_buffers;
+    let mut dirty = DirtyState::new();
+    let const_buffers = const_buffers();
+    let root_tables = [[0; 64]; 8];
+    let mut ctx = GraphicsContext {
+        channel: ChannelId(0),
+        memory: &gmmu,
+        regs: &regs,
+        dirty: &mut dirty,
+        const_buffers: &const_buffers,
+        root_tables: &root_tables,
+    };
+    f.rasterizer.draw_indirect(
+        &mut ctx,
+        &IndirectDraw {
+            topology: PrimitiveTopology::TRIANGLES,
+            indexed: false,
+            buffer: GPU_VA + commands,
+            stride: 16,
+            max_draws: 1,
+            count_buffer: None,
+        },
+    );
+    assert_eq!(
+        f.rasterizer.buffer_cache.stats().merged_buffers,
+        merged + 1,
+        "the command buffer merged with the vertex buffer's"
+    );
+    let r = &mut f.rasterizer;
+    let current = r
+        .buffer_cache
+        .acquire(&mut r.scheduler, &mut r.staging, DADDR + VERTICES, 24)
+        .unwrap();
+    assert_eq!(
+        r.draw.vertex_buffers[0], current.buffer,
+        "the vertex binding points at the merged buffer"
+    );
+    assert!(target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn changed_bindless_handles_translate_again() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(&f, PROGRAMS + u64::from(FRAGMENT), &sampling_program());
+    uniform_texture(&f, 0, TEXTURE, [10, 200, 30, 255]);
+    uniform_texture(&f, 1, OTHER_TEXTURE, [50, 60, 70, 255]);
+    let regs = sampling_regs();
+    draw(&mut f, &gmmu, &regs);
+    assert!(
+        target(&mut f).iter().all(|&t| t == [10, 200, 30, 255]),
+        "the draw samples texture 0"
+    );
+    draw(&mut f, &gmmu, &regs);
+    assert_eq!(f.rasterizer.draw.shaders.stats().translated, 2);
+
+    write(&f, FRAGMENT_CBUF + 0x40, &1u32.to_le_bytes());
+    f.rasterizer
+        .invalidate_region(DADDR + FRAGMENT_CBUF + 0x40, 4);
+    draw(&mut f, &gmmu, &regs);
+    assert_eq!(
+        f.rasterizer.draw.shaders.stats().translated,
+        3,
+        "the handle the translator read changed"
+    );
+    assert!(target(&mut f).iter().all(|&t| t == [50, 60, 70, 255]));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn draws_sampling_rescaled_images_are_skipped() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    f.rasterizer.apply_settings(&GraphicsSettings {
+        resolution_scale: ResolutionScale::X2,
+        async_shader_compilation: false,
+        ..GraphicsSettings::default()
+    });
+    let (width, height) = (64, 320);
+    let mut clear_regs = Regs::with_defaults();
+    let rt = &mut clear_regs.rt[0];
+    rt.address_high = ((GPU_VA + TEXTURE) >> 32) as u32;
+    rt.address_low = (GPU_VA + TEXTURE) as u32;
+    rt.width = width;
+    rt.height = height;
+    rt.format = 0xd5;
+    rt.tile_mode = TileMode(1 << 4);
+    rt.bits = RenderTargetConfigBits(1);
+    clear_regs.rt_control = RtControl(1);
+    clear_regs.clear_surface = ClearSurface(0b1111 << 2);
+    clear_regs.clear_color = [0.0, 1.0, 0.0, 1.0];
+    let mut dirty = DirtyState::new();
+    let const_buffers = const_buffers();
+    let root_tables = [[0; 64]; 8];
+    let mut ctx = GraphicsContext {
+        channel: ChannelId(0),
+        memory: &gmmu,
+        regs: &clear_regs,
+        dirty: &mut dirty,
+        const_buffers: &const_buffers,
+        root_tables: &root_tables,
+    };
+    f.rasterizer.clear(&mut ctx, 1);
+
+    write(&f, PROGRAMS + u64::from(FRAGMENT), &sampling_program());
+    let header = tic(GPU_VA + TEXTURE, width, height);
+    write(&f, TIC, bytemuck::cast_slice(&header));
+    draw(&mut f, &gmmu, &sampling_regs());
+    assert_ne!(
+        f.rasterizer.draw.warned & Warning::RescaledTexture as u32,
+        0,
+        "the rescaled texture was refused"
+    );
+    assert!(
+        target(&mut f).iter().all(|&t| t == [0; 4]),
+        "nothing was drawn"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn cached_samplers_follow_the_anisotropy_setting() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let mut tsc = [0u32; 8];
+    tsc[1] = 2 | 2 << 4;
+    write(&f, TSC, bytemuck::cast_slice(&tsc));
+    let cbufs = const_buffers();
+    let src = StageSources {
+        gmmu: &gmmu,
+        cbufs: &cbufs[4],
+        pool: TexturePool {
+            address: GPU_VA + TIC,
+            limit: 0,
+            via_header_index: false,
+            switch2: false,
+        },
+        samplers: GPU_VA + TSC,
+        sampler_limit: 0,
+    };
+    let r = &mut f.rasterizer;
+    r.draw.set_anisotropy(Anisotropy::X1);
+    let x1 = r.sampler(&src, 0).unwrap();
+    r.draw.set_anisotropy(Anisotropy::X16);
+    let x16 = r.sampler(&src, 0).unwrap();
+    assert_ne!(x1, x16, "a new setting creates a new sampler");
+    r.draw.set_anisotropy(Anisotropy::X1);
+    assert_eq!(r.sampler(&src, 0).unwrap(), x1);
+    assert_eq!(r.draw.samplers.len(), 2);
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn writes_to_any_page_of_a_scattered_program_translate_it_again() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    const SECOND_PAGE: u64 = PROGRAMS + 0x1000;
+    const ELSEWHERE: u64 = 0x60_0000;
+    gmmu.map(GPU_VA + SECOND_PAGE, DADDR + ELSEWHERE, 0x1000, 0, false)
+        .unwrap();
+    let start = SECOND_PAGE - 0x60;
+    let fragment = |order: [u64; 2]| {
+        let mut header = header(2, ShaderType::PIXEL);
+        header[18] = 0xf;
+        program(
+            header,
+            &[
+                mov_cbuf(2, 8),
+                mov_cbuf(3, 12),
+                mov_cbuf(0, order[0]),
+                mov_cbuf(1, order[1]),
+                exit(),
+            ],
+        )
+    };
+    gmmu.write_block(GPU_VA + start, &fragment([0, 4])).unwrap();
+    let mut regs = draw_regs();
+    regs.pipelines[5].offset = (start - PROGRAMS) as u32;
+    draw(&mut f, &gmmu, &regs);
+    assert!(target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]));
+
+    let swapped = fragment([4, 0]);
+    let second_page = &swapped[0x60..];
+    write(&f, ELSEWHERE, second_page);
+    f.rasterizer
+        .invalidate_region(DADDR + ELSEWHERE, second_page.len() as u64);
+    draw(&mut f, &gmmu, &regs);
+    assert_eq!(
+        f.rasterizer.draw.shaders.stats().translated,
+        3,
+        "the write to the second page's device memory reached the program"
+    );
+    assert!(target(&mut f).iter().all(|&t| t == [128, 255, 0, 255]));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn compute_programs_key_on_their_local_memory_size() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    const COMPUTE: u64 = 0x10_8000;
+    let mut code = 0u64.to_le_bytes().to_vec();
+    code.extend_from_slice(&exit().to_le_bytes());
+    write(&f, COMPUTE, &code);
+    let const_buffers = [ConstBufferBinding::default(); 8];
+    let qmd = [0u32; 64];
+    let dispatch = |f: &mut Fixture, local_memory_size: u32| {
+        f.rasterizer.dispatch_compute(&ComputeContext {
+            channel: ChannelId(0),
+            memory: &gmmu,
+            program: GPU_VA + COMPUTE,
+            grid: [1; 3],
+            block: [1; 3],
+            shared_memory_size: 0,
+            local_memory_size,
+            const_buffers: &const_buffers,
+            texture_headers: 0,
+            texture_header_limit: 0,
+            samplers: 0,
+            sampler_limit: 0,
+            linked_samplers: false,
+            qmd_version: QmdVersion::V2,
+            qmd: &qmd,
+        });
+    };
+    dispatch(&mut f, 0);
+    dispatch(&mut f, 0);
+    let stats = f.rasterizer.draw.shaders.stats();
+    assert_eq!((stats.translated, stats.failed, stats.hits), (1, 0, 1));
+    dispatch(&mut f, 64);
+    assert_eq!(
+        f.rasterizer.draw.shaders.stats().translated,
+        2,
+        "a different local memory size translates its own module"
+    );
+    f.rasterizer.wait_for_idle();
     f.assert_no_validation_errors();
 }
