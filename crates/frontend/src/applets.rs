@@ -168,12 +168,9 @@ impl KeyboardDialog {
                 }
             });
         });
-        let Some(ok) = clicked
+        let ok = clicked
             .or(enter.then_some(true))
-            .or((escape && confirm).then_some(false))
-        else {
-            return None;
-        };
+            .or((escape && confirm).then_some(false))?;
         if ok && confirm {
             return Some(SoftwareKeyboardAnswer::Submitted(self.text.clone()));
         }
