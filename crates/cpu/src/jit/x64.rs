@@ -57,6 +57,9 @@ pub(super) struct Target {
     pub cmpxchg16b: bool,
     /// The host has FMA3, which the fused multiply-adds need.
     pub fma: bool,
+    /// The host has SSE4.1 and SSE4.2.
+    pub sse41: bool,
+    pub sse42: bool,
 }
 
 /// Machine code for one block and its fastmem access sites as `(access, slow path)` offsets.
