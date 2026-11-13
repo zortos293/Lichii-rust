@@ -7,7 +7,7 @@ use std::sync::Arc;
 use lichii_common::ConsoleGeneration;
 use lichii_crypto::KeySet;
 use lichii_fs::cnmt::{ContentMetaType, ContentType};
-use lichii_fs::host::HostFile;
+use lichii_fs::host::{HostDir, HostFile};
 use lichii_fs::nacp::{Nacp, NacpLanguage};
 use lichii_fs::nca::FsType;
 use lichii_fs::pfs::{PartitionFs, PartitionKind};
@@ -158,6 +158,10 @@ impl Contents {
             .min();
         for extra in &options.updates_and_dlc {
             index.merge(open_container(extra, &HostFile::open(extra)?, &mut keys)?);
+        }
+        for registered in options.installed.iter().filter(|dir| dir.is_dir()) {
+            let dir = HostDir::open(registered)?;
+            index.merge(ContentIndex::from_registered(dir.as_ref(), &mut keys)?);
         }
         Ok(Self {
             index,
@@ -651,6 +655,66 @@ mod tests {
                 0xb0,
             ),
         ]
+    }
+
+    /// An update older than [`update_files`] (version 0x8000) with its own program and content ids.
+    fn old_update_files() -> Files {
+        let program = nca(
+            NCA_PROGRAM,
+            APP | 0x800,
+            vec![
+                pfs_section(exefs(3)),
+                patch_section(&base_romfs(), &patched_romfs(), 1),
+            ],
+        );
+        let control_tree = romfs(&[("control.nacp", nacp("Lichii Old Update", "1.5.0"))]);
+        let control = nca(NCA_CONTROL, APP | 0x800, vec![romfs_section(control_tree)]);
+        vec![
+            (content_name(0xd1), program),
+            (content_name(0xd2), control),
+            meta(
+                APP | 0x800,
+                0x8000,
+                0x81,
+                APP,
+                &[(CNMT_PROGRAM, 0xd1), (CNMT_CONTROL, 0xd2)],
+                0xd0,
+            ),
+        ]
+    }
+
+    /// Writes `files` as a registered content folder, the way an install leaves them.
+    fn write_registered(dir: &Path, files: Files) -> PathBuf {
+        let registered = dir.join("user/Contents/registered");
+        std::fs::create_dir_all(&registered).unwrap();
+        for (name, data) in files {
+            std::fs::write(registered.join(name), data).unwrap();
+        }
+        registered
+    }
+
+    #[test]
+    fn the_newest_update_wins_whether_installed_or_passed() {
+        let temp = TempDir::new("installed");
+        let base = write_nsp(&temp.0, "base.nsp", base_files());
+        let old = write_nsp(&temp.0, "old.nsp", old_update_files());
+        let installed = write_registered(&temp.0.join("new"), update_files());
+        let options = LoadOptions {
+            updates_and_dlc: vec![old],
+            installed: vec![installed, temp.0.join("missing")],
+            ..with_keys()
+        };
+        check_updated(&load(&base, &options).unwrap());
+
+        let new = write_nsp(&temp.0, "new.nsp", update_files());
+        let installed_old = write_registered(&temp.0.join("old"), old_update_files());
+        let options = LoadOptions {
+            updates_and_dlc: vec![new],
+            installed: vec![installed_old],
+            ..with_keys()
+        };
+        check_updated(&load(&base, &options).unwrap());
+        assert_eq!(scan(&base, &options).unwrap().version, "2.0.0");
     }
 
     fn dlc_files(version: u32, payload: &[u8]) -> Files {

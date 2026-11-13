@@ -3,7 +3,7 @@
 use std::sync::{Arc, Weak};
 
 use lichii_common::{ConsoleGeneration, HleResult, PAGE_SIZE, VAddr, align_up};
-use lichii_loader::npdm::{AddressSpaceType, PoolPartition};
+use lichii_loader::npdm::{AddressSpaceType, PoolPartition, ServiceAccess};
 use lichii_loader::program::{Module, Permission, ProgramImage};
 use lichii_memory::{AddressSpace, MemoryPermission};
 use parking_lot::{Mutex, RwLock};
@@ -41,6 +41,8 @@ pub struct ProcessParams {
     pub system_resource_size: u64,
     /// Raw kernel capability descriptors (ACI0).
     pub capabilities: Vec<u32>,
+    /// The services the NPDM lets the process open; empty for a program without one.
+    pub services: ServiceAccess,
 }
 
 impl ProcessParams {
@@ -68,6 +70,7 @@ impl ProcessParams {
             main_thread_stack_size: u64::from(image.main_thread.stack_size),
             system_resource_size: u64::from(image.system_resource_size),
             capabilities: image.kernel_capabilities.clone(),
+            services: image.services.clone(),
         })
     }
 }

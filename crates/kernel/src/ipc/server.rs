@@ -143,6 +143,7 @@ impl ServiceThread {
         ctx.server = None;
         ctx.copy_objects.clear();
         ctx.move_objects.clear();
+        ctx.input_objects.clear();
         clear_outputs(ctx);
         if let Err(code) = outcome {
             thread.wake(token, WakeResult::error(code));
@@ -199,6 +200,9 @@ impl ServiceThread {
                 };
                 ctx.move_objects.push(object);
             }
+        }
+        for &id in &ctx.request.input_objects {
+            ctx.input_objects.push(server.object(id));
         }
         ctx.pending = Some(pending);
         let code = match ctx.request.ty {
@@ -468,6 +472,11 @@ pub struct ClientSession {
 }
 
 impl ClientSession {
+    /// The HLE handler behind a session that is not a domain.
+    pub(crate) fn handler(&self) -> Option<Arc<dyn SessionHandler>> {
+        self.session.server.handler()
+    }
+
     /// Name of the handler behind the session, for logs.
     pub fn name(&self) -> String {
         match &*self.session.server.target.lock() {

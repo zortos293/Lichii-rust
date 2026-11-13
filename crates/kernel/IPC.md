@@ -85,6 +85,7 @@ drops everything the handler pushed (data, handles, interfaces).
 | `thread()`, `process()`, `memory()` | The client thread, its process and its address space. |
 | `copy_object(i)`, `copy_handle::<T>(i)` | The object behind copy handle `i`. Pseudo-handles resolve to the client's process or thread; handle 0 is `None`. |
 | `take_move_object(i)` | The object behind move handle `i`. The client has already lost that handle. |
+| `input_object(i)` | Input object `i` as its `SessionHandler`: in a domain, the domain object whose id follows the request data (it stays in the domain); otherwise the HLE handler of the session moved as handle `i`. A service recognises its own objects with `SessionHandler::as_any`, which defaults to `None`. |
 
 ### Buffers
 
@@ -139,11 +140,14 @@ specially built session; `push_interface` is the usual way.
   `sm::INVALID_CLIENT` before `RegisterClient`, and `sm::INVALID_SERVICE_NAME` for malformed
   names). 2/3 (guest `RegisterService`/`UnregisterService`) return `sm::NOT_ALLOWED`, because
   only HLE services register.
+  `GetServiceHandle` for a name the client's NPDM service list does not match (`*` ends a
+  prefix) is logged, and fails with `sm::NOT_ALLOWED` when
+  `Settings::system.enforce_service_access` is on (off by default until NPDM parsing has been
+  checked against real titles). Homebrew without an NPDM gets the loader's `*` list.
 
 ## Not supported yet
 
 - Guest servers: `CreateSession`, `AcceptSession`, `ReplyAndReceive`, `CreatePort`,
   `ManageNamedPort`, `ConnectToPort` and guest `RegisterService`. Titles do not use them;
   sysmodules would.
-- `SendAsyncRequestWithUserBuffer` (0x23), domain input objects, and inline C buffers.
-- Per-process service access control (the NPDM `services` list) is not enforced by `sm:`.
+- `SendAsyncRequestWithUserBuffer` (0x23) and inline C buffers.

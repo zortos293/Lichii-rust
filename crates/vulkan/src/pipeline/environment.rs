@@ -92,7 +92,8 @@ const NULL_TEXTURE: TextureDescriptor = TextureDescriptor {
     normalized_coords: true,
 };
 
-fn texture_type(desc: &TextureDescriptor) -> TextureType {
+/// The texture type a shader reads the header `desc` as.
+pub fn texture_type(desc: &TextureDescriptor) -> TextureType {
     use tic::TextureType as T;
     match desc.texture_type {
         T::D1 => TextureType::Color1D,

@@ -27,6 +27,8 @@ pub struct TestEnv {
     pub header: [u32; 20],
     pub cbuf: Vec<u32>,
     pub local_memory: u32,
+    pub shared_memory: u32,
+    pub workgroup: [u32; 3],
     pub mesh: Option<MeshState>,
 }
 
@@ -40,6 +42,8 @@ impl TestEnv {
             header: [0; 20],
             cbuf: Vec::new(),
             local_memory: 0,
+            shared_memory: 0,
+            workgroup: [1, 1, 1],
             mesh: None,
         }
     }
@@ -88,10 +92,10 @@ impl ShaderEnvironment for TestEnv {
         self.cbuf.get((offset / 4) as usize).copied().unwrap_or(0)
     }
     fn shared_memory_size(&self) -> u32 {
-        0
+        self.shared_memory
     }
     fn workgroup_size(&self) -> [u32; 3] {
-        [1, 1, 1]
+        self.workgroup
     }
     fn mesh_state(&self) -> Option<MeshState> {
         self.mesh

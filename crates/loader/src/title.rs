@@ -83,6 +83,10 @@ pub struct LoadOptions {
     /// NSP or XCI packages whose updates and DLC apply to the title being loaded, merged with
     /// the title's own package. The newest patch of the application wins.
     pub updates_and_dlc: Vec<PathBuf>,
+    /// Registered content folders (a NAND or SD card `Contents/registered`) whose installed updates
+    /// and DLC apply like [`Self::updates_and_dlc`]; the newest patch wins whichever list it came
+    /// from. Folders that do not exist are skipped.
+    pub installed: Vec<PathBuf>,
     /// The program of a multi-program application to load (its CNMT id offset); 0 is the main
     /// program.
     pub program_index: u8,
@@ -97,6 +101,7 @@ impl Default for LoadOptions {
             language: NacpLanguage::AmericanEnglish,
             keys: None,
             updates_and_dlc: Vec::new(),
+            installed: Vec::new(),
             program_index: 0,
             mods: ModOptions::default(),
         }
