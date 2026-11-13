@@ -1600,6 +1600,35 @@ fn side_commands_wait_behind_a_sync_entry_queued_before_them() {
 }
 
 #[test]
+fn submissions_after_a_held_side_command_keep_their_place() {
+    each_mode(|threading| {
+        let mut rig = Rig::deferred(threading);
+        let waiter = rig.channel(HostClass::Ampere);
+        let other = rig.channel(HostClass::Ampere);
+        let (writer, list) = list_written_by_a_release(&mut rig);
+        let words = Pushbuffer::default().bind(0, AMPERE_3D).inc(0, 0x702, &[2]);
+        rig.gpu.pause(true);
+        rig.gpu
+            .submit(waiter, Submission::new(&[writer, sync(list)]));
+        let log = rig.log.clone();
+        rig.gpu.run_in_order(move |_| log.lock().push(Event::Ran));
+        rig.submit(other, &words.0);
+        rig.gpu.pause(false);
+        rig.gpu.synchronize();
+        let order: Vec<_> = rig
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Ran => Some(0),
+                Event::Method { method, .. } if method == 0x701 || method == 0x702 => Some(method),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, [0x701, 0, 0x702], "{threading:?}");
+    });
+}
+
+#[test]
 fn a_sync_entry_suspends_only_its_channel() {
     each_mode(|threading| {
         let mut rig = Rig::deferred(threading);

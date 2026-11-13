@@ -312,7 +312,10 @@ impl Front {
         }
     }
 
-    /// Runs the channels whose wait is over. Returns whether any ran.
+    /// Handles the held commands in queue order. A side command stops the queue while a channel
+    /// is parked on a fetch synchronisation, because it must follow that channel's earlier
+    /// entries; the commands after it wait too, so that a later submission cannot land before
+    /// it. The wait ends once the back reaches the synchronisation.
     fn handle_held(&mut self) {
         while let Some(command) = self.held.pop_front() {
             if matches!(command, CpuCommand::Side(_))
@@ -329,6 +332,7 @@ impl Front {
         }
     }
 
+    /// Runs the channels whose wait is over. Returns whether any ran.
     fn resume(&mut self) -> bool {
         let mut resumed = false;
         for channel in self.channels.iter_mut().flatten() {
