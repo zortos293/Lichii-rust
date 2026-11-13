@@ -52,9 +52,7 @@ impl HostFp {
 
 impl Drop for HostFp {
     fn drop(&mut self) {
-        if self.0 & !MXCSR_FLAGS != MXCSR {
-            set_mxcsr(self.0);
-        }
+        set_mxcsr(self.0);
     }
 }
 
