@@ -43,7 +43,12 @@ impl GuestClock for HostClock {
 /// A kernel with 256 MiB of DRAM whose cores never run (tests drive it from the host). Its clock
 /// ticks at the generation's counter rate, as `core::System` sets it for a title.
 pub fn kernel(console: ConsoleGeneration) -> Kernel {
-    Kernel::new(KernelConfig {
+    Kernel::new(config(console)).expect("test kernel")
+}
+
+/// The configuration [`kernel`] uses; sm enforces NPDM service lists.
+pub fn config(console: ConsoleGeneration) -> KernelConfig {
+    KernelConfig {
         console,
         dram_size: 256 << 20,
         pool_layout: Some(PoolLayout {
@@ -55,6 +60,7 @@ pub fn kernel(console: ConsoleGeneration) -> Kernel {
         cpu_accuracy: CpuAccuracy::Auto,
         aslr: false,
         rng_seed: 1,
+        enforce_service_access: true,
         clock: Arc::new(HostClock {
             start: Instant::now(),
             hz: match console {
@@ -64,8 +70,7 @@ pub fn kernel(console: ConsoleGeneration) -> Kernel {
         }),
         cpu: Arc::new(|config| lichii_cpu::new_core(CpuBackend::Interpreter, config)),
         events: None,
-    })
-    .expect("test kernel")
+    }
 }
 
 /// A 64-bit application image with one 16 MiB module of zeroes; its writable part holds the

@@ -374,6 +374,7 @@ fn cores_are_created_with_the_configured_cpu_accuracy() {
         cpu_accuracy: CpuAccuracy::Paranoid,
         aslr: false,
         rng_seed: 1,
+        enforce_service_access: true,
         clock: Arc::new(super::HostClock(std::time::Instant::now())),
         cpu: Arc::new(move |config: CpuConfig| {
             recorded.lock().push(config.accuracy);

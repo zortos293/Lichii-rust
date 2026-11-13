@@ -3,7 +3,9 @@
 //! Both the CMIF and the TIPC flavours (firmware 12+, every Switch 2 title) use the same command
 //! ids. `GetServiceHandle` for a name nobody registered yet is deferred until it is registered,
 //! as Horizon's sm does; the client thread stays blocked meanwhile (NX2_NOTES row 123).
-//! A client may open only the services its NPDM lists (homebrew gets the loader's `*`).
+//! A client may open only the services its NPDM lists (homebrew gets the loader's `*`). Until
+//! NPDM parsing has been checked against real titles, that is enforced only when the kernel is
+//! configured to; otherwise sm logs the service and lets the client open it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -40,9 +42,9 @@ struct Registry {
 }
 
 /// The registry behind `sm:`.
-#[derive(Default)]
 pub struct ServiceManager {
     registry: Mutex<Registry>,
+    enforce_access: bool,
 }
 
 /// Packs a service name the way sm compares them: up to 8 bytes, zero padded.
@@ -70,6 +72,13 @@ fn display_name(name: u64) -> String {
 }
 
 impl ServiceManager {
+    pub(crate) fn new(enforce_access: bool) -> Self {
+        Self {
+            registry: Mutex::default(),
+            enforce_access,
+        }
+    }
+
     /// Registers an HLE service. Each `GetServiceHandle` gets a new session whose handler
     /// `factory` makes, served by `thread`. Clients already waiting for the name are answered.
     pub fn register(
@@ -134,9 +143,12 @@ impl ServiceManager {
             tracing::warn!(
                 service = display_name(name),
                 process = ctx.process().name(),
+                enforced = self.enforce_access,
                 "service not in the NPDM service list"
             );
-            return NOT_ALLOWED;
+            if self.enforce_access {
+                return NOT_ALLOWED;
+            }
         }
         let mut registry = self.registry.lock();
         let Some(service) = registry.services.get(&name) else {
@@ -261,52 +273,60 @@ mod tests {
     fn get_service_handle_honours_the_npdm_service_list() {
         use lichii_common::ConsoleGeneration;
 
-        use crate::testing::{IpcClient, Request, kernel, program_image};
+        use crate::testing::{IpcClient, Request, config, program_image};
+        use crate::{Kernel, KernelConfig};
 
-        let kernel = kernel(ConsoleGeneration::Switch1);
-        let thread = kernel.create_service_thread("services").unwrap();
-        for name in ["fsp-srv", "vi:m", "hid"] {
-            kernel
-                .service_manager()
-                .register(
-                    name,
-                    &thread,
-                    Arc::new(|| Arc::new(Null) as Arc<dyn SessionHandler>),
-                )
-                .unwrap();
-        }
-        let mut restricted = program_image(0x0100_0000_0000_2000);
-        restricted.services = ServiceAccess {
-            client: vec!["fsp-srv".into(), "vi:*".into()],
-            server: Vec::new(),
-        };
-        let mut empty = program_image(0x0100_0000_0000_3000);
-        empty.services = ServiceAccess::default();
-        let homebrew = program_image(0x0100_0000_0000_4000);
-        for (image, allowed) in [
-            (restricted, [true, true, false]),
-            (empty, [false, false, false]),
-            (homebrew, [true, true, true]),
-        ] {
-            let process = kernel.create_process(&image).unwrap();
-            let client = IpcClient::new(&kernel, &process);
-            let sm =
-                client.connect_handler(&thread, (kernel.service_manager().session_factory())());
-            let reply = client.send(sm, &Request::new(0).send_pid()).unwrap();
-            assert_eq!(reply.result, ResultCode::SUCCESS);
-            for (name, allowed) in ["fsp-srv", "vi:m", "hid"].into_iter().zip(allowed) {
-                let reply = client
-                    .send(sm, &Request::new(1).arg(encode_name(name).unwrap()))
+        for enforce in [true, false] {
+            let kernel = Kernel::new(KernelConfig {
+                enforce_service_access: enforce,
+                ..config(ConsoleGeneration::Switch1)
+            })
+            .unwrap();
+            let thread = kernel.create_service_thread("services").unwrap();
+            for name in ["fsp-srv", "vi:m", "hid"] {
+                kernel
+                    .service_manager()
+                    .register(
+                        name,
+                        &thread,
+                        Arc::new(|| Arc::new(Null) as Arc<dyn SessionHandler>),
+                    )
                     .unwrap();
-                let expected = if allowed {
-                    ResultCode::SUCCESS
-                } else {
-                    NOT_ALLOWED
-                };
-                assert_eq!(reply.result, expected, "{name}");
-                assert_eq!(reply.move_handles.len(), usize::from(allowed), "{name}");
             }
+            let mut restricted = program_image(0x0100_0000_0000_2000);
+            restricted.services = ServiceAccess {
+                client: vec!["fsp-srv".into(), "vi:*".into()],
+                server: Vec::new(),
+            };
+            let mut empty = program_image(0x0100_0000_0000_3000);
+            empty.services = ServiceAccess::default();
+            let homebrew = program_image(0x0100_0000_0000_4000);
+            for (image, listed) in [
+                (restricted, [true, true, false]),
+                (empty, [false, false, false]),
+                (homebrew, [true, true, true]),
+            ] {
+                let process = kernel.create_process(&image).unwrap();
+                let client = IpcClient::new(&kernel, &process);
+                let sm =
+                    client.connect_handler(&thread, (kernel.service_manager().session_factory())());
+                let reply = client.send(sm, &Request::new(0).send_pid()).unwrap();
+                assert_eq!(reply.result, ResultCode::SUCCESS);
+                for (name, listed) in ["fsp-srv", "vi:m", "hid"].into_iter().zip(listed) {
+                    let allowed = listed || !enforce;
+                    let reply = client
+                        .send(sm, &Request::new(1).arg(encode_name(name).unwrap()))
+                        .unwrap();
+                    let expected = if allowed {
+                        ResultCode::SUCCESS
+                    } else {
+                        NOT_ALLOWED
+                    };
+                    assert_eq!(reply.result, expected, "{name}, enforce {enforce}");
+                    assert_eq!(reply.move_handles.len(), usize::from(allowed), "{name}");
+                }
+            }
+            kernel.shutdown();
         }
-        kernel.shutdown();
     }
 }

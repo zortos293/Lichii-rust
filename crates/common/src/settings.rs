@@ -272,6 +272,8 @@ pub struct SystemSettings {
     pub time_zone: String,
     /// Whether titles may go online; when false the network services report no connection.
     pub network_enabled: bool,
+    /// Refuse services a title's NPDM does not list. When false, sm only logs them.
+    pub enforce_service_access: bool,
 }
 
 /// The [`SystemSettings::time_zone`] value that follows the host's time zone.
@@ -289,6 +291,7 @@ impl Default for SystemSettings {
             rng_seed: None,
             time_zone: TIME_ZONE_AUTO.into(),
             network_enabled: false,
+            enforce_service_access: false,
         }
     }
 }
@@ -1355,6 +1358,7 @@ mod tests {
         let (settings, _) = load("");
         assert_eq!(settings.system.time_zone, TIME_ZONE_AUTO);
         assert!(!settings.system.network_enabled);
+        assert!(!settings.system.enforce_service_access);
         let text = "[system]\ntime_zone = \" Europe/Amsterdam \"\nnetwork_enabled = true\n";
         let (settings, _) = load(text);
         assert_eq!(settings.system.time_zone, "Europe/Amsterdam");

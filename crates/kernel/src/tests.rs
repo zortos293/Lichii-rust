@@ -221,6 +221,7 @@ impl TestKernel {
             cpu_accuracy: CpuAccuracy::Auto,
             aslr: false,
             rng_seed: 1,
+            enforce_service_access: true,
             clock: Arc::new(HostClock(Instant::now())),
             cpu: Arc::new(move |config: CpuConfig| {
                 Box::new(MockCore {
