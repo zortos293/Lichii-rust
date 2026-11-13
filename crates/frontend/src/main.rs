@@ -7,6 +7,7 @@ mod frame_view;
 mod game_list;
 mod hotkeys;
 mod input_worker;
+mod install;
 mod per_game;
 mod session;
 mod setup;

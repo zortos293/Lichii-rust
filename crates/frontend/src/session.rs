@@ -7,7 +7,7 @@ use std::sync::Arc;
 use lichii_common::ConsoleGeneration;
 use lichii_common::settings::{AudioSettings, Settings};
 use lichii_core::{ExitReason, Host, System, SystemError};
-use lichii_crypto::{KeyError, KeySet};
+use lichii_crypto::KeyError;
 use lichii_loader::LoadOptions;
 
 use crate::game_list::GameKind;
@@ -58,12 +58,13 @@ pub struct Session {
 }
 
 impl Session {
-    /// Loads the title at `path`, decrypting it with `keys`, and starts it. `configure` picks the
-    /// settings (a game's own configuration applies by its program id) and builds the renderer
-    /// and shared state for its console generation, both known once the title is loaded.
+    /// Loads the title at `path` with `options` (keys, installed updates and DLC) and starts it.
+    /// `configure` picks the settings (a game's own configuration applies by its program id) and
+    /// builds the renderer and shared state for its console generation, both known once the title
+    /// is loaded.
     pub fn boot(
         path: &Path,
-        keys: Arc<KeySet>,
+        options: LoadOptions,
         configure: impl FnOnce(u64, ConsoleGeneration) -> (Arc<Settings>, Host),
     ) -> Result<Self, BootError> {
         if !path.exists() {
@@ -71,10 +72,6 @@ impl Session {
         }
         let kind = GameKind::detect(path).ok_or_else(|| BootError::Unsupported(path.into()))?;
         tracing::info!("booting {} ({})", path.display(), kind.label());
-        let options = LoadOptions {
-            keys: Some(keys),
-            ..LoadOptions::default()
-        };
         let image = lichii_loader::load(path, &options).map_err(SystemError::from)?;
         let program_id = image.program_id;
         let (settings, host) = configure(program_id, image.generation);
@@ -189,20 +186,23 @@ mod tests {
     fn rejects_missing_unknown_and_unloadable_titles() {
         let missing = Path::new("/definitely/not/here.nsp");
         assert!(matches!(
-            Session::boot(missing, Arc::default(), |_, _| (settings(), Host::headless())),
+            Session::boot(missing, LoadOptions::default(), |_, _| (settings(), Host::headless())),
             Err(BootError::NotFound(path)) if path == missing
         ));
         let dir = temp_dir("reject");
         let text = dir.join("notes.txt");
         std::fs::write(&text, "x").unwrap();
         assert!(matches!(
-            Session::boot(&text, Arc::default(), |_, _| (settings(), Host::headless())),
+            Session::boot(&text, LoadOptions::default(), |_, _| (
+                settings(),
+                Host::headless()
+            )),
             Err(BootError::Unsupported(_))
         ));
         let broken = dir.join("Broken.nro");
         std::fs::write(&broken, "x").unwrap();
         assert!(matches!(
-            Session::boot(&broken, Arc::default(), |_, _| (
+            Session::boot(&broken, LoadOptions::default(), |_, _| (
                 settings(),
                 Host::headless()
             )),
@@ -216,9 +216,11 @@ mod tests {
         let dir = temp_dir("keys");
         let nca = dir.join("Game.nca");
         std::fs::write(&nca, vec![0u8; 0x4000]).unwrap();
-        let error = Session::boot(&nca, Arc::default(), |_, _| (settings(), Host::headless()))
-            .err()
-            .expect("an NCA does not boot without keys");
+        let error = Session::boot(&nca, LoadOptions::default(), |_, _| {
+            (settings(), Host::headless())
+        })
+        .err()
+        .expect("an NCA does not boot without keys");
         assert_eq!(
             error.missing_key(),
             Some(&KeyError::Missing("header_key".into())),
@@ -245,7 +247,7 @@ mod tests {
         let host = Host::headless();
         let npad = host.npad.clone();
         let mut generation = None;
-        let mut session = Session::boot(&game, Arc::default(), |_, title| {
+        let mut session = Session::boot(&game, LoadOptions::default(), |_, title| {
             generation = Some(title);
             (settings(), host)
         })
