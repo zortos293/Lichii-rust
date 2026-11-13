@@ -1541,6 +1541,7 @@ dependencies = [
 name = "lichii-core"
 version = "0.1.0"
 dependencies = [
+ "lichii-audio",
  "lichii-common",
  "lichii-cpu",
  "lichii-gpu",

@@ -33,6 +33,7 @@ pub(super) const ATOMIC_CAS: i32 = 15;
 
 /// Allocatable general-purpose registers, callee-saved ones first so slow paths save less.
 const GPRS: [u8; 9] = [3, 5, 12, 6, 7, 8, 9, 10, 11];
+const RBX: u8 = 3;
 /// `rsi rdi r8-r11`.
 const CALLER_SAVED: u16 = 0b0000_1111_1100_0000;
 const XMMS: u8 = 15;
@@ -48,6 +49,8 @@ pub(super) struct Target {
     pub exclusive: usize,
     pub zero: usize,
     pub ticks: usize,
+    /// The host has `cmpxchg16b`.
+    pub cmpxchg16b: bool,
 }
 
 /// Machine code for one block and its fastmem access sites as `(access, slow path)` offsets.
@@ -80,8 +83,11 @@ struct Stub {
     info: i32,
     vec: bool,
     dst: Option<u8>,
-    values: [Option<Src>; 2],
+    /// Up to four 64-bit operands, or one vector in the first, stored at `scratch` then `scratch2`.
+    values: [Option<Src>; 4],
     saved: [u16; 2],
+    /// Registers a `cmpxchg16b` borrowed, restored from `cx16_save` before anything else.
+    borrowed: [Option<u8>; 2],
 }
 
 const fn ctx(offset: usize) -> i32 {
@@ -100,6 +106,8 @@ const CTX_TPIDRRO: i32 = ctx(offset_of!(ThreadContext, tpidrro_el0));
 const ST_SCRATCH: i32 = ctx(offset_of!(JitState, scratch));
 const ST_SCRATCH2: i32 = ctx(offset_of!(JitState, scratch2));
 const ST_SAVE_GPR: i32 = ctx(offset_of!(JitState, save_gpr));
+const ST_HIGH: i32 = ctx(offset_of!(JitState, high));
+const ST_CX16_SAVE: i32 = ctx(offset_of!(JitState, cx16_save));
 const ST_SAVE_XMM: i32 = ctx(offset_of!(JitState, save_xmm));
 const ST_SPILL: i32 = ctx(offset_of!(JitState, spill));
 const ST_LINK: i32 = ctx(offset_of!(JitState, link));
@@ -688,6 +696,10 @@ impl Emitter<'_> {
                 );
             }
             Op::Ticks => self.call(i, self.target.ticks),
+            Op::High => {
+                let d = self.def(v);
+                dynasm!(self.asm ; .arch x64 ; mov Rq(d), QWORD [r13 + ST_HIGH]);
+            }
             Op::Fence => dynasm!(self.asm ; .arch x64 ; mfence),
             _ => self.memory(i, op),
         }
@@ -802,21 +814,42 @@ impl Emitter<'_> {
             | Op::Cas { size, addr, pc, .. }
             | Op::LoadExclusive { size, addr, pc }
             | Op::StoreExclusive { size, addr, pc, .. } => (size, addr, pc),
+            Op::StoreExclusive128 { addr, pc, .. } | Op::Cas128 { addr, pc, .. } => (4, addr, pc),
             Op::ZeroBlock { addr, pc } => (6, addr, pc),
             _ => unreachable!(),
         };
         let vec = matches!(op, Op::LoadVec { .. } | Op::StoreVec { .. });
         let a = self.reg(addr);
+        let stored = match op {
+            Op::Store { value, .. } => Some(self.src(value, W::W64)),
+            _ => None,
+        };
+        let mut reg = |v: Value| Some(Src::Reg(self.reg(v)));
         let values = match op {
-            Op::Store { value, .. } => [Some(self.src(value, W::W64)), None],
+            Op::Store { .. } => [stored, None, None, None],
             Op::StoreVec { value, .. }
             | Op::AtomicRmw { value, .. }
-            | Op::StoreExclusive { value, .. } => [Some(Src::Reg(self.reg(value))), None],
-            Op::Cas { expected, new, .. } => [
-                Some(Src::Reg(self.reg(expected))),
-                Some(Src::Reg(self.reg(new))),
+            | Op::StoreExclusive { value, .. } => [reg(value), None, None, None],
+            Op::Cas { expected, new, .. } => [reg(expected), None, reg(new), None],
+            Op::StoreExclusive128 { low, high, .. } => [reg(low), reg(high), None, None],
+            Op::Cas128 {
+                expected_low,
+                expected_high,
+                new_low,
+                new_high,
+                ..
+            } => [
+                reg(expected_low),
+                reg(expected_high),
+                reg(new_low),
+                reg(new_high),
             ],
-            _ => [None, None],
+            _ => [None; 4],
+        };
+        let borrowed = if matches!(op, Op::StoreExclusive128 { .. } | Op::Cas128 { .. }) {
+            self.borrow_for_cx16(a, &values)
+        } else {
+            [None; 2]
         };
         let dst = (op.ty() != Ty::Void).then(|| self.def(Value(i as u32)));
         let label = self.asm.new_dynamic_label();
@@ -829,6 +862,8 @@ impl Emitter<'_> {
                         | Op::Cas { .. }
                         | Op::LoadExclusive { .. }
                         | Op::StoreExclusive { .. }
+                        | Op::StoreExclusive128 { .. }
+                        | Op::Cas128 { .. }
                 );
                 if aligned && size > 0 {
                     let misaligned = (1i32 << size) - 1;
@@ -841,7 +876,7 @@ impl Emitter<'_> {
                     ; cmp Rq(a), rax
                     ; ja =>label
                 );
-                self.access(op, a, dst, values)
+                self.access(op, a, dst, values, borrowed)
             }
             None => {
                 dynasm!(self.asm ; .arch x64 ; jmp =>label);
@@ -855,7 +890,10 @@ impl Emitter<'_> {
             Op::AtomicRmw { op, .. } => (self.target.atomic, size as i32 | (op as i32) << 8),
             Op::Cas { .. } => (self.target.atomic, size as i32 | ATOMIC_CAS << 8),
             Op::LoadExclusive { .. } => (self.target.exclusive, size as i32),
-            Op::StoreExclusive { .. } => (self.target.exclusive, size as i32 | 1 << 8),
+            Op::StoreExclusive { .. } | Op::StoreExclusive128 { .. } => {
+                (self.target.exclusive, size as i32 | 1 << 8)
+            }
+            Op::Cas128 { .. } => (self.target.atomic, size as i32 | ATOMIC_CAS << 8),
             _ => (self.target.zero, size as i32),
         };
         let saved = self.live_across(i);
@@ -871,12 +909,71 @@ impl Emitter<'_> {
             dst,
             values,
             saved,
+            borrowed,
         });
+    }
+
+    /// Saves `rbx`, which `cmpxchg16b` needs for the low half of the new value, and when the
+    /// address is in `rbx` also a second register to hold it: one that holds no operand.
+    fn borrow_for_cx16(&mut self, a: u8, values: &[Option<Src>; 4]) -> [Option<u8>; 2] {
+        let operands: Vec<u8> = values
+            .iter()
+            .filter_map(|v| match v {
+                Some(Src::Reg(r)) => Some(*r),
+                _ => None,
+            })
+            .collect();
+        let second = (a == RBX).then(|| {
+            *GPRS
+                .iter()
+                .find(|&&r| r != RBX && !operands.contains(&r))
+                .expect("five operands leave a free register")
+        });
+        for (k, r) in [Some(RBX), second].into_iter().enumerate() {
+            if let Some(r) = r {
+                let offset = ST_CX16_SAVE + 8 * k as i32;
+                dynasm!(self.asm ; .arch x64 ; mov QWORD [r13 + offset], Rq(r));
+            }
+        }
+        [Some(RBX), second]
+    }
+
+    /// Runs `lock cmpxchg16b` on the guest address in `a` with `rdx:rax` already holding the expected
+    /// value: loads the new value into `rcx:rbx`, then gives back the borrowed registers. Returns the
+    /// offset of the instruction that can fault.
+    fn cmpxchg16b(&mut self, a: u8, low: u8, high: u8, borrowed: [Option<u8>; 2]) -> u32 {
+        if let Some(y) = borrowed[1] {
+            dynasm!(self.asm ; .arch x64 ; lea Rq(y), [r14 + Rq(a)]);
+        }
+        dynasm!(self.asm ; .arch x64 ; mov rcx, Rq(high) ; mov rbx, Rq(low));
+        let site = self.asm.offset().0 as u32;
+        match borrowed[1] {
+            Some(y) => dynasm!(self.asm ; .arch x64 ; lock cmpxchg16b [Rq(y)]),
+            None => dynasm!(self.asm ; .arch x64 ; lock cmpxchg16b [r14 + Rq(a)]),
+        }
+        self.give_back(borrowed);
+        site
+    }
+
+    fn give_back(&mut self, borrowed: [Option<u8>; 2]) {
+        for (k, r) in borrowed.into_iter().enumerate() {
+            if let Some(r) = r {
+                let offset = ST_CX16_SAVE + 8 * k as i32;
+                dynasm!(self.asm ; .arch x64 ; mov Rq(r), QWORD [r13 + offset]);
+            }
+        }
     }
 
     /// Emits the fastmem access itself and returns the offsets of the instructions that can
     /// fault.
-    fn access(&mut self, op: Op, a: u8, dst: Option<u8>, values: [Option<Src>; 2]) -> Vec<u32> {
+    fn access(
+        &mut self,
+        op: Op,
+        a: u8,
+        dst: Option<u8>,
+        values: [Option<Src>; 4],
+        borrowed: [Option<u8>; 2],
+    ) -> Vec<u32> {
         let at = |asm: &Asm| asm.offset().0 as u32;
         let reg = |src: Option<Src>| match src {
             Some(Src::Reg(r)) => r,
@@ -1067,7 +1164,7 @@ impl Emitter<'_> {
                 return vec![first, second];
             }
             Op::Cas { size, .. } => {
-                let (e, n, d) = (reg(values[0]), reg(values[1]), dst.unwrap());
+                let (e, n, d) = (reg(values[0]), reg(values[2]), dst.unwrap());
                 dynasm!(self.asm ; .arch x64 ; mov rax, Rq(e));
                 site = at(&self.asm);
                 match size {
@@ -1084,6 +1181,58 @@ impl Emitter<'_> {
                         dynasm!(self.asm ; .arch x64 ; lock cmpxchg QWORD [r14 + Rq(a)], Rq(n) ; mov Rq(d), rax)
                     }
                 }
+            }
+            Op::LoadExclusive { size: 4, .. } => {
+                let d = dst.unwrap();
+                site = at(&self.asm);
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; movdqu xmm15, [r14 + Rq(a)]
+                    ; mov rcx, QWORD [r13 + ST_RESERVATION]
+                    ; movdqu [rcx + RES_VALUE_LO], xmm15
+                    ; movq Rq(d), xmm15
+                    ; mov rax, QWORD [rcx + RES_VALUE_HI]
+                    ; mov QWORD [r13 + ST_HIGH], rax
+                    ; mov QWORD [rcx + RES_ADDR], Rq(a)
+                    ; mov QWORD [rcx + RES_SIZE], 16
+                );
+            }
+            Op::StoreExclusive128 { .. } => {
+                let (low, high, d) = (reg(values[0]), reg(values[1]), dst.unwrap());
+                let (lost, done) = (self.asm.new_dynamic_label(), self.asm.new_dynamic_label());
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; mov rcx, QWORD [r13 + ST_RESERVATION]
+                    ; cmp QWORD [rcx + RES_SIZE], 16
+                    ; jne =>lost
+                    ; cmp QWORD [rcx + RES_ADDR], Rq(a)
+                    ; jne =>lost
+                    ; mov rax, QWORD [rcx + RES_VALUE_LO]
+                    ; mov rdx, QWORD [rcx + RES_VALUE_HI]
+                );
+                site = self.cmpxchg16b(a, low, high, borrowed);
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; setne al
+                    ; movzx Rd(d), al
+                    ; jmp =>done
+                    ; =>lost
+                    ; mov Rd(d), 1
+                    ; =>done
+                    ; mov rcx, QWORD [r13 + ST_RESERVATION]
+                    ; mov QWORD [rcx + RES_SIZE], 0
+                );
+            }
+            Op::Cas128 { .. } => {
+                let [el, eh, nl, nh] = values.map(reg);
+                let d = dst.unwrap();
+                dynasm!(self.asm ; .arch x64 ; mov rax, Rq(el) ; mov rdx, Rq(eh));
+                site = self.cmpxchg16b(a, nl, nh, borrowed);
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; mov QWORD [r13 + ST_HIGH], rdx
+                    ; mov Rq(d), rax
+                );
             }
             Op::LoadExclusive { size, .. } => {
                 let d = dst.unwrap();
@@ -1226,8 +1375,10 @@ impl Emitter<'_> {
     fn stub(&mut self, stub: &Stub) -> u32 {
         let start = self.asm.offset().0 as u32;
         dynasm!(self.asm ; .arch x64 ; =>stub.label);
+        self.give_back(stub.borrowed);
         self.save(stub.saved);
-        for (value, offset) in stub.values.iter().zip([ST_SCRATCH, ST_SCRATCH2]) {
+        let offsets = [ST_SCRATCH, ST_SCRATCH + 8, ST_SCRATCH2, ST_SCRATCH2 + 8];
+        for (value, offset) in stub.values.iter().zip(offsets) {
             match *value {
                 Some(Src::Reg(r)) if stub.vec => {
                     dynasm!(self.asm ; .arch x64 ; movdqu [r13 + offset], Rx(r))

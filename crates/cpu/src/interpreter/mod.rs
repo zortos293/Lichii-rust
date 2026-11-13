@@ -15,7 +15,7 @@ use lichii_common::VAddr;
 
 use self::cache::BlockCache;
 use self::exec::{Exec, Flow};
-pub(crate) use self::exec::{atomic_cas, atomic_rmw, condition_holds};
+pub(crate) use self::exec::{atomic_cas, atomic_rmw, cas128, condition_holds};
 use crate::decoder::{Inst, decode};
 use crate::{CpuConfig, CpuCore, CpuFault, HaltReason, InterruptHandle, ThreadContext};
 

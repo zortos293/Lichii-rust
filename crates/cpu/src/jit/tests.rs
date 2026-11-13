@@ -226,6 +226,8 @@ enum Backend {
     Jit(Passes),
     /// The JIT on an address space without a fastmem arena.
     SlowJit,
+    /// The JIT as on a host without `cmpxchg16b`.
+    NoCmpxchg16b,
 }
 
 struct Machine {
@@ -255,6 +257,11 @@ impl Machine {
             Backend::Interpreter => Box::new(Interpreter::new(config)),
             Backend::Jit(passes) => Box::new(Jit::with_passes(config, passes).unwrap()),
             Backend::SlowJit => Box::new(Jit::new(config).unwrap()),
+            Backend::NoCmpxchg16b => {
+                let mut jit = Jit::new(config).unwrap();
+                jit.target.cmpxchg16b = false;
+                Box::new(jit)
+            }
         };
         Self { mem, core }
     }
@@ -430,6 +437,10 @@ fn directed(code: &[u32], regs: &[(usize, u64)]) {
         ("interpreter", Machine::new(Backend::Interpreter)),
         ("jit", Machine::new(Backend::Jit(Passes::ALL))),
         ("jit without fastmem", Machine::new(Backend::SlowJit)),
+        (
+            "jit without cmpxchg16b",
+            Machine::new(Backend::NoCmpxchg16b),
+        ),
     ];
     compare(&mut machines, &code, &ctx, &data);
 }
@@ -590,6 +601,11 @@ fn atomics_fault_like_the_interpreter() {
     }
 }
 
+/// Keeps a value live in the first allocatable register (`rbx`) until `ADD_X10_X22_1`, so the
+/// address of a `cmpxchg16b` between them lands elsewhere.
+const MOV_X9_X22: u32 = 0xaa16_03e9;
+const ADD_X10_X22_1: u32 = 0x9100_06ca;
+
 #[test]
 fn exclusives_match_the_interpreter() {
     const LDXR_X1_X20: u32 = 0xc85f_7e81;
@@ -601,6 +617,10 @@ fn exclusives_match_the_interpreter() {
     const STXR_W3_X4_X21: u32 = 0xc803_7ea4;
     const STR_X6_X20: u32 = 0xf900_0286;
     const CLREX: u32 = 0xd503_3f5f;
+    const LDXP_X1_X2_X20: u32 = 0xc87f_0a81;
+    const LDAXP_X1_X2_X20: u32 = 0xc87f_8a81;
+    const STXP_W3_X4_X5_X20: u32 = 0xc823_1684;
+    const STLXP_W3_X4_X5_X20: u32 = 0xc823_9684;
     let sequences: &[&[u32]] = &[
         &[LDXR_X1_X20, STXR_W3_X4_X20],
         &[LDXR_X1_X20, STXR_W3_X4_X20, STXR_W3_X4_X20],
@@ -612,12 +632,20 @@ fn exclusives_match_the_interpreter() {
         &[LDAXRB_W1_X20, STXR_W3_X4_X20],
         &[LDXP_W1_W2_X20, STXP_W3_W4_W5_X20],
         &[LDXP_W1_W2_X20, STXR_W3_X4_X20],
+        &[LDXP_X1_X2_X20, STXP_W3_X4_X5_X20],
+        &[LDAXP_X1_X2_X20, STLXP_W3_X4_X5_X20],
+        &[LDXP_X1_X2_X20, STR_X6_X20, STXP_W3_X4_X5_X20],
+        &[LDXP_X1_X2_X20, STXR_W3_X4_X20],
+        &[LDXR_X1_X20, STXP_W3_X4_X5_X20],
+        &[STXP_W3_X4_X5_X20],
+        &[MOV_X9_X22, LDXP_X1_X2_X20, STXP_W3_X4_X5_X20, ADD_X10_X22_1],
     ];
     for code in sequences {
         for addr in [
             DATA + 0x100,
             DATA + 0x101,
             DATA + 0x104,
+            DATA + 0x108,
             RODATA + 0x10,
             1 << 39,
         ] {
@@ -640,25 +668,28 @@ fn casp_matches_the_interpreter() {
     const CASP_W2_W6_X20: u32 = 0x0822_7e86;
     const CASPAL_W2_W6_X20: u32 = 0x0862_fe86;
     const CASP_X2_X6_X20: u32 = 0x4822_7e86;
-    for code in [CASP_W2_W6_X20, CASPAL_W2_W6_X20, CASP_X2_X6_X20] {
-        for addr in [
-            DATA + 0x100,
-            DATA + 0x104,
-            DATA + 0x108,
-            RODATA + 0x10,
-            1 << 39,
-        ] {
-            for expected in [0x5a5a_5a5a, 0x5a5a_5a5b] {
-                directed(
-                    &[code],
-                    &[
-                        (20, addr),
-                        (2, expected),
-                        (3, 0x5a5a_5a5a),
-                        (6, 0x1111),
-                        (7, 0x2222),
-                    ],
-                );
+    for casp in [CASP_W2_W6_X20, CASPAL_W2_W6_X20, CASP_X2_X6_X20] {
+        for code in [&[casp][..], &[MOV_X9_X22, casp, ADD_X10_X22_1]] {
+            for addr in [
+                DATA + 0x100,
+                DATA + 0x104,
+                DATA + 0x108,
+                RODATA + 0x10,
+                1 << 39,
+            ] {
+                for expected in [0x5a5a_5a5a, 0x5a5a_5a5b] {
+                    directed(
+                        code,
+                        &[
+                            (20, addr),
+                            (2, expected),
+                            (3, 0x5a5a_5a5a),
+                            (6, 0x1111),
+                            (7, 0x2222),
+                            (22, 3),
+                        ],
+                    );
+                }
             }
         }
     }
