@@ -265,7 +265,7 @@ impl GpuChannel {
             tracing::error!("GPFIFO submission before an address space was bound");
             return NvResult::InvalidState;
         };
-        let mut submission = Submission::new(entries);
+        let mut submission = Submission::new(&entries);
         if flags & FLAG_FENCE_WAIT != 0 {
             if increment_value {
                 return NvResult::BadParameter;
