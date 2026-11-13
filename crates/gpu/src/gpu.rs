@@ -460,7 +460,8 @@ impl Gpu {
             .name("gpu-activity".into())
             .spawn({
                 let activity = activity.clone();
-                move || activity.report_until_stopped(threaded, &*back_progress)
+                let syncpoints = handles.syncpoints.clone();
+                move || activity.report_until_stopped(threaded, &*back_progress, &syncpoints)
             })
             .expect("failed to start the GPU activity thread");
         Self {
