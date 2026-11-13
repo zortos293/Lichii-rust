@@ -113,6 +113,7 @@ pub(crate) fn shader_profile(
         support_float16: features.shader_float16,
         support_int64: features.shader_int64,
         support_viewport_index_layer: profile.support_viewport_index_layer_non_geometry,
+        support_handle_programs: true,
         ..HostTranslateInfo::default()
     };
     (profile, host)

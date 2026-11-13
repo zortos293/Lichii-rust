@@ -1933,3 +1933,118 @@ fn indirect_dispatches_read_the_grid_earlier_gpu_work_wrote() {
     assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
     f.assert_no_validation_errors();
 }
+
+/// A handle table in the storage buffer c[0][0x110] describes, at a pointer no storage
+/// alignment divides.
+const TABLE: u64 = SSBO + 0x24;
+
+/// Samples at (0.5, 0.5), into render target 0, the texture whose handle is word 4 of the
+/// table the storage buffer c[0][0x110] points to.
+fn table_sampling_program() -> Vec<u8> {
+    let mut header = header(2, ShaderType::PIXEL);
+    header[18] = 0xf;
+    let ldg = sass(
+        Opcode::Ldg,
+        (4 << 48) | (1 << 45) | (0x10 << 20) | (4 << 8) | 6,
+    );
+    let tex = sass(
+        Opcode::TexB,
+        (7 << 51) | (0b1111 << 31) | (2 << 28) | (6 << 20) | (2 << 8),
+    );
+    program(
+        header,
+        &[
+            mov_cbuf(4, 0x110),
+            mov_cbuf(5, 0x114),
+            ldg,
+            mov_f32(2, 0.5),
+            mov_f32(3, 0.5),
+            tex,
+            exit(),
+        ],
+    )
+}
+
+/// Points the storage buffer c[0][0x110] at `TABLE` and stores `handle` as its word 4.
+fn handle_table(f: &mut Fixture, handle: u32) {
+    let mut binding = (GPU_VA + TABLE).to_le_bytes().to_vec();
+    binding.extend_from_slice(&0x100u32.to_le_bytes());
+    write(f, FRAGMENT_CBUF + 0x110, &binding);
+    write(f, TABLE + 0x10, &handle.to_le_bytes());
+    f.rasterizer.invalidate_region(DADDR + TABLE + 0x10, 4);
+}
+
+#[test]
+fn draws_bind_the_textures_handle_programs_read_from_storage_tables() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &table_sampling_program(),
+    );
+    uniform_texture(&f, 0, TEXTURE, [10, 200, 30, 255]);
+    uniform_texture(&f, 1, OTHER_TEXTURE, [50, 60, 70, 255]);
+    let regs = sampling_regs();
+    handle_table(&mut f, 1);
+    draw(&mut f, &gmmu, &regs);
+    assert!(
+        target(&mut f).iter().all(|&t| t == [50, 60, 70, 255]),
+        "the draw samples the texture the table names"
+    );
+    let translated = f.rasterizer.draw.shaders.stats().translated;
+
+    handle_table(&mut f, 0);
+    draw(&mut f, &gmmu, &regs);
+    assert!(
+        target(&mut f).iter().all(|&t| t == [10, 200, 30, 255]),
+        "the next draw evaluates the changed table"
+    );
+    assert_eq!(
+        f.rasterizer.draw.shaders.stats().translated,
+        translated,
+        "a handle program needs no new translation"
+    );
+    assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn handle_programs_naming_an_image_of_another_kind_bind_the_null_texture() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &table_sampling_program(),
+    );
+    uniform_texture(&f, 0, TEXTURE, [10, 200, 30, 255]);
+    let mut integer = tic(GPU_VA + TEXTURE, SIZE, SIZE);
+    integer[0] =
+        0x08 | 4 << 7 | 4 << 10 | 4 << 13 | 4 << 16 | 2 << 19 | 3 << 22 | 4 << 25 | 5 << 28;
+    write(&f, TIC + 32, bytemuck::cast_slice(&integer));
+    let regs = sampling_regs();
+    handle_table(&mut f, 1);
+    draw(&mut f, &gmmu, &regs);
+    assert!(
+        target(&mut f).iter().all(|&t| t == [0; 4]),
+        "an integer image under a float descriptor reads the null texture"
+    );
+
+    let mut array = tic(GPU_VA + TEXTURE, SIZE, SIZE);
+    array[4] |= 5 << 23;
+    write(&f, TIC + 32, bytemuck::cast_slice(&array));
+    f.rasterizer.invalidate_region(DADDR + TIC + 32, 32);
+    draw(&mut f, &gmmu, &regs);
+    assert!(
+        target(&mut f).iter().all(|&t| t == [0; 4]),
+        "a 2D array image under a 2D descriptor reads the null texture"
+    );
+
+    handle_table(&mut f, 0);
+    draw(&mut f, &gmmu, &regs);
+    assert!(target(&mut f).iter().all(|&t| t == [10, 200, 30, 255]));
+    f.assert_no_validation_errors();
+}

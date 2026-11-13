@@ -40,7 +40,7 @@ use crate::descriptors::DescriptorAllocator;
 use crate::device::Device;
 use crate::error::Result;
 use crate::memory::{Buffer, BufferView, Image, ImageDesc, ImageView};
-use crate::pipeline::environment::{ProgramEnv, TexturePool};
+use crate::pipeline::environment::{ProgramEnv, TexturePool, texture_type};
 use crate::pipeline::fixed_state::flags;
 use crate::pipeline::maxwell_to_vk as mvk;
 use crate::pipeline::sampler::{SamplerCaps, SamplerParams, Tsc};
@@ -997,6 +997,7 @@ impl VulkanRasterizer {
     /// Appends `module`'s descriptors to the current draw's writes. `false` skips the draw.
     fn bind_resources(&mut self, module: &ShaderModule, src: &StageSources<'_>) -> Result<bool> {
         let info = &module.info;
+        let align = self.buffer_cache.storage_alignment();
         for set in &module.resources.sets {
             for b in &set.bindings {
                 let descriptor = b.descriptor as usize;
@@ -1051,8 +1052,16 @@ impl VulkanRasterizer {
                         let desc = info.texture_descriptors[descriptor];
                         let mut array_rescaled = None;
                         for i in 0..b.count {
-                            let raw = handle_word(src, desc.handle, i << desc.size_shift);
-                            let texture = if desc.handle_is_pointer_word {
+                            let raw = match desc.handle_program {
+                                Some(program) => program_handle(src, info, program, i, align),
+                                None => handle_word(src, desc.handle, i << desc.size_shift),
+                            };
+                            let readable = desc.handle_program.is_none_or(|_| {
+                                let header = src.pool.header(src.gmmu, raw);
+                                texture_type(&header) == desc.ty
+                                    && header.format.is_integer() == desc.is_integer
+                            });
+                            let texture = if desc.handle_is_pointer_word || !readable {
                                 None
                             } else {
                                 self.texture_view(src, raw, desc.ty)?
@@ -1101,7 +1110,10 @@ impl VulkanRasterizer {
                     DescriptorKind::UniformTexelBuffer => {
                         let desc = info.texture_buffer_descriptors[descriptor];
                         for i in 0..b.count {
-                            let raw = handle_word(src, desc.handle, i << desc.size_shift);
+                            let raw = match desc.handle_program {
+                                Some(program) => program_handle(src, info, program, i, align),
+                                None => handle_word(src, desc.handle, i << desc.size_shift),
+                            };
                             let view = self.texel_view(src, raw, None, false, false)?;
                             self.push_texel_view(view, vk::Format::R8G8B8A8_UNORM)?;
                         }
@@ -1110,9 +1122,15 @@ impl VulkanRasterizer {
                         let desc = info.image_buffer_descriptors[descriptor];
                         let format = storage_format(desc.format);
                         for i in 0..b.count {
-                            let offset = desc.cbuf_offset + (i << desc.size_shift);
-                            let raw =
-                                read_cbuf::<u32>(src.gmmu, src.cbufs, desc.cbuf_index, offset);
+                            let raw = match desc.handle_program {
+                                Some(program) => program_handle(src, info, program, i, align),
+                                None => read_cbuf(
+                                    src.gmmu,
+                                    src.cbufs,
+                                    desc.cbuf_index,
+                                    desc.cbuf_offset + (i << desc.size_shift),
+                                ),
+                            };
                             let view = self.texel_view(src, raw, format, true, desc.is_written)?;
                             let null = match format.and_then(|f| self.texel_format(f)) {
                                 Some(texel) => texel.format,
@@ -1126,9 +1144,15 @@ impl VulkanRasterizer {
                         let desc = info.image_descriptors[descriptor];
                         let mut array_rescaled = None;
                         for i in 0..b.count {
-                            let offset = desc.cbuf_offset + (i << desc.size_shift);
-                            let raw =
-                                read_cbuf::<u32>(src.gmmu, src.cbufs, desc.cbuf_index, offset);
+                            let raw = match desc.handle_program {
+                                Some(program) => program_handle(src, info, program, i, align),
+                                None => read_cbuf(
+                                    src.gmmu,
+                                    src.cbufs,
+                                    desc.cbuf_index,
+                                    desc.cbuf_offset + (i << desc.size_shift),
+                                ),
+                            };
                             let Some((id, view)) = self.storage_view(src, raw, &desc)? else {
                                 self.draw.warn_once(
                                     Warning::NullStorageImage,
@@ -2126,6 +2150,40 @@ fn handle_word(src: &StageSources<'_>, handle: HandleSource, offset: u32) -> u32
         raw |= read_cbuf::<u32>(src.gmmu, src.cbufs, index, offset) << shift;
     }
     raw
+}
+
+/// The raw handle `info`'s handle program `program` computes for descriptor array `element`.
+/// Its storage reads are relative to the binding address, the buffer's pointer aligned down to
+/// `align`; words past the buffer, and of an unbound one, read as 0.
+fn program_handle(
+    src: &StageSources<'_>,
+    info: &ShaderInfo,
+    program: u32,
+    element: u32,
+    align: u64,
+) -> u32 {
+    let read_storage = |slot: u32, offset: u32| {
+        let mut slot = slot;
+        let Some((desc, element)) = info.storage_buffers_descriptors.iter().find_map(|d| {
+            let found = (slot < d.count).then_some((d, slot));
+            slot = slot.wrapping_sub(d.count);
+            found
+        }) else {
+            return 0;
+        };
+        let (address, size) = storage_pointer(src, desc, element);
+        let base = address & !(align - 1);
+        let word = base + u64::from(offset);
+        if address == 0 || word + 4 > address + size {
+            return 0;
+        }
+        src.gmmu.read::<u32>(word).unwrap_or(0)
+    };
+    info.handle_programs[program as usize].evaluate(
+        |index, offset| read_cbuf(src.gmmu, src.cbufs, index, offset),
+        read_storage,
+        element,
+    )
 }
 
 /// The GPU address and size of storage buffer `element` of `desc`: 16-byte NVN descriptors in
