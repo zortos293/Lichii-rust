@@ -62,7 +62,7 @@ fn finish(
 }
 
 /// A translated program, ready to become a Vulkan shader module.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ShaderModule {
     pub spirv: Vec<u32>,
     /// Cache key of the module: equal for the same guest code, the same GPU state read while
@@ -78,7 +78,7 @@ pub struct ShaderModule {
 }
 
 /// The descriptor sets and push-constant range a module declares.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ResourceLayout {
     pub sets: Vec<DescriptorSetLayout>,
     /// Bytes of push constants, starting at offset 0; 0 when the module has none. Rescaling
@@ -87,14 +87,14 @@ pub struct ResourceLayout {
 }
 
 /// One descriptor set: its index and its bindings in binding order.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DescriptorSetLayout {
     pub set: u32,
     pub bindings: Vec<DescriptorBinding>,
 }
 
 /// One binding of a descriptor set.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct DescriptorBinding {
     pub binding: u32,
     pub kind: DescriptorKind,
@@ -107,7 +107,7 @@ pub struct DescriptorBinding {
 }
 
 /// What a binding holds, as a Vulkan descriptor type.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum DescriptorKind {
     /// A guest constant buffer (`VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER`).
     UniformBuffer,

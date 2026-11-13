@@ -19,9 +19,10 @@ use crate::{
     MeshState, Profile, RuntimeInfo, ShaderArch, ShaderEnvironment, ShaderStage, TranslateError,
 };
 
-/// A synthetic Ampere program: instructions from `BASE`, a program header 0x80 bytes before it
-/// and one constant buffer.
+/// A synthetic Ampere program: instructions from `base` (`BASE` unless moved), a program header
+/// 0x80 bytes before it and one constant buffer.
 pub struct TestEnv {
+    pub base: GpuVAddr,
     pub code: Vec<Instruction>,
     pub stage: ShaderStage,
     pub header: [u32; 20],
@@ -37,6 +38,7 @@ impl TestEnv {
 
     pub fn new(code: &[Instruction]) -> TestEnv {
         TestEnv {
+            base: Self::BASE,
             code: code.to_vec(),
             stage: ShaderStage::Compute,
             header: [0; 20],
@@ -66,10 +68,10 @@ impl ShaderEnvironment for TestEnv {
         self.stage
     }
     fn start_address(&self) -> GpuVAddr {
-        Self::BASE
+        self.base
     }
     fn read_u64(&self, address: GpuVAddr) -> u64 {
-        if let Some(offset) = address.checked_sub(Self::BASE) {
+        if let Some(offset) = address.checked_sub(self.base) {
             let index = (offset / u64::from(INSTRUCTION_SIZE)) as usize;
             return self.code.get(index).map_or(0, |inst| {
                 if offset % 16 == 0 {
@@ -79,7 +81,7 @@ impl ShaderEnvironment for TestEnv {
                 }
             });
         }
-        let header = Self::BASE - crate::ampere::GRAPHICS_HEADER_SIZE;
+        let header = self.base - crate::ampere::GRAPHICS_HEADER_SIZE;
         match address.checked_sub(header) {
             Some(offset) if offset < 0x50 => {
                 let word = (offset / 4) as usize;
@@ -382,6 +384,89 @@ fn task_and_mesh_programs_take_their_layout_from_the_mesh_state() {
             stage: ShaderStage::Mesh
         })
     ));
+}
+
+/// Lavapipe draws nothing for a mesh program that stores an output vector one component at a
+/// time, so the native epilogue stores each vertex's position and generics whole.
+#[test]
+fn native_mesh_outputs_are_stored_as_whole_vectors() {
+    use rspirv::dr::Operand;
+    use rspirv::spirv::{BuiltIn, Decoration, Op};
+
+    let profile = Profile {
+        supported_spirv: 0x0001_0600,
+        support_mesh_shader: true,
+        ..Profile::default()
+    };
+    let host = HostTranslateInfo::default();
+    let exit = encode(Opcode::Exit, Form::Fixed, 7 << 87);
+    let mut env = TestEnv::new(&[exit]);
+    env.stage = ShaderStage::Mesh;
+    env.header[0x34 / 4] |= (0xf << 12) | (0x7 << 16);
+    env.mesh = Some(mesh_state(4, ProgramHeader::default()));
+    let runtime = RuntimeInfo {
+        convert_depth_mode: true,
+        ..RuntimeInfo::default()
+    };
+    let module = crate::compile(
+        &env,
+        mesh_options(&profile, &host),
+        &runtime,
+        &mut Bindings::default(),
+    )
+    .unwrap();
+    let position = u32::from(Attribute::POSITION_X.0);
+    assert!(
+        module
+            .info
+            .mesh
+            .vertex_lines
+            .starts_with(&[position, position + 1])
+    );
+    let spirv = rspirv::dr::load_words(&module.spirv).unwrap();
+    let position = spirv
+        .annotations
+        .iter()
+        .find(|inst| {
+            inst.class.opcode == Op::Decorate
+                && inst.operands[1..]
+                    == [
+                        Operand::Decoration(Decoration::BuiltIn),
+                        Operand::BuiltIn(BuiltIn::Position),
+                    ]
+        })
+        .and_then(|inst| inst.operands[0].id_ref_any())
+        .expect("a Position output");
+    let outputs: Vec<u32> = spirv
+        .types_global_values
+        .iter()
+        .filter(|inst| {
+            inst.class.opcode == Op::Variable
+                && inst.operands[0] == Operand::StorageClass(rspirv::spirv::StorageClass::Output)
+        })
+        .filter_map(|inst| inst.result_id)
+        .collect();
+    assert!(outputs.contains(&position));
+    let chains: Vec<_> = spirv.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter(|inst| {
+            inst.class.opcode == Op::AccessChain
+                && inst.operands[0]
+                    .id_ref_any()
+                    .is_some_and(|base| outputs.contains(&base))
+        })
+        .collect();
+    assert!(
+        chains
+            .iter()
+            .any(|inst| inst.operands[0].id_ref_any() == Some(position)),
+        "position is written"
+    );
+    for chain in chains {
+        assert_eq!(chain.operands.len(), 2, "{chain:?} selects a component");
+    }
 }
 
 /// Random task and mesh programs through compile, natively and emulated: each either fails

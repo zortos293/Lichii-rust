@@ -212,19 +212,37 @@ pub fn nacp_language(language: Language) -> NacpLanguage {
 /// Where metadata is cached, and which keys it was read with.
 pub struct MetadataCache {
     dir: PathBuf,
-    /// A hash of the keys folder and the size and modification time of its key files (never
-    /// their contents). A title read before its keys were fixed can have a name but no control
-    /// data, so new keys read every title again.
+    /// A hash of what titles are read with besides their own file: the keys folder and the size
+    /// and modification time of its key files (never their contents), and the names and sizes
+    /// of the installed content. A title read before its keys were fixed can have a name but no
+    /// control data, and an installed update changes its name and version, so either change
+    /// reads every title again.
     keys: u64,
 }
 
 impl MetadataCache {
-    pub fn new(dir: PathBuf, keys_dir: &Path) -> Self {
+    pub fn new(dir: PathBuf, keys_dir: &Path, installed: &[PathBuf]) -> Self {
         let mut bytes = keys_dir.to_string_lossy().into_owned().into_bytes();
         for name in ["prod.keys", "console.keys", "title.keys"] {
             let (size, modified) = file_time(&keys_dir.join(name)).unwrap_or_default();
             bytes.extend(size.to_le_bytes());
             bytes.extend(modified.to_le_bytes());
+        }
+        for dir in installed {
+            let mut entries: Vec<(String, u64)> = std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .map(|e| {
+                    let size = e.metadata().map_or(0, |m| m.len());
+                    (e.file_name().to_string_lossy().into_owned(), size)
+                })
+                .collect();
+            entries.sort();
+            for (name, size) in entries {
+                bytes.extend(name.into_bytes());
+                bytes.extend(size.to_le_bytes());
+            }
         }
         Self {
             dir,
@@ -369,6 +387,8 @@ pub struct ScanSources {
     pub cache_dir: PathBuf,
     /// The language titles are shown in, when the NACP has it.
     pub language: NacpLanguage,
+    /// Registered content folders whose installed updates and DLC apply.
+    pub installed: Vec<PathBuf>,
 }
 
 /// The list the UI shows, refreshed in the background.
@@ -395,10 +415,12 @@ impl GameList {
                     return;
                 }
                 wake();
-                let cache = MetadataCache::new(sources.cache_dir, &sources.keys_dir);
+                let cache =
+                    MetadataCache::new(sources.cache_dir, &sources.keys_dir, &sources.installed);
                 let options = LoadOptions {
                     keys: Some(crate::setup::KeyStatus::check(sources.keys_dir).keys),
                     language: sources.language,
+                    installed: sources.installed,
                     ..LoadOptions::default()
                 };
                 for (index, entry) in entries.iter().enumerate() {
@@ -665,7 +687,7 @@ mod tests {
         let control = nacp("Synthetic Game", "Lichii Tests", "1.2.3");
         std::fs::write(&path, nro([&png_icon(), &control, b""])).unwrap();
         let keys = tmp.0.join("keys");
-        let cache = MetadataCache::new(tmp.0.join("cache"), &keys);
+        let cache = MetadataCache::new(tmp.0.join("cache"), &keys, &[]);
         let game = scan(std::slice::from_ref(&tmp.0)).remove(0);
 
         let (meta, icon) = read_metadata(&game, &LoadOptions::default(), Some(&cache)).unwrap();
@@ -695,7 +717,7 @@ mod tests {
         assert!(icon.is_some(), "the cached icon is used");
         std::fs::create_dir_all(&keys).unwrap();
         std::fs::write(keys.join("prod.keys"), "").unwrap();
-        let new_keys = MetadataCache::new(tmp.0.join("cache"), &keys);
+        let new_keys = MetadataCache::new(tmp.0.join("cache"), &keys, &[]);
         let (rekeyed, _) = read_metadata(&game, &LoadOptions::default(), Some(&new_keys)).unwrap();
         assert_eq!(
             rekeyed.title, "Synthetic Game",
@@ -725,7 +747,7 @@ mod tests {
     fn titles_that_do_not_open_are_not_cached() {
         let tmp = TempDir::new("locked");
         tmp.file("Locked.nsp", 0x400);
-        let cache = MetadataCache::new(tmp.0.join("cache"), &tmp.0.join("keys"));
+        let cache = MetadataCache::new(tmp.0.join("cache"), &tmp.0.join("keys"), &[]);
         let game = scan(std::slice::from_ref(&tmp.0)).remove(0);
         assert!(read_metadata(&game, &LoadOptions::default(), Some(&cache)).is_none());
         assert!(!cache.dir.exists());
@@ -747,6 +769,7 @@ mod tests {
                 keys_dir: tmp.0.join("keys"),
                 cache_dir: tmp.0.join("cache"),
                 language: NacpLanguage::AmericanEnglish,
+                installed: Vec::new(),
             },
             move || {
                 let _ = tx.send(());

@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use lichii_common::settings::CpuAccuracy;
 use lichii_memory::{AddressSpace, ExclusiveMonitor, MemoryPermission, PhysicalMemory};
@@ -1507,6 +1508,119 @@ fn guest_stores_to_read_only_pages_fault_on_every_backend() {
                 0,
                 "{name}: {store:#010x}"
             );
+        }
+    }
+}
+
+#[test]
+fn profile_counts_without_changing_results() {
+    const PROGRAM: [u32; 10] = [
+        0xeb01_001f,
+        0x1400_0001,
+        0x4e28_4820,
+        0x1e62_2820,
+        0xd100_0529,
+        0xb5ff_ff69,
+        0xd503_201f,
+        0xd61f_0080,
+        0x4c40_8040,
+        BRK,
+    ];
+    let run = |profile: bool| {
+        let physical = Arc::new(PhysicalMemory::new(1 << 20).unwrap());
+        let memory = Arc::new(AddressSpace::with_fastmem(physical, 39).unwrap());
+        memory.map(CODE, 0, CODE_SIZE, MemoryPermission::READ_EXECUTE);
+        memory.map(DATA, 0x10000, DATA_SIZE, MemoryPermission::READ_WRITE);
+        let bytes: Vec<u8> = PROGRAM.iter().flat_map(|w| w.to_le_bytes()).collect();
+        memory.write_bytes(CODE, &bytes).unwrap();
+        let config = CpuConfig {
+            memory,
+            monitor: Arc::new(ExclusiveMonitor::new(1)),
+            clock: Arc::new(Clock::default()),
+            core_index: 0,
+            ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
+            dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+            accuracy: CpuAccuracy::Auto,
+        };
+        let mut jit = Jit::build(config, Passes::ALL, profile).unwrap();
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            fpcr: 1 << 24,
+            ..Default::default()
+        };
+        ctx.x[0] = 3;
+        ctx.x[1] = 5;
+        ctx.x[2] = DATA;
+        ctx.x[4] = CODE + 0x20;
+        ctx.x[9] = 4;
+        jit.clear_code_cache();
+        let halt = jit.run(&mut ctx);
+        let table = jit
+            .state
+            .profile_counts()
+            .map(|p| p.table(1, Duration::ZERO));
+        (halt, ctx, table)
+    };
+    let (halt, ctx, table) = run(true);
+    let (plain_halt, plain_ctx, plain_table) = run(false);
+    assert_eq!((halt, &ctx), (plain_halt, &plain_ctx));
+    assert!(plain_table.is_none());
+    let table = table.unwrap();
+    for line in [
+        "translation: 3 blocks, 8 instructions,",
+        "fault 0",
+        "indirect-branch miss 1,",
+        "code cache flushes: region full 0, clear 1, invalidate range 0",
+        "interpreter fallbacks: 2\n",
+        "LD2 (multiple structures)",
+        "Brk",
+        "CallSimd calls: 4\n",
+        "AES 0x4e284800",
+        "native FP slow paths, FPCR mode: 4\n",
+        "FP 2-source 0x1e602800",
+    ] {
+        assert!(table.contains(line), "{line:?} in\n{table}");
+    }
+    let count = |label: &str| -> u64 {
+        let rest = &table[table.find(label).unwrap() + label.len()..];
+        rest[..rest.find(|c: char| !c.is_ascii_digit()).unwrap()]
+            .parse()
+            .unwrap()
+    };
+    assert!(count("unlinked jump ") > 0, "{table}");
+    assert!(count("write-backs: native ") > 0, "{table}");
+    assert!(count(", dispatcher ") > 0, "{table}");
+}
+
+#[test]
+fn fp_selects_consume_fused_compares() {
+    const SETTERS: [u32; 6] = [
+        0xeb01_001f,
+        0xab01_001f,
+        0xea01_001f,
+        0x6b01_001f,
+        0x2b01_001f,
+        0x6a01_001f,
+    ];
+    const VALUES: [u64; 4] = [0, 1, 0x8000_0000, u64::MAX];
+    const FMOV_D1_X3: u32 = 0x9e67_0061;
+    const FMOV_D2_X4: u32 = 0x9e67_0082;
+    for setter in SETTERS {
+        for cond in 0..16 {
+            for fcsel in [0x1e22_0c20, 0x1e62_0c20] {
+                let code = [FMOV_D1_X3, FMOV_D2_X4, setter, fcsel | cond << 12];
+                for (a, b) in VALUES.into_iter().flat_map(|a| VALUES.map(|b| (a, b))) {
+                    directed(
+                        &code,
+                        &[
+                            (0, a),
+                            (1, b),
+                            (3, 0x3ff0_0000_0000_0001),
+                            (4, 0x4000_0000_0000_0002),
+                        ],
+                    );
+                }
+            }
         }
     }
 }

@@ -55,6 +55,11 @@ impl StorageData {
             _charge: charge,
         }
     }
+
+    /// The bytes, locked.
+    pub fn bytes(&self) -> parking_lot::MutexGuard<'_, Vec<u8>> {
+        self.bytes.lock()
+    }
 }
 
 pub(super) struct Storage {

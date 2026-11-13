@@ -108,7 +108,8 @@ fn tags(g: &GraphicsSettings) -> String {
     tags.join("  ")
 }
 
-/// The lines under the footer, each shown when its setting is on and it has a value.
+/// The lines under the footer, each shown when its setting is on and it has a value, then the
+/// JIT profile's rates while `LICHII_JIT_PROFILE` is set.
 fn detail_lines(fv: &FrameViewSettings, snap: &PerfSnapshot, g: &GraphicsSettings) -> Vec<String> {
     let mut lines = Vec::new();
     if fv.show_emulation_speed {
@@ -132,6 +133,7 @@ fn detail_lines(fv: &FrameViewSettings, snap: &PerfSnapshot, g: &GraphicsSetting
     if fv.show_resolution && snap.render_width > 0 {
         lines.push(format!("{}\u{d7}{}", snap.render_width, snap.render_height));
     }
+    lines.extend(lichii_cpu::jit_profile_summary());
     lines
 }
 

@@ -5,7 +5,9 @@ pub mod spirv;
 /// Next free descriptor binding of each kind, carried from one stage to the next so the stages
 /// of a pipeline share one descriptor set without overlapping. With
 /// [`crate::Profile::unified_descriptor_binding`] every kind takes its binding from `unified`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct Bindings {
     pub unified: u32,
     pub uniform_buffer: u32,

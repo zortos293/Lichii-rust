@@ -142,6 +142,15 @@ impl App {
             if self.menu_item(ui, "Load File…", HotkeyAction::LoadFile, true) {
                 actions.push(Action::Hotkey(HotkeyAction::LoadFile));
             }
+            if ui
+                .add_enabled(
+                    self.install.is_none(),
+                    egui::Button::new("Install Files to NAND…"),
+                )
+                .clicked()
+            {
+                actions.push(Action::InstallFiles);
+            }
             if ui.button("Add Game Directory…").clicked() {
                 actions.push(Action::AddGameDir);
             }
@@ -445,6 +454,34 @@ impl App {
                     self.ui.error = None;
                 }
             });
+        }
+        if let Some((title, text)) = self.ui.info.clone() {
+            egui::Modal::new(egui::Id::unique("info")).show(ctx, |ui| {
+                ui.heading(title);
+                ui.label(text);
+                if ui.button("OK").clicked() {
+                    self.ui.info = None;
+                }
+            });
+        }
+        if let Some(job) = &self.install {
+            let (index, count, file, share) = job.progress();
+            let name = file
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+            egui::Modal::new(egui::Id::unique("install")).show(ctx, |ui| {
+                ui.heading("Installing to NAND");
+                ui.label(format!(
+                    "Installing file \"{name}\" ({} of {count})…",
+                    index + 1
+                ));
+                ui.add(
+                    egui::ProgressBar::new(share)
+                        .show_percentage()
+                        .desired_width(360.0),
+                );
+            });
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         if self.ui.confirm_stop {
             let title = self.session.as_ref().map_or("", |s| s.title.as_str());

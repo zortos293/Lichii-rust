@@ -11,7 +11,9 @@ use lichii_common::settings::{
     Settings, Theme,
 };
 use lichii_core::{ExitReason, Host};
+use lichii_crypto::KeySet as ConsoleKeys;
 use lichii_input::{Key, KeyChord, KeySet, MouseButton};
+use lichii_loader::LoadOptions;
 use lichii_vulkan::present::{UiFrame, Viewport};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, StartCause, WindowEvent};
@@ -27,6 +29,7 @@ use crate::display::Display;
 use crate::game_list::{self, GameList, ScanSources};
 use crate::hotkeys::{self, HotkeyMap};
 use crate::input_worker::{InputEvent, InputMsg, InputWorker};
+use crate::install::{self, InstallJob};
 use crate::per_game::{self, GameConfig};
 use crate::session::Session;
 use crate::setup::{self, SetupWindow};
@@ -55,6 +58,7 @@ pub enum Action {
     SetScalingFilter(ScalingFilter),
     SetAntiAliasing(AntiAliasing),
     KeysAndFirmware,
+    InstallFiles,
     /// Lichii's "Start Game without Custom Configuration".
     BootWithoutCustom(PathBuf),
     GameProperties {
@@ -80,6 +84,8 @@ struct RunningConfig {
 #[derive(Default)]
 pub struct UiState {
     pub error: Option<String>,
+    /// A message with a title, such as the install results.
+    pub info: Option<(String, String)>,
     pub about: bool,
     pub confirm_stop: bool,
     pub toast: Option<(String, Instant)>,
@@ -115,6 +121,8 @@ pub struct App {
     running: Option<RunningConfig>,
     /// The running game was started without its custom configuration; a restart keeps that.
     without_custom: bool,
+    /// File → Install Files to NAND while it runs.
+    pub install: Option<InstallJob>,
     /// Where the renderer draws the guest frame, in physical pixels.
     pub viewport: Option<Viewport>,
     pending_boot: Option<PathBuf>,
@@ -172,6 +180,7 @@ impl App {
             game_config: None,
             running: None,
             without_custom: false,
+            install: None,
             viewport: None,
             pending_boot: cli.game,
             start_fullscreen: cli.fullscreen,
@@ -229,6 +238,7 @@ impl App {
             keys_dir: setup::keys_dir(&self.settings.paths, &self.paths),
             cache_dir: self.paths.cache_dir.join("game_list"),
             language: game_list::nacp_language(self.settings.system.language),
+            installed: self.installed_content(),
         };
         self.games.refresh(sources, move || {
             let _ = proxy.send_event(UserEvent::Wake);
@@ -291,6 +301,51 @@ impl App {
             .as_deref()
             .and_then(Path::parent)
             .map_or_else(|| self.paths.config_dir.clone(), Path::to_path_buf)
+    }
+
+    fn keys(&self) -> Arc<ConsoleKeys> {
+        setup::KeyStatus::check(setup::keys_dir(&self.settings.paths, &self.paths)).keys
+    }
+
+    /// The NAND's user content, where installed updates and DLC live.
+    fn installed_content(&self) -> Vec<PathBuf> {
+        vec![setup::nand_dir(&self.settings.paths, &self.paths).join("user/Contents/registered")]
+    }
+
+    /// File → Install Files to NAND: installs the chosen packages in the background.
+    fn install_files(&mut self) {
+        if self.install.is_some() {
+            return;
+        }
+        let Some(files) = rfd::FileDialog::new()
+            .set_title("Install Files to NAND")
+            .add_filter("Nintendo Submission Package", &["nsp"])
+            .pick_files()
+            .filter(|files| !files.is_empty())
+        else {
+            return;
+        };
+        let registered = self.installed_content().remove(0);
+        let proxy = self.proxy.clone();
+        self.install = Some(InstallJob::start(
+            files,
+            registered,
+            self.keys(),
+            move || {
+                let _ = proxy.send_event(UserEvent::Wake);
+            },
+        ));
+    }
+
+    /// Takes a finished install: shows its results and rescans the game list, whose versions
+    /// and names now include the installed updates.
+    fn poll_install(&mut self) {
+        let Some(results) = self.install.as_ref().and_then(InstallJob::poll) else {
+            return;
+        };
+        self.install = None;
+        self.ui.info = Some(("Install Results".into(), install::summary(&results)));
+        self.refresh_games();
     }
 
     /// Recomputes the running game's settings after the global ones or its configuration changed,
@@ -387,8 +442,12 @@ impl App {
             };
             (Arc::new(settings.clone()), host)
         };
-        let keys = setup::KeyStatus::check(setup::keys_dir(&self.settings.paths, &self.paths)).keys;
-        match Session::boot(&path, keys, configure) {
+        let options = LoadOptions {
+            keys: Some(self.keys()),
+            installed: self.installed_content(),
+            ..LoadOptions::default()
+        };
+        match Session::boot(&path, options, configure) {
             Ok(session) => {
                 self.session = Some(session);
                 self.without_custom = without_custom;
@@ -516,6 +575,7 @@ Dump prod.keys and title.keys \
             }
             Action::About => self.ui.about = true,
             Action::KeysAndFirmware => self.open_setup(),
+            Action::InstallFiles => self.install_files(),
             Action::SetResolution(scale) => {
                 self.set_graphics(|g| g.resolution_scale = scale);
                 self.toast(format!("Resolution: {}", scale.label()));
@@ -810,6 +870,7 @@ Dump prod.keys and title.keys \
             return;
         };
         self.games.poll();
+        self.poll_install();
         self.check_exit();
         let raw = egui_state.take_egui_input(&window);
         let ctx = self.egui_ctx.clone();
@@ -1004,7 +1065,10 @@ impl ApplicationHandler<UserEvent> for App {
                 self.apply(Action::Hotkey(action));
             }
             UserEvent::Hotkey(_) => {}
-            UserEvent::Wake => self.games.poll(),
+            UserEvent::Wake => {
+                self.games.poll();
+                self.poll_install();
+            }
         }
         self.sync_guest_input();
         if let Some(window) = &self.window {

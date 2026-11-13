@@ -14,9 +14,10 @@ use lichii_kernel::Kernel;
 use lichii_kernel::ipc::{ServiceThread, SessionHandler};
 use lichii_kernel::process::Process;
 use lichii_loader::program::ProgramImage;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use crate::Service;
+use crate::applets::{AppletFrontend, HeadlessApplets};
 use crate::dispatch::{Dispatch, UnknownCommands};
 
 /// The parts `core::System` hands to the services.
@@ -60,6 +61,8 @@ pub struct ServiceContext {
     pub(crate) unknown: UnknownCommands,
     /// The nvdrv state, once nvdrv registered: gsv opens `nx2:nvsrv` sessions with it.
     pub(crate) nvdrv: OnceLock<Arc<crate::nvdrv::Nvdrv>>,
+    /// The hid state, once hid registered: am's controller applet reports its connected npads.
+    pub(crate) hid: OnceLock<Arc<crate::hid::Hid>>,
     /// The selected user's id, once acc registered: am's preselected-user launch parameter names
     /// it.
     pub(crate) user: OnceLock<[u8; 16]>,
@@ -67,6 +70,7 @@ pub struct ServiceContext {
     pub(crate) vi: OnceLock<Arc<crate::vi::Vi>>,
     /// The NAND's registered content, indexed on first use by [`crate::fs::system_data`].
     pub(crate) installed_content: OnceLock<Option<ContentIndex>>,
+    applets: RwLock<Arc<dyn AppletFrontend>>,
     threads: Mutex<HashMap<String, ServiceThread>>,
 }
 
@@ -85,11 +89,24 @@ impl ServiceContext {
             audio: parts.audio,
             unknown: UnknownCommands::default(),
             nvdrv: OnceLock::new(),
+            hid: OnceLock::new(),
             user: OnceLock::new(),
             vi: OnceLock::new(),
             installed_content: OnceLock::new(),
+            applets: RwLock::new(Arc::new(HeadlessApplets)),
             threads: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Answers library applets (error, profile selector, controllers, software keyboard) with
+    /// `frontend` from now on, instead of [`HeadlessApplets`].
+    pub fn set_applet_frontend(&self, frontend: Arc<dyn AppletFrontend>) {
+        *self.applets.write() = frontend;
+    }
+
+    /// The frontend that answers library applets.
+    pub(crate) fn applet_frontend(&self) -> Arc<dyn AppletFrontend> {
+        self.applets.read().clone()
     }
 
     /// The service thread called `name`, created on first use. Services that may block (file
