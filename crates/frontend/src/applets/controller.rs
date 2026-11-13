@@ -3,7 +3,7 @@
 
 use crossbeam_channel::Sender;
 use egui::{Color32, Key, RichText};
-use lichii_common::settings::{ControlSettings, ControllerType, MAX_PLAYERS};
+use lichii_common::settings::{ControlSettings, ControllerType, MAX_PLAYERS, PlayerInput};
 use lichii_services::applets::{ControllerAnswer, ControllerRequest, ControllerSetup};
 
 const HANDHELD_NPAD: u32 = 0x20;
@@ -111,10 +111,17 @@ impl ControllerDialog {
 
     /// What the title sees after the applet. hid's own count knows how the title split Joy-Con
     /// pairs, so it is kept and moved by the players the user connected or disconnected. In
-    /// single-player mode am reports one player whatever hid shows, so only the controls count.
+    /// single-player mode am reports one player whatever hid shows, so only the player the
+    /// dialog shows counts.
     fn setup(&self) -> ControllerSetup {
-        let (before, after) = (host_setup(&self.original), host_setup(&self.controls));
-        if self.request.single_mode || after.player_count == 0 {
+        if self.request.single_mode {
+            return host_setup(&self.controls.players[..self.shown()]);
+        }
+        let (before, after) = (
+            host_setup(&self.original.players),
+            host_setup(&self.controls.players),
+        );
+        if after.player_count == 0 {
             return after;
         }
         let current = self.request.current;
@@ -204,10 +211,9 @@ impl ControllerDialog {
     }
 }
 
-/// The npads `controls` connect: how many players, and the first one (`0x20` for handheld).
-fn host_setup(controls: &ControlSettings) -> ControllerSetup {
-    let mut connected = controls
-        .players
+/// The npads `players` connect: how many players, and the first one (`0x20` for handheld).
+fn host_setup(players: &[PlayerInput]) -> ControllerSetup {
+    let mut connected = players
         .iter()
         .enumerate()
         .filter(|(_, player)| player.connected);
@@ -472,6 +478,29 @@ mod tests {
         );
         ui.key(Key::Escape);
         assert_eq!(answer.join().unwrap(), ControllerAnswer::Cancelled);
+    }
+
+    #[test]
+    fn single_player_mode_counts_only_the_player_it_shows() {
+        let mut ui = harness(&[
+            (true, ControllerType::ProController),
+            (true, ControllerType::ProController),
+        ]);
+        let one = ControllerSetup {
+            player_count: 1,
+            npad_id: 0,
+        };
+        let answer = configure(
+            &ui,
+            ControllerRequest {
+                single_mode: true,
+                current: one,
+                ..request(1, 4, FULL_KEY)
+            },
+        );
+        ui.frame(Vec::new());
+        assert_eq!(answer.join().unwrap(), ControllerAnswer::Confirmed(one));
+        assert!(ui.applied.is_none(), "player 2 stays connected in settings");
     }
 
     #[test]
