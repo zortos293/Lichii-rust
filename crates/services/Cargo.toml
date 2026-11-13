@@ -14,6 +14,7 @@ lichii-kernel.workspace = true
 lichii-loader.workspace = true
 lichii-fs.workspace = true
 lichii-gpu.workspace = true
+lichii-texture.workspace = true
 lichii-input.workspace = true
 opus1.workspace = true
 parking_lot.workspace = true
@@ -24,4 +25,3 @@ tracing.workspace = true
 bytemuck.workspace = true
 lichii-fs.workspace = true
 lichii-kernel = { workspace = true, features = ["testing"] }
-lichii-texture.workspace = true
