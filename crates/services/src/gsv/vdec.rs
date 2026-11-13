@@ -7,8 +7,9 @@
 //! gsv 911 pool image) to the decoder and reply the NativeSyncHandle `{~syncpoint, mode 0, u64
 //! value}` that is reached once a frame is in it, on a syncpoint the service owns. The worker
 //! writes each decoded picture, once it is due by its pts, into the next image in hand-out order
-//! (the order the client acquires them from its own ring) in the layout gsv 961 describes, and
-//! increments the syncpoint; 213 then reports the frame. An end-of-stream input completes after
+//! (the order the client acquires them from its own ring) in the layout gsv 961 describes, drops
+//! the renderer's cached copies of it (the title may have drawn into the image, which write
+//! tracking leaves alone), and increments the syncpoint; 213 then reports the frame. An end-of-stream input completes after
 //! the pictures the decoder still holds, and Stop and Finalize complete every fence handed out.
 //!
 //! Without FFmpeg, or for a codec it cannot decode, every input becomes one frame without a
@@ -20,6 +21,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use lichii_common::ResultCode;
+use lichii_gpu::Gpu;
+use lichii_gpu::backend::Rasterizer;
+use lichii_gpu::gmmu::{BigPageSize, Gmmu, RangeTarget};
 use lichii_gpu::host1x::Syncpoints;
 use lichii_kernel::ipc::HleRequestContext;
 use lichii_kernel::{Event, GuestClock};
@@ -92,6 +96,9 @@ struct Shared {
     syncpoints: Arc<Syncpoints>,
     syncpoint: u32,
     memory: Arc<AddressSpace>,
+    gpu: Arc<Gpu>,
+    /// Translates image addresses (GPU VA == CPU VA) to the device ranges the renderer caches.
+    gmmu: Arc<Gmmu>,
     objects: Arc<Mutex<NativeObjects>>,
     ready: Arc<Event>,
     state: Mutex<State>,
@@ -236,6 +243,8 @@ impl VideoDecoderService {
             syncpoints: context.gpu.host1x().syncpoints.clone(),
             syncpoint,
             memory: context.process.memory().clone(),
+            gpu: context.gpu.clone(),
+            gmmu: context.gpu.create_address_space(BigPageSize::Size64K),
             objects: objects.clone(),
             ready: Arc::new(Event::new()),
             state: Mutex::new(State {
@@ -591,6 +600,17 @@ impl Shared {
                         .is_ok()
             }
         };
+        if written {
+            let (gmmu, address, size) = (self.gmmu.clone(), target.address, layout.size);
+            self.gpu
+                .run_in_order(move |rasterizer: &mut dyn Rasterizer| {
+                    gmmu.for_each_range(address, size, |range| {
+                        if let RangeTarget::Device(daddr) = range.target {
+                            rasterizer.invalidate_region(daddr, range.size);
+                        }
+                    });
+                });
+        }
         if media.frames_out == 0 {
             tracing::info!(
                 "nx2:vdecsvc writes image {} at {:#x}: {layout:?}, written {written}",
@@ -748,6 +768,7 @@ impl Drop for VideoDecoderService {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        self.shared.gpu.destroy_address_space(&self.shared.gmmu);
         self.nvdrv.retire_syncpoint(self.shared.syncpoint);
     }
 }
