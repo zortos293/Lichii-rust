@@ -1,6 +1,6 @@
 //! The application: window, egui, emulation session, input thread and hotkeys.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,11 +21,13 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::choices::Choice;
 use crate::cli::Cli;
+use crate::config::game::GameConfigWindow;
 use crate::config::{ConfigEnv, ConfigWindow};
 use crate::display::Display;
 use crate::game_list::{self, GameList, ScanSources};
 use crate::hotkeys::{self, HotkeyMap};
 use crate::input_worker::{InputEvent, InputMsg, InputWorker};
+use crate::per_game::{self, GameConfig};
 use crate::session::Session;
 use crate::setup::{self, SetupWindow};
 
@@ -53,6 +55,25 @@ pub enum Action {
     SetScalingFilter(ScalingFilter),
     SetAntiAliasing(AntiAliasing),
     KeysAndFirmware,
+    /// Lichii's "Start Game without Custom Configuration".
+    BootWithoutCustom(PathBuf),
+    GameProperties {
+        path: PathBuf,
+        program_id: u64,
+        title: String,
+    },
+    ConfigureCurrentGame,
+    RemoveGameConfig {
+        path: PathBuf,
+        program_id: u64,
+    },
+}
+
+/// The configuration of the running game, when it has one.
+struct RunningConfig {
+    config: GameConfig,
+    /// The global settings with the game's overrides applied.
+    settings: Settings,
 }
 
 /// Dialogs and transient messages.
@@ -88,6 +109,12 @@ pub struct App {
     config: Option<ConfigWindow>,
     /// The keys and firmware window while it is open.
     setup: Option<SetupWindow>,
+    /// The per-game Properties window while it is open.
+    game_config: Option<GameConfigWindow>,
+    /// The running game's own configuration.
+    running: Option<RunningConfig>,
+    /// The running game was started without its custom configuration; a restart keeps that.
+    without_custom: bool,
     /// Where the renderer draws the guest frame, in physical pixels.
     pub viewport: Option<Viewport>,
     pending_boot: Option<PathBuf>,
@@ -142,6 +169,9 @@ impl App {
             paths: paths.clone(),
             config: None,
             setup: None,
+            game_config: None,
+            running: None,
+            without_custom: false,
             viewport: None,
             pending_boot: cli.game,
             start_fullscreen: cli.fullscreen,
@@ -248,18 +278,45 @@ impl App {
     }
 
     /// Replaces every setting (the configuration window's OK or Apply) and saves.
+    /// The settings in effect: the running game's, when it has its own configuration.
+    pub fn current(&self) -> &Settings {
+        self.running
+            .as_ref()
+            .map_or(&self.settings, |r| &r.settings)
+    }
+
+    /// Where per-game configuration files go: `custom/` beside the settings file.
+    fn config_dir(&self) -> PathBuf {
+        self.save_to
+            .as_deref()
+            .and_then(Path::parent)
+            .map_or_else(|| self.paths.config_dir.clone(), Path::to_path_buf)
+    }
+
+    /// Recomputes the running game's settings after the global ones or its configuration changed,
+    /// and hands the graphics settings to the presenter.
+    fn refresh_running(&mut self) {
+        if let Some(running) = &mut self.running {
+            running.settings = running.config.apply(&self.settings);
+        }
+        let graphics = self.current().graphics.clone();
+        if let Some(display) = &mut self.display {
+            display.set_settings(&graphics);
+        }
+    }
+
     fn apply_settings(&mut self, settings: Settings) {
         let rescan = settings.paths.game_dirs != self.settings.paths.game_dirs
             || settings.paths.keys_dir != self.settings.paths.keys_dir
             || settings.system.language != self.settings.system.language;
+        let window_before = self.game_window_settings();
         self.settings = settings;
+        self.refresh_running();
+        self.follow_into_game_window(window_before);
         if let Some(session) = &self.session {
-            session.set_audio_volume(&self.settings.audio);
+            session.set_audio_volume(&self.current().audio);
         }
         self.reconfigure_input();
-        if let Some(display) = &mut self.display {
-            display.set_settings(&self.settings.graphics);
-        }
         self.apply_theme();
         if rescan {
             self.refresh_games();
@@ -306,21 +363,46 @@ impl App {
         window.set_fullscreen(mode);
     }
 
-    fn boot(&mut self, path: PathBuf) {
+    /// Boots the title at `path`, with its custom configuration unless `without_custom`.
+    fn boot(&mut self, path: PathBuf, without_custom: bool) {
         self.end_session();
-        let settings = Arc::new(self.settings.clone());
-        let host = |title| Host {
-            renderer: match &self.display {
-                Some(display) => display.renderer(title, &self.settings.graphics),
-                None => lichii_core::headless_renderer(),
-            },
-            npad: self.input.hub().clone(),
-            perf: self.perf.clone(),
+        let config_dir = self.config_dir();
+        let mut running = None;
+        let configure = |program_id, title| {
+            let config = GameConfig::load(GameConfig::path(&config_dir, program_id, &path));
+            if !without_custom && !config.is_empty() {
+                running = Some(RunningConfig {
+                    settings: config.apply(&self.settings),
+                    config,
+                });
+            }
+            let settings = running.as_ref().map_or(&self.settings, |r| &r.settings);
+            let host = Host {
+                renderer: match &self.display {
+                    Some(display) => display.renderer(title, &settings.graphics),
+                    None => lichii_core::headless_renderer(),
+                },
+                npad: self.input.hub().clone(),
+                perf: self.perf.clone(),
+            };
+            (Arc::new(settings.clone()), host)
         };
         let keys = setup::KeyStatus::check(setup::keys_dir(&self.settings.paths, &self.paths)).keys;
-        match Session::boot(&path, settings, keys, host) {
+        match Session::boot(&path, keys, configure) {
             Ok(session) => {
                 self.session = Some(session);
+                self.without_custom = without_custom;
+                if let Some(running) = &running {
+                    let overridden = running.config.overridden();
+                    tracing::info!(
+                        file = %running.config.file().display(),
+                        "custom configuration: {}",
+                        overridden.into_iter().collect::<Vec<_>>().join(", ")
+                    );
+                    self.toast("Using this game's custom configuration");
+                }
+                self.running = running;
+                self.refresh_running();
                 self.settings.ui.push_recent(path);
                 self.save_settings();
             }
@@ -360,6 +442,9 @@ Dump prod.keys and title.keys \
     /// Drops the session, which stops its System, then the frame it last drew.
     fn end_session(&mut self) {
         self.session = None;
+        if self.running.take().is_some() {
+            self.refresh_running();
+        }
         if let Some(display) = &self.display {
             display.clear_frame();
         }
@@ -378,7 +463,39 @@ Dump prod.keys and title.keys \
     pub fn apply(&mut self, action: Action) {
         match action {
             Action::Hotkey(hotkey) => self.hotkey(hotkey),
-            Action::Boot(path) => self.boot(path),
+            Action::Boot(path) => self.boot(path, false),
+            Action::BootWithoutCustom(path) => self.boot(path, true),
+            Action::GameProperties {
+                path,
+                program_id,
+                title,
+            } => self.open_game_config(&path, program_id, title),
+            Action::ConfigureCurrentGame => {
+                if let Some(s) = &self.session {
+                    let (path, id, title) = (s.path.clone(), s.program_id, s.title.clone());
+                    self.open_game_config(&path, id, title);
+                }
+            }
+            Action::RemoveGameConfig { path, program_id } => {
+                let file = GameConfig::path(&self.config_dir(), program_id, &path);
+                match std::fs::remove_file(&file) {
+                    Ok(()) => self.toast("Removed the custom configuration"),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        self.toast("This game has no custom configuration")
+                    }
+                    Err(e) => {
+                        self.ui.error = Some(format!("Cannot remove {}: {e}", file.display()))
+                    }
+                }
+                if self
+                    .running
+                    .as_ref()
+                    .is_some_and(|r| r.config.file() == file)
+                {
+                    self.running = None;
+                    self.refresh_running();
+                }
+            }
             Action::StopConfirmed => self.stop(),
             Action::AddGameDir => {
                 if let Some(dir) = rfd::FileDialog::new()
@@ -411,6 +528,43 @@ Dump prod.keys and title.keys \
                 self.set_graphics(|g| g.anti_aliasing = aa);
                 self.toast(format!("Anti-aliasing: {}", aa.label()));
             }
+        }
+    }
+
+    fn open_game_config(&mut self, path: &Path, program_id: u64, title: String) {
+        let config = GameConfig::load(GameConfig::path(&self.config_dir(), program_id, path));
+        self.game_config = Some(GameConfigWindow::new(
+            title,
+            program_id,
+            config,
+            &self.settings,
+        ));
+    }
+
+    /// Draws the per-game Properties window when it is open; a saved configuration reaches the
+    /// game at once when it is the one running.
+    pub(crate) fn show_game_config(&mut self, ctx: &egui::Context) {
+        let Some(window) = &mut self.game_config else {
+            return;
+        };
+        let out = window.show(ctx, &self.settings, self.session.is_some());
+        let saved = out.saved.then(|| window.config.clone());
+        if out.close {
+            self.game_config = None;
+        }
+        let Some(config) = saved else {
+            return;
+        };
+        let running_this = !self.without_custom
+            && self.session.as_ref().is_some_and(|s| {
+                GameConfig::path(&self.config_dir(), s.program_id, &s.path) == config.file()
+            });
+        if running_this {
+            self.running = (!config.is_empty()).then(|| RunningConfig {
+                settings: config.apply(&self.settings),
+                config,
+            });
+            self.refresh_running();
         }
     }
 
@@ -448,18 +602,55 @@ Dump prod.keys and title.keys \
         }
     }
 
-    /// Changes graphics settings from the main window: the presenter and a running title's
-    /// renderer pick them up at once, an open configuration window's draft follows, and they are
-    /// saved.
+    /// Changes graphics settings from the main window; see [`Self::edit_settings`].
     fn set_graphics(&mut self, edit: impl Fn(&mut GraphicsSettings)) {
-        edit(&mut self.settings.graphics);
+        self.edit_settings(|s| edit(&mut s.graphics));
+    }
+
+    /// Changes settings from the main window (status bar, hotkeys). While a game with its own
+    /// configuration runs, settings it overrides change in its file and the rest globally. The
+    /// presenter and a running title's renderer pick graphics changes up at once, an open
+    /// configuration window's draft follows the global changes, and everything is saved.
+    fn edit_settings(&mut self, edit: impl Fn(&mut Settings)) {
+        let before = self.settings.clone();
+        let window_before = self.game_window_settings();
+        match &mut self.running {
+            Some(running) => {
+                running.config.edit(&mut self.settings, &edit);
+                if let Err(e) = running.config.save() {
+                    tracing::warn!("{}: {e}", running.config.file().display());
+                }
+            }
+            None => edit(&mut self.settings),
+        }
         if let Some(config) = &mut self.config {
-            edit(config.draft_graphics());
+            per_game::copy_changes(&before, &self.settings, config.draft());
         }
-        if let Some(display) = &mut self.display {
-            display.set_settings(&self.settings.graphics);
-        }
+        self.refresh_running();
+        self.follow_into_game_window(window_before);
         self.save_settings();
+    }
+
+    /// The settings the game in the Properties window runs with now.
+    fn game_window_settings(&self) -> Option<Settings> {
+        let window = self.game_config.as_ref()?;
+        Some(match &self.running {
+            Some(running) if running.config.file() == window.config.file() => {
+                running.settings.clone()
+            }
+            _ => window.config.apply(&self.settings),
+        })
+    }
+
+    /// Carries a change made outside the Properties window into its draft, so its next Apply
+    /// does not undo it.
+    fn follow_into_game_window(&mut self, before: Option<Settings>) {
+        let (Some(before), Some(after)) = (before, self.game_window_settings()) else {
+            return;
+        };
+        if let Some(window) = &mut self.game_config {
+            window.follow(&before, &after);
+        }
     }
 
     fn hotkey(&mut self, hotkey: HotkeyAction) {
@@ -483,7 +674,7 @@ Dump prod.keys and title.keys \
             }
             HotkeyAction::Restart => {
                 if let Some(path) = self.session.as_ref().map(|s| s.path.clone()) {
-                    self.boot(path);
+                    self.boot(path, self.without_custom);
                 }
             }
             HotkeyAction::LoadFile => {
@@ -493,7 +684,7 @@ Dump prod.keys and title.keys \
                     .add_filter("All files", &["*"])
                     .pick_file()
                 {
-                    self.boot(path);
+                    self.boot(path, false);
                 }
             }
             HotkeyAction::Configure => {
@@ -509,30 +700,27 @@ Dump prod.keys and title.keys \
                 }
             }
             HotkeyAction::ToggleDocked => {
-                let docked = !self.settings.system.docked;
-                self.settings.system.docked = docked;
+                let docked = !self.current().system.docked;
+                self.edit_settings(|s| s.system.docked = docked);
                 self.toast(if docked {
                     "Docked mode"
                 } else {
                     "Handheld mode"
                 });
-                self.save_settings();
             }
             HotkeyAction::ToggleSpeedLimit => {
-                let g = &mut self.settings.graphics;
-                g.speed_limit = match g.speed_limit {
+                let limit = match self.current().graphics.speed_limit {
                     Some(limit) => {
                         self.saved_speed_limit = limit;
                         None
                     }
                     None => Some(self.saved_speed_limit),
                 };
-                let text = match g.speed_limit {
+                self.set_graphics(|g| g.speed_limit = limit);
+                self.toast(match limit {
                     Some(limit) => format!("Speed limit {limit}%"),
                     None => "Speed limit off".into(),
-                };
-                self.toast(text);
-                self.save_settings();
+                });
             }
             HotkeyAction::ToggleFrameView => {
                 self.settings.frame_view.enabled ^= true;
@@ -554,15 +742,13 @@ Dump prod.keys and title.keys \
                 self.save_settings();
             }
             HotkeyAction::CycleScalingFilter => {
-                let filter = self.settings.graphics.scaling_filter.next();
+                let filter = self.current().graphics.scaling_filter.next();
                 self.apply(Action::SetScalingFilter(filter));
             }
             HotkeyAction::CycleGpuAccuracy => {
-                let g = &mut self.settings.graphics;
-                g.gpu_accuracy = g.gpu_accuracy.next();
-                let text = format!("GPU accuracy: {}", g.gpu_accuracy.label());
-                self.toast(text);
-                self.save_settings();
+                let accuracy = self.current().graphics.gpu_accuracy.next();
+                self.set_graphics(|g| g.gpu_accuracy = accuracy);
+                self.toast(format!("GPU accuracy: {}", accuracy.label()));
             }
             HotkeyAction::Exit => self.exit_requested = true,
         }
@@ -733,7 +919,7 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         if let Some(path) = self.pending_boot.take() {
-            self.boot(path);
+            self.boot(path, false);
         }
         if self.start_fullscreen {
             self.set_fullscreen(true);
@@ -804,7 +990,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.update_title();
                 }
             }
-            WindowEvent::DroppedFile(path) => self.boot(path),
+            WindowEvent::DroppedFile(path) => self.boot(path, false),
             _ => {}
         }
         if self.exit_requested {

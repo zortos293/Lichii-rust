@@ -14,6 +14,53 @@ use crate::game_list::{GameEntry, format_size};
 /// The game list's icon size, in points.
 const GAME_ICON: f32 = 40.0;
 
+/// A game's right-click menu, as in Lichii's game list.
+fn game_menu(ui: &mut Ui, entry: &GameEntry, actions: &mut Vec<Action>) {
+    let path = &entry.path;
+    let program_id = entry.meta.as_ref().map_or(0, |m| m.program_id);
+    let mut pick = |ui: &mut Ui, enabled: bool, label: &str, action: Action| {
+        if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+            actions.push(action);
+            ui.close();
+        }
+    };
+    pick(ui, true, "Start Game", Action::Boot(path.clone()));
+    pick(
+        ui,
+        true,
+        "Start Game without Custom Configuration",
+        Action::BootWithoutCustom(path.clone()),
+    );
+    ui.separator();
+    let known = entry.meta.is_some();
+    pick(
+        ui,
+        known,
+        "Properties…",
+        Action::GameProperties {
+            path: path.clone(),
+            program_id,
+            title: entry.title().to_owned(),
+        },
+    );
+    pick(
+        ui,
+        known,
+        "Remove Custom Configuration",
+        Action::RemoveGameConfig {
+            path: path.clone(),
+            program_id,
+        },
+    );
+    if !known {
+        ui.label(
+            RichText::new("Properties need the title's metadata; set up the keys first.")
+                .weak()
+                .small(),
+        );
+    }
+}
+
 /// A game list cell, centred on the icon's height.
 fn centered_cell(ui: &mut Ui, text: egui::WidgetText) {
     ui.horizontal(|ui| {
@@ -70,6 +117,7 @@ impl App {
         self.dialogs(ui.ctx(), actions);
         self.show_config(ui.ctx());
         self.show_setup(ui.ctx());
+        self.show_game_config(ui.ctx());
         if let Some((_, at)) = &self.ui.toast {
             let left = crate::app::TOAST_TIME.saturating_sub(at.elapsed());
             if left.is_zero() {
@@ -139,6 +187,12 @@ impl App {
             if self.menu_item(ui, "Configure…", HotkeyAction::Configure, true) {
                 actions.push(Action::Hotkey(HotkeyAction::Configure));
             }
+            if ui
+                .add_enabled(running, egui::Button::new("Configure Current Game…"))
+                .clicked()
+            {
+                actions.push(Action::ConfigureCurrentGame);
+            }
         });
         ui.menu_button("View", |ui| {
             let toggles = [
@@ -155,7 +209,7 @@ impl App {
                 ),
                 (
                     "Docked Mode",
-                    self.settings.system.docked,
+                    self.current().system.docked,
                     HotkeyAction::ToggleDocked,
                 ),
             ];
@@ -197,7 +251,7 @@ impl App {
                 let snap = self
                     .perf
                     .snapshot(Instant::now(), std::time::Duration::from_secs(1));
-                let g = &self.settings.graphics;
+                let g = &self.current().graphics;
                 ui.label(format!("Frame: {:.2} ms", snap.frame_time_ms));
                 ui.separator();
                 ui.label(format!("Game: {:.0} FPS", snap.game_fps));
@@ -208,7 +262,7 @@ impl App {
                     None => format!("Speed: {speed:.0}%"),
                 });
                 ui.separator();
-                ui.label(if self.settings.system.docked {
+                ui.label(if self.current().system.docked {
                     "Docked"
                 } else {
                     "Handheld"
@@ -315,7 +369,8 @@ impl App {
                             if row.double_clicked() {
                                 actions.push(Action::Boot(entry.path.clone()));
                             }
-                            row.on_hover_text("Double-click to boot");
+                            row.on_hover_text("Double-click to boot; right-click for more")
+                                .context_menu(|ui| game_menu(ui, entry, actions));
                         });
                         let meta = entry.meta.as_ref();
                         let size = if entry.size > 0 {
@@ -348,7 +403,7 @@ impl App {
             width: (rect.width() * ppp).round().max(1.0) as u32,
             height: (rect.height() * ppp).round().max(1.0) as u32,
         };
-        let aspect = self.settings.graphics.aspect_ratio;
+        let aspect = self.current().graphics.aspect_ratio;
         let fitted = Viewport::fit(aspect, area.x, area.y, area.width, area.height);
         self.viewport = Some(fitted);
         let guest = egui::Rect::from_min_size(
@@ -367,7 +422,7 @@ impl App {
         if fv.enabled {
             let window = std::time::Duration::from_secs_f32(fv.graph_seconds.max(0.1));
             let snap = self.perf.snapshot(Instant::now(), window);
-            crate::frame_view::draw(painter, guest, fv, &snap, &self.settings.graphics);
+            crate::frame_view::draw(painter, guest, fv, &snap, &self.current().graphics);
         }
         if !session.is_paused() {
             return;

@@ -52,18 +52,19 @@ impl From<SystemError> for BootError {
 pub struct Session {
     pub path: PathBuf,
     pub title: String,
+    /// The loaded program's id; 0 for homebrew and bare NSOs.
+    pub program_id: u64,
     system: System,
 }
 
 impl Session {
-    /// Loads the title at `path`, decrypting it with `keys`, and starts it. `host` builds the
-    /// renderer and shared state for the title's console generation, known once the title is
-    /// loaded.
+    /// Loads the title at `path`, decrypting it with `keys`, and starts it. `configure` picks the
+    /// settings (a game's own configuration applies by its program id) and builds the renderer
+    /// and shared state for its console generation, both known once the title is loaded.
     pub fn boot(
         path: &Path,
-        settings: Arc<Settings>,
         keys: Arc<KeySet>,
-        host: impl FnOnce(ConsoleGeneration) -> Host,
+        configure: impl FnOnce(u64, ConsoleGeneration) -> (Arc<Settings>, Host),
     ) -> Result<Self, BootError> {
         if !path.exists() {
             return Err(BootError::NotFound(path.to_path_buf()));
@@ -75,12 +76,14 @@ impl Session {
             ..LoadOptions::default()
         };
         let image = lichii_loader::load(path, &options).map_err(SystemError::from)?;
-        let host = host(image.generation);
+        let program_id = image.program_id;
+        let (settings, host) = configure(program_id, image.generation);
         let mut system = System::from_image(settings, image, host)?;
         system.run()?;
         Ok(Self {
             path: path.to_path_buf(),
             title: title(path, kind),
+            program_id,
             system,
         })
     }
@@ -186,20 +189,23 @@ mod tests {
     fn rejects_missing_unknown_and_unloadable_titles() {
         let missing = Path::new("/definitely/not/here.nsp");
         assert!(matches!(
-            Session::boot(missing, settings(), Arc::default(), |_| Host::headless()),
+            Session::boot(missing, Arc::default(), |_, _| (settings(), Host::headless())),
             Err(BootError::NotFound(path)) if path == missing
         ));
         let dir = temp_dir("reject");
         let text = dir.join("notes.txt");
         std::fs::write(&text, "x").unwrap();
         assert!(matches!(
-            Session::boot(&text, settings(), Arc::default(), |_| Host::headless()),
+            Session::boot(&text, Arc::default(), |_, _| (settings(), Host::headless())),
             Err(BootError::Unsupported(_))
         ));
         let broken = dir.join("Broken.nro");
         std::fs::write(&broken, "x").unwrap();
         assert!(matches!(
-            Session::boot(&broken, settings(), Arc::default(), |_| Host::headless()),
+            Session::boot(&broken, Arc::default(), |_, _| (
+                settings(),
+                Host::headless()
+            )),
             Err(BootError::System(SystemError::Loader(_)))
         ));
         std::fs::remove_dir_all(&dir).unwrap();
@@ -210,7 +216,7 @@ mod tests {
         let dir = temp_dir("keys");
         let nca = dir.join("Game.nca");
         std::fs::write(&nca, vec![0u8; 0x4000]).unwrap();
-        let error = Session::boot(&nca, settings(), Arc::default(), |_| Host::headless())
+        let error = Session::boot(&nca, Arc::default(), |_, _| (settings(), Host::headless()))
             .err()
             .expect("an NCA does not boot without keys");
         assert_eq!(
@@ -239,9 +245,9 @@ mod tests {
         let host = Host::headless();
         let npad = host.npad.clone();
         let mut generation = None;
-        let mut session = Session::boot(&game, settings(), Arc::default(), |title| {
+        let mut session = Session::boot(&game, Arc::default(), |_, title| {
             generation = Some(title);
-            host
+            (settings(), host)
         })
         .unwrap();
         assert_eq!(generation, Some(ConsoleGeneration::Switch1));
