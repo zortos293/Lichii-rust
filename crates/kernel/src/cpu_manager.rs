@@ -118,7 +118,9 @@ impl Core {
                 }
                 HaltReason::Interrupted | HaltReason::StepComplete => {
                     self.kernel.live_pcs.record(self.index, thread, &self.ctx);
-                    self.kernel.scheduler.take_reschedule(self.index);
+                    if self.kernel.scheduler.take_reschedule(self.index) {
+                        thread.pin_if_preemption_disabled();
+                    }
                     Flow::Yield
                 }
                 HaltReason::Breakpoint(imm) => {

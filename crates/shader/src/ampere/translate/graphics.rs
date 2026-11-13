@@ -1063,6 +1063,10 @@ mod tests {
             )
         );
         rejects(Geometry, fixed(Opcode::Lepc, dst(4) | ra(1)));
+        assert!(
+            run(Geometry, lepc).contains("SetRegister R4"),
+            "a geometry program's LEPC without the at-exit setup is an ordinary LEPC"
+        );
     }
 
     #[test]
@@ -1118,6 +1122,51 @@ mod tests {
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         validate(name, &profile, &module.spirv);
         ir
+    }
+
+    #[test]
+    fn geometry_program_inside_the_exit_envelope_emits() {
+        let body = [
+            ald(0x80, 4, ra(RZ) | rb(RZ)),
+            ast(0x70, 4, ra(RZ) | rb(0) | rc(RZ)),
+            encode(
+                Opcode::Out,
+                Form::RegReg,
+                dst(RZ) | ra(RZ) | rb(RZ) | (1 << 78),
+            ),
+        ];
+        let header = [
+            (0, 1 | (3 << 5) | (4 << 10)),
+            (2, 1 << 24),
+            (3, 7 << 24),
+            (4, 3),
+            (6, 0xf),
+            (13, 0xf0 << 8),
+        ];
+        let code = crate::ampere::geometry_exit::envelope(&body);
+        let env = whole_program(Geometry, &code, &header);
+        let ir = compile("ampere_geometry_exit", &env);
+        assert!(ir.contains("EmitVertex"), "{ir}");
+        assert!(ir.contains("SetAttribute PositionX"), "{ir}");
+        let (profile, host) = (Profile::default(), HostTranslateInfo::default());
+        let options = TranslateOptions {
+            profile: &profile,
+            host: &host,
+            resolution_scale: ResolutionScale::X1,
+        };
+        let translated = crate::translate::translate(&env, options).unwrap();
+        assert!(
+            !translated.info.reads_start_address,
+            "the setup's LEPC is skipped"
+        );
+
+        let mut broken = code.clone();
+        broken[code.len() - 2] = fixed(Opcode::Nop, 0);
+        let error =
+            crate::translate::translate(&whole_program(Geometry, &broken, &header), options)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("native exit handler body"), "{error}");
     }
 
     #[test]

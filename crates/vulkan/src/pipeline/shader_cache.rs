@@ -21,7 +21,8 @@
 //!
 //! With the title's disk cache open, a miss first replays the stored entries that share the
 //! program's probe key (`lichii_shader::cache`) and reuses a module whose every recorded answer
-//! still holds; new translations are appended to the file at the next flush.
+//! still holds; new translations serve later misses of the same run and are appended to the
+//! file at the next flush.
 //!
 //! With asynchronous translation on, a graphics miss the disk cannot serve queues the program
 //! for the workers (`shader_workers`) and skips the draw; the back thread never translates a

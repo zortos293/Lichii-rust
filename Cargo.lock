@@ -1654,6 +1654,7 @@ dependencies = [
  "lichii-common",
  "lichii-memory",
  "lichii-texture",
+ "lichii-video",
  "parking_lot",
  "thiserror 2.0.21",
  "tracing",
@@ -1767,6 +1768,7 @@ dependencies = [
 name = "lichii-video"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "libloading",
  "thiserror 2.0.21",
  "tracing",

@@ -1,8 +1,9 @@
 //! Shader translation off the GPU back thread. Jobs wait on a stack, so the programs the latest
 //! draws asked for go first, and a fixed pool of workers translates them. A job no draw asked
-//! for in the last [`STALE_FRAMES`] presents is dropped unstarted. Workers read guest memory
-//! through the channel's `Gmmu` as it is when they run; the back thread checks the program
-//! bytes again before it uses what they translated.
+//! for in the last [`STALE_FRAMES`] presents is dropped unstarted. Workers read constant
+//! buffers as the draw that queued the job saw them, since the guest rewrites them from draw to
+//! draw, and program memory through the channel's `Gmmu` as it is when they run; the back
+//! thread checks the program bytes again before it uses what they translated.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};

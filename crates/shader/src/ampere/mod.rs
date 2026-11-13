@@ -2,6 +2,7 @@
 
 mod decode;
 mod flow;
+mod geometry_exit;
 mod header;
 mod instruction;
 mod opcode;

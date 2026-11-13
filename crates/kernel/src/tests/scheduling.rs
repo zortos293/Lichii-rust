@@ -261,6 +261,110 @@ fn live_pc_sampling_finds_a_jit_spin_loop() {
     kernel.shutdown();
 }
 
+/// A user spinlock holder (B, 0x32) disables preemption in its TLS; a higher-priority thread (A,
+/// 0x28) becoming ready on the same core must not take the core from it. The interrupt pins B and
+/// raises its interrupt flag, and A runs only once B re-enables preemption and calls
+/// `svcSynchronizePreemptionState`.
+#[test]
+fn a_thread_with_preemption_disabled_is_pinned_until_it_synchronizes() {
+    const DISABLE_COUNT: u64 = 0x100;
+    const INTERRUPT_FLAG: u64 = 0x102;
+    let test = TestKernel::new(ConsoleGeneration::Switch1);
+    let heap = heap_base(&test);
+    let handles = heap + 0x1000;
+    let held = Arc::new(AtomicBool::new(false));
+    let a_ran = Arc::new(AtomicBool::new(false));
+    let saw = Arc::new(Mutex::new(None));
+    let a = {
+        let a_ran = a_ran.clone();
+        test.program(
+            Script::new()
+                .then(move |_, _| a_ran.store(true, Ordering::SeqCst))
+                .exit(),
+        )
+    };
+    let b = {
+        let (held, a_ran, a_ran_spin, saw) =
+            (held.clone(), a_ran.clone(), a_ran.clone(), saw.clone());
+        test.program(
+            Script::new()
+                .then(move |ctx, env| {
+                    env.memory
+                        .write::<u16>(ctx.tpidrro_el0 + DISABLE_COUNT, 1)
+                        .unwrap();
+                    held.store(true, Ordering::SeqCst);
+                })
+                .spin_until(move |ctx, env| {
+                    env.memory
+                        .read::<u16>(ctx.tpidrro_el0 + INTERRUPT_FLAG)
+                        .unwrap()
+                        != 0
+                        || a_ran_spin.load(Ordering::SeqCst)
+                })
+                .then(move |ctx, env| {
+                    let flag = env
+                        .memory
+                        .read::<u16>(ctx.tpidrro_el0 + INTERRUPT_FLAG)
+                        .unwrap();
+                    *saw.lock() = Some((flag, a_ran.load(Ordering::SeqCst)));
+                    env.memory
+                        .write::<u16>(ctx.tpidrro_el0 + DISABLE_COUNT, 0)
+                        .unwrap();
+                })
+                .svc(0x36, |_, _| {})
+                .exit(),
+        )
+    };
+    let main = {
+        let held = held.clone();
+        test.program(
+            Script::new()
+                .svc(0x08, move |ctx, _| {
+                    ctx.x[1] = b;
+                    ctx.x[2] = 0;
+                    ctx.x[3] = heap + 0x10_0000;
+                    ctx.x[4] = 0x32;
+                    ctx.x[5] = 1;
+                })
+                .then(move |ctx, env| env.memory.write(handles, ctx.x[1] as u32).unwrap())
+                .svc(0x09, move |ctx, env| {
+                    ctx.x[0] = env.memory.read::<u32>(handles).unwrap() as u64;
+                })
+                .spin_until(move |_, _| held.load(Ordering::SeqCst))
+                .svc(0x08, move |ctx, _| {
+                    ctx.x[1] = a;
+                    ctx.x[2] = 0;
+                    ctx.x[3] = heap + 0x11_0000;
+                    ctx.x[4] = 0x28;
+                    ctx.x[5] = 1;
+                })
+                .then(move |ctx, env| env.memory.write(handles + 4, ctx.x[1] as u32).unwrap())
+                .svc(0x09, move |ctx, env| {
+                    ctx.x[0] = env.memory.read::<u32>(handles + 4).unwrap() as u64;
+                })
+                .svc(0x18, move |ctx, _| {
+                    ctx.x[1] = handles;
+                    ctx.x[2] = 1;
+                    ctx.x[3] = u64::MAX;
+                })
+                .svc(0x18, move |ctx, _| {
+                    ctx.x[1] = handles + 4;
+                    ctx.x[2] = 1;
+                    ctx.x[3] = u64::MAX;
+                })
+                .exit(),
+        )
+    };
+    test.start(test.image(), main);
+    test.run_until_exit(Duration::from_secs(10));
+    assert_eq!(
+        *saw.lock(),
+        Some((1, false)),
+        "(interrupt flag, A ran) while B held the core"
+    );
+    assert!(a_ran.load(Ordering::SeqCst));
+}
+
 #[test]
 fn preemption_priority_threads_rotate() {
     let test = TestKernel::new(ConsoleGeneration::Switch1);
