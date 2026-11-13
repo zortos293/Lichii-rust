@@ -191,6 +191,41 @@ fn later_firmware_state_and_controller_commands_answer_like_the_reference() {
 }
 
 #[test]
+fn capture_commands_answer_without_a_shared_capture_buffer() {
+    let (_context, client, proxy) = booted(SWITCH1_TITLE);
+    let display = interface(&client, proxy, 4);
+    for command in [5, 7] {
+        let mut reply = client.send(display, &Request::new(command)).unwrap();
+        assert_eq!(reply.result, ResultCode::SUCCESS, "command {command}");
+        assert_eq!(
+            reply.pop::<u8>(),
+            1,
+            "command {command} reports a written image"
+        );
+    }
+    let screenshot = Request::new(8).arg(0u8).arg(0i32);
+    assert_eq!(
+        client.send(display, &screenshot).unwrap().result,
+        ResultCode::SUCCESS
+    );
+    let clear = Request::new(20).arg(0u8).arg(0i32).arg(0xff00_00ffu32);
+    assert_eq!(
+        client.send(display, &clear).unwrap().result,
+        crate::vi::PERMISSION_DENIED
+    );
+    for (acquire, release) in [(22, 23), (24, 25), (26, 27)] {
+        let reply = client.send(display, &Request::new(acquire)).unwrap();
+        assert_eq!(
+            reply.result,
+            crate::vi::PERMISSION_DENIED,
+            "command {acquire}"
+        );
+        let reply = client.send(display, &Request::new(release)).unwrap();
+        assert_eq!(reply.result, ResultCode::SUCCESS, "command {release}");
+    }
+}
+
+#[test]
 fn an_unpopped_storage_is_the_next_launch_parameter() {
     let (_context, client, proxy) = booted(SWITCH1_TITLE);
     let creator = interface(&client, proxy, 11);
