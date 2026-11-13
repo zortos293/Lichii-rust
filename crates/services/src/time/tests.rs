@@ -3,8 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::zone::RULE_SIZE;
 use super::{
     CLOCK_MISMATCH, CLOCK_SOURCE_ID, CalendarAdditionalInfo, CalendarTime, ClockSnapshot,
-    LOCAL_CONTEXT, NOT_IMPLEMENTED, PERMISSION_DENIED, STEADY_TIME_POINT, SteadyClockTimePoint,
-    SystemClockContext, TIME_ZONE_NOT_FOUND, utc_location,
+    LOCAL_CONTEXT, NOT_IMPLEMENTED, OVERFLOW, PERMISSION_DENIED, STEADY_TIME_POINT,
+    SteadyClockTimePoint, SystemClockContext, TIME_ZONE_NOT_FOUND, utc_location,
 };
 use lichii_common::settings::Settings;
 use lichii_kernel::object::KObject;
@@ -71,6 +71,25 @@ fn system_clocks_follow_the_host_clock() {
         client.send(ephemeral, &Request::new(0)).unwrap().result,
         CLOCK_MISMATCH
     );
+}
+
+#[test]
+fn reading_the_user_clock_leaves_its_event_alone() {
+    let client = boot();
+    let time = client.connect("time:u").unwrap();
+    let clock = interface(&client, time, 0);
+    let handle = client
+        .send(clock, &Request::new(4))
+        .unwrap()
+        .ok()
+        .copy_handles[0];
+    let Some(KObject::ReadableEvent(event)) = client.object(handle) else {
+        panic!("handle {handle:#x} is not a readable event");
+    };
+    event.clear();
+    client.send(clock, &Request::new(0)).unwrap().ok();
+    client.send(clock, &Request::new(2)).unwrap().ok();
+    assert!(!event.is_signaled());
 }
 
 #[test]
@@ -474,6 +493,14 @@ fn the_time_zone_is_utc() {
             (info.day_of_week, info.day_of_year, &info.name[..4]),
             (2, 317, &b"UTC\0"[..])
         );
+    }
+    for request in [
+        Request::new(100)
+            .arg(1_000_000_000_000i64)
+            .buffer_a(rule, RULE_SIZE as u64),
+        Request::new(101).arg(1_000_000_000_000i64),
+    ] {
+        assert_eq!(client.send(zone, &request).unwrap().result, OVERFLOW);
     }
     let calendar = CalendarTime {
         year: 2023,

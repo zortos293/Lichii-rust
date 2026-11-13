@@ -488,7 +488,7 @@ impl Rule {
         let days = local_time.div_euclid(SECONDS_PER_DAY);
         let seconds = local_time.rem_euclid(SECONDS_PER_DAY);
         let (year, month, day) = civil_from_days(days);
-        i32::try_from(year).ok()?;
+        let calendar_year = i16::try_from(year).ok()?;
         let mut name = [0; 8];
         if let Some(abbr) = self.chars.get(usize::from(local.abbr)..) {
             let len = abbr
@@ -500,7 +500,7 @@ impl Rule {
         }
         Some((
             CalendarTime {
-                year: year as i16,
+                year: calendar_year,
                 month: month as i8,
                 day: day as i8,
                 hour: (seconds / 3600) as i8,

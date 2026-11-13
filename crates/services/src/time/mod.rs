@@ -6,15 +6,15 @@ mod zone;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering, fence};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytemuck::{Pod, Zeroable};
 use lichii_common::{HleResult, ResultCode};
-use lichii_kernel::Event;
 use lichii_kernel::Pool;
 use lichii_kernel::ipc::HleRequestContext;
 use lichii_kernel::memory_objects::SharedMemory;
 use lichii_kernel::object::KObject;
+use lichii_kernel::{Event, GuestClock};
 use lichii_memory::MemoryPermission;
 use parking_lot::Mutex;
 
@@ -173,7 +173,7 @@ struct State {
 
 /// The clocks and time zone every `time:*` session shares.
 struct Clocks {
-    started: Instant,
+    clock: Arc<dyn GuestClock>,
     rtc_offset_ns: i64,
     test_offset_ns: AtomicI64,
     shared: Arc<SharedMemory>,
@@ -206,7 +206,7 @@ impl Clocks {
             .map_or(0, |since| since.as_nanos() as i64);
         let rule = Rule::parse_tzif(&zone::utc_tzif()).expect("the UTC rule parses");
         let clocks = Self {
-            started: Instant::now(),
+            clock: context.kernel.clock().clone(),
             rtc_offset_ns,
             test_offset_ns: AtomicI64::new(0),
             shared: Arc::new(shared),
@@ -253,9 +253,11 @@ impl Clocks {
         Ok(clocks)
     }
 
-    /// Time since boot. Stands in for the guest's system counter, which services cannot read yet.
+    /// Time since boot on the guest's system counter, the one shared-memory readers convert.
     fn uptime_ns(&self) -> i64 {
-        self.started.elapsed().as_nanos() as i64
+        let ns =
+            u128::from(self.clock.ticks()) * 1_000_000_000 / u128::from(self.clock.frequency());
+        ns as i64
     }
 
     fn raw_ns(&self) -> i64 {
@@ -269,8 +271,12 @@ impl Clocks {
         }
     }
 
+    /// Stores and publishes `context`, signalling the clock's event, unless it is unchanged.
     fn write_context(&self, state: &mut State, kind: ClockKind, context: SystemClockContext) {
         match kind {
+            ClockKind::Local if state.local == context => {}
+            ClockKind::Network if state.network == context => {}
+            ClockKind::EphemeralNetwork if state.ephemeral_network == context => {}
             ClockKind::Local => {
                 state.local = context;
                 write_shared(&self.shared, LOCAL_CONTEXT, &context);
