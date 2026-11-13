@@ -33,8 +33,8 @@ fn utc_location() -> [u8; 0x24] {
     location("UTC")
 }
 
-/// The zones the synthesized archive lists.
-const SYNTHESIZED_ZONES: [&str; 4] = ["Etc/GMT", "Etc/UTC", "GMT", "UTC"];
+/// The zones the synthesized archive lists: the whole tz database.
+const SYNTHESIZED_ZONES: &[&str] = tzdb_data::TZ_NAMES;
 
 fn host_now() -> i64 {
     SystemTime::now()
@@ -425,8 +425,8 @@ fn the_time_zone_is_utc() {
             .send(zone, &Request::new(2))
             .unwrap()
             .ok()
-            .get::<u32>(0),
-        4
+            .get::<u32>(0) as usize,
+        SYNTHESIZED_ZONES.len()
     );
     let names = client.alloc(&[0; 0x24 * 4]);
     let list = |index: u32, size: u64| {
@@ -439,17 +439,19 @@ fn the_time_zone_is_utc() {
             .map(|i| client.read(names + 0x24 * i as u64, 0x24))
             .collect::<Vec<_>>()
     };
-    let expected: Vec<Vec<u8>> = SYNTHESIZED_ZONES.map(|z| location(z).to_vec()).into();
-    assert_eq!(list(0, 0x24 * 4), expected);
+    let expected: Vec<Vec<u8>> = SYNTHESIZED_ZONES
+        .iter()
+        .map(|z| location(z).to_vec())
+        .collect();
+    let total = SYNTHESIZED_ZONES.len();
+    assert_eq!(list(0, 0x24 * 4), expected[..4]);
     assert_eq!(list(1, 0x24 * 2), expected[1..3]);
-    assert_eq!(list(3, 0x24 * 4), expected[3..]);
-    assert!(list(4, 0x24 * 4).is_empty());
+    assert_eq!(list(total as u32 - 2, 0x24 * 4), expected[total - 2..]);
+    assert!(list(total as u32, 0x24 * 4).is_empty());
     assert!(list(0, 0x23).is_empty());
     let mut version = [0u8; 0x10];
-    version[..6].copy_from_slice(
-        b"2025b
-",
-    );
+    let release = format!("{}\n", tzdb_data::VERSION);
+    version[..release.len()].copy_from_slice(release.as_bytes());
     assert_eq!(
         client.send(zone, &Request::new(5)).unwrap().ok().data(),
         version
@@ -490,12 +492,12 @@ fn the_time_zone_is_utc() {
         )
         .unwrap()
         .ok();
-    let mut tokyo = [0u8; 0x24];
-    tokyo[..10].copy_from_slice(b"Asia/Tokyo");
     let reply = client
         .send(
             zone,
-            &Request::new(4).arg(tokyo).buffer_b(rule, RULE_SIZE as u64),
+            &Request::new(4)
+                .arg(location("Mars/Olympus"))
+                .buffer_b(rule, RULE_SIZE as u64),
         )
         .unwrap();
     assert_eq!(reply.result, TIME_ZONE_NOT_FOUND);
@@ -576,7 +578,7 @@ fn administrators_set_the_location() {
     );
     assert_eq!(
         client
-            .send(zone, &Request::new(1).arg(location("Asia/Tokyo")))
+            .send(zone, &Request::new(1).arg(location("Mars/Olympus")))
             .unwrap()
             .result,
         TIME_ZONE_NOT_FOUND
@@ -668,7 +670,27 @@ fn the_device_location_follows_the_settings() {
 fn an_unknown_zone_falls_back_to_the_host_zone_then_utc() {
     let host = super::binary::host_zone().filter(|zone| SYNTHESIZED_ZONES.contains(&zone.as_str()));
     let expected = location(host.as_deref().unwrap_or("UTC"));
-    for setting in ["Mars/Olympus", "auto", "Asia/Tokyo"] {
+    for setting in ["Mars/Olympus", "auto", "Europe/Nowhere"] {
         assert_eq!(device_location(&boot_in(setting)), expected, "{setting}");
+    }
+}
+
+#[test]
+fn europe_amsterdam_resolves_with_its_daylight_saving_rule() {
+    let client = boot_in("Europe/Amsterdam");
+    assert_eq!(device_location(&client), location("Europe/Amsterdam"));
+    let time = client.connect("time:u").unwrap();
+    let zone = interface(&client, time, 3);
+    for (time, hour, name) in [
+        (1_700_000_000i64, 23, &b"CET\0"[..]),
+        (1_690_000_000, 6, &b"CEST"[..]),
+    ] {
+        let reply = client
+            .send(zone, &Request::new(101).arg(time))
+            .unwrap()
+            .ok();
+        let calendar: CalendarTime = reply.get(0);
+        let info: CalendarAdditionalInfo = reply.get(8);
+        assert_eq!((calendar.hour, &info.name[..4]), (hour, name), "{time}");
     }
 }
