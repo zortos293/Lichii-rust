@@ -306,7 +306,7 @@ impl Arbiter {
         if word.load(Ordering::SeqCst) != owner_handle | HANDLE_WAIT_MASK {
             return Ok(WaitOutcome::Done(ResultCode::SUCCESS));
         }
-        process
+        let owner = process
             .handles()
             .read()
             .get_typed::<Thread>(owner_handle)
@@ -325,20 +325,22 @@ impl Arbiter {
             mutex: addr,
             tag,
         });
+        owner.add_lock_waiter(thread, token, addr);
         Ok(WaitOutcome::Block(token))
     }
 
-    /// Hands the mutex at `addr` to its best waiter, or clears it.
+    /// `owner` hands the mutex at `addr` to its best waiter, or clears it.
     fn release_mutex(
         shard: &mut Shard,
-        memory: &AddressSpace,
+        owner: &Arc<Thread>,
         pid: ProcessId,
         addr: VAddr,
     ) -> HleResult<()> {
-        let word: &AtomicU32 = guest_word(memory, addr, true)?;
+        let word: &AtomicU32 = guest_word(owner.process().memory(), addr, true)?;
         loop {
             let Some(next) = take_best(&mut shard.mutex, pid, addr) else {
                 word.store(0, Ordering::SeqCst);
+                owner.pass_lock(addr, None);
                 return Ok(());
             };
             let mut s = next.thread.sched.lock();
@@ -351,22 +353,20 @@ impl Arbiter {
                 Ordering::SeqCst,
             );
             next.thread.wake_locked(&mut s, WakeResult::SUCCESS);
+            drop(s);
+            owner.pass_lock(addr, Some(&next.thread));
             return Ok(());
         }
     }
 
-    /// `svcArbitrateUnlock`.
-    pub fn arbitrate_unlock(
-        &self,
-        process: &crate::process::Process,
-        addr: VAddr,
-    ) -> HleResult<()> {
+    /// `svcArbitrateUnlock` from `thread`, the mutex's owner.
+    pub fn arbitrate_unlock(&self, thread: &Arc<Thread>, addr: VAddr) -> HleResult<()> {
         if !addr.is_multiple_of(4) {
             return Err(result::INVALID_ADDRESS);
         }
-        let pid = process.id();
+        let pid = thread.process().id();
         let mut shard = self.shard(pid, addr);
-        Self::release_mutex(&mut shard, process.memory(), pid, addr)
+        Self::release_mutex(&mut shard, thread, pid, addr)
     }
 
     /// `svcWaitProcessWideKeyAtomic`: releases the mutex at `addr` and waits on `key`.
@@ -402,7 +402,7 @@ impl Arbiter {
                 Some(&mut *lock_first),
             )
         };
-        if let Err(code) = Self::release_mutex(mutex_shard, memory, pid, addr) {
+        if let Err(code) = Self::release_mutex(mutex_shard, thread, pid, addr) {
             thread.cancel_wait(token);
             return Err(code);
         }
@@ -484,6 +484,10 @@ impl Arbiter {
                 waiter.thread.wake_locked(&mut s, WakeResult::SUCCESS);
             } else {
                 drop(s);
+                let owner = current & !HANDLE_WAIT_MASK;
+                if let Ok(owner) = process.handles().read().get_typed::<Thread>(owner) {
+                    owner.add_lock_waiter(&waiter.thread, waiter.token, waiter.mutex);
+                }
                 shard.mutex.retain(Waiter::is_live);
                 shard.mutex.push(Waiter {
                     key: waiter.mutex,
