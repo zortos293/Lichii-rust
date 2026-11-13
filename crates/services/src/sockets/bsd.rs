@@ -61,14 +61,19 @@ impl EventFd {
 /// One service's descriptor table; duplicates share an eventfd.
 pub(super) struct Descriptors {
     slots: Vec<Option<Arc<Mutex<EventFd>>>>,
-    /// Requests waiting for an eventfd to change; each runs again on every change.
-    waiting: Vec<DeferredRequest>,
+    /// Per closed fd, the blocked reads and writes on it that have yet to retry. The slot is
+    /// not reused until they have, so a retry never lands on a newer eventfd with that number.
+    closed_waiters: Vec<u16>,
+    /// Requests waiting for an eventfd to change, with the fd a read or write blocked on; each
+    /// runs again on every change.
+    waiting: Vec<(Option<usize>, DeferredRequest)>,
 }
 
 impl Descriptors {
     pub(super) fn new() -> Self {
         Self {
             slots: vec![None; MAX_FD],
+            closed_waiters: vec![0; MAX_FD],
             waiting: Vec::new(),
         }
     }
@@ -78,14 +83,29 @@ impl Descriptors {
         self.slots.get(fd)?.as_ref()
     }
 
+    /// The eventfd a read or write on `fd` uses. A miss on a closed fd counts down one of the
+    /// blocked requests it still owes a retry.
+    fn take_for_io(&mut self, fd: i32) -> Option<Arc<Mutex<EventFd>>> {
+        let index = usize::try_from(fd).ok().filter(|&i| i < MAX_FD)?;
+        if let Some(event_fd) = &self.slots[index] {
+            return Some(event_fd.clone());
+        }
+        self.closed_waiters[index] = self.closed_waiters[index].saturating_sub(1);
+        None
+    }
+
     fn insert(&mut self, event_fd: Arc<Mutex<EventFd>>) -> Option<i32> {
-        let fd = self.slots.iter().position(Option::is_none)?;
+        let fd = self
+            .slots
+            .iter()
+            .zip(&self.closed_waiters)
+            .position(|(slot, &waiters)| slot.is_none() && waiters == 0)?;
         self.slots[fd] = Some(event_fd);
         Some(fd as i32)
     }
 
     fn changed(&mut self) {
-        for request in self.waiting.drain(..) {
+        for (_, request) in self.waiting.drain(..) {
             request.retry();
         }
     }
@@ -207,7 +227,7 @@ impl Bsd {
     fn read(&self, ctx: &mut HleRequestContext) -> ResultCode {
         let fd: i32 = ctx.pop();
         let mut descriptors = self.descriptors.lock().unwrap();
-        let Some(event_fd) = descriptors.get(fd).cloned() else {
+        let Some(event_fd) = descriptors.take_for_io(fd) else {
             return reply(ctx, -1, BADF);
         };
         if ctx.writable_buffer(0).map_or(0, |b| b.size) < 8 {
@@ -219,7 +239,7 @@ impl Bsd {
                 return reply(ctx, -1, AGAIN);
             }
             drop(state);
-            descriptors.waiting.push(ctx.defer());
+            descriptors.waiting.push((Some(fd as usize), ctx.defer()));
             return ResultCode::SUCCESS;
         }
         let value = if state.semaphore { 1 } else { state.counter };
@@ -235,7 +255,7 @@ impl Bsd {
     fn write(&self, ctx: &mut HleRequestContext) -> ResultCode {
         let fd: i32 = ctx.pop();
         let mut descriptors = self.descriptors.lock().unwrap();
-        let Some(event_fd) = descriptors.get(fd).cloned() else {
+        let Some(event_fd) = descriptors.take_for_io(fd) else {
             return reply(ctx, -1, BADF);
         };
         let data = ctx.read_buffer(0).unwrap_or_default();
@@ -252,7 +272,7 @@ impl Bsd {
                 return reply(ctx, -1, AGAIN);
             }
             drop(state);
-            descriptors.waiting.push(ctx.defer());
+            descriptors.waiting.push((Some(fd as usize), ctx.defer()));
             return ResultCode::SUCCESS;
         }
         state.counter += value;
@@ -270,6 +290,13 @@ impl Bsd {
         if slot.and_then(Option::take).is_none() {
             return errno_reply(ctx, BADF);
         }
+        let index = fd as usize;
+        let waiters = descriptors
+            .waiting
+            .iter()
+            .filter(|(waiting_on, _)| *waiting_on == Some(index))
+            .count();
+        descriptors.closed_waiters[index] += waiters as u16;
         descriptors.changed();
         errno_reply(ctx, SUCCESS)
     }
@@ -345,7 +372,7 @@ impl Bsd {
             count += i32::from(revents != 0);
         }
         if count == 0 && timeout == -1 {
-            descriptors.waiting.push(ctx.defer());
+            descriptors.waiting.push((None, ctx.defer()));
             return ResultCode::SUCCESS;
         }
         drop(descriptors);
@@ -410,7 +437,7 @@ impl Bsd {
             }
         }
         if ready == 0 && forever {
-            descriptors.waiting.push(ctx.defer());
+            descriptors.waiting.push((None, ctx.defer()));
             return ResultCode::SUCCESS;
         }
         drop(descriptors);
@@ -709,5 +736,26 @@ mod tests {
         });
         assert_eq!(guest.read(out, 8), 1u64.to_le_bytes());
         assert_eq!(guest.read(polled + 6, 2), POLL_IN.to_le_bytes());
+    }
+
+    #[test]
+    fn closed_fds_with_blocked_io_are_not_reused_until_it_retries() {
+        let event_fd = || {
+            Arc::new(Mutex::new(EventFd {
+                counter: 0,
+                semaphore: false,
+                status_flags: 0,
+            }))
+        };
+        let mut descriptors = Descriptors::new();
+        assert_eq!(descriptors.insert(event_fd()), Some(0));
+        descriptors.slots[0] = None;
+        descriptors.closed_waiters[0] = 1;
+        assert_eq!(descriptors.insert(event_fd()), Some(1));
+        assert!(descriptors.take_for_io(0).is_none());
+        assert_eq!(descriptors.insert(event_fd()), Some(0));
+        assert!(descriptors.take_for_io(0).is_some());
+        assert!(descriptors.take_for_io(-1).is_none());
+        assert!(descriptors.take_for_io(MAX_FD as i32).is_none());
     }
 }
