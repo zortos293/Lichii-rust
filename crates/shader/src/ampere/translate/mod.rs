@@ -17,10 +17,11 @@ use lichii_common::GpuVAddr;
 
 use super::decode::{Form, decode};
 use super::flow::AmpereFlow;
+use super::geometry_exit::{self, NotAnEnvelope, SETUP_INSTRUCTIONS};
 use super::instruction::{INSTRUCTION_SIZE, Instruction};
 use super::opcode::Opcode;
 use crate::ir::{BlockId, Emitter, Program};
-use crate::{ShaderEnvironment, TranslateError};
+use crate::{ShaderEnvironment, ShaderStage, TranslateError};
 
 pub type TResult = Result<(), TranslateError>;
 
@@ -56,6 +57,21 @@ pub fn translate_block(
         form: Form::Fixed,
     };
     let mut pc = begin;
+    let opcode_at = |index: u32| decode(flow.read(env, index * INSTRUCTION_SIZE)).map(|d| d.opcode);
+    if begin == 0
+        && env.stage() == ShaderStage::Geometry
+        && opcode_at(0) == Some(Opcode::Lepc)
+        && opcode_at(SETUP_INSTRUCTIONS - 1) == Some(Opcode::BmovAtExit)
+    {
+        let read = |index: usize| flow.read(env, index as u32 * INSTRUCTION_SIZE);
+        if let Err(NotAnEnvelope { index, reason }) = geometry_exit::analyze(read) {
+            let address = base + index as u64 * u64::from(INSTRUCTION_SIZE);
+            return Err(TranslateError::Lowering(format!(
+                "geometry exit envelope at {address:#x}: {reason}"
+            )));
+        }
+        pc = (SETUP_INSTRUCTIONS * INSTRUCTION_SIZE).min(end);
+    }
     while pc < end {
         t.pc = pc;
         t.insn = flow.read(env, pc);
