@@ -617,6 +617,36 @@ fn joy_con_assignment_splits_a_pair_and_merges_it_back() {
             && left.right_stick == [0, 0]
     });
 
+    let rumble = |npad_id: u8, device_index: u8, value: VibrationValue| {
+        let handle = DeviceHandle {
+            style_index: 5,
+            npad_id,
+            device_index,
+            reserved: 0,
+        };
+        hid.send(
+            Request::new(201)
+                .send_pid()
+                .arg(handle)
+                .arg(RawVibration::from(value))
+                .arg(ARUID),
+        )
+        .ok();
+    };
+    let strong = VibrationValue {
+        low_amplitude: 0.5,
+        high_amplitude: 0.25,
+        ..DEFAULT_VIBRATION
+    };
+    let mut seen = 0;
+    rumble(0, 1, strong);
+    rumble(1, 0, DEFAULT_VIBRATION);
+    assert_eq!(
+        hid.context.npad.take_vibration(0, &mut seen),
+        Some(strong),
+        "both Joy-Cons rumble the one host pair"
+    );
+
     hid.send(Request::new(123).send_pid().arg(1u32).arg(ARUID).arg(0u64))
         .ok();
     assert_eq!(hid.style(1), Style::JoyLeft.tag());
@@ -636,6 +666,34 @@ fn joy_con_assignment_splits_a_pair_and_merges_it_back() {
         .ok();
     assert_eq!(hid.style(0), Style::JoyDual.tag());
     assert_eq!(hid.style(1), Style::JoyDual.tag());
+}
+
+#[test]
+fn a_split_without_a_free_entry_changes_nothing() {
+    let hid = Hid::new();
+    let ids = hid.client.alloc(bytemuck::cast_slice(&[0u32]));
+    hid.send(Request::new(102).send_pid().arg(ARUID).buffer_x(ids, 4))
+        .ok();
+    hid.start_npads(0b11111);
+    hid.publish(
+        0,
+        NpadState {
+            controller: ControllerType::DualJoycons,
+            ..pro_controller()
+        },
+    );
+    eventually("the pair to connect", || {
+        hid.style(0) == Style::JoyDual.tag()
+    });
+    let reply = hid
+        .send(Request::new(133).send_pid().arg(0u32).arg(ARUID).arg(0u64))
+        .ok();
+    assert_eq!((reply.get::<u8>(0), reply.get::<u32>(4)), (0, 0));
+    assert_eq!(hid.style(0), Style::JoyDual.tag());
+    assert_eq!(
+        hid.read::<u32>(NpadEntry::new(0).at(NpadEntry::ASSIGNMENT_MODE)),
+        0
+    );
 }
 
 #[test]

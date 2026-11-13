@@ -102,7 +102,7 @@ impl DeviceHandle {
     }
 }
 
-/// The one rumble the hub carries for an npad's two motors: each band from the motor that
+/// The one rumble the hub carries for a host controller's motors: each band from the motor that
 /// drives it harder.
 fn strongest(left: VibrationValue, right: VibrationValue) -> VibrationValue {
     let low = if right.low_amplitude > left.low_amplitude {
@@ -190,18 +190,20 @@ impl HidServer {
         if !state.vibration_permitted {
             return Ok(());
         }
-        let npad = &mut state.npads[index];
-        npad.vibration[handle.motor()] = value;
-        let [left, right] = npad.vibration;
-        let player = match (state.routes[index], index) {
-            (Some(route), _) => route.player,
-            (None, HANDHELD) => 0,
-            (None, OTHER) => return Ok(()),
-            (None, player) => player,
+        state.npads[index].vibration[handle.motor()] = value;
+        let Some(player) = state.host_player(index) else {
+            return Ok(());
         };
-        self.hid
-            .hub
-            .request_vibration(player, strongest(left, right));
+        let rumble = (0..NPAD_COUNT)
+            .filter(|&entry| {
+                entry == index
+                    || (state.npads[entry].style.is_some()
+                        && state.host_player(entry) == Some(player))
+            })
+            .flat_map(|entry| state.npads[entry].vibration)
+            .reduce(strongest)
+            .unwrap_or(value);
+        self.hid.hub.request_vibration(player, rumble);
         Ok(())
     }
 

@@ -450,6 +450,27 @@ impl HidState {
         single: bool,
         kept: Halves,
     ) -> Option<usize> {
+        let player = match self.routes[index] {
+            Some(route) => Some(route.player),
+            None => (index < MAX_PLAYERS).then_some(index),
+        };
+        let npad = &self.npads[index];
+        let splits = single
+            && npad.style == Some(Style::JoyDual)
+            && npad.halves == Halves::BOTH
+            && player.is_some_and(|player| {
+                Halves::of(hub.read(player).controller) == Some(Halves::BOTH)
+            });
+        let free = if splits {
+            Some((0..MAX_PLAYERS).find(|&other| {
+                other != index
+                    && self.supported_ids & 1 << other != 0
+                    && self.npads[other].style.is_none()
+                    && self.routes[other].is_none()
+            })?)
+        } else {
+            None
+        };
         if let Some(memory) = &self.memory {
             put(
                 memory,
@@ -458,16 +479,11 @@ impl HidState {
             );
         }
         self.npads[index].single = single;
+        let player = player?;
         let npad = &self.npads[index];
-        let player = match self.routes[index] {
-            Some(route) => route.player,
-            None if index < MAX_PLAYERS => index,
-            None => return None,
-        };
         let halves = npad.halves;
-        let mut moved = None;
-        match (npad.style, single) {
-            (Some(Style::JoyLeft | Style::JoyRight), false) => {
+        match (npad.style, single, free) {
+            (Some(Style::JoyLeft | Style::JoyRight), false, _) => {
                 let halves = if npad.style == Some(Style::JoyLeft) {
                     Halves::LEFT
                 } else {
@@ -475,18 +491,10 @@ impl HidState {
                 };
                 self.routes[index] = Some(Route { player, halves });
             }
-            (Some(Style::JoyDual), true) if halves != Halves::BOTH => {
+            (Some(Style::JoyDual), true, _) if halves != Halves::BOTH => {
                 self.routes[index] = Some(Route { player, halves });
             }
-            (Some(Style::JoyDual), true)
-                if Halves::of(hub.read(player).controller) == Some(Halves::BOTH) =>
-            {
-                let free = (0..MAX_PLAYERS).find(|&other| {
-                    other != index
-                        && self.supported_ids & 1 << other != 0
-                        && self.npads[other].style.is_none()
-                        && self.routes[other].is_none()
-                })?;
+            (_, _, Some(free)) => {
                 let other = Halves {
                     left: !kept.left,
                     right: !kept.right,
@@ -500,12 +508,22 @@ impl HidState {
                     halves: other,
                 });
                 self.npads[free].single = false;
-                moved = Some(free);
             }
             _ => return None,
         }
         self.update_npads(hub);
-        moved
+        free
+    }
+
+    /// The host player whose controller npad entry `index` shows: its route's player, player 1
+    /// for the handheld entry, and none for `Other`.
+    pub fn host_player(&self, index: usize) -> Option<usize> {
+        match (self.routes[index], index) {
+            (Some(route), _) => Some(route.player),
+            (None, HANDHELD) => Some(0),
+            (None, OTHER) => None,
+            (None, player) => Some(player),
+        }
     }
 
     /// `MergeSingleJoyAsDualJoy`: joins the two Joy-Cons of one host pair, shown on entries
@@ -543,16 +561,13 @@ impl HidState {
         if !self.npad_active {
             return;
         }
-        for (index, npad) in self.npads.iter_mut().enumerate() {
+        let players: [Option<usize>; NPAD_COUNT] =
+            std::array::from_fn(|index| self.host_player(index));
+        for ((index, npad), player) in self.npads.iter_mut().enumerate().zip(players) {
             let Some(style) = npad.style else { continue };
-            let player = match self.routes[index] {
-                Some(route) => route.player,
-                None if index == HANDHELD => 0,
-                None => index,
-            };
-            let motion = (player < MAX_PLAYERS && npad.sixaxis_enabled)
-                .then(|| hub.read(player).motion)
-                .flatten();
+            let motion = player
+                .filter(|_| npad.sixaxis_enabled)
+                .and_then(|player| hub.read(player).motion);
             let active = match motion {
                 Some(sample) => npad.integrate(sample.accel, sample.gyro),
                 None => SixAxisSensorState {
