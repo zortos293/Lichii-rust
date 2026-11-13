@@ -258,7 +258,9 @@ pub(crate) trait BackView: Send + Sync {
 /// Finds a back that has work queued but made no progress for [`STALL`].
 #[derive(Default)]
 struct StallWatch {
-    last: Option<BackSnapshot>,
+    /// The back's own position (consumed, executing) when last seen; the front publishing more
+    /// is not progress.
+    last: Option<(u64, u64)>,
     /// When the back last made progress, or had nothing to do.
     progressed: Option<Instant>,
     reported: Option<Instant>,
@@ -267,8 +269,9 @@ struct StallWatch {
 impl StallWatch {
     fn check(&mut self, activity: &Activity, now: BackSnapshot) {
         let idle = now.published == now.consumed && activity.current_call().is_none();
-        if idle || self.last != Some(now) {
-            self.last = Some(now);
+        let position = (now.consumed, now.executing);
+        if idle || self.last != Some(position) {
+            self.last = Some(position);
             self.progressed = Some(Instant::now());
             if self.reported.take().is_some() {
                 tracing::warn!("the GPU back is making progress again");
@@ -383,6 +386,15 @@ mod tests {
         assert!(
             watch.reported.is_some(),
             "no progress with work queued is a stall"
+        );
+        let more = BackSnapshot {
+            published: 20,
+            ..busy
+        };
+        watch.check(&activity, more);
+        assert!(
+            watch.reported.is_some(),
+            "the front publishing more is not the back making progress"
         );
         let idle = BackSnapshot {
             published: 10,
