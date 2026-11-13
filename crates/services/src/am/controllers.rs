@@ -196,6 +196,21 @@ impl Service for SelfController {
                 ctx.push(applet.state.lock().idle_time_detection_extension);
                 ResultCode::SUCCESS
             }
+            40 => match crate::vi::create_managed_layer(&self.context, self.context.process.id()) {
+                Ok(layer) => {
+                    ctx.push(layer);
+                    ResultCode::SUCCESS
+                }
+                Err(result) => result,
+            },
+            41..=43 => crate::vi::PERMISSION_DENIED,
+            44 => match crate::vi::create_managed_layer(&self.context, self.context.process.id()) {
+                Ok(layer) => {
+                    ctx.push([layer, 0]);
+                    ResultCode::SUCCESS
+                }
+                Err(result) => result,
+            },
             67 => push_bool(ctx, false),
             68 => {
                 applet.state.lock().auto_sleep_disabled = ctx.pop::<u8>() != 0;
