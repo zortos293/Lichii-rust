@@ -68,6 +68,7 @@ impl Service for ApplicationProxy {
             10 => context.handler(Interface("IProcessWindingController")),
             11 => context.handler(LibraryAppletCreator {
                 context: context.clone(),
+                applet,
             }),
             20 => context.handler(ApplicationFunctions {
                 context: context.clone(),

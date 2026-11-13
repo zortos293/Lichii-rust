@@ -187,6 +187,21 @@ fn storages_read_and_write_within_bounds() {
 }
 
 #[test]
+fn live_storage_is_charged_until_freed() {
+    let budget = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let full = storage::Charge::take(&budget, storage::LIVE_STORAGE_BUDGET).unwrap();
+    assert!(storage::Charge::take(&budget, 1).is_none());
+    drop(full);
+    let half = storage::LIVE_STORAGE_BUDGET / 2;
+    let first = storage::Charge::take(&budget, half).unwrap();
+    let _second = storage::Charge::take(&budget, half).unwrap();
+    assert!(storage::Charge::take(&budget, 1).is_none());
+    drop(first);
+    assert!(storage::Charge::take(&budget, half).is_some());
+    assert!(storage::Charge::take(&budget, usize::MAX).is_none());
+}
+
+#[test]
 fn fatal_sections_must_balance() {
     let (_context, client, proxy) = booted(SWITCH1_TITLE);
     let controller = interface(&client, proxy, 1);
