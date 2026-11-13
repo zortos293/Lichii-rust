@@ -973,18 +973,18 @@ impl PipelineCache {
         }
         let linking = self.linking.get_mut(&index)?;
         if let Linking::Parts(parts, layout) = linking {
-            let mut libraries = Vec::with_capacity(parts.len());
-            for part in parts.iter() {
+            let mut libraries = [vk::Pipeline::null(); 4];
+            for (raw, part) in libraries.iter_mut().zip(parts.iter()) {
                 match part.get() {
                     None => return None,
                     Some(None) => {
                         *linking = Linking::Failed;
                         return None;
                     }
-                    Some(Some(library)) => libraries.push(library.raw),
+                    Some(Some(library)) => *raw = library.raw,
                 }
             }
-            *linking = match self.ctx.link(&libraries, layout) {
+            *linking = match self.ctx.link(&libraries[..parts.len()], layout) {
                 Ok(pipeline) => {
                     self.ctx.shared.fast_linked.fetch_add(1, Ordering::Relaxed);
                     Linking::Linked(pipeline)
