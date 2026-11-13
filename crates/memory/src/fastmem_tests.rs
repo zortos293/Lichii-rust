@@ -41,6 +41,47 @@ fn fastmem_mirrors_guest_mappings() {
 }
 
 #[test]
+fn protections_lower_and_raise_again_within_and_across_views() {
+    let Some(space) = fastmem_space() else {
+        return;
+    };
+    let host_write = |va: u64, value: u8| {
+        let base = space.fastmem().unwrap().base();
+        // SAFETY: the test only writes pages it made writable.
+        unsafe { std::ptr::write_volatile(base.add(va as usize), value) }
+    };
+    space.map(
+        0x8000_0000,
+        0x40_0000,
+        0x1_0000,
+        MemoryPermission::READ_WRITE,
+    );
+    space.map(0x8001_0000, 0x50_0000, 0x1_0000, MemoryPermission::READ);
+
+    space.protect(0x8000_3000, 0x2000, MemoryPermission::NONE);
+    space.protect(0x8000_3000, 0x2000, MemoryPermission::READ_WRITE);
+    host_write(0x8000_3000, 1);
+
+    space.protect(0x8000_8000, 0x1_0000, MemoryPermission::NONE);
+    space.protect(0x8000_c000, 0x8000, MemoryPermission::READ);
+    space.protect(0x8000_0000, 0x2_0000, MemoryPermission::READ_WRITE);
+    host_write(0x8000_8000, 2);
+    host_write(0x8001_f000, 3);
+
+    assert_eq!(space.read::<u8>(0x8000_3000).unwrap(), 1);
+    assert_eq!(space.read::<u8>(0x8000_8000).unwrap(), 2);
+    assert_eq!(space.read::<u8>(0x8001_f000).unwrap(), 3);
+    assert_eq!(host_read::<u8>(&space, 0x8001_f000), 3);
+
+    space.unmap(0x8000_4000, 0x1_8000);
+    space.map(0x8000_4000, 0x60_0000, 0x1_8000, MemoryPermission::READ);
+    space.protect(0x8000_0000, 0x2_0000, MemoryPermission::READ_WRITE);
+    host_write(0x8000_4000, 4);
+    assert_eq!(space.read::<u8>(0x8000_4000).unwrap(), 4);
+    space.unmap(0x8000_0000, 0x2_0000);
+}
+
+#[test]
 fn physical_memory_is_committed_lazily() {
     let physical = PhysicalMemory::new(12 << 30).unwrap();
     physical.commit(0x1000_0000, 0x10_0000).unwrap();
