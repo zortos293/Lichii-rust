@@ -1846,6 +1846,86 @@ fn guest_stores_to_read_only_pages_fault_on_every_backend() {
     }
 }
 
+/// Runs `program` from `ctx` on a JIT without SSE4.1 and returns its halt, its final context and,
+/// with `profile`, its profile table.
+fn run_profiled(
+    program: &[u32],
+    mut ctx: ThreadContext,
+    profile: bool,
+) -> (HaltReason, ThreadContext, Option<String>) {
+    let physical = Arc::new(PhysicalMemory::new(1 << 20).unwrap());
+    let memory = Arc::new(AddressSpace::with_fastmem(physical, 39).unwrap());
+    memory.map(CODE, 0, CODE_SIZE, MemoryPermission::READ_EXECUTE);
+    memory.map(DATA, 0x10000, DATA_SIZE, MemoryPermission::READ_WRITE);
+    let bytes: Vec<u8> = program.iter().flat_map(|w| w.to_le_bytes()).collect();
+    memory.write_bytes(CODE, &bytes).unwrap();
+    let config = CpuConfig {
+        memory,
+        monitor: Arc::new(ExclusiveMonitor::new(1)),
+        clock: Arc::new(Clock::default()),
+        core_index: 0,
+        ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
+        dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+        accuracy: CpuAccuracy::Auto,
+    };
+    let mut jit = Jit::build(config, Passes::ALL, profile).unwrap();
+    jit.target.sse41 = false;
+    jit.clear_code_cache();
+    let halt = jit.run(&mut ctx);
+    let table = jit
+        .state
+        .profile_counts()
+        .map(|p| p.table(1, Duration::ZERO));
+    (halt, ctx, table)
+}
+
+/// A scalar product, fused product or quotient whose result is zero because a factor or the
+/// dividend is zero stays native; an underflow to zero still falls back, and an inexact op with
+/// FPSR.IXC clear is counted apart from it.
+#[test]
+fn zero_factor_products_stay_native() {
+    const PROGRAM: [u32; 9] = [
+        0x1e22_0820, // fmul s0, s1, s2
+        0x1f02_1023, // fmadd s3, s1, s2, s4
+        0x1e22_1825, // fdiv s5, s1, s2
+        0x1e21_884b, // fnmul s11, s2, s1
+        0x1e6d_098a, // fmul d10, d12, d13
+        0x1e27_08e6, // fmul s6, s7, s7
+        0xd51b_443f, // msr fpsr, xzr
+        0x1e29_0848, // fmul s8, s2, s9
+        BRK,
+    ];
+    let mut ctx = ThreadContext {
+        pc: CODE,
+        fpsr: 0x10,
+        ..Default::default()
+    };
+    ctx.v[1] = 0x8000_0000;
+    ctx.v[2] = 3.0f32.to_bits() as u128;
+    ctx.v[4] = 0x8000_0000;
+    ctx.v[7] = 2.0f32.powi(-100).to_bits() as u128;
+    ctx.v[9] = 0.1f32.to_bits() as u128;
+    ctx.v[12] = (-0.0f64).to_bits() as u128;
+    ctx.v[13] = 3.0f64.to_bits() as u128;
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+    ];
+    compare(machines, &PROGRAM, &ctx, &vec![0u8; DATA_SIZE as usize]);
+    let table = run_profiled(&PROGRAM, ctx, true).2.unwrap();
+    let fused_slow = u32::from(!std::arch::is_x86_feature_detected!("fma"));
+    for line in [
+        "native FP slow paths, FPSR.IXC clear: 1\n".to_string(),
+        format!(
+            "native FP slow paths, inputs or result: {}\n",
+            1 + fused_slow
+        ),
+        "FP 2-source 0x1e200800".to_string(),
+    ] {
+        assert!(table.contains(&line), "{line:?} in\n{table}");
+    }
+}
+
 #[test]
 fn profile_counts_without_changing_results() {
     const PROGRAM: [u32; 10] = [
@@ -1861,23 +1941,6 @@ fn profile_counts_without_changing_results() {
         BRK,
     ];
     let run = |profile: bool| {
-        let physical = Arc::new(PhysicalMemory::new(1 << 20).unwrap());
-        let memory = Arc::new(AddressSpace::with_fastmem(physical, 39).unwrap());
-        memory.map(CODE, 0, CODE_SIZE, MemoryPermission::READ_EXECUTE);
-        memory.map(DATA, 0x10000, DATA_SIZE, MemoryPermission::READ_WRITE);
-        let bytes: Vec<u8> = PROGRAM.iter().flat_map(|w| w.to_le_bytes()).collect();
-        memory.write_bytes(CODE, &bytes).unwrap();
-        let config = CpuConfig {
-            memory,
-            monitor: Arc::new(ExclusiveMonitor::new(1)),
-            clock: Arc::new(Clock::default()),
-            core_index: 0,
-            ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
-            dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
-            accuracy: CpuAccuracy::Auto,
-        };
-        let mut jit = Jit::build(config, Passes::ALL, profile).unwrap();
-        jit.target.sse41 = false;
         let mut ctx = ThreadContext {
             pc: CODE,
             fpcr: 1 << 24,
@@ -1888,13 +1951,7 @@ fn profile_counts_without_changing_results() {
         ctx.x[2] = DATA;
         ctx.x[4] = CODE + 0x20;
         ctx.x[9] = 4;
-        jit.clear_code_cache();
-        let halt = jit.run(&mut ctx);
-        let table = jit
-            .state
-            .profile_counts()
-            .map(|p| p.table(1, Duration::ZERO));
-        (halt, ctx, table)
+        run_profiled(&PROGRAM, ctx, profile)
     };
     let (halt, ctx, table) = run(true);
     let (plain_halt, plain_ctx, plain_table) = run(false);

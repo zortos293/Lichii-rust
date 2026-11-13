@@ -510,6 +510,44 @@ alu_class!(fp_step_vector, "0x001110xx1xxxxx111111xxxxxxxxxx", |w| {
 alu_class!(scvtf_vector, "0x0011100x100001110110xxxxxxxxxx", |w| {
     w & 0x4040_0000 != 0x0040_0000
 });
+
+/// Scalar FMUL, FNMUL, FDIV and the fused multiplies on four registers that MOVI and FNEG keep
+/// setting to +0 and -0, so products with a zero factor and zero dividends come up often.
+#[test]
+fn fp_zero_factors() {
+    const OPS: [u32; 7] = [
+        0x1e20_0800,
+        0x1e20_8800,
+        0x1e20_1800,
+        0x1f00_0000,
+        0x1f00_8000,
+        0x1f20_0000,
+        0x1f20_8000,
+    ];
+    differential(
+        "fp_zero_factors",
+        0x1234_5678 ^ line!() as u64,
+        |rng, out| {
+            for _ in 0..1 + rng.below(8) {
+                let reg = |rng: &mut Rng| rng.below(4) as u32;
+                let double = (rng.below(2) as u32) << 22;
+                let word = match rng.below(4) {
+                    0 => 0x2f00_e400 | reg(rng),
+                    1 => 0x1e21_4000 | double | reg(rng) << 5 | reg(rng),
+                    _ => {
+                        OPS[rng.below(OPS.len() as u64) as usize]
+                            | double
+                            | reg(rng) << 16
+                            | reg(rng) << 10
+                            | reg(rng) << 5
+                            | reg(rng)
+                    }
+                };
+                out.push(word);
+            }
+        },
+    );
+}
 alu_class!(ext, "0x101110000xxxxx0xxxx0xxxxxxxxxx", |w| w & 0x4000_4000
     != 0x4000);
 alu_class!(

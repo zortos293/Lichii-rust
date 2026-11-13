@@ -20,7 +20,7 @@ use super::ir::{Arith, Fp, Fused, SimdOp};
 /// FPCR.RMode and FPCR.FZ.
 pub(super) const HOST_FPCR: i32 = 3 << 22 | 1 << 24;
 /// FPSR.IXC.
-const IXC: i8 = 0x10;
+pub(super) const IXC: i8 = 0x10;
 /// An H value with exponent 31 (an infinity or a NaN, or under FPCR.AHP a normal number) falls
 /// back; every other H value means the same in both formats and converts exactly, so FPCR is not
 /// checked at all.
@@ -87,48 +87,77 @@ impl Emitter<'_> {
 
     /// Jumps to `slow` unless the FP result in `xmm15` is finite and, when `normal`, a normal
     /// number: a zero or subnormal result may have underflowed, and the Arm ARM detects tininess
-    /// before rounding, so a result of exactly the smallest normal falls back too. Leaves the
-    /// result's bits in `rax`.
-    fn check_result(&mut self, fp: Fp, normal: bool, slow: DynamicLabel) {
-        match (fp, normal) {
-            (Fp::S, false) => dynasm!(self.asm
+    /// before rounding, so a result of exactly the smallest normal falls back too. A zero result
+    /// stays native when one of `zero_factors` is zero, because a product or quotient with a zero
+    /// factor or dividend is exactly zero. Leaves the result's bits in `rax`.
+    fn check_result(&mut self, fp: Fp, normal: bool, zero_factors: &[u8], slow: DynamicLabel) {
+        match fp {
+            Fp::S => dynasm!(self.asm
                 ; .arch x64
                 ; movd eax, xmm15
                 ; mov ecx, eax
                 ; and ecx, 0x7fff_ffff
-                ; cmp ecx, 0x7f7f_ffff
-                ; ja =>slow
             ),
-            (Fp::S, true) => dynasm!(self.asm
+            Fp::D => dynasm!(self.asm
                 ; .arch x64
-                ; movd eax, xmm15
-                ; mov ecx, eax
-                ; and ecx, 0x7fff_ffff
+                ; movq rax, xmm15
+                ; mov rcx, rax
+                ; btr rcx, 63
+            ),
+        }
+        if !normal {
+            match fp {
+                Fp::S => dynasm!(self.asm ; .arch x64 ; cmp ecx, 0x7f7f_ffff ; ja =>slow),
+                Fp::D => dynasm!(self.asm
+                    ; .arch x64
+                    ; mov rdx, QWORD 0x7fef_ffff_ffff_ffff
+                    ; cmp rcx, rdx
+                    ; ja =>slow
+                ),
+            }
+            return;
+        }
+        let (zero, done) = (self.asm.new_dynamic_label(), self.asm.new_dynamic_label());
+        let below = if zero_factors.is_empty() { slow } else { zero };
+        match fp {
+            Fp::S => dynasm!(self.asm
+                ; .arch x64
                 ; sub ecx, 0x0080_0001
                 ; cmp ecx, 0x7f7f_ffff - 0x0080_0001
-                ; ja =>slow
+                ; jbe =>done
+                ; cmp ecx, -0x0080_0001
+                ; je =>below
+                ; jmp =>slow
             ),
-            (Fp::D, false) => dynasm!(self.asm
+            Fp::D => dynasm!(self.asm
                 ; .arch x64
-                ; movq rax, xmm15
-                ; mov rcx, rax
-                ; btr rcx, 63
-                ; mov rdx, QWORD 0x7fef_ffff_ffff_ffff
-                ; cmp rcx, rdx
-                ; ja =>slow
-            ),
-            (Fp::D, true) => dynasm!(self.asm
-                ; .arch x64
-                ; movq rax, xmm15
-                ; mov rcx, rax
-                ; btr rcx, 63
                 ; mov rdx, QWORD 0x0010_0000_0000_0001
                 ; sub rcx, rdx
                 ; mov rdx, QWORD 0x7fef_ffff_ffff_ffff - 0x0010_0000_0000_0001
                 ; cmp rcx, rdx
-                ; ja =>slow
+                ; jbe =>done
+                ; mov rdx, QWORD -0x0010_0000_0000_0001
+                ; cmp rcx, rdx
+                ; je =>below
+                ; jmp =>slow
             ),
         }
+        if let Some((&last, rest)) = zero_factors.split_last() {
+            dynasm!(self.asm ; .arch x64 ; =>zero ; xorps xmm15, xmm15);
+            for &f in rest {
+                match fp {
+                    Fp::S => dynasm!(self.asm ; .arch x64 ; ucomiss xmm15, Rx(f)),
+                    Fp::D => dynasm!(self.asm ; .arch x64 ; ucomisd xmm15, Rx(f)),
+                }
+                dynasm!(self.asm ; .arch x64 ; je =>done);
+            }
+            match fp {
+                Fp::S => dynasm!(self.asm ; .arch x64 ; ucomiss xmm15, Rx(last)),
+                Fp::D => dynasm!(self.asm ; .arch x64 ; ucomisd xmm15, Rx(last)),
+            }
+            dynasm!(self.asm ; .arch x64 ; jne =>slow);
+        }
+        dynasm!(self.asm ; .arch x64 ; =>done);
     }
 
     /// The NZCV of an ordered compare of `xmm a` with `xmm b` in `d`; unordered jumps to `slow`.
@@ -253,8 +282,13 @@ impl Emitter<'_> {
                     (Arith::Nmul, Fp::S) => dynasm!(self.asm ; .arch x64 ; mulss xmm15, Rx(b)),
                     (Arith::Nmul, Fp::D) => dynasm!(self.asm ; .arch x64 ; mulsd xmm15, Rx(b)),
                 }
+                let zero_factors: &[u8] = match op {
+                    Arith::Add | Arith::Sub => &[],
+                    Arith::Mul | Arith::Nmul => &[a, b],
+                    Arith::Div => &[a],
+                };
                 let sum = matches!(op, Arith::Add | Arith::Sub);
-                self.check_result(fp, !sum, slow);
+                self.check_result(fp, !sum, zero_factors, slow);
                 match (op, fp) {
                     (Arith::Nmul, Fp::S) => {
                         dynasm!(self.asm ; .arch x64 ; xor eax, 0x8000_0000u32 as i32)
@@ -304,7 +338,7 @@ impl Emitter<'_> {
                             dynasm!(self.asm ; .arch x64 ; vfmsub231sd xmm15, Rx(n), Rx(m))
                         }
                     }
-                    self.check_result(fp, true, slow);
+                    self.check_result(fp, true, &[n, m], slow);
                     self.rax_to_low(fp, d);
                 } else {
                     dynasm!(self.asm ; .arch x64 ; jmp =>slow);
@@ -319,7 +353,7 @@ impl Emitter<'_> {
                     Fp::S => dynasm!(self.asm ; .arch x64 ; sqrtss xmm15, Rx(a)),
                     Fp::D => dynasm!(self.asm ; .arch x64 ; sqrtsd xmm15, Rx(a)),
                 }
-                self.check_result(fp, false, slow);
+                self.check_result(fp, false, &[], slow);
                 self.rax_to_low(fp, d);
                 self.finish_checked(i, slow, word, d, Ty::U128);
             }
@@ -377,7 +411,7 @@ impl Emitter<'_> {
                         Fp::S
                     }
                 };
-                self.check_result(to, narrowing, slow);
+                self.check_result(to, narrowing, &[], slow);
                 self.rax_to_low(to, d);
                 self.finish_checked(i, slow, word, d, Ty::U128);
             }

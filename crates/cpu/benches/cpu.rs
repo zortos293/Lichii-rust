@@ -367,6 +367,29 @@ const WORKLOADS: &[Workload] = &[
         per_iteration: 10,
     },
     Workload {
+        name: "zero product loop",
+        code: &[
+            0x1e2703e0, // fmov s0, wzr
+            0x1e2f1002, // fmov s2, #1.5
+            0x1e2e1007, // fmov s7, #1.0
+            0x1e211008, // fmov s8, #3.0
+            0x1e2818e9, // fdiv s9, s7, s8
+            0x1e220801, // 1: fmul s1, s0, s2
+            0x1f020403, // fmadd s3, s0, s2, s1
+            0x1e290844, // fmul s4, s2, s9
+            0x1f000c85, // fmadd s5, s4, s0, s3
+            0x1e248806, // fnmul s6, s0, s4
+            0x1e22180a, // fdiv s10, s0, s2
+            0x1f09184b, // fmadd s11, s2, s9, s6
+            0xbd00002b, // str s11, [x1]
+            0xf10004a5, // subs x5, x5, #1
+            0x54fffee1, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 10,
+    },
+    Workload {
         name: "popcount loop",
         code: &[
             0x4c407020, // 1: ld1 {v0.16b}, [x1]
