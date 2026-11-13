@@ -26,7 +26,7 @@ impl std::fmt::Display for BootError {
             Self::NotFound(path) => write!(f, "{} does not exist", path.display()),
             Self::Unsupported(path) => write!(
                 f,
-                "{} is not an NSP, XCI, NCA, NRO, NSO or ExeFS directory",
+                "{} is not an NSP, XCI, NCA, NUP, NRO, NSO or ExeFS directory",
                 path.display()
             ),
             Self::System(err) => err.fmt(f),
@@ -248,6 +248,49 @@ mod tests {
             Some(&KeyError::Missing("header_key".into())),
             "{error}"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_nup_container_boots_its_exefs() {
+        use lichii_loader::nup::{META_TITLE_NAME, PackageKind};
+        use lichii_loader::testing::{
+            AcidLayout, Codec, NpdmSpec, NupPackage, build_npdm, build_nup, svc_mask, thread_info,
+        };
+
+        let program_id = 0x0100_0000_0001_0000;
+        let mut capabilities = vec![thread_info(63, 16, 0, 3)];
+        capabilities.extend((0..8).map(|index| svc_mask(index, 0xff_ffff)));
+        let npdm = build_npdm(&NpdmSpec {
+            program_id,
+            layout: AcidLayout::Switch1,
+            capabilities,
+            ..NpdmSpec::default()
+        });
+        let main = nso(&[0x14000000u32.to_le_bytes(), [0; 4]].concat());
+        let dir = temp_dir("nup");
+        let game = dir.join("Kart.nup");
+        std::fs::write(
+            &game,
+            build_nup(&[NupPackage::new(PackageKind::Base, program_id, 0)
+                .file("exefs/main.npdm", npdm, Codec::Zstd)
+                .file("exefs/main", main, Codec::Zstd)
+                .file("romfs/data.bin", vec![7; 0x300], Codec::Raw)
+                .meta(META_TITLE_NAME, "Synthetic Kart")]),
+        )
+        .unwrap();
+
+        let mut booted_as = None;
+        let session = Session::boot(&game, LoadOptions::default(), None, |id, generation| {
+            booted_as = Some((id, generation));
+            (settings(), Host::headless())
+        })
+        .unwrap();
+        assert_eq!(booted_as, Some((program_id, ConsoleGeneration::Switch1)));
+        assert_eq!(session.program_id, program_id);
+        assert_eq!(session.title, "Kart");
+        assert_eq!(session.exit_reason(), None);
+        drop(session);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
