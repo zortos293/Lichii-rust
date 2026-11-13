@@ -21,6 +21,8 @@ use crate::runtime::{AttributeType, CompareFunction};
 use crate::translate::{TranslateOptions, TranslatedProgram, translate};
 use crate::{Profile, RuntimeInfo, ShaderInfo, ShaderStage};
 
+mod image;
+
 const PT: u64 = 7 << 16;
 
 fn target_env(profile: &Profile) -> &'static str {
