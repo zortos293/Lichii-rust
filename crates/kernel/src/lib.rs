@@ -479,6 +479,7 @@ impl KernelInner {
                 }
             }
             pcs.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
+            let pcs_raw = pcs.clone();
             let process = first.thread.process();
             let pcs: Vec<String> = pcs
                 .iter()
@@ -494,6 +495,24 @@ impl KernelInner {
                 "live pc: {}",
                 pcs.join(", ")
             );
+            let regs: Vec<String> = first
+                .ctx
+                .x
+                .iter()
+                .enumerate()
+                .map(|(i, x)| format!("x{i}={x:#x}"))
+                .collect();
+            tracing::info!(target: "threads", core, "live regs: {}", regs.join(" "));
+            for (pc, _) in pcs_raw.iter().take(4) {
+                let start = pc.saturating_sub(0x20);
+                let words: Vec<String> = (0..24u64)
+                    .map(|i| match process.memory().read::<u32>(start + 4 * i) {
+                        Ok(w) => format!("{w:08x}"),
+                        Err(_) => "????????".into(),
+                    })
+                    .collect();
+                tracing::info!(target: "threads", core, "live code {}: {}", process.locate(start), words.join(" "));
+            }
         }
     }
 
