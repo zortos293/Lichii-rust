@@ -113,15 +113,12 @@ pub(crate) fn register(context: &Arc<ServiceContext>) -> HleResult<Arc<Nvdrv>> {
             NvdrvService::new(shared.clone(), name, None)
         })?;
     }
+    let _ = context.nvdrv.set(nvdrv.clone());
     Ok(nvdrv)
 }
 
 impl Nvdrv {
     /// A new `nx2:nvsrv` session for `process`, already initialized, for gsv to return.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "gsv TIPC 1402 returns it once gsv exists")
-    )]
     pub(crate) fn nvsrv_session(
         self: &Arc<Self>,
         context: &Arc<ServiceContext>,

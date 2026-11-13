@@ -2,7 +2,7 @@
 
 use lichii_common::settings::{Anisotropy, GraphicsSettings, ResolutionScale};
 use lichii_gpu::backend::{
-    ChannelId, ComputeContext, ConstBufferBinding, DrawParams, GraphicsConstBuffers,
+    ChannelId, ComputeContext, ConstBufferBinding, DrawParams, DrawTexture, GraphicsConstBuffers,
     GraphicsContext, IndirectDraw, QmdVersion, Rasterizer,
 };
 use lichii_gpu::engines::maxwell_3d::regs::{
@@ -14,7 +14,7 @@ use lichii_gpu::engines::maxwell_3d::{DirtyState, Regs};
 use lichii_gpu::gmmu::Gmmu;
 use lichii_shader::DescriptorKind;
 use lichii_shader::maxwell::opcode::Opcode;
-use lichii_texture::block_linear::{GobLayout, Tiling};
+use lichii_texture::block_linear::{GobLayout, Tiling, swizzle};
 
 use super::super::tests::{DADDR, Fixture, GPU_VA, fixture, gmmu, guest_linear};
 use super::{StageSources, Warning};
@@ -653,4 +653,233 @@ fn compute_programs_key_on_their_local_memory_size() {
     );
     f.rasterizer.wait_for_idle();
     f.assert_no_validation_errors();
+}
+
+/// texel (x, y) of the 8x8 draw-texture source: every texel distinct.
+fn source_texel(x: u32, y: u32) -> [u8; 4] {
+    [(x * 16) as u8, (y * 16) as u8, (x + y * 8) as u8, 255]
+}
+
+fn draw_texture(f: &mut Fixture, gmmu: &Gmmu, regs: &Regs, draw: DrawTexture) {
+    let mut dirty = DirtyState::new();
+    let const_buffers = const_buffers();
+    let root_tables = [[0; 64]; 8];
+    let mut ctx = GraphicsContext {
+        channel: ChannelId(0),
+        memory: gmmu,
+        regs,
+        dirty: &mut dirty,
+        const_buffers: &const_buffers,
+        root_tables: &root_tables,
+    };
+    f.rasterizer.draw_texture(&mut ctx, &draw);
+}
+
+#[test]
+fn draw_texture_maps_sub_rects_with_the_sampler_filter() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let tiling = Tiling::new(8, 8, 1, 4, 1, 0, GobLayout::Tegra);
+    let linear: Vec<u8> = (0..64).flat_map(|i| source_texel(i % 8, i / 8)).collect();
+    let mut tiled = vec![0; tiling.size_bytes()];
+    swizzle(&tiling, &linear, &mut tiled);
+    write(&f, TEXTURE, &tiled);
+    write(&f, TIC, bytemuck::cast_slice(&tic(GPU_VA + TEXTURE, 8, 8)));
+    let mut linear_tsc = [0u32; 8];
+    linear_tsc[1] = 2 | 2 << 4;
+    write(&f, TSC + 32, bytemuck::cast_slice(&linear_tsc));
+    let mut regs = sampling_regs();
+    regs.tex_sampler.limit = 1;
+    let rect = |dst: [f32; 4], src: [f32; 4], sampler: u32| DrawTexture {
+        dst_x0: dst[0],
+        dst_y0: dst[1],
+        dst_x1: dst[2],
+        dst_y1: dst[3],
+        src_x0: src[0],
+        src_y0: src[1],
+        src_x1: src[2],
+        src_y1: src[3],
+        texture: 0,
+        sampler,
+    };
+    // A: texels [2, 6) x [1, 5) at 1:1 into a destination given right to left.
+    draw_texture(
+        &mut f,
+        &gmmu,
+        &regs,
+        rect([10.0, 2.0, 6.0, 6.0], [2.0, 1.0, 6.0, 5.0], 0),
+    );
+    // B: the same texels with the source given bottom to top, which flips them.
+    draw_texture(
+        &mut f,
+        &gmmu,
+        &regs,
+        rect([10.0, 10.0, 14.0, 14.0], [2.0, 5.0, 6.0, 1.0], 0),
+    );
+    // C: texels [0, 4) x [0, 4) magnified twice, nearest.
+    draw_texture(
+        &mut f,
+        &gmmu,
+        &regs,
+        rect([0.0, 8.0, 8.0, 16.0], [0.0, 0.0, 4.0, 4.0], 0),
+    );
+    // D: texels [0, 2) of row 0 stretched over four pixels, linear.
+    draw_texture(
+        &mut f,
+        &gmmu,
+        &regs,
+        rect([12.0, 0.0, 16.0, 1.0], [0.0, 0.0, 2.0, 1.0], 1),
+    );
+
+    let texels = target(&mut f);
+    for (i, &texel) in texels.iter().enumerate() {
+        let (x, y) = (i as u32 % SIZE, i as u32 / SIZE);
+        let want = if (6..10).contains(&x) && (2..6).contains(&y) {
+            source_texel(x - 4, y - 1)
+        } else if (10..14).contains(&x) && (10..14).contains(&y) {
+            source_texel(x - 8, 14 - y)
+        } else if x < 8 && y >= 8 {
+            source_texel(x / 2, (y - 8) / 2)
+        } else if (12..16).contains(&x) && y == 0 {
+            if matches!(x, 13 | 14) {
+                let red = if x == 13 { 4 } else { 12 };
+                assert!(
+                    texel[0].abs_diff(red) <= 1 && texel[3] == 255,
+                    "linear texel ({x}, {y}): {texel:?}"
+                );
+            }
+            continue;
+        } else {
+            [0; 4]
+        };
+        assert_eq!(texel, want, "texel ({x}, {y})");
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn draw_texture_skips_rescaled_sources() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    f.rasterizer.apply_settings(&GraphicsSettings {
+        resolution_scale: ResolutionScale::X2,
+        async_shader_compilation: false,
+        ..GraphicsSettings::default()
+    });
+    let (width, height) = (64, 320);
+    let mut clear_regs = Regs::with_defaults();
+    let rt = &mut clear_regs.rt[0];
+    rt.address_high = ((GPU_VA + TEXTURE) >> 32) as u32;
+    rt.address_low = (GPU_VA + TEXTURE) as u32;
+    rt.width = width;
+    rt.height = height;
+    rt.format = 0xd5;
+    rt.tile_mode = TileMode(1 << 4);
+    rt.bits = RenderTargetConfigBits(1);
+    clear_regs.rt_control = RtControl(1);
+    clear_regs.clear_surface = ClearSurface(0b1111 << 2);
+    clear_regs.clear_color = [0.0, 1.0, 0.0, 1.0];
+    let mut dirty = DirtyState::new();
+    let const_buffers = const_buffers();
+    let root_tables = [[0; 64]; 8];
+    let mut ctx = GraphicsContext {
+        channel: ChannelId(0),
+        memory: &gmmu,
+        regs: &clear_regs,
+        dirty: &mut dirty,
+        const_buffers: &const_buffers,
+        root_tables: &root_tables,
+    };
+    f.rasterizer.clear(&mut ctx, 1);
+    write(
+        &f,
+        TIC,
+        bytemuck::cast_slice(&tic(GPU_VA + TEXTURE, width, height)),
+    );
+    let draw = DrawTexture {
+        dst_x0: 0.0,
+        dst_y0: 0.0,
+        dst_x1: 16.0,
+        dst_y1: 16.0,
+        src_x0: 0.0,
+        src_y0: 0.0,
+        src_x1: 16.0,
+        src_y1: 16.0,
+        texture: 0,
+        sampler: 0,
+    };
+    draw_texture(&mut f, &gmmu, &sampling_regs(), draw);
+    assert_ne!(
+        f.rasterizer.draw.warned & Warning::RescaledTexture as u32,
+        0
+    );
+    assert!(
+        target(&mut f).iter().all(|&t| t == [0; 4]),
+        "nothing was drawn"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn draw_texture_skips_integer_sources() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let mut header = tic(GPU_VA + TEXTURE, 8, 8);
+    header[0] = (header[0] & !(0xfff << 7)) | 4 << 7 | 4 << 10 | 4 << 13 | 4 << 16;
+    write(&f, TIC, bytemuck::cast_slice(&header));
+    draw_texture(&mut f, &gmmu, &sampling_regs(), full_rect(8.0));
+    assert_ne!(
+        f.rasterizer.draw.warned & Warning::DrawTextureSource as u32,
+        0
+    );
+    assert!(
+        target(&mut f).iter().all(|&t| t == [0; 4]),
+        "nothing was drawn"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn draw_texture_reads_layer_zero_of_array_sources() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let tiling = Tiling::new(8, 8, 1, 4, 1, 0, GobLayout::Tegra);
+    let linear: Vec<u8> = (0..64).flat_map(|i| source_texel(i % 8, i / 8)).collect();
+    let mut tiled = vec![0; tiling.size_bytes()];
+    swizzle(&tiling, &linear, &mut tiled);
+    write(&f, TEXTURE, &tiled);
+    let mut header = tic(GPU_VA + TEXTURE, 8, 8);
+    header[4] = (header[4] & !(0xf << 23)) | 5 << 23;
+    header[5] |= 1 << 16;
+    write(&f, TIC, bytemuck::cast_slice(&header));
+    draw_texture(&mut f, &gmmu, &sampling_regs(), full_rect(8.0));
+    for (i, &texel) in target(&mut f).iter().enumerate() {
+        let (x, y) = (i as u32 % SIZE, i as u32 / SIZE);
+        let want = if x < 8 && y < 8 {
+            source_texel(x, y)
+        } else {
+            [0; 4]
+        };
+        assert_eq!(texel, want, "texel ({x}, {y})");
+    }
+    f.assert_no_validation_errors();
+}
+
+fn full_rect(size: f32) -> DrawTexture {
+    DrawTexture {
+        dst_x0: 0.0,
+        dst_y0: 0.0,
+        dst_x1: size,
+        dst_y1: size,
+        src_x0: 0.0,
+        src_y0: 0.0,
+        src_x1: size,
+        src_y1: size,
+        texture: 0,
+        sampler: 0,
+    }
 }
