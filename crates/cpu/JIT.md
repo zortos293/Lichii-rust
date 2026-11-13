@@ -102,12 +102,12 @@ The plan is **dynasm-rs** (`dynasmrt::VecAssembler` for x64), emitting into a `V
 
 Every instruction in the SIMD/FP data-processing group runs inside the block. The ones `jit/simd` lowers become `Op::Simd`, and every other one becomes `Op::CallSimd`, which calls the interpreter's `simd::execute` on the live `ThreadContext`. Get/set elimination commits pending writes before a `CallSimd` and forgets every known location after it, because the instruction can touch any guest state.
 
-The lowered FP arithmetic (`FADD`, `FSUB`, `FMUL`, `FDIV`, the fused multiply-adds, `FSQRT`, `FCVT`, `SCVTF`/`UCVTF`, `FCVTZS`/`FCVTZU`, `FCMP`) is *checked*. The host computes the result only when the host and the Arm ARM must agree on both the value and the FPSR flags:
+The lowered FP arithmetic (`FADD`, `FSUB`, `FMUL`, `FNMUL`, `FDIV`, the fused multiply-adds, `FSQRT`, `FCVT`, `SCVTF`/`UCVTF`, `FCVTZS`/`FCVTZU`, `FCMP`) is *checked*. The host computes the result only when the host and the Arm ARM must agree on both the value and the FPSR flags:
 
 - FPCR selects round to nearest and FZ is clear. Every other rounding mode, and flush to zero, falls back.
 - FPSR.IXC is already set whenever the op can be inexact, so the op never needs to report IXC. Titles set IXC within their first few FP ops and rarely clear it. While it is clear, the op falls back, and the fallback sets IXC when the result is inexact.
 - The result is finite. Ops that can underflow also need a normal result above the smallest normal: the Arm ARM detects tininess before rounding and x86 after, and a zero or subnormal result may hide an underflow. Additions and subtractions of floats never round to a subnormal, so they accept any finite result.
-- The integer conversions also check for the host's out-of-range value and for unsigned range. `FCMP` falls back on an unordered compare.
+- The integer conversions also check for the host's out-of-range value and for unsigned range. `FCMP` falls back on an unordered compare. `FNMUL` is the checked `FMUL` with the sign of the rounded result flipped, which is exact under round to nearest. `FCCMP`/`FCCMPE` test the condition first and produce the immediate NZCV when it fails; otherwise they compare like `FCMP`. Their slow path materializes NZCV that an earlier block left lazy, because the interpreter reads the condition from the context.
 
 The fallback is an out-of-line slow path. It runs the original instruction through `CallSimd` and reloads the destination from the context. Because a checked op can fall back, it commits pending writes the same way an op that can exit does. The JIT never reads the MXCSR exception flags: under these conditions they would only repeat what FPSR already holds. Its control bits do matter, so `Jit::run` holds MXCSR at the default 0x1f80 (round to nearest, every exception masked, no FTZ or DAZ) while guest code runs, and restores the caller's value on exit. FZ titles need input and output denormal checks to stay native; that is future work.
 
@@ -127,6 +127,7 @@ Vector `FADD`, `FSUB`, `FMUL`, `FMLA` and `FMLS` on .2S, .4S and .2D, and `FMUL`
 | `vector struct loop` (LD2 .4S, ADD, ST2 .4S, LD4 .8H, EOR, ST3 .8B) | 19 MIPS | 18 MIPS | n/a (not a SIMD/FP data-processing op) | ~176 MIPS |
 | `vector ext loop` (LD1, EXT .16B and .8B, EOR, ST1) | 40 MIPS | n/a | 277 MIPS | ~1,380 MIPS |
 | `half convert loop` (LDR H, FCVT S and D from H, FABS, FNEG, FMOV) | 134 MIPS | n/a | 231 MIPS | ~1,650 MIPS |
+| `fp compare loop` (LDR S, FNMUL, FCMP, FCCMP, FCCMPE, FCSEL, STR S) | 110 MIPS | n/a | 177 MIPS | ~1,620 MIPS |
 
 ## CRC32
 

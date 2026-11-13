@@ -131,6 +131,27 @@ impl Emitter<'_> {
         }
     }
 
+    /// The NZCV of an ordered compare of `xmm a` with `xmm b` in `d`; unordered jumps to `slow`.
+    /// Clobbers `rax`, `rcx` and `rdx`.
+    fn compare_flags(&mut self, fp: Fp, a: u8, b: u8, d: u8, slow: DynamicLabel) {
+        match fp {
+            Fp::S => dynasm!(self.asm ; .arch x64 ; ucomiss Rx(a), Rx(b)),
+            Fp::D => dynasm!(self.asm ; .arch x64 ; ucomisd Rx(a), Rx(b)),
+        }
+        dynasm!(self.asm
+            ; .arch x64
+            ; jp =>slow
+            ; setb al
+            ; setz cl
+            ; movzx eax, al
+            ; movzx ecx, cl
+            ; lea edx, [rax * 8]
+            ; lea edx, [rdx + rcx * 4]
+            ; xor eax, 1
+            ; lea Rd(d), [rdx + rax * 2]
+        );
+    }
+
     pub(super) fn finish_checked(
         &mut self,
         i: usize,
@@ -229,9 +250,18 @@ impl Emitter<'_> {
                     (Arith::Mul, Fp::D) => dynasm!(self.asm ; .arch x64 ; mulsd xmm15, Rx(b)),
                     (Arith::Div, Fp::S) => dynasm!(self.asm ; .arch x64 ; divss xmm15, Rx(b)),
                     (Arith::Div, Fp::D) => dynasm!(self.asm ; .arch x64 ; divsd xmm15, Rx(b)),
+                    (Arith::Nmul, Fp::S) => dynasm!(self.asm ; .arch x64 ; mulss xmm15, Rx(b)),
+                    (Arith::Nmul, Fp::D) => dynasm!(self.asm ; .arch x64 ; mulsd xmm15, Rx(b)),
                 }
                 let sum = matches!(op, Arith::Add | Arith::Sub);
                 self.check_result(fp, !sum, slow);
+                match (op, fp) {
+                    (Arith::Nmul, Fp::S) => {
+                        dynasm!(self.asm ; .arch x64 ; xor eax, 0x8000_0000u32 as i32)
+                    }
+                    (Arith::Nmul, Fp::D) => dynasm!(self.asm ; .arch x64 ; btc rax, 63),
+                    _ => {}
+                }
                 self.rax_to_low(fp, d);
                 self.finish_checked(i, slow, word, d, Ty::U128);
             }
@@ -435,21 +465,29 @@ impl Emitter<'_> {
                 };
                 let d = self.def(v);
                 let slow = self.checked(false);
-                match fp {
-                    Fp::S => dynasm!(self.asm ; .arch x64 ; ucomiss Rx(a), Rx(b)),
-                    Fp::D => dynasm!(self.asm ; .arch x64 ; ucomisd Rx(a), Rx(b)),
-                }
+                self.compare_flags(fp, a, b, d, slow);
+                self.finish_checked(i, slow, word, d, Ty::Nzcv);
+            }
+            SimdOp::CondCompare {
+                fp,
+                c,
+                a,
+                b,
+                nzcv,
+                word,
+            } => {
+                let (c, a, b) = (self.reg(c), self.reg(a), self.reg(b));
+                let d = self.def(v);
+                let (skip, done) = (self.asm.new_dynamic_label(), self.asm.new_dynamic_label());
+                dynasm!(self.asm ; .arch x64 ; test Rd(c), Rd(c) ; jz =>skip);
+                let slow = self.checked(false);
+                self.compare_flags(fp, a, b, d, slow);
                 dynasm!(self.asm
                     ; .arch x64
-                    ; jp =>slow
-                    ; setb al
-                    ; setz cl
-                    ; movzx eax, al
-                    ; movzx ecx, cl
-                    ; lea edx, [rax * 8]
-                    ; lea edx, [rdx + rcx * 4]
-                    ; xor eax, 1
-                    ; lea Rd(d), [rdx + rax * 2]
+                    ; jmp =>done
+                    ; =>skip
+                    ; mov Rd(d), nzcv as i32
+                    ; =>done
                 );
                 self.finish_checked(i, slow, word, d, Ty::Nzcv);
             }
@@ -462,6 +500,9 @@ impl Emitter<'_> {
     pub(in super::super) fn simd_slow_paths(&mut self) {
         for slow in std::mem::take(&mut self.simd.slow) {
             dynasm!(self.asm ; .arch x64 ; =>slow.label);
+            if slow.ty == Ty::Nzcv {
+                self.materialize_nzcv();
+            }
             self.save(slow.saved);
             dynasm!(self.asm
                 ; .arch x64
