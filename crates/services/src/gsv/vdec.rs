@@ -55,8 +55,9 @@ const READY_INTERVAL: Duration = Duration::from_millis(4);
 const MAX_DRIFT: u64 = 1_000_000;
 /// Decoded pictures kept ahead of the images they go into.
 const DECODE_AHEAD: usize = 4;
-/// How long a write waits for the client's reads of an image it gave back (314) to pass.
-const RELEASE_WAIT: Duration = Duration::from_millis(100);
+/// How long the worker waits on a 314 release fence before it looks at its state again: Stop or
+/// Finalize may have taken the image back meanwhile.
+const RELEASE_SLICE: Duration = Duration::from_millis(10);
 
 /// gsv 902, 905, 906 and 1002. Without the decoder service its TIPC 1 creates,
 /// `InitializeVp9Decoder` fails with InvalidHandle and the movie player aborts.
@@ -103,6 +104,8 @@ struct Shared {
     ready: Arc<Event>,
     state: Mutex<State>,
     wake: Condvar,
+    /// Signalled when the worker finishes writing an image; Stop and Finalize wait for it.
+    idle: Condvar,
 }
 
 struct Input {
@@ -163,6 +166,10 @@ struct State {
     end_queued: bool,
     /// The end-of-stream frame is out and nothing was submitted since.
     stream_ended: bool,
+    /// The worker is writing an image with the state unlocked.
+    writing: bool,
+    /// Stops and Finalizes so far: a write that sees this change took an image they completed.
+    stops: u64,
     quit: bool,
 }
 
@@ -265,9 +272,12 @@ impl VideoDecoderService {
                 running: true,
                 end_queued: false,
                 stream_ended: false,
+                writing: false,
+                stops: 0,
                 quit: false,
             }),
             wake: Condvar::new(),
+            idle: Condvar::new(),
         });
         let worker = shared.clone();
         match std::thread::Builder::new()
@@ -405,6 +415,10 @@ impl VideoDecoderService {
         state.running = false;
         shared.ready.clear();
         state.free.clear();
+        state.stops += 1;
+        while state.writing {
+            shared.idle.wait(&mut state);
+        }
         let guest = shared.syncpoints.guest();
         let target = shared.syncpoints.max(shared.syncpoint).unwrap_or(0);
         while guest.is_reached(shared.syncpoint, target) == Ok(false) {
@@ -556,12 +570,6 @@ impl Shared {
         let Some(target) = self.objects.lock().decoder_image(handout.image) else {
             return (picture.width, picture.height);
         };
-        if let Some((syncpoint, value)) = handout.release {
-            let _ = self
-                .syncpoints
-                .guest()
-                .wait(syncpoint, value, Some(RELEASE_WAIT));
-        }
         let layout = target.layout;
         let (width, height) = (
             picture.width.min(layout.width),
@@ -676,21 +684,43 @@ impl Shared {
             if let (Some(decoded), Some(&Some(handout))) =
                 (state.decoded.front(), state.free.front())
             {
-                let due = if decoded.end && decoded.frame.is_none() {
+                let picture = decoded.frame.is_some();
+                let due = if decoded.end && !picture {
                     now
                 } else {
                     let pts = decoded.pts;
                     state.clock.due(now, pts)
                 };
+                if due <= now
+                    && picture
+                    && let Some((syncpoint, value)) = handout.release
+                    && self.syncpoints.guest().is_reached(syncpoint, value) == Ok(false)
+                {
+                    drop(state);
+                    let _ = self
+                        .syncpoints
+                        .guest()
+                        .wait(syncpoint, value, Some(RELEASE_SLICE));
+                    state = self.state.lock();
+                    continue;
+                }
                 if due <= now {
                     let decoded = state.decoded.pop_front().expect("checked above");
                     state.free.pop_front();
                     let size = (state.width, state.height);
                     let (width, height) = match &decoded.frame {
                         Some(frame) => {
+                            state.writing = true;
+                            let stops = state.stops;
                             drop(state);
                             let size = self.write(&mut media, handout, frame, size);
                             state = self.state.lock();
+                            state.writing = false;
+                            self.idle.notify_all();
+                            if state.stops != stops {
+                                state.frames.extend(decoded.frame);
+                                continue;
+                            }
                             size
                         }
                         None => size,
