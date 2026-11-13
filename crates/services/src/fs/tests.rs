@@ -7,10 +7,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use bytemuck::{Pod, Zeroable};
 use lichii_common::settings::Settings;
-use lichii_common::{ConsoleGeneration, ResultCode, VAddr};
+use lichii_common::{ResultCode, VAddr};
 use lichii_fs::romfs::{build_romfs, open_romfs};
 use lichii_fs::{DirectoryExt, FileExt, FileRef, MemDir, MemFile};
-use lichii_gpu::host1x::Host1x;
 use lichii_kernel::Kernel;
 use lichii_kernel::ipc::{Handle, UNKNOWN_COMMAND_ID};
 use lichii_kernel::testing::{self, IpcClient, Reply, Request};
@@ -18,8 +17,8 @@ use lichii_loader::program::{AddOnContent, ProgramImage};
 
 use super::result::*;
 use super::save::{RawSaveDataAttribute, SaveDataInfo};
+use crate::ServiceContext;
 use crate::testing::{SWITCH1_TITLE, SWITCH2_TITLE};
-use crate::{ServiceContext, ServiceParts};
 
 const SCRATCH_SIZE: usize = 2 << 20;
 
@@ -96,27 +95,10 @@ impl Guest {
         settings.paths.sdmc_dir = Some(root.join("sdmc"));
         settings.paths.keys_dir = Some(root.join("keys"));
 
-        let generation = ConsoleGeneration::from_program_id(program_id);
-        let kernel = testing::kernel(generation);
         let mut image = testing::program_image(program_id);
         configure(&mut image);
-        let program = Arc::new(image);
-        let process = kernel.create_process(&program).unwrap();
-        let bits = match generation {
-            ConsoleGeneration::Switch1 => 34,
-            ConsoleGeneration::Switch2 => 36,
-        };
-        let client = IpcClient::new(&kernel, &process);
-        let context = ServiceContext::new(ServiceParts {
-            kernel: kernel.clone(),
-            settings: Arc::new(settings),
-            program,
-            process,
-            host1x: Host1x::new(kernel.physical_memory().clone(), bits),
-            nx2_memory: None,
-            npad: Arc::default(),
-            perf: Arc::default(),
-        });
+        let (context, client) = crate::testing::context_with(image, settings);
+        let kernel = context.kernel.clone();
         super::register(&context).unwrap();
         let scratch = client.alloc(&vec![0; SCRATCH_SIZE]);
         Self {
