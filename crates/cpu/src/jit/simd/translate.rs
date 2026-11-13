@@ -117,6 +117,8 @@ pub(in super::super) fn lower(t: &mut Translator, word: u32) -> bool {
             1 => Arith::Div,
             2 => Arith::Add,
             3 => Arith::Sub,
+            4 | 6 => Arith::Max,
+            5 | 7 => Arith::Min,
             8 => Arith::Nmul,
             _ => return false,
         };

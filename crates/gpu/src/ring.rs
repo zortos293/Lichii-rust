@@ -143,6 +143,16 @@ pub(crate) fn ring(slots: usize, min_slots: usize) -> (Producer, Consumer) {
     )
 }
 
+impl crate::activity::BackView for Shared {
+    fn snapshot(&self) -> crate::activity::BackSnapshot {
+        crate::activity::BackSnapshot {
+            published: self.published.0.load(Ordering::Acquire),
+            consumed: self.consumed.0.load(Ordering::Acquire),
+            executing: self.executing.0.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// The writing end, owned by the front.
 pub(crate) struct Producer {
     shared: Arc<Shared>,
@@ -152,6 +162,11 @@ pub(crate) struct Producer {
 }
 
 impl Producer {
+    /// A view of the consumer's progress for another thread.
+    pub(crate) fn progress(&self) -> Arc<dyn crate::activity::BackView> {
+        self.shared.clone()
+    }
+
     /// The position after everything written so far.
     #[inline]
     pub(crate) fn position(&self) -> u64 {

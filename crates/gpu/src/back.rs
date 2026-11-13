@@ -4,7 +4,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
-use std::time::Instant;
 
 use lichii_common::DAddr;
 use lichii_memory::DeviceAddressSpace;
@@ -471,7 +470,7 @@ impl Back {
             SideCommand::FlushRegion(addr, size) => self.rasterizer.flush_region(addr, size),
             SideCommand::UnmapRegion(addr, size) => self.rasterizer.unmap_region(addr, size),
             SideCommand::Present(framebuffer) => {
-                let start = Instant::now();
+                let start = self.activity.begin_call(RendererCall::Present);
                 self.rasterizer.present(&framebuffer);
                 self.activity.renderer_call(RendererCall::Present, start);
                 self.timestamp.frame_presented();

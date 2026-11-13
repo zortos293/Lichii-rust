@@ -248,7 +248,9 @@ fn atomic(rng: &mut Rng) -> u32 {
     }
 }
 
-const FP: [&str; 23] = [
+const FP: [&str; 25] = [
+    "000111100x1xxxxx01xx10xxxxxxxxxx",
+    "0xx01110xx1xxxxx111001xxxxxxxxxx",
     "0x001110xx1xxxxx111111xxxxxxxxxx",
     "0xx011100x100001110110xxxxxxxxxx",
     "0x101110x01xxxxx110101xxxxxxxxxx",
@@ -820,7 +822,11 @@ fn simd_runs_mid_block_on_the_live_context() {
 /// FPSR.IXC both clear and already set.
 #[test]
 fn fp_edge_cases_match_the_interpreter() {
-    const OPS: [u32; 22] = [
+    const OPS: [u32; 26] = [
+        0x1e22_4820, // fmax s0, s1, s2
+        0x1e22_5820, // fmin s0, s1, s2
+        0x1e22_6820, // fmaxnm s0, s1, s2
+        0x1e22_7820, // fminnm s0, s1, s2
         0x1e22_2820, // fadd s0, s1, s2
         0x1e22_3820, // fsub s0, s1, s2
         0x1e22_0820, // fmul s0, s1, s2
@@ -991,7 +997,13 @@ fn conditional_compares_read_the_live_flags() {
 
 #[test]
 fn vector_fp_edge_cases_match_the_interpreter() {
-    const S_OPS: [u32; 22] = [
+    const S_OPS: [u32; 28] = [
+        0x4e22_e420, // fcmeq v0.4s, v1.4s, v2.4s
+        0x6e22_e420, // fcmge v0.4s, v1.4s, v2.4s
+        0x6ea2_e420, // fcmgt v0.4s, v1.4s, v2.4s
+        0x0e22_e420, // fcmeq v0.2s, v1.2s, v2.2s
+        0x2e22_e420, // fcmge v0.2s, v1.2s, v2.2s
+        0x2ea2_e420, // fcmgt v0.2s, v1.2s, v2.2s
         0x4e22_fc20, // frecps v0.4s, v1.4s, v2.4s
         0x4ea2_fc20, // frsqrts v0.4s, v1.4s, v2.4s
         0x0e22_fc20, // frecps v0.2s, v1.2s, v2.2s
@@ -1015,7 +1027,10 @@ fn vector_fp_edge_cases_match_the_interpreter() {
         0x5fa2_1020, // fmla s0, s1, v2.s[1]
         0x5f82_5820, // fmls s0, s1, v2.s[2]
     ];
-    const D_OPS: [u32; 12] = [
+    const D_OPS: [u32; 15] = [
+        0x4e62_e420, // fcmeq v0.2d, v1.2d, v2.2d
+        0x6e62_e420, // fcmge v0.2d, v1.2d, v2.2d
+        0x6ee2_e420, // fcmgt v0.2d, v1.2d, v2.2d
         0x4e62_fc20, // frecps v0.2d, v1.2d, v2.2d
         0x4ee2_fc20, // frsqrts v0.2d, v1.2d, v2.2d
         0x6e62_d420, // faddp v0.2d, v1.2d, v2.2d
