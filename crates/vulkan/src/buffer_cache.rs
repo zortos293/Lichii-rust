@@ -1354,7 +1354,7 @@ impl BufferCache {
             _ => return Ok(Some(IndexBinding::EMPTY)),
         };
         let start = index_buffer.start_addr();
-        let available = index_capacity(index_buffer, width);
+        let available = index_capacity(index_buffer, width).unwrap_or(u64::from(u32::MAX));
         let first = u64::from(draw.first).min(available);
         let count = u64::from(draw.count).min(available - first) as u32;
         if start == 0 || count == 0 {
@@ -1534,14 +1534,32 @@ impl BufferCache {
     }
 }
 
-/// Indices of `width` bytes the guest index buffer holds: up to its inclusive limit, or
-/// `u32::MAX` when the limit lies below the start, where the reference (which takes the span
-/// as a wrapping `u32`) does not clamp the draw either.
-pub(crate) fn index_capacity(buffer: &IndexBuffer, width: u64) -> u64 {
-    match buffer.limit_addr().checked_sub(buffer.start_addr()) {
-        Some(span) => (span + 1) / width,
-        None => u64::from(u32::MAX),
-    }
+/// Bytes from its start that an index buffer without a programmed limit binds for draws whose
+/// counts only the GPU knows (indirect and assembled draws).
+const UNSET_LIMIT_SPAN: u64 = 16 << 20;
+
+/// Indices of `width` bytes up to the guest index buffer's inclusive limit. `None` when the
+/// limit lies below the start: Switch 2 never programs it, and the reference (which takes the
+/// span as a wrapping `u32`) does not clamp those draws.
+pub(crate) fn index_capacity(buffer: &IndexBuffer, width: u64) -> Option<u64> {
+    let span = buffer.limit_addr().checked_sub(buffer.start_addr())?;
+    Some((span + 1) / width)
+}
+
+/// [`index_capacity`] for draws whose counts live in GPU memory: without a programmed limit,
+/// the indices mapped contiguously from the start, at most [`UNSET_LIMIT_SPAN`] bytes.
+pub(crate) fn bound_index_capacity(gmmu: &Gmmu, buffer: &IndexBuffer, width: u64) -> u64 {
+    index_capacity(buffer, width).unwrap_or_else(|| {
+        let mut mapped = 0;
+        let mut contiguous = true;
+        gmmu.for_each_range(buffer.start_addr(), UNSET_LIMIT_SPAN, |range| {
+            contiguous &= matches!(range.target, RangeTarget::Device(_));
+            if contiguous {
+                mapped += range.size;
+            }
+        });
+        mapped / width
+    })
 }
 
 #[cfg(test)]
@@ -2380,6 +2398,23 @@ mod tests {
             assert_eq!(f.read_indices(binding), [5, 6, 7], "{case}");
         }
         f.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn unset_index_limits_bind_the_mapped_run_for_gpu_counted_draws() {
+        let Some(f) = fixture() else { return };
+        f.gmmu.map(GPU_VA, DADDR, 0x10000, 0, false).unwrap();
+        let mut regs = bytemuck::zeroed_box::<Regs>();
+        regs.index_buffer.start_addr_low = (GPU_VA + 0x3000) as u32;
+        assert_eq!(index_capacity(&regs.index_buffer, 2), None);
+        assert_eq!(
+            bound_index_capacity(&f.gmmu, &regs.index_buffer, 2),
+            (0x10000 - 0x3000) / 2,
+            "the mapped run, not u32::MAX indices"
+        );
+        regs.index_buffer.limit_addr_low = (GPU_VA + 0x3000 + 11) as u32;
+        assert_eq!(index_capacity(&regs.index_buffer, 2), Some(6));
+        assert_eq!(bound_index_capacity(&f.gmmu, &regs.index_buffer, 2), 6);
     }
 
     #[test]
