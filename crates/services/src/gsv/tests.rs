@@ -515,3 +515,177 @@ fn gpu_only_regions_keep_what_the_gpu_writes() {
     context.gpu.synchronize();
     assert!(gmmu.translate(region).is_none());
 }
+
+fn sparse_request(va: u64, size: u64, handle: u32, offset: u64, kind: u8) -> Vec<u8> {
+    let mut request = Vec::new();
+    request.extend(va.to_le_bytes());
+    request.extend(size.to_le_bytes());
+    request.extend([0, 0, 0, kind, 0, 0, 0, 0]);
+    request.extend(handle.to_le_bytes());
+    request.extend(0u32.to_le_bytes());
+    request.extend(offset.to_le_bytes());
+    request
+}
+
+fn range_words(command: u32, first: u64, last: u64, rest: &[u32]) -> Request {
+    let mut values = vec![0];
+    values.extend(split(first));
+    values.extend(split(last));
+    values.extend(rest);
+    words(Request::tipc(command), &values)
+}
+
+#[test]
+fn memory_requests_apply_in_the_order_they_came() {
+    let (context, client, gsv) = gsv();
+    let gpu = session(&client, gsv, 497);
+    let gmmu = context
+        .gpu
+        .create_address_space(lichii_gpu::gmmu::BigPageSize::Size64K);
+    let process = client.process().clone();
+    let heap = process.page_table().set_heap_size(2 << 20).unwrap();
+    process.memory().write(heap, 0x1111_1111u32).unwrap();
+    process
+        .memory()
+        .write(heap + 0x1000, 0x2222_2222u32)
+        .unwrap();
+    let create = words(
+        Request::tipc(101),
+        &[split(heap), split(heap + 0xffff), [0, 0]].concat(),
+    );
+    let handle = client.send(gpu, &create).unwrap().pop::<u32>();
+
+    let va = 0x2_0000_0000u64;
+    let map = |offset: u64| {
+        let mut values = vec![7];
+        values.extend(split(va));
+        values.extend(split(va + 0xfff));
+        values.push(handle);
+        values.extend(split(offset));
+        values.resize(15, 0);
+        values.push(1);
+        client
+            .send(gpu, &words(Request::tipc(211), &values))
+            .unwrap();
+    };
+    map(0x1000);
+    client
+        .send(gpu, &range_words(213, va, va + 0xfff, &[0, 2]))
+        .unwrap();
+    map(0);
+    context.gpu.synchronize();
+    assert_eq!(
+        gmmu.read::<u32>(va).unwrap(),
+        0x1111_1111,
+        "an unmap does not undo the map that came after it"
+    );
+
+    let region = 0x3_0000_0000u64;
+    let last = region + 0x10_0000 - 1;
+    let sparse = range_words(214, region, last, &[0x200, 0, 0, 0, 3]);
+    client.send(gpu, &sparse).unwrap();
+    client
+        .send(gpu, &range_words(215, region, last, &[0, 4]))
+        .unwrap();
+    client.send(gpu, &sparse).unwrap();
+    context.gpu.synchronize();
+    assert_eq!(
+        gmmu.read::<u32>(region).unwrap(),
+        0,
+        "a region made again after its destroy stays"
+    );
+}
+
+#[test]
+fn a_failed_sparse_map_leaves_the_kind_alone() {
+    let (context, client, gsv) = gsv();
+    let gpu = session(&client, gsv, 497);
+    let gmmu = context
+        .gpu
+        .create_address_space(lichii_gpu::gmmu::BigPageSize::Size64K);
+    let region = 0x3_0000_0000u64;
+    client
+        .send(
+            gpu,
+            &range_words(214, region, region + 0x10_0000 - 1, &[0x200, 0, 0, 0, 3]),
+        )
+        .unwrap();
+    let before = gmmu.kind(region + 0x1_0000);
+    let request = sparse_request(region + 0x1_0000, 0x1000, 99, 0, 0xdb);
+    let input = client.alloc(&request);
+    let mut payload = vec![0; 6];
+    payload.push(4);
+    client
+        .send(
+            gpu,
+            &words(Request::tipc(216), &payload).buffer_a(input, 40),
+        )
+        .unwrap();
+    assert_eq!(gmmu.kind(region + 0x1_0000), before);
+}
+
+#[test]
+fn gpu_only_regions_that_cannot_be_mapped_are_not_backed() {
+    let (context, client, gsv) = gsv();
+    let gpu = session(&client, gsv, 497);
+    let gmmu = context
+        .gpu
+        .create_address_space(lichii_gpu::gmmu::BigPageSize::Size64K);
+    let unaligned = 0x81_0000_0800u64;
+    client
+        .send(
+            gpu,
+            &range_words(214, unaligned, unaligned + 0x20_0000 - 1, &[0, 0, 0, 0, 3]),
+        )
+        .unwrap();
+    assert!(gmmu.read::<u32>(unaligned).is_err());
+
+    let outside = lichii_gpu::gmmu::GPU_VA_SIZE;
+    client
+        .send(
+            gpu,
+            &range_words(214, outside, outside + 0x1_0000 - 1, &[0, 0, 0, 0, 3]),
+        )
+        .unwrap();
+    let process = client.process().clone();
+    let heap = process.page_table().set_heap_size(2 << 20).unwrap();
+    let create = words(
+        Request::tipc(101),
+        &[split(heap), split(heap + 0xffff), [0, 0]].concat(),
+    );
+    let handle = client.send(gpu, &create).unwrap().pop::<u32>();
+    assert_eq!(handle, 2, "the failed region's backing took handle 1");
+    let memory = context.gpu.nx2_memory().unwrap();
+    let first = lichii_gpu::nx2_memory::GpuMemoryHandle::new(1).unwrap();
+    assert!(
+        memory.memory_info(first).is_none(),
+        "the failed region's backing is destroyed"
+    );
+}
+
+#[test]
+fn restoring_a_gpu_only_region_keeps_its_own_device_ranges() {
+    use lichii_gpu::gmmu::MappedRange;
+    use lichii_gpu::nx2_memory::{AddressSpaceId, Unmapped};
+    let range = |gpu_va, daddr, size| Unmapped {
+        space: AddressSpaceId(0),
+        range: MappedRange {
+            gpu_va,
+            daddr,
+            size,
+        },
+    };
+    let mut unmapped = vec![
+        range(0x1000_0000, 0x5000, 0x4000),
+        range(0x1000_0000, 0x9_0000, 0x4000),
+    ];
+    super::gpu::keep_changed(&mut unmapped, 0x1000_1000, 0x1000_2000, 0x6000);
+    assert_eq!(
+        unmapped,
+        [
+            range(0x1000_0000, 0x5000, 0x1000),
+            range(0x1000_2000, 0x7000, 0x2000),
+            range(0x1000_0000, 0x9_0000, 0x4000),
+        ]
+    );
+}
