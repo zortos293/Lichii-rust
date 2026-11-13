@@ -117,6 +117,7 @@ pub(in super::super) fn lower(t: &mut Translator, word: u32) -> bool {
             1 => Arith::Div,
             2 => Arith::Add,
             3 => Arith::Sub,
+            8 => Arith::Nmul,
             _ => return false,
         };
         let (a, b) = (vec(t, rn), vec(t, rm));
@@ -148,6 +149,21 @@ pub(in super::super) fn lower(t: &mut Translator, word: u32) -> bool {
         let a = vec(t, rn);
         let b = (word & 0x8 == 0).then(|| vec(t, rm));
         let r = t.op(Op::Simd(SimdOp::Compare { fp, a, b, word }));
+        t.set(Loc::Nzcv, r);
+        return true;
+    }
+    if word & 0xff20_0c00 == 0x1e20_0400 {
+        let c = t.cond(field(word, 12, 4));
+        let (a, b) = (vec(t, rn), vec(t, rm));
+        let nzcv = field(word, 0, 4);
+        let r = t.op(Op::Simd(SimdOp::CondCompare {
+            fp,
+            c,
+            a,
+            b,
+            nzcv,
+            word,
+        }));
         t.set(Loc::Nzcv, r);
         return true;
     }

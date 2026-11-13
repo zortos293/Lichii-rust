@@ -302,6 +302,27 @@ const WORKLOADS: &[Workload] = &[
         per_iteration: 10,
     },
     Workload {
+        name: "fp compare loop",
+        code: &[
+            0x1c000180, // 1: ldr s0, 2f
+            0x1c000181, // ldr s1, 3f
+            0x1e218802, // fnmul s2, s0, s1
+            0x1e212040, // fcmp s2, s1
+            0x1e214404, // fccmp s0, s1, #4, mi
+            0x1e208843, // fnmul s3, s2, s0
+            0x1e200472, // fccmpe s3, s0, #2, eq
+            0x1e23cc06, // fcsel s6, s0, s3, gt
+            0xbd000026, // str s6, [x1]
+            0xf10004a5, // subs x5, x5, #1
+            0x54fffec1, // b.ne 1b
+            0xd4000001, // svc #0
+            0x3f8ccccd, // 2: 1.1
+            0x3e99999a, // 3: 0.3
+        ],
+        far: &[],
+        per_iteration: 11,
+    },
+    Workload {
         name: "popcount loop",
         code: &[
             0x4c407020, // 1: ld1 {v0.16b}, [x1]
