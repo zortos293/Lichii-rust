@@ -537,6 +537,31 @@ fn clear_rt_at(
 }
 
 #[test]
+fn targets_and_textures_over_the_same_gobs_copy_on_the_gpu() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let target = rt_info(128, 67, 3, GobLayout::Tegra);
+    clear_rt(&mut f, &target, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    let (id, _) = f.texture(&tic(0x08, GPU_VA, 120, 67, 1, 1, 3));
+    assert!(
+        f.read_image(id)[0]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|&t| t == [255, 0, 0, 255]),
+        "the 120-wide texture holds the 128-wide target's texels"
+    );
+    clear_rt(&mut f, &target, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    assert_eq!(
+        f.cache.traffic().downloads,
+        0,
+        "neither lookup reads the other image back"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
 fn cpu_writes_into_gpu_modified_images_keep_the_other_gpu_texels() {
     let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
         return;

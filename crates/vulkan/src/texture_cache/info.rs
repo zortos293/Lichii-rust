@@ -9,7 +9,7 @@ use lichii_gpu::engines::maxwell_3d::regs::{
     ZetaSizeDimensionControl,
 };
 use lichii_texture::PixelFormat;
-use lichii_texture::block_linear::{GobLayout, SurfaceLayout};
+use lichii_texture::block_linear::{GobLayout, SurfaceLayout, Tiling};
 use lichii_texture::guest::{DepthFormat, RenderTargetFormat};
 use lichii_texture::tic::{MsaaMode, SwizzleSource, TextureDescriptor, TextureMemory, TextureType};
 
@@ -380,8 +380,9 @@ impl ImageInfo {
 
     /// Where `other`, starting `offset` bytes into this image, lies as a subresource: the
     /// level and layer of its first subresource, when its levels and layers are a run of this
-    /// image's with the same block shape.
-    pub fn find_subresource(&self, other: &Self, offset: u64) -> Option<(u32, u32)> {
+    /// image's with the same block shape. `exact` also wants the same texel extents; without it
+    /// levels that fill the same GOBs match, as a 120- and a 128-texel-wide target do.
+    pub fn find_subresource(&self, other: &Self, offset: u64, exact: bool) -> Option<(u32, u32)> {
         let (GuestLayout::BlockLinear { .. }, GuestLayout::BlockLinear { .. }) =
             (self.layout, other.layout)
         else {
@@ -407,8 +408,24 @@ impl ImageInfo {
             && (other.layers == 1 || other.layer_stride == self.layer_stride);
         let other_surface = other.surface();
         let same_levels = (0..other.levels).all(|l| {
-            self.level_extent(level + l) == other.level_extent(l)
-                && surface.level_tiling(level + l) == other_surface.level_tiling(l)
+            let (own, theirs) = (
+                surface.level_tiling(level + l),
+                other_surface.level_tiling(l),
+            );
+            if exact {
+                return self.level_extent(level + l) == other.level_extent(l) && own == theirs;
+            }
+            let footprint = |t: Tiling| {
+                (
+                    t.size_bytes(),
+                    Tiling {
+                        width: 0,
+                        height: 0,
+                        ..t
+                    },
+                )
+            };
+            footprint(own) == footprint(theirs)
         });
         (fits && same_levels).then_some((level, layer))
     }

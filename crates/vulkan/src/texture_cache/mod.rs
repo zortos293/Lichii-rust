@@ -1503,7 +1503,7 @@ impl TextureCache {
             let candidate = if image.segments == self.segments && image.info.same_layout(info) {
                 Some((0, 0))
             } else if contiguous && image.contiguous() && base >= image.base() {
-                image.info.find_subresource(info, base - image.base())
+                image.info.find_subresource(info, base - image.base(), true)
             } else {
                 None
             };
@@ -1519,7 +1519,7 @@ impl TextureCache {
         for &id in &overlaps {
             let image = self.get(id).expect("a live image id");
             let subresource = (contiguous && image.contiguous() && image.base() >= base)
-                .then(|| info.find_subresource(&image.info, image.base() - base))
+                .then(|| info.find_subresource(&image.info, image.base() - base, false))
                 .flatten();
             match subresource {
                 Some((level, layer))
@@ -1578,7 +1578,15 @@ impl TextureCache {
             };
             let mut regions = Vec::with_capacity(src_levels as usize);
             for l in 0..src_levels {
-                let extent = self.image(join).host_extent(l);
+                let (src, dst) = (
+                    self.image(join).host_extent(l),
+                    self.image(id).host_extent(level + l),
+                );
+                let extent = vk::Extent3D {
+                    width: src.width.min(dst.width),
+                    height: src.height.min(dst.height),
+                    depth: src.depth.min(dst.depth),
+                };
                 let layers = |base| vk::ImageSubresourceLayers {
                     aspect_mask: src_aspect,
                     mip_level: 0,
