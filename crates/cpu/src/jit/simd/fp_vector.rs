@@ -28,6 +28,12 @@ pub enum LaneOp {
     Mla,
     /// Fused `acc - n * m`.
     Mls,
+    /// `FRECPS`: fused `2 - n * m`.
+    RecipStep,
+    /// `FRSQRTS`: fused `(3 - n * m) / 2`.
+    RsqrtStep,
+    /// `SCVTF` (vector) on 32-bit lanes of `n`.
+    FromInt,
 }
 
 /// A lane-wise op on `n` and `m`, or on `n` and lane `index` of `m` for the by-element forms. It
@@ -54,6 +60,37 @@ impl Lanes {
         }
     }
 }
+
+/// 2.0, 3.0 and 0.5 in every lane, as S then as D: the `FRECPS` and `FRSQRTS` constants.
+#[repr(align(16))]
+struct Steps([u32; 24]);
+
+static STEPS: Steps = Steps([
+    0x4000_0000,
+    0x4000_0000,
+    0x4000_0000,
+    0x4000_0000,
+    0x4040_0000,
+    0x4040_0000,
+    0x4040_0000,
+    0x4040_0000,
+    0x3f00_0000,
+    0x3f00_0000,
+    0x3f00_0000,
+    0x3f00_0000,
+    0,
+    0x4000_0000,
+    0,
+    0x4000_0000,
+    0,
+    0x4008_0000,
+    0,
+    0x4008_0000,
+    0,
+    0x3fe0_0000,
+    0,
+    0x3fe0_0000,
+]);
 
 /// The absolute-value mask, infinity and the smallest normal in every lane, for S then D.
 #[repr(align(16))]
@@ -106,6 +143,8 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         0x2e20_dc00 => Some(LaneOp::Mul),
         0x0e20_cc00 => Some(LaneOp::Mla),
         0x0ea0_cc00 => Some(LaneOp::Mls),
+        0x0e20_fc00 => Some(LaneOp::RecipStep),
+        0x0ea0_fc00 => Some(LaneOp::RsqrtStep),
         _ => None,
     };
     let by_element = |masked: u32| match masked {
@@ -114,7 +153,10 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         0x0f80_9000 => Some(LaneOp::Mul),
         _ => None,
     };
-    let (op, element, lanes) = if let Some(op) = three_same {
+    let from_int = word & 0xbfff_fc00 == 0x0e21_d800;
+    let (op, element, lanes) = if from_int {
+        (LaneOp::FromInt, false, vector_lanes)
+    } else if let Some(op) = three_same {
         (op, false, vector_lanes)
     } else if let Some(op) = by_element(word & 0xbf80_f400) {
         (op, true, vector_lanes)
@@ -139,7 +181,7 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
     let (rd, rn, rm) = (field(word, 0, 5), field(word, 5, 5), field(word, 16, 5));
     let vec = |t: &mut Translator, r: u8| t.op(Op::Get(Loc::V(r)));
     let n = vec(t, rn);
-    let m = vec(t, rm);
+    let m = if from_int { n } else { vec(t, rm) };
     let acc = matches!(op, LaneOp::Mla | LaneOp::Mls).then(|| vec(t, rd));
     let r = t.op(Op::Simd(SimdOp::Lanes(Lanes {
         op,
@@ -171,7 +213,10 @@ impl Emitter<'_> {
         let acc = acc.map(|a| self.reg(a));
         let d = self.def(Value(i as u32));
         let slow = self.checked(true);
-        let fused = matches!(op, LaneOp::Mla | LaneOp::Mls);
+        let fused = matches!(
+            op,
+            LaneOp::Mla | LaneOp::Mls | LaneOp::RecipStep | LaneOp::RsqrtStep
+        );
         if fused && !self.target.fma {
             dynasm!(self.asm ; .arch x64 ; jmp =>slow);
             self.finish_checked(i, slow, word, d, Ty::U128);
@@ -190,8 +235,34 @@ impl Emitter<'_> {
                 SCRATCH
             }
         };
-        dynasm!(self.asm ; .arch x64 ; movaps Rx(d), Rx(acc.unwrap_or(n)));
+        match op {
+            LaneOp::FromInt => {}
+            LaneOp::RecipStep | LaneOp::RsqrtStep => {
+                let constants = STEPS.0.as_ptr() as i64 + if fp == Fp::D { 48 } else { 0 };
+                let offset = if op == LaneOp::RsqrtStep { 16 } else { 0 };
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; mov rax, QWORD constants
+                    ; movaps Rx(d), [rax + offset]
+                );
+            }
+            _ => dynasm!(self.asm ; .arch x64 ; movaps Rx(d), Rx(acc.unwrap_or(n))),
+        }
         match (op, fp) {
+            (LaneOp::FromInt, _) => dynasm!(self.asm ; .arch x64 ; cvtdq2ps Rx(d), Rx(n)),
+            (LaneOp::RecipStep, Fp::S) => {
+                dynasm!(self.asm ; .arch x64 ; vfnmadd231ps Rx(d), Rx(n), Rx(m))
+            }
+            (LaneOp::RsqrtStep, Fp::S) => dynasm!(self.asm
+                ; .arch x64
+                ; vfnmadd231ps Rx(d), Rx(n), Rx(m)
+                ; mulps Rx(d), [rax + 32]
+            ),
+            (LaneOp::RecipStep, Fp::D) => self.fma231pd(0xbc, d, n, m),
+            (LaneOp::RsqrtStep, Fp::D) => {
+                self.fma231pd(0xbc, d, n, m);
+                dynasm!(self.asm ; .arch x64 ; mulpd Rx(d), [rax + 32]);
+            }
             (LaneOp::AddPairwise, Fp::S) if lanes == 4 => dynasm!(self.asm
                 ; .arch x64
                 ; shufps Rx(d), Rx(m), 0x88u8 as i8
@@ -225,7 +296,9 @@ impl Emitter<'_> {
             }
             (LaneOp::Mls, Fp::D) => self.fma231pd(0xbc, d, n, b),
         }
-        self.check_lanes(op, fp, lanes, d, n, m, index, slow);
+        if op != LaneOp::FromInt {
+            self.check_lanes(op, fp, lanes, d, n, m, index, slow);
+        }
         match (fp, lanes) {
             (Fp::S, 4) | (Fp::D, 2) => {}
             (Fp::S, 1) => dynasm!(self.asm ; .arch x64 ; movd eax, Rx(d) ; movd Rx(d), eax),

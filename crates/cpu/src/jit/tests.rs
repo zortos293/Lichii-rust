@@ -248,7 +248,9 @@ fn atomic(rng: &mut Rng) -> u32 {
     }
 }
 
-const FP: [&str; 21] = [
+const FP: [&str; 23] = [
+    "0x001110xx1xxxxx111111xxxxxxxxxx",
+    "0xx011100x100001110110xxxxxxxxxx",
     "0x101110x01xxxxx110101xxxxxxxxxx",
     "000111100x1xxxxxxxxx01xxxxxxxxxx",
     "0001111011100010x10000xxxxxxxxxx",
@@ -988,7 +990,13 @@ fn conditional_compares_read_the_live_flags() {
 
 #[test]
 fn vector_fp_edge_cases_match_the_interpreter() {
-    const S_OPS: [u32; 16] = [
+    const S_OPS: [u32; 22] = [
+        0x4e22_fc20, // frecps v0.4s, v1.4s, v2.4s
+        0x4ea2_fc20, // frsqrts v0.4s, v1.4s, v2.4s
+        0x0e22_fc20, // frecps v0.2s, v1.2s, v2.2s
+        0x0ea2_fc20, // frsqrts v0.2s, v1.2s, v2.2s
+        0x4e21_d820, // scvtf v0.4s, v1.4s
+        0x0e21_d820, // scvtf v0.2s, v1.2s
         0x6e22_d420, // faddp v0.4s, v1.4s, v2.4s
         0x2e22_d420, // faddp v0.2s, v1.2s, v2.2s
         0x4e22_d420, // fadd v0.4s, v1.4s, v2.4s
@@ -1006,7 +1014,9 @@ fn vector_fp_edge_cases_match_the_interpreter() {
         0x5fa2_1020, // fmla s0, s1, v2.s[1]
         0x5f82_5820, // fmls s0, s1, v2.s[2]
     ];
-    const D_OPS: [u32; 10] = [
+    const D_OPS: [u32; 12] = [
+        0x4e62_fc20, // frecps v0.2d, v1.2d, v2.2d
+        0x4ee2_fc20, // frsqrts v0.2d, v1.2d, v2.2d
         0x6e62_d420, // faddp v0.2d, v1.2d, v2.2d
         0x4e62_d420, // fadd v0.2d, v1.2d, v2.2d
         0x6e62_dc20, // fmul v0.2d, v1.2d, v2.2d
