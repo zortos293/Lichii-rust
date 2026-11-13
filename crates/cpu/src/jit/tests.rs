@@ -1903,12 +1903,13 @@ fn zero_factor_products_stay_native() {
     ];
     compare(machines, &PROGRAM, &ctx, &vec![0u8; DATA_SIZE as usize]);
     let table = run_profiled(&PROGRAM, ctx, true).2.unwrap();
+    let fused_slow = u32::from(!std::arch::is_x86_feature_detected!("fma"));
     for line in [
-        "native FP slow paths, FPSR.IXC clear: 1\n",
-        "native FP slow paths, inputs or result: 1\n",
-        "FP 2-source 0x1e200800",
+        "native FP slow paths, FPSR.IXC clear: 1\n".to_string(),
+        format!("native FP slow paths, inputs or result: {}\n", 1 + fused_slow),
+        "FP 2-source 0x1e200800".to_string(),
     ] {
-        assert!(table.contains(line), "{line:?} in\n{table}");
+        assert!(table.contains(&line), "{line:?} in\n{table}");
     }
 }
 
