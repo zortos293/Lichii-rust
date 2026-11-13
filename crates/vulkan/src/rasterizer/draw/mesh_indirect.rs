@@ -115,7 +115,7 @@ impl VulkanRasterizer {
             set,
             &infos,
             bytemuck::bytes_of(&params),
-            max_draws.div_ceil(GROUP),
+            [max_draws.div_ceil(GROUP), 1, 1],
             (
                 vk::PipelineStageFlags2::DRAW_INDIRECT,
                 vk::AccessFlags2::INDIRECT_COMMAND_READ,

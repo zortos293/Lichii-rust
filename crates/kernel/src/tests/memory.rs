@@ -171,6 +171,43 @@ fn map_memory_and_physical_memory() {
 }
 
 #[test]
+fn map_physical_memory_maps_each_run_across_mapped_parts() {
+    let test = TestKernel::new(ConsoleGeneration::Switch2);
+    let process = test.kernel.create_process(&test.image()).unwrap();
+    let table = process.page_table();
+    let alias = table.regions().alias.start + table.regions().alias.size() / 2;
+    table.map_physical_memory(alias + 0x2000, 0x1000).unwrap();
+    table.map_physical_memory(alias, 0x6000).unwrap();
+    let pa = |page: u64| {
+        process
+            .memory()
+            .physical_address(alias + page * 0x1000)
+            .unwrap()
+    };
+    let run: Vec<u64> = [0, 1, 3, 4, 5]
+        .iter()
+        .map(|&page| pa(page) - pa(0))
+        .collect();
+    assert_eq!(
+        run,
+        [0, 0x1000, 0x2000, 0x3000, 0x4000],
+        "one run split around page 2"
+    );
+    assert!(!(pa(0)..pa(0) + 0x5000).contains(&pa(2)));
+    for page in 0..6 {
+        process.memory().write(alias + page * 0x1000, page).unwrap();
+    }
+    for page in 0..6 {
+        assert_eq!(
+            process.memory().read::<u64>(alias + page * 0x1000).unwrap(),
+            page
+        );
+    }
+    table.unmap_physical_memory(alias, 0x6000).unwrap();
+    assert!(!process.memory().is_mapped(alias + 0x5000));
+}
+
+#[test]
 fn transfer_memory_locks_until_closed() {
     let test = TestKernel::new(ConsoleGeneration::Switch1);
     let process = test.kernel.create_process(&test.image()).unwrap();

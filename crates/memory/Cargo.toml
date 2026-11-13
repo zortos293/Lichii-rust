@@ -12,6 +12,10 @@ parking_lot.workspace = true
 portable-atomic = "1"
 thiserror.workspace = true
 
+[[bench]]
+name = "placement"
+harness = false
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

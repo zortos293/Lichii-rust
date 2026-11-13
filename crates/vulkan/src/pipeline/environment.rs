@@ -16,7 +16,7 @@ use lichii_gpu::engines::maxwell_3d::regs::{
 };
 use lichii_gpu::gmmu::Gmmu;
 use lichii_shader::ampere::{GRAPHICS_HEADER_SIZE, graphics_header_address};
-use lichii_shader::info::TexturePixelFormat;
+use lichii_shader::info::{HandleSource, TexturePixelFormat};
 use lichii_shader::ir::TextureType;
 use lichii_shader::maxwell::header::ProgramHeader;
 use lichii_shader::{MeshState, ShaderArch, ShaderEnvironment, ShaderStage};
@@ -44,14 +44,57 @@ fn graphics_header(regs: &Regs, slot: usize, arch: ShaderArch) -> GpuVAddr {
     }
 }
 
+impl EnvRead {
+    /// The recorded answer as a number.
+    pub fn answer(&self) -> u32 {
+        match *self {
+            EnvRead::Type(_, ty) | EnvRead::TypeOf(_, ty) => ty as u32,
+            EnvRead::PixelFormat(_, format) | EnvRead::PixelFormatOf(_, format) => format as u32,
+            EnvRead::Integer(_, integer) | EnvRead::IntegerOf(_, integer) => u32::from(integer),
+            EnvRead::Cbuf { value, .. } => value,
+        }
+    }
+
+    /// Whether both ask the same question, whatever their answers.
+    pub fn same_question(&self, other: &EnvRead) -> bool {
+        use EnvRead::*;
+        match (*self, *other) {
+            (Type(a, _), Type(b, _))
+            | (PixelFormat(a, _), PixelFormat(b, _))
+            | (Integer(a, _), Integer(b, _)) => a == b,
+            (TypeOf(a, _), TypeOf(b, _))
+            | (PixelFormatOf(a, _), PixelFormatOf(b, _))
+            | (IntegerOf(a, _), IntegerOf(b, _)) => a == b,
+            (
+                Cbuf {
+                    index: a,
+                    offset: x,
+                    ..
+                },
+                Cbuf {
+                    index: b,
+                    offset: y,
+                    ..
+                },
+            ) => (a, x) == (b, y),
+            _ => false,
+        }
+    }
+}
+
 /// A query the translator made of guest state outside the program bytes, and the answer it
-/// got: texture header queries by raw handle, and constant buffer words (bindless handles,
-/// indirect branch tables) by binding and offset.
+/// got: texture header queries by the constant buffer words that hold the handle (`*Of`) or by
+/// raw handle, and constant buffer words read as values (indirect branch tables) by binding
+/// and offset. A query by words replays against the handle the words hold at the time, so a
+/// different handle that selects the same kind of texture still matches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnvRead {
     Type(u32, TextureType),
     PixelFormat(u32, TexturePixelFormat),
     Integer(u32, bool),
+    TypeOf(HandleSource, TextureType),
+    PixelFormatOf(HandleSource, TexturePixelFormat),
+    IntegerOf(HandleSource, bool),
     Cbuf { index: u32, offset: u32, value: u32 },
 }
 
@@ -435,18 +478,23 @@ impl<'a> ProgramEnv<'a> {
         self.reads.take()
     }
 
-    /// Whether every recorded query still gives its recorded answer.
-    pub fn replay(&self, reads: &[EnvRead]) -> bool {
-        reads.iter().all(|read| match *read {
-            EnvRead::Type(handle, ty) => self.query_type(handle) == ty,
-            EnvRead::PixelFormat(handle, format) => self.query_format(handle) == format,
-            EnvRead::Integer(handle, integer) => self.query_integer(handle) == integer,
-            EnvRead::Cbuf {
-                index,
-                offset,
-                value,
-            } => self.cbuf_word(index, offset) == value,
-        })
+    /// The answer `read`'s question gets now, in the form [`EnvRead::answer`] gives the
+    /// recorded one. Records nothing.
+    pub fn answer(&self, read: &EnvRead) -> u32 {
+        match *read {
+            EnvRead::Type(handle, _) => self.query_type(handle) as u32,
+            EnvRead::PixelFormat(handle, _) => self.query_format(handle) as u32,
+            EnvRead::Integer(handle, _) => u32::from(self.query_integer(handle)),
+            EnvRead::TypeOf(source, _) => self.query_type(self.handle(source)) as u32,
+            EnvRead::PixelFormatOf(source, _) => self.query_format(self.handle(source)) as u32,
+            EnvRead::IntegerOf(source, _) => u32::from(self.query_integer(self.handle(source))),
+            EnvRead::Cbuf { index, offset, .. } => self.cbuf_word(index, offset),
+        }
+    }
+
+    /// The raw handle the constant buffer words of `source` hold now, without recording them.
+    fn handle(&self, source: HandleSource) -> u32 {
+        source.handle(|index, offset| self.cbuf_word(index, offset))
     }
 
     fn query_type(&self, handle: u32) -> TextureType {
@@ -535,6 +583,28 @@ impl ShaderEnvironment for ProgramEnv<'_> {
         let integer = self.query_integer(raw_handle);
         self.record(EnvRead::Integer(raw_handle, integer));
         integer
+    }
+
+    fn texture_type_of(&self, source: HandleSource) -> TextureType {
+        let ty = self.query_type(self.handle(source));
+        self.record(EnvRead::TypeOf(source, ty));
+        ty
+    }
+
+    fn texture_pixel_format_of(&self, source: HandleSource) -> TexturePixelFormat {
+        let format = self.query_format(self.handle(source));
+        self.record(EnvRead::PixelFormatOf(source, format));
+        format
+    }
+
+    fn is_texture_pixel_format_integer_of(&self, source: HandleSource) -> bool {
+        let integer = self.query_integer(self.handle(source));
+        self.record(EnvRead::IntegerOf(source, integer));
+        integer
+    }
+
+    fn is_texture_multisample_of(&self, _: HandleSource) -> bool {
+        false
     }
 
     fn mesh_state(&self) -> Option<MeshState> {

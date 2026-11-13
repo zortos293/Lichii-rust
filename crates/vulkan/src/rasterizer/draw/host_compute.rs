@@ -106,7 +106,7 @@ impl HostCompute {
         set: vk::DescriptorSet,
         buffers: &[vk::DescriptorBufferInfo],
         params: &[u8],
-        groups: u32,
+        groups: [u32; 3],
         reads: (vk::PipelineStageFlags2, vk::AccessFlags2),
     ) {
         let writes: [_; MAX_BINDINGS] = std::array::from_fn(|binding| {
@@ -145,7 +145,7 @@ impl HostCompute {
                 &[],
             );
             raw.cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::COMPUTE, 0, params);
-            raw.cmd_dispatch(cmd, groups, 1, 1);
+            raw.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
             raw.cmd_pipeline_barrier2(
                 cmd,
                 &vk::DependencyInfo::default().memory_barriers(&[after]),

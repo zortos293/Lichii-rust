@@ -242,6 +242,60 @@ fn a_record_matches_only_the_answers_it_saw() {
     }
 }
 
+/// Texture queries by the words that hold the handle record the words' location and the
+/// answer, not the words: a record and the module hash hold for any handle with the same answer.
+#[test]
+fn texture_queries_by_handle_words_hold_for_any_handle_with_the_same_answer() {
+    use crate::hash::Recorder;
+    use crate::info::HandleSource;
+    const HANDLE: HandleSource = HandleSource {
+        cbuf_index: 1,
+        cbuf_offset: 0x40,
+        shift_left: 0,
+        secondary: None,
+    };
+    let cases: [(Ask, Change); 4] = [
+        (
+            |e| format!("{:?}", e.texture_type_of(HANDLE)),
+            |a| a.texture_type = TextureType::Color3D,
+        ),
+        (
+            |e| format!("{:?}", e.texture_pixel_format_of(HANDLE)),
+            |a| a.pixel_format = TexturePixelFormat::R32Uint,
+        ),
+        (
+            |e| format!("{:?}", e.is_texture_pixel_format_integer_of(HANDLE)),
+            |a| a.integer = true,
+        ),
+        (
+            |e| format!("{:?}", e.is_texture_multisample_of(HANDLE)),
+            |a| a.multisample = true,
+        ),
+    ];
+    let base = Answers::default();
+    let other_handle = Answers {
+        cbuf: base.cbuf + 1,
+        ..base.clone()
+    };
+    for (i, (ask, change)) in cases.into_iter().enumerate() {
+        let logger = Logger::new(&base);
+        ask(&logger);
+        let record = logger.into_record();
+        assert!(record.matches(&other_handle, true), "case {i}");
+        let mut changed = base.clone();
+        change(&mut changed);
+        assert!(!record.matches(&changed, true), "case {i}");
+
+        let hash = |env: &Answers| {
+            let recorder = Recorder::new(env);
+            ask(&recorder);
+            recorder.hasher().finish()
+        };
+        assert_eq!(hash(&base), hash(&other_handle), "case {i}");
+        assert_ne!(hash(&base), hash(&changed), "case {i}");
+    }
+}
+
 #[test]
 fn program_memory_is_compared_relative_to_the_start() {
     let base = Answers::default();

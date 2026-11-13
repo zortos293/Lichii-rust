@@ -6,7 +6,7 @@ use std::hash::{Hash, Hasher};
 
 use lichii_common::GpuVAddr;
 
-use crate::info::{ReplaceConstant, TexturePixelFormat};
+use crate::info::{HandleSource, ReplaceConstant, TexturePixelFormat};
 use crate::ir::TextureType;
 use crate::{MeshState, ShaderArch, ShaderEnvironment, ShaderStage};
 
@@ -151,5 +151,21 @@ impl ShaderEnvironment for Recorder<'_> {
     fn is_texture_multisample(&self, raw_handle: u32) -> bool {
         self.record(21, raw_handle);
         self.record(21, self.env.is_texture_multisample(raw_handle))
+    }
+    fn texture_type_of(&self, source: HandleSource) -> TextureType {
+        self.record(22, source);
+        self.record(22, self.env.texture_type_of(source))
+    }
+    fn texture_pixel_format_of(&self, source: HandleSource) -> TexturePixelFormat {
+        self.record(23, source);
+        self.record(23, self.env.texture_pixel_format_of(source))
+    }
+    fn is_texture_pixel_format_integer_of(&self, source: HandleSource) -> bool {
+        self.record(24, source);
+        self.record(24, self.env.is_texture_pixel_format_integer_of(source))
+    }
+    fn is_texture_multisample_of(&self, source: HandleSource) -> bool {
+        self.record(25, source);
+        self.record(25, self.env.is_texture_multisample_of(source))
     }
 }
