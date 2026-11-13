@@ -1,6 +1,7 @@
 //! The configuration window: every field of `Settings`, organised like Lichii's configuration
 //! dialog. It edits a draft; OK and Apply hand the draft back to the app.
 
+mod controller_layout;
 mod controls;
 mod hotkeys;
 

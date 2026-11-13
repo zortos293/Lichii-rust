@@ -937,6 +937,18 @@ impl Default for StickBinding {
     }
 }
 
+/// How a bound button behaves, as set from Lichii's binding context menu.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ButtonOptions {
+    /// Reports the opposite of the host input.
+    pub inverted: bool,
+    /// Each press flips the button between held and released.
+    pub toggle: bool,
+    /// While held, the button alternates between pressed and released.
+    pub turbo: bool,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum InputDevice {
     #[default]
@@ -957,9 +969,14 @@ pub struct PlayerInput {
     pub controller_type: ControllerType,
     pub device: InputDevice,
     pub buttons: BTreeMap<NpadButton, InputBinding>,
+    /// Inverted, toggle and turbo buttons; absent buttons behave normally.
+    pub button_options: BTreeMap<NpadButton, ButtonOptions>,
     pub left_stick: StickBinding,
     pub right_stick: StickBinding,
     pub motion_enabled: bool,
+    /// Motion without a gyro, as in Lichii: while bound the controller reports lying at rest,
+    /// and holding the input shakes it. The device's own sensors take precedence.
+    pub motion_button: InputBinding,
     pub vibration_enabled: bool,
     /// 0..=100 percent.
     pub vibration_strength: u8,
@@ -974,9 +991,11 @@ impl Default for PlayerInput {
             controller_type: ControllerType::ProController,
             device: InputDevice::None,
             buttons: BTreeMap::new(),
+            button_options: BTreeMap::new(),
             left_stick: StickBinding::default(),
             right_stick: StickBinding::default(),
             motion_enabled: true,
+            motion_button: InputBinding::None,
             vibration_enabled: true,
             vibration_strength: 100,
             profile: None,

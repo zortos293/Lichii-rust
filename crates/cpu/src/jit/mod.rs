@@ -15,6 +15,7 @@ mod x64;
 
 use std::sync::atomic::AtomicBool;
 
+use lichii_common::settings::CpuAccuracy;
 use lichii_common::{PAGE_MASK, VAddr};
 use lichii_memory::{AddressSpace, ExclusiveMonitor, ReservationSlot};
 
@@ -248,8 +249,11 @@ pub struct Jit {
 unsafe impl Send for Jit {}
 
 impl Jit {
-    /// `None` when executable memory cannot be mapped.
+    /// `None` when the host cannot map JIT code, or under `CpuAccuracy::Paranoid`.
     pub fn new(config: CpuConfig) -> Option<Self> {
+        if config.accuracy == CpuAccuracy::Paranoid {
+            return None;
+        }
         Self::with_passes(config, Passes::ALL)
     }
 
