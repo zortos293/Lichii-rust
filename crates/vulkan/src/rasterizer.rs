@@ -549,6 +549,7 @@ impl VulkanRasterizer {
             return;
         }
         let (textures, buffers) = (self.texture_cache.traffic(), self.buffer_cache.stats());
+        let memory = self.device.memory_usage();
         tracing::debug!(
             target: ACTIVITY_TARGET,
             seconds = (now - since).as_secs_f32(),
@@ -565,6 +566,11 @@ impl VulkanRasterizer {
             buffer_upload_bytes = buffers.uploaded_bytes - a.buffers.uploaded_bytes,
             buffer_download_bytes = buffers.downloaded_bytes - a.buffers.downloaded_bytes,
             buffer_stream_bytes = buffers.streamed_bytes - a.buffers.streamed_bytes,
+            cached_images = self.texture_cache.len(),
+            created_buffers = buffers.created_buffers,
+            vram_used_mib = memory.used >> 20,
+            vram_slack_mib = memory.slack >> 20,
+            vram_budget_mib = memory.budget >> 20,
             "GPU thread"
         );
         *a = Activity {
