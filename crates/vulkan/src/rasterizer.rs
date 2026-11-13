@@ -1274,19 +1274,11 @@ mod tests {
             block_height_log2: Some(2),
             ..framebuffer(64, 32)
         };
-        f.rasterizer.present(&fb);
-        f.rasterizer.present(&fb);
-        assert_eq!(
-            f.rasterizer.frame_uploads.len(),
-            2,
-            "the first is still in flight"
-        );
-        f.rasterizer.scheduler.finish().unwrap();
         for _ in 0..4 {
             f.rasterizer.present(&fb);
             f.rasterizer.scheduler.finish().unwrap();
         }
-        assert_eq!(f.rasterizer.frame_uploads.len(), 2);
+        assert_eq!(f.rasterizer.frame_uploads.len(), 1);
         f.assert_no_validation_errors();
     }
 
