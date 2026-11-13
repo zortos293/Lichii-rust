@@ -117,7 +117,7 @@ impl System {
             "booting"
         );
 
-        let timing = Arc::new(CoreTiming::new());
+        let timing = Arc::new(CoreTiming::new(program.generation));
         let exit = Arc::new(ExitSignal::default());
         let backend = settings.cpu.backend;
         let kernel = Kernel::new(KernelConfig {
@@ -251,6 +251,7 @@ impl System {
         if self.state == State::Stopped {
             return;
         }
+        self.gpu.pause(true);
         self.kernel.shutdown();
         self.state = State::Stopped;
         tracing::info!("stopped");
