@@ -330,7 +330,7 @@ fn tic(gpu_va: u64, width: u32, height: u32) -> [u32; 8] {
         (gpu_va >> 32) as u32 | 3 << 21,
         1 << 3,
         (width - 1) | 1 << 23,
-        height - 1,
+        (height - 1) | 1 << 31,
         0,
         0,
     ]
