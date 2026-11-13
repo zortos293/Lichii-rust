@@ -32,6 +32,9 @@ fn hmul2(t: &mut Translator<'_>, src_b: Value, m: Hmul2) -> TResult {
     }
     let a = abs_neg_pair(&mut t.ir, a, m.abs_a, m.neg_a);
     let b = abs_neg_pair(&mut t.ir, b, m.abs_b, m.neg_b);
+    if m.precision & 3 == 3 {
+        crate::fallback::note("HMUL2", "precision_3");
+    }
     let (fmz_mode, fmz) = half_precision(m.precision);
     let control = FpControl {
         no_contraction: true,

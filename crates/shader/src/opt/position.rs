@@ -32,6 +32,7 @@ pub fn position(env: &dyn ShaderEnvironment, prog: &mut Program, info: &mut Shad
         })
         .collect();
     for (id, element) in position_stores {
+        crate::fallback::note("position", "ndc_remap");
         let value = prog.arg(id, 1);
         let mut ir = Emitter::before(prog, id);
         let extent = render_area_extent(&mut ir, element);
@@ -69,7 +70,10 @@ fn blit_word(ir: &mut Emitter<'_>, offset: u32) -> Value {
             let last = ir.fp_add(extent, Value::F32(-1.0), FpControl::default());
             ir.convert_f_to_i(32, false, last)
         }
-        _ => Value::U32(0),
+        _ => {
+            crate::fallback::note_value("blit", "word_unknown_zero", offset);
+            Value::U32(0)
+        }
     }
 }
 
@@ -119,6 +123,7 @@ fn drop_dither_bias(prog: &mut Program) {
                 && matches!(prog.arg(bias, 1).imm_u32(), Some(0x10 | 0x14 | 0x18))
                 && is_float_bits(prog, float_bits, 0)
             {
+                crate::fallback::note("blit", "dither_bias_dropped");
                 prog.set_arg(cast, 0, float_bits);
                 break;
             }
@@ -163,6 +168,7 @@ pub fn blit_constants(env: &dyn ShaderEnvironment, prog: &mut Program, info: &mu
         drop_dither_bias(prog);
     }
     for (id, offset) in reads {
+        crate::fallback::note("blit", "constants_synthesised");
         let op = prog.op(id);
         let mut ir = Emitter::before(prog, id);
         let value = match op {

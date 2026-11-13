@@ -125,7 +125,11 @@ fn alpha_test(ctx: &mut EmitContext<'_>) -> EmitResult<()> {
     let Some(function) = ctx.runtime.alpha_test_func else {
         return Ok(());
     };
-    if function == CompareFunction::Always || ctx.frag_color[0] == 0 || !is_float_output(ctx, 0) {
+    if function == CompareFunction::Always {
+        return Ok(());
+    }
+    if ctx.frag_color[0] == 0 || !is_float_output(ctx, 0) {
+        crate::fallback::note("alpha_test", "skipped_no_color0_or_integer");
         return Ok(());
     }
     let color = ctx.b.load(ctx.f32[4], None, ctx.frag_color[0], None, [])?;
@@ -226,12 +230,14 @@ fn stream(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Option<Word>> {
         return ctx.def(stream).map(Some);
     }
     tracing::warn!("geometry stream is not an immediate");
+    crate::fallback::note("OUT/CUT", "non_immediate_stream");
     Ok(Some(ctx.u32_zero_value))
 }
 
 /// Vertex emission outside a geometry program (a stray `OUT`) does nothing.
 pub(super) fn emit_vertex(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<()> {
     if ctx.stage != ShaderStage::Geometry {
+        crate::fallback::note("OUT", "emit_vertex_outside_geometry");
         return Ok(());
     }
     if ctx.runtime.convert_depth_mode && !ctx.profile.support_native_ndc {
@@ -251,6 +257,7 @@ pub(super) fn emit_vertex(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult
 
 pub(super) fn end_primitive(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<()> {
     if ctx.stage != ShaderStage::Geometry {
+        crate::fallback::note("CUT", "end_primitive_outside_geometry");
         return Ok(());
     }
     match stream(ctx, inst)? {

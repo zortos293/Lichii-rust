@@ -313,6 +313,7 @@ impl Builder<'_> {
                 && self.prog.resolve(self.arg(phi, i)) != Value::Inst(phi)
         });
         if varies {
+            crate::fallback::note("TEX", "handle_changes_per_loop_iteration");
             static WARNED: AtomicBool = AtomicBool::new(false);
             if !WARNED.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
@@ -334,8 +335,14 @@ impl Builder<'_> {
                 | Opcode::UndefU8
                 | Opcode::UndefU16
                 | Opcode::UndefU32
-                | Opcode::UndefU64 => None,
-                Opcode::ShuffleIndex => Some(self.prog.resolve(self.arg(id, 0))),
+                | Opcode::UndefU64 => {
+                    crate::fallback::note("TEX", "handle_phi_undef_input_ignored");
+                    None
+                }
+                Opcode::ShuffleIndex => {
+                    crate::fallback::note("TEX", "handle_phi_shuffle_as_identity");
+                    Some(self.prog.resolve(self.arg(id, 0)))
+                }
                 _ => Some(value),
             }
         });
@@ -343,6 +350,7 @@ impl Builder<'_> {
             return self.fail(Opcode::Phi);
         };
         if incoming.any(|value| value != first) {
+            crate::fallback::note("TEX", "handle_phi_conflicting_inputs");
             return self.fail(Opcode::Phi);
         }
         self.value(first)

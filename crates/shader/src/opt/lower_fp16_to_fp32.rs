@@ -5,6 +5,7 @@ use crate::ir::{Opcode, Program, Type};
 /// Replaces every F16 opcode with its F32 counterpart and retypes F16 phis to match. Half
 /// float conversions become identities.
 pub fn lower_fp16_to_fp32(prog: &mut Program) {
+    let mut lowered_any = false;
     for i in 0..prog.block_order.len() {
         let mut cur = prog.block(prog.block_order[i]).first();
         while let Some(id) = cur {
@@ -15,8 +16,12 @@ pub fn lower_fp16_to_fp32(prog: &mut Program) {
                 prog.set_flags(id, retype(ty).bits());
             } else if let Some(lowered) = replace(op) {
                 prog.replace_opcode(id, lowered);
+                lowered_any = true;
             }
         }
+    }
+    if lowered_any {
+        crate::fallback::note("fp16", "fp16_as_fp32");
     }
 }
 

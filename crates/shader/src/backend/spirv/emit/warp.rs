@@ -18,6 +18,7 @@ fn subgroup_scope(ctx: &mut EmitContext<'_>) -> Word {
 /// The host subgroup invocation id, or zero in stages without subgroups.
 fn thread_id(ctx: &mut EmitContext<'_>) -> EmitResult<Word> {
     if !ctx.supports_subgroups() {
+        crate::fallback::note("S2R", "no_subgroups_lane_id_zero");
         return Ok(ctx.u32_zero_value);
     }
     let (u32_t, id) = (ctx.u32[1], ctx.subgroup_invocation_id());
@@ -87,6 +88,7 @@ fn load_mask(ctx: &mut EmitContext<'_>, mask: Word) -> EmitResult<Word> {
 
 fn subgroup_mask(ctx: &mut EmitContext<'_>, mask: Word, single_lane: u32) -> EmitResult<Word> {
     if !ctx.supports_subgroups() {
+        crate::fallback::note("S2R", "subgroup_mask_no_subgroups");
         return Ok(ctx.const_u32(single_lane));
     }
     load_mask(ctx, mask)
@@ -227,6 +229,7 @@ fn single_lane_shuffle(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Op
     if ctx.supports_subgroups() {
         return Ok(None);
     }
+    crate::fallback::note("SHFL", "shuffle_no_subgroups");
     let false_value = ctx.false_value;
     set_in_bounds(ctx, inst, false_value);
     Ok(Some(ctx.def_arg(inst, 0)?))
@@ -243,6 +246,7 @@ pub(super) fn lane_id(ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<Wo
 pub(super) fn vote_all(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
     let pred = ctx.def_arg(inst, 0)?;
     if !ctx.supports_subgroups() {
+        crate::fallback::note("VOTE", "vote_all_no_subgroups");
         return Ok(pred);
     }
     let u1 = ctx.u1;
@@ -259,6 +263,7 @@ pub(super) fn vote_all(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Wo
 pub(super) fn vote_any(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
     let pred = ctx.def_arg(inst, 0)?;
     if !ctx.supports_subgroups() {
+        crate::fallback::note("VOTE", "vote_any_no_subgroups");
         return Ok(pred);
     }
     let u1 = ctx.u1;
@@ -275,6 +280,7 @@ pub(super) fn vote_any(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Wo
 pub(super) fn vote_equal(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
     let pred = ctx.def_arg(inst, 0)?;
     if !ctx.supports_subgroups() {
+        crate::fallback::note("VOTE", "vote_eq_no_subgroups");
         return Ok(ctx.true_value);
     }
     let u1 = ctx.u1;
@@ -293,6 +299,7 @@ pub(super) fn vote_equal(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<
 pub(super) fn subgroup_ballot(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
     let pred = ctx.def_arg(inst, 0)?;
     if !ctx.supports_subgroups() {
+        crate::fallback::note("VOTE", "ballot_no_subgroups");
         let (u32_t, one, zero) = (ctx.u32[1], ctx.const_u32(1), ctx.u32_zero_value);
         return Ok(ctx.b.select(u32_t, None, pred, one, zero)?);
     }
@@ -404,6 +411,7 @@ pub(super) fn quad_broadcast(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitRes
             .b
             .group_non_uniform_quad_broadcast(u32_t, None, scope, value, lane)?);
     }
+    crate::fallback::note("SHFL", "quad_broadcast_no_quad_shuffles");
     let thread = thread_id(ctx)?;
     let quad_mask = ctx.const_u32(!3);
     let three = ctx.const_u32(3);
@@ -422,6 +430,7 @@ pub(super) fn quad_swap(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<W
             .b
             .group_non_uniform_quad_swap(u32_t, None, scope, value, direction)?);
     }
+    crate::fallback::note("SHFL", "quad_swap_no_quad_shuffles");
     let one = ctx.const_u32(1);
     let xor_mask = ctx.b.i_add(u32_t, None, direction, one)?;
     Ok(ctx

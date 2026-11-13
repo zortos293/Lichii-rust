@@ -125,6 +125,7 @@ pub fn geometry_compaction(
         }
     }
     for (atomic, ballot) in slot_atomics {
+        crate::fallback::note("geometry", "compaction_slot_per_primitive");
         let block = prog.inst(atomic).block();
         rewrite_merged_slots(prog, block, atomic, invocations);
         rewrite_atomic(prog, atomic, invocations);

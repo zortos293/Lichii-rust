@@ -11,6 +11,7 @@ const F32_TO_F64_EXP: i32 = 1023 - 127;
 /// rebuilds `PackDouble2x32`/`UnpackDouble2x32` from the IEEE bit layouts. Doubles outside
 /// the single range overflow the exponent field, as on the C++ side.
 pub fn lower_fp64_to_fp32(prog: &mut Program) {
+    let mut lowered_any = false;
     for i in 0..prog.block_order.len() {
         let mut cur = prog.block(prog.block_order[i]).first();
         while let Some(id) = cur {
@@ -22,23 +23,29 @@ pub fn lower_fp64_to_fp32(prog: &mut Program) {
                     narrow_immediates(prog, id);
                 }
                 Opcode::PackDouble2x32 => {
+                    lowered_any = true;
                     let packed = prog.arg(id, 0);
                     let value = packed_f64_to_f32(&mut Emitter::before(prog, id), packed);
                     prog.replace_uses_with(id, value);
                 }
                 Opcode::UnpackDouble2x32 => {
+                    lowered_any = true;
                     let raw = prog.arg(id, 0);
                     let value = f32_to_packed_f64(&mut Emitter::before(prog, id), raw);
                     prog.replace_uses_with(id, value);
                 }
                 op => {
                     if let Some(lowered) = replace(op) {
+                        lowered_any = true;
                         prog.replace_opcode(id, lowered);
                         narrow_immediates(prog, id);
                     }
                 }
             }
         }
+    }
+    if lowered_any {
+        crate::fallback::note("fp64", "fp64_as_fp32");
     }
 }
 

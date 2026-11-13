@@ -260,6 +260,9 @@ fn fswzadd(t: &mut Translator<'_>) -> TResult {
     let i = t.insn;
     let a = t.f(i.src0());
     let b = t.f(i.src2());
+    if i.bit(77) {
+        crate::fallback::note("FSWZADD", "ndv");
+    }
     let codes = i.bits(32, 8) as u32;
     let swizzle = ((codes & 0x55) << 1) | ((codes & 0xaa) >> 1);
     let control = FpControl {
@@ -676,6 +679,9 @@ fn f2f(t: &mut Translator<'_>, wide: bool) -> TResult {
         },
     };
     let value = if src_width == dst_width {
+        if i.bits(78, 2) != 0 {
+            crate::fallback::note("F2F", "same_width_rounding_op");
+        }
         let zero = match src_width {
             16 => t.ir.fp_convert(16, Value::F32(0.0), FpControl::default()),
             32 => Value::F32(0.0),

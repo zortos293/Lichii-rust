@@ -39,7 +39,10 @@ pub(super) fn s2r(t: &mut Translator<'_>) -> TResult {
         58 => t.ir.inst(SubgroupLeMask, &[]),
         59 => t.ir.inst(SubgroupGtMask, &[]),
         60 => t.ir.inst(SubgroupGeMask, &[]),
-        _ => Value::U32(0),
+        _ => {
+            crate::fallback::note_value("S2R", "unknown_sr", sr as u32);
+            Value::U32(0)
+        }
     };
     t.set_x(t.insn.dest_reg(), value);
     Ok(())
@@ -52,6 +55,13 @@ mod tests {
 
     fn s2r(sr: u64) -> String {
         translate(&[encode(Opcode::S2r, (sr << 20) | 1)]).unwrap()
+    }
+
+    #[test]
+    fn unknown_special_register_is_counted() {
+        let _census = crate::fallback::test_census();
+        s2r(45);
+        assert!(crate::fallback::sites("S2R", "unknown_sr", Some(45)) >= 1);
     }
 
     #[test]

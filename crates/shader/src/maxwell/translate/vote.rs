@@ -21,6 +21,7 @@ pub(super) fn vote(t: &mut Translator<'_>) -> TResult {
 
 /// Stubbed like the C++ frontend: it emits nothing.
 pub(super) fn vote_vtg(_: &mut Translator<'_>) -> TResult {
+    crate::fallback::note("VOTE", "vtg_stubbed");
     Ok(())
 }
 

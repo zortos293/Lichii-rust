@@ -6,6 +6,7 @@ use crate::ir::Value;
 fn mov(t: &mut Translator<'_>, src: Value, mask: u64) -> TResult {
     if mask != 0xf && mask != 0x1 {
         tracing::warn!(mask, "(STUBBED) masked MOV");
+        crate::fallback::note_value("MOV", "write_mask", mask as u32);
         return Ok(());
     }
     t.set_x(t.insn.dest_reg(), src);

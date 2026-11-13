@@ -202,6 +202,7 @@ fn translate_recorded(
                         .set(Attribute(i as u16), passthrough);
                 }
                 if !host.support_geometry_shader_passthrough {
+                    crate::fallback::note("geometry", "passthrough_lowered_without_host_support");
                     let copied = Attribute::POSITION_X.0
                         ..Attribute::GENERIC_0_X.0 + Attribute::NUM_GENERICS * 4;
                     for i in (0..mask.len() as u16 * 32).filter(|i| !copied.contains(i)) {
@@ -419,6 +420,9 @@ fn tighten_output_vertices(program: &mut TranslatedProgram) {
         .filter(|&id| ir.op(id) == Opcode::EmitVertex)
         .count() as u32;
     if emits != 0 {
+        if emits < program.output_vertices {
+            crate::fallback::note("geometry", "output_vertices_tightened");
+        }
         program.output_vertices = program.output_vertices.min(emits);
     }
 }
@@ -446,7 +450,16 @@ fn collect_interpolation_info(
             imap = Some(value);
         }
         *slot = match imap {
-            None => continue,
+            None => {
+                if info.loads.generic(index as u16) {
+                    crate::fallback::note_value(
+                        "IPA",
+                        "interpolation_unused_defaults_smooth",
+                        index as u32,
+                    );
+                }
+                continue;
+            }
             Some(PixelImap::Unused | PixelImap::Perspective) => Interpolation::Smooth,
             Some(PixelImap::Constant) => Interpolation::Flat,
             Some(PixelImap::ScreenLinear) => Interpolation::NoPerspective,

@@ -11,23 +11,28 @@ use crate::backend::spirv::context::EmitContext;
 use crate::ir::InstId;
 
 pub(super) fn undef_u1(ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<Word> {
+    crate::fallback::note("undef", "reads_zero");
     Ok(ctx.false_value)
 }
 
 pub(super) fn undef_u8(ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<Word> {
+    crate::fallback::note("undef", "reads_zero");
     let ty = ctx.u8;
     Ok(ctx.const_null(ty))
 }
 
 pub(super) fn undef_u16(ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<Word> {
+    crate::fallback::note("undef", "reads_zero");
     let ty = ctx.u16;
     Ok(ctx.const_null(ty))
 }
 
 pub(super) fn undef_u32(ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<Word> {
+    crate::fallback::note("undef", "reads_zero");
     Ok(ctx.u32_zero_value)
 }
 
 pub(super) fn undef_u64(ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<Word> {
+    crate::fallback::note("undef", "reads_zero");
     Ok(ctx.const_u64(0))
 }

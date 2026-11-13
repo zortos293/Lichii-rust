@@ -934,6 +934,51 @@ fn generic_input_types_follow_the_vertex_attribute_formats() {
     emit("generic_inputs", &Profile::default(), &runtime, &program);
 }
 
+#[test]
+fn undeclared_generic_input_and_unbound_bank_are_counted() {
+    let _census = crate::fallback::test_census();
+    let mut s = Synthetic::new();
+    let b = s.block();
+    s.inst(b, Opcode::Prologue, &[]);
+    let attribute = Attribute::generic(5, 0);
+    let input = s.inst(
+        b,
+        Opcode::GetAttribute,
+        &[Value::Attribute(attribute), Value::U32(0)],
+    );
+    let word = s.inst(b, Opcode::GetCbufU32, &[Value::U32(30), Value::U32(0)]);
+    let word = s.inst(b, Opcode::BitCastF32U32, &[word]);
+    let sum = s.inst(b, Opcode::FPAdd32, &[input, word]);
+    s.inst(
+        b,
+        Opcode::SetFragColor,
+        &[Value::U32(0), Value::U32(0), sum],
+    );
+    s.inst(b, Opcode::Epilogue, &[]);
+    let info = ShaderInfo {
+        loads: varying(&[attribute]),
+        stores_frag_color: [true, false, false, false, false, false, false, false],
+        ..ShaderInfo::default()
+    };
+    let program = s.finish(
+        vec![SyntaxNode::Block(b), SyntaxNode::Return],
+        ShaderStage::Fragment,
+        info,
+    );
+    emit(
+        "undeclared_input",
+        &Profile::default(),
+        &RuntimeInfo::default(),
+        &program,
+    );
+    let index = u32::from(attribute.0);
+    assert!(crate::fallback::sites("attribute", "input_not_declared", Some(index)) >= 1);
+    assert!(
+        crate::fallback::sites("attribute", "input_not_stored_by_previous_stage", Some(5)) >= 1
+    );
+    assert!(crate::fallback::sites("cbuf", "bank_past_limit", Some(30)) >= 1);
+}
+
 /// InterpolateAtOffset on a float input, an integer (flat) input and an input the previous stage
 /// does not write.
 #[test]

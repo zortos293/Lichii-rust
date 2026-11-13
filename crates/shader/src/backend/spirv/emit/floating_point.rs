@@ -10,7 +10,7 @@ use rspirv::spirv::{Decoration, GlslStd450Op, Word};
 
 use crate::backend::spirv::EmitResult;
 use crate::backend::spirv::context::EmitContext;
-use crate::ir::{FpControl, InstId, Type};
+use crate::ir::{FpControl, FpRounding, InstId, Type};
 
 type CompareOp = fn(&mut Builder, Word, Option<Word>, Word, Word) -> Result<Word, dr::Error>;
 
@@ -18,7 +18,14 @@ type CompareOp = fn(&mut Builder, Word, Option<Word>, Word, Word) -> Result<Word
 const F16_ONE: u16 = 0x3c00;
 
 fn decorate(ctx: &mut EmitContext<'_>, inst: InstId, id: Word) -> Word {
-    if FpControl::from_flags(ctx.flags(inst)).no_contraction {
+    let control = FpControl::from_flags(ctx.flags(inst));
+    if matches!(
+        control.rounding,
+        FpRounding::Rm | FpRounding::Rp | FpRounding::Rz
+    ) {
+        crate::fallback::note("FP", "rounding_mode");
+    }
+    if control.no_contraction {
         ctx.decorate(id, Decoration::NoContraction, &[]);
     }
     id

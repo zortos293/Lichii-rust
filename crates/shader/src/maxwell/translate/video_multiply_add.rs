@@ -42,7 +42,11 @@ pub(super) fn extract_video_operand_value(
     signed: bool,
 ) -> Value {
     match width {
-        VideoWidth::Byte | VideoWidth::Unknown => {
+        VideoWidth::Byte => {
+            ir.bit_field_extract(value, Value::U32(selector * 8), Value::U32(8), signed)
+        }
+        VideoWidth::Unknown => {
+            crate::fallback::note("VIDEO", "unknown_width_as_byte");
             ir.bit_field_extract(value, Value::U32(selector * 8), Value::U32(8), signed)
         }
         VideoWidth::Short => {

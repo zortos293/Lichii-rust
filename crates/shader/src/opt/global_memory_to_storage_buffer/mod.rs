@@ -131,6 +131,7 @@ impl Collector<'_> {
     fn collect_access(&mut self, block: BlockId, inst: InstId, info: &mut StorageInfo) -> bool {
         let (prog, env) = (self.prog, self.env);
         let Some(addr) = track_low_address(prog, inst) else {
+            crate::fallback::note("global_memory", "address_untracked");
             return false;
         };
         let op = prog.op(inst);
@@ -185,8 +186,14 @@ impl Collector<'_> {
                 Some(pointer) if self.atomic_pointers.contains(&pointer) => {
                     storage_buffer = Some(pointer)
                 }
-                _ => return false,
+                _ => {
+                    crate::fallback::note("global_memory", "native_untracked");
+                    return false;
+                }
             }
+        }
+        if storage_buffer.is_none() {
+            crate::fallback::note("global_memory", "pointer_heuristics");
         }
         let tracker = &mut self.tracker;
         let found = storage_buffer
@@ -196,6 +203,7 @@ impl Collector<'_> {
             .or_else(|| tracker.track(prog, addr.value, None));
         let Some(storage_buffer) = found else {
             tracing::warn!("storage buffer failed to track, using global memory fallbacks");
+            crate::fallback::note("global_memory", "track_failed");
             return false;
         };
         if is_write {
@@ -219,6 +227,7 @@ fn bind_candidates(info: &mut StorageInfo, candidates: &Candidates, is_write: bo
             let added = usize::from(takes_binding(&candidate))
                 + usize::from(candidate.is_indirect() && takes_binding(&holder));
             if info.table_used + added > info.table_budget {
+                crate::fallback::note("global_memory", "table_candidate_budget");
                 continue;
             }
             info.table_used += added;

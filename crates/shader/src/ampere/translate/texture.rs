@@ -304,6 +304,9 @@ fn sample_component(t: &mut Translator<'_>, sample: Value, component: u32) -> Va
     if t.ir.ty(sample) != Type::F32 {
         return t.ir.composite_extract(sample, component);
     }
+    if component != 0 {
+        crate::fallback::note("TEX", "depth_sample_components");
+    }
     if component == 3 {
         Value::F32(1.0)
     } else {
@@ -372,8 +375,16 @@ impl Lod {
         Ok(match t.insn.bits(87, 3) {
             0 => (Lod::Auto, false),
             1 => (Lod::Zero, false),
-            2 | 6 => (Lod::Bias, false),
-            3 | 7 => (Lod::Explicit, false),
+            2 => (Lod::Bias, false),
+            3 => (Lod::Explicit, false),
+            6 => {
+                crate::fallback::note("TEX", "lba_lla_as_lb_ll");
+                (Lod::Bias, false)
+            }
+            7 => {
+                crate::fallback::note("TEX", "lba_lla_as_lb_ll");
+                (Lod::Explicit, false)
+            }
             4 => (Lod::Auto, true),
             5 => (Lod::Bias, true),
             _ => return Err(t.unsupported()),

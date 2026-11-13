@@ -613,7 +613,12 @@ fn copy_lines(
         let value = ctx.b.composite_construct(
             f32x4,
             None,
-            [0, 1, 2, 3].map(|i| components[i].unwrap_or(defaults[i])),
+            [0, 1, 2, 3].map(|i| {
+                components[i].unwrap_or_else(|| {
+                    crate::fallback::note("mesh", "unwritten_component_default");
+                    defaults[i]
+                })
+            }),
         )?;
         store(ctx, pointer, value)?;
     }
@@ -894,6 +899,7 @@ fn clear_positions(ctx: &mut EmitContext<'_>, invocation: Word) -> EmitResult<()
         if !positions.contains(&attribute) {
             continue;
         }
+        crate::fallback::note("mesh", "unwritten_position_nan");
         for first in (0..mesh.max_vertices).step_by(threads as usize) {
             let vertex = add_imm(ctx, invocation, first)?;
             let vertex = umin_imm(ctx, vertex, mesh.max_vertices - 1)?;

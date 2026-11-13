@@ -26,7 +26,13 @@ pub fn layer(
     }
     let layer_attribute = (0..Attribute::NUM_GENERICS)
         .find(|&index| !info.stores.generic(index))
-        .map_or(Attribute::LAYER, |index| Attribute::generic(index, 0));
+        .map_or_else(
+            || {
+                crate::fallback::note("layer", "emulation_no_free_generic");
+                Attribute::LAYER
+            },
+            |index| Attribute::generic(index, 0),
+        );
     let layer_stores: Vec<InstId> = prog
         .post_order
         .iter()

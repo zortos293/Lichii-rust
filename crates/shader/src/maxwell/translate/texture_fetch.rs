@@ -116,6 +116,9 @@ pub(super) fn sample_component(t: &mut Translator<'_>, sample: Value, component:
     if t.ir.ty(sample) != Type::F32 {
         return t.ir.composite_extract(sample, component);
     }
+    if component != 0 {
+        crate::fallback::note("TEX", "depth_sample_components");
+    }
     if component == 3 {
         Value::F32(1.0)
     } else {
@@ -460,6 +463,9 @@ fn tex_impl(
         Value::Void
     };
     let dref = if is_depth { t.f(meta) } else { Value::Void };
+    if t.insn.bit(35) && dim.ty() != TextureType::Color3D {
+        crate::fallback::note("TEX", "ndv");
+    }
     let info = TextureInstInfo {
         ty: dim.ty(),
         is_depth,

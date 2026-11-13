@@ -47,6 +47,9 @@ fn attribute_access(t: &Translator<'_>) -> Result<(u32, u16, bool), TranslateErr
     if !address.is_multiple_of(4) || (is_patch && !tessellation) {
         return Err(t.unsupported());
     }
+    if t.insn.bit(77) {
+        crate::fallback::note("ALD/AST", "physical_addressing_bit77");
+    }
     Ok((address / 4, t.insn.bits(74, 2) as u16 + 1, is_patch))
 }
 
@@ -117,6 +120,7 @@ fn ast(t: &mut Translator<'_>) -> TResult {
         return Err(t.unsupported());
     }
     if !is_patch && word == SHADING_RATE_HINT && count == 1 && index_reg.is_zero() {
+        crate::fallback::note("AST", "shading_rate_hint");
         return Ok(());
     }
     let src = t.insn.src1();
@@ -156,6 +160,12 @@ fn ipa(t: &mut Translator<'_>) -> TResult {
     let (location, frequency) = (insn.bits(76, 2), insn.bits(78, 2));
     if location > 2 || frequency > 1 || !insn.pred_dst0().is_true() {
         return Err(t.unsupported());
+    }
+    if location == 1 {
+        crate::fallback::note("IPA", "centroid_sample_location");
+    }
+    if frequency == 1 {
+        crate::fallback::note("IPA", "constant_frequency");
     }
     let word = insn.bits(64, 8) as u16;
     let index = insn.usrc0();
@@ -206,9 +216,13 @@ fn interpolate_at_offset(
         Attribute::PRIMITIVE_ID
         | Attribute::LAYER
         | Attribute::VIEWPORT_INDEX
-        | Attribute::FRONT_FACE => return Ok(t.ir.get_attribute(attribute, Value::U32(0))),
+        | Attribute::FRONT_FACE => {
+            crate::fallback::note("IPA", "offset_position_xy_shift");
+            return Ok(t.ir.get_attribute(attribute, Value::U32(0)));
+        }
         _ => return Err(t.unsupported()),
     };
+    crate::fallback::note("IPA", "offset_position_xy_shift");
     let delta = half(t, shift);
     let value = t.ir.get_attribute(attribute, Value::U32(0));
     Ok(t.ir.fp_add(value, delta, FpControl::default()))
@@ -228,6 +242,9 @@ fn isbe_address(t: &mut Translator<'_>) -> Result<Value, TranslateError> {
     let region = t.insn.bits(76, 2);
     if t.insn.bits(64, 32) & !ISBE_MODIFIERS != 0 || (region != 0 && region != 3) {
         return Err(t.unsupported());
+    }
+    if t.insn.bit(78) {
+        crate::fallback::note("ISBE", "skew_modifier");
     }
     let base = t.x(t.insn.src0());
     Ok(t.ir.iadd(base, Value::U32(t.insn.bits(40, 24) as u32)))
@@ -298,6 +315,9 @@ fn out(t: &mut Translator<'_>) -> TResult {
             t.ir.end_primitive(stream);
         }
     }
+    if !t.insn.dst().is_zero() {
+        crate::fallback::note("OUT", "next_output_handle");
+    }
     t.set_x(t.insn.dst(), Value::U32(0));
     Ok(())
 }
@@ -364,8 +384,14 @@ fn special_register(t: &mut Translator<'_>, sr: u64) -> Value {
         58 => t.ir.inst(Ir::SubgroupLeMask, &[]),
         59 => t.ir.inst(Ir::SubgroupGtMask, &[]),
         60 => t.ir.inst(Ir::SubgroupGeMask, &[]),
-        132 => Value::U32(VARIABLE_RATE_1X1),
-        _ => Value::U32(0),
+        132 => {
+            crate::fallback::note("S2R", "sr_variable_rate");
+            Value::U32(VARIABLE_RATE_1X1)
+        }
+        _ => {
+            crate::fallback::note_value("S2R", "unknown_sr", sr as u32);
+            Value::U32(0)
+        }
     }
 }
 
@@ -382,6 +408,9 @@ fn cs2r(t: &mut Translator<'_>) -> TResult {
     const SRZ: u64 = 255;
     let (sr, dest) = (t.insn.bits(72, 8), t.insn.dst());
     let registers: &[u64] = if t.insn.bit(80) { &[0, 1] } else { &[0] };
+    if t.insn.bit(80) && sr != SRZ {
+        crate::fallback::note("CS2R", "special_register_64bit");
+    }
     for &i in registers {
         let value = if sr == SRZ {
             Value::U32(0)
@@ -399,6 +428,7 @@ fn csmtest(t: &mut Translator<'_>) -> TResult {
     if t.insn.bits(87, 4) != 7 || t.insn.bits(16, 16) != 0 {
         return Err(t.unsupported());
     }
+    crate::fallback::note("CSMTEST", "coarse_shading_test");
     for pred in [t.insn.pred_dst0(), t.insn.pred_dst1()] {
         t.ir.set_pred(pred, Value::U1(false));
     }
@@ -904,6 +934,13 @@ mod tests {
 
     fn s2r(sr: u128) -> String {
         run(Compute, fixed(Opcode::S2r, dst(1) | (sr << 72)))
+    }
+
+    #[test]
+    fn unknown_special_register_is_counted() {
+        let _census = crate::fallback::test_census();
+        s2r(200);
+        assert!(crate::fallback::sites("S2R", "unknown_sr", Some(200)) >= 1);
     }
 
     #[test]

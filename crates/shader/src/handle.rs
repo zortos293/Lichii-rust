@@ -136,7 +136,10 @@ impl HandleProgram {
     pub(crate) fn with_storage_bindings(&self, bindings: &[u32]) -> HandleProgram {
         let remap = |op| match op {
             HandleOp::Storage { binding } => HandleOp::Storage {
-                binding: bindings.get(binding as usize).copied().unwrap_or(binding),
+                binding: bindings.get(binding as usize).copied().unwrap_or_else(|| {
+                    crate::fallback::note("handle_program", "storage_binding_remap_past_end");
+                    binding
+                }),
             },
             op => op,
         };

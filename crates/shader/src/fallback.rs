@@ -124,12 +124,37 @@ fn record(opcode: &'static str, variant: &'static str, value: Option<u32>) {
     REVISION.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Serializes the tests that switch the census on or off, which is process-global, and
+/// switches it on.
+#[cfg(test)]
+pub(crate) fn test_census() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let guard = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    set_enabled(true);
+    guard
+}
+
+/// How many sites hit `opcode` in mode `variant` (for `value`) since the census was turned on.
+#[cfg(test)]
+pub(crate) fn sites(opcode: &str, variant: &str, value: Option<u32>) -> u64 {
+    census()
+        .into_iter()
+        .find(|c| {
+            c.fallback.opcode == opcode
+                && c.fallback.variant == variant
+                && c.fallback.value == value
+        })
+        .map_or(0, |c| c.sites)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn counts_sites_and_programs_once_enabled() {
+        let _guard = test_census();
+        set_enabled(false);
         let count = |opcode| {
             census()
                 .into_iter()
