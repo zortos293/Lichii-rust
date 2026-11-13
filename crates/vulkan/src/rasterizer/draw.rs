@@ -563,12 +563,16 @@ impl VulkanRasterizer {
             false => mvk::primitive_topology(assembled_topology(call.topology()))
                 .unwrap_or(vk::PrimitiveTopology::TRIANGLE_LIST),
         };
+        let diag_t0 = std::time::Instant::now();
         if !self.graphics_stages(ctx, host_topology) {
+            diag_slow("stages(skip)", diag_t0, 0);
             return Ok(());
         }
+        let diag_t1 = std::time::Instant::now();
         if !self.render_targets(ctx)? {
             return Ok(());
         }
+        let diag_t2 = std::time::Instant::now();
 
         let draw = &mut self.draw;
         let fixed = *draw
@@ -585,9 +589,12 @@ impl VulkanRasterizer {
             samples,
         );
         let key = GraphicsPipelineKey::new(&draw.stages, attachments, &fixed);
+        let diag_t3 = std::time::Instant::now();
         let Some(pipeline) = draw.pipelines.graphics(&key, &draw.stages) else {
+            diag_slow("pipeline(skip)", diag_t3, 0);
             return Ok(());
         };
+        let diag_t4 = std::time::Instant::now();
         let pipeline_raw = pipeline.raw();
         let layout = pipeline.layout();
         let layout_raw = layout.raw();
@@ -677,7 +684,11 @@ impl VulkanRasterizer {
         if index.is_some_and(|i: IndexBinding| i.index_count == 0) {
             return Ok(());
         }
+        let diag_t5 = std::time::Instant::now();
         let set = self.descriptor_set(set_layout)?;
+        if diag_t0.elapsed() > std::time::Duration::from_millis(100) {
+            tracing::warn!(target: "diag", "DIAG slow draw total={:?} stages={:?} targets={:?} fixed={:?} pipeline={:?} resources={:?}", diag_t0.elapsed(), diag_t1 - diag_t0, diag_t2 - diag_t1, diag_t3 - diag_t2, diag_t4 - diag_t3, diag_t5 - diag_t4);
+        }
 
         let task = self.draw.stages[0]
             .as_ref()
@@ -964,12 +975,18 @@ impl VulkanRasterizer {
                 color_outputs,
                 &features,
             );
+            let diag_t = std::time::Instant::now();
             let module = self.draw.shaders.module(
                 vertex_a.as_ref(),
                 &env,
                 state.key(),
                 || state.runtime(previous.as_deref().map(|m| &m.info)),
                 &mut bindings,
+            );
+            diag_slow(
+                "module",
+                diag_t,
+                (slot as u64) << 56 | lichii_shader::ShaderEnvironment::start_address(&env),
             );
             let Some(module) = module else {
                 return false;
@@ -2429,3 +2446,10 @@ mod texture;
 
 #[cfg(test)]
 mod tests;
+
+fn diag_slow(what: &str, t: std::time::Instant, info: u64) {
+    let e = t.elapsed();
+    if e > std::time::Duration::from_millis(50) {
+        tracing::warn!(target: "diag", "DIAG slow {what} {e:?} info={info:#x}");
+    }
+}
