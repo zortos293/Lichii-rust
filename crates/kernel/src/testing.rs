@@ -550,6 +550,9 @@ pub struct JitCore {
 }
 
 impl JitCore {
+    /// A JIT core over `process`'s address space, sharing `kernel`'s exclusive monitor, clock and
+    /// CPU accuracy. It takes core 0's invalidations, so use it only on a kernel whose cores never
+    /// run, such as [`kernel`].
     pub fn new(kernel: &Kernel, process: &Arc<Process>) -> Self {
         let cpu = lichii_cpu::new_core(
             CpuBackend::Jit,
