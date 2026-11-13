@@ -1461,12 +1461,71 @@ fn prmt_with_an_immediate_selector() {
     assert_eq!(translate(&[inst]).unwrap(), expected);
 }
 
+/// PRMT modes from the PTX `prmt` tables: each entry lists the source bytes of d.b3..d.b0 for
+/// the selector's low two bits.
+fn prmt_mode_reference(mode: u128, x: u32, selector: u32, z: u32) -> u32 {
+    const TABLE: [[[u32; 4]; 4]; 6] = [
+        [[3, 2, 1, 0], [4, 3, 2, 1], [5, 4, 3, 2], [6, 5, 4, 3]],
+        [[5, 6, 7, 0], [6, 7, 0, 1], [7, 0, 1, 2], [0, 1, 2, 3]],
+        [[0, 0, 0, 0], [1, 1, 1, 1], [2, 2, 2, 2], [3, 3, 3, 3]],
+        [[3, 2, 1, 0], [3, 2, 1, 1], [3, 2, 2, 2], [3, 3, 3, 3]],
+        [[0, 0, 0, 0], [1, 1, 1, 0], [2, 2, 1, 0], [3, 2, 1, 0]],
+        [[1, 0, 1, 0], [3, 2, 3, 2], [1, 0, 1, 0], [3, 2, 3, 2]],
+    ];
+    let bytes = u64::from(z) << 32 | u64::from(x);
+    let row = TABLE[mode as usize - 1][(selector & 3) as usize];
+    (0..4).fold(0, |acc, byte| {
+        let index = row[3 - byte];
+        acc | (((bytes >> (index * 8)) & 0xff) as u32) << (byte * 8)
+    })
+}
+
 #[test]
-fn prmt_modes_are_unsupported() {
+fn prmt_modes_match_the_reference() {
+    let mut values = Values::new();
+    for mode in 1..=6u128 {
+        for case in 0..32 {
+            let (x, selector, z) = (values.next(), values.next(), values.next());
+            let (form, operand) = if case % 2 == 0 {
+                (Form::ImmReg, u128::from(selector))
+            } else {
+                (Form::RegReg, 2)
+            };
+            let inst = encode(
+                Opcode::Prmt,
+                form,
+                dst(0) | a(1) | b(operand) | c(3) | (mode << 72),
+            );
+            let state = exec(inst, &[(r(1), x), (r(2), selector), (r(3), z)]);
+            assert_eq!(
+                state.reg(r(0)),
+                prmt_mode_reference(mode, x, selector, z),
+                "mode {mode} {x:x} {selector:x} {z:x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn prmt_modes_compile_to_valid_spirv() {
+    let code: Vec<Instruction> = (1..=6u128)
+        .map(|mode| {
+            encode(
+                Opcode::Prmt,
+                Form::RegReg,
+                dst(mode - 1) | a(6) | b(7) | c(8) | (mode << 72),
+            )
+        })
+        .collect();
+    compile_fragment_and_validate("ampere-prmt-modes", &code);
+}
+
+#[test]
+fn prmt_reserved_mode_is_unsupported() {
     let inst = encode(
         Opcode::Prmt,
         Form::ImmReg,
-        dst(0) | a(1) | b(0) | c(2) | (1 << 72),
+        dst(0) | a(1) | b(0) | c(2) | (7 << 72),
     );
     assert!(is_unsupported(translate(&[inst])));
 }
