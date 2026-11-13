@@ -149,6 +149,26 @@ impl TextureInstInfo {
     /// Raw flag bit marking a byte-addressed image store (SUST.BA). It is the `is_depth` bit,
     /// which image instructions never set, as in the C++.
     pub const IMAGE_BYTE_ADDRESS: u32 = 1 << 18;
+    /// Bit of a `Bound*` handle that names its constant buffer, as Ampere bound texture and
+    /// surface instructions do (see [`Self::bound_handle`]). A handle without it is a byte
+    /// offset into the bound texture buffer (`ShaderEnvironment::texture_bound_buffer`).
+    pub const BOUND_HANDLE_SLOT: u32 = 1 << 31;
+
+    /// The `Bound*` handle of the texture handle word at byte `offset` of constant buffer
+    /// `slot`: [`Self::BOUND_HANDLE_SLOT`], the slot in bits 16..21, the offset below.
+    pub const fn bound_handle(slot: u32, offset: u32) -> u32 {
+        Self::BOUND_HANDLE_SLOT | (slot & 0x1f) << 16 | offset & 0xffff
+    }
+
+    /// The constant buffer slot and byte offset a [`Self::bound_handle`] names, or `None` for a
+    /// plain offset into the bound texture buffer.
+    pub const fn bound_handle_slot(handle: u32) -> Option<(u32, u32)> {
+        if handle & Self::BOUND_HANDLE_SLOT == 0 {
+            None
+        } else {
+            Some(((handle >> 16) & 0x1f, handle & 0xffff))
+        }
+    }
 
     pub const fn to_flags(self) -> u32 {
         (self.descriptor_index as u32 & 0x3fff)
