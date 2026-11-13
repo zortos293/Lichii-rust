@@ -75,6 +75,23 @@ fn push_session_on<S: Service>(
     }
 }
 
+/// 1402: a session to `nx2:nvsrv`, which speaks the nvdrv protocol, initialized for the title's
+/// process. It runs on the nvdrv thread with the other nvdrv sessions.
+fn open_nvsrv(context: &Arc<ServiceContext>, ctx: &mut HleRequestContext) -> ResultCode {
+    let Some(nvdrv) = context.nvdrv.get() else {
+        tracing::error!("nx2:gsv 1402: nvdrv is not registered");
+        return UNKNOWN;
+    };
+    match context.service_thread("nvdrv") {
+        Ok(thread) => {
+            let handler = nvdrv.nvsrv_session(context, context.process.clone());
+            ctx.push_copy_object(KObject::ClientSession(thread.session(handler)));
+            ResultCode::SUCCESS
+        }
+        Err(code) => code,
+    }
+}
+
 /// TIPC 0(u64 token) on the Switch 2 sessions: newer SDKs send it first and abort unless the
 /// reply echoes the token.
 fn handshake(ctx: &mut HleRequestContext) -> ResultCode {
@@ -145,6 +162,7 @@ impl Service for GraphicsSystem {
                 vi2::Vi2::new(context, self.objects.clone()),
             ),
             497 => push_session(context, ctx, gpu::GpuSession::new(context)),
+            1402 => open_nvsrv(context, ctx),
             111 | 112 | 114 | 423 | 426 | 428 | 429 | 430 | 435 | 1211 | 1291 | 1510 => {
                 native::handle(&self.objects, ctx)
             }

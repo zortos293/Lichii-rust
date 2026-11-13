@@ -1112,3 +1112,24 @@ fn vi2_shows_the_gpu_memory_a_native_image_was_bound_to() {
         "the 423 binding wins over whatever is mapped at the address now"
     );
 }
+
+#[test]
+fn gsv_hands_out_initialized_nvsrv_sessions() {
+    let (context, client, gsv) = gsv();
+    assert_eq!(
+        client.send(gsv, &Request::tipc(1402)).unwrap().result,
+        super::UNKNOWN,
+        "no nvsrv before nvdrv is registered"
+    );
+    crate::nvdrv::register(&context).unwrap();
+    let nvsrv = session(&client, gsv, 1402);
+    let mut name = b"/dev/nvhost-tsg-gpu".to_vec();
+    name.push(0);
+    let buffer = client.alloc(&name);
+    let request = Request::new(0).buffer_a(buffer, name.len() as u64);
+    let mut reply = client.send(nvsrv, &request).unwrap();
+    assert_eq!(reply.result, ResultCode::SUCCESS);
+    let (fd, error) = (reply.pop::<i32>(), reply.pop::<u32>());
+    assert!(fd > 0, "opened without Initialize");
+    assert_eq!(error, 0);
+}
