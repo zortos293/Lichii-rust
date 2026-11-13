@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use lichii_common::settings::CpuAccuracy;
 use lichii_memory::{AddressSpace, ExclusiveMonitor, MemoryPermission, PhysicalMemory};
 
 use super::{Jit, Passes};
@@ -252,6 +253,7 @@ impl Machine {
             core_index: 0,
             ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
             dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+            accuracy: CpuAccuracy::Auto,
         };
         let core: Box<dyn CpuCore> = match backend {
             Backend::Interpreter => Box::new(Interpreter::new(config)),
@@ -873,6 +875,7 @@ fn counter_reads_follow_the_tsc_scale() {
             core_index: 0,
             ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
             dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+            accuracy: CpuAccuracy::Auto,
         })
         .unwrap();
         assert!(jit.target.tsc_scale.is_some());
@@ -890,5 +893,27 @@ fn counter_reads_follow_the_tsc_scale() {
             &ctx.x[..2]
         );
         assert!(ctx.x[1].wrapping_sub(ctx.x[0]) <= after.wrapping_sub(before));
+    }
+}
+
+#[test]
+fn paranoid_accuracy_builds_no_jit() {
+    let physical = Arc::new(PhysicalMemory::new(1 << 20).unwrap());
+    let config = |accuracy| CpuConfig {
+        memory: Arc::new(AddressSpace::with_fastmem(physical.clone(), 39).unwrap()),
+        monitor: Arc::new(ExclusiveMonitor::new(1)),
+        clock: Arc::new(Clock::default()),
+        core_index: 0,
+        ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
+        dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+        accuracy,
+    };
+    assert!(Jit::new(config(CpuAccuracy::Paranoid)).is_none());
+    for accuracy in [
+        CpuAccuracy::Auto,
+        CpuAccuracy::Accurate,
+        CpuAccuracy::Unsafe,
+    ] {
+        assert!(Jit::new(config(accuracy)).is_some());
     }
 }
