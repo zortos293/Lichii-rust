@@ -268,8 +268,8 @@ const INSTALL_CHUNK: u64 = 4 << 20;
 /// newer one stays. Every file is written to a `.tmp` beside its destination and renamed into
 /// place, so an interrupted install never leaves a partial NCA or ticket that indexing would pick
 /// up, and a title's Meta NCA goes in after its contents, so a failed install keeps the version
-/// that was there. A package whose file names are not plain names (a path, `..`) installs
-/// nothing. `progress` gets the bytes written after each chunk.
+/// that was there. Delta fragments are not copied. A package that lacks a content its CNMT lists,
+/// or whose file names are not plain names (a path, `..`), installs nothing. `progress` gets the bytes written after each chunk.
 pub fn install_registered(
     package: &PartitionFs,
     index: &ContentIndex,
@@ -305,6 +305,22 @@ pub fn install_registered(
             None => InstallOutcome::New,
         };
         if !matches!(outcome, InstallOutcome::KeptNewer { .. }) {
+            if let Some(missing) = title.cnmt.contents.iter().find(|record| {
+                record.content_type != ContentType::DeltaFragment
+                    && !title
+                        .contents
+                        .iter()
+                        .any(|c| c.record.content_id == record.content_id)
+            }) {
+                return Err(corrupt(
+                    "NSP",
+                    format!(
+                        "{:016x} lists {} but the package lacks it",
+                        title.title_id(),
+                        missing.content_id.file_name()
+                    ),
+                ));
+            }
             copies.extend(index.file_names(title));
             if let Some(old) = old {
                 stale.extend(existing.file_names(old));
@@ -323,10 +339,17 @@ pub fn install_registered(
     if let Some(name) = copies.iter().find(|name| !is_plain_file_name(name)) {
         return Err(corrupt("NSP", format!("{name:?} is not a plain file name")));
     }
-    for name in &copies {
-        if let Some(file) = package.file(name) {
-            write_atomically(&registered.join(name), &file, &mut progress)?;
-        }
+    let files = copies
+        .iter()
+        .map(|name| {
+            package
+                .file(name)
+                .map(|file| (name, file))
+                .ok_or_else(|| corrupt("NSP", format!("{name} is listed but not in the package")))
+        })
+        .collect::<FsResult<Vec<_>>>()?;
+    for (name, file) in files {
+        write_atomically(&registered.join(name), &file, &mut progress)?;
     }
     for name in stale.iter().filter(|name| !copies.contains(name)) {
         let path = registered.join(name);
@@ -340,7 +363,7 @@ pub fn install_registered(
 }
 
 impl ContentIndex {
-    /// The file names of the NCAs `title`'s CNMT lists, then of its Meta NCA.
+    /// The file names of the NCAs `title`'s CNMT lists that are present, then of its Meta NCA.
     fn file_names(&self, title: &Title) -> Vec<String> {
         let meta = self.ncas.iter().find(|(_, nca)| {
             let header = nca.header();
@@ -823,6 +846,47 @@ pub(crate) mod tests {
 
         std::fs::remove_dir(&blocked).unwrap();
         install(&new, &registered);
+        let dir = HostDir::open(&registered).unwrap();
+        let index = ContentIndex::from_registered(dir.as_ref(), &mut key_set()).unwrap();
+        assert_eq!(index.patch_for(APP).unwrap().version(), 0x10000);
+    }
+
+    #[test]
+    fn a_title_missing_a_listed_content_installs_nothing_and_delta_fragments_are_skipped() {
+        let temp = TempDir::new("missing");
+        let registered = temp.0.join("registered");
+        let program = NcaSpec::new(PROGRAM, APP, vec![pfs_section(&exefs())]).build();
+        let patch = cnmt(
+            APP | 0x800,
+            0x10000,
+            ExtendedHeader::Patch {
+                application_id: APP,
+                required_system_version: 0,
+            },
+            vec![
+                record(ContentType::Program, 0xe1, &program),
+                record(ContentType::DeltaFragment, 0xe9, b"delta"),
+            ],
+        );
+        let mut keys = key_set();
+        let missing = open_package(&[meta_nca(&patch, 0xe0)], &mut keys);
+        let result = install_registered(
+            missing.partition(),
+            missing.index(),
+            &registered,
+            &mut keys,
+            |_| {},
+        );
+        assert!(result.is_err());
+        assert!(walk(&temp.0).is_empty());
+
+        let complete = open_package(
+            &[content_file(0xe1, program), meta_nca(&patch, 0xe0)],
+            &mut keys,
+        );
+        install(&complete, &registered);
+        assert!(registered.join(ContentId([0xe1; 16]).file_name()).exists());
+        assert!(!registered.join(ContentId([0xe9; 16]).file_name()).exists());
         let dir = HostDir::open(&registered).unwrap();
         let index = ContentIndex::from_registered(dir.as_ref(), &mut key_set()).unwrap();
         assert_eq!(index.patch_for(APP).unwrap().version(), 0x10000);
