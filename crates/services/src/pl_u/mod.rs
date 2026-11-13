@@ -6,8 +6,8 @@
 //! The standard font Switch 2 titles get also has the controller button icons of the extension
 //! font, where Switch 2 titles look for them.
 //!
-//! Fonts load on first use. Without fonts every font reads as empty, but the shared memory still
-//! exists, so titles that only map it keep going.
+//! Fonts load on first use. Without any font on the host, every type gets the open-source stand-in
+//! the reference serves (`fonts::STAND_INS`).
 
 mod font_merge;
 mod fonts;
@@ -67,7 +67,7 @@ struct LoadedFonts {
 impl LoadedFonts {
     fn load(context: &ServiceContext) -> HleResult<Self> {
         let memory = new_shared_memory(context, SHARED_FONT_MEMORY_SIZE)?;
-        let (data, searched) = fonts::find(&context.settings);
+        let data = fonts::find(&context.settings);
         let mut regions = [FontRegion::default(); FONT_COUNT];
         let mut offset = 0u64;
         for (region, font) in regions.iter_mut().zip(&data) {
@@ -84,12 +84,6 @@ impl LoadedFonts {
                 size: font.len() as u32,
             };
             offset = end;
-        }
-        if regions.iter().all(|region| region.size == 0) {
-            tracing::warn!(
-                ?searched,
-                "no shared fonts found: pl:u serves empty font memory"
-            );
         }
         let builtin_standard = match (&data[STANDARD_FONT], &data[EXTENSION_FONT]) {
             (Some(standard), Some(extension))
