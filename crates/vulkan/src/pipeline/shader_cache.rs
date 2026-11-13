@@ -26,6 +26,7 @@ use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use lichii_common::settings::ResolutionScale;
 use lichii_common::{DAddr, GpuVAddr};
@@ -76,6 +77,9 @@ struct ModuleKey {
     state: u64,
 }
 
+/// The shortest time between two INFO lines of [`ShaderCacheStats`].
+const STATS_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Variants kept per key; the oldest goes first.
 const MAX_VARIANTS: usize = 32;
 
@@ -100,6 +104,8 @@ pub struct ShaderCache {
     disk: Option<ShaderDisk>,
     bytes: Vec<u8>,
     stats: ShaderCacheStats,
+    /// The counts the last INFO line showed, and when it was written.
+    logged: (ShaderCacheStats, Option<Instant>),
 }
 
 impl ShaderCache {
@@ -115,6 +121,7 @@ impl ShaderCache {
             disk: None,
             bytes: Vec::new(),
             stats: ShaderCacheStats::default(),
+            logged: (ShaderCacheStats::default(), None),
         }
     }
 
@@ -124,6 +131,24 @@ impl ShaderCache {
 
     pub fn stats(&self) -> ShaderCacheStats {
         self.stats
+    }
+
+    /// Writes the counts as an INFO line when they changed since the last one and at least
+    /// [`STATS_INTERVAL`] has passed; returns whether it did.
+    pub fn log_stats(&mut self, now: Instant) -> bool {
+        let (logged, at) = self.logged;
+        if self.stats == logged || at.is_some_and(|at| now.duration_since(at) < STATS_INTERVAL) {
+            return false;
+        }
+        let ShaderCacheStats {
+            translated,
+            failed,
+            hits,
+            disk_hits,
+        } = self.stats;
+        tracing::info!(translated, failed, hits, disk_hits, "shader cache");
+        self.logged = (self.stats, Some(now));
+        true
     }
 
     /// Keeps translated programs in the per-title file at `path` from now on: programs it
@@ -285,6 +310,7 @@ impl ShaderCache {
             bindings: *bindings,
             module: module.clone(),
         });
+        self.log_stats(Instant::now());
         module
     }
 
@@ -365,5 +391,26 @@ fn warn_failed(env: &ProgramEnv<'_>, error: &TranslateError) {
             tracing::warn!(?stage, address, "skipping draws of a program: {error}");
         }
         _ => tracing::error!(?stage, address, "translating a program failed: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counts_are_logged_when_they_change_at_most_every_five_seconds() {
+        let mut cache = ShaderCache::new(Profile::default(), HostTranslateInfo::default());
+        let start = Instant::now();
+        assert!(!cache.log_stats(start), "nothing to log yet");
+        cache.stats.translated = 1;
+        assert!(cache.log_stats(start));
+        cache.stats.hits = 1;
+        assert!(!cache.log_stats(start + Duration::from_secs(4)));
+        assert!(cache.log_stats(start + STATS_INTERVAL));
+        assert!(
+            !cache.log_stats(start + Duration::from_secs(60)),
+            "nothing changed since"
+        );
     }
 }

@@ -564,3 +564,76 @@ fn software_tensor_mul_add() {
     );
     assert!(matches!(error, EmitError::Unsupported(_)), "{error}");
 }
+
+/// A fragment program after a native mesh program reads two of its per-primitive generics (one
+/// float, one integer) and one per-vertex generic: the per-primitive inputs are decorated
+/// PerPrimitiveEXT, the integer one also Flat, as the reference does.
+#[test]
+fn fragment_inputs_a_mesh_program_writes_per_primitive() {
+    use crate::runtime::AttributeType;
+
+    let mut s = Synthetic::new();
+    let b = s.block();
+    s.inst(b, Prologue, &[]);
+    for index in 0..3u16 {
+        let value = s.inst(
+            b,
+            GetAttribute,
+            &[
+                Value::Attribute(Attribute::generic(index, 0)),
+                Value::U32(0),
+            ],
+        );
+        s.inst(
+            b,
+            SetFragColor,
+            &[Value::U32(0), Value::U32(u32::from(index)), value],
+        );
+    }
+    s.inst(b, Epilogue, &[]);
+    let attributes: Vec<Attribute> = (0..3).map(|i| Attribute::generic(i, 0)).collect();
+    let info = ShaderInfo {
+        loads: super::varying(&attributes),
+        stores_frag_color: [true, false, false, false, false, false, false, false],
+        ..ShaderInfo::default()
+    };
+    let program = s.finish(
+        vec![SyntaxNode::Block(b), SyntaxNode::Return],
+        ShaderStage::Fragment,
+        info,
+    );
+    let mut runtime = RuntimeInfo {
+        previous_stage_stores: super::varying(&attributes),
+        per_primitive_generics: 0b011,
+        ..RuntimeInfo::default()
+    };
+    runtime.generic_input_types[1] = AttributeType::SignedInt;
+    let module = emit(
+        "per_primitive_fragment_inputs",
+        &mesh_profile(),
+        &runtime,
+        &program,
+    );
+    assert_eq!(per_primitive_decorations(&module), 2);
+    assert!(
+        module
+            .capabilities
+            .iter()
+            .any(|c| c.operands[0] == dr::Operand::Capability(Capability::MeshShadingEXT))
+    );
+    let flat = module
+        .annotations
+        .iter()
+        .filter(|a| a.operands.get(1) == Some(&dr::Operand::Decoration(Decoration::Flat)))
+        .count();
+    assert_eq!(flat, 1);
+
+    let old = Profile {
+        supported_spirv: 0x0001_0300,
+        ..mesh_profile()
+    };
+    assert!(matches!(
+        emit_error(&old, &runtime, &program),
+        EmitError::Unsupported(_)
+    ));
+}
