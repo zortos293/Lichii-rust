@@ -284,6 +284,24 @@ const WORKLOADS: &[Workload] = &[
         per_iteration: 9,
     },
     Workload {
+        name: "half convert loop",
+        code: &[
+            0x7d400020, // 1: ldr h0, [x1]
+            0x1ee24001, // fcvt s1, h0
+            0x1ee2c002, // fcvt d2, h0
+            0x1e20c023, // fabs s3, s1
+            0x1e614044, // fneg d4, d2
+            0x7d400425, // ldr h5, [x1, #2]
+            0x1ee240a6, // fcvt s6, h5
+            0x1e2600c7, // fmov w7, s6
+            0xf10004a5, // subs x5, x5, #1
+            0x54fffee1, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 10,
+    },
+    Workload {
         name: "popcount loop",
         code: &[
             0x4c407020, // 1: ld1 {v0.16b}, [x1]
