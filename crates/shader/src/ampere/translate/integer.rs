@@ -875,14 +875,18 @@ fn brev(t: &mut Translator<'_>) -> TResult {
 }
 
 /// LEA: `(a << s) + b` with `s` at 75..80, or with .HI (80) the high word of `c:a << s`, where
-/// .SX32 (73) makes `c` the sign of `a`. Bit 72 negates the shifted value; LEA.X (74) adds the
-/// carry predicate at 87 and inverts instead. The carry out goes to the predicate at 81.
+/// .SX32 (73) makes `c` the sign of `a`. The low word never sees the sign, so .SX32 changes
+/// nothing without .HI. Bit 72 negates the shifted value; LEA.X (74) adds the carry predicate at
+/// 87 and inverts instead. The carry out goes to the predicate at 81.
 fn lea(t: &mut Translator<'_>) -> TResult {
     let insn = t.insn;
     let (extended, high, sign_extend) = (insn.bit(74), insn.bit(80), insn.bit(73));
     let shift = insn.bits(75, 5) as u32;
-    let sign_extends_zero_c = high && reg_c(t).is_some_and(Reg::is_zero);
-    if slot32_abs(t) || (c_in_slot32(t) && slot32_neg(t)) || (sign_extend && !sign_extends_zero_c) {
+    let sign_extends_zero_c = reg_c(t).is_some_and(Reg::is_zero);
+    if slot32_abs(t)
+        || (c_in_slot32(t) && slot32_neg(t))
+        || (high && sign_extend && !sign_extends_zero_c)
+    {
         return Err(t.unsupported());
     }
     let negate_b = !c_in_slot32(t) && slot32_neg(t);
