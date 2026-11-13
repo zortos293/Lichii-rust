@@ -1505,6 +1505,8 @@ dependencies = [
  "egui-winit",
  "lichii-common",
  "lichii-core",
+ "lichii-crypto",
+ "lichii-fs",
  "lichii-input",
  "lichii-loader",
  "lichii-texture",
