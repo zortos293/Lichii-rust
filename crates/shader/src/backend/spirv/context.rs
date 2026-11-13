@@ -249,6 +249,8 @@ pub(crate) struct EmitContext<'a> {
     null_constants: FxHashMap<Word, Word>,
     pointer_types: FxHashMap<(u32, Word), Word>,
     array_types: FxHashMap<(Word, u32), Word>,
+    f16_constants: FxHashMap<u16, Word>,
+    iadd_carry_type: Word,
     capabilities: FxHashSet<u32>,
     extensions: FxHashSet<&'static str>,
 
@@ -533,6 +535,8 @@ impl<'a> EmitContext<'a> {
             null_constants: FxHashMap::default(),
             pointer_types: FxHashMap::default(),
             array_types: FxHashMap::default(),
+            f16_constants: FxHashMap::default(),
+            iadd_carry_type: 0,
             capabilities: FxHashSet::default(),
             extensions: FxHashSet::default(),
             glsl,
@@ -851,6 +855,16 @@ impl<'a> EmitContext<'a> {
         id
     }
 
+    /// An f16 constant from its bit pattern, cached.
+    pub fn const_f16(&mut self, bits: u16) -> Word {
+        if let Some(&id) = self.f16_constants.get(&bits) {
+            return id;
+        }
+        let id = self.b.constant_bit32(self.f16[1], u32::from(bits));
+        self.f16_constants.insert(bits, id);
+        id
+    }
+
     pub fn const_composite(&mut self, ty: Word, constituents: &[Word]) -> Word {
         let key = (ty, SmallVec::from_slice(constituents));
         if let Some(&id) = self.composite_constants.get(&key) {
@@ -943,6 +957,29 @@ impl<'a> EmitContext<'a> {
             Type::F64X4 => self.f64[4],
             ty => return Err(EmitError::InvalidIr(format!("no SPIR-V type for {ty}"))),
         })
+    }
+
+    /// The SPIR-V type of an IR type the program must have declared. The 8-, 16- and 64-bit
+    /// types exist only when the shader info records their use (and the host supports the
+    /// integer widths), so an instruction that slipped past the info or the lowering passes
+    /// fails here instead of producing an invalid module.
+    pub fn declared_type(&self, ty: Type) -> EmitResult<Word> {
+        match self.type_id(ty)? {
+            0 => Err(EmitError::InvalidIr(format!(
+                "{ty} used but not declared; the shader info or a lowering pass missed it"
+            ))),
+            id => Ok(id),
+        }
+    }
+
+    /// The `{u32, u32}` result type of OpIAddCarry. It gets its own id so it never aliases a
+    /// decorated block struct of the same shape.
+    pub fn iadd_carry_type(&mut self) -> Word {
+        if self.iadd_carry_type == 0 {
+            let id = self.b.id();
+            self.iadd_carry_type = self.b.type_struct_id(Some(id), [self.u32[1], self.u32[1]]);
+        }
+        self.iadd_carry_type
     }
 
     /// A GLSL.std.450 instruction.
