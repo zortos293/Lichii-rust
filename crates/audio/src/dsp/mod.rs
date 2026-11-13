@@ -7,7 +7,7 @@
 //! are read with the layouts in [`abi`].
 
 pub mod abi;
-mod aux;
+mod aux_buffer;
 mod biquad;
 mod command;
 mod compressor;

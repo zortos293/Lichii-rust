@@ -9,7 +9,8 @@ use super::memory::DspMemory;
 use super::sink::DeviceSinkFrame;
 use super::state::DspState;
 use super::{
-    MAX_CHANNELS, aux, biquad, compressor, delay, i3dl2, limiter, mix, reverb, sink, upsample,
+    MAX_CHANNELS, aux_buffer, biquad, compressor, delay, i3dl2, limiter, mix, reverb, sink,
+    upsample,
 };
 
 /// The time source performance commands and per-command timings read, in microseconds.
@@ -233,7 +234,7 @@ impl CommandListProcessor {
                 Command::Delay(c) => delay::delay(c, &mut frame, state),
                 Command::Upsample(c) => upsample::upsample(c, &frame, state),
                 Command::DownMix6chTo2ch(c) => mix::downmix_6ch_to_2ch(c, &mut frame),
-                Command::Aux(c) => aux::aux(c, &mut frame, memory),
+                Command::Aux(c) => aux_buffer::aux(c, &mut frame, memory),
                 Command::DeviceSink(c) => {
                     report.device_sink = Some(sink::device_sink(c, &frame, state, device_output));
                 }
@@ -252,7 +253,7 @@ impl CommandListProcessor {
                 Command::MultiTapBiquadFilter(c) => {
                     biquad::multi_tap_biquad_filter(c, &mut frame, state)
                 }
-                Command::Capture(c) => aux::capture(c, &frame, memory),
+                Command::Capture(c) => aux_buffer::capture(c, &frame, memory),
                 Command::Compressor(c) => compressor::compressor(c, &mut frame, state),
             }
             *time = clock.now_us().saturating_sub(command_start) as u32;
