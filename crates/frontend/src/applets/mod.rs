@@ -3,6 +3,7 @@
 //! dropped (the session stops), every question still waiting is answered as cancelled.
 
 mod controller;
+mod inline;
 mod keyboard;
 mod profile;
 #[cfg(test)]
@@ -14,10 +15,12 @@ use crossbeam_channel::{Receiver, Sender};
 use lichii_common::settings::ControlSettings;
 use lichii_services::applets::{
     AppletFrontend, ControllerAnswer, ControllerRequest, ErrorRequest, HeadlessApplets,
-    ProfileSelectAnswer, ProfileSelectRequest, SoftwareKeyboardAnswer, SoftwareKeyboardRequest,
+    InlineKeyboardEvent, InlineKeyboardReplies, ProfileSelectAnswer, ProfileSelectRequest,
+    SoftwareKeyboardAnswer, SoftwareKeyboardRequest,
 };
 
 use self::controller::ControllerDialog;
+use self::inline::{InlineKeyboard, InlineMsg, Reply};
 use self::keyboard::KeyboardDialog;
 use self::profile::ProfileDialog;
 
@@ -31,6 +34,7 @@ enum Request {
 /// the UI. Applets without a dialog yet answer like [`HeadlessApplets`].
 struct UiApplets {
     requests: Sender<Request>,
+    inline: Sender<InlineMsg>,
     wake: Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -62,6 +66,14 @@ impl AppletFrontend for UiApplets {
         self.ask(|reply| Request::Keyboard(request.clone(), reply))
             .unwrap_or(SoftwareKeyboardAnswer::Cancelled)
     }
+
+    fn inline_keyboard(&self, event: InlineKeyboardEvent, replies: &InlineKeyboardReplies) {
+        let replies = replies.clone();
+        let reply: Reply = Box::new(move |reply| replies.send(reply));
+        if self.inline.send(InlineMsg::new(event, reply)).is_ok() {
+            (self.wake)();
+        }
+    }
 }
 
 /// Controls the controller applet changed. The title gets its answer once input applied them,
@@ -83,6 +95,10 @@ enum Dialog {
 pub struct AppletDialogs {
     sender: Sender<Request>,
     requests: Receiver<Request>,
+    inline_sender: Sender<InlineMsg>,
+    inline_msgs: Receiver<InlineMsg>,
+    /// The inline keyboard while the title shows it; it draws under any applet dialog.
+    inline: Option<InlineKeyboard>,
     wake: Arc<dyn Fn() + Send + Sync>,
     /// The nickname of the user acc signed in, which the profile selector offers.
     username: String,
@@ -94,9 +110,13 @@ impl AppletDialogs {
     /// opens an applet, so the UI redraws.
     pub fn new(username: impl Into<String>, wake: impl Fn() + Send + Sync + 'static) -> Self {
         let (sender, requests) = crossbeam_channel::unbounded();
+        let (inline_sender, inline_msgs) = crossbeam_channel::unbounded();
         Self {
             sender,
             requests,
+            inline_sender,
+            inline_msgs,
+            inline: None,
             wake: Arc::new(wake),
             username: username.into(),
             open: None,
@@ -107,8 +127,18 @@ impl AppletDialogs {
     pub fn frontend(&self) -> Arc<dyn AppletFrontend> {
         Arc::new(UiApplets {
             requests: self.sender.clone(),
+            inline: self.inline_sender.clone(),
             wake: self.wake.clone(),
         })
+    }
+
+    /// What [`AppletFrontend::inline_keyboard`] passes on, with `reply` in place of the
+    /// title's replies, which only am can make.
+    #[cfg(test)]
+    fn inline(&self, event: InlineKeyboardEvent, reply: Reply) {
+        self.inline_sender
+            .send(InlineMsg::new(event, reply))
+            .unwrap();
     }
 
     /// Whether an applet dialog is waiting for the user.
@@ -123,6 +153,26 @@ impl AppletDialogs {
         ctx: &egui::Context,
         controls: &ControlSettings,
     ) -> Option<ControlsChange> {
+        for msg in self.inline_msgs.try_iter() {
+            match msg {
+                InlineMsg::Appear(appear, reply) => {
+                    self.inline = Some(InlineKeyboard::new(appear, reply));
+                }
+                InlineMsg::Text { text, cursor } => {
+                    if let Some(keyboard) = &mut self.inline {
+                        keyboard.set_text(text, cursor);
+                    }
+                }
+                InlineMsg::Hide => self.inline = None,
+            }
+        }
+        if self.open.is_none()
+            && self.requests.is_empty()
+            && let Some(keyboard) = &mut self.inline
+            && keyboard.show(ctx)
+        {
+            self.inline = None;
+        }
         if self.open.is_none() {
             self.open = self.requests.try_recv().ok().map(|request| match request {
                 Request::Keyboard(request, reply) => {
