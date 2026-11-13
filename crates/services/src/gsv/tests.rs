@@ -550,6 +550,42 @@ fn gpu_only_regions_take_system_memory_not_the_applications() {
     assert_eq!(manager.free_size(Pool::SystemNonSecure), system - 0x20_0000);
 }
 
+#[test]
+fn gpu_only_regions_too_big_for_the_pool_read_zero_like_sparse_regions() {
+    let (context, client, gsv) = gsv();
+    let gpu = session(&client, gsv, 497);
+    let gmmu = context
+        .gpu
+        .create_address_space(lichii_gpu::gmmu::BigPageSize::Size64K);
+    let process = client.process().clone();
+    let manager = process.page_table().memory_manager().clone();
+    let system = manager.free_size(Pool::SystemNonSecure);
+    let region = 0x84_3023_0000u64;
+    let size = (system + 0x100_0000).next_multiple_of(0x1_0000);
+    client
+        .send(
+            gpu,
+            &range_words(214, region, region + size - 1, &[0, 0, 0, 0, 3]),
+        )
+        .unwrap();
+    context.gpu.synchronize();
+    let reply = client.send(gpu, &Request::tipc(12).arg(3u32)).unwrap();
+    assert!(event(&client, reply.copy_handles[0]).is_signaled());
+    assert_eq!(gmmu.read::<u32>(region).unwrap(), 0);
+    assert_eq!(gmmu.read::<u32>(region + size - 4).unwrap(), 0);
+    assert_eq!(manager.free_size(Pool::SystemNonSecure), system);
+
+    let mut destroy = vec![0];
+    destroy.extend(split(region));
+    destroy.extend(split(region + size - 1));
+    destroy.extend([0, 5]);
+    client
+        .send(gpu, &words(Request::tipc(215), &destroy))
+        .unwrap();
+    context.gpu.synchronize();
+    assert!(gmmu.read::<u32>(region).is_err());
+}
+
 fn sparse_request(va: u64, size: u64, handle: u32, offset: u64, kind: u8) -> Vec<u8> {
     let mut request = Vec::new();
     request.extend(va.to_le_bytes());

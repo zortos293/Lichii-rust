@@ -14,8 +14,10 @@
 //! (NX2_NOTES row 57): the server backs it with memory of its own, from the non-secure system pool
 //! like the reference's graphics server memory, so the application pool the title sizes its heap
 //! from stays whole. The memory sits in the alias code region, made GPU accessible and mapped at
-//! the region. Tiles mapped into it and unmapped again show that
-//! memory again.
+//! the region. Tiles mapped into it and unmapped again show that memory again. A region the pool
+//! cannot back whole (Mario Kart World asks for 9 GiB of them, one of 5.7 GiB) is made a sparse
+//! region instead, as the reference keeps such regions without memory up front: it reads zero, and
+//! the host GPU still renders into the images placed there.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Weak, mpsc};
@@ -196,7 +198,8 @@ impl GpuSession {
     }
 
     /// 214 without the sparse flag: backs [`start`, +`size`) with server memory. The memory is
-    /// new, so it is made GPU accessible at once; the region is mapped in order.
+    /// new, so it is made GPU accessible at once; the region is mapped in order. Without memory
+    /// for all of it, the region becomes a sparse region.
     fn create_gpu_only(&self, start: GpuVAddr, size: u64, slot: u32) {
         let page_table = self.context.process.page_table();
         let region = page_table.regions().alias_code;
@@ -209,10 +212,12 @@ impl GpuSession {
         ) {
             Ok(cpu_va) => cpu_va,
             Err(code) => {
-                tracing::error!(
-                    "nx2:gpu 214: no memory for GPU-only region {start:#x}+{size:#x}: {code:?}"
+                tracing::warn!(
+                    "nx2:gpu 214: no memory for GPU-only region {start:#x}+{size:#x} ({code:?});                      it reads zero like a sparse region"
                 );
-                self.slot(slot).signal();
+                self.in_order(slot, false, move |memory, _, done| {
+                    done.unmapped = logged("214", memory.create_sparse_region(start, size));
+                });
                 return;
             }
         };
