@@ -1119,3 +1119,176 @@ fn collector_work_per_frame_is_bounded() {
     assert_eq!(f.cache.len(), 0);
     f.assert_no_validation_errors();
 }
+
+fn pitch_target(pitch: u32, height: u32) -> ImageInfo {
+    use lichii_gpu::engines::maxwell_3d::regs::{RenderTargetConfig, TileMode};
+    let mut rt: RenderTargetConfig = bytemuck::Zeroable::zeroed();
+    rt.address_low = 0x10_0000;
+    rt.width = pitch;
+    rt.height = height;
+    rt.format = 0xd5;
+    rt.tile_mode = TileMode(1 << 12);
+    ImageInfo::from_render_target(&rt, 0, GobLayout::Tegra).unwrap()
+}
+
+/// A pitch-linear 2D A8B8G8R8 texture header with identity swizzle.
+fn pitch_tic(gpu_va: GpuVAddr, width: u32, height: u32, pitch: u32) -> TicEntry {
+    let mut w = tic(0x08, gpu_va, width, height, 1, 1, 0).0;
+    w[2] = (gpu_va >> 32) as u32 | 2 << 21;
+    w[3] = pitch >> 5;
+    TicEntry(w)
+}
+
+fn all_texels(texels: &[u8], expected: [u8; 4]) -> bool {
+    texels.as_chunks::<4>().0.iter().all(|t| *t == expected)
+}
+
+#[test]
+fn pitch_overlaps_map_shared_texels_into_both_images() {
+    let wide = pitch_target(256, 8);
+    let narrow = ImageInfo { width: 60, ..wide };
+    assert_eq!(
+        pitch_overlap(&wide, DADDR, &narrow, DADDR),
+        Some(((0, 0), (0, 0), (60, 8)))
+    );
+    let below = ImageInfo { width: 16, ..wide };
+    assert_eq!(
+        pitch_overlap(&wide, DADDR, &below, DADDR + 2 * 256 + 8 * 4),
+        Some(((8, 2), (0, 0), (16, 6)))
+    );
+    assert_eq!(
+        pitch_overlap(&below, DADDR + 2 * 256 + 8 * 4, &wide, DADDR),
+        Some(((0, 0), (8, 2), (16, 6)))
+    );
+    assert_eq!(
+        pitch_overlap(&wide, DADDR, &below, DADDR + 60 * 4),
+        None,
+        "rows of the later image would wrap past the pitch"
+    );
+    assert_eq!(pitch_overlap(&wide, DADDR, &narrow, DADDR + 2), None);
+    let other_pitch = pitch_target(512, 8);
+    assert_eq!(pitch_overlap(&wide, DADDR, &other_pitch, DADDR), None);
+}
+
+#[test]
+fn narrower_pitch_textures_alias_their_render_target_without_a_flush() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let info = pitch_target(256, 8);
+    assert_eq!(info.width, 64);
+    let target = clear_rt(&mut f, &info, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    let header = pitch_tic(GPU_VA, 60, 8, 256);
+    let (texture, _) = f.texture(&header);
+    assert_ne!(texture, target.id);
+    assert!(
+        f.cache.state(target.id).is_some(),
+        "the render target stays"
+    );
+    assert_eq!(
+        f.cache.traffic().downloads,
+        0,
+        "no write-back to guest memory"
+    );
+    assert!(all_texels(&f.read_image(texture)[0], [255, 0, 0, 255]));
+
+    let again = clear_rt(&mut f, &info, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    assert_eq!(again.id, target.id);
+    assert_eq!(f.texture(&header).0, texture);
+    assert!(
+        all_texels(&f.read_image(texture)[0], [0, 255, 0, 255]),
+        "the texture takes the render target's newer texels"
+    );
+    assert_eq!(f.cache.traffic().downloads, 0);
+
+    clear_rt(&mut f, &info, [0.0, 0.0, 1.0, 1.0], Rect::ALL);
+    f.memory.write_bytes(DADDR + 62 * 4, &[7; 4]).unwrap();
+    {
+        let (mut tx, cache, _) = f.tx();
+        cache.invalidate(&mut tx, DADDR + 62 * 4, 4).unwrap();
+    }
+    let (refreshed, _) = f.texture(&header);
+    assert_eq!(refreshed, texture);
+    assert!(
+        all_texels(&f.read_image(texture)[0], [0, 0, 255, 255]),
+        "a CPU write next to the texture keeps the render target's texels in it"
+    );
+    let mut guest = vec![0; info.size_bytes() as usize];
+    f.memory.read_bytes(DADDR, &mut guest).unwrap();
+    for (i, texel) in guest.as_chunks::<4>().0.iter().enumerate() {
+        let expected = if i == 62 { [7; 4] } else { [0, 0, 255, 255] };
+        assert_eq!(*texel, expected, "guest texel {i}");
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn flushing_aliases_writes_the_newest_texels_back() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let wide = pitch_target(256, 8);
+    let narrow = ImageInfo { width: 60, ..wide };
+    let flushed = |f: &mut Fixture| {
+        {
+            let (mut tx, cache, _) = f.tx();
+            cache.flush(&mut tx, DADDR, wide.size_bytes()).unwrap();
+        }
+        let mut guest = vec![0; wide.size_bytes() as usize];
+        f.memory.read_bytes(DADDR, &mut guest).unwrap();
+        guest
+    };
+
+    let wide_id = clear_rt(&mut f, &wide, [1.0, 0.0, 0.0, 1.0], Rect::ALL).id;
+    let narrow_id = clear_rt(&mut f, &narrow, [0.0, 1.0, 0.0, 1.0], Rect::ALL).id;
+    assert_ne!(wide_id, narrow_id);
+    for (i, texel) in flushed(&mut f).as_chunks::<4>().0.iter().enumerate() {
+        let expected = if i % 64 < 60 {
+            [0, 255, 0, 255]
+        } else {
+            [255, 0, 0, 255]
+        };
+        assert_eq!(
+            *texel, expected,
+            "guest texel {i} with the narrow target newer"
+        );
+    }
+
+    clear_rt(&mut f, &narrow, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    clear_rt(&mut f, &wide, [0.0, 0.0, 1.0, 1.0], Rect::ALL);
+    for (i, texel) in flushed(&mut f).as_chunks::<4>().0.iter().enumerate() {
+        assert_eq!(
+            *texel,
+            [0, 0, 255, 255],
+            "guest texel {i} with the wide target newer"
+        );
+    }
+    assert!(!f.cache.state(narrow_id).unwrap().gpu_modified);
+    assert!(
+        all_texels(&f.read_image(narrow_id)[0], [0, 0, 255, 255]),
+        "the flush hands the newer texels to the narrow target"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn removed_aliases_hand_their_texels_to_the_other_image() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let info = pitch_target(256, 8);
+    let target = clear_rt(&mut f, &info, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    let header = pitch_tic(GPU_VA, 60, 8, 256);
+    let (texture, _) = f.texture(&header);
+    clear_rt(&mut f, &info, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    {
+        let (tx, cache, _) = f.tx();
+        cache.remove(tx.scheduler, target.id);
+    }
+    assert!(
+        all_texels(&f.read_image(texture)[0], [0, 255, 0, 255]),
+        "the texture holds the dropped render target's last texels"
+    );
+    assert!(f.cache.state(texture).unwrap().gpu_modified);
+    f.assert_no_validation_errors();
+}
