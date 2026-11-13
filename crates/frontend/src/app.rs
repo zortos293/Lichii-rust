@@ -249,7 +249,9 @@ impl App {
 
     /// Replaces every setting (the configuration window's OK or Apply) and saves.
     fn apply_settings(&mut self, settings: Settings) {
-        let dirs_changed = settings.paths.game_dirs != self.settings.paths.game_dirs;
+        let rescan = settings.paths.game_dirs != self.settings.paths.game_dirs
+            || settings.paths.keys_dir != self.settings.paths.keys_dir
+            || settings.system.language != self.settings.system.language;
         self.settings = settings;
         if let Some(session) = &self.session {
             session.set_audio_volume(&self.settings.audio);
@@ -259,7 +261,7 @@ impl App {
             display.set_settings(&self.settings.graphics);
         }
         self.apply_theme();
-        if dirs_changed {
+        if rescan {
             self.refresh_games();
         }
         self.save_settings();

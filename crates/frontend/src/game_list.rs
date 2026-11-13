@@ -209,17 +209,60 @@ pub fn nacp_language(language: Language) -> NacpLanguage {
     }
 }
 
-/// Reads a title's metadata and icon, from `cache` when the file has not changed since.
-/// Titles that do not open (no keys yet, a damaged file) have none and are not cached, so they
-/// are read again once the keys are set up.
+/// Where metadata is cached, and which keys it was read with.
+pub struct MetadataCache {
+    dir: PathBuf,
+    /// A hash of the keys folder and the size and modification time of its key files (never
+    /// their contents). A title read before its keys were fixed can have a name but no control
+    /// data, so new keys read every title again.
+    keys: u64,
+}
+
+impl MetadataCache {
+    pub fn new(dir: PathBuf, keys_dir: &Path) -> Self {
+        let mut bytes = keys_dir.to_string_lossy().into_owned().into_bytes();
+        for name in ["prod.keys", "title.keys"] {
+            let (size, modified) = file_time(&keys_dir.join(name)).unwrap_or_default();
+            bytes.extend(size.to_le_bytes());
+            bytes.extend(modified.to_le_bytes());
+        }
+        Self {
+            dir,
+            keys: fnv1a(bytes),
+        }
+    }
+}
+
+/// A file's size and modification time in nanoseconds since the Unix epoch.
+fn file_time(path: &Path) -> Option<(u64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    Some((meta.len(), u64::try_from(modified.as_nanos()).ok()?))
+}
+
+/// FNV-1a, stable across runs and Rust versions.
+fn fnv1a(bytes: impl IntoIterator<Item = u8>) -> u64 {
+    bytes.into_iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// Reads a title's metadata and icon, from `cache` when neither the file nor the keys have
+/// changed since. Titles that do not open (no keys yet, a damaged file) have none and are not
+/// cached, so they are read again once the keys are set up.
 pub fn read_metadata(
     entry: &GameEntry,
     options: &LoadOptions,
-    cache: Option<&Path>,
+    cache: Option<&MetadataCache>,
 ) -> Option<(Metadata, Option<Icon>)> {
     let cache = cache
         .filter(|_| entry.kind != GameKind::ExeFs)
-        .and_then(|dir| Some((dir, Stamp::of(&entry.path, options.language)?)));
+        .and_then(|cache| {
+            Some((
+                cache.dir.as_path(),
+                Stamp::of(&entry.path, options.language, cache.keys)?,
+            ))
+        });
     if let Some(hit) = cache.as_ref().and_then(|(dir, stamp)| stamp.load(dir)) {
         return Some(hit);
     }
@@ -240,13 +283,15 @@ pub fn read_metadata(
     Some((meta, icon))
 }
 
-/// What identifies one version of a file, read in one language, in the cache.
+/// What identifies one version of a file, read in one language with one set of keys, in the
+/// cache.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Stamp {
     path: PathBuf,
     size: u64,
     modified_ns: u64,
     language: u8,
+    keys: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -256,27 +301,20 @@ struct CacheRecord {
 }
 
 impl Stamp {
-    fn of(path: &Path, language: NacpLanguage) -> Option<Self> {
-        let meta = std::fs::metadata(path).ok()?;
-        let modified = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    fn of(path: &Path, language: NacpLanguage, keys: u64) -> Option<Self> {
+        let (size, modified_ns) = file_time(path)?;
         Some(Self {
             path: path.to_path_buf(),
-            size: meta.len(),
-            modified_ns: u64::try_from(modified.as_nanos()).ok()?,
+            size,
+            modified_ns,
             language: language as u8,
+            keys: format!("{keys:016x}"),
         })
     }
 
-    /// The cache file stem: an FNV-1a hash of the path, stable across runs and Rust versions.
+    /// The cache file stem: a hash of the path.
     fn key(&self) -> String {
-        let hash = self
-            .path
-            .to_string_lossy()
-            .bytes()
-            .fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
-                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-            });
-        format!("{hash:016x}")
+        format!("{:016x}", fnv1a(self.path.to_string_lossy().bytes()))
     }
 
     fn load(&self, dir: &Path) -> Option<(Metadata, Option<Icon>)> {
@@ -357,15 +395,14 @@ impl GameList {
                     return;
                 }
                 wake();
+                let cache = MetadataCache::new(sources.cache_dir, &sources.keys_dir);
                 let options = LoadOptions {
                     keys: Some(crate::setup::KeyStatus::check(sources.keys_dir).keys),
                     language: sources.language,
                     ..LoadOptions::default()
                 };
                 for (index, entry) in entries.iter().enumerate() {
-                    let Some((meta, icon)) =
-                        read_metadata(entry, &options, Some(&sources.cache_dir))
-                    else {
+                    let Some((meta, icon)) = read_metadata(entry, &options, Some(&cache)) else {
                         continue;
                     };
                     if tx.send(ScanEvent::Metadata(index, meta, icon)).is_err() {
@@ -627,7 +664,8 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let control = nacp("Synthetic Game", "Lichii Tests", "1.2.3");
         std::fs::write(&path, nro([&png_icon(), &control, b""])).unwrap();
-        let cache = tmp.0.join("cache");
+        let keys = tmp.0.join("keys");
+        let cache = MetadataCache::new(tmp.0.join("cache"), &keys);
         let game = scan(std::slice::from_ref(&tmp.0)).remove(0);
 
         let (meta, icon) = read_metadata(&game, &LoadOptions::default(), Some(&cache)).unwrap();
@@ -645,7 +683,7 @@ mod tests {
         assert_eq!(icon.0.len(), ICON_SIZE * ICON_SIZE * 4);
         assert_eq!(&icon.0[..4], [200, 30, 30, 255]);
 
-        let record = std::fs::read_dir(&cache)
+        let record = std::fs::read_dir(&cache.dir)
             .unwrap()
             .map(|e| e.unwrap().path())
             .find(|p| p.extension().is_some_and(|e| e == "toml"))
@@ -655,6 +693,14 @@ mod tests {
         let (cached, icon) = read_metadata(&game, &LoadOptions::default(), Some(&cache)).unwrap();
         assert_eq!(cached.title, "From Cache");
         assert!(icon.is_some(), "the cached icon is used");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::write(keys.join("prod.keys"), "").unwrap();
+        let new_keys = MetadataCache::new(tmp.0.join("cache"), &keys);
+        let (rekeyed, _) = read_metadata(&game, &LoadOptions::default(), Some(&new_keys)).unwrap();
+        assert_eq!(
+            rekeyed.title, "Synthetic Game",
+            "new keys read the title again"
+        );
         let british = LoadOptions {
             language: NacpLanguage::BritishEnglish,
             ..LoadOptions::default()
@@ -679,10 +725,10 @@ mod tests {
     fn titles_that_do_not_open_are_not_cached() {
         let tmp = TempDir::new("locked");
         tmp.file("Locked.nsp", 0x400);
-        let cache = tmp.0.join("cache");
+        let cache = MetadataCache::new(tmp.0.join("cache"), &tmp.0.join("keys"));
         let game = scan(std::slice::from_ref(&tmp.0)).remove(0);
         assert!(read_metadata(&game, &LoadOptions::default(), Some(&cache)).is_none());
-        assert!(!cache.exists());
+        assert!(!cache.dir.exists());
         assert_eq!(game.title(), "Locked");
     }
 
