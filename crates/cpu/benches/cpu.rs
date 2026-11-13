@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use lichii_common::settings::CpuBackend;
+use lichii_common::settings::{CpuAccuracy, CpuBackend};
 use lichii_cpu::{CpuConfig, GuestClock, HaltReason, ThreadContext, TscScale, new_core};
 use lichii_memory::{AddressSpace, ExclusiveMonitor, MemoryPermission, PhysicalMemory};
 
@@ -71,6 +71,23 @@ const WORKLOADS: &[Workload] = &[
         ],
         far: &[],
         per_iteration: 6,
+    },
+    Workload {
+        name: "compare/select loop",
+        code: &[
+            0xeb01001f, // 1: cmp x0, x1
+            0x9a813002, // csel x2, x0, x1, lo
+            0xeb03005f, // cmp x2, x3
+            0x9a84b484, // cinc x4, x4, ge
+            0xf240001f, // tst x0, #1
+            0x9a8000c6, // csel x6, x6, x0, eq
+            0x91000c00, // add x0, x0, #3
+            0xf10004a5, // subs x5, x5, #1
+            0x54ffff01, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 9,
     },
     Workload {
         name: "atomic add loop",
@@ -174,6 +191,7 @@ fn main() {
                 core_index: 0,
                 ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
                 dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+                accuracy: CpuAccuracy::Auto,
             },
         );
         let mut seconds = f64::MAX;

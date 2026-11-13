@@ -58,6 +58,8 @@ pub struct ServiceContext {
     /// and sets its host volume; the services set the device volume.
     pub audio: Arc<Sink>,
     pub(crate) unknown: UnknownCommands,
+    /// The nvdrv state, once nvdrv registered: gsv opens `nx2:nvsrv` sessions with it.
+    pub(crate) nvdrv: OnceLock<Arc<crate::nvdrv::Nvdrv>>,
     /// The NAND's registered content, indexed on first use by [`crate::fs::system_data`].
     pub(crate) installed_content: OnceLock<Option<ContentIndex>>,
     threads: Mutex<HashMap<String, ServiceThread>>,
@@ -77,6 +79,7 @@ impl ServiceContext {
             perf: parts.perf,
             audio: parts.audio,
             unknown: UnknownCommands::default(),
+            nvdrv: OnceLock::new(),
             installed_content: OnceLock::new(),
             threads: Mutex::new(HashMap::new()),
         })

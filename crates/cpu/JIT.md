@@ -54,7 +54,7 @@ Each pass is a function `fn(&mut Block)`. They run in this order:
 2. **Constant folding and propagation**: folds pure ops on immediates, `ADRP + ADD` address chains, `MOVZ/MOVK` sequences and conditions on known flags. A `Branch` with a known condition becomes `Jump`.
 3. **Flag liveness**: removes the `Nzcv` outputs nobody reads before the next full write. Within a block that is the common case. Flags are live at every exit, including the barrier ops of pass 1, so this is the NZCV case of pass 1 followed by DCE. At block ends flags stay live unless the successor is known to overwrite them; that refinement comes later.
 4. **Dead code elimination**: drops pure ops with no users. Memory ops, atomics, calls and terminals are roots.
-5. **Peepholes for the backend**: fuses `SUBS`/`ADDS`/`ANDS` with the `TestCond` that consumes its flags into one x86 `cmp`/`test` + `jcc`/`setcc`/`cmovcc`, skipping the packed `Nzcv` value.
+5. **Peepholes for the backend**: fuses `SUBS`/`ADDS`/`ANDS` with the `TestCond` that consumes its flags into one x86 `cmp`/`test` + `jcc`/`setcc`/`cmovcc`, skipping the packed `Nzcv` value. The pass rewrites the `TestCond` into a `Compare` on the flag op's operands; the backend emits a `Compare` whose only user is a `Select` or the `Branch` right at that user and consumes the host flags there. `HI` and `LS` after an add or a test have no single x86 condition code, so they keep the packed path.
 
 Pass tests run each block both with and without each pass, through the backend, and compare results. That turns every pass into its own differential test.
 
@@ -100,7 +100,7 @@ The plan is **dynasm-rs** (`dynasmrt::VecAssembler` for x64), emitting into a `V
 
 ## Accuracy settings
 
-`CpuAccuracy` only controls what is safe to relax. Under `Unsafe`, flags at block exits may be treated as dead and the bounds check is kept. Under `Paranoid` the JIT is off and every block is interpreted. `Accurate` and `Auto` are identical to the interpreter.
+`CpuConfig::accuracy` carries `Settings::cpu.accuracy` to each core. It only controls what is safe to relax. Under `Unsafe`, flags at block exits may be treated as dead and the bounds check is kept. Under `Paranoid` `Jit::new` returns `None`, so `new_core` builds the interpreter. `Accurate` and `Auto` are identical to the interpreter.
 
 ## Testing
 
@@ -122,4 +122,4 @@ The plan is **dynasm-rs** (`dynasmrt::VecAssembler` for x64), emitting into a `V
 
 - **`ExclusiveMonitor` inline reservations** (lichii-memory): expose each core's reservation as a `#[repr(C)]` `{ addr, value: u128, size }` slot that only its own core writes, so `LDXR`/`STXR` become inline loads and `lock cmpxchg` instead of helper calls. Today `clear(core)` is the only cross-thread operation, and it already runs on the owning core's thread during a context switch.
 - **`GuestClock` fast path** (lichii-cpu contract): `fn host_tsc_scale(&self) -> Option<TscScale>` with `(mul, shift, offset)`, so `MRS CNTPCT_EL0` becomes `rdtsc` plus a multiply-shift inline, instead of a dynamic call per read (notes rows 111 and 127). Returns `None` when the TSC is not invariant.
-- **`new_core` settings**: `new_core(backend, config)` has no access to `CpuSettings::accuracy` or `fastmem`. Proposal: add `accuracy: CpuAccuracy` to `CpuConfig`. Fastmem is already implied by whether the `AddressSpace` has an arena.
+- **`new_core` settings** (done): `CpuConfig::accuracy: CpuAccuracy`. Fastmem is already implied by whether the `AddressSpace` has an arena.

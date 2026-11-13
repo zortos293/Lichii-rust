@@ -5,6 +5,7 @@ mod flow;
 mod header;
 mod instruction;
 mod opcode;
+pub(crate) mod translate;
 
 #[cfg(test)]
 mod tests;

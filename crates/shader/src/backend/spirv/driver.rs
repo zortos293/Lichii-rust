@@ -10,7 +10,7 @@ use rspirv::spirv::{
 use smallvec::SmallVec;
 
 use super::context::{DeferredPhi, EmitContext};
-use super::emit::emit_inst;
+use super::emit::{emit_inst, mesh, tensor};
 use super::{EmitError, EmitResult};
 use crate::backend::Bindings;
 use crate::ir::{Attribute, InstId, SyntaxNode, Type};
@@ -28,15 +28,14 @@ pub(super) fn emit(
     program: &TranslatedProgram,
     bindings: &mut Bindings,
 ) -> EmitResult<Vec<u32>> {
-    if matches!(
-        program.stage,
-        ShaderStage::VertexA | ShaderStage::Task | ShaderStage::Mesh
-    ) {
+    if program.stage == ShaderStage::VertexA {
         return Err(EmitError::UnsupportedStage(program.stage));
     }
+    mesh::check_support(profile, runtime, program.stage, &program.info.mesh)?;
     let mut ctx = EmitContext::new(profile, runtime, program, bindings)?;
     let main = define_main(&mut ctx)?;
     ctx.define_deferred_functions()?;
+    tensor::define_functions(&mut ctx)?;
     define_entry_point(&mut ctx, main);
     if profile.support_float_controls {
         ctx.add_extension("SPV_KHR_float_controls");
@@ -120,7 +119,11 @@ fn traverse(ctx: &mut EmitContext<'_>) -> EmitResult<()> {
                 ctx.b
                     .branch_conditional(cond, ctx.label(loop_header), ctx.label(merge), [])?;
             }
-            SyntaxNode::Return => ctx.b.ret()?,
+            SyntaxNode::Return => {
+                if !std::mem::take(&mut ctx.mesh.terminated) {
+                    ctx.b.ret()?;
+                }
+            }
             SyntaxNode::Unreachable => ctx.b.unreachable()?,
         }
         in_block = false;
@@ -290,9 +293,8 @@ fn define_entry_point(ctx: &mut EmitContext<'_>, main: Word) {
             }
             ExecutionModel::Fragment
         }
-        ShaderStage::VertexA | ShaderStage::VertexB | ShaderStage::Task | ShaderStage::Mesh => {
-            ExecutionModel::Vertex
-        }
+        ShaderStage::Task | ShaderStage::Mesh => mesh::define_entry_point(ctx, main),
+        ShaderStage::VertexA | ShaderStage::VertexB => ExecutionModel::Vertex,
     };
     let interfaces = std::mem::take(&mut ctx.interfaces);
     ctx.b.entry_point(model, main, "main", &interfaces);
