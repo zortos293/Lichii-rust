@@ -21,6 +21,7 @@ pub mod macros;
 pub mod nx2_memory;
 pub mod pushbuffer;
 mod ring;
+pub mod semaphore_mirror;
 mod stream;
 mod written_pages;
 
