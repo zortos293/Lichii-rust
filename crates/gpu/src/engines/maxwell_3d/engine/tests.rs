@@ -166,6 +166,7 @@ impl Bench {
             syncpoints: &self.h.syncpoints,
             gob_layout: self.h.gob_layout,
             qmd_scheduler: &mut self.h.qmd_scheduler,
+            written_pages: &self.h.written_pages,
         };
         f(&mut self.engine, &mut ctx);
     }
