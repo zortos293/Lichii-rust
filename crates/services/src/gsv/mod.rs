@@ -7,6 +7,7 @@
 //! Commands nobody has decoded fall to the `nx2:` auto-stub (success and zeroed data), which is
 //! what the console's server answers for the feature queries titles make at boot.
 
+mod gpu;
 mod sessions;
 mod syncpt;
 #[cfg(test)]
@@ -121,6 +122,7 @@ impl Service for GraphicsSystem {
                 syncpt::SyncptSession::new(context, self.syncpt.clone()),
             ),
             204 => syncpt::attach(context, ctx, &self.syncpt),
+            497 => push_session(context, ctx, gpu::GpuSession::new(context)),
             434 => {
                 let id: u32 = ctx.pop();
                 self.state.lock().address_spaces.insert(id);
