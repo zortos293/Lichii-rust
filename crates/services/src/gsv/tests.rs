@@ -4,6 +4,7 @@ use lichii_common::ResultCode;
 use lichii_common::settings::Settings;
 use lichii_kernel::Event;
 use lichii_kernel::ipc::Handle;
+use lichii_kernel::memory::Pool;
 use lichii_kernel::memory_objects::TransferMemory;
 use lichii_kernel::object::KObject;
 use lichii_kernel::testing::{IpcClient, Request};
@@ -518,6 +519,35 @@ fn gpu_only_regions_keep_what_the_gpu_writes() {
         .unwrap();
     context.gpu.synchronize();
     assert!(gmmu.translate(region).is_none());
+}
+
+#[test]
+fn gpu_only_regions_take_system_memory_not_the_applications() {
+    let (context, client, gsv) = gsv();
+    let gpu = session(&client, gsv, 497);
+    let gmmu = context
+        .gpu
+        .create_address_space(lichii_gpu::gmmu::BigPageSize::Size64K);
+    let process = client.process().clone();
+    let manager = process.page_table().memory_manager().clone();
+    let total = process.total_memory();
+    let system = manager.free_size(Pool::SystemNonSecure);
+    let region = 0x81_0000_0000u64;
+    client
+        .send(
+            gpu,
+            &range_words(214, region, region + 0x20_0000 - 1, &[0, 0, 0, 0, 3]),
+        )
+        .unwrap();
+    context.gpu.synchronize();
+    gmmu.write(region, 0x1234_5678u32).unwrap();
+    assert_eq!(gmmu.read::<u32>(region).unwrap(), 0x1234_5678);
+    assert_eq!(
+        process.total_memory(),
+        total,
+        "the title's memory total stays whole"
+    );
+    assert_eq!(manager.free_size(Pool::SystemNonSecure), system - 0x20_0000);
 }
 
 fn sparse_request(va: u64, size: u64, handle: u32, offset: u64, kind: u8) -> Vec<u8> {

@@ -84,7 +84,7 @@ impl KernelEvents for LogEvents {}
 pub struct KernelConfig {
     pub console: ConsoleGeneration,
     pub dram_size: u64,
-    /// Pool split; `None` uses Horizon's split for `dram_size`.
+    /// Pool split of exactly `dram_size`; `None` uses [`PoolLayout::for_console`].
     pub pool_layout: Option<PoolLayout>,
     /// Give process address spaces a fastmem arena for the JIT.
     pub fastmem: bool,
@@ -153,10 +153,11 @@ pub struct Kernel(Arc<KernelInner>);
 
 impl Kernel {
     pub fn new(config: KernelConfig) -> Result<Self, KernelError> {
-        let physical = Arc::new(PhysicalMemory::new(config.dram_size)?);
-        let layout = config
-            .pool_layout
-            .unwrap_or_else(|| PoolLayout::for_dram(config.dram_size, config.console));
+        let (dram_size, layout) = match config.pool_layout {
+            Some(layout) => (config.dram_size, layout),
+            None => PoolLayout::for_console(config.dram_size, config.console),
+        };
+        let physical = Arc::new(PhysicalMemory::new(dram_size)?);
         let memory = Arc::new(MemoryManager::new(physical.clone(), layout));
         let cores = config.console.core_count();
         let service_manager = Arc::new(ServiceManager::new(config.enforce_service_access));
