@@ -4,8 +4,8 @@
 //! storage buffer pass rebases on the buffers whose pointers live in constant buffers. Generic
 //! accesses (LD, ST, ATOM) are treated as global: NVN programs use them on global pointers.
 //! Cache control and dependency barriers (CCTL, DEPBAR, LDGDEPBAR, ERRBAR) have no effect,
-//! because every translated access, LDGSTS included, completes in program order. LDSM, a
-//! cross-lane matrix load that only feeds HMMA, and bindless constant buffers are unsupported.
+//! because every translated access, LDGSTS included, completes in program order. Bindless
+//! constant buffers are unsupported.
 
 use super::{TResult, Translator};
 use crate::TranslateError;
@@ -26,6 +26,7 @@ pub(super) fn translate(t: &mut Translator<'_>, op: Opcode) -> TResult {
         Lds => lds(t),
         Sts => sts(t),
         Ldgsts => ldgsts(t),
+        Ldsm => ldsm(t),
         Atom | Atomg => atomg(t),
         AtomCas | AtomgCas => atomg_cas(t),
         Red => red(t),
@@ -483,6 +484,62 @@ fn lds(t: &mut Translator<'_>) -> TResult {
     let address = byte_address(t, ureg, true);
     let value = t.ir.inst(op, &[address]);
     write_words(t, dest, value, ty.words(), Value::U1(true));
+    Ok(())
+}
+
+/// `LDSM.16.M88.{1,2,4} Rd, [Ra + URb + imm]` (ldmatrix): 8x8 matrices of 16-bit values
+/// from shared memory, as many as bits 72..74 give. Lanes 8m..8m+7 hold the row addresses of
+/// matrix m, and lane t receives the 32 bits at row t/4, column 2(t%4) of each matrix in Rd+m.
+/// `.MT88` (78) transposes: lane t receives column t/4 of rows 2(t%4) and 2(t%4)+1.
+fn ldsm(t: &mut Translator<'_>) -> TResult {
+    let insn = t.insn;
+    let uniform = insn.bit(91);
+    if insn.bits(72, 2) == 3
+        || insn.bits(64, 32) & !0x0800_4300 != 0
+        || (!uniform && insn.bits(32, 8) != 0)
+    {
+        return Err(t.unsupported());
+    }
+    let count = 1u16 << insn.bits(72, 2);
+    let dest = insn.dst();
+    check_aligned(t, dest, count)?;
+    let ureg = address_ureg(t, 32);
+    let base = byte_address(t, ureg, false);
+    let lane = t.ir.lane_id();
+    let quad = t.ir.bitwise_and(lane, Value::U32(3));
+    let group = t.ir.shift_right_logical(lane, Value::U32(2));
+    let transpose = insn.bit(78);
+    let (first_row, column) = if transpose {
+        (
+            t.ir.shift_left_logical(quad, Value::U32(1)),
+            t.ir.shift_left_logical(group, Value::U32(1)),
+        )
+    } else {
+        (group, t.ir.shift_left_logical(quad, Value::U32(2)))
+    };
+    let load = |t: &mut Translator<'_>, row: u32, op: Op| {
+        let source = t.ir.iadd(first_row, Value::U32(row));
+        let address = t.ir.inst(
+            Op::ShuffleIndex,
+            &[base, source, Value::U32(31), Value::U32(0)],
+        );
+        let address = t.ir.iadd(address, column);
+        t.ir.inst(op, &[address])
+    };
+    for matrix in 0..count {
+        let row = u32::from(matrix) * 8;
+        let value = if transpose {
+            let low = load(t, row, Op::LoadSharedU16);
+            let high = load(t, row + 1, Op::LoadSharedU16);
+            let high = t.ir.shift_left_logical(high, Value::U32(16));
+            t.ir.bitwise_or(low, high)
+        } else {
+            load(t, row, Op::LoadSharedU32)
+        };
+        if !dest.is_zero() {
+            t.set_x(dest.offset(matrix), value);
+        }
+    }
     Ok(())
 }
 
@@ -1718,7 +1775,10 @@ mod tests {
             encode(Atoms, Fixed, f(73, 3)),
             encode(AtomsCas, Fixed, f(73, 2)),
             encode(AtomsPopcInc, Fixed, f(16, 1)),
-            encode(Ldsm, UniformAddress, 0),
+            encode(Ldsm, UniformAddress, f(72, 3)),
+            encode(Ldsm, UniformAddress, f(74, 1)),
+            encode(Ldsm, UniformAddress, f(32, 1)),
+            encode(Ldsm, UniformAddress, f(16, 1) | f(72, 1)),
         ];
         for insn in rejected {
             assert!(translate(&[insn]).is_err(), "{:#034x}", insn.0);
