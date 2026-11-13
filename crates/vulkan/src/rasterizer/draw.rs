@@ -203,6 +203,7 @@ pub(super) struct DrawState {
     texture_pipelines: Option<texture::TexturePipelines>,
     assembly: Option<assembly::AssemblyPass>,
     grid: Option<dispatch_grid::GridPass>,
+    frame_decode: Option<frame_decode::FrameDecodePass>,
     mesh_indirect: Option<mesh_indirect::MeshIndirectPass>,
 }
 
@@ -284,6 +285,7 @@ impl DrawState {
             texture_pipelines: None,
             assembly: None,
             grid: None,
+            frame_decode: None,
             mesh_indirect: None,
         })
     }
@@ -2419,6 +2421,7 @@ fn storage_pointer(
 
 mod assembly;
 mod dispatch_grid;
+mod frame_decode;
 mod host_compute;
 mod mesh_indirect;
 mod null;
