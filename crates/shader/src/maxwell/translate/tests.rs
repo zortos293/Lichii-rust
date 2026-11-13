@@ -127,11 +127,23 @@ fn control_flow_markers_translate_to_nothing() {
     for op in [
         Opcode::Nop,
         Opcode::Cal,
-        Opcode::Kil,
         Opcode::Pbk,
         Opcode::Pcnt,
         Opcode::Ssy,
     ] {
         assert_eq!(translate(&[encode(op, 0xf)]).unwrap(), "{0}:\n", "{op:?}");
+    }
+}
+
+#[test]
+fn kil_translates_only_in_fragment_programs() {
+    use crate::maxwell::opcode::Opcode;
+    for (stage, translates) in [(ShaderStage::Fragment, true), (ShaderStage::VertexB, false)] {
+        let mut env = TestEnv::new(&[encode(Opcode::Kil, 0xf)]);
+        env.stage = stage;
+        let mut prog = Program::new();
+        let block = prog.new_block();
+        let result = translate_block(&mut prog, block, &env, 0, env.end());
+        assert_eq!(result.is_ok(), translates, "{stage:?}");
     }
 }
