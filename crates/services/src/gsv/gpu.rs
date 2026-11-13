@@ -11,8 +11,10 @@
 //! back thread to reach it.
 //!
 //! A region 214 creates without the sparse flag is GPU-only storage the client renders into
-//! (NX2_NOTES row 57): the server backs it with memory of its own in the alias code region, made
-//! GPU accessible and mapped at the region. Tiles mapped into it and unmapped again show that
+//! (NX2_NOTES row 57): the server backs it with memory of its own, from the non-secure system pool
+//! like the reference's graphics server memory, so the application pool the title sizes its heap
+//! from stays whole. The memory sits in the alias code region, made GPU accessible and mapped at
+//! the region. Tiles mapped into it and unmapped again show that
 //! memory again.
 
 use std::collections::BTreeMap;
@@ -25,7 +27,7 @@ use lichii_gpu::gmmu::MappedRange;
 use lichii_gpu::nx2_memory::{GpuMemoryHandle, Nx2GpuMemory, Nx2MemoryError, Unmapped};
 use lichii_kernel::Event;
 use lichii_kernel::ipc::HleRequestContext;
-use lichii_kernel::memory::MemoryState;
+use lichii_kernel::memory::{MemoryState, Pool};
 use lichii_memory::{AddressSpace, MemoryPermission};
 use parking_lot::Mutex;
 
@@ -198,7 +200,8 @@ impl GpuSession {
     fn create_gpu_only(&self, start: GpuVAddr, size: u64, slot: u32) {
         let page_table = self.context.process.page_table();
         let region = page_table.regions().alias_code;
-        let cpu_va = match page_table.map_new_in(
+        let cpu_va = match page_table.map_new_from(
+            Pool::SystemNonSecure,
             region,
             size,
             MemoryState::IO_MEMORY,

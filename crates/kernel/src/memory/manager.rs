@@ -11,6 +11,11 @@ use crate::result;
 
 const MIB: u64 = 1 << 20;
 
+/// DRAM Switch 2 consoles get beyond their own for the memory the graphics server keeps itself
+/// (nx2:gpu 214 GPU-only regions, NX2_NOTES row 57). It joins the non-secure system pool, so the
+/// application pool a title sizes its heap from stays whole.
+pub const NX2_GRAPHICS_SERVER_MEMORY: u64 = 2 << 30;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Pool {
     Application = 0,
@@ -41,9 +46,19 @@ pub struct PoolLayout {
 }
 
 impl PoolLayout {
-    /// Horizon's split for the console's DRAM arrangement (4/6/8/12 GiB), proportional for any
-    /// other size.
-    pub fn for_dram(dram: u64, _console: ConsoleGeneration) -> Self {
+    /// The DRAM to emulate for a console with `dram` bytes, and its pools: Horizon's split for
+    /// the console's arrangement (4/6/8/12 GiB), proportional for any other size. Switch 2 adds
+    /// [`NX2_GRAPHICS_SERVER_MEMORY`] to the non-secure system pool.
+    pub fn for_console(dram: u64, console: ConsoleGeneration) -> (u64, Self) {
+        let mut layout = Self::for_dram(dram);
+        if console != ConsoleGeneration::Switch2 {
+            return (dram, layout);
+        }
+        layout.system_non_secure += NX2_GRAPHICS_SERVER_MEMORY;
+        (dram + NX2_GRAPHICS_SERVER_MEMORY, layout)
+    }
+
+    fn for_dram(dram: u64) -> Self {
         let application = match dram >> 30 {
             4 => 3285 * MIB,
             6 => 4916 * MIB,
@@ -301,9 +316,24 @@ mod tests {
 
     #[test]
     fn horizon_pool_sizes() {
-        let layout = PoolLayout::for_dram(12 << 30, ConsoleGeneration::Switch2);
-        assert_eq!(layout.application, 9809 * MIB);
-        let layout = PoolLayout::for_dram(4 << 30, ConsoleGeneration::Switch1);
+        let (dram, layout) = PoolLayout::for_console(4 << 30, ConsoleGeneration::Switch1);
+        assert_eq!(dram, 4 << 30);
         assert_eq!(layout.application, 3285 * MIB);
+        assert_eq!(
+            layout.system_non_secure,
+            0x2c0_4000_u64.next_multiple_of(2 * MIB)
+        );
+    }
+
+    #[test]
+    fn switch2_graphics_server_memory_is_outside_the_application_pool() {
+        let (dram, layout) = PoolLayout::for_console(12 << 30, ConsoleGeneration::Switch2);
+        let base = 0x2c0_4000_u64.next_multiple_of(2 * MIB);
+        assert_eq!(dram, 14 << 30);
+        assert_eq!(layout.application, 9809 * MIB);
+        assert_eq!(layout.applet, 507 * MIB);
+        assert_eq!(layout.system_non_secure, base + NX2_GRAPHICS_SERVER_MEMORY);
+        let system = dram - layout.application - layout.applet - layout.system_non_secure;
+        assert_eq!(system, (12 << 30) - 9809 * MIB - 507 * MIB - base);
     }
 }
