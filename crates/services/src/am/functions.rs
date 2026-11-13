@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use super::library_applet::{LibraryApplet, LibraryAppletAccessor, normalize_applet_id};
+use super::library_applet::{
+    LibraryApplet, LibraryAppletAccessor, input_storage, normalize_applet_id,
+};
 use super::storage::{Charge, Storage, StorageData};
 use super::{Applet, NO_DATA_IN_CHANNEL, UNKNOWN, push_bool, push_event};
 use crate::dispatch::push_nx2_stub;
@@ -145,6 +147,23 @@ impl Service for ApplicationFunctions {
             }
             121 => {
                 applet.state.lock().user_channel.clear();
+                ResultCode::SUCCESS
+            }
+            122 => match input_storage(ctx) {
+                Some(data) => {
+                    let bytes = data.bytes().clone();
+                    applet.state.lock().user_channel.push(bytes);
+                    ResultCode::SUCCESS
+                }
+                None => UNKNOWN,
+            },
+            29 => {
+                let max_index = nacp.map_or(0, |nacp| nacp.cache_storage_max_index());
+                let max_size = nacp.map_or(0, |nacp| {
+                    u64::from_le_bytes(nacp.raw()[0x3180..0x3188].try_into().unwrap())
+                });
+                ctx.push(u32::from(max_index));
+                ctx.push(max_size);
                 ResultCode::SUCCESS
             }
             123 => {

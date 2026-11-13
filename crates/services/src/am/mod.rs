@@ -114,6 +114,7 @@ pub(crate) struct Applet {
 struct AppletState {
     fatal_sections: u32,
     vr_mode: bool,
+    vr_mode_3d: bool,
     auto_sleep_disabled: bool,
     idle_time_detection_extension: u32,
     home_button_short_blocked: bool,

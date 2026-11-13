@@ -8,9 +8,10 @@ use lichii_common::ResultCode;
 use lichii_kernel::Event;
 use lichii_kernel::ipc::HleRequestContext;
 
+use super::library_applet::input_storage;
 use super::{
-    Applet, AppletMessage, FATAL_SECTION_COUNT_IMBALANCE, IN_FOCUS, NO_MESSAGES, push_bool,
-    push_event,
+    Applet, AppletMessage, FATAL_SECTION_COUNT_IMBALANCE, IN_FOCUS, NO_MESSAGES, UNKNOWN,
+    push_bool, push_event,
 };
 use crate::dispatch::{push_nx2_stub, push_stub_zeroes};
 use crate::{Service, ServiceContext};
@@ -141,6 +142,28 @@ impl Service for CommonStateGetter {
                 ctx.push(1i32);
                 ResultCode::SUCCESS
             }
+            20 => match input_storage(ctx) {
+                Some(_) => ResultCode::SUCCESS,
+                None => UNKNOWN,
+            },
+            610 | 611 => ResultCode::SUCCESS,
+            1000 | 1001 => {
+                applet.state.lock().vr_mode_3d = ctx.command() == 1000;
+                ResultCode::SUCCESS
+            }
+            1002 => push_bool(ctx, applet.state.lock().vr_mode_3d),
+            1003 => {
+                ctx.push([0i32, 0, 1280, 720]);
+                ResultCode::SUCCESS
+            }
+            1004 => {
+                ctx.push([137.25f32, 77.2]);
+                ResultCode::SUCCESS
+            }
+            1005 => {
+                ctx.push([1280i32, 720]);
+                ResultCode::SUCCESS
+            }
             _ => return None,
         })
     }
@@ -222,6 +245,11 @@ impl Service for SelfController {
                 ResultCode::SUCCESS
             }
             91 => push_event(ctx, &applet.suspended_tick_event),
+            230 => {
+                ctx.push(0u16);
+                ResultCode::SUCCESS
+            }
+            240 => ResultCode::SUCCESS,
             1000 => push_nx2_stub(&self.context, ctx, "ISelfController"),
             2000 => crate::gsv::open(&self.context, ctx),
             _ => return None,
