@@ -4,7 +4,7 @@ use ash::vk;
 use lichii_common::settings::{Anisotropy, GraphicsSettings, ResolutionScale};
 use lichii_gpu::backend::{
     ChannelId, ComputeContext, ConstBufferBinding, DrawParams, DrawTexture, GraphicsConstBuffers,
-    GraphicsContext, IndirectDraw, QmdVersion, Rasterizer,
+    GraphicsContext, IndirectDraw, IndirectGrid, QmdVersion, Rasterizer,
 };
 use lichii_gpu::engines::maxwell_3d::regs::{
     ClearSurface, DepthMode, IndexFormat, MAX_CONST_BUFFERS, MAX_SHADER_STAGE, MESH_CONTROL,
@@ -599,6 +599,7 @@ fn compute_programs_key_on_their_local_memory_size() {
             qmd_version: QmdVersion::V2,
             qmd: &qmd,
             indirect_grid: None,
+            indirect: None,
         });
     };
     dispatch(&mut f, 0);
@@ -1884,6 +1885,10 @@ fn launch(
         qmd_version: QmdVersion::V2,
         qmd: &qmd,
         indirect_grid: indirect_grid.map(|offset| GPU_VA + offset),
+        indirect: indirect_grid.map(|offset| IndirectGrid {
+            address: GPU_VA + offset,
+            layout: QmdVersion::V2,
+        }),
     });
 }
 

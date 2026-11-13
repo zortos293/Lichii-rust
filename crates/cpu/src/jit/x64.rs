@@ -123,6 +123,7 @@ const TSC_MUL: i32 = offset_of!(TscScale, mul) as i32;
 const TSC_SHIFT: i32 = offset_of!(TscScale, shift) as i32;
 const TSC_OFFSET: i32 = offset_of!(TscScale, offset) as i32;
 const ST_HIGH: i32 = ctx(offset_of!(JitState, high));
+const ST_COUNTER_FLOOR: i32 = ctx(offset_of!(JitState, counter_floor));
 const ST_CX16_SAVE: i32 = ctx(offset_of!(JitState, cx16_save));
 const ST_SAVE_XMM: i32 = ctx(offset_of!(JitState, save_xmm));
 const ST_SPILL: i32 = ctx(offset_of!(JitState, spill));
@@ -836,6 +837,9 @@ impl Emitter<'_> {
                         ; shrd rax, rdx, cl
                         ; mov rcx, QWORD scale as i64
                         ; add rax, QWORD [rcx + TSC_OFFSET]
+                        ; cmp rax, QWORD [r13 + ST_COUNTER_FLOOR]
+                        ; cmovb rax, QWORD [r13 + ST_COUNTER_FLOOR]
+                        ; mov QWORD [r13 + ST_COUNTER_FLOOR], rax
                         ; mov Rq(d), rax
                     );
                 }
