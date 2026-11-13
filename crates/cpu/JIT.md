@@ -133,7 +133,7 @@ Vector `FADD`, `FADDP`, `FSUB`, `FMUL`, `FMLA` and `FMLS` on .2S, .4S and .2D, a
 | `fp min max loop` (FMAXNM, FMINNM, FMAX, FMIN S, FCMGE, FCMGT, FCMEQ .4S, ST1) | 41 MIPS | n/a | 47 MIPS | ~2,150 MIPS |
 | `zero product loop` (FMUL, FMADD, FNMUL and FDIV S with a zero factor, STR S) | 88 MIPS | n/a | 157 MIPS (native ops on their slow paths) | ~1,380 MIPS |
 | `saturating narrow loop` (SQXTN and SQXTN2 to H and B, one source saturating, ST1) | 23 MIPS | n/a | 34 MIPS | ~2,390 MIPS |
-| `estimate loop` (FRSQRTE and FRECPE .4S and S, FRSQRTE .2S, ST1) | 45 MIPS | n/a | 60 MIPS | ~820 MIPS |
+| `estimate loop` (FRSQRTE and FRECPE .4S and S, FRSQRTE .2S, ST1) | 40 MIPS | n/a | 54 MIPS | ~730 MIPS |
 
 ## CRC32
 

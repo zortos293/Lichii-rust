@@ -445,7 +445,7 @@ const WORKLOADS: &[Workload] = &[
             0xd4000001, // svc #0
         ],
         far: &[],
-        per_iteration: 9,
+        per_iteration: 8,
     },
     Workload {
         name: "popcount loop",
