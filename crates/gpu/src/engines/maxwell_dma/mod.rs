@@ -51,6 +51,7 @@ impl MaxwellDma {
             return;
         };
         *word = argument;
+        crate::diag_ring::note(b'D', method, argument);
         if method == reg_index!(Regs, launch_dma) {
             self.launch(ctx);
         }
@@ -118,6 +119,10 @@ impl MaxwellDma {
             }
         };
         let semaphore = &self.regs.semaphore;
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if ctx.memory.translate(semaphore.address.address()).is_none() && crate::diag_ring::first(&N, 8) {
+            tracing::warn!("DIAG a0 dma launch={:#x} payload={:#x} addr={:#x} ring: {}", launch.0, semaphore.payload, semaphore.address.address(), crate::diag_ring::dump());
+        }
         ctx.rasterizer.query(
             ctx.channel,
             ctx.memory,

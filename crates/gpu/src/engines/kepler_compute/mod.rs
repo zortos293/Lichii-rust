@@ -113,6 +113,7 @@ impl KeplerCompute {
             return;
         };
         *word = argument;
+        crate::diag_ring::note(b'C', method, argument);
         match (self.version, method) {
             (_, EXEC_UPLOAD) => {
                 if self.version == QmdVersion::V2 {
@@ -260,7 +261,13 @@ impl KeplerCompute {
                 continue;
             }
             match release.decode() {
-                Some(release) => perform_release(ctx, &release),
+                Some(r) => {
+                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if ctx.memory.translate(r.address).is_none() && crate::diag_ring::first(&N, 8) {
+                        tracing::warn!("DIAG a0 qmd={:#x} slot={} words={:08x?} ring: {}", address, slot, words, crate::diag_ring::dump());
+                    }
+                    perform_release(ctx, &r)
+                }
                 None => tracing::warn!(
                     slot,
                     flags = release.flags.0,
@@ -306,6 +313,10 @@ impl KeplerCompute {
     fn report_semaphore(&self, ctx: &mut EngineContext<'_>) {
         let semaphore = &self.regs.report_semaphore;
         let control = semaphore.control;
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if ctx.memory.translate(semaphore.address()).is_none() && crate::diag_ring::first(&N, 8) {
+            tracing::warn!("DIAG a0 compute report regs={:08x?} ring: {}", bytemuck::bytes_of(semaphore).chunks(4).map(|c| u32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect::<Vec<_>>(), crate::diag_ring::dump());
+        }
         if !matches!(control.operation(), 0 | 2) {
             tracing::warn!(
                 operation = control.operation(),
