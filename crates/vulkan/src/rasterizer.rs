@@ -9,6 +9,7 @@
 mod draw;
 
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -64,6 +65,8 @@ impl LiveSettings {
 
 /// Frame images kept for reuse; one is being written while the presenter holds up to two.
 const FRAME_POOL: usize = 4;
+/// The translated programs of a title, in its disk cache directory.
+const SHADER_CACHE_FILE: &str = "shaders.bin";
 
 /// The Vulkan renderer. Owns the GPU thread's scheduler; shares only the device with the
 /// presenter, and hands it frames through the mailbox.
@@ -182,6 +185,27 @@ impl VulkanRasterizer {
             texture_cache,
             live: None,
         })
+    }
+
+    /// Keeps translated shaders and pipelines of the running title in `dir` (one directory per
+    /// title) and starts building the pipelines an earlier run used. Call it before the first
+    /// draw; it does nothing when `settings.disk_shader_cache` is off.
+    pub fn open_disk_cache(&mut self, dir: &Path, settings: &GraphicsSettings) -> Result<()> {
+        if !settings.disk_shader_cache {
+            return Ok(());
+        }
+        std::fs::create_dir_all(dir)?;
+        self.draw.shaders.open_disk(dir.join(SHADER_CACHE_FILE))?;
+        self.draw.pipelines.open_disk(dir, settings)?;
+        let modules = self.draw.shaders.disk_modules();
+        let queued = self
+            .draw
+            .pipelines
+            .prebuild(|hash| modules.get(&hash).cloned());
+        if queued > 0 {
+            tracing::info!("building {queued} pipelines from the disk cache");
+        }
+        Ok(())
     }
 
     /// Applies the settings the renderer reads while running: the resolution scale render
@@ -779,6 +803,7 @@ impl Rasterizer for VulkanRasterizer {
 
     fn present(&mut self, framebuffer: &FramebufferConfig) {
         self.handles.timestamp.frame_presented();
+        self.draw.shaders.flush_disk();
         let cached = match self.texture_cache.presentable(framebuffer) {
             Some(id) => self.present_cached(framebuffer, id),
             None => Ok(false),

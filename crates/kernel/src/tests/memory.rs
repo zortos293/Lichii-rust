@@ -427,3 +427,106 @@ fn program_image_address_space_and_validation() {
         Some(result::INVALID_MEMORY_REGION)
     );
 }
+
+#[test]
+fn reprotected_and_remapped_code_runs_fresh_on_the_jit() {
+    use lichii_common::settings::CpuBackend;
+    use lichii_cpu::{CpuCore, HaltReason, ThreadContext};
+    use lichii_memory::MemoryPermission;
+
+    use crate::memory::MemoryState;
+    use crate::{Kernel, KernelConfig};
+
+    const BRK: u32 = 0xd420_0000;
+    let mov_w0 = |imm: u32| (0x5280_0000 | imm << 5).to_le_bytes();
+    let kernel = Kernel::new(KernelConfig {
+        cpu: Arc::new(|config| lichii_cpu::new_core(CpuBackend::Jit, config)),
+        ..crate::testing::config(ConsoleGeneration::Switch1)
+    })
+    .unwrap();
+    let process = kernel
+        .create_process(&crate::testing::program_image(0x0100_0000_0000_2000))
+        .unwrap();
+    let table = process.page_table();
+    let code = |value: u32| [mov_w0(value), BRK.to_le_bytes()].concat();
+    let write = |value: u32, addr| process.memory().write_bytes(addr, &code(value)).unwrap();
+    let mut cpu = kernel.0.new_cpu(&process, 0);
+    let run = |cpu: &mut Box<dyn CpuCore>, addr| {
+        for (pid, start, size) in kernel.0.take_invalidations(0) {
+            if pid == process.id() {
+                cpu.invalidate_code(start, size);
+            }
+        }
+        let mut ctx = ThreadContext {
+            pc: addr,
+            ..Default::default()
+        };
+        assert_eq!(cpu.run(&mut ctx), HaltReason::Breakpoint(0));
+        ctx.x[0]
+    };
+
+    let addr = table
+        .map_new_in(
+            table.regions().alias,
+            0x1000,
+            MemoryState::CODE,
+            MemoryPermission::READ_WRITE,
+        )
+        .unwrap();
+    write(1, addr);
+    table
+        .set_process_memory_permission(
+            addr,
+            0x1000,
+            MemoryState::CODE,
+            MemoryPermission::READ_EXECUTE,
+        )
+        .unwrap();
+    assert_eq!(run(&mut cpu, addr), 1);
+
+    table
+        .set_process_memory_permission(
+            addr,
+            0x1000,
+            MemoryState::CODE,
+            MemoryPermission::READ_WRITE,
+        )
+        .unwrap();
+    write(2, addr);
+    table
+        .set_process_memory_permission(
+            addr,
+            0x1000,
+            MemoryState::CODE,
+            MemoryPermission::READ_EXECUTE,
+        )
+        .unwrap();
+    assert_eq!(run(&mut cpu, addr), 2, "code patched behind a reprotect");
+
+    table
+        .unmap_and_free(addr, 0x1000, MemoryState::CODE)
+        .unwrap();
+    table
+        .map_new(
+            addr,
+            0x1000,
+            MemoryState::CODE,
+            MemoryPermission::READ_WRITE,
+        )
+        .unwrap();
+    write(3, addr);
+    table
+        .set_process_memory_permission(
+            addr,
+            0x1000,
+            MemoryState::CODE,
+            MemoryPermission::READ_EXECUTE,
+        )
+        .unwrap();
+    assert_eq!(
+        run(&mut cpu, addr),
+        3,
+        "different code mapped at the same address"
+    );
+    kernel.shutdown();
+}

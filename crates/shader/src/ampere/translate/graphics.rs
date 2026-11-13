@@ -366,6 +366,7 @@ fn lepc(t: &mut Translator<'_>) -> TResult {
     }
     let dest = t.insn.dst();
     let address = t.base + u64::from(t.pc);
+    t.ir.prog.reads_start_address = true;
     t.set_x(dest, Value::U32(address as u32));
     t.set_x(dest.offset(1), Value::U32((address >> 32) as u32));
     Ok(())

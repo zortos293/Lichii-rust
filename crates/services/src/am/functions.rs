@@ -2,16 +2,14 @@
 
 use std::sync::Arc;
 
+use super::library_applet::{LibraryApplet, LibraryAppletAccessor, normalize_applet_id};
 use super::storage::{Charge, Storage, StorageData};
-use super::{Applet, NO_DATA_IN_CHANNEL, push_bool, push_event};
+use super::{Applet, NO_DATA_IN_CHANNEL, UNKNOWN, push_bool, push_event};
 use crate::dispatch::push_nx2_stub;
 use crate::{Service, ServiceContext};
 use lichii_common::settings::Language;
 use lichii_common::{ConsoleGeneration, ResultCode};
 use lichii_kernel::ipc::HleRequestContext;
-
-/// Eden's `ResultUnknown`.
-const UNKNOWN: ResultCode = ResultCode(u32::MAX);
 
 /// `nn::am::service::LaunchParameterKind::UserChannel`.
 const USER_CHANNEL: u32 = 1;
@@ -50,7 +48,9 @@ impl Service for ApplicationFunctions {
                     _ => None,
                 };
                 match data {
-                    Some(data) => push_storage(context, ctx, StorageData::new(data, None)),
+                    Some(data) => {
+                        push_storage(context, ctx, Arc::new(StorageData::new(data, None)))
+                    }
                     None => {
                         tracing::warn!(kind, "no launch parameter");
                         NO_DATA_IN_CHANNEL
@@ -154,7 +154,7 @@ impl Service for ApplicationFunctions {
             130 => push_event(ctx, &applet.gpu_error_event),
             140 => push_event(ctx, &applet.friend_invitation_event),
             141 => match applet.state.lock().friend_invitations.pop() {
-                Some(data) => push_storage(context, ctx, StorageData::new(data, None)),
+                Some(data) => push_storage(context, ctx, Arc::new(StorageData::new(data, None))),
                 None => NO_DATA_IN_CHANNEL,
             },
             150 => push_event(ctx, &applet.notification_event),
@@ -189,6 +189,21 @@ impl Service for LibraryAppletCreator {
 
     fn handle(&self, ctx: &mut HleRequestContext) -> Option<ResultCode> {
         Some(match ctx.command() {
+            0 => {
+                let (id, mode): (u32, u32) = (ctx.pop(), ctx.pop());
+                tracing::info!(
+                    applet = format_args!("{id:#x}"),
+                    mode,
+                    "CreateLibraryApplet"
+                );
+                let applet = LibraryApplet::new(normalize_applet_id(id), mode);
+                self.applet.library_applet_launchable_event.signal();
+                ctx.push_interface(self.context.handler(LibraryAppletAccessor {
+                    context: self.context.clone(),
+                    applet: Arc::new(applet),
+                }));
+                ResultCode::SUCCESS
+            }
             10 => {
                 let size: i64 = ctx.pop();
                 if size <= 0 || size > MAX_STORAGE_SIZE {
@@ -205,7 +220,11 @@ impl Service for LibraryAppletCreator {
                     return Some(UNKNOWN);
                 }
                 data.resize(size, 0);
-                push_storage(&self.context, ctx, StorageData::new(data, Some(charge)))
+                push_storage(
+                    &self.context,
+                    ctx,
+                    Arc::new(StorageData::new(data, Some(charge))),
+                )
             }
             _ => return None,
         })
@@ -226,14 +245,14 @@ fn preselected_user(context: &ServiceContext, applet: &Applet) -> Option<Vec<u8>
     Some(data)
 }
 
-fn push_storage(
+pub(super) fn push_storage(
     context: &Arc<ServiceContext>,
     ctx: &mut HleRequestContext,
-    data: StorageData,
+    data: Arc<StorageData>,
 ) -> ResultCode {
     ctx.push_interface(context.handler(Storage {
         context: context.clone(),
-        data: Arc::new(data),
+        data,
     }));
     ResultCode::SUCCESS
 }

@@ -4,8 +4,10 @@
 //! There is one application and no home menu, so the application is always in the foreground and
 //! in focus. Its first message is `FocusStateChanged`.
 
+pub mod applets;
 mod controllers;
 mod functions;
+mod library_applet;
 mod proxy;
 mod storage;
 
@@ -25,6 +27,8 @@ const fn am(description: u32) -> ResultCode {
     ResultCode::new(128, description)
 }
 
+/// Eden's `ResultUnknown`.
+pub(crate) const UNKNOWN: ResultCode = ResultCode(u32::MAX);
 pub(crate) const NO_DATA_IN_CHANNEL: ResultCode = am(2);
 pub(crate) const NO_MESSAGES: ResultCode = am(3);
 pub(crate) const INVALID_OFFSET: ResultCode = am(503);

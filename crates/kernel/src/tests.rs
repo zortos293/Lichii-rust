@@ -206,6 +206,11 @@ pub(crate) struct TestKernel {
 
 impl TestKernel {
     pub fn new(console: ConsoleGeneration) -> Self {
+        Self::with_fastmem(console, false)
+    }
+
+    /// A test kernel whose process address spaces get fastmem arenas when `fastmem` is set.
+    pub fn with_fastmem(console: ConsoleGeneration, fastmem: bool) -> Self {
         let scripts = Arc::new(Scripts::default());
         let factory_scripts = scripts.clone();
         let (tx, exits) = crossbeam_channel::unbounded();
@@ -217,7 +222,7 @@ impl TestKernel {
                 applet: 16 << 20,
                 system_non_secure: 16 << 20,
             }),
-            fastmem: false,
+            fastmem,
             cpu_accuracy: CpuAccuracy::Auto,
             aslr: false,
             rng_seed: 1,

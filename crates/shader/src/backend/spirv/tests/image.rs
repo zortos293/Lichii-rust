@@ -1050,6 +1050,121 @@ fn descriptor_arrays_index_their_elements_and_mark_non_uniform_indices() {
     }
 }
 
+/// A fragment program sampling descriptor arrays with implicit lods at one index: the lane
+/// id, or arithmetic on constants.
+fn table_sample_program(varying_index: bool) -> crate::translate::TranslatedProgram {
+    let mut s = Synthetic::new();
+    let b = s.block();
+    let index = if varying_index {
+        s.inst(b, Opcode::LaneId, &[])
+    } else {
+        let two = s.inst(
+            b,
+            Opcode::ShiftLeftLogical32,
+            &[Value::U32(1), Value::U32(1)],
+        );
+        s.inst(b, Opcode::IAdd32, &[two, Value::U32(1)])
+    };
+    let coords = f32x2(&mut s, b, 0.5, 0.25);
+    let both = TextureInstInfo {
+        has_bias: true,
+        has_lod_clamp: true,
+        ..flags(0, TextureType::Color2D)
+    };
+    let bias_lc = f32x2(&mut s, b, 1.0, 2.0);
+    s.inst_flags(
+        b,
+        Opcode::ImageSampleImplicitLod,
+        &[index, coords, bias_lc, Value::Void],
+        both.to_flags(),
+    );
+    let layered = s.inst(
+        b,
+        Opcode::CompositeConstructF32x3,
+        &[Value::F32(0.5), Value::F32(0.25), Value::F32(1.0)],
+    );
+    s.inst_flags(
+        b,
+        Opcode::ImageSampleDrefImplicitLod,
+        &[index, layered, Value::F32(0.5), Value::Void, Value::Void],
+        flags(1, TextureType::ColorArray2D).to_flags(),
+    );
+    let table = |descriptor: TextureDescriptor| TextureDescriptor {
+        count: 64,
+        is_descriptor_array: true,
+        ..descriptor
+    };
+    let info = ShaderInfo {
+        uses_subgroup_invocation_id: true,
+        texture_descriptors: vec![
+            table(texture(TextureType::Color2D)),
+            table(TextureDescriptor {
+                is_depth: true,
+                ..texture(TextureType::ColorArray2D)
+            }),
+        ],
+        ..ShaderInfo::default()
+    };
+    finish(s, b, ShaderStage::Fragment, info)
+}
+
+#[test]
+fn varying_table_indices_sample_with_explicit_gradients() {
+    let profile = Profile {
+        support_sampled_image_array_nonuniform_indexing: true,
+        ..Profile::default()
+    };
+    let implicit_samples = |module: &dr::Module| {
+        count_ops(module, Op::ImageSampleImplicitLod)
+            + count_ops(module, Op::ImageSampleDrefImplicitLod)
+    };
+
+    let varying = table_sample_program(true);
+    let module = emit(
+        "table_gradients",
+        &profile,
+        &RuntimeInfo::default(),
+        &varying,
+    );
+    assert_eq!(implicit_samples(&module), 0);
+    assert_eq!(count_ops(&module, Op::ImageSampleExplicitLod), 1);
+    assert_eq!(count_ops(&module, Op::ImageSampleDrefExplicitLod), 1);
+    assert_eq!(count_ops(&module, Op::DPdx), 2);
+    assert_eq!(count_ops(&module, Op::DPdy), 2);
+    assert_eq!(
+        count_ops(&module, Op::VectorTimesScalar),
+        2,
+        "bias scales one pair"
+    );
+    assert!(has_capability(&module, Capability::MinLod));
+
+    let uniform = table_sample_program(false);
+    let module = emit("table_uniform", &profile, &RuntimeInfo::default(), &uniform);
+    assert_eq!(
+        implicit_samples(&module),
+        2,
+        "a constant index keeps implicit lods"
+    );
+    assert_eq!(count_ops(&module, Op::DPdx), 0);
+
+    let quad_divergent = Profile {
+        support_quad_divergent_implicit_lod: true,
+        ..profile
+    };
+    let module = emit(
+        "table_quad_divergent",
+        &quad_divergent,
+        &RuntimeInfo::default(),
+        &varying,
+    );
+    assert_eq!(
+        implicit_samples(&module),
+        2,
+        "the device handles divergent lods"
+    );
+    assert_eq!(count_ops(&module, Op::DPdx), 0);
+}
+
 #[test]
 fn image_atomics_on_images_and_texel_buffers() {
     let mut s = Synthetic::new();

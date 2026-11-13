@@ -5,7 +5,9 @@ use crate::handle::HandleProgram;
 use crate::ir::{Attribute, ImageFormat, TextureType, Type};
 
 /// One bit per attribute (indexed by `Attribute.0`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct VaryingState(pub [u64; 8]);
 
 impl VaryingState {
@@ -62,7 +64,9 @@ impl VaryingState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum Interpolation {
     #[default]
     Smooth,
@@ -71,7 +75,9 @@ pub enum Interpolation {
 }
 
 /// A guest constant buffer bound as a uniform buffer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct ConstantBufferDescriptor {
     pub index: u32,
     pub count: u32,
@@ -79,7 +85,9 @@ pub struct ConstantBufferDescriptor {
 
 /// A guest global memory region bound as a storage buffer. Its GPU address and size are the
 /// 64-bit address and 32-bit size at `cbuf_offset` of constant buffer `cbuf_index`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct StorageBufferDescriptor {
     pub cbuf_index: u32,
     pub cbuf_offset: u32,
@@ -105,7 +113,19 @@ impl StorageBufferDescriptor {
 ///
 /// A Switch 2 native program's storage pointer carries no size, so the renderer binds a large
 /// range behind it; this is what it can claim a dispatch wrote instead of all of it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct StorageWriteExtent {
     /// False: the reach is not known (or the buffer is never written); take the whole binding.
     pub bounded: bool,
@@ -153,7 +173,19 @@ impl StorageWriteExtent {
 /// Where a texture handle comes from: the word at `cbuf_offset` of constant buffer
 /// `cbuf_index`, shifted left by `shift_left`, ORed with an optional secondary word (separate
 /// sampler handles).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct HandleSource {
     pub cbuf_index: u32,
     pub cbuf_offset: u32,
@@ -161,7 +193,7 @@ pub struct HandleSource {
     pub secondary: Option<(u32, u32, u32)>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TextureBufferDescriptor {
     pub handle: HandleSource,
     /// Array length; consecutive handles are `1 << size_shift` bytes apart.
@@ -173,7 +205,7 @@ pub struct TextureBufferDescriptor {
     pub handle_program: Option<u32>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ImageBufferDescriptor {
     pub format: ImageFormat,
     pub is_written: bool,
@@ -189,7 +221,7 @@ pub struct ImageBufferDescriptor {
     pub handle_program: Option<u32>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TextureDescriptor {
     pub ty: TextureType,
     pub is_depth: bool,
@@ -214,7 +246,7 @@ pub struct TextureDescriptor {
     pub handle_program: Option<u32>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ImageDescriptor {
     pub ty: TextureType,
     pub format: ImageFormat,
@@ -234,7 +266,7 @@ pub struct ImageDescriptor {
 }
 
 /// Task and mesh program layout (Switch 2 NVN task/mesh, see NX2_NOTES row 89).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MeshInfo {
     /// Task output / mesh input region, in 32-bit words.
     pub payload_words: u32,
@@ -260,8 +292,11 @@ impl MeshInfo {
 ///
 /// Descriptor order is binding order: uniform buffers, storage buffers, texture buffers, image
 /// buffers, textures, images, each in the order of its vector.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ShaderInfo {
+    /// The module holds the program's absolute address (Ampere LEPC), so it must not be reused
+    /// for the same code at another address; [`crate::ShaderModule::hash`] covers the address.
+    pub reads_start_address: bool,
     pub uses_workgroup_id: bool,
     pub uses_local_invocation_id: bool,
     pub uses_invocation_id: bool,
@@ -374,7 +409,7 @@ impl ShaderInfo {
 }
 
 /// Pixel format of a texture descriptor (TIC), as far as translation cares.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum TexturePixelFormat {
     A8b8g8r8Unorm,
     A8b8g8r8Snorm,
@@ -491,7 +526,7 @@ pub enum TexturePixelFormat {
 }
 
 /// Draw parameter a constant buffer word holds when HLE macros replaced it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ReplaceConstant {
     BaseInstance,
     BaseVertex,

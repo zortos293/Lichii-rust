@@ -14,6 +14,7 @@ pub mod key;
 pub mod maxwell_to_vk;
 pub mod sampler;
 pub mod shader_cache;
+mod shader_disk;
 
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
@@ -141,8 +142,9 @@ impl PipelineFeatures {
     }
 
     /// The dynamic states pipelines built with these features declare; the rasterizer sets
-    /// each of them before drawing.
-    pub fn dynamic_states(&self) -> Vec<vk::DynamicState> {
+    /// each of them before drawing. `mesh` pipelines have no vertex input or input assembly
+    /// state, so they leave out the dynamic states that belong to those.
+    pub fn dynamic_states(&self, mesh: bool) -> Vec<vk::DynamicState> {
         use vk::DynamicState as D;
         let mut states = vec![
             D::LINE_WIDTH,
@@ -159,7 +161,6 @@ impl PipelineFeatures {
                 D::SCISSOR_WITH_COUNT,
                 D::CULL_MODE,
                 D::FRONT_FACE,
-                D::PRIMITIVE_TOPOLOGY,
                 D::DEPTH_TEST_ENABLE,
                 D::DEPTH_WRITE_ENABLE,
                 D::DEPTH_COMPARE_OP,
@@ -167,21 +168,26 @@ impl PipelineFeatures {
                 D::STENCIL_TEST_ENABLE,
                 D::STENCIL_OP,
             ]);
-            if !self.dynamic_vertex_input {
+            if !mesh {
+                states.push(D::PRIMITIVE_TOPOLOGY);
+            }
+            if !mesh && !self.dynamic_vertex_input {
                 states.push(D::VERTEX_INPUT_BINDING_STRIDE);
             }
         } else {
             states.extend([D::VIEWPORT, D::SCISSOR]);
         }
         if self.extended_dynamic_state2 {
-            states.extend([
-                D::RASTERIZER_DISCARD_ENABLE,
-                D::DEPTH_BIAS_ENABLE,
-                D::PRIMITIVE_RESTART_ENABLE,
-            ]);
+            states.extend([D::RASTERIZER_DISCARD_ENABLE, D::DEPTH_BIAS_ENABLE]);
+            if !mesh {
+                states.push(D::PRIMITIVE_RESTART_ENABLE);
+            }
         }
         for (enabled, dynamic) in [
-            (self.dynamic_vertex_input, &[D::VERTEX_INPUT_EXT][..]),
+            (
+                self.dynamic_vertex_input && !mesh,
+                &[D::VERTEX_INPUT_EXT][..],
+            ),
             (
                 self.dynamic_blend,
                 &[

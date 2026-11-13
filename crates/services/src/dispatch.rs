@@ -61,6 +61,10 @@ impl<S: Service> SessionHandler for Dispatch<S> {
         }
         result
     }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(&self.service)
+    }
 }
 
 /// Prefix of Switch 2 interfaces whose commands are not known yet; their unknown commands are

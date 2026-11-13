@@ -36,6 +36,7 @@ macro_rules! test_gpu_state {
 
 pub mod ampere;
 pub mod backend;
+pub mod cache;
 pub mod flow;
 pub mod handle;
 mod hash;
@@ -58,7 +59,7 @@ pub use runtime::RuntimeInfo;
 
 use lichii_common::GpuVAddr;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ShaderStage {
     VertexA,
     VertexB,
@@ -72,7 +73,7 @@ pub enum ShaderStage {
 }
 
 /// Instruction set of the guest program.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ShaderArch {
     /// 64-bit instructions with scheduling words (Switch 1).
     Maxwell,
@@ -151,7 +152,9 @@ pub trait ShaderEnvironment {
 }
 
 /// The draw state a task or mesh program is translated against.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct MeshState {
     /// SET_MESH_SHADER_A: output topology in bits 3:0 (0 points, 1 lines, 4 triangles), maximum
     /// vertices in 12:4, maximum primitives in 22:13.

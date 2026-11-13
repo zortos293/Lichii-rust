@@ -15,32 +15,33 @@ use opus1::multistream::MultistreamDecoder;
 use opus1::{Channels, ErrorKind, OpusDecoder, SampleRate};
 use parking_lot::Mutex;
 
+use super::hwacod::{ClientSession, CodecTags};
 use crate::{Service, ServiceContext};
 
 const MODULE: u32 = 111;
-const LIB_OPUS_BAD_ARG: ResultCode = ResultCode::new(MODULE, 2);
-const BUFFER_TOO_SMALL: ResultCode = ResultCode::new(MODULE, 3);
+pub(super) const LIB_OPUS_BAD_ARG: ResultCode = ResultCode::new(MODULE, 2);
+pub(super) const BUFFER_TOO_SMALL: ResultCode = ResultCode::new(MODULE, 3);
 const LIB_OPUS_INTERNAL_ERROR: ResultCode = ResultCode::new(MODULE, 4);
 const LIB_OPUS_UNIMPLEMENTED: ResultCode = ResultCode::new(MODULE, 5);
 const LIB_OPUS_INVALID_STATE: ResultCode = ResultCode::new(MODULE, 6);
 const LIB_OPUS_ALLOC_FAIL: ResultCode = ResultCode::new(MODULE, 7);
-const INPUT_DATA_TOO_SMALL: ResultCode = ResultCode::new(MODULE, 8);
-const LIB_OPUS_INVALID_PACKET: ResultCode = ResultCode::new(MODULE, 17);
+pub(super) const INPUT_DATA_TOO_SMALL: ResultCode = ResultCode::new(MODULE, 8);
+pub(super) const LIB_OPUS_INVALID_PACKET: ResultCode = ResultCode::new(MODULE, 17);
 const OUT_OF_OPUS_DECODERS: ResultCode = ResultCode::new(MODULE, 385);
-const INVALID_OPUS_SAMPLE_RATE: ResultCode = ResultCode::new(MODULE, 1001);
-const INVALID_OPUS_CHANNEL_COUNT: ResultCode = ResultCode::new(MODULE, 1002);
+pub(super) const INVALID_OPUS_SAMPLE_RATE: ResultCode = ResultCode::new(MODULE, 1001);
+pub(super) const INVALID_OPUS_CHANNEL_COUNT: ResultCode = ResultCode::new(MODULE, 1002);
 
 /// Decoders the DSP holds at once.
 const MAX_DECODERS: usize = 24;
 const OPUS_STREAM_COUNT_MAX: u32 = 255;
 /// `sizeof(OpusDecodeObject)` (and the multistream one) on the 64-bit DSP side.
-const DECODE_OBJECT_SIZE: u32 = 24;
+pub(super) const DECODE_OBJECT_SIZE: u32 = 24;
 /// `opus_decoder_get_size` of libopus without the neural features, mono and stereo.
-const DECODER_SIZE: [u32; 2] = [18468, 27236];
+pub(super) const DECODER_SIZE: [u32; 2] = [18468, 27236];
 /// `opus_multistream_decoder_get_size`'s layout header and per-stream decoders (8-aligned).
-const MULTI_STREAM_HEADER_SIZE: u32 = 272;
-const ALIGNED_MONO_DECODER_SIZE: u32 = 18472;
-const ALIGNED_STEREO_DECODER_SIZE: u32 = 27240;
+pub(super) const MULTI_STREAM_HEADER_SIZE: u32 = 272;
+pub(super) const ALIGNED_MONO_DECODER_SIZE: u32 = 18472;
+pub(super) const ALIGNED_STEREO_DECODER_SIZE: u32 = 27240;
 /// The input area of a single-stream decoder's work buffer.
 const SINGLE_STREAM_INPUT_SIZE: usize = 0x600;
 
@@ -172,7 +173,7 @@ fn multi_stream_work_buffer_size(params: &OpusMultiStreamParametersEx) -> HleRes
     Ok(decoder + input + output)
 }
 
-fn opus_result(err: opus1::Error) -> ResultCode {
+pub(super) fn opus_result(err: opus1::Error) -> ResultCode {
     match err.kind() {
         ErrorKind::BadArg => LIB_OPUS_BAD_ARG,
         ErrorKind::BufferTooSmall => BUFFER_TOO_SMALL,
@@ -186,15 +187,18 @@ fn opus_result(err: opus1::Error) -> ResultCode {
 
 pub(super) fn register(context: &Arc<ServiceContext>) -> HleResult<()> {
     let open = Arc::new(Mutex::new(0));
+    let tags = Arc::new(CodecTags::new());
     context.register("hwopus", "hwopus", move |context| HwOpus {
         context: context.clone(),
         open: open.clone(),
+        tags: tags.clone(),
     })
 }
 
 struct HwOpus {
     context: Arc<ServiceContext>,
     open: Arc<Mutex<usize>>,
+    tags: Arc<CodecTags>,
 }
 
 /// One of the DSP's decoder slots, freed when the decoder closes.
@@ -263,6 +267,13 @@ impl Service for HwOpus {
             7 | 9 => read_pointer_params::<OpusMultiStreamParametersEx>(ctx)
                 .and_then(|params| multi_stream_work_buffer_size(&params))
                 .map(|size| ctx.push(size)),
+            100 => {
+                ctx.push_interface(self.context.handler(ClientSession {
+                    context: self.context.clone(),
+                    tags: self.tags.clone(),
+                }));
+                Ok(())
+            }
             _ => return None,
         };
         Some(result.into())

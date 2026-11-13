@@ -16,6 +16,8 @@ pub enum Error {
     NoSurfaceFormat,
     #[error("allocating device memory: {0}")]
     Allocation(#[from] gpu_allocator::AllocationError),
+    #[error("accessing the disk shader cache: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
