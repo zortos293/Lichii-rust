@@ -105,7 +105,14 @@ pub struct Thread {
     /// Threads waiting for mutexes this thread owns; they lend it their priority.
     lock_waiters: Mutex<Vec<LockWaiter>>,
     /// The owner of the mutex this thread waits for.
-    lock_owner: Mutex<Weak<Thread>>,
+    lock_owner: Mutex<LockOwner>,
+}
+
+/// Link from a waiter to the owner it lends its priority to, for the waiter's wait `token`.
+#[derive(Default)]
+struct LockOwner {
+    thread: Weak<Thread>,
+    token: u64,
 }
 
 struct LockWaiter {
@@ -206,7 +213,8 @@ impl Thread {
     /// `waiter` (in wait `token`) waits for the mutex at `mutex`, which this thread owns.
     ///
     /// The owner link is set before the wait is checked: a wake that ends the wait either
-    /// happened first, so the check fails, or sees the link and withdraws the donation.
+    /// happened first, so the check fails, or sees the link and withdraws the donation. A link
+    /// left by an earlier wait whose wake has not withdrawn it yet is withdrawn here.
     pub(crate) fn add_lock_waiter(
         self: &Arc<Self>,
         waiter: &Arc<Thread>,
@@ -214,27 +222,42 @@ impl Thread {
         mutex: VAddr,
     ) {
         let held = self.lock_inheritance();
-        *waiter.lock_owner.lock() = Arc::downgrade(self);
-        if !waiter.is_waiting_on(token) {
-            *waiter.lock_owner.lock() = Weak::new();
-            return;
-        }
-        self.lock_waiters.lock().push(LockWaiter {
-            thread: waiter.clone(),
+        let link = LockOwner {
+            thread: Arc::downgrade(self),
             token,
-            mutex,
-        });
+        };
+        let previous = std::mem::replace(&mut *waiter.lock_owner.lock(), link);
+        if waiter.is_waiting_on(token) {
+            self.lock_waiters.lock().push(LockWaiter {
+                thread: waiter.clone(),
+                token,
+                mutex,
+            });
+        } else {
+            *waiter.lock_owner.lock() = LockOwner::default();
+        }
+        if let Some(previous) = previous.thread.upgrade()
+            && !Arc::ptr_eq(&previous, self)
+        {
+            previous.restore_priority(&held);
+        }
         self.restore_priority(&held);
     }
 
     /// The thread's wait ended other than by a mutex handoff: it stops lending its priority to
     /// the owner of the mutex it waited for.
-    fn leave_lock_wait(self: &Arc<Self>) {
-        if self.lock_owner.lock().strong_count() == 0 {
+    fn leave_lock_wait(self: &Arc<Self>, token: u64) {
+        if token == 0 || self.lock_owner.lock().token != token {
             return;
         }
         let held = self.lock_inheritance();
-        let owner = std::mem::take(&mut *self.lock_owner.lock()).upgrade();
+        let owner = {
+            let mut link = self.lock_owner.lock();
+            if link.token != token {
+                return;
+            }
+            std::mem::take(&mut *link).thread.upgrade()
+        };
         if let Some(owner) = owner {
             owner.restore_priority(&held);
         }
@@ -257,13 +280,16 @@ impl Thread {
             moved
         };
         if let Some(next) = next {
-            *next.lock_owner.lock() = Weak::new();
+            *next.lock_owner.lock() = LockOwner::default();
             let moved: Vec<LockWaiter> = moved
                 .into_iter()
                 .filter(|w| !Arc::ptr_eq(&w.thread, next) && w.thread.is_waiting_on(w.token))
                 .collect();
             for waiter in &moved {
-                *waiter.thread.lock_owner.lock() = Arc::downgrade(next);
+                *waiter.thread.lock_owner.lock() = LockOwner {
+                    thread: Arc::downgrade(next),
+                    token: waiter.token,
+                };
             }
             next.lock_waiters.lock().extend(moved);
             next.restore_priority(held);
@@ -289,7 +315,7 @@ impl Thread {
                 }
                 thread.apply_priority(&mut s, priority);
             }
-            let Some(owner) = thread.lock_owner.lock().upgrade() else {
+            let Some(owner) = thread.lock_owner.lock().thread.upgrade() else {
                 return;
             };
             thread = owner;
@@ -377,7 +403,7 @@ impl Thread {
         }
         self.wake_locked(&mut s, wake);
         drop(s);
-        self.leave_lock_wait();
+        self.leave_lock_wait(token);
         true
     }
 
@@ -396,13 +422,14 @@ impl Thread {
 
     /// Marks the exiting thread terminated, ending any wait it is still in.
     pub(crate) fn mark_terminated(self: &Arc<Self>) {
+        let token = self.lock_owner.lock().token;
         {
             let mut s = self.sched.lock();
             s.state = ThreadState::Terminated;
             s.wait = 0;
             self.wait_token.store(0, Ordering::Release);
         }
-        self.leave_lock_wait();
+        self.leave_lock_wait(token);
     }
 
     /// Wakes the thread from the cancellable wait it is in, or makes its next one fail.
@@ -423,12 +450,13 @@ impl Thread {
         s.pause_requested = false;
         match s.state {
             ThreadState::Waiting => {
+                let token = s.wait;
                 self.wake_locked(
                     &mut s,
                     WakeResult::error(crate::result::TERMINATION_REQUESTED),
                 );
                 drop(s);
-                self.leave_lock_wait();
+                self.leave_lock_wait(token);
             }
             ThreadState::Suspended | ThreadState::Created => {
                 self.scheduler.enqueue(self, &mut s, true)

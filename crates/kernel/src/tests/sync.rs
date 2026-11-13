@@ -504,6 +504,23 @@ fn a_mutex_waiter_stops_lending_its_priority_when_its_wait_ends() {
         "an exited waiter withdraws its priority"
     );
 
+    let other_owner = thread(40);
+    let token = timed.begin_wait(Resume::Result, false).unwrap();
+    owner.add_lock_waiter(&timed, token, mutex);
+    timed.wake_locked(
+        &mut timed.sched.lock(),
+        WakeResult::error(result::TIMED_OUT),
+    );
+    let token = timed.begin_wait(Resume::Result, false).unwrap();
+    other_owner.add_lock_waiter(&timed, token, mutex + 4);
+    assert_eq!(
+        (owner.priority(), other_owner.priority()),
+        (50, 20),
+        "a waiter that blocks on another owner before its old wait is withdrawn moves its priority"
+    );
+    assert!(timed.wake(token, WakeResult::error(result::TIMED_OUT)));
+    assert_eq!(other_owner.priority(), 40);
+
     let token = late.begin_wait(Resume::Result, false).unwrap();
     assert!(late.wake(token, WakeResult::error(result::TIMED_OUT)));
     owner.add_lock_waiter(&late, token, mutex);
