@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 
 use lichii_common::DAddr;
+use lichii_memory::DeviceAddressSpace;
 use lichii_texture::block_linear::GobLayout;
 
 use crate::backend::{
@@ -39,7 +40,6 @@ pub(crate) enum SideCommand {
     CreateChannel(BackChannelSetup),
     DestroyChannel(ChannelId),
     BindAddressSpace(ChannelId, Arc<Gmmu>),
-    InvalidateRegion(DAddr, u64),
     FlushRegion(DAddr, u64),
     UnmapRegion(DAddr, u64),
     Present(FramebufferConfig),
@@ -56,6 +56,7 @@ struct BackChannel {
 /// Executes the stream.
 pub(crate) struct Back {
     rasterizer: Box<dyn Rasterizer>,
+    device: Arc<DeviceAddressSpace>,
     syncpoints: Arc<Syncpoints>,
     timestamp: Arc<GpuTimestamp>,
     engines: EngineFactory,
@@ -80,6 +81,7 @@ impl Back {
     ) -> Self {
         Self {
             rasterizer,
+            device: handles.device.clone(),
             syncpoints: handles.syncpoints.clone(),
             timestamp: handles.timestamp.clone(),
             engines,
@@ -97,6 +99,7 @@ impl Back {
     /// Executes everything published, until the ring is empty.
     pub(crate) fn run(&mut self, consumer: &mut Consumer) {
         while consumer.refill() {
+            self.drain_cpu_writes();
             while consumer.has_slots() {
                 let header = consumer.slot(0);
                 if header == WRAP {
@@ -111,6 +114,17 @@ impl Back {
                 }
             }
             consumer.release();
+        }
+    }
+
+    /// Drops the renderer's copies of device memory the guest CPU wrote while a cache held it.
+    /// Every write made before the work just published is seen here, ahead of that work.
+    #[inline]
+    fn drain_cpu_writes(&mut self) {
+        if self.device.has_cpu_writes() {
+            let rasterizer = &mut self.rasterizer;
+            self.device
+                .take_cpu_writes(|daddr, size| rasterizer.invalidate_region(daddr, size));
         }
     }
 
@@ -441,9 +455,6 @@ impl Back {
                 {
                     channel.setup.memory = memory;
                 }
-            }
-            SideCommand::InvalidateRegion(addr, size) => {
-                self.rasterizer.invalidate_region(addr, size)
             }
             SideCommand::FlushRegion(addr, size) => self.rasterizer.flush_region(addr, size),
             SideCommand::UnmapRegion(addr, size) => self.rasterizer.unmap_region(addr, size),
