@@ -92,12 +92,11 @@ impl ExclusiveMonitor {
         {
             return Ok(false);
         }
-        let ptr = mem.access(addr, MemoryPermission::WRITE)?;
         let expected = u128::from(slot.value_lo.load(Ordering::Relaxed))
             | u128::from(slot.value_hi.load(Ordering::Relaxed)) << 64;
         // SAFETY: exclusive accesses are naturally aligned, so ptr is aligned for the atomic type
         // and the value lies in one page.
-        let stored = unsafe {
+        mem.write_with(addr, MemoryPermission::WRITE, |ptr| unsafe {
             match size {
                 1 => cas::<AtomicU8, u8>(ptr, expected as u8, value as u8),
                 2 => cas::<AtomicU16, u16>(ptr, expected as u16, value as u16),
@@ -108,8 +107,7 @@ impl ExclusiveMonitor {
                     .is_ok(),
                 _ => unreachable!("exclusive size {size}"),
             }
-        };
-        Ok(stored)
+        })
     }
 
     pub fn clear(&self, core: usize) {

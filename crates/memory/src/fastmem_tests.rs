@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::{AddressSpace, FastmemError, HostFault, MemoryPermission, PhysicalMemory};
+use crate::{
+    AddressSpace, DeviceAddressSpace, FastmemError, HostFault, MemoryPermission, PhysicalMemory,
+};
 
 fn fastmem_space() -> Option<AddressSpace> {
     let physical = Arc::new(PhysicalMemory::new(1 << 26).unwrap());
@@ -168,5 +170,233 @@ mod faults {
         }
         stop.store(true, Ordering::Relaxed);
         churn.join().unwrap();
+    }
+
+    fn count_store(data: usize, _guest_addr: u64, fault: &mut HostFault) -> bool {
+        // SAFETY: `data` points at the test's counter, which outlives the arena.
+        unsafe { &*(data as *const AtomicU64) }.fetch_add(1, Ordering::SeqCst);
+        fault.set_pc(fault.pc() + 3);
+        true
+    }
+
+    fn store(base: *mut u8, va: u64, value: u64) {
+        // SAFETY: `mov [rdi], rsi` (3 bytes); a fault on it is handled by count_store, which
+        // steps over the instruction.
+        unsafe {
+            std::arch::asm!(
+                ".byte 0x48, 0x89, 0x37",
+                in("rdi") base.add(va as usize),
+                in("rsi") value,
+                options(nostack),
+            );
+        }
+    }
+
+    fn tracked_space() -> Option<(Arc<AddressSpace>, DeviceAddressSpace)> {
+        let space = Arc::new(fastmem_space()?);
+        let device = DeviceAddressSpace::new(space.physical().clone(), 36);
+        device.attach_process(space.clone());
+        Some((space, device))
+    }
+
+    #[test]
+    fn stores_to_cached_pages_fault_until_a_cpu_write_untracks_them() {
+        let faults = AtomicU64::new(0);
+        let Some((space, device)) = tracked_space() else {
+            return;
+        };
+        let fastmem = space.fastmem().unwrap();
+        fastmem.set_fault_handler(Some(count_store), &faults as *const AtomicU64 as usize);
+        let base = fastmem.base();
+        space.map(0x4000_0000, 0x10_0000, 0x2000, MemoryPermission::READ_WRITE);
+        device
+            .map_process(0x1_0000_0000, &space, 0x4000_0000, 0x2000)
+            .unwrap();
+
+        let cached = device.cache_pages(0x1_0000_0000, 0x1000);
+        store(base, 0x4000_0008, 1);
+        assert_eq!(
+            faults.load(Ordering::SeqCst),
+            1,
+            "the cached page is write-protected"
+        );
+        assert_eq!(host_read::<u64>(&space, 0x4000_0008), 0, "reads stay fast");
+        store(base, 0x4000_1008, 2);
+        assert_eq!(
+            faults.load(Ordering::SeqCst),
+            1,
+            "the page beside it is not cached"
+        );
+
+        space.guest_write(0x4000_0008, 3u64).unwrap();
+        assert!(device.has_cpu_writes());
+        store(base, 0x4000_0010, 4);
+        assert_eq!(
+            faults.load(Ordering::SeqCst),
+            1,
+            "the CPU write untracked the page"
+        );
+
+        let mut found = Vec::new();
+        device.take_cpu_writes(|daddr, size| found.push((daddr, size)));
+        assert_eq!(found, [(0x1_0000_0000, 0x1000)]);
+        drop(cached);
+        let _again = device.cache_pages(0x1_0000_0000, 0x1000);
+        store(base, 0x4000_0018, 5);
+        assert_eq!(
+            faults.load(Ordering::SeqCst),
+            2,
+            "caching again protects the page again"
+        );
+    }
+
+    #[test]
+    fn tracked_pages_stay_protected_through_protect_and_new_aliases() {
+        let faults = AtomicU64::new(0);
+        let Some((space, device)) = tracked_space() else {
+            return;
+        };
+        let fastmem = space.fastmem().unwrap();
+        fastmem.set_fault_handler(Some(count_store), &faults as *const AtomicU64 as usize);
+        let base = fastmem.base();
+        space.map(0x4000_0000, 0x10_0000, 0x4000, MemoryPermission::READ_WRITE);
+        device
+            .map_process(0x1_0000_0000, &space, 0x4000_0000, 0x4000)
+            .unwrap();
+        let _cached = device.cache_pages(0x1_0000_1000, 0x1000);
+
+        space.protect(0x4000_0000, 0x4000, MemoryPermission::READ);
+        space.protect(0x4000_0000, 0x4000, MemoryPermission::READ_WRITE);
+        store(base, 0x4000_1000, 1);
+        assert_eq!(
+            faults.load(Ordering::SeqCst),
+            1,
+            "protect keeps the page tracked"
+        );
+        store(base, 0x4000_2000, 2);
+        store(base, 0x4000_0000, 3);
+        assert_eq!(
+            faults.load(Ordering::SeqCst),
+            1,
+            "the views around it are writable"
+        );
+
+        space.map(0x5000_0000, 0x10_1000, 0x1000, MemoryPermission::READ_WRITE);
+        store(base, 0x5000_0000, 4);
+        assert_eq!(
+            faults.load(Ordering::SeqCst),
+            2,
+            "a new alias of the page is protected"
+        );
+        space.unmap(0x5000_0000, 0x1000);
+    }
+
+    #[test]
+    fn views_mapped_again_over_tracked_pages_publish_them() {
+        let faults = AtomicU64::new(0);
+        let Some((space, device)) = tracked_space() else {
+            return;
+        };
+        let fastmem = space.fastmem().unwrap();
+        fastmem.set_fault_handler(Some(count_store), &faults as *const AtomicU64 as usize);
+        let base = fastmem.base();
+        space.map(0x4000_0000, 0x10_0000, 0x4000, MemoryPermission::READ_WRITE);
+        device
+            .map_process(0x1_0000_0000, &space, 0x4000_0000, 0x4000)
+            .unwrap();
+        let _cached = device.cache_pages(0x1_0000_1000, 0x1000);
+
+        space.protect(0x4000_0000, 0x4000, MemoryPermission::READ_WRITE);
+        assert!(
+            !device.has_cpu_writes(),
+            "protecting a whole view never exposes it"
+        );
+        space.protect(0x4000_3000, 0x1000, MemoryPermission::READ);
+        let mut found = Vec::new();
+        device.take_cpu_writes(|daddr, size| found.push((daddr, size)));
+        assert_eq!(
+            !found.is_empty(),
+            cfg!(windows),
+            "only a Windows view split maps the tracked page again"
+        );
+        store(base, 0x4000_1000, 1);
+        assert_eq!(
+            faults.load(Ordering::SeqCst),
+            1,
+            "the page is still write-protected"
+        );
+
+        space.protect(0x4000_0000, 0x3000, MemoryPermission::READ);
+        assert!(
+            !device.has_cpu_writes(),
+            "protecting a whole view never exposes it"
+        );
+        space.protect(0x4000_0000, 0x1000, MemoryPermission::NONE);
+        let mut found = Vec::new();
+        device.take_cpu_writes(|daddr, size| found.push((daddr, size)));
+        assert_eq!(
+            !found.is_empty(),
+            cfg!(windows),
+            "a read-only view mapped again was briefly writable"
+        );
+
+        space.map(0x5000_0000, 0x10_1000, 0x1000, MemoryPermission::READ_WRITE);
+        let mut found = Vec::new();
+        device.take_cpu_writes(|daddr, size| found.push((daddr, size)));
+        assert_eq!(
+            found,
+            [(0x1_0000_1000, 0x1000)],
+            "a new alias was briefly writable"
+        );
+        space.unmap(0x5000_0000, 0x1000);
+    }
+
+    #[test]
+    fn many_scattered_pages_track_and_untrack() {
+        let faults = AtomicU64::new(0);
+        let Some((space, device)) = tracked_space() else {
+            return;
+        };
+        let fastmem = space.fastmem().unwrap();
+        fastmem.set_fault_handler(Some(count_store), &faults as *const AtomicU64 as usize);
+        let base = fastmem.base();
+        const PAGES: u64 = 0x2000;
+        let va = 0x4000_0000;
+        space.map(va, 0, PAGES * 0x1000, MemoryPermission::READ_WRITE);
+        device
+            .map_process(0x1_0000_0000, &space, va, PAGES * 0x1000)
+            .unwrap();
+        let page = |i: u64| 0x1_0000_0000 + i * 0x1000;
+
+        let mut guards: Vec<_> = (0..PAGES)
+            .step_by(3)
+            .map(|i| (i, device.cache_pages(page(i), 0x1000)))
+            .collect();
+        space.protect(va + 0x10_0000, 0x40_0000, MemoryPermission::READ);
+        space.protect(va, PAGES * 0x1000, MemoryPermission::READ_WRITE);
+        guards.retain(|(i, _)| i % 2 == 0);
+        for i in (0..PAGES).step_by(7) {
+            guards.push((i, device.cache_pages(page(i), 0x1000)));
+        }
+        let tracked: std::collections::BTreeSet<u64> = guards.iter().map(|(i, _)| *i).collect();
+        for i in 0..PAGES {
+            let before = faults.load(Ordering::SeqCst);
+            store(base, va + i * 0x1000, i);
+            let faulted = faults.load(Ordering::SeqCst) != before;
+            assert_eq!(faulted, tracked.contains(&i), "page {i}");
+            assert_eq!(
+                host_read::<u64>(&space, va + i * 0x1000),
+                if faulted { 0 } else { i }
+            );
+        }
+        guards.clear();
+        for i in 0..PAGES {
+            store(base, va + i * 0x1000, i + 1);
+        }
+        assert_eq!(
+            faults.load(Ordering::SeqCst),
+            tracked.len() as u64,
+            "every page is writable again"
+        );
     }
 }
