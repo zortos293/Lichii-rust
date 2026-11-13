@@ -3,6 +3,7 @@
 use rspirv::spirv::{SelectionControl, Word};
 use smallvec::SmallVec;
 
+use super::mesh;
 use crate::ShaderStage;
 use crate::backend::spirv::context::EmitContext;
 use crate::backend::spirv::{EmitError, EmitResult};
@@ -184,10 +185,13 @@ pub(super) fn prologue(ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<(
     if matches!(ctx.stage, ShaderStage::VertexB | ShaderStage::Geometry) {
         set_fixed_pipeline_point_size(ctx)?;
     }
-    Ok(())
+    mesh::prologue(ctx)
 }
 
 pub(super) fn epilogue(ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<()> {
+    if matches!(ctx.stage, ShaderStage::Task | ShaderStage::Mesh) {
+        return mesh::epilogue(ctx);
+    }
     let convert_depth = ctx.runtime.convert_depth_mode && !ctx.profile.support_native_ndc;
     if matches!(
         ctx.stage,

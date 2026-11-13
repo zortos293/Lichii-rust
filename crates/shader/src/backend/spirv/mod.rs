@@ -8,10 +8,17 @@
 mod context;
 mod driver;
 mod emit;
+mod mesh_emulation;
 #[cfg(test)]
 pub(crate) mod tests;
 
 use rspirv::dr;
+
+pub use mesh_emulation::{
+    MESH_EMULATION_ARGS_BASE, MESH_EMULATION_ARGS_REQUESTED, MESH_EMULATION_ARGS_TASKS,
+    MESH_EMULATION_ARGS_WORDS, MESH_EMULATION_DRAW_ARGS_OFFSET, MeshEmulationDistributionConstants,
+    emit_mesh_emulation_distribution, emit_mesh_emulation_vertex, mesh_emulation_block_words,
+};
 
 use crate::Profile;
 use crate::RuntimeInfo;
@@ -40,7 +47,8 @@ pub enum EmitError {
     /// A read of an attribute the backend has no input for, such as a fixed-function varying.
     #[error("reads of attribute {0} are not supported by the SPIR-V backend")]
     UnsupportedAttribute(Attribute),
-    /// Mesh, task and tensor instructions, which this backend does not emit.
+    /// An instruction in a form or stage the backend cannot emit, such as a stage buffer map
+    /// write outside a mesh program.
     #[error("{0:?} is not supported by the SPIR-V backend")]
     UnsupportedOpcode(Opcode),
     #[error("{0:?} programs are not supported by the SPIR-V backend")]

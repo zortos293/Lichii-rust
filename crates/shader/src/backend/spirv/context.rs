@@ -15,6 +15,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use super::emit::context_get_set::{get_cbuf_u32_at, get_cbuf_u32x2_at};
+use super::emit::mesh::{self, MeshState};
 use super::{
     EmitError, EmitResult, NUM_IMAGE_SCALING_WORDS, NUM_TEXTURE_SCALING_WORDS,
     RENDER_AREA_LAYOUT_OFFSET, RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, RESCALING_LAYOUT_IMAGES_OFFSET,
@@ -395,6 +396,11 @@ pub(crate) struct EmitContext<'a> {
     pub uses_nonuniform_storage_texel_buffer: bool,
 
     sparse_result_types: FxHashMap<Word, Word>,
+
+    /// Stage buffer and outputs of a task or mesh program.
+    pub(crate) mesh: MeshState,
+    /// The software TENSOR_MUL_ADD functions (K=8, K=16), defined after the entry point.
+    pub(crate) tensor_functions: [Word; 2],
 }
 
 /// Stages whose inputs are arrays indexed by vertex.
@@ -667,6 +673,8 @@ impl<'a> EmitContext<'a> {
             uses_nonuniform_uniform_texel_buffer: false,
             uses_nonuniform_storage_texel_buffer: false,
             sparse_result_types: FxHashMap::default(),
+            mesh: MeshState::default(),
+            tensor_functions: [0; 2],
         };
         let unified = profile.unified_descriptor_binding;
         ctx.add_capability(Capability::Shader);
@@ -674,6 +682,7 @@ impl<'a> EmitContext<'a> {
         ctx.define_common_constants();
         ctx.define_inputs()?;
         ctx.define_outputs()?;
+        mesh::define(&mut ctx);
         ctx.define_local_memory();
         ctx.define_shared_memory()?;
         ctx.define_shared_memory_functions()?;
@@ -693,6 +702,7 @@ impl<'a> EmitContext<'a> {
         ctx.define_attribute_mem_access()?;
         ctx.define_write_storage_cas_loop_function()?;
         ctx.define_global_memory_functions()?;
+        mesh::define_emulation_output(&mut ctx);
         ctx.define_rescaling_input();
         ctx.define_render_area();
         Ok(ctx)
@@ -710,9 +720,17 @@ impl<'a> EmitContext<'a> {
         }
     }
 
-    /// Whether this stage may use subgroup operations.
+    /// Whether this stage may use subgroup operations; the mesh emulation runs task and mesh
+    /// programs as compute shaders.
     pub fn supports_subgroups(&self) -> bool {
-        self.profile.supports_subgroup_stage(self.stage)
+        let emulated = self.runtime.mesh_emulation.is_some()
+            && matches!(self.stage, ShaderStage::Task | ShaderStage::Mesh);
+        let stage = if emulated {
+            ShaderStage::Compute
+        } else {
+            self.stage
+        };
+        self.profile.supports_subgroup_stage(stage)
     }
 
     /// The SubgroupLocalInvocationId input, defined on first use when the shader info flags did
@@ -1506,6 +1524,9 @@ impl<'a> EmitContext<'a> {
         let stores = &info.stores;
         let invocations = Some(self.translated.invocations);
         let is_fragment = stage == ShaderStage::Fragment;
+        if matches!(stage, ShaderStage::Task | ShaderStage::Mesh) {
+            return Ok(());
+        }
         if runtime.convert_depth_mode
             || stores.any_component(Attribute::POSITION_X)
             || stage == ShaderStage::VertexB
@@ -1683,6 +1704,7 @@ impl<'a> EmitContext<'a> {
         let info = self.info;
         let profile = self.profile;
         self.uses_explicit_workgroup_layout = profile.support_explicit_workgroup_layout
+            && !matches!(self.stage, ShaderStage::Task | ShaderStage::Mesh)
             && (!info.uses_int8 || profile.support_workgroup_layout_8bit_access)
             && (!info.uses_int16 || profile.support_workgroup_layout_16bit_access);
         let size = self.translated.shared_memory_size;
