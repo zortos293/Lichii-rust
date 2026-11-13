@@ -5,6 +5,8 @@
 //! A record's first slot is its header: tag (bits 0..8), engine (8..16), method (16..32) and
 //! argument (32..64). Records with more data carry it in the slots after the header.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 
 use lichii_common::GpuVAddr;
@@ -12,6 +14,7 @@ use lichii_common::GpuVAddr;
 use crate::back::{Back, SideCommand};
 use crate::backend::{ChannelId, ReleaseSize};
 use crate::engines::EngineKind;
+use crate::gpu::Inbox;
 use crate::host::Reduction;
 use crate::ring::{Consumer, Producer};
 
@@ -38,6 +41,8 @@ pub(crate) mod tag {
     pub const SIDE: u8 = 13;
     /// Then the GPU address and the size of a range the front reads.
     pub const SYNCHRONIZE_READ: u8 = 14;
+    /// Then the GPU address and the size of the GPFIFO entry a channel fetches next.
+    pub const SYNCHRONIZE_FETCH: u8 = 15;
 }
 
 /// Words of one multi-word record; longer runs are split.
@@ -65,6 +70,27 @@ pub(crate) const fn header(tag: u8, engine: u8, method: u32, argument: u32) -> u
     tag as u64 | (engine as u64) << 8 | ((method & 0xffff) as u64) << 16 | (argument as u64) << 32
 }
 
+/// How many of the fetches [`Stream::synchronize_fetch`] sent the back has synchronized.
+pub(crate) struct FetchSyncs {
+    completed: AtomicU64,
+    front: Arc<Inbox>,
+}
+
+impl FetchSyncs {
+    pub(crate) fn new(front: Arc<Inbox>) -> Self {
+        Self {
+            completed: AtomicU64::new(0),
+            front,
+        }
+    }
+
+    /// The back synchronized the next fetch: counts it and wakes the front.
+    pub(crate) fn complete(&self) {
+        self.completed.fetch_add(1, Ordering::Release);
+        self.front.wake();
+    }
+}
+
 /// Where the back runs.
 pub(crate) enum Link {
     /// On its own thread, reading the ring concurrently.
@@ -82,10 +108,18 @@ pub(crate) struct Stream {
     pending: Option<(EngineKind, u32)>,
     words: Vec<u32>,
     channel: Option<ChannelId>,
+    fetch_syncs: Arc<FetchSyncs>,
+    /// Fetches sent to [`FetchSyncs`] so far.
+    fetch_syncs_sent: u64,
 }
 
 impl Stream {
-    pub(crate) fn new(producer: Producer, link: Link, side: mpsc::Sender<SideCommand>) -> Self {
+    pub(crate) fn new(
+        producer: Producer,
+        link: Link,
+        side: mpsc::Sender<SideCommand>,
+        fetch_syncs: Arc<FetchSyncs>,
+    ) -> Self {
         Self {
             producer,
             link,
@@ -93,6 +127,8 @@ impl Stream {
             pending: None,
             words: Vec::with_capacity(MULTI_MAX_WORDS),
             channel: None,
+            fetch_syncs,
+            fetch_syncs_sent: 0,
         }
     }
 
@@ -218,6 +254,22 @@ impl Stream {
     pub(crate) fn synchronize_read(&mut self, address: GpuVAddr, size: u64) {
         self.record(&[header(tag::SYNCHRONIZE_READ, 0, 0, 0), address, size]);
         self.drain();
+    }
+
+    /// Has the back synchronize the fetch of `[address, address + size)` as
+    /// [`Stream::synchronize_read`] does, without waiting for it: the GPU work before completes,
+    /// its fences land and GPU-written data in the range reaches guest memory. Returns the ticket
+    /// [`Stream::fetch_synced`] takes.
+    pub(crate) fn synchronize_fetch(&mut self, address: GpuVAddr, size: u64) -> u64 {
+        self.record(&[header(tag::SYNCHRONIZE_FETCH, 0, 0, 0), address, size]);
+        self.producer.publish();
+        self.fetch_syncs_sent += 1;
+        self.fetch_syncs_sent
+    }
+
+    /// Whether the back synchronized the fetch `ticket` names.
+    pub(crate) fn fetch_synced(&self, ticket: u64) -> bool {
+        self.fetch_syncs.completed.load(Ordering::Acquire) >= ticket
     }
 
     /// The front has nothing to do: hand the back everything, and run an inline back now.
