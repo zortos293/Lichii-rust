@@ -8,7 +8,7 @@ use crate::PhysicalMemory;
 use crate::fault::{FaultHandler, Registration};
 use crate::host::{Arena, HostProtection};
 use crate::page_table::PageTable;
-use crate::tracking::{DirtyPages, ReverseMap};
+use crate::tracking::{DirtyPages, PageFlags, ReverseMap};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct MemoryPermission(pub u8);
@@ -107,6 +107,8 @@ pub struct AddressSpace {
     physical: Arc<PhysicalMemory>,
     fastmem: Option<Fastmem>,
     update: Mutex<Tracking>,
+    /// Physical pages a cache holds that no CPU write untracked since: the flag writes check.
+    tracked: PageFlags,
     dirty: DirtyPages,
 }
 
@@ -133,6 +135,7 @@ impl AddressSpace {
         Self {
             table: PageTable::new(address_space_bits),
             update: Mutex::new(Tracking::new(physical.size())),
+            tracked: PageFlags::new(physical.size()),
             dirty: DirtyPages::new(physical.size()),
             physical,
             fastmem: None,
@@ -153,6 +156,7 @@ impl AddressSpace {
         Ok(Self {
             table: PageTable::new(address_space_bits),
             update: Mutex::new(Tracking::new(physical.size())),
+            tracked: PageFlags::new(physical.size()),
             dirty: DirtyPages::new(physical.size()),
             physical,
             fastmem: Some(Fastmem {
@@ -209,11 +213,18 @@ impl AddressSpace {
                 )
                 .unwrap_or_else(|err| panic!("fastmem map {va:#x}+{size:#x}: {err}"));
         }
-        let mut aliases: Vec<VAddr> = (0..size / PAGE_SIZE)
-            .filter(|page| tracking.cached[((pa >> PAGE_BITS) + page) as usize] != 0)
-            .map(|page| va + page * PAGE_SIZE)
+        let held: Vec<u64> = (0..size / PAGE_SIZE)
+            .filter(|page| self.tracked.test(pa + page * PAGE_SIZE))
             .collect();
+        let mut aliases: Vec<VAddr> = held.iter().map(|page| va + page * PAGE_SIZE).collect();
         self.set_tracked(&mut aliases, true);
+        if self.fastmem.is_some() {
+            for page in held {
+                self.dirty.mark(pa + page * PAGE_SIZE);
+            }
+        }
+        self.publish_exposed();
+        drop(tracking);
     }
 
     pub fn unmap(&self, va: VAddr, size: u64) {
@@ -236,6 +247,8 @@ impl AddressSpace {
                 .unmap(self.physical.backing(), va as usize, size as usize)
                 .unwrap_or_else(|err| panic!("fastmem unmap {va:#x}+{size:#x}: {err}"));
         }
+        self.publish_exposed();
+        drop(tracking);
     }
 
     /// Changes the permission of the mapped pages of `[va, va + size)`. Write-tracked pages
@@ -257,6 +270,20 @@ impl AddressSpace {
         }
         if let Some((s, len)) = run {
             self.protect_host(s, len, perm);
+        }
+        self.publish_exposed();
+    }
+
+    /// Publishes as written the tracked pages whose fastmem views had to be mapped again (and so
+    /// were briefly writable). Called with `update` held, after the views are protected again.
+    fn publish_exposed(&self) {
+        let Some(fastmem) = &self.fastmem else {
+            return;
+        };
+        for va in fastmem.arena.take_exposed() {
+            if let Some(pa) = self.physical_address(va as u64) {
+                self.dirty.mark(pa);
+            }
         }
     }
 
@@ -299,6 +326,7 @@ impl AddressSpace {
                 *count = count
                     .checked_add(1)
                     .expect("too many cache holds on one page");
+                self.tracked.set(page);
                 tracking.reverse.for_each(page, |va| pages.push(va));
             }
         }
@@ -317,6 +345,7 @@ impl AddressSpace {
                 let count = &mut tracking.cached[(page >> PAGE_BITS) as usize];
                 *count = count.checked_sub(1).expect("cache hold released twice");
                 if *count == 0 {
+                    self.tracked.clear(page);
                     tracking.reverse.for_each(page, |va| pages.push(va));
                 }
             }
@@ -324,38 +353,70 @@ impl AddressSpace {
         self.set_tracked(&mut pages, false);
     }
 
-    /// Reports a write host code made to `[va, va + size)` after its bytes landed: a tracked page
-    /// is untracked everywhere and published dirty.
-    fn note_write(&self, va: VAddr, size: u64) {
-        if size == 0 {
-            return;
-        }
+    /// Reports a write host code made through `ptr`, a pointer into a page that
+    /// [`AddressSpace::translate`] or [`AddressSpace::access`] returned, once its bytes landed.
+    /// The write methods here report their own writes.
+    #[inline]
+    pub fn report_write(&self, ptr: *const u8) {
         fence(Ordering::SeqCst);
-        let last = va.saturating_add(size - 1) & !PAGE_MASK;
-        let mut page = va & !PAGE_MASK;
-        loop {
-            if self.table.is_tracked(page) {
-                self.cpu_wrote(page);
-            }
-            if page >= last {
-                break;
-            }
-            page += PAGE_SIZE;
-        }
-    }
-
-    #[cold]
-    fn cpu_wrote(&self, va: VAddr) {
-        let Some(pa) = self.physical_address(va) else {
+        let Some(pa) = self.physical.physical_address(ptr) else {
             return;
         };
         let pa = pa & !PAGE_MASK;
+        if self.tracked.test(pa) {
+            self.cpu_wrote(pa);
+        }
+    }
+
+    /// The CPU wrote tracked physical page `pa`: untracks it on every alias, then publishes it.
+    #[cold]
+    fn cpu_wrote(&self, pa: PAddr) {
         let tracking = self.update.lock();
-        let mut pages = Vec::new();
-        tracking.reverse.for_each(pa, |alias| pages.push(alias));
-        self.set_tracked(&mut pages, false);
+        if self.tracked.test(pa) {
+            self.tracked.clear(pa);
+            let mut pages = Vec::new();
+            tracking.reverse.for_each(pa, |alias| pages.push(alias));
+            self.set_tracked(&mut pages, false);
+        }
         drop(tracking);
         self.dirty.mark(pa);
+    }
+
+    /// Writes `[va, va + size)` page by page with `copy`, reporting each page after its bytes.
+    fn write_pages(
+        &self,
+        va: VAddr,
+        size: u64,
+        need: MemoryPermission,
+        mut copy: impl FnMut(*mut u8, usize, usize),
+    ) -> Result<(), MemoryFault> {
+        self.table
+            .for_each_chunk(va, size, need, |ptr, offset, len| {
+                copy(ptr, offset, len);
+                self.report_write(ptr);
+            })
+    }
+
+    #[inline]
+    fn write_value<T: bytemuck::Pod>(
+        &self,
+        va: VAddr,
+        value: T,
+        need: MemoryPermission,
+    ) -> Result<(), MemoryFault> {
+        let size = std::mem::size_of::<T>();
+        if (va & PAGE_MASK) as usize + size <= PAGE_SIZE as usize {
+            let ptr = self.table.access(va, need)?;
+            // SAFETY: the whole value is inside one mapped page.
+            unsafe { std::ptr::write_unaligned(ptr as *mut T, value) };
+            self.report_write(ptr);
+            return Ok(());
+        }
+        let bytes = bytemuck::bytes_of(&value);
+        self.write_pages(va, size as u64, need, |ptr, offset, len| {
+            // SAFETY: ptr is valid for len bytes inside one mapped page.
+            unsafe { std::ptr::copy_nonoverlapping(bytes[offset..].as_ptr(), ptr, len) };
+        })
     }
 
     /// Whether a CPU write to a tracked page is waiting for [`AddressSpace::take_cpu_writes`].
@@ -420,9 +481,7 @@ impl AddressSpace {
     /// Writes a value, whatever the page permissions (loading code, HLE writes).
     #[inline]
     pub fn write<T: bytemuck::Pod>(&self, va: VAddr, value: T) -> Result<(), MemoryFault> {
-        let result = self.table.write(va, value, MemoryPermission::NONE);
-        self.note_write(va, std::mem::size_of::<T>() as u64);
-        result
+        self.write_value(va, value, MemoryPermission::NONE)
     }
 
     pub fn read_bytes(&self, va: VAddr, out: &mut [u8]) -> Result<(), MemoryFault> {
@@ -430,15 +489,22 @@ impl AddressSpace {
     }
 
     pub fn write_bytes(&self, va: VAddr, data: &[u8]) -> Result<(), MemoryFault> {
-        let result = self.table.write_bytes(va, data, MemoryPermission::NONE);
-        self.note_write(va, data.len() as u64);
-        result
+        self.write_pages(
+            va,
+            data.len() as u64,
+            MemoryPermission::NONE,
+            |ptr, offset, len| {
+                // SAFETY: ptr is valid for len bytes inside one mapped page.
+                unsafe { std::ptr::copy_nonoverlapping(data[offset..].as_ptr(), ptr, len) };
+            },
+        )
     }
 
     pub fn fill(&self, va: VAddr, size: u64, byte: u8) -> Result<(), MemoryFault> {
-        let result = self.table.fill(va, size, byte, MemoryPermission::NONE);
-        self.note_write(va, size);
-        result
+        self.write_pages(va, size, MemoryPermission::NONE, |ptr, _, len| {
+            // SAFETY: ptr is valid for len bytes inside one mapped page.
+            unsafe { std::ptr::write_bytes(ptr, byte, len) };
+        })
     }
 
     /// Runs `write` on the host pointer for `va`, which needs `need`, then reports the write
@@ -450,8 +516,9 @@ impl AddressSpace {
         need: MemoryPermission,
         write: impl FnOnce(*mut u8) -> R,
     ) -> Result<R, MemoryFault> {
-        let result = write(self.table.access(va, need)?);
-        self.note_write(va, 1);
+        let ptr = self.table.access(va, need)?;
+        let result = write(ptr);
+        self.report_write(ptr);
         Ok(result)
     }
 
@@ -466,17 +533,16 @@ impl AddressSpace {
     /// stores fault into its slow path, which stores through here.
     #[inline]
     pub fn guest_write<T: bytemuck::Pod>(&self, va: VAddr, value: T) -> Result<(), MemoryFault> {
-        let result = self.table.write(va, value, MemoryPermission::WRITE);
-        self.note_write(va, std::mem::size_of::<T>() as u64);
-        result
+        self.write_value(va, value, MemoryPermission::WRITE)
     }
 
     /// A guest store of `size` copies of `byte` (`DC ZVA`), checked like
     /// [`AddressSpace::guest_write`]; pages before a faulting one are written.
     pub fn guest_fill(&self, va: VAddr, size: u64, byte: u8) -> Result<(), MemoryFault> {
-        let result = self.table.fill(va, size, byte, MemoryPermission::WRITE);
-        self.note_write(va, size);
-        result
+        self.write_pages(va, size, MemoryPermission::WRITE, |ptr, _, len| {
+            // SAFETY: ptr is valid for len bytes inside one mapped page.
+            unsafe { std::ptr::write_bytes(ptr, byte, len) };
+        })
     }
 
     /// Reads a NUL-terminated string of at most `max_len` bytes.
