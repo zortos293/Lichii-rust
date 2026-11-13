@@ -8,7 +8,7 @@ use lichii_gpu::nx2_memory::GpuMemoryHandle;
 use lichii_kernel::ipc::HleRequestContext;
 use parking_lot::Mutex;
 
-use super::Words;
+use super::{UNKNOWN, Words};
 
 /// An InterModuleUserImagePreference, 16 words.
 pub(super) type Preference = [u32; 16];
@@ -79,6 +79,9 @@ impl ImageLayout {
 
 /// Alignment of a decoder image pool (gsv 991): 128 rows of 64 bytes.
 const DECODER_ALIGNMENT: u64 = 64 * 128;
+/// Most images a decoder pool (gsv 911) may hold. Movie players use a few frames; each image
+/// gets its own handle, so the count is bounded.
+const MAX_DECODER_IMAGES: u32 = 64;
 
 /// Layout of a video decoder output image in an `nn::codec` image pool (gsv 911, 961, 991):
 /// pitch-linear rows padded to 128-row blocks. NV12 keeps its chroma plane after the luma plane.
@@ -264,6 +267,12 @@ pub(super) fn handle(objects: &Mutex<NativeObjects>, ctx: &mut HleRequestContext
             let count = words.u32(18).max(1);
             let memory = words.u32(19);
             let decoder = command == 911;
+            if decoder && count > MAX_DECODER_IMAGES {
+                tracing::warn!(
+                    "nx2:gsv 911: {count} decoder images, more than {MAX_DECODER_IMAGES}"
+                );
+                return UNKNOWN;
+            }
             let size = if decoder {
                 DecoderLayout::of(&preference).size
             } else {

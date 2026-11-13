@@ -1177,6 +1177,11 @@ fn decoder_image_pools_are_sized_and_described_like_the_codec_expects() {
         [0xa, 0x6_4000, 640, 0x6_4000 + 640 * 384, 640]
     );
 
+    let mut huge = decoder_preference(1, 640, 360);
+    huge.extend([u32::MAX, 7]);
+    let reply = client.send(gsv, &words(Request::tipc(911), &huge)).unwrap();
+    assert_ne!(reply.result, ResultCode::SUCCESS, "pools are bounded");
+
     let bgra = decoder_preference(2, 100, 50);
     let mut reply = client
         .send(
