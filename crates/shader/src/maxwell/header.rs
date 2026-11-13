@@ -74,7 +74,9 @@ impl SystemValuesC {
 }
 
 /// A Shader Program Header as twenty little-endian words.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct ProgramHeader {
     pub words: [u32; 20],
 }

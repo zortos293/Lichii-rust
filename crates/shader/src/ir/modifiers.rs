@@ -57,7 +57,19 @@ impl FpControl {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 #[repr(u8)]
 pub enum TextureType {
     Color1D,
@@ -95,7 +107,19 @@ impl TextureType {
 }
 
 /// Storage image format for typed loads and stores; `Typeless` needs formatted access support.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 #[repr(u8)]
 pub enum ImageFormat {
     #[default]
