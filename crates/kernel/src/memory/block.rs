@@ -77,6 +77,11 @@ pub mod attribute {
     pub const PERMISSION_LOCKED: u32 = 1 << 4;
     /// Switch 2: memory registered with the GPU (svc 0x80).
     pub const GPU_ACCESSIBLE: u32 = 1 << 5;
+    /// The bits `SetMemoryAttribute` and `SetGpuMemoryAttribute` may change.
+    pub const SET_MASK: u32 = UNCACHED | PERMISSION_LOCKED | GPU_ACCESSIBLE;
+    /// Bits a range's blocks may differ in and still count as one kind of memory, unless a check
+    /// says otherwise (`DefaultMemoryIgnoreAttr`).
+    pub const DEFAULT_IGNORE: u32 = IPC_LOCKED | DEVICE_SHARED;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,6 +250,18 @@ impl BlockMap {
         size: u64,
         expect: Expect,
     ) -> HleResult<(MemoryState, MemoryPermission, u32)> {
+        self.check_ignoring(addr, size, expect, attribute::DEFAULT_IGNORE)
+    }
+
+    /// Like [`BlockMap::check`], with blocks allowed to differ in the `ignore` attribute bits,
+    /// which the returned attribute leaves out.
+    pub fn check_ignoring(
+        &self,
+        addr: VAddr,
+        size: u64,
+        expect: Expect,
+        ignore: u32,
+    ) -> HleResult<(MemoryState, MemoryPermission, u32)> {
         if size == 0 || addr.checked_add(size).is_none_or(|end| end > self.end) {
             return Err(result::INVALID_CURRENT_MEMORY);
         }
@@ -256,7 +273,9 @@ impl BlockMap {
             match first {
                 None => first = Some(block),
                 Some(f)
-                    if f.state != block.state || f.perm != block.perm || f.attr != block.attr =>
+                    if f.state != block.state
+                        || f.perm != block.perm
+                        || (f.attr | ignore) != (block.attr | ignore) =>
                 {
                     return Err(result::INVALID_CURRENT_MEMORY);
                 }
@@ -264,7 +283,7 @@ impl BlockMap {
             }
         }
         let f = first.ok_or(result::INVALID_CURRENT_MEMORY)?;
-        Ok((f.state, f.perm, f.attr))
+        Ok((f.state, f.perm, f.attr & !ignore))
     }
 
     /// Like [`BlockMap::check`] but blocks may differ from each other.
@@ -462,5 +481,40 @@ mod tests {
         assert_eq!(free, 0x20_2000);
         let past_end = map.query(1 << 36);
         assert_eq!(past_end.state, MemoryState::INACCESSIBLE.svc_value());
+    }
+
+    #[test]
+    fn a_range_may_differ_only_in_ignored_attributes() {
+        let mut map = BlockMap::new(36);
+        let rw = MemoryPermission::READ_WRITE;
+        map.set(0x20_0000, 0x1000, MemoryState::NORMAL, rw, 0);
+        map.set(
+            0x20_1000,
+            0x1000,
+            MemoryState::NORMAL,
+            rw,
+            attribute::DEVICE_SHARED,
+        );
+        map.set(
+            0x20_2000,
+            0x1000,
+            MemoryState::NORMAL,
+            rw,
+            attribute::GPU_ACCESSIBLE,
+        );
+        let any = Expect::state(MemoryState::NORMAL, 0);
+        assert_eq!(
+            map.check(0x20_0000, 0x2000, any),
+            Ok((MemoryState::NORMAL, rw, 0))
+        );
+        assert_eq!(
+            map.check(0x20_1000, 0x2000, any),
+            Err(result::INVALID_CURRENT_MEMORY)
+        );
+        let ignore = attribute::SET_MASK | attribute::DEVICE_SHARED;
+        assert_eq!(
+            map.check_ignoring(0x20_0000, 0x3000, any, ignore),
+            Ok((MemoryState::NORMAL, rw, 0))
+        );
     }
 }
