@@ -24,7 +24,9 @@ use lichii_common::settings::Settings;
 use lichii_common::{HleResult, ResultCode};
 use lichii_crypto::KeySet;
 use lichii_fs::romfs::open_romfs;
-use lichii_fs::save::{Nand, SaveDataFactory, SaveDataSpaceId, SdCard};
+use lichii_fs::save::{
+    Nand, SaveDataAttribute, SaveDataFactory, SaveDataSpaceId, SaveDataType, SdCard,
+};
 use lichii_fs::{ContentIndex, FileRef};
 use lichii_kernel::ipc::HleRequestContext;
 
@@ -46,6 +48,22 @@ pub(crate) fn register(context: &Arc<ServiceContext>) -> HleResult<()> {
 }
 
 /// The NAND root: `settings.paths.nand_dir`, else the user's data directory.
+/// Creates the running program's account save for `user_id` in the user space, if it is not
+/// there (am's EnsureSaveData).
+pub(crate) fn ensure_account_save(context: &ServiceContext, user_id: u128) -> std::io::Result<()> {
+    let nand = Nand::open(nand_dir(&context.settings))?;
+    let program_id = context.program.program_id;
+    let attribute = SaveDataAttribute {
+        program_id,
+        user_id,
+        system_save_data_id: 0,
+        save_type: SaveDataType::Account,
+    };
+    SaveDataFactory::new(nand.root().clone(), program_id)
+        .create(SaveDataSpaceId::User, &attribute)
+        .map(drop)
+}
+
 pub(crate) fn nand_dir(settings: &Settings) -> PathBuf {
     settings
         .paths

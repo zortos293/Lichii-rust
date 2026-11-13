@@ -6,7 +6,10 @@ use std::time::{Duration, Instant};
 
 use lichii_common::paths::UserPaths;
 use lichii_common::perf::PerfStats;
-use lichii_common::settings::{FullscreenMode, HotkeyAction, Settings, Theme};
+use lichii_common::settings::{
+    AntiAliasing, FullscreenMode, GraphicsSettings, HotkeyAction, ResolutionScale, ScalingFilter,
+    Settings, Theme,
+};
 use lichii_core::{ExitReason, Host};
 use lichii_input::{Key, KeyChord, KeySet, MouseButton};
 use lichii_vulkan::present::{UiFrame, Viewport};
@@ -45,6 +48,9 @@ pub enum Action {
     RefreshGames,
     ClearRecent,
     About,
+    SetResolution(ResolutionScale),
+    SetScalingFilter(ScalingFilter),
+    SetAntiAliasing(AntiAliasing),
 }
 
 /// Dialogs and transient messages.
@@ -362,7 +368,33 @@ impl App {
                 self.save_settings();
             }
             Action::About => self.ui.about = true,
+            Action::SetResolution(scale) => {
+                self.set_graphics(|g| g.resolution_scale = scale);
+                self.toast(format!("Resolution: {}", scale.label()));
+            }
+            Action::SetScalingFilter(filter) => {
+                self.set_graphics(|g| g.scaling_filter = filter);
+                self.toast(format!("Scaling filter: {}", filter.label()));
+            }
+            Action::SetAntiAliasing(aa) => {
+                self.set_graphics(|g| g.anti_aliasing = aa);
+                self.toast(format!("Anti-aliasing: {}", aa.label()));
+            }
         }
+    }
+
+    /// Changes graphics settings from the main window: the presenter and a running title's
+    /// renderer pick them up at once, an open configuration window's draft follows, and they are
+    /// saved.
+    fn set_graphics(&mut self, edit: impl Fn(&mut GraphicsSettings)) {
+        edit(&mut self.settings.graphics);
+        if let Some(config) = &mut self.config {
+            edit(config.draft_graphics());
+        }
+        if let Some(display) = &mut self.display {
+            display.set_settings(&self.settings.graphics);
+        }
+        self.save_settings();
     }
 
     fn hotkey(&mut self, hotkey: HotkeyAction) {
@@ -457,14 +489,8 @@ impl App {
                 self.save_settings();
             }
             HotkeyAction::CycleScalingFilter => {
-                let g = &mut self.settings.graphics;
-                g.scaling_filter = g.scaling_filter.next();
-                let text = format!("Scaling filter: {}", g.scaling_filter.label());
-                self.toast(text);
-                if let Some(display) = &mut self.display {
-                    display.set_settings(&self.settings.graphics);
-                }
-                self.save_settings();
+                let filter = self.settings.graphics.scaling_filter.next();
+                self.apply(Action::SetScalingFilter(filter));
             }
             HotkeyAction::CycleGpuAccuracy => {
                 let g = &mut self.settings.graphics;
