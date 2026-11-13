@@ -393,6 +393,7 @@ fn shared_memory_program() -> TranslatedProgram {
     }
     s.inst(b, Opcode::SharedAtomicExchange64, &[x, Value::U64(1)]);
     s.inst(b, Opcode::SharedAtomicExchange32x2, &[x, u32x2]);
+    s.inst(b, Opcode::SharedAtomicCompareExchange32, &[x, x, x]);
     let info = ShaderInfo {
         uses_int8: true,
         uses_int16: true,

@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use lichii_common::settings::CpuAccuracy;
 use lichii_memory::{AddressSpace, ExclusiveMonitor, MemoryPermission, PhysicalMemory};
 
 use super::{Jit, Passes};
@@ -252,6 +253,7 @@ impl Machine {
             core_index: 0,
             ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
             dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+            accuracy: CpuAccuracy::Auto,
         };
         let core: Box<dyn CpuCore> = match backend {
             Backend::Interpreter => Box::new(Interpreter::new(config)),
@@ -360,10 +362,11 @@ fn describe(code: &[u32], expected: &Outcome, actual: &Outcome) -> String {
     lines.join("\n")
 }
 
-const ABLATIONS: [Passes; 4] = [
+const ABLATIONS: [Passes; 5] = [
     Passes {
         get_set: false,
         fold: false,
+        fuse: false,
         dce: false,
     },
     Passes {
@@ -372,6 +375,10 @@ const ABLATIONS: [Passes; 4] = [
     },
     Passes {
         fold: false,
+        ..Passes::ALL
+    },
+    Passes {
+        fuse: false,
         ..Passes::ALL
     },
     Passes {
@@ -405,6 +412,7 @@ fn random_streams_match_the_interpreter() {
             "jit without passes",
             "jit without get/set",
             "jit without folding",
+            "jit without fusion",
             "jit without dce",
         ][i];
         machines.push((name, Machine::new(Backend::Jit(*passes))));
@@ -443,6 +451,31 @@ fn directed(code: &[u32], regs: &[(usize, u64)]) {
         ),
     ];
     compare(&mut machines, &code, &ctx, &data);
+}
+
+#[test]
+fn fused_conditions_match_the_interpreter() {
+    const VALUES: [u64; 5] = [0, 1, 0x8000_0000, 1 << 63, u64::MAX];
+    let setters = [0xeb01_001f, 0xab01_001f, 0xea01_001f];
+    for setter in setters.into_iter().flat_map(|s| [s, s & !(1 << 31)]) {
+        let selects = (0..14).map(|cond| 0x9a84_0060 | cond << 12 | (2 + cond));
+        let code: Vec<u32> = [setter].into_iter().chain(selects).collect();
+        for (a, b) in VALUES.into_iter().flat_map(|a| VALUES.map(|b| (a, b))) {
+            let regs = [(0, a), (1, b), (3, 3), (4, 4)];
+            directed(&code, &regs);
+            for cond in 0..14 {
+                directed(&[setter, 0x5400_0040 | cond, 0xd280_0025], &regs);
+            }
+        }
+    }
+}
+
+#[test]
+fn fused_selects_release_their_compare_operands() {
+    let code: Vec<u32> = (0..300)
+        .flat_map(|i| [0x9100_0140 | i << 10, 0xeb01_001f, 0x9a83_0042])
+        .collect();
+    directed(&code, &[(1, 77), (3, 5), (10, 3)]);
 }
 
 #[test]
@@ -842,6 +875,7 @@ fn counter_reads_follow_the_tsc_scale() {
             core_index: 0,
             ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
             dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+            accuracy: CpuAccuracy::Auto,
         })
         .unwrap();
         assert!(jit.target.tsc_scale.is_some());
@@ -859,5 +893,27 @@ fn counter_reads_follow_the_tsc_scale() {
             &ctx.x[..2]
         );
         assert!(ctx.x[1].wrapping_sub(ctx.x[0]) <= after.wrapping_sub(before));
+    }
+}
+
+#[test]
+fn paranoid_accuracy_builds_no_jit() {
+    let physical = Arc::new(PhysicalMemory::new(1 << 20).unwrap());
+    let config = |accuracy| CpuConfig {
+        memory: Arc::new(AddressSpace::with_fastmem(physical.clone(), 39).unwrap()),
+        monitor: Arc::new(ExclusiveMonitor::new(1)),
+        clock: Arc::new(Clock::default()),
+        core_index: 0,
+        ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
+        dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+        accuracy,
+    };
+    assert!(Jit::new(config(CpuAccuracy::Paranoid)).is_none());
+    for accuracy in [
+        CpuAccuracy::Auto,
+        CpuAccuracy::Accurate,
+        CpuAccuracy::Unsafe,
+    ] {
+        assert!(Jit::new(config(accuracy)).is_some());
     }
 }

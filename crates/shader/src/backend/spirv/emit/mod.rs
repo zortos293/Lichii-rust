@@ -21,9 +21,11 @@ pub(super) mod image_atomic;
 pub(super) mod integer;
 pub(super) mod logical;
 pub(super) mod memory;
+pub(super) mod mesh;
 pub(super) mod select;
 pub(super) mod shared_memory;
 pub(super) mod special;
+pub(super) mod tensor;
 pub(super) mod undefined;
 pub(super) mod warp;
 
@@ -64,11 +66,11 @@ pub(super) fn emit_inst(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<(
                 "{op:?} whose producer did not define it"
             )));
         }
-        Opcode::IsbeRead
-        | Opcode::IsbeWriteAttribute
-        | Opcode::IsbeWriteMapU8
-        | Opcode::IsbeWriteMapU32
-        | Opcode::TensorMulAdd => return Err(EmitError::UnsupportedOpcode(op)),
+        Opcode::IsbeRead => mesh::isbe_read(ctx, inst)?,
+        Opcode::IsbeWriteAttribute => return mesh::isbe_write_attribute(ctx, inst),
+        Opcode::IsbeWriteMapU8 => return mesh::isbe_write_map_u8(ctx, inst),
+        Opcode::IsbeWriteMapU32 => return mesh::isbe_write_map_u32(ctx, inst),
+        Opcode::TensorMulAdd => tensor::tensor_mul_add(ctx, inst)?,
         Opcode::Prologue => return special::prologue(ctx, inst),
         Opcode::Epilogue => return special::epilogue(ctx, inst),
         Opcode::Join => return control_flow::join(ctx, inst),
@@ -382,6 +384,9 @@ pub(super) fn emit_inst(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<(
         Opcode::SharedAtomicExchange32 => atomic::shared_atomic_exchange32(ctx, inst)?,
         Opcode::SharedAtomicExchange64 => atomic::shared_atomic_exchange64(ctx, inst)?,
         Opcode::SharedAtomicExchange32x2 => atomic::shared_atomic_exchange32x2(ctx, inst)?,
+        Opcode::SharedAtomicCompareExchange32 => {
+            atomic::shared_atomic_compare_exchange32(ctx, inst)?
+        }
         Opcode::GlobalAtomicIAdd32 => atomic::global_atomic_i_add32(ctx, inst)?,
         Opcode::GlobalAtomicSMin32 => atomic::global_atomic_s_min32(ctx, inst)?,
         Opcode::GlobalAtomicUMin32 => atomic::global_atomic_u_min32(ctx, inst)?,
@@ -672,5 +677,6 @@ fn is_shared_memory_access(op: Opcode) -> bool {
             | SharedAtomicExchange32
             | SharedAtomicExchange64
             | SharedAtomicExchange32x2
+            | SharedAtomicCompareExchange32
     )
 }

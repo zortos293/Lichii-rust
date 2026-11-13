@@ -19,7 +19,7 @@ pub mod stick;
 pub use gamepad::{Gamepad, GamepadState, PadAxis, PadButton};
 pub use hub::NpadHub;
 pub use keys::{Key, KeyChord, KeySet, MouseButton};
-pub use mapping::{HostInput, InputMapper, PlayerMapping, Source};
+pub use mapping::{HostInput, InputMapper, PlayerMapping, Source, UPDATE_PERIOD};
 pub use npad::{
     MotionSample, NpadButtons, NpadState, STICK_MAX, StickPosition, TRIGGER_MAX, VibrationValue,
 };
