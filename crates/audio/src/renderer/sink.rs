@@ -38,10 +38,9 @@ pub struct CircularBufferInParameter {
     pub sample_count: u32,
     pub previous_pos: u32,
     pub format: u8,
-    pub _pad: [u8; 3],
     pub inputs: [i8; MAX_CHANNELS],
     pub in_use: u8,
-    pub _unk_23: [u8; 5],
+    pub _unk_20: [u8; 8],
 }
 const _: () = assert!(size_of::<CircularBufferInParameter>() == 0x28);
 

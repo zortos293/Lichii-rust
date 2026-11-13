@@ -55,6 +55,9 @@ pub struct BiquadFilterParameter2 {
 const _: () = assert!(size_of::<BiquadFilterParameter2>() == 0x18);
 
 /// Bit 0: reset the played sample count at loop points. Bit 1: skip pitch and SRC.
+///
+/// The reference ORs the skip request into bit 0, so its DSP never sees bit 1; this port keeps
+/// each request in its own bit.
 pub mod voice_flags {
     pub const PLAYED_SAMPLE_COUNT_RESET_AT_LOOP_POINT: u16 = 1;
     pub const PITCH_AND_SRC_SKIPPED: u16 = 2;
