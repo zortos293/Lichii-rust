@@ -39,6 +39,7 @@ mod audio;
 mod context;
 mod dispatch;
 mod fs;
+mod gsv;
 #[cfg(test)]
 mod testing;
 

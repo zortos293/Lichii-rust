@@ -208,6 +208,7 @@ impl Service for SelfController {
             }
             91 => push_event(ctx, &applet.suspended_tick_event),
             1000 => push_nx2_stub(&self.context, ctx, "ISelfController"),
+            2000 => crate::gsv::open(&self.context, ctx),
             _ => return None,
         })
     }
