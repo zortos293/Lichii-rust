@@ -34,6 +34,8 @@ pub struct DeviceExtensions {
     pub transform_feedback: bool,
     pub conditional_rendering: bool,
     pub mesh_shader: bool,
+    pub pipeline_library: bool,
+    pub graphics_pipeline_library: bool,
     pub provoking_vertex: bool,
     pub depth_clip_control: bool,
     pub depth_clip_enable: bool,
@@ -62,6 +64,10 @@ const OPTIONAL_EXTENSIONS: &[(&CStr, ExtensionFlag)] = &[
         &mut e.conditional_rendering
     }),
     (ext::mesh_shader::NAME, |e| &mut e.mesh_shader),
+    (khr::pipeline_library::NAME, |e| &mut e.pipeline_library),
+    (ext::graphics_pipeline_library::NAME, |e| {
+        &mut e.graphics_pipeline_library
+    }),
     (ext::provoking_vertex::NAME, |e| &mut e.provoking_vertex),
     (ext::depth_clip_control::NAME, |e| &mut e.depth_clip_control),
     (ext::depth_clip_enable::NAME, |e| &mut e.depth_clip_enable),
@@ -115,6 +121,8 @@ pub struct DeviceFeatures {
     pub conditional_rendering: bool,
     /// `VK_EXT_mesh_shader` with both task and mesh stages.
     pub mesh_shader: bool,
+    /// `VK_EXT_graphics_pipeline_library`: pipelines link from separately built parts.
+    pub graphics_pipeline_library: bool,
     pub storage_buffer_8bit: bool,
     pub uniform_and_storage_buffer_8bit: bool,
     pub storage_buffer_16bit: bool,
@@ -139,6 +147,8 @@ pub struct DeviceProperties {
     /// The most groups `vkCmdDrawMeshTasksEXT` takes along X, `[without, with]` a task stage
     /// (0 without mesh shaders).
     pub mesh_group_limit: [u32; 2],
+    /// Linking pipelines from graphics pipeline libraries is fast enough to do at draw time.
+    pub fast_pipeline_linking: bool,
 }
 
 /// The logical device, its single universal queue and the memory allocator. Shared between
@@ -323,6 +333,7 @@ impl Device {
         let mut xfb = vk::PhysicalDeviceTransformFeedbackFeaturesEXT::default();
         let mut conditional = vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default();
         let mut mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
+        let mut library = vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT::default();
         let mut provoking = vk::PhysicalDeviceProvokingVertexFeaturesEXT::default();
         let mut clip_control = vk::PhysicalDeviceDepthClipControlFeaturesEXT::default();
         let mut clip_enable = vk::PhysicalDeviceDepthClipEnableFeaturesEXT::default();
@@ -341,6 +352,7 @@ impl Device {
                 xfb.p_next = std::ptr::null_mut();
                 conditional.p_next = std::ptr::null_mut();
                 mesh.p_next = std::ptr::null_mut();
+                library.p_next = std::ptr::null_mut();
                 provoking.p_next = std::ptr::null_mut();
                 clip_control.p_next = std::ptr::null_mut();
                 clip_enable.p_next = std::ptr::null_mut();
@@ -370,6 +382,9 @@ impl Device {
                 }
                 if extensions.mesh_shader {
                     features = features.push_next(&mut mesh);
+                }
+                if extensions.graphics_pipeline_library {
+                    features = features.push_next(&mut library);
                 }
                 if extensions.provoking_vertex {
                     features = features.push_next(&mut provoking);
@@ -464,6 +479,9 @@ impl Device {
             conditional_rendering: extensions.conditional_rendering
                 && on(conditional.conditional_rendering),
             mesh_shader: extensions.mesh_shader && on(mesh.task_shader) && on(mesh.mesh_shader),
+            graphics_pipeline_library: extensions.pipeline_library
+                && extensions.graphics_pipeline_library
+                && on(library.graphics_pipeline_library),
             storage_buffer_8bit: on(v12.storage_buffer8_bit_access),
             uniform_and_storage_buffer_8bit: on(v12.uniform_and_storage_buffer8_bit_access),
             storage_buffer_16bit: on(v11.storage_buffer16_bit_access),
@@ -490,11 +508,16 @@ impl Device {
         let mut v11_properties = vk::PhysicalDeviceVulkan11Properties::default();
         let mut v12_properties = vk::PhysicalDeviceVulkan12Properties::default();
         let mut mesh_properties = vk::PhysicalDeviceMeshShaderPropertiesEXT::default();
+        let mut library_properties =
+            vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT::default();
         let mut properties2 = vk::PhysicalDeviceProperties2::default()
             .push_next(&mut v11_properties)
             .push_next(&mut v12_properties);
         if features.mesh_shader {
             properties2 = properties2.push_next(&mut mesh_properties);
+        }
+        if features.graphics_pipeline_library {
+            properties2 = properties2.push_next(&mut library_properties);
         }
         // SAFETY: valid physical device and queue family.
         let (queue, families, memory_properties) = unsafe {
@@ -531,6 +554,8 @@ impl Device {
                 mesh_properties.max_task_work_group_count[0]
                     .min(mesh_properties.max_task_work_group_total_count),
             ],
+            fast_pipeline_linking: library_properties.graphics_pipeline_library_fast_linking
+                != vk::FALSE,
         };
         tracing::info!(
             "Vulkan device: {} ({:?}, driver {:?}, API {}.{}.{})",
