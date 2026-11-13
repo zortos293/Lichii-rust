@@ -189,6 +189,9 @@ impl Translator<'_> {
         let target = |offset: i32| pc.wrapping_add(offset as i64 as u64);
         match *inst {
             Inst::Nop | Inst::Hint { .. } => {}
+            Inst::SimdFp { word } => {
+                self.op(Op::CallSimd { word, pc });
+            }
             Inst::Adr { rd, offset } => {
                 let v = self.k(target(offset));
                 self.set_x(rd, v);

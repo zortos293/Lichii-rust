@@ -152,7 +152,17 @@ impl VulkanRasterizer {
         mailbox: Arc<FrameMailbox>,
         gob_layout: GobLayout,
     ) -> Result<Self> {
-        let buffer_cache = BufferCache::new(device, handles.device.clone())?;
+        let buffer_cache = BufferCache::new(
+            device,
+            handles.device.clone(),
+            handles.written_pages.clone(),
+        )?;
+        let texture_cache = TextureCache::new(
+            device,
+            handles.written_pages.clone(),
+            gob_layout,
+            AstcRecompression::Uncompressed,
+        );
         let mut scheduler = Scheduler::new(device)?;
         let pipelines = PipelineCache::new(device, &GraphicsSettings::default(), None, None)?;
         let draw = draw::DrawState::new(device, pipelines, gob_layout, scheduler.record()?)?;
@@ -169,7 +179,7 @@ impl VulkanRasterizer {
             tiled: Vec::new(),
             fences: VecDeque::new(),
             unflushed: true,
-            texture_cache: TextureCache::new(device, gob_layout, AstcRecompression::Uncompressed),
+            texture_cache,
             live: None,
         })
     }

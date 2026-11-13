@@ -7,7 +7,7 @@ use crate::ir::{Pred, Value};
 
 /// One step of a LUT expression in postfix order.
 #[derive(Clone, Copy)]
-enum Step {
+pub(crate) enum Step {
     A,
     B,
     C,
@@ -23,7 +23,7 @@ use Step::{A, And, B, C, Not, Ones, Or, Xor, Zero};
 
 /// The expression the C++ frontend emits for each truth table (its generated ApplyLUT
 /// switch), in postfix order so the IR comes out in the same order.
-const LUT: [&[Step]; 256] = [
+pub(crate) const LUT: [&[Step]; 256] = [
     &[Zero],
     &[A, B, C, Or, Or, Not],
     &[C, A, B, Or, Not, And],

@@ -8,7 +8,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use bytemuck::Pod;
-use lichii_common::settings::CpuBackend;
+use lichii_common::settings::{CpuAccuracy, CpuBackend};
 use lichii_common::{ConsoleGeneration, ResultCode, VAddr};
 use lichii_cpu::GuestClock;
 use lichii_loader::npdm::{AddressSpaceType, KernelCapabilities, PoolPartition, ServiceAccess};
@@ -52,6 +52,7 @@ pub fn kernel(console: ConsoleGeneration) -> Kernel {
             system_non_secure: 16 << 20,
         }),
         fastmem: false,
+        cpu_accuracy: CpuAccuracy::Auto,
         aslr: false,
         rng_seed: 1,
         clock: Arc::new(HostClock {
