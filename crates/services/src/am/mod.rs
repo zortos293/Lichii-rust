@@ -121,7 +121,8 @@ struct AppletState {
     home_button_long_blocked: bool,
     main_volume: f32,
     library_volume: f32,
-    user_channel: Vec<Vec<u8>>,
+    /// Storages for the next title, each charged to the live-storage budget until freed.
+    user_channel: Vec<Arc<storage::StorageData>>,
     /// The preselected-user launch parameter was popped; it is there once per boot.
     preselected_user_popped: bool,
     friend_invitations: Vec<Vec<u8>>,

@@ -46,13 +46,12 @@ impl Service for ApplicationFunctions {
                 let kind: u32 = ctx.pop();
                 let data = match kind {
                     USER_CHANNEL => applet.state.lock().user_channel.pop(),
-                    PRESELECTED_USER => preselected_user(context, applet),
+                    PRESELECTED_USER => preselected_user(context, applet)
+                        .map(|data| Arc::new(StorageData::new(data, None))),
                     _ => None,
                 };
                 match data {
-                    Some(data) => {
-                        push_storage(context, ctx, Arc::new(StorageData::new(data, None)))
-                    }
+                    Some(data) => push_storage(context, ctx, data),
                     None => {
                         tracing::warn!(kind, "no launch parameter");
                         NO_DATA_IN_CHANNEL
@@ -149,14 +148,19 @@ impl Service for ApplicationFunctions {
                 applet.state.lock().user_channel.clear();
                 ResultCode::SUCCESS
             }
-            122 => match input_storage(ctx) {
-                Some(data) => {
-                    let bytes = data.bytes().clone();
-                    applet.state.lock().user_channel.push(bytes);
-                    ResultCode::SUCCESS
-                }
-                None => UNKNOWN,
-            },
+            122 => {
+                let Some(data) = input_storage(ctx) else {
+                    return Some(UNKNOWN);
+                };
+                let size = data.bytes().len();
+                let Some(charge) = Charge::take(&applet.storage_bytes, size) else {
+                    tracing::warn!(size, "live storage budget exhausted");
+                    return Some(UNKNOWN);
+                };
+                let copy = Arc::new(StorageData::new(data.bytes().clone(), Some(charge)));
+                applet.state.lock().user_channel.push(copy);
+                ResultCode::SUCCESS
+            }
             29 => {
                 let max_index = nacp.map_or(0, |nacp| nacp.cache_storage_max_index());
                 let max_size = nacp.map_or(0, |nacp| {

@@ -243,6 +243,27 @@ fn an_unpopped_storage_is_the_next_launch_parameter() {
 }
 
 #[test]
+fn unpopped_storages_are_charged_to_the_live_storage_budget() {
+    let (_context, client, _) = booted(SWITCH1_TITLE);
+    let am = Domain::open(&client);
+    let functions = am.object(am.proxy, Request::new(20));
+    let quarter = storage::LIVE_STORAGE_BUDGET / 4;
+    let storage = am.object(am.creator, Request::new(10).arg(quarter as i64));
+    let unpop = || {
+        am.call(functions, Request::new(122).input_object(storage))
+            .result
+    };
+    for copy in 1..=3 {
+        assert_eq!(unpop(), ResultCode::SUCCESS, "copy {copy}");
+    }
+    assert_eq!(
+        unpop(),
+        UNKNOWN,
+        "the original and three copies fill the budget"
+    );
+}
+
+#[test]
 fn cache_storage_limits_come_from_the_nacp() {
     let mut image = crate::testing::image();
     let mut raw = crate::testing::nacp("Cache", 1, 0).raw().to_vec();
@@ -385,6 +406,7 @@ fn launch_parameter_preselects_the_acc_user_whose_save_ensure_save_data_creates(
 struct Domain<'a> {
     client: &'a IpcClient,
     session: Handle,
+    proxy: u32,
     creator: u32,
 }
 
@@ -397,6 +419,7 @@ impl<'a> Domain<'a> {
         let mut domain = Self {
             client,
             session,
+            proxy,
             creator: 0,
         };
         domain.creator = domain.object(proxy, Request::new(11));
