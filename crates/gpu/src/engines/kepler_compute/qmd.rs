@@ -41,6 +41,8 @@ pub struct Launch {
     pub const_buffers: [ConstBufferBinding; 8],
     /// Samplers are indexed with the texture header index.
     pub linked_samplers: bool,
+    /// Per-thread local memory in bytes (positive plus call-return-stack allocation).
+    pub local_memory_size: u32,
 }
 
 bitfield! {
@@ -157,6 +159,8 @@ impl QmdV2 {
             shared_memory_size: self.shared.size(),
             const_buffers,
             linked_samplers: self.flags.linked_samplers(),
+            local_memory_size: (self.local_pos_alloc & 0xf_ffff)
+                + (self.local_crs_alloc & 0xf_ffff),
         }
     }
 }
@@ -329,7 +333,8 @@ pub struct QmdV3 {
     pub version_block_x: V3VersionBlockX,
     pub block_yz: V3BlockYz,
     pub const_buffer_mask: V3ConstBufferMask,
-    _pad3: [u32; 3],
+    _pad3: [u32; 2],
+    pub local_pos_alloc: u32,
     /// Release slots 0 and 1.
     pub releases: [V3Release; 2],
     pub const_buffers: [V3ConstBuffer; 8],
@@ -349,6 +354,7 @@ const _: () = {
     assert!(core::mem::offset_of!(QmdV3, shared) == 17 * 4);
     assert!(core::mem::offset_of!(QmdV3, version_block_x) == 18 * 4);
     assert!(core::mem::offset_of!(QmdV3, const_buffer_mask) == 20 * 4);
+    assert!(core::mem::offset_of!(QmdV3, local_pos_alloc) == 23 * 4);
     assert!(core::mem::offset_of!(QmdV3, releases) == 24 * 4);
     assert!(core::mem::offset_of!(QmdV3, const_buffers) == 32 * 4);
     assert!(core::mem::offset_of!(QmdV3, program_low) == 48 * 4);
@@ -405,6 +411,8 @@ impl QmdV3 {
             shared_memory_size: self.shared.size(),
             const_buffers,
             linked_samplers: false,
+            local_memory_size: (self.local_pos_alloc & 0xff_ffff)
+                + (self.local_crs_alloc & 0xff_ffff),
         })
     }
 
@@ -440,5 +448,20 @@ mod tests {
                 signed: false
             })
         );
+    }
+
+    #[test]
+    fn local_memory_adds_the_positive_and_call_stack_allocations() {
+        let mut words = [0u32; QMD_WORDS];
+        words[0x2d] = 0xfff0_0100;
+        words[0x2f] = 0x40;
+        let v2 = bytemuck::cast_ref::<[u32; QMD_WORDS], QmdV2>(&words);
+        assert_eq!(v2.launch(0).local_memory_size, 0x140);
+
+        let mut words = [0u32; QMD_WORDS];
+        words[23] = 0xff10_0000;
+        words[50] = 0x20;
+        let v3 = bytemuck::cast_ref::<[u32; QMD_WORDS], QmdV3>(&words);
+        assert_eq!(v3.launch().unwrap().local_memory_size, 0x10_0020);
     }
 }
