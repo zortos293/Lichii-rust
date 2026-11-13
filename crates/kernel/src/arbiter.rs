@@ -181,6 +181,30 @@ impl Arbiter {
         self.shards[Self::index(pid, addr)].lock()
     }
 
+    /// What each live waiter waits on, for the watchdog's thread log.
+    pub(crate) fn waits(&self) -> Vec<(crate::thread::ThreadId, String)> {
+        let mut waits = Vec::new();
+        for shard in &self.shards {
+            let shard = shard.lock();
+            let lists = [
+                ("address", &shard.address),
+                ("mutex", &shard.mutex),
+                ("condvar", &shard.condvar),
+            ];
+            for (kind, list) in lists {
+                for waiter in list.iter().filter(|w| w.is_live()) {
+                    let what = if kind == "condvar" {
+                        format!("condvar {:#x} mutex {:#x}", waiter.key, waiter.mutex)
+                    } else {
+                        format!("{kind} {:#x}", waiter.key)
+                    };
+                    waits.push((waiter.thread.id(), what));
+                }
+            }
+        }
+        waits
+    }
+
     /// `svcWaitForAddress`.
     pub fn wait_for_address(
         &self,

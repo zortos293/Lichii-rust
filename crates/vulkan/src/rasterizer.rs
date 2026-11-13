@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ash::vk;
+use gpu_allocator::MemoryLocation;
 use lichii_common::DAddr;
 use lichii_common::settings::{AstcRecompression, GraphicsSettings, ResolutionScale};
 use lichii_gpu::backend::ChannelId;
@@ -25,15 +26,15 @@ use lichii_gpu::backend::{
 use lichii_gpu::engines::maxwell_3d::Regs;
 use lichii_gpu::engines::maxwell_3d::regs::NUM_RENDER_TARGETS;
 use lichii_gpu::gmmu::Gmmu;
-use lichii_texture::block_linear::{GobLayout, Tiling, unswizzle};
+use lichii_texture::block_linear::{GobLayout, Tiling};
 use lichii_texture::{Aspect, Numeric};
 
-use crate::buffer_cache::{BufferCache, BufferCacheStats};
+use crate::buffer_cache::{BufferBinding, BufferCache, BufferCacheStats};
 use crate::commands::{COLOR_RANGE, ImageAccess, transition};
 use crate::device::Device;
 use crate::error::Result;
 use crate::format::{Conversion, host_format};
-use crate::memory::{Image, ImageDesc};
+use crate::memory::{Buffer, Image, ImageDesc};
 use crate::pipeline::PipelineCache;
 use crate::present::{FrameImage, FrameMailbox, GuestFrame};
 use crate::scheduler::Scheduler;
@@ -95,10 +96,12 @@ pub struct VulkanRasterizer {
     handles: GpuHandles,
     scheduler: Scheduler,
     staging: StagingRing,
+    /// Host-visible buffers framebuffers are read into, each with the tick of the present that
+    /// used it last; reused once that present completed, so presents allocate nothing.
+    frame_uploads: Vec<(u64, Buffer)>,
     mailbox: Arc<FrameMailbox>,
     gob_layout: GobLayout,
     frames: Vec<Arc<FrameImage>>,
-    tiled: Vec<u8>,
     fences: VecDeque<(u64, FenceAction)>,
     unflushed: bool,
     texture_cache: TextureCache,
@@ -199,10 +202,10 @@ impl VulkanRasterizer {
             handles,
             scheduler,
             staging: StagingRing::new(device, 32 << 20)?,
+            frame_uploads: Vec::new(),
             mailbox,
             gob_layout,
             frames: Vec::new(),
-            tiled: Vec::new(),
             fences: VecDeque::new(),
             unflushed: true,
             texture_cache,
@@ -626,6 +629,46 @@ impl VulkanRasterizer {
         Ok(frame)
     }
 
+    /// The index in `frame_uploads` of a buffer of at least `size` bytes that no in-flight work
+    /// uses, claimed for the work being recorded.
+    fn frame_upload(&mut self, size: u64) -> Result<usize> {
+        let tick = self.scheduler.tick();
+        let free =
+            |scheduler: &mut Scheduler, (used, _): &(u64, Buffer)| scheduler.is_complete(*used);
+        let index = match self
+            .frame_uploads
+            .iter()
+            .position(|upload| free(&mut self.scheduler, upload) && upload.1.size() >= size)
+        {
+            Some(index) => index,
+            None => {
+                let buffer = Buffer::new(
+                    &self.device,
+                    size,
+                    vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::STORAGE_BUFFER,
+                    MemoryLocation::CpuToGpu,
+                    "framebuffer upload",
+                )?;
+                match self
+                    .frame_uploads
+                    .iter()
+                    .position(|upload| free(&mut self.scheduler, upload))
+                {
+                    Some(index) => {
+                        self.frame_uploads[index].1 = buffer;
+                        index
+                    }
+                    None => {
+                        self.frame_uploads.push((tick, buffer));
+                        self.frame_uploads.len() - 1
+                    }
+                }
+            }
+        };
+        self.frame_uploads[index].0 = tick;
+        Ok(index)
+    }
+
     fn upload_frame(&mut self, fb: &FramebufferConfig) -> Result<()> {
         let info = fb.format.info();
         let host = host_format(&self.device, fb.format, AstcRecompression::Uncompressed);
@@ -638,29 +681,27 @@ impl VulkanRasterizer {
             return Ok(());
         }
         let row = (width * info.bytes_per_block) as usize;
-        let slice = self
-            .staging
-            .alloc(&mut self.scheduler, (row * height as usize) as u64, 16)?;
-        let read = match fb.block_height_log2 {
-            Some(block_height_log2) => {
-                let tiling = Tiling::new(
-                    width,
-                    height,
-                    1,
-                    info.bytes_per_block,
-                    block_height_log2,
-                    0,
-                    fb.gob_layout,
-                );
-                self.tiled.resize(tiling.size_bytes(), 0);
-                let read = self.handles.device.read_bytes(fb.address, &mut self.tiled);
-                if read.is_ok() {
-                    unswizzle(&tiling, &self.tiled, slice.data);
-                }
-                read
-            }
-            None => slice
-                .data
+        let tiling = fb.block_height_log2.map(|block_height_log2| {
+            Tiling::new(
+                width,
+                height,
+                1,
+                info.bytes_per_block,
+                block_height_log2,
+                0,
+                fb.gob_layout,
+            )
+        });
+        let size = tiling.map_or(row * height as usize, |tiling| tiling.size_bytes());
+        let index = self.frame_upload(size as u64)?;
+        let upload = &mut self.frame_uploads[index].1;
+        let buffer = upload.raw();
+        let data = &mut upload
+            .mapped_mut()
+            .expect("framebuffer uploads are host visible")[..size];
+        let read = match tiling {
+            Some(_) => self.handles.device.read_bytes(fb.address, data),
+            None => data
                 .chunks_exact_mut(row)
                 .enumerate()
                 .try_for_each(|(y, line)| {
@@ -677,9 +718,20 @@ impl VulkanRasterizer {
             );
             return Ok(());
         }
-        let (buffer, offset) = (slice.buffer, slice.offset);
+        let staged = BufferBinding {
+            buffer,
+            offset: 0,
+            size: size as u64,
+        };
         let frame = self.frame_image(width, height, &host)?;
         let cmd = self.scheduler.record()?;
+        let (buffer, offset, row_length) = match tiling {
+            Some(tiling) => {
+                let (buffer, pitch) = self.decode_block_linear(cmd, staged, &tiling)?;
+                (buffer, 0, pitch / info.bytes_per_block)
+            }
+            None => (staged.buffer, staged.offset, 0),
+        };
         let image = frame.image.raw();
         transition(
             &self.device,
@@ -691,6 +743,7 @@ impl VulkanRasterizer {
         );
         let region = [vk::BufferImageCopy {
             buffer_offset: offset,
+            buffer_row_length: row_length,
             image_subresource: vk::ImageSubresourceLayers {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 mip_level: 0,
@@ -965,7 +1018,7 @@ mod tests {
     use lichii_gpu::host1x::Syncpoints;
     use lichii_memory::{DeviceAddressSpace, PhysicalMemory};
     use lichii_texture::PixelFormat;
-    use lichii_texture::block_linear::swizzle;
+    use lichii_texture::block_linear::{swizzle, unswizzle};
 
     use super::*;
     use crate::memory::Buffer;
@@ -1214,6 +1267,55 @@ mod tests {
             assert!(texels == linear, "{layout:?}: deswizzled texels differ");
             f.assert_no_validation_errors();
         }
+    }
+
+    #[test]
+    fn presents_reuse_their_upload_buffer_once_it_is_free() {
+        let Some(mut f) = fixture(GobLayout::Tegra) else {
+            return;
+        };
+        let fb = FramebufferConfig {
+            block_height_log2: Some(2),
+            ..framebuffer(64, 32)
+        };
+        for _ in 0..4 {
+            f.rasterizer.present(&fb);
+            f.rasterizer.scheduler.finish().unwrap();
+        }
+        assert_eq!(f.rasterizer.frame_uploads.len(), 1);
+        f.assert_no_validation_errors();
+    }
+
+    /// The back thread's cost of presenting a 1080p block-linear framebuffer that is not in the
+    /// texture cache: `cargo test --release -p lichii-vulkan --lib present_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn present_cost_of_an_uncached_block_linear_1080p_frame() {
+        let Some(mut f) = fixture(GobLayout::Tegra) else {
+            return;
+        };
+        let (width, height) = (1920, 1080);
+        let tiling = Tiling::new(width, height, 1, 4, 4, 0, GobLayout::Tegra);
+        let mut tiled = vec![0; tiling.size_bytes()];
+        swizzle(&tiling, &pattern(width, height), &mut tiled);
+        f.memory.write_bytes(DADDR, &tiled).unwrap();
+        let fb = FramebufferConfig {
+            block_height_log2: Some(4),
+            ..framebuffer(width, height)
+        };
+        let mut times = Vec::new();
+        for _ in 0..65 {
+            let start = Instant::now();
+            f.rasterizer.present(&fb);
+            times.push(start.elapsed());
+            f.rasterizer.scheduler.finish().unwrap();
+        }
+        let times = &times[5..];
+        let mean = times.iter().sum::<Duration>() / times.len() as u32;
+        let worst = times.iter().max().unwrap();
+        eprintln!(
+            "present of an uncached 1080p block-linear frame: mean {mean:?}, worst {worst:?}"
+        );
     }
 
     #[test]

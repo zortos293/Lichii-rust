@@ -2404,6 +2404,65 @@ fn draws_bind_the_textures_handle_programs_read_from_storage_tables() {
     f.assert_no_validation_errors();
 }
 
+/// Constant buffer 2 of the fragment stage, which holds a per-material bindless handle at 0x20.
+const MATERIAL_CBUF: u64 = FRAGMENT_CBUF + 0x200;
+
+#[test]
+fn per_material_bindless_handles_share_one_variant_and_one_module() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let mut header = header(2, ShaderType::PIXEL);
+    header[18] = 0xf;
+    let tex = sass(
+        Opcode::TexB,
+        (7 << 51) | (0b1111 << 31) | (2 << 28) | (6 << 20) | (2 << 8),
+    );
+    let code = [
+        mov_cbuf(6, 0x20) | 2 << 34,
+        mov_f32(2, 0.5),
+        mov_f32(3, 0.5),
+        tex,
+        exit(),
+    ];
+    write(&f, PROGRAMS + u64::from(FRAGMENT), &program(header, &code));
+    uniform_texture(&f, 0, TEXTURE, [10, 200, 30, 255]);
+    uniform_texture(&f, 1, OTHER_TEXTURE, [50, 60, 70, 255]);
+    let mut regs = sampling_regs();
+    regs.tex_sampler.limit = 7;
+    let mut cbufs = const_buffers();
+    cbufs[4][2] = ConstBufferBinding {
+        address: GPU_VA + MATERIAL_CBUF,
+        size: 0x100,
+        enabled: true,
+    };
+    let sample = |f: &mut Fixture, header: u32, sampler: u32| {
+        write(
+            f,
+            MATERIAL_CBUF + 0x20,
+            &(header | sampler << 20).to_le_bytes(),
+        );
+        f.rasterizer
+            .invalidate_region(DADDR + MATERIAL_CBUF + 0x20, 4);
+        draw_with(f, &gmmu, &regs, &cbufs);
+        let mut stages = f.rasterizer.draw.stages.iter().flatten();
+        let fragment = stages.find(|m| m.stage == ShaderStage::Fragment).unwrap();
+        (f.rasterizer.draw.shaders.stats(), fragment.clone())
+    };
+    let (first, module) = sample(&mut f, 1, 3);
+    assert!(target(&mut f).iter().all(|&t| t == [50, 60, 70, 255]));
+    let (second, again) = sample(&mut f, 0, 5);
+    assert!(
+        target(&mut f).iter().all(|&t| t == [10, 200, 30, 255]),
+        "the second draw samples the texture its handle names"
+    );
+    assert_eq!(second.translated, first.translated, "no new variant");
+    assert!(second.hits > first.hits);
+    assert!(Arc::ptr_eq(&module, &again), "one module for both handles");
+    assert_eq!(second.failed, 0);
+    f.assert_no_validation_errors();
+}
+
 #[test]
 fn handle_programs_naming_an_image_of_another_kind_bind_the_null_texture() {
     let Some((mut f, gmmu)) = draw_fixture() else {

@@ -40,6 +40,7 @@ struct Answers {
     replace: Option<ReplaceConstant>,
     proprietary: bool,
     mesh: Option<MeshState>,
+    code_reads: std::cell::Cell<usize>,
 }
 
 impl Default for Answers {
@@ -67,6 +68,7 @@ impl Default for Answers {
             replace: None,
             proprietary: false,
             mesh: None,
+            code_reads: Default::default(),
         }
     }
 }
@@ -82,6 +84,7 @@ impl ShaderEnvironment for Answers {
         self.start
     }
     fn read_u64(&self, address: GpuVAddr) -> u64 {
+        self.code_reads.set(self.code_reads.get() + 1);
         let index = address.wrapping_sub(self.start) / 8;
         self.code.get(index as usize).copied().unwrap_or(0)
     }
@@ -235,10 +238,16 @@ fn a_record_matches_only_the_answers_it_saw() {
         let logger = Logger::new(&base);
         ask(&logger);
         let record = logger.into_record();
-        assert!(record.matches(&base, true), "case {i}");
+        assert!(
+            record.matches(&base, 1, Some(&mut CodeCheck::default())),
+            "case {i}"
+        );
         let mut changed = base.clone();
         change(&mut changed);
-        assert!(!record.matches(&changed, true), "case {i}");
+        assert!(
+            !record.matches(&changed, 1, Some(&mut CodeCheck::default())),
+            "case {i}"
+        );
     }
 }
 
@@ -281,10 +290,16 @@ fn texture_queries_by_handle_words_hold_for_any_handle_with_the_same_answer() {
         let logger = Logger::new(&base);
         ask(&logger);
         let record = logger.into_record();
-        assert!(record.matches(&other_handle, true), "case {i}");
+        assert!(
+            record.matches(&other_handle, 1, Some(&mut CodeCheck::default())),
+            "case {i}"
+        );
         let mut changed = base.clone();
         change(&mut changed);
-        assert!(!record.matches(&changed, true), "case {i}");
+        assert!(
+            !record.matches(&changed, 1, Some(&mut CodeCheck::default())),
+            "case {i}"
+        );
 
         let hash = |env: &Answers| {
             let recorder = Recorder::new(env);
@@ -308,12 +323,12 @@ fn program_memory_is_compared_relative_to_the_start() {
         start: 0x9000,
         ..base.clone()
     };
-    assert!(record.matches(&moved, true));
+    assert!(record.matches(&moved, 1, Some(&mut CodeCheck::default())));
     let mut edited = base.clone();
     edited.code[2] = 0;
-    assert!(!record.matches(&edited, true));
+    assert!(!record.matches(&edited, 1, Some(&mut CodeCheck::default())));
     assert!(
-        record.matches(&edited, false),
+        record.matches(&edited, 1, None),
         "state only skips program memory"
     );
 }
@@ -348,6 +363,7 @@ fn an_entry_survives_the_file_and_matches_only_its_program() {
     assert_eq!(entry.bindings_after(), bindings);
 
     let mut file = header().to_vec();
+    encode_module(entry.module(), &mut file);
     entry.encode(&mut file);
     let records = records(&file).expect("current header");
     let mut entries = entries(records);
@@ -361,11 +377,17 @@ fn an_entry_survives_the_file_and_matches_only_its_program() {
 
     let key = options_key(options, &runtime, &Bindings::default());
     assert_eq!(loaded.probe_key(), probe_key(None, &env, key));
-    assert!(loaded.matches(None, &env, key));
+    assert!(loaded.matches(None, &env, key, &mut CodeCheck::default()));
     let mut moved = store(5);
     moved.base = 0x8000;
-    assert!(loaded.matches(None, &moved, key), "same code elsewhere");
-    assert!(!loaded.matches(None, &store(7), key), "other code");
+    assert!(
+        loaded.matches(None, &moved, key, &mut CodeCheck::default()),
+        "same code elsewhere"
+    );
+    assert!(
+        !loaded.matches(None, &store(7), key, &mut CodeCheck::default()),
+        "other code"
+    );
     assert!(loaded.matches_state(None, &store(7), key), "state alone");
     let scaled = TranslateOptions {
         resolution_scale: ResolutionScale::X2,
@@ -373,10 +395,18 @@ fn an_entry_survives_the_file_and_matches_only_its_program() {
     };
     let other = options_key(scaled, &runtime, &Bindings::default());
     assert_ne!(other, key);
-    assert!(!loaded.matches(None, &env, other), "other options");
+    assert!(
+        !loaded.matches(None, &env, other, &mut CodeCheck::default()),
+        "other options"
+    );
     let mut shifted = Bindings::default();
     shifted.unified += 1;
-    assert!(!loaded.matches(None, &env, options_key(options, &runtime, &shifted)));
+    assert!(!loaded.matches(
+        None,
+        &env,
+        options_key(options, &runtime, &shifted),
+        &mut CodeCheck::default()
+    ));
     assert_eq!(
         loaded.code_ranges(),
         [(0, 0), (8, 24)],
@@ -410,13 +440,14 @@ fn an_entry_holding_its_address_does_not_move() {
     let entry = compile(&env, options, &runtime, &mut Bindings::default()).expect("translate");
     assert!(entry.module().info.reads_start_address);
     let mut file = header().to_vec();
+    encode_module(entry.module(), &mut file);
     entry.encode(&mut file);
     let loaded = entries(records(&file).unwrap()).next().expect("entry");
-    assert!(loaded.matches(None, &env, key));
+    assert!(loaded.matches(None, &env, key, &mut CodeCheck::default()));
 
     let moved = store_own_address(AmpereEnv::BASE + 0x1000);
     assert_eq!(moved.base % 32, env.base % 32);
-    assert!(!loaded.matches(None, &moved, key));
+    assert!(!loaded.matches(None, &moved, key, &mut CodeCheck::default()));
     assert!(!loaded.matches_state(None, &moved, key));
     let recompiled = crate::compile(&moved, options, &runtime, &mut Bindings::default()).unwrap();
     assert_ne!(recompiled.spirv, loaded.module().spirv);
@@ -438,14 +469,25 @@ fn dual_vertex_entries_need_both_programs() {
     let entry = compile_dual_vertex(&a, &b, options, &runtime, &mut Bindings::default())
         .expect("translate");
     let mut file = header().to_vec();
+    encode_module(entry.module(), &mut file);
     entry.encode(&mut file);
     let loaded = entries(records(&file).unwrap()).next().expect("entry");
     let key = options_key(options, &runtime, &Bindings::default());
     assert_eq!(loaded.probe_key(), probe_key(Some(&a), &b, key));
-    assert!(loaded.matches(Some(&a), &b, key));
-    assert!(!loaded.matches(None, &b, key));
-    assert!(!loaded.matches(Some(&program(ShaderStage::VertexA, 6)), &b, key));
-    assert!(!loaded.matches(Some(&a), &program(ShaderStage::VertexB, 6), key));
+    assert!(loaded.matches(Some(&a), &b, key, &mut CodeCheck::default()));
+    assert!(!loaded.matches(None, &b, key, &mut CodeCheck::default()));
+    assert!(!loaded.matches(
+        Some(&program(ShaderStage::VertexA, 6)),
+        &b,
+        key,
+        &mut CodeCheck::default()
+    ));
+    assert!(!loaded.matches(
+        Some(&a),
+        &program(ShaderStage::VertexB, 6),
+        key,
+        &mut CodeCheck::default()
+    ));
 }
 
 #[test]
@@ -474,6 +516,7 @@ fn stale_headers_and_damaged_records_are_refused() {
     )
     .unwrap();
     let mut bytes = Vec::new();
+    encode_module(entry.module(), &mut bytes);
     entry.encode(&mut bytes);
     let one = bytes.len();
     entry.encode(&mut bytes);
@@ -484,4 +527,70 @@ fn stale_headers_and_damaged_records_are_refused() {
     let mut corrupt = entries(&bytes);
     assert_eq!(corrupt.by_ref().count(), 1);
     assert_eq!(corrupt.valid_len(), one);
+}
+
+#[test]
+fn a_lookup_hashes_each_program_range_once() {
+    let base = Answers {
+        code: vec![1, 2, 3, 4],
+        ..Answers::default()
+    };
+    let logger = Logger::new(&base);
+    logger.read_u64(base.start);
+    logger.read_u64(base.start + 24);
+    let record = logger.into_record();
+    let mut check = CodeCheck::default();
+    base.code_reads.set(0);
+    assert!(record.matches(&base, 1, Some(&mut check)));
+    assert_eq!(base.code_reads.get(), 4, "the whole range, read once");
+    assert!(record.matches(&base, 1, Some(&mut check)));
+    assert_eq!(base.code_reads.get(), 4, "the second entry reuses the hash");
+    let mut edited = base.clone();
+    edited.code[1] = 0;
+    assert!(
+        !record.matches(&edited, 1, Some(&mut CodeCheck::default())),
+        "a word between the ones read counts too"
+    );
+}
+
+#[test]
+fn entries_sharing_a_module_store_it_once() {
+    let (profile, host) = (Profile::default(), HostTranslateInfo::default());
+    let options = options(&profile, &host);
+    let runtime = RuntimeInfo::default();
+    let first = compile(&store(5), options, &runtime, &mut Bindings::default()).unwrap();
+    let mut moved = store(5);
+    moved.base = 0x8000;
+    let second = compile(&moved, options, &runtime, &mut Bindings::default()).unwrap();
+    assert_eq!(first.module().hash, second.module().hash);
+
+    let mut file = header().to_vec();
+    encode_module(first.module(), &mut file);
+    first.encode(&mut file);
+    let one = file.len();
+    second.encode(&mut file);
+    let mut module = Vec::new();
+    encode_module(first.module(), &mut module);
+    assert!(file.len() - one < module.len(), "no second module");
+
+    let loaded: Vec<_> = entries(records(&file).unwrap()).collect();
+    assert_eq!(loaded.len(), 2);
+    assert!(Arc::ptr_eq(loaded[0].module(), loaded[1].module()));
+}
+
+#[test]
+fn an_entry_without_its_module_ends_the_readable_part() {
+    let (profile, host) = (Profile::default(), HostTranslateInfo::default());
+    let entry = compile(
+        &store(5),
+        options(&profile, &host),
+        &RuntimeInfo::default(),
+        &mut Bindings::default(),
+    )
+    .unwrap();
+    let mut bytes = Vec::new();
+    entry.encode(&mut bytes);
+    let mut orphan = entries(&bytes);
+    assert_eq!(orphan.by_ref().count(), 0);
+    assert_eq!(orphan.valid_len(), 0);
 }

@@ -203,6 +203,7 @@ pub(super) struct DrawState {
     texture_pipelines: Option<texture::TexturePipelines>,
     assembly: Option<assembly::AssemblyPass>,
     grid: Option<dispatch_grid::GridPass>,
+    frame_decode: Option<frame_decode::FrameDecodePass>,
     mesh_indirect: Option<mesh_indirect::MeshIndirectPass>,
 }
 
@@ -284,6 +285,7 @@ impl DrawState {
             texture_pipelines: None,
             assembly: None,
             grid: None,
+            frame_decode: None,
             mesh_indirect: None,
         })
     }
@@ -1516,7 +1518,10 @@ impl VulkanRasterizer {
         let Some((id, view)) = self.texture_info(src, raw, ty)? else {
             return Ok(None);
         };
-        Ok(self.texture_cache.view(id, &view)?.map(|raw| (id, raw)))
+        Ok(self
+            .texture_cache
+            .sampled_view(id, &view)?
+            .map(|raw| (id, raw)))
     }
 
     /// The image the texture header `raw` selects and the view of it `ty` reads; `None` when
@@ -2419,6 +2424,7 @@ fn storage_pointer(
 
 mod assembly;
 mod dispatch_grid;
+mod frame_decode;
 mod host_compute;
 mod mesh_indirect;
 mod null;

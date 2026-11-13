@@ -474,6 +474,31 @@ mod tests {
     }
 
     #[test]
+    fn a_bounded_syncpoint_wait_ends_when_the_kernel_shuts_down() {
+        let (context, _client) = context(SWITCH1_TITLE, Settings::default());
+        let kernel = context.kernel.clone();
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            kernel.shutdown();
+        });
+        let started = std::time::Instant::now();
+        let result = crate::context::wait_guest_syncpoint(
+            &context.kernel,
+            context.gpu.host1x().syncpoints.guest(),
+            0x30,
+            1,
+            Some(Duration::from_secs(10)),
+        );
+        assert!(matches!(result, Err(SyncpointWaitError::TimedOut { .. })));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the wait gave up {:?} after it began",
+            started.elapsed()
+        );
+        stopper.join().unwrap();
+    }
+
+    #[test]
     fn allocating_wait_ids_round_trip_for_every_slot() {
         let (_nvdrv, ctrl) = ctrl();
         for slot in 0..MAX_EVENTS {

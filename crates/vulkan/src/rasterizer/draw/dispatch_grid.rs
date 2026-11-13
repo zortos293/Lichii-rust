@@ -95,7 +95,7 @@ impl VulkanRasterizer {
             set,
             &buffers,
             bytemuck::bytes_of(&params),
-            1,
+            [1, 1, 1],
             (
                 vk::PipelineStageFlags2::DRAW_INDIRECT,
                 vk::AccessFlags2::INDIRECT_COMMAND_READ,

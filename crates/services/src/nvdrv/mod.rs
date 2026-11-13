@@ -26,7 +26,7 @@ mod tests;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytemuck::{Pod, Zeroable};
 use lichii_common::{ConsoleGeneration, HleResult, ResultCode};
@@ -101,30 +101,20 @@ impl Nvdrv {
         }
     }
 
-    /// Waits until guest syncpoint `id` reaches `threshold` or `timeout` passes, like
-    /// [`lichii_gpu::host1x::Syncpoints::wait`], and times out once the kernel shuts down: the GPU
-    /// stops first, so the value may never come, and a service thread still waiting would keep
-    /// the session from stopping.
+    /// Waits for guest syncpoint `id` like [`crate::context::wait_guest_syncpoint`].
     fn wait_syncpoint(
         &self,
         id: u32,
         threshold: u32,
         timeout: Option<Duration>,
     ) -> Result<u32, SyncpointWaitError> {
-        const SHUTDOWN_CHECK: Duration = Duration::from_millis(100);
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
-        let guest = self.syncpoints.syncpoints().guest();
-        loop {
-            let left = deadline.map_or(SHUTDOWN_CHECK, |deadline| {
-                deadline.saturating_duration_since(Instant::now())
-            });
-            match guest.wait(id, threshold, Some(left.min(SHUTDOWN_CHECK))) {
-                Err(SyncpointWaitError::TimedOut { .. })
-                    if !self.kernel.is_shutting_down()
-                        && deadline.is_none_or(|deadline| Instant::now() < deadline) => {}
-                result => return result,
-            }
-        }
+        crate::context::wait_guest_syncpoint(
+            &self.kernel,
+            self.syncpoints.syncpoints().guest(),
+            id,
+            threshold,
+            timeout,
+        )
     }
 
     /// Reserves a free syncpoint for an HLE service that counts its own work on it, such as the
