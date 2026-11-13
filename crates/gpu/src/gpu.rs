@@ -10,7 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
-use std::thread::JoinHandle;
+use std::thread::{JoinHandle, ThreadId};
 use std::time::Duration;
 
 use lichii_common::DAddr;
@@ -332,6 +332,8 @@ pub struct Gpu {
     references: Mutex<HashMap<ChannelId, Arc<AtomicU32>>>,
     /// The front thread, then the back thread when it has one; emptied by `shutdown`.
     threads: Mutex<Vec<JoinHandle<()>>>,
+    /// Ids of those threads, so `shutdown` recognises a GPU thread without taking `threads`.
+    thread_ids: Vec<ThreadId>,
 }
 
 const _: () = {
@@ -396,6 +398,11 @@ impl Gpu {
             inbox,
             next_channel: AtomicU32::new(0),
             references: Mutex::new(HashMap::new()),
+            thread_ids: [Some(&front), back.as_ref()]
+                .into_iter()
+                .flatten()
+                .map(|thread| thread.thread().id())
+                .collect(),
             threads: Mutex::new([Some(front), back].into_iter().flatten().collect()),
         }
     }
@@ -579,13 +586,11 @@ impl Gpu {
     /// From a GPU thread (a [`Gpu::run_in_order`] action) it closes the GPU without joining.
     pub fn shutdown(&self) {
         self.inbox.close();
-        let mut threads = self.threads.lock();
-        let current = std::thread::current().id();
-        if threads.iter().any(|thread| thread.thread().id() == current) {
+        if self.thread_ids.contains(&std::thread::current().id()) {
             tracing::error!("GPU shutdown from a GPU thread; not joining it");
             return;
         }
-        for thread in threads.drain(..) {
+        for thread in self.threads.lock().drain(..) {
             if thread.join().is_err() {
                 tracing::error!("a GPU thread panicked");
             }

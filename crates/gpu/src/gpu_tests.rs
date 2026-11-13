@@ -1418,6 +1418,27 @@ fn shutdown_joins_the_gpu_once_and_drops_later_commands() {
 }
 
 #[test]
+fn shutdown_from_a_gpu_callback_during_an_outside_shutdown_finishes() {
+    each_mode(|threading| {
+        let gpu = Arc::new(Rig::new(threading).gpu);
+        let (started, wait_started) = std::sync::mpsc::channel();
+        let (go, wait_go) = std::sync::mpsc::channel::<()>();
+        let inner = gpu.clone();
+        gpu.run_in_order(move |_| {
+            started.send(()).unwrap();
+            let _ = wait_go.recv();
+            inner.shutdown();
+        });
+        wait_started.recv().unwrap();
+        let outer = gpu.clone();
+        let outside = std::thread::spawn(move || outer.shutdown());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        go.send(()).unwrap();
+        outside.join().unwrap();
+    });
+}
+
+#[test]
 fn pause_holds_submissions_until_resumed() {
     each_mode(|threading| {
         let mut rig = Rig::new(threading);
