@@ -160,6 +160,17 @@ pub struct ImageState {
     pub cpu_dirty: bool,
 }
 
+/// Guest texture data the cache moved since it was created.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Traffic {
+    /// Images uploaded from guest memory, and the staged bytes.
+    pub uploads: u64,
+    pub upload_bytes: u64,
+    /// GPU-modified images written back to guest memory, and their guest bytes.
+    pub downloads: u64,
+    pub download_bytes: u64,
+}
+
 /// What the collector did since the cache was created.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CollectorStats {
@@ -404,6 +415,7 @@ pub struct TextureCache {
     host_formats: Vec<Option<HostFormat>>,
     tick: u64,
     visit: u64,
+    traffic: Traffic,
     ids: Vec<ImageId>,
     joins: Vec<(ImageId, u32, u32)>,
     segments: Vec<Segment>,
@@ -550,6 +562,7 @@ impl TextureCache {
             host_formats: vec![None; PixelFormat::ALL.len()],
             tick: 0,
             visit: 0,
+            traffic: Traffic::default(),
             ids: Vec::new(),
             joins: Vec::new(),
             segments: Vec::new(),
@@ -597,6 +610,10 @@ impl TextureCache {
 
     pub fn collector_stats(&self) -> CollectorStats {
         self.stats
+    }
+
+    pub fn traffic(&self) -> Traffic {
+        self.traffic
     }
 
     /// The host format of a guest format, queried from the device once.
@@ -1661,7 +1678,12 @@ impl TextureCache {
 
     fn upload(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
         let device = self.device.clone();
-        let Self { slots, scratch, .. } = self;
+        let Self {
+            slots,
+            scratch,
+            traffic,
+            ..
+        } = self;
         let image = slots[id.index as usize]
             .image
             .as_mut()
@@ -1679,6 +1701,8 @@ impl TextureCache {
                 total = total.next_multiple_of(align);
             }
         }
+        traffic.uploads += 1;
+        traffic.upload_bytes += total;
         let slice = tx.staging.alloc(tx.scheduler, total.max(align), align)?;
         let (buffer, base_offset) = (slice.buffer, slice.offset);
         scratch.regions.clear();
@@ -1817,7 +1841,11 @@ impl TextureCache {
                     &data[download.offset as usize..],
                     keep,
                 );
-                self.image(download.id).gpu_modified = false;
+                let image = self.image(download.id);
+                image.gpu_modified = false;
+                let bytes = image.info.size_bytes();
+                self.traffic.downloads += 1;
+                self.traffic.download_bytes += bytes;
             }
         }
         self.readback = readback;

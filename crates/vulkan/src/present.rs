@@ -24,6 +24,7 @@ use crate::descriptors::DescriptorAllocator;
 use crate::device::Device;
 use crate::error::{Result, VkResultExt};
 use crate::memory::{Image, ImageDesc, ImageView};
+use crate::rasterizer::ACTIVITY_TARGET;
 use crate::scheduler::{Scheduler, SemaphoreWait, Timeline};
 use crate::staging::StagingRing;
 use crate::swapchain::Swapchain;
@@ -274,6 +275,8 @@ pub struct Presenter {
     timestamps: Option<vk::QueryPool>,
     last_present: Option<Instant>,
     last_vram: Option<Instant>,
+    /// Start and count of the presents since the last activity line (see `record_perf`).
+    presents: (Option<Instant>, u32),
 }
 
 impl Presenter {
@@ -361,6 +364,7 @@ impl Presenter {
             timestamps: timestamps.flatten(),
             last_present: None,
             last_vram: None,
+            presents: (None, 0),
         })
     }
 
@@ -745,6 +749,20 @@ impl Presenter {
             });
         }
         self.last_present = Some(now);
+        if tracing::enabled!(target: ACTIVITY_TARGET, tracing::Level::DEBUG) {
+            let (since, count) = &mut self.presents;
+            *count += 1;
+            let start = *since.get_or_insert(now);
+            if now - start >= Duration::from_secs(1) {
+                tracing::debug!(
+                    target: ACTIVITY_TARGET,
+                    presents = *count,
+                    seconds = (now - start).as_secs_f32(),
+                    "presenter"
+                );
+                self.presents = (Some(now), 0);
+            }
+        }
         if self.last_vram.is_none_or(|t| now - t >= VRAM_INTERVAL) {
             let usage = self.device.memory_usage();
             self.perf.set_vram(usage.used, usage.budget);

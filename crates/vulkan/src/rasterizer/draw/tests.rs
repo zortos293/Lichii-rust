@@ -390,6 +390,31 @@ fn uniform_texture(f: &Fixture, index: u64, offset: u64, texel: [u8; 4]) {
 }
 
 #[test]
+fn activity_counts_draws_submits_and_texture_uploads() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(&f, PROGRAMS + u64::from(FRAGMENT), &sampling_program());
+    uniform_texture(&f, 0, TEXTURE, [10, 200, 30, 255]);
+    let regs = sampling_regs();
+    draw(&mut f, &gmmu, &regs);
+    let first = f.rasterizer.texture_cache.traffic();
+    draw(&mut f, &gmmu, &regs);
+    f.rasterizer.flush_commands();
+    let activity = &f.rasterizer.activity;
+    assert_eq!(activity.draws, 2);
+    assert_eq!(activity.submits, 1);
+    assert_eq!(first.uploads, 2, "the render target and the texture");
+    assert_eq!(first.upload_bytes, 2 * u64::from(SIZE * SIZE * 4));
+    let traffic = f.rasterizer.texture_cache.traffic();
+    assert_eq!(
+        traffic.uploads, first.uploads,
+        "the second draw reuses both cached images"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
 fn guest_barriers_record_between_draws() {
     let Some((mut f, gmmu)) = draw_fixture() else {
         return;
