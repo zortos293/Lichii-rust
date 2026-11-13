@@ -36,6 +36,25 @@ pub fn context(program_id: u64, settings: Settings) -> (Arc<ServiceContext>, Ipc
 
 /// A context for `program`, for tests that give the title a RomFS, NACP or add-on content.
 pub fn context_with(program: ProgramImage, settings: Settings) -> (Arc<ServiceContext>, IpcClient) {
+    context_with_session(program, settings, Arc::new(RecordedPrograms::default()))
+}
+
+/// The programs a test title asked to start, with the user channel it handed to each.
+#[derive(Default)]
+pub struct RecordedPrograms(pub parking_lot::Mutex<Vec<(u8, Vec<Vec<u8>>)>>);
+
+impl crate::SessionEvents for RecordedPrograms {
+    fn execute_program(&self, program_index: u8, user_channel: Vec<Vec<u8>>) {
+        self.0.lock().push((program_index, user_channel));
+    }
+}
+
+/// A context for `program` whose requests to the session go to `session`.
+pub fn context_with_session(
+    program: ProgramImage,
+    settings: Settings,
+    session: Arc<dyn crate::SessionEvents>,
+) -> (Arc<ServiceContext>, IpcClient) {
     let generation = ConsoleGeneration::from_program_id(program.program_id);
     let kernel = testing::kernel(generation);
     let program = Arc::new(program);
@@ -61,6 +80,7 @@ pub fn context_with(program: ProgramImage, settings: Settings) -> (Arc<ServiceCo
         npad: Arc::new(NpadHub::default()),
         perf: Arc::new(PerfStats::default()),
         audio: Arc::new(lichii_audio::sink::Sink::null()),
+        session,
     });
     (context, client)
 }

@@ -91,7 +91,7 @@ use std::sync::Arc;
 use lichii_common::HleResult;
 
 pub use am::applets;
-pub use context::{ServiceContext, ServiceParts};
+pub use context::{ServiceContext, ServiceParts, SessionEvents};
 pub use dispatch::Service;
 
 /// Registers every HLE service with `sm:`. Call it after the application process exists and

@@ -49,6 +49,7 @@ const IN_FOCUS: u8 = 1;
 
 pub(crate) fn register(context: &Arc<ServiceContext>) -> HleResult<()> {
     let applet = Arc::new(Applet::new());
+    let _ = context.am.set(applet.clone());
     context.register("appletOE", "am", move |context| {
         proxy::ApplicationProxyService {
             context: context.clone(),
@@ -129,6 +130,38 @@ struct AppletState {
 }
 
 impl Applet {
+    /// Pushes the storages a previous program handed over, charged like the title's own.
+    pub(crate) fn receive_user_channel(&self, user_channel: Vec<Vec<u8>>) {
+        let mut state = self.state.lock();
+        for data in user_channel {
+            let size = data.len();
+            let Some(charge) = storage::Charge::take(&self.storage_bytes, size) else {
+                tracing::warn!(
+                    size,
+                    "live storage budget exhausted; dropping a user channel storage"
+                );
+                continue;
+            };
+            state
+                .user_channel
+                .push(Arc::new(storage::StorageData::new(data, Some(charge))));
+        }
+    }
+
+    /// Hands the user channel over to the program at `program_index` and asks the session to
+    /// start it.
+    fn execute_program(&self, context: &ServiceContext, program_index: u8) {
+        let user_channel = self
+            .state
+            .lock()
+            .user_channel
+            .iter()
+            .map(|d| d.to_vec())
+            .collect();
+        tracing::info!(program_index, "the title asked to start another program");
+        context.session.execute_program(program_index, user_channel);
+    }
+
     fn new() -> Self {
         let applet = Self {
             lifecycle: Mutex::new(Lifecycle {
