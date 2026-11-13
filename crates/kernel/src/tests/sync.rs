@@ -1,8 +1,9 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use lichii_common::ConsoleGeneration;
+use lichii_cpu::ThreadContext;
 use parking_lot::Mutex;
 
 use super::scheduling::{heap_base, spawn_and_join};
@@ -369,4 +370,163 @@ fn abandoned_wait_does_not_replay_its_result() {
     );
     test.run_until_exit(Duration::from_secs(10));
     assert_eq!(*results.lock(), vec![(0, 0), (0, 0x1234)]);
+}
+
+#[test]
+fn a_mutex_owner_runs_at_the_priority_of_its_best_waiter() {
+    const LOW: u32 = 50;
+    const HIGH: u32 = 20;
+    let test = TestKernel::new(ConsoleGeneration::Switch1);
+    let heap = heap_base(&test);
+    let handles = heap + 0x1000;
+    let mutex = heap + 0x4000;
+    let locked = heap + 0x4004;
+    let release = heap + 0x4008;
+    let seen = Arc::new(AtomicU32::new(0));
+    let after = Arc::new(AtomicU32::new(0));
+    let (seen_by_owner, after_by_owner) = (seen.clone(), after.clone());
+    let own_handle = move |ctx: &mut ThreadContext, env: &super::Env| {
+        let slot = handles + 4 * ctx.x[20];
+        ctx.x[22] = word(env, slot).load(Ordering::SeqCst) as u64;
+        ctx.x[22] == 0
+    };
+    let worker = test.program(
+        Script::new()
+            .then(|ctx, _| ctx.x[20] = ctx.x[0])
+            .jump_if(1, own_handle)
+            .jump_if(13, |ctx, _| ctx.x[20] == 1)
+            .then(move |ctx, env| {
+                let tag = ctx.x[22] as u32;
+                while word(env, mutex)
+                    .compare_exchange(0, tag, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {}
+                word(env, locked).store(1, Ordering::SeqCst);
+            })
+            .svc(0x0c, |ctx, _| {
+                ctx.x[1] = crate::handle_table::CURRENT_THREAD as u64
+            })
+            .then(move |ctx, _| seen_by_owner.store(ctx.x[1] as u32, Ordering::SeqCst))
+            .jump_if(4, move |_, env| {
+                word(env, release).load(Ordering::SeqCst) == 0
+            })
+            .jump_if(9, move |ctx, env| {
+                word(env, mutex)
+                    .compare_exchange(ctx.x[22] as u32, 0, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            })
+            .svc(0x1b, move |ctx, _| ctx.x[0] = mutex)
+            .svc(0x0c, |ctx, _| {
+                ctx.x[1] = crate::handle_table::CURRENT_THREAD as u64
+            })
+            .then(move |ctx, _| after_by_owner.store(ctx.x[1] as u32, Ordering::SeqCst))
+            .exit()
+            .then(|_, _| {})
+            .jump_if(13, move |_, env| {
+                word(env, locked).load(Ordering::SeqCst) == 0
+            })
+            .then(move |ctx, env| {
+                let w = word(env, mutex);
+                let current = w.fetch_or(HANDLE_WAIT_MASK, Ordering::SeqCst);
+                ctx.x[23] = u64::from(current & !HANDLE_WAIT_MASK);
+            })
+            .svc(0x1a, move |ctx, _| {
+                ctx.x[0] = ctx.x[23];
+                ctx.x[1] = mutex;
+                ctx.x[2] = ctx.x[22];
+            })
+            .jump_if(18, move |ctx, env| {
+                word(env, mutex)
+                    .compare_exchange(ctx.x[22] as u32, 0, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            })
+            .svc(0x1b, move |ctx, _| ctx.x[0] = mutex)
+            .exit(),
+    );
+    let main = test.program(
+        spawn_and_join(heap, 2, worker, |i| {
+            (if i == 0 { LOW } else { HIGH }, i as u32)
+        })
+        .exit(),
+    );
+    let process = test.start(test.image(), main);
+    test.kernel.run().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while seen.load(Ordering::SeqCst) != HIGH {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the owner never inherited its waiter's priority (seen {})",
+            seen.load(Ordering::SeqCst)
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    process.memory().write(release, 1u32).unwrap();
+    test.wait_for_exit(Duration::from_secs(10));
+    assert_eq!(
+        after.load(Ordering::SeqCst),
+        LOW,
+        "releasing the mutex gives the priority back"
+    );
+}
+
+#[test]
+fn a_mutex_waiter_stops_lending_its_priority_when_its_wait_ends() {
+    use crate::thread::{Resume, WakeResult};
+    let test = TestKernel::new(ConsoleGeneration::Switch1);
+    let process = test.kernel.create_process(&test.image()).unwrap();
+    let entry = process.entry();
+    let thread = |priority| {
+        test.kernel
+            .0
+            .create_thread(&process, entry, 0, entry, priority, -2)
+            .unwrap()
+    };
+    let (owner, timed, terminated, late) = (thread(50), thread(20), thread(30), thread(10));
+    let mutex = 0x1000;
+
+    let token = timed.begin_wait(Resume::Result, false).unwrap();
+    owner.add_lock_waiter(&timed, token, mutex);
+    let other = terminated.begin_wait(Resume::Result, false).unwrap();
+    owner.add_lock_waiter(&terminated, other, mutex);
+    assert_eq!(owner.priority(), 20);
+
+    assert!(timed.wake(token, WakeResult::error(result::TIMED_OUT)));
+    assert_eq!(
+        owner.priority(),
+        30,
+        "a timed-out waiter withdraws its priority"
+    );
+
+    terminated.mark_terminated();
+    assert_eq!(
+        owner.priority(),
+        50,
+        "an exited waiter withdraws its priority"
+    );
+
+    let other_owner = thread(40);
+    let token = timed.begin_wait(Resume::Result, false).unwrap();
+    owner.add_lock_waiter(&timed, token, mutex);
+    timed.wake_locked(
+        &mut timed.sched.lock(),
+        WakeResult::error(result::TIMED_OUT),
+    );
+    let token = timed.begin_wait(Resume::Result, false).unwrap();
+    other_owner.add_lock_waiter(&timed, token, mutex + 4);
+    assert_eq!(
+        (owner.priority(), other_owner.priority()),
+        (50, 20),
+        "a waiter that blocks on another owner before its old wait is withdrawn moves its priority"
+    );
+    assert!(timed.wake(token, WakeResult::error(result::TIMED_OUT)));
+    assert_eq!(other_owner.priority(), 40);
+
+    let token = late.begin_wait(Resume::Result, false).unwrap();
+    assert!(late.wake(token, WakeResult::error(result::TIMED_OUT)));
+    owner.add_lock_waiter(&late, token, mutex);
+    assert_eq!(
+        owner.priority(),
+        50,
+        "a wait that already ended lends nothing"
+    );
 }
