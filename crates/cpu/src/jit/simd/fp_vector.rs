@@ -20,6 +20,8 @@ const SCRATCH: u8 = 15;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaneOp {
     Add,
+    /// `FADDP`: sums of adjacent lane pairs, those of `n` in the low lanes and those of `m` above.
+    AddPairwise,
     Sub,
     Mul,
     /// Fused `acc + n * m`.
@@ -99,6 +101,7 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
     };
     let three_same = match word & 0xbfa0_fc00 {
         0x0e20_d400 => Some(LaneOp::Add),
+        0x2e20_d400 => Some(LaneOp::AddPairwise),
         0x0ea0_d400 => Some(LaneOp::Sub),
         0x2e20_dc00 => Some(LaneOp::Mul),
         0x0e20_cc00 => Some(LaneOp::Mla),
@@ -189,6 +192,26 @@ impl Emitter<'_> {
         };
         dynasm!(self.asm ; .arch x64 ; movaps Rx(d), Rx(acc.unwrap_or(n)));
         match (op, fp) {
+            (LaneOp::AddPairwise, Fp::S) if lanes == 4 => dynasm!(self.asm
+                ; .arch x64
+                ; shufps Rx(d), Rx(m), 0x88u8 as i8
+                ; movaps xmm15, Rx(n)
+                ; shufps xmm15, Rx(m), 0xddu8 as i8
+                ; addps Rx(d), xmm15
+            ),
+            (LaneOp::AddPairwise, Fp::S) => dynasm!(self.asm
+                ; .arch x64
+                ; unpcklps Rx(d), Rx(m)
+                ; movhlps xmm15, Rx(d)
+                ; addps Rx(d), xmm15
+            ),
+            (LaneOp::AddPairwise, Fp::D) => dynasm!(self.asm
+                ; .arch x64
+                ; unpcklpd Rx(d), Rx(m)
+                ; movaps xmm15, Rx(n)
+                ; unpckhpd xmm15, Rx(m)
+                ; addpd Rx(d), xmm15
+            ),
             (LaneOp::Add, Fp::S) => dynasm!(self.asm ; .arch x64 ; addps Rx(d), Rx(b)),
             (LaneOp::Add, Fp::D) => dynasm!(self.asm ; .arch x64 ; addpd Rx(d), Rx(b)),
             (LaneOp::Sub, Fp::S) => dynasm!(self.asm ; .arch x64 ; subps Rx(d), Rx(b)),
