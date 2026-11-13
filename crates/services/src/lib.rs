@@ -39,6 +39,7 @@ mod chat;
 mod context;
 mod dispatch;
 mod fs;
+mod gsv;
 mod hid;
 mod pl_u;
 #[cfg(test)]
