@@ -1965,3 +1965,27 @@ fn switch_2_compute_calls_run_the_3d_macros_until_compute_uploads_its_own() {
         );
     });
 }
+
+#[test]
+fn one_channels_compute_upload_leaves_other_channels_on_the_3d_macros() {
+    each_mode(|threading| {
+        let mut rig = Rig::new(threading);
+        let uploader = rig.channel(HostClass::Ampere);
+        let caller = rig.channel(HostClass::Ampere);
+        let words = Pushbuffer::default()
+            .bind(1, 0xc7c0)
+            .load_macro(1, &masm::emit_program(0x200, 0xc0));
+        rig.submit(uploader, &words.0);
+        let words = Pushbuffer::default()
+            .bind(0, AMPERE_3D)
+            .bind(1, 0xc7c0)
+            .load_macro(0, &masm::emit_program(0x200, 0x3d))
+            .once(1, crate::macros::MACRO_METHOD_BASE, &[0]);
+        rig.submit(caller, &words.0);
+        assert_eq!(
+            rig.methods(),
+            [(caller.0, EngineKind::Compute, 0x200, 0x3d)],
+            "{threading:?}"
+        );
+    });
+}

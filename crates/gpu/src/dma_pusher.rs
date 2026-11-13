@@ -55,10 +55,10 @@ pub(crate) struct FrontShared {
     /// Switch 2: the channels of a process share one graphics context, and with it the macro
     /// code of their 3D engines (NX2_NOTES row 53). Each keeps its own data RAM.
     pub shared_macros: Option<MacroEngine>,
-    /// Switch 2: the compute engines' own macro code, once the compute class sets its
-    /// instruction or start-address pointer. Until then compute uploads and calls use the 3D
-    /// engines' macros, as the reference does; after it, compute uploads no longer overwrite
-    /// the 3D macros at the same code addresses.
+    /// Switch 2: the compute engines' own macro code, used by the channels whose compute class
+    /// set its instruction or start-address pointer (`ChannelState::compute_macros`). The
+    /// other channels' compute uploads and calls use the 3D macros, as in the reference, and no
+    /// compute upload overwrites the 3D macros at the same code addresses.
     pub compute_macros: Option<MacroEngine>,
     /// The words of the entry being parsed.
     pub words: Vec<u32>,
@@ -126,6 +126,9 @@ struct ChannelState {
     calls: [MacroCall; 2],
     /// Switch 1: GPU address the back takes the next compute DATA_UPLOAD word to come from.
     upload_next: Option<GpuVAddr>,
+    /// Switch 2: the compute class set a macro instruction or start-address pointer, so its
+    /// uploads and calls use [`FrontShared::compute_macros`] from then on.
+    compute_macros: bool,
 }
 
 /// Parameters one macro call can have: the words of one command (a 13-bit count).
@@ -187,6 +190,7 @@ impl FrontChannel {
                 macros: None,
                 calls: [MacroCall::new(), MacroCall::new()],
                 upload_next: None,
+                compute_macros: false,
             },
             queue: VecDeque::new(),
             offset: 0,
@@ -618,20 +622,18 @@ impl Dispatch<'_> {
         if native && is_load_mme(method) {
             self.state.compute[method as usize] = call.argument;
             let shared = &mut *self.shared;
-            if matches!(
+            self.state.compute_macros |= matches!(
                 method,
                 LOAD_MME_INSTRUCTION_RAM_POINTER | LOAD_MME_START_ADDRESS_RAM_POINTER
-            ) && shared.compute_macros.is_none()
-            {
-                shared.compute_macros = Some(MacroEngine::new(MacroIsa::Mme64));
-            }
-            match &mut shared.compute_macros {
-                Some(engine) => engine,
-                None => shared
-                    .shared_macros
-                    .get_or_insert_with(|| MacroEngine::new(MacroIsa::Mme64)),
-            }
-            .write_load_mme(method, call.argument);
+            );
+            let engine = if self.state.compute_macros {
+                &mut shared.compute_macros
+            } else {
+                &mut shared.shared_macros
+            };
+            engine
+                .get_or_insert_with(|| MacroEngine::new(MacroIsa::Mme64))
+                .write_load_mme(method, call.argument);
             return;
         }
         if !native && method == COMPUTE_DATA_UPLOAD {
@@ -659,6 +661,7 @@ impl Dispatch<'_> {
             data_ram,
             macros,
             calls,
+            compute_macros,
             ..
         } = &mut *self.state;
         let pending = &mut calls[target as usize];
@@ -672,7 +675,7 @@ impl Dispatch<'_> {
         let shared = &mut *self.shared;
         let engine = match (host.class(), target) {
             (HostClass::Maxwell, _) => macros.as_mut(),
-            (HostClass::Ampere, MacroTarget::Compute) if shared.compute_macros.is_some() => {
+            (HostClass::Ampere, MacroTarget::Compute) if *compute_macros => {
                 shared.compute_macros.as_mut()
             }
             (HostClass::Ampere, _) => shared.shared_macros.as_mut(),
