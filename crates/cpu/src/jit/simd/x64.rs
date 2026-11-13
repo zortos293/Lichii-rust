@@ -160,6 +160,32 @@ impl Emitter<'_> {
         dynasm!(self.asm ; .arch x64 ; =>done);
     }
 
+    /// `FMAX`, `FMIN`, `FMAXNM` or `FMINNM` of `xmm15` (a copy of `a`) and `b` into `xmm15`. Once a NaN
+    /// input has jumped to `slow`, every result is one of the inputs, exact and without flags.
+    /// Equal inputs are combined bitwise, because x86 returns the second operand for +0 and -0
+    /// where Arm returns +0 for the maximum and -0 for the minimum.
+    fn min_max(&mut self, max: bool, fp: Fp, a: u8, b: u8, slow: DynamicLabel) {
+        let (different, done) = (self.asm.new_dynamic_label(), self.asm.new_dynamic_label());
+        match fp {
+            Fp::S => dynasm!(self.asm ; .arch x64 ; ucomiss Rx(a), Rx(b)),
+            Fp::D => dynasm!(self.asm ; .arch x64 ; ucomisd Rx(a), Rx(b)),
+        }
+        dynasm!(self.asm ; .arch x64 ; jp =>slow ; jne =>different);
+        if max {
+            dynasm!(self.asm ; .arch x64 ; andps xmm15, Rx(b));
+        } else {
+            dynasm!(self.asm ; .arch x64 ; orps xmm15, Rx(b));
+        }
+        dynasm!(self.asm ; .arch x64 ; jmp =>done ; =>different);
+        match (max, fp) {
+            (true, Fp::S) => dynasm!(self.asm ; .arch x64 ; maxss xmm15, Rx(b)),
+            (true, Fp::D) => dynasm!(self.asm ; .arch x64 ; maxsd xmm15, Rx(b)),
+            (false, Fp::S) => dynasm!(self.asm ; .arch x64 ; minss xmm15, Rx(b)),
+            (false, Fp::D) => dynasm!(self.asm ; .arch x64 ; minsd xmm15, Rx(b)),
+        }
+        dynasm!(self.asm ; .arch x64 ; =>done);
+    }
+
     /// The NZCV of an ordered compare of `xmm a` with `xmm b` in `d`; unordered jumps to `slow`.
     /// Clobbers `rax`, `rcx` and `rdx`.
     fn compare_flags(&mut self, fp: Fp, a: u8, b: u8, d: u8, slow: DynamicLabel) {
@@ -268,9 +294,11 @@ impl Emitter<'_> {
             SimdOp::Arith { op, fp, a, b, word } => {
                 let (a, b) = (self.reg(a), self.reg(b));
                 let d = self.def(v);
-                let slow = self.checked(true);
+                let extreme = matches!(op, Arith::Max | Arith::Min);
+                let slow = self.checked(!extreme);
                 dynasm!(self.asm ; .arch x64 ; movaps xmm15, Rx(a));
                 match (op, fp) {
+                    (Arith::Max | Arith::Min, _) => self.min_max(op == Arith::Max, fp, a, b, slow),
                     (Arith::Add, Fp::S) => dynasm!(self.asm ; .arch x64 ; addss xmm15, Rx(b)),
                     (Arith::Add, Fp::D) => dynasm!(self.asm ; .arch x64 ; addsd xmm15, Rx(b)),
                     (Arith::Sub, Fp::S) => dynasm!(self.asm ; .arch x64 ; subss xmm15, Rx(b)),
@@ -282,13 +310,12 @@ impl Emitter<'_> {
                     (Arith::Nmul, Fp::S) => dynasm!(self.asm ; .arch x64 ; mulss xmm15, Rx(b)),
                     (Arith::Nmul, Fp::D) => dynasm!(self.asm ; .arch x64 ; mulsd xmm15, Rx(b)),
                 }
-                let zero_factors: &[u8] = match op {
-                    Arith::Add | Arith::Sub => &[],
-                    Arith::Mul | Arith::Nmul => &[a, b],
-                    Arith::Div => &[a],
-                };
-                let sum = matches!(op, Arith::Add | Arith::Sub);
-                self.check_result(fp, !sum, zero_factors, slow);
+                match op {
+                    Arith::Add | Arith::Sub => self.check_result(fp, false, &[], slow),
+                    Arith::Mul | Arith::Nmul => self.check_result(fp, true, &[a, b], slow),
+                    Arith::Div => self.check_result(fp, true, &[a], slow),
+                    Arith::Max | Arith::Min => self.low_to_rax(fp, 15),
+                }
                 match (op, fp) {
                     (Arith::Nmul, Fp::S) => {
                         dynasm!(self.asm ; .arch x64 ; xor eax, 0x8000_0000u32 as i32)

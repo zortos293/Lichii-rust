@@ -511,14 +511,19 @@ alu_class!(scvtf_vector, "0x0011100x100001110110xxxxxxxxxx", |w| {
     w & 0x4040_0000 != 0x0040_0000
 });
 
-/// Scalar FMUL, FNMUL, FDIV and the fused multiplies on four registers that MOVI and FNEG keep
-/// setting to +0 and -0, so products with a zero factor and zero dividends come up often.
+/// Scalar FMUL, FNMUL, FDIV, the fused multiplies and FMAX/FMIN/FMAXNM/FMINNM on four registers
+/// that MOVI and FNEG keep setting to +0 and -0, so zero factors, zero dividends and pairs of
+/// equal or opposite zeros come up often.
 #[test]
 fn fp_zero_factors() {
-    const OPS: [u32; 7] = [
+    const OPS: [u32; 11] = [
         0x1e20_0800,
         0x1e20_8800,
         0x1e20_1800,
+        0x1e20_4800,
+        0x1e20_5800,
+        0x1e20_6800,
+        0x1e20_7800,
         0x1f00_0000,
         0x1f00_8000,
         0x1f20_0000,
@@ -535,12 +540,9 @@ fn fp_zero_factors() {
                     0 => 0x2f00_e400 | reg(rng),
                     1 => 0x1e21_4000 | double | reg(rng) << 5 | reg(rng),
                     _ => {
-                        OPS[rng.below(OPS.len() as u64) as usize]
-                            | double
-                            | reg(rng) << 16
-                            | reg(rng) << 10
-                            | reg(rng) << 5
-                            | reg(rng)
+                        let op = OPS[rng.below(OPS.len() as u64) as usize];
+                        let ra = if op >> 24 == 0x1f { reg(rng) << 10 } else { 0 };
+                        op | double | reg(rng) << 16 | ra | reg(rng) << 5 | reg(rng)
                     }
                 };
                 out.push(word);
@@ -548,6 +550,11 @@ fn fp_zero_factors() {
         },
     );
 }
+alu_class!(fp_min_max, "000111100x1xxxxx01xx10xxxxxxxxxx");
+alu_class!(fp_compare_vector, "0xx01110xx1xxxxx111001xxxxxxxxxx", |w| {
+    matches!(w & 0xbfa0_fc00, 0x0e20_e400 | 0x2e20_e400 | 0x2ea0_e400)
+        && w & 0x4040_0000 != 0x0040_0000
+});
 alu_class!(ext, "0x101110000xxxxx0xxxx0xxxxxxxxxx", |w| w & 0x4000_4000
     != 0x4000);
 alu_class!(

@@ -19,6 +19,10 @@ pub enum Arith {
     Div,
     /// `FNMUL`: the rounded product, negated.
     Nmul,
+    /// `FMAX` or `FMAXNM`, which differ only on NaNs.
+    Max,
+    /// `FMIN` or `FMINNM`, which differ only on NaNs.
+    Min,
 }
 
 /// The fused multiply-adds, as `(n, m, a)` maps to the result.

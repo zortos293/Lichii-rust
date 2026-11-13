@@ -390,6 +390,28 @@ const WORKLOADS: &[Workload] = &[
         per_iteration: 10,
     },
     Workload {
+        name: "fp min max loop",
+        code: &[
+            0x4f03f700, // fmov v0.4s, #1.5
+            0x4f03f501, // fmov v1.4s, #0.75
+            0x1e2e1002, // fmov s2, #1.0
+            0x1e211003, // fmov s3, #3.0
+            0x1e236844, // 1: fmaxnm s4, s2, s3
+            0x1e227885, // fminnm s5, s4, s2
+            0x1e2348a6, // fmax s6, s5, s3
+            0x1e2458c7, // fmin s7, s6, s4
+            0x6e21e408, // fcmge v8.4s, v0.4s, v1.4s
+            0x6ea0e429, // fcmgt v9.4s, v1.4s, v0.4s
+            0x4e21e40a, // fcmeq v10.4s, v0.4s, v1.4s
+            0x4c007828, // st1 {v8.4s}, [x1]
+            0xf10004a5, // subs x5, x5, #1
+            0x54fffee1, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 10,
+    },
+    Workload {
         name: "popcount loop",
         code: &[
             0x4c407020, // 1: ld1 {v0.16b}, [x1]
