@@ -10,6 +10,9 @@
 //! remembered per device address and recomputed only after a guest write touched it. A hit
 //! is a page table lookup, two map lookups and the replay; it allocates nothing and takes no
 //! lock. Failed translations are cached too: their draws are skipped without translating again.
+//! A failure is remembered without the reads that led to it, so a constant buffer word that
+//! changes from draw to draw (a per-material bindless handle) does not translate the failing
+//! program again on every draw. Each key keeps at most [`MAX_VARIANTS`] variants.
 //!
 //! With the title's disk cache open, a miss first replays the stored entries that share the
 //! program's probe key (`lichii_shader::cache`) and reuses a module whose every recorded answer
@@ -69,6 +72,9 @@ struct ModuleKey {
     code: [u64; 2],
     state: u64,
 }
+
+/// Variants kept per key; the oldest goes first.
+const MAX_VARIANTS: usize = 32;
 
 struct Variant {
     reads: [Vec<EnvRead>; 2],
@@ -258,11 +264,19 @@ impl ShaderCache {
             code: [a.map_or(0, |a| self.learn(a)), self.learn(env)],
             state,
         };
-        self.modules.entry(key).or_default().push(Variant {
-            reads: [
-                a.map(ProgramEnv::take_reads).unwrap_or_default(),
-                env.take_reads(),
-            ],
+        let mut reads = [
+            a.map(ProgramEnv::take_reads).unwrap_or_default(),
+            env.take_reads(),
+        ];
+        if module.is_none() {
+            reads = Default::default();
+        }
+        let variants = self.modules.entry(key).or_default();
+        if variants.len() == MAX_VARIANTS {
+            variants.remove(0);
+        }
+        variants.push(Variant {
+            reads,
             bindings: *bindings,
             module: module.clone(),
         });
