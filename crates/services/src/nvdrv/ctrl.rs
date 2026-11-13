@@ -262,11 +262,12 @@ impl Ctrl {
             return NvResult::BadParameter;
         }
         if failing {
+            event.fails = 0;
+            drop(events);
             if let Err(error) = self.nvdrv.wait_syncpoint(fence_id, target, None) {
                 tracing::error!(%error, "event wait fallback");
             }
             params.value = target;
-            event.fails = 0;
             return NvResult::Success;
         }
 
@@ -546,6 +547,48 @@ mod tests {
             &ctrl.query_event(high).unwrap(),
             &slot_event(&ctrl, 16)
         ));
+    }
+
+    #[test]
+    fn a_fallback_wait_leaves_the_other_events_usable() {
+        let (nvdrv, ctrl) = ctrl();
+        let ctrl = Arc::new(ctrl);
+        assert_eq!(ctrl.register_event(3), NvResult::Success);
+        for _ in 0..=MAX_FAILS {
+            wait(&ctrl, 0x21, 3, false);
+            assert_eq!(ctrl.clear_event_wait(3), NvResult::Success);
+        }
+        let fallback = {
+            let ctrl = ctrl.clone();
+            std::thread::spawn(move || {
+                let mut params = EventWait {
+                    fence: NvFence { id: 0x21, value: 1 },
+                    timeout: 100,
+                    value: 3,
+                };
+                (ctrl.event_wait(&mut params, false), params.value)
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        let (done, registered) = std::sync::mpsc::channel();
+        let other = {
+            let ctrl = ctrl.clone();
+            std::thread::spawn(move || done.send(ctrl.register_event(5)).unwrap())
+        };
+        let result = registered.recv_timeout(Duration::from_secs(2));
+        nvdrv
+            .syncpoints
+            .syncpoints()
+            .guest()
+            .increment(0x21)
+            .unwrap();
+        assert_eq!(
+            result,
+            Ok(NvResult::Success),
+            "another event ioctl waited for the fallback wait"
+        );
+        assert_eq!(fallback.join().unwrap(), (NvResult::Success, 1));
+        other.join().unwrap();
     }
 
     #[test]

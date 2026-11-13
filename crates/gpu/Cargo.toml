@@ -10,6 +10,7 @@ bytemuck = { workspace = true, features = ["extern_crate_alloc"] }
 lichii-common.workspace = true
 lichii-memory.workspace = true
 lichii-texture.workspace = true
+lichii-video.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

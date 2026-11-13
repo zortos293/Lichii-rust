@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+bytemuck.workspace = true
 libloading.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
