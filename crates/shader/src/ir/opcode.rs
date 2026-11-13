@@ -547,6 +547,7 @@ pub enum Opcode {
     ImageAtomicExchange32,
     // Software matrix collective.
     TensorMulAdd,
+    TensorMulAddF32,
     // Warp operations
     LaneId,
     VoteAll,
@@ -1097,6 +1098,7 @@ impl Opcode {
             Opcode::ImageAtomicXor32 => Type::U32,
             Opcode::ImageAtomicExchange32 => Type::U32,
             Opcode::TensorMulAdd => Type::U32X2,
+            Opcode::TensorMulAddF32 => Type::U32X4,
             Opcode::LaneId => Type::U32,
             Opcode::VoteAll => Type::U1,
             Opcode::VoteAny => Type::U1,
@@ -1748,6 +1750,7 @@ impl Opcode {
             Opcode::ImageAtomicXor32 => &[Type::OPAQUE, Type::OPAQUE, Type::U32],
             Opcode::ImageAtomicExchange32 => &[Type::OPAQUE, Type::OPAQUE, Type::U32],
             Opcode::TensorMulAdd => &[Type::U32X4, Type::U32X2, Type::U32X2],
+            Opcode::TensorMulAddF32 => &[Type::U32X4, Type::U32X2, Type::U32X4],
             Opcode::LaneId => &[],
             Opcode::VoteAll => &[Type::U1],
             Opcode::VoteAny => &[Type::U1],
@@ -2496,6 +2499,7 @@ const OPCODE_NAMES: &[&str] = &[
     "ImageAtomicXor32",
     "ImageAtomicExchange32",
     "TensorMulAdd",
+    "TensorMulAddF32",
     "LaneId",
     "VoteAll",
     "VoteAny",

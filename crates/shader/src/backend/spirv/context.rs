@@ -400,7 +400,7 @@ pub(crate) struct EmitContext<'a> {
     /// Stage buffer and outputs of a task or mesh program.
     pub(crate) mesh: MeshState,
     /// The software TENSOR_MUL_ADD functions (K=8, K=16), defined after the entry point.
-    pub(crate) tensor_functions: [Word; 2],
+    pub(crate) tensor_functions: [Word; 4],
 }
 
 /// Stages whose inputs are arrays indexed by vertex.
@@ -674,7 +674,7 @@ impl<'a> EmitContext<'a> {
             uses_nonuniform_storage_texel_buffer: false,
             sparse_result_types: FxHashMap::default(),
             mesh: MeshState::default(),
-            tensor_functions: [0; 2],
+            tensor_functions: [0; 4],
         };
         let unified = profile.unified_descriptor_binding;
         ctx.add_capability(Capability::Shader);
