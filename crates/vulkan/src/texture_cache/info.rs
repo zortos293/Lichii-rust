@@ -75,7 +75,9 @@ fn block_linear(tile_mode: TileMode, gob: GobLayout) -> GuestLayout {
 
 impl ImageInfo {
     /// The image a texture header samples. `None` for texel buffers, which live in the buffer
-    /// cache.
+    /// cache. With Switch 2 GOBs only array headers have layers. Mario Tennis Fever, Donkey Kong
+    /// Bananza and Mario Kart World set the base layer field to 32 or 48 in every non-array
+    /// header they sample, 3D ones included, so it is read as selecting nothing there.
     pub fn from_texture(desc: &TextureDescriptor, gob: GobLayout) -> Option<Self> {
         let layout = match desc.memory {
             TextureMemory::BlockLinear {
@@ -91,7 +93,7 @@ impl ImageInfo {
             TextureMemory::Pitch { pitch } => GuestLayout::Pitch { pitch },
             TextureMemory::Buffer => return None,
         };
-        let arrayed = desc.depth > 1 || desc.base_layer != 0;
+        let arrayed = gob != GobLayout::Switch2 && (desc.depth > 1 || desc.base_layer != 0);
         let base = desc.base_layer;
         let (kind, height, depth, layers, mut rescaleable) = match desc.texture_type {
             TextureType::D1 if !arrayed => (ImageKind::D1, 1, 1, 1, false),
@@ -257,6 +259,19 @@ impl ImageInfo {
             },
             0,
         )
+    }
+
+    /// The first `layers` layers of the image, at most all of them. Draws and clears look up
+    /// only the layers they touch, so a render target's array size alone does not size the
+    /// host image: Mario Tennis Fever's targets each claim 33 layers while sitting one layer
+    /// apart.
+    pub fn with_layers(self, layers: u32) -> Self {
+        let stride = self.layer_stride;
+        Self {
+            layers: layers.clamp(1, self.layers),
+            ..self
+        }
+        .with_stride(stride)
     }
 
     /// Fills `layer_stride`: the guest's own array pitch when it gives one for an array, the
@@ -446,10 +461,18 @@ impl ViewInfo {
         };
         let base_level = desc.min_level.min(info.levels - 1);
         let last_level = desc.max_level.clamp(base_level, info.levels - 1);
-        let base_layer = if info.kind == ImageKind::D3 {
-            0
-        } else {
-            desc.base_layer
+        let switch2 = matches!(
+            info.layout,
+            GuestLayout::BlockLinear {
+                gob: GobLayout::Switch2,
+                ..
+            }
+        );
+        let base_layer = match desc.texture_type {
+            TextureType::D3 => 0,
+            TextureType::D1Array | TextureType::D2Array | TextureType::CubeArray => desc.base_layer,
+            _ if switch2 => 0,
+            _ => desc.base_layer,
         };
         Self {
             format: desc.format,

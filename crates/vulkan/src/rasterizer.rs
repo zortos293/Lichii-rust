@@ -12,6 +12,7 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use ash::vk;
 use lichii_common::DAddr;
@@ -27,7 +28,7 @@ use lichii_gpu::gmmu::Gmmu;
 use lichii_texture::block_linear::{GobLayout, Tiling, unswizzle};
 use lichii_texture::{Aspect, Numeric};
 
-use crate::buffer_cache::BufferCache;
+use crate::buffer_cache::{BufferCache, BufferCacheStats};
 use crate::commands::{COLOR_RANGE, ImageAccess, transition};
 use crate::device::Device;
 use crate::error::Result;
@@ -38,8 +39,27 @@ use crate::present::{FrameImage, FrameMailbox, GuestFrame};
 use crate::scheduler::Scheduler;
 use crate::staging::StagingRing;
 use crate::texture_cache::{
-    ClearValue, ImageId, ImageInfo, ImageKind, Rect, TextureCache, Transfer,
+    ClearValue, ImageId, ImageInfo, ImageKind, Rect, TextureCache, Traffic, Transfer,
 };
+
+/// The tracing target of the GPU thread's and the presenter's activity lines.
+pub(crate) const ACTIVITY_TARGET: &str = "lichii_vulkan::activity";
+
+/// What the GPU thread recorded since its last activity line. With
+/// `lichii_vulkan::activity=debug` it logs one line a second while it submits work, so a run
+/// shows which work keeps the host GPU busy.
+#[derive(Default)]
+struct Activity {
+    since: Option<Instant>,
+    draws: u32,
+    texture_draws: u32,
+    clears: u32,
+    dispatches: u32,
+    presents: u32,
+    submits: u32,
+    textures: Traffic,
+    buffers: BufferCacheStats,
+}
 
 /// Graphics settings the frontend changes while a renderer runs. A renderer that
 /// [follows](VulkanRasterizer::follow) them applies the newest at its next command flush.
@@ -85,6 +105,7 @@ pub struct VulkanRasterizer {
     buffer_cache: BufferCache,
     draw: draw::DrawState,
     live: Option<Arc<LiveSettings>>,
+    activity: Activity,
 }
 
 /// The rectangle a clear covers: the first scissor and the clear rectangle when
@@ -186,6 +207,7 @@ impl VulkanRasterizer {
             unflushed: true,
             texture_cache,
             live: None,
+            activity: Activity::default(),
         })
     }
 
@@ -251,8 +273,10 @@ impl VulkanRasterizer {
             && index < (regs.rt_control.count() as usize).min(NUM_RENDER_TARGETS))
         .then(|| {
             let rt = &regs.rt[index];
-            ImageInfo::from_render_target(rt, msaa, self.gob_layout)
-                .map(|info| (rt.address(), info, rt.width, rt.height))
+            ImageInfo::from_render_target(rt, msaa, self.gob_layout).map(|info| {
+                let info = info.with_layers(base_layer + layer_count);
+                (rt.address(), info, rt.width, rt.height)
+            })
         })
         .flatten();
         if let Some((address, info, width, height)) = color_target {
@@ -311,7 +335,8 @@ impl VulkanRasterizer {
         }
         let depth_target = ((use_depth || use_stencil) && regs.zeta_enable != 0)
             .then(|| ImageInfo::from_zeta(&regs.zeta, &regs.zeta_size, msaa, self.gob_layout))
-            .flatten();
+            .flatten()
+            .map(|info| info.with_layers(base_layer + layer_count));
         if let Some(info) = depth_target {
             let stencil_mask = if regs.clear_control.respect_stencil_mask() != 0 {
                 regs.stencil_front_mask & 0xff
@@ -508,6 +533,57 @@ impl VulkanRasterizer {
         if let Err(error) = self.scheduler.flush() {
             tracing::error!(%error, "submitting GPU work failed");
         }
+        self.activity.submits += 1;
+        self.log_activity();
+    }
+
+    /// Logs [`Activity`] once a second while it is enabled.
+    fn log_activity(&mut self) {
+        if !tracing::enabled!(target: ACTIVITY_TARGET, tracing::Level::DEBUG) {
+            return;
+        }
+        let now = Instant::now();
+        let a = &mut self.activity;
+        let Some(since) = a.since else {
+            a.since = Some(now);
+            a.textures = self.texture_cache.traffic();
+            a.buffers = self.buffer_cache.stats();
+            return;
+        };
+        if now - since < Duration::from_secs(1) {
+            return;
+        }
+        let (textures, buffers) = (self.texture_cache.traffic(), self.buffer_cache.stats());
+        let memory = self.device.memory_usage();
+        tracing::debug!(
+            target: ACTIVITY_TARGET,
+            seconds = (now - since).as_secs_f32(),
+            submits = a.submits,
+            draws = a.draws,
+            texture_draws = a.texture_draws,
+            clears = a.clears,
+            dispatches = a.dispatches,
+            presents = a.presents,
+            texture_uploads = textures.uploads - a.textures.uploads,
+            texture_upload_bytes = textures.upload_bytes - a.textures.upload_bytes,
+            texture_downloads = textures.downloads - a.textures.downloads,
+            texture_download_bytes = textures.download_bytes - a.textures.download_bytes,
+            buffer_upload_bytes = buffers.uploaded_bytes - a.buffers.uploaded_bytes,
+            buffer_download_bytes = buffers.downloaded_bytes - a.buffers.downloaded_bytes,
+            buffer_stream_bytes = buffers.streamed_bytes - a.buffers.streamed_bytes,
+            cached_images = self.texture_cache.len(),
+            created_buffers = buffers.created_buffers,
+            vram_used_mib = memory.used >> 20,
+            vram_slack_mib = memory.slack >> 20,
+            vram_budget_mib = memory.budget >> 20,
+            "GPU thread"
+        );
+        *a = Activity {
+            since: Some(now),
+            textures,
+            buffers,
+            ..Activity::default()
+        };
     }
 
     /// A free frame image of this size and format, or a new one.
@@ -655,30 +731,35 @@ impl VulkanRasterizer {
 
 impl Rasterizer for VulkanRasterizer {
     fn draw(&mut self, ctx: &mut GraphicsContext<'_>, draw: &DrawParams<'_>) {
+        self.activity.draws += 1;
         if let Err(error) = self.draw_graphics(ctx, draw::DrawCall::Direct(draw)) {
             tracing::error!(%error, "recording a draw failed");
         }
     }
 
     fn draw_indirect(&mut self, ctx: &mut GraphicsContext<'_>, draw: &IndirectDraw) {
+        self.activity.draws += 1;
         if let Err(error) = self.draw_graphics(ctx, draw::DrawCall::Indirect(draw)) {
             tracing::error!(%error, "recording an indirect draw failed");
         }
     }
 
     fn draw_texture(&mut self, ctx: &mut GraphicsContext<'_>, draw: &DrawTexture) {
+        self.activity.texture_draws += 1;
         if let Err(error) = self.record_draw_texture(ctx, draw) {
             tracing::error!(%error, "recording a texture draw failed");
         }
     }
 
     fn clear(&mut self, ctx: &mut GraphicsContext<'_>, layer_count: u32) {
+        self.activity.clears += 1;
         if let Err(error) = self.clear_targets(ctx, layer_count) {
             tracing::error!(%error, "clearing render targets failed");
         }
     }
 
     fn dispatch_compute(&mut self, ctx: &ComputeContext<'_>) {
+        self.activity.dispatches += 1;
         if let Err(error) = self.dispatch(ctx) {
             tracing::error!(%error, "recording a compute dispatch failed");
         }
@@ -811,6 +892,7 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn present(&mut self, framebuffer: &FramebufferConfig) {
+        self.activity.presents += 1;
         self.handles.timestamp.frame_presented();
         self.draw.shaders.flush_disk();
         for pipeline in self.draw.pipelines.replaced() {

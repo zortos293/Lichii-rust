@@ -210,6 +210,20 @@ fn tic(
     ])
 }
 
+#[test]
+fn switch2_two_dimensional_headers_ignore_their_base_layer() {
+    let mut header = tic(0x08, GPU_VA, 64, 32, 1, 1, 2);
+    header.0[2] |= 4 << 16;
+    let desc = header.decode().unwrap();
+    assert_eq!(desc.base_layer, 32);
+    let switch2 = ImageInfo::from_texture(&desc, GobLayout::Switch2).unwrap();
+    assert_eq!(switch2.layers, 1);
+    assert_eq!(ViewInfo::from_texture(&desc, &switch2).base_layer, 0);
+    let tegra = ImageInfo::from_texture(&desc, GobLayout::Tegra).unwrap();
+    assert_eq!(tegra.layers, 33, "Tegra headers keep selecting a layer");
+    assert_eq!(ViewInfo::from_texture(&desc, &tegra).base_layer, 32);
+}
+
 /// Writes `linear` level data into guest memory as the block-linear surface stores it.
 fn write_surface(memory: &DeviceAddressSpace, surface: &SurfaceLayout, data: &[Vec<u8>]) {
     let mut i = 0;

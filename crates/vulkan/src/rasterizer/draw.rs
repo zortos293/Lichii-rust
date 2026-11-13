@@ -998,6 +998,7 @@ impl VulkanRasterizer {
             let Some(info) = ImageInfo::from_render_target(rt, msaa, gob) else {
                 continue;
             };
+            let info = info.with_layers(1);
             let Some(found) = self.texture_cache.render_target(
                 &mut tx,
                 ctx.memory,
@@ -1012,6 +1013,7 @@ impl VulkanRasterizer {
         }
         if regs.zeta_enable != 0
             && let Some(info) = ImageInfo::from_zeta(&regs.zeta, &regs.zeta_size, msaa, gob)
+                .map(|info| info.with_layers(1))
             && let Some(found) = self.texture_cache.render_target(
                 &mut tx,
                 ctx.memory,
