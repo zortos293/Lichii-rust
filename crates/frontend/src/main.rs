@@ -3,6 +3,7 @@ mod choices;
 mod cli;
 mod config;
 mod display;
+mod frame_view;
 mod game_list;
 mod hotkeys;
 mod input_worker;

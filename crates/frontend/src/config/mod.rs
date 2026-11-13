@@ -358,20 +358,19 @@ impl ConfigWindow {
                 let fv = &mut d.frame_view;
                 section(ui, "Frame view");
                 ui.checkbox(&mut fv.enabled, "Show the frame view");
+                section(ui, "Show");
+                ui.columns(2, |cols| {
+                    cols[0].checkbox(&mut fv.show_fps, "Frames per second");
+                    cols[0].checkbox(&mut fv.show_frame_time, "Frame time");
+                    cols[0].checkbox(&mut fv.show_frame_time_graph, "Frame time graph");
+                    cols[0].checkbox(&mut fv.show_emulation_speed, "Emulation speed");
+                    cols[1].checkbox(&mut fv.show_cpu_gpu_time, "GPU time");
+                    cols[1].checkbox(&mut fv.show_vram_usage, "VRAM usage");
+                    cols[1].checkbox(&mut fv.show_shader_compilation, "Shaders building");
+                    cols[1].checkbox(&mut fv.show_resolution, "Render resolution");
+                });
+                section(ui, "Layout");
                 grid(ui, "frame view", |ui| {
-                    row(ui, "Show", |ui| {
-                        ui.vertical(|ui| {
-                            ui.checkbox(&mut fv.show_fps, "Frames per second");
-                            ui.checkbox(&mut fv.show_frame_time, "Frame time");
-                            ui.checkbox(&mut fv.show_frame_time_graph, "Frame time graph");
-                            ui.checkbox(&mut fv.show_emulation_speed, "Emulation speed");
-                            ui.checkbox(&mut fv.show_cpu_gpu_time, "GPU time");
-                            ui.checkbox(&mut fv.show_vram_usage, "VRAM usage");
-                            ui.checkbox(&mut fv.show_shader_compilation, "Shaders building");
-                            ui.checkbox(&mut fv.show_resolution, "Render resolution");
-                        })
-                        .response
-                    });
                     row(ui, "Position", |ui| {
                         combo(ui, "overlay position", &mut fv.position)
                     });
@@ -385,6 +384,17 @@ impl ConfigWindow {
                         ui.add(egui::Slider::new(&mut fv.scale, 0.5..=3.0))
                     });
                 });
+                section(ui, "Preview");
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(640.0, 360.0), egui::Sense::hover());
+                ui.painter()
+                    .rect_filled(rect, 0.0, egui::Color32::from_gray(24));
+                let sample = crate::frame_view::sample_snapshot();
+                crate::frame_view::draw(ui.painter(), rect, fv, &sample, &d.graphics);
+                note(
+                    ui,
+                    "Sample numbers; in a game the overlay sits in this corner of the picture.",
+                );
             }
             Page::Controls => self.controls.ui(ui, d, env, out),
             Page::Hotkeys => hotkeys::ui(ui, &mut d.ui.hotkeys, &mut self.hotkey_capture),
