@@ -300,6 +300,48 @@ fn cached_programs_translate_again_only_after_a_guest_write() {
     f.assert_no_validation_errors();
 }
 
+/// A failing program whose translation read a constant buffer word stays skipped when the word
+/// changes between draws, as a per-material bindless handle does.
+#[test]
+fn failed_translations_ignore_the_constant_buffer_words_they_read() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let mut header = header(2, ShaderType::PIXEL);
+    header[18] = 0xf;
+    let unsupported = sass(Opcode::Ast, 2 << 8);
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &program(
+            header,
+            &[
+                sass(Opcode::ImnmxImm, (1 << 20) | 1),
+                sass(Opcode::ShlImm, (2 << 20) | (1 << 8) | 2),
+                sass(Opcode::Ldc, (4 << 48) | (0x100 << 20) | (2 << 8) | 3),
+                sass(Opcode::Brx, (3 << 8) | 0xf),
+                unsupported,
+                exit(),
+                unsupported,
+                exit(),
+            ],
+        ),
+    );
+    let regs = draw_regs();
+    for entry in [0u32, 16, 24] {
+        write(&f, FRAGMENT_CBUF + 0x100, &entry.to_le_bytes());
+        write(&f, FRAGMENT_CBUF + 0x104, &24u32.to_le_bytes());
+        draw(&mut f, &gmmu, &regs);
+    }
+    let stats = f.rasterizer.draw.shaders.stats();
+    assert_eq!(
+        (stats.translated, stats.failed),
+        (2, 1),
+        "the jump table changed, the failure still holds"
+    );
+    f.assert_no_validation_errors();
+}
+
 #[test]
 fn draws_of_untranslatable_programs_are_skipped_without_retrying() {
     let Some((mut f, gmmu)) = draw_fixture() else {
