@@ -17,6 +17,8 @@ pub(super) enum Step {
 pub(super) struct Translator<'a> {
     pub block: Block,
     pub config: &'a CpuConfig,
+    /// Whether the host has `cmpxchg16b`; without it the 128-bit stores stay on the interpreter.
+    pub cmpxchg16b: bool,
 }
 
 impl Translator<'_> {
@@ -845,7 +847,7 @@ impl Translator<'_> {
                 rt2,
                 rn,
                 ..
-            } => {
+            } if self.cmpxchg16b => {
                 let addr = self.x(rn);
                 let (low, high) = (self.x(rt), self.x(rt2));
                 let status = self.op(Op::StoreExclusive128 {
@@ -864,7 +866,7 @@ impl Translator<'_> {
                 rt2,
                 rn,
                 ..
-            } => {
+            } if size + pair as u8 <= 3 => {
                 let addr = self.x(rn);
                 let value = if pair {
                     self.join32(rt, rt2)
@@ -904,7 +906,7 @@ impl Translator<'_> {
                 rt,
                 rn,
                 ..
-            } => {
+            } if self.cmpxchg16b => {
                 let addr = self.x(rn);
                 let (expected_low, expected_high) = (self.x(Reg(rs)), self.x(Reg(rs + 1)));
                 let (new_low, new_high) = (self.x(Reg(rt)), self.x(Reg(rt + 1)));

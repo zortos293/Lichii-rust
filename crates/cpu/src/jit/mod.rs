@@ -292,6 +292,7 @@ impl Jit {
                 exclusive: exclusive_slow as *const () as usize,
                 zero: zero_slow as *const () as usize,
                 ticks: ticks as *const () as usize,
+                cmpxchg16b: std::arch::is_x86_feature_detected!("cmpxchg16b"),
             },
             arena: fastmem.map_or(std::ptr::null_mut(), |f| f.base()),
             config,
@@ -312,6 +313,7 @@ impl Jit {
                 terminal: Terminal::Jump(start),
             },
             config: &self.config,
+            cmpxchg16b: self.target.cmpxchg16b,
         };
         let mut pc = start;
         loop {

@@ -226,6 +226,8 @@ enum Backend {
     Jit(Passes),
     /// The JIT on an address space without a fastmem arena.
     SlowJit,
+    /// The JIT as on a host without `cmpxchg16b`.
+    NoCmpxchg16b,
 }
 
 struct Machine {
@@ -255,6 +257,11 @@ impl Machine {
             Backend::Interpreter => Box::new(Interpreter::new(config)),
             Backend::Jit(passes) => Box::new(Jit::with_passes(config, passes).unwrap()),
             Backend::SlowJit => Box::new(Jit::new(config).unwrap()),
+            Backend::NoCmpxchg16b => {
+                let mut jit = Jit::new(config).unwrap();
+                jit.target.cmpxchg16b = false;
+                Box::new(jit)
+            }
         };
         Self { mem, core }
     }
@@ -430,6 +437,10 @@ fn directed(code: &[u32], regs: &[(usize, u64)]) {
         ("interpreter", Machine::new(Backend::Interpreter)),
         ("jit", Machine::new(Backend::Jit(Passes::ALL))),
         ("jit without fastmem", Machine::new(Backend::SlowJit)),
+        (
+            "jit without cmpxchg16b",
+            Machine::new(Backend::NoCmpxchg16b),
+        ),
     ];
     compare(&mut machines, &code, &ctx, &data);
 }

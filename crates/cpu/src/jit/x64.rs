@@ -49,6 +49,8 @@ pub(super) struct Target {
     pub exclusive: usize,
     pub zero: usize,
     pub ticks: usize,
+    /// The host has `cmpxchg16b`.
+    pub cmpxchg16b: bool,
 }
 
 /// Machine code for one block and its fastmem access sites as `(access, slow path)` offsets.
