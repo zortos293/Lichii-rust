@@ -58,6 +58,7 @@ pub fn context_with(program: ProgramImage, settings: Settings) -> (Arc<ServiceCo
         gpu: Arc::new(gpu),
         npad: Arc::new(NpadHub::default()),
         perf: Arc::new(PerfStats::default()),
+        audio: Arc::new(lichii_audio::sink::Sink::null()),
     });
     (context, client)
 }
