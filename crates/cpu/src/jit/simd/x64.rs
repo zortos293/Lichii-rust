@@ -525,6 +525,7 @@ impl Emitter<'_> {
                 );
                 self.finish_checked(i, slow, word, d, Ty::Nzcv);
             }
+            SimdOp::SatNarrow { size, n, low, .. } => self.sat_narrow(i, size, n, low),
             SimdOp::Vec(op) => self.vector(i, op),
             SimdOp::Lanes(lanes) => self.lanes(i, lanes),
         }
