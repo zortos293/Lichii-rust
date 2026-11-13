@@ -6,14 +6,18 @@ use lichii_gpu::backend::{
     GraphicsContext, IndirectDraw, QmdVersion, Rasterizer,
 };
 use lichii_gpu::engines::maxwell_3d::regs::{
-    ClearSurface, DepthMode, IndexFormat, MAX_CONST_BUFFERS, MAX_SHADER_STAGE, PipelineBits,
-    PrimitiveTopology, RenderTargetConfigBits, RtControl, ScissorTestBits, ScissorTestBits1,
-    ShaderType, SurfaceClipBits, SurfaceClipBits1, TileMode, VertexAttribute, VertexStreamBits,
+    ClearSurface, DepthMode, IndexFormat, MAX_CONST_BUFFERS, MAX_SHADER_STAGE, MESH_CONTROL,
+    MESH_INIT_SHADER, MESH_SHADER_A, MESH_SHADER_B, PipelineBits, PrimitiveTopology,
+    RenderTargetConfigBits, RtControl, ScissorTestBits, ScissorTestBits1, ShaderType,
+    SurfaceClipBits, SurfaceClipBits1, TileMode, VertexAttribute, VertexStreamBits,
 };
 use lichii_gpu::engines::maxwell_3d::{DirtyState, Regs};
 use lichii_gpu::gmmu::Gmmu;
-use lichii_shader::DescriptorKind;
+use lichii_shader::ampere::{
+    Decoded, Form, GRAPHICS_HEADER_SIZE, Instruction, Opcode as AmpereOpcode, decode,
+};
 use lichii_shader::maxwell::opcode::Opcode;
+use lichii_shader::{DescriptorKind, ShaderStage};
 use lichii_texture::block_linear::{GobLayout, Tiling, swizzle};
 
 use super::super::tests::{DADDR, Fixture, GPU_VA, fixture, gmmu, guest_linear};
@@ -2248,5 +2252,302 @@ fn per_invocation_table_handles_bind_a_texture_per_table_entry() {
         assert_eq!(texel, want, "column {x} samples the entry its index names");
     }
     assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
+    f.assert_no_validation_errors();
+}
+
+/// An Ampere `op` in `form` with the other bits from `fields`, guarded by PT.
+fn ampere(op: AmpereOpcode, form: Form, fields: u128) -> u128 {
+    let opcode = (0..4096u128)
+        .find(|&bits| decode(Instruction(bits)) == Some(Decoded { opcode: op, form }))
+        .expect("an encoding of the opcode");
+    (fields & !0xffff) | 7 << 12 | opcode
+}
+
+/// MOV R`dest`, `value`.
+fn ampere_mov(dest: u128, value: u32) -> u128 {
+    ampere(
+        AmpereOpcode::Mov,
+        Form::ImmReg,
+        dest << 16 | u128::from(value) << 32 | 0xf << 72,
+    )
+}
+
+fn ampere_exit() -> u128 {
+    ampere(AmpereOpcode::Exit, Form::Fixed, 7 << 87)
+}
+
+/// Stage buffer regions an ISBEWR writes.
+#[derive(Clone, Copy)]
+enum Isbe {
+    Attribute,
+    MapU32,
+    MapU8,
+}
+
+/// ISBEWR R`value` to byte `address` of `region`.
+fn isbewr(value: u128, address: u32, region: Isbe) -> u128 {
+    let modifiers = match region {
+        Isbe::Attribute => 3 << 76 | 1 << 75,
+        Isbe::MapU32 => 1 << 75,
+        Isbe::MapU8 => 0,
+    };
+    ampere(
+        AmpereOpcode::Isbewr,
+        Form::Fixed,
+        RZ_A | value << 32 | u128::from(address) << 40 | modifiers | 1 << 79,
+    )
+}
+
+const RZ_A: u128 = 0xff << 24;
+
+/// An NVN2 graphics program: its header padded to 0x80 bytes, then `code`.
+fn ampere_program(header: [u32; 20], code: &[u128]) -> Vec<u8> {
+    let mut bytes: Vec<u8> = bytemuck::cast_slice(&header).to_vec();
+    bytes.resize(GRAPHICS_HEADER_SIZE as usize, 0);
+    for insn in code {
+        bytes.extend_from_slice(&insn.to_le_bytes());
+    }
+    bytes
+}
+
+/// One triangle covering the target: three vertices with only a position (lines 0..4 of the
+/// attribute region), one primitive in the map.
+fn mesh_program() -> Vec<u8> {
+    let mut header = header(1, ShaderType::VERTEX_B);
+    header[13] |= 0xf0 << 8;
+    let positions = [
+        [-1.0f32, -1.0, 0.0, 1.0],
+        [3.0, -1.0, 0.0, 1.0],
+        [-1.0, 3.0, 0.0, 1.0],
+    ];
+    let mut code = Vec::new();
+    for (vertex, position) in positions.iter().enumerate() {
+        for (line, component) in position.iter().enumerate() {
+            code.push(ampere_mov(0, component.to_bits()));
+            let word = line as u32 * 32 + vertex as u32;
+            code.push(isbewr(0, word * 4, Isbe::Attribute));
+        }
+        code.push(ampere_mov(1, vertex as u32));
+        code.push(isbewr(1, 4 + vertex as u32, Isbe::MapU8));
+    }
+    code.push(ampere_mov(2, 1));
+    code.push(isbewr(2, 3, Isbe::MapU32));
+    code.push(ampere_exit());
+    ampere_program(header, &code)
+}
+
+/// Launches one mesh workgroup: the count at byte 4 of its output region.
+fn task_program() -> Vec<u8> {
+    ampere_program(
+        header(1, ShaderType::VERTEX_B),
+        &[
+            ampere_mov(0, 1),
+            isbewr(0, 4, Isbe::Attribute),
+            ampere_exit(),
+        ],
+    )
+}
+
+/// Writes render target 0 as (1, 0.5, 0, 1).
+fn ampere_fragment_program() -> Vec<u8> {
+    let mut header = header(2, ShaderType::PIXEL);
+    header[18] = 0xf;
+    ampere_program(
+        header,
+        &[
+            ampere_mov(0, 1.0f32.to_bits()),
+            ampere_mov(1, 0.5f32.to_bits()),
+            ampere_mov(2, 0),
+            ampere_mov(3, 1.0f32.to_bits()),
+            ampere_exit(),
+        ],
+    )
+}
+
+const MESH: u64 = PROGRAMS;
+const TASK: u64 = PROGRAMS + 0x1000;
+const MESH_FRAGMENT: u64 = PROGRAMS + 0x2000;
+
+fn bind_program(regs: &mut Regs, slot: usize, ty: ShaderType, offset: u64) {
+    let address = GPU_VA + offset;
+    let pipeline = &mut regs.pipelines[slot];
+    pipeline.bits = PipelineBits(1 | ty.0 << 4);
+    pipeline.reserved[0] = (address >> 32) as u32;
+    pipeline.reserved[1] = address as u32;
+}
+
+/// `draw_regs`' target and viewport with mesh control on: one triangle of at most three
+/// vertices, one thread per workgroup, and the mesh program in `mesh_slot`.
+fn mesh_regs(mesh_slot: usize) -> Box<Regs> {
+    let mut regs = draw_regs();
+    regs.pipelines[1].bits = PipelineBits(0);
+    regs.vertex_attrib_format[0] = VertexAttribute(0);
+    bind_program(&mut regs, mesh_slot, ShaderType::VERTEX_B, MESH);
+    bind_program(&mut regs, 5, ShaderType::PIXEL, MESH_FRAGMENT);
+    let words = regs.words_mut();
+    words[MESH_CONTROL] = 1;
+    words[MESH_SHADER_A] = 4 | 3 << 4 | 1 << 13;
+    words[MESH_SHADER_B] = 1 << 20;
+    words[MESH_INIT_SHADER] = 1 | 1 << 12;
+    regs
+}
+
+/// A Switch 2 fixture with the mesh, task and fragment programs, or `None` (skipping) without
+/// a device or without mesh shaders.
+fn mesh_fixture() -> Option<(Fixture, Gmmu)> {
+    let mut f = fixture(GobLayout::Switch2)?;
+    if !f.rasterizer.device.features.mesh_shader {
+        eprintln!("skipping: no VK_EXT_mesh_shader");
+        return None;
+    }
+    f.rasterizer.draw.pipelines.set_async_compilation(false);
+    let gmmu = gmmu(&f);
+    write(&f, MESH, &mesh_program());
+    write(&f, TASK, &task_program());
+    write(&f, MESH_FRAGMENT, &ampere_fragment_program());
+    Some((f, gmmu))
+}
+
+fn mesh_draw(f: &mut Fixture, gmmu: &Gmmu, regs: &Regs, groups: u32) {
+    let mut dirty = DirtyState::new();
+    let const_buffers = const_buffers();
+    let root_tables = [[0; 64]; 8];
+    let mut ctx = GraphicsContext {
+        channel: ChannelId(0),
+        memory: gmmu,
+        regs,
+        dirty: &mut dirty,
+        const_buffers: &const_buffers,
+        root_tables: &root_tables,
+    };
+    f.rasterizer.draw(
+        &mut ctx,
+        &DrawParams {
+            topology: PrimitiveTopology::TRIANGLES,
+            indexed: false,
+            first: 0,
+            count: groups,
+            base_vertex: 0,
+            base_instance: 0,
+            instance_count: 1,
+            inline_indices: None,
+        },
+    );
+}
+
+fn switch2_target(f: &mut Fixture) -> Vec<[u8; 4]> {
+    let tiling = Tiling::new(SIZE, SIZE, 1, 4, 1, 0, GobLayout::Switch2);
+    f.rasterizer.flush_region(DADDR, tiling.size_bytes() as u64);
+    guest_linear(f, DADDR, &tiling).as_chunks::<4>().0.to_vec()
+}
+
+/// The stages `mesh_draw` bound in host slots 0, 2 and 4.
+fn mesh_stages(f: &Fixture) -> [Option<ShaderStage>; 3] {
+    let stage = |i: usize| f.rasterizer.draw.stages[i].as_ref().map(|m| m.stage);
+    [stage(0), stage(2), stage(4)]
+}
+
+const TASK_STAGES: [Option<ShaderStage>; 3] = [
+    Some(ShaderStage::Task),
+    Some(ShaderStage::Mesh),
+    Some(ShaderStage::Fragment),
+];
+
+#[test]
+fn mesh_draws_build_task_and_mesh_pipelines() {
+    let Some((mut f, gmmu)) = mesh_fixture() else {
+        return;
+    };
+    mesh_draw(&mut f, &gmmu, &mesh_regs(1), 1);
+    assert_eq!(
+        mesh_stages(&f),
+        [Some(ShaderStage::Mesh), None, Some(ShaderStage::Fragment)],
+        "without a task program the VertexB slot holds the mesh program"
+    );
+    let mut regs = mesh_regs(3);
+    bind_program(&mut regs, 1, ShaderType::VERTEX_B, TASK);
+    mesh_draw(&mut f, &gmmu, &regs, 1);
+    assert_eq!(
+        mesh_stages(&f),
+        TASK_STAGES,
+        "with one the tessellation slot holds the mesh program"
+    );
+    let pipelines = f.rasterizer.draw.pipelines.stats();
+    assert_eq!((pipelines.built, pipelines.failed), (2, 0));
+    assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
+    f.assert_no_validation_errors();
+}
+
+#[test]
+#[ignore = "lavapipe (Mesa 25.2) drops the per-component gl_Position stores of native mesh programs"]
+fn mesh_draws_rasterize_the_primitives_their_mesh_program_writes() {
+    let Some((mut f, gmmu)) = mesh_fixture() else {
+        return;
+    };
+    let regs = mesh_regs(1);
+    mesh_draw(&mut f, &gmmu, &regs, 0);
+    assert!(
+        switch2_target(&mut f).iter().all(|&t| t == [0; 4]),
+        "no workgroups draw nothing"
+    );
+    mesh_draw(&mut f, &gmmu, &regs, 1);
+    let texels = switch2_target(&mut f);
+    assert!(
+        texels.iter().all(|&t| t == [255, 128, 0, 255]),
+        "the triangle covers the target: {:?}",
+        &texels[..4]
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+#[ignore = "lavapipe (Mesa 25.2) drops the per-component gl_Position stores of native mesh programs"]
+fn task_programs_launch_the_mesh_workgroups_they_count() {
+    let Some((mut f, gmmu)) = mesh_fixture() else {
+        return;
+    };
+    let mut regs = mesh_regs(3);
+    bind_program(&mut regs, 1, ShaderType::VERTEX_B, TASK);
+    mesh_draw(&mut f, &gmmu, &regs, 1);
+    let texels = switch2_target(&mut f);
+    assert!(
+        texels.iter().all(|&t| t == [255, 128, 0, 255]),
+        "the task's mesh workgroup covers the target: {:?}",
+        &texels[..4]
+    );
+    assert_eq!(mesh_stages(&f), TASK_STAGES);
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn indirect_mesh_draws_are_skipped() {
+    let Some((mut f, gmmu)) = mesh_fixture() else {
+        return;
+    };
+    let regs = mesh_regs(1);
+    let mut dirty = DirtyState::new();
+    let const_buffers = const_buffers();
+    let root_tables = [[0; 64]; 8];
+    let mut ctx = GraphicsContext {
+        channel: ChannelId(0),
+        memory: &gmmu,
+        regs: &regs,
+        dirty: &mut dirty,
+        const_buffers: &const_buffers,
+        root_tables: &root_tables,
+    };
+    f.rasterizer.draw_indirect(
+        &mut ctx,
+        &IndirectDraw {
+            topology: PrimitiveTopology::TRIANGLES,
+            indexed: false,
+            buffer: GPU_VA + VERTICES,
+            stride: 16,
+            max_draws: 1,
+            count_buffer: None,
+        },
+    );
+    assert_ne!(f.rasterizer.draw.warned & Warning::IndirectMesh as u32, 0);
+    assert_eq!(f.rasterizer.draw.shaders.stats().translated, 0);
     f.assert_no_validation_errors();
 }

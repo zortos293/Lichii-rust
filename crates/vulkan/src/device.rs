@@ -33,6 +33,7 @@ pub struct DeviceExtensions {
     pub robustness2: bool,
     pub transform_feedback: bool,
     pub conditional_rendering: bool,
+    pub mesh_shader: bool,
     pub provoking_vertex: bool,
     pub depth_clip_control: bool,
     pub depth_clip_enable: bool,
@@ -60,6 +61,7 @@ const OPTIONAL_EXTENSIONS: &[(&CStr, ExtensionFlag)] = &[
     (ext::conditional_rendering::NAME, |e| {
         &mut e.conditional_rendering
     }),
+    (ext::mesh_shader::NAME, |e| &mut e.mesh_shader),
     (ext::provoking_vertex::NAME, |e| &mut e.provoking_vertex),
     (ext::depth_clip_control::NAME, |e| &mut e.depth_clip_control),
     (ext::depth_clip_enable::NAME, |e| &mut e.depth_clip_enable),
@@ -111,6 +113,8 @@ pub struct DeviceFeatures {
     pub depth_clip_control: bool,
     pub transform_feedback: bool,
     pub conditional_rendering: bool,
+    /// `VK_EXT_mesh_shader` with both task and mesh stages.
+    pub mesh_shader: bool,
     pub storage_buffer_8bit: bool,
     pub uniform_and_storage_buffer_8bit: bool,
     pub storage_buffer_16bit: bool,
@@ -315,6 +319,7 @@ impl Device {
         let mut robustness2 = vk::PhysicalDeviceRobustness2FeaturesEXT::default();
         let mut xfb = vk::PhysicalDeviceTransformFeedbackFeaturesEXT::default();
         let mut conditional = vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default();
+        let mut mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
         let mut provoking = vk::PhysicalDeviceProvokingVertexFeaturesEXT::default();
         let mut clip_control = vk::PhysicalDeviceDepthClipControlFeaturesEXT::default();
         let mut clip_enable = vk::PhysicalDeviceDepthClipEnableFeaturesEXT::default();
@@ -332,6 +337,7 @@ impl Device {
                 robustness2.p_next = std::ptr::null_mut();
                 xfb.p_next = std::ptr::null_mut();
                 conditional.p_next = std::ptr::null_mut();
+                mesh.p_next = std::ptr::null_mut();
                 provoking.p_next = std::ptr::null_mut();
                 clip_control.p_next = std::ptr::null_mut();
                 clip_enable.p_next = std::ptr::null_mut();
@@ -358,6 +364,9 @@ impl Device {
                 }
                 if extensions.conditional_rendering {
                     features = features.push_next(&mut conditional);
+                }
+                if extensions.mesh_shader {
+                    features = features.push_next(&mut mesh);
                 }
                 if extensions.provoking_vertex {
                     features = features.push_next(&mut provoking);
@@ -396,6 +405,9 @@ impl Device {
         v13.robust_image_access = vk::FALSE;
         robustness2.robust_buffer_access2 = vk::FALSE;
         robustness2.robust_image_access2 = vk::FALSE;
+        mesh.multiview_mesh_shader &= v11.multiview;
+        mesh.primitive_fragment_shading_rate_mesh_shader = vk::FALSE;
+        mesh.mesh_shader_queries = vk::FALSE;
         let on = |b: vk::Bool32| b != vk::FALSE;
         let features = DeviceFeatures {
             extensions,
@@ -448,6 +460,7 @@ impl Device {
             transform_feedback: extensions.transform_feedback && on(xfb.transform_feedback),
             conditional_rendering: extensions.conditional_rendering
                 && on(conditional.conditional_rendering),
+            mesh_shader: extensions.mesh_shader && on(mesh.task_shader) && on(mesh.mesh_shader),
             storage_buffer_8bit: on(v12.storage_buffer8_bit_access),
             uniform_and_storage_buffer_8bit: on(v12.uniform_and_storage_buffer8_bit_access),
             storage_buffer_16bit: on(v11.storage_buffer16_bit_access),

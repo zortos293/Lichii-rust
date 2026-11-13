@@ -17,7 +17,7 @@ use std::thread::JoinHandle;
 use ash::vk;
 use lichii_common::perf::PerfStats;
 use lichii_common::settings::GraphicsSettings;
-use lichii_shader::{DescriptorKind, ShaderModule};
+use lichii_shader::{DescriptorKind, ShaderModule, ShaderStage};
 use parking_lot::{Condvar, Mutex};
 
 use super::disk::{self, Contents, DeviceIdentity};
@@ -350,12 +350,17 @@ impl Context {
         let fixed = &key.fixed;
         let features = &self.features;
         let topology = fixed.vk_topology();
-        let tessellated = programs[1].is_some() && programs[2].is_some();
+        let mesh = programs
+            .iter()
+            .flatten()
+            .any(|p| p.stage == ShaderStage::Mesh);
+        let tessellated = !mesh && programs[1].is_some() && programs[2].is_some();
         if programs[0].is_none() {
             return Err("no vertex stage".into());
         }
-        if programs[1].is_some() != programs[2].is_some()
-            || tessellated != (topology == vk::PrimitiveTopology::PATCH_LIST)
+        if !mesh
+            && (programs[1].is_some() != programs[2].is_some()
+                || tessellated != (topology == vk::PrimitiveTopology::PATCH_LIST))
         {
             return Err(format!(
                 "tessellation stages do not match topology {topology:?}"
@@ -510,7 +515,7 @@ impl Context {
             .logic_op_enable(raster(RASTER_LOGIC_OP))
             .logic_op(vk::LogicOp::from_raw(i32::from(fixed.logic_op)))
             .attachments(&blend_attachments);
-        let dynamic_states = features.dynamic_states();
+        let dynamic_states = features.dynamic_states(mesh);
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
         let depth_stencil_format = key.attachments.depth_stencil_format();
@@ -542,8 +547,6 @@ impl Context {
             .pipeline_stage_creation_feedbacks(&mut stage_feedback);
         let mut info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
-            .vertex_input_state(&vertex_input)
-            .input_assembly_state(&input_assembly)
             .viewport_state(&viewport)
             .rasterization_state(&rasterization)
             .multisample_state(&multisample)
@@ -553,6 +556,11 @@ impl Context {
             .layout(layout.raw)
             .push_next(&mut rendering)
             .push_next(&mut feedback_info);
+        if !mesh {
+            info = info
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&input_assembly);
+        }
         if tessellated {
             info = info.tessellation_state(&tessellation);
         }
