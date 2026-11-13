@@ -528,15 +528,14 @@ fn a_frontend_keyboard_goes_through_the_titles_text_check() {
 }
 
 #[test]
-fn error_applet_completes_without_out_data() {
+fn error_applet_completes_with_zeroed_out_data() {
     let (_context, client, _) = booted(SWITCH1_TITLE);
     let am = Domain::open(&client);
     let mut show_error = vec![0; 0x14];
     show_error[0x10..].copy_from_slice(&ResultCode::new(2, 1).0.to_le_bytes());
     let applet = am.run(library_applet::ERROR, 0, 0x20000, &[&show_error]);
     assert!(am.completed(applet));
-    let event = am.call(applet, Request::new(105)).copy_handles[0];
-    assert!(!event_signaled(&client, event));
+    assert_eq!(am.pop_out_data(applet), vec![0; 0x1000]);
     assert_eq!(
         am.call(applet, Request::new(101)).result,
         NO_DATA_IN_CHANNEL

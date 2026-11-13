@@ -34,6 +34,9 @@ const PARTIAL_FOREGROUND_INDIRECT_DISPLAY: u32 = 3;
 
 const COMMON_ARGUMENTS_SIZE: usize = 0x20;
 
+/// The zeroed out-data the error applet pushes when it closes.
+const ERROR_OUT_DATA_SIZE: usize = 0x1000;
+
 /// `nn::account::ResultCancelledByUser`, as the profile selector's `UiReturnArg` carries it.
 const ACCOUNT_CANCELLED_BY_USER: ResultCode = ResultCode::new(124, 1);
 
@@ -159,7 +162,7 @@ impl LibraryApplet {
         let step = match self.id {
             ERROR => {
                 frontend.show_error(&error_request(argument(1)));
-                Step::default()
+                Step::exit(vec![0; ERROR_OUT_DATA_SIZE])
             }
             PROFILE_SELECT => {
                 let request = profile_request(version, argument(1), context.user.get().copied());
