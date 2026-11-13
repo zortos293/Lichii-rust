@@ -632,11 +632,7 @@ impl<'a> ProgramEnv<'a> {
             return Box::default();
         }
         let mut bytes = vec![0; cbuf.size.min(MAX_CONST_BUFFER_SIZE) as usize + 3];
-        if self.gmmu.read_block(cbuf.address, &mut bytes).is_err() {
-            for (i, byte) in bytes.iter_mut().enumerate() {
-                *byte = self.gmmu.read::<u8>(cbuf.address + i as u64).unwrap_or(0);
-            }
-        }
+        let _unmapped_bytes_read_zero = self.gmmu.read_block(cbuf.address, &mut bytes);
         bytes.into_boxed_slice()
     }
 
