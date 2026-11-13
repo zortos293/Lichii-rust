@@ -1173,7 +1173,7 @@ fn paint_source(f: &mut Fixture, gmmu: &Arc<Gmmu>) {
 }
 
 #[test]
-fn draws_survive_a_texture_lookup_replacing_their_render_target() {
+fn draws_sample_a_texture_over_their_render_target_without_replacing_it() {
     let Some((mut f, gmmu)) = draw_fixture() else {
         return;
     };
@@ -1192,13 +1192,15 @@ fn draws_survive_a_texture_lookup_replacing_their_render_target() {
         .invalidate_region(DADDR + PROGRAMS + u64::from(FRAGMENT), 0x200);
     f.rasterizer
         .invalidate_region(DADDR + FRAGMENT_CBUF + 0x40, 4);
+    let removals = f.rasterizer.texture_cache.removals();
     draw(&mut f, &gmmu, &regs);
     draw(&mut f, &gmmu, &regs);
-    assert_ne!(
+    assert_eq!(
         f.rasterizer.draw.warned & super::Warning::ImageChurn as u32,
         0,
-        "the 32x8 texture and the 16x16 target over the same memory replace each other, so the draw is skipped"
+        "the 32x8 texture and the 16x16 target over the same memory stay live side by side, so the draw goes ahead"
     );
+    assert_eq!(f.rasterizer.texture_cache.removals(), removals);
     f.assert_no_validation_errors();
 }
 
