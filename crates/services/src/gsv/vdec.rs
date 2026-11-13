@@ -58,6 +58,9 @@ const DECODE_AHEAD: usize = 4;
 /// How long the worker waits on a 314 release fence before it looks at its state again: Stop or
 /// Finalize may have taken the image back meanwhile.
 const RELEASE_SLICE: Duration = Duration::from_millis(10);
+/// A release fence still pending after this lost its increment somewhere: the image is written
+/// anyway, so the movie does not freeze. GPU reads of a frame end long before.
+const RELEASE_LIMIT: Duration = Duration::from_secs(1);
 
 /// gsv 902, 905, 906 and 1002. Without the decoder service its TIPC 1 creates,
 /// `InitializeVp9Decoder` fails with InvalidHandle and the movie player aborts.
@@ -668,6 +671,7 @@ impl Shared {
             decodes: 0,
             decode_time: Duration::ZERO,
         };
+        let mut release_wait: Option<((u32, u32), Instant)> = None;
         let mut state = self.state.lock();
         while !state.quit {
             if std::mem::take(&mut state.reset) {
@@ -696,13 +700,25 @@ impl Shared {
                     && let Some((syncpoint, value)) = handout.release
                     && self.syncpoints.guest().is_reached(syncpoint, value) == Ok(false)
                 {
-                    drop(state);
-                    let _ = self
-                        .syncpoints
-                        .guest()
-                        .wait(syncpoint, value, Some(RELEASE_SLICE));
-                    state = self.state.lock();
-                    continue;
+                    let key = (handout.image, value);
+                    let since = match release_wait {
+                        Some((waiting, since)) if waiting == key => since,
+                        _ => release_wait.insert((key, host_now)).1,
+                    };
+                    if host_now - since < RELEASE_LIMIT {
+                        drop(state);
+                        let _ = self
+                            .syncpoints
+                            .guest()
+                            .wait(syncpoint, value, Some(RELEASE_SLICE));
+                        state = self.state.lock();
+                        continue;
+                    }
+                    tracing::warn!(
+                        "nx2:vdecsvc: image {}'s release fence ({syncpoint}, {value}) is still \
+                         pending after {RELEASE_LIMIT:?}; writing it anyway",
+                        handout.image
+                    );
                 }
                 if due <= now {
                     let decoded = state.decoded.pop_front().expect("checked above");
