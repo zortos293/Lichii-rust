@@ -431,6 +431,9 @@ struct Media {
     /// One output image in its guest layout, written to guest memory in one go.
     staging: Vec<u8>,
     write_failed: bool,
+    /// `LICHII_VDEC_DUMP`: a folder that gets the luma of every 120th frame, at a quarter of its
+    /// size, as a PGM.
+    dump: Option<std::path::PathBuf>,
     frames_out: u64,
     pictures: u64,
     decodes: u64,
@@ -588,6 +591,29 @@ impl Shared {
                         .is_ok()
             }
         };
+        if media.frames_out == 0 {
+            tracing::info!(
+                "nx2:vdecsvc writes image {} at {:#x}: {layout:?}, written {written}",
+                handout.image,
+                target.address
+            );
+        }
+        if written
+            && media.frames_out.is_multiple_of(120)
+            && let Some(dir) = &media.dump
+        {
+            let (w, h) = (width as usize / 4, height as usize / 4);
+            let mut pgm = format!("P5 {w} {h} 255\n").into_bytes();
+            pgm.extend(
+                (0..h)
+                    .flat_map(|y| (0..w).map(move |x| (y, x)))
+                    .map(|(y, x)| staging[y * 4 * pitch + x * 4]),
+            );
+            let path = dir.join(format!("vdec-{:05}.pgm", media.frames_out));
+            if let Err(err) = std::fs::write(&path, pgm) {
+                tracing::warn!("nx2:vdecsvc: dumping {}: {err}", path.display());
+            }
+        }
         if !written && !media.write_failed {
             media.write_failed = true;
             tracing::warn!(
@@ -608,6 +634,7 @@ impl Shared {
             decoded: Vec::new(),
             staging: Vec::new(),
             write_failed: false,
+            dump: std::env::var_os("LICHII_VDEC_DUMP").map(Into::into),
             frames_out: 0,
             pictures: 0,
             decodes: 0,
