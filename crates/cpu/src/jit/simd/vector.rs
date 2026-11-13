@@ -17,6 +17,22 @@ use crate::decoder::{Inst, PostIndex, Reg};
 
 const SCRATCH: u8 = 15;
 
+/// Byte masks for `CNT`: `0x55`, `0x33` and `0x0f` in every byte.
+#[repr(align(16))]
+struct Masks([u8; 48]);
+
+static CNT_MASKS: Masks = {
+    let mut m = [0; 48];
+    let mut i = 0;
+    while i < 16 {
+        m[i] = 0x55;
+        m[16 + i] = 0x33;
+        m[32 + i] = 0x0f;
+        i += 1;
+    }
+    Masks(m)
+};
+
 /// Lane-wise operations on two vectors. Comparisons give all ones in a lane where they hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Binary {
@@ -39,6 +55,9 @@ pub enum Binary {
     /// Unsigned `a >= b`.
     CmHs,
     Mul,
+    /// Sums of adjacent lane pairs, those of `a` in the low half and those of `b` in the high
+    /// half.
+    Addp,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +83,8 @@ pub enum VecOp {
     Shift(Shift, Arrangement, u8, Value),
     /// The 64-bit constant in the low half, and in the high half too when `q` is set.
     Imm(u64, bool),
+    /// The number of set bits in each byte, over 128 bits when `q` is set and else the low 64.
+    Cnt(bool, Value),
     /// The low lane-sized bits of a general-purpose value in every lane.
     Dup(Arrangement, Value),
     /// `vector` with lane `index` of `8 << size` bits replaced by the low bits of `value`.
@@ -101,7 +122,10 @@ impl VecOp {
                 f(a);
                 f(b);
             }
-            VecOp::Shift(_, _, _, a) | VecOp::Dup(_, a) | VecOp::Extract { vector: a, .. } => f(a),
+            VecOp::Shift(_, _, _, a)
+            | VecOp::Dup(_, a)
+            | VecOp::Cnt(_, a)
+            | VecOp::Extract { vector: a, .. } => f(a),
             VecOp::Imm(..) => {}
         }
     }
@@ -133,7 +157,8 @@ fn supported(t: &Translator, op: Binary, size: u8) -> bool {
         | Binary::Bic
         | Binary::Orr
         | Binary::Orn
-        | Binary::Eor => true,
+        | Binary::Eor
+        | Binary::Addp => true,
         Binary::CmEq => size < 3 || t.sse41,
         Binary::CmGt | Binary::CmGe => size < 3 || t.sse42,
         Binary::CmHi | Binary::CmHs => size == 0 || (size < 3 && t.sse41),
@@ -166,6 +191,7 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
             (0b00110, true, _) => Binary::CmHi,
             (0b00111, true, _) => Binary::CmHs,
             (0b10011, false, _) => Binary::Mul,
+            (0b10111, false, _) => Binary::Addp,
             _ => return false,
         };
         if opcode != 0b00011 && ((size == 3 && !q) || !supported(t, op, size)) {
@@ -183,6 +209,12 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         let a = vec(t, rn);
         let zero = emit(t, VecOp::Imm(0, true));
         let r = emit(t, VecOp::Binary(Binary::CmEq, arrangement, a, zero));
+        t.set(Loc::V(rd), r);
+        return true;
+    }
+    if word & 0xbfff_fc00 == 0x0e20_5800 {
+        let a = vec(t, rn);
+        let r = emit(t, VecOp::Cnt(q, a));
         t.set(Loc::V(rd), r);
         return true;
     }
@@ -410,6 +442,63 @@ impl Emitter<'_> {
         dynasm!(self.asm ; .arch x64 ; movdqa Rx(d), Rx(s));
     }
 
+    /// `x` = `s` with each pair of `8 << size`-bit lanes summed into one lane twice as wide: the
+    /// sum zero-extended for bytes, sign-extended for halfwords, and in the high half for words.
+    fn pair_sums(&mut self, size: u8, x: u8, s: u8) {
+        self.copy(x, s);
+        match size {
+            0 => dynasm!(self.asm
+                ; .arch x64
+                ; psllw Rx(x), 8
+                ; paddb Rx(x), Rx(s)
+                ; psrlw Rx(x), 8
+            ),
+            1 => dynasm!(self.asm
+                ; .arch x64
+                ; pslld Rx(x), 16
+                ; paddw Rx(x), Rx(s)
+                ; psrad Rx(x), 16
+            ),
+            _ => dynasm!(self.asm
+                ; .arch x64
+                ; psllq Rx(x), 32
+                ; paddd Rx(x), Rx(s)
+            ),
+        }
+    }
+
+    /// Narrows the pair sums `pair_sums` left in `d` and `s` to the low and high half of `d`.
+    fn pack_sums(&mut self, size: u8, d: u8, s: u8) {
+        match size {
+            0 => dynasm!(self.asm ; .arch x64 ; packuswb Rx(d), Rx(s)),
+            1 => dynasm!(self.asm ; .arch x64 ; packssdw Rx(d), Rx(s)),
+            _ => dynasm!(self.asm ; .arch x64 ; shufps Rx(d), Rx(s), 0xdd_u8 as i8),
+        }
+    }
+
+    fn addp(&mut self, size: u8, q: bool, d: u8, a: u8, b: u8) {
+        if size == 3 {
+            dynasm!(self.asm
+                ; .arch x64
+                ; movdqa Rx(d), Rx(a)
+                ; punpcklqdq Rx(d), Rx(b)
+                ; movdqa Rx(SCRATCH), Rx(a)
+                ; punpckhqdq Rx(SCRATCH), Rx(b)
+                ; paddq Rx(d), Rx(SCRATCH)
+            );
+        } else if q {
+            self.pair_sums(size, d, a);
+            self.pair_sums(size, SCRATCH, b);
+            self.pack_sums(size, d, SCRATCH);
+        } else {
+            self.copy(d, a);
+            dynasm!(self.asm ; .arch x64 ; punpcklqdq Rx(d), Rx(b));
+            self.pair_sums(size, SCRATCH, d);
+            self.pack_sums(size, SCRATCH, SCRATCH);
+            self.copy(d, SCRATCH);
+        }
+    }
+
     pub(super) fn vector(&mut self, i: usize, op: VecOp) {
         let v = Value(i as u32);
         let (d, q) = match op {
@@ -443,6 +532,7 @@ impl Emitter<'_> {
                         self.sse(Sse::MaxU, size, d, b);
                         self.sse(Sse::Eq, size, d, a);
                     }
+                    Binary::Addp => self.addp(size, q, d, a, b),
                     _ => {
                         let op = match op {
                             Binary::Add => Sse::Add,
@@ -492,6 +582,29 @@ impl Emitter<'_> {
                     dynasm!(self.asm ; .arch x64 ; punpcklqdq Rx(d), Rx(d));
                 }
                 return;
+            }
+            VecOp::Cnt(q, a) => {
+                let a = self.reg(a);
+                let d = self.def(v);
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; mov rax, QWORD CNT_MASKS.0.as_ptr() as i64
+                    ; movdqa Rx(d), Rx(a)
+                    ; movdqa Rx(SCRATCH), Rx(a)
+                    ; psrlw Rx(SCRATCH), 1
+                    ; pand Rx(SCRATCH), [rax]
+                    ; psubb Rx(d), Rx(SCRATCH)
+                    ; movdqa Rx(SCRATCH), Rx(d)
+                    ; psrlw Rx(SCRATCH), 2
+                    ; pand Rx(SCRATCH), [rax + 16]
+                    ; pand Rx(d), [rax + 16]
+                    ; paddb Rx(d), Rx(SCRATCH)
+                    ; movdqa Rx(SCRATCH), Rx(d)
+                    ; psrlw Rx(SCRATCH), 4
+                    ; paddb Rx(d), Rx(SCRATCH)
+                    ; pand Rx(d), [rax + 32]
+                );
+                (d, q)
             }
             VecOp::Dup(Arrangement { size, q }, x) => {
                 let x = self.reg(x);

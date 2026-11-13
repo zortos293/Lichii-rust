@@ -275,7 +275,7 @@ fn simd(rng: &mut Rng) -> u32 {
     }
 }
 
-const VECTOR: [&str; 9] = [
+const VECTOR: [&str; 11] = [
     "0xx01110xx1xxxxx100001xxxxxxxxxx",
     "0xx01110xx1xxxxx000111xxxxxxxxxx",
     "0xx01110xx1xxxxx0011x1xxxxxxxxxx",
@@ -285,9 +285,11 @@ const VECTOR: [&str; 9] = [
     "0xx011110xxxxxxx0x0x01xxxxxxxxxx",
     "0xx01110000xxxxx0xxxx1xxxxxxxxxx",
     "0xx0111100000xxxxxxx01xxxxxxxxxx",
+    "0x001110xx1xxxxx101111xxxxxxxxxx",
+    "0x00111000100000010110xxxxxxxxxx",
 ];
 
-/// An Advanced SIMD integer three-same, compare against zero, shift by immediate, copy or
+/// An Advanced SIMD integer three-same, compare against zero, `CNT`, shift by immediate, copy or
 /// modified-immediate instruction, or an `LD1`/`ST1` of one to four registers on `X20`..`X23` or
 /// `SP`, offset or post-indexed by an immediate or `X24`/`X26`.
 fn vector(rng: &mut Rng) -> u32 {
@@ -1663,6 +1665,48 @@ fn fp_selects_consume_fused_compares() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn cnt_and_addp_match_the_interpreter() {
+    let addp = (0..8)
+        .filter(|&a: &u32| a != 6)
+        .map(|a| 0x0e20_bc00 | (a & 1) << 30 | (a >> 1) << 22);
+    let words: Vec<u32> = [0x0e20_5800, 0x4e20_5800]
+        .into_iter()
+        .chain(addp)
+        .flat_map(|w| {
+            let rm = |r: u32| if w & 0x400 != 0 { r << 16 } else { 0 };
+            [
+                w | rm(3) | 2 << 5 | 1,
+                w | rm(1) | 1 << 5 | 1,
+                w | rm(4) | 4 << 5 | 5,
+            ]
+        })
+        .collect();
+    assert!(words.iter().all(|&w| {
+        crate::interpreter::simd::execute(&mut ThreadContext::default(), w) == Some(Ok(()))
+    }));
+    let mut machines = vec![
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+        ("jit without fastmem", Machine::new(Backend::SlowJit)),
+        ("jit without sse4", Machine::new(Backend::NoSse4)),
+    ];
+    let mut rng = Rng(0xc0ff_ee00_add0);
+    let data = vec![0u8; DATA_SIZE as usize];
+    for _ in 0..200 {
+        let ctx = initial(&mut rng);
+        for &w in &words {
+            compare(&mut machines, &[w, BRK], &ctx, &data);
+        }
+        compare(
+            &mut machines,
+            &[0x0e20_5800, 0x0e20_bc00, 0x0e60_bc00, 0x0ea0_bc00, BRK],
+            &ctx,
+            &data,
+        );
     }
 }
 
