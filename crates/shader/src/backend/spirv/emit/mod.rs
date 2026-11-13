@@ -551,6 +551,9 @@ pub(super) fn emit_inst(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<(
         Opcode::BindlessImageFetch => image::bindless_image_fetch(ctx, inst)?,
         Opcode::BindlessImageQueryDimensions => image::bindless_image_query_dimensions(ctx, inst)?,
         Opcode::BindlessImageQueryLod => image::bindless_image_query_lod(ctx, inst)?,
+        Opcode::BindlessImageQuerySamples | Opcode::BoundImageQuerySamples => {
+            return Err(image::unlowered(ctx, inst));
+        }
         Opcode::BindlessImageGradient => image::bindless_image_gradient(ctx, inst)?,
         Opcode::BindlessImageRead => image::bindless_image_read(ctx, inst)?,
         Opcode::BindlessImageWrite => return image::bindless_image_write(ctx, inst),
@@ -579,6 +582,7 @@ pub(super) fn emit_inst(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<(
         Opcode::ImageFetch => image::image_fetch(ctx, inst)?,
         Opcode::ImageQueryDimensions => image::image_query_dimensions(ctx, inst)?,
         Opcode::ImageQueryLod => image::image_query_lod(ctx, inst)?,
+        Opcode::ImageQuerySamples => image::image_query_samples(ctx, inst)?,
         Opcode::ImageGradient => image::image_gradient(ctx, inst)?,
         Opcode::ImageRead => image::image_read(ctx, inst)?,
         Opcode::ImageWrite => return image::image_write(ctx, inst),

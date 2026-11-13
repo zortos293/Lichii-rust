@@ -1146,6 +1146,16 @@ pub(super) fn image_query_dimensions(ctx: &mut EmitContext<'_>, inst: InstId) ->
     Ok(ctx.b.composite_construct(ctx.u32[4], None, constituents)?)
 }
 
+/// `OpImageQuerySamples` on a multisampled texture; every other texture has one sample.
+pub(super) fn image_query_samples(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
+    let info = TextureInstInfo::from_flags(ctx.flags(inst));
+    if !is_texture_msaa(ctx, info)? {
+        return Ok(ctx.const_u32(1));
+    }
+    let image = texture_image(ctx, inst, info)?;
+    Ok(ctx.b.image_query_samples(ctx.u32[1], None, image)?)
+}
+
 pub(super) fn image_query_lod(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
     let info = TextureInstInfo::from_flags(ctx.flags(inst));
     let coords = ctx.def_arg(inst, 1)?;

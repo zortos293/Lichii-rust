@@ -32,6 +32,13 @@ cargo build --release
 cargo test --workspace
 ```
 
+You need:
+
+- Rust 1.98 or newer (opus1 needs it). The workspace sets `rust-version`, so an older stable stops with a message that names the version; run `rustup update stable`.
+- CMake and a C compiler: SDL3 is built from source.
+- On Linux, the ALSA headers (`libasound2-dev` on Debian and Ubuntu).
+- On Windows, the Visual Studio C++ build tools and a CMake that has the Visual Studio generators, such as the one Visual Studio ships, the official installer or scoop. devkitPro's MSYS CMake has no Visual Studio generator, and SDL3 then fails with `Could not create named generator Visual Studio 17 2022`. If it is first on your `PATH`, point the build at another CMake with `CMAKE`, for example `$env:CMAKE = "C:/Program Files/CMake/bin/cmake.exe"`.
+
 ## License
 
 GPL-3.0-or-later, see [LICENSE](LICENSE). This project inherits the work of the Lichii, Eglantine, Eden, yuzu and Sudachi projects and their contributors.

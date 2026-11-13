@@ -766,14 +766,30 @@ fn txd(t: &mut Translator<'_>) -> TResult {
     Ok(())
 }
 
-/// TXQ: texture dimensions (query 0 at bits 62..64) at the level in Ra, after the register
-/// handle in the register form; width, height, depth and level count by the mask.
+/// TXQ, the query at bits 62..64 after the register handle in the register form:
+/// - 0, dimensions at the level in Ra: width, height, depth and level count by the mask.
+/// - 1, texture type: only its third component, the sample count, is known (Mesa NAK's
+///   `build_txq_samples_raw`), so the mask must select exactly that one.
 fn txq(t: &mut Translator<'_>) -> TResult {
     let insn = t.insn;
-    if insn.bits(62, 2) != 0 {
+    let query = insn.bits(62, 2);
+    let mask = insn.bits(72, 4) as u32;
+    if query > 1 || (query == 1 && mask != 0b100) {
         return Err(t.unsupported());
     }
     let form = HandleForm::decode(t)?;
+    if query == 1 {
+        let handle = texture_handle(t, form, insn.src0());
+        let samples = image(
+            t,
+            (Ir::BoundImageQuerySamples, Ir::BindlessImageQuerySamples),
+            handle,
+            0,
+            &[],
+        );
+        store(t, &[samples], 2);
+        return Ok(());
+    }
     let mut a = insn.src0();
     let register = if form == HandleForm::Register {
         let reg = a;
@@ -783,7 +799,6 @@ fn txq(t: &mut Translator<'_>) -> TResult {
         Reg::RZ
     };
     let handle = texture_handle(t, form, register);
-    let mask = insn.bits(72, 4) as u32;
     let lod = t.x(a);
     let skip_mips = Value::U1((mask >> 3) & 1 == 0);
     let query = image(
@@ -1643,6 +1658,80 @@ mod tests {
   SetRegister R5, %4
 "
         );
+    }
+
+    #[test]
+    fn txq_texture_type_reads_the_sample_count() {
+        let bound_query = encode(
+            Opcode::Txq,
+            Form::Bound,
+            bound(2, 0x4) | (1 << 62) | mask(4) | dst(4) | rc(RZ),
+        );
+        assert_eq!(
+            translate(&[bound_query]).unwrap(),
+            "{0}:\n  %0 = BoundImageQuerySamples #0x80020010\n  SetRegister R4, %0\n"
+        );
+        let register_query = encode(
+            Opcode::Txq,
+            Form::Bindless,
+            ra(0) | (1 << 62) | mask(4) | dst(4) | rc(RZ),
+        );
+        assert_eq!(
+            translate(&[register_query]).unwrap(),
+            "{0}:\n  %0 = GetRegister R0\n  %1 = BindlessImageQuerySamples %0\n  SetRegister R4, %1\n"
+        );
+    }
+
+    /// Only the texture type query's sample count component is known; the sampler position
+    /// query and the reserved one are not.
+    #[test]
+    fn txq_unknown_queries_and_components_are_rejected() {
+        let txq = |query: u128, components: u128| {
+            encode(
+                Opcode::Txq,
+                Form::Bound,
+                bound(2, 0x4) | (query << 62) | mask(components) | dst(4) | rc(RZ),
+            )
+        };
+        for components in [0x1, 0x2, 0x5, 0x8, 0xf] {
+            rejects(txq(1, components));
+        }
+        rejects(txq(2, 1));
+        rejects(txq(3, 1));
+    }
+
+    /// A multisampled texture answers the sample count with OpImageQuerySamples; one the
+    /// program never fetches per sample has a single sample.
+    #[test]
+    fn fragment_program_queries_the_sample_count() {
+        const IMAGE_QUERY_SAMPLES: u16 = 107;
+        let query = encode(
+            Opcode::Txq,
+            Form::Bound,
+            bound(3, 0x10) | (1 << 62) | mask(4) | dst(4) | rc(RZ),
+        );
+        let fetch = encode(
+            Opcode::Tld,
+            Form::Bound,
+            bound(3, 0x10)
+                | dim(1)
+                | lod(1)
+                | (1 << 78)
+                | ra(8)
+                | rb(10)
+                | mask(0xf)
+                | dst(0)
+                | rc(2)
+                | NO_FAULT,
+        );
+        let multisampled = super::super::integer::tests::compile_fragment_and_validate(
+            "ampere-txq-ms",
+            &[fetch, query],
+        );
+        assert!(multisampled.contains(&IMAGE_QUERY_SAMPLES));
+        let single =
+            super::super::integer::tests::compile_fragment_and_validate("ampere-txq", &[query]);
+        assert!(!single.contains(&IMAGE_QUERY_SAMPLES));
     }
 
     #[test]
