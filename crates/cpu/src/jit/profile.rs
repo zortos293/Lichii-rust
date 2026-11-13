@@ -330,15 +330,16 @@ pub(super) fn send(queued: &Arc<AtomicBool>, profile: &mut Profile) {
     let _ = SINK.tx.send((queued.clone(), std::mem::take(profile)));
 }
 
-/// Merges a dropped core's last counts; the last live core logs the table and resets the total.
+/// Merges a dropped core's last counts and drains the channel, so a dropped core leaves nothing
+/// queued; the last live core logs the table and resets the total.
 pub(super) fn retire(profile: Profile) {
     let mut g = global();
     g.total.merge(profile);
+    g.drain();
     g.live -= 1;
     if g.live > 0 {
         return;
     }
-    g.drain();
     let total = std::mem::take(&mut g.total);
     let cores = std::mem::take(&mut g.cores);
     let wall = g.started.take().map_or(Duration::ZERO, |t| t.elapsed());
