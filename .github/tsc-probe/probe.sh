@@ -19,7 +19,7 @@ git checkout -q crates/core/src/timing.rs
 for variant in main fixed; do
   fail=0
   for i in $(seq 1 1500); do
-    out=$(/tmp/core.$variant --exact timing::tests::tsc_reads_stay_monotonic_across_pause_and_resume 2>&1) || { fail=$((fail+1)); echo "$out" | grep -m1 'went back'; }
+    out=$(/tmp/core.$variant 2>&1) || { fail=$((fail+1)); echo "$out" | grep -m1 'went back'; }
   done
   echo "PROBE $variant: $fail failures in 1500 runs"
 done
