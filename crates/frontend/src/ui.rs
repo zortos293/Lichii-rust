@@ -342,7 +342,7 @@ impl App {
                 } else if self.games.is_scanning() {
                     "Scanning…"
                 } else {
-                    "No NSP, XCI, NCA, NRO, NSO or ExeFS titles found in the game directories."
+                    "No NSP, XCI, NCA, NUP, NRO, NSO or ExeFS titles found in the game directories."
                 };
                 ui.label(RichText::new(text).size(16.0).weak());
             });

@@ -12,6 +12,7 @@ use lichii_kernel::object::KObject;
 use lichii_memory::MemoryPermission;
 use parking_lot::Mutex;
 
+use crate::dispatch::Commandless;
 use crate::{Service, ServiceContext};
 
 const INVALID_PROCESSOR_STATE: ResultCode = ResultCode::new(205, 78);
@@ -57,7 +58,7 @@ pub(crate) fn register(context: &Arc<ServiceContext>) -> HleResult<()> {
         image_transfer: Mutex::new(Default::default()),
     });
     context.register("irs", "hid", move |_| Irs { irs: irs.clone() })?;
-    context.register("irs:sys", "hid", |_| IrsSys)
+    context.register("irs:sys", "hid", |_| Commandless("irs:sys"))
 }
 
 struct IrsState {
@@ -206,19 +207,6 @@ impl Service for Irs {
 
     fn handle(&self, ctx: &mut HleRequestContext) -> Option<ResultCode> {
         Some(self.command(ctx)?.err().unwrap_or(ResultCode::SUCCESS))
-    }
-}
-
-/// `irs:sys`: the reference implements none of its commands.
-struct IrsSys;
-
-impl Service for IrsSys {
-    fn name(&self) -> &str {
-        "irs:sys"
-    }
-
-    fn handle(&self, _: &mut HleRequestContext) -> Option<ResultCode> {
-        None
     }
 }
 

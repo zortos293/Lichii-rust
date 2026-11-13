@@ -386,7 +386,7 @@ impl Npdm {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub(crate) mod tests {
     use super::*;
 
