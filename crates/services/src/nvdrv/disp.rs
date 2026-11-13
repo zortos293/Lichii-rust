@@ -11,10 +11,6 @@ impl Nvdrv {
     /// (ids below zero are unused slots). `framebuffer.address` is replaced by the buffer's device
     /// address; the buffer must be pinned, as a buffer the title rendered to is. Each fence is
     /// waited for at most a second.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "vi presents through it once it exists")
-    )]
     pub(crate) fn flip(
         &self,
         handle: u32,
@@ -37,5 +33,31 @@ impl Nvdrv {
         framebuffer.address = daddr + offset;
         self.gpu.present(framebuffer);
         NvResult::Success
+    }
+
+    /// Holds nvmap buffer `handle` for a vi buffer queue: a reference keeps it, and its device
+    /// mapping, after the guest frees it, and a pin keeps it in device space. False when the
+    /// handle cannot be held.
+    pub(crate) fn pin_buffer(&self, handle: u32) -> bool {
+        let held =
+            self.nvmap
+                .duplicate_internal(handle)
+                .and_then(|()| match self.nvmap.pin(handle) {
+                    Ok(_) => Ok(()),
+                    Err(error) => {
+                        self.nvmap.free_internal(handle);
+                        Err(error)
+                    }
+                });
+        if let Err(error) = held {
+            tracing::warn!(handle, ?error, "vi: holding a preallocated buffer");
+        }
+        held.is_ok()
+    }
+
+    /// Lets go of a buffer [`Nvdrv::pin_buffer`] held.
+    pub(crate) fn unpin_buffer(&self, handle: u32) {
+        self.nvmap.unpin(handle);
+        self.nvmap.free_internal(handle);
     }
 }

@@ -1066,3 +1066,27 @@ fn flips_present_pinned_nvmap_buffers() {
     );
     assert!(nv.open("/dev/nvdisp_disp0") > 0);
 }
+
+#[test]
+fn buffers_vi_holds_survive_the_guest_freeing_them() {
+    let nv = Nv::new(SWITCH1_TITLE, "nvdrv");
+    let nvmap = nv.open("/dev/nvmap");
+    let (handle, _) = nv.nvmap_buffer(nvmap, &[0; 0x4000], 0x1000);
+    assert!(nv.nvdrv.pin_buffer(handle));
+    let daddr = nv.nvdrv.nvmap.device_address(handle);
+    assert_ne!(daddr, 0);
+    let free = Bytes::default().u32(handle).zeroes(20);
+    assert_eq!(nv.ioctl(nvmap, iowr(1, 0x5, 24), &free.0, 24).result, 0);
+    assert_eq!(
+        nv.nvdrv.nvmap.device_address(handle),
+        daddr,
+        "vi's reference keeps the mapping"
+    );
+    nv.nvdrv.unpin_buffer(handle);
+    assert_eq!(
+        nv.nvdrv.nvmap.size(handle),
+        None,
+        "the last reference removes it"
+    );
+    assert!(!nv.nvdrv.pin_buffer(handle));
+}
