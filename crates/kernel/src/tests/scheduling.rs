@@ -1,6 +1,6 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use lichii_common::ConsoleGeneration;
 use lichii_common::settings::{CpuAccuracy, CpuBackend};
@@ -183,6 +183,82 @@ pub(super) fn spawn_and_join_entries(
         .then(|ctx, _| ctx.x[19] += 1)
         .jump_if(8, move |ctx, _| ctx.x[19] < count)
         .exit()
+}
+
+/// A thread that spins in guest code without supervisor calls: sampling its core reports where
+/// it spins, by module and offset, and the thread keeps running between samples.
+#[test]
+fn live_pc_sampling_finds_a_spinning_thread() {
+    let test = TestKernel::new(ConsoleGeneration::Switch1);
+    let started = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (spin_started, spin_stop) = (started.clone(), stop.clone());
+    let main = test.program(
+        Script::new()
+            .then(move |ctx, _| {
+                ctx.x[30] = super::CODE_BASE + 0x40;
+                spin_started.store(true, Ordering::SeqCst);
+            })
+            .spin_until(move |_, _| spin_stop.load(Ordering::SeqCst))
+            .exit(),
+    );
+    let process = test.start(test.image(), main);
+    test.kernel.run().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !started.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "the spinner never started");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let kernel = &test.kernel.0;
+    for _ in 0..3 {
+        let sample = kernel
+            .live_pcs
+            .sample(&kernel.scheduler, 0, Duration::from_secs(1))
+            .expect("the spinning core stops at a block boundary");
+        assert_eq!(sample.thread.id(), process.threads()[0].id());
+        assert_eq!(sample.pc, main + 4);
+        assert_eq!(
+            process.locate(sample.pc),
+            format!("main+{:#x}", main + 4 - super::CODE_BASE)
+        );
+        assert_eq!(process.locate(sample.lr), "main+0x40");
+    }
+    assert!(
+        kernel
+            .live_pcs
+            .sample(&kernel.scheduler, 1, Duration::from_millis(20))
+            .is_none()
+    );
+    assert_eq!(process.locate(0x10), "0x10");
+    kernel.log_live_pcs();
+    stop.store(true, Ordering::SeqCst);
+    test.wait_for_exit(Duration::from_secs(5));
+}
+
+/// The same on the JIT: a guest loop (`add x1, x1, #1; b .-4`) is sampled at the start of its
+/// block, the one boundary translated code stops at.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn live_pc_sampling_finds_a_jit_spin_loop() {
+    let kernel = Kernel::new(KernelConfig {
+        cpu: Arc::new(|config| lichii_cpu::new_core(CpuBackend::Jit, config)),
+        ..crate::testing::config(ConsoleGeneration::Switch1)
+    })
+    .unwrap();
+    let mut image = crate::testing::program_image(0x0100_0000_0000_2000);
+    image.modules[0].image[..8].copy_from_slice(&[0x21, 0x04, 0x00, 0x91, 0xff, 0xff, 0xff, 0x17]);
+    let process = kernel.create_process(&image).unwrap();
+    kernel.start_process(&process).unwrap();
+    kernel.run().unwrap();
+    let inner = &kernel.0;
+    for _ in 0..3 {
+        let sample = inner
+            .live_pcs
+            .sample(&inner.scheduler, 0, Duration::from_secs(2))
+            .expect("the spinning core stops at a block boundary");
+        assert_eq!(process.locate(sample.pc), "main+0x0");
+    }
+    kernel.shutdown();
 }
 
 #[test]
