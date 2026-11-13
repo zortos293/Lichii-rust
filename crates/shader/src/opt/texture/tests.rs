@@ -843,6 +843,48 @@ fn loop_invariant_handle_builds_from_its_entry_value() {
 }
 
 #[test]
+fn handles_that_differ_between_branches_bind_no_texture() {
+    let (mut prog, b) = program(4);
+    prog.add_branch(b[0], b[1]);
+    prog.add_branch(b[0], b[2]);
+    prog.add_branch(b[1], b[3]);
+    prog.add_branch(b[2], b[3]);
+    let first = table_handle(&mut prog, b[1]);
+    let second = Value::Inst(prog.append(
+        b[2],
+        Opcode::LoadStorage32,
+        &[Value::U32(1), Value::U32(0x20)],
+        0,
+    ));
+    let phi = prog.append(b[3], Opcode::Phi, &[], 0);
+    prog.add_phi_operand(phi, b[1], first);
+    prog.add_phi_operand(phi, b[2], second);
+    sample(&mut prog, b[3], Value::Inst(phi));
+    let info = run(&Env::default(), &mut prog, &host(1024));
+    assert!(info.texture_descriptors[0].handle_is_pointer_word);
+    assert!(info.handle_programs.is_empty());
+
+    let (mut prog, b) = program(4);
+    prog.add_branch(b[0], b[1]);
+    prog.add_branch(b[0], b[2]);
+    prog.add_branch(b[1], b[3]);
+    prog.add_branch(b[2], b[3]);
+    let handle = table_handle(&mut prog, b[0]);
+    let uniform = prog.append(
+        b[1],
+        Opcode::ShuffleIndex,
+        &[handle, Value::U32(0), Value::U32(0x1f), Value::U32(0)],
+        0,
+    );
+    let phi = prog.append(b[3], Opcode::Phi, &[], 0);
+    prog.add_phi_operand(phi, b[1], Value::Inst(uniform));
+    prog.add_phi_operand(phi, b[2], handle);
+    sample(&mut prog, b[3], Value::Inst(phi));
+    let info = run(&Env::default(), &mut prog, &host(1024));
+    assert_eq!(info.texture_descriptors[0].handle_program, Some(0));
+}
+
+#[test]
 fn unrelated_ir_is_left_alone() {
     let (mut prog, b) = program(1);
     let x = lane(&mut prog, b[0]);

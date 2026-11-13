@@ -294,10 +294,11 @@ impl Builder<'_> {
         }
     }
 
-    /// The incoming value that is defined; of several, the one made uniform (the
-    /// register-to-uniform move a conditional block makes for a handle), then the others.
-    /// A loop header's phi builds only when every back edge carries the phi itself: a value
-    /// the loop changes differs between iterations.
+    /// The value every defined incoming edge carries, looking through the register-to-uniform
+    /// move a conditional block makes for a handle. Different values on different paths need
+    /// a condition no program has, so they bind nothing. A loop header's phi builds only when
+    /// every back edge carries the phi itself: a value the loop changes differs between
+    /// iterations.
     fn phi(&mut self, phi: InstId, value: Value) -> bool {
         if self.ctx.key.is_some() {
             let resolved = resolve_conditional_phi(self.prog, value, self.ctx.block);
@@ -320,40 +321,31 @@ impl Builder<'_> {
             }
             return self.fail(Opcode::Phi);
         }
-        let defined: Vec<usize> = (0..self.prog.inst(phi).num_args())
-            .filter(|&i| {
-                !self
-                    .prog
-                    .resolve(self.arg(phi, i))
-                    .inst()
-                    .is_some_and(|id| {
-                        matches!(
-                            self.prog.op(id),
-                            Opcode::UndefU1
-                                | Opcode::UndefU8
-                                | Opcode::UndefU16
-                                | Opcode::UndefU32
-                                | Opcode::UndefU64
-                        )
-                    })
-            })
-            .collect();
-        let uniform = defined.iter().rev().copied().find(|&i| {
-            self.prog
-                .resolve(self.arg(phi, i))
-                .inst()
-                .is_some_and(|id| self.prog.op(id) == Opcode::ShuffleIndex)
-        });
-        let chosen = uniform.or(defined.first().copied());
-        let order = chosen
-            .into_iter()
-            .chain(defined.iter().copied().filter(|&i| Some(i) != chosen));
-        for i in order {
-            if self.value(self.arg(phi, i)) {
-                return true;
+        let mut incoming = (0..self.prog.inst(phi).num_args()).filter_map(|i| {
+            let value = self.prog.resolve(self.arg(phi, i));
+            let Value::Inst(id) = value else {
+                return Some(value);
+            };
+            if id == phi {
+                return None;
             }
+            match self.prog.op(id) {
+                Opcode::UndefU1
+                | Opcode::UndefU8
+                | Opcode::UndefU16
+                | Opcode::UndefU32
+                | Opcode::UndefU64 => None,
+                Opcode::ShuffleIndex => Some(self.prog.resolve(self.arg(id, 0))),
+                _ => Some(value),
+            }
+        });
+        let Some(first) = incoming.next() else {
+            return self.fail(Opcode::Phi);
+        };
+        if incoming.any(|value| value != first) {
+            return self.fail(Opcode::Phi);
         }
-        false
+        self.value(first)
     }
 
     /// A word of a constant buffer read or a storage buffer load `source`, at byte offset

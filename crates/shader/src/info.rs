@@ -208,6 +208,9 @@ pub struct TextureDescriptor {
     /// draw (a handle read from a storage buffer); `None` when the handle is the constant buffer
     /// word above. With a `count` above 1 the program computes the handle of each element
     /// ([`crate::handle::HandleOp::Index`]): a table entry the shader picks per invocation.
+    /// No texture header is readable when the shader compiles, so such a descriptor's `ty` is
+    /// the type its instructions name (else 2D) and `is_integer` is false; bind the null
+    /// texture for a handle whose image differs in either.
     pub handle_program: Option<u32>,
 }
 

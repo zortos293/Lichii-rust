@@ -135,7 +135,7 @@ fn joined_descriptors_reuse_overlapping_ones_and_remap_the_second_program() {
         ..ShaderInfo::default()
     };
 
-    let joined = join_texture_info(&mut base, &second);
+    let joined = join_texture_info(&mut base, &second, &[]);
     assert_eq!(
         joined,
         JoinedDescriptors {
@@ -233,7 +233,7 @@ fn joined_storage_bindings_and_texture_indices_remap_together() {
     compute_post_order(&mut prog);
 
     let bindings = crate::opt::join_storage_info(&mut base, &second, 64).unwrap();
-    let joined = join_texture_info(&mut base, &second);
+    let joined = join_texture_info(&mut base, &second, &[]);
     remap_texture_descriptors(&mut prog, &joined);
     crate::opt::remap_storage_bindings(&mut prog, &bindings);
     assert_eq!(bindings, vec![1, 0]);
@@ -384,7 +384,7 @@ fn shared_stage_limits_count_other_resources_of_every_program() {
 }
 
 #[test]
-fn joined_handle_programs_are_shared_or_appended() {
+fn joined_handle_programs_read_the_joined_storage_bindings() {
     use crate::handle::{HandleOp, HandleProgram};
 
     let storage = |binding| {
@@ -406,10 +406,10 @@ fn joined_handle_programs_are_shared_or_appended() {
     };
     let second = ShaderInfo {
         texture_descriptors: vec![with_program(0), with_program(1)],
-        handle_programs: vec![storage(1), storage(0)],
+        handle_programs: vec![storage(0), storage(1)],
         ..ShaderInfo::default()
     };
-    let joined = join_texture_info(&mut base, &second);
+    let joined = join_texture_info(&mut base, &second, &[1, 0]);
     assert_eq!(base.handle_programs, [storage(0), storage(1)]);
     assert_eq!(joined.textures, [1, 0]);
     assert_eq!(base.texture_descriptors[1].handle_program, Some(1));

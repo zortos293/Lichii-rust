@@ -28,16 +28,23 @@ pub struct JoinedDescriptors {
 
 /// Adds the texture and image descriptors of `source` to `base`, reusing a descriptor of
 /// `base` that binds the same resource, and returns the index each one has in `base`.
+/// `storage_bindings` gives each of `source`'s storage buffers its binding in `base`
+/// (from `join_storage_info`), for the handle programs that read them.
 /// Point the source program's instructions at them with [`remap_texture_descriptors`].
-pub fn join_texture_info(base: &mut ShaderInfo, source: &ShaderInfo) -> JoinedDescriptors {
+pub fn join_texture_info(
+    base: &mut ShaderInfo,
+    source: &ShaderInfo,
+    storage_bindings: &[u32],
+) -> JoinedDescriptors {
     base.requires_coherent_image_memory |= source.requires_coherent_image_memory;
     let programs: Vec<u32> = source
         .handle_programs
         .iter()
         .map(|program| {
-            let index = base.handle_programs.iter().position(|p| p == program);
+            let program = program.with_storage_bindings(storage_bindings);
+            let index = base.handle_programs.iter().position(|p| *p == program);
             index.unwrap_or_else(|| {
-                base.handle_programs.push(program.clone());
+                base.handle_programs.push(program);
                 base.handle_programs.len() - 1
             }) as u32
         })

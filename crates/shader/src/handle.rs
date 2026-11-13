@@ -122,6 +122,18 @@ impl HandleProgram {
         &self.0
     }
 
+    /// The program reading storage buffer `bindings[b]` wherever it read binding `b`; a
+    /// binding past the end keeps its value.
+    pub(crate) fn with_storage_bindings(&self, bindings: &[u32]) -> HandleProgram {
+        let remap = |op| match op {
+            HandleOp::Storage { binding } => HandleOp::Storage {
+                binding: bindings.get(binding as usize).copied().unwrap_or(binding),
+            },
+            op => op,
+        };
+        HandleProgram(self.0.iter().copied().map(remap).collect())
+    }
+
     /// Computes the handle of descriptor array `element` (0 for a single descriptor).
     /// `read_cbuf(index, offset)` and `read_storage(binding, offset)` return the words the
     /// program reads, 0 for an unbound buffer. Allocates nothing.
