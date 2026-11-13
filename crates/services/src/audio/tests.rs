@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lichii_audio::sink::result;
-use lichii_common::settings::{AudioOutput, Settings};
 use lichii_common::ResultCode;
+use lichii_common::settings::{AudioOutput, Settings};
 use lichii_kernel::handle_table::CURRENT_PROCESS;
 use lichii_kernel::ipc::Handle;
 use lichii_kernel::object::KObject;
