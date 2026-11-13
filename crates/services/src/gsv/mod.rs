@@ -163,9 +163,8 @@ impl Service for GraphicsSystem {
             ),
             497 => push_session(context, ctx, gpu::GpuSession::new(context)),
             1402 => open_nvsrv(context, ctx),
-            111 | 112 | 114 | 423 | 426 | 428 | 429 | 430 | 435 | 1211 | 1291 | 1510 => {
-                native::handle(&self.objects, ctx)
-            }
+            111 | 112 | 114 | 423 | 426 | 428 | 429 | 430 | 435 | 911 | 912 | 961 | 991 | 1211
+            | 1291 | 1510 => native::handle(&self.objects, ctx),
             434 => {
                 let id: u32 = ctx.pop();
                 self.state.lock().address_spaces.insert(id);

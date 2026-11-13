@@ -530,3 +530,129 @@ fn reprotected_and_remapped_code_runs_fresh_on_the_jit() {
     );
     kernel.shutdown();
 }
+
+#[test]
+fn process_code_memory_svcs() {
+    const PROCESS: u64 = 0xffff_8001;
+    let test = TestKernel::new(ConsoleGeneration::Switch1);
+    let heap = heap_base(&test);
+    let log = Arc::new(Mutex::new(Vec::<(&'static str, u64)>::new()));
+    let dst = Arc::new(AtomicU64::new(0));
+    let l = |name: &'static str| {
+        let log = log.clone();
+        move |ctx: &mut lichii_cpu::ThreadContext, _: &super::Env| log.lock().push((name, ctx.x[0]))
+    };
+    let call = |args: [u64; 4]| {
+        let dst = dst.clone();
+        move |ctx: &mut lichii_cpu::ThreadContext, _: &super::Env| {
+            let base = dst.load(Ordering::Relaxed);
+            ctx.x[..4].copy_from_slice(&args.map(|a| {
+                if a >> 63 != 0 {
+                    base + (a & !(1 << 63))
+                } else {
+                    a
+                }
+            }));
+        }
+    };
+    let at = |offset: u64| 1 << 63 | offset;
+    let main = test.program(
+        Script::new()
+            .svc(0x77, call([PROCESS, at(0), heap, 0x2000]))
+            .then(l("map"))
+            .svc(0x77, call([PROCESS, at(0x1_0001), heap + 0x2000, 0x1000]))
+            .then(l("map misaligned"))
+            .svc(
+                0x77,
+                call([PROCESS, heap + 0x10_0000, heap + 0x2000, 0x1000]),
+            )
+            .then(l("map into the heap"))
+            .svc(0x77, call([PROCESS, at(0x1_0000), heap, 0x1000]))
+            .then(l("map locked source"))
+            .svc(0x77, call([0, at(0x1_0000), heap + 0x2000, 0x1000]))
+            .then(l("map bad handle"))
+            .svc(0x73, call([PROCESS, at(0), 0x1000, 5]))
+            .then(l("protect rx"))
+            .svc(0x73, call([PROCESS, at(0x1000), 0x1000, 3]))
+            .then(l("protect rw"))
+            .svc(0x73, call([PROCESS, at(0), 0x1000, 7]))
+            .then(l("protect rwx"))
+            .svc(0x78, call([PROCESS, at(0), heap + 0x1000, 0x1000]))
+            .then(l("unmap other pages"))
+            .svc(0x78, call([PROCESS, at(0), heap, 0x2000]))
+            .then(l("unmap"))
+            .exit(),
+    );
+    let process = test.kernel.create_process(&test.image()).unwrap();
+    let regions = *process.page_table().regions();
+    drop(process);
+    let free = regions.alias_code.end - 0x100_0000;
+    dst.store(free, Ordering::Relaxed);
+    let process = test.start(test.image(), main);
+    assert!(process.page_table().can_contain_alias_code(free, 0x10_0000));
+    test.run_until_exit(Duration::from_secs(10));
+    let log = log.lock().clone();
+    let expected: [(&str, u64); 10] = [
+        ("map", 0),
+        ("map misaligned", result::INVALID_ADDRESS.0 as u64),
+        ("map into the heap", result::INVALID_CURRENT_MEMORY.0 as u64),
+        ("map locked source", result::INVALID_CURRENT_MEMORY.0 as u64),
+        ("map bad handle", result::INVALID_HANDLE.0 as u64),
+        ("protect rx", 0),
+        ("protect rw", 0),
+        (
+            "protect rwx",
+            result::INVALID_NEW_MEMORY_PERMISSION.0 as u64,
+        ),
+        ("unmap other pages", result::INVALID_MEMORY_REGION.0 as u64),
+        ("unmap", 0),
+    ];
+    assert_eq!(log, expected);
+}
+
+#[test]
+fn code_memory_moves_heap_pages_and_marks_writable_code_as_data() {
+    let test = TestKernel::new(ConsoleGeneration::Switch1);
+    let process = test.kernel.create_process(&test.image()).unwrap();
+    let table = process.page_table();
+    let heap = table.set_heap_size(2 << 20).unwrap();
+    let dst = table.regions().alias_code.end - 0x100_0000;
+    process.memory().write(heap + 0x1008, 7u64).unwrap();
+    assert_eq!(
+        table.map_code_memory(heap + 0x10_0000, heap, 0x2000),
+        Err(result::INVALID_MEMORY_REGION)
+    );
+    table.map_code_memory(dst, heap, 0x2000).unwrap();
+    assert_eq!(process.memory().read::<u64>(dst + 0x1008).unwrap(), 7);
+    let src = table.query(heap);
+    assert_eq!((src.permission, src.attribute), (0, attribute::LOCKED));
+    let code = table.query(dst);
+    assert_eq!(
+        (code.state, code.permission, code.size),
+        (MemoryState::ALIAS_CODE.svc_value(), 0, 0x2000)
+    );
+
+    table
+        .set_code_permission(dst, 0x1000, MemoryPermission::READ_EXECUTE)
+        .unwrap();
+    table
+        .set_code_permission(dst + 0x1000, 0x1000, MemoryPermission::READ_WRITE)
+        .unwrap();
+    assert_eq!(
+        table.query(dst + 0x1000).state,
+        MemoryState::ALIAS_CODE_DATA.svc_value()
+    );
+    assert_eq!(
+        table.set_code_permission(dst + 0x1000, 0x1000, MemoryPermission::READ),
+        Err(result::INVALID_CURRENT_MEMORY)
+    );
+    assert_eq!(
+        table.unmap_code_memory(dst, heap + 0x1000, 0x1000),
+        Err(result::INVALID_MEMORY_REGION)
+    );
+    table.unmap_code_memory(dst, heap, 0x2000).unwrap();
+    assert_eq!(table.query(dst).state, MemoryState::FREE.svc_value());
+    let src = table.query(heap);
+    assert_eq!((src.permission, src.attribute), (3, 0));
+    assert_eq!(process.memory().read::<u64>(heap + 0x1008).unwrap(), 7);
+}

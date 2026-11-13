@@ -647,20 +647,29 @@ fn swizzled_coordinate(t: &mut Test, x: Value, dx: Value, dy: Value) -> Value {
 }
 
 fn sample_3d(ndv_is_active: bool) -> (Test, Value, [Value; 9]) {
+    sample_3d_with(ndv_is_active, |_| (TextureInstInfo::default(), Value::Void))
+}
+
+/// `sample_3d` with the flags and bias/clamp operand `lod` builds.
+fn sample_3d_with(
+    ndv_is_active: bool,
+    lod: impl FnOnce(&mut Test) -> (TextureInstInfo, Value),
+) -> (Test, Value, [Value; 9]) {
     let mut t = Test::new();
     let inputs = [0, 1, 2, 3, 4, 5, 6, 7, 8].map(|i| t.attr(i));
     let coords = [0, 1, 2]
         .map(|i| swizzled_coordinate(&mut t, inputs[i * 3], inputs[i * 3 + 1], inputs[i * 3 + 2]));
     let coords = t.op(Opcode::CompositeConstructF32x3, &coords);
+    let (info, bias_lc) = lod(&mut t);
     let info = TextureInstInfo {
         ty: TextureType::Color3D,
         ndv_is_active,
-        ..TextureInstInfo::default()
+        ..info
     };
     let sample = t.flags(
         Opcode::BoundImageSampleImplicitLod,
         info.to_flags(),
-        &[Value::U32(0x14), coords, Value::Void, Value::Void],
+        &[Value::U32(0x14), coords, bias_lc, Value::Void],
     );
     t.keep(sample);
     t.propagate(&Env::default());
@@ -697,6 +706,41 @@ fn swizzled_3d_sample_becomes_a_gradient_sample() {
         (Opcode::CompositeConstructF32x2, vec![v[7], v[8]])
     );
     assert_eq!(t.prog.arg(id, 4), Value::Void);
+}
+
+/// A minimum LOD computed by an instruction with operands of its own (Ampere TEX.LC's fixed
+/// point decode) stays the clamp; only a bias/clamp pair gives up its second component.
+#[test]
+fn swizzled_3d_sample_keeps_its_lod_clamp() {
+    let mut clamp = Value::Void;
+    let (t, sample, _) = sample_3d_with(true, |t| {
+        let fixed = t.attr(9);
+        clamp = t.op(Opcode::FPMul32, &[fixed, Value::F32(1.0 / 256.0)]);
+        let info = TextureInstInfo {
+            has_lod_clamp: true,
+            ..TextureInstInfo::default()
+        };
+        (info, clamp)
+    });
+    let id = t.prog.resolve(sample).inst().unwrap();
+    assert_eq!(t.prog.op(id), Opcode::BoundImageGradient);
+    assert_eq!(t.prog.resolve(t.prog.arg(id, 4)), t.prog.resolve(clamp));
+
+    let mut clamp = Value::Void;
+    let (t, sample, _) = sample_3d_with(true, |t| {
+        let (bias, fixed) = (t.attr(9), t.attr(10));
+        clamp = t.op(Opcode::FPMul32, &[fixed, Value::F32(1.0 / 256.0)]);
+        let pair = t.op(Opcode::CompositeConstructF32x2, &[bias, clamp]);
+        let info = TextureInstInfo {
+            has_bias: true,
+            has_lod_clamp: true,
+            ..TextureInstInfo::default()
+        };
+        (info, pair)
+    });
+    let id = t.prog.resolve(sample).inst().unwrap();
+    assert_eq!(t.prog.op(id), Opcode::BoundImageGradient);
+    assert_eq!(t.prog.resolve(t.prog.arg(id, 4)), t.prog.resolve(clamp));
 }
 
 #[test]

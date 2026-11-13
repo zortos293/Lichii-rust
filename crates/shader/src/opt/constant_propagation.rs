@@ -891,11 +891,13 @@ fn fold_image_sample_implicit_lod(prog: &mut Program, id: InstId) {
     if !all_scalars {
         return;
     }
-    let lod_clamp = match bias_lc.inst() {
-        _ if !info.has_lod_clamp => Value::Void,
-        Some(pair) if prog.inst(pair).num_args() > 1 => arg(prog, pair, 1),
-        Some(_) => return,
-        None => bias_lc,
+    let lod_clamp = match (info.has_lod_clamp, info.has_bias) {
+        (false, _) => Value::Void,
+        (true, false) => bias_lc,
+        (true, true) => match bias_lc.inst() {
+            Some(pair) if prog.op(pair) == Opcode::CompositeConstructF32x2 => arg(prog, pair, 1),
+            _ => return,
+        },
     };
     info.num_derivatives = 3;
     let op = match prog.op(id) {

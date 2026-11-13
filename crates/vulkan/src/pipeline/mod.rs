@@ -97,6 +97,9 @@ pub struct PipelineFeatures {
     pub depth_clip_control: bool,
     pub provoking_vertex_last: bool,
     pub multi_viewport: bool,
+    /// VK_EXT_graphics_pipeline_library with fast linking: while a pipeline builds, draws use
+    /// one linked from per-part libraries.
+    pub fast_link: bool,
 }
 
 impl PipelineFeatures {
@@ -138,6 +141,7 @@ impl PipelineFeatures {
             depth_clip_control: f.depth_clip_control,
             provoking_vertex_last: f.provoking_vertex_last,
             multi_viewport: f.multi_viewport,
+            fast_link: f.graphics_pipeline_library && device.properties.fast_pipeline_linking,
         }
     }
 

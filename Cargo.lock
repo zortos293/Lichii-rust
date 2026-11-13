@@ -1705,6 +1705,7 @@ dependencies = [
  "iana-time-zone",
  "lichii-audio",
  "lichii-common",
+ "lichii-cpu",
  "lichii-crypto",
  "lichii-fs",
  "lichii-gpu",
