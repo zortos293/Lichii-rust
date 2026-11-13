@@ -76,6 +76,11 @@ pub trait SessionHandler: Send + Sync {
     /// Handles one request. Returning an error code makes the kernel write it as the reply result
     /// and drop everything pushed into the reply.
     fn handle_request(&self, ctx: &mut HleRequestContext) -> ResultCode;
+    /// The handler as `Any`, so a service can recognise its own objects among the input objects
+    /// of a request (see [`HleRequestContext::input_object`]).
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }
 
 /// A parsed request and the reply being built. One context per service thread is reused for
@@ -89,6 +94,7 @@ pub struct HleRequestContext {
     request: message::Request,
     copy_objects: Vec<Option<KObject>>,
     move_objects: Vec<Option<KObject>>,
+    input_objects: Vec<Option<Arc<dyn SessionHandler>>>,
     cursor: usize,
     out_data: Vec<u8>,
     out_copy: Vec<KObject>,
@@ -109,6 +115,7 @@ impl HleRequestContext {
             request: message::Request::default(),
             copy_objects: Vec::new(),
             move_objects: Vec::new(),
+            input_objects: Vec::new(),
             cursor: 0,
             out_data: Vec::new(),
             out_copy: Vec::new(),
@@ -188,6 +195,18 @@ impl HleRequestContext {
         self.copy_object(index)
             .and_then(T::from_object)
             .ok_or(result::INVALID_HANDLE)
+    }
+
+    /// Input object `index`: in a domain, the domain object the request names (it stays in the
+    /// domain); otherwise the HLE handler of the session moved as handle `index`.
+    pub fn input_object(&self, index: usize) -> Option<Arc<dyn SessionHandler>> {
+        if self.domain {
+            return self.input_objects.get(index)?.clone();
+        }
+        match self.move_objects.get(index)?.as_ref()? {
+            KObject::ClientSession(session) => session.handler(),
+            _ => None,
+        }
     }
 
     /// Takes the object behind move handle `index`; the client no longer has the handle.

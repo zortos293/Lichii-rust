@@ -137,6 +137,9 @@ pub fn program_image(program_id: u64) -> ProgramImage {
 pub struct Request {
     command: u32,
     tipc: bool,
+    control: bool,
+    object: Option<u32>,
+    input_objects: Vec<u32>,
     data: Vec<u8>,
     send_pid: bool,
     copies: Vec<Handle>,
@@ -154,6 +157,27 @@ impl Request {
             command,
             ..Self::default()
         }
+    }
+
+    /// A CMIF control request (`ConvertCurrentObjectToDomain` is 0).
+    pub fn control(command: u32) -> Self {
+        Self {
+            command,
+            control: true,
+            ..Self::default()
+        }
+    }
+
+    /// Sends the request to domain object `id`, with a domain header.
+    pub fn to_object(mut self, id: u32) -> Self {
+        self.object = Some(id);
+        self
+    }
+
+    /// Passes domain object `id` as the next input object.
+    pub fn input_object(mut self, id: u32) -> Self {
+        self.input_objects.push(id);
+        self
     }
 
     /// A TIPC request for `command`.
@@ -219,7 +243,11 @@ impl Request {
     }
 
     fn encode(&self) -> Vec<u32> {
-        let ty = if self.tipc { 16 + self.command } else { 4 };
+        let ty = match (self.tipc, self.control) {
+            (true, _) => 16 + self.command,
+            (false, true) => 5,
+            (false, false) => 4,
+        };
         let mut words = vec![
             ty | (self.x.len() as u32) << 16
                 | (self.a.len() as u32) << 20
@@ -266,12 +294,18 @@ impl Request {
         } else {
             let header = raw_start.next_multiple_of(4);
             words.resize(header, 0);
+            if let Some(object) = self.object {
+                let size = (16 + payload * 4) as u32;
+                let count = self.input_objects.len() as u32;
+                words.extend([1 | count << 8 | size << 16, object, 0, 0]);
+            }
             words.extend([message::SFCI, 0, self.command, 0]);
-            words.resize(header + 4 + payload, 0);
+            words.resize(words.len() + payload, 0);
         }
         let start = words.len() - payload;
         bytemuck::cast_slice_mut::<u32, u8>(&mut words[start..])[..self.data.len()]
             .copy_from_slice(&self.data);
+        words.extend(&self.input_objects);
         let raw = if self.tipc {
             payload
         } else {
@@ -303,12 +337,14 @@ pub struct Reply {
     /// Handles the service moved to the client (sub-interface sessions among them), already in the
     /// client's handle table.
     pub move_handles: Vec<Handle>,
+    /// Domain object ids of the sub-interfaces a domain reply returned.
+    pub objects: Vec<u32>,
     data: Vec<u8>,
     cursor: usize,
 }
 
 impl Reply {
-    fn decode(words: &[u32], tipc: bool) -> Self {
+    fn decode(words: &[u32], tipc: bool, domain: bool) -> Self {
         let mut i = 2;
         let (mut copy_handles, mut move_handles) = (Vec::new(), Vec::new());
         if words[1] >> 31 != 0 {
@@ -320,15 +356,20 @@ impl Reply {
             i += move_handles.len();
         }
         let raw = (words[1] & 0x3ff) as usize;
+        let mut object_count = 0;
         let (result, start, data_words) = if tipc {
             (ResultCode(words[i]), i + 1, raw.saturating_sub(1))
         } else {
-            let header = i.next_multiple_of(4);
+            let mut header = i.next_multiple_of(4);
+            if domain {
+                object_count = words[header] as usize;
+                header += 4;
+            }
             assert_eq!(words[header], message::SFCO, "reply without SFCO");
             (
                 ResultCode(words[header + 2]),
                 header + 4,
-                raw.saturating_sub(8),
+                raw.saturating_sub(8 + if domain { 4 + object_count } else { 0 }),
             )
         };
         let raw_end = words.len().min(start + data_words);
@@ -336,6 +377,7 @@ impl Reply {
             result,
             copy_handles,
             move_handles,
+            objects: words[raw_end..raw_end + object_count].to_vec(),
             data: bytemuck::cast_slice(&words[start.min(raw_end)..raw_end]).to_vec(),
             cursor: 0,
         }
@@ -491,7 +533,11 @@ impl IpcClient {
             .memory()
             .read_bytes(message, bytemuck::cast_slice_mut(&mut reply))
             .expect("tls");
-        Ok(Reply::decode(&reply, request.tipc))
+        Ok(Reply::decode(
+            &reply,
+            request.tipc,
+            request.object.is_some(),
+        ))
     }
 }
 
@@ -597,6 +643,109 @@ mod tests {
         let (first, second) = (client.alloc(b"first"), other.alloc(b"other"));
         assert_ne!(first, second);
         assert_eq!(client.read(first, 5), b"first");
+        kernel.shutdown();
+    }
+    struct Root;
+
+    struct Leaf(u32);
+
+    impl SessionHandler for Leaf {
+        fn name(&self) -> &str {
+            "leaf"
+        }
+
+        fn handle_request(&self, _: &mut HleRequestContext) -> ResultCode {
+            ResultCode::SUCCESS
+        }
+
+        fn as_any(&self) -> Option<&dyn std::any::Any> {
+            Some(self)
+        }
+    }
+
+    impl SessionHandler for Root {
+        fn name(&self) -> &str {
+            "root"
+        }
+
+        fn handle_request(&self, ctx: &mut HleRequestContext) -> ResultCode {
+            match ctx.command() {
+                0 => ctx.push_interface(Arc::new(Leaf(42))),
+                1 => {
+                    let Some(object) = ctx.input_object(0) else {
+                        return ResultCode(0x1234);
+                    };
+                    let Some(leaf) = object.as_any().and_then(|any| any.downcast_ref::<Leaf>())
+                    else {
+                        return ResultCode(0x5678);
+                    };
+                    ctx.push(leaf.0);
+                }
+                _ => return ResultCode(0x1234),
+            }
+            ResultCode::SUCCESS
+        }
+    }
+
+    #[test]
+    fn input_objects_resolve_to_their_handlers() {
+        let kernel = kernel(ConsoleGeneration::Switch1);
+        let process = kernel
+            .create_process(&program_image(0x0100_0000_0000_2000))
+            .unwrap();
+        let thread = kernel.create_service_thread("objects").unwrap();
+        kernel
+            .service_manager()
+            .register(
+                "objects",
+                &thread,
+                Arc::new(|| Arc::new(Root) as Arc<dyn SessionHandler>),
+            )
+            .unwrap();
+        let client = IpcClient::new(&kernel, &process);
+
+        let session = client.connect("objects").unwrap();
+        let reply = client.send(session, &Request::new(0)).unwrap();
+        let leaf = reply.move_handles[0];
+        let mut reply = client
+            .send(session, &Request::new(1).move_handle(leaf))
+            .unwrap();
+        assert_eq!(reply.result, ResultCode::SUCCESS);
+        assert_eq!(reply.pop::<u32>(), 42, "a session moved as a handle");
+        let reply = client.send(session, &Request::new(1)).unwrap();
+        assert_eq!(reply.result, ResultCode(0x1234));
+
+        let domain = client.connect("objects").unwrap();
+        let mut reply = client.send(domain, &Request::control(0)).unwrap();
+        let root = reply.pop::<u32>();
+        let reply = client
+            .send(domain, &Request::new(0).to_object(root))
+            .unwrap();
+        assert_eq!(reply.result, ResultCode::SUCCESS);
+        let [leaf] = reply.objects[..] else {
+            panic!("one domain object, got {:?}", reply.objects);
+        };
+        let mut reply = client
+            .send(domain, &Request::new(1).to_object(root).input_object(leaf))
+            .unwrap();
+        assert_eq!(reply.result, ResultCode::SUCCESS);
+        assert_eq!(reply.pop::<u32>(), 42, "a domain object");
+        let reply = client
+            .send(domain, &Request::new(1).to_object(root).input_object(root))
+            .unwrap();
+        assert_eq!(
+            reply.result,
+            ResultCode(0x5678),
+            "another type does not downcast"
+        );
+        let reply = client
+            .send(domain, &Request::new(1).to_object(root).input_object(99))
+            .unwrap();
+        assert_eq!(
+            reply.result,
+            ResultCode(0x1234),
+            "an unknown id resolves to nothing"
+        );
         kernel.shutdown();
     }
 }
