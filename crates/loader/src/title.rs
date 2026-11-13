@@ -187,11 +187,12 @@ impl LooseTitle {
         })
     }
 
-    fn icon(&self) -> Option<Vec<u8>> {
+    /// The `icon_<language>.dat` for `language`, else the first in NACP order, else any image.
+    fn icon(&self, language: NacpLanguage) -> Option<Vec<u8>> {
         let dirs = self.sidecar_dirs();
         let named = dirs.iter().find_map(|dir| {
-            ICON_LANGUAGES
-                .iter()
+            std::iter::once(ICON_LANGUAGES[language as usize])
+                .chain(ICON_LANGUAGES)
                 .find_map(|lang| std::fs::read(dir.join(format!("icon_{lang}.dat"))).ok())
         });
         named.or_else(|| {
@@ -269,13 +270,12 @@ impl LooseTitle {
         }
     }
 
-    /// Reads the game-list entry without decompressing any module.
-    pub fn info(&self) -> LoaderResult<TitleInfo> {
+    /// Reads the game-list entry, named and with the icon in `language` when the title has it,
+    /// without decompressing any module.
+    pub fn info(&self, language: NacpLanguage) -> LoaderResult<TitleInfo> {
         let npdm = Npdm::parse(&std::fs::read(self.exefs.join("main.npdm"))?)?;
         let nacp = self.nacp();
-        let title = nacp
-            .as_ref()
-            .and_then(|n| n.preferred_title(NacpLanguage::AmericanEnglish));
+        let title = nacp.as_ref().and_then(|n| n.preferred_title(language));
         let version = nacp
             .as_ref()
             .map(Nacp::display_version)
@@ -296,7 +296,7 @@ impl LooseTitle {
                 .unwrap_or_else(|| self.folder_name()),
             publisher: title.map(|t| t.publisher.clone()).unwrap_or_default(),
             version,
-            icon: self.icon(),
+            icon: self.icon(language),
         })
     }
 
@@ -311,7 +311,7 @@ impl LooseTitle {
         mods.patch_modules(&mut modules)?;
         let mut image =
             ProgramImage::new(npdm, modules, mods.layer_romfs(self.romfs()?)?, self.nacp());
-        image.icon = self.icon();
+        image.icon = self.icon(options.language);
         Ok(image)
     }
 }
@@ -379,12 +379,15 @@ pub fn identify(path: &Path, keys: Option<&KeySet>) -> Option<TitleFormat> {
     }
 }
 
-/// Reads the game-list entry of the title at `path`. NSP, XCI and NCA titles use the keys,
-/// language, program index and update packages in `options`.
+/// Reads the game-list entry of the title at `path`, named in `options.language` when the
+/// title has that language. NSP, XCI and NCA titles also use the keys, program index and update
+/// packages in `options`.
 pub fn scan(path: &Path, options: &LoadOptions) -> LoaderResult<TitleInfo> {
     let not_a_title = || LoaderError::NotATitle(path.display().to_string());
     match identify(path, options.keys.as_deref()).ok_or_else(not_a_title)? {
-        TitleFormat::LooseExefs => LooseTitle::locate(path).ok_or_else(not_a_title)?.info(),
+        TitleFormat::LooseExefs => LooseTitle::locate(path)
+            .ok_or_else(not_a_title)?
+            .info(options.language),
         format @ (TitleFormat::Nsp | TitleFormat::Xci | TitleFormat::Nca) => {
             package::scan(path, format, options)
         }
@@ -399,7 +402,7 @@ pub fn scan(path: &Path, options: &LoadOptions) -> LoaderResult<TitleInfo> {
             };
             let title = nacp
                 .as_ref()
-                .and_then(|n| n.preferred_title(NacpLanguage::AmericanEnglish));
+                .and_then(|n| n.preferred_title(options.language));
             let stem = path
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -562,6 +565,54 @@ pub(crate) mod tests {
         );
     }
 
+    fn bilingual_nacp() -> Vec<u8> {
+        let mut nacp = vec![0u8; lichii_fs::nacp::NACP_SIZE];
+        nacp[..7].copy_from_slice(b"English");
+        let japanese = NacpLanguage::Japanese as usize * 0x300;
+        nacp[japanese..japanese + 7].copy_from_slice(b"Nihongo");
+        nacp
+    }
+
+    #[test]
+    fn loose_and_nro_titles_use_the_system_language() {
+        let temp = TempDir::new("language");
+        let game = temp.0.join("Game");
+        write_exefs(&game.join("base/exefs"), 0x0100_0000_0000_0000, 1);
+        std::fs::write(game.join("control.nacp"), bilingual_nacp()).unwrap();
+        std::fs::write(game.join("icon_AmericanEnglish.dat"), b"en").unwrap();
+        std::fs::write(game.join("icon_Japanese.dat"), b"ja").unwrap();
+        let options = |language| LoadOptions {
+            language,
+            ..LoadOptions::default()
+        };
+        let base = LooseTitle::locate(&game.join("base")).unwrap();
+        let info = base.info(NacpLanguage::Japanese).unwrap();
+        assert_eq!(
+            (info.name.as_str(), info.icon.as_deref()),
+            ("Nihongo", Some(&b"ja"[..]))
+        );
+        let info = base.info(NacpLanguage::German).unwrap();
+        assert_eq!(
+            (info.name.as_str(), info.icon.as_deref()),
+            ("English", Some(&b"en"[..])),
+            "a language the title lacks falls back to the first in NACP order"
+        );
+        let image = base.load(&options(NacpLanguage::Japanese)).unwrap();
+        assert_eq!(image.icon.as_deref(), Some(&b"ja"[..]));
+
+        let nro = temp.0.join("hello.nro");
+        let nacp = bilingual_nacp();
+        std::fs::write(&nro, crate::nro::tests::build_nro(&[b"icon", &nacp, b""])).unwrap();
+        assert_eq!(
+            scan(&nro, &options(NacpLanguage::Japanese)).unwrap().name,
+            "Nihongo"
+        );
+        assert_eq!(
+            scan(&nro, &options(NacpLanguage::German)).unwrap().name,
+            "English"
+        );
+    }
+
     #[test]
     fn sidecars_and_update_layouts() {
         let temp = TempDir::new("updates");
@@ -580,7 +631,7 @@ pub(crate) mod tests {
         std::fs::write(game.join("icon_AmericanEnglish.dat"), b"jpeg").unwrap();
 
         let base = LooseTitle::locate(&game.join("base")).unwrap();
-        let info = base.info().unwrap();
+        let info = base.info(NacpLanguage::AmericanEnglish).unwrap();
         assert_eq!(
             (
                 info.name.as_str(),

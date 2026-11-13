@@ -163,7 +163,7 @@ const fn width_bits(bits: u32) -> u64 {
     }
 }
 
-const fn crc_table(poly: u32) -> [u32; 256] {
+pub(crate) const fn crc_table(poly: u32) -> [u32; 256] {
     let mut table = [0; 256];
     let mut i = 0;
     while i < 256 {
@@ -185,6 +185,16 @@ const fn crc_table(poly: u32) -> [u32; 256] {
 
 static CRC32: [u32; 256] = crc_table(0xedb8_8320);
 static CRC32C: [u32; 256] = crc_table(0x82f6_3b78);
+
+/// `CRC32<B|H|W|X>` and `CRC32C<B|H|W|X>`: folds the low `8 << size` bits of `data` into `crc`.
+pub(crate) fn crc32(castagnoli: bool, size: u8, mut crc: u32, data: u64) -> u32 {
+    let table = if castagnoli { &CRC32C } else { &CRC32 };
+    for i in 0..1u32 << size {
+        let byte = (data >> (i * 8)) as u8;
+        crc = table[((crc ^ byte as u32) & 0xff) as usize] ^ (crc >> 8);
+    }
+    crc
+}
 
 impl Exec<'_> {
     #[inline(always)]
@@ -599,13 +609,7 @@ impl Exec<'_> {
                 rn,
                 rm,
             } => {
-                let table = if castagnoli { &CRC32C } else { &CRC32 };
-                let mut crc = self.x(rn) as u32;
-                let data = self.x(rm);
-                for i in 0..1u32 << size {
-                    let byte = (data >> (i * 8)) as u8;
-                    crc = table[((crc ^ byte as u32) & 0xff) as usize] ^ (crc >> 8);
-                }
+                let crc = crc32(castagnoli, size, self.x(rn) as u32, self.x(rm));
                 self.set(rd, crc as u64);
             }
             Inst::Pacga { rd, rn, rm } => {

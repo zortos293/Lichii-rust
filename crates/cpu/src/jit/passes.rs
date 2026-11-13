@@ -1,7 +1,7 @@
 //! IR passes. Each one rewrites a [`Block`] in place and keeps its meaning.
 
 use super::ir::{Block, Cmp, Loc, Op, Terminal, Value, W};
-use crate::interpreter::condition_holds;
+use crate::interpreter::{condition_holds, crc32};
 
 /// Which passes run; tests turn them off one at a time to check each against the others.
 #[derive(Clone, Copy, Debug)]
@@ -181,6 +181,12 @@ pub(super) fn evaluate(op: &Op, k: impl Fn(Value) -> Option<u64>) -> Option<u64>
             (((a & 0x00ff_00ff_00ff_00ff) << 8) | ((a >> 8) & 0x00ff_00ff_00ff_00ff)) & w.mask()
         }
         Op::Rev32(a) => k(a)?.swap_bytes().rotate_left(32),
+        Op::Crc32 {
+            castagnoli,
+            size,
+            crc,
+            data,
+        } => crc32(castagnoli, size, k(crc)? as u32, k(data)?) as u64,
         Op::Select(w, cond, a, b) => (if k(cond)? != 0 { k(a)? } else { k(b)? }) & w.mask(),
         Op::TestCond(cond, f) => condition_holds(cond, k(f)? as u32) as u64,
         Op::Compare(kind, cond, w, a, b) => {

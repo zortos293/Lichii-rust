@@ -214,6 +214,40 @@ const WORKLOADS: &[Workload] = &[
         far: &[],
         per_iteration: 11,
     },
+    Workload {
+        name: "crc32 loop",
+        code: &[
+            0xf8607823, // 1: ldr x3, [x1, x0, lsl #3]
+            0x1ac34042, // crc32b w2, w2, w3
+            0x1ac34442, // crc32h w2, w2, w3
+            0x1ac34842, // crc32w w2, w2, w3
+            0x9ac34c42, // crc32x w2, w2, x3
+            0x91000400, // add x0, x0, #1
+            0x92402400, // and x0, x0, #0x3ff
+            0xf10004a5, // subs x5, x5, #1
+            0x54ffff01, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 9,
+    },
+    Workload {
+        name: "crc32c loop",
+        code: &[
+            0xf8607823, // 1: ldr x3, [x1, x0, lsl #3]
+            0x1ac35042, // crc32cb w2, w2, w3
+            0x1ac35442, // crc32ch w2, w2, w3
+            0x1ac35842, // crc32cw w2, w2, w3
+            0x9ac35c42, // crc32cx w2, w2, x3
+            0x91000400, // add x0, x0, #1
+            0x92402400, // and x0, x0, #0x3ff
+            0xf10004a5, // subs x5, x5, #1
+            0x54ffff01, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 9,
+    },
 ];
 
 fn main() {

@@ -479,6 +479,7 @@ alu_class!(cnt, "0x00111000100000010110xxxxxxxxxx");
 alu_class!(addp, "0x001110xx1xxxxx101111xxxxxxxxxx", |w| {
     w & 0x40c0_0000 != 0x00c0_0000
 });
+alu_class!(crc32, "x0011010110xxxxx010xxxxxxxxxxxxx");
 
 #[test]
 fn flags() {
