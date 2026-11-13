@@ -15,6 +15,7 @@ struct Env {
     types: FxHashMap<u32, TextureType>,
     formats: FxHashMap<u32, TexturePixelFormat>,
     integers: Vec<u32>,
+    multisamples: Vec<u32>,
     stage: Option<ShaderStage>,
     cbuf_reads: Cell<u32>,
     type_reads: Cell<u32>,
@@ -75,6 +76,9 @@ impl ShaderEnvironment for Env {
     }
     fn is_texture_pixel_format_integer(&self, handle: u32) -> bool {
         self.integers.contains(&handle)
+    }
+    fn is_texture_multisample(&self, handle: u32) -> bool {
+        self.multisamples.contains(&handle)
     }
     fn viewport_transform_state(&self) -> u32 {
         1
@@ -295,6 +299,44 @@ fn texture_type_comes_from_the_descriptor() {
         info.texture_buffer_descriptors[0].handle,
         word_source(BOUND, 0x14)
     );
+}
+
+#[test]
+fn a_multisampled_descriptor_marks_its_queries() {
+    let (mut prog, b) = program(1);
+    let samples = prog.append(
+        b[0],
+        Opcode::BoundImageQuerySamples,
+        &[Value::U32(0x10)],
+        info(TextureType::Color2D).to_flags(),
+    );
+    let dimensions = prog.append(
+        b[0],
+        Opcode::BoundImageQueryDimensions,
+        &[Value::U32(0x14), Value::U32(0), Value::U1(false)],
+        0,
+    );
+    let single = prog.append(
+        b[0],
+        Opcode::BoundImageQuerySamples,
+        &[Value::U32(0x18)],
+        info(TextureType::Color2D).to_flags(),
+    );
+    let mut env = Env::default()
+        .word(BOUND, 0x10, 0x77)
+        .word(BOUND, 0x14, 0x88)
+        .ty(0x88, TextureType::ColorArray2D)
+        .word(BOUND, 0x18, 0x99);
+    env.multisamples = vec![0x77, 0x88];
+    let info = run(&env, &mut prog, &host(1024));
+
+    let multisample = |id: InstId| {
+        let index = flags_of(&prog, id).descriptor_index as usize;
+        info.texture_descriptors[index].is_multisample
+    };
+    assert!(multisample(samples));
+    assert!(multisample(dimensions));
+    assert!(!multisample(single));
 }
 
 #[test]
