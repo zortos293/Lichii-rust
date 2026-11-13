@@ -23,7 +23,7 @@ use lichii_texture::block_linear::{GobLayout, Tiling, swizzle};
 use super::super::tests::{DADDR, Fixture, GPU_VA, fixture, gmmu, guest_linear};
 use super::{StageSources, Warning};
 use crate::pipeline::environment::TexturePool;
-use crate::pipeline::shader_cache::ShaderCache;
+use crate::pipeline::shader_cache::{ShaderCache, ShaderCacheStats};
 use crate::rasterizer::VulkanRasterizer;
 
 const SIZE: u32 = 16;
@@ -2217,12 +2217,38 @@ fn indexed_table_sampling_program() -> Vec<u8> {
 
 #[test]
 fn per_invocation_table_handles_bind_a_texture_per_table_entry() {
-    draw_per_invocation_table_handles(true);
+    draw_per_invocation_table_handles(true, None);
 }
 
 #[test]
 fn table_handles_sample_with_explicit_gradients_without_quad_divergent_implicit_lod() {
-    draw_per_invocation_table_handles(false);
+    draw_per_invocation_table_handles(false, None);
+}
+
+#[test]
+fn the_disk_cache_is_keyed_on_quad_divergent_implicit_lod() {
+    let dir = cache_dir("quad-divergent-lod");
+    let Some((off, _)) = draw_per_invocation_table_handles(false, Some(&dir)) else {
+        return;
+    };
+    assert_eq!((off.translated, off.disk_hits), (2, 0));
+    let (again, _) = draw_per_invocation_table_handles(false, Some(&dir)).unwrap();
+    assert_eq!(
+        (again.translated, again.disk_hits),
+        (0, 2),
+        "same profile: served"
+    );
+    let (on, supported) = draw_per_invocation_table_handles(true, Some(&dir)).unwrap();
+    if supported {
+        assert_eq!(
+            (on.translated, on.disk_hits),
+            (2, 0),
+            "modules translated without quadDivergentImplicitLod are not reused with it"
+        );
+    } else {
+        eprintln!("skipping the reuse check: no quadDivergentImplicitLod");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Whether `spirv` takes a screen-space derivative (OpDPdx).
@@ -2239,10 +2265,13 @@ fn takes_derivatives(spirv: &[u32]) -> bool {
 
 /// Draws a fragment program that samples a texture handle table at a per-column index;
 /// `quad_divergent_implicit_lod: false` translates as for a device without that feature.
-fn draw_per_invocation_table_handles(quad_divergent_implicit_lod: bool) {
-    let Some((mut f, gmmu)) = draw_fixture() else {
-        return;
-    };
+/// With `disk`, shaders go through the disk cache there. Returns the shader cache's stats and
+/// whether the profile had quadDivergentImplicitLod; `None` when skipped.
+fn draw_per_invocation_table_handles(
+    quad_divergent_implicit_lod: bool,
+    disk: Option<&std::path::Path>,
+) -> Option<(ShaderCacheStats, bool)> {
+    let (mut f, gmmu) = draw_fixture()?;
     if !quad_divergent_implicit_lod {
         let mut profile = f.rasterizer.draw.shaders.profile().clone();
         profile.support_quad_divergent_implicit_lod = false;
@@ -2256,7 +2285,12 @@ fn draw_per_invocation_table_handles(quad_divergent_implicit_lod: bool) {
         .sampled_image_array_non_uniform_indexing
     {
         eprintln!("skipping: no non-uniform sampled image indexing");
-        return;
+        return None;
+    }
+    if let Some(dir) = disk {
+        f.rasterizer
+            .open_disk_cache(dir, &GraphicsSettings::default())
+            .unwrap();
     }
     write(
         &f,
@@ -2295,6 +2329,15 @@ fn draw_per_invocation_table_handles(quad_divergent_implicit_lod: bool) {
         "explicit gradients only without quadDivergentImplicitLod"
     );
     f.assert_no_validation_errors();
+    f.rasterizer.draw.shaders.flush_disk();
+    Some((
+        f.rasterizer.draw.shaders.stats(),
+        f.rasterizer
+            .draw
+            .shaders
+            .profile()
+            .support_quad_divergent_implicit_lod,
+    ))
 }
 
 fn cache_dir(name: &str) -> std::path::PathBuf {
