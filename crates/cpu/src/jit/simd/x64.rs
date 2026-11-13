@@ -21,6 +21,17 @@ use super::ir::{Arith, Fp, Fused, SimdOp};
 pub(super) const HOST_FPCR: i32 = 3 << 22 | 1 << 24;
 /// FPSR.IXC.
 const IXC: i8 = 0x10;
+/// An H value with exponent 31 (an infinity or a NaN, or under FPCR.AHP a normal number) falls
+/// back; every other H value means the same in both formats and converts exactly, so FPCR is not
+/// checked at all.
+///
+/// 2^112 as an S value and 2^1008 as a D value: the exponent bias differences from H. A finite H
+/// value's magnitude bits, shifted into the S or D position, times this scale is the exact
+/// converted value, subnormals included.
+#[repr(align(16))]
+struct HalfScale([u32; 4]);
+
+static HALF_SCALE: HalfScale = HalfScale([0x7780_0000, 0, 0, 0x7ef0_0000]);
 
 #[derive(Default)]
 pub(in super::super) struct State {
@@ -279,6 +290,45 @@ impl Emitter<'_> {
                     Fp::D => dynasm!(self.asm ; .arch x64 ; sqrtsd xmm15, Rx(a)),
                 }
                 self.check_result(fp, false, slow);
+                self.rax_to_low(fp, d);
+                self.finish_checked(i, slow, word, d, Ty::U128);
+            }
+            SimdOp::FromHalf { fp, a, word } => {
+                let a = self.reg(a);
+                let d = self.def(v);
+                let slow = self.asm.new_dynamic_label();
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; movd eax, Rx(a)
+                    ; mov ecx, eax
+                    ; and ecx, 0x7c00
+                    ; cmp ecx, 0x7c00
+                    ; je =>slow
+                    ; mov ecx, eax
+                    ; and ecx, 0x8000
+                    ; and eax, 0x7fff
+                    ; mov rdx, QWORD HALF_SCALE.0.as_ptr() as i64
+                );
+                match fp {
+                    Fp::S => dynasm!(self.asm
+                        ; .arch x64
+                        ; shl eax, 13
+                        ; movd xmm15, eax
+                        ; mulss xmm15, [rdx]
+                        ; movd eax, xmm15
+                        ; shl ecx, 16
+                        ; or eax, ecx
+                    ),
+                    Fp::D => dynasm!(self.asm
+                        ; .arch x64
+                        ; shl rax, 42
+                        ; movq xmm15, rax
+                        ; mulsd xmm15, [rdx + 8]
+                        ; movq rax, xmm15
+                        ; shl rcx, 48
+                        ; or rax, rcx
+                    ),
+                }
                 self.rax_to_low(fp, d);
                 self.finish_checked(i, slow, word, d, Ty::U128);
             }
