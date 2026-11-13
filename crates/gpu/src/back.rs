@@ -4,11 +4,13 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
+use std::time::Instant;
 
 use lichii_common::DAddr;
 use lichii_memory::DeviceAddressSpace;
 use lichii_texture::block_linear::GobLayout;
 
+use crate::activity::{Activity, RendererCall, Wait};
 use crate::backend::{
     ChannelId, FenceAction, FramebufferConfig, GpuHandles, GpuWrittenPages, Rasterizer, ReleaseSize,
 };
@@ -69,6 +71,7 @@ pub(crate) struct Back {
     qmd_scheduler: QmdScheduler,
     fetch_syncs: Arc<FetchSyncs>,
     written_pages: Arc<GpuWrittenPages>,
+    activity: Arc<Activity>,
 }
 
 impl Back {
@@ -78,6 +81,7 @@ impl Back {
         engines: EngineFactory,
         side: mpsc::Receiver<SideCommand>,
         fetch_syncs: Arc<FetchSyncs>,
+        activity: Arc<Activity>,
     ) -> Self {
         Self {
             rasterizer,
@@ -93,6 +97,7 @@ impl Back {
             qmd_scheduler: QmdScheduler::new(),
             fetch_syncs,
             written_pages: handles.written_pages.clone(),
+            activity,
         }
     }
 
@@ -134,11 +139,14 @@ impl Back {
         let mut poll = MIN_POLL;
         loop {
             self.run(&mut consumer);
-            let more = if self.poll_fences() {
+            let fences = self.poll_fences();
+            let idle = self.activity.waiting(Wait::BackIdle);
+            let more = if fences {
                 consumer.wait_more_for(poll)
             } else {
                 Some(consumer.wait_more())
             };
+            drop(idle);
             match more {
                 Some(true) => poll = MIN_POLL,
                 Some(false) => break,
@@ -235,7 +243,9 @@ impl Back {
                 1
             }
             tag::WAIT_FOR_IDLE => {
+                let waiting = self.activity.waiting(Wait::HostGpu);
                 self.rasterizer.wait_for_idle();
+                drop(waiting);
                 self.rasterizer.release_fences(false);
                 1
             }
@@ -325,6 +335,7 @@ impl Back {
             gob_layout: channel.setup.gob_layout,
             qmd_scheduler: &mut self.qmd_scheduler,
             written_pages: &self.written_pages,
+            activity: &self.activity,
         };
         call(instance, &mut ctx);
     }
@@ -375,6 +386,7 @@ impl Back {
     /// The front is about to read `[address, address + size)`: the GPU work before it completes,
     /// its fences and queries land, and GPU-written data in the range goes back to guest memory.
     fn synchronize_read(&mut self, address: u64, size: u64) {
+        let _waiting = self.activity.waiting(Wait::HostGpu);
         self.rasterizer.release_fences(true);
         let Some(channel) = self.current.and_then(|index| self.channels[index].as_ref()) else {
             return;
@@ -459,7 +471,9 @@ impl Back {
             SideCommand::FlushRegion(addr, size) => self.rasterizer.flush_region(addr, size),
             SideCommand::UnmapRegion(addr, size) => self.rasterizer.unmap_region(addr, size),
             SideCommand::Present(framebuffer) => {
+                let start = Instant::now();
                 self.rasterizer.present(&framebuffer);
+                self.activity.renderer_call(RendererCall::Present, start);
                 self.timestamp.frame_presented();
             }
             SideCommand::Run(action) => action(&mut *self.rasterizer),

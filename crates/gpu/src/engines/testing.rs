@@ -20,6 +20,10 @@ const CPU_VA: u64 = 0x1000_0000;
 pub const MAPPED: u64 = 0x40_0000;
 
 /// Renderer calls, recorded.
+/// The activity counters of engines under test.
+pub static ACTIVITY: std::sync::LazyLock<crate::activity::Activity> =
+    std::sync::LazyLock::new(crate::activity::Activity::new);
+
 #[derive(Default)]
 pub struct Recorder {
     pub inline_writes: Vec<(GpuVAddr, u64)>,
@@ -92,6 +96,7 @@ impl Harness {
             gob_layout: self.gob_layout,
             qmd_scheduler: &mut self.qmd_scheduler,
             written_pages: &self.written_pages,
+            activity: &crate::engines::testing::ACTIVITY,
         }
     }
 }

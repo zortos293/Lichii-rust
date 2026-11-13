@@ -949,6 +949,7 @@ mod tests {
             Arc::new(create_engine),
             side_receiver,
             fetch_syncs.clone(),
+            Arc::new(crate::activity::Activity::new()),
         );
         let mut shared = FrontShared {
             stream: Stream::new(
@@ -956,6 +957,7 @@ mod tests {
                 Link::Inline(Box::new((back, consumer))),
                 side,
                 fetch_syncs,
+                Arc::new(crate::activity::Activity::new()),
             ),
             shared_macros: None,
             compute_macros: None,
