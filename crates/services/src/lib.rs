@@ -55,6 +55,7 @@ mod gsv;
 mod hid;
 mod ldn;
 mod lm;
+mod mii;
 mod mm;
 mod ncm;
 mod ngc;
@@ -122,6 +123,7 @@ pub fn register_all(context: &Arc<ServiceContext>) -> HleResult<()> {
     fatal::register(context)?;
     mm::register(context)?;
     ngc::register(context)?;
+    mii::register(context)?;
     ectx::register(context)?;
     olsc::register(context)?;
     notif::register(context)?;
