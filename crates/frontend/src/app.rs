@@ -27,6 +27,7 @@ use crate::game_list::GameList;
 use crate::hotkeys::{self, HotkeyMap};
 use crate::input_worker::{InputEvent, InputMsg, InputWorker};
 use crate::session::Session;
+use crate::setup::{self, SetupWindow};
 
 /// Events other threads send to the UI thread.
 #[derive(Debug)]
@@ -51,6 +52,7 @@ pub enum Action {
     SetResolution(ResolutionScale),
     SetScalingFilter(ScalingFilter),
     SetAntiAliasing(AntiAliasing),
+    KeysAndFirmware,
 }
 
 /// Dialogs and transient messages.
@@ -84,6 +86,8 @@ pub struct App {
     paths: UserPaths,
     /// The configuration window while it is open.
     config: Option<ConfigWindow>,
+    /// The keys and firmware window while it is open.
+    setup: Option<SetupWindow>,
     /// Where the renderer draws the guest frame, in physical pixels.
     pub viewport: Option<Viewport>,
     pending_boot: Option<PathBuf>,
@@ -137,6 +141,7 @@ impl App {
             ui: UiState::default(),
             paths: paths.clone(),
             config: None,
+            setup: None,
             viewport: None,
             pending_boot: cli.game,
             start_fullscreen: cli.fullscreen,
@@ -145,6 +150,12 @@ impl App {
             guest_input: false,
         };
         app.refresh_games();
+        if app.pending_boot.is_none() && !app.settings.ui.setup_done {
+            let window = SetupWindow::new(&app.settings.paths, &app.paths);
+            if !window.keys_usable() {
+                app.setup = Some(window);
+            }
+        }
         app
     }
 
@@ -299,13 +310,25 @@ impl App {
             npad: self.input.hub().clone(),
             perf: self.perf.clone(),
         };
-        match Session::boot(&path, settings, host) {
+        let keys = setup::KeyStatus::check(setup::keys_dir(&self.settings.paths, &self.paths)).keys;
+        match Session::boot(&path, settings, keys, host) {
             Ok(session) => {
                 self.session = Some(session);
                 self.settings.ui.push_recent(path);
                 self.save_settings();
             }
-            Err(e) => self.ui.error = Some(format!("Cannot boot: {e}")),
+            Err(e) => match e.missing_key() {
+                Some(key) => {
+                    self.ui.error = Some(format!(
+                        "Lichii cannot decrypt this title: {key}.
+
+Dump prod.keys and title.keys \
+                         from your own console, then choose them in the Keys and Firmware window."
+                    ));
+                    self.open_setup();
+                }
+                None => self.ui.error = Some(format!("Cannot boot: {e}")),
+            },
         }
         self.input.send(InputMsg::ReleaseAll);
         self.update_title();
@@ -368,6 +391,7 @@ impl App {
                 self.save_settings();
             }
             Action::About => self.ui.about = true,
+            Action::KeysAndFirmware => self.open_setup(),
             Action::SetResolution(scale) => {
                 self.set_graphics(|g| g.resolution_scale = scale);
                 self.toast(format!("Resolution: {}", scale.label()));
@@ -380,6 +404,30 @@ impl App {
                 self.set_graphics(|g| g.anti_aliasing = aa);
                 self.toast(format!("Anti-aliasing: {}", aa.label()));
             }
+        }
+    }
+
+    fn open_setup(&mut self) {
+        self.setup = Some(SetupWindow::new(&self.settings.paths, &self.paths));
+    }
+
+    /// Draws the keys and firmware window when it is open; a changed folder is saved, and
+    /// follows into an open configuration window's draft.
+    pub(crate) fn show_setup(&mut self, ctx: &egui::Context) {
+        let Some(window) = &mut self.setup else {
+            return;
+        };
+        let out = window.show(ctx, &mut self.settings.paths, &self.paths);
+        if out.changed {
+            if let Some(config) = &mut self.config {
+                *config.draft_paths() = self.settings.paths.clone();
+            }
+            self.save_settings();
+        }
+        if out.closed {
+            self.setup = None;
+            self.settings.ui.setup_done = true;
+            self.save_settings();
         }
     }
 
