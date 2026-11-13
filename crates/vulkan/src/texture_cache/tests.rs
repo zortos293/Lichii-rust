@@ -1292,3 +1292,133 @@ fn removed_aliases_hand_their_texels_to_the_other_image() {
     assert!(f.cache.state(texture).unwrap().gpu_modified);
     f.assert_no_validation_errors();
 }
+
+fn texel_rows(texels: &[u8], width: usize) -> Vec<&[[u8; 4]]> {
+    texels.as_chunks::<4>().0.chunks(width).collect()
+}
+
+#[test]
+fn rejected_overlaps_keep_the_lookups_alias_rectangles() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let small = ImageInfo {
+        width: 16,
+        ..pitch_target(256, 8)
+    };
+    let left = clear_rt(&mut f, &small, [1.0, 0.0, 0.0, 1.0], Rect::ALL).id;
+    let right = clear_rt_at(&mut f, GPU_VA + 32, &small, [0.0, 0.0, 1.0, 1.0], Rect::ALL).id;
+    assert_ne!(left, right);
+    let strip = ImageInfo {
+        width: 60,
+        height: 2,
+        ..small
+    };
+    clear_rt_at(
+        &mut f,
+        GPU_VA + 256,
+        &strip,
+        [0.0, 1.0, 0.0, 1.0],
+        Rect::ALL,
+    );
+    assert!(
+        f.cache.state(right).is_none(),
+        "the overlap that wraps the pitch is flushed and dropped"
+    );
+    let (texture, _) = f.texture(&pitch_tic(GPU_VA, 16, 8, 256));
+    assert_eq!(texture, left);
+    for (y, row) in texel_rows(&f.read_image(texture)[0], 16).iter().enumerate() {
+        for (x, texel) in row.iter().enumerate() {
+            let expected = match (x, y) {
+                (_, 1..=2) => [0, 255, 0, 255],
+                (8.., _) => [0, 0, 255, 255],
+                _ => [255, 0, 0, 255],
+            };
+            assert_eq!(*texel, expected, "texel ({x}, {y})");
+        }
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn partial_flushes_keep_every_aliased_rectangle() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let wide = pitch_target(256, 8);
+    let strip = ImageInfo {
+        width: 60,
+        height: 2,
+        ..wide
+    };
+    let target = clear_rt(&mut f, &wide, [1.0, 0.0, 0.0, 1.0], Rect::ALL).id;
+    clear_rt(&mut f, &strip, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    clear_rt_at(
+        &mut f,
+        GPU_VA + 4 * 256,
+        &strip,
+        [0.0, 0.0, 1.0, 1.0],
+        Rect::ALL,
+    );
+    {
+        let (mut tx, cache, _) = f.tx();
+        cache
+            .flush(&mut tx, DADDR + 4 * 256, strip.size_bytes())
+            .unwrap();
+    }
+    let expected = |x: usize, y: usize| match (x, y) {
+        (0..60, 0..=1) => [0, 255, 0, 255],
+        (0..60, 4..=5) => [0, 0, 255, 255],
+        _ => [255, 0, 0, 255],
+    };
+    let (texture, _) = f.texture(&pitch_tic(GPU_VA, 64, 8, 256));
+    assert_eq!(texture, target);
+    for (y, row) in texel_rows(&f.read_image(texture)[0], 64).iter().enumerate() {
+        for (x, texel) in row.iter().enumerate() {
+            assert_eq!(*texel, expected(x, y), "texel ({x}, {y})");
+        }
+    }
+    let mut guest = vec![0; strip.size_bytes() as usize];
+    f.memory.read_bytes(DADDR + 4 * 256, &mut guest).unwrap();
+    for (y, row) in texel_rows(&guest, 64).iter().enumerate() {
+        for (x, texel) in row.iter().enumerate() {
+            assert_eq!(*texel, expected(x, y + 4), "guest texel ({x}, {})", y + 4);
+        }
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn presented_targets_take_their_aliases_texels() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let wide = pitch_target(256, 8);
+    let narrow = ImageInfo { width: 60, ..wide };
+    let target = clear_rt(&mut f, &wide, [1.0, 0.0, 0.0, 1.0], Rect::ALL).id;
+    clear_rt(&mut f, &narrow, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let fb = FramebufferConfig {
+        address: DADDR,
+        width: 64,
+        height: 8,
+        stride: 256,
+        format: PixelFormat::A8B8G8R8Unorm,
+        block_height_log2: None,
+        flip_vertical: false,
+        crop: None,
+        gob_layout: GobLayout::Tegra,
+    };
+    let presented = f.cache.presentable(&mut f.scheduler, &fb).unwrap();
+    assert_eq!(presented, Some(target));
+    for (y, row) in texel_rows(&f.read_image(target)[0], 64).iter().enumerate() {
+        for (x, texel) in row.iter().enumerate() {
+            let expected = if x < 60 {
+                [0, 255, 0, 255]
+            } else {
+                [255, 0, 0, 255]
+            };
+            assert_eq!(*texel, expected, "texel ({x}, {y})");
+        }
+    }
+    f.assert_no_validation_errors();
+}

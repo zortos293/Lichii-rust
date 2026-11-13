@@ -271,16 +271,20 @@ struct CachedImage {
     last_use: u64,
     /// Live images over some of the same texels, kept in step with GPU copies.
     aliases: Vec<Alias>,
+    /// Tick of the last GPU work that wrote this image itself rather than copied from an alias.
+    written: u64,
 }
 
 /// A live image that shares a rectangle of texels with another, at level 0 of layer 0:
-/// `at` in the alias, `own` in the image that lists it.
+/// `at` in the alias, `own` in the image that lists it. `synced` is the alias's `modified`
+/// tick when the rectangle last took its texels.
 #[derive(Clone, Copy, Debug)]
 struct Alias {
     id: ImageId,
     at: Texel,
     own: Texel,
     extent: Texel,
+    synced: u64,
 }
 
 /// A texel position or extent: x and y, or width and height.
@@ -442,6 +446,7 @@ pub struct TextureCache {
     ids: Vec<ImageId>,
     joins: Vec<(ImageId, u32, u32)>,
     new_aliases: Vec<Alias>,
+    alias_scratch: Vec<Alias>,
     segments: Vec<Segment>,
     scratch: Scratch,
     readback: Option<Buffer>,
@@ -671,6 +676,7 @@ impl TextureCache {
             ids: Vec::new(),
             joins: Vec::new(),
             new_aliases: Vec::new(),
+            alias_scratch: Vec::new(),
             segments: Vec::new(),
             scratch: Scratch::default(),
             readback: None,
@@ -1000,6 +1006,7 @@ impl TextureCache {
         image.gpu_modified = true;
         image.cpu_dirty = false;
         image.modified = tick;
+        image.written = tick;
     }
 
     /// The guest CPU wrote `[daddr, daddr + size)`: overlapping images re-upload on next use.
@@ -1063,8 +1070,12 @@ impl TextureCache {
     }
 
     /// A GPU-modified image whose first byte is the framebuffer's and that holds at least the
-    /// framebuffer's texels in the same layout.
-    pub fn presentable(&mut self, fb: &FramebufferConfig) -> Option<ImageId> {
+    /// framebuffer's texels in the same layout, brought up to date with its aliases.
+    pub fn presentable(
+        &mut self,
+        scheduler: &mut Scheduler,
+        fb: &FramebufferConfig,
+    ) -> Result<Option<ImageId>> {
         let info = ImageInfo::from_framebuffer(fb);
         self.collect_overlaps(&[Segment {
             offset: 0,
@@ -1093,7 +1104,8 @@ impl TextureCache {
             (GuestLayout::Pitch { pitch: a }, GuestLayout::Pitch { pitch: b }) => a == b,
             _ => false,
         };
-        self.ids
+        let found = self
+            .ids
             .iter()
             .copied()
             .filter(|&id| {
@@ -1108,7 +1120,11 @@ impl TextureCache {
                     && image.info.height >= fb.height
                     && layout_matches(&image.info)
             })
-            .max_by_key(|&id| self.get(id).map_or(0, |i| i.modified))
+            .max_by_key(|&id| self.get(id).map_or(0, |i| i.modified));
+        if let Some(id) = found {
+            self.take_from_aliases(scheduler, id)?;
+        }
+        Ok(found)
     }
 
     /// Clears a render target (level `target.level`, layers or 3D slices `target.layer +
@@ -1604,6 +1620,7 @@ impl TextureCache {
                     at,
                     own,
                     extent,
+                    synced: 0,
                 });
                 continue;
             }
@@ -1637,6 +1654,7 @@ impl TextureCache {
                 at: alias.own,
                 own: alias.at,
                 extent: alias.extent,
+                synced: 0,
             });
             self.image(id).aliases.push(*alias);
         }
@@ -1738,6 +1756,7 @@ impl TextureCache {
             visit: 0,
             last_use: self.frame,
             aliases: Vec::new(),
+            written: 0,
         };
         let index = match self.free.pop() {
             Some(index) => index,
@@ -1845,21 +1864,26 @@ impl TextureCache {
         if self.image(id).cpu_dirty {
             self.rescale(tx, id, ResolutionScale::X1, false)?;
             self.upload(tx, id)?;
-            self.image(id).cpu_dirty = false;
+            let image = self.image(id);
+            image.cpu_dirty = false;
+            for alias in &mut image.aliases {
+                alias.synced = 0;
+            }
         }
         self.take_from_aliases(tx.scheduler, id)
     }
 
-    /// Copies in, oldest first, what aliases the GPU wrote after this image last changed.
+    /// Copies in, oldest first, the rectangles GPU-modified aliases changed since this image
+    /// last took them or wrote itself.
     fn take_from_aliases(&mut self, scheduler: &mut Scheduler, id: ImageId) -> Result<()> {
-        let mut newer = std::mem::take(&mut self.new_aliases);
+        let mut newer = std::mem::take(&mut self.alias_scratch);
         newer.clear();
         let image = self.get(id).expect("a live image id");
-        let modified = image.modified;
+        let written = image.written;
         newer.extend(image.aliases.iter().copied());
         newer.retain(|a| {
             self.get(a.id)
-                .is_some_and(|other| other.gpu_modified && other.modified > modified)
+                .is_some_and(|other| other.gpu_modified && other.modified > a.synced.max(written))
         });
         newer.sort_by_key(|a| self.get(a.id).map_or(0, |other| other.modified));
         let mut result = Ok(());
@@ -1870,26 +1894,35 @@ impl TextureCache {
             }
             let tick = self.get(alias.id).map_or(0, |other| other.modified);
             let image = self.image(id);
-            image.modified = tick;
+            image.modified = image.modified.max(tick);
             image.gpu_modified = true;
+            let modified = image.modified;
+            Self::set_synced(image, alias.id, tick);
+            Self::set_synced(self.image(alias.id), id, modified);
         }
-        self.new_aliases = newer;
+        self.alias_scratch = newer;
         result
     }
 
-    /// Copies a GPU-modified image's shared texels into each alias that last changed before
-    /// it, so its data outlives its write-back or removal without another guest round trip.
-    /// Aliases also take its pending write-back when guest memory does not hold its texels yet.
+    /// Copies a GPU-modified image's shared texels into each alias whose rectangle neither took
+    /// them yet nor was written since, so its data outlives its write-back or removal without
+    /// another guest round trip. Aliases also take its pending write-back when guest memory does
+    /// not hold its texels yet.
     fn hand_off(&mut self, scheduler: &mut Scheduler, id: ImageId) {
-        let mut older = std::mem::take(&mut self.new_aliases);
+        let mut older = std::mem::take(&mut self.alias_scratch);
         older.clear();
         let image = self.get(id).expect("a live image id");
         let modified = image.modified;
         let unwritten = image.gpu_modified;
         older.extend(image.aliases.iter().copied());
         older.retain(|a| {
-            self.get(a.id)
-                .is_some_and(|other| other.modified < modified)
+            self.get(a.id).is_some_and(|other| {
+                other.written < modified
+                    && other
+                        .aliases
+                        .iter()
+                        .any(|back| back.id == id && back.synced < modified)
+            })
         });
         for alias in &older {
             if let Err(error) =
@@ -1899,10 +1932,17 @@ impl TextureCache {
                 continue;
             }
             let other = self.image(alias.id);
-            other.modified = modified;
+            other.modified = other.modified.max(modified);
             other.gpu_modified |= unwritten;
+            Self::set_synced(other, id, modified);
         }
-        self.new_aliases = older;
+        self.alias_scratch = older;
+    }
+
+    fn set_synced(image: &mut CachedImage, alias: ImageId, tick: u64) {
+        if let Some(link) = image.aliases.iter_mut().find(|a| a.id == alias) {
+            link.synced = tick;
+        }
     }
 
     /// Records a copy of the `extent` texels at `from_at` in `from` to `to_at` in `to`, at
@@ -2107,6 +2147,9 @@ impl TextureCache {
         ids: &[ImageId],
         keep: Option<(DAddr, DAddr)>,
     ) -> Result<()> {
+        for &id in ids {
+            self.take_from_aliases(tx.scheduler, id)?;
+        }
         let mut downloads = std::mem::take(&mut self.downloads);
         downloads.clear();
         for &id in ids {
