@@ -25,6 +25,7 @@ fn texture(ty: TextureType) -> TextureDescriptor {
         size_shift: 3,
         is_descriptor_array: false,
         handle_is_pointer_word: false,
+        handle_program: None,
     }
 }
 
@@ -40,6 +41,7 @@ fn image(ty: TextureType, format: ImageFormat, is_integer: bool) -> ImageDescrip
         count: 1,
         size_shift: 3,
         is_byte_addressed: false,
+        handle_program: None,
     }
 }
 
@@ -53,6 +55,7 @@ fn image_buffer(format: ImageFormat, is_integer: bool, count: u32) -> ImageBuffe
         cbuf_offset: 0x20,
         count,
         size_shift: 3,
+        handle_program: None,
     }
 }
 
@@ -61,6 +64,7 @@ fn texture_buffer(count: u32) -> TextureBufferDescriptor {
         handle: HandleSource::default(),
         count,
         size_shift: 3,
+        handle_program: None,
     }
 }
 
