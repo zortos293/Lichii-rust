@@ -468,3 +468,48 @@ fn a_mutex_owner_runs_at_the_priority_of_its_best_waiter() {
         "releasing the mutex gives the priority back"
     );
 }
+
+#[test]
+fn a_mutex_waiter_stops_lending_its_priority_when_its_wait_ends() {
+    use crate::thread::{Resume, WakeResult};
+    let test = TestKernel::new(ConsoleGeneration::Switch1);
+    let process = test.kernel.create_process(&test.image()).unwrap();
+    let entry = process.entry();
+    let thread = |priority| {
+        test.kernel
+            .0
+            .create_thread(&process, entry, 0, entry, priority, -2)
+            .unwrap()
+    };
+    let (owner, timed, terminated, late) = (thread(50), thread(20), thread(30), thread(10));
+    let mutex = 0x1000;
+
+    let token = timed.begin_wait(Resume::Result, false).unwrap();
+    owner.add_lock_waiter(&timed, token, mutex);
+    let other = terminated.begin_wait(Resume::Result, false).unwrap();
+    owner.add_lock_waiter(&terminated, other, mutex);
+    assert_eq!(owner.priority(), 20);
+
+    assert!(timed.wake(token, WakeResult::error(result::TIMED_OUT)));
+    assert_eq!(
+        owner.priority(),
+        30,
+        "a timed-out waiter withdraws its priority"
+    );
+
+    terminated.mark_terminated();
+    assert_eq!(
+        owner.priority(),
+        50,
+        "an exited waiter withdraws its priority"
+    );
+
+    let token = late.begin_wait(Resume::Result, false).unwrap();
+    assert!(late.wake(token, WakeResult::error(result::TIMED_OUT)));
+    owner.add_lock_waiter(&late, token, mutex);
+    assert_eq!(
+        owner.priority(),
+        50,
+        "a wait that already ended lends nothing"
+    );
+}

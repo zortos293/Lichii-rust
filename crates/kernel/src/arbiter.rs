@@ -337,10 +337,11 @@ impl Arbiter {
         addr: VAddr,
     ) -> HleResult<()> {
         let word: &AtomicU32 = guest_word(owner.process().memory(), addr, true)?;
+        let held = owner.lock_inheritance();
         loop {
             let Some(next) = take_best(&mut shard.mutex, pid, addr) else {
                 word.store(0, Ordering::SeqCst);
-                owner.pass_lock(addr, None);
+                owner.pass_lock(&held, addr, None);
                 return Ok(());
             };
             let mut s = next.thread.sched.lock();
@@ -354,7 +355,7 @@ impl Arbiter {
             );
             next.thread.wake_locked(&mut s, WakeResult::SUCCESS);
             drop(s);
-            owner.pass_lock(addr, Some(&next.thread));
+            owner.pass_lock(&held, addr, Some(&next.thread));
             return Ok(());
         }
     }
