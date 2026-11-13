@@ -753,10 +753,14 @@ fn the_thread_log_names_the_objects_a_thread_waits_on() {
             .0
             .wait_descriptions(std::slice::from_ref(&process))
             .remove(&thread)
+            && waits_on.matches("KReadableEvent").count() == 2
         {
             break waits_on;
         }
-        assert!(Instant::now() < deadline, "the thread never waited");
+        assert!(
+            Instant::now() < deadline,
+            "the thread never waited on both events"
+        );
         std::thread::sleep(Duration::from_millis(1));
     };
     let readable = guest_handles.lock().1;
