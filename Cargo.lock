@@ -1553,6 +1553,7 @@ dependencies = [
 name = "lichii-services"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "lichii-common",
  "lichii-crypto",
  "lichii-gpu",
@@ -1560,6 +1561,7 @@ dependencies = [
  "lichii-kernel",
  "lichii-loader",
  "lichii-memory",
+ "lichii-texture",
  "parking_lot",
  "thiserror 2.0.21",
  "tracing",

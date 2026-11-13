@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+bytemuck.workspace = true
 lichii-common.workspace = true
 lichii-crypto.workspace = true
 lichii-memory.workspace = true
@@ -18,3 +19,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 lichii-kernel = { workspace = true, features = ["testing"] }
+lichii-texture.workspace = true

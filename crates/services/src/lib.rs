@@ -37,6 +37,7 @@
 mod am;
 mod context;
 mod dispatch;
+mod nvdrv;
 #[cfg(test)]
 mod testing;
 
@@ -51,5 +52,6 @@ pub use dispatch::Service;
 /// before `Kernel::run`.
 pub fn register_all(context: &Arc<ServiceContext>) -> HleResult<()> {
     am::register(context)?;
+    nvdrv::register(context)?;
     Ok(())
 }
