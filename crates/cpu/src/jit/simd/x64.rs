@@ -57,7 +57,7 @@ impl Emitter<'_> {
     /// Starts a checked op and returns its slow-path label. The host computes only under round to
     /// nearest without flush to zero, and only reports inexact results by leaving FPSR.IXC alone,
     /// so an op that can be inexact also falls back while IXC is clear.
-    fn checked(&mut self, inexact: bool) -> DynamicLabel {
+    pub(super) fn checked(&mut self, inexact: bool) -> DynamicLabel {
         let slow = self.asm.new_dynamic_label();
         dynasm!(self.asm
             ; .arch x64
@@ -120,7 +120,14 @@ impl Emitter<'_> {
         }
     }
 
-    fn finish_checked(&mut self, i: usize, slow: DynamicLabel, word: u32, dst: u8, ty: Ty) {
+    pub(super) fn finish_checked(
+        &mut self,
+        i: usize,
+        slow: DynamicLabel,
+        word: u32,
+        dst: u8,
+        ty: Ty,
+    ) {
         let resume = self.asm.new_dynamic_label();
         dynasm!(self.asm ; .arch x64 ; =>resume);
         let saved = self.live_across(i);
@@ -397,6 +404,7 @@ impl Emitter<'_> {
                 self.finish_checked(i, slow, word, d, Ty::Nzcv);
             }
             SimdOp::Vec(op) => self.vector(i, op),
+            SimdOp::Lanes(lanes) => self.lanes(i, lanes),
         }
     }
 

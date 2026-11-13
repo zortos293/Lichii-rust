@@ -480,6 +480,21 @@ alu_class!(addp, "0x001110xx1xxxxx101111xxxxxxxxxx", |w| {
     w & 0x40c0_0000 != 0x00c0_0000
 });
 alu_class!(crc32, "x0011010110xxxxx010xxxxxxxxxxxxx");
+alu_class!(vector_fp_arith, "0xx01110xx1xxxxx110xx1xxxxxxxxxx", |w| {
+    matches!(
+        w & 0xbfa0_fc00,
+        0x0e20_d400 | 0x0ea0_d400 | 0x2e20_dc00 | 0x0e20_cc00 | 0x0ea0_cc00
+    ) && w & 0x4040_0000 != 0x0040_0000
+});
+alu_class!(
+    vector_fp_by_element,
+    "0xx011111xxxxxxxxx01x0xxxxxxxxxx",
+    |w| {
+        matches!(w & 0xbf80_f400, 0x0f80_1000 | 0x0f80_5000 | 0x0f80_9000)
+            && w & 0x4060_0000 != 0x0040_0000
+            && w & 0x0060_0000 != 0x0060_0000
+    }
+);
 
 #[test]
 fn flags() {
