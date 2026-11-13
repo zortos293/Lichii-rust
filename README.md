@@ -18,6 +18,7 @@ Only use games, keys and firmware you have legally obtained. None are included.
 | `lichii-services` | `crates/services` | HLE system services (sm, fs, am, hid, vi, nvdrv, gsv, audio, ...) |
 | `lichii-gpu` | `crates/gpu` | GPFIFO, DMA pusher, engines (Maxwell/Ampere), macros, GMMU, host1x |
 | `lichii-texture` | `crates/texture` | Surface formats, block-linear tiling, ASTC/BCn decoders |
+| `lichii-video` | `crates/video` | FFmpeg video decoding, NVDEC codec state, output image conversion |
 | `lichii-shader` | `crates/shader` | Maxwell/Ampere SASS -> IR -> SPIR-V |
 | `lichii-vulkan` | `crates/vulkan` | Vulkan renderer, caches, pipelines, resolution scaling, presentation |
 | `lichii-audio` | `crates/audio` | Audio renderer HLE and host output |
@@ -38,6 +39,14 @@ You need:
 - CMake and a C compiler: SDL3 is built from source.
 - On Linux, the ALSA headers (`libasound2-dev` on Debian and Ubuntu).
 - On Windows, the Visual Studio C++ build tools and a CMake that has the Visual Studio generators, such as the one Visual Studio ships, the official installer or scoop. devkitPro's MSYS CMake has no Visual Studio generator, and SDL3 then fails with `Could not create named generator Visual Studio 17 2022`. If it is first on your `PATH`, point the build at another CMake with `CMAKE`, for example `$env:CMAKE = "C:/Program Files/CMake/bin/cmake.exe"`.
+
+### Video (FFmpeg)
+
+Games play their movies through the console's video decoder, which Lichii emulates with FFmpeg's libavcodec. FFmpeg is loaded at runtime and is optional: without it Lichii logs one warning and movies play as black frames. Any FFmpeg 4 to 8 with shared libraries works.
+
+- Linux: install your distribution's FFmpeg libraries (`libavcodec60` on Ubuntu 24.04, `ffmpeg-libs` on Fedora).
+- Windows: put `avcodec-61.dll` and `avutil-59.dll` next to `lichii.exe`. The Release workflow's zip has them; to build them yourself, run `scripts/build-ffmpeg-windows.sh <dir>` on Linux or WSL with mingw-w64 and nasm. That build is LGPL-2.1-or-later (decoders only, no GPL or non-free parts) and writes its licence and source note beside the DLLs.
+- `LICHII_FFMPEG_DIR` points Lichii at another folder holding the libraries.
 
 ## License
 
