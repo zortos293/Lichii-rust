@@ -59,9 +59,7 @@ impl std::ops::Index<usize> for VectorTypes {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CbufElement {
     U8,
-    S8,
     U16,
-    S16,
     U32,
     F32,
     U32x2,
@@ -397,6 +395,14 @@ pub(crate) struct EmitContext<'a> {
     pub uses_nonuniform_storage_texel_buffer: bool,
 
     sparse_result_types: FxHashMap<Word, Word>,
+}
+
+/// Stages whose inputs are arrays indexed by vertex.
+pub(crate) fn is_arrayed_input_stage(stage: ShaderStage) -> bool {
+    matches!(
+        stage,
+        ShaderStage::TessellationControl | ShaderStage::TessellationEval | ShaderStage::Geometry
+    )
 }
 
 fn uses_nvn_storage_descriptor(info: &ShaderInfo, desc: &StorageBufferDescriptor) -> bool {
@@ -1258,7 +1264,7 @@ impl<'a> EmitContext<'a> {
             self.local_invocation_id =
                 self.define_input(u32x3, false, Some(BuiltIn::LocalInvocationId));
         }
-        if info.uses_invocation_id {
+        if info.uses_invocation_id || self.stage == ShaderStage::TessellationControl {
             self.invocation_id = self.define_input(u32_t, false, Some(BuiltIn::InvocationId));
         }
         if info.uses_invocation_info
@@ -2013,16 +2019,18 @@ impl<'a> EmitContext<'a> {
         let mut types = info.used_constant_buffer_types | info.used_indirect_cbuf_types;
         if types.contains(Type::U8) {
             if profile.support_int8 && profile.support_uniform_and_storage_buffer_8bit {
+                self.add_extension("SPV_KHR_8bit_storage");
+                self.add_capability(Capability::UniformAndStorageBuffer8BitAccess);
                 self.define_const_buffers(CbufElement::U8, *binding, self.u8, 'u', 1);
-                self.define_const_buffers(CbufElement::S8, *binding, self.s8, 's', 1);
             } else {
                 types |= Type::U32;
             }
         }
         if types.contains(Type::U16) {
             if profile.support_int16 && profile.support_uniform_and_storage_buffer_16bit {
+                self.add_extension("SPV_KHR_16bit_storage");
+                self.add_capability(Capability::UniformAndStorageBuffer16BitAccess);
                 self.define_const_buffers(CbufElement::U16, *binding, self.u16, 'u', 2);
-                self.define_const_buffers(CbufElement::S16, *binding, self.s16, 's', 2);
             } else {
                 types |= Type::U32;
             }
@@ -2506,7 +2514,7 @@ impl<'a> EmitContext<'a> {
 
     fn indexed_load_function(&mut self) -> EmitResult<Word> {
         let info = self.info;
-        let is_array = self.stage == ShaderStage::Geometry;
+        let is_array = is_arrayed_input_stage(self.stage);
         let (u32_t, f32_t) = (self.u32[1], self.f32[1]);
         let end_block = self.b.id();
         let default_label = self.b.id();
@@ -2764,21 +2772,28 @@ impl<'a> EmitContext<'a> {
 
     /// Base GPU address of storage buffer descriptor `index`, aligned down to the binding
     /// alignment as the renderer binds it.
-    fn storage_base_address(&mut self, index: usize) -> EmitResult<Word> {
+    /// Rounds a guest address down to the storage buffer offset alignment the renderer binds
+    /// storage buffers at.
+    fn align_storage_address(&mut self, address: Word) -> EmitResult<Word> {
+        let align = self.profile.min_ssbo_alignment.max(1);
+        let align_mask = self.const_u64(!(align - 1));
+        Ok(self.b.bitwise_and(self.u64, None, address, align_mask)?)
+    }
+
+    /// The guest pointer of storage buffer `index`, as its constant buffer descriptor holds it.
+    fn storage_guest_address(&mut self, index: usize) -> EmitResult<Word> {
         let info = self.info;
         let align = self.profile.min_ssbo_alignment.max(1);
         let ssbo = info.storage_buffers_descriptors[index];
         let u64_t = self.u64;
         let u32_t = self.u32[1];
-        let align_mask = self.const_u64(!(align - 1));
         let words = get_cbuf_u32x2_at(
             self,
             Value::U32(ssbo.cbuf_index),
             Value::U32(ssbo.cbuf_offset),
         )?;
         if ssbo.indirect_offset == StorageBufferDescriptor::DIRECT {
-            let address = self.b.bitcast(u64_t, None, words)?;
-            return Ok(self.b.bitwise_and(u64_t, None, address, align_mask)?);
+            return Ok(self.b.bitcast(u64_t, None, words)?);
         }
         let holder = info.storage_buffers_descriptors.iter().position(|d| {
             d.cbuf_index == ssbo.cbuf_index
@@ -2809,8 +2824,7 @@ impl<'a> EmitContext<'a> {
             .access_chain(element, None, storage, [zero, next_index])?;
         let high = self.b.load(u32_t, None, high_pointer, None, [])?;
         let pointer_words = self.b.composite_construct(self.u32[2], None, [low, high])?;
-        let address = self.b.bitcast(u64_t, None, pointer_words)?;
-        Ok(self.b.bitwise_and(u64_t, None, address, align_mask)?)
+        Ok(self.b.bitcast(u64_t, None, pointer_words)?)
     }
 
     /// Opens the routing body of a global memory function: for every storage buffer that may
@@ -2852,7 +2866,8 @@ impl<'a> EmitContext<'a> {
             let mut best_index = self.const_u32(u32::MAX);
             let mut best_distance = self.const_u64(u64::MAX);
             for index in 0..num_buffers {
-                let base = self.storage_base_address(index)?;
+                let guest = self.storage_guest_address(index)?;
+                let base = self.align_storage_address(guest)?;
                 bases.push(base);
                 let distance = self.b.i_sub(u64_t, None, addr, base)?;
                 let above = self.b.u_greater_than_equal(u1, None, addr, base)?;
@@ -2876,15 +2891,16 @@ impl<'a> EmitContext<'a> {
             if !uses_nvn_storage_descriptor(info, &ssbo) {
                 continue;
             }
-            let base = self.storage_base_address(index)?;
+            let guest = self.storage_guest_address(index)?;
+            let base = self.align_storage_address(guest)?;
             let size = get_cbuf_u32_at(
                 self,
                 Value::U32(ssbo.cbuf_index),
                 Value::U32(ssbo.cbuf_offset + 8),
             )?;
             let size = self.b.u_convert(u64_t, None, size)?;
-            let end = self.b.i_add(u64_t, None, base, size)?;
-            let above = self.b.u_greater_than_equal(u1, None, addr, base)?;
+            let end = self.b.i_add(u64_t, None, guest, size)?;
+            let above = self.b.u_greater_than_equal(u1, None, addr, guest)?;
             let below = self.b.u_less_than(u1, None, addr, end)?;
             let cond = self.b.logical_and(u1, None, above, below)?;
             route(self, index, base, cond)?;

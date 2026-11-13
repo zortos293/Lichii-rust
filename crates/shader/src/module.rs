@@ -43,6 +43,7 @@ fn finish(
     runtime: &RuntimeInfo,
     bindings: &mut Bindings,
 ) -> Result<ShaderModule, TranslateError> {
+    let incoming = *bindings;
     let first_binding = bindings.unified;
     let spirv = emit_spirv(options.profile, runtime, &program, bindings)?;
     let resources = ResourceLayout::for_module(&program.info, first_binding);
@@ -50,6 +51,7 @@ fn finish(
     let mut hasher = StableHasher::new();
     program.hash.hash(&mut hasher);
     format!("{runtime:?}").hash(&mut hasher);
+    incoming.hash(&mut hasher);
     Ok(ShaderModule {
         spirv,
         hash: hasher.finish(),
@@ -64,8 +66,8 @@ fn finish(
 pub struct ShaderModule {
     pub spirv: Vec<u32>,
     /// Cache key of the module: equal for the same guest code, the same GPU state read while
-    /// translating, the same runtime info and the same host profile, across runs and builds of
-    /// one translator version. Never 0.
+    /// translating, the same runtime info, the same incoming [`Bindings`] and the same host
+    /// profile, across runs and builds of one translator version. Never 0.
     pub hash: u64,
     pub stage: ShaderStage,
     /// Descriptor sets and push constants the module declares.
@@ -236,6 +238,31 @@ mod tests {
         assert_ne!(first.hash, module(&other).hash);
     }
     use crate::info::{ConstantBufferDescriptor, StorageBufferDescriptor, TextureDescriptor};
+
+    #[test]
+    fn hash_follows_the_incoming_bindings() {
+        let env = TestEnv::new(&[encode(Sass::Exit, (7 << 16) | 0xf)]);
+        let profile = Profile::default();
+        let host = HostTranslateInfo::default();
+        let options = TranslateOptions {
+            profile: &profile,
+            host: &host,
+            resolution_scale: ResolutionScale::X1,
+        };
+        let hash = |mut bindings: Bindings| {
+            compile(&env, options, &RuntimeInfo::default(), &mut bindings)
+                .expect("compile")
+                .hash
+        };
+        let first = hash(Bindings::default());
+        assert_eq!(first, hash(Bindings::default()));
+        let shifted = Bindings {
+            unified: 3,
+            texture_scaling_index: 1,
+            ..Bindings::default()
+        };
+        assert_ne!(first, hash(shifted));
+    }
 
     #[test]
     fn bindings_follow_descriptor_order_and_counts() {

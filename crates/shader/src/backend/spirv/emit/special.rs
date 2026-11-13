@@ -189,7 +189,11 @@ pub(super) fn prologue(ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<(
 
 pub(super) fn epilogue(ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<()> {
     let convert_depth = ctx.runtime.convert_depth_mode && !ctx.profile.support_native_ndc;
-    if ctx.stage == ShaderStage::VertexB && convert_depth {
+    if matches!(
+        ctx.stage,
+        ShaderStage::VertexB | ShaderStage::TessellationEval
+    ) && convert_depth
+    {
         convert_depth_mode(ctx)?;
     }
     if matches!(

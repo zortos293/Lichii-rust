@@ -4,7 +4,7 @@
 use rspirv::spirv::{StorageClass, Word};
 use smallvec::SmallVec;
 
-use crate::backend::spirv::context::{CbufElement, EmitContext};
+use crate::backend::spirv::context::{CbufElement, EmitContext, is_arrayed_input_stage};
 use crate::backend::spirv::{EmitError, EmitResult};
 use crate::ir::{Attribute, InstId, Patch, Value};
 use crate::runtime::AttributeType;
@@ -29,13 +29,6 @@ fn patch_arg(ctx: &EmitContext<'_>, inst: InstId) -> EmitResult<Patch> {
         Value::Patch(patch) => Ok(patch),
         v => Err(EmitError::InvalidIr(format!("{v:?} is not a patch"))),
     }
-}
-
-fn is_arrayed_input_stage(stage: ShaderStage) -> bool {
-    matches!(
-        stage,
-        ShaderStage::TessellationControl | ShaderStage::TessellationEval | ShaderStage::Geometry
-    )
 }
 
 /// Access chain into an input, through the vertex index in the stages whose inputs are arrays.
@@ -282,38 +275,21 @@ fn get_cbuf_narrow(ctx: &mut EmitContext<'_>, inst: InstId, narrow: Narrow) -> E
     let offset = ctx.arg(inst, 1);
     let profile = ctx.profile;
     let u32_t = ctx.u32[1];
-    let (direct, ty, element, size, func, signed) = match narrow {
+    let signed = matches!(narrow, Narrow::S8 | Narrow::S16);
+    let (direct, ty, element, size, func) = match narrow {
         Narrow::U8 | Narrow::S8 => (
             profile.support_int8 && profile.support_uniform_and_storage_buffer_8bit,
-            if matches!(narrow, Narrow::U8) {
-                ctx.u8
-            } else {
-                ctx.s8
-            },
-            if matches!(narrow, Narrow::U8) {
-                CbufElement::U8
-            } else {
-                CbufElement::S8
-            },
+            ctx.u8,
+            CbufElement::U8,
             1,
             ctx.load_const_func_u8,
-            matches!(narrow, Narrow::S8),
         ),
         Narrow::U16 | Narrow::S16 => (
             profile.support_int16 && profile.support_uniform_and_storage_buffer_16bit,
-            if matches!(narrow, Narrow::U16) {
-                ctx.u16
-            } else {
-                ctx.s16
-            },
-            if matches!(narrow, Narrow::U16) {
-                CbufElement::U16
-            } else {
-                CbufElement::S16
-            },
+            ctx.u16,
+            CbufElement::U16,
             2,
             ctx.load_const_func_u16,
-            matches!(narrow, Narrow::S16),
         ),
     };
     if profile.support_descriptor_aliasing && direct {

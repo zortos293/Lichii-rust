@@ -914,3 +914,78 @@ fn random_programs_compile_to_valid_spirv_for_every_stage() {
         );
     }
 }
+
+#[test]
+fn tessellation_indexed_attributes_and_signed_narrow_constant_buffers() {
+    let profile = Profile {
+        support_int8: true,
+        support_int16: true,
+        support_uniform_and_storage_buffer_8bit: true,
+        support_uniform_and_storage_buffer_16bit: true,
+        ..Profile::default()
+    };
+    for stage in [
+        ShaderStage::TessellationControl,
+        ShaderStage::TessellationEval,
+    ] {
+        let mut s = Synthetic::new();
+        let b = s.block();
+        s.inst(b, Opcode::Prologue, &[]);
+        let word = s.inst(b, Opcode::GetCbufU32, &[Value::U32(0), Value::U32(16)]);
+        let index = s.inst(b, Opcode::GetCbufS8, &[word, Value::U32(5)]);
+        s.inst(b, Opcode::GetCbufS16, &[word, index]);
+        s.inst(b, Opcode::GetCbufS8, &[Value::U32(1), index]);
+        let value = s.inst(b, Opcode::GetAttributeIndexed, &[index, Value::U32(1)]);
+        s.inst(
+            b,
+            Opcode::SetAttribute,
+            &[
+                Value::Attribute(Attribute::POSITION_X),
+                value,
+                Value::U32(0),
+            ],
+        );
+        s.inst(b, Opcode::Epilogue, &[]);
+        let info = ShaderInfo {
+            loads: varying(&[generic0().as_slice(), &[Attribute::POSITION_X]].concat()),
+            stores: varying(&[Attribute::POSITION_X]),
+            loads_indexed_attributes: true,
+            uses_cbuf_indirect: true,
+            uses_int8: true,
+            uses_int16: true,
+            used_constant_buffer_types: Type::U32 | Type::U8 | Type::U16,
+            used_indirect_cbuf_types: Type::U32 | Type::U8 | Type::U16,
+            constant_buffer_descriptors: vec![ConstantBufferDescriptor {
+                index: 0,
+                count: 14,
+            }],
+            ..ShaderInfo::default()
+        };
+        let mut program = s.finish(vec![SyntaxNode::Block(b), SyntaxNode::Return], stage, info);
+        program.invocations = 4;
+        program.output_vertices = 4;
+        let runtime = RuntimeInfo {
+            previous_stage_stores: varying(&generic0()),
+            convert_depth_mode: true,
+            ..RuntimeInfo::default()
+        };
+        let module = emit(
+            &format!("{stage:?}_indexed_narrow"),
+            &profile,
+            &runtime,
+            &program,
+        );
+        for capability in [
+            rspirv::spirv::Capability::UniformAndStorageBuffer8BitAccess,
+            rspirv::spirv::Capability::UniformAndStorageBuffer16BitAccess,
+        ] {
+            assert!(
+                module
+                    .capabilities
+                    .iter()
+                    .any(|i| i.operands.first() == Some(&Operand::Capability(capability))),
+                "{capability:?}"
+            );
+        }
+    }
+}
