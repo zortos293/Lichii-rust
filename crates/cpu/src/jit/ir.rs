@@ -321,7 +321,10 @@ impl Op {
 
     /// Whether removing the op when nothing uses its value changes nothing.
     pub fn is_pure(&self) -> bool {
-        !matches!(self, Op::Set(..) | Op::Fence) && !self.may_exit()
+        match self {
+            Op::Simd(s) => s.is_pure(),
+            _ => !matches!(self, Op::Set(..) | Op::Fence) && !self.may_exit(),
+        }
     }
 
     /// Calls `f` on every operand.

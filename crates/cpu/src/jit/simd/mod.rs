@@ -10,6 +10,7 @@ mod x64;
 
 pub(super) use self::ir::SimdOp;
 pub(super) use self::translate::lower;
+pub(super) use self::x64::State;
 use super::JitState;
 use crate::interpreter::simd::execute;
 use crate::{CpuFault, ThreadContext};

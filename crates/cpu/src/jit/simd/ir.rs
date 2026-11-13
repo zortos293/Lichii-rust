@@ -9,8 +9,34 @@ pub enum Fp {
     D,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arith {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+/// The fused multiply-adds, as `(n, m, a)` maps to the result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fused {
+    /// `a + n * m`.
+    Madd,
+    /// `a - n * m`.
+    Msub,
+    /// `-a - n * m`.
+    Nmadd,
+    /// `n * m - a`.
+    Nmsub,
+}
+
 /// Each op that produces a vector leaves its result in the low element and zeroes the rest, as
 /// A64 scalar writes do.
+///
+/// The ops with a `word` compute on the host and check the host's result: whenever it could
+/// differ from the Arm ARM in value or FPSR flags (a NaN, a denormal, an underflow, any rounding
+/// mode but nearest, and so on), they run `word` through `CallSimd` instead and take its result
+/// from the context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SimdOp {
     /// The low element of a vector, zero-extended to 64 bits.
@@ -25,14 +51,87 @@ pub enum SimdOp {
     Neg(Fp, Value),
     /// `FCSEL`: `if c != 0 { a } else { b }`.
     Select(Fp, Value, Value, Value),
+    Arith {
+        op: Arith,
+        fp: Fp,
+        a: Value,
+        b: Value,
+        word: u32,
+    },
+    Fused {
+        op: Fused,
+        fp: Fp,
+        n: Value,
+        m: Value,
+        a: Value,
+        word: u32,
+    },
+    Sqrt {
+        fp: Fp,
+        a: Value,
+        word: u32,
+    },
+    /// `FCVT` between S and D; `fp` is the source size.
+    Convert {
+        fp: Fp,
+        a: Value,
+        word: u32,
+    },
+    /// `SCVTF`/`UCVTF` from a W (`wide` false) or X register.
+    FromInt {
+        fp: Fp,
+        signed: bool,
+        wide: bool,
+        x: Value,
+        word: u32,
+    },
+    /// `FCVTZS`/`FCVTZU` to a W (`wide` false) or X register, zero-extended.
+    ToInt {
+        fp: Fp,
+        signed: bool,
+        wide: bool,
+        a: Value,
+        word: u32,
+    },
+    /// `FCMP` or `FCMPE`: the NZCV result. `b` is `None` for the forms that compare with zero.
+    /// They differ only on NaNs, which always fall back.
+    Compare {
+        fp: Fp,
+        a: Value,
+        b: Option<Value>,
+        word: u32,
+    },
 }
 
 impl SimdOp {
     pub fn ty(&self) -> Ty {
         match self {
-            SimdOp::ToGpr(..) => Ty::U64,
+            SimdOp::ToGpr(..) | SimdOp::ToInt { .. } => Ty::U64,
+            SimdOp::Compare { .. } => Ty::Nzcv,
             _ => Ty::U128,
         }
+    }
+
+    /// The instruction the op falls back to, which also updates FPSR.
+    pub fn falls_back(&self) -> bool {
+        self.word().is_some()
+    }
+
+    pub fn word(&self) -> Option<u32> {
+        match *self {
+            SimdOp::Arith { word, .. }
+            | SimdOp::Fused { word, .. }
+            | SimdOp::Sqrt { word, .. }
+            | SimdOp::Convert { word, .. }
+            | SimdOp::FromInt { word, .. }
+            | SimdOp::ToInt { word, .. }
+            | SimdOp::Compare { word, .. } => Some(word),
+            _ => None,
+        }
+    }
+
+    pub fn is_pure(&self) -> bool {
+        !self.falls_back()
     }
 
     pub fn for_each_arg(&mut self, mut f: impl FnMut(&mut Value)) {
@@ -41,11 +140,30 @@ impl SimdOp {
             | SimdOp::FromGpr(_, a)
             | SimdOp::Move(_, a)
             | SimdOp::Abs(_, a)
-            | SimdOp::Neg(_, a) => f(a),
+            | SimdOp::Neg(_, a)
+            | SimdOp::Sqrt { a, .. }
+            | SimdOp::Convert { a, .. }
+            | SimdOp::FromInt { x: a, .. }
+            | SimdOp::ToInt { a, .. } => f(a),
+            SimdOp::Arith { a, b, .. } => {
+                f(a);
+                f(b);
+            }
+            SimdOp::Compare { a, b, .. } => {
+                f(a);
+                if let Some(b) = b {
+                    f(b);
+                }
+            }
             SimdOp::Select(_, c, a, b) => {
                 f(c);
                 f(a);
                 f(b);
+            }
+            SimdOp::Fused { n, m, a, .. } => {
+                f(n);
+                f(m);
+                f(a);
             }
         }
     }

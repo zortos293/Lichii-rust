@@ -57,6 +57,17 @@ impl Rng {
         }
     }
 
+    /// A vector register value whose low lanes are often an edge-case S or D value.
+    fn vector(&mut self) -> u128 {
+        let low = match self.below(4) {
+            0 => self.next(),
+            1 => FP_S[self.below(FP_S.len() as u64) as usize] as u64 | self.next() << 32,
+            2 => FP_D[self.below(FP_D.len() as u64) as usize],
+            _ => ((self.below(4096) as f32 - 2048.0) / 16.0).to_bits() as u64,
+        };
+        (self.next() as u128) << 64 | low as u128
+    }
+
     fn pattern(&mut self, bits: &str) -> u32 {
         let random = self.next() as u32;
         bits.bytes().enumerate().fold(0, |w, (i, c)| {
@@ -69,6 +80,47 @@ impl Rng {
         })
     }
 }
+
+/// S values where host FP and the Arm ARM part ways: zeros, infinities, quiet and signalling NaNs,
+/// denormals, the largest finite value, the smallest normal and the value just below 1.0 (whose product with it is tiny
+/// before rounding but not after), and the integer conversion limits 2^31 and 2^32.
+const FP_S: [u32; 16] = [
+    0x7f7f_ffff,
+    0,
+    0x8000_0000,
+    0x7f80_0000,
+    0xff80_0000,
+    0xffc0_0000,
+    0x7fc0_0001,
+    0x7f80_0001,
+    0x0000_0001,
+    0x807f_ffff,
+    0x0080_0000,
+    0x3f80_0000,
+    0x3f7f_ffff,
+    0x4f00_0000,
+    0x4f80_0000,
+    0xbf00_0000,
+];
+
+const FP_D: [u64; 16] = [
+    0x7fef_ffff_ffff_ffff,
+    0,
+    0x8000_0000_0000_0000,
+    0x7ff0_0000_0000_0000,
+    0xfff0_0000_0000_0000,
+    0xfff8_0000_0000_0000,
+    0x7ff8_0000_0000_0001,
+    0x7ff0_0000_0000_0001,
+    1,
+    0x800f_ffff_ffff_ffff,
+    0x0010_0000_0000_0000,
+    0x3ff0_0000_0000_0000,
+    0x3fef_ffff_ffff_ffff,
+    0x43e0_0000_0000_0000,
+    0x41f0_0000_0000_0000,
+    0xbfe0_0000_0000_0000,
+];
 
 const ALU: [&str; 17] = [
     "xxx10000xxxxxxxxxxxxxxxxxxxxxxxx",
@@ -173,8 +225,14 @@ fn atomic(rng: &mut Rng) -> u32 {
     }
 }
 
-const FP: [&str; 8] = [
+const FP: [&str; 14] = [
     "000111100x10000xx10000xxxxxxxxxx",
+    "000111100x10001xx10000xxxxxxxxxx",
+    "000111100x1xxxxx00xx10xxxxxxxxxx",
+    "000111110xxxxxxxxxxxxxxxxxxxxxxx",
+    "000111100x1xxxxx001000xxxxxxx000",
+    "x00111100x1xx0xx000000xxxxxxxxxx",
+    "000111100x1xxxxxxxx10000000xxxxx",
     "000111100x1xxxxxxxxx11xxxxxxxxxx",
     "x00111100x10011x000000xxxxxxxxxx",
     "x0x11110xx1xxxxxxxxxxxxxxxxxxxxx",
@@ -254,6 +312,8 @@ enum Backend {
     SlowJit,
     /// The JIT as on a host without `cmpxchg16b`.
     NoCmpxchg16b,
+    /// The JIT as on a host without FMA3.
+    NoFma,
 }
 
 struct Machine {
@@ -289,6 +349,11 @@ impl Machine {
                 jit.target.cmpxchg16b = false;
                 Box::new(jit)
             }
+            Backend::NoFma => {
+                let mut jit = Jit::new(config).unwrap();
+                jit.target.fma = false;
+                Box::new(jit)
+            }
         };
         Self { mem, core }
     }
@@ -319,7 +384,7 @@ fn initial(rng: &mut Rng) -> ThreadContext {
         sp: DATA + 0x4000 + 16 * rng.below(64),
         pc: CODE,
         pstate: (rng.below(16) as u32) << 28,
-        v: std::array::from_fn(|_| (rng.next() as u128) << 64 | rng.next() as u128),
+        v: std::array::from_fn(|_| rng.vector()),
         tpidr_el0: rng.next(),
         fpcr: [
             0,
@@ -331,7 +396,7 @@ fn initial(rng: &mut Rng) -> ThreadContext {
             1 << 22 | 1 << 24,
             0x07c0_0000,
         ][rng.below(8) as usize],
-        fpsr: if rng.below(4) == 0 { 0x0800_009f } else { 0 },
+        fpsr: [0, 0x10, 0x10, 0x0800_009f][rng.below(4) as usize],
         ..Default::default()
     };
     let align = if rng.below(2) == 0 { !15 } else { !0 };
@@ -443,6 +508,7 @@ fn random_streams_match_the_interpreter() {
     let mut machines = vec![("interpreter", Machine::new(Backend::Interpreter))];
     machines.push(("jit", Machine::new(Backend::Jit(Passes::ALL))));
     machines.push(("jit without fastmem", Machine::new(Backend::SlowJit)));
+    machines.push(("jit without fma", Machine::new(Backend::NoFma)));
     for (i, passes) in ABLATIONS.iter().enumerate() {
         let name = [
             "jit without passes",
@@ -561,6 +627,127 @@ fn simd_runs_mid_block_on_the_live_context() {
             ],
             &[(1, value.to_bits())],
         );
+    }
+}
+
+/// Every natively lowered FP instruction on every pair of edge-case inputs, under the FPCR
+/// settings that change results (flush to zero, default NaN and a directed rounding mode), with
+/// FPSR.IXC both clear and already set.
+#[test]
+fn fp_edge_cases_match_the_interpreter() {
+    const OPS: [u32; 17] = [
+        0x1e22_2820, // fadd s0, s1, s2
+        0x1e22_3820, // fsub s0, s1, s2
+        0x1e22_0820, // fmul s0, s1, s2
+        0x1e22_1820, // fdiv s0, s1, s2
+        0x1f02_0c20, // fmadd s0, s1, s2, s3
+        0x1f02_8c20, // fmsub s0, s1, s2, s3
+        0x1f22_0c20, // fnmadd s0, s1, s2, s3
+        0x1f22_8c20, // fnmsub s0, s1, s2, s3
+        0x1e21_c020, // fsqrt s0, s1
+        0x1e22_c020, // fcvt d0, s1
+        0x1e22_2020, // fcmp s1, s2
+        0x1e22_2030, // fcmpe s1, s2
+        0x1e20_2028, // fcmp s1, #0.0
+        0x1e38_0020, // fcvtzs w0, s1
+        0x1e39_0020, // fcvtzu w0, s1
+        0x9e38_0020, // fcvtzs x0, s1
+        0x9e39_0020, // fcvtzu x0, s1
+    ];
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+        ("jit without fma", Machine::new(Backend::NoFma)),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    let fpcrs = [0, 1 << 24, 1 << 25, 3 << 22];
+    let s_values: Vec<u64> = FP_S.iter().map(|&s| s as u64).collect();
+    for (double, values) in [(false, s_values.as_slice()), (true, FP_D.as_slice())] {
+        for op in OPS {
+            let op = match (double, op) {
+                (false, op) => op,
+                (true, 0x1e22_c020) => 0x1e62_4020,
+                (true, op) => op | 1 << 22,
+            };
+            for (i, &a) in values.iter().enumerate() {
+                for (j, &b) in values.iter().enumerate() {
+                    for (fpcr, fpsr) in fpcrs.into_iter().flat_map(|c| [(c, 0), (c, 0x10)]) {
+                        let mut ctx = ThreadContext {
+                            pc: CODE,
+                            fpcr,
+                            fpsr,
+                            ..Default::default()
+                        };
+                        ctx.v[1] = a as u128;
+                        ctx.v[2] = b as u128;
+                        ctx.v[3] = values[(i * 7 + j) % values.len()] as u128;
+                        compare(machines, &[op, BRK], &ctx, &data);
+                    }
+                }
+            }
+        }
+    }
+    let integers = [
+        0,
+        1,
+        u64::MAX,
+        1 << 63,
+        (1 << 63) - 1,
+        0xffff_ffff,
+        0x8000_0001,
+        1 << 53 | 1,
+    ];
+    for x in integers {
+        for op in [0x1e22_0020, 0x1e23_0020, 0x9e22_0020, 0x9e23_0020] {
+            for (fp, fpsr) in [(0, 0), (0, 0x10), (1 << 22, 0), (1 << 22, 0x10)] {
+                let mut ctx = ThreadContext {
+                    pc: CODE,
+                    fpsr,
+                    ..Default::default()
+                };
+                ctx.x[1] = x;
+                compare(machines, &[op | fp, BRK], &ctx, &data);
+            }
+        }
+    }
+}
+
+/// Inexact native ops rely on FPSR.IXC being set already: after an FPSR write clears it, or while
+/// a saturating conversion falls back, the next op must still report IXC exactly.
+#[test]
+fn ixc_follows_fpsr_writes() {
+    const FCVTZU_W0_D1: u32 = 0x1e79_0020;
+    const FADD_S0_S1_S2: u32 = 0x1e22_2820;
+    const FADD_S3_S4_S4: u32 = 0x1e24_2883;
+    const MSR_FPSR_XZR: u32 = 0xd51b_443f;
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    for (code, fpcr, a, b) in [
+        (
+            [FCVTZU_W0_D1, FADD_S3_S4_S4, BRK].as_slice(),
+            0,
+            0x41f0_0000_0008_0000,
+            0,
+        ),
+        (
+            &[FADD_S0_S1_S2, MSR_FPSR_XZR, FADD_S3_S4_S4, BRK],
+            0,
+            0x3f80_0000,
+            0x3080_0000,
+        ),
+    ] {
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            fpcr,
+            ..Default::default()
+        };
+        ctx.v[1] = a;
+        ctx.v[2] = b;
+        ctx.v[4] = 0x3f80_0000;
+        compare(machines, code, &ctx, &data);
     }
 }
 
