@@ -271,8 +271,10 @@ impl VulkanRasterizer {
             && index < (regs.rt_control.count() as usize).min(NUM_RENDER_TARGETS))
         .then(|| {
             let rt = &regs.rt[index];
-            ImageInfo::from_render_target(rt, msaa, self.gob_layout)
-                .map(|info| (rt.address(), info, rt.width, rt.height))
+            ImageInfo::from_render_target(rt, msaa, self.gob_layout).map(|info| {
+                let info = info.with_layers(base_layer + layer_count);
+                (rt.address(), info, rt.width, rt.height)
+            })
         })
         .flatten();
         if let Some((address, info, width, height)) = color_target {
@@ -331,7 +333,8 @@ impl VulkanRasterizer {
         }
         let depth_target = ((use_depth || use_stencil) && regs.zeta_enable != 0)
             .then(|| ImageInfo::from_zeta(&regs.zeta, &regs.zeta_size, msaa, self.gob_layout))
-            .flatten();
+            .flatten()
+            .map(|info| info.with_layers(base_layer + layer_count));
         if let Some(info) = depth_target {
             let stencil_mask = if regs.clear_control.respect_stencil_mask() != 0 {
                 regs.stencil_front_mask & 0xff

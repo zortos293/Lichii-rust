@@ -415,6 +415,61 @@ fn activity_counts_draws_submits_and_texture_uploads() {
 }
 
 #[test]
+fn draws_back_only_the_layer_they_render_of_an_array_target() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    let layer = u64::from(SIZE * SIZE * 4);
+    let mut regs = draw_regs();
+    regs.rt[0].bits = RenderTargetConfigBits(33);
+    regs.rt[0].array_pitch = (layer / 4) as u32;
+    draw(&mut f, &gmmu, &regs);
+    let removals = f.rasterizer.texture_cache.removals();
+    let next = GPU_VA + layer;
+    regs.rt[0].address_high = (next >> 32) as u32;
+    regs.rt[0].address_low = next as u32;
+    draw(&mut f, &gmmu, &regs);
+    f.rasterizer.flush_commands();
+    let traffic = f.rasterizer.texture_cache.traffic();
+    assert_eq!(traffic.uploads, 2);
+    assert_eq!(traffic.upload_bytes, 2 * layer, "one layer per target");
+    assert_eq!(
+        f.rasterizer.texture_cache.removals(),
+        removals,
+        "a target one layer up does not replace the first"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn draws_sample_layer_zero_of_two_dimensional_textures_with_a_base_layer() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(&f, PROGRAMS + u64::from(FRAGMENT), &sampling_program());
+    uniform_texture(&f, 0, TEXTURE, [10, 200, 30, 255]);
+    let mut header = tic(GPU_VA + TEXTURE, SIZE, SIZE);
+    header[2] |= 4 << 16;
+    write(&f, TIC, bytemuck::cast_slice(&header));
+    draw(&mut f, &gmmu, &sampling_regs());
+    assert!(
+        target(&mut f).iter().all(|&t| t == [10, 200, 30, 255]),
+        "a 2D header's base layer (32 here) selects nothing"
+    );
+    assert_eq!(
+        f.rasterizer.texture_cache.traffic().upload_bytes,
+        2 * u64::from(SIZE * SIZE * 4),
+        "the texture is backed with one layer"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
 fn guest_barriers_record_between_draws() {
     let Some((mut f, gmmu)) = draw_fixture() else {
         return;

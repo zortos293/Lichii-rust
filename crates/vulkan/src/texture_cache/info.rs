@@ -91,23 +91,14 @@ impl ImageInfo {
             TextureMemory::Pitch { pitch } => GuestLayout::Pitch { pitch },
             TextureMemory::Buffer => return None,
         };
-        let arrayed = desc.depth > 1 || desc.base_layer != 0;
         let base = desc.base_layer;
         let (kind, height, depth, layers, mut rescaleable) = match desc.texture_type {
-            TextureType::D1 if !arrayed => (ImageKind::D1, 1, 1, 1, false),
-            TextureType::D1 | TextureType::D1Array => {
-                (ImageKind::D1, 1, 1, base + desc.depth, false)
-            }
-            TextureType::D2 | TextureType::D2NoMipmap if !arrayed => {
-                (ImageKind::D2, desc.height, 1, 1, true)
-            }
-            TextureType::D2 | TextureType::D2NoMipmap | TextureType::D2Array => {
-                (ImageKind::D2, desc.height, 1, base + desc.depth, true)
-            }
-            TextureType::Cube if !arrayed => (ImageKind::D2, desc.height, 1, 6, false),
-            TextureType::Cube | TextureType::CubeArray => {
-                (ImageKind::D2, desc.height, 1, base + desc.depth * 6, false)
-            }
+            TextureType::D1 => (ImageKind::D1, 1, 1, 1, false),
+            TextureType::D1Array => (ImageKind::D1, 1, 1, base + desc.depth, false),
+            TextureType::D2 | TextureType::D2NoMipmap => (ImageKind::D2, desc.height, 1, 1, true),
+            TextureType::D2Array => (ImageKind::D2, desc.height, 1, base + desc.depth, true),
+            TextureType::Cube => (ImageKind::D2, desc.height, 1, 6, false),
+            TextureType::CubeArray => (ImageKind::D2, desc.height, 1, base + desc.depth * 6, false),
             TextureType::D3 => (ImageKind::D3, desc.height, desc.depth, 1, false),
             TextureType::D1Buffer => return None,
         };
@@ -261,6 +252,19 @@ impl ImageInfo {
 
     /// Fills `layer_stride`: the guest's own array pitch when it gives one for an array, the
     /// hardware's rule otherwise.
+    /// The first `layers` layers of the image, at most all of them. Draws and clears look up
+    /// only the layers they touch, so a render target's array size alone does not size the
+    /// host image: Mario Tennis Fever's targets each claim 33 layers while sitting one layer
+    /// apart.
+    pub fn with_layers(self, layers: u32) -> Self {
+        let stride = self.layer_stride;
+        Self {
+            layers: layers.clamp(1, self.layers),
+            ..self
+        }
+        .with_stride(stride)
+    }
+
     fn with_stride(mut self, explicit: u64) -> Self {
         self.layer_stride = match self.layout {
             GuestLayout::BlockLinear { .. } if self.layers > 1 && explicit != 0 => explicit,
@@ -446,10 +450,9 @@ impl ViewInfo {
         };
         let base_level = desc.min_level.min(info.levels - 1);
         let last_level = desc.max_level.clamp(base_level, info.levels - 1);
-        let base_layer = if info.kind == ImageKind::D3 {
-            0
-        } else {
-            desc.base_layer
+        let base_layer = match desc.texture_type {
+            TextureType::D1Array | TextureType::D2Array | TextureType::CubeArray => desc.base_layer,
+            _ => 0,
         };
         Self {
             format: desc.format,
