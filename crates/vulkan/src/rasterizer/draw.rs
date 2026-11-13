@@ -562,9 +562,17 @@ impl VulkanRasterizer {
                 .unwrap_or(vk::PrimitiveTopology::TRIANGLE_LIST),
         };
         if !self.graphics_stages(ctx, host_topology) {
+            diag("DIAG skip: graphics_stages".into());
             return Ok(());
         }
         if !self.render_targets(ctx)? {
+            let hashes: Vec<_> = self
+                .draw
+                .stages
+                .iter()
+                .map(|m| m.as_ref().map(|m| m.hash))
+                .collect();
+            diag(format!("DIAG skip: render_targets {hashes:x?}"));
             return Ok(());
         }
 
@@ -584,6 +592,12 @@ impl VulkanRasterizer {
         );
         let key = GraphicsPipelineKey::new(&draw.stages, attachments, &fixed);
         let Some(pipeline) = draw.pipelines.graphics(&key, &draw.stages) else {
+            let hashes: Vec<_> = draw
+                .stages
+                .iter()
+                .map(|m| m.as_ref().map(|m| m.hash))
+                .collect();
+            diag(format!("DIAG skip: no pipeline {hashes:x?}"));
             return Ok(());
         };
         let pipeline_raw = pipeline.raw();
@@ -1180,10 +1194,63 @@ impl VulkanRasterizer {
                             }
                             let (view, layout) = match texture {
                                 Some((id, view)) => {
+                                    let h = src.pool.header(src.gmmu, raw);
+                                    let image =
+                                        self.texture_cache.state(id).map(|s| (s.format, s.extent));
+                                    let (_, si) = src.pool.split(raw);
+                                    let words = if si <= src.sampler_limit {
+                                        src.gmmu
+                                            .read::<[u32; 8]>(src.samplers + u64::from(si) * 32)
+                                            .unwrap_or_default()
+                                    } else {
+                                        [0; 8]
+                                    };
+                                    let cmp = crate::pipeline::sampler::Tsc(words).depth_compare();
+                                    diag(format!(
+                                        "DIAG tex hfmt={:?} type={:?} want={:?} depth_desc={} depth_tex={} cmp={:?} image={:?} srgb={} swz={:?}",
+                                        h.format,
+                                        h.texture_type,
+                                        desc.ty,
+                                        desc.is_depth,
+                                        h.depth_texture,
+                                        cmp,
+                                        image.map(|i| i.0),
+                                        h.srgb,
+                                        h.swizzle
+                                    ));
+                                    if desc.is_depth || cmp.is_some() {
+                                        diag(format!(
+                                            "DIAG depthtex stage={:#x} addr={:#x} hfmt={:?} {}x{} image={:?} cmp={:?} depth_desc={}",
+                                            module.hash,
+                                            h.address,
+                                            h.format,
+                                            h.width,
+                                            h.height,
+                                            image,
+                                            cmp,
+                                            desc.is_depth
+                                        ));
+                                    }
                                     self.draw.textures.push(id);
                                     (view, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                                 }
                                 None => {
+                                    let h = src.pool.header(src.gmmu, raw);
+                                    diag(format!(
+                                        "DIAG null texture stage={:#x} addr={:#x} fmt={:?} {}x{}x{} type={:?} want={:?} depth_desc={} ptr_word={} readable={readable} levels={} mem={:?}",
+                                        module.hash,
+                                        h.address,
+                                        h.format,
+                                        h.width,
+                                        h.height,
+                                        h.depth,
+                                        h.texture_type,
+                                        desc.ty,
+                                        desc.is_depth,
+                                        desc.handle_is_pointer_word,
+                                        h.levels,
+                                        h.memory
+                                    ));
                                     let format = match (desc.is_depth, desc.is_integer) {
                                         (true, _) => vk::Format::D16_UNORM,
                                         (false, true) => vk::Format::R8G8B8A8_UINT,
@@ -2426,3 +2493,11 @@ mod texture;
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) fn diag(line: String) {
+    static SEEN: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(Default::default);
+    if SEEN.lock().insert(line.clone()) {
+        tracing::info!(target: "diag", "{line}");
+    }
+}
