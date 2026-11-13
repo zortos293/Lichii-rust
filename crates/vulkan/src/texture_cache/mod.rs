@@ -454,6 +454,21 @@ pub struct TextureCache {
     stats: CollectorStats,
 }
 
+/// A depth or stencil view returns its value in R and leaves G undefined, while guest
+/// swizzles of depth formats (S8D24 among them) read the depth from G.
+fn sampled_swizzle(
+    swizzle: [SwizzleSource; 4],
+    aspect: vk::ImageAspectFlags,
+) -> [SwizzleSource; 4] {
+    if !aspect.intersects(vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL) {
+        return swizzle;
+    }
+    swizzle.map(|s| match s {
+        SwizzleSource::G => SwizzleSource::R,
+        s => s,
+    })
+}
+
 fn components(swizzle: [SwizzleSource; 4], host: vk::ComponentMapping) -> vk::ComponentMapping {
     use vk::ComponentSwizzle as C;
     let resolve = |c: C, own: C| if c == C::IDENTITY { own } else { c };
@@ -800,7 +815,10 @@ impl TextureCache {
         } else {
             host
         };
-        let mapping = components(view.swizzle, host.swizzle);
+        let mapping = components(
+            sampled_swizzle(view.swizzle, aspect_of(image.host.format)),
+            host.swizzle,
+        );
         let aspect = match aspect_of(image.host.format) {
             a if a.contains(vk::ImageAspectFlags::DEPTH) => vk::ImageAspectFlags::DEPTH,
             a => a,
