@@ -9,7 +9,9 @@
 //!
 //! A GPFIFO entry with its SYNC bit is fetched after the work before it completed, so a command
 //! list that compute or copy work wrote is read with those writes: the channel suspends until
-//! the back synchronized the entry's words, without the front waiting for it.
+//! the back synchronized the entry's words, without the front waiting for it. On Switch 2 an entry
+//! on a page GPU work may have written is fetched the same way: titles fetch command lists their
+//! own compute writes each frame.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -17,11 +19,12 @@ use std::sync::Arc;
 use lichii_common::GpuVAddr;
 
 use crate::back::{BackChannelSetup, SideCommand};
-use crate::backend::{ChannelId, ReleaseSize};
+use crate::backend::{ChannelId, GpuWrittenPages, ReleaseSize};
 use crate::channel::{ChannelConfig, SemaphoreWaiters, SyncpointFence, SyncpointIncrement};
 use crate::engines::EngineKind;
+use crate::engines::kepler_compute::Regs as ComputeRegs;
 use crate::engines::maxwell_3d::{MACRO_REGISTERS_START, RegisterState, Regs};
-use crate::gmmu::Gmmu;
+use crate::gmmu::{Gmmu, RangeTarget};
 use crate::gpu::Inbox;
 use crate::host::{AcquireOp, FIRST_ENGINE_METHOD, HostAction, HostClass, HostState, ReleaseKind};
 use crate::host1x::Syncpoints;
@@ -41,6 +44,7 @@ const DEFAULT_SUBCHANNELS: [(usize, EngineKind, u32); 1] =
 const CONST_BUFFER_DATA: u32 = reg_index!(Regs, const_buffer.buffer);
 const CONST_BUFFER_OFFSET: usize = reg_index!(Regs, const_buffer.offset) as usize;
 const FALCON_4: u32 = reg_index!(Regs, falcon) + 4;
+const COMPUTE_DATA_UPLOAD: u32 = reg_index!(ComputeRegs, data_upload);
 const SHADOW_SCRATCH_0: usize = reg_index!(Regs, shadow_scratch) as usize;
 
 /// What the front's channels share.
@@ -54,6 +58,9 @@ pub(crate) struct FrontShared {
     pub waiters: Arc<SemaphoreWaiters>,
     pub inbox: Arc<Inbox>,
     pub syncpoints: Arc<Syncpoints>,
+    /// Switch 2: the device pages GPU work may have written. An entry on one is fetched after the
+    /// back synchronised its words.
+    pub written_pages: Option<Arc<GpuWrittenPages>>,
 }
 
 /// A channel's queued work.
@@ -77,7 +84,8 @@ pub(crate) enum Wait {
         wide: bool,
     },
     Syncpoint(SyncpointFence),
-    /// The fetch of the entry at the queue's front, which has its SYNC bit, until
+    /// The fetch of the entry at the queue's front, which has its SYNC bit or lies on GPU-written
+    /// pages, until
     /// [`Stream::fetch_synced`] holds for this ticket.
     Fetch(u64),
 }
@@ -92,7 +100,7 @@ pub(crate) struct FrontChannel {
     /// Words of the entry at the queue's front already processed.
     offset: u32,
     wait: Option<Wait>,
-    /// The entry at the queue's front waited for its SYNC fetch.
+    /// The entry at the queue's front waited for its fetch synchronisation.
     fetch_synced: bool,
 }
 
@@ -109,6 +117,8 @@ struct ChannelState {
     macros: Option<MacroEngine>,
     /// Parameters of the macro call being received, for the 3D and the compute engine.
     calls: [MacroCall; 2],
+    /// Switch 1: GPU address the back takes the next compute DATA_UPLOAD word to come from.
+    upload_next: Option<GpuVAddr>,
 }
 
 /// Parameters one macro call can have: the words of one command (a 13-bit count).
@@ -169,6 +179,7 @@ impl FrontChannel {
                 data_ram: MacroDataRam::new(),
                 macros: None,
                 calls: [MacroCall::new(), MacroCall::new()],
+                upload_next: None,
             },
             queue: VecDeque::new(),
             offset: 0,
@@ -284,7 +295,10 @@ impl FrontChannel {
             self.offset = 0;
             return;
         }
-        if start == 0 && entry.sync() && !self.fetch_synced {
+        if start == 0
+            && !self.fetch_synced
+            && (entry.sync() || self.on_written_pages(entry, shared))
+        {
             let ticket = shared
                 .stream
                 .synchronize_fetch(entry.address(), u64::from(length) * 4);
@@ -301,7 +315,7 @@ impl FrontChannel {
             .memory
             .read_block(address, bytemuck::cast_slice_mut(&mut words))
         {
-            Ok(()) => self.dispatch_words(&words, shared),
+            Ok(()) => self.dispatch_words(&words, address, shared),
             Err(fault) => {
                 tracing::warn!(?fault, ?entry, "GPFIFO entry in unmapped GPU memory");
                 words.len()
@@ -317,13 +331,35 @@ impl FrontChannel {
         }
     }
 
-    fn dispatch_words(&mut self, words: &[u32], shared: &mut FrontShared) -> usize {
+    /// Switch 2: whether GPU work may have written the entry's words.
+    fn on_written_pages(&self, entry: GpEntry, shared: &FrontShared) -> bool {
+        let Some(pages) = &shared.written_pages else {
+            return false;
+        };
+        let mut written = false;
+        self.memory
+            .for_each_range(entry.address(), u64::from(entry.words()) * 4, |range| {
+                if let RangeTarget::Device(device) = range.target {
+                    written |= pages.may_be_written(device, range.size);
+                }
+            });
+        written
+    }
+
+    /// Parses `words`, read from GPU address `address`.
+    fn dispatch_words(
+        &mut self,
+        words: &[u32],
+        address: GpuVAddr,
+        shared: &mut FrontShared,
+    ) -> usize {
         let mut dispatch = Dispatch {
             id: self.id,
             memory: &self.memory,
             state: &mut self.state,
             shared,
             wait: &mut self.wait,
+            words_address: address,
         };
         self.parser.process(words, &mut dispatch)
     }
@@ -335,6 +371,7 @@ impl FrontChannel {
             state: &mut self.state,
             shared,
             wait: &mut self.wait,
+            words_address: 0,
         }
     }
 }
@@ -367,6 +404,8 @@ struct Dispatch<'a> {
     state: &'a mut ChannelState,
     shared: &'a mut FrontShared,
     wait: &'a mut Option<Wait>,
+    /// GPU address of the first word being parsed.
+    words_address: GpuVAddr,
 }
 
 impl MethodHandler for Dispatch<'_> {
@@ -547,6 +586,13 @@ impl Dispatch<'_> {
                 .get_or_insert_with(|| MacroEngine::new(MacroIsa::Mme64))
                 .write_load_mme(method, call.argument);
             return;
+        }
+        if !native && method == COMPUTE_DATA_UPLOAD {
+            let address = self.words_address + u64::from(call.position) * 4;
+            if self.state.upload_next != Some(address) {
+                self.shared.stream.upload_source(address);
+            }
+            self.state.upload_next = Some(address + 4);
         }
         send_compute(
             &mut self.state.compute,
@@ -740,6 +786,7 @@ mod tests {
             waiters: Arc::default(),
             inbox,
             syncpoints,
+            written_pages: None,
         };
         let config = ChannelConfig::new(
             Arc::new(Gmmu::new(device, BigPageSize::Size64K)),
@@ -754,7 +801,7 @@ mod tests {
         ];
         words.extend(0..count);
         let storage = channel.state.calls[0].parameters.as_ptr();
-        assert_eq!(channel.dispatch_words(&words, &mut shared), words.len());
+        assert_eq!(channel.dispatch_words(&words, 0, &mut shared), words.len());
         let parameters = &channel.state.calls[0].parameters;
         assert!(parameters.is_empty());
         assert_eq!(parameters.as_ptr(), storage);

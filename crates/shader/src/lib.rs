@@ -142,6 +142,27 @@ pub trait ShaderEnvironment {
     fn is_proprietary_driver(&self) -> bool {
         false
     }
+    /// Task and mesh programs: the mesh state they are drawn with. Without it (the default)
+    /// they fail to translate with [`TranslateError::MissingMeshState`].
+    fn mesh_state(&self) -> Option<MeshState> {
+        None
+    }
+}
+
+/// The draw state a task or mesh program is translated against.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct MeshState {
+    /// SET_MESH_SHADER_A: output topology in bits 3:0 (0 points, 1 lines, 4 triangles), maximum
+    /// vertices in 12:4, maximum primitives in 22:13.
+    pub shader_a: u32,
+    /// SET_MESH_SHADER_B: mesh workgroup threads in bits 25:20.
+    pub shader_b: u32,
+    /// SET_MESH_INIT_SHADER: task workgroup threads in bits 5:0, local buffer lines in 20:12,
+    /// lines passed to the mesh stage in 30:22 (a line is 128 bytes).
+    pub init_shader: u32,
+    /// Mesh programs: the header of the pass-through geometry program bound with them, whose
+    /// output map lists the per-primitive outputs.
+    pub primitive_header: maxwell::header::ProgramHeader,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -171,4 +192,8 @@ pub enum TranslateError {
     TooManyStorageBuffers { count: usize, limit: usize },
     #[error(transparent)]
     Texture(#[from] opt::TextureError),
+    #[error("{stage:?} program translated without mesh state")]
+    MissingMeshState { stage: ShaderStage },
+    #[error("unsupported mesh program: {0}")]
+    UnsupportedMesh(&'static str),
 }

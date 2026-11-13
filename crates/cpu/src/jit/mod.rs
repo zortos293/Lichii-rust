@@ -8,6 +8,7 @@
 mod cache;
 mod ir;
 mod passes;
+mod simd;
 #[cfg(test)]
 mod tests;
 mod translate;
@@ -15,6 +16,7 @@ mod x64;
 
 use std::sync::atomic::AtomicBool;
 
+use lichii_common::settings::CpuAccuracy;
 use lichii_common::{PAGE_MASK, VAddr};
 use lichii_memory::{AddressSpace, ExclusiveMonitor, ReservationSlot};
 
@@ -248,8 +250,11 @@ pub struct Jit {
 unsafe impl Send for Jit {}
 
 impl Jit {
-    /// `None` when executable memory cannot be mapped.
+    /// `None` when the host cannot map JIT code, or under `CpuAccuracy::Paranoid`.
     pub fn new(config: CpuConfig) -> Option<Self> {
+        if config.accuracy == CpuAccuracy::Paranoid {
+            return None;
+        }
         Self::with_passes(config, Passes::ALL)
     }
 
@@ -292,6 +297,7 @@ impl Jit {
                 exclusive: exclusive_slow as *const () as usize,
                 zero: zero_slow as *const () as usize,
                 ticks: ticks as *const () as usize,
+                simd: simd::call as *const () as usize,
                 tsc_scale: config.clock.host_tsc_scale().map(std::ptr::from_ref),
                 cmpxchg16b: std::arch::is_x86_feature_detected!("cmpxchg16b"),
             },

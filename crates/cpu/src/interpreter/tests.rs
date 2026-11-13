@@ -1,9 +1,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use lichii_common::settings::CpuAccuracy;
 use lichii_memory::{AddressSpace, ExclusiveMonitor, MemoryPermission, PhysicalMemory};
 
 use super::Interpreter;
+
 use crate::{CpuConfig, CpuCore, CpuFault, GuestClock, HaltReason, ThreadContext};
 
 const CODE: u64 = 0x10000;
@@ -40,6 +42,7 @@ fn harness(code: &[u32]) -> Harness {
         core_index: 0,
         ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
         dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+        accuracy: CpuAccuracy::Auto,
     });
     let ctx = ThreadContext {
         pc: CODE,

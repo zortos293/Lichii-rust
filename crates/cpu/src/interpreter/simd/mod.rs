@@ -33,7 +33,7 @@ type Exec = Result<(), Undefined>;
 ///
 /// Returns `None` when the instruction belongs to another group, `Some(Ok(()))` when it
 /// executed (the caller advances `pc`), and `Some(Err(_))` for an undefined encoding.
-pub(super) fn execute(ctx: &mut ThreadContext, instruction: u32) -> Option<Result<(), HaltReason>> {
+pub(crate) fn execute(ctx: &mut ThreadContext, instruction: u32) -> Option<Result<(), HaltReason>> {
     if bits(instruction, 27, 25) != 0b111 {
         return None;
     }

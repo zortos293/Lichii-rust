@@ -219,6 +219,7 @@ pub(crate) fn register(context: &Arc<ServiceContext>) -> HleResult<()> {
         &context.settings.system.username,
         &crate::fs::nand_dir(&context.settings),
     );
+    let _ = context.user.set(profile.uid);
     let profile = Arc::new(Mutex::new(profile));
     let services = [
         ("acc:u0", Interface::Application),

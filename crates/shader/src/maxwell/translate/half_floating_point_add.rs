@@ -6,7 +6,7 @@ use crate::ir::{Emitter, FmzMode, FpControl, FpRounding, Reg, Type, Value};
 
 /// How a 32-bit operand splits into the two lanes of a packed-half instruction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Swizzle {
+pub(crate) enum Swizzle {
     H1H0,
     /// The whole register is one F32, used by both lanes.
     F32,
@@ -15,7 +15,7 @@ pub(super) enum Swizzle {
 }
 
 impl Swizzle {
-    pub(super) const fn from_bits(bits: u64) -> Swizzle {
+    pub(crate) const fn from_bits(bits: u64) -> Swizzle {
         match bits & 3 {
             0 => Swizzle::H1H0,
             1 => Swizzle::F32,
@@ -47,7 +47,7 @@ impl Merge {
 
 /// The 2-bit precision field of HMUL2 and HFMA2: the denormal mode, and whether FMZ (D3D9
 /// `x * 0 == 0`) has to be emulated.
-pub(super) const fn half_precision(bits: u64) -> (FmzMode, bool) {
+pub(crate) const fn half_precision(bits: u64) -> (FmzMode, bool) {
     match bits & 3 {
         0 => (FmzMode::None, false),
         1 => (FmzMode::Ftz, false),
@@ -57,7 +57,7 @@ pub(super) const fn half_precision(bits: u64) -> (FmzMode, bool) {
 }
 
 /// The lanes of `value`: two F16 values, or one F32 value twice.
-pub(super) fn extract(ir: &mut Emitter<'_>, value: Value, swizzle: Swizzle) -> (Value, Value) {
+pub(crate) fn extract(ir: &mut Emitter<'_>, value: Value, swizzle: Swizzle) -> (Value, Value) {
     match swizzle {
         Swizzle::H1H0 => {
             let vector = ir.unpack_float_2x16(value);
@@ -83,7 +83,7 @@ pub(super) fn is_f16(ir: &Emitter<'_>, v: Value) -> bool {
 }
 
 /// Widens an F16 lane pair to F32; F32 pairs pass through.
-pub(super) fn promote(ir: &mut Emitter<'_>, (lhs, rhs): (Value, Value)) -> (Value, Value) {
+pub(crate) fn promote(ir: &mut Emitter<'_>, (lhs, rhs): (Value, Value)) -> (Value, Value) {
     if !is_f16(ir, lhs) {
         return (lhs, rhs);
     }
@@ -92,7 +92,7 @@ pub(super) fn promote(ir: &mut Emitter<'_>, (lhs, rhs): (Value, Value)) -> (Valu
     (lhs, rhs)
 }
 
-pub(super) fn abs_neg_pair(
+pub(crate) fn abs_neg_pair(
     ir: &mut Emitter<'_>,
     (lhs, rhs): (Value, Value),
     abs: bool,
@@ -104,7 +104,7 @@ pub(super) fn abs_neg_pair(
 /// A zero of the same float type as `like`, for the FMZ emulation.
 ///
 /// The C++ always compares against an F32 zero, which fails on unpromoted F16 lanes.
-pub(super) fn zero_like(ir: &mut Emitter<'_>, like: Value) -> Value {
+pub(crate) fn zero_like(ir: &mut Emitter<'_>, like: Value) -> Value {
     if is_f16(ir, like) {
         ir.fp_convert(16, Value::F32(0.0), FpControl::default())
     } else {
@@ -113,7 +113,7 @@ pub(super) fn zero_like(ir: &mut Emitter<'_>, like: Value) -> Value {
 }
 
 /// Narrows promoted F32 lane results back to F16.
-pub(super) fn demote(ir: &mut Emitter<'_>, (lhs, rhs): (Value, Value)) -> (Value, Value) {
+pub(crate) fn demote(ir: &mut Emitter<'_>, (lhs, rhs): (Value, Value)) -> (Value, Value) {
     let lhs = ir.fp_convert(16, lhs, FpControl::default());
     let rhs = ir.fp_convert(16, rhs, FpControl::default());
     (lhs, rhs)

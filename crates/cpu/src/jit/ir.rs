@@ -5,6 +5,7 @@
 //! one [`Terminal`]. Values only refer to earlier ops. Passes replace the ops they remove with
 //! [`Op::Nop`] instead of renumbering.
 
+use super::simd::SimdOp;
 use crate::decoder::AtomicOp;
 
 /// The result of the op at this index in [`Block::ops`].
@@ -265,6 +266,15 @@ pub enum Op {
     Ticks,
     /// `DMB`/`DSB`.
     Fence,
+    /// One instruction of the SIMD/FP data-processing group, run by the interpreter's
+    /// `simd::execute` on the live `ThreadContext`. It may read and write any guest state, and
+    /// faults with `CpuFault::Undefined` on an unallocated encoding.
+    CallSimd {
+        word: u32,
+        pc: u64,
+    },
+    /// A SIMD/FP operation the JIT lowers natively, defined by `jit::simd`.
+    Simd(SimdOp),
 }
 
 impl Op {
@@ -275,7 +285,8 @@ impl Op {
             | Op::Store { .. }
             | Op::StoreVec { .. }
             | Op::ZeroBlock { .. }
-            | Op::Fence => Ty::Void,
+            | Op::Fence
+            | Op::CallSimd { .. } => Ty::Void,
             Op::Get(loc) => loc.ty(),
             Op::LoadVec { .. } => Ty::U128,
             Op::AddFlags(..)
@@ -284,6 +295,7 @@ impl Op {
             | Op::SbcFlags(..)
             | Op::LogicFlags(..) => Ty::Nzcv,
             Op::TestCond(..) | Op::Compare(..) | Op::IsZero(..) | Op::TestBit(..) => Ty::U1,
+            Op::Simd(s) => s.ty(),
             _ => Ty::U64,
         }
     }
@@ -303,6 +315,7 @@ impl Op {
                 | Op::StoreExclusive128 { .. }
                 | Op::Cas128 { .. }
                 | Op::ZeroBlock { .. }
+                | Op::CallSimd { .. }
         )
     }
 
@@ -314,7 +327,14 @@ impl Op {
     /// Calls `f` on every operand.
     pub fn for_each_arg(&mut self, mut f: impl FnMut(&mut Value)) {
         match self {
-            Op::Nop | Op::Const(_) | Op::Get(_) | Op::Ticks | Op::Fence | Op::High => {}
+            Op::Nop
+            | Op::Const(_)
+            | Op::Get(_)
+            | Op::Ticks
+            | Op::Fence
+            | Op::High
+            | Op::CallSimd { .. } => {}
+            Op::Simd(s) => s.for_each_arg(&mut f),
             Op::StoreExclusive128 {
                 addr, low, high, ..
             } => {

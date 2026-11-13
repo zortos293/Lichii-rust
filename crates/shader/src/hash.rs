@@ -8,7 +8,7 @@ use lichii_common::GpuVAddr;
 
 use crate::info::{ReplaceConstant, TexturePixelFormat};
 use crate::ir::TextureType;
-use crate::{ShaderArch, ShaderEnvironment, ShaderStage};
+use crate::{MeshState, ShaderArch, ShaderEnvironment, ShaderStage};
 
 /// FNV-1a over the written bytes with a final avalanche step.
 #[derive(Clone, Copy)]
@@ -144,5 +144,8 @@ impl ShaderEnvironment for Recorder<'_> {
     }
     fn is_proprietary_driver(&self) -> bool {
         self.record(19, self.env.is_proprietary_driver())
+    }
+    fn mesh_state(&self) -> Option<MeshState> {
+        self.record(20, self.env.mesh_state())
     }
 }

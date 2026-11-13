@@ -75,6 +75,10 @@ enum Event {
         topology: PrimitiveTopology,
         count: u32,
     },
+    Dispatch {
+        grid: [u32; 3],
+        indirect_grid: Option<u64>,
+    },
 }
 
 /// Engines a rig binds: recording ones that log every method, or the real ones.
@@ -198,7 +202,12 @@ impl Rasterizer for Recorder {
     }
     fn draw_indirect(&mut self, _ctx: &mut GraphicsContext<'_>, _draw: &IndirectDraw) {}
     fn clear(&mut self, _ctx: &mut GraphicsContext<'_>, _layer_count: u32) {}
-    fn dispatch_compute(&mut self, _ctx: &ComputeContext<'_>) {}
+    fn dispatch_compute(&mut self, ctx: &ComputeContext<'_>) {
+        self.log.lock().push(Event::Dispatch {
+            grid: ctx.grid,
+            indirect_grid: ctx.indirect_grid,
+        });
+    }
     fn inline_written(&mut self, _channel: ChannelId, _memory: &Gmmu, address: u64, size: u64) {
         self.log.lock().push(Event::InlineWritten(address, size));
     }
@@ -1496,6 +1505,86 @@ fn present_restarts_the_switch_2_timestamp_frame_in_order() {
     });
 }
 
+/// A Switch 1 compute dispatch whose 7x3x5 grid an inline upload in the same entry writes into
+/// its descriptor; the upload's data words are marked GPU-written when `written`. Returns the
+/// dispatch events and the GPU address of the data words.
+fn dispatch_with_uploaded_grid(threading: Threading, written: bool) -> (Vec<Event>, u64) {
+    use crate::engines::kepler_compute::Regs as ComputeRegs;
+    const QMD: u64 = 0x30_0000;
+    let mut rig = Rig::build_for(
+        Console::Switch1,
+        threading,
+        crate::gpu::DEFAULT_RING_SLOTS,
+        Completion::Immediate,
+        Engines::Real,
+    );
+    let channel = rig.channel(HostClass::Maxwell);
+    let mut qmd = [0u32; 64];
+    qmd[18] = 64 << 16;
+    qmd[19] = 4 | 2 << 16;
+    rig.memory
+        .write_block(QMD, bytemuck::bytes_of(&qmd))
+        .unwrap();
+    let grid = QMD + 0x30;
+    let head = Pushbuffer::default()
+        .bind(1, 0xb1c0)
+        .inc(
+            1,
+            reg_index!(ComputeRegs, launch_desc_loc),
+            &[(QMD >> 8) as u32],
+        )
+        .inc(
+            1,
+            reg_index!(ComputeRegs, upload),
+            &[8, 1, (grid >> 32) as u32, grid as u32],
+        )
+        .inc(1, reg_index!(ComputeRegs, exec_upload), &[1]);
+    let data = (head.0.len() as u64 + 1) * 4;
+    let words = head
+        .non_inc(1, reg_index!(ComputeRegs, data_upload), &[7, 3 | 5 << 16])
+        .inc(1, reg_index!(ComputeRegs, launch), &[0])
+        .0;
+    let entry = rig.entry(&words);
+    if written {
+        rig.gpu
+            .handles()
+            .written_pages
+            .mark(DEVICE_BASE + entry.address() + data, 8);
+    }
+    rig.gpu.submit(channel, Submission::new(&[entry]));
+    rig.gpu.synchronize();
+    let dispatches = rig
+        .events()
+        .into_iter()
+        .filter(|e| matches!(e, Event::Dispatch { .. }))
+        .collect();
+    (dispatches, entry.address() + data)
+}
+
+#[test]
+fn switch_1_dispatches_a_grid_uploaded_from_gpu_written_commands_indirectly() {
+    each_mode(|threading| {
+        let (events, data) = dispatch_with_uploaded_grid(threading, true);
+        assert_eq!(
+            events,
+            [Event::Dispatch {
+                grid: [7, 3, 5],
+                indirect_grid: Some(data),
+            }],
+            "{threading:?}"
+        );
+        let (events, _) = dispatch_with_uploaded_grid(threading, false);
+        assert_eq!(
+            events,
+            [Event::Dispatch {
+                grid: [7, 3, 5],
+                indirect_grid: None,
+            }],
+            "{threading:?}"
+        );
+    });
+}
+
 /// Sets the entry's SYNC bit.
 fn sync(entry: GpEntry) -> GpEntry {
     GpEntry(entry.0 | 1 << 63)
@@ -1571,6 +1660,60 @@ fn entries_without_sync_are_fetched_without_waiting() {
         assert_eq!(rig.read(list.address() + 4), 0xdead);
         rig.complete();
         assert_eq!(rig.read(list.address() + 4), 0x1234);
+    });
+}
+
+fn gpu_written_list(console: Console, threading: Threading) -> (Rig, ChannelId, GpEntry) {
+    let mut rig = Rig::build_for(
+        console,
+        threading,
+        crate::gpu::DEFAULT_RING_SLOTS,
+        Completion::Deferred,
+        Engines::Recording,
+    );
+    let channel = rig.channel(HostClass::Ampere);
+    let (writer, list) = list_written_by_a_release(&mut rig);
+    rig.gpu
+        .handles()
+        .written_pages
+        .mark(DEVICE_BASE + list.address() + 4, 4);
+    rig.gpu.submit(channel, Submission::new(&[writer, list]));
+    (rig, channel, list)
+}
+
+#[test]
+fn switch_2_fetches_an_entry_on_gpu_written_pages_after_the_work_before_it() {
+    each_mode(|threading| {
+        let (rig, channel, list) = gpu_written_list(Console::Switch2, threading);
+        let events = rig.events();
+        let read = events
+            .iter()
+            .position(|e| {
+                *e == Event::Method {
+                    channel: channel.0,
+                    engine: EngineKind::Maxwell3d,
+                    method: 0x701,
+                    argument: 0x1234,
+                }
+            })
+            .unwrap_or_else(|| panic!("{threading:?}: the list is read with the released word"));
+        let flush = events
+            .iter()
+            .position(|e| *e == Event::FlushRegion(DEVICE_BASE + list.address(), 8))
+            .unwrap_or_else(|| panic!("{threading:?}: the list's words are flushed"));
+        assert!(flush < read, "{threading:?}");
+    });
+}
+
+#[test]
+fn switch_1_ignores_gpu_written_pages() {
+    each_mode(|threading| {
+        let (rig, channel, _) = gpu_written_list(Console::Switch1, threading);
+        assert_eq!(
+            rig.methods(),
+            [(channel.0, EngineKind::Maxwell3d, 0x701, 0xdead)],
+            "{threading:?}"
+        );
     });
 }
 

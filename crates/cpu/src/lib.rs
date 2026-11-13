@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use lichii_common::VAddr;
-use lichii_common::settings::CpuBackend;
+use lichii_common::settings::{CpuAccuracy, CpuBackend};
 use lichii_memory::{AddressSpace, ExclusiveMonitor};
 
 pub use interpreter::Interpreter;
@@ -147,6 +147,9 @@ pub struct CpuConfig {
     pub core_index: usize,
     pub ctr_el0: u32,
     pub dczid_el0: u32,
+    /// How far the JIT may relax guest semantics for speed (`Settings::cpu.accuracy`). Under
+    /// `Paranoid` no JIT is built and the core interprets every instruction.
+    pub accuracy: CpuAccuracy,
 }
 
 impl CpuConfig {

@@ -5,8 +5,9 @@ use super::floating_point_multi_function::has_native_instructions;
 use super::{TResult, Translator};
 use crate::ir::{Emitter, FmzMode, FpControl, FpRounding, ICompare, Type, Value};
 
+/// Source of an I2F conversion; the field is the log2 of its size in bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum IntFormat {
+pub(crate) enum IntFormat {
     U8,
     U16,
     U32,
@@ -14,7 +15,7 @@ enum IntFormat {
 }
 
 impl IntFormat {
-    const fn from_bits(bits: u64) -> IntFormat {
+    pub(crate) const fn from_bits(bits: u64) -> IntFormat {
         match bits & 3 {
             0 => IntFormat::U8,
             1 => IntFormat::U16,
@@ -155,7 +156,36 @@ fn convert_signed32_to_float_rp(ir: &mut Emitter<'_>, source: Value) -> Value {
     ir.bitcast_f32(result)
 }
 
-fn i2f(t: &mut Translator<'_>, mut src: Value) -> TResult {
+/// An I2F conversion.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct IntToFloat {
+    pub format: IntFormat,
+    /// Byte offset of an 8- or 16-bit source in its register.
+    pub selector: u64,
+    pub signed: bool,
+    /// Integer absolute value of the source.
+    pub abs: bool,
+    /// Negation of the result.
+    pub neg: bool,
+    /// 16, 32 or 64.
+    pub dst_bits: u32,
+    pub rounding: FpRounding,
+    /// Whether the program is native Ampere code, whose signed round-up conversion is exact.
+    pub native: bool,
+}
+
+impl IntToFloat {
+    /// Whether the selector names a byte the source format can start at.
+    pub(crate) const fn valid_selector(&self) -> bool {
+        match self.format {
+            IntFormat::U8 => true,
+            IntFormat::U16 => self.selector.is_multiple_of(2),
+            IntFormat::U32 | IntFormat::U64 => self.selector == 0,
+        }
+    }
+}
+
+fn i2f(t: &mut Translator<'_>, src: Value) -> TResult {
     let i = t.insn;
     let dst_bits = match i.bits(8, 2) {
         1 => 16,
@@ -163,74 +193,20 @@ fn i2f(t: &mut Translator<'_>, mut src: Value) -> TResult {
         3 => 64,
         _ => return Err(t.unsupported()),
     };
-    if i.bit(47) {
+    let conversion = IntToFloat {
+        format: int_format(t),
+        selector: i.bits(41, 2),
+        signed: i.bit(13),
+        abs: i.bit(49),
+        neg: i.bit(45),
+        dst_bits,
+        rounding: fp_rounding(i.bits(39, 2)),
+        native: has_native_instructions(t),
+    };
+    if i.bit(47) || !conversion.valid_selector() {
         return Err(t.unsupported());
     }
-    let signed = i.bit(13);
-    let abs = i.bit(49);
-    let neg = i.bit(45);
-    let selector = i.bits(41, 2);
-    let format = int_format(t);
-    let src_bits = match format {
-        IntFormat::U8 | IntFormat::U16 => {
-            let width = if format == IntFormat::U8 { 8 } else { 16 };
-            if width == 16 && selector % 2 == 1 {
-                return Err(t.unsupported());
-            }
-            let offset = Value::U32(selector as u32 * 8);
-            src =
-                t.ir.bit_field_extract(src, offset, Value::U32(width), signed);
-            if abs {
-                src = small_abs(&mut t.ir, src, width);
-            }
-            width
-        }
-        IntFormat::U32 | IntFormat::U64 => {
-            if selector != 0 {
-                return Err(t.unsupported());
-            }
-            if abs && signed {
-                src = t.ir.iabs(src);
-            }
-            if format == IntFormat::U64 { 64 } else { 32 }
-        }
-    };
-    let conversion_bits = if format == IntFormat::U64 { 64 } else { 32 };
-    let rounding = fp_rounding(i.bits(39, 2));
-    let control = FpControl {
-        no_contraction: false,
-        rounding,
-        fmz_mode: FmzMode::DontCare,
-    };
-    let mut value = if !signed && conversion_bits == 64 && dst_bits == 32 {
-        convert_unsigned64_to_float(&mut t.ir, src, rounding)
-    } else if !signed && conversion_bits == 32 && dst_bits == 32 && rounding == FpRounding::Rz {
-        convert_unsigned32_to_float_rz(&mut t.ir, src)
-    } else if has_native_instructions(t)
-        && signed
-        && format == IntFormat::U32
-        && dst_bits == 32
-        && rounding == FpRounding::Rp
-        && !abs
-        && !neg
-    {
-        convert_signed32_to_float_rp(&mut t.ir, src)
-    } else {
-        t.ir.convert_i_to_f(dst_bits, conversion_bits, signed, src, control)
-    };
-    if neg {
-        if abs || !signed {
-            value = t.ir.fp_neg(value);
-        } else {
-            let least = match src_bits {
-                64 => Value::U64(i64::MIN as u64),
-                bits => Value::U32(least_value(bits)),
-            };
-            let is_least = iequal(&mut t.ir, src, least);
-            let negated = t.ir.fp_neg(value);
-            value = t.ir.select(is_least, value, negated);
-        }
-    }
+    let value = int_to_float(&mut t.ir, conversion, src);
     match dst_bits {
         16 => {
             let zero = t.ir.fp_convert(16, Value::F32(0.0), FpControl::default());
@@ -245,6 +221,74 @@ fn i2f(t: &mut Translator<'_>, mut src: Value) -> TResult {
         }
         _ => t.set_d(i.dest_reg(), value),
     }
+}
+
+/// Converts `src` (a U64 for 64-bit formats, else a U32) to a float of `c.dst_bits`. The
+/// selector must be valid for the format.
+pub(crate) fn int_to_float(ir: &mut Emitter<'_>, c: IntToFloat, mut src: Value) -> Value {
+    let IntToFloat {
+        format,
+        selector,
+        signed,
+        abs,
+        neg,
+        dst_bits,
+        rounding,
+        native,
+    } = c;
+    let src_bits = match format {
+        IntFormat::U8 | IntFormat::U16 => {
+            let width = if format == IntFormat::U8 { 8 } else { 16 };
+            let offset = Value::U32(selector as u32 * 8);
+            src = ir.bit_field_extract(src, offset, Value::U32(width), signed);
+            if abs {
+                src = small_abs(ir, src, width);
+            }
+            width
+        }
+        IntFormat::U32 | IntFormat::U64 => {
+            if abs && signed {
+                src = ir.iabs(src);
+            }
+            if format == IntFormat::U64 { 64 } else { 32 }
+        }
+    };
+    let conversion_bits = if format == IntFormat::U64 { 64 } else { 32 };
+    let control = FpControl {
+        no_contraction: false,
+        rounding,
+        fmz_mode: FmzMode::DontCare,
+    };
+    let mut value = if !signed && conversion_bits == 64 && dst_bits == 32 {
+        convert_unsigned64_to_float(ir, src, rounding)
+    } else if !signed && conversion_bits == 32 && dst_bits == 32 && rounding == FpRounding::Rz {
+        convert_unsigned32_to_float_rz(ir, src)
+    } else if native
+        && signed
+        && format == IntFormat::U32
+        && dst_bits == 32
+        && rounding == FpRounding::Rp
+        && !abs
+        && !neg
+    {
+        convert_signed32_to_float_rp(ir, src)
+    } else {
+        ir.convert_i_to_f(dst_bits, conversion_bits, signed, src, control)
+    };
+    if neg {
+        if abs || !signed {
+            value = ir.fp_neg(value);
+        } else {
+            let least = match src_bits {
+                64 => Value::U64(i64::MIN as u64),
+                bits => Value::U32(least_value(bits)),
+            };
+            let is_least = iequal(ir, src, least);
+            let negated = ir.fp_neg(value);
+            value = ir.select(is_least, value, negated);
+        }
+    }
+    value
 }
 
 pub(super) fn i2f_cbuf(t: &mut Translator<'_>) -> TResult {
