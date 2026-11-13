@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lichii_memory::AddressSpace;
 
@@ -49,6 +49,8 @@ impl VideoEngine {
 pub const DECODE_TIME: Duration = Duration::from_millis(8);
 /// How often a host wait checks whether its channel is closing.
 const WAIT_SLICE: Duration = Duration::from_millis(50);
+/// A host wait blocked this long is logged, so a hang names the syncpoint it stopped on.
+const STALL_WARNING: Duration = Duration::from_secs(2);
 
 /// The host1x class whose methods wait on syncpoints.
 pub(super) const CLASS_CONTROL: u32 = 0x1;
@@ -239,12 +241,35 @@ impl CommandStream {
 
     /// Holds the channel until syncpoint `id` reaches `threshold` or the channel closes.
     fn wait(&self, id: u32, threshold: u32) {
+        let started = Instant::now();
+        let mut stalled = false;
         loop {
             match self.syncpoints.host().wait(id, threshold, Some(WAIT_SLICE)) {
-                Err(SyncpointWaitError::TimedOut { .. })
-                    if !self.closing.load(Ordering::Relaxed) => {}
-                _ => return,
+                Err(SyncpointWaitError::TimedOut { value })
+                    if !self.closing.load(Ordering::Relaxed) =>
+                {
+                    if !stalled && started.elapsed() >= STALL_WARNING {
+                        stalled = true;
+                        tracing::warn!(
+                            engine = self.kind.name(),
+                            syncpoint = id,
+                            threshold,
+                            value,
+                            "host1x channel wait blocked for over 2 s"
+                        );
+                    }
+                }
+                _ => break,
             }
+        }
+        if stalled {
+            tracing::warn!(
+                engine = self.kind.name(),
+                syncpoint = id,
+                threshold,
+                waited_ms = started.elapsed().as_millis() as u64,
+                "host1x channel wait resumed"
+            );
         }
     }
 }
