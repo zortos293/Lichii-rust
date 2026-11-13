@@ -154,25 +154,31 @@ impl KeyboardDialog {
             TextCheckPrompt::Rejected(message) => (message, false),
             TextCheckPrompt::Confirm(message) => (message, true),
         };
-        let (mut ok, mut cancel) = (enter, escape && confirm);
+        let mut clicked = None;
         egui::Modal::new(egui::Id::unique("software keyboard check")).show(ctx, |ui| {
             ui.set_max_width(420.0);
             ui.label(message.as_str());
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if confirm && ui.button("Cancel").clicked() {
-                    cancel = true;
+                    clicked = Some(false);
                 }
-                ok |= ui.button("OK").clicked();
+                if ui.button("OK").clicked() {
+                    clicked = Some(true);
+                }
             });
         });
+        let Some(ok) = clicked
+            .or(enter.then_some(true))
+            .or((escape && confirm).then_some(false))
+        else {
+            return None;
+        };
         if ok && confirm {
             return Some(SoftwareKeyboardAnswer::Submitted(self.text.clone()));
         }
-        if ok || cancel {
-            self.prompt = None;
-            self.focus = true;
-        }
+        self.prompt = None;
+        self.focus = true;
         None
     }
 
@@ -294,8 +300,9 @@ mod tests {
 
         fn ask(&self, request: SoftwareKeyboardRequest) -> JoinHandle<SoftwareKeyboardAnswer> {
             let frontend = self.dialogs.frontend();
+            let woken = self.wakes.load(Ordering::Relaxed);
             let handle = std::thread::spawn(move || frontend.software_keyboard(&request));
-            while !self.dialogs.is_open() {
+            while self.wakes.load(Ordering::Relaxed) == woken {
                 std::thread::yield_now();
             }
             handle
@@ -346,7 +353,7 @@ mod tests {
     fn typing_is_cut_at_the_maximum_and_enter_submits() {
         let mut ui = Harness::new();
         let answer = ui.ask(request("ab", 0, 5));
-        assert!(ui.wakes.load(Ordering::Relaxed) > 0, "the UI is woken");
+        assert!(ui.dialogs.is_open());
         ui.frame(Vec::new());
         ui.typed("cdefg");
         ui.key(Key::Enter);
@@ -455,6 +462,26 @@ mod tests {
         });
         ui.frame(Vec::new());
         ui.key(Key::Escape);
+        ui.frame(Vec::new());
+        ui.typed("o");
+        ui.key(Key::Enter);
+        assert_eq!(
+            answer.join().unwrap(),
+            SoftwareKeyboardAnswer::Submitted("bobo".into())
+        );
+    }
+
+    #[test]
+    fn enter_on_the_focused_cancel_button_returns_to_the_editor() {
+        let mut ui = Harness::new();
+        let answer = ui.ask(SoftwareKeyboardRequest {
+            text_check: Some(TextCheckPrompt::Confirm("Use this name?".into())),
+            ..request("bob", 1, 10)
+        });
+        ui.frame(Vec::new());
+        ui.key(Key::Tab);
+        ui.key(Key::Enter);
+        assert!(ui.dialogs.is_open(), "Cancel wins over the Enter shortcut");
         ui.frame(Vec::new());
         ui.typed("o");
         ui.key(Key::Enter);
