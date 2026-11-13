@@ -2,9 +2,10 @@
 //! for every core built afterwards. Unset, no counter exists and translated code is unchanged.
 //!
 //! Each core counts into its own [`Profile`] without locks. When `run` returns, at most every
-//! [`FLUSH_INTERVAL`], it sends the counts down a channel, which never blocks; the frame view's
-//! [`summary`] and dropping cores lock the process-wide total and drain the channel into it. The
-//! last profiled core to drop logs the total as a table.
+//! [`FLUSH_INTERVAL`], it sends the counts down a channel, which never blocks, and drains the
+//! channel into the process-wide total if that is not locked. The frame view's [`summary`] and
+//! dropping cores lock the total and drain it too. The last profiled core to drop logs the total
+//! as a table.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -315,9 +316,13 @@ pub(super) fn register() {
     g.started.get_or_insert_with(Instant::now);
 }
 
-/// Hands a running core's counts to the total without taking a lock.
+/// Hands a running core's counts to the total without waiting for a lock: when the total is free,
+/// this core drains the channel into it, so the channel stays short with the frame view off.
 pub(super) fn merge(profile: Profile) {
     let _ = SINK.tx.send(profile);
+    if let Ok(mut g) = SINK.global.try_lock() {
+        g.drain();
+    }
 }
 
 /// Merges a dropped core's last counts; the last live core logs the table and resets the total.
