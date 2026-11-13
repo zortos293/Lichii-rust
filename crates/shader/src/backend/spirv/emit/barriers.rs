@@ -18,14 +18,14 @@ fn memory_barrier(ctx: &mut EmitContext<'_>, scope: Scope) -> EmitResult<()> {
     Ok(ctx.b.memory_barrier(scope, semantics)?)
 }
 
-/// Vulkan's GLSL450 memory model allows workgroup execution scope in compute and
-/// tessellation control programs, and workgroup memory scope in compute programs only. A
-/// tessellation control barrier synchronises execution like GLSL's `barrier()`; elsewhere
-/// `BAR.SYNC` synchronises nothing and is dropped.
+/// Vulkan's GLSL450 memory model allows workgroup execution scope in compute, task, mesh and
+/// tessellation control programs, and workgroup memory scope in all of those but tessellation
+/// control. A tessellation control barrier synchronises execution like GLSL's `barrier()`;
+/// elsewhere `BAR.SYNC` synchronises nothing and is dropped.
 pub(super) fn barrier(ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<()> {
     let workgroup = ctx.const_u32(Scope::Workgroup as u32);
     match ctx.stage {
-        ShaderStage::Compute => {
+        ShaderStage::Compute | ShaderStage::Task | ShaderStage::Mesh => {
             let mut semantics =
                 MemorySemantics::ACQUIRE_RELEASE | MemorySemantics::WORKGROUP_MEMORY;
             if ctx.requires_coherent_global_memory {
@@ -46,9 +46,13 @@ pub(super) fn barrier(ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<()
     }
 }
 
-/// Widened to device scope outside compute programs, which have no workgroup memory scope.
+/// Widened to device scope outside compute, task and mesh programs, which have no workgroup
+/// memory scope.
 pub(super) fn workgroup_memory_barrier(ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<()> {
-    let scope = if ctx.stage == ShaderStage::Compute {
+    let scope = if matches!(
+        ctx.stage,
+        ShaderStage::Compute | ShaderStage::Task | ShaderStage::Mesh
+    ) {
         Scope::Workgroup
     } else {
         Scope::Device
