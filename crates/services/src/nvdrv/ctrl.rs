@@ -120,10 +120,10 @@ const ALLOCATED_BIT: u32 = 1 << 28;
 
 /// The event id an event wait returns and `QueryEvent` takes (`SyncpointEventValue`). An
 /// allocating wait puts the slot in bits 0..16 and the syncpoint in bits 16..28 and sets bit 28.
-/// A plain wait ORs the slot over the syncpoint shifted to bit 4; only its low four bits (the
-/// partial slot) have bits of their own.
+/// A plain wait puts a four-bit partial slot under the syncpoint shifted to bit 4; plain waits on
+/// slots it cannot hold get the allocating form, so that no two slots share an id.
 fn encode_event_id(slot: u32, syncpoint: u32, allocated: bool) -> u32 {
-    if allocated {
+    if allocated || slot > 0xf {
         (syncpoint & 0xfff) << 16 | ALLOCATED_BIT | slot
     } else {
         syncpoint << 4 | slot
@@ -386,34 +386,25 @@ impl Ctrl {
         NvResult::Success
     }
 
-    /// The event behind an id an event wait returned. A plain wait's id names every registered
-    /// slot with its partial slot whose id it re-encodes to; the lowest wins when slots 16 apart
-    /// on syncpoints whose low bits collide encode alike.
+    /// The event behind an id an event wait returned.
     pub fn query_event(&self, id: u32) -> Option<Arc<Event>> {
-        let allocated = id & ALLOCATED_BIT != 0;
-        let events = self.events.lock();
-        let matches = |slot: u32| {
-            let event = &events[slot as usize];
-            event.slot.is_some() && encode_event_id(slot, event.syncpoint, allocated) == id
-        };
-        let slot = if allocated {
-            Some(id & 0xffff).filter(|&slot| slot < MAX_EVENTS && matches(slot))
+        let (slot, syncpoint) = if id & ALLOCATED_BIT != 0 {
+            (id & 0xffff, (id >> 16) & 0xfff)
         } else {
-            (id & 0xf..MAX_EVENTS)
-                .step_by(16)
-                .find(|&slot| matches(slot))
+            (id & 0xf, id >> 4)
         };
-        let Some(slot) = slot else {
-            tracing::error!(
-                id = format_args!("{id:#x}"),
-                "query of an event that is not armed"
-            );
-            return None;
-        };
-        events[slot as usize]
-            .slot
-            .as_ref()
-            .map(|shared| shared.event.clone())
+        let events = self.events.lock();
+        match events.get(slot as usize) {
+            Some(NvEvent {
+                slot: Some(shared),
+                syncpoint: armed,
+                ..
+            }) if *armed == syncpoint => Some(shared.event.clone()),
+            _ => {
+                tracing::error!(slot, syncpoint, "query of an event that is not armed");
+                None
+            }
+        }
     }
 }
 
@@ -481,13 +472,36 @@ mod tests {
         let (_nvdrv, ctrl) = ctrl();
         for slot in 0..MAX_EVENTS {
             assert_eq!(ctrl.register_event(slot), NvResult::Success);
-            let syncpoint = 0x20 + 4 * (slot % 3);
+            let syncpoint = 0x20 + slot % 3;
             let id = wait(&ctrl, syncpoint, slot, false);
-            assert_eq!(id, syncpoint << 4 | slot);
+            if slot < 16 {
+                assert_eq!(id, syncpoint << 4 | slot);
+            } else {
+                assert_eq!(id, syncpoint << 16 | ALLOCATED_BIT | slot);
+            }
             let event = ctrl.query_event(id).expect("armed");
             assert!(Arc::ptr_eq(&event, &slot_event(&ctrl, slot)));
         }
         assert!(ctrl.query_event(0x30 << 4).is_none());
+    }
+
+    #[test]
+    fn plain_waits_on_colliding_syncpoints_keep_their_own_events() {
+        let (_nvdrv, ctrl) = ctrl();
+        for slot in [0, 16] {
+            assert_eq!(ctrl.register_event(slot), NvResult::Success);
+        }
+        let low = wait(&ctrl, 0x21, 0, false);
+        let high = wait(&ctrl, 0x20, 16, false);
+        assert_ne!(low, high);
+        assert!(Arc::ptr_eq(
+            &ctrl.query_event(low).unwrap(),
+            &slot_event(&ctrl, 0)
+        ));
+        assert!(Arc::ptr_eq(
+            &ctrl.query_event(high).unwrap(),
+            &slot_event(&ctrl, 16)
+        ));
     }
 
     #[test]

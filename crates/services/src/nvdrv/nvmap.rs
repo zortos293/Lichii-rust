@@ -299,9 +299,10 @@ impl NvMap {
 
     /// Drops one reference `session` holds and the handle reference behind it.
     fn free_session_ref(&self, session: u64, id: u32) -> Option<FreeInfo> {
-        if let Some(refs) = self.session_refs.lock().get_mut(&session)
-            && let Some(count) = refs.get_mut(&id)
         {
+            let mut sessions = self.session_refs.lock();
+            let refs = sessions.get_mut(&session)?;
+            let count = refs.get_mut(&id)?;
             *count -= 1;
             if *count == 0 {
                 refs.remove(&id);

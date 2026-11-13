@@ -531,6 +531,41 @@ fn a_closing_session_drops_every_nvmap_reference_it_holds() {
 }
 
 #[test]
+fn a_session_frees_only_the_nvmap_references_it_holds() {
+    let nv = Nv::new(SWITCH1_TITLE, "nvdrv");
+    let nvmap = nv.open("/dev/nvmap");
+    let (handle, _) = nv.nvmap_buffer(nvmap, &[1; 0x1000], 0x1000);
+    let other = nv.client.connect("nvdrv").unwrap();
+    nv.initialize(other);
+    let (other_nvmap, _) = nv.open_on(other, "/dev/nvmap");
+    let from_id = nv.ioctl_on(
+        other,
+        other_nvmap,
+        iowr(1, 0x3, 8),
+        &Bytes::default().u32(handle).u32(0).0,
+        8,
+    );
+    assert_eq!(from_id.result, 0);
+
+    for _ in 0..2 {
+        let free = nv.ioctl_on(
+            other,
+            other_nvmap,
+            iowr(1, 0x5, 24),
+            &Bytes::default().u32(handle).zeroes(20).0,
+            24,
+        );
+        assert_eq!(free.result, 0);
+    }
+    assert_eq!(
+        nv.nvdrv.nvmap.size(handle),
+        Some(0x1000),
+        "the creator's reference stays"
+    );
+    assert_eq!(nv.map_ex(nv.address_space(), 0, handle, 0, 0, 0).0, 0);
+}
+
+#[test]
 fn ctrl_reads_increments_and_waits_on_syncpoints() {
     let nv = Nv::new(SWITCH1_TITLE, "nvdrv");
     let ctrl = nv.open("/dev/nvhost-ctrl");
