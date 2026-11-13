@@ -264,16 +264,8 @@ impl NvMap {
         state.dupes -= 1;
         if state.dupes < 0 {
             tracing::warn!(id, "nvmap duplicate count imbalance");
-        } else if state.dupes == 0 {
-            if std::mem::take(&mut state.queued) {
-                self.unmap_queue
-                    .lock()
-                    .retain(|queued| !Arc::ptr_eq(queued, &handle));
-            }
-            if state.daddr != 0 {
-                self.unmap(&mut state);
-            }
-            state.pins = 0;
+        } else if state.dupes == 0 && state.internal_dupes <= 0 {
+            self.release_mapping(&handle, &mut state);
         }
         let removed = state.dupes <= 0 && state.internal_dupes <= 0;
         if removed {
@@ -285,6 +277,43 @@ impl NvMap {
             was_uncached: state.flags & FLAG_MAP_UNCACHED != 0,
             can_unlock: removed,
         })
+    }
+
+    /// Takes a reference on the emulator's behalf (vi holding a buffer): the handle and its
+    /// device mapping stay until [`NvMap::free_internal`], even after the guest frees it.
+    pub fn duplicate_internal(&self, id: u32) -> Result<(), NvResult> {
+        let handle = self.get(id).ok_or(NvResult::BadValue)?;
+        handle.state.lock().internal_dupes += 1;
+        Ok(())
+    }
+
+    /// Drops a reference [`NvMap::duplicate_internal`] took; the last reference of any kind
+    /// unmaps and removes the handle.
+    pub fn free_internal(&self, id: u32) {
+        let Some(handle) = self.get(id) else {
+            return;
+        };
+        let mut state = handle.state.lock();
+        state.internal_dupes -= 1;
+        if state.internal_dupes < 0 {
+            tracing::warn!(id, "nvmap internal duplicate count imbalance");
+        }
+        if state.dupes <= 0 && state.internal_dupes <= 0 {
+            self.release_mapping(&handle, &mut state);
+            self.handles.write().remove(&id);
+        }
+    }
+
+    fn release_mapping(&self, handle: &Arc<Handle>, state: &mut HandleState) {
+        if std::mem::take(&mut state.queued) {
+            self.unmap_queue
+                .lock()
+                .retain(|queued| !Arc::ptr_eq(queued, handle));
+        }
+        if state.daddr != 0 {
+            self.unmap(state);
+        }
+        state.pins = 0;
     }
 
     fn add_session_ref(&self, session: u64, id: u32) {
