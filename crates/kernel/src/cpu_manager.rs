@@ -72,7 +72,13 @@ impl Core {
         self.apply_invalidations();
         self.cpus[slot].1.clear_exclusive();
         loop {
-            let halt = self.cpus[slot].1.run(&mut self.ctx);
+            let halt = if self.kernel.scheduler.enter_guest(self.index) {
+                let halt = self.cpus[slot].1.run(&mut self.ctx);
+                self.kernel.scheduler.leave_guest(self.index);
+                halt
+            } else {
+                HaltReason::Interrupted
+            };
             let mut flow = match halt {
                 HaltReason::SupervisorCall(imm) => {
                     let mut svc = SvcContext {
