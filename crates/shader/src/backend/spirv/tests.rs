@@ -21,6 +21,8 @@ use crate::runtime::{AttributeType, CompareFunction};
 use crate::translate::{TranslateOptions, TranslatedProgram, translate};
 use crate::{Profile, RuntimeInfo, ShaderInfo, ShaderStage};
 
+mod arith;
+
 const PT: u64 = 7 << 16;
 
 fn target_env(profile: &Profile) -> &'static str {
@@ -755,9 +757,9 @@ fn unsupported_and_unimplemented_opcodes_are_reported() {
         matches!(error, EmitError::UnsupportedOpcode(Opcode::IsbeRead)),
         "{error}"
     );
-    let error = emit_single(Opcode::IAdd32, &[Value::U32(1), Value::U32(2)]);
+    let error = emit_single(Opcode::SharedAtomicIAdd32, &[Value::U32(1), Value::U32(2)]);
     assert!(
-        matches!(error, EmitError::Unimplemented(Opcode::IAdd32)),
+        matches!(error, EmitError::Unimplemented(Opcode::SharedAtomicIAdd32)),
         "{error}"
     );
 }
