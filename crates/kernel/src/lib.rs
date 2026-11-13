@@ -96,6 +96,8 @@ pub struct KernelConfig {
     pub rng_seed: u64,
     /// Make sm refuse services a process's NPDM does not list, instead of only logging them.
     pub enforce_service_access: bool,
+    /// Log every supervisor call with its arguments and what it returned (`debug.svc_trace`).
+    pub svc_trace: bool,
     pub clock: Arc<dyn GuestClock>,
     pub cpu: CpuFactory,
     pub events: Option<Arc<dyn KernelEvents>>,
@@ -122,6 +124,7 @@ pub(crate) struct KernelInner {
     fastmem: bool,
     cpu_accuracy: CpuAccuracy,
     aslr: bool,
+    svc_trace: bool,
     events: Arc<dyn KernelEvents>,
     rng: Mutex<Rng>,
     next_process_id: AtomicU64,
@@ -183,6 +186,7 @@ impl Kernel {
             fastmem: config.fastmem,
             cpu_accuracy: config.cpu_accuracy,
             aslr: config.aslr,
+            svc_trace: config.svc_trace,
             events: config.events.unwrap_or_else(|| Arc::new(LogEvents)),
             rng: Mutex::new(Rng::new(config.rng_seed)),
             next_process_id: AtomicU64::new(0x51),
