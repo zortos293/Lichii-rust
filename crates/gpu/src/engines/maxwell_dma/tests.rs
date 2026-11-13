@@ -141,6 +141,7 @@ impl Rig {
             rasterizer: &mut self.double,
             syncpoints: &self.h.syncpoints,
             gob_layout: self.h.gob_layout,
+            qmd_scheduler: &mut self.h.qmd_scheduler,
         };
         self.engine.call_method(&mut ctx, method, value);
     }

@@ -162,8 +162,21 @@ impl QmdV2 {
 }
 
 bitfield! {
+    /// Word 4: the hardware queue bit, whether an inline load waits for a scheduling PCAS, and
+    /// the dependence counter a scheduled QMD waits on.
     pub struct V3Control {
         queue: bool @ 8, 1;
+        require_scheduling_pcas: bool @ 12, 1;
+        dependence_counter: u32 @ 14, 16;
+    }
+}
+
+bitfield! {
+    /// Word 16: what the descriptor does to the QMD at `dependent_qmd_pointer` once it ran.
+    pub struct V3Dependent {
+        enable: bool @ 0, 1;
+        action: u32 @ 1, 3;
+        second_enable: bool @ 5, 1;
     }
 }
 
@@ -285,16 +298,7 @@ impl V3Release {
                 return None;
             }
             ReleaseKind::Reduction {
-                op: match flags.reduction_op() {
-                    0 => Reduction::Add,
-                    1 => Reduction::Min,
-                    2 => Reduction::Max,
-                    3 => Reduction::Inc,
-                    4 => Reduction::Dec,
-                    5 => Reduction::And,
-                    6 => Reduction::Or,
-                    _ => Reduction::Xor,
-                },
+                op: semaphore_reduction(flags.reduction_op()),
                 signed: flags.reduction_format() == 1,
             }
         } else if size == 0 {
@@ -314,6 +318,21 @@ impl V3Release {
     }
 }
 
+/// The reduction a 3-bit semaphore reduction field selects, in the order QMD releases and the
+/// compute report semaphore share (ADD, MIN, MAX, INC, DEC, AND, OR, XOR).
+pub fn semaphore_reduction(op: u32) -> Reduction {
+    match op & 7 {
+        0 => Reduction::Add,
+        1 => Reduction::Min,
+        2 => Reduction::Max,
+        3 => Reduction::Inc,
+        4 => Reduction::Dec,
+        5 => Reduction::And,
+        6 => Reduction::Or,
+        _ => Reduction::Xor,
+    }
+}
+
 /// An Ampere launch descriptor (version 3.0).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -324,7 +343,9 @@ pub struct QmdV3 {
     pub grid_width: u32,
     pub grid_height: V3Dim16,
     pub grid_depth: V3Dim16,
-    _pad2: [u32; 2],
+    /// The dependent QMD's address shifted right by 8.
+    pub dependent_qmd_pointer: u32,
+    pub dependent: V3Dependent,
     pub shared: V3Shared,
     pub version_block_x: V3VersionBlockX,
     pub block_yz: V3BlockYz,
@@ -346,6 +367,8 @@ const _: () = {
     assert!(core::mem::size_of::<QmdV3>() == QMD_WORDS * 4);
     assert!(core::mem::offset_of!(QmdV3, control) == 4 * 4);
     assert!(core::mem::offset_of!(QmdV3, grid_width) == 12 * 4);
+    assert!(core::mem::offset_of!(QmdV3, dependent_qmd_pointer) == 15 * 4);
+    assert!(core::mem::offset_of!(QmdV3, dependent) == 16 * 4);
     assert!(core::mem::offset_of!(QmdV3, shared) == 17 * 4);
     assert!(core::mem::offset_of!(QmdV3, version_block_x) == 18 * 4);
     assert!(core::mem::offset_of!(QmdV3, const_buffer_mask) == 20 * 4);
