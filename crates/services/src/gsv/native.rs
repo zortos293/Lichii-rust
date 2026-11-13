@@ -7,7 +7,8 @@ use lichii_common::{ResultCode, VAddr};
 use lichii_gpu::nx2_memory::GpuMemoryHandle;
 use lichii_kernel::ipc::HleRequestContext;
 use lichii_memory::AddressSpace;
-use lichii_texture::block_linear::{GobLayout, Tiling, swizzle};
+use lichii_texture::PixelFormat;
+use lichii_texture::block_linear::{GobLayout, SurfaceLayout, Tiling, swizzle};
 use parking_lot::Mutex;
 
 use super::{UNKNOWN, Words};
@@ -134,17 +135,22 @@ impl DecoderLayout {
     }
 
     /// The layout an RGBA or BGRA image takes once the title reads it on the GPU (426/428): RGBA
-    /// texels in Switch 2 block-linear with 16-GOB blocks, as the reference writes them.
+    /// texels in Switch 2 block-linear with 16-GOB blocks, as the reference writes them, shrunk to
+    /// fit a short image the way the hardware and the texture cache read it.
     pub fn tiling(&self) -> Tiling {
-        Tiling::new(
-            (self.pitch / 4) as u32,
-            self.height,
-            1,
-            4,
-            4,
-            0,
-            GobLayout::Switch2,
-        )
+        SurfaceLayout {
+            format: PixelFormat::A8B8G8R8Unorm,
+            width: (self.pitch / 4) as u32,
+            height: self.height,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            block_height_log2: 4,
+            block_depth_log2: 0,
+            tile_width_spacing: 0,
+            layout: GobLayout::Switch2,
+        }
+        .level_tiling(0)
     }
 
     /// The picture kind gsv 961 reports.

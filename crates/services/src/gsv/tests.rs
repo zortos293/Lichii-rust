@@ -1576,7 +1576,8 @@ fn video_decoder_writes_an_image_only_after_its_release_fence_and_never_after_st
 
 #[test]
 fn video_decoder_writes_block_linear_rgba_into_images_the_title_reads_on_the_gpu() {
-    use lichii_texture::block_linear::{GobLayout, Tiling, unswizzle};
+    use lichii_texture::PixelFormat;
+    use lichii_texture::block_linear::{GobLayout, SurfaceLayout, unswizzle};
 
     if !lichii_video::available() {
         eprintln!("FFmpeg is not installed; skipping");
@@ -1608,7 +1609,23 @@ fn video_decoder_writes_block_linear_rgba_into_images_the_title_reads_on_the_gpu
             .unwrap();
         bytes
     };
-    let tiling = Tiling::new(64, 48, 1, 4, 4, 0, GobLayout::Switch2);
+    let tiling = SurfaceLayout {
+        format: PixelFormat::A8B8G8R8Unorm,
+        width: 64,
+        height: 48,
+        depth: 1,
+        levels: 1,
+        layers: 1,
+        block_height_log2: 4,
+        block_depth_log2: 0,
+        tile_width_spacing: 0,
+        layout: GobLayout::Switch2,
+    }
+    .level_tiling(0);
+    assert_eq!(
+        tiling.block_height_log2, 3,
+        "the renderer shrinks 16-GOB blocks to fit 48 rows"
+    );
     let untile = |tiled: &[u8]| {
         let mut linear = vec![0u8; tiling.linear_size_bytes()];
         unswizzle(&tiling, tiled, &mut linear);
