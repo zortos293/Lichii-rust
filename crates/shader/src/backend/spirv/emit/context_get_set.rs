@@ -138,7 +138,10 @@ fn output_attr_pointer(
 }
 
 /// Loads `element` from constant buffer `binding` at byte `offset`. Hardware reads the aligned
-/// element (an LDC.U32 at offset 6 reads offset 4), so immediate offsets round down.
+/// element (an LDC.U32 at offset 6 reads offset 4), so immediate offsets round down. A bank past
+/// the hardware slots is never bound, and the console reads zeros from an unbound bank: NVN2
+/// fullscreen vertex programs read bank 24, which the reference redirects to the never-bound
+/// slot 17.
 fn get_cbuf(
     ctx: &mut EmitContext<'_>,
     result_type: Word,
@@ -168,9 +171,7 @@ fn get_cbuf(
         )?);
     };
     if binding as usize >= ShaderInfo::MAX_CBUFS {
-        return Err(EmitError::Unsupported(
-            "constant buffer index past the hardware slots",
-        ));
+        return Ok(ctx.const_null(result_type));
     }
     let uniform_type = ctx.uniform_type(element);
     let cbuf = ctx.cbuf(binding as usize, element);

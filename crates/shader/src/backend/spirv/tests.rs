@@ -1296,3 +1296,57 @@ fn render_area_follows_the_rescaling_words_in_one_push_constant_block() {
         assert_eq!(layout.push_constant_size, 48, "{name}");
     }
 }
+
+/// A bank past the 18 hardware slots, as NVN2 fullscreen vertex programs read bank 24, reads
+/// zero: no constant buffer is declared or accessed for it.
+#[test]
+fn constant_buffer_banks_past_the_hardware_slots_read_zero() {
+    let mut s = Synthetic::new();
+    let b = s.block();
+    let word = s.inst(b, Opcode::GetCbufU32, &[Value::U32(24), Value::U32(0x10)]);
+    let float = s.inst(b, Opcode::GetCbufF32, &[Value::U32(31), Value::U32(4)]);
+    let bits = s.inst(b, Opcode::BitCastU32F32, &[float]);
+    let sum = s.inst(b, Opcode::IAdd32, &[word, bits]);
+    let value = s.inst(b, Opcode::BitCastF32U32, &[sum]);
+    s.inst(
+        b,
+        Opcode::SetAttribute,
+        &[
+            Value::Attribute(Attribute::generic(0, 0)),
+            value,
+            Value::U32(0),
+        ],
+    );
+    let info = ShaderInfo {
+        used_constant_buffer_types: Type::U32 | Type::F32,
+        stores: varying(&[Attribute::generic(0, 0)]),
+        ..ShaderInfo::default()
+    };
+    let program = s.finish(
+        vec![SyntaxNode::Block(b), SyntaxNode::Return],
+        ShaderStage::VertexB,
+        info,
+    );
+    let module = emit(
+        "unbound_cbuf_banks",
+        &Profile::default(),
+        &RuntimeInfo::default(),
+        &program,
+    );
+    let nulls = module
+        .types_global_values
+        .iter()
+        .filter(|i| i.class.opcode == Op::ConstantNull)
+        .count();
+    assert!(nulls >= 2, "{nulls} null constants");
+    let uniforms = module
+        .types_global_values
+        .iter()
+        .filter(|i| {
+            i.class.opcode == Op::Variable
+                && i.operands.first()
+                    == Some(&Operand::StorageClass(rspirv::spirv::StorageClass::Uniform))
+        })
+        .count();
+    assert_eq!(uniforms, 0);
+}
