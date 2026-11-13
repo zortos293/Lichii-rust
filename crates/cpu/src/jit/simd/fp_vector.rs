@@ -34,6 +34,12 @@ pub enum LaneOp {
     RsqrtStep,
     /// `SCVTF` (vector) on 32-bit lanes of `n`.
     FromInt,
+    /// `FCMEQ`: all ones where `n == m`.
+    CompareEq,
+    /// `FCMGE`: all ones where `n >= m`.
+    CompareGe,
+    /// `FCMGT`: all ones where `n > m`.
+    CompareGt,
 }
 
 /// A lane-wise op on `n` and `m`, or on `n` and lane `index` of `m` for the by-element forms. It
@@ -145,6 +151,9 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         0x0ea0_cc00 => Some(LaneOp::Mls),
         0x0e20_fc00 => Some(LaneOp::RecipStep),
         0x0ea0_fc00 => Some(LaneOp::RsqrtStep),
+        0x0e20_e400 => Some(LaneOp::CompareEq),
+        0x2e20_e400 => Some(LaneOp::CompareGe),
+        0x2ea0_e400 => Some(LaneOp::CompareGt),
         _ => None,
     };
     let by_element = |masked: u32| match masked {
@@ -212,7 +221,11 @@ impl Emitter<'_> {
         let (n, m) = (self.reg(n), self.reg(m));
         let acc = acc.map(|a| self.reg(a));
         let d = self.def(Value(i as u32));
-        let slow = self.checked(true);
+        let compare = matches!(
+            op,
+            LaneOp::CompareEq | LaneOp::CompareGe | LaneOp::CompareGt
+        );
+        let slow = self.checked(!compare);
         let fused = matches!(
             op,
             LaneOp::Mla | LaneOp::Mls | LaneOp::RecipStep | LaneOp::RsqrtStep
@@ -235,8 +248,24 @@ impl Emitter<'_> {
                 SCRATCH
             }
         };
+        if compare {
+            let written = (1i32 << lanes) - 1;
+            dynasm!(self.asm ; .arch x64 ; movaps xmm15, Rx(n));
+            match fp {
+                Fp::S => {
+                    dynasm!(self.asm ; .arch x64 ; cmpps xmm15, Rx(m), 3 ; movmskps eax, xmm15)
+                }
+                Fp::D => {
+                    dynasm!(self.asm ; .arch x64 ; cmppd xmm15, Rx(m), 3 ; movmskpd eax, xmm15)
+                }
+            }
+            dynasm!(self.asm ; .arch x64 ; test eax, written ; jnz =>slow);
+        }
         match op {
             LaneOp::FromInt => {}
+            LaneOp::CompareGe | LaneOp::CompareGt => {
+                dynasm!(self.asm ; .arch x64 ; movaps Rx(d), Rx(m))
+            }
             LaneOp::RecipStep | LaneOp::RsqrtStep => {
                 let constants = STEPS.0.as_ptr() as i64 + if fp == Fp::D { 48 } else { 0 };
                 let offset = if op == LaneOp::RsqrtStep { 16 } else { 0 };
@@ -250,6 +279,12 @@ impl Emitter<'_> {
         }
         match (op, fp) {
             (LaneOp::FromInt, _) => dynasm!(self.asm ; .arch x64 ; cvtdq2ps Rx(d), Rx(n)),
+            (LaneOp::CompareEq, Fp::S) => dynasm!(self.asm ; .arch x64 ; cmpps Rx(d), Rx(m), 0),
+            (LaneOp::CompareEq, Fp::D) => dynasm!(self.asm ; .arch x64 ; cmppd Rx(d), Rx(m), 0),
+            (LaneOp::CompareGe, Fp::S) => dynasm!(self.asm ; .arch x64 ; cmpps Rx(d), Rx(n), 2),
+            (LaneOp::CompareGe, Fp::D) => dynasm!(self.asm ; .arch x64 ; cmppd Rx(d), Rx(n), 2),
+            (LaneOp::CompareGt, Fp::S) => dynasm!(self.asm ; .arch x64 ; cmpps Rx(d), Rx(n), 1),
+            (LaneOp::CompareGt, Fp::D) => dynasm!(self.asm ; .arch x64 ; cmppd Rx(d), Rx(n), 1),
             (LaneOp::RecipStep, Fp::S) => {
                 dynasm!(self.asm ; .arch x64 ; vfnmadd231ps Rx(d), Rx(n), Rx(m))
             }
@@ -296,7 +331,7 @@ impl Emitter<'_> {
             }
             (LaneOp::Mls, Fp::D) => self.fma231pd(0xbc, d, n, b),
         }
-        if op != LaneOp::FromInt {
+        if op != LaneOp::FromInt && !compare {
             self.check_lanes(op, fp, lanes, d, n, m, index, slow);
         }
         match (fp, lanes) {
