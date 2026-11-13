@@ -80,6 +80,8 @@ pub(crate) struct Nvdrv {
     nvmap: NvMap,
     syncpoints: SyncpointTable,
     next_session: AtomicU64,
+    /// `debug.ipc_trace`: log every ioctl with its device and result.
+    ipc_trace: bool,
 }
 
 impl Nvdrv {
@@ -90,6 +92,7 @@ impl Nvdrv {
             syncpoints: SyncpointTable::new(gpu.host1x().syncpoints.clone()),
             nx2: context.program.generation == ConsoleGeneration::Switch2,
             next_session: AtomicU64::new(1),
+            ipc_trace: context.settings.debug.ipc_trace,
             gpu,
         }
     }
@@ -399,6 +402,15 @@ impl NvdrvService {
             return result;
         }
         let result = device.ioctl(files, &mut buffers.args(variant, ioctl));
+        if self.nvdrv.ipc_trace {
+            tracing::info!(
+                target: "ipc",
+                device = device.name(),
+                fd,
+                ioctl = format_args!("{:#010x}", ioctl.0),
+                result = ?result,
+            );
+        }
         if ioctl.is_out()
             && let Err(error) = buffers.store(ctx, variant)
         {

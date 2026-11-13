@@ -153,6 +153,7 @@ impl System {
             aslr: false,
             rng_seed: settings.system.rng_seed.map_or_else(entropy, u64::from),
             enforce_service_access: settings.system.enforce_service_access,
+            svc_trace: settings.debug.svc_trace,
             clock: timing.clone(),
             cpu: Arc::new(move |config| lichii_cpu::new_core(backend, config)),
             events: Some(exit.clone()),

@@ -547,7 +547,8 @@ mod sys {
         ) -> io::Result<()> {
             // SAFETY: [offset, offset + len) lies in one free placeholder (the gap invariant), so
             // splitting it out and replacing it with a view of our section is valid. The split
-            // fails harmlessly when the range already is the whole placeholder.
+            // fails harmlessly when the range already is the whole placeholder. The view is mapped
+            // read-write because its protection at map time caps what VirtualProtect may set later.
             unsafe {
                 VirtualFree(
                     base.add(offset).cast(),
@@ -561,7 +562,7 @@ mod sys {
                     view.backing_offset as u64,
                     view.len,
                     MEM_REPLACE_PLACEHOLDER,
-                    page_flags(view.prot),
+                    PAGE_READWRITE,
                     std::ptr::null_mut(),
                     0,
                 );
@@ -569,7 +570,26 @@ mod sys {
                     return Err(io::Error::last_os_error());
                 }
             }
-            views.insert(offset, view);
+            views.insert(
+                offset,
+                View {
+                    prot: HostProtection::ReadWrite,
+                    ..view
+                },
+            );
+            if view.prot != HostProtection::ReadWrite {
+                let mut old = 0;
+                // SAFETY: [offset, offset + len) is the view just mapped.
+                check(unsafe {
+                    VirtualProtect(
+                        base.add(offset).cast(),
+                        view.len,
+                        page_flags(view.prot),
+                        &mut old,
+                    )
+                })?;
+                views.insert(offset, view);
+            }
             Ok(())
         }
 
