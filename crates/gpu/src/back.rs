@@ -103,6 +103,7 @@ impl Back {
                     consumer.wrap();
                     continue;
                 }
+                consumer.begin(header);
                 let len = self.execute(header, consumer);
                 consumer.advance(len);
                 if consumer.unreleased() >= RELEASE_SLOTS {
