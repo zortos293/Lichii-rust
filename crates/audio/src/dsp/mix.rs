@@ -27,7 +27,7 @@ fn apply_mix<const Q: u32>(
     }
 }
 
-fn apply_mix_ramp<const Q: u32>(
+pub(super) fn apply_mix_ramp<const Q: u32>(
     mix: &mut [i32],
     output: usize,
     input: usize,
@@ -59,7 +59,7 @@ fn apply_gain<const Q: u32>(
     }
 }
 
-fn apply_linear_envelope<const Q: u32>(
+pub(super) fn apply_linear_envelope<const Q: u32>(
     mix: &mut [i32],
     output: usize,
     input: usize,
