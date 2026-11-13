@@ -52,6 +52,9 @@ mod friend;
 mod fs;
 mod gsv;
 mod hid;
+mod hidbus;
+mod irs;
+mod jit;
 mod lm;
 mod mm;
 mod ncm;
@@ -100,6 +103,8 @@ pub fn register_all(context: &Arc<ServiceContext>) -> HleResult<()> {
     time::register(context)?;
     chat::register(context)?;
     hid::register(context)?;
+    irs::register(context)?;
+    hidbus::register(context)?;
     pl_u::register(context)?;
     aoc::register(context)?;
     arp::register(context)?;
@@ -117,6 +122,7 @@ pub fn register_all(context: &Arc<ServiceContext>) -> HleResult<()> {
     mm::register(context)?;
     ngc::register(context)?;
     ro::register(context)?;
+    jit::register(context)?;
     let nvdrv = nvdrv::register(context)?;
     vi::register(context, nvdrv)?;
     Ok(())
