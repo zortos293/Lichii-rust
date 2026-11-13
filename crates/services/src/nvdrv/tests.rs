@@ -666,6 +666,7 @@ fn a_closed_channel_retires_the_increments_of_its_dropped_work() {
     let (gpu, syncpoint) = nv.channel(as_fd);
     let guest = nv.syncpoints().guest();
 
+    nv.syncpoints().increase_max(26, 1).unwrap();
     let reply = nv.submit(gpu, &[], 1 << 0 | 1 << 1, (26, 1));
     assert_eq!(reply.result, 0);
     let fence = u32_at(&reply.output, 20);
