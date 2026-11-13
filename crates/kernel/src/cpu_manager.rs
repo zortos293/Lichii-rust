@@ -83,6 +83,11 @@ impl Core {
                     };
                     svc::dispatch(&mut svc, imm)
                 }
+                HaltReason::InvalidateCode { addr, size } => {
+                    self.kernel
+                        .invalidate_code(thread.process().id(), addr, size);
+                    Flow::Continue
+                }
                 HaltReason::Interrupted | HaltReason::StepComplete => {
                     self.kernel.scheduler.take_reschedule(self.index);
                     Flow::Yield

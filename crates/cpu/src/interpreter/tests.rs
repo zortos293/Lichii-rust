@@ -280,6 +280,13 @@ fn guest_icache_maintenance_invalidates_patched_code() {
     h.ctx.x[9] = DATA;
     h.ctx.x[10] = target;
     h.ctx.pc = CODE;
+    assert_eq!(
+        h.core.run(&mut h.ctx),
+        HaltReason::InvalidateCode {
+            addr: target,
+            size: 64
+        }
+    );
     assert_eq!(h.core.run(&mut h.ctx), HaltReason::SupervisorCall(3));
 }
 #[test]

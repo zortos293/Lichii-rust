@@ -892,3 +892,76 @@ fn counter_reads_follow_the_tsc_scale() {
         assert!(ctx.x[1].wrapping_sub(ctx.x[0]) <= after.wrapping_sub(before));
     }
 }
+
+#[test]
+fn icache_maintenance_reaches_the_other_cores() {
+    const IC_IVAU_X10: u32 = 0xd50b_752a;
+    const IC_IALLU: u32 = 0xd508_751f;
+    const MOV_X0_1: u32 = 0xd280_0020;
+    const MOV_X0_2: u32 = 0xd280_0040;
+    const MOV_X0_3: u32 = 0xd280_0060;
+    let target = CODE + 0x100;
+    let physical = Arc::new(PhysicalMemory::new(1 << 20).unwrap());
+    let mem = Arc::new(AddressSpace::with_fastmem(physical, 39).unwrap());
+    mem.map(CODE, 0, CODE_SIZE, MemoryPermission::READ_EXECUTE);
+    let monitor = Arc::new(ExclusiveMonitor::new(2));
+    let mut cores: Vec<Jit> = (0..2)
+        .map(|core_index| {
+            Jit::new(CpuConfig {
+                memory: mem.clone(),
+                monitor: monitor.clone(),
+                clock: Arc::new(Clock::default()),
+                core_index,
+                ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
+                dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+            })
+            .unwrap()
+        })
+        .collect();
+    for (i, word) in [IC_IVAU_X10, BRK, IC_IALLU, BRK].into_iter().enumerate() {
+        mem.write(CODE + 4 * i as u64, word).unwrap();
+    }
+    mem.write(target + 4, BRK).unwrap();
+    let run_target = |core: &mut Jit| {
+        let mut ctx = ThreadContext {
+            pc: target,
+            ..Default::default()
+        };
+        assert_eq!(core.run(&mut ctx), HaltReason::Breakpoint(0));
+        ctx.x[0]
+    };
+    let maintain = |core: &mut Jit, pc: u64| {
+        let mut ctx = ThreadContext {
+            pc,
+            ..Default::default()
+        };
+        ctx.x[10] = target + 8;
+        let halt = core.run(&mut ctx);
+        assert_eq!(ctx.pc, pc + 4);
+        assert_eq!(core.run(&mut ctx), HaltReason::Breakpoint(0));
+        halt
+    };
+    let [first, second] = &mut cores[..] else {
+        unreachable!()
+    };
+    mem.write(target, MOV_X0_1).unwrap();
+    assert_eq!(run_target(first), 1);
+    for (pc, mov, x0, range) in [
+        (CODE, MOV_X0_2, 2, (target, 64)),
+        (CODE + 8, MOV_X0_3, 3, (0, u64::MAX)),
+    ] {
+        mem.write(target, mov).unwrap();
+        let halt = maintain(second, pc);
+        assert_eq!(
+            halt,
+            HaltReason::InvalidateCode {
+                addr: range.0,
+                size: range.1
+            }
+        );
+        let before = run_target(first);
+        assert_ne!(before, x0, "the other core still runs the old block");
+        first.invalidate_code(range.0, range.1);
+        assert_eq!(run_target(first), x0);
+    }
+}
