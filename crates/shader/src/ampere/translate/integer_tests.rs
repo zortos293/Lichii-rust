@@ -1711,6 +1711,15 @@ fn lea_shifts_and_adds() {
     assert_eq!(translate(&[inst]).unwrap(), expected);
 }
 
+/// Without .HI only the low word of `a << s` is added, which the sign of `a` never reaches.
+#[test]
+fn lea_sx32_low_form_is_the_plain_lea() {
+    let fields = dst(0) | a(1) | b(2) | c(RZ) | (3 << 75) | pred(81, PT);
+    let plain = translate(&[encode(Opcode::Lea, Form::RegReg, fields)]).unwrap();
+    let sign_extended = translate(&[encode(Opcode::Lea, Form::RegReg, fields | bit(73))]).unwrap();
+    assert_eq!(sign_extended, plain);
+}
+
 #[test]
 fn ulea_hi_of_uniform_registers() {
     let inst = encode(

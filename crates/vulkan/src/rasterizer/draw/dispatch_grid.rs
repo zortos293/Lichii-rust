@@ -1,13 +1,15 @@
-//! Dispatches whose grid GPU work may have written ([`ComputeContext::indirect_grid`]): a
-//! one-invocation pass (`dispatch_grid.comp`) unpacks the descriptor's packed grid words into a
-//! `VkDispatchIndirectCommand`, which `vkCmdDispatchIndirect` then reads.
+//! Dispatches whose grid GPU work may have written ([`ComputeContext::indirect`]): a
+//! one-invocation pass (`dispatch_grid.comp`) unpacks the descriptor's packed grid words, in the
+//! layout of their descriptor version, into a `VkDispatchIndirectCommand`, which
+//! `vkCmdDispatchIndirect` then reads.
 //!
-//! [`ComputeContext::indirect_grid`]: lichii_gpu::backend::ComputeContext::indirect_grid
+//! [`ComputeContext::indirect`]: lichii_gpu::backend::ComputeContext::indirect
 
 use std::sync::Arc;
 
 use ash::vk;
 use gpu_allocator::MemoryLocation;
+use lichii_gpu::backend::QmdVersion;
 
 use super::host_compute::{HostCompute, storage};
 use crate::buffer_cache::BufferBinding;
@@ -25,6 +27,7 @@ const COMMAND_SIZE: u64 = size_of::<vk::DispatchIndirectCommand>() as u64;
 struct Params {
     limit: [u32; 3],
     grid_word: u32,
+    v3: u32,
 }
 
 /// The unpack pipeline and the command it writes. Every dispatch reuses the command, ordered
@@ -55,13 +58,14 @@ impl GridPass {
 }
 
 impl VulkanRasterizer {
-    /// Records the pass unpacking the grid words at byte `byte` of `grid` and returns the buffer
-    /// holding the `VkDispatchIndirectCommand`, at offset 0.
+    /// Records the pass unpacking the grid words in `layout` at byte `byte` of `grid` and returns
+    /// the buffer holding the `VkDispatchIndirectCommand`, at offset 0.
     pub(super) fn unpack_grid(
         &mut self,
         cmd: vk::CommandBuffer,
         grid: BufferBinding,
         byte: u32,
+        layout: QmdVersion,
     ) -> Result<vk::Buffer> {
         if self.draw.grid.is_none() {
             self.draw.grid = Some(GridPass::new(&self.device)?);
@@ -76,6 +80,7 @@ impl VulkanRasterizer {
         let params = Params {
             limit: self.device.properties.limits.max_compute_work_group_count,
             grid_word: (offset + byte) / 4,
+            v3: u32::from(layout == QmdVersion::V3),
         };
         let buffers = [
             grid,
