@@ -209,9 +209,10 @@ impl Host1xClient {
 
 impl Drop for Host1xClient {
     fn drop(&mut self) {
+        self.channel.close();
         for handle in self.pinned.get_mut().drain(..) {
             self.nvdrv.nvmap.unpin(handle);
         }
-        self.nvdrv.syncpoints.free(self.syncpoint);
+        self.nvdrv.syncpoints.retire(self.syncpoint);
     }
 }

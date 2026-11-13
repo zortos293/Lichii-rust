@@ -1052,6 +1052,50 @@ fn host1x_engine_channels_increment_syncpoints_as_their_command_buffers_run() {
 }
 
 #[test]
+fn closing_a_host1x_channel_retires_increments_it_never_ran() {
+    let nv = Nv::new(SWITCH1_TITLE, "nvdrv");
+    let nvmap = nv.open("/dev/nvmap");
+    let vic = nv.open("/dev/nvhost-vic");
+    let reply = nv.ioctl(vic, iowr(0, 0x2, 8), &[0; 8], 8);
+    let syncpoint = u32_at(&reply.output, 4);
+    let never = nv.nvdrv.syncpoints.allocate();
+    let commands = Bytes::default()
+        .u32((4 << 28) | syncpoint)
+        .u32(1 << 6)
+        .u32((4 << 28) | (0x4e << 16) | 1)
+        .u32((4 << 28) | (0x50 << 16) | never)
+        .u32((4 << 28) | syncpoint)
+        .0;
+    let (buffer, _) = nv.nvmap_buffer(nvmap, &commands, 0x1000);
+    let submit = Bytes::default()
+        .u32(1)
+        .u32(0)
+        .u32(1)
+        .u32(1)
+        .u32(buffer)
+        .u32(0)
+        .u32(5)
+        .u32(syncpoint)
+        .u32(2)
+        .zeroes(12)
+        .u32(0)
+        .0;
+    assert_eq!(
+        nv.ioctl(vic, iowr(0, 0x1, 16), &submit, submit.len())
+            .result,
+        0
+    );
+    nv.syncpoints()
+        .host()
+        .wait(syncpoint, 1, Some(std::time::Duration::from_secs(5)))
+        .expect("the first increment ran");
+    assert_eq!(nv.close(vic), 0);
+    assert!(!nv.nvdrv.syncpoints.is_allocated(syncpoint));
+    assert_eq!(nv.syncpoints().guest().value(syncpoint), Ok(2));
+    assert_eq!(nv.syncpoints().host().value(syncpoint), Ok(2));
+}
+
+#[test]
 fn flips_present_pinned_nvmap_buffers() {
     use lichii_gpu::backend::FramebufferConfig;
     use lichii_texture::PixelFormat;

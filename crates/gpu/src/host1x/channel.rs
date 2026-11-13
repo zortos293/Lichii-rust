@@ -59,7 +59,8 @@ const THI_METHOD_1: u32 = 0x11;
 /// at index 0xc0.
 const ENGINE_EXECUTE: u32 = 0xc0;
 
-/// An open video engine channel. Dropping it stops the channel once its current command returns.
+/// An open video engine channel. Closing or dropping it stops the channel once its current command
+/// returns.
 pub struct EngineChannel {
     submits: Option<mpsc::Sender<Vec<u32>>>,
     closing: Arc<AtomicBool>,
@@ -92,15 +93,21 @@ impl EngineChannel {
             let _ = submits.send(words);
         }
     }
-}
 
-impl Drop for EngineChannel {
-    fn drop(&mut self) {
+    /// Stops the channel and returns once its thread has; queued buffers that had not started
+    /// are dropped. Submissions after this are ignored.
+    pub fn close(&mut self) {
         self.closing.store(true, Ordering::Relaxed);
         self.submits = None;
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+impl Drop for EngineChannel {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
