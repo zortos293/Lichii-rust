@@ -147,3 +147,196 @@ pub fn work_buffer_size(params: &AudioRendererParameterInternal) -> u64 {
     size += (0x40 - 1) * 2;
     align_up(size, 0x1000)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::renderer::revision::encode_revision;
+
+    #[allow(clippy::too_many_arguments)]
+    fn params(
+        sample_rate: u32,
+        sample_count: u32,
+        mixes: u32,
+        sub_mixes: u32,
+        voices: u32,
+        sinks: u32,
+        effects: u32,
+        perf_frames: u32,
+        splitter_infos: u32,
+        splitter_destinations: i32,
+        revision: u32,
+    ) -> AudioRendererParameterInternal {
+        AudioRendererParameterInternal {
+            sample_rate,
+            sample_count,
+            mixes,
+            sub_mixes,
+            voices,
+            sinks,
+            effects,
+            perf_frames,
+            splitter_infos,
+            splitter_destinations,
+            revision,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn work_buffer_sizes_match_the_reference() {
+        let cases = [
+            (
+                params(
+                    48000,
+                    240,
+                    24,
+                    1,
+                    24,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    encode_revision(1, false),
+                ),
+                0x38000,
+                0x808,
+            ),
+            (
+                params(
+                    48000,
+                    240,
+                    24,
+                    4,
+                    96,
+                    2,
+                    4,
+                    0,
+                    2,
+                    8,
+                    encode_revision(4, false),
+                ),
+                0x74000,
+                0xD08,
+            ),
+            (
+                params(
+                    48000,
+                    240,
+                    24,
+                    4,
+                    96,
+                    2,
+                    4,
+                    1,
+                    2,
+                    8,
+                    encode_revision(5, false),
+                ),
+                0x83000,
+                0x1398,
+            ),
+            (
+                params(
+                    48000,
+                    240,
+                    24,
+                    8,
+                    128,
+                    2,
+                    8,
+                    2,
+                    4,
+                    16,
+                    encode_revision(9, false),
+                ),
+                0xC6000,
+                0x1758,
+            ),
+            (
+                params(
+                    48000,
+                    240,
+                    24,
+                    16,
+                    256,
+                    2,
+                    16,
+                    1,
+                    16,
+                    64,
+                    encode_revision(13, false),
+                ),
+                0x1BD000,
+                0x24D8,
+            ),
+            (
+                params(
+                    48000,
+                    240,
+                    24,
+                    8,
+                    192,
+                    2,
+                    8,
+                    1,
+                    8,
+                    32,
+                    encode_revision(15, false),
+                ),
+                0x108000,
+                0x1D58,
+            ),
+            (
+                params(
+                    48000,
+                    240,
+                    24,
+                    8,
+                    192,
+                    2,
+                    8,
+                    1,
+                    8,
+                    32,
+                    encode_revision(16, true),
+                ),
+                0x108000,
+                0x1D58,
+            ),
+            (
+                params(
+                    32000,
+                    160,
+                    12,
+                    2,
+                    64,
+                    1,
+                    2,
+                    0,
+                    0,
+                    0,
+                    encode_revision(15, true),
+                ),
+                0x41000,
+                0x1020,
+            ),
+        ];
+        for (params, size, frame) in cases {
+            let behavior = BehaviorInfo::new(params.revision);
+            assert_eq!(
+                work_buffer_size(&params),
+                size,
+                "revision {:#x}",
+                params.revision
+            );
+            assert_eq!(
+                performance::frame_size(&behavior, &params),
+                frame,
+                "revision {:#x}",
+                params.revision
+            );
+        }
+    }
+}
