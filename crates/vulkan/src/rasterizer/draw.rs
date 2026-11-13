@@ -34,7 +34,7 @@ use lichii_texture::tic::TextureMemory;
 use lichii_texture::{Numeric, PixelFormat};
 
 use super::VulkanRasterizer;
-use crate::buffer_cache::{IndexBinding, assembled_topology, vertex_stream_range};
+use crate::buffer_cache::{BufferBinding, IndexBinding, assembled_topology, vertex_stream_range};
 use crate::commands::{COLOR_RANGE, ImageAccess, transition};
 use crate::descriptors::DescriptorAllocator;
 use crate::device::Device;
@@ -187,6 +187,7 @@ pub(super) struct DrawState {
     blend_equations: Vec<vk::ColorBlendEquationEXT>,
     write_masks: Vec<vk::ColorComponentFlags>,
     texture_pipelines: Option<texture::TexturePipelines>,
+    assembly: Option<assembly::AssemblyPass>,
 }
 
 impl DrawState {
@@ -300,6 +301,7 @@ impl DrawState {
             blend_equations: Vec::new(),
             write_masks: Vec::new(),
             texture_pipelines: None,
+            assembly: None,
         })
     }
 
@@ -320,6 +322,17 @@ impl DrawState {
             unsafe { device.raw.destroy_sampler(sampler, None) };
         }
     }
+}
+
+/// The GPU buffers an indirect draw reads.
+#[derive(Clone, Copy)]
+pub(super) struct IndirectBuffers {
+    commands: BufferBinding,
+    count: Option<BufferBinding>,
+    /// The guest index buffer, for an assembled indexed draw.
+    indices: Option<assembly::GuestIndices>,
+    stride: u32,
+    max_draws: u32,
 }
 
 /// The draw a graphics call issues.
@@ -617,7 +630,7 @@ impl VulkanRasterizer {
                 DrawCall::Indirect(indirect) => self.indirect_index_buffer(gmmu, regs, indirect)?,
             };
             let indirect = match call {
-                DrawCall::Indirect(draw) => match self.indirect_buffers(gmmu, draw)? {
+                DrawCall::Indirect(draw) => match self.indirect_buffers(gmmu, regs, draw)? {
                     Some(buffers) => Some(buffers),
                     None => return Ok(()),
                 },
@@ -633,6 +646,15 @@ impl VulkanRasterizer {
         let set = self.descriptor_set(set_layout)?;
 
         let cmd = self.scheduler.record()?;
+        let (index, indirect) = match (call, indirect) {
+            (DrawCall::Indirect(draw), Some(inputs))
+                if assembled_topology(draw.topology) != draw.topology =>
+            {
+                let (index, commands) = self.assemble_indirect(cmd, regs, draw, &inputs)?;
+                (Some(index), Some(commands))
+            }
+            (_, indirect) => (index, indirect),
+        };
         let draw = &mut self.draw;
         for target in draw.colors.iter().flatten() {
             self.texture_cache
@@ -744,40 +766,46 @@ impl VulkanRasterizer {
                     params.first,
                     params.base_instance,
                 ),
-                (DrawCall::Indirect(params), Some((buffer, count)), index) => {
-                    let indexed = index.is_some();
-                    match (count, indexed) {
+                (DrawCall::Indirect(_), Some(buffers), index) => {
+                    let IndirectBuffers {
+                        commands,
+                        count,
+                        stride,
+                        max_draws,
+                        ..
+                    } = buffers;
+                    match (count, index.is_some()) {
                         (Some(count), true) => raw.cmd_draw_indexed_indirect_count(
                             cmd,
-                            buffer.buffer,
-                            buffer.offset,
+                            commands.buffer,
+                            commands.offset,
                             count.buffer,
                             count.offset,
-                            params.max_draws,
-                            params.stride,
+                            max_draws,
+                            stride,
                         ),
                         (Some(count), false) => raw.cmd_draw_indirect_count(
                             cmd,
-                            buffer.buffer,
-                            buffer.offset,
+                            commands.buffer,
+                            commands.offset,
                             count.buffer,
                             count.offset,
-                            params.max_draws,
-                            params.stride,
+                            max_draws,
+                            stride,
                         ),
                         (None, true) => raw.cmd_draw_indexed_indirect(
                             cmd,
-                            buffer.buffer,
-                            buffer.offset,
-                            params.max_draws,
-                            params.stride,
+                            commands.buffer,
+                            commands.offset,
+                            max_draws,
+                            stride,
                         ),
                         (None, false) => raw.cmd_draw_indirect(
                             cmd,
-                            buffer.buffer,
-                            buffer.offset,
-                            params.max_draws,
-                            params.stride,
+                            commands.buffer,
+                            commands.offset,
+                            max_draws,
+                            stride,
                         ),
                     }
                 }
@@ -1408,13 +1436,14 @@ impl VulkanRasterizer {
     }
 
     /// The whole index buffer of an indexed indirect draw, whose counts live in GPU memory.
+    /// Assembled draws read the guest indices in their assembly pass instead.
     fn indirect_index_buffer(
         &mut self,
         gmmu: &lichii_gpu::gmmu::Gmmu,
         regs: &Regs,
         draw: &IndirectDraw,
     ) -> Result<Option<IndexBinding>> {
-        if !draw.indexed {
+        if !draw.indexed || assembled_topology(draw.topology) != draw.topology {
             return Ok(None);
         }
         let width = match regs.index_buffer.format {
@@ -1442,26 +1471,15 @@ impl VulkanRasterizer {
             .index_buffer(&mut self.scheduler, &mut self.staging, gmmu, regs, &params)
     }
 
-    /// The command buffer and count buffer of an indirect draw. `None` skips the draw.
-    #[allow(clippy::type_complexity)]
+    /// The buffers an indirect draw reads. `None` skips the draw.
     fn indirect_buffers(
         &mut self,
         gmmu: &lichii_gpu::gmmu::Gmmu,
+        regs: &Regs,
         draw: &IndirectDraw,
-    ) -> Result<
-        Option<(
-            crate::buffer_cache::BufferBinding,
-            Option<crate::buffer_cache::BufferBinding>,
-        )>,
-    > {
-        if assembled_topology(draw.topology) != draw.topology {
-            self.draw.warn_once(
-                Warning::IndirectAssembly,
-                "indirect draws of quads and line loops are not assembled yet; skipping them",
-            );
-            return Ok(None);
-        }
-        if draw.count_buffer.is_some() && !self.device.features.draw_indirect_count {
+    ) -> Result<Option<IndirectBuffers>> {
+        let assembled = assembled_topology(draw.topology) != draw.topology;
+        if !assembled && draw.count_buffer.is_some() && !self.device.features.draw_indirect_count {
             self.draw.warn_once(
                 Warning::NoIndirectCount,
                 "the device cannot take indirect draw counts; skipping those draws",
@@ -1495,7 +1513,21 @@ impl VulkanRasterizer {
             },
             None => None,
         };
-        Ok(Some((commands, count)))
+        let indices = if assembled && draw.indexed {
+            let Some(indices) = self.guest_indices(gmmu, regs)? else {
+                return Ok(None);
+            };
+            Some(indices)
+        } else {
+            None
+        };
+        Ok(Some(IndirectBuffers {
+            commands,
+            count,
+            indices,
+            stride: draw.stride,
+            max_draws: draw.max_draws,
+        }))
     }
 
     /// Allocates and writes the draw's descriptor set.
@@ -2090,6 +2122,7 @@ fn storage_pointer(
     (address, 64 << 10)
 }
 
+mod assembly;
 mod texture;
 
 #[cfg(test)]

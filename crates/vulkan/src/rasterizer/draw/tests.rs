@@ -6,9 +6,9 @@ use lichii_gpu::backend::{
     GraphicsContext, IndirectDraw, QmdVersion, Rasterizer,
 };
 use lichii_gpu::engines::maxwell_3d::regs::{
-    ClearSurface, DepthMode, MAX_CONST_BUFFERS, MAX_SHADER_STAGE, PipelineBits, PrimitiveTopology,
-    RenderTargetConfigBits, RtControl, ScissorTestBits, ScissorTestBits1, ShaderType,
-    SurfaceClipBits, SurfaceClipBits1, TileMode, VertexAttribute, VertexStreamBits,
+    ClearSurface, DepthMode, IndexFormat, MAX_CONST_BUFFERS, MAX_SHADER_STAGE, PipelineBits,
+    PrimitiveTopology, RenderTargetConfigBits, RtControl, ScissorTestBits, ScissorTestBits1,
+    ShaderType, SurfaceClipBits, SurfaceClipBits1, TileMode, VertexAttribute, VertexStreamBits,
 };
 use lichii_gpu::engines::maxwell_3d::{DirtyState, Regs};
 use lichii_gpu::gmmu::Gmmu;
@@ -19,6 +19,7 @@ use lichii_texture::block_linear::{GobLayout, Tiling, swizzle};
 use super::super::tests::{DADDR, Fixture, GPU_VA, fixture, gmmu, guest_linear};
 use super::{StageSources, Warning};
 use crate::pipeline::environment::TexturePool;
+use crate::rasterizer::VulkanRasterizer;
 
 const SIZE: u32 = 16;
 const PROGRAMS: u64 = 0x10_0000;
@@ -1479,4 +1480,310 @@ fn draws_load_rescaled_storage_images_at_guest_coordinates() {
     );
     assert_eq!(f.rasterizer.draw.image_scaling.words, [1, 0]);
     f.assert_no_validation_errors();
+}
+
+const INDICES: u64 = 0x70_0000;
+const COMMANDS: u64 = 0x71_0000;
+const COUNT: u64 = 0x72_0000;
+const ORANGE: [u8; 4] = [255, 128, 0, 255];
+
+/// `draw_regs` over the XY `vertices`, with the u16 `indices` bound when set.
+fn assembly_regs(
+    f: &Fixture,
+    vertices: &[f32],
+    indices: Option<&[u16]>,
+    restart: bool,
+) -> Box<Regs> {
+    let mut regs = draw_regs();
+    write(f, VERTICES, &f32_bytes(vertices));
+    let limit = GPU_VA + VERTICES + 4 * vertices.len() as u64 - 1;
+    regs.vertex_stream_limits[0].address_high = (limit >> 32) as u32;
+    regs.vertex_stream_limits[0].address_low = limit as u32;
+    if let Some(indices) = indices {
+        write(f, INDICES, bytemuck::cast_slice(indices));
+        let start = GPU_VA + INDICES;
+        let limit = start + 2 * indices.len() as u64 - 1;
+        let buffer = &mut regs.index_buffer;
+        buffer.start_addr_high = (start >> 32) as u32;
+        buffer.start_addr_low = start as u32;
+        buffer.limit_addr_high = (limit >> 32) as u32;
+        buffer.limit_addr_low = limit as u32;
+        buffer.format = IndexFormat::UNSIGNED_SHORT;
+    }
+    regs.primitive_restart.enabled = u32::from(restart);
+    regs
+}
+
+/// The target after `issue` draws over `assembly_regs` on a fresh fixture, with `memory`
+/// written first, as rows of `#` for drawn and `.` for untouched texels; `None` without a
+/// Vulkan device.
+fn render(
+    vertices: &[f32],
+    indices: Option<&[u16]>,
+    restart: bool,
+    memory: &[(u64, &[u32])],
+    issue: impl FnOnce(&mut VulkanRasterizer, &mut GraphicsContext<'_>),
+) -> Option<Vec<String>> {
+    let (mut f, gmmu) = draw_fixture()?;
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    for &(offset, words) in memory {
+        write(&f, offset, bytemuck::cast_slice(words));
+    }
+    let regs = assembly_regs(&f, vertices, indices, restart);
+    let mut dirty = DirtyState::new();
+    let const_buffers = const_buffers();
+    let root_tables = [[0; 64]; 8];
+    let mut ctx = GraphicsContext {
+        channel: ChannelId(0),
+        memory: &gmmu,
+        regs: &regs,
+        dirty: &mut dirty,
+        const_buffers: &const_buffers,
+        root_tables: &root_tables,
+    };
+    issue(&mut f.rasterizer, &mut ctx);
+    let texels = target(&mut f);
+    f.assert_no_validation_errors();
+    let picture = texels
+        .chunks(SIZE as usize)
+        .map(|row| {
+            row.iter()
+                .map(|&t| match t {
+                    ORANGE => '#',
+                    [0, 0, 0, 0] => '.',
+                    _ => '?',
+                })
+                .collect()
+        })
+        .collect();
+    Some(picture)
+}
+
+fn direct(
+    topology: PrimitiveTopology,
+    indexed: bool,
+    count: u32,
+) -> impl FnOnce(&mut VulkanRasterizer, &mut GraphicsContext<'_>) {
+    move |r, ctx| {
+        r.draw(
+            ctx,
+            &DrawParams {
+                topology,
+                indexed,
+                first: 0,
+                count,
+                base_vertex: 0,
+                base_instance: 0,
+                instance_count: 1,
+                inline_indices: None,
+            },
+        )
+    }
+}
+
+fn indirect(
+    topology: PrimitiveTopology,
+    indexed: bool,
+    stride: u32,
+    max_draws: u32,
+    count_buffer: Option<u64>,
+) -> impl FnOnce(&mut VulkanRasterizer, &mut GraphicsContext<'_>) {
+    move |r, ctx| {
+        r.draw_indirect(
+            ctx,
+            &IndirectDraw {
+                topology,
+                indexed,
+                buffer: GPU_VA + COMMANDS,
+                stride,
+                max_draws,
+                count_buffer: count_buffer.map(|offset| GPU_VA + offset),
+            },
+        )
+    }
+}
+
+fn colored(picture: &[String]) -> usize {
+    picture.iter().map(|row| row.matches('#').count()).sum()
+}
+
+/// Quad A covers the left half of the target, quad B a quarter of the right half.
+const TWO_QUADS: [f32; 16] = [
+    -1.0, -1.0, 0.0, -1.0, 0.0, 1.0, -1.0, 1.0, //
+    0.0, -1.0, 1.0, -1.0, 1.0, 0.0, 0.0, 0.0,
+];
+
+#[test]
+fn indirect_quads_draw_the_pixels_of_direct_quads() {
+    let Some(expected) = render(
+        &TWO_QUADS,
+        None,
+        false,
+        &[],
+        direct(PrimitiveTopology::QUADS, false, 8),
+    ) else {
+        return;
+    };
+    assert_eq!(colored(&expected), 128 + 64, "both quads drew");
+
+    let commands = [4, 1, 0, 0, 4, 1, 4, 0];
+    let arrays = render(
+        &TWO_QUADS,
+        None,
+        false,
+        &[(COMMANDS, &commands)],
+        indirect(PrimitiveTopology::QUADS, false, 16, 2, None),
+    )
+    .unwrap();
+    assert_eq!(arrays, expected, "one quad per non-indexed command");
+
+    let indices = [7, 0, 1, 2, 3, 2, 3, 4, 5];
+    let commands = [4, 1, 1, 0, 0, 0, 4, 1, 5, 2, 0, 0];
+    let elements = render(
+        &TWO_QUADS,
+        Some(&indices),
+        false,
+        &[(COMMANDS, &commands)],
+        indirect(PrimitiveTopology::QUADS, true, 24, 2, None),
+    )
+    .unwrap();
+    assert_eq!(
+        elements, expected,
+        "indexed commands with their first index and vertex offset"
+    );
+}
+
+#[test]
+fn indirect_quad_strips_restart_like_direct_ones() {
+    let vertices = [
+        -1.0, -1.0, -1.0, 1.0, 0.0, -1.0, 0.0, 1.0, //
+        0.0, -1.0, 0.0, 0.0, 1.0, -1.0, 1.0, 0.0,
+    ];
+    let indices = [0, 1, 2, 3, 0xffff, 4, 5, 6, 7];
+    let Some(expected) = render(
+        &vertices,
+        Some(&indices),
+        true,
+        &[],
+        direct(PrimitiveTopology::QUAD_STRIP, true, 9),
+    ) else {
+        return;
+    };
+    assert_eq!(colored(&expected), 128 + 64, "both strips drew");
+    let drawn = render(
+        &vertices,
+        Some(&indices),
+        true,
+        &[(COMMANDS, &[9, 1, 0, 0, 0])],
+        indirect(PrimitiveTopology::QUAD_STRIP, true, 20, 1, None),
+    )
+    .unwrap();
+    assert_eq!(drawn, expected);
+}
+
+#[test]
+fn indirect_line_loops_close() {
+    let (near, far) = (2.5 / 8.0 - 1.0, 13.5 / 8.0 - 1.0);
+    let square = [near, near, far, near, far, far, near, far];
+    let left_edge = |picture: &[String]| picture[8].as_bytes()[2] == b'#';
+    let Some(expected) = render(
+        &square,
+        None,
+        false,
+        &[],
+        direct(PrimitiveTopology::LINE_LOOP, false, 4),
+    ) else {
+        return;
+    };
+    assert!(left_edge(&expected), "the closing line drew");
+    assert_eq!(expected[8].as_bytes()[8], b'.', "lines only");
+    let drawn = render(
+        &square,
+        None,
+        false,
+        &[(COMMANDS, &[4, 1, 0, 0])],
+        indirect(PrimitiveTopology::LINE_LOOP, false, 16, 1, None),
+    )
+    .unwrap();
+    assert_eq!(drawn, expected);
+
+    let mut vertices = square.to_vec();
+    vertices.extend([-0.25, -0.25, 0.25, -0.25, 0.0, 0.25]);
+    let indices = [0, 1, 2, 3, 0xffff, 4, 5, 6];
+    let expected = render(
+        &vertices,
+        Some(&indices),
+        true,
+        &[],
+        direct(PrimitiveTopology::LINE_LOOP, true, 8),
+    )
+    .unwrap();
+    let drawn = render(
+        &vertices,
+        Some(&indices),
+        true,
+        &[(COMMANDS, &[8, 1, 0, 0, 0])],
+        indirect(PrimitiveTopology::LINE_LOOP, true, 20, 1, None),
+    )
+    .unwrap();
+    assert!(left_edge(&drawn), "the first loop closed");
+    assert_eq!(drawn, expected, "each run between restart indices closes");
+}
+
+#[test]
+fn indirect_quads_draw_only_the_commands_the_count_buffer_names() {
+    let Some(expected) = render(
+        &TWO_QUADS,
+        None,
+        false,
+        &[],
+        direct(PrimitiveTopology::QUADS, false, 4),
+    ) else {
+        return;
+    };
+    assert_eq!(colored(&expected), 128, "quad A alone");
+    let commands = [4, 1, 0, 0, 4, 1, 4, 0];
+    let drawn = render(
+        &TWO_QUADS,
+        None,
+        false,
+        &[(COMMANDS, &commands), (COUNT, &[1])],
+        indirect(PrimitiveTopology::QUADS, false, 16, 2, Some(COUNT)),
+    )
+    .unwrap();
+    assert_eq!(drawn, expected);
+}
+
+#[test]
+fn indirect_assembly_carries_runs_across_workgroup_chunks() {
+    let mut indices = vec![0, 1, 2, 3];
+    indices.resize(62, 0xffff);
+    indices.extend([4, 5, 6, 7]);
+    let Some(expected) = render(
+        &TWO_QUADS,
+        Some(&indices),
+        true,
+        &[],
+        direct(PrimitiveTopology::QUADS, true, indices.len() as u32),
+    ) else {
+        return;
+    };
+    assert_eq!(colored(&expected), 128 + 64, "both quads drew");
+    let count = indices.len() as u32;
+    let drawn = render(
+        &TWO_QUADS,
+        Some(&indices),
+        true,
+        &[(COMMANDS, &[count, 1, 0, 0, 0])],
+        indirect(PrimitiveTopology::QUADS, true, 20, 1, None),
+    )
+    .unwrap();
+    assert_eq!(
+        drawn, expected,
+        "quad B spans indices 62..66, across the first 64-index chunk"
+    );
 }
