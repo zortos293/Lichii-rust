@@ -38,6 +38,7 @@ mod am;
 mod context;
 mod dispatch;
 mod fs;
+mod gsv;
 mod nvdrv;
 #[cfg(test)]
 mod testing;
