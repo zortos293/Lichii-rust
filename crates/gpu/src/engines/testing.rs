@@ -58,7 +58,7 @@ impl Rasterizer for Recorder {
 /// [`MAPPED`] bytes of zeroed GPU memory at GPU VA 0, and a recording renderer.
 pub struct Harness {
     _space: AddressSpace,
-    pub memory: Gmmu,
+    pub memory: Arc<Gmmu>,
     pub rasterizer: Recorder,
     pub syncpoints: Syncpoints,
     pub gob_layout: GobLayout,
@@ -74,7 +74,7 @@ impl Harness {
         let device = Arc::new(DeviceAddressSpace::new(physical, 36));
         let daddr = 0x4_0000_0000;
         device.map_process(daddr, &space, CPU_VA, MAPPED).unwrap();
-        let memory = Gmmu::new(device, BigPageSize::Size64K);
+        let memory = Arc::new(Gmmu::new(device, BigPageSize::Size64K));
         memory.map(0, daddr, MAPPED, 0, false).unwrap();
         Self {
             _space: space,
