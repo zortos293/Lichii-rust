@@ -94,6 +94,34 @@ fn point_size_scales_up() {
     );
 }
 
+/// The offset is in guest pixels; the host interpolates in rescaled ones.
+#[test]
+fn interpolation_offsets_scale_up_in_fragment_programs() {
+    let (mut prog, b) = program();
+    let interpolate = prog.append(
+        b,
+        Opcode::InterpolateAtOffset,
+        &[
+            Value::Attribute(Attribute::generic(0, 0)),
+            Value::F32(0.25),
+            Value::F32(-0.5),
+        ],
+        0,
+    );
+    rescaling(&mut prog, ShaderStage::Fragment, ResolutionScale::X2);
+    for (index, offset) in [(1, 0.25), (2, -0.5)] {
+        let scaled = arg_inst(&prog, interpolate, index);
+        assert_eq!(prog.op(scaled), Opcode::FPMul32);
+        assert_eq!(prog.arg(scaled, 0), Value::F32(offset));
+        let up = arg_inst(&prog, scaled, 1);
+        assert_eq!(prog.op(up), Opcode::FPRecip32);
+        assert_eq!(
+            prog.op(arg_inst(&prog, up, 0)),
+            Opcode::ResolutionDownFactor
+        );
+    }
+}
+
 fn query(prog: &mut Program, block: BlockId, ty: TextureType) -> InstId {
     prog.append(
         block,

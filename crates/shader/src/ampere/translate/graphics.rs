@@ -165,7 +165,7 @@ fn ipa(t: &mut Translator<'_>) -> TResult {
             return Err(t.unsupported());
         }
         let offset = t.x(insn.src1());
-        interpolate_at_offset(t, Attribute(word), offset)
+        interpolate_at_offset(t, Attribute(word), offset)?
     } else if indexed {
         let base = t.x(index);
         let address = t.ir.iadd(base, Value::U32(u32::from(word) * 4));
@@ -178,28 +178,40 @@ fn ipa(t: &mut Translator<'_>) -> TResult {
 }
 
 /// IPA.OFFSET's offset holds x in the low and y in the high halfword, signed with 12 fraction
-/// bits (NAK's `load_barycentric_offset`). Generic inputs interpolate at it. The others are
-/// either flat or, like the position, linear in screen space, so the value moves along its
-/// fine derivatives.
-fn interpolate_at_offset(t: &mut Translator<'_>, attribute: Attribute, offset: Value) -> Value {
-    let [x, y] = [0, 16].map(|shift| {
+/// bits (NAK's `load_barycentric_offset`). Generic inputs interpolate at it, the position's x
+/// and y move by it, and system values that are constant over the primitive read as they are.
+/// The position's z and w and the point coordinate would need the hardware's interpolation.
+fn interpolate_at_offset(
+    t: &mut Translator<'_>,
+    attribute: Attribute,
+    offset: Value,
+) -> Result<Value, TranslateError> {
+    let half = |t: &mut Translator<'_>, shift: u32| {
         let half =
             t.ir.bit_field_extract(offset, Value::U32(shift), Value::U32(16), true);
         let half =
             t.ir.convert_i_to_f(32, 32, true, half, FpControl::default());
         t.ir.fp_mul(half, Value::F32(1.0 / 4096.0), FpControl::default())
-    });
-    if attribute.is_generic() {
-        return t.ir.inst(
-            Ir::InterpolateAtOffset,
-            &[Value::Attribute(attribute), x, y],
-        );
-    }
+    };
+    let shift = match attribute {
+        _ if attribute.is_generic() => {
+            let (x, y) = (half(t, 0), half(t, 16));
+            return Ok(t.ir.inst(
+                Ir::InterpolateAtOffset,
+                &[Value::Attribute(attribute), x, y],
+            ));
+        }
+        Attribute::POSITION_X => 0,
+        Attribute::POSITION_Y => 16,
+        Attribute::PRIMITIVE_ID
+        | Attribute::LAYER
+        | Attribute::VIEWPORT_INDEX
+        | Attribute::FRONT_FACE => return Ok(t.ir.get_attribute(attribute, Value::U32(0))),
+        _ => return Err(t.unsupported()),
+    };
+    let delta = half(t, shift);
     let value = t.ir.get_attribute(attribute, Value::U32(0));
-    let dx = t.ir.inst(Ir::DPdxFine, &[value]);
-    let dy = t.ir.inst(Ir::DPdyFine, &[value]);
-    let value = t.ir.fp_fma(dx, x, value, FpControl::default());
-    t.ir.fp_fma(dy, y, value, FpControl::default())
+    Ok(t.ir.fp_add(value, delta, FpControl::default()))
 }
 
 fn is_task_or_mesh(t: &Translator<'_>) -> bool {
@@ -684,12 +696,41 @@ mod tests {
     }
 
     #[test]
-    fn ipa_offset_moves_other_inputs_along_their_derivatives() {
-        let ir = run(Fragment, ipa_at_offset(28, 0));
-        for op in ["GetAttribute PositionX", "DPdxFine", "DPdyFine", "FPFma32"] {
-            assert!(ir.contains(op), "{ir}");
+    fn ipa_offset_moves_the_position_by_the_offset() {
+        assert_eq!(
+            run(Fragment, ipa_at_offset(29, 0)),
+            "{0}:\n\
+             \x20 %0 = GetRegister R4\n\
+             \x20 %1 = BitFieldSExtract %0, #0x10, #0x10\n\
+             \x20 %2 = ConvertF32S32 %1\n\
+             \x20 %3 = FPMul32 %2, #0.00024414063f\n\
+             \x20 %4 = GetAttribute PositionY, #0x0\n\
+             \x20 %5 = FPAdd32 %4, %3\n\
+             \x20 %6 = BitCastU32F32 %5\n\
+             \x20 SetRegister R1, %6\n"
+        );
+        assert!(run(Fragment, ipa_at_offset(28, 0)).contains("BitFieldSExtract %0, #0x0, #0x10"));
+    }
+
+    #[test]
+    fn ipa_offset_reads_flat_system_values_as_they_are() {
+        for (word, name) in [
+            (24, "PrimitiveId"),
+            (25, "Layer"),
+            (26, "ViewportIndex"),
+            (255, "FrontFace"),
+        ] {
+            assert_eq!(
+                run(Fragment, ipa_at_offset(word, 0)),
+                format!(
+                    "{{0}}:\n\
+                     \x20 %0 = GetRegister R4\n\
+                     \x20 %1 = GetAttribute {name}, #0x0\n\
+                     \x20 %2 = BitCastU32F32 %1\n\
+                     \x20 SetRegister R1, %2\n"
+                )
+            );
         }
-        assert!(!ir.contains("InterpolateAtOffset"), "{ir}");
     }
 
     #[test]
@@ -704,6 +745,9 @@ mod tests {
     fn ipa_other_modes_are_unsupported() {
         rejects(Fragment, ipa(32, 3 << 76));
         rejects(VertexB, ipa_at_offset(32, 0));
+        for word in [30, 31, 184] {
+            rejects(Fragment, ipa_at_offset(word, 0));
+        }
         let indexed = dst(1) | ra(5) | rb(4) | (32 << 64) | PT_DST | (2 << 76);
         rejects(Fragment, encode(Opcode::Ipa, Form::UregIndexed, indexed));
         rejects(Fragment, ipa(32, 2 << 78));
@@ -1091,8 +1135,8 @@ mod tests {
             ipa_to(4, 34, 0),
             ipa_at_offset_to(0, 32, 0),
             ipa_at_offset_to(1, 33, 0),
-            ipa_to(2, 34, 0),
-            ipa_at_offset_to(3, 31, 0),
+            ipa_at_offset_to(2, 28, 0),
+            ipa_at_offset_to(3, 255, 0),
             exit(),
         ];
         let env = whole_program(
@@ -1107,7 +1151,7 @@ mod tests {
         );
         let ir = compile("ampere_fragment_offset", &env);
         assert_eq!(ir.matches("InterpolateAtOffset").count(), 2, "{ir}");
-        assert!(ir.contains("DPdxFine"), "{ir}");
+        assert!(!ir.contains("DPdx"), "{ir}");
     }
 
     #[test]
