@@ -404,6 +404,8 @@ impl ShaderCache {
         if wildcard {
             reads = Default::default();
         }
+        self.answers.clear();
+        self.answers.reserve(reads[0].len() + reads[1].len());
         self.modules
             .entry(key)
             .or_default()
