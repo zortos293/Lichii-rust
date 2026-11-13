@@ -156,8 +156,27 @@ extern "sysv64" fn atomic_slow(state: &mut JitState, addr: u64, pc: u64, info: u
         state.fault = Some(CpuFault::Alignment { pc, addr });
         return true;
     }
+    let (scratch, scratch2) = (state.scratch, state.scratch2);
+    let op = (info >> 8) as i32;
     // SAFETY: called from a slow path.
-    let Ok(ptr) = unsafe { state.memory() }.access(addr, MemoryPermission::READ_WRITE) else {
+    let memory = unsafe { state.memory() };
+    let result = memory.write_with(addr, MemoryPermission::READ_WRITE, |ptr| {
+        if size == 4 {
+            // SAFETY: the pair is 16-byte aligned, so it lies in the one page of `ptr`.
+            return unsafe { cas128(ptr, scratch, scratch2) };
+        }
+        let (operand, second) = (scratch as u64, scratch2 as u64);
+        // SAFETY: the access is naturally aligned, so it stays inside the one mapped guest page
+        // of `ptr`.
+        u128::from(unsafe {
+            if op == x64::ATOMIC_CAS {
+                atomic_cas(ptr, size, operand, second)
+            } else {
+                atomic_rmw(ptr, size, ATOMIC_OPS[op as usize], operand)
+            }
+        })
+    });
+    let Ok(old) = result else {
         state.fault = Some(CpuFault::Data {
             pc,
             addr,
@@ -165,25 +184,10 @@ extern "sysv64" fn atomic_slow(state: &mut JitState, addr: u64, pc: u64, info: u
         });
         return true;
     };
+    state.scratch = old;
     if size == 4 {
-        // SAFETY: the pair is 16-byte aligned, so it lies in the one page `translate` returned.
-        let old = unsafe { cas128(ptr, state.scratch, state.scratch2) };
-        state.scratch = old;
         state.high = (old >> 64) as u64;
-        return false;
     }
-    let (operand, second) = (state.scratch as u64, state.scratch2 as u64);
-    let op = (info >> 8) as i32;
-    // SAFETY: the access is naturally aligned, so it stays inside the one mapped guest page that
-    // `translate` returned.
-    let old = unsafe {
-        if op == x64::ATOMIC_CAS {
-            atomic_cas(ptr, size, operand, second)
-        } else {
-            atomic_rmw(ptr, size, ATOMIC_OPS[op as usize], operand)
-        }
-    };
-    state.scratch = old as u128;
     false
 }
 

@@ -310,14 +310,20 @@ impl Exec<'_> {
         }
     }
 
-    /// Host pointer for an atomic access of `bytes` bytes, which must be naturally aligned.
-    fn atomic_ptr(&self, addr: VAddr, bytes: u64) -> Result<*mut u8, HaltReason> {
+    /// Runs `op` on the host pointer for an atomic access of `bytes` bytes, which must be
+    /// naturally aligned, so it lies in one mapped page.
+    fn atomic<R>(
+        &self,
+        addr: VAddr,
+        bytes: u64,
+        op: impl FnOnce(*mut u8) -> R,
+    ) -> Result<R, HaltReason> {
         if addr & (bytes - 1) != 0 {
             return Err(self.fault(CpuFault::Alignment { pc: self.pc, addr }));
         }
         self.cfg
             .memory
-            .access(addr, MemoryPermission::READ_WRITE)
+            .write_with(addr, MemoryPermission::READ_WRITE, op)
             .map_err(|_| self.data_fault(addr, true))
     }
 
@@ -920,39 +926,44 @@ impl Exec<'_> {
                 rn,
                 ..
             } => {
-                let ptr = self.atomic_ptr(self.x(rn), 1 << size)?;
                 let operand = self.x(rs);
-                // SAFETY: `atomic_ptr` checked that the access is naturally aligned and inside one
+                // SAFETY: `atomic` checked that the access is naturally aligned and inside one
                 // mapped guest page, which outlives this call.
-                let old = unsafe { atomic_rmw(ptr, size, op, operand) };
+                let old = self.atomic(self.x(rn), 1 << size, |ptr| unsafe {
+                    atomic_rmw(ptr, size, op, operand)
+                })?;
                 self.set(rt, old);
             }
             Inst::Cas {
                 size, rs, rt, rn, ..
             } => {
-                let ptr = self.atomic_ptr(self.x(rn), 1 << size)?;
                 let (expected, new) = (self.x(rs), self.x(rt));
                 // SAFETY: as for `AtomicRmw`.
-                let old = unsafe { atomic_cas(ptr, size, expected, new) };
+                let old = self.atomic(self.x(rn), 1 << size, |ptr| unsafe {
+                    atomic_cas(ptr, size, expected, new)
+                })?;
                 self.set(rs, old);
             }
             Inst::Casp {
                 size, rs, rt, rn, ..
             } => {
-                let ptr = self.atomic_ptr(self.x(rn), 2 << size)?;
                 let pair = |r: u8| (self.x(Reg(r)), self.x(Reg(r + 1)));
                 let ((e0, e1), (n0, n1)) = (pair(rs), pair(rt));
                 let (o0, o1) = if size == 2 {
                     let expected = (e1 << 32) | (e0 & 0xffff_ffff);
                     let new = (n1 << 32) | (n0 & 0xffff_ffff);
                     // SAFETY: as for `AtomicRmw`.
-                    let old = unsafe { atomic_cas(ptr, 3, expected, new) };
+                    let old = self.atomic(self.x(rn), 2 << size, |ptr| unsafe {
+                        atomic_cas(ptr, 3, expected, new)
+                    })?;
                     (old & 0xffff_ffff, old >> 32)
                 } else {
                     let expected = (e1 as u128) << 64 | e0 as u128;
                     let new = (n1 as u128) << 64 | n0 as u128;
-                    // SAFETY: `atomic_ptr` checked 16-byte alignment, so the pair lies in one page.
-                    let old = unsafe { cas128(ptr, expected, new) };
+                    // SAFETY: `atomic` checked 16-byte alignment, so the pair lies in one page.
+                    let old = self.atomic(self.x(rn), 2 << size, |ptr| unsafe {
+                        cas128(ptr, expected, new)
+                    })?;
                     (old as u64, (old >> 64) as u64)
                 };
                 self.set(Reg(rs), o0);

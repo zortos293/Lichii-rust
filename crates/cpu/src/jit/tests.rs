@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use lichii_common::settings::CpuAccuracy;
-use lichii_memory::{AddressSpace, ExclusiveMonitor, MemoryPermission, PhysicalMemory};
+use lichii_memory::{
+    AddressSpace, DeviceAddressSpace, ExclusiveMonitor, MemoryPermission, PhysicalMemory,
+};
 
 use super::{Jit, Passes, simd};
 use crate::decoder::{Inst, decode};
@@ -2017,5 +2019,97 @@ fn crc32_matches_the_interpreter() {
     for _ in 0..300 {
         let regs: Vec<(usize, u64)> = (0..20).map(|r| (r, rng.interesting())).collect();
         directed(&code, &regs);
+    }
+}
+
+#[test]
+fn stores_to_gpu_cached_pages_land_and_are_reported() {
+    const STR_X1_X2: u32 = 0xf900_0041;
+    const STR_X1_X2_8: u32 = 0xf900_0441;
+    const STP_X1_X3_X2: u32 = 0xa900_0c41;
+    const LDADD_X1_X0_X2: u32 = 0xf821_0040;
+    const LDXR_X0_X2: u32 = 0xc85f_7c40;
+    const STXR_W4_X1_X2: u32 = 0xc804_7c41;
+    const DC_ZVA_X2: u32 = 0xd50b_7422;
+    const ST1_V0_X2: u32 = 0x4c00_7040;
+    const DADDR: u64 = 0x1_0000_0000;
+    const STR_Q0_X2: u32 = 0x3d80_0040;
+    const ST2_V0_V1_X2: u32 = 0x4c00_8040;
+    const SWP_X1_X0_X2: u32 = 0xf821_8040;
+    const STLR_X1_X2: u32 = 0xc89f_fc41;
+    let cases: [(&str, &[u32]); 10] = [
+        ("str", &[STR_X1_X2]),
+        ("str q", &[STR_Q0_X2]),
+        ("st2", &[ST2_V0_V1_X2]),
+        ("swp", &[SWP_X1_X0_X2]),
+        ("stlr", &[STLR_X1_X2]),
+        ("stp", &[STP_X1_X3_X2]),
+        ("ldadd", &[LDADD_X1_X0_X2]),
+        ("ldxr/stxr", &[LDXR_X0_X2, STXR_W4_X1_X2]),
+        ("dc zva", &[DC_ZVA_X2]),
+        ("st1", &[ST1_V0_X2]),
+    ];
+    let run = |backend: Backend, code: &[u32]| {
+        let mut machine = Machine::new(backend);
+        let device = DeviceAddressSpace::new(machine.mem.physical().clone(), 36);
+        device.attach_process(machine.mem.clone());
+        device
+            .map_process(DADDR, &machine.mem, DATA, DATA_SIZE)
+            .unwrap();
+        let mut words = code.to_vec();
+        words.push(BRK);
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        machine.mem.write_bytes(CODE, &bytes).unwrap();
+        machine.mem.write_bytes(DATA, &[0x5a; 0x1000]).unwrap();
+        machine.core.clear_code_cache();
+        let mut reported = Vec::new();
+        let cached = device.cache_pages(DADDR, 0x1000);
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            ..Default::default()
+        };
+        ctx.x[1] = 0x1111_2222_3333_4444;
+        ctx.x[2] = DATA + 0x100;
+        ctx.x[3] = 0x5555_6666_7777_8888;
+        let halt = machine.core.run(&mut ctx);
+        device.take_cpu_writes(|daddr, size| reported.push((daddr, size)));
+
+        let again = [STR_X1_X2_8, BRK];
+        let bytes: Vec<u8> = again.iter().flat_map(|w| w.to_le_bytes()).collect();
+        machine.mem.write_bytes(CODE, &bytes).unwrap();
+        machine.core.clear_code_cache();
+        let mut second = ctx.clone();
+        second.pc = CODE;
+        machine.core.run(&mut second);
+        let mut later = Vec::new();
+        device.take_cpu_writes(|daddr, size| later.push((daddr, size)));
+        drop(cached);
+
+        let mut data = vec![0; 0x1000];
+        machine.mem.read_bytes(DATA, &mut data).unwrap();
+        (halt, ctx, data, reported, later)
+    };
+    for (what, code) in cases {
+        let expected = run(Backend::Interpreter, code);
+        assert_eq!(expected.3, [(DADDR, 0x1000)], "interpreter {what}");
+        assert!(
+            expected.4.is_empty(),
+            "interpreter {what}: the page stays untracked"
+        );
+        for (name, backend) in [
+            ("jit", Backend::Jit(Passes::ALL)),
+            ("jit without fastmem", Backend::SlowJit),
+            ("jit without cmpxchg16b", Backend::NoCmpxchg16b),
+        ] {
+            let actual = run(backend, code);
+            assert_eq!(actual.0, expected.0, "{name} {what}: halt");
+            assert_eq!(actual.1, expected.1, "{name} {what}: registers");
+            assert!(actual.2 == expected.2, "{name} {what}: memory");
+            assert_eq!(actual.3, [(DADDR, 0x1000)], "{name} {what}: reported");
+            assert!(
+                actual.4.is_empty(),
+                "{name} {what}: the page stays untracked"
+            );
+        }
     }
 }
