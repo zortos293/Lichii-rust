@@ -269,8 +269,8 @@ impl VulkanRasterizer {
             return Ok(());
         }
         let source = |value: f32| scaled(value, src_scale) as f32;
-        let source_width = source((header.width >> header.min_level).max(1) as f32);
-        let source_height = source((header.height >> header.min_level).max(1) as f32);
+        let source_width = source((header.width >> header.min_level).max(1) as f32).max(1.0);
+        let source_height = source((header.height >> header.min_level).max(1) as f32).max(1.0);
         let (sx0, sy0) = (source(draw.src_x0), source(draw.src_y0));
         let (sx1, sy1) = (source(draw.src_x1), source(draw.src_y1));
         let params = Params {

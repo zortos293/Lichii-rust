@@ -973,6 +973,30 @@ fn draws_query_rescaled_textures_at_their_guest_size() {
 }
 
 #[test]
+fn draws_skip_images_rescaled_at_an_earlier_scale() {
+    let Some((mut f, gmmu)) = rescaled_fixture() else {
+        return;
+    };
+    paint_source(&mut f, &gmmu);
+    f.rasterizer.apply_settings(&GraphicsSettings {
+        resolution_scale: ResolutionScale::X3,
+        async_shader_compilation: false,
+        ..GraphicsSettings::default()
+    });
+    let mut regs = sampling_regs();
+    regs.rt[0].format = 0xe4;
+    read_with(&mut f, &gmmu, &mut regs, &query_program(0), 0);
+    assert_ne!(f.rasterizer.draw.warned & Warning::StaleScale as u32, 0);
+    assert!(
+        target(&mut f)
+            .iter()
+            .all(|&t| u32::from_le_bytes(t) != SOURCE.0),
+        "the stale image was not sampled"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
 fn draws_filter_rescaled_textures_at_guest_coordinates() {
     let Some((mut f, gmmu)) = rescaled_fixture() else {
         return;

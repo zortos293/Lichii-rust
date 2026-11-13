@@ -67,6 +67,8 @@ enum Warning {
     NoIndirectCount = 1 << 4,
     DrawTextureTarget = 1 << 7,
     DrawTextureSource = 1 << 8,
+    StaleScale = 1 << 6,
+    MixedScaleArray = 1 << 9,
 }
 
 /// A descriptor write of the current draw: `count` infos from `first` of the info list for
@@ -961,6 +963,7 @@ impl VulkanRasterizer {
                     }
                     DescriptorKind::CombinedImageSampler => {
                         let desc = info.texture_descriptors[descriptor];
+                        let mut array_rescaled = None;
                         for i in 0..b.count {
                             let h = desc.handle;
                             let offset = h.cbuf_offset + (i << desc.size_shift);
@@ -976,12 +979,25 @@ impl VulkanRasterizer {
                             } else {
                                 self.texture_view(src, raw, desc.ty)?
                             };
-                            if let Some((id, _)) = texture
-                                && self
-                                    .texture_cache
-                                    .state(id)
-                                    .is_some_and(|s| s.scale != ResolutionScale::X1)
-                            {
+                            let scale = texture
+                                .and_then(|(id, _)| self.texture_cache.state(id))
+                                .map_or(ResolutionScale::X1, |s| s.scale);
+                            let rescaled = scale != ResolutionScale::X1;
+                            if rescaled && scale != self.texture_cache.resolution_scale() {
+                                self.draw.warn_once(
+                                    Warning::StaleScale,
+                                    "a draw samples an image rendered at an earlier resolution scale; skipping it until the image renders again",
+                                );
+                                return Ok(false);
+                            }
+                            if *array_rescaled.get_or_insert(rescaled) != rescaled {
+                                self.draw.warn_once(
+                                    Warning::MixedScaleArray,
+                                    "a draw samples a texture array mixing rescaled and native images; skipping it",
+                                );
+                                return Ok(false);
+                            }
+                            if rescaled {
                                 self.draw.texture_scaling.set(b.descriptor);
                             }
                             let view = match texture {
