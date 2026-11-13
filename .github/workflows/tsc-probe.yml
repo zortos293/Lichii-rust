@@ -1,0 +1,13 @@
+name: TSC probe
+
+on: pull_request
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libvulkan-dev mesa-vulkan-drivers libudev-dev libasound2-dev libxkbcommon-dev libwayland-dev spirv-tools
+      - run: bash .github/tsc-probe/probe.sh
