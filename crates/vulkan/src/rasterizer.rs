@@ -121,6 +121,8 @@ pub(crate) mod frame_diag {
         pub rts: HashMap<(u64, String), [u32; 2]>,
         pub skips: [u32; 3],
         pub presents: u64,
+        pub ids: HashMap<u64, crate::texture_cache::ImageId>,
+        pub traffic: (u64, u64),
     }
     pub static F: Mutex<Option<Frame>> = Mutex::new(None);
     pub fn with<R>(f: impl FnOnce(&mut Frame) -> R) -> R {
@@ -994,6 +996,22 @@ impl Rasterizer for VulkanRasterizer {
                 let mut rts: Vec<_> = f.rts.iter().collect();
                 rts.sort_by_key(|(_, c)| std::cmp::Reverse(c[0] + c[1]));
                 tracing::warn!(target: "diag", "DIAG present #{} fb={:x?} found={found:?} state={:?} skips(stages,targets,pipeline)={:?}", f.presents, framebuffer, state.map(|s| (s.info, s.format, s.extent, s.gpu_modified, s.cpu_dirty)), f.skips);
+                let rt = f.ids.get(&framebuffer.address).copied();
+                let rt_state = rt.map(|id| {
+                    self.texture_cache.state(id).map(|s| {
+                        (
+                            s.info.format,
+                            s.info.width,
+                            s.info.height,
+                            s.info.layout,
+                            s.gpu_modified,
+                            s.cpu_dirty,
+                        )
+                    })
+                });
+                let t = self.texture_cache.traffic();
+                tracing::warn!(target: "diag", "DIAG   fb-rt id={rt:?} now={rt_state:?} downloads+={} uploads+={} removals={}", t.downloads - f.traffic.0, t.uploads - f.traffic.1, self.texture_cache.removals());
+                f.traffic = (t.downloads, t.uploads);
                 for ((daddr, k), c) in rts.iter().take(12) {
                     tracing::warn!(target: "diag", "DIAG   rt daddr={daddr:#x} draws={} clears={} {k}{}", c[0], c[1], if *daddr == framebuffer.address { "  <== FB" } else { "" });
                 }

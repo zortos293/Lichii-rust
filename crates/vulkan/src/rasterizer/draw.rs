@@ -1023,6 +1023,7 @@ impl VulkanRasterizer {
             else {
                 continue;
             };
+            crate::rasterizer::frame_diag::with(|f| f.ids.insert(daddr, found.id));
             self.draw.colors[i] = Self::target_view(&mut self.texture_cache, found, &info)?;
         }
         if regs.zeta_enable != 0
