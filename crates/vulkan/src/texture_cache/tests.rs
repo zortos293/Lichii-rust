@@ -600,7 +600,7 @@ fn render_targets_sampled_later_reuse_the_gpu_written_image() {
 }
 
 #[test]
-fn incompatible_overlaps_are_flushed_then_replaced() {
+fn incompatible_overlaps_stay_live_and_take_newer_texels_through_guest_memory() {
     let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
         return;
     };
@@ -610,10 +610,10 @@ fn incompatible_overlaps_are_flushed_then_replaced() {
     let (id, _) = f.texture(&tic(0x08, GPU_VA, 128, 32, 1, 1, 2));
     assert_ne!(id, target.id);
     assert!(
-        f.cache.state(target.id).is_none(),
-        "the render target was dropped"
+        f.cache.state(target.id).is_some(),
+        "the render target stays live"
     );
-    assert_eq!(f.cache.len(), 1);
+    assert_eq!(f.cache.len(), 2);
     let mut guest = vec![0; 16 << 10];
     f.memory.read_bytes(DADDR, &mut guest).unwrap();
     assert!(
@@ -631,6 +631,162 @@ fn incompatible_overlaps_are_flushed_then_replaced() {
             .iter()
             .all(|t| *t == [0, 255, 0, 255])
     );
+    f.assert_no_validation_errors();
+}
+
+const GREEN: [u8; 4] = [0, 255, 0, 255];
+const RED: [u8; 4] = [255, 0, 0, 255];
+
+fn guest_texels(f: &Fixture, offset: u64, len: usize) -> Vec<u8> {
+    let mut guest = vec![0; len];
+    f.memory.read_bytes(DADDR + offset, &mut guest).unwrap();
+    guest
+}
+
+fn count_texels(texels: &[u8], expected: [u8; 4]) -> usize {
+    texels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|t| **t == expected)
+        .count()
+}
+
+#[test]
+fn targets_cleared_whole_over_overlaps_skip_the_guest_round_trip() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let big = rt_info(64, 64, 3, GobLayout::Tegra);
+    let small = rt_info(32, 32, 2, GobLayout::Tegra);
+    assert_eq!(small.size_bytes(), 4 << 10);
+    let before = f.cache.traffic();
+    let a = clear_rt(&mut f, &big, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let b = clear_rt(&mut f, &small, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    let again = clear_rt(&mut f, &big, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let b_again = clear_rt(&mut f, &small, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    assert_eq!((again.id, b_again.id), (a.id, b.id), "both stay live");
+    assert_eq!(
+        f.cache.traffic(),
+        before,
+        "no write-back or upload between whole clears"
+    );
+    let (mut tx, cache, _) = f.tx();
+    cache.flush(&mut tx, DADDR, 16 << 10).unwrap();
+    assert!(
+        all_texels(&guest_texels(&f, 0, 4 << 10), RED),
+        "the newer target's bytes"
+    );
+    assert!(all_texels(&guest_texels(&f, 4 << 10, 12 << 10), GREEN));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn write_backs_leave_the_bytes_of_newer_overlaps_alone() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let big = rt_info(64, 64, 3, GobLayout::Tegra);
+    let small = rt_info(32, 32, 2, GobLayout::Tegra);
+    clear_rt(&mut f, &big, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    clear_rt(&mut f, &small, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    let (mut tx, cache, _) = f.tx();
+    cache.flush(&mut tx, DADDR + (8 << 10), 4 << 10).unwrap();
+    assert_eq!(
+        count_texels(&guest_texels(&f, 0, 4 << 10), GREEN),
+        0,
+        "the older target skips the newer one's bytes"
+    );
+    assert!(all_texels(&guest_texels(&f, 4 << 10, 12 << 10), GREEN));
+    let (mut tx, cache, _) = f.tx();
+    cache.flush(&mut tx, DADDR, 4 << 10).unwrap();
+    assert!(all_texels(&guest_texels(&f, 0, 4 << 10), RED));
+    assert!(all_texels(&guest_texels(&f, 4 << 10, 12 << 10), GREEN));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn write_backs_leave_the_bytes_of_removed_newer_overlaps_alone() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let big = rt_info(64, 64, 3, GobLayout::Tegra);
+    clear_rt(&mut f, &big, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let b = clear_rt_at(
+        &mut f,
+        GPU_VA + (8 << 10),
+        &big,
+        [1.0, 0.0, 0.0, 1.0],
+        Rect::ALL,
+    );
+    let (mut tx, cache, _) = f.tx();
+    cache.flush(&mut tx, DADDR + (16 << 10), 8 << 10).unwrap();
+    assert!(all_texels(&guest_texels(&f, 8 << 10, 16 << 10), RED));
+    let chain = ImageInfo { levels: 2, ..big };
+    let (mut tx, cache, gmmu) = f.tx();
+    let found = cache
+        .find(&mut tx, gmmu, GPU_VA + (8 << 10), &chain)
+        .unwrap()
+        .unwrap();
+    assert!(
+        f.cache.state(b.id).is_none(),
+        "the written-back target is a level of the new chain"
+    );
+    assert!(all_texels(&guest_texels(&f, 0, 8 << 10), GREEN));
+    assert!(
+        all_texels(&guest_texels(&f, 8 << 10, 16 << 10), RED),
+        "the older target's write-back skips the removed one's bytes"
+    );
+    assert!(all_texels(&f.read_image(found.id)[0], RED));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn stale_overlaps_are_not_joined_over_newer_whole_clears() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let big = rt_info(64, 64, 3, GobLayout::Tegra);
+    let small = rt_info(32, 32, 2, GobLayout::Tegra);
+    clear_rt(&mut f, &big, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    clear_rt(&mut f, &small, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    clear_rt(&mut f, &big, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let chain = ImageInfo { levels: 2, ..small };
+    let (mut tx, cache, gmmu) = f.tx();
+    let found = cache.find(&mut tx, gmmu, GPU_VA, &chain).unwrap().unwrap();
+    assert!(
+        all_texels(&f.read_image(found.id)[0], GREEN),
+        "the newer whole clear, not the stale small target"
+    );
+    let (mut tx, cache, _) = f.tx();
+    cache.flush(&mut tx, DADDR, 16 << 10).unwrap();
+    assert!(all_texels(&guest_texels(&f, 0, 16 << 10), GREEN));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn stale_overlaps_take_newer_texels_before_they_are_drawn_into() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let big = rt_info(64, 64, 3, GobLayout::Tegra);
+    let small = rt_info(32, 32, 2, GobLayout::Tegra);
+    let a = clear_rt(&mut f, &big, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let b = clear_rt(&mut f, &small, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    let (mut tx, cache, gmmu) = f.tx();
+    let found = cache
+        .render_target(&mut tx, gmmu, GPU_VA, &big, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.id, a.id);
+    let read = f.read_image(a.id);
+    assert_eq!(
+        count_texels(&read[0], RED),
+        32 * 32,
+        "the small target's texels"
+    );
+    assert_eq!(count_texels(&read[0], GREEN), 64 * 64 - 32 * 32);
+    assert!(all_texels(&f.read_image(b.id)[0], RED));
     f.assert_no_validation_errors();
 }
 
@@ -1117,6 +1273,349 @@ fn collector_work_per_frame_is_bounded() {
     f.tick(1);
     assert_eq!(stats(&f), (74, 24, 0));
     assert_eq!(f.cache.len(), 0);
+    f.assert_no_validation_errors();
+}
+
+fn pitch_target(pitch: u32, height: u32) -> ImageInfo {
+    use lichii_gpu::engines::maxwell_3d::regs::{RenderTargetConfig, TileMode};
+    let mut rt: RenderTargetConfig = bytemuck::Zeroable::zeroed();
+    rt.address_low = 0x10_0000;
+    rt.width = pitch;
+    rt.height = height;
+    rt.format = 0xd5;
+    rt.tile_mode = TileMode(1 << 12);
+    ImageInfo::from_render_target(&rt, 0, GobLayout::Tegra).unwrap()
+}
+
+/// A pitch-linear 2D A8B8G8R8 texture header with identity swizzle.
+fn pitch_tic(gpu_va: GpuVAddr, width: u32, height: u32, pitch: u32) -> TicEntry {
+    let mut w = tic(0x08, gpu_va, width, height, 1, 1, 0).0;
+    w[2] = (gpu_va >> 32) as u32 | 2 << 21;
+    w[3] = pitch >> 5;
+    TicEntry(w)
+}
+
+fn all_texels(texels: &[u8], expected: [u8; 4]) -> bool {
+    texels.as_chunks::<4>().0.iter().all(|t| *t == expected)
+}
+
+#[test]
+fn pitch_overlaps_map_shared_texels_into_both_images() {
+    let wide = pitch_target(256, 8);
+    let narrow = ImageInfo { width: 60, ..wide };
+    assert_eq!(
+        pitch_overlap(&wide, DADDR, &narrow, DADDR),
+        Some(((0, 0), (0, 0), (60, 8)))
+    );
+    let below = ImageInfo { width: 16, ..wide };
+    assert_eq!(
+        pitch_overlap(&wide, DADDR, &below, DADDR + 2 * 256 + 8 * 4),
+        Some(((8, 2), (0, 0), (16, 6)))
+    );
+    assert_eq!(
+        pitch_overlap(&below, DADDR + 2 * 256 + 8 * 4, &wide, DADDR),
+        Some(((0, 0), (8, 2), (16, 6)))
+    );
+    assert_eq!(
+        pitch_overlap(&wide, DADDR, &below, DADDR + 60 * 4),
+        None,
+        "rows of the later image would wrap past the pitch"
+    );
+    assert_eq!(pitch_overlap(&wide, DADDR, &narrow, DADDR + 2), None);
+    let other_pitch = pitch_target(512, 8);
+    assert_eq!(pitch_overlap(&wide, DADDR, &other_pitch, DADDR), None);
+}
+
+#[test]
+fn narrower_pitch_textures_alias_their_render_target_without_a_flush() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let info = pitch_target(256, 8);
+    assert_eq!(info.width, 64);
+    let target = clear_rt(&mut f, &info, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    let header = pitch_tic(GPU_VA, 60, 8, 256);
+    let (texture, _) = f.texture(&header);
+    assert_ne!(texture, target.id);
+    assert!(
+        f.cache.state(target.id).is_some(),
+        "the render target stays"
+    );
+    assert_eq!(
+        f.cache.traffic().downloads,
+        0,
+        "no write-back to guest memory"
+    );
+    assert!(all_texels(&f.read_image(texture)[0], [255, 0, 0, 255]));
+
+    let again = clear_rt(&mut f, &info, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    assert_eq!(again.id, target.id);
+    assert_eq!(f.texture(&header).0, texture);
+    assert!(
+        all_texels(&f.read_image(texture)[0], [0, 255, 0, 255]),
+        "the texture takes the render target's newer texels"
+    );
+    assert_eq!(f.cache.traffic().downloads, 0);
+
+    clear_rt(&mut f, &info, [0.0, 0.0, 1.0, 1.0], Rect::ALL);
+    f.memory.write_bytes(DADDR + 62 * 4, &[7; 4]).unwrap();
+    {
+        let (mut tx, cache, _) = f.tx();
+        cache.invalidate(&mut tx, DADDR + 62 * 4, 4).unwrap();
+    }
+    let (refreshed, _) = f.texture(&header);
+    assert_eq!(refreshed, texture);
+    assert!(
+        all_texels(&f.read_image(texture)[0], [0, 0, 255, 255]),
+        "a CPU write next to the texture keeps the render target's texels in it"
+    );
+    let mut guest = vec![0; info.size_bytes() as usize];
+    f.memory.read_bytes(DADDR, &mut guest).unwrap();
+    for (i, texel) in guest.as_chunks::<4>().0.iter().enumerate() {
+        let expected = if i == 62 { [7; 4] } else { [0, 0, 255, 255] };
+        assert_eq!(*texel, expected, "guest texel {i}");
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn flushing_aliases_writes_the_newest_texels_back() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let wide = pitch_target(256, 8);
+    let narrow = ImageInfo { width: 60, ..wide };
+    let flushed = |f: &mut Fixture| {
+        {
+            let (mut tx, cache, _) = f.tx();
+            cache.flush(&mut tx, DADDR, wide.size_bytes()).unwrap();
+        }
+        let mut guest = vec![0; wide.size_bytes() as usize];
+        f.memory.read_bytes(DADDR, &mut guest).unwrap();
+        guest
+    };
+
+    let wide_id = clear_rt(&mut f, &wide, [1.0, 0.0, 0.0, 1.0], Rect::ALL).id;
+    let narrow_id = clear_rt(&mut f, &narrow, [0.0, 1.0, 0.0, 1.0], Rect::ALL).id;
+    assert_ne!(wide_id, narrow_id);
+    for (i, texel) in flushed(&mut f).as_chunks::<4>().0.iter().enumerate() {
+        let expected = if i % 64 < 60 {
+            [0, 255, 0, 255]
+        } else {
+            [255, 0, 0, 255]
+        };
+        assert_eq!(
+            *texel, expected,
+            "guest texel {i} with the narrow target newer"
+        );
+    }
+
+    clear_rt(&mut f, &narrow, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    clear_rt(&mut f, &wide, [0.0, 0.0, 1.0, 1.0], Rect::ALL);
+    for (i, texel) in flushed(&mut f).as_chunks::<4>().0.iter().enumerate() {
+        assert_eq!(
+            *texel,
+            [0, 0, 255, 255],
+            "guest texel {i} with the wide target newer"
+        );
+    }
+    assert!(!f.cache.state(narrow_id).unwrap().gpu_modified);
+    assert!(
+        all_texels(&f.read_image(narrow_id)[0], [0, 0, 255, 255]),
+        "the flush hands the newer texels to the narrow target"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn removed_aliases_hand_their_texels_to_the_other_image() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let info = pitch_target(256, 8);
+    let target = clear_rt(&mut f, &info, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    let header = pitch_tic(GPU_VA, 60, 8, 256);
+    let (texture, _) = f.texture(&header);
+    clear_rt(&mut f, &info, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    {
+        let (tx, cache, _) = f.tx();
+        cache.remove(tx.scheduler, target.id);
+    }
+    assert!(
+        all_texels(&f.read_image(texture)[0], [0, 255, 0, 255]),
+        "the texture holds the dropped render target's last texels"
+    );
+    assert!(f.cache.state(texture).unwrap().gpu_modified);
+    f.assert_no_validation_errors();
+}
+
+fn texel_rows(texels: &[u8], width: usize) -> Vec<&[[u8; 4]]> {
+    texels.as_chunks::<4>().0.chunks(width).collect()
+}
+
+#[test]
+fn rejected_overlaps_keep_the_lookups_alias_rectangles() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let small = ImageInfo {
+        width: 16,
+        ..pitch_target(256, 8)
+    };
+    let left = clear_rt(&mut f, &small, [1.0, 0.0, 0.0, 1.0], Rect::ALL).id;
+    let right = clear_rt_at(&mut f, GPU_VA + 32, &small, [0.0, 0.0, 1.0, 1.0], Rect::ALL).id;
+    assert_ne!(left, right);
+    let strip = ImageInfo {
+        width: 60,
+        height: 2,
+        ..small
+    };
+    clear_rt_at(
+        &mut f,
+        GPU_VA + 256,
+        &strip,
+        [0.0, 1.0, 0.0, 1.0],
+        Rect::ALL,
+    );
+    assert!(
+        f.cache.state(right).is_some(),
+        "the overlap that wraps the pitch stays live beside the strip"
+    );
+    let (texture, _) = f.texture(&pitch_tic(GPU_VA, 16, 8, 256));
+    assert_eq!(texture, left);
+    for (y, row) in texel_rows(&f.read_image(texture)[0], 16).iter().enumerate() {
+        for (x, texel) in row.iter().enumerate() {
+            let expected = match (x, y) {
+                (_, 1..=2) => [0, 255, 0, 255],
+                (8.., _) => [0, 0, 255, 255],
+                _ => [255, 0, 0, 255],
+            };
+            assert_eq!(*texel, expected, "texel ({x}, {y})");
+        }
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn partial_flushes_keep_every_aliased_rectangle() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let wide = pitch_target(256, 8);
+    let strip = ImageInfo {
+        width: 60,
+        height: 2,
+        ..wide
+    };
+    let target = clear_rt(&mut f, &wide, [1.0, 0.0, 0.0, 1.0], Rect::ALL).id;
+    clear_rt(&mut f, &strip, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    clear_rt_at(
+        &mut f,
+        GPU_VA + 4 * 256,
+        &strip,
+        [0.0, 0.0, 1.0, 1.0],
+        Rect::ALL,
+    );
+    {
+        let (mut tx, cache, _) = f.tx();
+        cache
+            .flush(&mut tx, DADDR + 4 * 256, strip.size_bytes())
+            .unwrap();
+    }
+    let expected = |x: usize, y: usize| match (x, y) {
+        (0..60, 0..=1) => [0, 255, 0, 255],
+        (0..60, 4..=5) => [0, 0, 255, 255],
+        _ => [255, 0, 0, 255],
+    };
+    let (texture, _) = f.texture(&pitch_tic(GPU_VA, 64, 8, 256));
+    assert_eq!(texture, target);
+    for (y, row) in texel_rows(&f.read_image(texture)[0], 64).iter().enumerate() {
+        for (x, texel) in row.iter().enumerate() {
+            assert_eq!(*texel, expected(x, y), "texel ({x}, {y})");
+        }
+    }
+    let mut guest = vec![0; strip.size_bytes() as usize];
+    f.memory.read_bytes(DADDR + 4 * 256, &mut guest).unwrap();
+    for (y, row) in texel_rows(&guest, 64).iter().enumerate() {
+        for (x, texel) in row.iter().enumerate() {
+            assert_eq!(*texel, expected(x, y + 4), "guest texel ({x}, {})", y + 4);
+        }
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn presented_targets_take_their_aliases_texels() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let wide = pitch_target(256, 8);
+    let narrow = ImageInfo { width: 60, ..wide };
+    let target = clear_rt(&mut f, &wide, [1.0, 0.0, 0.0, 1.0], Rect::ALL).id;
+    clear_rt(&mut f, &narrow, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let fb = FramebufferConfig {
+        address: DADDR,
+        width: 64,
+        height: 8,
+        stride: 256,
+        format: PixelFormat::A8B8G8R8Unorm,
+        block_height_log2: None,
+        flip_vertical: false,
+        crop: None,
+        gob_layout: GobLayout::Tegra,
+    };
+    let presented = f.cache.presentable(&mut f.scheduler, &fb).unwrap();
+    assert_eq!(presented, Some(target));
+    for (y, row) in texel_rows(&f.read_image(target)[0], 64).iter().enumerate() {
+        for (x, texel) in row.iter().enumerate() {
+            let expected = if x < 60 {
+                [0, 255, 0, 255]
+            } else {
+                [255, 0, 0, 255]
+            };
+            assert_eq!(*texel, expected, "texel ({x}, {y})");
+        }
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn handed_off_aliases_keep_newer_writes_in_other_aliases() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let wide = pitch_target(256, 8);
+    let strip = ImageInfo {
+        width: 60,
+        height: 2,
+        ..wide
+    };
+    clear_rt(&mut f, &wide, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    let top = clear_rt(&mut f, &strip, [0.0, 1.0, 0.0, 1.0], Rect::ALL).id;
+    let bottom = clear_rt_at(
+        &mut f,
+        GPU_VA + 4 * 256,
+        &strip,
+        [0.0, 0.0, 1.0, 1.0],
+        Rect::ALL,
+    )
+    .id;
+    {
+        let (tx, cache, _) = f.tx();
+        cache.remove(tx.scheduler, bottom);
+    }
+    let found = {
+        let (mut tx, cache, gmmu) = f.tx();
+        cache
+            .render_target(&mut tx, gmmu, GPU_VA, &strip, false)
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(found.id, top);
+    assert!(
+        all_texels(&f.read_image(top)[0], [0, 255, 0, 255]),
+        "the top strip keeps its own newer texels"
+    );
     f.assert_no_validation_errors();
 }
 

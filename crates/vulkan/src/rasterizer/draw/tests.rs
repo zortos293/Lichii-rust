@@ -343,6 +343,84 @@ fn failed_translations_ignore_the_constant_buffer_words_they_read() {
 }
 
 #[test]
+fn draws_skip_while_workers_translate_their_programs() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    f.rasterizer.draw.shaders.set_async(true);
+    let regs = draw_regs();
+    draw(&mut f, &gmmu, &regs);
+    draw(&mut f, &gmmu, &regs);
+    assert!(
+        target(&mut f).iter().all(|&t| t == [0; 4]),
+        "draws whose programs are queued draw nothing"
+    );
+    let mut rounds = 0;
+    while target(&mut f).iter().any(|&t| t != [255, 128, 0, 255]) {
+        rounds += 1;
+        assert!(rounds <= 3, "the vertex then the fragment program land");
+        f.rasterizer.draw.shaders.finish_translations();
+        draw(&mut f, &gmmu, &regs);
+    }
+    let stats = f.rasterizer.draw.shaders.stats();
+    assert_eq!(
+        (stats.translated, stats.failed),
+        (2, 0),
+        "each program translated once however many draws asked"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn a_fragment_program_after_another_vertex_program_with_the_same_outputs_is_not_translated_again() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    let mut header = header(1, ShaderType::VERTEX_B);
+    header[6] = 0b11;
+    let ald = sass(
+        Opcode::Ald,
+        (1 << 47) | (RZ << 39) | (0x80 << 20) | (RZ << 8),
+    );
+    let ast = sass(
+        Opcode::Ast,
+        (3 << 47) | (RZ << 39) | (0x70 << 20) | (RZ << 8),
+    );
+    let reordered = [ald, mov_cbuf(3, 4), mov_cbuf(2, 0), ast, exit()];
+    const OTHER_VERTEX: u32 = 0x400;
+    write(
+        &f,
+        PROGRAMS + u64::from(OTHER_VERTEX),
+        &program(header, &reordered),
+    );
+    let mut regs = draw_regs();
+    draw(&mut f, &gmmu, &regs);
+    let fragment = |f: &Fixture| f.rasterizer.draw.stages[4].clone().unwrap();
+    let (first, vertex) = (fragment(&f), f.rasterizer.draw.stages[0].clone().unwrap());
+    regs.pipelines[1].offset = OTHER_VERTEX;
+    draw(&mut f, &gmmu, &regs);
+    let other_vertex = f.rasterizer.draw.stages[0].clone().unwrap();
+    assert_ne!(vertex.hash, other_vertex.hash, "another vertex module");
+    assert!(
+        Arc::ptr_eq(&first, &fragment(&f)),
+        "the fragment module reads the same outputs"
+    );
+    assert_eq!(f.rasterizer.draw.shaders.stats().translated, 3);
+    assert!(target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]));
+    f.assert_no_validation_errors();
+}
+
+#[test]
 fn draws_of_untranslatable_programs_are_skipped_without_retrying() {
     let Some((mut f, gmmu)) = draw_fixture() else {
         return;
@@ -1129,7 +1207,7 @@ fn paint_source(f: &mut Fixture, gmmu: &Arc<Gmmu>) {
 }
 
 #[test]
-fn draws_survive_a_texture_lookup_replacing_their_render_target() {
+fn draws_sample_a_texture_over_their_render_target_without_replacing_it() {
     let Some((mut f, gmmu)) = draw_fixture() else {
         return;
     };
@@ -1148,13 +1226,15 @@ fn draws_survive_a_texture_lookup_replacing_their_render_target() {
         .invalidate_region(DADDR + PROGRAMS + u64::from(FRAGMENT), 0x200);
     f.rasterizer
         .invalidate_region(DADDR + FRAGMENT_CBUF + 0x40, 4);
+    let removals = f.rasterizer.texture_cache.removals();
     draw(&mut f, &gmmu, &regs);
     draw(&mut f, &gmmu, &regs);
-    assert_ne!(
+    assert_eq!(
         f.rasterizer.draw.warned & super::Warning::ImageChurn as u32,
         0,
-        "the 32x8 texture and the 16x16 target over the same memory replace each other, so the draw is skipped"
+        "the 32x8 texture and the 16x16 target over the same memory stay live side by side, so the draw goes ahead"
     );
+    assert_eq!(f.rasterizer.texture_cache.removals(), removals);
     f.assert_no_validation_errors();
 }
 

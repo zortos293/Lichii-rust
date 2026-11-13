@@ -22,12 +22,18 @@
 //! With the title's disk cache open, a miss first replays the stored entries that share the
 //! program's probe key (`lichii_shader::cache`) and reuses a module whose every recorded answer
 //! still holds; new translations are appended to the file at the next flush.
+//!
+//! With asynchronous translation on, a graphics miss the disk cannot serve queues the program
+//! for the workers (`shader_workers`) and skips the draw; the back thread never translates a
+//! graphics program itself. Compute programs translate in place, since a skipped dispatch would
+//! change what the guest computes.
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use lichii_common::settings::ResolutionScale;
@@ -39,12 +45,13 @@ use lichii_shader::cache;
 use lichii_shader::profile::HostTranslateInfo;
 use lichii_shader::translate::TranslateOptions;
 use lichii_shader::{
-    Profile, RuntimeInfo, ShaderEnvironment, ShaderModule, TranslateError, compile,
+    Profile, RuntimeInfo, ShaderEnvironment, ShaderModule, ShaderStage, TranslateError, compile,
     compile_dual_vertex,
 };
 
 use super::environment::{EnvRead, ProgramEnv};
 use super::shader_disk::ShaderDisk;
+use super::shader_workers::{Job, Workers};
 use super::{FxBuildHasher, FxHasher};
 
 /// Counts since the cache was created.
@@ -204,6 +211,9 @@ pub struct ShaderCache {
     disk: Option<ShaderDisk>,
     bytes: Vec<u8>,
     answers: Vec<u32>,
+    workers: Option<Workers>,
+    /// Translations queued or running, by request key, with the last frame a draw asked.
+    pending: HashMap<u64, Arc<AtomicU64>, FxBuildHasher>,
     code_check: cache::CodeCheck,
     stats: ShaderCacheStats,
     /// The counts the last INFO line showed, and when it was written.
@@ -223,6 +233,8 @@ impl ShaderCache {
             disk: None,
             bytes: Vec::new(),
             answers: Vec::new(),
+            workers: None,
+            pending: HashMap::default(),
             code_check: cache::CodeCheck::default(),
             stats: ShaderCacheStats::default(),
             logged: (ShaderCacheStats::default(), None),
@@ -312,6 +324,7 @@ impl ShaderCache {
         runtime: impl FnOnce() -> RuntimeInfo,
         bindings: &mut Bindings,
     ) -> Option<Arc<ShaderModule>> {
+        self.drain();
         let mut hasher = FxHasher::default();
         (state, *bindings, self.scale, env.state_words()).hash(&mut hasher);
         let state = hasher.finish();
@@ -369,6 +382,10 @@ impl ShaderCache {
                 *bindings = after;
                 Some(module)
             }
+            None if self.workers.is_some() && env.stage() != ShaderStage::Compute => {
+                self.request(a, env, state, runtime, first);
+                return None;
+            }
             None => {
                 let result = match (&mut self.disk, a) {
                     (Some(disk), a) => match a {
@@ -408,14 +425,136 @@ impl ShaderCache {
         if wildcard {
             reads = Default::default();
         }
+        self.remember(key, reads, *bindings, module.clone());
+        module
+    }
+
+    fn remember(
+        &mut self,
+        key: ModuleKey,
+        reads: [Vec<EnvRead>; 2],
+        bindings: Bindings,
+        module: Option<Arc<ShaderModule>>,
+    ) {
         self.answers.clear();
         self.answers.reserve(reads[0].len() + reads[1].len());
         self.modules
             .entry(key)
             .or_default()
-            .insert(reads, *bindings, module.clone());
+            .insert(reads, bindings, module);
         self.log_stats(Instant::now());
-        module
+    }
+
+    /// Queues the translation a draw missed, once while it is queued or running.
+    fn request(
+        &mut self,
+        a: Option<&ProgramEnv<'_>>,
+        env: &ProgramEnv<'_>,
+        state: u64,
+        runtime: RuntimeInfo,
+        bindings: Bindings,
+    ) {
+        let Some(workers) = &self.workers else {
+            return;
+        };
+        let mut hasher = FxHasher::default();
+        (state, a.map(ProgramEnv::code_start), env.code_start()).hash(&mut hasher);
+        let key = hasher.finish();
+        let frame = workers.frame();
+        if let Some(seen) = self.pending.get(&key) {
+            seen.store(frame, Ordering::Relaxed);
+            return;
+        }
+        let seen = Arc::new(AtomicU64::new(frame));
+        self.pending.insert(key, seen.clone());
+        let job = Job {
+            key,
+            state,
+            vertex_a: a.map(ProgramEnv::snapshot),
+            program: env.snapshot(),
+            runtime,
+            bindings,
+            scale: self.scale,
+            disk: self.disk.is_some(),
+        };
+        workers.push(seen, job);
+    }
+
+    /// Takes in what the workers translated. A result whose program bytes changed since is
+    /// dropped; the next draw of the program asks again.
+    fn drain(&mut self) {
+        while let Some(done) = self.workers.as_ref().and_then(Workers::try_recv) {
+            self.pending.remove(&done.key);
+            let Some(translated) = done.translated else {
+                continue;
+            };
+            let mut code = [0; 2];
+            for (hash, program) in code.iter_mut().zip(&translated.code) {
+                let Some(program) = program else {
+                    continue;
+                };
+                let (gmmu, start, len) = (&program.gmmu, program.start, program.len);
+                *hash = match gmmu.translate(start) {
+                    Some(daddr) => self.track(gmmu, start, len, daddr),
+                    None => self.hash_bytes(gmmu, start, len),
+                };
+            }
+            let changed = code
+                .iter()
+                .zip(&translated.code)
+                .any(|(&hash, program)| program.as_ref().is_some_and(|p| p.hash != hash));
+            if changed {
+                continue;
+            }
+            self.stats.translated += 1;
+            if translated.module.is_err() {
+                self.stats.failed += 1;
+            }
+            if let (Some(disk), Some(entry)) = (&mut self.disk, &translated.entry) {
+                disk.append(entry);
+            }
+            let key = ModuleKey {
+                code,
+                state: done.state,
+            };
+            self.remember(
+                key,
+                translated.reads,
+                translated.bindings,
+                translated.module.ok(),
+            );
+        }
+    }
+
+    /// Translates graphics programs on worker threads, so a draw whose program is not
+    /// translated yet is skipped instead of waiting; compute programs translate in place.
+    pub fn set_async(&mut self, on: bool) {
+        if on == self.workers.is_some() {
+            return;
+        }
+        self.workers = on.then(|| Workers::new(&self.profile, &self.host));
+        self.pending.clear();
+    }
+
+    /// Ages the queued translations: one no draw asked for in the last few presents is dropped.
+    pub fn end_frame(&self) {
+        if let Some(workers) = &self.workers {
+            workers.end_frame();
+        }
+    }
+
+    /// Waits until every queued translation is taken in.
+    #[cfg(test)]
+    pub(crate) fn finish_translations(&mut self) {
+        let start = Instant::now();
+        while !self.pending.is_empty() {
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "translations never finished"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+            self.drain();
+        }
     }
 
     /// The hash of the program at `env`'s address, when its extent is known.
@@ -475,10 +614,15 @@ impl ShaderCache {
     }
 
     fn hash_bytes(&mut self, gmmu: &Gmmu, start: GpuVAddr, len: u64) -> u64 {
-        self.bytes.resize(len as usize, 0);
-        let _ = gmmu.read_block(start, &mut self.bytes);
-        hash_code(&self.bytes)
+        hash_program(gmmu, start, len, &mut self.bytes)
     }
+}
+
+/// The hash of the `len` program bytes at `start`, read into `bytes`.
+pub(super) fn hash_program(gmmu: &Gmmu, start: GpuVAddr, len: u64, bytes: &mut Vec<u8>) -> u64 {
+    bytes.resize(len as usize, 0);
+    let _ = gmmu.read_block(start, bytes);
+    hash_code(bytes)
 }
 
 fn hash_code(bytes: &[u8]) -> u64 {
@@ -488,7 +632,7 @@ fn hash_code(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-fn warn_failed(env: &ProgramEnv<'_>, error: &TranslateError) {
+pub(super) fn warn_failed(env: &ProgramEnv<'_>, error: &TranslateError) {
     let (stage, address) = (env.stage(), env.start_address());
     match error {
         TranslateError::Emit(_) | TranslateError::UnsupportedProgram { .. } => {
