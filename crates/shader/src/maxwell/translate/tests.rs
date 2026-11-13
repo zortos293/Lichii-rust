@@ -120,3 +120,18 @@ fn ram_and_sam_translate_to_nothing() {
         assert_eq!(translate(&[encode(op, 0)]).unwrap(), "{0}:\n", "{op:?}");
     }
 }
+
+#[test]
+fn control_flow_markers_translate_to_nothing() {
+    use crate::maxwell::opcode::Opcode;
+    for op in [
+        Opcode::Nop,
+        Opcode::Cal,
+        Opcode::Kil,
+        Opcode::Pbk,
+        Opcode::Pcnt,
+        Opcode::Ssy,
+    ] {
+        assert_eq!(translate(&[encode(op, 0xf)]).unwrap(), "{0}:\n", "{op:?}");
+    }
+}
