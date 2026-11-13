@@ -37,16 +37,23 @@ pub(super) struct Entry {
     len: u64,
 }
 
-/// Executable memory for one cache. Read-write-execute until J3 splits it into two views.
+/// Code memory for one cache: one shared-memory object mapped twice, so blocks run from a
+/// read-execute view and are written and patched through a read-write one, never through
+/// `mprotect`.
 struct CodeMemory {
-    base: *mut u8,
+    exec: *mut u8,
+    write: *mut u8,
     used: usize,
 }
 
 impl CodeMemory {
     fn new() -> Option<Self> {
-        let base = sys::map(CODE_SIZE)?;
-        Some(Self { base, used: 0 })
+        let (write, exec) = sys::map(CODE_SIZE)?;
+        Some(Self {
+            exec,
+            write,
+            used: 0,
+        })
     }
 
     fn push(&mut self, code: &[u8]) -> Option<*const u8> {
@@ -56,17 +63,35 @@ impl CodeMemory {
         }
         // SAFETY: `[start, start + len)` is inside the mapping, and no code runs while the cache
         // is mutated.
-        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), self.base.add(start), code.len()) };
+        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), self.write.add(start), code.len()) };
         self.used = start + code.len();
         // SAFETY: as above.
-        Some(unsafe { self.base.add(start) })
+        Some(unsafe { self.exec.add(start) })
+    }
+
+    /// Points the `jmp rel32` at executable address `site` to `target`.
+    ///
+    /// # Safety
+    /// `site` must be a link site of a block in this memory, and none of its code may be
+    /// running on another thread.
+    unsafe fn patch(&mut self, site: usize, target: usize) {
+        let rel = target.wrapping_sub(site + 5) as i32;
+        // SAFETY: guaranteed by the caller; the operand follows the one-byte opcode, at the same
+        // offset in the writable view.
+        unsafe {
+            let operand = self.write.add(site + 1 - self.exec as usize);
+            std::ptr::write_unaligned(operand.cast::<i32>(), rel);
+        }
     }
 }
 
 impl Drop for CodeMemory {
     fn drop(&mut self) {
-        // SAFETY: `base` came from `sys::map(CODE_SIZE)`.
-        unsafe { sys::unmap(self.base, CODE_SIZE) };
+        // SAFETY: both views came from one `sys::map(CODE_SIZE)`.
+        unsafe {
+            sys::unmap(self.exec, CODE_SIZE);
+            sys::unmap(self.write, CODE_SIZE);
+        }
     }
 }
 
@@ -135,17 +160,6 @@ fn table_slot(pc: u64) -> usize {
     ((pc >> 2) as usize) & ((1 << x64::TABLE_BITS) - 1)
 }
 
-/// Points the `jmp rel32` at `site` to `target`.
-///
-/// # Safety
-/// `site` must be a link site in live code memory, and none of this cache's code may be running
-/// on another thread.
-unsafe fn patch(site: usize, target: usize) {
-    let rel = target.wrapping_sub(site + 5) as i32;
-    // SAFETY: guaranteed by the caller; the operand follows the one-byte opcode.
-    unsafe { std::ptr::write_unaligned((site + 1) as *mut i32, rel) };
-}
-
 #[inline]
 fn fast_slot(pc: u64) -> usize {
     ((pc >> 2) as usize) & ((1 << FAST_BITS) - 1)
@@ -168,8 +182,8 @@ impl JitCache {
                 region.sites.store(&mut *sites, Ordering::Release);
                 region
                     .end
-                    .store(memory.base as usize + CODE_SIZE, Ordering::Release);
-                region.start.store(memory.base as usize, Ordering::Release);
+                    .store(memory.exec as usize + CODE_SIZE, Ordering::Release);
+                region.start.store(memory.exec as usize, Ordering::Release);
             }
             slot
         };
@@ -212,7 +226,7 @@ impl JitCache {
     pub fn link(&mut self, site: usize, target: u64, code: *const u8) {
         // SAFETY: the site belongs to code of the current generation, and this core's code only
         // runs on the thread that owns the cache.
-        unsafe { patch(site, code as usize) };
+        unsafe { self.memory.patch(site, code as usize) };
         self.links.entry(target).or_default().push(site);
     }
 
@@ -291,7 +305,7 @@ impl JitCache {
             for site in self.links.remove(&start).unwrap_or_default() {
                 // SAFETY: link sites stay in code memory until the next `clear`, which forgets
                 // them, and no code of this cache runs while it is changed.
-                unsafe { patch(site, site + 5) };
+                unsafe { self.memory.patch(site, site + 5) };
             }
             let slot = table_slot(start);
             if self.table[slot].0 == start {
@@ -330,23 +344,65 @@ impl Drop for JitCache {
 
 #[cfg(unix)]
 mod sys {
-    pub fn map(size: usize) -> Option<*mut u8> {
-        // SAFETY: an anonymous private mapping has no preconditions.
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn create_fd() -> libc::c_int {
+        // SAFETY: plain system call with a NUL-terminated name.
+        unsafe { libc::memfd_create(c"lichii-jit".as_ptr(), libc::MFD_CLOEXEC) }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn create_fd() -> libc::c_int {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!("/lichii-jit-{}-{id}\0", std::process::id());
+        // SAFETY: the name is NUL-terminated; the object is unlinked right away so it lives only
+        // as long as the descriptor.
+        unsafe {
+            let fd = libc::shm_open(
+                name.as_ptr().cast(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+                0o600,
+            );
+            if fd >= 0 {
+                libc::shm_unlink(name.as_ptr().cast());
+            }
+            fd
+        }
+    }
+
+    /// Maps one shared-memory object of `size` bytes twice: read-write, then read-execute.
+    pub fn map(size: usize) -> Option<(*mut u8, *mut u8)> {
+        let fd = create_fd();
+        if fd < 0 {
+            return None;
+        }
+        let view = |prot| {
+            // SAFETY: a fresh shared mapping of a descriptor this function owns.
+            let ptr =
+                unsafe { libc::mmap(std::ptr::null_mut(), size, prot, libc::MAP_SHARED, fd, 0) };
+            (ptr != libc::MAP_FAILED).then_some(ptr.cast::<u8>())
         };
-        (ptr != libc::MAP_FAILED).then_some(ptr.cast())
+        // SAFETY: `fd` is open and owned here.
+        let sized = unsafe { libc::ftruncate(fd, size as libc::off_t) } == 0;
+        let write = sized
+            .then(|| view(libc::PROT_READ | libc::PROT_WRITE))
+            .flatten();
+        let exec = write.and_then(|_| view(libc::PROT_READ | libc::PROT_EXEC));
+        // SAFETY: the mappings keep the object alive without the descriptor.
+        unsafe { libc::close(fd) };
+        match (write, exec) {
+            (Some(write), Some(exec)) => Some((write, exec)),
+            (Some(write), None) => {
+                // SAFETY: `write` is the mapping made above.
+                unsafe { unmap(write, size) };
+                None
+            }
+            _ => None,
+        }
     }
 
     /// # Safety
-    /// `ptr` and `size` must come from one `map` call, and no code in it may run again.
+    /// `ptr` and `size` must name one view from `map`, and no code in it may run again.
     pub unsafe fn unmap(ptr: *mut u8, size: usize) {
         // SAFETY: guaranteed by the caller.
         unsafe { libc::munmap(ptr.cast(), size) };
@@ -355,27 +411,52 @@ mod sys {
 
 #[cfg(windows)]
 mod sys {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree,
+        CreateFileMappingW, FILE_MAP, FILE_MAP_EXECUTE, FILE_MAP_READ, FILE_MAP_WRITE,
+        MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_EXECUTE_READWRITE, UnmapViewOfFile,
     };
 
-    pub fn map(size: usize) -> Option<*mut u8> {
-        // SAFETY: a fresh reservation has no preconditions.
-        let ptr = unsafe {
-            VirtualAlloc(
+    /// Maps one pagefile-backed section of `size` bytes twice: read-write, then read-execute.
+    pub fn map(size: usize) -> Option<(*mut u8, *mut u8)> {
+        // SAFETY: a fresh anonymous section has no preconditions.
+        let section = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
                 std::ptr::null(),
-                size,
-                MEM_RESERVE | MEM_COMMIT,
                 PAGE_EXECUTE_READWRITE,
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
             )
         };
-        (!ptr.is_null()).then_some(ptr.cast())
+        if section.is_null() {
+            return None;
+        }
+        let view = |access: FILE_MAP| {
+            // SAFETY: `section` is a live section of `size` bytes.
+            let ptr = unsafe { MapViewOfFile(section, access, 0, 0, size) }.Value;
+            (!ptr.is_null()).then_some(ptr.cast::<u8>())
+        };
+        let write = view(FILE_MAP_WRITE);
+        let exec = write.and_then(|_| view(FILE_MAP_READ | FILE_MAP_EXECUTE));
+        // SAFETY: the views keep the section alive without the handle.
+        unsafe { CloseHandle(section) };
+        match (write, exec) {
+            (Some(write), Some(exec)) => Some((write, exec)),
+            (Some(write), None) => {
+                // SAFETY: `write` is the view made above.
+                unsafe { unmap(write, size) };
+                None
+            }
+            _ => None,
+        }
     }
 
     /// # Safety
-    /// `ptr` must come from `map`, and no code in it may run again.
+    /// `ptr` must be one view from `map`, and no code in it may run again.
     pub unsafe fn unmap(ptr: *mut u8, _size: usize) {
         // SAFETY: guaranteed by the caller.
-        unsafe { VirtualFree(ptr.cast(), 0, MEM_RELEASE) };
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: ptr.cast() }) };
     }
 }
