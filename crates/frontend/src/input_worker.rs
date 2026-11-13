@@ -10,10 +10,11 @@ use crossbeam_channel::{RecvTimeoutError, Sender};
 use lichii_common::settings::{ControlSettings, HotkeyAction, MAX_PLAYERS, NpadButton};
 use lichii_input::{
     Gamepad, HostInput, InputMapper, Key, MouseButton, NpadButtons, NpadHub, NpadState, SdlInput,
+    UPDATE_PERIOD,
 };
 
-/// How often the thread polls SDL, resolves and publishes (250 Hz, above hid's sampling rate).
-const POLL: Duration = Duration::from_millis(4);
+/// How often the thread polls SDL, resolves and publishes.
+const POLL: Duration = UPDATE_PERIOD;
 /// Each rumble request lasts this long unless a newer one replaces it.
 const RUMBLE_MS: u32 = 1000;
 const TEST_RUMBLE_MS: u32 = 400;

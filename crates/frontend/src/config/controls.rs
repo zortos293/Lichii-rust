@@ -12,7 +12,7 @@ use lichii_common::settings::{
 use lichii_input::capture::{detect_press, detect_stick};
 use lichii_input::{
     HostInput, Key, MouseButton, NpadButtons, NpadState, PadAxis, PadButton, PlayerMapping,
-    ProfileStore, STICK_MAX, Source,
+    ProfileStore, STICK_MAX, Source, UPDATE_PERIOD,
 };
 
 use super::controller_layout::{self, Body};
@@ -84,13 +84,15 @@ pub struct ControlsPage {
     preview: Option<Preview>,
 }
 
-/// The page's own compiled mapping for the live diagram, kept across frames so toggle and turbo
-/// buttons show as they will in game.
+/// The page's own compiled mapping for the live diagram, kept across frames and resolved at the
+/// input thread's rate so toggle and turbo buttons show as they will in game.
 struct Preview {
     player: usize,
     input: PlayerInput,
     pad: Option<usize>,
     mapping: PlayerMapping,
+    started: Instant,
+    updates: u64,
 }
 
 impl ControlsPage {
@@ -189,7 +191,7 @@ impl ControlsPage {
         let pad = pad_index(player, env.host);
         let state = env
             .host
-            .map(|host| self.preview(player, host, pad).resolve(host, keyboard));
+            .map(|host| self.preview(player, host, pad, keyboard));
 
         ui.add_space(6.0);
         ui.horizontal_top(|ui| {
@@ -217,7 +219,7 @@ impl ControlsPage {
                 ui.horizontal(|ui| {
                     ui.label("Motion button")
                         .on_hover_text("Without a gyro the controller lies at rest; holding this input shakes it");
-                    self.bind_button(ui, &mut player.motion_button, None, Target::Motion);
+                    self.bind_button(ui, &mut player.motion_button, None, true, Target::Motion);
                 });
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut player.vibration_enabled, "Vibration");
@@ -277,13 +279,15 @@ impl ControlsPage {
         ui.ctx().request_repaint_after(Duration::from_millis(16));
     }
 
-    /// The live diagram's mapping, compiled again only when the player's settings or device change.
+    /// The live diagram's state. The mapping is compiled again only when the player's settings or
+    /// device change, and runs the input-thread updates due since the last frame.
     fn preview(
         &mut self,
         player: &PlayerInput,
         host: &HostInput,
         pad: Option<usize>,
-    ) -> &mut PlayerMapping {
+        keyboard: bool,
+    ) -> NpadState {
         let index = self.player;
         if self
             .preview
@@ -292,15 +296,22 @@ impl ControlsPage {
         {
             self.preview = None;
         }
-        &mut self
-            .preview
-            .get_or_insert_with(|| Preview {
-                player: index,
-                input: player.clone(),
-                pad,
-                mapping: PlayerMapping::compile(player, host),
-            })
-            .mapping
+        let preview = self.preview.get_or_insert_with(|| Preview {
+            player: index,
+            input: player.clone(),
+            pad,
+            mapping: PlayerMapping::compile(player, host),
+            started: Instant::now(),
+            updates: 0,
+        });
+        let due = (preview.started.elapsed().as_nanos() / UPDATE_PERIOD.as_nanos()) as u64;
+        let steps = due.saturating_sub(preview.updates).clamp(1, 64);
+        preview.updates = due.max(preview.updates + 1);
+        let mut state = preview.mapping.resolve(host, keyboard);
+        for _ in 1..steps {
+            state = preview.mapping.resolve(host, keyboard);
+        }
+        state
     }
 
     fn poll_capture(&mut self, player: &mut PlayerInput, host: Option<&HostInput>) {
@@ -398,6 +409,7 @@ impl ControlsPage {
         ui: &mut Ui,
         binding: &mut InputBinding,
         options: Option<&mut ButtonOptions>,
+        threshold: bool,
         target: Target,
     ) {
         let text = if self.capturing(target) {
@@ -410,7 +422,7 @@ impl ControlsPage {
         if response.clicked() {
             self.start(target);
         }
-        binding_menu(&response, binding, options);
+        binding_menu(&response, binding, options, threshold);
     }
 
     fn buttons_ui(&mut self, ui: &mut Ui, player: &mut PlayerInput, buttons: &[NpadButton]) {
@@ -426,8 +438,10 @@ impl ControlsPage {
                         continue;
                     }
                     ui.label(button_label(controller, button));
+                    let digital = !controller_layout::analog_trigger(controller, button);
                     edit_button(player, button, |binding, options| {
-                        self.bind_button(ui, binding, Some(options), Target::Button(button));
+                        let options = digital.then_some(options);
+                        self.bind_button(ui, binding, options, digital, Target::Button(button));
                     });
                     ui.end_row();
                 }
@@ -476,6 +490,7 @@ impl ControlsPage {
                             ui,
                             dir.binding(stick),
                             None,
+                            true,
                             Target::Stick { right, dir },
                         );
                         ui.end_row();
@@ -671,8 +686,9 @@ impl ControlsPage {
             if hit.clicked() {
                 clicked = Some(Target::Button(button));
             }
+            let digital = !controller_layout::analog_trigger(controller, button);
             edit_button(player, button, |binding, options| {
-                binding_menu(&hit, binding, Some(options));
+                binding_menu(&hit, binding, digital.then_some(options), digital);
             });
         }
         for stick in &layout.sticks {
@@ -770,12 +786,14 @@ fn edit_button(
     }
 }
 
-/// Lichii's binding context menu: clear, invert, toggle and turbo for buttons, and the press
-/// threshold of an analog axis bound as a button.
+/// Lichii's binding context menu: clear, invert, toggle and turbo for digital buttons, and the
+/// press threshold of an analog axis bound as a digital input. GameCube's analog triggers read
+/// their binding directly, so they get neither.
 fn binding_menu(
     response: &Response,
     binding: &mut InputBinding,
     options: Option<&mut ButtonOptions>,
+    threshold: bool,
 ) {
     response.context_menu(|ui| {
         let cleared = ui.button("Clear").clicked();
@@ -787,7 +805,7 @@ fn binding_menu(
                 *options = ButtonOptions::default();
             }
         }
-        if let InputBinding::GamepadAxis { threshold, .. } = binding {
+        if let (true, InputBinding::GamepadAxis { threshold, .. }) = (threshold, &mut *binding) {
             ui.add(egui::Slider::new(threshold, 0.05..=0.95).text("Threshold"));
         }
         if cleared {

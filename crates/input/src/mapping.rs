@@ -5,6 +5,7 @@
 //! string compares, no locks.
 
 use std::f32::consts::TAU;
+use std::time::Duration;
 
 use lichii_common::settings::{
     ButtonOptions, ControlSettings, ControllerType, InputBinding, InputDevice, MAX_PLAYERS,
@@ -203,7 +204,11 @@ impl StickMapping {
     }
 }
 
-/// Input-thread updates a turbo button stays pressed, then released (48 ms each at 250 Hz).
+/// How often the input thread resolves every player (250 Hz, above hid's sampling rate). Turbo
+/// counts these updates.
+pub const UPDATE_PERIOD: Duration = Duration::from_millis(4);
+
+/// Updates a turbo button stays pressed, then released (48 ms each).
 const TURBO_TICKS: u32 = 12;
 
 /// One player's bindings, compiled, and the state toggle and turbo buttons keep between updates.
