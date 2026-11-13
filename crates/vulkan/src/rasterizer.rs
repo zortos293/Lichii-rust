@@ -865,6 +865,7 @@ mod tests {
             device: memory.clone(),
             syncpoints: syncpoints.clone(),
             timestamp: Arc::new(GpuTimestamp::new(Arc::new(HostTime(Instant::now())), false)),
+            written_pages: Arc::new(lichii_gpu::backend::GpuWrittenPages::new(36)),
         };
         let mailbox = Arc::new(FrameMailbox::default());
         let rasterizer =
