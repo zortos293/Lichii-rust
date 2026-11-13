@@ -46,6 +46,25 @@ impl W {
     }
 }
 
+/// The host instruction whose flags an [`Op::Compare`] tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cmp {
+    /// The flags of `AddFlags(a, b)`.
+    Add,
+    /// The flags of `SubFlags(a, b)`.
+    Sub,
+    /// The flags of `LogicFlags(a & b)`.
+    Test,
+}
+
+impl Cmp {
+    /// Whether one host condition code computes A64 condition `cond` on these flags. Only
+    /// subtraction has A64's inverted carry, which `HI` and `LS` need.
+    pub fn fuses(self, cond: u8) -> bool {
+        cond < 14 && (self == Cmp::Sub || !matches!(cond, 8 | 9))
+    }
+}
+
 /// What an op produces. Every type but `U128` and `Void` lives in a general-purpose host
 /// register; `U128` lives in a vector register.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,6 +174,9 @@ pub enum Op {
     Select(W, Value, Value, Value),
     /// `ConditionHolds(cond)` on an `Nzcv` value.
     TestCond(u8, Value),
+    /// `ConditionHolds(cond)` on the flags the host instruction of `Cmp` sets on `a` and `b`,
+    /// for a `cond` that [`Cmp::fuses`].
+    Compare(Cmp, u8, W, Value, Value),
     IsZero(W, Value),
     TestBit(Value, u8),
 
@@ -272,7 +294,7 @@ impl Op {
             | Op::AdcFlags(..)
             | Op::SbcFlags(..)
             | Op::LogicFlags(..) => Ty::Nzcv,
-            Op::TestCond(..) | Op::IsZero(..) | Op::TestBit(..) => Ty::U1,
+            Op::TestCond(..) | Op::Compare(..) | Op::IsZero(..) | Op::TestBit(..) => Ty::U1,
             Op::Simd(s) => s.ty(),
             _ => Ty::U64,
         }
@@ -355,6 +377,7 @@ impl Op {
             | Op::Sub(_, a, b)
             | Op::AddFlags(_, a, b)
             | Op::SubFlags(_, a, b)
+            | Op::Compare(_, _, _, a, b)
             | Op::And(_, a, b)
             | Op::Or(_, a, b)
             | Op::Xor(_, a, b)

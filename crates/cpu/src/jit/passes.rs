@@ -1,6 +1,6 @@
 //! IR passes. Each one rewrites a [`Block`] in place and keeps its meaning.
 
-use super::ir::{Block, Loc, Op, Terminal, Value, W};
+use super::ir::{Block, Cmp, Loc, Op, Terminal, Value, W};
 use crate::interpreter::condition_holds;
 
 /// Which passes run; tests turn them off one at a time to check each against the others.
@@ -8,6 +8,7 @@ use crate::interpreter::condition_holds;
 pub(crate) struct Passes {
     pub get_set: bool,
     pub fold: bool,
+    pub fuse: bool,
     pub dce: bool,
 }
 
@@ -15,6 +16,7 @@ impl Passes {
     pub const ALL: Self = Self {
         get_set: true,
         fold: true,
+        fuse: true,
         dce: true,
     };
 
@@ -24,6 +26,9 @@ impl Passes {
         }
         if self.fold {
             fold_constants(block);
+        }
+        if self.fuse {
+            fuse_conditions(block);
         }
         if self.dce {
             dead_code_elimination(block);
@@ -168,6 +173,17 @@ pub(super) fn evaluate(op: &Op, k: impl Fn(Value) -> Option<u64>) -> Option<u64>
         Op::Rev32(a) => k(a)?.swap_bytes().rotate_left(32),
         Op::Select(w, cond, a, b) => (if k(cond)? != 0 { k(a)? } else { k(b)? }) & w.mask(),
         Op::TestCond(cond, f) => condition_holds(cond, k(f)? as u32) as u64,
+        Op::Compare(kind, cond, w, a, b) => {
+            let flags = match kind {
+                Cmp::Add => add_with_carry(w, k(a)?, k(b)?, 0).1,
+                Cmp::Sub => add_with_carry(w, k(a)?, !k(b)?, 1).1,
+                Cmp::Test => {
+                    let r = k(a)? & k(b)? & w.mask();
+                    nzcv(r >> (w.bits() - 1) != 0, r == 0, false, false)
+                }
+            };
+            condition_holds(cond, flags as u32) as u64
+        }
         Op::IsZero(w, a) => (k(a)? & w.mask() == 0) as u64,
         Op::TestBit(a, bit) => k(a)? >> bit & 1,
         _ => return None,
@@ -197,6 +213,30 @@ pub(super) fn fold_constants(block: &mut Block) {
         },
         t => t,
     };
+}
+
+/// Turns each `TestCond` on the flags of an add, a subtract or a logical result into a
+/// `Compare` on their operands, which the backend lowers to one host `add`, `cmp` or `test`
+/// and a condition code. The flags op stays only while something else, such as the NZCV write
+/// at the block's end, still reads it.
+pub(super) fn fuse_conditions(block: &mut Block) {
+    for i in 0..block.ops.len() {
+        let Op::TestCond(cond, f) = block.ops[i] else {
+            continue;
+        };
+        let (kind, w, a, b) = match block.ops[f.index()] {
+            Op::AddFlags(w, a, b) => (Cmp::Add, w, a, b),
+            Op::SubFlags(w, a, b) => (Cmp::Sub, w, a, b),
+            Op::LogicFlags(w, r) => match block.ops[r.index()] {
+                Op::And(aw, a, b) if aw == w => (Cmp::Test, w, a, b),
+                _ => (Cmp::Test, w, r, r),
+            },
+            _ => continue,
+        };
+        if kind.fuses(cond) {
+            block.ops[i] = Op::Compare(kind, cond, w, a, b);
+        }
+    }
 }
 
 /// Removes pure ops whose value nothing uses.

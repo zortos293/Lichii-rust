@@ -6,6 +6,12 @@
 //! acquire, a syncpoint wait, wait-for-idle and MME DMA reads (NX2_GPU_THREAD_SPLIT.md). An acquire
 //! or syncpoint wait that still fails after that suspends the channel; the front runs other
 //! channels and resumes it at the next word once the condition holds.
+//!
+//! A GPFIFO entry with its SYNC bit is fetched after the work before it completed, so a command
+//! list that compute or copy work wrote is read with those writes: the channel suspends until
+//! the back synchronized the entry's words, without the front waiting for it. On Switch 2 an entry
+//! on a page GPU work may have written is fetched the same way: titles fetch command lists their
+//! own compute writes each frame.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -13,11 +19,11 @@ use std::sync::Arc;
 use lichii_common::GpuVAddr;
 
 use crate::back::{BackChannelSetup, SideCommand};
-use crate::backend::{ChannelId, ReleaseSize};
+use crate::backend::{ChannelId, GpuWrittenPages, ReleaseSize};
 use crate::channel::{ChannelConfig, SemaphoreWaiters, SyncpointFence, SyncpointIncrement};
 use crate::engines::EngineKind;
 use crate::engines::maxwell_3d::{MACRO_REGISTERS_START, RegisterState, Regs};
-use crate::gmmu::Gmmu;
+use crate::gmmu::{Gmmu, RangeTarget};
 use crate::gpu::Inbox;
 use crate::host::{AcquireOp, FIRST_ENGINE_METHOD, HostAction, HostClass, HostState, ReleaseKind};
 use crate::host1x::Syncpoints;
@@ -50,6 +56,9 @@ pub(crate) struct FrontShared {
     pub waiters: Arc<SemaphoreWaiters>,
     pub inbox: Arc<Inbox>,
     pub syncpoints: Arc<Syncpoints>,
+    /// Switch 2: the device pages GPU work may have written. An entry on one is fetched after the
+    /// back synchronised its words.
+    pub written_pages: Option<Arc<GpuWrittenPages>>,
 }
 
 /// A channel's queued work.
@@ -73,6 +82,10 @@ pub(crate) enum Wait {
         wide: bool,
     },
     Syncpoint(SyncpointFence),
+    /// The fetch of the entry at the queue's front, which has its SYNC bit or lies on GPU-written
+    /// pages, until
+    /// [`Stream::fetch_synced`] holds for this ticket.
+    Fetch(u64),
 }
 
 /// One channel on the front.
@@ -85,6 +98,8 @@ pub(crate) struct FrontChannel {
     /// Words of the entry at the queue's front already processed.
     offset: u32,
     wait: Option<Wait>,
+    /// The entry at the queue's front waited for its fetch synchronisation.
+    fetch_synced: bool,
 }
 
 /// What the method handler of a channel changes.
@@ -164,6 +179,7 @@ impl FrontChannel {
             queue: VecDeque::new(),
             offset: 0,
             wait: None,
+            fetch_synced: false,
         }
     }
 
@@ -180,6 +196,11 @@ impl FrontChannel {
 
     pub(crate) fn is_waiting(&self) -> bool {
         self.wait.is_some()
+    }
+
+    /// Whether the channel is parked until the back synchronised an entry's fetch.
+    pub(crate) fn waits_for_fetch(&self) -> bool {
+        matches!(self.wait, Some(Wait::Fetch(_)))
     }
 
     /// Whether the channel has work it can run now.
@@ -206,6 +227,7 @@ impl FrontChannel {
                 .guest()
                 .is_reached(fence.id, fence.value)
                 .unwrap_or(true),
+            Wait::Fetch(ticket) => shared.stream.fetch_synced(ticket),
         }
     }
 
@@ -268,6 +290,18 @@ impl FrontChannel {
             self.offset = 0;
             return;
         }
+        if start == 0
+            && !self.fetch_synced
+            && (entry.sync() || self.on_written_pages(entry, shared))
+        {
+            let ticket = shared
+                .stream
+                .synchronize_fetch(entry.address(), u64::from(length) * 4);
+            self.fetch_synced = true;
+            self.wait = Some(Wait::Fetch(ticket));
+            return;
+        }
+        self.fetch_synced = false;
         let mut words = std::mem::take(&mut shared.words);
         words.clear();
         words.resize((length - start) as usize, 0);
@@ -290,6 +324,21 @@ impl FrontChannel {
         } else {
             self.offset = done;
         }
+    }
+
+    /// Switch 2: whether GPU work may have written the entry's words.
+    fn on_written_pages(&self, entry: GpEntry, shared: &FrontShared) -> bool {
+        let Some(pages) = &shared.written_pages else {
+            return false;
+        };
+        let mut written = false;
+        self.memory
+            .for_each_range(entry.address(), u64::from(entry.words()) * 4, |range| {
+                if let RangeTarget::Device(device) = range.target {
+                    written |= pages.may_be_written(device, range.size);
+                }
+            });
+        written
     }
 
     fn dispatch_words(&mut self, words: &[u32], shared: &mut FrontShared) -> usize {
@@ -666,14 +715,14 @@ mod tests {
 
     use super::*;
     use crate::back::Back;
-    use crate::backend::GpuHandles;
+    use crate::backend::{GpuHandles, GpuWrittenPages};
     use crate::clock::{GpuTimestamp, GuestTime};
     use crate::engines::create_engine;
     use crate::engines::testing::Recorder;
     use crate::gmmu::BigPageSize;
     use crate::pushbuffer::{CommandHeader, SubmissionMode};
     use crate::ring;
-    use crate::stream::{Link, MIN_RING_SLOTS};
+    use crate::stream::{FetchSyncs, Link, MIN_RING_SLOTS};
 
     #[test]
     fn macro_parameters_are_collected_without_allocating() {
@@ -690,22 +739,32 @@ mod tests {
             device: device.clone(),
             syncpoints: syncpoints.clone(),
             timestamp: Arc::new(GpuTimestamp::new(Arc::new(Boot), false)),
+            written_pages: Arc::new(GpuWrittenPages::new(36)),
         };
         let (producer, consumer) = ring::ring(MIN_RING_SLOTS, MIN_RING_SLOTS);
         let (side, side_receiver) = mpsc::channel();
+        let inbox = Arc::new(Inbox::new());
+        let fetch_syncs = Arc::new(FetchSyncs::new(inbox.clone()));
         let back = Back::new(
             Box::new(Recorder::default()),
             &handles,
             Arc::new(create_engine),
             side_receiver,
+            fetch_syncs.clone(),
         );
         let mut shared = FrontShared {
-            stream: Stream::new(producer, Link::Inline(Box::new((back, consumer))), side),
+            stream: Stream::new(
+                producer,
+                Link::Inline(Box::new((back, consumer))),
+                side,
+                fetch_syncs,
+            ),
             shared_macros: None,
             words: Vec::new(),
             waiters: Arc::default(),
-            inbox: Arc::new(Inbox::new()),
+            inbox,
             syncpoints,
+            written_pages: None,
         };
         let config = ChannelConfig::new(
             Arc::new(Gmmu::new(device, BigPageSize::Size64K)),
