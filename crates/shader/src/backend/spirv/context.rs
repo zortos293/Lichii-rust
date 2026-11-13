@@ -3226,7 +3226,11 @@ impl<'a> EmitContext<'a> {
             self.define_global_load(StorageElement::U32x4, u32x4_def.element, u32x4, 4)?;
         self.write_global_func_u32x4 =
             self.define_global_write(StorageElement::U32x4, u32x4_def.element, u32x4, 4)?;
-        for (bits, used) in [(8, info.uses_int8), (16, info.uses_int16)] {
+        let narrow = info.used_storage_buffer_types;
+        for (bits, used) in [
+            (8, info.uses_int8 && narrow.contains(Type::U8)),
+            (16, info.uses_int16 && narrow.contains(Type::U16)),
+        ] {
             if !used {
                 continue;
             }

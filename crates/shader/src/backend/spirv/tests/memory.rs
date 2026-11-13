@@ -290,6 +290,38 @@ fn narrow_global_accesses_use_narrow_views_or_their_containing_word() {
         )]));
 }
 
+/// Narrow integers elsewhere in a program that only makes 32-bit global accesses declare no
+/// narrow storage views, so no narrow global routing may refer to them.
+#[test]
+fn wide_global_accesses_beside_narrow_integers_stay_valid() {
+    let mut s = Synthetic::new();
+    let (b, _) = compute_block(&mut s);
+    let address = Value::U64(0x8000_1000);
+    let value = s.inst(b, Opcode::LoadGlobal32, &[address]);
+    s.inst(b, Opcode::WriteGlobal32, &[address, value]);
+    let info = ShaderInfo {
+        uses_int8: true,
+        uses_int16: true,
+        ..global_memory_info(0x110)
+    };
+    let program = finish_compute(s, b, info);
+    let views = Profile {
+        support_int64: true,
+        support_int8: true,
+        support_int16: true,
+        support_storage_buffer_8bit: true,
+        support_storage_buffer_16bit: true,
+        min_ssbo_alignment: 4,
+        ..Profile::default()
+    };
+    emit(
+        "global_wide_beside_narrow",
+        &views,
+        &RuntimeInfo::default(),
+        &program,
+    );
+}
+
 fn storage_atomic_program() -> TranslatedProgram {
     let mut s = Synthetic::new();
     let (b, x) = compute_block(&mut s);
