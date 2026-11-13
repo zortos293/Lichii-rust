@@ -27,7 +27,7 @@ use lichii_memory::DeviceAddressSpace;
 use crate::commands::transfer_to_all_barrier;
 use crate::device::Device;
 use crate::error::Result;
-use crate::memory::Buffer;
+use crate::memory::{Buffer, BufferView};
 use crate::scheduler::Scheduler;
 use crate::staging::{StagingRing, StagingSlice};
 
@@ -47,6 +47,8 @@ const CACHED_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
         | vk::BufferUsageFlags::INDEX_BUFFER.as_raw()
         | vk::BufferUsageFlags::UNIFORM_BUFFER.as_raw()
         | vk::BufferUsageFlags::STORAGE_BUFFER.as_raw()
+        | vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER.as_raw()
+        | vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER.as_raw()
         | vk::BufferUsageFlags::INDIRECT_BUFFER.as_raw()
         | vk::BufferUsageFlags::TRANSFER_SRC.as_raw()
         | vk::BufferUsageFlags::TRANSFER_DST.as_raw(),
@@ -135,6 +137,8 @@ struct CachedBuffer {
     dirty: Vec<u64>,
     dirty_pages: u64,
     stream_score: u32,
+    /// Texel buffer views by offset, range and format, dropped with the buffer.
+    views: Vec<((u64, u64, i32), BufferView)>,
 }
 
 impl CachedBuffer {
@@ -942,6 +946,7 @@ impl BufferCache {
             dirty,
             dirty_pages: pages as u64,
             stream_score: 0,
+            views: Vec::new(),
         };
         if !self.overlaps.is_empty() {
             let cmd = scheduler.record()?;
@@ -974,7 +979,7 @@ impl BufferCache {
                 if !leap {
                     new.stream_score += old.stream_score + 1;
                 }
-                scheduler.retire(old.buffer);
+                scheduler.retire((old.buffer, old.views));
                 self.stats.merged_buffers += 1;
             }
             transfer_to_all_barrier(&self.device, cmd);
@@ -1191,6 +1196,55 @@ impl BufferCache {
         };
         self.mark_gpu_written(daddr, binding.size);
         Ok(Some(binding))
+    }
+
+    /// A texel buffer view of `[gpu_va, +size)` read as `format`, `texel` bytes an element, over
+    /// the range's first contiguous run as Lichii binds texture buffers. Views are created on
+    /// first use and dropped with their buffer. With `written`, the viewed range is marked
+    /// GPU-written. `None` when no device memory backs the range or the run's offset breaks
+    /// the device's texel buffer alignment.
+    #[allow(clippy::too_many_arguments)]
+    pub fn texel_buffer(
+        &mut self,
+        scheduler: &mut Scheduler,
+        staging: &mut StagingRing,
+        gmmu: &Gmmu,
+        gpu_va: GpuVAddr,
+        size: u64,
+        (format, texel): (vk::Format, u64),
+        written: bool,
+    ) -> Result<Option<vk::BufferView>> {
+        if gpu_va == 0 || size < texel {
+            return Ok(None);
+        }
+        let Some((binding, daddr)) = self.first_run(scheduler, staging, gmmu, gpu_va, size)? else {
+            return Ok(None);
+        };
+        let limits = &self.device.properties.limits;
+        let elements = (binding.size / texel).min(u64::from(limits.max_texel_buffer_elements));
+        if elements == 0 || binding.offset % limits.min_texel_buffer_offset_alignment != 0 {
+            return Ok(None);
+        }
+        let range = elements * texel;
+        if written {
+            self.mark_gpu_written(daddr, range);
+        }
+        let id = Self::lookup(&self.page_table, daddr).expect("an acquired range has a buffer");
+        let key = (binding.offset, range, format.as_raw());
+        let buffer = self.buffers[id].as_mut().expect("live buffer");
+        if let Some((_, view)) = buffer.views.iter().find(|(k, _)| *k == key) {
+            return Ok(Some(view.raw()));
+        }
+        let view = BufferView::new(
+            &self.device,
+            buffer.buffer.raw(),
+            format,
+            binding.offset,
+            range,
+        )?;
+        let raw = view.raw();
+        buffer.views.push((key, view));
+        Ok(Some(raw))
     }
 
     /// The index buffer for a draw, converted where the host cannot draw the guest's indices:

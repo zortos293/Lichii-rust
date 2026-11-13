@@ -48,6 +48,14 @@ pub enum HaltReason {
     /// [`CpuCore::step`] executed one instruction.
     StepComplete,
     Fault(CpuFault),
+    /// `IC IVAU` or `IC IALLU` dropped this core's translated code for guest
+    /// `[addr, addr + size)`; `IC IALLU` reports `addr` 0 and `size` `u64::MAX`. Instruction
+    /// cache maintenance reaches every core, so the owner must drop the range on every other core
+    /// of the process too, then resume: `pc` already points past the instruction.
+    InvalidateCode {
+        addr: VAddr,
+        size: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

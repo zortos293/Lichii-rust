@@ -568,6 +568,17 @@ impl Device {
         }
     }
 
+    /// Format support for `format` in texel buffers.
+    pub fn buffer_features(&self, format: vk::Format) -> vk::FormatFeatureFlags {
+        // SAFETY: valid physical device.
+        unsafe {
+            self.instance
+                .raw
+                .get_physical_device_format_properties(self.physical, format)
+        }
+        .buffer_features
+    }
+
     /// Format support for `format` with optimal tiling.
     pub fn format_features(&self, format: vk::Format) -> vk::FormatFeatureFlags {
         // SAFETY: valid physical device.
