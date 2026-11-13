@@ -356,8 +356,9 @@ fn set_fault(t: &mut Translator<'_>, result: Value) {
     t.ir.set_pred(pred, fault);
 }
 
-/// LOD mode at bits 87..90. LBA and LLA (6, 7) sample as LB and LL; the clamp modes are not
-/// supported.
+/// LOD mode at bits 87..90. LBA and LLA (6, 7) sample as LB and LL. The clamp modes, LC (4) and
+/// LB.LC (5), are the implicit and biased modes with a minimum LOD; [`Lod::decode`] returns
+/// whether the mode clamps.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Lod {
     Auto,
@@ -367,12 +368,14 @@ enum Lod {
 }
 
 impl Lod {
-    fn decode(t: &Translator<'_>) -> Result<Lod, TranslateError> {
+    fn decode(t: &Translator<'_>) -> Result<(Lod, bool), TranslateError> {
         Ok(match t.insn.bits(87, 3) {
-            0 => Lod::Auto,
-            1 => Lod::Zero,
-            2 | 6 => Lod::Bias,
-            3 | 7 => Lod::Explicit,
+            0 => (Lod::Auto, false),
+            1 => (Lod::Zero, false),
+            2 | 6 => (Lod::Bias, false),
+            3 | 7 => (Lod::Explicit, false),
+            4 => (Lod::Auto, true),
+            5 => (Lod::Bias, true),
             _ => return Err(t.unsupported()),
         })
     }
@@ -383,10 +386,12 @@ impl Lod {
 }
 
 /// TEX: sampling with an implicit, zero, biased or explicit LOD, AOFFI offsets (bit 76),
-/// non-divergent derivatives (77), depth compare (78) and half results (79).
+/// non-divergent derivatives (77), depth compare (78) and half results (79). A clamped LOD mode
+/// puts a first operand before the coordinates even without an array: the layer in its low 16
+/// bits and the minimum LOD, unsigned 4.8 fixed point, in its high 16.
 fn tex(t: &mut Translator<'_>) -> TResult {
     let insn = t.insn;
-    let lod = Lod::decode(t)?;
+    let (lod, clamped) = Lod::decode(t)?;
     let dim = Dim::decode(t)?;
     let form = HandleForm::decode(t)?;
     if insn.bit(80) {
@@ -397,7 +402,22 @@ fn tex(t: &mut Translator<'_>) -> TResult {
         + u16::from(lod.has_operand())
         + u16::from(aoffi)
         + u16::from(depth);
-    let mut ops = Operands::new(t, dim.values(), rest, insn.bit(60));
+    let leading = dim.values() + u16::from(clamped && !dim.is_array());
+    let mut ops = Operands::new(t, leading, rest, insn.bit(60));
+    let min_lod = if clamped {
+        let packed = t.x(ops.a);
+        let fixed = t.ir.shift_right_logical(packed, Value::U32(16));
+        let lod =
+            t.ir.convert_i_to_f(32, 32, false, fixed, FpControl::default());
+        let min_lod =
+            t.ir.fp_mul(lod, Value::F32(1.0 / 256.0), FpControl::default());
+        if !dim.is_array() {
+            ops.next();
+        }
+        Some(min_lod)
+    } else {
+        None
+    };
     let coords = float_coords(t, &mut ops, dim);
     let register = if form == HandleForm::Register {
         ops.next()
@@ -410,6 +430,11 @@ fn tex(t: &mut Translator<'_>) -> TResult {
     } else {
         Value::F32(0.0)
     };
+    let lod_value = match (min_lod, lod) {
+        (None, _) => lod_value,
+        (Some(min_lod), Lod::Bias) => t.ir.composite_construct(&[lod_value, min_lod]),
+        (Some(min_lod), _) => min_lod,
+    };
     let offset = if aoffi {
         let reg = ops.next();
         packed_offset(t, reg, dim, 4, 4)?
@@ -421,6 +446,7 @@ fn tex(t: &mut Translator<'_>) -> TResult {
         ty: dim.ty(),
         is_depth: depth,
         has_bias: lod == Lod::Bias,
+        has_lod_clamp: clamped,
         relaxed_precision: half,
         ndv_is_active: insn.bit(77),
         ..Default::default()
@@ -1050,6 +1076,7 @@ mod tests {
     use crate::ampere::opcode::Opcode;
     use crate::backend::Bindings;
     use crate::backend::spirv::tests::validate;
+    use crate::ir::{TextureInstInfo, TextureType};
     use crate::profile::HostTranslateInfo;
     use crate::translate::{TranslateOptions, TranslatedProgram};
     use crate::{Profile, RuntimeInfo};
@@ -1800,8 +1827,30 @@ mod tests {
             lla.contains("BoundImageSampleExplicitLod #0x80020000, %4, %6, void (flags 0x8000)"),
             "{lla}"
         );
-        rejects(tex(4));
-        rejects(tex(5));
+        let min_lod = "{0}:\n\
+                       \x20 %0 = GetRegister R0\n\
+                       \x20 %1 = ShiftRightLogical32 %0, #0x10\n\
+                       \x20 %2 = ConvertF32U32 %1\n\
+                       \x20 %3 = FPMul32 %2, #0.00390625f\n\
+                       \x20 %4 = GetRegister R1\n";
+        let lc = translate(&[tex(4)]).unwrap();
+        assert!(lc.starts_with(min_lod), "{lc}");
+        assert!(
+            lc.contains("BoundImageSampleImplicitLod #0x80020000, %8, %3, void (flags 0x108000)"),
+            "{lc}"
+        );
+        let lb_lc = translate(&[tex(5)]).unwrap();
+        assert!(lb_lc.starts_with(min_lod), "{lb_lc}");
+        assert!(
+            lb_lc.contains("%11 = CompositeConstructF32x2 %10, %3\n"),
+            "{lb_lc}"
+        );
+        assert!(
+            lb_lc.contains(
+                "BoundImageSampleImplicitLod #0x80020000, %8, %11, void (flags 0x188000)"
+            ),
+            "{lb_lc}"
+        );
     }
 
     #[test]
@@ -1958,6 +2007,58 @@ mod tests {
             ),
             (3, 0x40)
         );
+    }
+
+    /// LB.LC on a 2D array: the first operand holds the layer and the minimum LOD, the bias
+    /// follows in Rb.
+    #[test]
+    fn fragment_program_samples_with_a_minimum_lod() {
+        let ipa = |reg: u128, word: u128| {
+            encode(
+                Opcode::Ipa,
+                Form::Fixed,
+                dst(reg) | rb(RZ) | (word << 64) | NO_FAULT,
+            )
+        };
+        let code = [
+            ipa(5, 32),
+            ipa(6, 33),
+            ipa(8, 34),
+            encode(
+                Opcode::Tex,
+                Form::Bound,
+                bound(3, 0x10)
+                    | dim(5)
+                    | lod(5)
+                    | ra(4)
+                    | rb(8)
+                    | mask(0xf)
+                    | dst(0)
+                    | rc(2)
+                    | NO_FAULT,
+            ),
+            exit(),
+        ];
+        let mut env = TestEnv::new(&code);
+        env.stage = ShaderStage::Fragment;
+        for (word, value) in [
+            (0, 2 | (3 << 5) | (5 << 10)),
+            (5, 0x80 << 24),
+            (6, 0x2a),
+            (18, 0xf),
+        ] {
+            env.header[word] = value;
+        }
+        let program = compile("ampere_fragment_min_lod", &env);
+        let ir = program.ir.dump();
+        let sample = ir
+            .lines()
+            .find(|line| line.contains("ImageSampleImplicitLod"))
+            .expect("an implicit-lod sample");
+        let flags = sample.rsplit("0x").next().unwrap().trim_end_matches(')');
+        let info = TextureInstInfo::from_flags(u32::from_str_radix(flags, 16).unwrap());
+        assert!(info.has_bias && info.has_lod_clamp, "{sample}");
+        assert_eq!(info.ty, TextureType::ColorArray2D);
     }
 
     #[test]
