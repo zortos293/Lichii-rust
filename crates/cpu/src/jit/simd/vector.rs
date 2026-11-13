@@ -330,23 +330,32 @@ fn copy(t: &mut Translator, word: u32) -> bool {
     true
 }
 
-/// `LD1`/`ST1` (multiple structures) of `rpt` consecutive registers, one vector access each in
-/// register order. A load writes the registers only after every access succeeded and the base is
-/// written back last, so a fault leaves the interpreter's state: no register or base written, and
-/// every byte before the faulting one stored.
-pub(in super::super) fn load_store_multiple(t: &mut Translator, inst: &Inst, pc: u64) {
+/// Emits `LD1`..`LD4`/`ST1`..`ST4` (multiple structures) and returns true, or emits nothing and
+/// returns false when an interleaved form needs SSE4.1 lane inserts the host lacks.
+///
+/// `LD1`/`ST1` make one vector access per register, in register order. `LD2`..`LD4`/`ST2`..`ST4`
+/// access the interleaved structures as 16-byte chunks (and an 8-byte tail) in address order, and
+/// move each element between its chunk lane and its register lane. Either way a load writes the
+/// registers only after every access succeeded and the base is written back last, so a fault
+/// leaves the interpreter's state: no register or base written, and every byte before the
+/// faulting one stored.
+pub(in super::super) fn load_store_multiple(t: &mut Translator, inst: &Inst, pc: u64) -> bool {
     let Inst::VecMulti {
         load,
         q,
+        size: element,
         rpt,
+        selem,
         vt,
         rn,
         post,
-        ..
     } = *inst
     else {
         unreachable!("only VecMulti reaches here");
     };
+    if selem > 1 {
+        return interleaved(t, load, q, element, selem, vt, rn, post, pc);
+    }
     let size = if q { 4 } else { 3 };
     let base = t.x(rn);
     let mut loaded = [Value(0); 4];
@@ -375,6 +384,100 @@ pub(in super::super) fn load_store_multiple(t: &mut Translator, inst: &Inst, pc:
         }
     }
     post_index(t, rn, post, base);
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn interleaved(
+    t: &mut Translator,
+    load: bool,
+    q: bool,
+    size: u8,
+    selem: u8,
+    vt: u8,
+    rn: Reg,
+    post: PostIndex,
+    pc: u64,
+) -> bool {
+    if size.is_multiple_of(2) && !t.sse41 {
+        return false;
+    }
+    let vector = |t: &mut Translator, op| t.op(Op::Simd(SimdOp::Vec(op)));
+    let move_lane =
+        |t: &mut Translator, from: Value, from_lane: usize, to: Value, to_lane: usize| {
+            let value = vector(
+                t,
+                VecOp::Extract {
+                    size,
+                    index: from_lane as u8,
+                    signed: None,
+                    vector: from,
+                },
+            );
+            vector(
+                t,
+                VecOp::Insert {
+                    size,
+                    index: to_lane as u8,
+                    vector: to,
+                    value,
+                },
+            )
+        };
+    let bytes = selem as usize * if q { 16 } else { 8 };
+    let lanes = (if q { 16 } else { 8 }) >> size;
+    let per_chunk = 16 >> size;
+    let base = t.x(rn);
+    let mut chunks = [(Value(0), Value(0)); 4];
+    for (c, chunk) in chunks.iter_mut().enumerate().take(bytes.div_ceil(16)) {
+        chunk.0 = if c == 0 {
+            base
+        } else {
+            let offset = t.op(Op::Const(16 * c as u64));
+            t.op(Op::Add(W::W64, base, offset))
+        };
+    }
+    let chunk_size = |c: usize| if 16 * c + 16 <= bytes { 4 } else { 3 };
+    let regs: [u8; 4] = std::array::from_fn(|s| (vt + s as u8) % 32);
+    if load {
+        for (c, (addr, value)) in chunks.iter_mut().enumerate().take(bytes.div_ceil(16)) {
+            *value = t.op(Op::LoadVec {
+                size: chunk_size(c),
+                addr: *addr,
+                pc,
+            });
+        }
+        let mut loaded = [Value(0); 4];
+        for (s, value) in loaded.iter_mut().enumerate().take(selem as usize) {
+            *value = (0..lanes).fold(vector(t, VecOp::Imm(0, true)), |v, e| {
+                let k = e * selem as usize + s;
+                move_lane(t, chunks[k / per_chunk].1, k % per_chunk, v, e)
+            });
+        }
+        for (s, &value) in loaded.iter().enumerate().take(selem as usize) {
+            t.set(Loc::V(regs[s]), value);
+        }
+    } else {
+        let mut source = [Value(0); 4];
+        for (s, value) in source.iter_mut().enumerate().take(selem as usize) {
+            *value = t.op(Op::Get(Loc::V(regs[s])));
+        }
+        for (c, &(addr, _)) in chunks.iter().enumerate().take(bytes.div_ceil(16)) {
+            let elements = (bytes - 16 * c).min(16) >> size;
+            let value = (0..elements).fold(vector(t, VecOp::Imm(0, true)), |v, i| {
+                let k = c * per_chunk + i;
+                move_lane(t, source[k % selem as usize], k / selem as usize, v, i)
+            });
+            t.op(Op::StoreVec {
+                size: chunk_size(c),
+                addr,
+                value,
+                pc,
+            });
+        }
+    }
+    post_index(t, rn, post, base);
+    true
 }
 
 /// Emits `LD1`..`LD4`/`ST1`..`ST4` (single structure) or `LD1R`..`LD4R` and returns true, or emits

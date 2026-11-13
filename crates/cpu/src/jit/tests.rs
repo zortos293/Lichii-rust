@@ -300,7 +300,7 @@ const VECTOR: [&str; 11] = [
 ];
 
 /// An Advanced SIMD integer three-same, compare against zero, `CNT`, shift by immediate, copy or
-/// modified-immediate instruction, or an `LD1`/`ST1` of one to four registers on `X20`..`X23` or
+/// modified-immediate instruction, or an `LD1`..`LD4`/`ST1`..`ST4` of one to four registers on `X20`..`X23` or
 /// `SP`, offset or post-indexed by an immediate or `X24`/`X26`.
 fn vector(rng: &mut Rng) -> u32 {
     if rng.below(3) == 0 {
@@ -309,7 +309,8 @@ fn vector(rng: &mut Rng) -> u32 {
         } else {
             BASES + rng.below(4) as u32
         };
-        let opcode = [0b0111, 0b1010, 0b0110, 0b0010][rng.below(4) as usize];
+        let opcode =
+            [0b0111, 0b1010, 0b0110, 0b0010, 0b1000, 0b0100, 0b0000][rng.below(7) as usize];
         let post = rng.below(2) as u32;
         let rm = post * [31, 24, 26][rng.below(3) as usize];
         if rng.below(2) == 0 {
@@ -723,6 +724,12 @@ fn vector_structure_faults_leave_the_interpreters_state() {
     const LD2_D1_X2_POST_X3: u32 = 0x4de3_8441;
     const ST3_B13_X2_POST_X3: u32 = 0x4d83_3441;
     const LD4R_2D_X2_POST: u32 = 0x4dff_ec41;
+    const LD4_4S_X2_POST: u32 = 0x4cdf_0840;
+    const ST4_4S_X2_POST: u32 = 0x4c9f_0840;
+    const LD3_8B_X2_POST_X3: u32 = 0x0cc3_4041;
+    const ST2_8H_X2_POST_X3: u32 = 0x4c83_8441;
+    const ST3_16B_X2: u32 = 0x4c00_4041;
+    const LD2_2D_X2: u32 = 0x4c40_8c41;
     let movi = |rd: u32, imm: u32| 0x4f00_e400 | (imm >> 5) << 16 | (imm & 31) << 5 | rd;
     for addr in [
         RODATA + 0x1000 - 1,
@@ -750,6 +757,12 @@ fn vector_structure_faults_leave_the_interpreters_state() {
             LD2_D1_X2_POST_X3,
             ST3_B13_X2_POST_X3,
             LD4R_2D_X2_POST,
+            LD4_4S_X2_POST,
+            ST4_4S_X2_POST,
+            LD3_8B_X2_POST_X3,
+            ST2_8H_X2_POST_X3,
+            ST3_16B_X2,
+            LD2_2D_X2,
         ] {
             let code = [
                 movi(0, 0x11),
@@ -1760,6 +1773,7 @@ fn profile_counts_without_changing_results() {
             accuracy: CpuAccuracy::Auto,
         };
         let mut jit = Jit::build(config, Passes::ALL, profile).unwrap();
+        jit.target.sse41 = false;
         let mut ctx = ThreadContext {
             pc: CODE,
             fpcr: 1 << 24,
