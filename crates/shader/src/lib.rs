@@ -207,3 +207,41 @@ pub enum TranslateError {
     #[error("unsupported mesh program: {0}")]
     UnsupportedMesh(&'static str),
 }
+
+impl TranslateError {
+    /// Whether the texture headers translation read may have caused the failure, so the same
+    /// program may translate under other headers. True when the cause is not known.
+    pub fn depends_on_textures(&self) -> bool {
+        use backend::spirv::EmitError;
+        match self {
+            Self::Texture(_) | Self::Lowering(_) | Self::InvalidIr(_) => true,
+            Self::Emit(error) => matches!(error, EmitError::InvalidIr(_) | EmitError::Builder(_)),
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    #[test]
+    fn only_failures_a_texture_header_may_cause_depend_on_textures() {
+        let format = TranslateError::from(opt::TextureError::ByteAddressedFormat {
+            format: info::TexturePixelFormat::B10g11r11Float,
+            ty: ir::TextureType::Color2D,
+            index: 0,
+            offset: 0x70,
+        });
+        assert!(format.depends_on_textures());
+        let narrow = TranslateError::from(backend::spirv::EmitError::Unsupported(
+            "8 and 16-bit global memory access the storage buffer pass left",
+        ));
+        assert!(!narrow.depends_on_textures());
+        let unsupported = TranslateError::Unsupported {
+            address: GpuVAddr::default(),
+            opcode: 0,
+        };
+        assert!(!unsupported.depends_on_textures());
+    }
+}

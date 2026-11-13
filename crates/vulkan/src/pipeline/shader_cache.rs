@@ -10,9 +10,12 @@
 //! remembered per device address and recomputed only after a guest write touched it. A hit
 //! is a page table lookup, two map lookups and the replay; it allocates nothing and takes no
 //! lock. Failed translations are cached too: their draws are skipped without translating again.
-//! A failure is remembered without the reads that led to it, so a constant buffer word that
-//! changes from draw to draw (a per-material bindless handle) does not translate the failing
-//! program again on every draw. Each key keeps at most [`MAX_VARIANTS`] variants.
+//! A failure no texture header can have caused ([`TranslateError::depends_on_textures`]) is
+//! remembered without the reads that led to it, so a constant buffer word that changes from
+//! draw to draw (a per-material bindless handle) does not translate the failing program again
+//! on every draw; one that changes a jump table does not either. A failure a texture header may
+//! have caused keeps its reads and translates again under other headers. Each key keeps at most
+//! [`MAX_VARIANTS`] variants.
 //!
 //! With the title's disk cache open, a miss first replays the stored entries that share the
 //! program's probe key (`lichii_shader::cache`) and reuses a module whose every recorded answer
@@ -202,6 +205,7 @@ impl ShaderCache {
         }
 
         let first = *bindings;
+        let mut wildcard = false;
         let options = TranslateOptions {
             profile: &self.profile,
             host: &self.host,
@@ -255,6 +259,7 @@ impl ShaderCache {
                         self.stats.failed += 1;
                         *bindings = first;
                         warn_failed(env, &error);
+                        wildcard = !error.depends_on_textures();
                         None
                     }
                 }
@@ -268,7 +273,7 @@ impl ShaderCache {
             a.map(ProgramEnv::take_reads).unwrap_or_default(),
             env.take_reads(),
         ];
-        if module.is_none() {
+        if wildcard {
             reads = Default::default();
         }
         let variants = self.modules.entry(key).or_default();
