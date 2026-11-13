@@ -1243,7 +1243,7 @@ fn normalize_rect_coords(prog: &mut Program, id: InstId) {
         ir.fp_recip(extent)
     };
     let recips = [recip(&mut ir, 0), recip(&mut ir, 1)];
-    let mut scale = |ir: &mut Emitter<'_>, vector: Value, components: usize| {
+    let scale = |ir: &mut Emitter<'_>, vector: Value, components: usize| {
         let scaled: Vec<Value> = (0..components)
             .map(|component| {
                 let value = ir.composite_extract(vector, component as u32);
