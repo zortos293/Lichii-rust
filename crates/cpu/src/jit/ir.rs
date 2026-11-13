@@ -265,6 +265,13 @@ pub enum Op {
     Ticks,
     /// `DMB`/`DSB`.
     Fence,
+    /// One instruction of the SIMD/FP data-processing group, run by the interpreter's
+    /// `simd::execute` on the live `ThreadContext`. It may read and write any guest state, and
+    /// faults with `CpuFault::Undefined` on an unallocated encoding.
+    CallSimd {
+        word: u32,
+        pc: u64,
+    },
 }
 
 impl Op {
@@ -275,7 +282,8 @@ impl Op {
             | Op::Store { .. }
             | Op::StoreVec { .. }
             | Op::ZeroBlock { .. }
-            | Op::Fence => Ty::Void,
+            | Op::Fence
+            | Op::CallSimd { .. } => Ty::Void,
             Op::Get(loc) => loc.ty(),
             Op::LoadVec { .. } => Ty::U128,
             Op::AddFlags(..)
@@ -303,6 +311,7 @@ impl Op {
                 | Op::StoreExclusive128 { .. }
                 | Op::Cas128 { .. }
                 | Op::ZeroBlock { .. }
+                | Op::CallSimd { .. }
         )
     }
 
@@ -314,7 +323,13 @@ impl Op {
     /// Calls `f` on every operand.
     pub fn for_each_arg(&mut self, mut f: impl FnMut(&mut Value)) {
         match self {
-            Op::Nop | Op::Const(_) | Op::Get(_) | Op::Ticks | Op::Fence | Op::High => {}
+            Op::Nop
+            | Op::Const(_)
+            | Op::Get(_)
+            | Op::Ticks
+            | Op::Fence
+            | Op::High
+            | Op::CallSimd { .. } => {}
             Op::StoreExclusive128 {
                 addr, low, high, ..
             } => {
