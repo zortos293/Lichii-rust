@@ -19,6 +19,9 @@ pub(super) struct Translator<'a> {
     pub config: &'a CpuConfig,
     /// Whether the host has `cmpxchg16b`; without it the 128-bit stores stay on the interpreter.
     pub cmpxchg16b: bool,
+    /// Whether the host has SSE4.1 and SSE4.2; SIMD lowerings that need them stay on `CallSimd`.
+    pub sse41: bool,
+    pub sse42: bool,
 }
 
 impl Translator<'_> {
@@ -194,6 +197,7 @@ impl Translator<'_> {
                     self.op(Op::CallSimd { word, pc });
                 }
             }
+            Inst::VecMulti { selem: 1, .. } => super::simd::load_store_multiple(self, inst, pc),
             Inst::Adr { rd, offset } => {
                 let v = self.k(target(offset));
                 self.set_x(rd, v);

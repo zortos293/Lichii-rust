@@ -241,6 +241,13 @@ impl AddressSpace {
         self.table.translate(va)
     }
 
+    /// Host pointer for an access to `va` that needs `need` (atomics, exclusives): a permission
+    /// fault when the page is mapped without it.
+    #[inline]
+    pub fn access(&self, va: VAddr, need: MemoryPermission) -> Result<*mut u8, MemoryFault> {
+        self.table.access(va, need)
+    }
+
     /// Host pointer for `[va, va + size)` when it is mapped to contiguous DRAM.
     pub fn contiguous_pointer(&self, va: VAddr, size: u64) -> Option<*mut u8> {
         self.table.contiguous(va, size)
@@ -256,26 +263,48 @@ impl AddressSpace {
         self.translate(va).is_some()
     }
 
+    /// Reads a value, whatever the page permissions (the kernel's and the services' view).
     #[inline]
     pub fn read<T: bytemuck::Pod>(&self, va: VAddr) -> Result<T, MemoryFault> {
-        self.table.read(va)
+        self.table.read(va, MemoryPermission::NONE)
     }
 
+    /// Writes a value, whatever the page permissions (loading code, HLE writes).
     #[inline]
     pub fn write<T: bytemuck::Pod>(&self, va: VAddr, value: T) -> Result<(), MemoryFault> {
-        self.table.write(va, value)
+        self.table.write(va, value, MemoryPermission::NONE)
     }
 
     pub fn read_bytes(&self, va: VAddr, out: &mut [u8]) -> Result<(), MemoryFault> {
-        self.table.read_bytes(va, out)
+        self.table.read_bytes(va, out, MemoryPermission::NONE)
     }
 
     pub fn write_bytes(&self, va: VAddr, data: &[u8]) -> Result<(), MemoryFault> {
-        self.table.write_bytes(va, data)
+        self.table.write_bytes(va, data, MemoryPermission::NONE)
     }
 
     pub fn fill(&self, va: VAddr, size: u64, byte: u8) -> Result<(), MemoryFault> {
-        self.table.fill(va, size, byte)
+        self.table.fill(va, size, byte, MemoryPermission::NONE)
+    }
+
+    /// A guest load: the page must be readable, else a permission fault.
+    #[inline]
+    pub fn guest_read<T: bytemuck::Pod>(&self, va: VAddr) -> Result<T, MemoryFault> {
+        self.table.read(va, MemoryPermission::READ)
+    }
+
+    /// A guest store: a page without write permission is a permission fault and is left
+    /// unchanged. The fastmem arena protects such pages on the host too, so the JIT's direct
+    /// stores fault into its slow path, which stores through here.
+    #[inline]
+    pub fn guest_write<T: bytemuck::Pod>(&self, va: VAddr, value: T) -> Result<(), MemoryFault> {
+        self.table.write(va, value, MemoryPermission::WRITE)
+    }
+
+    /// A guest store of `size` copies of `byte` (`DC ZVA`), checked like
+    /// [`AddressSpace::guest_write`]; pages before a faulting one are written.
+    pub fn guest_fill(&self, va: VAddr, size: u64, byte: u8) -> Result<(), MemoryFault> {
+        self.table.fill(va, size, byte, MemoryPermission::WRITE)
     }
 
     /// Reads a NUL-terminated string of at most `max_len` bytes.

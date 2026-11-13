@@ -177,6 +177,24 @@ const WORKLOADS: &[Workload] = &[
         far: &[],
         per_iteration: 6,
     },
+    Workload {
+        name: "vector int loop",
+        code: &[
+            0x4c407820, // 1: ld1 {v0.4s}, [x1]
+            0x4e040c41, // dup v1.4s, w2
+            0x4ea18400, // add v0.4s, v0.4s, v1.4s
+            0x6e211c02, // eor v2.16b, v0.16b, v1.16b
+            0x4f235442, // shl v2.4s, v2.4s, #3
+            0x4ea03443, // cmgt v3.4s, v2.4s, v0.4s
+            0x0e0c3c42, // umov w2, v2.s[1]
+            0x4c007822, // st1 {v2.4s}, [x1]
+            0xf10004a5, // subs x5, x5, #1
+            0x54fffee1, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 10,
+    },
 ];
 
 fn main() {

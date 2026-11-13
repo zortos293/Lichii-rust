@@ -1709,7 +1709,6 @@ version = "0.1.0"
 dependencies = [
  "bcdec_rs",
  "bytemuck",
- "lichii-common",
  "texture2ddecoder",
  "thiserror 2.0.21",
 ]

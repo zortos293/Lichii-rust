@@ -125,6 +125,8 @@ pub(crate) struct KernelInner {
     next_process_id: AtomicU64,
     next_thread_id: AtomicU64,
     processes: Mutex<Vec<Arc<Process>>>,
+    /// Counts process exits, so cores know when to drop the CPU state of exited processes.
+    process_exits: AtomicU64,
     invalidations: Box<[Mutex<Vec<CodeRange>>]>,
     host_threads: Mutex<Vec<JoinHandle<()>>>,
     application_limit: Arc<ResourceLimit>,
@@ -184,6 +186,7 @@ impl Kernel {
             next_process_id: AtomicU64::new(0x51),
             next_thread_id: AtomicU64::new(1),
             processes: Mutex::new(Vec::new()),
+            process_exits: AtomicU64::new(0),
             invalidations: (0..cores).map(|_| Mutex::new(Vec::new())).collect(),
             host_threads: Mutex::new(Vec::new()),
         })))
@@ -552,11 +555,7 @@ impl KernelInner {
 
     /// Called on the core that ran the thread when it exits.
     pub(crate) fn exit_thread(&self, core: usize, thread: &Arc<Thread>) {
-        {
-            let mut s = thread.sched.lock();
-            s.state = thread::ThreadState::Terminated;
-            s.wait = 0;
-        }
+        thread.mark_terminated();
         self.scheduler.clear_running(core);
         thread.sync.signal();
         svc::release_thread_resources(thread);
@@ -565,6 +564,7 @@ impl KernelInner {
             process.finalize();
             self.events.on_process_exit(process);
             self.processes.lock().retain(|p| !Arc::ptr_eq(p, process));
+            self.process_exits.fetch_add(1, Ordering::Release);
         }
     }
 }

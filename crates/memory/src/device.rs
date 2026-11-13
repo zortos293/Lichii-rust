@@ -136,30 +136,30 @@ impl DeviceAddressSpace {
     /// Reads a value; it may straddle pages. Fails on the first unmapped page.
     #[inline]
     pub fn read<T: bytemuck::Pod>(&self, daddr: DAddr) -> Result<T, MemoryFault> {
-        self.table.read(daddr)
+        self.table.read(daddr, MemoryPermission::NONE)
     }
 
     /// Writes a value; it may straddle pages. Fails on the first unmapped page, after writing the
     /// bytes before it.
     #[inline]
     pub fn write<T: bytemuck::Pod>(&self, daddr: DAddr, value: T) -> Result<(), MemoryFault> {
-        self.table.write(daddr, value)
+        self.table.write(daddr, value, MemoryPermission::NONE)
     }
 
     /// Copies `out.len()` bytes from `daddr`. Fails on the first unmapped page.
     pub fn read_bytes(&self, daddr: DAddr, out: &mut [u8]) -> Result<(), MemoryFault> {
-        self.table.read_bytes(daddr, out)
+        self.table.read_bytes(daddr, out, MemoryPermission::NONE)
     }
 
     /// Copies `data` to `daddr`. Fails on the first unmapped page, after writing the bytes
     /// before it.
     pub fn write_bytes(&self, daddr: DAddr, data: &[u8]) -> Result<(), MemoryFault> {
-        self.table.write_bytes(daddr, data)
+        self.table.write_bytes(daddr, data, MemoryPermission::NONE)
     }
 
     /// Sets `size` bytes at `daddr` to `byte`. Fails on the first unmapped page.
     pub fn fill(&self, daddr: DAddr, size: u64, byte: u8) -> Result<(), MemoryFault> {
-        self.table.fill(daddr, size, byte)
+        self.table.fill(daddr, size, byte, MemoryPermission::NONE)
     }
 }
 

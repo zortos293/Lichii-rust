@@ -1,11 +1,11 @@
 //! Guest threads.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 use lichii_common::{ResultCode, VAddr};
 use lichii_cpu::ThreadContext;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 
 use crate::process::Process;
 use crate::scheduler::Scheduler;
@@ -17,6 +17,8 @@ pub type ThreadId = u64;
 pub const LOWEST_PRIORITY: u8 = 63;
 /// Size of a thread's TLS slot (`TPIDRRO_EL0`).
 pub const TLS_SIZE: u64 = 0x200;
+/// Longest chain of mutex owners a priority change is passed along.
+const MAX_INHERITANCE_DEPTH: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThreadState {
@@ -66,7 +68,11 @@ pub enum Resume {
 
 pub(crate) struct Sched {
     pub state: ThreadState,
+    /// The effective priority: the base priority, raised by the threads waiting for mutexes this
+    /// thread owns.
     pub priority: u8,
+    /// The priority the guest set.
+    pub base_priority: u8,
     pub affinity: u64,
     pub ideal_core: i32,
     pub active_core: usize,
@@ -81,6 +87,10 @@ pub(crate) struct Sched {
     pub terminate_requested: bool,
 }
 
+/// Held while a process changes its mutex ownership links (`lock_waiters`, `lock_owner`) and the
+/// priorities they lend, so updates along an owner chain never interleave.
+pub(crate) type InheritanceGuard<'a> = MutexGuard<'a, ()>;
+
 /// A guest thread: its saved context, scheduling state and TLS slot.
 pub struct Thread {
     id: ThreadId,
@@ -92,6 +102,23 @@ pub struct Thread {
     pub(crate) sched: Mutex<Sched>,
     wait_token: AtomicU64,
     pub(crate) sync: SyncState,
+    /// Threads waiting for mutexes this thread owns; they lend it their priority.
+    lock_waiters: Mutex<Vec<LockWaiter>>,
+    /// The owner of the mutex this thread waits for.
+    lock_owner: Mutex<LockOwner>,
+}
+
+/// Link from a waiter to the owner it lends its priority to, for the waiter's wait `token`.
+#[derive(Default)]
+struct LockOwner {
+    thread: Weak<Thread>,
+    token: u64,
+}
+
+struct LockWaiter {
+    thread: Arc<Thread>,
+    token: u64,
+    mutex: VAddr,
 }
 
 pub(crate) struct NewThread {
@@ -126,6 +153,7 @@ impl Thread {
             sched: Mutex::new(Sched {
                 state: ThreadState::Created,
                 priority: new.priority,
+                base_priority: new.priority,
                 affinity: new.affinity,
                 ideal_core: new.ideal_core,
                 active_core: new.ideal_core.max(0) as usize,
@@ -140,6 +168,8 @@ impl Thread {
             }),
             wait_token: AtomicU64::new(0),
             sync: SyncState::default(),
+            lock_waiters: Mutex::default(),
+            lock_owner: Mutex::default(),
         })
     }
 
@@ -166,6 +196,146 @@ impl Thread {
 
     pub fn priority(&self) -> u8 {
         self.sched.lock().priority
+    }
+
+    /// Sets the priority the guest asked for; the effective priority stays raised while
+    /// higher-priority threads wait for mutexes this thread owns.
+    pub(crate) fn set_base_priority(self: &Arc<Self>, priority: u8) {
+        let held = self.lock_inheritance();
+        self.sched.lock().base_priority = priority;
+        self.restore_priority(&held);
+    }
+
+    pub(crate) fn lock_inheritance(&self) -> InheritanceGuard<'_> {
+        self.process.inheritance.lock()
+    }
+
+    /// `waiter` (in wait `token`) waits for the mutex at `mutex`, which this thread owns.
+    ///
+    /// The owner link is set before the wait is checked: a wake that ends the wait either
+    /// happened first, so the check fails, or sees the link and withdraws the donation. A link
+    /// left by an earlier wait whose wake has not withdrawn it yet is withdrawn here.
+    pub(crate) fn add_lock_waiter(
+        self: &Arc<Self>,
+        waiter: &Arc<Thread>,
+        token: u64,
+        mutex: VAddr,
+    ) {
+        let held = self.lock_inheritance();
+        let link = LockOwner {
+            thread: Arc::downgrade(self),
+            token,
+        };
+        let previous = std::mem::replace(&mut *waiter.lock_owner.lock(), link);
+        if waiter.is_waiting_on(token) {
+            self.lock_waiters.lock().push(LockWaiter {
+                thread: waiter.clone(),
+                token,
+                mutex,
+            });
+        } else {
+            *waiter.lock_owner.lock() = LockOwner::default();
+        }
+        if let Some(previous) = previous.thread.upgrade()
+            && !Arc::ptr_eq(&previous, self)
+        {
+            previous.restore_priority(&held);
+        }
+        self.restore_priority(&held);
+    }
+
+    /// The thread's wait ended other than by a mutex handoff: it stops lending its priority to
+    /// the owner of the mutex it waited for.
+    fn leave_lock_wait(self: &Arc<Self>, token: u64) {
+        if token == 0 || self.lock_owner.lock().token != token {
+            return;
+        }
+        let held = self.lock_inheritance();
+        let owner = {
+            let mut link = self.lock_owner.lock();
+            if link.token != token {
+                return;
+            }
+            std::mem::take(&mut *link).thread.upgrade()
+        };
+        if let Some(owner) = owner {
+            owner.restore_priority(&held);
+        }
+    }
+
+    /// This thread released the mutex at `mutex` to `next`, or to nobody: its waiters now wait
+    /// for `next`, and lend their priority to it instead.
+    pub(crate) fn pass_lock(
+        self: &Arc<Self>,
+        held: &InheritanceGuard,
+        mutex: VAddr,
+        next: Option<&Arc<Thread>>,
+    ) {
+        let moved: Vec<LockWaiter> = {
+            let mut waiters = self.lock_waiters.lock();
+            let (moved, kept) = std::mem::take(&mut *waiters)
+                .into_iter()
+                .partition(|waiter| waiter.mutex == mutex);
+            *waiters = kept;
+            moved
+        };
+        if let Some(next) = next {
+            *next.lock_owner.lock() = LockOwner::default();
+            let moved: Vec<LockWaiter> = moved
+                .into_iter()
+                .filter(|w| !Arc::ptr_eq(&w.thread, next) && w.thread.is_waiting_on(w.token))
+                .collect();
+            for waiter in &moved {
+                *waiter.thread.lock_owner.lock() = LockOwner {
+                    thread: Arc::downgrade(next),
+                    token: waiter.token,
+                };
+            }
+            next.lock_waiters.lock().extend(moved);
+            next.restore_priority(held);
+        }
+        self.restore_priority(held);
+    }
+
+    /// Recomputes the effective priority from the base priority and the live lock waiters, and
+    /// passes a change on along the chain of mutex owners.
+    fn restore_priority(self: &Arc<Self>, _held: &InheritanceGuard) {
+        let mut thread = self.clone();
+        for _ in 0..MAX_INHERITANCE_DEPTH {
+            let inherited = {
+                let mut waiters = thread.lock_waiters.lock();
+                waiters.retain(|waiter| waiter.thread.is_waiting_on(waiter.token));
+                waiters.iter().map(|waiter| waiter.thread.priority()).min()
+            };
+            {
+                let mut s = thread.sched.lock();
+                let priority = inherited.map_or(s.base_priority, |p| p.min(s.base_priority));
+                if s.priority == priority {
+                    return;
+                }
+                thread.apply_priority(&mut s, priority);
+            }
+            let Some(owner) = thread.lock_owner.lock().thread.upgrade() else {
+                return;
+            };
+            thread = owner;
+        }
+    }
+
+    fn apply_priority(self: &Arc<Self>, s: &mut Sched, priority: u8) {
+        match s.state {
+            ThreadState::Runnable => {
+                self.scheduler.dequeue(self, s);
+                s.priority = priority;
+                self.scheduler.enqueue(self, s, false);
+            }
+            ThreadState::Running(core) => {
+                s.priority = priority;
+                self.scheduler.set_running_priority(core, priority);
+                self.scheduler.request_reschedule(core);
+            }
+            _ => s.priority = priority,
+        }
     }
 
     /// `(ideal core, affinity mask)`.
@@ -232,6 +402,8 @@ impl Thread {
             return false;
         }
         self.wake_locked(&mut s, wake);
+        drop(s);
+        self.leave_lock_wait(token);
         true
     }
 
@@ -246,6 +418,18 @@ impl Thread {
                 self.scheduler.enqueue(self, s, false);
             }
         }
+    }
+
+    /// Marks the exiting thread terminated, ending any wait it is still in.
+    pub(crate) fn mark_terminated(self: &Arc<Self>) {
+        let token = self.lock_owner.lock().token;
+        {
+            let mut s = self.sched.lock();
+            s.state = ThreadState::Terminated;
+            s.wait = 0;
+            self.wait_token.store(0, Ordering::Release);
+        }
+        self.leave_lock_wait(token);
     }
 
     /// Wakes the thread from the cancellable wait it is in, or makes its next one fail.
@@ -265,10 +449,15 @@ impl Thread {
         s.terminate_requested = true;
         s.pause_requested = false;
         match s.state {
-            ThreadState::Waiting => self.wake_locked(
-                &mut s,
-                WakeResult::error(crate::result::TERMINATION_REQUESTED),
-            ),
+            ThreadState::Waiting => {
+                let token = s.wait;
+                self.wake_locked(
+                    &mut s,
+                    WakeResult::error(crate::result::TERMINATION_REQUESTED),
+                );
+                drop(s);
+                self.leave_lock_wait(token);
+            }
             ThreadState::Suspended | ThreadState::Created => {
                 self.scheduler.enqueue(self, &mut s, true)
             }

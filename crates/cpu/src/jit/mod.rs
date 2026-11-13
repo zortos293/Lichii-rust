@@ -18,10 +18,10 @@ use std::sync::atomic::AtomicBool;
 
 use lichii_common::settings::CpuAccuracy;
 use lichii_common::{PAGE_MASK, VAddr};
-use lichii_memory::{AddressSpace, ExclusiveMonitor, ReservationSlot};
+use lichii_memory::{AddressSpace, ExclusiveMonitor, MemoryPermission, ReservationSlot};
 
 use self::cache::{Code, Entry, JitCache};
-use self::ir::{Block, Terminal};
+use self::ir::{Block, Cmp, Terminal};
 pub(crate) use self::passes::Passes;
 use self::translate::{Step, Translator};
 use self::x64::{EXIT_FAULT, SPILL_SLOTS, Target};
@@ -55,6 +55,13 @@ pub(super) struct JitState {
     /// The `jmp` the last block left through, for the dispatcher to link; 0 when none.
     link: usize,
     fault: Option<CpuFault>,
+    /// NZCV a block left unpacked: the [`Cmp::lazy_code`] of the flags, 0 when the context holds
+    /// them, and the operands they come from.
+    lazy_nzcv: u32,
+    lazy_a: u64,
+    lazy_b: u64,
+    /// `x64::materialize_stub` in the code cache.
+    materialize: usize,
 }
 
 // SAFETY: `memory`, `clock` and `interrupt` point into `Arc`s the owning `Jit` keeps, and all
@@ -62,6 +69,16 @@ pub(super) struct JitState {
 unsafe impl Send for JitState {}
 
 impl JitState {
+    /// Packs NZCV a block left lazy into `ctx`, so the context is exact outside translated code.
+    fn materialize_nzcv(&mut self, ctx: &mut ThreadContext) {
+        let code = std::mem::take(&mut self.lazy_nzcv);
+        if code != 0 {
+            let (kind, w) = Cmp::from_lazy_code(code);
+            let nzcv = passes::flags_of(kind, w, self.lazy_a, self.lazy_b) as u32;
+            ctx.pstate = ctx.pstate & 0x0fff_ffff | nzcv << 28;
+        }
+    }
+
     /// # Safety
     /// Only called by slow paths of translated code, while the owning `Jit` is running it.
     unsafe fn memory(&self) -> &AddressSpace {
@@ -74,11 +91,11 @@ extern "sysv64" fn read_slow(state: &mut JitState, addr: u64, pc: u64, size: u32
     // SAFETY: called from a slow path.
     let memory = unsafe { state.memory() };
     let value = match size {
-        0 => memory.read::<u8>(addr).map(u128::from),
-        1 => memory.read::<u16>(addr).map(u128::from),
-        2 => memory.read::<u32>(addr).map(u128::from),
-        3 => memory.read::<u64>(addr).map(u128::from),
-        _ => memory.read::<u128>(addr),
+        0 => memory.guest_read::<u8>(addr).map(u128::from),
+        1 => memory.guest_read::<u16>(addr).map(u128::from),
+        2 => memory.guest_read::<u32>(addr).map(u128::from),
+        3 => memory.guest_read::<u64>(addr).map(u128::from),
+        _ => memory.guest_read::<u128>(addr),
     };
     match value {
         Ok(value) => {
@@ -118,7 +135,7 @@ extern "sysv64" fn atomic_slow(state: &mut JitState, addr: u64, pc: u64, info: u
         return true;
     }
     // SAFETY: called from a slow path.
-    let Some((ptr, _)) = unsafe { state.memory() }.translate(addr) else {
+    let Ok(ptr) = unsafe { state.memory() }.access(addr, MemoryPermission::READ_WRITE) else {
         state.fault = Some(CpuFault::Data {
             pc,
             addr,
@@ -191,7 +208,7 @@ extern "sysv64" fn exclusive_slow(state: &mut JitState, addr: u64, pc: u64, info
 extern "sysv64" fn zero_slow(state: &mut JitState, addr: u64, pc: u64, _info: u32) -> bool {
     // SAFETY: called from a slow path.
     let memory = unsafe { state.memory() };
-    match memory.fill(addr, 64, 0) {
+    match memory.guest_fill(addr, 64, 0) {
         Ok(()) => false,
         Err(f) => {
             state.fault = Some(CpuFault::Data {
@@ -214,11 +231,11 @@ extern "sysv64" fn write_slow(state: &mut JitState, addr: u64, pc: u64, size: u3
     let memory = unsafe { state.memory() };
     let value = state.scratch;
     let result = match size {
-        0 => memory.write(addr, value as u8),
-        1 => memory.write(addr, value as u16),
-        2 => memory.write(addr, value as u32),
-        3 => memory.write(addr, value as u64),
-        _ => memory.write(addr, value),
+        0 => memory.guest_write(addr, value as u8),
+        1 => memory.guest_write(addr, value as u16),
+        2 => memory.guest_write(addr, value as u32),
+        3 => memory.guest_write(addr, value as u64),
+        _ => memory.guest_write(addr, value),
     };
     match result {
         Ok(()) => false,
@@ -287,6 +304,10 @@ impl Jit {
             table: cache.table(),
             link: 0,
             fault: None,
+            lazy_nzcv: 0,
+            lazy_a: 0,
+            lazy_b: 0,
+            materialize: cache.materialize(),
         });
         Some(Self {
             target: Target {
@@ -301,6 +322,8 @@ impl Jit {
                 tsc_scale: config.clock.host_tsc_scale().map(std::ptr::from_ref),
                 cmpxchg16b: std::arch::is_x86_feature_detected!("cmpxchg16b"),
                 fma: std::arch::is_x86_feature_detected!("fma"),
+                sse41: std::arch::is_x86_feature_detected!("sse4.1"),
+                sse42: std::arch::is_x86_feature_detected!("sse4.2"),
             },
             arena: fastmem.map_or(std::ptr::null_mut(), |f| f.base()),
             config,
@@ -322,6 +345,8 @@ impl Jit {
             },
             config: &self.config,
             cmpxchg16b: self.target.cmpxchg16b,
+            sse41: self.target.sse41,
+            sse42: self.target.sse42,
         };
         let mut pc = start;
         loop {
@@ -413,7 +438,9 @@ impl CpuCore for Jit {
             let enter = self.cache.trampoline();
             // SAFETY: `code` is a compiled block in this core's code memory; it only touches
             // `ctx`, the state, and the arena behind the bounds check.
-            if unsafe { enter(ctx, &mut *self.state, self.arena, code) } == EXIT_FAULT {
+            let exit = unsafe { enter(ctx, &mut *self.state, self.arena, code) };
+            self.state.materialize_nzcv(ctx);
+            if exit == EXIT_FAULT {
                 let fault = self
                     .state
                     .fault
