@@ -9,7 +9,7 @@ use crate::result;
 use crate::thread::{Resume, TLS_SIZE};
 
 /// Size of the IPC message at the start of a thread's TLS.
-const TLS_MESSAGE_SIZE: usize = 0x100;
+use crate::ipc::TLS_MESSAGE_SIZE;
 const _: () = assert!(TLS_MESSAGE_SIZE as u64 <= TLS_SIZE);
 
 /// `svcConnectToNamedPort(name x1)` -> `w1` session handle.

@@ -245,7 +245,9 @@ impl Scheduler {
         self.wait(tick)
     }
 
-    fn collect(&mut self) {
+    /// Recycles the command buffers and drops the retired objects of the work the GPU
+    /// finished; returns the last finished tick.
+    pub fn collect(&mut self) -> u64 {
         let completed = self.completed();
         while let Some(&(tick, cmd)) = self.in_flight.front() {
             if tick > completed {
@@ -270,6 +272,7 @@ impl Scheduler {
         {
             self.garbage.pop_front();
         }
+        completed
     }
 }
 

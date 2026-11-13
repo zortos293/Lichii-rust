@@ -16,7 +16,8 @@ use crate::reg_index;
 /// First method number that calls a macro instead of writing a register.
 pub const MACRO_REGISTERS_START: u32 = NUM_REGS as u32;
 
-/// NVN2 root tables (Ampere): selects one of eight 64-word tables and resets its write offset.
+/// NVN2 root tables (Ampere): selects one of eight 64-word tables (bits 0-2) and the byte offset
+/// the next load writes (bits 8-15).
 pub const ROOT_TABLE_SELECT: u32 = 0x504 / 4;
 /// NVN2 root tables: stores one word at the selected table's offset and advances it.
 pub const ROOT_TABLE_LOAD: u32 = 0x508 / 4;
@@ -110,8 +111,12 @@ pub mod dirty {
     pub const INDEX_BUFFER: u8 = VERTEX_BUFFER0 + 32;
     pub const SHADERS: u8 = INDEX_BUFFER + 1;
     pub const DEPTH_BIAS_GLOBAL: u8 = SHADERS + 1;
+    /// Constant buffer bindings of stage `n` changed (`CONST_BUFFER0 + n`, five stages).
+    pub const CONST_BUFFER0: u8 = DEPTH_BIAS_GLOBAL + 1;
+    /// A word of the NVN2 root tables changed.
+    pub const ROOT_TABLES: u8 = CONST_BUFFER0 + 5;
     /// First flag index free for the renderer.
-    pub const LAST_COMMON: u8 = DEPTH_BIAS_GLOBAL + 1;
+    pub const LAST_COMMON: u8 = ROOT_TABLES + 1;
 }
 
 /// 256 dirty flags and the two method-to-flag tables that set them.
@@ -394,6 +399,21 @@ impl RegisterState {
     #[inline]
     pub fn shadow(&self, method: u32) -> u32 {
         self.shadow.words()[method as usize]
+    }
+
+    /// Whether [`RegisterState::write`] of `argument` to `method` would change a register value
+    /// or run an action. Shadow RAM tracking alone does not count: the renderer never reads it.
+    #[inline]
+    pub fn would_change(&self, method: u32, argument: u32) -> bool {
+        if self.executable.contains(method) {
+            return true;
+        }
+        let m = method as usize;
+        let value = match self.shadow.shadow_ram_control {
+            ShadowRamControl::REPLAY => self.shadow.words()[m],
+            _ => argument,
+        };
+        self.regs.words()[m] != value
     }
 
     /// Writes `argument` to register `method` (below [`MACRO_REGISTERS_START`]) through shadow

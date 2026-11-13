@@ -107,6 +107,7 @@ pub struct Scheduler {
     cores: Box<[Core]>,
     idle: AtomicU64,
     shutdown: AtomicBool,
+    paused: AtomicBool,
 }
 
 impl Scheduler {
@@ -125,6 +126,7 @@ impl Scheduler {
                 .collect(),
             idle: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
         }
     }
 
@@ -147,7 +149,10 @@ impl Scheduler {
     pub(crate) fn set_interrupt(&self, core: usize, handle: InterruptHandle) {
         let c = &self.cores[core];
         let mut slot = c.interrupt.lock();
-        if c.resched.load(Ordering::Acquire) || self.shutdown.load(Ordering::Acquire) {
+        if c.resched.load(Ordering::Acquire)
+            || self.shutdown.load(Ordering::Acquire)
+            || self.paused.load(Ordering::Acquire)
+        {
             handle.signal();
         }
         *slot = Some(handle);
@@ -234,11 +239,14 @@ impl Scheduler {
             if self.shutdown.load(Ordering::Acquire) {
                 return None;
             }
-            if let Some(picked) = self.pick(core) {
+            let paused = self.paused.load(Ordering::Acquire);
+            if !paused && let Some(picked) = self.pick(core) {
                 return Some(picked);
             }
             self.idle.fetch_or(1 << core, Ordering::SeqCst);
-            if let Some(picked) = self.pick(core) {
+            if !self.paused.load(Ordering::Acquire)
+                && let Some(picked) = self.pick(core)
+            {
                 self.idle.fetch_and(!(1 << core), Ordering::SeqCst);
                 return Some(picked);
             }
@@ -340,6 +348,12 @@ impl Scheduler {
             self.clear_running(core);
             return Preempt::Pause;
         }
+        if self.paused.load(Ordering::Acquire) {
+            save();
+            self.enqueue(thread, &mut s, true);
+            self.clear_running(core);
+            return Preempt::Switch;
+        }
         let c = &self.cores[core];
         let rotate = c.rotate.swap(false, Ordering::AcqRel);
         let top = c.queue.lock().top();
@@ -371,6 +385,26 @@ impl Scheduler {
                 self.interrupt(core);
             }
         }
+    }
+
+    /// Takes every running thread off its core and keeps the cores idle until [`Scheduler::resume`].
+    /// Threads stay runnable; waits and timers go on.
+    pub(crate) fn pause(&self) {
+        self.paused.store(true, Ordering::Release);
+        for core in 0..self.cores.len() {
+            self.request_reschedule(core);
+        }
+    }
+
+    pub(crate) fn resume(&self) {
+        self.paused.store(false, Ordering::Release);
+        for core in 0..self.cores.len() {
+            self.unpark(core);
+        }
+    }
+
+    pub(crate) fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
     }
 
     pub(crate) fn shutdown(&self) {

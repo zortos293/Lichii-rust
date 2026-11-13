@@ -25,6 +25,8 @@ pub mod thread;
 mod timer;
 mod util;
 
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 #[cfg(test)]
 mod tests;
 
@@ -33,7 +35,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 use lichii_common::{ConsoleGeneration, HleResult, PAGE_SIZE, VAddr, align_up};
-use lichii_cpu::{CpuConfig, CpuCore, GuestClock};
+use lichii_cpu::{CpuConfig, CpuCore};
 use lichii_loader::program::ProgramImage;
 use lichii_memory::{
     AddressSpace, ExclusiveMonitor, MemoryPermission, PhysicalMemory, PhysicalMemoryError,
@@ -54,6 +56,7 @@ use crate::util::Rng;
 
 pub use crate::event::Event;
 pub use crate::memory::Pool;
+pub use lichii_cpu::GuestClock;
 
 /// A range of translated code to drop: `(process, address, size)`.
 pub(crate) type CodeRange = (ProcessId, VAddr, u64);
@@ -189,6 +192,12 @@ impl Kernel {
         self.0.scheduler.core_count()
     }
 
+    /// The guest system counter the cores read (`CNTPCT_EL0`, `CNTFRQ_EL0`); services take guest
+    /// ticks and time from it.
+    pub fn clock(&self) -> &Arc<dyn GuestClock> {
+        &self.0.clock
+    }
+
     pub fn physical_memory(&self) -> &Arc<PhysicalMemory> {
         &self.0.physical
     }
@@ -248,19 +257,7 @@ impl Kernel {
 
     /// Starts the core threads, the timer thread and the service threads.
     pub fn run(&self) -> Result<(), KernelError> {
-        {
-            let mut services = self.0.services.lock();
-            if !services.running {
-                services.running = true;
-                let joins = services
-                    .threads
-                    .iter()
-                    .map(ServiceThread::spawn)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(KernelError::Spawn)?;
-                services.joins = joins;
-            }
-        }
+        self.spawn_service_threads()?;
         let mut threads = self.0.host_threads.lock();
         let kernel = self.0.clone();
         threads.push(
@@ -277,6 +274,21 @@ impl Kernel {
                     .spawn(move || cpu_manager::run_core(kernel, core))
                     .map_err(KernelError::Spawn)?,
             );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn spawn_service_threads(&self) -> Result<(), KernelError> {
+        let mut services = self.0.services.lock();
+        if !services.running {
+            services.running = true;
+            let joins = services
+                .threads
+                .iter()
+                .map(ServiceThread::spawn)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(KernelError::Spawn)?;
+            services.joins = joins;
         }
         Ok(())
     }
@@ -306,6 +318,22 @@ impl Kernel {
                 process.finalize();
             }
         }
+    }
+
+    /// Stops running guest code: every core puts its thread back in its run queue and idles until
+    /// [`Kernel::resume`]. Service threads, waits and timers keep going.
+    pub fn pause(&self) {
+        self.0.scheduler.pause();
+    }
+
+    /// Lets the cores pick threads again after [`Kernel::pause`].
+    pub fn resume(&self) {
+        self.0.scheduler.resume();
+    }
+
+    /// Whether [`Kernel::pause`] is in effect.
+    pub fn is_paused(&self) -> bool {
+        self.0.scheduler.is_paused()
     }
 
     /// Asks every thread of `process` to terminate.

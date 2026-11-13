@@ -6,8 +6,7 @@ use std::sync::Arc;
 use lichii_common::HleResult;
 use lichii_common::perf::PerfStats;
 use lichii_common::settings::Settings;
-use lichii_gpu::host1x::Host1x;
-use lichii_gpu::nx2_memory::Nx2GpuMemory;
+use lichii_gpu::Gpu;
 use lichii_input::NpadHub;
 use lichii_kernel::Kernel;
 use lichii_kernel::ipc::{ServiceThread, SessionHandler};
@@ -26,10 +25,9 @@ pub struct ServiceParts {
     pub program: Arc<ProgramImage>,
     /// The title's process.
     pub process: Arc<Process>,
-    /// SMMU, device allocator and syncpoints shared with the GPU.
-    pub host1x: Host1x,
-    /// The Switch 2 GPU memory registry of the title's process; `None` for Switch 1 titles.
-    pub nx2_memory: Option<Arc<Nx2GpuMemory>>,
+    /// The GPU: channels, address spaces, host1x (SMMU, device allocator, syncpoints) and, for
+    /// Switch 2 titles, the GPU memory registry.
+    pub gpu: Arc<Gpu>,
     pub npad: Arc<NpadHub>,
     pub perf: Arc<PerfStats>,
 }
@@ -45,10 +43,9 @@ pub struct ServiceContext {
     pub program: Arc<ProgramImage>,
     /// The title's process.
     pub process: Arc<Process>,
-    /// SMMU, device allocator and syncpoints shared with the GPU.
-    pub host1x: Host1x,
-    /// The Switch 2 GPU memory registry of the title's process; `None` for Switch 1 titles.
-    pub nx2_memory: Option<Arc<Nx2GpuMemory>>,
+    /// The GPU: channels, address spaces, host1x (SMMU, device allocator, syncpoints) and, for
+    /// Switch 2 titles, the GPU memory registry.
+    pub gpu: Arc<Gpu>,
     /// Controller state from the frontend's input thread; hid reads it, and writes vibration.
     pub npad: Arc<NpadHub>,
     /// Counters the overlay shows; vi/gsv record guest frames here.
@@ -66,8 +63,7 @@ impl ServiceContext {
             settings: parts.settings,
             program: parts.program,
             process: parts.process,
-            host1x: parts.host1x,
-            nx2_memory: parts.nx2_memory,
+            gpu: parts.gpu,
             npad: parts.npad,
             perf: parts.perf,
             unknown: UnknownCommands::default(),
