@@ -504,6 +504,12 @@ alu_class!(scalar_dup, "01011110000xxxxx000001xxxxxxxxxx", |w| w
 alu_class!(faddp_vector, "0x101110x01xxxxx110101xxxxxxxxxx", |w| {
     w & 0x4040_0000 != 0x0040_0000
 });
+alu_class!(fp_step_vector, "0x001110xx1xxxxx111111xxxxxxxxxx", |w| {
+    w & 0x4040_0000 != 0x0040_0000
+});
+alu_class!(scvtf_vector, "0x0011100x100001110110xxxxxxxxxx", |w| {
+    w & 0x4040_0000 != 0x0040_0000
+});
 alu_class!(ext, "0x101110000xxxxx0xxxx0xxxxxxxxxx", |w| w & 0x4000_4000
     != 0x4000);
 alu_class!(
