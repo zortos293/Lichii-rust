@@ -12,6 +12,7 @@ mod cpu_manager;
 pub mod event;
 pub mod handle_table;
 pub mod ipc;
+mod live_pc;
 pub mod memory;
 pub mod memory_objects;
 pub mod object;
@@ -48,6 +49,7 @@ use parking_lot::Mutex;
 
 use crate::arbiter::Arbiter;
 use crate::ipc::{ClientSession, ServiceThread, SessionFactory};
+use crate::live_pc::LivePcs;
 use crate::memory::{MemoryManager, MemoryState, PoolLayout, Region, Regions};
 use crate::object::KObject;
 use crate::process::{NewProcess, Process, ProcessId, ProcessParams, ProcessState};
@@ -128,6 +130,9 @@ pub(crate) struct KernelInner {
     cpu_accuracy: CpuAccuracy,
     aslr: bool,
     svc_trace: bool,
+    /// Add the cores' live guest pcs to every watchdog thread log (`LICHII_LIVE_PC`).
+    live_pc_log: bool,
+    live_pcs: LivePcs,
     events: Arc<dyn KernelEvents>,
     rng: Mutex<Rng>,
     next_process_id: AtomicU64,
@@ -191,6 +196,8 @@ impl Kernel {
             cpu_accuracy: config.cpu_accuracy,
             aslr: config.aslr,
             svc_trace: config.svc_trace,
+            live_pc_log: std::env::var_os("LICHII_LIVE_PC").is_some(),
+            live_pcs: LivePcs::new(cores),
             events: config.events.unwrap_or_else(|| Arc::new(LogEvents)),
             rng: Mutex::new(Rng::new(config.rng_seed)),
             next_process_id: AtomicU64::new(0x51),
@@ -384,8 +391,12 @@ const WATCH_PERIOD: Duration = Duration::from_millis(250);
 /// How long a core may run a thread its best queued thread outranks before the watchdog logs
 /// every thread.
 const STALLED_AFTER: Duration = Duration::from_secs(2);
-/// How often the watchdog logs every thread under `debug.svc_trace`.
+/// How often the watchdog logs every thread under `debug.svc_trace` or `LICHII_LIVE_PC`.
 const TRACE_LOG_PERIOD: Duration = Duration::from_secs(5);
+/// How many consecutive block boundaries the watchdog samples on each core running guest code.
+const LIVE_PC_SAMPLES: usize = 16;
+/// How long the watchdog waits for a core to reach a block boundary.
+const LIVE_PC_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// How long [`Kernel::shutdown`] waits for a thread before naming it.
 const SLOW_JOIN: Duration = Duration::from_secs(2);
@@ -433,12 +444,63 @@ impl KernelInner {
                 );
             }
         }
+        if self.live_pc_log {
+            self.log_live_pcs();
+        }
+    }
+
+    /// Samples each core running guest code at [`LIVE_PC_SAMPLES`] consecutive block boundaries
+    /// and logs the guest pcs its thread was at, as module and offset, most frequent first.
+    fn log_live_pcs(&self) {
+        for core in 0..self.scheduler.core_count() {
+            if !self.scheduler.in_guest(core) {
+                continue;
+            }
+            let Some(first) = self.live_pcs.sample(&self.scheduler, core, LIVE_PC_TIMEOUT) else {
+                tracing::info!(
+                    target: "threads",
+                    core,
+                    "live pc: the core reached no block boundary in {LIVE_PC_TIMEOUT:?}"
+                );
+                continue;
+            };
+            let mut pcs = vec![(first.pc, 1)];
+            for _ in 1..LIVE_PC_SAMPLES {
+                let Some(sample) = self.live_pcs.sample(&self.scheduler, core, LIVE_PC_TIMEOUT)
+                else {
+                    break;
+                };
+                if !Arc::ptr_eq(&sample.thread, &first.thread) {
+                    continue;
+                }
+                match pcs.iter_mut().find(|(pc, _)| *pc == sample.pc) {
+                    Some((_, count)) => *count += 1,
+                    None => pcs.push((sample.pc, 1)),
+                }
+            }
+            pcs.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
+            let process = first.thread.process();
+            let pcs: Vec<String> = pcs
+                .iter()
+                .map(|(pc, count)| format!("{} x{count}", process.locate(*pc)))
+                .collect();
+            tracing::info!(
+                target: "threads",
+                core,
+                thread = first.thread.id(),
+                process = process.name(),
+                lr = process.locate(first.lr),
+                sp = format_args!("{:#x}", first.sp),
+                "live pc: {}",
+                pcs.join(", ")
+            );
+        }
     }
 
     /// The kernel watchdog: logs every thread once when a core has kept running a thread that its
     /// best queued thread outranks (or idled with a queued thread) for [`STALLED_AFTER`], and
-    /// every [`TRACE_LOG_PERIOD`] under `debug.svc_trace`. Each look is one uncontended
-    /// `try_lock` per core; the cores' own paths do no watchdog work.
+    /// every [`TRACE_LOG_PERIOD`] under `debug.svc_trace` or `LICHII_LIVE_PC`. Each look is
+    /// one uncontended `try_lock` per core; the cores' own paths do no watchdog work.
     fn watch(&self) {
         let mut stalled_since: Vec<Option<Instant>> = vec![None; self.scheduler.core_count()];
         let mut warned = false;
@@ -466,7 +528,9 @@ impl KernelInner {
                     self.log_thread_states();
                 }
             }
-            if self.svc_trace && now.duration_since(logged) >= TRACE_LOG_PERIOD {
+            if (self.svc_trace || self.live_pc_log)
+                && now.duration_since(logged) >= TRACE_LOG_PERIOD
+            {
                 logged = now;
                 self.log_thread_states();
             }

@@ -117,6 +117,7 @@ impl Core {
                     Flow::Continue
                 }
                 HaltReason::Interrupted | HaltReason::StepComplete => {
+                    self.kernel.live_pcs.record(self.index, thread, &self.ctx);
                     self.kernel.scheduler.take_reschedule(self.index);
                     Flow::Yield
                 }
