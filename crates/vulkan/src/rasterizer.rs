@@ -3,8 +3,10 @@
 //! This milestone implements presentation (guest framebuffers read from device memory, deswizzled
 //! and handed to the [`Presenter`](crate::present::Presenter), or taken from the texture cache
 //! when the GPU rendered them), the fence and query protocol, clears (masked ones included)
-//! through the [`TextureCache`], and its collector once per presented frame. Draws and compute
-//! dispatches are accepted and dropped until the buffer and pipeline caches land.
+//! through the [`TextureCache`], its collector once per presented frame, and draws and compute
+//! dispatches (see [`draw`]).
+
+mod draw;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -30,6 +32,7 @@ use crate::device::Device;
 use crate::error::Result;
 use crate::format::{Conversion, host_format};
 use crate::memory::{Image, ImageDesc};
+use crate::pipeline::PipelineCache;
 use crate::present::{FrameImage, FrameMailbox, GuestFrame};
 use crate::scheduler::Scheduler;
 use crate::staging::StagingRing;
@@ -75,9 +78,9 @@ pub struct VulkanRasterizer {
     tiled: Vec<u8>,
     fences: VecDeque<(u64, FenceAction)>,
     unflushed: bool,
-    warned_unimplemented: bool,
     texture_cache: TextureCache,
     buffer_cache: BufferCache,
+    draw: draw::DrawState,
     live: Option<Arc<LiveSettings>>,
 }
 
@@ -150,19 +153,22 @@ impl VulkanRasterizer {
         gob_layout: GobLayout,
     ) -> Result<Self> {
         let buffer_cache = BufferCache::new(device, handles.device.clone())?;
+        let mut scheduler = Scheduler::new(device)?;
+        let pipelines = PipelineCache::new(device, &GraphicsSettings::default(), None, None)?;
+        let draw = draw::DrawState::new(device, pipelines, gob_layout, scheduler.record()?)?;
         Ok(Self {
             buffer_cache,
+            draw,
             device: device.clone(),
             handles,
-            scheduler: Scheduler::new(device)?,
+            scheduler,
             staging: StagingRing::new(device, 32 << 20)?,
             mailbox,
             gob_layout,
             frames: Vec::new(),
             tiled: Vec::new(),
             fences: VecDeque::new(),
-            unflushed: false,
-            warned_unimplemented: false,
+            unflushed: true,
             texture_cache: TextureCache::new(device, gob_layout, AstcRecompression::Uncompressed),
             live: None,
         })
@@ -170,8 +176,16 @@ impl VulkanRasterizer {
 
     /// Applies the settings the renderer reads while running: the resolution scale render
     /// targets use from their next binding on, the ASTC fallback format of new textures, and
-    /// how much device memory the texture cache may fill.
+    /// how much device memory the texture cache may fill, sampler anisotropy and whether
+    /// pipelines compile asynchronously.
     pub fn apply_settings(&mut self, settings: &GraphicsSettings) {
+        self.draw.set_anisotropy(settings.anisotropic_filtering);
+        self.draw
+            .pipelines
+            .set_async_compilation(settings.async_shader_compilation);
+        self.draw
+            .shaders
+            .set_resolution_scale(settings.resolution_scale);
         self.texture_cache.set_vram_usage(settings.vram_usage);
         self.texture_cache
             .set_resolution_scale(settings.resolution_scale);
@@ -447,13 +461,6 @@ impl VulkanRasterizer {
         });
     }
 
-    fn unimplemented(&mut self, what: &str) {
-        if !self.warned_unimplemented {
-            self.warned_unimplemented = true;
-            tracing::warn!("{what} and other rendering are not implemented yet; dropping them");
-        }
-    }
-
     fn flush(&mut self) {
         if !self.unflushed {
             return;
@@ -608,12 +615,16 @@ impl VulkanRasterizer {
 }
 
 impl Rasterizer for VulkanRasterizer {
-    fn draw(&mut self, _ctx: &mut GraphicsContext<'_>, _draw: &DrawParams<'_>) {
-        self.unimplemented("draws");
+    fn draw(&mut self, ctx: &mut GraphicsContext<'_>, draw: &DrawParams<'_>) {
+        if let Err(error) = self.draw_graphics(ctx, draw::DrawCall::Direct(draw)) {
+            tracing::error!(%error, "recording a draw failed");
+        }
     }
 
-    fn draw_indirect(&mut self, _ctx: &mut GraphicsContext<'_>, _draw: &IndirectDraw) {
-        self.unimplemented("indirect draws");
+    fn draw_indirect(&mut self, ctx: &mut GraphicsContext<'_>, draw: &IndirectDraw) {
+        if let Err(error) = self.draw_graphics(ctx, draw::DrawCall::Indirect(draw)) {
+            tracing::error!(%error, "recording an indirect draw failed");
+        }
     }
 
     fn clear(&mut self, ctx: &mut GraphicsContext<'_>, layer_count: u32) {
@@ -622,8 +633,10 @@ impl Rasterizer for VulkanRasterizer {
         }
     }
 
-    fn dispatch_compute(&mut self, _ctx: &ComputeContext<'_>) {
-        self.unimplemented("compute dispatches");
+    fn dispatch_compute(&mut self, ctx: &ComputeContext<'_>) {
+        if let Err(error) = self.dispatch(ctx) {
+            tracing::error!(%error, "recording a compute dispatch failed");
+        }
     }
 
     fn query(&mut self, _channel: ChannelId, memory: &Gmmu, query: &Query) {
@@ -675,6 +688,7 @@ impl Rasterizer for VulkanRasterizer {
 
     fn invalidate_region(&mut self, addr: DAddr, size: u64) {
         self.buffer_cache.invalidate(addr, size);
+        self.draw.shaders.invalidate(addr, size);
         let mut tx = Transfer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
@@ -701,11 +715,35 @@ impl Rasterizer for VulkanRasterizer {
 
     fn unmap_region(&mut self, addr: DAddr, size: u64) {
         self.buffer_cache.invalidate(addr, size);
+        self.draw.shaders.invalidate(addr, size);
         self.texture_cache.unmap(&mut self.scheduler, addr, size);
     }
 
     fn invalidate_gpu_caches(&mut self) {
         self.texture_cache.invalidate_lookups();
+    }
+
+    fn barrier(&mut self) {
+        let cmd = match self.scheduler.record() {
+            Ok(cmd) => cmd,
+            Err(error) => {
+                tracing::error!(%error, "recording a guest barrier failed");
+                return;
+            }
+        };
+        let barrier = vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE);
+        // SAFETY: `cmd` is recording outside any rendering; draws begin and end theirs.
+        unsafe {
+            self.device.raw.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().memory_barriers(&[barrier]),
+            );
+        }
+        self.unflushed = true;
     }
 
     fn flush_commands(&mut self) {
@@ -760,6 +798,7 @@ impl Rasterizer for VulkanRasterizer {
 impl Drop for VulkanRasterizer {
     fn drop(&mut self) {
         let _ = self.scheduler.finish();
+        self.draw.destroy(&self.device);
     }
 }
 
@@ -787,16 +826,16 @@ mod tests {
     use crate::{Instance, SurfaceSupport};
 
     const DRAM: u64 = 16 << 20;
-    const DADDR: DAddr = 0x1_0000_0000;
+    pub(super) const DADDR: DAddr = 0x1_0000_0000;
 
-    struct Fixture {
-        rasterizer: VulkanRasterizer,
+    pub(super) struct Fixture {
+        pub(super) rasterizer: VulkanRasterizer,
         mailbox: Arc<FrameMailbox>,
-        memory: Arc<DeviceAddressSpace>,
+        pub(super) memory: Arc<DeviceAddressSpace>,
         syncpoints: Arc<Syncpoints>,
     }
 
-    fn fixture(gob_layout: GobLayout) -> Option<Fixture> {
+    pub(super) fn fixture(gob_layout: GobLayout) -> Option<Fixture> {
         let instance = match Instance::new(true, SurfaceSupport::None) {
             Ok(instance) => Arc::new(instance),
             Err(error) => {
@@ -891,7 +930,7 @@ mod tests {
             (frame, readback.mapped().unwrap().to_vec())
         }
 
-        fn assert_no_validation_errors(&self) {
+        pub(super) fn assert_no_validation_errors(&self) {
             assert_eq!(
                 self.rasterizer.device.instance().validation_errors(),
                 0,
@@ -900,9 +939,9 @@ mod tests {
         }
     }
 
-    const GPU_VA: u64 = 0x20_0000_0000;
+    pub(super) const GPU_VA: u64 = 0x20_0000_0000;
 
-    fn gmmu(f: &Fixture) -> Gmmu {
+    pub(super) fn gmmu(f: &Fixture) -> Gmmu {
         let gmmu = Gmmu::new(f.memory.clone(), BigPageSize::Size64K);
         gmmu.map(GPU_VA, DADDR, DRAM, 0, false).unwrap();
         gmmu
@@ -954,7 +993,7 @@ mod tests {
         regs.scissor_test[0].bits1 = ScissorTestBits1(y0 | y1 << 16);
     }
 
-    fn guest_linear(f: &Fixture, address: DAddr, tiling: &Tiling) -> Vec<u8> {
+    pub(super) fn guest_linear(f: &Fixture, address: DAddr, tiling: &Tiling) -> Vec<u8> {
         let mut tiled = vec![0; tiling.size_bytes()];
         f.memory.read_bytes(address, &mut tiled).unwrap();
         let mut linear = vec![0; tiling.linear_size_bytes()];

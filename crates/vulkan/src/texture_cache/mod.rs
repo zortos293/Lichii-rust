@@ -77,7 +77,7 @@ const VISITS_PER_EVICTION: u32 = 8;
 const MAX_FLUSH_BYTES: u64 = 16 << 20;
 
 /// Depth/stencil attachment access for clears through dynamic rendering.
-const DEPTH_ATTACHMENT: ImageAccess = ImageAccess {
+pub(crate) const DEPTH_ATTACHMENT: ImageAccess = ImageAccess {
     layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
     stage: vk::PipelineStageFlags2::from_raw(
         vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS.as_raw()

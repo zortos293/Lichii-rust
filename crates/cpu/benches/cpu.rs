@@ -104,6 +104,20 @@ const WORKLOADS: &[Workload] = &[
         far: &[],
         per_iteration: 6,
     },
+    Workload {
+        name: "exclusive pair loop",
+        code: &[
+            0xc87f1823, // 1: ldxp x3, x6, [x1]
+            0x91000463, // add x3, x3, #1
+            0xc8241823, // stxp w4, x3, x6, [x1]
+            0x35ffffa4, // cbnz w4, 1b
+            0xf10004a5, // subs x5, x5, #1
+            0x54ffff61, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 6,
+    },
 ];
 
 fn main() {

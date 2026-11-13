@@ -190,9 +190,9 @@ pub enum Op {
         value: Value,
         pc: u64,
     },
-    /// `LDXR` and the 32-bit `LDXP` of `1 << size` bytes (at most 8): the zero-extended value,
-    /// with a reservation for it in this core's `ExclusiveMonitor` slot. Aligned like
-    /// `AtomicRmw`.
+    /// `LDXR` and `LDXP` of `1 << size` bytes: the zero-extended value, with a reservation for it
+    /// in this core's `ExclusiveMonitor` slot. Aligned like `AtomicRmw`. A 16-byte load gives the low
+    /// half and leaves the high half for `High`.
     LoadExclusive {
         size: u8,
         addr: Value,
@@ -207,6 +207,25 @@ pub enum Op {
         value: Value,
         pc: u64,
     },
+    /// The 64-bit `STXP`: `StoreExclusive` of `high:low`.
+    StoreExclusive128 {
+        addr: Value,
+        low: Value,
+        high: Value,
+        pc: u64,
+    },
+    /// The 64-bit `CASP`: the low half of the old `high:low` value, leaving the high half for `High`.
+    /// Aligned like `AtomicRmw`.
+    Cas128 {
+        addr: Value,
+        expected_low: Value,
+        expected_high: Value,
+        new_low: Value,
+        new_high: Value,
+        pc: u64,
+    },
+    /// The high half of the last 16-byte `LoadExclusive` or `Cas128`, which must come right before it.
+    High,
     /// `CAS`: the zero-extended old value, aligned like `AtomicRmw`.
     Cas {
         size: u8,
@@ -259,6 +278,8 @@ impl Op {
                 | Op::Cas { .. }
                 | Op::LoadExclusive { .. }
                 | Op::StoreExclusive { .. }
+                | Op::StoreExclusive128 { .. }
+                | Op::Cas128 { .. }
                 | Op::ZeroBlock { .. }
         )
     }
@@ -271,7 +292,28 @@ impl Op {
     /// Calls `f` on every operand.
     pub fn for_each_arg(&mut self, mut f: impl FnMut(&mut Value)) {
         match self {
-            Op::Nop | Op::Const(_) | Op::Get(_) | Op::Ticks | Op::Fence => {}
+            Op::Nop | Op::Const(_) | Op::Get(_) | Op::Ticks | Op::Fence | Op::High => {}
+            Op::StoreExclusive128 {
+                addr, low, high, ..
+            } => {
+                f(addr);
+                f(low);
+                f(high);
+            }
+            Op::Cas128 {
+                addr,
+                expected_low,
+                expected_high,
+                new_low,
+                new_high,
+                ..
+            } => {
+                f(addr);
+                f(expected_low);
+                f(expected_high);
+                f(new_low);
+                f(new_high);
+            }
             Op::Set(_, a)
             | Op::LogicFlags(_, a)
             | Op::Not(_, a)
@@ -339,7 +381,7 @@ impl Op {
     }
 
     pub fn args(&self) -> impl Iterator<Item = Value> {
-        let mut args = [Value(0); 3];
+        let mut args = [Value(0); 5];
         let mut len = 0;
         let mut op = *self;
         op.for_each_arg(|v| {

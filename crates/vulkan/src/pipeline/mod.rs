@@ -2,23 +2,26 @@
 //! pipeline key extracted from the 3D registers, and a cache that builds pipelines on worker
 //! threads and keeps the driver's compiled pipelines on disk.
 //!
-//! Shader identities come from the shader translator: a [`ShaderProgram`] is one host stage's
-//! SPIR-V plus the [`ShaderResources`] it binds, under a hash that stays the same across runs
-//! for the same guest program, so the disk cache can name pipelines by their stages.
+//! Shader identities come from the shader translator: a [`ShaderModule`] is one host stage's
+//! SPIR-V plus the resources it binds, under a hash that stays the same across runs for the
+//! same guest program, so the disk cache can name pipelines by their stages.
 
 pub mod cache;
 mod disk;
+pub mod environment;
 pub mod fixed_state;
 pub mod key;
 pub mod maxwell_to_vk;
 pub mod sampler;
+pub mod shader_cache;
 
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
 use ash::vk;
+use lichii_shader::{DescriptorKind, ShaderModule, ShaderStage};
 
-pub use cache::{Pipeline, PipelineCache, PipelineLayout, PipelineStats};
+pub use cache::{LayoutBinding, Pipeline, PipelineCache, PipelineLayout, PipelineStats};
 pub use fixed_state::{FixedPipelineState, FixedStateTracker};
 pub use key::{AttachmentState, ComputePipelineKey, GraphicsPipelineKey};
 
@@ -35,62 +38,31 @@ pub const GRAPHICS_STAGES: [vk::ShaderStageFlags; 5] = [
 ];
 
 /// The programs of one graphics pipeline, one slot per [`GRAPHICS_STAGES`] entry.
-pub type GraphicsShaders = [Option<Arc<ShaderProgram>>; 5];
+pub type GraphicsShaders = [Option<Arc<ShaderModule>>; 5];
 
-/// What a descriptor binding holds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum DescriptorKind {
-    UniformBuffer,
-    StorageBuffer,
-    /// A texture sampled through its sampler (combined image sampler).
-    SampledImage,
-    StorageImage,
-    UniformTexelBuffer,
-    StorageTexelBuffer,
-}
-
-impl DescriptorKind {
-    pub fn descriptor_type(self) -> vk::DescriptorType {
-        match self {
-            Self::UniformBuffer => vk::DescriptorType::UNIFORM_BUFFER,
-            Self::StorageBuffer => vk::DescriptorType::STORAGE_BUFFER,
-            Self::SampledImage => vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-            Self::StorageImage => vk::DescriptorType::STORAGE_IMAGE,
-            Self::UniformTexelBuffer => vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
-            Self::StorageTexelBuffer => vk::DescriptorType::STORAGE_TEXEL_BUFFER,
-        }
+/// The Vulkan stage a translated module runs in; VertexA never reaches the host on its own.
+pub fn stage_flags(stage: ShaderStage) -> vk::ShaderStageFlags {
+    match stage {
+        ShaderStage::VertexA | ShaderStage::VertexB => vk::ShaderStageFlags::VERTEX,
+        ShaderStage::TessellationControl => vk::ShaderStageFlags::TESSELLATION_CONTROL,
+        ShaderStage::TessellationEval => vk::ShaderStageFlags::TESSELLATION_EVALUATION,
+        ShaderStage::Geometry => vk::ShaderStageFlags::GEOMETRY,
+        ShaderStage::Fragment => vk::ShaderStageFlags::FRAGMENT,
+        ShaderStage::Compute => vk::ShaderStageFlags::COMPUTE,
+        ShaderStage::Task => vk::ShaderStageFlags::TASK_EXT,
+        ShaderStage::Mesh => vk::ShaderStageFlags::MESH_EXT,
     }
 }
 
-/// One descriptor binding a shader declares.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ResourceBinding {
-    pub set: u32,
-    pub binding: u32,
-    pub kind: DescriptorKind,
-    /// Array length; 1 for a single descriptor.
-    pub count: u32,
-}
-
-/// The resources one shader stage binds. Stages of a pipeline that declare the same
-/// `(set, binding)` must agree on its kind and count; the pipeline layout merges their stage
-/// flags.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct ShaderResources {
-    pub bindings: Vec<ResourceBinding>,
-    /// Bytes of the push constant block at offset 0; 0 when the stage has none.
-    pub push_constant_size: u32,
-}
-
-/// One translated host shader stage.
-#[derive(Clone, Debug)]
-pub struct ShaderProgram {
-    /// Identity of the program, stable across runs; never 0 (0 marks an absent stage).
-    pub hash: u64,
-    /// A single stage bit.
-    pub stage: vk::ShaderStageFlags,
-    pub spirv: Vec<u32>,
-    pub resources: ShaderResources,
+pub fn descriptor_type(kind: DescriptorKind) -> vk::DescriptorType {
+    match kind {
+        DescriptorKind::UniformBuffer => vk::DescriptorType::UNIFORM_BUFFER,
+        DescriptorKind::StorageBuffer => vk::DescriptorType::STORAGE_BUFFER,
+        DescriptorKind::UniformTexelBuffer => vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+        DescriptorKind::StorageTexelBuffer => vk::DescriptorType::STORAGE_TEXEL_BUFFER,
+        DescriptorKind::CombinedImageSampler => vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        DescriptorKind::StorageImage => vk::DescriptorType::STORAGE_IMAGE,
+    }
 }
 
 /// What the device lets the pipeline leave to dynamic state, and the optional fixed-function

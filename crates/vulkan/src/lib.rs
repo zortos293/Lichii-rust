@@ -12,6 +12,7 @@ pub mod instance;
 pub mod memory;
 pub mod pipeline;
 pub mod present;
+mod profile;
 pub mod rasterizer;
 pub mod scheduler;
 pub mod shaders;
