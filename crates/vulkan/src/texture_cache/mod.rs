@@ -800,7 +800,20 @@ impl TextureCache {
         } else {
             host
         };
-        let mapping = components(view.swizzle, host.swizzle);
+        let depth_stencil = aspect_of(image.host.format)
+            .intersects(vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL);
+        let swizzle = if depth_stencil {
+            view.swizzle.map(|s| {
+                if s == SwizzleSource::G {
+                    SwizzleSource::R
+                } else {
+                    s
+                }
+            })
+        } else {
+            view.swizzle
+        };
+        let mapping = components(swizzle, host.swizzle);
         let aspect = match aspect_of(image.host.format) {
             a if a.contains(vk::ImageAspectFlags::DEPTH) => vk::ImageAspectFlags::DEPTH,
             a => a,
