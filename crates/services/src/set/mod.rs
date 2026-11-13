@@ -156,6 +156,10 @@ pub(crate) fn register(context: &Arc<ServiceContext>) -> HleResult<()> {
     let shared = Arc::new(Mutex::new(shared));
     let state = Arc::new(Mutex::new(state));
     let files = Arc::new(Mutex::new(files));
+    let nfc = state.clone();
+    let _ = context
+        .nfc_enabled
+        .set(Box::new(move || nfc.lock().nfc_enabled()));
 
     let set = shared.clone();
     context.register("set", "set", move |_| Settings {

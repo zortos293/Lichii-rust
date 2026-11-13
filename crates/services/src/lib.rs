@@ -55,8 +55,11 @@ mod gsv;
 mod hid;
 mod ldn;
 mod lm;
+mod mii;
 mod mm;
 mod ncm;
+mod nfc;
+mod nfp;
 mod ngc;
 mod nifm;
 mod nim;
@@ -69,6 +72,7 @@ mod pctl;
 mod pl_u;
 mod prepo;
 mod ptm;
+mod reference_services;
 mod ro;
 mod set;
 mod sockets;
@@ -121,6 +125,9 @@ pub fn register_all(context: &Arc<ServiceContext>) -> HleResult<()> {
     fatal::register(context)?;
     mm::register(context)?;
     ngc::register(context)?;
+    nfc::register(context)?;
+    nfp::register(context)?;
+    mii::register(context)?;
     ectx::register(context)?;
     olsc::register(context)?;
     notif::register(context)?;
@@ -129,5 +136,13 @@ pub fn register_all(context: &Arc<ServiceContext>) -> HleResult<()> {
     ro::register(context)?;
     let nvdrv = nvdrv::register(context)?;
     vi::register(context, nvdrv)?;
+    let missing = reference_services::missing(context);
+    if !missing.is_empty() {
+        tracing::warn!(
+            count = missing.len(),
+            services = ?missing,
+            "the title may open services the reference registers and Lichii does not"
+        );
+    }
     Ok(())
 }

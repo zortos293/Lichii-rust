@@ -511,6 +511,38 @@ fn get_service_waits_for_a_late_registration() {
 }
 
 #[test]
+fn a_client_stalled_on_an_unregistered_service_is_reported() {
+    let test = TestKernel::new(ConsoleGeneration::Switch2);
+    let heap = heap_base(&test);
+    let replies = Replies::default();
+    let mut s = connect_sm(Script::new(), heap + 0x3000);
+    s = call(
+        s,
+        &replies,
+        19,
+        Msg {
+            pid: true,
+            ..Msg::tipc(0, &[])
+        },
+        None,
+    );
+    s = call(s, &replies, 19, Msg::tipc(1, &name("test:u")), Some(20));
+    let main = test.program(s.exit());
+    test.start(test.image(), main);
+    test.kernel.run().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while test.kernel.service_manager().stalled().is_empty() {
+        assert!(std::time::Instant::now() < deadline, "no stall reported");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(test.kernel.service_manager().stalled(), ["test:u"]);
+    assert_eq!(test.kernel.service_manager().waiting_for(), ["test:u"]);
+    register_test_service(&test, Arc::new(Event::new()));
+    test.wait_for_exit(Duration::from_secs(10));
+    assert_eq!(replies.lock()[1].0, 0, "answered once registered");
+}
+
+#[test]
 fn user_buffers_clones_and_deferred_move_handles() {
     let test = TestKernel::new(ConsoleGeneration::Switch2);
     let heap = heap_base(&test);

@@ -94,6 +94,10 @@ pub struct UiState {
 }
 
 pub const TOAST_TIME: Duration = Duration::from_secs(3);
+/// How often the window redraws a running title that presents no frames, for its status bar.
+const RUNNING_REDRAW: Duration = Duration::from_millis(250);
+/// How often a minimized window still polls the game list, installs and the title's exit.
+const MINIMIZED_POLL: Duration = Duration::from_millis(100);
 
 pub struct App {
     pub settings: Settings,
@@ -881,9 +885,26 @@ Dump prod.keys and title.keys \
         }
     }
 
+    /// A minimized window draws nothing. The presenter would wait for a swapchain image the
+    /// compositor keeps until the window is restored, and every event would queue behind it,
+    /// a close request too. The game list, installs and the title's exit are still polled.
+    fn idle(&mut self, event_loop: &ActiveEventLoop) {
+        self.games.poll();
+        self.poll_install();
+        self.check_exit();
+        self.sync_guest_input();
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + MINIMIZED_POLL));
+    }
+
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
-        let (Some(window), Some(mut egui_state)) = (self.window.clone(), self.egui_state.take())
-        else {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        if minimized(&window) {
+            self.idle(event_loop);
+            return;
+        }
+        let Some(mut egui_state) = self.egui_state.take() else {
             return;
         };
         self.games.poll();
@@ -924,7 +945,12 @@ Dump prod.keys and title.keys \
             .viewport_output
             .get(&egui::ViewportId::ROOT)
             .map_or(Duration::MAX, |v| v.repaint_delay);
-        if running || delay.is_zero() {
+        let delay = if running {
+            delay.min(RUNNING_REDRAW)
+        } else {
+            delay
+        };
+        if delay.is_zero() {
             event_loop.set_control_flow(ControlFlow::Wait);
             window.request_redraw();
         } else if let Some(at) = Instant::now().checked_add(delay) {
@@ -956,7 +982,15 @@ Dump prod.keys and title.keys \
                 .create_window(attributes)
                 .map_err(|e| format!("creating the window: {e}"))?,
         );
-        let display = Display::new(window.clone(), &self.settings.graphics, self.perf.clone())?;
+        let proxy = self.proxy.clone();
+        let display = Display::new(
+            window.clone(),
+            &self.settings.graphics,
+            self.perf.clone(),
+            move || {
+                let _ = proxy.send_event(UserEvent::Wake);
+            },
+        )?;
         self.egui_state = Some(egui_winit::State::new(
             self.egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -972,12 +1006,20 @@ Dump prod.keys and title.keys \
     }
 }
 
+/// Minimized, or shrunk to nothing, so there is no surface to present to.
+fn minimized(window: &Window) -> bool {
+    let size = window.inner_size();
+    size.width == 0 || size.height == 0 || window.is_minimized() == Some(true)
+}
+
 impl ApplicationHandler<UserEvent> for App {
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
         if let StartCause::ResumeTimeReached { .. } = cause {
             event_loop.set_control_flow(ControlFlow::Wait);
-            if let Some(window) = &self.window {
-                window.request_redraw();
+            match self.window.clone() {
+                Some(window) if minimized(&window) => self.idle(event_loop),
+                Some(window) => window.request_redraw(),
+                None => {}
             }
         }
     }
