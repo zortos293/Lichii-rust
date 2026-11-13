@@ -38,7 +38,7 @@ use lichii_common::{DAddr, GpuVAddr, PAGE_SIZE};
 use lichii_gpu::backend::{FramebufferConfig, GpuWrittenPages};
 use lichii_gpu::gmmu::{Gmmu, RangeTarget};
 use lichii_gpu::lazy::LazyDeviceRanges;
-use lichii_memory::DeviceAddressSpace;
+use lichii_memory::{CachedPages, DeviceAddressSpace};
 use lichii_texture::PixelFormat;
 use lichii_texture::block_linear::{GobLayout, swizzle, unswizzle};
 use lichii_texture::tic::{SwizzleSource, TextureDescriptor};
@@ -259,6 +259,9 @@ struct CachedImage {
     views: Vec<(ViewKey, ImageView)>,
     /// Guest memory changed since the last upload.
     cpu_dirty: bool,
+    /// Write tracking over the segments the last upload read, so a guest CPU write to them
+    /// invalidates the image. Empty before the first upload and after an invalidation.
+    tracked: Vec<CachedPages>,
     /// The host image holds data guest memory does not.
     gpu_modified: bool,
     /// Order of the last GPU write, for aliasing.
@@ -271,6 +274,15 @@ struct CachedImage {
 impl CachedImage {
     fn base(&self) -> DAddr {
         self.segments[0].daddr
+    }
+
+    /// Tracks the image's pages for guest CPU writes, before the cache relies on their bytes.
+    fn track(&mut self, memory: &DeviceAddressSpace) {
+        self.tracked = self
+            .segments
+            .iter()
+            .map(|s| memory.cache_pages(s.daddr, s.size))
+            .collect();
     }
 
     /// Whether the guest format can be written back from the host image.
@@ -949,10 +961,31 @@ impl TextureCache {
             let image = self.image(id);
             image.cpu_dirty = true;
             image.gpu_modified = false;
+            image.tracked.clear();
         }
         ids.clear();
         self.ids = ids;
         result
+    }
+
+    /// Write tracking saw guest CPU writes in the pages of `[daddr, daddr + size)`: images
+    /// that hold only guest data re-upload on next use. GPU-modified images keep their texels,
+    /// which a write beside them on a shared page must not replace.
+    pub fn cpu_written(&mut self, daddr: DAddr, size: u64) {
+        self.collect_overlaps(&[Segment {
+            offset: 0,
+            daddr,
+            size,
+        }]);
+        let ids = std::mem::take(&mut self.ids);
+        for &id in &ids {
+            let image = self.image(id);
+            if !image.gpu_modified {
+                image.cpu_dirty = true;
+                image.tracked.clear();
+            }
+        }
+        self.ids = ids;
     }
 
     /// Writes GPU-modified images overlapping `[daddr, daddr + size)` back to guest memory.
@@ -1630,6 +1663,7 @@ impl TextureCache {
             segments,
             views: Vec::new(),
             cpu_dirty: true,
+            tracked: Vec::new(),
             gpu_modified: false,
             modified: 0,
             visit: 0,
@@ -1751,6 +1785,7 @@ impl TextureCache {
             .image
             .as_mut()
             .expect("a live image id");
+        image.track(tx.memory);
         let info = image.info;
         let host = image.host;
         let format = info.format;
@@ -1897,6 +1932,7 @@ impl TextureCache {
                 });
             } else {
                 image.gpu_modified = false;
+                image.track(tx.memory);
             }
         }
         let mut readback = self.readback.take();
@@ -2081,6 +2117,7 @@ impl TextureCache {
             .image
             .as_mut()
             .expect("a live image id");
+        image.track(memory);
         let info = image.info;
         let host = image.host;
         let format = info.format;

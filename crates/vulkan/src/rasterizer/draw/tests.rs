@@ -1,5 +1,7 @@
 //! Draws of hand-assembled Maxwell programs on synthetic 3D engine state.
 
+use std::sync::Arc;
+
 use ash::vk;
 use lichii_common::settings::{Anisotropy, GraphicsSettings, ResolutionScale};
 use lichii_gpu::backend::{
@@ -14,6 +16,7 @@ use lichii_gpu::engines::maxwell_3d::regs::{
 };
 use lichii_gpu::engines::maxwell_3d::{DirtyState, Regs};
 use lichii_gpu::gmmu::Gmmu;
+use lichii_memory::{AddressSpace, MemoryPermission};
 use lichii_shader::ampere::{
     Decoded, Form, GRAPHICS_HEADER_SIZE, Instruction, Opcode as AmpereOpcode, decode,
 };
@@ -189,15 +192,18 @@ fn const_buffers() -> GraphicsConstBuffers {
 }
 
 fn draw(f: &mut Fixture, gmmu: &Gmmu, regs: &Regs) {
+    draw_with(f, gmmu, regs, &const_buffers());
+}
+
+fn draw_with(f: &mut Fixture, gmmu: &Gmmu, regs: &Regs, const_buffers: &GraphicsConstBuffers) {
     let mut dirty = DirtyState::new();
-    let const_buffers = const_buffers();
     let root_tables = [[0; 64]; 8];
     let mut ctx = GraphicsContext {
         channel: ChannelId(0),
         memory: gmmu,
         regs,
         dirty: &mut dirty,
-        const_buffers: &const_buffers,
+        const_buffers,
         root_tables: &root_tables,
     };
     f.rasterizer.draw(
@@ -411,6 +417,174 @@ fn activity_counts_draws_submits_and_texture_uploads() {
         traffic.uploads, first.uploads,
         "the second draw reuses both cached images"
     );
+    f.assert_no_validation_errors();
+}
+
+/// A guest address space mapping `size` bytes of the fixture's DRAM at each (va, offset), whose
+/// writes the fixture's device tracks.
+fn cpu_space(f: &Fixture, maps: &[(u64, u64)], size: u64) -> Arc<AddressSpace> {
+    let space = Arc::new(AddressSpace::new(f.memory.physical().clone(), 39));
+    for &(va, offset) in maps {
+        space.map(va, offset, size, MemoryPermission::READ_WRITE);
+    }
+    f.memory.attach_process(space.clone());
+    space
+}
+
+/// Hands the guest CPU writes write tracking saw to the renderer, as the GPU back does.
+fn drain_cpu_writes(f: &mut Fixture) {
+    let memory = f.memory.clone();
+    memory.take_cpu_writes(|daddr, size| f.rasterizer.cpu_written(daddr, size));
+}
+
+/// A guest CPU write beside a render target on the page holding its last texels leaves the
+/// GPU's texels alone, and once they are written back a CPU write over them is tracked again.
+#[test]
+fn cpu_writes_beside_a_render_target_keep_its_texels() {
+    const CPU_VA: u64 = 0x1000_0000;
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let space = cpu_space(&f, &[(CPU_VA, 0)], 0x1_0000);
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    let regs = draw_regs();
+    draw(&mut f, &gmmu, &regs);
+    let end = Tiling::new(SIZE, SIZE, 1, 4, 1, 0, GobLayout::Tegra).size_bytes() as u64;
+    assert_ne!(end % 0x1000, 0, "the target ends inside a page");
+    space.write_bytes(CPU_VA + end, &[0x5a; 16]).unwrap();
+    assert!(f.memory.has_cpu_writes(), "the target's pages are tracked");
+    drain_cpu_writes(&mut f);
+    assert!(
+        target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]),
+        "the drawn texels"
+    );
+    space.write_bytes(CPU_VA, &[0x5a; 16]).unwrap();
+    assert!(
+        f.memory.has_cpu_writes(),
+        "the written-back target is tracked again"
+    );
+    drain_cpu_writes(&mut f);
+    let uploads = f.rasterizer.texture_cache.traffic().uploads;
+    draw(&mut f, &gmmu, &regs);
+    assert_eq!(
+        f.rasterizer.texture_cache.traffic().uploads,
+        uploads + 1,
+        "the target uploads the CPU's bytes"
+    );
+    f.assert_no_validation_errors();
+}
+
+/// A guest CPU write to a program's bytes comes back through write tracking and translates the
+/// program again, and so does a second write after it was hashed anew.
+#[test]
+fn cpu_writes_to_cached_programs_translate_them_again() {
+    const CPU_VA: u64 = 0x1000_0000;
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let space = cpu_space(&f, &[(CPU_VA, PROGRAMS)], 0x1_0000);
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    let regs = draw_regs();
+    draw(&mut f, &gmmu, &regs);
+    let original = target(&mut f);
+    let mut colours = Vec::new();
+    for order in [[4, 0], [0, 4]] {
+        space
+            .write_bytes(CPU_VA + u64::from(FRAGMENT), &fragment_program(order))
+            .unwrap();
+        assert!(
+            f.memory.has_cpu_writes(),
+            "{order:?}: the write was tracked"
+        );
+        drain_cpu_writes(&mut f);
+        draw(&mut f, &gmmu, &regs);
+        colours.push(target(&mut f));
+    }
+    assert!(
+        colours[0].iter().all(|&t| t == [128, 255, 0, 255]),
+        "the rewritten program's colour"
+    );
+    assert_eq!(colours[1], original, "the first program again");
+    assert_eq!(f.rasterizer.draw.shaders.stats().translated, 3);
+    f.assert_no_validation_errors();
+}
+
+/// The guest CPU rewrites a bound uniform buffer between draws: the next draw reads the new
+/// values, for a streamed buffer and for one over 4 KiB that binds the cached buffer through
+/// write tracking, the second rewrite too.
+#[test]
+fn draws_read_uniform_buffers_the_cpu_rewrote() {
+    const CPU_VA: u64 = 0x1000_0000;
+    for size in [0x200, 0x2000] {
+        let Some((mut f, gmmu)) = draw_fixture() else {
+            return;
+        };
+        let space = cpu_space(&f, &[(CPU_VA, FRAGMENT_CBUF)], 0x2000);
+        let mut const_buffers = const_buffers();
+        const_buffers[4][0].size = size;
+        write(
+            &f,
+            PROGRAMS + u64::from(FRAGMENT),
+            &fragment_program([0, 4]),
+        );
+        let regs = draw_regs();
+        draw_with(&mut f, &gmmu, &regs, &const_buffers);
+        assert!(
+            target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]),
+            "{size:#x}"
+        );
+        for (values, colour) in [
+            ([0.0, 1.0, 1.0, 1.0], [0, 255, 255, 255]),
+            ([1.0, 0.0, 1.0, 1.0], [255, 0, 255, 255]),
+        ] {
+            space.write_bytes(CPU_VA, &f32_bytes(&values)).unwrap();
+            drain_cpu_writes(&mut f);
+            draw_with(&mut f, &gmmu, &regs, &const_buffers);
+            assert!(
+                target(&mut f).iter().all(|&t| t == colour),
+                "{size:#x} {values:?}"
+            );
+        }
+        f.assert_no_validation_errors();
+    }
+}
+
+/// The guest CPU rewrites a texture after a draw sampled it, through two virtual aliases of its
+/// pages: each write reaches the renderer through write tracking, as the GPU back drains it, and
+/// the next draw samples the new texels.
+#[test]
+fn draws_sample_texels_the_cpu_wrote_after_the_upload() {
+    const CPU_VA: u64 = 0x1000_0000;
+    const ALIAS_VA: u64 = 0x2000_0000;
+    const TEXTURE_SIZE: u64 = 0x1_0000;
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let space = cpu_space(&f, &[(CPU_VA, TEXTURE), (ALIAS_VA, TEXTURE)], TEXTURE_SIZE);
+    write(&f, PROGRAMS + u64::from(FRAGMENT), &sampling_program());
+    uniform_texture(&f, 0, TEXTURE, [10, 200, 30, 255]);
+    let regs = sampling_regs();
+    draw(&mut f, &gmmu, &regs);
+    assert_eq!(target(&mut f)[0], [10, 200, 30, 255]);
+    let tiling = Tiling::new(SIZE, SIZE, 1, 4, 1, 0, GobLayout::Tegra);
+    for (va, texel) in [(CPU_VA, [90, 20, 140, 255]), (ALIAS_VA, [5, 6, 250, 255])] {
+        space
+            .write_bytes(va, &texel.repeat(tiling.size_bytes() / 4))
+            .unwrap();
+        assert!(f.memory.has_cpu_writes(), "{va:#x}: the write was tracked");
+        drain_cpu_writes(&mut f);
+        draw(&mut f, &gmmu, &regs);
+        assert_eq!(target(&mut f)[0], texel, "{va:#x}");
+    }
+    assert_eq!(f.rasterizer.texture_cache.traffic().uploads, 4);
     f.assert_no_validation_errors();
 }
 

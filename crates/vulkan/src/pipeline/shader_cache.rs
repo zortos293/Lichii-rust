@@ -24,6 +24,7 @@ use std::sync::Arc;
 use lichii_common::settings::ResolutionScale;
 use lichii_common::{DAddr, GpuVAddr};
 use lichii_gpu::gmmu::{Gmmu, RangeTarget};
+use lichii_memory::CachedPages;
 use lichii_shader::backend::Bindings;
 use lichii_shader::cache;
 use lichii_shader::profile::HostTranslateInfo;
@@ -49,7 +50,7 @@ pub struct ShaderCacheStats {
     pub disk_hits: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct ProgramBytes {
     len: u64,
     hash: u64,
@@ -57,6 +58,9 @@ struct ProgramBytes {
     stale: bool,
     /// The device ranges backing the bytes, which need not be contiguous.
     segments: Vec<(DAddr, u64)>,
+    /// Write tracking over `segments`, taken before the bytes were hashed and dropped once a
+    /// guest write makes them stale.
+    tracked: Vec<CachedPages>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -153,6 +157,7 @@ impl ShaderCache {
                 && let Some(program) = self.programs.get_mut(&key)
             {
                 program.stale = true;
+                program.tracked.clear();
             }
         }
     }
@@ -287,13 +292,17 @@ impl ShaderCache {
     /// Hashes the `len` program bytes at `start` (device address `key`) and registers every
     /// device range now backing them.
     fn track(&mut self, gmmu: &Gmmu, start: GpuVAddr, len: u64, key: DAddr) -> u64 {
-        let hash = self.hash_bytes(gmmu, start, len);
         let mut segments = Vec::new();
         gmmu.for_each_range(start, len, |range| {
             if let RangeTarget::Device(daddr) = range.target {
                 segments.push((daddr, range.size));
             }
         });
+        let tracked = segments
+            .iter()
+            .map(|&(daddr, size)| gmmu.device().cache_pages(daddr, size))
+            .collect();
+        let hash = self.hash_bytes(gmmu, start, len);
         for &(daddr, size) in &segments {
             self.longest = self.longest.max(size);
             self.segments.insert((daddr, key), size);
@@ -303,6 +312,7 @@ impl ShaderCache {
             hash,
             stale: false,
             segments,
+            tracked,
         };
         if let Some(old) = self.programs.insert(key, program) {
             let current = &self.programs[&key].segments;

@@ -124,7 +124,7 @@ impl Back {
         if self.device.has_cpu_writes() {
             let rasterizer = &mut self.rasterizer;
             self.device
-                .take_cpu_writes(|daddr, size| rasterizer.invalidate_region(daddr, size));
+                .take_cpu_writes(|daddr, size| rasterizer.cpu_written(daddr, size));
         }
     }
 
