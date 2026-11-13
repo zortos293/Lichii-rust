@@ -239,7 +239,8 @@ pub enum FenceAction {
 
 impl FenceAction {
     /// Performs the action. The renderer calls this from whichever thread notices completion;
-    /// 16-byte releases take their timestamp from [`GpuHandles::timestamp`].
+    /// 16-byte releases take their timestamp from [`GpuHandles::timestamp`]. A semaphore write
+    /// resumes the channels waiting for its value ([`Syncpoints::semaphore_waiters`](crate::host1x::Syncpoints::semaphore_waiters)).
     pub fn execute(self, handles: &GpuHandles) {
         match self {
             Self::WriteSemaphore {
@@ -256,7 +257,17 @@ impl FenceAction {
                 };
                 if let Err(fault) = result {
                     tracing::warn!(?fault, "semaphore release to unmapped device memory");
+                    return;
                 }
+                let bytes = match size {
+                    ReleaseSize::Four => 4,
+                    ReleaseSize::Eight => 8,
+                    ReleaseSize::Sixteen => 16,
+                };
+                handles
+                    .syncpoints
+                    .semaphore_waiters()
+                    .written(&handles.device, address, bytes);
             }
             Self::ReduceSemaphore {
                 address,
@@ -280,6 +291,10 @@ impl FenceAction {
                 ) {
                     old = current;
                 }
+                handles
+                    .syncpoints
+                    .semaphore_waiters()
+                    .written(&handles.device, address, 4);
             }
             Self::IncrementSyncpoint(id) => {
                 if handles.syncpoints.guest().increment(id).is_err() {
@@ -386,7 +401,8 @@ pub trait Rasterizer: Send {
         });
     }
 
-    /// Writes a query result or semaphore release.
+    /// Writes a query result or semaphore release. With `after_work` the write may land after
+    /// the call returns, but before the next `release_fences(true)` returns.
     fn query(&mut self, channel: ChannelId, memory: &Gmmu, query: &Query);
 
     /// Resets a counter [`QueryKind`] reads from.
@@ -396,7 +412,8 @@ pub trait Rasterizer: Send {
     /// fences are not tracked).
     fn signal_fence(&mut self, action: FenceAction);
 
-    /// Runs the actions of finished fences; `wait` blocks until all of them finished.
+    /// Runs the actions of finished fences; `wait` blocks until all of them finished and ran,
+    /// and deferred [`Query`] writes landed.
     fn release_fences(&mut self, wait: bool);
 
     /// The guest CPU wrote `[addr, addr + size)`; drop or re-upload cached copies.
@@ -424,6 +441,61 @@ pub trait Rasterizer: Send {
 
     /// Presents a guest frame (scaled, filtered and anti-aliased per settings).
     fn present(&mut self, framebuffer: &FramebufferConfig);
+}
+
+/// A renderer that draws nothing, for headless runs and tests that build a real GPU. Every fence
+/// runs at once, and queries write their release as soon as they are made: payloads write the
+/// payload and counters write 0.
+pub struct NullRasterizer {
+    handles: GpuHandles,
+}
+
+impl NullRasterizer {
+    /// A renderer whose fences and releases act on `handles`.
+    pub fn new(handles: GpuHandles) -> Self {
+        Self { handles }
+    }
+}
+
+impl Rasterizer for NullRasterizer {
+    fn draw(&mut self, _ctx: &mut GraphicsContext<'_>, _draw: &DrawParams<'_>) {}
+
+    fn draw_indirect(&mut self, _ctx: &mut GraphicsContext<'_>, _draw: &IndirectDraw) {}
+
+    fn clear(&mut self, _ctx: &mut GraphicsContext<'_>, _layer_count: u32) {}
+
+    fn dispatch_compute(&mut self, _ctx: &ComputeContext<'_>) {}
+
+    fn query(&mut self, _channel: ChannelId, memory: &Gmmu, query: &Query) {
+        let Some(address) = memory.translate(query.address) else {
+            tracing::warn!(address = query.address, "query to unmapped GPU memory");
+            return;
+        };
+        let value = match query.kind {
+            QueryKind::Payload => query.payload,
+            _ => 0,
+        };
+        FenceAction::WriteSemaphore {
+            address,
+            value,
+            size: query.size,
+        }
+        .execute(&self.handles);
+    }
+
+    fn signal_fence(&mut self, action: FenceAction) {
+        action.execute(&self.handles);
+    }
+
+    fn release_fences(&mut self, _wait: bool) {}
+
+    fn invalidate_region(&mut self, _addr: DAddr, _size: u64) {}
+
+    fn flush_region(&mut self, _addr: DAddr, _size: u64) {}
+
+    fn wait_for_idle(&mut self) {}
+
+    fn present(&mut self, _framebuffer: &FramebufferConfig) {}
 }
 
 /// The 32-bit semaphore at `address` as an atomic, so reductions running on different threads
@@ -522,5 +594,44 @@ mod tests {
             }
         });
         assert_eq!(h.device.read::<u32>(0x10_0004).unwrap(), 4000);
+    }
+
+    #[test]
+    fn null_rasterizer_writes_releases_and_runs_fences_at_once() {
+        let (_space, h) = handles();
+        let memory = Gmmu::new(h.device.clone(), crate::gmmu::BigPageSize::Size64K);
+        memory
+            .map(0x2000_0000, 0x10_0000, 0x1000, 0, false)
+            .unwrap();
+        let mut null = NullRasterizer::new(h.clone());
+        let query = |address, kind, size| Query {
+            address,
+            kind,
+            payload: 0x1234_5678_9abc,
+            size,
+            after_work: true,
+        };
+        null.query(
+            ChannelId(0),
+            &memory,
+            &query(0x2000_0000, QueryKind::Payload, ReleaseSize::Eight),
+        );
+        assert_eq!(h.device.read::<u64>(0x10_0000).unwrap(), 0x1234_5678_9abc);
+        null.query(
+            ChannelId(0),
+            &memory,
+            &query(0x2000_0010, QueryKind::SamplesPassed, ReleaseSize::Sixteen),
+        );
+        assert_eq!(
+            h.device.read::<[u64; 2]>(0x10_0010).unwrap(),
+            [0, 614_400_000]
+        );
+        null.query(
+            ChannelId(0),
+            &memory,
+            &query(0x3000_0000, QueryKind::Payload, ReleaseSize::Four),
+        );
+        null.signal_fence(FenceAction::IncrementSyncpoint(3));
+        assert_eq!(h.syncpoints.guest().value(3).unwrap(), 1);
     }
 }

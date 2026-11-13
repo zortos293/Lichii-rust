@@ -1045,10 +1045,10 @@ impl PlayerInput {
             (Home, "guide"),
             (Capture, "misc1"),
             (C, "touchpad"),
-            (GL, "leftpaddle1"),
-            (GR, "rightpaddle1"),
-            (LeftSL, "leftpaddle2"),
-            (RightSR, "rightpaddle2"),
+            (GL, "paddle2"),
+            (GR, "paddle1"),
+            (LeftSL, "paddle4"),
+            (RightSR, "paddle3"),
         ]
         .into_iter()
         .map(|(button, name)| (button, pad(name)))

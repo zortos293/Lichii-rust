@@ -37,21 +37,30 @@ impl Service for Upload {
 
 #[cfg(test)]
 mod tests {
-    use lichii_common::ConsoleGeneration;
 
-    use crate::testing::{Guest, Request, settings};
+    use lichii_common::settings::Settings;
+    use lichii_kernel::testing::Request;
+
+    use crate::testing::{ReplyExt, SWITCH1_TITLE, booted};
 
     #[test]
     fn uploads_are_accepted() {
-        let guest = Guest::new(ConsoleGeneration::Switch1, settings(), super::register);
-        let context = guest.connect("eupld:c");
+        let client = booted(SWITCH1_TITLE, Settings::default(), super::register);
+        let context = client.connect("eupld:c").unwrap();
         for command in 0..4 {
-            guest.call(context, &Request::new(command)).ok();
+            client.send(context, &Request::new(command)).unwrap().ok();
         }
-        assert_eq!(guest.call(context, &Request::new(4)).ok().get::<u8>(0), 0);
-        let request = guest.connect("eupld:r");
+        assert_eq!(
+            client
+                .send(context, &Request::new(4))
+                .unwrap()
+                .ok()
+                .get::<u8>(0),
+            0
+        );
+        let request = client.connect("eupld:r").unwrap();
         for command in [0, 1, 2, 4] {
-            guest.call(request, &Request::new(command)).ok();
+            client.send(request, &Request::new(command)).unwrap().ok();
         }
     }
 }

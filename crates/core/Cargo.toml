@@ -12,5 +12,7 @@ lichii-kernel.workspace = true
 lichii-services.workspace = true
 lichii-loader.workspace = true
 lichii-gpu.workspace = true
+lichii-input.workspace = true
+parking_lot.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

@@ -1,7 +1,9 @@
-use lichii_common::ConsoleGeneration;
-
 use super::{Message, parse};
-use crate::testing::{Guest, Request, settings};
+use lichii_common::ResultCode;
+use lichii_common::settings::Settings;
+use lichii_kernel::testing::{IpcClient, Request};
+
+use crate::testing::{ReplyExt, SWITCH2_TITLE, booted};
 
 fn chunk(key: u8, data: &[u8]) -> Vec<u8> {
     let mut out = vec![key, data.len() as u8];
@@ -52,32 +54,47 @@ fn log_packets_parse_into_fields() {
 
 #[test]
 fn split_messages_are_reassembled() {
-    let guest = Guest::new(ConsoleGeneration::Switch2, settings(), super::register);
-    let lm = guest.connect("lm");
-    let logger = guest
-        .call(lm, &Request::new(0).arg(0u64).pid())
+    let client = booted(SWITCH2_TITLE, Settings::default(), super::register);
+    let lm = client.connect("lm").unwrap();
+    let logger = client
+        .send(lm, &Request::new(0).arg(0u64).send_pid())
+        .unwrap()
         .ok()
         .interface();
-    guest.call(logger, &Request::new(1).arg(3u32)).ok();
+    client
+        .send(logger, &Request::new(1).arg(3u32))
+        .unwrap()
+        .ok();
     let text = chunk(2, b"split message");
     for (flags, part) in [(1u8, &text[..5]), (0, &text[5..9]), (2, &text[9..])] {
         let bytes = packet(flags, part);
-        let buffer = guest.buffer_with(&bytes);
-        guest
-            .call(logger, &Request::new(0).a(buffer, bytes.len() as u64))
+        let buffer = client.alloc(&bytes);
+        client
+            .send(
+                logger,
+                &Request::new(0).buffer_a(buffer, bytes.len() as u64),
+            )
+            .unwrap()
             .ok();
     }
-    assert!(logger_is_idle(&guest, logger));
+    assert!(logger_is_idle(&client, logger));
     let orphan = packet(2, &chunk(2, b"x"));
-    let buffer = guest.buffer_with(&orphan);
-    guest
-        .call(logger, &Request::new(0).x(buffer, orphan.len() as u64))
+    let buffer = client.alloc(&orphan);
+    client
+        .send(
+            logger,
+            &Request::new(0).buffer_x(buffer, orphan.len() as u64),
+        )
+        .unwrap()
         .ok();
-    let short = guest.buffer_with(&[0; 4]);
-    guest.call(logger, &Request::new(0).a(short, 4)).ok();
+    let short = client.alloc(&[0; 4]);
+    client
+        .send(logger, &Request::new(0).buffer_a(short, 4))
+        .unwrap()
+        .ok();
 }
 
-fn logger_is_idle(guest: &Guest, logger: u32) -> bool {
-    guest.call(logger, &Request::new(2)).result == 0
-        && guest.call(logger, &Request::new(3)).result == 0
+fn logger_is_idle(client: &IpcClient, logger: u32) -> bool {
+    client.send(logger, &Request::new(2)).unwrap().result == ResultCode::SUCCESS
+        && client.send(logger, &Request::new(3)).unwrap().result == ResultCode::SUCCESS
 }

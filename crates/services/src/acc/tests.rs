@@ -1,15 +1,16 @@
-use lichii_common::ConsoleGeneration;
-
 use super::{
     APPLICATION_INFO_ALREADY_INITIALIZED, AVATAR, INVALID_ARRAY_LENGTH, INVALID_USER_ID, UNKNOWN,
     account_id, user_id,
 };
-use crate::testing::{Guest, Request, settings};
+use lichii_common::settings::Settings;
+use lichii_kernel::testing::{IpcClient, Request};
 
-fn guest(username: &str) -> Guest {
-    let mut settings = settings();
+use crate::testing::{ReplyExt, SWITCH2_TITLE, booted};
+
+fn boot(username: &str) -> IpcClient {
+    let mut settings = Settings::default();
     settings.system.username = username.into();
-    Guest::new(ConsoleGeneration::Switch2, settings, super::register)
+    booted(SWITCH2_TITLE, settings, super::register)
 }
 
 #[test]
@@ -21,25 +22,40 @@ fn user_ids_are_stable_per_name() {
 
 #[test]
 fn the_one_user_is_open_and_selected() {
-    let guest = guest("player");
-    let acc = guest.connect("acc:u0");
+    let client = boot("player");
+    let acc = client.connect("acc:u0").unwrap();
     let uid = user_id("player");
-    assert_eq!(guest.call(acc, &Request::new(0)).ok().get::<u32>(0), 1);
     assert_eq!(
-        guest.call(acc, &Request::new(1).arg(uid)).ok().get::<u8>(0),
+        client
+            .send(acc, &Request::new(0))
+            .unwrap()
+            .ok()
+            .get::<u32>(0),
         1
     );
     assert_eq!(
-        guest
-            .call(acc, &Request::new(1).arg([1u8; 16]))
+        client
+            .send(acc, &Request::new(1).arg(uid))
+            .unwrap()
+            .ok()
+            .get::<u8>(0),
+        1
+    );
+    assert_eq!(
+        client
+            .send(acc, &Request::new(1).arg([1u8; 16]))
+            .unwrap()
             .ok()
             .get::<u8>(0),
         0
     );
-    let list = guest.buffer(0x80);
+    let list = client.alloc(&[0; 0x80]);
     for command in [2, 3, 141] {
-        guest.call(acc, &Request::new(command).b(list, 0x80)).ok();
-        let users = guest.read(list, 0x80);
+        client
+            .send(acc, &Request::new(command).buffer_b(list, 0x80))
+            .unwrap()
+            .ok();
+        let users = client.read(list, 0x80);
         assert_eq!(
             (&users[..16], &users[16..]),
             (&uid[..], &[0; 0x70][..]),
@@ -48,177 +64,311 @@ fn the_one_user_is_open_and_selected() {
     }
     for command in [4, 51, 52] {
         assert_eq!(
-            guest
-                .call(acc, &Request::new(command))
+            client
+                .send(acc, &Request::new(command))
+                .unwrap()
                 .ok()
                 .get::<[u8; 16]>(0),
             uid
         );
     }
-    assert_eq!(guest.call(acc, &Request::new(50)).ok().get::<u8>(0), 1);
-    assert_eq!(guest.call(acc, &Request::new(150)).ok().get::<u8>(0), 0);
-}
-
-#[test]
-fn profiles_carry_the_username_and_avatar() {
-    let guest = guest("player");
-    let acc = guest.connect("acc:u0");
-    let uid = user_id("player");
-    let profile = guest.call(acc, &Request::new(5).arg(uid)).ok().interface();
-    let user_data = guest.buffer(0x80);
-    let base = guest
-        .call(profile, &Request::new(0).b(user_data, 0x80))
-        .ok();
-    assert_eq!(base.data.len(), 0x38);
-    assert_eq!(base.get::<[u8; 16]>(0), uid);
-    assert_eq!(&base.data[0x18..0x1F], b"player\0");
-    assert_eq!(guest.call(profile, &Request::new(1)).ok().data, base.data);
     assert_eq!(
-        guest.call(profile, &Request::new(10)).ok().get::<u32>(0),
-        AVATAR.len() as u32
-    );
-    let image = guest.buffer(0x2000);
-    let reply = guest.call(profile, &Request::new(11).b(image, 0x2000)).ok();
-    assert_eq!(reply.get::<u32>(0), AVATAR.len() as u32);
-    assert_eq!(guest.read(image, AVATAR.len()), AVATAR);
-    assert_eq!(&AVATAR[..2], [0xFF, 0xD8]);
-    for command in [20, 21, 30] {
-        guest.call(profile, &Request::new(command)).ok();
-    }
-
-    let stranger = guest
-        .call(acc, &Request::new(5).arg([7u8; 16]))
-        .ok()
-        .interface();
-    assert_eq!(guest.call(stranger, &Request::new(1)).result, UNKNOWN.0);
-}
-
-#[test]
-fn the_profile_editor_stores_profiles() {
-    let guest = guest("player");
-    let su = guest.connect("acc:su");
-    let uid = user_id("player");
-    let editor = guest.call(su, &Request::new(205).arg(uid)).ok().interface();
-    let mut base = [0u8; 0x38];
-    base[..16].copy_from_slice(&uid);
-    base[0x18..0x1D].copy_from_slice(b"Renan");
-    let data = guest.buffer_with(&[5; 0x80]);
-    guest
-        .call(editor, &Request::new(100).arg(base).a(data, 0x80))
-        .ok();
-    let short = guest.buffer_with(&[5; 0x10]);
-    let reply = guest.call(editor, &Request::new(100).arg(base).a(short, 0x10));
-    assert_eq!(reply.result, INVALID_ARRAY_LENGTH.0);
-
-    let acc = guest.connect("acc:u0");
-    let profile = guest.call(acc, &Request::new(5).arg(uid)).ok().interface();
-    let user_data = guest.buffer(0x80);
-    let reply = guest
-        .call(profile, &Request::new(0).b(user_data, 0x80))
-        .ok();
-    assert_eq!(reply.get::<[u8; 0x38]>(0), base);
-    assert_eq!(guest.read(user_data, 0x80), [5; 0x80]);
-    assert_ne!(guest.call(profile, &Request::new(100).arg(base)).result, 0);
-    assert_eq!(guest.call(su, &Request::new(401)).ok().get::<u32>(0), 0);
-    let admin = guest.call(su, &Request::new(250).arg(uid)).ok().interface();
-    assert_eq!(guest.call(admin, &Request::new(250)).ok().get::<u8>(0), 0);
-}
-
-#[test]
-fn application_info_initializes_once() {
-    let guest = guest("lichii");
-    let acc = guest.connect("acc:u0");
-    guest.call(acc, &Request::new(100).pid()).ok();
-    let reply = guest.call(acc, &Request::new(140).pid());
-    assert_eq!(reply.result, APPLICATION_INFO_ALREADY_INITIALIZED.0);
-    guest.call(acc, &Request::new(160).pid()).ok();
-}
-
-#[test]
-fn the_account_manager_reports_an_unlinked_account() {
-    let guest = guest("lichii");
-    let acc = guest.connect("acc:u0");
-    let uid = user_id("lichii");
-    let manager = guest.call(acc, &Request::new(101)).ok().interface();
-    guest.call(manager, &Request::new(0)).ok();
-    assert_eq!(
-        guest.call(manager, &Request::new(1)).ok().get::<u64>(0),
-        account_id(&uid)
-    );
-    let token = guest.buffer_with(&[0xAA; 0x100]);
-    let reply = guest.call(manager, &Request::new(4).b(token, 0x100)).ok();
-    assert_eq!(
-        (reply.get::<u32>(0), guest.read(token, 0x100)),
-        (0x100, vec![0; 0x100])
-    );
-    assert_eq!(guest.call(manager, &Request::new(3)).ok().get::<u32>(0), 0);
-    let cache = guest.buffer_with(&[0xAA; 0x68]);
-    let reply = guest.call(manager, &Request::new(130).b(cache, 0x68)).ok();
-    assert_eq!(
-        (reply.get::<u64>(0), guest.read(cache, 0x68)),
-        (account_id(&uid), vec![0; 0x68])
-    );
-
-    let async_context = guest.call(manager, &Request::new(2)).ok().interface();
-    assert_eq!(
-        guest
-            .call(async_context, &Request::new(0))
-            .ok()
-            .copies
-            .len(),
-        1
-    );
-    assert_eq!(
-        guest
-            .call(async_context, &Request::new(2))
+        client
+            .send(acc, &Request::new(50))
+            .unwrap()
             .ok()
             .get::<u8>(0),
         1
     );
-    guest.call(async_context, &Request::new(3)).ok();
-    for command in [150, 170] {
-        guest.call(manager, &Request::new(command)).ok().interface();
+    assert_eq!(
+        client
+            .send(acc, &Request::new(150))
+            .unwrap()
+            .ok()
+            .get::<u8>(0),
+        0
+    );
+}
+
+#[test]
+fn profiles_carry_the_username_and_avatar() {
+    let client = boot("player");
+    let acc = client.connect("acc:u0").unwrap();
+    let uid = user_id("player");
+    let profile = client
+        .send(acc, &Request::new(5).arg(uid))
+        .unwrap()
+        .ok()
+        .interface();
+    let user_data = client.alloc(&[0; 0x80]);
+    let base = client
+        .send(profile, &Request::new(0).buffer_b(user_data, 0x80))
+        .unwrap()
+        .ok();
+    assert_eq!(base.data().len(), 0x38);
+    assert_eq!(base.get::<[u8; 16]>(0), uid);
+    assert_eq!(&base.data()[0x18..0x1F], b"player\0");
+    assert_eq!(
+        client.send(profile, &Request::new(1)).unwrap().ok().data(),
+        base.data()
+    );
+    assert_eq!(
+        client
+            .send(profile, &Request::new(10))
+            .unwrap()
+            .ok()
+            .get::<u32>(0),
+        AVATAR.len() as u32
+    );
+    let image = client.alloc(&vec![0; 0x2000]);
+    let reply = client
+        .send(profile, &Request::new(11).buffer_b(image, 0x2000))
+        .unwrap()
+        .ok();
+    assert_eq!(reply.get::<u32>(0), AVATAR.len() as u32);
+    assert_eq!(client.read(image, AVATAR.len()), AVATAR);
+    assert_eq!(&AVATAR[..2], [0xFF, 0xD8]);
+    for command in [20, 21, 30] {
+        client.send(profile, &Request::new(command)).unwrap().ok();
     }
 
-    let list = guest.buffer(0x80);
-    guest.call(acc, &Request::new(131).b(list, 0x80)).ok();
-    assert_eq!(guest.read(list, 16), [0; 16]);
-    guest.call(manager, &Request::new(160)).ok();
-    guest.call(acc, &Request::new(131).b(list, 0x80)).ok();
-    assert_eq!(guest.read(list, 16), uid);
+    let stranger = client
+        .send(acc, &Request::new(5).arg([7u8; 16]))
+        .unwrap()
+        .ok()
+        .interface();
+    assert_eq!(
+        client.send(stranger, &Request::new(1)).unwrap().result,
+        UNKNOWN
+    );
+}
+
+#[test]
+fn the_profile_editor_stores_profiles() {
+    let client = boot("player");
+    let su = client.connect("acc:su").unwrap();
+    let uid = user_id("player");
+    let editor = client
+        .send(su, &Request::new(205).arg(uid))
+        .unwrap()
+        .ok()
+        .interface();
+    let mut base = [0u8; 0x38];
+    base[..16].copy_from_slice(&uid);
+    base[0x18..0x1D].copy_from_slice(b"Renan");
+    let data = client.alloc(&[5; 0x80]);
+    client
+        .send(editor, &Request::new(100).arg(base).buffer_a(data, 0x80))
+        .unwrap()
+        .ok();
+    let short = client.alloc(&[5; 0x10]);
+    let reply = client
+        .send(editor, &Request::new(100).arg(base).buffer_a(short, 0x10))
+        .unwrap();
+    assert_eq!(reply.result, INVALID_ARRAY_LENGTH);
+
+    let acc = client.connect("acc:u0").unwrap();
+    let profile = client
+        .send(acc, &Request::new(5).arg(uid))
+        .unwrap()
+        .ok()
+        .interface();
+    let user_data = client.alloc(&[0; 0x80]);
+    let reply = client
+        .send(profile, &Request::new(0).buffer_b(user_data, 0x80))
+        .unwrap()
+        .ok();
+    assert_eq!(reply.get::<[u8; 0x38]>(0), base);
+    assert_eq!(client.read(user_data, 0x80), [5; 0x80]);
+    let mut other = base;
+    other[0x18..0x1D].copy_from_slice(b"Other");
+    client
+        .send(profile, &Request::new(100).arg(other).buffer_a(data, 0x80))
+        .unwrap();
+    let reply = client.send(profile, &Request::new(1)).unwrap().ok();
+    assert_eq!(reply.get::<[u8; 0x38]>(0), base, "IProfile has no Store");
+    assert_eq!(
+        client
+            .send(su, &Request::new(401))
+            .unwrap()
+            .ok()
+            .get::<u32>(0),
+        0
+    );
+    let admin = client
+        .send(su, &Request::new(250).arg(uid))
+        .unwrap()
+        .ok()
+        .interface();
+    assert_eq!(
+        client
+            .send(admin, &Request::new(250))
+            .unwrap()
+            .ok()
+            .get::<u8>(0),
+        0
+    );
+}
+
+#[test]
+fn application_info_initializes_once() {
+    let client = boot("lichii");
+    let acc = client.connect("acc:u0").unwrap();
+    client
+        .send(acc, &Request::new(100).send_pid())
+        .unwrap()
+        .ok();
+    let reply = client.send(acc, &Request::new(140).send_pid()).unwrap();
+    assert_eq!(reply.result, APPLICATION_INFO_ALREADY_INITIALIZED);
+    client
+        .send(acc, &Request::new(160).send_pid())
+        .unwrap()
+        .ok();
+}
+
+#[test]
+fn the_account_manager_reports_an_unlinked_account() {
+    let client = boot("lichii");
+    let acc = client.connect("acc:u0").unwrap();
+    let uid = user_id("lichii");
+    let manager = client
+        .send(acc, &Request::new(101))
+        .unwrap()
+        .ok()
+        .interface();
+    client.send(manager, &Request::new(0)).unwrap().ok();
+    assert_eq!(
+        client
+            .send(manager, &Request::new(1))
+            .unwrap()
+            .ok()
+            .get::<u64>(0),
+        account_id(&uid)
+    );
+    let token = client.alloc(&[0xAA; 0x100]);
+    let reply = client
+        .send(manager, &Request::new(4).buffer_b(token, 0x100))
+        .unwrap()
+        .ok();
+    assert_eq!(
+        (reply.get::<u32>(0), client.read(token, 0x100)),
+        (0x100, vec![0; 0x100])
+    );
+    assert_eq!(
+        client
+            .send(manager, &Request::new(3))
+            .unwrap()
+            .ok()
+            .get::<u32>(0),
+        0
+    );
+    let cache = client.alloc(&[0xAA; 0x68]);
+    let reply = client
+        .send(manager, &Request::new(130).buffer_b(cache, 0x68))
+        .unwrap()
+        .ok();
+    assert_eq!(
+        (reply.get::<u64>(0), client.read(cache, 0x68)),
+        (account_id(&uid), vec![0; 0x68])
+    );
+
+    let async_context = client
+        .send(manager, &Request::new(2))
+        .unwrap()
+        .ok()
+        .interface();
+    assert_eq!(
+        client
+            .send(async_context, &Request::new(0))
+            .unwrap()
+            .ok()
+            .copy_handles
+            .len(),
+        1
+    );
+    assert_eq!(
+        client
+            .send(async_context, &Request::new(2))
+            .unwrap()
+            .ok()
+            .get::<u8>(0),
+        1
+    );
+    client.send(async_context, &Request::new(3)).unwrap().ok();
+    for command in [150, 170] {
+        client
+            .send(manager, &Request::new(command))
+            .unwrap()
+            .ok()
+            .interface();
+    }
+
+    let list = client.alloc(&[0; 0x80]);
+    client
+        .send(acc, &Request::new(131).buffer_b(list, 0x80))
+        .unwrap()
+        .ok();
+    assert_eq!(client.read(list, 16), [0; 16]);
+    client.send(manager, &Request::new(160)).unwrap().ok();
+    client
+        .send(acc, &Request::new(131).buffer_b(list, 0x80))
+        .unwrap()
+        .ok();
+    assert_eq!(client.read(list, 16), uid);
 }
 
 #[test]
 fn system_services_get_their_own_manager() {
-    let guest = guest("lichii");
-    let acc = guest.connect("acc:u1");
+    let client = boot("lichii");
+    let acc = client.connect("acc:u1").unwrap();
     let uid = user_id("lichii");
-    let manager = guest
-        .call(acc, &Request::new(102).arg(uid))
+    let manager = client
+        .send(acc, &Request::new(102).arg(uid))
+        .unwrap()
         .ok()
         .interface();
     assert_eq!(
-        guest.call(manager, &Request::new(1)).ok().get::<u64>(0),
+        client
+            .send(manager, &Request::new(1))
+            .unwrap()
+            .ok()
+            .get::<u64>(0),
         account_id(&uid)
     );
-    let license = guest.call(manager, &Request::new(143)).ok();
-    assert_eq!(license.data, [0; 16]);
-    let list = guest.buffer(0x80);
-    guest.call(acc, &Request::new(140).b(list, 0x80)).ok();
-    assert_eq!(guest.read(list, 16), uid);
+    let license = client.send(manager, &Request::new(143)).unwrap().ok();
+    assert_eq!(license.data(), [0; 16]);
+    let list = client.alloc(&[0; 0x80]);
+    client
+        .send(acc, &Request::new(140).buffer_b(list, 0x80))
+        .unwrap()
+        .ok();
+    assert_eq!(client.read(list, 16), uid);
 }
 
 #[test]
 fn thumbnails_need_a_user_and_the_full_size() {
-    let guest = guest("lichii");
-    let acc = guest.connect("acc:u0");
+    let client = boot("lichii");
+    let acc = client.connect("acc:u0").unwrap();
     let uid = user_id("lichii");
-    let thumbnail = guest.buffer(0x24000);
-    guest
-        .call(acc, &Request::new(110).arg(uid).a(thumbnail, 0x24000))
+    let thumbnail = client.alloc(&vec![0; 0x24000]);
+    client
+        .send(
+            acc,
+            &Request::new(110).arg(uid).buffer_a(thumbnail, 0x24000),
+        )
+        .unwrap()
         .ok();
-    let reply = guest.call(acc, &Request::new(110).arg([0u8; 16]).a(thumbnail, 0x24000));
-    assert_eq!(reply.result, INVALID_USER_ID.0);
-    let reply = guest.call(acc, &Request::new(110).arg(uid).a(thumbnail, 0x100));
-    assert_eq!(reply.result, INVALID_ARRAY_LENGTH.0);
+    let reply = client
+        .send(
+            acc,
+            &Request::new(110)
+                .arg([0u8; 16])
+                .buffer_a(thumbnail, 0x24000),
+        )
+        .unwrap();
+    assert_eq!(reply.result, INVALID_USER_ID);
+    let reply = client
+        .send(acc, &Request::new(110).arg(uid).buffer_a(thumbnail, 0x100))
+        .unwrap();
+    assert_eq!(reply.result, INVALID_ARRAY_LENGTH);
 }

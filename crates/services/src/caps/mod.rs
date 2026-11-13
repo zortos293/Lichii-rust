@@ -88,64 +88,120 @@ impl Service for Album {
 
 #[cfg(test)]
 mod tests {
-    use lichii_common::ConsoleGeneration;
 
     use super::{FILE_NOT_FOUND, INVALID_STORAGE};
-    use crate::testing::{Guest, Request, settings};
+
+    use lichii_common::settings::Settings;
+    use lichii_kernel::testing::Request;
+
+    use crate::testing::{ReplyExt, SWITCH1_TITLE, SWITCH2_TITLE, booted};
 
     #[test]
     fn the_album_is_mounted_and_empty() {
-        let guest = Guest::new(ConsoleGeneration::Switch1, settings(), super::register);
-        let a = guest.connect("caps:a");
-        let list = guest.buffer(0x100);
-        let count = |request: Request| guest.call(a, &request.b(list, 0x100)).ok().get::<u64>(0);
+        let client = booted(SWITCH1_TITLE, Settings::default(), super::register);
+        let a = client.connect("caps:a").unwrap();
+        let list = client.alloc(&vec![0; 0x100]);
+        let count = |request: Request| {
+            client
+                .send(a, &request.buffer_b(list, 0x100))
+                .unwrap()
+                .ok()
+                .get::<u64>(0)
+        };
         assert_eq!(count(Request::new(1).arg(1u8)), 0);
         assert_eq!(count(Request::new(101).arg(1u8).arg(0u8)), 0);
         assert_eq!(
-            guest.call(a, &Request::new(5).arg(1u8)).ok().get::<u8>(0),
+            client
+                .send(a, &Request::new(5).arg(1u8))
+                .unwrap()
+                .ok()
+                .get::<u8>(0),
             1
         );
-        let nand_and_sd = guest.call(a, &Request::new(5).arg(0u8)).ok();
+        let nand_and_sd = client.send(a, &Request::new(5).arg(0u8)).unwrap().ok();
         assert_eq!(nand_and_sd.get::<u8>(0), 1);
         assert_eq!(
-            guest.call(a, &Request::new(5).arg(2u8)).result,
-            INVALID_STORAGE.0
+            client.send(a, &Request::new(5).arg(2u8)).unwrap().result,
+            INVALID_STORAGE
         );
-        assert_eq!(guest.call(a, &Request::new(18)).ok().get::<u32>(0), 0);
-        assert_eq!(guest.call(a, &Request::new(401)).ok().get::<u8>(0), 0);
-        assert_eq!(guest.call(a, &Request::new(50011)).ok().get::<u32>(0), 0);
-        assert_eq!(guest.call(a, &Request::new(3)).result, FILE_NOT_FOUND.0);
-        let u = guest.connect("caps:u");
-        guest.call(u, &Request::new(32).arg(1u64).pid()).ok();
         assert_eq!(
-            guest
-                .call(u, &Request::new(142).b(list, 0x100))
+            client
+                .send(a, &Request::new(18))
+                .unwrap()
+                .ok()
+                .get::<u32>(0),
+            0
+        );
+        assert_eq!(
+            client
+                .send(a, &Request::new(401))
+                .unwrap()
+                .ok()
+                .get::<u8>(0),
+            0
+        );
+        assert_eq!(
+            client
+                .send(a, &Request::new(50011))
+                .unwrap()
+                .ok()
+                .get::<u32>(0),
+            0
+        );
+        assert_eq!(
+            client.send(a, &Request::new(3)).unwrap().result,
+            FILE_NOT_FOUND
+        );
+        let u = client.connect("caps:u").unwrap();
+        client
+            .send(u, &Request::new(32).arg(1u64).send_pid())
+            .unwrap()
+            .ok();
+        assert_eq!(
+            client
+                .send(u, &Request::new(142).buffer_b(list, 0x100))
+                .unwrap()
                 .ok()
                 .get::<u64>(0),
             0
         );
-        assert_eq!(guest.call(u, &Request::new(104)).ok().data, [0; 128]);
-        guest.call(guest.connect("caps:c"), &Request::new(33)).ok();
-        guest.connect("caps:sc");
+        assert_eq!(
+            client.send(u, &Request::new(104)).unwrap().ok().data(),
+            [0; 128]
+        );
+        client
+            .send(client.connect("caps:c").unwrap(), &Request::new(33))
+            .unwrap()
+            .ok();
+        client.connect("caps:sc").unwrap();
     }
 
     #[test]
     fn screenshots_are_accepted() {
-        let guest = Guest::new(ConsoleGeneration::Switch2, settings(), super::register);
-        let image = guest.buffer(0x1000);
+        let client = booted(SWITCH2_TITLE, Settings::default(), super::register);
+        let image = client.alloc(&vec![0; 0x1000]);
         for (service, command) in [
             ("caps:su", 203),
             ("caps:su", 205),
             ("caps:ss", 203),
             ("caps:ss", 206),
         ] {
-            let handle = guest.connect(service);
-            let entry = guest
-                .call(handle, &Request::new(command).a(image, 0x1000))
+            let handle = client.connect(service).unwrap();
+            let entry = client
+                .send(handle, &Request::new(command).buffer_a(image, 0x1000))
+                .unwrap()
                 .ok();
-            assert_eq!(entry.data, [0; 0x20]);
+            assert_eq!(entry.data(), [0; 0x20]);
         }
-        let su = guest.connect("caps:su");
-        assert_eq!(guest.call(su, &Request::new(201)).ok().data.len(), 128);
+        let su = client.connect("caps:su").unwrap();
+        assert_eq!(
+            client
+                .send(su, &Request::new(201))
+                .unwrap()
+                .ok()
+                .data()
+                .len(),
+            128
+        );
     }
 }

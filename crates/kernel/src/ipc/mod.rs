@@ -6,7 +6,7 @@
 //! [`SessionHandler`], writes the reply into the same buffer and wakes the thread. The kernel
 //! crew owns the context's layout; services only use its methods. See `crates/kernel/IPC.md`.
 
-mod message;
+pub(crate) mod message;
 mod server;
 
 use std::sync::Arc;
@@ -25,6 +25,9 @@ use crate::thread::Thread;
 
 /// A kernel handle in a process's handle table.
 pub type Handle = u32;
+
+/// Size of the IPC message area at the start of a thread's TLS.
+pub(crate) const TLS_MESSAGE_SIZE: usize = 0x100;
 
 /// Makes the handler of each new session to a service or named port.
 pub type SessionFactory = Arc<dyn Fn() -> Arc<dyn SessionHandler> + Send + Sync>;

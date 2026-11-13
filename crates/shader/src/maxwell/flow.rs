@@ -249,6 +249,7 @@ mod tests {
     }
 
     impl ShaderEnvironment for MockEnv {
+        test_gpu_state!();
         fn arch(&self) -> ShaderArch {
             ShaderArch::Maxwell
         }

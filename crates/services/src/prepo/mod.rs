@@ -101,44 +101,55 @@ impl Service for PlayReport {
 
 #[cfg(test)]
 mod tests {
-    use lichii_common::ConsoleGeneration;
 
-    use crate::testing::{Guest, Request, settings};
+    use lichii_common::settings::Settings;
+    use lichii_kernel::testing::Request;
+
+    use crate::testing::{ReplyExt, SWITCH1_TITLE, booted};
 
     #[test]
     fn reports_are_accepted() {
-        let guest = Guest::new(ConsoleGeneration::Switch1, settings(), super::register);
-        let prepo = guest.connect("prepo:u");
-        let event = guest.buffer_with(b"test_event\0");
-        let data = guest.buffer_with(&[0x80]);
+        let client = booted(SWITCH1_TITLE, Settings::default(), super::register);
+        let prepo = client.connect("prepo:u").unwrap();
+        let event = client.alloc(b"test_event\0");
+        let data = client.alloc(&[0x80]);
         for command in [10100, 10102, 10104, 10106] {
             let request = Request::new(command)
                 .arg(0u64)
-                .pid()
-                .a(event, 11)
-                .x(data, 1);
-            guest.call(prepo, &request).ok();
+                .send_pid()
+                .buffer_a(event, 11)
+                .buffer_x(data, 1);
+            client.send(prepo, &request).unwrap().ok();
         }
         let with_user = Request::new(10107)
             .arg([1u64, 2])
             .arg(0u64)
-            .pid()
-            .a(event, 11)
-            .x(data, 1);
-        guest.call(prepo, &with_user).ok();
-        guest
-            .call(
+            .send_pid()
+            .buffer_a(event, 11)
+            .buffer_x(data, 1);
+        client.send(prepo, &with_user).unwrap().ok();
+        client
+            .send(
                 prepo,
                 &Request::new(20103).arg(0u64).arg([1u64, 2]).arg(0x0100u64),
             )
+            .unwrap()
             .ok();
-        guest.call(prepo, &Request::new(10200)).ok();
+        client.send(prepo, &Request::new(10200)).unwrap().ok();
         assert_eq!(
-            guest.call(prepo, &Request::new(10300)).ok().get::<i32>(0),
+            client
+                .send(prepo, &Request::new(10300))
+                .unwrap()
+                .ok()
+                .get::<i32>(0),
             0
         );
         assert_eq!(
-            guest.call(prepo, &Request::new(10400)).ok().get::<u64>(0),
+            client
+                .send(prepo, &Request::new(10400))
+                .unwrap()
+                .ok()
+                .get::<u64>(0),
             0
         );
     }

@@ -48,17 +48,22 @@ impl Service for Session {
 
 #[cfg(test)]
 mod tests {
-    use lichii_common::ConsoleGeneration;
 
-    use crate::testing::{Guest, Request, settings};
+    use lichii_common::settings::Settings;
+    use lichii_kernel::testing::Request;
+
+    use crate::testing::{ReplyExt, SWITCH1_TITLE, booted};
 
     #[test]
     fn reports_are_accepted() {
-        let guest = Guest::new(ConsoleGeneration::Switch1, settings(), super::register);
-        let erpt = guest.connect("erpt:c");
+        let client = booted(SWITCH1_TITLE, Settings::default(), super::register);
+        let erpt = client.connect("erpt:c").unwrap();
         for command in [0, 1, 5, 11, 12] {
-            guest.call(erpt, &Request::new(command).arg(2u32)).ok();
+            client
+                .send(erpt, &Request::new(command).arg(2u32))
+                .unwrap()
+                .ok();
         }
-        guest.connect("erpt:r");
+        client.connect("erpt:r").unwrap();
     }
 }
