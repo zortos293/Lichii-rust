@@ -10,6 +10,7 @@ use lichii_core::{ExitReason, Host, System, SystemError};
 use lichii_crypto::KeyError;
 use lichii_loader::LoadOptions;
 
+use crate::applets::AppletDialogs;
 use crate::game_list::GameKind;
 
 #[derive(Debug)]
@@ -54,17 +55,22 @@ pub struct Session {
     pub title: String,
     /// The loaded program's id; 0 for homebrew and bare NSOs.
     pub program_id: u64,
+    /// Dropped before `system`, so an applet the title is waiting on answers and the title can stop.
+    applets: Option<AppletDialogs>,
     system: System,
 }
 
 impl Session {
     /// Loads the title at `path` with `options` (keys, installed updates and DLC) and starts it.
+    /// Library applets show in `applets`; without them they answer as
+    /// [`lichii_services::applets::HeadlessApplets`] does.
     /// `configure` picks the settings (a game's own configuration applies by its program id) and
     /// builds the renderer and shared state for its console generation, both known once the title
     /// is loaded.
     pub fn boot(
         path: &Path,
         options: LoadOptions,
+        applets: Option<AppletDialogs>,
         configure: impl FnOnce(u64, ConsoleGeneration) -> (Arc<Settings>, Host),
     ) -> Result<Self, BootError> {
         if !path.exists() {
@@ -76,11 +82,15 @@ impl Session {
         let program_id = image.program_id;
         let (settings, host) = configure(program_id, image.generation);
         let mut system = System::from_image(settings, image, host)?;
+        if let Some(applets) = &applets {
+            system.services().set_applet_frontend(applets.frontend());
+        }
         system.run()?;
         Ok(Self {
             path: path.to_path_buf(),
             title: title(path, kind),
             program_id,
+            applets,
             system,
         })
     }
@@ -110,6 +120,18 @@ impl Session {
     /// Applies volume and mute to the running title's audio.
     pub fn set_audio_volume(&self, audio: &AudioSettings) {
         self.system.set_audio_volume(audio);
+    }
+
+    /// Shows the library applet the title is waiting on, if any.
+    pub fn show_applets(&mut self, ctx: &egui::Context) {
+        if let Some(applets) = &mut self.applets {
+            applets.show(ctx);
+        }
+    }
+
+    /// Whether the title is waiting on a library applet dialog.
+    pub fn applet_open(&self) -> bool {
+        self.applets.as_ref().is_some_and(AppletDialogs::is_open)
     }
 
     /// Why the title stopped, once it has.
@@ -186,14 +208,14 @@ mod tests {
     fn rejects_missing_unknown_and_unloadable_titles() {
         let missing = Path::new("/definitely/not/here.nsp");
         assert!(matches!(
-            Session::boot(missing, LoadOptions::default(), |_, _| (settings(), Host::headless())),
+            Session::boot(missing, LoadOptions::default(), None, |_, _| (settings(), Host::headless())),
             Err(BootError::NotFound(path)) if path == missing
         ));
         let dir = temp_dir("reject");
         let text = dir.join("notes.txt");
         std::fs::write(&text, "x").unwrap();
         assert!(matches!(
-            Session::boot(&text, LoadOptions::default(), |_, _| (
+            Session::boot(&text, LoadOptions::default(), None, |_, _| (
                 settings(),
                 Host::headless()
             )),
@@ -202,7 +224,7 @@ mod tests {
         let broken = dir.join("Broken.nro");
         std::fs::write(&broken, "x").unwrap();
         assert!(matches!(
-            Session::boot(&broken, LoadOptions::default(), |_, _| (
+            Session::boot(&broken, LoadOptions::default(), None, |_, _| (
                 settings(),
                 Host::headless()
             )),
@@ -216,7 +238,7 @@ mod tests {
         let dir = temp_dir("keys");
         let nca = dir.join("Game.nca");
         std::fs::write(&nca, vec![0u8; 0x4000]).unwrap();
-        let error = Session::boot(&nca, LoadOptions::default(), |_, _| {
+        let error = Session::boot(&nca, LoadOptions::default(), None, |_, _| {
             (settings(), Host::headless())
         })
         .err()
@@ -247,7 +269,7 @@ mod tests {
         let host = Host::headless();
         let npad = host.npad.clone();
         let mut generation = None;
-        let mut session = Session::boot(&game, LoadOptions::default(), |_, title| {
+        let mut session = Session::boot(&game, LoadOptions::default(), None, |_, title| {
             generation = Some(title);
             (settings(), host)
         })
@@ -311,7 +333,7 @@ mod tests {
                 renderer,
                 ..Host::headless()
             };
-            let session = Session::boot(&game, LoadOptions::default(), |_, _| {
+            let session = Session::boot(&game, LoadOptions::default(), None, |_, _| {
                 (Arc::new(settings), host)
             })
             .unwrap();

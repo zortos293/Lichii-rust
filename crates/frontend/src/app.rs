@@ -21,6 +21,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::PhysicalKey;
 use winit::window::{Fullscreen, Window, WindowId};
 
+use crate::applets::AppletDialogs;
 use crate::choices::Choice;
 use crate::cli::Cli;
 use crate::config::game::GameConfigWindow;
@@ -451,7 +452,11 @@ impl App {
             installed: self.installed_content(),
             ..LoadOptions::default()
         };
-        match Session::boot(&path, options, configure) {
+        let proxy = self.proxy.clone();
+        let applets = AppletDialogs::new(move || {
+            let _ = proxy.send_event(UserEvent::Wake);
+        });
+        match Session::boot(&path, options, Some(applets), configure) {
             Ok(session) => {
                 self.session = Some(session);
                 self.without_custom = without_custom;
@@ -818,10 +823,15 @@ Dump prod.keys and title.keys \
         }
     }
 
-    /// Tells the input thread whether the guest should see input: only while a title runs and
-    /// the configuration window is closed (its keys bind controls, not play).
+    /// Tells the input thread whether the guest should see input: only while a title runs, no
+    /// applet dialog waits for the user and the configuration window is closed (its keys bind
+    /// controls, not play).
     fn sync_guest_input(&mut self) {
-        let on = self.config.is_none() && self.session.as_ref().is_some_and(|s| !s.is_paused());
+        let on = self.config.is_none()
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|s| !s.is_paused() && !s.applet_open());
         if on != self.guest_input {
             self.guest_input = on;
             self.input.send(InputMsg::GuestInput(on));

@@ -633,6 +633,7 @@ struct Tracker<'a> {
     handles: FxHashMap<HandleSource, u32>,
     types: FxHashMap<HandleSource, TextureType>,
     integers: FxHashMap<HandleSource, bool>,
+    multisamples: FxHashMap<HandleSource, bool>,
     phis: FxHashMap<(InstId, BlockId), Value>,
     tracked: FxHashMap<TrackKey, Option<CbufAddr>>,
     /// The handle program and table index word built for a search start.
@@ -654,6 +655,7 @@ impl<'a> Tracker<'a> {
             handles: FxHashMap::default(),
             types: FxHashMap::default(),
             integers: FxHashMap::default(),
+            multisamples: FxHashMap::default(),
             phis: FxHashMap::default(),
             tracked: FxHashMap::default(),
             built: FxHashMap::default(),
@@ -705,6 +707,20 @@ impl<'a> Tracker<'a> {
         let ty = self.env.texture_type(handle);
         self.types.insert(source, ty);
         ty
+    }
+
+    fn is_multisample(&mut self, cbuf: &CbufAddr) -> bool {
+        if !cbuf.is_word() {
+            return false;
+        }
+        let source = cbuf.handle;
+        if let Some(&multisample) = self.multisamples.get(&source) {
+            return multisample;
+        }
+        let handle = self.handle(source);
+        let multisample = self.env.is_texture_multisample(handle);
+        self.multisamples.insert(source, multisample);
+        multisample
     }
 
     fn is_integer(&mut self, cbuf: &CbufAddr) -> bool {
@@ -1135,7 +1151,9 @@ fn bind(
         && tracker.texture_type(&cbuf) == TextureType::Color2DRect;
     match op {
         Opcode::ImageQueryDimensions | Opcode::ImageQuerySamples => {
-            flags.ty = tracker.resolved_type(op, flags.ty, &cbuf)
+            flags.ty = tracker.resolved_type(op, flags.ty, &cbuf);
+            is_multisample = matches!(flags.ty, TextureType::Color2D | TextureType::ColorArray2D)
+                && tracker.is_multisample(&cbuf);
         }
         Opcode::ImageFetch => {
             if matches!(

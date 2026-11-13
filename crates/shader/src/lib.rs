@@ -102,6 +102,12 @@ pub trait ShaderEnvironment {
     fn texture_pixel_format(&self, raw_handle: u32) -> info::TexturePixelFormat;
     /// Whether that descriptor's pixel format is an integer format.
     fn is_texture_pixel_format_integer(&self, raw_handle: u32) -> bool;
+    /// Whether that descriptor holds a multisampled texture. Size and sample count queries,
+    /// which address no sample, take it from here; without it only a per-sample fetch marks a
+    /// texture multisampled.
+    fn is_texture_multisample(&self, _raw_handle: u32) -> bool {
+        false
+    }
     /// The viewport transform enable register (0 when the guest disabled it).
     fn viewport_transform_state(&self) -> u32;
     /// Constant buffer that holds bound texture handles.

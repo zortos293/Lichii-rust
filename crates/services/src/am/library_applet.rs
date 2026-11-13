@@ -372,7 +372,7 @@ impl Service for LibraryAppletAccessor {
 }
 
 /// The data of input object 0 when it is one of am's `IStorage`s.
-fn input_storage(ctx: &HleRequestContext) -> Option<Arc<StorageData>> {
+pub(super) fn input_storage(ctx: &HleRequestContext) -> Option<Arc<StorageData>> {
     let object = ctx.input_object(0)?;
     let storage = object.as_any()?.downcast_ref::<Storage>()?;
     Some(storage.data.clone())
