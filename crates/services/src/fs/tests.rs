@@ -97,7 +97,7 @@ impl Guest {
 
         let mut image = testing::program_image(program_id);
         configure(&mut image);
-        let (context, client) = crate::testing::context_for(image, settings);
+        let (context, client) = crate::testing::context_with(image, settings);
         let kernel = context.kernel.clone();
         super::register(&context).unwrap();
         let scratch = client.alloc(&vec![0; SCRATCH_SIZE]);
