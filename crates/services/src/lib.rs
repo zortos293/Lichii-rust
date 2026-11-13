@@ -41,6 +41,7 @@ mod bcat;
 mod context;
 mod dispatch;
 mod friend;
+mod fs;
 mod ncm;
 mod nifm;
 mod nim;
@@ -60,6 +61,7 @@ pub use dispatch::Service;
 /// Registers every HLE service with `sm:`. Call it after the application process exists and
 /// before `Kernel::run`.
 pub fn register_all(context: &Arc<ServiceContext>) -> HleResult<()> {
+    fs::register(context)?;
     am::register(context)?;
     aoc::register(context)?;
     arp::register(context)?;
