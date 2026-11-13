@@ -122,7 +122,8 @@ pub(crate) fn shader_profile(
         support_int64: features.shader_int64,
         support_viewport_index_layer: profile.support_viewport_index_layer_non_geometry,
         support_handle_programs: true,
-        support_handle_table_arrays: features.sampled_image_array_non_uniform_indexing,
+        support_handle_table_arrays: features.sampled_image_array_non_uniform_indexing
+            && on(v12.quad_divergent_implicit_lod),
         ..HostTranslateInfo::default()
     };
     (profile, host)
