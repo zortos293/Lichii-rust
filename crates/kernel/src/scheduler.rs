@@ -451,6 +451,31 @@ impl Scheduler {
         }
     }
 
+    /// Each core's running priority and queued threads, for the `debug.svc_trace` dump at
+    /// shutdown.
+    pub(crate) fn describe(&self) -> Vec<String> {
+        self.cores
+            .iter()
+            .enumerate()
+            .map(|(index, core)| {
+                let queue = core.queue.lock();
+                let queued: Vec<(usize, Vec<u64>)> = (0..LEVELS)
+                    .filter(|&priority| !queue.levels[priority].is_empty())
+                    .map(|priority| {
+                        let ids = queue.levels[priority].iter().map(|t| t.id()).collect();
+                        (priority, ids)
+                    })
+                    .collect();
+                format!(
+                    "core={index} running_priority={} resched={} idle={} queued={queued:?}",
+                    core.running_priority.load(Ordering::Acquire),
+                    core.resched.load(Ordering::Acquire),
+                    self.idle.load(Ordering::Acquire) & (1 << index) != 0,
+                )
+            })
+            .collect()
+    }
+
     /// Drops every queued thread (on shutdown, to break thread/scheduler reference cycles).
     pub(crate) fn clear(&self) {
         for c in self.cores.iter() {

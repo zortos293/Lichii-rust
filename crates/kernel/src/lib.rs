@@ -312,6 +312,9 @@ impl Kernel {
     /// Stops every core and kernel thread and releases all processes. A thread still running
     /// after [`SLOW_JOIN`] is named in a warning, so a shutdown that hangs says what it waits for.
     pub fn shutdown(&self) {
+        if self.0.svc_trace {
+            self.0.log_thread_states();
+        }
         self.0.scheduler.shutdown();
         self.0.timer.shutdown();
         let threads = std::mem::take(&mut *self.0.host_threads.lock());
@@ -389,6 +392,20 @@ fn join_noting_slow(thread: JoinHandle<()>) {
 }
 
 impl KernelInner {
+    /// Logs every core's queue and every thread's scheduling state, so a `debug.svc_trace` run of
+    /// a title that stalls ends with what each thread was left waiting on.
+    fn log_thread_states(&self) {
+        for line in self.scheduler.describe() {
+            tracing::info!(target: "svc", "{line}");
+        }
+        let processes = self.processes.lock().clone();
+        for process in processes {
+            for thread in process.threads() {
+                tracing::info!(target: "svc", process = process.name(), "{}", thread.describe());
+            }
+        }
+    }
+
     pub(crate) fn events(&self) -> &dyn KernelEvents {
         &*self.events
     }

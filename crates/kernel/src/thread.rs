@@ -338,6 +338,37 @@ impl Thread {
         }
     }
 
+    /// The thread's scheduling state on one line, for the `debug.svc_trace` dump at shutdown. The
+    /// saved `pc` is stale while the thread runs.
+    pub(crate) fn describe(&self) -> String {
+        let lock_owner = self
+            .lock_owner
+            .lock()
+            .thread
+            .upgrade()
+            .map(|owner| owner.id());
+        let lenders: Vec<ThreadId> = self
+            .lock_waiters
+            .lock()
+            .iter()
+            .map(|waiter| waiter.thread.id())
+            .collect();
+        let s = self.sched.lock();
+        let ctx = self.context.lock();
+        format!(
+            "thread={} state={:?} priority={} base={} core={} affinity={:#x} wait={} pc={:#x} lr={:#x} lock_owner={lock_owner:?} lenders={lenders:?}",
+            self.id,
+            s.state,
+            s.priority,
+            s.base_priority,
+            s.active_core,
+            s.affinity,
+            s.wait,
+            ctx.pc,
+            ctx.x[30],
+        )
+    }
+
     /// `(ideal core, affinity mask)`.
     pub fn core_mask(&self) -> (i32, u64) {
         let s = self.sched.lock();
