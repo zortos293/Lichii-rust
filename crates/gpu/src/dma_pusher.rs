@@ -17,7 +17,8 @@
 //! Switch 2, and a wait for the host GPU there kept every frame's commands behind the previous
 //! frame's rendering. On Switch 2 an entry on a page GPU work may have written is fetched after
 //! that work completed and its words reached guest memory: titles fetch command lists their own
-//! compute writes each frame.
+//! compute writes each frame. A Switch 2 SYNC entry is checked for such pages again once the back
+//! executed the work before it, which may be what marked them.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -43,7 +44,7 @@ use crate::macros::{
 use crate::pushbuffer::{CommandParser, Flow, GpEntry, MethodCall, MethodHandler};
 use crate::reg_index;
 use crate::semaphore_mirror::SemaphoreMirror;
-use crate::stream::Stream;
+use crate::stream::{FetchSync, Stream};
 
 /// Engines every channel has bound before any SET_OBJECT: NVN uses subchannel 2 as
 /// inline-to-memory without binding it (NX2_NOTES row 49).
@@ -393,13 +394,22 @@ impl FrontChannel {
             return;
         }
         if start == 0 && !self.fetch_synced {
-            let written = self.on_written_pages(entry, shared);
-            if written || entry.sync() {
-                let ticket = shared.stream.synchronize_fetch(
-                    entry.address(),
-                    u64::from(length) * 4,
-                    written,
-                );
+            let sync = if self.on_written_pages(entry, shared) {
+                Some(FetchSync::Host)
+            } else if entry.sync() {
+                Some(if shared.written_pages.is_some() {
+                    FetchSync::HostIfWritten
+                } else {
+                    FetchSync::Order
+                })
+            } else {
+                None
+            };
+            if let Some(sync) = sync {
+                let ticket =
+                    shared
+                        .stream
+                        .synchronize_fetch(entry.address(), u64::from(length) * 4, sync);
                 self.fetch_synced = true;
                 self.wait = Some(Wait::Fetch(ticket));
                 return;

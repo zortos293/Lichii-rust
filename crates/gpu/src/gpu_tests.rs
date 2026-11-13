@@ -1827,6 +1827,36 @@ fn a_sync_entry_is_fetched_after_the_back_ran_the_work_before_it_but_not_the_hos
 }
 
 #[test]
+fn a_switch_2_sync_entry_on_a_page_the_work_before_it_marks_waits_for_the_host_gpu() {
+    each_mode(|threading| {
+        let mut rig = Rig::build_for(
+            Console::Switch2,
+            threading,
+            crate::gpu::DEFAULT_RING_SLOTS,
+            Completion::Deferred,
+            Engines::Recording,
+        );
+        let channel = rig.channel(HostClass::Ampere);
+        let (writer, list) = list_written_by_a_release(&mut rig);
+        rig.gpu.submit(channel, Submission::new(&[writer]));
+        let pages = rig.gpu.handles().written_pages.clone();
+        let page = DEVICE_BASE + list.address() + 4;
+        rig.gpu.run_in_order(move |_| pages.mark(page, 4));
+        rig.gpu.submit(channel, Submission::new(&[sync(list)]));
+        assert_eq!(
+            rig.methods(),
+            [(channel.0, EngineKind::Maxwell3d, 0x701, 0x1234)],
+            "{threading:?}: the list is read with the released word"
+        );
+        assert!(
+            rig.events()
+                .contains(&Event::FlushRegion(DEVICE_BASE + list.address(), 8)),
+            "{threading:?}"
+        );
+    });
+}
+
+#[test]
 fn entries_without_sync_are_fetched_without_waiting() {
     each_mode(|threading| {
         let mut rig = Rig::deferred(threading);
