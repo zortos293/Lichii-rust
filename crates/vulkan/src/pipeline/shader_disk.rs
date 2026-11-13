@@ -95,12 +95,16 @@ impl ShaderDisk {
             .collect()
     }
 
-    /// Queues `entry` for the next [`Self::flush`].
+    /// Queues `entry` for the next [`Self::flush`], and serves it to later lookups.
     pub(crate) fn append(&mut self, entry: &CacheEntry) {
         if self.stored.insert(entry.module().hash) {
             cache::encode_module(entry.module(), &mut self.pending);
         }
         entry.encode(&mut self.pending);
+        self.entries
+            .entry(entry.probe_key())
+            .or_default()
+            .push(entry.clone());
     }
 
     /// Appends the queued entries to the file. A write that failed part-way is cut off before

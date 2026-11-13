@@ -2,7 +2,8 @@
 //!
 //! A submission reserves its syncpoint increments and hands its command buffers to the channel's
 //! [`EngineChannel`], which counts the increments as its stream reaches them. Map-buffer pins
-//! return the nvmap device address, as there is no separate host1x IOVA space.
+//! return the nvmap device address, as there is no separate host1x IOVA space. VIC output is
+//! reported to the opening process's write tracking.
 
 use std::sync::Arc;
 
@@ -11,7 +12,7 @@ use lichii_gpu::host1x::{EngineChannel, VideoEngine};
 use parking_lot::Mutex;
 
 use super::ioctl::{Args, Variant, items, read_struct, write_struct};
-use super::{NvResult, Nvdrv};
+use super::{Client, NvResult, Nvdrv};
 
 #[derive(Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
@@ -65,7 +66,7 @@ pub(crate) struct Host1xClient {
 }
 
 impl Host1xClient {
-    pub fn new(nvdrv: Arc<Nvdrv>, path: &str) -> Self {
+    pub fn new(nvdrv: Arc<Nvdrv>, client: &Client, path: &str) -> Self {
         let (name, engine) = match path {
             "/dev/nvhost-nvdec" => ("/dev/nvhost-nvdec", VideoEngine::NvDec),
             "/dev/nvhost-vic" => ("/dev/nvhost-vic", VideoEngine::Vic),
@@ -74,7 +75,7 @@ impl Host1xClient {
         tracing::info!(device = name, "host1x engine channel opened");
         Self {
             syncpoint: nvdrv.syncpoints.allocate(),
-            channel: EngineChannel::open(engine, nvdrv.gpu.host1x().syncpoints.clone()),
+            channel: EngineChannel::open(engine, nvdrv.gpu.host1x(), Some(client.memory().clone())),
             nvdrv,
             name,
             pinned: Mutex::default(),

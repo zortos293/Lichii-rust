@@ -275,6 +275,8 @@ pub struct Frame {
 
 // SAFETY: the frame's buffers are reference counted by FFmpeg and owned by this frame alone.
 unsafe impl Send for Frame {}
+// SAFETY: a shared frame is only read; every call that changes it takes `&mut self`.
+unsafe impl Sync for Frame {}
 
 impl Frame {
     /// An empty frame. Fails with [`VideoError::Unavailable`] when FFmpeg is not installed.

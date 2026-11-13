@@ -85,11 +85,19 @@ pub(crate) struct Sched {
     pub pause_requested: bool,
     pub cancel_pending: bool,
     pub terminate_requested: bool,
+    /// Pinned to its core by an interrupt that found preemption disabled; it keeps the core until
+    /// `svcSynchronizePreemptionState`.
+    pub pinned: bool,
 }
 
 /// Held while a process changes its mutex ownership links (`lock_waiters`, `lock_owner`) and the
 /// priorities they lend, so updates along an owner chain never interleave.
 pub(crate) type InheritanceGuard<'a> = MutexGuard<'a, ()>;
+
+/// Offset of the guest's preemption disable count in the thread-local region.
+const TLS_DISABLE_COUNT: VAddr = 0x100;
+/// Offset of the flag the kernel raises when it pinned the thread instead of preempting it.
+const TLS_INTERRUPT_FLAG: VAddr = 0x102;
 
 /// A guest thread: its saved context, scheduling state and TLS slot.
 pub struct Thread {
@@ -165,6 +173,7 @@ impl Thread {
                 pause_requested: false,
                 cancel_pending: false,
                 terminate_requested: false,
+                pinned: false,
             }),
             wait_token: AtomicU64::new(0),
             sync: SyncState::default(),
@@ -184,6 +193,38 @@ impl Thread {
     /// Address of the thread's TLS slot.
     pub fn tls_address(&self) -> VAddr {
         self.tls
+    }
+
+    /// Called by the thread's core when an interrupt asks it to give up the core. If the guest has
+    /// disabled preemption (`ThreadLocalRegion::disable_count`, set around user spinlocks), the
+    /// thread is pinned instead and its `interrupt_flag` raised, so the guest calls
+    /// `svcSynchronizePreemptionState` once it enables preemption again.
+    pub(crate) fn pin_if_preemption_disabled(&self) {
+        let memory = self.process().memory();
+        if memory
+            .read::<u16>(self.tls + TLS_DISABLE_COUNT)
+            .unwrap_or(0)
+            == 0
+        {
+            return;
+        }
+        let mut s = self.sched.lock();
+        if !s.pinned {
+            s.pinned = true;
+            let _ = memory.write::<u16>(self.tls + TLS_INTERRUPT_FLAG, 1);
+        }
+    }
+
+    /// Unpins the thread and clears its `interrupt_flag`. Returns whether it was pinned.
+    pub(crate) fn unpin(&self) -> bool {
+        if !std::mem::take(&mut self.sched.lock().pinned) {
+            return false;
+        }
+        let _ = self
+            .process()
+            .memory()
+            .write::<u16>(self.tls + TLS_INTERRUPT_FLAG, 0);
+        true
     }
 
     pub fn stack_top(&self) -> VAddr {
