@@ -4,11 +4,12 @@ use std::time::Duration;
 
 use lichii_common::ConsoleGeneration;
 use lichii_cpu::ThreadContext;
+use lichii_memory::DeviceAddressSpace;
 use parking_lot::Mutex;
 
 use super::scheduling::{heap_base, spawn_and_join};
 use super::{Script, TestKernel, word};
-use crate::arbiter::HANDLE_WAIT_MASK;
+use crate::arbiter::{HANDLE_WAIT_MASK, SignalType};
 use crate::event::Event;
 use crate::object::KObject;
 use crate::result;
@@ -529,4 +530,41 @@ fn a_mutex_waiter_stops_lending_its_priority_when_its_wait_ends() {
         50,
         "a wait that already ended lends nothing"
     );
+}
+
+/// `SignalToAddress` writes to its guest word reach write tracking, so a GPU cache over the
+/// page drops its copy; a plain signal writes nothing.
+#[test]
+fn signal_to_address_writes_are_tracked() {
+    const DADDR: u64 = 0x1_0000_0000;
+    let test = TestKernel::new(ConsoleGeneration::Switch2);
+    let main = test.program(Script::new().exit());
+    let process = test.start(test.image(), main);
+    let word = heap_base(&test) + 0x40;
+    let memory = process.memory();
+    memory.write(word, 7u32).unwrap();
+    let device = DeviceAddressSpace::new(memory.physical().clone(), 36);
+    device.attach_process(memory.clone());
+    device
+        .map_process(DADDR, memory, word & !0xfff, 0x1000)
+        .unwrap();
+    let cases = [
+        (SignalType::Signal, 7, false),
+        (SignalType::SignalAndIncrementIfEqual, 7, true),
+        (SignalType::SignalAndModifyByWaitingCountIfEqual, 8, true),
+    ];
+    for (kind, value, writes) in cases {
+        let cached = device.cache_pages(DADDR, 0x1000);
+        test.kernel
+            .0
+            .arbiter
+            .signal_to_address(&process, word, kind, value, 1)
+            .unwrap();
+        let mut reported = Vec::new();
+        device.take_cpu_writes(|daddr, size| reported.push((daddr, size)));
+        let expected: &[(u64, u64)] = if writes { &[(DADDR, 0x1000)] } else { &[] };
+        assert_eq!(reported, expected, "{kind:?}");
+        drop(cached);
+    }
+    assert_eq!(memory.read::<u32>(word).unwrap(), 9);
 }

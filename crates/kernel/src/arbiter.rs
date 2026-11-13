@@ -106,20 +106,50 @@ impl SignalType {
     }
 }
 
-/// A guest word as a host atomic. The address must be aligned and mapped readable (and
-/// writable when `write` is set).
-fn guest_word<T>(memory: &AddressSpace, addr: VAddr, write: bool) -> HleResult<&T> {
-    let (ptr, perm) = memory
-        .translate(addr)
-        .ok_or(result::INVALID_CURRENT_MEMORY)?;
-    if !perm.contains(MemoryPermission::READ) || (write && !perm.contains(MemoryPermission::WRITE))
-    {
-        return Err(result::INVALID_CURRENT_MEMORY);
+/// A guest word as a host atomic. Taken for writing, it reports the write to write tracking when
+/// dropped, after the caller's store.
+struct GuestWord<'a, T> {
+    memory: &'a AddressSpace,
+    word: &'a T,
+    write: bool,
+}
+
+impl<T> std::ops::Deref for GuestWord<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.word
     }
+}
+
+impl<T> Drop for GuestWord<'_, T> {
+    fn drop(&mut self) {
+        if self.write {
+            self.memory.report_write((self.word as *const T).cast());
+        }
+    }
+}
+
+/// The guest word at `addr`, which must be aligned and mapped readable (and writable when
+/// `write` is set).
+fn guest_word<T>(memory: &AddressSpace, addr: VAddr, write: bool) -> HleResult<GuestWord<'_, T>> {
+    let need = if write {
+        MemoryPermission::READ_WRITE
+    } else {
+        MemoryPermission::READ
+    };
+    let ptr = memory
+        .access(addr, need)
+        .map_err(|_| result::INVALID_CURRENT_MEMORY)?;
     debug_assert_eq!(ptr as usize % std::mem::align_of::<T>(), 0);
     // SAFETY: the address is aligned for T (checked by every caller) and lies inside one mapped
     // DRAM page, which stays valid for the life of the address space.
-    Ok(unsafe { &*(ptr as *const T) })
+    let word = unsafe { &*(ptr as *const T) };
+    Ok(GuestWord {
+        memory,
+        word,
+        write,
+    })
 }
 
 /// What a wait operation decided: either it is done (no block), or the thread was registered
@@ -170,13 +200,13 @@ impl Arbiter {
         let mut shard = self.shard(pid, addr);
         match kind {
             ArbitrationType::WaitIfLessThan => {
-                let word: &AtomicI32 = guest_word(memory, addr, false)?;
+                let word = guest_word::<AtomicI32>(memory, addr, false)?;
                 if word.load(Ordering::SeqCst) as i64 >= value {
                     return Ok(WaitOutcome::Done(result::INVALID_STATE));
                 }
             }
             ArbitrationType::DecrementAndWaitIfLessThan => {
-                let word: &AtomicI32 = guest_word(memory, addr, true)?;
+                let word = guest_word::<AtomicI32>(memory, addr, true)?;
                 let mut current = word.load(Ordering::SeqCst);
                 loop {
                     if current as i64 >= value {
@@ -194,13 +224,13 @@ impl Arbiter {
                 }
             }
             ArbitrationType::WaitIfEqual => {
-                let word: &AtomicI32 = guest_word(memory, addr, false)?;
+                let word = guest_word::<AtomicI32>(memory, addr, false)?;
                 if word.load(Ordering::SeqCst) != value as i32 {
                     return Ok(WaitOutcome::Done(result::INVALID_STATE));
                 }
             }
             ArbitrationType::WaitIfEqual64 => {
-                let word: &AtomicI64 = guest_word(memory, addr, false)?;
+                let word = guest_word::<AtomicI64>(memory, addr, false)?;
                 if word.load(Ordering::SeqCst) != value {
                     return Ok(WaitOutcome::Done(result::INVALID_STATE));
                 }
@@ -243,7 +273,7 @@ impl Arbiter {
         match kind {
             SignalType::Signal => {}
             SignalType::SignalAndIncrementIfEqual => {
-                let word: &AtomicI32 = guest_word(process.memory(), addr, true)?;
+                let word = guest_word::<AtomicI32>(process.memory(), addr, true)?;
                 if word
                     .compare_exchange(
                         value,
@@ -264,7 +294,7 @@ impl Arbiter {
                     (false, n) if ((n - 1) as i64) < count as i64 => value.wrapping_sub(1),
                     (false, _) => value,
                 };
-                let word: &AtomicI32 = guest_word(process.memory(), addr, new_value != value)?;
+                let word = guest_word::<AtomicI32>(process.memory(), addr, new_value != value)?;
                 let ok = if new_value != value {
                     word.compare_exchange(value, new_value, Ordering::SeqCst, Ordering::SeqCst)
                         .is_ok()
@@ -302,7 +332,7 @@ impl Arbiter {
         let process = thread.process();
         let pid = process.id();
         let mut shard = self.shard(pid, addr);
-        let word: &AtomicU32 = guest_word(process.memory(), addr, false)?;
+        let word = guest_word::<AtomicU32>(process.memory(), addr, false)?;
         if word.load(Ordering::SeqCst) != owner_handle | HANDLE_WAIT_MASK {
             return Ok(WaitOutcome::Done(ResultCode::SUCCESS));
         }
@@ -336,7 +366,7 @@ impl Arbiter {
         pid: ProcessId,
         addr: VAddr,
     ) -> HleResult<()> {
-        let word: &AtomicU32 = guest_word(owner.process().memory(), addr, true)?;
+        let word = guest_word::<AtomicU32>(owner.process().memory(), addr, true)?;
         let held = owner.lock_inheritance();
         loop {
             let Some(next) = take_best(&mut shard.mutex, pid, addr) else {
@@ -411,7 +441,7 @@ impl Arbiter {
             thread.cancel_wait(token);
             return Ok(WaitOutcome::Done(result::TIMED_OUT));
         }
-        let key_word: &AtomicU32 = match guest_word(memory, key, true) {
+        let key_word = match guest_word::<AtomicU32>(memory, key, true) {
             Ok(word) => word,
             Err(code) => {
                 thread.cancel_wait(token);
@@ -462,7 +492,7 @@ impl Arbiter {
             if s.wait != waiter.token {
                 continue;
             }
-            let word: &AtomicU32 = match guest_word(memory, waiter.mutex, true) {
+            let word = match guest_word::<AtomicU32>(memory, waiter.mutex, true) {
                 Ok(word) => word,
                 Err(code) => {
                     waiter.thread.wake_locked(&mut s, WakeResult::error(code));

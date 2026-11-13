@@ -64,6 +64,7 @@ pub fn context_with_session(
         ConsoleGeneration::Switch2 => (Console::Switch2, 36),
     };
     let host1x = Host1x::new(kernel.physical_memory().clone(), bits);
+    host1x.memory.attach_process(process.memory().clone());
     let gpu = Gpu::new(
         host1x,
         Arc::new(Clock),

@@ -633,10 +633,10 @@ impl SysmixStream {
     /// The ring cursor at `offset` as a host atomic on the guest's memory, the word the guest's
     /// own exclusive loads and stores see, or `None` unless its page is mapped read-write.
     fn cursor_word(&self, offset: u64) -> Option<&AtomicU32> {
-        let (ptr, perm) = self.memory.translate(self.buffer + offset)?;
-        if !perm.contains(MemoryPermission::READ_WRITE) {
-            return None;
-        }
+        let ptr = self
+            .memory
+            .access(self.buffer + offset, MemoryPermission::READ_WRITE)
+            .ok()?;
         debug_assert_eq!(ptr as usize % align_of::<AtomicU32>(), 0);
         // SAFETY: the ring is page aligned and both cursors sit at 4-byte aligned offsets of its
         // first two pages, so the word is aligned and inside one mapped page, which stays valid
@@ -654,10 +654,11 @@ impl SysmixStream {
     /// guest moved the cursor first.
     fn swap_cursor(&self, offset: u64, expected: u32, next: u32) -> Option<bool> {
         let word = self.cursor_word(offset)?;
-        Some(
-            word.compare_exchange(expected, next, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok(),
-        )
+        let swapped = word
+            .compare_exchange(expected, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        self.memory.report_write(word.as_ptr().cast());
+        Some(swapped)
     }
 
     fn read_payload(&self, slot: u32, out: &mut [u8], frame_bytes: u32) -> bool {
