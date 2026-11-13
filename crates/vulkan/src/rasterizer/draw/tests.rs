@@ -343,6 +343,40 @@ fn failed_translations_ignore_the_constant_buffer_words_they_read() {
 }
 
 #[test]
+fn draws_skip_while_workers_translate_their_programs() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    f.rasterizer.draw.shaders.set_async(true);
+    let regs = draw_regs();
+    draw(&mut f, &gmmu, &regs);
+    draw(&mut f, &gmmu, &regs);
+    assert!(
+        target(&mut f).iter().all(|&t| t == [0; 4]),
+        "draws whose programs are queued draw nothing"
+    );
+    let mut rounds = 0;
+    while target(&mut f).iter().any(|&t| t != [255, 128, 0, 255]) {
+        rounds += 1;
+        assert!(rounds <= 3, "the vertex then the fragment program land");
+        f.rasterizer.draw.shaders.finish_translations();
+        draw(&mut f, &gmmu, &regs);
+    }
+    let stats = f.rasterizer.draw.shaders.stats();
+    assert_eq!(
+        (stats.translated, stats.failed),
+        (2, 0),
+        "each program translated once however many draws asked"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
 fn a_fragment_program_after_another_vertex_program_with_the_same_outputs_is_not_translated_again() {
     let Some((mut f, gmmu)) = draw_fixture() else {
         return;

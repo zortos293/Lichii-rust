@@ -7,6 +7,7 @@
 //! format under an unchanged program translates it again.
 
 use std::cell::{Cell, RefCell};
+use std::sync::Arc;
 
 use lichii_common::GpuVAddr;
 use lichii_gpu::backend::{ComputeContext, ConstBufferBinding, GraphicsContext, QmdVersion};
@@ -325,12 +326,29 @@ fn mesh_state(ctx: &GraphicsContext<'_>, slot: usize, arch: ShaderArch) -> Optio
     })
 }
 
+/// The register state and bindings of a [`ProgramEnv`], owned; [`ProgramEnv::from_snapshot`]
+/// translates from it on another thread.
+pub struct EnvSnapshot {
+    arch: ShaderArch,
+    stage: ShaderStage,
+    start: GpuVAddr,
+    gmmu: Arc<Gmmu>,
+    const_buffers: Vec<ConstBufferBinding>,
+    pool: TexturePool,
+    viewport_transform: u32,
+    texture_bound: u32,
+    local_memory: u32,
+    shared_memory: u32,
+    workgroup: [u32; 3],
+    mesh: Option<MeshState>,
+}
+
 /// One guest program, as the translator reads it.
 pub struct ProgramEnv<'a> {
     arch: ShaderArch,
     stage: ShaderStage,
     start: GpuVAddr,
-    gmmu: &'a Gmmu,
+    gmmu: &'a Arc<Gmmu>,
     const_buffers: &'a [ConstBufferBinding],
     pool: TexturePool,
     viewport_transform: u32,
@@ -343,6 +361,9 @@ pub struct ProgramEnv<'a> {
     reads: RefCell<Vec<EnvRead>>,
     /// Lowest and one past the highest program byte the translator read.
     extent: Cell<(GpuVAddr, GpuVAddr)>,
+    /// Every program word the translator read, kept on a worker's environment, where the guest
+    /// may rewrite the program while it translates.
+    code_log: Option<RefCell<Vec<(GpuVAddr, u64)>>>,
 }
 
 impl<'a> ProgramEnv<'a> {
@@ -386,6 +407,7 @@ impl<'a> ProgramEnv<'a> {
             mesh,
             reads: RefCell::new(Vec::new()),
             extent: Cell::new((start, start)),
+            code_log: None,
         };
         let word = |index: u64| env.word(header + index * 4);
         let low = word(1) & 0xff_ffff;
@@ -421,6 +443,7 @@ impl<'a> ProgramEnv<'a> {
             mesh: None,
             reads: RefCell::new(Vec::new()),
             extent: Cell::new((ctx.program, ctx.program)),
+            code_log: None,
         }
     }
 
@@ -447,6 +470,63 @@ impl<'a> ProgramEnv<'a> {
 
     pub fn gmmu(&self) -> &'a Gmmu {
         self.gmmu
+    }
+
+    /// Whether `bytes`, program memory from `start`, still hold every word the translator read
+    /// from a snapshot. Always true off a snapshot, where nothing else runs during translation.
+    pub fn consumed_unchanged(&self, start: GpuVAddr, bytes: &[u8]) -> bool {
+        self.code_log.as_ref().is_none_or(|log| {
+            log.borrow().iter().all(|&(address, value)| {
+                let offset = address.wrapping_sub(start) as usize;
+                bytes
+                    .get(offset..offset + 8)
+                    .is_some_and(|word| word == value.to_le_bytes())
+            })
+        })
+    }
+
+    /// The channel's address space, to share with another thread.
+    pub fn memory(&self) -> &'a Arc<Gmmu> {
+        self.gmmu
+    }
+
+    /// What this environment reads, owned, so another thread can translate the program.
+    pub fn snapshot(&self) -> EnvSnapshot {
+        EnvSnapshot {
+            arch: self.arch,
+            stage: self.stage,
+            start: self.start,
+            gmmu: self.gmmu.clone(),
+            const_buffers: self.const_buffers.to_vec(),
+            pool: self.pool,
+            viewport_transform: self.viewport_transform,
+            texture_bound: self.texture_bound,
+            local_memory: self.local_memory,
+            shared_memory: self.shared_memory,
+            workgroup: self.workgroup,
+            mesh: self.mesh,
+        }
+    }
+
+    /// The environment `snapshot` was taken of, reading guest memory as it is now.
+    pub fn from_snapshot(snapshot: &'a EnvSnapshot) -> Self {
+        Self {
+            arch: snapshot.arch,
+            stage: snapshot.stage,
+            start: snapshot.start,
+            gmmu: &snapshot.gmmu,
+            const_buffers: &snapshot.const_buffers,
+            pool: snapshot.pool,
+            viewport_transform: snapshot.viewport_transform,
+            texture_bound: snapshot.texture_bound,
+            local_memory: snapshot.local_memory,
+            shared_memory: snapshot.shared_memory,
+            workgroup: snapshot.workgroup,
+            mesh: snapshot.mesh,
+            reads: RefCell::new(Vec::new()),
+            extent: Cell::new((snapshot.start, snapshot.start)),
+            code_log: Some(RefCell::new(Vec::new())),
+        }
     }
 
     pub fn pool(&self) -> &TexturePool {
@@ -546,7 +626,11 @@ impl ShaderEnvironment for ProgramEnv<'_> {
         let (low, high) = self.extent.get();
         self.extent
             .set((low.min(address), high.max(address.saturating_add(8))));
-        self.gmmu.read::<u64>(address).unwrap_or(0)
+        let value = self.gmmu.read::<u64>(address).unwrap_or(0);
+        if let Some(log) = &self.code_log {
+            log.borrow_mut().push((address, value));
+        }
+        value
     }
 
     fn read_code(&self, address: GpuVAddr, out: &mut [u8]) {
