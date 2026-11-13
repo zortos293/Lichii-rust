@@ -58,6 +58,32 @@ impl Drop for HostFp {
     }
 }
 
+/// [`call`] for `Op::CallSimd`, counted in the core's profile.
+pub(super) extern "sysv64" fn call_profiled(
+    ctx: &mut ThreadContext,
+    word: u32,
+    state: &mut JitState,
+    pc: u64,
+) -> bool {
+    if let Some(p) = state.profile.as_deref_mut() {
+        p.simd_call(word);
+    }
+    call(ctx, word, state, pc)
+}
+
+/// [`call`] for the slow path of a native op, counted in the core's profile.
+pub(super) extern "sysv64" fn slow_profiled(
+    ctx: &mut ThreadContext,
+    word: u32,
+    state: &mut JitState,
+    pc: u64,
+) -> bool {
+    if let Some(p) = state.profile.as_deref_mut() {
+        p.simd_slow(word, ctx.fpcr & x64::HOST_FPCR as u32 != 0);
+    }
+    call(ctx, word, state, pc)
+}
+
 /// Runs `Op::CallSimd` on the live context. Returns true, with the fault recorded in `state`,
 /// when the instruction is undefined.
 pub(super) extern "sysv64" fn call(

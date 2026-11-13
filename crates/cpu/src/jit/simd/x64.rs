@@ -18,7 +18,7 @@ use super::super::x64::{CTX_FPCR, CTX_FPSR, CTX_PSTATE, Emitter, loc_offset};
 use super::ir::{Arith, Fp, Fused, SimdOp};
 
 /// FPCR.RMode and FPCR.FZ.
-const HOST_FPCR: i32 = 3 << 22 | 1 << 24;
+pub(super) const HOST_FPCR: i32 = 3 << 22 | 1 << 24;
 /// FPSR.IXC.
 const IXC: i8 = 0x10;
 
@@ -399,7 +399,7 @@ impl Emitter<'_> {
                 ; mov esi, slow.word as i32
                 ; mov rdx, r13
                 ; xor ecx, ecx
-                ; mov rax, QWORD self.target.simd as i64
+                ; mov rax, QWORD self.target.simd_slow as i64
                 ; sub rsp, 8
                 ; call rax
                 ; add rsp, 8

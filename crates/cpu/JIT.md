@@ -130,6 +130,14 @@ Vector integer ops are exact on the host, so they are lowered without checks: th
 4. **Fault paths**: fastmem faults on unmapped and protected pages, from loads, stores, pairs and atomics. Each must give the same `CpuFault` and `pc` as the interpreter.
 5. **Throughput**: `benches/interpreter.rs` grows a JIT column, and the target is at least 10x the interpreter on the integer loops.
 
+## Profiling
+
+`LICHII_JIT_PROFILE=1` turns on per-core counters that rank JIT work on real titles: J5's SIMD/FP lowerings and this file's remaining items. With the variable unset, no counter exists and every emitted block is byte-identical. The dispatcher pays one predicted `None` check per block exit.
+
+- **What it counts**: interpreter fallbacks by `Inst` variant (`LD2`-`LD4` and `ST2`-`ST4` apart from the rest of `VecMulti`); `CallSimd` calls; slow paths of native FP ops, split into FPCR mode (FZ or a rounding mode) and inputs or a clear FPSR.IXC; dispatcher exits by reason (unlinked jump, indirect-branch miss, interrupt, fault); lazy NZCV write-backs by the native stub and by the dispatcher; code cache flushes (region full, clear, range invalidation); and translated blocks, instructions, code bytes and translation time. SIMD/FP words are grouped by the Arm ARM's top-level decode, and their register and immediate fields are masked out, so `FP 2-source 0x1e602800` is every double-precision `FADD`.
+- **How**: each core counts into its own table without locks. The helpers behind `CallSimd` and the FP slow paths are swapped for counting wrappers, and the materialize stub gains an `inc`. A core merges its counts into a process-wide total at most every 250 ms when `run` returns, and when it drops.
+- **Output**: when the last profiled core drops (`System::stop` ends the session), the total is logged at info level as a table sorted by count. The frame view adds one line of per-second rates: translation milliseconds, interpreter fallbacks, and SIMD helper calls and slow paths.
+
 ## Milestones
 
 1. **J1**: the IR, the translator for integer, branch and plain load/store `Inst`s, passes 1-4, the x64 backend with linear-scan allocation, the entry trampoline, unlinked dispatch, fastmem loads and stores with the bounds check, the fastmem fault handler and slow paths, and the interpreter fallback for everything else. Until J3 the code cache is one read-write-execute region. It must pass the JIT-vs-interpreter suite, fault paths included.

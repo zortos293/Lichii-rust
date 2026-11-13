@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 lichii-common.workspace = true
 lichii-core.workspace = true
+lichii-cpu.workspace = true
 lichii-crypto.workspace = true
 lichii-fs.workspace = true
 lichii-input.workspace = true

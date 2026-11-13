@@ -27,6 +27,8 @@ use crate::{ThreadContext, TscScale};
 type Asm = VecAssembler<X64Relocation>;
 
 pub(super) const EXIT_CONTINUE: u64 = 0;
+/// The block's entry check saw the interrupt flag; the dispatcher treats it as `EXIT_CONTINUE`.
+pub(super) const EXIT_INTERRUPT: u64 = 1;
 pub(super) const EXIT_FAULT: u64 = 2;
 /// The `info` operation code of a `CAS` slow path; `LD<op>` uses the `AtomicOp` discriminant.
 pub(super) const ATOMIC_CAS: i32 = 15;
@@ -49,8 +51,10 @@ pub(super) struct Target {
     pub exclusive: usize,
     pub zero: usize,
     pub ticks: usize,
-    /// `simd::call`, which runs `Op::CallSimd`.
+    /// `simd::call`, which runs `Op::CallSimd`, or its counting wrapper when profiling.
     pub simd: usize,
+    /// What the slow paths of native SIMD/FP ops call: `simd::call`, or a wrapper that counts them.
+    pub simd_slow: usize,
     /// The clock's `TscScale`, which counter reads use inline instead of calling `ticks`.
     pub tsc_scale: Option<*const TscScale>,
     /// The host has `cmpxchg16b`.
@@ -134,6 +138,7 @@ const ST_LAZY_NZCV: i32 = ctx(offset_of!(JitState, lazy_nzcv));
 const ST_LAZY_A: i32 = ctx(offset_of!(JitState, lazy_a));
 const ST_LAZY_B: i32 = ctx(offset_of!(JitState, lazy_b));
 const ST_MATERIALIZE: i32 = ctx(offset_of!(JitState, materialize));
+const ST_MATERIALIZED: i32 = ctx(offset_of!(JitState, materialized));
 /// Entries in the direct-mapped `guest pc -> host code` table indirect branches probe.
 pub(super) const TABLE_BITS: u32 = 16;
 
@@ -1672,16 +1677,20 @@ pub(super) fn compile(block: &Block, start: u64, target: &Target) -> Compiled {
         ; ret
         ; =>interrupted
     );
-    e.exit_to(start, EXIT_CONTINUE);
+    e.exit_to(start, EXIT_INTERRUPT);
     let code = e.asm.finalize().expect("every label is defined");
     Compiled { code, sites }
 }
 
 /// Called from translated code while lazy NZCV is pending: recomputes the flags from
 /// `JitState::lazy_a` and `lazy_b` with the host instruction their code names, packs them into
-/// `pstate` and clears the code. Clobbers `rax`, `rcx`, `rdx` and the host flags.
-pub(super) fn materialize_stub() -> Vec<u8> {
+/// `pstate` and clears the code. Clobbers `rax`, `rcx`, `rdx` and the host flags. With
+/// `profile` it also counts itself in `JitState::materialized`.
+pub(super) fn materialize_stub(profile: bool) -> Vec<u8> {
     let mut asm = Asm::new(0);
+    if profile {
+        dynasm!(asm ; .arch x64 ; inc QWORD [r13 + ST_MATERIALIZED]);
+    }
     let pack = asm.new_dynamic_label();
     let ops: [(Cmp, W); 6] = [
         (Cmp::Sub, W::W64),
