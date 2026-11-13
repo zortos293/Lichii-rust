@@ -239,7 +239,8 @@ pub enum FenceAction {
 
 impl FenceAction {
     /// Performs the action. The renderer calls this from whichever thread notices completion;
-    /// 16-byte releases take their timestamp from [`GpuHandles::timestamp`].
+    /// 16-byte releases take their timestamp from [`GpuHandles::timestamp`]. A semaphore write
+    /// resumes the channels waiting for its value ([`Syncpoints::semaphore_waiters`](crate::host1x::Syncpoints::semaphore_waiters)).
     pub fn execute(self, handles: &GpuHandles) {
         match self {
             Self::WriteSemaphore {
@@ -256,7 +257,17 @@ impl FenceAction {
                 };
                 if let Err(fault) = result {
                     tracing::warn!(?fault, "semaphore release to unmapped device memory");
+                    return;
                 }
+                let bytes = match size {
+                    ReleaseSize::Four => 4,
+                    ReleaseSize::Eight => 8,
+                    ReleaseSize::Sixteen => 16,
+                };
+                handles
+                    .syncpoints
+                    .semaphore_waiters()
+                    .written(&handles.device, address, bytes);
             }
             Self::ReduceSemaphore {
                 address,
@@ -280,6 +291,10 @@ impl FenceAction {
                 ) {
                     old = current;
                 }
+                handles
+                    .syncpoints
+                    .semaphore_waiters()
+                    .written(&handles.device, address, 4);
             }
             Self::IncrementSyncpoint(id) => {
                 if handles.syncpoints.guest().increment(id).is_err() {
@@ -386,7 +401,8 @@ pub trait Rasterizer: Send {
         });
     }
 
-    /// Writes a query result or semaphore release.
+    /// Writes a query result or semaphore release. With `after_work` the write may land after
+    /// the call returns, but before the next `release_fences(true)` returns.
     fn query(&mut self, channel: ChannelId, memory: &Gmmu, query: &Query);
 
     /// Resets a counter [`QueryKind`] reads from.
@@ -396,7 +412,8 @@ pub trait Rasterizer: Send {
     /// fences are not tracked).
     fn signal_fence(&mut self, action: FenceAction);
 
-    /// Runs the actions of finished fences; `wait` blocks until all of them finished.
+    /// Runs the actions of finished fences; `wait` blocks until all of them finished and ran,
+    /// and deferred [`Query`] writes landed.
     fn release_fences(&mut self, wait: bool);
 
     /// The guest CPU wrote `[addr, addr + size)`; drop or re-upload cached copies.

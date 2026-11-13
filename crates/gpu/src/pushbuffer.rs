@@ -18,7 +18,7 @@ impl GpEntry {
         Self((address & ((1 << 40) - 4)) | (((words as u64) & 0x1f_ffff) << 42))
     }
 
-    /// GET[39:2]; bits 0 and 1 are the FETCH flags, not address bits.
+    /// GET\[39:2\]; bits 0 and 1 are the FETCH flags, not address bits.
     #[inline]
     pub const fn address(self) -> GpuVAddr {
         self.0 & ((1 << 40) - 4)
