@@ -117,6 +117,8 @@ struct AppletState {
     main_volume: f32,
     library_volume: f32,
     user_channel: Vec<Vec<u8>>,
+    /// The preselected-user launch parameter was popped; it is there once per boot.
+    preselected_user_popped: bool,
     friend_invitations: Vec<Vec<u8>>,
 }
 

@@ -60,6 +60,9 @@ pub struct ServiceContext {
     pub(crate) unknown: UnknownCommands,
     /// The nvdrv state, once nvdrv registered: gsv opens `nx2:nvsrv` sessions with it.
     pub(crate) nvdrv: OnceLock<Arc<crate::nvdrv::Nvdrv>>,
+    /// The selected user's id, once acc registered: am's preselected-user launch parameter names
+    /// it.
+    pub(crate) user: OnceLock<[u8; 16]>,
     /// The NAND's registered content, indexed on first use by [`crate::fs::system_data`].
     pub(crate) installed_content: OnceLock<Option<ContentIndex>>,
     threads: Mutex<HashMap<String, ServiceThread>>,
@@ -80,6 +83,7 @@ impl ServiceContext {
             audio: parts.audio,
             unknown: UnknownCommands::default(),
             nvdrv: OnceLock::new(),
+            user: OnceLock::new(),
             installed_content: OnceLock::new(),
             threads: Mutex::new(HashMap::new()),
         })
