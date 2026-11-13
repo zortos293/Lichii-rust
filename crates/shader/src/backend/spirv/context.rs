@@ -1288,7 +1288,7 @@ impl<'a> EmitContext<'a> {
         {
             self.patch_vertices_in = self.define_input(u32_t, false, Some(BuiltIn::PatchVertices));
         }
-        if info.uses_sample_id {
+        if info.uses_sample_id && self.profile.support_sample_rate_shading {
             self.sample_id = self.define_input(u32_t, false, Some(BuiltIn::SampleId));
             if is_fragment {
                 self.decorate(self.sample_id, Decoration::Flat, &[]);

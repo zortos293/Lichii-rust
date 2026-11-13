@@ -901,6 +901,79 @@ fn interpolate_at_offset_follows_the_generic_input_types() {
     );
 }
 
+/// A fragment program reading the sample index and interpolating at an offset needs
+/// `SampleRateShading` and `InterpolationFunction` only while the host supports them.
+#[test]
+fn sample_rate_shading_follows_the_profile() {
+    let mut s = Synthetic::new();
+    let b = s.block();
+    s.inst(b, Opcode::Prologue, &[]);
+    let sample = s.inst(b, Opcode::SampleId, &[]);
+    let x = s.inst(b, Opcode::ConvertF32U32, &[sample]);
+    let value = s.inst(
+        b,
+        Opcode::InterpolateAtOffset,
+        &[
+            Value::Attribute(Attribute::generic(0, 0)),
+            x,
+            Value::F32(0.25),
+        ],
+    );
+    s.inst(
+        b,
+        Opcode::SetFragColor,
+        &[Value::U32(0), Value::U32(0), value],
+    );
+    s.inst(b, Opcode::Epilogue, &[]);
+    let info = ShaderInfo {
+        loads: varying(&[Attribute::generic(0, 0)]),
+        stores_frag_color: [true, false, false, false, false, false, false, false],
+        uses_sample_id: true,
+        ..ShaderInfo::default()
+    };
+    let program = s.finish(
+        vec![SyntaxNode::Block(b), SyntaxNode::Return],
+        ShaderStage::Fragment,
+        info,
+    );
+    let runtime = RuntimeInfo {
+        previous_stage_stores: varying(&[Attribute::generic(0, 0)]),
+        ..RuntimeInfo::default()
+    };
+    let capabilities = |module: &dr::Module| {
+        [
+            Capability::SampleRateShading,
+            Capability::InterpolationFunction,
+        ]
+        .map(|capability| {
+            module
+                .capabilities
+                .iter()
+                .any(|c| c.operands[0] == Operand::Capability(capability))
+        })
+    };
+    let module = emit(
+        "sample_rate_shading",
+        &Profile::default(),
+        &runtime,
+        &program,
+    );
+    assert_eq!(capabilities(&module), [true, true]);
+    assert_eq!(count_ops(&module, Op::ExtInst), 1);
+
+    let per_pixel = Profile {
+        support_sample_rate_shading: false,
+        ..Profile::default()
+    };
+    let module = emit("sample_rate_shading_off", &per_pixel, &runtime, &program);
+    assert_eq!(capabilities(&module), [false, false]);
+    assert_eq!(count_ops(&module, Op::ExtInst), 0);
+    assert!(!module.annotations.iter().any(|a| {
+        a.operands.get(1) == Some(&Operand::Decoration(Decoration::BuiltIn))
+            && a.operands.get(2) == Some(&Operand::BuiltIn(rspirv::spirv::BuiltIn::SampleId))
+    }));
+}
+
 mod memory;
 
 /// Random Maxwell programs with random program headers, through translation and `compile`, for
