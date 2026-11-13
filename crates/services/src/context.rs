@@ -1,11 +1,12 @@
 //! What services share: the kernel, settings, the title, the GPU and input.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use lichii_common::HleResult;
 use lichii_common::perf::PerfStats;
 use lichii_common::settings::Settings;
+use lichii_fs::ContentIndex;
 use lichii_gpu::Gpu;
 use lichii_input::NpadHub;
 use lichii_kernel::Kernel;
@@ -51,6 +52,8 @@ pub struct ServiceContext {
     /// Counters the overlay shows; vi/gsv record guest frames here.
     pub perf: Arc<PerfStats>,
     pub(crate) unknown: UnknownCommands,
+    /// The NAND's registered content, indexed on first use by [`crate::fs::system_data`].
+    pub(crate) installed_content: OnceLock<Option<ContentIndex>>,
     threads: Mutex<HashMap<String, ServiceThread>>,
 }
 
@@ -67,6 +70,7 @@ impl ServiceContext {
             npad: parts.npad,
             perf: parts.perf,
             unknown: UnknownCommands::default(),
+            installed_content: OnceLock::new(),
             threads: Mutex::new(HashMap::new()),
         })
     }
