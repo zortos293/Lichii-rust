@@ -94,7 +94,7 @@ pub enum Command {
     BiquadFilter(BiquadFilterCommand),
     Mix(MixCommand),
     MixRamp(MixRampCommand),
-    MixRampGrouped(Box<MixRampGroupedCommand>),
+    MixRampGrouped(MixRampGroupedCommand),
     DepopPrepare(DepopPrepareCommand),
     DepopForMixBuffers(DepopForMixBuffersCommand),
     Delay(DelayCommand),

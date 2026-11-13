@@ -7,6 +7,7 @@
 //! [`system::RendererSystem`] through the accessors each context exposes.
 
 pub mod behavior;
+pub mod command;
 pub mod device;
 pub mod effect;
 pub mod memory;
