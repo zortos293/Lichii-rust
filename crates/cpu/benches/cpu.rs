@@ -195,6 +195,25 @@ const WORKLOADS: &[Workload] = &[
         far: &[],
         per_iteration: 10,
     },
+    Workload {
+        name: "popcount loop",
+        code: &[
+            0x4c407020, // 1: ld1 {v0.16b}, [x1]
+            0x4e205801, // cnt v1.16b, v0.16b
+            0x0e205802, // cnt v2.8b, v0.8b
+            0x0e22bc43, // addp v3.8b, v2.8b, v2.8b
+            0x4e63bc24, // addp v4.8h, v1.8h, v3.8h
+            0x4ea0bc85, // addp v5.4s, v4.4s, v0.4s
+            0x4ee1bca6, // addp v6.2d, v5.2d, v1.2d
+            0x6e261c00, // eor v0.16b, v0.16b, v6.16b
+            0x4c007020, // st1 {v0.16b}, [x1]
+            0xf10004a5, // subs x5, x5, #1
+            0x54fffec1, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 11,
+    },
 ];
 
 fn main() {
