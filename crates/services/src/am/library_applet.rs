@@ -2,10 +2,13 @@
 //!
 //! `Start` runs the applet at once: am parses the `CommonArguments` and the applet's own
 //! arguments from the pushed in-data, asks the [`AppletFrontend`], pushes the answer and exits
-//! the applet. The software keyboard stays running while the title checks the submitted text.
+//! the applet. The software keyboard stays running while the title checks the submitted text,
+//! and the inline keyboard runs its own state machine until the title finalizes it.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+
+use inline_keyboard::InlineKeyboard;
 
 use lichii_common::ResultCode;
 use lichii_kernel::Event;
@@ -14,13 +17,15 @@ use parking_lot::Mutex;
 
 use super::applets::{
     AppletFrontend, ControllerAnswer, ControllerRequest, ControllerSetup, ErrorCode, ErrorRequest,
-    ProfileSelectAnswer, ProfileSelectRequest, SoftwareKeyboardAnswer, SoftwareKeyboardRequest,
-    TextCheckPrompt,
+    InlineKeyboardEvent, InlineKeyboardReplies, InlineKeyboardReply, ProfileSelectAnswer,
+    ProfileSelectRequest, SoftwareKeyboardAnswer, SoftwareKeyboardRequest, TextCheckPrompt,
 };
 use super::functions::push_storage;
 use super::storage::{Storage, StorageData};
 use super::{NO_DATA_IN_CHANNEL, UNKNOWN, push_bool, push_event};
 use crate::{Service, ServiceContext};
+
+mod inline_keyboard;
 
 /// `AppletId`s am answers through the frontend.
 pub(super) const CONTROLLER: u32 = 0x0c;
@@ -51,9 +56,6 @@ const KEYBOARD_CANCEL: u32 = 1;
 const TEXT_CHECK_SUCCESS: u32 = 0;
 const TEXT_CHECK_FAILURE: u32 = 1;
 const TEXT_CHECK_CONFIRM: u32 = 2;
-/// `SwkbdState::InitializedIsHidden` and `SwkbdReplyType::DecidedCancel`.
-const INLINE_HIDDEN: u32 = 1;
-const INLINE_DECIDED_CANCEL: u32 = 6;
 const KEYBOARD_STRING_SIZE: usize = 0x7d4;
 const KEYBOARD_MAX_LENGTH: u32 = 500;
 /// `SwkbdAppletVersion`s whose config layout differs from `SwkbdConfigCommon`.
@@ -117,6 +119,7 @@ struct RunState {
     interactive_out: Channel,
     completed: bool,
     text_check: Option<TextCheck>,
+    inline: Option<InlineKeyboard>,
 }
 
 /// A library applet am runs for the application.
@@ -137,7 +140,7 @@ impl LibraryApplet {
         }
     }
 
-    fn start(&self, context: &ServiceContext) {
+    fn start(self: &Arc<Self>, context: &ServiceContext) {
         let inputs: Vec<Vec<u8>> = {
             let mut state = self.state.lock();
             std::iter::from_fn(|| state.in_data.pop())
@@ -183,11 +186,8 @@ impl LibraryApplet {
                     PARTIAL_FOREGROUND | PARTIAL_FOREGROUND_INDIRECT_DISPLAY
                 ) =>
             {
-                tracing::warn!("inline software keyboard answers DecidedCancel");
-                Step {
-                    interactive_out: Some(inline_reply(INLINE_HIDDEN, INLINE_DECIDED_CANCEL)),
-                    ..Step::default()
-                }
+                self.state.lock().inline = Some(InlineKeyboard::default());
+                return;
             }
             SOFTWARE_KEYBOARD => match keyboard_config(version, argument(1), argument(2)) {
                 Some(config) => keyboard_step(frontend.as_ref(), config),
@@ -210,14 +210,25 @@ impl LibraryApplet {
         self.apply(step);
     }
 
-    fn push_interactive(&self, context: &ServiceContext, data: Arc<StorageData>) {
-        let check = {
-            let mut state = self.state.lock();
-            match state.text_check.take() {
-                Some(check) => check,
-                None => return state.interactive_in.push(data),
+    fn push_interactive(self: &Arc<Self>, context: &ServiceContext, data: Arc<StorageData>) {
+        let mut state = self.state.lock();
+        if let Some(keyboard) = state.inline.as_mut() {
+            let outcome = keyboard.request(&data.bytes());
+            for reply in outcome.replies {
+                state
+                    .interactive_out
+                    .push(Arc::new(StorageData::new(reply, None)));
             }
+            if outcome.finalized {
+                self.exit(&mut state);
+            }
+            drop(state);
+            return self.notify_inline(context, outcome.events);
+        }
+        let Some(check) = state.text_check.take() else {
+            return state.interactive_in.push(data);
         };
+        drop(state);
         let data = data.bytes().clone();
         let step = text_checked(context.applet_frontend().as_ref(), check, &data);
         self.apply(step);
@@ -239,10 +250,49 @@ impl LibraryApplet {
         }
     }
 
+    /// Exits on the title's request, closing the inline keyboard if it runs.
+    fn terminate(self: &Arc<Self>, context: &ServiceContext) {
+        let inline = {
+            let mut state = self.state.lock();
+            let inline = state.inline.is_some();
+            self.exit(&mut state);
+            inline
+        };
+        if inline {
+            self.notify_inline(context, [InlineKeyboardEvent::Finalize]);
+        }
+    }
+
     fn exit(&self, state: &mut RunState) {
         state.completed = true;
         state.text_check = None;
+        state.inline = None;
         self.state_changed_event.signal();
+    }
+
+    fn notify_inline(
+        self: &Arc<Self>,
+        context: &ServiceContext,
+        events: impl IntoIterator<Item = InlineKeyboardEvent>,
+    ) {
+        let frontend = context.applet_frontend();
+        let replies = InlineKeyboardReplies(Arc::downgrade(self));
+        for event in events {
+            frontend.inline_keyboard(event, &replies);
+        }
+    }
+
+    /// Queues the frontend's inline keyboard reply, unless the keyboard is closed.
+    pub(super) fn inline_reply(&self, reply: InlineKeyboardReply) {
+        let mut state = self.state.lock();
+        let Some(keyboard) = state.inline.as_mut() else {
+            return;
+        };
+        for data in keyboard.reply(reply) {
+            state
+                .interactive_out
+                .push(Arc::new(StorageData::new(data, None)));
+        }
     }
 }
 
@@ -284,7 +334,7 @@ impl Service for LibraryAppletAccessor {
                 ResultCode::SUCCESS
             }
             20 | 25 => {
-                applet.exit(&mut applet.state.lock());
+                applet.terminate(&self.context);
                 ResultCode::SUCCESS
             }
             30 | 50 | 60 => ResultCode::SUCCESS,
@@ -480,14 +530,7 @@ fn keyboard_config(version: u32, config: &[u8], work: &[u8]) -> Option<KeyboardC
         }
     };
     let flag = |offset: usize| config.get(offset).is_some_and(|&byte| byte != 0);
-    let max_length = match u32_at(config, 0x3ac) {
-        length @ 1..=KEYBOARD_MAX_LENGTH => length,
-        _ => KEYBOARD_MAX_LENGTH,
-    };
-    let min_length = match u32_at(config, 0x3b0) {
-        length if length <= max_length => length,
-        _ => 0,
-    };
+    let (max_length, min_length) = text_lengths(u32_at(config, 0x3ac), u32_at(config, 0x3b0));
     let initial_offset = u32_at(config, layout.initial_offset) as usize;
     let initial_length = u32_at(config, layout.initial_offset + 4) as usize;
     Some(KeyboardConfig {
@@ -507,6 +550,16 @@ fn keyboard_config(version: u32, config: &[u8], work: &[u8]) -> Option<KeyboardC
         utf8: version == KEYBOARD_UTF8_VERSION || flag(layout.utf8),
         text_check: flag(layout.text_check),
     })
+}
+
+/// A keyboard's maximum and minimum text length: the maximum is 1 to 500, else 500, and a
+/// minimum above it is 0.
+fn text_lengths(max: u32, min: u32) -> (u32, u32) {
+    let max = match max {
+        length @ 1..=KEYBOARD_MAX_LENGTH => length,
+        _ => KEYBOARD_MAX_LENGTH,
+    };
+    (max, if min <= max { min } else { 0 })
 }
 
 fn keyboard_step(frontend: &dyn AppletFrontend, config: KeyboardConfig) -> Step {
@@ -579,11 +632,6 @@ fn text_check_request(text: &str, utf8: bool) -> Vec<u8> {
     let terminator = if utf8 { 1 } else { 2 };
     out[..8].copy_from_slice(&((written + terminator) as u64).to_le_bytes());
     out
-}
-
-/// An inline keyboard reply: `SwkbdState` and `SwkbdReplyType`.
-fn inline_reply(state: u32, reply: u32) -> Vec<u8> {
-    [state.to_le_bytes(), reply.to_le_bytes()].concat()
 }
 
 /// Writes `text` NUL-terminated into `buffer`, truncated to fit; returns the bytes written.
