@@ -9,6 +9,8 @@
 //! The channel waits for each decode, but at most [`DECODE_TIMEOUT`]: a decode that has not
 //! finished by then leaves the channel's later jobs completing without decoding, as they do
 //! without FFmpeg, so a decoder that never returns cannot hold the title's video waits forever.
+//! Its pictures are dropped and whatever it still decodes is not kept, since the guest may reuse
+//! a surface as soon as the job completes.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -238,6 +240,8 @@ pub(super) struct Nvdec {
     regs: Box<NvdecRegisters>,
     /// `None` without FFmpeg: jobs complete without decoding.
     worker: Option<DecodeWorker>,
+    frames: Arc<DecodedFrames>,
+    channel: u64,
 }
 
 impl Nvdec {
@@ -248,7 +252,7 @@ impl Nvdec {
                 builder: None,
                 backend: Backend::Closed,
                 memory,
-                frames,
+                frames: frames.clone(),
                 channel,
                 packets: [Packet::default(); IN_FLIGHT],
                 next_pts: 0,
@@ -259,6 +263,8 @@ impl Nvdec {
         Self {
             regs: Box::default(),
             worker,
+            frames,
+            channel,
         }
     }
 
@@ -273,6 +279,7 @@ impl Nvdec {
             && !worker.decode(&self.regs)
         {
             self.worker = None;
+            self.frames.revoke(self.channel);
         }
         true
     }
