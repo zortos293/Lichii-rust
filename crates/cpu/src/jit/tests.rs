@@ -1665,3 +1665,38 @@ fn fp_selects_consume_fused_compares() {
         }
     }
 }
+
+fn crc(castagnoli: bool, size: u32, rd: u32, rn: u32, rm: u32) -> u32 {
+    let sf = if size == 3 { 0x8000_0000 } else { 0 };
+    sf | 0x1ac0_4000 | rm << 16 | u32::from(castagnoli) << 12 | size << 10 | rn << 5 | rd
+}
+
+#[test]
+fn crc32_matches_the_interpreter() {
+    assert_eq!(crc(false, 0, 2, 2, 3), 0x1ac3_4042);
+    assert_eq!(crc(true, 3, 2, 2, 3), 0x9ac3_5c42);
+    let code = [
+        crc(false, 0, 2, 2, 3),
+        crc(true, 1, 4, 4, 3),
+        crc(false, 2, 5, 2, 6),
+        crc(true, 3, 7, 5, 3),
+        crc(false, 3, 8, 8, 9),
+        crc(true, 0, 10, 4, 9),
+        crc(false, 1, 11, 11, 6),
+        crc(true, 2, 12, 7, 12),
+        crc(false, 3, 3, 3, 3),
+        crc(true, 2, 31, 9, 31),
+        0xd29b_ddcd,
+        crc(false, 3, 14, 14, 13),
+        crc(true, 3, 15, 15, 13),
+        0x528b_4b50,
+        crc(false, 0, 17, 16, 3),
+        crc(true, 1, 18, 16, 6),
+        crc(false, 2, 19, 16, 13),
+    ];
+    let mut rng = Rng(0x0c3c_3200_1eed_c0de);
+    for _ in 0..300 {
+        let regs: Vec<(usize, u64)> = (0..20).map(|r| (r, rng.interesting())).collect();
+        directed(&code, &regs);
+    }
+}

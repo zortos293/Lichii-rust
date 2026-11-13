@@ -32,9 +32,10 @@ use crate::stream::{FetchSyncs, Link, MIN_RING_SLOTS, Stream};
 pub const DEFAULT_RING_SLOTS: usize = 1 << 20;
 /// How long the front first sleeps while every channel with work waits, doubling up to
 /// [`MAX_POLL`]. A semaphore write that meets a waiter, a syncpoint increment or [`Gpu::wake`]
-/// ends the sleep at once; the poll only catches memory the guest CPU wrote.
-const MIN_POLL: Duration = Duration::from_micros(50);
-const MAX_POLL: Duration = Duration::from_millis(1);
+/// ends the sleep at once; the poll only catches memory the guest CPU wrote. An idle back polls
+/// the renderer's pending fences at the same pace.
+pub(crate) const MIN_POLL: Duration = Duration::from_micros(50);
+pub(crate) const MAX_POLL: Duration = Duration::from_millis(1);
 
 /// Where the back half runs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -218,9 +219,10 @@ impl Front {
         let _closed = Closed(&inbox);
         let mut batch = VecDeque::new();
         let mut poll = MIN_POLL;
+        let mut fences = false;
         loop {
             let waiting = self.channels.iter().flatten().any(FrontChannel::is_waiting);
-            let closed = inbox.take(&mut batch, waiting.then_some(poll));
+            let closed = inbox.take(&mut batch, (waiting || fences).then_some(poll));
             let busy = !batch.is_empty();
             self.held.append(&mut batch);
             self.handle_held();
@@ -228,14 +230,14 @@ impl Front {
             if resumed {
                 self.handle_held();
             }
-            self.shared.stream.idle();
+            fences = self.shared.stream.idle();
             if closed {
                 break;
             }
             if busy || resumed {
                 poll = MIN_POLL;
-            } else if waiting {
-                if poll == MAX_POLL {
+            } else if waiting || fences {
+                if waiting && poll == MAX_POLL {
                     self.shared.stream.release_fences();
                 }
                 poll = (poll * 2).min(MAX_POLL);

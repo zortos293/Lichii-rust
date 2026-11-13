@@ -475,6 +475,7 @@ alu_class!(data_processing_2, "x0011010110xxxxxxxxxxxxxxxxxxxxx", |w| {
     !matches!((w >> 10) & 0x3f, 4 | 5 | 12)
 });
 alu_class!(data_processing_3, "xxx11011xxxxxxxxxxxxxxxxxxxxxxxx");
+alu_class!(crc32, "x0011010110xxxxx010xxxxxxxxxxxxx");
 
 #[test]
 fn flags() {

@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
+use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
@@ -42,26 +43,46 @@ impl Signal {
 
     /// Returns once `ready` holds. `ready` must read with acquire ordering what the notifier
     /// stores before [`Signal::notify`].
-    pub(crate) fn wait_until(&self, mut ready: impl FnMut() -> bool) {
+    pub(crate) fn wait_until(&self, ready: impl FnMut() -> bool) {
+        self.wait_until_deadline(ready, None);
+    }
+
+    /// Like [`Signal::wait_until`], but gives up at `deadline`. Whether `ready` held.
+    fn wait_until_deadline(
+        &self,
+        mut ready: impl FnMut() -> bool,
+        deadline: Option<Instant>,
+    ) -> bool {
         for _ in 0..SPINS {
             if ready() {
-                return;
+                return true;
             }
             std::hint::spin_loop();
         }
         for _ in 0..YIELDS {
             if ready() {
-                return;
+                return true;
             }
             std::thread::yield_now();
         }
         let mut guard = self.lock.lock();
         self.sleeping.store(true, Ordering::Relaxed);
         fence(Ordering::SeqCst);
-        while !ready() {
-            self.cond.wait(&mut guard);
-        }
+        let met = loop {
+            if ready() {
+                break true;
+            }
+            match deadline {
+                None => self.cond.wait(&mut guard),
+                Some(deadline) => {
+                    if self.cond.wait_until(&mut guard, deadline).timed_out() {
+                        break ready();
+                    }
+                }
+            }
+        };
         self.sleeping.store(false, Ordering::Relaxed);
+        met
     }
 
     /// Wakes the waiter if it sleeps. Call it after storing what its condition reads.
@@ -281,14 +302,30 @@ impl Consumer {
     /// Sleeps until more is published or the producer closed the ring; false once it is closed
     /// and everything was read.
     pub(crate) fn wait_more(&mut self) -> bool {
+        self.wait_more_until(None)
+            .expect("a wait without a deadline returns once there is more")
+    }
+
+    /// Like [`Consumer::wait_more`], but gives up after `timeout` and returns `None`.
+    pub(crate) fn wait_more_for(&mut self, timeout: Duration) -> Option<bool> {
+        self.wait_more_until(Some(Instant::now() + timeout))
+    }
+
+    fn wait_more_until(&mut self, deadline: Option<Instant>) -> Option<bool> {
         let shared = &*self.shared;
         let read = self.read;
-        shared.more.wait_until(|| {
-            shared.published.0.load(Ordering::Acquire) != read
-                || shared.closed.load(Ordering::Acquire)
-        });
+        let more = shared.more.wait_until_deadline(
+            || {
+                shared.published.0.load(Ordering::Acquire) != read
+                    || shared.closed.load(Ordering::Acquire)
+            },
+            deadline,
+        );
+        if !more {
+            return None;
+        }
         let closed = shared.closed.load(Ordering::Acquire);
-        self.refill() || !closed
+        Some(self.refill() || !closed)
     }
 
     /// A guard that marks the consumer gone when dropped (its thread ended or panicked), so a
@@ -366,6 +403,20 @@ mod tests {
         assert_eq!(out, expected);
         assert_eq!(producer.position(), 16 + 6);
         assert!(producer.consumed(22));
+    }
+
+    #[test]
+    fn a_timed_wait_for_more_gives_up_or_sees_the_next_record() {
+        let (mut producer, mut consumer) = ring(16, 16);
+        assert_eq!(consumer.wait_more_for(Duration::from_millis(5)), None);
+        assert!(push(&mut producer, &[1 << 32 | 7]));
+        producer.publish();
+        assert_eq!(consumer.wait_more_for(Duration::from_secs(5)), Some(true));
+        let mut out = Vec::new();
+        read_all(&mut consumer, &mut out);
+        assert_eq!(out, [1 << 32 | 7]);
+        producer.close();
+        assert_eq!(consumer.wait_more_for(Duration::from_secs(5)), Some(false));
     }
 
     #[test]

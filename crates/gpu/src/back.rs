@@ -15,6 +15,7 @@ use crate::clock::GpuTimestamp;
 use crate::engines::kepler_compute::pcas::QmdScheduler;
 use crate::engines::{Engine, EngineContext, EngineFactory, EngineKind};
 use crate::gmmu::{Gmmu, RangeTarget};
+use crate::gpu::{MAX_POLL, MIN_POLL};
 use crate::host1x::Syncpoints;
 use crate::ring::{Consumer, WRAP};
 use crate::stream::{FetchSyncs, MULTI_MAX_WORDS, REDUCTIONS, RELEASE_SIZES, tag};
@@ -115,12 +116,32 @@ impl Back {
     /// The back thread: runs until the front closes the stream.
     pub(crate) fn run_thread(mut self, mut consumer: Consumer) {
         let _liveness = consumer.liveness();
+        let mut poll = MIN_POLL;
         loop {
             self.run(&mut consumer);
-            if !consumer.wait_more() {
-                break;
+            let more = if self.poll_fences() {
+                consumer.wait_more_for(poll)
+            } else {
+                Some(consumer.wait_more())
+            };
+            match more {
+                Some(true) => poll = MIN_POLL,
+                Some(false) => break,
+                None => poll = (poll * 2).min(MAX_POLL),
             }
         }
+    }
+
+    /// The stream is empty: submits the recorded host GPU work and runs the actions of fences
+    /// whose work finished, so that a syncpoint or semaphore the guest CPU waits on lands without
+    /// more GPU work behind it. Whether fences are still pending, and the back should look again.
+    pub(crate) fn poll_fences(&mut self) -> bool {
+        if !self.rasterizer.has_pending_fences() {
+            return false;
+        }
+        self.rasterizer.flush_commands();
+        self.rasterizer.release_fences(false);
+        self.rasterizer.has_pending_fences()
     }
 
     /// Executes the record whose header is `header`; returns its length in slots.
