@@ -1,7 +1,8 @@
 //! What services share: the kernel, settings, the title, the GPU, input and the audio sink.
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use lichii_audio::sink::Sink;
@@ -10,6 +11,7 @@ use lichii_common::perf::PerfStats;
 use lichii_common::settings::Settings;
 use lichii_fs::ContentIndex;
 use lichii_gpu::Gpu;
+use lichii_gpu::backend::FramebufferConfig;
 use lichii_gpu::host1x::{SyncpointBank, SyncpointWaitError};
 use lichii_input::NpadHub;
 use lichii_kernel::Kernel;
@@ -214,6 +216,52 @@ pub(crate) fn wait_guest_syncpoint(
                 if !kernel.is_shutting_down()
                     && deadline.is_none_or(|deadline| Instant::now() < deadline) => {}
             result => return result,
+        }
+    }
+}
+
+/// Presents `framebuffer` once the guest reached every fence `(syncpoint, value)`, on whichever thread
+/// increments the last one, as the reference's composite does: the caller never waits for the
+/// GPU. A fence on an invalid syncpoint counts as reached.
+pub(crate) fn present_when_reached(
+    gpu: &Arc<Gpu>,
+    fences: impl IntoIterator<Item = (u32, u32)>,
+    framebuffer: FramebufferConfig,
+) {
+    let pending = Arc::new(PendingPresent {
+        left: AtomicUsize::new(1),
+        framebuffer: Mutex::new(Some(framebuffer)),
+        gpu: Arc::downgrade(gpu),
+    });
+    let bank = gpu.host1x().syncpoints.guest();
+    for (id, value) in fences {
+        pending.left.fetch_add(1, Ordering::AcqRel);
+        let waiter = pending.clone();
+        if bank
+            .register_action(id, value, move || waiter.arrive())
+            .is_err()
+        {
+            pending.arrive();
+        }
+    }
+    pending.arrive();
+}
+
+/// A frame waiting for its fences: the last fence to arrive presents it.
+struct PendingPresent {
+    left: AtomicUsize,
+    framebuffer: Mutex<Option<FramebufferConfig>>,
+    gpu: Weak<Gpu>,
+}
+
+impl PendingPresent {
+    fn arrive(&self) {
+        if self.left.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        if let (Some(framebuffer), Some(gpu)) = (self.framebuffer.lock().take(), self.gpu.upgrade())
+        {
+            gpu.present(framebuffer);
         }
     }
 }

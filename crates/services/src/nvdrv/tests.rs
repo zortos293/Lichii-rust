@@ -1130,6 +1130,57 @@ fn flips_present_pinned_nvmap_buffers() {
 }
 
 #[test]
+fn a_flip_waits_for_its_acquire_fence_on_the_syncpoint_not_in_the_caller() {
+    use lichii_gpu::backend::FramebufferConfig;
+    use lichii_texture::PixelFormat;
+    use lichii_texture::block_linear::GobLayout;
+
+    let nv = Nv::new(SWITCH1_TITLE, "nvdrv");
+    let nvmap = nv.open("/dev/nvmap");
+    let (handle, _) = nv.nvmap_buffer(nvmap, &[0; 0x4000], 0x1000);
+    let as_fd = nv.address_space();
+    nv.map(as_fd, handle);
+    let framebuffer = FramebufferConfig {
+        address: 0,
+        width: 64,
+        height: 64,
+        stride: 256,
+        format: PixelFormat::ALL[0],
+        block_height_log2: None,
+        gob_layout: GobLayout::Tegra,
+        flip_vertical: false,
+        crop: None,
+    };
+    let guest = nv.syncpoints().guest();
+    let syncpoint = 30;
+    let fence = NvFence {
+        id: syncpoint as i32,
+        value: guest.value(syncpoint).unwrap() + 1,
+    };
+    let started = std::time::Instant::now();
+    assert_eq!(
+        nv.nvdrv.flip(handle, 0, framebuffer, &[fence]),
+        NvResult::Success
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(100),
+        "the flip returned after {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        guest.next_action_threshold(syncpoint),
+        Ok(Some(fence.value)),
+        "the present waits on the syncpoint"
+    );
+    guest.increment(syncpoint).unwrap();
+    assert_eq!(
+        guest.next_action_threshold(syncpoint),
+        Ok(None),
+        "reaching the fence presents the frame"
+    );
+}
+
+#[test]
 fn buffers_vi_holds_survive_the_guest_freeing_them() {
     let nv = Nv::new(SWITCH1_TITLE, "nvdrv");
     let nvmap = nv.open("/dev/nvmap");

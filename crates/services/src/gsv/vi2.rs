@@ -249,21 +249,11 @@ impl Vi2 {
 
     /// Presents native image `handle` once `fence`, this frame's, is reached: the frame's GPU
     /// work may still wait on a semaphore the title releases after the present returns.
-    fn composite(&self, handle: u32, drawn: u32, (id, value): (u32, u32)) {
+    fn composite(&self, handle: u32, drawn: u32, fence: (u32, u32)) {
         let Some(framebuffer) = self.framebuffer(handle, drawn) else {
             return;
         };
-        let guest = self.context.gpu.host1x().syncpoints.guest();
-        if guest.value(id).is_err() {
-            self.context.gpu.present(framebuffer);
-            return;
-        }
-        let gpu: Weak<Gpu> = Arc::downgrade(&self.context.gpu);
-        let _ = guest.register_action(id, value, move || {
-            if let Some(gpu) = gpu.upgrade() {
-                gpu.present(framebuffer);
-            }
-        });
+        crate::context::present_when_reached(&self.context.gpu, [fence], framebuffer);
     }
 
     /// How native image `handle` is shown. `drawn` is ((height - 1) << 16) | (width - 1) of the
