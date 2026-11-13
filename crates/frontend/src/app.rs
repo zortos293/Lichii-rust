@@ -752,7 +752,7 @@ Dump prod.keys and title.keys \
             HotkeyAction::LoadFile => {
                 if let Some(path) = rfd::FileDialog::new()
                     .set_title("Load file")
-                    .add_filter("Switch titles", &["nsp", "xci", "nca", "nro", "nso"])
+                    .add_filter("Switch titles", &["nsp", "xci", "nca", "nup", "nro", "nso"])
                     .add_filter("All files", &["*"])
                     .pick_file()
                 {
