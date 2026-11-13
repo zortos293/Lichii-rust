@@ -1518,7 +1518,10 @@ impl VulkanRasterizer {
         let Some((id, view)) = self.texture_info(src, raw, ty)? else {
             return Ok(None);
         };
-        Ok(self.texture_cache.view(id, &view)?.map(|raw| (id, raw)))
+        Ok(self
+            .texture_cache
+            .sampled_view(id, &view)?
+            .map(|raw| (id, raw)))
     }
 
     /// The image the texture header `raw` selects and the view of it `ty` reads; `None` when

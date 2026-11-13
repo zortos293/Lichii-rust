@@ -1119,3 +1119,18 @@ fn collector_work_per_frame_is_bounded() {
     assert_eq!(f.cache.len(), 0);
     f.assert_no_validation_errors();
 }
+
+#[test]
+fn depth_and_stencil_views_read_green_as_red() {
+    use SwizzleSource::{A, B, G, OneFloat, R, Zero};
+    let shadow = [G, Zero, Zero, OneFloat];
+    for aspect in [
+        vk::ImageAspectFlags::DEPTH,
+        vk::ImageAspectFlags::STENCIL,
+        vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
+    ] {
+        assert_eq!(sampled_swizzle(shadow, aspect), [R, Zero, Zero, OneFloat]);
+        assert_eq!(sampled_swizzle([R, G, B, A], aspect), [R, R, B, A]);
+    }
+    assert_eq!(sampled_swizzle(shadow, vk::ImageAspectFlags::COLOR), shadow);
+}
