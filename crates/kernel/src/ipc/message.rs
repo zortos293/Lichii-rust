@@ -36,6 +36,8 @@ pub(crate) struct Request {
     pub c: Vec<BufferDescriptor>,
     /// Domain header of a CMIF request to a domain: command and object id.
     pub domain: Option<(DomainCommand, u32)>,
+    /// Domain object ids the request passes as input objects (after its data).
+    pub input_objects: Vec<u32>,
     pub command: u32,
     /// Input data after the CMIF header (or the TIPC header), in bytes of the message.
     pub payload: Range<usize>,
@@ -54,6 +56,7 @@ impl Default for Request {
             w: Vec::new(),
             c: Vec::new(),
             domain: None,
+            input_objects: Vec::new(),
             command: 0,
             payload: 0..0,
         }
@@ -167,7 +170,12 @@ impl Request {
             if command == DomainCommand::CloseVirtualHandle {
                 return Ok(());
             }
-            end = end.min(j * 4 + (header >> 16) as usize);
+            let data_end = j * 4 + (header >> 16) as usize;
+            let ids = data_end.div_ceil(4);
+            for i in 0..((header >> 8) & 0xff) as usize {
+                self.input_objects.push(word(ids + i)?);
+            }
+            end = end.min(data_end);
         }
         if word(j)? != SFCI {
             return Err(result::INVALID_COMBINATION);
@@ -195,6 +203,7 @@ impl Request {
             list.clear();
         }
         self.domain = None;
+        self.input_objects.clear();
         self.command = 0;
         self.payload = 0..0;
     }
@@ -355,11 +364,13 @@ mod tests {
             0,
             1,
             2,
+            7,
         ];
         words[1] = (words.len() - 2) as u32;
         let mut request = Request::default();
         request.parse(&words, true).unwrap();
         assert_eq!(request.domain, Some((DomainCommand::SendMessage, 5)));
+        assert_eq!(request.input_objects, [7]);
         assert_eq!(request.command, 9);
         assert_eq!(request.payload, 48..56);
 
