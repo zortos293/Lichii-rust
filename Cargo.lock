@@ -1508,6 +1508,7 @@ dependencies = [
  "image",
  "lichii-common",
  "lichii-core",
+ "lichii-cpu",
  "lichii-crypto",
  "lichii-fs",
  "lichii-input",

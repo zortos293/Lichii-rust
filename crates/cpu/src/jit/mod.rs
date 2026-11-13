@@ -8,13 +8,16 @@
 mod cache;
 mod ir;
 mod passes;
+pub(crate) mod profile;
 mod simd;
 #[cfg(test)]
 mod tests;
 mod translate;
 mod x64;
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Instant;
 
 use lichii_common::settings::CpuAccuracy;
 use lichii_common::{PAGE_MASK, VAddr};
@@ -23,8 +26,9 @@ use lichii_memory::{AddressSpace, ExclusiveMonitor, MemoryPermission, Reservatio
 use self::cache::{Code, Entry, JitCache};
 use self::ir::{Block, Cmp, Terminal};
 pub(crate) use self::passes::Passes;
+use self::profile::{Flush, Profile};
 use self::translate::{Step, Translator};
-use self::x64::{EXIT_FAULT, SPILL_SLOTS, Target};
+use self::x64::{EXIT_FAULT, EXIT_INTERRUPT, SPILL_SLOTS, Target};
 use crate::decoder::{AtomicOp, decode};
 use crate::interpreter::{Exit, Interpreter, atomic_cas, atomic_rmw, cas128};
 use crate::{CpuConfig, CpuCore, CpuFault, GuestClock, HaltReason, InterruptHandle, ThreadContext};
@@ -62,6 +66,9 @@ pub(super) struct JitState {
     lazy_b: u64,
     /// `x64::materialize_stub` in the code cache.
     materialize: usize,
+    /// Lazy NZCV write-backs the native stub made, counted only while profiling.
+    materialized: u64,
+    profile: Option<Box<Profile>>,
 }
 
 // SAFETY: `memory`, `clock` and `interrupt` point into `Arc`s the owning `Jit` keeps, and all
@@ -69,6 +76,14 @@ pub(super) struct JitState {
 unsafe impl Send for JitState {}
 
 impl JitState {
+    /// This core's counts since it last sent them, with the native stub's write-backs moved in.
+    fn profile_counts(&mut self) -> Option<&mut Profile> {
+        let native = std::mem::take(&mut self.materialized);
+        let p = self.profile.as_deref_mut()?;
+        p.materialized(native, 0);
+        Some(p)
+    }
+
     /// Packs NZCV a block left lazy into `ctx`, so the context is exact outside translated code.
     fn materialize_nzcv(&mut self, ctx: &mut ThreadContext) {
         let code = std::mem::take(&mut self.lazy_nzcv);
@@ -76,6 +91,9 @@ impl JitState {
             let (kind, w) = Cmp::from_lazy_code(code);
             let nzcv = passes::flags_of(kind, w, self.lazy_a, self.lazy_b) as u32;
             ctx.pstate = ctx.pstate & 0x0fff_ffff | nzcv << 28;
+            if let Some(p) = self.profile.as_deref_mut() {
+                p.materialized(0, 1);
+            }
         }
     }
 
@@ -260,6 +278,10 @@ pub struct Jit {
     target: Target,
     arena: *mut u8,
     passes: Passes,
+    /// When this core last sent its profile towards the process-wide total.
+    flushed: Instant,
+    /// Set while the profile this core sent last waits to be merged.
+    queued: Arc<AtomicBool>,
 }
 
 // SAFETY: `arena` is the base of the fastmem arena owned by `config.memory`, which is `Sync`; the
@@ -276,7 +298,11 @@ impl Jit {
     }
 
     pub(crate) fn with_passes(config: CpuConfig, passes: Passes) -> Option<Self> {
-        let cache = JitCache::new()?;
+        Self::build(config, passes, profile::enabled())
+    }
+
+    fn build(config: CpuConfig, passes: Passes, profile: bool) -> Option<Self> {
+        let cache = JitCache::new(profile)?;
         let interrupt = InterruptHandle::default();
         let fastmem = config.memory.fastmem().filter(|_| {
             if !cache.handles_faults() {
@@ -308,7 +334,23 @@ impl Jit {
             lazy_a: 0,
             lazy_b: 0,
             materialize: cache.materialize(),
+            materialized: 0,
+            profile: profile.then(Box::default),
         });
+        if profile {
+            profile::register();
+        }
+        let (simd, simd_slow) = if profile {
+            (
+                simd::call_profiled as *const () as usize,
+                simd::slow_profiled as *const () as usize,
+            )
+        } else {
+            (
+                simd::call as *const () as usize,
+                simd::call as *const () as usize,
+            )
+        };
         Some(Self {
             target: Target {
                 arena_size: fastmem.map(|f| f.size() as u64),
@@ -318,7 +360,8 @@ impl Jit {
                 exclusive: exclusive_slow as *const () as usize,
                 zero: zero_slow as *const () as usize,
                 ticks: ticks as *const () as usize,
-                simd: simd::call as *const () as usize,
+                simd,
+                simd_slow,
                 tsc_scale: config.clock.host_tsc_scale().map(std::ptr::from_ref),
                 cmpxchg16b: std::arch::is_x86_feature_detected!("cmpxchg16b"),
                 fma: std::arch::is_x86_feature_detected!("fma"),
@@ -331,6 +374,8 @@ impl Jit {
             cache,
             state,
             passes,
+            flushed: Instant::now(),
+            queued: Arc::default(),
         })
     }
 
@@ -338,6 +383,7 @@ impl Jit {
         if start & 3 != 0 {
             return Err(CpuFault::Prefetch { pc: start });
         }
+        let started = self.state.profile.is_some().then(Instant::now);
         let mut t = Translator {
             block: Block {
                 ops: Vec::new(),
@@ -364,7 +410,11 @@ impl Jit {
                     break;
                 }
                 Step::Rejected if pc == start => {
-                    return Ok(self.cache.insert(start, 4, Err(inst)));
+                    let entry = self.cache.insert(start, 4, Err(inst));
+                    if let (Some(p), Some(started)) = (self.state.profile.as_deref_mut(), started) {
+                        p.translated(started.elapsed(), 0, 0);
+                    }
+                    return Ok(entry);
                 }
                 Step::Rejected => {
                     t.block.ops.truncate(mark);
@@ -383,7 +433,22 @@ impl Jit {
         let len = pc + 4 - start;
         self.passes.run(&mut block);
         let compiled = x64::compile(&block, start, &self.target);
-        Ok(self.cache.insert(start, len, Ok(compiled)))
+        let code_bytes = compiled.code.len();
+        let generation = self.cache.generation();
+        let entry = self.cache.insert(start, len, Ok(compiled));
+        if let (Some(p), Some(started)) = (self.state.profile.as_deref_mut(), started) {
+            p.translated(started.elapsed(), len / 4, code_bytes);
+            if self.cache.generation() != generation {
+                p.flush(Flush::Full);
+            }
+        }
+        Ok(entry)
+    }
+
+    fn count_flush(&mut self, flush: Flush) {
+        if let Some(p) = self.state.profile.as_deref_mut() {
+            p.flush(flush);
+        }
     }
 
     fn apply(&mut self, exit: Exit) -> Option<HaltReason> {
@@ -391,10 +456,12 @@ impl Jit {
             Exit::Continue => None,
             Exit::Halt(halt) => Some(halt),
             Exit::Invalidate(addr, size) => {
+                self.count_flush(Flush::Invalidate);
                 self.cache.invalidate(addr, size);
                 Some(HaltReason::InvalidateCode { addr, size })
             }
             Exit::InvalidateAll => {
+                self.count_flush(Flush::Clear);
                 self.cache.clear();
                 Some(HaltReason::InvalidateCode {
                     addr: 0,
@@ -403,10 +470,8 @@ impl Jit {
             }
         }
     }
-}
 
-impl CpuCore for Jit {
-    fn run(&mut self, ctx: &mut ThreadContext) -> HaltReason {
+    fn dispatch(&mut self, ctx: &mut ThreadContext) -> HaltReason {
         let _fp = simd::HostFp::enter();
         loop {
             let link = std::mem::take(&mut self.state.link);
@@ -424,6 +489,9 @@ impl CpuCore for Jit {
             let code = match entry.code {
                 Code::Native(code) => code,
                 Code::Interpret(inst) => {
+                    if let Some(p) = self.state.profile.as_deref_mut() {
+                        p.fallback(&inst);
+                    }
                     let exit = Interpreter::execute(&self.config, ctx, &[inst]);
                     if let Some(halt) = self.apply(exit) {
                         return halt;
@@ -440,6 +508,15 @@ impl CpuCore for Jit {
             // `ctx`, the state, and the arena behind the bounds check.
             let exit = unsafe { enter(ctx, &mut *self.state, self.arena, code) };
             self.state.materialize_nzcv(ctx);
+            let state = &mut *self.state;
+            if let Some(p) = state.profile.as_deref_mut() {
+                p.exit(match exit {
+                    EXIT_FAULT => profile::Exit::Fault,
+                    EXIT_INTERRUPT => profile::Exit::Interrupt,
+                    _ if state.link != 0 => profile::Exit::Unlinked,
+                    _ => profile::Exit::IndirectMiss,
+                });
+            }
             if exit == EXIT_FAULT {
                 let fault = self
                     .state
@@ -455,6 +532,19 @@ impl CpuCore for Jit {
                 return HaltReason::Fault(fault);
             }
         }
+    }
+}
+
+impl CpuCore for Jit {
+    fn run(&mut self, ctx: &mut ThreadContext) -> HaltReason {
+        let halt = self.dispatch(ctx);
+        if self.state.profile.is_some() && self.flushed.elapsed() >= profile::FLUSH_INTERVAL {
+            self.flushed = Instant::now();
+            if let Some(p) = self.state.profile_counts() {
+                profile::send(&self.queued, p);
+            }
+        }
+        halt
     }
 
     fn step(&mut self, ctx: &mut ThreadContext) -> HaltReason {
@@ -472,14 +562,24 @@ impl CpuCore for Jit {
     }
 
     fn invalidate_code(&mut self, addr: VAddr, size: u64) {
+        self.count_flush(Flush::Invalidate);
         self.cache.invalidate(addr, size);
     }
 
     fn clear_code_cache(&mut self) {
+        self.count_flush(Flush::Clear);
         self.cache.clear();
     }
 
     fn clear_exclusive(&mut self) {
         self.config.monitor.clear(self.config.core_index);
+    }
+}
+
+impl Drop for Jit {
+    fn drop(&mut self) {
+        if let Some(p) = self.state.profile_counts() {
+            profile::retire(std::mem::take(p));
+        }
     }
 }
