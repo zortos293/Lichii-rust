@@ -21,24 +21,26 @@ use self::ir::{Block, Terminal};
 pub(crate) use self::passes::Passes;
 use self::translate::{Step, Translator};
 use self::x64::{EXIT_CONTINUE, EXIT_FAULT, SPILL_SLOTS, Target};
-use crate::decoder::decode;
-use crate::interpreter::{Exit, Interpreter};
-use crate::{CpuConfig, CpuCore, CpuFault, HaltReason, InterruptHandle, ThreadContext};
+use crate::decoder::{AtomicOp, decode};
+use crate::interpreter::{Exit, Interpreter, atomic_cas, atomic_rmw};
+use crate::{CpuConfig, CpuCore, CpuFault, GuestClock, HaltReason, InterruptHandle, ThreadContext};
 
 /// Runtime state translated code reaches through `r13`.
 #[repr(C, align(16))]
 pub(super) struct JitState {
     /// Values passed between slow paths and their helpers.
     scratch: u128,
+    scratch2: u128,
     save_xmm: [u128; 16],
     save_gpr: [u64; 16],
     spill: [u128; SPILL_SLOTS],
     memory: *const AddressSpace,
+    clock: *const dyn GuestClock,
     fault: Option<CpuFault>,
 }
 
-// SAFETY: `memory` points into the `Arc<AddressSpace>` the owning `Jit` keeps in its config, and
-// `AddressSpace` is `Sync`.
+// SAFETY: `memory` and `clock` point into the `Arc`s the owning `Jit` keeps in its config, and
+// both are `Sync`.
 unsafe impl Send for JitState {}
 
 impl JitState {
@@ -74,6 +76,72 @@ extern "sysv64" fn read_slow(state: &mut JitState, addr: u64, pc: u64, size: u32
             true
         }
     }
+}
+
+/// `AtomicOp` by discriminant, as `x64` encodes it in a slow path's `info`.
+const ATOMIC_OPS: [AtomicOp; 9] = [
+    AtomicOp::Add,
+    AtomicOp::Clr,
+    AtomicOp::Eor,
+    AtomicOp::Set,
+    AtomicOp::Smax,
+    AtomicOp::Smin,
+    AtomicOp::Umax,
+    AtomicOp::Umin,
+    AtomicOp::Swp,
+];
+
+/// `LD<op>`, `SWP` and `CAS` as the interpreter runs them: `info` holds the size in bits 7..0
+/// and the operation above it; the operands are in `scratch` and `scratch2`.
+extern "sysv64" fn atomic_slow(state: &mut JitState, addr: u64, pc: u64, info: u32) -> bool {
+    let size = info as u8;
+    if addr & ((1 << size) - 1) != 0 {
+        state.fault = Some(CpuFault::Alignment { pc, addr });
+        return true;
+    }
+    // SAFETY: called from a slow path.
+    let Some((ptr, _)) = unsafe { state.memory() }.translate(addr) else {
+        state.fault = Some(CpuFault::Data {
+            pc,
+            addr,
+            write: true,
+        });
+        return true;
+    };
+    let (operand, second) = (state.scratch as u64, state.scratch2 as u64);
+    let op = (info >> 8) as i32;
+    // SAFETY: the access is naturally aligned, so it stays inside the one mapped guest page that
+    // `translate` returned.
+    let old = unsafe {
+        if op == x64::ATOMIC_CAS {
+            atomic_cas(ptr, size, operand, second)
+        } else {
+            atomic_rmw(ptr, size, ATOMIC_OPS[op as usize], operand)
+        }
+    };
+    state.scratch = old as u128;
+    false
+}
+
+extern "sysv64" fn zero_slow(state: &mut JitState, addr: u64, pc: u64, _info: u32) -> bool {
+    // SAFETY: called from a slow path.
+    let memory = unsafe { state.memory() };
+    match memory.fill(addr, 64, 0) {
+        Ok(()) => false,
+        Err(f) => {
+            state.fault = Some(CpuFault::Data {
+                pc,
+                addr: f.addr,
+                write: true,
+            });
+            true
+        }
+    }
+}
+
+extern "sysv64" fn ticks(state: &mut JitState) -> u64 {
+    // SAFETY: see the `Send` impl.
+    unsafe { (*state.clock).ticks() }
 }
 
 extern "sysv64" fn write_slow(state: &mut JitState, addr: u64, pc: u64, size: u32) -> bool {
@@ -135,10 +203,12 @@ impl Jit {
         }
         let state = Box::new(JitState {
             scratch: 0,
+            scratch2: 0,
             save_xmm: [0; 16],
             save_gpr: [0; 16],
             spill: [0; SPILL_SLOTS],
             memory: &*config.memory,
+            clock: &*config.clock,
             fault: None,
         });
         Some(Self {
@@ -146,6 +216,9 @@ impl Jit {
                 arena_size: fastmem.map(|f| f.size() as u64),
                 read: read_slow as *const () as usize,
                 write: write_slow as *const () as usize,
+                atomic: atomic_slow as *const () as usize,
+                zero: zero_slow as *const () as usize,
+                ticks: ticks as *const () as usize,
             },
             arena: fastmem.map_or(std::ptr::null_mut(), |f| f.base()),
             config,
@@ -248,9 +321,12 @@ impl CpuCore for Jit {
                             .fault
                             .take()
                             .expect("a slow path recorded the fault");
-                        if let CpuFault::Data { pc, .. } = fault {
-                            ctx.pc = pc;
-                        }
+                        ctx.pc = match fault {
+                            CpuFault::Data { pc, .. }
+                            | CpuFault::Alignment { pc, .. }
+                            | CpuFault::Prefetch { pc }
+                            | CpuFault::Undefined { pc, .. } => pc,
+                        };
                         return HaltReason::Fault(fault);
                     }
                     _ => {}
