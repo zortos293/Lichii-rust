@@ -803,6 +803,19 @@ impl TextureCache {
         Ok(Some(found))
     }
 
+    /// A view a shader samples: [`TextureCache::view`] with the guest swizzle a depth or stencil
+    /// image needs on the host.
+    pub fn sampled_view(&mut self, id: ImageId, view: &ViewInfo) -> Result<Option<vk::ImageView>> {
+        let Some(image) = self.get(id) else {
+            return Ok(None);
+        };
+        let view = ViewInfo {
+            swizzle: sampled_swizzle(view.swizzle, aspect_of(image.host.format)),
+            ..*view
+        };
+        self.view(id, &view)
+    }
+
     /// A view of a cached image. `None` when the image cannot be read as `view.format`.
     pub fn view(&mut self, id: ImageId, view: &ViewInfo) -> Result<Option<vk::ImageView>> {
         if self.get(id).is_none() || !self.view_compatible(id, view.format) {
@@ -815,10 +828,7 @@ impl TextureCache {
         } else {
             host
         };
-        let mapping = components(
-            sampled_swizzle(view.swizzle, aspect_of(image.host.format)),
-            host.swizzle,
-        );
+        let mapping = components(view.swizzle, host.swizzle);
         let aspect = match aspect_of(image.host.format) {
             a if a.contains(vk::ImageAspectFlags::DEPTH) => vk::ImageAspectFlags::DEPTH,
             a => a,
