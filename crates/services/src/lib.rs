@@ -37,6 +37,7 @@
 mod am;
 mod context;
 mod dispatch;
+mod fs;
 mod gsv;
 #[cfg(test)]
 mod testing;
@@ -51,6 +52,7 @@ pub use dispatch::Service;
 /// Registers every HLE service with `sm:`. Call it after the application process exists and
 /// before `Kernel::run`.
 pub fn register_all(context: &Arc<ServiceContext>) -> HleResult<()> {
+    fs::register(context)?;
     am::register(context)?;
     Ok(())
 }
