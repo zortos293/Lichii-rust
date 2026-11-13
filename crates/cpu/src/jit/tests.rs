@@ -173,8 +173,33 @@ fn atomic(rng: &mut Rng) -> u32 {
     }
 }
 
+const FP: [&str; 8] = [
+    "000111100x10000xx10000xxxxxxxxxx",
+    "000111100x1xxxxxxxxx11xxxxxxxxxx",
+    "x00111100x10011x000000xxxxxxxxxx",
+    "x0x11110xx1xxxxxxxxxxxxxxxxxxxxx",
+    "x0x11111xxxxxxxxxxxxxxxxxxxxxxxx",
+    "01x11110xxxxxxxxxxxxxxxxxxxxxxxx",
+    "0xx01110xxxxxxxxxxxxxxxxxxxxxxxx",
+    "1101010100x110110100010000xxxxxx",
+];
+
+/// A defined SIMD/FP data-processing instruction, or an `MRS`/`MSR` of FPCR or FPSR.
 fn simd(rng: &mut Rng) -> u32 {
-    rng.pattern("0x00111x0xxxxxxxxxxxx1xxxxxxxxxx")
+    loop {
+        let class = FP[rng.below(FP.len() as u64) as usize];
+        let w = rng.pattern(class);
+        let defined = match decode(w) {
+            Inst::SimdFp { word } => {
+                crate::interpreter::simd::execute(&mut ThreadContext::default(), word)
+                    == Some(Ok(()))
+            }
+            inst => !matches!(inst, Inst::Undefined { .. }),
+        };
+        if defined {
+            return w;
+        }
+    }
 }
 
 /// A forward branch from `from` to `to` (word indices).
@@ -199,7 +224,7 @@ fn stream(rng: &mut Rng) -> Vec<u32> {
         .map(|i| match kinds[i] {
             0..=7 => alu(rng),
             8..=11 => memory(rng),
-            12 => simd(rng),
+            12 | 15 => simd(rng),
             14 => atomic(rng),
             13 => {
                 let to = i + 1 + rng.below((len - i) as u64) as usize;
@@ -296,6 +321,17 @@ fn initial(rng: &mut Rng) -> ThreadContext {
         pstate: (rng.below(16) as u32) << 28,
         v: std::array::from_fn(|_| (rng.next() as u128) << 64 | rng.next() as u128),
         tpidr_el0: rng.next(),
+        fpcr: [
+            0,
+            0,
+            1 << 24,
+            1 << 25,
+            1 << 19,
+            3 << 22,
+            1 << 22 | 1 << 24,
+            0x07c0_0000,
+        ][rng.below(8) as usize],
+        fpsr: if rng.below(4) == 0 { 0x0800_009f } else { 0 },
         ..Default::default()
     };
     let align = if rng.below(2) == 0 { !15 } else { !0 };
@@ -499,6 +535,41 @@ fn faults_leave_the_interpreters_state() {
             directed(&[MOV_X0_1, access, MOV_X0_2], &[(2, addr)]);
         }
     }
+}
+
+#[test]
+fn simd_runs_mid_block_on_the_live_context() {
+    const FMOV_D0_X1: u32 = 0x9e67_0020;
+    const ADD_X5_X1_1: u32 = 0x9100_0425;
+    const FADD_D1_D0_D0: u32 = 0x1e60_2801;
+    const FCMP_D1_D0: u32 = 0x1e60_2020;
+    const CSET_X2_GT: u32 = 0x9a9f_d7e2;
+    const FMOV_X3_D1: u32 = 0x9e66_0023;
+    const ADD_X4_X3_X2: u32 = 0x8b02_0064;
+    const ADD_X6_X5_X5: u32 = 0x8b05_00a6;
+    for value in [1.5f64, -2.0, f64::NAN] {
+        directed(
+            &[
+                FMOV_D0_X1,
+                ADD_X5_X1_1,
+                FADD_D1_D0_D0,
+                FCMP_D1_D0,
+                CSET_X2_GT,
+                FMOV_X3_D1,
+                ADD_X4_X3_X2,
+                ADD_X6_X5_X5,
+            ],
+            &[(1, value.to_bits())],
+        );
+    }
+}
+
+#[test]
+fn undefined_simd_faults_mid_block() {
+    const MOV_X0_1: u32 = 0xd280_0020;
+    const MOV_X0_2: u32 = 0xd280_0040;
+    const UNALLOCATED_MOVI: u32 = 0x6f00_fc00;
+    directed(&[MOV_X0_1, UNALLOCATED_MOVI, MOV_X0_2], &[]);
 }
 
 #[test]

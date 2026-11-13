@@ -66,6 +66,7 @@ mod ssl;
 #[cfg(test)]
 mod testing;
 mod time;
+mod vi;
 
 use std::sync::Arc;
 
@@ -103,6 +104,7 @@ pub fn register_all(context: &Arc<ServiceContext>) -> HleResult<()> {
     ns::register(context)?;
     sockets::register(context)?;
     ssl::register(context)?;
-    nvdrv::register(context)?;
+    let nvdrv = nvdrv::register(context)?;
+    vi::register(context, nvdrv)?;
     Ok(())
 }

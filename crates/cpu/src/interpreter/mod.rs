@@ -7,7 +7,7 @@
 
 mod cache;
 mod exec;
-mod simd;
+pub(crate) mod simd;
 #[cfg(test)]
 mod tests;
 

@@ -43,7 +43,8 @@ fn resolve(replace: &[Value], v: &mut Value) {
 
 /// Forwards known guest state to later reads and drops writes a later write of the same
 /// location makes dead. An op that can exit commits every pending write first, so the context is
-/// exact wherever the block can leave.
+/// exact wherever the block can leave. `CallSimd` can also write any location, so reads after it
+/// load from the context again.
 pub(super) fn get_set_elimination(block: &mut Block) {
     let mut replace: Vec<Value> = (0..block.ops.len() as u32).map(Value).collect();
     let mut known: [Option<Value>; Loc::COUNT] = [None; Loc::COUNT];
@@ -64,6 +65,10 @@ pub(super) fn get_set_elimination(block: &mut Block) {
                     block.ops[dead] = Op::Nop;
                 }
                 known[loc.index()] = Some(v);
+            }
+            Op::CallSimd { .. } => {
+                pending = [None; Loc::COUNT];
+                known = [None; Loc::COUNT];
             }
             _ if op.may_exit() => pending = [None; Loc::COUNT],
             _ => {}

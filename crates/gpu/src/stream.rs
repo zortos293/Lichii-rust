@@ -43,6 +43,8 @@ pub(crate) mod tag {
     pub const SYNCHRONIZE_READ: u8 = 14;
     /// Then the GPU address and the size of the GPFIFO entry a channel fetches next.
     pub const SYNCHRONIZE_FETCH: u8 = 15;
+    /// Then the GPU address the engine's next DATA_UPLOAD word comes from.
+    pub const UPLOAD_SOURCE: u8 = 16;
 }
 
 /// Words of one multi-word record; longer runs are split.
@@ -186,6 +188,15 @@ impl Stream {
 
     pub(crate) fn bind(&mut self, engine: EngineKind, class: u32) {
         self.record(&[header(tag::BIND, engine.index() as u8, 0, class)]);
+    }
+
+    /// Switch 1: the compute engine's next DATA_UPLOAD word comes from `address`, and each one
+    /// after it from the next word.
+    pub(crate) fn upload_source(&mut self, address: GpuVAddr) {
+        self.record(&[
+            header(tag::UPLOAD_SOURCE, EngineKind::Compute.index() as u8, 0, 0),
+            address,
+        ]);
     }
 
     pub(crate) fn release(&mut self, address: GpuVAddr, payload: u64, size: ReleaseSize) {
