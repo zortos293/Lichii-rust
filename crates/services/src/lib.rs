@@ -72,6 +72,7 @@ use std::sync::Arc;
 
 use lichii_common::HleResult;
 
+pub use am::applets;
 pub use context::{ServiceContext, ServiceParts};
 pub use dispatch::Service;
 
