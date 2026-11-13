@@ -1,5 +1,6 @@
-//! Tensor-core instructions: HMMA.1688 and HMMA.16816 with half accumulators, which become the
-//! IR's software matrix multiply-add, and MOVM.16.MT88, an 8x8 transpose across the warp.
+//! Tensor-core instructions: HMMA.1688 and HMMA.16816 with half or f32 accumulators, which
+//! become the IR's software matrix multiply-add, and MOVM.16.MT88, an 8x8 transpose across the
+//! warp.
 
 use super::{TResult, Translator};
 use crate::ampere::opcode::Opcode;
@@ -18,20 +19,22 @@ fn aligned(reg: Reg, count: u16) -> bool {
 }
 
 /// `HMMA.16816.F16 Rd, Ra, Rb, Rc` (.1688 when bit 75 is clear): D = A * B + C on 16x8 tiles with
-/// K = 16 (or 8), every operand packed halves spread over the warp. A takes four registers
-/// (two for K = 8), B two (one), C and D two; Rc = RZ adds zero.
+/// K = 16 (or 8), A and B packed halves spread over the warp. A takes four registers (two for
+/// K = 8), B two (one). C and D are two registers of packed halves, or with .F32 (bit 76) four
+/// f32 registers; Rc = RZ adds zero.
 fn hmma(t: &mut Translator<'_>) -> TResult {
     let insn = t.insn;
-    let long = insn.bit(75);
+    let (long, f32_accumulators) = (insn.bit(75), insn.bit(76));
     let (dest, a, b, c) = (insn.dst(), insn.src0(), insn.src1(), insn.reg_at(64));
     let (a_count, b_count) = if long { (4, 2) } else { (2, 1) };
+    let c_count = if f32_accumulators { 4 } else { 2 };
     if insn.bits(40, 24) != 0
-        || insn.bits(72, 24) & !(1 << 3) != 0
+        || insn.bits(72, 24) & !(0b11 << 3) != 0
         || insn.bits(96, 9) != 0
-        || !aligned(dest, 2)
+        || !aligned(dest, c_count)
         || !aligned(a, a_count)
         || !aligned(b, b_count)
-        || !aligned(c, 2)
+        || !aligned(c, c_count)
     {
         return Err(t.unsupported());
     }
@@ -49,10 +52,15 @@ fn hmma(t: &mut Translator<'_>) -> TResult {
     };
     let a = words(t, a, a_count, 4);
     let b = words(t, b, b_count, 2);
-    let c = words(t, c, 2, 2);
+    let c = words(t, c, c_count, c_count);
     let depth = if long { 16 } else { 8 };
-    let result = t.ir.inst_flags(Op::TensorMulAdd, depth, &[a, b, c]);
-    for word in 0..2 {
+    let op = if f32_accumulators {
+        Op::TensorMulAddF32
+    } else {
+        Op::TensorMulAdd
+    };
+    let result = t.ir.inst_flags(op, depth, &[a, b, c]);
+    for word in 0..u32::from(c_count) {
         let value = t.ir.composite_extract(result, word);
         if !dest.is_zero() {
             t.set_x(dest.offset(word as u16), value);
@@ -291,6 +299,50 @@ mod tests {
         assert!(ir.contains("TensorMulAdd %2, %4, %5 (flags 0x8)"), "{ir}");
     }
 
+    #[test]
+    fn hmma_f32_accumulates_in_four_registers() {
+        let long = encode(
+            Opcode::Hmma,
+            Form::Fixed,
+            f(16, 8) | f(24, 4) | f(32, 2) | f(64, 12) | f(75, 1) | f(76, 1),
+        );
+        let ir = translate(&[long]).unwrap();
+        assert!(
+            ir.ends_with(
+                "  %8 = GetRegister R12
+  %9 = GetRegister R13
+  %10 = GetRegister R14
+  %11 = GetRegister R15
+  %12 = CompositeConstructU32x4 %8, %9, %10, %11
+  %13 = TensorMulAddF32 %4, %7, %12 (flags 0x10)
+  %14 = CompositeExtractU32x4 %13, #0x0
+  SetRegister R8, %14
+  %15 = CompositeExtractU32x4 %13, #0x1
+  SetRegister R9, %15
+  %16 = CompositeExtractU32x4 %13, #0x2
+  SetRegister R10, %16
+  %17 = CompositeExtractU32x4 %13, #0x3
+  SetRegister R11, %17
+"
+            ),
+            "{ir}"
+        );
+        let short = encode(
+            Opcode::Hmma,
+            Form::Fixed,
+            f(16, 8) | f(24, 4) | f(32, 3) | f(64, 0xff) | f(76, 1),
+        );
+        let ir = translate(&[short]).unwrap();
+        assert!(
+            ir.contains("CompositeConstructU32x4 #0x0, #0x0, #0x0, #0x0"),
+            "{ir}"
+        );
+        assert!(
+            ir.contains("TensorMulAddF32 %2, %4, %5 (flags 0x8)"),
+            "{ir}"
+        );
+    }
+
     /// A warp loads its matrices with LDSM, transposes one with MOVM, multiplies them with HMMA
     /// and stores the product: the whole program compiles to valid SPIR-V.
     #[test]
@@ -339,6 +391,50 @@ mod tests {
         validate("ampere_tensor", &profile, &module.spirv);
     }
 
+    /// The same with an f32 accumulator, stored as four words.
+    #[test]
+    fn f32_tensor_program_compiles() {
+        let code = [
+            encode(
+                Opcode::Ldsm,
+                Form::UniformAddress,
+                f(16, 4) | f(24, 2) | f(72, 2),
+            ),
+            encode(
+                Opcode::Hmma,
+                Form::Fixed,
+                f(16, 12) | f(24, 4) | f(32, 8) | f(64, 0xff) | f(75, 1) | f(76, 1),
+            ),
+            encode(
+                Opcode::Sts,
+                Form::UniformAddress,
+                f(24, 2) | f(32, 12) | f(73, 6),
+            ),
+            encode(Opcode::Exit, Form::Fixed, 7 << 87),
+        ];
+        let mut env = TestEnv::new(&code);
+        env.shared_memory = 0x1000;
+        env.workgroup = [32, 1, 1];
+        let profile = Profile::default();
+        let host = HostTranslateInfo::default();
+        let options = TranslateOptions {
+            profile: &profile,
+            host: &host,
+            resolution_scale: ResolutionScale::X1,
+        };
+        let program = crate::translate::translate(&env, options).unwrap();
+        let ir = program.ir.dump();
+        assert!(ir.contains("TensorMulAddF32"), "{ir}");
+        let module = crate::module::compile(
+            &env,
+            options,
+            &RuntimeInfo::default(),
+            &mut Bindings::default(),
+        )
+        .unwrap();
+        validate("ampere_tensor_f32", &profile, &module.spirv);
+    }
+
     #[test]
     fn unsupported_matrix_forms_are_rejected() {
         let hmma = |fields| {
@@ -349,7 +445,14 @@ mod tests {
             )
         };
         for insn in [
-            hmma(f(76, 1)),
+            hmma(f(76, 1) | f(64, 6)),
+            encode(
+                Opcode::Hmma,
+                Form::Fixed,
+                f(16, 6) | f(24, 4) | f(32, 2) | f(76, 1),
+            ),
+            hmma(f(77, 1)),
+            hmma(f(82, 1)),
             hmma(f(40, 1)),
             encode(
                 Opcode::Hmma,
