@@ -21,6 +21,7 @@ use parking_lot::Mutex;
 
 use crate::device_memory::DeviceAllocator;
 use crate::gmmu::{GPU_VA_SIZE, Gmmu, MappedRange, PTE_KIND_INVALID, PTE_KIND_PITCH};
+use crate::semaphore_mirror::{REGION_SIZE, SemaphoreMirror};
 
 const DEVICE_ALIGN: u64 = 0x2_0000;
 
@@ -87,6 +88,7 @@ pub enum Nx2MemoryError {
 pub struct Nx2GpuMemory {
     device: Arc<DeviceAddressSpace>,
     allocator: Arc<DeviceAllocator>,
+    semaphores: Arc<SemaphoreMirror>,
     state: Mutex<State>,
 }
 
@@ -127,10 +129,16 @@ impl Backing {
 
 impl Nx2GpuMemory {
     /// A registry mapping into `device`, taking device ranges from `allocator` (shared with nvmap).
-    pub fn new(device: Arc<DeviceAddressSpace>, allocator: Arc<DeviceAllocator>) -> Self {
+    /// Memories of [`REGION_SIZE`] bytes hold queue semaphores, and `semaphores` mirrors them.
+    pub fn new(
+        device: Arc<DeviceAddressSpace>,
+        allocator: Arc<DeviceAllocator>,
+        semaphores: Arc<SemaphoreMirror>,
+    ) -> Self {
         Self {
             device,
             allocator,
+            semaphores,
             state: Mutex::new(State::default()),
         }
     }
@@ -191,6 +199,9 @@ impl Nx2GpuMemory {
                 daddr,
             },
         );
+        if size == REGION_SIZE {
+            self.semaphores.add_region(daddr);
+        }
         state.take(cpu_va, size);
         let replaced = state.insert(
             cpu_va,
@@ -225,6 +236,9 @@ impl Nx2GpuMemory {
         let mut unmapped = Vec::new();
         for (start, size) in reaching {
             unmapped.extend(state.unmap(start, size));
+        }
+        if memory.size == REGION_SIZE {
+            self.semaphores.remove_region(memory.daddr);
         }
         self.device.unmap(memory.daddr, memory.size);
         self.allocator
@@ -577,7 +591,7 @@ mod tests {
         ];
         Fixture {
             space,
-            memory: Nx2GpuMemory::new(device.clone(), allocator.clone()),
+            memory: Nx2GpuMemory::new(device.clone(), allocator.clone(), Arc::default()),
             device,
             allocator,
             gmmus,

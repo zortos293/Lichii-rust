@@ -94,7 +94,7 @@ pub fn translate_dual_vertex(
         &b.info,
         opt::storage_buffer_limit(options.profile),
     )?;
-    let descriptors = opt::join_texture_info(&mut info, &b.info);
+    let descriptors = opt::join_texture_info(&mut info, &b.info, &storage_bindings);
     opt::remap_texture_descriptors(&mut b.ir, &descriptors);
     opt::remap_storage_bindings(&mut b.ir, &storage_bindings);
 

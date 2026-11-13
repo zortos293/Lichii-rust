@@ -1332,6 +1332,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -1503,6 +1505,7 @@ dependencies = [
  "crossbeam-channel",
  "egui",
  "egui-winit",
+ "image",
  "lichii-common",
  "lichii-core",
  "lichii-crypto",
@@ -1512,6 +1515,8 @@ dependencies = [
  "lichii-texture",
  "lichii-vulkan",
  "rfd",
+ "serde",
+ "toml",
  "tracing",
  "winit",
 ]

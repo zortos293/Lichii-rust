@@ -552,11 +552,7 @@ impl KernelInner {
 
     /// Called on the core that ran the thread when it exits.
     pub(crate) fn exit_thread(&self, core: usize, thread: &Arc<Thread>) {
-        {
-            let mut s = thread.sched.lock();
-            s.state = thread::ThreadState::Terminated;
-            s.wait = 0;
-        }
+        thread.mark_terminated();
         self.scheduler.clear_running(core);
         thread.sync.signal();
         svc::release_thread_resources(thread);

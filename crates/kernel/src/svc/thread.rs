@@ -95,30 +95,10 @@ pub(super) fn set_thread_priority(svc: &mut SvcContext) -> Flow {
             return Err(result::INVALID_PRIORITY);
         }
         let thread = svc.typed::<Thread>(svc.arg32(0))?;
-        set_priority(svc, &thread, priority as u8);
+        thread.set_base_priority(priority as u8);
         Ok(())
     })();
     svc.finish(result)
-}
-
-fn set_priority(svc: &SvcContext, thread: &Arc<Thread>, priority: u8) {
-    let mut s = thread.sched.lock();
-    if s.priority == priority {
-        return;
-    }
-    match s.state {
-        ThreadState::Runnable => {
-            thread.scheduler.dequeue(thread, &s);
-            s.priority = priority;
-            thread.scheduler.enqueue(thread, &mut s, false);
-        }
-        ThreadState::Running(core) => {
-            s.priority = priority;
-            svc.kernel.scheduler.set_running_priority(core, priority);
-            svc.kernel.scheduler.request_reschedule(core);
-        }
-        _ => s.priority = priority,
-    }
 }
 
 /// `svcGetThreadCoreMask(handle w2)` -> `w1` ideal core, `x2` affinity mask.
