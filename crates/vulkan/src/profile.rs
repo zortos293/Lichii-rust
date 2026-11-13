@@ -37,6 +37,8 @@ pub(crate) fn shader_profile(
         vk::ShaderStageFlags::GEOMETRY,
         vk::ShaderStageFlags::FRAGMENT,
         vk::ShaderStageFlags::COMPUTE,
+        vk::ShaderStageFlags::TASK_EXT,
+        vk::ShaderStageFlags::MESH_EXT,
     ]
     .iter()
     .enumerate()
@@ -84,6 +86,7 @@ pub(crate) fn shader_profile(
         support_typeless_image_loads: features.storage_image_read_without_format,
         support_demote_to_helper_invocation: features.demote_to_helper_invocation,
         support_derivative_control: true,
+        support_mesh_shader: features.mesh_shader,
         support_sampled_image_array_nonuniform_indexing: features
             .sampled_image_array_non_uniform_indexing,
         support_storage_image_array_nonuniform_indexing: features
