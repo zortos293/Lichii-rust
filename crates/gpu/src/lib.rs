@@ -22,6 +22,7 @@ pub mod nx2_memory;
 pub mod pushbuffer;
 mod ring;
 mod stream;
+mod written_pages;
 
 #[cfg(test)]
 mod gpu_tests;

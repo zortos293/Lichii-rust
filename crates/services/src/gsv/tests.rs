@@ -775,3 +775,361 @@ fn memory_made_after_an_unmap_stays_mapped() {
         "the unmap sent before the memory was made does not remove it"
     );
 }
+
+const COLOR_PREFERENCE: [u32; 16] = [
+    0,
+    2,
+    (2160 - 1) << 16 | (3840 - 1),
+    0,
+    7,
+    240,
+    1,
+    1,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+];
+
+#[test]
+fn native_image_layouts_follow_the_preference() {
+    use super::native::ImageLayout;
+    let layout = ImageLayout::requirements(&COLOR_PREFERENCE, 1);
+    assert_eq!((layout.width, layout.height), (3840, 2160));
+    assert_eq!((layout.pitch, layout.block_rows_log2), (0x3c00, 7));
+    assert_eq!((layout.size, layout.alignment), (0x1fe_0000, 0x1000));
+    assert_eq!(ImageLayout::of(&COLOR_PREFERENCE).alignment, 0x2000);
+
+    let mut fp16 = COLOR_PREFERENCE;
+    fp16[6] = 5;
+    fp16[5] = 480;
+    let layout = ImageLayout::of(&fp16);
+    assert_eq!((layout.pitch, layout.size), (0x7800, 0x3fc_0000));
+
+    fp16[5] = 240;
+    fp16[4] = 3;
+    let layout = ImageLayout::of(&fp16);
+    assert_eq!(
+        (layout.pitch, layout.block_rows_log2),
+        (0x7800, 7),
+        "a pitch too small for 8-byte pixels falls back"
+    );
+
+    let mut tall = COLOR_PREFERENCE;
+    tall[4] = 8;
+    let layout = ImageLayout::requirements(&tall, 1);
+    assert_eq!((layout.size, layout.alignment), (0x21c_0000, 0x1000));
+
+    let mut hd = COLOR_PREFERENCE;
+    hd[2] = (1080 - 1) << 16 | (1920 - 1);
+    hd[5] = 120;
+    assert_eq!(ImageLayout::requirements(&hd, 1).size, 0x87_0000);
+}
+
+fn hd_preference() -> Vec<u32> {
+    let mut preference = COLOR_PREFERENCE;
+    preference[2] = (1080 - 1) << 16 | (1920 - 1);
+    preference[5] = 120;
+    preference.to_vec()
+}
+
+#[test]
+fn native_memory_and_images_are_registered() {
+    let (_context, client, gsv) = gsv();
+    let mut reply = client
+        .send(gsv, &words(Request::tipc(111), &[1, 0x87_0000, 0]))
+        .unwrap();
+    let memory = reply.pop::<u32>();
+    assert_eq!(memory, 1);
+    let bind = words(
+        Request::tipc(114),
+        &[
+            [memory].as_slice(),
+            &split(0x10_0000_0000),
+            &split(0x87_0000),
+            &[0; 4],
+        ]
+        .concat(),
+    );
+    assert_eq!(client.send(gsv, &bind).unwrap().result, ResultCode::SUCCESS);
+
+    let mut request = hd_preference();
+    request.extend([2, memory]);
+    let mut reply = client
+        .send(gsv, &words(Request::tipc(429), &request))
+        .unwrap();
+    let image = reply.pop::<u32>();
+    let mut reply = client
+        .send(gsv, &words(Request::tipc(429), &request))
+        .unwrap();
+    assert_eq!(
+        reply.pop::<u32>(),
+        image + 2,
+        "a pool keeps a handle per image"
+    );
+
+    let mut sized = hd_preference();
+    sized.push(2);
+    let mut reply = client
+        .send(gsv, &words(Request::tipc(435), &sized))
+        .unwrap();
+    assert_eq!(reply.pop::<u64>(), 2 * 0x87_0000);
+    let single = [hd_preference(), vec![1]].concat();
+    let mut reply = client
+        .send(gsv, &words(Request::tipc(1510), &single))
+        .unwrap();
+    assert_eq!(reply.pop::<[u64; 2]>(), [0x87_0000, 0x1000]);
+
+    let mut reply = client
+        .send(gsv, &Request::tipc(426).arg(image + 1))
+        .unwrap();
+    let [gpu_address, offset] = reply.pop::<[u64; 2]>();
+    assert_eq!(offset, 0x87_0000, "image 1 of the pool");
+    assert_eq!(gpu_address, 0x10_0000_0000 + 0x87_0000);
+    let descriptor = reply.pop::<[u32; 12]>();
+    assert_eq!(descriptor[0], 1);
+    assert_eq!(descriptor[2], (1080 - 1) << 16 | (1920 - 1));
+    assert_eq!(descriptor[5], 120);
+    assert_eq!(descriptor[11], 0x87_0000);
+
+    client.send(gsv, &Request::tipc(430).arg(image)).unwrap();
+    let mut reply = client.send(gsv, &Request::tipc(428).arg(image)).unwrap();
+    reply.pop::<[u64; 2]>();
+    assert_eq!(reply.pop::<[u32; 12]>()[2], 0, "a destroyed image is gone");
+}
+
+fn present(image: u32, timing: u32, fence: (u32, u32)) -> Request {
+    let mut values = vec![0u32; 23];
+    values[3] = image;
+    values[10] = timing;
+    values[20] = !fence.0;
+    values[22] = fence.1;
+    words(Request::tipc(229), &values)
+}
+
+#[test]
+fn vi2_presents_native_images_and_counts_guest_frames() {
+    let (context, client, gsv) = gsv();
+    let gpu = session(&client, gsv, 497);
+    let vi2 = session(&client, gsv, 305);
+    let mut reply = client.send(vi2, &Request::tipc(5)).unwrap();
+    assert_eq!(reply.pop::<u32>(), 7);
+    let mut reply = client
+        .send(
+            vi2,
+            &Request::tipc(106).arg(u64::from_le_bytes(*b"default\0")),
+        )
+        .unwrap();
+    assert_eq!(reply.pop::<u64>(), 4, "docked: up to 1440p");
+
+    let process = client.process().clone();
+    let heap = process.page_table().set_heap_size(16 << 20).unwrap();
+    let create = words(
+        Request::tipc(101),
+        &[split(heap), split(heap + 0x87_0000 - 1), [0, 0]].concat(),
+    );
+    let handle = client.send(gpu, &create).unwrap().pop::<u32>();
+    let memory = client
+        .send(gsv, &words(Request::tipc(111), &[1, 0x87_0000, 0]))
+        .unwrap()
+        .pop::<u32>();
+    let bind = words(
+        Request::tipc(423),
+        &[
+            [memory].as_slice(),
+            &split(heap),
+            &split(0x87_0000),
+            &[handle],
+            &split(0),
+        ]
+        .concat(),
+    );
+    client.send(gsv, &bind).unwrap();
+    let mut request = hd_preference();
+    request.extend([1, memory]);
+    let image = client
+        .send(gsv, &words(Request::tipc(429), &request))
+        .unwrap()
+        .pop::<u32>();
+
+    let syncpoint = 20;
+    let started = std::time::Instant::now();
+    for frame in 1..=3u32 {
+        context
+            .gpu
+            .host1x()
+            .syncpoints
+            .guest()
+            .increment(syncpoint)
+            .unwrap();
+        let mut reply = client
+            .send(vi2, &present(image, 1 << 16 | 60, (syncpoint, frame)))
+            .unwrap();
+        assert_eq!(reply.result, ResultCode::SUCCESS);
+        assert_eq!(reply.pop::<u64>(), 0x7fff);
+    }
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(30),
+        "presents are paced to 60 Hz"
+    );
+    let now = std::time::Instant::now();
+    let perf = context
+        .perf
+        .snapshot(now, std::time::Duration::from_secs(1));
+    assert_eq!(
+        perf.game_frame_times_ms.len(),
+        2,
+        "three guest frames recorded"
+    );
+}
+
+#[test]
+fn vi2_native_events_fire_with_vsync_until_rebound() {
+    let (_context, client, gsv) = gsv();
+    let vi2 = session(&client, gsv, 305);
+    let reply = client.send(vi2, &Request::tipc(31).arg(0u32)).unwrap();
+    let vsync = event(&client, reply.copy_handles[0]);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(vsync.is_signaled(), "an acquired slot fires every vblank");
+
+    let reply = client.send(vi2, &Request::tipc(31).arg(1u32)).unwrap();
+    let change = event(&client, reply.copy_handles[0]);
+    let name = u64::from_le_bytes(*b"default\0");
+    client
+        .send(vi2, &Request::tipc(263).arg(name).arg(1u32))
+        .unwrap();
+    assert!(change.is_signaled(), "a change slot fires once when bound");
+    change.clear();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(!change.is_signaled(), "and not with vsync");
+    assert_eq!(
+        client
+            .send(vi2, &Request::tipc(31).arg(8u32))
+            .unwrap()
+            .result,
+        super::UNKNOWN
+    );
+}
+
+#[test]
+fn vi2_shows_the_drawn_area_of_a_native_image() {
+    use lichii_gpu::backend::CropRect;
+    use lichii_texture::PixelFormat;
+    use lichii_texture::block_linear::GobLayout;
+    let (context, client) = context(SWITCH2_TITLE, Settings::default());
+    let process = client.process().clone();
+    let heap = process.page_table().set_heap_size(32 << 20).unwrap();
+    let memory = context.gpu.nx2_memory().unwrap();
+    let (handle, _) = memory
+        .create_gpu_accessible_memory(process.memory(), heap, 0x200_0000)
+        .unwrap();
+    let daddr = memory.memory_info(handle).unwrap().daddr;
+    let (objects, image) = super::native::NativeObjects::with_image(heap, None, COLOR_PREFERENCE);
+    let vi2 = super::vi2::Vi2::new(&context, Arc::new(parking_lot::Mutex::new(objects)));
+
+    let shown = vi2
+        .framebuffer(image, (1440 - 1) << 16 | (2560 - 1))
+        .unwrap();
+    assert_eq!(
+        shown.address, daddr,
+        "found through the display's address space"
+    );
+    assert_eq!((shown.width, shown.height), (3840, 2160));
+    assert_eq!(shown.format, PixelFormat::A8B8G8R8Unorm);
+    assert_eq!(
+        shown.block_height_log2,
+        Some(4),
+        "128-row blocks are 16 GOBs"
+    );
+    assert_eq!(shown.gob_layout, GobLayout::Switch2);
+    assert_eq!(
+        shown.crop,
+        Some(CropRect {
+            left: 0,
+            top: 0,
+            right: 2560,
+            bottom: 1440
+        })
+    );
+    assert_eq!(
+        vi2.framebuffer(image, 0).unwrap().crop.unwrap().right,
+        3840,
+        "without a drawn area the whole image shows"
+    );
+
+    let mut handheld = Settings::default();
+    handheld.system.docked = false;
+    let (context, client) = crate::testing::context(SWITCH2_TITLE, handheld);
+    let process = client.process().clone();
+    let heap = process.page_table().set_heap_size(32 << 20).unwrap();
+    let (objects, image) = super::native::NativeObjects::with_image(heap, None, COLOR_PREFERENCE);
+    let vi2 = super::vi2::Vi2::new(&context, Arc::new(parking_lot::Mutex::new(objects)));
+    assert!(
+        vi2.framebuffer(image, 0).is_none(),
+        "memory no GPU address space reaches is not shown"
+    );
+    let memory = context.gpu.nx2_memory().unwrap();
+    memory
+        .create_gpu_accessible_memory(process.memory(), heap, 0x200_0000)
+        .unwrap();
+    let crop = vi2.framebuffer(image, 0).unwrap().crop.unwrap();
+    assert_eq!(
+        (crop.right, crop.bottom),
+        (1920, 1080),
+        "handheld shows the panel's corner of a docked image"
+    );
+}
+
+#[test]
+fn vi2_shows_the_gpu_memory_a_native_image_was_bound_to() {
+    let (context, client) = context(SWITCH2_TITLE, Settings::default());
+    let process = client.process().clone();
+    let heap = process.page_table().set_heap_size(64 << 20).unwrap();
+    let memory = context.gpu.nx2_memory().unwrap();
+    let (parent, _) = memory
+        .create_gpu_accessible_memory(process.memory(), heap, 0x200_0000)
+        .unwrap();
+    let (other, _) = memory
+        .create_gpu_accessible_memory(process.memory(), heap + 0x200_0000, 0x200_0000)
+        .unwrap();
+    memory
+        .normal_map_4k(heap + 0x1000, heap + 0x1000 + 0x1fe_0000 - 1, other, 0)
+        .unwrap();
+    let parent_daddr = memory.memory_info(parent).unwrap().daddr;
+    let (objects, image) = super::native::NativeObjects::with_image(
+        heap + 0x1000,
+        Some((parent, 0x1000)),
+        COLOR_PREFERENCE,
+    );
+    let vi2 = super::vi2::Vi2::new(&context, Arc::new(parking_lot::Mutex::new(objects)));
+    assert_eq!(
+        vi2.framebuffer(image, 0).unwrap().address,
+        parent_daddr + 0x1000,
+        "the 423 binding wins over whatever is mapped at the address now"
+    );
+}
+
+#[test]
+fn gsv_hands_out_initialized_nvsrv_sessions() {
+    let (context, client, gsv) = gsv();
+    assert_eq!(
+        client.send(gsv, &Request::tipc(1402)).unwrap().result,
+        super::UNKNOWN,
+        "no nvsrv before nvdrv is registered"
+    );
+    crate::nvdrv::register(&context).unwrap();
+    let nvsrv = session(&client, gsv, 1402);
+    let mut name = b"/dev/nvhost-tsg-gpu".to_vec();
+    name.push(0);
+    let buffer = client.alloc(&name);
+    let request = Request::new(0).buffer_a(buffer, name.len() as u64);
+    let mut reply = client.send(nvsrv, &request).unwrap();
+    assert_eq!(reply.result, ResultCode::SUCCESS);
+    let (fd, error) = (reply.pop::<i32>(), reply.pop::<u32>());
+    assert!(fd > 0, "opened without Initialize");
+    assert_eq!(error, 0);
+}

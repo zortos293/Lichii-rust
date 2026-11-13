@@ -19,7 +19,7 @@ use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, VecAssembler, dynasm};
 use lichii_memory::ReservationSlot;
 
 use super::JitState;
-use super::ir::{Block, Loc, Op, Terminal, Ty, Value, W};
+use super::ir::{Block, Cmp, Loc, Op, Terminal, Ty, Value, W};
 use crate::decoder::AtomicOp;
 use crate::interpreter::condition_holds;
 use crate::{ThreadContext, TscScale};
@@ -141,6 +141,41 @@ fn loc_offset(loc: Loc) -> i32 {
     }
 }
 
+/// The x86 condition code that holds after the host instruction of `kind` exactly when A64
+/// `cond` holds. x86 `CF` is A64's `C` after an add or a test, and its inverse after a subtract.
+fn host_cc(kind: Cmp, cond: u8) -> u8 {
+    const AFTER_SUB: [u8; 14] = [
+        0x4, 0x5, 0x3, 0x2, 0x8, 0x9, 0x0, 0x1, 0x7, 0x6, 0xd, 0xc, 0xf, 0xe,
+    ];
+    debug_assert!(kind.fuses(cond));
+    match (kind, cond) {
+        (Cmp::Add | Cmp::Test, 2 | 3) => cond,
+        _ => AFTER_SUB[cond as usize],
+    }
+}
+
+/// `j<cc ^ 1>`: jumps to `label` unless condition code `cc` holds.
+fn jump_unless(a: &mut Asm, cc: u8, label: DynamicLabel) {
+    match cc ^ 1 {
+        0x0 => dynasm!(a ; .arch x64 ; jo =>label),
+        0x1 => dynasm!(a ; .arch x64 ; jno =>label),
+        0x2 => dynasm!(a ; .arch x64 ; jb =>label),
+        0x3 => dynasm!(a ; .arch x64 ; jae =>label),
+        0x4 => dynasm!(a ; .arch x64 ; je =>label),
+        0x5 => dynasm!(a ; .arch x64 ; jne =>label),
+        0x6 => dynasm!(a ; .arch x64 ; jbe =>label),
+        0x7 => dynasm!(a ; .arch x64 ; ja =>label),
+        0x8 => dynasm!(a ; .arch x64 ; js =>label),
+        0x9 => dynasm!(a ; .arch x64 ; jns =>label),
+        0xa => dynasm!(a ; .arch x64 ; jp =>label),
+        0xb => dynasm!(a ; .arch x64 ; jnp =>label),
+        0xc => dynasm!(a ; .arch x64 ; jl =>label),
+        0xd => dynasm!(a ; .arch x64 ; jge =>label),
+        0xe => dynasm!(a ; .arch x64 ; jle =>label),
+        _ => dynasm!(a ; .arch x64 ; jg =>label),
+    }
+}
+
 /// Bit `nzcv` of the result is whether `cond` holds for those flags.
 fn cond_table(cond: u8) -> i32 {
     (0..16).fold(0, |mask, flags| {
@@ -217,6 +252,9 @@ struct Emitter<'a> {
     next_slot: u16,
     locked: [u16; 2],
     last_use: Vec<u32>,
+    /// `Compare`s emitted by their only user, a `Select` or the `Branch`, which consumes the
+    /// host flags directly.
+    fused: Vec<bool>,
     stubs: Vec<Stub>,
     fault_exit: DynamicLabel,
 }
@@ -329,9 +367,31 @@ impl Emitter<'_> {
         }
     }
 
-    /// Frees every operand whose last use was op `i`, and the op's own value if it is unused.
+    /// Sets the host flags of `Compare` `v` and returns the condition code that then holds.
+    fn compare(&mut self, v: Value) -> u8 {
+        let Op::Compare(kind, cond, w, a, b) = self.block.ops[v.index()] else {
+            unreachable!("only a Compare sets host flags for its user");
+        };
+        let y = self.src(b, w);
+        let x = self.reg(a);
+        match kind {
+            Cmp::Add => {
+                mov(&mut self.asm, w, 0, Src::Reg(x));
+                alu!(self.asm, add, w, 0, y);
+            }
+            Cmp::Sub => alu!(self.asm, cmp, w, x, y),
+            Cmp::Test => alu!(self.asm, test, w, x, y),
+        }
+        host_cc(kind, cond)
+    }
+
+    /// Frees every operand whose last use was op `i`, including those of a `Compare` it emitted,
+    /// and the op's own value if it is unused.
     fn finish(&mut self, i: usize, op: &Op) {
-        for v in op.args().chain([Value(i as u32)]) {
+        let block = self.block;
+        let fused = op.args().find(|c| self.fused[c.index()]);
+        let compared = fused.into_iter().flat_map(|c| block.ops[c.index()].args());
+        for v in op.args().chain(compared).chain([Value(i as u32)]) {
             if self.last_use[v.index()] as usize <= i {
                 self.release(v);
             }
@@ -659,6 +719,23 @@ impl Emitter<'_> {
                     ; bswap Rq(d)
                     ; rol Rq(d), 32
                 );
+            }
+            Op::Select(w, c, a, b) if self.fused[c.index()] => {
+                let a = self.reg(a);
+                let b = self.src(b, w);
+                let d = self.def(v);
+                mov(&mut self.asm, w, d, b);
+                let cc = self.compare(c);
+                let rex = 0x40 | ((w == W::W64) as u8) << 3 | (d >> 3) << 2 | a >> 3;
+                self.asm
+                    .extend([rex, 0x0f, 0x40 | cc, 0xc0 | (d & 7) << 3 | a & 7]);
+            }
+            Op::Compare(..) if self.fused[i] => return,
+            Op::Compare(..) => {
+                let cc = self.compare(v);
+                let d = self.def(v);
+                self.asm.extend([0x0f, 0x90 | cc, 0xc0]);
+                dynasm!(self.asm ; .arch x64 ; movzx Rd(d), al);
             }
             Op::Select(w, c, a, b) => {
                 let c = self.reg(c);
@@ -1376,9 +1453,14 @@ impl Emitter<'_> {
                 taken,
                 not_taken,
             } => {
-                let c = self.reg(cond);
                 let other = self.asm.new_dynamic_label();
-                dynasm!(self.asm ; .arch x64 ; test Rd(c), Rd(c) ; jz =>other);
+                if self.fused[cond.index()] {
+                    let cc = self.compare(cond);
+                    jump_unless(&mut self.asm, cc, other);
+                } else {
+                    let c = self.reg(cond);
+                    dynasm!(self.asm ; .arch x64 ; test Rd(c), Rd(c) ; jz =>other);
+                }
                 self.link(taken);
                 dynasm!(self.asm ; .arch x64 ; =>other);
                 self.link(not_taken);
@@ -1475,6 +1557,34 @@ pub(super) fn compile(block: &Block, start: u64, target: &Target) -> Compiled {
     }
     let mut terminal = block.terminal;
     terminal.for_each_arg(|v| last_use[v.index()] = n as u32);
+    let mut uses = vec![0u32; n];
+    block
+        .ops
+        .iter()
+        .flat_map(Op::args)
+        .for_each(|v| uses[v.index()] += 1);
+    terminal.for_each_arg(|v| uses[v.index()] += 1);
+    let users = block
+        .ops
+        .iter()
+        .enumerate()
+        .filter_map(|(i, op)| match *op {
+            Op::Select(_, c, ..) => Some((c, i as u32)),
+            _ => None,
+        });
+    let branch = match terminal {
+        Terminal::Branch { cond, .. } => Some((cond, n as u32)),
+        _ => None,
+    };
+    let mut fused = vec![false; n];
+    for (c, user) in users.chain(branch) {
+        if uses[c.index()] == 1 && matches!(block.ops[c.index()], Op::Compare(..)) {
+            fused[c.index()] = true;
+            for v in block.ops[c.index()].args() {
+                last_use[v.index()] = last_use[v.index()].max(user);
+            }
+        }
+    }
     let mut asm = Asm::new(0);
     let fault_exit = asm.new_dynamic_label();
     let mut e = Emitter {
@@ -1488,6 +1598,7 @@ pub(super) fn compile(block: &Block, start: u64, target: &Target) -> Compiled {
         next_slot: 0,
         locked: [0; 2],
         last_use,
+        fused,
         stubs: Vec::new(),
         fault_exit,
     };

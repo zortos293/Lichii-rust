@@ -17,7 +17,7 @@ use crate::engines::{Engine, EngineContext, EngineFactory, EngineKind};
 use crate::gmmu::{Gmmu, RangeTarget};
 use crate::host1x::Syncpoints;
 use crate::ring::{Consumer, WRAP};
-use crate::stream::{MULTI_MAX_WORDS, REDUCTIONS, RELEASE_SIZES, tag};
+use crate::stream::{FetchSyncs, MULTI_MAX_WORDS, REDUCTIONS, RELEASE_SIZES, tag};
 
 /// The back reports progress at least this often while it executes.
 const RELEASE_SLOTS: u64 = 1024;
@@ -65,6 +65,7 @@ pub(crate) struct Back {
     last: Option<(usize, u8)>,
     words: Vec<u32>,
     qmd_scheduler: QmdScheduler,
+    fetch_syncs: Arc<FetchSyncs>,
 }
 
 impl Back {
@@ -73,6 +74,7 @@ impl Back {
         handles: &GpuHandles,
         engines: EngineFactory,
         side: mpsc::Receiver<SideCommand>,
+        fetch_syncs: Arc<FetchSyncs>,
     ) -> Self {
         Self {
             rasterizer,
@@ -85,6 +87,7 @@ impl Back {
             last: None,
             words: Vec::with_capacity(MULTI_MAX_WORDS + 1),
             qmd_scheduler: QmdScheduler::new(),
+            fetch_syncs,
         }
     }
 
@@ -213,6 +216,11 @@ impl Back {
             }
             tag::SYNCHRONIZE_READ => {
                 self.synchronize_read(consumer.slot(1), consumer.slot(2));
+                3
+            }
+            tag::SYNCHRONIZE_FETCH => {
+                self.synchronize_read(consumer.slot(1), consumer.slot(2));
+                self.fetch_syncs.complete();
                 3
             }
             tag::SIDE => {

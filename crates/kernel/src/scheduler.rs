@@ -21,6 +21,8 @@ use crate::thread::{Resume, Sched, Thread, ThreadState, WakeResult};
 const LEVELS: usize = 64;
 const IDLE_PRIORITY: u32 = LEVELS as u32;
 const PARK_TIMEOUT: Duration = Duration::from_millis(10);
+/// How often a pause looks again for cores still in guest code, should a wakeup be missed.
+const GUEST_EXIT_POLL: Duration = Duration::from_millis(1);
 
 struct RunQueue {
     levels: [VecDeque<Arc<Thread>>; LEVELS],
@@ -84,6 +86,8 @@ struct Core {
     running_priority: AtomicU32,
     resched: AtomicBool,
     rotate: AtomicBool,
+    /// The core is running guest code (inside `CpuCore::run`).
+    in_guest: AtomicBool,
 }
 
 /// A thread taken from a run queue to run on a core.
@@ -108,6 +112,9 @@ pub struct Scheduler {
     idle: AtomicU64,
     shutdown: AtomicBool,
     paused: AtomicBool,
+    /// Signalled when a core leaves guest code while paused.
+    left_guest: Condvar,
+    left_guest_lock: Mutex<()>,
 }
 
 impl Scheduler {
@@ -122,11 +129,14 @@ impl Scheduler {
                     running_priority: AtomicU32::new(IDLE_PRIORITY),
                     resched: AtomicBool::new(false),
                     rotate: AtomicBool::new(false),
+                    in_guest: AtomicBool::new(false),
                 })
                 .collect(),
             idle: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             paused: AtomicBool::new(false),
+            left_guest: Condvar::new(),
+            left_guest_lock: Mutex::new(()),
         }
     }
 
@@ -388,11 +398,33 @@ impl Scheduler {
     }
 
     /// Takes every running thread off its core and keeps the cores idle until [`Scheduler::resume`].
-    /// Threads stay runnable; waits and timers go on.
+    /// Threads stay runnable; waits and timers go on. Returns once no core runs guest code.
     pub(crate) fn pause(&self) {
-        self.paused.store(true, Ordering::Release);
+        self.paused.store(true, Ordering::SeqCst);
         for core in 0..self.cores.len() {
             self.request_reschedule(core);
+        }
+        let mut guard = self.left_guest_lock.lock();
+        while self.cores.iter().any(|c| c.in_guest.load(Ordering::SeqCst)) {
+            self.left_guest.wait_for(&mut guard, GUEST_EXIT_POLL);
+        }
+    }
+
+    /// Marks `core` as running guest code. False while paused: the core must not enter then.
+    pub(crate) fn enter_guest(&self, core: usize) -> bool {
+        self.cores[core].in_guest.store(true, Ordering::SeqCst);
+        if self.paused.load(Ordering::SeqCst) {
+            self.leave_guest(core);
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn leave_guest(&self, core: usize) {
+        self.cores[core].in_guest.store(false, Ordering::SeqCst);
+        if self.paused.load(Ordering::SeqCst) {
+            let _guard = self.left_guest_lock.lock();
+            self.left_guest.notify_all();
         }
     }
 

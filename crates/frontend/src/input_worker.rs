@@ -202,13 +202,6 @@ impl InputWorker {
     }
 
     /// The npad states the hid service reads.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "lichii-core's System takes the hub once it exists"
-        )
-    )]
     pub fn hub(&self) -> &Arc<NpadHub> {
         &self.hub
     }
