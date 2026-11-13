@@ -25,6 +25,8 @@ pub mod thread;
 mod timer;
 mod util;
 
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 #[cfg(test)]
 mod tests;
 
@@ -248,19 +250,7 @@ impl Kernel {
 
     /// Starts the core threads, the timer thread and the service threads.
     pub fn run(&self) -> Result<(), KernelError> {
-        {
-            let mut services = self.0.services.lock();
-            if !services.running {
-                services.running = true;
-                let joins = services
-                    .threads
-                    .iter()
-                    .map(ServiceThread::spawn)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(KernelError::Spawn)?;
-                services.joins = joins;
-            }
-        }
+        self.spawn_service_threads()?;
         let mut threads = self.0.host_threads.lock();
         let kernel = self.0.clone();
         threads.push(
@@ -277,6 +267,21 @@ impl Kernel {
                     .spawn(move || cpu_manager::run_core(kernel, core))
                     .map_err(KernelError::Spawn)?,
             );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn spawn_service_threads(&self) -> Result<(), KernelError> {
+        let mut services = self.0.services.lock();
+        if !services.running {
+            services.running = true;
+            let joins = services
+                .threads
+                .iter()
+                .map(ServiceThread::spawn)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(KernelError::Spawn)?;
+            services.joins = joins;
         }
         Ok(())
     }
@@ -306,6 +311,22 @@ impl Kernel {
                 process.finalize();
             }
         }
+    }
+
+    /// Stops running guest code: every core puts its thread back in its run queue and idles until
+    /// [`Kernel::resume`]. Service threads, waits and timers keep going.
+    pub fn pause(&self) {
+        self.0.scheduler.pause();
+    }
+
+    /// Lets the cores pick threads again after [`Kernel::pause`].
+    pub fn resume(&self) {
+        self.0.scheduler.resume();
+    }
+
+    /// Whether [`Kernel::pause`] is in effect.
+    pub fn is_paused(&self) -> bool {
+        self.0.scheduler.is_paused()
     }
 
     /// Asks every thread of `process` to terminate.

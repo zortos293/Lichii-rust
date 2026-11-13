@@ -14,5 +14,8 @@ thiserror.workspace = true
 bytemuck.workspace = true
 tracing.workspace = true
 
+[features]
+testing = []
+
 [dev-dependencies]
 crossbeam-channel.workspace = true

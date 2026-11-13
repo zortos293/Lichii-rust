@@ -141,6 +141,14 @@ impl ServiceManager {
         ResultCode::SUCCESS
     }
 
+    /// A new session to the registered service `name`, as `GetService` would return.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn open(&self, name: &str) -> Option<Arc<ClientSession>> {
+        let registry = self.registry.lock();
+        let service = registry.services.get(&encode_name(name).ok()?)?;
+        Some(service.thread.session((service.factory)()))
+    }
+
     /// Drops every service and waiting request (their clients get `SessionClosed`). Service
     /// factories usually hold the services' shared state, which holds the kernel, so shutdown
     /// breaks that cycle here.
