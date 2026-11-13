@@ -6,7 +6,6 @@
 //!
 //! [`MemoryLayout`]: lichii_common::settings::MemoryLayout
 
-mod null_renderer;
 mod timing;
 
 use std::path::Path;
@@ -15,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use lichii_common::settings::Settings;
 use lichii_common::{ConsoleGeneration, ResultCode, VAddr};
-use lichii_gpu::backend::{GpuHandles, Rasterizer};
+use lichii_gpu::backend::{GpuHandles, NullRasterizer, Rasterizer};
 use lichii_gpu::host1x::Host1x;
 use lichii_gpu::{Console, Gpu, GpuConfig};
 use lichii_input::hub::NpadHub;
@@ -25,7 +24,6 @@ use lichii_loader::{LoadOptions, LoaderError, ProgramImage};
 use lichii_services::{ServiceContext, ServiceParts};
 use parking_lot::{Condvar, Mutex};
 
-pub use crate::null_renderer::NullRasterizer;
 pub use crate::timing::CoreTiming;
 pub use lichii_common::perf::PerfStats;
 
@@ -62,8 +60,13 @@ enum State {
 }
 
 /// Builds the renderer once the GPU knows the handles fences and queries need. The frontend
-/// passes its Vulkan renderer here; headless runs pass [`NullRasterizer::factory`].
+/// passes its Vulkan renderer here; headless runs pass [`headless_renderer`].
 pub type RendererFactory = Box<dyn FnOnce(GpuHandles) -> Box<dyn Rasterizer> + Send>;
+
+/// A [`RendererFactory`] that draws nothing: [`NullRasterizer`] runs fences and releases at once.
+pub fn headless_renderer() -> RendererFactory {
+    Box::new(|handles| Box::new(NullRasterizer::new(handles)))
+}
 
 /// One emulation session: a booted title and every subsystem it runs on.
 pub struct System {
