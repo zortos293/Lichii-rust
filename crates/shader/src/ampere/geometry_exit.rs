@@ -192,9 +192,7 @@ pub fn analyze(read: impl Fn(usize) -> Instruction) -> Result<u32, NotAnEnvelope
             0x805 | 0xab9 | 0x945 => {}
             0x381 | 0x981 => {
                 let (address, size) = (bits(index, 24, 8), bits(index, 73, 3));
-                if opcode == 0x381 {
-                    read_predicate(7 - bits(index, 64, 3));
-                }
+                read_predicate(7 - bits(index, 64, 3));
                 if address != 255 {
                     read_register(address);
                     read_register(address + 1);
@@ -262,6 +260,7 @@ pub fn analyze(read: impl Fn(usize) -> Instruction) -> Result<u32, NotAnEnvelope
                 write_register(bits(index, 16, 8));
             }
             0x322 => {
+                read_register(bits(index, 24, 8));
                 let value = bits(index, 32, 8);
                 if value != 255 {
                     for i in 0..=bits(index, 74, 2) {
@@ -367,6 +366,16 @@ mod tests {
         );
         assert_eq!(
             reason(&envelope(&[READ_R0, WRITE_R0])),
+            Err((5, "native body reads exit setup state"))
+        );
+        let ast_indexed_by_r3 = Instruction(0x0300_7322 | 0xff << 32 | 0xff << 64);
+        assert_eq!(
+            reason(&envelope(&[ast_indexed_by_r3, WRITE_R0])),
+            Err((5, "native body reads exit setup state"))
+        );
+        let uniform_ldg_under_p0 = Instruction(0xff04_7981 | 7 << 64 | 4 << 73);
+        assert_eq!(
+            reason(&envelope(&[uniform_ldg_under_p0, WRITE_R0])),
             Err((5, "native body reads exit setup state"))
         );
         let at_exit = Instruction(0x7357);

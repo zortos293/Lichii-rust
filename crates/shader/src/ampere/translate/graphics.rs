@@ -1026,6 +1026,10 @@ mod tests {
             )
         );
         rejects(Geometry, fixed(Opcode::Lepc, dst(4) | ra(1)));
+        assert!(
+            run(Geometry, lepc).contains("SetRegister R4"),
+            "a geometry program's LEPC without the at-exit setup is an ordinary LEPC"
+        );
     }
 
     #[test]

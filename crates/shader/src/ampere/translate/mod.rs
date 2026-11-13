@@ -57,9 +57,11 @@ pub fn translate_block(
         form: Form::Fixed,
     };
     let mut pc = begin;
+    let opcode_at = |index: u32| decode(flow.read(env, index * INSTRUCTION_SIZE)).map(|d| d.opcode);
     if begin == 0
         && env.stage() == ShaderStage::Geometry
-        && decode(flow.read(env, 0)).is_some_and(|d| d.opcode == Opcode::Lepc)
+        && opcode_at(0) == Some(Opcode::Lepc)
+        && opcode_at(SETUP_INSTRUCTIONS - 1) == Some(Opcode::BmovAtExit)
     {
         let read = |index: usize| flow.read(env, index as u32 * INSTRUCTION_SIZE);
         if let Err(NotAnEnvelope { index, reason }) = geometry_exit::analyze(read) {
