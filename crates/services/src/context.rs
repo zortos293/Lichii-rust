@@ -206,18 +206,42 @@ pub(crate) fn wait_guest_syncpoint(
     timeout: Option<Duration>,
 ) -> Result<u32, SyncpointWaitError> {
     const SHUTDOWN_CHECK: Duration = Duration::from_millis(100);
-    let deadline = timeout.map(|timeout| Instant::now() + timeout);
-    loop {
+    const STALL_WARNING: Duration = Duration::from_secs(2);
+    let started = Instant::now();
+    let deadline = timeout.map(|timeout| started + timeout);
+    let mut stalled = false;
+    let result = loop {
         let left = deadline.map_or(SHUTDOWN_CHECK, |deadline| {
             deadline.saturating_duration_since(Instant::now())
         });
         match bank.wait(id, threshold, Some(left.min(SHUTDOWN_CHECK))) {
-            Err(SyncpointWaitError::TimedOut { .. })
+            Err(SyncpointWaitError::TimedOut { value })
                 if !kernel.is_shutting_down()
-                    && deadline.is_none_or(|deadline| Instant::now() < deadline) => {}
-            result => return result,
+                    && deadline.is_none_or(|deadline| Instant::now() < deadline) =>
+            {
+                if !stalled && started.elapsed() >= STALL_WARNING {
+                    stalled = true;
+                    tracing::warn!(
+                        syncpoint = id,
+                        threshold,
+                        value,
+                        "guest syncpoint wait blocked for over 2 s"
+                    );
+                }
+            }
+            result => break result,
         }
+    };
+    if stalled {
+        tracing::warn!(
+            syncpoint = id,
+            threshold,
+            waited_ms = started.elapsed().as_millis() as u64,
+            ?result,
+            "guest syncpoint wait ended"
+        );
     }
+    result
 }
 
 /// Presents `framebuffer` once the guest reached every fence `(syncpoint, value)`, on whichever thread
