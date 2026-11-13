@@ -124,6 +124,16 @@ pub enum SimdOp {
         b: Option<Value>,
         word: u32,
     },
+    /// `SQXTN` and `SQXTN2` to B (`size` 0) or H (`size` 1) lanes: the lanes of `n` narrowed with
+    /// signed saturation, in the low half over zeros, or for `SQXTN2` in the high half over the
+    /// low half of `low`. It sets FPSR.QC itself when a lane saturates, so like a checked op it
+    /// carries `word` and passes treat it as writing FPSR.
+    SatNarrow {
+        size: u8,
+        n: Value,
+        low: Option<Value>,
+        word: u32,
+    },
     /// Advanced SIMD integer and element-move ops.
     Vec(VecOp),
     /// Advanced SIMD FP arithmetic on S or D lanes, checked like the scalar ops.
@@ -155,7 +165,8 @@ impl SimdOp {
             | SimdOp::FromInt { word, .. }
             | SimdOp::ToInt { word, .. }
             | SimdOp::Compare { word, .. }
-            | SimdOp::CondCompare { word, .. } => Some(word),
+            | SimdOp::CondCompare { word, .. }
+            | SimdOp::SatNarrow { word, .. } => Some(word),
             SimdOp::Lanes(lanes) => Some(lanes.word),
             _ => None,
         }
@@ -196,6 +207,12 @@ impl SimdOp {
                 f(n);
                 f(m);
                 f(a);
+            }
+            SimdOp::SatNarrow { n, low, .. } => {
+                f(n);
+                if let Some(low) = low {
+                    f(low);
+                }
             }
             SimdOp::Vec(op) => op.for_each_arg(f),
             SimdOp::Lanes(lanes) => lanes.for_each_arg(f),

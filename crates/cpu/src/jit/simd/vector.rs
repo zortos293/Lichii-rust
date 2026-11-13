@@ -7,15 +7,17 @@
     reason = "dynasm! converts every register operand with into()"
 )]
 
-use dynasmrt::{DynasmApi, dynasm};
+use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
 
 use super::super::ir::{Loc, Op, Ty, Value, W};
 use super::super::translate::Translator;
-use super::super::x64::Emitter;
+use super::super::x64::{CTX_FPSR, Emitter};
 use super::ir::SimdOp;
 use crate::decoder::{Inst, PostIndex, Reg};
 
 const SCRATCH: u8 = 15;
+/// FPSR.QC.
+const QC: i32 = 1 << 27;
 
 /// Byte masks for `CNT`: `0x55`, `0x33` and `0x0f` in every byte.
 #[repr(align(16))]
@@ -302,6 +304,13 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         }
         let (n, m) = (vec(t, rn), vec(t, rm));
         let r = emit(t, VecOp::Ext { q, index, n, m });
+        t.set(Loc::V(rd), r);
+        return true;
+    }
+    if word & 0xbf3f_fc00 == 0x0e21_4800 && size < 2 {
+        let n = vec(t, rn);
+        let low = q.then(|| vec(t, rd));
+        let r = t.op(Op::Simd(SimdOp::SatNarrow { size, n, low, word }));
         t.set(Loc::V(rd), r);
         return true;
     }
@@ -732,6 +741,50 @@ impl Emitter<'_> {
             self.pack_sums(size, SCRATCH, SCRATCH);
             self.copy(d, SCRATCH);
         }
+    }
+
+    /// `SQXTN`/`SQXTN2`: packs `n` with signed saturation, and sets FPSR.QC unless sign-extending
+    /// the packed lanes again gives back every lane of `n`.
+    pub(super) fn sat_narrow(&mut self, i: usize, size: u8, n: Value, low: Option<Value>) {
+        let n = self.reg(n);
+        let low = low.map(|low| self.reg(low));
+        let d = self.def(Value(i as u32));
+        dynasm!(self.asm ; .arch x64 ; movaps xmm15, Rx(n));
+        match size {
+            0 => dynasm!(self.asm ; .arch x64 ; packsswb xmm15, xmm15),
+            _ => dynasm!(self.asm ; .arch x64 ; packssdw xmm15, xmm15),
+        }
+        match low {
+            Some(low) => dynasm!(self.asm
+                ; .arch x64
+                ; movaps Rx(d), Rx(low)
+                ; punpcklqdq Rx(d), xmm15
+            ),
+            None => dynasm!(self.asm ; .arch x64 ; movq Rx(d), xmm15),
+        }
+        match size {
+            0 => dynasm!(self.asm
+                ; .arch x64
+                ; punpcklbw xmm15, xmm15
+                ; psraw xmm15, 8
+                ; pcmpeqw xmm15, Rx(n)
+            ),
+            _ => dynasm!(self.asm
+                ; .arch x64
+                ; punpcklwd xmm15, xmm15
+                ; psrad xmm15, 16
+                ; pcmpeqd xmm15, Rx(n)
+            ),
+        }
+        let exact = self.asm.new_dynamic_label();
+        dynasm!(self.asm
+            ; .arch x64
+            ; pmovmskb eax, xmm15
+            ; cmp eax, 0xffff
+            ; je =>exact
+            ; or DWORD [r15 + CTX_FPSR], QC
+            ; =>exact
+        );
     }
 
     pub(super) fn vector(&mut self, i: usize, op: VecOp) {

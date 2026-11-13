@@ -412,6 +412,23 @@ const WORKLOADS: &[Workload] = &[
         per_iteration: 10,
     },
     Workload {
+        name: "saturating narrow loop",
+        code: &[
+            0x4f000460, // movi v0.4s, #3
+            0x4f0367e1, // movi v1.4s, #0x7f, lsl #24
+            0x0e614802, // 1: sqxtn v2.4h, v0.4s
+            0x4e614822, // sqxtn2 v2.8h, v1.4s
+            0x0e214843, // sqxtn v3.8b, v2.8h
+            0x4e214843, // sqxtn2 v3.16b, v2.8h
+            0x4c007023, // st1 {v3.16b}, [x1]
+            0xf10004a5, // subs x5, x5, #1
+            0x54ffff41, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 7,
+    },
+    Workload {
         name: "estimate loop",
         code: &[
             0x4f03f700, // fmov v0.4s, #1.5

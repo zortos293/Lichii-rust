@@ -296,7 +296,8 @@ fn simd(rng: &mut Rng) -> u32 {
     }
 }
 
-const VECTOR: [&str; 13] = [
+const VECTOR: [&str; 14] = [
+    "0x001110xx100001010010xxxxxxxxxx",
     "01011110000xxxxx000001xxxxxxxxxx",
     "0x101110000xxxxx0xxxx0xxxxxxxxxx",
     "0xx01110xx1xxxxx100001xxxxxxxxxx",
@@ -1082,6 +1083,55 @@ fn vector_fp_edge_cases_match_the_interpreter() {
                         ctx.v[2] = vector(&|k| j + 5 * k);
                         compare(machines, &[op, BRK], &ctx, &data);
                     }
+                }
+            }
+        }
+    }
+}
+
+/// SQXTN and SQXTN2 on lanes at and around the saturation bounds, with FPSR.QC clear and set.
+#[test]
+fn saturating_narrow_matches_the_interpreter() {
+    const OPS: [u32; 4] = [
+        0x0e21_4820, // sqxtn v0.8b, v1.8h
+        0x4e21_4820, // sqxtn2 v0.16b, v1.8h
+        0x0e61_4820, // sqxtn v0.4h, v1.4s
+        0x4e61_4820, // sqxtn2 v0.8h, v1.4s
+    ];
+    const H: [u16; 8] = [0, 1, 0xffff, 0x7f, 0x80, 0xff80, 0xff7f, 0x8000];
+    const S: [u32; 8] = [
+        0,
+        1,
+        0xffff_ffff,
+        0x7fff,
+        0x8000,
+        0xffff_8000,
+        0xffff_7fff,
+        0x8000_0000,
+    ];
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    for op in OPS {
+        for start in 0..8 {
+            for stride in 0..8 {
+                let lane = |k: usize| (start + stride * k) % 8;
+                let v1 = if op & 1 << 22 == 0 {
+                    (0..8).fold(0u128, |v, k| v | (H[lane(k)] as u128) << (16 * k))
+                } else {
+                    (0..4).fold(0u128, |v, k| v | (S[lane(k)] as u128) << (32 * k))
+                };
+                for fpsr in [0, 1 << 27] {
+                    let mut ctx = ThreadContext {
+                        pc: CODE,
+                        fpsr,
+                        ..Default::default()
+                    };
+                    ctx.v[0] = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210;
+                    ctx.v[1] = v1;
+                    compare(machines, &[op, BRK], &ctx, &data);
                 }
             }
         }
