@@ -84,6 +84,14 @@ pub(crate) fn shader_profile(
         support_typeless_image_loads: features.storage_image_read_without_format,
         support_demote_to_helper_invocation: features.demote_to_helper_invocation,
         support_derivative_control: true,
+        support_sampled_image_array_nonuniform_indexing: features
+            .sampled_image_array_non_uniform_indexing,
+        support_storage_image_array_nonuniform_indexing: features
+            .storage_image_array_non_uniform_indexing,
+        support_uniform_texel_buffer_array_nonuniform_indexing: features
+            .uniform_texel_buffer_array_non_uniform_indexing,
+        support_storage_texel_buffer_array_nonuniform_indexing: features
+            .storage_texel_buffer_array_non_uniform_indexing,
         support_native_ndc: features.depth_clip_control,
         max_user_clip_distances: limits.max_clip_distances,
         max_compute_shared_memory_size: limits.max_compute_shared_memory_size,
@@ -114,6 +122,8 @@ pub(crate) fn shader_profile(
         support_int64: features.shader_int64,
         support_viewport_index_layer: profile.support_viewport_index_layer_non_geometry,
         support_handle_programs: true,
+        support_handle_table_arrays: features.sampled_image_array_non_uniform_indexing
+            && on(v12.quad_divergent_implicit_lod),
         ..HostTranslateInfo::default()
     };
     (profile, host)

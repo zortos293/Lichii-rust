@@ -98,6 +98,10 @@ pub struct DeviceFeatures {
     pub shader_output_layer: bool,
     pub shader_output_viewport_index: bool,
     pub draw_indirect_count: bool,
+    pub sampled_image_array_non_uniform_indexing: bool,
+    pub storage_image_array_non_uniform_indexing: bool,
+    pub uniform_texel_buffer_array_non_uniform_indexing: bool,
+    pub storage_texel_buffer_array_non_uniform_indexing: bool,
     pub maintenance4: bool,
     pub null_descriptor: bool,
     pub custom_border_color_without_format: bool,
@@ -418,6 +422,18 @@ impl Device {
             shader_output_layer: on(v12.shader_output_layer),
             shader_output_viewport_index: on(v12.shader_output_viewport_index),
             draw_indirect_count: on(v12.draw_indirect_count),
+            sampled_image_array_non_uniform_indexing: on(
+                v12.shader_sampled_image_array_non_uniform_indexing
+            ),
+            storage_image_array_non_uniform_indexing: on(
+                v12.shader_storage_image_array_non_uniform_indexing
+            ),
+            uniform_texel_buffer_array_non_uniform_indexing: on(
+                v12.shader_uniform_texel_buffer_array_non_uniform_indexing
+            ),
+            storage_texel_buffer_array_non_uniform_indexing: on(
+                v12.shader_storage_texel_buffer_array_non_uniform_indexing
+            ),
             maintenance4: on(v13.maintenance4),
             null_descriptor: extensions.robustness2 && on(robustness2.null_descriptor),
             custom_border_color_without_format: extensions.custom_border_color

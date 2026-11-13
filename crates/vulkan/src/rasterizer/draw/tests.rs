@@ -2164,3 +2164,89 @@ fn handle_programs_skip_typeless_image_loads_of_integer_images() {
     assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
     f.assert_no_validation_errors();
 }
+
+/// Per-invocation table indices: the storage buffer c[0][0x120] describes, one word per column.
+const INDICES_TABLE: u64 = SSBO + 0x400;
+
+/// Samples at (0.5, 0.5), into render target 0, the texture whose handle is entry `i` of the
+/// 8-byte entry table the storage buffer c[0][0x110] points to, where `i` is the word of the
+/// storage buffer c[0][0x120] the pixel's column selects: the table index varies per invocation.
+fn indexed_table_sampling_program() -> Vec<u8> {
+    let mut header = header(2, ShaderType::PIXEL);
+    header[18] = 0xf;
+    let tex = sass(
+        Opcode::TexB,
+        (7 << 51) | (0b1111 << 31) | (2 << 28) | (6 << 20) | (2 << 8),
+    );
+    let shl = |shift: u64| sass(Opcode::ShlImm, (1 << 39) | (shift << 20) | (1 << 8) | 1);
+    let add_low = |r: u64| sass(Opcode::IaddReg, (1 << 47) | (1 << 20) | (r << 8) | r);
+    let add_high = |r: u64| sass(Opcode::IaddReg, (1 << 43) | (RZ << 20) | (r << 8) | r);
+    let ldg = |dest: u64, r: u64| sass(Opcode::Ldg, (4 << 48) | (1 << 45) | (r << 8) | dest);
+    program(
+        header,
+        &[
+            sass(Opcode::Ipa, (28 << 30) | (RZ << 8) | 1),
+            sass(
+                Opcode::F2iReg,
+                (1 << 39) | (1 << 20) | (2 << 10) | (2 << 8) | 1,
+            ),
+            shl(2),
+            mov_cbuf(8, 0x120),
+            mov_cbuf(9, 0x124),
+            add_low(8),
+            add_high(9),
+            ldg(1, 8),
+            shl(3),
+            mov_cbuf(4, 0x110),
+            mov_cbuf(5, 0x114),
+            add_low(4),
+            add_high(5),
+            ldg(6, 4),
+            mov_f32(2, 0.5),
+            mov_f32(3, 0.5),
+            tex,
+            exit(),
+        ],
+    )
+}
+
+#[test]
+fn per_invocation_table_handles_bind_a_texture_per_table_entry() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    if !f
+        .rasterizer
+        .device
+        .features
+        .sampled_image_array_non_uniform_indexing
+    {
+        eprintln!("skipping: no non-uniform sampled image indexing");
+        return;
+    }
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &indexed_table_sampling_program(),
+    );
+    let (even, odd) = ([10, 200, 30, 255], [50, 60, 70, 255]);
+    uniform_texture(&f, 0, TEXTURE, even);
+    uniform_texture(&f, 1, OTHER_TEXTURE, odd);
+    for (cbuf, buffer) in [(0x110, TABLE), (0x120, INDICES_TABLE)] {
+        let mut binding = (GPU_VA + buffer).to_le_bytes().to_vec();
+        binding.extend_from_slice(&0x200u32.to_le_bytes());
+        write(&f, FRAGMENT_CBUF + cbuf, &binding);
+    }
+    let entries: Vec<u32> = (0..64).flat_map(|i| [i & 1, 0]).collect();
+    write(&f, TABLE, bytemuck::cast_slice(&entries));
+    let indices: Vec<u32> = (0..SIZE).map(|x| x & 1).collect();
+    write(&f, INDICES_TABLE, bytemuck::cast_slice(&indices));
+    draw(&mut f, &gmmu, &sampling_regs());
+    for (i, &texel) in target(&mut f).iter().enumerate() {
+        let x = i as u32 % SIZE;
+        let want = if x.is_multiple_of(2) { even } else { odd };
+        assert_eq!(texel, want, "column {x} samples the entry its index names");
+    }
+    assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
+    f.assert_no_validation_errors();
+}
