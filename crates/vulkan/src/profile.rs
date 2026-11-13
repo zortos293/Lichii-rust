@@ -83,6 +83,7 @@ pub(crate) fn shader_profile(
         support_viewport_index_layer_non_geometry: features.shader_output_layer
             && features.shader_output_viewport_index,
         support_multi_viewport: features.multi_viewport,
+        support_sample_rate_shading: features.sample_rate_shading,
         support_typeless_image_loads: features.storage_image_read_without_format,
         support_demote_to_helper_invocation: features.demote_to_helper_invocation,
         support_derivative_control: true,
