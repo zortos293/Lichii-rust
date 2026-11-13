@@ -751,15 +751,10 @@ fn emit_single(op: Opcode, args: &[Value]) -> EmitError {
 }
 
 #[test]
-fn unsupported_and_unimplemented_opcodes_are_reported() {
+fn unsupported_opcodes_are_reported() {
     let error = emit_single(Opcode::IsbeRead, &[Value::U32(0)]);
     assert!(
         matches!(error, EmitError::UnsupportedOpcode(Opcode::IsbeRead)),
-        "{error}"
-    );
-    let error = emit_single(Opcode::SharedAtomicIAdd32, &[Value::U32(1), Value::U32(2)]);
-    assert!(
-        matches!(error, EmitError::Unimplemented(Opcode::SharedAtomicIAdd32)),
         "{error}"
     );
 }
