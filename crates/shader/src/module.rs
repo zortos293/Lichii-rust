@@ -18,6 +18,7 @@ pub fn compile(
     runtime: &RuntimeInfo,
     bindings: &mut Bindings,
 ) -> Result<ShaderModule, TranslateError> {
+    crate::fallback::begin_program();
     finish(translate(env, options)?, options, runtime, bindings)
 }
 
@@ -29,6 +30,7 @@ pub fn compile_dual_vertex(
     runtime: &RuntimeInfo,
     bindings: &mut Bindings,
 ) -> Result<ShaderModule, TranslateError> {
+    crate::fallback::begin_program();
     finish(
         translate_dual_vertex(env_a, env_b, options)?,
         options,

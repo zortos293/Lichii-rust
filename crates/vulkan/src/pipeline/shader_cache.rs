@@ -218,6 +218,8 @@ pub struct ShaderCache {
     stats: ShaderCacheStats,
     /// The counts the last INFO line showed, and when it was written.
     logged: (ShaderCacheStats, Option<Instant>),
+    /// The fallback census revision the last log showed.
+    logged_fallbacks: u64,
 }
 
 impl ShaderCache {
@@ -238,6 +240,7 @@ impl ShaderCache {
             code_check: cache::CodeCheck::default(),
             stats: ShaderCacheStats::default(),
             logged: (ShaderCacheStats::default(), None),
+            logged_fallbacks: 0,
         }
     }
 
@@ -249,11 +252,15 @@ impl ShaderCache {
         self.stats
     }
 
-    /// Writes the counts as an INFO line when they changed since the last one and at least
-    /// [`STATS_INTERVAL`] has passed; returns whether it did.
+    /// Writes the counts as an INFO line, and the translation fallback census after them, when
+    /// either changed since the last log and at least [`STATS_INTERVAL`] has passed; returns
+    /// whether it did.
     pub fn log_stats(&mut self, now: Instant) -> bool {
         let (logged, at) = self.logged;
-        if self.stats == logged || at.is_some_and(|at| now.duration_since(at) < STATS_INTERVAL) {
+        let fallbacks = lichii_shader::fallback::revision();
+        if (self.stats == logged && fallbacks == self.logged_fallbacks)
+            || at.is_some_and(|at| now.duration_since(at) < STATS_INTERVAL)
+        {
             return false;
         }
         let ShaderCacheStats {
@@ -263,7 +270,26 @@ impl ShaderCache {
             disk_hits,
         } = self.stats;
         tracing::info!(translated, failed, hits, disk_hits, "shader cache");
+        if fallbacks != self.logged_fallbacks {
+            for count in lichii_shader::fallback::census() {
+                let lichii_shader::fallback::Fallback {
+                    opcode,
+                    variant,
+                    value,
+                } = count.fallback;
+                tracing::info!(
+                    target: "shader_fallback",
+                    opcode,
+                    variant,
+                    value,
+                    programs = count.programs,
+                    sites = count.sites,
+                    "census"
+                );
+            }
+        }
         self.logged = (self.stats, Some(now));
+        self.logged_fallbacks = fallbacks;
         true
     }
 

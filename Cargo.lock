@@ -1553,6 +1553,7 @@ dependencies = [
  "lichii-kernel",
  "lichii-loader",
  "lichii-services",
+ "lichii-shader",
  "lichii-texture",
  "lichii-vulkan",
  "rfd",

@@ -493,6 +493,12 @@ impl ConfigWindow {
                     row(ui, "", |ui| {
                         ui.checkbox(&mut d.debug.dump_shaders, "Dump shaders")
                     });
+                    row(ui, "", |ui| {
+                        ui.checkbox(
+                            &mut d.debug.shader_fallbacks,
+                            "Log shader translation fallbacks (at launch)",
+                        )
+                    });
                     row(ui, "GDB stub port", |ui| {
                         optional_number(ui, &mut d.debug.gdb_stub_port, 6543)
                     });

@@ -77,6 +77,7 @@ fn main() -> ExitCode {
     let settings_path = cli.config.clone().unwrap_or_else(|| paths.settings_file());
     let (settings, warnings, writable) = read_settings(&settings_path);
     lichii_common::init_logging(&settings.debug.log_filter);
+    lichii_shader::fallback::set_enabled(settings.debug.shader_fallbacks);
     tracing::info!("Lichii {}", env!("CARGO_PKG_VERSION"));
     for warning in warnings {
         tracing::warn!("{}: {warning}", settings_path.display());
