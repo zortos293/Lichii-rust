@@ -94,6 +94,8 @@ pub struct KernelConfig {
     pub aslr: bool,
     /// Seed for ASLR and random entropy.
     pub rng_seed: u64,
+    /// Make sm refuse services a process's NPDM does not list, instead of only logging them.
+    pub enforce_service_access: bool,
     pub clock: Arc<dyn GuestClock>,
     pub cpu: CpuFactory,
     pub events: Option<Arc<dyn KernelEvents>>,
@@ -154,7 +156,7 @@ impl Kernel {
             .unwrap_or_else(|| PoolLayout::for_dram(config.dram_size, config.console));
         let memory = Arc::new(MemoryManager::new(physical.clone(), layout));
         let cores = config.console.core_count();
-        let service_manager = Arc::new(ServiceManager::default());
+        let service_manager = Arc::new(ServiceManager::new(config.enforce_service_access));
         let sm_thread = ServiceThread::new("sm");
         let named_ports = vec![(
             "sm:".to_string(),

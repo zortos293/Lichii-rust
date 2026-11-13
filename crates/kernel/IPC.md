@@ -139,6 +139,10 @@ specially built session; `push_interface` is the usual way.
   `sm::INVALID_CLIENT` before `RegisterClient`, and `sm::INVALID_SERVICE_NAME` for malformed
   names). 2/3 (guest `RegisterService`/`UnregisterService`) return `sm::NOT_ALLOWED`, because
   only HLE services register.
+  `GetServiceHandle` for a name the client's NPDM service list does not match (`*` ends a
+  prefix) is logged, and fails with `sm::NOT_ALLOWED` when
+  `Settings::system.enforce_service_access` is on (off by default until NPDM parsing has been
+  checked against real titles). Homebrew without an NPDM gets the loader's `*` list.
 
 ## Not supported yet
 
@@ -146,4 +150,3 @@ specially built session; `push_interface` is the usual way.
   `ManageNamedPort`, `ConnectToPort` and guest `RegisterService`. Titles do not use them;
   sysmodules would.
 - `SendAsyncRequestWithUserBuffer` (0x23), domain input objects, and inline C buffers.
-- Per-process service access control (the NPDM `services` list) is not enforced by `sm:`.
