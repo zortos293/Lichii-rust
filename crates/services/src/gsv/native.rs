@@ -136,6 +136,8 @@ struct Image {
     size: u64,
     /// Images in the pool: handle + i is image i.
     count: u32,
+    /// Where image 0 starts in the memory.
+    offset: u64,
     /// A video decoder output image pool (gsv 911), laid out by [`DecoderLayout`].
     decoder: bool,
 }
@@ -163,7 +165,7 @@ impl NativeObjects {
     fn image(&self, handle: u32) -> Option<(&Image, u64)> {
         let (&first, image) = self.images.range(..=handle).next_back()?;
         let index = handle - first;
-        (index < image.count).then(|| (image, u64::from(index) * image.size))
+        (index < image.count).then(|| (image, image.offset + u64::from(index) * image.size))
     }
 
     pub fn presentable(&self, handle: u32) -> Option<Presentable> {
@@ -202,6 +204,7 @@ impl NativeObjects {
                 preference,
                 size: ImageLayout::of(&preference).size,
                 count: 1,
+                offset: 0,
                 decoder: false,
             },
         );
@@ -269,16 +272,27 @@ pub(super) fn handle(objects: &Mutex<NativeObjects>, ctx: &mut HleRequestContext
             let mut objects = objects.lock();
             let id = objects.last_image + 1;
             objects.last_image += count;
-            objects.images.insert(
-                id,
-                Image {
-                    memory,
-                    preference,
-                    size,
-                    count,
-                    decoder,
-                },
-            );
+            let image = Image {
+                memory,
+                preference,
+                size,
+                count,
+                offset: 0,
+                decoder,
+            };
+            if decoder {
+                for i in 0..count {
+                    let offset = u64::from(i) * size;
+                    let one = Image {
+                        count: 1,
+                        offset,
+                        ..image
+                    };
+                    objects.images.insert(id + i, one);
+                }
+            } else {
+                objects.images.insert(id, image);
+            }
             tracing::info!(
                 "nx2:gsv {command}: native image {id} x{count} in memory {memory}, {size:#x} bytes, \
                  format {}",

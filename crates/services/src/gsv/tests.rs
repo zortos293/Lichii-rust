@@ -1190,12 +1190,18 @@ fn decoder_image_pools_are_sized_and_described_like_the_codec_expects() {
     let descriptor = reply.pop::<[u32; 32]>();
     assert_eq!((descriptor[0], descriptor[4], descriptor[6]), (0x9, 448, 0));
 
-    client.send(gsv, &Request::tipc(912).arg(pool)).unwrap();
+    client.send(gsv, &Request::tipc(912).arg(pool + 1)).unwrap();
     let mut reply = client.send(gsv, &Request::tipc(961).arg(pool + 1)).unwrap();
     assert_eq!(
         reply.pop::<[u32; 32]>(),
         [0; 32],
-        "a destroyed pool is gone"
+        "a destroyed image is gone"
+    );
+    let mut reply = client.send(gsv, &Request::tipc(961).arg(pool + 2)).unwrap();
+    assert_eq!(
+        reply.pop::<[u32; 32]>()[2],
+        2 * 0x6_4000,
+        "its siblings keep their place in the pool"
     );
 
     let mut reply = client
