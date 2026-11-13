@@ -2479,7 +2479,6 @@ fn mesh_draws_build_task_and_mesh_pipelines() {
 }
 
 #[test]
-#[ignore = "lavapipe (Mesa 25.2) drops the per-component gl_Position stores of native mesh programs"]
 fn mesh_draws_rasterize_the_primitives_their_mesh_program_writes() {
     let Some((mut f, gmmu)) = mesh_fixture() else {
         return;
@@ -2501,7 +2500,6 @@ fn mesh_draws_rasterize_the_primitives_their_mesh_program_writes() {
 }
 
 #[test]
-#[ignore = "lavapipe (Mesa 25.2) drops the per-component gl_Position stores of native mesh programs"]
 fn task_programs_launch_the_mesh_workgroups_they_count() {
     let Some((mut f, gmmu)) = mesh_fixture() else {
         return;
