@@ -143,7 +143,11 @@ fn higher_priority_thread_preempts_a_spinner() {
 
 /// Like [`spawn_and_join`] with a different entry per thread; waits a little between starts so
 /// the first thread is running when the second becomes ready.
-fn spawn_and_join_entries(heap: u64, entries: Vec<u64>, spec: Vec<(u32, u32)>) -> Script {
+pub(super) fn spawn_and_join_entries(
+    heap: u64,
+    entries: Vec<u64>,
+    spec: Vec<(u32, u32)>,
+) -> Script {
     let count = entries.len() as u64;
     let handles = heap + 0x1000;
     let entries = Arc::new(entries);

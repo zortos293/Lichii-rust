@@ -338,6 +338,38 @@ impl Thread {
         }
     }
 
+    /// The thread's scheduling state on one line, for the kernel watchdog's log. The saved `pc`
+    /// is stale while the thread runs.
+    pub(crate) fn describe(&self, waits_on: Option<&str>) -> String {
+        let lock_owner = self
+            .lock_owner
+            .lock()
+            .thread
+            .upgrade()
+            .map(|owner| owner.id());
+        let lenders: Vec<ThreadId> = self
+            .lock_waiters
+            .lock()
+            .iter()
+            .map(|waiter| waiter.thread.id())
+            .collect();
+        let s = self.sched.lock();
+        let ctx = self.context.lock();
+        format!(
+            "thread={} state={:?} priority={} base={} core={} affinity={:#x} wait={} waits_on={} pc={:#x} lr={:#x} lock_owner={lock_owner:?} lenders={lenders:?}",
+            self.id,
+            s.state,
+            s.priority,
+            s.base_priority,
+            s.active_core,
+            s.affinity,
+            s.wait,
+            waits_on.unwrap_or("-"),
+            ctx.pc,
+            ctx.x[30],
+        )
+    }
+
     /// `(ideal core, affinity mask)`.
     pub fn core_mask(&self) -> (i32, u64) {
         let s = self.sched.lock();

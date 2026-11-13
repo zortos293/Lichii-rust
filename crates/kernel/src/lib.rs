@@ -31,6 +31,7 @@ pub mod testing;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
@@ -53,7 +54,7 @@ use crate::process::{NewProcess, Process, ProcessId, ProcessParams, ProcessState
 use crate::resource_limit::{LimitableResource, ResourceLimit};
 use crate::scheduler::Scheduler;
 use crate::sm::ServiceManager;
-use crate::thread::{LOWEST_PRIORITY, NewThread, Thread};
+use crate::thread::{LOWEST_PRIORITY, NewThread, Thread, ThreadId, ThreadState};
 use crate::timer::Timer;
 use crate::util::Rng;
 
@@ -283,6 +284,13 @@ impl Kernel {
                 .spawn(move || kernel.timer.run(&kernel.scheduler))
                 .map_err(KernelError::Spawn)?,
         );
+        let kernel = self.0.clone();
+        threads.push(
+            std::thread::Builder::new()
+                .name("kernel watchdog".into())
+                .spawn(move || kernel.watch())
+                .map_err(KernelError::Spawn)?,
+        );
         for core in 0..self.core_count() {
             let kernel = self.0.clone();
             threads.push(
@@ -316,6 +324,9 @@ impl Kernel {
         self.0.scheduler.shutdown();
         self.0.timer.shutdown();
         let threads = std::mem::take(&mut *self.0.host_threads.lock());
+        for thread in &threads {
+            thread.thread().unpark();
+        }
         for thread in threads {
             join_noting_slow(thread);
         }
@@ -368,6 +379,14 @@ impl Kernel {
     }
 }
 
+/// How often the kernel watchdog looks at the cores.
+const WATCH_PERIOD: Duration = Duration::from_millis(250);
+/// How long a core may run a thread its best queued thread outranks before the watchdog logs
+/// every thread.
+const STALLED_AFTER: Duration = Duration::from_secs(2);
+/// How often the watchdog logs every thread under `debug.svc_trace`.
+const TRACE_LOG_PERIOD: Duration = Duration::from_secs(5);
+
 /// How long [`Kernel::shutdown`] waits for a thread before naming it.
 const SLOW_JOIN: Duration = Duration::from_secs(2);
 
@@ -390,6 +409,70 @@ fn join_noting_slow(thread: JoinHandle<()>) {
 }
 
 impl KernelInner {
+    /// Logs every core's running thread and queue and every thread's scheduling state and wait.
+    fn log_thread_states(&self) {
+        let processes = self.processes.lock().clone();
+        let mut running = vec![Vec::new(); self.scheduler.core_count()];
+        for thread in processes.iter().flat_map(|process| process.threads()) {
+            if let ThreadState::Running(core) = thread.sched.lock().state {
+                running[core].push(thread.id());
+            }
+        }
+        for line in self.scheduler.describe(&running) {
+            tracing::info!(target: "threads", "{line}");
+        }
+        let waits: HashMap<ThreadId, String> = self.arbiter.waits().into_iter().collect();
+        for process in processes {
+            for thread in process.threads() {
+                let waits_on = waits.get(&thread.id()).map(String::as_str);
+                tracing::info!(
+                    target: "threads",
+                    process = process.name(),
+                    "{}",
+                    thread.describe(waits_on)
+                );
+            }
+        }
+    }
+
+    /// The kernel watchdog: logs every thread once when a core has kept running a thread that its
+    /// best queued thread outranks (or idled with a queued thread) for [`STALLED_AFTER`], and
+    /// every [`TRACE_LOG_PERIOD`] under `debug.svc_trace`. Each look is one uncontended
+    /// `try_lock` per core; the cores' own paths do no watchdog work.
+    fn watch(&self) {
+        let mut stalled_since: Vec<Option<Instant>> = vec![None; self.scheduler.core_count()];
+        let mut warned = false;
+        let mut logged = Instant::now();
+        while !self.scheduler.is_shut_down() {
+            std::thread::park_timeout(WATCH_PERIOD);
+            let now = Instant::now();
+            let outranked = if self.scheduler.is_paused() {
+                0
+            } else {
+                self.scheduler.outranked_cores()
+            };
+            for (core, since) in stalled_since.iter_mut().enumerate() {
+                if outranked & (1 << core) == 0 {
+                    *since = None;
+                    continue;
+                }
+                let since = *since.get_or_insert(now);
+                if !warned && now.duration_since(since) >= STALLED_AFTER {
+                    warned = true;
+                    tracing::warn!(
+                        core,
+                        "a queued thread has outranked the running one for {STALLED_AFTER:?}; logging every thread"
+                    );
+                    self.log_thread_states();
+                }
+            }
+            if self.svc_trace && now.duration_since(logged) >= TRACE_LOG_PERIOD {
+                logged = now;
+                self.log_thread_states();
+            }
+        }
+    }
+
     pub(crate) fn events(&self) -> &dyn KernelEvents {
         &*self.events
     }
