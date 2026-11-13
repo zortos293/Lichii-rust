@@ -1787,3 +1787,149 @@ fn indirect_assembly_carries_runs_across_workgroup_chunks() {
         "quad B spans indices 62..66, across the first 64-index chunk"
     );
 }
+
+const COUNTER: u64 = 0x74_0000;
+const GRID: u64 = 0x75_0000;
+const COUNTER_CBUF: u64 = 0x76_0000;
+const GRID_CBUF: u64 = 0x76_1000;
+const COUNTING: u64 = 0x10_8000;
+const GRID_WRITER: u64 = 0x10_9000;
+
+/// Compute `code` with a scheduling word in the first slot of every 32 bytes.
+fn compute_code(code: &[u64]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for insn in code {
+        if bytes.len().is_multiple_of(32) {
+            bytes.extend_from_slice(&0u64.to_le_bytes());
+        }
+        bytes.extend_from_slice(&insn.to_le_bytes());
+    }
+    bytes
+}
+
+/// Every workgroup of one thread adds 1 to the word at c[0][0x110] and its CTAID.Y to the next.
+fn counting_program() -> Vec<u8> {
+    compute_code(&[
+        mov_cbuf(4, 0x110),
+        mov_cbuf(5, 0x114),
+        mov_u32(6, 1),
+        sass(Opcode::S2r, (38 << 20) | 7),
+        sass(Opcode::Red, (1 << 48) | (4 << 8) | 6),
+        sass(Opcode::Red, (1 << 48) | (4 << 28) | (4 << 8) | 7),
+        exit(),
+    ])
+}
+
+/// Stores `words` at c[0][0x110].
+fn grid_writer_program(words: [u32; 2]) -> Vec<u8> {
+    let stg = |data: u64, offset: u64| {
+        sass(
+            Opcode::Stg,
+            (1 << 45) | (4 << 48) | (offset << 20) | (4 << 8) | data,
+        )
+    };
+    compute_code(&[
+        mov_cbuf(4, 0x110),
+        mov_cbuf(5, 0x114),
+        mov_u32(6, words[0]),
+        mov_u32(7, words[1]),
+        stg(6, 0),
+        stg(7, 4),
+        exit(),
+    ])
+}
+
+/// Points the storage buffer at c[0][0x110] of the constant buffer at `cbuf` to `buffer`.
+fn storage_binding(f: &Fixture, cbuf: u64, buffer: u64) {
+    let mut binding = (GPU_VA + buffer).to_le_bytes().to_vec();
+    binding.extend_from_slice(&0x100u32.to_le_bytes());
+    write(f, cbuf + 0x110, &binding);
+}
+
+fn launch(
+    f: &mut Fixture,
+    gmmu: &Gmmu,
+    program: u64,
+    cbuf: u64,
+    grid: [u32; 3],
+    indirect_grid: Option<u64>,
+) {
+    let mut const_buffers = [ConstBufferBinding::default(); 8];
+    const_buffers[0] = ConstBufferBinding {
+        address: GPU_VA + cbuf,
+        size: 0x200,
+        enabled: true,
+    };
+    let qmd = [0u32; 64];
+    f.rasterizer.dispatch_compute(&ComputeContext {
+        channel: ChannelId(0),
+        memory: gmmu,
+        program: GPU_VA + program,
+        grid,
+        block: [1; 3],
+        shared_memory_size: 0,
+        local_memory_size: 0,
+        const_buffers: &const_buffers,
+        texture_headers: 0,
+        texture_header_limit: 0,
+        samplers: 0,
+        sampler_limit: 0,
+        linked_samplers: false,
+        qmd_version: QmdVersion::V2,
+        qmd: &qmd,
+        indirect_grid: indirect_grid.map(|offset| GPU_VA + offset),
+    });
+}
+
+/// The workgroups that ran and the sum of their CTAID.Y.
+fn counted(f: &mut Fixture) -> [u32; 2] {
+    f.rasterizer.flush_region(DADDR + COUNTER, 8);
+    let mut words = [0u32; 2];
+    f.memory
+        .read_bytes(DADDR + COUNTER, bytemuck::cast_slice_mut(&mut words))
+        .unwrap();
+    words
+}
+
+#[test]
+fn indirect_dispatches_unpack_the_descriptor_grid() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(&f, COUNTING, &counting_program());
+    storage_binding(&f, COUNTER_CBUF, COUNTER);
+    write(&f, COUNTER, &[0; 8]);
+    let packed = [3 | 1 << 31, 4 | 5 << 16, 7];
+    let grid = GRID + 0x24;
+    write(&f, grid, bytemuck::cast_slice(&packed));
+    launch(&mut f, &gmmu, COUNTING, COUNTER_CBUF, [1; 3], Some(grid));
+    assert_eq!(
+        counted(&mut f),
+        [3 * 4 * 5, 3 * 5 * (1 + 2 + 3)],
+        "width 3 (bit 31 is another field), height 4 and depth 5"
+    );
+    assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn indirect_dispatches_read_the_grid_earlier_gpu_work_wrote() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(&f, COUNTING, &counting_program());
+    write(&f, GRID_WRITER, &grid_writer_program([2, 3 | 4 << 16]));
+    storage_binding(&f, COUNTER_CBUF, COUNTER);
+    storage_binding(&f, GRID_CBUF, GRID);
+    write(&f, COUNTER, &[0; 8]);
+    write(&f, GRID, bytemuck::cast_slice(&[1u32, 1 | 1 << 16]));
+    launch(&mut f, &gmmu, GRID_WRITER, GRID_CBUF, [1; 3], None);
+    launch(&mut f, &gmmu, COUNTING, COUNTER_CBUF, [1; 3], Some(GRID));
+    assert_eq!(
+        counted(&mut f),
+        [2 * 3 * 4, 2 * 4 * (1 + 2)],
+        "the 2x3x4 grid the first dispatch stored, not the guest's 1x1x1"
+    );
+    assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
+    f.assert_no_validation_errors();
+}
