@@ -583,7 +583,7 @@ impl Translator<'_> {
                     SysReg::CntfrqEl0 => self.k(self.config.clock.frequency()),
                     SysReg::CtrEl0 => self.k(self.config.ctr_el0 as u64),
                     SysReg::DczidEl0 => self.k(self.config.dczid_el0 as u64),
-                    SysReg::CntpctEl0 | SysReg::CntvctEl0 => return Step::Rejected,
+                    SysReg::CntpctEl0 | SysReg::CntvctEl0 => self.op(Op::Ticks),
                 };
                 self.set_x(rt, v);
             }
@@ -760,6 +760,45 @@ impl Translator<'_> {
                     pc,
                 });
                 self.writeback(rn, wb);
+            }
+            Inst::AtomicRmw {
+                op,
+                size,
+                rs,
+                rt,
+                rn,
+                ..
+            } => {
+                let addr = self.x(rn);
+                let value = self.x(rs);
+                let old = self.op(Op::AtomicRmw {
+                    op,
+                    size,
+                    addr,
+                    value,
+                    pc,
+                });
+                self.set_x(rt, old);
+            }
+            Inst::Cas {
+                size, rs, rt, rn, ..
+            } => {
+                let addr = self.x(rn);
+                let (expected, new) = (self.x(rs), self.x(rt));
+                let old = self.op(Op::Cas {
+                    size,
+                    addr,
+                    expected,
+                    new,
+                    pc,
+                });
+                self.set_x(rs, old);
+            }
+            Inst::DcZva { rt } if 4 << (self.config.dczid_el0 & 0xf) == 64 => {
+                let t = self.x(rt);
+                let mask = self.k(!63);
+                let addr = self.op(Op::And(W::W64, t, mask));
+                self.op(Op::ZeroBlock { addr, pc });
             }
             _ => return Step::Rejected,
         }

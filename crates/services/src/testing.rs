@@ -6,7 +6,9 @@ use lichii_common::perf::PerfStats;
 use lichii_common::settings::Settings;
 use lichii_common::{ConsoleGeneration, ResultCode, VAddr};
 use lichii_fs::nacp::Nacp;
+use lichii_gpu::backend::NullRasterizer;
 use lichii_gpu::host1x::Host1x;
+use lichii_gpu::{Console, Gpu, GpuConfig};
 use lichii_input::hub::NpadHub;
 use lichii_kernel::ipc::Handle;
 use lichii_kernel::memory_objects::TransferMemory;
@@ -35,19 +37,24 @@ pub fn context_for(program: ProgramImage, settings: Settings) -> (Arc<ServiceCon
     let kernel = testing::kernel(generation);
     let program = Arc::new(program);
     let process = kernel.create_process(&program).unwrap();
-    let bits = match generation {
-        ConsoleGeneration::Switch1 => 34,
-        ConsoleGeneration::Switch2 => 36,
+    let (console, bits) = match generation {
+        ConsoleGeneration::Switch1 => (Console::Switch1, 34),
+        ConsoleGeneration::Switch2 => (Console::Switch2, 36),
     };
     let host1x = Host1x::new(kernel.physical_memory().clone(), bits);
+    let gpu = Gpu::new(
+        host1x,
+        Arc::new(Clock),
+        GpuConfig::new(console),
+        |handles| Box::new(NullRasterizer::new(handles)),
+    );
     let client = IpcClient::new(&kernel, &process);
     let context = ServiceContext::new(ServiceParts {
         kernel,
         settings: Arc::new(settings),
         program,
         process,
-        host1x,
-        nx2_memory: None,
+        gpu: Arc::new(gpu),
         npad: Arc::new(NpadHub::default()),
         perf: Arc::new(PerfStats::default()),
     });
@@ -190,5 +197,13 @@ impl ReplyExt for Reply {
     fn handle(&self) -> Handle {
         assert_eq!(self.copy_handles.len(), 1, "expected one copy handle");
         self.copy_handles[0]
+    }
+}
+
+struct Clock;
+
+impl lichii_gpu::clock::GuestTime for Clock {
+    fn global_time_ns(&self) -> u64 {
+        0
     }
 }

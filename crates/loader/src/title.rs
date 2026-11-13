@@ -301,12 +301,10 @@ impl LooseTitle {
         let mods = Mods::find(&options.mods, Npdm::parse(&npdm.read_all()?)?.program_id)?;
         let (npdm, mut modules) = load_exefs(mods.layer_exefs(exefs)?.as_ref(), options.hashes)?;
         mods.patch_modules(&mut modules)?;
-        Ok(ProgramImage::new(
-            npdm,
-            modules,
-            mods.layer_romfs(self.romfs()?)?,
-            self.nacp(),
-        ))
+        let mut image =
+            ProgramImage::new(npdm, modules, mods.layer_romfs(self.romfs()?)?, self.nacp());
+        image.icon = self.icon();
+        Ok(image)
     }
 }
 
@@ -436,12 +434,9 @@ pub fn load(path: &Path, options: &LoadOptions) -> LoaderResult<ProgramImage> {
                 .unwrap_or_default();
             let (module, assets) = load_nro(&HostFile::open(path)?, &name)?;
             let nacp = assets.nacp.and_then(|f| Nacp::read(f.as_ref()).ok());
-            Ok(ProgramImage::new(
-                Npdm::homebrew(0),
-                vec![module],
-                assets.romfs,
-                nacp,
-            ))
+            let mut image = ProgramImage::new(Npdm::homebrew(0), vec![module], assets.romfs, nacp);
+            image.icon = assets.icon.map(|f| f.read_all()).transpose()?;
+            Ok(image)
         }
     }
 }
