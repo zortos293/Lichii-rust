@@ -147,6 +147,8 @@ pub struct EngineContext<'a> {
     pub syncpoints: &'a Syncpoints,
     /// GOB byte order of block-linear surfaces (Switch 2 swaps bits 5 and 6).
     pub gob_layout: GobLayout,
+    /// Dependence state of native compute QMDs, one table for every channel.
+    pub qmd_scheduler: &'a mut kepler_compute::pcas::QmdScheduler,
 }
 
 #[cfg(test)]

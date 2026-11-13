@@ -19,7 +19,11 @@ dynasm = "5"
 libc = "0.2"
 
 [target.'cfg(all(target_arch = "x86_64", windows))'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Memory",
+] }
 
 [dev-dependencies]
 unicorn-engine = { version = "2.1.5", default-features = false, features = ["arch_arm", "arch_aarch64"] }

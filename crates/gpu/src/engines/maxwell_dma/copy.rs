@@ -418,6 +418,18 @@ fn copy_elements(
             return;
         }
     }
+    if let Some(value) = remap.and_then(|remap| remap.fill_value())
+        && !dst_gob
+        && ctx.rasterizer.accelerate_buffer_clear(
+            ctx.channel,
+            ctx.memory,
+            dst,
+            elements * dst_bytes,
+            value,
+        )
+    {
+        return;
+    }
     let step = (CHUNK as u64 / src_bytes.max(dst_bytes)).max(1);
     let chunks = elements.div_ceil(step);
     let backwards = remap.is_none() && dst > src && dst - src < elements;

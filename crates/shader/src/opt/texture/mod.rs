@@ -1058,7 +1058,10 @@ fn bind(
         }
         let is_written = op != Opcode::ImageRead;
         let is_read = op != Opcode::ImageWrite;
-        let is_integer = byte_address || tracker.is_integer(cbuf.handle);
+        let is_integer = byte_address
+            || flags.image_format != ImageFormat::Typeless
+            || !matches!(op, Opcode::ImageRead | Opcode::ImageWrite)
+            || tracker.is_integer(cbuf.handle);
         let (cbuf_index, cbuf_offset) = (cbuf.handle.cbuf_index, cbuf.handle.cbuf_offset);
         if flags.ty == TextureType::Buffer {
             let desc = ImageBufferDescriptor {
