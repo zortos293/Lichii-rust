@@ -2176,7 +2176,8 @@ impl VulkanRasterizer {
     /// The raw handle `info`'s handle program `program` computes for descriptor array
     /// `element`. Its storage reads are relative to the binding address, the buffer's pointer
     /// aligned down to the storage alignment; words past the buffer, and of an unbound one,
-    /// read as 0. A word GPU work wrote is downloaded first, so no handle reads stale memory.
+    /// read as 0. A word GPU work wrote is downloaded first, so no handle reads stale memory;
+    /// the download waits for the GPU, which frees views retired since, so the bind loop reruns.
     fn program_handle(
         &mut self,
         src: &StageSources<'_>,
@@ -2220,6 +2221,7 @@ impl VulkanRasterizer {
                 return Ok(raw);
             };
             self.buffer_cache.flush(&mut self.scheduler, daddr, 4)?;
+            self.draw.rebind = true;
         }
     }
 }
