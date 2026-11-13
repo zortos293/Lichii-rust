@@ -193,6 +193,20 @@ pub struct HandleSource {
     pub secondary: Option<(u32, u32, u32)>,
 }
 
+impl HandleSource {
+    /// The raw handle the words hold, read through `read_cbuf(index, offset)`: the primary word
+    /// shifted, ORed with the secondary word shifted (with no secondary, the primary word
+    /// itself, as the C++ does).
+    pub fn handle(&self, mut read_cbuf: impl FnMut(u32, u32) -> u32) -> u32 {
+        let lhs = read_cbuf(self.cbuf_index, self.cbuf_offset);
+        let (rhs, shift) = match self.secondary {
+            Some((index, offset, shift)) => (read_cbuf(index, offset), shift),
+            None => (lhs, 0),
+        };
+        lhs.checked_shl(self.shift_left).unwrap_or(0) | rhs.checked_shl(shift).unwrap_or(0)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct TextureBufferDescriptor {
     pub handle: HandleSource,
