@@ -231,3 +231,44 @@ fn lock_accessors_start_free_with_their_event_signaled() {
     let mut reply = client.send(lock, &Request::new(1).arg(0u8)).unwrap();
     assert_eq!(reply.pop::<u8>(), 0, "already held");
 }
+
+#[test]
+fn launch_parameter_preselects_the_acc_user_whose_save_ensure_save_data_creates() {
+    let dir = crate::testing::TempDir::new("am-preselected");
+    let settings = dir.settings();
+    let nand = settings.paths.nand_dir.clone().unwrap();
+    let (context, client) = context(SWITCH1_TITLE, settings);
+    crate::acc::register(&context).unwrap();
+    register(&context).unwrap();
+    let proxy = open(&client, 0);
+    let functions = interface(&client, proxy, 20);
+    let user = *context.user.get().unwrap();
+
+    let reply = client.send(functions, &Request::new(1).arg(2u32)).unwrap();
+    assert_eq!(reply.result, ResultCode::SUCCESS);
+    let accessor = interface(&client, reply.move_handles[0], 0);
+    let output = client.alloc(&[0xff; 0x88]);
+    let read = Request::new(11).arg(0i64).buffer_b(output, 0x88);
+    assert_eq!(
+        client.send(accessor, &read).unwrap().result,
+        ResultCode::SUCCESS
+    );
+    let data = client.read(output, 0x88);
+    assert_eq!(&data[0..4], &0xc794_97cau32.to_le_bytes());
+    assert_eq!(&data[4..8], &1u32.to_le_bytes());
+    assert_eq!(&data[8..24], &user);
+    assert!(data[24..].iter().all(|&b| b == 0));
+    let again = client.send(functions, &Request::new(1).arg(2u32)).unwrap();
+    assert_eq!(again.result, NO_DATA_IN_CHANNEL);
+
+    let mut reply = client.send(functions, &Request::new(20).arg(user)).unwrap();
+    assert_eq!(reply.result, ResultCode::SUCCESS);
+    assert_eq!(reply.pop::<u64>(), 0);
+    let id = u128::from_le_bytes(user);
+    let save = nand.join(format!(
+        "user/save/0000000000000000/{:016X}{:016X}/{SWITCH1_TITLE:016X}",
+        (id >> 64) as u64,
+        id as u64
+    ));
+    assert!(save.is_dir(), "{} was not created", save.display());
+}
