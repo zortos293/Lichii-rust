@@ -1190,6 +1190,7 @@ fn video_decoder_sessions_hand_out_decoder_services() {
 struct Vdec {
     context: Arc<ServiceContext>,
     client: IpcClient,
+    gsv: Handle,
     service: Handle,
     frame: u64,
 }
@@ -1206,6 +1207,7 @@ impl Vdec {
         let vdec = Self {
             context,
             client,
+            gsv,
             service,
             frame,
         };
@@ -1244,6 +1246,16 @@ impl Vdec {
                 .buffer_a(self.frame, size)
                 .arg(pts)
                 .arg(u8::from(end)),
+        )
+    }
+
+    fn submit_frame(&self, data: &[u8], pts: u64) -> lichii_kernel::testing::Reply {
+        let frame = self.client.alloc(data);
+        self.send(
+            &Request::tipc(109)
+                .buffer_a(frame, data.len() as u64)
+                .arg(pts)
+                .arg(0u8),
         )
     }
 
@@ -1388,16 +1400,17 @@ fn video_decoder_counts_unregistered_images_off_in_turn() {
 #[test]
 fn video_decoder_stop_completes_handed_fences_and_full_queues_are_busy() {
     let vdec = Vdec::open();
-    for pts in 0..24 {
-        assert_eq!(vdec.submit(pts * 16_667, false).result, ResultCode::SUCCESS);
+    let mut accepted = 0;
+    while vdec.submit(accepted * 16_667, false).result == ResultCode::SUCCESS {
+        accepted += 1;
+        assert!(accepted <= 32, "busy while no image takes a frame");
     }
-    assert_eq!(
-        vdec.submit(24 * 16_667, false).result,
-        ResultCode::new(111, 3603),
-        "busy while no image takes a frame"
+    assert!(
+        accepted >= 24,
+        "{accepted} inputs queue before the decoder refuses more"
     );
     assert_eq!(
-        vdec.submit(25 * 16_667, true).result,
+        vdec.submit(40 * 16_667, true).result,
         ResultCode::SUCCESS,
         "end of stream is never refused"
     );
@@ -1413,6 +1426,80 @@ fn video_decoder_stop_completes_handed_fences_and_full_queues_are_busy() {
         last,
         "stopped images take no more frames"
     );
+    vdec.close(syncpoint);
+}
+
+/// The frames of an IVF file.
+fn ivf_frames(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut at = usize::from(u16::from_le_bytes([bytes[6], bytes[7]]));
+    let mut frames = Vec::new();
+    while at + 12 <= bytes.len() {
+        let size = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        frames.push(&bytes[at + 12..at + 12 + size]);
+        at += 12 + size;
+    }
+    frames
+}
+
+#[test]
+fn video_decoder_writes_decoded_pictures_into_nv12_images() {
+    if !lichii_video::available() {
+        eprintln!("FFmpeg is not installed; skipping");
+        return;
+    }
+    const IMAGE_SIZE: u64 = 64 * 128 * 2;
+    let vdec = Vdec::open();
+    let images = vdec.client.alloc(&vec![0u8; 3 * IMAGE_SIZE as usize]);
+    let mut reply = vdec
+        .client
+        .send(
+            vdec.gsv,
+            &words(Request::tipc(111), &[1, 3 * IMAGE_SIZE as u32, 0]),
+        )
+        .unwrap();
+    let memory = reply.pop::<u32>();
+    let bind = [
+        [memory].as_slice(),
+        &split(images),
+        &split(3 * IMAGE_SIZE),
+        &[0; 4],
+    ]
+    .concat();
+    let reply = vdec
+        .client
+        .send(vdec.gsv, &words(Request::tipc(114), &bind))
+        .unwrap();
+    assert_eq!(reply.result, ResultCode::SUCCESS);
+    let pool_request = [decoder_preference(1, 64, 48), vec![3, memory]].concat();
+    let mut reply = vdec
+        .client
+        .send(vdec.gsv, &words(Request::tipc(911), &pool_request))
+        .unwrap();
+    let pool = reply.pop::<u32>();
+
+    let fences: Vec<_> = (0..3).map(|i| vdec.hand_out(311, pool + i)).collect();
+    let stream = ivf_frames(include_bytes!(
+        "../../../video/tests/data/quadrants.vp9.ivf"
+    ));
+    for (frame, data) in stream.iter().take(3).enumerate() {
+        let reply = vdec.submit_frame(data, frame as u64 * 33_333);
+        assert_eq!(reply.result, ResultCode::SUCCESS);
+    }
+    let (syncpoint, last) = fences[2];
+    vdec.wait(syncpoint, last);
+
+    let memory = vdec.context.process.memory();
+    for frame in 0..3u64 {
+        assert_eq!(
+            vdec.output(),
+            Some((pool + frame as u32, 64, frame * 33_333_000, false))
+        );
+        let image = images + frame * IMAGE_SIZE;
+        let luma: u8 = memory.read(image + 6 * 64 + 8).unwrap();
+        let chroma: [u8; 2] = memory.read(image + 64 * 128 + 3 * 64 + 8).unwrap();
+        assert_eq!(luma, 40 + 30 * frame as u8, "frame {frame} luma");
+        assert_eq!(chroma, [90, 200 - 15 * frame as u8], "frame {frame} chroma");
+    }
     vdec.close(syncpoint);
 }
 

@@ -185,7 +185,8 @@ impl State {
 
     fn flush(&mut self) {
         let inputs: Vec<_> = self.inputs.drain(..).chain(self.held.take()).collect();
-        self.spare.extend(inputs.into_iter().map(|input| input.data));
+        self.spare
+            .extend(inputs.into_iter().map(|input| input.data));
         let frames: Vec<_> = self.decoded.drain(..).filter_map(|d| d.frame).collect();
         self.frames.extend(frames);
         self.reset = true;
@@ -507,7 +508,13 @@ impl Shared {
     }
 
     /// Writes `frame`'s picture into `image`; returns the size the frame reports.
-    fn write(&self, media: &mut Media, handout: Handout, frame: &Frame, size: (u32, u32)) -> (u32, u32) {
+    fn write(
+        &self,
+        media: &mut Media,
+        handout: Handout,
+        frame: &Frame,
+        size: (u32, u32),
+    ) -> (u32, u32) {
         let Some(picture) = frame.picture() else {
             return size;
         };
@@ -515,7 +522,10 @@ impl Shared {
             return (picture.width, picture.height);
         };
         if let Some((syncpoint, value)) = handout.release {
-            let _ = self.syncpoints.guest().wait(syncpoint, value, Some(RELEASE_WAIT));
+            let _ = self
+                .syncpoints
+                .guest()
+                .wait(syncpoint, value, Some(RELEASE_WAIT));
         }
         let layout = target.layout;
         let (width, height) = (
@@ -530,7 +540,10 @@ impl Shared {
             DecoderFormat::Nv12 { chroma_offset } => {
                 let chroma = chroma_offset as usize;
                 write_nv12(&picture, staging, pitch, chroma, width, height)
-                    && self.memory.write_bytes(target.address, &staging[..rows]).is_ok()
+                    && self
+                        .memory
+                        .write_bytes(target.address, &staging[..rows])
+                        .is_ok()
                     && self
                         .memory
                         .write_bytes(
@@ -546,7 +559,10 @@ impl Shared {
                     ColorOrder::Bgra
                 };
                 write_rgba(&picture, staging, pitch, width, height, order)
-                    && self.memory.write_bytes(target.address, &staging[..rows]).is_ok()
+                    && self
+                        .memory
+                        .write_bytes(target.address, &staging[..rows])
+                        .is_ok()
             }
         };
         if !written && !media.write_failed {

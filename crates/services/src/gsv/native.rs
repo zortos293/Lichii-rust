@@ -87,7 +87,9 @@ const MAX_DECODER_IMAGES: u32 = 64;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DecoderFormat {
     /// Luma rows, then interleaved CbCr rows from `chroma_offset`.
-    Nv12 { chroma_offset: u64 },
+    Nv12 {
+        chroma_offset: u64,
+    },
     Bgra,
     Rgba,
 }
