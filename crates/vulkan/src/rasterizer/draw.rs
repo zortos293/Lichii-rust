@@ -188,6 +188,7 @@ pub(super) struct DrawState {
     write_masks: Vec<vk::ColorComponentFlags>,
     texture_pipelines: Option<texture::TexturePipelines>,
     assembly: Option<assembly::AssemblyPass>,
+    grid: Option<dispatch_grid::GridPass>,
 }
 
 impl DrawState {
@@ -302,6 +303,7 @@ impl DrawState {
             write_masks: Vec::new(),
             texture_pipelines: None,
             assembly: None,
+            grid: None,
         })
     }
 
@@ -1996,7 +1998,7 @@ impl VulkanRasterizer {
             samplers: ctx.samplers,
             sampler_limit: ctx.sampler_limit,
         };
-        loop {
+        let grid = loop {
             let merged = self.buffer_cache.stats().merged_buffers;
             self.draw.rebind = false;
             self.draw.buffer_infos.clear();
@@ -2010,12 +2012,33 @@ impl VulkanRasterizer {
             if !self.bind_resources(&module, &sources)? {
                 return Ok(());
             }
+            let grid = match ctx.indirect_grid {
+                Some(address) => match self.buffer_cache.storage_buffer(
+                    &mut self.scheduler,
+                    &mut self.staging,
+                    ctx.memory,
+                    address,
+                    8,
+                    false,
+                )? {
+                    Some(binding) => Some((binding, address)),
+                    None => return Ok(()),
+                },
+                None => None,
+            };
             if self.buffer_cache.stats().merged_buffers == merged && !self.draw.rebind {
-                break;
+                break grid;
             }
-        }
+        };
         let set = self.descriptor_set(set_layout)?;
         let cmd = self.scheduler.record()?;
+        let align = self.buffer_cache.storage_alignment();
+        let grid = match grid {
+            Some((binding, address)) => {
+                Some(self.unpack_grid(cmd, binding, (address & (align - 1)) as u32)?)
+            }
+            None => None,
+        };
         for &id in &self.draw.textures {
             self.texture_cache.prepare(cmd, id, SHADER_SAMPLED);
         }
@@ -2048,7 +2071,10 @@ impl VulkanRasterizer {
         let raw = &self.device.raw;
         // SAFETY: as above.
         unsafe {
-            raw.cmd_dispatch(cmd, x, y, z);
+            match grid {
+                Some(command) => raw.cmd_dispatch_indirect(cmd, command, 0),
+                None => raw.cmd_dispatch(cmd, x, y, z),
+            }
             raw.cmd_pipeline_barrier2(
                 cmd,
                 &vk::DependencyInfo::default().memory_barriers(&[barrier]),
@@ -2123,6 +2149,8 @@ fn storage_pointer(
 }
 
 mod assembly;
+mod dispatch_grid;
+mod host_compute;
 mod texture;
 
 #[cfg(test)]

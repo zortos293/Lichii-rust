@@ -94,6 +94,8 @@ pub static EGUI_FRAG: &[u32] = spirv!("egui.frag");
 pub static BLOCK_LINEAR_UNSWIZZLE_COMP: &[u32] = spirv!("block_linear_unswizzle.comp");
 /// `indirect_assemble.comp`: Quads, quad strips and line loops of indirect draws as u32 triangle list or line strip indices and patched `VkDrawIndexedIndirectCommand`s, one 64-invocation workgroup per guest command.
 pub static INDIRECT_ASSEMBLE_COMP: &[u32] = spirv!("indirect_assemble.comp");
+/// `dispatch_grid.comp`: The packed grid words of a version 1.x launch descriptor as a `VkDispatchIndirectCommand`, clamped to the device's workgroup count limits; one invocation.
+pub static DISPATCH_GRID_COMP: &[u32] = spirv!("dispatch_grid.comp");
 /// `clear.vert`: Fullscreen triangle from `gl_VertexIndex` 0..2 with no outputs, for masked clears.
 pub static CLEAR_VERT: &[u32] = spirv!("clear.vert");
 /// `clear_float.frag`: Writes the push constant `vec4` to a float or normalized colour target at location 0.
@@ -128,6 +130,7 @@ pub static ALL: &[(&str, &[u32])] = &[
     ("egui.frag", EGUI_FRAG),
     ("block_linear_unswizzle.comp", BLOCK_LINEAR_UNSWIZZLE_COMP),
     ("indirect_assemble.comp", INDIRECT_ASSEMBLE_COMP),
+    ("dispatch_grid.comp", DISPATCH_GRID_COMP),
     ("clear.vert", CLEAR_VERT),
     ("clear_float.frag", CLEAR_FLOAT_FRAG),
     ("clear_uint.frag", CLEAR_UINT_FRAG),
