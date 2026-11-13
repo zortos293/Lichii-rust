@@ -243,6 +243,66 @@ fn serves_plain_font_copies_to_switch_2_titles() {
 }
 
 #[test]
+fn switch_2_standard_font_gets_the_button_icons() {
+    let dir = TempDir::new("icons");
+    let standard = font_merge::tests::font(
+        1024,
+        &[
+            font_merge::tests::triangle(10),
+            font_merge::tests::triangle(20),
+        ],
+        &[(0x41, 1)],
+        false,
+    );
+    let extension = font_merge::tests::font(
+        1024,
+        &[
+            font_merge::tests::triangle(10),
+            font_merge::tests::triangle(30),
+        ],
+        &[(0xE0A0, 1)],
+        false,
+    );
+    let merged =
+        font_merge::merge_glyphs(&standard, &extension, &font_merge::BUTTON_GLYPHS).unwrap();
+    std::fs::write(dir.0.join("fonts/nintendo_udsg-r_std_003.ttf"), &standard).unwrap();
+    std::fs::write(dir.0.join("fonts/nintendo_ext_003.ttf"), &extension).unwrap();
+    let (_context, client, pl) = boot(SWITCH2_TITLE, &dir);
+
+    let size = merged.len() as u32;
+    assert_eq!(
+        font_data(&client, pl, Request::new(2010).arg(0u32)),
+        (1, 0, size)
+    );
+    let extension_offset = size.next_multiple_of(0x1000);
+    assert_eq!(
+        font_data(&client, pl, Request::new(2010).arg(5u32)),
+        (1, extension_offset, extension.len() as u32)
+    );
+    let reply = send(&client, pl, Request::new(2000));
+    let builtin = shared_memory(&client, reply.copy_handles[0]);
+    assert_eq!(read(&builtin, 0, merged.len()), merged);
+    let (address, transfer) = transfer_memory(&client, 0, 0x4000);
+    send(
+        &client,
+        pl,
+        Request::new(2100)
+            .arg(0u32)
+            .arg(0x4000u32)
+            .copy_handle(transfer),
+    );
+    assert_eq!(client.read(address, merged.len()), merged);
+
+    let handle = send(&client, pl, Request::new(4)).copy_handles[0];
+    let switch1 = shared_memory(&client, handle);
+    assert_eq!(
+        read(&switch1, 8, standard.len()),
+        standard,
+        "Switch 1 titles keep the firmware font"
+    );
+}
+
+#[test]
 fn without_fonts_serves_empty_well_formed_memory() {
     let dir = TempDir::new("empty");
     let (_context, client, pl) = boot(SWITCH1_TITLE, &dir);

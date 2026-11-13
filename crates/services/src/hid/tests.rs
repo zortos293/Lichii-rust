@@ -522,6 +522,123 @@ fn vibration_reaches_the_npad_hub() {
 }
 
 #[test]
+fn both_motors_of_an_npad_reach_the_hub_together() {
+    let hid = Hid::new();
+    let handle = |device_index| DeviceHandle {
+        style_index: 5,
+        npad_id: 1,
+        device_index,
+        reserved: 0,
+    };
+    let active = VibrationValue {
+        low_amplitude: 0.5,
+        low_frequency: 100.0,
+        high_amplitude: 0.0,
+        high_frequency: 320.0,
+    };
+    let high = VibrationValue {
+        high_amplitude: 0.75,
+        high_frequency: 400.0,
+        ..DEFAULT_VIBRATION
+    };
+    let mut seen = 0;
+    for (device, value) in [(0, active), (1, DEFAULT_VIBRATION), (1, high)] {
+        hid.send(
+            Request::new(201)
+                .send_pid()
+                .arg(handle(device))
+                .arg(RawVibration::from(value))
+                .arg(ARUID),
+        )
+        .ok();
+        let expected = VibrationValue {
+            high_amplitude: value.high_amplitude,
+            high_frequency: value.high_frequency,
+            ..active
+        };
+        assert_eq!(
+            hid.context.npad.take_vibration(1, &mut seen),
+            Some(expected),
+            "after {value:?} on device {device}"
+        );
+    }
+}
+
+#[test]
+fn joy_con_assignment_splits_a_pair_and_merges_it_back() {
+    let hid = Hid::new();
+    let all_styles = 0b11111;
+    hid.start_npads(all_styles);
+    hid.publish(
+        0,
+        NpadState {
+            controller: ControllerType::DualJoycons,
+            buttons: NpadButtons::A | NpadButtons::UP,
+            ..pro_controller()
+        },
+    );
+    eventually("the pair to connect", || {
+        hid.style(0) == Style::JoyDual.tag()
+    });
+    let event = hid
+        .send(Request::new(106).send_pid().arg(0u32).arg(ARUID).arg(0u64))
+        .ok()
+        .copies[0];
+    let event = hid.event(event);
+    event.clear();
+    let assignment = |index| hid.read::<u32>(NpadEntry::new(index).at(NpadEntry::ASSIGNMENT_MODE));
+
+    let keep_right = 1u64;
+    let split = hid
+        .send(
+            Request::new(133)
+                .send_pid()
+                .arg(0u32)
+                .arg(ARUID)
+                .arg(keep_right),
+        )
+        .ok();
+    assert_eq!((split.get::<u8>(0), split.get::<u32>(4)), (1, 1));
+    assert_eq!(hid.style(0), Style::JoyRight.tag());
+    assert_eq!(hid.style(1), Style::JoyDual.tag());
+    assert_eq!((assignment(0), assignment(1)), (1, 0));
+    assert!(
+        event.is_signaled(),
+        "the split changes the style of entry 0"
+    );
+    let right = lifo_offset(NpadEntry::new(0).pad(PadLifo::JoyRight));
+    let left_half = lifo_offset(NpadEntry::new(1).pad(PadLifo::JoyDual));
+    eventually("each Joy-Con's buttons on its own entry", || {
+        let right = hid.newest::<NpadGenericState>(right).1;
+        let left = hid.newest::<NpadGenericState>(left_half).1;
+        right.buttons == NpadButtons::A.bits()
+            && left.buttons == NpadButtons::UP.bits()
+            && left.attributes == 0x5
+            && left.right_stick == [0, 0]
+    });
+
+    hid.send(Request::new(123).send_pid().arg(1u32).arg(ARUID).arg(0u64))
+        .ok();
+    assert_eq!(hid.style(1), Style::JoyLeft.tag());
+    assert_eq!(assignment(1), 1);
+
+    hid.send(Request::new(125).send_pid().arg(0u32).arg(1u32).arg(ARUID))
+        .ok();
+    assert_eq!(hid.style(0), Style::JoyDual.tag());
+    assert_eq!(hid.style(1), 0);
+    assert_eq!(assignment(0), 0);
+
+    hid.send(Request::new(122).send_pid().arg(0u32).arg(ARUID))
+        .ok();
+    assert_eq!(hid.style(0), Style::JoyLeft.tag());
+    assert_eq!(hid.style(1), Style::JoyDual.tag());
+    hid.send(Request::new(124).send_pid().arg(0u32).arg(ARUID))
+        .ok();
+    assert_eq!(hid.style(0), Style::JoyDual.tag());
+    assert_eq!(hid.style(1), Style::JoyDual.tag());
+}
+
+#[test]
 fn npad_settings_round_trip() {
     let hid = Hid::new();
     assert_eq!(

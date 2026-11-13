@@ -5,7 +5,7 @@
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use lichii_common::settings::ControllerType;
+use lichii_common::settings::{ControllerType, MAX_PLAYERS};
 use lichii_input::{NpadButtons, NpadHub, NpadState, VibrationValue};
 use lichii_kernel::Event;
 use lichii_kernel::memory_objects::SharedMemory;
@@ -98,6 +98,62 @@ impl Style {
     }
 }
 
+/// The Joy-Cons of a host controller an npad entry shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Halves {
+    pub left: bool,
+    pub right: bool,
+}
+
+impl Halves {
+    pub const BOTH: Self = Self {
+        left: true,
+        right: true,
+    };
+    pub const LEFT: Self = Self {
+        left: true,
+        right: false,
+    };
+    pub const RIGHT: Self = Self {
+        left: false,
+        right: true,
+    };
+
+    /// The Joy-Cons a host controller has, `None` for one that is not made of Joy-Cons.
+    fn of(controller: ControllerType) -> Option<Self> {
+        match Style::of(controller) {
+            Style::JoyDual => Some(Self::BOTH),
+            Style::JoyLeft => Some(Self::LEFT),
+            Style::JoyRight => Some(Self::RIGHT),
+            _ => None,
+        }
+    }
+
+    fn contains(self, other: Self) -> bool {
+        (self.left || !other.left) && (self.right || !other.right)
+    }
+}
+
+/// An npad entry the title reassigned (`SetNpadMode`, `MergeSingleJoyAsDualJoy`): it shows
+/// `halves` of host `player`'s Joy-Cons instead of the player's own controller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Route {
+    pub player: usize,
+    pub halves: Halves,
+}
+
+impl Route {
+    /// The style of a reassigned entry: a whole pair is dual, one Joy-Con is single only in the
+    /// single assignment mode.
+    fn style(self, single: bool) -> Style {
+        match (self.halves, single) {
+            (Halves::LEFT, true) => Style::JoyLeft,
+            (Halves::RIGHT, true) => Style::JoyRight,
+            _ => Style::JoyDual,
+        }
+    }
+}
+
 /// Controller colors: `{ body, buttons }` as RGBA bytes.
 const FULL_KEY_COLORS: [[u8; 4]; 2] = [[0x2d, 0x2d, 0x2d, 0xff], [0xe6, 0xe6, 0xe6, 0xff]];
 const LEFT_COLORS: [[u8; 4]; 2] = [[0x0a, 0xb9, 0xe6, 0xff], [0x1e, 0x1e, 0x1e, 0xff]];
@@ -130,26 +186,32 @@ const LEFT_BUTTONS: NpadButtons = NpadButtons::LEFT
 
 /// The guest npad state of a host state for `style`: buttons the style does not have are
 /// dropped, and a GameCube controller's L/R/Z are moved where the guest expects them.
-fn pad_state(style: Style, state: &NpadState) -> NpadGenericState {
+fn pad_state(style: Style, halves: Halves, state: &NpadState) -> NpadGenericState {
     let raw = state.buttons;
     let mut buttons = NpadButtons::empty();
     let mut pad = NpadGenericState {
         attributes: style.attributes(),
         ..NpadGenericState::default()
     };
-    if style != Style::JoyLeft {
+    if style != Style::JoyLeft && halves.right {
         buttons |= raw & RIGHT_BUTTONS;
         pad.right_stick = [state.right_stick.x, state.right_stick.y];
     }
-    if style != Style::JoyRight {
+    if style != Style::JoyRight && halves.left {
         buttons |= raw & LEFT_BUTTONS;
         pad.left_stick = [state.left_stick.x, state.left_stick.y];
     }
-    if matches!(style, Style::JoyLeft | Style::JoyDual) {
+    if matches!(style, Style::JoyLeft | Style::JoyDual) && halves.left {
         buttons |= raw & (NpadButtons::LEFT_SL | NpadButtons::LEFT_SR);
     }
-    if matches!(style, Style::JoyRight | Style::JoyDual) {
+    if matches!(style, Style::JoyRight | Style::JoyDual) && halves.right {
         buttons |= raw & (NpadButtons::RIGHT_SL | NpadButtons::RIGHT_SR);
+    }
+    if !halves.left {
+        pad.attributes &= !0b1100;
+    }
+    if !halves.right {
+        pad.attributes &= !0b11_0000;
     }
     if style == Style::Gc {
         buttons.remove(NpadButtons::ZL | NpadButtons::ZR | NpadButtons::L | NpadButtons::R);
@@ -165,6 +227,10 @@ fn pad_state(style: Style, state: &NpadState) -> NpadGenericState {
 pub(super) struct Npad {
     /// The style the shared memory shows as connected.
     pub style: Option<Style>,
+    /// The Joy-Cons the connected controller has.
+    pub halves: Halves,
+    /// `NpadJoyAssignmentMode::Single`.
+    pub single: bool,
     /// Disconnected by the title (`DisconnectNpad`): stays off until the controller goes away.
     pub suppressed: bool,
     pub style_event: Option<Arc<Event>>,
@@ -186,6 +252,8 @@ impl Default for Npad {
     fn default() -> Self {
         Self {
             style: None,
+            halves: Halves::BOTH,
+            single: false,
             suppressed: false,
             style_event: None,
             sixaxis_enabled: false,
@@ -237,6 +305,7 @@ pub(super) struct HidState {
     pub mouse_active: bool,
     pub keyboard_active: bool,
     pub npads: [Npad; NPAD_COUNT],
+    pub routes: [Option<Route>; NPAD_COUNT],
 }
 
 impl Default for HidState {
@@ -255,6 +324,7 @@ impl Default for HidState {
             mouse_active: false,
             keyboard_active: false,
             npads: Default::default(),
+            routes: [None; NPAD_COUNT],
         }
     }
 }
@@ -292,10 +362,32 @@ impl HidState {
         if !self.npad_active || self.supported_styles.is_none() {
             return;
         }
-        let mut wanted: [Option<(Style, NpadState)>; NPAD_COUNT] = [None; NPAD_COUNT];
-        for player in 0..lichii_common::settings::MAX_PLAYERS {
-            let state = hub.read(player);
-            if !state.connected {
+        let states: [NpadState; MAX_PLAYERS] = std::array::from_fn(|player| hub.read(player));
+        for route in &mut self.routes {
+            let valid = route.is_some_and(|route| {
+                let state = &states[route.player];
+                state.connected
+                    && Halves::of(state.controller).is_some_and(|host| host.contains(route.halves))
+            });
+            if !valid {
+                *route = None;
+            }
+        }
+        let mut wanted: [Option<(Style, Halves, NpadState)>; NPAD_COUNT] = [None; NPAD_COUNT];
+        for (index, route) in self.routes.iter().enumerate() {
+            let Some(route) = route else { continue };
+            let style = route.style(self.npads[index].single);
+            if let Some((index, style)) = self.placement(index, style) {
+                wanted[index].get_or_insert((style, route.halves, states[route.player]));
+            }
+        }
+        for (player, state) in states.into_iter().enumerate() {
+            let routed = self
+                .routes
+                .iter()
+                .flatten()
+                .any(|route| route.player == player);
+            if !state.connected || routed {
                 continue;
             }
             let style = Style::of(state.controller);
@@ -309,7 +401,7 @@ impl HidState {
                 style
             };
             if let Some((index, style)) = self.placement(index, style) {
-                wanted[index].get_or_insert((style, state));
+                wanted[index].get_or_insert((style, Halves::BOTH, state));
             }
         }
         for (index, wanted) in wanted.into_iter().enumerate() {
@@ -320,18 +412,19 @@ impl HidState {
                 }
                 npad.suppressed = false;
             }
-            let wanted_style = wanted.map(|(style, _)| style);
-            if npad.style.is_some() && npad.style != wanted_style {
+            let shown = npad.style.map(|style| (style, npad.halves));
+            let wanted_style = wanted.map(|(style, halves, _)| (style, halves));
+            if shown.is_some() && shown != wanted_style {
                 disconnect(&memory, index, npad);
             }
-            let Some((style, state)) = wanted else {
+            let Some((style, halves, state)) = wanted else {
                 continue;
             };
             if npad.style.is_none() {
-                connect(&memory, index, npad, style);
+                connect(&memory, index, npad, style, halves);
             }
             let entry = NpadEntry::new(index);
-            let pad = pad_state(style, &state);
+            let pad = pad_state(style, halves, &state);
             entry.pad(style.pad_lifo()).push(&memory, pad);
             entry.pad(PadLifo::SystemExt).push(&memory, pad);
             if style == Style::Gc {
@@ -345,6 +438,92 @@ impl HidState {
                 );
             }
         }
+    }
+
+    /// `SetNpadMode`: sets the Joy-Con assignment mode of entry `index` and applies it. A dual
+    /// pair set to single keeps the `kept` Joy-Con and moves the other one to the first free
+    /// entry, which it returns; a single Joy-Con set to dual becomes a pair with one side.
+    pub fn set_assignment_mode(
+        &mut self,
+        hub: &NpadHub,
+        index: usize,
+        single: bool,
+        kept: Halves,
+    ) -> Option<usize> {
+        if let Some(memory) = &self.memory {
+            put(
+                memory,
+                NpadEntry::new(index).at(NpadEntry::ASSIGNMENT_MODE),
+                u32::from(single),
+            );
+        }
+        self.npads[index].single = single;
+        let npad = &self.npads[index];
+        let player = match self.routes[index] {
+            Some(route) => route.player,
+            None if index < MAX_PLAYERS => index,
+            None => return None,
+        };
+        let halves = npad.halves;
+        let mut moved = None;
+        match (npad.style, single) {
+            (Some(Style::JoyLeft | Style::JoyRight), false) => {
+                let halves = if npad.style == Some(Style::JoyLeft) {
+                    Halves::LEFT
+                } else {
+                    Halves::RIGHT
+                };
+                self.routes[index] = Some(Route { player, halves });
+            }
+            (Some(Style::JoyDual), true) if halves != Halves::BOTH => {
+                self.routes[index] = Some(Route { player, halves });
+            }
+            (Some(Style::JoyDual), true)
+                if Halves::of(hub.read(player).controller) == Some(Halves::BOTH) =>
+            {
+                let free = (0..MAX_PLAYERS).find(|&other| {
+                    other != index
+                        && self.supported_ids & 1 << other != 0
+                        && self.npads[other].style.is_none()
+                        && self.routes[other].is_none()
+                })?;
+                let other = Halves {
+                    left: !kept.left,
+                    right: !kept.right,
+                };
+                self.routes[index] = Some(Route {
+                    player,
+                    halves: kept,
+                });
+                self.routes[free] = Some(Route {
+                    player,
+                    halves: other,
+                });
+                self.npads[free].single = false;
+                moved = Some(free);
+            }
+            _ => return None,
+        }
+        self.update_npads(hub);
+        moved
+    }
+
+    /// `MergeSingleJoyAsDualJoy`: joins the two Joy-Cons of one host pair, shown on entries
+    /// `first` and `second`, back into a dual pair on `first`.
+    pub fn merge_joy_cons(&mut self, hub: &NpadHub, first: usize, second: usize) {
+        let (Some(a), Some(b)) = (self.routes[first], self.routes[second]) else {
+            return;
+        };
+        let complementary = a.halves.left != b.halves.left && a.halves.right != b.halves.right;
+        if first == second || a.player != b.player || !complementary {
+            return;
+        }
+        self.routes[first] = Some(Route {
+            player: a.player,
+            halves: Halves::BOTH,
+        });
+        self.routes[second] = None;
+        self.update_npads(hub);
     }
 
     /// Disconnects npad entry `index` now and keeps it off until its controller goes away.
@@ -366,8 +545,12 @@ impl HidState {
         }
         for (index, npad) in self.npads.iter_mut().enumerate() {
             let Some(style) = npad.style else { continue };
-            let player = if index == HANDHELD { 0 } else { index };
-            let motion = (player < lichii_common::settings::MAX_PLAYERS && npad.sixaxis_enabled)
+            let player = match self.routes[index] {
+                Some(route) => route.player,
+                None if index == HANDHELD => 0,
+                None => index,
+            };
+            let motion = (player < MAX_PLAYERS && npad.sixaxis_enabled)
                 .then(|| hub.read(player).motion)
                 .flatten();
             let active = match motion {
@@ -448,16 +631,6 @@ impl HidState {
             layout::set_hold_type(memory, hold_type);
         }
     }
-
-    pub fn set_assignment_mode(&mut self, index: usize, mode: u32) {
-        if let Some(memory) = &self.memory {
-            put(
-                memory,
-                NpadEntry::new(index).at(NpadEntry::ASSIGNMENT_MODE),
-                mode,
-            );
-        }
-    }
 }
 
 const IDENTITY: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
@@ -512,7 +685,7 @@ impl Npad {
 
 /// Writes a newly connected controller into its npad entry (the reference's
 /// `InitNewlyAddedController`) and signals the style-set event.
-fn connect(memory: &SharedMemory, index: usize, npad: &mut Npad, style: Style) {
+fn connect(memory: &SharedMemory, index: usize, npad: &mut Npad, style: Style, halves: Halves) {
     let entry = NpadEntry::new(index);
     clear_device(memory, entry);
     let joy_colors = |left: bool, right: bool| {
@@ -565,7 +738,6 @@ fn connect(memory: &SharedMemory, index: usize, npad: &mut Npad, style: Style) {
                 entry.at(NpadEntry::JOY_COLOR),
                 joy_colors(true, true),
             );
-            put(memory, entry.at(NpadEntry::ASSIGNMENT_MODE), 0u32);
             (
                 1 << 2 | 1 << 3,
                 IS_VERTICAL | USE_PLUS | USE_MINUS | USE_DIRECTIONAL_BUTTONS,
@@ -582,9 +754,8 @@ fn connect(memory: &SharedMemory, index: usize, npad: &mut Npad, style: Style) {
             put(
                 memory,
                 entry.at(NpadEntry::JOY_COLOR),
-                joy_colors(true, true),
+                joy_colors(halves.left, halves.right),
             );
-            put(memory, entry.at(NpadEntry::ASSIGNMENT_MODE), 0u32);
             for battery in [
                 NpadEntry::BATTERY_DUAL,
                 NpadEntry::BATTERY_LEFT,
@@ -640,7 +811,14 @@ fn connect(memory: &SharedMemory, index: usize, npad: &mut Npad, style: Style) {
             1u8,
         );
     }
+    npad.single = matches!(style, Style::JoyLeft | Style::JoyRight);
+    put(
+        memory,
+        entry.at(NpadEntry::ASSIGNMENT_MODE),
+        u32::from(npad.single),
+    );
     npad.style = Some(style);
+    npad.halves = halves;
     npad.orientation = [1.0, 0.0, 0.0, 0.0];
     npad.rotation = [0.0; 3];
     npad.signal_style_change();

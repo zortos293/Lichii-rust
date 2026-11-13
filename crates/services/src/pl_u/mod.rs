@@ -3,9 +3,13 @@
 //! `GetBuiltInFontData` and read plain copies from the shared memory 2000 returns, or have them
 //! copied into their own transfer memory with 2100 (NX2_NOTES row 36).
 //!
+//! The standard font Switch 2 titles get also has the controller button icons of the extension
+//! font, where Switch 2 titles look for them.
+//!
 //! Fonts load on first use. Without fonts every font reads as empty, but the shared memory still
 //! exists, so titles that only map it keep going.
 
+mod font_merge;
 mod fonts;
 
 use std::sync::{Arc, OnceLock};
@@ -26,6 +30,9 @@ const SHARED_FONT_MEMORY_SIZE: u64 = 0x110_0000;
 const MAX_PRIORITY_FONTS: usize = 6;
 /// `LoadState::Loaded`.
 const LOADED: u32 = 1;
+/// `SharedFontType::JapanUSEuropeStandard` and `SharedFontType::NintendoExtended`.
+const STANDARD_FONT: usize = 0;
+const EXTENSION_FONT: usize = 5;
 
 pub(crate) fn register(context: &Arc<ServiceContext>) -> HleResult<()> {
     let fonts = Arc::new(SharedFonts {
@@ -51,6 +58,9 @@ struct LoadedFonts {
     regions: [FontRegion; FONT_COUNT],
     /// Where the Switch 2 built-in font memory (and the 2100 transfer memory) has each font.
     builtin: [FontRegion; FONT_COUNT],
+    /// The Switch 2 standard font: the Switch 1 one with the button icons added, `None` when
+    /// they could not be added and the Switch 1 font is served unchanged.
+    builtin_standard: Option<Vec<u8>>,
     builtin_size: u32,
 }
 
@@ -81,19 +91,32 @@ impl LoadedFonts {
                 "no shared fonts found: pl:u serves empty font memory"
             );
         }
+        let builtin_standard = match (&data[STANDARD_FONT], &data[EXTENSION_FONT]) {
+            (Some(standard), Some(extension))
+                if regions[STANDARD_FONT].size != 0 && regions[EXTENSION_FONT].size != 0 =>
+            {
+                font_merge::merge_glyphs(standard, extension, &font_merge::BUTTON_GLYPHS)
+            }
+            _ => None,
+        };
         let mut builtin = [FontRegion::default(); FONT_COUNT];
         let mut builtin_offset = 0u64;
-        for (slot, region) in builtin.iter_mut().zip(&regions) {
+        for (font_type, (slot, region)) in builtin.iter_mut().zip(&regions).enumerate() {
+            let size = match &builtin_standard {
+                Some(font) if font_type == STANDARD_FONT => font.len() as u32,
+                _ => region.size,
+            };
             *slot = FontRegion {
                 offset: builtin_offset as u32,
-                size: region.size,
+                size,
             };
-            builtin_offset = align_up(builtin_offset + u64::from(region.size), PAGE_SIZE);
+            builtin_offset = align_up(builtin_offset + u64::from(size), PAGE_SIZE);
         }
         Ok(Self {
             memory,
             regions,
             builtin,
+            builtin_standard,
             builtin_size: builtin_offset.max(PAGE_SIZE) as u32,
         })
     }
@@ -116,7 +139,13 @@ impl LoadedFonts {
     /// Copies every font in the built-in layout through `write(offset, data)`.
     fn copy_builtin(&self, mut write: impl FnMut(u64, &[u8]) -> HleResult<()>) -> HleResult<()> {
         let mut chunk = [0u8; 0x4000];
-        for (target, source) in self.builtin.iter().zip(&self.regions) {
+        for (font_type, (target, source)) in self.builtin.iter().zip(&self.regions).enumerate() {
+            if let Some(font) = &self.builtin_standard
+                && font_type == STANDARD_FONT
+            {
+                write(u64::from(target.offset), font)?;
+                continue;
+            }
             let mut done = 0u64;
             while done < u64::from(source.size) {
                 let len = (u64::from(source.size) - done).min(chunk.len() as u64) as usize;

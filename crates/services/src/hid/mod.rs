@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 
 use crate::{Service, ServiceContext};
 use npad::{
-    DEFAULT_FUSION_PARAMETERS, DEFAULT_VIBRATION, HANDHELD, Hid, HidState, OTHER,
+    DEFAULT_FUSION_PARAMETERS, DEFAULT_VIBRATION, HANDHELD, Halves, Hid, HidState, OTHER,
     STANDARD_DRIFT_MODE, npad_index,
 };
 use shared_memory::NPAD_COUNT;
@@ -39,6 +39,8 @@ const INVALID_ARRAY_SIZE: ResultCode = hid_result(715);
 
 /// Most vibration values one `SendVibrationValues` call carries; titles send one per motor.
 const MAX_VIBRATIONS: usize = 32;
+/// `NpadJoyDeviceType::Right`.
+const JOY_DEVICE_RIGHT: u64 = 1;
 
 pub(crate) fn register(context: &Arc<ServiceContext>) -> HleResult<()> {
     let hid = Arc::new(Hid {
@@ -97,6 +99,27 @@ impl DeviceHandle {
     /// The motor slot (left or right) a vibration for this handle goes to.
     fn motor(self) -> usize {
         usize::from(self.device_index == 1)
+    }
+}
+
+/// The one rumble the hub carries for an npad's two motors: each band from the motor that
+/// drives it harder.
+fn strongest(left: VibrationValue, right: VibrationValue) -> VibrationValue {
+    let low = if right.low_amplitude > left.low_amplitude {
+        right
+    } else {
+        left
+    };
+    let high = if right.high_amplitude > left.high_amplitude {
+        right
+    } else {
+        left
+    };
+    VibrationValue {
+        low_amplitude: low.low_amplitude,
+        low_frequency: low.low_frequency,
+        high_amplitude: high.high_amplitude,
+        high_frequency: high.high_frequency,
     }
 }
 
@@ -167,13 +190,18 @@ impl HidServer {
         if !state.vibration_permitted {
             return Ok(());
         }
-        state.npads[index].vibration[handle.motor()] = value;
-        let player = match index {
-            HANDHELD => 0,
-            OTHER => return Ok(()),
-            player => player,
+        let npad = &mut state.npads[index];
+        npad.vibration[handle.motor()] = value;
+        let [left, right] = npad.vibration;
+        let player = match (state.routes[index], index) {
+            (Some(route), _) => route.player,
+            (None, HANDHELD) => 0,
+            (None, OTHER) => return Ok(()),
+            (None, player) => player,
         };
-        self.hid.hub.request_vibration(player, value);
+        self.hid
+            .hub
+            .request_vibration(player, strongest(left, right));
         Ok(())
     }
 
@@ -286,14 +314,39 @@ impl HidServer {
                 ctx.push(hold_type);
                 Ok(())
             }
-            122..=124 => {
+            122..=124 | 133 => {
+                let command = ctx.command();
                 let npad_id: u32 = ctx.pop();
-                let mode = u32::from(ctx.command() != 124);
-                npad_index(npad_id)
-                    .ok_or(INVALID_NPAD_ID)
-                    .map(|index| self.state().set_assignment_mode(index, mode))
+                let _aruid: u64 = ctx.pop();
+                let kept = match command {
+                    123 | 133 if ctx.pop::<u64>() == JOY_DEVICE_RIGHT => Halves::RIGHT,
+                    _ => Halves::LEFT,
+                };
+                npad_index(npad_id).ok_or(INVALID_NPAD_ID).map(|index| {
+                    let moved = self.state().set_assignment_mode(
+                        &self.hid.hub,
+                        index,
+                        command != 124,
+                        kept,
+                    );
+                    if command == 133 {
+                        ctx.push(u8::from(moved.is_some()));
+                        ctx.push(moved.map_or(npad_id, |index| index as u32));
+                    }
+                })
             }
-            125..=127 | 130 | 134..=136 => Ok(()),
+            125 => {
+                let first: u32 = ctx.pop();
+                let second: u32 = ctx.pop();
+                match (npad_index(first), npad_index(second)) {
+                    (Some(first), Some(second)) => {
+                        self.state().merge_joy_cons(&self.hid.hub, first, second);
+                        Ok(())
+                    }
+                    _ => Err(INVALID_NPAD_ID),
+                }
+            }
+            126 | 127 | 130 | 134..=136 => Ok(()),
             128 => {
                 let _aruid: u64 = ctx.pop();
                 let mode: u64 = ctx.pop();
@@ -318,12 +371,6 @@ impl HidServer {
                 npad_index(npad_id)
                     .ok_or(INVALID_NPAD_ID)
                     .map(|index| self.state().npads[index].home_protection = enabled)
-            }
-            133 => {
-                let npad_id: u32 = ctx.pop();
-                ctx.push(0u8);
-                ctx.push(npad_id);
-                Ok(())
             }
             _ => return None,
         })
