@@ -824,3 +824,5 @@ fn generic_input_types_follow_the_vertex_attribute_formats() {
     runtime.generic_input_types[3] = AttributeType::Disabled;
     emit("generic_inputs", &Profile::default(), &runtime, &program);
 }
+
+mod memory;
