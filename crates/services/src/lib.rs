@@ -42,6 +42,7 @@ mod context;
 mod dispatch;
 mod friend;
 mod fs;
+mod gsv;
 mod ncm;
 mod nifm;
 mod nim;
