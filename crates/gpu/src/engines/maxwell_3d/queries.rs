@@ -1,5 +1,7 @@
 //! Report semaphores, counter resets and conditional rendering.
 
+use std::time::Instant;
+
 use super::regs::{
     ClearReport, Regs, RenderEnableMode, RenderEnableOverride, ReportSemaphoreCompare,
     ReportSemaphoreOperation, ReportSemaphoreReport,
@@ -77,7 +79,9 @@ pub(super) fn render_enable(regs: &Regs, ctx: &mut EngineContext<'_>) -> bool {
     }
     let address = regs.render_enable.address();
     ctx.rasterizer.flush_commands();
+    let start = Instant::now();
     ctx.rasterizer.release_fences(true);
+    ctx.activity.host_waited(start);
     ctx.memory.for_each_range(
         address,
         size_of::<ReportSemaphoreCompare>() as u64,

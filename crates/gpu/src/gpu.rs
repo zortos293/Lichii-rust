@@ -11,11 +11,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread::{JoinHandle, ThreadId};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lichii_common::DAddr;
 use parking_lot::{Condvar, Mutex};
 
+use crate::activity::{Activity, Reporter};
 use crate::back::{Back, SideCommand};
 use crate::backend::{ChannelId, FramebufferConfig, GpuHandles, Rasterizer};
 use crate::channel::{ChannelConfig, GpEntry, Submission, SyncpointFence, SyncpointIncrement};
@@ -208,6 +209,8 @@ struct Front {
     /// fetch synchronisation, so it cannot overtake that channel's earlier entries, and every
     /// command after it waits too.
     held: VecDeque<CpuCommand>,
+    reporter: Reporter,
+    activity: Arc<Activity>,
 }
 
 impl Front {
@@ -224,7 +227,10 @@ impl Front {
         let mut fences = false;
         loop {
             let waiting = self.channels.iter().flatten().any(FrontChannel::is_waiting);
+            let idle = Instant::now();
             let closed = inbox.take(&mut batch, (waiting || fences).then_some(poll));
+            self.activity.front_idle(idle);
+            self.reporter.tick();
             let busy = !batch.is_empty();
             self.held.append(&mut batch);
             self.handle_held();
@@ -404,12 +410,14 @@ impl Gpu {
         let (producer, consumer) = ring::ring(config.ring_slots, MIN_RING_SLOTS);
         let (side_sender, side_receiver) = mpsc::channel();
         let fetch_syncs = Arc::new(FetchSyncs::new(inbox.clone()));
+        let activity = Arc::new(Activity::new());
         let back = Back::new(
             rasterizer,
             &handles,
             config.engines,
             side_receiver,
             fetch_syncs.clone(),
+            activity.clone(),
         );
         let (link, back) = match config.threading {
             Threading::Split => {
@@ -423,7 +431,7 @@ impl Gpu {
         };
         let front = Front {
             shared: FrontShared {
-                stream: Stream::new(producer, link, side_sender, fetch_syncs),
+                stream: Stream::new(producer, link, side_sender, fetch_syncs, activity.clone()),
                 shared_macros: None,
                 compute_macros: None,
                 words: Vec::new(),
@@ -435,6 +443,8 @@ impl Gpu {
             },
             channels: Vec::new(),
             held: VecDeque::new(),
+            reporter: Reporter::new(activity.clone(), config.threading == Threading::Split),
+            activity,
         };
         let front_inbox = inbox.clone();
         let front = std::thread::Builder::new()

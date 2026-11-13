@@ -10,6 +10,8 @@
 //! (NX2_GPU_THREAD_SPLIT.md): `const_buffer.offset` (+4 per constant buffer data word) and
 //! `shadow_scratch[0]` (set to 1 by FALCON[4]).
 
+use std::time::Instant;
+
 use super::const_buffers::{self, RootTableState};
 use super::draw::{self, DrawState};
 use super::queries;
@@ -17,6 +19,7 @@ use super::regs::{BindGroup, LaunchDmaLayout, MAX_SHADER_STAGE, Regs, ShadowRamC
 use super::state::{
     MACRO_REGISTERS_START, ROOT_TABLE_LOAD, ROOT_TABLE_SELECT, RegisterState, dirty,
 };
+use crate::activity::RendererCall;
 use crate::backend::{
     DrawParams, FenceAction, GraphicsConstBuffers, GraphicsContext, IndirectDraw, InlineIndices,
 };
@@ -165,8 +168,10 @@ impl Maxwell3d {
                 topology: draw::topology(&self.state.regs, draw.topology),
                 ..*draw
             };
+            let start = Instant::now();
             ctx.rasterizer
                 .draw_indirect(&mut graphics!(self, ctx), &draw);
+            ctx.activity.renderer_call(RendererCall::Draw, start);
         }
     }
 
@@ -203,14 +208,18 @@ impl Maxwell3d {
             ROOT_TABLE_LOAD => self.load_root_table(&[value]),
             CLEAR_SURFACE => {
                 if self.renders() {
+                    let start = Instant::now();
                     ctx.rasterizer.clear(&mut graphics!(self, ctx), 1);
+                    ctx.activity.renderer_call(RendererCall::Clear, start);
                 }
             }
             draw::DRAW_TEXTURE => {
                 if self.renders() {
                     let texture = draw::texture(regs);
+                    let start = Instant::now();
                     ctx.rasterizer
                         .draw_texture(&mut graphics!(self, ctx), &texture);
+                    ctx.activity.renderer_call(RendererCall::Draw, start);
                 }
             }
             REPORT_SEMAPHORE_QUERY => {
@@ -268,7 +277,9 @@ impl Maxwell3d {
                     instance_count: 1,
                     inline_indices: Some(InlineIndices::U32(&self.draw.inline_indices)),
                 };
+                let start = Instant::now();
                 ctx.rasterizer.draw(&mut graphics!(self, ctx), &params);
+                ctx.activity.renderer_call(RendererCall::Draw, start);
             }
             self.draw.inline_indices.clear();
             self.draw.indexed = false;
@@ -350,7 +361,9 @@ impl Maxwell3d {
 
     fn render(&mut self, ctx: &mut EngineContext<'_>, draw: &DrawParams<'_>) {
         if self.renders() {
+            let start = Instant::now();
             ctx.rasterizer.draw(&mut graphics!(self, ctx), draw);
+            ctx.activity.renderer_call(RendererCall::Draw, start);
         }
     }
 
