@@ -262,7 +262,8 @@ impl GpuSession {
 
     /// 101(first u64, last u64, flags): makes process memory GPU accessible at GPU VA == CPU VA.
     /// Reply word 3 is the GpuMemoryHandle later requests name, so the reply waits until the back
-    /// thread reached the request and made the memory.
+    /// thread reached the request and made the memory. A GPU shut down meanwhile drops the request,
+    /// which ends the wait.
     fn create_memory(&self, ctx: &mut HleRequestContext) -> ResultCode {
         let words = Words::command(ctx);
         let (first, last) = (words.u64(2), words.u64(4));
@@ -271,14 +272,18 @@ impl GpuSession {
             return lichii_kernel::result::INVALID_SIZE;
         };
         let (sender, created) = mpsc::sync_channel(1);
-        let context = self.context.clone();
+        let gpu: Weak<Gpu> = Arc::downgrade(&self.context.gpu);
+        let process = self.context.process.clone();
         self.context
             .gpu
             .run_in_order(move |rasterizer: &mut dyn Rasterizer| {
-                let Some(memory) = context.gpu.nx2_memory() else {
+                let Some(gpu) = gpu.upgrade() else {
                     return;
                 };
-                let space: &AddressSpace = context.process.memory();
+                let Some(memory) = gpu.nx2_memory() else {
+                    return;
+                };
+                let space: &AddressSpace = process.memory();
                 let result = memory.create_gpu_accessible_memory(space, first, size).map(
                     |(handle, unmapped)| {
                         for range in &unmapped {
