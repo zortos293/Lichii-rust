@@ -962,9 +962,13 @@ impl Rasterizer for VulkanRasterizer {
         for pipeline in self.draw.pipelines.replaced() {
             self.scheduler.retire(pipeline);
         }
-        let cached = match self.texture_cache.presentable(framebuffer) {
-            Some(id) => self.present_cached(framebuffer, id),
-            None => Ok(false),
+        let cached = match self
+            .texture_cache
+            .presentable(&mut self.scheduler, framebuffer)
+        {
+            Ok(Some(id)) => self.present_cached(framebuffer, id),
+            Ok(None) => Ok(false),
+            Err(error) => Err(error),
         };
         let result = match cached {
             Ok(true) => Ok(()),

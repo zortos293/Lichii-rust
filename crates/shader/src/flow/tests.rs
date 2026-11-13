@@ -338,6 +338,10 @@ mod structured {
     use crate::ir::{Opcode, Program, Value};
 
     fn run(program: Vec<FlowInst>, options: StructureOptions) -> String {
+        structured(program, options).dump()
+    }
+
+    fn structured(program: Vec<FlowInst>, options: StructureOptions) -> Program {
         let cfg = build(program);
         let mut prog = Program::new();
         let mut translate = |prog: &mut Program, block, begin: u32, end: u32| {
@@ -350,7 +354,7 @@ mod structured {
             Ok(())
         };
         structure(&mut prog, &cfg, options, &mut translate).expect("structure");
-        prog.dump()
+        prog
     }
 
     #[test]
@@ -488,5 +492,52 @@ mod structured {
             },
         );
         assert_eq!(dump.matches("Epilogue").count(), 1, "{dump}");
+    }
+
+    #[test]
+    fn an_exit_moved_out_of_a_skipped_branch_reads_a_defined_goto_variable() {
+        let mut prog = structured(
+            vec![
+                op(N),
+                guarded(FlowOp::Branch { target: 32 }, 0),
+                guarded(FlowOp::Exit, 1),
+                op(N),
+                op(N),
+                op(FlowOp::Exit),
+            ],
+            StructureOptions {
+                converge_exits: true,
+                ..Default::default()
+            },
+        );
+        crate::opt::compute_post_order(&mut prog);
+        crate::opt::ssa_rewrite(&mut prog);
+        let dump = prog.dump();
+        assert!(dump.contains("SetGotoVariable"), "{dump}");
+        assert_eq!(dump.matches("UndefU1").count(), 2, "{dump}");
+    }
+
+    #[test]
+    fn interleaved_branches_reset_goto_variables_next_to_their_uses() {
+        let dump = run(
+            vec![
+                op(N),
+                guarded(FlowOp::Branch { target: 40 }, 0),
+                op(N),
+                guarded(FlowOp::Branch { target: 56 }, 1),
+                op(N),
+                guarded(FlowOp::Branch { target: 72 }, 2),
+                op(N),
+                op(N),
+                op(N),
+                op(FlowOp::Exit),
+            ],
+            StructureOptions::default(),
+        );
+        let entry = &dump[..dump.find("Reference #0x8").unwrap()];
+        assert_eq!(entry.matches("SetGotoVariable").count(), 1, "{dump}");
+        let reset = dump.find("SetGotoVariable #0x5, #false").unwrap();
+        let set = dump.find("SetGotoVariable #0x5, %").unwrap();
+        assert!(reset < set, "{dump}");
     }
 }
