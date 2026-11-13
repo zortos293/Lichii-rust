@@ -383,9 +383,13 @@ impl Emitter<'_> {
         host_cc(kind, cond)
     }
 
-    /// Frees every operand whose last use was op `i`, and the op's own value if it is unused.
+    /// Frees every operand whose last use was op `i`, including those of a `Compare` it emitted,
+    /// and the op's own value if it is unused.
     fn finish(&mut self, i: usize, op: &Op) {
-        for v in op.args().chain([Value(i as u32)]) {
+        let block = self.block;
+        let fused = op.args().find(|c| self.fused[c.index()]);
+        let compared = fused.into_iter().flat_map(|c| block.ops[c.index()].args());
+        for v in op.args().chain(compared).chain([Value(i as u32)]) {
             if self.last_use[v.index()] as usize <= i {
                 self.release(v);
             }

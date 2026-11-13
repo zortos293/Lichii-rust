@@ -469,6 +469,14 @@ fn fused_conditions_match_the_interpreter() {
 }
 
 #[test]
+fn fused_selects_release_their_compare_operands() {
+    let code: Vec<u32> = (0..300)
+        .flat_map(|i| [0x9100_0140 | i << 10, 0xeb01_001f, 0x9a83_0042])
+        .collect();
+    directed(&code, &[(1, 77), (3, 5), (10, 3)]);
+}
+
+#[test]
 fn faults_leave_the_interpreters_state() {
     const MOV_X0_1: u32 = 0xd280_0020;
     const MOV_X0_2: u32 = 0xd280_0040;
