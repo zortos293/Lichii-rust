@@ -253,6 +253,19 @@ fn pbk_and_brk_leave_a_loop() {
 }
 
 #[test]
+fn a_loop_back_to_the_first_instruction_keeps_a_separate_entry_block() {
+    validate_maxwell(
+        "entry_loop",
+        ShaderStage::Compute,
+        &[
+            encode(Sass::Mov32i, PT | (1 << 20) | (0xf << 12) | 1),
+            encode(Sass::Bra, PT | relative(-16) | 0xf),
+            encode(Sass::Exit, PT | 0xf),
+        ],
+    );
+}
+
+#[test]
 fn kil_demotes_a_fragment() {
     validate_maxwell(
         "kil",

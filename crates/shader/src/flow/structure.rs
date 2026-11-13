@@ -831,6 +831,9 @@ impl TranslatePass<'_, '_> {
                     self.prog.syntax_list.push(SyntaxNode::Block(merge));
                 }
                 Kind::Loop { cond } => {
+                    if self.prog.syntax_list.is_empty() {
+                        self.ensure_block(&mut current);
+                    }
                     let header = self.new_block();
                     if let Some(block) = current {
                         self.prog.add_branch(block, header);
