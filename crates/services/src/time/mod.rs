@@ -1,7 +1,9 @@
 //! `time:u`, `time:a`, `time:r` and `time:su`: the steady clock, the user, local and network
 //! system clocks and time zones, as glue and psc serve them. The clocks follow the host's wall
-//! clock; UTC is the only time zone.
+//! clock. The device location is `settings.system.time_zone` (or the host's zone), and the
+//! location list and rules come from the TimeZoneBinary system archive ([`binary`]).
 
+mod binary;
 mod zone;
 
 use std::sync::Arc;
@@ -19,6 +21,7 @@ use lichii_memory::MemoryPermission;
 use parking_lot::Mutex;
 
 use crate::{Service, ServiceContext};
+use binary::{LocationName, TimeZoneBinary};
 use zone::{RULE_SIZE, Rule};
 
 const MODULE: u32 = 116;
@@ -27,6 +30,7 @@ const CLOCK_MISMATCH: ResultCode = ResultCode::new(MODULE, 102);
 const TIME_NOT_FOUND: ResultCode = ResultCode::new(MODULE, 200);
 const OVERFLOW: ResultCode = ResultCode::new(MODULE, 201);
 const TIME_ZONE_OUT_OF_RANGE: ResultCode = ResultCode::new(MODULE, 902);
+const TIME_ZONE_PARSE_FAILED: ResultCode = ResultCode::new(MODULE, 903);
 const TIME_ZONE_NOT_FOUND: ResultCode = ResultCode::new(MODULE, 989);
 const NOT_IMPLEMENTED: ResultCode = ResultCode::new(MODULE, 990);
 
@@ -166,7 +170,7 @@ struct State {
     ephemeral_network: SystemClockContext,
     automatic_correction: bool,
     automatic_correction_updated: SteadyClockTimePoint,
-    location: [u8; 0x24],
+    location: LocationName,
     location_updated: SteadyClockTimePoint,
     rule: Rule,
 }
@@ -182,12 +186,7 @@ struct Clocks {
     network_event: Arc<Event>,
     ephemeral_event: Arc<Event>,
     location_event: Arc<Event>,
-}
-
-fn utc_location() -> [u8; 0x24] {
-    let mut name = [0; 0x24];
-    name[..3].copy_from_slice(b"UTC");
-    name
+    binary: TimeZoneBinary,
 }
 
 impl Clocks {
@@ -204,7 +203,9 @@ impl Clocks {
         let rtc_offset_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_nanos() as i64);
-        let rule = Rule::parse_tzif(&zone::utc_tzif()).expect("the UTC rule parses");
+        let binary = TimeZoneBinary::open(context);
+        let (location, rule) =
+            binary.device_location(&context.settings.system.time_zone, binary::host_zone);
         let clocks = Self {
             clock: context.kernel.clock().clone(),
             rtc_offset_ns,
@@ -216,7 +217,7 @@ impl Clocks {
                 ephemeral_network: SystemClockContext::default(),
                 automatic_correction: true,
                 automatic_correction_updated: SteadyClockTimePoint::default(),
-                location: utc_location(),
+                location,
                 location_updated: SteadyClockTimePoint::default(),
                 rule,
             }),
@@ -224,6 +225,7 @@ impl Clocks {
             network_event: Arc::new(Event::new()),
             ephemeral_event: Arc::new(Event::new()),
             location_event: Arc::new(Event::new()),
+            binary,
         };
         let boot_time = clocks.raw_ns() - clocks.uptime_ns();
         let steady = SteadyClockTimePoint {
@@ -684,6 +686,34 @@ impl TimeZoneService {
     fn guest_rule(ctx: &HleRequestContext) -> Result<Rule, ResultCode> {
         Rule::read(&ctx.read_buffer(0)?).map_err(|_| TIME_ZONE_OUT_OF_RANGE)
     }
+
+    /// The archive's rule for `location`.
+    fn archive_rule(&self, location: &LocationName) -> Result<Rule, ResultCode> {
+        let file = self
+            .clocks
+            .binary
+            .rule_file(location)
+            .ok_or(TIME_ZONE_NOT_FOUND)?;
+        Rule::parse_tzif(&file).ok_or(TIME_ZONE_PARSE_FAILED)
+    }
+
+    /// `LoadLocationNameList(u32 index)`: the locations from `index` that fit buffer 0.
+    fn location_names(&self, ctx: &mut HleRequestContext) -> ResultCode {
+        let index = ctx.pop::<u32>() as usize;
+        let capacity = ctx
+            .writable_buffer(0)
+            .map_or(0, |buffer| buffer.size as usize / size_of::<LocationName>());
+        let locations = self.clocks.binary.locations();
+        let names = &locations[index.min(locations.len())..];
+        let names = &names[..names.len().min(capacity)];
+        if !names.is_empty()
+            && let Err(result) = ctx.write_buffer(0, names.as_flattened())
+        {
+            return result;
+        }
+        ctx.push(names.len() as u32);
+        ResultCode::SUCCESS
+    }
 }
 
 impl Service for TimeZoneService {
@@ -697,37 +727,32 @@ impl Service for TimeZoneService {
             0 => ctx.push(clocks.state.lock().location),
             1 | 7 if !self.writable => return Some(PERMISSION_DENIED),
             1 => {
-                if ctx.pop::<[u8; 0x24]>() != utc_location() {
-                    return Some(TIME_ZONE_NOT_FOUND);
-                }
+                let location: LocationName = ctx.pop();
+                let rule = match self.archive_rule(&location) {
+                    Ok(rule) => rule,
+                    Err(result) => return Some(result),
+                };
                 let mut state = clocks.state.lock();
-                state.location = utc_location();
+                state.location = location;
+                state.rule = rule;
                 state.location_updated = clocks.steady_now();
                 clocks.location_event.signal();
             }
-            2 => ctx.push(1u32),
-            3 => {
-                let index: u32 = ctx.pop();
-                let count =
-                    u32::from(index == 0 && ctx.writable_buffer(0).is_some_and(|b| b.size >= 0x24));
-                if count == 1
-                    && let Err(result) = ctx.write_buffer(0, &utc_location())
-                {
-                    return Some(result);
-                }
-                ctx.push(count);
-            }
+            2 => ctx.push(clocks.binary.locations().len() as u32),
+            3 => return Some(self.location_names(ctx)),
             4 => {
-                if ctx.pop::<[u8; 0x24]>() != utc_location() {
-                    return Some(TIME_ZONE_NOT_FOUND);
-                }
-                let mut rule = Box::new([0; RULE_SIZE]);
-                clocks.state.lock().rule.write(&mut rule);
-                if let Err(result) = ctx.write_buffer(0, &rule[..]) {
+                let location: LocationName = ctx.pop();
+                let rule = match self.archive_rule(&location) {
+                    Ok(rule) => rule,
+                    Err(result) => return Some(result),
+                };
+                let mut out = Box::new([0; RULE_SIZE]);
+                rule.write(&mut out);
+                if let Err(result) = ctx.write_buffer(0, &out[..]) {
                     return Some(result);
                 }
             }
-            5 => ctx.push([0u8; 0x10]),
+            5 => ctx.push(clocks.binary.version()),
             6 => {
                 let state = clocks.state.lock();
                 ctx.push(state.location);

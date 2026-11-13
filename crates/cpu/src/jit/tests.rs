@@ -11,7 +11,7 @@ use lichii_memory::{AddressSpace, ExclusiveMonitor, MemoryPermission, PhysicalMe
 
 use super::{Jit, Passes};
 use crate::decoder::{Inst, decode};
-use crate::{CpuConfig, CpuCore, GuestClock, HaltReason, Interpreter, ThreadContext};
+use crate::{CpuConfig, CpuCore, GuestClock, HaltReason, Interpreter, ThreadContext, TscScale};
 
 const CODE: u64 = 0x10000;
 const CODE_SIZE: u64 = 0x4000;
@@ -803,5 +803,61 @@ fn an_indirect_jump_to_the_empty_table_key_faults() {
             machine.core.run(&mut ctx),
             HaltReason::Fault(crate::CpuFault::Prefetch { pc: u64::MAX })
         );
+    }
+}
+
+struct TscClock(TscScale);
+
+impl GuestClock for TscClock {
+    fn ticks(&self) -> u64 {
+        // SAFETY: `rdtsc` has no preconditions on x86-64.
+        self.0.ticks(unsafe { std::arch::x86_64::_rdtsc() })
+    }
+
+    fn host_tsc_scale(&self) -> Option<&TscScale> {
+        Some(&self.0)
+    }
+}
+
+#[test]
+fn counter_reads_follow_the_tsc_scale() {
+    const MRS_X0_CNTPCT: u32 = 0xd53b_e020;
+    const MRS_X1_CNTVCT: u32 = 0xd53b_e041;
+    for scale in [
+        TscScale::new(0, 0, 12345),
+        TscScale::new(3 << 32, 32, 1000),
+        TscScale::new(0x1234_5678_9abc, 40, u64::MAX - 5),
+    ] {
+        let clock = Arc::new(TscClock(scale));
+        let physical = Arc::new(PhysicalMemory::new(1 << 20).unwrap());
+        let mem = Arc::new(AddressSpace::with_fastmem(physical, 39).unwrap());
+        mem.map(CODE, 0, CODE_SIZE, MemoryPermission::READ_EXECUTE);
+        for (i, word) in [MRS_X0_CNTPCT, MRS_X1_CNTVCT, BRK].iter().enumerate() {
+            mem.write(CODE + 4 * i as u64, *word).unwrap();
+        }
+        let mut jit = Jit::new(CpuConfig {
+            memory: mem,
+            monitor: Arc::new(ExclusiveMonitor::new(1)),
+            clock: clock.clone(),
+            core_index: 0,
+            ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
+            dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+        })
+        .unwrap();
+        assert!(jit.target.tsc_scale.is_some());
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            ..Default::default()
+        };
+        let before = clock.ticks();
+        assert_eq!(jit.run(&mut ctx), HaltReason::Breakpoint(0));
+        let after = clock.ticks();
+        let within = |t: u64| t.wrapping_sub(before) <= after.wrapping_sub(before);
+        assert!(
+            within(ctx.x[0]) && within(ctx.x[1]),
+            "{before} {:?} {after}",
+            &ctx.x[..2]
+        );
+        assert!(ctx.x[1].wrapping_sub(ctx.x[0]) <= after.wrapping_sub(before));
     }
 }
