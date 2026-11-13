@@ -4,17 +4,37 @@ use super::zone::RULE_SIZE;
 use super::{
     CLOCK_MISMATCH, CLOCK_SOURCE_ID, CalendarAdditionalInfo, CalendarTime, ClockSnapshot,
     LOCAL_CONTEXT, NOT_IMPLEMENTED, OVERFLOW, PERMISSION_DENIED, STEADY_TIME_POINT,
-    SteadyClockTimePoint, SystemClockContext, TIME_ZONE_NOT_FOUND, utc_location,
+    SteadyClockTimePoint, SystemClockContext, TIME_ZONE_NOT_FOUND,
 };
-use lichii_common::settings::Settings;
 use lichii_kernel::object::KObject;
 use lichii_kernel::testing::{IpcClient, Request};
 
-use crate::testing::{ReplyExt, SWITCH2_TITLE, booted, read_value};
+use crate::testing::{ReplyExt, SWITCH2_TITLE, TempDir, booted, read_value};
+
+/// The time services with `time_zone` as the configured zone, over the synthesized archive.
+fn boot_in(time_zone: &str) -> IpcClient {
+    let dir = TempDir::new("time");
+    let mut settings = dir.settings();
+    settings.system.time_zone = time_zone.into();
+    booted(SWITCH2_TITLE, settings, super::register)
+}
 
 fn boot() -> IpcClient {
-    booted(SWITCH2_TITLE, Settings::default(), super::register)
+    boot_in("UTC")
 }
+
+fn location(name: &str) -> [u8; 0x24] {
+    let mut location = [0; 0x24];
+    location[..name.len()].copy_from_slice(name.as_bytes());
+    location
+}
+
+fn utc_location() -> [u8; 0x24] {
+    location("UTC")
+}
+
+/// The zones the synthesized archive lists.
+const SYNTHESIZED_ZONES: [&str; 4] = ["Etc/GMT", "Etc/UTC", "GMT", "UTC"];
 
 fn host_now() -> i64 {
     SystemTime::now()
@@ -406,29 +426,33 @@ fn the_time_zone_is_utc() {
             .unwrap()
             .ok()
             .get::<u32>(0),
-        1
+        4
     );
     let names = client.alloc(&[0; 0x24 * 4]);
-    assert_eq!(
-        client
-            .send(zone, &Request::new(3).arg(0u32).buffer_b(names, 0x24 * 4))
+    let list = |index: u32, size: u64| {
+        let count = client
+            .send(zone, &Request::new(3).arg(index).buffer_b(names, size))
             .unwrap()
             .ok()
-            .get::<u32>(0),
-        1
-    );
-    assert_eq!(client.read(names, 0x24), utc_location());
-    assert_eq!(
-        client
-            .send(zone, &Request::new(3).arg(1u32).buffer_b(names, 0x24 * 4))
-            .unwrap()
-            .ok()
-            .get::<u32>(0),
-        0
+            .get::<u32>(0) as usize;
+        (0..count)
+            .map(|i| client.read(names + 0x24 * i as u64, 0x24))
+            .collect::<Vec<_>>()
+    };
+    let expected: Vec<Vec<u8>> = SYNTHESIZED_ZONES.map(|z| location(z).to_vec()).into();
+    assert_eq!(list(0, 0x24 * 4), expected);
+    assert_eq!(list(1, 0x24 * 2), expected[1..3]);
+    assert_eq!(list(3, 0x24 * 4), expected[3..]);
+    assert!(list(4, 0x24 * 4).is_empty());
+    assert!(list(0, 0x23).is_empty());
+    let mut version = [0u8; 0x10];
+    version[..6].copy_from_slice(
+        b"2025b
+",
     );
     assert_eq!(
         client.send(zone, &Request::new(5)).unwrap().ok().data(),
-        [0; 0x10]
+        version
     );
     let reply = client.send(zone, &Request::new(6)).unwrap().ok();
     assert_eq!(
@@ -538,11 +562,21 @@ fn administrators_set_the_location() {
         reply.get::<SteadyClockTimePoint>(0x28).source_id,
         CLOCK_SOURCE_ID
     );
-    let mut tokyo = [0u8; 0x24];
-    tokyo[..10].copy_from_slice(b"Asia/Tokyo");
+    client
+        .send(zone, &Request::new(1).arg(location("GMT")))
+        .unwrap()
+        .ok();
     assert_eq!(
         client
-            .send(zone, &Request::new(1).arg(tokyo))
+            .send(zone, &Request::new(0))
+            .unwrap()
+            .ok()
+            .get::<[u8; 0x24]>(0),
+        location("GMT")
+    );
+    assert_eq!(
+        client
+            .send(zone, &Request::new(1).arg(location("Asia/Tokyo")))
             .unwrap()
             .result,
         TIME_ZONE_NOT_FOUND
@@ -597,4 +631,44 @@ fn the_shared_memory_holds_the_clock_contexts() {
     let local: SystemClockContext = bytemuck::pod_read_unaligned(&read(LOCAL_CONTEXT.values, 0x20));
     assert_eq!(local, moved);
     assert_eq!(read(LOCAL_CONTEXT.counter, 4), 2u32.to_le_bytes());
+}
+
+fn device_location(client: &IpcClient) -> [u8; 0x24] {
+    let time = client.connect("time:u").unwrap();
+    let zone = interface(client, time, 3);
+    client
+        .send(zone, &Request::new(0))
+        .unwrap()
+        .ok()
+        .get::<[u8; 0x24]>(0)
+}
+
+#[test]
+fn the_device_location_follows_the_settings() {
+    for zone_name in ["Etc/GMT", "GMT", "Etc/UTC"] {
+        let client = boot_in(zone_name);
+        assert_eq!(device_location(&client), location(zone_name));
+        let time = client.connect("time:u").unwrap();
+        let snapshot = client.alloc(&[0; size_of::<ClockSnapshot>()]);
+        client
+            .send(
+                time,
+                &Request::new(400)
+                    .arg(0u8)
+                    .buffer_b(snapshot, size_of::<ClockSnapshot>() as u64),
+            )
+            .unwrap()
+            .ok();
+        let snapshot: ClockSnapshot = read_value(&client, snapshot);
+        assert_eq!(snapshot.location_name, location(zone_name));
+    }
+}
+
+#[test]
+fn an_unknown_zone_falls_back_to_the_host_zone_then_utc() {
+    let host = super::binary::host_zone().filter(|zone| SYNTHESIZED_ZONES.contains(&zone.as_str()));
+    let expected = location(host.as_deref().unwrap_or("UTC"));
+    for setting in ["Mars/Olympus", "auto", "Asia/Tokyo"] {
+        assert_eq!(device_location(&boot_in(setting)), expected, "{setting}");
+    }
 }

@@ -16,13 +16,13 @@ mod tests;
 mod transfer;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 
 use lichii_common::paths::UserPaths;
+use lichii_common::settings::Settings;
 use lichii_common::{HleResult, ResultCode};
 use lichii_crypto::KeySet;
-use lichii_fs::cnmt::ContentType;
 use lichii_fs::romfs::open_romfs;
 use lichii_fs::save::{Nand, SaveDataFactory, SaveDataSpaceId, SdCard};
 use lichii_fs::{ContentIndex, FileRef};
@@ -45,32 +45,77 @@ pub(crate) fn register(context: &Arc<ServiceContext>) -> HleResult<()> {
     context.register("fsp-pr", THREAD, |_| Commandless("fsp-pr"))
 }
 
-/// What every `fsp-srv` session shares: the host roots and the installed system content.
+/// The NAND root: `settings.paths.nand_dir`, else the user's data directory.
+pub(crate) fn nand_dir(settings: &Settings) -> PathBuf {
+    settings
+        .paths
+        .nand_dir
+        .clone()
+        .unwrap_or_else(|| UserPaths::discover().nand_dir())
+}
+
+/// The RomFS of system data `title_id` (or another installed data title): the Data NCA of the
+/// NAND's registered content, else the archive [`archive::synthesize`] builds. fsp-srv and the
+/// services that read system archives themselves (time) share this one lookup.
+pub(crate) fn system_data(context: &ServiceContext, title_id: u64) -> Option<FileRef> {
+    let installed = context
+        .installed_content
+        .get_or_init(|| index_nand(&context.settings))
+        .as_ref()
+        .and_then(|index| {
+            index
+                .data_romfs(title_id)
+                .inspect_err(|e| tracing::error!("opening the RomFS of {title_id:#018x}: {e}"))
+                .ok()
+                .flatten()
+        });
+    installed.or_else(|| archive::synthesize(title_id))
+}
+
+/// The titles registered in the NAND's system and user content.
+fn index_nand(settings: &Settings) -> Option<ContentIndex> {
+    let nand_dir = nand_dir(settings);
+    let nand = Nand::open(&nand_dir)
+        .inspect_err(|e| tracing::error!("opening the NAND at {}: {e}", nand_dir.display()))
+        .ok()?;
+    let keys_dir = settings
+        .paths
+        .keys_dir
+        .clone()
+        .unwrap_or_else(|| UserPaths::discover().keys_dir());
+    let mut keys = KeySet::load_dir(&keys_dir)
+        .map(|(keys, _)| keys)
+        .unwrap_or_else(|_| KeySet::new());
+    let mut index = ContentIndex::default();
+    for dir in [nand.system_contents(), nand.user_contents()] {
+        match dir
+            .map_err(Into::into)
+            .and_then(|d| ContentIndex::from_registered(d.as_ref(), &mut keys))
+        {
+            Ok(found) => index.merge(found),
+            Err(e) => tracing::warn!("indexing NAND content: {e}"),
+        }
+    }
+    Some(index)
+}
+
+/// What every `fsp-srv` session shares: the host roots.
 struct FsShared {
     context: Arc<ServiceContext>,
     nand: Option<(Nand, PathBuf)>,
     sdmc: Option<(SdCard, PathBuf)>,
     saves: Option<SaveDataFactory>,
-    keys_dir: PathBuf,
-    installed: OnceLock<Option<ContentIndex>>,
 }
 
 impl FsShared {
     fn new(context: Arc<ServiceContext>) -> Self {
-        let paths = &context.settings.paths;
-        let user_paths = || UserPaths::discover();
-        let nand_dir = paths
-            .nand_dir
-            .clone()
-            .unwrap_or_else(|| user_paths().nand_dir());
-        let sdmc_dir = paths
+        let nand_dir = nand_dir(&context.settings);
+        let sdmc_dir = context
+            .settings
+            .paths
             .sdmc_dir
             .clone()
-            .unwrap_or_else(|| user_paths().sdmc_dir());
-        let keys_dir = paths
-            .keys_dir
-            .clone()
-            .unwrap_or_else(|| user_paths().keys_dir());
+            .unwrap_or_else(|| UserPaths::discover().sdmc_dir());
         let nand = Nand::open(&nand_dir)
             .inspect_err(|e| tracing::error!("opening the NAND at {}: {e}", nand_dir.display()))
             .ok()
@@ -87,41 +132,7 @@ impl FsShared {
             nand,
             sdmc,
             saves,
-            keys_dir,
-            installed: OnceLock::new(),
         }
-    }
-
-    /// The titles installed in the NAND's system and user content, indexed on first use.
-    fn installed(&self) -> Option<&ContentIndex> {
-        self.installed
-            .get_or_init(|| {
-                let (nand, _) = self.nand.as_ref()?;
-                let mut keys = KeySet::load_dir(&self.keys_dir)
-                    .map(|(keys, _)| keys)
-                    .unwrap_or_else(|_| KeySet::new());
-                let mut index = ContentIndex::default();
-                for dir in [nand.system_contents(), nand.user_contents()] {
-                    match dir
-                        .map_err(Into::into)
-                        .and_then(|d| ContentIndex::from_dir(d.as_ref(), &mut keys))
-                    {
-                        Ok(found) => index.merge(found),
-                        Err(e) => tracing::warn!("indexing NAND content: {e}"),
-                    }
-                }
-                Some(index)
-            })
-            .as_ref()
-    }
-
-    /// The installed data title `title_id`'s RomFS.
-    fn installed_data(&self, title_id: u64) -> Option<FileRef> {
-        let nca = self.installed()?.nca(title_id, ContentType::Data)?;
-        nca.romfs()
-            .inspect_err(|e| tracing::error!("opening the RomFS of {title_id:#018x}: {e}"))
-            .ok()
-            .flatten()
     }
 }
 
@@ -415,8 +426,7 @@ impl FspSrv {
         let title_id: u64 = ctx.pop();
         let data = self
             .add_on(title_id)
-            .or_else(|| self.shared.installed_data(title_id))
-            .or_else(|| archive::synthesize(title_id))
+            .or_else(|| system_data(self.context(), title_id))
             .ok_or_else(|| {
                 tracing::error!("no data storage {title_id:#018x} (storage {storage_id:#x})");
                 UNKNOWN

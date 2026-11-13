@@ -1,12 +1,13 @@
 //! What services share: the kernel, settings, the title, the GPU, input and the audio sink.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use lichii_audio::sink::Sink;
 use lichii_common::HleResult;
 use lichii_common::perf::PerfStats;
 use lichii_common::settings::Settings;
+use lichii_fs::ContentIndex;
 use lichii_gpu::Gpu;
 use lichii_input::NpadHub;
 use lichii_kernel::Kernel;
@@ -57,6 +58,8 @@ pub struct ServiceContext {
     /// and sets its host volume; the services set the device volume.
     pub audio: Arc<Sink>,
     pub(crate) unknown: UnknownCommands,
+    /// The NAND's registered content, indexed on first use by [`crate::fs::system_data`].
+    pub(crate) installed_content: OnceLock<Option<ContentIndex>>,
     threads: Mutex<HashMap<String, ServiceThread>>,
 }
 
@@ -74,6 +77,7 @@ impl ServiceContext {
             perf: parts.perf,
             audio: parts.audio,
             unknown: UnknownCommands::default(),
+            installed_content: OnceLock::new(),
             threads: Mutex::new(HashMap::new()),
         })
     }
