@@ -35,7 +35,7 @@ impl StagingRing {
         let ring = Buffer::new(
             device,
             capacity,
-            vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::STORAGE_BUFFER,
             MemoryLocation::CpuToGpu,
             "staging ring",
         )?;
@@ -62,7 +62,7 @@ impl StagingRing {
             let buffer = Buffer::new(
                 &self.device,
                 size,
-                vk::BufferUsageFlags::TRANSFER_SRC,
+                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::STORAGE_BUFFER,
                 MemoryLocation::CpuToGpu,
                 "staging (oversized)",
             )?;
