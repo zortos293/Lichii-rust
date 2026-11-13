@@ -18,7 +18,7 @@ pub use address_space::{
     AddressSpace, Fastmem, FastmemError, FaultKind, MemoryFault, MemoryPermission,
 };
 pub use device::DeviceAddressSpace;
-pub use exclusive::ExclusiveMonitor;
+pub use exclusive::{ExclusiveMonitor, ReservationSlot};
 pub use fault::{FaultHandler, HostFault};
 pub use physical::{PhysicalMemory, PhysicalMemoryError};
 

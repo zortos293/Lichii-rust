@@ -41,6 +41,8 @@ pub struct Launch {
     pub const_buffers: [ConstBufferBinding; 8],
     /// Samplers are indexed with the texture header index.
     pub linked_samplers: bool,
+    /// Per-thread local memory in bytes (positive plus call-return-stack allocation).
+    pub local_memory_size: u32,
 }
 
 bitfield! {
@@ -157,13 +159,28 @@ impl QmdV2 {
             shared_memory_size: self.shared.size(),
             const_buffers,
             linked_samplers: self.flags.linked_samplers(),
+            local_memory_size: (self.local_pos_alloc & 0xf_ffff)
+                + (self.local_crs_alloc & 0xf_ffff),
         }
     }
 }
 
 bitfield! {
+    /// Word 4: the hardware queue bit, whether an inline load waits for a scheduling PCAS, and
+    /// the dependence counter a scheduled QMD waits on.
     pub struct V3Control {
         queue: bool @ 8, 1;
+        require_scheduling_pcas: bool @ 12, 1;
+        dependence_counter: u32 @ 14, 16;
+    }
+}
+
+bitfield! {
+    /// Word 16: what the descriptor does to the QMD at `dependent_qmd_pointer` once it ran.
+    pub struct V3Dependent {
+        enable: bool @ 0, 1;
+        action: u32 @ 1, 3;
+        second_enable: bool @ 5, 1;
     }
 }
 
@@ -285,16 +302,7 @@ impl V3Release {
                 return None;
             }
             ReleaseKind::Reduction {
-                op: match flags.reduction_op() {
-                    0 => Reduction::Add,
-                    1 => Reduction::Min,
-                    2 => Reduction::Max,
-                    3 => Reduction::Inc,
-                    4 => Reduction::Dec,
-                    5 => Reduction::And,
-                    6 => Reduction::Or,
-                    _ => Reduction::Xor,
-                },
+                op: semaphore_reduction(flags.reduction_op()),
                 signed: flags.reduction_format() == 1,
             }
         } else if size == 0 {
@@ -314,6 +322,21 @@ impl V3Release {
     }
 }
 
+/// The reduction a 3-bit semaphore reduction field selects, in the order QMD releases and the
+/// compute report semaphore share (ADD, MIN, MAX, INC, DEC, AND, OR, XOR).
+pub fn semaphore_reduction(op: u32) -> Reduction {
+    match op & 7 {
+        0 => Reduction::Add,
+        1 => Reduction::Min,
+        2 => Reduction::Max,
+        3 => Reduction::Inc,
+        4 => Reduction::Dec,
+        5 => Reduction::And,
+        6 => Reduction::Or,
+        _ => Reduction::Xor,
+    }
+}
+
 /// An Ampere launch descriptor (version 3.0).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -324,12 +347,15 @@ pub struct QmdV3 {
     pub grid_width: u32,
     pub grid_height: V3Dim16,
     pub grid_depth: V3Dim16,
-    _pad2: [u32; 2],
+    /// The dependent QMD's address shifted right by 8.
+    pub dependent_qmd_pointer: u32,
+    pub dependent: V3Dependent,
     pub shared: V3Shared,
     pub version_block_x: V3VersionBlockX,
     pub block_yz: V3BlockYz,
     pub const_buffer_mask: V3ConstBufferMask,
-    _pad3: [u32; 3],
+    _pad3: [u32; 2],
+    pub local_pos_alloc: u32,
     /// Release slots 0 and 1.
     pub releases: [V3Release; 2],
     pub const_buffers: [V3ConstBuffer; 8],
@@ -346,9 +372,12 @@ const _: () = {
     assert!(core::mem::size_of::<QmdV3>() == QMD_WORDS * 4);
     assert!(core::mem::offset_of!(QmdV3, control) == 4 * 4);
     assert!(core::mem::offset_of!(QmdV3, grid_width) == 12 * 4);
+    assert!(core::mem::offset_of!(QmdV3, dependent_qmd_pointer) == 15 * 4);
+    assert!(core::mem::offset_of!(QmdV3, dependent) == 16 * 4);
     assert!(core::mem::offset_of!(QmdV3, shared) == 17 * 4);
     assert!(core::mem::offset_of!(QmdV3, version_block_x) == 18 * 4);
     assert!(core::mem::offset_of!(QmdV3, const_buffer_mask) == 20 * 4);
+    assert!(core::mem::offset_of!(QmdV3, local_pos_alloc) == 23 * 4);
     assert!(core::mem::offset_of!(QmdV3, releases) == 24 * 4);
     assert!(core::mem::offset_of!(QmdV3, const_buffers) == 32 * 4);
     assert!(core::mem::offset_of!(QmdV3, program_low) == 48 * 4);
@@ -405,6 +434,8 @@ impl QmdV3 {
             shared_memory_size: self.shared.size(),
             const_buffers,
             linked_samplers: false,
+            local_memory_size: (self.local_pos_alloc & 0xff_ffff)
+                + (self.local_crs_alloc & 0xff_ffff),
         })
     }
 
@@ -440,5 +471,20 @@ mod tests {
                 signed: false
             })
         );
+    }
+
+    #[test]
+    fn local_memory_adds_the_positive_and_call_stack_allocations() {
+        let mut words = [0u32; QMD_WORDS];
+        words[0x2d] = 0xfff0_0100;
+        words[0x2f] = 0x40;
+        let v2 = bytemuck::cast_ref::<[u32; QMD_WORDS], QmdV2>(&words);
+        assert_eq!(v2.launch(0).local_memory_size, 0x140);
+
+        let mut words = [0u32; QMD_WORDS];
+        words[23] = 0xff10_0000;
+        words[50] = 0x20;
+        let v3 = bytemuck::cast_ref::<[u32; QMD_WORDS], QmdV3>(&words);
+        assert_eq!(v3.launch().unwrap().local_memory_size, 0x10_0020);
     }
 }

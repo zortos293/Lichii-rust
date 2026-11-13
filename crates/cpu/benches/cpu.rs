@@ -12,6 +12,8 @@ use lichii_memory::{AddressSpace, ExclusiveMonitor, MemoryPermission, PhysicalMe
 
 const CODE: u64 = 0x10000;
 const DATA: u64 = 0x100000;
+/// Where `far` code goes: its addresses share indirect-table slots with `CODE`'s.
+const FAR: u64 = CODE + 0x40000;
 
 struct Clock;
 
@@ -25,6 +27,7 @@ impl GuestClock for Clock {
 struct Workload {
     name: &'static str,
     code: &'static [u32],
+    far: &'static [u32],
     per_iteration: u64,
 }
 
@@ -42,6 +45,7 @@ const WORKLOADS: &[Workload] = &[
             0x54ffff21, // b.ne 1b
             0xd4000001, // svc #0
         ],
+        far: &[],
         per_iteration: 8,
     },
     Workload {
@@ -56,6 +60,7 @@ const WORKLOADS: &[Workload] = &[
             0xd65f03c0, // ret
             0xd65f03c0, // 3: ret
         ],
+        far: &[],
         per_iteration: 6,
     },
     Workload {
@@ -66,7 +71,24 @@ const WORKLOADS: &[Workload] = &[
             0x54ffffc1, // b.ne 1b
             0xd4000001, // svc #0
         ],
+        far: &[],
         per_iteration: 3,
+    },
+    Workload {
+        name: "colliding returns",
+        code: &[
+            0x94000008, // 1: bl 3f
+            0x1400ffff, // b 2f
+            0, 0, 0, 0, 0, 0, 0x91000442, // 3: add x2, x2, #1
+            0xd65f03c0, // ret
+        ],
+        far: &[
+            0x97ff0008, // 2: bl 3b
+            0xf10004a5, // subs x5, x5, #1
+            0x54dfffc1, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        per_iteration: 9,
     },
 ];
 
@@ -86,8 +108,11 @@ fn main() {
         );
         mem.map(CODE, 0, 0x1000, MemoryPermission::READ_EXECUTE);
         mem.map(DATA, 0x1000, 0x2000, MemoryPermission::READ_WRITE);
-        for (i, word) in workload.code.iter().enumerate() {
-            mem.write(CODE + 4 * i as u64, *word).unwrap();
+        mem.map(FAR, 0x3000, 0x1000, MemoryPermission::READ_EXECUTE);
+        for (base, words) in [(CODE, workload.code), (FAR, workload.far)] {
+            for (i, word) in words.iter().enumerate() {
+                mem.write(base + 4 * i as u64, *word).unwrap();
+            }
         }
         let mut core = new_core(
             backend,
