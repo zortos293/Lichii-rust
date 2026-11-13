@@ -50,6 +50,7 @@ fn fixture(gob: GobLayout, recompression: AstcRecompression) -> Option<Fixture> 
         cache: TextureCache::new(
             &device,
             Arc::new(GpuWrittenPages::new(36)),
+            Arc::new(lichii_gpu::lazy::LazyDeviceRanges::new(memory.clone())),
             gob,
             recompression,
         ),

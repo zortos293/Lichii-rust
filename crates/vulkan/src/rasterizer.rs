@@ -180,10 +180,12 @@ impl VulkanRasterizer {
             device,
             handles.device.clone(),
             handles.written_pages.clone(),
+            handles.lazy.clone(),
         )?;
         let texture_cache = TextureCache::new(
             device,
             handles.written_pages.clone(),
+            handles.lazy.clone(),
             gob_layout,
             AstcRecompression::Uncompressed,
         );
@@ -993,6 +995,7 @@ mod tests {
             syncpoints: syncpoints.clone(),
             timestamp: Arc::new(GpuTimestamp::new(Arc::new(HostTime(Instant::now())), false)),
             written_pages: Arc::new(lichii_gpu::backend::GpuWrittenPages::new(36)),
+            lazy: Arc::new(lichii_gpu::lazy::LazyDeviceRanges::new(memory.clone())),
         };
         let mailbox = Arc::new(FrameMailbox::default());
         let rasterizer =

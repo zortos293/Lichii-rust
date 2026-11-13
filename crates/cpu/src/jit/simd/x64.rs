@@ -21,6 +21,17 @@ use super::ir::{Arith, Fp, Fused, SimdOp};
 pub(super) const HOST_FPCR: i32 = 3 << 22 | 1 << 24;
 /// FPSR.IXC.
 const IXC: i8 = 0x10;
+/// An H value with exponent 31 (an infinity or a NaN, or under FPCR.AHP a normal number) falls
+/// back; every other H value means the same in both formats and converts exactly, so FPCR is not
+/// checked at all.
+///
+/// 2^112 as an S value and 2^1008 as a D value: the exponent bias differences from H. A finite H
+/// value's magnitude bits, shifted into the S or D position, times this scale is the exact
+/// converted value, subnormals included.
+#[repr(align(16))]
+struct HalfScale([u32; 4]);
+
+static HALF_SCALE: HalfScale = HalfScale([0x7780_0000, 0, 0, 0x7ef0_0000]);
 
 #[derive(Default)]
 pub(in super::super) struct State {
@@ -118,6 +129,27 @@ impl Emitter<'_> {
                 ; ja =>slow
             ),
         }
+    }
+
+    /// The NZCV of an ordered compare of `xmm a` with `xmm b` in `d`; unordered jumps to `slow`.
+    /// Clobbers `rax`, `rcx` and `rdx`.
+    fn compare_flags(&mut self, fp: Fp, a: u8, b: u8, d: u8, slow: DynamicLabel) {
+        match fp {
+            Fp::S => dynasm!(self.asm ; .arch x64 ; ucomiss Rx(a), Rx(b)),
+            Fp::D => dynasm!(self.asm ; .arch x64 ; ucomisd Rx(a), Rx(b)),
+        }
+        dynasm!(self.asm
+            ; .arch x64
+            ; jp =>slow
+            ; setb al
+            ; setz cl
+            ; movzx eax, al
+            ; movzx ecx, cl
+            ; lea edx, [rax * 8]
+            ; lea edx, [rdx + rcx * 4]
+            ; xor eax, 1
+            ; lea Rd(d), [rdx + rax * 2]
+        );
     }
 
     pub(super) fn finish_checked(
@@ -218,9 +250,18 @@ impl Emitter<'_> {
                     (Arith::Mul, Fp::D) => dynasm!(self.asm ; .arch x64 ; mulsd xmm15, Rx(b)),
                     (Arith::Div, Fp::S) => dynasm!(self.asm ; .arch x64 ; divss xmm15, Rx(b)),
                     (Arith::Div, Fp::D) => dynasm!(self.asm ; .arch x64 ; divsd xmm15, Rx(b)),
+                    (Arith::Nmul, Fp::S) => dynasm!(self.asm ; .arch x64 ; mulss xmm15, Rx(b)),
+                    (Arith::Nmul, Fp::D) => dynasm!(self.asm ; .arch x64 ; mulsd xmm15, Rx(b)),
                 }
                 let sum = matches!(op, Arith::Add | Arith::Sub);
                 self.check_result(fp, !sum, slow);
+                match (op, fp) {
+                    (Arith::Nmul, Fp::S) => {
+                        dynasm!(self.asm ; .arch x64 ; xor eax, 0x8000_0000u32 as i32)
+                    }
+                    (Arith::Nmul, Fp::D) => dynasm!(self.asm ; .arch x64 ; btc rax, 63),
+                    _ => {}
+                }
                 self.rax_to_low(fp, d);
                 self.finish_checked(i, slow, word, d, Ty::U128);
             }
@@ -279,6 +320,45 @@ impl Emitter<'_> {
                     Fp::D => dynasm!(self.asm ; .arch x64 ; sqrtsd xmm15, Rx(a)),
                 }
                 self.check_result(fp, false, slow);
+                self.rax_to_low(fp, d);
+                self.finish_checked(i, slow, word, d, Ty::U128);
+            }
+            SimdOp::FromHalf { fp, a, word } => {
+                let a = self.reg(a);
+                let d = self.def(v);
+                let slow = self.asm.new_dynamic_label();
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; movd eax, Rx(a)
+                    ; mov ecx, eax
+                    ; and ecx, 0x7c00
+                    ; cmp ecx, 0x7c00
+                    ; je =>slow
+                    ; mov ecx, eax
+                    ; and ecx, 0x8000
+                    ; and eax, 0x7fff
+                    ; mov rdx, QWORD HALF_SCALE.0.as_ptr() as i64
+                );
+                match fp {
+                    Fp::S => dynasm!(self.asm
+                        ; .arch x64
+                        ; shl eax, 13
+                        ; movd xmm15, eax
+                        ; mulss xmm15, [rdx]
+                        ; movd eax, xmm15
+                        ; shl ecx, 16
+                        ; or eax, ecx
+                    ),
+                    Fp::D => dynasm!(self.asm
+                        ; .arch x64
+                        ; shl rax, 42
+                        ; movq xmm15, rax
+                        ; mulsd xmm15, [rdx + 8]
+                        ; movq rax, xmm15
+                        ; shl rcx, 48
+                        ; or rax, rcx
+                    ),
+                }
                 self.rax_to_low(fp, d);
                 self.finish_checked(i, slow, word, d, Ty::U128);
             }
@@ -385,21 +465,29 @@ impl Emitter<'_> {
                 };
                 let d = self.def(v);
                 let slow = self.checked(false);
-                match fp {
-                    Fp::S => dynasm!(self.asm ; .arch x64 ; ucomiss Rx(a), Rx(b)),
-                    Fp::D => dynasm!(self.asm ; .arch x64 ; ucomisd Rx(a), Rx(b)),
-                }
+                self.compare_flags(fp, a, b, d, slow);
+                self.finish_checked(i, slow, word, d, Ty::Nzcv);
+            }
+            SimdOp::CondCompare {
+                fp,
+                c,
+                a,
+                b,
+                nzcv,
+                word,
+            } => {
+                let (c, a, b) = (self.reg(c), self.reg(a), self.reg(b));
+                let d = self.def(v);
+                let (skip, done) = (self.asm.new_dynamic_label(), self.asm.new_dynamic_label());
+                dynasm!(self.asm ; .arch x64 ; test Rd(c), Rd(c) ; jz =>skip);
+                let slow = self.checked(false);
+                self.compare_flags(fp, a, b, d, slow);
                 dynasm!(self.asm
                     ; .arch x64
-                    ; jp =>slow
-                    ; setb al
-                    ; setz cl
-                    ; movzx eax, al
-                    ; movzx ecx, cl
-                    ; lea edx, [rax * 8]
-                    ; lea edx, [rdx + rcx * 4]
-                    ; xor eax, 1
-                    ; lea Rd(d), [rdx + rax * 2]
+                    ; jmp =>done
+                    ; =>skip
+                    ; mov Rd(d), nzcv as i32
+                    ; =>done
                 );
                 self.finish_checked(i, slow, word, d, Ty::Nzcv);
             }
@@ -412,6 +500,9 @@ impl Emitter<'_> {
     pub(in super::super) fn simd_slow_paths(&mut self) {
         for slow in std::mem::take(&mut self.simd.slow) {
             dynasm!(self.asm ; .arch x64 ; =>slow.label);
+            if slow.ty == Ty::Nzcv {
+                self.materialize_nzcv();
+            }
             self.save(slow.saved);
             dynasm!(self.asm
                 ; .arch x64

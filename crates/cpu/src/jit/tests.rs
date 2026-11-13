@@ -246,7 +246,9 @@ fn atomic(rng: &mut Rng) -> u32 {
     }
 }
 
-const FP: [&str; 18] = [
+const FP: [&str; 20] = [
+    "000111100x1xxxxxxxxx01xxxxxxxxxx",
+    "0001111011100010x10000xxxxxxxxxx",
     "01x111111xxxxxxxxx01x0xxxxxxxxxx",
     "01x111100x100001110110xxxxxxxxxx",
     "0xx01110xx1xxxxx110xx1xxxxxxxxxx",
@@ -811,7 +813,7 @@ fn simd_runs_mid_block_on_the_live_context() {
 /// FPSR.IXC both clear and already set.
 #[test]
 fn fp_edge_cases_match_the_interpreter() {
-    const OPS: [u32; 17] = [
+    const OPS: [u32; 22] = [
         0x1e22_2820, // fadd s0, s1, s2
         0x1e22_3820, // fsub s0, s1, s2
         0x1e22_0820, // fmul s0, s1, s2
@@ -829,6 +831,11 @@ fn fp_edge_cases_match_the_interpreter() {
         0x1e39_0020, // fcvtzu w0, s1
         0x9e38_0020, // fcvtzs x0, s1
         0x9e39_0020, // fcvtzu x0, s1
+        0x1e22_8820, // fnmul s0, s1, s2
+        0x1e22_0425, // fccmp s1, s2, #5, eq
+        0x1e22_1425, // fccmp s1, s2, #5, ne
+        0x1e22_0435, // fccmpe s1, s2, #5, eq
+        0x1e22_1435, // fccmpe s1, s2, #5, ne
     ];
     let machines = &mut [
         ("interpreter", Machine::new(Backend::Interpreter)),
@@ -891,6 +898,85 @@ fn fp_edge_cases_match_the_interpreter() {
                 ctx.x[1] = x;
                 ctx.v[1] = 0x5a5a_5a5a_5a5a_5a5a << 64 | x as u128;
                 compare(machines, &[op | fp, BRK], &ctx, &data);
+            }
+        }
+    }
+}
+
+/// Every exponent of H, with mantissas at the ends, the middle and the quiet bit, converted to S and
+/// D under the FPCR controls that matter: AHP, DN, FZ and FZ16.
+#[test]
+fn half_conversions_match_the_interpreter() {
+    const FCVT_S0_H1: u32 = 0x1ee2_4020;
+    const FCVT_D0_H1: u32 = 0x1ee2_c020;
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    for sign in [0, 0x8000] {
+        for exponent in 0..32 {
+            for mantissa in [0, 1, 0x155, 0x200, 0x3ff] {
+                let half = sign | exponent << 10 | mantissa;
+                for fpcr in [0, 1 << 26, 1 << 25, 1 << 24, 1 << 19, 3 << 22] {
+                    for op in [FCVT_S0_H1, FCVT_D0_H1] {
+                        let mut ctx = ThreadContext {
+                            pc: CODE,
+                            fpcr,
+                            ..Default::default()
+                        };
+                        ctx.v[1] = 0x5a5a_5a5a_5a5a_5a5a_5a5a_5a5a_5a5a << 16 | half as u128;
+                        compare(machines, &[op, BRK], &ctx, &data);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// FCCMP reads NZCV: from a flag op earlier in its block, and lazily from the previous block,
+/// with operands that compare natively and NaNs that take the slow path.
+#[test]
+fn conditional_compares_read_the_live_flags() {
+    const SUBS_X0_X1_X2: u32 = 0xeb02_0020;
+    const B_NEXT: u32 = 0x1400_0001;
+    const FCCMP_S1_S2_5_EQ: u32 = 0x1e22_0425;
+    const FCCMPE_D1_D2_5_NE: u32 = 0x1e62_1435;
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+        ("jit without fastmem", Machine::new(Backend::SlowJit)),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    let cases: [(u32, [u64; 3], u64); 2] = [
+        (
+            FCCMP_S1_S2_5_EQ,
+            [0x3f80_0000, 0x7fc0_0000, 0x7fa0_0000],
+            0x4000_0000,
+        ),
+        (
+            FCCMPE_D1_D2_5_NE,
+            [0x3ff0 << 48, 0x7ff8 << 48, 0x7ff4 << 48],
+            0x4000 << 48,
+        ),
+    ];
+    for (fccmp, values, b) in cases {
+        for code in [
+            [SUBS_X0_X1_X2, fccmp, BRK, BRK],
+            [SUBS_X0_X1_X2, B_NEXT, fccmp, BRK],
+        ] {
+            for x2 in [7, 8] {
+                for a in values {
+                    let mut ctx = ThreadContext {
+                        pc: CODE,
+                        ..Default::default()
+                    };
+                    ctx.x[1] = 7;
+                    ctx.x[2] = x2;
+                    ctx.v[1] = a as u128;
+                    ctx.v[2] = b as u128;
+                    compare(machines, &code, &ctx, &data);
+                }
             }
         }
     }

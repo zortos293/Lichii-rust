@@ -15,6 +15,7 @@ use lichii_memory::DeviceAddressSpace;
 use parking_lot::Mutex;
 
 use crate::host1x::Syncpoints;
+use crate::lazy::LazyDeviceRanges;
 
 /// Width of a GPU virtual address space.
 pub const GPU_VA_BITS: u32 = 40;
@@ -182,6 +183,8 @@ pub struct Gmmu {
     directory: Box<[AtomicPtr<BigTable>]>,
     writer: Mutex<()>,
     shim: OnceLock<(GpuVAddr, Arc<Syncpoints>)>,
+    /// Device ranges that get memory as they are written, set for Switch 2 address spaces.
+    lazy: OnceLock<Arc<LazyDeviceRanges>>,
     generation: AtomicU64,
     table_bytes: AtomicU64,
 }
@@ -198,6 +201,7 @@ impl Gmmu {
             directory,
             writer: Mutex::new(()),
             shim: OnceLock::new(),
+            lazy: OnceLock::new(),
             generation: AtomicU64::new(0),
             table_bytes: AtomicU64::new(0),
         }
@@ -273,6 +277,11 @@ impl Gmmu {
         Ok(())
     }
 
+    /// Writes to device pages without memory give lazy device ranges their memory from now on.
+    pub(crate) fn set_lazy(&self, lazy: Arc<LazyDeviceRanges>) {
+        let _ = self.lazy.set(lazy);
+    }
+
     /// Maps the read-only syncpoint shim page at `gpu_va`: a u32 per syncpoint id with its guest
     /// value (NX2_NOTES row 46). One shim per address space.
     pub fn map_syncpoint_shim(
@@ -309,12 +318,11 @@ impl Gmmu {
     pub fn read<T: bytemuck::Pod>(&self, gpu_va: GpuVAddr) -> Result<T, GpuFault> {
         let (pte, page) = self.lookup(gpu_va);
         let offset = gpu_va & (page - 1);
-        if pte.state() == MAPPED && offset + size_of::<T>() as u64 <= page {
-            let daddr = pte.daddr() + offset;
-            return self
-                .device
-                .read(daddr)
-                .map_err(|fault| device_fault(gpu_va + (fault.addr - daddr)));
+        if pte.state() == MAPPED
+            && offset + size_of::<T>() as u64 <= page
+            && let Ok(value) = self.device.read(pte.daddr() + offset)
+        {
+            return Ok(value);
         }
         let mut value = T::zeroed();
         self.read_block(gpu_va, bytemuck::bytes_of_mut(&mut value))?;
@@ -325,12 +333,11 @@ impl Gmmu {
     pub fn write<T: bytemuck::Pod>(&self, gpu_va: GpuVAddr, value: T) -> Result<(), GpuFault> {
         let (pte, page) = self.lookup(gpu_va);
         let offset = gpu_va & (page - 1);
-        if pte.state() == MAPPED && offset + size_of::<T>() as u64 <= page {
-            let daddr = pte.daddr() + offset;
-            return self
-                .device
-                .write(daddr, value)
-                .map_err(|fault| device_fault(gpu_va + (fault.addr - daddr)));
+        if pte.state() == MAPPED
+            && offset + size_of::<T>() as u64 <= page
+            && self.device.write(pte.daddr() + offset, value).is_ok()
+        {
+            return Ok(());
         }
         self.write_block(gpu_va, bytemuck::bytes_of(&value))
     }
@@ -442,7 +449,7 @@ impl Gmmu {
     }
 
     /// Copies device memory a page at a time; unmapped pages read zero. Returns the first
-    /// unmapped device address.
+    /// unmapped device address outside lazy device ranges, whose pages without memory are zero.
     fn read_device(&self, daddr: DAddr, out: &mut [u8]) -> Result<(), DAddr> {
         let mut fault = None;
         let mut done = 0;
@@ -455,7 +462,10 @@ impl Gmmu {
                 Some(ptr) => unsafe { std::ptr::copy_nonoverlapping(ptr, chunk.as_mut_ptr(), len) },
                 None => {
                     chunk.fill(0);
-                    fault.get_or_insert(addr);
+                    let lazy = self.lazy.get();
+                    if !lazy.is_some_and(|lazy| lazy.is_lazy(addr, len as u64)) {
+                        fault.get_or_insert(addr);
+                    }
                 }
             }
             done += len;
@@ -463,9 +473,17 @@ impl Gmmu {
         fault.map_or(Ok(()), Err)
     }
 
-    /// Writes device memory a page at a time, skipping unmapped pages. Returns the first
-    /// unmapped device address.
+    /// Writes device memory a page at a time, skipping unmapped pages; pages of lazy device
+    /// ranges get memory instead. Returns the first unmapped device address.
     fn write_device(&self, daddr: DAddr, data: &[u8]) -> Result<(), DAddr> {
+        let result = self.write_mapped(daddr, data);
+        match (result, self.lazy.get()) {
+            (Err(_), Some(lazy)) => lazy.write(daddr, data).map_err(|fault| fault.addr),
+            (result, _) => result,
+        }
+    }
+
+    fn write_mapped(&self, daddr: DAddr, data: &[u8]) -> Result<(), DAddr> {
         let mut fault = None;
         let mut done = 0;
         while done < data.len() {

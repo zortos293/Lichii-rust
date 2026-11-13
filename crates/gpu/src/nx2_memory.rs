@@ -7,7 +7,8 @@
 //! every GMMU shares, freed for reuse when it is destroyed (rows 42 and 85). Destroying memory
 //! unmaps every GPU range that reaches it from every GMMU, because the title reuses it as heap
 //! right away (row 68). Sparse regions commit no memory until something is mapped into them
-//! (rows 57, 80 and 81).
+//! (rows 57, 80 and 81). Lazy regions (214 for GPU-only storage) get a device range of their own
+//! with memory behind it only where something writes ([`crate::lazy`]).
 //!
 //! Ranges named by first and last address are inclusive, as the requests carry them.
 
@@ -21,6 +22,7 @@ use parking_lot::Mutex;
 
 use crate::device_memory::DeviceAllocator;
 use crate::gmmu::{GPU_VA_SIZE, Gmmu, MappedRange, PTE_KIND_INVALID, PTE_KIND_PITCH};
+use crate::lazy::{LAZY_BLOCK_SIZE, LazyBlock, LazyDeviceRanges};
 use crate::semaphore_mirror::{REGION_SIZE, SemaphoreMirror};
 
 const DEVICE_ALIGN: u64 = 0x2_0000;
@@ -59,6 +61,16 @@ pub struct GpuMemoryInfo {
     pub daddr: DAddr,
 }
 
+/// What destroying a lazy region released.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LazyRegionDestroyed {
+    /// The mappings removed from the address spaces.
+    pub unmapped: Vec<Unmapped>,
+    /// Every block [`LazyBacking::back`](crate::lazy::LazyBacking::back) gave memory, now
+    /// unmapped from the device address space: its memory goes back to the services.
+    pub backed: Vec<LazyBlock>,
+}
+
 /// Why a request failed; the services turn these into Horizon results.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Nx2MemoryError {
@@ -89,6 +101,7 @@ pub struct Nx2GpuMemory {
     device: Arc<DeviceAddressSpace>,
     allocator: Arc<DeviceAllocator>,
     semaphores: Arc<SemaphoreMirror>,
+    lazy: Arc<LazyDeviceRanges>,
     state: Mutex<State>,
 }
 
@@ -97,9 +110,17 @@ struct State {
     last_handle: u32,
     last_space: u32,
     memories: HashMap<u32, GpuMemoryInfo>,
-    sparse_regions: BTreeMap<GpuVAddr, u64>,
+    regions: BTreeMap<GpuVAddr, Region>,
     ranges: BTreeMap<GpuVAddr, Range>,
     spaces: Vec<(AddressSpaceId, Arc<Gmmu>)>,
+}
+
+/// A sparse or lazy region (gpu sub 214).
+#[derive(Clone, Copy, Debug)]
+struct Region {
+    size: u64,
+    /// A lazy region's device range; none for a sparse one.
+    lazy: Option<DAddr>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -113,12 +134,14 @@ struct Range {
 enum Backing {
     Sparse,
     Memory { handle: u32, offset: u64 },
+    Lazy { daddr: DAddr },
 }
 
 impl Backing {
     fn advanced(self, by: u64) -> Self {
         match self {
             Self::Sparse => Self::Sparse,
+            Self::Lazy { daddr } => Self::Lazy { daddr: daddr + by },
             Self::Memory { handle, offset } => Self::Memory {
                 handle,
                 offset: offset + by,
@@ -130,15 +153,18 @@ impl Backing {
 impl Nx2GpuMemory {
     /// A registry mapping into `device`, taking device ranges from `allocator` (shared with nvmap).
     /// Memories of [`REGION_SIZE`] bytes hold queue semaphores, and `semaphores` mirrors them.
+    /// Lazy regions are ranges of `lazy`, which must cover `device`.
     pub fn new(
         device: Arc<DeviceAddressSpace>,
         allocator: Arc<DeviceAllocator>,
         semaphores: Arc<SemaphoreMirror>,
+        lazy: Arc<LazyDeviceRanges>,
     ) -> Self {
         Self {
             device,
             allocator,
             semaphores,
+            lazy,
             state: Mutex::new(State::default()),
         }
     }
@@ -148,6 +174,7 @@ impl Nx2GpuMemory {
         let mut state = self.state.lock();
         state.last_space += 1;
         let id = AddressSpaceId(state.last_space);
+        gmmu.set_lazy(self.lazy.clone());
         for (&start, range) in &state.ranges {
             apply(&state.memories, &gmmu, start, range);
         }
@@ -305,24 +332,10 @@ impl Nx2GpuMemory {
     ) -> Result<Vec<Unmapped>, Nx2MemoryError> {
         check_range(va, size)?;
         let mut state = self.state.lock();
-        let end = va + size;
-        let in_use = |last: Option<(&GpuVAddr, u64)>| last.is_some_and(|(&s, len)| s + len > va);
-        if in_use(
-            state
-                .sparse_regions
-                .range(..end)
-                .next_back()
-                .map(|(s, &l)| (s, l)),
-        ) || in_use(
-            state
-                .ranges
-                .range(..end)
-                .next_back()
-                .map(|(s, r)| (s, r.size)),
-        ) {
+        if state.in_use(va, size) {
             return Err(Nx2MemoryError::RangeInUse { va, size });
         }
-        state.sparse_regions.insert(va, size);
+        state.regions.insert(va, Region { size, lazy: None });
         Ok(state.insert(
             va,
             Range {
@@ -341,15 +354,82 @@ impl Nx2GpuMemory {
         size: u64,
     ) -> Result<Vec<Unmapped>, Nx2MemoryError> {
         let mut state = self.state.lock();
-        if state.sparse_regions.get(&va) != Some(&size) {
+        if !state
+            .regions
+            .get(&va)
+            .is_some_and(|r| r.size == size && r.lazy.is_none())
+        {
             return Err(Nx2MemoryError::NoSuchRegion { va, size });
         }
-        state.sparse_regions.remove(&va);
-        let mut unmapped = Vec::new();
-        for (start, range) in state.take(va, size) {
-            unmapped.extend(state.unmap_everywhere(start, range.size));
+        state.regions.remove(&va);
+        Ok(state.unmap_region(va, size))
+    }
+
+    /// CreateSparseRegion (gpu sub 214) for GPU-only storage, backed as it is written: gives
+    /// [`va`, +`size`) a device range of its own with no memory behind it and maps it there in
+    /// every address space. Pages without memory read zero, and a block gets memory from the
+    /// [`LazyBacking`](crate::lazy::LazyBacking) when a write lands in it. Returns the device
+    /// range and the mappings replaced.
+    pub fn create_lazy_region(
+        &self,
+        va: GpuVAddr,
+        size: u64,
+    ) -> Result<(DAddr, Vec<Unmapped>), Nx2MemoryError> {
+        check_range(va, size)?;
+        let mut state = self.state.lock();
+        if state.in_use(va, size) {
+            return Err(Nx2MemoryError::RangeInUse { va, size });
         }
-        Ok(unmapped)
+        let daddr = self
+            .allocator
+            .allocate(size.next_multiple_of(LAZY_BLOCK_SIZE), LAZY_BLOCK_SIZE)
+            .ok_or(Nx2MemoryError::OutOfDeviceMemory { size })?;
+        self.lazy.add(daddr, size);
+        state.regions.insert(
+            va,
+            Region {
+                size,
+                lazy: Some(daddr),
+            },
+        );
+        let replaced = state.insert(
+            va,
+            Range {
+                size,
+                backing: Backing::Lazy { daddr },
+                kind: PTE_KIND_PITCH,
+            },
+        );
+        Ok((daddr, replaced))
+    }
+
+    /// DestroySparseRegion (gpu sub 215) of a lazy region: unmaps it and everything mapped into it
+    /// from every address space, unmaps the blocks that got memory from the device address space
+    /// and frees the device range. The services take back the memory of the blocks returned.
+    pub fn destroy_lazy_region(
+        &self,
+        va: GpuVAddr,
+        size: u64,
+    ) -> Result<LazyRegionDestroyed, Nx2MemoryError> {
+        let mut state = self.state.lock();
+        let Some(daddr) = state
+            .regions
+            .get(&va)
+            .filter(|r| r.size == size)
+            .and_then(|r| r.lazy)
+        else {
+            return Err(Nx2MemoryError::NoSuchRegion { va, size });
+        };
+        state.regions.remove(&va);
+        let unmapped = state.unmap_region(va, size);
+        let backed = self.lazy.remove(daddr);
+        for block in &backed {
+            self.device.unmap(block.daddr, block.size);
+        }
+        self.allocator
+            .free(daddr, size.next_multiple_of(LAZY_BLOCK_SIZE))
+            .expect("the range was allocated at creation");
+        Ok(LazyRegionDestroyed { unmapped, backed })
     }
 
     /// NormalModifyMemoryKind4K (gpu sub 212, behind NvRmGpuMappingModify): sets the PTE kind of
@@ -395,6 +475,24 @@ impl Nx2GpuMemory {
 }
 
 impl State {
+    /// Whether [`va`, +`size`) overlaps a region or a mapping.
+    fn in_use(&self, va: GpuVAddr, size: u64) -> bool {
+        let end = va + size;
+        let region = self.regions.range(..end).next_back();
+        let range = self.ranges.range(..end).next_back();
+        region.is_some_and(|(&s, r)| s + r.size > va)
+            || range.is_some_and(|(&s, r)| s + r.size > va)
+    }
+
+    /// Unmaps a region that was just removed, and everything mapped into it, everywhere.
+    fn unmap_region(&mut self, va: GpuVAddr, size: u64) -> Vec<Unmapped> {
+        let mut unmapped = Vec::new();
+        for (start, range) in self.take(va, size) {
+            unmapped.extend(self.unmap_everywhere(start, range.size));
+        }
+        unmapped
+    }
+
     fn split_at(&mut self, at: GpuVAddr) {
         let Some((&start, &range)) = self.ranges.range(..at).next_back() else {
             return;
@@ -466,53 +564,60 @@ impl State {
     }
 
     /// Unmaps the recorded ranges inside [`start`, +`size`); what lies in a sparse region turns
-    /// sparse again.
+    /// sparse again, and what lies in a lazy region maps its device range again.
     fn unmap(&mut self, start: GpuVAddr, size: u64) -> Vec<Unmapped> {
         let mut unmapped = Vec::new();
         for (piece_start, range) in self.take(start, size) {
-            let kind = match range.backing {
-                Backing::Sparse => range.kind,
-                Backing::Memory { .. } => PTE_KIND_INVALID,
-            };
-            for (va, len, sparse) in self.sparse_pieces(piece_start, range.size) {
-                if sparse {
-                    unmapped.extend(self.insert(
-                        va,
-                        Range {
-                            size: len,
-                            backing: Backing::Sparse,
-                            kind,
-                        },
-                    ));
-                } else {
+            for (va, len, backing) in self.region_pieces(piece_start, range.size) {
+                let Some(backing) = backing else {
                     unmapped.extend(self.unmap_everywhere(va, len));
-                }
+                    continue;
+                };
+                let kind = match (range.backing, backing) {
+                    (Backing::Memory { .. }, Backing::Sparse) => PTE_KIND_INVALID,
+                    (Backing::Memory { .. }, _) => PTE_KIND_PITCH,
+                    _ => range.kind,
+                };
+                unmapped.extend(self.insert(
+                    va,
+                    Range {
+                        size: len,
+                        backing,
+                        kind,
+                    },
+                ));
             }
         }
         unmapped
     }
 
-    /// [`start`, +`size`) cut where sparse regions begin and end, each piece marked with whether
-    /// it lies in one.
-    fn sparse_pieces(&self, start: GpuVAddr, size: u64) -> Vec<(GpuVAddr, u64, bool)> {
+    /// [`start`, +`size`) cut where regions begin and end, each piece with the backing its
+    /// region gives it, or none outside regions.
+    fn region_pieces(&self, start: GpuVAddr, size: u64) -> Vec<(GpuVAddr, u64, Option<Backing>)> {
         let end = start + size;
         let mut pieces = Vec::new();
         let mut at = start;
-        for (&region, &len) in self.sparse_regions.range(..end) {
-            let region_end = region + len;
+        for (&region, r) in self.regions.range(..end) {
+            let region_end = region + r.size;
             if region_end <= at {
                 continue;
             }
             let from = region.max(at);
             if from > at {
-                pieces.push((at, from - at, false));
+                pieces.push((at, from - at, None));
             }
             let to = region_end.min(end);
-            pieces.push((from, to - from, true));
+            let backing = match r.lazy {
+                Some(daddr) => Backing::Lazy {
+                    daddr: daddr + (from - region),
+                },
+                None => Backing::Sparse,
+            };
+            pieces.push((from, to - from, Some(backing)));
             at = to;
         }
         if at < end {
-            pieces.push((at, end - at, false));
+            pieces.push((at, end - at, None));
         }
         pieces
     }
@@ -540,6 +645,7 @@ fn apply(
             range.kind,
             false,
         ),
+        Backing::Lazy { daddr } => gmmu.map(start, daddr, range.size, range.kind, false),
     };
     result.expect("registry ranges are validated")
 }
@@ -565,6 +671,7 @@ fn inclusive_size(first: u64, last: u64) -> Result<u64, Nx2MemoryError> {
 mod tests {
     use super::*;
     use crate::gmmu::{BigPageSize, RangeTarget};
+    use crate::lazy::LazyBacking;
     use lichii_common::PAGE_SIZE;
     use lichii_memory::{MemoryPermission, PhysicalMemory};
 
@@ -575,6 +682,7 @@ mod tests {
         space: AddressSpace,
         device: Arc<DeviceAddressSpace>,
         allocator: Arc<DeviceAllocator>,
+        lazy: Arc<LazyDeviceRanges>,
         memory: Nx2GpuMemory,
         gmmus: [Arc<Gmmu>; 2],
     }
@@ -585,13 +693,20 @@ mod tests {
         space.map(CPU_VA, 0, 0x20_0000, MemoryPermission::READ_WRITE);
         let device = Arc::new(DeviceAddressSpace::new(physical, 36));
         let allocator = Arc::new(DeviceAllocator::new(36));
+        let lazy = Arc::new(LazyDeviceRanges::new(device.clone()));
         let gmmus = [
             Arc::new(Gmmu::new(device.clone(), BigPageSize::Size64K)),
             Arc::new(Gmmu::new(device.clone(), BigPageSize::Size128K)),
         ];
         Fixture {
             space,
-            memory: Nx2GpuMemory::new(device.clone(), allocator.clone(), Arc::default()),
+            memory: Nx2GpuMemory::new(
+                device.clone(),
+                allocator.clone(),
+                Arc::default(),
+                lazy.clone(),
+            ),
+            lazy,
             device,
             allocator,
             gmmus,
@@ -602,6 +717,99 @@ mod tests {
         let mut target = RangeTarget::Unmapped;
         gmmu.for_each_range(va, 1, |r| target = r.target);
         target
+    }
+
+    /// Gives lazy blocks memory from a list of DRAM blocks, as the services' reserve does.
+    struct Blocks {
+        device: Arc<DeviceAddressSpace>,
+        free: Mutex<Vec<u64>>,
+    }
+
+    impl LazyBacking for Blocks {
+        fn back(&self, daddr: DAddr, size: u64) -> bool {
+            let Some(pa) = self.free.lock().pop() else {
+                return false;
+            };
+            self.device.map(daddr, pa, size);
+            true
+        }
+    }
+
+    #[test]
+    fn lazy_regions_back_the_blocks_written_and_give_back_exactly_those() {
+        let f = fixture();
+        f.memory.register_address_space(f.gmmus[0].clone());
+        f.lazy.set_backing(Arc::new(Blocks {
+            device: f.device.clone(),
+            free: Mutex::new(vec![0xc0_0000, 0x80_0000]),
+        }));
+        let before = f.allocator.allocated_bytes();
+        let size = 0x2_0000_0000;
+        let (daddr, replaced) = f.memory.create_lazy_region(SPARSE_VA, size).unwrap();
+        assert!(replaced.is_empty());
+        let gmmu = &f.gmmus[0];
+        assert_eq!(
+            target(gmmu, SPARSE_VA + 0x1000),
+            RangeTarget::Device(daddr + 0x1000)
+        );
+        assert_eq!(gmmu.read::<u32>(SPARSE_VA + 0x1000), Ok(0));
+        assert!(
+            f.device.translate(daddr).is_none(),
+            "nothing is backed up front"
+        );
+
+        gmmu.write(SPARSE_VA + 0x10, 0x1111u32).unwrap();
+        gmmu.write(SPARSE_VA + 5 * LAZY_BLOCK_SIZE + 4, 0x2222u32)
+            .unwrap();
+        gmmu.write(SPARSE_VA + 2 * LAZY_BLOCK_SIZE, 0u32).unwrap();
+        assert_eq!(gmmu.read::<u32>(SPARSE_VA + 0x10), Ok(0x1111));
+        assert_eq!(
+            gmmu.read::<u32>(SPARSE_VA + 5 * LAZY_BLOCK_SIZE + 4),
+            Ok(0x2222)
+        );
+        assert_eq!(gmmu.read::<u32>(SPARSE_VA + 2 * LAZY_BLOCK_SIZE), Ok(0));
+
+        let (handle, _) = f
+            .memory
+            .create_gpu_accessible_memory(&f.space, CPU_VA, 0x1_0000)
+            .unwrap();
+        let inside = SPARSE_VA + 0x10_0000;
+        f.memory
+            .normal_map_4k(inside, inside + 0xffff, handle, 0)
+            .unwrap();
+        f.memory.unmap_4k(inside, inside + 0xffff).unwrap();
+        assert_eq!(
+            target(gmmu, inside),
+            RangeTarget::Device(daddr + 0x10_0000),
+            "an unmap inside a lazy region maps its device range again"
+        );
+
+        let destroyed = f.memory.destroy_lazy_region(SPARSE_VA, size).unwrap();
+        assert_eq!(
+            destroyed.backed,
+            [
+                LazyBlock {
+                    daddr,
+                    size: LAZY_BLOCK_SIZE
+                },
+                LazyBlock {
+                    daddr: daddr + 5 * LAZY_BLOCK_SIZE,
+                    size: LAZY_BLOCK_SIZE
+                }
+            ]
+        );
+        assert!(f.device.translate(daddr).is_none());
+        assert!(f.device.translate(daddr + 5 * LAZY_BLOCK_SIZE).is_none());
+        assert_eq!(target(gmmu, SPARSE_VA), RangeTarget::Unmapped);
+        f.memory.destroy(handle).unwrap();
+        assert_eq!(f.allocator.allocated_bytes(), before);
+        assert_eq!(
+            f.memory.destroy_lazy_region(SPARSE_VA, size),
+            Err(Nx2MemoryError::NoSuchRegion {
+                va: SPARSE_VA,
+                size
+            })
+        );
     }
 
     #[test]

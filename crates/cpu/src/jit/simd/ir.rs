@@ -17,6 +17,8 @@ pub enum Arith {
     Sub,
     Mul,
     Div,
+    /// `FNMUL`: the rounded product, negated.
+    Nmul,
 }
 
 /// The fused multiply-adds, as `(n, m, a)` maps to the result.
@@ -73,6 +75,12 @@ pub enum SimdOp {
         a: Value,
         word: u32,
     },
+    /// `FCVT` from H to S or D; `fp` is the destination size.
+    FromHalf {
+        fp: Fp,
+        a: Value,
+        word: u32,
+    },
     /// `FCVT` between S and D; `fp` is the source size.
     Convert {
         fp: Fp,
@@ -95,6 +103,15 @@ pub enum SimdOp {
         a: Value,
         word: u32,
     },
+    /// `FCCMP` or `FCCMPE`: the compare's NZCV when `c` is nonzero, else the immediate `nzcv`.
+    CondCompare {
+        fp: Fp,
+        c: Value,
+        a: Value,
+        b: Value,
+        nzcv: u8,
+        word: u32,
+    },
     /// `FCMP` or `FCMPE`: the NZCV result. `b` is `None` for the forms that compare with zero.
     /// They differ only on NaNs, which always fall back.
     Compare {
@@ -113,7 +130,7 @@ impl SimdOp {
     pub fn ty(&self) -> Ty {
         match self {
             SimdOp::ToGpr(..) | SimdOp::ToInt { .. } => Ty::U64,
-            SimdOp::Compare { .. } => Ty::Nzcv,
+            SimdOp::Compare { .. } | SimdOp::CondCompare { .. } => Ty::Nzcv,
             SimdOp::Vec(op) => op.ty(),
             _ => Ty::U128,
         }
@@ -130,9 +147,11 @@ impl SimdOp {
             | SimdOp::Fused { word, .. }
             | SimdOp::Sqrt { word, .. }
             | SimdOp::Convert { word, .. }
+            | SimdOp::FromHalf { word, .. }
             | SimdOp::FromInt { word, .. }
             | SimdOp::ToInt { word, .. }
-            | SimdOp::Compare { word, .. } => Some(word),
+            | SimdOp::Compare { word, .. }
+            | SimdOp::CondCompare { word, .. } => Some(word),
             SimdOp::Lanes(lanes) => Some(lanes.word),
             _ => None,
         }
@@ -151,6 +170,7 @@ impl SimdOp {
             | SimdOp::Neg(_, a)
             | SimdOp::Sqrt { a, .. }
             | SimdOp::Convert { a, .. }
+            | SimdOp::FromHalf { a, .. }
             | SimdOp::FromInt { x: a, .. }
             | SimdOp::ToInt { a, .. } => f(a),
             SimdOp::Arith { a, b, .. } => {
@@ -163,7 +183,7 @@ impl SimdOp {
                     f(b);
                 }
             }
-            SimdOp::Select(_, c, a, b) => {
+            SimdOp::Select(_, c, a, b) | SimdOp::CondCompare { c, a, b, .. } => {
                 f(c);
                 f(a);
                 f(b);

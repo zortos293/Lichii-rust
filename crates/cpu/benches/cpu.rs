@@ -284,6 +284,45 @@ const WORKLOADS: &[Workload] = &[
         per_iteration: 9,
     },
     Workload {
+        name: "half convert loop",
+        code: &[
+            0x7d400020, // 1: ldr h0, [x1]
+            0x1ee24001, // fcvt s1, h0
+            0x1ee2c002, // fcvt d2, h0
+            0x1e20c023, // fabs s3, s1
+            0x1e614044, // fneg d4, d2
+            0x7d400425, // ldr h5, [x1, #2]
+            0x1ee240a6, // fcvt s6, h5
+            0x1e2600c7, // fmov w7, s6
+            0xf10004a5, // subs x5, x5, #1
+            0x54fffee1, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 10,
+    },
+    Workload {
+        name: "fp compare loop",
+        code: &[
+            0x1c000180, // 1: ldr s0, 2f
+            0x1c000181, // ldr s1, 3f
+            0x1e218802, // fnmul s2, s0, s1
+            0x1e212040, // fcmp s2, s1
+            0x1e214404, // fccmp s0, s1, #4, mi
+            0x1e208843, // fnmul s3, s2, s0
+            0x1e200472, // fccmpe s3, s0, #2, eq
+            0x1e23cc06, // fcsel s6, s0, s3, gt
+            0xbd000026, // str s6, [x1]
+            0xf10004a5, // subs x5, x5, #1
+            0x54fffec1, // b.ne 1b
+            0xd4000001, // svc #0
+            0x3f8ccccd, // 2: 1.1
+            0x3e99999a, // 3: 0.3
+        ],
+        far: &[],
+        per_iteration: 11,
+    },
+    Workload {
         name: "popcount loop",
         code: &[
             0x4c407020, // 1: ld1 {v0.16b}, [x1]
