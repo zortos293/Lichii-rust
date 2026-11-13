@@ -12,6 +12,7 @@ use crate::{Service, ServiceContext};
 use lichii_common::settings::Language;
 use lichii_common::{ConsoleGeneration, ResultCode};
 use lichii_kernel::ipc::HleRequestContext;
+use lichii_kernel::memory_objects::TransferMemory;
 
 /// `nn::am::service::LaunchParameterKind::UserChannel`.
 const USER_CHANNEL: u32 = 1;
@@ -152,12 +153,12 @@ impl Service for ApplicationFunctions {
                 let Some(data) = input_storage(ctx) else {
                     return Some(UNKNOWN);
                 };
-                let size = data.bytes().len();
+                let size = data.len();
                 let Some(charge) = Charge::take(&applet.storage_bytes, size) else {
                     tracing::warn!(size, "live storage budget exhausted");
                     return Some(UNKNOWN);
                 };
-                let copy = Arc::new(StorageData::new(data.bytes().clone(), Some(charge)));
+                let copy = Arc::new(StorageData::new(data.to_vec(), Some(charge)));
                 applet.state.lock().user_channel.push(copy);
                 ResultCode::SUCCESS
             }
@@ -212,7 +213,7 @@ impl Service for LibraryAppletCreator {
 
     fn handle(&self, ctx: &mut HleRequestContext) -> Option<ResultCode> {
         Some(match ctx.command() {
-            0 => {
+            0 | 3 => {
                 let (id, mode): (u32, u32) = (ctx.pop(), ctx.pop());
                 tracing::info!(
                     applet = format_args!("{id:#x}"),
@@ -248,6 +249,31 @@ impl Service for LibraryAppletCreator {
                     ctx,
                     Arc::new(StorageData::new(data, Some(charge))),
                 )
+            }
+            11 | 12 => {
+                let writable = ctx.command() == 12 || ctx.pop::<u8>() != 0;
+                let size: i64 = ctx.pop();
+                if size <= 0 {
+                    return Some(UNKNOWN);
+                }
+                let Ok(memory) = ctx.copy_handle::<TransferMemory>(0) else {
+                    return Some(UNKNOWN);
+                };
+                if size as u64 > memory.size() {
+                    tracing::warn!(
+                        size,
+                        lent = memory.size(),
+                        "storage larger than its transfer memory"
+                    );
+                    return Some(UNKNOWN);
+                }
+                let data = StorageData::transfer_memory(
+                    memory,
+                    size as usize,
+                    writable,
+                    ctx.command() == 12,
+                );
+                push_storage(&self.context, ctx, Arc::new(data))
             }
             _ => return None,
         })
