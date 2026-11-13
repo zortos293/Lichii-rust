@@ -9,6 +9,7 @@ use lichii_gpu::backend::NullRasterizer;
 use lichii_gpu::host1x::Host1x;
 use lichii_gpu::{Console, Gpu, GpuConfig};
 use lichii_input::hub::NpadHub;
+use lichii_kernel::Kernel;
 use lichii_kernel::testing::{self, IpcClient};
 
 use crate::{ServiceContext, ServiceParts};
@@ -24,28 +25,33 @@ pub fn context(program_id: u64, settings: Settings) -> (Arc<ServiceContext>, Ipc
     let kernel = testing::kernel(generation);
     let program = Arc::new(testing::program_image(program_id));
     let process = kernel.create_process(&program).unwrap();
-    let (console, bits) = match generation {
-        ConsoleGeneration::Switch1 => (Console::Switch1, 34),
-        ConsoleGeneration::Switch2 => (Console::Switch2, 36),
-    };
-    let host1x = Host1x::new(kernel.physical_memory().clone(), bits);
-    let gpu = Gpu::new(
-        host1x,
-        Arc::new(Clock),
-        GpuConfig::new(console),
-        |handles| Box::new(NullRasterizer::new(handles)),
-    );
+    let gpu = gpu(&kernel, generation);
     let client = IpcClient::new(&kernel, &process);
     let context = ServiceContext::new(ServiceParts {
         kernel,
         settings: Arc::new(settings),
         program,
         process,
-        gpu: Arc::new(gpu),
+        gpu,
         npad: Arc::new(NpadHub::default()),
         perf: Arc::new(PerfStats::default()),
     });
     (context, client)
+}
+
+/// A GPU with the null rasterizer for a test kernel of `generation`.
+pub fn gpu(kernel: &Kernel, generation: ConsoleGeneration) -> Arc<Gpu> {
+    let (console, bits) = match generation {
+        ConsoleGeneration::Switch1 => (Console::Switch1, 34),
+        ConsoleGeneration::Switch2 => (Console::Switch2, 36),
+    };
+    let host1x = Host1x::new(kernel.physical_memory().clone(), bits);
+    Arc::new(Gpu::new(
+        host1x,
+        Arc::new(Clock),
+        GpuConfig::new(console),
+        |handles| Box::new(NullRasterizer::new(handles)),
+    ))
 }
 
 struct Clock;

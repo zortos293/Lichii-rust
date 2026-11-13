@@ -10,7 +10,6 @@ use lichii_common::settings::Settings;
 use lichii_common::{ConsoleGeneration, ResultCode, VAddr};
 use lichii_fs::romfs::{build_romfs, open_romfs};
 use lichii_fs::{DirectoryExt, FileExt, FileRef, MemDir, MemFile};
-use lichii_gpu::host1x::Host1x;
 use lichii_kernel::Kernel;
 use lichii_kernel::ipc::{Handle, UNKNOWN_COMMAND_ID};
 use lichii_kernel::testing::{self, IpcClient, Reply, Request};
@@ -102,18 +101,13 @@ impl Guest {
         configure(&mut image);
         let program = Arc::new(image);
         let process = kernel.create_process(&program).unwrap();
-        let bits = match generation {
-            ConsoleGeneration::Switch1 => 34,
-            ConsoleGeneration::Switch2 => 36,
-        };
         let client = IpcClient::new(&kernel, &process);
         let context = ServiceContext::new(ServiceParts {
             kernel: kernel.clone(),
             settings: Arc::new(settings),
             program,
             process,
-            host1x: Host1x::new(kernel.physical_memory().clone(), bits),
-            nx2_memory: None,
+            gpu: crate::testing::gpu(&kernel, generation),
             npad: Arc::default(),
             perf: Arc::default(),
         });
