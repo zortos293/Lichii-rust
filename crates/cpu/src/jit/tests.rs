@@ -285,7 +285,8 @@ fn simd(rng: &mut Rng) -> u32 {
     }
 }
 
-const VECTOR: [&str; 11] = [
+const VECTOR: [&str; 12] = [
+    "0x101110000xxxxx0xxxx0xxxxxxxxxx",
     "0xx01110xx1xxxxx100001xxxxxxxxxx",
     "0xx01110xx1xxxxx000111xxxxxxxxxx",
     "0xx01110xx1xxxxx0011x1xxxxxxxxxx",
