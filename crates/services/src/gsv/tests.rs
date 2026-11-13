@@ -383,6 +383,7 @@ fn gpu_memory_is_mapped_for_every_address_space() {
     map.resize(15, 0);
     map.push(9);
     client.send(gpu, &words(Request::tipc(211), &map)).unwrap();
+    context.gpu.synchronize();
     assert_eq!(gmmu.read::<u32>(va + 4).unwrap(), 0xdead_beef);
     let reply = client.send(gpu, &Request::tipc(12).arg(9u32)).unwrap();
     assert!(event(&client, reply.copy_handles[0]).is_signaled());
@@ -407,6 +408,7 @@ fn gpu_memory_is_mapped_for_every_address_space() {
     client
         .send(gpu, &words(Request::tipc(214), &sparse))
         .unwrap();
+    context.gpu.synchronize();
     assert_eq!(
         gmmu.read::<u32>(region + 4).unwrap(),
         0,
@@ -433,6 +435,7 @@ fn gpu_memory_is_mapped_for_every_address_space() {
         )
         .unwrap();
     assert_eq!(reply.pop::<u64>(), 1);
+    context.gpu.synchronize();
     assert_eq!(client.read(kinds, 1), [0xdb]);
     assert_eq!(gmmu.read::<u32>(region + 0x1_0004).unwrap(), 0xdead_beef);
     assert_eq!(gmmu.kind(region + 0x1_0000), Some(0xdb));
@@ -466,6 +469,7 @@ fn gpu_only_regions_keep_what_the_gpu_writes() {
     client
         .send(gpu, &words(Request::tipc(214), &create))
         .unwrap();
+    context.gpu.synchronize();
     gmmu.write(region + 0x1_0000, 0x1234_5678u32).unwrap();
     assert_eq!(gmmu.read::<u32>(region + 0x1_0000).unwrap(), 0x1234_5678);
 
@@ -610,6 +614,7 @@ fn a_failed_sparse_map_leaves_the_kind_alone() {
             &range_words(214, region, region + 0x10_0000 - 1, &[0x200, 0, 0, 0, 3]),
         )
         .unwrap();
+    context.gpu.synchronize();
     let before = gmmu.kind(region + 0x1_0000);
     let request = sparse_request(region + 0x1_0000, 0x1000, 99, 0, 0xdb);
     let input = client.alloc(&request);
@@ -621,6 +626,7 @@ fn a_failed_sparse_map_leaves_the_kind_alone() {
             &words(Request::tipc(216), &payload).buffer_a(input, 40),
         )
         .unwrap();
+    context.gpu.synchronize();
     assert_eq!(gmmu.kind(region + 0x1_0000), before);
 }
 
@@ -655,6 +661,7 @@ fn gpu_only_regions_that_cannot_be_mapped_are_not_backed() {
     );
     let handle = client.send(gpu, &create).unwrap().pop::<u32>();
     assert_eq!(handle, 2, "the failed region's backing took handle 1");
+    context.gpu.synchronize();
     let memory = context.gpu.nx2_memory().unwrap();
     let first = lichii_gpu::nx2_memory::GpuMemoryHandle::new(1).unwrap();
     assert!(
@@ -688,4 +695,45 @@ fn restoring_a_gpu_only_region_keeps_its_own_device_ranges() {
             range(0x1000_0000, 0x9_0000, 0x4000),
         ]
     );
+}
+
+#[test]
+fn an_unmap_waits_for_the_gpu_work_queued_before_it() {
+    let (context, client, gsv) = gsv();
+    let gpu = session(&client, gsv, 497);
+    let gmmu = context
+        .gpu
+        .create_address_space(lichii_gpu::gmmu::BigPageSize::Size64K);
+    let process = client.process().clone();
+    let heap = process.page_table().set_heap_size(2 << 20).unwrap();
+    process.memory().write(heap, 0x1111_1111u32).unwrap();
+    let create = words(
+        Request::tipc(101),
+        &[split(heap), split(heap + 0xffff), [0, 0]].concat(),
+    );
+    let handle = client.send(gpu, &create).unwrap().pop::<u32>();
+
+    let (release, queued_work) = std::sync::mpsc::channel::<()>();
+    let (seen, reads) = std::sync::mpsc::channel();
+    let reader = gmmu.clone();
+    context.gpu.run_in_order(move |_| {
+        queued_work.recv().unwrap();
+        seen.send(reader.read::<u32>(heap).ok()).unwrap();
+    });
+    let destroy = Request::tipc(102).arg(handle).arg(6u32);
+    client.send(gpu, &destroy).unwrap();
+    let reply = client.send(gpu, &Request::tipc(12).arg(6u32)).unwrap();
+    let slot = event(&client, reply.copy_handles[0]);
+    assert!(!slot.is_signaled());
+    assert_eq!(gmmu.read::<u32>(heap).unwrap(), 0x1111_1111);
+
+    release.send(()).unwrap();
+    context.gpu.synchronize();
+    assert_eq!(
+        reads.recv().unwrap(),
+        Some(0x1111_1111),
+        "work queued before the destroy still reads the memory"
+    );
+    assert!(gmmu.read::<u32>(heap).is_err());
+    assert!(slot.is_signaled());
 }

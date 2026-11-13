@@ -3,10 +3,12 @@
 //! [`Nx2GpuMemory`] registry.
 //!
 //! Requests name their memory by inclusive [first, last] ranges and complete through a job slot:
-//! the SDK waits on the slot's event (12) after the reply. Every request changes the registry at
-//! once, in the order the title sent them, as the reference does. An unmap or destroy hands what it
-//! removed to the renderer after the GPU work queued before it, and completes its slot once the
-//! host GPU finished that work, because the title reuses the memory right after.
+//! the SDK waits on the slot's event (12) after the reply. Every request except 101 changes the
+//! registry on the GPU's back thread, so it keeps its order both with the other requests and with
+//! the GPU work: work queued before it still sees the old mappings, work queued after it the new
+//! ones. An unmap or destroy completes its slot once the host GPU finished the work before it,
+//! because the title reuses the memory right after. 101 runs at once, since its reply names the
+//! new memory; it only adds a mapping at the memory's own address.
 //!
 //! A region 214 creates without the sparse flag is GPU-only storage the client renders into
 //! (NX2_NOTES row 57): the server backs it with memory of its own in the alias code region, made
@@ -14,7 +16,7 @@
 //! memory again.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use lichii_common::{DAddr, GpuVAddr, PAGE_MASK, ResultCode, VAddr};
 use lichii_gpu::Gpu;
@@ -149,25 +151,35 @@ impl GpuSession {
         self.context.gpu.nx2_memory()
     }
 
-    /// After the GPU work queued before it, hands `unmapped` to the renderer, waits until the host
-    /// GPU finished everything submitted, then runs `then`.
-    fn after_gpu(&self, unmapped: Vec<Unmapped>, then: impl FnOnce(&State) + Send + 'static) {
+    /// Runs `change` on the GPU's back thread, after the GPU work queued before it and in order
+    /// with the other requests, hands what it unmapped to the renderer, then signals job slot
+    /// `slot`. When a `destructive` change unmapped something, or the change released backings,
+    /// the host GPU finishes the work before it first: the title reuses that memory right after.
+    fn in_order(
+        &self,
+        slot: u32,
+        destructive: bool,
+        change: impl FnOnce(&Nx2GpuMemory, &State, &mut Change) + Send + 'static,
+    ) {
+        let gpu: Weak<Gpu> = Arc::downgrade(&self.context.gpu);
         let state = self.state.clone();
+        let event = self.slot(slot).clone();
         self.context
             .gpu
             .run_in_order(move |rasterizer: &mut dyn Rasterizer| {
-                for range in &unmapped {
-                    rasterizer.unmap_region(range.range.daddr, range.range.size);
+                if let Some(memory) = gpu.upgrade().as_deref().and_then(Gpu::nx2_memory) {
+                    let mut done = Change::default();
+                    change(memory, &state, &mut done);
+                    for range in &done.unmapped {
+                        rasterizer.unmap_region(range.range.daddr, range.range.size);
+                    }
+                    if (destructive && !done.unmapped.is_empty()) || !done.released.is_empty() {
+                        rasterizer.wait_for_idle();
+                    }
+                    state.released.lock().extend(done.released);
                 }
-                rasterizer.wait_for_idle();
-                then(&state);
+                event.signal();
             });
-    }
-
-    /// Completes a destructive request: signals job slot `slot` once the GPU is past `unmapped`.
-    fn complete(&self, slot: u32, unmapped: Vec<Unmapped>) {
-        let event = self.slot(slot).clone();
-        self.after_gpu(unmapped, move |_| event.signal());
     }
 
     /// Frees the backings of destroyed GPU-only regions the GPU is past.
@@ -186,8 +198,9 @@ impl GpuSession {
         }
     }
 
-    /// 214 without the sparse flag: backs [`start`, +`size`) with server memory.
-    fn create_gpu_only(&self, memory: &Nx2GpuMemory, start: GpuVAddr, size: u64) {
+    /// 214 without the sparse flag: backs [`start`, +`size`) with server memory. The memory is
+    /// new, so it is made GPU accessible at once; the region is mapped in order.
+    fn create_gpu_only(&self, memory: &Nx2GpuMemory, start: GpuVAddr, size: u64, slot: u32) {
         let page_table = self.context.process.page_table();
         let region = page_table.regions().alias_code;
         let cpu_va = match page_table.map_new_in(
@@ -201,46 +214,45 @@ impl GpuSession {
                 tracing::error!(
                     "nx2:gpu 214: no memory for GPU-only region {start:#x}+{size:#x}: {code:?}"
                 );
+                self.slot(slot).signal();
                 return;
             }
         };
         let space: &AddressSpace = self.context.process.memory();
-        let (handle, mut unmapped) = match memory.create_gpu_accessible_memory(space, cpu_va, size)
-        {
-            Ok(created) => created,
+        let handle = match memory.create_gpu_accessible_memory(space, cpu_va, size) {
+            Ok((handle, unmapped)) => {
+                unmap(&self.context.gpu, &unmapped);
+                handle
+            }
             Err(err) => {
                 tracing::error!("nx2:gpu 214: GPU-only region {start:#x}+{size:#x}: {err}");
                 let _ = page_table.unmap_and_free(cpu_va, size, MemoryState::IO_MEMORY);
+                self.slot(slot).signal();
                 return;
             }
         };
-        match memory.normal_map_4k(start, start + size - 1, handle, 0) {
-            Ok(replaced) => unmapped.extend(replaced),
-            Err(err) => {
-                tracing::error!("nx2:gpu 214: GPU-only region {start:#x}+{size:#x}: {err}");
-                unmapped.extend(logged("214", memory.destroy(handle)));
-                unmap(&self.context.gpu, &unmapped);
-                let _ = page_table.unmap_and_free(cpu_va, size, MemoryState::IO_MEMORY);
-                return;
-            }
-        }
-        unmap(&self.context.gpu, &unmapped);
-        tracing::info!("nx2:gpu 214: GPU-only region {start:#x}+{size:#x} backed at {cpu_va:#x}");
         let backing = Backing {
             handle,
             cpu_va,
             size,
         };
-        let old = self.state.gpu_only.lock().insert(start, backing);
-        if let Some(old) = old {
-            self.release(memory, old);
-        }
-    }
-
-    /// Destroys a backing's GPU memory, and queues the backing for freeing once the GPU is past it.
-    fn release(&self, memory: &Nx2GpuMemory, backing: Backing) {
-        let unmapped = logged("releasing GPU-only memory", memory.destroy(backing.handle));
-        self.after_gpu(unmapped, move |state| state.released.lock().push(backing));
+        self.in_order(slot, false, move |memory, state, done| {
+            match memory.normal_map_4k(start, start + size - 1, handle, 0) {
+                Ok(replaced) => done.unmapped.extend(replaced),
+                Err(err) => {
+                    tracing::error!("nx2:gpu 214: GPU-only region {start:#x}+{size:#x}: {err}");
+                    done.release(memory, backing);
+                    return;
+                }
+            }
+            tracing::info!(
+                "nx2:gpu 214: GPU-only region {start:#x}+{size:#x} backed at {cpu_va:#x}"
+            );
+            let old = state.gpu_only.lock().insert(start, backing);
+            if let Some(old) = old {
+                done.release(memory, old);
+            }
+        });
     }
 
     fn create_device(&self, ctx: &mut HleRequestContext) -> ResultCode {
@@ -254,7 +266,7 @@ impl GpuSession {
     }
 
     /// 101(first u64, last u64, flags): makes process memory GPU accessible at GPU VA == CPU VA.
-    /// Reply word 3 is the GpuMemoryHandle later requests name.
+    /// Reply word 3 is the GpuMemoryHandle later requests name, so this one runs at once.
     fn create_memory(&self, ctx: &mut HleRequestContext, memory: &Nx2GpuMemory) -> ResultCode {
         let words = Words::command(ctx);
         let (first, last) = (words.u64(2), words.u64(4));
@@ -281,44 +293,89 @@ impl GpuSession {
     /// makes the range read zero again, or show its GPU-only region's memory.
     /// The payload follows the two buffer descriptors, so the job slot (the reference's word 14)
     /// is payload word 6.
-    fn sparse_map(&self, ctx: &mut HleRequestContext, memory: &Nx2GpuMemory) -> ResultCode {
+    fn sparse_map(&self, ctx: &mut HleRequestContext) -> ResultCode {
         let slot = Words::of(ctx.input()).u32(6);
-        let requests = ctx.read_buffer(0).unwrap_or_default();
-        let count = requests.len() / SPARSE_REQUEST_SIZE;
-        let mut kinds = Vec::with_capacity(count);
-        let mut unmapped = Vec::new();
-        for request in requests.as_chunks::<SPARSE_REQUEST_SIZE>().0 {
-            let words = Words::of(request);
-            let (va, size) = (words.u64(0), words.u64(2));
-            let kind = request[19];
-            kinds.push(kind);
-            let Some(last) = size.checked_sub(1).and_then(|n| va.checked_add(n)) else {
-                continue;
-            };
-            match GpuMemoryHandle::new(words.u32(6)) {
-                Some(handle) => match memory.normal_map_4k(va, last, handle, words.u64(8)) {
-                    Ok(replaced) => {
-                        unmapped.extend(replaced);
-                        if let Err(err) = memory.modify_kind(va, last, kind) {
-                            tracing::warn!("nx2:gpu 216: kind {kind:#x} at {va:#x}: {err}");
-                        }
-                    }
-                    Err(err) => tracing::warn!("nx2:gpu 216: {err}"),
-                },
-                None => {
-                    let mut removed = logged("216", memory.unmap_4k(va, last));
-                    self.state.restore_gpu_only(memory, va, size, &mut removed);
-                    unmapped.extend(removed);
+        let data = ctx.read_buffer(0).unwrap_or_default();
+        let requests: Vec<SparseMap> = data
+            .as_chunks::<SPARSE_REQUEST_SIZE>()
+            .0
+            .iter()
+            .map(|request| {
+                let words = Words::of(request);
+                SparseMap {
+                    va: words.u64(0),
+                    size: words.u64(2),
+                    handle: GpuMemoryHandle::new(words.u32(6)),
+                    offset: words.u64(8),
+                    kind: request[19],
                 }
-            }
-        }
+            })
+            .collect();
+        let count = requests.len();
         if count != 0 && ctx.writable_buffer(0).is_some() {
+            let kinds: Vec<u8> = requests.iter().map(|r| r.kind).collect();
             let _ = ctx.write_buffer(0, &kinds);
         }
-        self.complete(slot, unmapped);
+        self.in_order(slot, true, move |memory, state, done| {
+            for SparseMap {
+                va,
+                size,
+                handle,
+                offset,
+                kind,
+            } in requests
+            {
+                let Some(last) = size.checked_sub(1).and_then(|n| va.checked_add(n)) else {
+                    continue;
+                };
+                match handle {
+                    Some(handle) => match memory.normal_map_4k(va, last, handle, offset) {
+                        Ok(replaced) => {
+                            done.unmapped.extend(replaced);
+                            if let Err(err) = memory.modify_kind(va, last, kind) {
+                                tracing::warn!("nx2:gpu 216: kind {kind:#x} at {va:#x}: {err}");
+                            }
+                        }
+                        Err(err) => tracing::warn!("nx2:gpu 216: {err}"),
+                    },
+                    None => {
+                        let mut removed = logged("216", memory.unmap_4k(va, last));
+                        state.restore_gpu_only(memory, va, size, &mut removed);
+                        done.unmapped.extend(removed);
+                    }
+                }
+            }
+        });
         ctx.push(count as u64);
         ResultCode::SUCCESS
     }
+}
+
+/// What a request changed, as [`GpuSession::in_order`] passes it on.
+#[derive(Default)]
+struct Change {
+    unmapped: Vec<Unmapped>,
+    /// GPU-only backings to free once the host GPU is past them.
+    released: Vec<Backing>,
+}
+
+impl Change {
+    fn release(&mut self, memory: &Nx2GpuMemory, backing: Backing) {
+        self.unmapped.extend(logged(
+            "releasing GPU-only memory",
+            memory.destroy(backing.handle),
+        ));
+        self.released.push(backing);
+    }
+}
+
+/// One of 216's SparseMapRequests.
+struct SparseMap {
+    va: GpuVAddr,
+    size: u64,
+    handle: Option<GpuMemoryHandle>,
+    offset: u64,
+    kind: u8,
 }
 
 /// A request's unmapped ranges, or none after logging why it failed. Failures still complete the
@@ -433,98 +490,102 @@ impl Service for GpuSession {
                 match command {
                     101 => self.create_memory(ctx, memory),
                     102 => {
-                        let mut unmapped = match GpuMemoryHandle::new(words.u32(2)) {
-                            Some(handle) => logged("102", memory.destroy(handle)),
-                            None => {
+                        let handle = GpuMemoryHandle::new(words.u32(2));
+                        self.in_order(words.u32(3), true, move |memory, state, done| {
+                            let Some(handle) = handle else {
                                 tracing::warn!("nx2:gpu 102: memory handle 0");
-                                Vec::new()
+                                return;
+                            };
+                            done.unmapped = logged("102", memory.destroy(handle));
+                            let mut spans: Vec<(GpuVAddr, u64)> = done
+                                .unmapped
+                                .iter()
+                                .map(|u| (u.range.gpu_va, u.range.size))
+                                .collect();
+                            spans.sort_unstable();
+                            spans.dedup();
+                            for (va, size) in spans {
+                                state.restore_gpu_only(memory, va, size, &mut done.unmapped);
                             }
-                        };
-                        let mut spans: Vec<(GpuVAddr, u64)> = unmapped
-                            .iter()
-                            .map(|u| (u.range.gpu_va, u.range.size))
-                            .collect();
-                        spans.sort_unstable();
-                        spans.dedup();
-                        for (va, size) in spans {
-                            self.state.restore_gpu_only(memory, va, size, &mut unmapped);
-                        }
-                        self.complete(words.u32(3), unmapped);
+                        });
                         ResultCode::SUCCESS
                     }
                     211 => {
-                        match GpuMemoryHandle::new(words.u32(7)) {
-                            Some(handle) => unmap(
-                                &self.context.gpu,
-                                &logged(
+                        let (handle, offset) = (GpuMemoryHandle::new(words.u32(7)), words.u64(8));
+                        self.in_order(words.u32(17), false, move |memory, _, done| match handle {
+                            Some(handle) => {
+                                done.unmapped = logged(
                                     "211",
-                                    memory.normal_map_4k(range.0, range.1, handle, words.u64(8)),
-                                ),
-                            ),
+                                    memory.normal_map_4k(range.0, range.1, handle, offset),
+                                );
+                            }
                             None => tracing::warn!("nx2:gpu 211: memory handle 0"),
-                        }
-                        self.slot(words.u32(17)).signal();
+                        });
                         ResultCode::SUCCESS
                     }
                     212 => {
                         let wanted = (words.u32(7) & 0xff) as u8;
-                        if let Err(err) = memory.modify_kind(range.0, range.1, wanted) {
-                            tracing::warn!("nx2:gpu 212: {err}");
-                        }
-                        self.slot(words.u32(10)).signal();
+                        self.in_order(words.u32(10), false, move |memory, _, _| {
+                            if let Err(err) = memory.modify_kind(range.0, range.1, wanted) {
+                                tracing::warn!("nx2:gpu 212: {err}");
+                            }
+                        });
                         ctx.push(u32::from(wanted));
                         ResultCode::SUCCESS
                     }
                     213 => {
                         let (first, last) = range;
-                        let mut unmapped = logged("213", memory.unmap_4k(first, last));
-                        if last >= first {
-                            self.state.restore_gpu_only(
-                                memory,
-                                first,
-                                last - first + 1,
-                                &mut unmapped,
-                            );
-                        }
-                        self.complete(words.u32(8), unmapped);
+                        self.in_order(words.u32(8), true, move |memory, state, done| {
+                            done.unmapped = logged("213", memory.unmap_4k(first, last));
+                            if last >= first {
+                                state.restore_gpu_only(
+                                    memory,
+                                    first,
+                                    last - first + 1,
+                                    &mut done.unmapped,
+                                );
+                            }
+                        });
                         ResultCode::SUCCESS
                     }
                     214 => {
-                        let size = range.1.wrapping_sub(range.0).wrapping_add(1);
+                        let (first, last) = range;
+                        let size = last.wrapping_sub(first).wrapping_add(1);
+                        let slot = words.u32(11);
                         if words.u32(7) & SPARSE_REGION != 0 {
-                            unmap(
-                                &self.context.gpu,
-                                &logged("214", memory.create_sparse_region(range.0, size)),
-                            );
-                        } else if range.1 > range.0 && (range.0 | size) & PAGE_MASK == 0 {
-                            self.create_gpu_only(memory, range.0, size);
+                            self.in_order(slot, false, move |memory, _, done| {
+                                done.unmapped =
+                                    logged("214", memory.create_sparse_region(first, size));
+                            });
+                        } else if last > first && (first | size) & PAGE_MASK == 0 {
+                            self.create_gpu_only(memory, first, size, slot);
                         } else {
                             tracing::warn!(
-                                "nx2:gpu 214: unexpected region [{:#x}, {:#x}]",
-                                range.0,
-                                range.1
+                                "nx2:gpu 214: unexpected region [{first:#x}, {last:#x}]"
                             );
+                            self.slot(slot).signal();
                         }
-                        self.slot(words.u32(11)).signal();
                         ResultCode::SUCCESS
                     }
                     215 => {
                         let (first, last) = range;
                         let size = last.wrapping_sub(first).wrapping_add(1);
-                        let backing = self.state.gpu_only.lock().remove(&first);
-                        if let Some(backing) = backing {
-                            self.release(memory, backing);
-                        }
-                        let result = match memory.destroy_sparse_region(first, size) {
-                            Err(Nx2MemoryError::NoSuchRegion { .. }) => {
-                                memory.unmap_4k(first, last)
+                        self.in_order(words.u32(8), true, move |memory, state, done| {
+                            let backing = state.gpu_only.lock().remove(&first);
+                            if let Some(backing) = backing {
+                                done.release(memory, backing);
                             }
-                            result => result,
-                        };
-                        self.complete(words.u32(8), logged("215", result));
+                            let result = match memory.destroy_sparse_region(first, size) {
+                                Err(Nx2MemoryError::NoSuchRegion { .. }) => {
+                                    memory.unmap_4k(first, last)
+                                }
+                                result => result,
+                            };
+                            done.unmapped.extend(logged("215", result));
+                        });
                         ResultCode::SUCCESS
                     }
-                    _ => self.sparse_map(ctx, memory),
+                    _ => self.sparse_map(ctx),
                 }
             }
             _ => return None,
