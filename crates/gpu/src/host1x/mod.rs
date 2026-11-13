@@ -1,11 +1,14 @@
-//! host1x: the SMMU and the syncpoints the GPU shares with the other Tegra engines.
+//! host1x: the SMMU, the syncpoints the GPU shares with the other Tegra engines, and the channels
+//! of the video engines.
 
+mod channel;
 mod syncpoints;
 
 use std::sync::Arc;
 
 use lichii_memory::{DeviceAddressSpace, PhysicalMemory};
 
+pub use channel::{DECODE_TIME, EngineChannel, VideoEngine};
 pub use syncpoints::{
     ActionHandle, InvalidSyncpoint, SYNCPOINT_COUNT, SyncpointBank, SyncpointWaitError, Syncpoints,
     is_reached,

@@ -1010,28 +1010,89 @@ fn switch2_channels_echo_unknown_ioctls_and_map_ampere_classes() {
 }
 
 #[test]
-fn host1x_engine_stubs_count_their_syncpoint_increments() {
+fn host1x_engine_channels_increment_syncpoints_as_their_command_buffers_run() {
     let nv = Nv::new(SWITCH1_TITLE, "nvdrv");
-    let vic = nv.open("/dev/nvhost-vic");
-    let reply = nv.ioctl(vic, iowr(0, 0x2, 8), &[0; 8], 8);
+    let nvmap = nv.open("/dev/nvmap");
+    let nvdec = nv.open("/dev/nvhost-nvdec");
+    let reply = nv.ioctl(nvdec, iowr(0, 0x2, 8), &[0; 8], 8);
     let syncpoint = u32_at(&reply.output, 4);
     assert!(nv.nvdrv.syncpoints.is_allocated(syncpoint));
+    let commands = Bytes::default()
+        .zeroes(8)
+        .u32((4 << 28) | syncpoint)
+        .u32((1 << 28) | (0x10 << 16) | 2)
+        .u32(0xc0)
+        .u32(0)
+        .u32((4 << 28) | (1 << 8) | syncpoint)
+        .0;
+    let (buffer, _) = nv.nvmap_buffer(nvmap, &commands, 0x1000);
     let submit = Bytes::default()
-        .u32(0)
+        .u32(1)
         .u32(0)
         .u32(1)
         .u32(1)
+        .u32(buffer)
+        .u32(8)
+        .u32(5)
         .u32(syncpoint)
-        .u32(3)
+        .u32(2)
         .zeroes(12)
         .u32(0)
         .0;
-    let reply = nv.ioctl(vic, iowr(0, 0x1, 16), &submit, submit.len());
+    let reply = nv.ioctl(nvdec, iowr(0, 0x1, 16), &submit, submit.len());
     assert_eq!(reply.result, 0);
-    assert_eq!(u32_at(&reply.output, 36), 3);
-    assert_eq!(nv.syncpoints().guest().value(syncpoint), Ok(3));
+    assert_eq!(u32_at(&reply.output, 48), 2);
+    nv.syncpoints()
+        .host()
+        .wait(syncpoint, 2, Some(std::time::Duration::from_secs(5)))
+        .expect("the channel ran both increments");
+    assert_eq!(nv.syncpoints().guest().value(syncpoint), Ok(2));
+    assert_eq!(nv.close(nvdec), 0);
+    assert!(!nv.nvdrv.syncpoints.is_allocated(syncpoint));
+}
+
+#[test]
+fn closing_a_host1x_channel_retires_increments_it_never_ran() {
+    let nv = Nv::new(SWITCH1_TITLE, "nvdrv");
+    let nvmap = nv.open("/dev/nvmap");
+    let vic = nv.open("/dev/nvhost-vic");
+    let reply = nv.ioctl(vic, iowr(0, 0x2, 8), &[0; 8], 8);
+    let syncpoint = u32_at(&reply.output, 4);
+    let never = nv.nvdrv.syncpoints.allocate();
+    let commands = Bytes::default()
+        .u32((4 << 28) | syncpoint)
+        .u32(1 << 6)
+        .u32((4 << 28) | (0x4e << 16) | 1)
+        .u32((4 << 28) | (0x50 << 16) | never)
+        .u32((4 << 28) | syncpoint)
+        .0;
+    let (buffer, _) = nv.nvmap_buffer(nvmap, &commands, 0x1000);
+    let submit = Bytes::default()
+        .u32(1)
+        .u32(0)
+        .u32(1)
+        .u32(1)
+        .u32(buffer)
+        .u32(0)
+        .u32(5)
+        .u32(syncpoint)
+        .u32(2)
+        .zeroes(12)
+        .u32(0)
+        .0;
+    assert_eq!(
+        nv.ioctl(vic, iowr(0, 0x1, 16), &submit, submit.len())
+            .result,
+        0
+    );
+    nv.syncpoints()
+        .host()
+        .wait(syncpoint, 1, Some(std::time::Duration::from_secs(5)))
+        .expect("the first increment ran");
     assert_eq!(nv.close(vic), 0);
     assert!(!nv.nvdrv.syncpoints.is_allocated(syncpoint));
+    assert_eq!(nv.syncpoints().guest().value(syncpoint), Ok(2));
+    assert_eq!(nv.syncpoints().host().value(syncpoint), Ok(2));
 }
 
 #[test]

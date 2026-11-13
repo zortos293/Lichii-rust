@@ -1,12 +1,13 @@
 //! `/dev/nvhost-nvdec`, `/dev/nvhost-vic` and `/dev/nvhost-nvjpg`: host1x engine channels.
 //!
-//! There are no video engines yet, so these are stubs: a submission's syncpoint increments are
-//! reserved and counted at once, and command buffers are not executed. Map-buffer pins return the
-//! nvmap device address, as there is no separate host1x IOVA space.
+//! A submission reserves its syncpoint increments and hands its command buffers to the channel's
+//! [`EngineChannel`], which counts the increments as its stream reaches them. Map-buffer pins
+//! return the nvmap device address, as there is no separate host1x IOVA space.
 
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
+use lichii_gpu::host1x::{EngineChannel, VideoEngine};
 use parking_lot::Mutex;
 
 use super::ioctl::{Args, Variant, items, read_struct, write_struct};
@@ -19,6 +20,14 @@ struct Submit {
     relocation_count: u32,
     syncpoint_count: u32,
     fence_count: u32,
+}
+
+#[derive(Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
+struct CommandBuffer {
+    memory_id: u32,
+    offset: u32,
+    word_count: u32,
 }
 
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -44,7 +53,6 @@ struct MapBufferEntry {
     address: u32,
 }
 
-const COMMAND_BUFFER_SIZE: usize = 12;
 const RELOC_SIZE: usize = 16;
 const CLOCK_RATE: u32 = 614_400_000;
 
@@ -53,18 +61,20 @@ pub(crate) struct Host1xClient {
     name: &'static str,
     syncpoint: u32,
     pinned: Mutex<Vec<u32>>,
+    channel: EngineChannel,
 }
 
 impl Host1xClient {
     pub fn new(nvdrv: Arc<Nvdrv>, path: &str) -> Self {
-        let name = match path {
-            "/dev/nvhost-nvdec" => "/dev/nvhost-nvdec",
-            "/dev/nvhost-vic" => "/dev/nvhost-vic",
-            _ => "/dev/nvhost-nvjpg",
+        let (name, engine) = match path {
+            "/dev/nvhost-nvdec" => ("/dev/nvhost-nvdec", VideoEngine::NvDec),
+            "/dev/nvhost-vic" => ("/dev/nvhost-vic", VideoEngine::Vic),
+            _ => ("/dev/nvhost-nvjpg", VideoEngine::NvJpg),
         };
-        tracing::info!(device = name, "host1x engine channel opened (stub)");
+        tracing::info!(device = name, "host1x engine channel opened");
         Self {
             syncpoint: nvdrv.syncpoints.allocate(),
+            channel: EngineChannel::open(engine, nvdrv.gpu.host1x().syncpoints.clone()),
             nvdrv,
             name,
             pinned: Mutex::default(),
@@ -101,16 +111,40 @@ impl Host1xClient {
         })
     }
 
-    /// Reserves each syncpoint increment and counts it at once, and writes the thresholds back.
+    /// Reserves each syncpoint increment, writes the thresholds back and queues the command
+    /// buffers on the channel.
     fn submit(&self, args: &mut Args) -> NvResult {
         let params: Submit = read_struct(args.input);
         args.echo();
         let syncpoints = self.nvdrv.syncpoints.syncpoints();
-        let increments_at = size_of::<Submit>()
-            + params.cmd_buffer_count as usize * COMMAND_BUFFER_SIZE
-            + params.relocation_count as usize * (RELOC_SIZE + size_of::<u32>());
+        let buffers_at = size_of::<Submit>();
+        let relocations_at =
+            buffers_at + params.cmd_buffer_count as usize * size_of::<CommandBuffer>();
+        let increments_at =
+            relocations_at + params.relocation_count as usize * (RELOC_SIZE + size_of::<u32>());
         let thresholds_at =
             increments_at + params.syncpoint_count as usize * size_of::<SyncptIncr>();
+        let buffers = args
+            .input
+            .get(buffers_at..relocations_at)
+            .unwrap_or_default();
+        let mut command_buffers = Vec::new();
+        for buffer in items::<CommandBuffer>(buffers) {
+            let mut words = vec![0u32; buffer.word_count as usize];
+            if let Err(error) = self.nvdrv.nvmap.read(
+                buffer.memory_id,
+                u64::from(buffer.offset),
+                bytemuck::cast_slice_mut(&mut words),
+            ) {
+                tracing::warn!(
+                    device = self.name,
+                    ?error,
+                    "host1x command buffer unreadable"
+                );
+                return NvResult::InvalidState;
+            }
+            command_buffers.push(words);
+        }
         let increments = args
             .input
             .get(increments_at..thresholds_at)
@@ -119,16 +153,14 @@ impl Host1xClient {
             let Ok(threshold) = syncpoints.increase_max(increment.id, increment.increments) else {
                 return NvResult::BadParameter;
             };
-            for _ in 0..increment.increments {
-                let _ = syncpoints.host().increment(increment.id);
-                let _ = syncpoints.guest().increment(increment.id);
-            }
             if index < params.fence_count as usize {
                 let at = thresholds_at + index * size_of::<u32>();
                 write_struct(args.output.get_mut(at..).unwrap_or_default(), &threshold);
             }
         }
-        tracing::debug!(device = self.name, "(stubbed) host1x submission");
+        for words in command_buffers {
+            self.channel.submit(words);
+        }
         NvResult::Success
     }
 
@@ -177,9 +209,10 @@ impl Host1xClient {
 
 impl Drop for Host1xClient {
     fn drop(&mut self) {
+        self.channel.close();
         for handle in self.pinned.get_mut().drain(..) {
             self.nvdrv.nvmap.unpin(handle);
         }
-        self.nvdrv.syncpoints.free(self.syncpoint);
+        self.nvdrv.syncpoints.retire(self.syncpoint);
     }
 }
