@@ -1477,7 +1477,18 @@ impl<'a> EmitContext<'a> {
                 AttributeType::SignedInt | AttributeType::UnsignedInt
             );
             if runtime.per_primitive_generics & (1 << index) != 0 {
-                return Err(EmitError::Unsupported("per-primitive fragment inputs"));
+                if profile.supported_spirv < 0x0001_0400 {
+                    return Err(EmitError::Unsupported(
+                        "per-primitive fragment inputs below SPIR-V 1.4",
+                    ));
+                }
+                self.add_extension("SPV_EXT_mesh_shader");
+                self.add_capability(Capability::MeshShadingEXT);
+                self.decorate(id, Decoration::PerPrimitiveEXT, &[]);
+                if is_integer {
+                    self.decorate(id, Decoration::Flat, &[]);
+                }
+                continue;
             }
             if is_integer {
                 self.decorate(id, Decoration::Flat, &[]);
