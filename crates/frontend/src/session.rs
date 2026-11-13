@@ -5,12 +5,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lichii_common::ConsoleGeneration;
-use lichii_common::settings::{AudioSettings, Settings};
+use lichii_common::settings::{AudioSettings, ControlSettings, Settings};
 use lichii_core::{ExitReason, Host, System, SystemError};
 use lichii_crypto::KeyError;
 use lichii_loader::LoadOptions;
 
-use crate::applets::AppletDialogs;
+use crate::applets::{AppletDialogs, ControlsChange};
 use crate::game_list::GameKind;
 
 #[derive(Debug)]
@@ -122,11 +122,14 @@ impl Session {
         self.system.set_audio_volume(audio);
     }
 
-    /// Shows the library applet the title is waiting on, if any.
-    pub fn show_applets(&mut self, ctx: &egui::Context) {
-        if let Some(applets) = &mut self.applets {
-            applets.show(ctx);
-        }
+    /// Shows the library applet the title is waiting on, if any. Returns the controls when the
+    /// controller applet changed them.
+    pub fn show_applets(
+        &mut self,
+        ctx: &egui::Context,
+        controls: &ControlSettings,
+    ) -> Option<ControlsChange> {
+        self.applets.as_mut()?.show(ctx, controls)
     }
 
     /// Whether the title is waiting on a library applet dialog.

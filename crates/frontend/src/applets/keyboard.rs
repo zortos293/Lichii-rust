@@ -1,116 +1,18 @@
-//! Library applets the running title opens, shown as egui dialogs. am asks on its service
-//! thread and waits for the answer; the dialog answers from the UI thread. Once the dialogs are
-//! dropped (the session stops), every question still waiting is answered as cancelled.
+//! The full-screen software keyboard.
 
-use std::sync::Arc;
-
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Sender;
 use egui::{Color32, Key, RichText};
-use lichii_services::applets::{
-    AppletFrontend, ControllerAnswer, ControllerRequest, ErrorRequest, HeadlessApplets,
-    ProfileSelectAnswer, ProfileSelectRequest, SoftwareKeyboardAnswer, SoftwareKeyboardRequest,
-    TextCheckPrompt,
-};
+use lichii_services::applets::{SoftwareKeyboardAnswer, SoftwareKeyboardRequest, TextCheckPrompt};
 
 /// `SwkbdType::NumberPad`: only digits can be typed.
 const NUMBER_PAD: u32 = 1;
 
-enum Request {
-    Keyboard(SoftwareKeyboardRequest, Sender<SoftwareKeyboardAnswer>),
-}
-
-/// The [`AppletFrontend`] a session installs: it hands each request to [`AppletDialogs`] and wakes
-/// the UI. Applets without a dialog yet answer like [`HeadlessApplets`].
-struct UiApplets {
-    requests: Sender<Request>,
-    wake: Arc<dyn Fn() + Send + Sync>,
-}
-
-impl UiApplets {
-    fn ask<T>(&self, request: impl FnOnce(Sender<T>) -> Request) -> Option<T> {
-        let (reply, answer) = crossbeam_channel::bounded(1);
-        self.requests.send(request(reply)).ok()?;
-        (self.wake)();
-        answer.recv().ok()
-    }
-}
-
-impl AppletFrontend for UiApplets {
-    fn show_error(&self, request: &ErrorRequest) {
-        HeadlessApplets.show_error(request);
-    }
-
-    fn select_profile(&self, request: &ProfileSelectRequest) -> ProfileSelectAnswer {
-        HeadlessApplets.select_profile(request)
-    }
-
-    fn configure_controllers(&self, request: &ControllerRequest) -> ControllerAnswer {
-        HeadlessApplets.configure_controllers(request)
-    }
-
-    fn software_keyboard(&self, request: &SoftwareKeyboardRequest) -> SoftwareKeyboardAnswer {
-        self.ask(|reply| Request::Keyboard(request.clone(), reply))
-            .unwrap_or(SoftwareKeyboardAnswer::Cancelled)
-    }
-}
-
-/// The UI side of a session's applets: shows one applet dialog at a time, in the order the
-/// title opened them.
-pub struct AppletDialogs {
-    sender: Sender<Request>,
-    requests: Receiver<Request>,
-    wake: Arc<dyn Fn() + Send + Sync>,
-    open: Option<KeyboardDialog>,
-}
-
-impl AppletDialogs {
-    /// Dialogs whose frontend calls `wake` when a title opens an applet, so the UI redraws.
-    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
-        let (sender, requests) = crossbeam_channel::unbounded();
-        Self {
-            sender,
-            requests,
-            wake: Arc::new(wake),
-            open: None,
-        }
-    }
-
-    /// The frontend to install with `ServiceContext::set_applet_frontend`.
-    pub fn frontend(&self) -> Arc<dyn AppletFrontend> {
-        Arc::new(UiApplets {
-            requests: self.sender.clone(),
-            wake: self.wake.clone(),
-        })
-    }
-
-    /// Whether an applet dialog is waiting for the user.
-    pub fn is_open(&self) -> bool {
-        self.open.is_some() || !self.requests.is_empty()
-    }
-
-    pub fn show(&mut self, ctx: &egui::Context) {
-        if self.open.is_none() {
-            self.open = self.requests.try_recv().ok().map(|request| match request {
-                Request::Keyboard(request, reply) => KeyboardDialog::new(request, reply),
-            });
-        }
-        let Some(dialog) = &mut self.open else {
-            return;
-        };
-        if let Some(answer) = dialog.show(ctx) {
-            let _ = dialog.reply.send(answer);
-            self.open = None;
-            ctx.request_repaint();
-        }
-    }
-}
-
 /// The full-screen software keyboard, after Lichii's QtSoftwareKeyboardDialog: the header, sub
 /// and guide texts, the length limits, number pad and password modes, and the text check's
 /// message before the text can be edited again.
-struct KeyboardDialog {
+pub(super) struct KeyboardDialog {
     request: SoftwareKeyboardRequest,
-    reply: Sender<SoftwareKeyboardAnswer>,
+    pub reply: Sender<SoftwareKeyboardAnswer>,
     text: String,
     /// The text check's message while it is shown, before editing.
     prompt: Option<TextCheckPrompt>,
@@ -118,7 +20,7 @@ struct KeyboardDialog {
 }
 
 impl KeyboardDialog {
-    fn new(request: SoftwareKeyboardRequest, reply: Sender<SoftwareKeyboardAnswer>) -> Self {
+    pub fn new(request: SoftwareKeyboardRequest, reply: Sender<SoftwareKeyboardAnswer>) -> Self {
         let mut text = request.initial_text.clone();
         limit(&mut text, &request);
         Self {
@@ -134,7 +36,7 @@ impl KeyboardDialog {
         utf16_len(&self.text) >= self.request.min_length
     }
 
-    fn show(&mut self, ctx: &egui::Context) -> Option<SoftwareKeyboardAnswer> {
+    pub fn show(&mut self, ctx: &egui::Context) -> Option<SoftwareKeyboardAnswer> {
         let (enter, escape) =
             ctx.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
         match self.prompt.clone() {
@@ -269,70 +171,16 @@ fn limit(text: &mut String, request: &SoftwareKeyboardRequest) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread::JoinHandle;
 
-    use egui::{Event, Modifiers, RawInput};
-
+    use super::super::testing::Harness;
     use super::*;
 
-    struct Harness {
-        ctx: egui::Context,
-        dialogs: AppletDialogs,
-        wakes: Arc<AtomicUsize>,
-    }
-
-    impl Harness {
-        fn new() -> Self {
-            let wakes = Arc::new(AtomicUsize::new(0));
-            let counter = wakes.clone();
-            Self {
-                ctx: egui::Context::default(),
-                dialogs: AppletDialogs::new(move || {
-                    counter.fetch_add(1, Ordering::Relaxed);
-                }),
-                wakes,
-            }
-        }
-
-        fn ask(&self, request: SoftwareKeyboardRequest) -> JoinHandle<SoftwareKeyboardAnswer> {
-            let frontend = self.dialogs.frontend();
-            let woken = self.wakes.load(Ordering::Relaxed);
-            let handle = std::thread::spawn(move || frontend.software_keyboard(&request));
-            while self.wakes.load(Ordering::Relaxed) == woken {
-                std::thread::yield_now();
-            }
-            handle
-        }
-
-        fn frame(&mut self, events: Vec<Event>) {
-            let input = RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(1280.0, 720.0),
-                )),
-                events,
-                ..RawInput::default()
-            };
-            let dialogs = &mut self.dialogs;
-            let mut output = self.ctx.run_ui(input, |ui| dialogs.show(ui.ctx()));
-            output.textures_delta.clear();
-        }
-
-        fn typed(&mut self, text: &str) {
-            self.frame(vec![Event::Text(text.to_owned())]);
-        }
-
-        fn key(&mut self, key: Key) {
-            let press = |pressed| Event::Key {
-                key,
-                physical_key: None,
-                pressed,
-                repeat: false,
-                modifiers: Modifiers::NONE,
-            };
-            self.frame(vec![press(true), press(false)]);
-        }
+    fn keyboard(
+        ui: &Harness,
+        request: SoftwareKeyboardRequest,
+    ) -> JoinHandle<SoftwareKeyboardAnswer> {
+        ui.ask(move |frontend| frontend.software_keyboard(&request))
     }
 
     fn request(initial: &str, min: u32, max: u32) -> SoftwareKeyboardRequest {
@@ -349,7 +197,7 @@ mod tests {
     #[test]
     fn typing_is_cut_at_the_maximum_and_enter_submits() {
         let mut ui = Harness::new();
-        let answer = ui.ask(request("ab", 0, 5));
+        let answer = keyboard(&ui, request("ab", 0, 5));
         assert!(ui.dialogs.is_open());
         ui.frame(Vec::new());
         ui.typed("cdefg");
@@ -364,7 +212,7 @@ mod tests {
     #[test]
     fn enter_waits_for_the_minimum_length() {
         let mut ui = Harness::new();
-        let answer = ui.ask(request("", 3, 10));
+        let answer = keyboard(&ui, request("", 3, 10));
         ui.frame(Vec::new());
         ui.typed("ab");
         ui.key(Key::Enter);
@@ -381,10 +229,13 @@ mod tests {
     #[test]
     fn the_number_pad_takes_digits_only() {
         let mut ui = Harness::new();
-        let answer = ui.ask(SoftwareKeyboardRequest {
-            kind: NUMBER_PAD,
-            ..request("4x", 0, 8)
-        });
+        let answer = keyboard(
+            &ui,
+            SoftwareKeyboardRequest {
+                kind: NUMBER_PAD,
+                ..request("4x", 0, 8)
+            },
+        );
         ui.frame(Vec::new());
         ui.typed("1a2");
         ui.key(Key::Enter);
@@ -397,15 +248,18 @@ mod tests {
     #[test]
     fn escape_cancels_unless_the_title_disabled_cancel() {
         let mut ui = Harness::new();
-        let answer = ui.ask(request("ab", 0, 5));
+        let answer = keyboard(&ui, request("ab", 0, 5));
         ui.frame(Vec::new());
         ui.key(Key::Escape);
         assert_eq!(answer.join().unwrap(), SoftwareKeyboardAnswer::Cancelled);
 
-        let answer = ui.ask(SoftwareKeyboardRequest {
-            cancel_disabled: true,
-            ..request("ab", 0, 5)
-        });
+        let answer = keyboard(
+            &ui,
+            SoftwareKeyboardRequest {
+                cancel_disabled: true,
+                ..request("ab", 0, 5)
+            },
+        );
         ui.frame(Vec::new());
         ui.key(Key::Escape);
         assert!(ui.dialogs.is_open(), "cancel is disabled");
@@ -419,10 +273,13 @@ mod tests {
     #[test]
     fn a_rejected_text_shows_the_message_then_edits_it_again() {
         let mut ui = Harness::new();
-        let answer = ui.ask(SoftwareKeyboardRequest {
-            text_check: Some(TextCheckPrompt::Rejected("That name is taken.".into())),
-            ..request("bob", 1, 10)
-        });
+        let answer = keyboard(
+            &ui,
+            SoftwareKeyboardRequest {
+                text_check: Some(TextCheckPrompt::Rejected("That name is taken.".into())),
+                ..request("bob", 1, 10)
+            },
+        );
         ui.frame(Vec::new());
         ui.typed("x");
         ui.key(Key::Enter);
@@ -442,10 +299,13 @@ mod tests {
     #[test]
     fn a_confirm_prompt_submits_the_text_unchanged() {
         let mut ui = Harness::new();
-        let answer = ui.ask(SoftwareKeyboardRequest {
-            text_check: Some(TextCheckPrompt::Confirm("Use this name?".into())),
-            ..request("bob", 1, 10)
-        });
+        let answer = keyboard(
+            &ui,
+            SoftwareKeyboardRequest {
+                text_check: Some(TextCheckPrompt::Confirm("Use this name?".into())),
+                ..request("bob", 1, 10)
+            },
+        );
         ui.frame(Vec::new());
         ui.key(Key::Enter);
         assert_eq!(
@@ -453,10 +313,13 @@ mod tests {
             SoftwareKeyboardAnswer::Submitted("bob".into())
         );
 
-        let answer = ui.ask(SoftwareKeyboardRequest {
-            text_check: Some(TextCheckPrompt::Confirm("Use this name?".into())),
-            ..request("bob", 1, 10)
-        });
+        let answer = keyboard(
+            &ui,
+            SoftwareKeyboardRequest {
+                text_check: Some(TextCheckPrompt::Confirm("Use this name?".into())),
+                ..request("bob", 1, 10)
+            },
+        );
         ui.frame(Vec::new());
         ui.key(Key::Escape);
         ui.frame(Vec::new());
@@ -471,10 +334,13 @@ mod tests {
     #[test]
     fn enter_on_the_focused_cancel_button_returns_to_the_editor() {
         let mut ui = Harness::new();
-        let answer = ui.ask(SoftwareKeyboardRequest {
-            text_check: Some(TextCheckPrompt::Confirm("Use this name?".into())),
-            ..request("bob", 1, 10)
-        });
+        let answer = keyboard(
+            &ui,
+            SoftwareKeyboardRequest {
+                text_check: Some(TextCheckPrompt::Confirm("Use this name?".into())),
+                ..request("bob", 1, 10)
+            },
+        );
         ui.frame(Vec::new());
         ui.key(Key::Tab);
         ui.key(Key::Enter);
@@ -491,7 +357,7 @@ mod tests {
     #[test]
     fn requests_are_cancelled_once_the_dialogs_are_gone() {
         let ui = Harness::new();
-        let answer = ui.ask(request("ab", 0, 5));
+        let answer = keyboard(&ui, request("ab", 0, 5));
         let frontend = ui.dialogs.frontend();
         drop(ui);
         assert_eq!(answer.join().unwrap(), SoftwareKeyboardAnswer::Cancelled);

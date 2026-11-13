@@ -21,7 +21,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::PhysicalKey;
 use winit::window::{Fullscreen, Window, WindowId};
 
-use crate::applets::AppletDialogs;
+use crate::applets::{AppletDialogs, ControlsChange};
 use crate::choices::Choice;
 use crate::cli::Cli;
 use crate::config::game::GameConfigWindow;
@@ -386,11 +386,24 @@ impl App {
 
     /// Re-applies settings that live outside `self.settings`: input bindings and hotkeys.
     fn reconfigure_input(&mut self) {
+        self.configure_input(None);
+    }
+
+    fn configure_input(&mut self, applied: Option<Box<dyn FnOnce() + Send>>) {
         self.hotkeys = HotkeyMap::new(&self.settings.ui.hotkeys);
         self.input.send(InputMsg::Configure {
             controls: Box::new(self.settings.controls.clone()),
             combos: hotkeys::combos(&self.settings.ui.hotkeys),
+            applied,
         });
+    }
+
+    /// Saves the controller applet's setup like the Controls page does, and answers the title
+    /// once input uses it.
+    pub(crate) fn apply_controls(&mut self, change: ControlsChange) {
+        self.settings.controls = change.controls;
+        self.configure_input(Some(change.applied));
+        self.save_settings();
     }
 
     fn update_title(&self) {
@@ -457,7 +470,7 @@ impl App {
             ..LoadOptions::default()
         };
         let proxy = self.proxy.clone();
-        let applets = AppletDialogs::new(move || {
+        let applets = AppletDialogs::new(self.settings.system.username.clone(), move || {
             let _ = proxy.send_event(UserEvent::Wake);
         });
         match Session::boot(&path, options, Some(applets), configure) {
