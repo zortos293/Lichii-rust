@@ -56,7 +56,7 @@ mod load_store_attribute;
 mod load_store_local_shared;
 mod load_store_memory;
 mod logic_operation;
-mod logic_operation_three_input;
+pub(crate) mod logic_operation_three_input;
 mod move_predicate_to_register;
 mod move_register;
 mod move_register_to_predicate;
