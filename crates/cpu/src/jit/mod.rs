@@ -371,11 +371,14 @@ impl Jit {
             Exit::Halt(halt) => Some(halt),
             Exit::Invalidate(addr, size) => {
                 self.cache.invalidate(addr, size);
-                None
+                Some(HaltReason::InvalidateCode { addr, size })
             }
             Exit::InvalidateAll => {
                 self.cache.clear();
-                None
+                Some(HaltReason::InvalidateCode {
+                    addr: 0,
+                    size: u64::MAX,
+                })
             }
         }
     }
