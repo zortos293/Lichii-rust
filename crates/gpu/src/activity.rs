@@ -4,12 +4,18 @@
 //! for the host GPU. It tells a slow title's GPU threads apart from its CPU side, and a renderer
 //! that never draws from one that draws nothing visible.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
 const REPORT_PERIOD: Duration = Duration::from_secs(5);
+/// How often the reporter looks for a back that stopped making progress.
+const STALL_CHECK: Duration = Duration::from_secs(1);
+/// A back that made no progress this long with work queued is reported.
+const STALL: Duration = Duration::from_secs(2);
+/// A stall still going on is reported again this often.
+const STALL_REPEAT: Duration = Duration::from_secs(30);
 
 /// A renderer call [`Activity`] counts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,6 +24,10 @@ pub enum RendererCall {
     Clear,
     Dispatch,
     Present,
+}
+
+impl RendererCall {
+    const ALL: [Self; 4] = [Self::Draw, Self::Clear, Self::Dispatch, Self::Present];
 }
 
 /// A wait [`Activity`] times. Only one thread at a time waits on each.
@@ -75,6 +85,10 @@ pub struct Activity {
     calls: [AtomicU64; 4],
     renderer_ns: AtomicU64,
     longest_ns: AtomicU64,
+    /// The renderer call going on, and since when ([`Activity::base`] nanoseconds), or
+    /// [`NOT_WAITING`].
+    call_kind: AtomicU8,
+    call_since: AtomicU64,
     waits: [WaitClock; 4],
     stopped: Mutex<bool>,
     stop: Condvar,
@@ -111,6 +125,8 @@ impl Activity {
             calls: [const { AtomicU64::new(0) }; 4],
             renderer_ns: AtomicU64::new(0),
             longest_ns: AtomicU64::new(0),
+            call_kind: AtomicU8::new(0),
+            call_since: AtomicU64::new(NOT_WAITING),
             waits: [const { WaitClock::new() }; 4],
             stopped: Mutex::new(false),
             stop: Condvar::new(),
@@ -121,9 +137,20 @@ impl Activity {
         u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(NOT_WAITING - 1)
     }
 
-    /// Counts a renderer call of `kind` that started at `start` and has returned.
+    /// A renderer call of `kind` starts; returns the start [`Activity::renderer_call`] takes when
+    /// it returned.
+    #[inline]
+    pub fn begin_call(&self, kind: RendererCall) -> Instant {
+        self.call_kind.store(kind as u8, Ordering::Relaxed);
+        self.call_since.store(self.now(), Ordering::Release);
+        Instant::now()
+    }
+
+    /// Counts a renderer call of `kind` that [`Activity::begin_call`] started at `start` and that
+    /// has returned.
     #[inline]
     pub fn renderer_call(&self, kind: RendererCall, start: Instant) {
+        self.call_since.store(NOT_WAITING, Ordering::Release);
         let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.calls[kind as usize].fetch_add(1, Ordering::Relaxed);
         self.renderer_ns.fetch_add(ns, Ordering::Relaxed);
@@ -142,20 +169,39 @@ impl Activity {
         }
     }
 
-    /// Logs a report every [`REPORT_PERIOD`] until [`Activity::stop`]. `threaded`: whether the
-    /// back has a thread of its own; otherwise its time is the front's.
-    pub(crate) fn report_until_stopped(&self, threaded: bool) {
+    /// Logs a report every [`REPORT_PERIOD`], and a back that stopped making progress, until
+    /// [`Activity::stop`]. `threaded`: whether the back has a thread of its own; otherwise its
+    /// time is the front's.
+    pub(crate) fn report_until_stopped(&self, threaded: bool, back: &dyn BackView) {
         let mut since = Instant::now();
+        let mut watch = StallWatch::default();
         let mut stopped = self.stopped.lock();
         while !*stopped {
-            self.stop.wait_until(&mut stopped, since + REPORT_PERIOD);
+            self.stop.wait_for(&mut stopped, STALL_CHECK);
             if *stopped {
                 return;
             }
-            let elapsed = since.elapsed();
-            since = Instant::now();
-            self.report(elapsed, threaded);
+            watch.check(self, back.snapshot());
+            if since.elapsed() >= REPORT_PERIOD {
+                let elapsed = since.elapsed();
+                since = Instant::now();
+                self.report(elapsed, threaded);
+            }
         }
+    }
+
+    /// The renderer call going on, if any.
+    fn current_call(&self) -> Option<RendererCall> {
+        let since = self.call_since.load(Ordering::Acquire);
+        (since != NOT_WAITING)
+            .then(|| RendererCall::ALL[usize::from(self.call_kind.load(Ordering::Relaxed)) & 3])
+    }
+
+    fn waiting_for_host_gpu(&self) -> bool {
+        self.waits[Wait::HostGpu as usize]
+            .since
+            .load(Ordering::Acquire)
+            != NOT_WAITING
     }
 
     /// Ends [`Activity::report_until_stopped`].
@@ -195,6 +241,61 @@ impl Activity {
     }
 }
 
+/// What the back is doing, as the ring sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BackSnapshot {
+    pub published: u64,
+    pub consumed: u64,
+    /// The header of the record the back executes.
+    pub executing: u64,
+}
+
+/// Reads [`BackSnapshot`]s from another thread.
+pub(crate) trait BackView: Send + Sync {
+    fn snapshot(&self) -> BackSnapshot;
+}
+
+/// Finds a back that has work queued but made no progress for [`STALL`].
+#[derive(Default)]
+struct StallWatch {
+    last: Option<BackSnapshot>,
+    /// When the back last made progress, or had nothing to do.
+    progressed: Option<Instant>,
+    reported: Option<Instant>,
+}
+
+impl StallWatch {
+    fn check(&mut self, activity: &Activity, now: BackSnapshot) {
+        let idle = now.published == now.consumed && activity.current_call().is_none();
+        if idle || self.last != Some(now) {
+            self.last = Some(now);
+            self.progressed = Some(Instant::now());
+            if self.reported.take().is_some() {
+                tracing::warn!("the GPU back is making progress again");
+            }
+            return;
+        }
+        let stalled = self.progressed.map_or(Duration::ZERO, |at| at.elapsed());
+        if stalled < STALL || self.reported.is_some_and(|at| at.elapsed() < STALL_REPEAT) {
+            return;
+        }
+        self.reported = Some(Instant::now());
+        let header = now.executing;
+        tracing::warn!(
+            for_ = ?stalled,
+            record = header as u8,
+            engine = (header >> 8) as u8,
+            method = format_args!("{:#x}", (header >> 16) & 0xffff),
+            argument = format_args!("{:#x}", header >> 32),
+            renderer_call = ?activity.current_call(),
+            waiting_for_host_gpu = activity.waiting_for_host_gpu(),
+            published = now.published,
+            consumed = now.consumed,
+            "the GPU back has made no progress with work queued; this is the record it executes"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,10 +303,14 @@ mod tests {
     #[test]
     fn a_report_resets_the_counters() {
         let activity = Activity::new();
-        let start = Instant::now();
-        activity.renderer_call(RendererCall::Draw, start);
-        activity.renderer_call(RendererCall::Draw, start);
-        activity.renderer_call(RendererCall::Present, start);
+        for kind in [
+            RendererCall::Draw,
+            RendererCall::Draw,
+            RendererCall::Present,
+        ] {
+            let start = activity.begin_call(kind);
+            activity.renderer_call(kind, start);
+        }
         assert_eq!(
             activity.calls[RendererCall::Draw as usize].load(Ordering::Relaxed),
             2
@@ -245,11 +350,53 @@ mod tests {
     #[test]
     fn the_reporter_thread_stops() {
         let activity = std::sync::Arc::new(Activity::new());
+        struct Idle;
+        impl BackView for Idle {
+            fn snapshot(&self) -> BackSnapshot {
+                BackSnapshot {
+                    published: 0,
+                    consumed: 0,
+                    executing: 0,
+                }
+            }
+        }
         let reporter = std::thread::spawn({
             let activity = activity.clone();
-            move || activity.report_until_stopped(true)
+            move || activity.report_until_stopped(true, &Idle)
         });
         activity.stop();
         reporter.join().unwrap();
+    }
+
+    #[test]
+    fn a_stalled_back_is_found_only_with_work_queued() {
+        let activity = Activity::new();
+        let mut watch = StallWatch::default();
+        let busy = BackSnapshot {
+            published: 10,
+            consumed: 4,
+            executing: 1,
+        };
+        watch.check(&activity, busy);
+        watch.progressed = Some(Instant::now() - STALL);
+        watch.check(&activity, busy);
+        assert!(
+            watch.reported.is_some(),
+            "no progress with work queued is a stall"
+        );
+        let idle = BackSnapshot {
+            published: 10,
+            consumed: 10,
+            executing: 1,
+        };
+        watch.check(&activity, idle);
+        assert!(watch.reported.is_none());
+        watch.progressed = Some(Instant::now() - STALL);
+        watch.check(&activity, idle);
+        assert!(watch.reported.is_none(), "an idle back is not stalled");
+        let start = activity.begin_call(RendererCall::Present);
+        assert_eq!(activity.current_call(), Some(RendererCall::Present));
+        activity.renderer_call(RendererCall::Present, start);
+        assert_eq!(activity.current_call(), None);
     }
 }

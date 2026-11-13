@@ -19,8 +19,6 @@ pub mod pcas;
 pub mod qmd;
 pub mod regs;
 
-use std::time::Instant;
-
 use lichii_common::GpuVAddr;
 
 use super::EngineContext;
@@ -347,7 +345,7 @@ impl KeplerCompute {
         }
         let tic = &self.regs.tic;
         let tsc = &self.regs.tsc;
-        let start = Instant::now();
+        let start = ctx.activity.begin_call(RendererCall::Dispatch);
         ctx.rasterizer.dispatch_compute(&ComputeContext {
             channel: ctx.channel,
             memory: ctx.memory,
