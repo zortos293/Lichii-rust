@@ -960,6 +960,9 @@ impl<'a> Tracker<'a> {
     /// becomes a descriptor array of the table's entries, when the host binds such arrays and
     /// the index is defined wherever `inst` runs.
     fn handle_program(&mut self, prog: &Program, inst: InstId, ctx: Ctx) -> Option<CbufAddr> {
+        if !self.host.support_handle_programs {
+            return None;
+        }
         let handle = prog.arg(inst, 0);
         let key = (self.start(prog, handle, ctx)?, ctx.key);
         let built = match self.built.get(&key) {
@@ -1268,8 +1271,8 @@ fn byte_address_to_texel(
     {
         return Err(TextureError::ByteAddressedMode(op));
     }
-    let format = tracker.pixel_format(&cbuf);
-    let ty = tracker.texture_type(&cbuf);
+    let format = tracker.pixel_format(cbuf);
+    let ty = tracker.texture_type(cbuf);
     let env = tracker.env;
     let packed_r16 = tracker.host.support_byte_addressed_r16
         && format == TexturePixelFormat::R16Float

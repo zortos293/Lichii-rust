@@ -97,6 +97,7 @@ fn host(limit: u32) -> HostTranslateInfo {
         max_descriptor_set_samplers: limit,
         max_descriptor_set_sampled_images: limit,
         max_per_stage_resources: 1024,
+        support_handle_programs: true,
         ..HostTranslateInfo::default()
     }
 }
@@ -698,6 +699,17 @@ fn handle_read_from_a_storage_buffer_becomes_a_handle_program() {
         0,
     );
     assert_eq!(handle, 0x0004_0003);
+
+    let (mut prog, b) = program(1);
+    let handle = table_handle(&mut prog, b[0]);
+    sample(&mut prog, b[0], handle);
+    let without = HostTranslateInfo {
+        support_handle_programs: false,
+        ..host(1024)
+    };
+    let info = run(&env, &mut prog, &without);
+    assert!(info.texture_descriptors[0].handle_is_pointer_word);
+    assert!(info.handle_programs.is_empty());
 }
 
 #[test]

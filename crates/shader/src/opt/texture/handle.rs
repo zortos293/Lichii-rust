@@ -7,6 +7,8 @@
 //! bounds it. Reaching a value again while it is being built means a loop carries it, which no
 //! single evaluation can give.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use rustc_hash::FxHashMap;
 
 use super::{Ctx, resolve_conditional_phi};
@@ -310,6 +312,12 @@ impl Builder<'_> {
                 && self.prog.resolve(self.arg(phi, i)) != Value::Inst(phi)
         });
         if varies {
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "a bindless handle changes on each loop iteration: binding no texture for it"
+                );
+            }
             return self.fail(Opcode::Phi);
         }
         let defined: Vec<usize> = (0..self.prog.inst(phi).num_args())
