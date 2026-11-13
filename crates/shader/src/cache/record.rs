@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use lichii_common::GpuVAddr;
 use serde::{Deserialize, Serialize};
 
-use crate::info::{ReplaceConstant, TexturePixelFormat};
+use crate::info::{HandleSource, ReplaceConstant, TexturePixelFormat};
 use crate::ir::TextureType;
 use crate::{MeshState, ShaderArch, ShaderEnvironment, ShaderStage};
 
@@ -42,6 +42,22 @@ enum Query {
     },
     Multisample {
         handle: u32,
+        multisample: bool,
+    },
+    TextureTypeOf {
+        source: HandleSource,
+        ty: TextureType,
+    },
+    PixelFormatOf {
+        source: HandleSource,
+        format: TexturePixelFormat,
+    },
+    IntegerFormatOf {
+        source: HandleSource,
+        integer: bool,
+    },
+    MultisampleOf {
+        source: HandleSource,
         multisample: bool,
     },
     ViewportTransform(u32),
@@ -97,6 +113,17 @@ impl Query {
                 handle,
                 multisample,
             } => env.is_texture_multisample(handle) == multisample,
+            Query::TextureTypeOf { source, ty } => env.texture_type_of(source) == ty,
+            Query::PixelFormatOf { source, format } => {
+                env.texture_pixel_format_of(source) == format
+            }
+            Query::IntegerFormatOf { source, integer } => {
+                env.is_texture_pixel_format_integer_of(source) == integer
+            }
+            Query::MultisampleOf {
+                source,
+                multisample,
+            } => env.is_texture_multisample_of(source) == multisample,
             Query::ViewportTransform(state) => env.viewport_transform_state() == state,
             Query::TextureBoundBuffer(buffer) => env.texture_bound_buffer() == buffer,
             Query::LocalMemorySize(size) => env.local_memory_size() == size,
@@ -247,6 +274,29 @@ impl ShaderEnvironment for Logger<'_> {
         let multisample = self.env.is_texture_multisample(handle);
         self.log(Query::Multisample {
             handle,
+            multisample,
+        });
+        multisample
+    }
+    fn texture_type_of(&self, source: HandleSource) -> TextureType {
+        let ty = self.env.texture_type_of(source);
+        self.log(Query::TextureTypeOf { source, ty });
+        ty
+    }
+    fn texture_pixel_format_of(&self, source: HandleSource) -> TexturePixelFormat {
+        let format = self.env.texture_pixel_format_of(source);
+        self.log(Query::PixelFormatOf { source, format });
+        format
+    }
+    fn is_texture_pixel_format_integer_of(&self, source: HandleSource) -> bool {
+        let integer = self.env.is_texture_pixel_format_integer_of(source);
+        self.log(Query::IntegerFormatOf { source, integer });
+        integer
+    }
+    fn is_texture_multisample_of(&self, source: HandleSource) -> bool {
+        let multisample = self.env.is_texture_multisample_of(source);
+        self.log(Query::MultisampleOf {
+            source,
             multisample,
         });
         multisample

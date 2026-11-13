@@ -108,6 +108,26 @@ pub trait ShaderEnvironment {
     fn is_texture_multisample(&self, _raw_handle: u32) -> bool {
         false
     }
+    /// [`Self::texture_type`] of the handle the constant buffer words of `source` hold.
+    /// Translation asks through these `_of` queries, so an environment that records what
+    /// translation read overrides them to record `source` and the answer instead of the words:
+    /// another handle that selects the same kind of texture then translates the same.
+    fn texture_type_of(&self, source: info::HandleSource) -> ir::TextureType {
+        self.texture_type(source.handle(|index, offset| self.read_cbuf(index, offset)))
+    }
+    /// [`Self::texture_pixel_format`] of the handle at `source`.
+    fn texture_pixel_format_of(&self, source: info::HandleSource) -> info::TexturePixelFormat {
+        self.texture_pixel_format(source.handle(|index, offset| self.read_cbuf(index, offset)))
+    }
+    /// [`Self::is_texture_pixel_format_integer`] of the handle at `source`.
+    fn is_texture_pixel_format_integer_of(&self, source: info::HandleSource) -> bool {
+        let handle = source.handle(|index, offset| self.read_cbuf(index, offset));
+        self.is_texture_pixel_format_integer(handle)
+    }
+    /// [`Self::is_texture_multisample`] of the handle at `source`.
+    fn is_texture_multisample_of(&self, source: info::HandleSource) -> bool {
+        self.is_texture_multisample(source.handle(|index, offset| self.read_cbuf(index, offset)))
+    }
     /// The viewport transform enable register (0 when the guest disabled it).
     fn viewport_transform_state(&self) -> u32;
     /// Constant buffer that holds bound texture handles.
