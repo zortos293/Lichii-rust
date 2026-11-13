@@ -32,4 +32,5 @@ winit.workspace = true
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 
 [dev-dependencies]
+lichii-kernel = { workspace = true, features = ["testing"] }
 lichii-loader = { workspace = true, features = ["testing"] }
