@@ -302,6 +302,21 @@ fn vector(rng: &mut Rng) -> u32 {
         let opcode = [0b0111, 0b1010, 0b0110, 0b0010][rng.below(4) as usize];
         let post = rng.below(2) as u32;
         let rm = post * [31, 24, 26][rng.below(3) as usize];
+        if rng.below(2) == 0 {
+            loop {
+                let w = (rng.next() as u32 & (1 << 30 | 1 << 22 | 1 << 21 | 0x3f << 10 | 0x1f))
+                    | 0x0d00_0000
+                    | post << 23
+                    | rm << 16
+                    | base << 5;
+                if matches!(
+                    decode(w),
+                    Inst::VecSingle { .. } | Inst::VecReplicate { .. }
+                ) {
+                    return w;
+                }
+            }
+        }
         return (rng.next() as u32 & (1 << 30 | 1 << 22 | 3 << 10 | 0x1f))
             | 0x0c00_0000
             | post << 23
@@ -683,7 +698,7 @@ fn faults_leave_the_interpreters_state() {
 }
 
 #[test]
-fn multiple_structure_faults_leave_the_interpreters_state() {
+fn vector_structure_faults_leave_the_interpreters_state() {
     const MOV_X0_1: u32 = 0xd280_0020;
     const MOV_X0_2: u32 = 0xd280_0040;
     const LD1_16B_X4_X2_POST: u32 = 0x4cdf_2040;
@@ -692,6 +707,12 @@ fn multiple_structure_faults_leave_the_interpreters_state() {
     const ST1_2D_X2_X2: u32 = 0x4c00_ac40;
     const LD1_8B_X3_X2_POST_X3: u32 = 0x0cc3_6040;
     const ST1_8B_X3_X2_POST_X3: u32 = 0x0c83_6040;
+    const LD4_S1_X2_POST: u32 = 0x0dff_b040;
+    const ST4_S1_X2_POST: u32 = 0x0dbf_b040;
+    const LD3R_8H_X2: u32 = 0x4d40_e440;
+    const LD2_D1_X2_POST_X3: u32 = 0x4de3_8441;
+    const ST3_B13_X2_POST_X3: u32 = 0x4d83_3441;
+    const LD4R_2D_X2_POST: u32 = 0x4dff_ec41;
     let movi = |rd: u32, imm: u32| 0x4f00_e400 | (imm >> 5) << 16 | (imm & 31) << 5 | rd;
     for addr in [
         RODATA + 0x1000 - 1,
@@ -713,6 +734,12 @@ fn multiple_structure_faults_leave_the_interpreters_state() {
             ST1_2D_X2_X2,
             LD1_8B_X3_X2_POST_X3,
             ST1_8B_X3_X2_POST_X3,
+            LD4_S1_X2_POST,
+            ST4_S1_X2_POST,
+            LD3R_8H_X2,
+            LD2_D1_X2_POST_X3,
+            ST3_B13_X2_POST_X3,
+            LD4R_2D_X2_POST,
         ] {
             let code = [
                 movi(0, 0x11),
