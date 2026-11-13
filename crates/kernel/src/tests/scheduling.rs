@@ -3,11 +3,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use lichii_common::ConsoleGeneration;
+use lichii_common::settings::{CpuAccuracy, CpuBackend};
+use lichii_cpu::CpuConfig;
 use parking_lot::Mutex;
 
 use super::{Script, TestKernel, word};
 use crate::process::{Process, ProcessParams};
 use crate::util::Rng;
+use crate::{Kernel, KernelConfig};
 
 pub(super) fn heap_base(test: &TestKernel) -> u64 {
     let params = ProcessParams::from_image(&test.image(), false).unwrap();
@@ -357,4 +360,30 @@ fn guest_time_never_steps_back_across_pause() {
         !stepped_back.load(Ordering::SeqCst),
         "a core read the counter after the pause returned"
     );
+}
+
+#[test]
+fn cores_are_created_with_the_configured_cpu_accuracy() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    let kernel = Kernel::new(KernelConfig {
+        console: ConsoleGeneration::Switch1,
+        dram_size: 256 << 20,
+        pool_layout: None,
+        fastmem: false,
+        cpu_accuracy: CpuAccuracy::Paranoid,
+        aslr: false,
+        rng_seed: 1,
+        clock: Arc::new(super::HostClock(std::time::Instant::now())),
+        cpu: Arc::new(move |config: CpuConfig| {
+            recorded.lock().push(config.accuracy);
+            lichii_cpu::new_core(CpuBackend::Interpreter, config)
+        }),
+        events: None,
+    })
+    .unwrap();
+    let image = crate::testing::program_image(0x0100_0000_0000_1000);
+    let process = kernel.create_process(&image).unwrap();
+    let _cpu = kernel.0.new_cpu(&process, 0);
+    assert_eq!(*seen.lock(), [CpuAccuracy::Paranoid]);
 }
