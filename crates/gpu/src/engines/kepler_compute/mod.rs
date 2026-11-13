@@ -43,12 +43,13 @@ const QMD_V2_GRID: u64 = 0xc * 4;
 /// Words of a version 1.x grid.
 const GRID_WORDS: u32 = 2;
 
-/// An inline upload since the last LAUNCH: where it wrote, how many bytes, and where its first
+/// An inline upload since the last LAUNCH: where it wrote, how many bytes it wrote contiguously
+/// from there (its first line, when linear), and where its first
 /// [`GRID_WORDS`] data words came from when they were contiguous in the command stream.
 #[derive(Clone, Copy)]
 struct UploadSource {
     target: GpuVAddr,
-    size: u64,
+    contiguous: u64,
     source: Option<GpuVAddr>,
 }
 
@@ -112,9 +113,14 @@ impl KeplerCompute {
                         self.uploads.remove(0);
                     }
                     let upload = &self.regs.upload;
+                    let linear = self.regs.exec_upload.linear() != 0;
                     self.uploads.push(UploadSource {
                         target: upload.dest.address(),
-                        size: u64::from(upload.line_length_in) * u64::from(upload.line_count),
+                        contiguous: if linear && upload.line_count != 0 {
+                            u64::from(upload.line_length_in)
+                        } else {
+                            0
+                        },
                         source: None,
                     });
                     self.upload_words = 0;
@@ -173,7 +179,7 @@ impl KeplerCompute {
             .iter()
             .rev()
             .find(|upload| upload.target == grid)
-            .filter(|upload| upload.size >= u64::from(GRID_WORDS) * 4)
+            .filter(|upload| upload.contiguous >= u64::from(GRID_WORDS) * 4)
             .and_then(|upload| upload.source)
             .filter(|&source| gpu_written(ctx, source, u64::from(GRID_WORDS) * 4));
         self.dispatch(
@@ -668,8 +674,15 @@ mod tests {
         rig.engine.upload_source(SOURCE + 0x10);
         rig.call(reg_index!(Regs, data_upload), 7);
         rig.launch(QMD);
+        rig.call(upload, 4);
+        rig.call(upload + 1, 2);
+        rig.call(reg_index!(Regs, exec_upload), 1);
+        rig.engine.upload_source(SOURCE + 0x20);
+        rig.call(reg_index!(Regs, data_upload), 7);
+        rig.call(reg_index!(Regs, data_upload), 3 | 5 << 16);
+        rig.launch(QMD);
         let indirect: Vec<_> = rig.spy.dispatches.iter().map(|d| d.indirect_grid).collect();
-        assert_eq!(indirect, [None, None]);
+        assert_eq!(indirect, [None, None, None]);
     }
 
     #[test]
