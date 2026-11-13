@@ -1677,13 +1677,17 @@ fn cnt_and_addp_match_the_interpreter() {
         .into_iter()
         .chain(addp)
         .flat_map(|w| {
+            let rm = |r: u32| if w & 0x400 != 0 { r << 16 } else { 0 };
             [
-                w | 3 << 16 | 2 << 5 | 1,
-                w | 1 << 16 | 1 << 5 | 1,
-                w | 4 << 16 | 4 << 5 | 5,
+                w | rm(3) | 2 << 5 | 1,
+                w | rm(1) | 1 << 5 | 1,
+                w | rm(4) | 4 << 5 | 5,
             ]
         })
         .collect();
+    assert!(words.iter().all(|&w| {
+        crate::interpreter::simd::execute(&mut ThreadContext::default(), w) == Some(Ok(()))
+    }));
     let mut machines = vec![
         ("interpreter", Machine::new(Backend::Interpreter)),
         ("jit", Machine::new(Backend::Jit(Passes::ALL))),
