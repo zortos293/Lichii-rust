@@ -470,6 +470,7 @@ pub struct TextureCache {
     new_aliases: Vec<Alias>,
     alias_scratch: Vec<Alias>,
     new_overlaps: Vec<ImageId>,
+    dropped: Vec<ImageId>,
     overlap_scratch: Vec<ImageId>,
     keep: Vec<(DAddr, DAddr)>,
     segments: Vec<Segment>,
@@ -722,6 +723,7 @@ impl TextureCache {
             new_aliases: Vec::new(),
             alias_scratch: Vec::new(),
             new_overlaps: Vec::new(),
+            dropped: Vec::new(),
             overlap_scratch: Vec::new(),
             keep: Vec::new(),
             segments: Vec::new(),
@@ -1692,6 +1694,7 @@ impl TextureCache {
         self.joins.clear();
         self.new_aliases.clear();
         self.new_overlaps.clear();
+        self.dropped.clear();
         let host = self.host(info.format);
         let overlaps = std::mem::take(&mut self.ids);
         for &id in &overlaps {
@@ -1723,11 +1726,16 @@ impl TextureCache {
                 {
                     self.joins.push((id, level, layer));
                 }
-                Some(_) if !image.gpu_modified => self.remove(tx.scheduler, id),
+                Some(_) if !image.gpu_modified => self.dropped.push(id),
                 _ => self.new_overlaps.push(id),
             }
         }
         self.ids = overlaps;
+        let dropped = std::mem::take(&mut self.dropped);
+        for &other in &dropped {
+            self.remove(tx.scheduler, other);
+        }
+        self.dropped = dropped;
         let segments = self.segments.clone();
         let id = self.create(info, segments)?;
         let new_overlaps = std::mem::take(&mut self.new_overlaps);
@@ -1903,7 +1911,7 @@ impl TextureCache {
         for &other in &image.overlaps {
             let other = self.get_mut(other).expect("overlaps are live");
             other.overlaps.retain(|&o| o != id);
-            if other.gpu_modified && other.modified < image.modified {
+            if other.gpu_modified && other.current < image.modified {
                 other
                     .keep_out
                     .extend(image.segments.iter().map(|s| (s.daddr, s.daddr + s.size)));
@@ -2046,13 +2054,13 @@ impl TextureCache {
     }
 
     /// Appends the device ranges a write-back of `id` leaves alone: those of overlaps modified
-    /// after it, live or removed.
+    /// after it last held the shared bytes, live or removed.
     fn keep_newer(&self, id: ImageId, keep: &mut Vec<(DAddr, DAddr)>) {
         let image = self.get(id).expect("a live image id");
         keep.extend_from_slice(&image.keep_out);
         for &other in &image.overlaps {
             let other = self.get(other).expect("overlaps are live");
-            if other.modified > image.modified {
+            if other.modified > image.current {
                 keep.extend(other.segments.iter().map(|s| (s.daddr, s.daddr + s.size)));
             }
         }
