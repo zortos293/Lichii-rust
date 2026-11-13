@@ -3,7 +3,7 @@
 use super::{TResult, Translator};
 use crate::ampere::decode::Form;
 use crate::ampere::opcode::Opcode;
-use crate::ir::{Attribute, Opcode as Ir, Patch, Value};
+use crate::ir::{Attribute, FpControl, Opcode as Ir, Patch, Value};
 use crate::{ShaderStage, TranslateError};
 
 pub(super) fn translate(t: &mut Translator<'_>, op: Opcode) -> TResult {
@@ -143,21 +143,30 @@ fn ast(t: &mut Translator<'_>) -> TResult {
     Ok(())
 }
 
-/// IPA: the attribute word at 64..72, the sample location at 76..78 (default or centroid; an
-/// explicit offset is not supported) and the frequency at 78..80 (pass or constant). The
-/// indexed form adds the uniform register at 24..30 to the attribute's byte address.
+/// IPA: the attribute word at 64..72, the sample location at 76..78 (default, centroid or
+/// .OFFSET by Rb at 32..40) and the frequency at 78..80 (pass or constant; NAK never emits the
+/// third, state). The indexed form adds the uniform register at 24..30 to the attribute's byte
+/// address.
 ///
 /// SM70+ interpolates perspective-correct inputs in hardware (Mesa NAK emits a plain IPA.PASS
 /// there), so unlike Maxwell's IPA the value is used as interpolated, with no multiply by the
-/// position's W.
+/// position's W. A constant input does not vary, so .OFFSET reads it as it is.
 fn ipa(t: &mut Translator<'_>) -> TResult {
     let insn = t.insn;
-    if insn.bits(76, 2) > 1 || insn.bits(78, 2) > 1 || !insn.pred_dst0().is_true() {
+    let (location, frequency) = (insn.bits(76, 2), insn.bits(78, 2));
+    if location > 2 || frequency > 1 || !insn.pred_dst0().is_true() {
         return Err(t.unsupported());
     }
     let word = insn.bits(64, 8) as u16;
     let index = insn.usrc0();
-    let value = if t.form == Form::UregIndexed && !index.is_zero() {
+    let indexed = t.form == Form::UregIndexed && !index.is_zero();
+    let value = if location == 2 && frequency == 0 {
+        if indexed || t.env.stage() != ShaderStage::Fragment {
+            return Err(t.unsupported());
+        }
+        let offset = t.x(insn.src1());
+        interpolate_at_offset(t, Attribute(word), offset)
+    } else if indexed {
         let base = t.x(index);
         let address = t.ir.iadd(base, Value::U32(u32::from(word) * 4));
         t.ir.get_attribute_indexed(address, Value::U32(0))
@@ -166,6 +175,31 @@ fn ipa(t: &mut Translator<'_>) -> TResult {
     };
     t.set_f(insn.dst(), value);
     Ok(())
+}
+
+/// IPA.OFFSET's offset holds x in the low and y in the high halfword, signed with 12 fraction
+/// bits (NAK's `load_barycentric_offset`). Generic inputs interpolate at it. The others are
+/// either flat or, like the position, linear in screen space, so the value moves along its
+/// fine derivatives.
+fn interpolate_at_offset(t: &mut Translator<'_>, attribute: Attribute, offset: Value) -> Value {
+    let [x, y] = [0, 16].map(|shift| {
+        let half =
+            t.ir.bit_field_extract(offset, Value::U32(shift), Value::U32(16), true);
+        let half =
+            t.ir.convert_i_to_f(32, 32, true, half, FpControl::default());
+        t.ir.fp_mul(half, Value::F32(1.0 / 4096.0), FpControl::default())
+    });
+    if attribute.is_generic() {
+        return t.ir.inst(
+            Ir::InterpolateAtOffset,
+            &[Value::Attribute(attribute), x, y],
+        );
+    }
+    let value = t.ir.get_attribute(attribute, Value::U32(0));
+    let dx = t.ir.inst(Ir::DPdxFine, &[value]);
+    let dy = t.ir.inst(Ir::DPdyFine, &[value]);
+    let value = t.ir.fp_fma(dx, x, value, FpControl::default());
+    t.ir.fp_fma(dy, y, value, FpControl::default())
 }
 
 fn is_task_or_mesh(t: &Translator<'_>) -> bool {
@@ -620,9 +654,58 @@ mod tests {
         assert!(run(Fragment, urz).starts_with("{0}:\n  %0 = GetAttribute Generic0X, #0x0\n"));
     }
 
+    fn ipa_at_offset_to(reg: u128, word: u128, fields: u128) -> Instruction {
+        fixed(
+            Opcode::Ipa,
+            dst(reg) | rb(4) | (word << 64) | PT_DST | (2 << 76) | fields,
+        )
+    }
+
+    fn ipa_at_offset(word: u128, fields: u128) -> Instruction {
+        ipa_at_offset_to(1, word, fields)
+    }
+
+    #[test]
+    fn ipa_offset_interpolates_generic_inputs() {
+        assert_eq!(
+            run(Fragment, ipa_at_offset(33, 0)),
+            "{0}:\n\
+             \x20 %0 = GetRegister R4\n\
+             \x20 %1 = BitFieldSExtract %0, #0x0, #0x10\n\
+             \x20 %2 = ConvertF32S32 %1\n\
+             \x20 %3 = FPMul32 %2, #0.00024414063f\n\
+             \x20 %4 = BitFieldSExtract %0, #0x10, #0x10\n\
+             \x20 %5 = ConvertF32S32 %4\n\
+             \x20 %6 = FPMul32 %5, #0.00024414063f\n\
+             \x20 %7 = InterpolateAtOffset Generic0Y, %3, %6\n\
+             \x20 %8 = BitCastU32F32 %7\n\
+             \x20 SetRegister R1, %8\n"
+        );
+    }
+
+    #[test]
+    fn ipa_offset_moves_other_inputs_along_their_derivatives() {
+        let ir = run(Fragment, ipa_at_offset(28, 0));
+        for op in ["GetAttribute PositionX", "DPdxFine", "DPdyFine", "FPFma32"] {
+            assert!(ir.contains(op), "{ir}");
+        }
+        assert!(!ir.contains("InterpolateAtOffset"), "{ir}");
+    }
+
+    #[test]
+    fn ipa_offset_reads_constant_inputs_as_they_are() {
+        assert_eq!(
+            run(Fragment, ipa_at_offset(33, 1 << 78)),
+            run(Fragment, ipa(33, 0))
+        );
+    }
+
     #[test]
     fn ipa_other_modes_are_unsupported() {
-        rejects(Fragment, ipa(32, 2 << 76));
+        rejects(Fragment, ipa(32, 3 << 76));
+        rejects(VertexB, ipa_at_offset(32, 0));
+        let indexed = dst(1) | ra(5) | rb(4) | (32 << 64) | PT_DST | (2 << 76);
+        rejects(Fragment, encode(Opcode::Ipa, Form::UregIndexed, indexed));
         rejects(Fragment, ipa(32, 2 << 78));
         rejects(Fragment, ipa(32, 3 << 78));
         rejects(Fragment, Instruction(ipa(32, 0).0 ^ PT_DST));
@@ -1000,6 +1083,31 @@ mod tests {
         let ir = compile("ampere_fragment", &env);
         assert!(ir.contains("SetFragColor"), "{ir}");
         assert!(!ir.contains("FPMul"), "{ir}");
+    }
+
+    #[test]
+    fn fragment_program_interpolates_at_an_offset() {
+        let code = [
+            ipa_to(4, 34, 0),
+            ipa_at_offset_to(0, 32, 0),
+            ipa_at_offset_to(1, 33, 0),
+            ipa_to(2, 34, 0),
+            ipa_at_offset_to(3, 31, 0),
+            exit(),
+        ];
+        let env = whole_program(
+            Fragment,
+            &code,
+            &[
+                (0, 2 | (3 << 5) | (5 << 10)),
+                (5, 0x80 << 24),
+                (6, 0x2a),
+                (18, 0xf),
+            ],
+        );
+        let ir = compile("ampere_fragment_offset", &env);
+        assert_eq!(ir.matches("InterpolateAtOffset").count(), 2, "{ir}");
+        assert!(ir.contains("DPdxFine"), "{ir}");
     }
 
     #[test]
