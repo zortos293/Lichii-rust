@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use lichii_common::VAddr;
 use portable_atomic::AtomicU128;
 
-use crate::{AddressSpace, MemoryFault};
+use crate::{AddressSpace, MemoryFault, MemoryPermission};
 
 /// One core's reservation, laid out so translated code can take and check it inline, on its own
 /// cache line so cores never share one.
@@ -57,12 +57,12 @@ impl ExclusiveMonitor {
         size: u8,
     ) -> Result<u128, MemoryFault> {
         let value = match size {
-            1 => mem.read::<u8>(addr)? as u128,
-            2 => mem.read::<u16>(addr)? as u128,
-            4 => mem.read::<u32>(addr)? as u128,
-            8 => mem.read::<u64>(addr)? as u128,
+            1 => mem.guest_read::<u8>(addr)? as u128,
+            2 => mem.guest_read::<u16>(addr)? as u128,
+            4 => mem.guest_read::<u32>(addr)? as u128,
+            8 => mem.guest_read::<u64>(addr)? as u128,
             16 => {
-                let (ptr, _) = mem.translate(addr).ok_or(MemoryFault::unmapped(addr))?;
+                let ptr = mem.access(addr, MemoryPermission::READ)?;
                 // SAFETY: exclusive pairs are 16-byte aligned, so the value is aligned and lies in
                 // one mapped page.
                 unsafe { AtomicU128::from_ptr(ptr.cast()) }.load(Ordering::SeqCst)
@@ -92,7 +92,7 @@ impl ExclusiveMonitor {
         {
             return Ok(false);
         }
-        let (ptr, _) = mem.translate(addr).ok_or(MemoryFault::unmapped(addr))?;
+        let ptr = mem.access(addr, MemoryPermission::WRITE)?;
         let expected = u128::from(slot.value_lo.load(Ordering::Relaxed))
             | u128::from(slot.value_hi.load(Ordering::Relaxed)) << 64;
         // SAFETY: exclusive accesses are naturally aligned, so ptr is aligned for the atomic type

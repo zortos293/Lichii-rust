@@ -18,7 +18,7 @@ use std::sync::atomic::AtomicBool;
 
 use lichii_common::settings::CpuAccuracy;
 use lichii_common::{PAGE_MASK, VAddr};
-use lichii_memory::{AddressSpace, ExclusiveMonitor, ReservationSlot};
+use lichii_memory::{AddressSpace, ExclusiveMonitor, MemoryPermission, ReservationSlot};
 
 use self::cache::{Code, Entry, JitCache};
 use self::ir::{Block, Terminal};
@@ -74,11 +74,11 @@ extern "sysv64" fn read_slow(state: &mut JitState, addr: u64, pc: u64, size: u32
     // SAFETY: called from a slow path.
     let memory = unsafe { state.memory() };
     let value = match size {
-        0 => memory.read::<u8>(addr).map(u128::from),
-        1 => memory.read::<u16>(addr).map(u128::from),
-        2 => memory.read::<u32>(addr).map(u128::from),
-        3 => memory.read::<u64>(addr).map(u128::from),
-        _ => memory.read::<u128>(addr),
+        0 => memory.guest_read::<u8>(addr).map(u128::from),
+        1 => memory.guest_read::<u16>(addr).map(u128::from),
+        2 => memory.guest_read::<u32>(addr).map(u128::from),
+        3 => memory.guest_read::<u64>(addr).map(u128::from),
+        _ => memory.guest_read::<u128>(addr),
     };
     match value {
         Ok(value) => {
@@ -118,7 +118,7 @@ extern "sysv64" fn atomic_slow(state: &mut JitState, addr: u64, pc: u64, info: u
         return true;
     }
     // SAFETY: called from a slow path.
-    let Some((ptr, _)) = unsafe { state.memory() }.translate(addr) else {
+    let Ok(ptr) = unsafe { state.memory() }.access(addr, MemoryPermission::READ_WRITE) else {
         state.fault = Some(CpuFault::Data {
             pc,
             addr,
@@ -191,7 +191,7 @@ extern "sysv64" fn exclusive_slow(state: &mut JitState, addr: u64, pc: u64, info
 extern "sysv64" fn zero_slow(state: &mut JitState, addr: u64, pc: u64, _info: u32) -> bool {
     // SAFETY: called from a slow path.
     let memory = unsafe { state.memory() };
-    match memory.fill(addr, 64, 0) {
+    match memory.guest_fill(addr, 64, 0) {
         Ok(()) => false,
         Err(f) => {
             state.fault = Some(CpuFault::Data {
@@ -214,11 +214,11 @@ extern "sysv64" fn write_slow(state: &mut JitState, addr: u64, pc: u64, size: u3
     let memory = unsafe { state.memory() };
     let value = state.scratch;
     let result = match size {
-        0 => memory.write(addr, value as u8),
-        1 => memory.write(addr, value as u16),
-        2 => memory.write(addr, value as u32),
-        3 => memory.write(addr, value as u64),
-        _ => memory.write(addr, value),
+        0 => memory.guest_write(addr, value as u8),
+        1 => memory.guest_write(addr, value as u16),
+        2 => memory.guest_write(addr, value as u32),
+        3 => memory.guest_write(addr, value as u64),
+        _ => memory.guest_write(addr, value),
     };
     match result {
         Ok(()) => false,
