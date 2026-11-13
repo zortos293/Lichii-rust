@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread::{JoinHandle, ThreadId};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lichii_common::DAddr;
 use parking_lot::{Condvar, Mutex};
@@ -355,6 +355,10 @@ impl Front {
     }
 }
 
+/// How long [`Gpu::shutdown`] waits for the GPU threads, which a renderer call that never
+/// returns can hold forever.
+const STOP_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// The emulated GPU. Every method may be called from any thread and none waits for GPU work
 /// unless it says so; work is executed in the order it was queued.
 pub struct Gpu {
@@ -408,6 +412,7 @@ impl Gpu {
         let inbox = Arc::new(Inbox::new());
         handles.syncpoints.semaphore_waiters().attach(&inbox);
         let (producer, consumer) = ring::ring(config.ring_slots, MIN_RING_SLOTS);
+        let back_progress = producer.progress();
         let (side_sender, side_receiver) = mpsc::channel();
         let fetch_syncs = Arc::new(FetchSyncs::new(inbox.clone()));
         let activity = Arc::new(Activity::new());
@@ -455,7 +460,7 @@ impl Gpu {
             .name("gpu-activity".into())
             .spawn({
                 let activity = activity.clone();
-                move || activity.report_until_stopped(threaded)
+                move || activity.report_until_stopped(threaded, &*back_progress)
             })
             .expect("failed to start the GPU activity thread");
         Self {
@@ -660,7 +665,18 @@ impl Gpu {
             tracing::error!("GPU shutdown from a GPU thread; not joining it");
             return;
         }
+        let deadline = Instant::now() + STOP_TIMEOUT;
         for thread in self.threads.lock().drain(..) {
+            while !thread.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if !thread.is_finished() {
+                tracing::error!(
+                    thread = thread.thread().name(),
+                    "a GPU thread did not stop within {STOP_TIMEOUT:?}; leaving it"
+                );
+                continue;
+            }
             if thread.join().is_err() {
                 tracing::error!("a GPU thread panicked");
             }
