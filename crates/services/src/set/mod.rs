@@ -1,7 +1,10 @@
-//! `set`, `set:sys`, `set:cal` and `set:fd`: language, region and system settings. Values live in
-//! memory for the session of the emulator and start from [`lichii_common::settings::Settings`].
+//! `set`, `set:sys`, `set:cal` and `set:fd`: language, region and system settings. Language and
+//! region start from [`lichii_common::settings::Settings`] on every boot; what `set:sys` changes is
+//! saved in the NAND, in the C++ settings files ([`save`]), and read back when the services
+//! register.
 
 mod key_code_map;
+mod save;
 mod system;
 
 use std::sync::Arc;
@@ -141,14 +144,18 @@ pub(crate) fn register(context: &Arc<ServiceContext>) -> HleResult<()> {
     let language = system.language as usize;
     let mut device_nickname = [0; 0x80];
     device_nickname[..6].copy_from_slice(b"Lichii");
-    let shared = Arc::new(Mutex::new(Shared {
+    let mut shared = Shared {
         language_code: LANGUAGES[language].0,
         region_code: region_code(system.region),
         quest_flag: 0,
         device_nickname,
-    }));
-    let keyboard_layout = LANGUAGES[language].1;
-    let state = Arc::new(Mutex::new(system::State::new(keyboard_layout)));
+    };
+    let mut state = system::State::new(LANGUAGES[language].1);
+    let files = save::SettingsFiles::open(crate::fs::nand_dir(&context.settings));
+    system::load(&files, &mut state, &mut shared);
+    let shared = Arc::new(Mutex::new(shared));
+    let state = Arc::new(Mutex::new(state));
+    let files = Arc::new(Mutex::new(files));
 
     let set = shared.clone();
     context.register("set", "set", move |_| Settings {
@@ -158,6 +165,7 @@ pub(crate) fn register(context: &Arc<ServiceContext>) -> HleResult<()> {
         region: context.settings.system.region,
         shared: shared.clone(),
         state: state.clone(),
+        files: files.clone(),
     })?;
     for name in ["set:cal", "set:fd"] {
         context.register(name, "set", move |_| Unimplemented { name })?;

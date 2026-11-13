@@ -1,14 +1,21 @@
+use std::path::PathBuf;
+
 use lichii_common::settings::{Language, Region};
 
 use super::{INVALID_LANGUAGE, KEY_CODE_MAP_SIZE, NULL_POINTER, key_code_map};
 use lichii_common::ResultCode;
-use lichii_common::settings::Settings;
 use lichii_kernel::testing::{IpcClient, Request};
 
-use crate::testing::{ReplyExt, SWITCH2_TITLE, booted, read_value};
+use crate::testing::{ReplyExt, SWITCH2_TITLE, TempDir, booted, read_value};
 
-fn boot(language: Language, region: Region) -> IpcClient {
-    let mut settings = Settings::default();
+/// The settings services on a NAND of their own, which lives as long as the returned directory.
+fn boot(language: Language, region: Region) -> (IpcClient, TempDir) {
+    let dir = TempDir::new("set");
+    (boot_in(&dir, language, region), dir)
+}
+
+fn boot_in(dir: &TempDir, language: Language, region: Region) -> IpcClient {
+    let mut settings = dir.settings();
     settings.system.language = language;
     settings.system.region = region;
     booted(SWITCH2_TITLE, settings, super::register)
@@ -28,7 +35,7 @@ fn name(text: &str) -> Vec<u8> {
 
 #[test]
 fn language_and_region_follow_the_settings() {
-    let client = boot(Language::BritishEnglish, Region::Europe);
+    let (client, _dir) = boot(Language::BritishEnglish, Region::Europe);
     let set = client.connect("set").unwrap();
     assert_eq!(
         client
@@ -93,7 +100,7 @@ fn language_and_region_follow_the_settings() {
 
 #[test]
 fn korea_and_taiwan_share_a_region_code() {
-    let client = boot(Language::Korean, Region::Korea);
+    let (client, _dir) = boot(Language::Korean, Region::Korea);
     let set = client.connect("set").unwrap();
     assert_eq!(
         client
@@ -107,7 +114,7 @@ fn korea_and_taiwan_share_a_region_code() {
 
 #[test]
 fn available_language_codes_fit_the_buffer() {
-    let client = boot(Language::AmericanEnglish, Region::Usa);
+    let (client, _dir) = boot(Language::AmericanEnglish, Region::Usa);
     let set = client.connect("set").unwrap();
     let buffer = client.alloc(&vec![0; 0x40 * 8]);
     let reply = client
@@ -135,7 +142,7 @@ fn available_language_codes_fit_the_buffer() {
 
 #[test]
 fn key_code_maps_follow_the_language() {
-    let client = boot(Language::German, Region::Europe);
+    let (client, _dir) = boot(Language::German, Region::Europe);
     let set = client.connect("set").unwrap();
     let buffer = client.alloc(&vec![0; KEY_CODE_MAP_SIZE]);
     for command in [7, 9, 12] {
@@ -166,7 +173,7 @@ fn key_code_maps_follow_the_language() {
 
 #[test]
 fn system_settings_update_what_set_reads() {
-    let client = boot(Language::AmericanEnglish, Region::Usa);
+    let (client, _dir) = boot(Language::AmericanEnglish, Region::Usa);
     let set = client.connect("set").unwrap();
     let sys = client.connect("set:sys").unwrap();
     let nickname = client.alloc(&[0; 0x80]);
@@ -228,7 +235,7 @@ fn system_settings_update_what_set_reads() {
 
 #[test]
 fn firmware_version_is_23_0_0() {
-    let client = boot(Language::AmericanEnglish, Region::Usa);
+    let (client, _dir) = boot(Language::AmericanEnglish, Region::Usa);
     let sys = client.connect("set:sys").unwrap();
     let buffer = client.alloc(&vec![0; 0x100]);
     for command in [3, 4] {
@@ -246,7 +253,7 @@ fn firmware_version_is_23_0_0() {
 
 #[test]
 fn settings_items_return_their_values() {
-    let client = boot(Language::AmericanEnglish, Region::Usa);
+    let (client, _dir) = boot(Language::AmericanEnglish, Region::Usa);
     let sys = client.connect("set:sys").unwrap();
     let category = client.alloc(&name("hbloader"));
     let item = client.alloc(&name("applet_heap_reservation_size"));
@@ -285,7 +292,7 @@ fn settings_items_return_their_values() {
 
 #[test]
 fn system_values_have_sysmodule_defaults_and_round_trip() {
-    let client = boot(Language::Japanese, Region::Japan);
+    let (client, _dir) = boot(Language::Japanese, Region::Japan);
     let sys = client.connect("set:sys").unwrap();
     let get = |command| client.send(sys, &Request::new(command)).unwrap().ok();
     assert_eq!(get(29).get::<[u32; 6]>(0), [0x300, 2, 9, 0, 21, 0]);
@@ -367,7 +374,7 @@ fn system_values_have_sysmodule_defaults_and_round_trip() {
 
 #[test]
 fn serial_numbers_carry_the_region_and_a_check_digit() {
-    let client = boot(Language::AmericanEnglish, Region::Usa);
+    let (client, _dir) = boot(Language::AmericanEnglish, Region::Usa);
     let sys = client.connect("set:sys").unwrap();
     let serial = client
         .send(sys, &Request::new(68))
@@ -387,7 +394,7 @@ fn serial_numbers_carry_the_region_and_a_check_digit() {
 
 #[test]
 fn eula_versions_round_trip() {
-    let client = boot(Language::AmericanEnglish, Region::Usa);
+    let (client, _dir) = boot(Language::AmericanEnglish, Region::Usa);
     let sys = client.connect("set:sys").unwrap();
     let entries: Vec<u8> = (0..0x60).map(|i| i as u8).collect();
     let input = client.alloc(&entries);
@@ -420,4 +427,142 @@ fn eula_versions_round_trip() {
         1
     );
     assert_eq!(client.read(out, 0x18), [7; 0x18]);
+}
+
+fn settings_file(dir: &TempDir, save: &str) -> PathBuf {
+    dir.settings()
+        .paths
+        .nand_dir
+        .unwrap()
+        .join("system/save")
+        .join(save)
+        .join("settings.dat")
+}
+
+fn location(name: &str) -> [u8; 0x24] {
+    let mut location = [0; 0x24];
+    location[..name.len()].copy_from_slice(name.as_bytes());
+    location
+}
+
+#[test]
+fn system_values_survive_a_reboot() {
+    let dir = TempDir::new("set");
+    let launch: [u32; 8] = [0x10001, 0, 5, 6, 7, 8, 9, 10];
+    {
+        let client = boot_in(&dir, Language::AmericanEnglish, Region::Usa);
+        let sys = client.connect("set:sys").unwrap();
+        for request in [
+            Request::new(8).arg(1u8),
+            Request::new(14).arg([5u8; 16]),
+            Request::new(24).arg(1u32),
+            Request::new(44).arg(3u32).arg(2u32),
+            Request::new(48).arg(1u8),
+            Request::new(54).arg(location("Europe/Amsterdam")),
+            Request::new(76).arg(launch),
+            Request::new(105).arg(-7i64),
+        ] {
+            client.send(sys, &request).unwrap().ok();
+        }
+        let name = client.alloc(b"Switch\0");
+        client
+            .send(sys, &Request::new(78).buffer_a(name, 7))
+            .unwrap()
+            .ok();
+        let eula = client.alloc(&[3; 0x30]);
+        client
+            .send(sys, &Request::new(22).buffer_a(eula, 0x30))
+            .unwrap()
+            .ok();
+    }
+
+    let system = std::fs::read(settings_file(&dir, "8000000000000050")).unwrap();
+    assert_eq!(system.len(), 0x10 + 0x336a0);
+    assert_eq!(&system[..12], b"yuzu_set\x04\0\0\0");
+    assert_eq!(system[0x10..0x18], [0, 0, 0x14, 0, 7, 0, 0, 0]);
+    assert_eq!(system[0x10 + 0x29470], 1);
+    assert_eq!(system[0x10 + 0x2a950..][..7], *b"Switch\0");
+    let private = std::fs::read(settings_file(&dir, "8000000000000052")).unwrap();
+    assert_eq!(private.len(), 0x10 + 0xd8);
+    assert_eq!(private[0x10 + 0x50..][..16], [5; 16]);
+
+    let client = boot_in(&dir, Language::AmericanEnglish, Region::Usa);
+    let sys = client.connect("set:sys").unwrap();
+    let get = |command: u32| client.send(sys, &Request::new(command)).unwrap().ok();
+    assert_eq!(get(7).get::<u8>(0), 1);
+    assert_eq!(get(13).get::<[u8; 16]>(0), [5; 16]);
+    assert_eq!(get(23).get::<u32>(0), 1);
+    assert_eq!(get(47).get::<u8>(0), 1);
+    assert_eq!(get(53).get::<[u8; 0x24]>(0), location("Europe/Amsterdam"));
+    assert_eq!(get(75).get::<[u32; 8]>(0), launch);
+    assert_eq!(get(106).get::<i64>(0), -7);
+    let mode = client
+        .send(sys, &Request::new(43).arg(3u32))
+        .unwrap()
+        .ok()
+        .get::<u32>(0);
+    assert_eq!(mode, 2);
+    let out = client.alloc(&[0; 0x80]);
+    client
+        .send(sys, &Request::new(77).buffer_b(out, 0x80))
+        .unwrap()
+        .ok();
+    assert_eq!(&client.read(out, 7), b"Switch\0");
+    let count = client
+        .send(sys, &Request::new(21).buffer_b(out, 0x60))
+        .unwrap()
+        .ok()
+        .get::<i32>(0);
+    assert_eq!((count, client.read(out, 0x30)), (1, vec![3; 0x30]));
+    let set = client.connect("set").unwrap();
+    assert_eq!(
+        client
+            .send(set, &Request::new(8))
+            .unwrap()
+            .ok()
+            .get::<u8>(0),
+        1
+    );
+}
+
+#[test]
+fn settings_files_in_the_cpp_layout_are_read_and_kept() {
+    let dir = TempDir::new("set");
+    let mut system = b"yuzu_set\x04\0\0\0".to_vec();
+    system.resize(0x10 + 0x336a0, 0);
+    let mut put = |offset: usize, bytes: &[u8]| {
+        system[0x10 + offset..][..bytes.len()].copy_from_slice(bytes);
+    };
+    put(0x99b0, &8u32.to_le_bytes());
+    put(0x29478, &1u32.to_le_bytes());
+    put(0x29a40, &0.25f32.to_le_bytes());
+    put(0x2a140, &99i32.to_le_bytes());
+    put(0x100, b"not served");
+    let path = settings_file(&dir, "8000000000000050");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &system).unwrap();
+    let private = settings_file(&dir, "8000000000000052");
+    std::fs::create_dir_all(private.parent().unwrap()).unwrap();
+    std::fs::write(&private, [0xff; 0x40]).unwrap();
+
+    let client = boot_in(&dir, Language::AmericanEnglish, Region::Usa);
+    let sys = client.connect("set:sys").unwrap();
+    let get = |command: u32| client.send(sys, &Request::new(command)).unwrap().ok();
+    assert_eq!(get(136).get::<u32>(0), 8);
+    assert_eq!(get(23).get::<u32>(0), 1);
+    assert_eq!(get(35).get::<f32>(0), 0.25);
+    assert_eq!(get(13).get::<[u8; 16]>(0), [0; 16]);
+    let out = client.alloc(&[0; 0x30 * 40]);
+    let count = client
+        .send(sys, &Request::new(21).buffer_b(out, 0x30 * 40))
+        .unwrap()
+        .ok()
+        .get::<i32>(0);
+    assert_eq!(count, 32);
+
+    client.send(sys, &Request::new(8).arg(1u8)).unwrap().ok();
+    let saved = std::fs::read(&path).unwrap();
+    assert_eq!(&saved[0x10 + 0x100..][..10], b"not served");
+    assert_eq!(saved[0x10 + 0x29470], 1);
+    assert_eq!(std::fs::read(&private).unwrap().len(), 0x10 + 0xd8);
 }
