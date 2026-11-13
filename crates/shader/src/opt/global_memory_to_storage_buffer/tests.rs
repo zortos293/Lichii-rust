@@ -274,6 +274,29 @@ fn atomics_keep_their_operands_and_results() {
 }
 
 #[test]
+fn wide_compare_exchange_keeps_compare_before_value() {
+    let mut b = Builder::new();
+    let address = b.pair_address(0, 0x180, 8);
+    let swap = b
+        .inst(
+            Opcode::GlobalAtomicCompareExchange64,
+            &[address, Value::U64(2), Value::U64(3)],
+        )
+        .inst()
+        .unwrap();
+    b.use_value(Value::Inst(swap));
+    let info = b.run(&Env::default(), &profile()).unwrap();
+
+    assert!(info.storage_buffers_descriptors[0].is_written);
+    let swap = forwarded(&b.prog, swap);
+    assert_eq!(b.prog.op(swap), Opcode::StorageAtomicCompareExchange64);
+    assert_eq!(
+        &b.prog.inst(swap).args()[2..],
+        &[Value::U64(2), Value::U64(3)]
+    );
+}
+
+#[test]
 fn single_addend_word_is_the_base_without_a_high_pair() {
     let mut b = Builder::new();
     let pointer = b.cbuf(2, 0x18);

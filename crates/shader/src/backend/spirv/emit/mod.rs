@@ -389,6 +389,9 @@ pub(super) fn emit_inst(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<(
         Opcode::SharedAtomicCompareExchange32 => {
             atomic::shared_atomic_compare_exchange32(ctx, inst)?
         }
+        Opcode::SharedAtomicCompareExchange64 => {
+            atomic::shared_atomic_compare_exchange64(ctx, inst)?
+        }
         Opcode::GlobalAtomicIAdd32 => atomic::global_atomic_i_add32(ctx, inst)?,
         Opcode::GlobalAtomicSMin32 => atomic::global_atomic_s_min32(ctx, inst)?,
         Opcode::GlobalAtomicUMin32 => atomic::global_atomic_u_min32(ctx, inst)?,
@@ -412,6 +415,9 @@ pub(super) fn emit_inst(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<(
         Opcode::GlobalAtomicOr64 => atomic::global_atomic_or64(ctx, inst)?,
         Opcode::GlobalAtomicXor64 => atomic::global_atomic_xor64(ctx, inst)?,
         Opcode::GlobalAtomicExchange64 => atomic::global_atomic_exchange64(ctx, inst)?,
+        Opcode::GlobalAtomicCompareExchange64 => {
+            atomic::global_atomic_compare_exchange64(ctx, inst)?
+        }
         Opcode::GlobalAtomicIAdd32x2 => atomic::global_atomic_i_add32x2(ctx, inst)?,
         Opcode::GlobalAtomicSMin32x2 => atomic::global_atomic_s_min32x2(ctx, inst)?,
         Opcode::GlobalAtomicUMin32x2 => atomic::global_atomic_u_min32x2(ctx, inst)?,
@@ -451,6 +457,9 @@ pub(super) fn emit_inst(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<(
         Opcode::StorageAtomicOr64 => atomic::storage_atomic_or64(ctx, inst)?,
         Opcode::StorageAtomicXor64 => atomic::storage_atomic_xor64(ctx, inst)?,
         Opcode::StorageAtomicExchange64 => atomic::storage_atomic_exchange64(ctx, inst)?,
+        Opcode::StorageAtomicCompareExchange64 => {
+            atomic::storage_atomic_compare_exchange64(ctx, inst)?
+        }
         Opcode::StorageAtomicIAdd32x2 => atomic::storage_atomic_i_add32x2(ctx, inst)?,
         Opcode::StorageAtomicSMin32x2 => atomic::storage_atomic_s_min32x2(ctx, inst)?,
         Opcode::StorageAtomicUMin32x2 => atomic::storage_atomic_u_min32x2(ctx, inst)?,
@@ -680,5 +689,6 @@ fn is_shared_memory_access(op: Opcode) -> bool {
             | SharedAtomicExchange64
             | SharedAtomicExchange32x2
             | SharedAtomicCompareExchange32
+            | SharedAtomicCompareExchange64
     )
 }

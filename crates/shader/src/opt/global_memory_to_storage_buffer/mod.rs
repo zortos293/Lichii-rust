@@ -389,7 +389,10 @@ fn replace(prog: &mut Program, inst: InstId, binding: Value, offset: Value) {
         prog.invalidate(inst);
         return;
     }
-    let atomic = if op == Opcode::GlobalAtomicCompareExchange32 {
+    let atomic = if matches!(
+        op,
+        Opcode::GlobalAtomicCompareExchange32 | Opcode::GlobalAtomicCompareExchange64
+    ) {
         let comparator = prog.arg(inst, 2);
         prog.insert_before(inst, storage_op, &[binding, offset, data, comparator], 0)
     } else {
@@ -531,6 +534,7 @@ fn is_global_atomic(op: Opcode) -> bool {
             | GlobalAtomicOr64
             | GlobalAtomicXor64
             | GlobalAtomicExchange64
+            | GlobalAtomicCompareExchange64
             | GlobalAtomicIAdd32x2
             | GlobalAtomicSMin32x2
             | GlobalAtomicUMin32x2
@@ -606,6 +610,7 @@ fn is_storage_access(op: Opcode) -> bool {
             | StorageAtomicOr64
             | StorageAtomicXor64
             | StorageAtomicExchange64
+            | StorageAtomicCompareExchange64
             | StorageAtomicIAdd32x2
             | StorageAtomicSMin32x2
             | StorageAtomicUMin32x2
@@ -663,6 +668,7 @@ fn global_to_storage(op: Opcode) -> Opcode {
         GlobalAtomicOr64 => StorageAtomicOr64,
         GlobalAtomicXor64 => StorageAtomicXor64,
         GlobalAtomicExchange64 => StorageAtomicExchange64,
+        GlobalAtomicCompareExchange64 => StorageAtomicCompareExchange64,
         GlobalAtomicIAdd32x2 => StorageAtomicIAdd32x2,
         GlobalAtomicSMin32x2 => StorageAtomicSMin32x2,
         GlobalAtomicUMin32x2 => StorageAtomicUMin32x2,
@@ -699,6 +705,7 @@ fn store_size(op: Opcode) -> u32 {
         | GlobalAtomicOr64
         | GlobalAtomicXor64
         | GlobalAtomicExchange64
+        | GlobalAtomicCompareExchange64
         | GlobalAtomicIAdd32x2
         | GlobalAtomicSMin32x2
         | GlobalAtomicUMin32x2

@@ -340,6 +340,7 @@ pub enum Opcode {
     SharedAtomicExchange64,
     SharedAtomicExchange32x2,
     SharedAtomicCompareExchange32,
+    SharedAtomicCompareExchange64,
     GlobalAtomicIAdd32,
     GlobalAtomicSMin32,
     GlobalAtomicUMin32,
@@ -361,6 +362,7 @@ pub enum Opcode {
     GlobalAtomicOr64,
     GlobalAtomicXor64,
     GlobalAtomicExchange64,
+    GlobalAtomicCompareExchange64,
     GlobalAtomicIAdd32x2,
     GlobalAtomicSMin32x2,
     GlobalAtomicUMin32x2,
@@ -398,6 +400,7 @@ pub enum Opcode {
     StorageAtomicOr64,
     StorageAtomicXor64,
     StorageAtomicExchange64,
+    StorageAtomicCompareExchange64,
     StorageAtomicIAdd32x2,
     StorageAtomicSMin32x2,
     StorageAtomicUMin32x2,
@@ -897,6 +900,7 @@ impl Opcode {
             Opcode::SharedAtomicExchange64 => Type::U64,
             Opcode::SharedAtomicExchange32x2 => Type::U32X2,
             Opcode::SharedAtomicCompareExchange32 => Type::U32,
+            Opcode::SharedAtomicCompareExchange64 => Type::U64,
             Opcode::GlobalAtomicIAdd32 => Type::U32,
             Opcode::GlobalAtomicSMin32 => Type::U32,
             Opcode::GlobalAtomicUMin32 => Type::U32,
@@ -918,6 +922,7 @@ impl Opcode {
             Opcode::GlobalAtomicOr64 => Type::U64,
             Opcode::GlobalAtomicXor64 => Type::U64,
             Opcode::GlobalAtomicExchange64 => Type::U64,
+            Opcode::GlobalAtomicCompareExchange64 => Type::U64,
             Opcode::GlobalAtomicIAdd32x2 => Type::U32X2,
             Opcode::GlobalAtomicSMin32x2 => Type::U32X2,
             Opcode::GlobalAtomicUMin32x2 => Type::U32X2,
@@ -955,6 +960,7 @@ impl Opcode {
             Opcode::StorageAtomicOr64 => Type::U64,
             Opcode::StorageAtomicXor64 => Type::U64,
             Opcode::StorageAtomicExchange64 => Type::U64,
+            Opcode::StorageAtomicCompareExchange64 => Type::U64,
             Opcode::StorageAtomicIAdd32x2 => Type::U32X2,
             Opcode::StorageAtomicSMin32x2 => Type::U32X2,
             Opcode::StorageAtomicUMin32x2 => Type::U32X2,
@@ -1448,6 +1454,7 @@ impl Opcode {
             Opcode::SharedAtomicExchange64 => &[Type::U32, Type::U64],
             Opcode::SharedAtomicExchange32x2 => &[Type::U32, Type::U32X2],
             Opcode::SharedAtomicCompareExchange32 => &[Type::U32, Type::U32, Type::U32],
+            Opcode::SharedAtomicCompareExchange64 => &[Type::U32, Type::U64, Type::U64],
             Opcode::GlobalAtomicIAdd32 => &[Type::U64, Type::U32],
             Opcode::GlobalAtomicSMin32 => &[Type::U64, Type::U32],
             Opcode::GlobalAtomicUMin32 => &[Type::U64, Type::U32],
@@ -1469,6 +1476,7 @@ impl Opcode {
             Opcode::GlobalAtomicOr64 => &[Type::U64, Type::U64],
             Opcode::GlobalAtomicXor64 => &[Type::U64, Type::U64],
             Opcode::GlobalAtomicExchange64 => &[Type::U64, Type::U64],
+            Opcode::GlobalAtomicCompareExchange64 => &[Type::U64, Type::U64, Type::U64],
             Opcode::GlobalAtomicIAdd32x2 => &[Type::U32X2, Type::U32X2],
             Opcode::GlobalAtomicSMin32x2 => &[Type::U32X2, Type::U32X2],
             Opcode::GlobalAtomicUMin32x2 => &[Type::U32X2, Type::U32X2],
@@ -1506,6 +1514,7 @@ impl Opcode {
             Opcode::StorageAtomicOr64 => &[Type::U32, Type::U32, Type::U64],
             Opcode::StorageAtomicXor64 => &[Type::U32, Type::U32, Type::U64],
             Opcode::StorageAtomicExchange64 => &[Type::U32, Type::U32, Type::U64],
+            Opcode::StorageAtomicCompareExchange64 => &[Type::U32, Type::U32, Type::U64, Type::U64],
             Opcode::StorageAtomicIAdd32x2 => &[Type::U32, Type::U32, Type::U32X2],
             Opcode::StorageAtomicSMin32x2 => &[Type::U32, Type::U32, Type::U32X2],
             Opcode::StorageAtomicUMin32x2 => &[Type::U32, Type::U32, Type::U32X2],
@@ -1857,6 +1866,7 @@ impl Opcode {
                 | SharedAtomicExchange64
                 | SharedAtomicExchange32x2
                 | SharedAtomicCompareExchange32
+                | SharedAtomicCompareExchange64
                 | GlobalAtomicIAdd32
                 | GlobalAtomicSMin32
                 | GlobalAtomicUMin32
@@ -1878,6 +1888,7 @@ impl Opcode {
                 | GlobalAtomicOr64
                 | GlobalAtomicXor64
                 | GlobalAtomicExchange64
+                | GlobalAtomicCompareExchange64
                 | GlobalAtomicIAdd32x2
                 | GlobalAtomicSMin32x2
                 | GlobalAtomicUMin32x2
@@ -1915,6 +1926,7 @@ impl Opcode {
                 | StorageAtomicOr64
                 | StorageAtomicXor64
                 | StorageAtomicExchange64
+                | StorageAtomicCompareExchange64
                 | StorageAtomicIAdd32x2
                 | StorageAtomicSMin32x2
                 | StorageAtomicUMin32x2
@@ -2300,6 +2312,7 @@ const OPCODE_NAMES: &[&str] = &[
     "SharedAtomicExchange64",
     "SharedAtomicExchange32x2",
     "SharedAtomicCompareExchange32",
+    "SharedAtomicCompareExchange64",
     "GlobalAtomicIAdd32",
     "GlobalAtomicSMin32",
     "GlobalAtomicUMin32",
@@ -2321,6 +2334,7 @@ const OPCODE_NAMES: &[&str] = &[
     "GlobalAtomicOr64",
     "GlobalAtomicXor64",
     "GlobalAtomicExchange64",
+    "GlobalAtomicCompareExchange64",
     "GlobalAtomicIAdd32x2",
     "GlobalAtomicSMin32x2",
     "GlobalAtomicUMin32x2",
@@ -2358,6 +2372,7 @@ const OPCODE_NAMES: &[&str] = &[
     "StorageAtomicOr64",
     "StorageAtomicXor64",
     "StorageAtomicExchange64",
+    "StorageAtomicCompareExchange64",
     "StorageAtomicIAdd32x2",
     "StorageAtomicSMin32x2",
     "StorageAtomicUMin32x2",

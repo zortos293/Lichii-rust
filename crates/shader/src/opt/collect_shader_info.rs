@@ -393,6 +393,7 @@ fn visit_usages(info: &mut ShaderInfo, prog: &Program, id: InstId) {
             | ConvertF32U64
             | ConvertF64U64
             | SharedAtomicExchange64
+            | SharedAtomicCompareExchange64
             | GlobalAtomicIAdd64
             | GlobalAtomicSMin64
             | GlobalAtomicUMin64
@@ -402,6 +403,7 @@ fn visit_usages(info: &mut ShaderInfo, prog: &Program, id: InstId) {
             | GlobalAtomicOr64
             | GlobalAtomicXor64
             | GlobalAtomicExchange64
+            | GlobalAtomicCompareExchange64
             | StorageAtomicIAdd64
             | StorageAtomicSMin64
             | StorageAtomicUMin64
@@ -411,6 +413,7 @@ fn visit_usages(info: &mut ShaderInfo, prog: &Program, id: InstId) {
             | StorageAtomicOr64
             | StorageAtomicXor64
             | StorageAtomicExchange64
+            | StorageAtomicCompareExchange64
     ) {
         info.uses_int64 = true;
     }
@@ -445,6 +448,7 @@ fn visit_usages(info: &mut ShaderInfo, prog: &Program, id: InstId) {
             | GlobalAtomicOr64
             | GlobalAtomicXor64
             | GlobalAtomicExchange64
+            | GlobalAtomicCompareExchange64
             | GlobalAtomicIAdd32x2
             | GlobalAtomicSMin32x2
             | GlobalAtomicUMin32x2
@@ -625,7 +629,9 @@ fn visit_usages(info: &mut ShaderInfo, prog: &Program, id: InstId) {
         SharedAtomicSMax32 => info.uses_atomic_s32_max = true,
         SharedAtomicInc32 => info.uses_shared_increment = true,
         SharedAtomicDec32 => info.uses_shared_decrement = true,
-        SharedAtomicExchange64 => info.uses_int64_bit_atomics = true,
+        SharedAtomicExchange64 | SharedAtomicCompareExchange64 => {
+            info.uses_int64_bit_atomics = true;
+        }
         GlobalAtomicInc32 | StorageAtomicInc32 => {
             info.used_storage_buffer_types |= Type::U32;
             info.uses_global_increment = true;
@@ -679,6 +685,7 @@ fn visit_usages(info: &mut ShaderInfo, prog: &Program, id: InstId) {
         | GlobalAtomicOr64
         | GlobalAtomicXor64
         | GlobalAtomicExchange64
+        | GlobalAtomicCompareExchange64
         | StorageAtomicIAdd64
         | StorageAtomicSMin64
         | StorageAtomicUMin64
@@ -686,7 +693,9 @@ fn visit_usages(info: &mut ShaderInfo, prog: &Program, id: InstId) {
         | StorageAtomicUMax64
         | StorageAtomicAnd64
         | StorageAtomicOr64
-        | StorageAtomicXor64 => {
+        | StorageAtomicXor64
+        | StorageAtomicExchange64
+        | StorageAtomicCompareExchange64 => {
             info.used_storage_buffer_types |= Type::U64 | Type::U32X2;
             info.uses_int64_bit_atomics = true;
         }
