@@ -19,7 +19,9 @@ pub fn compile(
     bindings: &mut Bindings,
 ) -> Result<ShaderModule, TranslateError> {
     crate::fallback::begin_program();
-    finish(translate(env, options)?, options, runtime, bindings)
+    let module = translate(env, options).and_then(|p| finish(p, options, runtime, bindings));
+    crate::fallback::end_program(env);
+    module
 }
 
 /// Like [`compile`] for a VertexA/VertexB pair, which becomes one VertexB module.
@@ -31,12 +33,10 @@ pub fn compile_dual_vertex(
     bindings: &mut Bindings,
 ) -> Result<ShaderModule, TranslateError> {
     crate::fallback::begin_program();
-    finish(
-        translate_dual_vertex(env_a, env_b, options)?,
-        options,
-        runtime,
-        bindings,
-    )
+    let module = translate_dual_vertex(env_a, env_b, options)
+        .and_then(|p| finish(p, options, runtime, bindings));
+    crate::fallback::end_program(env_b);
+    module
 }
 
 fn finish(

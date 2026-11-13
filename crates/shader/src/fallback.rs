@@ -73,6 +73,31 @@ pub(crate) fn begin_program() {
     }
 }
 
+/// The program `env` describes finished translating on this thread: logs the fallbacks it hit,
+/// so a census can be tied to the programs of one draw.
+pub(crate) fn end_program(env: &dyn crate::ShaderEnvironment) {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let hit = PROGRAM.with(|hit| hit.borrow().clone());
+    if hit.is_empty() {
+        return;
+    }
+    let fallbacks: Vec<String> = hit
+        .iter()
+        .map(|f| match f.value {
+            Some(value) => format!("{}/{}={value}", f.opcode, f.variant),
+            None => format!("{}/{}", f.opcode, f.variant),
+        })
+        .collect();
+    tracing::info!(
+        target: "shader_fallback",
+        stage = ?env.stage(),
+        address = format_args!("{:#x}", env.start_address()),
+        "program fallbacks {fallbacks:?}"
+    );
+}
+
 /// Translation of the current program approximates `opcode` in mode `variant`.
 pub(crate) fn note(opcode: &'static str, variant: &'static str) {
     record(opcode, variant, None);
