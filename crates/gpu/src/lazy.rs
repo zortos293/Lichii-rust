@@ -17,8 +17,9 @@ use lichii_common::DAddr;
 use lichii_memory::{DeviceAddressSpace, MemoryFault};
 use parking_lot::Mutex;
 
-/// Granularity at which a lazy range gets memory, counted from the start of its range.
+/// Granularity at which a lazy range gets memory. Lazy ranges start on a multiple of it.
 pub const LAZY_BLOCK_SIZE: u64 = 4 << 20;
+const BLOCK_BITS: u32 = LAZY_BLOCK_SIZE.trailing_zeros();
 
 /// Gives a block of a lazy range its memory; installed by the services.
 pub trait LazyBacking: Send + Sync {
@@ -40,9 +41,9 @@ pub struct LazyBlock {
 /// Every lazy range of one device address space.
 pub struct LazyDeviceRanges {
     device: Arc<DeviceAddressSpace>,
-    /// Bounds of every range added so far, for a check without the lock.
-    low: AtomicU64,
-    high: AtomicU64,
+    /// A bit per [`LAZY_BLOCK_SIZE`] of device space, set where a lazy range lies: readers check
+    /// it without the lock, which only backing changes take.
+    blocks: Box<[AtomicU64]>,
     state: Mutex<State>,
 }
 
@@ -71,10 +72,10 @@ impl Region {
 
 impl LazyDeviceRanges {
     pub fn new(device: Arc<DeviceAddressSpace>) -> Self {
+        let blocks = (1u64 << device.address_space_bits().saturating_sub(BLOCK_BITS)).div_ceil(64);
         Self {
             device,
-            low: AtomicU64::new(u64::MAX),
-            high: AtomicU64::new(0),
+            blocks: (0..blocks).map(|_| AtomicU64::new(0)).collect(),
             state: Mutex::default(),
         }
     }
@@ -84,8 +85,13 @@ impl LazyDeviceRanges {
         self.state.lock().backing = Some(backing);
     }
 
-    /// Makes `[daddr, daddr + size)`, which must have no memory mapped, a lazy range.
+    /// Makes `[daddr, daddr + size)`, which must have no memory mapped, a lazy range. `daddr` is a
+    /// multiple of [`LAZY_BLOCK_SIZE`], and nothing else lies in the rest of its last block.
     pub(crate) fn add(&self, daddr: DAddr, size: u64) {
+        assert!(
+            daddr.is_multiple_of(LAZY_BLOCK_SIZE),
+            "unaligned lazy range {daddr:#x}"
+        );
         let blocks = size.div_ceil(LAZY_BLOCK_SIZE) as usize;
         self.state.lock().regions.insert(
             daddr,
@@ -95,8 +101,19 @@ impl LazyDeviceRanges {
                 dropped: 0,
             },
         );
-        self.low.fetch_min(daddr, Ordering::AcqRel);
-        self.high.fetch_max(daddr + size, Ordering::AcqRel);
+        self.mark(daddr, size, true);
+    }
+
+    fn mark(&self, daddr: DAddr, size: u64, lazy: bool) {
+        for block in daddr >> BLOCK_BITS..(daddr + size).div_ceil(LAZY_BLOCK_SIZE) {
+            let bit = 1 << (block % 64);
+            let word = &self.blocks[(block / 64) as usize];
+            if lazy {
+                word.fetch_or(bit, Ordering::Release);
+            } else {
+                word.fetch_and(!bit, Ordering::Release);
+            }
+        }
     }
 
     /// Ends the lazy range at `daddr` and returns the blocks that got memory, which stay mapped
@@ -105,6 +122,7 @@ impl LazyDeviceRanges {
         let Some(region) = self.state.lock().regions.remove(&daddr) else {
             return Vec::new();
         };
+        self.mark(daddr, region.size, false);
         if region.dropped != 0 {
             tracing::warn!(
                 daddr = format_args!("{daddr:#x}"),
@@ -119,18 +137,17 @@ impl LazyDeviceRanges {
             .collect()
     }
 
-    /// Whether `[daddr, daddr + size)` overlaps a lazy range.
+    /// Whether `[daddr, daddr + size)` overlaps a lazy range. Takes no lock.
     pub fn is_lazy(&self, daddr: DAddr, size: u64) -> bool {
-        let end = daddr + size;
-        if end <= self.low.load(Ordering::Acquire) || daddr >= self.high.load(Ordering::Acquire) {
+        if size == 0 {
             return false;
         }
-        self.state
-            .lock()
-            .regions
-            .range(..end)
-            .next_back()
-            .is_some_and(|(&start, region)| start + region.size > daddr)
+        let (first, last) = (daddr >> BLOCK_BITS, (daddr + size - 1) >> BLOCK_BITS);
+        (first..=last).any(|block| {
+            self.blocks
+                .get((block / 64) as usize)
+                .is_some_and(|word| word.load(Ordering::Acquire) & (1 << (block % 64)) != 0)
+        })
     }
 
     /// Writes `data` to device memory at `daddr`. Blocks of lazy ranges the write touches get

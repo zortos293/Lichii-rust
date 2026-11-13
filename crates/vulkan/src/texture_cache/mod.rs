@@ -34,7 +34,7 @@ use std::sync::Arc;
 use ash::vk;
 use gpu_allocator::MemoryLocation;
 use lichii_common::settings::{AstcRecompression, ResolutionScale, VramUsage};
-use lichii_common::{DAddr, GpuVAddr};
+use lichii_common::{DAddr, GpuVAddr, PAGE_SIZE};
 use lichii_gpu::backend::{FramebufferConfig, GpuWrittenPages};
 use lichii_gpu::gmmu::{Gmmu, RangeTarget};
 use lichii_gpu::lazy::LazyDeviceRanges;
@@ -455,7 +455,7 @@ fn components(swizzle: [SwizzleSource; 4], host: vk::ComponentMapping) -> vk::Co
     }
 }
 
-/// Reads guest bytes `[offset, offset + out.len())` of an image; unmapped gaps read zero, and
+/// Reads guest bytes `[offset, offset + out.len())` of an image; unmapped pages read zero, and
 /// are only reported outside lazy device ranges, whose pages without memory are zero.
 fn read_guest(
     memory: &DeviceAddressSpace,
@@ -473,10 +473,25 @@ fn read_guest(
         }
         let chunk = &mut out[(start - offset) as usize..(stop - offset) as usize];
         let daddr = s.daddr + (start - s.offset);
-        if let Err(fault) = memory.read_bytes(daddr, chunk)
-            && !lazy.is_lazy(daddr, chunk.len() as u64)
-        {
-            tracing::warn!(?fault, "texture reads unmapped device memory");
+        if memory.read_bytes(daddr, chunk).is_ok() {
+            continue;
+        }
+        let mut unmapped = None;
+        let mut done = 0;
+        while done < chunk.len() {
+            let addr = daddr + done as u64;
+            let len = ((PAGE_SIZE - addr % PAGE_SIZE) as usize).min(chunk.len() - done);
+            let page = &mut chunk[done..done + len];
+            if memory.read_bytes(addr, page).is_err() {
+                page.fill(0);
+                if !lazy.is_lazy(addr, len as u64) {
+                    unmapped.get_or_insert(addr);
+                }
+            }
+            done += len;
+        }
+        if let Some(daddr) = unmapped {
+            tracing::warn!(daddr, "texture reads unmapped device memory");
         }
     }
 }
