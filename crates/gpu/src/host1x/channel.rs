@@ -43,6 +43,8 @@ impl VideoEngine {
 /// How long an NVDEC job takes without a decoder: half a 60 FPS frame, as the reference sleeps with
 /// decoding off, because titles stall when a decode completes in well under a millisecond.
 pub const DECODE_TIME: Duration = Duration::from_millis(8);
+/// How long closing a channel waits for its thread before saying so.
+const CLOSE_WARNING: Duration = Duration::from_secs(2);
 /// How often a host wait checks whether its channel is closing.
 const WAIT_SLICE: Duration = Duration::from_millis(50);
 
@@ -62,6 +64,7 @@ const ENGINE_EXECUTE: u32 = 0xc0;
 /// An open video engine channel. Closing or dropping it stops the channel once its current command
 /// returns.
 pub struct EngineChannel {
+    engine: VideoEngine,
     submits: Option<mpsc::Sender<Vec<u32>>>,
     closing: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -81,6 +84,7 @@ impl EngineChannel {
             })
             .expect("failed to start a host1x channel thread");
         Self {
+            engine,
             submits: Some(submits),
             closing,
             thread: Some(thread),
@@ -100,6 +104,18 @@ impl EngineChannel {
         self.closing.store(true, Ordering::Relaxed);
         self.submits = None;
         if let Some(thread) = self.thread.take() {
+            let started = std::time::Instant::now();
+            let mut warned = false;
+            while !thread.is_finished() {
+                if !warned && started.elapsed() >= CLOSE_WARNING {
+                    warned = true;
+                    tracing::warn!(
+                        engine = self.engine.name(),
+                        "host1x channel still running after close"
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
             let _ = thread.join();
         }
     }
