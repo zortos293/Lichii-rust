@@ -384,6 +384,9 @@ pub(super) fn emit_inst(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<(
         Opcode::SharedAtomicExchange32 => atomic::shared_atomic_exchange32(ctx, inst)?,
         Opcode::SharedAtomicExchange64 => atomic::shared_atomic_exchange64(ctx, inst)?,
         Opcode::SharedAtomicExchange32x2 => atomic::shared_atomic_exchange32x2(ctx, inst)?,
+        Opcode::SharedAtomicCompareExchange32 => {
+            atomic::shared_atomic_compare_exchange32(ctx, inst)?
+        }
         Opcode::GlobalAtomicIAdd32 => atomic::global_atomic_i_add32(ctx, inst)?,
         Opcode::GlobalAtomicSMin32 => atomic::global_atomic_s_min32(ctx, inst)?,
         Opcode::GlobalAtomicUMin32 => atomic::global_atomic_u_min32(ctx, inst)?,
@@ -674,5 +677,6 @@ fn is_shared_memory_access(op: Opcode) -> bool {
             | SharedAtomicExchange32
             | SharedAtomicExchange64
             | SharedAtomicExchange32x2
+            | SharedAtomicCompareExchange32
     )
 }

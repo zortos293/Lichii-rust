@@ -337,6 +337,7 @@ pub enum Opcode {
     SharedAtomicExchange32,
     SharedAtomicExchange64,
     SharedAtomicExchange32x2,
+    SharedAtomicCompareExchange32,
     GlobalAtomicIAdd32,
     GlobalAtomicSMin32,
     GlobalAtomicUMin32,
@@ -891,6 +892,7 @@ impl Opcode {
             Opcode::SharedAtomicExchange32 => Type::U32,
             Opcode::SharedAtomicExchange64 => Type::U64,
             Opcode::SharedAtomicExchange32x2 => Type::U32X2,
+            Opcode::SharedAtomicCompareExchange32 => Type::U32,
             Opcode::GlobalAtomicIAdd32 => Type::U32,
             Opcode::GlobalAtomicSMin32 => Type::U32,
             Opcode::GlobalAtomicUMin32 => Type::U32,
@@ -1439,6 +1441,7 @@ impl Opcode {
             Opcode::SharedAtomicExchange32 => &[Type::U32, Type::U32],
             Opcode::SharedAtomicExchange64 => &[Type::U32, Type::U64],
             Opcode::SharedAtomicExchange32x2 => &[Type::U32, Type::U32X2],
+            Opcode::SharedAtomicCompareExchange32 => &[Type::U32, Type::U32, Type::U32],
             Opcode::GlobalAtomicIAdd32 => &[Type::U64, Type::U32],
             Opcode::GlobalAtomicSMin32 => &[Type::U64, Type::U32],
             Opcode::GlobalAtomicUMin32 => &[Type::U64, Type::U32],
@@ -1846,6 +1849,7 @@ impl Opcode {
                 | SharedAtomicExchange32
                 | SharedAtomicExchange64
                 | SharedAtomicExchange32x2
+                | SharedAtomicCompareExchange32
                 | GlobalAtomicIAdd32
                 | GlobalAtomicSMin32
                 | GlobalAtomicUMin32
@@ -2287,6 +2291,7 @@ const OPCODE_NAMES: &[&str] = &[
     "SharedAtomicExchange32",
     "SharedAtomicExchange64",
     "SharedAtomicExchange32x2",
+    "SharedAtomicCompareExchange32",
     "GlobalAtomicIAdd32",
     "GlobalAtomicSMin32",
     "GlobalAtomicUMin32",
