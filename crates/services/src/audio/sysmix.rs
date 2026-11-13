@@ -21,7 +21,7 @@ use lichii_audio::sink::{SAMPLE_RATE, Sink, SinkStream, StreamType, TARGET_SAMPL
 use lichii_common::{HleResult, PAGE_SIZE};
 use lichii_kernel::Event;
 use lichii_kernel::process::Process;
-use lichii_memory::AddressSpace;
+use lichii_memory::{AddressSpace, MemoryPermission};
 use parking_lot::Mutex;
 
 const READ_OFFSET: u64 = 0x44;
@@ -273,6 +273,16 @@ impl SysmixStream {
 
     pub fn data_event(&self) -> &Arc<Event> {
         &self.data_event
+    }
+
+    /// Whether a started host stream is playing the ring.
+    #[cfg(test)]
+    pub fn is_playing(&self) -> bool {
+        self.inner
+            .lock()
+            .host
+            .as_ref()
+            .is_some_and(|host| !host.is_paused())
     }
 
     #[cfg(test)]
@@ -620,18 +630,34 @@ impl SysmixStream {
         );
     }
 
-    fn cursor(&self, offset: u64) -> Option<u32> {
-        self.memory.read::<u32>(self.buffer + offset).ok()
+    /// The ring cursor at `offset` as a host atomic on the guest's memory, the word the guest's
+    /// own exclusive loads and stores see, or `None` unless its page is mapped read-write.
+    fn cursor_word(&self, offset: u64) -> Option<&AtomicU32> {
+        let (ptr, perm) = self.memory.translate(self.buffer + offset)?;
+        if !perm.contains(MemoryPermission::READ_WRITE) {
+            return None;
+        }
+        debug_assert_eq!(ptr as usize % align_of::<AtomicU32>(), 0);
+        // SAFETY: the ring is page aligned and both cursors sit at 4-byte aligned offsets of its
+        // first two pages, so the word is aligned and inside one mapped page, which stays valid
+        // host memory for the life of the address space (the kernel's address arbiter relies on
+        // the same).
+        Some(unsafe { AtomicU32::from_ptr(ptr.cast()) })
     }
 
-    /// Stores `next` in the cursor at `offset` if it still holds `expected`: `None` when the
-    /// memory is gone, `Some(false)` when the guest moved the cursor first.
+    fn cursor(&self, offset: u64) -> Option<u32> {
+        Some(self.cursor_word(offset)?.load(Ordering::Acquire))
+    }
+
+    /// Atomically stores `next` in the cursor at `offset` if it still holds `expected` (the
+    /// reference's `WriteExclusive32`): `None` when the memory is gone, `Some(false)` when the
+    /// guest moved the cursor first.
     fn swap_cursor(&self, offset: u64, expected: u32, next: u32) -> Option<bool> {
-        if self.cursor(offset)? != expected {
-            return Some(false);
-        }
-        self.memory.write(self.buffer + offset, next).ok()?;
-        Some(true)
+        let word = self.cursor_word(offset)?;
+        Some(
+            word.compare_exchange(expected, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+        )
     }
 
     fn read_payload(&self, slot: u32, out: &mut [u8], frame_bytes: u32) -> bool {
@@ -678,10 +704,12 @@ impl SysmixStream {
         }
     }
 
-    /// Stops the stream after bad guest memory and tells the guest through the state event.
+    /// Stops the stream after bad guest memory, closing its host stream so nothing queued keeps
+    /// playing, and tells the guest through the state event.
     fn fault(&self, p: &mut Inner, result: lichii_common::ResultCode) -> lichii_common::ResultCode {
         p.faulted = true;
         p.engaged = false;
+        p.host = None;
         p.counters.faults += 1;
         self.state_event.signal();
         tracing::error!(

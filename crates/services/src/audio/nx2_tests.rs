@@ -498,6 +498,37 @@ fn sysmix_pumps_a_stereo_s16_ring_into_the_host_stream() {
 }
 
 #[test]
+fn sysmix_input_captures_silence_and_purges_it() {
+    let h = harness();
+    let session = user_session(&h);
+    let ring = h.heap + RING_OFFSET;
+    let mut reply = create_stream(&h, session, 2, 0x2, ring);
+    assert_eq!(reply.result, ResultCode::SUCCESS);
+    let id: u32 = reply.pop();
+    let stream = reply.move_handles[0];
+    h.write(ring + 0x1040, &[0xff; 240 * 4]);
+    assert_eq!(open_stream(&h, stream, 2, 2), ResultCode::SUCCESS);
+    let ids = h.client.alloc(&id.to_le_bytes());
+    h.ok(session, Request::new(2).buffer_a(ids, 4));
+
+    wait_for("captured frames", || h.read_u32(ring + 0x1004) >= 480);
+    assert!(
+        h.client
+            .read(ring + 0x1040, 240 * 4)
+            .iter()
+            .all(|&b| b == 0),
+        "the host has no microphone, so the ring captures silence"
+    );
+    let purged: u32 = h.ok(stream, Request::new(11).arg(0u32)).pop();
+    assert!(purged >= 480, "purged {purged} frames");
+    assert_eq!(
+        h.read_u32(ring + 0x44),
+        purged,
+        "purge moves the guest's read cursor"
+    );
+}
+
+#[test]
 fn renderer_error_paths_use_the_reference_results() {
     let h = harness();
     let manager = h.renderer_manager();
@@ -617,9 +648,14 @@ fn sysmix_error_paths_use_the_reference_results() {
         "only input streams purge"
     );
     h.ok(session, Request::new(2).buffer_a(ids, 4));
-    h.write(ring + 0x44, &5u32.to_le_bytes());
     let sysmix = h.audio.sysmix.get(id).unwrap();
+    assert!(sysmix.is_playing());
+    h.write(ring + 0x44, &5u32.to_le_bytes());
     wait_for("the fault", || sysmix.counters().faults == 1);
+    assert!(
+        !sysmix.is_playing(),
+        "a faulted stream stops its host stream"
+    );
     assert_eq!(
         h.ok(stream, Request::new(2)).pop::<u32>(),
         0,

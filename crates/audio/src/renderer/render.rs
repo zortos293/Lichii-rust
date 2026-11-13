@@ -7,6 +7,10 @@
 //! has room ([`SinkStream::wait_free_space`]), so the null sink and a host device both pull frames
 //! at 48 kHz. A frame with no device sink appends silence, which keeps that clock running. Nothing
 //! is allocated per frame once a session's command list has held its largest frame.
+//!
+//! The device sink interleaves as many channels as the guest's sink has inputs, so each frame is
+//! spread into a six-channel block before it is appended; the stream downmixes that to the host's
+//! channel count.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -100,9 +104,8 @@ impl RenderManager {
             .ok_or(OUT_OF_SESSIONS)?;
         let mut system = RendererSystem::new(params, transfer_memory_size)?;
         system.session_id = id as i32;
-        let channels = self.shared.sink.device_channels();
         let stream = self.shared.sink.open_stream(
-            channels,
+            MAX_CHANNELS,
             &format!("AudioRenderer-{id}"),
             StreamType::Render,
         );
@@ -116,6 +119,7 @@ impl RenderManager {
                 memory: GuestMemory(memory),
                 processor: CommandListProcessor::new(),
                 device: vec![0; FRAME_SAMPLES].into_boxed_slice(),
+                frame: vec![0; FRAME_SAMPLES].into_boxed_slice(),
             }),
             stream,
             rendered,
@@ -184,7 +188,10 @@ struct SessionState {
     system: RendererSystem,
     memory: GuestMemory,
     processor: CommandListProcessor,
+    /// What the device sink wrote, interleaved by the guest sink's channel count.
     device: Box<[i16]>,
+    /// The frame as the stream takes it: six channels per sample frame.
+    frame: Box<[i16]>,
 }
 
 /// One `IAudioRenderer` session. Dropping it frees its session id and closes its stream.
@@ -205,6 +212,8 @@ impl RendererSession {
         self.id
     }
 
+    /// Whether the session renders every frame by itself (`Auto`) or only when the guest asks
+    /// (`Manual`, which this port never renders). Fixed when the session opens.
     pub fn execution_mode(&self) -> ExecutionMode {
         self.execution_mode
     }
@@ -241,22 +250,26 @@ impl RendererSession {
         if !state.system.active {
             return false;
         }
-        let channels = self.stream.system_channels();
-        state.system.generate_command(channels as u32);
+        state
+            .system
+            .generate_command(self.stream.device_channels() as u32);
         let (list, frame) = state
             .system
             .dsp_frame(&mut state.memory, clock, &mut state.device);
         let report = state.processor.process(list, frame);
-        let samples = &mut state.device[..TARGET_SAMPLE_COUNT as usize * channels];
-        if report.device_sink.is_none() {
-            samples.fill(0);
-        }
-        let audible = samples
-            .chunks_exact(channels)
+        let channels = report
+            .device_sink
+            .map_or(0, |sink| (sink.channel_count as usize).min(MAX_CHANNELS));
+        to_stream_layout(&state.device, channels, &mut state.frame);
+        let audible = state
+            .frame
+            .as_chunks::<MAX_CHANNELS>()
+            .0
+            .iter()
             .filter(|frame| frame.iter().any(|&sample| sample != 0))
             .count();
         self.stream
-            .append_buffer(u64::from(TARGET_SAMPLE_COUNT), samples);
+            .append_buffer(u64::from(TARGET_SAMPLE_COUNT), &state.frame);
         drop(guard);
         self.frames_rendered
             .fetch_add(u64::from(TARGET_SAMPLE_COUNT), Ordering::AcqRel);
@@ -264,6 +277,19 @@ impl RendererSession {
             .fetch_add(audible as u64, Ordering::AcqRel);
         (self.rendered)();
         true
+    }
+}
+
+/// Spreads `device`, one frame of `channels`-channel samples, into six-channel `frame`, the
+/// missing channels silent. No channels (no device sink ran) gives a silent frame.
+fn to_stream_layout(device: &[i16], channels: usize, frame: &mut [i16]) {
+    frame.fill(0);
+    if channels == 0 {
+        return;
+    }
+    let (out, _) = frame.as_chunks_mut::<MAX_CHANNELS>();
+    for (out, samples) in out.iter_mut().zip(device.chunks_exact(channels)) {
+        out[..channels].copy_from_slice(samples);
     }
 }
 
@@ -286,5 +312,30 @@ impl DspMemory for GuestMemory {
 
     fn write(&mut self, address: u64, data: &[u8]) {
         let _ = self.0.write_bytes(address, data);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_frames_spread_into_six_channel_blocks() {
+        let mut frame = [7i16; FRAME_SAMPLES];
+        let stereo: Vec<i16> = (0..TARGET_SAMPLE_COUNT as i16 * 2).collect();
+        to_stream_layout(&stereo, 2, &mut frame);
+        assert_eq!(
+            frame[..MAX_CHANNELS * 2],
+            [0, 1, 0, 0, 0, 0, 2, 3, 0, 0, 0, 0]
+        );
+        let last = &frame[FRAME_SAMPLES - MAX_CHANNELS..];
+        assert_eq!(last, [478, 479, 0, 0, 0, 0]);
+
+        let surround: Vec<i16> = (0..FRAME_SAMPLES as i16).collect();
+        to_stream_layout(&surround, MAX_CHANNELS, &mut frame);
+        assert_eq!(frame[..], surround[..]);
+
+        to_stream_layout(&surround, 0, &mut frame);
+        assert!(frame.iter().all(|&sample| sample == 0));
     }
 }
