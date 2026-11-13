@@ -142,6 +142,50 @@ impl FixedPipelineState {
     pub(crate) fn vk_topology(&self) -> vk::PrimitiveTopology {
         vk::PrimitiveTopology::from_raw(i32::from(self.topology))
     }
+
+    /// The fields the graphics pipeline library state `subsets` are built from, the rest
+    /// zeroed: libraries are cached by it, so pipelines that differ only in other subsets share
+    /// them.
+    pub(crate) fn subset(&self, subsets: vk::GraphicsPipelineLibraryFlagsEXT) -> Self {
+        use vk::GraphicsPipelineLibraryFlagsEXT as S;
+        let mut out = Self::zeroed();
+        let (mut groups, mut raster, mut eds2) = (0, 0, 0);
+        if subsets.contains(S::VERTEX_INPUT_INTERFACE) {
+            groups |= GROUP_EDS2 | GROUP_VERTEX | GROUP_STRIDES;
+            eds2 |= EDS2_PRIMITIVE_RESTART;
+            out.topology = self.topology;
+            out.attributes = self.attributes;
+            out.instanced = self.instanced;
+            out.strides = self.strides;
+        }
+        if subsets.contains(S::PRE_RASTERIZATION_SHADERS) {
+            groups |= GROUP_EDS2;
+            eds2 |= EDS2_RASTERIZER_DISCARD | EDS2_DEPTH_BIAS;
+            raster |= RASTER_DEPTH_CLAMP | RASTER_NDC_MINUS_ONE_TO_ONE | RASTER_PROVOKING_LAST;
+            out.topology = self.topology;
+            out.patch_control_points = self.patch_control_points;
+            out.polygon_mode = self.polygon_mode;
+            out.cull_mode = self.cull_mode;
+            out.front_face = self.front_face;
+        }
+        if subsets.contains(S::FRAGMENT_SHADER) {
+            groups |= GROUP_DEPTH_STENCIL;
+            out.depth = self.depth;
+            out.depth_compare = self.depth_compare;
+            out.stencil_front = self.stencil_front;
+            out.stencil_back = self.stencil_back;
+        }
+        if subsets.contains(S::FRAGMENT_OUTPUT_INTERFACE) {
+            groups |= GROUP_BLEND;
+            raster |= RASTER_ALPHA_TO_COVERAGE | RASTER_ALPHA_TO_ONE | RASTER_LOGIC_OP;
+            out.logic_op = self.logic_op;
+            out.blend = self.blend;
+        }
+        out.groups = self.groups & groups;
+        out.raster = self.raster & raster;
+        out.eds2 = self.eds2 & eds2;
+        out
+    }
 }
 
 impl PartialEq for FixedPipelineState {
@@ -593,6 +637,40 @@ mod tests {
             multi_viewport: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn library_subsets_partition_the_state() {
+        use vk::GraphicsPipelineLibraryFlagsEXT as S;
+        let mut fixed: FixedPipelineState =
+            bytemuck::pod_read_unaligned(&[0xa5; size_of::<FixedPipelineState>()]);
+        fixed._pad = 0;
+        fixed.groups = 0x1f;
+        fixed.raster = 0x3f;
+        fixed.eds2 = 0x7;
+        let all = S::VERTEX_INPUT_INTERFACE
+            | S::PRE_RASTERIZATION_SHADERS
+            | S::FRAGMENT_SHADER
+            | S::FRAGMENT_OUTPUT_INTERFACE;
+        assert_eq!(
+            bytemuck::bytes_of(&fixed.subset(all)),
+            bytemuck::bytes_of(&fixed),
+            "every field belongs to a subset"
+        );
+        let output = fixed.subset(S::FRAGMENT_OUTPUT_INTERFACE);
+        assert_eq!(output.blend, fixed.blend);
+        assert_eq!(
+            output.raster,
+            RASTER_ALPHA_TO_COVERAGE | RASTER_ALPHA_TO_ONE | RASTER_LOGIC_OP
+        );
+        assert_eq!(
+            (output.cull_mode, output.depth, output.attributes[0].format),
+            (0, 0, 0)
+        );
+        let shader = fixed.subset(S::FRAGMENT_SHADER);
+        assert_eq!(shader.groups, GROUP_DEPTH_STENCIL);
+        assert_eq!(shader.stencil_back, fixed.stencil_back);
+        assert_eq!(shader.blend, [BlendAttachment::default(); 8]);
     }
 
     fn all_dynamic() -> PipelineFeatures {

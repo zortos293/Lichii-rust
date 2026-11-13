@@ -227,6 +227,10 @@ pub struct PipelineStats {
     pub cache_hits: u64,
     /// Bytes of driver cache the disk cache seeded the `VkPipelineCache` with.
     pub loaded_bytes: usize,
+    /// Graphics pipeline libraries built, one per state subset (fast linking).
+    pub libraries: u64,
+    /// Pipelines linked from libraries for draws whose pipeline was still building.
+    pub fast_linked: u64,
 }
 
 /// `None` once set: the build failed and the draw is skipped from then on instead of being
@@ -241,6 +245,8 @@ struct Shared {
     built: AtomicU64,
     failed: AtomicU64,
     cache_hits: AtomicU64,
+    libraries: AtomicU64,
+    fast_linked: AtomicU64,
 }
 
 impl Shared {
@@ -266,11 +272,59 @@ struct Context {
     gate: parking_lot::RwLock<()>,
 }
 
+const ALL_SUBSETS: vk::GraphicsPipelineLibraryFlagsEXT =
+    vk::GraphicsPipelineLibraryFlagsEXT::from_raw(0xf);
+
+/// The state subsets a graphics build creates: all of them for a pipeline, one for a library.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Part {
+    subsets: vk::GraphicsPipelineLibraryFlagsEXT,
+    mesh: bool,
+}
+
+impl Part {
+    fn pipeline(programs: &GraphicsShaders) -> Self {
+        Self {
+            subsets: ALL_SUBSETS,
+            mesh: programs
+                .iter()
+                .flatten()
+                .any(|p| p.stage == ShaderStage::Mesh),
+        }
+    }
+
+    fn has(self, subset: vk::GraphicsPipelineLibraryFlagsEXT) -> bool {
+        self.subsets.contains(subset)
+    }
+
+    fn is_library(self) -> bool {
+        self.subsets != ALL_SUBSETS
+    }
+}
+
+/// A graphics pipeline library: `key` holds only the fields and shaders of `part`, and
+/// `layout` is the pipeline layout's address for the shader subsets (0 otherwise).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct LibraryKey {
+    part: Part,
+    layout: usize,
+    key: GraphicsPipelineKey,
+}
+
+/// Fast linking of one pending graphics pipeline.
+enum Linking {
+    /// Waiting for the libraries, one per state subset.
+    Parts(Vec<Arc<Slot>>, Arc<PipelineLayout>),
+    Linked(Pipeline),
+    Failed,
+}
+
 enum Build {
     Graphics {
         key: Box<GraphicsPipelineKey>,
         programs: GraphicsShaders,
         layout: Arc<PipelineLayout>,
+        part: Part,
     },
     Compute {
         key: ComputePipelineKey,
@@ -281,12 +335,14 @@ enum Build {
 
 impl Context {
     fn build(&self, build: Build) -> Option<Pipeline> {
+        let library = matches!(&build, Build::Graphics { part, .. } if part.is_library());
         let (result, layout) = match build {
             Build::Graphics {
                 key,
                 programs,
                 layout,
-            } => (self.build_graphics(&key, &programs, &layout), layout),
+                part,
+            } => (self.build_graphics(&key, &programs, &layout, part), layout),
             Build::Compute {
                 key,
                 program,
@@ -294,6 +350,10 @@ impl Context {
             } => (self.build_compute(&key, &program, &layout), layout),
         };
         match result {
+            Ok((raw, _)) if library => {
+                self.shared.libraries.fetch_add(1, Ordering::Relaxed);
+                Some(Pipeline { raw, layout })
+            }
             Ok((raw, cache_hit)) => {
                 self.shared.built.fetch_add(1, Ordering::Relaxed);
                 if cache_hit {
@@ -346,25 +406,26 @@ impl Context {
         key: &GraphicsPipelineKey,
         programs: &GraphicsShaders,
         layout: &PipelineLayout,
+        part: Part,
     ) -> std::result::Result<(vk::Pipeline, bool), String> {
+        use vk::GraphicsPipelineLibraryFlagsEXT as S;
         let fixed = &key.fixed;
         let features = &self.features;
         let topology = fixed.vk_topology();
-        let mesh = programs
-            .iter()
-            .flatten()
-            .any(|p| p.stage == ShaderStage::Mesh);
+        let mesh = part.mesh;
         let tessellated = !mesh && programs[1].is_some() && programs[2].is_some();
-        if programs[0].is_none() {
-            return Err("no vertex stage".into());
-        }
-        if !mesh
-            && (programs[1].is_some() != programs[2].is_some()
-                || tessellated != (topology == vk::PrimitiveTopology::PATCH_LIST))
-        {
-            return Err(format!(
-                "tessellation stages do not match topology {topology:?}"
-            ));
+        if part.has(S::PRE_RASTERIZATION_SHADERS) {
+            if programs[0].is_none() {
+                return Err("no vertex stage".into());
+            }
+            if !mesh
+                && (programs[1].is_some() != programs[2].is_some()
+                    || tessellated != (topology == vk::PrimitiveTopology::PATCH_LIST))
+            {
+                return Err(format!(
+                    "tessellation stages do not match topology {topology:?}"
+                ));
+            }
         }
         let modules = self.modules(programs.iter().flatten().map(|p| &**p))?;
         let stages: Vec<_> = modules
@@ -545,24 +606,40 @@ impl Context {
         let mut feedback_info = vk::PipelineCreationFeedbackCreateInfo::default()
             .pipeline_creation_feedback(&mut feedback)
             .pipeline_stage_creation_feedbacks(&mut stage_feedback);
+        let mut library = vk::GraphicsPipelineLibraryCreateInfoEXT::default().flags(part.subsets);
         let mut info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
-            .viewport_state(&viewport)
-            .rasterization_state(&rasterization)
-            .multisample_state(&multisample)
-            .depth_stencil_state(&depth_stencil)
-            .color_blend_state(&color_blend)
             .dynamic_state(&dynamic)
-            .layout(layout.raw)
-            .push_next(&mut rendering)
             .push_next(&mut feedback_info);
-        if !mesh {
+        if part.is_library() {
+            info = info
+                .flags(vk::PipelineCreateFlags::LIBRARY_KHR)
+                .push_next(&mut library);
+        }
+        if part.has(S::VERTEX_INPUT_INTERFACE) && !mesh {
             info = info
                 .vertex_input_state(&vertex_input)
                 .input_assembly_state(&input_assembly);
         }
-        if tessellated {
-            info = info.tessellation_state(&tessellation);
+        if part.has(S::PRE_RASTERIZATION_SHADERS) {
+            info = info
+                .viewport_state(&viewport)
+                .rasterization_state(&rasterization);
+            if tessellated {
+                info = info.tessellation_state(&tessellation);
+            }
+        }
+        if part.has(S::FRAGMENT_SHADER) {
+            info = info.depth_stencil_state(&depth_stencil);
+        }
+        if part.has(S::PRE_RASTERIZATION_SHADERS) || part.has(S::FRAGMENT_SHADER) {
+            info = info.layout(layout.raw);
+        }
+        if part.has(S::FRAGMENT_OUTPUT_INTERFACE) {
+            info = info
+                .multisample_state(&multisample)
+                .color_blend_state(&color_blend)
+                .push_next(&mut rendering);
         }
         // SAFETY: every referenced object is live; the cache is internally synchronised.
         let pipelines = unsafe {
@@ -573,6 +650,29 @@ impl Context {
         let raw =
             pipelines.map_err(|(_, result)| format!("vkCreateGraphicsPipelines: {result}"))?[0];
         Ok((raw, cache_hit(&feedback)))
+    }
+
+    /// Links `libraries` without link-time optimisation.
+    fn link(
+        &self,
+        libraries: &[vk::Pipeline],
+        layout: &Arc<PipelineLayout>,
+    ) -> std::result::Result<Pipeline, String> {
+        let mut libraries = vk::PipelineLibraryCreateInfoKHR::default().libraries(libraries);
+        let info = vk::GraphicsPipelineCreateInfo::default()
+            .layout(layout.raw)
+            .push_next(&mut libraries);
+        // SAFETY: the libraries and the layout are live; no pipeline cache is shared.
+        let pipelines = unsafe {
+            self.device
+                .raw
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+        };
+        let raw = pipelines.map_err(|(_, result)| format!("linking a pipeline: {result}"))?[0];
+        Ok(Pipeline {
+            raw,
+            layout: layout.clone(),
+        })
     }
 
     fn build_compute(
@@ -707,6 +807,9 @@ pub struct PipelineCache {
     graphics: HashMap<GraphicsPipelineKey, usize, FxBuildHasher>,
     compute: HashMap<ComputePipelineKey, usize, FxBuildHasher>,
     slots: Vec<Arc<Slot>>,
+    libraries: HashMap<LibraryKey, Arc<Slot>, FxBuildHasher>,
+    /// Graphics slots drawn while building, with fast linking on.
+    linking: HashMap<usize, Linking, FxBuildHasher>,
 }
 
 fn identity(device: &Device) -> DeviceIdentity {
@@ -794,6 +897,8 @@ impl PipelineCache {
                     built: AtomicU64::new(0),
                     failed: AtomicU64::new(0),
                     cache_hits: AtomicU64::new(0),
+                    libraries: AtomicU64::new(0),
+                    fast_linked: AtomicU64::new(0),
                 },
                 #[cfg(test)]
                 gate: parking_lot::RwLock::new(()),
@@ -812,6 +917,8 @@ impl PipelineCache {
             graphics: HashMap::default(),
             compute: HashMap::default(),
             slots: Vec::new(),
+            libraries: HashMap::default(),
+            linking: HashMap::default(),
         })
     }
 
@@ -836,7 +943,9 @@ impl PipelineCache {
     }
 
     /// The pipeline for `key`, built from `shaders` (whose hashes `key` holds) on a miss.
-    /// `None` while it builds asynchronously or when it failed to build: skip the draw.
+    /// While it builds asynchronously, one fast-linked from graphics pipeline libraries once
+    /// they are built (when the device links fast). `None` while neither is ready or when it
+    /// failed to build: skip the draw.
     pub fn graphics(
         &mut self,
         key: &GraphicsPipelineKey,
@@ -844,9 +953,135 @@ impl PipelineCache {
     ) -> Option<&Pipeline> {
         let index = match self.graphics.get(key) {
             Some(&index) => index,
-            None => self.insert_graphics(key, shaders),
+            None => self.insert_graphics(key, shaders, true),
         };
+        if self.async_compile && self.ctx.features.fast_link && self.slots[index].get().is_none() {
+            return self.fast_linked(index, key, shaders);
+        }
         self.ready(index)
+    }
+
+    fn fast_linked(
+        &mut self,
+        index: usize,
+        key: &GraphicsPipelineKey,
+        shaders: &GraphicsShaders,
+    ) -> Option<&Pipeline> {
+        if !self.linking.contains_key(&index) {
+            let layout = self.layout(shaders.iter().flatten().map(|p| &**p))?;
+            self.start_linking(index, key, shaders, layout);
+        }
+        let linking = self.linking.get_mut(&index)?;
+        if let Linking::Parts(parts, layout) = linking {
+            let mut libraries = Vec::with_capacity(parts.len());
+            for part in parts.iter() {
+                match part.get() {
+                    None => return None,
+                    Some(None) => {
+                        *linking = Linking::Failed;
+                        return None;
+                    }
+                    Some(Some(library)) => libraries.push(library.raw),
+                }
+            }
+            *linking = match self.ctx.link(&libraries, layout) {
+                Ok(pipeline) => {
+                    self.ctx.shared.fast_linked.fetch_add(1, Ordering::Relaxed);
+                    Linking::Linked(pipeline)
+                }
+                Err(error) => {
+                    tracing::error!("{error}");
+                    Linking::Failed
+                }
+            };
+        }
+        match linking {
+            Linking::Linked(pipeline) => Some(pipeline),
+            _ => None,
+        }
+    }
+
+    /// Finds or starts the libraries slot `index` links from: the shader subsets on the
+    /// workers, the interface subsets (no shaders, cheap) right away.
+    fn start_linking(
+        &mut self,
+        index: usize,
+        key: &GraphicsPipelineKey,
+        shaders: &GraphicsShaders,
+        layout: Arc<PipelineLayout>,
+    ) {
+        use vk::GraphicsPipelineLibraryFlagsEXT as S;
+        let mesh = Part::pipeline(shaders).mesh;
+        let subsets = [
+            S::VERTEX_INPUT_INTERFACE,
+            S::PRE_RASTERIZATION_SHADERS,
+            S::FRAGMENT_SHADER,
+            S::FRAGMENT_OUTPUT_INTERFACE,
+        ];
+        let mut parts = Vec::with_capacity(subsets.len());
+        for subsets in subsets {
+            if mesh && subsets == S::VERTEX_INPUT_INTERFACE {
+                continue;
+            }
+            let part = Part { subsets, mesh };
+            let mut programs = GraphicsShaders::default();
+            let shaded = match subsets {
+                S::PRE_RASTERIZATION_SHADERS => {
+                    programs[..4].clone_from_slice(&shaders[..4]);
+                    true
+                }
+                S::FRAGMENT_SHADER => {
+                    programs[4] = shaders[4].clone();
+                    true
+                }
+                _ => false,
+            };
+            let attachments = if subsets == S::FRAGMENT_OUTPUT_INTERFACE {
+                key.attachments
+            } else {
+                bytemuck::Zeroable::zeroed()
+            };
+            let library = LibraryKey {
+                part,
+                layout: if shaded {
+                    Arc::as_ptr(&layout) as usize
+                } else {
+                    0
+                },
+                key: GraphicsPipelineKey::new(&programs, attachments, &key.fixed.subset(subsets)),
+            };
+            if let Some(slot) = self.libraries.get(&library) {
+                parts.push(slot.clone());
+                continue;
+            }
+            let slot = Arc::new(Slot::new());
+            self.libraries.insert(library, slot.clone());
+            let build = Build::Graphics {
+                key: Box::new(library.key),
+                programs,
+                layout: layout.clone(),
+                part,
+            };
+            if shaded {
+                self.start(slot.clone(), build);
+            } else {
+                let _ = slot.set(self.ctx.build(build));
+            }
+            parts.push(slot);
+        }
+        self.linking.insert(index, Linking::Parts(parts, layout));
+    }
+
+    /// Fast-linked pipelines whose own pipeline finished building. Drop them once the GPU
+    /// finished the work recorded with them.
+    pub fn replaced(&mut self) -> impl Iterator<Item = Pipeline> + '_ {
+        let slots = &self.slots;
+        self.linking
+            .extract_if(|&index, _| slots[index].get().is_some())
+            .filter_map(|(_, linking)| match linking {
+                Linking::Linked(pipeline) => Some(pipeline),
+                _ => None,
+            })
     }
 
     /// The compute pipeline for `key`, built from `shader` on a miss; `None` as for
@@ -872,7 +1107,13 @@ impl PipelineCache {
         }
     }
 
-    fn insert_graphics(&mut self, key: &GraphicsPipelineKey, shaders: &GraphicsShaders) -> usize {
+    /// `link`: also start the libraries fast linking uses, ahead of the pipeline itself.
+    fn insert_graphics(
+        &mut self,
+        key: &GraphicsPipelineKey,
+        shaders: &GraphicsShaders,
+        link: bool,
+    ) -> usize {
         debug_assert_eq!(
             GraphicsPipelineKey::new(shaders, key.attachments, &key.fixed),
             *key,
@@ -880,13 +1121,20 @@ impl PipelineCache {
         );
         let index = self.slots.len();
         self.graphics.insert(*key, index);
-        let build = self
-            .layout(shaders.iter().flatten().map(|p| &**p))
-            .map(|layout| Build::Graphics {
-                key: Box::new(*key),
-                programs: shaders.clone(),
-                layout,
-            });
+        let layout = self.layout(shaders.iter().flatten().map(|p| &**p));
+        if let Some(layout) = &layout
+            && link
+            && self.async_compile
+            && self.ctx.features.fast_link
+        {
+            self.start_linking(index, key, shaders, layout.clone());
+        }
+        let build = layout.map(|layout| Build::Graphics {
+            key: Box::new(*key),
+            programs: shaders.clone(),
+            layout,
+            part: Part::pipeline(shaders),
+        });
         self.queue(build);
         index
     }
@@ -933,6 +1181,11 @@ impl PipelineCache {
             let _ = slot.set(None);
             return;
         };
+        self.start(slot, build);
+    }
+
+    /// Builds into `slot`: on a worker with asynchronous compilation, else right away.
+    fn start(&mut self, slot: Arc<Slot>, build: Build) {
         if self.async_compile && self.workers.is_none() {
             self.workers = Workers::new(self.worker_count);
         }
@@ -977,6 +1230,8 @@ impl PipelineCache {
             failed: shared.failed.load(Ordering::Relaxed),
             cache_hits: shared.cache_hits.load(Ordering::Relaxed),
             loaded_bytes: self.loaded_blob_bytes,
+            libraries: shared.libraries.load(Ordering::Relaxed),
+            fast_linked: shared.fast_linked.load(Ordering::Relaxed),
         }
     }
 
@@ -1031,7 +1286,7 @@ impl PipelineCache {
                 hash == 0 || slot.is_some()
             });
             if resolved {
-                self.insert_graphics(key, &shaders);
+                self.insert_graphics(key, &shaders, false);
                 queued += 1;
             }
         }
@@ -1104,6 +1359,8 @@ impl Drop for PipelineCache {
             tracing::warn!("writing the pipeline cache: {error}");
         }
         self.ctx.device.wait_idle();
+        self.linking.clear();
+        self.libraries.clear();
         self.slots.clear();
         self.layouts.clear();
         // SAFETY: no build is running and no pipeline creation uses the cache any more.
@@ -1688,8 +1945,12 @@ mod tests {
     fn builds_asynchronously_and_reports_progress() {
         let Some(device) = device() else { return };
         let perf = Arc::new(PerfStats::default());
-        let mut cache =
-            PipelineCache::new(&device, &settings(true), None, Some(perf.clone())).unwrap();
+        let cache = PipelineCache::new(&device, &settings(true), None, Some(perf.clone())).unwrap();
+        let features = PipelineFeatures {
+            fast_link: false,
+            ..*cache.features()
+        };
+        let mut cache = cache.with_features(features);
         let shaders = present_shaders();
         let keys: Vec<_> = variants(4)
             .iter()
@@ -1752,6 +2013,77 @@ mod tests {
                 .all(|t| *t == [0, 0, 255, 255]),
             "{texels:?}"
         );
+        assert_eq!(device.instance().validation_errors(), 0);
+    }
+
+    #[test]
+    fn fast_links_while_the_pipeline_builds() {
+        let Some(device) = device() else { return };
+        let cache = PipelineCache::new(&device, &settings(true), None, None).unwrap();
+        if !cache.features().fast_link {
+            eprintln!("skipping: the device does not link pipeline libraries fast");
+            return;
+        }
+        let features = PipelineFeatures {
+            dynamic_blend: false,
+            ..*cache.features()
+        };
+        let mut cache = cache.with_features(features);
+        let shaders = present_shaders();
+        let plain = key(&cache, &Regs::with_defaults(), &shaders);
+        let mut regs = Regs::with_defaults();
+        regs.blend.enable[0] = 1;
+        regs.blend.color_source = BlendFactor::ZERO_GL;
+        regs.blend.color_dest = BlendFactor::ONE_MINUS_SOURCE_COLOR_GL;
+        let blended = key(&cache, &regs, &shaders);
+        assert_ne!(plain, blended);
+        let ctx = cache.ctx.clone();
+        {
+            let _paused = ctx.gate.write();
+            assert!(
+                cache.graphics(&plain, &shaders).is_none(),
+                "no shader libraries yet"
+            );
+        }
+        cache.wait_for_builds();
+        assert!(cache.graphics(&plain, &shaders).is_some());
+        assert_eq!(cache.stats().libraries, 4);
+
+        let fast = {
+            let _paused = ctx.gate.write();
+            let fast = cache
+                .graphics(&blended, &shaders)
+                .expect("linked from the shader libraries of the plain pipeline")
+                .raw();
+            assert_eq!(
+                cache.graphics(&blended, &shaders).map(Pipeline::raw),
+                Some(fast),
+                "linked once"
+            );
+            let stats = cache.stats();
+            assert_eq!((stats.libraries, stats.fast_linked), (5, 1));
+            let texels = draw(
+                &device,
+                &features,
+                cache.graphics(&blended, &shaders).unwrap(),
+                [0.0, 1.0, 0.0, 1.0],
+            );
+            assert!(
+                texels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|t| *t == [0, 0, 0, 255]),
+                "blended over black: {texels:?}"
+            );
+            assert_eq!(cache.replaced().count(), 0, "still building");
+            fast
+        };
+        cache.wait_for_builds();
+        let built = cache.graphics(&blended, &shaders).unwrap().raw();
+        assert_ne!(built, fast, "the built pipeline replaces the linked one");
+        assert_eq!(cache.replaced().count(), 1);
+        assert_eq!(cache.stats().built, 2);
         assert_eq!(device.instance().validation_errors(), 0);
     }
 

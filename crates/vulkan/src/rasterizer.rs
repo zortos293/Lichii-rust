@@ -804,6 +804,9 @@ impl Rasterizer for VulkanRasterizer {
     fn present(&mut self, framebuffer: &FramebufferConfig) {
         self.handles.timestamp.frame_presented();
         self.draw.shaders.flush_disk();
+        for pipeline in self.draw.pipelines.replaced() {
+            self.scheduler.retire(pipeline);
+        }
         let cached = match self.texture_cache.presentable(framebuffer) {
             Some(id) => self.present_cached(framebuffer, id),
             None => Ok(false),
