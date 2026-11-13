@@ -5,7 +5,9 @@
 //! size, so a reversed destination draws unflipped, as the reference does), and the source
 //! rectangle, in texels, becomes the normalized UV window the fullscreen triangle interpolates
 //! (a reversed source flips). Coordinates are truncated to whole texels and pixels like the
-//! reference, and the destination is scaled to the render target's resolution scale. The TSC
+//! reference, and the destination is scaled to the render target's resolution scale. While the
+//! target is rescaled, the source rectangle and size are scaled to the source's scale as well
+//! (the reference's `ScaleSrc`); at integer scales that leaves the UV window unchanged. The TSC
 //! filter applies through the cached sampler; coordinates are always normalized.
 
 use std::collections::HashMap;
@@ -180,7 +182,8 @@ impl Drop for TexturePipelines {
     }
 }
 
-/// `value` truncated to a whole pixel and scaled up by `scale`, as the reference's `ScaleDst`.
+/// `value` truncated to a whole pixel and scaled up by `scale`, as the reference's `ScaleDst`
+/// and `ScaleSrc`.
 fn scaled(value: f32, scale: ResolutionScale) -> i64 {
     let (num, den) = scale.ratio();
     value as i64 * i64::from(num) / i64::from(den)
@@ -239,17 +242,10 @@ impl VulkanRasterizer {
             );
             return Ok(());
         }
-        if self
-            .texture_cache
-            .state(texture)
-            .is_some_and(|s| s.scale != ResolutionScale::X1)
-        {
-            self.draw.warn_once(
-                Warning::RescaledTexture,
-                "a draw samples a rescaled image, which needs per-binding scale bits; skipping it",
-            );
-            return Ok(());
-        }
+        let src_scale = match self.texture_cache.state(texture) {
+            Some(s) if dst_scale != ResolutionScale::X1 => s.scale,
+            _ => ResolutionScale::X1,
+        };
         let sampler = self.sampler(&src, draw.sampler)?;
 
         let (x0, x1) = (
@@ -272,10 +268,11 @@ impl VulkanRasterizer {
         if scissor_width == 0 || scissor_height == 0 {
             return Ok(());
         }
-        let source_width = (header.width >> header.min_level).max(1) as f32;
-        let source_height = (header.height >> header.min_level).max(1) as f32;
-        let (sx0, sy0) = (draw.src_x0 as i64 as f32, draw.src_y0 as i64 as f32);
-        let (sx1, sy1) = (draw.src_x1 as i64 as f32, draw.src_y1 as i64 as f32);
+        let source = |value: f32| scaled(value, src_scale) as f32;
+        let source_width = source((header.width >> header.min_level).max(1) as f32);
+        let source_height = source((header.height >> header.min_level).max(1) as f32);
+        let (sx0, sy0) = (source(draw.src_x0), source(draw.src_y0));
+        let (sx1, sy1) = (source(draw.src_x1), source(draw.src_y1));
         let params = Params {
             src_rect: [
                 sx0 / source_width,

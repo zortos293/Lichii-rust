@@ -21,7 +21,8 @@ use lichii_gpu::engines::maxwell_3d::regs::{
 };
 use lichii_shader::backend::Bindings;
 use lichii_shader::backend::spirv::{
-    RENDER_AREA_LAYOUT_OFFSET, RESCALING_LAYOUT_DOWN_FACTOR_OFFSET,
+    NUM_TEXTURE_SCALING_WORDS, RENDER_AREA_LAYOUT_OFFSET, RESCALING_LAYOUT_DOWN_FACTOR_OFFSET,
+    RESCALING_LAYOUT_TEXTURES_OFFSET,
 };
 use lichii_shader::info::StorageBufferDescriptor;
 use lichii_shader::ir::TextureType;
@@ -64,7 +65,6 @@ enum Warning {
     IndirectAssembly = 1 << 2,
     IndirectScattered = 1 << 3,
     NoIndirectCount = 1 << 4,
-    RescaledTexture = 1 << 6,
     DrawTextureTarget = 1 << 7,
     DrawTextureSource = 1 << 8,
 }
@@ -77,6 +77,33 @@ struct Write {
     kind: DescriptorKind,
     first: usize,
     count: u32,
+}
+
+/// The texture rescaling words of the push constant block, as Lichii's
+/// `RescalingPushConstant`: bit `n` is set when the texture descriptor with scaling index `n`
+/// samples a rescaled image, so the shader scales its texel fetches and size queries to it.
+/// Scaling indices number the texture descriptors of the draw's stages in stage order, one per
+/// descriptor however many elements it has, as `Bindings::texture_scaling_index` counts them
+/// when the stages translate.
+#[derive(Clone, Copy, Default)]
+struct TextureScaling {
+    words: [u32; NUM_TEXTURE_SCALING_WORDS as usize],
+    stage_base: u32,
+}
+
+impl TextureScaling {
+    /// Marks texture descriptor `descriptor` of the current stage as sampling a rescaled image.
+    fn set(&mut self, descriptor: u32) {
+        let index = self.stage_base + descriptor;
+        if let Some(word) = self.words.get_mut((index / 32) as usize) {
+            *word |= 1 << (index % 32);
+        }
+    }
+
+    /// Moves past the current stage's `count` texture descriptors.
+    fn next_stage(&mut self, count: usize) {
+        self.stage_base += count as u32;
+    }
 }
 
 /// One bound render target of the current draw.
@@ -110,6 +137,7 @@ pub(super) struct DrawState {
     colors: [Option<Target>; 8],
     depth: Option<Target>,
     textures: Vec<ImageId>,
+    texture_scaling: TextureScaling,
     buffer_infos: Vec<vk::DescriptorBufferInfo>,
     image_infos: Vec<vk::DescriptorImageInfo>,
     writes: Vec<Write>,
@@ -214,6 +242,7 @@ impl DrawState {
             colors: [None; 8],
             depth: None,
             textures: Vec::new(),
+            texture_scaling: TextureScaling::default(),
             buffer_infos: Vec::new(),
             image_infos: Vec::new(),
             writes: Vec::new(),
@@ -507,6 +536,7 @@ impl VulkanRasterizer {
             self.draw.image_infos.clear();
             self.draw.writes.clear();
             self.draw.textures.clear();
+            self.draw.texture_scaling = TextureScaling::default();
             for &(slot, host) in &GRAPHICS_SLOTS {
                 let Some(module) = self.draw.stages[host].clone() else {
                     continue;
@@ -632,13 +662,14 @@ impl VulkanRasterizer {
                 );
             }
         }
-        let stages = self.draw.stages.iter().flatten();
-        let rescaling = stages.clone().any(|m| m.info.uses_rescaling_uniform);
-        let render_area = stages
-            .clone()
+        let render_area = self
+            .draw
+            .stages
+            .iter()
+            .flatten()
             .any(|m| m.info.uses_render_area)
             .then(|| guest_render_area(regs));
-        self.push_constants(cmd, layout_raw, push, rescaling, render_area, scale);
+        self.push_constants(cmd, layout_raw, push, render_area, scale);
         self.set_dynamic_state(cmd, regs, &features, host_topology, extent, scale);
         let raw = &self.device.raw;
         let draw = &self.draw;
@@ -951,11 +982,7 @@ impl VulkanRasterizer {
                                     .state(id)
                                     .is_some_and(|s| s.scale != ResolutionScale::X1)
                             {
-                                self.draw.warn_once(
-                                    Warning::RescaledTexture,
-                                    "a draw samples a rescaled image, which needs per-binding scale bits; skipping it",
-                                );
-                                return Ok(false);
+                                self.draw.texture_scaling.set(b.descriptor);
                             }
                             let view = match texture {
                                 Some((id, view)) => {
@@ -1000,6 +1027,9 @@ impl VulkanRasterizer {
                 });
             }
         }
+        self.draw
+            .texture_scaling
+            .next_stage(info.texture_descriptors.len());
         Ok(true)
     }
 
@@ -1239,14 +1269,14 @@ impl VulkanRasterizer {
     }
 
     /// Pushes the one range every stage of `layout` shares (`push` is its stages and size): the
-    /// rescaling words at 0 (no texture or image rescaled) with the down factor of `scale` at 24,
+    /// texture rescaling words of the bound textures at 0 (storage images are never bound, so
+    /// their words stay 0) with the down factor of `scale`, the targets' scale, at 24,
     /// and the render area at `RENDER_AREA_LAYOUT_OFFSET` (32), so a 48-byte range holds both.
     fn push_constants(
         &mut self,
         cmd: vk::CommandBuffer,
         layout: vk::PipelineLayout,
         (stages, size): (vk::ShaderStageFlags, u32),
-        rescaling: bool,
         render_area: Option<(f32, f32)>,
         scale: ResolutionScale,
     ) {
@@ -1254,12 +1284,13 @@ impl VulkanRasterizer {
             return;
         }
         let mut bytes = [0u8; RENDER_AREA_LAYOUT_OFFSET as usize + 16];
-        if rescaling {
-            let (num, den) = scale.ratio();
-            let down = den as f32 / num as f32;
-            let at = RESCALING_LAYOUT_DOWN_FACTOR_OFFSET as usize;
-            bytes[at..at + 4].copy_from_slice(&down.to_le_bytes());
-        }
+        let words: &[u8] = bytemuck::cast_slice(&self.draw.texture_scaling.words);
+        let at = RESCALING_LAYOUT_TEXTURES_OFFSET as usize;
+        bytes[at..at + words.len()].copy_from_slice(words);
+        let (num, den) = scale.ratio();
+        let down = den as f32 / num as f32;
+        let at = RESCALING_LAYOUT_DOWN_FACTOR_OFFSET as usize;
+        bytes[at..at + 4].copy_from_slice(&down.to_le_bytes());
         if let Some((width, height)) = render_area {
             let at = RENDER_AREA_LAYOUT_OFFSET as usize;
             bytes[at..at + 4].copy_from_slice(&width.to_le_bytes());
@@ -1667,6 +1698,7 @@ impl VulkanRasterizer {
             self.draw.image_infos.clear();
             self.draw.writes.clear();
             self.draw.textures.clear();
+            self.draw.texture_scaling = TextureScaling::default();
             if !self.bind_resources(&module, &sources)? {
                 return Ok(());
             }
@@ -1696,7 +1728,7 @@ impl VulkanRasterizer {
                 );
             }
         }
-        self.push_constants(cmd, layout_raw, push, false, None, ResolutionScale::X1);
+        self.push_constants(cmd, layout_raw, push, None, ResolutionScale::X1);
         let barrier = vk::MemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
             .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
