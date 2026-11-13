@@ -1083,3 +1083,32 @@ fn vi2_shows_the_drawn_area_of_a_native_image() {
         "handheld shows the panel's corner of a docked image"
     );
 }
+
+#[test]
+fn vi2_shows_the_gpu_memory_a_native_image_was_bound_to() {
+    let (context, client) = context(SWITCH2_TITLE, Settings::default());
+    let process = client.process().clone();
+    let heap = process.page_table().set_heap_size(64 << 20).unwrap();
+    let memory = context.gpu.nx2_memory().unwrap();
+    let (parent, _) = memory
+        .create_gpu_accessible_memory(process.memory(), heap, 0x200_0000)
+        .unwrap();
+    let (other, _) = memory
+        .create_gpu_accessible_memory(process.memory(), heap + 0x200_0000, 0x200_0000)
+        .unwrap();
+    memory
+        .normal_map_4k(heap + 0x1000, heap + 0x1000 + 0x1fe_0000 - 1, other, 0)
+        .unwrap();
+    let parent_daddr = memory.memory_info(parent).unwrap().daddr;
+    let (objects, image) = super::native::NativeObjects::with_image(
+        heap + 0x1000,
+        Some((parent, 0x1000)),
+        COLOR_PREFERENCE,
+    );
+    let vi2 = super::vi2::Vi2::new(&context, Arc::new(parking_lot::Mutex::new(objects)));
+    assert_eq!(
+        vi2.framebuffer(image, 0).unwrap().address,
+        parent_daddr + 0x1000,
+        "the 423 binding wins over whatever is mapped at the address now"
+    );
+}

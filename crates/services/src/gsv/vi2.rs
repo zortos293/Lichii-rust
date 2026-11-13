@@ -202,8 +202,8 @@ impl Vi2 {
     }
 
     /// 229(u64 client token, u32 slot, u32 image, ..., u32 drawn size at word 7, u32 timing at
-    /// word 12, ~fence syncpoint at word 22, fence value at word 24): shows the image once the
-    /// GPU work queued before it ran, waits for the previous frame's fence, so the title runs at
+    /// word 12, ~fence syncpoint at word 22, fence value at word 24): shows the image once its
+    /// fence is reached, waits for the previous frame's fence, so the title runs at
     /// most a frame ahead of the GPU, and paces the title to its swap interval. Waiting for the
     /// previous frame rather than this one cannot deadlock a title whose GPU work waits on a
     /// semaphore its CPU releases only after the present returns.
@@ -231,7 +231,7 @@ impl Vi2 {
                 tracing::warn!("nx2:vi2 229: previous frame's fence ({id}, {value:#x}): {err}");
             }
         }
-        self.composite(image, drawn);
+        self.composite(image, drawn, fence);
         self.context
             .perf
             .record_guest_frame(Instant::now(), timing.target_hz());
@@ -241,10 +241,23 @@ impl Vi2 {
         ResultCode::SUCCESS
     }
 
-    fn composite(&self, handle: u32, drawn: u32) {
-        if let Some(framebuffer) = self.framebuffer(handle, drawn) {
+    /// Presents native image `handle` once `fence`, this frame's, is reached: the frame's GPU
+    /// work may still wait on a semaphore the title releases after the present returns.
+    fn composite(&self, handle: u32, drawn: u32, (id, value): (u32, u32)) {
+        let Some(framebuffer) = self.framebuffer(handle, drawn) else {
+            return;
+        };
+        let guest = self.context.gpu.host1x().syncpoints.guest();
+        if guest.value(id).is_err() {
             self.context.gpu.present(framebuffer);
+            return;
         }
+        let gpu: Weak<Gpu> = Arc::downgrade(&self.context.gpu);
+        let _ = guest.register_action(id, value, move || {
+            if let Some(gpu) = gpu.upgrade() {
+                gpu.present(framebuffer);
+            }
+        });
     }
 
     /// How native image `handle` is shown. `drawn` is ((height - 1) << 16) | (width - 1) of the
@@ -254,14 +267,15 @@ impl Vi2 {
             tracing::warn!("nx2:vi2 229: native image {handle} has no bound memory");
             return None;
         };
-        let address = self
-            .display
-            .as_ref()
-            .and_then(|display| display.gmmu.translate(image.address))
-            .or_else(|| {
-                let (parent, offset) = image.parent?;
+        let address = image
+            .parent
+            .and_then(|(parent, offset)| {
                 let memory = self.context.gpu.nx2_memory()?.memory_info(parent)?;
                 Some(memory.daddr + offset)
+            })
+            .or_else(|| {
+                let display = self.display.as_ref()?;
+                display.gmmu.translate(image.address)
             });
         let Some(address) = address else {
             tracing::warn!(
