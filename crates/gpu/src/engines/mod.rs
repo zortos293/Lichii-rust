@@ -103,14 +103,35 @@ impl Engine for maxwell_dma::MaxwellDma {
     }
 }
 
+impl Engine for maxwell_3d::Maxwell3d {
+    fn call_method(&mut self, ctx: &mut EngineContext<'_>, method: u32, argument: u32) {
+        maxwell_3d::Maxwell3d::call_method(self, ctx, method, argument);
+    }
+
+    fn call_multi(&mut self, ctx: &mut EngineContext<'_>, method: u32, arguments: &[u32]) {
+        maxwell_3d::Maxwell3d::call_multi(self, ctx, method, arguments);
+    }
+
+    fn flush(&mut self, ctx: &mut EngineContext<'_>) {
+        maxwell_3d::Maxwell3d::flush(self, ctx);
+    }
+}
+
+impl Engine for fermi_2d::Fermi2d {
+    fn call_method(&mut self, ctx: &mut EngineContext<'_>, method: u32, argument: u32) {
+        fermi_2d::Fermi2d::call_method(self, ctx, method, argument);
+    }
+}
+
 /// Creates the engine a channel binds: `class` is the class id SET_OBJECT bound. The one place
-/// engines are wired in; kinds without an engine yet return `None` and their methods are dropped.
+/// engines are wired in.
 pub fn create_engine(kind: EngineKind, class: u32) -> Option<Box<dyn Engine>> {
     match kind {
         EngineKind::InlineToMemory => Some(Box::new(kepler_memory::KeplerMemory::new())),
         EngineKind::Compute => Some(Box::new(kepler_compute::KeplerCompute::new(class))),
         EngineKind::Dma => Some(Box::new(maxwell_dma::MaxwellDma::new())),
-        EngineKind::Maxwell3d | EngineKind::Fermi2d => None,
+        EngineKind::Maxwell3d => Some(Box::new(maxwell_3d::Maxwell3d::new(class))),
+        EngineKind::Fermi2d => Some(Box::new(fermi_2d::Fermi2d::new())),
     }
 }
 
@@ -130,3 +151,18 @@ pub struct EngineContext<'a> {
 
 #[cfg(test)]
 pub(crate) mod testing;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_engine_kind_creates_an_engine() {
+        for class in [
+            0xb197, 0xc797, 0xb1c0, 0xc7c0, 0xb0b5, 0xc7b5, 0x902d, 0xa140,
+        ] {
+            let kind = EngineKind::from_class(class).unwrap();
+            assert!(create_engine(kind, class).is_some(), "{kind:?} {class:#x}");
+        }
+    }
+}

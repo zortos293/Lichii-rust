@@ -16,6 +16,7 @@ use crate::backend::{
 use crate::channel::{ChannelConfig, GpEntry, Submission, SyncpointFence, SyncpointIncrement};
 use crate::clock::{GpuClockSpeed, GuestTime};
 use crate::engines::maxwell_3d::Regs;
+use crate::engines::maxwell_3d::regs::PrimitiveTopology;
 use crate::engines::{Engine, EngineContext, EngineKind, create_engine};
 use crate::gmmu::{BigPageSize, Gmmu};
 use crate::gpu::{Console, Gpu, GpuConfig, Threading};
@@ -70,6 +71,17 @@ enum Event {
     /// An engine finished the work it held back.
     Flush(EngineKind),
     FlushRegion(u64, u64),
+    Draw {
+        topology: PrimitiveTopology,
+        count: u32,
+    },
+}
+
+/// Engines a rig binds: recording ones that log every method, or the real ones.
+#[derive(Clone, Copy)]
+enum Engines {
+    Recording,
+    Real,
 }
 
 type Log = Arc<Mutex<Vec<Event>>>;
@@ -178,7 +190,12 @@ struct Recorder {
 }
 
 impl Rasterizer for Recorder {
-    fn draw(&mut self, _ctx: &mut GraphicsContext<'_>, _draw: &DrawParams<'_>) {}
+    fn draw(&mut self, _ctx: &mut GraphicsContext<'_>, draw: &DrawParams<'_>) {
+        self.log.lock().push(Event::Draw {
+            topology: draw.topology,
+            count: draw.count,
+        });
+    }
     fn draw_indirect(&mut self, _ctx: &mut GraphicsContext<'_>, _draw: &IndirectDraw) {}
     fn clear(&mut self, _ctx: &mut GraphicsContext<'_>, _layer_count: u32) {}
     fn dispatch_compute(&mut self, _ctx: &ComputeContext<'_>) {}
@@ -244,7 +261,13 @@ impl Rig {
     }
 
     fn build(threading: Threading, ring_slots: usize, completion: Completion) -> Self {
-        Self::build_for(Console::Switch1, threading, ring_slots, completion)
+        Self::build_for(
+            Console::Switch1,
+            threading,
+            ring_slots,
+            completion,
+            Engines::Recording,
+        )
     }
 
     fn build_for(
@@ -252,6 +275,7 @@ impl Rig {
         threading: Threading,
         ring_slots: usize,
         completion: Completion,
+        engines: Engines,
     ) -> Self {
         let physical = Arc::new(PhysicalMemory::new(1 << 24).unwrap());
         let space = AddressSpace::new(physical.clone(), 39);
@@ -274,8 +298,10 @@ impl Rig {
             GpuConfig {
                 threading,
                 ring_slots,
-                engines: Arc::new(move |engine, class| match engine {
-                    EngineKind::InlineToMemory => create_engine(engine, class),
+                engines: Arc::new(move |engine, class| match (engines, engine) {
+                    (Engines::Real, _) | (_, EngineKind::InlineToMemory) => {
+                        create_engine(engine, class)
+                    }
                     _ => Some(Box::new(RecordingEngine {
                         engine,
                         log: engines_log.clone(),
@@ -481,6 +507,44 @@ fn methods_reach_their_subchannels_in_order() {
             method: 0x700,
             count: 3
         }));
+    });
+}
+
+#[test]
+fn a_bound_3d_class_draws_through_the_real_engine() {
+    each_mode(|threading| {
+        let mut rig = Rig::build_for(
+            Console::Switch1,
+            threading,
+            crate::gpu::DEFAULT_RING_SLOTS,
+            Completion::Immediate,
+            Engines::Real,
+        );
+        let channel = rig.channel(HostClass::Maxwell);
+        let pushbuffer = Pushbuffer::default()
+            .bind(0, 0xb197)
+            .once(0, reg_index!(Regs, vertex_buffer.count), &[3])
+            .once(
+                0,
+                reg_index!(Regs, draw.begin),
+                &[PrimitiveTopology::TRIANGLES.0],
+            )
+            .once(0, reg_index!(Regs, draw.end), &[0]);
+        rig.submit(channel, &pushbuffer.0);
+        rig.gpu.synchronize();
+        let draws: Vec<_> = rig
+            .events()
+            .into_iter()
+            .filter(|event| matches!(event, Event::Draw { .. }))
+            .collect();
+        assert_eq!(
+            draws,
+            [Event::Draw {
+                topology: PrimitiveTopology::TRIANGLES,
+                count: 3,
+            }],
+            "{threading:?}"
+        );
     });
 }
 
@@ -1169,6 +1233,7 @@ fn switch_2_address_spaces_get_the_identity_mappings_until_destroyed() {
         Threading::Split,
         crate::gpu::DEFAULT_RING_SLOTS,
         Completion::Immediate,
+        Engines::Recording,
     );
     let nx2 = rig.gpu.nx2_memory().expect("Switch 2 has the registry");
     let early = rig.gpu.create_address_space(BigPageSize::Size64K);
@@ -1344,6 +1409,7 @@ fn present_restarts_the_switch_2_timestamp_frame_in_order() {
             threading,
             crate::gpu::DEFAULT_RING_SLOTS,
             Completion::Immediate,
+            Engines::Recording,
         );
         let timestamp = rig.gpu.handles().timestamp.clone();
         timestamp.set_speed(GpuClockSpeed::Boost);
