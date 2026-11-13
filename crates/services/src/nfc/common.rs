@@ -3,15 +3,17 @@
 //! events titles wait on.
 //!
 //! There is no amiibo or Mifare backend, so no tag is ever found: detection starts and stops,
-//! every command that needs a tag answers `WrongDeviceState`, and the activate, deactivate and
-//! availability events never fire. Player 1 and handheld have the reference's virtual reader when
-//! their controller has one; the other npads are devices that stay unavailable.
+//! every command that needs a tag answers `WrongDeviceState`, and the activate and deactivate
+//! events never fire. Player 1 and handheld have the reference's virtual reader when their
+//! controller has one, and the availability event fires when that changes; the other npads are
+//! devices that stay unavailable. `set:sys`'s NFC enable flag gates every device command.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 use lichii_common::settings::ControllerType;
 use lichii_common::{HleResult, ResultCode};
-use lichii_input::NpadHub;
+use lichii_input::{NpadHub, NpadState};
 use lichii_kernel::Event;
 use lichii_kernel::ipc::HleRequestContext;
 use lichii_kernel::object::KObject;
@@ -27,6 +29,8 @@ const NFP_NFC_DISABLED: u32 = 80;
 const DEVICE_COUNT: usize = 10;
 const PLAYER_1: u32 = 0;
 const HANDHELD: u32 = 0x20;
+/// What [`Readers`] holds while no npad has a reader.
+const NO_READER: u32 = u32::MAX;
 /// The `NpadIdType` of each device, which is also its handle, in the reference's order
 /// (`HID::IndexToNpadIdType`).
 const NPAD_IDS: [u32; DEVICE_COUNT] = [PLAYER_1, 1, 2, 3, 4, 5, 6, 7, HANDHELD, 0x10];
@@ -49,6 +53,7 @@ enum Error {
     InvalidArgument = 65,
     WrongDeviceState = 73,
     NfcNotInitialized = 77,
+    NfcDisabled = 80,
 }
 
 impl Backend {
@@ -130,7 +135,7 @@ impl Service for UserManager {
         if ctx.command() != 0 {
             return None;
         }
-        let user = User::new(self.kind, self.context.npad.clone());
+        let user = User::new(self.kind, self.context.clone());
         ctx.push_interface(self.context.handler(user));
         Some(ResultCode::SUCCESS)
     }
@@ -139,7 +144,7 @@ impl Service for UserManager {
 /// An `IUser` and its own device manager, as each reference interface has one.
 struct User {
     kind: UserKind,
-    hub: Arc<NpadHub>,
+    context: Arc<ServiceContext>,
     availability_change: Arc<Event>,
     activate: [Arc<Event>; DEVICE_COUNT],
     deactivate: [Arc<Event>; DEVICE_COUNT],
@@ -148,25 +153,80 @@ struct User {
 
 struct State {
     initialized: bool,
+    /// The [`Readers`] change count `devices` follow.
+    generation: u64,
     devices: [DeviceState; DEVICE_COUNT],
 }
 
 impl State {
     const FINALIZED: Self = Self {
         initialized: false,
+        generation: 0,
         devices: [DeviceState::Unavailable; DEVICE_COUNT],
     };
 }
 
 /// The npad id whose reader the host's player 1 controller provides (`EmulatedController::HasNfc`):
 /// handheld, or player 1 on a style with a right Joy-Con or Pro Controller reader.
-fn reader_npad(controller: ControllerType) -> Option<u32> {
+fn reader_of(host: &NpadState) -> u32 {
     use ControllerType::*;
-    match controller {
+    if !host.connected {
+        return NO_READER;
+    }
+    match host.controller {
         ProController | Switch2ProController | DualJoycons | Switch2DualJoycons | RightJoycon
-        | Switch2RightJoycon => Some(PLAYER_1),
-        Handheld | Switch2Handheld => Some(HANDHELD),
-        LeftJoycon | Switch2LeftJoycon | GameCube => None,
+        | Switch2RightJoycon => PLAYER_1,
+        Handheld | Switch2Handheld => HANDHELD,
+        LeftJoycon | Switch2LeftJoycon | GameCube => NO_READER,
+    }
+}
+
+/// Which npad has a reader, shared by every `IUser`. hid's updater and every NFC command poll
+/// it; a change signals each interface's availability event, as the reference's npad callbacks
+/// do on connection and disconnection.
+pub(crate) struct Readers {
+    /// The reader's npad id, or [`NO_READER`].
+    reader: AtomicU32,
+    /// Counts changes, so an interface can tell a reconnection from no change.
+    generation: AtomicU64,
+    availability_events: Mutex<Vec<Weak<Event>>>,
+}
+
+impl Readers {
+    pub(crate) fn new(hub: &NpadHub) -> Self {
+        Self {
+            reader: AtomicU32::new(reader_of(&hub.read(0))),
+            generation: AtomicU64::new(0),
+            availability_events: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Samples the host's player 1; when the reader moved, signals every availability event.
+    pub(crate) fn poll(&self, hub: &NpadHub) {
+        let reader = reader_of(&hub.read(0));
+        let old = self.reader.load(Ordering::Acquire);
+        if old == reader
+            || self
+                .reader
+                .compare_exchange(old, reader, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+        self.generation.fetch_add(1, Ordering::Release);
+        self.availability_events
+            .lock()
+            .retain(|event| event.upgrade().inspect(|event| event.signal()).is_some());
+    }
+
+    /// The change count and the reader's npad id.
+    fn current(&self) -> (u64, u32) {
+        let generation = self.generation.load(Ordering::Acquire);
+        (generation, self.reader.load(Ordering::Acquire))
+    }
+
+    fn watch(&self, event: &Arc<Event>) {
+        self.availability_events.lock().push(Arc::downgrade(event));
     }
 }
 
@@ -175,12 +235,15 @@ fn device_index(handle: u64) -> Option<usize> {
 }
 
 impl User {
-    fn new(kind: UserKind, hub: Arc<NpadHub>) -> Self {
+    fn new(kind: UserKind, context: Arc<ServiceContext>) -> Self {
         let event = |_| Arc::new(Event::new());
+        let availability_change = Arc::new(Event::new());
+        context.nfc_readers.poll(&context.npad);
+        context.nfc_readers.watch(&availability_change);
         Self {
             kind,
-            hub,
-            availability_change: Arc::new(Event::new()),
+            context,
+            availability_change,
             activate: std::array::from_fn(event),
             deactivate: std::array::from_fn(event),
             state: Mutex::new(State::FINALIZED),
@@ -191,28 +254,42 @@ impl User {
         self.kind.backend.result(error)
     }
 
-    /// Follows controller changes as the reference's npad callbacks do: a device whose npad lost
-    /// its reader becomes unavailable, and one that got it back starts over as initialized.
-    fn sync(&self, state: &mut State) {
-        if !state.initialized {
-            return;
-        }
-        let host = self.hub.read(0);
-        let reader = host
-            .connected
-            .then(|| reader_npad(host.controller))
-            .flatten();
-        for (device, &npad_id) in state.devices.iter_mut().zip(&NPAD_IDS) {
-            if reader != Some(npad_id) {
-                *device = DeviceState::Unavailable;
-            } else if *device == DeviceState::Unavailable {
-                *device = DeviceState::Initialized;
+    fn nfc_enabled(&self) -> bool {
+        self.context
+            .nfc_enabled
+            .get()
+            .is_none_or(|enabled| enabled())
+    }
+
+    /// Starts every device over from the current reader: the one with it is initialized, the
+    /// rest unavailable, as the reference's `Initialize` and npad callbacks leave them.
+    fn reset(&self, state: &mut State) {
+        let (generation, reader) = self.context.nfc_readers.current();
+        state.generation = generation;
+        state.devices = NPAD_IDS.map(|npad_id| {
+            if npad_id == reader {
+                DeviceState::Initialized
+            } else {
+                DeviceState::Unavailable
             }
+        });
+    }
+
+    /// Follows controller changes since the last command.
+    fn sync(&self, state: &mut State) {
+        let readers = &self.context.nfc_readers;
+        readers.poll(&self.context.npad);
+        if state.initialized && state.generation != readers.current().0 {
+            self.reset(state);
         }
     }
 
-    /// The device `handle` names, once the manager is initialized (`GetDeviceHandle`).
+    /// The device `handle` names, once NFC is enabled and the manager initialized
+    /// (`GetDeviceHandle`).
     fn device(&self, state: &State, handle: u64) -> HleResult<usize> {
+        if !self.nfc_enabled() {
+            return Err(self.error(Error::NfcDisabled));
+        }
         if !state.initialized {
             return Err(self.error(Error::NfcNotInitialized));
         }
@@ -234,16 +311,18 @@ impl User {
         match command {
             Command::Initialize => {
                 state.initialized = true;
-                state.devices = [DeviceState::Unavailable; DEVICE_COUNT];
-                self.sync(&mut state);
+                self.reset(&mut state);
             }
             Command::Finalize => *state = State::FINALIZED,
             Command::GetState => ctx.push(u32::from(state.initialized)),
-            Command::IsNfcEnabled => ctx.push(1u8),
+            Command::IsNfcEnabled => ctx.push(u8::from(self.nfc_enabled())),
             Command::ListDevices => {
                 let capacity = ctx.writable_buffer(0).map_or(0, |buffer| buffer.size / 8);
                 if capacity == 0 {
                     return Err(self.error(Error::InvalidArgument));
+                }
+                if !self.nfc_enabled() {
+                    return Err(self.error(Error::NfcDisabled));
                 }
                 if !state.initialized {
                     return Err(self.error(Error::NfcNotInitialized));
@@ -353,7 +432,16 @@ pub(crate) mod testing {
         controller: Option<ControllerType>,
         register: fn(&Arc<ServiceContext>) -> lichii_common::HleResult<()>,
     ) -> (Arc<ServiceContext>, IpcClient) {
-        let (context, client) = context(program_id, Settings::default());
+        booted_with(program_id, Settings::default(), controller, register)
+    }
+
+    pub fn booted_with(
+        program_id: u64,
+        settings: Settings,
+        controller: Option<ControllerType>,
+        register: fn(&Arc<ServiceContext>) -> lichii_common::HleResult<()>,
+    ) -> (Arc<ServiceContext>, IpcClient) {
+        let (context, client) = context(program_id, settings);
         register(&context).unwrap();
         if let Some(controller) = controller {
             connect(&context, controller);

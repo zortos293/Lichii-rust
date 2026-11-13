@@ -75,12 +75,20 @@ mod tests {
     use lichii_common::settings::ControllerType;
     use lichii_kernel::ipc::UNKNOWN_COMMAND_ID;
 
-    use super::common::testing::{booted, disconnect, is_quiet_event, list_devices, user};
-    use crate::testing::{Request, SWITCH1_TITLE, SWITCH2_TITLE};
+    use std::time::{Duration, Instant};
+
+    use lichii_kernel::ipc::Handle;
+    use lichii_kernel::object::KObject;
+
+    use super::common::testing::{
+        booted, booted_with, connect, disconnect, is_quiet_event, list_devices, user,
+    };
+    use crate::testing::{Request, SWITCH1_TITLE, SWITCH2_TITLE, TempDir};
 
     const NFC_DEVICE_NOT_FOUND: ResultCode = ResultCode::new(127, 64);
     const NFC_WRONG_DEVICE_STATE: ResultCode = ResultCode::new(127, 73);
     const NFC_NOT_INITIALIZED: ResultCode = ResultCode::new(127, 77);
+    const NFC_DISABLED: ResultCode = ResultCode::new(127, 80);
     const NFP_WRONG_DEVICE_STATE: ResultCode = ResultCode::new(115, 73);
     const NFP_NFC_DISABLED: ResultCode = ResultCode::new(115, 80);
 
@@ -175,6 +183,100 @@ mod tests {
         assert_eq!(call(on(4)).result, ResultCode::SUCCESS);
         assert_eq!(call(Request::new(1)).result, ResultCode::SUCCESS);
         assert_eq!(call(Request::new(10)).pop::<u32>(), 0);
+    }
+
+    /// Waits for the hid updater to signal `event`, with no NFC command in between.
+    fn wait_signaled(client: &lichii_kernel::testing::IpcClient, event: Handle) {
+        let Some(KObject::ReadableEvent(event)) = client.object(event) else {
+            panic!("not a readable event");
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !event.is_signaled() {
+            assert!(Instant::now() < deadline, "availability event never fired");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        event.clear();
+    }
+
+    #[test]
+    fn controller_changes_signal_the_availability_event() {
+        let (context, client) = booted(SWITCH1_TITLE, None, |context| {
+            crate::hid::register(context)?;
+            super::register(context)
+        });
+        let hid = client.connect("hid").unwrap();
+        let resource = client
+            .send(hid, &Request::new(0).send_pid().arg(0x51u64))
+            .unwrap()
+            .move_handles[0];
+        assert_eq!(
+            client.send(resource, &Request::new(0)).unwrap().result,
+            ResultCode::SUCCESS,
+            "hid shared memory starts the updater"
+        );
+
+        let user = user(&client, "nfc:user");
+        client.send(user, &Request::new(400)).unwrap();
+        let reply = client.send(user, &Request::new(407)).unwrap();
+        assert!(is_quiet_event(&client, &reply));
+        let event = reply.copy_handles[0];
+        assert_eq!(
+            list_devices(&client, user, 404).0.result,
+            NFC_DEVICE_NOT_FOUND
+        );
+
+        connect(&context, ControllerType::ProController);
+        wait_signaled(&client, event);
+        assert_eq!(list_devices(&client, user, 404).1, [0], "connected");
+
+        disconnect(&context);
+        wait_signaled(&client, event);
+        assert_eq!(
+            list_devices(&client, user, 404).0.result,
+            NFC_DEVICE_NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn disabling_nfc_in_set_sys_disables_every_interface() {
+        let dir = TempDir::new("nfc-disabled");
+        let (_context, client) = booted_with(
+            SWITCH1_TITLE,
+            dir.settings(),
+            Some(ControllerType::ProController),
+            |context| {
+                crate::set::register(context)?;
+                super::register(context)?;
+                crate::nfp::register(context)
+            },
+        );
+        let set_sys = client.connect("set:sys").unwrap();
+        let reply = client.send(set_sys, &Request::new(70).arg(0u8)).unwrap();
+        assert_eq!(reply.result, ResultCode::SUCCESS);
+
+        let nfc = user(&client, "nfc:user");
+        assert_eq!(client.send(nfc, &Request::new(403)).unwrap().pop::<u8>(), 0);
+        client.send(nfc, &Request::new(400)).unwrap();
+        assert_eq!(list_devices(&client, nfc, 404).0.result, NFC_DISABLED);
+        for command in [406, 408, 410, 411] {
+            let reply = client.send(nfc, &Request::new(command).arg(0u64)).unwrap();
+            assert_eq!(reply.result, NFC_DISABLED, "nfc {command}");
+        }
+
+        for (service, initialize, list, mount) in [("nfp:user", 0, 2, 5), ("nfc:mf:u", 0, 2, 5)] {
+            let user = user(&client, service);
+            client.send(user, &Request::new(initialize)).unwrap();
+            assert_eq!(
+                list_devices(&client, user, list).0.result,
+                NFP_NFC_DISABLED,
+                "{service}"
+            );
+            let reply = client.send(user, &Request::new(mount).arg(0u64)).unwrap();
+            assert_eq!(reply.result, NFP_NFC_DISABLED, "{service} {mount}");
+        }
+
+        client.send(set_sys, &Request::new(70).arg(1u8)).unwrap();
+        assert_eq!(list_devices(&client, nfc, 404).1, [0], "enabled again");
     }
 
     #[test]

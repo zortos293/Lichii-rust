@@ -68,6 +68,10 @@ pub struct ServiceContext {
     pub(crate) user: OnceLock<[u8; 16]>,
     /// The vi state, once vi registered: am creates the application's layer in it.
     pub(crate) vi: OnceLock<Arc<crate::vi::Vi>>,
+    /// Which npad has an NFC reader; hid's updater polls it so NFC sees controller changes.
+    pub(crate) nfc_readers: Arc<crate::nfc::common::Readers>,
+    /// Reads `set:sys`'s NFC enable flag, once set registered.
+    pub(crate) nfc_enabled: OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
     /// The NAND's registered content, indexed on first use by [`crate::fs::system_data`].
     pub(crate) installed_content: OnceLock<Option<ContentIndex>>,
     applets: RwLock<Arc<dyn AppletFrontend>>,
@@ -78,6 +82,7 @@ impl ServiceContext {
     /// Builds the shared state. `core::System` calls this once per boot, after creating the
     /// title's process, and passes the result to [`crate::register_all`].
     pub fn new(parts: ServiceParts) -> Arc<Self> {
+        let nfc_readers = Arc::new(crate::nfc::common::Readers::new(&parts.npad));
         Arc::new(Self {
             kernel: parts.kernel,
             settings: parts.settings,
@@ -92,6 +97,8 @@ impl ServiceContext {
             hid: OnceLock::new(),
             user: OnceLock::new(),
             vi: OnceLock::new(),
+            nfc_readers,
+            nfc_enabled: OnceLock::new(),
             installed_content: OnceLock::new(),
             applets: RwLock::new(Arc::new(HeadlessApplets)),
             threads: Mutex::new(HashMap::new()),
