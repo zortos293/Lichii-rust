@@ -7,9 +7,12 @@
 //! Lookups first try a per-address-space table keyed by the GPU address and the guest layout,
 //! validated by the GMMU's mapping generation: a hit costs one hash lookup and allocates
 //! nothing. A miss walks the mapping, reuses an image of the same layout (or one that holds the
-//! requested image as a level/layer run), and otherwise creates a new image. Overlapping images
-//! that a new one cannot take in are flushed to guest memory when the GPU modified them and
-//! then dropped; images that fit as subresources of the new one are copied into it on the GPU.
+//! requested image as a level/layer run), and otherwise creates a new image. Images that fit as
+//! subresources of the new one are copied into it on the GPU. Other overlapping images stay
+//! live beside it as overlaps: whichever was modified later owns the shared guest bytes, so
+//! write-backs leave those bytes to it, and an image whose shared bytes a later overlap wrote
+//! takes them through guest memory only when it is next used without being overwritten whole.
+//! A transient target the guest clears before each use never round-trips.
 //! Pitch-linear images with the same pitch, such as a render target and a narrower texture over
 //! it, stay live side by side as aliases: whichever the GPU wrote last is copied into the other
 //! on the GPU when that one is next used, so neither round-trips through guest memory.
@@ -276,6 +279,13 @@ struct CachedImage {
     aliases: Vec<Alias>,
     /// Tick of the last GPU work that wrote this image itself rather than copied from an alias.
     written: u64,
+    /// Live images over some of the same guest bytes that neither can copy texels from.
+    overlaps: Vec<ImageId>,
+    /// Tick up to which the image holds what its overlaps wrote: its last GPU write, upload or
+    /// whole overwrite. An overlap modified after it makes the shared texels stale.
+    current: u64,
+    /// Device ranges of removed overlaps modified after this image: write-backs skip them.
+    keep_out: Vec<(DAddr, DAddr)>,
 }
 
 /// A live image that shares a rectangle of texels with another, at level 0 of layer 0:
@@ -459,6 +469,9 @@ pub struct TextureCache {
     joins: Vec<(ImageId, u32, u32)>,
     new_aliases: Vec<Alias>,
     alias_scratch: Vec<Alias>,
+    new_overlaps: Vec<ImageId>,
+    overlap_scratch: Vec<ImageId>,
+    keep: Vec<(DAddr, DAddr)>,
     segments: Vec<Segment>,
     scratch: Scratch,
     readback: Option<Buffer>,
@@ -604,7 +617,7 @@ fn write_guest(
     segments: &[Segment],
     offset: u64,
     data: &[u8],
-    keep: Option<(DAddr, DAddr)>,
+    keep: &[(DAddr, DAddr)],
 ) {
     let end = offset + data.len() as u64;
     let write = |daddr: DAddr, chunk: &[u8]| {
@@ -620,16 +633,20 @@ fn write_guest(
         let chunk = &data[(start - offset) as usize..(stop - offset) as usize];
         let daddr = s.daddr + (start - s.offset);
         let chunk_end = daddr + chunk.len() as u64;
-        match keep {
-            Some((k0, k1)) if k0 < chunk_end && k1 > daddr => {
-                if k0 > daddr {
-                    write(daddr, &chunk[..(k0 - daddr) as usize]);
-                }
-                if k1 < chunk_end {
-                    write(k1, &chunk[(k1 - daddr) as usize..]);
-                }
+        let mut from = daddr;
+        while from < chunk_end {
+            let next = keep
+                .iter()
+                .filter(|&&(k0, k1)| k0 < chunk_end && k1 > from)
+                .min_by_key(|k| k.0);
+            let to = next.map_or(chunk_end, |k| k.0.max(from));
+            if to > from {
+                write(from, &chunk[(from - daddr) as usize..(to - daddr) as usize]);
             }
-            _ => write(daddr, chunk),
+            match next {
+                Some(&(_, k1)) => from = k1,
+                None => break,
+            }
         }
     }
 }
@@ -689,6 +706,9 @@ impl TextureCache {
             joins: Vec::new(),
             new_aliases: Vec::new(),
             alias_scratch: Vec::new(),
+            new_overlaps: Vec::new(),
+            overlap_scratch: Vec::new(),
+            keep: Vec::new(),
             segments: Vec::new(),
             scratch: Scratch::default(),
             readback: None,
@@ -855,7 +875,10 @@ impl TextureCache {
             image.info.levels == 1 && image.info.layers == info.layers
         };
         if discard && whole {
-            self.image(found.id).cpu_dirty = false;
+            let tick = self.tick;
+            let image = self.image(found.id);
+            image.cpu_dirty = false;
+            image.current = tick;
         }
         self.refresh(tx, found.id)?;
         let target = if self.can_rescale(found.id) {
@@ -1019,6 +1042,8 @@ impl TextureCache {
         image.cpu_dirty = false;
         image.modified = tick;
         image.written = tick;
+        image.current = tick;
+        image.keep_out.clear();
     }
 
     /// The guest CPU wrote `[daddr, daddr + size)`: overlapping images re-upload on next use.
@@ -1637,6 +1662,7 @@ impl TextureCache {
         }
         self.joins.clear();
         self.new_aliases.clear();
+        self.new_overlaps.clear();
         let host = self.host(info.format);
         let overlaps = std::mem::take(&mut self.ids);
         for &id in &overlaps {
@@ -1666,17 +1692,19 @@ impl TextureCache {
                 {
                     self.joins.push((id, level, layer));
                 }
-                _ => {
-                    if image.gpu_modified {
-                        self.download(tx, &[id], None)?;
-                    }
-                    self.remove(tx.scheduler, id);
-                }
+                Some(_) if !image.gpu_modified => self.remove(tx.scheduler, id),
+                _ => self.new_overlaps.push(id),
             }
         }
         self.ids = overlaps;
         let segments = self.segments.clone();
         let id = self.create(info, segments)?;
+        let new_overlaps = std::mem::take(&mut self.new_overlaps);
+        for &other in &new_overlaps {
+            self.image(other).overlaps.push(id);
+        }
+        self.image(id).overlaps.extend_from_slice(&new_overlaps);
+        self.new_overlaps = new_overlaps;
         let new_aliases = std::mem::take(&mut self.new_aliases);
         for alias in new_aliases
             .iter()
@@ -1791,6 +1819,9 @@ impl TextureCache {
             last_use: self.frame,
             aliases: Vec::new(),
             written: 0,
+            overlaps: Vec::new(),
+            current: 0,
+            keep_out: Vec::new(),
         };
         let index = match self.free.pop() {
             Some(index) => index,
@@ -1836,6 +1867,15 @@ impl TextureCache {
         for alias in &image.aliases {
             if let Some(other) = self.get_mut(alias.id) {
                 other.aliases.retain(|a| a.id != id);
+            }
+        }
+        for &other in &image.overlaps {
+            let other = self.get_mut(other).expect("overlaps are live");
+            other.overlaps.retain(|&o| o != id);
+            if other.gpu_modified && other.modified < image.modified {
+                other
+                    .keep_out
+                    .extend(image.segments.iter().map(|s| (s.daddr, s.daddr + s.size)));
             }
         }
         self.removals += 1;
@@ -1892,19 +1932,90 @@ impl TextureCache {
         Ok(())
     }
 
-    /// Uploads guest memory into the image when the guest CPU wrote it since the last upload,
-    /// then copies in what its aliases' GPU work wrote since.
+    /// Uploads guest memory into the image when the guest CPU or a later overlap wrote it since
+    /// the last upload, then copies in what its aliases' GPU work wrote since.
     fn refresh(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
+        self.take_from_overlaps(tx, id)?;
         if self.image(id).cpu_dirty {
             self.rescale(tx, id, ResolutionScale::X1, false)?;
             self.upload(tx, id)?;
+            let tick = self.tick;
             let image = self.image(id);
             image.cpu_dirty = false;
+            image.current = tick;
+            image.keep_out.clear();
             for alias in &mut image.aliases {
                 alias.synced = 0;
             }
         }
         self.take_from_aliases(tx.scheduler, id)
+    }
+
+    /// Readies an upload of what overlaps modified after the image last held their bytes:
+    /// writes back the GPU-modified ones, and its own texels around theirs unless they cover
+    /// all of it.
+    fn take_from_overlaps(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
+        let mut newer = std::mem::take(&mut self.overlap_scratch);
+        newer.clear();
+        let image = self.get(id).expect("a live image id");
+        let current = image.current;
+        newer.extend(
+            image
+                .overlaps
+                .iter()
+                .copied()
+                .filter(|&o| self.get(o).is_some_and(|o| o.modified > current)),
+        );
+        if newer.is_empty() {
+            self.overlap_scratch = newer;
+            return Ok(());
+        }
+        let own = image.gpu_modified && !self.covered(id, &newer);
+        newer.retain(|&o| self.get(o).is_some_and(|o| o.gpu_modified));
+        if own {
+            newer.push(id);
+        }
+        let result = self.download(tx, &newer, None);
+        self.overlap_scratch = newer;
+        result?;
+        let image = self.image(id);
+        image.gpu_modified = false;
+        image.cpu_dirty = true;
+        Ok(())
+    }
+
+    /// Whether the segments of the `newer` images cover every byte of `id`.
+    fn covered(&self, id: ImageId, newer: &[ImageId]) -> bool {
+        let image = self.get(id).expect("a live image id");
+        image.segments.iter().all(|s| {
+            let (mut at, end) = (s.daddr, s.daddr + s.size);
+            while at < end {
+                let reach = newer
+                    .iter()
+                    .flat_map(|&o| &self.get(o).expect("overlaps are live").segments)
+                    .filter(|o| o.daddr <= at && at < o.daddr + o.size)
+                    .map(|o| o.daddr + o.size)
+                    .max();
+                let Some(reach) = reach else {
+                    return false;
+                };
+                at = reach;
+            }
+            true
+        })
+    }
+
+    /// Appends the device ranges a write-back of `id` leaves alone: those of overlaps modified
+    /// after it, live or removed.
+    fn keep_newer(&self, id: ImageId, keep: &mut Vec<(DAddr, DAddr)>) {
+        let image = self.get(id).expect("a live image id");
+        keep.extend_from_slice(&image.keep_out);
+        for &other in &image.overlaps {
+            let other = self.get(other).expect("overlaps are live");
+            if other.modified > image.modified {
+                keep.extend(other.segments.iter().map(|s| (s.daddr, s.daddr + s.size)));
+            }
+        }
     }
 
     /// Copies in, oldest first, the rectangles of GPU-modified aliases that wrote themselves
@@ -2211,12 +2322,16 @@ impl TextureCache {
         if result.is_ok()
             && let Some(data) = readback.as_ref().and_then(Buffer::mapped)
         {
+            let mut ranges = std::mem::take(&mut self.keep);
             for download in &downloads {
+                ranges.clear();
+                ranges.extend(keep);
+                self.keep_newer(download.id, &mut ranges);
                 self.write_back(
                     tx.memory,
                     download.id,
                     &data[download.offset as usize..],
-                    keep,
+                    &ranges,
                 );
                 let image = self.image(download.id);
                 image.gpu_modified = false;
@@ -2225,6 +2340,7 @@ impl TextureCache {
                 self.traffic.download_bytes += bytes;
                 self.hand_off(tx.scheduler, download.id);
             }
+            self.keep = ranges;
         }
         self.readback = readback;
         self.downloads = downloads;
@@ -2372,7 +2488,7 @@ impl TextureCache {
         memory: &DeviceAddressSpace,
         id: ImageId,
         data: &[u8],
-        keep: Option<(DAddr, DAddr)>,
+        keep: &[(DAddr, DAddr)],
     ) {
         let Self {
             slots,
@@ -2488,12 +2604,16 @@ impl TextureCache {
                 continue;
             }
             if image.gpu_modified {
+                let mut ranges = std::mem::take(&mut self.keep);
+                ranges.clear();
+                self.keep_newer(download.id, &mut ranges);
                 self.write_back(
                     tx.memory,
                     download.id,
                     &data[download.offset as usize..],
-                    None,
+                    &ranges,
                 );
+                self.keep = ranges;
                 self.stats.flushed += 1;
             }
             self.evict(tx.scheduler, download.id);

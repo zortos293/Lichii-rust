@@ -600,7 +600,7 @@ fn render_targets_sampled_later_reuse_the_gpu_written_image() {
 }
 
 #[test]
-fn incompatible_overlaps_are_flushed_then_replaced() {
+fn incompatible_overlaps_stay_live_and_take_newer_texels_through_guest_memory() {
     let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
         return;
     };
@@ -610,10 +610,10 @@ fn incompatible_overlaps_are_flushed_then_replaced() {
     let (id, _) = f.texture(&tic(0x08, GPU_VA, 128, 32, 1, 1, 2));
     assert_ne!(id, target.id);
     assert!(
-        f.cache.state(target.id).is_none(),
-        "the render target was dropped"
+        f.cache.state(target.id).is_some(),
+        "the render target stays live"
     );
-    assert_eq!(f.cache.len(), 1);
+    assert_eq!(f.cache.len(), 2);
     let mut guest = vec![0; 16 << 10];
     f.memory.read_bytes(DADDR, &mut guest).unwrap();
     assert!(
@@ -631,6 +631,139 @@ fn incompatible_overlaps_are_flushed_then_replaced() {
             .iter()
             .all(|t| *t == [0, 255, 0, 255])
     );
+    f.assert_no_validation_errors();
+}
+
+const GREEN: [u8; 4] = [0, 255, 0, 255];
+const RED: [u8; 4] = [255, 0, 0, 255];
+
+fn guest_texels(f: &Fixture, offset: u64, len: usize) -> Vec<u8> {
+    let mut guest = vec![0; len];
+    f.memory.read_bytes(DADDR + offset, &mut guest).unwrap();
+    guest
+}
+
+fn count_texels(texels: &[u8], expected: [u8; 4]) -> usize {
+    texels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|t| **t == expected)
+        .count()
+}
+
+#[test]
+fn targets_cleared_whole_over_overlaps_skip_the_guest_round_trip() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let big = rt_info(64, 64, 3, GobLayout::Tegra);
+    let small = rt_info(32, 32, 2, GobLayout::Tegra);
+    assert_eq!(small.size_bytes(), 4 << 10);
+    let before = f.cache.traffic();
+    let a = clear_rt(&mut f, &big, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let b = clear_rt(&mut f, &small, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    let again = clear_rt(&mut f, &big, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let b_again = clear_rt(&mut f, &small, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    assert_eq!((again.id, b_again.id), (a.id, b.id), "both stay live");
+    assert_eq!(
+        f.cache.traffic(),
+        before,
+        "no write-back or upload between whole clears"
+    );
+    let (mut tx, cache, _) = f.tx();
+    cache.flush(&mut tx, DADDR, 16 << 10).unwrap();
+    assert!(
+        all_texels(&guest_texels(&f, 0, 4 << 10), RED),
+        "the newer target's bytes"
+    );
+    assert!(all_texels(&guest_texels(&f, 4 << 10, 12 << 10), GREEN));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn write_backs_leave_the_bytes_of_newer_overlaps_alone() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let big = rt_info(64, 64, 3, GobLayout::Tegra);
+    let small = rt_info(32, 32, 2, GobLayout::Tegra);
+    clear_rt(&mut f, &big, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    clear_rt(&mut f, &small, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    let (mut tx, cache, _) = f.tx();
+    cache.flush(&mut tx, DADDR + (8 << 10), 4 << 10).unwrap();
+    assert_eq!(
+        count_texels(&guest_texels(&f, 0, 4 << 10), GREEN),
+        0,
+        "the older target skips the newer one's bytes"
+    );
+    assert!(all_texels(&guest_texels(&f, 4 << 10, 12 << 10), GREEN));
+    let (mut tx, cache, _) = f.tx();
+    cache.flush(&mut tx, DADDR, 4 << 10).unwrap();
+    assert!(all_texels(&guest_texels(&f, 0, 4 << 10), RED));
+    assert!(all_texels(&guest_texels(&f, 4 << 10, 12 << 10), GREEN));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn write_backs_leave_the_bytes_of_removed_newer_overlaps_alone() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let big = rt_info(64, 64, 3, GobLayout::Tegra);
+    clear_rt(&mut f, &big, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let b = clear_rt_at(
+        &mut f,
+        GPU_VA + (8 << 10),
+        &big,
+        [1.0, 0.0, 0.0, 1.0],
+        Rect::ALL,
+    );
+    let (mut tx, cache, _) = f.tx();
+    cache.flush(&mut tx, DADDR + (16 << 10), 8 << 10).unwrap();
+    assert!(all_texels(&guest_texels(&f, 8 << 10, 16 << 10), RED));
+    let chain = ImageInfo { levels: 2, ..big };
+    let (mut tx, cache, gmmu) = f.tx();
+    let found = cache
+        .find(&mut tx, gmmu, GPU_VA + (8 << 10), &chain)
+        .unwrap()
+        .unwrap();
+    assert!(
+        f.cache.state(b.id).is_none(),
+        "the written-back target is a level of the new chain"
+    );
+    assert!(all_texels(&guest_texels(&f, 0, 8 << 10), GREEN));
+    assert!(
+        all_texels(&guest_texels(&f, 8 << 10, 16 << 10), RED),
+        "the older target's write-back skips the removed one's bytes"
+    );
+    assert!(all_texels(&f.read_image(found.id)[0], RED));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn stale_overlaps_take_newer_texels_before_they_are_drawn_into() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let big = rt_info(64, 64, 3, GobLayout::Tegra);
+    let small = rt_info(32, 32, 2, GobLayout::Tegra);
+    let a = clear_rt(&mut f, &big, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let b = clear_rt(&mut f, &small, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    let (mut tx, cache, gmmu) = f.tx();
+    let found = cache
+        .render_target(&mut tx, gmmu, GPU_VA, &big, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.id, a.id);
+    let read = f.read_image(a.id);
+    assert_eq!(
+        count_texels(&read[0], RED),
+        32 * 32,
+        "the small target's texels"
+    );
+    assert_eq!(count_texels(&read[0], GREEN), 64 * 64 - 32 * 32);
+    assert!(all_texels(&f.read_image(b.id)[0], RED));
     f.assert_no_validation_errors();
 }
 
@@ -1322,8 +1455,8 @@ fn rejected_overlaps_keep_the_lookups_alias_rectangles() {
         Rect::ALL,
     );
     assert!(
-        f.cache.state(right).is_none(),
-        "the overlap that wraps the pitch is flushed and dropped"
+        f.cache.state(right).is_some(),
+        "the overlap that wraps the pitch stays live beside the strip"
     );
     let (texture, _) = f.texture(&pitch_tic(GPU_VA, 16, 8, 256));
     assert_eq!(texture, left);
