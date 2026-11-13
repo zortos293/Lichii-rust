@@ -397,12 +397,12 @@ fn semaphore_met(
     let current = if wide {
         memory.read::<u64>(address)
     } else {
-        memory.read::<u32>(address).map(|guest| {
-            let seen = memory
-                .translate(address)
-                .and_then(|device| mirror.read(device, guest));
-            u64::from(seen.unwrap_or(guest))
-        })
+        let load = || memory.read::<u32>(address);
+        match memory.translate(address) {
+            Some(device) => mirror.acquire_view(device, load),
+            None => load(),
+        }
+        .map(u64::from)
     };
     match current {
         Ok(current) => op.is_met(current, payload, wide),

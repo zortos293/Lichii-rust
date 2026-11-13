@@ -27,6 +27,7 @@ use crate::engines::maxwell_3d::{DirtyState, Regs};
 use crate::gmmu::Gmmu;
 use crate::host::Reduction;
 use crate::host1x::Syncpoints;
+use crate::semaphore_mirror::{self, FirstPage};
 pub use crate::written_pages::GpuWrittenPages;
 
 /// A GPU channel (one per nvhost-gpu channel or NVN2 queue).
@@ -295,22 +296,41 @@ impl FenceAction {
                 value,
                 size,
             } => {
-                if !write_semaphore(handles, address, value, size) {
+                let timestamp = match size {
+                    ReleaseSize::Sixteen => handles.timestamp.now(),
+                    ReleaseSize::Four | ReleaseSize::Eight => 0,
+                };
+                let words = [
+                    value as u32,
+                    (value >> 32) as u32,
+                    timestamp as u32,
+                    (timestamp >> 32) as u32,
+                ];
+                let words = &words[..match size {
+                    ReleaseSize::Four => 1,
+                    ReleaseSize::Eight => 2,
+                    ReleaseSize::Sixteen => 4,
+                }];
+                let bytes = 4 * words.len() as u64;
+                let mirror = handles.syncpoints.semaphore_mirror();
+                let mut page = mirror.first_page(address);
+                if let Err(fault) = handles
+                    .device
+                    .write_bytes(address, bytemuck::cast_slice(words))
+                {
+                    tracing::warn!(?fault, "semaphore release to unmapped device memory");
                     return;
                 }
-                let mirror = handles.syncpoints.semaphore_mirror();
-                mirror.note_direct(address);
-                let Some(target) = mirror.mirror_of(address) else {
-                    return;
-                };
-                if !mirror.diverts(target) {
-                    write_semaphore(handles, target, value, size);
-                } else if let Ok(guest) = handles.device.read::<u32>(target) {
-                    mirror.set(target, value as u32, guest);
-                    handles
-                        .syncpoints
-                        .semaphore_waiters()
-                        .met_by(target, value as u32);
+                if let Some(page) = &mut page {
+                    page.note_direct(address, bytes);
+                }
+                drop(page);
+                handles
+                    .syncpoints
+                    .semaphore_waiters()
+                    .written(&handles.device, address, bytes);
+                if let Some(page) = mirror.mirror_of(address) {
+                    mirror_release(handles, page, address - semaphore_mirror::PAGE, words);
                 }
             }
             Self::ReduceSemaphore {
@@ -319,6 +339,8 @@ impl FenceAction {
                 signed,
                 payload,
             } => {
+                let mirror = handles.syncpoints.semaphore_mirror();
+                let mut page = mirror.first_page(address);
                 let Some(word) = semaphore_word(&handles.device, address) else {
                     tracing::warn!(
                         address,
@@ -336,17 +358,21 @@ impl FenceAction {
                     old = current;
                 }
                 let after = op.apply(old, payload, signed);
-                let seen = handles.syncpoints.semaphore_mirror().note_combined(
-                    address,
-                    old,
-                    after,
-                    |current| op.apply(current, payload, signed),
-                );
+                let seen = match &mut page {
+                    Some(page) => page.combine(address, old, after, |current| {
+                        op.apply(current, payload, signed)
+                    }),
+                    None => after,
+                };
+                drop(page);
                 let waiters = handles.syncpoints.semaphore_waiters();
                 if seen == after {
                     waiters.written(&handles.device, address, 4);
                 } else {
                     waiters.met_by(address, seen);
+                }
+                if let Some(page) = mirror.mirror_of(address) {
+                    mirror_release(handles, page, address - semaphore_mirror::PAGE, &[after]);
                 }
             }
             Self::IncrementSyncpoint(id) => {
@@ -571,29 +597,39 @@ impl Rasterizer for NullRasterizer {
 
 /// The 32-bit semaphore at `address` as an atomic, so reductions running on different threads
 /// never lose an update.
-/// Writes a semaphore release and latches the waiters it meets; false when the memory is unmapped.
-fn write_semaphore(handles: &GpuHandles, address: DAddr, value: u64, size: ReleaseSize) -> bool {
-    let result = match size {
-        ReleaseSize::Four => handles.device.write(address, value as u32),
-        ReleaseSize::Eight => handles.device.write(address, value),
-        ReleaseSize::Sixteen => handles
-            .device
-            .write(address, [value, handles.timestamp.now()]),
-    };
-    if let Err(fault) = result {
-        tracing::warn!(?fault, "semaphore release to unmapped device memory");
-        return false;
+/// Writes the `words` of a release that landed in a second page to `target` in the region's
+/// first `page`. A word with releases of its own keeps its value in memory, and acquires see the
+/// mirrored one beside it.
+fn mirror_release(handles: &GpuHandles, mut page: FirstPage<'_>, target: DAddr, words: &[u32]) {
+    let mut kept = [None; 4];
+    let mut written = 0;
+    for (index, &word) in words.iter().enumerate() {
+        let address = target + 4 * index as u64;
+        if !page.contains(address) {
+            break;
+        }
+        if !page.diverts(address) {
+            if let Err(fault) = handles.device.write(address, word) {
+                tracing::warn!(
+                    ?fault,
+                    "mirrored semaphore release to unmapped device memory"
+                );
+                break;
+            }
+        } else if let Ok(guest) = handles.device.read::<u32>(address) {
+            page.keep(address, word, guest);
+            kept[index] = Some(word);
+        }
+        written += 4;
     }
-    let bytes = match size {
-        ReleaseSize::Four => 4,
-        ReleaseSize::Eight => 8,
-        ReleaseSize::Sixteen => 16,
-    };
-    handles
-        .syncpoints
-        .semaphore_waiters()
-        .written(&handles.device, address, bytes);
-    true
+    drop(page);
+    let waiters = handles.syncpoints.semaphore_waiters();
+    waiters.written(&handles.device, target, written);
+    for (index, value) in kept.into_iter().enumerate() {
+        if let Some(value) = value {
+            waiters.met_by(target + 4 * index as u64, value);
+        }
+    }
 }
 
 fn semaphore_word(device: &DeviceAddressSpace, address: DAddr) -> Option<&AtomicU32> {
@@ -670,6 +706,98 @@ mod tests {
         }
         .execute(&h);
         assert_eq!(h.device.read::<u32>(0x10_0000).unwrap(), 15);
+    }
+
+    const FIRST: DAddr = 0x10_0000;
+
+    fn handles_with_region() -> (AddressSpace, GpuHandles) {
+        let (space, handles) = handles();
+        space.map(0x1000_1000, 0x1000, 0x1000, MemoryPermission::READ_WRITE);
+        handles
+            .device
+            .map_process(FIRST + 0x1000, &space, 0x1000_1000, 0x1000)
+            .unwrap();
+        handles.syncpoints.semaphore_mirror().add_region(FIRST);
+        (space, handles)
+    }
+
+    fn release(h: &GpuHandles, address: DAddr, value: u64, size: ReleaseSize) {
+        FenceAction::WriteSemaphore {
+            address,
+            value,
+            size,
+        }
+        .execute(h);
+    }
+
+    fn reduce(h: &GpuHandles, address: DAddr, op: Reduction, payload: u32) {
+        FenceAction::ReduceSemaphore {
+            address,
+            op,
+            signed: false,
+            payload,
+        }
+        .execute(h);
+    }
+
+    fn acquire_sees(h: &GpuHandles, address: DAddr) -> u32 {
+        h.syncpoints
+            .semaphore_mirror()
+            .acquire_view(address, || h.device.read::<u32>(address))
+            .unwrap()
+    }
+
+    #[test]
+    fn wide_mirrors_keep_each_word_with_releases_of_its_own() {
+        let (_space, h) = handles_with_region();
+        release(&h, FIRST + 4, 9, ReleaseSize::Four);
+        release(&h, FIRST + 0x1000, 6 << 32 | 5, ReleaseSize::Eight);
+        assert_eq!(h.device.read::<[u32; 2]>(FIRST + 0x1000).unwrap(), [5, 6]);
+        assert_eq!(h.device.read::<[u32; 2]>(FIRST).unwrap(), [5, 9]);
+        assert_eq!(acquire_sees(&h, FIRST), 5);
+        assert_eq!(acquire_sees(&h, FIRST + 4), 6);
+
+        release(&h, FIRST + 0x1010, 7, ReleaseSize::Sixteen);
+        assert_eq!(
+            h.device.read::<[u64; 2]>(FIRST + 0x10).unwrap(),
+            h.device.read::<[u64; 2]>(FIRST + 0x1010).unwrap()
+        );
+    }
+
+    #[test]
+    fn second_page_reductions_reach_the_first_page() {
+        let (_space, h) = handles_with_region();
+        reduce(&h, FIRST + 0x1010, Reduction::Max, 5);
+        assert_eq!(h.device.read::<u32>(FIRST + 0x10).unwrap(), 5);
+
+        release(&h, FIRST + 0x20, 9, ReleaseSize::Four);
+        reduce(&h, FIRST + 0x1020, Reduction::Add, 4);
+        assert_eq!(h.device.read::<u32>(FIRST + 0x20).unwrap(), 9);
+        assert_eq!(acquire_sees(&h, FIRST + 0x20), 4);
+    }
+
+    #[test]
+    fn acquires_polled_during_reductions_keep_the_mirrored_value() {
+        let (_space, h) = handles_with_region();
+        release(&h, FIRST, 0, ReleaseSize::Four);
+        release(&h, FIRST + 0x1000, 10, ReleaseSize::Four);
+        assert_eq!(acquire_sees(&h, FIRST), 10);
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !done.load(Ordering::Acquire) {
+                    acquire_sees(&h, FIRST);
+                }
+            });
+            scope.spawn(|| {
+                for _ in 0..2000 {
+                    reduce(&h, FIRST, Reduction::Add, 1);
+                }
+                done.store(true, Ordering::Release);
+            });
+        });
+        assert_eq!(h.device.read::<u32>(FIRST).unwrap(), 2000);
+        assert_eq!(acquire_sees(&h, FIRST), 2010);
     }
 
     #[test]
