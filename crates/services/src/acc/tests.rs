@@ -1,6 +1,6 @@
 use super::{
-    APPLICATION_INFO_ALREADY_INITIALIZED, AVATAR, INVALID_ARRAY_LENGTH, INVALID_USER_ID, UNKNOWN,
-    account_id, user_id,
+    APPLICATION_INFO_ALREADY_INITIALIZED, AVATAR, INVALID_ARRAY_LENGTH, INVALID_USER_ID, Profile,
+    UNKNOWN, account_id, user_id,
 };
 use lichii_kernel::testing::{IpcClient, Request};
 
@@ -474,4 +474,31 @@ fn users_of_a_cpp_profiles_file_are_opened_by_nickname_and_kept() {
     let saved = std::fs::read(&path).unwrap();
     assert_eq!(saved[..0x10 + 2 * 0xc8], file[..0x10 + 2 * 0xc8]);
     assert_eq!(saved[0x10 + 2 * 0xc8..][..16], user_id("player"));
+}
+
+#[test]
+fn an_exact_user_id_wins_over_a_nickname() {
+    let dir = TempDir::new("acc");
+    let mut file = vec![0; 0x10];
+    file.extend(user_raw([0x42; 16], "player", 1, 1));
+    file.extend(user_raw(user_id("player"), "Other", 2, 2));
+    file.resize(0x650, 0);
+    let path = profiles_file(&dir);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &file).unwrap();
+
+    let client = boot_in(&dir, "player");
+    let acc = client.connect("acc:u0").unwrap();
+    let last = client.send(acc, &Request::new(4)).unwrap().ok();
+    assert_eq!(last.get::<[u8; 16]>(0), user_id("player"));
+}
+
+#[test]
+fn an_unreadable_profiles_file_is_never_written() {
+    let dir = TempDir::new("acc");
+    let path = profiles_file(&dir);
+    std::fs::create_dir_all(&path).unwrap();
+    let profile = Profile::open("player", &dir.settings().paths.nand_dir.unwrap());
+    assert!(profile.slot.is_none());
+    assert!(path.is_dir());
 }

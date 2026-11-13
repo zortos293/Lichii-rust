@@ -82,10 +82,15 @@ struct ProfileData {
 
 const _: () = assert!(size_of::<ProfileData>() == 0x650);
 
-/// The users of the file at `path`; none when it is missing or short.
-fn read_profiles(path: &Path) -> ProfileData {
-    let data = std::fs::read(path).unwrap_or_default();
-    match data.get(..size_of::<ProfileData>()) {
+/// The users of the file at `path`; none when it is missing or short. An error is a file
+/// that exists but cannot be read.
+fn read_profiles(path: &Path) -> std::io::Result<ProfileData> {
+    let data = match std::fs::read(path) {
+        Ok(data) => data,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    Ok(match data.get(..size_of::<ProfileData>()) {
         Some(data) => bytemuck::pod_read_unaligned(data),
         None => {
             if !data.is_empty() {
@@ -93,7 +98,7 @@ fn read_profiles(path: &Path) -> ProfileData {
             }
             ProfileData::zeroed()
         }
-    }
+    })
 }
 
 /// The profile all `acc` interfaces share, and the file it is saved in.
@@ -110,19 +115,34 @@ struct Profile {
 }
 
 impl Profile {
-    /// Opens `username`'s user in `profiles.dat` under `nand`, adding (and saving) it when the
-    /// file has no user with its id or nickname.
+    /// Opens `username`'s user in `profiles.dat` under `nand`: the user with its id, else the
+    /// first with its nickname, else a new one added and saved. A file that exists but cannot
+    /// be read is never written.
     fn open(username: &str, nand: &Path) -> Self {
         let path = nand.join(PROFILES_PATH);
-        let data = read_profiles(&path);
+        let (data, writable) = match read_profiles(&path) {
+            Ok(data) => (data, true),
+            Err(e) => {
+                tracing::error!("reading {}: {e}; the profile is not saved", path.display());
+                (ProfileData::zeroed(), false)
+            }
+        };
         let uid = user_id(username);
         let mut nickname = [0; 32];
         let name = &username.as_bytes()[..username.len().min(32)];
         nickname[..name.len()].copy_from_slice(name);
-        let found = data.users.iter().position(|user| {
-            user.uuid != [0; 16] && (user.uuid == uid || user.nickname == nickname)
-        });
-        let slot = found.or_else(|| data.users.iter().position(|user| user.uuid == [0; 16]));
+        let in_use = |user: &UserRaw| user.uuid != [0; 16];
+        let found = data
+            .users
+            .iter()
+            .position(|user| in_use(user) && user.uuid == uid)
+            .or_else(|| {
+                data.users
+                    .iter()
+                    .position(|user| in_use(user) && user.nickname == nickname)
+            });
+        let free = || data.users.iter().position(|user| !in_use(user));
+        let slot = found.or_else(free).filter(|_| writable);
         let user = match found {
             Some(slot) => data.users[slot],
             None => UserRaw {
@@ -149,9 +169,10 @@ impl Profile {
         match (found, slot) {
             (Some(_), _) => {}
             (None, Some(_)) => profile.save(),
-            (None, None) => {
+            (None, None) if writable => {
                 tracing::warn!("profiles.dat has no free slot; {username} is not saved")
             }
+            (None, None) => {}
         }
         profile
     }

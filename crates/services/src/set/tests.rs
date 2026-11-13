@@ -566,3 +566,15 @@ fn settings_files_in_the_cpp_layout_are_read_and_kept() {
     assert_eq!(saved[0x10 + 0x29470], 1);
     assert_eq!(std::fs::read(&private).unwrap().len(), 0x10 + 0xd8);
 }
+
+#[test]
+fn an_unreadable_settings_file_is_never_written() {
+    let dir = TempDir::new("set");
+    let system = settings_file(&dir, "8000000000000050");
+    std::fs::create_dir_all(&system).unwrap();
+    std::fs::write(system.join("kept"), b"kept").unwrap();
+    let files = super::save::SettingsFiles::open(dir.settings().paths.nand_dir.unwrap());
+    files.store();
+    assert_eq!(std::fs::read(system.join("kept")).unwrap(), b"kept");
+    assert!(settings_file(&dir, "8000000000000052").is_file());
+}

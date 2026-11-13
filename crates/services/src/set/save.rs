@@ -59,15 +59,27 @@ pub(super) struct SettingsFiles {
     system: Vec<u8>,
     private: Vec<u8>,
     loaded: [bool; 2],
+    /// Per part, whether its file may be written: not when it exists but could not be read.
+    writable: [bool; 2],
 }
 
 impl SettingsFiles {
-    /// Reads both files under `nand`. A missing or malformed one starts from the defaults.
+    /// Reads both files under `nand`. A missing or malformed one starts from the defaults; one
+    /// that cannot be read starts from them too and is never written.
     pub(super) fn open(nand: PathBuf) -> Self {
-        let read = |part: Part| read_part(&nand, part);
-        let (system, private) = (read(Part::System), read(Part::Private));
+        let read = |part: Part| match read_part(&nand, part) {
+            Ok(bytes) => (bytes, true),
+            Err(e) => {
+                let path = nand.join(part.dir()).join(FILE_NAME);
+                tracing::error!("reading {}: {e}; it is not saved", path.display());
+                (None, false)
+            }
+        };
+        let ((system, system_writable), (private, private_writable)) =
+            (read(Part::System), read(Part::Private));
         Self {
             loaded: [system.is_some(), private.is_some()],
+            writable: [system_writable, private_writable],
             system: system.unwrap_or_else(|| Part::System.default_bytes()),
             private: private.unwrap_or_else(|| Part::Private.default_bytes()),
             nand,
@@ -96,6 +108,9 @@ impl SettingsFiles {
     /// Writes both files, each to a temporary file renamed over the old one.
     pub(super) fn store(&self) {
         for part in [Part::System, Part::Private] {
+            if !self.writable[part as usize] {
+                continue;
+            }
             let path = self.nand.join(part.dir()).join(FILE_NAME);
             let mut file = Vec::with_capacity(HEADER_SIZE + part.size());
             file.extend_from_slice(&MAGIC);
@@ -109,16 +124,21 @@ impl SettingsFiles {
     }
 }
 
-/// The structure in `part`'s file, if it has the C++ header, version and size.
-fn read_part(nand: &Path, part: Part) -> Option<Vec<u8>> {
+/// The structure in `part`'s file, if it exists with the C++ header, version and size. An
+/// error is a file that exists but cannot be read.
+fn read_part(nand: &Path, part: Part) -> std::io::Result<Option<Vec<u8>>> {
     let path = nand.join(part.dir()).join(FILE_NAME);
-    let file = std::fs::read(&path).ok()?;
+    let file = match std::fs::read(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
     let valid = file.len() == HEADER_SIZE + part.size()
         && file[..8] == MAGIC
         && u32::from_le_bytes(file[8..12].try_into().unwrap()) >= VERSION;
     if !valid {
         tracing::warn!("{} is not a settings file; using defaults", path.display());
-        return None;
+        return Ok(None);
     }
-    Some(file[HEADER_SIZE..].to_vec())
+    Ok(Some(file[HEADER_SIZE..].to_vec()))
 }
