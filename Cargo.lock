@@ -1550,6 +1550,7 @@ dependencies = [
  "lichii-crypto",
  "lichii-fs",
  "lichii-input",
+ "lichii-kernel",
  "lichii-loader",
  "lichii-services",
  "lichii-texture",

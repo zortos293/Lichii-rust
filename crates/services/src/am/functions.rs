@@ -26,6 +26,12 @@ const PRESELECTED_USER_SIZE: usize = 0x88;
 const ACCOUNT_SAVE: u8 = 1;
 const DEVICE_SAVE: u8 = 3;
 
+/// `ProgramSpecifyKind` values `ExecuteProgram` accepts: `ExecuteProgram` and `RestartProgram`.
+const EXECUTE_PROGRAM: u32 = 0;
+const RESTART_PROGRAM: u32 = 2;
+/// Masks a program id down to its application's id (`FileSys::GetBaseTitleID`).
+const BASE_TITLE_ID_MASK: u64 = !0x1fff;
+
 /// Largest storage `CreateStorage` makes; applet arguments are a few KiB to a few MiB.
 const MAX_STORAGE_SIZE: i64 = 64 << 20;
 
@@ -145,6 +151,39 @@ impl Service for ApplicationFunctions {
                 ctx.push(0i32);
                 ResultCode::SUCCESS
             }
+            12 => {
+                let application_id: u64 = ctx.pop();
+                let base = context.program.program_id & BASE_TITLE_ID_MASK;
+                let index = match application_id {
+                    0 => Some(0),
+                    id if id & BASE_TITLE_ID_MASK == base => u8::try_from(id - base).ok(),
+                    _ => None,
+                };
+                let Some(index) = index else {
+                    tracing::error!(
+                        application_id = format_args!("{application_id:016x}"),
+                        "starting another application is not supported"
+                    );
+                    return Some(UNKNOWN);
+                };
+                applet.execute_program(context, index);
+                ResultCode::SUCCESS
+            }
+            120 => {
+                let kind: u32 = ctx.pop();
+                let value: u64 = ctx.pop();
+                let index = u8::try_from(value).ok();
+                match (kind, index) {
+                    (EXECUTE_PROGRAM | RESTART_PROGRAM, Some(index)) => {
+                        applet.execute_program(context, index)
+                    }
+                    _ => {
+                        tracing::error!(kind, value, "unsupported program to execute");
+                        return Some(UNKNOWN);
+                    }
+                }
+                ResultCode::SUCCESS
+            }
             121 => {
                 applet.state.lock().user_channel.clear();
                 ResultCode::SUCCESS
@@ -172,7 +211,8 @@ impl Service for ApplicationFunctions {
                 ResultCode::SUCCESS
             }
             123 => {
-                ctx.push(-1i32);
+                let previous = applet.state.lock().previous_program_index;
+                ctx.push(previous.map_or(-1, i32::from));
                 ResultCode::SUCCESS
             }
             130 => push_event(ctx, &applet.gpu_error_event),
