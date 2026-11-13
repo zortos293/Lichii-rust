@@ -274,6 +274,7 @@ impl Jit {
                 exclusive: exclusive_slow as *const () as usize,
                 zero: zero_slow as *const () as usize,
                 ticks: ticks as *const () as usize,
+                tsc_scale: config.clock.host_tsc_scale().map(std::ptr::from_ref),
             },
             arena: fastmem.map_or(std::ptr::null_mut(), |f| f.base()),
             config,
