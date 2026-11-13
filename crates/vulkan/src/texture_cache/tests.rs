@@ -742,6 +742,29 @@ fn write_backs_leave_the_bytes_of_removed_newer_overlaps_alone() {
 }
 
 #[test]
+fn stale_overlaps_are_not_joined_over_newer_whole_clears() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let big = rt_info(64, 64, 3, GobLayout::Tegra);
+    let small = rt_info(32, 32, 2, GobLayout::Tegra);
+    clear_rt(&mut f, &big, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    clear_rt(&mut f, &small, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    clear_rt(&mut f, &big, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let chain = ImageInfo { levels: 2, ..small };
+    let (mut tx, cache, gmmu) = f.tx();
+    let found = cache.find(&mut tx, gmmu, GPU_VA, &chain).unwrap().unwrap();
+    assert!(
+        all_texels(&f.read_image(found.id)[0], GREEN),
+        "the newer whole clear, not the stale small target"
+    );
+    let (mut tx, cache, _) = f.tx();
+    cache.flush(&mut tx, DADDR, 16 << 10).unwrap();
+    assert!(all_texels(&guest_texels(&f, 0, 16 << 10), GREEN));
+    f.assert_no_validation_errors();
+}
+
+#[test]
 fn stale_overlaps_take_newer_texels_before_they_are_drawn_into() {
     let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
         return;

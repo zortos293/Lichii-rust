@@ -1205,6 +1205,7 @@ impl TextureCache {
                     && image.info.width >= fb.width
                     && image.info.height >= fb.height
                     && layout_matches(&image.info)
+                    && !self.stale(id)
             })
             .max_by_key(|&id| self.get(id).map_or(0, |i| i.modified));
         if let Some(id) = found {
@@ -1716,7 +1717,9 @@ impl TextureCache {
                 .flatten();
             match subresource {
                 Some((level, layer))
-                    if image.gpu_modified && Self::copy_compatible(image, host, info.format) =>
+                    if image.gpu_modified
+                        && Self::copy_compatible(image, host, info.format)
+                        && !self.stale(id) =>
                 {
                     self.joins.push((id, level, layer));
                 }
@@ -2010,6 +2013,15 @@ impl TextureCache {
         image.gpu_modified = false;
         image.cpu_dirty = true;
         Ok(())
+    }
+
+    /// Whether an overlap was modified after `id` last held the shared bytes.
+    fn stale(&self, id: ImageId) -> bool {
+        let image = self.get(id).expect("a live image id");
+        image
+            .overlaps
+            .iter()
+            .any(|&o| self.get(o).expect("overlaps are live").modified > image.current)
     }
 
     /// Whether the segments of the `newer` images cover every byte of `id`.
