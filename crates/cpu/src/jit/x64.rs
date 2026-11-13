@@ -49,6 +49,8 @@ pub(super) struct Target {
     pub exclusive: usize,
     pub zero: usize,
     pub ticks: usize,
+    /// `simd::call`, which runs `Op::CallSimd`.
+    pub simd: usize,
     /// The clock's `TscScale`, which counter reads use inline instead of calling `ticks`.
     pub tsc_scale: Option<*const TscScale>,
     /// The host has `cmpxchg16b`.
@@ -724,6 +726,7 @@ impl Emitter<'_> {
                 dynasm!(self.asm ; .arch x64 ; mov Rq(d), QWORD [r13 + ST_HIGH]);
             }
             Op::Fence => dynasm!(self.asm ; .arch x64 ; mfence),
+            Op::CallSimd { word, pc } => self.call_simd(i, word, pc),
             _ => self.memory(i, op),
         }
         self.finish(i, &op);
@@ -825,6 +828,27 @@ impl Emitter<'_> {
         );
         self.restore(saved);
         dynasm!(self.asm ; .arch x64 ; mov Rq(d), rax);
+    }
+
+    /// Calls `simd(ctx, word, state, pc) -> undefined` from the main path, leaving through the fault
+    /// exit when the instruction is undefined.
+    fn call_simd(&mut self, i: usize, word: u32, pc: u64) {
+        let saved = self.live_across(i);
+        self.save(saved);
+        dynasm!(self.asm
+            ; .arch x64
+            ; mov rdi, r15
+            ; mov esi, word as i32
+            ; mov rdx, r13
+            ; mov rcx, QWORD pc as i64
+            ; mov rax, QWORD self.target.simd as i64
+            ; sub rsp, 8
+            ; call rax
+            ; add rsp, 8
+            ; test al, al
+            ; jnz =>self.fault_exit
+        );
+        self.restore(saved);
     }
 
     fn memory(&mut self, i: usize, op: Op) {
