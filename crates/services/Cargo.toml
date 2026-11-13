@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 lichii-common.workspace = true
+lichii-crypto.workspace = true
 lichii-memory.workspace = true
 lichii-kernel.workspace = true
 lichii-loader.workspace = true
@@ -14,3 +15,6 @@ lichii-input.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+lichii-kernel = { workspace = true, features = ["testing"] }
