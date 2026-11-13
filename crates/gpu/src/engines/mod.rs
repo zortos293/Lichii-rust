@@ -10,6 +10,8 @@ pub mod maxwell_3d;
 pub mod maxwell_dma;
 pub mod upload;
 
+use std::sync::Arc;
+
 use lichii_common::GpuVAddr;
 use lichii_texture::block_linear::GobLayout;
 
@@ -153,7 +155,9 @@ pub type EngineFactory =
 /// What a back-thread engine method may touch.
 pub struct EngineContext<'a> {
     pub channel: ChannelId,
-    pub memory: &'a Gmmu,
+    /// The channel's address space, shared so renderer workers can keep reading it (shader
+    /// translation off the back thread). Reads are lock-free while it is mapped and unmapped.
+    pub memory: &'a Arc<Gmmu>,
     pub rasterizer: &'a mut dyn Rasterizer,
     pub syncpoints: &'a Syncpoints,
     /// GOB byte order of block-linear surfaces (Switch 2 swaps bits 5 and 6).
