@@ -27,6 +27,8 @@ pub struct Instance {
     pub(crate) headless: Option<ext::headless_surface::Instance>,
     debug: Option<(ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
     validation_errors: Box<AtomicU32>,
+    #[cfg(test)]
+    _serial: test_serial::Token,
 }
 
 unsafe extern "system" fn debug_callback(
@@ -59,6 +61,8 @@ impl Instance {
     /// Loads Vulkan and creates an instance. Validation is enabled when `validation` is set
     /// and the Khronos layer is installed; otherwise it is skipped with a warning.
     pub fn new(validation: bool, surfaces: SurfaceSupport) -> Result<Self> {
+        #[cfg(test)]
+        let serial = test_serial::Token::acquire();
         // SAFETY: loading the system Vulkan library runs its initialisation code, which is
         // the documented way to use the loader.
         let entry = unsafe { ash::Entry::load()? };
@@ -165,6 +169,8 @@ impl Instance {
             headless,
             debug: debug.flatten(),
             validation_errors,
+            #[cfg(test)]
+            _serial: serial,
         })
     }
 
@@ -197,6 +203,40 @@ impl Drop for Instance {
                 loader.destroy_debug_utils_messenger(messenger, None);
             }
             self.raw.destroy_instance(None);
+        }
+    }
+}
+
+/// Unit tests keep one live instance per process: the Vulkan loader (1.4.341) frees a device in
+/// `vkDestroyDevice` before it unlinks it from the list other threads walk under their own
+/// lock, and the validation layer (1.3.275) keeps every instance and device in an unsynchronised
+/// global map. Parallel tests create and destroy instances and devices on many threads and
+/// crashed in both; the emulator itself creates one.
+#[cfg(test)]
+mod test_serial {
+    use std::sync::{Condvar, Mutex, PoisonError};
+
+    static LIVE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+
+    pub struct Token;
+
+    impl Token {
+        pub fn acquire() -> Self {
+            let (live, released) = &LIVE;
+            let mut live = live.lock().unwrap_or_else(PoisonError::into_inner);
+            while *live {
+                live = released.wait(live).unwrap_or_else(PoisonError::into_inner);
+            }
+            *live = true;
+            Self
+        }
+    }
+
+    impl Drop for Token {
+        fn drop(&mut self) {
+            let (live, released) = &LIVE;
+            *live.lock().unwrap_or_else(PoisonError::into_inner) = false;
+            released.notify_one();
         }
     }
 }
