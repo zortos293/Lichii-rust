@@ -1133,3 +1133,93 @@ fn gsv_hands_out_initialized_nvsrv_sessions() {
     assert!(fd > 0, "opened without Initialize");
     assert_eq!(error, 0);
 }
+
+fn decoder_preference(code: u32, width: u32, height: u32) -> Vec<u32> {
+    let mut preference = vec![0; 16];
+    preference[1] = code;
+    preference[2] = (height - 1) << 16 | (width - 1);
+    preference
+}
+
+#[test]
+fn decoder_image_pools_are_sized_and_described_like_the_codec_expects() {
+    let (_context, client, gsv) = gsv();
+    let nv12 = decoder_preference(1, 640, 360);
+    let mut reply = client
+        .send(
+            gsv,
+            &words(Request::tipc(991), &[nv12.clone(), vec![2]].concat()),
+        )
+        .unwrap();
+    assert_eq!(
+        reply.pop::<[u64; 2]>(),
+        [2 * 0x6_4000, 0x2000],
+        "640x360 NV12 is 0x64000 bytes"
+    );
+
+    let mut reply = client
+        .send(
+            gsv,
+            &words(Request::tipc(911), &[nv12, vec![3, 7]].concat()),
+        )
+        .unwrap();
+    let pool = reply.pop::<u32>();
+    let mut reply = client.send(gsv, &Request::tipc(961).arg(pool + 1)).unwrap();
+    let descriptor = reply.pop::<[u32; 32]>();
+    assert_eq!(
+        [
+            descriptor[0],
+            descriptor[2],
+            descriptor[4],
+            descriptor[6],
+            descriptor[8]
+        ],
+        [0xa, 0x6_4000, 640, 0x6_4000 + 640 * 384, 640]
+    );
+
+    let mut huge = decoder_preference(1, 640, 360);
+    huge.extend([u32::MAX, 7]);
+    let reply = client.send(gsv, &words(Request::tipc(911), &huge)).unwrap();
+    assert_ne!(reply.result, ResultCode::SUCCESS, "pools are bounded");
+
+    let bgra = decoder_preference(2, 100, 50);
+    let mut reply = client
+        .send(
+            gsv,
+            &words(Request::tipc(911), &[bgra, vec![1, 7]].concat()),
+        )
+        .unwrap();
+    let image = reply.pop::<u32>();
+    assert_eq!(image, pool + 3);
+    let mut reply = client.send(gsv, &Request::tipc(961).arg(image)).unwrap();
+    let descriptor = reply.pop::<[u32; 32]>();
+    assert_eq!((descriptor[0], descriptor[4], descriptor[6]), (0x9, 448, 0));
+
+    client.send(gsv, &Request::tipc(912).arg(pool + 1)).unwrap();
+    let mut reply = client.send(gsv, &Request::tipc(961).arg(pool + 1)).unwrap();
+    assert_eq!(
+        reply.pop::<[u32; 32]>(),
+        [0; 32],
+        "a destroyed image is gone"
+    );
+    let mut reply = client.send(gsv, &Request::tipc(961).arg(pool + 2)).unwrap();
+    assert_eq!(
+        reply.pop::<[u32; 32]>()[2],
+        2 * 0x6_4000,
+        "its siblings keep their place in the pool"
+    );
+
+    let mut reply = client
+        .send(
+            gsv,
+            &words(Request::tipc(429), &[hd_preference(), vec![1, 1]].concat()),
+        )
+        .unwrap();
+    let native = reply.pop::<u32>();
+    let mut reply = client.send(gsv, &Request::tipc(961).arg(native)).unwrap();
+    assert_eq!(
+        reply.pop::<[u32; 32]>()[0],
+        0,
+        "only decoder images have a CPU descriptor"
+    );
+}
