@@ -983,11 +983,11 @@ impl VulkanRasterizer {
                 || state.runtime(previous.as_deref().map(|m| &m.info)),
                 &mut bindings,
             );
-            diag_slow(
-                "module",
-                diag_t,
-                (slot as u64) << 56 | lichii_shader::ShaderEnvironment::start_address(&env),
-            );
+            if diag_t.elapsed() > std::time::Duration::from_millis(50) {
+                let (start, len) = env.code_range();
+                let a_range = vertex_a.as_ref().map(|a| a.code_range());
+                tracing::warn!(target: "diag", "DIAG slow module {:?} slot={slot} start={start:#x} len={len:#x} vertex_a={a_range:x?} hash={:x?}", diag_t.elapsed(), module.as_ref().map(|m| m.hash));
+            }
             let Some(module) = module else {
                 return false;
             };
