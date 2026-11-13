@@ -84,6 +84,28 @@ fn one_sided_write_reads_undef_on_the_other_path() {
 }
 
 #[test]
+fn a_merge_reached_from_an_unreachable_join_still_merges_the_reachable_writes() {
+    let mut prog = Program::new();
+    let b = blocks(&mut prog, 7);
+    prog.add_branch(b[0], b[1]);
+    prog.add_branch(b[0], b[2]);
+    prog.add_branch(b[1], b[3]);
+    prog.add_branch(b[2], b[3]);
+    prog.add_branch(b[5], b[4]);
+    prog.add_branch(b[6], b[4]);
+    prog.add_branch(b[4], b[3]);
+    set(&mut prog, b[1], 1);
+    set(&mut prog, b[2], 2);
+    let r = use_r1(&mut prog, b[3]);
+    optimize(&mut prog);
+    let ops = phi_operands(&prog, prog.arg(r, 0));
+    assert!(
+        ops.contains(&Value::U32(1)) && ops.contains(&Value::U32(2)),
+        "{ops:?}"
+    );
+}
+
+#[test]
 fn same_value_on_both_paths_needs_no_phi() {
     let mut prog = Program::new();
     let b = blocks(&mut prog, 4);
