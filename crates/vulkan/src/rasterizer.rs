@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ash::vk;
+use gpu_allocator::MemoryLocation;
 use lichii_common::DAddr;
 use lichii_common::settings::{AstcRecompression, GraphicsSettings, ResolutionScale};
 use lichii_gpu::backend::ChannelId;
@@ -33,7 +34,7 @@ use crate::commands::{COLOR_RANGE, ImageAccess, transition};
 use crate::device::Device;
 use crate::error::Result;
 use crate::format::{Conversion, host_format};
-use crate::memory::{Image, ImageDesc};
+use crate::memory::{Buffer, Image, ImageDesc};
 use crate::pipeline::PipelineCache;
 use crate::present::{FrameImage, FrameMailbox, GuestFrame};
 use crate::scheduler::Scheduler;
@@ -95,6 +96,9 @@ pub struct VulkanRasterizer {
     handles: GpuHandles,
     scheduler: Scheduler,
     staging: StagingRing,
+    /// Host-visible buffers framebuffers are read into, each with the tick of the present that
+    /// used it last; reused once that present completed, so presents allocate nothing.
+    frame_uploads: Vec<(u64, Buffer)>,
     mailbox: Arc<FrameMailbox>,
     gob_layout: GobLayout,
     frames: Vec<Arc<FrameImage>>,
@@ -198,6 +202,7 @@ impl VulkanRasterizer {
             handles,
             scheduler,
             staging: StagingRing::new(device, 32 << 20)?,
+            frame_uploads: Vec::new(),
             mailbox,
             gob_layout,
             frames: Vec::new(),
@@ -624,6 +629,46 @@ impl VulkanRasterizer {
         Ok(frame)
     }
 
+    /// The index in `frame_uploads` of a buffer of at least `size` bytes that no in-flight work
+    /// uses, claimed for the work being recorded.
+    fn frame_upload(&mut self, size: u64) -> Result<usize> {
+        let tick = self.scheduler.tick();
+        let free =
+            |scheduler: &mut Scheduler, (used, _): &(u64, Buffer)| scheduler.is_complete(*used);
+        let index = match self
+            .frame_uploads
+            .iter()
+            .position(|upload| free(&mut self.scheduler, upload) && upload.1.size() >= size)
+        {
+            Some(index) => index,
+            None => {
+                let buffer = Buffer::new(
+                    &self.device,
+                    size,
+                    vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::STORAGE_BUFFER,
+                    MemoryLocation::CpuToGpu,
+                    "framebuffer upload",
+                )?;
+                match self
+                    .frame_uploads
+                    .iter()
+                    .position(|upload| free(&mut self.scheduler, upload))
+                {
+                    Some(index) => {
+                        self.frame_uploads[index].1 = buffer;
+                        index
+                    }
+                    None => {
+                        self.frame_uploads.push((tick, buffer));
+                        self.frame_uploads.len() - 1
+                    }
+                }
+            }
+        };
+        self.frame_uploads[index].0 = tick;
+        Ok(index)
+    }
+
     fn upload_frame(&mut self, fb: &FramebufferConfig) -> Result<()> {
         let info = fb.format.info();
         let host = host_format(&self.device, fb.format, AstcRecompression::Uncompressed);
@@ -648,12 +693,12 @@ impl VulkanRasterizer {
             )
         });
         let size = tiling.map_or(row * height as usize, |tiling| tiling.size_bytes());
-        let slice = self.staging.alloc(
-            &mut self.scheduler,
-            size as u64,
-            self.buffer_cache.storage_alignment(),
-        )?;
-        let data = &mut slice.data[..size];
+        let index = self.frame_upload(size as u64)?;
+        let upload = &mut self.frame_uploads[index].1;
+        let buffer = upload.raw();
+        let data = &mut upload
+            .mapped_mut()
+            .expect("framebuffer uploads are host visible")[..size];
         let read = match tiling {
             Some(_) => self.handles.device.read_bytes(fb.address, data),
             None => data
@@ -674,8 +719,8 @@ impl VulkanRasterizer {
             return Ok(());
         }
         let staged = BufferBinding {
-            buffer: slice.buffer,
-            offset: slice.offset,
+            buffer,
+            offset: 0,
             size: size as u64,
         };
         let frame = self.frame_image(width, height, &host)?;
@@ -1218,6 +1263,31 @@ mod tests {
             assert!(texels == linear, "{layout:?}: deswizzled texels differ");
             f.assert_no_validation_errors();
         }
+    }
+
+    #[test]
+    fn presents_reuse_their_upload_buffer_once_it_is_free() {
+        let Some(mut f) = fixture(GobLayout::Tegra) else {
+            return;
+        };
+        let fb = FramebufferConfig {
+            block_height_log2: Some(2),
+            ..framebuffer(64, 32)
+        };
+        f.rasterizer.present(&fb);
+        f.rasterizer.present(&fb);
+        assert_eq!(
+            f.rasterizer.frame_uploads.len(),
+            2,
+            "the first is still in flight"
+        );
+        f.rasterizer.scheduler.finish().unwrap();
+        for _ in 0..4 {
+            f.rasterizer.present(&fb);
+            f.rasterizer.scheduler.finish().unwrap();
+        }
+        assert_eq!(f.rasterizer.frame_uploads.len(), 2);
+        f.assert_no_validation_errors();
     }
 
     /// The back thread's cost of presenting a 1080p block-linear framebuffer that is not in the
