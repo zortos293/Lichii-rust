@@ -164,6 +164,8 @@ pub(super) struct DrawState {
     texture_scaling: ScalingBits<{ NUM_TEXTURE_SCALING_WORDS as usize }>,
     /// Storage images of the current draw and whether it writes them.
     storage_images: Vec<(ImageId, bool)>,
+    /// A storage image was scaled down while binding, so views collected before it are stale.
+    rebind: bool,
     image_scaling: ScalingBits<{ NUM_IMAGE_SCALING_WORDS as usize }>,
     texel_views: Vec<vk::BufferView>,
     /// Texel buffer formats by `PixelFormat`: the host format and whether uniform and storage
@@ -279,6 +281,7 @@ impl DrawState {
             textures: Vec::new(),
             texture_scaling: ScalingBits::default(),
             storage_images: Vec::new(),
+            rebind: false,
             image_scaling: ScalingBits::default(),
             texel_views: Vec::new(),
             texel_formats: vec![None; PixelFormat::ALL.len()],
@@ -572,6 +575,7 @@ impl VulkanRasterizer {
         let gmmu = ctx.memory;
         let (index, indirect) = loop {
             let merged = self.buffer_cache.stats().merged_buffers;
+            self.draw.rebind = false;
             self.draw.buffer_infos.clear();
             self.draw.image_infos.clear();
             self.draw.writes.clear();
@@ -619,7 +623,7 @@ impl VulkanRasterizer {
                 },
                 DrawCall::Direct(_) => None,
             };
-            if self.buffer_cache.stats().merged_buffers == merged {
+            if self.buffer_cache.stats().merged_buffers == merged && !self.draw.rebind {
                 break (index, indirect);
             }
         };
@@ -1068,7 +1072,7 @@ impl VulkanRasterizer {
                         let desc = info.texture_buffer_descriptors[descriptor];
                         for i in 0..b.count {
                             let raw = handle_word(src, desc.handle, i << desc.size_shift);
-                            let view = self.texel_view(src, raw, None, false)?;
+                            let view = self.texel_view(src, raw, None, false, false)?;
                             self.push_texel_view(view, vk::Format::R8G8B8A8_UNORM)?;
                         }
                     }
@@ -1079,7 +1083,7 @@ impl VulkanRasterizer {
                             let offset = desc.cbuf_offset + (i << desc.size_shift);
                             let raw =
                                 read_cbuf::<u32>(src.gmmu, src.cbufs, desc.cbuf_index, offset);
-                            let view = self.texel_view(src, raw, format, desc.is_written)?;
+                            let view = self.texel_view(src, raw, format, true, desc.is_written)?;
                             let null = match format.and_then(|f| self.texel_format(f)) {
                                 Some(texel) => texel.format,
                                 None if desc.is_integer || format.is_some() => vk::Format::R32_UINT,
@@ -1090,7 +1094,7 @@ impl VulkanRasterizer {
                     }
                     DescriptorKind::StorageImage => {
                         let desc = info.image_descriptors[descriptor];
-                        let mut rescaled = false;
+                        let mut array_rescaled = None;
                         for i in 0..b.count {
                             let offset = desc.cbuf_offset + (i << desc.size_shift);
                             let raw =
@@ -1102,10 +1106,17 @@ impl VulkanRasterizer {
                                 );
                                 return Ok(false);
                             };
-                            rescaled |= self
+                            let rescaled = self
                                 .texture_cache
                                 .state(id)
                                 .is_some_and(|s| s.scale != ResolutionScale::X1);
+                            if *array_rescaled.get_or_insert(rescaled) != rescaled {
+                                self.draw.warn_once(
+                                    Warning::MixedScaleArray,
+                                    "a draw binds a storage image array mixing rescaled and native images; skipping it",
+                                );
+                                return Ok(false);
+                            }
                             self.draw.storage_images.push((id, desc.is_written));
                             self.draw.image_infos.push(vk::DescriptorImageInfo {
                                 sampler: vk::Sampler::null(),
@@ -1113,7 +1124,7 @@ impl VulkanRasterizer {
                                 image_layout: vk::ImageLayout::GENERAL,
                             });
                         }
-                        if rescaled {
+                        if array_rescaled == Some(true) {
                             self.draw.image_scaling.set(b.descriptor);
                         }
                     }
@@ -1182,6 +1193,7 @@ impl VulkanRasterizer {
         src: &StageSources<'_>,
         raw: u32,
         explicit: Option<PixelFormat>,
+        storage: bool,
         written: bool,
     ) -> Result<Option<vk::BufferView>> {
         let (index, _) = src.pool.split(raw);
@@ -1193,7 +1205,6 @@ impl VulkanRasterizer {
             return Ok(None);
         }
         let format = explicit.unwrap_or(header.format);
-        let storage = explicit.is_some() || written;
         let Some(texel) = self
             .texel_format(format)
             .filter(|f| if storage { f.storage } else { f.uniform })
@@ -1263,6 +1274,7 @@ impl VulkanRasterizer {
                 memory: &self.handles.device,
             };
             self.texture_cache.scale_down(&mut tx, id)?;
+            self.draw.rebind = true;
         }
         if let Some(format) = storage_format(desc.format) {
             view.format = format;
@@ -1954,6 +1966,7 @@ impl VulkanRasterizer {
         };
         loop {
             let merged = self.buffer_cache.stats().merged_buffers;
+            self.draw.rebind = false;
             self.draw.buffer_infos.clear();
             self.draw.image_infos.clear();
             self.draw.writes.clear();
@@ -1965,7 +1978,7 @@ impl VulkanRasterizer {
             if !self.bind_resources(&module, &sources)? {
                 return Ok(());
             }
-            if self.buffer_cache.stats().merged_buffers == merged {
+            if self.buffer_cache.stats().merged_buffers == merged && !self.draw.rebind {
                 break;
             }
         }
