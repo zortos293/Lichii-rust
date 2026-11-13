@@ -192,15 +192,18 @@ fn const_buffers() -> GraphicsConstBuffers {
 }
 
 fn draw(f: &mut Fixture, gmmu: &Gmmu, regs: &Regs) {
+    draw_with(f, gmmu, regs, &const_buffers());
+}
+
+fn draw_with(f: &mut Fixture, gmmu: &Gmmu, regs: &Regs, const_buffers: &GraphicsConstBuffers) {
     let mut dirty = DirtyState::new();
-    let const_buffers = const_buffers();
     let root_tables = [[0; 64]; 8];
     let mut ctx = GraphicsContext {
         channel: ChannelId(0),
         memory: gmmu,
         regs,
         dirty: &mut dirty,
-        const_buffers: &const_buffers,
+        const_buffers,
         root_tables: &root_tables,
     };
     f.rasterizer.draw(
@@ -471,6 +474,46 @@ fn cpu_writes_to_cached_programs_translate_them_again() {
     assert_eq!(colours[1], original, "the first program again");
     assert_eq!(f.rasterizer.draw.shaders.stats().translated, 3);
     f.assert_no_validation_errors();
+}
+
+/// The guest CPU rewrites a bound uniform buffer between draws: the next draw reads the new
+/// values, for a streamed buffer and for one over 4 KiB that binds the cached buffer through
+/// write tracking, the second rewrite too.
+#[test]
+fn draws_read_uniform_buffers_the_cpu_rewrote() {
+    const CPU_VA: u64 = 0x1000_0000;
+    for size in [0x200, 0x2000] {
+        let Some((mut f, gmmu)) = draw_fixture() else {
+            return;
+        };
+        let space = cpu_space(&f, &[(CPU_VA, FRAGMENT_CBUF)], 0x2000);
+        let mut const_buffers = const_buffers();
+        const_buffers[4][0].size = size;
+        write(
+            &f,
+            PROGRAMS + u64::from(FRAGMENT),
+            &fragment_program([0, 4]),
+        );
+        let regs = draw_regs();
+        draw_with(&mut f, &gmmu, &regs, &const_buffers);
+        assert!(
+            target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]),
+            "{size:#x}"
+        );
+        for (values, colour) in [
+            ([0.0, 1.0, 1.0, 1.0], [0, 255, 255, 255]),
+            ([1.0, 0.0, 1.0, 1.0], [255, 0, 255, 255]),
+        ] {
+            space.write_bytes(CPU_VA, &f32_bytes(&values)).unwrap();
+            drain_cpu_writes(&mut f);
+            draw_with(&mut f, &gmmu, &regs, &const_buffers);
+            assert!(
+                target(&mut f).iter().all(|&t| t == colour),
+                "{size:#x} {values:?}"
+            );
+        }
+        f.assert_no_validation_errors();
+    }
 }
 
 /// The guest CPU rewrites a texture after a draw sampled it, through two virtual aliases of its
