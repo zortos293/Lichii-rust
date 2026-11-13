@@ -353,4 +353,52 @@ mod tests {
             reader.join().unwrap();
         }
     }
+
+    #[test]
+    fn probe_monotonic_paths() {
+        fn run(timing: CoreTiming) -> (u64, u64) {
+            let timing = std::sync::Arc::new(timing);
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let readers: Vec<_> = (0..3)
+                .map(|_| {
+                    let (timing, stop) = (timing.clone(), stop.clone());
+                    std::thread::spawn(move || {
+                        let (mut last, mut backs, mut worst) = (0, 0, 0);
+                        while !stop.load(Ordering::Relaxed) {
+                            let now = timing.global_time_ns();
+                            if now < last {
+                                backs += 1;
+                                worst = worst.max(last - now);
+                            }
+                            last = last.max(now);
+                        }
+                        (backs, worst)
+                    })
+                })
+                .collect();
+            for _ in 0..2000 {
+                timing.pause();
+                std::hint::spin_loop();
+                timing.resume();
+            }
+            stop.store(true, Ordering::Relaxed);
+            readers
+                .into_iter()
+                .map(|r| r.join().unwrap())
+                .fold((0, 0), |a, b| (a.0 + b.0, a.1.max(b.1)))
+        }
+        let hz = measure_tsc_hz();
+        let mut tsc = (0, 0, 0);
+        let mut instant = (0, 0, 0);
+        for _ in 0..100 {
+            let (b, w) = run(CoreTiming::with_tsc_hz(ConsoleGeneration::Switch1, hz));
+            tsc = (tsc.0 + (b > 0) as u64, tsc.1 + b, tsc.2.max(w));
+            let (b, w) = run(CoreTiming::with_tsc_hz(ConsoleGeneration::Switch1, None));
+            instant = (instant.0 + (b > 0) as u64, instant.1 + b, instant.2.max(w));
+        }
+        panic!(
+            "PROBE2 hz={hz:?} trusted={:?} tsc(runs,backs,worst_ns)={tsc:?} instant={instant:?}",
+            trusted_tsc_hz()
+        );
+    }
 }
