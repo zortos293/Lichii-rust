@@ -7,7 +7,7 @@ use egui::{RichText, Ui};
 use lichii_common::settings::{ScalingFilter, Settings};
 
 use super::{combo, docked_toggle, note, section, speed_limit, time_zone};
-use crate::per_game::{GameConfig, copy_key};
+use crate::per_game::{self, GameConfig, copy_key};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -123,6 +123,13 @@ impl GameConfigWindow {
             out.close = true;
         }
         out
+    }
+
+    /// Follows a change made outside this window (the status bar, a hotkey, Configure):
+    /// settings whose value for this game went from `before` to `after` take the new value, and
+    /// the window's unsaved edits to other settings stay.
+    pub fn follow(&mut self, before: &Settings, after: &Settings) {
+        per_game::copy_changes(before, after, &mut self.draft);
     }
 
     fn save(&mut self) -> bool {
@@ -320,5 +327,26 @@ impl Rows<'_> {
         }
         ui.add_enabled_ui(on, |ui| ui.horizontal(|ui| add(ui, self.draft)));
         ui.end_row();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lichii_common::settings::{CpuAccuracy, ResolutionScale};
+
+    #[test]
+    fn outside_changes_follow_into_the_draft_without_undoing_its_edits() {
+        let global = Settings::default();
+        let mut window = GameConfigWindow::new("Game".into(), 1, GameConfig::default(), &global);
+        window.custom.insert("cpu.accuracy");
+        window.draft.cpu.accuracy = CpuAccuracy::Paranoid;
+
+        let mut after = global.clone();
+        after.graphics.resolution_scale = ResolutionScale::X2;
+        window.follow(&global, &after);
+
+        assert_eq!(window.draft.graphics.resolution_scale, ResolutionScale::X2);
+        assert_eq!(window.draft.cpu.accuracy, CpuAccuracy::Paranoid);
     }
 }

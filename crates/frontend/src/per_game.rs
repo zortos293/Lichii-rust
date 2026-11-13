@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use lichii_common::settings::Settings;
+use lichii_common::settings::{Settings, write_atomic};
 
 /// The settings a game can override, as `section.key`.
 pub const KEYS: &[&str] = &[
@@ -152,11 +152,8 @@ impl GameConfig {
                 _ => Ok(()),
             };
         }
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
         let text = toml::to_string_pretty(&self.overrides).map_err(std::io::Error::other)?;
-        std::fs::write(&self.path, text)
+        write_atomic(&self.path, text.as_bytes())
     }
 }
 

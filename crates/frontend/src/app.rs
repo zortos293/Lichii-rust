@@ -309,8 +309,10 @@ impl App {
         let rescan = settings.paths.game_dirs != self.settings.paths.game_dirs
             || settings.paths.keys_dir != self.settings.paths.keys_dir
             || settings.system.language != self.settings.system.language;
+        let window_before = self.game_window_settings();
         self.settings = settings;
         self.refresh_running();
+        self.follow_into_game_window(window_before);
         if let Some(session) = &self.session {
             session.set_audio_volume(&self.current().audio);
         }
@@ -611,6 +613,7 @@ Dump prod.keys and title.keys \
     /// configuration window's draft follows the global changes, and everything is saved.
     fn edit_settings(&mut self, edit: impl Fn(&mut Settings)) {
         let before = self.settings.clone();
+        let window_before = self.game_window_settings();
         match &mut self.running {
             Some(running) => {
                 running.config.edit(&mut self.settings, &edit);
@@ -624,7 +627,30 @@ Dump prod.keys and title.keys \
             per_game::copy_changes(&before, &self.settings, config.draft());
         }
         self.refresh_running();
+        self.follow_into_game_window(window_before);
         self.save_settings();
+    }
+
+    /// The settings the game in the Properties window runs with now.
+    fn game_window_settings(&self) -> Option<Settings> {
+        let window = self.game_config.as_ref()?;
+        Some(match &self.running {
+            Some(running) if running.config.file() == window.config.file() => {
+                running.settings.clone()
+            }
+            _ => window.config.apply(&self.settings),
+        })
+    }
+
+    /// Carries a change made outside the Properties window into its draft, so its next Apply
+    /// does not undo it.
+    fn follow_into_game_window(&mut self, before: Option<Settings>) {
+        let (Some(before), Some(after)) = (before, self.game_window_settings()) else {
+            return;
+        };
+        if let Some(window) = &mut self.game_config {
+            window.follow(&before, &after);
+        }
     }
 
     fn hotkey(&mut self, hotkey: HotkeyAction) {
