@@ -14,6 +14,8 @@ pub struct TestEnv {
     pub cbuf: Vec<u32>,
     pub local_memory: u32,
     pub base: GpuVAddr,
+    /// Program header words read from the 0x50 bytes in front of `base`.
+    pub header: [u32; 20],
 }
 
 impl TestEnv {
@@ -33,6 +35,7 @@ impl TestEnv {
             cbuf: Vec::new(),
             local_memory: 0,
             base: Self::BASE,
+            header: [0; 20],
         }
     }
 
@@ -57,6 +60,13 @@ impl ShaderEnvironment for TestEnv {
         self.base
     }
     fn read_u64(&self, address: GpuVAddr) -> u64 {
+        if let Some(i) = address
+            .checked_sub(self.base - 0x50)
+            .filter(|&offset| offset < 0x50)
+            .map(|offset| offset as usize / 4)
+        {
+            return u64::from(self.header[i]) | (u64::from(self.header[i + 1]) << 32);
+        }
         self.words
             .get((address.wrapping_sub(self.base) / 8) as usize)
             .copied()

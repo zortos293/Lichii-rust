@@ -29,11 +29,19 @@ pub(super) mod warp;
 
 use super::context::EmitContext;
 use super::{EmitError, EmitResult, driver};
-use crate::ir::{InstId, Opcode};
+use crate::ir::{InstId, Opcode, Type};
 
 /// Emits one instruction of the block being built.
 pub(super) fn emit_inst(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<()> {
     let op = ctx.program.op(inst);
+    if ctx.shared_memory_u32 == 0 && is_shared_memory_access(op) {
+        if op.ty() != Type::VOID {
+            let ty = ctx.declared_type(op.ty())?;
+            let zero = ctx.const_null(ty);
+            ctx.set_def(inst, zero);
+        }
+        return Ok(());
+    }
     let id = match op {
         Opcode::Phi => driver::emit_phi(ctx, inst)?,
         Opcode::Identity | Opcode::ConditionRef => ctx.def_arg(inst, 0)?,
@@ -631,4 +639,38 @@ pub(super) fn emit_inst(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<(
     };
     ctx.set_def(inst, id);
     Ok(())
+}
+
+/// Shared memory exists only in compute programs that declare a size; elsewhere a stray
+/// access reads zero and its stores are dropped.
+fn is_shared_memory_access(op: Opcode) -> bool {
+    use Opcode::*;
+    matches!(
+        op,
+        LoadSharedU8
+            | LoadSharedS8
+            | LoadSharedU16
+            | LoadSharedS16
+            | LoadSharedU32
+            | LoadSharedU64
+            | LoadSharedU128
+            | WriteSharedU8
+            | WriteSharedU16
+            | WriteSharedU32
+            | WriteSharedU64
+            | WriteSharedU128
+            | SharedAtomicIAdd32
+            | SharedAtomicSMin32
+            | SharedAtomicUMin32
+            | SharedAtomicSMax32
+            | SharedAtomicUMax32
+            | SharedAtomicInc32
+            | SharedAtomicDec32
+            | SharedAtomicAnd32
+            | SharedAtomicOr32
+            | SharedAtomicXor32
+            | SharedAtomicExchange32
+            | SharedAtomicExchange64
+            | SharedAtomicExchange32x2
+    )
 }

@@ -4,11 +4,11 @@
 use rspirv::spirv::{StorageClass, Word};
 use smallvec::SmallVec;
 
-use crate::ShaderStage;
 use crate::backend::spirv::context::{CbufElement, EmitContext};
 use crate::backend::spirv::{EmitError, EmitResult};
 use crate::ir::{Attribute, InstId, Patch, Value};
 use crate::runtime::AttributeType;
+use crate::{ShaderInfo, ShaderStage};
 
 fn survived_ssa(ctx: &EmitContext<'_>, inst: InstId) -> EmitError {
     EmitError::InvalidIr(format!(
@@ -172,6 +172,11 @@ fn get_cbuf(
             [binding, buffer_offset],
         )?);
     };
+    if binding as usize >= ShaderInfo::MAX_CBUFS {
+        return Err(EmitError::Unsupported(
+            "constant buffer index past the hardware slots",
+        ));
+    }
     let uniform_type = ctx.uniform_type(element);
     let cbuf = ctx.cbuf(binding as usize, element);
     let pointer = ctx.b.access_chain(
@@ -507,7 +512,7 @@ pub(super) fn get_attribute(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResu
             let pointer = ctx.b.access_chain(ctx.input_f32, None, variable, [index])?;
             Ok(ctx.b.load(f32_t, None, pointer, None, [])?)
         }
-        _ => Err(EmitError::InvalidIr(format!("read of attribute {attr}"))),
+        _ => Err(EmitError::UnsupportedAttribute(attr)),
     }
 }
 
@@ -521,11 +526,7 @@ pub(super) fn get_attribute_u32(ctx: &mut EmitContext<'_>, inst: InstId) -> Emit
         Attribute::BASE_INSTANCE => ctx.base_instance,
         Attribute::BASE_VERTEX => ctx.base_vertex,
         Attribute::DRAW_ID => ctx.draw_index,
-        _ => {
-            return Err(EmitError::InvalidIr(format!(
-                "U32 read of attribute {attr}"
-            )));
-        }
+        _ => return Err(EmitError::UnsupportedAttribute(attr)),
     };
     Ok(ctx.b.load(u32_t, None, variable, None, [])?)
 }
@@ -774,12 +775,19 @@ fn local_pointer(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
     )?)
 }
 
+/// A program whose header declares no local memory reads zero and drops its stores.
 pub(super) fn load_local(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
+    if ctx.local_memory == 0 {
+        return Ok(ctx.u32_zero_value);
+    }
     let pointer = local_pointer(ctx, inst)?;
     Ok(ctx.b.load(ctx.u32[1], None, pointer, None, [])?)
 }
 
 pub(super) fn write_local(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<()> {
+    if ctx.local_memory == 0 {
+        return Ok(());
+    }
     let value = ctx.def_arg(inst, 1)?;
     let pointer = local_pointer(ctx, inst)?;
     Ok(ctx.b.store(pointer, value, None, [])?)

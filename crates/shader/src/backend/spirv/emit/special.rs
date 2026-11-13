@@ -221,7 +221,11 @@ fn stream(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Option<Word>> {
     Ok(Some(ctx.u32_zero_value))
 }
 
+/// Vertex emission outside a geometry program (a stray `OUT`) does nothing.
 pub(super) fn emit_vertex(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<()> {
+    if ctx.stage != ShaderStage::Geometry {
+        return Ok(());
+    }
     if ctx.runtime.convert_depth_mode && !ctx.profile.support_native_ndc {
         convert_depth_mode(ctx)?;
     }
@@ -238,6 +242,9 @@ pub(super) fn emit_vertex(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult
 }
 
 pub(super) fn end_primitive(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<()> {
+    if ctx.stage != ShaderStage::Geometry {
+        return Ok(());
+    }
     match stream(ctx, inst)? {
         None => ctx.b.end_primitive()?,
         Some(stream) => ctx.b.end_stream_primitive(stream)?,

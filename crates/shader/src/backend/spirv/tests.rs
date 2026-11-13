@@ -824,3 +824,93 @@ fn generic_input_types_follow_the_vertex_attribute_formats() {
 }
 
 mod memory;
+
+/// Random Maxwell programs with random program headers, through translation and `compile`, for
+/// every stage this backend emits: each either fails with an error or yields a module that
+/// passes spirv-val.
+#[test]
+fn random_programs_compile_to_valid_spirv_for_every_stage() {
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let native_host = HostTranslateInfo {
+        support_float64: true,
+        support_float16: true,
+        support_int64: true,
+        ..HostTranslateInfo::default()
+    };
+    let minimal_host = HostTranslateInfo::default();
+    let native = Profile {
+        support_int8: true,
+        support_int16: true,
+        support_int64: true,
+        support_float16: true,
+        support_float64: true,
+        ..Profile::default()
+    };
+    let stages = [
+        ShaderStage::Compute,
+        ShaderStage::VertexB,
+        ShaderStage::TessellationControl,
+        ShaderStage::TessellationEval,
+        ShaderStage::Geometry,
+        ShaderStage::Fragment,
+    ];
+    for stage in stages {
+        let mut compiled = 0;
+        for i in 0..1500 {
+            let len = 1 + (next() % 5) as usize;
+            let mut code: Vec<u64> = (0..len)
+                .map(|_| {
+                    let op = Sass::ALL[(next() % Sass::ALL.len() as u64) as usize];
+                    (encode(op, next()) & !(0xf << 16)) | PT
+                })
+                .collect();
+            code.push(encode(Sass::Exit, PT | 0xf));
+            let mut env = TestEnv::new(&code);
+            env.stage = stage;
+            for word in &mut env.header {
+                *word = next() as u32;
+            }
+            let topology = [1, 6, 7][(next() % 3) as usize];
+            env.header[3] = (env.header[3] & !(0xf << 24)) | (topology << 24);
+            env.header[2] = (env.header[2] & 0x00ff_ffff) | ((1 + next() as u32 % 4) << 24);
+            env.header[4] = (env.header[4] & !0xfff) | (1 + next() as u32 % 16);
+            for byte in 0x18..0x38 {
+                let mode = (next() % 4) as u32 * 0x55;
+                let shift = byte % 4 * 8;
+                env.header[byte / 4] = (env.header[byte / 4] & !(0xff << shift)) | (mode << shift);
+            }
+            let (profile, host) = if i % 2 == 0 {
+                (&native, &native_host)
+            } else {
+                (&Profile::default(), &minimal_host)
+            };
+            let options = TranslateOptions {
+                profile,
+                host,
+                resolution_scale: ResolutionScale::X1,
+            };
+            let mut bindings = Bindings::default();
+            match crate::module::compile(&env, options, &RuntimeInfo::default(), &mut bindings) {
+                Ok(module) => {
+                    validate(&format!("random-{stage:?}-{i}"), profile, &module.spirv);
+                    compiled += 1;
+                }
+                Err(crate::TranslateError::InvalidIr(e)) => panic!("{stage:?} {code:x?}: {e}"),
+                Err(crate::TranslateError::Emit(EmitError::InvalidIr(e))) => {
+                    panic!("{stage:?} {code:x?}: {e}")
+                }
+                Err(_) => {}
+            }
+        }
+        assert!(
+            compiled > 100,
+            "{stage:?}: only {compiled} programs compiled"
+        );
+    }
+}

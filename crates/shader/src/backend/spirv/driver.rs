@@ -370,12 +370,6 @@ fn setup_signed_nan_capabilities(ctx: &mut EmitContext<'_>, main: Word) {
 fn setup_capabilities(ctx: &mut EmitContext<'_>) {
     let info = ctx.info;
     let profile = ctx.profile;
-    if info.uses_sampled_1d {
-        ctx.add_capability(Capability::Sampled1D);
-    }
-    if info.uses_image_1d {
-        ctx.add_capability(Capability::Image1D);
-    }
     if info.uses_sparse_residency {
         ctx.add_capability(Capability::SparseResidency);
     }
@@ -431,9 +425,6 @@ fn setup_capabilities(ctx: &mut EmitContext<'_>) {
     }
     if info.uses_typeless_image_writes {
         ctx.add_capability(Capability::StorageImageWriteWithoutFormat);
-    }
-    if info.uses_image_buffers {
-        ctx.add_capability(Capability::ImageBuffer);
     }
     if info.uses_sample_id {
         ctx.add_capability(Capability::SampleRateShading);

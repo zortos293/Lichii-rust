@@ -17,7 +17,7 @@ use crate::Profile;
 use crate::RuntimeInfo;
 use crate::ShaderStage;
 use crate::backend::Bindings;
-use crate::ir::Opcode;
+use crate::ir::{Attribute, Opcode};
 use crate::translate::TranslatedProgram;
 
 /// Words of the texture rescaling bit set in the rescaling push constant block.
@@ -36,9 +36,9 @@ pub const RENDER_AREA_LAYOUT_OFFSET: u32 = 0;
 /// Why a program could not be emitted.
 #[derive(Debug, thiserror::Error)]
 pub enum EmitError {
-    /// The opcode's emission family has not been written yet.
-    #[error("SPIR-V emission of {0:?} is not implemented")]
-    Unimplemented(Opcode),
+    /// A read of an attribute the backend has no input for, such as a fixed-function varying.
+    #[error("reads of attribute {0} are not supported by the SPIR-V backend")]
+    UnsupportedAttribute(Attribute),
     /// Mesh, task and tensor instructions, which this backend does not emit.
     #[error("{0:?} is not supported by the SPIR-V backend")]
     UnsupportedOpcode(Opcode),

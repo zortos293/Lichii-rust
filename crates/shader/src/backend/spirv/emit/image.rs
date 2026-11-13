@@ -688,8 +688,15 @@ fn sample_explicit(
     emit_image_op(ctx, inst, info, ops, result_type, &fixed, &operands)
 }
 
+/// Vulkan gathers only from 2D and cube textures; `TLD4` encodes no other type on hardware.
 fn gather(ctx: &mut EmitContext<'_>, inst: InstId, dref: Option<Word>) -> EmitResult<Word> {
     let info = TextureInstInfo::from_flags(ctx.flags(inst));
+    if matches!(
+        info.ty,
+        TextureType::Color1D | TextureType::ColorArray1D | TextureType::Color3D
+    ) {
+        return Err(EmitError::Unsupported("gathers from 1D and 3D textures"));
+    }
     let is_integer = is_texture_integer(ctx, info)?;
     let result_type = color_type(ctx, is_integer);
     let mut coords = ctx.def_arg(inst, 1)?;
@@ -875,10 +882,19 @@ pub(super) fn image_sample_explicit_lod(
     to_f32_color(ctx, is_integer, color)
 }
 
+/// Vulkan has no depth compare on 3D textures.
+fn reject_3d_depth_compare(ctx: &EmitContext<'_>, inst: InstId) -> EmitResult<()> {
+    if TextureInstInfo::from_flags(ctx.flags(inst)).ty == TextureType::Color3D {
+        return Err(EmitError::Unsupported("depth compare on 3D textures"));
+    }
+    Ok(())
+}
+
 pub(super) fn image_sample_dref_implicit_lod(
     ctx: &mut EmitContext<'_>,
     inst: InstId,
 ) -> EmitResult<Word> {
+    reject_3d_depth_compare(ctx, inst)?;
     let dref = ctx.def_arg(inst, 2)?;
     let bias_lc = ctx.def_opt(ctx.arg(inst, 3))?;
     let offset = ctx.arg(inst, 4);
@@ -890,6 +906,7 @@ pub(super) fn image_sample_dref_explicit_lod(
     ctx: &mut EmitContext<'_>,
     inst: InstId,
 ) -> EmitResult<Word> {
+    reject_3d_depth_compare(ctx, inst)?;
     let dref = ctx.def_arg(inst, 2)?;
     let lod = ctx.def_arg(inst, 3)?;
     let offset = ctx.arg(inst, 4);
@@ -908,6 +925,12 @@ pub(super) fn image_gather_dref(ctx: &mut EmitContext<'_>, inst: InstId) -> Emit
 
 pub(super) fn image_fetch(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
     let info = TextureInstInfo::from_flags(ctx.flags(inst));
+    if matches!(
+        info.ty,
+        TextureType::ColorCube | TextureType::ColorArrayCube
+    ) {
+        return Err(EmitError::Unsupported("texel fetches from cube textures"));
+    }
     let is_integer = is_texture_integer(ctx, info)?;
     let result_type = color_type(ctx, is_integer);
     let coords = ctx.def_arg(inst, 1)?;

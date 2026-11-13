@@ -1804,6 +1804,9 @@ impl<'a> EmitContext<'a> {
     }
 
     fn define_shared_memory_functions(&mut self) -> EmitResult<()> {
+        if self.shared_memory_u32 == 0 {
+            return Ok(());
+        }
         let (array, element, u32_t) = (self.shared_memory_u32_type, self.shared_u32, self.u32[1]);
         if self.info.uses_shared_increment {
             self.increment_cas_shared = self.cas_loop(
@@ -2296,16 +2299,11 @@ impl<'a> EmitContext<'a> {
                 ..
             } = *desc;
             let sampled_type = if is_integer { self.u32[1] } else { self.f32[1] };
-            let image_type = self.b.type_image(
-                sampled_type,
-                Dim::DimBuffer,
-                0,
-                0,
-                0,
-                2,
-                spv_image_format(format),
-                None,
-            );
+            self.add_capability(Capability::ImageBuffer);
+            let format = self.storage_format(format);
+            let image_type =
+                self.b
+                    .type_image(sampled_type, Dim::DimBuffer, 0, 0, 0, 2, format, None);
             let pointer_type = self.type_pointer(StorageClass::UniformConstant, image_type);
             let desc_type = self.descriptor_type(image_type, pointer_type, count);
             let id = self.global_variable(desc_type, StorageClass::UniformConstant, None);
@@ -2350,6 +2348,9 @@ impl<'a> EmitContext<'a> {
                 ));
             }
         };
+        if dim == Dim::Dim1D {
+            self.add_capability(Capability::Sampled1D);
+        }
         Ok(self
             .b
             .type_image(ty, dim, depth, arrayed, ms, 1, SpvFormat::Unknown, None))
@@ -2373,16 +2374,25 @@ impl<'a> EmitContext<'a> {
                 )));
             }
         };
-        Ok(self.b.type_image(
-            sampled_type,
-            dim,
-            0,
-            arrayed,
-            0,
-            2,
-            spv_image_format(desc.format),
-            None,
-        ))
+        if dim == Dim::Dim1D {
+            self.add_capability(Capability::Image1D);
+        }
+        let format = self.storage_format(desc.format);
+        Ok(self
+            .b
+            .type_image(sampled_type, dim, 0, arrayed, 0, 2, format, None))
+    }
+
+    /// The SPIR-V format of a storage image, adding the capability the extended formats need.
+    fn storage_format(&mut self, format: ImageFormat) -> SpvFormat {
+        let format = spv_image_format(format);
+        if !matches!(
+            format,
+            SpvFormat::Unknown | SpvFormat::R32ui | SpvFormat::Rgba32ui
+        ) {
+            self.add_capability(Capability::StorageImageExtendedFormats);
+        }
+        format
     }
 
     fn define_textures(&mut self, binding: &mut u32, scaling_index: &mut u32) -> EmitResult<()> {
