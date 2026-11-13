@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use lichii_common::ConsoleGeneration;
 use lichii_common::settings::{AudioSettings, ControlSettings, Settings};
-use lichii_core::{ExitReason, Host, System, SystemError};
+use lichii_core::{ExitReason, Handover, Host, PROGRAM_INDEX_MASK, System, SystemError};
 use lichii_crypto::KeyError;
 use lichii_loader::LoadOptions;
 
@@ -17,6 +17,9 @@ use crate::game_list::GameKind;
 pub enum BootError {
     NotFound(PathBuf),
     Unsupported(PathBuf),
+    /// The title asked to start a program its file does not hold, or that its format cannot
+    /// select.
+    NoProgram(u8),
     System(SystemError),
 }
 
@@ -29,6 +32,7 @@ impl std::fmt::Display for BootError {
                 "{} is not an NSP, XCI, NCA, NUP, NRO, NSO or ExeFS directory",
                 path.display()
             ),
+            Self::NoProgram(index) => write!(f, "the title has no program {index} to start"),
             Self::System(err) => err.fmt(f),
         }
     }
@@ -73,7 +77,7 @@ impl Session {
         applets: Option<AppletDialogs>,
         configure: impl FnOnce(u64, ConsoleGeneration) -> (Arc<Settings>, Host),
     ) -> Result<Self, BootError> {
-        Self::start(path, options, Vec::new(), applets, configure)
+        Self::start(path, options, None, applets, configure)
     }
 
     /// Stops this session and boots program `program_index` of the same title in its place,
@@ -86,19 +90,19 @@ impl Session {
         configure: impl FnOnce(u64, ConsoleGeneration) -> (Arc<Settings>, Host),
     ) -> Result<Self, BootError> {
         let path = self.path.clone();
-        let user_channel = self.system.take_user_channel();
+        let handover = self.system.take_handover();
         drop(self);
         let options = LoadOptions {
             program_index,
             ..options
         };
-        Self::start(&path, options, user_channel, applets, configure)
+        Self::start(&path, options, Some(handover), applets, configure)
     }
 
     fn start(
         path: &Path,
         options: LoadOptions,
-        user_channel: Vec<Vec<u8>>,
+        handover: Option<Handover>,
         applets: Option<AppletDialogs>,
         configure: impl FnOnce(u64, ConsoleGeneration) -> (Arc<Settings>, Host),
     ) -> Result<Self, BootError> {
@@ -109,12 +113,18 @@ impl Session {
         tracing::info!("booting {} ({})", path.display(), kind.label());
         let image = lichii_loader::load(path, &options).map_err(SystemError::from)?;
         let program_id = image.program_id;
+        if handover.is_some() && program_id & PROGRAM_INDEX_MASK != u64::from(options.program_index)
+        {
+            return Err(BootError::NoProgram(options.program_index));
+        }
         let (settings, host) = configure(program_id, image.generation);
         let mut system = System::from_image(settings, image, host)?;
         if let Some(applets) = &applets {
             system.services().set_applet_frontend(applets.frontend());
         }
-        system.set_user_channel(user_channel);
+        if let Some(handover) = handover {
+            system.set_handover(handover);
+        }
         system.run()?;
         Ok(Self {
             path: path.to_path_buf(),
@@ -416,8 +426,25 @@ mod tests {
         let mut read = [0; 8];
         process.memory().read_bytes(output, &mut read).unwrap();
         assert_eq!(&read, b"handover");
+        let mut previous = client.send(functions, &Request::new(123)).unwrap();
+        assert_eq!(previous.pop::<i32>(), 0, "started by program 0");
         drop(client);
         drop(session);
+
+        let single = dir.join("Single.nso");
+        std::fs::write(
+            &single,
+            nso(&[0x14000000u32.to_le_bytes(), [0; 4]].concat()),
+        )
+        .unwrap();
+        let session = Session::boot(&single, LoadOptions::default(), None, configure).unwrap();
+        let (client, functions, _) = application(&session);
+        assert_eq!(client.send(functions, &execute).unwrap().result.0, 0);
+        drop(client);
+        assert!(matches!(
+            session.execute_program(1, LoadOptions::default(), None, configure),
+            Err(BootError::NoProgram(1))
+        ));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

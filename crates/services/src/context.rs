@@ -39,6 +39,13 @@ pub struct ServiceParts {
     pub session: Arc<dyn SessionEvents>,
 }
 
+/// What a program leaves the program it starts: its own index, which `GetPreviousProgramIndex`
+/// returns, and its user channel.
+pub struct Handover {
+    pub previous_program_index: u8,
+    pub user_channel: Vec<Vec<u8>>,
+}
+
 /// Requests from the title that only the session running it can carry out.
 pub trait SessionEvents: Send + Sync {
     /// The title asked to stop and start program `program_index` of its application
@@ -127,12 +134,11 @@ impl ServiceContext {
         *self.applets.write() = frontend;
     }
 
-    /// Gives the title the user channel the program before it handed over, before the title
-    /// starts.
-    pub fn set_user_channel(&self, user_channel: Vec<Vec<u8>>) {
+    /// Gives the title what the program before it handed over, before the title starts.
+    pub fn receive_handover(&self, handover: Handover) {
         match self.am.get() {
-            Some(applet) => applet.receive_user_channel(user_channel),
-            None => tracing::warn!("am is not registered; the user channel is lost"),
+            Some(applet) => applet.receive_handover(handover),
+            None => tracing::warn!("am is not registered; the handover is lost"),
         }
     }
 

@@ -211,7 +211,8 @@ impl Service for ApplicationFunctions {
                 ResultCode::SUCCESS
             }
             123 => {
-                ctx.push(-1i32);
+                let previous = applet.state.lock().previous_program_index;
+                ctx.push(previous.map_or(-1, i32::from));
                 ResultCode::SUCCESS
             }
             130 => push_event(ctx, &applet.gpu_error_event),

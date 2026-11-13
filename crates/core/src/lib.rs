@@ -26,6 +26,10 @@ use lichii_services::{ServiceContext, ServiceParts, SessionEvents};
 use parking_lot::{Condvar, Mutex};
 
 pub use crate::timing::CoreTiming;
+pub use lichii_services::Handover;
+
+/// The bits of a program id that name the program within its application.
+pub const PROGRAM_INDEX_MASK: u64 = 0x7ff;
 pub use lichii_common::perf::PerfStats;
 
 #[derive(Debug, thiserror::Error)]
@@ -52,8 +56,8 @@ pub enum ExitReason {
     Break { reason: u32 },
     /// The title asked to start program `program_index` of its application in its place
     /// (`ExecuteProgram`, `CreateApplicationAndRequestToStart`). Boot it with
-    /// `LoadOptions::program_index`, and hand it [`System::take_user_channel`] through
-    /// [`System::set_user_channel`] before [`System::run`].
+    /// `LoadOptions::program_index`, and hand it [`System::take_handover`] through
+    /// [`System::set_handover`] before [`System::run`].
     ExecuteProgram { program_index: u8 },
 }
 
@@ -365,16 +369,20 @@ impl System {
         &self.npad
     }
 
-    /// The user channel the title handed to the program it asked to start
-    /// ([`ExitReason::ExecuteProgram`]); empty otherwise, and after the first call.
-    pub fn take_user_channel(&self) -> Vec<Vec<u8>> {
-        std::mem::take(&mut *self.exit.user_channel.lock())
+    /// What the title leaves the program it asked to start ([`ExitReason::ExecuteProgram`]): its
+    /// program index and its user channel, which is empty unless the title asked, and after the
+    /// first call.
+    pub fn take_handover(&self) -> Handover {
+        Handover {
+            previous_program_index: (self.program.program_id & PROGRAM_INDEX_MASK) as u8,
+            user_channel: std::mem::take(&mut *self.exit.user_channel.lock()),
+        }
     }
 
-    /// Gives the title the user channel the program before it handed over. Call it before the
-    /// first [`System::run`].
-    pub fn set_user_channel(&self, user_channel: Vec<Vec<u8>>) {
-        self.services.set_user_channel(user_channel);
+    /// Gives the title what the program before it handed over. Call it before the first
+    /// [`System::run`].
+    pub fn set_handover(&self, handover: Handover) {
+        self.services.receive_handover(handover);
     }
 
     /// Frame and performance counters for the frontend overlay.

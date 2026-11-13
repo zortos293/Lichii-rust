@@ -124,16 +124,20 @@ struct AppletState {
     library_volume: f32,
     /// Storages for the next title, each charged to the live-storage budget until freed.
     user_channel: Vec<Arc<storage::StorageData>>,
+    /// The program that started this one (`GetPreviousProgramIndex`); `None` on a fresh boot.
+    previous_program_index: Option<u8>,
     /// The preselected-user launch parameter was popped; it is there once per boot.
     preselected_user_popped: bool,
     friend_invitations: Vec<Vec<u8>>,
 }
 
 impl Applet {
-    /// Pushes the storages a previous program handed over, charged like the title's own.
-    pub(crate) fn receive_user_channel(&self, user_channel: Vec<Vec<u8>>) {
+    /// Takes what the previous program handed over: its index, and its user channel's storages,
+    /// charged like the title's own.
+    pub(crate) fn receive_handover(&self, handover: crate::Handover) {
         let mut state = self.state.lock();
-        for data in user_channel {
+        state.previous_program_index = Some(handover.previous_program_index);
+        for data in handover.user_channel {
             let size = data.len();
             let Some(charge) = storage::Charge::take(&self.storage_bytes, size) else {
                 tracing::warn!(

@@ -317,8 +317,17 @@ fn execute_program_hands_the_user_channel_to_the_session() {
 #[test]
 fn a_restarted_program_pops_the_user_channel_it_was_handed() {
     let (context, client, proxy) = booted(SWITCH1_TITLE);
-    context.set_user_channel(vec![b"first".to_vec(), b"second".to_vec()]);
     let functions = interface(&client, proxy, 20);
+    let previous = |client: &IpcClient| {
+        let mut reply = client.send(functions, &Request::new(123)).unwrap();
+        reply.pop::<i32>()
+    };
+    assert_eq!(previous(&client), -1, "a fresh boot");
+    context.receive_handover(crate::Handover {
+        previous_program_index: 2,
+        user_channel: vec![b"first".to_vec(), b"second".to_vec()],
+    });
+    assert_eq!(previous(&client), 2);
     assert_eq!(
         pop_user_channel(&client, functions, 6).as_deref(),
         Some(&b"second"[..])
