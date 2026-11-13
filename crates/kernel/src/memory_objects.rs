@@ -327,7 +327,6 @@ impl CodeMemory {
                 }
                 table.unmap_group(addr, size, MemoryState::CODE_OUT)?;
                 mapped.1 = None;
-                self.owner.invalidate_code(addr, size);
             }
         }
         Ok(())
@@ -344,7 +343,6 @@ impl Drop for CodeMemory {
         }
         if let Some(addr) = slave {
             let _ = table.unmap_group(addr, size, MemoryState::CODE_OUT);
-            self.owner.invalidate_code(addr, size);
         }
         let _ = table.unlock_for_code_memory(self.address, size);
     }
