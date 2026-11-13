@@ -2743,19 +2743,32 @@ fn per_primitive_fragment_inputs_skip_the_draw() {
     f.assert_no_validation_errors();
 }
 
-#[test]
-fn indirect_mesh_draws_are_skipped() {
-    let Some((mut f, gmmu)) = mesh_fixture() else {
-        return;
-    };
-    let regs = mesh_regs(1);
+/// Draws `commands` (guest indirect commands of `stride` bytes) as an indirect task/mesh draw,
+/// with the draw count `count` when set, and returns whether the triangle covered the target.
+fn mesh_indirect_draw(
+    f: &mut Fixture,
+    gmmu: &Gmmu,
+    regs: &Regs,
+    indexed: bool,
+    stride: u32,
+    commands: &[u32],
+    count: Option<u32>,
+) -> bool {
+    write(f, COMMANDS, bytemuck::cast_slice(commands));
+    f.rasterizer
+        .invalidate_region(DADDR + COMMANDS, commands.len() as u64 * 4);
+    if let Some(count) = count {
+        write(f, COUNT, &count.to_le_bytes());
+        f.rasterizer.invalidate_region(DADDR + COUNT, 4);
+    }
+    let words = commands.len() as u32 * 4;
     let mut dirty = DirtyState::new();
     let const_buffers = const_buffers();
     let root_tables = [[0; 64]; 8];
     let mut ctx = GraphicsContext {
         channel: ChannelId(0),
-        memory: &gmmu,
-        regs: &regs,
+        memory: gmmu,
+        regs,
         dirty: &mut dirty,
         const_buffers: &const_buffers,
         root_tables: &root_tables,
@@ -2763,15 +2776,134 @@ fn indirect_mesh_draws_are_skipped() {
     f.rasterizer.draw_indirect(
         &mut ctx,
         &IndirectDraw {
-            topology: PrimitiveTopology::TRIANGLES,
-            indexed: false,
-            buffer: GPU_VA + VERTICES,
-            stride: 16,
-            max_draws: 1,
-            count_buffer: None,
+            topology: PrimitiveTopology::QUADS,
+            indexed,
+            buffer: GPU_VA + COMMANDS,
+            stride,
+            max_draws: words / stride,
+            count_buffer: count.map(|_| GPU_VA + COUNT),
         },
     );
-    assert_ne!(f.rasterizer.draw.warned & Warning::IndirectMesh as u32, 0);
-    assert_eq!(f.rasterizer.draw.shaders.stats().translated, 0);
+    let texels = switch2_target(f);
+    let covered = texels.iter().all(|&t| t == [255, 128, 0, 255]);
+    assert!(
+        covered || texels.iter().all(|&t| t == [0; 4]),
+        "all or nothing: {:?}",
+        &texels[..4]
+    );
+    covered
+}
+
+#[test]
+fn indirect_mesh_draws_launch_the_groups_their_first_word_counts() {
+    let Some((mut f, gmmu)) = mesh_fixture() else {
+        return;
+    };
+    let regs = mesh_regs(1);
+    assert!(
+        !mesh_indirect_draw(&mut f, &gmmu, &regs, false, 16, &[0, 1, 0, 0], None),
+        "no groups draw nothing"
+    );
+    assert!(
+        mesh_indirect_draw(&mut f, &gmmu, &regs, false, 16, &[1, 0, 0, 0], None),
+        "one group, whatever the instance count and first vertex words hold"
+    );
+    assert_eq!(f.rasterizer.draw.pipelines.stats().built, 1);
+    assert_eq!(
+        f.rasterizer.draw.warned & Warning::IndirectMesh as u32,
+        0,
+        "the quad topology is not assembled"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn indexed_indirect_mesh_draws_count_groups_with_the_index_count() {
+    let Some((mut f, gmmu)) = mesh_fixture() else {
+        return;
+    };
+    let regs = mesh_regs(1);
+    assert!(!mesh_indirect_draw(
+        &mut f,
+        &gmmu,
+        &regs,
+        true,
+        20,
+        &[0, 1, 0, 0, 0],
+        None
+    ));
+    assert!(mesh_indirect_draw(
+        &mut f,
+        &gmmu,
+        &regs,
+        true,
+        20,
+        &[1, 1, 0, 0, 0],
+        None
+    ));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn indirect_mesh_draws_launch_only_the_commands_the_count_buffer_names() {
+    let Some((mut f, gmmu)) = mesh_fixture() else {
+        return;
+    };
+    let regs = mesh_regs(1);
+    let commands = [0, 1, 0, 0, 1, 1, 0, 0];
+    assert!(
+        !mesh_indirect_draw(&mut f, &gmmu, &regs, false, 16, &commands, Some(1)),
+        "the second command is past the count"
+    );
+    assert!(mesh_indirect_draw(
+        &mut f,
+        &gmmu,
+        &regs,
+        false,
+        16,
+        &commands,
+        Some(2)
+    ));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn indirect_mesh_draws_launch_every_command_without_a_count() {
+    let Some((mut f, gmmu)) = mesh_fixture() else {
+        return;
+    };
+    let regs = mesh_regs(1);
+    assert!(
+        mesh_indirect_draw(
+            &mut f,
+            &gmmu,
+            &regs,
+            false,
+            16,
+            &[0, 1, 0, 0, 1, 1, 0, 0],
+            None
+        ),
+        "the second command draws"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn indirect_task_draws_launch_the_mesh_workgroups_their_tasks_count() {
+    let Some((mut f, gmmu)) = mesh_fixture() else {
+        return;
+    };
+    let mut regs = mesh_regs(3);
+    bind_program(&mut regs, 1, ShaderType::VERTEX_B, TASK);
+    assert!(mesh_indirect_draw(
+        &mut f,
+        &gmmu,
+        &regs,
+        false,
+        16,
+        &[1, 1, 0, 0],
+        None
+    ));
+    assert_eq!(mesh_stages(&f), TASK_STAGES);
     f.assert_no_validation_errors();
 }
