@@ -419,6 +419,7 @@ impl Gpu {
             shared: FrontShared {
                 stream: Stream::new(producer, link, side_sender, fetch_syncs),
                 shared_macros: None,
+                compute_macros: None,
                 words: Vec::new(),
                 waiters: handles.syncpoints.semaphore_waiters().clone(),
                 inbox: inbox.clone(),

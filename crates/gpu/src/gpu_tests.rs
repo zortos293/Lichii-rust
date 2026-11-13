@@ -1005,6 +1005,17 @@ mod masm {
         }
     }
 
+    /// Writes `value` to `method`, then ends.
+    pub fn emit_program(method: u16, value: u16) -> Vec<u32> {
+        [
+            inst(imm(method), imm(value)).out0(IMM0, IMM1).end(),
+            inst(nop(), nop()),
+        ]
+        .iter()
+        .flat_map(Inst::encode)
+        .collect()
+    }
+
     /// Reads `count` words at the address in parameters 0 (high) and 1 (low) through
     /// MME_DMA_READ_FIFOED and sends them to methods 0xc00...
     pub fn dma_read_program(count: u16) -> Vec<u32> {
@@ -1906,6 +1917,51 @@ fn an_idle_gpu_with_no_pending_fences_sleeps() {
             rig.work.fence_polls.load(Ordering::Relaxed),
             before,
             "{threading:?}: the GPU polls fences while none are pending"
+        );
+    });
+}
+
+#[test]
+fn switch_2_compute_macros_keep_their_own_code_beside_the_3d_macros() {
+    each_mode(|threading| {
+        let mut rig = Rig::new(threading);
+        let channel = rig.channel(HostClass::Ampere);
+        let call = |words: Pushbuffer, subchannel| {
+            words.once(subchannel, crate::macros::MACRO_METHOD_BASE, &[0])
+        };
+        let words = Pushbuffer::default()
+            .bind(0, AMPERE_3D)
+            .bind(1, 0xc7c0)
+            .load_macro(0, &masm::emit_program(0x701, 0x3d))
+            .load_macro(1, &masm::emit_program(0x200, 0xc0));
+        let words = call(call(words, 0), 1);
+        rig.submit(channel, &words.0);
+        assert_eq!(
+            rig.methods(),
+            [
+                (channel.0, EngineKind::Maxwell3d, 0x701, 0x3d),
+                (channel.0, EngineKind::Compute, 0x200, 0xc0),
+            ],
+            "{threading:?}"
+        );
+    });
+}
+
+#[test]
+fn switch_2_compute_calls_run_the_3d_macros_until_compute_uploads_its_own() {
+    each_mode(|threading| {
+        let mut rig = Rig::new(threading);
+        let channel = rig.channel(HostClass::Ampere);
+        let words = Pushbuffer::default()
+            .bind(0, AMPERE_3D)
+            .bind(1, 0xc7c0)
+            .load_macro(0, &masm::emit_program(0x200, 0x3d))
+            .once(1, crate::macros::MACRO_METHOD_BASE, &[0]);
+        rig.submit(channel, &words.0);
+        assert_eq!(
+            rig.methods(),
+            [(channel.0, EngineKind::Compute, 0x200, 0x3d)],
+            "{threading:?}"
         );
     });
 }

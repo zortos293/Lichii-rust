@@ -29,8 +29,9 @@ use crate::gpu::Inbox;
 use crate::host::{AcquireOp, FIRST_ENGINE_METHOD, HostAction, HostClass, HostState, ReleaseKind};
 use crate::host1x::Syncpoints;
 use crate::macros::{
-    LOAD_MME_INSTRUCTION_RAM_POINTER, LOAD_MME_START_ADDRESS_RAM, MACRO_METHOD_BASE, MacroDataRam,
-    MacroEngine, MacroHost, MacroIsa,
+    LOAD_MME_INSTRUCTION_RAM_POINTER, LOAD_MME_START_ADDRESS_RAM,
+    LOAD_MME_START_ADDRESS_RAM_POINTER, MACRO_METHOD_BASE, MacroDataRam, MacroEngine, MacroHost,
+    MacroIsa,
 };
 use crate::pushbuffer::{CommandParser, Flow, GpEntry, MethodCall, MethodHandler};
 use crate::reg_index;
@@ -52,8 +53,13 @@ const SHADOW_SCRATCH_0: usize = reg_index!(Regs, shadow_scratch) as usize;
 pub(crate) struct FrontShared {
     pub stream: Stream,
     /// Switch 2: the channels of a process share one graphics context, and with it the macro
-    /// code of their 3D and compute engines (NX2_NOTES row 53). Each keeps its own data RAM.
+    /// code of their 3D engines (NX2_NOTES row 53). Each keeps its own data RAM.
     pub shared_macros: Option<MacroEngine>,
+    /// Switch 2: the compute engines' own macro code, once the compute class sets its
+    /// instruction or start-address pointer. Until then compute uploads and calls use the 3D
+    /// engines' macros, as the reference does; after it, compute uploads no longer overwrite
+    /// the 3D macros at the same code addresses.
+    pub compute_macros: Option<MacroEngine>,
     /// The words of the entry being parsed.
     pub words: Vec<u32>,
     pub waiters: Arc<SemaphoreWaiters>,
@@ -611,10 +617,21 @@ impl Dispatch<'_> {
         }
         if native && is_load_mme(method) {
             self.state.compute[method as usize] = call.argument;
-            self.shared
-                .shared_macros
-                .get_or_insert_with(|| MacroEngine::new(MacroIsa::Mme64))
-                .write_load_mme(method, call.argument);
+            let shared = &mut *self.shared;
+            if matches!(
+                method,
+                LOAD_MME_INSTRUCTION_RAM_POINTER | LOAD_MME_START_ADDRESS_RAM_POINTER
+            ) && shared.compute_macros.is_none()
+            {
+                shared.compute_macros = Some(MacroEngine::new(MacroIsa::Mme64));
+            }
+            match &mut shared.compute_macros {
+                Some(engine) => engine,
+                None => shared
+                    .shared_macros
+                    .get_or_insert_with(|| MacroEngine::new(MacroIsa::Mme64)),
+            }
+            .write_load_mme(method, call.argument);
             return;
         }
         if !native && method == COMPUTE_DATA_UPLOAD {
@@ -652,16 +669,20 @@ impl Dispatch<'_> {
         if call.remaining != 0 {
             return;
         }
-        let engine = match host.class() {
-            HostClass::Maxwell => macros.as_mut(),
-            HostClass::Ampere => self.shared.shared_macros.as_mut(),
+        let shared = &mut *self.shared;
+        let engine = match (host.class(), target) {
+            (HostClass::Maxwell, _) => macros.as_mut(),
+            (HostClass::Ampere, MacroTarget::Compute) if shared.compute_macros.is_some() => {
+                shared.compute_macros.as_mut()
+            }
+            (HostClass::Ampere, _) => shared.shared_macros.as_mut(),
         };
         if let Some(engine) = engine {
             let mut host = FrontMacroHost {
                 target,
                 graphics,
                 compute,
-                stream: &mut self.shared.stream,
+                stream: &mut shared.stream,
                 memory: self.memory,
             };
             if let Err(error) =
@@ -812,6 +833,7 @@ mod tests {
                 fetch_syncs,
             ),
             shared_macros: None,
+            compute_macros: None,
             words: Vec::new(),
             waiters: Arc::default(),
             inbox,
