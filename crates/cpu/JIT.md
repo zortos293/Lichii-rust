@@ -109,7 +109,7 @@ The lowered FP arithmetic (`FADD`, `FSUB`, `FMUL`, `FDIV`, the fused multiply-ad
 - The result is finite. Ops that can underflow also need a normal result above the smallest normal: the Arm ARM detects tininess before rounding and x86 after, and a zero or subnormal result may hide an underflow. Additions and subtractions of floats never round to a subnormal, so they accept any finite result.
 - The integer conversions also check for the host's out-of-range value and for unsigned range. `FCMP` falls back on an unordered compare.
 
-The fallback is an out-of-line slow path. It runs the original instruction through `CallSimd` and reloads the destination from the context. Because a checked op can fall back, it commits pending writes the same way an op that can exit does. MXCSR is never touched: under these conditions the host's flags would only repeat what FPSR already holds. FZ titles need input and output denormal checks to stay native; that is future work.
+The fallback is an out-of-line slow path. It runs the original instruction through `CallSimd` and reloads the destination from the context. Because a checked op can fall back, it commits pending writes the same way an op that can exit does. The JIT never reads the MXCSR exception flags: under these conditions they would only repeat what FPSR already holds. Its control bits do matter, so `Jit::run` holds MXCSR at the default 0x1f80 (round to nearest, every exception masked, no FTZ or DAZ) while guest code runs, and restores the caller's value on exit. FZ titles need input and output denormal checks to stay native; that is future work.
 
 | Loop (`benches/cpu.rs`, 2M iterations) | Interpreter | JIT before J4 (block ends at SIMD) | JIT with `CallSimd` | JIT native |
 |---|---|---|---|---|
