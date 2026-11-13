@@ -7,6 +7,7 @@ use lichii_common::settings::Region;
 use lichii_kernel::ipc::HleRequestContext;
 use parking_lot::Mutex;
 
+use super::save::{Part, SettingsFiles};
 use super::{KeyboardLayout, Shared};
 use crate::Service;
 
@@ -14,6 +15,14 @@ const UNKNOWN: ResultCode = ResultCode(u32::MAX);
 
 const EULA_VERSION_SIZE: usize = 0x30;
 const ACCOUNT_NOTIFICATION_SIZE: usize = 0x18;
+/// `GetMiiAuthorId`: the same id on every boot.
+pub(super) const MII_AUTHOR_ID: &[u8; 16] = b"Lichii Author ID";
+
+/// Commands that change a value the settings files keep.
+const SETTERS: &[u32] = &[
+    8, 14, 16, 18, 22, 24, 26, 28, 30, 32, 36, 40, 44, 46, 48, 54, 59, 61, 64, 66, 70, 72, 74, 76,
+    78, 89, 96, 100, 105, 121, 125, 127, 137, 151, 153, 188, 204,
+];
 
 /// `GetSettingsItemValue` keys the services read, with the values the C++ reference returns.
 const SETTINGS_ITEMS: &[(&str, &str, &[u8])] = &[
@@ -164,13 +173,13 @@ pub(super) struct State {
     user_system_clock_context: [u8; 0x20],
     account_settings: u32,
     eula_versions: [[u8; EULA_VERSION_SIZE]; 32],
-    eula_version_count: usize,
+    eula_version_count: i32,
     color_set_id: u32,
     console_information_upload: u8,
     automatic_application_download: u8,
     notification_settings: [u32; 6],
     account_notification_settings: [[u8; ACCOUNT_NOTIFICATION_SIZE]; 8],
-    account_notification_count: usize,
+    account_notification_count: i32,
     vibration_master_volume: f32,
     tv_settings: [u32; 8],
     audio_output_modes: [u32; 5],
@@ -244,10 +253,113 @@ impl State {
     }
 }
 
+/// Visits every value the settings files keep, as bytes, with the structure and offset it has
+/// there.
+fn fields(s: &mut State, shared: &mut Shared, mut visit: impl FnMut(Part, usize, &mut [u8])) {
+    use Part::{Private, System};
+    use bytemuck::bytes_of_mut as bytes;
+    let [hdmi, speaker, headphone, type3, type4] = &mut s.audio_output_modes;
+    let (launch_flags, launch_time) = bytes(&mut s.initial_launch_settings).split_at_mut(8);
+    visit(System, 0x54, bytes(&mut s.wireless_lan_enable));
+    visit(System, 0x8064, bytes(&mut s.bluetooth_enable));
+    visit(
+        System,
+        0x9930,
+        bytes(&mut s.push_notification_activity_mode_on_sleep),
+    );
+    visit(System, 0x9970, bytes(&mut s.error_report_share_permission));
+    visit(System, 0x99b0, bytes(&mut s.keyboard_layout));
+    visit(System, 0x29470, bytes(&mut s.lock_screen));
+    visit(System, 0x29478, bytes(&mut s.color_set_id));
+    visit(System, 0x2947c, bytes(&mut shared.quest_flag));
+    visit(System, 0x29484, &mut launch_flags[..4]);
+    visit(System, 0x29488, launch_time);
+    visit(System, 0x294a0, bytes(&mut s.battery_percentage));
+    visit(System, 0x294a4, bytes(&mut s.applet_launch_flags));
+    visit(System, 0x294c4, bytes(&mut s.panel_crc_mode));
+    visit(System, 0x29580, bytes(&mut s.user_system_clock_context));
+    visit(System, 0x295a0, bytes(&mut s.network_system_clock_context));
+    visit(
+        System,
+        0x295c0,
+        bytes(&mut s.user_system_clock_automatic_correction),
+    );
+    visit(
+        System,
+        0x295c8,
+        bytes(&mut s.user_system_clock_automatic_correction_updated_time),
+    );
+    visit(System, 0x295f0, bytes(&mut s.account_settings));
+    visit(System, 0x29700, bytes(hdmi));
+    visit(System, 0x29704, bytes(speaker));
+    visit(System, 0x29708, bytes(headphone));
+    visit(System, 0x2970c, bytes(&mut s.speaker_auto_mute));
+    visit(System, 0x29720, bytes(type3));
+    visit(System, 0x29724, bytes(type4));
+    visit(System, 0x29770, bytes(&mut s.console_information_upload));
+    visit(
+        System,
+        0x297b0,
+        bytes(&mut s.automatic_application_download),
+    );
+    visit(System, 0x297b8, bytes(&mut s.notification_settings));
+    visit(System, 0x29830, bytes(&mut s.account_notification_count));
+    visit(System, 0x29840, bytes(&mut s.account_notification_settings));
+    visit(System, 0x29a40, bytes(&mut s.vibration_master_volume));
+    visit(System, 0x29a68, bytes(&mut s.touch_screen_mode));
+    visit(System, 0x29a80, bytes(&mut s.tv_settings));
+    visit(
+        System,
+        0x29f40,
+        bytes(&mut s.device_time_zone_location_name),
+    );
+    visit(
+        System,
+        0x29f68,
+        bytes(&mut s.device_time_zone_location_updated_time),
+    );
+    visit(System, 0x2a040, bytes(&mut s.primary_album_storage));
+    visit(System, 0x2a080, bytes(&mut s.usb30_enable));
+    visit(System, 0x2a0c0, bytes(&mut s.nfc_enable));
+    visit(System, 0x2a100, bytes(&mut s.sleep_settings));
+    visit(System, 0x2a140, bytes(&mut s.eula_version_count));
+    visit(System, 0x2a150, bytes(&mut s.eula_versions));
+    visit(System, 0x2a950, bytes(&mut shared.device_nickname));
+    visit(System, 0x2aa50, bytes(&mut s.auto_update_enable));
+    visit(Private, 0x50, bytes(&mut s.external_steady_clock_source_id));
+    visit(
+        Private,
+        0x68,
+        bytes(&mut s.external_steady_clock_internal_offset),
+    );
+}
+
+/// Takes the values of the files that were read; the rest keep their defaults.
+pub(super) fn load(files: &SettingsFiles, s: &mut State, shared: &mut Shared) {
+    fields(s, shared, |part, offset, value| {
+        if files.loaded(part) {
+            value.copy_from_slice(&files.bytes(part)[offset..][..value.len()]);
+        }
+    });
+    s.eula_version_count = s.eula_version_count.clamp(0, s.eula_versions.len() as i32);
+    s.account_notification_count = s
+        .account_notification_count
+        .clamp(0, s.account_notification_settings.len() as i32);
+}
+
+/// Writes the current values into the files.
+fn store(files: &mut SettingsFiles, s: &mut State, shared: &mut Shared) {
+    fields(s, shared, |part, offset, value| {
+        files.bytes_mut(part)[offset..][..value.len()].copy_from_slice(value);
+    });
+    files.store();
+}
+
 pub(super) struct SystemSettings {
     pub(super) region: Region,
     pub(super) shared: Arc<Mutex<Shared>>,
     pub(super) state: Arc<Mutex<State>>,
+    pub(super) files: Arc<Mutex<SettingsFiles>>,
 }
 
 /// Writes the first `count` entries to output buffer 0 (as many as fit) and pushes the count.
@@ -297,6 +409,16 @@ impl Service for SystemSettings {
 
     fn handle(&self, ctx: &mut HleRequestContext) -> Option<ResultCode> {
         let mut s = self.state.lock();
+        let result = self.dispatch(ctx, &mut s);
+        if result == Some(ResultCode::SUCCESS) && SETTERS.contains(&ctx.command()) {
+            store(&mut self.files.lock(), &mut s, &mut self.shared.lock());
+        }
+        result
+    }
+}
+
+impl SystemSettings {
+    fn dispatch(&self, ctx: &mut HleRequestContext, s: &mut State) -> Option<ResultCode> {
         match ctx.command() {
             0 => self.shared.lock().language_code = ctx.pop(),
             3 | 4 => {
@@ -316,9 +438,12 @@ impl Service for SystemSettings {
             16 => s.user_system_clock_context = ctx.pop(),
             17 => ctx.push(s.account_settings),
             18 => s.account_settings = ctx.pop(),
-            21 => return Some(write_entries(ctx, &s.eula_versions[..s.eula_version_count])),
+            21 => {
+                let count = s.eula_version_count as usize;
+                return Some(write_entries(ctx, &s.eula_versions[..count]));
+            }
             22 => match read_entries(ctx, &mut s.eula_versions) {
-                Ok(count) => s.eula_version_count = count,
+                Ok(count) => s.eula_version_count = count as i32,
                 Err(result) => return Some(result),
             },
             23 => ctx.push(s.color_set_id),
@@ -330,14 +455,14 @@ impl Service for SystemSettings {
             29 => ctx.push(s.notification_settings),
             30 => s.notification_settings = ctx.pop(),
             31 => {
-                let count = s.account_notification_count;
+                let count = s.account_notification_count as usize;
                 return Some(write_entries(
                     ctx,
                     &s.account_notification_settings[..count],
                 ));
             }
             32 => match read_entries(ctx, &mut s.account_notification_settings) {
-                Ok(count) => s.account_notification_count = count,
+                Ok(count) => s.account_notification_count = count as i32,
                 Err(result) => return Some(result),
             },
             35 => ctx.push(s.vibration_master_volume),
@@ -424,7 +549,7 @@ impl Service for SystemSettings {
             79 => ctx.push(1u32),
             88 => ctx.push(s.bluetooth_enable),
             89 => s.bluetooth_enable = ctx.pop(),
-            90 => ctx.push(*b"Lichii Author ID"),
+            90 => ctx.push(*MII_AUTHOR_ID),
             95 => ctx.push(s.auto_update_enable),
             96 => s.auto_update_enable = ctx.pop(),
             99 => ctx.push(s.battery_percentage),

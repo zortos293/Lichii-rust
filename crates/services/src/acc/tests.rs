@@ -1,14 +1,19 @@
 use super::{
-    APPLICATION_INFO_ALREADY_INITIALIZED, AVATAR, INVALID_ARRAY_LENGTH, INVALID_USER_ID, UNKNOWN,
-    account_id, user_id,
+    APPLICATION_INFO_ALREADY_INITIALIZED, AVATAR, INVALID_ARRAY_LENGTH, INVALID_USER_ID, Profile,
+    UNKNOWN, account_id, user_id,
 };
-use lichii_common::settings::Settings;
 use lichii_kernel::testing::{IpcClient, Request};
 
-use crate::testing::{ReplyExt, SWITCH2_TITLE, booted};
+use crate::testing::{ReplyExt, SWITCH2_TITLE, TempDir, booted};
 
-fn boot(username: &str) -> IpcClient {
-    let mut settings = Settings::default();
+/// The account services on a NAND of their own, which lives as long as the returned directory.
+fn boot(username: &str) -> (IpcClient, TempDir) {
+    let dir = TempDir::new("acc");
+    (boot_in(&dir, username), dir)
+}
+
+fn boot_in(dir: &TempDir, username: &str) -> IpcClient {
+    let mut settings = dir.settings();
     settings.system.username = username.into();
     booted(SWITCH2_TITLE, settings, super::register)
 }
@@ -22,7 +27,7 @@ fn user_ids_are_stable_per_name() {
 
 #[test]
 fn the_one_user_is_open_and_selected() {
-    let client = boot("player");
+    let (client, _dir) = boot("player");
     let acc = client.connect("acc:u0").unwrap();
     let uid = user_id("player");
     assert_eq!(
@@ -92,7 +97,7 @@ fn the_one_user_is_open_and_selected() {
 
 #[test]
 fn profiles_carry_the_username_and_avatar() {
-    let client = boot("player");
+    let (client, _dir) = boot("player");
     let acc = client.connect("acc:u0").unwrap();
     let uid = user_id("player");
     let profile = client
@@ -145,7 +150,7 @@ fn profiles_carry_the_username_and_avatar() {
 
 #[test]
 fn the_profile_editor_stores_profiles() {
-    let client = boot("player");
+    let (client, _dir) = boot("player");
     let su = client.connect("acc:su").unwrap();
     let uid = user_id("player");
     let editor = client
@@ -212,7 +217,7 @@ fn the_profile_editor_stores_profiles() {
 
 #[test]
 fn application_info_initializes_once() {
-    let client = boot("lichii");
+    let (client, _dir) = boot("lichii");
     let acc = client.connect("acc:u0").unwrap();
     client
         .send(acc, &Request::new(100).send_pid())
@@ -228,7 +233,7 @@ fn application_info_initializes_once() {
 
 #[test]
 fn the_account_manager_reports_an_unlinked_account() {
-    let client = boot("lichii");
+    let (client, _dir) = boot("lichii");
     let acc = client.connect("acc:u0").unwrap();
     let uid = user_id("lichii");
     let manager = client
@@ -319,7 +324,7 @@ fn the_account_manager_reports_an_unlinked_account() {
 
 #[test]
 fn system_services_get_their_own_manager() {
-    let client = boot("lichii");
+    let (client, _dir) = boot("lichii");
     let acc = client.connect("acc:u1").unwrap();
     let uid = user_id("lichii");
     let manager = client
@@ -347,7 +352,7 @@ fn system_services_get_their_own_manager() {
 
 #[test]
 fn thumbnails_need_a_user_and_the_full_size() {
-    let client = boot("lichii");
+    let (client, _dir) = boot("lichii");
     let acc = client.connect("acc:u0").unwrap();
     let uid = user_id("lichii");
     let thumbnail = client.alloc(&vec![0; 0x24000]);
@@ -371,4 +376,129 @@ fn thumbnails_need_a_user_and_the_full_size() {
         .send(acc, &Request::new(110).arg(uid).buffer_a(thumbnail, 0x100))
         .unwrap();
     assert_eq!(reply.result, INVALID_ARRAY_LENGTH);
+}
+
+fn profiles_file(dir: &TempDir) -> std::path::PathBuf {
+    dir.settings()
+        .paths
+        .nand_dir
+        .unwrap()
+        .join("system/save/8000000000000010/su/avators/profiles.dat")
+}
+
+/// A `UserRaw` of `profiles.dat`.
+fn user_raw(uid: [u8; 16], nickname: &str, timestamp: u64, data: u8) -> Vec<u8> {
+    let mut user = vec![0; 0xc8];
+    user[..16].copy_from_slice(&uid);
+    user[16..32].copy_from_slice(&uid);
+    user[32..40].copy_from_slice(&timestamp.to_le_bytes());
+    user[40..40 + nickname.len()].copy_from_slice(nickname.as_bytes());
+    user[72..].fill(data);
+    user
+}
+
+fn base(client: &IpcClient, uid: [u8; 16]) -> ([u8; 0x38], Vec<u8>) {
+    let acc = client.connect("acc:u0").unwrap();
+    let profile = client
+        .send(acc, &Request::new(5).arg(uid))
+        .unwrap()
+        .ok()
+        .interface();
+    let user_data = client.alloc(&[0; 0x80]);
+    let reply = client
+        .send(profile, &Request::new(0).buffer_b(user_data, 0x80))
+        .unwrap()
+        .ok();
+    (reply.get(0), client.read(user_data, 0x80))
+}
+
+#[test]
+fn the_profile_survives_a_reboot() {
+    let dir = TempDir::new("acc");
+    let uid = user_id("player");
+    let mut edited = [0u8; 0x38];
+    edited[..16].copy_from_slice(&uid);
+    edited[0x10..0x18].copy_from_slice(&99u64.to_le_bytes());
+    edited[0x18..0x1d].copy_from_slice(b"Renan");
+    {
+        let client = boot_in(&dir, "player");
+        let file = std::fs::read(profiles_file(&dir)).unwrap();
+        assert_eq!(file.len(), 0x650);
+        assert_eq!(file[0x10..0x10 + 0xc8], user_raw(uid, "player", 0, 0));
+        assert!(file[0x10 + 0xc8..].iter().all(|&b| b == 0));
+
+        let su = client.connect("acc:su").unwrap();
+        let editor = client
+            .send(su, &Request::new(205).arg(uid))
+            .unwrap()
+            .ok()
+            .interface();
+        let data = client.alloc(&[5; 0x80]);
+        client
+            .send(editor, &Request::new(100).arg(edited).buffer_a(data, 0x80))
+            .unwrap()
+            .ok();
+    }
+    let client = boot_in(&dir, "player");
+    assert_eq!(base(&client, uid), (edited, vec![5; 0x80]));
+    let file = std::fs::read(profiles_file(&dir)).unwrap();
+    assert_eq!(file[0x10 + 16..0x10 + 32], uid);
+}
+
+#[test]
+fn users_of_a_cpp_profiles_file_are_opened_by_nickname_and_kept() {
+    let dir = TempDir::new("acc");
+    let eden = [0x42; 16];
+    let other = [0x24; 16];
+    let mut file = vec![0; 0x10];
+    file.extend(user_raw(other, "Other", 7, 1));
+    file.extend(user_raw(eden, "Eden", 0x1234, 2));
+    file.resize(0x650, 0);
+    let path = profiles_file(&dir);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &file).unwrap();
+
+    let client = boot_in(&dir, "Eden");
+    let acc = client.connect("acc:u0").unwrap();
+    let last = client.send(acc, &Request::new(4)).unwrap().ok();
+    assert_eq!(last.get::<[u8; 16]>(0), eden);
+    let (eden_base, user_data) = base(&client, eden);
+    assert_eq!(&eden_base[0x18..0x1d], b"Eden\0");
+    assert_eq!(eden_base[0x10..0x18], 0x1234u64.to_le_bytes());
+    assert_eq!(user_data, vec![2; 0x80]);
+    assert_eq!(std::fs::read(&path).unwrap(), file, "opening saves nothing");
+    drop(client);
+
+    let client = boot_in(&dir, "player");
+    assert_eq!(base(&client, user_id("player")).0[0x18..0x1f], *b"player\0");
+    let saved = std::fs::read(&path).unwrap();
+    assert_eq!(saved[..0x10 + 2 * 0xc8], file[..0x10 + 2 * 0xc8]);
+    assert_eq!(saved[0x10 + 2 * 0xc8..][..16], user_id("player"));
+}
+
+#[test]
+fn an_exact_user_id_wins_over_a_nickname() {
+    let dir = TempDir::new("acc");
+    let mut file = vec![0; 0x10];
+    file.extend(user_raw([0x42; 16], "player", 1, 1));
+    file.extend(user_raw(user_id("player"), "Other", 2, 2));
+    file.resize(0x650, 0);
+    let path = profiles_file(&dir);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &file).unwrap();
+
+    let client = boot_in(&dir, "player");
+    let acc = client.connect("acc:u0").unwrap();
+    let last = client.send(acc, &Request::new(4)).unwrap().ok();
+    assert_eq!(last.get::<[u8; 16]>(0), user_id("player"));
+}
+
+#[test]
+fn an_unreadable_profiles_file_is_never_written() {
+    let dir = TempDir::new("acc");
+    let path = profiles_file(&dir);
+    std::fs::create_dir_all(&path).unwrap();
+    let profile = Profile::open("player", &dir.settings().paths.nand_dir.unwrap());
+    assert!(profile.slot.is_none());
+    assert!(path.is_dir());
 }

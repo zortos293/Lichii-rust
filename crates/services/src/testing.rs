@@ -1,6 +1,8 @@
 //! Builds a [`ServiceContext`] on the kernel's host-side IPC client for service tests.
 
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use bytemuck::Pod;
 use lichii_common::perf::PerfStats;
@@ -72,6 +74,39 @@ pub fn booted(
     let (context, client) = context(program_id, settings);
     register(&context).unwrap();
     client
+}
+
+static NEXT_DIR: AtomicU32 = AtomicU32::new(0);
+
+/// A host directory of its own for one test, removed when dropped.
+pub struct TempDir(PathBuf);
+
+impl TempDir {
+    pub fn new(tag: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "lichii-{tag}-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    /// Default settings with the NAND, SD card and keys in this directory.
+    pub fn settings(&self) -> Settings {
+        let mut settings = Settings::default();
+        settings.paths.nand_dir = Some(self.0.join("nand"));
+        settings.paths.sdmc_dir = Some(self.0.join("sdmc"));
+        settings.paths.keys_dir = Some(self.0.join("keys"));
+        settings
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Reads a value of guest memory.
