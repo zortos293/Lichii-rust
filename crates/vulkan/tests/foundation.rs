@@ -16,6 +16,16 @@ use lichii_vulkan::staging::StagingRing;
 use lichii_vulkan::swapchain::{Surface, Swapchain};
 use lichii_vulkan::{Device, Instance, SurfaceSupport, available_devices};
 
+/// Tests in this binary run one at a time: the Vulkan loader and the validation layer are not
+/// safe when several threads create and destroy instances and devices at once (see
+/// `Instance`'s unit-test serialisation).
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn instance(surfaces: SurfaceSupport) -> Option<Arc<Instance>> {
     match Instance::new(true, surfaces) {
         Ok(instance) => {
@@ -50,6 +60,7 @@ fn assert_no_validation_errors(device: &Device) {
 
 #[test]
 fn selects_devices_by_name_and_falls_back() {
+    let _serial = serial();
     let Some(instance) = instance(SurfaceSupport::None) else {
         return;
     };
@@ -75,6 +86,7 @@ fn selects_devices_by_name_and_falls_back() {
 
 #[test]
 fn copies_through_the_scheduler_and_retires_after_completion() {
+    let _serial = serial();
     let Some(device) = device() else { return };
     let mut scheduler = Scheduler::new(&device).unwrap();
     let data: Vec<u8> = (0..4096u32).map(|i| (i * 7) as u8).collect();
@@ -150,11 +162,13 @@ fn copies_through_the_scheduler_and_retires_after_completion() {
 
 #[test]
 fn staging_ring_wraps_and_waits_for_the_gpu() {
+    let _serial = serial();
     staging_round_trip(5);
 }
 
 #[test]
 fn staging_ring_wraps_within_one_submission() {
+    let _serial = serial();
     staging_round_trip(u64::MAX);
 }
 
@@ -255,6 +269,7 @@ fn staging_round_trip(flush_every: u64) {
 
 #[test]
 fn images_round_trip_through_staging() {
+    let _serial = serial();
     let Some(device) = device() else { return };
     let mut scheduler = Scheduler::new(&device).unwrap();
     let mut ring = StagingRing::new(&device, 1 << 20).unwrap();
@@ -351,6 +366,7 @@ fn images_round_trip_through_staging() {
 
 #[test]
 fn every_guest_format_gets_a_sampleable_host_format() {
+    let _serial = serial();
     let Some(device) = device() else { return };
     for &format in PixelFormat::ALL {
         for recompression in [AstcRecompression::Uncompressed, AstcRecompression::Bc3] {
@@ -414,6 +430,7 @@ fn every_guest_format_gets_a_sampleable_host_format() {
 
 #[test]
 fn headless_swapchain_presents_and_recreates() {
+    let _serial = serial();
     let Some(instance) = instance(SurfaceSupport::Headless) else {
         return;
     };
@@ -490,6 +507,7 @@ fn headless_swapchain_presents_and_recreates() {
 
 #[test]
 fn descriptor_pools_rotate_and_reset_after_completion() {
+    let _serial = serial();
     use lichii_vulkan::descriptors::DescriptorAllocator;
     let Some(device) = device() else { return };
     let mut scheduler = Scheduler::new(&device).unwrap();
