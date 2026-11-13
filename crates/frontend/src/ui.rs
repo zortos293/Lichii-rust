@@ -156,6 +156,17 @@ impl App {
             {
                 actions.push(Action::InstallFiles);
             }
+            let idle = !running && self.install.is_none() && self.firmware.is_none();
+            ui.add_enabled_ui(idle, |ui| {
+                ui.menu_button("Install Firmware", |ui| {
+                    if ui.button("From Folder…").clicked() {
+                        actions.push(Action::InstallFirmware { zip: false });
+                    }
+                    if ui.button("From ZIP…").clicked() {
+                        actions.push(Action::InstallFirmware { zip: true });
+                    }
+                });
+            });
             if ui.button("Add Game Directory…").clicked() {
                 actions.push(Action::AddGameDir);
             }
@@ -485,6 +496,21 @@ impl App {
                         .show_percentage()
                         .desired_width(360.0),
                 );
+            });
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        if let Some(job) = &self.firmware {
+            let share = job.progress().share();
+            egui::Modal::new(egui::Id::unique("install firmware")).show(ctx, |ui| {
+                ui.heading("Installing Firmware...");
+                ui.add(
+                    egui::ProgressBar::new(share)
+                        .show_percentage()
+                        .desired_width(360.0),
+                );
+                if ui.button("Cancel").clicked() {
+                    actions.push(Action::CancelFirmwareInstall);
+                }
             });
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }

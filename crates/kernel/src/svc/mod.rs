@@ -147,6 +147,23 @@ impl SvcContext<'_> {
 }
 
 pub(crate) fn dispatch(svc: &mut SvcContext, imm: u32) -> Flow {
+    if !svc.kernel.svc_trace {
+        return call(svc, imm);
+    }
+    let args: [u64; 8] = svc.ctx.x[..8].try_into().unwrap();
+    let flow = call(svc, imm);
+    tracing::info!(
+        target: "svc",
+        thread = svc.thread.id(),
+        svc = format_args!("{imm:#04x}"),
+        args = format_args!("{args:#x?}"),
+        out = format_args!("{:#x?}", &svc.ctx.x[..4]),
+        blocked = flow == Flow::Switch,
+    );
+    flow
+}
+
+fn call(svc: &mut SvcContext, imm: u32) -> Flow {
     let caps = svc.process().capabilities();
     if caps.svc_mask != [0; 4] && !caps.permits_svc(imm) {
         tracing::warn!(

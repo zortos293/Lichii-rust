@@ -61,6 +61,7 @@ pub fn config(console: ConsoleGeneration) -> KernelConfig {
         aslr: false,
         rng_seed: 1,
         enforce_service_access: true,
+        svc_trace: false,
         clock: Arc::new(HostClock {
             start: Instant::now(),
             hz: match console {
