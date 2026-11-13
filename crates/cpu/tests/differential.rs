@@ -498,6 +498,12 @@ alu_class!(int_to_fp_in_simd, "01x111100x100001110110xxxxxxxxxx");
 alu_class!(fcvt_from_half, "0001111011100010x10000xxxxxxxxxx");
 alu_class!(fp_conditional_compare, "000111100x1xxxxxxxxx01xxxxxxxxxx");
 alu_class!(fnmul, "000111100x1xxxxx100010xxxxxxxxxx");
+alu_class!(scalar_dup, "01011110000xxxxx000001xxxxxxxxxx", |w| w
+    & 0xf_0000
+    != 0);
+alu_class!(faddp_vector, "0x101110x01xxxxx110101xxxxxxxxxx", |w| {
+    w & 0x4040_0000 != 0x0040_0000
+});
 alu_class!(ext, "0x101110000xxxxx0xxxx0xxxxxxxxxx", |w| w & 0x4000_4000
     != 0x4000);
 alu_class!(

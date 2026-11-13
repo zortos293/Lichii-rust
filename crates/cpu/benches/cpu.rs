@@ -323,6 +323,27 @@ const WORKLOADS: &[Workload] = &[
         per_iteration: 11,
     },
     Workload {
+        name: "lane sum loop",
+        code: &[
+            0x4f03f700, // fmov v0.4s, #1.5
+            0x1e2e1007, // fmov s7, #1.0
+            0x1e211008, // fmov s8, #3.0
+            0x1e2818e9, // fdiv s9, s7, s8
+            0x5e0c0401, // 1: mov s1, v0.s[1]
+            0x5e140402, // mov s2, v0.s[2]
+            0x5e1c0403, // mov s3, v0.s[3]
+            0x6e21d404, // faddp v4.4s, v0.4s, v1.4s
+            0x2e22d485, // faddp v5.2s, v4.2s, v2.2s
+            0x6e23d4a6, // faddp v6.4s, v5.4s, v3.4s
+            0x4c007826, // st1 {v6.4s}, [x1]
+            0xf10004a5, // subs x5, x5, #1
+            0x54ffff01, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 9,
+    },
+    Workload {
         name: "popcount loop",
         code: &[
             0x4c407020, // 1: ld1 {v0.16b}, [x1]
