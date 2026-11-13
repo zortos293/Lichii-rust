@@ -35,7 +35,7 @@ use ash::vk;
 use gpu_allocator::MemoryLocation;
 use lichii_common::settings::{AstcRecompression, ResolutionScale, VramUsage};
 use lichii_common::{DAddr, GpuVAddr};
-use lichii_gpu::backend::FramebufferConfig;
+use lichii_gpu::backend::{FramebufferConfig, GpuWrittenPages};
 use lichii_gpu::gmmu::{Gmmu, RangeTarget};
 use lichii_memory::DeviceAddressSpace;
 use lichii_texture::PixelFormat;
@@ -392,6 +392,8 @@ struct Scratch {
 /// Host images for guest images. Owned by the rasterizer on the GPU thread.
 pub struct TextureCache {
     device: Arc<Device>,
+    /// Device pages GPU work wrote, marked with every segment of an image the GPU modifies.
+    written_pages: Arc<GpuWrittenPages>,
     gob_layout: GobLayout,
     recompression: AstcRecompression,
     scale: ResolutionScale,
@@ -531,11 +533,13 @@ impl TextureCache {
     /// sample.
     pub fn new(
         device: &Arc<Device>,
+        written_pages: Arc<GpuWrittenPages>,
         gob_layout: GobLayout,
         recompression: AstcRecompression,
     ) -> Self {
         Self {
             device: device.clone(),
+            written_pages,
             gob_layout,
             recompression,
             scale: ResolutionScale::X1,
@@ -784,8 +788,14 @@ impl TextureCache {
         image.image.raw()
     }
 
-    /// Marks a cached image as written by the GPU.
+    /// Marks a cached image as written by the GPU, and its device pages in the written-pages
+    /// bitmap. Called when the writing work is recorded.
     pub fn mark_modified(&mut self, id: ImageId) {
+        if let Some(image) = self.get(id) {
+            for s in &image.segments {
+                self.written_pages.mark(s.daddr, s.size);
+            }
+        }
         self.tick += 1;
         let tick = self.tick;
         let image = self.image(id);
