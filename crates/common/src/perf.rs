@@ -18,10 +18,15 @@ pub struct FrameSample {
 
 #[derive(Clone, Debug, Default)]
 pub struct PerfSnapshot {
+    /// Host presents in the last second.
     pub fps: f32,
     pub frame_time_ms: f32,
-    /// Frame times in milliseconds, oldest first, covering the requested window.
+    /// Present-to-present times in milliseconds, oldest first, covering the requested window.
     pub frame_times_ms: Vec<f32>,
+    /// Guest frames in the last second.
+    pub game_fps: f32,
+    /// Times between guest frames in milliseconds, oldest first, covering the requested window.
+    pub game_frame_times_ms: Vec<f32>,
     pub gpu_time_ms: Option<f32>,
     /// Guest frames per second relative to the title's target rate (1.0 = full speed).
     pub emulation_speed: f32,
@@ -107,6 +112,12 @@ impl PerfStats {
             .iter()
             .filter(|t| now.duration_since(**t) <= Duration::from_secs(1))
             .count();
+        let guest_recent: Vec<Instant> = state
+            .guest_frames
+            .iter()
+            .copied()
+            .filter(|t| now.duration_since(*t) <= window)
+            .collect();
         let emulation_speed = if state.guest_target_hz > 0.0 {
             guest_last_second as f32 / state.guest_target_hz
         } else {
@@ -120,6 +131,11 @@ impl PerfStats {
             frame_times_ms: recent
                 .iter()
                 .map(|s| s.frame_time.as_secs_f32() * 1000.0)
+                .collect(),
+            game_fps: guest_last_second as f32,
+            game_frame_times_ms: guest_recent
+                .windows(2)
+                .map(|w| (w[1] - w[0]).as_secs_f32() * 1000.0)
                 .collect(),
             gpu_time_ms: recent
                 .last()
@@ -162,5 +178,8 @@ mod tests {
             snap.emulation_speed
         );
         assert_eq!(snap.frame_times_ms.len(), 120);
+        assert!((59.0..=61.0).contains(&snap.game_fps), "{}", snap.game_fps);
+        assert_eq!(snap.game_frame_times_ms.len(), 119);
+        assert!((16.0..=17.0).contains(&snap.game_frame_times_ms[0]));
     }
 }

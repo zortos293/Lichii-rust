@@ -153,7 +153,7 @@ impl App {
                 let g = &self.settings.graphics;
                 ui.label(format!("Frame: {:.2} ms", snap.frame_time_ms));
                 ui.separator();
-                ui.label(format!("Game: {:.0} FPS", snap.fps));
+                ui.label(format!("Game: {:.0} FPS", snap.game_fps));
                 ui.separator();
                 let speed = snap.emulation_speed * 100.0;
                 ui.label(match g.speed_limit {
@@ -266,6 +266,12 @@ impl App {
             egui::StrokeKind::Inside,
         );
         let Some(session) = &self.session else { return };
+        let fv = &self.settings.frame_view;
+        if fv.enabled {
+            let window = std::time::Duration::from_secs_f32(fv.graph_seconds.max(0.1));
+            let snap = self.perf.snapshot(Instant::now(), window);
+            crate::frame_view::draw(painter, guest, fv, &snap, &self.settings.graphics);
+        }
         let text = if session.is_paused() {
             format!("{}\nPaused", session.title)
         } else {

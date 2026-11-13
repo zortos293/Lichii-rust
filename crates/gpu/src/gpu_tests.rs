@@ -1286,6 +1286,29 @@ fn submit_reserves_increasing_fences_that_execution_reaches() {
 }
 
 #[test]
+fn submit_to_a_destroyed_channel_reserves_nothing() {
+    each_mode(|threading| {
+        let rig = Rig::new(threading);
+        let channel = rig.channel(HostClass::Maxwell);
+        let id = 12;
+        let increment = || Submission {
+            entries: Vec::new(),
+            wait: None,
+            increment: Some(SyncpointIncrement::increment_value(id, 2)),
+        };
+        assert_eq!(
+            rig.gpu.submit(channel, increment()),
+            Some(SyncpointFence { id, value: 2 })
+        );
+        rig.gpu.destroy_channel(channel);
+        assert_eq!(rig.gpu.submit(channel, increment()), None);
+        assert_eq!(rig.syncpoints.max(id), Ok(2));
+        rig.gpu.synchronize();
+        assert_eq!(rig.syncpoints.guest().value(id), Ok(2), "{threading:?}");
+    });
+}
+
+#[test]
 fn pause_holds_submissions_until_resumed() {
     each_mode(|threading| {
         let mut rig = Rig::new(threading);

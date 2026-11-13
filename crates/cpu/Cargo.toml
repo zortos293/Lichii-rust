@@ -11,9 +11,19 @@ thiserror.workspace = true
 tracing.workspace = true
 portable-atomic = "1"
 
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+dynasmrt = "5"
+dynasm = "5"
+
+[target.'cfg(all(target_arch = "x86_64", unix))'.dependencies]
+libc = "0.2"
+
+[target.'cfg(all(target_arch = "x86_64", windows))'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
+
 [dev-dependencies]
 unicorn-engine = { version = "2.1.5", default-features = false, features = ["arch_arm", "arch_aarch64"] }
 
 [[bench]]
-name = "interpreter"
+name = "cpu"
 harness = false

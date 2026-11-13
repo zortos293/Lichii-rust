@@ -114,8 +114,17 @@ impl Inbox {
     }
 
     fn push(&self, command: CpuCommand) {
+        self.push_with(|| Some(command));
+    }
+
+    /// Queues the command `make` returns, if any. `make` runs under the inbox lock, so what it
+    /// does is ordered like the queue; it does not run once the inbox is closed.
+    fn push_with(&self, make: impl FnOnce() -> Option<CpuCommand>) {
         let mut state = self.state.lock();
-        if !state.closed {
+        if state.closed {
+            return;
+        }
+        if let Some(command) = make() {
             state.commands.push_back(command);
             self.cond.notify_one();
         }
@@ -422,31 +431,42 @@ impl Gpu {
     /// Destroys a channel once the work queued before has run (a suspended channel's remaining
     /// work is dropped).
     pub fn destroy_channel(&self, channel: ChannelId) {
-        self.references.lock().remove(&channel);
-        self.inbox.push(CpuCommand::DestroyChannel(channel));
+        self.inbox.push_with(|| {
+            self.references.lock().remove(&channel);
+            Some(CpuCommand::DestroyChannel(channel))
+        });
     }
 
     /// Queues a GPFIFO submission without waiting for it. Reserves the submission's syncpoint
-    /// increments in [`Syncpoints::increase_max`](crate::host1x::Syncpoints::increase_max) and
-    /// returns the fence they reach; `None` without increments or for an invalid syncpoint.
+    /// increments in [`Syncpoints::increase_max`](crate::host1x::Syncpoints::increase_max), in
+    /// the order submissions are queued, and returns the fence they reach; `None` without
+    /// increments or for an invalid syncpoint. A submission to a destroyed channel is dropped
+    /// and reserves nothing.
     pub fn submit(&self, channel: ChannelId, submission: Submission) -> Option<SyncpointFence> {
-        let fence = submission.increment.and_then(|increment| {
-            match self
-                .host1x
-                .syncpoints
-                .increase_max(increment.id, increment.count)
-            {
-                Ok(value) => Some(SyncpointFence {
-                    id: increment.id,
-                    value,
-                }),
-                Err(error) => {
-                    tracing::warn!(%error, "submission increments an invalid syncpoint");
-                    None
-                }
+        let mut fence = None;
+        self.inbox.push_with(|| {
+            if !self.references.lock().contains_key(&channel) {
+                tracing::warn!(?channel, "submission to a channel that does not exist");
+                return None;
             }
+            fence = submission.increment.and_then(|increment| {
+                match self
+                    .host1x
+                    .syncpoints
+                    .increase_max(increment.id, increment.count)
+                {
+                    Ok(value) => Some(SyncpointFence {
+                        id: increment.id,
+                        value,
+                    }),
+                    Err(error) => {
+                        tracing::warn!(%error, "submission increments an invalid syncpoint");
+                        None
+                    }
+                }
+            });
+            Some(CpuCommand::Submit(channel, submission))
         });
-        self.inbox.push(CpuCommand::Submit(channel, submission));
         fence
     }
 
