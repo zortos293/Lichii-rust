@@ -112,7 +112,7 @@ impl Iterator for Entries<'_> {
             }
             let entry = match postcard::from_bytes(payload).ok()? {
                 Stored::Module(module) => {
-                    self.modules.insert(module.hash, Arc::new(module));
+                    self.modules.insert(module.hash, Arc::from(module));
                     None
                 }
                 Stored::Entry(stored) => {
@@ -258,7 +258,7 @@ enum StoredRef<'a> {
 
 #[derive(Deserialize)]
 enum Stored {
-    Module(ShaderModule),
+    Module(Box<ShaderModule>),
     Entry(StoredEntry),
 }
 

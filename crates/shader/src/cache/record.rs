@@ -205,6 +205,8 @@ pub struct CodeCheck {
 }
 
 impl CodeCheck {
+    /// Forgets every hash. Call it before a lookup on other environments or after program
+    /// memory may have changed, or a stale hash would match the old bytes.
     pub fn clear(&mut self) {
         self.hashes.clear();
     }
@@ -235,9 +237,8 @@ fn hash_code(env: &dyn ShaderEnvironment, address: GpuVAddr, len: u64, bytes: &m
     bytes.resize(len as usize, 0);
     env.read_code(address, bytes);
     let mut hash = len.wrapping_mul(K);
-    for word in bytes.chunks_exact(8) {
-        let word = u64::from_le_bytes(word.try_into().expect("8 bytes"));
-        hash = (hash.rotate_left(5) ^ word).wrapping_mul(K);
+    for &word in bytes.as_chunks::<8>().0 {
+        hash = (hash.rotate_left(5) ^ u64::from_le_bytes(word)).wrapping_mul(K);
     }
     hash ^= hash >> 33;
     hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);

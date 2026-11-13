@@ -92,7 +92,7 @@ pub trait ShaderEnvironment {
     /// Reads program memory from `address` into `out`, whose length is a multiple of 8, as
     /// [`Self::read_u64`] would word by word. Override it where a block read is cheaper.
     fn read_code(&self, address: GpuVAddr, out: &mut [u8]) {
-        for (i, word) in out.chunks_exact_mut(8).enumerate() {
+        for (i, word) in out.as_chunks_mut::<8>().0.iter_mut().enumerate() {
             let value = self.read_u64(address.wrapping_add(i as u64 * 8));
             word.copy_from_slice(&value.to_le_bytes());
         }
