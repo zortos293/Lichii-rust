@@ -11,6 +11,7 @@ use super::{
     LOWEST_VOICE_PRIORITY, MAX_BIQUAD_FILTERS, MAX_CHANNELS, MAX_MIX_BUFFERS, MAX_WAVE_BUFFERS,
     PlayState, SampleFormat, SrcQuality, UNUSED_MIX_ID, UNUSED_SPLITTER_ID,
 };
+use crate::dsp::fixed::Q15;
 
 /// Wave buffer as the game describes it.
 #[repr(C)]
@@ -214,41 +215,9 @@ pub struct VoiceChannelResource {
     pub in_use: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct BiquadFilterState {
-    pub s0: i64,
-    pub s1: i64,
-    pub s2: i64,
-    pub s3: i64,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct AdpcmContext {
-    pub header: u16,
-    pub yn0: i16,
-    pub yn1: i16,
-}
-
-/// Per-channel decode state. The DSP updates the shared copy while rendering; the renderer
-/// copies it back after every command list.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct VoiceState {
-    pub played_sample_count: u64,
-    pub offset: u32,
-    pub wave_buffer_index: u32,
-    pub wave_buffer_valid: [bool; MAX_WAVE_BUFFERS],
-    pub wave_buffers_consumed: u32,
-    pub sample_history: [i16; MAX_WAVE_BUFFERS * 2],
-    /// Resampling position, Q49.15.
-    pub fraction: i64,
-    pub adpcm_context: AdpcmContext,
-    pub biquad_states: [[BiquadFilterState; MAX_BIQUAD_FILTERS]; MAX_BIQUAD_FILTERS],
-    pub previous_samples: [i32; MAX_MIX_BUFFERS],
-    pub external_context_size: u32,
-    pub external_context_enabled: bool,
-    pub voice_dropped: bool,
-    pub loop_count: i32,
-}
+/// Per-channel decode state is the DSP's: the renderer keeps a host copy and reads the shared
+/// states in [`DspState::voices`](crate::dsp::DspState::voices), one per channel resource.
+pub use crate::dsp::{AdpcmContext, BiquadFilterState, VoiceState};
 
 /// Play state as the renderer tracks it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -700,7 +669,7 @@ impl VoiceInfo {
                     state.played_sample_count = 0;
                     state.adpcm_context = AdpcmContext::default();
                     state.sample_history = [0; MAX_WAVE_BUFFERS * 2];
-                    state.fraction = 0;
+                    state.fraction = Q15::default();
                 }
                 self.current_play_state = ServerPlayState::Stopped;
                 self.was_playing = self.last_play_state == ServerPlayState::Started;
@@ -710,14 +679,14 @@ impl VoiceInfo {
     }
 }
 
-/// All voices of a renderer.
+/// All voices of a renderer. The DSP-shared voice states live in the session's
+/// [`DspState`](crate::dsp::DspState); the methods that read or prepare them take that slice.
 #[derive(Clone, Debug)]
 pub struct VoiceContext {
     infos: Vec<VoiceInfo>,
     sorted: Vec<u32>,
     channel_resources: Vec<VoiceChannelResource>,
     cpu_states: Vec<VoiceState>,
-    dsp_states: Vec<VoiceState>,
     active_count: u32,
 }
 
@@ -734,7 +703,6 @@ impl VoiceContext {
                 })
                 .collect(),
             cpu_states: vec![VoiceState::default(); count],
-            dsp_states: vec![VoiceState::default(); count],
             active_count: 0,
         }
     }
@@ -777,15 +745,6 @@ impl VoiceContext {
         &self.cpu_states
     }
 
-    /// DSP-shared voice states the command list decodes into.
-    pub fn dsp_states(&self) -> &[VoiceState] {
-        &self.dsp_states
-    }
-
-    pub fn dsp_states_mut(&mut self) -> &mut [VoiceState] {
-        &mut self.dsp_states
-    }
-
     pub fn active_count(&self) -> u32 {
         self.active_count
     }
@@ -810,29 +769,39 @@ impl VoiceContext {
         });
     }
 
-    /// Copies the DSP-shared states back to the host copy after a command list.
-    pub fn update_state_by_dsp_shared(&mut self) {
-        self.cpu_states.copy_from_slice(&self.dsp_states);
+    /// Copies the DSP-shared states `dsp` into the host copy after a command list.
+    pub fn update_state_by_dsp_shared(&mut self, dsp: &[VoiceState]) {
+        self.cpu_states.copy_from_slice(dsp);
     }
 
     /// Prepares voice `index` for command generation: resets new voices and applies flushes
-    /// and play state changes. Returns whether the voice was playing.
+    /// and play state changes to the DSP-shared states `dsp`. Returns whether the voice has
+    /// anything to render.
     pub fn update_for_command_generation(
         &mut self,
         index: usize,
         pools: &[MemoryPoolInfo],
+        dsp: &mut [VoiceState],
     ) -> bool {
         let info = &mut self.infos[index];
         if info.is_new {
             for &id in info.channel_ids() {
-                self.dsp_states[id as usize] = VoiceState::default();
+                dsp[id as usize] = VoiceState::default();
                 let resource = &mut self.channel_resources[id as usize];
                 resource.prev_mix_volumes = resource.mix_volumes;
             }
             info.prev_volume = info.volume;
             info.is_new = false;
         }
-        info.update_parameters_for_command_generation(&mut self.dsp_states, pools)
+        info.update_parameters_for_command_generation(dsp, pools)
+    }
+
+    /// Voice `index` and the channel resources its mix volumes live in.
+    pub(crate) fn info_and_resources_mut(
+        &mut self,
+        index: usize,
+    ) -> (&mut VoiceInfo, &mut [VoiceChannelResource]) {
+        (&mut self.infos[index], &mut self.channel_resources)
     }
 
     pub(crate) fn split_for_update(&mut self) -> (&mut [VoiceInfo], &mut [VoiceState]) {

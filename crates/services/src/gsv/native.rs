@@ -1,5 +1,5 @@
-//! Native memory and images (gsv 111-114, 423-435, 1211, 1291 and 1510): the graphics server's
-//! registry of the memory and images the Switch 2 SDKs make, which vi2 presents from.
+//! Native memory and images (gsv 111-114, 423-435, 911-991, 1211, 1291 and 1510): the graphics
+//! server's registry of the memory and images the Switch 2 SDKs make, which vi2 presents from.
 
 use std::collections::BTreeMap;
 
@@ -8,7 +8,7 @@ use lichii_gpu::nx2_memory::GpuMemoryHandle;
 use lichii_kernel::ipc::HleRequestContext;
 use parking_lot::Mutex;
 
-use super::Words;
+use super::{UNKNOWN, Words};
 
 /// An InterModuleUserImagePreference, 16 words.
 pub(super) type Preference = [u32; 16];
@@ -77,6 +77,48 @@ impl ImageLayout {
     }
 }
 
+/// Alignment of a decoder image pool (gsv 991): 128 rows of 64 bytes.
+const DECODER_ALIGNMENT: u64 = 64 * 128;
+/// Most images a decoder pool (gsv 911) may hold. Movie players use a few frames; each image
+/// gets its own handle, so the count is bounded.
+const MAX_DECODER_IMAGES: u32 = 64;
+
+/// Layout of a video decoder output image in an `nn::codec` image pool (gsv 911, 961, 991):
+/// pitch-linear rows padded to 128-row blocks. NV12 keeps its chroma plane after the luma plane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DecoderLayout {
+    /// The picture kind gsv 961 reports: 0xa NV12, 0x9 BGRA8, 0x8 RGBA8.
+    pub kind: u32,
+    pub pitch: u64,
+    pub chroma_offset: Option<u64>,
+    pub size: u64,
+}
+
+impl DecoderLayout {
+    pub fn of(preference: &Preference) -> Self {
+        let width = u64::from(preference[2] & 0xffff) + 1;
+        let height = u64::from(preference[2] >> 16) + 1;
+        let (kind, nv12) = match preference[1] {
+            1 | 4 => (0xa, true),
+            2 | 5 => (0x9, false),
+            _ => (0x8, false),
+        };
+        let pitch = (width * if nv12 { 1 } else { 4 }).next_multiple_of(64);
+        let luma = pitch * height.next_multiple_of(128);
+        let chroma = if nv12 {
+            pitch * height.div_ceil(2).next_multiple_of(128)
+        } else {
+            0
+        };
+        Self {
+            kind,
+            pitch,
+            chroma_offset: nv12.then_some(luma),
+            size: luma + chroma,
+        }
+    }
+}
+
 pub(super) fn bytes_per_pixel(format: u32) -> u64 {
     if format == FORMAT_RGBA16_FLOAT { 8 } else { 4 }
 }
@@ -97,6 +139,10 @@ struct Image {
     size: u64,
     /// Images in the pool: handle + i is image i.
     count: u32,
+    /// Where image 0 starts in the memory.
+    offset: u64,
+    /// A video decoder output image pool (gsv 911), laid out by [`DecoderLayout`].
+    decoder: bool,
 }
 
 /// A native image vi2 can show.
@@ -122,7 +168,7 @@ impl NativeObjects {
     fn image(&self, handle: u32) -> Option<(&Image, u64)> {
         let (&first, image) = self.images.range(..=handle).next_back()?;
         let index = handle - first;
-        (index < image.count).then(|| (image, u64::from(index) * image.size))
+        (index < image.count).then(|| (image, image.offset + u64::from(index) * image.size))
     }
 
     pub fn presentable(&self, handle: u32) -> Option<Presentable> {
@@ -161,6 +207,8 @@ impl NativeObjects {
                 preference,
                 size: ImageLayout::of(&preference).size,
                 count: 1,
+                offset: 0,
+                decoder: false,
             },
         );
         (objects, 1)
@@ -214,23 +262,46 @@ pub(super) fn handle(objects: &Mutex<NativeObjects>, ctx: &mut HleRequestContext
             }
             tracing::info!("nx2:gsv {command}: native memory {id} at {address:#x}+{size:#x}");
         }
-        429 | 1211 => {
+        429 | 911 | 1211 => {
             let preference = preference(&words);
             let count = words.u32(18).max(1);
             let memory = words.u32(19);
+            let decoder = command == 911;
+            if decoder && count > MAX_DECODER_IMAGES {
+                tracing::warn!(
+                    "nx2:gsv 911: {count} decoder images, more than {MAX_DECODER_IMAGES}"
+                );
+                return UNKNOWN;
+            }
+            let size = if decoder {
+                DecoderLayout::of(&preference).size
+            } else {
+                ImageLayout::of(&preference).size
+            };
             let mut objects = objects.lock();
             let id = objects.last_image + 1;
             objects.last_image += count;
-            let size = ImageLayout::of(&preference).size;
-            objects.images.insert(
-                id,
-                Image {
-                    memory,
-                    preference,
-                    size,
-                    count,
-                },
-            );
+            let image = Image {
+                memory,
+                preference,
+                size,
+                count,
+                offset: 0,
+                decoder,
+            };
+            if decoder {
+                for i in 0..count {
+                    let offset = u64::from(i) * size;
+                    let one = Image {
+                        count: 1,
+                        offset,
+                        ..image
+                    };
+                    objects.images.insert(id + i, one);
+                }
+            } else {
+                objects.images.insert(id, image);
+            }
             tracing::info!(
                 "nx2:gsv {command}: native image {id} x{count} in memory {memory}, {size:#x} bytes, \
                  format {}",
@@ -238,8 +309,33 @@ pub(super) fn handle(objects: &Mutex<NativeObjects>, ctx: &mut HleRequestContext
             );
             ctx.push(id);
         }
-        430 => {
+        430 | 912 => {
             objects.lock().images.remove(&words.u32(2));
+        }
+        961 => {
+            let handle = words.u32(2);
+            let mut descriptor = [0u32; 32];
+            match objects.lock().image(handle) {
+                Some((image, offset)) if image.decoder => {
+                    let layout = DecoderLayout::of(&image.preference);
+                    descriptor[0] = layout.kind;
+                    descriptor[2] = offset as u32;
+                    descriptor[4] = layout.pitch as u32;
+                    if let Some(chroma) = layout.chroma_offset {
+                        descriptor[6] = (offset + chroma) as u32;
+                        descriptor[8] = layout.pitch as u32;
+                    }
+                }
+                _ => tracing::warn!("nx2:gsv 961: no decoder image {handle}"),
+            }
+            for word in descriptor {
+                ctx.push(word);
+            }
+        }
+        991 => {
+            let layout = DecoderLayout::of(&preference(&words));
+            let size = layout.size * u64::from(words.u32(18).max(1));
+            push_u64s(ctx, &[size, DECODER_ALIGNMENT]);
         }
         426 | 428 => {
             let handle = words.u32(2);

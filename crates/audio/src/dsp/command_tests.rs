@@ -405,7 +405,7 @@ fn mix_ramps_record_their_last_sample_and_feed_depop() {
     rig.state.voices[0].previous_samples[1] = 99;
     let mut expected = rig.mix.clone();
     let last = mix::apply_mix_ramp::<23>(&mut expected, 5 * SC, 0, 1.0, -0.5 / SC as f32, SC);
-    rig.run(vec![Command::MixRampGrouped(Box::new(grouped))]);
+    rig.run(vec![Command::MixRampGrouped(grouped)]);
     assert_eq!(rig.mix, expected);
     assert_eq!(rig.state.voices[0].previous_samples[..2], [last, 0]);
 
