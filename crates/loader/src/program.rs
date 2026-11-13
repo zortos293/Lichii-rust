@@ -168,6 +168,12 @@ pub struct ProgramImage {
     /// The RomFS image the title sees, with its update and LayeredFS mods applied.
     pub romfs: Option<FileRef>,
     pub nacp: Option<Nacp>,
+    /// The title's icon (JPEG for packaged titles) in the preferred language, for
+    /// `GetApplicationControlData`.
+    pub icon: Option<Vec<u8>>,
+    /// The title version from its CNMT, the update's when one applies; 0 when the title has no
+    /// CNMT (loose files, NSO, NRO).
+    pub version: u32,
     /// Seed for `GetPseudoDeviceId`: the NACP's, or the program id when there is no NACP.
     pub pseudo_device_seed: u64,
     pub add_ons: Vec<AddOnContent>,
@@ -210,6 +216,8 @@ impl ProgramImage {
             code_size: offset,
             romfs,
             nacp,
+            icon: None,
+            version: 0,
             pseudo_device_seed,
             add_ons: Vec::new(),
         }

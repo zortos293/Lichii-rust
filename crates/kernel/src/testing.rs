@@ -116,6 +116,8 @@ pub fn program_image(program_id: u64) -> ProgramImage {
         entry_offset: 0,
         romfs: None,
         nacp: None,
+        icon: None,
+        version: 0,
         pseudo_device_seed: program_id,
         add_ons: Vec::new(),
     }

@@ -58,6 +58,16 @@ const WORKLOADS: &[Workload] = &[
         ],
         per_iteration: 6,
     },
+    Workload {
+        name: "atomic add loop",
+        code: &[
+            0xf8220023, // 1: ldadd x2, x3, [x1]
+            0xf10004a5, // subs x5, x5, #1
+            0x54ffffc1, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        per_iteration: 3,
+    },
 ];
 
 fn main() {

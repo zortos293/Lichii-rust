@@ -1556,6 +1556,7 @@ dependencies = [
  "bytemuck",
  "lichii-common",
  "lichii-crypto",
+ "lichii-fs",
  "lichii-gpu",
  "lichii-input",
  "lichii-kernel",

@@ -6,7 +6,7 @@ use lichii_crypto::{KeySet, Ticket, TitleKey};
 use crate::cnmt::{Cnmt, ContentMetaType, ContentRecord, ContentType, ExtendedHeader};
 use crate::error::{FsResult, corrupt};
 use crate::nca::{FsType, Nca, NcaContentType};
-use crate::vfs::{Directory, DirectoryExt, EntryKind, FileExt, FileRef, not_found};
+use crate::vfs::{ConcatFile, Directory, DirectoryExt, EntryKind, FileExt, FileRef, not_found};
 
 const MAX_SMALL_FILE: u64 = 16 << 20;
 
@@ -71,15 +71,37 @@ impl ContentIndex {
     /// and every Meta NCA's CNMT parsed. Contents a CNMT lists are found by their
     /// `<content id>.nca` name; missing ones (delta fragments, stripped manuals) are skipped.
     pub fn from_dir(dir: &dyn Directory, keys: &mut KeySet) -> FsResult<Self> {
+        Self::index(dir, keys, false)
+    }
+
+    /// Indexes a NAND or SD card `Contents/registered` directory. Entries are `<id>.nca` files
+    /// or `<id>.nca` directories of `00`, `01`, ... parts. NCAs and CNMTs that do not open
+    /// (a missing key, a damaged file) are logged and skipped, so one bad content never hides
+    /// the rest.
+    pub fn from_registered(dir: &dyn Directory, keys: &mut KeySet) -> FsResult<Self> {
+        Self::index(dir, keys, true)
+    }
+
+    /// The RomFS of the Data NCA of system data or an add-on, such as the time zone archive.
+    pub fn data_romfs(&self, title_id: u64) -> FsResult<Option<FileRef>> {
+        match self.nca(title_id, ContentType::Data) {
+            Some(nca) => nca.romfs(),
+            None => Ok(None),
+        }
+    }
+
+    fn index(dir: &dyn Directory, keys: &mut KeySet, lenient: bool) -> FsResult<Self> {
         let mut entries = dir.entries()?;
-        entries.retain(|e| e.kind == EntryKind::File);
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         let open = |name: &str| -> FsResult<FileRef> {
             Ok(dir.open_file(name)?.ok_or_else(|| not_found(name))?)
         };
 
         let mut index = Self::default();
-        for entry in entries.iter().filter(|e| e.name.ends_with(".tik")) {
+        for entry in entries
+            .iter()
+            .filter(|e| e.kind == EntryKind::File && e.name.ends_with(".tik"))
+        {
             let ticket = Ticket::parse(&read_small(&open(&entry.name)?)?)
                 .map_err(|e| corrupt("ticket", format!("{}: {e}", entry.name)))?;
             match ticket.title_key {
@@ -92,14 +114,31 @@ impl ContentIndex {
             index.tickets.push(ticket);
         }
         for entry in entries.iter().filter(|e| e.name.ends_with(".nca")) {
-            let nca = Nca::open(open(&entry.name)?, keys)?;
-            index.ncas.push((entry.name.clone(), nca));
+            let opened = match entry.kind {
+                EntryKind::File => open(&entry.name),
+                EntryKind::Directory => open_split(dir, &entry.name),
+            }
+            .and_then(|file| Nca::open(file, keys));
+            match opened {
+                Ok(nca) => index.ncas.push((entry.name.clone(), nca)),
+                Err(error) if lenient => {
+                    tracing::warn!(nca = %entry.name, "skipping content: {error}");
+                }
+                Err(error) => return Err(error),
+            }
         }
         for (name, meta) in &index.ncas {
             if meta.header().content_type != NcaContentType::Meta {
                 continue;
             }
-            let cnmt = read_cnmt(meta)?;
+            let cnmt = match read_cnmt(meta) {
+                Ok(cnmt) => cnmt,
+                Err(error) if lenient => {
+                    tracing::warn!(meta = %name, "skipping title: {error}");
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let mut contents = Vec::new();
             for record in &cnmt.contents {
                 if record.content_type == ContentType::DeltaFragment {
@@ -193,6 +232,27 @@ impl ContentIndex {
     pub fn tickets(&self) -> &[Ticket] {
         &self.tickets
     }
+}
+
+/// A split NCA: a directory of `00`, `01`, ... parts in order.
+fn open_split(dir: &dyn Directory, name: &str) -> FsResult<FileRef> {
+    let parts_dir = dir.open_dir(name)?.ok_or_else(|| not_found(name))?;
+    let mut names: Vec<String> = parts_dir
+        .entries()?
+        .into_iter()
+        .filter(|e| e.kind == EntryKind::File && e.name.len() == 2)
+        .filter(|e| e.name.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(|e| e.name)
+        .collect();
+    names.sort();
+    if names.is_empty() {
+        return Err(corrupt("NCA", format!("{name}: a split NCA without parts")));
+    }
+    let mut parts = Vec::with_capacity(names.len());
+    for part in &names {
+        parts.push(parts_dir.open_file(part)?.ok_or_else(|| not_found(part))?);
+    }
+    Ok(ConcatFile::from_parts(parts))
 }
 
 fn read_small(file: &FileRef) -> FsResult<Vec<u8>> {
@@ -299,6 +359,60 @@ pub(crate) mod tests {
         let dir = dir.with_dir("ignored", MemDir::new());
         let mut keys = key_set();
         check_application(&ContentIndex::from_dir(&dir, &mut keys).unwrap());
+    }
+
+    #[test]
+    fn registered_contents_join_split_ncas_and_skip_bad_ones() {
+        let mut dir = MemDir::new();
+        let mut files = application_package(true);
+        files.extend(update_package());
+        for (name, file) in files {
+            if name.ends_with(".nca") && file.size() > 0x1000 && !dir_has_split(&dir) {
+                let data = file.read_all().unwrap();
+                let (first, second) = data.split_at(data.len() / 2);
+                let parts = MemDir::new()
+                    .with_bytes("00", first.to_vec())
+                    .with_bytes("01", second.to_vec());
+                dir = dir.with_dir(name, parts);
+            } else {
+                dir = dir.with_file(name, file);
+            }
+        }
+        assert!(dir_has_split(&dir));
+        let dir = dir.with_bytes("ffffffffffffffffffffffffffffffff.nca", vec![0u8; 0x400]);
+        let mut keys = key_set();
+        assert!(ContentIndex::from_dir(&dir, &mut keys).is_err());
+        let index = ContentIndex::from_registered(&dir, &mut keys).unwrap();
+        assert_eq!(index.titles().len(), 3);
+        let program = index.nca(APP, ContentType::Program).unwrap();
+        assert_eq!(
+            program
+                .exefs()
+                .unwrap()
+                .unwrap()
+                .file("main")
+                .unwrap()
+                .read_all()
+                .unwrap(),
+            bytes(0x2345, 1)
+        );
+        let dlc = open_romfs(&index.data_romfs(APP + 0x1001).unwrap().unwrap()).unwrap();
+        assert_eq!(
+            dlc.open_file("dlc.bin")
+                .unwrap()
+                .unwrap()
+                .read_all()
+                .unwrap(),
+            bytes(0x900, 23)
+        );
+        assert!(index.data_romfs(APP + 0x2001).unwrap().is_none());
+    }
+
+    fn dir_has_split(dir: &MemDir) -> bool {
+        dir.entries()
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == EntryKind::Directory)
     }
 
     #[test]

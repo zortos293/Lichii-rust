@@ -19,6 +19,7 @@ pub mod nca;
 pub mod nsp;
 pub mod pfs;
 pub mod romfs;
+pub mod save;
 #[cfg(test)]
 mod testutil;
 pub mod vfs;
