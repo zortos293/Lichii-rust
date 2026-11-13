@@ -11,3 +11,4 @@ tracing.workspace = true
 bitflags.workspace = true
 smallvec = { version = "1", features = ["union", "const_generics"] }
 rustc-hash = "2"
+rspirv = "0.13"

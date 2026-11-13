@@ -36,18 +36,29 @@
 
 mod acc;
 mod am;
+mod aoc;
 mod apm;
+mod arp;
+mod bcat;
 mod caps;
 mod context;
 mod dispatch;
 mod erpt;
 mod eupld;
+mod friend;
 mod fs;
 mod gsv;
 mod lm;
+mod ncm;
+mod nifm;
+mod nim;
+mod ns;
+mod nvdrv;
 mod pctl;
 mod prepo;
 mod set;
+mod sockets;
+mod ssl;
 #[cfg(test)]
 mod testing;
 mod time;
@@ -74,5 +85,16 @@ pub fn register_all(context: &Arc<ServiceContext>) -> HleResult<()> {
     set::register(context)?;
     acc::register(context)?;
     time::register(context)?;
+    aoc::register(context)?;
+    arp::register(context)?;
+    bcat::register(context)?;
+    friend::register(context)?;
+    ncm::register(context)?;
+    nifm::register(context)?;
+    nim::register(context)?;
+    ns::register(context)?;
+    sockets::register(context)?;
+    ssl::register(context)?;
+    nvdrv::register(context)?;
     Ok(())
 }

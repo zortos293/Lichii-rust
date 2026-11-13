@@ -161,6 +161,7 @@ impl Bench {
             rasterizer: &mut self.renderer,
             syncpoints: &self.h.syncpoints,
             gob_layout: self.h.gob_layout,
+            qmd_scheduler: &mut self.h.qmd_scheduler,
         };
         f(&mut self.engine, &mut ctx);
     }

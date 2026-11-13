@@ -7,6 +7,7 @@ use lichii_memory::{AddressSpace, DeviceAddressSpace, MemoryPermission, Physical
 use lichii_texture::block_linear::GobLayout;
 
 use super::EngineContext;
+use super::kepler_compute::pcas::QmdScheduler;
 use crate::backend::{
     ChannelId, ComputeContext, DrawParams, FenceAction, FramebufferConfig, GraphicsContext,
     IndirectDraw, Query, Rasterizer,
@@ -57,6 +58,7 @@ pub struct Harness {
     pub rasterizer: Recorder,
     pub syncpoints: Syncpoints,
     pub gob_layout: GobLayout,
+    pub qmd_scheduler: QmdScheduler,
 }
 
 impl Harness {
@@ -75,6 +77,7 @@ impl Harness {
             rasterizer: Recorder::default(),
             syncpoints: Syncpoints::new(),
             gob_layout: GobLayout::Tegra,
+            qmd_scheduler: QmdScheduler::new(),
         }
     }
 
@@ -85,6 +88,7 @@ impl Harness {
             rasterizer: &mut self.rasterizer,
             syncpoints: &self.syncpoints,
             gob_layout: self.gob_layout,
+            qmd_scheduler: &mut self.qmd_scheduler,
         }
     }
 }

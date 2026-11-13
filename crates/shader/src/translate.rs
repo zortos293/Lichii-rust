@@ -3,8 +3,11 @@
 
 use lichii_common::settings::ResolutionScale;
 
+use std::hash::{Hash, Hasher};
+
 use crate::flow::Cfg;
 use crate::flow::structure::{StructureOptions, structure};
+use crate::hash::Recorder;
 use crate::info::{Interpolation, StorageBufferDescriptor, StorageWriteExtent};
 use crate::ir::{Attribute, Opcode, Program, SyntaxNode};
 use crate::maxwell::flow::MaxwellFlow;
@@ -15,12 +18,18 @@ use crate::opt;
 use crate::profile::HostTranslateInfo;
 use crate::{Profile, ShaderArch, ShaderEnvironment, ShaderInfo, ShaderStage, TranslateError};
 
+/// Bump when a translator change alters the output for unchanged inputs, so cached modules
+/// from older builds stop matching.
+pub const TRANSLATOR_VERSION: u32 = 1;
+
 /// Size of the Maxwell program header in front of a graphics program's first instruction.
 const HEADER_SIZE: u64 = 0x50;
 
 /// A translated program: optimized SSA IR and what the backend needs to emit it.
 #[derive(Clone, Debug)]
 pub struct TranslatedProgram {
+    /// Stable hash of everything translation read from the environment, with the options.
+    pub hash: u64,
     pub ir: Program,
     pub info: ShaderInfo,
     pub stage: ShaderStage,
@@ -57,6 +66,7 @@ pub fn translate_dual_vertex(
     options: TranslateOptions<'_>,
 ) -> Result<TranslatedProgram, TranslateError> {
     let TranslatedProgram {
+        hash: a_hash,
         mut ir,
         mut info,
         local_memory_size,
@@ -101,6 +111,9 @@ pub fn translate_dual_vertex(
     opt::collect_shader_info(env_b, ir, &mut info);
     b.info = info;
     b.local_memory_size = b.local_memory_size.max(local_memory_size);
+    let mut hasher = crate::hash::StableHasher::new();
+    (a_hash, b.hash).hash(&mut hasher);
+    b.hash = hasher.finish();
     Ok(b)
 }
 
@@ -109,12 +122,31 @@ pub fn translate_dual_vertex(
 fn translate_into(
     env: &dyn ShaderEnvironment,
     options: TranslateOptions<'_>,
+    ir: Program,
+) -> Result<TranslatedProgram, TranslateError> {
+    let recorder = Recorder::new(env);
+    let mut program = translate_recorded(&recorder, options, ir)?;
+    let mut hasher = recorder.hasher();
+    TRANSLATOR_VERSION.hash(&mut hasher);
+    format!(
+        "{:?}{:?}{:?}",
+        options.profile, options.host, options.resolution_scale
+    )
+    .hash(&mut hasher);
+    program.hash = hasher.finish();
+    Ok(program)
+}
+
+fn translate_recorded(
+    env: &dyn ShaderEnvironment,
+    options: TranslateOptions<'_>,
     mut ir: Program,
 ) -> Result<TranslatedProgram, TranslateError> {
     let host = options.host.clone().with_descriptor_limits();
     let stage = env.stage();
     build(env, &host, &mut ir)?;
     let mut program = TranslatedProgram {
+        hash: 0,
         ir,
         info: ShaderInfo::default(),
         stage,
@@ -382,6 +414,8 @@ fn add_nvn_storage_buffers(info: &mut ShaderInfo, profile: &Profile) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lichii_common::GpuVAddr;
+
     use crate::maxwell::opcode::Opcode as Sass;
     use crate::maxwell::translate::tests::{TestEnv, encode};
 
@@ -435,6 +469,31 @@ mod tests {
         assert_eq!(dump.matches("return").count(), 1, "{dump}");
         assert_eq!(merged.stage, ShaderStage::VertexB);
         opt::verify(&merged.ir).expect("valid IR");
+    }
+
+    #[test]
+    fn hash_follows_code_and_options_but_not_the_address() {
+        let host = HostTranslateInfo::default();
+        let profile = Profile::default();
+        let hash = |code: &[u64], base: GpuVAddr, profile: &Profile| {
+            let mut env = TestEnv::new(code);
+            env.base = base;
+            translate(&env, options(profile, &host))
+                .expect("translate")
+                .hash
+        };
+        let [mov, sts] = shared_store(0x10, 5);
+        let exit = encode(Sass::Exit, PT | 0xf);
+        let a = hash(&[mov, sts, exit], 0x1000, &profile);
+        assert_ne!(a, 0);
+        assert_eq!(a, hash(&[mov, sts, exit], 0x9000, &profile));
+        let [mov7, sts7] = shared_store(0x10, 7);
+        assert_ne!(a, hash(&[mov7, sts7, exit], 0x1000, &profile));
+        let other = Profile {
+            support_int64: !profile.support_int64,
+            ..profile.clone()
+        };
+        assert_ne!(a, hash(&[mov, sts, exit], 0x1000, &other));
     }
 
     #[test]

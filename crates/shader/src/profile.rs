@@ -7,6 +7,10 @@ pub struct Profile {
     /// Highest SPIR-V version, as `0x00MMmm00` (Vulkan 1.3 is 0x00010600).
     pub supported_spirv: u32,
     pub unified_descriptor_binding: bool,
+    /// Buffer bindings may be declared with several element types (8/16/32/64-bit and vector
+    /// views of one binding). Without it constant buffers are read as vec4 arrays and storage
+    /// buffers as words.
+    pub support_descriptor_aliasing: bool,
 
     pub support_int8: bool,
     pub support_int16: bool,
@@ -99,6 +103,7 @@ impl Default for Profile {
         Profile {
             supported_spirv: 0x0001_0300,
             unified_descriptor_binding: true,
+            support_descriptor_aliasing: true,
             support_int8: false,
             support_int16: false,
             support_int64: false,
