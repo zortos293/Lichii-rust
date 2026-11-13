@@ -14,6 +14,7 @@ mod sessions;
 mod syncpt;
 #[cfg(test)]
 mod tests;
+mod vdec;
 mod vi2;
 
 use std::collections::BTreeSet;
@@ -179,7 +180,7 @@ impl Service for GraphicsSystem {
                 } else {
                     "nx2:vdec"
                 };
-                let decoder = sessions::VideoDecoder {
+                let decoder = vdec::VideoDecoder {
                     context: context.clone(),
                     name,
                 };

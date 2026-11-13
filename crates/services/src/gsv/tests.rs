@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use lichii_common::ResultCode;
 use lichii_common::settings::Settings;
@@ -1168,19 +1169,228 @@ fn gsv_hands_out_initialized_nvsrv_sessions() {
 
 #[test]
 fn video_decoder_sessions_hand_out_decoder_services() {
-    let (_context, client, gsv) = gsv();
+    let (context, client, gsv) = gsv();
+    let decoder = session(&client, gsv, 902);
+    assert_eq!(
+        client.send(decoder, &Request::tipc(1)).unwrap().result,
+        super::UNKNOWN,
+        "no decoder service before nvdrv is registered"
+    );
+    crate::nvdrv::register(&context).unwrap();
     for command in [902, 905, 906, 1002] {
         let decoder = session(&client, gsv, command);
         let service = session(&client, decoder, 1);
         let ready = session(&client, service, 3);
         assert!(event(&client, ready).is_signaled(), "gsv {command}");
         let reply = client.send(service, &Request::tipc(200)).unwrap();
-        assert_eq!(
-            reply.result,
-            ResultCode::SUCCESS,
-            "initialize falls to the auto-stub"
+        assert_eq!(reply.result, ResultCode::SUCCESS);
+    }
+}
+
+struct Vdec {
+    context: Arc<ServiceContext>,
+    client: IpcClient,
+    service: Handle,
+    frame: u64,
+}
+
+impl Vdec {
+    /// A decoder service through gsv 902, initialized (200), configured (101) for a 1280x720
+    /// VP9 movie and started (6), as Mario Tennis Fever opens its movie.
+    fn open() -> Self {
+        let (context, client, gsv) = gsv();
+        crate::nvdrv::register(&context).unwrap();
+        let decoder = session(&client, gsv, 902);
+        let service = session(&client, decoder, 1);
+        let frame = client.alloc(&[0x82; 64]);
+        let vdec = Self {
+            context,
+            client,
+            service,
+            frame,
+        };
+        let initialize = Request::tipc(200).arg(0x5a_0000u64).arg([1u32, 0, 0]);
+        assert_eq!(vdec.send(&initialize).result, ResultCode::SUCCESS);
+        let codec = vdec.client.alloc(b"video/vp9\0");
+        let configure = Request::tipc(101)
+            .buffer_a(codec, 10)
+            .arg([1280u32, 720, 60, 0]);
+        assert_eq!(vdec.send(&configure).result, ResultCode::SUCCESS);
+        assert_eq!(vdec.send(&Request::tipc(6)).result, ResultCode::SUCCESS);
+        vdec
+    }
+
+    fn send(&self, request: &Request) -> lichii_kernel::testing::Reply {
+        self.client.send(self.service, request).unwrap()
+    }
+
+    /// 311 or 314 for \`image\`: the NativeSyncHandle's syncpoint and value.
+    fn hand_out(&self, command: u32, image: u32) -> (u32, u32) {
+        let mut request = Request::tipc(command).arg(image);
+        if command == 314 {
+            request = request.arg(0u32).arg([!40u32, 0]).arg(7u64);
+        }
+        let mut reply = self.send(&request);
+        assert_eq!(reply.result, ResultCode::SUCCESS, "{command} {image}");
+        let (counter, mode, value) = (reply.pop::<u32>(), reply.pop::<u32>(), reply.pop::<u64>());
+        assert_eq!(mode, 0);
+        (!counter, value as u32)
+    }
+
+    fn submit(&self, pts: u64, end: bool) -> lichii_kernel::testing::Reply {
+        let size = if end { 0 } else { 64 };
+        self.send(
+            &Request::tipc(109)
+                .buffer_a(self.frame, size)
+                .arg(pts)
+                .arg(u8::from(end)),
+        )
+    }
+
+    fn wait(&self, syncpoint: u32, value: u32) {
+        let guest = self.context.gpu.host1x().syncpoints.guest();
+        let reached = guest.wait(syncpoint, value, Some(Duration::from_secs(5)));
+        assert!(
+            reached.is_ok(),
+            "syncpoint {syncpoint} never reached {value}"
         );
     }
+
+    /// 213: the image, width, pts in ns and end of stream of the next filled image.
+    fn output(&self) -> Option<(u32, u32, u64, bool)> {
+        let mut reply = self.send(&Request::tipc(213));
+        if reply.result != ResultCode::SUCCESS {
+            assert_eq!(reply.result, ResultCode::new(111, 3604));
+            return None;
+        }
+        let words = reply.pop::<[u32; 6]>();
+        let (pts, end) = (reply.pop::<u64>(), reply.pop::<u32>());
+        assert_eq!(reply.data().len(), 64);
+        Some((words[0], words[1], pts, end != 0))
+    }
+
+    /// Closes the session and waits until its syncpoint is free again.
+    fn close(self, syncpoint: u32) {
+        self.client.process().handles().write().remove(self.service);
+        let nvdrv = self.context.nvdrv.get().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let id = nvdrv.allocate_syncpoint();
+            nvdrv.retire_syncpoint(id);
+            if id == syncpoint {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "syncpoint {syncpoint} was not freed"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+#[test]
+fn video_decoder_plays_a_movie_at_its_pts_pace_and_ends_it() {
+    let vdec = Vdec::open();
+    let fences: Vec<_> = (1..=3).map(|image| vdec.hand_out(311, image)).collect();
+    let syncpoint = fences[0].0;
+    let base = vdec
+        .context
+        .gpu
+        .host1x()
+        .syncpoints
+        .guest()
+        .value(syncpoint)
+        .unwrap();
+    assert_eq!(
+        fences,
+        [
+            (syncpoint, base + 1),
+            (syncpoint, base + 2),
+            (syncpoint, base + 3)
+        ]
+    );
+    let ready = event(&vdec.client, vdec.send(&Request::tipc(3)).copy_handles[0]);
+    assert!(ready.is_signaled());
+    ready.clear();
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(ready.is_signaled(), "signalled again while there is room");
+
+    let start = Instant::now();
+    for (index, pts) in [0, 20_000, 40_000].into_iter().enumerate() {
+        let mut reply = vdec.submit(pts, false);
+        assert_eq!(reply.result, ResultCode::SUCCESS);
+        assert_eq!(reply.pop::<u64>(), index as u64 + 1);
+    }
+    assert_eq!(vdec.submit(40_000, true).result, ResultCode::SUCCESS);
+    vdec.wait(syncpoint, base + 3);
+    assert!(
+        start.elapsed() >= Duration::from_millis(40),
+        "the last frame came {:?} after the first",
+        start.elapsed()
+    );
+    for (image, pts) in [(1, 0), (2, 20_000_000), (3, 40_000_000)] {
+        assert_eq!(vdec.output(), Some((image, 1280, pts, false)));
+    }
+    assert_eq!(vdec.output(), None);
+
+    assert_eq!(
+        vdec.hand_out(314, 1),
+        (syncpoint, base + 4),
+        "a released image waits for the next frame"
+    );
+    vdec.wait(syncpoint, base + 4);
+    assert_eq!(
+        vdec.output(),
+        Some((1, 1280, 40_000_000, true)),
+        "end of stream completes as an empty frame"
+    );
+    assert_eq!(vdec.output(), None);
+    ready.clear();
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(
+        !ready.is_signaled(),
+        "no input is wanted after the end of stream"
+    );
+
+    let (_, value) = vdec.hand_out(314, 2);
+    let guest = vdec.context.gpu.host1x().syncpoints.clone();
+    vdec.close(syncpoint);
+    assert!(
+        guest.guest().is_reached(syncpoint, value).unwrap(),
+        "closing completes the fences handed out"
+    );
+}
+
+#[test]
+fn video_decoder_stop_completes_handed_fences_and_full_queues_are_busy() {
+    let vdec = Vdec::open();
+    for pts in 0..24 {
+        assert_eq!(vdec.submit(pts * 16_667, false).result, ResultCode::SUCCESS);
+    }
+    assert_eq!(
+        vdec.submit(24 * 16_667, false).result,
+        ResultCode::new(111, 3603),
+        "busy while no image takes a frame"
+    );
+    assert_eq!(
+        vdec.submit(25 * 16_667, true).result,
+        ResultCode::SUCCESS,
+        "end of stream is never refused"
+    );
+
+    let fences: Vec<_> = (1..=3).map(|image| vdec.hand_out(311, image)).collect();
+    let (syncpoint, last) = fences[2];
+    assert_eq!(vdec.send(&Request::tipc(207)).result, ResultCode::SUCCESS);
+    let guest = vdec.context.gpu.host1x().syncpoints.guest();
+    assert!(guest.is_reached(syncpoint, last).unwrap());
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(
+        guest.value(syncpoint).unwrap(),
+        last,
+        "stopped images take no more frames"
+    );
+    vdec.close(syncpoint);
 }
 
 fn decoder_preference(code: u32, width: u32, height: u32) -> Vec<u32> {
