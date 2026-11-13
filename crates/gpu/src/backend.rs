@@ -314,6 +314,7 @@ impl FenceAction {
                 let bytes = 4 * words.len() as u64;
                 let mirror = handles.syncpoints.semaphore_mirror();
                 let mut page = mirror.first_page(address);
+                let mirrored = mirror.mirror_of(address);
                 if let Err(fault) = handles
                     .device
                     .write_bytes(address, bytemuck::cast_slice(words))
@@ -329,7 +330,7 @@ impl FenceAction {
                     .syncpoints
                     .semaphore_waiters()
                     .written(&handles.device, address, bytes);
-                if let Some(page) = mirror.mirror_of(address) {
+                if let Some(page) = mirrored {
                     mirror_release(handles, page, address - semaphore_mirror::PAGE, words);
                 }
             }
@@ -341,6 +342,7 @@ impl FenceAction {
             } => {
                 let mirror = handles.syncpoints.semaphore_mirror();
                 let mut page = mirror.first_page(address);
+                let mirrored = mirror.mirror_of(address);
                 let Some(word) = semaphore_word(&handles.device, address) else {
                     tracing::warn!(
                         address,
@@ -371,7 +373,7 @@ impl FenceAction {
                 } else {
                     waiters.met_by(address, seen);
                 }
-                if let Some(page) = mirror.mirror_of(address) {
+                if let Some(page) = mirrored {
                     mirror_release(handles, page, address - semaphore_mirror::PAGE, &[after]);
                 }
             }
@@ -798,6 +800,22 @@ mod tests {
         });
         assert_eq!(h.device.read::<u32>(FIRST).unwrap(), 2000);
         assert_eq!(acquire_sees(&h, FIRST), 2010);
+    }
+
+    #[test]
+    fn concurrent_second_page_reductions_mirror_the_final_value() {
+        let (_space, h) = handles_with_region();
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..1000 {
+                        reduce(&h, FIRST + 0x1008, Reduction::Add, 1);
+                    }
+                });
+            }
+        });
+        assert_eq!(h.device.read::<u32>(FIRST + 0x1008).unwrap(), 4000);
+        assert_eq!(h.device.read::<u32>(FIRST + 8).unwrap(), 4000);
     }
 
     #[test]
