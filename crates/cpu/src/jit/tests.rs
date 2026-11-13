@@ -398,11 +398,12 @@ fn describe(code: &[u32], expected: &Outcome, actual: &Outcome) -> String {
     lines.join("\n")
 }
 
-const ABLATIONS: [Passes; 5] = [
+const ABLATIONS: [Passes; 6] = [
     Passes {
         get_set: false,
         fold: false,
         fuse: false,
+        lazy: false,
         dce: false,
     },
     Passes {
@@ -415,6 +416,10 @@ const ABLATIONS: [Passes; 5] = [
     },
     Passes {
         fuse: false,
+        ..Passes::ALL
+    },
+    Passes {
+        lazy: false,
         ..Passes::ALL
     },
     Passes {
@@ -449,6 +454,7 @@ fn random_streams_match_the_interpreter() {
             "jit without get/set",
             "jit without folding",
             "jit without fusion",
+            "jit without lazy flags",
             "jit without dce",
         ][i];
         machines.push((name, Machine::new(Backend::Jit(*passes))));
@@ -1060,5 +1066,61 @@ fn paranoid_accuracy_builds_no_jit() {
         CpuAccuracy::Unsafe,
     ] {
         assert!(Jit::new(config(accuracy)).is_some());
+    }
+}
+
+#[test]
+fn lazy_flags_cross_linked_blocks() {
+    const SETTERS: [u32; 6] = [
+        0xeb01_001f,
+        0xab01_001f,
+        0xea01_001f,
+        0x6b01_001f,
+        0x2b01_001f,
+        0x6a01_001f,
+    ];
+    const VALUES: [u64; 4] = [0, 1, 0x8000_0000, u64::MAX];
+    for setter in SETTERS {
+        for cond in 0..14 {
+            let code = [
+                0x5400_0040 | cond,
+                0x9100_0442,
+                setter,
+                0x8b07_0000,
+                0xd100_0529,
+                0xb5ff_ff69,
+            ];
+            for (a, b) in VALUES.into_iter().flat_map(|a| VALUES.map(|b| (a, b))) {
+                for step in [1, 0x7fff_ffff_ffff_ffff] {
+                    directed(&code, &[(0, a), (1, b), (7, step), (9, 4)]);
+                }
+            }
+        }
+    }
+    const MSR_LOOP: [u32; 8] = [
+        0xf100_0400,
+        0x1400_0001,
+        0xd51b_4203,
+        0x1400_0001,
+        0xd53b_4204,
+        0x8b04_00a5,
+        0xd100_0529,
+        0xb5ff_ff29,
+    ];
+    for nzcv in [0, 0x6000_0000, 0xf000_0000] {
+        directed(&MSR_LOOP, &[(0, 2), (3, nzcv), (9, 4)]);
+    }
+    const FCCMP_LOOP: [u32; 8] = [
+        0xeb01_0000,
+        0x1400_0001,
+        0x1e61_0403,
+        0x1400_0001,
+        0xd53b_4204,
+        0x8b04_00a5,
+        0xd100_0529,
+        0xb5ff_ff29,
+    ];
+    for (a, b) in [(5, 5), (5, 3), (3, 5)] {
+        directed(&FCCMP_LOOP, &[(0, a), (1, b), (9, 4)]);
     }
 }

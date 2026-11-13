@@ -63,6 +63,22 @@ impl Cmp {
     pub fn fuses(self, cond: u8) -> bool {
         cond < 14 && (self == Cmp::Sub || !matches!(cond, 8 | 9))
     }
+
+    /// The code `SetLazyNzcv` stores for these flags at width `w`; 0 means none are pending.
+    pub fn lazy_code(self, w: W) -> u32 {
+        let kind = match self {
+            Cmp::Add => 0,
+            Cmp::Sub => 1,
+            Cmp::Test => 2,
+        };
+        1 + 2 * kind + (w == W::W64) as u32
+    }
+
+    /// The flags and width a nonzero [`Cmp::lazy_code`] stands for.
+    pub fn from_lazy_code(code: u32) -> (Cmp, W) {
+        let kind = [Cmp::Add, Cmp::Sub, Cmp::Test][(code as usize - 1) / 2];
+        (kind, if code & 1 == 0 { W::W64 } else { W::W32 })
+    }
 }
 
 /// What an op produces. Every type but `U128` and `Void` lives in a general-purpose host
@@ -177,6 +193,10 @@ pub enum Op {
     /// `ConditionHolds(cond)` on the flags the host instruction of `Cmp` sets on `a` and `b`,
     /// for a `cond` that [`Cmp::fuses`].
     Compare(Cmp, u8, W, Value, Value),
+    /// Sets NZCV to the flags the host instruction of `Cmp` sets on `a` and `b` without computing
+    /// them: the operands are kept, and the first read of NZCV, in this block or a later one,
+    /// computes the flags.
+    SetLazyNzcv(Cmp, W, Value, Value),
     IsZero(W, Value),
     TestBit(Value, u8),
 
@@ -286,7 +306,8 @@ impl Op {
             | Op::StoreVec { .. }
             | Op::ZeroBlock { .. }
             | Op::Fence
-            | Op::CallSimd { .. } => Ty::Void,
+            | Op::CallSimd { .. }
+            | Op::SetLazyNzcv(..) => Ty::Void,
             Op::Get(loc) => loc.ty(),
             Op::LoadVec { .. } => Ty::U128,
             Op::AddFlags(..)
@@ -321,7 +342,7 @@ impl Op {
 
     /// Whether removing the op when nothing uses its value changes nothing.
     pub fn is_pure(&self) -> bool {
-        !matches!(self, Op::Set(..) | Op::Fence) && !self.may_exit()
+        !matches!(self, Op::Set(..) | Op::SetLazyNzcv(..) | Op::Fence) && !self.may_exit()
     }
 
     /// Calls `f` on every operand.
@@ -378,6 +399,7 @@ impl Op {
             | Op::AddFlags(_, a, b)
             | Op::SubFlags(_, a, b)
             | Op::Compare(_, _, _, a, b)
+            | Op::SetLazyNzcv(_, _, a, b)
             | Op::And(_, a, b)
             | Op::Or(_, a, b)
             | Op::Xor(_, a, b)

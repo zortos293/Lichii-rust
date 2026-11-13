@@ -9,6 +9,7 @@ pub(crate) struct Passes {
     pub get_set: bool,
     pub fold: bool,
     pub fuse: bool,
+    pub lazy: bool,
     pub dce: bool,
 }
 
@@ -17,6 +18,7 @@ impl Passes {
         get_set: true,
         fold: true,
         fuse: true,
+        lazy: true,
         dce: true,
     };
 
@@ -29,6 +31,9 @@ impl Passes {
         }
         if self.fuse {
             fuse_conditions(block);
+        }
+        if self.lazy {
+            lazy_flags(block);
         }
         if self.dce {
             dead_code_elimination(block);
@@ -174,20 +179,24 @@ pub(super) fn evaluate(op: &Op, k: impl Fn(Value) -> Option<u64>) -> Option<u64>
         Op::Select(w, cond, a, b) => (if k(cond)? != 0 { k(a)? } else { k(b)? }) & w.mask(),
         Op::TestCond(cond, f) => condition_holds(cond, k(f)? as u32) as u64,
         Op::Compare(kind, cond, w, a, b) => {
-            let flags = match kind {
-                Cmp::Add => add_with_carry(w, k(a)?, k(b)?, 0).1,
-                Cmp::Sub => add_with_carry(w, k(a)?, !k(b)?, 1).1,
-                Cmp::Test => {
-                    let r = k(a)? & k(b)? & w.mask();
-                    nzcv(r >> (w.bits() - 1) != 0, r == 0, false, false)
-                }
-            };
-            condition_holds(cond, flags as u32) as u64
+            condition_holds(cond, flags_of(kind, w, k(a)?, k(b)?) as u32) as u64
         }
         Op::IsZero(w, a) => (k(a)? & w.mask() == 0) as u64,
         Op::TestBit(a, bit) => k(a)? >> bit & 1,
         _ => return None,
     })
+}
+
+/// The NZCV the host instruction of `kind` sets on `a` and `b`.
+pub(super) fn flags_of(kind: Cmp, w: W, a: u64, b: u64) -> u64 {
+    match kind {
+        Cmp::Add => add_with_carry(w, a, b, 0).1,
+        Cmp::Sub => add_with_carry(w, a, !b, 1).1,
+        Cmp::Test => {
+            let r = a & b & w.mask();
+            nzcv(r >> (w.bits() - 1) != 0, r == 0, false, false)
+        }
+    }
 }
 
 /// Evaluates pure ops on constants, and simplifies the terminal when its operand is known.
@@ -224,17 +233,47 @@ pub(super) fn fuse_conditions(block: &mut Block) {
         let Op::TestCond(cond, f) = block.ops[i] else {
             continue;
         };
-        let (kind, w, a, b) = match block.ops[f.index()] {
-            Op::AddFlags(w, a, b) => (Cmp::Add, w, a, b),
-            Op::SubFlags(w, a, b) => (Cmp::Sub, w, a, b),
-            Op::LogicFlags(w, r) => match block.ops[r.index()] {
-                Op::And(aw, a, b) if aw == w => (Cmp::Test, w, a, b),
-                _ => (Cmp::Test, w, r, r),
-            },
-            _ => continue,
-        };
-        if kind.fuses(cond) {
+        if let Some((kind, w, a, b)) = compared(block, f)
+            && kind.fuses(cond)
+        {
             block.ops[i] = Op::Compare(kind, cond, w, a, b);
+        }
+    }
+}
+
+/// The host instruction and operands whose flags `f` is, when it is the NZCV of an add, a
+/// subtract or a logical result.
+fn compared(block: &Block, f: Value) -> Option<(Cmp, W, Value, Value)> {
+    Some(match block.ops[f.index()] {
+        Op::AddFlags(w, a, b) => (Cmp::Add, w, a, b),
+        Op::SubFlags(w, a, b) => (Cmp::Sub, w, a, b),
+        Op::LogicFlags(w, r) => match block.ops[r.index()] {
+            Op::And(aw, a, b) if aw == w => (Cmp::Test, w, a, b),
+            _ => (Cmp::Test, w, r, r),
+        },
+        _ => return None,
+    })
+}
+
+/// Writes NZCV lazily: a `Set` of flags that nothing else reads becomes `SetLazyNzcv` on the
+/// flag op's operands, so the block stores those instead of packing the flags, and DCE removes
+/// the flags op.
+pub(super) fn lazy_flags(block: &mut Block) {
+    let mut uses = vec![0u32; block.ops.len()];
+    block
+        .ops
+        .iter()
+        .flat_map(Op::args)
+        .for_each(|v| uses[v.index()] += 1);
+    block.terminal.for_each_arg(|v| uses[v.index()] += 1);
+    for i in 0..block.ops.len() {
+        let Op::Set(Loc::Nzcv, f) = block.ops[i] else {
+            continue;
+        };
+        if uses[f.index()] == 1
+            && let Some((kind, w, a, b)) = compared(block, f)
+        {
+            block.ops[i] = Op::SetLazyNzcv(kind, w, a, b);
         }
     }
 }
