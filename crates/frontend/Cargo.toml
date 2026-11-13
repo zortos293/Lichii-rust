@@ -29,4 +29,10 @@ serde.workspace = true
 toml.workspace = true
 tracing.workspace = true
 winit.workspace = true
+<<<<<<< HEAD
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+=======
+
+[dev-dependencies]
+lichii-loader = { workspace = true, features = ["testing"] }
+>>>>>>> origin/main

@@ -17,6 +17,7 @@ use crate::exefs::load_exefs;
 use crate::npdm::Npdm;
 use crate::nro::load_nro;
 use crate::nso::{HashCheck, load_nso};
+use crate::nup;
 use crate::package;
 use crate::patch::{ModOptions, Mods};
 use crate::program::ProgramImage;
@@ -56,6 +57,8 @@ pub enum TitleFormat {
     Xci,
     /// A standalone Program NCA.
     Nca,
+    /// A NUP container of loose ExeFS and RomFS trees for a program, its updates and DLC.
+    Nup,
 }
 
 /// What the game list shows for a title.
@@ -371,6 +374,7 @@ pub fn identify(path: &Path, keys: Option<&KeySet>) -> Option<TitleFormat> {
     match (&head[..4], &head[0x10..0x14]) {
         (b"NSO0", _) => Some(TitleFormat::Nso),
         (_, b"NRO0") => Some(TitleFormat::Nro),
+        (magic, _) if magic == nup::MAGIC => Some(TitleFormat::Nup),
         _ => package::identify(&magic.1, path, keys),
     }
 }
@@ -384,6 +388,7 @@ pub fn scan(path: &Path, options: &LoadOptions) -> LoaderResult<TitleInfo> {
         format @ (TitleFormat::Nsp | TitleFormat::Xci | TitleFormat::Nca) => {
             package::scan(path, format, options)
         }
+        TitleFormat::Nup => nup::scan(path, options),
         format @ (TitleFormat::Nso | TitleFormat::Nro) => {
             let (nacp, icon) = if format == TitleFormat::Nro {
                 let (_, assets) = load_nro(&HostFile::open(path)?, "nro")?;
@@ -420,6 +425,7 @@ pub fn load(path: &Path, options: &LoadOptions) -> LoaderResult<ProgramImage> {
         format @ (TitleFormat::Nsp | TitleFormat::Xci | TitleFormat::Nca) => {
             package::load(path, format, options)
         }
+        TitleFormat::Nup => nup::load(path, options),
         TitleFormat::LooseExefs => LooseTitle::locate(path)
             .ok_or_else(not_a_title)?
             .load(options),

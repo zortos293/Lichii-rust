@@ -2,7 +2,7 @@
 //!
 //! NSO (LZ4 and Switch 2 ZBIC segments, MOD0), NRO with assets, NPDM in the Switch 1 and
 //! Switch 2 ACID layouts, loose ExeFS directories with their sibling `romfs/`, NSP, XCI and
-//! standalone NCA titles with their updates and DLC, and the title metadata (program id, name,
+//! standalone NCA titles with their updates and DLC, NUP containers ([`nup`]), and the title metadata (program id, name,
 //! icon, version) the game list shows. [`patch`] applies mods: ExeFS replacement and
 //! IPS/IPSwitch patches, and LayeredFS RomFS replacement.
 
@@ -11,9 +11,12 @@ pub mod exefs;
 pub mod npdm;
 pub mod nro;
 pub mod nso;
+pub mod nup;
 mod package;
 pub mod patch;
 pub mod program;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 pub mod title;
 pub mod zstd;
 

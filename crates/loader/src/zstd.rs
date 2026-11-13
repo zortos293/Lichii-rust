@@ -119,6 +119,8 @@ pub enum ZstdError {
     Checksum { expected: u32, actual: u32 },
     #[error("corrupt data: {0}")]
     Corrupt(&'static str),
+    #[error("reading the frame: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 type Result<T> = std::result::Result<T, ZstdError>;
@@ -165,13 +167,24 @@ fn section(src: &[u8], start: usize, len: usize) -> Result<&[u8]> {
         .ok_or(ZstdError::Corrupt("section overruns its block"))
 }
 
+/// Where [`FrameStream`] reads a frame from.
+pub trait Input {
+    /// The next `len` bytes, valid until the next call. Fails with [`ZstdError::Truncated`]
+    /// when the input ends first.
+    fn take(&mut self, len: usize) -> std::result::Result<&[u8], ZstdError>;
+
+    fn le(&mut self, len: usize) -> std::result::Result<u64, ZstdError> {
+        self.take(len).map(le)
+    }
+}
+
 struct Cursor<'a> {
     data: &'a [u8],
     pos: usize,
 }
 
-impl<'a> Cursor<'a> {
-    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
+impl Input for Cursor<'_> {
+    fn take(&mut self, len: usize) -> Result<&[u8]> {
         let end = self
             .pos
             .checked_add(len)
@@ -181,9 +194,86 @@ impl<'a> Cursor<'a> {
         self.pos = end;
         Ok(bytes)
     }
+}
 
-    fn le(&mut self, len: usize) -> Result<u64> {
-        self.take(len).map(le)
+struct FrameHeader {
+    descriptor: u8,
+    content_size: Option<u64>,
+    block_max: usize,
+}
+
+/// Decodes one frame a block at a time, so a reader can stop as soon as the bytes it needs are
+/// out and resume later. The output buffer holds the whole frame and doubles as the window, so
+/// the same buffer must be passed to every call.
+pub struct FrameStream<I> {
+    decoder: Box<Decoder>,
+    input: I,
+    header: FrameHeader,
+    decoded: usize,
+    finished: bool,
+}
+
+impl<I: Input> FrameStream<I> {
+    /// Reads the frame magic and header from `input`.
+    pub fn new(variant: Variant, mut input: I) -> Result<Self> {
+        let magic = input.le(4)? as u32;
+        if magic != variant.magic() {
+            return Err(ZstdError::BadMagic(magic));
+        }
+        let mut decoder = Box::new(Decoder::new(variant)?);
+        let header = decoder.begin_frame(&mut input)?;
+        Ok(Self {
+            decoder,
+            input,
+            header,
+            decoded: 0,
+            finished: false,
+        })
+    }
+
+    /// The content size the frame header declares, if it declares one.
+    pub fn content_size(&self) -> Option<u64> {
+        self.header.content_size
+    }
+
+    /// Bytes of `dst` decoded so far.
+    pub fn decoded(&self) -> usize {
+        self.decoded
+    }
+
+    /// Whether the last block, the checksum and the content size check are done.
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    pub fn input(&self) -> &I {
+        &self.input
+    }
+
+    /// Decodes blocks into `dst` until at least `target` bytes are out or the frame ends, and
+    /// returns how many bytes are decoded.
+    pub fn decode_to(&mut self, dst: &mut [u8], target: usize) -> Result<usize> {
+        if let Some(size) = self.header.content_size
+            && size > dst.len() as u64
+        {
+            return Err(ZstdError::OutputTooSmall);
+        }
+        while !self.finished && self.decoded < target {
+            let last;
+            (self.decoded, last) = self.decoder.decode_next_block(
+                &mut self.input,
+                dst,
+                0,
+                self.decoded,
+                self.header.block_max,
+            )?;
+            if last {
+                self.decoder
+                    .end_frame(&mut self.input, dst, 0, self.decoded, &self.header)?;
+                self.finished = true;
+            }
+        }
+        Ok(self.decoded)
     }
 }
 
@@ -217,6 +307,26 @@ impl Decoder {
     }
 
     fn decode_frame(&mut self, input: &mut Cursor, dst: &mut [u8], start: usize) -> Result<usize> {
+        let header = self.begin_frame(input)?;
+        if let Some(size) = header.content_size
+            && size > (dst.len() - start) as u64
+        {
+            return Err(ZstdError::OutputTooSmall);
+        }
+        let mut pos = start;
+        loop {
+            let last;
+            (pos, last) = self.decode_next_block(input, dst, start, pos, header.block_max)?;
+            if last {
+                break;
+            }
+        }
+        self.end_frame(input, dst, start, pos, &header)?;
+        Ok(pos)
+    }
+
+    /// Reads a frame header (after its magic) and resets the per-frame state.
+    fn begin_frame(&mut self, input: &mut impl Input) -> Result<FrameHeader> {
         let descriptor = input.take(1)?[0];
         if descriptor & 0x08 != 0 {
             return corrupt("reserved frame header bit set");
@@ -241,60 +351,73 @@ impl Decoder {
             _ => Some(input.le(8)?),
         };
         let window = window_size.or(content_size).unwrap_or(0);
-        let block_max = window.min(BLOCK_SIZE_MAX as u64) as usize;
-        if let Some(size) = content_size
-            && size > (dst.len() - start) as u64
-        {
-            return Err(ZstdError::OutputTooSmall);
-        }
-
         self.tables
             .iter_mut()
             .for_each(|table| table.entries.clear());
         self.huffman.entries.clear();
         self.reps = [1, 4, 8];
+        Ok(FrameHeader {
+            descriptor,
+            content_size,
+            block_max: window.min(BLOCK_SIZE_MAX as u64) as usize,
+        })
+    }
 
-        let mut pos = start;
-        loop {
-            let header = input.le(3)? as usize;
-            let size = header >> 3;
-            match (header >> 1) & 3 {
-                0 => {
-                    let data = input.take(size)?;
-                    dst.get_mut(pos..pos + size)
-                        .ok_or(ZstdError::OutputTooSmall)?
-                        .copy_from_slice(data);
-                    pos += size;
-                }
-                1 => {
-                    let byte = input.take(1)?[0];
-                    dst.get_mut(pos..pos + size)
-                        .ok_or(ZstdError::OutputTooSmall)?
-                        .fill(byte);
-                    pos += size;
-                }
-                2 => {
-                    if size > block_max {
-                        return corrupt("compressed block larger than the block size limit");
-                    }
-                    let block = input.take(size)?;
-                    pos = self.decode_block(block, dst, start, pos, block_max)?;
-                }
-                _ => return corrupt("reserved block type"),
+    /// Decodes the block at `pos` and returns where it ends and whether it was the frame's last.
+    fn decode_next_block(
+        &mut self,
+        input: &mut impl Input,
+        dst: &mut [u8],
+        start: usize,
+        pos: usize,
+        block_max: usize,
+    ) -> Result<(usize, bool)> {
+        let header = input.le(3)? as usize;
+        let size = header >> 3;
+        let end = match (header >> 1) & 3 {
+            0 => {
+                let data = input.take(size)?;
+                dst.get_mut(pos..pos + size)
+                    .ok_or(ZstdError::OutputTooSmall)?
+                    .copy_from_slice(data);
+                pos + size
             }
-            if header & 1 != 0 {
-                break;
+            1 => {
+                let byte = input.take(1)?[0];
+                dst.get_mut(pos..pos + size)
+                    .ok_or(ZstdError::OutputTooSmall)?
+                    .fill(byte);
+                pos + size
             }
-        }
+            2 => {
+                if size > block_max {
+                    return corrupt("compressed block larger than the block size limit");
+                }
+                let block = input.take(size)?;
+                self.decode_block(block, dst, start, pos, block_max)?
+            }
+            _ => return corrupt("reserved block type"),
+        };
+        Ok((end, header & 1 != 0))
+    }
 
-        if descriptor & 0x04 != 0 {
+    /// Checks the frame's checksum and content size once its last block is decoded.
+    fn end_frame(
+        &self,
+        input: &mut impl Input,
+        dst: &[u8],
+        start: usize,
+        pos: usize,
+        header: &FrameHeader,
+    ) -> Result<()> {
+        if header.descriptor & 0x04 != 0 {
             let expected = input.le(4)? as u32;
             let actual = xxh64(&dst[start..pos], 0) as u32;
             if expected != actual {
                 return Err(ZstdError::Checksum { expected, actual });
             }
         }
-        if let Some(expected) = content_size
+        if let Some(expected) = header.content_size
             && expected != (pos - start) as u64
         {
             return Err(ZstdError::ContentSize {
@@ -302,7 +425,7 @@ impl Decoder {
                 actual: (pos - start) as u64,
             });
         }
-        Ok(pos)
+        Ok(())
     }
 
     fn decode_block(
