@@ -321,8 +321,8 @@ impl Kernel {
     /// Stops every core and kernel thread and releases all processes. A thread still running
     /// after [`SLOW_JOIN`] is named in a warning, so a shutdown that hangs says what it waits for.
     pub fn shutdown(&self) {
-        self.0.scheduler.shutdown();
-        self.0.timer.shutdown();
+        step_noting_slow("stopping the scheduler", || self.0.scheduler.shutdown());
+        step_noting_slow("stopping the timer", || self.0.timer.shutdown());
         let threads = std::mem::take(&mut *self.0.host_threads.lock());
         for thread in &threads {
             thread.thread().unpark();
@@ -331,22 +331,28 @@ impl Kernel {
             join_noting_slow(thread);
         }
         let services = std::mem::take(&mut *self.0.services.lock());
-        for thread in &services.threads {
-            thread.stop();
-        }
+        step_noting_slow("stopping the service threads", || {
+            for thread in &services.threads {
+                thread.stop();
+            }
+        });
         for join in services.joins {
             join_noting_slow(join);
         }
-        self.0.service_manager.clear();
-        self.0.named_ports.lock().clear();
-        self.0.scheduler.clear();
+        step_noting_slow("closing service sessions", || {
+            self.0.service_manager.clear();
+            self.0.named_ports.lock().clear();
+            self.0.scheduler.clear();
+        });
         let processes = std::mem::take(&mut *self.0.processes.lock());
-        for process in processes {
-            process.threads.lock().clear();
-            if process.state() != ProcessState::Exited {
-                process.finalize();
+        step_noting_slow("releasing processes", || {
+            for process in processes {
+                process.threads.lock().clear();
+                if process.state() != ProcessState::Exited {
+                    process.finalize();
+                }
             }
-        }
+        });
     }
 
     /// Stops running guest code: every core puts its thread back in its run queue and idles until
@@ -388,6 +394,26 @@ const TRACE_LOG_PERIOD: Duration = Duration::from_secs(5);
 
 /// How long [`Kernel::shutdown`] waits for a thread before naming it.
 const SLOW_JOIN: Duration = Duration::from_secs(2);
+
+/// Runs one step of [`Kernel::shutdown`] that joins no thread of its own, naming it in a warning
+/// when it takes longer than [`SLOW_JOIN`], so a shutdown that hangs in a drop says where.
+fn step_noting_slow(step: &'static str, run: impl FnOnce()) {
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let watchdog = std::thread::Builder::new()
+        .name("shutdown watchdog".into())
+        .spawn(move || {
+            if finished.recv_timeout(SLOW_JOIN) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                tracing::warn!(step, "shutdown: still in a step");
+                let _ = finished.recv();
+                tracing::warn!(step, "shutdown: step finished");
+            }
+        });
+    run();
+    drop(done);
+    if let Ok(watchdog) = watchdog {
+        let _ = watchdog.join();
+    }
+}
 
 fn join_noting_slow(thread: JoinHandle<()>) {
     let started = Instant::now();
