@@ -210,14 +210,9 @@ pub enum TranslateError {
 
 impl TranslateError {
     /// Whether the texture headers translation read may have caused the failure, so the same
-    /// program may translate under other headers. True when the cause is not known.
+    /// program may translate under other headers: only the texture pass reads them to decide.
     pub fn depends_on_textures(&self) -> bool {
-        use backend::spirv::EmitError;
-        match self {
-            Self::Texture(_) | Self::Lowering(_) | Self::InvalidIr(_) => true,
-            Self::Emit(error) => matches!(error, EmitError::InvalidIr(_) | EmitError::Builder(_)),
-            _ => false,
-        }
+        matches!(self, Self::Texture(_))
     }
 }
 
@@ -243,5 +238,6 @@ mod error_tests {
             opcode: 0,
         };
         assert!(!unsupported.depends_on_textures());
+        assert!(!TranslateError::Lowering("64-bit integers".into()).depends_on_textures());
     }
 }
