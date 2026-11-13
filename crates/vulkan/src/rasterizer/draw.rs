@@ -40,7 +40,7 @@ use crate::descriptors::DescriptorAllocator;
 use crate::device::Device;
 use crate::error::Result;
 use crate::memory::{Buffer, BufferView, Image, ImageDesc, ImageView};
-use crate::pipeline::environment::{ProgramEnv, TexturePool};
+use crate::pipeline::environment::{ProgramEnv, TexturePool, texture_type};
 use crate::pipeline::fixed_state::flags;
 use crate::pipeline::maxwell_to_vk as mvk;
 use crate::pipeline::sampler::{SamplerCaps, SamplerParams, Tsc};
@@ -1051,8 +1051,16 @@ impl VulkanRasterizer {
                         let desc = info.texture_descriptors[descriptor];
                         let mut array_rescaled = None;
                         for i in 0..b.count {
-                            let raw = handle_word(src, desc.handle, i << desc.size_shift);
-                            let texture = if desc.handle_is_pointer_word {
+                            let raw = match desc.handle_program {
+                                Some(program) => self.program_handle(src, info, program, i)?,
+                                None => handle_word(src, desc.handle, i << desc.size_shift),
+                            };
+                            let readable = desc.handle_program.is_none_or(|_| {
+                                let header = src.pool.header(src.gmmu, raw);
+                                texture_type(&header) == desc.ty
+                                    && header.format.is_integer() == desc.is_integer
+                            });
+                            let texture = if desc.handle_is_pointer_word || !readable {
                                 None
                             } else {
                                 self.texture_view(src, raw, desc.ty)?
@@ -1101,7 +1109,10 @@ impl VulkanRasterizer {
                     DescriptorKind::UniformTexelBuffer => {
                         let desc = info.texture_buffer_descriptors[descriptor];
                         for i in 0..b.count {
-                            let raw = handle_word(src, desc.handle, i << desc.size_shift);
+                            let raw = match desc.handle_program {
+                                Some(program) => self.program_handle(src, info, program, i)?,
+                                None => handle_word(src, desc.handle, i << desc.size_shift),
+                            };
                             let view = self.texel_view(src, raw, None, false, false)?;
                             self.push_texel_view(view, vk::Format::R8G8B8A8_UNORM)?;
                         }
@@ -1110,10 +1121,26 @@ impl VulkanRasterizer {
                         let desc = info.image_buffer_descriptors[descriptor];
                         let format = storage_format(desc.format);
                         for i in 0..b.count {
-                            let offset = desc.cbuf_offset + (i << desc.size_shift);
-                            let raw =
-                                read_cbuf::<u32>(src.gmmu, src.cbufs, desc.cbuf_index, offset);
-                            let view = self.texel_view(src, raw, format, true, desc.is_written)?;
+                            let raw = match desc.handle_program {
+                                Some(program) => self.program_handle(src, info, program, i)?,
+                                None => read_cbuf(
+                                    src.gmmu,
+                                    src.cbufs,
+                                    desc.cbuf_index,
+                                    desc.cbuf_offset + (i << desc.size_shift),
+                                ),
+                            };
+                            let view = if numeric_mismatch(
+                                src,
+                                desc.handle_program,
+                                desc.format,
+                                desc.is_integer,
+                                raw,
+                            ) {
+                                None
+                            } else {
+                                self.texel_view(src, raw, format, true, desc.is_written)?
+                            };
                             let null = match format.and_then(|f| self.texel_format(f)) {
                                 Some(texel) => texel.format,
                                 None if desc.is_integer || format.is_some() => vk::Format::R32_UINT,
@@ -1126,10 +1153,27 @@ impl VulkanRasterizer {
                         let desc = info.image_descriptors[descriptor];
                         let mut array_rescaled = None;
                         for i in 0..b.count {
-                            let offset = desc.cbuf_offset + (i << desc.size_shift);
-                            let raw =
-                                read_cbuf::<u32>(src.gmmu, src.cbufs, desc.cbuf_index, offset);
-                            let Some((id, view)) = self.storage_view(src, raw, &desc)? else {
+                            let raw = match desc.handle_program {
+                                Some(program) => self.program_handle(src, info, program, i)?,
+                                None => read_cbuf(
+                                    src.gmmu,
+                                    src.cbufs,
+                                    desc.cbuf_index,
+                                    desc.cbuf_offset + (i << desc.size_shift),
+                                ),
+                            };
+                            let found = if numeric_mismatch(
+                                src,
+                                desc.handle_program,
+                                desc.format,
+                                desc.is_integer,
+                                raw,
+                            ) {
+                                None
+                            } else {
+                                self.storage_view(src, raw, &desc)?
+                            };
+                            let Some((id, view)) = found else {
                                 self.draw.warn_once(
                                     Warning::NullStorageImage,
                                     "a draw binds an unbound or unstorable storage image; skipping it",
@@ -2126,6 +2170,74 @@ fn handle_word(src: &StageSources<'_>, handle: HandleSource, offset: u32) -> u32
         raw |= read_cbuf::<u32>(src.gmmu, src.cbufs, index, offset) << shift;
     }
     raw
+}
+
+impl VulkanRasterizer {
+    /// The raw handle `info`'s handle program `program` computes for descriptor array
+    /// `element`. Its storage reads are relative to the binding address, the buffer's pointer
+    /// aligned down to the storage alignment; words past the buffer, and of an unbound one,
+    /// read as 0. A word GPU work wrote is downloaded first, so no handle reads stale memory;
+    /// the download waits for the GPU, which frees views retired since, so the bind loop reruns.
+    fn program_handle(
+        &mut self,
+        src: &StageSources<'_>,
+        info: &ShaderInfo,
+        program: u32,
+        element: u32,
+    ) -> Result<u32> {
+        let align = self.buffer_cache.storage_alignment();
+        loop {
+            let cache = &self.buffer_cache;
+            let mut stale = None;
+            let read_storage = |slot: u32, offset: u32| {
+                let mut slot = slot;
+                let Some((desc, element)) = info.storage_buffers_descriptors.iter().find_map(|d| {
+                    let found = (slot < d.count).then_some((d, slot));
+                    slot = slot.wrapping_sub(d.count);
+                    found
+                }) else {
+                    return 0;
+                };
+                let (address, size) = storage_pointer(src, desc, element);
+                let base = address & !(align - 1);
+                let word = base + u64::from(offset);
+                if address == 0 || word + 4 > address + size {
+                    return 0;
+                }
+                match src.gmmu.translate(word) {
+                    Some(daddr) if cache.is_gpu_written(daddr, 4) => {
+                        stale = Some(daddr);
+                        0
+                    }
+                    _ => src.gmmu.read::<u32>(word).unwrap_or(0),
+                }
+            };
+            let raw = info.handle_programs[program as usize].evaluate(
+                |index, offset| read_cbuf(src.gmmu, src.cbufs, index, offset),
+                read_storage,
+                element,
+            );
+            let Some(daddr) = stale else {
+                return Ok(raw);
+            };
+            self.buffer_cache.flush(&mut self.scheduler, daddr, 4)?;
+            self.draw.rebind = true;
+        }
+    }
+}
+
+/// Whether the image `raw` selects has another numeric type than the typeless access a handle
+/// program feeds was compiled for: with no header to read, the shader declared `is_integer`.
+fn numeric_mismatch(
+    src: &StageSources<'_>,
+    program: Option<u32>,
+    format: ImageFormat,
+    is_integer: bool,
+    raw: u32,
+) -> bool {
+    program.is_some()
+        && format == ImageFormat::Typeless
+        && src.pool.header(src.gmmu, raw).format.is_integer() != is_integer
 }
 
 /// The GPU address and size of storage buffer `element` of `desc`: 16-byte NVN descriptors in
