@@ -2,14 +2,16 @@
 //!
 //! Both the CMIF and the TIPC flavours (firmware 12+, every Switch 2 title) use the same command
 //! ids. `GetServiceHandle` for a name nobody registered yet is deferred until it is registered,
-//! as Horizon's sm does; the client thread stays blocked meanwhile (NX2_NOTES row 123).
+//! as Horizon's sm does; the client thread stays blocked meanwhile (NX2_NOTES row 123). A name
+//! still unregistered a second after its first request is logged as a warning, once.
 //! A client may open only the services its NPDM lists (homebrew gets the loader's `*`). Until
 //! NPDM parsing has been checked against real titles, that is enforced only when the kernel is
 //! configured to; otherwise sm logs the service and lets the client open it.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use lichii_common::{HleResult, ResultCode};
 use parking_lot::Mutex;
@@ -30,6 +32,9 @@ pub const INVALID_SERVICE_NAME: ResultCode = sm(6);
 pub const NOT_REGISTERED: ResultCode = sm(7);
 pub const NOT_ALLOWED: ResultCode = sm(8);
 
+/// How long a client waits on an unregistered name before sm warns about it.
+const STALL_WARNING_DELAY: Duration = Duration::from_millis(if cfg!(test) { 100 } else { 1000 });
+
 struct Service {
     thread: ServiceThread,
     factory: SessionFactory,
@@ -39,6 +44,10 @@ struct Service {
 struct Registry {
     services: HashMap<u64, Service>,
     waiting: Vec<(u64, DeferredRequest)>,
+    /// Unregistered names a stall check was started for.
+    watched: HashSet<u64>,
+    /// Names still unregistered when their stall check ran.
+    stalled: HashSet<u64>,
 }
 
 /// The registry behind `sm:`.
@@ -136,8 +145,19 @@ impl ServiceManager {
             .collect()
     }
 
+    /// Names a client was still waiting for when their stall check ran.
+    #[cfg(test)]
+    pub(crate) fn stalled(&self) -> Vec<String> {
+        self.registry
+            .lock()
+            .stalled
+            .iter()
+            .map(|&name| display_name(name))
+            .collect()
+    }
+
     /// Connects to `name` or, when it is not registered, defers the request until it is.
-    fn get_service(&self, ctx: &mut HleRequestContext, name: u64) -> ResultCode {
+    fn get_service(self: &Arc<Self>, ctx: &mut HleRequestContext, name: u64) -> ResultCode {
         let access = &ctx.process().params().services;
         if !access.allows_client(&display_name(name)) {
             tracing::warn!(
@@ -155,12 +175,40 @@ impl ServiceManager {
             tracing::info!(service = display_name(name), "waiting for service");
             let request = ctx.defer();
             registry.waiting.push((name, request));
+            if registry.watched.insert(name) {
+                self.watch_stall(name);
+            }
             return ResultCode::SUCCESS;
         };
         let session: Arc<ClientSession> = service.thread.session((service.factory)());
         drop(registry);
         ctx.push_move_object(KObject::ClientSession(session));
         ResultCode::SUCCESS
+    }
+
+    /// Warns once if a client still waits for `name` after [`STALL_WARNING_DELAY`]: a title
+    /// blocked on a service nobody registers otherwise hangs without a word.
+    fn watch_stall(self: &Arc<Self>, name: u64) {
+        let manager: Weak<Self> = Arc::downgrade(self);
+        let spawned = std::thread::Builder::new()
+            .name("sm-stall".into())
+            .spawn(move || {
+                std::thread::sleep(STALL_WARNING_DELAY);
+                let Some(manager) = manager.upgrade() else {
+                    return;
+                };
+                let mut registry = manager.registry.lock();
+                if registry.waiting.iter().any(|(waiting, _)| *waiting == name) {
+                    registry.stalled.insert(name);
+                    tracing::warn!(
+                        service = display_name(name),
+                        "a client is waiting for a service nobody registered"
+                    );
+                }
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "could not start the sm stall check");
+        }
     }
 
     /// A new session to the registered service `name`, as `GetService` would return.

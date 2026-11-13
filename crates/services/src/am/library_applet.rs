@@ -144,7 +144,7 @@ impl LibraryApplet {
         let inputs: Vec<Vec<u8>> = {
             let mut state = self.state.lock();
             std::iter::from_fn(|| state.in_data.pop())
-                .map(|data| data.bytes().clone())
+                .map(|data| data.to_vec())
                 .collect()
         };
         let Some(common) = inputs
@@ -213,7 +213,7 @@ impl LibraryApplet {
     fn push_interactive(self: &Arc<Self>, context: &ServiceContext, data: Arc<StorageData>) {
         let mut state = self.state.lock();
         if let Some(keyboard) = state.inline.as_mut() {
-            let outcome = keyboard.request(&data.bytes());
+            let outcome = keyboard.request(&data.to_vec());
             for reply in outcome.replies {
                 state
                     .interactive_out
@@ -229,7 +229,7 @@ impl LibraryApplet {
             return state.interactive_in.push(data);
         };
         drop(state);
-        let data = data.bytes().clone();
+        let data = data.to_vec();
         let step = text_checked(context.applet_frontend().as_ref(), check, &data);
         self.apply(step);
     }
