@@ -530,10 +530,13 @@ fn a_client_stalled_on_an_unregistered_service_is_reported() {
     let main = test.program(s.exit());
     test.start(test.image(), main);
     test.kernel.run().unwrap();
-    std::thread::sleep(Duration::from_millis(30));
-    assert!(test.kernel.service_manager().stalled().is_empty());
-    std::thread::sleep(Duration::from_millis(300));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while test.kernel.service_manager().stalled().is_empty() {
+        assert!(std::time::Instant::now() < deadline, "no stall reported");
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert_eq!(test.kernel.service_manager().stalled(), ["test:u"]);
+    assert_eq!(test.kernel.service_manager().waiting_for(), ["test:u"]);
     register_test_service(&test, Arc::new(Event::new()));
     test.wait_for_exit(Duration::from_secs(10));
     assert_eq!(replies.lock()[1].0, 0, "answered once registered");
