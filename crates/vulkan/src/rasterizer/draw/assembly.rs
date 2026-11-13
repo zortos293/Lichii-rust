@@ -188,7 +188,7 @@ impl VulkanRasterizer {
             &mut self.staging,
             gmmu,
             start,
-            (limit * width).next_multiple_of(4),
+            (start + limit * width).next_multiple_of(4) - start,
             false,
         )?;
         Ok(binding.map(|binding| GuestIndices {
