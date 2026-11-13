@@ -2,14 +2,18 @@
 //! out a [`VideoDecoder`], whose TIPC 1 (`CreateVideoDecoderService`) hands out a
 //! [`VideoDecoderService`].
 //!
-//! Nothing is decoded yet: every submitted input becomes one frame without a picture, and the
-//! output image keeps what it held. The command flow is the reference's, so a movie plays at its
-//! pts pace and ends. 311 and 314 hand an output image to the decoder and reply the
-//! NativeSyncHandle `{~syncpoint, mode 0, u64 value}` that is reached once a frame is in it, on a
-//! syncpoint the service owns. A worker thread fills the images in hand-out order (the order the
-//! client acquires them from its own ring), each frame once it is due by its pts, and increments
-//! the syncpoint; 213 then reports the frame. An end-of-stream input completes as an empty
-//! end-of-stream frame, and Stop and Finalize complete every fence handed out.
+//! 101 names the codec (`"video/vp9"`, ...) and 109 submits demuxed frames, which a worker thread
+//! decodes with FFmpeg ([`lichii_video`]) a few frames ahead. 311 and 314 hand an output image (a
+//! gsv 911 pool image) to the decoder and reply the NativeSyncHandle `{~syncpoint, mode 0, u64
+//! value}` that is reached once a frame is in it, on a syncpoint the service owns. The worker
+//! writes each decoded picture, once it is due by its pts, into the next image in hand-out order
+//! (the order the client acquires them from its own ring) in the layout gsv 961 describes, drops
+//! the renderer's cached copies of it (the title may have drawn into the image, which write
+//! tracking leaves alone), and increments the syncpoint; 213 then reports the frame. An end-of-stream input completes after
+//! the pictures the decoder still holds, and Stop and Finalize complete every fence handed out.
+//!
+//! Without FFmpeg, or for a codec it cannot decode, every input becomes one frame without a
+//! picture, so a movie still plays at its pace (black) and ends.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -17,11 +21,19 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use lichii_common::ResultCode;
+use lichii_gpu::Gpu;
+use lichii_gpu::backend::Rasterizer;
+use lichii_gpu::gmmu::{BigPageSize, Gmmu, RangeTarget};
 use lichii_gpu::host1x::Syncpoints;
 use lichii_kernel::ipc::HleRequestContext;
 use lichii_kernel::{Event, GuestClock};
+use lichii_memory::AddressSpace;
+use lichii_texture::block_linear::swizzle;
+use lichii_video::convert::{ColorOrder, write_nv12, write_rgba};
+use lichii_video::{Codec, Decoder, Frame, Latency, VideoError};
 use parking_lot::{Condvar, Mutex};
 
+use super::native::{DecoderFormat, NativeObjects, relayout_decoder_image};
 use super::{UNKNOWN, push_readable, push_session};
 use crate::nvdrv::Nvdrv;
 use crate::{Service, ServiceContext};
@@ -42,11 +54,20 @@ const REFUSE_AT: usize = READY_WATERMARK * 3;
 const READY_INTERVAL: Duration = Duration::from_millis(4);
 /// A frame further than this (us) from the movie clock restarts it: a seek or a loop.
 const MAX_DRIFT: u64 = 1_000_000;
+/// Decoded pictures kept ahead of the images they go into.
+const DECODE_AHEAD: usize = 4;
+/// How long the worker waits on a 314 release fence before it looks at its state again: Stop or
+/// Finalize may have taken the image back meanwhile.
+const RELEASE_SLICE: Duration = Duration::from_millis(10);
+/// A release fence still pending after this lost its increment somewhere: the image is written
+/// anyway, so the movie does not freeze. GPU reads of a frame end long before.
+const RELEASE_LIMIT: Duration = Duration::from_secs(1);
 
 /// gsv 902, 905, 906 and 1002. Without the decoder service its TIPC 1 creates,
 /// `InitializeVp9Decoder` fails with InvalidHandle and the movie player aborts.
 pub(super) struct VideoDecoder {
     pub context: Arc<ServiceContext>,
+    pub objects: Arc<Mutex<NativeObjects>>,
     pub name: &'static str,
 }
 
@@ -57,7 +78,7 @@ impl Service for VideoDecoder {
 
     fn handle(&self, ctx: &mut HleRequestContext) -> Option<ResultCode> {
         Some(match ctx.command() {
-            1 => match VideoDecoderService::new(&self.context) {
+            1 => match VideoDecoderService::new(&self.context, &self.objects) {
                 Ok(service) => push_session(&self.context, ctx, service),
                 Err(code) => code,
             },
@@ -79,15 +100,36 @@ struct Shared {
     clock: Arc<dyn GuestClock>,
     syncpoints: Arc<Syncpoints>,
     syncpoint: u32,
+    memory: Arc<AddressSpace>,
+    gpu: Arc<Gpu>,
+    /// Translates image addresses (GPU VA == CPU VA) to the device ranges the renderer caches.
+    gmmu: Arc<Gmmu>,
+    objects: Arc<Mutex<NativeObjects>>,
     ready: Arc<Event>,
     state: Mutex<State>,
     wake: Condvar,
+    /// Signalled when the worker finishes writing an image; Stop and Finalize wait for it.
+    idle: Condvar,
 }
 
-#[derive(Clone, Copy)]
 struct Input {
     pts: u64,
     size: u64,
+    end: bool,
+    data: Vec<u8>,
+}
+
+/// An output image handed out, and the fence the client's reads of it end at (314).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Handout {
+    image: u32,
+    release: Option<(u32, u32)>,
+}
+
+/// A decoded frame waiting for an image; `frame` is `None` for a frame without a picture.
+struct Decoded {
+    frame: Option<Frame>,
+    pts: u64,
     end: bool,
 }
 
@@ -100,15 +142,23 @@ struct Output {
 }
 
 struct State {
+    codec: Option<Codec>,
     width: u32,
     height: u32,
     inputs: VecDeque<Input>,
     /// The last refused input, queued ahead of the client's next one unless that is the same
     /// input sent again: some clients retry a refused input, others ignore the result.
     held: Option<Input>,
+    /// Input buffers the worker is done with, for the next submissions.
+    spare: Vec<Vec<u8>>,
+    decoded: VecDeque<Decoded>,
+    /// Frames for the worker to decode into again.
+    frames: Vec<Frame>,
+    /// A flush came: the worker drops what its decoder holds.
+    reset: bool,
     /// Output images handed out and not filled yet, in the order the client acquires them. `None`
     /// is an image unregistered before it took a frame: its fence value is still counted in turn.
-    free: VecDeque<Option<u32>>,
+    free: VecDeque<Option<Handout>>,
     /// Filled images, for 213.
     outputs: VecDeque<Output>,
     clock: MovieClock,
@@ -120,6 +170,10 @@ struct State {
     end_queued: bool,
     /// The end-of-stream frame is out and nothing was submitted since.
     stream_ended: bool,
+    /// The worker is writing an image with the state unlocked.
+    writing: bool,
+    /// Stops and Finalizes so far: a write that sees this change took an image they completed.
+    stops: u64,
     quit: bool,
 }
 
@@ -128,25 +182,32 @@ impl State {
         !self.stream_ended && !self.end_queued && self.inputs.len() < READY_WATERMARK
     }
 
+    /// Queues `input`; false when the queue is full.
     fn submit(&mut self, input: Input) -> bool {
-        if let Some(held) = self.held.take()
-            && (held.pts, held.size) != (input.pts, input.size)
-        {
-            self.inputs.push_back(held);
+        if let Some(held) = self.held.take() {
+            if (held.pts, held.size) != (input.pts, input.size) {
+                self.inputs.push_back(held);
+            } else {
+                self.spare.push(held.data);
+            }
         }
         if !input.end && self.inputs.len() >= REFUSE_AT {
             self.held = Some(input);
             return false;
         }
-        self.inputs.push_back(input);
         self.stream_ended = false;
         self.end_queued |= input.end;
+        self.inputs.push_back(input);
         true
     }
 
     fn flush(&mut self) {
-        self.inputs.clear();
-        self.held = None;
+        let inputs: Vec<_> = self.inputs.drain(..).chain(self.held.take()).collect();
+        self.spare
+            .extend(inputs.into_iter().map(|input| input.data));
+        let frames: Vec<_> = self.decoded.drain(..).filter_map(|d| d.frame).collect();
+        self.frames.extend(frames);
+        self.reset = true;
         self.stream_ended = false;
         self.end_queued = false;
         self.clock = MovieClock::default();
@@ -178,7 +239,10 @@ impl MovieClock {
 impl VideoDecoderService {
     /// Fails until nvdrv, which allocates syncpoints, is registered, and when the worker thread
     /// cannot start.
-    fn new(context: &ServiceContext) -> Result<Self, ResultCode> {
+    fn new(
+        context: &ServiceContext,
+        objects: &Arc<Mutex<NativeObjects>>,
+    ) -> Result<Self, ResultCode> {
         let Some(nvdrv) = context.nvdrv.get().cloned() else {
             tracing::error!("nx2:vdec 1: nvdrv is not registered");
             return Err(UNKNOWN);
@@ -189,12 +253,21 @@ impl VideoDecoderService {
             clock: context.kernel.clock().clone(),
             syncpoints: context.gpu.host1x().syncpoints.clone(),
             syncpoint,
+            memory: context.process.memory().clone(),
+            gpu: context.gpu.clone(),
+            gmmu: context.gpu.create_address_space(BigPageSize::Size64K),
+            objects: objects.clone(),
             ready: Arc::new(Event::new()),
             state: Mutex::new(State {
+                codec: None,
                 width: 0,
                 height: 0,
                 inputs: VecDeque::new(),
                 held: None,
+                spare: Vec::new(),
+                decoded: VecDeque::new(),
+                frames: Vec::new(),
+                reset: false,
                 free: VecDeque::new(),
                 outputs: VecDeque::new(),
                 clock: MovieClock::default(),
@@ -203,9 +276,12 @@ impl VideoDecoderService {
                 running: true,
                 end_queued: false,
                 stream_ended: false,
+                writing: false,
+                stops: 0,
                 quit: false,
             }),
             wake: Condvar::new(),
+            idle: Condvar::new(),
         });
         let worker = shared.clone();
         match std::thread::Builder::new()
@@ -226,19 +302,28 @@ impl VideoDecoderService {
     }
 
     /// 311(u32 image) and 314(u32 image, u32, NativeSyncHandle release): queues the image for the
-    /// next frame and replies the NativeSyncHandle reached once that frame is in it. The release
-    /// fence guards the client's reads of the image, which nothing here writes.
+    /// next frame and replies the NativeSyncHandle reached once that frame is in it. A frame is
+    /// written into a 314 image once the release fence guarding the client's reads has passed.
     fn hand_out(&self, ctx: &mut HleRequestContext) -> ResultCode {
         let image: u32 = ctx.pop();
+        let release = (ctx.command() == 314).then(|| {
+            let _: u32 = ctx.pop();
+            let (counter, _mode, value) = (ctx.pop::<u32>(), ctx.pop::<u32>(), ctx.pop::<u64>());
+            (!counter, value as u32)
+        });
         let shared = &self.shared;
         let value = {
             let mut state = shared.state.lock();
             let Ok(value) = shared.syncpoints.increase_max(shared.syncpoint, 1) else {
                 return UNKNOWN;
             };
-            state.free.push_back(Some(image));
+            state.free.push_back(Some(Handout { image, release }));
             value
         };
+        tracing::debug!(
+            "nx2:vdecsvc {} image {image} release {release:?} -> fence {value}",
+            ctx.command()
+        );
         shared.wake.notify_one();
         ctx.push(!shared.syncpoint);
         ctx.push(0u32);
@@ -249,10 +334,23 @@ impl VideoDecoderService {
     /// 109(A: frame; u64 pts in us, u8 end of stream) and 400 (a frame information block in a
     /// second A buffer): replies the input's number, or busy while the queue is full.
     fn submit(&self, ctx: &mut HleRequestContext) -> ResultCode {
+        let buffer = ctx.readable_buffer(0);
+        let (pts, end) = (ctx.pop::<u64>(), ctx.pop::<u8>() != 0);
+        let size = buffer.map_or(0, |buffer| buffer.size);
+        let mut data = self.shared.state.lock().spare.pop().unwrap_or_default();
+        data.clear();
+        if let Some(buffer) = buffer {
+            data.resize(buffer.size as usize, 0);
+            if ctx.memory().read_bytes(buffer.address, &mut data).is_err() {
+                tracing::warn!("nx2:vdecsvc: input at {:#x} is unreadable", buffer.address);
+                data.clear();
+            }
+        }
         let input = Input {
-            size: ctx.readable_buffer(0).map_or(0, |buffer| buffer.size),
-            pts: ctx.pop(),
-            end: ctx.pop::<u8>() != 0,
+            pts,
+            size,
+            end,
+            data,
         };
         let id = {
             let mut state = self.shared.state.lock();
@@ -262,6 +360,7 @@ impl VideoDecoderService {
             state.submitted += 1;
             state.submitted
         };
+        tracing::debug!("nx2:vdecsvc input {id}: {size} bytes, pts {pts}, end {end}");
         self.shared.wake.notify_one();
         ctx.push(id);
         ResultCode::SUCCESS
@@ -270,13 +369,12 @@ impl VideoDecoderService {
     /// 101(A: codec name; u32 width, u32 height, u32 rate, u32).
     fn configure(&self, ctx: &mut HleRequestContext) -> ResultCode {
         let name = ctx.read_buffer(0).unwrap_or_default();
-        let codec = name.split(|&b| b == 0).next().unwrap_or_default();
+        let mime = String::from_utf8_lossy(name.split(|&b| b == 0).next().unwrap_or_default());
         let (width, height, rate) = (ctx.pop::<u32>(), ctx.pop::<u32>(), ctx.pop::<u32>());
-        tracing::info!(
-            "nx2:vdecsvc configure \"{}\" {width}x{height} rate {rate}; frames are not decoded",
-            String::from_utf8_lossy(codec)
-        );
+        let codec = Codec::from_mime(&mime);
+        tracing::info!("nx2:vdecsvc configure \"{mime}\" {width}x{height} rate {rate}: {codec:?}");
         let mut state = self.shared.state.lock();
+        state.codec = codec;
         state.width = width;
         state.height = height;
         state.clock = MovieClock::default();
@@ -321,11 +419,17 @@ impl VideoDecoderService {
         state.running = false;
         shared.ready.clear();
         state.free.clear();
+        state.stops += 1;
+        while state.writing {
+            shared.idle.wait(&mut state);
+        }
         let guest = shared.syncpoints.guest();
         let target = shared.syncpoints.max(shared.syncpoint).unwrap_or(0);
         while guest.is_reached(shared.syncpoint, target) == Ok(false) {
             let _ = guest.increment(shared.syncpoint);
         }
+        drop(state);
+        shared.wake.notify_one();
         ResultCode::SUCCESS
     }
 
@@ -344,6 +448,109 @@ impl VideoDecoderService {
     }
 }
 
+/// The worker's own decoding state.
+struct Media {
+    decoder: Option<Decoder>,
+    /// The codec `decoder` was opened for, or failed to open for.
+    codec: Option<Codec>,
+    /// Pictures one input completed.
+    decoded: Vec<Decoded>,
+    /// One output image in its guest layout, written to guest memory in one go.
+    staging: Vec<u8>,
+    /// The block-linear copy of `staging` for an image the title reads on the GPU.
+    tiled: Vec<u8>,
+    write_failed: bool,
+    /// `LICHII_VDEC_DUMP`: a folder that gets the luma of every 120th frame, at a quarter of its
+    /// size, as a PGM.
+    dump: Option<std::path::PathBuf>,
+    frames_out: u64,
+    pictures: u64,
+    decodes: u64,
+    decode_time: Duration,
+}
+
+impl Media {
+    /// Decodes one input into `self.decoded`, taking frames from and returning them to `frames`.
+    fn decode(&mut self, codec: Option<Codec>, input: &Input, frames: &mut Vec<Frame>) {
+        if codec != self.codec {
+            self.codec = codec;
+            self.decoder = codec.and_then(|codec| match Decoder::new(codec, Latency::Immediate) {
+                Ok(decoder) => Some(decoder),
+                Err(VideoError::Unavailable) => None,
+                Err(err) => {
+                    tracing::error!("nx2:vdecsvc: opening the {codec:?} decoder: {err}");
+                    None
+                }
+            });
+        }
+        let Some(decoder) = &mut self.decoder else {
+            self.decoded.push(Decoded {
+                frame: None,
+                pts: input.pts,
+                end: input.end,
+            });
+            return;
+        };
+        let started = Instant::now();
+        let sent = match decoder.send(&input.data, input.pts as i64) {
+            _ if input.data.is_empty() => true,
+            Ok(()) => true,
+            Err(err) => {
+                tracing::debug!(
+                    "nx2:vdecsvc: input at pts {} does not decode: {err}",
+                    input.pts
+                );
+                false
+            }
+        };
+        if input.end {
+            decoder.end_of_stream();
+        }
+        loop {
+            let mut frame = match frames.pop().map(Ok).unwrap_or_else(Frame::new) {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
+            if decoder.receive(&mut frame) != Ok(true) {
+                frames.push(frame);
+                break;
+            }
+            let pts = frame.picture().map_or(input.pts, |p| p.pts.max(0) as u64);
+            self.decoded.push(Decoded {
+                frame: Some(frame),
+                pts,
+                end: false,
+            });
+        }
+        self.decodes += 1;
+        self.decode_time += started.elapsed();
+        self.pictures += self.decoded.iter().filter(|d| d.frame.is_some()).count() as u64;
+        if !sent && self.decoded.is_empty() {
+            self.decoded.push(Decoded {
+                frame: None,
+                pts: input.pts,
+                end: false,
+            });
+        }
+        if input.end {
+            match self.decoded.last_mut() {
+                Some(last) => last.end = true,
+                None => self.decoded.push(Decoded {
+                    frame: None,
+                    pts: input.pts,
+                    end: true,
+                }),
+            }
+        }
+    }
+
+    fn drop_queued(&mut self) {
+        if let Some(decoder) = &mut self.decoder {
+            decoder.flush();
+        }
+    }
+}
+
 impl Shared {
     fn now_us(&self) -> u64 {
         (u128::from(self.clock.ticks()) * 1_000_000 / u128::from(self.clock.frequency())) as u64
@@ -355,11 +562,145 @@ impl Shared {
         }
     }
 
-    /// The worker: puts each queued input, once it is due, into the next free image, and counts
-    /// unregistered images off in their turn.
+    /// Writes `frame`'s picture into `image`; returns the size the frame reports.
+    fn write(
+        &self,
+        media: &mut Media,
+        handout: Handout,
+        frame: &Frame,
+        size: (u32, u32),
+    ) -> (u32, u32) {
+        let Some(picture) = frame.picture() else {
+            return size;
+        };
+        let Some(target) = self.objects.lock().decoder_image(handout.image) else {
+            return (picture.width, picture.height);
+        };
+        let layout = target.layout;
+        let (width, height) = (
+            picture.width.min(layout.width),
+            picture.height.min(layout.height),
+        );
+        let pitch = layout.pitch as usize;
+        let rows = pitch * height as usize;
+        media.staging.resize(layout.size as usize, 0);
+        let staging = &mut media.staging;
+        let written = match layout.format {
+            DecoderFormat::Nv12 { chroma_offset } => {
+                let chroma = chroma_offset as usize;
+                write_nv12(&picture, staging, pitch, chroma, width, height)
+                    && self
+                        .memory
+                        .write_bytes(target.address, &staging[..rows])
+                        .is_ok()
+                    && self
+                        .memory
+                        .write_bytes(
+                            target.address + chroma_offset,
+                            &staging[chroma..chroma + pitch * height.div_ceil(2) as usize],
+                        )
+                        .is_ok()
+            }
+            DecoderFormat::Rgba | DecoderFormat::Bgra => {
+                let order = if layout.format == DecoderFormat::Rgba || target.block_linear {
+                    ColorOrder::Rgba
+                } else {
+                    ColorOrder::Bgra
+                };
+                if !write_rgba(&picture, staging, pitch, width, height, order) {
+                    false
+                } else if target.block_linear {
+                    let tiling = layout.tiling();
+                    media.tiled.resize(tiling.size_bytes(), 0);
+                    swizzle(
+                        &tiling,
+                        &staging[..tiling.linear_size_bytes()],
+                        &mut media.tiled,
+                    );
+                    self.memory
+                        .write_bytes(target.address, &media.tiled)
+                        .is_ok()
+                } else {
+                    let mut objects = self.objects.lock();
+                    let written = self
+                        .memory
+                        .write_bytes(target.address, &staging[..rows])
+                        .is_ok();
+                    if written && objects.wrote_pitch_frame(handout.image) {
+                        relayout_decoder_image(&self.memory, target.address, &layout);
+                    }
+                    written
+                }
+            }
+        };
+        if written {
+            let (gmmu, address, size) = (self.gmmu.clone(), target.address, layout.size);
+            self.gpu
+                .run_in_order(move |rasterizer: &mut dyn Rasterizer| {
+                    gmmu.for_each_range(address, size, |range| {
+                        if let RangeTarget::Device(daddr) = range.target {
+                            rasterizer.invalidate_region(daddr, range.size);
+                        }
+                    });
+                });
+        }
+        if media.frames_out == 0 {
+            tracing::info!(
+                "nx2:vdecsvc writes image {} at {:#x}: {layout:?}, written {written}",
+                handout.image,
+                target.address
+            );
+        }
+        if written
+            && media.frames_out.is_multiple_of(120)
+            && let Some(dir) = &media.dump
+        {
+            let (w, h) = (width as usize / 4, height as usize / 4);
+            let mut pgm = format!("P5 {w} {h} 255\n").into_bytes();
+            pgm.extend(
+                (0..h)
+                    .flat_map(|y| (0..w).map(move |x| (y, x)))
+                    .map(|(y, x)| staging[y * 4 * pitch + x * 4]),
+            );
+            let path = dir.join(format!("vdec-{:05}.pgm", media.frames_out));
+            if let Err(err) = std::fs::write(&path, pgm) {
+                tracing::warn!("nx2:vdecsvc: dumping {}: {err}", path.display());
+            }
+        }
+        if !written && !media.write_failed {
+            media.write_failed = true;
+            tracing::warn!(
+                "nx2:vdecsvc: cannot write a {width}x{height} frame into image {} at {:#x}",
+                handout.image,
+                target.address
+            );
+        }
+        (width, height)
+    }
+
+    /// The worker: decodes queued input a few frames ahead, puts each decoded frame, once it is
+    /// due, into the next free image, and counts unregistered images off in their turn.
     fn run(&self) {
+        let mut media = Media {
+            decoder: None,
+            codec: None,
+            decoded: Vec::new(),
+            staging: Vec::new(),
+            tiled: Vec::new(),
+            write_failed: false,
+            dump: std::env::var_os("LICHII_VDEC_DUMP").map(Into::into),
+            frames_out: 0,
+            pictures: 0,
+            decodes: 0,
+            decode_time: Duration::ZERO,
+        };
+        let mut release_wait: Option<((u32, u32), Instant)> = None;
         let mut state = self.state.lock();
         while !state.quit {
+            if std::mem::take(&mut state.reset) {
+                media.drop_queued();
+                continue;
+            }
             if state.free.front() == Some(&None) {
                 state.free.pop_front();
                 self.increment();
@@ -367,29 +708,85 @@ impl Shared {
             }
             let (now, host_now) = (self.now_us(), Instant::now());
             let mut wake = None;
-            let next = state
-                .inputs
-                .front()
-                .copied()
-                .zip(state.free.front().copied().flatten());
-            if let Some((input, image)) = next {
-                let due = if input.end {
+            if let (Some(decoded), Some(&Some(handout))) =
+                (state.decoded.front(), state.free.front())
+            {
+                let picture = decoded.frame.is_some();
+                let due = if decoded.end && !picture {
                     now
                 } else {
-                    state.clock.due(now, input.pts)
+                    let pts = decoded.pts;
+                    state.clock.due(now, pts)
                 };
+                if due <= now
+                    && picture
+                    && let Some((syncpoint, value)) = handout.release
+                    && self.syncpoints.guest().is_reached(syncpoint, value) == Ok(false)
+                {
+                    let key = (handout.image, value);
+                    let since = match release_wait {
+                        Some((waiting, since)) if waiting == key => since,
+                        _ => release_wait.insert((key, host_now)).1,
+                    };
+                    if host_now - since < RELEASE_LIMIT {
+                        drop(state);
+                        let _ = self
+                            .syncpoints
+                            .guest()
+                            .wait(syncpoint, value, Some(RELEASE_SLICE));
+                        state = self.state.lock();
+                        continue;
+                    }
+                    tracing::warn!(
+                        "nx2:vdecsvc: image {}'s release fence ({syncpoint}, {value}) is still \
+                         pending after {RELEASE_LIMIT:?}; writing it anyway",
+                        handout.image
+                    );
+                }
                 if due <= now {
-                    state.inputs.pop_front();
+                    let decoded = state.decoded.pop_front().expect("checked above");
                     state.free.pop_front();
-                    let (width, height) = (state.width, state.height);
+                    let size = (state.width, state.height);
+                    let (width, height) = match &decoded.frame {
+                        Some(frame) => {
+                            state.writing = true;
+                            let stops = state.stops;
+                            drop(state);
+                            let size = self.write(&mut media, handout, frame, size);
+                            state = self.state.lock();
+                            state.writing = false;
+                            self.idle.notify_all();
+                            if state.stops != stops {
+                                state.frames.extend(decoded.frame);
+                                continue;
+                            }
+                            size
+                        }
+                        None => size,
+                    };
+                    state.frames.extend(decoded.frame);
                     state.outputs.push_back(Output {
-                        image,
+                        image: handout.image,
                         width,
                         height,
-                        pts: input.pts,
-                        end: input.end,
+                        pts: decoded.pts,
+                        end: decoded.end,
                     });
-                    if input.end {
+                    media.frames_out += 1;
+                    if media.frames_out == 1 || media.frames_out.is_multiple_of(600) || decoded.end
+                    {
+                        tracing::info!(
+                            "nx2:vdecsvc frame {} ({width}x{height}, pts {} us{}) in image {}, \
+                             {} decoded, {:.2} ms per decode",
+                            media.frames_out,
+                            decoded.pts,
+                            if decoded.end { ", end of stream" } else { "" },
+                            handout.image,
+                            media.pictures,
+                            media.decode_time.as_secs_f64() * 1000.0 / media.decodes.max(1) as f64,
+                        );
+                    }
+                    if decoded.end {
                         state.stream_ended = true;
                         state.end_queued = false;
                         state.clock = MovieClock::default();
@@ -398,6 +795,25 @@ impl Shared {
                     continue;
                 }
                 wake = Some(host_now + Duration::from_micros(due - now));
+            }
+            if state.decoded.len() < DECODE_AHEAD
+                && let Some(input) = state.inputs.pop_front()
+            {
+                let codec = state.codec;
+                let mut frames = std::mem::take(&mut state.frames);
+                drop(state);
+                media.decode(codec, &input, &mut frames);
+                state = self.state.lock();
+                state.frames.append(&mut frames);
+                state.spare.push(input.data);
+                if std::mem::take(&mut state.reset) {
+                    media.drop_queued();
+                    let dropped = media.decoded.drain(..).filter_map(|d| d.frame);
+                    state.frames.extend(dropped);
+                } else {
+                    state.decoded.extend(media.decoded.drain(..));
+                }
+                continue;
             }
             if state.armed && state.running && state.has_room() {
                 self.ready.signal();
@@ -421,6 +837,7 @@ impl Drop for VideoDecoderService {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        self.shared.gpu.destroy_address_space(&self.shared.gmmu);
         self.nvdrv.retire_syncpoint(self.shared.syncpoint);
     }
 }
@@ -447,8 +864,10 @@ impl Service for VideoDecoderService {
             212 => {
                 let image: u32 = ctx.pop();
                 let mut state = self.shared.state.lock();
-                for free in state.free.iter_mut().filter(|free| **free == Some(image)) {
-                    *free = None;
+                for free in state.free.iter_mut() {
+                    if free.is_some_and(|handout| handout.image == image) {
+                        *free = None;
+                    }
                 }
                 drop(state);
                 self.shared.wake.notify_one();

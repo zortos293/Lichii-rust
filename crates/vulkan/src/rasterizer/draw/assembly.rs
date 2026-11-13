@@ -13,7 +13,7 @@ use lichii_gpu::gmmu::Gmmu;
 
 use super::host_compute::{HostCompute, storage};
 use super::{IndirectBuffers, Warning};
-use crate::buffer_cache::{BufferBinding, IndexBinding};
+use crate::buffer_cache::{BufferBinding, IndexBinding, bound_index_capacity};
 use crate::device::Device;
 use crate::error::Result;
 use crate::memory::Buffer;
@@ -103,8 +103,7 @@ impl VulkanRasterizer {
             _ => return Ok(None),
         };
         let start = buffer.start_addr();
-        let limit = (buffer.limit_addr().wrapping_add(1).saturating_sub(start) / width)
-            .min(u64::from(u32::MAX));
+        let limit = bound_index_capacity(gmmu, buffer, width).min(u64::from(u32::MAX));
         if start == 0 || limit == 0 {
             return Ok(None);
         }

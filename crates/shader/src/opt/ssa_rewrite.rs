@@ -5,6 +5,10 @@
 //! Reads walk predecessors with an explicit stack instead of recursion. A phi in a sealed block
 //! stays pending until a cycle reads it or it merges two different values, so most trivial phis
 //! are never inserted.
+//!
+//! A block outside the iterated dominance frontier of a variable's definitions cannot need a phi
+//! for it, so a read there jumps to the immediate dominator instead of walking every
+//! predecessor. Without this, a read crosses every block of every `if` since the definition.
 
 use rustc_hash::FxHashMap;
 
@@ -70,6 +74,9 @@ struct Pass {
     goto_defs: FxHashMap<(u32, u32), Def>,
     incomplete: FxHashMap<u32, Vec<(u32, InstId)>>,
     sealed: Vec<bool>,
+    idom: Vec<u32>,
+    phi_start: Vec<u32>,
+    phi_vars: Vec<u32>,
     stack: Vec<Frame>,
     pending_operands: Vec<(BlockId, Value)>,
 }
@@ -129,6 +136,12 @@ impl Pass {
         defs[block.0 as usize] = Some(def);
     }
 
+    fn may_need_phi(&self, var: u32, block: BlockId) -> bool {
+        let b = block.0 as usize;
+        let vars = &self.phi_vars[self.phi_start[b] as usize..self.phi_start[b + 1] as usize];
+        vars.binary_search(&var).is_ok()
+    }
+
     fn write(&mut self, var: u32, block: BlockId, value: Value) {
         self.set_def(var, block, Def::Value(value));
     }
@@ -150,6 +163,15 @@ impl Pass {
                         let phi = self.materialize_phi(prog, self.pending_frame(block), var);
                         self.stack[top].result = Value::Inst(phi);
                         self.set_value(var);
+                    }
+                    None if prog.block(block).predecessors.len() > 1
+                        && self.idom[block.0 as usize] != u32::MAX
+                        && self.idom[block.0 as usize] != block.0
+                        && !self.may_need_phi(var, block) =>
+                    {
+                        let idom = BlockId(self.idom[block.0 as usize]);
+                        self.stack[top].pc = Status::SetValue;
+                        self.stack.push(Frame::new(idom));
                     }
                     None if !self.sealed[block.0 as usize] => {
                         let phi = new_phi(prog, block, var);
@@ -295,14 +317,148 @@ fn flag_variable(op: Opcode) -> Option<u32> {
     }
 }
 
+fn written_variable(prog: &Program, id: InstId) -> Option<u32> {
+    match prog.op(id) {
+        Opcode::SetRegister | Opcode::SetPred | Opcode::SetGotoVariable => variable(prog, id),
+        op if op.ty() == crate::ir::Type::VOID => flag_variable(op),
+        _ => None,
+    }
+}
+
+/// Immediate dominators (Cooper, Harvey and Kennedy), `u32::MAX` for unreachable blocks.
+fn immediate_dominators(prog: &Program, order: &[BlockId]) -> Vec<u32> {
+    let mut rank = vec![u32::MAX; prog.num_blocks()];
+    for (i, b) in order.iter().enumerate() {
+        rank[b.0 as usize] = i as u32;
+    }
+    let mut idom = vec![u32::MAX; prog.num_blocks()];
+    let Some(entry) = order.first() else {
+        return idom;
+    };
+    idom[entry.0 as usize] = entry.0;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in &order[1..] {
+            let mut new = u32::MAX;
+            for p in &prog.block(*b).predecessors {
+                let mut p = p.0;
+                if idom[p as usize] == u32::MAX {
+                    continue;
+                }
+                if new != u32::MAX {
+                    while p != new {
+                        while rank[p as usize] > rank[new as usize] {
+                            p = idom[p as usize];
+                        }
+                        while rank[new as usize] > rank[p as usize] {
+                            new = idom[new as usize];
+                        }
+                    }
+                }
+                new = p;
+            }
+            if idom[b.0 as usize] != new {
+                idom[b.0 as usize] = new;
+                changed = true;
+            }
+        }
+    }
+    idom
+}
+
+/// Groups `(key, value)` pairs by key in one stable counting pass: the values of key `k` are
+/// `values[start[k]..start[k + 1]]`, in input order.
+fn buckets(keys: usize, pairs: &[(u32, u32)]) -> (Vec<u32>, Vec<u32>) {
+    let mut start = vec![0u32; keys + 1];
+    for &(k, _) in pairs {
+        start[k as usize + 1] += 1;
+    }
+    for k in 0..keys {
+        start[k + 1] += start[k];
+    }
+    let mut next = start.clone();
+    let mut values = vec![0u32; pairs.len()];
+    for &(k, v) in pairs {
+        values[next[k as usize] as usize] = v;
+        next[k as usize] += 1;
+    }
+    (start, values)
+}
+
+/// For every block, the sorted variables whose iterated dominance frontier holds it.
+fn phi_candidates(prog: &Program, order: &[BlockId], idom: &[u32]) -> (Vec<u32>, Vec<u32>) {
+    let n = prog.num_blocks();
+    let mut frontier = Vec::new();
+    let mut defs = Vec::new();
+    let mut vars = 0;
+    for b in order {
+        let preds = &prog.block(*b).predecessors;
+        if preds.len() > 1 {
+            for p in preds {
+                let mut runner = p.0;
+                while runner != idom[b.0 as usize] && idom[runner as usize] != u32::MAX {
+                    frontier.push((runner, b.0));
+                    runner = idom[runner as usize];
+                }
+            }
+        }
+        let mut cur = prog.block(*b).first();
+        while let Some(id) = cur {
+            if let Some(var) = written_variable(prog, id) {
+                defs.push((var, b.0));
+                vars = vars.max(var as usize + 1);
+            }
+            cur = prog.inst(id).next();
+        }
+    }
+    let (frontier_start, frontier) = buckets(n, &frontier);
+    let (def_start, def_blocks) = buckets(vars, &defs);
+    let mut candidates = Vec::new();
+    let mut queued = vec![u32::MAX; n];
+    let mut placed = vec![u32::MAX; n];
+    let mut worklist = Vec::new();
+    for var in 0..vars as u32 {
+        for &b in
+            &def_blocks[def_start[var as usize] as usize..def_start[var as usize + 1] as usize]
+        {
+            if queued[b as usize] != var {
+                queued[b as usize] = var;
+                worklist.push(b);
+            }
+        }
+        while let Some(x) = worklist.pop() {
+            let range =
+                frontier_start[x as usize] as usize..frontier_start[x as usize + 1] as usize;
+            for &y in &frontier[range] {
+                if placed[y as usize] == var {
+                    continue;
+                }
+                placed[y as usize] = var;
+                candidates.push((y, var));
+                if queued[y as usize] != var {
+                    queued[y as usize] = var;
+                    worklist.push(y);
+                }
+            }
+        }
+    }
+    buckets(n, &candidates)
+}
+
 /// Rewrites every context read into SSA form. Needs `Program::post_order`.
 pub fn ssa_rewrite(prog: &mut Program) {
+    let order: Vec<BlockId> = prog.post_order.iter().rev().copied().collect();
+    let idom = immediate_dominators(prog, &order);
+    let (phi_start, phi_vars) = phi_candidates(prog, &order, &idom);
     let mut pass = Pass {
         sealed: vec![false; prog.num_blocks()],
         defs: vec![Vec::new(); GOTO_BASE as usize],
+        idom,
+        phi_start,
+        phi_vars,
         ..Pass::default()
     };
-    let order: Vec<BlockId> = prog.post_order.iter().rev().copied().collect();
     for &block in &order {
         if prog
             .block(block)

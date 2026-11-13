@@ -198,6 +198,8 @@ pub struct Process {
     resource_limit: Arc<ResourceLimit>,
     local_region: VAddr,
     code: Region,
+    /// Each module's name, start and size, for naming guest addresses.
+    modules: Vec<(String, VAddr, u64)>,
     entry: VAddr,
     main_stack: Mutex<Option<(VAddr, u64)>>,
     max_memory: u64,
@@ -280,6 +282,17 @@ impl Process {
             resource_limit: new.resource_limit,
             local_region,
             code: new.code,
+            modules: new
+                .modules
+                .iter()
+                .map(|module| {
+                    (
+                        module.name.clone(),
+                        new.code.start + module.offset,
+                        module.size,
+                    )
+                })
+                .collect(),
             entry: new.entry,
             main_stack: Mutex::new(None),
             max_memory,
@@ -349,6 +362,18 @@ impl Process {
 
     pub fn code_region(&self) -> Region {
         self.code
+    }
+
+    /// `addr` as `module+offset` when one of the process's modules holds it, else as an address.
+    pub(crate) fn locate(&self, addr: VAddr) -> String {
+        match self
+            .modules
+            .iter()
+            .find(|(_, start, size)| addr >= *start && addr - start < *size)
+        {
+            Some((name, start, _)) => format!("{name}+{:#x}", addr - start),
+            None => format!("{addr:#x}"),
+        }
     }
 
     pub fn state(&self) -> ProcessState {

@@ -168,7 +168,10 @@ impl Scheduler {
         *slot = Some(handle);
     }
 
-    fn interrupt(&self, core: usize) {
+    /// Makes the CPU running on `core` halt with [`HaltReason::Interrupted`] at its next check.
+    ///
+    /// [`HaltReason::Interrupted`]: lichii_cpu::HaltReason::Interrupted
+    pub(crate) fn interrupt(&self, core: usize) {
         if let Some(handle) = self.cores[core].interrupt.lock().as_ref() {
             handle.signal();
         }
@@ -418,6 +421,11 @@ impl Scheduler {
             return false;
         }
         true
+    }
+
+    /// Whether `core` is running guest code.
+    pub(crate) fn in_guest(&self, core: usize) -> bool {
+        self.cores[core].in_guest.load(Ordering::Acquire)
     }
 
     pub(crate) fn leave_guest(&self, core: usize) {

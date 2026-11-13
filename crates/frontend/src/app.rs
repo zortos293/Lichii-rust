@@ -472,8 +472,10 @@ impl App {
         let Some(window) = &self.window else { return };
         let version = env!("CARGO_PKG_VERSION");
         let title = match &self.session {
-            Some(s) if s.is_paused() => format!("Lichii {version} | {} (paused)", s.title),
-            Some(s) => format!("Lichii {version} | {}", s.title),
+            Some(s) if s.is_paused() => {
+                format!("Lichii {version} | {} (paused)", s.display_title())
+            }
+            Some(s) => format!("Lichii {version} | {}", s.display_title()),
             None => format!("Lichii {version}"),
         };
         window.set_title(&title);

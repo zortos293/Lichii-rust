@@ -182,6 +182,7 @@ impl Service for GraphicsSystem {
                 };
                 let decoder = vdec::VideoDecoder {
                     context: context.clone(),
+                    objects: self.objects.clone(),
                     name,
                 };
                 push_session(context, ctx, decoder)

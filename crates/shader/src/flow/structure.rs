@@ -21,6 +21,7 @@ enum Expr {
     Identity(Condition),
     Not(ExprId),
     Or(ExprId, ExprId),
+    And(ExprId, ExprId),
     Variable(u32),
     IndirectBranchCond(u32),
 }
@@ -322,6 +323,7 @@ impl<'a> GotoPass<'a> {
         for &goto_stmt in gotos.iter().rev() {
             pass.remove_goto(goto_stmt)?;
         }
+        pass.prune(ROOT);
         pass.reset_goto_variables();
         Ok(pass.tree)
     }
@@ -429,6 +431,40 @@ impl<'a> GotoPass<'a> {
         Ok(())
     }
 
+    /// Drops the goto variables that moves assigned to themselves and the `if`s left empty, and
+    /// folds an `if` whose whole body is another `if` into one `if` on both conditions.
+    fn prune(&mut self, parent: StmtId) {
+        let mut stmt = self.tree.s(parent).first;
+        while stmt != NIL {
+            let next = self.tree.s(stmt).next;
+            match self.tree.s(stmt).kind {
+                Kind::SetVariable { id, op } => {
+                    if matches!(self.tree.exprs[op as usize], Expr::Variable(v) if v == id) {
+                        self.tree.erase(stmt);
+                    }
+                }
+                Kind::If { cond } => {
+                    self.prune(stmt);
+                    let inner = self.tree.s(stmt).first;
+                    if inner == NIL {
+                        self.tree.erase(stmt);
+                    } else if let Kind::If { cond: inner_cond } = self.tree.s(inner).kind
+                        && self.tree.s(inner).next == NIL
+                    {
+                        let and = self.tree.expr(Expr::And(cond, inner_cond));
+                        self.tree.sm(stmt).kind = Kind::If { cond: and };
+                        self.tree.erase(inner);
+                        let first = self.tree.s(inner).first;
+                        self.tree.splice(stmt, inner, first, NIL);
+                    }
+                }
+                Kind::Loop { .. } => self.prune(stmt),
+                _ => {}
+            }
+            stmt = next;
+        }
+    }
+
     /// Sets every goto variable that is read to false just before its first use, in the
     /// innermost list holding all its uses. Without gotos the tree enters a list only at its
     /// front, so that statement dominates every use, and SSA reads of the variable stop there
@@ -471,7 +507,7 @@ impl<'a> GotoPass<'a> {
                         read[id] = true;
                     }
                     Expr::Not(e) => exprs.push(e),
-                    Expr::Or(a, b) => exprs.extend([a, b]),
+                    Expr::Or(a, b) | Expr::And(a, b) => exprs.extend([a, b]),
                     Expr::Identity(_) | Expr::IndirectBranchCond(_) => {}
                 }
             }
@@ -741,6 +777,11 @@ fn visit_expr(exprs: &[Expr], ir: &mut Emitter<'_>, expr: ExprId) -> Value {
             let a = visit_expr(exprs, ir, a);
             let b = visit_expr(exprs, ir, b);
             ir.logical_or(a, b)
+        }
+        Expr::And(a, b) => {
+            let a = visit_expr(exprs, ir, a);
+            let b = visit_expr(exprs, ir, b);
+            ir.logical_and(a, b)
         }
         Expr::Variable(id) => ir.get_goto_variable(id),
         Expr::IndirectBranchCond(location) => {

@@ -6,6 +6,9 @@ use std::collections::BTreeMap;
 use lichii_common::{ResultCode, VAddr};
 use lichii_gpu::nx2_memory::GpuMemoryHandle;
 use lichii_kernel::ipc::HleRequestContext;
+use lichii_memory::AddressSpace;
+use lichii_texture::PixelFormat;
+use lichii_texture::block_linear::{GobLayout, SurfaceLayout, Tiling, swizzle};
 use parking_lot::Mutex;
 
 use super::{UNKNOWN, Words};
@@ -83,39 +86,116 @@ const DECODER_ALIGNMENT: u64 = 64 * 128;
 /// gets its own handle, so the count is bounded.
 const MAX_DECODER_IMAGES: u32 = 64;
 
+/// Pixel layout of a video decoder output image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DecoderFormat {
+    /// Luma rows, then interleaved CbCr rows from `chroma_offset`.
+    Nv12 {
+        chroma_offset: u64,
+    },
+    Bgra,
+    Rgba,
+}
+
 /// Layout of a video decoder output image in an `nn::codec` image pool (gsv 911, 961, 991):
 /// pitch-linear rows padded to 128-row blocks. NV12 keeps its chroma plane after the luma plane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct DecoderLayout {
-    /// The picture kind gsv 961 reports: 0xa NV12, 0x9 BGRA8, 0x8 RGBA8.
-    pub kind: u32,
+    pub width: u32,
+    pub height: u32,
+    pub format: DecoderFormat,
     pub pitch: u64,
-    pub chroma_offset: Option<u64>,
     pub size: u64,
 }
 
 impl DecoderLayout {
     pub fn of(preference: &Preference) -> Self {
-        let width = u64::from(preference[2] & 0xffff) + 1;
-        let height = u64::from(preference[2] >> 16) + 1;
-        let (kind, nv12) = match preference[1] {
-            1 | 4 => (0xa, true),
-            2 | 5 => (0x9, false),
-            _ => (0x8, false),
-        };
-        let pitch = (width * if nv12 { 1 } else { 4 }).next_multiple_of(64);
-        let luma = pitch * height.next_multiple_of(128);
-        let chroma = if nv12 {
-            pitch * height.div_ceil(2).next_multiple_of(128)
-        } else {
-            0
+        let width = (preference[2] & 0xffff) + 1;
+        let height = (preference[2] >> 16) + 1;
+        let nv12 = matches!(preference[1], 1 | 4);
+        let pitch = (u64::from(width) * if nv12 { 1 } else { 4 }).next_multiple_of(64);
+        let luma = pitch * u64::from(height).next_multiple_of(128);
+        let (format, chroma) = match preference[1] {
+            1 | 4 => (
+                DecoderFormat::Nv12 {
+                    chroma_offset: luma,
+                },
+                pitch * u64::from(height.div_ceil(2)).next_multiple_of(128),
+            ),
+            2 | 5 => (DecoderFormat::Bgra, 0),
+            _ => (DecoderFormat::Rgba, 0),
         };
         Self {
-            kind,
+            width,
+            height,
+            format,
             pitch,
-            chroma_offset: nv12.then_some(luma),
             size: luma + chroma,
         }
+    }
+
+    /// The layout an RGBA or BGRA image takes once the title reads it on the GPU (426/428): RGBA
+    /// texels in Switch 2 block-linear with 16-GOB blocks, as the reference writes them, shrunk to
+    /// fit a short image the way the hardware and the texture cache read it.
+    pub fn tiling(&self) -> Tiling {
+        SurfaceLayout {
+            format: PixelFormat::A8B8G8R8Unorm,
+            width: (self.pitch / 4) as u32,
+            height: self.height,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            block_height_log2: 4,
+            block_depth_log2: 0,
+            tile_width_spacing: 0,
+            layout: GobLayout::Switch2,
+        }
+        .level_tiling(0)
+    }
+
+    /// The picture kind gsv 961 reports.
+    pub fn kind(&self) -> u32 {
+        match self.format {
+            DecoderFormat::Nv12 { .. } => 0xa,
+            DecoderFormat::Bgra => 0x9,
+            DecoderFormat::Rgba => 0x8,
+        }
+    }
+}
+
+/// Where a decoder output image lies in the title's memory.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DecoderImage {
+    pub address: VAddr,
+    pub layout: DecoderLayout,
+    /// Frames go in [`DecoderLayout::tiling`]: the title reads this RGBA or BGRA image on the GPU.
+    pub block_linear: bool,
+}
+
+/// Rewrites a decoder image holding a pitch-linear RGBA or BGRA frame in [`DecoderLayout::tiling`],
+/// for a frame written before the title's first 426/428 for the image.
+pub(super) fn relayout_decoder_image(
+    memory: &AddressSpace,
+    address: VAddr,
+    layout: &DecoderLayout,
+) {
+    if matches!(layout.format, DecoderFormat::Nv12 { .. }) {
+        return;
+    }
+    let tiling = layout.tiling();
+    let mut linear = vec![0u8; tiling.linear_size_bytes()];
+    if memory.read_bytes(address, &mut linear).is_err() {
+        return;
+    }
+    if layout.format == DecoderFormat::Bgra {
+        for texel in linear.as_chunks_mut::<4>().0 {
+            texel.swap(0, 2);
+        }
+    }
+    let mut tiled = vec![0u8; tiling.size_bytes()];
+    swizzle(&tiling, &linear, &mut tiled);
+    if memory.write_bytes(address, &tiled).is_err() {
+        tracing::warn!("nx2:gsv: cannot relayout the decoder image at {address:#x}");
     }
 }
 
@@ -143,6 +223,10 @@ struct Image {
     offset: u64,
     /// A video decoder output image pool (gsv 911), laid out by [`DecoderLayout`].
     decoder: bool,
+    /// A decoder image the title read on the GPU (426/428).
+    gpu_read: bool,
+    /// A decoder image holding a frame written pitch-linear, before its first 426/428.
+    pitch_frame: bool,
 }
 
 /// A native image vi2 can show.
@@ -169,6 +253,28 @@ impl NativeObjects {
         let (&first, image) = self.images.range(..=handle).next_back()?;
         let index = handle - first;
         (index < image.count).then(|| (image, image.offset + u64::from(index) * image.size))
+    }
+
+    /// The decoder output image `handle` names, when its memory is bound.
+    pub fn decoder_image(&self, handle: u32) -> Option<DecoderImage> {
+        let (image, offset) = self.image(handle)?;
+        let memory = self.memories.get(&image.memory)?;
+        let layout = DecoderLayout::of(&image.preference);
+        (image.decoder && memory.address != 0).then(|| DecoderImage {
+            address: memory.address + offset,
+            layout,
+            block_linear: image.gpu_read && !matches!(layout.format, DecoderFormat::Nv12 { .. }),
+        })
+    }
+
+    /// The decoder wrote a pitch-linear frame into decoder image `handle`. True when a 426/428
+    /// came in meanwhile, so the frame needs [`relayout_decoder_image`] now.
+    pub fn wrote_pitch_frame(&mut self, handle: u32) -> bool {
+        let Some(image) = self.images.get_mut(&handle) else {
+            return false;
+        };
+        image.pitch_frame = !image.gpu_read;
+        image.gpu_read
     }
 
     pub fn presentable(&self, handle: u32) -> Option<Presentable> {
@@ -209,6 +315,8 @@ impl NativeObjects {
                 count: 1,
                 offset: 0,
                 decoder: false,
+                gpu_read: false,
+                pitch_frame: false,
             },
         );
         (objects, 1)
@@ -288,6 +396,8 @@ pub(super) fn handle(objects: &Mutex<NativeObjects>, ctx: &mut HleRequestContext
                 count,
                 offset: 0,
                 decoder,
+                gpu_read: false,
+                pitch_frame: false,
             };
             if decoder {
                 for i in 0..count {
@@ -318,11 +428,11 @@ pub(super) fn handle(objects: &Mutex<NativeObjects>, ctx: &mut HleRequestContext
             match objects.lock().image(handle) {
                 Some((image, offset)) if image.decoder => {
                     let layout = DecoderLayout::of(&image.preference);
-                    descriptor[0] = layout.kind;
+                    descriptor[0] = layout.kind();
                     descriptor[2] = offset as u32;
                     descriptor[4] = layout.pitch as u32;
-                    if let Some(chroma) = layout.chroma_offset {
-                        descriptor[6] = (offset + chroma) as u32;
+                    if let DecoderFormat::Nv12 { chroma_offset } = layout.format {
+                        descriptor[6] = (offset + chroma_offset) as u32;
                         descriptor[8] = layout.pitch as u32;
                     }
                 }
@@ -340,11 +450,21 @@ pub(super) fn handle(objects: &Mutex<NativeObjects>, ctx: &mut HleRequestContext
         426 | 428 => {
             let handle = words.u32(2);
             let (preference, offset, address) = {
-                let objects = objects.lock();
-                match objects.image(handle) {
-                    Some((image, offset)) => {
-                        let address = objects.memories.get(&image.memory).map_or(0, |m| m.address);
-                        (image.preference, offset, address)
+                let mut objects = objects.lock();
+                let found = objects.image(handle).map(|(image, offset)| {
+                    let address = objects.memories.get(&image.memory).map_or(0, |m| m.address);
+                    (image.preference, offset, address, image.decoder)
+                });
+                match found {
+                    Some((preference, offset, address, decoder)) => {
+                        if decoder && let Some(image) = objects.images.get_mut(&handle) {
+                            image.gpu_read = true;
+                            if std::mem::take(&mut image.pitch_frame) && address != 0 {
+                                let layout = DecoderLayout::of(&preference);
+                                relayout_decoder_image(ctx.memory(), address + offset, &layout);
+                            }
+                        }
+                        (preference, offset, address)
                     }
                     None => {
                         tracing::warn!("nx2:gsv {command}: no native image {handle}");
