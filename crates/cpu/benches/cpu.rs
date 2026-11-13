@@ -232,6 +232,25 @@ const WORKLOADS: &[Workload] = &[
         per_iteration: 9,
     },
     Workload {
+        name: "fp element loop",
+        code: &[
+            0x4f03f702, // fmov v2.4s, #1.5
+            0x4f03f500, // fmov v0.4s, #0.75
+            0x5fa29001, // 1: fmul s1, s0, v2.s[1]
+            0x5f821824, // fmla s4, s1, v2.s[2]
+            0x5fc25805, // fmls d5, d0, v2.d[1]
+            0x5e21d803, // scvtf s3, s0
+            0x1e232886, // fadd s6, s4, s3
+            0x7e61d827, // ucvtf d7, d1
+            0xbd000026, // str s6, [x1]
+            0xf10004a5, // subs x5, x5, #1
+            0x54ffff01, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 9,
+    },
+    Workload {
         name: "popcount loop",
         code: &[
             0x4c407020, // 1: ld1 {v0.16b}, [x1]

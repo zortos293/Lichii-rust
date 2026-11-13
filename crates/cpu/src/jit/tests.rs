@@ -246,7 +246,9 @@ fn atomic(rng: &mut Rng) -> u32 {
     }
 }
 
-const FP: [&str; 16] = [
+const FP: [&str; 18] = [
+    "01x111111xxxxxxxxx01x0xxxxxxxxxx",
+    "01x111100x100001110110xxxxxxxxxx",
     "0xx01110xx1xxxxx110xx1xxxxxxxxxx",
     "0xx011111xxxxxxxxx01x0xxxxxxxxxx",
     "000111100x10000xx10000xxxxxxxxxx",
@@ -858,7 +860,14 @@ fn fp_edge_cases_match_the_interpreter() {
         1 << 53 | 1,
     ];
     for x in integers {
-        for op in [0x1e22_0020, 0x1e23_0020, 0x9e22_0020, 0x9e23_0020] {
+        for op in [
+            0x1e22_0020,
+            0x1e23_0020,
+            0x9e22_0020,
+            0x9e23_0020,
+            0x5e21_d820,
+            0x7e21_d820,
+        ] {
             for (fp, fpsr) in [(0, 0), (0, 0x10), (1 << 22, 0), (1 << 22, 0x10)] {
                 let mut ctx = ThreadContext {
                     pc: CODE,
@@ -866,6 +875,7 @@ fn fp_edge_cases_match_the_interpreter() {
                     ..Default::default()
                 };
                 ctx.x[1] = x;
+                ctx.v[1] = 0x5a5a_5a5a_5a5a_5a5a << 64 | x as u128;
                 compare(machines, &[op | fp, BRK], &ctx, &data);
             }
         }
@@ -874,7 +884,7 @@ fn fp_edge_cases_match_the_interpreter() {
 
 #[test]
 fn vector_fp_edge_cases_match_the_interpreter() {
-    const S_OPS: [u32; 11] = [
+    const S_OPS: [u32; 14] = [
         0x4e22_d420, // fadd v0.4s, v1.4s, v2.4s
         0x4ea2_d420, // fsub v0.4s, v1.4s, v2.4s
         0x6e22_dc20, // fmul v0.4s, v1.4s, v2.4s
@@ -886,14 +896,20 @@ fn vector_fp_edge_cases_match_the_interpreter() {
         0x0e22_d420, // fadd v0.2s, v1.2s, v2.2s
         0x0f82_1020, // fmla v0.2s, v1.2s, v2.s[0]
         0x0fa2_9820, // fmul v0.2s, v1.2s, v2.s[3]
+        0x5fa2_9820, // fmul s0, s1, v2.s[3]
+        0x5fa2_1020, // fmla s0, s1, v2.s[1]
+        0x5f82_5820, // fmls s0, s1, v2.s[2]
     ];
-    const D_OPS: [u32; 6] = [
+    const D_OPS: [u32; 9] = [
         0x4e62_d420, // fadd v0.2d, v1.2d, v2.2d
         0x6e62_dc20, // fmul v0.2d, v1.2d, v2.2d
         0x4e62_cc20, // fmla v0.2d, v1.2d, v2.2d
         0x4ee2_cc20, // fmls v0.2d, v1.2d, v2.2d
         0x4fc2_9820, // fmul v0.2d, v1.2d, v2.d[1]
         0x4fc2_1020, // fmla v0.2d, v1.2d, v2.d[0]
+        0x5fc2_9820, // fmul d0, d1, v2.d[1]
+        0x5fc2_1020, // fmla d0, d1, v2.d[0]
+        0x5fc2_5820, // fmls d0, d1, v2.d[1]
     ];
     let machines = &mut [
         ("interpreter", Machine::new(Backend::Interpreter)),
