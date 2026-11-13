@@ -38,7 +38,7 @@ use lichii_common::{DAddr, GpuVAddr, PAGE_SIZE};
 use lichii_gpu::backend::{FramebufferConfig, GpuWrittenPages};
 use lichii_gpu::gmmu::{Gmmu, RangeTarget};
 use lichii_gpu::lazy::LazyDeviceRanges;
-use lichii_memory::DeviceAddressSpace;
+use lichii_memory::{CachedPages, DeviceAddressSpace};
 use lichii_texture::PixelFormat;
 use lichii_texture::block_linear::{GobLayout, swizzle, unswizzle};
 use lichii_texture::tic::{SwizzleSource, TextureDescriptor};
@@ -259,6 +259,9 @@ struct CachedImage {
     views: Vec<(ViewKey, ImageView)>,
     /// Guest memory changed since the last upload.
     cpu_dirty: bool,
+    /// Write tracking over the segments the last upload read, so a guest CPU write to them
+    /// invalidates the image. Empty before the first upload and after an invalidation.
+    tracked: Vec<CachedPages>,
     /// The host image holds data guest memory does not.
     gpu_modified: bool,
     /// Order of the last GPU write, for aliasing.
@@ -949,6 +952,7 @@ impl TextureCache {
             let image = self.image(id);
             image.cpu_dirty = true;
             image.gpu_modified = false;
+            image.tracked.clear();
         }
         ids.clear();
         self.ids = ids;
@@ -1630,6 +1634,7 @@ impl TextureCache {
             segments,
             views: Vec::new(),
             cpu_dirty: true,
+            tracked: Vec::new(),
             gpu_modified: false,
             modified: 0,
             visit: 0,
@@ -1751,6 +1756,11 @@ impl TextureCache {
             .image
             .as_mut()
             .expect("a live image id");
+        image.tracked = image
+            .segments
+            .iter()
+            .map(|s| tx.memory.cache_pages(s.daddr, s.size))
+            .collect();
         let info = image.info;
         let host = image.host;
         let format = info.format;

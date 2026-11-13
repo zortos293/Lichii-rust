@@ -23,7 +23,7 @@ use lichii_gpu::engines::maxwell_3d::Regs;
 use lichii_gpu::engines::maxwell_3d::regs::{IndexFormat, PrimitiveTopology};
 use lichii_gpu::gmmu::{Gmmu, GpuRange, RangeTarget};
 use lichii_gpu::lazy::LazyDeviceRanges;
-use lichii_memory::DeviceAddressSpace;
+use lichii_memory::{CachedPages, DeviceAddressSpace};
 
 use crate::commands::transfer_to_all_barrier;
 use crate::device::Device;
@@ -140,6 +140,9 @@ struct CachedBuffer {
     stream_score: u32,
     /// Texel buffer views by offset, range and format, dropped with the buffer.
     views: Vec<((u64, u64, i32), BufferView)>,
+    /// Write tracking over each uploaded range (start, end), so a guest CPU write to it marks
+    /// the pages dirty.
+    tracked: Vec<(DAddr, DAddr, CachedPages)>,
 }
 
 impl CachedBuffer {
@@ -160,6 +163,28 @@ impl CachedBuffer {
                 self.dirty[word] |= bit;
                 self.dirty_pages += 1;
             }
+        }
+    }
+
+    /// Stops tracking the pages of `[start, end)`, which upload again and are tracked anew.
+    /// The rest of each range tracked with them keeps a guard of its own, taken before the old
+    /// one is dropped, so it never goes untracked.
+    fn untrack(&mut self, memory: &DeviceAddressSpace, start: DAddr, end: DAddr) {
+        let (start, end) = (start & !(PAGE_SIZE - 1), end.next_multiple_of(PAGE_SIZE));
+        let mut i = 0;
+        while i < self.tracked.len() {
+            let (s, e) = (self.tracked[i].0, self.tracked[i].1);
+            if s >= end || e <= start {
+                i += 1;
+                continue;
+            }
+            let (_, _, old) = self.tracked.swap_remove(i);
+            for (a, b) in [(s, start), (end, e)] {
+                if a < b {
+                    self.tracked.push((a, b, memory.cache_pages(a, b - a)));
+                }
+            }
+            drop(old);
         }
     }
 }
@@ -725,7 +750,9 @@ impl BufferCache {
                 continue;
             };
             let buffer = self.buffers[id].as_mut().expect("live buffer");
-            buffer.mark_dirty(daddr.max(buffer.daddr), end.min(buffer.end()));
+            let (start, stop) = (daddr.max(buffer.daddr), end.min(buffer.end()));
+            buffer.mark_dirty(start, stop);
+            buffer.untrack(&self.memory, start, stop);
             page = buffer.end() >> CACHING_PAGE_BITS;
         }
     }
@@ -883,6 +910,9 @@ impl BufferCache {
         copies.clear();
         let mut offset = 0;
         for &(addr, len) in uploads.iter() {
+            buffer
+                .tracked
+                .push((addr, addr + len, self.memory.cache_pages(addr, len)));
             read_guest(
                 &self.memory,
                 addr,
@@ -959,13 +989,15 @@ impl BufferCache {
             dirty_pages: pages as u64,
             stream_score: 0,
             views: Vec::new(),
+            tracked: Vec::new(),
         };
         if !self.overlaps.is_empty() {
             let cmd = scheduler.record()?;
             before_transfer(&self.device, cmd);
             for i in 0..self.overlaps.len() {
                 let id = self.overlaps[i];
-                let old = self.buffers[id].take().expect("live buffer");
+                let mut old = self.buffers[id].take().expect("live buffer");
+                new.tracked.append(&mut old.tracked);
                 self.free_slots.push(id);
                 let offset = old.daddr - begin;
                 let region = [vk::BufferCopy {
@@ -1487,7 +1519,7 @@ mod tests {
 
     use lichii_common::settings::GraphicsSettings;
     use lichii_gpu::gmmu::BigPageSize;
-    use lichii_memory::PhysicalMemory;
+    use lichii_memory::{AddressSpace, MemoryPermission, PhysicalMemory};
 
     use super::*;
     use crate::{Instance, SurfaceSupport};
@@ -1790,6 +1822,41 @@ mod tests {
         let stats = f.cache.stats();
         assert_eq!(stats.uploaded_bytes, 6 * PAGE_SIZE, "pages 1 to 6 upload");
         assert_eq!(stats.created_buffers, 1);
+        f.assert_no_validation_errors();
+    }
+
+    /// Guest CPU writes to uploaded pages come back through write tracking: only the written
+    /// pages upload again, the rest stay tracked, and a page uploaded anew is tracked anew.
+    #[test]
+    fn cpu_writes_to_uploaded_pages_are_tracked() {
+        const CPU_VA: u64 = 0x1000_0000;
+        let Some(mut f) = fixture() else { return };
+        let space = Arc::new(AddressSpace::new(f.memory.physical().clone(), 39));
+        space.map(CPU_VA, 0, 0x10000, MemoryPermission::READ_WRITE);
+        f.memory.attach_process(space.clone());
+        space.write_bytes(CPU_VA, &pattern(0x10000, 2)).unwrap();
+        let binding = f.acquire(DADDR, 0x10000);
+        for (offset, byte) in [(0x5010, 7), (0x9ffc, 8), (0x5010, 9)] {
+            space.write_bytes(CPU_VA + offset, &[byte; 8]).unwrap();
+            assert!(
+                f.memory.has_cpu_writes(),
+                "{offset:#x}: the write was tracked"
+            );
+            let memory = f.memory.clone();
+            memory.take_cpu_writes(|daddr, size| f.cache.invalidate(daddr, size));
+            f.acquire(DADDR, 0x10000);
+        }
+        assert_eq!(
+            f.cache.stats().uploaded_bytes,
+            0x10000 + 4 * PAGE_SIZE,
+            "pages 5, 9, 10 and 5 again"
+        );
+        let mut guest = vec![0; 0x10000];
+        space.read_bytes(CPU_VA, &mut guest).unwrap();
+        assert!(
+            f.read_binding(binding) == guest,
+            "the buffer holds the CPU's bytes"
+        );
         f.assert_no_validation_errors();
     }
 
