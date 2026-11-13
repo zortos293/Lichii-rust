@@ -160,8 +160,10 @@ pub struct SetupWindow {
 
 /// What the window did this frame.
 pub struct SetupOutput {
-    /// The keys or NAND folder changed; save the settings.
-    pub changed: bool,
+    /// The keys folder changed; save the settings.
+    pub keys_changed: bool,
+    /// The NAND folder changed; save the settings.
+    pub nand_changed: bool,
     pub closed: bool,
 }
 
@@ -183,7 +185,8 @@ impl SetupWindow {
         user: &UserPaths,
     ) -> SetupOutput {
         let mut open = true;
-        let mut changed = false;
+        let mut keys_changed = false;
+        let mut nand_changed = false;
         let mut close = false;
         egui::Window::new("Keys and Firmware")
             .open(&mut open)
@@ -197,7 +200,7 @@ impl SetupWindow {
                 );
                 ui.add_space(8.0);
                 ui.heading("Console keys");
-                changed |= folder_row(
+                keys_changed = folder_row(
                     ui,
                     &self.keys.dir,
                     &mut paths.keys_dir,
@@ -215,7 +218,7 @@ impl SetupWindow {
                 ui.add_space(8.0);
                 ui.heading("Firmware");
                 let nand = nand_dir(paths, user);
-                changed |= folder_row(
+                nand_changed = folder_row(
                     ui,
                     &nand,
                     &mut paths.nand_dir,
@@ -230,11 +233,12 @@ impl SetupWindow {
                 ui.add_space(8.0);
                 close = ui.button("Close").clicked();
             });
-        if changed {
+        if keys_changed || nand_changed {
             *self = Self::new(paths, user);
         }
         SetupOutput {
-            changed,
+            keys_changed,
+            nand_changed,
             closed: close || !open,
         }
     }

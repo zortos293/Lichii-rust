@@ -418,11 +418,15 @@ Dump prod.keys and title.keys \
             return;
         };
         let out = window.show(ctx, &mut self.settings.paths, &self.paths);
-        if out.changed {
+        if out.keys_changed || out.nand_changed {
             if let Some(config) = &mut self.config {
                 let draft = config.draft_paths();
-                draft.keys_dir.clone_from(&self.settings.paths.keys_dir);
-                draft.nand_dir.clone_from(&self.settings.paths.nand_dir);
+                if out.keys_changed {
+                    draft.keys_dir.clone_from(&self.settings.paths.keys_dir);
+                }
+                if out.nand_changed {
+                    draft.nand_dir.clone_from(&self.settings.paths.nand_dir);
+                }
             }
             self.save_settings();
         }
