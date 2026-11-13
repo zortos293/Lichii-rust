@@ -321,7 +321,8 @@ impl Kernel {
     }
 
     /// Stops running guest code: every core puts its thread back in its run queue and idles until
-    /// [`Kernel::resume`]. Service threads, waits and timers keep going.
+    /// [`Kernel::resume`]. Service threads, waits and timers keep going. Returns once every core
+    /// has left guest code, so a clock paused after this sees no more guest counter reads.
     pub fn pause(&self) {
         self.0.scheduler.pause();
     }
