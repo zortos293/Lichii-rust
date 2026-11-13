@@ -326,6 +326,20 @@ mod faults {
             "the page is still write-protected"
         );
 
+        space.protect(0x4000_0000, 0x3000, MemoryPermission::READ);
+        assert!(
+            !device.has_cpu_writes(),
+            "protecting a whole view never exposes it"
+        );
+        space.protect(0x4000_0000, 0x1000, MemoryPermission::NONE);
+        let mut found = Vec::new();
+        device.take_cpu_writes(|daddr, size| found.push((daddr, size)));
+        assert_eq!(
+            !found.is_empty(),
+            cfg!(windows),
+            "a read-only view mapped again was briefly writable"
+        );
+
         space.map(0x5000_0000, 0x10_1000, 0x1000, MemoryPermission::READ_WRITE);
         let mut found = Vec::new();
         device.take_cpu_writes(|daddr, size| found.push((daddr, size)));
