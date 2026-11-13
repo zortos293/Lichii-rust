@@ -127,6 +127,19 @@ impl Nvdrv {
         }
     }
 
+    /// Reserves a free syncpoint for an HLE service that counts its own work on it, such as the
+    /// Switch 2 video decoder. It reserves each increment with
+    /// [`lichii_gpu::host1x::Syncpoints::increase_max`].
+    pub(crate) fn allocate_syncpoint(&self) -> u32 {
+        self.syncpoints.allocate()
+    }
+
+    /// Runs every increment reserved on a syncpoint from [`Nvdrv::allocate_syncpoint`] and
+    /// frees it.
+    pub(crate) fn retire_syncpoint(&self, id: u32) {
+        self.syncpoints.retire(id);
+    }
+
     fn console(&self) -> Console {
         if self.nx2 {
             Console::Switch2

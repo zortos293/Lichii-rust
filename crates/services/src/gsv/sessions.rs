@@ -1,4 +1,4 @@
-//! The small sessions gsv hands out: GPU time, camera, chat and the video decoder.
+//! The small sessions gsv hands out: GPU time, camera and chat.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -8,8 +8,8 @@ use lichii_kernel::Event;
 use lichii_kernel::ipc::HleRequestContext;
 use parking_lot::Mutex;
 
-use super::{handshake, push_readable, push_session};
-use crate::{Service, ServiceContext};
+use super::{handshake, push_readable};
+use crate::Service;
 
 /// HIPC `ResultNotSupported`.
 const NOT_SUPPORTED: ResultCode = ResultCode::new(11, 1);
@@ -78,55 +78,6 @@ impl Service for Chat {
                 let event = self.events.lock().entry(id).or_default().clone();
                 push_readable(ctx, &event)
             }
-            _ => return None,
-        })
-    }
-}
-
-/// gsv 902, 905, 906 and 1002 (`nn::codec::video::detail::ipc`): TIPC 1
-/// (`CreateVideoDecoderService`) hands out a [`VideoDecoderService`]. Without that session
-/// `InitializeVp9Decoder` fails with InvalidHandle and the movie player aborts.
-pub(super) struct VideoDecoder {
-    pub context: Arc<ServiceContext>,
-    pub name: &'static str,
-}
-
-impl Service for VideoDecoder {
-    fn name(&self) -> &str {
-        self.name
-    }
-
-    fn handle(&self, ctx: &mut HleRequestContext) -> Option<ResultCode> {
-        Some(match ctx.command() {
-            1 => push_session(&self.context, ctx, VideoDecoderService::default()),
-            _ => return None,
-        })
-    }
-}
-
-/// A video decoder. Frames are not decoded: 3 returns the submission-ready event, signalled so
-/// submissions never wait, and the rest (initialize, configure, buffers, input, output info) fall
-/// to the auto-stub, so movies play without a picture.
-pub(super) struct VideoDecoderService {
-    ready: Arc<Event>,
-}
-
-impl Default for VideoDecoderService {
-    fn default() -> Self {
-        let ready = Arc::new(Event::default());
-        ready.signal();
-        Self { ready }
-    }
-}
-
-impl Service for VideoDecoderService {
-    fn name(&self) -> &str {
-        "nx2:vdecsvc"
-    }
-
-    fn handle(&self, ctx: &mut HleRequestContext) -> Option<ResultCode> {
-        Some(match ctx.command() {
-            3 => push_readable(ctx, &self.ready),
             _ => return None,
         })
     }
