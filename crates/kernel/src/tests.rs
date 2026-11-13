@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
+use lichii_common::settings::CpuAccuracy;
 use lichii_common::{ConsoleGeneration, VAddr};
 use lichii_cpu::{CpuConfig, CpuCore, GuestClock, HaltReason, InterruptHandle, ThreadContext};
 use lichii_loader::npdm::{AddressSpaceType, KernelCapabilities, PoolPartition, ServiceAccess};
@@ -217,6 +218,7 @@ impl TestKernel {
                 system_non_secure: 16 << 20,
             }),
             fastmem: false,
+            cpu_accuracy: CpuAccuracy::Auto,
             aslr: false,
             rng_seed: 1,
             clock: Arc::new(HostClock(Instant::now())),

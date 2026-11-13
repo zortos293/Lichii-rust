@@ -416,6 +416,8 @@ impl Gpu {
                 waiters: handles.syncpoints.semaphore_waiters().clone(),
                 inbox: inbox.clone(),
                 syncpoints: handles.syncpoints.clone(),
+                written_pages: (config.console == Console::Switch2)
+                    .then(|| handles.written_pages.clone()),
             },
             channels: Vec::new(),
             held: VecDeque::new(),

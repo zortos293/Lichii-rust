@@ -3,11 +3,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use lichii_common::ConsoleGeneration;
+use lichii_common::settings::{CpuAccuracy, CpuBackend};
+use lichii_cpu::CpuConfig;
 use parking_lot::Mutex;
 
 use super::{Script, TestKernel, word};
 use crate::process::{Process, ProcessParams};
 use crate::util::Rng;
+use crate::{Kernel, KernelConfig};
 
 pub(super) fn heap_base(test: &TestKernel) -> u64 {
     let params = ProcessParams::from_image(&test.image(), false).unwrap();
@@ -274,4 +277,113 @@ fn pause_stops_guest_code_until_resume() {
     assert!(read(counter) > paused_at, "guest did not resume");
     process.memory().write(done, 1u32).unwrap();
     test.wait_for_exit(Duration::from_secs(10));
+}
+
+/// A guest counter read the way translated code reads it: host time plus an offset the clock
+/// moves only at pause and resume, which a core still in guest code would not see.
+struct InlineCounter {
+    epoch: std::time::Instant,
+    offset_ns: std::sync::atomic::AtomicI64,
+    paused_at: std::sync::atomic::AtomicI64,
+}
+
+impl InlineCounter {
+    fn read(&self) -> i64 {
+        self.offset_ns.load(Ordering::SeqCst) + self.epoch.elapsed().as_nanos() as i64
+    }
+
+    fn pause(&self) {
+        self.paused_at.store(self.read(), Ordering::SeqCst);
+    }
+
+    fn resume(&self) {
+        let elapsed = self.epoch.elapsed().as_nanos() as i64;
+        self.offset_ns.store(
+            self.paused_at.load(Ordering::SeqCst) - elapsed,
+            Ordering::SeqCst,
+        );
+    }
+}
+
+#[test]
+fn guest_time_never_steps_back_across_pause() {
+    let test = TestKernel::new(ConsoleGeneration::Switch2);
+    let heap = heap_base(&test);
+    let done = heap + 0x800;
+    let counter = Arc::new(InlineCounter {
+        epoch: std::time::Instant::now(),
+        offset_ns: Default::default(),
+        paused_at: Default::default(),
+    });
+    let last = Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN));
+    let stepped_back = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let main = {
+        let (counter, last, stepped_back) = (counter.clone(), last.clone(), stepped_back.clone());
+        test.program(
+            Script::new()
+                .step(move |_, env| {
+                    let observe = |now: i64| {
+                        if now < last.swap(now, Ordering::SeqCst) {
+                            stepped_back.store(true, Ordering::SeqCst);
+                        }
+                    };
+                    observe(counter.read());
+                    let busy = std::time::Instant::now();
+                    while busy.elapsed() < Duration::from_millis(1) {
+                        std::hint::spin_loop();
+                    }
+                    observe(counter.read());
+                    if word(env, done).load(Ordering::SeqCst) == 1 {
+                        super::Action::Next
+                    } else {
+                        super::Action::Stay
+                    }
+                })
+                .exit(),
+        )
+    };
+    let process = test.start(test.image(), main);
+    test.kernel.run().unwrap();
+    std::thread::sleep(Duration::from_millis(10));
+    for _ in 0..20 {
+        test.kernel.pause();
+        counter.pause();
+        std::thread::sleep(Duration::from_millis(2));
+        counter.resume();
+        test.kernel.resume();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    process.memory().write(done, 1u32).unwrap();
+    test.wait_for_exit(Duration::from_secs(10));
+    assert!(last.load(Ordering::SeqCst) > i64::MIN, "guest never ran");
+    assert!(
+        !stepped_back.load(Ordering::SeqCst),
+        "a core read the counter after the pause returned"
+    );
+}
+
+#[test]
+fn cores_are_created_with_the_configured_cpu_accuracy() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    let kernel = Kernel::new(KernelConfig {
+        console: ConsoleGeneration::Switch1,
+        dram_size: 256 << 20,
+        pool_layout: None,
+        fastmem: false,
+        cpu_accuracy: CpuAccuracy::Paranoid,
+        aslr: false,
+        rng_seed: 1,
+        clock: Arc::new(super::HostClock(std::time::Instant::now())),
+        cpu: Arc::new(move |config: CpuConfig| {
+            recorded.lock().push(config.accuracy);
+            lichii_cpu::new_core(CpuBackend::Interpreter, config)
+        }),
+        events: None,
+    })
+    .unwrap();
+    let image = crate::testing::program_image(0x0100_0000_0000_1000);
+    let process = kernel.create_process(&image).unwrap();
+    let _cpu = kernel.0.new_cpu(&process, 0);
+    assert_eq!(*seen.lock(), [CpuAccuracy::Paranoid]);
 }

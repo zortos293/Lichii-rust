@@ -34,6 +34,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
+use lichii_common::settings::CpuAccuracy;
 use lichii_common::{ConsoleGeneration, HleResult, PAGE_SIZE, VAddr, align_up};
 use lichii_cpu::{CpuConfig, CpuCore};
 use lichii_loader::program::ProgramImage;
@@ -87,6 +88,8 @@ pub struct KernelConfig {
     pub pool_layout: Option<PoolLayout>,
     /// Give process address spaces a fastmem arena for the JIT.
     pub fastmem: bool,
+    /// The accuracy every CPU core is created with.
+    pub cpu_accuracy: CpuAccuracy,
     /// Slide the code region base of new processes (ASLR).
     pub aslr: bool,
     /// Seed for ASLR and random entropy.
@@ -115,6 +118,7 @@ pub(crate) struct KernelInner {
     pub clock: Arc<dyn GuestClock>,
     cpu_factory: CpuFactory,
     fastmem: bool,
+    cpu_accuracy: CpuAccuracy,
     aslr: bool,
     events: Arc<dyn KernelEvents>,
     rng: Mutex<Rng>,
@@ -173,6 +177,7 @@ impl Kernel {
             clock: config.clock,
             cpu_factory: config.cpu,
             fastmem: config.fastmem,
+            cpu_accuracy: config.cpu_accuracy,
             aslr: config.aslr,
             events: config.events.unwrap_or_else(|| Arc::new(LogEvents)),
             rng: Mutex::new(Rng::new(config.rng_seed)),
@@ -321,7 +326,8 @@ impl Kernel {
     }
 
     /// Stops running guest code: every core puts its thread back in its run queue and idles until
-    /// [`Kernel::resume`]. Service threads, waits and timers keep going.
+    /// [`Kernel::resume`]. Service threads, waits and timers keep going. Returns once every core
+    /// has left guest code, so a clock paused after this sees no more guest counter reads.
     pub fn pause(&self) {
         self.0.scheduler.pause();
     }
@@ -540,6 +546,7 @@ impl KernelInner {
             core_index: core,
             ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
             dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+            accuracy: self.cpu_accuracy,
         })
     }
 

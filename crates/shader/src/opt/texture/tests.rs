@@ -188,6 +188,18 @@ fn bound_textures_share_a_descriptor_per_offset() {
 }
 
 #[test]
+fn bound_handle_with_a_slot_reads_that_constant_buffer() {
+    let (mut prog, b) = program(1);
+    let handle = TextureInstInfo::bound_handle(5, 0x40);
+    let id = sample(&mut prog, b[0], Value::U32(handle));
+    let info = run(&Env::default(), &mut prog, &host(1024));
+
+    assert_eq!(prog.op(id), Opcode::ImageSampleImplicitLod);
+    assert_eq!(info.texture_descriptors[0].handle, word_source(5, 0x40));
+    assert_eq!(prog.arg(id, 0), Value::Void);
+}
+
+#[test]
 fn bindless_handle_tracks_its_constant_buffer_word() {
     let (mut prog, b) = program(1);
     let word = cbuf(&mut prog, b[0], 1, Value::U32(0x40));

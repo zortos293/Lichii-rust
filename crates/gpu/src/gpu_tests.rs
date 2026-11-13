@@ -1574,6 +1574,60 @@ fn entries_without_sync_are_fetched_without_waiting() {
     });
 }
 
+fn gpu_written_list(console: Console, threading: Threading) -> (Rig, ChannelId, GpEntry) {
+    let mut rig = Rig::build_for(
+        console,
+        threading,
+        crate::gpu::DEFAULT_RING_SLOTS,
+        Completion::Deferred,
+        Engines::Recording,
+    );
+    let channel = rig.channel(HostClass::Ampere);
+    let (writer, list) = list_written_by_a_release(&mut rig);
+    rig.gpu
+        .handles()
+        .written_pages
+        .mark(DEVICE_BASE + list.address() + 4, 4);
+    rig.gpu.submit(channel, Submission::new(&[writer, list]));
+    (rig, channel, list)
+}
+
+#[test]
+fn switch_2_fetches_an_entry_on_gpu_written_pages_after_the_work_before_it() {
+    each_mode(|threading| {
+        let (rig, channel, list) = gpu_written_list(Console::Switch2, threading);
+        let events = rig.events();
+        let read = events
+            .iter()
+            .position(|e| {
+                *e == Event::Method {
+                    channel: channel.0,
+                    engine: EngineKind::Maxwell3d,
+                    method: 0x701,
+                    argument: 0x1234,
+                }
+            })
+            .unwrap_or_else(|| panic!("{threading:?}: the list is read with the released word"));
+        let flush = events
+            .iter()
+            .position(|e| *e == Event::FlushRegion(DEVICE_BASE + list.address(), 8))
+            .unwrap_or_else(|| panic!("{threading:?}: the list's words are flushed"));
+        assert!(flush < read, "{threading:?}");
+    });
+}
+
+#[test]
+fn switch_1_ignores_gpu_written_pages() {
+    each_mode(|threading| {
+        let (rig, channel, _) = gpu_written_list(Console::Switch1, threading);
+        assert_eq!(
+            rig.methods(),
+            [(channel.0, EngineKind::Maxwell3d, 0x701, 0xdead)],
+            "{threading:?}"
+        );
+    });
+}
+
 #[test]
 fn side_commands_wait_behind_a_sync_entry_queued_before_them() {
     each_mode(|threading| {

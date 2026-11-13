@@ -100,7 +100,7 @@ The plan is **dynasm-rs** (`dynasmrt::VecAssembler` for x64), emitting into a `V
 
 ## Accuracy settings
 
-`CpuAccuracy` only controls what is safe to relax. Under `Unsafe`, flags at block exits may be treated as dead and the bounds check is kept. Under `Paranoid` the JIT is off and every block is interpreted. `Accurate` and `Auto` are identical to the interpreter.
+`CpuConfig::accuracy` carries `Settings::cpu.accuracy` to each core. It only controls what is safe to relax. Under `Unsafe`, flags at block exits may be treated as dead and the bounds check is kept. Under `Paranoid` `Jit::new` returns `None`, so `new_core` builds the interpreter. `Accurate` and `Auto` are identical to the interpreter.
 
 ## Testing
 
@@ -122,4 +122,4 @@ The plan is **dynasm-rs** (`dynasmrt::VecAssembler` for x64), emitting into a `V
 
 - **`ExclusiveMonitor` inline reservations** (lichii-memory): expose each core's reservation as a `#[repr(C)]` `{ addr, value: u128, size }` slot that only its own core writes, so `LDXR`/`STXR` become inline loads and `lock cmpxchg` instead of helper calls. Today `clear(core)` is the only cross-thread operation, and it already runs on the owning core's thread during a context switch.
 - **`GuestClock` fast path** (lichii-cpu contract): `fn host_tsc_scale(&self) -> Option<TscScale>` with `(mul, shift, offset)`, so `MRS CNTPCT_EL0` becomes `rdtsc` plus a multiply-shift inline, instead of a dynamic call per read (notes rows 111 and 127). Returns `None` when the TSC is not invariant.
-- **`new_core` settings**: `new_core(backend, config)` has no access to `CpuSettings::accuracy` or `fastmem`. Proposal: add `accuracy: CpuAccuracy` to `CpuConfig`. Fastmem is already implied by whether the `AddressSpace` has an arena.
+- **`new_core` settings** (done): `CpuConfig::accuracy: CpuAccuracy`. Fastmem is already implied by whether the `AddressSpace` has an arena.
