@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use lichii_common::paths::UserPaths;
 use lichii_common::perf::PerfStats;
 use lichii_common::settings::{FullscreenMode, HotkeyAction, Settings, Theme};
+use lichii_core::{ExitReason, Host};
 use lichii_input::{Key, KeyChord, KeySet, MouseButton};
 use lichii_vulkan::present::{UiFrame, Viewport};
 use winit::application::ApplicationHandler;
@@ -228,6 +229,9 @@ impl App {
     fn apply_settings(&mut self, settings: Settings) {
         let dirs_changed = settings.paths.game_dirs != self.settings.paths.game_dirs;
         self.settings = settings;
+        if let Some(session) = &self.session {
+            session.set_audio_volume(&self.settings.audio);
+        }
         self.reconfigure_input();
         if let Some(display) = &mut self.display {
             display.set_settings(&self.settings.graphics);
@@ -280,7 +284,16 @@ impl App {
 
     fn boot(&mut self, path: PathBuf) {
         self.session = None;
-        match Session::boot(&path) {
+        let settings = Arc::new(self.settings.clone());
+        let host = |title| Host {
+            renderer: match &self.display {
+                Some(display) => display.renderer(title, &self.settings.graphics),
+                None => lichii_core::headless_renderer(),
+            },
+            npad: self.input.hub().clone(),
+            perf: self.perf.clone(),
+        };
+        match Session::boot(&path, settings, host) {
             Ok(session) => {
                 self.session = Some(session);
                 self.settings.ui.push_recent(path);
@@ -290,6 +303,22 @@ impl App {
         }
         self.input.send(InputMsg::ReleaseAll);
         self.update_title();
+    }
+
+    /// Ends the session once its title has exited, saying why when it crashed.
+    fn check_exit(&mut self) {
+        let Some(reason) = self.session.as_ref().and_then(Session::exit_reason) else {
+            return;
+        };
+        match reason {
+            ExitReason::Exited => self.toast("The title exited"),
+            ExitReason::Break { reason } => {
+                self.ui.error = Some(format!(
+                    "The title stopped with a break (reason {reason:#x})"
+                ))
+            }
+        }
+        self.stop();
     }
 
     fn stop(&mut self) {
@@ -496,6 +525,7 @@ impl App {
             return;
         };
         self.games.poll();
+        self.check_exit();
         let raw = egui_state.take_egui_input(&window);
         let ctx = self.egui_ctx.clone();
         let mut actions = Vec::new();

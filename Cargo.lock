@@ -1473,6 +1473,8 @@ dependencies = [
  "lichii-common",
  "lichii-core",
  "lichii-input",
+ "lichii-loader",
+ "lichii-texture",
  "lichii-vulkan",
  "rfd",
  "tracing",

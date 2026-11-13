@@ -69,6 +69,27 @@ pub fn headless_renderer() -> RendererFactory {
     Box::new(|handles| Box::new(NullRasterizer::new(handles)))
 }
 
+/// What the application running a session provides: the renderer, and the state it shares with
+/// the guest.
+pub struct Host {
+    pub renderer: RendererFactory,
+    /// Controller state the frontend's input thread publishes; hid reads it.
+    pub npad: Arc<NpadHub>,
+    /// Counters the frontend's overlay shows; the presenter and the services record into it.
+    pub perf: Arc<PerfStats>,
+}
+
+impl Host {
+    /// A host without a window: [`headless_renderer`], no controller input, fresh counters.
+    pub fn headless() -> Self {
+        Self {
+            renderer: headless_renderer(),
+            npad: Arc::new(NpadHub::default()),
+            perf: Arc::new(PerfStats::default()),
+        }
+    }
+}
+
 /// One emulation session: a booted title and every subsystem it runs on.
 pub struct System {
     settings: Arc<Settings>,
@@ -87,22 +108,23 @@ pub struct System {
 
 impl System {
     /// Loads the title at `path` and boots it up to the point where [`System::run`] starts it.
-    pub fn boot(
-        settings: Arc<Settings>,
-        path: &Path,
-        renderer: RendererFactory,
-    ) -> Result<Self, SystemError> {
+    pub fn boot(settings: Arc<Settings>, path: &Path, host: Host) -> Result<Self, SystemError> {
         tracing::info!(path = %path.display(), "loading title");
         let image = lichii_loader::load(path, &LoadOptions::default())?;
-        Self::from_image(settings, image, renderer)
+        Self::from_image(settings, image, host)
     }
 
     /// Boots an already loaded title.
     pub fn from_image(
         settings: Arc<Settings>,
         image: ProgramImage,
-        renderer: RendererFactory,
+        host: Host,
     ) -> Result<Self, SystemError> {
+        let Host {
+            renderer,
+            npad,
+            perf,
+        } = host;
         let program = Arc::new(image);
         let console = match program.generation {
             ConsoleGeneration::Switch2 => ConsoleGeneration::Switch2,
@@ -146,8 +168,6 @@ impl System {
         );
 
         let gpu = Self::start_gpu(&kernel, &program, &timing, renderer);
-        let npad = Arc::new(NpadHub::default());
-        let perf = Arc::new(PerfStats::default());
         let audio = Arc::new(Sink::new(&settings.audio));
         let services = ServiceContext::new(ServiceParts {
             kernel: kernel.clone(),

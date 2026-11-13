@@ -3,9 +3,13 @@
 
 use std::sync::Arc;
 
+use lichii_common::ConsoleGeneration;
 use lichii_common::perf::PerfStats;
 use lichii_common::settings::GraphicsSettings;
+use lichii_core::RendererFactory;
+use lichii_texture::block_linear::GobLayout;
 use lichii_vulkan::present::{FrameMailbox, Presenter, UiFrame, Viewport};
+use lichii_vulkan::rasterizer::VulkanRasterizer;
 use lichii_vulkan::swapchain::{Surface, Swapchain};
 use lichii_vulkan::{Device, Instance, SurfaceSupport};
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -15,6 +19,7 @@ use winit::window::Window;
 pub struct Display {
     presenter: Presenter,
     device: Arc<Device>,
+    mailbox: Arc<FrameMailbox>,
     window: Arc<Window>,
 }
 
@@ -56,12 +61,42 @@ impl Display {
             settings.present_mode
         );
         let mailbox = Arc::new(FrameMailbox::default());
-        let presenter = Presenter::new(&device, swapchain, settings, mailbox, perf)
+        let presenter = Presenter::new(&device, swapchain, settings, mailbox.clone(), perf)
             .map_err(|e| format!("creating the presenter: {e}"))?;
         Ok(Self {
             presenter,
             device,
+            mailbox,
             window,
+        })
+    }
+
+    /// A Vulkan renderer for a title of generation `title` on this display's device, drawing
+    /// guest frames into the presenter's mailbox. If the renderer cannot be created the title
+    /// runs on the headless renderer and shows nothing.
+    pub fn renderer(
+        &self,
+        title: ConsoleGeneration,
+        settings: &GraphicsSettings,
+    ) -> RendererFactory {
+        let device = self.device.clone();
+        let mailbox = self.mailbox.clone();
+        let settings = settings.clone();
+        let gob_layout = match title {
+            ConsoleGeneration::Switch1 => GobLayout::Tegra,
+            ConsoleGeneration::Switch2 => GobLayout::Switch2,
+        };
+        Box::new(move |handles| {
+            match VulkanRasterizer::new(&device, handles.clone(), mailbox, gob_layout) {
+                Ok(mut rasterizer) => {
+                    rasterizer.apply_settings(&settings);
+                    Box::new(rasterizer)
+                }
+                Err(e) => {
+                    tracing::error!("creating the Vulkan renderer, drawing nothing: {e}");
+                    lichii_core::headless_renderer()(handles)
+                }
+            }
         })
     }
 
