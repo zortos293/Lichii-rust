@@ -2062,7 +2062,7 @@ fn handle_programs_naming_an_image_of_another_kind_bind_the_null_texture() {
 }
 
 #[test]
-fn null_views_exist_for_every_view_type_and_null_format() {
+fn null_images_exist_for_every_view_type_and_null_format() {
     let Some((mut f, _)) = draw_fixture() else {
         return;
     };
@@ -2086,21 +2086,12 @@ fn null_views_exist_for_every_view_type_and_null_format() {
             if depth_3d {
                 continue;
             }
-            let view = f.rasterizer.null_view(view_type, format, false).unwrap();
+            let view = f.rasterizer.null_view(view_type, format).unwrap();
             assert!(view.is_some(), "{view_type:?} {format:?}");
             assert_eq!(
-                f.rasterizer.null_view(view_type, format, false).unwrap(),
+                f.rasterizer.null_view(view_type, format).unwrap(),
                 view,
                 "created once"
-            );
-        }
-        for format in [vk::Format::R32_UINT, vk::Format::R32_SFLOAT] {
-            assert!(
-                f.rasterizer
-                    .null_view(view_type, format, true)
-                    .unwrap()
-                    .is_some(),
-                "storage {view_type:?} {format:?}"
             );
         }
     }
@@ -2248,15 +2239,17 @@ fn handle_programs_load_zeros_for_integer_images_under_typeless_loads() {
 
     handle_table(&mut f, 1);
     draw(&mut f, &gmmu, &regs);
-    assert!(
-        target(&mut f).iter().all(|&t| t == [0, 0, 0, 255]),
-        "an integer image under the float declaration reads the null storage image: {:?}",
-        &target(&mut f)[..2]
-    );
-    assert_eq!(
-        f.rasterizer.draw.warned & Warning::NullStorageImage as u32,
-        0
-    );
+    let warned = f.rasterizer.draw.warned & Warning::NullStorageImage as u32 != 0;
+    if f.rasterizer.device.features.null_descriptor {
+        assert!(
+            target(&mut f).iter().all(|t| t[..3] == [0; 3]),
+            "an integer image under the float declaration loads from a null descriptor: {:?}",
+            &target(&mut f)[..2]
+        );
+        assert!(!warned);
+    } else {
+        assert!(warned, "without null descriptors the draw is skipped");
+    }
     assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
     f.assert_no_validation_errors();
 }

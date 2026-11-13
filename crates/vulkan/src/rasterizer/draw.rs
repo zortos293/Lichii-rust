@@ -1153,10 +1153,11 @@ impl VulkanRasterizer {
                                         (false, false) => vk::Format::R8G8B8A8_UNORM,
                                     };
                                     let null = match desc.is_multisample {
-                                        true => None,
-                                        false => {
-                                            self.null_view(view_type(desc.ty), format, false)?
+                                        _ if self.device.features.null_descriptor => {
+                                            Some(vk::ImageView::null())
                                         }
+                                        true => None,
+                                        false => self.null_view(view_type(desc.ty), format)?,
                                     };
                                     let Some(view) = null else {
                                         self.draw.warn_once(
@@ -1245,24 +1246,17 @@ impl VulkanRasterizer {
                                 self.storage_view(src, raw, &desc)?
                             };
                             let Some((id, view)) = found else {
-                                let format = match storage_format(desc.format) {
-                                    Some(format) => self.texture_cache.host(format).format,
-                                    None if desc.is_integer => vk::Format::R32_UINT,
-                                    None => vk::Format::R32_SFLOAT,
-                                };
-                                let Some(view) =
-                                    self.null_view(view_type(desc.ty), format, true)?
-                                else {
+                                if !self.device.features.null_descriptor {
                                     self.draw.warn_once(
                                         Warning::NullStorageImage,
-                                        "a draw binds an unbound storage image of a format the device cannot store; skipping it",
+                                        "a draw binds an unbound storage image without null descriptors; skipping it",
                                     );
                                     return Ok(false);
-                                };
+                                }
                                 self.draw.image_infos.push(vk::DescriptorImageInfo {
                                     sampler: vk::Sampler::null(),
-                                    image_view: view,
-                                    image_layout: null::NULL_LAYOUT,
+                                    image_view: vk::ImageView::null(),
+                                    image_layout: vk::ImageLayout::GENERAL,
                                 });
                                 continue;
                             };
@@ -1445,22 +1439,17 @@ impl VulkanRasterizer {
             .map(|raw| (id, raw)))
     }
 
-    /// A view of `view_type` and `format` reading zeros, for an unbound texture or (with
-    /// `storage`) storage image; `None` when the device cannot sample or store the format.
+    /// A view of `view_type` and `format` reading zeros, for an unbound texture on a device
+    /// without null descriptors; `None` when the device cannot sample the format.
     fn null_view(
         &mut self,
         view_type: vk::ImageViewType,
         format: vk::Format,
-        storage: bool,
     ) -> Result<Option<vk::ImageView>> {
         let scheduler = &mut self.scheduler;
-        self.draw.null_images.view(
-            &self.device,
-            || scheduler.record(),
-            view_type,
-            format,
-            storage,
-        )
+        self.draw
+            .null_images
+            .view(&self.device, || scheduler.record(), view_type, format)
     }
 
     fn push_buffer(&mut self, binding: Option<crate::buffer_cache::BufferBinding>) {

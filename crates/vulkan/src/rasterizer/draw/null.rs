@@ -1,5 +1,6 @@
-//! Zeroed images standing in for unbound textures and storage images, so a draw that names
-//! one still runs and reads zeros, as unbound Switch textures do.
+//! Zeroed images standing in for unbound textures on devices without null descriptors
+//! (VK_EXT_robustness2 `nullDescriptor`), so a draw that samples one still runs and reads
+//! zeros, as unbound Switch textures do.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -13,15 +14,11 @@ use crate::error::Result;
 use crate::memory::{Image, ImageDesc, ImageView, aspect_of};
 use crate::pipeline::FxBuildHasher;
 
-/// Null images stay in the general layout, readable by samplers and storage access.
+/// Null images stay readable by samplers from their first clear on.
 const NULL_ACCESS: ImageAccess = ImageAccess {
-    layout: vk::ImageLayout::GENERAL,
+    layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
     stage: vk::PipelineStageFlags2::ALL_COMMANDS,
-    access: vk::AccessFlags2::from_raw(
-        vk::AccessFlags2::SHADER_SAMPLED_READ.as_raw()
-            | vk::AccessFlags2::SHADER_STORAGE_READ.as_raw()
-            | vk::AccessFlags2::SHADER_STORAGE_WRITE.as_raw(),
-    ),
+    access: vk::AccessFlags2::SHADER_SAMPLED_READ,
 };
 
 /// The layout descriptors of null views name.
@@ -30,7 +27,6 @@ pub(super) const NULL_LAYOUT: vk::ImageLayout = NULL_ACCESS.layout;
 struct NullImage {
     _image: Image,
     view: ImageView,
-    storage: bool,
 }
 
 /// One 1x1 (six layers for cube views) zeroed image and view per view type and format, created
@@ -41,25 +37,20 @@ pub(super) struct NullImages {
 }
 
 impl NullImages {
-    /// A view of `view_type` and `format` reading zeros, in [`NULL_LAYOUT`]; with `storage`,
-    /// also bindable as a storage image. Records the first clear into `cmd`, outside rendering.
-    /// `None` when the device cannot sample (or store to) the format.
+    /// A view of `view_type` and `format` reading zeros, in [`NULL_LAYOUT`]. Records the first
+    /// clear into `cmd`, outside rendering. `None` when the device cannot sample the format.
     pub(super) fn view(
         &mut self,
         device: &Arc<Device>,
         cmd: impl FnOnce() -> Result<vk::CommandBuffer>,
         view_type: vk::ImageViewType,
         format: vk::Format,
-        storage: bool,
     ) -> Result<Option<vk::ImageView>> {
         let image = match self.images.entry((view_type, format)) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => entry.insert(create(device, cmd, view_type, format)?),
         };
-        Ok(image
-            .as_ref()
-            .filter(|image| image.storage || !storage)
-            .map(|image| image.view.raw()))
+        Ok(image.as_ref().map(|image| image.view.raw()))
     }
 }
 
@@ -69,15 +60,13 @@ fn create(
     view_type: vk::ImageViewType,
     format: vk::Format,
 ) -> Result<Option<NullImage>> {
-    let features = device.format_features(format);
-    if !features.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE) {
+    if !device
+        .format_features(format)
+        .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE)
+    {
         return Ok(None);
     }
-    let storage = features.contains(vk::FormatFeatureFlags::STORAGE_IMAGE);
-    let mut usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST;
-    if storage {
-        usage |= vk::ImageUsageFlags::STORAGE;
-    }
+    let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST;
     let mut desc = ImageDesc::d2(format, 1, 1, usage);
     match view_type {
         vk::ImageViewType::TYPE_1D | vk::ImageViewType::TYPE_1D_ARRAY => {
@@ -134,6 +123,5 @@ fn create(
     Ok(Some(NullImage {
         _image: image,
         view,
-        storage,
     }))
 }
