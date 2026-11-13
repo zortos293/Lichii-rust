@@ -9,8 +9,8 @@ use lichii_texture::block_linear::GobLayout;
 use super::EngineContext;
 use super::kepler_compute::pcas::QmdScheduler;
 use crate::backend::{
-    ChannelId, ComputeContext, DrawParams, FenceAction, FramebufferConfig, GraphicsContext,
-    IndirectDraw, Query, Rasterizer,
+    ChannelId, ComputeContext, DrawParams, FenceAction, FramebufferConfig, GpuWrittenPages,
+    GraphicsContext, IndirectDraw, Query, Rasterizer,
 };
 use crate::gmmu::{BigPageSize, Gmmu};
 use crate::host1x::Syncpoints;
@@ -59,6 +59,7 @@ pub struct Harness {
     pub syncpoints: Syncpoints,
     pub gob_layout: GobLayout,
     pub qmd_scheduler: QmdScheduler,
+    pub written_pages: GpuWrittenPages,
 }
 
 impl Harness {
@@ -78,6 +79,7 @@ impl Harness {
             syncpoints: Syncpoints::new(),
             gob_layout: GobLayout::Tegra,
             qmd_scheduler: QmdScheduler::new(),
+            written_pages: GpuWrittenPages::new(36),
         }
     }
 
@@ -89,6 +91,7 @@ impl Harness {
             syncpoints: &self.syncpoints,
             gob_layout: self.gob_layout,
             qmd_scheduler: &mut self.qmd_scheduler,
+            written_pages: &self.written_pages,
         }
     }
 }

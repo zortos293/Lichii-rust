@@ -653,6 +653,7 @@ mod tests {
             syncpoints: &h.syncpoints,
             gob_layout: h.gob_layout,
             qmd_scheduler: &mut h.qmd_scheduler,
+            written_pages: &h.written_pages,
         };
         write(
             &mut engine,
@@ -700,6 +701,7 @@ mod tests {
             syncpoints: &h.syncpoints,
             gob_layout: h.gob_layout,
             qmd_scheduler: &mut h.qmd_scheduler,
+            written_pages: &h.written_pages,
         };
         run(&mut engine, &mut ctx, &setup);
         assert_eq!(accelerator.blits.len(), 1);
@@ -731,6 +733,7 @@ mod tests {
             syncpoints: &h.syncpoints,
             gob_layout: h.gob_layout,
             qmd_scheduler: &mut h.qmd_scheduler,
+            written_pages: &h.written_pages,
         };
         run(&mut engine, &mut ctx, &setup);
         assert_eq!(accelerator.blits[0].src_x0, 3 << 32);
@@ -761,6 +764,7 @@ mod tests {
             syncpoints: &h.syncpoints,
             gob_layout: h.gob_layout,
             qmd_scheduler: &mut h.qmd_scheduler,
+            written_pages: &h.written_pages,
         };
         run(&mut engine, &mut ctx, &setup);
         assert_eq!(accelerator.blits[0].src_x0, (3 << 32) | 0x8000_0000);

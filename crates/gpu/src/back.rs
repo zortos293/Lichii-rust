@@ -9,7 +9,7 @@ use lichii_common::DAddr;
 use lichii_texture::block_linear::GobLayout;
 
 use crate::backend::{
-    ChannelId, FenceAction, FramebufferConfig, GpuHandles, Rasterizer, ReleaseSize,
+    ChannelId, FenceAction, FramebufferConfig, GpuHandles, GpuWrittenPages, Rasterizer, ReleaseSize,
 };
 use crate::clock::GpuTimestamp;
 use crate::engines::kepler_compute::pcas::QmdScheduler;
@@ -66,6 +66,7 @@ pub(crate) struct Back {
     words: Vec<u32>,
     qmd_scheduler: QmdScheduler,
     fetch_syncs: Arc<FetchSyncs>,
+    written_pages: Arc<GpuWrittenPages>,
 }
 
 impl Back {
@@ -88,6 +89,7 @@ impl Back {
             words: Vec::with_capacity(MULTI_MAX_WORDS + 1),
             qmd_scheduler: QmdScheduler::new(),
             fetch_syncs,
+            written_pages: handles.written_pages.clone(),
         }
     }
 
@@ -128,7 +130,7 @@ impl Back {
         let method = (header >> 16) as u32 & 0xffff;
         let argument = (header >> 32) as u32;
         let record = header as u8;
-        if record == tag::METHOD || record == tag::MULTI {
+        if matches!(record, tag::METHOD | tag::MULTI | tag::UPLOAD_SOURCE) {
             let target = self.current.map(|index| (index, engine));
             if self.last != target {
                 self.flush_engine();
@@ -158,6 +160,11 @@ impl Back {
                 self.with_engine(engine, |engine, ctx| engine.call_multi(ctx, method, &words));
                 self.words = words;
                 1 + slots
+            }
+            tag::UPLOAD_SOURCE => {
+                let address = consumer.slot(1);
+                self.with_engine(engine, |engine, _| engine.upload_source(address));
+                2
             }
             tag::CHANNEL => {
                 let index = argument as usize;
@@ -273,6 +280,7 @@ impl Back {
             syncpoints: &self.syncpoints,
             gob_layout: channel.setup.gob_layout,
             qmd_scheduler: &mut self.qmd_scheduler,
+            written_pages: &self.written_pages,
         };
         call(instance, &mut ctx);
     }
