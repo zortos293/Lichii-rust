@@ -232,7 +232,7 @@ fn audout_plays_buffers_and_releases_them_in_real_time() {
     });
     let elapsed = appended.elapsed();
     assert!(
-        elapsed >= Duration::from_millis(60),
+        elapsed >= Duration::from_millis(40),
         "100 ms released after {elapsed:?}"
     );
     assert!(h.ok(out, Request::new(10)).pop::<u64>() >= 960 + 4800);

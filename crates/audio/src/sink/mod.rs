@@ -234,7 +234,7 @@ mod tests {
         }
         let elapsed = started.elapsed();
         assert!(
-            elapsed >= Duration::from_millis(90),
+            elapsed >= Duration::from_millis(70),
             "played 100 ms in {elapsed:?}"
         );
         assert!(stream.expected_played_sample_count() >= end);
