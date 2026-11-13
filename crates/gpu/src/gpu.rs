@@ -384,12 +384,14 @@ impl Gpu {
             syncpoints: host1x.syncpoints.clone(),
             timestamp: Arc::new(GpuTimestamp::new(time, config.console == Console::Switch2)),
             written_pages: host1x.written_pages.clone(),
+            lazy: host1x.lazy.clone(),
         };
         let nx2_memory = (config.console == Console::Switch2).then(|| {
             Nx2GpuMemory::new(
                 host1x.memory.clone(),
                 host1x.allocator.clone(),
                 host1x.syncpoints.semaphore_mirror().clone(),
+                host1x.lazy.clone(),
             )
         });
         let rasterizer = renderer(handles.clone());

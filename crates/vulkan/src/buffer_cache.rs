@@ -22,6 +22,7 @@ use lichii_gpu::backend::{DrawParams, GpuWrittenPages, InlineIndices};
 use lichii_gpu::engines::maxwell_3d::Regs;
 use lichii_gpu::engines::maxwell_3d::regs::{IndexFormat, PrimitiveTopology};
 use lichii_gpu::gmmu::{Gmmu, GpuRange, RangeTarget};
+use lichii_gpu::lazy::LazyDeviceRanges;
 use lichii_memory::DeviceAddressSpace;
 
 use crate::commands::transfer_to_all_barrier;
@@ -620,6 +621,8 @@ pub struct BufferCache {
     /// Device pages GPU work wrote, marked with every range [`BufferCache::mark_gpu_written`]
     /// records.
     written_pages: Arc<GpuWrittenPages>,
+    /// Device ranges that get memory as they are written: downloads go through them.
+    lazy: Arc<LazyDeviceRanges>,
     limit: DAddr,
     /// Buffer slot + 1 for each 64 KiB caching page, 0 where no buffer covers it.
     page_table: Vec<u32>,
@@ -646,12 +649,14 @@ impl BufferCache {
         device: &Arc<Device>,
         memory: Arc<DeviceAddressSpace>,
         written_pages: Arc<GpuWrittenPages>,
+        lazy: Arc<LazyDeviceRanges>,
     ) -> Result<Self> {
         let limit = 1u64 << memory.address_space_bits();
         Ok(Self {
             device: device.clone(),
             memory,
             written_pages,
+            lazy,
             limit,
             page_table: vec![0; (limit >> CACHING_PAGE_BITS) as usize],
             buffers: Vec::new(),
@@ -793,7 +798,7 @@ impl BufferCache {
         let mut offset = 0;
         for &(_, _, daddr, len) in &self.downloads {
             let bytes = &data[offset as usize..(offset + len) as usize];
-            if let Err(fault) = self.memory.write_bytes(daddr, bytes) {
+            if let Err(fault) = self.lazy.write(daddr, bytes) {
                 tracing::warn!(
                     ?fault,
                     daddr,
@@ -1556,8 +1561,13 @@ mod tests {
         Some(Fixture {
             scheduler: Scheduler::new(&device).unwrap(),
             staging: StagingRing::new(&device, 8 << 20).unwrap(),
-            cache: BufferCache::new(&device, memory.clone(), Arc::new(GpuWrittenPages::new(36)))
-                .unwrap(),
+            cache: BufferCache::new(
+                &device,
+                memory.clone(),
+                Arc::new(GpuWrittenPages::new(36)),
+                Arc::new(LazyDeviceRanges::new(memory.clone())),
+            )
+            .unwrap(),
             gmmu: Gmmu::new(memory.clone(), BigPageSize::Size64K),
             device,
             memory,

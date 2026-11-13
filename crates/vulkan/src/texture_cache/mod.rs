@@ -37,6 +37,7 @@ use lichii_common::settings::{AstcRecompression, ResolutionScale, VramUsage};
 use lichii_common::{DAddr, GpuVAddr};
 use lichii_gpu::backend::{FramebufferConfig, GpuWrittenPages};
 use lichii_gpu::gmmu::{Gmmu, RangeTarget};
+use lichii_gpu::lazy::LazyDeviceRanges;
 use lichii_memory::DeviceAddressSpace;
 use lichii_texture::PixelFormat;
 use lichii_texture::block_linear::{GobLayout, swizzle, unswizzle};
@@ -394,6 +395,8 @@ pub struct TextureCache {
     device: Arc<Device>,
     /// Device pages GPU work wrote, marked with every segment of an image the GPU modifies.
     written_pages: Arc<GpuWrittenPages>,
+    /// Device ranges that get memory as they are written: flushes go through them.
+    lazy: Arc<LazyDeviceRanges>,
     gob_layout: GobLayout,
     recompression: AstcRecompression,
     scale: ResolutionScale,
@@ -452,8 +455,15 @@ fn components(swizzle: [SwizzleSource; 4], host: vk::ComponentMapping) -> vk::Co
     }
 }
 
-/// Reads guest bytes `[offset, offset + out.len())` of an image; unmapped gaps read zero.
-fn read_guest(memory: &DeviceAddressSpace, segments: &[Segment], offset: u64, out: &mut [u8]) {
+/// Reads guest bytes `[offset, offset + out.len())` of an image; unmapped gaps read zero, and
+/// are only reported outside lazy device ranges, whose pages without memory are zero.
+fn read_guest(
+    memory: &DeviceAddressSpace,
+    lazy: &LazyDeviceRanges,
+    segments: &[Segment],
+    offset: u64,
+    out: &mut [u8],
+) {
     out.fill(0);
     let end = offset + out.len() as u64;
     for s in segments {
@@ -462,16 +472,19 @@ fn read_guest(memory: &DeviceAddressSpace, segments: &[Segment], offset: u64, ou
             continue;
         }
         let chunk = &mut out[(start - offset) as usize..(stop - offset) as usize];
-        if let Err(fault) = memory.read_bytes(s.daddr + (start - s.offset), chunk) {
+        let daddr = s.daddr + (start - s.offset);
+        if let Err(fault) = memory.read_bytes(daddr, chunk)
+            && !lazy.is_lazy(daddr, chunk.len() as u64)
+        {
             tracing::warn!(?fault, "texture reads unmapped device memory");
         }
     }
 }
 
 /// Writes guest bytes of an image, except those at device addresses in `keep`; bytes over
-/// unmapped gaps are dropped.
+/// unmapped gaps are dropped, and blocks of lazy device ranges get memory.
 fn write_guest(
-    memory: &DeviceAddressSpace,
+    lazy: &LazyDeviceRanges,
     segments: &[Segment],
     offset: u64,
     data: &[u8],
@@ -479,7 +492,7 @@ fn write_guest(
 ) {
     let end = offset + data.len() as u64;
     let write = |daddr: DAddr, chunk: &[u8]| {
-        if let Err(fault) = memory.write_bytes(daddr, chunk) {
+        if let Err(fault) = lazy.write(daddr, chunk) {
             tracing::warn!(?fault, "texture flush to unmapped device memory");
         }
     };
@@ -536,12 +549,14 @@ impl TextureCache {
     pub fn new(
         device: &Arc<Device>,
         written_pages: Arc<GpuWrittenPages>,
+        lazy: Arc<LazyDeviceRanges>,
         gob_layout: GobLayout,
         recompression: AstcRecompression,
     ) -> Self {
         Self {
             device: device.clone(),
             written_pages,
+            lazy,
             gob_layout,
             recompression,
             scale: ResolutionScale::X1,
@@ -1693,7 +1708,12 @@ impl TextureCache {
 
     fn upload(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
         let device = self.device.clone();
-        let Self { slots, scratch, .. } = self;
+        let Self {
+            slots,
+            scratch,
+            lazy,
+            ..
+        } = self;
         let image = slots[id.index as usize]
             .image
             .as_mut()
@@ -1730,7 +1750,13 @@ impl TextureCache {
                     GuestLayout::BlockLinear { .. } => {
                         let tiling = info.surface().level_tiling(level);
                         scratch.tiled.resize(tiling.size_bytes(), 0);
-                        read_guest(tx.memory, &image.segments, guest_offset, &mut scratch.tiled);
+                        read_guest(
+                            tx.memory,
+                            lazy,
+                            &image.segments,
+                            guest_offset,
+                            &mut scratch.tiled,
+                        );
                         if direct {
                             unswizzle(&tiling, &scratch.tiled, out);
                         } else {
@@ -1742,7 +1768,13 @@ impl TextureCache {
                         let rows = extent.1.div_ceil(format.block_height()) as usize;
                         let row = linear_len / rows.max(1);
                         scratch.tiled.resize(pitch as usize * rows, 0);
-                        read_guest(tx.memory, &image.segments, guest_offset, &mut scratch.tiled);
+                        read_guest(
+                            tx.memory,
+                            lazy,
+                            &image.segments,
+                            guest_offset,
+                            &mut scratch.tiled,
+                        );
                         scratch.linear.resize(linear_len, 0);
                         for (dst, src) in scratch
                             .linear
@@ -2000,7 +2032,12 @@ impl TextureCache {
         data: &[u8],
         keep: Option<(DAddr, DAddr)>,
     ) {
-        let Self { slots, scratch, .. } = self;
+        let Self {
+            slots,
+            scratch,
+            lazy,
+            ..
+        } = self;
         let image = slots[id.index as usize]
             .image
             .as_mut()
@@ -2032,16 +2069,22 @@ impl TextureCache {
                     GuestLayout::BlockLinear { .. } => {
                         let tiling = info.surface().level_tiling(level);
                         scratch.tiled.resize(tiling.size_bytes(), 0);
-                        read_guest(memory, &image.segments, guest_offset, &mut scratch.tiled);
+                        read_guest(
+                            memory,
+                            lazy,
+                            &image.segments,
+                            guest_offset,
+                            &mut scratch.tiled,
+                        );
                         swizzle(&tiling, &scratch.linear, &mut scratch.tiled);
-                        write_guest(memory, &image.segments, guest_offset, &scratch.tiled, keep);
+                        write_guest(lazy, &image.segments, guest_offset, &scratch.tiled, keep);
                     }
                     GuestLayout::Pitch { pitch } => {
                         let rows = extent.1.div_ceil(format.block_height()).max(1) as usize;
                         let row = scratch.linear.len() / rows;
                         for (y, line) in scratch.linear.chunks_exact(row).enumerate() {
                             write_guest(
-                                memory,
+                                lazy,
                                 &image.segments,
                                 guest_offset + y as u64 * u64::from(pitch),
                                 line,
