@@ -217,19 +217,32 @@ fn read_guest_depth(format: PixelFormat, texel: &[u8]) -> (f64, u8) {
 
 fn write_guest_depth(format: PixelFormat, depth: f64, stencil: u8, texel: &mut [u8]) {
     use PixelFormat::*;
-    let unorm24 = || (depth.clamp(0.0, 1.0) * 16_777_215.0).round() as u32;
+    let unorm = |max: f64| (depth.clamp(0.0, 1.0) * max).round() as u32;
+    let bits = match format {
+        D16Unorm => unorm(65535.0),
+        X8D24Unorm | D24UnormS8Uint | S8UintD24Unorm => unorm(16_777_215.0),
+        D32Float | D32FloatS8Uint => (depth as f32).to_bits(),
+        _ => 0,
+    };
+    write_guest_depth_bits(format, bits, stencil, texel);
+}
+
+/// Writes a depth/stencil texel from depth already in the guest format's encoding: unorm bits
+/// for D16 and D24, float bits for D32.
+fn write_guest_depth_bits(format: PixelFormat, depth: u32, stencil: u8, texel: &mut [u8]) {
+    use PixelFormat::*;
+    let depth24 = depth & 0xff_ffff;
     let word = match format {
         D16Unorm => {
-            let v = (depth.clamp(0.0, 1.0) * 65535.0).round() as u16;
-            texel.copy_from_slice(&v.to_le_bytes());
+            texel.copy_from_slice(&(depth as u16).to_le_bytes());
             return;
         }
-        X8D24Unorm => unorm24(),
-        D24UnormS8Uint => unorm24() | u32::from(stencil) << 24,
-        S8UintD24Unorm => unorm24() << 8 | u32::from(stencil),
-        D32Float => (depth as f32).to_bits(),
+        X8D24Unorm => depth24,
+        D24UnormS8Uint => depth24 | u32::from(stencil) << 24,
+        S8UintD24Unorm => depth24 << 8 | u32::from(stencil),
+        D32Float => depth,
         D32FloatS8Uint => {
-            texel[..4].copy_from_slice(&(depth as f32).to_bits().to_le_bytes());
+            texel[..4].copy_from_slice(&depth.to_le_bytes());
             texel[4..].copy_from_slice(&[stencil, 0, 0, 0]);
             return;
         }
@@ -240,6 +253,22 @@ fn write_guest_depth(format: PixelFormat, depth: f64, stencil: u8, texel: &mut [
         _ => return,
     };
     texel.copy_from_slice(&word.to_le_bytes());
+}
+
+/// Whether the host depth plane stores depth in the guest format's encoding, so a download
+/// copies its bits instead of converting through a float.
+fn same_depth_encoding(format: PixelFormat, host: vk::Format) -> bool {
+    use PixelFormat::*;
+    use vk::Format as F;
+    match format {
+        D16Unorm => matches!(host, F::D16_UNORM | F::D16_UNORM_S8_UINT),
+        X8D24Unorm | D24UnormS8Uint | S8UintD24Unorm => {
+            matches!(host, F::X8_D24_UNORM_PACK32 | F::D24_UNORM_S8_UINT)
+        }
+        D32Float | D32FloatS8Uint => matches!(host, F::D32_SFLOAT | F::D32_SFLOAT_S8_UINT),
+        S8Uint => host == F::S8_UINT,
+        _ => false,
+    }
 }
 
 fn write_host_depth(host: vk::Format, depth: f64, out: &mut [u8]) {
@@ -375,6 +404,18 @@ pub(super) fn to_guest(
     if let Some((depth_bytes, stencil)) = depth_planes(host.format) {
         let guest_bytes = format.bytes_per_block() as usize;
         let (depth_in, stencil_in) = host_bytes.split_at(texels * depth_bytes);
+        if same_depth_encoding(format, host.format) {
+            for (i, texel) in guest.chunks_exact_mut(guest_bytes).take(texels).enumerate() {
+                let depth = match depth_bytes {
+                    2 => u32::from(u16::from_le_bytes([depth_in[2 * i], depth_in[2 * i + 1]])),
+                    4 => u32::from_le_bytes(depth_in[4 * i..4 * i + 4].try_into().unwrap()),
+                    _ => 0,
+                };
+                let s = if stencil { stencil_in[i] } else { 0 };
+                write_guest_depth_bits(format, depth, s, texel);
+            }
+            return Ok(());
+        }
         for (i, texel) in guest.chunks_exact_mut(guest_bytes).take(texels).enumerate() {
             let depth = if depth_bytes > 0 {
                 read_host_depth(
@@ -534,6 +575,59 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, [8, 16, 25, 255]);
+    }
+
+    #[test]
+    fn downloads_copy_depth_bits_the_host_stores_in_the_guest_encoding() {
+        let cases: [(PixelFormat, vk::Format, &[u8], &[u8]); 5] = [
+            (
+                PixelFormat::D32Float,
+                vk::Format::D32_SFLOAT,
+                &0.3f32.to_bits().to_le_bytes(),
+                &0.3f32.to_bits().to_le_bytes(),
+            ),
+            (
+                PixelFormat::D16Unorm,
+                vk::Format::D16_UNORM,
+                &[0x34, 0x12],
+                &[0x34, 0x12],
+            ),
+            (
+                PixelFormat::S8UintD24Unorm,
+                vk::Format::D24_UNORM_S8_UINT,
+                &[0x78, 0x56, 0x34, 0xee, 0x12],
+                &0x3456_7812u32.to_le_bytes(),
+            ),
+            (
+                PixelFormat::X8D24Unorm,
+                vk::Format::X8_D24_UNORM_PACK32,
+                &[0x78, 0x56, 0x34, 0xee],
+                &0x0034_5678u32.to_le_bytes(),
+            ),
+            (
+                PixelFormat::D32FloatS8Uint,
+                vk::Format::D32_SFLOAT_S8_UINT,
+                &[0, 0, 0x80, 0x3f, 9],
+                &[0, 0, 0x80, 0x3f, 9, 0, 0, 0],
+            ),
+        ];
+        for (format, host_format, planes, expected) in cases {
+            assert!(same_depth_encoding(format, host_format));
+            let mut out = vec![0; expected.len()];
+            to_guest(
+                format,
+                &host(host_format, Conversion::None),
+                (1, 1, 1),
+                planes,
+                &mut out,
+            )
+            .unwrap();
+            assert_eq!(out, expected, "{format:?} from {host_format:?}");
+        }
+        assert!(!same_depth_encoding(
+            PixelFormat::D24UnormS8Uint,
+            vk::Format::D32_SFLOAT_S8_UINT
+        ));
     }
 
     #[test]

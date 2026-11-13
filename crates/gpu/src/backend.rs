@@ -68,7 +68,9 @@ pub type RootTables = [[u32; 64]; 8];
 /// What the renderer sees of the 3D engine for a draw or a clear.
 pub struct GraphicsContext<'a> {
     pub channel: ChannelId,
-    pub memory: &'a Gmmu,
+    /// The channel's address space, shared so renderer workers can keep reading it (shader
+    /// translation off the back thread). Reads are lock-free while it is mapped and unmapped.
+    pub memory: &'a Arc<Gmmu>,
     pub regs: &'a Regs,
     /// Flags set by register writes since the renderer last cleared them.
     pub dirty: &'a mut DirtyState,
@@ -175,7 +177,9 @@ impl IndirectGrid {
 /// A compute dispatch, decoded from its launch descriptor (QMD).
 pub struct ComputeContext<'a> {
     pub channel: ChannelId,
-    pub memory: &'a Gmmu,
+    /// The channel's address space, shared so renderer workers can keep reading it (shader
+    /// translation off the back thread). Reads are lock-free while it is mapped and unmapped.
+    pub memory: &'a Arc<Gmmu>,
     /// GPU address of the program's first instruction.
     pub program: GpuVAddr,
     pub grid: [u32; 3],

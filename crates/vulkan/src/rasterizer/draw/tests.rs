@@ -161,7 +161,7 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
 }
 
 /// Memory for `draw_regs`: the vertices, both constant buffers and the vertex program.
-fn draw_fixture() -> Option<(Fixture, Gmmu)> {
+fn draw_fixture() -> Option<(Fixture, Arc<Gmmu>)> {
     let mut f = fixture(GobLayout::Tegra)?;
     f.rasterizer.draw.pipelines.set_async_compilation(false);
     let gmmu = gmmu(&f);
@@ -191,11 +191,11 @@ fn const_buffers() -> GraphicsConstBuffers {
     const_buffers
 }
 
-fn draw(f: &mut Fixture, gmmu: &Gmmu, regs: &Regs) {
+fn draw(f: &mut Fixture, gmmu: &Arc<Gmmu>, regs: &Regs) {
     draw_with(f, gmmu, regs, &const_buffers());
 }
 
-fn draw_with(f: &mut Fixture, gmmu: &Gmmu, regs: &Regs, const_buffers: &GraphicsConstBuffers) {
+fn draw_with(f: &mut Fixture, gmmu: &Arc<Gmmu>, regs: &Regs, const_buffers: &GraphicsConstBuffers) {
     let mut dirty = DirtyState::new();
     let root_tables = [[0; 64]; 8];
     let mut ctx = GraphicsContext {
@@ -948,7 +948,7 @@ fn source_texel(x: u32, y: u32) -> [u8; 4] {
     [(x * 16) as u8, (y * 16) as u8, (x + y * 8) as u8, 255]
 }
 
-fn draw_texture(f: &mut Fixture, gmmu: &Gmmu, regs: &Regs, draw: DrawTexture) {
+fn draw_texture(f: &mut Fixture, gmmu: &Arc<Gmmu>, regs: &Regs, draw: DrawTexture) {
     let mut dirty = DirtyState::new();
     let const_buffers = const_buffers();
     let root_tables = [[0; 64]; 8];
@@ -1117,7 +1117,7 @@ const BLUE: [u8; 4] = [0, 0, 255, 255];
 const READER: u32 = 0x400;
 
 /// `draw_fixture` at 2x resolution scale.
-fn rescaled_fixture() -> Option<(Fixture, Gmmu)> {
+fn rescaled_fixture() -> Option<(Fixture, Arc<Gmmu>)> {
     let (mut f, gmmu) = draw_fixture()?;
     f.rasterizer.apply_settings(&GraphicsSettings {
         resolution_scale: ResolutionScale::X2,
@@ -1147,7 +1147,7 @@ fn target_regs(offset: u64, (width, height): (u32, u32)) -> Box<Regs> {
 
 /// Renders `color` into guest texels [x0, x1) x [y0, y1) of the source target, under a
 /// scissor.
-fn paint(f: &mut Fixture, gmmu: &Gmmu, [x0, y0, x1, y1]: [u32; 4], color: [u8; 4]) {
+fn paint(f: &mut Fixture, gmmu: &Arc<Gmmu>, [x0, y0, x1, y1]: [u32; 4], color: [u8; 4]) {
     let mut regs = target_regs(TEXTURE, SOURCE);
     let scissor = &mut regs.scissor_test[0];
     scissor.enable = 1;
@@ -1165,7 +1165,7 @@ fn paint(f: &mut Fixture, gmmu: &Gmmu, [x0, y0, x1, y1]: [u32; 4], color: [u8; 4
 
 /// The source target painted green with its top-left quarter, [0, 32) x [0, 160), blue, bound
 /// as texture header 0.
-fn paint_source(f: &mut Fixture, gmmu: &Gmmu) {
+fn paint_source(f: &mut Fixture, gmmu: &Arc<Gmmu>) {
     paint(f, gmmu, [0, 0, SOURCE.0, SOURCE.1], GREEN);
     paint(f, gmmu, [0, 0, 32, 160], BLUE);
     let header = tic(GPU_VA + TEXTURE, SOURCE.0, SOURCE.1);
@@ -1204,7 +1204,7 @@ fn draws_survive_a_texture_lookup_replacing_their_render_target() {
 
 /// Draws the 16x16 target with `code` as the fragment program and the texture handle
 /// `handle` in c[0][0x40].
-fn read_with(f: &mut Fixture, gmmu: &Gmmu, regs: &mut Regs, code: &[u8], handle: u32) {
+fn read_with(f: &mut Fixture, gmmu: &Arc<Gmmu>, regs: &mut Regs, code: &[u8], handle: u32) {
     let at = PROGRAMS + u64::from(READER);
     write(f, at, code);
     f.rasterizer
@@ -1439,7 +1439,7 @@ fn draws_set_the_scaling_bit_of_each_rescaled_descriptor() {
 }
 
 /// Renders source texel (x, y) of [0, 4) x [0, 4) as `source_texel` into the green source.
-fn paint_texels(f: &mut Fixture, gmmu: &Gmmu) {
+fn paint_texels(f: &mut Fixture, gmmu: &Arc<Gmmu>) {
     paint(f, gmmu, [0, 0, SOURCE.0, SOURCE.1], GREEN);
     for y in 0..4 {
         for x in 0..4 {
@@ -2212,7 +2212,7 @@ fn storage_binding(f: &Fixture, cbuf: u64, buffer: u64) {
 
 fn launch(
     f: &mut Fixture,
-    gmmu: &Gmmu,
+    gmmu: &Arc<Gmmu>,
     program: u64,
     cbuf: u64,
     grid: [u32; 3],
@@ -2919,7 +2919,7 @@ fn cache_dir(name: &str) -> std::path::PathBuf {
 }
 
 /// `draw_fixture` with the disk cache in `dir` and the fragment program `fragment`.
-fn disk_fixture(dir: &std::path::Path, fragment: [u64; 2]) -> Option<(Fixture, Gmmu)> {
+fn disk_fixture(dir: &std::path::Path, fragment: [u64; 2]) -> Option<(Fixture, Arc<Gmmu>)> {
     let (mut f, gmmu) = draw_fixture()?;
     write(
         &f,
@@ -3151,7 +3151,7 @@ fn mesh_regs(mesh_slot: usize) -> Box<Regs> {
 
 /// A Switch 2 fixture with the mesh, task and fragment programs, or `None` (skipping) without
 /// a device or without mesh shaders.
-fn mesh_fixture() -> Option<(Fixture, Gmmu)> {
+fn mesh_fixture() -> Option<(Fixture, Arc<Gmmu>)> {
     let mut f = fixture(GobLayout::Switch2)?;
     if !f.rasterizer.device.features.mesh_shader {
         eprintln!("skipping: no VK_EXT_mesh_shader");
@@ -3165,7 +3165,7 @@ fn mesh_fixture() -> Option<(Fixture, Gmmu)> {
     Some((f, gmmu))
 }
 
-fn mesh_draw(f: &mut Fixture, gmmu: &Gmmu, regs: &Regs, groups: u32) {
+fn mesh_draw(f: &mut Fixture, gmmu: &Arc<Gmmu>, regs: &Regs, groups: u32) {
     let mut dirty = DirtyState::new();
     let const_buffers = const_buffers();
     let root_tables = [[0; 64]; 8];
@@ -3318,7 +3318,7 @@ fn per_primitive_fragment_inputs_draw() {
 /// with the draw count `count` when set, and returns whether the triangle covered the target.
 fn mesh_indirect_draw(
     f: &mut Fixture,
-    gmmu: &Gmmu,
+    gmmu: &Arc<Gmmu>,
     regs: &Regs,
     indexed: bool,
     stride: u32,
