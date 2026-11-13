@@ -11,7 +11,7 @@ use lichii_crypto::KeyError;
 use lichii_loader::LoadOptions;
 
 use crate::applets::{AppletDialogs, ControlsChange};
-use crate::game_list::GameKind;
+use crate::game_list::{GameKind, nacp_language};
 
 #[derive(Debug)]
 pub enum BootError {
@@ -115,10 +115,15 @@ impl Session {
         tracing::info!("booting {} ({})", path.display(), kind.label());
         let image = lichii_loader::load(path, &options).map_err(SystemError::from)?;
         let program_id = image.program_id;
+        if handover.is_some() && program_id & PROGRAM_INDEX_MASK != u64::from(options.program_index)
+        {
+            return Err(BootError::NoProgram(options.program_index));
+        }
+        let (settings, host) = configure(program_id, image.generation);
         let title = image
             .nacp
             .as_ref()
-            .and_then(|nacp| nacp.preferred_title(options.language))
+            .and_then(|nacp| nacp.preferred_title(nacp_language(settings.system.language)))
             .map(|entry| entry.name.clone())
             .filter(|name| !name.is_empty())
             .or_else(|| {
@@ -128,11 +133,6 @@ impl Session {
                     .filter(|name| !name.is_empty())
             })
             .unwrap_or_else(|| file_title(path, kind));
-        if handover.is_some() && program_id & PROGRAM_INDEX_MASK != u64::from(options.program_index)
-        {
-            return Err(BootError::NoProgram(options.program_index));
-        }
-        let (settings, host) = configure(program_id, image.generation);
         let mut system = System::from_image(settings, image, host)?;
         if let Some(applets) = &applets {
             system.services().set_applet_frontend(applets.frontend());
@@ -363,6 +363,7 @@ mod tests {
 
     #[test]
     fn a_loose_dump_is_named_by_its_nacp_else_its_game_folder() {
+        use lichii_common::settings::Language;
         use lichii_fs::nacp::NacpLanguage;
         use lichii_loader::testing::{AcidLayout, NpdmSpec, build_npdm, svc_mask, thread_info};
 
@@ -386,14 +387,16 @@ mod tests {
         )
         .unwrap();
         let boot = |language| {
-            let options = LoadOptions {
-                language,
-                ..LoadOptions::default()
-            };
-            Session::boot(&exefs, options, None, |_, _| (settings(), Host::headless())).unwrap()
+            Session::boot(&exefs, LoadOptions::default(), None, |_, _| {
+                let mut settings = Settings::default();
+                settings.system.language = language;
+                settings.audio.output = AudioOutput::Null;
+                (Arc::new(settings), Host::headless())
+            })
+            .unwrap()
         };
 
-        let session = boot(NacpLanguage::AmericanEnglish);
+        let session = boot(Language::AmericanEnglish);
         assert_eq!(
             session.title, "SyntheticTennis_v1.1.1",
             "not the storage folder"
@@ -413,13 +416,10 @@ mod tests {
             nacp[at..at + name.len()].copy_from_slice(name.as_bytes());
         }
         std::fs::write(game.join("base/control.nacp"), nacp).unwrap();
+        assert_eq!(boot(Language::AmericanEnglish).title, "Synthetic Tennis");
+        assert_eq!(boot(Language::Japanese).title, "Gousei Tenisu");
         assert_eq!(
-            boot(NacpLanguage::AmericanEnglish).title,
-            "Synthetic Tennis"
-        );
-        assert_eq!(boot(NacpLanguage::Japanese).title, "Gousei Tenisu");
-        assert_eq!(
-            boot(NacpLanguage::German).display_title(),
+            boot(Language::German).display_title(),
             "Synthetic Tennis [0400000000030000]",
             "a language without a name falls back to American English"
         );
