@@ -1555,7 +1555,10 @@ fn profile_counts_without_changing_results() {
         ctx.x[9] = 4;
         jit.clear_code_cache();
         let halt = jit.run(&mut ctx);
-        let table = jit.take_profile().map(|p| p.table(1, Duration::ZERO));
+        let table = jit
+            .state
+            .profile_counts()
+            .map(|p| p.table(1, Duration::ZERO));
         (halt, ctx, table)
     };
     let (halt, ctx, table) = run(true);

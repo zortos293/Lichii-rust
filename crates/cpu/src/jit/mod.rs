@@ -15,6 +15,7 @@ mod tests;
 mod translate;
 mod x64;
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
@@ -75,6 +76,14 @@ pub(super) struct JitState {
 unsafe impl Send for JitState {}
 
 impl JitState {
+    /// This core's counts since it last sent them, with the native stub's write-backs moved in.
+    fn profile_counts(&mut self) -> Option<&mut Profile> {
+        let native = std::mem::take(&mut self.materialized);
+        let p = self.profile.as_deref_mut()?;
+        p.materialized(native, 0);
+        Some(p)
+    }
+
     /// Packs NZCV a block left lazy into `ctx`, so the context is exact outside translated code.
     fn materialize_nzcv(&mut self, ctx: &mut ThreadContext) {
         let code = std::mem::take(&mut self.lazy_nzcv);
@@ -269,8 +278,10 @@ pub struct Jit {
     target: Target,
     arena: *mut u8,
     passes: Passes,
-    /// When this core last merged its profile into the process-wide total.
+    /// When this core last sent its profile towards the process-wide total.
     flushed: Instant,
+    /// Set while the profile this core sent last waits to be merged.
+    queued: Arc<AtomicBool>,
 }
 
 // SAFETY: `arena` is the base of the fastmem arena owned by `config.memory`, which is `Sync`; the
@@ -364,6 +375,7 @@ impl Jit {
             state,
             passes,
             flushed: Instant::now(),
+            queued: Arc::default(),
         })
     }
 
@@ -437,14 +449,6 @@ impl Jit {
         if let Some(p) = self.state.profile.as_deref_mut() {
             p.flush(flush);
         }
-    }
-
-    /// This core's counts since the last merge, with the native stub's write-backs moved in.
-    fn take_profile(&mut self) -> Option<Profile> {
-        let native = std::mem::take(&mut self.state.materialized);
-        let p = self.state.profile.as_deref_mut()?;
-        p.materialized(native, 0);
-        Some(std::mem::take(p))
     }
 
     fn apply(&mut self, exit: Exit) -> Option<HaltReason> {
@@ -536,7 +540,9 @@ impl CpuCore for Jit {
         let halt = self.dispatch(ctx);
         if self.state.profile.is_some() && self.flushed.elapsed() >= profile::FLUSH_INTERVAL {
             self.flushed = Instant::now();
-            profile::merge(self.take_profile().unwrap_or_default());
+            if let Some(p) = self.state.profile_counts() {
+                profile::send(&self.queued, p);
+            }
         }
         halt
     }
@@ -572,8 +578,8 @@ impl CpuCore for Jit {
 
 impl Drop for Jit {
     fn drop(&mut self) {
-        if let Some(p) = self.take_profile() {
-            profile::retire(p);
+        if let Some(p) = self.state.profile_counts() {
+            profile::retire(std::mem::take(p));
         }
     }
 }

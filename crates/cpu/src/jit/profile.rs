@@ -2,17 +2,18 @@
 //! for every core built afterwards. Unset, no counter exists and translated code is unchanged.
 //!
 //! Each core counts into its own [`Profile`] without locks. When `run` returns, at most every
-//! [`FLUSH_INTERVAL`], it sends the counts down a channel, which never blocks, and drains the
-//! channel into the process-wide total if that is not locked. The frame view's [`summary`] and
-//! dropping cores lock the total and drain it too. The last profiled core to drop logs the total
-//! as a table.
+//! [`FLUSH_INTERVAL`], it sends the counts down a channel unless its previous counts are still
+//! queued, so dispatch takes no lock and the channel holds at most one message per core. The frame
+//! view's [`summary`] and dropping cores lock the process-wide total and drain the channel into it.
+//! The last profiled core to drop logs the total as a table.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fmt::Write;
 use std::mem::{Discriminant, discriminant};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::decoder::Inst;
@@ -280,14 +281,17 @@ impl Profile {
     }
 }
 
+/// Counts a core sent, with the flag that stays set until they are merged into the total.
+type Queued = (Arc<AtomicBool>, Profile);
+
 /// Cores send their counts through `tx`; only the frame view and dropping cores lock `global`.
 struct Sink {
-    tx: Sender<Profile>,
+    tx: Sender<Queued>,
     global: Mutex<Global>,
 }
 
 struct Global {
-    rx: Receiver<Profile>,
+    rx: Receiver<Queued>,
     total: Profile,
     live: usize,
     cores: usize,
@@ -298,8 +302,9 @@ struct Global {
 
 impl Global {
     fn drain(&mut self) {
-        while let Ok(profile) = self.rx.try_recv() {
+        while let Ok((queued, profile)) = self.rx.try_recv() {
             self.total.merge(profile);
+            queued.store(false, Ordering::Release);
         }
     }
 }
@@ -316,13 +321,13 @@ pub(super) fn register() {
     g.started.get_or_insert_with(Instant::now);
 }
 
-/// Hands a running core's counts to the total without waiting for a lock: when the total is free,
-/// this core drains the channel into it, so the channel stays short with the frame view off.
-pub(super) fn merge(profile: Profile) {
-    let _ = SINK.tx.send(profile);
-    if let Ok(mut g) = SINK.global.try_lock() {
-        g.drain();
+/// Sends a running core's counts towards the total, unless the ones it sent last are still queued
+/// (`queued` is set); then they keep accumulating in `profile`. Takes no lock.
+pub(super) fn send(queued: &Arc<AtomicBool>, profile: &mut Profile) {
+    if queued.swap(true, Ordering::AcqRel) {
+        return;
     }
+    let _ = SINK.tx.send((queued.clone(), std::mem::take(profile)));
 }
 
 /// Merges a dropped core's last counts; the last live core logs the table and resets the total.
@@ -473,7 +478,28 @@ fn simd_name(word: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{compact, simd_name};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::{Exit, Profile, compact, global, send, simd_name};
+
+    #[test]
+    fn a_core_queues_at_most_one_message() {
+        let mut g = global();
+        let queued = Arc::new(AtomicBool::new(false));
+        let mut p = Profile::default();
+        p.exit(Exit::Fault);
+        send(&queued, &mut p);
+        assert!(queued.load(Ordering::Acquire));
+        assert_eq!(p.exits[Exit::Fault as usize], 0);
+        p.exit(Exit::Fault);
+        send(&queued, &mut p);
+        assert_eq!(p.exits[Exit::Fault as usize], 1);
+        let before = g.total.exits[Exit::Fault as usize];
+        g.drain();
+        assert!(!queued.load(Ordering::Acquire));
+        assert_eq!(g.total.exits[Exit::Fault as usize], before + 1);
+    }
 
     #[test]
     fn compact_numbers_fit_four_characters() {
