@@ -227,6 +227,21 @@ impl ShaderCache {
                 *bindings = variant.bindings;
                 return variant.module.clone();
             }
+            if let Some(variants) = self.modules.get(&key) {
+                static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 400 {
+                    let v = variants.last().expect("a variant");
+                    let miss = |reads: &[EnvRead], e: &ProgramEnv<'_>| {
+                        reads
+                            .iter()
+                            .find(|r| !e.replay(std::slice::from_ref(r)))
+                            .copied()
+                    };
+                    let a_miss = a.and_then(|a| miss(&v.reads[0], a));
+                    let miss = miss(&v.reads[1], env);
+                    tracing::info!(target: "diag", "DIAG variant miss code={:x?} variants={} reads={} a_miss={a_miss:?} miss={miss:?} now={:?}", key.code, variants.len(), v.reads[1].len(), miss.map(|r| match r { EnvRead::Cbuf { index, offset, .. } => env.cbuf_now(index, offset), _ => 0 }));
+                }
+            }
         }
 
         let first = *bindings;

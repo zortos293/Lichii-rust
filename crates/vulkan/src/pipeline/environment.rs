@@ -464,6 +464,10 @@ impl<'a> ProgramEnv<'a> {
         )
     }
 
+    pub fn cbuf_now(&self, index: u32, offset: u32) -> u32 {
+        self.cbuf_word(index, offset)
+    }
+
     fn cbuf_word(&self, index: u32, offset: u32) -> u32 {
         match self.const_buffers.get(index as usize) {
             Some(cbuf) if cbuf.enabled && offset < cbuf.size => {
