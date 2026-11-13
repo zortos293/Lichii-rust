@@ -70,8 +70,11 @@ pub enum FastmemError {
 /// `va` is mapped at `base + va` with host protection matching the guest permission, and
 /// unmapped pages are inaccessible. The JIT emits direct host loads and stores against it.
 pub struct Fastmem {
-    arena: Arena,
+    /// Declared before `arena` so it unregisters first: once the arena is unmapped the host can
+    /// hand the range to a new arena, and a stale registration listed ahead of the new one would
+    /// take its faults.
     registration: Registration,
+    arena: Arena,
 }
 
 impl Fastmem {
@@ -128,8 +131,8 @@ impl AddressSpace {
             table: PageTable::new(address_space_bits),
             physical,
             fastmem: Some(Fastmem {
-                arena,
                 registration,
+                arena,
             }),
             update: Mutex::new(()),
         })

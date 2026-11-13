@@ -357,7 +357,7 @@ impl Rig {
 
     fn submit(&mut self, channel: ChannelId, words: &[u32]) {
         let entry = self.entry(words);
-        self.gpu.submit(channel, Submission::new(vec![entry]));
+        self.gpu.submit(channel, Submission::new(&[entry]));
     }
 
     fn events(&self) -> Vec<Event> {
@@ -640,7 +640,7 @@ fn methods_and_macro_calls_continue_across_entries() {
             ]),
             rig.entry(&[0x22]),
         ];
-        rig.gpu.submit(channel, Submission::new(entries));
+        rig.gpu.submit(channel, Submission::new(&entries));
         let c = channel.0;
         let d3 = EngineKind::Maxwell3d;
         assert_eq!(
@@ -771,7 +771,7 @@ fn switch_1_fence_increments_after_a_wait_for_idle() {
         rig.gpu.submit(
             channel,
             Submission {
-                entries: vec![entry],
+                entries: &[entry],
                 wait: None,
                 increment: Some(SyncpointIncrement::fence_increment(id, false)),
             },
@@ -798,7 +798,7 @@ fn switch_2_increment_value_counts_the_fence_value() {
         rig.gpu.submit(
             channel,
             Submission {
-                entries: vec![entry],
+                entries: &[entry],
                 wait: None,
                 increment: Some(SyncpointIncrement::increment_value(id, 4)),
             },
@@ -844,7 +844,7 @@ fn syncpoint_wait_holds_the_submission_until_reached() {
         rig.gpu.submit(
             channel,
             Submission {
-                entries: vec![entry],
+                entries: &[entry],
                 wait: Some(SyncpointFence { id, value: 1 }),
                 increment: None,
             },
@@ -1290,7 +1290,7 @@ fn bind_address_space_switches_memory_for_later_work_only() {
         rig.gpu.submit(
             channel,
             Submission {
-                entries: vec![first],
+                entries: &[first],
                 wait: Some(SyncpointFence { id, value: 1 }),
                 increment: None,
             },
@@ -1302,7 +1302,7 @@ fn bind_address_space_switches_memory_for_later_work_only() {
             .unwrap();
         rig.gpu.submit(
             channel,
-            Submission::new(vec![GpEntry::new(0x28_0000, second.len() as u32)]),
+            Submission::new(&[GpEntry::new(0x28_0000, second.len() as u32)]),
         );
         rig.gpu.synchronize();
         assert_eq!(rig.read(0x20_0000), 0, "{threading:?}");
@@ -1320,7 +1320,7 @@ fn submit_reserves_increasing_fences_that_execution_reaches() {
         let channel = rig.channel(HostClass::Maxwell);
         let id = 12;
         let increment = |count| Submission {
-            entries: Vec::new(),
+            entries: &[],
             wait: None,
             increment: Some(SyncpointIncrement::increment_value(id, count)),
         };
@@ -1328,7 +1328,7 @@ fn submit_reserves_increasing_fences_that_execution_reaches() {
             rig.gpu.submit(channel, increment(2)),
             Some(SyncpointFence { id, value: 2 })
         );
-        assert_eq!(rig.gpu.submit(channel, Submission::new(Vec::new())), None);
+        assert_eq!(rig.gpu.submit(channel, Submission::new(&[])), None);
         assert_eq!(
             rig.gpu.submit(channel, increment(3)),
             Some(SyncpointFence { id, value: 5 })
@@ -1340,7 +1340,7 @@ fn submit_reserves_increasing_fences_that_execution_reaches() {
             rig.gpu.submit(
                 channel,
                 Submission {
-                    entries: Vec::new(),
+                    entries: &[],
                     wait: None,
                     increment: Some(SyncpointIncrement::increment_value(0x400, 1)),
                 },
@@ -1357,7 +1357,7 @@ fn submit_to_a_destroyed_channel_reserves_nothing() {
         let channel = rig.channel(HostClass::Maxwell);
         let id = 12;
         let increment = || Submission {
-            entries: Vec::new(),
+            entries: &[],
             wait: None,
             increment: Some(SyncpointIncrement::increment_value(id, 2)),
         };
@@ -1374,6 +1374,71 @@ fn submit_to_a_destroyed_channel_reserves_nothing() {
 }
 
 #[test]
+fn submissions_reuse_the_pooled_entry_buffer() {
+    each_mode(|threading| {
+        let mut rig = Rig::new(threading);
+        let channel = rig.channel(HostClass::Maxwell);
+        let entry = rig.entry(&Pushbuffer::default().upload(0x20_0000, &[7]).0);
+        let entries = [entry; 8];
+        rig.gpu.submit(channel, Submission::new(&entries));
+        rig.gpu.synchronize();
+        let pooled = rig.gpu.pooled_entry_buffers();
+        assert!(
+            matches!(pooled[..], [capacity] if capacity >= 8),
+            "{pooled:?}"
+        );
+        rig.gpu.submit(channel, Submission::new(&entries[..4]));
+        rig.gpu.synchronize();
+        assert_eq!(rig.gpu.pooled_entry_buffers(), pooled, "{threading:?}");
+        assert_eq!(rig.read(0x20_0000), 7);
+    });
+}
+
+#[test]
+fn shutdown_joins_the_gpu_once_and_drops_later_commands() {
+    each_mode(|threading| {
+        let mut rig = Rig::new(threading);
+        let channel = rig.channel(HostClass::Maxwell);
+        let entry = rig.entry(&Pushbuffer::default().upload(0x20_0000, &[7]).0);
+        rig.gpu.submit(channel, Submission::new(&[entry]));
+        rig.gpu.synchronize();
+        rig.gpu.shutdown();
+        rig.gpu.shutdown();
+        let id = 12;
+        let late = Submission {
+            entries: &[],
+            wait: None,
+            increment: Some(SyncpointIncrement::increment_value(id, 1)),
+        };
+        assert_eq!(rig.gpu.submit(channel, late), None);
+        assert_eq!(rig.syncpoints.max(id), Ok(0));
+        rig.gpu.synchronize();
+        assert_eq!(rig.read(0x20_0000), 7, "{threading:?}");
+    });
+}
+
+#[test]
+fn shutdown_from_a_gpu_callback_during_an_outside_shutdown_finishes() {
+    each_mode(|threading| {
+        let gpu = Arc::new(Rig::new(threading).gpu);
+        let (started, wait_started) = std::sync::mpsc::channel();
+        let (go, wait_go) = std::sync::mpsc::channel::<()>();
+        let inner = gpu.clone();
+        gpu.run_in_order(move |_| {
+            started.send(()).unwrap();
+            let _ = wait_go.recv();
+            inner.shutdown();
+        });
+        wait_started.recv().unwrap();
+        let outer = gpu.clone();
+        let outside = std::thread::spawn(move || outer.shutdown());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        go.send(()).unwrap();
+        outside.join().unwrap();
+    });
+}
+
+#[test]
 fn pause_holds_submissions_until_resumed() {
     each_mode(|threading| {
         let mut rig = Rig::new(threading);
@@ -1384,7 +1449,7 @@ fn pause_holds_submissions_until_resumed() {
         let fence = rig.gpu.submit(
             channel,
             Submission {
-                entries: vec![entry],
+                entries: &[entry],
                 wait: None,
                 increment: Some(SyncpointIncrement::increment_value(3, 1)),
             },

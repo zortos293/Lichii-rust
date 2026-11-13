@@ -36,6 +36,25 @@ impl Translator<'_> {
         }
     }
 
+    /// `high:low` as one 64-bit value from the low words of two registers.
+    fn join32(&mut self, low: Reg, high: Reg) -> Value {
+        let low = self.x(low);
+        let low = self.op(Op::ZeroExt(2, low));
+        let high = self.x(high);
+        let shift = self.k(32);
+        let high = self.op(Op::Lsl(W::W64, high, shift));
+        self.op(Op::Or(W::W64, high, low))
+    }
+
+    /// Writes the low and high words of `value` to two registers, zero-extended.
+    fn split32(&mut self, value: Value, low: Reg, high: Reg) {
+        let low_word = self.op(Op::ZeroExt(2, value));
+        let shift = self.k(32);
+        let high_word = self.op(Op::Lsr(W::W64, value, shift));
+        self.set_x(low, low_word);
+        self.set_x(high, high_word);
+    }
+
     fn set_x(&mut self, r: Reg, value: Value) {
         match r.0 {
             31 => {}
@@ -793,6 +812,68 @@ impl Translator<'_> {
                     pc,
                 });
                 self.set_x(rs, old);
+            }
+            Inst::LoadExclusive {
+                size,
+                pair,
+                rt,
+                rt2,
+                rn,
+                ..
+            } if size + pair as u8 <= 3 => {
+                let addr = self.x(rn);
+                let value = self.op(Op::LoadExclusive {
+                    size: size + pair as u8,
+                    addr,
+                    pc,
+                });
+                if pair {
+                    self.split32(value, rt, rt2);
+                } else {
+                    self.set_x(rt, value);
+                }
+            }
+            Inst::StoreExclusive {
+                size,
+                pair,
+                rs,
+                rt,
+                rt2,
+                rn,
+                ..
+            } if size + pair as u8 <= 3 => {
+                let addr = self.x(rn);
+                let value = if pair {
+                    self.join32(rt, rt2)
+                } else {
+                    self.x(rt)
+                };
+                let status = self.op(Op::StoreExclusive {
+                    size: size + pair as u8,
+                    addr,
+                    value,
+                    pc,
+                });
+                self.set_x(rs, status);
+            }
+            Inst::Casp {
+                size: 2,
+                rs,
+                rt,
+                rn,
+                ..
+            } => {
+                let addr = self.x(rn);
+                let expected = self.join32(Reg(rs), Reg(rs + 1));
+                let new = self.join32(Reg(rt), Reg(rt + 1));
+                let old = self.op(Op::Cas {
+                    size: 3,
+                    addr,
+                    expected,
+                    new,
+                    pc,
+                });
+                self.split32(old, Reg(rs), Reg(rs + 1));
             }
             Inst::DcZva { rt } if 4 << (self.config.dczid_el0 & 0xf) == 64 => {
                 let t = self.x(rt);

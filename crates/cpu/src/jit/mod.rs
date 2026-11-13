@@ -16,7 +16,7 @@ mod x64;
 use std::sync::atomic::AtomicBool;
 
 use lichii_common::{PAGE_MASK, VAddr};
-use lichii_memory::AddressSpace;
+use lichii_memory::{AddressSpace, ExclusiveMonitor, ReservationSlot};
 
 use self::cache::{Code, Entry, JitCache};
 use self::ir::{Block, Terminal};
@@ -38,6 +38,10 @@ pub(super) struct JitState {
     spill: [u128; SPILL_SLOTS],
     memory: *const AddressSpace,
     clock: *const dyn GuestClock,
+    monitor: *const ExclusiveMonitor,
+    core_index: usize,
+    /// This core's slot in `monitor`.
+    reservation: *const ReservationSlot,
     /// The interrupt flag every block checks on entry.
     interrupt: *const AtomicBool,
     /// The indirect-branch table of the cache.
@@ -131,6 +135,41 @@ extern "sysv64" fn atomic_slow(state: &mut JitState, addr: u64, pc: u64, info: u
     false
 }
 
+/// `LDXR` (`info` bit 8 clear) or `STXR` (set) of `1 << info` bytes through the monitor, as the
+/// interpreter runs them; the stored value is in `scratch`, and the result goes back there.
+extern "sysv64" fn exclusive_slow(state: &mut JitState, addr: u64, pc: u64, info: u32) -> bool {
+    let bytes = 1u8 << (info as u8);
+    let store = info & 1 << 8 != 0;
+    if addr & (u64::from(bytes) - 1) != 0 {
+        state.fault = Some(CpuFault::Alignment { pc, addr });
+        return true;
+    }
+    // SAFETY: called from a slow path; see the `Send` impl.
+    let (memory, monitor) = unsafe { (state.memory(), &*state.monitor) };
+    let result = if store {
+        let value = state.scratch as u64 as u128;
+        monitor
+            .write(state.core_index, memory, addr, bytes, value)
+            .map(|stored| u128::from(!stored))
+    } else {
+        monitor.read(state.core_index, memory, addr, bytes)
+    };
+    match result {
+        Ok(value) => {
+            state.scratch = value;
+            false
+        }
+        Err(f) => {
+            state.fault = Some(CpuFault::Data {
+                pc,
+                addr: f.addr,
+                write: store,
+            });
+            true
+        }
+    }
+}
+
 extern "sysv64" fn zero_slow(state: &mut JitState, addr: u64, pc: u64, _info: u32) -> bool {
     // SAFETY: called from a slow path.
     let memory = unsafe { state.memory() };
@@ -218,6 +257,9 @@ impl Jit {
             spill: [0; SPILL_SLOTS],
             memory: &*config.memory,
             clock: &*config.clock,
+            monitor: &*config.monitor,
+            core_index: config.core_index,
+            reservation: config.monitor.slot(config.core_index),
             interrupt: &*interrupt.0,
             table: cache.table(),
             link: 0,
@@ -229,6 +271,7 @@ impl Jit {
                 read: read_slow as *const () as usize,
                 write: write_slow as *const () as usize,
                 atomic: atomic_slow as *const () as usize,
+                exclusive: exclusive_slow as *const () as usize,
                 zero: zero_slow as *const () as usize,
                 ticks: ticks as *const () as usize,
             },
