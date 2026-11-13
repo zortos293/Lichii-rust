@@ -22,7 +22,7 @@ use parking_lot::Mutex;
 
 use crate::device_memory::DeviceAllocator;
 use crate::gmmu::{GPU_VA_SIZE, Gmmu, MappedRange, PTE_KIND_INVALID, PTE_KIND_PITCH};
-use crate::lazy::{LazyBlock, LazyDeviceRanges};
+use crate::lazy::{LAZY_BLOCK_SIZE, LazyBlock, LazyDeviceRanges};
 use crate::semaphore_mirror::{REGION_SIZE, SemaphoreMirror};
 
 const DEVICE_ALIGN: u64 = 0x2_0000;
@@ -382,7 +382,7 @@ impl Nx2GpuMemory {
         }
         let daddr = self
             .allocator
-            .allocate(size, DEVICE_ALIGN)
+            .allocate(size.next_multiple_of(LAZY_BLOCK_SIZE), LAZY_BLOCK_SIZE)
             .ok_or(Nx2MemoryError::OutOfDeviceMemory { size })?;
         self.lazy.add(daddr, size);
         state.regions.insert(
@@ -427,7 +427,7 @@ impl Nx2GpuMemory {
             self.device.unmap(block.daddr, block.size);
         }
         self.allocator
-            .free(daddr, size)
+            .free(daddr, size.next_multiple_of(LAZY_BLOCK_SIZE))
             .expect("the range was allocated at creation");
         Ok(LazyRegionDestroyed { unmapped, backed })
     }
@@ -671,7 +671,7 @@ fn inclusive_size(first: u64, last: u64) -> Result<u64, Nx2MemoryError> {
 mod tests {
     use super::*;
     use crate::gmmu::{BigPageSize, RangeTarget};
-    use crate::lazy::{LAZY_BLOCK_SIZE, LazyBacking};
+    use crate::lazy::LazyBacking;
     use lichii_common::PAGE_SIZE;
     use lichii_memory::{MemoryPermission, PhysicalMemory};
 
