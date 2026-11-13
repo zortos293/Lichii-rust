@@ -289,26 +289,23 @@ impl FenceAction {
                 value,
                 size,
             } => {
-                let result = match size {
-                    ReleaseSize::Four => handles.device.write(address, value as u32),
-                    ReleaseSize::Eight => handles.device.write(address, value),
-                    ReleaseSize::Sixteen => handles
-                        .device
-                        .write(address, [value, handles.timestamp.now()]),
-                };
-                if let Err(fault) = result {
-                    tracing::warn!(?fault, "semaphore release to unmapped device memory");
+                if !write_semaphore(handles, address, value, size) {
                     return;
                 }
-                let bytes = match size {
-                    ReleaseSize::Four => 4,
-                    ReleaseSize::Eight => 8,
-                    ReleaseSize::Sixteen => 16,
+                let mirror = handles.syncpoints.semaphore_mirror();
+                mirror.note_direct(address);
+                let Some(target) = mirror.mirror_of(address) else {
+                    return;
                 };
-                handles
-                    .syncpoints
-                    .semaphore_waiters()
-                    .written(&handles.device, address, bytes);
+                if !mirror.diverts(target) {
+                    write_semaphore(handles, target, value, size);
+                } else if let Ok(guest) = handles.device.read::<u32>(target) {
+                    mirror.set(target, value as u32, guest);
+                    handles
+                        .syncpoints
+                        .semaphore_waiters()
+                        .met_by(target, value as u32);
+                }
             }
             Self::ReduceSemaphore {
                 address,
@@ -332,10 +329,19 @@ impl FenceAction {
                 ) {
                     old = current;
                 }
-                handles
-                    .syncpoints
-                    .semaphore_waiters()
-                    .written(&handles.device, address, 4);
+                let after = op.apply(old, payload, signed);
+                let seen = handles.syncpoints.semaphore_mirror().note_combined(
+                    address,
+                    old,
+                    after,
+                    |current| op.apply(current, payload, signed),
+                );
+                let waiters = handles.syncpoints.semaphore_waiters();
+                if seen == after {
+                    waiters.written(&handles.device, address, 4);
+                } else {
+                    waiters.met_by(address, seen);
+                }
             }
             Self::IncrementSyncpoint(id) => {
                 if handles.syncpoints.guest().increment(id).is_err() {
@@ -559,6 +565,31 @@ impl Rasterizer for NullRasterizer {
 
 /// The 32-bit semaphore at `address` as an atomic, so reductions running on different threads
 /// never lose an update.
+/// Writes a semaphore release and latches the waiters it meets; false when the memory is unmapped.
+fn write_semaphore(handles: &GpuHandles, address: DAddr, value: u64, size: ReleaseSize) -> bool {
+    let result = match size {
+        ReleaseSize::Four => handles.device.write(address, value as u32),
+        ReleaseSize::Eight => handles.device.write(address, value),
+        ReleaseSize::Sixteen => handles
+            .device
+            .write(address, [value, handles.timestamp.now()]),
+    };
+    if let Err(fault) = result {
+        tracing::warn!(?fault, "semaphore release to unmapped device memory");
+        return false;
+    }
+    let bytes = match size {
+        ReleaseSize::Four => 4,
+        ReleaseSize::Eight => 8,
+        ReleaseSize::Sixteen => 16,
+    };
+    handles
+        .syncpoints
+        .semaphore_waiters()
+        .written(&handles.device, address, bytes);
+    true
+}
+
 fn semaphore_word(device: &DeviceAddressSpace, address: DAddr) -> Option<&AtomicU32> {
     if !address.is_multiple_of(4) {
         return None;

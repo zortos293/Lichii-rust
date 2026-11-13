@@ -33,6 +33,7 @@ use crate::macros::{
 };
 use crate::pushbuffer::{CommandParser, Flow, GpEntry, MethodCall, MethodHandler};
 use crate::reg_index;
+use crate::semaphore_mirror::SemaphoreMirror;
 use crate::stream::Stream;
 
 /// Engines every channel has bound before any SET_OBJECT: NVN uses subchannel 2 as
@@ -220,7 +221,14 @@ impl FrontChannel {
                 wide,
             } => {
                 shared.waiters.latched(self.id)
-                    || semaphore_met(&self.memory, address, payload, op, wide)
+                    || semaphore_met(
+                        &self.memory,
+                        shared.syncpoints.semaphore_mirror(),
+                        address,
+                        payload,
+                        op,
+                        wide,
+                    )
             }
             Wait::Syncpoint(fence) => shared
                 .syncpoints
@@ -363,8 +371,11 @@ impl FrontChannel {
     }
 }
 
+/// Whether the word at `address` meets the acquire, as GPU acquires see it: a 32-bit word may
+/// hold a mirrored Switch 2 queue semaphore value kept out of memory.
 fn semaphore_met(
     memory: &Gmmu,
+    mirror: &SemaphoreMirror,
     address: GpuVAddr,
     payload: u64,
     op: AcquireOp,
@@ -373,7 +384,12 @@ fn semaphore_met(
     let current = if wide {
         memory.read::<u64>(address)
     } else {
-        memory.read::<u32>(address).map(u64::from)
+        memory.read::<u32>(address).map(|guest| {
+            let seen = memory
+                .translate(address)
+                .and_then(|device| mirror.read(device, guest));
+            u64::from(seen.unwrap_or(guest))
+        })
     };
     match current {
         Ok(current) => op.is_met(current, payload, wide),
@@ -476,12 +492,26 @@ impl Dispatch<'_> {
         if let Some(device) = self.memory.translate(address) {
             self.shared.waiters.add(self.id, device, payload, op, wide);
         }
-        if semaphore_met(self.memory, address, payload, op, wide) {
+        if semaphore_met(
+            self.memory,
+            self.shared.syncpoints.semaphore_mirror(),
+            address,
+            payload,
+            op,
+            wide,
+        ) {
             self.shared.waiters.remove(self.id);
             return Flow::Continue;
         }
         self.shared.stream.drain();
-        if semaphore_met(self.memory, address, payload, op, wide) {
+        if semaphore_met(
+            self.memory,
+            self.shared.syncpoints.semaphore_mirror(),
+            address,
+            payload,
+            op,
+            wide,
+        ) {
             self.shared.waiters.remove(self.id);
             return Flow::Continue;
         }
