@@ -12,7 +12,8 @@ use parking_lot::Mutex;
 const RUNNING: u64 = u64::MAX;
 const SHIFT: u32 = 63;
 
-/// Guest time counted from an invariant host TSC, so the JIT can read the counter inline.
+/// Guest time counted from a host TSC the OS keeps synchronized across cores, so the JIT can
+/// read the counter inline.
 struct TscClock {
     start: u64,
     ns_mul: u64,
@@ -21,8 +22,8 @@ struct TscClock {
 }
 
 impl TscClock {
-    fn new(counter_hz: u64) -> Option<Self> {
-        let tsc_hz = u128::from(invariant_tsc_hz()?);
+    fn new(counter_hz: u64, tsc_hz: u64) -> Option<Self> {
+        let tsc_hz = u128::from(tsc_hz);
         let ns_mul = u64::try_from((1_000_000_000u128 << SHIFT) / tsc_hz).ok()?;
         let tick_mul = u64::try_from((u128::from(counter_hz) << SHIFT) / tsc_hz).ok()?;
         let start = read_tsc()?;
@@ -37,7 +38,7 @@ impl TscClock {
 
     fn host_ns(&self) -> u64 {
         let tsc = read_tsc().unwrap_or(self.start);
-        scaled(tsc.wrapping_sub(self.start), self.ns_mul)
+        scaled(tsc.saturating_sub(self.start), self.ns_mul)
     }
 }
 
@@ -45,25 +46,47 @@ fn scaled(tsc: u64, mul: u64) -> u64 {
     ((u128::from(tsc) * u128::from(mul)) >> SHIFT) as u64
 }
 
-/// The host TSC frequency, measured once against [`Instant`]; `None` unless the TSC is invariant.
-fn invariant_tsc_hz() -> Option<u64> {
+/// The host TSC frequency, measured once per process; `None` unless the TSC is invariant and the
+/// OS itself keeps time with it, which is its guarantee that the TSC agrees across cores.
+fn trusted_tsc_hz() -> Option<u64> {
     static HZ: OnceLock<Option<u64>> = OnceLock::new();
     *HZ.get_or_init(|| {
-        if !tsc_is_invariant() {
-            return None;
+        if tsc_is_invariant() && os_clock_is_tsc() {
+            measure_tsc_hz()
+        } else {
+            None
         }
-        let sample = || {
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn os_clock_is_tsc() -> bool {
+    std::fs::read_to_string("/sys/devices/system/clocksource/clocksource0/current_clocksource")
+        .is_ok_and(|source| source.trim() == "tsc")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn os_clock_is_tsc() -> bool {
+    false
+}
+
+/// The TSC frequency against [`Instant`] over 20 ms. Each endpoint is an `Instant` read between
+/// two TSC reads at most 100 000 cycles apart, so a preempted sample is retried instead of skewing
+/// the rate.
+fn measure_tsc_hz() -> Option<u64> {
+    let sample = || {
+        (0..100).find_map(|_| {
             let before = read_tsc()?;
             let now = Instant::now();
             let after = read_tsc()?;
-            Some((now, before / 2 + after / 2 + (before & after & 1)))
-        };
-        let (start, start_tsc) = sample()?;
-        std::thread::sleep(Duration::from_millis(20));
-        let (end, end_tsc) = sample()?;
-        let ns = end.duration_since(start).as_nanos();
-        u64::try_from(u128::from(end_tsc - start_tsc) * 1_000_000_000 / ns).ok()
-    })
+            (after - before < 100_000).then(|| (now, before + (after - before) / 2))
+        })
+    };
+    let (start, start_tsc) = sample()?;
+    std::thread::sleep(Duration::from_millis(20));
+    let (end, end_tsc) = sample()?;
+    let ns = end.duration_since(start).as_nanos();
+    u64::try_from(u128::from(end_tsc - start_tsc) * 1_000_000_000 / ns).ok()
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -95,8 +118,8 @@ fn read_tsc() -> Option<u64> {
 /// Nanoseconds of guest time since boot, counted from the host clock minus the time spent paused.
 ///
 /// Reads take no lock: `pause` and `resume` publish their changes under a sequence counter
-/// that is odd while they write, and a read that overlaps a change retries. On hosts with an
-/// invariant TSC the host clock is the TSC, so the JIT's inline counter reads through
+/// that is odd while they write, and a read that overlaps a change retries. When the OS keeps time
+/// with an invariant TSC, the host clock is the TSC, so the JIT's inline counter reads through
 /// [`GuestClock::host_tsc_scale`] agree with [`GuestClock::ticks`].
 pub struct CoreTiming {
     start: Instant,
@@ -113,13 +136,17 @@ impl CoreTiming {
     /// title's SDK converts ticks with: 19.2 MHz for Switch 1 titles, 31.25 MHz for Switch 2
     /// titles (at 19.2 MHz every tick-based time of a Switch 2 title is off by 1.63x).
     pub fn new(title: ConsoleGeneration) -> Self {
+        Self::with_tsc_hz(title, trusted_tsc_hz())
+    }
+
+    fn with_tsc_hz(title: ConsoleGeneration, tsc_hz: Option<u64>) -> Self {
         let counter_hz = match title {
             ConsoleGeneration::Switch1 => 19_200_000,
             ConsoleGeneration::Switch2 => 31_250_000,
         };
         Self {
             start: Instant::now(),
-            tsc: TscClock::new(counter_hz),
+            tsc: tsc_hz.and_then(|hz| TscClock::new(counter_hz, hz)),
             counter_hz,
             sequence: AtomicU64::new(0),
             paused_ns: AtomicU64::new(0),
@@ -168,25 +195,22 @@ impl CoreTiming {
         self.sequence.fetch_add(1, Ordering::Release);
     }
 
-    /// Stops guest time until [`CoreTiming::resume`]. Call it only while no core runs guest
-    /// code, because it rewrites the TSC scale those cores read.
+    /// Stops guest time until [`CoreTiming::resume`]. It leaves the TSC scale alone, so a core
+    /// that has not stopped yet keeps reading a running counter until it does.
     pub fn pause(&self) {
         self.update(|| {
             if self.frozen_at.load(Ordering::Relaxed) == RUNNING {
                 let now = self.host_ns() - self.paused_ns.load(Ordering::Relaxed);
                 self.frozen_at.store(now, Ordering::Relaxed);
-                if let Some(tsc) = &self.tsc {
-                    tsc.scale.mul.store(0, Ordering::Relaxed);
-                    tsc.scale
-                        .offset
-                        .store(self.ticks_at(now), Ordering::Relaxed);
-                }
             }
         });
     }
 
-    /// Restarts guest time from where [`CoreTiming::pause`] froze it. Call it only while no core
-    /// runs guest code, because it rewrites the TSC scale those cores read.
+    /// Restarts guest time from where [`CoreTiming::pause`] froze it.
+    ///
+    /// The TSC scale stays running while paused, because no core runs guest code then. Resuming
+    /// moves only its offset, with one store, so a core that still runs guest code reads either
+    /// the old or the new mapping, never a mix.
     pub fn resume(&self) {
         self.update(|| {
             let frozen = self.frozen_at.load(Ordering::Relaxed);
@@ -195,14 +219,13 @@ impl CoreTiming {
                     Some(tsc) => {
                         let now = read_tsc().unwrap_or(tsc.start);
                         self.paused_ns.store(
-                            scaled(now.wrapping_sub(tsc.start), tsc.ns_mul) - frozen,
+                            scaled(now.saturating_sub(tsc.start), tsc.ns_mul) - frozen,
                             Ordering::Relaxed,
                         );
                         let offset = self
                             .ticks_at(frozen)
                             .wrapping_sub(scaled(now, tsc.tick_mul));
                         tsc.scale.offset.store(offset, Ordering::Relaxed);
-                        tsc.scale.mul.store(tsc.tick_mul, Ordering::Relaxed);
                     }
                     None => self
                         .paused_ns
@@ -269,12 +292,13 @@ mod tests {
     }
 
     #[test]
-    fn the_tsc_scale_matches_the_counter_and_freezes_while_paused() {
-        let timing = CoreTiming::new(ConsoleGeneration::Switch1);
-        let Some(scale) = timing.host_tsc_scale() else {
-            assert!(read_tsc().is_none() || !tsc_is_invariant());
+    fn the_tsc_scale_matches_the_counter_across_pause_and_resume() {
+        let Some(tsc_hz) = tsc_is_invariant().then(measure_tsc_hz).flatten() else {
             return;
         };
+        let timing = CoreTiming::with_tsc_hz(ConsoleGeneration::Switch1, Some(tsc_hz));
+        let scale = timing.host_tsc_scale().unwrap();
+        let mul = scale.mul.load(Ordering::Relaxed);
         let agrees = |timing: &CoreTiming| {
             let before = timing.ticks();
             let inline = scale.ticks(read_tsc().unwrap());
@@ -292,9 +316,9 @@ mod tests {
         let frozen = timing.ticks();
         assert!(frozen + 1 >= running);
         std::thread::sleep(Duration::from_millis(10));
-        assert_eq!(scale.ticks(read_tsc().unwrap()), frozen);
-        assert_eq!(scale.ticks(0), frozen);
+        assert_eq!(timing.ticks(), frozen);
         timing.resume();
+        assert_eq!(scale.mul.load(Ordering::Relaxed), mul);
         let resumed = agrees(&timing);
         assert!(resumed + 1 >= frozen && resumed < frozen + 19_200);
         std::thread::sleep(Duration::from_millis(30));
