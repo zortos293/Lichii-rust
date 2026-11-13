@@ -75,8 +75,8 @@ fn block_linear(tile_mode: TileMode, gob: GobLayout) -> GuestLayout {
 
 impl ImageInfo {
     /// The image a texture header samples. `None` for texel buffers, which live in the buffer
-    /// cache. With Switch 2 GOBs only array headers have layers: NVN2 leaves base layer 32 in 2D
-    /// headers of render targets packed one layer apart (Mario Tennis Fever).
+    /// cache. With Switch 2 GOBs only array headers have layers: NVN2 sets the base layer field
+    /// (32 or 48) in 2D, cube and 3D headers alike, where it selects nothing.
     pub fn from_texture(desc: &TextureDescriptor, gob: GobLayout) -> Option<Self> {
         let layout = match desc.memory {
             TextureMemory::BlockLinear {
