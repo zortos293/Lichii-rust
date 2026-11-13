@@ -149,6 +149,7 @@ impl System {
             dram_size,
             pool_layout: None,
             fastmem: settings.cpu.fastmem,
+            cpu_accuracy: settings.cpu.accuracy,
             aslr: false,
             rng_seed: settings.system.rng_seed.map_or_else(entropy, u64::from),
             clock: timing.clone(),
