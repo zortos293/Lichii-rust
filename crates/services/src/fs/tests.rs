@@ -1,19 +1,194 @@
-//! fsp-srv driven through the kernel's IPC path by a mock-core guest.
+//! fsp-srv driven through the kernel's IPC path with the shared host-side client: real CMIF
+//! requests, handles, guest buffers and the client's pid.
 
-mod harness;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
-use bytemuck::Zeroable;
-use lichii_common::ConsoleGeneration;
+use bytemuck::{Pod, Zeroable};
+use lichii_common::settings::Settings;
+use lichii_common::{ConsoleGeneration, ResultCode, VAddr};
 use lichii_fs::romfs::{build_romfs, open_romfs};
 use lichii_fs::{DirectoryExt, FileExt, FileRef, MemDir, MemFile};
-use lichii_kernel::ipc::UNKNOWN_COMMAND_ID;
-use lichii_loader::program::AddOnContent;
+use lichii_gpu::host1x::Host1x;
+use lichii_kernel::Kernel;
+use lichii_kernel::ipc::{Handle, UNKNOWN_COMMAND_ID};
+use lichii_kernel::testing::{self, IpcClient, Reply, Request};
+use lichii_loader::program::{AddOnContent, ProgramImage};
 
-use self::harness::{Guest, Request, SWITCH1_PROGRAM, SWITCH2_PROGRAM};
 use super::result::*;
 use super::save::{RawSaveDataAttribute, SaveDataInfo};
+use crate::testing::{SWITCH1_TITLE, SWITCH2_TITLE};
+use crate::{ServiceContext, ServiceParts};
 
-const AOC: u64 = SWITCH2_PROGRAM + 0x1001;
+const SCRATCH_SIZE: usize = 2 << 20;
+
+/// A guest buffer: address and size.
+type Buffer = (VAddr, u64);
+
+trait Buffers {
+    fn x(self, buffer: Buffer) -> Self;
+    fn a(self, buffer: Buffer) -> Self;
+    fn b(self, buffer: Buffer) -> Self;
+}
+
+impl Buffers for Request {
+    fn x(self, (address, size): Buffer) -> Self {
+        self.buffer_x(address, size)
+    }
+
+    fn a(self, (address, size): Buffer) -> Self {
+        self.buffer_a(address, size)
+    }
+
+    fn b(self, (address, size): Buffer) -> Self {
+        self.buffer_b(address, size)
+    }
+}
+
+trait Checked {
+    fn ok(self) -> Self;
+    fn get<T: Pod>(&self, offset: usize) -> T;
+    fn handle(&self) -> Handle;
+}
+
+impl Checked for Reply {
+    #[track_caller]
+    fn ok(self) -> Self {
+        assert_eq!(self.result, ResultCode::SUCCESS);
+        self
+    }
+
+    #[track_caller]
+    fn get<T: Pod>(&self, offset: usize) -> T {
+        bytemuck::pod_read_unaligned(&self.data()[offset..offset + size_of::<T>()])
+    }
+
+    #[track_caller]
+    fn handle(&self) -> Handle {
+        assert_eq!(self.result, ResultCode::SUCCESS);
+        self.move_handles[0]
+    }
+}
+
+static NEXT_ROOT: AtomicU32 = AtomicU32::new(0);
+
+/// A title's process with the fs services registered, an IPC client in it, 2 MiB of guest
+/// scratch memory, and host NAND and SD card directories under `root`.
+struct Guest {
+    kernel: Kernel,
+    client: IpcClient,
+    _context: Arc<ServiceContext>,
+    scratch: VAddr,
+    root: PathBuf,
+}
+
+impl Guest {
+    fn new(program_id: u64, configure: impl FnOnce(&mut ProgramImage)) -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "lichii-fsp-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut settings = Settings::default();
+        settings.paths.nand_dir = Some(root.join("nand"));
+        settings.paths.sdmc_dir = Some(root.join("sdmc"));
+        settings.paths.keys_dir = Some(root.join("keys"));
+
+        let generation = ConsoleGeneration::from_program_id(program_id);
+        let kernel = testing::kernel(generation);
+        let mut image = testing::program_image(program_id);
+        configure(&mut image);
+        let program = Arc::new(image);
+        let process = kernel.create_process(&program).unwrap();
+        let bits = match generation {
+            ConsoleGeneration::Switch1 => 34,
+            ConsoleGeneration::Switch2 => 36,
+        };
+        let client = IpcClient::new(&kernel, &process);
+        let context = ServiceContext::new(ServiceParts {
+            kernel: kernel.clone(),
+            settings: Arc::new(settings),
+            program,
+            process,
+            host1x: Host1x::new(kernel.physical_memory().clone(), bits),
+            nx2_memory: None,
+            npad: Arc::default(),
+            perf: Arc::default(),
+        });
+        super::register(&context).unwrap();
+        let scratch = client.alloc(&vec![0; SCRATCH_SIZE]);
+        Self {
+            kernel,
+            client,
+            _context: context,
+            scratch,
+            root,
+        }
+    }
+
+    #[track_caller]
+    fn call(&self, session: Handle, request: Request) -> Reply {
+        self.client
+            .send(session, &request)
+            .expect("SendSyncRequest")
+    }
+
+    #[track_caller]
+    fn service(&self, name: &str) -> Handle {
+        self.client.connect(name).expect("service registered")
+    }
+
+    /// Closes a session the way `svcCloseHandle` does.
+    #[track_caller]
+    fn close(&self, handle: Handle) {
+        let session = self.client.process().handles().write().remove(handle);
+        assert!(session.is_some(), "handle {handle:#x} is not open");
+    }
+
+    /// `bytes` written to scratch memory at `offset`.
+    fn put(&self, offset: u64, bytes: &[u8]) -> Buffer {
+        let address = self.scratch + offset;
+        self.client
+            .process()
+            .memory()
+            .write_bytes(address, bytes)
+            .unwrap();
+        (address, bytes.len() as u64)
+    }
+
+    /// A NUL-terminated path in path slot `slot`, sized like `nn::fssrv::sf::Path`.
+    fn path(&self, slot: u64, path: &str) -> Buffer {
+        let mut raw = vec![0u8; 0x301];
+        raw[..path.len()].copy_from_slice(path.as_bytes());
+        self.put(0x1000 + slot * 0x400, &raw)
+    }
+
+    /// `size` bytes of `fill` at `offset` into scratch memory.
+    fn buffer(&self, offset: u64, size: u64, fill: u8) -> Buffer {
+        let address = self.scratch + offset;
+        self.client
+            .process()
+            .memory()
+            .fill(address, size, fill)
+            .unwrap();
+        (address, size)
+    }
+
+    fn read(&self, (address, size): Buffer) -> Vec<u8> {
+        self.client.read(address, size as usize)
+    }
+}
+
+impl Drop for Guest {
+    fn drop(&mut self) {
+        self.kernel.shutdown();
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+const AOC: u64 = SWITCH2_TITLE + 0x1001;
 const USER: [u64; 2] = [0x8877_6655_4433_2211, 0x0102_0304_0506_0708];
 const USER_DIR: &str = "01020304050607088877665544332211";
 
@@ -32,7 +207,7 @@ fn aoc_romfs() -> FileRef {
 }
 
 fn switch2_title() -> Guest {
-    Guest::new(ConsoleGeneration::Switch2, |image| {
+    Guest::new(SWITCH2_TITLE, |image| {
         image.romfs = Some(romfs());
         image.add_ons.push(AddOnContent {
             title_id: AOC,
@@ -43,7 +218,7 @@ fn switch2_title() -> Guest {
 }
 
 /// Reads a whole storage into guest memory at heap + 0x100000 and opens it as a RomFS.
-fn read_storage(guest: &Guest, storage: u32) -> FileRef {
+fn read_storage(guest: &Guest, storage: Handle) -> FileRef {
     let size: u64 = guest.call(storage, Request::new(4)).ok().get(0);
     let buffer = guest.buffer(0x10_0000, size, 0);
     guest
@@ -69,8 +244,8 @@ fn attribute(program_id: u64, save_type: u8, system_save_data_id: u64) -> RawSav
 fn set_current_process_accepts_only_the_application() {
     let guest = switch2_title();
     let fsp = guest.service("fsp-srv");
-    guest.call(fsp, Request::new(1).pid().arg(0u64)).ok();
-    guest.call(fsp, Request::new(210).pid().arg(0u64)).ok();
+    guest.call(fsp, Request::new(1).send_pid().arg(0u64)).ok();
+    guest.call(fsp, Request::new(210).send_pid().arg(0u64)).ok();
     let other = guest.call(fsp, Request::new(1).arg(0x9999u64));
     assert_eq!(other.result, TARGET_NOT_FOUND);
 }
@@ -114,12 +289,12 @@ fn data_storage_of_the_current_process() {
     assert_eq!(unsupported.result, UNSUPPORTED_OPERATE_RANGE_FOR_STORAGE);
 
     let by_id = guest
-        .call(fsp, Request::new(201).arg(SWITCH2_PROGRAM))
+        .call(fsp, Request::new(201).arg(SWITCH2_TITLE))
         .handle();
     assert_eq!(read_storage(&guest, by_id).size(), romfs().size());
     let aoc = guest.call(fsp, Request::new(201).arg(AOC)).handle();
     assert_eq!(read_storage(&guest, aoc).size(), aoc_romfs().size());
-    let missing = guest.call(fsp, Request::new(201).arg(SWITCH1_PROGRAM));
+    let missing = guest.call(fsp, Request::new(201).arg(SWITCH1_TITLE));
     assert_eq!(missing.result, TARGET_NOT_FOUND);
 
     let index0 = guest.call(fsp, Request::new(205).arg(0u8)).handle();
@@ -129,13 +304,13 @@ fn data_storage_of_the_current_process() {
         guest.call(fsp, Request::new(203).arg(0u8).arg(0u64)).result,
         TARGET_NOT_FOUND
     );
-    let patch = Request::new(7).arg(4u8).arg(SWITCH2_PROGRAM);
+    let patch = Request::new(7).arg(4u8).arg(SWITCH2_TITLE);
     assert_eq!(guest.call(fsp, patch).result, TARGET_NOT_FOUND);
 }
 
 #[test]
 fn a_title_without_romfs_has_no_data_storage() {
-    let guest = Guest::new(ConsoleGeneration::Switch2, |_| {});
+    let guest = Guest::new(SWITCH2_TITLE, |_| {});
     let fsp = guest.service("fsp-srv");
     assert_eq!(guest.call(fsp, Request::new(200)).result, UNKNOWN);
     assert_eq!(guest.call(fsp, Request::new(2)).result, UNKNOWN);
@@ -266,7 +441,7 @@ fn sd_card_file_system() {
 
     let data = guest.put(0x2000, b"abcd");
     let file = open("/a/f.bin", 3).handle();
-    let write = |file: u32, option: u32, offset: i64, size: i64| {
+    let write = |file: Handle, option: u32, offset: i64, size: i64| {
         guest.call(
             file,
             Request::new(1).arg(option).arg(offset).arg(size).a(data),
@@ -280,7 +455,7 @@ fn sd_card_file_system() {
     );
     assert_eq!(write(file, 0, -1, 1).result, OUT_OF_RANGE);
     let out = guest.buffer(0x3000, 0x10, 0);
-    let read = |file: u32, offset: i64, size: i64| {
+    let read = |file: Handle, offset: i64, size: i64| {
         guest.call(file, Request::new(0).arg(0u32).arg(offset).arg(size).b(out))
     };
     assert_eq!(read(file, 1, 0x10).ok().get::<i64>(0), 3);
@@ -332,6 +507,7 @@ fn sd_card_file_system() {
     );
     assert_eq!(read.ok().get::<i64>(0), big.len() as i64);
     assert_eq!(guest.read(big_out), big);
+    guest.close(big_file);
     std::fs::remove_file(sd.join("big.bin")).unwrap();
 
     assert_eq!(call1(7, "/a").ok().get::<u32>(0), 0);
@@ -383,6 +559,9 @@ fn sd_card_file_system() {
     assert_eq!(call2(5, "/a/x", "/a/b/h.bin").result, PATH_ALREADY_EXISTS);
     assert_eq!(call2(5, "/a/none", "/a/y").result, PATH_NOT_FOUND);
     assert_eq!(call2(5, "/a/b", "/a/y").result, PATH_NOT_FOUND);
+    for handle in [file, read_only, append] {
+        guest.close(handle);
+    }
     call2(6, "/a/b", "/a/d").ok();
     assert!(sd.join("a/d/c").is_dir());
     call2(6, "/a/d", "/e").ok();
@@ -427,7 +606,7 @@ fn sd_card_file_system() {
     assert_eq!(query(0, "/none").result, PATH_NOT_FOUND);
     query(1, "/used").ok();
     query(2, "/").ok();
-    assert_eq!(guest.read((guest.heap + 0x5000, 1)), [0]);
+    assert_eq!(guest.read((guest.scratch + 0x5000, 1)), [0]);
     assert_eq!(query(3, "/used").result, NOT_IMPLEMENTED);
 }
 
@@ -518,7 +697,7 @@ fn save_data_file_systems() {
         )
         .ok();
     let account_dir = nand.join(format!(
-        "user/save/0000000000000000/{USER_DIR}/{SWITCH2_PROGRAM:016X}"
+        "user/save/0000000000000000/{USER_DIR}/{SWITCH2_TITLE:016X}"
     ));
     assert!(account_dir.is_dir());
     let open = |command: u32, space: u8, attr: RawSaveDataAttribute| {
@@ -531,24 +710,24 @@ fn save_data_file_systems() {
         .get(0);
     assert_eq!(free, 0x6_8000_0000 - 0x10_0000);
     open(53, 1, account).handle();
-    let other = attribute(SWITCH2_PROGRAM + 0x2000, 1, 0);
+    let other = attribute(SWITCH2_TITLE + 0x2000, 1, 0);
     assert_eq!(open(51, 1, other).result, TARGET_NOT_FOUND);
 
-    let temporary = attribute(SWITCH2_PROGRAM, 4, 0);
+    let temporary = attribute(SWITCH2_TITLE, 4, 0);
     let temporary_fs = open(51, 3, temporary).handle();
     let create = Request::new(0)
         .x(guest.path(0, "/scratch"))
         .arg(0i32)
         .arg(1i64);
     guest.call(temporary_fs, create).ok();
-    let cache = attribute(SWITCH2_PROGRAM, 5, 0);
+    let cache = attribute(SWITCH2_TITLE, 5, 0);
     open(51, 1, cache).handle();
     assert!(
-        nand.join(format!("user/save/cache/{SWITCH2_PROGRAM:016X}"))
+        nand.join(format!("user/save/cache/{SWITCH2_TITLE:016X}"))
             .is_dir()
     );
     guest.call(fsp, Request::new(1003)).ok();
-    let late_cache = attribute(SWITCH2_PROGRAM + 0x3000, 5, 0);
+    let late_cache = attribute(SWITCH2_TITLE + 0x3000, 5, 0);
     assert_eq!(open(51, 1, late_cache).result, TARGET_NOT_FOUND);
 
     let mut info2 = [0u8; 0xa0];
@@ -561,7 +740,7 @@ fn save_data_file_systems() {
             .is_dir()
     );
 
-    let read_info = |reader: u32| -> Vec<SaveDataInfo> {
+    let read_info = |reader: Handle| -> Vec<SaveDataInfo> {
         let buffer = guest.buffer(0x8000, 0x60 * 8, 0);
         let count: u64 = guest.call(reader, Request::new(0).b(buffer)).ok().get(0);
         let raw = guest.read(buffer);
@@ -572,7 +751,7 @@ fn save_data_file_systems() {
     };
     let user = read_info(guest.call(fsp, Request::new(61).arg(1u8)).handle());
     let titles: Vec<_> = user.iter().map(|i| (i.save_type, i.title_id)).collect();
-    assert_eq!(titles, [(1, SWITCH2_PROGRAM)]);
+    assert_eq!(titles, [(1, SWITCH2_TITLE)]);
     assert_eq!(user[0].user_id, bytemuck::cast::<[u64; 2], [u8; 16]>(USER));
     assert_eq!(user[0].space, 1);
     let systems = read_info(guest.call(fsp, Request::new(61).arg(0u8)).handle());
@@ -584,7 +763,7 @@ fn save_data_file_systems() {
     assert_eq!(temporary.len(), 1);
     assert_eq!(
         (temporary[0].save_type, temporary[0].title_id),
-        (4, SWITCH2_PROGRAM)
+        (4, SWITCH2_TITLE)
     );
     let all = read_info(guest.call(fsp, Request::new(60)).handle());
     assert_eq!(all.len(), 3);
@@ -631,10 +810,7 @@ fn save_data_file_systems() {
     let cache_size = guest.call(fsp, Request::new(34).arg(0i32)).ok();
     assert_eq!(cache_size.get::<[i64; 2]>(0), [0, 0]);
     let prohibiter = guest.call(fsp, Request::new(83).arg(1u64)).handle();
-    assert_eq!(
-        guest.call(prohibiter, Request::new(0)).result,
-        UNKNOWN_COMMAND_ID
-    );
+    guest.call(prohibiter, Request::new(0)).ok();
     let commit = guest.call(fsp, Request::new(1200)).handle();
     guest.call(commit, Request::new(1)).ok();
     guest.call(commit, Request::new(2)).ok();
@@ -654,14 +830,22 @@ fn proxy_settings_and_stubs() {
     let index = guest.call(fsp, Request::new(1011)).ok();
     assert_eq!(index.get::<[u32; 2]>(0), [2, 0]);
     guest.call(fsp, Request::new(1016)).ok();
+    guest.call(fsp, Request::new(606)).ok();
+    for name in ["fsp-ldr", "fsp-pr"] {
+        let session = guest.service(name);
+        guest.call(session, Request::new(0)).ok();
+    }
+
+    let switch1 = Guest::new(SWITCH1_TITLE, |_| {});
+    let fsp = switch1.service("fsp-srv");
     assert_eq!(
-        guest.call(fsp, Request::new(606)).result,
+        switch1.call(fsp, Request::new(606)).result,
         UNKNOWN_COMMAND_ID
     );
     for name in ["fsp-ldr", "fsp-pr"] {
-        let session = guest.service(name);
+        let session = switch1.service(name);
         assert_eq!(
-            guest.call(session, Request::new(0)).result,
+            switch1.call(session, Request::new(0)).result,
             UNKNOWN_COMMAND_ID
         );
     }
@@ -669,7 +853,7 @@ fn proxy_settings_and_stubs() {
 
 #[test]
 fn switch1_storage_reads_are_paced_like_a_game_card() {
-    let guest = Guest::new(ConsoleGeneration::Switch1, |image| {
+    let guest = Guest::new(SWITCH1_TITLE, |image| {
         image.romfs = Some(MemFile::from_bytes(vec![0x5a; 0x2_0000]));
     });
     let fsp = guest.service("fsp-srv");

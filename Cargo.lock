@@ -1555,7 +1555,6 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "lichii-common",
- "lichii-cpu",
  "lichii-crypto",
  "lichii-fs",
  "lichii-gpu",

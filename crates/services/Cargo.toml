@@ -19,5 +19,4 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-lichii-cpu.workspace = true
 lichii-kernel = { workspace = true, features = ["testing"] }
