@@ -59,6 +59,11 @@ mod faults {
 
     fn skip_load(data: usize, guest_addr: u64, fault: &mut HostFault) -> bool {
         LAST_FAULT.store(guest_addr, Ordering::SeqCst);
+        skip_load_quietly(data, guest_addr, fault)
+    }
+
+    /// Like `skip_load`, without touching `LAST_FAULT`, which another test asserts on.
+    fn skip_load_quietly(data: usize, _guest_addr: u64, fault: &mut HostFault) -> bool {
         fault.set_gpr(0, data as u64);
         fault.set_pc(fault.pc() + 3);
         true
@@ -117,7 +122,7 @@ mod faults {
             let physical = Arc::new(PhysicalMemory::new(1 << 26).unwrap());
             let space = AddressSpace::with_fastmem(physical, 36).unwrap();
             let fastmem = space.fastmem().unwrap();
-            fastmem.set_fault_handler(Some(skip_load), 0xdead);
+            fastmem.set_fault_handler(Some(skip_load_quietly), 0xdead);
             assert_eq!(load(fastmem.base(), 0x1000), 0xdead);
         }
         stop.store(true, Ordering::Relaxed);
