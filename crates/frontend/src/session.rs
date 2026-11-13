@@ -281,7 +281,7 @@ mod tests {
         .unwrap();
 
         let mut booted_as = None;
-        let session = Session::boot(&game, LoadOptions::default(), |id, generation| {
+        let session = Session::boot(&game, LoadOptions::default(), None, |id, generation| {
             booted_as = Some((id, generation));
             (settings(), Host::headless())
         })
