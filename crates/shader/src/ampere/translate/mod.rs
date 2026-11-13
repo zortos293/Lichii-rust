@@ -7,6 +7,7 @@ mod float;
 mod graphics;
 mod integer;
 mod memory;
+mod tensor;
 #[cfg(test)]
 pub(crate) mod tests;
 mod texture;
@@ -96,6 +97,7 @@ fn dispatch(t: &mut Translator<'_>, op: Opcode) -> TResult {
         Vote | Voteu | Shfl | Match | Redux => warp::translate(t, op),
         Warpsync | Nanosleep | Yield | Nop | Bpt | Bra | Brx | Brxu | Jmp | Jmx | Jmxu
         | CallAbs | CallRel | Ret | Exit | Kill | Bssy | Bsync | Break | BmovR | BmovB
-        | BmovAtExit | Hmma | Imma | Movm => control::translate(t, op),
+        | BmovAtExit | Imma => control::translate(t, op),
+        Hmma | Movm => tensor::translate(t, op),
     }
 }
