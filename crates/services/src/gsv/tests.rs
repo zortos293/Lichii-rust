@@ -416,13 +416,13 @@ fn gpu_memory_is_mapped_for_every_address_space() {
     let mut request = Vec::new();
     request.extend((region + 0x1_0000).to_le_bytes());
     request.extend(0x1000u64.to_le_bytes());
-    request.extend([0, 0, 0, 0xfe, 0, 0, 0, 0]);
+    request.extend([0, 0, 0, 0xdb, 0, 0, 0, 0]);
     request.extend(handle.to_le_bytes());
     request.extend(0u32.to_le_bytes());
     request.extend(0x1000u64.to_le_bytes());
     let input = client.alloc(&request);
     let kinds = client.alloc(&[0]);
-    let mut map = vec![0; 12];
+    let mut map = vec![0; 6];
     map.push(12);
     let mut reply = client
         .send(
@@ -433,8 +433,12 @@ fn gpu_memory_is_mapped_for_every_address_space() {
         )
         .unwrap();
     assert_eq!(reply.pop::<u64>(), 1);
-    assert_eq!(client.read(kinds, 1), [0xfe]);
+    assert_eq!(client.read(kinds, 1), [0xdb]);
     assert_eq!(gmmu.read::<u32>(region + 0x1_0004).unwrap(), 0xdead_beef);
+    assert_eq!(gmmu.kind(region + 0x1_0000), Some(0xdb));
+    context.gpu.synchronize();
+    let reply = client.send(gpu, &Request::tipc(12).arg(12u32)).unwrap();
+    assert!(event(&client, reply.copy_handles[0]).is_signaled());
 
     let destroy = Request::tipc(102).arg(handle).arg(13u32);
     client.send(gpu, &destroy).unwrap();
@@ -445,4 +449,69 @@ fn gpu_memory_is_mapped_for_every_address_space() {
         0,
         "the tile reads zero again"
     );
+}
+
+#[test]
+fn gpu_only_regions_keep_what_the_gpu_writes() {
+    let (context, client, gsv) = gsv();
+    let gpu = session(&client, gsv, 497);
+    let gmmu = context
+        .gpu
+        .create_address_space(lichii_gpu::gmmu::BigPageSize::Size64K);
+    let region = 0x81_0000_0000u64;
+    let mut create = vec![0];
+    create.extend(split(region));
+    create.extend(split(region + 0x20_0000 - 1));
+    create.extend([0, 0, 0, 0, 3]);
+    client
+        .send(gpu, &words(Request::tipc(214), &create))
+        .unwrap();
+    gmmu.write(region + 0x1_0000, 0x1234_5678u32).unwrap();
+    assert_eq!(gmmu.read::<u32>(region + 0x1_0000).unwrap(), 0x1234_5678);
+
+    let process = client.process().clone();
+    let heap = process.page_table().set_heap_size(2 << 20).unwrap();
+    process.memory().write(heap, 0xdead_beefu32).unwrap();
+    let memory = words(
+        Request::tipc(101),
+        &[split(heap), split(heap + 0xffff), [0, 0]].concat(),
+    );
+    let handle = client.send(gpu, &memory).unwrap().pop::<u32>();
+    let tile = |handle: u32| {
+        let mut request = Vec::new();
+        request.extend((region + 0x1_0000).to_le_bytes());
+        request.extend(0x1000u64.to_le_bytes());
+        request.extend([0; 8]);
+        request.extend(handle.to_le_bytes());
+        request.extend(0u32.to_le_bytes());
+        request.extend(0u64.to_le_bytes());
+        let input = client.alloc(&request);
+        let mut payload = vec![0; 6];
+        payload.push(4);
+        client
+            .send(
+                gpu,
+                &words(Request::tipc(216), &payload).buffer_a(input, 40),
+            )
+            .unwrap();
+        context.gpu.synchronize();
+    };
+    tile(handle);
+    assert_eq!(gmmu.read::<u32>(region + 0x1_0000).unwrap(), 0xdead_beef);
+    tile(0);
+    assert_eq!(
+        gmmu.read::<u32>(region + 0x1_0000).unwrap(),
+        0x1234_5678,
+        "an unmapped tile shows the region's own memory again"
+    );
+
+    let mut destroy = vec![0];
+    destroy.extend(split(region));
+    destroy.extend(split(region + 0x20_0000 - 1));
+    destroy.extend([0, 5]);
+    client
+        .send(gpu, &words(Request::tipc(215), &destroy))
+        .unwrap();
+    context.gpu.synchronize();
+    assert!(gmmu.translate(region).is_none());
 }
