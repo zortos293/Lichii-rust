@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use lichii_crypto::sha256;
+use lichii_fs::FileExt;
 
 pub use crate::npdm::AcidLayout;
 pub use crate::npdm::tests::{NpdmSpec, build_npdm, svc_mask, thread_info};
@@ -316,4 +317,88 @@ pub fn build_nup(packages: &[NupPackage]) -> Vec<u8> {
     put(&mut out, 0x48, &(packages.len() as u32).to_le_bytes());
     put(&mut out, SUPERBLOCK_SIZE, &toc);
     out
+}
+
+/// A PFS0 image holding `files`, such as an ExeFS.
+pub fn pfs0(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    let files: Vec<_> = files
+        .iter()
+        .map(|(name, data)| {
+            (
+                (*name).to_owned(),
+                lichii_fs::MemFile::from_bytes(data.clone()),
+            )
+        })
+        .collect();
+    lichii_fs::pfs::build_partition(lichii_fs::pfs::PartitionKind::Pfs0, &files)
+        .unwrap()
+        .read_all()
+        .unwrap()
+}
+
+/// An NCA stored decrypted (`DNCA`) whose sections are PFS0 images without encryption.
+fn decrypted_nca(content_type: u8, program_id: u64, sections: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = vec![0u8; 0xc00];
+    for (index, image) in sections.iter().enumerate() {
+        let mut fs = vec![0u8; 0x200];
+        fs[0..2].copy_from_slice(&2u16.to_le_bytes());
+        fs[2] = 1;
+        fs[3] = 1;
+        fs[4] = 1;
+        let mut data = image.clone();
+        data.resize(data.len().next_multiple_of(0x200), 0);
+        let start = (out.len() / 0x200) as u32;
+        let end = start + (data.len() / 0x200) as u32;
+        let entry = 0x240 + index * 0x10;
+        put(&mut out, entry, &start.to_le_bytes());
+        put(&mut out, entry + 4, &end.to_le_bytes());
+        put(&mut out, entry + 8, &1u32.to_le_bytes());
+        put(&mut out, 0x280 + index * 0x20, &sha256(&fs));
+        put(&mut out, 0x400 + index * 0x200, &fs);
+        out.extend(data);
+    }
+    put(&mut out, 0x200, b"DNCA");
+    out[0x205] = content_type;
+    let size = out.len() as u64;
+    put(&mut out, 0x208, &size.to_le_bytes());
+    put(&mut out, 0x210, &program_id.to_le_bytes());
+    out
+}
+
+/// An NSP of a multi-program application: program `index` of `application_id` runs the
+/// ExeFS image `exefs[index]`, and the application's CNMT lists every program. Its NCAs are
+/// stored decrypted, so it loads without keys.
+pub fn multi_program_nsp(application_id: u64, exefs: &[Vec<u8>]) -> Vec<u8> {
+    const NCA_PROGRAM: u8 = 0;
+    const NCA_META: u8 = 1;
+    const CNMT_PROGRAM: u8 = 1;
+    const APPLICATION: u8 = 0x80;
+    let content_id = |index: usize| [0xa0 + index as u8; 16];
+    let hex = |id: [u8; 16]| id.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let mut files = Vec::new();
+    let mut cnmt = application_id.to_le_bytes().to_vec();
+    cnmt.extend(0u32.to_le_bytes());
+    cnmt.extend([APPLICATION, 0]);
+    cnmt.extend(16u16.to_le_bytes());
+    cnmt.extend((exefs.len() as u16).to_le_bytes());
+    cnmt.extend(0u16.to_le_bytes());
+    cnmt.extend([0u8; 12]);
+    cnmt.extend((application_id | 0x800).to_le_bytes());
+    cnmt.extend([0u8; 8]);
+    for (index, image) in exefs.iter().enumerate() {
+        let program_id = application_id + index as u64;
+        let nca = decrypted_nca(NCA_PROGRAM, program_id, std::slice::from_ref(image));
+        cnmt.extend([0u8; 32]);
+        cnmt.extend(content_id(index));
+        cnmt.extend(&(nca.len() as u64).to_le_bytes()[..6]);
+        cnmt.extend([CNMT_PROGRAM, index as u8]);
+        files.push((format!("{}.nca", hex(content_id(index))), nca));
+    }
+    let meta = pfs0(&[(&format!("{application_id:016x}.cnmt"), cnmt)]);
+    files.push((
+        format!("{}.cnmt.nca", hex([0x9f; 16])),
+        decrypted_nca(NCA_META, application_id, &[meta]),
+    ));
+    let files: Vec<(&str, Vec<u8>)> = files.iter().map(|(n, d)| (n.as_str(), d.clone())).collect();
+    pfs0(&files)
 }

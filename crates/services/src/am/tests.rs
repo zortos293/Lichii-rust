@@ -225,6 +225,120 @@ fn capture_commands_answer_without_a_shared_capture_buffer() {
     }
 }
 
+fn make_storage(client: &IpcClient, proxy: Handle, data: &[u8]) -> Handle {
+    let creator = interface(client, proxy, 11);
+    let request = Request::new(10).arg(data.len() as i64);
+    let storage = client.send(creator, &request).unwrap().move_handles[0];
+    let accessor = interface(client, storage, 0);
+    let input = client.alloc(data);
+    let write = Request::new(10)
+        .arg(0i64)
+        .buffer_a(input, data.len() as u64);
+    assert_eq!(
+        client.send(accessor, &write).unwrap().result,
+        ResultCode::SUCCESS
+    );
+    storage
+}
+
+fn pop_user_channel(client: &IpcClient, functions: Handle, size: usize) -> Option<Vec<u8>> {
+    let reply = client.send(functions, &Request::new(1).arg(1u32)).unwrap();
+    if reply.result != ResultCode::SUCCESS {
+        assert_eq!(reply.result, NO_DATA_IN_CHANNEL);
+        return None;
+    }
+    let accessor = interface(client, reply.move_handles[0], 0);
+    let output = client.alloc(&vec![0; size]);
+    let read = Request::new(11).arg(0i64).buffer_b(output, size as u64);
+    assert_eq!(
+        client.send(accessor, &read).unwrap().result,
+        ResultCode::SUCCESS
+    );
+    Some(client.read(output, size))
+}
+
+#[test]
+fn execute_program_hands_the_user_channel_to_the_session() {
+    const APPLICATION: u64 = 0x0100_0000_0001_0000;
+    let session = Arc::new(crate::testing::RecordedPrograms::default());
+    let (context, client) = crate::testing::context_with_session(
+        lichii_kernel::testing::program_image(APPLICATION + 1),
+        Settings::default(),
+        session.clone(),
+    );
+    register(&context).unwrap();
+    let proxy = open(&client, 0);
+    let functions = interface(&client, proxy, 20);
+    let push = Request::new(122).move_handle(make_storage(&client, proxy, b"handover"));
+    assert_eq!(
+        client.send(functions, &push).unwrap().result,
+        ResultCode::SUCCESS
+    );
+
+    let call = |request: Request| client.send(functions, &request).unwrap().result;
+    assert_eq!(
+        call(Request::new(120).arg(0u32).arg(2u64)),
+        ResultCode::SUCCESS
+    );
+    assert_eq!(
+        call(Request::new(120).arg(2u32).arg(0u64)),
+        ResultCode::SUCCESS
+    );
+    assert_eq!(call(Request::new(120).arg(1u32).arg(2u64)), UNKNOWN);
+    assert_eq!(call(Request::new(120).arg(0u32).arg(0x100u64)), UNKNOWN);
+    assert_eq!(call(Request::new(12).arg(0u64)), ResultCode::SUCCESS);
+    assert_eq!(
+        call(Request::new(12).arg(APPLICATION + 3)),
+        ResultCode::SUCCESS
+    );
+    assert_eq!(
+        call(Request::new(12).arg(0x0100_0000_0002_0000u64)),
+        UNKNOWN,
+        "another application"
+    );
+
+    let handover = vec![b"handover".to_vec()];
+    assert_eq!(
+        *session.0.lock(),
+        [
+            (2, handover.clone()),
+            (0, handover.clone()),
+            (0, handover.clone()),
+            (3, handover),
+        ]
+    );
+    assert_eq!(
+        pop_user_channel(&client, functions, 8).as_deref(),
+        Some(&b"handover"[..]),
+        "the title keeps its own user channel"
+    );
+}
+
+#[test]
+fn a_restarted_program_pops_the_user_channel_it_was_handed() {
+    let (context, client, proxy) = booted(SWITCH1_TITLE);
+    let functions = interface(&client, proxy, 20);
+    let previous = |client: &IpcClient| {
+        let mut reply = client.send(functions, &Request::new(123)).unwrap();
+        reply.pop::<i32>()
+    };
+    assert_eq!(previous(&client), -1, "a fresh boot");
+    context.receive_handover(crate::Handover {
+        previous_program_index: 2,
+        user_channel: vec![b"first".to_vec(), b"second".to_vec()],
+    });
+    assert_eq!(previous(&client), 2);
+    assert_eq!(
+        pop_user_channel(&client, functions, 6).as_deref(),
+        Some(&b"second"[..])
+    );
+    assert_eq!(
+        pop_user_channel(&client, functions, 5).as_deref(),
+        Some(&b"first"[..])
+    );
+    assert_eq!(pop_user_channel(&client, functions, 5), None);
+}
+
 #[test]
 fn an_unpopped_storage_is_the_next_launch_parameter() {
     let (_context, client, proxy) = booted(SWITCH1_TITLE);

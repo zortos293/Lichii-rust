@@ -500,6 +500,12 @@ impl App {
 
     /// Boots the title at `path`, with its custom configuration unless `without_custom`.
     fn boot(&mut self, path: PathBuf, without_custom: bool) {
+        self.start(path, without_custom, None);
+    }
+
+    /// Boots `path`, or with `restart`, the program its running session asked for in that
+    /// session's place.
+    fn start(&mut self, path: PathBuf, without_custom: bool, restart: Option<(Session, u8)>) {
         if self.firmware.is_some() {
             self.toast("Wait for the firmware install to finish");
             return;
@@ -539,7 +545,13 @@ impl App {
         let applets = AppletDialogs::new(self.settings.system.username.clone(), move || {
             let _ = proxy.send_event(UserEvent::Wake);
         });
-        match Session::boot(&path, options, Some(applets), configure) {
+        let booted = match restart {
+            Some((session, program_index)) => {
+                session.execute_program(program_index, options, Some(applets), configure)
+            }
+            None => Session::boot(&path, options, Some(applets), configure),
+        };
+        match booted {
             Ok(session) => {
                 self.session = Some(session);
                 self.without_custom = without_custom;
@@ -588,6 +600,14 @@ Dump prod.keys and title.keys \
                 self.ui.error = Some(format!(
                     "The title stopped with a break (reason {reason:#x})"
                 ))
+            }
+            ExitReason::ExecuteProgram { program_index } => {
+                let Some(session) = self.session.take() else {
+                    return;
+                };
+                let path = session.path.clone();
+                self.start(path, self.without_custom, Some((session, program_index)));
+                return;
             }
         }
         self.stop();

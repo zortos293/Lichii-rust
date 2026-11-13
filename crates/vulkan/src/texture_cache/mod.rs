@@ -416,6 +416,8 @@ pub struct TextureCache {
     tick: u64,
     visit: u64,
     traffic: Traffic,
+    /// Images removed so far; see [`TextureCache::removals`].
+    removals: u64,
     ids: Vec<ImageId>,
     joins: Vec<(ImageId, u32, u32)>,
     segments: Vec<Segment>,
@@ -563,6 +565,7 @@ impl TextureCache {
             tick: 0,
             visit: 0,
             traffic: Traffic::default(),
+            removals: 0,
             ids: Vec::new(),
             joins: Vec::new(),
             segments: Vec::new(),
@@ -653,6 +656,12 @@ impl TextureCache {
         })
     }
 
+    /// How many images have been removed so far. A lookup removes the overlapping images it
+    /// cannot reuse, so ids taken before a lookup that changes this may name removed images.
+    pub fn removals(&self) -> u64 {
+        self.removals
+    }
+
     /// Number of live images.
     pub fn len(&self) -> usize {
         self.slots.iter().filter(|s| s.image.is_some()).count()
@@ -739,7 +748,7 @@ impl TextureCache {
 
     /// A view of a cached image. `None` when the image cannot be read as `view.format`.
     pub fn view(&mut self, id: ImageId, view: &ViewInfo) -> Result<Option<vk::ImageView>> {
-        if !self.view_compatible(id, view.format) {
+        if self.get(id).is_none() || !self.view_compatible(id, view.format) {
             return Ok(None);
         }
         let host = self.host(view.format);
@@ -803,6 +812,9 @@ impl TextureCache {
     /// Scales `id` back to native resolution, keeping its contents: Lichii does so for images a
     /// shader writes as storage images, which the shader cannot address at a scale.
     pub fn scale_down(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
+        if self.get(id).is_none() {
+            return Ok(());
+        }
         self.rescale(tx, id, ResolutionScale::X1, true)
     }
 
@@ -838,8 +850,25 @@ impl TextureCache {
         Ok(raw)
     }
 
-    /// Records the barrier that makes the image ready for `access` and returns it.
+    /// Records the barrier that makes the image ready for `access` and returns it; `None`, with
+    /// a warning, once the image was removed.
     pub fn prepare(
+        &mut self,
+        cmd: vk::CommandBuffer,
+        id: ImageId,
+        access: ImageAccess,
+    ) -> Option<vk::Image> {
+        if self.get(id).is_none() {
+            tracing::warn!(
+                ?id,
+                "preparing a removed texture cache image; skipping its barrier"
+            );
+            return None;
+        }
+        Some(self.prepare_live(cmd, id, access))
+    }
+
+    fn prepare_live(
         &mut self,
         cmd: vk::CommandBuffer,
         id: ImageId,
@@ -862,7 +891,9 @@ impl TextureCache {
         }
         self.tick += 1;
         let tick = self.tick;
-        let image = self.image(id);
+        let Some(image) = self.get_mut(id) else {
+            return;
+        };
         image.gpu_modified = true;
         image.cpu_dirty = false;
         image.modified = tick;
@@ -1538,7 +1569,7 @@ impl TextureCache {
                 });
             }
             let src = self.image(join).image.raw();
-            let dst = self.prepare(cmd, id, ImageAccess::TRANSFER_DST);
+            let dst = self.prepare_live(cmd, id, ImageAccess::TRANSFER_DST);
             // SAFETY: both images are in the layouts named and the regions lie inside them.
             unsafe {
                 device.raw.cmd_copy_image(
@@ -1612,6 +1643,7 @@ impl TextureCache {
             return;
         };
         slot.generation = slot.generation.wrapping_add(1);
+        self.removals += 1;
         self.free.push(id.index);
         for s in &image.segments {
             for page in pages(s.daddr, s.size) {

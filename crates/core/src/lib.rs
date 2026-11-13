@@ -22,10 +22,14 @@ use lichii_input::hub::NpadHub;
 use lichii_kernel::process::Process;
 use lichii_kernel::{Kernel, KernelConfig, KernelError, KernelEvents};
 use lichii_loader::{LoadOptions, LoaderError, ProgramImage};
-use lichii_services::{ServiceContext, ServiceParts};
+use lichii_services::{ServiceContext, ServiceParts, SessionEvents};
 use parking_lot::{Condvar, Mutex};
 
 pub use crate::timing::CoreTiming;
+pub use lichii_services::Handover;
+
+/// The bits of a program id that name the program within its application.
+pub const PROGRAM_INDEX_MASK: u64 = 0x7ff;
 pub use lichii_common::perf::PerfStats;
 
 #[derive(Debug, thiserror::Error)]
@@ -50,6 +54,11 @@ pub enum ExitReason {
     Exited,
     /// The process called `svcBreak` with a non-notification reason (an abort or a panic).
     Break { reason: u32 },
+    /// The title asked to start program `program_index` of its application in its place
+    /// (`ExecuteProgram`, `CreateApplicationAndRequestToStart`). Boot it with
+    /// `LoadOptions::program_index`, and hand it [`System::take_handover`] through
+    /// [`System::set_handover`] before [`System::run`].
+    ExecuteProgram { program_index: u8 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,6 +190,7 @@ impl System {
             npad: npad.clone(),
             perf: perf.clone(),
             audio: audio.clone(),
+            session: exit.clone(),
         });
         if let Err(code) = lichii_services::register_all(&services) {
             kernel.shutdown();
@@ -359,6 +369,22 @@ impl System {
         &self.npad
     }
 
+    /// What the title leaves the program it asked to start ([`ExitReason::ExecuteProgram`]): its
+    /// program index and its user channel, which is empty unless the title asked, and after the
+    /// first call.
+    pub fn take_handover(&self) -> Handover {
+        Handover {
+            previous_program_index: (self.program.program_id & PROGRAM_INDEX_MASK) as u8,
+            user_channel: std::mem::take(&mut *self.exit.user_channel.lock()),
+        }
+    }
+
+    /// Gives the title what the program before it handed over. Call it before the first
+    /// [`System::run`].
+    pub fn set_handover(&self, handover: Handover) {
+        self.services.receive_handover(handover);
+    }
+
     /// Frame and performance counters for the frontend overlay.
     pub fn perf(&self) -> &Arc<PerfStats> {
         &self.perf
@@ -381,6 +407,7 @@ fn entropy() -> u64 {
 struct ExitSignal {
     reason: Mutex<Option<ExitReason>>,
     changed: Condvar,
+    user_channel: Mutex<Vec<Vec<u8>>>,
 }
 
 impl ExitSignal {
@@ -406,6 +433,16 @@ impl ExitSignal {
             }
         }
         *slot
+    }
+}
+
+impl SessionEvents for ExitSignal {
+    fn execute_program(&self, program_index: u8, user_channel: Vec<Vec<u8>>) {
+        if self.reason.lock().is_some() {
+            return;
+        }
+        *self.user_channel.lock() = user_channel;
+        self.set(ExitReason::ExecuteProgram { program_index });
     }
 }
 
