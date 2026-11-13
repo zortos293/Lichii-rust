@@ -15,6 +15,7 @@ pub mod mix;
 pub mod nodes;
 pub mod parameter;
 pub mod performance;
+pub mod render;
 pub mod result;
 pub mod revision;
 pub mod sink;

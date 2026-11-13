@@ -5,7 +5,7 @@ use std::process::Command;
 
 use lichii_common::settings::ResolutionScale;
 use rspirv::dr::{self, Operand};
-use rspirv::spirv::{Decoration, Op, StorageClass};
+use rspirv::spirv::{Capability, Decoration, GlslStd450Op, Op, StorageClass};
 
 use super::{EmitError, emit_spirv};
 use crate::backend::Bindings;
@@ -823,6 +823,82 @@ fn generic_input_types_follow_the_vertex_attribute_formats() {
     runtime.generic_input_types[2] = AttributeType::SignedScaled;
     runtime.generic_input_types[3] = AttributeType::Disabled;
     emit("generic_inputs", &Profile::default(), &runtime, &program);
+}
+
+/// InterpolateAtOffset on a float input, an integer (flat) input and an input the previous stage
+/// does not write.
+#[test]
+fn interpolate_at_offset_follows_the_generic_input_types() {
+    let mut s = Synthetic::new();
+    let b = s.block();
+    s.inst(b, Opcode::Prologue, &[]);
+    let x = s.inst(
+        b,
+        Opcode::GetAttribute,
+        &[Value::Attribute(Attribute::generic(3, 0)), Value::U32(0)],
+    );
+    for index in 0..3u16 {
+        let value = s.inst(
+            b,
+            Opcode::InterpolateAtOffset,
+            &[
+                Value::Attribute(Attribute::generic(index, 1)),
+                x,
+                Value::F32(-0.25),
+            ],
+        );
+        s.inst(
+            b,
+            Opcode::SetFragColor,
+            &[Value::U32(0), Value::U32(u32::from(index)), value],
+        );
+    }
+    s.inst(b, Opcode::Epilogue, &[]);
+    let mut attributes: Vec<Attribute> = (0..3).map(|i| Attribute::generic(i, 1)).collect();
+    attributes.push(Attribute::generic(3, 0));
+    let info = ShaderInfo {
+        loads: varying(&attributes),
+        stores_frag_color: [true, false, false, false, false, false, false, false],
+        ..ShaderInfo::default()
+    };
+    let program = s.finish(
+        vec![SyntaxNode::Block(b), SyntaxNode::Return],
+        ShaderStage::Fragment,
+        info,
+    );
+    let mut runtime = RuntimeInfo {
+        previous_stage_stores: varying(&[
+            Attribute::generic(0, 1),
+            Attribute::generic(1, 1),
+            Attribute::generic(3, 0),
+        ]),
+        ..RuntimeInfo::default()
+    };
+    runtime.generic_input_types[1] = AttributeType::SignedInt;
+    let module = emit(
+        "interpolate_at_offset",
+        &Profile::default(),
+        &runtime,
+        &program,
+    );
+    let interpolations = module
+        .functions
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.instructions)
+        .filter(|i| {
+            i.class.opcode == Op::ExtInst
+                && i.operands[1]
+                    == Operand::LiteralExtInstInteger(GlslStd450Op::InterpolateAtOffset as u32)
+        })
+        .count();
+    assert_eq!(interpolations, 1);
+    assert!(
+        module
+            .capabilities
+            .iter()
+            .any(|c| c.operands[0] == Operand::Capability(Capability::InterpolationFunction))
+    );
 }
 
 mod memory;
