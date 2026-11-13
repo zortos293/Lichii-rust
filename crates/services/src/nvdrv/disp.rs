@@ -35,20 +35,29 @@ impl Nvdrv {
         NvResult::Success
     }
 
-    /// Keeps nvmap buffer `handle` in device space while a vi buffer queue holds it. False when
-    /// the handle cannot be pinned.
+    /// Holds nvmap buffer `handle` for a vi buffer queue: a reference keeps it, and its device
+    /// mapping, after the guest frees it, and a pin keeps it in device space. False when the
+    /// handle cannot be held.
     pub(crate) fn pin_buffer(&self, handle: u32) -> bool {
-        match self.nvmap.pin(handle) {
-            Ok(_) => true,
-            Err(error) => {
-                tracing::warn!(handle, ?error, "vi: pinning a preallocated buffer");
-                false
-            }
+        let held =
+            self.nvmap
+                .duplicate_internal(handle)
+                .and_then(|()| match self.nvmap.pin(handle) {
+                    Ok(_) => Ok(()),
+                    Err(error) => {
+                        self.nvmap.free_internal(handle);
+                        Err(error)
+                    }
+                });
+        if let Err(error) = held {
+            tracing::warn!(handle, ?error, "vi: holding a preallocated buffer");
         }
+        held.is_ok()
     }
 
-    /// Drops a pin [`Nvdrv::pin_buffer`] took.
+    /// Lets go of a buffer [`Nvdrv::pin_buffer`] held.
     pub(crate) fn unpin_buffer(&self, handle: u32) {
         self.nvmap.unpin(handle);
+        self.nvmap.free_internal(handle);
     }
 }

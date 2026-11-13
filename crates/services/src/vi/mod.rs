@@ -251,8 +251,10 @@ impl Vi {
         }
     }
 
-    /// Shows the next frame of the top-most visible layer of the Default display. With
-    /// `latest`, layers skip to their newest frame and ignore swap intervals.
+    /// Shows the next frame of the top-most visible layer of the Default display that has a
+    /// frame. While that layer holds its frame (swap interval) or has none queued, the screen
+    /// keeps it; the layers below are drained without being shown. With `latest`, layers skip to
+    /// their newest frame and ignore swap intervals.
     fn compose(&self, frame: u64, latest: bool) {
         let mut layers: Vec<(i64, Arc<BufferQueue>)> = {
             let state = self.state.lock();
@@ -264,13 +266,12 @@ impl Vi {
                 .collect()
         };
         layers.sort_by_key(|(z, _)| std::cmp::Reverse(*z));
-        let mut shown = false;
-        for (_, queue) in &layers {
+        let top = layers.iter().position(|(_, queue)| queue.has_frames());
+        for (index, (_, queue)) in layers.iter().enumerate() {
             let Some(item) = queue.acquire(frame, latest) else {
                 continue;
             };
-            if !shown {
-                shown = true;
+            if Some(index) == top {
                 self.flip(&item);
             }
             queue.release(&item);

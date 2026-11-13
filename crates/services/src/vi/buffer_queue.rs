@@ -155,6 +155,8 @@ struct State {
     /// The compositor frame before which no new item is taken: the frame shown last stays for
     /// its swap interval.
     hold_until: u64,
+    /// The compositor took a frame since the producer connected.
+    shown: bool,
     /// DequeueBuffer requests waiting for a free slot.
     waiting: Vec<DeferredRequest>,
 }
@@ -202,6 +204,7 @@ impl BufferQueue {
                 default_format: 1,
                 frames: 0,
                 hold_until: 0,
+                shown: false,
                 waiting: Vec::new(),
             }),
             released: Arc::new(Event::new()),
@@ -347,6 +350,7 @@ impl BufferQueue {
                     NO_INIT
                 } else {
                     state.connected = false;
+                    state.shown = false;
                     state.queue.clear();
                     let freed = std::mem::replace(&mut state.slots, [Slot::EMPTY; SLOTS]);
                     freed.iter().for_each(|slot| self.unpin(slot));
@@ -427,7 +431,14 @@ impl BufferQueue {
         }
         state.slots[item.slot].state = SlotState::Acquired;
         state.hold_until = frame + u64::from(item.swap_interval);
+        state.shown = true;
         Some(item)
+    }
+
+    /// The layer has a frame on screen or queued: it covers the layers below it.
+    pub fn has_frames(&self) -> bool {
+        let state = self.state.lock();
+        state.shown || !state.queue.is_empty()
     }
 
     /// Gives a shown frame's buffer back to the producer.
