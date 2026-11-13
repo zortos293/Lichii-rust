@@ -1510,3 +1510,36 @@ fn guest_stores_to_read_only_pages_fault_on_every_backend() {
         }
     }
 }
+
+#[test]
+fn fp_selects_consume_fused_compares() {
+    const SETTERS: [u32; 6] = [
+        0xeb01_001f,
+        0xab01_001f,
+        0xea01_001f,
+        0x6b01_001f,
+        0x2b01_001f,
+        0x6a01_001f,
+    ];
+    const VALUES: [u64; 4] = [0, 1, 0x8000_0000, u64::MAX];
+    const FMOV_D1_X3: u32 = 0x9e67_0061;
+    const FMOV_D2_X4: u32 = 0x9e67_0082;
+    for setter in SETTERS {
+        for cond in 0..16 {
+            for fcsel in [0x1e22_0c20, 0x1e62_0c20] {
+                let code = [FMOV_D1_X3, FMOV_D2_X4, setter, fcsel | cond << 12];
+                for (a, b) in VALUES.into_iter().flat_map(|a| VALUES.map(|b| (a, b))) {
+                    directed(
+                        &code,
+                        &[
+                            (0, a),
+                            (1, b),
+                            (3, 0x3ff0_0000_0000_0001),
+                            (4, 0x4000_0000_0000_0002),
+                        ],
+                    );
+                }
+            }
+        }
+    }
+}
