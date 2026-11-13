@@ -110,6 +110,7 @@ const _: () = assert!(size_of::<EffectOutStatusV1>() == 0x10);
 pub struct EffectResultState {
     pub state: [u8; EFFECT_RESULT_STATE_SIZE],
 }
+const _: () = assert!(size_of::<EffectResultState>() == 0x80);
 
 impl Default for EffectResultState {
     fn default() -> Self {
