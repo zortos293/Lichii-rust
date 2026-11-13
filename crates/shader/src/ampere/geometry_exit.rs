@@ -45,7 +45,10 @@ pub fn analyze(read: impl Fn(usize) -> Instruction) -> Result<u32, NotAnEnvelope
     let fail = |index: usize, reason| Err(NotAnEnvelope { index, reason });
     let target = word(read(1), 1);
     let handler = (target / INSTRUCTION_SIZE) as usize;
-    if target % INSTRUCTION_SIZE != 0 || handler <= setup + 1 || handler + 3 > MAX_INSTRUCTIONS {
+    if !target.is_multiple_of(INSTRUCTION_SIZE)
+        || handler <= setup + 1
+        || handler + 3 > MAX_INSTRUCTIONS
+    {
         return fail(1, "native exit handler location");
     }
     let code: Vec<Instruction> = (0..handler + 3).map(read).collect();
@@ -89,7 +92,7 @@ pub fn analyze(read: impl Fn(usize) -> Instruction) -> Result<u32, NotAnEnvelope
         return fail(handler - 1, "native exit handler reached by fallthrough");
     }
 
-    for index in setup..handler {
+    for (index, &inst) in code.iter().enumerate().take(handler).skip(setup) {
         let opcode = bits(index, 0, 12);
         let family = opcode & 0x1ff;
         if family == 0x14e || (0x154..=0x157).contains(&family) {
@@ -107,7 +110,6 @@ pub fn analyze(read: impl Fn(usize) -> Instruction) -> Result<u32, NotAnEnvelope
         {
             continue;
         }
-        let inst = code[index];
         let noinc_call = opcode == 0x944 && word(inst, 2) & 0x40_0000 != 0;
         if opcode != 0x945 && opcode != 0x947 && !noinc_call {
             return fail(index, "native control flow in exit envelope body");
