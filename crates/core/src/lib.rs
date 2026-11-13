@@ -10,6 +10,7 @@ mod timing;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant, SystemTime};
 
 use lichii_audio::sink::Sink;
@@ -291,9 +292,9 @@ impl System {
         if self.state == State::Stopped {
             return;
         }
-        self.gpu.shutdown();
+        noting_slow("stopping the GPU", || self.gpu.shutdown());
         self.audio.set_paused(true);
-        self.kernel.shutdown();
+        noting_slow("stopping the kernel", || self.kernel.shutdown());
         self.state = State::Stopped;
         tracing::info!("stopped");
     }
@@ -394,6 +395,27 @@ impl System {
 impl Drop for System {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// Runs one step of [`System::stop`], warning when it takes longer than [`SLOW_STOP`] and
+/// again when it ends, so a stop that hangs says which step.
+fn noting_slow(step: &'static str, run: impl FnOnce()) {
+    const SLOW_STOP: Duration = Duration::from_secs(5);
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let watchdog = std::thread::Builder::new()
+        .name("stop watchdog".into())
+        .spawn(move || {
+            if finished.recv_timeout(SLOW_STOP) == Err(RecvTimeoutError::Timeout) {
+                tracing::warn!("{step} takes longer than {SLOW_STOP:?}");
+                let _ = finished.recv();
+                tracing::warn!("{step} finished");
+            }
+        });
+    run();
+    drop(done);
+    if let Ok(watchdog) = watchdog {
+        let _ = watchdog.join();
     }
 }
 
