@@ -6,6 +6,7 @@
 mod audctl;
 mod audin;
 mod audout;
+mod hwacod;
 mod hwopus;
 #[cfg(test)]
 mod tests;
