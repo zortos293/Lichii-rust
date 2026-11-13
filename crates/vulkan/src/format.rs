@@ -360,12 +360,16 @@ pub fn host_format(
         if viewable_as_attachment(attachable, swizzle)
             && supports(native_format, attachable, storage)
         {
+            let linear = format.to_linear();
+            let stored_as_linear = linear != format
+                && viewable_as_attachment(true, swizzle)
+                && host_format(device, linear, recompression).storage;
             return HostFormat {
                 format: native_format,
                 conversion: Conversion::None,
                 swizzle,
                 attachable,
-                storage,
+                storage: storage || stored_as_linear,
             };
         }
         let candidate = alternatives(native_format)

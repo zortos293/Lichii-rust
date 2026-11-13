@@ -321,7 +321,38 @@ impl Image {
             self.desc.format,
             components,
             self.full_range(),
+            self.view_usage(self.desc.format),
         )
+    }
+
+    /// The usage a view read as `format` must declare: `None` (the image's usage) unless the
+    /// image was created with `EXTENDED_USAGE`, whose usage can include features `format`
+    /// lacks, such as storage on an sRGB image stored through its linear twin.
+    pub fn view_usage(&self, format: vk::Format) -> Option<vk::ImageUsageFlags> {
+        if !self
+            .desc
+            .flags
+            .contains(vk::ImageCreateFlags::EXTENDED_USAGE)
+        {
+            return None;
+        }
+        let features = self.device.format_features(format);
+        let mut usage = self.desc.usage;
+        for (flag, feature) in [
+            (
+                vk::ImageUsageFlags::STORAGE,
+                vk::FormatFeatureFlags::STORAGE_IMAGE,
+            ),
+            (
+                vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                vk::FormatFeatureFlags::COLOR_ATTACHMENT,
+            ),
+        ] {
+            if !features.contains(feature) {
+                usage &= !flag;
+            }
+        }
+        Some(usage)
     }
 }
 
@@ -344,7 +375,7 @@ pub struct ImageView {
 
 impl ImageView {
     /// Creates a view of `range` of `image` read as `format`, with channels remapped by
-    /// `components`.
+    /// `components`, declaring `usage` when set (see [`Image::view_usage`]).
     pub fn new(
         device: &Arc<Device>,
         image: vk::Image,
@@ -352,13 +383,19 @@ impl ImageView {
         format: vk::Format,
         components: vk::ComponentMapping,
         range: vk::ImageSubresourceRange,
+        usage: Option<vk::ImageUsageFlags>,
     ) -> Result<Self> {
-        let info = vk::ImageViewCreateInfo::default()
+        let mut usage_info =
+            vk::ImageViewUsageCreateInfo::default().usage(usage.unwrap_or_default());
+        let mut info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(view_type)
             .format(format)
             .components(components)
             .subresource_range(range);
+        if usage.is_some() {
+            info = info.push_next(&mut usage_info);
+        }
         // SAFETY: `image` is a live image of this device compatible with the view.
         let raw = unsafe {
             device
