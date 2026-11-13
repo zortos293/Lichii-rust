@@ -121,21 +121,7 @@ enum Extend {
 
 /// Whether the host reads `bits`-wide storage directly, and the type and view it reads with.
 fn small_view(ctx: &EmitContext<'_>, bits: u32, extend: Extend) -> Option<(Word, StorageElement)> {
-    let profile = ctx.profile;
-    let (supported, storage) = if bits == 8 {
-        (profile.support_int8, profile.support_storage_buffer_8bit)
-    } else {
-        (profile.support_int16, profile.support_storage_buffer_16bit)
-    };
-    if !(supported && storage && profile.support_descriptor_aliasing) {
-        return None;
-    }
-    Some(match (bits, extend) {
-        (8, Extend::Zero) => (ctx.u8, StorageElement::U8),
-        (8, Extend::Sign) => (ctx.s8, StorageElement::S8),
-        (_, Extend::Zero) => (ctx.u16, StorageElement::U16),
-        (_, Extend::Sign) => (ctx.s16, StorageElement::S16),
-    })
+    ctx.small_storage_view(bits, matches!(extend, Extend::Sign))
 }
 
 fn small_bit_offset(ctx: &mut EmitContext<'_>, inst: InstId, bits: u32) -> EmitResult<Word> {
@@ -277,23 +263,24 @@ fn write_global(ctx: &mut EmitContext<'_>, inst: InstId, func: Word) -> EmitResu
     Ok(())
 }
 
-const UNTRACKED_SMALL_GLOBAL: EmitError =
-    EmitError::Unsupported("8 and 16-bit global memory access the storage buffer pass left");
-
-pub(super) fn load_global_u8(_ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<Word> {
-    Err(UNTRACKED_SMALL_GLOBAL)
+pub(super) fn load_global_u8(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
+    let func = ctx.load_global_small_funcs[0];
+    load_global(ctx, inst, func, 1)
 }
 
-pub(super) fn load_global_s8(_ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<Word> {
-    Err(UNTRACKED_SMALL_GLOBAL)
+pub(super) fn load_global_s8(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
+    let func = ctx.load_global_small_funcs[1];
+    load_global(ctx, inst, func, 1)
 }
 
-pub(super) fn load_global_u16(_ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<Word> {
-    Err(UNTRACKED_SMALL_GLOBAL)
+pub(super) fn load_global_u16(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
+    let func = ctx.load_global_small_funcs[2];
+    load_global(ctx, inst, func, 1)
 }
 
-pub(super) fn load_global_s16(_ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<Word> {
-    Err(UNTRACKED_SMALL_GLOBAL)
+pub(super) fn load_global_s16(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
+    let func = ctx.load_global_small_funcs[3];
+    load_global(ctx, inst, func, 1)
 }
 
 pub(super) fn load_global32(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
@@ -311,20 +298,24 @@ pub(super) fn load_global128(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitRes
     load_global(ctx, inst, func, 4)
 }
 
-pub(super) fn write_global_u8(_ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<()> {
-    Err(UNTRACKED_SMALL_GLOBAL)
+pub(super) fn write_global_u8(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<()> {
+    let func = ctx.write_global_small_funcs[0];
+    write_global(ctx, inst, func)
 }
 
-pub(super) fn write_global_s8(_ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<()> {
-    Err(UNTRACKED_SMALL_GLOBAL)
+pub(super) fn write_global_s8(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<()> {
+    let func = ctx.write_global_small_funcs[0];
+    write_global(ctx, inst, func)
 }
 
-pub(super) fn write_global_u16(_ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<()> {
-    Err(UNTRACKED_SMALL_GLOBAL)
+pub(super) fn write_global_u16(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<()> {
+    let func = ctx.write_global_small_funcs[1];
+    write_global(ctx, inst, func)
 }
 
-pub(super) fn write_global_s16(_ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<()> {
-    Err(UNTRACKED_SMALL_GLOBAL)
+pub(super) fn write_global_s16(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<()> {
+    let func = ctx.write_global_small_funcs[1];
+    write_global(ctx, inst, func)
 }
 
 pub(super) fn write_global32(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<()> {

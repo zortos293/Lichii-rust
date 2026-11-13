@@ -1106,6 +1106,62 @@ mod tests {
     }
 
     #[test]
+    fn narrow_global_accesses_compile_to_valid_spirv() {
+        let load = encode(
+            Opcode::Ldg,
+            Form::UniformAddress,
+            f(16, 1)
+                | f(24, 2)
+                | f(32, 4)
+                | f(40, 0xfffff0)
+                | f(64, 6)
+                | f(67, 1)
+                | f(72, 1)
+                | f(90, 1)
+                | f(91, 1),
+        );
+        let store = encode(
+            Opcode::Stg,
+            Form::UniformAddress,
+            f(24, 255) | f(32, 1) | f(64, 4) | f(72, 1) | f(73, 3) | f(91, 1),
+        );
+        let env = super::super::integer::tests::fragment_env(&[load, store]);
+        let words = crate::Profile {
+            support_int64: true,
+            ..crate::Profile::default()
+        };
+        let views = crate::Profile {
+            support_int8: true,
+            support_int16: true,
+            support_storage_buffer_8bit: true,
+            support_storage_buffer_16bit: true,
+            ..words.clone()
+        };
+        let host = crate::profile::HostTranslateInfo {
+            support_int64: true,
+            ..crate::profile::HostTranslateInfo::default()
+        };
+        for (name, profile) in [
+            ("ampere-narrow-global-words", &words),
+            ("ampere-narrow-global-views", &views),
+        ] {
+            let options = crate::translate::TranslateOptions {
+                profile,
+                host: &host,
+                resolution_scale: ResolutionScale::X1,
+            };
+            let module = crate::module::compile(
+                &env,
+                options,
+                &crate::RuntimeInfo::default(),
+                &mut crate::backend::Bindings::default(),
+            )
+            .expect("compiles");
+            crate::backend::spirv::tests::validate(name, profile, &module.spirv);
+        }
+    }
+
+    #[test]
     fn ldg_memory_descriptor_is_not_an_address() {
         let insn = encode(
             Opcode::Ldg,
