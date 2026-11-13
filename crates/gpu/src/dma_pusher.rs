@@ -802,6 +802,8 @@ impl Dispatch<'_> {
             (HostClass::Ampere, _) => shared.shared_macros.as_mut(),
         };
         if let Some(engine) = engine {
+            A0_MACRO.with(|m| m.set(pending.method));
+            A0_PARAMS.with(|p| { let mut p = p.borrow_mut(); p.clear(); p.extend(pending.parameters.iter().take(24)); });
             let mut host = FrontMacroHost {
                 target,
                 graphics,
@@ -814,9 +816,28 @@ impl Dispatch<'_> {
             {
                 tracing::warn!(%error, method = pending.method, "macro call failed");
             }
+            A0_MACRO.with(|m| m.set(0));
         }
         pending.parameters.clear();
     }
+}
+
+thread_local! {
+    static A0_MACRO: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static A0_PARAMS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn a0_check(engine: &str, regs: &[u32], method: u32) {
+    if method != 0x6c3 || regs[0x6c0] != 0 || regs[0x6c1] != 0 {
+        return;
+    }
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if !crate::diag_ring::first(&N, 16) {
+        return;
+    }
+    let m = A0_MACRO.with(|m| m.get());
+    let params = A0_PARAMS.with(|p| format!("{:x?}", p.borrow()));
+    tracing::warn!("DIAG a0 front {engine} report to 0 from {} d={:#x} params={}", if m == 0 { "pushbuffer".to_string() } else { format!("macro {:#x}", m) }, regs[0x6c3], if m == 0 { String::new() } else { params });
 }
 
 #[inline]
@@ -843,6 +864,7 @@ fn send_graphics(state: &mut RegisterState, stream: &mut Stream, method: u32, ar
             }
         }
     }
+    a0_check("3d", state.regs.words(), method);
     stream.engine_word(EngineKind::Maxwell3d, method, argument);
 }
 
@@ -850,6 +872,9 @@ fn send_graphics(state: &mut RegisterState, stream: &mut Stream, method: u32, ar
 fn send_compute(registers: &mut [u32], stream: &mut Stream, method: u32, argument: u32) {
     if let Some(register) = registers.get_mut(method as usize) {
         *register = argument;
+    }
+    if registers.len() > 0x6c3 {
+        a0_check("compute", registers, method);
     }
     stream.engine_word(EngineKind::Compute, method, argument);
 }
