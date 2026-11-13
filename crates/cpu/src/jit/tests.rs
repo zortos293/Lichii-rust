@@ -1322,6 +1322,47 @@ fn counter_reads_follow_the_tsc_scale() {
 }
 
 #[test]
+fn counter_reads_never_step_back_when_the_tsc_lags() {
+    const MRS_X0_CNTPCT: u32 = 0xd53b_e020;
+    let clock = Arc::new(TscClock(TscScale::new(1 << 31, 32, 1 << 40)));
+    let physical = Arc::new(PhysicalMemory::new(1 << 20).unwrap());
+    let mem = Arc::new(AddressSpace::with_fastmem(physical, 39).unwrap());
+    mem.map(CODE, 0, CODE_SIZE, MemoryPermission::READ_EXECUTE);
+    mem.write(CODE, MRS_X0_CNTPCT).unwrap();
+    mem.write(CODE + 4, BRK).unwrap();
+    let mut jit = Jit::new(CpuConfig {
+        memory: mem,
+        monitor: Arc::new(ExclusiveMonitor::new(1)),
+        clock: clock.clone(),
+        core_index: 0,
+        ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
+        dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+        accuracy: CpuAccuracy::Auto,
+    })
+    .unwrap();
+    let mut read = || {
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            ..Default::default()
+        };
+        assert_eq!(jit.run(&mut ctx), HaltReason::Breakpoint(0));
+        ctx.x[0]
+    };
+    let ahead = read();
+    clock.0.offset.fetch_sub(1 << 30, Ordering::Relaxed);
+    let lagging = read();
+    assert!(
+        lagging >= ahead,
+        "the counter went back from {ahead} to {lagging}"
+    );
+    clock.0.offset.fetch_add(1 << 31, Ordering::Relaxed);
+    assert!(
+        read() > ahead + (1 << 29),
+        "the floor holds reads back only until the counter passes it"
+    );
+}
+
+#[test]
 fn icache_maintenance_reaches_the_other_cores() {
     const IC_IVAU_X10: u32 = 0xd50b_752a;
     const IC_IALLU: u32 = 0xd508_751f;
