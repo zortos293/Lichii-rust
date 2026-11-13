@@ -17,7 +17,7 @@ const MAX_WAIT_OBJECTS: usize = 64;
 pub(super) fn signal_event(svc: &mut SvcContext) -> Flow {
     let result = match svc.object(svc.arg32(0)) {
         Some(KObject::WritableEvent(event)) => {
-            event.signal();
+            event.signal_from_guest(svc.thread.id());
             Ok(())
         }
         _ => Err(result::INVALID_HANDLE),
@@ -74,6 +74,7 @@ pub(super) fn create_event(svc: &mut SvcContext) -> Flow {
             .resource_limit()
             .reserve_owned(LimitableResource::Events, 1)?;
         let event = Arc::new(Event::reserved(reservation));
+        event.note_origin(|| format!("svcCreateEvent by thread {}", svc.thread.id()));
         let mut handles = process.handles().write();
         let writable = handles.add(KObject::WritableEvent(event.clone()))?;
         let readable = match handles.add(KObject::ReadableEvent(event)) {
