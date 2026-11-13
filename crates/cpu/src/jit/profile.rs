@@ -1,14 +1,16 @@
 //! Opt-in JIT counters for ranking JIT work on real titles. `LICHII_JIT_PROFILE=1` turns them on
 //! for every core built afterwards. Unset, no counter exists and translated code is unchanged.
 //!
-//! Each core counts into its own [`Profile`] without locks and merges it into a process-wide total
-//! when `run` returns, at most every [`FLUSH_INTERVAL`], and when the core drops. The last profiled
-//! core to drop logs the total as a table, and [`summary`] gives the frame view a line of rates.
+//! Each core counts into its own [`Profile`] without locks. When `run` returns, at most every
+//! [`FLUSH_INTERVAL`], it sends the counts down a channel, which never blocks; the frame view's
+//! [`summary`] and dropping cores lock the process-wide total and drain the channel into it. The
+//! last profiled core to drop logs the total as a table.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fmt::Write;
 use std::mem::{Discriminant, discriminant};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -21,7 +23,21 @@ static ENABLED: LazyLock<bool> = LazyLock::new(|| {
     std::env::var_os("LICHII_JIT_PROFILE").is_some_and(|v| !v.is_empty() && v != "0")
 });
 
-static GLOBAL: LazyLock<Mutex<Global>> = LazyLock::new(Mutex::default);
+static SINK: LazyLock<Sink> = LazyLock::new(|| {
+    let (tx, rx) = mpsc::channel();
+    Sink {
+        tx,
+        global: Mutex::new(Global {
+            rx,
+            total: Profile::default(),
+            live: 0,
+            cores: 0,
+            started: None,
+            last: None,
+            line: String::new(),
+        }),
+    }
+});
 
 /// Whether `LICHII_JIT_PROFILE` asks for the profile.
 pub(super) fn enabled() -> bool {
@@ -263,8 +279,14 @@ impl Profile {
     }
 }
 
-#[derive(Default)]
+/// Cores send their counts through `tx`; only the frame view and dropping cores lock `global`.
+struct Sink {
+    tx: Sender<Profile>,
+    global: Mutex<Global>,
+}
+
 struct Global {
+    rx: Receiver<Profile>,
     total: Profile,
     live: usize,
     cores: usize,
@@ -273,8 +295,16 @@ struct Global {
     line: String,
 }
 
+impl Global {
+    fn drain(&mut self) {
+        while let Ok(profile) = self.rx.try_recv() {
+            self.total.merge(profile);
+        }
+    }
+}
+
 fn global() -> MutexGuard<'static, Global> {
-    GLOBAL.lock().unwrap_or_else(|e| e.into_inner())
+    SINK.global.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Counts a new profiled core.
@@ -285,8 +315,9 @@ pub(super) fn register() {
     g.started.get_or_insert_with(Instant::now);
 }
 
+/// Hands a running core's counts to the total without taking a lock.
 pub(super) fn merge(profile: Profile) {
-    global().total.merge(profile);
+    let _ = SINK.tx.send(profile);
 }
 
 /// Merges a dropped core's last counts; the last live core logs the table and resets the total.
@@ -297,9 +328,13 @@ pub(super) fn retire(profile: Profile) {
     if g.live > 0 {
         return;
     }
-    let g = std::mem::take(&mut *g);
-    let wall = g.started.map_or(Duration::ZERO, |t| t.elapsed());
-    tracing::info!("{}", g.total.table(g.cores, wall));
+    g.drain();
+    let total = std::mem::take(&mut g.total);
+    let cores = std::mem::take(&mut g.cores);
+    let wall = g.started.take().map_or(Duration::ZERO, |t| t.elapsed());
+    g.last = None;
+    drop(g);
+    tracing::info!("{}", total.table(cores, wall));
 }
 
 /// Translation time, interpreter fallbacks and SIMD helper calls per second, over the last
@@ -309,6 +344,7 @@ pub fn summary() -> Option<String> {
         return None;
     }
     let mut g = global();
+    g.drain();
     let now = Instant::now();
     let rates = g.total.rates();
     match g.last {
