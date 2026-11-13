@@ -1,12 +1,13 @@
 //! The frame view: a performance overlay in a corner of the guest area, after Lichii's
 //! PerformanceOverlay. It shows the game's frame rate and frame time, a frame-time graph with
-//! its min, median and max, then speed, VRAM, shader builds and the render resolution.
+//! its min, median and max, a footer with the frame rate's range and the scaling features in use,
+//! then speed, VRAM, shader builds and the render resolution.
 
 use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Shape, Stroke, pos2, vec2};
 use lichii_common::perf::PerfSnapshot;
-use lichii_common::settings::{FrameViewSettings, GraphicsSettings, OverlayPosition};
-
-use crate::choices::Choice;
+use lichii_common::settings::{
+    FrameViewSettings, GraphicsSettings, OverlayPosition, ScalingFilter,
+};
 
 const WIDTH: f32 = 300.0;
 const CONTENT: f32 = 280.0;
@@ -19,14 +20,18 @@ const AXIS_X: f32 = 240.0;
 const LABEL_X: f32 = 247.0;
 const LABEL: f32 = 14.0;
 const LINE: f32 = 16.0;
+/// The footer sits this far below the graph (the graph's own 4 included), as in Lichii.
+const FOOTER_GAP: f32 = 10.0;
 const MARGIN: f32 = 8.0;
 /// A frame this much slower than the median is a spike.
 const SPIKE_RATIO: f32 = 1.2;
-/// The header's frame time averages this much recent history.
+/// The header's frame time averages this much recent history, and the footer's frame-rate range
+/// is taken over readings of this length.
 const FRAME_TIME_WINDOW_MS: f32 = 500.0;
 
 const TEXT: Color32 = Color32::from_rgb(0xF2, 0xF3, 0xF5);
 const MUTED: Color32 = Color32::from_rgb(0xA0, 0xA5, 0xAD);
+const DIM: Color32 = Color32::from_rgb(0x6E, 0x73, 0x7B);
 const SPIKE: Color32 = Color32::from_rgb(0xFF, 0x5D, 0x52);
 const AXIS: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 46);
 const MEDIAN: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 56);
@@ -73,23 +78,39 @@ fn recent_frame_time(times: &[f32]) -> Option<f32> {
     (count > 0).then(|| sum / count as f32)
 }
 
-/// The lines under the graph, each shown when its setting is on and it has a value.
-fn detail_lines(fv: &FrameViewSettings, snap: &PerfSnapshot, g: &GraphicsSettings) -> Vec<String> {
-    let mut lines = Vec::new();
-    if fv.show_fps {
-        let rates: Vec<f32> = snap
-            .game_frame_times_ms
-            .iter()
-            .filter(|ms| **ms > 0.0)
-            .map(|ms| 1000.0 / ms)
-            .collect();
-        if let Some(s) = summarize(&rates) {
-            lines.push(format!(
-                "{:.0} {:.0} {:.0} fps (min med max)",
-                s.min, s.median, s.max
-            ));
+/// Whole-number frame rates over consecutive [`FRAME_TIME_WINDOW_MS`] stretches of `times`,
+/// newest first: the readings Lichii's footer takes its min, median and max from.
+fn fps_readings(times: &[f32]) -> Vec<f32> {
+    let mut readings = Vec::new();
+    let (mut sum, mut count) = (0.0, 0);
+    for &ms in times.iter().rev() {
+        sum += ms;
+        count += 1;
+        if sum >= FRAME_TIME_WINDOW_MS {
+            readings.push((count as f32 * 1000.0 / sum).round());
+            (sum, count) = (0.0, 0);
         }
     }
+    readings
+}
+
+/// The scaling features in use, as Lichii tags them in the footer: FSR, then the resolution
+/// scale when it is not 1x.
+fn tags(g: &GraphicsSettings) -> String {
+    let mut tags = Vec::new();
+    if g.scaling_filter == ScalingFilter::Fsr {
+        tags.push("FSR".to_owned());
+    }
+    let (num, den) = g.resolution_scale.ratio();
+    if num != den {
+        tags.push(format!("{}\u{d7}", num as f32 / den as f32));
+    }
+    tags.join("  ")
+}
+
+/// The lines under the footer, each shown when its setting is on and it has a value.
+fn detail_lines(fv: &FrameViewSettings, snap: &PerfSnapshot, g: &GraphicsSettings) -> Vec<String> {
+    let mut lines = Vec::new();
     if fv.show_emulation_speed {
         let speed = snap.emulation_speed * 100.0;
         lines.push(match g.speed_limit {
@@ -109,12 +130,7 @@ fn detail_lines(fv: &FrameViewSettings, snap: &PerfSnapshot, g: &GraphicsSetting
         lines.push(format!("Building {} shaders", snap.shaders_building));
     }
     if fv.show_resolution && snap.render_width > 0 {
-        lines.push(format!(
-            "{}\u{d7}{}  {}",
-            snap.render_width,
-            snap.render_height,
-            g.scaling_filter.label()
-        ));
+        lines.push(format!("{}\u{d7}{}", snap.render_width, snap.render_height));
     }
     lines
 }
@@ -131,6 +147,7 @@ pub fn draw(
     let lines = detail_lines(fv, snap, graphics);
     let content = f32::from(u8::from(header)) * HEADER
         + f32::from(u8::from(fv.show_frame_time_graph)) * (GRAPH + 4.0)
+        + f32::from(u8::from(fv.show_fps)) * (FOOTER_GAP + LABEL)
         + lines.len() as f32 * LINE;
     if content == 0.0 {
         return;
@@ -166,7 +183,7 @@ pub fn draw(
                 at(PAD_X, y + HEADER / 2.0),
                 Align2::LEFT_CENTER,
                 fps,
-                mono(36.0),
+                mono(40.0),
                 TEXT,
             );
             painter.text(
@@ -180,10 +197,17 @@ pub fn draw(
         if fv.show_frame_time {
             let ms = recent_frame_time(&snap.game_frame_times_ms)
                 .map_or("\u{2014}".to_owned(), |ms| format!("{ms:.1}"));
-            painter.text(
+            let unit = painter.text(
                 at(right, y + HEADER * 0.3),
                 Align2::RIGHT_CENTER,
-                format!("{ms} ms"),
+                " ms",
+                mono(13.0),
+                MUTED,
+            );
+            painter.text(
+                pos2(unit.min.x, unit.center().y),
+                Align2::RIGHT_CENTER,
+                ms,
                 mono(13.0),
                 TEXT,
             );
@@ -212,6 +236,35 @@ pub fn draw(
             k,
         );
         y += GRAPH + 4.0;
+    }
+    if fv.show_fps {
+        let center = y + FOOTER_GAP - 4.0 + LABEL / 2.0;
+        let range = summarize(&fps_readings(&snap.game_frame_times_ms))
+            .map_or("\u{2014} \u{2014} \u{2014}".to_owned(), |s| {
+                format!("{:.0} {:.0} {:.0}", s.min, s.median, s.max)
+            });
+        let range = painter.text(
+            at(PAD_X, center),
+            Align2::LEFT_CENTER,
+            range,
+            mono(11.0),
+            MUTED,
+        );
+        painter.text(
+            pos2(range.max.x, range.center().y),
+            Align2::LEFT_CENTER,
+            " fps",
+            mono(11.0),
+            DIM,
+        );
+        painter.text(
+            at(right, center),
+            Align2::RIGHT_CENTER,
+            tags(graphics),
+            mono(11.0),
+            MUTED,
+        );
+        y += FOOTER_GAP + LABEL;
     }
     for line in lines {
         painter.text(
@@ -320,6 +373,7 @@ pub fn sample_snapshot() -> PerfSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lichii_common::settings::ResolutionScale;
 
     #[test]
     fn summary_and_range() {
@@ -346,6 +400,26 @@ mod tests {
         assert_eq!(recent_frame_time(&times), Some(20.0));
         assert_eq!(recent_frame_time(&[900.0]), Some(900.0));
         assert_eq!(recent_frame_time(&[]), None);
+    }
+
+    #[test]
+    fn fps_readings_cover_half_seconds_newest_first() {
+        let mut times = vec![25.0; 40];
+        times.extend([10.0; 50]);
+        assert_eq!(fps_readings(&times), [100.0, 40.0, 40.0]);
+        assert!(fps_readings(&[16.7; 20]).is_empty());
+    }
+
+    #[test]
+    fn tags_name_fsr_and_a_scale_other_than_one() {
+        let mut g = GraphicsSettings::default();
+        assert_eq!(tags(&g), "FSR");
+        g.resolution_scale = ResolutionScale::X3_4;
+        g.scaling_filter = ScalingFilter::Bilinear;
+        assert_eq!(tags(&g), "0.75\u{d7}");
+        g.scaling_filter = ScalingFilter::Fsr;
+        g.resolution_scale = ResolutionScale::X2;
+        assert_eq!(tags(&g), "FSR  2\u{d7}");
     }
 
     fn texts(fv: &FrameViewSettings, snap: &PerfSnapshot) -> Vec<String> {
@@ -406,7 +480,9 @@ mod tests {
     #[test]
     fn no_game_frames_shows_dashes() {
         let shown = texts(&FrameViewSettings::default(), &PerfSnapshot::default());
-        assert!(shown.iter().any(|t| t == "\u{2014}"));
-        assert!(shown.iter().any(|t| t == "\u{2014} ms"));
+        let dashes = shown.iter().filter(|t| *t == "\u{2014}").count();
+        assert_eq!(dashes, 2, "fps and frame time in {shown:?}");
+        assert!(shown.iter().any(|t| t == " ms"));
+        assert!(shown.iter().any(|t| t == "\u{2014} \u{2014} \u{2014}"));
     }
 }

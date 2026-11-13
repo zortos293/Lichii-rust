@@ -90,6 +90,12 @@ pub struct ConfigWindow {
 }
 
 impl ConfigWindow {
+    /// The draft's graphics settings, so a change made from the main window while this window
+    /// is open is not undone by its next Apply.
+    pub fn draft_graphics(&mut self) -> &mut GraphicsSettings {
+        &mut self.draft.graphics
+    }
+
     pub fn new(settings: &Settings, paths: &UserPaths) -> Self {
         Self {
             draft: settings.clone(),
@@ -314,6 +320,12 @@ impl ConfigWindow {
                         num * 1080 / den,
                     ),
                 );
+                if env.running {
+                    note(
+                        ui,
+                        "Resolution, filter and anti-aliasing apply to the running game on Apply; the status bar changes them directly.",
+                    );
+                }
                 section(ui, "Speed");
                 speed_limit(ui, &mut d.graphics.speed_limit);
             }

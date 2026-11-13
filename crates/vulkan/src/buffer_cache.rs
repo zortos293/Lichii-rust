@@ -18,7 +18,7 @@ use std::sync::Arc;
 use ash::vk;
 use gpu_allocator::MemoryLocation;
 use lichii_common::{DAddr, GpuVAddr, PAGE_BITS, PAGE_SIZE};
-use lichii_gpu::backend::{DrawParams, InlineIndices};
+use lichii_gpu::backend::{DrawParams, GpuWrittenPages, InlineIndices};
 use lichii_gpu::engines::maxwell_3d::Regs;
 use lichii_gpu::engines::maxwell_3d::regs::{IndexFormat, PrimitiveTopology};
 use lichii_gpu::gmmu::{Gmmu, GpuRange, RangeTarget};
@@ -613,6 +613,9 @@ struct QuadLut {
 pub struct BufferCache {
     device: Arc<Device>,
     memory: Arc<DeviceAddressSpace>,
+    /// Device pages GPU work wrote, marked with every range [`BufferCache::mark_gpu_written`]
+    /// records.
+    written_pages: Arc<GpuWrittenPages>,
     limit: DAddr,
     /// Buffer slot + 1 for each 64 KiB caching page, 0 where no buffer covers it.
     page_table: Vec<u32>,
@@ -635,11 +638,16 @@ pub struct BufferCache {
 
 impl BufferCache {
     /// A cache over the device address space `memory`.
-    pub fn new(device: &Arc<Device>, memory: Arc<DeviceAddressSpace>) -> Result<Self> {
+    pub fn new(
+        device: &Arc<Device>,
+        memory: Arc<DeviceAddressSpace>,
+        written_pages: Arc<GpuWrittenPages>,
+    ) -> Result<Self> {
         let limit = 1u64 << memory.address_space_bits();
         Ok(Self {
             device: device.clone(),
             memory,
+            written_pages,
             limit,
             page_table: vec![0; (limit >> CACHING_PAGE_BITS) as usize],
             buffers: Vec::new(),
@@ -707,10 +715,12 @@ impl BufferCache {
     }
 
     /// The GPU wrote `[daddr, +size)` (storage writes, transform feedback, copies): the bytes
-    /// stay in the host buffer until [`BufferCache::flush`] downloads them.
+    /// stay in the host buffer until [`BufferCache::flush`] downloads them, and the pages are
+    /// marked in the written-pages bitmap. Called when the writing work is recorded.
     pub fn mark_gpu_written(&mut self, daddr: DAddr, size: u64) {
         let end = daddr.saturating_add(size).min(self.limit);
         if daddr < end {
+            self.written_pages.mark(daddr, end - daddr);
             self.gpu_written.insert(daddr, end);
         }
     }
@@ -1485,7 +1495,8 @@ mod tests {
         Some(Fixture {
             scheduler: Scheduler::new(&device).unwrap(),
             staging: StagingRing::new(&device, 8 << 20).unwrap(),
-            cache: BufferCache::new(&device, memory.clone()).unwrap(),
+            cache: BufferCache::new(&device, memory.clone(), Arc::new(GpuWrittenPages::new(36)))
+                .unwrap(),
             gmmu: Gmmu::new(memory.clone(), BigPageSize::Size64K),
             device,
             memory,

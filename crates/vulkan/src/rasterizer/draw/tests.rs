@@ -6,7 +6,7 @@ use lichii_gpu::backend::{
     GraphicsContext, IndirectDraw, QmdVersion, Rasterizer,
 };
 use lichii_gpu::engines::maxwell_3d::regs::{
-    DepthMode, MAX_CONST_BUFFERS, MAX_SHADER_STAGE, PipelineBits, PrimitiveTopology,
+    ClearSurface, DepthMode, MAX_CONST_BUFFERS, MAX_SHADER_STAGE, PipelineBits, PrimitiveTopology,
     RenderTargetConfigBits, RtControl, ScissorTestBits, ScissorTestBits1, ShaderType,
     SurfaceClipBits, SurfaceClipBits1, TileMode, VertexAttribute, VertexStreamBits,
 };
@@ -175,7 +175,7 @@ fn const_buffers() -> GraphicsConstBuffers {
     };
     const_buffers[4][0] = ConstBufferBinding {
         address: GPU_VA + FRAGMENT_CBUF,
-        size: 0x100,
+        size: 0x200,
         enabled: true,
     };
     const_buffers
@@ -1154,5 +1154,124 @@ fn draw_texture_reads_rescaled_sources_exactly() {
     let scale = |f: &Fixture, id| f.rasterizer.texture_cache.state(id).map(|s| s.scale);
     let target_id = f.rasterizer.draw.colors[0].expect("a bound target").id;
     assert!(scale(&f, target_id) == Some(ResolutionScale::X2));
+    f.assert_no_validation_errors();
+}
+
+const PAGE: u64 = 0x1000;
+const SSBO: u64 = 0x60_0000;
+
+/// Whether the written-pages bitmap may hold a GPU write in guest `[offset, +size)`.
+fn written(f: &Fixture, offset: u64, size: u64) -> bool {
+    f.rasterizer
+        .handles
+        .written_pages
+        .may_be_written(DADDR + offset, size)
+}
+
+/// Exactly the `pages` pages from `offset` are marked, and not the page on either side.
+fn assert_marked(f: &Fixture, offset: u64, pages: u64, what: &str) {
+    for page in 0..pages {
+        assert!(
+            written(f, offset + page * PAGE, 1),
+            "{what}: page {page} is marked"
+        );
+    }
+    assert!(!written(f, offset - PAGE, PAGE), "{what}: the page before");
+    assert!(
+        !written(f, offset + pages * PAGE, PAGE),
+        "{what}: the page after"
+    );
+}
+
+/// Stores 0xdeadbeef through the storage buffer c[0][0x110] (address) and c[0][0x118] (size)
+/// describe, and writes render target 0 from the zeroed registers.
+fn storing_program() -> Vec<u8> {
+    let mut header = header(2, ShaderType::PIXEL);
+    header[18] = 0xf;
+    let stg = sass(Opcode::Stg, (1 << 45) | (4 << 48) | (4 << 8) | 6);
+    program(
+        header,
+        &[
+            mov_cbuf(4, 0x110),
+            mov_cbuf(5, 0x114),
+            mov_u32(6, 0xdead_beef),
+            stg,
+            exit(),
+        ],
+    )
+}
+
+#[test]
+fn draws_mark_the_pages_of_their_writable_storage_buffers() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let buffer = SSBO + PAGE;
+    let mut binding = (GPU_VA + buffer).to_le_bytes().to_vec();
+    binding.extend_from_slice(&0x100u32.to_le_bytes());
+    write(&f, FRAGMENT_CBUF + 0x110, &binding);
+    write(&f, PROGRAMS + u64::from(FRAGMENT), &storing_program());
+    assert!(!written(&f, SSBO, 3 * PAGE));
+    draw(&mut f, &gmmu, &draw_regs());
+    assert_marked(&f, buffer, 1, "the storage buffer");
+    assert!(written(&f, buffer, 0x100));
+    f.rasterizer.flush_region(DADDR + buffer, 4);
+    let mut word = [0; 4];
+    f.memory.read_bytes(DADDR + buffer, &mut word).unwrap();
+    assert_eq!(u32::from_le_bytes(word), 0xdead_beef, "the program stored");
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn draws_clears_and_texture_draws_mark_their_targets() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let source_pages = 20;
+    assert!(!written(&f, 0, 0x60_0000));
+
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    draw(&mut f, &gmmu, &draw_regs());
+    assert!(written(&f, 0, 1));
+    assert!(!written(&f, PAGE, PAGE), "the 16x16 target takes 1 KiB");
+
+    let mut regs = target_regs(TEXTURE, SOURCE);
+    regs.clear_surface = ClearSurface(0b1111 << 2);
+    regs.clear_color = [0.0, 1.0, 0.0, 1.0];
+    let mut dirty = DirtyState::new();
+    let const_buffers = const_buffers();
+    let root_tables = [[0; 64]; 8];
+    let mut ctx = GraphicsContext {
+        channel: ChannelId(0),
+        memory: &gmmu,
+        regs: &regs,
+        dirty: &mut dirty,
+        const_buffers: &const_buffers,
+        root_tables: &root_tables,
+    };
+    f.rasterizer.clear(&mut ctx, 1);
+    assert_marked(&f, TEXTURE, source_pages, "the cleared 64x320 target");
+
+    let header = tic(GPU_VA + TEXTURE, SOURCE.0, SOURCE.1);
+    write(&f, TIC, bytemuck::cast_slice(&header));
+    assert!(!written(&f, OTHER_TEXTURE, source_pages * PAGE));
+    let rect = DrawTexture {
+        dst_x0: 0.0,
+        dst_y0: 0.0,
+        dst_x1: 4.0,
+        dst_y1: 4.0,
+        src_x0: 0.0,
+        src_y0: 0.0,
+        src_x1: 4.0,
+        src_y1: 4.0,
+        texture: 0,
+        sampler: 0,
+    };
+    draw_texture(&mut f, &gmmu, &target_regs(OTHER_TEXTURE, SOURCE), rect);
+    assert_marked(&f, OTHER_TEXTURE, source_pages, "the texture draw's target");
     f.assert_no_validation_errors();
 }
