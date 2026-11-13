@@ -248,6 +248,7 @@ impl KeplerCompute {
             grid: launch.grid,
             block: launch.block,
             shared_memory_size: launch.shared_memory_size,
+            local_memory_size: launch.local_memory_size,
             const_buffers: &launch.const_buffers,
             texture_headers: tic.address(),
             texture_header_limit: tic.limit,

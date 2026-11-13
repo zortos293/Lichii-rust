@@ -2,14 +2,16 @@
 
 use std::sync::Arc;
 
-use lichii_common::ConsoleGeneration;
+use bytemuck::Pod;
 use lichii_common::perf::PerfStats;
 use lichii_common::settings::Settings;
+use lichii_common::{ConsoleGeneration, HleResult, ResultCode, VAddr};
 use lichii_gpu::backend::NullRasterizer;
 use lichii_gpu::host1x::Host1x;
 use lichii_gpu::{Console, Gpu, GpuConfig};
 use lichii_input::hub::NpadHub;
-use lichii_kernel::testing::{self, IpcClient};
+use lichii_kernel::ipc::Handle;
+use lichii_kernel::testing::{self, IpcClient, Reply};
 use lichii_loader::program::ProgramImage;
 
 use crate::{ServiceContext, ServiceParts};
@@ -52,6 +54,48 @@ pub fn context_with(program: ProgramImage, settings: Settings) -> (Arc<ServiceCo
         perf: Arc::new(PerfStats::default()),
     });
     (context, client)
+}
+
+/// An IPC client in a test title whose services `register` has registered.
+pub fn booted(
+    program_id: u64,
+    settings: Settings,
+    register: impl FnOnce(&Arc<ServiceContext>) -> HleResult<()>,
+) -> IpcClient {
+    let (context, client) = context(program_id, settings);
+    register(&context).unwrap();
+    client
+}
+
+/// Reads a value of guest memory.
+pub fn read_value<T: Pod>(client: &IpcClient, address: VAddr) -> T {
+    bytemuck::pod_read_unaligned(&client.read(address, std::mem::size_of::<T>()))
+}
+
+/// Checks and reads of replies.
+pub trait ReplyExt {
+    /// Asserts the service answered success.
+    fn ok(self) -> Self;
+    /// The value at byte `offset` of the reply data.
+    fn get<T: Pod>(&self, offset: usize) -> T;
+    /// The first moved handle: a returned interface.
+    fn interface(&self) -> Handle;
+}
+
+impl ReplyExt for Reply {
+    #[track_caller]
+    fn ok(self) -> Self {
+        assert_eq!(self.result, ResultCode::SUCCESS);
+        self
+    }
+
+    fn get<T: Pod>(&self, offset: usize) -> T {
+        bytemuck::pod_read_unaligned(&self.data()[offset..offset + std::mem::size_of::<T>()])
+    }
+
+    fn interface(&self) -> Handle {
+        self.move_handles[0]
+    }
 }
 
 struct Clock;
