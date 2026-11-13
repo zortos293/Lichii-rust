@@ -7,6 +7,7 @@ use std::sync::Arc;
 use lichii_common::ConsoleGeneration;
 use lichii_common::settings::{AudioSettings, Settings};
 use lichii_core::{ExitReason, Host, System, SystemError};
+use lichii_crypto::{KeyError, KeySet};
 use lichii_loader::LoadOptions;
 
 use crate::game_list::GameKind;
@@ -32,6 +33,16 @@ impl std::fmt::Display for BootError {
     }
 }
 
+impl BootError {
+    /// The key a title needed and the loaded keys lack, when that is why it did not boot.
+    pub fn missing_key(&self) -> Option<&KeyError> {
+        match self {
+            Self::System(SystemError::Loader(error)) => crate::setup::missing_key(error),
+            _ => None,
+        }
+    }
+}
+
 impl From<SystemError> for BootError {
     fn from(err: SystemError) -> Self {
         Self::System(err)
@@ -45,11 +56,13 @@ pub struct Session {
 }
 
 impl Session {
-    /// Loads the title at `path` and starts it. `host` builds the renderer and shared state for
-    /// the title's console generation, known once the title is loaded.
+    /// Loads the title at `path`, decrypting it with `keys`, and starts it. `host` builds the
+    /// renderer and shared state for the title's console generation, known once the title is
+    /// loaded.
     pub fn boot(
         path: &Path,
         settings: Arc<Settings>,
+        keys: Arc<KeySet>,
         host: impl FnOnce(ConsoleGeneration) -> Host,
     ) -> Result<Self, BootError> {
         if !path.exists() {
@@ -57,8 +70,11 @@ impl Session {
         }
         let kind = GameKind::detect(path).ok_or_else(|| BootError::Unsupported(path.into()))?;
         tracing::info!("booting {} ({})", path.display(), kind.label());
-        let image =
-            lichii_loader::load(path, &LoadOptions::default()).map_err(SystemError::from)?;
+        let options = LoadOptions {
+            keys: Some(keys),
+            ..LoadOptions::default()
+        };
+        let image = lichii_loader::load(path, &options).map_err(SystemError::from)?;
         let host = host(image.generation);
         let mut system = System::from_image(settings, image, host)?;
         system.run()?;
@@ -170,22 +186,38 @@ mod tests {
     fn rejects_missing_unknown_and_unloadable_titles() {
         let missing = Path::new("/definitely/not/here.nsp");
         assert!(matches!(
-            Session::boot(missing, settings(), |_| Host::headless()),
+            Session::boot(missing, settings(), Arc::default(), |_| Host::headless()),
             Err(BootError::NotFound(path)) if path == missing
         ));
         let dir = temp_dir("reject");
         let text = dir.join("notes.txt");
         std::fs::write(&text, "x").unwrap();
         assert!(matches!(
-            Session::boot(&text, settings(), |_| Host::headless()),
+            Session::boot(&text, settings(), Arc::default(), |_| Host::headless()),
             Err(BootError::Unsupported(_))
         ));
         let broken = dir.join("Broken.nro");
         std::fs::write(&broken, "x").unwrap();
         assert!(matches!(
-            Session::boot(&broken, settings(), |_| Host::headless()),
+            Session::boot(&broken, settings(), Arc::default(), |_| Host::headless()),
             Err(BootError::System(SystemError::Loader(_)))
         ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_encrypted_title_without_keys_names_the_missing_key() {
+        let dir = temp_dir("keys");
+        let nca = dir.join("Game.nca");
+        std::fs::write(&nca, vec![0u8; 0x4000]).unwrap();
+        let error = Session::boot(&nca, settings(), Arc::default(), |_| Host::headless())
+            .err()
+            .expect("an NCA does not boot without keys");
+        assert_eq!(
+            error.missing_key(),
+            Some(&KeyError::Missing("header_key".into())),
+            "{error}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -207,7 +239,7 @@ mod tests {
         let host = Host::headless();
         let npad = host.npad.clone();
         let mut generation = None;
-        let mut session = Session::boot(&game, settings(), |title| {
+        let mut session = Session::boot(&game, settings(), Arc::default(), |title| {
             generation = Some(title);
             host
         })

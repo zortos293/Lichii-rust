@@ -18,8 +18,8 @@ use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, VecAssembler, dynasm};
 
 use lichii_memory::ReservationSlot;
 
-use super::JitState;
 use super::ir::{Block, Cmp, Loc, Op, Terminal, Ty, Value, W};
+use super::{JitState, simd};
 use crate::decoder::AtomicOp;
 use crate::interpreter::condition_holds;
 use crate::{ThreadContext, TscScale};
@@ -55,6 +55,8 @@ pub(super) struct Target {
     pub tsc_scale: Option<*const TscScale>,
     /// The host has `cmpxchg16b`.
     pub cmpxchg16b: bool,
+    /// The host has FMA3, which the fused multiply-adds need.
+    pub fma: bool,
 }
 
 /// Machine code for one block and its fastmem access sites as `(access, slow path)` offsets.
@@ -101,9 +103,9 @@ const fn ctx(offset: usize) -> i32 {
 const CTX_X: i32 = ctx(offset_of!(ThreadContext, x));
 const CTX_SP: i32 = ctx(offset_of!(ThreadContext, sp));
 const CTX_PC: i32 = ctx(offset_of!(ThreadContext, pc));
-const CTX_PSTATE: i32 = ctx(offset_of!(ThreadContext, pstate));
-const CTX_FPCR: i32 = ctx(offset_of!(ThreadContext, fpcr));
-const CTX_FPSR: i32 = ctx(offset_of!(ThreadContext, fpsr));
+pub(super) const CTX_PSTATE: i32 = ctx(offset_of!(ThreadContext, pstate));
+pub(super) const CTX_FPCR: i32 = ctx(offset_of!(ThreadContext, fpcr));
+pub(super) const CTX_FPSR: i32 = ctx(offset_of!(ThreadContext, fpsr));
 const CTX_V: i32 = ctx(offset_of!(ThreadContext, v));
 const CTX_TPIDR: i32 = ctx(offset_of!(ThreadContext, tpidr_el0));
 const CTX_TPIDRRO: i32 = ctx(offset_of!(ThreadContext, tpidrro_el0));
@@ -132,7 +134,7 @@ const ST_MATERIALIZE: i32 = ctx(offset_of!(JitState, materialize));
 /// Entries in the direct-mapped `guest pc -> host code` table indirect branches probe.
 pub(super) const TABLE_BITS: u32 = 16;
 
-fn loc_offset(loc: Loc) -> i32 {
+pub(super) fn loc_offset(loc: Loc) -> i32 {
     match loc {
         Loc::X(n) => CTX_X + 8 * n as i32,
         Loc::Sp => CTX_SP,
@@ -248,7 +250,7 @@ fn flags_to_nzcv(a: &mut Asm, inverted_carry: bool) {
 pub(super) struct Emitter<'a> {
     pub(super) asm: Asm,
     block: &'a Block,
-    target: &'a Target,
+    pub(super) target: &'a Target,
     holder: [[Option<u32>; 16]; 2],
     reg: Vec<Option<u8>>,
     slot: Vec<Option<u16>>,
@@ -261,6 +263,7 @@ pub(super) struct Emitter<'a> {
     fused: Vec<bool>,
     stubs: Vec<Stub>,
     fault_exit: DynamicLabel,
+    pub(super) simd: simd::State,
 }
 
 impl Emitter<'_> {
@@ -885,7 +888,7 @@ impl Emitter<'_> {
     }
 
     /// Caller-saved registers holding a value that is still needed after op `i`.
-    fn live_across(&self, i: usize) -> [u16; 2] {
+    pub(super) fn live_across(&self, i: usize) -> [u16; 2] {
         let mut saved = [0u16; 2];
         for class in [Class::Gpr, Class::Xmm] {
             for r in 0..16u8 {
@@ -901,7 +904,7 @@ impl Emitter<'_> {
         saved
     }
 
-    fn save(&mut self, saved: [u16; 2]) {
+    pub(super) fn save(&mut self, saved: [u16; 2]) {
         for r in 0..16u8 {
             if saved[0] & (1 << r) != 0 {
                 let offset = ST_SAVE_GPR + 8 * r as i32;
@@ -914,7 +917,7 @@ impl Emitter<'_> {
         }
     }
 
-    fn restore(&mut self, saved: [u16; 2]) {
+    pub(super) fn restore(&mut self, saved: [u16; 2]) {
         for r in 0..16u8 {
             if saved[0] & (1 << r) != 0 {
                 let offset = ST_SAVE_GPR + 8 * r as i32;
@@ -1639,6 +1642,7 @@ pub(super) fn compile(block: &Block, start: u64, target: &Target) -> Compiled {
         fused,
         stubs: Vec::new(),
         fault_exit,
+        simd: simd::State::default(),
     };
     let interrupted = e.asm.new_dynamic_label();
     dynasm!(e.asm
@@ -1657,6 +1661,7 @@ pub(super) fn compile(block: &Block, start: u64, target: &Target) -> Compiled {
         let start = e.stub(stub);
         sites.extend(stub.sites.iter().map(|&site| (site, start)));
     }
+    e.simd_slow_paths();
     dynasm!(e.asm
         ; .arch x64
         ; =>fault_exit

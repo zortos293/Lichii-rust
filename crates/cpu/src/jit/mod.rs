@@ -321,6 +321,7 @@ impl Jit {
                 simd: simd::call as *const () as usize,
                 tsc_scale: config.clock.host_tsc_scale().map(std::ptr::from_ref),
                 cmpxchg16b: std::arch::is_x86_feature_detected!("cmpxchg16b"),
+                fma: std::arch::is_x86_feature_detected!("fma"),
             },
             arena: fastmem.map_or(std::ptr::null_mut(), |f| f.base()),
             config,
@@ -402,6 +403,7 @@ impl Jit {
 
 impl CpuCore for Jit {
     fn run(&mut self, ctx: &mut ThreadContext) -> HaltReason {
+        let _fp = simd::HostFp::enter();
         loop {
             let link = std::mem::take(&mut self.state.link);
             if self.interrupt.is_signaled() && self.interrupt.take() {

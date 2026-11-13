@@ -463,6 +463,92 @@ fn rectangle_sample_normalizes_its_coordinates() {
     assert_eq!(prog.arg(size, 0), Value::U32(0));
 }
 
+#[test]
+fn rectangle_textures_take_texel_coordinates_in_every_sample() {
+    let lod = Value::F32(0.0);
+    let cases: [(Opcode, &[Value]); 8] = [
+        (
+            Opcode::BoundImageSampleImplicitLod,
+            &[Value::Void, Value::Void],
+        ),
+        (Opcode::BoundImageSampleExplicitLod, &[lod, Value::Void]),
+        (
+            Opcode::BoundImageSampleDrefImplicitLod,
+            &[Value::F32(0.5), Value::Void, Value::Void],
+        ),
+        (
+            Opcode::BoundImageSampleDrefExplicitLod,
+            &[Value::F32(0.5), lod, Value::Void],
+        ),
+        (Opcode::BoundImageGather, &[Value::Void, Value::Void]),
+        (
+            Opcode::BoundImageGatherDref,
+            &[Value::Void, Value::Void, Value::F32(0.5)],
+        ),
+        (Opcode::BoundImageQueryLod, &[]),
+        (
+            Opcode::BoundImageGradient,
+            &[Value::Void, Value::Void, Value::Void],
+        ),
+    ];
+    for (op, rest) in cases {
+        for ty in [TextureType::Color2DRect, TextureType::Color2D] {
+            let (mut prog, b) = program(1);
+            let coords = prog.append(
+                b[0],
+                Opcode::CompositeConstructF32x2,
+                &[Value::F32(8.0), Value::F32(4.0)],
+                0,
+            );
+            let derivatives = prog.append(
+                b[0],
+                Opcode::CompositeConstructF32x4,
+                &[
+                    Value::F32(1.0),
+                    Value::F32(2.0),
+                    Value::F32(3.0),
+                    Value::F32(4.0),
+                ],
+                0,
+            );
+            let mut args = vec![Value::U32(0x10), Value::Inst(coords)];
+            args.extend_from_slice(rest);
+            let mut flags = info(TextureType::Color2D);
+            if op == Opcode::BoundImageGradient {
+                args[2] = Value::Inst(derivatives);
+                flags.num_derivatives = 2;
+            }
+            let id = prog.append(b[0], op, &args, flags.to_flags());
+            let env = Env::default().word(BOUND, 0x10, 0x3).ty(0x3, ty);
+            run(&env, &mut prog, &host(1024));
+
+            if ty == TextureType::Color2D {
+                assert_eq!(prog.arg(id, 1), Value::Inst(coords), "{op:?}");
+                continue;
+            }
+            let normalized = inst_of(&prog, prog.arg(id, 1));
+            assert_eq!(
+                prog.op(normalized),
+                Opcode::CompositeConstructF32x2,
+                "{op:?}"
+            );
+            let recip = |prog: &Program, vector: InstId, component| {
+                let mul = inst_of(prog, prog.arg(vector, component));
+                assert_eq!(prog.op(mul), Opcode::FPMul32, "{op:?}");
+                prog.arg(mul, 1)
+            };
+            let (width, height) = (recip(&prog, normalized, 0), recip(&prog, normalized, 1));
+            assert_ne!(width, height, "{op:?}");
+            if op == Opcode::BoundImageGradient {
+                let scaled = inst_of(&prog, prog.arg(id, 2));
+                assert_eq!(prog.op(scaled), Opcode::CompositeConstructF32x4);
+                let recips: Vec<Value> = (0..4).map(|c| recip(&prog, scaled, c)).collect();
+                assert_eq!(recips, [width, width, height, height]);
+            }
+        }
+    }
+}
+
 fn buffer_fetch(prog: &mut Program, block: BlockId) -> (InstId, InstId) {
     let fetch = prog.append(
         block,
