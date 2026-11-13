@@ -9,6 +9,7 @@
 
 mod gpu;
 mod native;
+mod reserve;
 mod sessions;
 mod syncpt;
 #[cfg(test)]
@@ -25,6 +26,8 @@ use lichii_kernel::object::KObject;
 use parking_lot::Mutex;
 
 use crate::{Service, ServiceContext};
+
+pub(crate) use reserve::Reserve;
 
 /// The service thread every gsv session runs on, except vi2.
 const THREAD: &str = "gsv";

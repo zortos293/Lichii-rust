@@ -82,6 +82,8 @@ pub struct ServiceContext {
     pub(crate) am: OnceLock<Arc<crate::am::Applet>>,
     /// The nvdrv state, once nvdrv registered: gsv opens `nx2:nvsrv` sessions with it.
     pub(crate) nvdrv: OnceLock<Arc<crate::nvdrv::Nvdrv>>,
+    /// The memory behind nx2:gpu's lazy GPU-only regions, once the title made one.
+    pub(crate) gpu_reserve: OnceLock<Arc<crate::gsv::Reserve>>,
     /// The hid state, once hid registered: am's controller applet reports its connected npads.
     pub(crate) hid: OnceLock<Arc<crate::hid::Hid>>,
     /// The selected user's id, once acc registered: am's preselected-user launch parameter names
@@ -117,6 +119,7 @@ impl ServiceContext {
             unknown: UnknownCommands::default(),
             am: OnceLock::new(),
             nvdrv: OnceLock::new(),
+            gpu_reserve: OnceLock::new(),
             hid: OnceLock::new(),
             user: OnceLock::new(),
             vi: OnceLock::new(),
