@@ -1,10 +1,11 @@
 //! F2I: float to integer conversion with Maxwell's saturation and NaN results.
 
 use super::{TResult, Translator};
-use crate::ir::{FmzMode, FpCompare, FpControl, FpRounding, Value};
+use crate::ir::{Emitter, FmzMode, FpCompare, FpControl, FpRounding, Value};
 
+/// Destination of an F2I conversion; the field is the log2 of its size in bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DestFormat {
+pub(crate) enum DestFormat {
     I8,
     I16,
     I32,
@@ -12,7 +13,7 @@ enum DestFormat {
 }
 
 impl DestFormat {
-    const fn from_bits(bits: u64) -> DestFormat {
+    pub(crate) const fn from_bits(bits: u64) -> DestFormat {
         match bits & 3 {
             0 => DestFormat::I8,
             1 => DestFormat::I16,
@@ -45,15 +46,16 @@ impl DestFormat {
     }
 }
 
+/// Source of an F2I conversion; the field is the log2 of its size in bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SrcFormat {
+pub(crate) enum SrcFormat {
     F16,
     F32,
     F64,
 }
 
 impl SrcFormat {
-    const fn from_bits(bits: u64) -> Option<SrcFormat> {
+    pub(crate) const fn from_bits(bits: u64) -> Option<SrcFormat> {
         match bits & 3 {
             1 => Some(SrcFormat::F16),
             2 => Some(SrcFormat::F32),
@@ -70,14 +72,45 @@ fn src_format(t: &Translator<'_>) -> Result<SrcFormat, crate::TranslateError> {
 /// Largest F32 below 2^64 (0x1.fffffep63).
 const MAX_F32_BELOW_2_POW_64: f32 = f32::from_bits(0x5f7f_ffff);
 
+/// An F2I conversion: formats, signedness, the 2-bit rounding field (nearest even, floor, ceil,
+/// trunc) and FTZ.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FloatToInt {
+    pub src: SrcFormat,
+    pub dest: DestFormat,
+    pub signed: bool,
+    pub rounding: u64,
+    pub ftz: bool,
+}
+
 fn f2i(t: &mut Translator<'_>, src: SrcFormat, src_a: Value) -> TResult {
     let i = t.insn;
     if i.bit(47) {
         return Err(t.unsupported());
     }
-    let dest = DestFormat::from_bits(i.bits(8, 2));
+    let conversion = FloatToInt {
+        src,
+        dest: DestFormat::from_bits(i.bits(8, 2)),
+        signed: i.bit(12),
+        rounding: i.bits(39, 2),
+        ftz: i.bit(44),
+    };
+    let op_a = t.ir.fp_abs_neg(src_a, i.bit(45), i.bit(49));
+    let result = float_to_int(&mut t.ir, conversion, op_a);
+    if conversion.dest == DestFormat::I64 {
+        t.set_l(i.dest_reg(), result)
+    } else {
+        t.set_x(i.dest_reg(), result);
+        Ok(())
+    }
+}
+
+/// Converts `op_a` (modifiers applied) with Maxwell's clamping and NaN results. A 64-bit
+/// destination gives a U64, every other one a U32.
+pub(crate) fn float_to_int(ir: &mut Emitter<'_>, c: FloatToInt, op_a: Value) -> Value {
+    let (src, dest) = (c.src, c.dest);
     let denorm_cares = src == SrcFormat::F32 && dest != DestFormat::I64;
-    let fmz_mode = match (denorm_cares, i.bit(44)) {
+    let fmz_mode = match (denorm_cares, c.ftz) {
         (false, _) => FmzMode::DontCare,
         (true, true) => FmzMode::Ftz,
         (true, false) => FmzMode::None,
@@ -87,31 +120,28 @@ fn f2i(t: &mut Translator<'_>, src: SrcFormat, src_a: Value) -> TResult {
         rounding: FpRounding::DontCare,
         fmz_mode,
     };
-    let op_a = t.ir.fp_abs_neg(src_a, i.bit(45), i.bit(49));
-    let rounded = match i.bits(39, 2) {
-        0 => t.ir.fp_round_even(op_a, control),
-        1 => t.ir.fp_floor(op_a, control),
-        2 => t.ir.fp_ceil(op_a, control),
-        _ => t.ir.fp_trunc(op_a, control),
+    let rounded = match c.rounding {
+        0 => ir.fp_round_even(op_a, control),
+        1 => ir.fp_floor(op_a, control),
+        2 => ir.fp_ceil(op_a, control),
+        _ => ir.fp_trunc(op_a, control),
     };
-    let signed = i.bit(12);
+    let signed = c.signed;
     let (max_bound, min_bound) = dest.clamp_bounds(signed);
     let unsigned_f32_i64 = dest == DestFormat::I64 && src == SrcFormat::F32 && !signed;
 
     let intermediate = match src {
         SrcFormat::F16 => {
-            let max_val =
-                t.ir.fp_convert(16, Value::F32(max_bound as f32), FpControl::default());
-            let min_val =
-                t.ir.fp_convert(16, Value::F32(min_bound as f32), FpControl::default());
+            let max_val = ir.fp_convert(16, Value::F32(max_bound as f32), FpControl::default());
+            let min_val = ir.fp_convert(16, Value::F32(min_bound as f32), FpControl::default());
             let mut safe = rounded;
             if dest == DestFormat::I8 {
-                let widened = t.ir.fp_convert(32, safe, FpControl::default());
-                let nan = t.ir.fp_is_nan(op_a);
-                let selected = t.ir.select(nan, Value::F32(min_bound as f32), widened);
-                safe = t.ir.fp_convert(16, selected, FpControl::default());
+                let widened = ir.fp_convert(32, safe, FpControl::default());
+                let nan = ir.fp_is_nan(op_a);
+                let selected = ir.select(nan, Value::F32(min_bound as f32), widened);
+                safe = ir.fp_convert(16, selected, FpControl::default());
             }
-            t.ir.fp_clamp(safe, min_val, max_val)
+            ir.fp_clamp(safe, min_val, max_val)
         }
         SrcFormat::F32 => {
             let max_val = Value::F32(if unsigned_f32_i64 {
@@ -122,35 +152,33 @@ fn f2i(t: &mut Translator<'_>, src: SrcFormat, src_a: Value) -> TResult {
             let min_val = Value::F32(min_bound as f32);
             let mut safe = rounded;
             if unsigned_f32_i64 || dest == DestFormat::I8 {
-                let nan = t.ir.fp_is_nan(op_a);
-                safe = t.ir.select(nan, min_val, safe);
+                let nan = ir.fp_is_nan(op_a);
+                safe = ir.select(nan, min_val, safe);
             }
-            t.ir.fp_clamp(safe, min_val, max_val)
+            ir.fp_clamp(safe, min_val, max_val)
         }
         SrcFormat::F64 if dest == DestFormat::I8 => {
             let max_val = Value::F32(max_bound as f32);
             let min_val = Value::F32(min_bound as f32);
-            let narrowed = t.ir.fp_convert(32, rounded, FpControl::default());
-            let nan = t.ir.fp_is_nan(op_a);
-            let safe = t.ir.select(nan, min_val, narrowed);
-            t.ir.fp_clamp(safe, min_val, max_val)
+            let narrowed = ir.fp_convert(32, rounded, FpControl::default());
+            let nan = ir.fp_is_nan(op_a);
+            let safe = ir.select(nan, min_val, narrowed);
+            ir.fp_clamp(safe, min_val, max_val)
         }
-        SrcFormat::F64 => {
-            t.ir.fp_clamp(rounded, Value::F64(min_bound), Value::F64(max_bound))
-        }
+        SrcFormat::F64 => ir.fp_clamp(rounded, Value::F64(min_bound), Value::F64(max_bound)),
     };
 
     let bitsize = dest.bits().max(32);
-    let mut result = t.ir.convert_f_to_i(bitsize, signed, intermediate);
+    let mut result = ir.convert_f_to_i(bitsize, signed, intermediate);
     if unsigned_f32_i64 {
-        let ge = t.ir.fp_compare(
+        let ge = ir.fp_compare(
             FpCompare::GreaterThanEqual,
             op_a,
             Value::F32(18_446_744_073_709_551_616.0),
             true,
             FpControl::default(),
         );
-        result = t.ir.select(ge, Value::U64(u64::MAX), result);
+        result = ir.select(ge, Value::U64(u64::MAX), result);
     }
 
     let special_nan = (src == SrcFormat::F64) != (dest == DestFormat::I64);
@@ -162,16 +190,11 @@ fn f2i(t: &mut Translator<'_>, src: SrcFormat, src_a: Value) -> TResult {
         _ => None,
     };
     if let Some(nan_value) = nan_value {
-        let nan = t.ir.fp_is_nan(op_a);
-        result = t.ir.select(nan, nan_value, result);
+        let nan = ir.fp_is_nan(op_a);
+        result = ir.select(nan, nan_value, result);
     }
 
-    if bitsize == 64 {
-        t.set_l(i.dest_reg(), result)
-    } else {
-        t.set_x(i.dest_reg(), result);
-        Ok(())
-    }
+    result
 }
 
 /// The F64 operand of F2I (cbuf): only the high word is read, the low word is zero.
