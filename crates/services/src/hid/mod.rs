@@ -47,6 +47,7 @@ pub(crate) fn register(context: &Arc<ServiceContext>) -> HleResult<()> {
     let hid = Arc::new(Hid {
         hub: context.npad.clone(),
         state: Mutex::new(HidState::default()),
+        nfc_readers: context.nfc_readers.clone(),
     });
     let _ = context.hid.set(hid.clone());
     context.register("hid", "hid", move |context| HidServer {

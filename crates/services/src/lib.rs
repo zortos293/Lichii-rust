@@ -58,6 +58,8 @@ mod lm;
 mod mii;
 mod mm;
 mod ncm;
+mod nfc;
+mod nfp;
 mod ngc;
 mod nifm;
 mod nim;
@@ -123,6 +125,8 @@ pub fn register_all(context: &Arc<ServiceContext>) -> HleResult<()> {
     fatal::register(context)?;
     mm::register(context)?;
     ngc::register(context)?;
+    nfc::register(context)?;
+    nfp::register(context)?;
     mii::register(context)?;
     ectx::register(context)?;
     olsc::register(context)?;

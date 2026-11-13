@@ -894,6 +894,8 @@ fn write_empty_entries(memory: &SharedMemory, entry: NpadEntry) {
 pub(crate) struct Hid {
     pub(super) hub: Arc<NpadHub>,
     pub(super) state: parking_lot::Mutex<HidState>,
+    /// Polled every update, so NFC signals controller changes as they happen.
+    pub(super) nfc_readers: Arc<crate::nfc::common::Readers>,
 }
 
 impl Hid {
@@ -933,6 +935,7 @@ pub(super) fn spawn_updater(hid: &Arc<Hid>) {
                 }
                 let Some(hid) = weak.upgrade() else { return };
                 hid.state.lock().tick(&hid.hub, tick);
+                hid.nfc_readers.poll(&hid.hub);
             }
         });
     if let Err(err) = spawned {

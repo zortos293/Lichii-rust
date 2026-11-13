@@ -253,6 +253,13 @@ impl State {
     }
 }
 
+impl State {
+    /// The NFC enable flag `GetNfcEnableFlag` answers.
+    pub(super) fn nfc_enabled(&self) -> bool {
+        self.nfc_enable != 0
+    }
+}
+
 /// Visits every value the settings files keep, as bytes, with the structure and offset it has
 /// there.
 fn fields(s: &mut State, shared: &mut Shared, mut visit: impl FnMut(Part, usize, &mut [u8])) {
