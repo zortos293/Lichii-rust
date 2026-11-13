@@ -35,8 +35,11 @@
 //! ```
 
 mod am;
+mod chat;
 mod context;
 mod dispatch;
+mod hid;
+mod pl_u;
 #[cfg(test)]
 mod testing;
 
@@ -51,5 +54,8 @@ pub use dispatch::Service;
 /// before `Kernel::run`.
 pub fn register_all(context: &Arc<ServiceContext>) -> HleResult<()> {
     am::register(context)?;
+    chat::register(context)?;
+    hid::register(context)?;
+    pl_u::register(context)?;
     Ok(())
 }
