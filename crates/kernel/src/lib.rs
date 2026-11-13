@@ -33,6 +33,7 @@ mod tests;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use lichii_common::settings::CpuAccuracy;
 use lichii_common::{ConsoleGeneration, HleResult, PAGE_SIZE, VAddr, align_up};
@@ -308,20 +309,21 @@ impl Kernel {
         Ok(())
     }
 
-    /// Stops every core and kernel thread and releases all processes.
+    /// Stops every core and kernel thread and releases all processes. A thread still running
+    /// after [`SLOW_JOIN`] is named in a warning, so a shutdown that hangs says what it waits for.
     pub fn shutdown(&self) {
         self.0.scheduler.shutdown();
         self.0.timer.shutdown();
         let threads = std::mem::take(&mut *self.0.host_threads.lock());
         for thread in threads {
-            let _ = thread.join();
+            join_noting_slow(thread);
         }
         let services = std::mem::take(&mut *self.0.services.lock());
         for thread in &services.threads {
             thread.stop();
         }
         for join in services.joins {
-            let _ = join.join();
+            join_noting_slow(join);
         }
         self.0.service_manager.clear();
         self.0.named_ports.lock().clear();
@@ -347,6 +349,13 @@ impl Kernel {
         self.0.scheduler.resume();
     }
 
+    /// Whether [`Kernel::shutdown`] has begun. A service handler that waits on something the
+    /// stopping session may never deliver (a syncpoint of the stopped GPU) gives up once it is set,
+    /// so the shutdown can join its thread.
+    pub fn is_shutting_down(&self) -> bool {
+        self.0.scheduler.is_shut_down()
+    }
+
     /// Whether [`Kernel::pause`] is in effect.
     pub fn is_paused(&self) -> bool {
         self.0.scheduler.is_paused()
@@ -355,6 +364,27 @@ impl Kernel {
     /// Asks every thread of `process` to terminate.
     pub fn terminate_process(&self, process: &Arc<Process>) {
         self.0.terminate_process(process);
+    }
+}
+
+/// How long [`Kernel::shutdown`] waits for a thread before naming it.
+const SLOW_JOIN: Duration = Duration::from_secs(2);
+
+fn join_noting_slow(thread: JoinHandle<()>) {
+    let started = Instant::now();
+    let mut warned = false;
+    while !thread.is_finished() {
+        if !warned && started.elapsed() >= SLOW_JOIN {
+            warned = true;
+            tracing::warn!(
+                thread = thread.thread().name().unwrap_or("unnamed"),
+                "shutdown: still waiting for a thread"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    if thread.join().is_err() {
+        tracing::error!("a kernel thread panicked");
     }
 }
 
