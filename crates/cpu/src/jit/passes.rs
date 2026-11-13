@@ -44,7 +44,8 @@ fn resolve(replace: &[Value], v: &mut Value) {
 /// Forwards known guest state to later reads and drops writes a later write of the same
 /// location makes dead. An op that can exit commits every pending write first, so the context is
 /// exact wherever the block can leave. `CallSimd` can also write any location, so reads after it
-/// load from the context again.
+/// load from the context again. A native SIMD op that can fall back to `CallSimd` commits every
+/// pending write, and always updates FPSR.
 pub(super) fn get_set_elimination(block: &mut Block) {
     let mut replace: Vec<Value> = (0..block.ops.len() as u32).map(Value).collect();
     let mut known: [Option<Value>; Loc::COUNT] = [None; Loc::COUNT];
@@ -69,6 +70,10 @@ pub(super) fn get_set_elimination(block: &mut Block) {
             Op::CallSimd { .. } => {
                 pending = [None; Loc::COUNT];
                 known = [None; Loc::COUNT];
+            }
+            Op::Simd(s) if s.falls_back() => {
+                pending = [None; Loc::COUNT];
+                known[Loc::Fpsr.index()] = None;
             }
             _ if op.may_exit() => pending = [None; Loc::COUNT],
             _ => {}
