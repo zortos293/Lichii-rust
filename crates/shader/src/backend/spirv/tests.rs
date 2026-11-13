@@ -1420,6 +1420,16 @@ fn interleaved_forward_branches_translate_in_linear_time() {
 }
 
 #[test]
+fn widely_interleaved_branches_stay_under_six_blocks_per_unit() {
+    let program = translate_env(&branchy(1000, 8));
+    assert!(
+        program.ir.num_blocks() < 6000,
+        "{} blocks for 1000 units",
+        program.ir.num_blocks()
+    );
+}
+
+#[test]
 #[ignore = "benchmark: cargo test --release -p lichii-shader --lib bench_branchy -- --ignored --nocapture"]
 fn bench_branchy_translation() {
     for (units, span) in [
