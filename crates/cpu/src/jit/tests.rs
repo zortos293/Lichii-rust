@@ -248,7 +248,8 @@ fn atomic(rng: &mut Rng) -> u32 {
     }
 }
 
-const FP: [&str; 20] = [
+const FP: [&str; 21] = [
+    "0x101110x01xxxxx110101xxxxxxxxxx",
     "000111100x1xxxxxxxxx01xxxxxxxxxx",
     "0001111011100010x10000xxxxxxxxxx",
     "01x111111xxxxxxxxx01x0xxxxxxxxxx",
@@ -289,7 +290,8 @@ fn simd(rng: &mut Rng) -> u32 {
     }
 }
 
-const VECTOR: [&str; 12] = [
+const VECTOR: [&str; 13] = [
+    "01011110000xxxxx000001xxxxxxxxxx",
     "0x101110000xxxxx0xxxx0xxxxxxxxxx",
     "0xx01110xx1xxxxx100001xxxxxxxxxx",
     "0xx01110xx1xxxxx000111xxxxxxxxxx",
@@ -986,7 +988,9 @@ fn conditional_compares_read_the_live_flags() {
 
 #[test]
 fn vector_fp_edge_cases_match_the_interpreter() {
-    const S_OPS: [u32; 14] = [
+    const S_OPS: [u32; 16] = [
+        0x6e22_d420, // faddp v0.4s, v1.4s, v2.4s
+        0x2e22_d420, // faddp v0.2s, v1.2s, v2.2s
         0x4e22_d420, // fadd v0.4s, v1.4s, v2.4s
         0x4ea2_d420, // fsub v0.4s, v1.4s, v2.4s
         0x6e22_dc20, // fmul v0.4s, v1.4s, v2.4s
@@ -1002,7 +1006,8 @@ fn vector_fp_edge_cases_match_the_interpreter() {
         0x5fa2_1020, // fmla s0, s1, v2.s[1]
         0x5f82_5820, // fmls s0, s1, v2.s[2]
     ];
-    const D_OPS: [u32; 9] = [
+    const D_OPS: [u32; 10] = [
+        0x6e62_d420, // faddp v0.2d, v1.2d, v2.2d
         0x4e62_d420, // fadd v0.2d, v1.2d, v2.2d
         0x6e62_dc20, // fmul v0.2d, v1.2d, v2.2d
         0x4e62_cc20, // fmla v0.2d, v1.2d, v2.2d

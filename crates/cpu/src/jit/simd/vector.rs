@@ -101,6 +101,13 @@ pub enum VecOp {
         signed: Option<W>,
         vector: Value,
     },
+    /// Scalar `DUP` (`MOV` from an element): lane `index` of `8 << size` bits, with every other
+    /// bit zero.
+    ScalarDup {
+        size: u8,
+        index: u8,
+        vector: Value,
+    },
     /// `EXT`: bytes `index` onwards of `m:n` (with `n` in the low bytes), 16 of them when `q` is
     /// set and else 8 from the low halves.
     Ext {
@@ -132,6 +139,7 @@ impl VecOp {
                 f(b);
             }
             VecOp::Shift(_, _, _, a)
+            | VecOp::ScalarDup { vector: a, .. }
             | VecOp::Dup(_, a)
             | VecOp::Cnt(_, a)
             | VecOp::Extract { vector: a, .. } => f(a),
@@ -267,6 +275,25 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
     }
     if word & 0x9fe0_8400 == 0x0e00_0400 {
         return copy(t, word);
+    }
+    if word & 0xffe0_fc00 == 0x5e00_0400 {
+        let imm5 = field(word, 16, 5);
+        let size = imm5.trailing_zeros() as u8;
+        if size > 3 {
+            return false;
+        }
+        let vector = vec(t, rn);
+        let index = imm5 >> (size + 1);
+        let r = emit(
+            t,
+            VecOp::ScalarDup {
+                size,
+                index,
+                vector,
+            },
+        );
+        t.set(Loc::V(rd), r);
+        return true;
     }
     if word & 0xbfe0_8400 == 0x2e00_0000 {
         let index = field(word, 11, 4);
@@ -774,6 +801,30 @@ impl Emitter<'_> {
                     (Shift::Sshr, _) => dynasm!(self.asm ; .arch x64 ; psrad Rx(d), n),
                 }
                 (d, q)
+            }
+            VecOp::ScalarDup {
+                size,
+                index,
+                vector,
+            } => {
+                let s = self.reg(vector);
+                let d = self.def(v);
+                self.copy(d, s);
+                if index != 0 {
+                    let bytes = (index << size) as i8;
+                    dynasm!(self.asm ; .arch x64 ; psrldq Rx(d), bytes);
+                }
+                match size {
+                    0 => {
+                        dynasm!(self.asm ; .arch x64 ; movd eax, Rx(d) ; movzx eax, al ; movd Rx(d), eax)
+                    }
+                    1 => {
+                        dynasm!(self.asm ; .arch x64 ; movd eax, Rx(d) ; movzx eax, ax ; movd Rx(d), eax)
+                    }
+                    2 => dynasm!(self.asm ; .arch x64 ; movd eax, Rx(d) ; movd Rx(d), eax),
+                    _ => dynasm!(self.asm ; .arch x64 ; movq Rx(d), Rx(d)),
+                }
+                return;
             }
             VecOp::Ext { q, index, n, m } => {
                 let (n, m) = (self.reg(n), self.reg(m));
