@@ -330,7 +330,7 @@ fn tic(gpu_va: u64, width: u32, height: u32) -> [u32; 8] {
         (gpu_va >> 32) as u32 | 3 << 21,
         1 << 3,
         (width - 1) | 1 << 23,
-        height - 1,
+        (height - 1) | 1 << 31,
         0,
         0,
     ]
@@ -875,14 +875,14 @@ fn fetch_program(x: u32, y: u32) -> Vec<u8> {
     program(header, &[mov_u32(4, x), mov_u32(5, y), fetch, exit()])
 }
 
-/// Samples level 0 of the texture whose handle is c[0][0x40] at (`u`, `v`) into render target 0
-/// (TEX.LZ).
+/// Samples the texture whose handle is c[0][0x40] at (`u`, `v`) into render target 0, with an
+/// implicit level of detail.
 fn filter_program(u: f32, v: f32) -> Vec<u8> {
     let mut header = header(2, ShaderType::PIXEL);
     header[18] = 0xf;
     let tex = sass(
         Opcode::Tex,
-        (1 << 55) | (0x10 << 36) | (7 << 51) | (0b1111 << 31) | (2 << 28) | (2 << 8),
+        (0x10 << 36) | (7 << 51) | (0b1111 << 31) | (2 << 28) | (2 << 8),
     );
     program(header, &[mov_f32(2, u), mov_f32(3, v), tex, exit()])
 }
@@ -901,7 +901,7 @@ fn query_program(component: u32) -> Vec<u8> {
 
 #[test]
 fn texture_scaling_bits_number_descriptors_across_stages() {
-    let mut scaling = super::TextureScaling::default();
+    let mut scaling = super::ScalingBits::<4>::default();
     scaling.set(1);
     scaling.next_stage(3);
     scaling.set(0);
@@ -1273,5 +1273,209 @@ fn draws_clears_and_texture_draws_mark_their_targets() {
     };
     draw_texture(&mut f, &gmmu, &target_regs(OTHER_TEXTURE, SOURCE), rect);
     assert_marked(&f, OTHER_TEXTURE, source_pages, "the texture draw's target");
+    f.assert_no_validation_errors();
+}
+
+const TEXEL_BUFFER: u64 = 0x68_0000;
+const STORAGE_IMAGE: u64 = 0x6c_0000;
+
+/// A one-dimensional A8B8G8R8 buffer texture header of `texels` texels at `gpu_va`.
+fn buffer_tic(gpu_va: u64, texels: u32) -> [u32; 8] {
+    let last = texels - 1;
+    [
+        tic(gpu_va, 1, 1)[0],
+        gpu_va as u32,
+        (gpu_va >> 32) as u32,
+        last >> 16,
+        (last & 0xffff) | 6 << 23,
+        0,
+        0,
+        0,
+    ]
+}
+
+/// A fragment program running `code` that writes render target 0 from R0..R3.
+fn pixel_program(code: &[u64]) -> Vec<u8> {
+    let mut header = header(2, ShaderType::PIXEL);
+    header[18] = 0xf;
+    let mut code = code.to_vec();
+    code.push(exit());
+    program(header, &code)
+}
+
+/// SUST.D.32 (bound, typed R32) of R6 to the storage image or image buffer whose handle is
+/// c[0][0x40], at the coordinates from R4 (and R5): `dim` 1 is a buffer, 3 a 2D image.
+fn sust_r32(dim: u64) -> u64 {
+    sass(
+        Opcode::Sust,
+        (1 << 52) | (1 << 51) | (0x10 << 36) | (dim << 33) | (4 << 20) | (4 << 8) | 6,
+    )
+}
+
+/// Texel `i` of the texel buffer: every texel distinct.
+fn buffer_texel(i: u32) -> [u8; 4] {
+    [i as u8, (i * 3) as u8, 255 - i as u8, 255]
+}
+
+#[test]
+fn draws_fetch_uniform_texel_buffers() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let texels: Vec<u8> = (0..64).flat_map(buffer_texel).collect();
+    write(&f, TEXEL_BUFFER, &texels);
+    let header = buffer_tic(GPU_VA + TEXEL_BUFFER, 64);
+    write(&f, TIC, bytemuck::cast_slice(&header));
+    let tld = sass(
+        Opcode::Tld,
+        (0x10 << 36) | (0b1111 << 31) | (RZ << 20) | (4 << 8),
+    );
+    for i in [5, 63] {
+        let code = pixel_program(&[mov_u32(4, i), tld]);
+        read_with(&mut f, &gmmu, &mut sampling_regs(), &code, 0);
+        assert!(
+            target(&mut f).iter().all(|&t| t == buffer_texel(i)),
+            "texel {i}: {:?}",
+            target(&mut f)[0]
+        );
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn draws_store_texel_buffers_for_flushes() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let header = buffer_tic(GPU_VA + TEXEL_BUFFER, 1024);
+    write(&f, TIC, bytemuck::cast_slice(&header));
+    assert!(!written(&f, TEXEL_BUFFER, PAGE));
+    let code = pixel_program(&[mov_u32(4, 7), mov_u32(6, 0xdead_beef), sust_r32(1)]);
+    read_with(&mut f, &gmmu, &mut sampling_regs(), &code, 0);
+    assert_marked(&f, TEXEL_BUFFER, 1, "the image buffer");
+    f.rasterizer.flush_region(DADDR + TEXEL_BUFFER, 4096);
+    let mut words = [0u8; 32];
+    f.memory
+        .read_bytes(DADDR + TEXEL_BUFFER, &mut words)
+        .unwrap();
+    let words: Vec<u32> = words
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|w| u32::from_le_bytes(*w))
+        .collect();
+    assert_eq!(words, [0, 0, 0, 0, 0, 0, 0, 0xdead_beef]);
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn draws_store_storage_images_for_sampling_and_flushes() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let header = tic(GPU_VA + STORAGE_IMAGE, SIZE, SIZE);
+    write(&f, TIC, bytemuck::cast_slice(&header));
+    assert!(!written(&f, STORAGE_IMAGE, PAGE));
+    let code = pixel_program(&[
+        mov_u32(4, 3),
+        mov_u32(5, 5),
+        mov_u32(6, 0xff40_ff00),
+        sust_r32(3),
+    ]);
+    read_with(&mut f, &gmmu, &mut sampling_regs(), &code, 0);
+    assert_marked(&f, STORAGE_IMAGE, 1, "the storage image");
+    let stored = [0x00, 0xff, 0x40, 0xff];
+
+    read_with(&mut f, &gmmu, &mut sampling_regs(), &fetch_program(3, 5), 0);
+    assert!(
+        target(&mut f).iter().all(|&t| t == stored),
+        "the sampled texel: {:?}",
+        target(&mut f)[0]
+    );
+    read_with(&mut f, &gmmu, &mut sampling_regs(), &fetch_program(4, 5), 0);
+    assert!(target(&mut f).iter().all(|&t| t == [0; 4]), "other texels");
+
+    let tiling = Tiling::new(SIZE, SIZE, 1, 4, 1, 0, GobLayout::Tegra);
+    let image = read_target(&mut f, STORAGE_IMAGE, (SIZE, SIZE));
+    assert_eq!(tiling.size_bytes(), image.len() * 4);
+    for (i, &texel) in image.iter().enumerate() {
+        let want = if i == 5 * SIZE as usize + 3 {
+            stored
+        } else {
+            [0; 4]
+        };
+        assert_eq!(texel, want, "flushed texel {i}");
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn storage_writes_to_rescaled_images_scale_them_down() {
+    let Some((mut f, gmmu)) = rescaled_fixture() else {
+        return;
+    };
+    paint_source(&mut f, &gmmu);
+    let source = |f: &Fixture| f.rasterizer.draw.textures.first().copied();
+    read_with(&mut f, &gmmu, &mut sampling_regs(), &fetch_program(0, 0), 0);
+    let id = source(&f).expect("the source was sampled");
+    let scale = |f: &Fixture| f.rasterizer.texture_cache.state(id).map(|s| s.scale);
+    assert!(scale(&f) == Some(ResolutionScale::X2));
+    let code = pixel_program(&[
+        mov_u32(4, 40),
+        mov_u32(5, 200),
+        mov_u32(6, 0xff40_ff00),
+        sust_r32(3),
+    ]);
+    read_with(&mut f, &gmmu, &mut sampling_regs(), &code, 0);
+    assert!(
+        scale(&f) == Some(ResolutionScale::X1),
+        "scaled down for the store"
+    );
+    assert_eq!(f.rasterizer.draw.image_scaling.words, [0, 0]);
+    for (x, y, want) in [
+        (40, 200, [0x00, 0xff, 0x40, 0xff]),
+        (31, 159, BLUE),
+        (32, 159, GREEN),
+    ] {
+        read_with(&mut f, &gmmu, &mut sampling_regs(), &fetch_program(x, y), 0);
+        assert!(
+            target(&mut f).iter().all(|&t| t == want),
+            "texel ({x}, {y}) is {want:?}: {:?}",
+            target(&mut f)[0]
+        );
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn draws_load_rescaled_storage_images_at_guest_coordinates() {
+    let Some((mut f, gmmu)) = rescaled_fixture() else {
+        return;
+    };
+    paint_source(&mut f, &gmmu);
+    let suld = sass(
+        Opcode::Suld,
+        (1 << 52) | (1 << 51) | (0x10 << 36) | (3 << 33) | (4 << 20) | (4 << 8),
+    );
+    let mut regs = sampling_regs();
+    regs.rt[0].format = 0xe4;
+    for (x, y, want) in [(31, 159, BLUE), (32, 159, GREEN), (31, 160, GREEN)] {
+        let code = pixel_program(&[mov_u32(4, x), mov_u32(5, y), suld]);
+        read_with(&mut f, &gmmu, &mut regs, &code, 0);
+        let texels = target(&mut f);
+        assert!(
+            texels.iter().all(|&t| t == want),
+            "texel ({x}, {y}) is {want:?}: {:?}",
+            texels[0]
+        );
+    }
+    let (id, written) = f.rasterizer.draw.storage_images[0];
+    assert!(!written);
+    let scale = f.rasterizer.texture_cache.state(id).map(|s| s.scale);
+    assert!(
+        scale == Some(ResolutionScale::X2),
+        "read-only images keep their scale"
+    );
+    assert_eq!(f.rasterizer.draw.image_scaling.words, [1, 0]);
     f.assert_no_validation_errors();
 }

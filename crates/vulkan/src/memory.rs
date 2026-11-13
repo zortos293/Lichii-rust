@@ -377,6 +377,52 @@ impl ImageView {
     }
 }
 
+/// A texel buffer view, destroyed on drop.
+pub struct BufferView {
+    device: Arc<Device>,
+    raw: vk::BufferView,
+}
+
+impl BufferView {
+    /// Creates a view of `range` bytes of `buffer` from `offset`, read as `format`.
+    pub fn new(
+        device: &Arc<Device>,
+        buffer: vk::Buffer,
+        format: vk::Format,
+        offset: u64,
+        range: u64,
+    ) -> Result<Self> {
+        let info = vk::BufferViewCreateInfo::default()
+            .buffer(buffer)
+            .format(format)
+            .offset(offset)
+            .range(range);
+        // SAFETY: `buffer` is a live texel buffer of this device holding the range, and the
+        // caller checked the offset alignment, the element count and the format's support.
+        let raw = unsafe {
+            device
+                .raw
+                .create_buffer_view(&info, None)
+                .call("vkCreateBufferView")?
+        };
+        Ok(Self {
+            device: device.clone(),
+            raw,
+        })
+    }
+
+    pub fn raw(&self) -> vk::BufferView {
+        self.raw
+    }
+}
+
+impl Drop for BufferView {
+    fn drop(&mut self) {
+        // SAFETY: the owner guarantees the GPU no longer uses the view.
+        unsafe { self.device.raw.destroy_buffer_view(self.raw, None) };
+    }
+}
+
 impl Drop for ImageView {
     fn drop(&mut self) {
         // SAFETY: the owner guarantees the GPU no longer uses the view.
