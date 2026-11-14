@@ -279,7 +279,7 @@ fn ldc(t: &mut Translator<'_>) -> TResult {
     let ty = MemType::decode_cbuf(t)?;
     let dest = t.insn.dst();
     check_aligned(t, dest, ty.words())?;
-    let bank = t.insn.bits(54, 5) as u32;
+    let bank = t.insn.cbuf_slot();
     let imm = t.insn.bits(38, 16) as u32;
     let reg = t.insn.src0();
     let (index, offset) = match t.insn.bits(78, 2) {
@@ -308,7 +308,7 @@ fn uldc(t: &mut Translator<'_>) -> TResult {
     let ty = MemType::decode_cbuf(t)?;
     let dest = t.insn.udst();
     check_aligned(t, dest, ty.words())?;
-    let bank = t.insn.bits(54, 5) as u32;
+    let bank = t.insn.cbuf_slot();
     let imm = t.insn.bits(38, 16) as u32;
     let offset = match t.form {
         Form::Bound if t.insn.bit(91) => return Err(t.unsupported()),
@@ -973,6 +973,21 @@ mod tests {
              \x20 %4 = IAdd32 %2, #0x8\n\
              \x20 %5 = GetCbufS8 %3, %4\n\
              \x20 SetRegister R1, %5\n"
+        );
+    }
+
+    #[test]
+    fn ldc_reads_root_table_slot_24_from_slot_17() {
+        let insn = encode(
+            Opcode::Ldc,
+            Form::Bound,
+            f(16, 1) | f(24, 255) | f(38, 0x8) | f(54, 24) | f(73, 4),
+        );
+        assert_eq!(
+            translate(&[insn]).unwrap(),
+            "{0}:\n\
+             \x20 %0 = GetCbufU32 #0x11, #0x8\n\
+             \x20 SetRegister R1, %0\n"
         );
     }
 

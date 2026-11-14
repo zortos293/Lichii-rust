@@ -57,6 +57,8 @@ use crate::pipeline::{
 use crate::texture_cache::{DEPTH_ATTACHMENT, ImageId, ImageInfo, Transfer, ViewInfo};
 
 const NULL_BUFFER_SIZE: u64 = 64 << 10;
+/// The constant buffer slot NVN2 graphics programs read root table 0 from (their slot 24).
+const ROOT_TABLE_SLOT: usize = 17;
 /// How often a draw or dispatch looks its images up again after a lookup removed one it held,
 /// before it gives up: a render target and a texture over the same memory in layouts the
 /// texture cache cannot share replace each other on every lookup.
@@ -563,6 +565,8 @@ fn read_cbuf<T: bytemuck::Pod + Default>(
 struct StageSources<'a> {
     gmmu: &'a lichii_gpu::gmmu::Gmmu,
     cbufs: &'a [ConstBufferBinding],
+    /// Root table 0, which NVN2 graphics programs read as constant buffer slot 17.
+    root_table: Option<&'a [u32; 64]>,
     pool: TexturePool,
     samplers: GpuVAddr,
     sampler_limit: u32,
@@ -642,6 +646,7 @@ impl VulkanRasterizer {
                 let sources = StageSources {
                     gmmu,
                     cbufs: &ctx.const_buffers[slot - 1],
+                    root_table: Some(&ctx.root_tables[0]),
                     pool: TexturePool {
                         address: regs.tex_header.address(),
                         limit: regs.tex_header.limit,
@@ -1147,16 +1152,23 @@ impl VulkanRasterizer {
                                 .get((desc.index + i) as usize)
                                 .copied()
                                 .unwrap_or_default();
-                            let binding = if cbuf.enabled {
-                                self.buffer_cache.uniform_buffer(
+                            let index = (desc.index + i) as usize;
+                            let binding = match src.root_table {
+                                _ if cbuf.enabled => self.buffer_cache.uniform_buffer(
                                     &mut self.scheduler,
                                     &mut self.staging,
                                     src.gmmu,
                                     cbuf.address,
                                     u64::from(cbuf.size),
-                                )?
-                            } else {
-                                None
+                                )?,
+                                Some(table) if index == ROOT_TABLE_SLOT => {
+                                    Some(self.buffer_cache.stream_uniform(
+                                        &mut self.scheduler,
+                                        bytemuck::bytes_of(table),
+                                        info.constant_buffer_used_sizes[index],
+                                    )?)
+                                }
+                                _ => None,
                             };
                             self.push_buffer(binding);
                         }
@@ -2237,6 +2249,7 @@ impl VulkanRasterizer {
         let sources = StageSources {
             gmmu: ctx.memory,
             cbufs: ctx.const_buffers,
+            root_table: None,
             pool: *env.pool(),
             samplers: ctx.samplers,
             sampler_limit: ctx.sampler_limit,
