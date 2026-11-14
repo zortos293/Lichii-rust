@@ -2731,6 +2731,51 @@ fn images_split_across_device_ranges_sync_on_the_gpu() {
 }
 
 #[test]
+fn images_whose_layers_share_device_memory_sync_on_the_gpu() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let aliased = GPU_VA + (1 << 30);
+    f.gmmu
+        .map(aliased, DADDR + 0x10_0000, 0x1_0000, 0, false)
+        .unwrap();
+    f.gmmu
+        .map(aliased + 0x1_0000, DADDR + 0x10_0000, 0x1_0000, 0, false)
+        .unwrap();
+    let header = tic(0x08, aliased, 128, 128, 2, 1, 4);
+    let pattern: Vec<u8> = (0..0x1_0000).map(|i: u32| (i * 7 + i / 89) as u8).collect();
+    f.memory.write_bytes(DADDR + 0x10_0000, &pattern).unwrap();
+    let (texture, _) = f.texture(&header);
+    assert_eq!(f.cache.get(texture).unwrap().segments.len(), 2);
+    let target = rt_info(128, 128, 3, GobLayout::Tegra);
+    clear_rt_at(
+        &mut f,
+        GPU_VA + 0x10_0000,
+        &target,
+        [0.0, 1.0, 0.0, 1.0],
+        Rect::ALL,
+    );
+    let traffic = f.cache.traffic();
+    assert_eq!(f.texture(&header).0, texture);
+    let after = f.cache.traffic();
+    assert_eq!(
+        after.downloads, traffic.downloads,
+        "no write-back to guest memory"
+    );
+    assert_eq!(after.gpu_syncs, traffic.gpu_syncs + 1);
+    let texels = f.read_image(texture);
+    assert!(
+        all_texels(&texels[0], GREEN),
+        "layer 0 takes the target's texels"
+    );
+    assert!(
+        all_texels(&texels[1], GREEN),
+        "and so does the layer aliasing it"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
 fn single_slice_volumes_of_a_deeper_block_sync_on_the_gpu() {
     let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
         return;
