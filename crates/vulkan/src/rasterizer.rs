@@ -125,6 +125,9 @@ enum Release {
     },
     /// A Z-pass counter reset; its earlier queries are free once the work before it completed.
     SamplesReset(u64),
+    /// Reads the Z-pass queries of `range` into the running count, freeing their slots while the
+    /// guest counts without reporting.
+    SamplesFold(samples::SampleRange),
 }
 
 /// The rectangle a clear covers: the first scissor and the clear rectangle when
@@ -623,6 +626,7 @@ impl VulkanRasterizer {
             texture_upload_bytes = textures.upload_bytes - a.textures.upload_bytes,
             texture_downloads = textures.downloads - a.textures.downloads,
             texture_download_bytes = textures.download_bytes - a.textures.download_bytes,
+            texture_gpu_syncs = textures.gpu_syncs - a.textures.gpu_syncs,
             buffer_upload_bytes = buffers.uploaded_bytes - a.buffers.uploaded_bytes,
             buffer_download_bytes = buffers.downloaded_bytes - a.buffers.downloaded_bytes,
             buffer_stream_bytes = buffers.streamed_bytes - a.buffers.streamed_bytes,
@@ -989,6 +993,9 @@ impl Rasterizer for VulkanRasterizer {
                 }
                 .execute(&self.handles),
                 Release::SamplesReset(reset_at) => self.samples.retire(reset_at),
+                Release::SamplesFold(range) => {
+                    self.samples.resolve(&self.device, range);
+                }
             }
         }
     }

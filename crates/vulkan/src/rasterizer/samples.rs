@@ -2,8 +2,9 @@
 //! query, and a SamplesPassed report sums the queries recorded since the counter's last reset.
 //!
 //! Queries live in one pool used as a ring. Draws take slots in recording order and reset them
-//! a block at a time from the command buffer, so recording never waits on the host GPU; reports
-//! read their results once the work before them completed.
+//! a block at a time from the command buffer, so recording never waits on the host GPU. Each new
+//! block also queues a read of the queries so far, so slots come free as their work completes
+//! whether or not the guest reports; reports read the rest once the work before them completed.
 
 use ash::vk;
 use lichii_common::settings::ResolutionScale;
@@ -11,7 +12,7 @@ use lichii_common::settings::ResolutionScale;
 use crate::device::Device;
 use crate::error::{Result, VkResultExt};
 
-const SLOTS: u64 = 16 * 1024;
+pub(super) const SLOTS: u64 = if cfg!(test) { 256 } else { 16 * 1024 };
 /// Slots reset by one command; a slot is taken only once every query of its block was read.
 const BLOCK: u64 = 64;
 
@@ -100,6 +101,13 @@ impl SampleCounter {
         self.scales[slot as usize] = scale;
         self.next += 1;
         Some(slot)
+    }
+
+    /// Whether `slot` is the first of its block. A draw taking it queues a
+    /// [`resolve`](Self::resolve) of the counter so far, so slots come free as their work
+    /// completes even when the guest does not report.
+    pub(super) fn starts_block(slot: u32) -> bool {
+        u64::from(slot).is_multiple_of(BLOCK)
     }
 
     /// Begins the query of a reserved `slot` inside the draw's rendering.

@@ -148,6 +148,52 @@ impl Fixture {
             .collect()
     }
 
+    /// One aspect of level 0, layer 0 as tightly packed texels of `bytes` bytes each.
+    fn read_plane(&mut self, id: ImageId, aspect: vk::ImageAspectFlags, bytes: u32) -> Vec<u8> {
+        let (w, h, _) = self.cache.get(id).unwrap().info.level_extent(0);
+        let size = u64::from(w * h * bytes).next_multiple_of(4);
+        let buffer = Buffer::new(
+            &self.device,
+            size,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            MemoryLocation::GpuToCpu,
+            "plane readback",
+        )
+        .unwrap();
+        let cmd = self.scheduler.record().unwrap();
+        let raw = self
+            .cache
+            .prepare(cmd, id, ImageAccess::TRANSFER_SRC)
+            .expect("a live image");
+        let region = vk::BufferImageCopy {
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: aspect,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            image_extent: vk::Extent3D {
+                width: w,
+                height: h,
+                depth: 1,
+            },
+            ..Default::default()
+        };
+        // SAFETY: the image is in TRANSFER_SRC layout and the buffer holds the region.
+        unsafe {
+            self.device.raw.cmd_copy_image_to_buffer(
+                cmd,
+                raw,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                buffer.raw(),
+                &[region],
+            )
+        };
+        transfer_to_all_barrier(&self.device, cmd);
+        self.scheduler.finish().unwrap();
+        buffer.mapped().unwrap()[..(w * h * bytes) as usize].to_vec()
+    }
+
     /// Device memory of the live images.
     fn image_bytes(&self) -> u64 {
         self.cache
@@ -2056,4 +2102,232 @@ fn blits_from_guest_data_stay_in_software() {
     assert!(!blitted, "an uploaded source no GPU work wrote");
     assert_eq!(f.cache.traffic(), before, "no upload for a software blit");
     f.assert_no_validation_errors();
+}
+
+#[test]
+fn narrower_block_linear_textures_alias_their_render_target_without_a_flush() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let info = rt_info(32, 24, 1, GobLayout::Tegra);
+    let target = clear_rt(&mut f, &info, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    let header = tic(0x08, GPU_VA, 24, 24, 1, 1, 1);
+    let (texture, _) = f.texture(&header);
+    assert_ne!(texture, target.id);
+    assert!(
+        f.cache.state(target.id).is_some(),
+        "the render target stays"
+    );
+    assert!(all_texels(&f.read_image(texture)[0], [255, 0, 0, 255]));
+    clear_rt(&mut f, &info, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    assert_eq!(f.texture(&header).0, texture);
+    assert!(
+        all_texels(&f.read_image(texture)[0], [0, 255, 0, 255]),
+        "the texture takes the render target's newer texels"
+    );
+    assert_eq!(
+        f.cache.traffic().downloads,
+        0,
+        "no write-back to guest memory"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn overlaps_of_another_layout_sync_on_the_gpu_without_a_flush() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let wide = rt_info(256, 64, 2, GobLayout::Tegra);
+    let narrow = rt_info(64, 64, 2, GobLayout::Tegra);
+    let corner = Rect {
+        x: 0,
+        y: 0,
+        width: 8,
+        height: 8,
+    };
+    let first = clear_rt(&mut f, &wide, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    let second = clear_rt(&mut f, &narrow, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    assert_ne!(first.id, second.id);
+    let before = f.cache.traffic();
+    for _ in 0..3 {
+        assert_eq!(
+            clear_rt(&mut f, &wide, [1.0, 0.0, 0.0, 1.0], corner).id,
+            first.id
+        );
+        assert_eq!(
+            clear_rt(&mut f, &narrow, [0.0, 1.0, 0.0, 1.0], corner).id,
+            second.id
+        );
+    }
+    let after = f.cache.traffic();
+    assert_eq!(
+        after.downloads, before.downloads,
+        "no write-back to guest memory"
+    );
+    assert_eq!(
+        after.uploads, before.uploads,
+        "no re-upload from guest memory"
+    );
+    assert!(
+        after.gpu_syncs >= before.gpu_syncs + 6,
+        "each switch synced on the GPU"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn gpu_overlap_syncs_move_texels_through_the_guest_layout() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let wide = rt_info(256, 64, 2, GobLayout::Tegra);
+    let narrow = rt_info(64, 64, 2, GobLayout::Tegra);
+    let pattern: Vec<u8> = (0..wide.size_bytes())
+        .map(|i| (i * 7 + i / 251) as u8)
+        .collect();
+    f.memory.write_bytes(DADDR, &pattern).unwrap();
+    let wide_rect = Rect {
+        x: 4,
+        y: 3,
+        width: 20,
+        height: 9,
+    };
+    let target = clear_rt(&mut f, &wide, [0.0, 0.0, 1.0, 1.0], wide_rect);
+    let mut expected = f.read_image(target.id).remove(0);
+    clear_rt(
+        &mut f,
+        &narrow,
+        [0.0, 1.0, 0.0, 1.0],
+        Rect {
+            x: 8,
+            y: 40,
+            width: 16,
+            height: 8,
+        },
+    );
+    for y in 8..16 {
+        for x in 72..88 {
+            let at = (y * 256 + x) * 4;
+            expected[at..at + 4].copy_from_slice(&[0, 255, 0, 255]);
+        }
+    }
+    let syncs = f.cache.traffic().gpu_syncs;
+    let downloads = f.cache.traffic().downloads;
+    let (mut tx, cache, gmmu) = f.tx();
+    let synced = cache
+        .render_target(&mut tx, gmmu, GPU_VA, &wide, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(synced.id, target.id);
+    let texels = f.read_image(target.id).remove(0);
+    assert!(f.cache.traffic().gpu_syncs > syncs);
+    assert_eq!(f.cache.traffic().downloads, downloads);
+    let wrong: Vec<usize> = (0..texels.len() / 4)
+        .filter(|i| texels[i * 4..i * 4 + 4] != expected[i * 4..i * 4 + 4])
+        .take(8)
+        .collect();
+    assert!(wrong.is_empty(), "texels differ at {wrong:?}");
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn depth_stencil_overlaps_sync_on_the_gpu() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let clear = |f: &mut Fixture, info: &ImageInfo, depth: f32, stencil: u8, rect: Rect| {
+        let (mut tx, cache, gmmu) = f.tx();
+        let target = cache
+            .render_target(&mut tx, gmmu, GPU_VA, info, rect == Rect::ALL)
+            .unwrap()
+            .unwrap();
+        cache
+            .clear(
+                &mut tx,
+                target,
+                ClearValue::DepthStencil {
+                    depth: Some(depth),
+                    stencil: Some(stencil),
+                    stencil_mask: 0xff,
+                },
+                rect,
+                0,
+                1,
+            )
+            .unwrap();
+        target
+    };
+    for format in [PixelFormat::S8UintD24Unorm, PixelFormat::D24UnormS8Uint] {
+        let mut wide = rt_info(256, 64, 2, GobLayout::Tegra);
+        let mut narrow = rt_info(64, 64, 2, GobLayout::Tegra);
+        wide.format = format;
+        narrow.format = format;
+        let target = clear(&mut f, &wide, 0.5, 0x5a, Rect::ALL);
+        if f.cache.get(target.id).unwrap().host.format != vk::Format::D24_UNORM_S8_UINT {
+            eprintln!("skipping: no host D24S8");
+            return;
+        }
+        clear(
+            &mut f,
+            &narrow,
+            0.25,
+            0x33,
+            Rect {
+                x: 8,
+                y: 40,
+                width: 16,
+                height: 8,
+            },
+        );
+        let syncs = f.cache.traffic().gpu_syncs;
+        let downloads = f.cache.traffic().downloads;
+        let (mut tx, cache, gmmu) = f.tx();
+        let synced = cache
+            .render_target(&mut tx, gmmu, GPU_VA, &wide, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(synced.id, target.id);
+        assert!(f.cache.traffic().gpu_syncs > syncs, "{format:?}");
+        assert_eq!(f.cache.traffic().downloads, downloads, "{format:?}");
+        let depth = f.read_plane(target.id, vk::ImageAspectFlags::DEPTH, 4);
+        let stencil = f.read_plane(target.id, vk::ImageAspectFlags::STENCIL, 1);
+        for (i, word) in depth.as_chunks::<4>().0.iter().enumerate() {
+            let (x, y) = (i % 256, i / 256);
+            let inside = (72..88).contains(&x) && (8..16).contains(&y);
+            let (want_depth, want_stencil) = if inside {
+                (0x40_0000, 0x33)
+            } else {
+                (0x80_0000, 0x5a)
+            };
+            let d = u32::from_le_bytes(*word) & 0xff_ffff;
+            assert!(
+                d.abs_diff(want_depth) <= 1,
+                "{format:?}: depth {d:#x} at ({x}, {y})"
+            );
+            assert_eq!(
+                stencil[i], want_stencil,
+                "{format:?}: stencil at ({x}, {y})"
+            );
+        }
+        f.cache.unmap(&mut f.scheduler, DADDR, 1 << 20);
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn block_linear_aliases_need_the_same_depth_stencil_encoding() {
+    let info = |format, width| {
+        let mut info = rt_info(width, 64, 2, GobLayout::Tegra);
+        info.format = format;
+        info
+    };
+    let d24s8 = info(PixelFormat::D24UnormS8Uint, 256);
+    let s8d24 = info(PixelFormat::S8UintD24Unorm, 252);
+    assert!(block_linear_overlap(&d24s8, DADDR, &s8d24, DADDR).is_none());
+    let narrower = info(PixelFormat::D24UnormS8Uint, 252);
+    assert_eq!(
+        block_linear_overlap(&d24s8, DADDR, &narrower, DADDR),
+        Some(((0, 0), (0, 0), (252, 64)))
+    );
 }

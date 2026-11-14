@@ -266,6 +266,32 @@ fn draws_hand_assembled_programs_and_reads_the_target_back() {
     f.assert_no_validation_errors();
 }
 
+/// A count spanning more draws than the query pool holds is exact: completed queries are read
+/// as their work finishes, not only when the guest reports.
+#[test]
+fn z_pass_counts_more_draws_than_the_query_pool_holds() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    let mut regs = draw_regs();
+    regs.zpass_pixel_count_enable = 1;
+    f.rasterizer.reset_counter(QueryKind::SamplesPassed);
+    let draws = 3 * crate::rasterizer::samples::SLOTS;
+    for i in 1..=draws {
+        draw(&mut f, &gmmu, &regs);
+        if i % 32 == 0 {
+            f.rasterizer.wait_for_idle();
+        }
+    }
+    assert_eq!(z_pass_report(&mut f, &gmmu), draws * u64::from(SIZE * SIZE));
+    f.assert_no_validation_errors();
+}
+
 /// The Z-pass pixel count, reported once the work recorded so far completed.
 fn z_pass_report(f: &mut Fixture, gmmu: &Arc<Gmmu>) -> u64 {
     const REPORT: u64 = 0x40_0000;

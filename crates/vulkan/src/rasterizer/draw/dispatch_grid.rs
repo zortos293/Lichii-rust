@@ -11,10 +11,10 @@ use ash::vk;
 use gpu_allocator::MemoryLocation;
 use lichii_gpu::backend::QmdVersion;
 
-use super::host_compute::{HostCompute, storage};
 use crate::buffer_cache::BufferBinding;
 use crate::device::Device;
 use crate::error::Result;
+use crate::host_compute::{HostCompute, storage};
 use crate::memory::Buffer;
 use crate::rasterizer::VulkanRasterizer;
 use crate::shaders;

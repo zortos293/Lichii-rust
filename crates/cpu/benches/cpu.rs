@@ -502,14 +502,26 @@ const WORKLOADS: &[Workload] = &[
     },
 ];
 
+/// Workloads that run a second time under FPCR.FZ, which titles such as Splatoon 3 set.
+const FLUSH_TO_ZERO: &[&str] = &[
+    "scalar fp loop",
+    "vector fp loop",
+    "fp element loop",
+    "fp compare loop",
+];
+
 fn main() {
     let iterations: u64 = std::env::var("LICHII_BENCH_ITERATIONS")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|&n| n > 0)
         .unwrap_or(10_000_000);
-    for (workload, backend) in WORKLOADS
+    for ((workload, fpcr), backend) in WORKLOADS
         .iter()
+        .flat_map(|w| {
+            let fz = FLUSH_TO_ZERO.contains(&w.name).then_some((w, 1 << 24));
+            std::iter::once((w, 0)).chain(fz)
+        })
         .flat_map(|w| [(w, CpuBackend::Interpreter), (w, CpuBackend::Jit)])
     {
         let mem = Arc::new(
@@ -543,6 +555,7 @@ fn main() {
         for _ in 0..3 {
             let mut ctx = ThreadContext {
                 pc: CODE,
+                fpcr,
                 ..Default::default()
             };
             ctx.x[1] = DATA;
@@ -552,9 +565,12 @@ fn main() {
             seconds = seconds.min(start.elapsed().as_secs_f64());
         }
         let instructions = iterations * workload.per_iteration;
+        let name = match fpcr {
+            0 => workload.name.to_string(),
+            _ => format!("{} fz", workload.name),
+        };
         println!(
-            "{:<18} {:<12} {:>8.1} MIPS ({instructions} instructions in {seconds:.3} s, best of 3)",
-            workload.name,
+            "{name:<18} {:<12} {:>8.1} MIPS ({instructions} instructions in {seconds:.3} s, best of 3)",
             format!("{backend:?}"),
             instructions as f64 / seconds / 1e6
         );

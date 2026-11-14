@@ -8,6 +8,7 @@ pub mod descriptors;
 pub mod device;
 mod error;
 pub mod format;
+mod host_compute;
 pub mod instance;
 pub mod memory;
 pub mod pipeline;
