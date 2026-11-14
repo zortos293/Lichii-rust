@@ -809,11 +809,13 @@ impl Dispatch<'_> {
                 stream: &mut shared.stream,
                 memory: self.memory,
             };
+            crate::diag_dma::call_begin(pending.method);
             if let Err(error) =
                 engine.execute(pending.method, &pending.parameters, data_ram, &mut host)
             {
                 tracing::warn!(%error, method = pending.method, "macro call failed");
             }
+            crate::diag_dma::call_end();
         }
         pending.parameters.clear();
     }
@@ -876,6 +878,7 @@ impl MacroHost for FrontMacroHost<'_> {
 
     #[inline]
     fn write_method(&mut self, method: u32, argument: u32) {
+        crate::diag_dma::emit(method);
         if is_load_mme(method) {
             tracing::debug!(method, "macro writes LOAD_MME; ignored");
             return;
@@ -892,8 +895,10 @@ impl MacroHost for FrontMacroHost<'_> {
     /// Reads memory as of the macro's position in the stream: the work sent before it completes
     /// and what the GPU wrote to the words reaches guest memory first.
     fn dma_read(&mut self, gpu_va: u64, out: &mut [u32]) {
+        let diag_start = std::time::Instant::now();
         self.stream
             .synchronize_read(gpu_va, size_of_val(out) as u64);
+        let diag_ns = diag_start.elapsed().as_nanos() as u64;
         if let Err(fault) = self
             .memory
             .read_block(gpu_va, bytemuck::cast_slice_mut(out))
@@ -901,6 +906,7 @@ impl MacroHost for FrontMacroHost<'_> {
             tracing::warn!(?fault, "MME DMA read from unmapped GPU memory");
             out.fill(0);
         }
+        crate::diag_dma::front_read(gpu_va, out, diag_ns);
     }
 }
 

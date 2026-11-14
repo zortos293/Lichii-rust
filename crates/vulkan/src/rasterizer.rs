@@ -1037,6 +1037,7 @@ impl Rasterizer for VulkanRasterizer {
             }
             return;
         };
+        lichii_gpu::diag_dma::query(address, query);
         let value = match query.kind {
             QueryKind::Payload => query.payload,
             QueryKind::SamplesPassed => {
@@ -1130,6 +1131,7 @@ impl Rasterizer for VulkanRasterizer {
             ReleaseSize::Eight => 8,
             ReleaseSize::Sixteen => 16,
         };
+        let mut diag_hit = None;
         let last = self.fences.iter().rev().find_map(|&(tick, release)| {
             let hit = match release {
                 Release::Action(FenceAction::WriteSemaphore { address, size, .. })
@@ -1139,14 +1141,25 @@ impl Rasterizer for VulkanRasterizer {
                 | Release::SamplesReset(_)
                 | Release::SamplesFold(_) => false,
             };
+            if hit {
+                diag_hit = Some(match release {
+                    Release::Action(FenceAction::WriteSemaphore { address, size, value }) => (address, format!("sem{size:?}={value:#x}")),
+                    Release::Samples { address, size, .. } => (address, format!("samples{size:?}")),
+                    Release::Action(FenceAction::ReduceSemaphore { address, .. }) => (address, "reduce".to_string()),
+                    _ => (0, "?".to_string()),
+                });
+            }
             hit.then_some(tick)
         });
+        let diag_start = std::time::Instant::now();
+        let diag_pending = last.map_or(0, |tick| self.scheduler.tick().saturating_sub(tick));
         if let Some(tick) = last {
             self.flush();
             if let Err(error) = self.scheduler.wait(tick) {
                 tracing::error!(%error, "waiting for GPU work failed");
             }
         }
+        lichii_gpu::diag_dma::back_read(addr, size, diag_hit, diag_pending, diag_start.elapsed().as_nanos() as u64);
         self.release_fences(false);
         self.flush_region(addr, size);
     }

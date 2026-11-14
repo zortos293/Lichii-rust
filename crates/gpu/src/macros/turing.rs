@@ -173,6 +173,7 @@ impl<H: MacroHost> Io<'_, H> {
     /// end are dropped) or onto the load FIFO.
     #[cold]
     fn dma_read(&mut self, fifoed: bool, count: u32) -> Result<(), MacroErrorKind> {
+        crate::diag_dma::set_fifoed(fifoed);
         self.record.uncacheable();
         let high = self.host.read_register(SET_MME_MEM_ADDRESS_A) & 0x1_FFFF;
         let low = self.host.read_register(SET_MME_MEM_ADDRESS_B);
