@@ -34,6 +34,8 @@ pub struct Scheduler {
     garbage: VecDeque<(u64, Box<dyn Send>)>,
     /// Where blocking waits are timed as [`Wait::HostGpu`]: the GPU thread's scheduler only.
     activity: Option<Arc<Activity>>,
+    /// Tick of a sparse binding the next submission must wait for.
+    bound: Option<u64>,
 }
 
 impl Scheduler {
@@ -77,6 +79,7 @@ impl Scheduler {
             current: None,
             garbage: VecDeque::new(),
             activity: None,
+            bound: None,
         })
     }
 
@@ -169,8 +172,14 @@ impl Scheduler {
                     .call("vkEndCommandBuffer")?
             };
         }
+        let bound = self.bound.take().map(|value| SemaphoreWait {
+            semaphore: self.timeline.raw,
+            value,
+            stage: vk::PipelineStageFlags2::ALL_COMMANDS,
+        });
         let wait_infos: Vec<_> = waits
             .iter()
+            .chain(bound.iter())
             .map(|w| {
                 vk::SemaphoreSubmitInfo::default()
                     .semaphore(w.semaphore)
@@ -203,6 +212,43 @@ impl Scheduler {
         }
         self.tick += 1;
         Ok(tick)
+    }
+
+    /// Binds sparse memory to `image` after the work recorded so far and before any recorded
+    /// later. The binding takes a tick of its own, which the next submission waits for.
+    pub fn bind_sparse(
+        &mut self,
+        image: vk::Image,
+        binds: &[vk::SparseImageMemoryBind],
+        opaque: &[vk::SparseMemoryBind],
+    ) -> Result<()> {
+        let after = self.flush()?;
+        let tick = self.tick;
+        let image_info = [vk::SparseImageMemoryBindInfo::default()
+            .image(image)
+            .binds(binds)];
+        let opaque_info = [vk::SparseImageOpaqueMemoryBindInfo::default()
+            .image(image)
+            .binds(opaque)];
+        let semaphores = [self.timeline.raw];
+        let (waits, signals) = ([after], [tick]);
+        let mut values = vk::TimelineSemaphoreSubmitInfo::default()
+            .wait_semaphore_values(&waits)
+            .signal_semaphore_values(&signals);
+        let mut info = vk::BindSparseInfo::default()
+            .wait_semaphores(&semaphores)
+            .signal_semaphores(&semaphores)
+            .push_next(&mut values);
+        if !binds.is_empty() {
+            info = info.image_binds(&image_info);
+        }
+        if !opaque.is_empty() {
+            info = info.image_opaque_binds(&opaque_info);
+        }
+        self.device.bind_sparse(&[info])?;
+        self.bound = Some(tick);
+        self.tick += 1;
+        Ok(())
     }
 
     /// The last tick the GPU finished, refreshed from the semaphore.

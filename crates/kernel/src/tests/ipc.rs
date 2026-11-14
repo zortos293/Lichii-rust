@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lichii_common::{ConsoleGeneration, ResultCode};
 use lichii_cpu::ThreadContext;
@@ -11,6 +11,7 @@ use super::{Script, TestKernel};
 use crate::event::Event;
 use crate::ipc::{HleRequestContext, SessionHandler, UNKNOWN_COMMAND_ID};
 use crate::object::KObject;
+use crate::process::ProcessState;
 use crate::result;
 
 const SFCI: u32 = u32::from_le_bytes(*b"SFCI");
@@ -256,7 +257,7 @@ fn cmif_round_trips_through_sm_sessions_and_domains() {
     let test = TestKernel::new(ConsoleGeneration::Switch1);
     let heap = heap_base(&test);
     let event = Arc::new(Event::new());
-    register_test_service(&test, event);
+    register_test_service(&test, event.clone());
     let replies = Replies::default();
     let (input, output) = (heap + 0x4000, heap + 0x5000);
     let mut s = connect_sm(Script::new(), heap + 0x3000);
@@ -424,6 +425,8 @@ fn cmif_round_trips_through_sm_sessions_and_domains() {
     // Close, then the session is gone.
     assert_eq!(r[16].0, 0);
     assert_eq!(r[17].0, u64::from(result::SESSION_CLOSED.0));
+    // The event remembers the command that first handed it to the guest.
+    assert_eq!(event.origin(), Some("test:u command 3"));
 }
 
 #[test]
@@ -632,4 +635,88 @@ fn user_buffers_clones_and_deferred_move_handles() {
     assert_eq!(r[6].0, u64::from(result::SESSION_CLOSED.0));
     // A deferred request keeps the object of its move handle for the retry.
     assert_eq!((r[7].0, r[7].1[6], r[7].1[8]), (0, 0, 1));
+}
+
+struct Stuck {
+    entered: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+}
+
+impl SessionHandler for Stuck {
+    fn name(&self) -> &str {
+        "stuck:u"
+    }
+
+    fn handle_request(&self, _ctx: &mut HleRequestContext) -> ResultCode {
+        self.entered.store(true, Ordering::SeqCst);
+        while !self.release.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        ResultCode::SUCCESS
+    }
+}
+
+/// A service thread still inside a request (blocked on the GPU or the host) does not hold up the
+/// kernel's shutdown, and the process it serves keeps its memory until the request returns.
+#[test]
+fn shutdown_leaves_a_service_thread_stuck_in_a_request() {
+    let test = TestKernel::new(ConsoleGeneration::Switch1);
+    let heap = heap_base(&test);
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let thread = test.kernel.create_service_thread("stuck").unwrap();
+    let (handler_entered, handler_release) = (entered.clone(), release.clone());
+    test.kernel
+        .service_manager()
+        .register(
+            "stuck:u",
+            &thread,
+            Arc::new(move || {
+                Arc::new(Stuck {
+                    entered: handler_entered.clone(),
+                    release: handler_release.clone(),
+                }) as Arc<dyn SessionHandler>
+            }),
+        )
+        .unwrap();
+    let replies = Replies::default();
+    let mut s = connect_sm(Script::new(), heap + 0x3000);
+    s = call(
+        s,
+        &replies,
+        19,
+        Msg {
+            pid: true,
+            ..Msg::cmif(0, &[0, 0])
+        },
+        None,
+    );
+    s = call(s, &replies, 19, Msg::cmif(1, &name("stuck:u")), Some(20));
+    s = call(s, &replies, 20, Msg::cmif(0, &[]), None);
+    let main = test.program(s.exit());
+    let process = test.start(test.image(), main);
+    test.kernel.run().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !entered.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < deadline,
+            "the request never reached the service"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let start = Instant::now();
+    test.kernel.shutdown();
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "shutdown took {:?}",
+        start.elapsed()
+    );
+    assert_ne!(process.state(), ProcessState::Exited);
+    assert!(process.memory().read::<u32>(heap + 0x3000).is_ok());
+    release.store(true, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process.state() != ProcessState::Exited {
+        assert!(Instant::now() < deadline, "the process was never released");
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }

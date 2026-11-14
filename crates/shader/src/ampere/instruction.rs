@@ -131,13 +131,23 @@ impl Instruction {
         self.bits(32, 32) as u32
     }
 
+    /// The constant buffer slot at 54..59. NVN2 programs read root table 0 (where the console
+    /// keeps the blit parameter block) as slot 24, past Maxwell's 18; it is read as slot 17,
+    /// which NVN2 never binds.
+    pub const fn cbuf_slot(self) -> u32 {
+        match self.bits(54, 5) as u32 {
+            24 => 17,
+            slot => slot,
+        }
+    }
+
     /// The constant-buffer operand of a constant-buffer form: offset at 38..54, slot at
-    /// 54..59, or a uniform register handle at 32..38 when bit 91 is set.
+    /// 54..59 ([`Self::cbuf_slot`]), or a uniform register handle at 32..38 when bit 91 is set.
     pub const fn cbuf(self) -> CbufOperand {
         let bank = if self.bit(91) {
             CbufBank::Ureg(self.ureg_at(32))
         } else {
-            CbufBank::Index(self.bits(54, 5) as u32)
+            CbufBank::Index(self.cbuf_slot())
         };
         CbufOperand {
             bank,

@@ -113,6 +113,8 @@ pub struct DeviceFeatures {
     pub storage_texel_buffer_array_non_uniform_indexing: bool,
     pub maintenance4: bool,
     pub null_descriptor: bool,
+    /// Sparse binding and 2D sparse residency, on the universal queue.
+    pub sparse_residency: bool,
     pub custom_border_color_without_format: bool,
     pub vertex_input_dynamic_state: bool,
     pub provoking_vertex_last: bool,
@@ -468,6 +470,14 @@ impl Device {
             ),
             maintenance4: on(v13.maintenance4),
             null_descriptor: extensions.robustness2 && on(robustness2.null_descriptor),
+            sparse_residency: on(core.sparse_binding)
+                && on(core.sparse_residency_image2_d)
+                // SAFETY: valid physical device.
+                && unsafe {
+                    raw_instance.get_physical_device_queue_family_properties(physical)
+                }
+                .get(candidate.queue_family as usize)
+                .is_some_and(|f| f.queue_flags.contains(vk::QueueFlags::SPARSE_BINDING)),
             custom_border_color_without_format: extensions.custom_border_color
                 && on(border.custom_border_color_without_format),
             vertex_input_dynamic_state: extensions.vertex_input_dynamic_state
@@ -621,6 +631,41 @@ impl Device {
         // SAFETY: the queue is externally synchronised by the lock; the caller keeps every
         // referenced object alive until the submission completes.
         unsafe { self.raw.queue_submit2(*queue, submits, fence) }.call("vkQueueSubmit2")
+    }
+
+    /// Binds sparse memory on the universal queue, under the same lock as submissions.
+    pub fn bind_sparse(&self, infos: &[vk::BindSparseInfo<'_>]) -> Result<()> {
+        let queue = self.queue.lock();
+        // SAFETY: the queue is externally synchronised by the lock; the caller keeps the images
+        // and memory alive until the binding completes.
+        unsafe { self.raw.queue_bind_sparse(*queue, infos, vk::Fence::null()) }
+            .call("vkQueueBindSparse")
+    }
+
+    /// Block shape of sparse images of `format` with `usage` (single-sampled, 2D, optimal
+    /// tiling), `None` when the device cannot make such images sparse.
+    pub fn sparse_granularity(
+        &self,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+    ) -> Option<vk::Extent3D> {
+        if !self.features.sparse_residency {
+            return None;
+        }
+        // SAFETY: valid physical device.
+        let properties = unsafe {
+            self.instance
+                .raw
+                .get_physical_device_sparse_image_format_properties(
+                    self.physical,
+                    format,
+                    vk::ImageType::TYPE_2D,
+                    vk::SampleCountFlags::TYPE_1,
+                    usage,
+                    vk::ImageTiling::OPTIMAL,
+                )
+        };
+        properties.first().map(|p| p.image_granularity)
     }
 
     /// Runs `f` with the queue locked (presentation).

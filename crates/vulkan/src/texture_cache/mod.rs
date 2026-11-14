@@ -64,9 +64,13 @@ use clear::ClearPipelines;
 
 /// Device memory is indexed in pages of this many bits (Lichii's texture cache uses 1 MiB).
 const PAGE_BITS: u32 = 20;
-/// Images with more texels are not created: an 8192x8192x68 virtual texture would take ~23 GB
-/// (NX2_NOTES row 87).
+/// Images with more texels are created sparse with no memory, as an 8192x8192x68 virtual
+/// texture would take ~23 GB (NX2_NOTES row 87): the subresources the GPU writes get memory,
+/// and nothing is uploaded or written back.
 const MAX_TEXELS: u64 = 1 << 28;
+/// Device memory one sparse image may bind by default; writes to subresources past it are
+/// dropped.
+const SPARSE_IMAGE_CAP: u64 = 2 << 30;
 /// The lookup table is emptied when it grows past this many entries.
 const MAX_LOOKUPS: usize = 1 << 16;
 
@@ -321,10 +325,11 @@ impl CachedImage {
 
     /// Whether the guest format can be written back from the host image.
     fn downloadable(&self) -> bool {
-        !matches!(
-            self.host.conversion,
-            Conversion::Decode | Conversion::DecodeToBc(_)
-        )
+        !self.image.is_sparse()
+            && !matches!(
+                self.host.conversion,
+                Conversion::Decode | Conversion::DecodeToBc(_)
+            )
     }
 
     /// Bytes a native-resolution readback of the image takes, and their alignment.
@@ -474,6 +479,10 @@ pub struct TextureCache {
     new_overlaps: Vec<ImageId>,
     dropped: Vec<ImageId>,
     overlap_scratch: Vec<ImageId>,
+    /// A sparse image hit its memory cap (warned once).
+    sparse_capped: bool,
+    /// Device memory one sparse image may bind.
+    sparse_cap: u64,
     keep: Vec<(DAddr, DAddr)>,
     segments: Vec<Segment>,
     scratch: Scratch,
@@ -727,6 +736,8 @@ impl TextureCache {
             new_overlaps: Vec::new(),
             dropped: Vec::new(),
             overlap_scratch: Vec::new(),
+            sparse_capped: false,
+            sparse_cap: SPARSE_IMAGE_CAP,
             keep: Vec::new(),
             segments: Vec::new(),
             scratch: Scratch::default(),
@@ -876,6 +887,12 @@ impl TextureCache {
         Ok(Some((found.id, view)))
     }
 
+    /// Whether `id` is a sparse image nothing has written yet, which samples as no image.
+    pub fn unwritten(&self, id: ImageId) -> bool {
+        self.get(id)
+            .is_some_and(|image| image.image.is_sparse() && image.image.memory_size() == 0)
+    }
+
     /// The image a render target or depth target writes, at the scale the rules allow.
     /// `discard` skips uploading guest data the caller overwrites entirely (a full clear).
     pub fn render_target(
@@ -906,6 +923,12 @@ impl TextureCache {
             ResolutionScale::X1
         };
         self.rescale(tx, found.id, target, !(discard && whole))?;
+        self.bind_written(
+            tx,
+            found.id,
+            found.level,
+            found.layer..found.layer + info.layers,
+        )?;
         Ok(Some(found))
     }
 
@@ -1524,11 +1547,92 @@ impl TextureCache {
         let image = self.get(id).expect("a live image id");
         let info = &image.info;
         self.scale != ResolutionScale::X1
+            && !image.image.is_sparse()
             && info.rescaleable
             && info.kind == ImageKind::D2
             && info.levels == 1
             && (self.scale > ResolutionScale::X1 || info.downscaleable)
             && self.can_blit(image.host.format)
+    }
+
+    /// Whether the device can create `info` as a sparse image (2D, single-sampled).
+    fn can_be_sparse(&mut self, info: &ImageInfo) -> bool {
+        let host = self.host(info.format);
+        let desc = Self::image_desc(info, &host, ResolutionScale::X1);
+        desc.image_type == vk::ImageType::TYPE_2D
+            && self
+                .device
+                .sparse_granularity(desc.format, desc.usage)
+                .is_some()
+    }
+
+    /// Gives memory to the subresources of `level` in `layers` the GPU is about to write when
+    /// `id` is sparse, clearing what it binds to the zeros unbound memory reads as. Returns
+    /// whether all of them have memory; false when the cap stopped the binding, and writes
+    /// to what it left unbound are dropped.
+    pub fn bind_written(
+        &mut self,
+        tx: &mut Transfer<'_>,
+        id: ImageId,
+        level: u32,
+        layers: std::ops::Range<u32>,
+    ) -> Result<bool> {
+        let device = self.device.clone();
+        let cap = self.sparse_cap;
+        let Some(image) = self.get_mut(id) else {
+            return Ok(true);
+        };
+        if !image.image.is_sparse() {
+            return Ok(true);
+        }
+        let bound = image.image.bind(tx.scheduler, level, layers, cap)?;
+        if !bound.complete && !self.sparse_capped {
+            self.sparse_capped = true;
+            tracing::warn!(
+                cap,
+                "a sparse image reached its memory cap; GPU writes past it are dropped"
+            );
+        }
+        if bound.newly.is_empty() {
+            return Ok(bound.complete);
+        }
+        let cmd = tx.scheduler.record()?;
+        let image = self.image(id);
+        image.transition(&device, cmd, ImageAccess::TRANSFER_DST);
+        let aspect = aspect_of(image.host.format);
+        let ranges: Vec<_> = bound
+            .newly
+            .iter()
+            .map(|&layer| vk::ImageSubresourceRange {
+                aspect_mask: aspect,
+                base_mip_level: level,
+                level_count: 1,
+                base_array_layer: layer,
+                layer_count: 1,
+            })
+            .collect();
+        let raw = image.image.raw();
+        // SAFETY: `cmd` is recording and the image was just made a transfer destination.
+        unsafe {
+            if aspect.contains(vk::ImageAspectFlags::COLOR) {
+                device.raw.cmd_clear_color_image(
+                    cmd,
+                    raw,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &vk::ClearColorValue::default(),
+                    &ranges,
+                );
+            } else {
+                device.raw.cmd_clear_depth_stencil_image(
+                    cmd,
+                    raw,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &vk::ClearDepthStencilValue::default(),
+                    &ranges,
+                );
+            }
+        }
+        Ok(bound.complete)
     }
 
     fn image_desc(info: &ImageInfo, host: &HostFormat, scale: ResolutionScale) -> ImageDesc {
@@ -1675,7 +1779,7 @@ impl TextureCache {
             tracing::debug!(gpu_va, "image at unmapped GPU memory is not cached");
             return Ok(None);
         }
-        if info.texels() > MAX_TEXELS {
+        if info.texels() > MAX_TEXELS && !self.can_be_sparse(info) {
             tracing::warn!(?info, "image too large to back on the host; not cached");
             return Ok(None);
         }
@@ -1799,6 +1903,12 @@ impl TextureCache {
         let device = self.device.clone();
         for &(join, level, layer) in &joins {
             self.rescale(tx, join, target, true)?;
+            let desc = *self.image(join).image.desc();
+            let mut resident = true;
+            for l in 0..desc.mip_levels {
+                resident &=
+                    self.bind_written(tx, id, level + l, layer..layer + desc.array_layers)?;
+            }
             let cmd = tx.scheduler.record()?;
             let (src_levels, src_layers, src_aspect) = {
                 let src = self.image(join);
@@ -1841,7 +1951,12 @@ impl TextureCache {
                     &regions,
                 )
             };
-            self.remove(tx.scheduler, join);
+            if resident {
+                self.remove(tx.scheduler, join);
+            } else {
+                self.image(join).overlaps.push(id);
+                self.image(id).overlaps.push(join);
+            }
             self.mark_modified(id);
         }
         Ok(())
@@ -1850,7 +1965,11 @@ impl TextureCache {
     fn create(&mut self, info: &ImageInfo, segments: Vec<Segment>) -> Result<ImageId> {
         let host = self.host(info.format);
         let desc = Self::image_desc(info, &host, ResolutionScale::X1);
-        let image = Image::new(&self.device, &desc, "guest image")?;
+        let image = if info.texels() > MAX_TEXELS {
+            Image::new_sparse(&self.device, &desc)?
+        } else {
+            Image::new(&self.device, &desc, "guest image")?
+        };
         let cached = CachedImage {
             info: *info,
             host,
@@ -1983,6 +2102,13 @@ impl TextureCache {
     /// Uploads guest memory into the image when the guest CPU or a later overlap wrote it since
     /// the last upload, then copies in what its aliases' GPU work wrote since.
     fn refresh(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
+        if self.image(id).image.is_sparse() {
+            let tick = self.tick;
+            let image = self.image(id);
+            image.cpu_dirty = false;
+            image.current = tick;
+            return self.take_from_aliases(tx.scheduler, id);
+        }
         self.take_from_overlaps(tx, id)?;
         if self.image(id).cpu_dirty {
             self.rescale(tx, id, ResolutionScale::X1, false)?;
@@ -2007,13 +2133,10 @@ impl TextureCache {
         newer.clear();
         let image = self.get(id).expect("a live image id");
         let current = image.current;
-        newer.extend(
-            image
-                .overlaps
-                .iter()
-                .copied()
-                .filter(|&o| self.get(o).is_some_and(|o| o.modified > current)),
-        );
+        newer.extend(image.overlaps.iter().copied().filter(|&o| {
+            self.get(o)
+                .is_some_and(|o| o.modified > current && !o.image.is_sparse())
+        }));
         if newer.is_empty() {
             self.overlap_scratch = newer;
             return Ok(());
@@ -2069,7 +2192,7 @@ impl TextureCache {
         keep.extend_from_slice(&image.keep_out);
         for &other in &image.overlaps {
             let other = self.get(other).expect("overlaps are live");
-            if other.modified > image.current {
+            if other.modified > image.current && !other.image.is_sparse() {
                 keep.extend(other.segments.iter().map(|s| (s.daddr, s.daddr + s.size)));
             }
         }

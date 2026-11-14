@@ -1225,6 +1225,29 @@ impl BufferCache {
             .map(Some)
     }
 
+    /// A uniform buffer binding of `bytes` followed by zeros up to `size` (at least the bytes,
+    /// at most the device's uniform range), copied to the stream ring.
+    pub fn stream_uniform(
+        &mut self,
+        scheduler: &mut Scheduler,
+        bytes: &[u8],
+        size: u32,
+    ) -> Result<BufferBinding> {
+        let limits = &self.device.properties.limits;
+        let size = u64::from(size.min(limits.max_uniform_buffer_range)).max(bytes.len() as u64);
+        let align = limits.min_uniform_buffer_offset_alignment;
+        let slice = self.stream.alloc(scheduler, size, align)?;
+        let (head, tail) = slice.data.split_at_mut(bytes.len());
+        head.copy_from_slice(bytes);
+        tail.fill(0);
+        self.stats.streamed_bytes += size;
+        Ok(BufferBinding {
+            buffer: slice.buffer,
+            offset: slice.offset,
+            size,
+        })
+    }
+
     /// A storage buffer binding for `[gpu_va, +size)`, starting at `gpu_va` rounded down to
     /// [`BufferCache::storage_alignment`]. With `written`, the range is marked GPU-written; a
     /// written range over scattered memory binds only its first contiguous run (as Lichii does

@@ -3,10 +3,10 @@
 
 use ash::vk;
 use lichii_common::GpuVAddr;
-use lichii_gpu::gmmu::Gmmu;
+use lichii_gpu::gmmu::{Gmmu, RangeTarget};
 use lichii_texture::{Numeric, PixelFormat};
 
-use super::{Found, ImageInfo, ImageKind, TextureCache, Transfer};
+use super::{Found, ImageInfo, ImageKind, Segment, TextureCache, Transfer};
 use crate::commands::ImageAccess;
 use crate::error::Result;
 use crate::format::{Conversion, HostFormat};
@@ -24,8 +24,9 @@ pub struct BlitSide {
 impl TextureCache {
     /// Blits `src.rect` over `dst.rect` on the GPU, filtering linearly when `linear`.
     /// `Ok(false)` when the cache cannot, and the caller blits in software: a format the host
-    /// does not blit as it is, an image the lookup resolves to another format, a rectangle
-    /// outside its image, or one image on both sides.
+    /// does not blit as it is, a source no GPU work wrote (guest memory holds its texels, which
+    /// the software blit reads without an upload), an image the lookup resolves to another
+    /// format, a rectangle outside its image, or one image on both sides.
     pub fn blit(
         &mut self,
         tx: &mut Transfer<'_>,
@@ -39,6 +40,7 @@ impl TextureCache {
         if src.info.kind != ImageKind::D2
             || dst.info.kind != ImageKind::D2
             || !self.blittable(src.info.format, src_host, dst.info.format, dst_host)
+            || !self.gpu_holds(gmmu, src.gpu_va, src.info.size_bytes())
         {
             return Ok(false);
         }
@@ -101,6 +103,27 @@ impl TextureCache {
         }
         self.mark_modified(target.id);
         Ok(true)
+    }
+
+    /// Whether a GPU-modified image overlaps the `size` bytes at `gpu_va`, so texels there are
+    /// newer on the GPU than in guest memory.
+    fn gpu_holds(&mut self, gmmu: &Gmmu, gpu_va: GpuVAddr, size: u64) -> bool {
+        let mut ranges = std::mem::take(&mut self.segments);
+        ranges.clear();
+        gmmu.for_each_range(gpu_va, size, |range| {
+            if let RangeTarget::Device(daddr) = range.target {
+                ranges.push(Segment {
+                    offset: 0,
+                    daddr,
+                    size: range.size,
+                });
+            }
+        });
+        self.collect_overlaps(&ranges);
+        self.segments = ranges;
+        self.ids
+            .iter()
+            .any(|&id| self.get(id).is_some_and(|image| image.gpu_modified))
     }
 
     /// Whether `vkCmdBlitImage` turns `src` texels into `dst` ones as the guest does: host
