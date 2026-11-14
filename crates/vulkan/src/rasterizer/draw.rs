@@ -96,6 +96,7 @@ enum Warning {
     IndirectMesh = 1 << 14,
     MeshGroupLimit = 1 << 15,
     ImageChurn = 1 << 16,
+    SampleQueries = 1 << 17,
 }
 
 /// A descriptor write of the current draw: `count` infos from `first` of the info list for
@@ -742,8 +743,21 @@ impl VulkanRasterizer {
         for &(id, _) in &draw.storage_images {
             self.texture_cache.prepare(cmd, id, SHADER_STORAGE);
         }
-        let extent = self.render_area(regs);
         let scale = self.target_scale();
+        let query = match regs.zpass_pixel_count_enable {
+            0 => None,
+            _ => {
+                let slot = self.samples.reserve(&self.device, cmd, scale);
+                if slot.is_none() {
+                    self.draw.warn_once(
+                        Warning::SampleQueries,
+                        "every occlusion query waits for a report to read it; draws go uncounted",
+                    );
+                }
+                slot
+            }
+        };
+        let extent = self.render_area(regs);
         let raw = &self.device.raw;
         let draw = &mut self.draw;
         draw.attachments.clear();
@@ -795,6 +809,9 @@ impl VulkanRasterizer {
         // for these attachment formats.
         unsafe {
             raw.cmd_begin_rendering(cmd, &rendering);
+            if let Some(slot) = query {
+                self.samples.begin(&self.device, cmd, slot);
+            }
             raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline_raw);
             if let Some(set) = set {
                 raw.cmd_bind_descriptor_sets(
@@ -916,6 +933,9 @@ impl VulkanRasterizer {
                     }
                 }
                 (DrawCall::Indirect(_), None, _) => {}
+            }
+            if let Some(slot) = query {
+                self.samples.end(&self.device, cmd, slot);
             }
             raw.cmd_end_rendering(cmd);
         }
