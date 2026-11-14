@@ -32,7 +32,9 @@ use self::translate::{Step, Translator};
 use self::x64::{EXIT_FAULT, EXIT_INTERRUPT, SPILL_SLOTS, Target};
 use crate::decoder::{AtomicOp, decode};
 use crate::interpreter::{Exit, Interpreter, atomic_cas, atomic_rmw, cas128};
-use crate::{CpuConfig, CpuCore, CpuFault, GuestClock, HaltReason, InterruptHandle, ThreadContext};
+use crate::{
+    CpuConfig, CpuCore, CpuFault, GuestClock, HaltReason, InterruptHandle, ThreadContext, TscScale,
+};
 
 /// Runtime state translated code reaches through `r13`.
 #[repr(C, align(16))]
@@ -48,6 +50,8 @@ pub(super) struct JitState {
     /// by a few cycles, so after the OS moves this core's thread to a lagging one, reads stay here
     /// until the counter passes it instead of stepping back.
     counter_floor: u64,
+    /// The clock's `TscScale` that inline counter reads use, or null when they call `ticks`.
+    tsc_scale: *const TscScale,
     /// The registers a `cmpxchg16b` borrows while it runs.
     cx16_save: [u64; 2],
     spill: [u128; SPILL_SLOTS],
@@ -291,6 +295,8 @@ pub struct Jit {
     flushed: Instant,
     /// Set while the profile this core sent last waits to be merged.
     queued: Arc<AtomicBool>,
+    /// Blocks this core translated.
+    translated: u64,
 }
 
 // SAFETY: `arena` is the base of the fastmem arena owned by `config.memory`, which is `Sync`; the
@@ -311,14 +317,35 @@ impl Jit {
     }
 
     fn build(config: CpuConfig, passes: Passes, profile: bool) -> Option<Self> {
-        let cache = JitCache::new(profile)?;
+        let fastmem = config.memory.fastmem();
+        let features = [
+            std::arch::is_x86_feature_detected!("cmpxchg16b"),
+            std::arch::is_x86_feature_detected!("fma"),
+            std::arch::is_x86_feature_detected!("sse4.1"),
+            std::arch::is_x86_feature_detected!("sse4.2"),
+        ];
+        let [cmpxchg16b, fma, sse41, sse42] = features;
+        let tsc_scale = config.clock.host_tsc_scale().map(std::ptr::from_ref);
+        let flavour = [
+            passes.get_set,
+            passes.fold,
+            passes.fuse,
+            passes.lazy,
+            passes.dce,
+            profile,
+            fastmem.is_some(),
+            tsc_scale.is_some(),
+        ]
+        .into_iter()
+        .chain(features)
+        .fold(0, |bits, on| bits << 1 | u64::from(on));
+        let key = [
+            flavour,
+            config.clock.frequency(),
+            u64::from(config.ctr_el0) << 32 | u64::from(config.dczid_el0),
+        ];
+        let cache = JitCache::new(cache::Shared::of(&config.memory, key, profile)?);
         let interrupt = InterruptHandle::default();
-        let fastmem = config.memory.fastmem().filter(|_| {
-            if !cache.handles_faults() {
-                tracing::warn!("the JIT fault-site table is full; this core runs without fastmem");
-            }
-            cache.handles_faults()
-        });
         if let Some(fastmem) = fastmem {
             fastmem.set_fault_handler(Some(cache::on_fault), 0);
         }
@@ -329,6 +356,7 @@ impl Jit {
             save_gpr: [0; 16],
             high: 0,
             counter_floor: 0,
+            tsc_scale: tsc_scale.unwrap_or(std::ptr::null()),
             cx16_save: [0; 2],
             spill: [0; SPILL_SLOTS],
             memory: &*config.memory,
@@ -372,11 +400,11 @@ impl Jit {
                 ticks: ticks as *const () as usize,
                 simd,
                 simd_slow,
-                tsc_scale: config.clock.host_tsc_scale().map(std::ptr::from_ref),
-                cmpxchg16b: std::arch::is_x86_feature_detected!("cmpxchg16b"),
-                fma: std::arch::is_x86_feature_detected!("fma"),
-                sse41: std::arch::is_x86_feature_detected!("sse4.1"),
-                sse42: std::arch::is_x86_feature_detected!("sse4.2"),
+                tsc_scale: tsc_scale.is_some(),
+                cmpxchg16b,
+                fma,
+                sse41,
+                sse42,
             },
             arena: fastmem.map_or(std::ptr::null_mut(), |f| f.base()),
             config,
@@ -386,6 +414,7 @@ impl Jit {
             passes,
             flushed: Instant::now(),
             queued: Arc::default(),
+            translated: 0,
         })
     }
 
@@ -393,7 +422,9 @@ impl Jit {
         if start & 3 != 0 {
             return Err(CpuFault::Prefetch { pc: start });
         }
+        self.translated += 1;
         let started = self.state.profile.is_some().then(Instant::now);
+        let seen = self.cache.invalidations();
         let mut t = Translator {
             block: Block {
                 ops: Vec::new(),
@@ -420,7 +451,9 @@ impl Jit {
                     break;
                 }
                 Step::Rejected if pc == start => {
-                    let entry = self.cache.insert(start, 4, Err(inst));
+                    let Some(entry) = self.cache.insert(start, 4, Err(inst), seen) else {
+                        return self.uncached(start);
+                    };
                     if let (Some(p), Some(started)) = (self.state.profile.as_deref_mut(), started) {
                         p.translated(started.elapsed(), 0, 0);
                     }
@@ -446,7 +479,9 @@ impl Jit {
         let code_bytes = compiled.code.len();
         let mapped = map::enabled().then(|| compiled.code.clone());
         let generation = self.cache.generation();
-        let entry = self.cache.insert(start, len, Ok(compiled));
+        let Some(entry) = self.cache.insert(start, len, Ok(compiled), seen) else {
+            return self.uncached(start);
+        };
         if let (Some(code), cache::Code::Native(host)) = (mapped, entry.code) {
             let words: Vec<u32> = (0..len / 4)
                 .map(|i| self.config.memory.read::<u32>(start + 4 * i).unwrap_or(0))
@@ -460,6 +495,19 @@ impl Jit {
             }
         }
         Ok(entry)
+    }
+
+    /// The instruction at `start` for the interpreter, read again, for a block the cache refused.
+    fn uncached(&self, start: u64) -> Result<Entry, CpuFault> {
+        let word = self
+            .config
+            .memory
+            .read::<u32>(start)
+            .map_err(|_| CpuFault::Prefetch { pc: start })?;
+        Ok(Entry {
+            code: Code::Interpret(decode(word)),
+            len: 4,
+        })
     }
 
     fn count_flush(&mut self, flush: Flush) {
@@ -479,7 +527,7 @@ impl Jit {
             }
             Exit::InvalidateAll => {
                 self.count_flush(Flush::Clear);
-                self.cache.clear();
+                self.cache.invalidate(0, u64::MAX);
                 Some(HaltReason::InvalidateCode {
                     addr: 0,
                     size: u64::MAX,
@@ -489,6 +537,15 @@ impl Jit {
     }
 
     fn dispatch(&mut self, ctx: &mut ThreadContext) -> HaltReason {
+        self.cache.enter();
+        let halt = self.run_blocks(ctx);
+        self.cache.leave();
+        halt
+    }
+
+    /// The dispatcher loop. Only between `JitCache::enter` and `leave`, which keep the code it
+    /// runs mapped.
+    fn run_blocks(&mut self, ctx: &mut ThreadContext) -> HaltReason {
         let _fp = simd::HostFp::enter();
         loop {
             let link = std::mem::take(&mut self.state.link);
@@ -520,6 +577,7 @@ impl Jit {
                 self.cache.link(link, ctx.pc, code);
             }
             self.cache.publish(ctx.pc, code);
+            self.state.materialize = self.cache.materialize();
             let enter = self.cache.trampoline();
             // SAFETY: `code` is a compiled block in this core's code memory; it only touches
             // `ctx`, the state, and the arena behind the bounds check.
@@ -597,6 +655,12 @@ impl Drop for Jit {
     fn drop(&mut self) {
         if let Some(p) = self.state.profile_counts() {
             profile::retire(std::mem::take(p));
+            tracing::info!(
+                core = self.config.core_index,
+                translated = self.translated,
+                shared = self.cache.adopted(),
+                "JIT core totals"
+            );
         }
         map::sync();
     }
