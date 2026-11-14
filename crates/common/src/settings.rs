@@ -413,6 +413,9 @@ pub struct GraphicsSettings {
     pub anisotropic_filtering: Anisotropy,
     pub astc_decode: AstcDecode,
     pub astc_recompression: AstcRecompression,
+    /// Compiles shaders and pipelines on worker threads and skips each draw until its
+    /// program is ready. Off by default, as in the C++ reference: a skipped one-off pass
+    /// (bloom, a baked texture) can leave a scene dark or corrupt for the rest of the run.
     pub async_shader_compilation: bool,
     pub disk_shader_cache: bool,
     pub vram_usage: VramUsage,
@@ -435,7 +438,7 @@ impl Default for GraphicsSettings {
             anisotropic_filtering: Anisotropy::Auto,
             astc_decode: AstcDecode::Gpu,
             astc_recompression: AstcRecompression::Uncompressed,
-            async_shader_compilation: true,
+            async_shader_compilation: false,
             disk_shader_cache: true,
             vram_usage: VramUsage::Conservative,
             validation_layers: false,
@@ -1370,6 +1373,15 @@ mod tests {
         let zone = |text: &str| load(text).0.system.time_zone;
         assert_eq!(zone("[system]\ntime_zone = \"\"\n"), TIME_ZONE_AUTO);
         assert_eq!(zone("[system]\ntime_zone = \"AUTO\"\n"), TIME_ZONE_AUTO);
+    }
+
+    #[test]
+    fn shaders_compile_synchronously_unless_asked() {
+        assert!(!load("").0.graphics.async_shader_compilation);
+        let text = "[graphics]
+async_shader_compilation = true
+";
+        assert!(load(text).0.graphics.async_shader_compilation);
     }
 
     #[test]
