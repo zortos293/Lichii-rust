@@ -188,6 +188,7 @@ impl GpuSession {
         let reserve = self.context.gpu_reserve.get().cloned();
         let event = slot.map(|slot| self.slot(slot).clone());
         let fence = destructive.then(|| self.fence()).flatten();
+        let (diag_cmd, diag_t) = (diag::current(), std::time::Instant::now());
         let pending = range.map(|(first, last)| self.state.pending.lock().add(first, last));
         let state = self.state.clone();
         self.context
@@ -213,6 +214,7 @@ impl GpuSession {
                         reserve.free(detached);
                     }
                     if let Some(event) = event {
+                        diag::record(diag_cmd, diag_t.elapsed());
                         event.signal();
                     }
                 };
@@ -279,6 +281,13 @@ impl GpuSession {
     /// as soon as the title has the handle. Otherwise it would change mappings queued GPU work may
     /// still use, so it is made in order and the reply waits for the back thread.
     fn create_memory(&self, ctx: &mut HleRequestContext) -> ResultCode {
+        let t = std::time::Instant::now();
+        let result = self.create_memory_inner(ctx);
+        diag::record(101, t.elapsed());
+        result
+    }
+
+    fn create_memory_inner(&self, ctx: &mut HleRequestContext) -> ResultCode {
         let words = Words::command(ctx);
         let (first, last) = (words.u64(2), words.u64(4));
         let size = last.checked_sub(first).and_then(|n| n.checked_add(1));
@@ -431,6 +440,7 @@ impl Service for GpuSession {
 
     fn handle(&self, ctx: &mut HleRequestContext) -> Option<ResultCode> {
         let command = ctx.command();
+        diag::set_current(command);
         let words = Words::command(ctx);
         Some(match command {
             0 => handshake(ctx),
@@ -607,5 +617,62 @@ mod pending_tests {
         assert!(pending.overlaps(0x4800, 0x4800));
         pending.remove(b);
         assert!(!pending.overlaps(0, u64::MAX));
+    }
+}
+
+mod diag {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::time::{Duration, Instant};
+
+    use parking_lot::Mutex;
+
+    const COMMANDS: [u32; 6] = [101, 102, 213, 214, 215, 216];
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    static STATS: [AtomicU64; 18] = [ZERO; 18];
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+
+    thread_local! {
+        static CURRENT: Cell<u32> = const { Cell::new(0) };
+    }
+
+    pub fn set_current(command: u32) {
+        CURRENT.set(command);
+    }
+
+    pub fn current() -> u32 {
+        CURRENT.get()
+    }
+
+    pub fn record(command: u32, took: Duration) {
+        if let Some(i) = COMMANDS.iter().position(|&c| c == command) {
+            let ns = took.as_nanos() as u64;
+            STATS[i * 3].fetch_add(1, Relaxed);
+            STATS[i * 3 + 1].fetch_add(ns, Relaxed);
+            STATS[i * 3 + 2].fetch_max(ns, Relaxed);
+        }
+        let mut last = LAST.lock();
+        let now = Instant::now();
+        let start = *last.get_or_insert(now);
+        if now - start < Duration::from_secs(5) {
+            return;
+        }
+        *last = Some(now);
+        drop(last);
+        let line: Vec<String> = COMMANDS
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let n = STATS[i * 3].swap(0, Relaxed);
+                let total = STATS[i * 3 + 1].swap(0, Relaxed);
+                let max = STATS[i * 3 + 2].swap(0, Relaxed);
+                format!(
+                    "{c}: n={n} total={:.1}ms max={:.1}ms",
+                    total as f64 / 1e6,
+                    max as f64 / 1e6
+                )
+            })
+            .collect();
+        tracing::info!("diag nx2:gpu waits {}", line.join(" | "));
     }
 }
