@@ -198,15 +198,39 @@ impl Nx2GpuMemory {
         cpu_va: VAddr,
         size: u64,
     ) -> Result<(GpuMemoryHandle, Vec<Unmapped>), Nx2MemoryError> {
-        check_range(cpu_va, size)?;
-        if !Arc::ptr_eq(space.physical(), self.device.physical()) {
-            return Err(Nx2MemoryError::ForeignPhysicalMemory);
-        }
+        let handle = self.reserve_handle()?;
+        let replaced = self.create_gpu_accessible_memory_as(handle, space, cpu_va, size)?;
+        Ok((handle, replaced))
+    }
+
+    /// Takes the next memory handle without creating memory, so 101 can reply with it before the
+    /// GPU's back thread reaches [`Nx2GpuMemory::create_gpu_accessible_memory_as`].
+    pub fn reserve_handle(&self) -> Result<GpuMemoryHandle, Nx2MemoryError> {
         let mut state = self.state.lock();
         let handle = state
             .last_handle
             .checked_add(1)
             .ok_or(Nx2MemoryError::OutOfHandles)?;
+        state.last_handle = handle;
+        Ok(GpuMemoryHandle::new(handle).expect("handles start at 1"))
+    }
+
+    /// [`Nx2GpuMemory::create_gpu_accessible_memory`] under `handle`, which
+    /// [`Nx2GpuMemory::reserve_handle`] returned. Returns the mappings the identity mapping
+    /// replaced.
+    pub fn create_gpu_accessible_memory_as(
+        &self,
+        handle: GpuMemoryHandle,
+        space: &AddressSpace,
+        cpu_va: VAddr,
+        size: u64,
+    ) -> Result<Vec<Unmapped>, Nx2MemoryError> {
+        check_range(cpu_va, size)?;
+        if !Arc::ptr_eq(space.physical(), self.device.physical()) {
+            return Err(Nx2MemoryError::ForeignPhysicalMemory);
+        }
+        let handle = handle.raw();
+        let mut state = self.state.lock();
         let daddr = self
             .allocator
             .allocate(size, DEVICE_ALIGN)
@@ -217,7 +241,6 @@ impl Nx2GpuMemory {
                 .expect("the range was just allocated");
             return Err(Nx2MemoryError::SourceUnmapped { va: fault.addr });
         }
-        state.last_handle = handle;
         state.memories.insert(
             handle,
             GpuMemoryInfo {
@@ -238,10 +261,7 @@ impl Nx2GpuMemory {
                 kind: PTE_KIND_PITCH,
             },
         );
-        Ok((
-            GpuMemoryHandle::new(handle).expect("handles start at 1"),
-            replaced,
-        ))
+        Ok(replaced)
     }
 
     /// Destroys GPU memory (gpu sub 102): unmaps every GPU range that reaches it, wherever it is

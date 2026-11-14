@@ -349,6 +349,66 @@ fn gpu_session_slots_devices_and_partitions() {
 }
 
 #[test]
+fn gpu_memory_handles_come_back_before_the_back_thread_makes_the_memory() {
+    let (context, client, gsv) = gsv();
+    let gpu = session(&client, gsv, 497);
+    let process = client.process().clone();
+    let heap = process.page_table().set_heap_size(2 << 20).unwrap();
+    process.memory().write(heap + 4, 0x1234_5678u32).unwrap();
+    let gmmu = context
+        .gpu
+        .create_address_space(lichii_gpu::gmmu::BigPageSize::Size64K);
+
+    context.gpu.pause(true);
+    let create = words(
+        Request::tipc(101),
+        &[split(heap), split(heap + 0x1_0000 - 1), [0, 0]].concat(),
+    );
+    let mut reply = client.send(gpu, &create).unwrap();
+    assert_eq!(reply.result, ResultCode::SUCCESS);
+    assert_ne!(reply.pop::<u32>(), 0);
+    assert!(gmmu.translate(heap).is_none(), "made in order, later");
+
+    context.gpu.pause(false);
+    context.gpu.synchronize();
+    assert_eq!(gmmu.read::<u32>(heap + 4).unwrap(), 0x1234_5678);
+}
+
+#[test]
+fn unmap_jobs_complete_through_the_session_fence() {
+    let (context, client, gsv) = gsv();
+    crate::nvdrv::register(&context).unwrap();
+    let gpu = session(&client, gsv, 497);
+    let process = client.process().clone();
+    let heap = process.page_table().set_heap_size(2 << 20).unwrap();
+    let create = words(
+        Request::tipc(101),
+        &[split(heap), split(heap + 0x1_0000 - 1), [0, 0]].concat(),
+    );
+    client.send(gpu, &create).unwrap();
+    let slot = client.send(gpu, &Request::tipc(12).arg(10u32)).unwrap();
+    let slot = event(&client, slot.copy_handles[0]);
+    slot.clear();
+
+    let mut unmap = vec![0];
+    unmap.extend(split(heap));
+    unmap.extend(split(heap + 0xfff));
+    unmap.extend([0, 10]);
+    client
+        .send(gpu, &words(Request::tipc(213), &unmap))
+        .unwrap();
+    context.gpu.synchronize();
+    let started = Instant::now();
+    while !slot.is_signaled() {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the slot completes once the host GPU passed the fence"
+        );
+        std::thread::yield_now();
+    }
+}
+
+#[test]
 fn gpu_memory_is_mapped_for_every_address_space() {
     let (context, client, gsv) = gsv();
     let gpu = session(&client, gsv, 497);
@@ -370,6 +430,7 @@ fn gpu_memory_is_mapped_for_every_address_space() {
     let mut reply = client.send(gpu, &create).unwrap();
     assert_eq!(reply.result, ResultCode::SUCCESS);
     let handle = reply.pop::<u32>();
+    context.gpu.synchronize();
     assert_eq!(
         gmmu.read::<u32>(heap + 0x1004).unwrap(),
         0xdead_beef,
@@ -745,6 +806,7 @@ fn an_unmap_waits_for_the_gpu_work_queued_before_it() {
         &[split(heap), split(heap + 0xffff), [0, 0]].concat(),
     );
     let handle = client.send(gpu, &create).unwrap().pop::<u32>();
+    context.gpu.synchronize();
 
     let (release, queued_work) = std::sync::mpsc::channel::<()>();
     let (seen, reads) = std::sync::mpsc::channel();
