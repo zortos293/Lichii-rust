@@ -33,6 +33,7 @@ use super::{
     ComputePipelineKey, FxBuildHasher, GraphicsPipelineKey, GraphicsShaders, PipelineFeatures,
     descriptor_type, stage_flags,
 };
+use crate::debug::{Program, Programs};
 use crate::device::Device;
 use crate::error::{Result, VkResultExt};
 
@@ -346,12 +347,31 @@ impl Context {
                 programs,
                 layout,
                 part,
-            } => (self.build_graphics(&key, &programs, &layout, part), layout),
+            } => {
+                let result = self.build_graphics(&key, &programs, &layout, part);
+                if let Ok((raw, _)) = result {
+                    let kind = if library {
+                        "graphics library"
+                    } else {
+                        "graphics"
+                    };
+                    self.device
+                        .name(raw, format_args!("{kind} {}", Programs(&programs)));
+                }
+                (result, layout)
+            }
             Build::Compute {
                 key,
                 program,
                 layout,
-            } => (self.build_compute(&key, &program, &layout), layout),
+            } => {
+                let result = self.build_compute(&key, &program, &layout);
+                if let Ok((raw, _)) = result {
+                    self.device
+                        .name(raw, format_args!("compute {}", Program(&program)));
+                }
+                (result, layout)
+            }
         };
         match result {
             Ok((raw, _)) if library => {
@@ -389,6 +409,11 @@ impl Context {
             let module = unsafe { self.device.raw.create_shader_module(&info, None) }
                 .call("vkCreateShaderModule")
                 .map_err(|e| e.to_string())?;
+            self.device
+                .name(module, format_args!("{}", Program(program)));
+            if let Some(aftermath) = crate::debug::aftermath::get() {
+                aftermath.save_shader(&program.spirv);
+            }
             modules.stages.push((stage_flags(program.stage), module));
         }
         Ok(modules)

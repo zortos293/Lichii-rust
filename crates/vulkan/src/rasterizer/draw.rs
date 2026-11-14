@@ -41,6 +41,7 @@ use super::VulkanRasterizer;
 use super::samples::SampleCounter;
 use crate::buffer_cache::{BufferBinding, IndexBinding, assembled_topology, vertex_stream_range};
 use crate::commands::ImageAccess;
+use crate::debug::{Program, Programs};
 use crate::descriptors::DescriptorAllocator;
 use crate::device::Device;
 use crate::error::Result;
@@ -874,6 +875,15 @@ impl VulkanRasterizer {
         if let Some(stencil) = depth_attachment.as_ref().filter(|_| has_stencil) {
             rendering = rendering.stencil_attachment(stencil);
         }
+        self.device.begin_label(
+            cmd,
+            format_args!(
+                "draw {} -> {}x{}",
+                Programs(&draw.stages),
+                extent.width,
+                extent.height
+            ),
+        );
         // SAFETY: `cmd` is recording outside any rendering; every view, buffer and descriptor
         // set is live until the scheduler's current tick completes, and the pipeline was built
         // for these attachment formats.
@@ -1009,6 +1019,7 @@ impl VulkanRasterizer {
             }
             raw.cmd_end_rendering(cmd);
         }
+        self.device.end_label(cmd);
         let written: [Option<ImageId>; 9] = std::array::from_fn(|i| match i {
             8 => draw.depth.map(|t| t.id),
             i => draw.colors[i].map(|t| t.id),
@@ -2439,6 +2450,15 @@ impl VulkanRasterizer {
             .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
             .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
             .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE);
+        match grid {
+            Some(_) => self
+                .device
+                .begin_label(cmd, format_args!("dispatch indirect {}", Program(&module))),
+            None => self.device.begin_label(
+                cmd,
+                format_args!("dispatch {x}x{y}x{z} {}", Program(&module)),
+            ),
+        }
         let raw = &self.device.raw;
         // SAFETY: as above.
         unsafe {
@@ -2446,6 +2466,7 @@ impl VulkanRasterizer {
                 Some(command) => raw.cmd_dispatch_indirect(cmd, command, 0),
                 None => raw.cmd_dispatch(cmd, x, y, z),
             }
+            self.device.end_label(cmd);
             raw.cmd_pipeline_barrier2(
                 cmd,
                 &vk::DependencyInfo::default().memory_barriers(&[barrier]),

@@ -1231,6 +1231,7 @@ pub enum HotkeyAction {
     ToggleMousePanning,
     CycleScalingFilter,
     CycleGpuAccuracy,
+    ToggleRenderdocCapture,
     Exit,
 }
 
@@ -1245,7 +1246,7 @@ pub struct Hotkey {
 }
 
 impl HotkeyAction {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::ContinuePause,
         Self::Stop,
         Self::Restart,
@@ -1260,6 +1261,7 @@ impl HotkeyAction {
         Self::ToggleMousePanning,
         Self::CycleScalingFilter,
         Self::CycleGpuAccuracy,
+        Self::ToggleRenderdocCapture,
         Self::Exit,
     ];
 
@@ -1279,6 +1281,7 @@ impl HotkeyAction {
             Self::ToggleMousePanning => "Toggle Mouse Panning",
             Self::CycleScalingFilter => "Change Scaling Filter",
             Self::CycleGpuAccuracy => "Change GPU Accuracy",
+            Self::ToggleRenderdocCapture => "Toggle Renderdoc Capture",
             Self::Exit => "Exit Lichii",
         }
     }
@@ -1302,6 +1305,7 @@ impl HotkeyAction {
                 Self::ToggleMousePanning => ("Ctrl+F9", &[]),
                 Self::CycleScalingFilter => ("F8", &[Home, L]),
                 Self::CycleGpuAccuracy => ("F9", &[Home, R]),
+                Self::ToggleRenderdocCapture => ("", &[]),
                 Self::Exit => ("Ctrl+KeyQ", &[Home, Minus]),
             };
             (
@@ -1337,6 +1341,15 @@ pub struct DebugSettings {
     pub auto_stub: bool,
     pub gdb_stub_port: Option<u16>,
     pub dump_shaders: bool,
+    /// Loads RenderDoc's in-application API at startup and lets the "Toggle Renderdoc Capture"
+    /// hotkey start and stop captures. Applies at the next start.
+    pub renderdoc_hotkey: bool,
+    /// Writes Nsight Aftermath GPU crash dumps when the Vulkan device is lost (NVIDIA only).
+    /// Applies at the next start.
+    pub nsight_aftermath: bool,
+    /// Names Vulkan images, buffers, shaders and pipelines and labels draws and dispatches, so
+    /// RenderDoc and Nsight captures are readable. Applies at the next start.
+    pub vulkan_labels: bool,
 }
 
 impl Default for DebugSettings {
@@ -1348,6 +1361,9 @@ impl Default for DebugSettings {
             auto_stub: false,
             gdb_stub_port: None,
             dump_shaders: false,
+            renderdoc_hotkey: false,
+            nsight_aftermath: false,
+            vulkan_labels: false,
         }
     }
 }
