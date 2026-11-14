@@ -140,6 +140,12 @@ impl Activity {
         }
     }
 
+    /// Whether a thread is in `wait` now.
+    #[cfg(test)]
+    pub(crate) fn is_waiting(&self, wait: Wait) -> bool {
+        self.waits[wait as usize].since.load(Ordering::Acquire) != NOT_WAITING
+    }
+
     fn now(&self) -> u64 {
         u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(NOT_WAITING - 1)
     }
