@@ -81,6 +81,7 @@ mod set;
 mod sockets;
 mod spl;
 mod ssl;
+mod stpl;
 #[cfg(test)]
 mod testing;
 mod time;
@@ -142,6 +143,8 @@ pub fn register_all(context: &Arc<ServiceContext>) -> HleResult<()> {
     jit::register(context)?;
     let nvdrv = nvdrv::register(context)?;
     vi::register(context, nvdrv)?;
+    stpl::register(context)?;
+    stub_missing_switch2_services(context)?;
     let missing = reference_services::missing(context);
     if !missing.is_empty() {
         tracing::warn!(
@@ -150,5 +153,20 @@ pub fn register_all(context: &Arc<ServiceContext>) -> HleResult<()> {
             "the title may open services the reference registers and Lichii does not"
         );
     }
+    Ok(())
+}
+
+/// Switch 2 titles also open services nothing here provides (`mnpp:app`, `htc:tenv`), and
+/// waiting in `sm:` would hang them for good: they get an [`dispatch::Nx2Stub`] session whose
+/// commands are all auto-stubbed, as the reference does.
+fn stub_missing_switch2_services(context: &Arc<ServiceContext>) -> HleResult<()> {
+    let thread = context.service_thread("services")?;
+    let stubs = context.clone();
+    context.kernel.service_manager().set_switch2_stub(
+        &thread,
+        Arc::new(move |name| {
+            stubs.handler(dispatch::Nx2Stub(format!("{}{name}", dispatch::NX2_PREFIX)))
+        }),
+    );
     Ok(())
 }

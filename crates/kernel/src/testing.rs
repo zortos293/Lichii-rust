@@ -443,6 +443,12 @@ impl IpcClient {
         Some(self.insert(session))
     }
 
+    /// Opens a session to the named port `name` (`sm:`), as `svcConnectToNamedPort` does.
+    pub fn connect_port(&self, name: &str) -> Option<Handle> {
+        let session = self.kernel.0.connect_named_port(name)?;
+        Some(self.insert(session))
+    }
+
     /// Opens a session to `handler`, served by `thread`.
     pub fn connect_handler(
         &self,
