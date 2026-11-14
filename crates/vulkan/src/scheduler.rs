@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use ash::vk;
+use lichii_gpu::activity::{Activity, Wait};
 
 use crate::device::Device;
 use crate::error::{Result, VkResultExt};
@@ -31,6 +32,8 @@ pub struct Scheduler {
     in_flight: VecDeque<(u64, vk::CommandBuffer)>,
     current: Option<vk::CommandBuffer>,
     garbage: VecDeque<(u64, Box<dyn Send>)>,
+    /// Where blocking waits are timed as [`Wait::HostGpu`]: the GPU thread's scheduler only.
+    activity: Option<Arc<Activity>>,
     /// Tick of a sparse binding the next submission must wait for.
     bound: Option<u64>,
 }
@@ -75,8 +78,14 @@ impl Scheduler {
             in_flight: VecDeque::new(),
             current: None,
             garbage: VecDeque::new(),
+            activity: None,
             bound: None,
         })
+    }
+
+    /// Times every blocking [`Scheduler::wait`] from now on in `activity`.
+    pub fn time_waits(&mut self, activity: Arc<Activity>) {
+        self.activity = Some(activity);
     }
 
     pub fn device(&self) -> &Arc<Device> {
@@ -273,13 +282,16 @@ impl Scheduler {
         let info = vk::SemaphoreWaitInfo::default()
             .semaphores(&semaphores)
             .values(&values);
-        // SAFETY: the semaphore belongs to this scheduler and `tick` was submitted.
-        unsafe {
-            self.device
-                .raw
-                .wait_semaphores(&info, u64::MAX)
-                .call("vkWaitSemaphores")?
-        };
+        {
+            let _waiting = self.activity.as_deref().map(|a| a.waiting(Wait::HostGpu));
+            // SAFETY: the semaphore belongs to this scheduler and `tick` was submitted.
+            unsafe {
+                self.device
+                    .raw
+                    .wait_semaphores(&info, u64::MAX)
+                    .call("vkWaitSemaphores")?
+            };
+        }
         self.completed = self.completed.max(tick);
         self.collect();
         Ok(())

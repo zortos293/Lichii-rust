@@ -21,6 +21,7 @@ use lichii_memory::DeviceAddressSpace;
 use lichii_texture::PixelFormat;
 use lichii_texture::block_linear::GobLayout;
 
+use crate::activity::Activity;
 use crate::clock::GpuTimestamp;
 use crate::engines::maxwell_3d::regs::{MAX_CONST_BUFFERS, MAX_SHADER_STAGE, PrimitiveTopology};
 use crate::engines::maxwell_3d::{DirtyState, Regs};
@@ -48,6 +49,9 @@ pub struct GpuHandles {
     /// Device ranges that get memory as they are written: write GPU results to device memory
     /// through [`LazyDeviceRanges::write`].
     pub lazy: Arc<LazyDeviceRanges>,
+    /// The GPU threads' activity counters: the renderer times its waits for the host GPU in
+    /// [`crate::activity::Wait::HostGpu`].
+    pub activity: Arc<Activity>,
 }
 
 /// A constant buffer bound to a shader stage slot.
@@ -739,6 +743,7 @@ mod tests {
             syncpoints: Arc::new(Syncpoints::new()),
             timestamp: Arc::new(GpuTimestamp::new(Arc::new(Boot), false)),
             written_pages: Arc::new(GpuWrittenPages::new(36)),
+            activity: Arc::new(Activity::new()),
         };
         (space, handles)
     }

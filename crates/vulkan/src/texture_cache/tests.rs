@@ -1928,3 +1928,132 @@ fn sparse_images_take_the_layers_of_a_join_their_cap_admits() {
     );
     f.assert_no_validation_errors();
 }
+
+fn blit_side(gpu_va: GpuVAddr, info: ImageInfo, rect: [i32; 4]) -> BlitSide {
+    BlitSide { gpu_va, info, rect }
+}
+
+#[test]
+fn blits_scale_between_render_targets_on_the_gpu() {
+    let gob = GobLayout::Tegra;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let src = rt_info(64, 64, 3, gob);
+    let dst = rt_info(32, 32, 2, gob);
+    let dst_va = GPU_VA + (64 << 10);
+    clear_rt(&mut f, &src, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let quarter = Rect {
+        x: 0,
+        y: 0,
+        width: 32,
+        height: 32,
+    };
+    clear_rt(&mut f, &src, [1.0, 0.0, 0.0, 1.0], quarter);
+    let before = f.cache.traffic();
+    let (mut tx, cache, gmmu) = f.tx();
+    let blitted = cache
+        .blit(
+            &mut tx,
+            gmmu,
+            &blit_side(GPU_VA, src, [0, 0, 64, 64]),
+            &blit_side(dst_va, dst, [0, 0, 32, 32]),
+        )
+        .unwrap();
+    assert!(blitted);
+    assert_eq!(
+        f.cache.traffic(),
+        before,
+        "no upload or write-back: the source stays on the GPU and the whole target is replaced"
+    );
+    let (mut tx, cache, _) = f.tx();
+    cache
+        .flush(&mut tx, DADDR + (64 << 10), dst.size_bytes())
+        .unwrap();
+    let tiling = Tiling::new(32, 32, 1, 4, 2, 0, gob);
+    let mut tiled = vec![0; tiling.size_bytes()];
+    f.memory.read_bytes(DADDR + (64 << 10), &mut tiled).unwrap();
+    let mut linear = vec![0; tiling.linear_size_bytes()];
+    unswizzle(&tiling, &tiled, &mut linear);
+    for (i, texel) in linear.as_chunks::<4>().0.iter().enumerate() {
+        let (x, y) = (i % 32, i / 32);
+        let want = if x < 16 && y < 16 { RED } else { GREEN };
+        assert_eq!(*texel, want, "texel ({x}, {y})");
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn blits_the_host_cannot_do_as_they_are_go_to_software() {
+    let gob = GobLayout::Tegra;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let src = rt_info(64, 64, 3, gob);
+    clear_rt(&mut f, &src, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let integer = ImageInfo {
+        format: PixelFormat::A8B8G8R8Uint,
+        ..rt_info(32, 32, 2, gob)
+    };
+    let (mut tx, cache, gmmu) = f.tx();
+    let side = blit_side(GPU_VA, src, [0, 0, 64, 64]);
+    assert!(
+        !cache
+            .blit(
+                &mut tx,
+                gmmu,
+                &side,
+                &blit_side(GPU_VA + (64 << 10), integer, [0, 0, 32, 32])
+            )
+            .unwrap(),
+        "a float format into an integer one"
+    );
+    assert!(
+        !cache
+            .blit(
+                &mut tx,
+                gmmu,
+                &side,
+                &blit_side(GPU_VA, src, [0, 0, 32, 32])
+            )
+            .unwrap(),
+        "one image on both sides"
+    );
+    assert!(
+        !cache
+            .blit(
+                &mut tx,
+                gmmu,
+                &side,
+                &blit_side(GPU_VA + (128 << 10), src, [0, 0, 65, 64])
+            )
+            .unwrap(),
+        "a rectangle leaving its image"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn blits_from_guest_data_stay_in_software() {
+    let gob = GobLayout::Tegra;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let src = rt_info(64, 64, 3, gob);
+    let dst = rt_info(32, 32, 2, gob);
+    let (mut tx, cache, gmmu) = f.tx();
+    cache.find(&mut tx, gmmu, GPU_VA, &src).unwrap().unwrap();
+    let before = f.cache.traffic();
+    let (mut tx, cache, gmmu) = f.tx();
+    let blitted = cache
+        .blit(
+            &mut tx,
+            gmmu,
+            &blit_side(GPU_VA, src, [0, 0, 64, 64]),
+            &blit_side(GPU_VA + (64 << 10), dst, [0, 0, 32, 32]),
+        )
+        .unwrap();
+    assert!(!blitted, "an uploaded source no GPU work wrote");
+    assert_eq!(f.cache.traffic(), before, "no upload for a software blit");
+    f.assert_no_validation_errors();
+}
