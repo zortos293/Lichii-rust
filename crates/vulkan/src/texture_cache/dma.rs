@@ -2,23 +2,21 @@
 //! buffer cache, so the texels stay on the GPU until the guest reads the destination.
 
 use ash::vk;
-use lichii_common::DAddr;
 use lichii_gpu::backend::ImageCopy;
 use lichii_gpu::gmmu::{Gmmu, RangeTarget};
-use lichii_texture::PixelFormat;
+use lichii_texture::block_linear::Tiling;
 
-use super::{GuestLayout, ImageInfo, ImageKind, ResolutionScale, Segment, TextureCache, Transfer};
-use crate::buffer_cache::BufferBinding;
+use super::{GuestLayout, ImageKind, ResolutionScale, Segment, TextureCache, Transfer};
 use crate::commands::{ImageAccess, transfer_to_all_barrier};
 use crate::error::Result;
 use crate::format::Conversion;
 
 impl TextureCache {
     /// Copies a copy engine transfer from a block-linear surface into a pitch-linear one on the
-    /// GPU, when a GPU-modified image starts at the source and tiles as the surface does.
-    /// `acquire` returns the host buffer over the destination's device bytes, which the call
-    /// returns for the caller to mark GPU-written. `Ok(None)` when the cache cannot and the
-    /// engine copies in software: no such image, a host format that is not the guest's bytes, a
+    /// GPU, when a GPU-modified image starts at the source and tiles as the copy engine
+    /// addresses the surface. The texels land in the buffer cache, marked GPU-written, until a
+    /// read of the destination flushes them. `Ok(false)` when the cache cannot and the engine
+    /// copies in software: no such image, a host format that is not the guest's bytes, a
     /// rectangle outside the image, or a destination that is not one device range clear of
     /// cached images.
     pub fn copy_to_buffer(
@@ -26,39 +24,42 @@ impl TextureCache {
         tx: &mut Transfer<'_>,
         gmmu: &Gmmu,
         copy: &ImageCopy,
-        acquire: impl FnOnce(&mut Transfer<'_>, DAddr, u64) -> Result<BufferBinding>,
-    ) -> Result<Option<(DAddr, u64)>> {
+    ) -> Result<bool> {
         let (src, dst) = (&copy.src, &copy.dst);
         let bpp = src.bytes_per_pixel;
-        let format = match bpp {
-            1 => PixelFormat::R8Uint,
-            2 => PixelFormat::R16Uint,
-            4 => PixelFormat::R32Uint,
-            8 => PixelFormat::R32G32Uint,
-            16 => PixelFormat::R32G32B32A32Uint,
-            _ => return Ok(None),
+        let Some((0, block_height_log2, block_depth_log2)) = src.block else {
+            return Ok(false);
         };
-        if src.block.is_none()
+        if src.depth > 1
+            || src.layer != 0
             || dst.block.is_some()
             || dst.bytes_per_pixel != bpp
+            || bpp == 0
             || copy.width == 0
             || copy.height == 0
             || u64::from(dst.pitch) < u64::from(copy.width) * u64::from(bpp)
         {
-            return Ok(None);
+            return Ok(false);
         }
-        let Some(surface) = ImageInfo::from_copy_surface(src, format, self.gob_layout) else {
-            return Ok(None);
-        };
-        let Some(source) = self.single_range(gmmu, src.address, surface.size_bytes()) else {
-            return Ok(None);
+        let addressed = Tiling::new(
+            src.width,
+            src.height,
+            1,
+            bpp,
+            block_height_log2,
+            block_depth_log2,
+            self.gob_layout,
+        );
+        let Some(source) = self.single_range(gmmu, src.address, addressed.size_bytes() as u64)
+        else {
+            return Ok(false);
         };
         let first = u64::from(copy.dst_origin.1) * u64::from(dst.pitch)
             + u64::from(copy.dst_origin.0) * u64::from(bpp);
         let span = u64::from(copy.height - 1) * u64::from(dst.pitch)
             + u64::from(copy.width) * u64::from(bpp);
         let Some(target) = self.single_range(gmmu, dst.address + first, span) else {
-            return Ok(None);
+            return Ok(false);
         };
         self.collect_overlaps(&[target]);
         let clear = self.ids.iter().all(|&id| {
@@ -69,10 +70,9 @@ impl TextureCache {
             })
         });
         if !clear {
-            return Ok(None);
+            return Ok(false);
         }
-        let surface_tiling = surface.surface().level_tiling(0);
-        let shape = |t: &lichii_texture::block_linear::Tiling| {
+        let shape = |t: &Tiling| {
             (
                 t.row_gobs,
                 t.block_height_log2,
@@ -94,11 +94,11 @@ impl TextureCache {
                     && info.format.block_width() == 1
                     && info.format.block_height() == 1
                     && image.host.conversion == Conversion::None
-                    && shape(&info.surface().level_tiling(0)) == shape(&surface_tiling)
+                    && shape(&info.surface().level_tiling(0)) == shape(&addressed)
             })
         });
         let Some(id) = found else {
-            return Ok(None);
+            return Ok(false);
         };
         let image = self.get(id).expect("a live image id");
         let bpb = image.info.format.bytes_per_block();
@@ -112,10 +112,12 @@ impl TextureCache {
             && x + w <= width
             && copy.src_origin.1 + copy.height <= height;
         if !fits {
-            return Ok(None);
+            return Ok(false);
         }
         self.refresh(tx, id)?;
-        let binding = acquire(tx, target.daddr, target.size)?;
+        let binding = tx
+            .buffers
+            .acquire(tx.scheduler, tx.staging, target.daddr, target.size)?;
         let device = self.device.clone();
         let cmd = tx.scheduler.record()?;
         let raw = self.prepare_live(cmd, id, ImageAccess::TRANSFER_SRC);
@@ -162,7 +164,8 @@ impl TextureCache {
             );
         }
         transfer_to_all_barrier(&device, cmd);
-        Ok(Some((target.daddr, target.size)))
+        tx.buffers.mark_gpu_written(target.daddr, target.size);
+        Ok(true)
     }
 
     /// The one device range `[gpu_va, +size)` maps to, or `None` when it is split or unmapped.

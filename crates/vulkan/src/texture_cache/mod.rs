@@ -55,6 +55,7 @@ use lichii_texture::tic::{SwizzleSource, TextureDescriptor};
 pub use blit::BlitSide;
 pub use info::{GuestLayout, ImageInfo, ImageKind, ViewInfo};
 
+use crate::buffer_cache::BufferCache;
 use crate::commands::{ImageAccess, transfer_to_all_barrier, transition};
 use crate::device::Device;
 use crate::error::Result;
@@ -125,6 +126,9 @@ pub struct Transfer<'a> {
     pub scheduler: &'a mut Scheduler,
     pub staging: &'a mut StagingRing,
     pub memory: &'a DeviceAddressSpace,
+    /// Holds bytes the GPU wrote to buffers ahead of guest memory: uploads flush what they
+    /// read from it first.
+    pub buffers: &'a mut BufferCache,
 }
 
 /// A rectangle in guest pixels of a render target (before resolution scaling).
@@ -2376,6 +2380,10 @@ impl TextureCache {
     }
 
     fn upload(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
+        for segment in &self.get(id).expect("a live image id").segments {
+            tx.buffers
+                .flush(tx.scheduler, segment.daddr, segment.size)?;
+        }
         let device = self.device.clone();
         let Self {
             slots,

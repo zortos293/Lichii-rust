@@ -394,6 +394,7 @@ impl VulkanRasterizer {
                     scheduler: &mut self.scheduler,
                     staging: &mut self.staging,
                     memory: &self.handles.device,
+                    buffers: &mut self.buffer_cache,
                 };
                 if let Some(target) = self
                     .texture_cache
@@ -439,6 +440,7 @@ impl VulkanRasterizer {
                     scheduler: &mut self.scheduler,
                     staging: &mut self.staging,
                     memory: &self.handles.device,
+                    buffers: &mut self.buffer_cache,
                 };
                 if let Some(target) = self.texture_cache.render_target(
                     &mut tx,
@@ -763,6 +765,7 @@ impl VulkanRasterizer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
             memory: &self.handles.device,
+            buffers: &mut self.buffer_cache,
         };
         self.texture_cache
             .flush(&mut tx, fb.address, size as u64)
@@ -955,6 +958,7 @@ impl Rasterizer for VulkanRasterizer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
             memory: &self.handles.device,
+            buffers: &mut self.buffer_cache,
         };
         let blitted = self.texture_cache.blit(
             &mut tx,
@@ -992,20 +996,14 @@ impl Rasterizer for VulkanRasterizer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
             memory: &self.handles.device,
+            buffers: &mut self.buffer_cache,
         };
-        let buffers = &mut self.buffer_cache;
-        let copied = self
-            .texture_cache
-            .copy_to_buffer(&mut tx, memory, copy, |tx, daddr, size| {
-                buffers.acquire(tx.scheduler, tx.staging, daddr, size)
-            });
-        match copied {
-            Ok(Some((daddr, size))) => {
-                self.buffer_cache.mark_gpu_written(daddr, size);
+        match self.texture_cache.copy_to_buffer(&mut tx, memory, copy) {
+            Ok(true) => {
                 self.unflushed = true;
                 true
             }
-            Ok(None) => false,
+            Ok(false) => false,
             Err(error) => {
                 tracing::error!(%error, "copying an image to a buffer on the GPU failed; copying in software");
                 false
@@ -1117,6 +1115,7 @@ impl Rasterizer for VulkanRasterizer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
             memory: &self.handles.device,
+            buffers: &mut self.buffer_cache,
         };
         if let Err(error) = self.texture_cache.invalidate(&mut tx, addr, size) {
             tracing::error!(%error, "writing back GPU-modified images before a CPU write failed");
@@ -1137,6 +1136,7 @@ impl Rasterizer for VulkanRasterizer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
             memory: &self.handles.device,
+            buffers: &mut self.buffer_cache,
         };
         if let Err(error) = self.texture_cache.flush(&mut tx, addr, size) {
             tracing::error!(%error, "flushing GPU-modified images failed");
@@ -1233,6 +1233,7 @@ impl Rasterizer for VulkanRasterizer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
             memory: &self.handles.device,
+            buffers: &mut self.buffer_cache,
         };
         let device = &self.device;
         if let Err(error) = self
