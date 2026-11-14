@@ -599,11 +599,7 @@ mod tests {
         let dir = temp_dir("shader-cache");
         let game = dir.join("Spin.nso");
         std::fs::write(&game, nso(&[0x14000000u32.to_le_bytes(), [0; 4]].concat())).unwrap();
-        let user = lichii_common::paths::UserPaths {
-            config_dir: dir.join("config"),
-            data_dir: dir.clone(),
-            cache_dir: dir.join("cache"),
-        };
+        let user = lichii_common::paths::UserPaths::portable(dir.clone());
         assert_eq!(crate::display::shader_cache_dir(&user, 0), None);
         let cache = crate::display::shader_cache_dir(&user, 0x0100_0000_0000_1000).unwrap();
         assert_eq!(cache, dir.join("shader").join("0100000000001000"));
