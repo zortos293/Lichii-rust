@@ -540,6 +540,7 @@ pub struct TextureCache {
     new_overlaps: Vec<ImageId>,
     dropped: Vec<ImageId>,
     overlap_scratch: Vec<ImageId>,
+    overlap_ranges: Vec<(DAddr, u64)>,
     /// A sparse image hit its memory cap (warned once).
     sparse_capped: bool,
     /// Device memory one sparse image may bind.
@@ -839,6 +840,7 @@ impl TextureCache {
             new_overlaps: Vec::new(),
             dropped: Vec::new(),
             overlap_scratch: Vec::new(),
+            overlap_ranges: Vec::new(),
             sparse_capped: false,
             sparse_cap: SPARSE_IMAGE_CAP,
             keep: Vec::new(),
@@ -2235,7 +2237,7 @@ impl TextureCache {
 
     /// Readies an upload of what overlaps modified after the image last held their bytes:
     /// writes back the GPU-modified ones, and its own texels around theirs unless they cover
-    /// all of it.
+    /// all of it, then marks the subresources under the overlaps for upload.
     fn take_from_overlaps(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
         let mut newer = std::mem::take(&mut self.overlap_scratch);
         newer.clear();
@@ -2251,17 +2253,27 @@ impl TextureCache {
         }
         let image = self.get(id).expect("a live image id");
         let own = image.gpu_modified && !self.covered(id, &newer);
+        let mut ranges = std::mem::take(&mut self.overlap_ranges);
+        ranges.clear();
+        for &o in &newer {
+            let o = self.get(o).expect("overlaps are live");
+            ranges.extend(o.segments.iter().map(|s| (s.daddr, s.size)));
+        }
         newer.retain(|&o| self.get(o).is_some_and(|o| o.gpu_modified));
         if own {
             newer.push(id);
         }
         let result = self.download(tx, &newer, None);
         self.overlap_scratch = newer;
-        result?;
-        let image = self.image(id);
-        image.gpu_modified = false;
-        image.mark_dirty_whole();
-        Ok(())
+        if result.is_ok() {
+            let image = self.image(id);
+            image.gpu_modified = false;
+            for &(daddr, size) in &ranges {
+                image.mark_cpu_written(daddr, size);
+            }
+        }
+        self.overlap_ranges = ranges;
+        result
     }
 
     /// Whether an overlap was modified after `id` last held the shared bytes.
