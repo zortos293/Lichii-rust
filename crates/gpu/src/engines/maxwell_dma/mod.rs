@@ -69,6 +69,30 @@ impl MaxwellDma {
         let remap = Remap::decode(regs);
         let src_address = regs.offset_in.address();
         let dst_address = regs.offset_out.address();
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            use crate::diag_glyph as dg;
+            let src_pitch = launch.src_memory_layout() == LaunchDmaMemoryLayout::PITCH;
+            let dst_pitch = launch.dst_memory_layout() == LaunchDmaMemoryLayout::PITCH;
+            let counter = if launch.multi_line_enable() == 0 {
+                &dg::DMA_FLAT
+            } else {
+                match (src_pitch, dst_pitch) {
+                    (true, true) => &dg::DMA_PITCH_PITCH,
+                    (true, false) => &dg::DMA_PITCH_BLOCK,
+                    (false, true) => &dg::DMA_BLOCK_PITCH,
+                    (false, false) => &dg::DMA_BLOCK_BLOCK,
+                }
+            };
+            counter.fetch_add(1, Relaxed);
+            if launch.multi_line_enable() != 0 && !dst_pitch {
+                dg::DMA_TO_BLOCK_BYTES.fetch_add(u64::from(regs.line_length_in) * u64::from(regs.line_count), Relaxed);
+            }
+            if launch.multi_line_enable() != 0 && dg::first(3, dst_address ^ (u64::from(regs.dst_params.origin.0) << 40)) {
+                tracing::info!("DIAG glyph dma t={:.1} src={src_address:#x} src_pitch={src_pitch} pitch_in={} src={:?} dst={dst_address:#x} dst_pitch={dst_pitch} pitch_out={} dst={:?} len={} lines={} remap={}", dg::secs(), regs.pitch_in, regs.src_params, regs.pitch_out, regs.dst_params, regs.line_length_in, regs.line_count, launch.remap_enable());
+            }
+            dg::tick();
+        }
         if launch.multi_line_enable() == 0 {
             copy::copy_linear(
                 ctx,

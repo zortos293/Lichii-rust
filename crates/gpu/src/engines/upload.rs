@@ -74,6 +74,23 @@ impl Upload {
         self.column = 0;
         self.remaining = self.line_length * regs.line_count as usize;
         self.chunk.clear();
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let d = crate::diag_glyph::secs();
+            if linear {
+                crate::diag_glyph::I2M_LINEAR.fetch_add(1, Relaxed);
+                if self.remaining >= 1024 && crate::diag_glyph::first(1, self.address) {
+                    tracing::info!("DIAG glyph i2m linear t={d:.1} addr={:#x} pitch={} len={} lines={}", self.address, dest.pitch, self.line_length, regs.line_count);
+                }
+            } else {
+                crate::diag_glyph::I2M_BLOCK.fetch_add(1, Relaxed);
+                crate::diag_glyph::I2M_BLOCK_BYTES.fetch_add(self.remaining as u64, Relaxed);
+                if crate::diag_glyph::first(2, self.address ^ (u64::from(dest.y) << 48) ^ (u64::from(dest.x) << 36)) {
+                    tracing::info!("DIAG glyph i2m block t={d:.1} addr={:#x} w={} h={} d={} layer={} bh={} bd={} x={} y={} len={} lines={}", self.address, dest.width, dest.height, dest.depth, dest.layer, dest.block_height(), dest.block_depth(), dest.x, dest.y, self.line_length, regs.line_count);
+                }
+            }
+            crate::diag_glyph::tick();
+        }
         self.target = if linear {
             Target::Linear {
                 pitch: u64::from(dest.pitch),

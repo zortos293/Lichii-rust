@@ -12,6 +12,7 @@ mod bits;
 pub mod channel;
 pub mod clock;
 pub mod device_memory;
+pub mod diag_glyph;
 mod dma_pusher;
 pub mod engines;
 pub mod gmmu;

@@ -1640,6 +1640,7 @@ impl VulkanRasterizer {
         if header.address == 0 {
             return Ok(None);
         }
+        diag_texture_dump(src.gmmu, &header);
         let mut tx = Transfer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
@@ -2529,3 +2530,67 @@ mod texture;
 
 #[cfg(test)]
 mod tests;
+
+fn diag_texture_dump(gmmu: &lichii_gpu::gmmu::Gmmu, d: &lichii_texture::tic::TextureDescriptor) {
+    use lichii_gpu::diag_glyph as dg;
+    use std::sync::OnceLock;
+    static CONFIG: OnceLock<Option<(std::path::PathBuf, f64, f64)>> = OnceLock::new();
+    static BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let Some((dir, from, to)) = CONFIG.get_or_init(|| {
+        let dir = std::env::var_os("LICHII_TEXDUMP_DIR")?;
+        let num = |k: &str, v: f64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(v);
+        Some((dir.into(), num("LICHII_TEXDUMP_FROM", 0.0), num("LICHII_TEXDUMP_TO", 1e9)))
+    }) else {
+        return;
+    };
+    let t = dg::secs();
+    if t < *from || t > *to {
+        return;
+    }
+    let key = d.address ^ (u64::from(d.width) << 40) ^ (u64::from(d.height) << 52) ^ ((d.format as u64) << 30);
+    if !dg::first(4, key) {
+        return;
+    }
+    let layers = match d.texture_type {
+        lichii_texture::tic::TextureType::D2Array | lichii_texture::tic::TextureType::D1Array => d.depth.max(1),
+        lichii_texture::tic::TextureType::Cube => 6,
+        lichii_texture::tic::TextureType::CubeArray => d.depth.max(1) * 6,
+        _ => 1,
+    };
+    let (size, mem) = match d.memory {
+        TextureMemory::BlockLinear { block_height_log2, block_depth_log2, tile_width_spacing } => {
+            let layout = lichii_texture::block_linear::SurfaceLayout {
+                format: d.format,
+                width: d.width,
+                height: d.height,
+                depth: if matches!(d.texture_type, lichii_texture::tic::TextureType::D3) { d.depth.max(1) } else { 1 },
+                levels: 1,
+                layers,
+                block_height_log2,
+                block_depth_log2,
+                tile_width_spacing,
+                layout: GobLayout::Switch2,
+            };
+            (layout.size_bytes(), format!("bl_bh{block_height_log2}_bd{block_depth_log2}_tws{tile_width_spacing}"))
+        }
+        TextureMemory::Pitch { pitch } => (u64::from(pitch) * u64::from(d.height), format!("pitch{pitch}")),
+        TextureMemory::Buffer => (0, "buffer".into()),
+    };
+    tracing::info!(
+        "DIAG glyph tex t={t:.1} addr={:#x} fmt={:?} type={:?} w={} h={} depth={} levels={} min={} max={} mem={mem} swizzle={:?} srgb={} size={size}",
+        d.address, d.format, d.texture_type, d.width, d.height, d.depth, d.levels, d.min_level, d.max_level, d.swizzle, d.srgb
+    );
+    if size == 0 || size > 16 << 20 {
+        return;
+    }
+    if BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed) > 1200 << 20 {
+        return;
+    }
+    let mut bytes = vec![0u8; size as usize];
+    if gmmu.read_block(d.address, &mut bytes).is_err() {
+        tracing::info!("DIAG glyph tex read failed addr={:#x}", d.address);
+        return;
+    }
+    let name = format!("tex-{:x}-{:?}-{}x{}x{}-{mem}.bin", d.address, d.format, d.width, d.height, layers);
+    let _ = std::fs::write(dir.join(name), &bytes);
+}
