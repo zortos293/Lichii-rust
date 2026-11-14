@@ -583,6 +583,15 @@ pub trait Rasterizer: Send {
     /// Write GPU-modified data in `[addr, addr + size)` back to guest memory.
     fn flush_region(&mut self, addr: DAddr, size: u64);
 
+    /// The front is about to read `[addr, addr + size)`: every GPU writer of the range lands in
+    /// guest memory first (releases still waiting for host GPU work, and cached buffers and
+    /// images). The default waits for every fence, then writes the range back; a renderer that
+    /// knows which pending work writes the range may wait for less.
+    fn synchronize_region(&mut self, addr: DAddr, size: u64) {
+        self.release_fences(true);
+        self.flush_region(addr, size);
+    }
+
     /// Device memory `[addr, addr + size)` is no longer mapped in some GPU address space.
     fn unmap_region(&mut self, addr: DAddr, size: u64) {
         self.invalidate_region(addr, size);
