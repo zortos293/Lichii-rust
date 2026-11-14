@@ -31,8 +31,6 @@ pub(super) struct SampleCounter {
     reset_at: u64,
     /// Queries below this were read or are summed by no report; their slots may be reused.
     released: u64,
-    /// End of the newest report's range.
-    reported: u64,
     /// Resolution scale of each slot's draw, so results count guest pixels.
     scales: Vec<ResolutionScale>,
     summed_from: u64,
@@ -63,7 +61,6 @@ impl SampleCounter {
             next: 0,
             reset_at: 0,
             released: 0,
-            reported: 0,
             scales: vec![ResolutionScale::X1; SLOTS as usize],
             summed_from: 0,
             summed_to: 0,
@@ -117,25 +114,24 @@ impl SampleCounter {
         unsafe { device.raw.cmd_end_query(cmd, self.pool, slot) };
     }
 
-    /// CLEAR_REPORT_VALUE: later reports count only draws recorded from now on.
-    pub(super) fn reset(&mut self) {
+    /// CLEAR_REPORT_VALUE: later reports count only draws recorded from now on. Returns the
+    /// first counted query, for [`retire`](Self::retire) once the work before it completed.
+    pub(super) fn reset(&mut self) -> u64 {
         self.reset_at = self.next;
-        self.release_unreported();
+        self.reset_at
+    }
+
+    /// The work recorded before a reset at `reset_at` completed: reports queued earlier have
+    /// read their queries, and later ones read none before it, so its slots may be reused.
+    pub(super) fn retire(&mut self, reset_at: u64) {
+        self.released = self.released.max(reset_at);
     }
 
     /// What a report recorded now sums.
-    pub(super) fn report(&mut self) -> SampleRange {
-        self.reported = self.next;
+    pub(super) fn report(&self) -> SampleRange {
         SampleRange {
             from: self.reset_at,
             to: self.next,
-        }
-    }
-
-    /// Once no queued report reads them, the queries before the last reset are never read.
-    fn release_unreported(&mut self) {
-        if self.released >= self.reported {
-            self.released = self.released.max(self.reset_at);
         }
     }
 
@@ -173,8 +169,7 @@ impl SampleCounter {
             }
             self.summed_to += count;
         }
-        self.released = range.to;
-        self.release_unreported();
+        self.released = self.released.max(range.to);
         self.sum
     }
 }

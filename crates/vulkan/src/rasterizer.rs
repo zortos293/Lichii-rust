@@ -123,6 +123,8 @@ enum Release {
         size: ReleaseSize,
         range: samples::SampleRange,
     },
+    /// A Z-pass counter reset; its earlier queries are free once the work before it completed.
+    SamplesReset(u64),
 }
 
 /// The rectangle a clear covers: the first scissor and the clear rectangle when
@@ -872,7 +874,10 @@ impl Rasterizer for VulkanRasterizer {
 
     fn reset_counter(&mut self, kind: QueryKind) {
         if kind == QueryKind::SamplesPassed {
-            self.samples.reset();
+            let reset_at = self.samples.reset();
+            self.fences
+                .push_back((self.scheduler.tick(), Release::SamplesReset(reset_at)));
+            self.unflushed = true;
         }
     }
 
@@ -907,6 +912,7 @@ impl Rasterizer for VulkanRasterizer {
                     size,
                 }
                 .execute(&self.handles),
+                Release::SamplesReset(reset_at) => self.samples.retire(reset_at),
             }
         }
     }
