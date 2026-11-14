@@ -30,6 +30,7 @@ pub(super) fn create_thread(svc: &mut SvcContext) -> Flow {
                 .add(KObject::Thread(thread.clone()));
             match handle {
                 Ok(handle) => {
+                    crate::thread::publish_handle(svc.process(), &thread, handle);
                     svc.set(1, handle as u64);
                     svc.finish(Ok(()))
                 }

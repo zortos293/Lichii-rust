@@ -839,3 +839,54 @@ fn closing_the_last_handle_of_an_unstarted_thread_releases_it() {
     assert!(process.threads().is_empty());
     assert_eq!(create().tls_address(), thread.tls_address());
 }
+
+/// The SDK's critical sections read the current thread's handle at TLS+0x110 to tag their
+/// owner; the main thread finds the handle it got in x1 there.
+#[test]
+fn main_thread_handle_is_at_tls_0x110() {
+    let test = TestKernel::new(ConsoleGeneration::Switch2);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = seen.clone();
+    let main = test.program(
+        Script::new()
+            .then(move |ctx, env| {
+                let tls = env.memory.read::<u32>(ctx.tpidrro_el0 + 0x110).unwrap();
+                record.lock().push((tls, ctx.x[1] as u32));
+            })
+            .exit(),
+    );
+    test.start(test.image(), main);
+    test.run_until_exit(Duration::from_secs(10));
+    let seen = seen.lock().clone();
+    assert_eq!(seen.len(), 1);
+    assert_ne!(seen[0].1, 0);
+    assert_eq!(seen[0].0, seen[0].1);
+}
+
+/// Threads made with svcCreateThread find the handle it returned at TLS+0x110.
+#[test]
+fn created_thread_handles_are_at_tls_0x110() {
+    let test = TestKernel::new(ConsoleGeneration::Switch2);
+    let heap = heap_base(&test);
+    let handles = heap + 0x1000;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = seen.clone();
+    let worker = test.program(
+        Script::new()
+            .then(move |ctx, env| {
+                let tls = env.memory.read::<u32>(ctx.tpidrro_el0 + 0x110).unwrap();
+                let handle = env.memory.read::<u32>(handles + 4 * ctx.x[0]).unwrap();
+                record.lock().push((tls, handle));
+            })
+            .exit(),
+    );
+    let main = test.program(spawn_and_join(heap, 3, worker, |_| (44, 0)).exit());
+    test.start(test.image(), main);
+    test.run_until_exit(Duration::from_secs(10));
+    let seen = seen.lock().clone();
+    assert_eq!(seen.len(), 3);
+    for (tls, handle) in seen {
+        assert_ne!(handle, 0);
+        assert_eq!(tls, handle);
+    }
+}
