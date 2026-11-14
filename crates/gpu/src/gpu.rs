@@ -357,11 +357,14 @@ impl Front {
 }
 
 /// Whether guest CPU accesses to memory the GPU modified trap until the GPU writes it back.
-/// `LICHII_FLUSH_TRAPS=0` turns them off: no handler is installed and the renderer arms nothing,
-/// so such reads see what guest memory held, as before flush traps.
+/// Off by default: a trap downloads the whole GPU-written range, and Splatoon 3 cold boots
+/// crashed with it. `LICHII_FLUSH_TRAPS=1` turns them on; otherwise no handler is installed and
+/// the renderer arms nothing, so such reads see what guest memory holds.
 pub fn flush_traps_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("LICHII_FLUSH_TRAPS").is_none_or(|value| value != "0"))
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("LICHII_FLUSH_TRAPS").map_or(cfg!(test), |value| value != "0")
+    })
 }
 
 /// How long [`Gpu::shutdown`] waits for the GPU threads, which a renderer call that never
