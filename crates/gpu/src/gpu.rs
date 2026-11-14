@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread::{JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
@@ -357,7 +357,7 @@ impl Front {
 
 /// How long [`Gpu::shutdown`] waits for the GPU threads, which a renderer call that never
 /// returns can hold forever.
-const STOP_TIMEOUT: Duration = Duration::from_secs(3);
+const STOP_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// The emulated GPU. Every method may be called from any thread and none waits for GPU work
 /// unless it says so; work is executed in the order it was queued.
@@ -376,6 +376,8 @@ pub struct Gpu {
     activity: Arc<Activity>,
     /// Ids of those threads, so `shutdown` recognises a GPU thread without taking `threads`.
     thread_ids: Vec<ThreadId>,
+    /// Tells the back to drop its stream once `shutdown` starts.
+    stopping: Arc<AtomicBool>,
 }
 
 const _: () = {
@@ -416,6 +418,7 @@ impl Gpu {
         let (side_sender, side_receiver) = mpsc::channel();
         let fetch_syncs = Arc::new(FetchSyncs::new(inbox.clone()));
         let activity = Arc::new(Activity::new());
+        let stopping = Arc::new(AtomicBool::new(false));
         let back = Back::new(
             rasterizer,
             &handles,
@@ -423,6 +426,7 @@ impl Gpu {
             side_receiver,
             fetch_syncs.clone(),
             activity.clone(),
+            stopping.clone(),
         );
         let (link, back) = match config.threading {
             Threading::Split => {
@@ -473,6 +477,7 @@ impl Gpu {
             inbox,
             next_channel: AtomicU32::new(0),
             references: Mutex::new(HashMap::new()),
+            stopping,
             thread_ids: [Some(&front), back.as_ref()]
                 .into_iter()
                 .flatten()
@@ -655,11 +660,13 @@ impl Gpu {
         self.inbox.pause(paused);
     }
 
-    /// Stops the GPU: commands still queued are dropped, and the threads finish what they hold
-    /// and are joined before this returns. Calling it again, or from several threads, is safe;
+    /// Stops the GPU: commands still queued are dropped, the back drops the stream it has not
+    /// executed yet (a waiter on a dropped action or synchronize returns), and the threads finish
+    /// the record they hold and are joined before this returns, or left after [`STOP_TIMEOUT`]. Calling it again, or from several threads, is safe;
     /// commands sent afterwards are dropped, and calls that wait for the GPU return at once.
     /// From a GPU thread (a [`Gpu::run_in_order`] action) it closes the GPU without joining.
     pub fn shutdown(&self) {
+        self.stopping.store(true, Ordering::Relaxed);
         self.inbox.close();
         self.activity.stop();
         if self.thread_ids.contains(&std::thread::current().id()) {

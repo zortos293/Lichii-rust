@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lichii_common::{ConsoleGeneration, ResultCode};
 use lichii_cpu::ThreadContext;
@@ -634,4 +634,70 @@ fn user_buffers_clones_and_deferred_move_handles() {
     assert_eq!(r[6].0, u64::from(result::SESSION_CLOSED.0));
     // A deferred request keeps the object of its move handle for the retry.
     assert_eq!((r[7].0, r[7].1[6], r[7].1[8]), (0, 0, 1));
+}
+
+struct Stuck(Arc<AtomicBool>);
+
+impl SessionHandler for Stuck {
+    fn name(&self) -> &str {
+        "stuck:u"
+    }
+
+    fn handle_request(&self, _ctx: &mut HleRequestContext) -> ResultCode {
+        self.0.store(true, Ordering::SeqCst);
+        loop {
+            std::thread::park();
+        }
+    }
+}
+
+/// A service thread that never finishes its request (blocked on the GPU or the host) does not
+/// hold up the kernel's shutdown: it is left after the service stop timeout.
+#[test]
+fn shutdown_leaves_a_service_thread_stuck_in_a_request() {
+    let test = TestKernel::new(ConsoleGeneration::Switch1);
+    let heap = heap_base(&test);
+    let entered = Arc::new(AtomicBool::new(false));
+    let thread = test.kernel.create_service_thread("stuck").unwrap();
+    let handler_entered = entered.clone();
+    test.kernel
+        .service_manager()
+        .register(
+            "stuck:u",
+            &thread,
+            Arc::new(move || Arc::new(Stuck(handler_entered.clone())) as Arc<dyn SessionHandler>),
+        )
+        .unwrap();
+    let replies = Replies::default();
+    let mut s = connect_sm(Script::new(), heap + 0x3000);
+    s = call(
+        s,
+        &replies,
+        19,
+        Msg {
+            pid: true,
+            ..Msg::cmif(0, &[0, 0])
+        },
+        None,
+    );
+    s = call(s, &replies, 19, Msg::cmif(1, &name("stuck:u")), Some(20));
+    s = call(s, &replies, 20, Msg::cmif(0, &[]), None);
+    let main = test.program(s.exit());
+    test.start(test.image(), main);
+    test.kernel.run().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !entered.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < deadline,
+            "the request never reached the service"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let start = Instant::now();
+    test.kernel.shutdown();
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "shutdown took {:?}",
+        start.elapsed()
+    );
 }

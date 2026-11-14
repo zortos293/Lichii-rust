@@ -329,6 +329,12 @@ impl Consumer {
         self.read += len as u64;
     }
 
+    /// Moves past everything published without reading it.
+    #[inline]
+    pub(crate) fn skip_published(&mut self) {
+        self.read = self.end;
+    }
+
     /// Moves past a [`WRAP`] slot to the ring's start.
     #[inline]
     pub(crate) fn wrap(&mut self) {

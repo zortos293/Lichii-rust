@@ -328,6 +328,8 @@ impl Kernel {
 
     /// Stops every core and kernel thread and releases all processes. A thread still running
     /// after [`SLOW_JOIN`] is named in a warning, so a shutdown that hangs says what it waits for.
+    /// Service threads get [`SERVICE_STOP_TIMEOUT`] together: one still inside a request after
+    /// that (blocked on the GPU or the host) is named and left to finish on its own.
     pub fn shutdown(&self) {
         self.0.scheduler.shutdown();
         self.0.timer.shutdown();
@@ -342,8 +344,9 @@ impl Kernel {
         for thread in &services.threads {
             thread.stop();
         }
+        let deadline = Instant::now() + SERVICE_STOP_TIMEOUT;
         for join in services.joins {
-            join_noting_slow(join);
+            join_or_leave(join, deadline);
         }
         self.0.service_manager.clear();
         self.0.named_ports.lock().clear();
@@ -401,6 +404,24 @@ const LIVE_PC_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// How long [`Kernel::shutdown`] waits for a thread before naming it.
 const SLOW_JOIN: Duration = Duration::from_secs(2);
+/// How long [`Kernel::shutdown`] waits for all service threads before leaving the busy ones.
+const SERVICE_STOP_TIMEOUT: Duration = Duration::from_millis(300);
+
+fn join_or_leave(thread: JoinHandle<()>, deadline: Instant) {
+    while !thread.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    if !thread.is_finished() {
+        tracing::warn!(
+            thread = thread.thread().name().unwrap_or("unnamed"),
+            "shutdown: a service thread is still inside a request; leaving it"
+        );
+        return;
+    }
+    if thread.join().is_err() {
+        tracing::error!("a kernel thread panicked");
+    }
+}
 
 fn join_noting_slow(thread: JoinHandle<()>) {
     let started = Instant::now();
