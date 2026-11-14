@@ -214,6 +214,7 @@ impl VulkanRasterizer {
         let src = StageSources {
             gmmu: ctx.memory,
             cbufs: &[],
+            root_table: None,
             pool: TexturePool {
                 address: regs.tex_header.address(),
                 limit: regs.tex_header.limit,
