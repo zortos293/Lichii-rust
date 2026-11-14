@@ -2487,3 +2487,122 @@ fn full_clears_over_copy_engine_destinations_stay_newer_than_the_copy() {
     ));
     f.assert_no_validation_errors();
 }
+
+#[test]
+fn cpu_writes_upload_only_the_layers_they_touch() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let header = tic(0x08, GPU_VA, 64, 64, 4, 1, 3);
+    let info = ImageInfo::from_texture(&header.decode().unwrap(), GobLayout::Tegra).unwrap();
+    let pattern: Vec<u8> = (0..info.size_bytes())
+        .map(|i| (i * 13 + i / 97) as u8)
+        .collect();
+    f.memory.write_bytes(DADDR, &pattern).unwrap();
+    let (texture, _) = f.texture(&header);
+    let before = f.read_image(texture);
+    let uploaded = f.cache.traffic();
+    let layer = info.layer_stride;
+    f.memory
+        .write_bytes(DADDR + 2 * layer + 256, &[0xab; 64])
+        .unwrap();
+    {
+        let (mut tx, cache, _) = f.tx();
+        cache
+            .invalidate(&mut tx, DADDR + 2 * layer + 256, 64)
+            .unwrap();
+    }
+    assert_eq!(f.texture(&header).0, texture);
+    let traffic = f.cache.traffic();
+    assert_eq!(traffic.uploads, uploaded.uploads + 1);
+    assert_eq!(
+        traffic.upload_bytes - uploaded.upload_bytes,
+        64 * 64 * 4,
+        "only layer 2 uploads again"
+    );
+    let after = f.read_image(texture);
+    for l in [0, 1, 3] {
+        assert_eq!(after[l], before[l], "layer {l} keeps its texels");
+    }
+    assert_ne!(after[2], before[2], "layer 2 takes the CPU's bytes");
+    let changed = after[2]
+        .iter()
+        .zip(&before[2])
+        .filter(|(a, b)| a != b)
+        .count();
+    assert!(changed > 0 && changed <= 64, "{changed} bytes changed");
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn overlaps_written_back_upload_only_the_layers_they_cover() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let header = tic(0x08, GPU_VA, 64, 64, 4, 1, 3);
+    let info = ImageInfo::from_texture(&header.decode().unwrap(), GobLayout::Tegra).unwrap();
+    let pattern: Vec<u8> = (0..info.size_bytes())
+        .map(|i| (i * 13 + i / 97) as u8)
+        .collect();
+    f.memory.write_bytes(DADDR, &pattern).unwrap();
+    let (texture, _) = f.texture(&header);
+    let before = f.read_image(texture);
+    let mut bytes = rt_info(128, 32, 2, GobLayout::Tegra);
+    bytes.format = PixelFormat::R8Unorm;
+    assert_eq!(bytes.size_bytes(), 4096);
+    let layer_va = GPU_VA + 2 * info.layer_stride;
+    let target = clear_rt_at(&mut f, layer_va, &bytes, [1.0, 0.0, 0.0, 0.0], Rect::ALL);
+    assert_ne!(target.id, texture);
+    let uploaded = f.cache.traffic();
+    assert_eq!(f.texture(&header).0, texture);
+    let traffic = f.cache.traffic();
+    assert_eq!(
+        traffic.upload_bytes - uploaded.upload_bytes,
+        64 * 64 * 4,
+        "only layer 2 uploads again"
+    );
+    let after = f.read_image(texture);
+    for l in [0, 1, 3] {
+        assert_eq!(after[l], before[l], "layer {l} keeps its texels");
+    }
+    for (i, texel) in after[2].as_chunks::<4>().0.iter().enumerate() {
+        if i % 64 < 16 {
+            assert_eq!(
+                *texel, [255; 4],
+                "texel {i} of layer 2 takes the render target's bytes"
+            );
+        } else {
+            assert_eq!(
+                texel[..],
+                before[2][i * 4..i * 4 + 4],
+                "texel {i} of layer 2"
+            );
+        }
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn cpu_writes_between_layers_upload_nothing() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let header = tic(0x08, GPU_VA, 64, 64, 4, 3, 3);
+    let info = ImageInfo::from_texture(&header.decode().unwrap(), GobLayout::Tegra).unwrap();
+    let used = info.subresource_offset(2, 0) + info.level_size(2);
+    assert!(
+        used < info.layer_stride,
+        "{used} of {} bytes",
+        info.layer_stride
+    );
+    let (texture, _) = f.texture(&header);
+    let uploaded = f.cache.traffic();
+    {
+        let (mut tx, cache, _) = f.tx();
+        cache.invalidate(&mut tx, DADDR + used, 64).unwrap();
+    }
+    assert_eq!(f.texture(&header).0, texture);
+    assert_eq!(f.cache.traffic().upload_bytes, uploaded.upload_bytes);
+    f.scheduler.finish().unwrap();
+    f.assert_no_validation_errors();
+}
