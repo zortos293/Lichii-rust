@@ -989,6 +989,7 @@ impl Rasterizer for VulkanRasterizer {
         if let Err(error) = result {
             tracing::error!(%error, "presenting a guest frame failed");
         }
+        self.probe_frame(framebuffer);
         self.release_fences(false);
         let mut tx = Transfer {
             scheduler: &mut self.scheduler,

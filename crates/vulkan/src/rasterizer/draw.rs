@@ -168,6 +168,7 @@ pub(super) struct DrawState {
     vertex_input: ash::ext::vertex_input_dynamic_state::Device,
     mesh: ash::ext::mesh_shader::Device,
     null_buffer: Buffer,
+    pub(super) probe: probe::Probe,
     null_images: null::NullImages,
     arch: ShaderArch,
     channel: Option<ChannelId>,
@@ -253,6 +254,7 @@ impl DrawState {
             ),
             mesh: ash::ext::mesh_shader::Device::new(&device.instance.raw, &device.raw),
             null_buffer,
+            probe: probe::Probe::new(device)?,
             null_images: null::NullImages::default(),
             arch: if gob_layout == GobLayout::Switch2 {
                 ShaderArch::Ampere
@@ -977,8 +979,143 @@ impl VulkanRasterizer {
                 self.texture_cache.mark_modified(id);
             }
         }
+        if self.draw.probe.collecting {
+            self.probe_draw(cmd, regs, index.map(|i| i.index_count));
+        }
         self.unflushed = true;
         Ok(())
+    }
+
+    fn probe_draw(&mut self, cmd: vk::CommandBuffer, regs: &Regs, indices: Option<u32>) {
+        let d = self.draw.probe.next_draw();
+        let stages: Vec<String> = self
+            .draw
+            .stages
+            .iter()
+            .flatten()
+            .map(|m| format!("{:x}", m.hash))
+            .collect();
+        let meta = format!(
+            "d{d} stages=[{}] indices={indices:?} depth_test={} depth_write={} depth_func={:?} stencil={} mask0={:?} blend={:?}",
+            stages.join(","),
+            regs.depth_test_enable,
+            regs.depth_write_enabled,
+            regs.depth_test_func,
+            regs.stencil_enable,
+            regs.color_mask[0],
+            regs.blend,
+        );
+        let targets = self.draw.colors;
+        for (i, target) in targets.iter().enumerate() {
+            let Some(target) = target else {
+                continue;
+            };
+            let address = regs.rt[render_target_index(regs, i)].address();
+            for (k, (fx, fy)) in probe::POINTS.iter().enumerate() {
+                let x = (target.extent.width as f32 * fx) as i32;
+                let y = (target.extent.height as f32 * fy) as i32;
+                let key = format!(
+                    "{address:#x} {:?} {}x{} rt{i} pt{k}",
+                    target.format, target.extent.width, target.extent.height
+                );
+                let Some((buffer, offset)) = self.draw.probe.slot(key, meta.clone(), target.format)
+                else {
+                    return;
+                };
+                let Some(image) =
+                    self.texture_cache
+                        .prepare(cmd, target.id, ImageAccess::TRANSFER_SRC)
+                else {
+                    continue;
+                };
+                let region = vk::BufferImageCopy {
+                    buffer_offset: offset,
+                    buffer_row_length: 0,
+                    buffer_image_height: 0,
+                    image_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    image_offset: vk::Offset3D { x, y, z: 0 },
+                    image_extent: vk::Extent3D {
+                        width: 1,
+                        height: 1,
+                        depth: 1,
+                    },
+                };
+                // SAFETY: the image is in TRANSFER_SRC layout and the texel lies inside it; the
+                // probe buffer outlives the frame.
+                unsafe {
+                    self.device.raw.cmd_copy_image_to_buffer(
+                        cmd,
+                        image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        buffer,
+                        &[region],
+                    );
+                }
+            }
+        }
+    }
+
+    /// At present: logs the probed pixels of a collected frame and dumps the presented frame.
+    pub(super) fn probe_frame(&mut self, fb: &lichii_gpu::backend::FramebufferConfig) {
+        if self.draw.probe.dir.is_none() {
+            return;
+        }
+        let collecting = self.draw.probe.collecting;
+        if collecting && let Err(error) = self.scheduler.finish() {
+            tracing::error!(%error, "probe: finishing the frame failed");
+            return;
+        }
+        let frame = self.draw.probe.frame;
+        if !self.draw.probe.end_frame() {
+            return;
+        }
+        let info = ImageInfo::from_framebuffer(fb);
+        let size = info.size_bytes();
+        let mut tx = Transfer {
+            scheduler: &mut self.scheduler,
+            staging: &mut self.staging,
+            memory: &self.handles.device,
+        };
+        if let Err(error) = self.texture_cache.flush(&mut tx, fb.address, size) {
+            tracing::error!(%error, "probe: flushing the frame failed");
+            return;
+        }
+        let mut tiled = vec![0u8; size as usize];
+        if self
+            .handles
+            .device
+            .read_bytes(fb.address, &mut tiled)
+            .is_err()
+        {
+            tracing::error!("probe: reading the frame failed");
+            return;
+        }
+        let (bytes, pitch) = match fb.block_height_log2 {
+            Some(_) => {
+                let tiling = info.surface().level_tiling(0);
+                let mut linear = vec![0u8; tiling.linear_size_bytes()];
+                lichii_texture::block_linear::unswizzle(&tiling, &tiled, &mut linear);
+                let pitch = linear.len() / fb.height.max(1) as usize;
+                (linear, pitch)
+            }
+            None => (tiled, fb.stride as usize),
+        };
+        let name = format!(
+            "frame{frame:03}-{}x{}-p{pitch}-{:?}.raw",
+            fb.width, fb.height, fb.format
+        );
+        let path = self.draw.probe.dir.as_ref().map(|d| d.join(&name));
+        if let Some(path) = path {
+            match std::fs::write(&path, &bytes) {
+                Ok(()) => tracing::info!(target: "probe", "dumped {name}"),
+                Err(error) => tracing::error!(%error, "probe: writing the frame failed"),
+            }
+        }
     }
 
     /// Translates (or finds) the enabled programs into `self.draw.stages`. `false` skips the
@@ -2572,6 +2709,7 @@ mod frame_decode;
 mod host_compute;
 mod mesh_indirect;
 mod null;
+mod probe;
 mod texture;
 
 #[cfg(test)]
