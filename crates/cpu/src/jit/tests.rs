@@ -2010,7 +2010,7 @@ fn run_profiled(
 
 /// A scalar product, fused product, quotient or narrowing conversion whose result is zero because a
 /// factor, the dividend or the source is zero stays native; an underflow to zero still falls back, and an inexact op with
-/// FPSR.IXC clear is counted apart from it.
+/// FPSR.IXC clear that has no native exactness check is counted apart from it.
 #[test]
 fn zero_factor_products_stay_native() {
     const PROGRAM: [u32; 10] = [
@@ -2022,7 +2022,7 @@ fn zero_factor_products_stay_native() {
         0x1e6d_098a, // fmul d10, d12, d13
         0x1e27_08e6, // fmul s6, s7, s7
         0xd51b_443f, // msr fpsr, xzr
-        0x1e29_0848, // fmul s8, s2, s9
+        0x1e21_c128, // fsqrt s8, s9
         BRK,
     ];
     let mut ctx = ThreadContext {
@@ -2050,7 +2050,7 @@ fn zero_factor_products_stay_native() {
             "native FP slow paths, inputs or result: {}\n",
             1 + fused_slow
         ),
-        "FP 2-source 0x1e200800".to_string(),
+        "FP 1-source 0x1e21c000".to_string(),
     ] {
         assert!(table.contains(&line), "{line:?} in\n{table}");
     }
@@ -2784,4 +2784,82 @@ fn cores_sharing_code_read_their_own_tsc_scale() {
     assert_eq!(run_to_brk(&mut cores[0])[0], 12345);
     assert_eq!(run_to_brk(&mut cores[1])[0], 67890);
     assert!(cores[1].cache.adopted() > 0);
+}
+
+/// While FPSR.IXC is clear, scalar sums and S products and quotients stay native and set IXC
+/// exactly when their result is rounded. Small integers, powers of two and scaled integers make
+/// many results exact; random bits make most of them rounded.
+#[test]
+fn ixc_clear_arithmetic_sets_ixc_only_for_rounded_results() {
+    const OPS: [u32; 9] = [
+        0x1e22_2820, // fadd s0, s1, s2
+        0x1e22_3820, // fsub s0, s1, s2
+        0x1e22_0820, // fmul s0, s1, s2
+        0x1e22_1820, // fdiv s0, s1, s2
+        0x1e22_8820, // fnmul s0, s1, s2
+        0x1e62_2820, // fadd d0, d1, d2
+        0x1e62_3820, // fsub d0, d1, d2
+        0x1e62_0820, // fmul d0, d1, d2
+        0x1e62_1820, // fdiv d0, d1, d2
+    ];
+    let mut rng = Rng(0x1c5e_7a11_0dd5_eed5);
+    let mut value = |double: bool| {
+        let sign = if rng.below(2) == 0 { 1.0 } else { -1.0 };
+        let x = sign
+            * match rng.below(5) {
+                0 => rng.below(41) as f64,
+                1 if double => 2f64.powi(rng.below(2100) as i32 - 1076),
+                1 => 2f64.powi(rng.below(280) as i32 - 151),
+                2 => (rng.below(1 << 20) as f64) * 2f64.powi(rng.below(60) as i32 - 30),
+                3 => 1.0 + 2f64.powi(-(rng.below(60) as i32)),
+                _ if double => f64::from_bits(rng.next() >> 2),
+                _ => f32::from_bits(rng.next() as u32 >> 2) as f64,
+            };
+        if double {
+            x.to_bits() as u128
+        } else {
+            (x as f32).to_bits() as u128
+        }
+    };
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+        ("jit without fma", Machine::new(Backend::NoFma)),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    for i in 0..30_000 {
+        let op = OPS[i % OPS.len()];
+        let double = op & 1 << 22 != 0;
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            fpcr: if i % 4 == 3 { 1 << 24 } else { 0 },
+            ..Default::default()
+        };
+        ctx.v[1] = value(double);
+        ctx.v[2] = value(double);
+        compare(machines, &[op, BRK], &ctx, &data);
+    }
+    let program = [
+        0xd51b_443f,
+        OPS[0],
+        OPS[1],
+        OPS[2],
+        OPS[3],
+        OPS[4],
+        OPS[5],
+        OPS[6],
+        BRK,
+    ];
+    let mut ctx = ThreadContext {
+        pc: CODE,
+        fpsr: 0x10,
+        ..Default::default()
+    };
+    ctx.v[1] = 3.0f32.to_bits() as u128;
+    ctx.v[2] = 0.1f32.to_bits() as u128;
+    let (halt, after, table) = run_profiled(&program, ctx, true);
+    assert_eq!(halt, HaltReason::Breakpoint(0));
+    assert_eq!(after.fpsr & 0x10, 0x10);
+    let table = table.unwrap();
+    assert!(!table.contains("FPSR.IXC clear"), "{table}");
 }

@@ -1,7 +1,7 @@
 //! Interpreter and JIT throughput on synthetic guest loops, in guest MIPS.
 //!
-//! `cargo bench -p lichii-cpu --bench cpu`; `LICHII_BENCH_ITERATIONS` sets the loop count
-//! (default 10M, zero is ignored).
+//! `cargo bench -p lichii-cpu --bench cpu [names...]`; `LICHII_BENCH_ITERATIONS` sets the loop
+//! count (default 10M, zero is ignored), and names run only the workloads containing one of them.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -162,6 +162,25 @@ const WORKLOADS: &[Workload] = &[
         ],
         far: &[],
         per_iteration: 12,
+    },
+    Workload {
+        name: "exact fp loop",
+        code: &[
+            0x1e2e1000, // fmov s0, #1.0
+            0x1e201001, // fmov s1, #2.0
+            0x1e2c1002, // fmov s2, #0.5
+            0x1e212803, // 1: fadd s3, s0, s1
+            0x1e210864, // fmul s4, s3, s1
+            0x1e203885, // fsub s5, s4, s0
+            0x1e2218a6, // fdiv s6, s5, s2
+            0x1e2288c7, // fnmul s7, s6, s2
+            0xbd000027, // str s7, [x1]
+            0xf10004a5, // subs x5, x5, #1
+            0x54ffff21, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 8,
     },
     Workload {
         name: "exclusive pair loop",
@@ -537,8 +556,13 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .filter(|&n| n > 0)
         .unwrap_or(10_000_000);
+    let names: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
     for ((workload, fpcr), backend) in WORKLOADS
         .iter()
+        .filter(|w| names.is_empty() || names.iter().any(|n| w.name.contains(n.as_str())))
         .flat_map(|w| {
             let fz = FLUSH_TO_ZERO.contains(&w.name).then_some((w, 1 << 24));
             std::iter::once((w, 0)).chain(fz)
