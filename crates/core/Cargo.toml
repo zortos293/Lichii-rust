@@ -18,3 +18,6 @@ lichii-input.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+lichii-kernel = { workspace = true, features = ["testing"] }
