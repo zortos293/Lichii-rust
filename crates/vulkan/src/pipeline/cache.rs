@@ -810,6 +810,8 @@ pub struct PipelineCache {
     libraries: HashMap<LibraryKey, Arc<Slot>, FxBuildHasher>,
     /// Graphics slots drawn while building, with fast linking on.
     linking: HashMap<usize, Linking, FxBuildHasher>,
+    /// Graphics lookups that found the pipeline still building, with nothing fast-linked yet.
+    waits: u64,
 }
 
 fn identity(device: &Device) -> DeviceIdentity {
@@ -919,6 +921,7 @@ impl PipelineCache {
             slots: Vec::new(),
             libraries: HashMap::default(),
             linking: HashMap::default(),
+            waits: 0,
         })
     }
 
@@ -955,10 +958,22 @@ impl PipelineCache {
             Some(&index) => index,
             None => self.insert_graphics(key, shaders, true),
         };
-        if self.async_compile && self.ctx.features.fast_link && self.slots[index].get().is_none() {
-            return self.fast_linked(index, key, shaders);
+        if self.async_compile && self.slots[index].get().is_none() {
+            if self.ctx.features.fast_link && self.fast_linked(index, key, shaders).is_some() {
+                return match self.linking.get(&index) {
+                    Some(Linking::Linked(pipeline)) => Some(pipeline),
+                    _ => None,
+                };
+            }
+            self.waits += 1;
+            return None;
         }
         self.ready(index)
+    }
+
+    /// Graphics lookups since the cache was created that found the pipeline still building.
+    pub fn waits(&self) -> u64 {
+        self.waits
     }
 
     fn fast_linked(
@@ -1977,6 +1992,7 @@ mod tests {
                 "a queued key is not queued twice"
             );
             assert_eq!(cache.building(), 5);
+            assert_eq!(cache.waits(), 5, "every skipped graphics draw is counted");
         }
         cache.wait_for_builds();
         assert_eq!(cache.building(), 0);
@@ -1989,6 +2005,7 @@ mod tests {
             assert!(cache.graphics(key, &shaders).is_some());
         }
         assert!(cache.compute(&compute_key(), &compute_shader()).is_some());
+        assert_eq!(cache.waits(), 5, "hits are not waits");
         assert_eq!(cache.stats().built, 5);
         assert_eq!(cache.stats().failed, 0);
 

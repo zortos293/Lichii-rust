@@ -40,6 +40,7 @@ use crate::error::Result;
 use crate::format::{Conversion, host_format};
 use crate::memory::{Buffer, Image, ImageDesc};
 use crate::pipeline::PipelineCache;
+use crate::pipeline::shader_cache::ShaderCache;
 use crate::present::{FrameImage, FrameMailbox, GuestFrame};
 use crate::scheduler::Scheduler;
 use crate::staging::StagingRing;
@@ -64,6 +65,56 @@ struct Activity {
     submits: u32,
     textures: Traffic,
     buffers: BufferCacheStats,
+}
+
+/// Draws skipped while their shaders translated or their pipelines built, and the longest time
+/// between two presents, over the second since the last `draw stalls` line. The line is
+/// written at INFO, at most once a second, only for a second that skipped draws or held a
+/// present back for [`Stalls::SLOW_FRAME`] or more, so scene loads show up and steady play does not.
+#[derive(Default)]
+struct Stalls {
+    since: Option<Instant>,
+    last_present: Option<Instant>,
+    worst_frame: Duration,
+    presents: u32,
+    /// Shader and pipeline waits when the window started.
+    waits_at: (u64, u64),
+}
+
+impl Stalls {
+    const SLOW_FRAME: Duration = Duration::from_millis(50);
+
+    fn present(&mut self, now: Instant, shaders: &ShaderCache, pipelines: &PipelineCache) {
+        if let Some(last) = self.last_present.replace(now) {
+            self.worst_frame = self.worst_frame.max(now - last);
+        }
+        self.presents += 1;
+        let waits = (shaders.waits(), pipelines.waits());
+        let since = *self.since.get_or_insert(now);
+        if now - since < Duration::from_secs(1) {
+            return;
+        }
+        let skipped_shader = waits.0 - self.waits_at.0;
+        let skipped_pipeline = waits.1 - self.waits_at.1;
+        if skipped_shader + skipped_pipeline > 0 || self.worst_frame >= Self::SLOW_FRAME {
+            tracing::info!(
+                skipped_shader,
+                skipped_pipeline,
+                worst_frame_ms = self.worst_frame.as_secs_f32() * 1000.0,
+                presents = self.presents,
+                seconds = (now - since).as_secs_f32(),
+                translating = shaders.translating(),
+                building = pipelines.building(),
+                "draw stalls"
+            );
+        }
+        *self = Self {
+            since: Some(now),
+            last_present: Some(now),
+            waits_at: waits,
+            ..Self::default()
+        };
+    }
 }
 
 /// Graphics settings the frontend changes while a renderer runs. A renderer that
@@ -114,6 +165,7 @@ pub struct VulkanRasterizer {
     draw: draw::DrawState,
     live: Option<Arc<LiveSettings>>,
     activity: Activity,
+    stalls: Stalls,
     frame_dump: Option<frame_dump::FrameDump>,
 }
 
@@ -284,6 +336,7 @@ impl VulkanRasterizer {
             texture_cache,
             live: None,
             activity: Activity::default(),
+            stalls: Stalls::default(),
             frame_dump: frame_dump::FrameDump::from_env(),
         })
     }
@@ -1240,6 +1293,8 @@ impl Rasterizer for VulkanRasterizer {
 
     fn present(&mut self, framebuffer: &FramebufferConfig) {
         self.activity.presents += 1;
+        self.stalls
+            .present(Instant::now(), &self.draw.shaders, &self.draw.pipelines);
         self.handles.timestamp.frame_presented();
         self.draw.shaders.flush_disk();
         self.draw.shaders.log_stats(Instant::now());
