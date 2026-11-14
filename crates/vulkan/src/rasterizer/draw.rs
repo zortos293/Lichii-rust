@@ -43,7 +43,9 @@ use crate::descriptors::DescriptorAllocator;
 use crate::device::Device;
 use crate::error::Result;
 use crate::memory::{Buffer, BufferView};
-use crate::pipeline::environment::{ProgramEnv, TexturePool, texture_type};
+use crate::pipeline::environment::{
+    ProgramEnv, TexturePool, graphics_program_header, texture_type,
+};
 use crate::pipeline::fixed_state::flags;
 use crate::pipeline::maxwell_to_vk as mvk;
 use crate::pipeline::sampler::{SamplerCaps, SamplerParams, Tsc};
@@ -411,6 +413,8 @@ struct StageState {
     point_size: Option<u32>,
     alpha_test: Option<(CompareFunction, u32)>,
     color_outputs: [AttributeType; 8],
+    noperspective_outputs: u32,
+    scaled_noperspective_inputs: bool,
 }
 
 impl StageState {
@@ -433,6 +437,8 @@ impl StageState {
             point_size: None,
             alpha_test: None,
             color_outputs: [AttributeType::Float; 8],
+            noperspective_outputs: 0,
+            scaled_noperspective_inputs: false,
         };
         if slot == 1 {
             state.generic_inputs = std::array::from_fn(|i| attribute_type(regs, i));
@@ -473,6 +479,8 @@ impl StageState {
             input_topology: self.input_topology,
             fixed_state_point_size: self.point_size.map(f32::from_bits),
             color_output_types: self.color_outputs,
+            noperspective_outputs: self.noperspective_outputs,
+            scaled_noperspective_inputs: self.scaled_noperspective_inputs,
             ..RuntimeInfo::default()
         };
         if let Some((func, reference)) = self.alpha_test {
@@ -968,6 +976,15 @@ impl VulkanRasterizer {
         });
         let features = *self.draw.pipelines.features();
         let arch = self.draw.arch;
+        let passthrough_geometry =
+            enabled(4) && graphics_program_header(ctx, 4, arch).geometry_passthrough();
+        let noperspective = if mesh || !enabled(5) || passthrough_geometry {
+            0
+        } else {
+            graphics_program_header(ctx, 5, arch)
+                .ps()
+                .screen_linear_generics()
+        };
         let mut bindings = Bindings::default();
         let mut previous: Option<Arc<ShaderModule>> = None;
         for (slot, host) in GRAPHICS_SLOTS {
@@ -978,7 +995,7 @@ impl VulkanRasterizer {
             let env = ProgramEnv::graphics(ctx, slot, arch);
             let vertex_a = (slot == 1 && !mesh && regs.pipelines[0].enable() != 0)
                 .then(|| ProgramEnv::graphics(ctx, 0, arch));
-            let state = StageState::new(
+            let mut state = StageState::new(
                 regs,
                 slot,
                 slot == last_pre_raster,
@@ -987,6 +1004,10 @@ impl VulkanRasterizer {
                 color_outputs,
                 &features,
             );
+            if slot == last_pre_raster {
+                state.noperspective_outputs = noperspective;
+            }
+            state.scaled_noperspective_inputs = slot == 5 && noperspective != 0;
             let module = self.draw.shaders.module(
                 vertex_a.as_ref(),
                 &env,
@@ -1485,6 +1506,9 @@ impl VulkanRasterizer {
         let Some((id, mut view)) = self.texture_info(src, raw, desc.ty)? else {
             return Ok(None);
         };
+        if !desc.is_written && self.texture_cache.unwritten(id) {
+            return Ok(None);
+        }
         if desc.is_written
             && self
                 .texture_cache
@@ -1501,6 +1525,19 @@ impl VulkanRasterizer {
         }
         if let Some(format) = storage_format(desc.format) {
             view.format = format;
+        }
+        if desc.is_written {
+            let mut tx = Transfer {
+                scheduler: &mut self.scheduler,
+                staging: &mut self.staging,
+                memory: &self.handles.device,
+            };
+            self.texture_cache.bind_written(
+                &mut tx,
+                id,
+                view.base_level,
+                view.base_layer..view.base_layer + view.layers,
+            )?;
         }
         Ok(self
             .texture_cache
@@ -1548,6 +1585,9 @@ impl VulkanRasterizer {
         let Some((id, view)) = self.texture_info(src, raw, ty)? else {
             return Ok(None);
         };
+        if self.texture_cache.unwritten(id) {
+            return Ok(None);
+        }
         Ok(self
             .texture_cache
             .sampled_view(id, &view)?

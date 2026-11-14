@@ -1633,3 +1633,298 @@ fn depth_and_stencil_views_read_green_as_red() {
     }
     assert_eq!(sampled_swizzle(shadow, vk::ImageAspectFlags::COLOR), shadow);
 }
+
+#[test]
+fn images_over_the_texel_limit_are_sparse_and_bind_what_the_gpu_writes() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let info = ImageInfo {
+        layers: 65,
+        ..rt_info(2048, 2048, 4, GobLayout::Tegra)
+    };
+    assert!(info.texels() > MAX_TEXELS);
+    let layer = 2048 * 2048 * 4;
+    let (mut tx, cache, gmmu) = f.tx();
+    if !cache.can_be_sparse(&info) {
+        eprintln!("skipping: no sparse residency");
+        return;
+    }
+    let found = cache
+        .find(&mut tx, gmmu, GPU_VA, &info)
+        .unwrap()
+        .expect("huge images are cached, not refused");
+    let memory = |cache: &TextureCache| cache.get(found.id).unwrap().image.memory_size();
+    assert!(cache.get(found.id).unwrap().image.is_sparse());
+    assert_eq!(
+        memory(cache),
+        0,
+        "nothing is uploaded or bound for sampling"
+    );
+    let desc = tic(0x08, GPU_VA, 2048, 2048, 65, 1, 4).decode().unwrap();
+    assert_eq!(
+        cache
+            .texture(&mut tx, gmmu, &desc)
+            .unwrap()
+            .map(|(id, _)| id),
+        Some(found.id),
+        "storage writes find the image to bind"
+    );
+    assert!(
+        cache.unwritten(found.id),
+        "an image nothing wrote samples as no image"
+    );
+    cache.bind_written(&mut tx, found.id, 0, 3..4).unwrap();
+    assert_eq!(memory(cache), layer, "the written layer");
+    assert!(!cache.unwritten(found.id));
+    cache.bind_written(&mut tx, found.id, 0, 3..5).unwrap();
+    assert_eq!(memory(cache), 2 * layer, "only the layer not bound yet");
+    assert!(!cache.get(found.id).unwrap().downloadable());
+    let (mut tx, cache, _) = f.tx();
+    cache
+        .clear(
+            &mut tx,
+            Found {
+                id: found.id,
+                level: 0,
+                layer: 0,
+            },
+            ClearValue::Color {
+                value: vk::ClearColorValue {
+                    float32: [0.0, 1.0, 0.0, 1.0],
+                },
+                mask: vk::ColorComponentFlags::RGBA,
+            },
+            Rect {
+                x: 0,
+                y: 0,
+                width: 16,
+                height: 16,
+            },
+            4,
+            1,
+        )
+        .unwrap();
+    cache.bind_written(&mut tx, found.id, 0, 0..6).unwrap();
+    assert_eq!(
+        cache.get(found.id).unwrap().image.memory_size(),
+        6 * layer,
+        "the layers around the bound ones"
+    );
+    let buffer = Buffer::new(
+        &f.device,
+        32 * 4,
+        vk::BufferUsageFlags::TRANSFER_DST,
+        MemoryLocation::GpuToCpu,
+        "readback",
+    )
+    .unwrap();
+    let cmd = f.scheduler.record().unwrap();
+    let raw = f
+        .cache
+        .prepare(cmd, found.id, ImageAccess::TRANSFER_SRC)
+        .unwrap();
+    let region = vk::BufferImageCopy {
+        image_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 4,
+            layer_count: 1,
+        },
+        image_extent: vk::Extent3D {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+        ..Default::default()
+    };
+    // SAFETY: the image is a transfer source and the buffer holds the row.
+    unsafe {
+        f.device.raw.cmd_copy_image_to_buffer(
+            cmd,
+            raw,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            buffer.raw(),
+            &[region],
+        )
+    };
+    f.scheduler.finish().unwrap();
+    let row = buffer.mapped().unwrap();
+    assert!(all_texels(&row[..16 * 4], GREEN), "the cleared texels");
+    assert!(
+        row[16 * 4..].iter().all(|&b| b == 0),
+        "the rest of the bound layer reads zero"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn sparse_images_take_nothing_from_overlaps_through_guest_memory() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let info = ImageInfo {
+        layers: 65,
+        ..rt_info(2048, 2048, 4, GobLayout::Tegra)
+    };
+    let (mut tx, cache, gmmu) = f.tx();
+    if !cache.can_be_sparse(&info) {
+        eprintln!("skipping: no sparse residency");
+        return;
+    }
+    let sparse = cache.find(&mut tx, gmmu, GPU_VA, &info).unwrap().unwrap();
+    let small = rt_info(64, 64, 4, GobLayout::Tegra);
+    for frame in 0..3 {
+        let color = [frame as f32 / 2.0, 0.0, 1.0, 1.0];
+        clear_rt_at(&mut f, GPU_VA + 0x10000, &small, color, Rect::ALL);
+        let (mut tx, cache, gmmu) = f.tx();
+        let again = cache.find(&mut tx, gmmu, GPU_VA, &info).unwrap().unwrap();
+        assert_eq!(again.id, sparse.id);
+    }
+    assert_eq!(
+        f.cache.traffic().downloads,
+        0,
+        "render targets inside a sparse image are not written back to refresh it"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn sparse_images_bind_the_layers_they_join() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let single = rt_info(2048, 2048, 4, GobLayout::Tegra);
+    let info = ImageInfo {
+        layers: 65,
+        ..single
+    };
+    if !f.cache.can_be_sparse(&info) {
+        eprintln!("skipping: no sparse residency");
+        return;
+    }
+    let target = clear_rt(&mut f, &single, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let (mut tx, cache, gmmu) = f.tx();
+    let array = cache.find(&mut tx, gmmu, GPU_VA, &info).unwrap().unwrap();
+    assert_ne!(array.id, target.id);
+    cache.joins.push((target.id, 0, 0));
+    cache.join(&mut tx, array.id).unwrap();
+    assert!(
+        cache.get(target.id).is_none(),
+        "the target joined the array"
+    );
+    assert_eq!(
+        cache.get(array.id).unwrap().image.memory_size(),
+        2048 * 2048 * 4,
+        "the joined layer has memory"
+    );
+    assert!(all_texels(
+        &f.read_image(array.id)[0][..64],
+        [0, 255, 0, 255]
+    ));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn sparse_images_take_the_layers_of_a_join_their_cap_admits() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let source = ImageInfo {
+        layers: 4,
+        ..rt_info(1024, 1024, 4, GobLayout::Tegra)
+    };
+    let info = ImageInfo {
+        layers: 300,
+        ..source
+    };
+    let layer = 1024 * 1024 * 4;
+    if !f.cache.can_be_sparse(&info) {
+        eprintln!("skipping: no sparse residency");
+        return;
+    }
+    f.cache.sparse_cap = 2 * layer;
+    let (mut tx, cache, gmmu) = f.tx();
+    let target = cache
+        .render_target(&mut tx, gmmu, GPU_VA, &source, true)
+        .unwrap()
+        .unwrap();
+    cache
+        .clear(
+            &mut tx,
+            target,
+            ClearValue::Color {
+                value: vk::ClearColorValue {
+                    float32: [0.0, 1.0, 0.0, 1.0],
+                },
+                mask: vk::ColorComponentFlags::RGBA,
+            },
+            Rect::ALL,
+            0,
+            4,
+        )
+        .unwrap();
+    let array = cache.find(&mut tx, gmmu, GPU_VA, &info).unwrap().unwrap();
+    assert_ne!(array.id, target.id);
+    cache.joins.push((target.id, 0, 0));
+    cache.join(&mut tx, array.id).unwrap();
+    assert_eq!(
+        cache.get(array.id).unwrap().image.memory_size(),
+        2 * layer,
+        "the cap admits two layers"
+    );
+    assert!(
+        cache.get(target.id).is_some(),
+        "the source keeps the layers past the cap"
+    );
+    let again = cache.find(&mut tx, gmmu, GPU_VA, &source).unwrap().unwrap();
+    assert_eq!(again.id, target.id);
+    assert!(
+        all_texels(&f.read_image(target.id)[3][..64], [0, 255, 0, 255]),
+        "a layer past the cap survives the source's next lookup"
+    );
+    assert_eq!(f.cache.traffic().uploads, 0);
+    let buffer = Buffer::new(
+        &f.device,
+        16 * 4,
+        vk::BufferUsageFlags::TRANSFER_DST,
+        MemoryLocation::GpuToCpu,
+        "readback",
+    )
+    .unwrap();
+    let cmd = f.scheduler.record().unwrap();
+    let raw = f
+        .cache
+        .prepare(cmd, array.id, ImageAccess::TRANSFER_SRC)
+        .unwrap();
+    let region = vk::BufferImageCopy {
+        image_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 1,
+            layer_count: 1,
+        },
+        image_extent: vk::Extent3D {
+            width: 16,
+            height: 1,
+            depth: 1,
+        },
+        ..Default::default()
+    };
+    // SAFETY: the image is a transfer source and the buffer holds the row.
+    unsafe {
+        f.device.raw.cmd_copy_image_to_buffer(
+            cmd,
+            raw,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            buffer.raw(),
+            &[region],
+        )
+    };
+    f.scheduler.finish().unwrap();
+    assert!(
+        all_texels(&buffer.mapped().unwrap()[..16 * 4], [0, 255, 0, 255]),
+        "a bound layer holds the join's texels"
+    );
+    f.assert_no_validation_errors();
+}
