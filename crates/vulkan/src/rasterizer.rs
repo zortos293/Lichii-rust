@@ -1293,11 +1293,13 @@ impl Rasterizer for VulkanRasterizer {
 
     fn present(&mut self, framebuffer: &FramebufferConfig) {
         self.activity.presents += 1;
+        let now = Instant::now();
         self.stalls
-            .present(Instant::now(), &self.draw.shaders, &self.draw.pipelines);
+            .present(now, &self.draw.shaders, &self.draw.pipelines);
         self.handles.timestamp.frame_presented();
         self.draw.shaders.flush_disk();
-        self.draw.shaders.log_stats(Instant::now());
+        self.draw.pipelines.autosave(now);
+        self.draw.shaders.log_stats(now);
         self.draw.shaders.end_frame();
         for pipeline in self.draw.pipelines.replaced() {
             self.scheduler.retire(pipeline);
