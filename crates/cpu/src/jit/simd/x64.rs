@@ -638,11 +638,22 @@ impl Emitter<'_> {
                 let a = self.reg(a);
                 let d = self.def(v);
                 let slow = self.checked(true, Some(Inputs::scalar(fp, &[a], false)));
+                let src = match word >> 19 & 3 {
+                    3 => a,
+                    rmode => {
+                        let imm = [8, 10, 9][rmode as usize];
+                        match fp {
+                            Fp::S => dynasm!(self.asm ; .arch x64 ; roundss xmm15, Rx(a), imm),
+                            Fp::D => dynasm!(self.asm ; .arch x64 ; roundsd xmm15, Rx(a), imm),
+                        }
+                        15
+                    }
+                };
                 match (fp, signed && !wide) {
-                    (Fp::S, true) => dynasm!(self.asm ; .arch x64 ; cvttss2si eax, Rx(a)),
-                    (Fp::D, true) => dynasm!(self.asm ; .arch x64 ; cvttsd2si eax, Rx(a)),
-                    (Fp::S, false) => dynasm!(self.asm ; .arch x64 ; cvttss2si rax, Rx(a)),
-                    (Fp::D, false) => dynasm!(self.asm ; .arch x64 ; cvttsd2si rax, Rx(a)),
+                    (Fp::S, true) => dynasm!(self.asm ; .arch x64 ; cvttss2si eax, Rx(src)),
+                    (Fp::D, true) => dynasm!(self.asm ; .arch x64 ; cvttsd2si eax, Rx(src)),
+                    (Fp::S, false) => dynasm!(self.asm ; .arch x64 ; cvttss2si rax, Rx(src)),
+                    (Fp::D, false) => dynasm!(self.asm ; .arch x64 ; cvttsd2si rax, Rx(src)),
                 }
                 match (signed, wide) {
                     (true, false) => dynasm!(self.asm

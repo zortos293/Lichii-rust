@@ -99,7 +99,8 @@ pub enum SimdOp {
         x: Value,
         word: u32,
     },
-    /// `FCVTZS`/`FCVTZU` to a W (`wide` false) or X register, zero-extended.
+    /// `FCVTZS`/`FCVTZU` to a W (`wide` false) or X register, zero-extended; also `FCVTNS`,
+    /// `FCVTPS`, `FCVTMS` and their unsigned forms, which round as `word`'s RMode field says first.
     ToInt {
         fp: Fp,
         signed: bool,

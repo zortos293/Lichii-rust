@@ -11,7 +11,7 @@ use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
 
 use super::super::ir::{Loc, Op, Ty, Value, W};
 use super::super::translate::Translator;
-use super::super::x64::{CTX_FPSR, Emitter};
+use super::super::x64::{CTX_FPSR, Emitter, ST_SCRATCH};
 use super::ir::SimdOp;
 use crate::decoder::{Inst, PostIndex, Reg};
 
@@ -34,6 +34,21 @@ static CNT_MASKS: Masks = {
     }
     Masks(m)
 };
+
+/// `0x70` in every byte: added with unsigned saturation to a `TBL` index, it keeps indices below
+/// 16 below `0x80` with the same low nibble and sends every other one to `0x80` or above, which
+/// `PSHUFB` turns into a zero byte.
+#[repr(align(16))]
+struct TableBias([u8; 16]);
+
+static TABLE_BIAS: TableBias = TableBias([0x70; 16]);
+
+/// For `USHL` on S lanes and on D lanes: a mask of each lane's low byte, then 1 in each lane.
+#[repr(align(16))]
+struct ShiftMasks([u32; 8], [u64; 4]);
+
+static SHIFT_MASKS: ShiftMasks =
+    ShiftMasks([0xff, 0xff, 0xff, 0xff, 1, 1, 1, 1], [0xff, 0xff, 1, 1]);
 
 /// Lane-wise operations on two vectors. Comparisons give all ones in a lane where they hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,6 +182,16 @@ pub enum VecOp {
         shift: u8,
         a: Value,
     },
+    /// `USHL` on S or D lanes: each lane of `n` shifted by the signed low byte of `m`'s lane, left
+    /// when it is positive and logically right when negative, giving zero from the lane width on.
+    Ushl(Arrangement, Value, Value),
+    /// `TBL` with one table register: byte `i` is byte `index[i]` of `table`, or zero from 16 on,
+    /// over 16 bytes when `q` is set and else the low 8.
+    Table {
+        q: bool,
+        table: Value,
+        index: Value,
+    },
 }
 
 impl VecOp {
@@ -187,7 +212,11 @@ impl VecOp {
             }
             | VecOp::Ext { n: a, m: b, .. }
             | VecOp::Zip { n: a, m: b, .. }
-            | VecOp::AddWide { n: a, m: b, .. } => {
+            | VecOp::AddWide { n: a, m: b, .. }
+            | VecOp::Ushl(_, a, b)
+            | VecOp::Table {
+                table: a, index: b, ..
+            } => {
                 f(a);
                 f(b);
             }
@@ -253,6 +282,18 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
     let arrangement = Arrangement { size, q };
     let vec = |t: &mut Translator, r: u8| t.op(Op::Get(Loc::V(r)));
     let emit = |t: &mut Translator, op: VecOp| t.op(Op::Simd(SimdOp::Vec(op)));
+    if word & 0xbfe0_fc00 == 0x0e00_0000 && t.sse41 {
+        let (table, index) = (vec(t, rn), vec(t, rm));
+        let r = emit(t, VecOp::Table { q, table, index });
+        t.set(Loc::V(rd), r);
+        return true;
+    }
+    if word & 0xbf20_fc00 == 0x2e20_4400 && t.avx2 && (size == 2 || (size == 3 && q)) {
+        let (n, m) = (vec(t, rn), vec(t, rm));
+        let r = emit(t, VecOp::Ushl(arrangement, n, m));
+        t.set(Loc::V(rd), r);
+        return true;
+    }
     if word & 0x9f20_fc00 == 0x0e20_1c00 && u && size != 0 {
         let op = [Select::Bsl, Select::Bit, Select::Bif][size as usize - 1];
         let (old, n, m) = (vec(t, rd), vec(t, rn), vec(t, rm));
@@ -321,13 +362,34 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         t.set(Loc::V(rd), r);
         return true;
     }
-    if word & 0xbf3f_fc00 == 0x0e20_9800 {
-        if (size == 3 && !q) || !supported(t, Binary::CmEq, size) {
+    if word & 0x9f3f_ec00 == 0x0e20_8800 || word & 0xbf3f_fc00 == 0x0e20_a800 {
+        let (op, swap) = match (field(word, 12, 2), u) {
+            (0, false) => (Binary::CmGt, false),
+            (0, true) => (Binary::CmGe, false),
+            (1, false) => (Binary::CmEq, false),
+            (1, true) => (Binary::CmGe, true),
+            _ => (Binary::CmGt, true),
+        };
+        if (size == 3 && !q) || !supported(t, op, size) {
             return false;
         }
         let a = vec(t, rn);
         let zero = emit(t, VecOp::Imm(0, true));
-        let r = emit(t, VecOp::Binary(Binary::CmEq, arrangement, a, zero));
+        let (a, b) = if swap { (zero, a) } else { (a, zero) };
+        let r = emit(t, VecOp::Binary(op, arrangement, a, b));
+        t.set(Loc::V(rd), r);
+        return true;
+    }
+    if word & 0x9fbf_fc00 == 0x0ea0_f800 && (q || size == 2) {
+        let sign = if size == 3 {
+            1 << 63
+        } else {
+            0x8000_0000_8000_0000
+        };
+        let a = vec(t, rn);
+        let mask = emit(t, VecOp::Imm(sign, true));
+        let op = if u { Binary::Eor } else { Binary::Bic };
+        let r = emit(t, VecOp::Binary(op, arrangement, a, mask));
         t.set(Loc::V(rd), r);
         return true;
     }
@@ -1146,6 +1208,51 @@ impl Emitter<'_> {
                     dynasm!(self.asm ; .arch x64 ; punpcklqdq Rx(d), Rx(d));
                 }
                 return;
+            }
+            VecOp::Table { q, table, index } => {
+                let (table, index) = (self.reg(table), self.reg(index));
+                let d = self.def(v);
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; mov rax, QWORD TABLE_BIAS.0.as_ptr() as i64
+                    ; movdqa Rx(SCRATCH), Rx(index)
+                    ; paddusb Rx(SCRATCH), [rax]
+                );
+                self.copy(d, table);
+                dynasm!(self.asm ; .arch x64 ; pshufb Rx(d), Rx(SCRATCH));
+                (d, q)
+            }
+            VecOp::Ushl(Arrangement { size, q }, n, m) => {
+                let (n, m) = (self.reg(n), self.reg(m));
+                let d = self.def(v);
+                let masks = match size {
+                    2 => SHIFT_MASKS.0.as_ptr() as i64,
+                    _ => SHIFT_MASKS.1.as_ptr() as i64,
+                };
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; mov rax, QWORD masks
+                    ; movdqa Rx(SCRATCH), Rx(m)
+                    ; pand Rx(SCRATCH), [rax]
+                    ; movdqu [r13 + ST_SCRATCH], Rx(SCRATCH)
+                    ; pxor Rx(SCRATCH), [rax]
+                );
+                match size {
+                    2 => dynasm!(self.asm
+                        ; .arch x64
+                        ; paddd Rx(SCRATCH), [rax + 16]
+                        ; vpsrlvd Rx(SCRATCH), Rx(n), Rx(SCRATCH)
+                        ; vpsllvd Rx(d), Rx(n), [r13 + ST_SCRATCH]
+                    ),
+                    _ => dynasm!(self.asm
+                        ; .arch x64
+                        ; paddq Rx(SCRATCH), [rax + 16]
+                        ; vpsrlvq Rx(SCRATCH), Rx(n), Rx(SCRATCH)
+                        ; vpsllvq Rx(d), Rx(n), [r13 + ST_SCRATCH]
+                    ),
+                }
+                dynasm!(self.asm ; .arch x64 ; por Rx(d), Rx(SCRATCH));
+                (d, q)
             }
             VecOp::Cnt(q, a) => {
                 let a = self.reg(a);
