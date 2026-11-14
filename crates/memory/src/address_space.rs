@@ -572,6 +572,26 @@ impl AddressSpace {
     #[inline(never)]
     fn flush_trap(&self, va: VAddr) {
         if let Some(pa) = self.physical_address(va) {
+            {
+                use std::collections::HashMap;
+                static HITS: parking_lot::Mutex<Option<(HashMap<VAddr, u64>, std::time::Instant)>> =
+                    parking_lot::Mutex::new(None);
+                let mut hits = HITS.lock();
+                let (map, last) = hits.get_or_insert_with(|| (HashMap::new(), std::time::Instant::now()));
+                let n = map.entry(va & !PAGE_MASK).or_insert(0);
+                *n += 1;
+                if *n <= 3 {
+                    tracing::info!(va = format_args!("{va:#x}"), pa = format_args!("{pa:#x}"), thread = ?std::thread::current().name(), "DIAG CPU flush trap");
+                }
+                if last.elapsed() >= std::time::Duration::from_secs(5) {
+                    *last = std::time::Instant::now();
+                    let mut top: Vec<_> = map.iter().map(|(k, v)| (*k, *v)).collect();
+                    top.sort_by_key(|e| std::cmp::Reverse(e.1));
+                    top.truncate(12);
+                    let top: Vec<String> = top.iter().map(|(k, v)| format!("{k:#x}:{v}")).collect();
+                    tracing::info!(pages = map.len(), top = ?top, "DIAG CPU trap pages");
+                }
+            }
             self.flush_physical(pa & !PAGE_MASK);
         }
     }
