@@ -10,10 +10,10 @@ use lichii_gpu::backend::{
     ReleaseSize,
 };
 use lichii_gpu::engines::maxwell_3d::regs::{
-    ClearSurface, DepthMode, IndexFormat, MAX_CONST_BUFFERS, MAX_SHADER_STAGE, MESH_CONTROL,
-    MESH_INIT_SHADER, MESH_SHADER_A, MESH_SHADER_B, PipelineBits, PrimitiveTopology,
-    RenderTargetConfigBits, RtControl, ScissorTestBits, ScissorTestBits1, ShaderType,
-    SurfaceClipBits, SurfaceClipBits1, TileMode, VertexAttribute, VertexStreamBits,
+    BlendEquation, BlendFactor, ClearSurface, DepthMode, IndexFormat, MAX_CONST_BUFFERS,
+    MAX_SHADER_STAGE, MESH_CONTROL, MESH_INIT_SHADER, MESH_SHADER_A, MESH_SHADER_B, PipelineBits,
+    PrimitiveTopology, RenderTargetConfigBits, RtControl, ScissorTestBits, ScissorTestBits1,
+    ShaderType, SurfaceClipBits, SurfaceClipBits1, TileMode, VertexAttribute, VertexStreamBits,
 };
 use lichii_gpu::engines::maxwell_3d::{DirtyState, Regs};
 use lichii_gpu::gmmu::Gmmu;
@@ -262,6 +262,55 @@ fn draws_hand_assembled_programs_and_reads_the_target_back() {
         binding(fragment),
         (1, DescriptorKind::UniformBuffer),
         "the fragment stage numbers its bindings after the vertex stage's"
+    );
+    f.assert_no_validation_errors();
+}
+
+/// Render target 0 blended with source factor SOURCE1_COLOR takes the fragment program's second
+/// colour output (render target 1's registers) as the factor, as the hardware does.
+#[test]
+fn second_source_blend_factors_read_the_second_colour_output() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    if !f.rasterizer.draw.pipelines.features().dual_src_blend {
+        return;
+    }
+    let mut header = header(2, ShaderType::PIXEL);
+    header[18] = 0xff;
+    let code: Vec<u64> = (0..8).map(|r| mov_cbuf(r, r * 4)).chain([exit()]).collect();
+    write(&f, PROGRAMS + u64::from(FRAGMENT), &program(header, &code));
+    write(
+        &f,
+        FRAGMENT_CBUF,
+        &f32_bytes(&[1.0, 0.5, 1.0, 1.0, 0.5, 1.0, 0.0, 1.0]),
+    );
+    let mut regs = draw_regs();
+    regs.blend.enable[0] = 1;
+    regs.blend.color_op = BlendEquation::ADD_GL;
+    regs.blend.color_source = BlendFactor::SOURCE1_COLOR_GL;
+    regs.blend.color_dest = BlendFactor::ZERO_GL;
+    regs.blend.alpha_op = BlendEquation::ADD_GL;
+    regs.blend.alpha_source = BlendFactor::ONE_GL;
+    regs.blend.alpha_dest = BlendFactor::ZERO_GL;
+    draw(&mut f, &gmmu, &regs);
+    let texels = target(&mut f);
+    assert!(
+        texels.iter().all(|&t| t == [128, 128, 0, 255]),
+        "colour 0 times colour 1 everywhere: {:?}",
+        &texels[..4]
+    );
+    let Some(fragment) = &f.rasterizer.draw.stages[4] else {
+        panic!("fragment module bound");
+    };
+    const OP_DECORATE: u32 = 71;
+    const INDEX: u32 = 32;
+    assert!(
+        fragment
+            .spirv
+            .windows(4)
+            .any(|w| w[0] == (4 << 16 | OP_DECORATE) && w[2] == INDEX && w[3] == 1),
+        "colour output 1 is the second blend source (Location 0, Index 1)"
     );
     f.assert_no_validation_errors();
 }
