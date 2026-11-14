@@ -371,17 +371,24 @@ impl Kernel {
             );
         }
         let inner = self.0.clone();
+        let (hand_over, handed) = std::sync::mpsc::channel::<Vec<JoinHandle<()>>>();
         let teardown = std::thread::Builder::new()
             .name("kernel teardown".into())
             .spawn(move || {
-                for join in busy {
+                for join in handed.recv().unwrap_or_default() {
                     join_noting_slow(join);
                 }
                 inner.release_processes();
             });
         if let Err(error) = teardown {
-            tracing::error!(%error, "cannot start the kernel teardown thread");
+            tracing::error!(%error, "cannot start the kernel teardown thread; waiting here");
+            for join in busy {
+                join_noting_slow(join);
+            }
+            self.0.release_processes();
+            return;
         }
+        let _ = hand_over.send(busy);
     }
 
     /// Stops running guest code: every core puts its thread back in its run queue and idles until
