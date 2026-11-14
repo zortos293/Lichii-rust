@@ -1311,9 +1311,8 @@ impl Rasterizer for VulkanRasterizer {
 }
 
 impl Drop for VulkanRasterizer {
-    /// Waits for the GPU, then frees the caches on their own threads while the other fields
-    /// drop: freeing thousands of images and buffers is driver-bound and would otherwise hold
-    /// up the GPU thread's stop.
+    /// Waits for the GPU, then frees the texture and buffer caches on their own threads while
+    /// the other fields drop on this one.
     fn drop(&mut self) {
         if self.scheduler.finish().is_err() {
             self.device.wait_idle();
