@@ -23,7 +23,8 @@ use lichii_common::settings::{AstcRecompression, GraphicsSettings, ResolutionSca
 use lichii_gpu::backend::ChannelId;
 use lichii_gpu::backend::{
     Blit, BlitOperation, ComputeContext, DrawParams, DrawTexture, FenceAction, FramebufferConfig,
-    GpuHandles, GraphicsContext, IndirectDraw, Query, QueryKind, Rasterizer, ReleaseSize,
+    GpuHandles, GraphicsContext, ImageCopy, IndirectDraw, Query, QueryKind, Rasterizer,
+    ReleaseSize,
 };
 use lichii_gpu::engines::maxwell_3d::Regs;
 use lichii_gpu::engines::maxwell_3d::regs::NUM_RENDER_TARGETS;
@@ -393,6 +394,7 @@ impl VulkanRasterizer {
                     scheduler: &mut self.scheduler,
                     staging: &mut self.staging,
                     memory: &self.handles.device,
+                    buffers: &mut self.buffer_cache,
                 };
                 if let Some(target) = self
                     .texture_cache
@@ -438,6 +440,7 @@ impl VulkanRasterizer {
                     scheduler: &mut self.scheduler,
                     staging: &mut self.staging,
                     memory: &self.handles.device,
+                    buffers: &mut self.buffer_cache,
                 };
                 if let Some(target) = self.texture_cache.render_target(
                     &mut tx,
@@ -762,6 +765,7 @@ impl VulkanRasterizer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
             memory: &self.handles.device,
+            buffers: &mut self.buffer_cache,
         };
         self.texture_cache
             .flush(&mut tx, fb.address, size as u64)
@@ -954,6 +958,7 @@ impl Rasterizer for VulkanRasterizer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
             memory: &self.handles.device,
+            buffers: &mut self.buffer_cache,
         };
         let blitted = self.texture_cache.blit(
             &mut tx,
@@ -976,6 +981,31 @@ impl Rasterizer for VulkanRasterizer {
             }
             Err(error) => {
                 tracing::error!(%error, "blitting on the GPU failed; blitting in software");
+                false
+            }
+        }
+    }
+
+    fn accelerate_image_copy(
+        &mut self,
+        _channel: ChannelId,
+        memory: &Gmmu,
+        copy: &ImageCopy,
+    ) -> bool {
+        let mut tx = Transfer {
+            scheduler: &mut self.scheduler,
+            staging: &mut self.staging,
+            memory: &self.handles.device,
+            buffers: &mut self.buffer_cache,
+        };
+        match self.texture_cache.copy_to_buffer(&mut tx, memory, copy) {
+            Ok(true) => {
+                self.unflushed = true;
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                tracing::error!(%error, "copying an image to a buffer on the GPU failed; copying in software");
                 false
             }
         }
@@ -1085,6 +1115,7 @@ impl Rasterizer for VulkanRasterizer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
             memory: &self.handles.device,
+            buffers: &mut self.buffer_cache,
         };
         if let Err(error) = self.texture_cache.invalidate(&mut tx, addr, size) {
             tracing::error!(%error, "writing back GPU-modified images before a CPU write failed");
@@ -1105,6 +1136,7 @@ impl Rasterizer for VulkanRasterizer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
             memory: &self.handles.device,
+            buffers: &mut self.buffer_cache,
         };
         if let Err(error) = self.texture_cache.flush(&mut tx, addr, size) {
             tracing::error!(%error, "flushing GPU-modified images failed");
@@ -1201,6 +1233,7 @@ impl Rasterizer for VulkanRasterizer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
             memory: &self.handles.device,
+            buffers: &mut self.buffer_cache,
         };
         let device = &self.device;
         if let Err(error) = self
