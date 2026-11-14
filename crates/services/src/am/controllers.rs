@@ -89,7 +89,14 @@ impl Service for CommonStateGetter {
                 applet.state.lock().vr_mode = ctx.command() == 53;
                 ResultCode::SUCCESS
             }
-            52 | 66 | 900 => ResultCode::SUCCESS,
+            66 => {
+                let mode: u32 = ctx.pop();
+                if let Some(apm) = self.context.apm.get() {
+                    apm.set_cpu_boost_mode(mode);
+                }
+                ResultCode::SUCCESS
+            }
+            52 | 900 => ResultCode::SUCCESS,
             55 => push_bool(ctx, false),
             60 => {
                 let resolution: [i32; 2] = if docked { [1920, 1080] } else { [1280, 720] };
