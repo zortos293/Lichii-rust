@@ -30,6 +30,7 @@ use crate::host::Reduction;
 use crate::host1x::Syncpoints;
 use crate::lazy::LazyDeviceRanges;
 use crate::semaphore_mirror::{self, FirstPage};
+use crate::throttle::Throttle;
 pub use crate::written_pages::GpuWrittenPages;
 
 /// A GPU channel (one per nvhost-gpu channel or NVN2 queue).
@@ -629,7 +630,14 @@ impl Rasterizer for NullRasterizer {
 
     fn query(&mut self, _channel: ChannelId, memory: &Gmmu, query: &Query) {
         let Some(address) = memory.translate(query.address) else {
-            tracing::warn!(address = query.address, "query to unmapped GPU memory");
+            static UNMAPPED: Throttle = Throttle::new();
+            if let Some(dropped) = UNMAPPED.allow() {
+                tracing::warn!(
+                    address = query.address,
+                    dropped,
+                    "query to unmapped GPU memory"
+                );
+            }
             return;
         };
         let value = match query.kind {
