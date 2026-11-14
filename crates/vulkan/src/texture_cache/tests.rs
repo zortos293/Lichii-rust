@@ -2747,3 +2747,50 @@ fn single_slice_volumes_of_a_deeper_block_sync_on_the_gpu() {
     assert_eq!(f.read_image(texture)[0], want);
     f.assert_no_validation_errors();
 }
+
+#[test]
+fn subresources_split_across_device_ranges_sync_every_part() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    for va in [GPU_VA + (1 << 30), GPU_VA + (2 << 30)] {
+        f.gmmu
+            .map(va, DADDR + 0x10_0000, 0x1_0000, 0, false)
+            .unwrap();
+        f.gmmu
+            .map(va + 0x1_0000, DADDR + 0x30_0000, 0x1_0000, 0, false)
+            .unwrap();
+    }
+    let header = tic(0x08, GPU_VA + (1 << 30), 128, 256, 1, 1, 4);
+    let pattern: Vec<u8> = (0..0x1_0000).map(|i: u32| (i * 7 + i / 89) as u8).collect();
+    f.memory.write_bytes(DADDR + 0x10_0000, &pattern).unwrap();
+    f.memory.write_bytes(DADDR + 0x30_0000, &pattern).unwrap();
+    let (texture, _) = f.texture(&header);
+    assert_eq!(f.cache.get(texture).unwrap().segments.len(), 2);
+    let target = rt_info(256, 128, 4, GobLayout::Tegra);
+    let found = clear_rt_at(
+        &mut f,
+        GPU_VA + (2 << 30),
+        &target,
+        [0.0, 1.0, 0.0, 1.0],
+        Rect::ALL,
+    );
+    assert_ne!(found.id, texture);
+    let traffic = f.cache.traffic();
+    assert_eq!(f.texture(&header).0, texture);
+    let after = f.cache.traffic();
+    assert_eq!(
+        after.downloads, traffic.downloads,
+        "no write-back to guest memory"
+    );
+    assert_eq!(after.gpu_syncs, traffic.gpu_syncs + 1);
+    assert!(
+        f.read_image(texture)[0]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|t| *t == [0, 255, 0, 255]),
+        "both device ranges take the render target's texels"
+    );
+    f.assert_no_validation_errors();
+}

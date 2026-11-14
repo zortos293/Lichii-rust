@@ -10,7 +10,7 @@ use lichii_texture::PixelFormat;
 use lichii_texture::block_linear::GobLayout;
 
 use super::{
-    CachedImage, GuestLayout, ImageId, ImageKind, ResolutionScale, TextureCache, Transfer,
+    CachedImage, GuestLayout, ImageId, ImageKind, ResolutionScale, Segment, TextureCache, Transfer,
 };
 use crate::commands::ImageAccess;
 use crate::descriptors::DescriptorAllocator;
@@ -66,6 +66,7 @@ pub(super) struct GuestSync {
     guest: Option<Buffer>,
     linear: Option<Buffer>,
     stencil: Option<Buffer>,
+    scratch: RunScratch,
 }
 
 impl GuestSync {
@@ -81,6 +82,7 @@ impl GuestSync {
             guest: None,
             linear: None,
             stencil: None,
+            scratch: RunScratch::default(),
         })
     }
 }
@@ -133,29 +135,52 @@ struct Run {
     at: u64,
 }
 
-/// Where the bytes of `image` land in the guest bytes buffer, which holds the offsets
-/// `window` of `target`: one run per pair of their segments sharing device memory.
-fn runs<'a>(
-    image: &'a CachedImage,
-    target: &'a CachedImage,
+/// Reused storage for [`shared_runs`]: the target's segments by device address, and the runs.
+#[derive(Default)]
+struct RunScratch {
+    targets: Vec<Segment>,
+    runs: Vec<Run>,
+}
+
+/// Fills `scratch.runs`, by image offset, with where the bytes of `image` land in the
+/// guest bytes buffer, which holds the offsets `window` of `target`: one run per pair of
+/// their segments sharing device memory. False when two of the target's segments share device
+/// memory, which the search can't place.
+fn shared_runs(
+    image: &CachedImage,
+    target: &CachedImage,
     window: (u64, u64),
-) -> impl Iterator<Item = Run> + 'a {
-    image.segments.iter().flat_map(move |s| {
-        target.segments.iter().filter_map(move |t| {
-            let lo = s.daddr.max(t.daddr);
-            let hi = (s.daddr + s.size).min(t.daddr + t.size);
-            if lo >= hi {
-                return None;
-            }
+    scratch: &mut RunScratch,
+) -> bool {
+    let RunScratch { targets, runs } = scratch;
+    targets.clear();
+    targets.extend_from_slice(&target.segments);
+    targets.sort_unstable_by_key(|t| t.daddr);
+    if targets
+        .windows(2)
+        .any(|t| t[0].daddr + t[0].size > t[1].daddr)
+    {
+        return false;
+    }
+    runs.clear();
+    for s in &image.segments {
+        let end = s.daddr + s.size;
+        let first = targets.partition_point(|t| t.daddr + t.size <= s.daddr);
+        for t in targets[first..].iter().take_while(|t| t.daddr < end) {
+            let (lo, hi) = (s.daddr.max(t.daddr), end.min(t.daddr + t.size));
             let offset = t.offset + (lo - t.daddr);
             let (from, to) = (offset.max(window.0), (offset + (hi - lo)).min(window.1));
-            (from < to).then(|| Run {
-                from: s.offset + (lo - s.daddr) + (from - offset),
-                size: to - from,
-                at: from - window.0,
-            })
-        })
-    })
+            if from < to {
+                runs.push(Run {
+                    from: s.offset + (lo - s.daddr) + (from - offset),
+                    size: to - from,
+                    at: from - window.0,
+                });
+            }
+        }
+    }
+    runs.sort_unstable_by_key(|r| r.from);
+    true
 }
 
 fn barrier(device: &Device, cmd: vk::CommandBuffer) {
@@ -222,17 +247,36 @@ impl TextureCache {
         {
             return Ok(false);
         }
-        let whole = (0, image.info.size_bytes());
-        let window = if packing(image) == Some(Packing::Plain) {
-            newer
-                .iter()
-                .flat_map(|&o| runs(self.get(o).expect("overlaps are live"), image, whole))
-                .fold((u64::MAX, 0), |(lo, hi), r| {
-                    (lo.min(r.at), hi.max(r.at + r.size))
-                })
-        } else {
-            whole
+        if self.guest_sync.is_none() {
+            self.guest_sync = Some(GuestSync::new(&self.device)?);
+        }
+        let Self {
+            slots, guest_sync, ..
+        } = self;
+        let live = |id: ImageId| {
+            slots[id.index as usize]
+                .image
+                .as_ref()
+                .expect("a live image id")
         };
+        let scratch = &mut guest_sync.as_mut().expect("just created").scratch;
+        let image = live(id);
+        let whole = (0, image.info.size_bytes());
+        if !shared_runs(image, image, whole, scratch) {
+            return Ok(false);
+        }
+        let mut window = whole;
+        if packing(image) == Some(Packing::Plain) {
+            window = (u64::MAX, 0);
+            for &o in newer.iter() {
+                if !shared_runs(live(o), image, whole, scratch) {
+                    return Ok(false);
+                }
+                for r in &scratch.runs {
+                    window = (window.0.min(r.at), window.1.max(r.at + r.size));
+                }
+            }
+        }
         if window.0 >= window.1 {
             return Ok(false);
         }
@@ -245,9 +289,6 @@ impl TextureCache {
             linear =
                 linear.max(u64::from(w) * u64::from(h) * u64::from(info.format.bytes_per_block()));
             stencil = stencil.max((u64::from(w) * u64::from(h)).next_multiple_of(4));
-        }
-        if self.guest_sync.is_none() {
-            self.guest_sync = Some(GuestSync::new(&self.device)?);
         }
         let device = self.device.clone();
         let sync = self.guest_sync.as_mut().expect("just created");
@@ -339,6 +380,8 @@ impl TextureCache {
             vk::ImageAspectFlags::DEPTH
         };
         let sync = guest_sync.as_mut().expect("created by sync_on_gpu");
+        let placed = shared_runs(image, target, window, &mut sync.scratch);
+        debug_assert!(placed, "checked by sync_on_gpu");
         let guest = sync.guest.as_ref().expect("ensured").raw();
         let linear = sync.linear.as_ref().expect("ensured").raw();
         let stencil = sync.stencil.as_ref().expect("ensured").raw();
@@ -355,13 +398,13 @@ impl TextureCache {
             for level in 0..levels {
                 let start = info.subresource_offset(level, layer);
                 let end = start + info.level_size(level);
-                let shared = || {
-                    runs(image, target, window)
-                        .filter(move |r| r.from < end && start < r.from + r.size)
-                };
-                if shared().next().is_none() {
+                let runs = &sync.scratch.runs;
+                let first = runs.partition_point(|r| r.from + r.size <= start);
+                let count = runs[first..].iter().take_while(|r| r.from < end).count();
+                if count == 0 {
                     continue;
                 }
+                let shared = first..first + count;
                 let tiling = info.surface().level_tiling(level);
                 let (w, h, _) = info.level_extent(level);
                 let row_words = w * tiling.bytes_per_block / 4;
@@ -381,7 +424,9 @@ impl TextureCache {
                 };
                 let groups = [row_words.div_ceil(GROUP[0]), h.div_ceil(GROUP[1]), 1];
                 let keep = direction == Direction::ToGuest
-                    || !shared().any(|r| r.from <= start && end <= r.from + r.size);
+                    || !sync.scratch.runs[shared.clone()]
+                        .iter()
+                        .any(|r| r.from <= start && end <= r.from + r.size);
                 // SAFETY: `cmd` is recording outside any rendering; the image is in `layout`,
                 // which copies both ways allow, and every buffer holds the subresource's texels.
                 unsafe {
@@ -411,7 +456,8 @@ impl TextureCache {
                         }
                     }
                     barrier(&device, cmd);
-                    for run in shared() {
+                    for index in shared.clone() {
+                        let run = sync.scratch.runs[index];
                         let set = sync
                             .descriptors
                             .allocate(tx.scheduler, sync.compute.set_layout)?;
