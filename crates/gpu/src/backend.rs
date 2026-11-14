@@ -360,6 +360,7 @@ impl FenceAction {
                     ReleaseSize::Sixteen => 4,
                 }];
                 let bytes = 4 * words.len() as u64;
+                crate::diag_sem::rec("sem-write", address, value, bytes, 0);
                 let mirror = handles.syncpoints.semaphore_mirror();
                 let mut page = mirror.first_page(address);
                 let mirrored = mirror.mirror_of(address);
@@ -405,6 +406,13 @@ impl FenceAction {
                     old = current;
                 }
                 let after = op.apply(old, payload, signed);
+                crate::diag_sem::rec(
+                    "sem-reduce",
+                    address,
+                    (op as u64) << 33 | u64::from(signed) << 32 | u64::from(payload),
+                    u64::from(old),
+                    u64::from(after),
+                );
                 let seen = match &mut page {
                     Some(page) => page.combine(address, old, after, |current| {
                         op.apply(current, payload, signed)

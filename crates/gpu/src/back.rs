@@ -390,6 +390,7 @@ impl Back {
             return;
         };
         let Some(daddr) = channel.setup.memory.translate(address) else {
+            crate::diag_sem::drop("drop-release", address, payload, size as u64, 0);
             static UNMAPPED: Throttle = Throttle::new();
             if let Some(dropped) = UNMAPPED.allow() {
                 tracing::warn!(address, dropped, "semaphore release to unmapped GPU memory");

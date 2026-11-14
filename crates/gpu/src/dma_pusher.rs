@@ -299,6 +299,7 @@ impl FrontChannel {
                     address,
                     wide,
                 );
+                crate::diag_sem::dump(channel, self.memory.translate(address), address);
                 tracing::warn!(
                     channel,
                     method = format_args!("{method:#x}"),
@@ -623,6 +624,13 @@ impl Dispatch<'_> {
         if let Some(device) = self.memory.translate(address) {
             self.shared.waiters.add(self.id, device, payload, op, wide);
         }
+        crate::diag_sem::rec(
+            "acquire",
+            self.memory.translate(address).unwrap_or(0),
+            address,
+            payload,
+            u64::from(self.id.0) << 32 | u64::from(method) << 8 | op as u64,
+        );
         if semaphore_met(
             self.memory,
             self.shared.syncpoints.semaphore_mirror(),

@@ -344,6 +344,13 @@ impl KeplerCompute {
         if launch.block.contains(&0) || (indirect.is_none() && launch.grid.contains(&0)) {
             return;
         }
+        crate::diag_sem::rec(
+            "dispatch",
+            launch.program,
+            u64::from(launch.grid[0]) << 32 | u64::from(launch.grid[1]) << 16 | u64::from(launch.grid[2]),
+            u64::from(ctx.channel.0),
+            u64::from(launch.block[0]) << 32 | u64::from(launch.block[1]) << 16 | u64::from(launch.block[2]),
+        );
         let tic = &self.regs.tic;
         let tsc = &self.regs.tsc;
         let start = ctx.activity.begin_call(RendererCall::Dispatch);
@@ -408,6 +415,7 @@ fn perform_release(ctx: &mut EngineContext<'_>, release: &Release) {
                 .memory
                 .read_block(address, &mut probe[..if timestamped { 16 } else { 4 }])
             {
+                crate::diag_sem::drop("drop-compute-release", address, u64::from(payload), timestamped as u64, 0);
                 static UNMAPPED: Throttle = Throttle::new();
                 if let Some(dropped) = UNMAPPED.allow() {
                     tracing::warn!(

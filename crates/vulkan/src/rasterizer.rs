@@ -1013,6 +1013,7 @@ impl Rasterizer for VulkanRasterizer {
 
     fn query(&mut self, _channel: ChannelId, memory: &Gmmu, query: &Query) {
         let Some(address) = memory.translate(query.address) else {
+            lichii_gpu::diag_sem::drop("drop-query", query.address, query.payload, u64::from(matches!(query.kind, QueryKind::Payload)), 0);
             static UNMAPPED: Throttle = Throttle::new();
             if let Some(dropped) = UNMAPPED.allow() {
                 tracing::warn!(

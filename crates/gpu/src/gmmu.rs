@@ -337,6 +337,14 @@ impl Gmmu {
             && offset + size_of::<T>() as u64 <= page
             && self.device.write(pte.daddr() + offset, value).is_ok()
         {
+            let bytes = bytemuck::bytes_of(&value);
+            crate::diag_sem::rec(
+                "gmmu-write",
+                gpu_va,
+                bytes.get(..4).map_or(0, |w| u64::from(u32::from_le_bytes(w.try_into().unwrap()))),
+                bytes.len() as u64,
+                pte.daddr() + offset,
+            );
             return Ok(());
         }
         self.write_block(gpu_va, bytemuck::bytes_of(&value))
@@ -380,6 +388,13 @@ impl Gmmu {
     /// Writes `data` across any number of mappings. Writes to sparse memory are dropped; the
     /// first unmapped or read-only address is the error, with the rest still written.
     pub fn write_block(&self, gpu_va: GpuVAddr, data: &[u8]) -> Result<(), GpuFault> {
+        crate::diag_sem::rec(
+            "gmmu-write",
+            gpu_va,
+            data.get(..4).map_or(0, |w| u64::from(u32::from_le_bytes(w.try_into().unwrap()))),
+            data.len() as u64,
+            self.translate(gpu_va).unwrap_or(0),
+        );
         let mut fault = None;
         let mut done = 0;
         self.for_each_range(gpu_va, data.len() as u64, |range| {
