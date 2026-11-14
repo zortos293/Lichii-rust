@@ -13,8 +13,10 @@ pub struct Throttle {
 }
 
 impl Throttle {
+    /// Shortest gap between two logged occurrences, in milliseconds.
     pub const PERIOD_MS: u64 = 5_000;
 
+    /// A throttle that lets its first occurrence through at once, with nothing dropped yet.
     pub const fn new() -> Self {
         Self {
             next: AtomicU64::new(0),
