@@ -397,7 +397,7 @@ impl Thread {
         let s = self.sched.lock();
         let ctx = self.context.lock();
         format!(
-            "thread={} state={:?} priority={} base={} core={} affinity={:#x} wait={} waits_on={} pc={:#x} lr={:#x} lock_owner={lock_owner:?} lenders={lenders:?}",
+            "thread={} state={:?} priority={} base={} core={} affinity={:#x} wait={} pinned={} waits_on={} pc={:#x} lr={:#x} lock_owner={lock_owner:?} lenders={lenders:?}",
             self.id,
             s.state,
             s.priority,
@@ -405,6 +405,7 @@ impl Thread {
             s.active_core,
             s.affinity,
             s.wait,
+            s.pinned,
             waits_on.unwrap_or("-"),
             ctx.pc,
             ctx.x[30],
