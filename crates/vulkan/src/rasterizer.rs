@@ -1104,6 +1104,39 @@ impl Rasterizer for VulkanRasterizer {
         self.unflushed || !self.fences.is_empty()
     }
 
+    fn synchronize_region(&mut self, addr: DAddr, size: u64) {
+        let end = addr.saturating_add(size);
+        let mirror = lichii_gpu::semaphore_mirror::REGION_SIZE / 2;
+        let lands = |address: DAddr, bytes: u64| address < end && addr < address + bytes;
+        let writes = |address: DAddr, bytes: u64| {
+            lands(address, bytes) || lands(address.wrapping_sub(mirror), bytes)
+        };
+        let release_bytes = |size: ReleaseSize| match size {
+            ReleaseSize::Four => 4,
+            ReleaseSize::Eight => 8,
+            ReleaseSize::Sixteen => 16,
+        };
+        let last = self.fences.iter().rev().find_map(|&(tick, release)| {
+            let hit = match release {
+                Release::Action(FenceAction::WriteSemaphore { address, size, .. })
+                | Release::Samples { address, size, .. } => writes(address, release_bytes(size)),
+                Release::Action(FenceAction::ReduceSemaphore { address, .. }) => writes(address, 4),
+                Release::Action(FenceAction::IncrementSyncpoint(_))
+                | Release::SamplesReset(_)
+                | Release::SamplesFold(_) => false,
+            };
+            hit.then_some(tick)
+        });
+        if let Some(tick) = last {
+            self.flush();
+            if let Err(error) = self.scheduler.wait(tick) {
+                tracing::error!(%error, "waiting for GPU work failed");
+            }
+        }
+        self.release_fences(false);
+        self.flush_region(addr, size);
+    }
+
     fn release_channel(&mut self, _channel: ChannelId) {
         self.texture_cache.invalidate_lookups();
     }
@@ -2110,5 +2143,150 @@ mod tests {
         ] {
             assert_eq!(blit_rects(&blit), None, "{why}");
         }
+    }
+
+    #[test]
+    fn reads_wait_only_for_the_releases_that_write_their_range() {
+        let Some(mut f) = fixture(GobLayout::Tegra) else {
+            return;
+        };
+        let (semaphore, reduced) = (DADDR + 0x80_0000, DADDR + 0x80_0100);
+        f.memory.write(reduced, 5u32).unwrap();
+        f.rasterizer.barrier();
+        f.rasterizer
+            .signal_fence(FenceAction::IncrementSyncpoint(5));
+        f.rasterizer.synchronize_region(DADDR + 0x40_0000, 0x18);
+        assert_eq!(
+            f.syncpoints.guest().value(5).unwrap(),
+            0,
+            "a read of a range no release writes leaves recorded work unsubmitted"
+        );
+        f.rasterizer.signal_fence(FenceAction::WriteSemaphore {
+            address: semaphore,
+            value: 0x1234_5678,
+            size: ReleaseSize::Four,
+        });
+        f.rasterizer.signal_fence(FenceAction::ReduceSemaphore {
+            address: reduced,
+            op: lichii_gpu::host::Reduction::Add,
+            signed: false,
+            payload: 3,
+        });
+        f.rasterizer
+            .signal_fence(FenceAction::IncrementSyncpoint(6));
+        f.rasterizer.synchronize_region(semaphore, 0x18);
+        assert_eq!(f.memory.read::<u32>(semaphore).unwrap(), 0x1234_5678);
+        assert_eq!(
+            f.syncpoints.guest().value(5).unwrap(),
+            1,
+            "earlier releases run in order"
+        );
+        f.rasterizer.synchronize_region(reduced, 4);
+        assert_eq!(f.memory.read::<u32>(reduced).unwrap(), 8);
+        f.rasterizer.release_fences(true);
+        assert_eq!(f.syncpoints.guest().value(6).unwrap(), 1);
+        f.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn reads_of_a_first_page_wait_for_releases_mirrored_into_it() {
+        let Some(mut f) = fixture(GobLayout::Tegra) else {
+            return;
+        };
+        let first = DADDR + 0x80_0000;
+        f.syncpoints.semaphore_mirror().add_region(first);
+        f.rasterizer.barrier();
+        f.rasterizer.signal_fence(FenceAction::WriteSemaphore {
+            address: first + 0x1010,
+            value: 0x55,
+            size: ReleaseSize::Four,
+        });
+        f.rasterizer.synchronize_region(first + 0x10, 4);
+        assert_eq!(f.memory.read::<u32>(first + 0x10).unwrap(), 0x55);
+        f.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn reads_wait_for_query_reports_into_their_range() {
+        let Some(mut f) = fixture(GobLayout::Tegra) else {
+            return;
+        };
+        let gmmu = gmmu(&f);
+        let report = DADDR + 0x80_0000;
+        f.memory.write(report, u64::MAX).unwrap();
+        f.rasterizer.query(
+            ChannelId(0),
+            &gmmu,
+            &Query {
+                address: GPU_VA + 0x80_0000,
+                kind: QueryKind::SamplesPassed,
+                payload: 0,
+                size: ReleaseSize::Eight,
+                after_work: true,
+            },
+        );
+        f.rasterizer.synchronize_region(report, 8);
+        assert_eq!(
+            f.memory.read::<u64>(report).unwrap(),
+            0,
+            "no samples passed"
+        );
+        f.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn reads_take_buffer_writes_and_keep_later_inline_writes() {
+        let Some(mut f) = fixture(GobLayout::Tegra) else {
+            return;
+        };
+        let (written, inline) = (DADDR + 0x80_0000, DADDR + 0x80_1000);
+        let r = &mut f.rasterizer;
+        for daddr in [written, inline] {
+            let binding = r
+                .buffer_cache
+                .acquire(&mut r.scheduler, &mut r.staging, daddr, 256)
+                .unwrap();
+            let cmd = r.scheduler.record().unwrap();
+            // SAFETY: `cmd` is recording outside any rendering and the binding holds 256 bytes.
+            unsafe {
+                r.device
+                    .raw
+                    .cmd_fill_buffer(cmd, binding.buffer, binding.offset, 256, 0xabab_abab);
+            }
+            crate::commands::transfer_to_all_barrier(&r.device, cmd);
+            r.buffer_cache.mark_gpu_written(daddr, 256);
+        }
+        f.memory.write_bytes(inline, &[7; 256]).unwrap();
+        f.rasterizer.invalidate_region(inline, 256);
+        f.rasterizer.synchronize_region(written, 256);
+        f.rasterizer.synchronize_region(inline, 256);
+        let mut bytes = [0u8; 256];
+        f.memory.read_bytes(written, &mut bytes).unwrap();
+        assert!(bytes.iter().all(|&b| b == 0xab), "the GPU write lands");
+        f.memory.read_bytes(inline, &mut bytes).unwrap();
+        assert!(bytes.iter().all(|&b| b == 7), "a later inline write wins");
+        f.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn reads_take_render_target_texels() {
+        let Some(mut f) = fixture(GobLayout::Switch2) else {
+            return;
+        };
+        let gmmu = gmmu(&f);
+        let (width, height) = (96, 48);
+        clear(
+            &mut f,
+            &gmmu,
+            &clear_regs(width, height, 2, [1.0, 0.5, 0.25, 0.0]),
+        );
+        let tiling = Tiling::new(width, height, 1, 4, 2, 0, GobLayout::Switch2);
+        f.rasterizer.synchronize_region(DADDR + 0x100, 16);
+        assert_eq!(
+            guest_linear(&f, DADDR, &tiling)[..4],
+            [255, 128, 64, 0],
+            "the read lands the target's texels"
+        );
+        f.assert_no_validation_errors();
     }
 }

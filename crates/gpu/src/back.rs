@@ -407,16 +407,18 @@ impl Back {
     /// its fences and queries land, and GPU-written data in the range goes back to guest memory.
     fn synchronize_read(&mut self, address: u64, size: u64) {
         let _waiting = self.activity.waiting(Wait::HostGpu);
-        self.rasterizer.release_fences(true);
         let Some(channel) = self.current.and_then(|index| self.channels[index].as_ref()) else {
+            self.rasterizer.release_fences(true);
             return;
         };
         let rasterizer = &mut *self.rasterizer;
-        channel.setup.memory.for_each_range(address, size, |range| {
-            if let RangeTarget::Device(daddr) = range.target {
-                rasterizer.flush_region(daddr, range.size);
-            }
-        });
+        channel
+            .setup
+            .memory
+            .for_each_range(address, size, |range| match range.target {
+                RangeTarget::Device(daddr) => rasterizer.synchronize_region(daddr, range.size),
+                _ => rasterizer.release_fences(true),
+            });
     }
 
     /// Whether GPU work may have written a page of the current channel's `[address, +size)`.
