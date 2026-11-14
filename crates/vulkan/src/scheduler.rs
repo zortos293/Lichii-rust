@@ -334,11 +334,20 @@ impl Scheduler {
     }
 }
 
+struct Diag(std::time::Instant, &'static str);
+impl Drop for Diag {
+    fn drop(&mut self) {
+        tracing::info!(took = ?self.0.elapsed(), "diag drop: {}", self.1);
+    }
+}
+
 impl Drop for Scheduler {
     fn drop(&mut self) {
+        let t = std::time::Instant::now();
         if self.current.is_some() {
             let _ = self.flush();
         }
+        let _diag = Diag(t, "scheduler drop");
         let last = self.tick - 1;
         if let Err(error) = self.wait(last) {
             tracing::error!("waiting for the GPU on shutdown: {error}");

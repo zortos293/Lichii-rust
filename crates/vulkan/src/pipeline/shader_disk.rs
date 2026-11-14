@@ -123,8 +123,20 @@ impl ShaderDisk {
     }
 }
 
+struct DiagDisk(std::time::Instant);
+impl Drop for DiagDisk {
+    fn drop(&mut self) {
+        tracing::info!(took = ?self.0.elapsed(), "diag drop: shader disk flushed");
+    }
+}
+fn scopeguard_diag(t: std::time::Instant) -> DiagDisk {
+    DiagDisk(t)
+}
+
 impl Drop for ShaderDisk {
     fn drop(&mut self) {
+        let t = std::time::Instant::now();
+        let _diag = scopeguard_diag(t);
         if let Err(error) = self.flush() {
             tracing::warn!("writing {}: {error}", self.path.display());
         }

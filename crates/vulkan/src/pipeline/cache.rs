@@ -1354,15 +1354,24 @@ impl PipelineCache {
 impl Drop for PipelineCache {
     fn drop(&mut self) {
         self.ctx.shared.shutdown.store(true, Ordering::Relaxed);
+        let t = std::time::Instant::now();
         self.workers = None;
+        tracing::info!(took = ?t.elapsed(), "diag drop: pipeline workers joined");
+        let t = std::time::Instant::now();
         if let Err(error) = self.save() {
             tracing::warn!("writing the pipeline cache: {error}");
         }
+        tracing::info!(took = ?t.elapsed(), "diag drop: pipeline cache saved");
+        let t = std::time::Instant::now();
         self.ctx.device.wait_idle();
+        tracing::info!(took = ?t.elapsed(), "diag drop: pipeline wait_idle");
+        let t = std::time::Instant::now();
+        let pipelines = self.slots.len();
         self.linking.clear();
         self.libraries.clear();
         self.slots.clear();
         self.layouts.clear();
+        tracing::info!(took = ?t.elapsed(), pipelines, "diag drop: pipelines destroyed");
         // SAFETY: no build is running and no pipeline creation uses the cache any more.
         unsafe {
             self.ctx

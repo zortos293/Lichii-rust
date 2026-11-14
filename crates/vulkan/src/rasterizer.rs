@@ -1278,11 +1278,23 @@ impl Rasterizer for VulkanRasterizer {
     }
 }
 
+impl VulkanRasterizer {
+    fn texture_cache_len_diag(&self) -> usize {
+        self.texture_cache.len()
+    }
+}
+
 impl Drop for VulkanRasterizer {
     fn drop(&mut self) {
+        let t = std::time::Instant::now();
         let _ = self.scheduler.finish();
+        tracing::info!(took = ?t.elapsed(), "diag drop: scheduler.finish");
+        let t = std::time::Instant::now();
         self.draw.destroy(&self.device);
+        tracing::info!(took = ?t.elapsed(), "diag drop: draw.destroy");
+        let t = std::time::Instant::now();
         self.samples.destroy(&self.device);
+        tracing::info!(took = ?t.elapsed(), images = self.texture_cache_len_diag(), "diag drop: samples.destroy; fields drop next");
     }
 }
 
