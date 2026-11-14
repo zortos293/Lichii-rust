@@ -445,6 +445,20 @@ impl Jit {
         let code_bytes = compiled.code.len();
         let generation = self.cache.generation();
         let entry = self.cache.insert(start, len, Ok(compiled));
+        static DELAY: std::sync::LazyLock<Option<std::time::Duration>> =
+            std::sync::LazyLock::new(|| {
+                std::env::var("LICHII_JIT_DELAY_US")
+                    .ok()?
+                    .parse()
+                    .ok()
+                    .map(std::time::Duration::from_micros)
+            });
+        if let Some(delay) = *DELAY {
+            let until = std::time::Instant::now() + delay;
+            while std::time::Instant::now() < until {
+                std::hint::spin_loop();
+            }
+        }
         if let (Some(p), Some(started)) = (self.state.profile.as_deref_mut(), started) {
             p.translated(started.elapsed(), len / 4, code_bytes);
             if self.cache.generation() != generation {
