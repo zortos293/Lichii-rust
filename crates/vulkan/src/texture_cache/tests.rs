@@ -5,7 +5,7 @@ use lichii_gpu::backend::{CopySurface, ImageCopy};
 use lichii_gpu::gmmu::BigPageSize;
 use lichii_memory::PhysicalMemory;
 use lichii_texture::block_linear::{SurfaceLayout, Tiling};
-use lichii_texture::tic::TicEntry;
+use lichii_texture::tic::{TextureType, TicEntry};
 use lichii_texture::{Compression, astc, bcn, etc};
 
 use super::*;
@@ -268,6 +268,28 @@ fn switch2_two_dimensional_headers_ignore_their_base_layer() {
     let tegra = ImageInfo::from_texture(&desc, GobLayout::Tegra).unwrap();
     assert_eq!(tegra.layers, 33, "Tegra headers keep selecting a layer");
     assert_eq!(ViewInfo::from_texture(&desc, &tegra).base_layer, 32);
+}
+
+#[test]
+fn switch2_array_headers_ignore_their_base_layer() {
+    let mut header = tic(0x08, GPU_VA, 64, 32, 4, 1, 2);
+    header.0[2] |= 4 << 16;
+    let desc = header.decode().unwrap();
+    assert_eq!(
+        (desc.texture_type, desc.base_layer),
+        (TextureType::D2Array, 32)
+    );
+    let switch2 = ImageInfo::from_texture(&desc, GobLayout::Switch2).unwrap();
+    assert_eq!(switch2.layers, 4);
+    let view = ViewInfo::from_texture(&desc, &switch2);
+    assert_eq!((view.base_layer, view.layers), (0, 4));
+    let tegra = ImageInfo::from_texture(&desc, GobLayout::Tegra).unwrap();
+    assert_eq!(
+        tegra.layers, 36,
+        "Tegra array headers keep their base layer"
+    );
+    let view = ViewInfo::from_texture(&desc, &tegra);
+    assert_eq!((view.base_layer, view.layers), (32, 4));
 }
 
 /// Writes `linear` level data into guest memory as the block-linear surface stores it.
