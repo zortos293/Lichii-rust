@@ -132,6 +132,23 @@ enum Release {
     SamplesFold(samples::SampleRange),
 }
 
+/// The part of `fb` the display shows, as left, top, right and bottom in texels: its crop
+/// clamped to the framebuffer, or all of it when the crop is empty.
+fn displayed_rect(fb: &FramebufferConfig) -> [u32; 4] {
+    let (width, height) = (fb.width, fb.height);
+    fb.crop
+        .map(|c| {
+            [
+                c.left.min(width),
+                c.top.min(height),
+                c.right.min(width),
+                c.bottom.min(height),
+            ]
+        })
+        .filter(|&[left, top, right, bottom]| right > left && bottom > top)
+        .unwrap_or([0, 0, width, height])
+}
+
 /// The rectangle a clear covers: the first scissor and the clear rectangle when
 /// `clear_control` asks for them, in pixels.
 fn clear_rect(regs: &Regs) -> Rect {
@@ -553,20 +570,8 @@ impl VulkanRasterizer {
         tick: u64,
         scale: ResolutionScale,
     ) {
-        let (width, height) = (fb.width, fb.height);
-        let (left, top, right, bottom) = fb
-            .crop
-            .map(|c| {
-                (
-                    c.left.min(width),
-                    c.top.min(height),
-                    c.right.min(width),
-                    c.bottom.min(height),
-                )
-            })
-            .filter(|&(left, top, right, bottom)| right > left && bottom > top)
-            .unwrap_or((0, 0, width, height));
-        let (w, h) = (width as f32, height as f32);
+        let [left, top, right, bottom] = displayed_rect(fb);
+        let (w, h) = (fb.width as f32, fb.height as f32);
         let mut uv_rect = [
             left as f32 / w,
             top as f32 / h,
@@ -773,7 +778,13 @@ impl VulkanRasterizer {
             }
             None => (guest, fb.stride as usize),
         };
-        frame_dump::write_bmp(path, fb.width, fb.height, pitch, &texels, rgba)
+        let layout = frame_dump::Layout {
+            pitch,
+            rect: displayed_rect(fb),
+            flip_vertical: fb.flip_vertical,
+            rgba,
+        };
+        frame_dump::write_bmp(path, &texels, &layout)
     }
 
     fn upload_frame(&mut self, fb: &FramebufferConfig) -> Result<()> {

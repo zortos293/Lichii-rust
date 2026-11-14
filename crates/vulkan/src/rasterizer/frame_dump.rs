@@ -61,21 +61,26 @@ impl FrameDump {
     }
 }
 
-/// Writes `height` rows of `width` four-byte texels, `pitch` bytes apart, as a 32-bit BMP.
-/// `rgba` says the texels are R, G, B, A bytes; otherwise they are B, G, R, A.
-pub(super) fn write_bmp(
-    path: &Path,
-    width: u32,
-    height: u32,
-    pitch: usize,
-    texels: &[u8],
-    rgba: bool,
-) -> std::io::Result<()> {
-    std::fs::write(path, bmp(width, height, pitch, texels, rgba))
+/// Where the displayed picture lies in a frame of four-byte texels.
+pub(super) struct Layout {
+    /// Bytes from one row to the next.
+    pub(super) pitch: usize,
+    /// Left, top, right and bottom of the displayed part, in texels.
+    pub(super) rect: [u32; 4],
+    pub(super) flip_vertical: bool,
+    /// The texels are R, G, B, A bytes; otherwise B, G, R, A.
+    pub(super) rgba: bool,
 }
 
-fn bmp(width: u32, height: u32, pitch: usize, texels: &[u8], rgba: bool) -> Vec<u8> {
+/// Writes the displayed part of `texels` to `path` as a 32-bit BMP, the right way up.
+pub(super) fn write_bmp(path: &Path, texels: &[u8], layout: &Layout) -> std::io::Result<()> {
+    std::fs::write(path, bmp(texels, layout))
+}
+
+fn bmp(texels: &[u8], layout: &Layout) -> Vec<u8> {
     const HEADERS: u32 = 14 + 40;
+    let [left, top, right, bottom] = layout.rect;
+    let (width, height) = (right - left, bottom - top);
     let row = width as usize * 4;
     let image = (row * height as usize) as u32;
     let mut out = Vec::with_capacity((HEADERS + image) as usize);
@@ -88,10 +93,20 @@ fn bmp(width: u32, height: u32, pitch: usize, texels: &[u8], rgba: bool) -> Vec<
     for word in [0, image, 2835, 2835, 0, 0] {
         out.extend_from_slice(&word.to_le_bytes());
     }
-    for y in (0..height as usize).rev() {
-        let line = &texels[y * pitch..y * pitch + row];
-        for &[a, b, c, d] in line.as_chunks::<4>().0 {
-            out.extend_from_slice(&if rgba { [c, b, a, d] } else { [a, b, c, d] });
+    let rows = top as usize..bottom as usize;
+    let rows: Box<dyn Iterator<Item = usize>> = if layout.flip_vertical {
+        Box::new(rows)
+    } else {
+        Box::new(rows.rev())
+    };
+    for y in rows {
+        let start = y * layout.pitch + left as usize * 4;
+        for &[a, b, c, d] in texels[start..start + row].as_chunks::<4>().0 {
+            out.extend_from_slice(&if layout.rgba {
+                [c, b, a, d]
+            } else {
+                [a, b, c, d]
+            });
         }
     }
     out
@@ -142,7 +157,13 @@ mod tests {
             1, 2, 3, 4, 5, 6, 7, 8, 0, 0, // row 0, two texels and padding
             9, 10, 11, 12, 13, 14, 15, 16, 0, 0,
         ];
-        let rgba = bmp(2, 2, 10, &texels, true);
+        let layout = Layout {
+            pitch: 10,
+            rect: [0, 0, 2, 2],
+            flip_vertical: false,
+            rgba: true,
+        };
+        let rgba = bmp(&texels, &layout);
         assert_eq!(&rgba[..2], b"BM");
         assert_eq!(u32::from_le_bytes(rgba[2..6].try_into().unwrap()), 54 + 16);
         assert_eq!(u32::from_le_bytes(rgba[10..14].try_into().unwrap()), 54);
@@ -152,7 +173,34 @@ mod tests {
             &rgba[54..],
             [11, 10, 9, 12, 15, 14, 13, 16, 3, 2, 1, 4, 7, 6, 5, 8]
         );
-        let bgra = bmp(2, 2, 10, &texels, false);
+        let bgra = bmp(
+            &texels,
+            &Layout {
+                rgba: false,
+                ..layout
+            },
+        );
         assert_eq!(&bgra[54..58], [9, 10, 11, 12]);
+    }
+
+    #[test]
+    fn bmp_keeps_the_displayed_part_the_right_way_up() {
+        let texels: Vec<u8> = (0..3 * 3 * 4).collect();
+        let layout = Layout {
+            pitch: 12,
+            rect: [1, 0, 3, 2],
+            flip_vertical: true,
+            rgba: false,
+        };
+        let out = bmp(&texels, &layout);
+        assert_eq!(i32::from_le_bytes(out[18..22].try_into().unwrap()), 2);
+        assert_eq!(i32::from_le_bytes(out[22..26].try_into().unwrap()), 2);
+        let rows: Vec<&[u8]> = out[54..].chunks(8).collect();
+        assert_eq!(
+            rows[0],
+            &texels[4..12],
+            "flipped: guest row 0 is the bottom row"
+        );
+        assert_eq!(rows[1], &texels[16..24]);
     }
 }
