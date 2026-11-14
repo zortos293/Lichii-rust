@@ -828,8 +828,31 @@ thread_local! {
 }
 
 fn a0_check(engine: &str, regs: &[u32], method: u32) {
-    if method != 0x6c3 || regs[0x6c0] != 0 || regs[0x6c1] != 0 {
+    if method != 0x6c3 {
         return;
+    }
+    {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        static C: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+        let zero = regs[0x6c0] == 0 && regs[0x6c1] == 0;
+        let from_macro = A0_MACRO.with(|m| m.get()) != 0;
+        let compute = engine == "compute";
+        let total = C[0].fetch_add(1, Relaxed) + 1;
+        if zero {
+            C[1 + usize::from(compute) * 2 + usize::from(from_macro)].fetch_add(1, Relaxed);
+        }
+        if compute {
+            C[5].fetch_add(1, Relaxed);
+        }
+        if total % 5000 == 0 {
+            tracing::warn!(
+                "DIAG a0 census triggers={total} compute_triggers={} zero_3d_pushbuffer={} zero_3d_macro={} zero_compute_pushbuffer={} zero_compute_macro={}",
+                C[5].load(Relaxed), C[1].load(Relaxed), C[2].load(Relaxed), C[3].load(Relaxed), C[4].load(Relaxed)
+            );
+        }
+        if !zero {
+            return;
+        }
     }
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     if !crate::diag_ring::first(&N, 16) {
