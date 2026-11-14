@@ -222,6 +222,30 @@ impl Activity {
             != NOT_WAITING
     }
 
+    /// The renderer call and the waits going on, and for how long, for a GPU thread that does
+    /// not stop.
+    pub(crate) fn describe_busy(&self) -> String {
+        let now = self.now();
+        let ms = |since: u64| now.saturating_sub(since) / 1_000_000;
+        let mut parts = Vec::new();
+        if let Some(call) = self.current_call() {
+            let since = self.call_since.load(Ordering::Acquire);
+            parts.push(format!("{call:?} call for {} ms", ms(since)));
+        }
+        let waits = [Wait::FrontIdle, Wait::FrontWaitingForBack, Wait::BackIdle, Wait::HostGpu];
+        for wait in waits {
+            let since = self.waits[wait as usize].since.load(Ordering::Acquire);
+            if since != NOT_WAITING {
+                parts.push(format!("{wait:?} for {} ms", ms(since)));
+            }
+        }
+        if parts.is_empty() {
+            "no renderer call or timed wait".into()
+        } else {
+            parts.join(", ")
+        }
+    }
+
     /// Ends [`Activity::report_until_stopped`].
     pub(crate) fn stop(&self) {
         *self.stopped.lock() = true;

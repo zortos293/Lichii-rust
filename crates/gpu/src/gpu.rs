@@ -684,6 +684,7 @@ impl Gpu {
             if !thread.is_finished() {
                 tracing::error!(
                     thread = thread.thread().name(),
+                    busy = %self.activity.describe_busy(),
                     "a GPU thread did not stop within {STOP_TIMEOUT:?}; leaving it"
                 );
                 continue;
