@@ -7,6 +7,7 @@
 //! dispatches (see [`draw`]).
 
 mod draw;
+mod samples;
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -21,7 +22,7 @@ use lichii_common::settings::{AstcRecompression, GraphicsSettings, ResolutionSca
 use lichii_gpu::backend::ChannelId;
 use lichii_gpu::backend::{
     Blit, BlitOperation, ComputeContext, DrawParams, DrawTexture, FenceAction, FramebufferConfig,
-    GpuHandles, GraphicsContext, IndirectDraw, Query, QueryKind, Rasterizer,
+    GpuHandles, GraphicsContext, IndirectDraw, Query, QueryKind, Rasterizer, ReleaseSize,
 };
 use lichii_gpu::engines::maxwell_3d::Regs;
 use lichii_gpu::engines::maxwell_3d::regs::NUM_RENDER_TARGETS;
@@ -102,13 +103,28 @@ pub struct VulkanRasterizer {
     mailbox: Arc<FrameMailbox>,
     gob_layout: GobLayout,
     frames: Vec<Arc<FrameImage>>,
-    fences: VecDeque<(u64, FenceAction)>,
+    fences: VecDeque<(u64, Release)>,
+    samples: samples::SampleCounter,
     unflushed: bool,
     texture_cache: TextureCache,
     buffer_cache: BufferCache,
     draw: draw::DrawState,
     live: Option<Arc<LiveSettings>>,
     activity: Activity,
+}
+
+/// Work that runs once the host GPU finished everything recorded before it.
+#[derive(Clone, Copy)]
+enum Release {
+    Action(FenceAction),
+    /// A SamplesPassed report: the counter value at `range`, written to `address`.
+    Samples {
+        address: DAddr,
+        size: ReleaseSize,
+        range: samples::SampleRange,
+    },
+    /// A Z-pass counter reset; its earlier queries are free once the work before it completed.
+    SamplesReset(u64),
 }
 
 /// The rectangle a clear covers: the first scissor and the clear rectangle when
@@ -239,6 +255,7 @@ impl VulkanRasterizer {
             gob_layout,
             frames: Vec::new(),
             fences: VecDeque::new(),
+            samples: samples::SampleCounter::new(device)?,
             unflushed: true,
             texture_cache,
             live: None,
@@ -904,6 +921,19 @@ impl Rasterizer for VulkanRasterizer {
         };
         let value = match query.kind {
             QueryKind::Payload => query.payload,
+            QueryKind::SamplesPassed => {
+                let range = self.samples.report();
+                self.fences.push_back((
+                    self.scheduler.tick(),
+                    Release::Samples {
+                        address,
+                        size: query.size,
+                        range,
+                    },
+                ));
+                self.unflushed = true;
+                return;
+            }
             _ => 0,
         };
         let action = FenceAction::WriteSemaphore {
@@ -918,8 +948,18 @@ impl Rasterizer for VulkanRasterizer {
         }
     }
 
+    fn reset_counter(&mut self, kind: QueryKind) {
+        if kind == QueryKind::SamplesPassed {
+            let reset_at = self.samples.reset();
+            self.fences
+                .push_back((self.scheduler.tick(), Release::SamplesReset(reset_at)));
+            self.unflushed = true;
+        }
+    }
+
     fn signal_fence(&mut self, action: FenceAction) {
-        self.fences.push_back((self.scheduler.tick(), action));
+        self.fences
+            .push_back((self.scheduler.tick(), Release::Action(action)));
         self.unflushed = true;
     }
 
@@ -936,7 +976,20 @@ impl Rasterizer for VulkanRasterizer {
                 break;
             }
             self.fences.pop_front();
-            action.execute(&self.handles);
+            match action {
+                Release::Action(action) => action.execute(&self.handles),
+                Release::Samples {
+                    address,
+                    size,
+                    range,
+                } => FenceAction::WriteSemaphore {
+                    address,
+                    value: self.samples.resolve(&self.device, range),
+                    size,
+                }
+                .execute(&self.handles),
+                Release::SamplesReset(reset_at) => self.samples.retire(reset_at),
+            }
         }
     }
 
@@ -1078,6 +1131,7 @@ impl Drop for VulkanRasterizer {
     fn drop(&mut self) {
         let _ = self.scheduler.finish();
         self.draw.destroy(&self.device);
+        self.samples.destroy(&self.device);
     }
 }
 
