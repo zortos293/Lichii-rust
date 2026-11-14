@@ -272,6 +272,44 @@ impl Rasterizer for Recorder {
     fn release_fences(&mut self, wait: bool) {
         self.work.run_finished(wait);
     }
+    fn pending_semaphore_words(
+        &mut self,
+        addr: u64,
+        size: u64,
+        put: &mut dyn FnMut(u64, u32),
+    ) -> bool {
+        let timestamp = self.work.handles.timestamp.now();
+        for work in &self.work.pending.lock().0 {
+            match *work {
+                Pending::Fence(FenceAction::WriteSemaphore {
+                    address,
+                    value,
+                    size: release,
+                }) => {
+                    let words = [
+                        value as u32,
+                        (value >> 32) as u32,
+                        timestamp as u32,
+                        (timestamp >> 32) as u32,
+                    ];
+                    let count = match release {
+                        ReleaseSize::Four => 1,
+                        ReleaseSize::Eight => 2,
+                        ReleaseSize::Sixteen => 4,
+                    };
+                    for (i, &word) in words[..count].iter().enumerate() {
+                        let at = address + 4 * i as u64;
+                        if (addr..addr + size).contains(&at) {
+                            put(at, word);
+                        }
+                    }
+                }
+                Pending::Fence(FenceAction::IncrementSyncpoint(_)) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
     fn has_pending_fences(&self) -> bool {
         self.work.fence_polls.fetch_add(1, Ordering::Relaxed);
         !self.work.pending.lock().0.is_empty()

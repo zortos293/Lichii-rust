@@ -592,6 +592,20 @@ pub trait Rasterizer: Send {
         self.flush_region(addr, size);
     }
 
+    /// Passes `put` the words of `[addr, addr + size)` that semaphore releases still waiting in
+    /// the renderer's fences write, in the order they were signalled; a 16-byte release's
+    /// timestamp is taken now. Returns true only when every pending write the renderer holds for
+    /// the range is such a release, so its value is known; then a read needs no wait for them.
+    /// The default holds no fences it can tell apart and returns false: the caller synchronizes.
+    fn pending_semaphore_words(
+        &mut self,
+        _addr: DAddr,
+        _size: u64,
+        _put: &mut dyn FnMut(DAddr, u32),
+    ) -> bool {
+        false
+    }
+
     /// Device memory `[addr, addr + size)` is no longer mapped in some GPU address space.
     fn unmap_region(&mut self, addr: DAddr, size: u64) {
         self.invalidate_region(addr, size);

@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 
 use lichii_common::GpuVAddr;
+use parking_lot::Mutex;
 
 use crate::activity::{Activity, Wait};
 use crate::back::{Back, SideCommand};
@@ -17,7 +18,6 @@ use crate::backend::{ChannelId, ReleaseSize};
 use crate::engines::EngineKind;
 use crate::gpu::Inbox;
 use crate::host::Reduction;
-use crate::host_releases::ReadOverlay;
 use crate::ring::{Consumer, Producer};
 
 pub(crate) mod tag {
@@ -92,7 +92,7 @@ pub(crate) const fn header(tag: u8, engine: u8, method: u32, argument: u32) -> u
 pub(crate) struct FetchSyncs {
     completed: AtomicU64,
     front: Arc<Inbox>,
-    /// What pending host releases write over the read [`Stream::synchronize_read`] last sent.
+    /// What pending semaphore releases write over the read [`Stream::synchronize_read`] last sent.
     pub(crate) read_overlay: ReadOverlay,
 }
 
@@ -109,6 +109,38 @@ impl FetchSyncs {
     pub(crate) fn complete(&self) {
         self.completed.fetch_add(1, Ordering::Release);
         self.front.wake();
+    }
+}
+
+/// Words a synchronized read can take from pending semaphore releases instead of waiting.
+pub(crate) const OVERLAY_WORDS: usize = 16;
+
+/// The words of a synchronized read that semaphore releases still on their way to the host GPU
+/// write, handed from the back to the front with the read: the front reads guest memory and puts
+/// these over it.
+#[derive(Default)]
+pub(crate) struct ReadOverlay(Mutex<Overlay>);
+
+#[derive(Default)]
+struct Overlay {
+    words: [Option<u32>; OVERLAY_WORDS],
+}
+
+impl ReadOverlay {
+    /// Back: the words of the read being synchronized, by index, that guest memory does not hold
+    /// yet; none when it takes guest memory as it is.
+    pub(crate) fn set(&self, words: [Option<u32>; OVERLAY_WORDS]) {
+        self.0.lock().words = words;
+    }
+
+    /// Front: puts the overlay over `out`, the words just read, and clears it.
+    pub(crate) fn apply(&self, out: &mut [u32]) {
+        let words = std::mem::take(&mut self.0.lock().words);
+        for (slot, word) in out.iter_mut().zip(words) {
+            if let Some(word) = word {
+                *slot = word;
+            }
+        }
     }
 }
 
@@ -292,8 +324,8 @@ impl Stream {
         self.drain();
     }
 
-    /// Puts what host releases still on their way to the host GPU write over `out`, the words
-    /// the front read after [`Stream::synchronize_read`]: the back hands those values over
+    /// Puts what semaphore releases still on their way to the host GPU write over `out`, the
+    /// words the front read after [`Stream::synchronize_read`]: the back hands those values over
     /// instead of waiting for them.
     pub(crate) fn overlay_read(&self, out: &mut [u32]) {
         self.fetch_syncs.read_overlay.apply(out);

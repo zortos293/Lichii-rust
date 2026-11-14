@@ -10,8 +10,6 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use lichii_common::DAddr;
 use lichii_memory::DeviceAddressSpace;
-
-use crate::host_releases::ReleaseLandings;
 use lichii_texture::block_linear::GobLayout;
 use parking_lot::Mutex;
 
@@ -133,7 +131,6 @@ impl<'a> Submission<'a> {
 /// cannot miss a value that is overwritten before the front reads the word (NX2_NOTES row 70).
 #[derive(Default)]
 pub struct SemaphoreWaiters {
-    landings: ReleaseLandings,
     count: AtomicUsize,
     list: Mutex<Vec<Waiter>>,
     front: OnceLock<Weak<Inbox>>,
@@ -149,11 +146,6 @@ struct Waiter {
 }
 
 impl SemaphoreWaiters {
-    /// The landings of the host releases the back tracks.
-    pub(crate) fn landings(&self) -> &ReleaseLandings {
-        &self.landings
-    }
-
     /// Wakes `inbox` whenever a write latches a waiter.
     pub(crate) fn attach(&self, inbox: &Arc<Inbox>) {
         if self.front.set(Arc::downgrade(inbox)).is_err() {
@@ -228,7 +220,6 @@ impl SemaphoreWaiters {
     /// stands in for the 64-bit word a wide acquire reads.
     #[inline]
     pub(crate) fn written(&self, device: &DeviceAddressSpace, address: DAddr, size: u64) {
-        self.landings.written(address);
         if self.count.load(Ordering::Acquire) == 0 {
             return;
         }

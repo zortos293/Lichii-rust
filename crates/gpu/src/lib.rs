@@ -18,7 +18,6 @@ pub mod gmmu;
 pub mod gpu;
 pub mod host;
 pub mod host1x;
-mod host_releases;
 pub mod lazy;
 pub mod macros;
 pub mod nx2_memory;

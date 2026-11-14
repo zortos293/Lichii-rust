@@ -18,10 +18,11 @@ use crate::engines::kepler_compute::pcas::QmdScheduler;
 use crate::engines::{Engine, EngineContext, EngineFactory, EngineKind};
 use crate::gmmu::{Gmmu, RangeTarget};
 use crate::gpu::{MAX_POLL, MIN_POLL};
-use crate::host_releases::{HostReleases, Pending};
 use crate::host1x::Syncpoints;
 use crate::ring::{Consumer, WRAP};
-use crate::stream::{FetchSync, FetchSyncs, MULTI_MAX_WORDS, REDUCTIONS, RELEASE_SIZES, tag};
+use crate::stream::{
+    FetchSync, FetchSyncs, MULTI_MAX_WORDS, OVERLAY_WORDS, REDUCTIONS, RELEASE_SIZES, tag,
+};
 use crate::throttle::Throttle;
 
 /// The back reports progress at least this often while it executes.
@@ -72,8 +73,6 @@ pub(crate) struct Back {
     qmd_scheduler: QmdScheduler,
     fetch_syncs: Arc<FetchSyncs>,
     written_pages: Arc<GpuWrittenPages>,
-    /// Host releases queued to the renderer, for the macro reads of their words.
-    releases: HostReleases,
     activity: Arc<Activity>,
     /// Set by [`crate::Gpu::shutdown`]: the back drops what is left instead of executing it.
     stopping: Arc<AtomicBool>,
@@ -103,7 +102,6 @@ impl Back {
             qmd_scheduler: QmdScheduler::new(),
             fetch_syncs,
             written_pages: handles.written_pages.clone(),
-            releases: HostReleases::new(),
             activity,
             stopping,
         }
@@ -288,8 +286,12 @@ impl Back {
             }
             tag::SYNCHRONIZE_READ => {
                 let (address, size) = (consumer.slot(1), consumer.slot(2));
-                if !self.read_releases(address, size) {
-                    self.fetch_syncs.read_overlay.clear();
+                let pending = self.pending_releases(address, size);
+                let waits = pending.is_none();
+                self.fetch_syncs
+                    .read_overlay
+                    .set(pending.unwrap_or_default());
+                if waits {
                     self.synchronize_read(address, size);
                 }
                 3
@@ -402,73 +404,11 @@ impl Back {
             }
             return;
         };
-        let words = match size {
-            ReleaseSize::Four => 1,
-            ReleaseSize::Eight => 2,
-            ReleaseSize::Sixteen => 4,
-        };
-        self.releases.release(
-            self.syncpoints.semaphore_waiters().landings(),
-            daddr,
-            payload,
-            words,
-        );
         self.rasterizer.signal_fence(FenceAction::WriteSemaphore {
             address: daddr,
             value: payload,
             size,
         });
-    }
-
-    /// A macro read of words that only GPU-untouched pages and host releases still on their way
-    /// to the host GPU hold: the front gets the releases' values with the read instead of the back
-    /// waiting for them to land. Returns false, having handed nothing over, for any other read.
-    fn read_releases(&mut self, address: u64, size: u64) -> bool {
-        let Some(channel) = self.current.and_then(|index| self.channels[index].as_ref()) else {
-            return false;
-        };
-        if !address.is_multiple_of(4) {
-            return false;
-        }
-        let landings = self.syncpoints.semaphore_waiters().landings();
-        let mut words = [(0u32, 0u32); 16];
-        let mut len = 0;
-        let mut plain = true;
-        let mut known = false;
-        channel.setup.memory.for_each_range(address, size, |range| {
-            let RangeTarget::Device(daddr) = range.target else {
-                plain = false;
-                return;
-            };
-            if self.written_pages.may_be_written(daddr, range.size) {
-                plain = false;
-                return;
-            }
-            let base = range.gpu_va - address;
-            match self.releases.pending(
-                landings,
-                daddr,
-                range.size,
-                || self.timestamp.now(),
-                |at, word| {
-                    if let Some(slot) = words.get_mut(len) {
-                        *slot = (((base + at - daddr) / 4) as u32, word);
-                    }
-                    len += 1;
-                },
-            ) {
-                Pending::Nothing => {}
-                Pending::Known => known = true,
-                Pending::Unknown => plain = false,
-            }
-        });
-        plain
-            && known
-            && len <= words.len()
-            && self
-                .fetch_syncs
-                .read_overlay
-                .set(words[..len].iter().copied())
     }
 
     /// The front is about to read `[address, address + size)`: the GPU work before it completes,
@@ -487,6 +427,42 @@ impl Back {
                 RangeTarget::Device(daddr) => rasterizer.synchronize_region(daddr, range.size),
                 _ => rasterizer.release_fences(true),
             });
+    }
+
+    /// The words of `[address, address + size)` that semaphore releases still on their way write,
+    /// by index, when GPU work never wrote its pages and the renderer holds no other pending write
+    /// there: the read takes guest memory with these over it and needs no wait. None when the
+    /// read must synchronize.
+    fn pending_releases(
+        &mut self,
+        address: u64,
+        size: u64,
+    ) -> Option<[Option<u32>; OVERLAY_WORDS]> {
+        let channel = self
+            .current
+            .and_then(|index| self.channels[index].as_ref())?;
+        if !address.is_multiple_of(4) || size > 4 * OVERLAY_WORDS as u64 {
+            return None;
+        }
+        let rasterizer = &mut *self.rasterizer;
+        let written_pages = &self.written_pages;
+        let mut words = [None; OVERLAY_WORDS];
+        let mut known = true;
+        channel.setup.memory.for_each_range(address, size, |range| {
+            let RangeTarget::Device(daddr) = range.target else {
+                known = false;
+                return;
+            };
+            if !known || written_pages.may_be_written(daddr, range.size) {
+                known = false;
+                return;
+            }
+            let base = range.gpu_va - address;
+            known = rasterizer.pending_semaphore_words(daddr, range.size, &mut |at, word| {
+                words[((base + at - daddr) / 4) as usize] = Some(word);
+            });
+        });
+        (known && words.iter().any(Option::is_some)).then_some(words)
     }
 
     /// Whether GPU work may have written a page of the current channel's `[address, +size)`.
@@ -514,8 +490,6 @@ impl Back {
             tracing::warn!(address, "semaphore reduction on unmapped GPU memory");
             return;
         };
-        self.releases
-            .reduce(self.syncpoints.semaphore_waiters().landings(), daddr);
         self.rasterizer.signal_fence(FenceAction::ReduceSemaphore {
             address: daddr,
             op,
