@@ -606,6 +606,45 @@ struct StageSources<'a> {
     sampler_limit: u32,
 }
 
+thread_local! {
+    pub(super) static DIAG_MARKS: std::cell::Cell<[Option<std::time::Instant>; 3]> =
+        const { std::cell::Cell::new([None; 3]) };
+}
+
+pub(super) fn diag_mark(i: usize) {
+    DIAG_MARKS.with(|m| {
+        let mut a = m.get();
+        a[i] = Some(std::time::Instant::now());
+        m.set(a);
+    });
+}
+
+/// Logs the call when it took 50 ms or more, with the marks set since it started.
+pub(super) struct DiagTimer(pub &'static str, pub std::time::Instant);
+
+impl DiagTimer {
+    pub(super) fn start(name: &'static str) -> Self {
+        DIAG_MARKS.with(|m| m.set([None; 3]));
+        Self(name, std::time::Instant::now())
+    }
+}
+
+impl Drop for DiagTimer {
+    fn drop(&mut self) {
+        let total = self.1.elapsed();
+        if total >= std::time::Duration::from_millis(50) {
+            let marks = DIAG_MARKS
+                .with(|m| m.get())
+                .map(|m| m.map(|m| (m - self.1).as_secs_f32() * 1000.0));
+            tracing::info!(
+                "slow renderer call: {} {:.1} ms marks_ms={marks:?}",
+                self.0,
+                total.as_secs_f32() * 1000.0
+            );
+        }
+    }
+}
+
 impl VulkanRasterizer {
     pub(super) fn draw_graphics(
         &mut self,
@@ -630,9 +669,11 @@ impl VulkanRasterizer {
         if !self.graphics_stages(ctx, host_topology) {
             return Ok(());
         }
+        diag_mark(0);
         if !self.render_targets(ctx)? {
             return Ok(());
         }
+        diag_mark(1);
 
         let draw = &mut self.draw;
         let mut fixed = *draw
@@ -656,6 +697,7 @@ impl VulkanRasterizer {
         let Some(pipeline) = draw.pipelines.graphics(&key, &draw.stages) else {
             return Ok(());
         };
+        diag_mark(2);
         let pipeline_raw = pipeline.raw();
         let layout = pipeline.layout();
         let layout_raw = layout.raw();
@@ -2302,6 +2344,7 @@ impl VulkanRasterizer {
         else {
             return Ok(());
         };
+        diag_mark(0);
         let key = ComputePipelineKey {
             shader: module.hash,
             workgroup: ctx.block,
@@ -2310,6 +2353,7 @@ impl VulkanRasterizer {
         let Some(pipeline) = self.draw.pipelines.compute(&key, &module) else {
             return Ok(());
         };
+        diag_mark(1);
         let pipeline_raw = pipeline.raw();
         let layout_raw = pipeline.layout().raw();
         let push = pipeline.layout().push_constants();

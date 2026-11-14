@@ -975,6 +975,7 @@ impl VulkanRasterizer {
 impl Rasterizer for VulkanRasterizer {
     fn draw(&mut self, ctx: &mut GraphicsContext<'_>, draw: &DrawParams<'_>) {
         self.activity.draws += 1;
+        let _diag = draw::DiagTimer::start("draw");
         if let Err(error) = self.draw_graphics(ctx, draw::DrawCall::Direct(draw)) {
             tracing::error!(%error, "recording a draw failed");
         }
@@ -982,6 +983,7 @@ impl Rasterizer for VulkanRasterizer {
 
     fn draw_indirect(&mut self, ctx: &mut GraphicsContext<'_>, draw: &IndirectDraw) {
         self.activity.draws += 1;
+        let _diag = draw::DiagTimer::start("draw_indirect");
         if let Err(error) = self.draw_graphics(ctx, draw::DrawCall::Indirect(draw)) {
             tracing::error!(%error, "recording an indirect draw failed");
         }
@@ -1003,6 +1005,7 @@ impl Rasterizer for VulkanRasterizer {
 
     fn dispatch_compute(&mut self, ctx: &ComputeContext<'_>) {
         self.activity.dispatches += 1;
+        let _diag = draw::DiagTimer::start("dispatch");
         if let Err(error) = self.dispatch(ctx) {
             tracing::error!(%error, "recording a compute dispatch failed");
         }
@@ -1293,6 +1296,7 @@ impl Rasterizer for VulkanRasterizer {
 
     fn present(&mut self, framebuffer: &FramebufferConfig) {
         self.activity.presents += 1;
+        let _diag = draw::DiagTimer::start("present");
         let now = Instant::now();
         self.stalls
             .present(now, &self.draw.shaders, &self.draw.pipelines);
@@ -1301,6 +1305,7 @@ impl Rasterizer for VulkanRasterizer {
         self.draw.pipelines.autosave(now);
         self.draw.shaders.log_stats(now);
         self.draw.shaders.end_frame();
+        draw::diag_mark(0);
         for pipeline in self.draw.pipelines.replaced() {
             self.scheduler.retire(pipeline);
         }
@@ -1321,6 +1326,7 @@ impl Rasterizer for VulkanRasterizer {
             }
             Err(error) => Err(error),
         };
+        draw::diag_mark(1);
         if let Err(error) = result {
             tracing::error!(%error, "presenting a guest frame failed");
         }
@@ -1333,6 +1339,7 @@ impl Rasterizer for VulkanRasterizer {
             tracing::warn!(%error, ?path, "dumping a frame failed");
         }
         self.release_fences(false);
+        draw::diag_mark(2);
         let mut tx = Transfer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
