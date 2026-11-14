@@ -6,7 +6,8 @@ use ash::vk;
 use lichii_common::settings::{Anisotropy, GraphicsSettings, ResolutionScale};
 use lichii_gpu::backend::{
     ChannelId, ComputeContext, ConstBufferBinding, DrawParams, DrawTexture, GraphicsConstBuffers,
-    GraphicsContext, IndirectDraw, IndirectGrid, QmdVersion, Rasterizer,
+    GraphicsContext, IndirectDraw, IndirectGrid, QmdVersion, Query, QueryKind, Rasterizer,
+    ReleaseSize,
 };
 use lichii_gpu::engines::maxwell_3d::regs::{
     ClearSurface, DepthMode, IndexFormat, MAX_CONST_BUFFERS, MAX_SHADER_STAGE, MESH_CONTROL,
@@ -262,6 +263,63 @@ fn draws_hand_assembled_programs_and_reads_the_target_back() {
         (1, DescriptorKind::UniformBuffer),
         "the fragment stage numbers its bindings after the vertex stage's"
     );
+    f.assert_no_validation_errors();
+}
+
+/// Z-pass pixel count reports sum the samples of every draw since the counter's last reset,
+/// counting draws only while the counter is enabled.
+#[test]
+fn z_pass_reports_count_the_samples_of_enabled_draws_since_the_last_reset() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    const REPORT: u64 = 0x40_0000;
+    let report = |f: &mut Fixture| {
+        f.rasterizer.query(
+            ChannelId(0),
+            &gmmu,
+            &Query {
+                address: GPU_VA + REPORT,
+                kind: QueryKind::SamplesPassed,
+                payload: 0,
+                size: ReleaseSize::Eight,
+                after_work: true,
+            },
+        );
+        f.rasterizer.wait_for_idle();
+        f.memory.read::<u64>(DADDR + REPORT).unwrap()
+    };
+    let mut regs = draw_regs();
+    regs.zpass_pixel_count_enable = 1;
+    let pixels = u64::from(SIZE * SIZE);
+
+    f.rasterizer.reset_counter(QueryKind::SamplesPassed);
+    draw(&mut f, &gmmu, &regs);
+    assert_eq!(report(&mut f), pixels);
+    draw(&mut f, &gmmu, &regs);
+    assert_eq!(
+        report(&mut f),
+        2 * pixels,
+        "the count accumulates until a reset"
+    );
+
+    f.rasterizer.reset_counter(QueryKind::SamplesPassed);
+    assert_eq!(report(&mut f), 0);
+    regs.zpass_pixel_count_enable = 0;
+    draw(&mut f, &gmmu, &regs);
+    assert_eq!(
+        report(&mut f),
+        0,
+        "draws with the counter disabled are not counted"
+    );
+    regs.zpass_pixel_count_enable = 1;
+    draw(&mut f, &gmmu, &regs);
+    assert_eq!(report(&mut f), pixels);
     f.assert_no_validation_errors();
 }
 
