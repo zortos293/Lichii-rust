@@ -1074,18 +1074,26 @@ fn scaled_noperspective_inputs_read_times_frag_coord_w() {
         let frag_coord = module.annotations.iter().any(|i| {
             i.operands.get(2) == Some(&Operand::BuiltIn(rspirv::spirv::BuiltIn::FragCoord))
         });
-        let multiplies = module
-            .functions
-            .iter()
-            .flat_map(|f| &f.blocks)
-            .flat_map(|b| &b.instructions)
-            .filter(|i| i.class.opcode == Op::FMul)
-            .count();
+        let count = |op: Op| {
+            module
+                .functions
+                .iter()
+                .flat_map(|f| &f.blocks)
+                .flat_map(|b| &b.instructions)
+                .filter(|i| i.class.opcode == op)
+                .count()
+        };
+        let slope = (count(Op::DPdx), count(Op::DPdy));
         if scaled {
-            assert_eq!((noperspective, frag_coord), (0, true));
-            assert_eq!(multiplies, 5, "the direct, offset and three indexed reads");
+            assert_eq!((noperspective, frag_coord, slope), (0, true, (1, 1)));
+            assert_eq!(
+                count(Op::FMul),
+                7,
+                "the direct read, three indexed reads and the offset read with its W at the offset"
+            );
         } else {
-            assert_eq!((noperspective, frag_coord, multiplies), (3, false, 0));
+            assert_eq!((noperspective, frag_coord, slope), (3, false, (0, 0)));
+            assert_eq!(count(Op::FMul), 0);
         }
     }
 }

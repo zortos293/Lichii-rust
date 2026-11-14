@@ -374,6 +374,9 @@ pub(crate) struct EmitContext<'a> {
 
     pub need_input_position_indirect: bool,
     pub input_position: Word,
+    /// d/dx and d/dy of FragCoord.w, taken in the prologue where control flow is uniform, when
+    /// screen-linear inputs are read times FragCoord.w.
+    pub frag_w_slope: [Word; 2],
     pub input_generics: [InputGenericInfo; 32],
     pub output_point_size: Word,
     pub output_position: Word,
@@ -659,6 +662,7 @@ impl<'a> EmitContext<'a> {
             atomic_cas_global_func_u32: 0,
             need_input_position_indirect: false,
             input_position: 0,
+            frag_w_slope: [0; 2],
             input_generics: [InputGenericInfo::default(); 32],
             output_point_size: 0,
             output_position: 0,
@@ -2682,14 +2686,19 @@ impl<'a> EmitContext<'a> {
             InputGenericLoadOp::SToF => self.b.convert_s_to_f(f32_t, None, value)?,
             InputGenericLoadOp::UToF => self.b.convert_u_to_f(f32_t, None, value)?,
             InputGenericLoadOp::TimesFragCoordW => {
-                let w = self.const_u32(3);
-                let pointer =
-                    self.b
-                        .access_chain(self.input_f32, None, self.input_position, [w])?;
-                let w = self.b.load(f32_t, None, pointer, None, [])?;
+                let w = self.frag_coord_w()?;
                 self.b.f_mul(f32_t, None, value, w)?
             }
         })
+    }
+
+    /// Loads FragCoord.w, the reciprocal of the clip-space W interpolated screen-linear.
+    pub fn frag_coord_w(&mut self) -> EmitResult<Word> {
+        let w = self.const_u32(3);
+        let pointer = self
+            .b
+            .access_chain(self.input_f32, None, self.input_position, [w])?;
+        Ok(self.b.load(self.f32[1], None, pointer, None, [])?)
     }
 
     fn indexed_store_function(&mut self) -> EmitResult<Word> {
