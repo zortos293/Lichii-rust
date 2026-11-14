@@ -59,7 +59,7 @@ unsafe impl Sync for Code {}
 pub(super) struct Entry {
     pub code: Code,
     /// Guest bytes covered.
-    len: u64,
+    pub len: u64,
 }
 
 /// Code memory for one generation: one shared-memory object mapped twice, so blocks run from a
@@ -356,6 +356,8 @@ pub(super) struct Shared {
     current: AtomicPtr<Generation>,
     /// Bumped by every retirement.
     epoch: AtomicU64,
+    /// Bumped by every invalidation, so a translation that raced one is not published.
+    invalidations: AtomicU64,
     profile: bool,
 }
 
@@ -365,18 +367,19 @@ unsafe impl Send for Shared {}
 // SAFETY: as above.
 unsafe impl Sync for Shared {}
 
-type Registry = Vec<(Weak<AddressSpace>, u64, Weak<Shared>)>;
+type Registry = Vec<(Weak<AddressSpace>, [u64; 3], Weak<Shared>)>;
 static SHARED: Mutex<Registry> = Mutex::new(Vec::new());
 
 impl Shared {
-    /// The code shared by every core of `memory` whose blocks compile like `flavour`.
-    pub fn of(memory: &Arc<AddressSpace>, flavour: u64, profile: bool) -> Option<Arc<Self>> {
+    /// The code shared by every core of `memory` whose blocks compile alike: `key` holds every
+    /// input of the translator and emitter that can differ between such cores.
+    pub fn of(memory: &Arc<AddressSpace>, key: [u64; 3], profile: bool) -> Option<Arc<Self>> {
         let mut registry = SHARED.lock().unwrap_or_else(|e| e.into_inner());
         registry
             .retain(|(memory, _, shared)| memory.strong_count() > 0 && shared.strong_count() > 0);
         let found = registry
             .iter()
-            .find(|(m, f, _)| *f == flavour && std::ptr::eq(m.as_ptr(), Arc::as_ptr(memory)))
+            .find(|(m, k, _)| *k == key && std::ptr::eq(m.as_ptr(), Arc::as_ptr(memory)))
             .and_then(|(_, _, shared)| shared.upgrade());
         if found.is_some() {
             return found;
@@ -394,9 +397,10 @@ impl Shared {
             }),
             current: AtomicPtr::new(Box::into_raw(generation)),
             epoch: AtomicU64::new(0),
+            invalidations: AtomicU64::new(0),
             profile,
         });
-        registry.push((Arc::downgrade(memory), flavour, Arc::downgrade(&shared)));
+        registry.push((Arc::downgrade(memory), key, Arc::downgrade(&shared)));
         Some(shared)
     }
 
@@ -421,13 +425,24 @@ impl Shared {
         (g.id, g.trampoline, g.materialize, g.miss)
     }
 
-    /// Adds the block at `start` to the current generation, unless another core added it first,
-    /// and returns the block's entry and the generation it lives in.
-    fn insert(&self, start: u64, len: u64, body: Result<Compiled, Inst>) -> (Entry, u64) {
+    /// Adds the block at `start`, translated from guest memory read after the invalidation count
+    /// was `seen`, to the current generation, unless another core added it first. Returns the
+    /// block's entry and the generation it lives in, or `None` when an invalidation ran since
+    /// `seen` or the generation is full and no fresh one can be mapped.
+    fn insert(
+        &self,
+        start: u64,
+        len: u64,
+        body: Result<Compiled, Inst>,
+        seen: u64,
+    ) -> Option<(Entry, u64)> {
         let mut w = self.lock();
+        if self.invalidations.load(Ordering::Relaxed) != seen {
+            return None;
+        }
         let generation = self.current();
         if let Some(&index) = w.by_start.get(&start) {
-            return (generation.block(index), generation.id);
+            return Some((generation.block(index), generation.id));
         }
         let (bytes, sites) = body
             .as_ref()
@@ -436,8 +451,8 @@ impl Shared {
             || 2 * (w.keys + 1) > 1 << LOOKUP_BITS
             || generation.sites.len.load(Ordering::Relaxed) + sites > SITES
             || w.used.next_multiple_of(16) + bytes > CODE_SIZE;
-        if full {
-            self.retire(&mut w);
+        if full && !self.retire(&mut w) {
+            return None;
         }
         let generation = self.current();
         let code = match body {
@@ -472,15 +487,17 @@ impl Shared {
             w.keys += 1;
         }
         w.by_start.insert(start, index);
-        (entry, generation.id)
+        Some((entry, generation.id))
     }
 
     /// Replaces the current generation with a fresh one and frees the retired ones no core can
-    /// still be running.
-    fn retire(&self, w: &mut Writer) {
-        let id = self.current().id + 1;
-        let (fresh, used) =
-            Generation::new(id, self.profile).expect("the host cannot map more JIT code");
+    /// still be running. Returns false, changing nothing, when no fresh generation can be mapped
+    /// or every fault-table slot is taken.
+    fn retire(&self, w: &mut Writer) -> bool {
+        self.collect(w);
+        let Some((fresh, used)) = Generation::new(self.current().id + 1, self.profile) else {
+            return false;
+        };
         let old = self.current.swap(Box::into_raw(fresh), Ordering::SeqCst);
         let epoch = self.epoch.fetch_add(1, Ordering::SeqCst) + 1;
         // SAFETY: `old` came from `Box::into_raw` and is no longer current.
@@ -491,6 +508,7 @@ impl Shared {
         w.by_start.clear();
         w.links.clear();
         self.collect(w);
+        true
     }
 
     /// Frees the retired generations every core has left the dispatcher since.
@@ -515,6 +533,7 @@ impl Shared {
         let end = addr.saturating_add(size);
         let first = addr.saturating_sub(PAGE_SIZE);
         let mut w = self.lock();
+        self.invalidations.fetch_add(1, Ordering::Release);
         let generation = self.current();
         let doomed: Vec<u64> = w
             .by_start
@@ -554,9 +573,10 @@ impl Shared {
         w.links.entry(target).or_default().push(site);
     }
 
-    fn clear(&self) {
+    /// Moves every core to a fresh generation. Returns false when none can be mapped.
+    fn clear(&self) -> bool {
         let mut w = self.lock();
-        self.retire(&mut w);
+        self.retire(&mut w)
     }
 }
 
@@ -671,6 +691,12 @@ impl JitCache {
         self.adopted
     }
 
+    /// The count of invalidations so far, to read before the guest memory a translation reads
+    /// and pass to [`JitCache::insert`].
+    pub fn invalidations(&self) -> u64 {
+        self.shared.invalidations.load(Ordering::Acquire)
+    }
+
     /// Blocks in the shared code's current generation.
     #[cfg(test)]
     pub fn shared_blocks(&self) -> usize {
@@ -711,21 +737,36 @@ impl JitCache {
         if self.sync() {
             return None;
         }
-        let entry = self.shared.current().find(pc)?;
+        let generation = self.shared.current();
+        if generation.id != self.generation {
+            return None;
+        }
+        let entry = generation.find(pc)?;
         self.adopted += 1;
         self.remember(pc, entry);
         Some(entry)
     }
 
-    /// Adds a block covering guest `[start, start + len)` to the shared code, or takes the one
-    /// another core added first.
-    pub fn insert(&mut self, start: u64, len: u64, body: Result<Compiled, Inst>) -> Entry {
-        let (entry, generation) = self.shared.insert(start, len, body);
+    /// Adds a block covering guest `[start, start + len)`, translated after
+    /// [`JitCache::invalidations`] returned `seen`, to the shared code, or takes the one another
+    /// core added first. `None` when the block must not run: an invalidation raced the
+    /// translation, the shared code moved past the block's generation, or no generation has room.
+    pub fn insert(
+        &mut self,
+        start: u64,
+        len: u64,
+        body: Result<Compiled, Inst>,
+        seen: u64,
+    ) -> Option<Entry> {
+        let (entry, generation) = self.shared.insert(start, len, body, seen)?;
         if generation != self.generation {
             self.sync();
         }
+        if generation != self.generation {
+            return None;
+        }
         self.remember(start, entry);
-        entry
+        Some(entry)
     }
 
     fn remember(&mut self, start: u64, entry: Entry) {
@@ -774,9 +815,12 @@ impl JitCache {
     }
 
     /// Discards all translated code of every core: the shared code moves to a fresh generation,
-    /// which each core picks up the next time it enters the dispatcher or misses.
+    /// which each core picks up the next time it enters the dispatcher or misses. When no fresh
+    /// generation can be mapped, drops every block of the shared code and of this core instead.
     pub fn clear(&mut self) {
-        self.shared.clear();
+        if !self.shared.clear() {
+            self.invalidate(0, u64::MAX);
+        }
     }
 }
 

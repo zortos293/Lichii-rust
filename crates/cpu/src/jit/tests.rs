@@ -1725,7 +1725,7 @@ fn counter_reads_follow_the_tsc_scale() {
             accuracy: CpuAccuracy::Auto,
         })
         .unwrap();
-        assert!(jit.target.tsc_scale.is_some());
+        assert!(jit.target.tsc_scale);
         let mut ctx = ThreadContext {
             pc: CODE,
             ..Default::default()
@@ -2687,4 +2687,101 @@ fn cores_run_while_another_clears_the_shared_code() {
             });
         }
     });
+}
+
+fn core_on(
+    mem: &Arc<AddressSpace>,
+    core_index: usize,
+    clock: Arc<dyn GuestClock>,
+    ctr_el0: u32,
+) -> Jit {
+    Jit::new(CpuConfig {
+        memory: mem.clone(),
+        monitor: Arc::new(ExclusiveMonitor::new(core_index + 1)),
+        clock,
+        core_index,
+        ctr_el0,
+        dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+        accuracy: CpuAccuracy::Auto,
+    })
+    .unwrap()
+}
+
+fn run_to_brk(core: &mut Jit) -> [u64; 31] {
+    let mut ctx = ThreadContext {
+        pc: CODE,
+        ..Default::default()
+    };
+    assert_eq!(core.run(&mut ctx), HaltReason::Breakpoint(0));
+    ctx.x
+}
+
+#[test]
+fn a_translation_that_raced_an_invalidation_is_not_shared() {
+    const MOV_X0_1: u32 = 0xd280_0020;
+    const MOV_X0_2: u32 = 0xd280_0040;
+    let (mem, mut cores) = shared_cores(2);
+    mem.write(CODE, MOV_X0_1).unwrap();
+    mem.write(CODE + 4, BRK).unwrap();
+    let seen = cores[0].cache.invalidations();
+    mem.write(CODE, MOV_X0_2).unwrap();
+    cores[1].invalidate_code(CODE, 4);
+    let stale = Err(decode(MOV_X0_1));
+    assert!(cores[0].cache.insert(CODE, 4, stale, seen).is_none());
+    assert_eq!(cores[0].cache.shared_blocks(), 0);
+    for core in &mut cores {
+        assert_eq!(run_to_brk(core)[0], 2);
+    }
+}
+
+struct Configured(u64);
+
+impl GuestClock for Configured {
+    fn ticks(&self) -> u64 {
+        0
+    }
+
+    fn frequency(&self) -> u64 {
+        self.0
+    }
+}
+
+#[test]
+fn cores_with_other_clocks_or_registers_do_not_share_blocks() {
+    const MRS_X0_CNTFRQ: u32 = 0xd53b_e000;
+    const MRS_X1_CTR: u32 = 0xd53b_0021;
+    let (mem, _) = shared_cores(0);
+    for (i, word) in [MRS_X0_CNTFRQ, MRS_X1_CTR, BRK].into_iter().enumerate() {
+        mem.write(CODE + 4 * i as u64, word).unwrap();
+    }
+    let ctr = CpuConfig::DEFAULT_CTR_EL0;
+    let mut cores = [
+        core_on(&mem, 0, Arc::new(Configured(19_200_000)), ctr),
+        core_on(&mem, 1, Arc::new(Configured(1_000_000)), ctr),
+        core_on(&mem, 2, Arc::new(Configured(19_200_000)), ctr ^ 1),
+    ];
+    let expected = [(19_200_000, ctr), (1_000_000, ctr), (19_200_000, ctr ^ 1)];
+    for (core, (frequency, ctr)) in cores.iter_mut().zip(expected) {
+        let x = run_to_brk(core);
+        assert_eq!((x[0], x[1]), (frequency, u64::from(ctr)));
+        assert_eq!(core.cache.adopted(), 0);
+    }
+}
+
+#[test]
+fn cores_sharing_code_read_their_own_tsc_scale() {
+    const MRS_X0_CNTVCT: u32 = 0xd53b_e040;
+    let (mem, _) = shared_cores(0);
+    mem.write(CODE, MRS_X0_CNTVCT).unwrap();
+    mem.write(CODE + 4, BRK).unwrap();
+    let ctr = CpuConfig::DEFAULT_CTR_EL0;
+    let mut cores = [12345, 67890]
+        .map(|offset| Arc::new(TscClock(TscScale::new(0, 0, offset))))
+        .into_iter()
+        .enumerate()
+        .map(|(i, clock)| core_on(&mem, i, clock, ctr))
+        .collect::<Vec<_>>();
+    assert_eq!(run_to_brk(&mut cores[0])[0], 12345);
+    assert_eq!(run_to_brk(&mut cores[1])[0], 67890);
+    assert!(cores[1].cache.adopted() > 0);
 }
