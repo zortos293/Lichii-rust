@@ -274,6 +274,11 @@ struct CachedImage {
     views: Vec<(ViewKey, ImageView)>,
     /// Guest memory changed since the last upload.
     cpu_dirty: bool,
+    /// While `cpu_dirty`: every subresource uploads again, not only those in `dirty_subresources`.
+    dirty_whole: bool,
+    /// While `cpu_dirty` and not `dirty_whole`: a bit per subresource the guest CPU wrote,
+    /// layer-major, that the next upload refreshes.
+    dirty_subresources: Vec<u64>,
     /// Write tracking over the segments the last upload read, so a guest CPU write to them
     /// invalidates the image. Empty before the first upload and after an invalidation.
     tracked: Vec<CachedPages>,
@@ -324,6 +329,59 @@ impl CachedImage {
             .iter()
             .map(|s| memory.cache_pages(s.daddr, s.size))
             .collect();
+    }
+
+    /// Guest memory must replace every texel on the next upload.
+    fn mark_dirty_whole(&mut self) {
+        self.cpu_dirty = true;
+        self.dirty_whole = true;
+    }
+
+    /// The guest CPU wrote `[daddr, daddr + size)`: the subresources holding those bytes upload
+    /// again. Write tracking stays on the other pages, so later writes there are still seen.
+    fn mark_cpu_written(&mut self, daddr: DAddr, size: u64) {
+        if !self.cpu_dirty {
+            self.cpu_dirty = true;
+            self.dirty_whole = !self.keep_out.is_empty();
+            self.dirty_subresources.clear();
+        }
+        if self.dirty_whole {
+            return;
+        }
+        let info = self.info;
+        let levels = self.image.desc().mip_levels;
+        let count = info.layers as usize * levels as usize;
+        self.dirty_subresources.resize(count.div_ceil(64), 0);
+        let end = daddr.saturating_add(size);
+        for s in &self.segments {
+            let (lo, hi) = (daddr.max(s.daddr), end.min(s.daddr + s.size));
+            if lo >= hi {
+                continue;
+            }
+            let (lo, hi) = (s.offset + (lo - s.daddr), s.offset + (hi - s.daddr));
+            let layers = match lo.checked_div(info.layer_stride) {
+                Some(first) if info.layers > 1 => {
+                    let last = ((hi - 1) / info.layer_stride).min(u64::from(info.layers) - 1);
+                    first as u32..last as u32 + 1
+                }
+                _ => 0..info.layers,
+            };
+            for layer in layers {
+                for level in 0..levels {
+                    let start = info.subresource_offset(level, layer);
+                    if start < hi && lo < start + info.level_size(level) {
+                        let bit = (layer * levels + level) as usize;
+                        self.dirty_subresources[bit / 64] |= 1 << (bit % 64);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether the next upload refreshes `level` of `layer`.
+    fn upload_due(&self, layer: u32, level: u32) -> bool {
+        let bit = (layer * self.image.desc().mip_levels + level) as usize;
+        self.dirty_whole || self.dirty_subresources[bit / 64] & (1 << (bit % 64)) != 0
     }
 
     /// Whether the guest format can be written back from the host image.
@@ -1169,9 +1227,8 @@ impl TextureCache {
                 result = result.and(written_back);
             }
             let image = self.image(id);
-            image.cpu_dirty = true;
+            image.mark_cpu_written(daddr, size);
             image.gpu_modified = false;
-            image.tracked.clear();
         }
         ids.clear();
         self.ids = ids;
@@ -1191,8 +1248,7 @@ impl TextureCache {
         for &id in &ids {
             let image = self.image(id);
             if !image.gpu_modified {
-                image.cpu_dirty = true;
-                image.tracked.clear();
+                image.mark_cpu_written(daddr, size);
             }
         }
         self.ids = ids;
@@ -2026,6 +2082,8 @@ impl TextureCache {
             segments,
             views: Vec::new(),
             cpu_dirty: true,
+            dirty_whole: true,
+            dirty_subresources: Vec::new(),
             tracked: Vec::new(),
             gpu_modified: false,
             modified: 0,
@@ -2158,6 +2216,9 @@ impl TextureCache {
         }
         self.take_from_overlaps(tx, id)?;
         if self.image(id).cpu_dirty {
+            if self.image(id).scale != ResolutionScale::X1 {
+                self.image(id).mark_dirty_whole();
+            }
             self.rescale(tx, id, ResolutionScale::X1, false)?;
             self.upload(tx, id)?;
             let tick = self.tick;
@@ -2199,7 +2260,7 @@ impl TextureCache {
         result?;
         let image = self.image(id);
         image.gpu_modified = false;
-        image.cpu_dirty = true;
+        image.mark_dirty_whole();
         Ok(())
     }
 
@@ -2394,8 +2455,8 @@ impl TextureCache {
         let levels = image.image.desc().mip_levels;
         let align = alignment(&host, format);
         let mut total = 0u64;
-        for _ in 0..info.layers {
-            for level in 0..levels {
+        for layer in 0..info.layers {
+            for level in (0..levels).filter(|&level| image.upload_due(layer, level)) {
                 let layout = convert::host_layout(format, &host, info.level_extent(level));
                 total = total.next_multiple_of(align) + layout.total() as u64;
                 total = total.next_multiple_of(align);
@@ -2411,7 +2472,7 @@ impl TextureCache {
         let direct =
             host.conversion == Conversion::None && convert::depth_planes(host.format).is_none();
         for layer in 0..info.layers {
-            for level in 0..levels {
+            for level in (0..levels).filter(|&level| image.upload_due(layer, level)) {
                 let extent = info.level_extent(level);
                 let layout = convert::host_layout(format, &host, extent);
                 offset = offset.next_multiple_of(align as usize);
@@ -2498,7 +2559,9 @@ impl TextureCache {
             }
         }
         let cmd = tx.scheduler.record()?;
-        image.access.layout = vk::ImageLayout::UNDEFINED;
+        if image.dirty_whole {
+            image.access.layout = vk::ImageLayout::UNDEFINED;
+        }
         image.transition(&device, cmd, ImageAccess::TRANSFER_DST);
         // SAFETY: the image is in TRANSFER_DST layout and every region reads staged bytes the
         // host layout sized.

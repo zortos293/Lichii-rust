@@ -2331,3 +2331,49 @@ fn block_linear_aliases_need_the_same_depth_stencil_encoding() {
         Some(((0, 0), (0, 0), (252, 64)))
     );
 }
+
+#[test]
+fn cpu_writes_upload_only_the_layers_they_touch() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let header = tic(0x08, GPU_VA, 64, 64, 4, 1, 3);
+    let info = ImageInfo::from_texture(&header.decode().unwrap(), GobLayout::Tegra).unwrap();
+    let pattern: Vec<u8> = (0..info.size_bytes())
+        .map(|i| (i * 13 + i / 97) as u8)
+        .collect();
+    f.memory.write_bytes(DADDR, &pattern).unwrap();
+    let (texture, _) = f.texture(&header);
+    let before = f.read_image(texture);
+    let uploaded = f.cache.traffic();
+    let layer = info.layer_stride;
+    f.memory
+        .write_bytes(DADDR + 2 * layer + 256, &[0xab; 64])
+        .unwrap();
+    {
+        let (mut tx, cache, _) = f.tx();
+        cache
+            .invalidate(&mut tx, DADDR + 2 * layer + 256, 64)
+            .unwrap();
+    }
+    assert_eq!(f.texture(&header).0, texture);
+    let traffic = f.cache.traffic();
+    assert_eq!(traffic.uploads, uploaded.uploads + 1);
+    assert_eq!(
+        traffic.upload_bytes - uploaded.upload_bytes,
+        64 * 64 * 4,
+        "only layer 2 uploads again"
+    );
+    let after = f.read_image(texture);
+    for l in [0, 1, 3] {
+        assert_eq!(after[l], before[l], "layer {l} keeps its texels");
+    }
+    assert_ne!(after[2], before[2], "layer 2 takes the CPU's bytes");
+    let changed = after[2]
+        .iter()
+        .zip(&before[2])
+        .filter(|(a, b)| a != b)
+        .count();
+    assert!(changed > 0 && changed <= 64, "{changed} bytes changed");
+    f.assert_no_validation_errors();
+}
