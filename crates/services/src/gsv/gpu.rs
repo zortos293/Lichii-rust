@@ -281,8 +281,9 @@ impl GpuSession {
     fn create_memory(&self, ctx: &mut HleRequestContext) -> ResultCode {
         let words = Words::command(ctx);
         let (first, last) = (words.u64(2), words.u64(4));
-        let Some(size) = last.checked_sub(first).map(|n| n + 1) else {
-            tracing::warn!("nx2:gpu 101: empty range [{first:#x}, {last:#x}]");
+        let size = last.checked_sub(first).and_then(|n| n.checked_add(1));
+        let Some(size) = size.filter(|&size| first.checked_add(size).is_some()) else {
+            tracing::warn!("nx2:gpu 101: bad range [{first:#x}, {last:#x}]");
             return lichii_kernel::result::INVALID_SIZE;
         };
         let Some(memory) = self.memory() else {

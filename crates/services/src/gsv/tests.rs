@@ -376,6 +376,20 @@ fn fresh_gpu_memory_is_mapped_before_the_reply_without_the_back_thread() {
 }
 
 #[test]
+fn gpu_memory_ranges_reaching_the_end_of_the_address_space_are_refused() {
+    let (_context, client, gsv) = gsv();
+    let gpu = session(&client, gsv, 497);
+    for (first, last) in [(0x1000, u64::MAX), (0, u64::MAX)] {
+        let create = words(
+            Request::tipc(101),
+            &[split(first), split(last), [0, 0]].concat(),
+        );
+        let reply = client.send(gpu, &create).unwrap();
+        assert_eq!(reply.result, lichii_kernel::result::INVALID_SIZE);
+    }
+}
+
+#[test]
 fn gpu_memory_over_queued_changes_is_made_in_order() {
     let (context, client, gsv) = gsv();
     let gpu = session(&client, gsv, 497);
