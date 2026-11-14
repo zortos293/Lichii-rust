@@ -779,6 +779,7 @@ impl KernelInner {
             .write()
             .add(KObject::Thread(thread.clone()))?;
         thread.context.lock().x[1] = handle as u64;
+        thread.retain();
         process.set_state(ProcessState::Running);
         let mut s = thread.sched.lock();
         self.scheduler.enqueue(&thread, &mut s, false);
@@ -826,7 +827,7 @@ impl KernelInner {
         thread.mark_terminated();
         self.scheduler.clear_running(core);
         thread.sync.signal();
-        svc::release_thread_resources(thread);
+        thread.release();
         let process = thread.process();
         if process.remove_thread(thread) {
             process.finalize();

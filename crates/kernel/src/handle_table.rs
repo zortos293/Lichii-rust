@@ -51,6 +51,9 @@ impl HandleTable {
         } else {
             linear_id + 1
         };
+        if let KObject::Thread(thread) = &object {
+            thread.retain();
+        }
         self.entries[index as usize] = Some(Entry { linear_id, object });
         self.count += 1;
         self.peak = self.peak.max(self.count);
@@ -86,6 +89,9 @@ impl HandleTable {
         let entry = self.entries[index].take()?;
         self.free.push(index as u16);
         self.count -= 1;
+        if let KObject::Thread(thread) = &entry.object {
+            thread.release();
+        }
         Some(entry.object)
     }
 
@@ -113,11 +119,16 @@ impl HandleTable {
     }
 
     pub fn clear(&mut self) -> Vec<KObject> {
-        let objects = self
+        let objects: Vec<KObject> = self
             .entries
             .iter_mut()
             .filter_map(|e| e.take().map(|e| e.object))
             .collect();
+        for object in &objects {
+            if let KObject::Thread(thread) = object {
+                thread.release();
+            }
+        }
         let size = self.entries.len();
         self.free = (0..size as u16).rev().collect();
         self.count = 0;
