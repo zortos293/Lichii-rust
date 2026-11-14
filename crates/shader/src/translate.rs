@@ -298,29 +298,31 @@ fn build(
     let stage = env.stage();
     let arch = env.arch();
     let base = env.start_address();
-    let cfg = match arch {
+    let cfg = crate::stage(0, || match arch {
         ShaderArch::Maxwell => {
-            Cfg::build(&MaxwellFlow { base }, env, 0, stage == ShaderStage::VertexA)?
+            Cfg::build(&MaxwellFlow { base }, env, 0, stage == ShaderStage::VertexA)
         }
-        ShaderArch::Ampere => Cfg::build(&AmpereFlow { base }, env, 0, false)?,
-    };
+        ShaderArch::Ampere => Cfg::build(&AmpereFlow { base }, env, 0, false),
+    })?;
     let options = StructureOptions {
         converge_exits: matches!(stage, ShaderStage::Task | ShaderStage::Mesh),
         reorder_demotes: host.needs_demote_reorder,
     };
-    structure(
-        ir,
-        &cfg,
-        options,
-        &mut |prog, block, begin, end| match arch {
-            ShaderArch::Maxwell => {
-                crate::maxwell::translate::translate_block(prog, block, env, begin, end)
-            }
-            ShaderArch::Ampere => {
-                crate::ampere::translate::translate_block(prog, block, env, begin, end)
-            }
-        },
-    )?;
+    crate::stage(1, || {
+        structure(
+            ir,
+            &cfg,
+            options,
+            &mut |prog, block, begin, end| match arch {
+                ShaderArch::Maxwell => {
+                    crate::maxwell::translate::translate_block(prog, block, env, begin, end)
+                }
+                ShaderArch::Ampere => {
+                    crate::ampere::translate::translate_block(prog, block, env, begin, end)
+                }
+            },
+        )
+    })?;
     opt::compute_post_order(ir);
     Ok(())
 }
@@ -362,24 +364,24 @@ fn optimize(
     if !host.support_conditional_barrier {
         opt::conditional_barrier(ir, info);
     }
-    opt::ssa_rewrite(ir);
-    opt::constant_propagation(env, ir);
+    crate::stage(2, || opt::ssa_rewrite(ir));
+    crate::stage(3, || opt::constant_propagation(env, ir));
     opt::position(env, ir, info);
     opt::blit_constants(env, ir, info);
-    opt::global_memory_to_storage_buffer(env, ir, info, profile)?;
+    crate::stage(4, || opt::global_memory_to_storage_buffer(env, ir, info, profile))?;
     opt::geometry_compaction(ir, stage, program.invocations, host);
-    opt::texture_pass(env, ir, info, host)?;
+    crate::stage(5, || opt::texture_pass(env, ir, info, host))?;
     if scale != ResolutionScale::X1 {
         opt::rescaling(ir, stage, scale);
     }
-    opt::dead_code_elimination(ir);
-    opt::identity_removal(ir);
+    crate::stage(6, || opt::dead_code_elimination(ir));
+    crate::stage(7, || opt::identity_removal(ir));
     tighten_output_vertices(program);
     let TranslatedProgram { ir, info, .. } = program;
     if cfg!(debug_assertions) {
         opt::verify(ir).map_err(TranslateError::InvalidIr)?;
     }
-    opt::collect_shader_info(env, ir, info);
+    crate::stage(8, || opt::collect_shader_info(env, ir, info));
     if stage == ShaderStage::Mesh {
         for &line in info
             .mesh

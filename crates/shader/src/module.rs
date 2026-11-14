@@ -18,7 +18,8 @@ pub fn compile(
     runtime: &RuntimeInfo,
     bindings: &mut Bindings,
 ) -> Result<ShaderModule, TranslateError> {
-    finish(translate(env, options)?, options, runtime, bindings)
+    crate::STAGE_NS[11].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::stage(10, || finish(translate(env, options)?, options, runtime, bindings))
 }
 
 /// Like [`compile`] for a VertexA/VertexB pair, which becomes one VertexB module.
@@ -29,12 +30,15 @@ pub fn compile_dual_vertex(
     runtime: &RuntimeInfo,
     bindings: &mut Bindings,
 ) -> Result<ShaderModule, TranslateError> {
-    finish(
-        translate_dual_vertex(env_a, env_b, options)?,
-        options,
-        runtime,
-        bindings,
-    )
+    crate::STAGE_NS[11].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::stage(10, || {
+        finish(
+            translate_dual_vertex(env_a, env_b, options)?,
+            options,
+            runtime,
+            bindings,
+        )
+    })
 }
 
 fn finish(
@@ -45,7 +49,7 @@ fn finish(
 ) -> Result<ShaderModule, TranslateError> {
     let incoming = *bindings;
     let first_binding = bindings.unified;
-    let spirv = emit_spirv(options.profile, runtime, &program, bindings)?;
+    let spirv = crate::stage(9, || emit_spirv(options.profile, runtime, &program, bindings))?;
     let resources = ResourceLayout::for_module(&program.info, first_binding);
     debug_assert_eq!(resources.next_binding(first_binding), bindings.unified);
     let mut hasher = StableHasher::new();

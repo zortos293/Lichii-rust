@@ -49,6 +49,18 @@ pub mod profile;
 pub mod runtime;
 pub mod translate;
 
+pub static STAGE_NS: [std::sync::atomic::AtomicU64; 12] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+pub const STAGE_NAMES: [&str; 12] = [
+    "cfg", "structure", "ssa", "constprop", "gmem", "texture", "dce", "other_opt", "info", "spirv", "total", "programs",
+];
+pub fn stage<R>(i: usize, f: impl FnOnce() -> R) -> R {
+    let start = std::time::Instant::now();
+    let r = f();
+    STAGE_NS[i].fetch_add(start.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    r
+}
+
 pub use info::ShaderInfo;
 pub use module::{
     DescriptorBinding, DescriptorKind, DescriptorSetLayout, ResourceLayout, ShaderModule, compile,

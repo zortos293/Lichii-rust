@@ -294,6 +294,15 @@ impl ShaderCache {
             disk_hits,
         } = self.stats;
         tracing::info!(translated, failed, hits, disk_hits, "shader cache");
+        let stages: Vec<String> = lichii_shader::STAGE_NAMES
+            .iter()
+            .zip(&lichii_shader::STAGE_NS)
+            .map(|(n, v)| {
+                let v = v.load(std::sync::atomic::Ordering::Relaxed);
+                if *n == "programs" { format!("{n}={v}") } else { format!("{n}={:.1}", v as f64 / 1e6) }
+            })
+            .collect();
+        tracing::info!("translate stages ms: {}", stages.join(" "));
         self.logged = (self.stats, Some(now));
         true
     }
