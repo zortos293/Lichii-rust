@@ -73,6 +73,28 @@ const SHADER_SAMPLED: ImageAccess = ImageAccess {
     access: vk::AccessFlags2::SHADER_SAMPLED_READ,
 };
 
+/// A colour target the same draw samples, in the one layout both uses allow.
+const FEEDBACK_COLOR: ImageAccess = ImageAccess {
+    layout: vk::ImageLayout::GENERAL,
+    stage: vk::PipelineStageFlags2::ALL_COMMANDS,
+    access: vk::AccessFlags2::from_raw(
+        vk::AccessFlags2::COLOR_ATTACHMENT_READ.as_raw()
+            | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE.as_raw()
+            | vk::AccessFlags2::SHADER_SAMPLED_READ.as_raw(),
+    ),
+};
+
+/// A depth target the same draw samples, in the one layout both uses allow.
+const FEEDBACK_DEPTH: ImageAccess = ImageAccess {
+    layout: vk::ImageLayout::GENERAL,
+    stage: vk::PipelineStageFlags2::ALL_COMMANDS,
+    access: vk::AccessFlags2::from_raw(
+        vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ.as_raw()
+            | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE.as_raw()
+            | vk::AccessFlags2::SHADER_SAMPLED_READ.as_raw(),
+    ),
+};
+
 const SHADER_STORAGE: ImageAccess = ImageAccess {
     layout: vk::ImageLayout::GENERAL,
     stage: vk::PipelineStageFlags2::ALL_COMMANDS,
@@ -238,6 +260,11 @@ impl DrawState {
     fn presented_only(&self) -> bool {
         let mut colors = self.colors.iter().flatten().peekable();
         colors.peek().is_some() && colors.all(|t| self.presented.contains(&Some(t.id)))
+    }
+
+    /// Whether `id` is one of the draw's colour or depth targets.
+    fn is_target(&self, id: ImageId) -> bool {
+        self.colors.iter().flatten().any(|t| t.id == id) || self.depth.is_some_and(|d| d.id == id)
     }
 
     pub(super) fn new(
@@ -800,8 +827,10 @@ impl VulkanRasterizer {
             (_, indirect) => (index, indirect),
         };
         for &id in &self.draw.textures {
-            self.texture_cache
-                .prepare(&mut self.scheduler, id, SHADER_SAMPLED)?;
+            if !self.draw.is_target(id) {
+                self.texture_cache
+                    .prepare(&mut self.scheduler, id, SHADER_SAMPLED)?;
+            }
         }
         for &(id, _) in &self.draw.storage_images {
             self.texture_cache
@@ -837,26 +866,26 @@ impl VulkanRasterizer {
             depth: self.draw.depth.map_or(vk::ImageView::null(), |d| d.view),
             extent,
         };
-        let continues = self.scheduler.rendering() == Some(key)
-            && self.draw.colors.iter().flatten().all(|t| {
-                self.texture_cache
-                    .is_in(t.id, ImageAccess::COLOR_ATTACHMENT)
+        let draw = &self.draw;
+        let colors = draw.colors.map(|t| {
+            t.map(|t| match draw.textures.contains(&t.id) {
+                true => (t.id, FEEDBACK_COLOR),
+                false => (t.id, ImageAccess::COLOR_ATTACHMENT),
             })
-            && self
-                .draw
-                .depth
-                .is_none_or(|d| self.texture_cache.is_in(d.id, DEPTH_ATTACHMENT));
+        });
+        let depth = draw.depth.map(|d| match draw.textures.contains(&d.id) {
+            true => (d.id, FEEDBACK_DEPTH),
+            false => (d.id, DEPTH_ATTACHMENT),
+        });
+        let continues = self.scheduler.rendering() == Some(key)
+            && colors.iter().flatten().chain(&depth).all(|&(id, access)| {
+                ![FEEDBACK_COLOR, FEEDBACK_DEPTH].contains(&access)
+                    && self.texture_cache.is_in(id, access)
+            });
         if !continues {
-            for target in self.draw.colors.iter().flatten() {
-                self.texture_cache.prepare(
-                    &mut self.scheduler,
-                    target.id,
-                    ImageAccess::COLOR_ATTACHMENT,
-                )?;
-            }
-            if let Some(depth) = self.draw.depth {
+            for &(id, access) in colors.iter().flatten().chain(&depth) {
                 self.texture_cache
-                    .prepare(&mut self.scheduler, depth.id, DEPTH_ATTACHMENT)?;
+                    .prepare(&mut self.scheduler, id, access)?;
             }
         }
         let raw = &self.device.raw;
@@ -867,19 +896,21 @@ impl VulkanRasterizer {
             .iter()
             .rposition(Option::is_some)
             .map_or(0, |i| i + 1);
-        for target in &draw.colors[..last] {
+        for (target, access) in draw.colors[..last].iter().zip(colors) {
+            let layout =
+                access.map_or(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, |(_, a)| a.layout);
             draw.attachments.push(
                 vk::RenderingAttachmentInfo::default()
                     .image_view(target.map_or(vk::ImageView::null(), |t| t.view))
-                    .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .image_layout(layout)
                     .load_op(vk::AttachmentLoadOp::LOAD)
                     .store_op(vk::AttachmentStoreOp::STORE),
             );
         }
-        let depth_attachment = draw.depth.map(|depth| {
+        let depth_attachment = draw.depth.zip(depth).map(|(target, (_, access))| {
             vk::RenderingAttachmentInfo::default()
-                .image_view(depth.view)
-                .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                .image_view(target.view)
+                .image_layout(access.layout)
                 .load_op(vk::AttachmentLoadOp::LOAD)
                 .store_op(vk::AttachmentStoreOp::STORE)
         });
@@ -1360,7 +1391,12 @@ impl VulkanRasterizer {
                             let (view, layout) = match texture {
                                 Some((id, view)) => {
                                     self.draw.textures.push(id);
-                                    (view, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                                    let feedback = module.stage != ShaderStage::Compute
+                                        && self.draw.is_target(id);
+                                    match feedback {
+                                        true => (view, vk::ImageLayout::GENERAL),
+                                        false => (view, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                                    }
                                 }
                                 None => {
                                     let format = match (desc.is_depth, desc.is_integer) {
