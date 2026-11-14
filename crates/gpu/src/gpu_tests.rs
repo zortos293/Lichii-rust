@@ -7,8 +7,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use lichii_memory::{AddressSpace, MemoryPermission, PhysicalMemory};
 use lichii_texture::PixelFormat;
 use lichii_texture::block_linear::GobLayout;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
+use crate::activity::Wait;
 use crate::backend::{
     ChannelId, ComputeContext, DrawParams, FenceAction, FramebufferConfig, GpuHandles,
     GraphicsContext, IndirectDraw, Query, QueryKind, Rasterizer, ReleaseSize,
@@ -65,7 +66,7 @@ enum Event {
         payload: u64,
     },
     Fence(FenceAction),
-    WaitForIdle,
+    Barrier,
     InlineWritten(u64, u64),
     Invalidate(u64, u64),
     Ran,
@@ -191,9 +192,51 @@ impl HostWork {
     }
 }
 
+/// Holds the recording renderer in every barrier past the first `open_through`.
+struct Gate {
+    /// Barriers entered, and how many of them may pass.
+    state: Mutex<(usize, usize)>,
+    opened: Condvar,
+}
+
+impl Default for Gate {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new((0, usize::MAX)),
+            opened: Condvar::new(),
+        }
+    }
+}
+
+impl Gate {
+    fn open_through(&self, barriers: usize) {
+        self.state.lock().1 = barriers;
+        self.opened.notify_all();
+    }
+
+    fn pass(&self) {
+        let mut state = self.state.lock();
+        state.0 += 1;
+        let n = state.0;
+        self.opened.notify_all();
+        while n > state.1 {
+            self.opened.wait(&mut state);
+        }
+    }
+
+    /// Waits until the renderer entered `n` barriers.
+    fn entered(&self, n: usize) {
+        let mut state = self.state.lock();
+        while state.0 < n {
+            self.opened.wait(&mut state);
+        }
+    }
+}
+
 struct Recorder {
     log: Log,
     work: Arc<HostWork>,
+    gate: Arc<Gate>,
 }
 
 impl Rasterizer for Recorder {
@@ -239,8 +282,11 @@ impl Rasterizer for Recorder {
     fn flush_region(&mut self, addr: u64, size: u64) {
         self.log.lock().push(Event::FlushRegion(addr, size));
     }
+    fn barrier(&mut self) {
+        self.log.lock().push(Event::Barrier);
+        self.gate.pass();
+    }
     fn wait_for_idle(&mut self) {
-        self.log.lock().push(Event::WaitForIdle);
         self.work.finish_all();
     }
     fn present(&mut self, _framebuffer: &FramebufferConfig) {}
@@ -252,6 +298,7 @@ struct Rig {
     syncpoints: Arc<Syncpoints>,
     log: Log,
     work: Arc<HostWork>,
+    gate: Arc<Gate>,
     next_pushbuffer: u64,
     space: Arc<AddressSpace>,
     time: Arc<TestTime>,
@@ -311,6 +358,7 @@ impl Rig {
         let engines_log = log.clone();
         let mut work = None;
         let time = Arc::new(TestTime::default());
+        let gate = Arc::new(Gate::default());
         let gpu = Gpu::new(
             host1x,
             time.clone(),
@@ -340,6 +388,7 @@ impl Rig {
                 Box::new(Recorder {
                     log: log.clone(),
                     work: host,
+                    gate: gate.clone(),
                 })
             },
         );
@@ -349,6 +398,7 @@ impl Rig {
             syncpoints,
             log,
             work: work.expect("the renderer was created"),
+            gate,
             next_pushbuffer: 0x1_0000,
             space,
             time,
@@ -771,7 +821,7 @@ fn increments(events: &[Event]) -> Vec<Event> {
         .filter(|e| {
             matches!(
                 e,
-                Event::Fence(FenceAction::IncrementSyncpoint(_)) | Event::WaitForIdle
+                Event::Fence(FenceAction::IncrementSyncpoint(_)) | Event::Barrier
             )
         })
         .cloned()
@@ -799,11 +849,93 @@ fn switch_1_fence_increments_after_a_wait_for_idle() {
         let fence = Event::Fence(FenceAction::IncrementSyncpoint(id));
         assert_eq!(
             increments(&rig.events()),
-            [fence.clone(), Event::WaitForIdle, fence.clone(), fence],
+            [fence.clone(), Event::Barrier, fence.clone(), fence],
             "{threading:?}"
         );
         assert_eq!(rig.syncpoints.guest().value(id), Ok(3));
         assert_eq!(rig.syncpoints.host().value(id), Ok(3));
+    });
+}
+
+#[test]
+fn a_wait_for_idle_does_not_hold_the_front() {
+    let mut rig = Rig::new(Threading::Split);
+    let channel = rig.channel(HostClass::Maxwell);
+    rig.gate.open_through(0);
+    let words = Pushbuffer::default()
+        .bind(0, MAXWELL_3D)
+        .host(host::WFI, 0)
+        .inc(0, 0x700, &[1]);
+    rig.submit(channel, &words.0);
+    let activity = rig.work.handles.activity.clone();
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_millis(200) {
+        assert!(!activity.is_waiting(Wait::FrontWaitingForBack));
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    rig.gate.open_through(usize::MAX);
+    assert_eq!(
+        rig.methods(),
+        [(channel.0, EngineKind::Maxwell3d, 0x700, 1)]
+    );
+}
+
+#[test]
+fn a_wait_for_idle_runs_the_fences_whose_gpu_work_finished() {
+    let mut rig = Rig::deferred(Threading::Split);
+    let channel = rig.channel(HostClass::Maxwell);
+    let id = 8;
+    rig.gate.open_through(1);
+    let entry = rig.entry(&Pushbuffer::default().host(host::SYNCPOINT_A, 0).0);
+    rig.gpu.submit(
+        channel,
+        Submission {
+            entries: &[entry],
+            wait: None,
+            increment: Some(SyncpointIncrement::fence_increment(id, false)),
+        },
+    );
+    rig.submit(
+        channel,
+        &Pushbuffer::default()
+            .host(host::WFI, 0)
+            .host(host::WFI, 0)
+            .0,
+    );
+    rig.gate.entered(2);
+    assert_eq!(rig.syncpoints.guest().value(id), Ok(0));
+    rig.work.finish_all();
+    rig.gate.open_through(2);
+    rig.gate.entered(3);
+    assert_eq!(rig.syncpoints.guest().value(id), Ok(2));
+    rig.gate.open_through(usize::MAX);
+    rig.complete();
+    assert_eq!(rig.syncpoints.guest().value(id), Ok(2));
+}
+
+#[test]
+fn a_syncpoint_after_a_wait_for_idle_waits_for_the_gpu_work_before_it() {
+    each_mode(|threading| {
+        let mut rig = Rig::deferred(threading);
+        let channel = rig.channel(HostClass::Maxwell);
+        let id = 8;
+        let words = Pushbuffer::default()
+            .host(host::SYNCPOINT_A, 0)
+            .host(host::SYNCPOINT_B, id << 8 | 1);
+        let entry = rig.entry(&words.0);
+        rig.gpu.submit(
+            channel,
+            Submission {
+                entries: &[entry],
+                wait: None,
+                increment: Some(SyncpointIncrement::fence_increment(id, false)),
+            },
+        );
+        assert!(rig.events().contains(&Event::Barrier), "{threading:?}");
+        assert_eq!(rig.syncpoints.host().value(id), Ok(3), "{threading:?}");
+        assert_eq!(rig.syncpoints.guest().value(id), Ok(0), "{threading:?}");
+        rig.complete();
+        assert_eq!(rig.syncpoints.guest().value(id), Ok(3), "{threading:?}");
     });
 }
 
@@ -828,7 +960,7 @@ fn switch_2_increment_value_counts_the_fence_value() {
         assert_eq!(
             increments(&events),
             [
-                Event::WaitForIdle,
+                Event::Barrier,
                 fence.clone(),
                 fence.clone(),
                 fence.clone(),
@@ -1001,7 +1133,7 @@ fn wait_for_idle_and_reference_count_run_in_order() {
                     method: 0x700,
                     argument: 1
                 },
-                Event::WaitForIdle,
+                Event::Barrier,
                 Event::Method {
                     channel: c,
                     engine: EngineKind::Maxwell3d,

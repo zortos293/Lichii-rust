@@ -695,7 +695,6 @@ impl Dispatch<'_> {
 
     fn wait_for_idle(&mut self) {
         self.shared.stream.wait_for_idle();
-        self.shared.stream.drain();
     }
 
     #[inline]
