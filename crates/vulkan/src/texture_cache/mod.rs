@@ -29,6 +29,7 @@
 
 mod clear;
 mod convert;
+mod guest_sync;
 mod info;
 #[cfg(test)]
 mod tests;
@@ -180,6 +181,8 @@ pub struct Traffic {
     /// GPU-modified images written back to guest memory, and their guest bytes.
     pub downloads: u64,
     pub download_bytes: u64,
+    /// Overlap syncs done on the GPU instead of through guest memory.
+    pub gpu_syncs: u64,
 }
 
 /// What the collector did since the cache was created.
@@ -487,6 +490,7 @@ pub struct TextureCache {
     readback: Option<Buffer>,
     downloads: Vec<Download>,
     clear_pipelines: Option<ClearPipelines>,
+    guest_sync: Option<guest_sync::GuestSync>,
     vram_usage: VramUsage,
     /// Frames presented so far.
     frame: u64,
@@ -782,6 +786,7 @@ impl TextureCache {
             readback: None,
             downloads: Vec::new(),
             clear_pipelines: None,
+            guest_sync: None,
             vram_usage: VramUsage::default(),
             frame: 0,
             lru_head: NIL,
@@ -2176,10 +2181,11 @@ impl TextureCache {
             self.get(o)
                 .is_some_and(|o| o.modified > current && !o.image.is_sparse())
         }));
-        if newer.is_empty() {
+        if newer.is_empty() || self.sync_on_gpu(tx, id, &mut newer)? {
             self.overlap_scratch = newer;
             return Ok(());
         }
+        let image = self.get(id).expect("a live image id");
         let own = image.gpu_modified && !self.covered(id, &newer);
         newer.retain(|&o| self.get(o).is_some_and(|o| o.gpu_modified));
         if own {

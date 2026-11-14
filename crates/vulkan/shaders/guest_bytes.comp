@@ -1,0 +1,78 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// Moves one 2D block-linear slice (block depth 1) between a pitch-linear buffer and a buffer of
+// guest bytes, one 32-bit word per invocation. Mirrors lichii_texture::block_linear (Tiling::offset
+// and GobLayout). Words whose guest offset falls outside [0, guest_limit) are skipped, so a slice
+// can be painted into the bytes of a smaller image it overlaps. Depth-stencil packings combine a
+// depth word per texel with stencil bytes packed four to a word.
+
+#version 460
+
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer Guest { uint guest[]; };
+layout(set = 0, binding = 1) buffer Linear { uint linear_words[]; };
+layout(set = 0, binding = 2) buffer Stencil { uint stencil_words[]; };
+
+const uint TO_GUEST = 0u;
+const uint PLAIN = 0u;
+const uint DEPTH_LOW_STENCIL_HIGH = 1u;
+const uint STENCIL_LOW_DEPTH_HIGH = 2u;
+
+layout(push_constant) uniform P {
+    uint row_words;
+    uint height;
+    uint row_gobs;
+    uint block_height_log2;
+    uint switch2_layout;
+    int guest_offset;
+    uint guest_limit;
+    uint direction;
+    uint packing;
+    uint stencil_pitch;
+} p;
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= p.row_words || y >= p.height) {
+        return;
+    }
+    uint bh = p.block_height_log2;
+    uint xb = x * 4u;
+    uint block_size = p.row_gobs << (9u + bh);
+    uint gob_y = y >> 3u;
+    uint base = (gob_y >> bh) * block_size + ((gob_y & ((1u << bh) - 1u)) << 9u) + ((xb >> 6u) << (9u + bh));
+    uint in_gob = ((xb & 32u) << 3u) | ((xb & 16u) << 1u) | (xb & 15u) | ((y & 6u) << 5u) | ((y & 1u) << 4u);
+    if (p.switch2_layout != 0u) {
+        uint differ = ((in_gob >> 5u) ^ (in_gob >> 6u)) & 1u;
+        in_gob ^= (differ << 5u) | (differ << 6u);
+    }
+    int at = p.guest_offset + int(base + in_gob);
+    if (at < 0 || uint(at) >= p.guest_limit) {
+        return;
+    }
+    uint word = uint(at) >> 2u;
+    uint texel = y * p.row_words + x;
+    uint s_index = y * p.stencil_pitch + x;
+    uint s_shift = (s_index & 3u) * 8u;
+    if (p.direction == TO_GUEST) {
+        uint value = linear_words[texel];
+        if (p.packing != PLAIN) {
+            uint s = (stencil_words[s_index >> 2u] >> s_shift) & 0xFFu;
+            value = p.packing == DEPTH_LOW_STENCIL_HIGH ? (value & 0xFFFFFFu) | (s << 24u)
+                                                        : s | ((value & 0xFFFFFFu) << 8u);
+        }
+        guest[word] = value;
+    } else {
+        uint value = guest[word];
+        if (p.packing == PLAIN) {
+            linear_words[texel] = value;
+        } else {
+            uint d = p.packing == DEPTH_LOW_STENCIL_HIGH ? value & 0xFFFFFFu : value >> 8u;
+            uint s = p.packing == DEPTH_LOW_STENCIL_HIGH ? value >> 24u : value & 0xFFu;
+            linear_words[texel] = d;
+            atomicOr(stencil_words[s_index >> 2u], s << s_shift);
+        }
+    }
+}

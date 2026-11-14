@@ -92,6 +92,8 @@ pub static EGUI_VERT: &[u32] = spirv!("egui.vert");
 pub static EGUI_FRAG: &[u32] = spirv!("egui.frag");
 /// `block_linear_unswizzle.comp`: Block-linear to pitch-linear copy of one 2D slice, one word per invocation, local size 32x8. Matches `lichii_texture::block_linear` for both GOB layouts.
 pub static BLOCK_LINEAR_UNSWIZZLE_COMP: &[u32] = spirv!("block_linear_unswizzle.comp");
+/// `guest_bytes.comp`: One 2D block-linear slice between a pitch-linear buffer and a buffer of guest bytes, either way, skipping words outside the guest buffer; packs and unpacks D24S8 depth and stencil. Local size 32x8.
+pub static GUEST_BYTES_COMP: &[u32] = spirv!("guest_bytes.comp");
 /// `indirect_assemble.comp`: Quads, quad strips and line loops of indirect draws as u32 triangle list or line strip indices and patched `VkDrawIndexedIndirectCommand`s, one 64-invocation workgroup per guest command.
 pub static INDIRECT_ASSEMBLE_COMP: &[u32] = spirv!("indirect_assemble.comp");
 /// `dispatch_grid.comp`: The packed grid words of a version 1.x launch descriptor as a `VkDispatchIndirectCommand`, clamped to the device's workgroup count limits; one invocation.
@@ -131,6 +133,7 @@ pub static ALL: &[(&str, &[u32])] = &[
     ("egui.vert", EGUI_VERT),
     ("egui.frag", EGUI_FRAG),
     ("block_linear_unswizzle.comp", BLOCK_LINEAR_UNSWIZZLE_COMP),
+    ("guest_bytes.comp", GUEST_BYTES_COMP),
     ("indirect_assemble.comp", INDIRECT_ASSEMBLE_COMP),
     ("dispatch_grid.comp", DISPATCH_GRID_COMP),
     ("mesh_indirect.comp", MESH_INDIRECT_COMP),

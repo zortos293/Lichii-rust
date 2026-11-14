@@ -13,9 +13,9 @@ use crate::present::passes::shader_module;
 /// Storage buffers a host pass binds at most.
 const MAX_BINDINGS: usize = 5;
 
-pub(super) struct HostCompute {
+pub(crate) struct HostCompute {
     device: Arc<Device>,
-    pub(super) set_layout: vk::DescriptorSetLayout,
+    pub(crate) set_layout: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
     module: vk::ShaderModule,
     pipeline: vk::Pipeline,
@@ -24,7 +24,7 @@ pub(super) struct HostCompute {
 impl HostCompute {
     /// The pipeline of `spirv`, reading `bindings` storage buffers at set 0 and `push_size`
     /// bytes of push constants.
-    pub(super) fn new(
+    pub(crate) fn new(
         device: &Arc<Device>,
         spirv: &[u32],
         bindings: usize,
@@ -100,7 +100,7 @@ impl HostCompute {
     /// `groups` workgroups with `params` as push constants. A barrier orders the earlier
     /// `reads` of the outputs before the pass writes them, and another the pass's writes before
     /// later `reads`.
-    pub(super) fn dispatch(
+    pub(crate) fn dispatch(
         &self,
         cmd: vk::CommandBuffer,
         set: vk::DescriptorSet,
@@ -171,7 +171,7 @@ impl Drop for HostCompute {
 
 /// A storage descriptor over `binding`, starting at its offset rounded down to `align`, and the
 /// byte offset of `binding` in it.
-pub(super) fn storage(binding: BufferBinding, align: u64) -> (vk::DescriptorBufferInfo, u32) {
+pub(crate) fn storage(binding: BufferBinding, align: u64) -> (vk::DescriptorBufferInfo, u32) {
     let offset = binding.offset & !(align - 1);
     let info = vk::DescriptorBufferInfo {
         buffer: binding.buffer,

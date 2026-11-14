@@ -2458,7 +2458,6 @@ fn storage_pointer(
 mod assembly;
 mod dispatch_grid;
 mod frame_decode;
-mod host_compute;
 mod mesh_indirect;
 mod null;
 mod texture;
