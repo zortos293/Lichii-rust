@@ -85,6 +85,8 @@ pub(super) struct Target {
     /// The host has SSE4.1 and SSE4.2.
     pub sse41: bool,
     pub sse42: bool,
+    /// The host has AVX2.
+    pub avx2: bool,
 }
 
 /// Machine code for one block and its fastmem access sites as `(access, slow path)` offsets.

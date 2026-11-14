@@ -22,6 +22,8 @@ pub(super) struct Translator<'a> {
     /// Whether the host has SSE4.1 and SSE4.2; SIMD lowerings that need them stay on `CallSimd`.
     pub sse41: bool,
     pub sse42: bool,
+    /// Whether the host has AVX2; the variable vector shifts need it.
+    pub avx2: bool,
 }
 
 impl Translator<'_> {

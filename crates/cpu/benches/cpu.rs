@@ -183,6 +183,26 @@ const WORKLOADS: &[Workload] = &[
         per_iteration: 8,
     },
     Workload {
+        name: "simd misc loop",
+        code: &[
+            0x1e2f1000, // fmov s0, #1.5
+            0x1e2e100a, // fmov s10, #1.0
+            0x1e21100b, // fmov s11, #3.0
+            0x1e2b194c, // fdiv s12, s10, s11
+            0x4e020023, // 1: tbl v3.16b, {v1.16b}, v2.16b
+            0x6ea54464, // ushl v4.4s, v3.4s, v5.4s
+            0x6ea08886, // cmge v6.4s, v4.4s, #0
+            0x6ea0f8c7, // fneg v7.4s, v6.4s
+            0x1e280008, // fcvtps w8, s0
+            0x8b080129, // add x9, x9, x8
+            0xf10004a5, // subs x5, x5, #1
+            0x54ffff21, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 8,
+    },
+    Workload {
         name: "exclusive pair loop",
         code: &[
             0xc87f1823, // 1: ldxp x3, x6, [x1]

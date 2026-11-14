@@ -96,7 +96,10 @@ pub(in super::super) fn lower(t: &mut Translator, word: u32) -> bool {
             );
             return true;
         }
-        0x1e38_0000 | 0x1e39_0000 => {
+        0x1e38_0000 | 0x1e39_0000 | 0x1e20_0000 | 0x1e21_0000 | 0x1e28_0000 | 0x1e29_0000
+        | 0x1e30_0000 | 0x1e31_0000
+            if word & 0x0018_0000 == 0x0018_0000 || t.sse41 =>
+        {
             let a = vec(t, rn);
             let signed = word & 0x1_0000 == 0;
             let r = t.op(Op::Simd(SimdOp::ToInt {

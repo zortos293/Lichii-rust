@@ -323,8 +323,9 @@ impl Jit {
             std::arch::is_x86_feature_detected!("fma"),
             std::arch::is_x86_feature_detected!("sse4.1"),
             std::arch::is_x86_feature_detected!("sse4.2"),
+            std::arch::is_x86_feature_detected!("avx2"),
         ];
-        let [cmpxchg16b, fma, sse41, sse42] = features;
+        let [cmpxchg16b, fma, sse41, sse42, avx2] = features;
         let tsc_scale = config.clock.host_tsc_scale().map(std::ptr::from_ref);
         let flavour = [
             passes.get_set,
@@ -405,6 +406,7 @@ impl Jit {
                 fma,
                 sse41,
                 sse42,
+                avx2,
             },
             arena: fastmem.map_or(std::ptr::null_mut(), |f| f.base()),
             config,
@@ -434,6 +436,7 @@ impl Jit {
             cmpxchg16b: self.target.cmpxchg16b,
             sse41: self.target.sse41,
             sse42: self.target.sse42,
+            avx2: self.target.avx2,
         };
         let mut pc = start;
         loop {
