@@ -48,14 +48,14 @@ pub(super) fn create_thread(svc: &mut SvcContext) -> Flow {
 pub(super) fn start_thread(svc: &mut SvcContext) -> Flow {
     let result = svc.typed::<Thread>(svc.arg32(0)).and_then(|thread| {
         let mut s = thread.sched.lock();
-        if s.finalized {
-            return Err(result::INVALID_HANDLE);
-        }
         if s.state != ThreadState::Created {
             return Err(result::INVALID_STATE);
         }
         if s.terminate_requested {
             return Err(result::TERMINATION_REQUESTED);
+        }
+        if !thread.try_retain() {
+            return Err(result::INVALID_HANDLE);
         }
         thread.scheduler.enqueue(&thread, &mut s, false);
         Ok(())

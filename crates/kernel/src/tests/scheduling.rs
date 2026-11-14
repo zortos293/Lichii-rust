@@ -8,6 +8,7 @@ use lichii_cpu::CpuConfig;
 use parking_lot::Mutex;
 
 use super::{Script, TestKernel, word};
+use crate::object::KObject;
 use crate::process::{Process, ProcessParams};
 use crate::util::Rng;
 use crate::{Kernel, KernelConfig};
@@ -812,4 +813,29 @@ fn an_exited_thread_keeps_its_tls_slot_until_its_last_handle_closes() {
         third, first,
         "closing the last handle did not free the TLS slot"
     );
+}
+
+/// Closing the last handle of a thread that never started gives its TLS slot back and drops it
+/// from the process, so creating and closing threads cannot pile up unreachable ones.
+#[test]
+fn closing_the_last_handle_of_an_unstarted_thread_releases_it() {
+    let test = TestKernel::new(ConsoleGeneration::Switch1);
+    let process = test.kernel.create_process(&test.image()).unwrap();
+    let entry = process.entry();
+    let create = || {
+        test.kernel
+            .0
+            .create_thread(&process, entry, 0, entry, 44, -2)
+            .unwrap()
+    };
+    let thread = create();
+    let handle = process
+        .handles()
+        .write()
+        .add(KObject::Thread(thread.clone()))
+        .unwrap();
+    assert_eq!(process.threads().len(), 1);
+    process.handles().write().remove(handle);
+    assert!(process.threads().is_empty());
+    assert_eq!(create().tls_address(), thread.tls_address());
 }

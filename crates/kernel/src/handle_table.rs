@@ -52,7 +52,7 @@ impl HandleTable {
             linear_id + 1
         };
         if let KObject::Thread(thread) = &object {
-            thread.open_handle();
+            thread.retain();
         }
         self.entries[index as usize] = Some(Entry { linear_id, object });
         self.count += 1;
@@ -90,7 +90,7 @@ impl HandleTable {
         self.free.push(index as u16);
         self.count -= 1;
         if let KObject::Thread(thread) = &entry.object {
-            thread.close_handle();
+            thread.release();
         }
         Some(entry.object)
     }
@@ -126,7 +126,7 @@ impl HandleTable {
             .collect();
         for object in &objects {
             if let KObject::Thread(thread) = object {
-                thread.close_handle();
+                thread.release();
             }
         }
         let size = self.entries.len();
