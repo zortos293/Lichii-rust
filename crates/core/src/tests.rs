@@ -163,9 +163,9 @@ fn exit_lock_system(exit_timeout_ms: u32) -> (System, TempFile) {
     (system, file)
 }
 
-/// Opens the application proxy as the title would and returns (common state getter, self
-/// controller) after locking exit.
-fn lock_exit(client: &IpcClient) -> (Handle, Handle) {
+/// Opens the application proxy as the title would, locks exit, and returns the common state
+/// getter the title reads its messages from.
+fn lock_exit(client: &IpcClient) -> Handle {
     let service = client.connect("appletOE").unwrap();
     let request = Request::new(0)
         .send_pid()
@@ -183,14 +183,15 @@ fn lock_exit(client: &IpcClient) -> (Handle, Handle) {
         client.send(controller, &Request::new(1)).unwrap().result,
         lichii_common::ResultCode::SUCCESS
     );
-    (state, controller)
+    state
 }
 
 #[test]
 fn closing_lets_a_title_holding_the_exit_lock_exit_by_itself() {
     let (mut system, _file) = exit_lock_system(10_000);
     let client = IpcClient::new(system.kernel(), system.process());
-    let (state, controller) = lock_exit(&client);
+    let state = lock_exit(&client);
+    let (kernel, process) = (system.kernel().clone(), system.process().clone());
     std::thread::scope(|scope| {
         scope.spawn(|| {
             loop {
@@ -200,7 +201,7 @@ fn closing_lets_a_title_holding_the_exit_lock_exit_by_itself() {
                 }
                 std::thread::sleep(Duration::from_millis(1));
             }
-            let _ = client.send(controller, &Request::new(0));
+            kernel.terminate_process(&process);
         });
         let started = Instant::now();
         system.stop();
