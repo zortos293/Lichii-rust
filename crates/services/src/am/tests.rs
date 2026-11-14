@@ -5,7 +5,7 @@ use lichii_kernel::object::KObject;
 use lichii_kernel::testing::{IpcClient, Reply, Request};
 
 use super::*;
-use crate::testing::{SWITCH1_TITLE, SWITCH2_TITLE, context};
+use crate::testing::{ReplyExt, SWITCH1_TITLE, SWITCH2_TITLE, context};
 
 const CURRENT_PROCESS: Handle = 0xffff_8001;
 
@@ -188,6 +188,41 @@ fn later_firmware_state_and_controller_commands_answer_like_the_reference() {
         0
     );
     call(controller, Request::new(240).arg(7u32));
+}
+
+#[test]
+fn set_cpu_boost_mode_sets_the_apm_boost_configuration() {
+    let (context, client, proxy) = booted(SWITCH1_TITLE);
+    crate::apm::register(&context).unwrap();
+    let apm = client.connect("apm").unwrap();
+    let session = client.send(apm, &Request::new(0)).unwrap().ok().interface();
+    let boost_configuration = || {
+        client
+            .send(session, &Request::new(1).arg(1i32))
+            .unwrap()
+            .ok()
+            .get::<u32>(0)
+    };
+    assert_eq!(boost_configuration(), 0x0002_0003);
+    let state = interface(&client, proxy, 0);
+    let boost = |mode: u32| {
+        client
+            .send(state, &Request::new(66).arg(mode))
+            .unwrap()
+            .ok()
+    };
+    boost(1);
+    assert_eq!(boost_configuration(), 0x9222_0009, "fast load");
+    boost(2);
+    assert_eq!(boost_configuration(), 0x9222_000b);
+    boost(7);
+    assert_eq!(
+        boost_configuration(),
+        0x9222_000b,
+        "an invalid mode changes nothing"
+    );
+    boost(0);
+    assert_eq!(boost_configuration(), 0x0002_0003);
 }
 
 #[test]
