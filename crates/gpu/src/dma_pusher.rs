@@ -891,8 +891,10 @@ impl MacroHost for FrontMacroHost<'_> {
     /// Reads memory as of the macro's position in the stream: the work sent before it completes
     /// and what the GPU wrote to the words reaches guest memory first.
     fn dma_read(&mut self, gpu_va: u64, out: &mut [u32]) {
+        let diag_start = std::time::Instant::now();
         self.stream
             .synchronize_read(gpu_va, size_of_val(out) as u64);
+        diag_mr::note(false, diag_start.elapsed().as_nanos() as u64);
         if let Err(fault) = self
             .memory
             .read_block(gpu_va, bytemuck::cast_slice_mut(out))
@@ -985,5 +987,32 @@ mod tests {
         let parameters = &channel.state.calls[0].parameters;
         assert!(parameters.is_empty());
         assert_eq!(parameters.as_ptr(), storage);
+    }
+}
+
+mod diag_mr {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static FAST: AtomicU64 = AtomicU64::new(0);
+    static SLOW: AtomicU64 = AtomicU64::new(0);
+    static SLOW_NS: AtomicU64 = AtomicU64::new(0);
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    pub(super) fn note(fast: bool, ns: u64) {
+        if fast {
+            FAST.fetch_add(1, Ordering::Relaxed);
+        } else {
+            SLOW.fetch_add(1, Ordering::Relaxed);
+            SLOW_NS.fetch_add(ns, Ordering::Relaxed);
+        }
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let now = START.get_or_init(std::time::Instant::now).elapsed().as_secs();
+        if now >= LAST.load(Ordering::Relaxed) + 5 {
+            LAST.store(now, Ordering::Relaxed);
+            tracing::info!(
+                "DIAG macro reads t={now} served={} synchronized={} sync_ms={}",
+                FAST.swap(0, Ordering::Relaxed),
+                SLOW.swap(0, Ordering::Relaxed),
+                SLOW_NS.swap(0, Ordering::Relaxed) / 1_000_000
+            );
+        }
     }
 }
