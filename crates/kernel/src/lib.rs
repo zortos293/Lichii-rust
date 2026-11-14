@@ -328,6 +328,10 @@ impl Kernel {
 
     /// Stops every core and kernel thread and releases all processes. A thread still running
     /// after [`SLOW_JOIN`] is named in a warning, so a shutdown that hangs says what it waits for.
+    /// Service threads get [`SERVICE_STOP_TIMEOUT`] together. When one is still inside a request
+    /// after that (blocked on the GPU or the host), this returns and a background thread waits for
+    /// it before it clears the run queues and releases the processes, so the request keeps its
+    /// memory and a late reply wakes nobody.
     pub fn shutdown(&self) {
         self.0.scheduler.shutdown();
         self.0.timer.shutdown();
@@ -342,19 +346,49 @@ impl Kernel {
         for thread in &services.threads {
             thread.stop();
         }
+        let deadline = Instant::now() + SERVICE_STOP_TIMEOUT;
+        let mut busy = Vec::new();
         for join in services.joins {
-            join_noting_slow(join);
+            while !join.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            if !join.is_finished() {
+                busy.push(join);
+            } else if join.join().is_err() {
+                tracing::error!("a kernel thread panicked");
+            }
         }
         self.0.service_manager.clear();
         self.0.named_ports.lock().clear();
-        self.0.scheduler.clear();
-        let processes = std::mem::take(&mut *self.0.processes.lock());
-        for process in processes {
-            process.threads.lock().clear();
-            if process.state() != ProcessState::Exited {
-                process.finalize();
-            }
+        if busy.is_empty() {
+            self.0.release_processes();
+            return;
         }
+        for join in &busy {
+            tracing::warn!(
+                thread = join.thread().name().unwrap_or("unnamed"),
+                "shutdown: a service thread is still inside a request; the processes are released once it returns"
+            );
+        }
+        let inner = self.0.clone();
+        let (hand_over, handed) = std::sync::mpsc::channel::<Vec<JoinHandle<()>>>();
+        let teardown = std::thread::Builder::new()
+            .name("kernel teardown".into())
+            .spawn(move || {
+                for join in handed.recv().unwrap_or_default() {
+                    join_noting_slow(join);
+                }
+                inner.release_processes();
+            });
+        if let Err(error) = teardown {
+            tracing::error!(%error, "cannot start the kernel teardown thread; waiting here");
+            for join in busy {
+                join_noting_slow(join);
+            }
+            self.0.release_processes();
+            return;
+        }
+        let _ = hand_over.send(busy);
     }
 
     /// Stops running guest code: every core puts its thread back in its run queue and idles until
@@ -401,6 +435,8 @@ const LIVE_PC_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// How long [`Kernel::shutdown`] waits for a thread before naming it.
 const SLOW_JOIN: Duration = Duration::from_secs(2);
+/// How long [`Kernel::shutdown`] waits for all service threads before leaving the busy ones.
+const SERVICE_STOP_TIMEOUT: Duration = Duration::from_millis(300);
 
 fn join_noting_slow(thread: JoinHandle<()>) {
     let started = Instant::now();
@@ -421,6 +457,19 @@ fn join_noting_slow(thread: JoinHandle<()>) {
 }
 
 impl KernelInner {
+    /// Empties the run queues and finalizes every process, once no service thread can still
+    /// reply to one of their threads.
+    fn release_processes(&self) {
+        self.scheduler.clear();
+        let processes = std::mem::take(&mut *self.processes.lock());
+        for process in processes {
+            process.threads.lock().clear();
+            if process.state() != ProcessState::Exited {
+                process.finalize();
+            }
+        }
+    }
+
     /// Logs every core's running thread and queue and every thread's scheduling state and wait.
     fn log_thread_states(&self) {
         let processes = self.processes.lock().clone();

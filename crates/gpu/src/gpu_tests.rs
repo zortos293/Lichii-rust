@@ -2192,3 +2192,29 @@ fn cpu_writes_to_cached_pages_invalidate_before_later_work() {
         );
     });
 }
+
+/// Shutdown drops the stream the back has not executed: an action queued behind a renderer call
+/// that is still running never runs, and its waiter sees the sender dropped.
+#[test]
+fn shutdown_drops_actions_queued_behind_a_busy_back() {
+    each_mode(|threading| {
+        let gpu = Rig::new(threading).gpu;
+        let (started, wait_started) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        gpu.run_in_order(move |_| {
+            started.send(()).unwrap();
+            let _ = held.recv();
+        });
+        let (ran, waiter) = std::sync::mpsc::channel::<()>();
+        gpu.run_in_order(move |_| ran.send(()).unwrap());
+        wait_started.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        gpu.shutdown();
+        release.send(()).unwrap();
+        assert_eq!(
+            waiter.recv_timeout(std::time::Duration::from_secs(5)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+            "{threading:?}"
+        );
+    });
+}
