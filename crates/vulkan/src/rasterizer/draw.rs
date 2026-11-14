@@ -743,10 +743,11 @@ impl VulkanRasterizer {
         for &(id, _) in &draw.storage_images {
             self.texture_cache.prepare(cmd, id, SHADER_STORAGE);
         }
+        let scale = self.target_scale();
         let query = match regs.zpass_pixel_count_enable {
             0 => None,
             _ => {
-                let slot = self.samples.reserve(&self.device, cmd);
+                let slot = self.samples.reserve(&self.device, cmd, scale);
                 if slot.is_none() {
                     self.draw.warn_once(
                         Warning::SampleQueries,
@@ -757,7 +758,6 @@ impl VulkanRasterizer {
             }
         };
         let extent = self.render_area(regs);
-        let scale = self.target_scale();
         let raw = &self.device.raw;
         let draw = &mut self.draw;
         draw.attachments.clear();

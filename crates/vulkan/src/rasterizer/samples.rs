@@ -6,6 +6,7 @@
 //! read their results once the work before them completed.
 
 use ash::vk;
+use lichii_common::settings::ResolutionScale;
 
 use crate::device::Device;
 use crate::error::{Result, VkResultExt};
@@ -30,6 +31,10 @@ pub(super) struct SampleCounter {
     reset_at: u64,
     /// Queries below this were read or are summed by no report; their slots may be reused.
     released: u64,
+    /// End of the newest report's range.
+    reported: u64,
+    /// Resolution scale of each slot's draw, so results count guest pixels.
+    scales: Vec<ResolutionScale>,
     summed_from: u64,
     summed_to: u64,
     sum: u64,
@@ -58,6 +63,8 @@ impl SampleCounter {
             next: 0,
             reset_at: 0,
             released: 0,
+            reported: 0,
+            scales: vec![ResolutionScale::X1; SLOTS as usize],
             summed_from: 0,
             summed_to: 0,
             sum: 0,
@@ -71,10 +78,15 @@ impl SampleCounter {
         unsafe { device.raw.destroy_query_pool(self.pool, None) };
     }
 
-    /// Takes the slot of the next counted draw, recording a reset of its block into `cmd`
+    /// Takes the slot of the next counted draw, rendering at `scale`, recording a reset of its block into `cmd`
     /// (outside any rendering) when the draw starts one. `None` when the block still holds
     /// queries no report has read; the draw then goes uncounted.
-    pub(super) fn reserve(&mut self, device: &Device, cmd: vk::CommandBuffer) -> Option<u32> {
+    pub(super) fn reserve(
+        &mut self,
+        device: &Device,
+        cmd: vk::CommandBuffer,
+        scale: ResolutionScale,
+    ) -> Option<u32> {
         let slot = (self.next % SLOTS) as u32;
         if self.next.is_multiple_of(BLOCK) {
             if self.next + BLOCK - self.released > SLOTS {
@@ -88,6 +100,7 @@ impl SampleCounter {
                     .cmd_reset_query_pool(cmd, self.pool, slot, BLOCK as u32)
             };
         }
+        self.scales[slot as usize] = scale;
         self.next += 1;
         Some(slot)
     }
@@ -107,13 +120,22 @@ impl SampleCounter {
     /// CLEAR_REPORT_VALUE: later reports count only draws recorded from now on.
     pub(super) fn reset(&mut self) {
         self.reset_at = self.next;
+        self.release_unreported();
     }
 
     /// What a report recorded now sums.
-    pub(super) fn report(&self) -> SampleRange {
+    pub(super) fn report(&mut self) -> SampleRange {
+        self.reported = self.next;
         SampleRange {
             from: self.reset_at,
             to: self.next,
+        }
+    }
+
+    /// Once no queued report reads them, the queries before the last reset are never read.
+    fn release_unreported(&mut self) {
+        if self.released >= self.reported {
+            self.released = self.released.max(self.reset_at);
         }
     }
 
@@ -139,13 +161,20 @@ impl SampleCounter {
                     vk::QueryResultFlags::TYPE_64,
                 )
             };
+            let scales = &self.scales[first as usize..][..count as usize];
             match read {
-                Ok(()) => self.sum += self.results.iter().sum::<u64>(),
+                Ok(()) => {
+                    for (&samples, scale) in self.results.iter().zip(scales) {
+                        let (num, den) = scale.ratio();
+                        self.sum += (samples * u64::from(den * den)).div_ceil(u64::from(num * num));
+                    }
+                }
                 Err(error) => tracing::error!(%error, "reading occlusion query results failed"),
             }
             self.summed_to += count;
         }
         self.released = range.to;
+        self.release_unreported();
         self.sum
     }
 }

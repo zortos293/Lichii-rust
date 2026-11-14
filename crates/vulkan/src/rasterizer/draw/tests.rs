@@ -266,6 +266,24 @@ fn draws_hand_assembled_programs_and_reads_the_target_back() {
     f.assert_no_validation_errors();
 }
 
+/// The Z-pass pixel count, reported once the work recorded so far completed.
+fn z_pass_report(f: &mut Fixture, gmmu: &Arc<Gmmu>) -> u64 {
+    const REPORT: u64 = 0x40_0000;
+    f.rasterizer.query(
+        ChannelId(0),
+        gmmu,
+        &Query {
+            address: GPU_VA + REPORT,
+            kind: QueryKind::SamplesPassed,
+            payload: 0,
+            size: ReleaseSize::Eight,
+            after_work: true,
+        },
+    );
+    f.rasterizer.wait_for_idle();
+    f.memory.read::<u64>(DADDR + REPORT).unwrap()
+}
+
 /// Z-pass pixel count reports sum the samples of every draw since the counter's last reset,
 /// counting draws only while the counter is enabled.
 #[test]
@@ -278,22 +296,7 @@ fn z_pass_reports_count_the_samples_of_enabled_draws_since_the_last_reset() {
         PROGRAMS + u64::from(FRAGMENT),
         &fragment_program([0, 4]),
     );
-    const REPORT: u64 = 0x40_0000;
-    let report = |f: &mut Fixture| {
-        f.rasterizer.query(
-            ChannelId(0),
-            &gmmu,
-            &Query {
-                address: GPU_VA + REPORT,
-                kind: QueryKind::SamplesPassed,
-                payload: 0,
-                size: ReleaseSize::Eight,
-                after_work: true,
-            },
-        );
-        f.rasterizer.wait_for_idle();
-        f.memory.read::<u64>(DADDR + REPORT).unwrap()
-    };
+    let report = |f: &mut Fixture| z_pass_report(f, &gmmu);
     let mut regs = draw_regs();
     regs.zpass_pixel_count_enable = 1;
     let pixels = u64::from(SIZE * SIZE);
@@ -1677,6 +1680,28 @@ fn draws_query_rescaled_textures_at_their_guest_size() {
             u32::from_le_bytes(texels[0])
         );
     }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn z_pass_reports_count_rescaled_draws_in_guest_pixels() {
+    let Some((mut f, gmmu)) = rescaled_fixture() else {
+        return;
+    };
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    let mut regs = target_regs(TEXTURE, SOURCE);
+    regs.zpass_pixel_count_enable = 1;
+    f.rasterizer.reset_counter(QueryKind::SamplesPassed);
+    draw(&mut f, &gmmu, &regs);
+    assert_eq!(
+        z_pass_report(&mut f, &gmmu),
+        u64::from(SOURCE.0 * SOURCE.1),
+        "a 2x target's samples count as guest pixels"
+    );
     f.assert_no_validation_errors();
 }
 
