@@ -343,6 +343,8 @@ impl JitCache {
         self.links.clear();
         self.generation += 1;
         self.memory.used = self.code_start;
+        let exec = self.memory.exec as usize;
+        super::map::clear(exec + self.code_start, exec + CODE_SIZE);
     }
 }
 

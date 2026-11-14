@@ -598,5 +598,6 @@ impl Drop for Jit {
         if let Some(p) = self.state.profile_counts() {
             profile::retire(std::mem::take(p));
         }
+        map::sync();
     }
 }
