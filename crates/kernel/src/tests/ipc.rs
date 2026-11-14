@@ -11,6 +11,7 @@ use super::{Script, TestKernel};
 use crate::event::Event;
 use crate::ipc::{HleRequestContext, SessionHandler, UNKNOWN_COMMAND_ID};
 use crate::object::KObject;
+use crate::process::ProcessState;
 use crate::result;
 
 const SFCI: u32 = u32::from_le_bytes(*b"SFCI");
@@ -636,7 +637,10 @@ fn user_buffers_clones_and_deferred_move_handles() {
     assert_eq!((r[7].0, r[7].1[6], r[7].1[8]), (0, 0, 1));
 }
 
-struct Stuck(Arc<AtomicBool>);
+struct Stuck {
+    entered: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+}
 
 impl SessionHandler for Stuck {
     fn name(&self) -> &str {
@@ -644,28 +648,35 @@ impl SessionHandler for Stuck {
     }
 
     fn handle_request(&self, _ctx: &mut HleRequestContext) -> ResultCode {
-        self.0.store(true, Ordering::SeqCst);
-        loop {
-            std::thread::park();
+        self.entered.store(true, Ordering::SeqCst);
+        while !self.release.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
         }
+        ResultCode::SUCCESS
     }
 }
 
-/// A service thread that never finishes its request (blocked on the GPU or the host) does not
-/// hold up the kernel's shutdown: it is left after the service stop timeout.
+/// A service thread still inside a request (blocked on the GPU or the host) does not hold up the
+/// kernel's shutdown, and the process it serves keeps its memory until the request returns.
 #[test]
 fn shutdown_leaves_a_service_thread_stuck_in_a_request() {
     let test = TestKernel::new(ConsoleGeneration::Switch1);
     let heap = heap_base(&test);
     let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
     let thread = test.kernel.create_service_thread("stuck").unwrap();
-    let handler_entered = entered.clone();
+    let (handler_entered, handler_release) = (entered.clone(), release.clone());
     test.kernel
         .service_manager()
         .register(
             "stuck:u",
             &thread,
-            Arc::new(move || Arc::new(Stuck(handler_entered.clone())) as Arc<dyn SessionHandler>),
+            Arc::new(move || {
+                Arc::new(Stuck {
+                    entered: handler_entered.clone(),
+                    release: handler_release.clone(),
+                }) as Arc<dyn SessionHandler>
+            }),
         )
         .unwrap();
     let replies = Replies::default();
@@ -683,7 +694,7 @@ fn shutdown_leaves_a_service_thread_stuck_in_a_request() {
     s = call(s, &replies, 19, Msg::cmif(1, &name("stuck:u")), Some(20));
     s = call(s, &replies, 20, Msg::cmif(0, &[]), None);
     let main = test.program(s.exit());
-    test.start(test.image(), main);
+    let process = test.start(test.image(), main);
     test.kernel.run().unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while !entered.load(Ordering::SeqCst) {
@@ -700,4 +711,12 @@ fn shutdown_leaves_a_service_thread_stuck_in_a_request() {
         "shutdown took {:?}",
         start.elapsed()
     );
+    assert_ne!(process.state(), ProcessState::Exited);
+    assert!(process.memory().read::<u32>(heap + 0x3000).is_ok());
+    release.store(true, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process.state() != ProcessState::Exited {
+        assert!(Instant::now() < deadline, "the process was never released");
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
