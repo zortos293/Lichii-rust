@@ -233,19 +233,8 @@ impl AddressSpace {
     }
 
     pub fn unmap(&self, va: VAddr, size: u64) {
-        assert_eq!(
-            (va | size) & PAGE_MASK,
-            0,
-            "unaligned unmap {va:#x} {size:#x}"
-        );
         let mut tracking = self.update.lock();
-        for page in 0..size / PAGE_SIZE {
-            let addr = va + page * PAGE_SIZE;
-            if let Some(old) = self.physical_address(addr) {
-                tracking.reverse.remove(old, addr);
-            }
-            self.table.clear(addr);
-        }
+        self.clear_pages(&mut tracking, va, size);
         if let Some(fastmem) = &self.fastmem {
             fastmem
                 .arena
@@ -254,6 +243,42 @@ impl AddressSpace {
         }
         self.publish_exposed();
         drop(tracking);
+    }
+
+    /// Unmaps `[va, va + size)` like [`AddressSpace::unmap`] but leaves its fastmem views for
+    /// [`AddressSpace::release_fastmem`]. Only for an address space that runs no more guest code,
+    /// since the arena still shows the old pages.
+    pub fn unmap_retired(&self, va: VAddr, size: u64) {
+        let mut tracking = self.update.lock();
+        self.clear_pages(&mut tracking, va, size);
+    }
+
+    /// Removes every fastmem view. The host then frees the page tables of every page the title
+    /// touched, which takes most of a second for 10 GiB on Windows, so a process exit does it
+    /// after reporting the exit.
+    pub fn release_fastmem(&self) {
+        let _tracking = self.update.lock();
+        if let Some(fastmem) = &self.fastmem {
+            fastmem
+                .arena
+                .clear()
+                .unwrap_or_else(|err| panic!("fastmem release: {err}"));
+        }
+    }
+
+    fn clear_pages(&self, tracking: &mut Tracking, va: VAddr, size: u64) {
+        assert_eq!(
+            (va | size) & PAGE_MASK,
+            0,
+            "unaligned unmap {va:#x} {size:#x}"
+        );
+        for page in 0..size / PAGE_SIZE {
+            let addr = va + page * PAGE_SIZE;
+            if let Some(old) = self.physical_address(addr) {
+                tracking.reverse.remove(old, addr);
+            }
+            self.table.clear(addr);
+        }
     }
 
     /// Changes the permission of the mapped pages of `[va, va + size)`. Write-tracked pages
