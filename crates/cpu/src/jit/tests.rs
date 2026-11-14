@@ -2040,8 +2040,12 @@ fn zero_factor_products_stay_native() {
 }
 
 /// Values at the FZ flush boundary: normals whose sums and products are tiny, exactly the
-/// smallest normal or just above it, subnormals and zeros.
-const FZ_S: [u32; 9] = [
+/// smallest normal or just above it, values at and just below the floor of a native sum's inputs
+/// (2^-103 and 2^-970), subnormals and zeros.
+const FZ_S: [u32; 12] = [
+    0x0c00_0000,
+    0x0c00_0001,
+    0x8bff_ffff,
     0x0080_0001,
     0x0080_0000,
     0x8080_0000,
@@ -2053,7 +2057,10 @@ const FZ_S: [u32; 9] = [
     0x4000_0000,
 ];
 
-const FZ_D: [u64; 9] = [
+const FZ_D: [u64; 12] = [
+    0x0350_0000_0000_0000,
+    0x0350_0000_0000_0001,
+    0x834f_ffff_ffff_ffff,
     0x0010_0000_0000_0001,
     0x0010_0000_0000_0000,
     0x8010_0000_0000_0000,
