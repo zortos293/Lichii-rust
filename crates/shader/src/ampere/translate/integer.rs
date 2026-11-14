@@ -462,6 +462,7 @@ fn src_c_pair(t: &mut Translator<'_>) -> Result<(Value, Value), TranslateError> 
             let CbufBank::Index(index) = operand.bank else {
                 return Err(t.unsupported());
             };
+            t.note_cbuf_bank("IMAD", Value::U32(index));
             let pair =
                 t.ir.get_cbuf_sized(Value::U32(index), Value::U32(operand.offset), 64, false);
             let low = t.ir.composite_extract(pair, 0);

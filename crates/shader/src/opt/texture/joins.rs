@@ -194,6 +194,7 @@ pub fn limit_pipeline_sampled_texture_arrays(
     if textures.arrays == 0 || textures.fit(host) {
         return Ok(());
     }
+    crate::fallback::note("TEX", "limit_pipeline_arrays");
     let budget = host
         .max_descriptor_set_samplers
         .saturating_sub(textures.fixed_samplers)
@@ -238,5 +239,9 @@ pub fn limit_shared_stage_sampled_texture_arrays(
             .min(host.max_per_stage_resources.saturating_sub(other_resources)),
         ..host.clone()
     };
+    let textures = PipelineTextures::new(programs.iter().map(|(_, info)| &**info));
+    if textures.arrays != 0 && !textures.fit(&shared) {
+        crate::fallback::note("TEX", "limit_shared_stage_arrays");
+    }
     limit_pipeline_sampled_texture_arrays(programs, &shared)
 }

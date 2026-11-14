@@ -75,6 +75,7 @@ fn output_attr_pointer(
         let element = u32::from(attr.component());
         let info = ctx.output_generics[index as usize][element as usize];
         if info.id == 0 {
+            crate::fallback::note_value("attribute", "output_not_declared", u32::from(attr.0));
             return Ok(None);
         }
         if info.num_components == 1 {
@@ -103,6 +104,7 @@ fn output_attr_pointer(
                     "ignoring clip distance store {index} >= {} supported",
                     ctx.profile.max_user_clip_distances
                 );
+                crate::fallback::note_value("attribute", "clip_distance_past_host_limit", index);
                 return Ok(None);
             }
             let index = ctx.const_u32(index);
@@ -110,19 +112,25 @@ fn output_attr_pointer(
             Ok(Some((pointer, None)))
         }
         Attribute::LAYER if stage_allows_layer => Ok(Some((ctx.layer, Some(ctx.u32[1])))),
-        Attribute::LAYER => Ok(None),
+        Attribute::LAYER => {
+            crate::fallback::note("attribute", "layer_store_unsupported_stage");
+            Ok(None)
+        }
         Attribute::VIEWPORT_INDEX => {
             if !ctx.profile.support_multi_viewport {
                 tracing::warn!("ignoring viewport index store on a host without multi viewport");
+                crate::fallback::note("attribute", "viewport_index_no_multi_viewport");
                 return Ok(None);
             }
             if !stage_allows_layer {
+                crate::fallback::note("attribute", "viewport_index_unsupported_stage");
                 return Ok(None);
             }
             Ok(Some((ctx.viewport_index, Some(ctx.u32[1]))))
         }
         Attribute::VIEWPORT_MASK => {
             if !ctx.profile.support_viewport_mask {
+                crate::fallback::note("attribute", "viewport_mask_unsupported");
                 return Ok(None);
             }
             let pointer = ctx.b.access_chain(
@@ -171,6 +179,7 @@ fn get_cbuf(
         )?);
     };
     if binding as usize >= ShaderInfo::MAX_CBUFS {
+        crate::fallback::note_value("cbuf", "bank_past_limit", binding);
         return Ok(ctx.const_null(result_type));
     }
     let uniform_type = ctx.uniform_type(element);
@@ -185,6 +194,7 @@ fn get_cbuf(
     if offset.is_immediate() || !ctx.profile.has_broken_robust {
         return Ok(value);
     }
+    crate::fallback::note("cbuf", "dynamic_offset_past_64k_robust_workaround");
     let limit = ctx.const_u32(0xffff);
     let in_bounds = ctx
         .b
@@ -433,6 +443,11 @@ pub(super) fn interpolate_at_offset(ctx: &mut EmitContext<'_>, inst: InstId) -> 
     let generic = ctx.input_generics[index as usize];
     let element = u32::from(attr.component());
     if generic.id == 0 {
+        crate::fallback::note_value(
+            "attribute",
+            "input_not_declared_at_offset",
+            u32::from(attr.0),
+        );
         return Ok(ctx.const_f32(if element == 3 { 1.0 } else { 0.0 }));
     }
     let element = ctx.const_u32(element);
@@ -444,6 +459,7 @@ pub(super) fn interpolate_at_offset(ctx: &mut EmitContext<'_>, inst: InstId) -> 
         InputGenericLoadOp::None | InputGenericLoadOp::TimesFragCoordW
     );
     if !interpolates || !ctx.profile.support_sample_rate_shading {
+        crate::fallback::note("attribute", "offset_ignored_flat_or_no_sample_rate_shading");
         let value = ctx
             .b
             .load(generic.component_type, None, pointer, None, [])?;
@@ -474,6 +490,7 @@ pub(super) fn get_attribute(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResu
     if let Some(index) = attr.generic_index() {
         let generic = ctx.input_generics[index as usize];
         if generic.id == 0 {
+            crate::fallback::note_value("attribute", "input_not_declared", u32::from(attr.0));
             return Ok(ctx.const_f32(if element == 3 { 1.0 } else { 0.0 }));
         }
         let element = ctx.const_u32(element);
@@ -731,6 +748,7 @@ pub(super) fn invocation_info(ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitR
         ShaderStage::Geometry => Ok(ctx.const_u32(ctx.runtime.input_topology.vertices() << 16)),
         _ => {
             tracing::warn!("invocation info read outside tessellation and geometry (stubbed)");
+            crate::fallback::note("S2R", "invocation_info_other_stages");
             Ok(ctx.const_u32(0x00ff_0000))
         }
     }
@@ -738,6 +756,7 @@ pub(super) fn invocation_info(ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitR
 
 pub(super) fn sample_id(ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<Word> {
     if !ctx.profile.support_sample_rate_shading {
+        crate::fallback::note("S2R", "sample_id_no_sample_rate_shading");
         return Ok(ctx.u32_zero_value);
     }
     Ok(ctx.b.load(ctx.u32[1], None, ctx.sample_id, None, [])?)
@@ -751,11 +770,13 @@ pub(super) fn is_helper_invocation(ctx: &mut EmitContext<'_>, _inst: InstId) -> 
 
 pub(super) fn w_scale_factor_xy(ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<Word> {
     tracing::warn!("SR_WSCALEFACTOR_XY read (stubbed)");
+    crate::fallback::note("S2R", "wscale_factor_xy");
     Ok(ctx.const_u32(0x00ff_0000))
 }
 
 pub(super) fn w_scale_factor_z(ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<Word> {
     tracing::warn!("SR_WSCALEFACTOR_Z read (stubbed)");
+    crate::fallback::note("S2R", "wscale_factor_z");
     Ok(ctx.const_u32(0x00ff_0000))
 }
 
@@ -807,6 +828,7 @@ fn local_pointer(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
 /// A program whose header declares no local memory reads zero and drops its stores.
 pub(super) fn load_local(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
     if ctx.local_memory == 0 {
+        crate::fallback::note("LDL", "no_local_memory_declared");
         return Ok(ctx.u32_zero_value);
     }
     let pointer = local_pointer(ctx, inst)?;
@@ -815,6 +837,7 @@ pub(super) fn load_local(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<
 
 pub(super) fn write_local(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<()> {
     if ctx.local_memory == 0 {
+        crate::fallback::note("STL", "no_local_memory_declared");
         return Ok(());
     }
     let value = ctx.def_arg(inst, 1)?;

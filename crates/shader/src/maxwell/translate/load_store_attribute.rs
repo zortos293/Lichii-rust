@@ -88,6 +88,9 @@ pub(super) fn ipa(t: &mut Translator<'_>) -> TResult {
     if insn.bit(51) && attribute == Attribute::FRONT_FACE {
         return Err(t.unsupported());
     }
+    if insn.bits(52, 2) != 0 {
+        crate::fallback::note("IPA", "sample_mode");
+    }
     let index_reg = insn.src_a_reg();
     let mut value = if insn.bit(38) && !index_reg.is_zero() {
         let index = t.x(index_reg);
@@ -96,7 +99,10 @@ pub(super) fn ipa(t: &mut Translator<'_>) -> TResult {
         t.ir.get_attribute(attribute, Value::U32(0))
     };
     if let Some(generic) = attribute.generic_index() {
-        let sph = program_header(t).unwrap_or_default();
+        let sph = program_header(t).unwrap_or_else(|| {
+            crate::fallback::note("IPA", "no_program_header");
+            Default::default()
+        });
         let imap = sph
             .ps()
             .generic_input_map(usize::from(generic))

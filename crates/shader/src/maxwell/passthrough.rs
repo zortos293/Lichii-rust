@@ -101,8 +101,6 @@ fn find_free_register(prog: &Program) -> Option<Reg> {
 /// Turns the program's viewport mask stores into writes of a free register, which starts at
 /// viewport 0's bit, and returns the register; none when the program stores no mask.
 fn lower_viewport_mask(prog: &mut Program) -> Option<Reg> {
-    let reg = find_free_register(prog)?;
-    let &entry = prog.block_order.first()?;
     let stores: Vec<InstId> = insts(prog)
         .filter(|&id| {
             prog.op(id) == Opcode::SetAttribute
@@ -112,6 +110,11 @@ fn lower_viewport_mask(prog: &mut Program) -> Option<Reg> {
     if stores.is_empty() {
         return None;
     }
+    let Some(reg) = find_free_register(prog) else {
+        crate::fallback::note("geometry", "viewport_mask_no_free_register");
+        return None;
+    };
+    let &entry = prog.block_order.first()?;
     for id in stores {
         let value = prog.arg(id, 1);
         let mut e = Emitter::before(prog, id);
@@ -187,11 +190,17 @@ fn generate_legacy_to_generic_mappings(
             continue;
         }
         if previous(attr).is_some() {
-            mapping.extend(
-                (0..count).filter_map(|i| Some((attr.offset(i), previous(attr.offset(i))?))),
-            );
+            mapping.extend((0..count).filter_map(|i| {
+                let generic = previous(attr.offset(i));
+                if generic.is_none() {
+                    crate::fallback::note("attribute", "legacy_component_unmapped");
+                }
+                Some((attr.offset(i), generic?))
+            }));
         } else if let Some(generic) = unused_generics.next() {
             mapping.extend((0..count).map(|i| (attr.offset(i), generic.offset(i))));
+        } else {
+            crate::fallback::note("attribute", "legacy_no_free_generic");
         }
     }
     mapping

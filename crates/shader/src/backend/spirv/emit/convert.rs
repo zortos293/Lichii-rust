@@ -75,6 +75,7 @@ fn float_to_int(
     ty: Type,
     signed: bool,
 ) -> EmitResult<Word> {
+    crate::fallback::note("F2I", "float_to_int_unclamped");
     let ty = ctx.declared_type(ty)?;
     let value = ctx.def_arg(inst, 0)?;
     Ok(if signed {
@@ -244,6 +245,7 @@ pub(super) fn convert_f16_f32(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitRe
     let ty = ctx.declared_type(Type::F16)?;
     let value = ctx.def_arg(inst, 0)?;
     let result = ctx.b.f_convert(ty, None, value)?;
+    crate::fallback::note("F2F", "f16_nan_to_zero");
     let is_nan = ctx.b.is_nan(ctx.u1, None, result)?;
     let zero = ctx.const_f16(0);
     Ok(ctx.b.select(ty, None, is_nan, zero, result)?)

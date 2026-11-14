@@ -294,6 +294,7 @@ impl ImageOperands {
         bias_lc: Option<Word>,
         offset: Value,
     ) -> EmitResult<ImageOperands> {
+        crate::fallback::note("TEX", "implicit_lod_as_explicit_gradients");
         let (bias, clamp) = bias_and_clamp(ctx, info, bias_lc)?;
         let (count, total) = match info.ty {
             TextureType::Color1D | TextureType::Buffer => (1, 1),
@@ -367,6 +368,7 @@ impl ImageOperands {
             || !program.inst(second).are_all_args_immediates()
         {
             tracing::warn!("not all PTP gather offsets are immediate, ignoring them");
+            crate::fallback::note("TLD4", "ptp_non_immediate_offsets");
             return Ok(operands);
         }
         if program.op(first) != Opcode::CompositeConstructU32x4
@@ -499,6 +501,8 @@ impl ImageOperands {
         } else if runtime_allowed {
             let offset = ctx.def(offset)?;
             self.add(ctx, Mask::OFFSET, &[offset]);
+        } else {
+            crate::fallback::note("TEX", "runtime_texel_offset_non_gather");
         }
         Ok(())
     }
@@ -571,6 +575,7 @@ fn gather_dynamic_ptp(
     fixed: &[Word],
     offsets: [Value; 2],
 ) -> EmitResult<Word> {
+    crate::fallback::note("TLD4", "dynamic_ptp_per_tap_gather");
     let packed = [ctx.def(offsets[0])?, ctx.def(offsets[1])?];
     let component_type = if result_type == ctx.u32[4] {
         ctx.u32[1]
@@ -608,7 +613,10 @@ fn gather_subpixel_offset(
     let dim = match info.ty {
         TextureType::Color2D | TextureType::Color2DRect => 2,
         TextureType::ColorArray2D => 3,
-        _ => return Ok(coords),
+        _ => {
+            crate::fallback::note("TLD4", "gather_subpixel_offset_skipped");
+            return Ok(coords);
+        }
     };
     let image = texture_image(ctx, inst, info)?;
     let size = ctx
@@ -652,7 +660,10 @@ fn add_offset_to_coordinates(
             )
         }
         TextureType::Color3D => (ctx.u32[3], offset),
-        TextureType::ColorCube | TextureType::ColorArrayCube => return Ok(coords),
+        TextureType::ColorCube | TextureType::ColorArrayCube => {
+            crate::fallback::note("TLD", "fetch_offset_cube");
+            return Ok(coords);
+        }
     };
     Ok(ctx.b.i_add(ty, None, coords, offset)?)
 }
@@ -813,6 +824,7 @@ fn sample_implicit(
             };
             (ops, operands)
         } else {
+            crate::fallback::note("TEX", "implicit_lod_non_fragment");
             let lod = ctx.f32_zero_value;
             let operands = ImageOperands::explicit_lod(ctx, lod, offset)?;
             (explicit_ops(dref), operands)
@@ -1124,6 +1136,7 @@ pub(super) fn image_query_dimensions(ctx: &mut EmitContext<'_>, inst: InstId) ->
     let mips = if skip_mips {
         zero
     } else if info.ty == TextureType::Buffer {
+        crate::fallback::note("TXQ", "query_dimensions_buffer_mip_count");
         ctx.const_u32(1)
     } else {
         ctx.b.image_query_levels(ctx.u32[1], None, image)?
@@ -1197,6 +1210,7 @@ pub(super) fn image_read(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<
     let info = TextureInstInfo::from_flags(ctx.flags(inst));
     if info.image_format == ImageFormat::Typeless && !ctx.profile.support_typeless_image_loads {
         tracing::warn!("typeless image read not supported by the host");
+        crate::fallback::note("SULD", "typeless_image_read_unsupported");
         return Ok(ctx.const_null(ctx.u32[4]));
     }
     let coords = ctx.def_arg(inst, 1)?;

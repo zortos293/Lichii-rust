@@ -177,6 +177,7 @@ fn storage_atomic64(ctx: &mut EmitContext<'_>, inst: InstId, op: AtomicOp) -> Em
     let u64_t = ctx.u64;
     if !ctx.profile.support_descriptor_aliasing {
         tracing::warn!("descriptor aliasing not supported, 64-bit storage atomic ignored");
+        crate::fallback::note("ATOM", "storage_atomic64_no_descriptor_aliasing");
         return Ok(ctx.const_null(u64_t));
     }
     let value = ctx.def_arg(inst, 2)?;
@@ -185,6 +186,7 @@ fn storage_atomic64(ctx: &mut EmitContext<'_>, inst: InstId, op: AtomicOp) -> Em
         return op.atomic(ctx, u64_t, pointer, value);
     }
     tracing::warn!("int64 atomics not supported, falling back to non-atomic");
+    crate::fallback::note("ATOM", "storage_atomic64_no_int64_atomics");
     let u32x2 = ctx.u32[2];
     let pointer = storage_pointer(ctx, inst, StorageElement::U32x2, 8, 0)?;
     let words = ctx.b.load(u32x2, None, pointer, None, [])?;
@@ -199,9 +201,11 @@ fn storage_atomic32x2(ctx: &mut EmitContext<'_>, inst: InstId, op: AtomicOp) -> 
     let u32x2 = ctx.u32[2];
     if !ctx.profile.support_descriptor_aliasing {
         tracing::warn!("descriptor aliasing not supported, 64-bit storage atomic ignored");
+        crate::fallback::note("ATOM", "storage_atomic32x2_no_descriptor_aliasing");
         return Ok(ctx.const_null(u32x2));
     }
     tracing::warn!("int64 atomics not supported, falling back to non-atomic");
+    crate::fallback::note("ATOM", "storage_atomic32x2_always_non_atomic");
     let value = ctx.def_arg(inst, 2)?;
     let pointer = storage_pointer(ctx, inst, StorageElement::U32x2, 8, 0)?;
     let old = ctx.b.load(u32x2, None, pointer, None, [])?;
@@ -322,6 +326,7 @@ pub(super) fn shared_atomic_exchange64(
         return AtomicOp::Exchange.atomic(ctx, u64_t, pointer, value);
     }
     tracing::warn!("shared int64 atomics not supported, falling back to non-atomic");
+    crate::fallback::note("ATOMS", "shared_exchange64_no_int64_atomics");
     let u32x2 = ctx.u32[2];
     let words = ctx.b.bitcast(u32x2, None, value)?;
     let old = shared_exchange_words(ctx, offset, words)?;
@@ -333,6 +338,7 @@ pub(super) fn shared_atomic_exchange32x2(
     inst: InstId,
 ) -> EmitResult<Word> {
     tracing::warn!("shared int64 atomics not supported, falling back to non-atomic");
+    crate::fallback::note("ATOMS", "shared_exchange32x2_non_atomic");
     let offset = ctx.def_arg(inst, 0)?;
     let value = ctx.def_arg(inst, 1)?;
     shared_exchange_words(ctx, offset, value)
@@ -372,6 +378,7 @@ pub(super) fn shared_atomic_compare_exchange64(
         )?);
     }
     tracing::warn!("shared int64 atomics not supported, falling back to non-atomic");
+    crate::fallback::note("ATOMS", "shared_cas64_no_int64_atomics");
     let low = shared_pointer(ctx, offset, 0)?;
     let high = shared_pointer(ctx, offset, 1)?;
     let old_low = ctx.b.load(u32_t, None, low, None, [])?;
@@ -714,6 +721,7 @@ pub(super) fn storage_atomic_compare_exchange64(
     let u64_t = ctx.u64;
     if !ctx.profile.support_descriptor_aliasing {
         tracing::warn!("descriptor aliasing not supported, 64-bit storage atomic ignored");
+        crate::fallback::note("ATOM", "storage_cas64_no_descriptor_aliasing");
         return Ok(ctx.const_null(u64_t));
     }
     let comparator = ctx.def_arg(inst, 2)?;
@@ -727,6 +735,7 @@ pub(super) fn storage_atomic_compare_exchange64(
         )?);
     }
     tracing::warn!("int64 atomics not supported, falling back to non-atomic");
+    crate::fallback::note("ATOM", "storage_cas64_no_int64_atomics");
     let (u1, u32x2) = (ctx.u1, ctx.u32[2]);
     let pointer = storage_pointer(ctx, inst, StorageElement::U32x2, 8, 0)?;
     let words = ctx.b.load(u32x2, None, pointer, None, [])?;

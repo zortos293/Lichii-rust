@@ -37,6 +37,7 @@ use crate::ir::{InstId, Opcode, Type};
 pub(super) fn emit_inst(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<()> {
     let op = ctx.program.op(inst);
     if ctx.shared_memory_u32 == 0 && is_shared_memory_access(op) {
+        crate::fallback::note("shared_memory", "no_shared_memory_declared");
         if op.ty() != Type::VOID {
             let ty = ctx.declared_type(op.ty())?;
             let zero = ctx.const_null(ty);

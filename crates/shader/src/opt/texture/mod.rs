@@ -677,7 +677,10 @@ impl<'a> Tracker<'a> {
     fn texture_type(&mut self, cbuf: &CbufAddr) -> TextureType {
         if !cbuf.is_word() {
             let program = cbuf.program.and_then(|p| self.program_types.get(&p));
-            return program.copied().unwrap_or(TextureType::Color2D);
+            return program.copied().unwrap_or_else(|| {
+                crate::fallback::note("TEX", "handle_program_type_default_2d");
+                TextureType::Color2D
+            });
         }
         let source = cbuf.handle;
         if let Some(&ty) = self.types.get(&source) {
@@ -690,6 +693,7 @@ impl<'a> Tracker<'a> {
 
     fn is_multisample(&mut self, cbuf: &CbufAddr) -> bool {
         if !cbuf.is_word() {
+            crate::fallback::note("TEX", "handle_program_multisample_false");
             return false;
         }
         let source = cbuf.handle;
@@ -703,6 +707,7 @@ impl<'a> Tracker<'a> {
 
     fn is_integer(&mut self, cbuf: &CbufAddr) -> bool {
         if !cbuf.is_word() {
+            crate::fallback::note("TEX", "handle_program_integer_false");
             return false;
         }
         let source = cbuf.handle;
@@ -716,6 +721,7 @@ impl<'a> Tracker<'a> {
 
     fn pixel_format(&mut self, cbuf: &CbufAddr) -> TexturePixelFormat {
         if !cbuf.is_word() {
+            crate::fallback::note("TLD", "handle_program_pixel_format_default");
             return TexturePixelFormat::A8b8g8r8Unorm;
         }
         self.env.texture_pixel_format_of(cbuf.handle)
@@ -864,7 +870,12 @@ impl<'a> Tracker<'a> {
                     }
                 }
                 let mut lhs = self.track(prog, value, ctx)?;
-                lhs.handle.shift_left = mask.imm_u32()?.trailing_zeros();
+                let mask = mask.imm_u32()?;
+                let shift = mask.trailing_zeros();
+                if mask != u32::MAX.checked_shl(shift).unwrap_or(0) {
+                    crate::fallback::note("TEX", "handle_and_mask_trailing_zeros");
+                }
+                lhs.handle.shift_left = shift;
                 Some(lhs)
             }
             Opcode::GetCbufU32 | Opcode::GetCbufU32x2 => self.cbuf_read(prog, inst),
@@ -939,6 +950,7 @@ impl<'a> Tracker<'a> {
         if is_storage_image(image_op) || flags.ty == TextureType::Buffer {
             return Err(TextureError::UntrackedHandle(op));
         }
+        crate::fallback::note("TEX", "unbound_handle");
         static WARNINGS: AtomicU32 = AtomicU32::new(0);
         if WARNINGS.fetch_add(1, Ordering::Relaxed) < 32 {
             tracing::warn!("bindless {op:?} handle has no per-draw value: binding no texture");
@@ -983,6 +995,7 @@ impl<'a> Tracker<'a> {
                     Ok(built) => Some((self.intern(built.program), built.index)),
                     Err(failure) => {
                         tracing::debug!("handle program stopped at {failure:?}");
+                        crate::fallback::note("TEX", "handle_program_build_failed");
                         None
                     }
                 };
@@ -991,11 +1004,15 @@ impl<'a> Tracker<'a> {
             }
         };
         let (program, index) = built?;
+        let had_index = index.is_some();
         let index = index.filter(|&index| {
             self.dominance
                 .get_or_insert_with(|| handle::Dominance::new(prog))
                 .dominates(prog, index, inst)
         });
+        if had_index && index.is_none() {
+            crate::fallback::note("TEX", "handle_table_index_not_dominating");
+        }
         Some(CbufAddr {
             handle: HandleSource::default(),
             program: Some(program),
@@ -1138,6 +1155,9 @@ fn bind(
             ) {
                 is_multisample = prog.arg(id, 4) != Value::Void;
             } else {
+                if prog.arg(id, 4) != Value::Void {
+                    crate::fallback::note("TLD", "fetch_sample_index_dropped_non_2d");
+                }
                 prog.set_arg(id, 4, Value::Void);
             }
             flags.ty = tracker.resolved_type(op, flags.ty, &cbuf);
@@ -1200,6 +1220,9 @@ fn bind(
         };
         descriptors.texture_buffer(&mut info.texture_buffer_descriptors, desc)
     } else {
+        if count > sampled_cap {
+            crate::fallback::note("TEX", "descriptor_array_capped");
+        }
         count = count.min(sampled_cap);
         let is_integer = !flags.is_depth && tracker.is_integer(&cbuf);
         let desc = TextureDescriptor {
@@ -1376,6 +1399,7 @@ fn cap_texture_arrays(prog: &mut Program, info: &mut ShaderInfo, cap: u32) {
     if !shrunk.contains(&true) {
         return;
     }
+    crate::fallback::note("TEX", "limit_sampled_texture_arrays");
     for i in 0..prog.post_order.len() {
         let mut cur = prog.block(prog.post_order[i]).first();
         while let Some(id) = cur {

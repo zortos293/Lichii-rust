@@ -11,6 +11,7 @@ pub(super) fn fswzadd(t: &mut Translator<'_>) -> TResult {
     }
     if i.bit(38) {
         tracing::warn!("(STUBBED) FSWZADD - NDV mode");
+        crate::fallback::note("FSWZADD", "ndv");
     }
     let src_a = t.get_float_reg8();
     let src_b = t.get_float_reg20();

@@ -1,6 +1,7 @@
 //! Register and operand access shared by the Ampere translators.
 
 use super::{TResult, Translator};
+use crate::ShaderInfo;
 use crate::TranslateError;
 use crate::ampere::decode::Form;
 use crate::ampere::instruction::CbufBank;
@@ -89,9 +90,19 @@ impl Translator<'_> {
         let CbufBank::Index(index) = operand.bank else {
             return Err(self.unsupported());
         };
+        self.note_cbuf_bank("ALU", Value::U32(index));
         Ok(self
             .ir
             .get_cbuf(Value::U32(index), Value::U32(operand.offset)))
+    }
+
+    /// Counts a constant buffer read from a bank the host never binds, which reads zero.
+    pub fn note_cbuf_bank(&self, opcode: &'static str, bank: Value) {
+        if let Some(bank) = bank.imm_u32()
+            && bank as usize >= ShaderInfo::MAX_CBUFS
+        {
+            crate::fallback::note_value(opcode, "bank_past_limit", bank);
+        }
     }
 
     /// The first source, a register at 24..32 (a uniform register on the uniform datapath).
@@ -289,6 +300,7 @@ impl Translator<'_> {
     /// The two words of a 64-bit constant-buffer operand, as a vector.
     fn cbuf_pair(&mut self) -> Result<Value, TranslateError> {
         let (index, offset) = self.cbuf_slot()?;
+        self.note_cbuf_bank("DALU", Value::U32(index));
         let lo = self.ir.get_cbuf(Value::U32(index), Value::U32(offset));
         let hi = self
             .ir
@@ -312,6 +324,7 @@ impl Translator<'_> {
             Operand::Imm(imm) => Value::F32(f32::from_bits(imm)),
             Operand::Cbuf => {
                 let (index, offset) = self.cbuf_slot()?;
+                self.note_cbuf_bank("FALU", Value::U32(index));
                 self.ir
                     .get_float_cbuf(Value::U32(index), Value::U32(offset))
             }

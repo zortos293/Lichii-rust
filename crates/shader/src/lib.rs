@@ -37,6 +37,7 @@ macro_rules! test_gpu_state {
 pub mod ampere;
 pub mod backend;
 pub mod cache;
+pub mod fallback;
 pub mod flow;
 pub mod handle;
 mod hash;

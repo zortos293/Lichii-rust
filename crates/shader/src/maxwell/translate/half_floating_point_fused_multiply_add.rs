@@ -39,6 +39,9 @@ fn hfma2(t: &mut Translator<'_>, src_b: Value, src_c: Value, m: Hfma2) -> TResul
         t.ir.fp_abs_neg(c.0, false, m.neg_c),
         t.ir.fp_abs_neg(c.1, false, m.neg_c),
     );
+    if m.precision & 3 == 3 {
+        crate::fallback::note("HFMA2", "precision_3");
+    }
     let (fmz_mode, fmz) = half_precision(m.precision);
     let control = FpControl {
         no_contraction: true,

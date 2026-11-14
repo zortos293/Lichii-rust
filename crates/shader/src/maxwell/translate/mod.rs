@@ -558,6 +558,7 @@ fn dispatch(t: &mut Translator<'_>, opcode: Opcode) -> TResult {
         Opcode::R2pImm => move_register_to_predicate::r2p_imm(t),
         Opcode::Ram => {
             tracing::warn!("(STUBBED) RAM");
+            crate::fallback::note("RAM", "stubbed");
             Ok(())
         }
         Opcode::Ret => Err(t.unsupported()),
@@ -565,6 +566,7 @@ fn dispatch(t: &mut Translator<'_>, opcode: Opcode) -> TResult {
         Opcode::Rtt => Err(t.unsupported()),
         Opcode::Sam => {
             tracing::warn!("(STUBBED) SAM");
+            crate::fallback::note("SAM", "stubbed");
             Ok(())
         }
         Opcode::SelImm => select_source_with_predicate::sel_imm(t),

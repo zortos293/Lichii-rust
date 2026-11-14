@@ -51,7 +51,11 @@ fn is_get_cbuf(op: Opcode) -> bool {
 }
 
 fn add_constant_buffer_descriptor(info: &mut ShaderInfo, index: u32) {
-    if index as usize >= ShaderInfo::MAX_CBUFS || info.constant_buffer_mask & (1 << index) != 0 {
+    if index as usize >= ShaderInfo::MAX_CBUFS {
+        crate::fallback::note_value("cbuf", "bank_past_limit_no_descriptor", index);
+        return;
+    }
+    if info.constant_buffer_mask & (1 << index) != 0 {
         return;
     }
     info.constant_buffer_mask |= 1 << index;
@@ -789,7 +793,11 @@ fn visit_fp_modifiers(info: &mut ShaderInfo, prog: &Program, id: InstId) {
     };
     match FpControl::from_flags(inst.flags).fmz_mode {
         FmzMode::DontCare => {}
-        FmzMode::Ftz | FmzMode::Fmz => *flush = true,
+        FmzMode::Ftz => *flush = true,
+        FmzMode::Fmz => {
+            crate::fallback::note("FMUL", "fmz_as_ftz");
+            *flush = true;
+        }
         FmzMode::None => *preserve = true,
     }
 }

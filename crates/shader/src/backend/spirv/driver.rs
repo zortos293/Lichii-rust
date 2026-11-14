@@ -266,6 +266,7 @@ fn define_entry_point(ctx: &mut EmitContext<'_>, main: Word) {
                     ctx.add_capability(Capability::GeometryShaderPassthroughNV);
                 } else {
                     tracing::warn!("geometry shader passthrough used with no host support");
+                    crate::fallback::note("geometry", "passthrough_no_host_support");
                 }
             }
             ExecutionModel::Geometry
@@ -305,6 +306,7 @@ fn setup_denorm_control(ctx: &mut EmitContext<'_>, main: Word) {
     let profile = ctx.profile;
     if info.uses_fp32_denorms_flush && info.uses_fp32_denorms_preserve {
         tracing::debug!("fp32 denorm flush and preserve in the same program");
+        crate::fallback::note("fp32", "flush_and_preserve_conflict");
     } else if info.uses_fp32_denorms_flush {
         if profile.support_fp32_denorm_flush && !profile.has_broken_fp32_denorm_flush {
             ctx.add_capability(Capability::DenormFlushToZero);
@@ -318,13 +320,18 @@ fn setup_denorm_control(ctx: &mut EmitContext<'_>, main: Word) {
                 .execution_mode(main, ExecutionMode::DenormPreserve, [32]);
         } else {
             tracing::debug!("fp32 denorm preserve used without host support");
+            crate::fallback::note("fp32", "denorm_preserve_unsupported");
         }
     }
     if !profile.support_separate_denorm_behavior || profile.has_broken_fp16_float_controls {
+        if info.uses_fp16_denorms_flush || info.uses_fp16_denorms_preserve {
+            crate::fallback::note("fp16", "denorm_control_unavailable");
+        }
         return;
     }
     if info.uses_fp16_denorms_flush && info.uses_fp16_denorms_preserve {
         tracing::debug!("fp16 denorm flush and preserve in the same program");
+        crate::fallback::note("fp16", "flush_and_preserve_conflict");
     } else if info.uses_fp16_denorms_flush {
         if profile.support_fp16_denorm_flush {
             ctx.add_capability(Capability::DenormFlushToZero);
@@ -338,6 +345,7 @@ fn setup_denorm_control(ctx: &mut EmitContext<'_>, main: Word) {
                 .execution_mode(main, ExecutionMode::DenormPreserve, [16]);
         } else {
             tracing::debug!("fp16 denorm preserve used without host support");
+            crate::fallback::note("fp16", "denorm_preserve_unsupported");
         }
     }
 }

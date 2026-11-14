@@ -144,22 +144,27 @@ fn emulate(prog: &mut Program, id: InstId, op: Opcode) {
             with(prog, id, |e| unpack(e, a).0)
         }
         ConvertS64F16 | ConvertS64F32 | ConvertS64F64 => {
+            crate::fallback::note("int64", "float_conversions_emulated");
             let a = arg(0);
             with(prog, id, |e| float_to_int64(e, a, true))
         }
         ConvertU64F16 | ConvertU64F32 | ConvertU64F64 => {
+            crate::fallback::note("int64", "float_conversions_emulated");
             let a = arg(0);
             with(prog, id, |e| float_to_int64(e, a, false))
         }
         ConvertF16S64 | ConvertF32S64 | ConvertF64S64 => {
+            crate::fallback::note("int64", "float_conversions_emulated");
             let a = arg(0);
             with(prog, id, |e| int64_to_float(e, a, true, float_bits(op)))
         }
         ConvertF16U64 | ConvertF32U64 | ConvertF64U64 => {
+            crate::fallback::note("int64", "float_conversions_emulated");
             let a = arg(0);
             with(prog, id, |e| int64_to_float(e, a, false, float_bits(op)))
         }
         SharedAtomicCompareExchange64 => {
+            crate::fallback::note("ATOMS", "shared_cas64_lowered_non_atomic");
             tracing::warn!(
                 "int64 not supported, {} falls back to non-atomic",
                 op.name()
@@ -173,6 +178,7 @@ fn emulate(prog: &mut Program, id: InstId, op: Opcode) {
             })
         }
         GlobalAtomicCompareExchange64 => {
+            crate::fallback::note("ATOM", "global_cas64_lowered_non_atomic");
             tracing::warn!(
                 "int64 not supported, {} falls back to non-atomic",
                 op.name()

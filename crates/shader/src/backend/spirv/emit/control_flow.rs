@@ -22,6 +22,7 @@ pub(super) fn demote_to_helper_invocation(
         ctx.b.insert_into_block(InsertPoint::End, demote)?;
         return Ok(());
     }
+    crate::fallback::note("discard", "demote_as_kill");
     let kill_label = ctx.b.id();
     let impossible_label = ctx.b.id();
     ctx.b

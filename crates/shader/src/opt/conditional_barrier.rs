@@ -23,6 +23,7 @@ pub fn conditional_barrier(prog: &mut Program, info: &mut ShaderInfo) {
                 while let Some(id) = cur {
                     cur = prog.inst(id).next();
                     if prog.op(id) == Opcode::Barrier {
+                        crate::fallback::note("BAR", "conditional_barrier_removed");
                         prog.remove(id);
                         info.removed_conditional_barrier = true;
                     }

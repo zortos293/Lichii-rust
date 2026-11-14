@@ -242,6 +242,7 @@ fn load_global(
 ) -> EmitResult<Word> {
     if !ctx.profile.support_int64 {
         tracing::warn!("int64 not supported, ignoring global memory load");
+        crate::fallback::note("LDG", "global_load_no_int64");
         return Ok(ctx.const_u32_vec(&[0; 4][..words]));
     }
     let func = global_function(func)?;
@@ -253,6 +254,7 @@ fn load_global(
 fn write_global(ctx: &mut EmitContext<'_>, inst: InstId, func: Word) -> EmitResult<()> {
     if !ctx.profile.support_int64 {
         tracing::warn!("int64 not supported, ignoring global memory store");
+        crate::fallback::note("STG", "global_store_no_int64");
         return Ok(());
     }
     let func = global_function(func)?;

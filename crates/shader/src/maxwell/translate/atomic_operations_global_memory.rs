@@ -176,9 +176,11 @@ fn global_atomic(
     let result = if !op_not_applicable(size, op) {
         apply(t, operand, offset, size, op)?
     } else if size.is_64() {
+        crate::fallback::note("ATOM/RED", "op_not_applicable");
         let words = t.ir.inst(Opcode::LoadGlobal64, &[offset]);
         t.ir.pack_uint_2x32(words)
     } else {
+        crate::fallback::note("ATOM/RED", "op_not_applicable");
         t.ir.inst(Opcode::LoadGlobal32, &[offset])
     };
     if dest.is_zero() {

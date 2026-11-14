@@ -1334,6 +1334,9 @@ pub struct DebugSettings {
     pub auto_stub: bool,
     pub gdb_stub_port: Option<u16>,
     pub dump_shaders: bool,
+    /// Count every place shader translation approximates or stubs a guest mode, and log each
+    /// (opcode, variant) once plus a census of them. Read at launch.
+    pub shader_fallbacks: bool,
 }
 
 impl Default for DebugSettings {
@@ -1345,6 +1348,7 @@ impl Default for DebugSettings {
             auto_stub: false,
             gdb_stub_port: None,
             dump_shaders: false,
+            shader_fallbacks: false,
         }
     }
 }

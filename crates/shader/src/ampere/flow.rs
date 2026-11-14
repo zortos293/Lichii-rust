@@ -129,9 +129,12 @@ impl FlowIsa for AmpereFlow {
             },
             Opcode::Brx | Opcode::Brxu => FlowOp::IndirectBranch { absolute: false },
             Opcode::Jmx | Opcode::Jmxu => FlowOp::IndirectBranch { absolute: true },
-            Opcode::CallRel if inst.bit(86) && !cond.is_true() => FlowOp::Branch {
-                target: self.relative_target(pc, inst)?,
-            },
+            Opcode::CallRel if inst.bit(86) && !cond.is_true() => {
+                crate::fallback::note("CALL.REL", "noinc_predicated_as_branch");
+                FlowOp::Branch {
+                    target: self.relative_target(pc, inst)?,
+                }
+            }
             Opcode::CallRel => FlowOp::Call {
                 target: self.relative_target(pc, inst)?,
             },
@@ -139,7 +142,12 @@ impl FlowIsa for AmpereFlow {
                 target: self.absolute_target(pc, inst)?,
             },
             Opcode::Ret => FlowOp::Return,
-            Opcode::Exit => FlowOp::Exit,
+            Opcode::Exit => {
+                if inst.bits(84, 2) != 0 {
+                    crate::fallback::note("EXIT", "exit_modifiers_bits84_85");
+                }
+                FlowOp::Exit
+            }
             Opcode::Kill => FlowOp::Kill,
             _ => FlowOp::Normal,
         };

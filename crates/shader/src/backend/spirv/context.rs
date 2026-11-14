@@ -1470,6 +1470,21 @@ impl<'a> EmitContext<'a> {
                 || (!loads.generic(index) && !info.passthrough.generic(index))
                 || input_type == AttributeType::Disabled
             {
+                if loads.generic(index) || info.passthrough.generic(index) {
+                    if !runtime.previous_stage_stores.generic(index) {
+                        crate::fallback::note_value(
+                            "attribute",
+                            "input_not_stored_by_previous_stage",
+                            u32::from(index),
+                        );
+                    } else {
+                        crate::fallback::note_value(
+                            "attribute",
+                            "input_type_disabled",
+                            u32::from(index),
+                        );
+                    }
+                }
                 continue;
             }
             let ty = self.attribute_type(input_type);
@@ -2183,6 +2198,7 @@ impl<'a> EmitContext<'a> {
         let labels: [Word; ShaderInfo::MAX_INDIRECT_CBUFS] = std::array::from_fn(|_| self.b.id());
         self.b
             .selection_merge(merge_label, SelectionControl::NONE)?;
+        crate::fallback::note("cbuf", "indirect_default_bank0");
         self.b.switch(
             binding,
             labels[0],
@@ -2633,6 +2649,7 @@ impl<'a> EmitContext<'a> {
                 .map(|&(literal, label)| (Operand::LiteralBit32(literal), label)),
         )?;
         self.begin_label(default_label)?;
+        crate::fallback::note("attribute", "indexed_load_not_declared");
         self.b.ret_value(self.f32_zero_value)?;
         let mut labels = cases.iter().map(|&(_, label)| label);
         if position {
@@ -2656,6 +2673,11 @@ impl<'a> EmitContext<'a> {
             self.begin_label(labels.next().unwrap_or_default())?;
             let generic = self.input_generics[index as usize];
             if generic.id == 0 {
+                crate::fallback::note_value(
+                    "attribute",
+                    "indexed_load_generic_not_declared",
+                    u32::from(index),
+                );
                 self.b.ret_value(self.f32_zero_value)?;
                 continue;
             }
@@ -2730,6 +2752,8 @@ impl<'a> EmitContext<'a> {
         let clip_base = u32::from(Attribute::CLIP_DISTANCE_0.0) >> 2;
         if clip && max_clip >= 4 {
             cases.push((clip_base, self.b.id()));
+        } else if clip {
+            crate::fallback::note("attribute", "indexed_store_clip_past_host_limit");
         }
         if clip && max_clip >= 8 {
             cases.push((clip_base + 1, self.b.id()));
@@ -2743,6 +2767,7 @@ impl<'a> EmitContext<'a> {
                 .map(|&(literal, label)| (Operand::LiteralBit32(literal), label)),
         )?;
         self.begin_label(default_label)?;
+        crate::fallback::note("attribute", "indexed_store_default_dropped");
         self.b.ret()?;
         let mut labels = cases.iter().map(|&(_, label)| label);
         if position {
@@ -2893,6 +2918,7 @@ impl<'a> EmitContext<'a> {
                 && d.indirect_offset == StorageBufferDescriptor::DIRECT
         });
         let Some(holder) = holder else {
+            crate::fallback::note("global_memory", "storage_guest_address_missing_holder");
             return Ok(self.const_u64(u64::MAX));
         };
         let holder_low = self.b.composite_extract(u32_t, None, words, [0])?;
@@ -2954,6 +2980,7 @@ impl<'a> EmitContext<'a> {
             ctx.begin_label(else_label)
         };
         if info.native_global_bounds {
+            crate::fallback::note("global_memory", "nearest_buffer_route");
             let mut bases = Vec::with_capacity(num_buffers);
             let mut best_index = self.const_u32(u32::MAX);
             let mut best_distance = self.const_u64(u64::MAX);
@@ -2981,6 +3008,7 @@ impl<'a> EmitContext<'a> {
         for index in 0..num_buffers {
             let ssbo = info.storage_buffers_descriptors[index];
             if !uses_nvn_storage_descriptor(info, &ssbo) {
+                crate::fallback::note("global_memory", "route_nvn_slots_only");
                 continue;
             }
             let guest = self.storage_guest_address(index)?;
@@ -3068,6 +3096,7 @@ impl<'a> EmitContext<'a> {
                 },
             )?;
         }
+        crate::fallback::note("LDG", "global_load_no_matching_buffer");
         let null = self.const_null(ty);
         self.b.ret_value(null)?;
         self.b.end_function()?;
@@ -3139,6 +3168,7 @@ impl<'a> EmitContext<'a> {
                 },
             )?;
         }
+        crate::fallback::note("STG", "global_store_no_matching_buffer");
         self.b.ret()?;
         self.b.end_function()?;
         Ok(func)
@@ -3191,6 +3221,7 @@ impl<'a> EmitContext<'a> {
                 },
             )?;
         }
+        crate::fallback::note("LDG", "global_small_load_no_matching_buffer");
         let zero = self.u32_zero_value;
         self.b.ret_value(zero)?;
         self.b.end_function()?;
@@ -3247,6 +3278,9 @@ impl<'a> EmitContext<'a> {
     fn define_global_memory_functions(&mut self) -> EmitResult<()> {
         let info = self.info;
         if !info.uses_global_memory || !self.profile.support_int64 {
+            if info.uses_global_memory {
+                crate::fallback::note("global_memory", "routing_functions_not_defined");
+            }
             return Ok(());
         }
         let u32_def = self.storage_type(StorageElement::U32);

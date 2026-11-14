@@ -19,15 +19,27 @@ pub(super) fn translate(t: &mut Translator<'_>, op: Opcode) -> TResult {
         Ldc => ldc(t),
         Uldc => uldc(t),
         Ldcg => ldcg(t),
-        Ld | Ldg => ldg(t),
-        St | Stg => stg(t),
+        Ld => {
+            crate::fallback::note("LD", "generic_as_global");
+            ldg(t)
+        }
+        Ldg => ldg(t),
+        St => {
+            crate::fallback::note("ST", "generic_as_global");
+            stg(t)
+        }
+        Stg => stg(t),
         Ldl => ldl(t),
         Stl => stl(t),
         Lds => lds(t),
         Sts => sts(t),
         Ldgsts => ldgsts(t),
         Ldsm => ldsm(t),
-        Atom | Atomg => atomg(t),
+        Atom => {
+            crate::fallback::note("ATOM", "generic_as_global");
+            atomg(t)
+        }
+        Atomg => atomg(t),
         AtomCas | AtomgCas => atomg_cas(t),
         Red => red(t),
         Atoms => atoms(t),
@@ -297,6 +309,7 @@ fn ldc(t: &mut Translator<'_>) -> TResult {
         }
         _ => return Err(t.unsupported()),
     };
+    t.note_cbuf_bank("LDC", index);
     let value = t.ir.get_cbuf_sized(index, offset, ty.bits(), ty.signed());
     write_words(t, dest, value, ty.words(), Value::U1(true));
     Ok(())
@@ -315,6 +328,7 @@ fn uldc(t: &mut Translator<'_>) -> TResult {
         Form::Bound => Value::U32(imm),
         _ => add_u32(t, t.insn.usrc0(), imm),
     };
+    t.note_cbuf_bank("ULDC", Value::U32(bank));
     let value =
         t.ir.get_cbuf_sized(Value::U32(bank), offset, ty.bits(), ty.signed());
     write_words(t, dest, value, ty.words(), Value::U1(true));
@@ -348,6 +362,9 @@ fn ldcg(t: &mut Translator<'_>) -> TResult {
     let address = global_address(t, operands, t.insn.sbits(38, 32))?;
     let value = t.ir.inst(load_global_op(ty), &[address]);
     let enable = t.pred(t.insn.upred_src(87, 90));
+    if enable != Value::U1(true) {
+        crate::fallback::note("LDCG", "load_predicate_false");
+    }
     write_words(t, dest, value, ty.words(), enable);
     Ok(())
 }
@@ -363,6 +380,9 @@ fn ldg(t: &mut Translator<'_>) -> TResult {
     let value = t.ir.inst(load_global_op(ty), &[address]);
     let pred = Pred::p(7 - t.insn.bits(64, 3) as u8);
     let enable = t.pred((pred, t.insn.bit(67)));
+    if enable != Value::U1(true) {
+        crate::fallback::note("LDG", "load_predicate_false");
+    }
     write_words(t, dest, value, ty.words(), enable);
     Ok(())
 }
@@ -419,6 +439,9 @@ fn ldl(t: &mut Translator<'_>) -> TResult {
     let offset = byte_address(t, ureg, false);
     let word = local_word(t, offset);
     let size = t.env.local_memory_size();
+    if size == 0 || matches!(offset, Value::U32(bytes) if bytes >= size) {
+        crate::fallback::note("LDL", "local_read_past_size");
+    }
     let value = load_local(t, word, offset, size);
     if ty.bits() < 32 {
         let bit = sub_word_bit(t, offset, if ty.bits() == 8 { 24 } else { 16 });
@@ -448,6 +471,7 @@ fn stl(t: &mut Translator<'_>) -> TResult {
     if let Value::U32(bytes) = offset
         && bytes >= t.env.local_memory_size()
     {
+        crate::fallback::note("STL", "local_write_past_size");
         return Ok(());
     }
     let word = local_word(t, offset);
@@ -598,6 +622,9 @@ fn ldgsts(t: &mut Translator<'_>) -> TResult {
     let address = global_address(t, operands, insn.sbits(32, 12))?;
     let loaded = t.ir.inst(load, &[address]);
     let enable = t.pred(insn.pred_src(87, not_bit));
+    if enable != Value::U1(true) {
+        crate::fallback::note("LDGSTS", "predicate_false_zero_fill");
+    }
     let value = if words == 1 {
         zero_unless(t, enable, loaded)
     } else if enable == Value::U1(true) {
@@ -934,6 +961,18 @@ mod tests {
         let block = prog.new_block();
         translate_block(&mut prog, block, &env, 0, env.end()).unwrap();
         prog.dump()
+    }
+
+    #[test]
+    fn ldc_from_a_bank_past_the_limit_is_counted() {
+        let _census = crate::fallback::test_census();
+        let insn = encode(
+            Opcode::Ldc,
+            Form::Bound,
+            f(16, 2) | f(24, 4) | f(38, 0x10) | f(54, 24) | f(73, 5),
+        );
+        translate(&[insn]).unwrap();
+        assert!(crate::fallback::sites("LDC", "bank_past_limit", Some(24)) >= 1);
     }
 
     #[test]

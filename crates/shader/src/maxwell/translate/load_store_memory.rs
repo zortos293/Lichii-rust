@@ -36,7 +36,11 @@ pub(super) fn ldg(t: &mut Translator<'_>) -> TResult {
         3 => (Opcode::LoadGlobalS16, 1),
         4 => (Opcode::LoadGlobal32, 1),
         5 => (Opcode::LoadGlobal64, 2),
-        _ => (Opcode::LoadGlobal128, 4),
+        6 => (Opcode::LoadGlobal128, 4),
+        _ => {
+            crate::fallback::note("LDG", "size_7_as_128");
+            (Opcode::LoadGlobal128, 4)
+        }
     };
     if !is_aligned(dest, count) {
         return Err(t.unsupported());

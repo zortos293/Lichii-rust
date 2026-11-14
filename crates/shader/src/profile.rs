@@ -277,6 +277,7 @@ impl HostTranslateInfo {
             &mut self.max_descriptor_set_input_attachements,
         ] {
             if *limit == 0 {
+                crate::fallback::note("profile", "unset_limit_default_1024");
                 *limit = Self::DEFAULT_DESCRIPTOR_LIMIT;
             }
         }

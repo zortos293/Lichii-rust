@@ -66,6 +66,9 @@ pub(super) fn ldl(t: &mut Translator<'_>) -> TResult {
         return Err(t.unsupported());
     }
     let (word, offset) = word_offset(t);
+    if local_size == 0 || matches!(offset, Value::U32(bytes) if bytes >= local_size) {
+        crate::fallback::note("LDL", "local_read_past_size");
+    }
     let value = load_local(t, word, offset, local_size);
     if bits < 32 {
         let bit = sub_word_bit(t, offset, if bits == 8 { 24 } else { 16 });
@@ -95,6 +98,7 @@ pub(super) fn stl(t: &mut Translator<'_>) -> TResult {
     if let Value::U32(bytes) = offset
         && bytes >= local_memory_size(t)?
     {
+        crate::fallback::note("STL", "local_write_past_size");
         return Ok(());
     }
     let src = t.x(reg);

@@ -42,7 +42,10 @@ pub(super) fn barrier(ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<()
             let none = ctx.const_u32(0);
             Ok(ctx.b.control_barrier(workgroup, invocation, none)?)
         }
-        _ => Ok(()),
+        _ => {
+            crate::fallback::note("BAR", "barrier_stage_without_workgroup");
+            Ok(())
+        }
     }
 }
 
