@@ -48,6 +48,8 @@ pub(crate) fn init() {
         lod0 = lod0(),
         no_a2c = no_a2c(),
         samples1 = samples1(),
+        no_dual = no_dual(),
+        no_cmask = no_cmask(),
         log = state().is_some(),
         "draw diag build"
     );
@@ -75,6 +77,16 @@ pub(crate) fn lod0() -> bool {
 pub(crate) fn no_a2c() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| flag("LICHII_DIAG_NO_A2C"))
+}
+
+pub(crate) fn no_dual() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| flag("LICHII_DIAG_NO_DUAL"))
+}
+
+pub(crate) fn no_cmask() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| flag("LICHII_DIAG_NO_CMASK"))
 }
 
 pub(crate) fn samples1() -> bool {
@@ -188,6 +200,14 @@ impl VulkanRasterizer {
             regs.framebuffer_srgb,
             regs.logic_op.enable,
             regs.logic_op.op,
+        );
+        let _ = write!(
+            s,
+            " dual={} fsout={:x?}",
+            super::blends_second_source(regs),
+            self.draw.stages[4]
+                .as_ref()
+                .map(|m| m.info.frag_color_components)
         );
         for i in 0..8 {
             let Some(t) = self.draw.colors[i] else {

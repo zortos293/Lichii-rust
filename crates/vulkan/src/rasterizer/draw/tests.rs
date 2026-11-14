@@ -315,6 +315,32 @@ fn second_source_blend_factors_read_the_second_colour_output() {
     f.assert_no_validation_errors();
 }
 
+/// A fragment program that outputs only red, green and blue leaves the target's alpha as it
+/// was, although the colour mask enables all four components.
+#[test]
+fn components_the_fragment_program_does_not_output_keep_their_texels() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let mut header = header(2, ShaderType::PIXEL);
+    header[18] = 0x7;
+    let code = [mov_cbuf(0, 0), mov_cbuf(1, 4), mov_cbuf(2, 8), exit()];
+    write(&f, PROGRAMS + u64::from(FRAGMENT), &program(header, &code));
+    let tiling = Tiling::new(SIZE, SIZE, 1, 4, 1, 0, GobLayout::Tegra);
+    f.memory
+        .write_bytes(DADDR, &vec![0x40; tiling.size_bytes()])
+        .unwrap();
+    let regs = draw_regs();
+    draw(&mut f, &gmmu, &regs);
+    let texels = target(&mut f);
+    assert!(
+        texels.iter().all(|&t| t == [255, 128, 0, 0x40]),
+        "red, green and blue drawn, alpha kept: {:?}",
+        &texels[..4]
+    );
+    f.assert_no_validation_errors();
+}
+
 /// A count spanning more draws than the query pool holds is exact: completed queries are read
 /// as their work finishes, not only when the guest reports.
 #[test]
