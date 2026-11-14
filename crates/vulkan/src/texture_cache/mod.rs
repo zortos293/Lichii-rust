@@ -297,14 +297,16 @@ struct CachedImage {
     keep_out: Vec<(DAddr, DAddr)>,
 }
 
-/// A live image that shares a rectangle of texels with another, at level 0 of layer 0:
-/// `at` in the alias, `own` in the image that lists it. `synced` is the alias's `written`
-/// tick when the rectangle last took its texels.
+/// A live image that shares a rectangle of texels with another, at level 0: `at` in layer
+/// `at_layer` of the alias, `own` in layer `own_layer` of the image that lists it. `synced` is
+/// the alias's `written` tick when the rectangle last took its texels.
 #[derive(Clone, Copy, Debug)]
 struct Alias {
     id: ImageId,
     at: Texel,
+    at_layer: u32,
     own: Texel,
+    own_layer: u32,
     extent: Texel,
     synced: u64,
 }
@@ -547,25 +549,25 @@ fn components(swizzle: [SwizzleSource; 4], host: vk::ComponentMapping) -> vk::Co
     }
 }
 
-/// The rectangle two single-level 2D block-linear images at the same address share at level 0:
-/// the same as [`pitch_overlap`], for images whose level 0 tiles alike (equal GOBs per row,
-/// block height and GOB layout) and so differ at most in width and height.
+/// The rectangle two 2D block-linear images share at level 0, when one starts at layer 0 of the
+/// other or both are single-layer at the same address: the rectangle's texel offset in `a`, in
+/// `b`, its extent, and the layer of each it lies in. Their level 0 must tile alike (equal GOBs per
+/// row, block height and GOB layout), so they differ at most in width, height and layer count, as
+/// when a render target of another size is drawn into one layer of an array texture.
 fn block_linear_overlap(
     a: &ImageInfo,
     a_base: DAddr,
     b: &ImageInfo,
     b_base: DAddr,
-) -> Option<(Texel, Texel, Texel)> {
+) -> Option<(Texel, Texel, Texel, (u32, u32))> {
     let tiling = |i: &ImageInfo| {
-        let single = matches!(i.layout, GuestLayout::BlockLinear { .. })
+        let plain = matches!(i.layout, GuestLayout::BlockLinear { .. })
             && i.format.block_width() == 1
             && i.format.block_height() == 1
             && i.kind == ImageKind::D2
             && i.depth == 1
-            && i.levels == 1
-            && i.layers == 1
             && i.samples == 1;
-        single.then(|| i.surface().level_tiling(0))
+        plain.then(|| i.surface().level_tiling(0))
     };
     let (ta, tb) = (tiling(a)?, tiling(b)?);
     let shape = |t: &Tiling| {
@@ -578,13 +580,25 @@ fn block_linear_overlap(
         )
     };
     let same_encoding = a.format.is_color() || a.format == b.format;
-    if a_base != b_base || shape(&ta) != shape(&tb) || !same_encoding {
+    if shape(&ta) != shape(&tb) || !same_encoding {
         return None;
     }
+    let layer_in = |array: &ImageInfo, offset: u64| {
+        let layer = offset.checked_div(array.layer_stride)?;
+        (offset.is_multiple_of(array.layer_stride) && layer < u64::from(array.layers))
+            .then_some(layer as u32)
+    };
+    let layers = match a_base.cmp(&b_base) {
+        std::cmp::Ordering::Equal if a.layers == 1 || b.layers == 1 => (0, 0),
+        std::cmp::Ordering::Less if b.layers == 1 => (layer_in(a, b_base - a_base)?, 0),
+        std::cmp::Ordering::Greater if a.layers == 1 => (0, layer_in(b, a_base - b_base)?),
+        _ => return None,
+    };
     Some((
         (0, 0),
         (0, 0),
         (a.width.min(b.width), a.height.min(b.height)),
+        layers,
     ))
 }
 
@@ -1858,26 +1872,36 @@ impl TextureCache {
         let overlaps = std::mem::take(&mut self.ids);
         for &id in &overlaps {
             let image = self.get(id).expect("a live image id");
+            let subresource = (contiguous && image.contiguous() && image.base() >= base)
+                .then(|| info.find_subresource(&image.info, image.base() - base))
+                .flatten();
             if contiguous
                 && image.contiguous()
                 && image.scale == ResolutionScale::X1
                 && Self::copy_compatible(image, host, info.format)
-                && let Some((at, own, extent)) =
+                && let Some((at, own, extent, (at_layer, own_layer))) =
                     pitch_overlap(&image.info, image.base(), info, base)
-                        .or_else(|| block_linear_overlap(&image.info, image.base(), info, base))
+                        .map(|(at, own, extent)| (at, own, extent, (0, 0)))
+                        .or_else(|| {
+                            subresource
+                                .is_none()
+                                .then(|| {
+                                    block_linear_overlap(&image.info, image.base(), info, base)
+                                })
+                                .flatten()
+                        })
             {
                 self.new_aliases.push(Alias {
                     id,
                     at,
+                    at_layer,
                     own,
+                    own_layer,
                     extent,
                     synced: 0,
                 });
                 continue;
             }
-            let subresource = (contiguous && image.contiguous() && image.base() >= base)
-                .then(|| info.find_subresource(&image.info, image.base() - base))
-                .flatten();
             match subresource {
                 Some((level, layer))
                     if image.gpu_modified
@@ -1912,7 +1936,9 @@ impl TextureCache {
             self.image(alias.id).aliases.push(Alias {
                 id,
                 at: alias.own,
+                at_layer: alias.own_layer,
                 own: alias.at,
+                own_layer: alias.at_layer,
                 extent: alias.extent,
                 synced: 0,
             });
@@ -2262,7 +2288,12 @@ impl TextureCache {
         newer.sort_by_key(|a| self.get(a.id).map_or(0, |other| other.written));
         let mut result = Ok(());
         for alias in &newer {
-            result = self.copy_texels(scheduler, alias.id, alias.at, id, alias.own, alias.extent);
+            result = self.copy_texels(
+                scheduler,
+                (alias.id, alias.at, alias.at_layer),
+                (id, alias.own, alias.own_layer),
+                alias.extent,
+            );
             if result.is_err() {
                 break;
             }
@@ -2299,9 +2330,12 @@ impl TextureCache {
             })
         });
         for alias in &older {
-            if let Err(error) =
-                self.copy_texels(scheduler, id, alias.own, alias.id, alias.at, alias.extent)
-            {
+            if let Err(error) = self.copy_texels(
+                scheduler,
+                (id, alias.own, alias.own_layer),
+                (alias.id, alias.at, alias.at_layer),
+                alias.extent,
+            ) {
                 tracing::error!(%error, "copying an image into its alias failed");
                 continue;
             }
@@ -2319,15 +2353,13 @@ impl TextureCache {
         }
     }
 
-    /// Records a copy of the `extent` texels at `from_at` in `from` to `to_at` in `to`, at
-    /// level 0 of layer 0.
+    /// Records a copy of the `extent` texels at a position in a layer of one image to a position
+    /// in a layer of another, at level 0.
     fn copy_texels(
         &mut self,
         scheduler: &mut Scheduler,
-        from: ImageId,
-        from_at: Texel,
-        to: ImageId,
-        to_at: Texel,
+        (from, from_at, from_layer): (ImageId, Texel, u32),
+        (to, to_at, to_layer): (ImageId, Texel, u32),
         extent: Texel,
     ) -> Result<()> {
         let device = self.device.clone();
@@ -2338,10 +2370,10 @@ impl TextureCache {
             (image.image.raw(), aspect_of(image.image.desc().format))
         };
         let dst = self.prepare_live(cmd, to, ImageAccess::TRANSFER_DST);
-        let layers = vk::ImageSubresourceLayers {
+        let layer = |base_array_layer| vk::ImageSubresourceLayers {
             aspect_mask: aspect,
             mip_level: 0,
-            base_array_layer: 0,
+            base_array_layer,
             layer_count: 1,
         };
         let offset = |(x, y): Texel| vk::Offset3D {
@@ -2350,9 +2382,9 @@ impl TextureCache {
             z: 0,
         };
         let region = vk::ImageCopy {
-            src_subresource: layers,
+            src_subresource: layer(from_layer),
             src_offset: offset(from_at),
-            dst_subresource: layers,
+            dst_subresource: layer(to_layer),
             dst_offset: offset(to_at),
             extent: vk::Extent3D {
                 width: extent.0,

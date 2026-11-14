@@ -2328,6 +2328,61 @@ fn block_linear_aliases_need_the_same_depth_stencil_encoding() {
     let narrower = info(PixelFormat::D24UnormS8Uint, 252);
     assert_eq!(
         block_linear_overlap(&d24s8, DADDR, &narrower, DADDR),
-        Some(((0, 0), (0, 0), (252, 64)))
+        Some(((0, 0), (0, 0), (252, 64), (0, 0)))
     );
+}
+
+#[test]
+fn render_targets_alias_the_array_layer_they_share() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let header = tic(0x08, GPU_VA, 64, 64, 4, 1, 3);
+    let stride = ImageInfo::from_texture(&header.decode().unwrap(), GobLayout::Tegra)
+        .unwrap()
+        .layer_stride;
+    let target = rt_info(60, 64, 3, GobLayout::Tegra);
+    let layer_va = GPU_VA + 2 * stride;
+    for array_first in [false, true] {
+        let (array, rt) = if array_first {
+            let (array, _) = f.texture(&header);
+            (
+                array,
+                clear_rt_at(&mut f, layer_va, &target, [0.0, 0.0, 1.0, 1.0], Rect::ALL).id,
+            )
+        } else {
+            let rt = clear_rt_at(&mut f, layer_va, &target, [0.0, 0.0, 1.0, 1.0], Rect::ALL).id;
+            (f.texture(&header).0, rt)
+        };
+        assert_ne!(array, rt, "array_first={array_first}");
+        let uploads = f.cache.traffic().uploads;
+        for color in [[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]] {
+            assert_eq!(
+                clear_rt_at(&mut f, layer_va, &target, color, Rect::ALL).id,
+                rt
+            );
+            assert_eq!(f.texture(&header).0, array, "array_first={array_first}");
+            let want = color.map(|c| (c * 255.0) as u8);
+            let layer = f.read_image(array).remove(2);
+            for (i, texel) in layer.as_chunks::<4>().0.iter().enumerate() {
+                if i % 64 < 60 {
+                    assert_eq!(
+                        *texel, want,
+                        "array_first={array_first}: texel {i} of layer 2"
+                    );
+                }
+            }
+        }
+        let traffic = f.cache.traffic();
+        assert_eq!(
+            traffic.uploads, uploads,
+            "array_first={array_first}: no re-upload"
+        );
+        assert_eq!(
+            traffic.downloads, 0,
+            "array_first={array_first}: no write-back"
+        );
+        f.cache.unmap(&mut f.scheduler, DADDR, 1 << 20);
+    }
+    f.assert_no_validation_errors();
 }
