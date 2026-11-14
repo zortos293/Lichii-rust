@@ -33,8 +33,19 @@ fn push(ring: &Mutex<VecDeque<Entry>>, cap: usize, entry: Entry) {
     ring.push_back(entry);
 }
 
+static WATCH: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
 pub fn rec(kind: &'static str, addr: u64, a: u64, b: u64, c: u64) {
-    push(&RING, 1 << 15, Entry { t: secs(), kind, addr, a, b, c });
+    let entry = Entry { t: secs(), kind, addr, a, b, c };
+    {
+        let watch = WATCH.lock().unwrap();
+        let lo = addr & !0xfff;
+        let hi = addr.saturating_add(b.max(4).min(1 << 20));
+        if watch.iter().any(|&w| (w & !0xfff) <= hi && (w & !0xfff) + 0x1000 > lo) {
+            tracing::warn!("DIAG acquire watched {}", line(&entry));
+        }
+    }
+    push(&RING, 1 << 15, entry);
 }
 
 pub fn drop(kind: &'static str, addr: u64, a: u64, b: u64, c: u64) {
@@ -49,6 +60,11 @@ fn line(e: &Entry) -> String {
 /// Dumps every recorded entry touching the page of `device` or of `gpu_va`, then the newest
 /// entries and dropped releases.
 pub fn dump(channel: u32, device: Option<u64>, gpu_va: u64) {
+    {
+        let mut watch = WATCH.lock().unwrap();
+        watch.extend(device);
+        watch.push(gpu_va);
+    }
     let ring = RING.lock().unwrap().clone();
     let page = |a: u64| a & !0xfff;
     let hits: Vec<&Entry> = ring
