@@ -413,9 +413,9 @@ pub struct GraphicsSettings {
     pub anisotropic_filtering: Anisotropy,
     pub astc_decode: AstcDecode,
     pub astc_recompression: AstcRecompression,
-    /// Compiles shaders and pipelines on worker threads and skips each draw until its
-    /// program is ready. Off by default, as in the C++ reference: a skipped one-off pass
-    /// (bloom, a baked texture) can leave a scene dark or corrupt for the rest of the run.
+    /// Compiles shaders and pipelines on worker threads. Only a draw into the presented frame
+    /// is skipped until its program is ready; a draw into any other target waits for it, so
+    /// no one-off pass (bloom, a baked texture) is lost.
     pub async_shader_compilation: bool,
     pub disk_shader_cache: bool,
     pub vram_usage: VramUsage,
@@ -438,7 +438,7 @@ impl Default for GraphicsSettings {
             anisotropic_filtering: Anisotropy::Auto,
             astc_decode: AstcDecode::Gpu,
             astc_recompression: AstcRecompression::Uncompressed,
-            async_shader_compilation: false,
+            async_shader_compilation: true,
             disk_shader_cache: true,
             vram_usage: VramUsage::Conservative,
             validation_layers: false,
@@ -1376,12 +1376,12 @@ mod tests {
     }
 
     #[test]
-    fn shaders_compile_synchronously_unless_asked() {
-        assert!(!load("").0.graphics.async_shader_compilation);
+    fn shaders_compile_asynchronously_unless_turned_off() {
+        assert!(load("").0.graphics.async_shader_compilation);
         let text = "[graphics]
-async_shader_compilation = true
+async_shader_compilation = false
 ";
-        assert!(load(text).0.graphics.async_shader_compilation);
+        assert!(!load(text).0.graphics.async_shader_compilation);
     }
 
     #[test]
