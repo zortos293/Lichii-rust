@@ -340,6 +340,7 @@ impl KeplerCompute {
         words: &[u32; QMD_WORDS],
         indirect: Option<IndirectGrid>,
     ) {
+        crate::diag::add(crate::diag::K::kc_launch);
         if launch.block.contains(&0) || (indirect.is_none() && launch.grid.contains(&0)) {
             return;
         }

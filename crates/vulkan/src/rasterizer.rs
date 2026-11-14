@@ -1091,6 +1091,7 @@ impl Rasterizer for VulkanRasterizer {
 
     fn present(&mut self, framebuffer: &FramebufferConfig) {
         self.activity.presents += 1;
+        lichii_gpu::diag::present();
         self.handles.timestamp.frame_presented();
         self.draw.shaders.flush_disk();
         self.draw.shaders.log_stats(Instant::now());

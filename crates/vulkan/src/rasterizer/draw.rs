@@ -591,15 +591,30 @@ impl VulkanRasterizer {
         }
         let regs = ctx.regs;
         let mesh = is_mesh_draw(regs, self.draw.arch);
+        {
+            use lichii_gpu::diag::{K, add};
+            add(match call {
+                DrawCall::Direct(_) if mesh => K::vk_mesh,
+                DrawCall::Indirect(_) if mesh => K::vk_mesh_indirect,
+                DrawCall::Direct(p) if p.inline_indices.is_some() => K::vk_inline,
+                DrawCall::Direct(p) if p.indexed => K::vk_draw_indexed,
+                DrawCall::Direct(_) => K::vk_draw,
+                DrawCall::Indirect(d) if d.count_buffer.is_some() => K::vk_indirect_count,
+                DrawCall::Indirect(d) if d.indexed => K::vk_indirect_indexed,
+                DrawCall::Indirect(_) => K::vk_indirect,
+            });
+        }
         let host_topology = match mesh {
             true => mesh_topology(regs),
             false => mvk::primitive_topology(assembled_topology(call.topology()))
                 .unwrap_or(vk::PrimitiveTopology::TRIANGLE_LIST),
         };
         if !self.graphics_stages(ctx, host_topology) {
+            lichii_gpu::diag::add(lichii_gpu::diag::K::vk_skip_stages);
             return Ok(());
         }
         if !self.render_targets(ctx)? {
+            lichii_gpu::diag::add(lichii_gpu::diag::K::vk_skip_targets);
             return Ok(());
         }
 
@@ -619,6 +634,7 @@ impl VulkanRasterizer {
         );
         let key = GraphicsPipelineKey::new(&draw.stages, attachments, &fixed);
         let Some(pipeline) = draw.pipelines.graphics(&key, &draw.stages) else {
+            lichii_gpu::diag::add(lichii_gpu::diag::K::vk_skip_pipeline);
             return Ok(());
         };
         let pipeline_raw = pipeline.raw();
@@ -661,6 +677,7 @@ impl VulkanRasterizer {
                     sampler_limit: regs.tex_sampler.limit,
                 };
                 if !self.bind_resources(&module, &sources)? {
+                    lichii_gpu::diag::add(lichii_gpu::diag::K::vk_skip_resources);
                     return Ok(());
                 }
             }
@@ -685,7 +702,10 @@ impl VulkanRasterizer {
             let indirect = match call {
                 DrawCall::Indirect(draw) => match self.indirect_buffers(gmmu, regs, draw, mesh)? {
                     Some(buffers) => Some(buffers),
-                    None => return Ok(()),
+                    None => {
+                        lichii_gpu::diag::add(lichii_gpu::diag::K::vk_skip_indirect);
+                        return Ok(());
+                    }
                 },
                 DrawCall::Direct(_) => None,
             };
@@ -700,6 +720,7 @@ impl VulkanRasterizer {
                         Warning::ImageChurn,
                         "a draw's render targets and textures keep replacing each other in the texture cache; skipping it",
                     );
+                    lichii_gpu::diag::add(lichii_gpu::diag::K::vk_skip_churn);
                     return Ok(());
                 }
                 if !self.render_targets(ctx)? {
@@ -709,7 +730,32 @@ impl VulkanRasterizer {
             }
         };
         if index.is_some_and(|i: IndexBinding| i.index_count == 0) {
+            lichii_gpu::diag::add(lichii_gpu::diag::K::vk_skip_zero_index);
             return Ok(());
+        }
+        {
+            use lichii_gpu::diag::{K, add, sources};
+            add(K::vk_recorded);
+            let depth_only = self.draw.colors.iter().all(Option::is_none);
+            add(if depth_only {
+                K::vk_depth_only
+            } else {
+                K::vk_color
+            });
+            let mut keys = [0u64; 33];
+            let mut n = 0;
+            if mesh {
+                keys[0] = self.draw.stages[0].as_ref().map_or(0, |m| m.hash) | 1 << 63;
+                n = 1;
+            } else {
+                for stream in &regs.vertex_streams {
+                    if stream.enable() != 0 && stream.address() != 0 {
+                        keys[n] = stream.address();
+                        n += 1;
+                    }
+                }
+            }
+            sources(depth_only, &keys[..n]);
         }
         let set = self.descriptor_set(set_layout)?;
 
@@ -2252,6 +2298,7 @@ impl VulkanRasterizer {
     }
 
     pub(super) fn dispatch(&mut self, ctx: &ComputeContext<'_>) -> Result<()> {
+        lichii_gpu::diag::add(lichii_gpu::diag::K::vk_dispatch);
         let env = ProgramEnv::compute(ctx);
         let mut bindings = Bindings::default();
         let Some(module) =
