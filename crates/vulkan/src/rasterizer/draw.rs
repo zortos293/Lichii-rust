@@ -786,7 +786,8 @@ impl VulkanRasterizer {
             .map_or(0, |m| m.hash);
         let traced = diag::trace_fs().contains(&traced_fs);
         if diag::dump_due(traced_fs) {
-            let ids = self.draw.textures.clone();
+            let mut ids = self.draw.textures.clone();
+            ids.extend(self.draw.colors.iter().flatten().map(|t| t.id));
             let label = format!("fs={traced_fs:016x}");
             self.diag_image_stats(&label, &ids, true, true);
         }
