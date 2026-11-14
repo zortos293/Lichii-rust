@@ -10,7 +10,7 @@ use lichii_texture::PixelFormat;
 use lichii_texture::block_linear::GobLayout;
 
 use super::{
-    CachedImage, GuestLayout, ImageId, ImageKind, ResolutionScale, TextureCache, Transfer,
+    CachedImage, GuestLayout, ImageId, ImageKind, ResolutionScale, Segment, TextureCache, Transfer,
 };
 use crate::commands::ImageAccess;
 use crate::descriptors::DescriptorAllocator;
@@ -49,8 +49,10 @@ struct Params {
     height: u32,
     row_gobs: u32,
     block_height_log2: u32,
+    block_depth_log2: u32,
     switch2_layout: u32,
     guest_offset: i32,
+    guest_floor: u32,
     guest_limit: u32,
     direction: u32,
     packing: u32,
@@ -64,6 +66,7 @@ pub(super) struct GuestSync {
     guest: Option<Buffer>,
     linear: Option<Buffer>,
     stencil: Option<Buffer>,
+    scratch: RunScratch,
 }
 
 impl GuestSync {
@@ -79,41 +82,40 @@ impl GuestSync {
             guest: None,
             linear: None,
             stencil: None,
+            scratch: RunScratch::default(),
         })
     }
 }
 
 /// How `image` packs into guest words on the GPU, or `None` when the pass can't move it: only
-/// 2D block-linear images at native scale whose texels are whole 32-bit words, laid out as the
-/// guest's, or D24S8 kept as the host's D24S8.
+/// block-linear 2D images (or 3D ones one slice deep) at native scale whose rows are whole
+/// 32-bit words at every level, laid out as the guest's, or D24S8 kept as the host's D24S8 and
+/// mapped whole.
 fn packing(image: &CachedImage) -> Option<Packing> {
     let info = &image.info;
-    let block_linear = matches!(
-        info.layout,
-        GuestLayout::BlockLinear {
-            block_depth_log2: 0,
-            ..
-        }
-    );
-    let shape = block_linear
-        && image.contiguous()
+    let bytes = info.format.bytes_per_block();
+    let shape = matches!(info.layout, GuestLayout::BlockLinear { .. })
         && image.scale == ResolutionScale::X1
-        && matches!(info.kind, ImageKind::D2)
+        && match info.kind {
+            ImageKind::D2 => true,
+            ImageKind::D3 => info.layers == 1,
+            ImageKind::D1 => false,
+        }
         && info.depth == 1
         && info.samples == 1
         && info.format.block_width() == 1
         && info.format.block_height() == 1
-        && info.format.bytes_per_block().is_multiple_of(4);
+        && (0..info.levels).all(|level| (info.level_extent(level).0 * bytes).is_multiple_of(4));
     if !shape {
         return None;
     }
     let host = image.host.format;
     match info.format {
         PixelFormat::D24UnormS8Uint if host == vk::Format::D24_UNORM_S8_UINT => {
-            Some(Packing::DepthLowStencilHigh)
+            image.contiguous().then_some(Packing::DepthLowStencilHigh)
         }
         PixelFormat::S8UintD24Unorm if host == vk::Format::D24_UNORM_S8_UINT => {
-            Some(Packing::StencilLowDepthHigh)
+            image.contiguous().then_some(Packing::StencilLowDepthHigh)
         }
         _ if image.host.conversion == Conversion::None
             && !aspect_of(host).contains(vk::ImageAspectFlags::STENCIL) =>
@@ -122,6 +124,63 @@ fn packing(image: &CachedImage) -> Option<Packing> {
         }
         _ => None,
     }
+}
+
+/// Bytes `image` shares with the guest bytes buffer: its offsets `[from, from + size)` are the
+/// buffer's bytes from `at`.
+#[derive(Clone, Copy)]
+struct Run {
+    from: u64,
+    size: u64,
+    at: u64,
+}
+
+/// Reused storage for [`shared_runs`]: the target's segments by device address, and the runs.
+#[derive(Default)]
+struct RunScratch {
+    targets: Vec<Segment>,
+    runs: Vec<Run>,
+}
+
+/// Fills `scratch.runs`, by image offset, with where the bytes of `image` land in the
+/// guest bytes buffer, which holds the offsets `window` of `target`: one run per pair of
+/// their segments sharing device memory. False when two of the target's segments share device
+/// memory, which the search can't place.
+fn shared_runs(
+    image: &CachedImage,
+    target: &CachedImage,
+    window: (u64, u64),
+    scratch: &mut RunScratch,
+) -> bool {
+    let RunScratch { targets, runs } = scratch;
+    targets.clear();
+    targets.extend_from_slice(&target.segments);
+    targets.sort_unstable_by_key(|t| t.daddr);
+    if targets
+        .windows(2)
+        .any(|t| t[0].daddr + t[0].size > t[1].daddr)
+    {
+        return false;
+    }
+    runs.clear();
+    for s in &image.segments {
+        let end = s.daddr + s.size;
+        let first = targets.partition_point(|t| t.daddr + t.size <= s.daddr);
+        for t in targets[first..].iter().take_while(|t| t.daddr < end) {
+            let (lo, hi) = (s.daddr.max(t.daddr), end.min(t.daddr + t.size));
+            let offset = t.offset + (lo - t.daddr);
+            let (from, to) = (offset.max(window.0), (offset + (hi - lo)).min(window.1));
+            if from < to {
+                runs.push(Run {
+                    from: s.offset + (lo - s.daddr) + (from - offset),
+                    size: to - from,
+                    at: from - window.0,
+                });
+            }
+        }
+    }
+    runs.sort_unstable_by_key(|r| r.from);
+    true
 }
 
 fn barrier(device: &Device, cmd: vk::CommandBuffer) {
@@ -175,20 +234,50 @@ impl TextureCache {
         newer: &mut [ImageId],
     ) -> Result<bool> {
         let image = self.get(id).expect("a live image id");
-        let base = image.base();
-        let limit = image.info.size_bytes();
-        let fits = |o: &CachedImage| {
-            (o.base() as i64 - base as i64).unsigned_abs() + o.info.size_bytes() < 1 << 31
+        let movable = |o: &CachedImage| {
+            !o.cpu_dirty
+                && o.keep_out.is_empty()
+                && o.info.size_bytes() < 1 << 31
+                && packing(o).is_some()
         };
-        if image.cpu_dirty
-            || !image.keep_out.is_empty()
-            || packing(image).is_none()
-            || limit >= 1 << 31
-            || newer.iter().any(|&o| {
-                let o = self.get(o).expect("overlaps are live");
-                o.cpu_dirty || !o.keep_out.is_empty() || packing(o).is_none() || !fits(o)
-            })
+        if !movable(image)
+            || newer
+                .iter()
+                .any(|&o| !movable(self.get(o).expect("overlaps are live")))
         {
+            return Ok(false);
+        }
+        if self.guest_sync.is_none() {
+            self.guest_sync = Some(GuestSync::new(&self.device)?);
+        }
+        let Self {
+            slots, guest_sync, ..
+        } = self;
+        let live = |id: ImageId| {
+            slots[id.index as usize]
+                .image
+                .as_ref()
+                .expect("a live image id")
+        };
+        let scratch = &mut guest_sync.as_mut().expect("just created").scratch;
+        let image = live(id);
+        let whole = (0, image.info.size_bytes());
+        if !shared_runs(image, image, whole, scratch) {
+            return Ok(false);
+        }
+        let mut window = whole;
+        if packing(image) == Some(Packing::Plain) {
+            window = (u64::MAX, 0);
+            for &o in newer.iter() {
+                if !shared_runs(live(o), image, whole, scratch) {
+                    return Ok(false);
+                }
+                for r in &scratch.runs {
+                    window = (window.0.min(r.at), window.1.max(r.at + r.size));
+                }
+            }
+        }
+        if window.0 >= window.1 {
             return Ok(false);
         }
         newer.sort_by_key(|&o| self.get(o).map_or(0, |o| o.modified));
@@ -201,9 +290,6 @@ impl TextureCache {
                 linear.max(u64::from(w) * u64::from(h) * u64::from(info.format.bytes_per_block()));
             stencil = stencil.max((u64::from(w) * u64::from(h)).next_multiple_of(4));
         }
-        if self.guest_sync.is_none() {
-            self.guest_sync = Some(GuestSync::new(&self.device)?);
-        }
         let device = self.device.clone();
         let sync = self.guest_sync.as_mut().expect("just created");
         let storage = vk::BufferUsageFlags::STORAGE_BUFFER
@@ -213,7 +299,7 @@ impl TextureCache {
             &device,
             tx,
             &mut sync.guest,
-            limit.max(4),
+            (window.1 - window.0).max(4),
             storage,
             "guest bytes",
         )?;
@@ -234,11 +320,11 @@ impl TextureCache {
             "guest sync stencil",
         )?;
         let cmd = tx.scheduler.record()?;
-        self.paint(tx, cmd, id, base, limit, Direction::ToGuest)?;
+        self.paint(tx, cmd, id, id, window, Direction::ToGuest)?;
         for &o in newer.iter() {
-            self.paint(tx, cmd, o, base, limit, Direction::ToGuest)?;
+            self.paint(tx, cmd, o, id, window, Direction::ToGuest)?;
         }
-        self.paint(tx, cmd, id, base, limit, Direction::FromGuest)?;
+        self.paint(tx, cmd, id, id, window, Direction::FromGuest)?;
         let tick = self.tick;
         let image = self.image(id);
         image.current = tick;
@@ -250,45 +336,75 @@ impl TextureCache {
         Ok(true)
     }
 
-    /// Records the move of every subresource of `id` between the image and the guest bytes
-    /// buffer, which holds `limit` bytes from device address `base`.
+    /// Records the move of the subresources of `id` that share bytes with the guest bytes
+    /// buffer, which holds the offsets `window` of `target`, between the image and the buffer.
+    /// Texels outside the buffer keep the image's own values.
     fn paint(
         &mut self,
         tx: &mut Transfer<'_>,
         cmd: vk::CommandBuffer,
         id: ImageId,
-        base: u64,
-        limit: u64,
+        target: ImageId,
+        window: (u64, u64),
         direction: Direction,
     ) -> Result<()> {
         let device = self.device.clone();
-        let image = self.get_mut(id).expect("a live image id");
+        let access = match direction {
+            Direction::ToGuest => ImageAccess::TRANSFER_SRC,
+            Direction::FromGuest => ImageAccess::STORAGE_WRITE,
+        };
+        self.get_mut(id)
+            .expect("a live image id")
+            .transition(&device, cmd, access);
+        barrier(&device, cmd);
+        let layout = access.layout;
+        let Self {
+            slots, guest_sync, ..
+        } = self;
+        let image = slots[id.index as usize]
+            .image
+            .as_ref()
+            .expect("a live image id");
+        let target = slots[target.index as usize]
+            .image
+            .as_ref()
+            .expect("a live image id");
         let packing = packing(image).expect("checked by sync_on_gpu");
         let info = image.info;
         let raw = image.image.raw();
         let levels = info.levels.min(image.image.desc().mip_levels);
         let host = image.host.format;
-        let start = image.base() as i64 - base as i64;
-        let access = match direction {
-            Direction::ToGuest => ImageAccess::TRANSFER_SRC,
-            Direction::FromGuest => ImageAccess::TRANSFER_DST,
-        };
-        image.transition(&device, cmd, access);
         let main_aspect = if packing == Packing::Plain {
             aspect_of(host)
         } else {
             vk::ImageAspectFlags::DEPTH
         };
-        let sync = self.guest_sync.as_mut().expect("created by sync_on_gpu");
+        let sync = guest_sync.as_mut().expect("created by sync_on_gpu");
+        let placed = shared_runs(image, target, window, &mut sync.scratch);
+        debug_assert!(placed, "checked by sync_on_gpu");
         let guest = sync.guest.as_ref().expect("ensured").raw();
         let linear = sync.linear.as_ref().expect("ensured").raw();
         let stencil = sync.stencil.as_ref().expect("ensured").raw();
+        let buffers = [guest, linear, stencil].map(|buffer| vk::DescriptorBufferInfo {
+            buffer,
+            offset: 0,
+            range: vk::WHOLE_SIZE,
+        });
+        let all = (
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+        );
         for layer in 0..info.layers {
             for level in 0..levels {
-                let offset = start + info.subresource_offset(level, layer) as i64;
-                if offset >= limit as i64 || offset + info.level_size(level) as i64 <= 0 {
+                let start = info.subresource_offset(level, layer);
+                let end = start + info.level_size(level);
+                let runs = &sync.scratch.runs;
+                let first = runs.partition_point(|r| r.from + r.size <= start);
+                let count = runs[first..].iter().take_while(|r| r.from < end).count();
+                if count == 0 {
                     continue;
                 }
+                let shared = first..first + count;
                 let tiling = info.surface().level_tiling(level);
                 let (w, h, _) = info.level_extent(level);
                 let row_words = w * tiling.bytes_per_block / 4;
@@ -306,97 +422,89 @@ impl TextureCache {
                     },
                     ..Default::default()
                 };
-                let params = Params {
-                    row_words,
-                    height: h,
-                    row_gobs: tiling.row_gobs,
-                    block_height_log2: tiling.block_height_log2,
-                    switch2_layout: u32::from(tiling.layout == GobLayout::Switch2),
-                    guest_offset: offset as i32,
-                    guest_limit: limit as u32,
-                    direction: direction as u32,
-                    packing: packing as u32,
-                    stencil_pitch: w,
-                };
-                let set = sync
-                    .descriptors
-                    .allocate(tx.scheduler, sync.compute.set_layout)?;
-                let buffers = [guest, linear, stencil].map(|buffer| vk::DescriptorBufferInfo {
-                    buffer,
-                    offset: 0,
-                    range: vk::WHOLE_SIZE,
-                });
                 let groups = [row_words.div_ceil(GROUP[0]), h.div_ceil(GROUP[1]), 1];
-                let all = (
-                    vk::PipelineStageFlags2::ALL_COMMANDS,
-                    vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
-                );
-                // SAFETY: `cmd` is recording outside any rendering; the image is in the layout
-                // `access` names and every buffer holds the subresource's texels.
+                let keep = direction == Direction::ToGuest
+                    || !sync.scratch.runs[shared.clone()]
+                        .iter()
+                        .any(|r| r.from <= start && end <= r.from + r.size);
+                // SAFETY: `cmd` is recording outside any rendering; the image is in `layout`,
+                // which copies both ways allow, and every buffer holds the subresource's texels.
                 unsafe {
-                    match direction {
-                        Direction::ToGuest => {
-                            device.raw.cmd_copy_image_to_buffer(
+                    if keep {
+                        device.raw.cmd_copy_image_to_buffer(
+                            cmd,
+                            raw,
+                            layout,
+                            linear,
+                            &[region(main_aspect)],
+                        );
+                    }
+                    if packing != Packing::Plain {
+                        match direction {
+                            Direction::ToGuest => device.raw.cmd_copy_image_to_buffer(
                                 cmd,
                                 raw,
-                                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                                linear,
-                                &[region(main_aspect)],
-                            );
-                            if packing != Packing::Plain {
-                                device.raw.cmd_copy_image_to_buffer(
-                                    cmd,
-                                    raw,
-                                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                                    stencil,
-                                    &[region(vk::ImageAspectFlags::STENCIL)],
-                                );
-                            }
-                            barrier(&device, cmd);
-                            sync.compute.dispatch(
-                                cmd,
-                                set,
-                                &buffers,
-                                bytemuck::bytes_of(&params),
-                                groups,
-                                all,
-                            );
-                        }
-                        Direction::FromGuest => {
-                            if packing != Packing::Plain {
+                                layout,
+                                stencil,
+                                &[region(vk::ImageAspectFlags::STENCIL)],
+                            ),
+                            Direction::FromGuest => {
                                 device
                                     .raw
                                     .cmd_fill_buffer(cmd, stencil, 0, vk::WHOLE_SIZE, 0);
                             }
-                            barrier(&device, cmd);
-                            sync.compute.dispatch(
-                                cmd,
-                                set,
-                                &buffers,
-                                bytemuck::bytes_of(&params),
-                                groups,
-                                all,
-                            );
-                            device.raw.cmd_copy_buffer_to_image(
-                                cmd,
-                                linear,
-                                raw,
-                                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                                &[region(main_aspect)],
-                            );
-                            if packing != Packing::Plain {
-                                device.raw.cmd_copy_buffer_to_image(
-                                    cmd,
-                                    stencil,
-                                    raw,
-                                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                                    &[region(vk::ImageAspectFlags::STENCIL)],
-                                );
-                            }
                         }
                     }
+                    barrier(&device, cmd);
+                    for index in shared.clone() {
+                        let run = sync.scratch.runs[index];
+                        let set = sync
+                            .descriptors
+                            .allocate(tx.scheduler, sync.compute.set_layout)?;
+                        let params = Params {
+                            row_words,
+                            height: h,
+                            row_gobs: tiling.row_gobs,
+                            block_height_log2: tiling.block_height_log2,
+                            block_depth_log2: tiling.block_depth_log2,
+                            switch2_layout: u32::from(tiling.layout == GobLayout::Switch2),
+                            guest_offset: (run.at as i64 + start as i64 - run.from as i64) as i32,
+                            guest_floor: run.at as u32,
+                            guest_limit: (run.at + run.size) as u32,
+                            direction: direction as u32,
+                            packing: packing as u32,
+                            stencil_pitch: w,
+                        };
+                        sync.compute.dispatch(
+                            cmd,
+                            set,
+                            &buffers,
+                            bytemuck::bytes_of(&params),
+                            groups,
+                            all,
+                        );
+                        barrier(&device, cmd);
+                    }
+                    if direction == Direction::FromGuest {
+                        device.raw.cmd_copy_buffer_to_image(
+                            cmd,
+                            linear,
+                            raw,
+                            layout,
+                            &[region(main_aspect)],
+                        );
+                        if packing != Packing::Plain {
+                            device.raw.cmd_copy_buffer_to_image(
+                                cmd,
+                                stencil,
+                                raw,
+                                layout,
+                                &[region(vk::ImageAspectFlags::STENCIL)],
+                            );
+                        }
+                        barrier(&device, cmd);
+                    }
                 }
-                barrier(&device, cmd);
             }
         }
         Ok(())
