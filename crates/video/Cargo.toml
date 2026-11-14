@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 bytemuck.workspace = true
+lichii-common.workspace = true
 libloading.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

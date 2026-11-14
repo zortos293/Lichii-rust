@@ -30,6 +30,7 @@ use crate::backend::{
 use crate::gmmu::{Gmmu, GpuFault, RangeTarget};
 use crate::host::Reduction;
 use crate::reg_index;
+use crate::throttle::Throttle;
 use pcas::{CHAIN_LIMIT, PcasAction, PcasError};
 use qmd::{QMD_WORDS, QmdV2, QmdV3, Release, ReleaseKind};
 pub use regs::Regs;
@@ -407,7 +408,15 @@ fn perform_release(ctx: &mut EngineContext<'_>, release: &Release) {
                 .memory
                 .read_block(address, &mut probe[..if timestamped { 16 } else { 4 }])
             {
-                tracing::warn!(?fault, address, "compute release to unmapped memory");
+                static UNMAPPED: Throttle = Throttle::new();
+                if let Some(dropped) = UNMAPPED.allow() {
+                    tracing::warn!(
+                        ?fault,
+                        address,
+                        dropped,
+                        "compute release to unmapped memory"
+                    );
+                }
                 return;
             }
             ctx.rasterizer.query(

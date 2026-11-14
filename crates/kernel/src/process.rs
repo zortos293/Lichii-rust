@@ -424,9 +424,9 @@ impl Process {
     }
 
     /// Removes an exited thread; returns whether it was the last one.
-    pub(crate) fn remove_thread(&self, thread: &Arc<Thread>) -> bool {
+    pub(crate) fn remove_thread(&self, thread: &Thread) -> bool {
         let mut threads = self.threads.lock();
-        threads.retain(|t| !Arc::ptr_eq(t, thread));
+        threads.retain(|t| !std::ptr::eq(Arc::as_ptr(t), thread));
         threads.is_empty()
     }
 

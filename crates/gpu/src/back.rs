@@ -21,6 +21,7 @@ use crate::gpu::{MAX_POLL, MIN_POLL};
 use crate::host1x::Syncpoints;
 use crate::ring::{Consumer, WRAP};
 use crate::stream::{FetchSync, FetchSyncs, MULTI_MAX_WORDS, REDUCTIONS, RELEASE_SIZES, tag};
+use crate::throttle::Throttle;
 
 /// The back reports progress at least this often while it executes.
 const RELEASE_SLOTS: u64 = 1024;
@@ -389,7 +390,10 @@ impl Back {
             return;
         };
         let Some(daddr) = channel.setup.memory.translate(address) else {
-            tracing::warn!(address, "semaphore release to unmapped GPU memory");
+            static UNMAPPED: Throttle = Throttle::new();
+            if let Some(dropped) = UNMAPPED.allow() {
+                tracing::warn!(address, dropped, "semaphore release to unmapped GPU memory");
+            }
             return;
         };
         self.rasterizer.signal_fence(FenceAction::WriteSemaphore {

@@ -1769,6 +1769,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "libloading",
+ "lichii-common",
  "thiserror 2.0.21",
  "tracing",
 ]

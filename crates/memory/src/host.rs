@@ -181,6 +181,12 @@ impl Arena {
             .unmap(self.base, &backing.sys, offset, len, &tracked)
     }
 
+    /// Removes every view; the whole arena faults again.
+    pub(crate) fn clear(&self) -> io::Result<()> {
+        self.tracked.lock().clear();
+        self.sys.clear(self.base, self.size)
+    }
+
     /// Changes the protection of mapped pages in `[offset, offset + len)`.
     pub(crate) fn protect(
         &self,
@@ -428,6 +434,13 @@ mod sys {
             // SAFETY: the range lies inside the arena reservation.
             let ptr = reserve_at(unsafe { base.add(offset) }, len, true);
             if ptr == libc::MAP_FAILED {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        pub fn clear(&self, base: *mut u8, size: usize) -> io::Result<()> {
+            if reserve_at(base, size, true) == libc::MAP_FAILED {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
@@ -953,26 +966,35 @@ mod sys {
             Ok(())
         }
 
-        pub fn release(&mut self, base: *mut u8, _size: usize) {
-            let views = std::mem::take(self.views.get_mut());
-            // SAFETY: unmaps every view we made, then frees the placeholders.
-            unsafe {
-                for start in views.keys() {
+        /// Unmaps every view and coalesces the arena back into one placeholder.
+        pub fn clear(&self, base: *mut u8, _size: usize) -> io::Result<()> {
+            let mut views = self.views.lock();
+            if views.is_empty() {
+                return Ok(());
+            }
+            for start in std::mem::take(&mut *views).into_keys() {
+                #[cfg(test)]
+                self.calls.unmap.fetch_add(1, Ordering::Relaxed);
+                // SAFETY: start is the base address of a view we mapped.
+                check(unsafe {
                     UnmapViewOfFile2(
                         GetCurrentProcess(),
                         MEMORY_MAPPED_VIEW_ADDRESS {
-                            Value: base.add(*start).cast(),
+                            Value: base.add(start).cast(),
                         },
                         MEM_PRESERVE_PLACEHOLDER,
-                    );
-                }
-                VirtualFree(
-                    base.cast(),
-                    self.size,
-                    MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS,
-                );
-                VirtualFree(base.cast(), 0, MEM_RELEASE);
+                    )
+                })?;
             }
+            self.exposed.lock().clear();
+            self.coalesce(base, &views, 0);
+            Ok(())
+        }
+
+        pub fn release(&mut self, base: *mut u8, size: usize) {
+            let _ = self.clear(base, size);
+            // SAFETY: the arena is one free placeholder again; this frees the reservation.
+            unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
         }
     }
 }

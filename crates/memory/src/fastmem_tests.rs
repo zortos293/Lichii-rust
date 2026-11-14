@@ -84,6 +84,25 @@ fn protections_lower_and_raise_again_within_and_across_views() {
 }
 
 #[test]
+fn retired_pages_keep_their_views_until_the_arena_is_released() {
+    let Some(space) = fastmem_space() else {
+        return;
+    };
+    space.map(0x8000_0000, 0x20_0000, 0x4000, MemoryPermission::READ_WRITE);
+    space.write(0x8000_1008, 0x1234_5678u32).unwrap();
+
+    space.unmap_retired(0x8000_0000, 0x4000);
+    assert!(space.read::<u32>(0x8000_1008).is_err());
+    assert_eq!(host_read::<u32>(&space, 0x8000_1008), 0x1234_5678);
+
+    space.release_fastmem();
+    space.release_fastmem();
+    space.map(0x8000_0000, 0x30_0000, 0x4000, MemoryPermission::READ_WRITE);
+    space.write(0x8000_1008, 0xaau8).unwrap();
+    assert_eq!(host_read::<u8>(&space, 0x8000_1008), 0xaa);
+}
+
+#[test]
 fn physical_memory_is_committed_lazily() {
     let physical = PhysicalMemory::new(12 << 30).unwrap();
     physical.commit(0x1000_0000, 0x10_0000).unwrap();
@@ -144,6 +163,22 @@ mod faults {
         space.unmap(0x4000_0000, 0x1000);
         assert_eq!(load(fastmem.base(), 0x4000_0000), 0xdead);
         assert_eq!(LAST_FAULT.load(Ordering::SeqCst), 0x4000_0000);
+    }
+
+    #[test]
+    fn released_views_fault_again() {
+        let Some(space) = fastmem_space() else {
+            return;
+        };
+        let fastmem = space.fastmem().unwrap();
+        fastmem.set_fault_handler(Some(skip_load_quietly), 0xdead);
+        space.map(0x5000_0000, 0x1000, 0x2000, MemoryPermission::READ_WRITE);
+        space.write(0x5000_1000, 77u64).unwrap();
+        assert_eq!(load(fastmem.base(), 0x5000_1000), 77);
+
+        space.unmap_retired(0x5000_0000, 0x2000);
+        space.release_fastmem();
+        assert_eq!(load(fastmem.base(), 0x5000_1000), 0xdead);
     }
 
     #[test]
@@ -509,6 +544,34 @@ mod placement {
         space.unmap(0x8fff_0000, 0x4_0000);
         assert_eq!(arena.view_count(), 0);
         assert_eq!(arena.calls.take(), (0, 4, 2));
+        space.map(0x8000_0000, 0, 0x400_0000, rw);
+        assert_eq!(
+            arena.calls.take(),
+            (1, 0, 0),
+            "the whole arena is one gap again"
+        );
+    }
+
+    #[test]
+    fn release_unmaps_each_view_once_and_coalesces_once() {
+        let Some(space) = fastmem_space() else {
+            return;
+        };
+        let arena = space.fastmem().unwrap().arena().sys();
+        let rw = MemoryPermission::READ_WRITE;
+        space.map(0x8000_0000, 0x20_0000, 0x20_0000, rw);
+        for page in 0..4 {
+            space.map(0x9000_0000 + page * 0x2000, 0x40_0000, 0x1000, rw);
+        }
+        space.unmap_retired(0x8000_0000, 0x20_0000);
+        assert_eq!(arena.view_count(), 5, "retired pages keep their views");
+        arena.calls.take();
+
+        space.release_fastmem();
+        assert_eq!(arena.view_count(), 0);
+        assert_eq!(arena.calls.take(), (0, 5, 1));
+        space.release_fastmem();
+        assert_eq!(arena.calls.take(), (0, 0, 0));
         space.map(0x8000_0000, 0, 0x400_0000, rw);
         assert_eq!(
             arena.calls.take(),

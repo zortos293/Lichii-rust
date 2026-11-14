@@ -175,6 +175,73 @@ fn paired_pointer_load_becomes_a_storage_load() {
 }
 
 #[test]
+fn zero_extended_offset_plus_paired_pointer_becomes_a_storage_load() {
+    let mut b = Builder::new();
+    let low = b.cbuf(0, 0x110);
+    let high = b.cbuf(0, 0x114);
+    let vector = b.inst(Opcode::CompositeConstructU32x2, &[low, high]);
+    let pointer = b.inst(Opcode::PackUint2x32, &[vector]);
+    let x = b.local_x();
+    let scaled = b.inst(Opcode::ShiftLeftLogical32, &[x, Value::U32(6)]);
+    let offset = b.inst(Opcode::ConvertU64U32, &[scaled]);
+    let sum = b.inst(Opcode::IAdd64, &[offset, pointer]);
+    let address = b.inst(Opcode::IAdd64, &[sum, Value::U64(8)]);
+    let load = b.inst(Opcode::LoadGlobal32, &[address]).inst().unwrap();
+    let info = b.run(&Env::default(), &profile()).unwrap();
+
+    assert_eq!(
+        info.storage_buffers_descriptors,
+        vec![descriptor(0, 0x110, false)]
+    );
+    let storage = forwarded(&b.prog, load);
+    assert_eq!(b.prog.op(storage), Opcode::LoadStorage32);
+    assert_eq!(b.prog.arg(storage, 0), Value::U32(0));
+    let rebased = b.prog.arg(storage, 1).inst().unwrap();
+    let low_sum = b.prog.arg(b.prog.arg(rebased, 0).inst().unwrap(), 0);
+    let low_sum = low_sum.inst().unwrap();
+    assert_eq!(b.prog.op(low_sum), Opcode::IAdd32);
+    assert_eq!(b.prog.inst(low_sum).args(), &[scaled, low]);
+    assert_offset(
+        &b.prog,
+        b.prog.arg(storage, 1),
+        Value::Inst(low_sum),
+        8,
+        (0, 0x110),
+    );
+}
+
+#[test]
+fn paired_pointer_plus_zero_extended_offset_store_records_its_extent() {
+    let mut b = Builder::new();
+    let low = b.cbuf(0, 0x140);
+    let high = b.cbuf(0, 0x144);
+    let vector = b.inst(Opcode::CompositeConstructU32x2, &[low, high]);
+    let pointer = b.inst(Opcode::PackUint2x32, &[vector]);
+    let x = b.local_x();
+    let scaled = b.inst(Opcode::ShiftLeftLogical32, &[x, Value::U32(2)]);
+    let offset = b.inst(Opcode::ConvertU64U32, &[scaled]);
+    let sum = b.inst(Opcode::IAdd64, &[pointer, offset]);
+    let address = b.inst(Opcode::IAdd64, &[sum, Value::U64(16)]);
+    let store = b
+        .inst(Opcode::WriteGlobal32, &[address, Value::U32(7)])
+        .inst()
+        .unwrap();
+    let info = b.run(&Env::default(), &profile()).unwrap();
+
+    let mut expected = descriptor(0, 0x140, true);
+    expected.write_extent = StorageWriteExtent {
+        bounded: true,
+        const_end: 20,
+        local_stride: [4, 0, 0],
+        ..StorageWriteExtent::default()
+    };
+    assert_eq!(info.storage_buffers_descriptors, vec![expected]);
+    assert_eq!(b.prog.op(store), Opcode::Void);
+    let write = b.prog.inst(store).prev().unwrap();
+    assert_eq!(b.prog.op(write), Opcode::WriteStorage32);
+}
+
+#[test]
 fn bindings_follow_constant_buffer_order() {
     let mut b = Builder::new();
     let late = b.pair_address(0, 0x200, 0);

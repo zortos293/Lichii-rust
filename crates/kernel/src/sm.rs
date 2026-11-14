@@ -3,7 +3,9 @@
 //! Both the CMIF and the TIPC flavours (firmware 12+, every Switch 2 title) use the same command
 //! ids. `GetServiceHandle` for a name nobody registered yet is deferred until it is registered,
 //! as Horizon's sm does; the client thread stays blocked meanwhile (NX2_NOTES row 123). A name
-//! still unregistered a second after its first request is logged as a warning, once.
+//! still unregistered a second after its first request is logged as a warning, once. Switch 2
+//! programs also ask for services nothing here provides, and would wait for good: like the
+//! reference, they get a session from the [`StubFactory`] instead, logged once per name.
 //! A client may open only the services its NPDM lists (homebrew gets the loader's `*`). Until
 //! NPDM parsing has been checked against real titles, that is enforced only when the kernel is
 //! configured to; otherwise sm logs the service and lets the client open it.
@@ -13,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use lichii_common::{HleResult, ResultCode};
+use lichii_common::{ConsoleGeneration, HleResult, ResultCode};
 use parking_lot::Mutex;
 
 use crate::ipc::{
@@ -40,6 +42,9 @@ struct Service {
     factory: SessionFactory,
 }
 
+/// Makes the handler of the session a Switch 2 client gets for `name` when nobody registered it.
+pub type StubFactory = Arc<dyn Fn(&str) -> Arc<dyn SessionHandler> + Send + Sync>;
+
 #[derive(Default)]
 struct Registry {
     services: HashMap<u64, Service>,
@@ -48,6 +53,9 @@ struct Registry {
     watched: HashSet<u64>,
     /// Names still unregistered when their stall check ran.
     stalled: HashSet<u64>,
+    stub: Option<(ServiceThread, StubFactory)>,
+    /// Names a Switch 2 client got a stub for.
+    stubbed: HashSet<u64>,
 }
 
 /// The registry behind `sm:`.
@@ -121,6 +129,12 @@ impl ServiceManager {
         Ok(())
     }
 
+    /// Serves Switch 2 clients that ask for an unregistered name with a session from `factory` on
+    /// `thread`, instead of deferring them.
+    pub fn set_switch2_stub(&self, thread: &ServiceThread, factory: StubFactory) {
+        self.registry.lock().stub = Some((thread.clone(), factory));
+    }
+
     pub fn unregister(&self, name: &str) -> HleResult<()> {
         let key = encode_name(name)?;
         self.registry
@@ -170,8 +184,22 @@ impl ServiceManager {
                 return NOT_ALLOWED;
             }
         }
+        let switch2 = ctx.process().params().console == ConsoleGeneration::Switch2;
         let mut registry = self.registry.lock();
         let Some(service) = registry.services.get(&name) else {
+            if let Some((thread, factory)) = registry.stub.as_ref().filter(|_| switch2) {
+                let (thread, factory) = (thread.clone(), factory.clone());
+                if registry.stubbed.insert(name) {
+                    tracing::warn!(
+                        service = display_name(name),
+                        "Switch 2 service does not exist; returning a stub"
+                    );
+                }
+                drop(registry);
+                let session = thread.session(factory(&display_name(name)));
+                ctx.push_move_object(KObject::ClientSession(session));
+                return ResultCode::SUCCESS;
+            }
             tracing::info!(service = display_name(name), "waiting for service");
             let request = ctx.defer();
             registry.waiting.push((name, request));
@@ -373,6 +401,67 @@ mod tests {
                     assert_eq!(reply.result, expected, "{name}, enforce {enforce}");
                     assert_eq!(reply.move_handles.len(), usize::from(allowed), "{name}");
                 }
+            }
+            kernel.shutdown();
+        }
+    }
+
+    #[test]
+    fn switch2_clients_get_a_stub_for_unregistered_services_and_switch1_clients_wait() {
+        use lichii_common::ConsoleGeneration;
+
+        use crate::Kernel;
+        use crate::testing::{IpcClient, Request, config, program_image};
+
+        for console in [ConsoleGeneration::Switch1, ConsoleGeneration::Switch2] {
+            let kernel = Kernel::new(config(console)).unwrap();
+            let thread = kernel.create_service_thread("services").unwrap();
+            let names = Arc::new(Mutex::new(Vec::new()));
+            let seen = names.clone();
+            kernel.service_manager().set_switch2_stub(
+                &thread,
+                Arc::new(move |name| {
+                    seen.lock().push(name.to_string());
+                    Arc::new(Null) as Arc<dyn SessionHandler>
+                }),
+            );
+            let mut image = program_image(0x0100_0000_0000_5000);
+            image.generation = console;
+            let process = kernel.create_process(&image).unwrap();
+            let client = IpcClient::new(&kernel, &process);
+            let sm =
+                client.connect_handler(&thread, (kernel.service_manager().session_factory())());
+            client.send(sm, &Request::new(0).send_pid()).unwrap();
+            let get = Request::new(1).arg(encode_name("mnpp:app").unwrap());
+            if console == ConsoleGeneration::Switch2 {
+                for _ in 0..2 {
+                    let reply = client.send(sm, &get).unwrap();
+                    assert_eq!(reply.result, ResultCode::SUCCESS);
+                    assert_eq!(reply.move_handles.len(), 1);
+                }
+                assert_eq!(*names.lock(), ["mnpp:app", "mnpp:app"]);
+                assert!(kernel.service_manager().waiting_for().is_empty());
+            } else {
+                let (late, service_thread) = (kernel.clone(), thread.clone());
+                let registrar = std::thread::spawn(move || {
+                    let started = std::time::Instant::now();
+                    while late.service_manager().waiting_for() != ["mnpp:app"] {
+                        assert!(started.elapsed() < Duration::from_secs(5), "never deferred");
+                        std::thread::yield_now();
+                    }
+                    late.service_manager()
+                        .register(
+                            "mnpp:app",
+                            &service_thread,
+                            Arc::new(|| Arc::new(Null) as Arc<dyn SessionHandler>),
+                        )
+                        .unwrap();
+                });
+                let reply = client.send(sm, &get).unwrap();
+                registrar.join().unwrap();
+                assert_eq!(reply.result, ResultCode::SUCCESS);
+                assert_eq!(reply.move_handles.len(), 1);
+                assert!(names.lock().is_empty(), "Switch 1 clients wait instead");
             }
             kernel.shutdown();
         }

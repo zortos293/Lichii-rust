@@ -977,8 +977,9 @@ impl PageTable {
         }
     }
 
-    /// Frees every page the process owns (on process destruction). Stacks are not included:
-    /// `MapMemory` aliases share the stack state, so the process frees its main stack itself.
+    /// Frees every page the process owns (on process destruction), leaving the fastmem views for
+    /// [`AddressSpace::release_fastmem`]. Stacks are not included: `MapMemory` aliases share the
+    /// stack state, so the process frees its main stack itself.
     pub(crate) fn release_all(&self) {
         let mut s = self.state.lock();
         let mapped: Vec<(VAddr, u64, bool)> = s
@@ -1006,7 +1007,11 @@ impl PageTable {
                 let group = self.physical_runs(start, size);
                 self.memory.free_group(&group);
             }
-            self.unmap_space(&s.blocks, start, size);
+            let code = has_code(&s.blocks, start, size);
+            self.space.unmap_retired(start, size);
+            if code {
+                (self.invalidate_code)(start, size);
+            }
         }
         let end = s.blocks.end();
         s.blocks

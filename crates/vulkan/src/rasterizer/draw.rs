@@ -1065,6 +1065,7 @@ impl VulkanRasterizer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
             memory: &self.handles.device,
+            buffers: &mut self.buffer_cache,
         };
         for i in 0..count {
             let rt = &regs.rt[render_target_index(regs, i)];
@@ -1546,6 +1547,7 @@ impl VulkanRasterizer {
                 scheduler: &mut self.scheduler,
                 staging: &mut self.staging,
                 memory: &self.handles.device,
+                buffers: &mut self.buffer_cache,
             };
             self.texture_cache.scale_down(&mut tx, id)?;
             self.draw.rebind = true;
@@ -1558,6 +1560,7 @@ impl VulkanRasterizer {
                 scheduler: &mut self.scheduler,
                 staging: &mut self.staging,
                 memory: &self.handles.device,
+                buffers: &mut self.buffer_cache,
             };
             self.texture_cache.bind_written(
                 &mut tx,
@@ -1641,6 +1644,7 @@ impl VulkanRasterizer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
             memory: &self.handles.device,
+            buffers: &mut self.buffer_cache,
         };
         let Some((id, mut view)) = self.texture_cache.texture(&mut tx, src.gmmu, &header)? else {
             return Ok(None);
