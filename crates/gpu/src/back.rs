@@ -134,6 +134,7 @@ impl Back {
     /// [`crate::Gpu::run_in_order`] action or a synchronize still queued drops its sender and its
     /// waiter returns.
     fn abandon(&mut self, consumer: &mut Consumer) {
+        tracing::info!("diag back: abandoning the stream");
         consumer.skip_published();
         consumer.release();
         while self.side.try_recv().is_ok() {}
@@ -170,6 +171,10 @@ impl Back {
                 None => poll = (poll * 2).min(MAX_POLL),
             }
         }
+        tracing::info!("diag back: stream closed; dropping the renderer");
+        let start = std::time::Instant::now();
+        drop(self);
+        tracing::info!(took = ?start.elapsed(), "diag back: renderer dropped");
     }
 
     /// The stream is empty: submits the recorded host GPU work and runs the actions of fences
