@@ -1277,6 +1277,12 @@ impl VulkanRasterizer {
                                 size,
                                 desc.is_written,
                             )?;
+                            diag::append(|l| {
+                                l.push_str(&format!(
+                                    " SB{descriptor}.{i}@{address:#x}/{size} w={}",
+                                    desc.is_written
+                                ))
+                            });
                             self.push_buffer(binding);
                         }
                     }
@@ -1460,6 +1466,18 @@ impl VulkanRasterizer {
                                     "a draw binds a storage image array mixing rescaled and native images; skipping it",
                                 );
                                 return Ok(false);
+                            }
+                            if let Some(st) = self.texture_cache.state(id) {
+                                diag::append(|l| {
+                                    l.push_str(&format!(
+                                        " SI{descriptor}.{i} raw={raw:#x} -> {id:?} {:?} {:?} {}x{} w={}",
+                                        st.info.format,
+                                        st.info.layout,
+                                        st.extent.width,
+                                        st.extent.height,
+                                        desc.is_written
+                                    ))
+                                });
                             }
                             self.draw.storage_images.push((id, desc.is_written));
                             self.draw.image_infos.push(vk::DescriptorImageInfo {
@@ -2349,7 +2367,7 @@ impl VulkanRasterizer {
         else {
             return Ok(());
         };
-        diag::with(|d| {
+        if diag::with(|d| d.begin()) == Some(true) {
             let cb: Vec<String> = ctx
                 .const_buffers
                 .iter()
@@ -2364,14 +2382,16 @@ impl VulkanRasterizer {
                     format!("CB{i}@{:#x}/{}=[{}]", c.address, c.size, f.join(" "))
                 })
                 .collect();
-            d.event(&format!(
-                "X compute={:016x} grid={:?} block={:?} {}",
-                module.hash,
-                ctx.grid,
-                ctx.block,
-                cb.join(" ")
-            ))
-        });
+            diag::append(|l| {
+                l.push_str(&format!(
+                    "X compute={:016x} grid={:?} block={:?} {}",
+                    module.hash,
+                    ctx.grid,
+                    ctx.block,
+                    cb.join(" ")
+                ))
+            });
+        }
         let key = ComputePipelineKey {
             shader: module.hash,
             workgroup: ctx.block,
@@ -2424,6 +2444,7 @@ impl VulkanRasterizer {
             };
             let removed = self.texture_cache.removals() != removals;
             if self.buffer_cache.stats().merged_buffers == merged && !self.draw.rebind && !removed {
+                diag::with(|d| d.finish("compute"));
                 break grid;
             }
             if removed {

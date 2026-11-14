@@ -308,6 +308,13 @@ impl VulkanRasterizer {
         );
         match tic.decode() {
             Ok(d) => {
+                if d.width * d.height <= 4
+                    && matches!(d.memory, lichii_texture::tic::TextureMemory::Pitch { .. })
+                {
+                    if let Ok(words) = src.gmmu.read::<[u32; 4]>(d.address) {
+                        let _ = write!(s, " guest={:?}", words.map(f32::from_bits));
+                    }
+                }
                 let _ = write!(
                     s,
                     " {:?} {}x{}x{} lv={} res={}..{} base_layer={} sw={:?} srgb={} {:?} {:?} ms={:?} norm={}",
