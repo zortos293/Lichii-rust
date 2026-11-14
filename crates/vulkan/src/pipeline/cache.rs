@@ -866,6 +866,9 @@ pub struct PipelineCache {
     waits: u64,
     /// [`Self::graphics_waiting`] lookups that waited for a pipeline still building.
     blocked: u64,
+    /// Run by tests when a [`Self::graphics_waiting`] lookup is about to wait.
+    #[cfg(test)]
+    on_block: Option<Box<dyn FnOnce() + Send>>,
     /// Pipeline count and driver compilations at the last [`Self::autosave`] write, or
     /// `None` when that write failed.
     saved: Option<(usize, u64)>,
@@ -991,6 +994,8 @@ impl PipelineCache {
             linking: HashMap::default(),
             waits: 0,
             blocked: 0,
+            #[cfg(test)]
+            on_block: None,
             saved: Some((0, 0)),
             next_save: None,
             save: Arc::new(AtomicU8::new(SAVE_IDLE)),
@@ -1057,6 +1062,10 @@ impl PipelineCache {
         };
         if self.async_compile && self.slots[index].get().is_none() {
             self.blocked += 1;
+            #[cfg(test)]
+            if let Some(on_block) = self.on_block.take() {
+                on_block();
+            }
             if self.ctx.features.fast_link && self.fast_linked(index, key, shaders).is_none() {
                 if let Some(Linking::Parts(parts, _)) = self.linking.get(&index) {
                     for part in parts {
@@ -2414,12 +2423,14 @@ mod tests {
         let key = key(&cache, &Regs::with_defaults(), &shaders);
         let ctx = cache.ctx.clone();
         let (paused, wait) = std::sync::mpsc::channel();
+        let (release, hold) = std::sync::mpsc::channel();
         let gate = std::thread::spawn(move || {
             let _paused = ctx.gate.write();
             paused.send(()).unwrap();
-            std::thread::sleep(Duration::from_millis(200));
+            hold.recv().unwrap();
         });
         wait.recv().unwrap();
+        cache.on_block = Some(Box::new(move || release.send(()).unwrap()));
         assert!(
             cache.graphics_waiting(&key, &shaders).is_some(),
             "fast-linked or built once the paused builds run, never skipped"
