@@ -48,6 +48,10 @@ Games play their movies through the console's video decoder, which Lichii emulat
 - Windows: put `avcodec-61.dll` and `avutil-59.dll` next to `lichii.exe`. The Release workflow's zip has them; to build them yourself, run `scripts/build-ffmpeg-windows.sh <dir>` on Linux or WSL with mingw-w64 and nasm. That build is LGPL-2.1-or-later (decoders only, no GPL or non-free parts) and writes its licence and source note beside the DLLs.
 - `LICHII_FFMPEG_DIR` points Lichii at another folder holding the libraries.
 
+### Frame dumps
+
+To see what a title draws when a screen capture doesn't work (a window on a sleeping display captures as white, for example), set `LICHII_FRAME_DUMP_DIR` to a folder. Lichii then writes the presented guest frame there as a BMP every 2 seconds. `LICHII_FRAME_DUMP_EVERY` changes the period, and `LICHII_FRAME_DUMP_FROM` and `LICHII_FRAME_DUMP_TO` limit dumping to a window, all in seconds since the renderer started. Each dump writes the frame back to guest memory first, so dumping slows the frames it dumps. Without the variable, nothing is dumped.
+
 ## License
 
 GPL-3.0-or-later, see [LICENSE](LICENSE). This project inherits the work of the Lichii, Eglantine, Eden, yuzu and Sudachi projects and their contributors.
