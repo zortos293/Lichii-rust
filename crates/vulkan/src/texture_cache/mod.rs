@@ -66,7 +66,8 @@ const PAGE_BITS: u32 = 20;
 /// texture would take ~23 GB (NX2_NOTES row 87): the subresources the GPU writes get memory,
 /// and nothing is uploaded or written back.
 const MAX_TEXELS: u64 = 1 << 28;
-/// Device memory one sparse image may bind; writes to subresources past it are dropped.
+/// Device memory one sparse image may bind by default; writes to subresources past it are
+/// dropped.
 const SPARSE_IMAGE_CAP: u64 = 2 << 30;
 /// The lookup table is emptied when it grows past this many entries.
 const MAX_LOOKUPS: usize = 1 << 16;
@@ -478,6 +479,8 @@ pub struct TextureCache {
     overlap_scratch: Vec<ImageId>,
     /// A sparse image hit its memory cap (warned once).
     sparse_capped: bool,
+    /// Device memory one sparse image may bind.
+    sparse_cap: u64,
     keep: Vec<(DAddr, DAddr)>,
     segments: Vec<Segment>,
     scratch: Scratch,
@@ -732,6 +735,7 @@ impl TextureCache {
             dropped: Vec::new(),
             overlap_scratch: Vec::new(),
             sparse_capped: false,
+            sparse_cap: SPARSE_IMAGE_CAP,
             keep: Vec::new(),
             segments: Vec::new(),
             scratch: Scratch::default(),
@@ -1572,19 +1576,18 @@ impl TextureCache {
         layers: std::ops::Range<u32>,
     ) -> Result<bool> {
         let device = self.device.clone();
+        let cap = self.sparse_cap;
         let Some(image) = self.get_mut(id) else {
             return Ok(true);
         };
         if !image.image.is_sparse() {
             return Ok(true);
         }
-        let bound = image
-            .image
-            .bind(tx.scheduler, level, layers, SPARSE_IMAGE_CAP)?;
+        let bound = image.image.bind(tx.scheduler, level, layers, cap)?;
         if !bound.complete && !self.sparse_capped {
             self.sparse_capped = true;
             tracing::warn!(
-                cap = SPARSE_IMAGE_CAP,
+                cap,
                 "a sparse image reached its memory cap; GPU writes past it are dropped"
             );
         }
@@ -1904,11 +1907,6 @@ impl TextureCache {
                 resident &=
                     self.bind_written(tx, id, level + l, layer..layer + desc.array_layers)?;
             }
-            if !resident {
-                self.image(join).overlaps.push(id);
-                self.image(id).overlaps.push(join);
-                continue;
-            }
             let cmd = tx.scheduler.record()?;
             let (src_levels, src_layers, src_aspect) = {
                 let src = self.image(join);
@@ -1951,7 +1949,12 @@ impl TextureCache {
                     &regions,
                 )
             };
-            self.remove(tx.scheduler, join);
+            if resident {
+                self.remove(tx.scheduler, join);
+            } else {
+                self.image(join).overlaps.push(id);
+                self.image(id).overlaps.push(join);
+            }
             self.mark_modified(id);
         }
         Ok(())

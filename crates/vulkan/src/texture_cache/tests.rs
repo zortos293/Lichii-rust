@@ -1824,3 +1824,100 @@ fn sparse_images_bind_the_layers_they_join() {
     ));
     f.assert_no_validation_errors();
 }
+
+#[test]
+fn sparse_images_take_the_layers_of_a_join_their_cap_admits() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let source = ImageInfo {
+        layers: 4,
+        ..rt_info(1024, 1024, 4, GobLayout::Tegra)
+    };
+    let info = ImageInfo {
+        layers: 300,
+        ..source
+    };
+    let layer = 1024 * 1024 * 4;
+    if !f.cache.can_be_sparse(&info) {
+        eprintln!("skipping: no sparse residency");
+        return;
+    }
+    f.cache.sparse_cap = 2 * layer;
+    let (mut tx, cache, gmmu) = f.tx();
+    let target = cache
+        .render_target(&mut tx, gmmu, GPU_VA, &source, true)
+        .unwrap()
+        .unwrap();
+    cache
+        .clear(
+            &mut tx,
+            target,
+            ClearValue::Color {
+                value: vk::ClearColorValue {
+                    float32: [0.0, 1.0, 0.0, 1.0],
+                },
+                mask: vk::ColorComponentFlags::RGBA,
+            },
+            Rect::ALL,
+            0,
+            4,
+        )
+        .unwrap();
+    let array = cache.find(&mut tx, gmmu, GPU_VA, &info).unwrap().unwrap();
+    assert_ne!(array.id, target.id);
+    cache.joins.push((target.id, 0, 0));
+    cache.join(&mut tx, array.id).unwrap();
+    assert_eq!(
+        cache.get(array.id).unwrap().image.memory_size(),
+        2 * layer,
+        "the cap admits two layers"
+    );
+    assert!(
+        cache.get(target.id).is_some(),
+        "the source keeps the layers past the cap"
+    );
+    let buffer = Buffer::new(
+        &f.device,
+        16 * 4,
+        vk::BufferUsageFlags::TRANSFER_DST,
+        MemoryLocation::GpuToCpu,
+        "readback",
+    )
+    .unwrap();
+    let cmd = f.scheduler.record().unwrap();
+    let raw = f
+        .cache
+        .prepare(cmd, array.id, ImageAccess::TRANSFER_SRC)
+        .unwrap();
+    let region = vk::BufferImageCopy {
+        image_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 1,
+            layer_count: 1,
+        },
+        image_extent: vk::Extent3D {
+            width: 16,
+            height: 1,
+            depth: 1,
+        },
+        ..Default::default()
+    };
+    // SAFETY: the image is a transfer source and the buffer holds the row.
+    unsafe {
+        f.device.raw.cmd_copy_image_to_buffer(
+            cmd,
+            raw,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            buffer.raw(),
+            &[region],
+        )
+    };
+    f.scheduler.finish().unwrap();
+    assert!(
+        all_texels(&buffer.mapped().unwrap()[..16 * 4], [0, 255, 0, 255]),
+        "a bound layer holds the join's texels"
+    );
+    f.assert_no_validation_errors();
+}
