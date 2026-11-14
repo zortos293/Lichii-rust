@@ -135,39 +135,71 @@ struct Run {
     at: u64,
 }
 
-/// Reused storage for [`shared_runs`]: the target's segments by device address, and the runs.
+/// Reused storage for [`shared_runs`]: the target's segments by device address, the runs, and
+/// the longest run when the target's segments share device memory, so runs overlap.
 #[derive(Default)]
 struct RunScratch {
     targets: Vec<Segment>,
     runs: Vec<Run>,
+    overlapping: Option<u64>,
 }
+
+impl RunScratch {
+    /// The runs that may hold bytes of the image's offsets `[start, end)`.
+    fn within(&self, start: u64, end: u64) -> std::ops::Range<usize> {
+        let first = match self.overlapping {
+            Some(longest) => self.runs.partition_point(|r| r.from + longest <= start),
+            None => self.runs.partition_point(|r| r.from + r.size <= start),
+        };
+        let count = self.runs[first..]
+            .iter()
+            .take_while(|r| r.from < end)
+            .count();
+        first..first + count
+    }
+}
+
+/// Segment pairs past which a target whose segments share device memory is not searched.
+const MAX_OVERLAPPING_PAIRS: usize = 1 << 16;
 
 /// Fills `scratch.runs`, by image offset, with where the bytes of `image` land in the
 /// guest bytes buffer, which holds the offsets `window` of `target`: one run per pair of
-/// their segments sharing device memory. False when two of the target's segments share device
-/// memory, which the search can't place.
+/// their segments sharing device memory. Where the target's own segments share device memory,
+/// a byte lands at each of its offsets. False when such a target has too many segment pairs to
+/// search.
 fn shared_runs(
     image: &CachedImage,
     target: &CachedImage,
     window: (u64, u64),
     scratch: &mut RunScratch,
 ) -> bool {
-    let RunScratch { targets, runs } = scratch;
+    let RunScratch {
+        targets,
+        runs,
+        overlapping,
+    } = scratch;
     targets.clear();
     targets.extend_from_slice(&target.segments);
     targets.sort_unstable_by_key(|t| t.daddr);
-    if targets
+    let shared = targets
         .windows(2)
-        .any(|t| t[0].daddr + t[0].size > t[1].daddr)
-    {
+        .any(|t| t[0].daddr + t[0].size > t[1].daddr);
+    if shared && image.segments.len() * targets.len() > MAX_OVERLAPPING_PAIRS {
         return false;
     }
     runs.clear();
     for s in &image.segments {
         let end = s.daddr + s.size;
-        let first = targets.partition_point(|t| t.daddr + t.size <= s.daddr);
+        let first = if shared {
+            0
+        } else {
+            targets.partition_point(|t| t.daddr + t.size <= s.daddr)
+        };
         for t in targets[first..].iter().take_while(|t| t.daddr < end) {
             let (lo, hi) = (s.daddr.max(t.daddr), end.min(t.daddr + t.size));
+            if lo >= hi {
+                continue;
+            }
             let offset = t.offset + (lo - t.daddr);
             let (from, to) = (offset.max(window.0), (offset + (hi - lo)).min(window.1));
             if from < to {
@@ -180,6 +212,7 @@ fn shared_runs(
         }
     }
     runs.sort_unstable_by_key(|r| r.from);
+    *overlapping = shared.then(|| runs.iter().map(|r| r.size).max().unwrap_or(0));
     true
 }
 
@@ -398,13 +431,10 @@ impl TextureCache {
             for level in 0..levels {
                 let start = info.subresource_offset(level, layer);
                 let end = start + info.level_size(level);
-                let runs = &sync.scratch.runs;
-                let first = runs.partition_point(|r| r.from + r.size <= start);
-                let count = runs[first..].iter().take_while(|r| r.from < end).count();
-                if count == 0 {
+                let shared = sync.scratch.within(start, end);
+                if shared.is_empty() {
                     continue;
                 }
-                let shared = first..first + count;
                 let tiling = info.surface().level_tiling(level);
                 let (w, h, _) = info.level_extent(level);
                 let row_words = w * tiling.bytes_per_block / 4;
@@ -508,5 +538,22 @@ impl TextureCache {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlapping_runs_are_all_found_for_the_offsets_they_hold() {
+        let run = |from, size| Run { from, size, at: 0 };
+        let scratch = RunScratch {
+            targets: Vec::new(),
+            runs: vec![run(0, 100), run(50, 10)],
+            overlapping: Some(100),
+        };
+        assert_eq!(scratch.within(70, 80), 0..2);
+        assert_eq!(scratch.within(200, 220), 2..2);
     }
 }
