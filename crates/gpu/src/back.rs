@@ -18,6 +18,7 @@ use crate::engines::kepler_compute::pcas::QmdScheduler;
 use crate::engines::{Engine, EngineContext, EngineFactory, EngineKind};
 use crate::gmmu::{Gmmu, RangeTarget};
 use crate::gpu::{MAX_POLL, MIN_POLL};
+use crate::host_releases::HostReleases;
 use crate::host1x::Syncpoints;
 use crate::ring::{Consumer, WRAP};
 use crate::stream::{FetchSync, FetchSyncs, MULTI_MAX_WORDS, REDUCTIONS, RELEASE_SIZES, tag};
@@ -71,6 +72,8 @@ pub(crate) struct Back {
     qmd_scheduler: QmdScheduler,
     fetch_syncs: Arc<FetchSyncs>,
     written_pages: Arc<GpuWrittenPages>,
+    /// Host releases queued to the renderer, for the macro reads of their words.
+    releases: HostReleases,
     activity: Arc<Activity>,
     /// Set by [`crate::Gpu::shutdown`]: the back drops what is left instead of executing it.
     stopping: Arc<AtomicBool>,
@@ -100,6 +103,7 @@ impl Back {
             qmd_scheduler: QmdScheduler::new(),
             fetch_syncs,
             written_pages: handles.written_pages.clone(),
+            releases: HostReleases::new(),
             activity,
             stopping,
         }
@@ -283,7 +287,11 @@ impl Back {
                 1
             }
             tag::SYNCHRONIZE_READ => {
-                self.synchronize_read(consumer.slot(1), consumer.slot(2));
+                let (address, size) = (consumer.slot(1), consumer.slot(2));
+                if !self.read_releases(address, size) {
+                    self.fetch_syncs.read_overlay.clear();
+                    self.synchronize_read(address, size);
+                }
                 3
             }
             tag::SYNCHRONIZE_FETCH => {
@@ -394,11 +402,69 @@ impl Back {
             }
             return;
         };
+        let words = match size {
+            ReleaseSize::Four => 1,
+            ReleaseSize::Eight => 2,
+            ReleaseSize::Sixteen => 4,
+        };
+        self.releases.release(
+            self.syncpoints.semaphore_waiters().landings(),
+            daddr,
+            payload,
+            words,
+        );
         self.rasterizer.signal_fence(FenceAction::WriteSemaphore {
             address: daddr,
             value: payload,
             size,
         });
+    }
+
+    /// A macro read of words that only GPU-untouched pages and host releases still on their way
+    /// to the host GPU hold: the front gets the releases' values with the read instead of the back
+    /// waiting for them to land. Returns false, having handed nothing over, for any other read.
+    fn read_releases(&mut self, address: u64, size: u64) -> bool {
+        let Some(channel) = self.current.and_then(|index| self.channels[index].as_ref()) else {
+            return false;
+        };
+        if !address.is_multiple_of(4) {
+            return false;
+        }
+        let landings = self.syncpoints.semaphore_waiters().landings();
+        let mut words = [(0u32, 0u32); 16];
+        let mut len = 0;
+        let mut plain = true;
+        let mut any = false;
+        channel.setup.memory.for_each_range(address, size, |range| {
+            let RangeTarget::Device(daddr) = range.target else {
+                plain = false;
+                return;
+            };
+            if self.written_pages.may_be_written(daddr, range.size) {
+                plain = false;
+                return;
+            }
+            let base = range.gpu_va - address;
+            any |= self.releases.pending(
+                landings,
+                daddr,
+                range.size,
+                || self.timestamp.now(),
+                |at, word| {
+                    if let Some(slot) = words.get_mut(len) {
+                        *slot = (((base + at - daddr) / 4) as u32, word);
+                    }
+                    len += 1;
+                },
+            );
+        });
+        plain
+            && any
+            && len <= words.len()
+            && self
+                .fetch_syncs
+                .read_overlay
+                .set(words[..len].iter().copied())
     }
 
     /// The front is about to read `[address, address + size)`: the GPU work before it completes,
@@ -444,6 +510,8 @@ impl Back {
             tracing::warn!(address, "semaphore reduction on unmapped GPU memory");
             return;
         };
+        self.releases
+            .forget(self.syncpoints.semaphore_waiters().landings(), daddr, 8);
         self.rasterizer.signal_fence(FenceAction::ReduceSemaphore {
             address: daddr,
             op,

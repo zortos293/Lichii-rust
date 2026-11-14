@@ -29,7 +29,6 @@ use lichii_common::GpuVAddr;
 use crate::back::{BackChannelSetup, SideCommand};
 use crate::backend::{ChannelId, GpuWrittenPages, ReleaseSize};
 use crate::channel::{ChannelConfig, SemaphoreWaiters, SyncpointFence, SyncpointIncrement};
-use crate::clock::GpuTimestamp;
 use crate::engines::EngineKind;
 use crate::engines::kepler_compute::Regs as ComputeRegs;
 use crate::engines::maxwell_3d::{MACRO_REGISTERS_START, RegisterState, Regs};
@@ -42,7 +41,6 @@ use crate::macros::{
     LOAD_MME_START_ADDRESS_RAM_POINTER, MACRO_METHOD_BASE, MacroDataRam, MacroEngine, MacroHost,
     MacroIsa,
 };
-use crate::pending_releases::PendingReleases;
 use crate::pushbuffer::{CommandParser, Flow, GpEntry, MethodCall, MethodHandler};
 use crate::reg_index;
 use crate::semaphore_mirror::SemaphoreMirror;
@@ -78,8 +76,6 @@ pub(crate) struct FrontShared {
     /// Switch 2: the device pages GPU work may have written. An entry on one is fetched after the
     /// back synchronised its words.
     pub written_pages: Option<Arc<GpuWrittenPages>>,
-    /// Timestamps of the 16-byte releases macro DMA reads see before they land.
-    pub timestamp: Arc<GpuTimestamp>,
 }
 
 /// A channel's queued work.
@@ -146,8 +142,6 @@ struct ChannelState {
     /// Switch 2: the compute class set a macro instruction or start-address pointer, so its
     /// uploads and calls use [`FrontShared::compute_macros`] from then on.
     compute_macros: bool,
-    /// Host semaphore releases sent to the back, for the macro DMA reads of their words.
-    releases: PendingReleases,
 }
 
 /// Parameters one macro call can have: the words of one command (a 13-bit count).
@@ -210,7 +204,6 @@ impl FrontChannel {
                 calls: [MacroCall::new(), MacroCall::new()],
                 upload_next: None,
                 compute_macros: false,
-                releases: PendingReleases::new(),
             },
             queue: VecDeque::new(),
             offset: 0,
@@ -369,7 +362,6 @@ impl FrontChannel {
                         .stream
                         .side(SideCommand::BindAddressSpace(self.id, memory.clone()));
                     self.memory = memory;
-                    self.state.releases.clear();
                 }
                 Work::Increment(increment) => {
                     self.queue.pop_front();
@@ -590,26 +582,21 @@ impl Dispatch<'_> {
                 address,
                 payload,
                 kind,
-            } => {
-                let size = match kind {
+            } => stream.release(
+                address,
+                payload,
+                match kind {
                     ReleaseKind::Four => ReleaseSize::Four,
                     ReleaseKind::Eight => ReleaseSize::Eight,
                     ReleaseKind::WithTimestamp => ReleaseSize::Sixteen,
-                };
-                self.state
-                    .releases
-                    .release(self.memory, address, payload, size);
-                stream.release(address, payload, size);
-            }
+                },
+            ),
             HostAction::Reduce {
                 address,
                 payload,
                 op,
                 signed,
-            } => {
-                self.state.releases.forget(address, 8);
-                stream.reduce(address, payload, op, signed);
-            }
+            } => stream.reduce(address, payload, op, signed),
             HostAction::SyncpointWait { id, value } => {
                 return self.syncpoint_wait(SyncpointFence { id, value });
             }
@@ -795,7 +782,6 @@ impl Dispatch<'_> {
             macros,
             calls,
             compute_macros,
-            releases,
             ..
         } = &mut *self.state;
         let pending = &mut calls[target as usize];
@@ -821,9 +807,6 @@ impl Dispatch<'_> {
                 compute,
                 stream: &mut shared.stream,
                 memory: self.memory,
-                releases,
-                written_pages: shared.written_pages.as_deref(),
-                timestamp: &shared.timestamp,
             };
             if let Err(error) =
                 engine.execute(pending.method, &pending.parameters, data_ram, &mut host)
@@ -878,32 +861,6 @@ struct FrontMacroHost<'a> {
     compute: &'a mut [u32],
     stream: &'a mut Stream,
     memory: &'a Gmmu,
-    releases: &'a mut PendingReleases,
-    written_pages: Option<&'a GpuWrittenPages>,
-    timestamp: &'a GpuTimestamp,
-}
-
-impl FrontMacroHost<'_> {
-    /// Serves a read of host semaphore words from the releases queued to them, when GPU work
-    /// never wrote their pages: nothing else queued writes them, so the read needs no drain.
-    fn read_released(&mut self, gpu_va: u64, out: &mut [u32]) -> bool {
-        let Some(pages) = self.written_pages else {
-            return false;
-        };
-        let mut plain = true;
-        self.memory
-            .for_each_range(gpu_va, size_of_val(out) as u64, |range| {
-                match range.target {
-                    RangeTarget::Device(daddr) => plain &= !pages.may_be_written(daddr, range.size),
-                    _ => plain = false,
-                }
-            });
-        let timestamp = self.timestamp;
-        plain
-            && self
-                .releases
-                .read(self.memory, gpu_va, out, || timestamp.now())
-    }
 }
 
 impl MacroHost for FrontMacroHost<'_> {
@@ -934,9 +891,6 @@ impl MacroHost for FrontMacroHost<'_> {
     /// Reads memory as of the macro's position in the stream: the work sent before it completes
     /// and what the GPU wrote to the words reaches guest memory first.
     fn dma_read(&mut self, gpu_va: u64, out: &mut [u32]) {
-        if self.read_released(gpu_va, out) {
-            return;
-        }
         self.stream
             .synchronize_read(gpu_va, size_of_val(out) as u64);
         if let Err(fault) = self
@@ -946,6 +900,7 @@ impl MacroHost for FrontMacroHost<'_> {
             tracing::warn!(?fault, "MME DMA read from unmapped GPU memory");
             out.fill(0);
         }
+        self.stream.overlay_read(out);
     }
 }
 
@@ -1013,7 +968,6 @@ mod tests {
             inbox,
             syncpoints,
             written_pages: None,
-            timestamp: Arc::new(GpuTimestamp::new(Arc::new(Boot), false)),
         };
         let config = ChannelConfig::new(
             Arc::new(Gmmu::new(device, BigPageSize::Size64K)),

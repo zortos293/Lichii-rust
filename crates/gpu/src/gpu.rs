@@ -450,7 +450,6 @@ impl Gpu {
                 syncpoints: handles.syncpoints.clone(),
                 written_pages: (config.console == Console::Switch2)
                     .then(|| handles.written_pages.clone()),
-                timestamp: handles.timestamp.clone(),
             },
             channels: Vec::new(),
             held: VecDeque::new(),

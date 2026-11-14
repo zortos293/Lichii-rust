@@ -17,6 +17,7 @@ use crate::backend::{ChannelId, ReleaseSize};
 use crate::engines::EngineKind;
 use crate::gpu::Inbox;
 use crate::host::Reduction;
+use crate::host_releases::ReadOverlay;
 use crate::ring::{Consumer, Producer};
 
 pub(crate) mod tag {
@@ -91,6 +92,8 @@ pub(crate) const fn header(tag: u8, engine: u8, method: u32, argument: u32) -> u
 pub(crate) struct FetchSyncs {
     completed: AtomicU64,
     front: Arc<Inbox>,
+    /// What pending host releases write over the read [`Stream::synchronize_read`] last sent.
+    pub(crate) read_overlay: ReadOverlay,
 }
 
 impl FetchSyncs {
@@ -98,6 +101,7 @@ impl FetchSyncs {
         Self {
             completed: AtomicU64::new(0),
             front,
+            read_overlay: ReadOverlay::default(),
         }
     }
 
@@ -286,6 +290,13 @@ impl Stream {
     pub(crate) fn synchronize_read(&mut self, address: GpuVAddr, size: u64) {
         self.record(&[header(tag::SYNCHRONIZE_READ, 0, 0, 0), address, size]);
         self.drain();
+    }
+
+    /// Puts what host releases still on their way to the host GPU write over `out`, the words
+    /// the front read after [`Stream::synchronize_read`]: the back hands those values over
+    /// instead of waiting for them.
+    pub(crate) fn overlay_read(&self, out: &mut [u32]) {
+        self.fetch_syncs.read_overlay.apply(out);
     }
 
     /// Has the back synchronize the fetch of `[address, address + size)` as `sync` says, without
