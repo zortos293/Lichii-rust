@@ -291,6 +291,8 @@ pub struct Jit {
     flushed: Instant,
     /// Set while the profile this core sent last waits to be merged.
     queued: Arc<AtomicBool>,
+    /// Blocks this core translated.
+    translated: u64,
 }
 
 // SAFETY: `arena` is the base of the fastmem arena owned by `config.memory`, which is `Sync`; the
@@ -311,14 +313,28 @@ impl Jit {
     }
 
     fn build(config: CpuConfig, passes: Passes, profile: bool) -> Option<Self> {
-        let cache = JitCache::new(profile)?;
+        let fastmem = config.memory.fastmem();
+        let features = [
+            std::arch::is_x86_feature_detected!("cmpxchg16b"),
+            std::arch::is_x86_feature_detected!("fma"),
+            std::arch::is_x86_feature_detected!("sse4.1"),
+            std::arch::is_x86_feature_detected!("sse4.2"),
+        ];
+        let [cmpxchg16b, fma, sse41, sse42] = features;
+        let flavour = [
+            passes.get_set,
+            passes.fold,
+            passes.fuse,
+            passes.lazy,
+            passes.dce,
+            profile,
+            fastmem.is_some(),
+        ]
+        .into_iter()
+        .chain(features)
+        .fold(0, |bits, on| bits << 1 | u64::from(on));
+        let cache = JitCache::new(cache::Shared::of(&config.memory, flavour, profile)?);
         let interrupt = InterruptHandle::default();
-        let fastmem = config.memory.fastmem().filter(|_| {
-            if !cache.handles_faults() {
-                tracing::warn!("the JIT fault-site table is full; this core runs without fastmem");
-            }
-            cache.handles_faults()
-        });
         if let Some(fastmem) = fastmem {
             fastmem.set_fault_handler(Some(cache::on_fault), 0);
         }
@@ -373,10 +389,10 @@ impl Jit {
                 simd,
                 simd_slow,
                 tsc_scale: config.clock.host_tsc_scale().map(std::ptr::from_ref),
-                cmpxchg16b: std::arch::is_x86_feature_detected!("cmpxchg16b"),
-                fma: std::arch::is_x86_feature_detected!("fma"),
-                sse41: std::arch::is_x86_feature_detected!("sse4.1"),
-                sse42: std::arch::is_x86_feature_detected!("sse4.2"),
+                cmpxchg16b,
+                fma,
+                sse41,
+                sse42,
             },
             arena: fastmem.map_or(std::ptr::null_mut(), |f| f.base()),
             config,
@@ -386,6 +402,7 @@ impl Jit {
             passes,
             flushed: Instant::now(),
             queued: Arc::default(),
+            translated: 0,
         })
     }
 
@@ -393,6 +410,7 @@ impl Jit {
         if start & 3 != 0 {
             return Err(CpuFault::Prefetch { pc: start });
         }
+        self.translated += 1;
         let started = self.state.profile.is_some().then(Instant::now);
         let mut t = Translator {
             block: Block {
@@ -479,7 +497,7 @@ impl Jit {
             }
             Exit::InvalidateAll => {
                 self.count_flush(Flush::Clear);
-                self.cache.clear();
+                self.cache.invalidate(0, u64::MAX);
                 Some(HaltReason::InvalidateCode {
                     addr: 0,
                     size: u64::MAX,
@@ -489,6 +507,15 @@ impl Jit {
     }
 
     fn dispatch(&mut self, ctx: &mut ThreadContext) -> HaltReason {
+        self.cache.enter();
+        let halt = self.run_blocks(ctx);
+        self.cache.leave();
+        halt
+    }
+
+    /// The dispatcher loop. Only between `JitCache::enter` and `leave`, which keep the code it
+    /// runs mapped.
+    fn run_blocks(&mut self, ctx: &mut ThreadContext) -> HaltReason {
         let _fp = simd::HostFp::enter();
         loop {
             let link = std::mem::take(&mut self.state.link);
@@ -520,6 +547,7 @@ impl Jit {
                 self.cache.link(link, ctx.pc, code);
             }
             self.cache.publish(ctx.pc, code);
+            self.state.materialize = self.cache.materialize();
             let enter = self.cache.trampoline();
             // SAFETY: `code` is a compiled block in this core's code memory; it only touches
             // `ctx`, the state, and the arena behind the bounds check.
@@ -597,6 +625,12 @@ impl Drop for Jit {
     fn drop(&mut self) {
         if let Some(p) = self.state.profile_counts() {
             profile::retire(std::mem::take(p));
+            tracing::info!(
+                core = self.config.core_index,
+                translated = self.translated,
+                shared = self.cache.adopted(),
+                "JIT core totals"
+            );
         }
         map::sync();
     }
