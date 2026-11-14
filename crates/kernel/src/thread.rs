@@ -1,6 +1,6 @@
 //! Guest threads.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use lichii_common::{ResultCode, VAddr};
@@ -17,6 +17,8 @@ pub type ThreadId = u64;
 pub const LOWEST_PRIORITY: u8 = 63;
 /// Size of a thread's TLS slot (`TPIDRRO_EL0`).
 pub const TLS_SIZE: u64 = 0x200;
+/// [`Thread::refs`] once the thread gave its resources back.
+const FINALIZED: usize = usize::MAX;
 /// Longest chain of mutex owners a priority change is passed along.
 const MAX_INHERITANCE_DEPTH: usize = 64;
 
@@ -111,7 +113,6 @@ pub struct Thread {
     wait_token: AtomicU64,
     /// Handle-table entries that refer to the thread, plus one from its start until it exits.
     refs: AtomicUsize,
-    finalized: AtomicBool,
     pub(crate) sync: SyncState,
     /// Threads waiting for mutexes this thread owns; they lend it their priority.
     lock_waiters: Mutex<Vec<LockWaiter>>,
@@ -180,7 +181,6 @@ impl Thread {
             }),
             wait_token: AtomicU64::new(0),
             refs: AtomicUsize::new(0),
-            finalized: AtomicBool::new(false),
             sync: SyncState::default(),
             lock_waiters: Mutex::default(),
             lock_owner: Mutex::default(),
@@ -432,9 +432,14 @@ impl Thread {
         *self.context.lock() = context;
     }
 
-    /// Takes a reference: a handle-table entry, or the thread's own while it runs.
-    pub(crate) fn retain(&self) {
-        self.refs.fetch_add(1, Ordering::SeqCst);
+    /// Takes a reference: a handle-table entry, or the thread's own while it runs. Fails once the
+    /// thread is finalized.
+    pub(crate) fn retain(&self) -> bool {
+        self.refs
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |refs| {
+                (refs != FINALIZED).then_some(refs + 1)
+            })
+            .is_ok()
     }
 
     /// Takes the reference a starting thread holds until it exits, unless no reference is left
@@ -442,24 +447,35 @@ impl Thread {
     pub(crate) fn try_retain(&self) -> bool {
         self.refs
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |refs| {
-                (refs != 0).then_some(refs + 1)
+                (refs != 0 && refs != FINALIZED).then_some(refs + 1)
             })
             .is_ok()
     }
 
-    /// Whether the last reference dropped and the thread gave its resources back.
-    pub(crate) fn is_finalized(&self) -> bool {
-        self.finalized.load(Ordering::SeqCst)
+    /// Drops a reference; the last one finalizes the thread.
+    pub(crate) fn release(&self) {
+        let dropped = self
+            .refs
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |refs| {
+                (refs != 0 && refs != FINALIZED).then(|| refs - 1)
+            });
+        if dropped == Ok(1) {
+            self.finalize_unreferenced();
+        }
     }
 
-    /// Drops a reference. The last one gives the TLS slot and the thread count back to the
-    /// process and detaches the thread from it, as Horizon's `KThread::Finalize` does once
-    /// the thread has exited (or never started) and its last handle is closed. Freeing the slot
-    /// at exit instead would hand a new thread the slot of one whose handle is still open. Takes
-    /// no thread lock, so handle tables may call it under their own lock.
-    pub(crate) fn release(&self) {
-        if self.refs.fetch_sub(1, Ordering::SeqCst) != 1
-            || self.finalized.swap(true, Ordering::SeqCst)
+    /// Gives the TLS slot and the thread count back to the process and detaches the thread from
+    /// it, if no reference is left, as Horizon's `KThread::Finalize` does once the thread has
+    /// exited (or never started) and its last handle is closed. Freeing the slot at exit instead
+    /// would hand a new thread the slot of one whose handle is still open. Moving the count from
+    /// zero to [`FINALIZED`] decides it atomically, so a reference taken meanwhile keeps the
+    /// thread, and none can be taken after. Takes no thread lock, so handle tables may call it
+    /// under their own lock.
+    pub(crate) fn finalize_unreferenced(&self) {
+        if self
+            .refs
+            .compare_exchange(0, FINALIZED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
         {
             return;
         }
@@ -572,12 +588,10 @@ impl Thread {
                 drop(s);
                 self.leave_lock_wait(token);
             }
-            ThreadState::Created if self.is_finalized() => {}
-            ThreadState::Created => {
-                self.retain();
+            ThreadState::Created if !self.retain() => {}
+            ThreadState::Suspended | ThreadState::Created => {
                 self.scheduler.enqueue(self, &mut s, true)
             }
-            ThreadState::Suspended => self.scheduler.enqueue(self, &mut s, true),
             ThreadState::Running(core) => self.scheduler.request_reschedule(core),
             ThreadState::Runnable | ThreadState::Terminated => {}
         }

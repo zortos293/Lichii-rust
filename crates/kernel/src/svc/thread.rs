@@ -34,8 +34,7 @@ pub(super) fn create_thread(svc: &mut SvcContext) -> Flow {
                     svc.finish(Ok(()))
                 }
                 Err(code) => {
-                    svc.process().remove_thread(&thread);
-                    release_thread_resources(&thread);
+                    thread.finalize_unreferenced();
                     svc.finish(Err(code))
                 }
             }
@@ -54,7 +53,7 @@ pub(super) fn start_thread(svc: &mut SvcContext) -> Flow {
         if s.terminate_requested {
             return Err(result::TERMINATION_REQUESTED);
         }
-        if thread.is_finalized() || !thread.try_retain() {
+        if !thread.try_retain() {
             return Err(result::INVALID_HANDLE);
         }
         thread.scheduler.enqueue(&thread, &mut s, false);
