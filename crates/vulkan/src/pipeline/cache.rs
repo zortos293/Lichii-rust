@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use ash::vk;
 use lichii_common::perf::PerfStats;
@@ -812,7 +813,15 @@ pub struct PipelineCache {
     linking: HashMap<usize, Linking, FxBuildHasher>,
     /// Graphics lookups that found the pipeline still building, with nothing fast-linked yet.
     waits: u64,
+    /// Pipeline count and driver compilations at the last [`Self::autosave`] write.
+    saved: (usize, u64),
+    next_save: Option<Instant>,
+    /// Set while an [`Self::autosave`] write runs on a worker.
+    saving: Arc<AtomicBool>,
 }
+
+/// How often [`PipelineCache::autosave`] writes the disk cache while its pipelines change.
+const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(10);
 
 fn identity(device: &Device) -> DeviceIdentity {
     // SAFETY: `physical` belongs to this instance.
@@ -922,6 +931,9 @@ impl PipelineCache {
             libraries: HashMap::default(),
             linking: HashMap::default(),
             waits: 0,
+            saved: (0, 0),
+            next_save: None,
+            saving: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -1324,14 +1336,54 @@ impl PipelineCache {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        // SAFETY: the cache belongs to this device; drivers synchronise reads internally.
-        let blob = unsafe {
-            self.ctx
-                .device
-                .raw
-                .get_pipeline_cache_data(self.ctx.vk_cache)
+        write(&self.ctx, path, &self.identity, self.keys())
+    }
+
+    /// Writes the disk cache on a pipeline worker once [`AUTOSAVE_INTERVAL`] passed since the
+    /// last write and pipelines were added or compiled since, so a run that never drops the
+    /// cache (a killed process) keeps what it built. Call it once a frame with the time.
+    pub fn autosave(&mut self, now: Instant) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let Some(next) = self.next_save else {
+            self.next_save = Some(now + AUTOSAVE_INTERVAL);
+            return;
+        };
+        if now < next || self.saving.load(Ordering::Acquire) {
+            return;
         }
-        .map_err(io::Error::other)?;
+        let shared = &self.ctx.shared;
+        let state = (
+            self.graphics.len() + self.compute.len(),
+            shared.built.load(Ordering::Relaxed) - shared.cache_hits.load(Ordering::Relaxed),
+        );
+        let sender = self.workers.as_ref().and_then(|w| w.sender.as_ref());
+        let (false, Some(sender)) = (state == self.saved, sender) else {
+            return;
+        };
+        let (ctx, path, identity, keys) =
+            (self.ctx.clone(), path.clone(), self.identity, self.keys());
+        let saving = self.saving.clone();
+        saving.store(true, Ordering::Release);
+        let job: Job = Box::new(move || {
+            if !ctx.shared.shutdown.load(Ordering::Relaxed)
+                && let Err(error) = write(&ctx, &path, &identity, keys)
+            {
+                tracing::warn!("writing the pipeline cache: {error}");
+            }
+            saving.store(false, Ordering::Release);
+        });
+        if sender.send(job).is_err() {
+            self.saving.store(false, Ordering::Release);
+            return;
+        }
+        self.saved = state;
+        self.next_save = Some(now + AUTOSAVE_INTERVAL);
+    }
+
+    /// The pipeline keys [`Self::save`] writes, without the driver cache.
+    fn keys(&self) -> Contents {
         let failed = |index: usize| matches!(self.slots[index].get(), Some(None));
         let mut graphics: Vec<_> = self
             .graphics
@@ -1357,13 +1409,21 @@ impl PipelineCache {
                 .iter()
                 .filter(|key| !self.compute.contains_key(*key)),
         );
-        let contents = Contents {
+        Contents {
             graphics,
             compute,
-            blob,
-        };
-        disk::write_atomic(path, &disk::encode(&self.identity, &contents))
+            blob: Vec::new(),
+        }
     }
+}
+
+/// Writes `keys` and the driver cache of `ctx` to `path`.
+fn write(ctx: &Context, path: &Path, identity: &DeviceIdentity, keys: Contents) -> io::Result<()> {
+    // SAFETY: the cache belongs to this device; drivers synchronise reads internally.
+    let blob = unsafe { ctx.device.raw.get_pipeline_cache_data(ctx.vk_cache) }
+        .map_err(io::Error::other)?;
+    let contents = Contents { blob, ..keys };
+    disk::write_atomic(path, &disk::encode(identity, &contents))
 }
 
 impl Drop for PipelineCache {
@@ -2167,6 +2227,46 @@ mod tests {
         );
         assert_eq!(cache.stats().failed, 4);
         assert_eq!(device.instance().validation_errors(), 0);
+    }
+
+    #[test]
+    fn autosave_writes_new_pipelines_on_a_worker_without_dropping_the_cache() {
+        let Some(device) = device() else { return };
+        let dir = temp_dir("pipeline-autosave");
+        let shaders = present_shaders();
+        let mut cache = PipelineCache::new(&device, &settings(true), Some(&dir), None).unwrap();
+        let keys: Vec<_> = variants(2)
+            .iter()
+            .map(|regs| key(&cache, regs, &shaders))
+            .collect();
+        for key in &keys {
+            let _ = cache.graphics(key, &shaders);
+        }
+        cache.wait_for_builds();
+        let path = dir.join(FILE_NAME);
+        let start = Instant::now();
+        cache.autosave(start);
+        cache.autosave(start + AUTOSAVE_INTERVAL / 2);
+        assert!(
+            !path.exists(),
+            "nothing is written before the interval passes"
+        );
+        cache.autosave(start + AUTOSAVE_INTERVAL);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while cache.saving.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let stored = disk::decode(&std::fs::read(&path).unwrap(), &identity(&device))
+            .expect("this device's file");
+        assert_eq!(stored.graphics.len(), keys.len());
+        assert!(keys.iter().all(|key| stored.graphics.contains(key)));
+        assert!(stored.blob.len() >= 32, "the driver cache is written too");
+        std::fs::remove_file(&path).unwrap();
+        cache.autosave(start + AUTOSAVE_INTERVAL * 3);
+        assert!(
+            !cache.saving.load(Ordering::Acquire) && !path.exists(),
+            "an unchanged cache is not written again"
+        );
     }
 
     #[test]
