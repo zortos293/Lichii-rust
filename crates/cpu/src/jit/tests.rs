@@ -296,7 +296,11 @@ fn simd(rng: &mut Rng) -> u32 {
     }
 }
 
-const VECTOR: [&str; 14] = [
+const VECTOR: [&str; 18] = [
+    "0xx01110xx1xxxxx0110x1xxxxxxxxxx",
+    "0x001110xx0xxxxx0x1110xxxxxxxxxx",
+    "0xx01110xx1xxxxx000100xxxxxxxxxx",
+    "0xx011110xxxxxxx101001xxxxxxxxxx",
     "0x001110xx100001010010xxxxxxxxxx",
     "01011110000xxxxx000001xxxxxxxxxx",
     "0x101110000xxxxx0xxxx0xxxxxxxxxx",
@@ -313,8 +317,8 @@ const VECTOR: [&str; 14] = [
     "0x00111000100000010110xxxxxxxxxx",
 ];
 
-/// An Advanced SIMD integer three-same, compare against zero, `CNT`, shift by immediate, copy or
-/// modified-immediate instruction, or an `LD1`..`LD4`/`ST1`..`ST4` of one to four registers on `X20`..`X23` or
+/// An Advanced SIMD integer three-same, compare against zero, `CNT`, shift by immediate (long
+/// too), `ZIP1`/`ZIP2`, `SADDW`/`UADDW`, copy or modified-immediate instruction, or an `LD1`..`LD4`/`ST1`..`ST4` of one to four registers on `X20`..`X23` or
 /// `SP`, offset or post-indexed by an immediate or `X24`/`X26`.
 fn vector(rng: &mut Rng) -> u32 {
     if rng.below(3) == 0 {
@@ -999,7 +1003,14 @@ fn conditional_compares_read_the_live_flags() {
 
 #[test]
 fn vector_fp_edge_cases_match_the_interpreter() {
-    const S_OPS: [u32; 34] = [
+    const S_OPS: [u32; 41] = [
+        0x6ea1_f820, // fsqrt v0.4s, v1.4s
+        0x2ea1_f820, // fsqrt v0.2s, v1.2s
+        0x4e22_f420, // fmax v0.4s, v1.4s, v2.4s
+        0x4ea2_f420, // fmin v0.4s, v1.4s, v2.4s
+        0x4e22_c420, // fmaxnm v0.4s, v1.4s, v2.4s
+        0x4ea2_c420, // fminnm v0.4s, v1.4s, v2.4s
+        0x0e22_f420, // fmax v0.2s, v1.2s, v2.2s
         0x4ea1_d820, // frecpe v0.4s, v1.4s
         0x6ea1_d820, // frsqrte v0.4s, v1.4s
         0x0ea1_d820, // frecpe v0.2s, v1.2s
@@ -1035,7 +1046,12 @@ fn vector_fp_edge_cases_match_the_interpreter() {
         0x5fa2_1020, // fmla s0, s1, v2.s[1]
         0x5f82_5820, // fmls s0, s1, v2.s[2]
     ];
-    const D_OPS: [u32; 15] = [
+    const D_OPS: [u32; 20] = [
+        0x6ee1_f820, // fsqrt v0.2d, v1.2d
+        0x4e62_f420, // fmax v0.2d, v1.2d, v2.2d
+        0x4ee2_f420, // fmin v0.2d, v1.2d, v2.2d
+        0x4e62_c420, // fmaxnm v0.2d, v1.2d, v2.2d
+        0x4ee2_c420, // fminnm v0.2d, v1.2d, v2.2d
         0x4e62_e420, // fcmeq v0.2d, v1.2d, v2.2d
         0x6e62_e420, // fcmge v0.2d, v1.2d, v2.2d
         0x6ee2_e420, // fcmgt v0.2d, v1.2d, v2.2d
@@ -1992,12 +2008,13 @@ fn run_profiled(
     (halt, ctx, table)
 }
 
-/// A scalar product, fused product or quotient whose result is zero because a factor or the
-/// dividend is zero stays native; an underflow to zero still falls back, and an inexact op with
+/// A scalar product, fused product, quotient or narrowing conversion whose result is zero because a
+/// factor, the dividend or the source is zero stays native; an underflow to zero still falls back, and an inexact op with
 /// FPSR.IXC clear is counted apart from it.
 #[test]
 fn zero_factor_products_stay_native() {
-    const PROGRAM: [u32; 9] = [
+    const PROGRAM: [u32; 10] = [
+        0x1e62_418e, // fcvt s14, d12
         0x1e22_0820, // fmul s0, s1, s2
         0x1f02_1023, // fmadd s3, s1, s2, s4
         0x1e22_1825, // fdiv s5, s1, s2
@@ -2087,7 +2104,9 @@ fn flush_to_zero_boundaries_match_the_interpreter() {
         0x1e22_4820, // fmax s0, s1, s2
         0x1e38_0020, // fcvtzs w0, s1
     ];
-    const S_VECTOR: [u32; 7] = [
+    const S_VECTOR: [u32; 9] = [
+        0x6ea1_f820, // fsqrt v0.4s, v1.4s
+        0x4e22_f420, // fmax v0.4s, v1.4s, v2.4s
         0x4e22_d420, // fadd v0.4s, v1.4s, v2.4s
         0x4ea2_d420, // fsub v0.4s, v1.4s, v2.4s
         0x6e22_d420, // faddp v0.4s, v1.4s, v2.4s
@@ -2096,7 +2115,8 @@ fn flush_to_zero_boundaries_match_the_interpreter() {
         0x4fa2_9820, // fmul v0.4s, v1.4s, v2.s[3]
         0x6e22_e420, // fcmge v0.4s, v1.4s, v2.4s
     ];
-    const D_VECTOR: [u32; 4] = [
+    const D_VECTOR: [u32; 5] = [
+        0x4ee2_f420, // fmin v0.2d, v1.2d, v2.2d
         0x4e62_d420, // fadd v0.2d, v1.2d, v2.2d
         0x6e62_dc20, // fmul v0.2d, v1.2d, v2.2d
         0x4e62_cc20, // fmla v0.2d, v1.2d, v2.2d
@@ -2145,7 +2165,10 @@ fn flush_to_zero_boundaries_match_the_interpreter() {
 /// even where a lane the instruction does not read holds a subnormal.
 #[test]
 fn flush_to_zero_stays_native_on_normal_inputs() {
-    const PROGRAM: [u32; 23] = [
+    const PROGRAM: [u32; 26] = [
+        0x6ea1_f8a0, // fsqrt v0.4s, v5.4s
+        0x4e22_f420, // fmax v0.4s, v1.4s, v2.4s
+        0x4ea2_c420, // fminnm v0.4s, v1.4s, v2.4s
         0x1e22_2820, // fadd s0, s1, s2
         0x1e22_3820, // fsub s0, s1, s2
         0x1e22_0820, // fmul s0, s1, s2
@@ -2182,6 +2205,7 @@ fn flush_to_zero_stays_native_on_normal_inputs() {
     ctx.v[2] = s([2.0, 0.75, -1.25, 8.0].map(f32::to_bits));
     ctx.v[3] = s([1.25f32.to_bits(), (-0.5f32).to_bits(), 1, 0x807f_ffff]);
     ctx.v[4] = s([3.0f32.to_bits(), 0x0000_0002, 0x8000_0003, 0x007f_ffff]);
+    ctx.v[5] = s([4.0, 2.25, 9.0, 0.5].map(f32::to_bits));
     let machines = &mut [
         ("interpreter", Machine::new(Backend::Interpreter)),
         ("jit", Machine::new(Backend::Jit(Passes::ALL))),
@@ -2282,6 +2306,67 @@ fn fp_selects_consume_fused_compares() {
             }
         }
     }
+}
+
+/// ZIP1/ZIP2, the bitwise selects, integer max/min, SADDW/UADDW and SSHLL/USHLL on every
+/// arrangement, with the destination aliasing a source, with and without SSE4.1. Every form but the
+/// max/min that need SSE4.1 runs natively without it.
+#[test]
+fn permutes_selects_and_widening_match_the_interpreter() {
+    let qs = [0u32, 1 << 30];
+    let zips = [0x0e00_3800u32, 0x0e00_7800]
+        .into_iter()
+        .flat_map(|w| (0..4u32).flat_map(move |size| qs.map(|q| w | q | size << 22)));
+    let zips = zips.filter(|w| w >> 30 & 1 == 1 || w >> 22 & 3 != 3);
+    let selects = (1..4u32).flat_map(|size| qs.map(|q| 0x2e20_1c00 | q | size << 22));
+    let extremes = [0x0e20_6400u32, 0x0e20_6c00, 0x2e20_6400, 0x2e20_6c00]
+        .into_iter()
+        .flat_map(|w| (0..3u32).flat_map(move |size| qs.map(|q| w | q | size << 22)));
+    let widening = [0x0e20_1000u32, 0x2e20_1000]
+        .into_iter()
+        .flat_map(|w| (0..3u32).flat_map(move |size| qs.map(|q| w | q | size << 22)));
+    let long = [0x0f00_a400u32, 0x2f00_a400].into_iter().flat_map(|w| {
+        (0..3u32).flat_map(move |size| {
+            let esize = 8 << size;
+            [0, 1, esize - 1]
+                .into_iter()
+                .flat_map(move |shift| qs.map(|q| w | q | (esize + shift) << 16))
+        })
+    });
+    let words: Vec<u32> = zips
+        .chain(selects)
+        .chain(extremes)
+        .chain(widening)
+        .chain(long)
+        .flat_map(|w| {
+            let rm = |r: u32| if w >> 24 & 1 == 0 { r << 16 } else { 0 };
+            [
+                w | rm(3) | 2 << 5 | 1,
+                w | rm(3) | 1 << 5 | 1,
+                w | rm(5) | 4 << 5 | 5,
+            ]
+        })
+        .collect();
+    assert!(words.iter().all(|&w| {
+        crate::interpreter::simd::execute(&mut ThreadContext::default(), w) == Some(Ok(()))
+    }));
+    let mut machines = vec![
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+        ("jit without sse4", Machine::new(Backend::NoSse4)),
+    ];
+    let mut rng = Rng(0x5eed_21b0_0f00);
+    let data = vec![0u8; DATA_SIZE as usize];
+    for _ in 0..100 {
+        let ctx = initial(&mut rng);
+        for &w in &words {
+            compare(&mut machines, &[w, BRK], &ctx, &data);
+        }
+    }
+    let sse2 = |w: &u32| w & 0x9f20_f400 != 0x0e20_6400 || w >> 22 & 3 == (w >> 29 & 1 ^ 1);
+    let program: Vec<u32> = words.iter().copied().filter(sse2).chain([BRK]).collect();
+    let table = run_profiled(&program, initial(&mut rng), true).2.unwrap();
+    assert!(!table.contains("CallSimd"), "{table}");
 }
 
 #[test]
