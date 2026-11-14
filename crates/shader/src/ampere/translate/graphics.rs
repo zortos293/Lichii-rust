@@ -1133,6 +1133,85 @@ mod tests {
     }
 
     #[test]
+    fn passthrough_geometry_carries_the_vertex_generics_to_the_fragment_stage() {
+        let (profile, host) = (Profile::default(), HostTranslateInfo::default());
+        let options = TranslateOptions {
+            profile: &profile,
+            host: &host,
+            resolution_scale: ResolutionScale::X1,
+        };
+        let declares = |spirv: &[u32], name: &str| {
+            let bytes: Vec<u8> = spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let name = format!("{name}\0");
+            bytes.windows(name.len()).any(|w| w == name.as_bytes())
+        };
+        let vertex = whole_program(
+            VertexB,
+            &[
+                ald(0x80, 4, ra(RZ) | rb(RZ)),
+                ast(0x70, 4, ra(RZ) | rb(0) | rc(RZ)),
+                ast(0xa0, 4, ra(RZ) | rb(0) | rc(RZ)),
+                exit(),
+            ],
+            &[
+                (0, 1 | (3 << 5) | (1 << 10)),
+                (6, 0xf),
+                (13, 0xf0 << 8),
+                (14, 0xf00),
+            ],
+        );
+        let runtime = RuntimeInfo {
+            previous_stage_stores: crate::info::VaryingState([u64::MAX; 8]),
+            ..RuntimeInfo::default()
+        };
+        let mut bindings = Bindings::default();
+        let vertex = crate::module::compile(&vertex, options, &runtime, &mut bindings).unwrap();
+        validate("passthrough_chain_vertex", &profile, &vertex.spirv);
+        assert!(vertex.info.stores.generic(2));
+        assert!(!vertex.info.stores.generic(5));
+
+        let geometry = whole_program(
+            Geometry,
+            &[exit()],
+            &[
+                (0, 1 | (3 << 5) | (4 << 10) | (1 << 24)),
+                (2, 1 << 24),
+                (3, 7 << 24),
+                (4, 3),
+            ],
+        );
+        let runtime = RuntimeInfo {
+            previous_stage_stores: vertex.info.stores,
+            input_topology: crate::runtime::InputTopology::Triangles,
+            ..RuntimeInfo::default()
+        };
+        let geometry = crate::module::compile(&geometry, options, &runtime, &mut bindings).unwrap();
+        validate("passthrough_chain_geometry", &profile, &geometry.spirv);
+        assert!(declares(&geometry.spirv, "in_attr2"));
+        assert!(!declares(&geometry.spirv, "in_attr5"));
+        assert!(geometry.info.stores.generic(2));
+
+        let fragment = whole_program(
+            Fragment,
+            &[
+                ipa_to(0, 40, 0),
+                ipa_to(1, 41, 0),
+                ipa_to(2, 42, 0),
+                ipa_to(3, 43, 0),
+                exit(),
+            ],
+            &[(0, 2 | (3 << 5) | (5 << 10)), (6, 0xaa << 16), (18, 0xf)],
+        );
+        let runtime = RuntimeInfo {
+            previous_stage_stores: geometry.info.stores,
+            ..RuntimeInfo::default()
+        };
+        let fragment = crate::module::compile(&fragment, options, &runtime, &mut bindings).unwrap();
+        validate("passthrough_chain_fragment", &profile, &fragment.spirv);
+        assert!(declares(&fragment.spirv, "in_attr2"));
+    }
+
+    #[test]
     fn vertex_program_copies_an_attribute_to_the_position() {
         let code = [
             ald(0x80, 4, ra(RZ) | rb(RZ)),
