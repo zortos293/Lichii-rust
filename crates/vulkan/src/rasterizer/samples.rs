@@ -11,6 +11,7 @@ use lichii_common::settings::ResolutionScale;
 
 use crate::device::Device;
 use crate::error::{Result, VkResultExt};
+use crate::scheduler::Scheduler;
 
 pub(super) const SLOTS: u64 = if cfg!(test) { 256 } else { 16 * 1024 };
 /// Slots reset by one command; a slot is taken only once every query of its block was read.
@@ -76,20 +77,21 @@ impl SampleCounter {
         unsafe { device.raw.destroy_query_pool(self.pool, None) };
     }
 
-    /// Takes the slot of the next counted draw, rendering at `scale`, recording a reset of its block into `cmd`
-    /// (outside any rendering) when the draw starts one. `None` when the block still holds
+    /// Takes the slot of the next counted draw, rendering at `scale`, recording a reset of its
+    /// block outside any rendering when the draw starts one. `None` when the block still holds
     /// queries no report has read; the draw then goes uncounted.
     pub(super) fn reserve(
         &mut self,
         device: &Device,
-        cmd: vk::CommandBuffer,
+        scheduler: &mut Scheduler,
         scale: ResolutionScale,
-    ) -> Option<u32> {
+    ) -> Result<Option<u32>> {
         let slot = (self.next % SLOTS) as u32;
         if self.next.is_multiple_of(BLOCK) {
             if self.next + BLOCK - self.released > SLOTS {
-                return None;
+                return Ok(None);
             }
+            let cmd = scheduler.record()?;
             // SAFETY: `cmd` is recording outside rendering, and the host read every query of
             // the block before releasing it.
             unsafe {
@@ -100,7 +102,7 @@ impl SampleCounter {
         }
         self.scales[slot as usize] = scale;
         self.next += 1;
-        Some(slot)
+        Ok(Some(slot))
     }
 
     /// Whether `slot` is the first of its block. A draw taking it queues a

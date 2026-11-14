@@ -113,7 +113,8 @@ impl Fixture {
         let cmd = self.scheduler.record().unwrap();
         let raw = self
             .cache
-            .prepare(cmd, id, ImageAccess::TRANSFER_SRC)
+            .prepare(&mut self.scheduler, id, ImageAccess::TRANSFER_SRC)
+            .unwrap()
             .expect("a live image");
         let regions: Vec<_> = subresources
             .iter()
@@ -163,7 +164,8 @@ impl Fixture {
         let cmd = self.scheduler.record().unwrap();
         let raw = self
             .cache
-            .prepare(cmd, id, ImageAccess::TRANSFER_SRC)
+            .prepare(&mut self.scheduler, id, ImageAccess::TRANSFER_SRC)
+            .unwrap()
             .expect("a live image");
         let region = vk::BufferImageCopy {
             image_subresource: vk::ImageSubresourceLayers {
@@ -1787,7 +1789,8 @@ fn images_over_the_texel_limit_are_sparse_and_bind_what_the_gpu_writes() {
     let cmd = f.scheduler.record().unwrap();
     let raw = f
         .cache
-        .prepare(cmd, found.id, ImageAccess::TRANSFER_SRC)
+        .prepare(&mut f.scheduler, found.id, ImageAccess::TRANSFER_SRC)
+        .unwrap()
         .unwrap();
     let region = vk::BufferImageCopy {
         image_subresource: vk::ImageSubresourceLayers {
@@ -1960,7 +1963,8 @@ fn sparse_images_take_the_layers_of_a_join_their_cap_admits() {
     let cmd = f.scheduler.record().unwrap();
     let raw = f
         .cache
-        .prepare(cmd, array.id, ImageAccess::TRANSFER_SRC)
+        .prepare(&mut f.scheduler, array.id, ImageAccess::TRANSFER_SRC)
+        .unwrap()
         .unwrap();
     let region = vk::BufferImageCopy {
         image_subresource: vk::ImageSubresourceLayers {

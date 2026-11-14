@@ -56,6 +56,7 @@ use crate::pipeline::{
     AttachmentState, ComputePipelineKey, FixedStateTracker, FxBuildHasher, GraphicsPipelineKey,
     GraphicsShaders, PipelineCache, PipelineFeatures,
 };
+use crate::scheduler::RenderingKey;
 use crate::texture_cache::{DEPTH_ATTACHMENT, ImageId, ImageInfo, Transfer, ViewInfo};
 
 const NULL_BUFFER_SIZE: u64 = 64 << 10;
@@ -208,6 +209,8 @@ pub(super) struct DrawState {
     vertex_bindings: Vec<vk::VertexInputBindingDescription2EXT<'static>>,
     vertex_attributes: Vec<vk::VertexInputAttributeDescription2EXT<'static>>,
     attachments: Vec<vk::RenderingAttachmentInfo<'static>>,
+    /// The graphics pipeline the open rendering last bound.
+    bound_pipeline: vk::Pipeline,
     blend_enables: Vec<vk::Bool32>,
     blend_equations: Vec<vk::ColorBlendEquationEXT>,
     write_masks: Vec<vk::ColorComponentFlags>,
@@ -309,6 +312,7 @@ impl DrawState {
             vertex_bindings: Vec::new(),
             vertex_attributes: Vec::new(),
             attachments: Vec::new(),
+            bound_pipeline: vk::Pipeline::null(),
             blend_enables: Vec::new(),
             blend_equations: Vec::new(),
             write_masks: Vec::new(),
@@ -780,39 +784,36 @@ impl VulkanRasterizer {
             .as_ref()
             .is_some_and(|m| m.stage == ShaderStage::Task);
         let mesh_limit = self.device.properties.mesh_group_limit[usize::from(task)];
-        let cmd = self.scheduler.record()?;
         let (index, indirect) = match (call, indirect) {
             (DrawCall::Indirect(draw), Some(inputs)) if mesh => {
+                let cmd = self.scheduler.record()?;
                 let commands = self.rewrite_mesh_indirect(cmd, draw, &inputs, mesh_limit)?;
                 (None, Some(commands))
             }
             (DrawCall::Indirect(draw), Some(inputs))
                 if assembled_topology(draw.topology) != draw.topology =>
             {
+                let cmd = self.scheduler.record()?;
                 let (index, commands) = self.assemble_indirect(cmd, regs, draw, &inputs)?;
                 (Some(index), Some(commands))
             }
             (_, indirect) => (index, indirect),
         };
-        let draw = &mut self.draw;
-        for target in draw.colors.iter().flatten() {
+        for &id in &self.draw.textures {
             self.texture_cache
-                .prepare(cmd, target.id, ImageAccess::COLOR_ATTACHMENT);
+                .prepare(&mut self.scheduler, id, SHADER_SAMPLED)?;
         }
-        if let Some(depth) = draw.depth {
-            self.texture_cache.prepare(cmd, depth.id, DEPTH_ATTACHMENT);
-        }
-        for &id in &draw.textures {
-            self.texture_cache.prepare(cmd, id, SHADER_SAMPLED);
-        }
-        for &(id, _) in &draw.storage_images {
-            self.texture_cache.prepare(cmd, id, SHADER_STORAGE);
+        for &(id, _) in &self.draw.storage_images {
+            self.texture_cache
+                .prepare(&mut self.scheduler, id, SHADER_STORAGE)?;
         }
         let scale = self.target_scale();
         let query = match regs.zpass_pixel_count_enable {
             0 => None,
             _ => {
-                let slot = self.samples.reserve(&self.device, cmd, scale);
+                let slot = self
+                    .samples
+                    .reserve(&self.device, &mut self.scheduler, scale)?;
                 match slot {
                     None => self.draw.warn_once(
                         Warning::SampleQueries,
@@ -828,6 +829,36 @@ impl VulkanRasterizer {
             }
         };
         let extent = self.render_area(regs);
+        let key = RenderingKey {
+            colors: self
+                .draw
+                .colors
+                .map(|t| t.map_or(vk::ImageView::null(), |t| t.view)),
+            depth: self.draw.depth.map_or(vk::ImageView::null(), |d| d.view),
+            extent,
+        };
+        let continues = self.scheduler.rendering() == Some(key)
+            && self.draw.colors.iter().flatten().all(|t| {
+                self.texture_cache
+                    .is_in(t.id, ImageAccess::COLOR_ATTACHMENT)
+            })
+            && self
+                .draw
+                .depth
+                .is_none_or(|d| self.texture_cache.is_in(d.id, DEPTH_ATTACHMENT));
+        if !continues {
+            for target in self.draw.colors.iter().flatten() {
+                self.texture_cache.prepare(
+                    &mut self.scheduler,
+                    target.id,
+                    ImageAccess::COLOR_ATTACHMENT,
+                )?;
+            }
+            if let Some(depth) = self.draw.depth {
+                self.texture_cache
+                    .prepare(&mut self.scheduler, depth.id, DEPTH_ATTACHMENT)?;
+            }
+        }
         let raw = &self.device.raw;
         let draw = &mut self.draw;
         draw.attachments.clear();
@@ -874,15 +905,18 @@ impl VulkanRasterizer {
         if let Some(stencil) = depth_attachment.as_ref().filter(|_| has_stencil) {
             rendering = rendering.stencil_attachment(stencil);
         }
-        // SAFETY: `cmd` is recording outside any rendering; every view, buffer and descriptor
-        // set is live until the scheduler's current tick completes, and the pipeline was built
-        // for these attachment formats.
+        let (cmd, began) = self.scheduler.record_rendering(key, &rendering)?;
+        // SAFETY: `cmd` is recording inside the rendering of this draw's attachments; every
+        // view, buffer and descriptor set is live until the scheduler's current tick completes,
+        // and the pipeline was built for these attachment formats.
         unsafe {
-            raw.cmd_begin_rendering(cmd, &rendering);
             if let Some(slot) = query {
                 self.samples.begin(&self.device, cmd, slot);
             }
-            raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline_raw);
+            if began || draw.bound_pipeline != pipeline_raw {
+                raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline_raw);
+                draw.bound_pipeline = pipeline_raw;
+            }
             if let Some(set) = set {
                 raw.cmd_bind_descriptor_sets(
                     cmd,
@@ -1007,7 +1041,6 @@ impl VulkanRasterizer {
             if let Some(slot) = query {
                 self.samples.end(&self.device, cmd, slot);
             }
-            raw.cmd_end_rendering(cmd);
         }
         let written: [Option<ImageId>; 9] = std::array::from_fn(|i| match i {
             8 => draw.depth.map(|t| t.id),
@@ -2411,10 +2444,12 @@ impl VulkanRasterizer {
             None => None,
         };
         for &id in &self.draw.textures {
-            self.texture_cache.prepare(cmd, id, SHADER_SAMPLED);
+            self.texture_cache
+                .prepare(&mut self.scheduler, id, SHADER_SAMPLED)?;
         }
         for &(id, _) in &self.draw.storage_images {
-            self.texture_cache.prepare(cmd, id, SHADER_STORAGE);
+            self.texture_cache
+                .prepare(&mut self.scheduler, id, SHADER_STORAGE)?;
         }
         let raw = &self.device.raw;
         let [x, y, z] = ctx.grid;
