@@ -293,7 +293,7 @@ impl VulkanRasterizer {
             Ok(d) => {
                 let _ = write!(
                     s,
-                    " {:?} {}x{}x{} lv={} res={}..{} sw={:?} srgb={} {:?} {:?} ms={:?} norm={}",
+                    " {:?} {}x{}x{} lv={} res={}..{} base_layer={} sw={:?} srgb={} {:?} {:?} ms={:?} norm={}",
                     d.format,
                     d.width,
                     d.height,
@@ -301,6 +301,7 @@ impl VulkanRasterizer {
                     d.levels,
                     d.min_level,
                     d.max_level,
+                    d.base_layer,
                     d.swizzle,
                     d.srgb,
                     d.texture_type,
