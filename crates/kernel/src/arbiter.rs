@@ -424,7 +424,9 @@ impl Arbiter {
         Self::release_mutex(&mut shard, thread, pid, addr)
     }
 
-    /// `svcWaitProcessWideKeyAtomic`: releases the mutex at `addr` and waits on `key`.
+    /// `svcWaitProcessWideKeyAtomic`: releases the mutex at `addr` and waits on `key`. The
+    /// key word is set before the mutex is released: the guest signals only when it reads a
+    /// waiter flag there, so a thread that takes the mutex in between must already see it.
     pub fn wait_condvar(
         &self,
         thread: &Arc<Thread>,
@@ -457,14 +459,6 @@ impl Arbiter {
                 Some(&mut *lock_first),
             )
         };
-        if let Err(code) = Self::release_mutex(mutex_shard, thread, pid, addr) {
-            thread.cancel_wait(token);
-            return Err(code);
-        }
-        if timeout_zero {
-            thread.cancel_wait(token);
-            return Ok(WaitOutcome::Done(result::TIMED_OUT));
-        }
         let key_word = match guest_word::<AtomicU32>(memory, key, true) {
             Ok(word) => word,
             Err(code) => {
@@ -473,6 +467,14 @@ impl Arbiter {
             }
         };
         key_word.store(1, Ordering::SeqCst);
+        if let Err(code) = Self::release_mutex(mutex_shard, thread, pid, addr) {
+            thread.cancel_wait(token);
+            return Err(code);
+        }
+        if timeout_zero {
+            thread.cancel_wait(token);
+            return Ok(WaitOutcome::Done(result::TIMED_OUT));
+        }
         let shard = key_shard.unwrap_or(mutex_shard);
         shard.condvar.retain(Waiter::is_live);
         shard.condvar.push(Waiter {

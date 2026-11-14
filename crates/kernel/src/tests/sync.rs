@@ -785,3 +785,77 @@ fn the_thread_log_names_the_objects_a_thread_waits_on() {
             .is_empty()
     );
 }
+
+/// The guest's condition variable signals only when the key word says a thread waits on it, so
+/// a waiter must raise that flag before it lets go of the mutex. W waits on the condvar each
+/// round; S takes the mutex the moment W's wait releases it, sets the predicate, unlocks, and
+/// signals only if the key word is set. Raising the flag after the unlock lets S see 0 in that
+/// window and skip the signal, and W sleeps forever.
+#[test]
+fn a_condvar_waiter_flags_the_key_before_it_releases_the_mutex() {
+    const ROUNDS: u64 = 3000;
+    const TAG_W: u32 = 0x1234;
+    const TAG_S: u32 = 0x5678;
+    let test = TestKernel::new(ConsoleGeneration::Switch2);
+    let heap = heap_base(&test);
+    let (mutex, key, predicate, round) =
+        (heap + 0x3000, heap + 0x3004, heap + 0x3008, heap + 0x300c);
+    let w = test.program(
+        Script::new()
+            .then(|ctx, _| ctx.x[20] = 1)
+            .spin_until(move |_, env| {
+                word(env, mutex)
+                    .compare_exchange(0, TAG_W, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            })
+            .then(move |ctx, env| word(env, round).store(ctx.x[20] as u32, Ordering::SeqCst))
+            .jump_if(6, move |ctx, env| {
+                u64::from(word(env, predicate).load(Ordering::SeqCst)) >= ctx.x[20]
+            })
+            .svc(0x1c, move |ctx, _| {
+                ctx.x[0] = mutex;
+                ctx.x[1] = key;
+                ctx.x[2] = u64::from(TAG_W);
+                ctx.x[3] = u64::MAX;
+            })
+            .jump_if(3, |ctx, _| {
+                assert_eq!(ctx.x[0] as u32, 0, "WaitProcessWideKeyAtomic failed");
+                true
+            })
+            .then(move |_, env| {
+                assert_eq!(word(env, mutex).swap(0, Ordering::SeqCst), TAG_W);
+            })
+            .then(|ctx, _| ctx.x[20] += 1)
+            .jump_if(1, |ctx, _| ctx.x[20] <= ROUNDS)
+            .exit(),
+    );
+    let s = test.program(
+        Script::new()
+            .then(|ctx, _| ctx.x[20] = 1)
+            .spin_until(move |ctx, env| {
+                u64::from(word(env, round).load(Ordering::SeqCst)) == ctx.x[20]
+            })
+            .spin_until(move |_, env| {
+                word(env, mutex)
+                    .compare_exchange(0, TAG_S, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            })
+            .then(move |ctx, env| {
+                word(env, predicate).store(ctx.x[20] as u32, Ordering::SeqCst);
+                word(env, mutex).store(0, Ordering::SeqCst);
+                ctx.x[21] = u64::from(word(env, key).load(Ordering::SeqCst));
+            })
+            .jump_if(6, |ctx, _| ctx.x[21] == 0)
+            .svc(0x1d, move |ctx, _| {
+                ctx.x[0] = key;
+                ctx.x[1] = 1;
+            })
+            .then(|ctx, _| ctx.x[20] += 1)
+            .jump_if(1, |ctx, _| ctx.x[20] <= ROUNDS)
+            .exit(),
+    );
+    let main =
+        test.program(spawn_and_join_entries(heap, vec![w, s], vec![(44, 1), (44, 2)]).exit());
+    test.start(test.image(), main);
+    test.run_until_exit(Duration::from_secs(20));
+}
