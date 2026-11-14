@@ -1400,6 +1400,7 @@ impl<'a> EmitContext<'a> {
         if loads.any_component(Attribute::POSITION_X)
             || info.passthrough.any_component(Attribute::POSITION_X)
             || unscales_noperspective
+            || (is_fragment && info.uses_interpolate_at_offset)
         {
             if !is_fragment && profile.has_broken_spirv_position_input {
                 self.need_input_position_indirect = true;

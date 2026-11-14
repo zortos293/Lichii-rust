@@ -476,7 +476,7 @@ impl Machine {
         let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
         self.mem.write_bytes(CODE, &bytes).unwrap();
         self.mem.write_bytes(DATA, data).unwrap();
-        self.core.clear_code_cache();
+        self.core.invalidate_code(CODE, CODE_SIZE);
         let mut ctx = ctx.clone();
         let halt = self.core.run(&mut ctx);
         let mut data = vec![0; (DATA_SIZE + 0x1000) as usize];
@@ -1725,7 +1725,7 @@ fn counter_reads_follow_the_tsc_scale() {
             accuracy: CpuAccuracy::Auto,
         })
         .unwrap();
-        assert!(jit.target.tsc_scale.is_some());
+        assert!(jit.target.tsc_scale);
         let mut ctx = ThreadContext {
             pc: CODE,
             ..Default::default()
@@ -2536,4 +2536,252 @@ fn stores_to_gpu_cached_pages_land_and_are_reported() {
             );
         }
     }
+}
+
+fn shared_cores(n: usize) -> (Arc<AddressSpace>, Vec<Jit>) {
+    let physical = Arc::new(PhysicalMemory::new(1 << 20).unwrap());
+    let mem = Arc::new(AddressSpace::with_fastmem(physical, 39).unwrap());
+    mem.map(CODE, 0, CODE_SIZE, MemoryPermission::READ_EXECUTE);
+    mem.map(DATA, 0x10000, DATA_SIZE, MemoryPermission::READ_WRITE);
+    let monitor = Arc::new(ExclusiveMonitor::new(n));
+    let cores = (0..n)
+        .map(|core_index| {
+            Jit::new(CpuConfig {
+                memory: mem.clone(),
+                monitor: monitor.clone(),
+                clock: Arc::new(Clock::default()),
+                core_index,
+                ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
+                dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+                accuracy: CpuAccuracy::Auto,
+            })
+            .unwrap()
+        })
+        .collect();
+    (mem, cores)
+}
+
+#[test]
+fn cores_of_one_process_share_translated_blocks() {
+    const MOV_X0_7: u32 = 0xd280_00e0;
+    const B_PLUS_8: u32 = 0x1400_0002;
+    let (mem, mut cores) = shared_cores(2);
+    for (i, word) in [MOV_X0_7, B_PLUS_8, BRK, BRK].into_iter().enumerate() {
+        mem.write(CODE + 4 * i as u64, word).unwrap();
+    }
+    let run = |core: &mut Jit| {
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            ..Default::default()
+        };
+        assert_eq!(core.run(&mut ctx), HaltReason::Breakpoint(0));
+        ctx.x[0]
+    };
+    assert_eq!(run(&mut cores[0]), 7);
+    let translated = cores[0].cache.shared_blocks();
+    assert!(translated > 0);
+    for core in &mut cores {
+        assert_eq!(run(core), 7);
+    }
+    assert_eq!(cores[1].cache.shared_blocks(), translated);
+}
+
+#[test]
+fn invalidation_on_one_core_reaches_every_core_and_its_links() {
+    const MOV_X0_1: u32 = 0xd280_0020;
+    const MOV_X0_2: u32 = 0xd280_0040;
+    const B_PLUS_8: u32 = 0x1400_0002;
+    let (mem, mut cores) = shared_cores(2);
+    let target = CODE + 0x100;
+    mem.write(CODE, B_PLUS_8).unwrap();
+    mem.write(CODE + 8, 0x1400_0000 | ((target - CODE - 8) / 4) as u32)
+        .unwrap();
+    mem.write(target, MOV_X0_1).unwrap();
+    mem.write(target + 4, BRK).unwrap();
+    let run = |core: &mut Jit| {
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            ..Default::default()
+        };
+        assert_eq!(core.run(&mut ctx), HaltReason::Breakpoint(0));
+        ctx.x[0]
+    };
+    for _ in 0..3 {
+        for core in &mut cores {
+            assert_eq!(run(core), 1);
+        }
+    }
+    mem.write(target, MOV_X0_2).unwrap();
+    cores[1].invalidate_code(target, 4);
+    assert_eq!(run(&mut cores[1]), 2);
+    cores[0].invalidate_code(target, 4);
+    for _ in 0..3 {
+        for core in &mut cores {
+            assert_eq!(run(core), 2);
+        }
+    }
+}
+
+#[test]
+fn cores_run_while_another_clears_the_shared_code() {
+    const THREADS: usize = 4;
+    let mut rng = Rng(0x5eed_1234_abcd_9876);
+    let streams: Vec<Vec<u32>> = (0..8)
+        .map(|_| {
+            let len = 8 + rng.below(32) as usize;
+            (0..len)
+                .map(|i| match rng.below(8) {
+                    0 => simd(&mut rng),
+                    1 => vector(&mut rng),
+                    2 => {
+                        let to = i + 1 + rng.below((len - i) as u64) as usize;
+                        branch(&mut rng, i, to)
+                    }
+                    _ => alu(&mut rng),
+                })
+                .chain([BRK])
+                .collect()
+        })
+        .collect();
+    let (mem, cores) = shared_cores(THREADS);
+    let mut reference = Machine::new(Backend::Interpreter);
+    let slot = |i: usize| CODE + 0x400 * i as u64;
+    let mut expected = Vec::new();
+    for (i, code) in streams.iter().enumerate() {
+        let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+        mem.write_bytes(slot(i), &bytes).unwrap();
+        reference.mem.write_bytes(slot(i), &bytes).unwrap();
+        let mut ctx = ThreadContext {
+            pc: slot(i),
+            sp: DATA + 0x4000,
+            ..Default::default()
+        };
+        let halt = reference.core.run(&mut ctx);
+        expected.push((halt, ctx.x));
+    }
+    std::thread::scope(|scope| {
+        for (t, mut core) in cores.into_iter().enumerate() {
+            let (streams, expected) = (&streams, &expected);
+            scope.spawn(move || {
+                for round in 0..3000 {
+                    let i = (round + t) % streams.len();
+                    let (want_halt, want_x) = &expected[i];
+                    if *want_halt != HaltReason::Breakpoint(0) {
+                        continue;
+                    }
+                    let mut ctx = ThreadContext {
+                        pc: slot(i),
+                        sp: DATA + 0x4000,
+                        ..Default::default()
+                    };
+                    let mut halt = core.run(&mut ctx);
+                    while let HaltReason::InvalidateCode { .. } = halt {
+                        halt = core.run(&mut ctx);
+                    }
+                    assert_eq!(halt, HaltReason::Breakpoint(0));
+                    assert_eq!(ctx.x, *want_x, "stream {i} on core {t}");
+                    if t == 0 && round % 10 == 0 {
+                        core.clear_code_cache();
+                    }
+                }
+            });
+        }
+    });
+}
+
+fn core_on(
+    mem: &Arc<AddressSpace>,
+    core_index: usize,
+    clock: Arc<dyn GuestClock>,
+    ctr_el0: u32,
+) -> Jit {
+    Jit::new(CpuConfig {
+        memory: mem.clone(),
+        monitor: Arc::new(ExclusiveMonitor::new(core_index + 1)),
+        clock,
+        core_index,
+        ctr_el0,
+        dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+        accuracy: CpuAccuracy::Auto,
+    })
+    .unwrap()
+}
+
+fn run_to_brk(core: &mut Jit) -> [u64; 31] {
+    let mut ctx = ThreadContext {
+        pc: CODE,
+        ..Default::default()
+    };
+    assert_eq!(core.run(&mut ctx), HaltReason::Breakpoint(0));
+    ctx.x
+}
+
+#[test]
+fn a_translation_that_raced_an_invalidation_is_not_shared() {
+    const MOV_X0_1: u32 = 0xd280_0020;
+    const MOV_X0_2: u32 = 0xd280_0040;
+    let (mem, mut cores) = shared_cores(2);
+    mem.write(CODE, MOV_X0_1).unwrap();
+    mem.write(CODE + 4, BRK).unwrap();
+    let seen = cores[0].cache.invalidations();
+    mem.write(CODE, MOV_X0_2).unwrap();
+    cores[1].invalidate_code(CODE, 4);
+    let stale = Err(decode(MOV_X0_1));
+    assert!(cores[0].cache.insert(CODE, 4, stale, seen).is_none());
+    assert_eq!(cores[0].cache.shared_blocks(), 0);
+    for core in &mut cores {
+        assert_eq!(run_to_brk(core)[0], 2);
+    }
+}
+
+struct Configured(u64);
+
+impl GuestClock for Configured {
+    fn ticks(&self) -> u64 {
+        0
+    }
+
+    fn frequency(&self) -> u64 {
+        self.0
+    }
+}
+
+#[test]
+fn cores_with_other_clocks_or_registers_do_not_share_blocks() {
+    const MRS_X0_CNTFRQ: u32 = 0xd53b_e000;
+    const MRS_X1_CTR: u32 = 0xd53b_0021;
+    let (mem, _) = shared_cores(0);
+    for (i, word) in [MRS_X0_CNTFRQ, MRS_X1_CTR, BRK].into_iter().enumerate() {
+        mem.write(CODE + 4 * i as u64, word).unwrap();
+    }
+    let ctr = CpuConfig::DEFAULT_CTR_EL0;
+    let mut cores = [
+        core_on(&mem, 0, Arc::new(Configured(19_200_000)), ctr),
+        core_on(&mem, 1, Arc::new(Configured(1_000_000)), ctr),
+        core_on(&mem, 2, Arc::new(Configured(19_200_000)), ctr ^ 1),
+    ];
+    let expected = [(19_200_000, ctr), (1_000_000, ctr), (19_200_000, ctr ^ 1)];
+    for (core, (frequency, ctr)) in cores.iter_mut().zip(expected) {
+        let x = run_to_brk(core);
+        assert_eq!((x[0], x[1]), (frequency, u64::from(ctr)));
+        assert_eq!(core.cache.adopted(), 0);
+    }
+}
+
+#[test]
+fn cores_sharing_code_read_their_own_tsc_scale() {
+    const MRS_X0_CNTVCT: u32 = 0xd53b_e040;
+    let (mem, _) = shared_cores(0);
+    mem.write(CODE, MRS_X0_CNTVCT).unwrap();
+    mem.write(CODE + 4, BRK).unwrap();
+    let ctr = CpuConfig::DEFAULT_CTR_EL0;
+    let mut cores = [12345, 67890]
+        .map(|offset| Arc::new(TscClock(TscScale::new(0, 0, offset))))
+        .into_iter()
+        .enumerate()
+        .map(|(i, clock)| core_on(&mem, i, clock, ctr))
+        .collect::<Vec<_>>();
+    assert_eq!(run_to_brk(&mut cores[0])[0], 12345);
+    assert_eq!(run_to_brk(&mut cores[1])[0], 67890);
+    assert!(cores[1].cache.adopted() > 0);
 }

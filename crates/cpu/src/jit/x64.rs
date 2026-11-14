@@ -75,8 +75,9 @@ pub(super) struct Target {
     pub simd: usize,
     /// What the slow paths of native SIMD/FP ops call: `simd::call`, or a wrapper that counts them.
     pub simd_slow: usize,
-    /// The clock's `TscScale`, which counter reads use inline instead of calling `ticks`.
-    pub tsc_scale: Option<*const TscScale>,
+    /// The clock has a `TscScale`, which counter reads use inline through `JitState` instead of
+    /// calling `ticks`.
+    pub tsc_scale: bool,
     /// The host has `cmpxchg16b`.
     pub cmpxchg16b: bool,
     /// The host has FMA3, which the fused multiply-adds need.
@@ -144,6 +145,7 @@ const TSC_SHIFT: i32 = offset_of!(TscScale, shift) as i32;
 const TSC_OFFSET: i32 = offset_of!(TscScale, offset) as i32;
 const ST_HIGH: i32 = ctx(offset_of!(JitState, high));
 const ST_COUNTER_FLOOR: i32 = ctx(offset_of!(JitState, counter_floor));
+const ST_TSC_SCALE: i32 = ctx(offset_of!(JitState, tsc_scale));
 const ST_CX16_SAVE: i32 = ctx(offset_of!(JitState, cx16_save));
 const ST_SAVE_XMM: i32 = ctx(offset_of!(JitState, save_xmm));
 const ST_SPILL: i32 = ctx(offset_of!(JitState, spill));
@@ -902,28 +904,26 @@ impl Emitter<'_> {
                     ; mov Rd(d), eax
                 );
             }
-            Op::Ticks => match self.target.tsc_scale {
-                Some(scale) => {
-                    let d = self.def(v);
-                    dynasm!(self.asm
-                        ; .arch x64
-                        ; rdtsc
-                        ; shl rdx, 32
-                        ; or rax, rdx
-                        ; mov rcx, QWORD scale as i64
-                        ; mul QWORD [rcx + TSC_MUL]
-                        ; mov rcx, QWORD [rcx + TSC_SHIFT]
-                        ; shrd rax, rdx, cl
-                        ; mov rcx, QWORD scale as i64
-                        ; add rax, QWORD [rcx + TSC_OFFSET]
-                        ; cmp rax, QWORD [r13 + ST_COUNTER_FLOOR]
-                        ; cmovb rax, QWORD [r13 + ST_COUNTER_FLOOR]
-                        ; mov QWORD [r13 + ST_COUNTER_FLOOR], rax
-                        ; mov Rq(d), rax
-                    );
-                }
-                None => self.call(i, self.target.ticks),
-            },
+            Op::Ticks if self.target.tsc_scale => {
+                let d = self.def(v);
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; rdtsc
+                    ; shl rdx, 32
+                    ; or rax, rdx
+                    ; mov rcx, QWORD [r13 + ST_TSC_SCALE]
+                    ; mul QWORD [rcx + TSC_MUL]
+                    ; mov rcx, QWORD [rcx + TSC_SHIFT]
+                    ; shrd rax, rdx, cl
+                    ; mov rcx, QWORD [r13 + ST_TSC_SCALE]
+                    ; add rax, QWORD [rcx + TSC_OFFSET]
+                    ; cmp rax, QWORD [r13 + ST_COUNTER_FLOOR]
+                    ; cmovb rax, QWORD [r13 + ST_COUNTER_FLOOR]
+                    ; mov QWORD [r13 + ST_COUNTER_FLOOR], rax
+                    ; mov Rq(d), rax
+                );
+            }
+            Op::Ticks => self.call(i, self.target.ticks),
             Op::High => {
                 let d = self.def(v);
                 dynasm!(self.asm ; .arch x64 ; mov Rq(d), QWORD [r13 + ST_HIGH]);
@@ -1603,9 +1603,17 @@ impl Emitter<'_> {
     /// A linkable exit to `target`: a `jmp rel32` that starts out jumping to the code right after
     /// it, which leaves to the dispatcher with the jump's address in `JitState::link`. Linking
     /// points the `jmp` at the target block; unlinking sets its offset back to zero.
+    /// Blocks start 16-byte aligned and the offset never crosses a 16-byte boundary, so it sits
+    /// in one cache line and another core can repoint it with one store while running the block.
     fn link(&mut self, target: u64) {
         let site = self.asm.new_dynamic_label();
         let unlinked = self.asm.new_dynamic_label();
+        match self.asm.offset().0 % 16 {
+            12 => dynasm!(self.asm ; .arch x64 ; .bytes [0x0f, 0x1f, 0x00]),
+            13 => dynasm!(self.asm ; .arch x64 ; .bytes [0x66, 0x90]),
+            14 => dynasm!(self.asm ; .arch x64 ; nop),
+            _ => {}
+        }
         dynasm!(self.asm
             ; .arch x64
             ; =>site
