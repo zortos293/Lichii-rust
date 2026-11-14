@@ -293,12 +293,27 @@ impl System {
         if self.state == State::Stopped {
             return;
         }
+        self.let_the_title_exit();
         self.kernel.pause();
         noting_slow("stopping the GPU", || self.gpu.shutdown());
         self.audio.set_paused(true);
         noting_slow("stopping the kernel", || self.kernel.shutdown());
         self.state = State::Stopped;
         tracing::info!("stopped");
+    }
+
+    /// Sends a running title that holds the exit lock the exit request and waits up to
+    /// `system.exit_timeout_ms` for it to save and exit; past that, [`System::stop`] stops it.
+    fn let_the_title_exit(&self) {
+        let timeout = Duration::from_millis(self.settings.system.exit_timeout_ms.into());
+        if timeout.is_zero() || self.state != State::Running || !self.services.request_exit() {
+            return;
+        }
+        let started = Instant::now();
+        match self.exit.wait(Some(timeout)) {
+            Some(_) => tracing::info!(took = ?started.elapsed(), "the title exited on request"),
+            None => tracing::warn!(?timeout, "the title did not exit on request; stopping it"),
+        }
     }
 
     /// Whether the session is paused.

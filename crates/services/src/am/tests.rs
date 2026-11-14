@@ -2,6 +2,7 @@ use lichii_common::ResultCode;
 use lichii_common::settings::Settings;
 use lichii_kernel::ipc::{Handle, UNKNOWN_COMMAND_ID};
 use lichii_kernel::object::KObject;
+use lichii_kernel::process::ProcessState;
 use lichii_kernel::testing::{IpcClient, Reply, Request};
 
 use super::*;
@@ -75,6 +76,44 @@ fn first_message_is_focus_state_changed_and_the_event_follows_the_queue() {
     assert_eq!(
         reply.pop::<u32>(),
         AppletMessage::StartupLogoDisappeared as u32
+    );
+}
+
+#[test]
+fn the_exit_request_reaches_a_title_only_while_it_holds_the_exit_lock() {
+    let (context, client, proxy) = booted(SWITCH1_TITLE);
+    let state = interface(&client, proxy, 0);
+    client.send(state, &Request::new(1)).unwrap();
+    assert!(!context.request_exit(), "no exit lock");
+    assert_eq!(
+        client.send(state, &Request::new(1)).unwrap().result,
+        NO_MESSAGES
+    );
+
+    let (context, client, proxy) = booted(SWITCH1_TITLE);
+    let state = interface(&client, proxy, 0);
+    let controller = interface(&client, proxy, 1);
+    client.send(state, &Request::new(1)).unwrap();
+    client.send(controller, &Request::new(1)).unwrap();
+    client.send(controller, &Request::new(2)).unwrap();
+    assert!(!context.request_exit(), "unlocked again");
+
+    let (context, client, proxy) = booted(SWITCH1_TITLE);
+    let state = interface(&client, proxy, 0);
+    let controller = interface(&client, proxy, 1);
+    client.send(state, &Request::new(1)).unwrap();
+    client.send(controller, &Request::new(1)).unwrap();
+    assert!(context.request_exit());
+    let mut reply = client.send(state, &Request::new(1)).unwrap();
+    assert_eq!(reply.pop::<u32>(), AppletMessage::Exit as u32);
+    assert_ne!(context.process.state(), ProcessState::Exiting);
+    client.send(controller, &Request::new(2)).unwrap();
+    assert!(
+        matches!(
+            context.process.state(),
+            ProcessState::Exiting | ProcessState::Exited
+        ),
+        "UnlockExit after the request terminates the title"
     );
 }
 

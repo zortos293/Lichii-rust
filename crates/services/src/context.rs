@@ -106,6 +106,12 @@ pub struct ServiceContext {
 }
 
 impl ServiceContext {
+    /// Asks the title to exit before the session stops. True when it holds the exit lock and got
+    /// the exit message, so it should save and exit by itself.
+    pub fn request_exit(&self) -> bool {
+        self.am.get().is_some_and(|applet| applet.request_exit())
+    }
+
     /// Builds the shared state. `core::System` calls this once per boot, after creating the
     /// title's process, and passes the result to [`crate::register_all`].
     pub fn new(parts: ServiceParts) -> Arc<Self> {

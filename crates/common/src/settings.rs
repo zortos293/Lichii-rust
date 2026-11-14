@@ -274,6 +274,9 @@ pub struct SystemSettings {
     pub network_enabled: bool,
     /// Refuse services a title's NPDM does not list. When false, sm only logs them.
     pub enforce_service_access: bool,
+    /// How long closing waits, in milliseconds, for a title that holds the exit lock
+    /// (`LockExit`) to save and exit after it gets the exit request; 0 stops it at once.
+    pub exit_timeout_ms: u32,
 }
 
 /// The [`SystemSettings::time_zone`] value that follows the host's time zone.
@@ -292,6 +295,7 @@ impl Default for SystemSettings {
             time_zone: TIME_ZONE_AUTO.into(),
             network_enabled: false,
             enforce_service_access: false,
+            exit_timeout_ms: 2000,
         }
     }
 }

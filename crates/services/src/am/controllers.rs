@@ -187,6 +187,13 @@ impl Service for SelfController {
                 self.context.kernel.terminate_process(&self.context.process);
                 ResultCode::SUCCESS
             }
+            1 | 2 => {
+                if !applet.set_exit_locked(ctx.command() == 1) {
+                    tracing::info!("application exits after the exit request");
+                    self.context.kernel.terminate_process(&self.context.process);
+                }
+                ResultCode::SUCCESS
+            }
             3 => {
                 applet.state.lock().fatal_sections += 1;
                 ResultCode::SUCCESS
@@ -208,7 +215,7 @@ impl Service for SelfController {
                 applet.set_focus_notification(notify);
                 ResultCode::SUCCESS
             }
-            1 | 2 | 10..=12 | 14..=16 | 19 | 50 | 51 | 60 | 61 | 65 | 72 | 100 | 120 | 130 => {
+            10..=12 | 14..=16 | 19 | 50 | 51 | 60 | 61 | 65 | 72 | 100 | 120 | 130 => {
                 ResultCode::SUCCESS
             }
             62 => {

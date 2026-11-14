@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use lichii_kernel::ipc::Handle;
+use lichii_kernel::testing::{IpcClient, Request};
+
 use super::*;
 
 const SVC_OUTPUT_DEBUG_STRING: u32 = 0xd400_04e1;
@@ -146,4 +149,81 @@ fn audio_volume_reaches_the_services_sink() {
     audio.muted = true;
     system.set_audio_volume(&audio);
     assert_eq!(system.audio().host_volume(), 0.0);
+}
+
+fn exit_lock_system(exit_timeout_ms: u32) -> (System, TempFile) {
+    let file = TempFile::new(
+        &format!("exit-lock-{exit_timeout_ms}.nso"),
+        &nso(&[0x14000000u32.to_le_bytes(), [0; 4]].concat()),
+    );
+    let mut settings = (*settings(ConsoleGeneration::Switch1)).clone();
+    settings.system.exit_timeout_ms = exit_timeout_ms;
+    let mut system = System::boot(Arc::new(settings), &file.0, Host::headless()).unwrap();
+    system.run().unwrap();
+    (system, file)
+}
+
+/// Opens the application proxy as the title would and returns (common state getter, self
+/// controller) after locking exit.
+fn lock_exit(client: &IpcClient) -> (Handle, Handle) {
+    let service = client.connect("appletOE").unwrap();
+    let request = Request::new(0)
+        .send_pid()
+        .arg(0u64)
+        .copy_handle(0xffff_8001);
+    let proxy = client.send(service, &request).unwrap().move_handles[0];
+    let interface = |command| {
+        client
+            .send(proxy, &Request::new(command))
+            .unwrap()
+            .move_handles[0]
+    };
+    let (state, controller) = (interface(0), interface(1));
+    assert_eq!(
+        client.send(controller, &Request::new(1)).unwrap().result,
+        lichii_common::ResultCode::SUCCESS
+    );
+    (state, controller)
+}
+
+#[test]
+fn closing_lets_a_title_holding_the_exit_lock_exit_by_itself() {
+    let (mut system, _file) = exit_lock_system(10_000);
+    let client = IpcClient::new(system.kernel(), system.process());
+    let (state, controller) = lock_exit(&client);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            loop {
+                let mut reply = client.send(state, &Request::new(1)).unwrap();
+                if reply.result.is_success() && reply.pop::<u32>() == 4 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let _ = client.send(controller, &Request::new(0));
+        });
+        let started = Instant::now();
+        system.stop();
+        assert!(started.elapsed() < Duration::from_secs(5));
+    });
+    assert_eq!(system.exit_reason(), Some(ExitReason::Exited));
+}
+
+#[test]
+fn closing_stops_a_title_holding_the_exit_lock_after_the_timeout() {
+    let (mut system, _file) = exit_lock_system(300);
+    let client = IpcClient::new(system.kernel(), system.process());
+    lock_exit(&client);
+    let started = Instant::now();
+    system.stop();
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    assert_eq!(system.exit_reason(), None);
+
+    let (mut system, _file) = exit_lock_system(0);
+    let client = IpcClient::new(system.kernel(), system.process());
+    lock_exit(&client);
+    let started = Instant::now();
+    system.stop();
+    assert!(started.elapsed() < Duration::from_millis(300));
+    assert_eq!(system.exit_reason(), None);
 }

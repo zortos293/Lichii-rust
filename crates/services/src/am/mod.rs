@@ -38,6 +38,7 @@ pub(crate) const FATAL_SECTION_COUNT_IMBALANCE: ResultCode = am(512);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub(crate) enum AppletMessage {
+    Exit = 4,
     FocusStateChanged = 15,
     DetectShortPressingHomeButton = 20,
     DetectLongPressingHomeButton = 21,
@@ -65,6 +66,8 @@ struct Lifecycle {
     focus_changed: bool,
     unordered: VecDeque<AppletMessage>,
     signaled: bool,
+    exit_locked: bool,
+    exit_requested: bool,
 }
 
 impl Lifecycle {
@@ -199,6 +202,27 @@ impl Applet {
         let mut lifecycle = self.lifecycle.lock();
         lifecycle.unordered.push_back(message);
         lifecycle.sync(&self.message_event);
+    }
+
+    /// Asks the application to exit. True when it holds the exit lock: it gets the exit message
+    /// and is expected to exit by itself.
+    pub(crate) fn request_exit(&self) -> bool {
+        let mut lifecycle = self.lifecycle.lock();
+        lifecycle.exit_requested = true;
+        if !lifecycle.exit_locked {
+            return false;
+        }
+        lifecycle.unordered.push_back(AppletMessage::Exit);
+        lifecycle.sync(&self.message_event);
+        true
+    }
+
+    /// Sets the exit lock (`LockExit`, `UnlockExit`). False once an exit was requested: the
+    /// application must then terminate.
+    fn set_exit_locked(&self, locked: bool) -> bool {
+        let mut lifecycle = self.lifecycle.lock();
+        lifecycle.exit_locked = locked && !lifecycle.exit_requested;
+        !lifecycle.exit_requested
     }
 
     fn pop_message(&self) -> Option<AppletMessage> {
