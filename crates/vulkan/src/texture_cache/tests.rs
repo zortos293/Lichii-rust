@@ -2581,3 +2581,28 @@ fn overlaps_written_back_upload_only_the_layers_they_cover() {
     }
     f.assert_no_validation_errors();
 }
+
+#[test]
+fn cpu_writes_between_layers_upload_nothing() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let header = tic(0x08, GPU_VA, 64, 64, 4, 3, 3);
+    let info = ImageInfo::from_texture(&header.decode().unwrap(), GobLayout::Tegra).unwrap();
+    let used = info.subresource_offset(2, 0) + info.level_size(2);
+    assert!(
+        used < info.layer_stride,
+        "{used} of {} bytes",
+        info.layer_stride
+    );
+    let (texture, _) = f.texture(&header);
+    let uploaded = f.cache.traffic();
+    {
+        let (mut tx, cache, _) = f.tx();
+        cache.invalidate(&mut tx, DADDR + used, 64).unwrap();
+    }
+    assert_eq!(f.texture(&header).0, texture);
+    assert_eq!(f.cache.traffic().upload_bytes, uploaded.upload_bytes);
+    f.scheduler.finish().unwrap();
+    f.assert_no_validation_errors();
+}

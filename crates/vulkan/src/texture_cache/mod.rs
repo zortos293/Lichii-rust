@@ -2494,9 +2494,12 @@ impl TextureCache {
                 total = total.next_multiple_of(align);
             }
         }
+        if total == 0 {
+            return Ok(());
+        }
         traffic.uploads += 1;
         traffic.upload_bytes += total;
-        let slice = tx.staging.alloc(tx.scheduler, total.max(align), align)?;
+        let slice = tx.staging.alloc(tx.scheduler, total, align)?;
         let (buffer, base_offset) = (slice.buffer, slice.offset);
         scratch.regions.clear();
         let mut offset = 0usize;
