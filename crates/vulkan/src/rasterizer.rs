@@ -7,6 +7,7 @@
 //! dispatches (see [`draw`]).
 
 mod draw;
+mod frame_dump;
 mod samples;
 
 use std::collections::VecDeque;
@@ -22,13 +23,15 @@ use lichii_common::settings::{AstcRecompression, GraphicsSettings, ResolutionSca
 use lichii_gpu::backend::ChannelId;
 use lichii_gpu::backend::{
     Blit, BlitOperation, ComputeContext, DrawParams, DrawTexture, FenceAction, FramebufferConfig,
-    GpuHandles, GraphicsContext, IndirectDraw, Query, QueryKind, Rasterizer, ReleaseSize,
+    GpuHandles, GraphicsContext, ImageCopy, IndirectDraw, Query, QueryKind, Rasterizer,
+    ReleaseSize,
 };
 use lichii_gpu::engines::maxwell_3d::Regs;
 use lichii_gpu::engines::maxwell_3d::regs::NUM_RENDER_TARGETS;
 use lichii_gpu::gmmu::Gmmu;
-use lichii_texture::block_linear::{GobLayout, Tiling};
-use lichii_texture::{Aspect, Numeric};
+use lichii_gpu::throttle::Throttle;
+use lichii_texture::block_linear::{GobLayout, Tiling, unswizzle};
+use lichii_texture::{Aspect, Numeric, PixelFormat};
 
 use crate::buffer_cache::{BufferBinding, BufferCache, BufferCacheStats};
 use crate::commands::{COLOR_RANGE, ImageAccess, transition};
@@ -111,6 +114,7 @@ pub struct VulkanRasterizer {
     draw: draw::DrawState,
     live: Option<Arc<LiveSettings>>,
     activity: Activity,
+    frame_dump: Option<frame_dump::FrameDump>,
 }
 
 /// Work that runs once the host GPU finished everything recorded before it.
@@ -128,6 +132,23 @@ enum Release {
     /// Reads the Z-pass queries of `range` into the running count, freeing their slots while the
     /// guest counts without reporting.
     SamplesFold(samples::SampleRange),
+}
+
+/// The part of `fb` the display shows, as left, top, right and bottom in texels: its crop
+/// clamped to the framebuffer, or all of it when the crop is empty.
+fn displayed_rect(fb: &FramebufferConfig) -> [u32; 4] {
+    let (width, height) = (fb.width, fb.height);
+    fb.crop
+        .map(|c| {
+            [
+                c.left.min(width),
+                c.top.min(height),
+                c.right.min(width),
+                c.bottom.min(height),
+            ]
+        })
+        .filter(|&[left, top, right, bottom]| right > left && bottom > top)
+        .unwrap_or([0, 0, width, height])
 }
 
 /// The rectangle a clear covers: the first scissor and the clear rectangle when
@@ -263,6 +284,7 @@ impl VulkanRasterizer {
             texture_cache,
             live: None,
             activity: Activity::default(),
+            frame_dump: frame_dump::FrameDump::from_env(),
         })
     }
 
@@ -372,6 +394,7 @@ impl VulkanRasterizer {
                     scheduler: &mut self.scheduler,
                     staging: &mut self.staging,
                     memory: &self.handles.device,
+                    buffers: &mut self.buffer_cache,
                 };
                 if let Some(target) = self
                     .texture_cache
@@ -417,6 +440,7 @@ impl VulkanRasterizer {
                     scheduler: &mut self.scheduler,
                     staging: &mut self.staging,
                     memory: &self.handles.device,
+                    buffers: &mut self.buffer_cache,
                 };
                 if let Some(target) = self.texture_cache.render_target(
                     &mut tx,
@@ -550,20 +574,8 @@ impl VulkanRasterizer {
         tick: u64,
         scale: ResolutionScale,
     ) {
-        let (width, height) = (fb.width, fb.height);
-        let (left, top, right, bottom) = fb
-            .crop
-            .map(|c| {
-                (
-                    c.left.min(width),
-                    c.top.min(height),
-                    c.right.min(width),
-                    c.bottom.min(height),
-                )
-            })
-            .filter(|&(left, top, right, bottom)| right > left && bottom > top)
-            .unwrap_or((0, 0, width, height));
-        let (w, h) = (width as f32, height as f32);
+        let [left, top, right, bottom] = displayed_rect(fb);
+        let (w, h) = (fb.width as f32, fb.height as f32);
         let mut uv_rect = [
             left as f32 / w,
             top as f32 / h,
@@ -723,6 +735,61 @@ impl VulkanRasterizer {
         };
         self.frame_uploads[index].0 = tick;
         Ok(index)
+    }
+
+    /// Writes the guest framebuffer `fb` to `path` as a BMP, after writing back what the GPU
+    /// rendered into it.
+    fn dump_frame(&mut self, fb: &FramebufferConfig, path: &Path) -> std::io::Result<()> {
+        let rgba = match fb.format {
+            PixelFormat::A8B8G8R8Unorm | PixelFormat::A8B8G8R8Srgb => true,
+            PixelFormat::B8G8R8A8Unorm | PixelFormat::B8G8R8A8Srgb => false,
+            format => {
+                return Err(std::io::Error::other(format!(
+                    "{format:?} frames are not dumped"
+                )));
+            }
+        };
+        let tiling = fb.block_height_log2.map(|block_height_log2| {
+            Tiling::new(
+                fb.width,
+                fb.height,
+                1,
+                4,
+                block_height_log2,
+                0,
+                fb.gob_layout,
+            )
+        });
+        let size = tiling.map_or(fb.stride as usize * fb.height as usize, |t| t.size_bytes());
+        let mut tx = Transfer {
+            scheduler: &mut self.scheduler,
+            staging: &mut self.staging,
+            memory: &self.handles.device,
+            buffers: &mut self.buffer_cache,
+        };
+        self.texture_cache
+            .flush(&mut tx, fb.address, size as u64)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let mut guest = vec![0; size];
+        self.handles
+            .device
+            .read_bytes(fb.address, &mut guest)
+            .map_err(|fault| std::io::Error::other(format!("{fault:?}")))?;
+        let (texels, pitch) = match tiling {
+            Some(tiling) => {
+                let mut linear = vec![0; tiling.linear_size_bytes()];
+                unswizzle(&tiling, &guest, &mut linear);
+                (linear, fb.width as usize * 4)
+            }
+            None => (guest, fb.stride as usize),
+        };
+        let layout = frame_dump::Layout {
+            pitch,
+            rect: displayed_rect(fb),
+            flip_vertical: fb.flip_vertical,
+            rgba,
+        };
+        frame_dump::write_bmp(path, &texels, &layout)
     }
 
     fn upload_frame(&mut self, fb: &FramebufferConfig) -> Result<()> {
@@ -891,6 +958,7 @@ impl Rasterizer for VulkanRasterizer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
             memory: &self.handles.device,
+            buffers: &mut self.buffer_cache,
         };
         let blitted = self.texture_cache.blit(
             &mut tx,
@@ -918,9 +986,41 @@ impl Rasterizer for VulkanRasterizer {
         }
     }
 
+    fn accelerate_image_copy(
+        &mut self,
+        _channel: ChannelId,
+        memory: &Gmmu,
+        copy: &ImageCopy,
+    ) -> bool {
+        let mut tx = Transfer {
+            scheduler: &mut self.scheduler,
+            staging: &mut self.staging,
+            memory: &self.handles.device,
+            buffers: &mut self.buffer_cache,
+        };
+        match self.texture_cache.copy_to_buffer(&mut tx, memory, copy) {
+            Ok(true) => {
+                self.unflushed = true;
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                tracing::error!(%error, "copying an image to a buffer on the GPU failed; copying in software");
+                false
+            }
+        }
+    }
+
     fn query(&mut self, _channel: ChannelId, memory: &Gmmu, query: &Query) {
         let Some(address) = memory.translate(query.address) else {
-            tracing::warn!(address = query.address, "query to unmapped GPU memory");
+            static UNMAPPED: Throttle = Throttle::new();
+            if let Some(dropped) = UNMAPPED.allow() {
+                tracing::warn!(
+                    address = query.address,
+                    dropped,
+                    "query to unmapped GPU memory"
+                );
+            }
             return;
         };
         let value = match query.kind {
@@ -1015,6 +1115,7 @@ impl Rasterizer for VulkanRasterizer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
             memory: &self.handles.device,
+            buffers: &mut self.buffer_cache,
         };
         if let Err(error) = self.texture_cache.invalidate(&mut tx, addr, size) {
             tracing::error!(%error, "writing back GPU-modified images before a CPU write failed");
@@ -1035,6 +1136,7 @@ impl Rasterizer for VulkanRasterizer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
             memory: &self.handles.device,
+            buffers: &mut self.buffer_cache,
         };
         if let Err(error) = self.texture_cache.flush(&mut tx, addr, size) {
             tracing::error!(%error, "flushing GPU-modified images failed");
@@ -1118,11 +1220,20 @@ impl Rasterizer for VulkanRasterizer {
         if let Err(error) = result {
             tracing::error!(%error, "presenting a guest frame failed");
         }
+        if let Some(path) = self
+            .frame_dump
+            .as_mut()
+            .and_then(frame_dump::FrameDump::due)
+            && let Err(error) = self.dump_frame(framebuffer, &path)
+        {
+            tracing::warn!(%error, ?path, "dumping a frame failed");
+        }
         self.release_fences(false);
         let mut tx = Transfer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
             memory: &self.handles.device,
+            buffers: &mut self.buffer_cache,
         };
         let device = &self.device;
         if let Err(error) = self

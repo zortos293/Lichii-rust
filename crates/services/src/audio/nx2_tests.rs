@@ -334,20 +334,16 @@ fn a_switch2_title_renders_a_voice_through_aud_u() {
     assert_eq!(reply.result, ResultCode::SUCCESS);
 
     let session = h.audio.renderer.session(0).unwrap();
-    std::thread::sleep(Duration::from_millis(30));
     assert_eq!(
         session.frames_rendered(),
         0,
         "a stopped session renders nothing"
     );
+    rendered.clear();
     h.ok(renderer, Request::new(5));
     assert_eq!(h.ok(renderer, Request::new(3)).pop::<u32>(), 0, "started");
-    rendered.clear();
     wait_for("audible frames", || session.audible_frames() >= 240 * 4);
-    assert!(
-        rendered.is_signaled(),
-        "the rendered event fires each frame"
-    );
+    wait_for("the rendered event", || rendered.is_signaled());
     assert!(session.stream().expected_played_sample_count() > 0);
     h.ok(renderer, Request::new(6));
 }

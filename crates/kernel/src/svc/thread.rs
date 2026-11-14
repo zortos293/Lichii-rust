@@ -54,6 +54,9 @@ pub(super) fn start_thread(svc: &mut SvcContext) -> Flow {
         if s.terminate_requested {
             return Err(result::TERMINATION_REQUESTED);
         }
+        if !thread.try_retain() {
+            return Err(result::INVALID_HANDLE);
+        }
         thread.scheduler.enqueue(&thread, &mut s, false);
         Ok(())
     });
@@ -285,7 +288,7 @@ pub(super) fn get_thread_context3(svc: &mut SvcContext) -> Flow {
     svc.finish(result)
 }
 
-pub(crate) fn release_thread_resources(thread: &Arc<Thread>) {
+pub(crate) fn release_thread_resources(thread: &Thread) {
     let process = thread.process();
     process.page_table().free_tls(thread.tls_address());
     process

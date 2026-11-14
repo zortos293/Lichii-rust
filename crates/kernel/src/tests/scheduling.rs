@@ -8,6 +8,7 @@ use lichii_cpu::CpuConfig;
 use parking_lot::Mutex;
 
 use super::{Script, TestKernel, word};
+use crate::object::KObject;
 use crate::process::{Process, ProcessParams};
 use crate::util::Rng;
 use crate::{Kernel, KernelConfig};
@@ -753,4 +754,88 @@ fn exited_processes_give_back_their_fastmem_arenas() {
             .expect("process exits");
     }
     test.kernel.shutdown();
+}
+
+/// A thread's TLS slot stays reserved while a handle to it is open, even after it exited, as in
+/// Horizon (`KThread::Finalize`): a thread created before the handle closes gets another slot,
+/// one created after gets the freed slot back.
+#[test]
+fn an_exited_thread_keeps_its_tls_slot_until_its_last_handle_closes() {
+    let test = TestKernel::new(ConsoleGeneration::Switch1);
+    let heap = heap_base(&test);
+    let handles = heap + 0x1000;
+    let tls = Arc::new(Mutex::new([0u64; 3]));
+    let record = tls.clone();
+    let worker = test.program(
+        Script::new()
+            .then(move |ctx, _| record.lock()[ctx.x[0] as usize] = ctx.tpidrro_el0)
+            .exit(),
+    );
+    let spawn_and_join = |script: Script, i: u64| {
+        script
+            .svc(0x08, move |ctx, _| {
+                ctx.x[1] = worker;
+                ctx.x[2] = i;
+                ctx.x[3] = heap + 0x10_0000 + 0x1_0000 * i;
+                ctx.x[4] = 44;
+                ctx.x[5] = -2i32 as u32 as u64;
+            })
+            .then(move |ctx, env| {
+                assert_eq!(ctx.x[0], 0, "CreateThread failed");
+                env.memory.write(handles + 4 * i, ctx.x[1] as u32).unwrap();
+            })
+            .svc(0x09, move |ctx, env| {
+                ctx.x[0] = env.memory.read::<u32>(handles + 4 * i).unwrap() as u64;
+            })
+            .then(|ctx, _| assert_eq!(ctx.x[0], 0, "StartThread failed"))
+            .svc(0x18, move |ctx, _| {
+                ctx.x[1] = handles + 4 * i;
+                ctx.x[2] = 1;
+                ctx.x[3] = u64::MAX;
+            })
+            .then(|ctx, _| assert_eq!(ctx.x[0], 0, "WaitSynchronization on a thread failed"))
+    };
+    let main = spawn_and_join(spawn_and_join(Script::new(), 0), 1)
+        .svc(0x16, move |ctx, env| {
+            ctx.x[0] = env.memory.read::<u32>(handles).unwrap() as u64;
+        })
+        .then(|ctx, _| assert_eq!(ctx.x[0], 0, "CloseHandle failed"));
+    let main = test.program(spawn_and_join(main, 2).exit());
+    test.start(test.image(), main);
+    test.run_until_exit(Duration::from_secs(10));
+    let [first, second, third] = *tls.lock();
+    assert_ne!(first, 0);
+    assert_ne!(
+        second, first,
+        "a new thread got the TLS slot of an exited thread whose handle is still open"
+    );
+    assert_eq!(
+        third, first,
+        "closing the last handle did not free the TLS slot"
+    );
+}
+
+/// Closing the last handle of a thread that never started gives its TLS slot back and drops it
+/// from the process, so creating and closing threads cannot pile up unreachable ones.
+#[test]
+fn closing_the_last_handle_of_an_unstarted_thread_releases_it() {
+    let test = TestKernel::new(ConsoleGeneration::Switch1);
+    let process = test.kernel.create_process(&test.image()).unwrap();
+    let entry = process.entry();
+    let create = || {
+        test.kernel
+            .0
+            .create_thread(&process, entry, 0, entry, 44, -2)
+            .unwrap()
+    };
+    let thread = create();
+    let handle = process
+        .handles()
+        .write()
+        .add(KObject::Thread(thread.clone()))
+        .unwrap();
+    assert_eq!(process.threads().len(), 1);
+    process.handles().write().remove(handle);
+    assert!(process.threads().is_empty());
+    assert_eq!(create().tls_address(), thread.tls_address());
 }

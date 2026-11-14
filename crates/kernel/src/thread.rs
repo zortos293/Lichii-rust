@@ -1,6 +1,6 @@
 //! Guest threads.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use lichii_common::{ResultCode, VAddr};
@@ -109,6 +109,9 @@ pub struct Thread {
     pub(crate) context: Mutex<ThreadContext>,
     pub(crate) sched: Mutex<Sched>,
     wait_token: AtomicU64,
+    /// Handle-table entries that refer to the thread, plus one from its start until it exits.
+    refs: AtomicUsize,
+    finalized: AtomicBool,
     pub(crate) sync: SyncState,
     /// Threads waiting for mutexes this thread owns; they lend it their priority.
     lock_waiters: Mutex<Vec<LockWaiter>>,
@@ -176,6 +179,8 @@ impl Thread {
                 pinned: false,
             }),
             wait_token: AtomicU64::new(0),
+            refs: AtomicUsize::new(0),
+            finalized: AtomicBool::new(false),
             sync: SyncState::default(),
             lock_waiters: Mutex::default(),
             lock_owner: Mutex::default(),
@@ -427,6 +432,36 @@ impl Thread {
         *self.context.lock() = context;
     }
 
+    /// Takes a reference: a handle-table entry, or the thread's own while it runs.
+    pub(crate) fn retain(&self) {
+        self.refs.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Takes the reference a starting thread holds until it exits, unless no reference is left
+    /// (the last handle closed before the start).
+    pub(crate) fn try_retain(&self) -> bool {
+        self.refs
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |refs| {
+                (refs != 0).then_some(refs + 1)
+            })
+            .is_ok()
+    }
+
+    /// Drops a reference. The last one gives the TLS slot and the thread count back to the
+    /// process and detaches the thread from it, as Horizon's `KThread::Finalize` does once
+    /// the thread has exited (or never started) and its last handle is closed. Freeing the slot
+    /// at exit instead would hand a new thread the slot of one whose handle is still open. Takes
+    /// no thread lock, so handle tables may call it under their own lock.
+    pub(crate) fn release(&self) {
+        if self.refs.fetch_sub(1, Ordering::SeqCst) != 1
+            || self.finalized.swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        crate::svc::release_thread_resources(self);
+        self.process.remove_thread(self);
+    }
+
     /// Whether the thread terminated. Threads are signalled when they exit.
     pub fn is_terminated(&self) -> bool {
         self.sync.is_signaled()
@@ -532,6 +567,7 @@ impl Thread {
                 drop(s);
                 self.leave_lock_wait(token);
             }
+            ThreadState::Created if !self.try_retain() => {}
             ThreadState::Suspended | ThreadState::Created => {
                 self.scheduler.enqueue(self, &mut s, true)
             }

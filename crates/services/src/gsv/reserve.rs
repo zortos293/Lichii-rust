@@ -135,22 +135,35 @@ impl Reserve {
         }
     }
 
-    /// Takes back the memory of `blocks`, which the device no longer maps and the GPU is past:
-    /// the refill thread frees it.
-    pub(crate) fn release(&self, blocks: &[LazyBlock]) {
+    /// Takes the memory of `blocks`, which the device no longer maps, off their device addresses,
+    /// so a region made at the same addresses meanwhile gets memory of its own. Hand it to
+    /// [`Reserve::free`] once the GPU is past the blocks.
+    pub(crate) fn detach(&self, blocks: &[LazyBlock]) -> Vec<VAddr> {
+        if blocks.is_empty() {
+            return Vec::new();
+        }
+        let mut state = self.state.lock();
+        blocks
+            .iter()
+            .filter_map(|block| {
+                let va = state.backed.remove(&block.daddr);
+                if va.is_none() {
+                    tracing::warn!(
+                        "nx2:gpu: device block {:#x} was not backed by the reserve",
+                        block.daddr
+                    );
+                }
+                va
+            })
+            .collect()
+    }
+
+    /// Gives back memory [`Reserve::detach`] took, which the GPU is past: the refill thread frees it.
+    pub(crate) fn free(&self, blocks: Vec<VAddr>) {
         if blocks.is_empty() {
             return;
         }
-        let mut state = self.state.lock();
-        for block in blocks {
-            match state.backed.remove(&block.daddr) {
-                Some(va) => state.released.push(va),
-                None => tracing::warn!(
-                    "nx2:gpu: device block {:#x} was not backed by the reserve",
-                    block.daddr
-                ),
-            }
-        }
+        self.state.lock().released.extend(blocks);
         self.work.notify_one();
     }
 }
