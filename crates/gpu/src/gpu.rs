@@ -674,6 +674,8 @@ impl Gpu {
             tracing::error!("GPU shutdown from a GPU thread; not joining it");
             return;
         }
+        let started = Instant::now();
+        tracing::info!(busy = %self.activity.describe_busy(), "diag gpu stop: begin");
         let deadline = Instant::now() + STOP_TIMEOUT;
         for thread in self.threads.lock().drain(..) {
             while !thread.is_finished() && Instant::now() < deadline {
@@ -687,6 +689,7 @@ impl Gpu {
                 );
                 continue;
             }
+            tracing::info!(thread = thread.thread().name(), after = ?started.elapsed(), "diag gpu stop: thread finished");
             if thread.join().is_err() {
                 tracing::error!("a GPU thread panicked");
             }
