@@ -75,9 +75,10 @@ fn block_linear(tile_mode: TileMode, gob: GobLayout) -> GuestLayout {
 
 impl ImageInfo {
     /// The image a texture header samples. `None` for texel buffers, which live in the buffer
-    /// cache. With Switch 2 GOBs only array headers have layers. Mario Tennis Fever, Donkey Kong
-    /// Bananza and Mario Kart World set the base layer field to 32 or 48 in every non-array
-    /// header they sample, 3D ones included, so it is read as selecting nothing there.
+    /// cache. With Switch 2 GOBs the base layer field is not a layer: Mario Tennis Fever, Donkey
+    /// Kong Bananza and Mario Kart World set it to 32 or 48 in every header they sample, array
+    /// and 3D ones included, and Lichii zeroes it for every Switch 2 header. Only array headers
+    /// have layers there.
     pub fn from_texture(desc: &TextureDescriptor, gob: GobLayout) -> Option<Self> {
         let layout = match desc.memory {
             TextureMemory::BlockLinear {
@@ -93,8 +94,9 @@ impl ImageInfo {
             TextureMemory::Pitch { pitch } => GuestLayout::Pitch { pitch },
             TextureMemory::Buffer => return None,
         };
-        let arrayed = gob != GobLayout::Switch2 && (desc.depth > 1 || desc.base_layer != 0);
-        let base = desc.base_layer;
+        let switch2 = gob == GobLayout::Switch2;
+        let base = if switch2 { 0 } else { desc.base_layer };
+        let arrayed = !switch2 && (desc.depth > 1 || base != 0);
         let (kind, height, depth, layers, mut rescaleable) = match desc.texture_type {
             TextureType::D1 if !arrayed => (ImageKind::D1, 1, 1, 1, false),
             TextureType::D1 | TextureType::D1Array => {
@@ -516,7 +518,6 @@ impl ViewInfo {
         );
         let base_layer = match desc.texture_type {
             TextureType::D3 => 0,
-            TextureType::D1Array | TextureType::D2Array | TextureType::CubeArray => desc.base_layer,
             _ if switch2 => 0,
             _ => desc.base_layer,
         };
