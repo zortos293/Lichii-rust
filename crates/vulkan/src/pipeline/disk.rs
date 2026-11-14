@@ -3,7 +3,7 @@
 //! changed.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::mem::size_of;
 use std::path::Path;
 
@@ -144,16 +144,15 @@ pub(crate) fn decode(bytes: &[u8], identity: &DeviceIdentity) -> Option<Contents
     r.0.is_empty().then_some(contents)
 }
 
-/// Replaces `path` with `bytes` so a crash leaves either the old file or the new one.
+/// Replaces `path` with `bytes` so a crashed process leaves either the old file or the new one.
+/// It does not sync: after a power loss the file may be damaged, which `decode`'s checksum
+/// rejects, and an fsync would cost the GPU thread's shutdown tens of milliseconds.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
     let temporary = path.with_extension("tmp");
-    let mut file = fs::File::create(&temporary)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
+    fs::write(&temporary, bytes)?;
     fs::rename(&temporary, path)
 }
 
