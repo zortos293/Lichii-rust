@@ -2412,10 +2412,19 @@ mod tests {
         let mut cache = PipelineCache::new(&device, &settings(true), None, None).unwrap();
         let shaders = present_shaders();
         let key = key(&cache, &Regs::with_defaults(), &shaders);
+        let ctx = cache.ctx.clone();
+        let (paused, wait) = std::sync::mpsc::channel();
+        let gate = std::thread::spawn(move || {
+            let _paused = ctx.gate.write();
+            paused.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        wait.recv().unwrap();
         assert!(
             cache.graphics_waiting(&key, &shaders).is_some(),
-            "fast-linked or built, never skipped"
+            "fast-linked or built once the paused builds run, never skipped"
         );
+        gate.join().unwrap();
         assert_eq!((cache.blocked(), cache.waits()), (1, 0));
         cache.wait_for_builds();
         assert!(cache.graphics_waiting(&key, &shaders).is_some());
