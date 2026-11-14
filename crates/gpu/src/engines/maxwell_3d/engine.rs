@@ -358,6 +358,7 @@ impl Maxwell3d {
     }
 
     fn render(&mut self, ctx: &mut EngineContext<'_>, draw: &DrawParams<'_>) {
+        crate::diag_glyph::draw(&self.state.regs, self.renders());
         if self.renders() {
             let start = ctx.activity.begin_call(RendererCall::Draw);
             ctx.rasterizer.draw(&mut graphics!(self, ctx), draw);

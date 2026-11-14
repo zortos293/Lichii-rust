@@ -1208,6 +1208,14 @@ impl Rasterizer for VulkanRasterizer {
             Ok(None) => Ok(false),
             Err(error) => Err(error),
         };
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let hit = matches!(cached, Ok(true));
+            if hit { lichii_gpu::diag_glyph::PRESENT_CACHED.fetch_add(1, Relaxed); } else { lichii_gpu::diag_glyph::PRESENT_UPLOAD.fetch_add(1, Relaxed); }
+            if lichii_gpu::diag_glyph::first(5, framebuffer.address ^ u64::from(hit) << 63) {
+                tracing::info!("DIAG glyph present t={:.1} addr={:#x} {}x{} stride={} fmt={:?} bh={:?} gob={:?} crop={:?} cached={hit}", lichii_gpu::diag_glyph::secs(), framebuffer.address, framebuffer.width, framebuffer.height, framebuffer.stride, framebuffer.format, framebuffer.block_height_log2, framebuffer.gob_layout, framebuffer.crop);
+            }
+        }
         let result = match cached {
             Ok(true) => Ok(()),
             Ok(false) => {
