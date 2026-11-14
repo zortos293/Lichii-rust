@@ -1877,6 +1877,13 @@ fn sparse_images_take_the_layers_of_a_join_their_cap_admits() {
         cache.get(target.id).is_some(),
         "the source keeps the layers past the cap"
     );
+    let again = cache.find(&mut tx, gmmu, GPU_VA, &source).unwrap().unwrap();
+    assert_eq!(again.id, target.id);
+    assert!(
+        all_texels(&f.read_image(target.id)[3][..64], [0, 255, 0, 255]),
+        "a layer past the cap survives the source's next lookup"
+    );
+    assert_eq!(f.cache.traffic().uploads, 0);
     let buffer = Buffer::new(
         &f.device,
         16 * 4,

@@ -2131,13 +2131,10 @@ impl TextureCache {
         newer.clear();
         let image = self.get(id).expect("a live image id");
         let current = image.current;
-        newer.extend(
-            image
-                .overlaps
-                .iter()
-                .copied()
-                .filter(|&o| self.get(o).is_some_and(|o| o.modified > current)),
-        );
+        newer.extend(image.overlaps.iter().copied().filter(|&o| {
+            self.get(o)
+                .is_some_and(|o| o.modified > current && !o.image.is_sparse())
+        }));
         if newer.is_empty() {
             self.overlap_scratch = newer;
             return Ok(());
@@ -2193,7 +2190,7 @@ impl TextureCache {
         keep.extend_from_slice(&image.keep_out);
         for &other in &image.overlaps {
             let other = self.get(other).expect("overlaps are live");
-            if other.modified > image.current {
+            if other.modified > image.current && !other.image.is_sparse() {
                 keep.extend(other.segments.iter().map(|s| (s.daddr, s.daddr + s.size)));
             }
         }
