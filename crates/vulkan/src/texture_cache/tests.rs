@@ -2036,3 +2036,29 @@ fn blits_the_host_cannot_do_as_they_are_go_to_software() {
     );
     f.assert_no_validation_errors();
 }
+
+#[test]
+fn blits_from_guest_data_stay_in_software() {
+    let gob = GobLayout::Tegra;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let src = rt_info(64, 64, 3, gob);
+    let dst = rt_info(32, 32, 2, gob);
+    let (mut tx, cache, gmmu) = f.tx();
+    cache.find(&mut tx, gmmu, GPU_VA, &src).unwrap().unwrap();
+    let before = f.cache.traffic();
+    let (mut tx, cache, gmmu) = f.tx();
+    let blitted = cache
+        .blit(
+            &mut tx,
+            gmmu,
+            &blit_side(GPU_VA, src, [0, 0, 64, 64]),
+            &blit_side(GPU_VA + (64 << 10), dst, [0, 0, 32, 32]),
+            false,
+        )
+        .unwrap();
+    assert!(!blitted, "an uploaded source no GPU work wrote");
+    assert_eq!(f.cache.traffic(), before, "no upload for a software blit");
+    f.assert_no_validation_errors();
+}
