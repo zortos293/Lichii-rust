@@ -1,9 +1,10 @@
 //! Attributes, interpolation, internal stage buffers, geometry output, special registers and barriers.
 
-use super::{TResult, Translator};
+use super::{TResult, Translator, control};
 use crate::ampere::decode::Form;
 use crate::ampere::opcode::Opcode;
-use crate::ir::{Attribute, FpControl, Opcode as Ir, Patch, Value};
+use crate::ir::{Attribute, FpControl, ICompare, Opcode as Ir, Patch, Value};
+use crate::maxwell::header::PixelImap;
 use crate::{ShaderStage, TranslateError};
 
 pub(super) fn translate(t: &mut Translator<'_>, op: Opcode) -> TResult {
@@ -148,9 +149,10 @@ fn ast(t: &mut Translator<'_>) -> TResult {
 /// third, state). The indexed form adds the uniform register at 24..30 to the attribute's byte
 /// address.
 ///
-/// SM70+ interpolates perspective-correct inputs in hardware (Mesa NAK emits a plain IPA.PASS
-/// there), so unlike Maxwell's IPA the value is used as interpolated, with no multiply by the
-/// position's W. A constant input does not vary, so .OFFSET reads it as it is.
+/// IPA returns a perspective input divided by the clip-space w, and programs multiply it by the
+/// reciprocal of IPA's position w themselves, so the value is multiplied by the position's w as
+/// Maxwell's IPA does. `InterpolateAtOffset` divides by w at the offset itself. A constant input
+/// does not vary, so .OFFSET reads it as it is.
 fn ipa(t: &mut Translator<'_>) -> TResult {
     let insn = t.insn;
     let (location, frequency) = (insn.bits(76, 2), insn.bits(78, 2));
@@ -158,6 +160,7 @@ fn ipa(t: &mut Translator<'_>) -> TResult {
         return Err(t.unsupported());
     }
     let word = insn.bits(64, 8) as u16;
+    let attribute = Attribute(word);
     let index = insn.usrc0();
     let indexed = t.form == Form::UregIndexed && !index.is_zero();
     let value = if location == 2 && frequency == 0 {
@@ -165,16 +168,68 @@ fn ipa(t: &mut Translator<'_>) -> TResult {
             return Err(t.unsupported());
         }
         let offset = t.x(insn.src1());
-        interpolate_at_offset(t, Attribute(word), offset)?
+        interpolate_at_offset(t, attribute, offset)?
     } else if indexed {
         let base = t.x(index);
         let address = t.ir.iadd(base, Value::U32(u32::from(word) * 4));
-        t.ir.get_attribute_indexed(address, Value::U32(0))
+        let value = t.ir.get_attribute_indexed(address, Value::U32(0));
+        divide_indexed_by_w(t, address, value)
     } else {
-        t.ir.get_attribute(Attribute(word), Value::U32(0))
+        let value = t.ir.get_attribute(attribute, Value::U32(0));
+        if interpolates_in_perspective(t, attribute) {
+            let w = t.ir.get_attribute(Attribute::POSITION_W, Value::U32(0));
+            t.ir.fp_mul(value, w, FpControl::default())
+        } else {
+            value
+        }
     };
     t.set_f(insn.dst(), value);
     Ok(())
+}
+
+/// Divides an indexed read by w when the attribute `address` selects at run time interpolates
+/// in perspective, from a mask of the program's 64 16-byte attribute slots.
+fn divide_indexed_by_w(t: &mut Translator<'_>, address: Value, value: Value) -> Value {
+    let mut mask = 0u64;
+    for slot in 0..64u16 {
+        if (0..4).any(|c| interpolates_in_perspective(t, Attribute(slot * 4 + c))) {
+            mask |= 1 << slot;
+        }
+    }
+    if mask == 0 {
+        return value;
+    }
+    let w = t.ir.get_attribute(Attribute::POSITION_W, Value::U32(0));
+    let slot = t.ir.shift_right_logical(address, Value::U32(4));
+    let slot = t.ir.bitwise_and(slot, Value::U32(63));
+    let low = t.ir.icompare(ICompare::ULessThan, slot, Value::U32(32));
+    let half = t.ir.select(
+        low,
+        Value::U32(mask as u32),
+        Value::U32((mask >> 32) as u32),
+    );
+    let bit = t.ir.bitwise_and(slot, Value::U32(31));
+    let bit = t.ir.bit_field_extract(half, bit, Value::U32(1), false);
+    let perspective = t.ir.icompare(ICompare::NotEqual, bit, Value::U32(0));
+    let factor = t.ir.select(perspective, w, Value::F32(1.0));
+    t.ir.fp_mul(value, factor, FpControl::default())
+}
+
+/// Whether IPA returns `attribute` divided by the clip-space w: a generic the program header
+/// maps as perspective (or leaves unused), or a legacy input. The host interpolates it
+/// perspective-correct, so the translation multiplies it by `gl_FragCoord.w` (1 / w).
+fn interpolates_in_perspective(t: &Translator<'_>, attribute: Attribute) -> bool {
+    let Some(generic) = attribute.generic_index() else {
+        return attribute.is_legacy();
+    };
+    let imap = control::program_header(t)
+        .unwrap_or_default()
+        .ps()
+        .generic_input_map(usize::from(generic))
+        .into_iter()
+        .find(|&imap| imap != PixelImap::Unused)
+        .unwrap_or(PixelImap::Unused);
+    matches!(imap, PixelImap::Perspective | PixelImap::Unused)
 }
 
 /// IPA.OFFSET's offset holds x in the low and y in the high halfword, signed with 12 fraction
@@ -638,8 +693,10 @@ mod tests {
     fn ipa_reads_the_interpolated_value() {
         let expected = "{0}:\n\
                         \x20 %0 = GetAttribute Generic0Y, #0x0\n\
-                        \x20 %1 = BitCastU32F32 %0\n\
-                        \x20 SetRegister R1, %1\n";
+                        \x20 %1 = GetAttribute PositionW, #0x0\n\
+                        \x20 %2 = FPMul32 %0, %1\n\
+                        \x20 %3 = BitCastU32F32 %2\n\
+                        \x20 SetRegister R1, %3\n";
         assert_eq!(run(Fragment, ipa(33, 0)), expected);
         let centroid = 1 << 76;
         let constant = 1 << 78;
@@ -659,8 +716,18 @@ mod tests {
              \x20 %0 = GetRegister UR5\n\
              \x20 %1 = IAdd32 %0, #0x80\n\
              \x20 %2 = GetAttributeIndexed %1, #0x0\n\
-             \x20 %3 = BitCastU32F32 %2\n\
-             \x20 SetRegister R1, %3\n"
+             \x20 %3 = GetAttribute PositionW, #0x0\n\
+             \x20 %4 = ShiftRightLogical32 %1, #0x4\n\
+             \x20 %5 = BitwiseAnd32 %4, #0x3f\n\
+             \x20 %6 = ULessThan %5, #0x20\n\
+             \x20 %7 = SelectU32 %6, #0xffffff00, #0x3ff4fff\n\
+             \x20 %8 = BitwiseAnd32 %5, #0x1f\n\
+             \x20 %9 = BitFieldUExtract %7, %8, #0x1\n\
+             \x20 %10 = INotEqual %9, #0x0\n\
+             \x20 %11 = SelectF32 %10, %3, #1.0f\n\
+             \x20 %12 = FPMul32 %2, %11\n\
+             \x20 %13 = BitCastU32F32 %12\n\
+             \x20 SetRegister R1, %13\n"
         );
         let urz = encode(Opcode::Ipa, Form::UregIndexed, fields | ra(63));
         assert!(run(Fragment, urz).starts_with("{0}:\n  %0 = GetAttribute Generic0X, #0x0\n"));
@@ -1204,7 +1271,60 @@ mod tests {
         );
         let ir = compile("ampere_fragment", &env);
         assert!(ir.contains("SetFragColor"), "{ir}");
-        assert!(!ir.contains("FPMul"), "{ir}");
+        assert_eq!(ir.matches("FPMul").count(), 3, "{ir}");
+    }
+
+    /// An indexed IPA divides by w only when the attribute it selects at run time is
+    /// perspective: the mask has a bit per 16-byte slot, generic n at slot 8 + n.
+    #[test]
+    fn indexed_ipa_masks_the_perspective_slots() {
+        let fields = dst(1) | ra(5) | rb(RZ) | (32 << 64) | PT_DST;
+        let code = [encode(Opcode::Ipa, Form::UregIndexed, fields), exit()];
+        let perspective_constant_screen_linear = 0xaa | (0x55 << 8) | (0xff << 16);
+        let mut env = whole_program(Fragment, &code, &[(6, perspective_constant_screen_linear)]);
+        env.header[7] = 0x5555_5555;
+        let mut prog = crate::ir::Program::new();
+        let block = prog.new_block();
+        super::super::translate_block(&mut prog, block, &env, 0, env.end() - 16).unwrap();
+        let ir = prog.dump();
+        let low = !(0xff | (0b110 << 8) | (0xf << 12));
+        assert!(
+            ir.contains(&format!("SelectU32 %6, #{low:#x}, #0x3ff4fff")),
+            "{ir}"
+        );
+    }
+
+    /// IPA returns a perspective input divided by w, which programs undo with the reciprocal of
+    /// IPA's position w; constant and screen-linear inputs come back as they are.
+    #[test]
+    fn ipa_divides_only_perspective_inputs_by_w() {
+        let code = [
+            ipa_to(0, 32, 0),
+            ipa_to(1, 36, 0),
+            ipa_to(2, 40, 0),
+            ipa_to(3, 31, 0),
+            exit(),
+        ];
+        let constant_screen_linear_perspective = 0x55 | (0xff << 8) | (0xaa << 16);
+        let env = whole_program(
+            Fragment,
+            &code,
+            &[
+                (0, 2 | (3 << 5) | (5 << 10)),
+                (5, 0x80 << 24),
+                (6, constant_screen_linear_perspective),
+                (18, 0xf),
+            ],
+        );
+        let ir = compile("ampere_fragment_imap", &env);
+        let multiplied: Vec<&str> = ir.lines().filter(|line| line.contains("FPMul")).collect();
+        assert_eq!(multiplied.len(), 1, "{ir}");
+        let z = ir
+            .lines()
+            .find(|line| line.contains("GetAttribute Generic2X"))
+            .and_then(|line| line.split_whitespace().next())
+            .expect("Generic2X is read");
+        assert!(multiplied[0].contains(&format!("FPMul32 {z},")), "{ir}");
     }
 
     #[test]

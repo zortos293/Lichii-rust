@@ -353,6 +353,8 @@ pub struct ShaderInfo {
     pub uses_sampled_1d: bool,
     pub uses_sparse_residency: bool,
     pub uses_demote_to_helper_invocation: bool,
+    /// The program interpolates an input at an offset, which needs the slope of FragCoord.w.
+    pub uses_interpolate_at_offset: bool,
     pub uses_subgroup_vote: bool,
     pub uses_subgroup_mask: bool,
     pub uses_fswzadd: bool,
