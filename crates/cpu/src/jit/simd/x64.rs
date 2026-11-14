@@ -1,9 +1,9 @@
 //! x86-64 code for `Op::Simd`.
 //!
 //! A checked op computes on the host only where the host's result is the Arm ARM's: FPCR selects
-//! round to nearest without flush to zero, FPSR.IXC is already set when the op can be inexact,
-//! and the result is not a NaN, an infinity or (for ops that can underflow) below the normal
-//! range. Any other case takes the op's slow path, which runs the instruction through
+//! round to nearest, FPSR.IXC is already set when the op can be inexact, no input is one FPCR.FZ
+//! would flush, and the result is not a NaN, an infinity or (for ops that can underflow) below the
+//! normal range. Any other case takes the op's slow path, which runs the instruction through
 //! `CallSimd` and reloads its result from the context.
 
 #![allow(
@@ -17,8 +17,10 @@ use super::super::ir::{Loc, Ty, Value};
 use super::super::x64::{CTX_FPCR, CTX_FPSR, CTX_PSTATE, Emitter, loc_offset};
 use super::ir::{Arith, Fp, Fused, SimdOp};
 
-/// FPCR.RMode and FPCR.FZ.
-pub(super) const HOST_FPCR: i32 = 3 << 22 | 1 << 24;
+/// FPCR.RMode.
+pub(super) const RMODE: i32 = 3 << 22;
+/// FPCR.FZ.
+const FZ: i32 = 1 << 24;
 /// FPSR.IXC.
 pub(super) const IXC: i8 = 0x10;
 /// An H value with exponent 31 (an infinity or a NaN, or under FPCR.AHP a normal number) falls
@@ -36,6 +38,65 @@ static HALF_SCALE: HalfScale = HalfScale([0x7780_0000, 0, 0, 0x7ef0_0000]);
 #[derive(Default)]
 pub(in super::super) struct State {
     slow: Vec<Slow>,
+    flush: Vec<Flush>,
+}
+
+/// The inputs of a checked op that FPCR.FZ changes. FZ flushes a subnormal input to zero and
+/// raises IDC, so one sends the op to its slow path. A sum also falls back on a nonzero input
+/// below 2^-103 (S) or 2^-970 (D): from there up, every input is a multiple of the smallest
+/// normal, so a nonzero exact sum is never below the normal range, where FZ would flush it. Every
+/// other result FZ flushes is below the normal range, which the result checks already send to the
+/// slow path.
+#[derive(Clone, Copy)]
+pub(super) struct Inputs {
+    fp: Fp,
+    sum: bool,
+    lanes: bool,
+    /// Each input `xmm` with, for a vector op, the mask of the lanes the op reads.
+    regs: [(u8, i32); 3],
+    len: usize,
+}
+
+impl Inputs {
+    pub(super) fn scalar(fp: Fp, regs: &[u8], sum: bool) -> Self {
+        let mut inputs = Self::lanes(fp, &[], sum);
+        for (slot, &reg) in inputs.regs.iter_mut().zip(regs) {
+            *slot = (reg, 1);
+        }
+        inputs.lanes = false;
+        inputs.len = regs.len();
+        inputs
+    }
+
+    pub(super) fn lanes(fp: Fp, regs: &[(u8, i32)], sum: bool) -> Self {
+        let mut all = [(0, 0); 3];
+        all[..regs.len()].copy_from_slice(regs);
+        Self {
+            fp,
+            sum,
+            lanes: true,
+            regs: all,
+            len: regs.len(),
+        }
+    }
+
+    /// The smallest magnitude, as bits, of a nonzero input that stays native under FZ.
+    fn floor(&self) -> u64 {
+        match (self.fp, self.sum) {
+            (Fp::S, false) => 0x0080_0000,
+            (Fp::S, true) => 0x0c00_0000,
+            (Fp::D, false) => 0x0010_0000_0000_0000,
+            (Fp::D, true) => 0x0350_0000_0000_0000,
+        }
+    }
+}
+
+/// The out-of-line check of a checked op's [`Inputs`], entered while FPCR.RMode or FPCR.FZ is set.
+struct Flush {
+    label: DynamicLabel,
+    resume: DynamicLabel,
+    slow: DynamicLabel,
+    inputs: Inputs,
 }
 
 /// The out-of-line path of a checked op: runs `word` through `CallSimd` and reloads the result.
@@ -66,15 +127,33 @@ impl Emitter<'_> {
     }
 
     /// Starts a checked op and returns its slow-path label. The host computes only under round to
-    /// nearest without flush to zero, and only reports inexact results by leaving FPSR.IXC alone,
-    /// so an op that can be inexact also falls back while IXC is clear.
-    pub(super) fn checked(&mut self, inexact: bool) -> DynamicLabel {
+    /// nearest, and only reports inexact results by leaving FPSR.IXC alone, so an op that can be
+    /// inexact also falls back while IXC is clear. While FPCR.FZ is set, `inputs` are checked out
+    /// of line, so the op costs nothing more while it is clear.
+    pub(super) fn checked(&mut self, inexact: bool, inputs: Option<Inputs>) -> DynamicLabel {
         let slow = self.asm.new_dynamic_label();
-        dynasm!(self.asm
-            ; .arch x64
-            ; test DWORD [r15 + CTX_FPCR], HOST_FPCR
-            ; jnz =>slow
-        );
+        match inputs {
+            None => dynasm!(self.asm
+                ; .arch x64
+                ; test DWORD [r15 + CTX_FPCR], RMODE
+                ; jnz =>slow
+            ),
+            Some(inputs) => {
+                let (label, resume) = (self.asm.new_dynamic_label(), self.asm.new_dynamic_label());
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; test DWORD [r15 + CTX_FPCR], RMODE | FZ
+                    ; jnz =>label
+                    ; =>resume
+                );
+                self.simd.flush.push(Flush {
+                    label,
+                    resume,
+                    slow,
+                    inputs,
+                });
+            }
+        }
         if inexact {
             dynasm!(self.asm
                 ; .arch x64
@@ -88,9 +167,17 @@ impl Emitter<'_> {
     /// Jumps to `slow` unless the FP result in `xmm15` is finite and, when `normal`, a normal
     /// number: a zero or subnormal result may have underflowed, and the Arm ARM detects tininess
     /// before rounding, so a result of exactly the smallest normal falls back too. A zero result
-    /// stays native when one of `zero_factors` is zero, because a product or quotient with a zero
-    /// factor or dividend is exactly zero. Leaves the result's bits in `rax`.
-    fn check_result(&mut self, fp: Fp, normal: bool, zero_factors: &[u8], slow: DynamicLabel) {
+    /// stays native when one of `zero_factors` (registers holding values of the given size) is
+    /// zero, because a product or quotient with a zero factor or dividend, and a conversion of a
+    /// zero, is exactly zero. Leaves the result's bits in `rax`.
+    fn check_result(
+        &mut self,
+        fp: Fp,
+        normal: bool,
+        zero_factors: (Fp, &[u8]),
+        slow: DynamicLabel,
+    ) {
+        let (factor_fp, zero_factors) = zero_factors;
         match fp {
             Fp::S => dynasm!(self.asm
                 ; .arch x64
@@ -145,13 +232,13 @@ impl Emitter<'_> {
         if let Some((&last, rest)) = zero_factors.split_last() {
             dynasm!(self.asm ; .arch x64 ; =>zero ; xorps xmm15, xmm15);
             for &f in rest {
-                match fp {
+                match factor_fp {
                     Fp::S => dynasm!(self.asm ; .arch x64 ; ucomiss xmm15, Rx(f)),
                     Fp::D => dynasm!(self.asm ; .arch x64 ; ucomisd xmm15, Rx(f)),
                 }
                 dynasm!(self.asm ; .arch x64 ; je =>done);
             }
-            match fp {
+            match factor_fp {
                 Fp::S => dynasm!(self.asm ; .arch x64 ; ucomiss xmm15, Rx(last)),
                 Fp::D => dynasm!(self.asm ; .arch x64 ; ucomisd xmm15, Rx(last)),
             }
@@ -205,6 +292,40 @@ impl Emitter<'_> {
             ; xor eax, 1
             ; lea Rd(d), [rdx + rax * 2]
         );
+    }
+
+    /// Jumps to `slow` if one of `inputs` is below its floor and not a zero. Clobbers `xmm15`,
+    /// `rax`, `rcx` and `rdx`.
+    fn flushed_inputs(&mut self, inputs: Inputs, slow: DynamicLabel) {
+        let regs = &inputs.regs[..inputs.len];
+        if inputs.lanes {
+            self.flushed_lanes(inputs.fp, regs, inputs.sum, slow);
+            return;
+        }
+        let bound = 2 * inputs.floor() - 4;
+        if inputs.fp == Fp::D {
+            dynasm!(self.asm ; .arch x64 ; mov rdx, QWORD bound as i64);
+        }
+        for &(x, _) in regs {
+            match inputs.fp {
+                Fp::S => dynasm!(self.asm
+                    ; .arch x64
+                    ; movd eax, Rx(x)
+                    ; add eax, eax
+                    ; sub eax, 2
+                    ; cmp eax, bound as i32
+                    ; jbe =>slow
+                ),
+                Fp::D => dynasm!(self.asm
+                    ; .arch x64
+                    ; movq rax, Rx(x)
+                    ; add rax, rax
+                    ; sub rax, 2
+                    ; cmp rax, rdx
+                    ; jbe =>slow
+                ),
+            }
+        }
     }
 
     pub(super) fn finish_checked(
@@ -295,7 +416,8 @@ impl Emitter<'_> {
                 let (a, b) = (self.reg(a), self.reg(b));
                 let d = self.def(v);
                 let extreme = matches!(op, Arith::Max | Arith::Min);
-                let slow = self.checked(!extreme);
+                let sum = matches!(op, Arith::Add | Arith::Sub);
+                let slow = self.checked(!extreme, Some(Inputs::scalar(fp, &[a, b], sum)));
                 dynasm!(self.asm ; .arch x64 ; movaps xmm15, Rx(a));
                 match (op, fp) {
                     (Arith::Max | Arith::Min, _) => self.min_max(op == Arith::Max, fp, a, b, slow),
@@ -311,9 +433,9 @@ impl Emitter<'_> {
                     (Arith::Nmul, Fp::D) => dynasm!(self.asm ; .arch x64 ; mulsd xmm15, Rx(b)),
                 }
                 match op {
-                    Arith::Add | Arith::Sub => self.check_result(fp, false, &[], slow),
-                    Arith::Mul | Arith::Nmul => self.check_result(fp, true, &[a, b], slow),
-                    Arith::Div => self.check_result(fp, true, &[a], slow),
+                    Arith::Add | Arith::Sub => self.check_result(fp, false, (fp, &[]), slow),
+                    Arith::Mul | Arith::Nmul => self.check_result(fp, true, (fp, &[a, b]), slow),
+                    Arith::Div => self.check_result(fp, true, (fp, &[a]), slow),
                     Arith::Max | Arith::Min => self.low_to_rax(fp, 15),
                 }
                 match (op, fp) {
@@ -336,7 +458,7 @@ impl Emitter<'_> {
             } => {
                 let (n, m, a) = (self.reg(n), self.reg(m), self.reg(a));
                 let d = self.def(v);
-                let slow = self.checked(true);
+                let slow = self.checked(true, Some(Inputs::scalar(fp, &[n, m, a], false)));
                 if self.target.fma {
                     dynasm!(self.asm ; .arch x64 ; movaps xmm15, Rx(a));
                     match (op, fp) {
@@ -365,7 +487,7 @@ impl Emitter<'_> {
                             dynasm!(self.asm ; .arch x64 ; vfmsub231sd xmm15, Rx(n), Rx(m))
                         }
                     }
-                    self.check_result(fp, true, &[n, m], slow);
+                    self.check_result(fp, true, (fp, &[n, m]), slow);
                     self.rax_to_low(fp, d);
                 } else {
                     dynasm!(self.asm ; .arch x64 ; jmp =>slow);
@@ -375,12 +497,12 @@ impl Emitter<'_> {
             SimdOp::Sqrt { fp, a, word } => {
                 let a = self.reg(a);
                 let d = self.def(v);
-                let slow = self.checked(true);
+                let slow = self.checked(true, Some(Inputs::scalar(fp, &[a], false)));
                 match fp {
                     Fp::S => dynasm!(self.asm ; .arch x64 ; sqrtss xmm15, Rx(a)),
                     Fp::D => dynasm!(self.asm ; .arch x64 ; sqrtsd xmm15, Rx(a)),
                 }
-                self.check_result(fp, false, &[], slow);
+                self.check_result(fp, false, (fp, &[]), slow);
                 self.rax_to_low(fp, d);
                 self.finish_checked(i, slow, word, d, Ty::U128);
             }
@@ -427,7 +549,7 @@ impl Emitter<'_> {
                 let a = self.reg(a);
                 let d = self.def(v);
                 let narrowing = fp == Fp::D;
-                let slow = self.checked(narrowing);
+                let slow = self.checked(narrowing, Some(Inputs::scalar(fp, &[a], false)));
                 let to = match fp {
                     Fp::S => {
                         dynasm!(self.asm ; .arch x64 ; cvtss2sd xmm15, Rx(a));
@@ -438,7 +560,7 @@ impl Emitter<'_> {
                         Fp::S
                     }
                 };
-                self.check_result(to, narrowing, &[], slow);
+                self.check_result(to, narrowing, (fp, &[a]), slow);
                 self.rax_to_low(to, d);
                 self.finish_checked(i, slow, word, d, Ty::U128);
             }
@@ -451,7 +573,7 @@ impl Emitter<'_> {
             } => {
                 let x = self.reg(x);
                 let d = self.def(v);
-                let slow = self.checked(true);
+                let slow = self.checked(true, None);
                 match (signed, wide) {
                     (true, true) => dynasm!(self.asm ; .arch x64 ; mov rax, Rq(x)),
                     (true, false) => dynasm!(self.asm ; .arch x64 ; movsxd rax, Rd(x)),
@@ -481,7 +603,7 @@ impl Emitter<'_> {
             } => {
                 let a = self.reg(a);
                 let d = self.def(v);
-                let slow = self.checked(true);
+                let slow = self.checked(true, Some(Inputs::scalar(fp, &[a], false)));
                 match (fp, signed && !wide) {
                     (Fp::S, true) => dynasm!(self.asm ; .arch x64 ; cvttss2si eax, Rx(a)),
                     (Fp::D, true) => dynasm!(self.asm ; .arch x64 ; cvttsd2si eax, Rx(a)),
@@ -525,7 +647,9 @@ impl Emitter<'_> {
                     }
                 };
                 let d = self.def(v);
-                let slow = self.checked(false);
+                let inputs = [a, b];
+                let inputs = &inputs[..if b == 15 { 1 } else { 2 }];
+                let slow = self.checked(false, Some(Inputs::scalar(fp, inputs, false)));
                 self.compare_flags(fp, a, b, d, slow);
                 self.finish_checked(i, slow, word, d, Ty::Nzcv);
             }
@@ -541,7 +665,7 @@ impl Emitter<'_> {
                 let d = self.def(v);
                 let (skip, done) = (self.asm.new_dynamic_label(), self.asm.new_dynamic_label());
                 dynasm!(self.asm ; .arch x64 ; test Rd(c), Rd(c) ; jz =>skip);
-                let slow = self.checked(false);
+                let slow = self.checked(false, Some(Inputs::scalar(fp, &[a, b], false)));
                 self.compare_flags(fp, a, b, d, slow);
                 dynasm!(self.asm
                     ; .arch x64
@@ -558,8 +682,18 @@ impl Emitter<'_> {
         }
     }
 
-    /// Emits the slow paths of every checked op in the block.
+    /// Emits the slow paths and FZ input checks of every checked op in the block.
     pub(in super::super) fn simd_slow_paths(&mut self) {
+        for flush in std::mem::take(&mut self.simd.flush) {
+            dynasm!(self.asm
+                ; .arch x64
+                ; =>flush.label
+                ; test DWORD [r15 + CTX_FPCR], RMODE
+                ; jnz =>flush.slow
+            );
+            self.flushed_inputs(flush.inputs, flush.slow);
+            dynasm!(self.asm ; .arch x64 ; jmp =>flush.resume);
+        }
         for slow in std::mem::take(&mut self.simd.slow) {
             dynasm!(self.asm ; .arch x64 ; =>slow.label);
             if slow.ty == Ty::Nzcv {

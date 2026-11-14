@@ -1,7 +1,8 @@
 //! Advanced SIMD floating-point arithmetic on S and D lanes, compiled as checked ops: every lane is
 //! computed on the host, and the whole instruction falls back to `CallSimd` unless each lane the
-//! instruction writes passes the scalar checks (finite, and above the smallest normal or an exact
-//! zero for the ops that can underflow).
+//! instruction reads passes the scalar FPCR.FZ input check and each lane it writes passes the
+//! scalar result checks (finite, and above the smallest normal or an exact zero for the ops that
+//! can underflow).
 
 #![allow(
     clippy::useless_conversion,
@@ -14,6 +15,7 @@ use super::super::ir::{Loc, Op, Ty, Value};
 use super::super::translate::Translator;
 use super::super::x64::Emitter;
 use super::ir::{Fp, SimdOp};
+use super::x64::Inputs;
 use crate::interpreter::simd::softfloat::{recip_estimate_u9, recip_sqrt_estimate_u9};
 
 const SCRATCH: u8 = 15;
@@ -45,6 +47,12 @@ pub enum LaneOp {
     RecipEstimate,
     /// `FRSQRTE` on S lanes of `n`.
     RsqrtEstimate,
+    /// `FSQRT` on the lanes of `n`.
+    Sqrt,
+    /// `FMAX` or `FMAXNM`, which differ only on NaNs.
+    Max,
+    /// `FMIN` or `FMINNM`, which differ only on NaNs.
+    Min,
 }
 
 /// A lane-wise op on `n` and `m`, or on `n` and lane `index` of `m` for the by-element forms. It
@@ -166,9 +174,10 @@ static RECIP_FRACTIONS: [u8; 256] = {
     table
 };
 
-/// The absolute-value mask, infinity and the smallest normal in every lane, for S then D.
+/// The absolute-value mask, infinity, the smallest normal, zero and a sum's input floor (see
+/// [`Inputs`]) in every lane, for S then D.
 #[repr(align(16))]
-struct Bounds([u32; 24]);
+struct Bounds([u32; 40]);
 
 static BOUNDS: Bounds = Bounds([
     0x7fff_ffff,
@@ -183,6 +192,14 @@ static BOUNDS: Bounds = Bounds([
     0x0080_0000,
     0x0080_0000,
     0x0080_0000,
+    0,
+    0,
+    0,
+    0,
+    0x0c00_0000,
+    0x0c00_0000,
+    0x0c00_0000,
+    0x0c00_0000,
     0xffff_ffff,
     0x7fff_ffff,
     0xffff_ffff,
@@ -195,7 +212,20 @@ static BOUNDS: Bounds = Bounds([
     0x0010_0000,
     0x0000_0000,
     0x0010_0000,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0x0350_0000,
+    0,
+    0x0350_0000,
 ]);
+
+/// The `BOUNDS` rows for `fp`.
+fn bounds(fp: Fp) -> i64 {
+    BOUNDS.0.as_ptr() as i64 + if fp == Fp::D { 80 } else { 0 }
+}
 
 const fn field(word: u32, low: u32, bits: u32) -> u8 {
     ((word >> low) & ((1 << bits) - 1)) as u8
@@ -222,6 +252,8 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         0x0e20_e400 => Some(LaneOp::CompareEq),
         0x2e20_e400 => Some(LaneOp::CompareGe),
         0x2ea0_e400 => Some(LaneOp::CompareGt),
+        0x0e20_f400 | 0x0e20_c400 => Some(LaneOp::Max),
+        0x0ea0_f400 | 0x0ea0_c400 => Some(LaneOp::Min),
         _ => None,
     };
     let by_element = |masked: u32| match masked {
@@ -236,7 +268,9 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         0x2ea1_d800 => Some(LaneOp::RsqrtEstimate),
         _ => None,
     };
-    let (op, element, lanes) = if let Some(op) = unary(word & 0xbfff_fc00) {
+    let (op, element, lanes) = if word & 0xbfbf_fc00 == 0x2ea1_f800 {
+        (LaneOp::Sqrt, false, vector_lanes)
+    } else if let Some(op) = unary(word & 0xbfff_fc00) {
         (op, false, vector_lanes)
     } else if let Some(op) =
         unary(word & 0xffff_fc00 ^ 0x5000_0000).filter(|&op| op != LaneOp::FromInt)
@@ -269,7 +303,7 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
     let n = vec(t, rn);
     let m = if matches!(
         op,
-        LaneOp::FromInt | LaneOp::RecipEstimate | LaneOp::RsqrtEstimate
+        LaneOp::FromInt | LaneOp::RecipEstimate | LaneOp::RsqrtEstimate | LaneOp::Sqrt
     ) {
         n
     } else {
@@ -310,10 +344,24 @@ impl Emitter<'_> {
             LaneOp::CompareEq | LaneOp::CompareGe | LaneOp::CompareGt
         );
         let estimate = matches!(op, LaneOp::RecipEstimate | LaneOp::RsqrtEstimate);
-        let slow = if estimate {
-            self.asm.new_dynamic_label()
-        } else {
-            self.checked(!compare)
+        let extreme = matches!(op, LaneOp::Max | LaneOp::Min);
+        let written = (1i32 << lanes) - 1;
+        let element = index.map_or(written, |index| 1 << index);
+        let inputs = [(n, written), (m, element), (acc.unwrap_or(n), written)];
+        let count = match (acc, op) {
+            (Some(_), _) => 3,
+            (_, LaneOp::Sqrt) => 1,
+            _ => 2,
+        };
+        let inputs = Inputs::lanes(
+            fp,
+            &inputs[..count],
+            matches!(op, LaneOp::Add | LaneOp::Sub | LaneOp::AddPairwise),
+        );
+        let slow = match op {
+            _ if estimate => self.asm.new_dynamic_label(),
+            LaneOp::FromInt => self.checked(true, None),
+            _ => self.checked(!compare && !extreme, Some(inputs)),
         };
         let fused = matches!(
             op,
@@ -337,8 +385,7 @@ impl Emitter<'_> {
                 SCRATCH
             }
         };
-        if compare {
-            let written = (1i32 << lanes) - 1;
+        if compare || extreme {
             dynasm!(self.asm ; .arch x64 ; movaps xmm15, Rx(n));
             match fp {
                 Fp::S => {
@@ -351,7 +398,7 @@ impl Emitter<'_> {
             dynasm!(self.asm ; .arch x64 ; test eax, written ; jnz =>slow);
         }
         match op {
-            LaneOp::FromInt | LaneOp::RecipEstimate | LaneOp::RsqrtEstimate => {}
+            LaneOp::FromInt | LaneOp::RecipEstimate | LaneOp::RsqrtEstimate | LaneOp::Sqrt => {}
             LaneOp::CompareGe | LaneOp::CompareGt => {
                 dynasm!(self.asm ; .arch x64 ; movaps Rx(d), Rx(m))
             }
@@ -368,6 +415,40 @@ impl Emitter<'_> {
         }
         match (op, fp) {
             (LaneOp::FromInt, _) => dynasm!(self.asm ; .arch x64 ; cvtdq2ps Rx(d), Rx(n)),
+            (LaneOp::Sqrt, Fp::S) => dynasm!(self.asm ; .arch x64 ; sqrtps Rx(d), Rx(n)),
+            (LaneOp::Sqrt, Fp::D) => dynasm!(self.asm ; .arch x64 ; sqrtpd Rx(d), Rx(n)),
+            (LaneOp::Max, Fp::S) => dynasm!(self.asm
+                ; .arch x64
+                ; movaps xmm15, Rx(n)
+                ; cmpps xmm15, Rx(m), 4
+                ; orps xmm15, Rx(n)
+                ; maxps Rx(d), Rx(m)
+                ; andps Rx(d), xmm15
+            ),
+            (LaneOp::Max, Fp::D) => dynasm!(self.asm
+                ; .arch x64
+                ; movaps xmm15, Rx(n)
+                ; cmppd xmm15, Rx(m), 4
+                ; orps xmm15, Rx(n)
+                ; maxpd Rx(d), Rx(m)
+                ; andps Rx(d), xmm15
+            ),
+            (LaneOp::Min, Fp::S) => dynasm!(self.asm
+                ; .arch x64
+                ; movaps xmm15, Rx(n)
+                ; cmpps xmm15, Rx(m), 0
+                ; andps xmm15, Rx(n)
+                ; minps Rx(d), Rx(m)
+                ; orps Rx(d), xmm15
+            ),
+            (LaneOp::Min, Fp::D) => dynasm!(self.asm
+                ; .arch x64
+                ; movaps xmm15, Rx(n)
+                ; cmppd xmm15, Rx(m), 0
+                ; andps xmm15, Rx(n)
+                ; minpd Rx(d), Rx(m)
+                ; orps Rx(d), xmm15
+            ),
             (LaneOp::RecipEstimate | LaneOp::RsqrtEstimate, _) => {
                 self.estimate(op == LaneOp::RsqrtEstimate, lanes, d, n, slow)
             }
@@ -423,7 +504,7 @@ impl Emitter<'_> {
             }
             (LaneOp::Mls, Fp::D) => self.fma231pd(0xbc, d, n, b),
         }
-        if op != LaneOp::FromInt && !compare && !estimate {
+        if op != LaneOp::FromInt && !compare && !estimate && !extreme {
             self.check_lanes(op, fp, lanes, d, n, m, index, slow);
         }
         match (fp, lanes) {
@@ -523,6 +604,30 @@ impl Emitter<'_> {
         }
     }
 
+    /// Jumps to `slow` if a lane of an input `xmm` that its mask selects is below the smallest
+    /// normal, or for a `sum` below its floor (see [`Inputs`]), and not a zero. Clobbers `xmm15`,
+    /// `rax` and `rcx`.
+    pub(super) fn flushed_lanes(
+        &mut self,
+        fp: Fp,
+        inputs: &[(u8, i32)],
+        sum: bool,
+        slow: dynasmrt::DynamicLabel,
+    ) {
+        const LT: i8 = 1;
+        const NEQ: i8 = 4;
+        const RCX: u8 = 1;
+        dynasm!(self.asm ; .arch x64 ; mov rax, QWORD bounds(fp));
+        for &(src, mask) in inputs {
+            dynasm!(self.asm ; .arch x64 ; movaps xmm15, Rx(src) ; andps xmm15, [rax]);
+            self.compare_bound(fp, if sum { 64 } else { 32 }, LT);
+            dynasm!(self.asm ; .arch x64 ; andps xmm15, Rx(src));
+            self.compare_bound(fp, 48, NEQ);
+            self.lane_mask(fp, RCX);
+            dynasm!(self.asm ; .arch x64 ; test ecx, mask ; jnz =>slow);
+        }
+    }
+
     /// Jumps to `slow` unless every written lane of the result in `xmm d` is finite and, for the
     /// ops that can underflow, above the smallest normal or a zero whose product had a zero
     /// factor. Clobbers `xmm15`, `rax`, `rcx` and `rdx`.
@@ -538,7 +643,6 @@ impl Emitter<'_> {
         index: Option<u8>,
         slow: dynasmrt::DynamicLabel,
     ) {
-        let bounds = BOUNDS.0.as_ptr() as i64 + if fp == Fp::D { 48 } else { 0 };
         let written = (1i32 << lanes) - 1;
         const LT: i8 = 1;
         const NLE: i8 = 6;
@@ -547,7 +651,7 @@ impl Emitter<'_> {
         const RDX: u8 = 2;
         dynasm!(self.asm
             ; .arch x64
-            ; mov rax, QWORD bounds
+            ; mov rax, QWORD bounds(fp)
             ; movaps xmm15, Rx(d)
             ; andps xmm15, [rax]
         );

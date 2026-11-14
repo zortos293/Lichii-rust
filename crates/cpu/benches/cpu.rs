@@ -412,6 +412,27 @@ const WORKLOADS: &[Workload] = &[
         per_iteration: 10,
     },
     Workload {
+        name: "zip widen loop",
+        code: &[
+            0x4f03f700, // fmov v0.4s, #1.5
+            0x4f03f501, // fmov v1.4s, #0.75
+            0x4e813802, // 1: zip1 v2.4s, v0.4s, v1.4s
+            0x4e817803, // zip2 v3.4s, v0.4s, v1.4s
+            0x6ea31c44, // bit v4.16b, v2.16b, v3.16b
+            0x4ea36c45, // smin v5.4s, v2.4s, v3.4s
+            0x2e641026, // uaddw v6.4s, v1.4s, v4.4h
+            0x0f10a4a7, // sshll v7.4s, v5.4h, #0
+            0x6ea1f848, // fsqrt v8.4s, v2.4s
+            0x4e23f449, // fmax v9.4s, v2.4s, v3.4s
+            0x4c007828, // st1 {v8.4s}, [x1]
+            0xf10004a5, // subs x5, x5, #1
+            0x54fffec1, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 11,
+    },
+    Workload {
         name: "saturating narrow loop",
         code: &[
             0x4f000460, // movi v0.4s, #3
@@ -502,14 +523,26 @@ const WORKLOADS: &[Workload] = &[
     },
 ];
 
+/// Workloads that run a second time under FPCR.FZ, which titles such as Splatoon 3 set.
+const FLUSH_TO_ZERO: &[&str] = &[
+    "scalar fp loop",
+    "vector fp loop",
+    "fp element loop",
+    "fp compare loop",
+];
+
 fn main() {
     let iterations: u64 = std::env::var("LICHII_BENCH_ITERATIONS")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|&n| n > 0)
         .unwrap_or(10_000_000);
-    for (workload, backend) in WORKLOADS
+    for ((workload, fpcr), backend) in WORKLOADS
         .iter()
+        .flat_map(|w| {
+            let fz = FLUSH_TO_ZERO.contains(&w.name).then_some((w, 1 << 24));
+            std::iter::once((w, 0)).chain(fz)
+        })
         .flat_map(|w| [(w, CpuBackend::Interpreter), (w, CpuBackend::Jit)])
     {
         let mem = Arc::new(
@@ -543,6 +576,7 @@ fn main() {
         for _ in 0..3 {
             let mut ctx = ThreadContext {
                 pc: CODE,
+                fpcr,
                 ..Default::default()
             };
             ctx.x[1] = DATA;
@@ -552,9 +586,12 @@ fn main() {
             seconds = seconds.min(start.elapsed().as_secs_f64());
         }
         let instructions = iterations * workload.per_iteration;
+        let name = match fpcr {
+            0 => workload.name.to_string(),
+            _ => format!("{} fz", workload.name),
+        };
         println!(
-            "{:<18} {:<12} {:>8.1} MIPS ({instructions} instructions in {seconds:.3} s, best of 3)",
-            workload.name,
+            "{name:<18} {:<12} {:>8.1} MIPS ({instructions} instructions in {seconds:.3} s, best of 3)",
             format!("{backend:?}"),
             instructions as f64 / seconds / 1e6
         );

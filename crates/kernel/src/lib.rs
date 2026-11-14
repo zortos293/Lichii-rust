@@ -466,6 +466,7 @@ impl KernelInner {
             process.threads.lock().clear();
             if process.state() != ProcessState::Exited {
                 process.finalize();
+                process.memory().release_fastmem();
             }
         }
     }
@@ -832,6 +833,7 @@ impl KernelInner {
             self.events.on_process_exit(process);
             self.processes.lock().retain(|p| !Arc::ptr_eq(p, process));
             self.process_exits.fetch_add(1, Ordering::Release);
+            process.memory().release_fastmem();
         }
     }
 }
