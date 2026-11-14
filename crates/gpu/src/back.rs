@@ -260,10 +260,8 @@ impl Back {
                 1
             }
             tag::WAIT_FOR_IDLE => {
-                let waiting = self.activity.waiting(Wait::HostGpu);
-                self.rasterizer.wait_for_idle();
-                drop(waiting);
                 self.rasterizer.release_fences(false);
+                self.rasterizer.barrier();
                 1
             }
             tag::INVALIDATE_CACHES => {
