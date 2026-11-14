@@ -866,6 +866,8 @@ pub struct PipelineCache {
     waits: u64,
     /// [`Self::graphics_waiting`] lookups that waited for a pipeline still building.
     blocked: u64,
+    /// Render-thread time spent creating, linking or waiting for graphics pipelines.
+    stalled: Duration,
     /// Run by tests when a [`Self::graphics_waiting`] lookup is about to wait.
     #[cfg(test)]
     on_block: Option<Box<dyn FnOnce() + Send>>,
@@ -994,6 +996,7 @@ impl PipelineCache {
             linking: HashMap::default(),
             waits: 0,
             blocked: 0,
+            stalled: Duration::ZERO,
             #[cfg(test)]
             on_block: None,
             saved: Some((0, 0)),
@@ -1033,7 +1036,7 @@ impl PipelineCache {
     ) -> Option<&Pipeline> {
         let index = match self.graphics.get(key) {
             Some(&index) => index,
-            None => self.insert_graphics(key, shaders, true),
+            None => self.timed_insert(key, shaders),
         };
         if self.async_compile && self.slots[index].get().is_none() {
             if self.ctx.features.fast_link && self.fast_linked(index, key, shaders).is_some() {
@@ -1058,7 +1061,7 @@ impl PipelineCache {
     ) -> Option<&Pipeline> {
         let index = match self.graphics.get(key) {
             Some(&index) => index,
-            None => self.insert_graphics(key, shaders, true),
+            None => self.timed_insert(key, shaders),
         };
         if self.async_compile && self.slots[index].get().is_none() {
             self.blocked += 1;
@@ -1068,17 +1071,35 @@ impl PipelineCache {
             }
             if self.ctx.features.fast_link && self.fast_linked(index, key, shaders).is_none() {
                 if let Some(Linking::Parts(parts, _)) = self.linking.get(&index) {
+                    let start = Instant::now();
                     for part in parts {
                         part.wait();
                     }
+                    self.stalled += start.elapsed();
                 }
                 let _ = self.fast_linked(index, key, shaders);
             }
             if let Some(Linking::Linked(pipeline)) = self.linking.get(&index) {
                 return Some(pipeline);
             }
+            let start = Instant::now();
+            self.slots[index].wait();
+            self.stalled += start.elapsed();
         }
         self.slots[index].wait().as_ref()
+    }
+
+    fn timed_insert(&mut self, key: &GraphicsPipelineKey, shaders: &GraphicsShaders) -> usize {
+        let start = Instant::now();
+        let index = self.insert_graphics(key, shaders, true);
+        self.stalled += start.elapsed();
+        index
+    }
+
+    /// Render-thread time since the cache was created spent creating graphics pipelines and
+    /// libraries in place, fast-linking them, and waiting for workers to build them.
+    pub fn stalled(&self) -> Duration {
+        self.stalled
     }
 
     /// Graphics lookups since the cache was created that waited for a pipeline still building.
@@ -1114,7 +1135,10 @@ impl PipelineCache {
                     Some(Some(library)) => *raw = library.raw,
                 }
             }
-            *linking = match self.ctx.link(&libraries[..parts.len()], layout) {
+            let start = Instant::now();
+            let linked = self.ctx.link(&libraries[..parts.len()], layout);
+            self.stalled += start.elapsed();
+            *linking = match linked {
                 Ok(pipeline) => {
                     self.ctx.shared.fast_linked.fetch_add(1, Ordering::Relaxed);
                     Linking::Linked(pipeline)
@@ -2437,6 +2461,7 @@ mod tests {
         );
         gate.join().unwrap();
         assert_eq!((cache.blocked(), cache.waits()), (1, 0));
+        assert!(cache.stalled() > Duration::ZERO, "the wait is timed");
         cache.wait_for_builds();
         assert!(cache.graphics_waiting(&key, &shaders).is_some());
         assert_eq!(cache.blocked(), 1, "a built pipeline needs no wait");

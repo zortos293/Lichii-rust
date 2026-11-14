@@ -831,6 +831,10 @@ fn draws_into_targets_no_present_showed_translate_in_place_instead_of_skipping()
         (0, 2),
         "nothing skipped; the vertex and fragment programs translated in place"
     );
+    assert!(
+        shaders.stalled() > std::time::Duration::ZERO,
+        "the translations are timed"
+    );
     f.assert_no_validation_errors();
 }
 

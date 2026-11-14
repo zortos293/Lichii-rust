@@ -68,10 +68,12 @@ struct Activity {
     buffers: BufferCacheStats,
 }
 
-/// Draws skipped while their shaders translated or their pipelines built, and the longest time
-/// between two presents, over the second since the last `draw stalls` line. The line is
-/// written at INFO, at most once a second, only for a second that skipped draws or held a
-/// present back for [`Stalls::SLOW_FRAME`] or more, so scene loads show up and steady play does not.
+/// Draws skipped while their shaders translated or their pipelines built, draws that waited
+/// for them, the render-thread time spent translating and building in place or waiting, and
+/// the longest time between two presents, over the second since the last `draw stalls` line.
+/// The line is written at INFO, at most once a second, only for a second that skipped or
+/// waited, compiled on the render thread for a millisecond or more, or held a present back for
+/// [`Stalls::SLOW_FRAME`] or more, so scene loads show up and steady play does not.
 #[derive(Default)]
 struct Stalls {
     since: Option<Instant>,
@@ -80,6 +82,8 @@ struct Stalls {
     presents: u32,
     /// Shader and pipeline skips and blocking waits when the window started.
     waits_at: [u64; 4],
+    /// Shader and pipeline render-thread compile time when the window started.
+    stalled_at: [Duration; 2],
 }
 
 impl Stalls {
@@ -96,10 +100,13 @@ impl Stalls {
             shaders.blocked(),
             pipelines.blocked(),
         ];
+        let stalled = [shaders.stalled(), pipelines.stalled()];
         let since = *self.since.get_or_insert(now);
         if now - since < Duration::from_secs(1) {
             return;
         }
+        let [shader_ms, pipeline_ms] =
+            std::array::from_fn(|i| (stalled[i] - self.stalled_at[i]).as_secs_f32() * 1000.0);
         let [
             skipped_shader,
             skipped_pipeline,
@@ -107,6 +114,7 @@ impl Stalls {
             waited_pipeline,
         ] = std::array::from_fn(|i| waits[i] - self.waits_at[i]);
         if skipped_shader + skipped_pipeline + waited_shader + waited_pipeline > 0
+            || shader_ms + pipeline_ms >= 1.0
             || self.worst_frame >= Self::SLOW_FRAME
         {
             tracing::info!(
@@ -114,6 +122,8 @@ impl Stalls {
                 skipped_pipeline,
                 waited_shader,
                 waited_pipeline,
+                shader_ms,
+                pipeline_ms,
                 worst_frame_ms = self.worst_frame.as_secs_f32() * 1000.0,
                 presents = self.presents,
                 seconds = (now - since).as_secs_f32(),
@@ -126,6 +136,7 @@ impl Stalls {
             since: Some(now),
             last_present: Some(now),
             waits_at: waits,
+            stalled_at: stalled,
             ..Self::default()
         };
     }
