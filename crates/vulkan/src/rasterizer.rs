@@ -469,14 +469,28 @@ impl VulkanRasterizer {
     }
 
     /// Presents a framebuffer the GPU rendered into a cached image: copies it, at the image's
-    /// scale, into a frame image on the GPU. `false` when the formats need the CPU path.
+    /// scale, into a frame image on the GPU. `false` when the formats need the CPU path. The
+    /// display reads the image's texels as the framebuffer format, as the guest does, so they are
+    /// copied as bits whenever both host formats store the guest texels as they are: an sRGB
+    /// render target shown as UNORM keeps its encoded values instead of being decoded to linear.
     fn present_cached(&mut self, fb: &FramebufferConfig, id: ImageId) -> Result<bool> {
         let Some(state) = self.texture_cache.state(id) else {
             return Ok(false);
         };
         let host = host_format(&self.device, fb.format, AstcRecompression::Uncompressed);
+        let source = host_format(
+            &self.device,
+            state.info.format,
+            AstcRecompression::Uncompressed,
+        );
         let blit = vk::FormatFeatureFlags::BLIT_SRC | vk::FormatFeatureFlags::BLIT_DST;
-        let same_format = state.format == host.format;
+        let order = |m: vk::ComponentMapping| (m.r, m.g, m.b, m.a);
+        let same_format = state.format == host.format
+            || (source.format == state.format
+                && source.conversion == Conversion::None
+                && host.conversion == Conversion::None
+                && order(source.swizzle) == order(host.swizzle)
+                && state.info.format.bytes_per_block() == fb.format.bytes_per_block());
         if !same_format
             && !(self.device.format_features(state.format).contains(blit)
                 && self.device.format_features(host.format).contains(blit))
@@ -1803,6 +1817,30 @@ mod tests {
             );
             f.assert_no_validation_errors();
         }
+    }
+
+    #[test]
+    fn srgb_render_targets_present_their_encoded_texels() {
+        let Some(mut f) = fixture(GobLayout::Tegra) else {
+            return;
+        };
+        let gmmu = gmmu(&f);
+        let (width, height) = (64, 64);
+        let mut regs = clear_regs(width, height, 3, [0.5, 0.0, 1.0, 1.0]);
+        regs.rt[0].format = 0xd6;
+        clear(&mut f, &gmmu, &regs);
+        f.rasterizer.present(&FramebufferConfig {
+            block_height_log2: Some(3),
+            ..framebuffer(width, height)
+        });
+        let (_, texels) = f.read_frame();
+        let first = texels.as_chunks::<4>().0[0];
+        assert!(
+            (187..=189).contains(&first[0]) && first[1..] == [0, 255, 255],
+            "the frame shows the sRGB-encoded texel as the guest stores it, got {first:?}"
+        );
+        assert!(texels.as_chunks::<4>().0.iter().all(|t| *t == first));
+        f.assert_no_validation_errors();
     }
 
     #[test]
