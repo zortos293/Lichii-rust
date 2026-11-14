@@ -258,7 +258,7 @@ impl GameConfigWindow {
                         |ui, d| {
                             ui.checkbox(
                                 &mut d.graphics.async_shader_compilation,
-                                "Build shaders asynchronously",
+                                "Build shaders asynchronously (less stutter, but can corrupt some scenes)",
                             );
                         },
                     );

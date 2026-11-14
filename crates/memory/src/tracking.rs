@@ -28,6 +28,24 @@
 //! Pages that are not tracked cost nothing on fastmem accesses; the first write to a tracked page
 //! costs one fault, once per cache cycle.
 //!
+//! # Flush traps
+//!
+//! The other direction: a GPU cache that leaves GPU-modified data in device memory without writing
+//! it back arms a flush trap over it with [`DeviceAddressSpace::arm_flush_traps`]. Every
+//! physical page under it gets a per-physical-page flag, a flag on every virtual page that maps it,
+//! and an inaccessible fastmem view. Any CPU access then reaches the [`FlushTrapHandler`] first,
+//! which has the GPU write the data back and disarms what it wrote back; the access goes on after
+//! it returns.
+//! - JIT loads and stores fault into their slow path, which accesses through the page table.
+//! - Host accesses through the page table test the flag in the entry they load anyway. Host code
+//!   that reads through a raw pointer calls [`crate::AddressSpace::flush_gpu_writes`] first.
+//! - Writes trap too, so a CPU store lands over the written-back data rather than under data the
+//!   GPU writes back later.
+//! - Arming a trapped page again costs one flag test, with no lock; a trap costs one fault and one
+//!   write-back per cycle.
+//!
+//! [`DeviceAddressSpace::arm_flush_traps`]: crate::DeviceAddressSpace::arm_flush_traps
+//!
 //! [`DeviceAddressSpace::cache_pages`]: crate::DeviceAddressSpace::cache_pages
 //! [`DeviceAddressSpace::take_cpu_writes`]: crate::DeviceAddressSpace::take_cpu_writes
 
@@ -204,6 +222,16 @@ impl DirtyPages {
         }
         flush(&mut run);
     }
+}
+
+/// Writes GPU-modified data back to guest memory before a CPU access, for flush traps. Installed
+/// with [`crate::DeviceAddressSpace::set_flush_trap_handler`].
+pub trait FlushTrapHandler: Send + Sync {
+    /// The CPU is about to access device page `[daddr, daddr + size)`, whose physical page has
+    /// a flush trap. Returns once the GPU-modified data there is in guest memory, disarming the
+    /// traps of what it wrote back. Runs on the accessing thread, which may be a guest core, so
+    /// it must not access the process's memory through [`AddressSpace`].
+    fn flush_for_cpu(&self, daddr: lichii_common::DAddr, size: u64);
 }
 
 /// Physical pages a GPU cache copied, tracked for CPU writes until the guard is dropped. Take it
@@ -454,5 +482,269 @@ mod tests {
             last.load(Ordering::Relaxed),
             "the copy missed a write"
         );
+    }
+}
+
+#[cfg(test)]
+mod flush_trap_tests {
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Weak};
+    use std::time::Duration;
+
+    use parking_lot::Mutex;
+
+    use super::FlushTrapHandler;
+    use crate::{
+        AddressSpace, DeviceAddressSpace, ExclusiveMonitor, MemoryPermission, PhysicalMemory,
+    };
+
+    const VA: u64 = 0x8000_0000;
+    const PA: u64 = 0x10_0000;
+    const DADDR: u64 = 0x4_0000_0000;
+    const GPU: u32 = 0x1122_3344;
+
+    /// Writes GPU in every word of the page it is called with, then disarms it.
+    struct Flusher {
+        device: Weak<DeviceAddressSpace>,
+        calls: Mutex<Vec<(u64, u64)>>,
+        delay: Duration,
+    }
+
+    impl FlushTrapHandler for Flusher {
+        fn flush_for_cpu(&self, daddr: u64, size: u64) {
+            self.calls.lock().push((daddr, size));
+            std::thread::sleep(self.delay);
+            let device = self.device.upgrade().unwrap();
+            for offset in (0..size).step_by(4) {
+                device.write(daddr + offset, GPU).unwrap();
+            }
+            device.disarm_flush_traps(daddr, size);
+        }
+    }
+
+    impl Flusher {
+        fn take(&self) -> Vec<(u64, u64)> {
+            std::mem::take(&mut *self.calls.lock())
+        }
+    }
+
+    fn spaces(delay: Duration) -> (Arc<AddressSpace>, Arc<DeviceAddressSpace>, Arc<Flusher>) {
+        let physical = Arc::new(PhysicalMemory::new(1 << 24).unwrap());
+        let process = Arc::new(AddressSpace::new(physical.clone(), 39));
+        process.map(VA, PA, 0x4000, MemoryPermission::READ_WRITE);
+        let device = Arc::new(DeviceAddressSpace::new(physical, 36));
+        device.map_process(DADDR, &process, VA, 0x4000).unwrap();
+        device.attach_process(process.clone());
+        let flusher = Arc::new(Flusher {
+            device: Arc::downgrade(&device),
+            calls: Mutex::default(),
+            delay,
+        });
+        device.set_flush_trap_handler(Some(flusher.clone()));
+        (process, device, flusher)
+    }
+
+    #[test]
+    fn a_cpu_read_of_an_armed_page_writes_the_gpu_data_back_first() {
+        let (process, device, flusher) = spaces(Duration::ZERO);
+        device.arm_flush_traps(DADDR + 0x1000, 0x1000);
+        assert_eq!(process.read::<u32>(VA + 0x1010).unwrap(), GPU);
+        assert_eq!(flusher.take(), [(DADDR + 0x1000, 0x1000)]);
+        assert_eq!(process.read::<u32>(VA + 0x1020).unwrap(), GPU);
+        assert!(flusher.take().is_empty(), "the flush disarmed the page");
+        assert_eq!(process.read::<u32>(VA).unwrap(), 0);
+        assert!(
+            flusher.take().is_empty(),
+            "the page beside it was never armed"
+        );
+    }
+
+    #[test]
+    fn unarmed_pages_never_trap_and_arming_again_takes_no_lock() {
+        let (process, device, flusher) = spaces(Duration::ZERO);
+        for offset in (0..0x4000).step_by(0x800) {
+            process.read::<u64>(VA + offset).unwrap();
+            process.guest_write(VA + offset, 1u64).unwrap();
+        }
+        assert!(flusher.take().is_empty());
+        assert_eq!(process.trap_updates.load(Ordering::Relaxed), 0);
+
+        device.arm_flush_traps(DADDR, 0x2000);
+        device.arm_flush_traps(DADDR, 0x2000);
+        device.arm_flush_traps(DADDR + 0x1000, 0x1000);
+        assert_eq!(
+            process.trap_updates.load(Ordering::Relaxed),
+            1,
+            "arming armed pages is a flag test"
+        );
+        device.disarm_flush_traps(DADDR, 0x2000);
+        device.disarm_flush_traps(DADDR, 0x2000);
+        assert_eq!(process.trap_updates.load(Ordering::Relaxed), 2);
+        assert!(flusher.take().is_empty());
+    }
+
+    #[test]
+    fn every_alias_of_an_armed_page_traps() {
+        let (process, device, flusher) = spaces(Duration::ZERO);
+        process.map(
+            0x9000_0000,
+            PA + 0x1000,
+            0x1000,
+            MemoryPermission::READ_WRITE,
+        );
+        device.arm_flush_traps(DADDR + 0x1000, 0x1000);
+        assert_eq!(process.read::<u32>(0x9000_0000).unwrap(), GPU);
+        assert_eq!(flusher.take(), [(DADDR + 0x1000, 0x1000)]);
+
+        device.arm_flush_traps(DADDR + 0x1000, 0x1000);
+        process.map(
+            0xa000_0000,
+            PA + 0x1000,
+            0x1000,
+            MemoryPermission::READ_WRITE,
+        );
+        process.read::<u32>(0xa000_0000).unwrap();
+        assert_eq!(
+            flusher.take(),
+            [(DADDR + 0x1000, 0x1000)],
+            "an alias mapped after arming"
+        );
+        process.unmap(0x9000_0000, 0x1000);
+        process.unmap(0xa000_0000, 0x1000);
+    }
+
+    #[test]
+    fn every_host_access_path_traps() {
+        let (process, device, flusher) = spaces(Duration::ZERO);
+        let monitor = ExclusiveMonitor::new(1);
+        let check = |what: &str, access: &dyn Fn()| {
+            device.arm_flush_traps(DADDR, 0x4000);
+            access();
+            assert!(!flusher.take().is_empty(), "{what}");
+            device.disarm_flush_traps(DADDR, 0x4000);
+        };
+        check("read", &|| {
+            process.read::<u8>(VA + 4).unwrap();
+        });
+        check("guest_read", &|| {
+            process.guest_read::<u64>(VA + 8).unwrap();
+        });
+        check("read_bytes across pages", &|| {
+            process.read_bytes(VA + 0xffe, &mut [0; 4]).unwrap()
+        });
+        check("read_cstring", &|| {
+            process.read_cstring(VA + 0x10, 4).unwrap();
+        });
+        check("write", &|| process.write(VA + 4, 1u8).unwrap());
+        check("guest_write", &|| {
+            process.guest_write(VA + 4, 1u16).unwrap()
+        });
+        check("write_bytes", &|| {
+            process.write_bytes(VA + 0x1ffe, &[1; 4]).unwrap()
+        });
+        check("fill", &|| process.fill(VA + 0x2000, 0x10, 7).unwrap());
+        check("guest_fill", &|| {
+            process.guest_fill(VA + 0x3000, 0x40, 0).unwrap()
+        });
+        check("write_with", &|| {
+            process
+                .write_with(VA + 8, MemoryPermission::WRITE, |ptr| {
+                    // SAFETY: the pointer is valid for the page holding VA + 8.
+                    unsafe { ptr.write(9) }
+                })
+                .unwrap()
+        });
+        check("access", &|| {
+            process.access(VA + 0x40, MemoryPermission::READ).unwrap();
+        });
+        check("load-exclusive", &|| {
+            monitor.read(0, &process, VA + 0x10, 8).unwrap();
+        });
+        check("load-exclusive pair", &|| {
+            monitor.read(0, &process, VA + 0x20, 16).unwrap();
+        });
+        monitor.read(0, &process, VA + 0x30, 8).unwrap();
+        check("store-exclusive", &|| {
+            monitor.write(0, &process, VA + 0x30, 8, 5).unwrap();
+        });
+        check("flush_gpu_writes", &|| {
+            process.flush_gpu_writes(VA + 0x2ff0, 0x20)
+        });
+    }
+
+    #[test]
+    fn a_write_to_an_armed_page_lands_over_the_written_back_data() {
+        let (process, device, _flusher) = spaces(Duration::ZERO);
+        device.arm_flush_traps(DADDR + 0x1000, 0x1000);
+        process.guest_write(VA + 0x1001, 0xaau8).unwrap();
+        let mut bytes = [0; 4];
+        process.read_bytes(VA + 0x1000, &mut bytes).unwrap();
+        let mut expected = GPU.to_le_bytes();
+        expected[1] = 0xaa;
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn concurrent_readers_all_see_the_written_back_data() {
+        let (process, device, flusher) = spaces(Duration::from_millis(20));
+        device.arm_flush_traps(DADDR + 0x2000, 0x1000);
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let readers: Vec<_> = (0..8)
+            .map(|i| {
+                let (process, barrier) = (process.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    process.read::<u32>(VA + 0x2000 + i * 8).unwrap()
+                })
+            })
+            .collect();
+        for reader in readers {
+            assert_eq!(reader.join().unwrap(), GPU);
+        }
+        assert!(!flusher.take().is_empty());
+    }
+
+    #[test]
+    fn traps_follow_the_physical_page_through_unmaps_and_remaps() {
+        let (process, device, flusher) = spaces(Duration::ZERO);
+        device.arm_flush_traps(DADDR + 0x1000, 0x1000);
+        process.unmap(VA + 0x1000, 0x1000);
+        process.map(VA + 0x1000, 0x20_0000, 0x1000, MemoryPermission::READ_WRITE);
+        assert_eq!(process.read::<u32>(VA + 0x1000).unwrap(), 0);
+        assert!(
+            flusher.take().is_empty(),
+            "another physical page is mapped there now"
+        );
+        process.map(
+            0xb000_0000,
+            PA + 0x1000,
+            0x1000,
+            MemoryPermission::READ_WRITE,
+        );
+        assert_eq!(process.read::<u32>(0xb000_0000).unwrap(), GPU);
+        assert_eq!(flusher.take(), [(DADDR + 0x1000, 0x1000)]);
+
+        device.arm_flush_traps(DADDR + 0x2000, 0x1000);
+        device.unmap(DADDR + 0x2000, 0x1000);
+        device.disarm_flush_traps(DADDR + 0x2000, 0x1000);
+        assert_eq!(process.read::<u32>(VA + 0x2000).unwrap(), 0);
+        assert!(
+            flusher.take().is_empty(),
+            "no device page maps it, so the trap only removes itself"
+        );
+        let updates = process.trap_updates.load(Ordering::Relaxed);
+        process.read::<u32>(VA + 0x2000).unwrap();
+        assert_eq!(process.trap_updates.load(Ordering::Relaxed), updates);
+        process.unmap(0xb000_0000, 0x1000);
+    }
+
+    #[test]
+    fn without_a_handler_a_trap_only_removes_itself() {
+        let (process, device, flusher) = spaces(Duration::ZERO);
+        device.set_flush_trap_handler(None);
+        process.write(VA + 0x3000, 5u32).unwrap();
+        device.arm_flush_traps(DADDR + 0x3000, 0x1000);
+        assert_eq!(process.read::<u32>(VA + 0x3000).unwrap(), 5);
+        assert!(flusher.take().is_empty());
     }
 }

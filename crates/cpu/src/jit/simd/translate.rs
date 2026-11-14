@@ -89,6 +89,19 @@ pub(in super::super) fn lower(t: &mut Translator, word: u32) -> bool {
         );
         return true;
     }
+    if word & 0x7f3e_0000 == 0x1e18_0000 && (wide || word & 0x8000 != 0) {
+        let a = vec(t, rn);
+        let signed = word & 0x1_0000 == 0;
+        let r = t.op(Op::Simd(SimdOp::ToInt {
+            fp,
+            signed,
+            wide,
+            a,
+            word,
+        }));
+        t.set_x(Reg(rd), r);
+        return true;
+    }
     match word & 0x7f3f_fc00 {
         0x1e22_0000 | 0x1e23_0000 => {
             let x = t.x(Reg(rn));

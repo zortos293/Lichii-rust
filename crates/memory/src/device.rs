@@ -3,8 +3,8 @@ use std::sync::{Arc, OnceLock};
 use lichii_common::{DAddr, PAGE_MASK, PAGE_SIZE, PAddr, VAddr};
 use parking_lot::Mutex;
 
-use crate::page_table::PageTable;
-use crate::tracking::{CachedPages, ReverseMap};
+use crate::page_table::{PageTable, no_trap};
+use crate::tracking::{CachedPages, FlushTrapHandler, ReverseMap};
 use crate::{AddressSpace, MemoryFault, MemoryPermission, PhysicalMemory};
 
 /// A device (SMMU) address space: guest memory as the GPU and other DMA engines see it.
@@ -12,12 +12,14 @@ use crate::{AddressSpace, MemoryFault, MemoryPermission, PhysicalMemory};
 /// Device addresses map to DRAM pages, usually pinned from a process address space
 /// ([`DeviceAddressSpace::map_process`]). Translation is a lock-free table walk, safe to call from
 /// the GPU thread while a service thread maps or unmaps; there is no translation cache to
-/// invalidate. GPU caches learn about CPU writes through it ([`crate::tracking`]).
+/// invalidate. GPU caches learn about CPU writes, and have their writes flushed before CPU
+/// accesses, through it ([`crate::tracking`]).
 pub struct DeviceAddressSpace {
     table: PageTable,
     physical: Arc<PhysicalMemory>,
-    /// Serialises map and unmap; the device pages mapping each physical page.
-    update: Mutex<ReverseMap>,
+    /// Serialises map and unmap; the device pages mapping each physical page. Shared with the
+    /// attached process's flush sink.
+    update: Arc<Mutex<ReverseMap>>,
     process: OnceLock<Arc<AddressSpace>>,
 }
 
@@ -26,7 +28,7 @@ impl DeviceAddressSpace {
     pub fn new(physical: Arc<PhysicalMemory>, address_space_bits: u32) -> Self {
         Self {
             table: PageTable::new(address_space_bits),
-            update: Mutex::new(ReverseMap::new(physical.size())),
+            update: Arc::new(Mutex::new(ReverseMap::new(physical.size()))),
             physical,
             process: OnceLock::new(),
         }
@@ -48,19 +50,89 @@ impl DeviceAddressSpace {
     /// until the guard is dropped. A cache takes it before it reads the bytes it copies, and a
     /// new one for every upload; without an attached process nothing is tracked.
     pub fn cache_pages(&self, daddr: DAddr, size: u64) -> CachedPages {
+        CachedPages::new(self.process.get().cloned(), self.physical_runs(daddr, size))
+    }
+
+    /// The physical pages behind the mapped pages of `[daddr, daddr + size)`, as runs.
+    fn physical_runs(&self, daddr: DAddr, size: u64) -> Vec<(PAddr, u64)> {
         let mut runs: Vec<(PAddr, u64)> = Vec::new();
+        self.for_each_physical_page(daddr, size, |pa| {
+            match runs.last_mut() {
+                Some((start, len)) if *start + *len == pa => *len += PAGE_SIZE,
+                _ => runs.push((pa, PAGE_SIZE)),
+            }
+            true
+        });
+        runs
+    }
+
+    /// Calls `f` with the physical page behind each mapped page of `[daddr, daddr + size)`
+    /// until it returns false; returns whether it never did.
+    fn for_each_physical_page(
+        &self,
+        daddr: DAddr,
+        size: u64,
+        mut f: impl FnMut(PAddr) -> bool,
+    ) -> bool {
         let end = daddr.saturating_add(size);
         let mut page = daddr & !PAGE_MASK;
         while page < end {
-            if let Some(pa) = self.physical_address(page) {
-                match runs.last_mut() {
-                    Some((start, len)) if *start + *len == pa => *len += PAGE_SIZE,
-                    _ => runs.push((pa, PAGE_SIZE)),
-                }
+            if let Some(pa) = self.physical_address(page)
+                && !f(pa)
+            {
+                return false;
             }
             page += PAGE_SIZE;
         }
-        CachedPages::new(self.process.get().cloned(), runs)
+        true
+    }
+
+    /// Traps every CPU access to the physical pages behind `[daddr, daddr + size)`, at every
+    /// virtual address of the attached process that maps one, until
+    /// [`DeviceAddressSpace::disarm_flush_traps`]: the GPU modified them and holds data guest
+    /// memory lacks. An access calls the [`FlushTrapHandler`] first. Pages already trapped cost
+    /// one flag test each, with no lock and no allocation.
+    pub fn arm_flush_traps(&self, daddr: DAddr, size: u64) {
+        let Some(process) = self.process.get() else {
+            return;
+        };
+        if self.for_each_physical_page(daddr, size, |pa| process.is_trapped(pa)) {
+            return;
+        }
+        process.arm_physical(&self.physical_runs(daddr, size));
+    }
+
+    /// Ends the flush traps of the physical pages behind `[daddr, daddr + size)`: the GPU wrote
+    /// its data there back to guest memory, or dropped it. Untrapped pages cost one flag test.
+    pub fn disarm_flush_traps(&self, daddr: DAddr, size: u64) {
+        let Some(process) = self.process.get() else {
+            return;
+        };
+        if self.for_each_physical_page(daddr, size, |pa| !process.is_trapped(pa)) {
+            return;
+        }
+        process.disarm_physical(&self.physical_runs(daddr, size));
+    }
+
+    /// Installs the handler that flush traps of the attached process call, with each device page
+    /// that maps the trapped physical page; `None` removes it. A trap on a page no device page
+    /// maps, or with no handler, only removes itself.
+    pub fn set_flush_trap_handler(&self, handler: Option<Arc<dyn FlushTrapHandler>>) {
+        let Some(process) = self.process.get() else {
+            return;
+        };
+        let sink = handler.map(|handler| {
+            let reverse = self.update.clone();
+            Arc::new(move |pa: PAddr| {
+                let mut pages: Vec<DAddr> = Vec::new();
+                reverse.lock().for_each(pa, |daddr| pages.push(daddr));
+                for &daddr in &pages {
+                    handler.flush_for_cpu(daddr, PAGE_SIZE);
+                }
+                !pages.is_empty()
+            }) as crate::address_space::FlushSink
+        });
+        process.set_flush_sink(sink);
     }
 
     /// Whether the attached process wrote a tracked page since the last
@@ -144,6 +216,7 @@ impl DeviceAddressSpace {
             daddr,
             self.physical.pointer(pa),
             MemoryPermission::READ_WRITE,
+            0,
         );
         reverse.insert(pa, daddr);
     }
@@ -223,7 +296,7 @@ impl DeviceAddressSpace {
     /// Reads a value; it may straddle pages. Fails on the first unmapped page.
     #[inline]
     pub fn read<T: bytemuck::Pod>(&self, daddr: DAddr) -> Result<T, MemoryFault> {
-        self.table.read(daddr, MemoryPermission::NONE)
+        self.table.read(daddr, MemoryPermission::NONE, no_trap)
     }
 
     /// Writes a value; it may straddle pages. Fails on the first unmapped page, after writing the
@@ -235,7 +308,8 @@ impl DeviceAddressSpace {
 
     /// Copies `out.len()` bytes from `daddr`. Fails on the first unmapped page.
     pub fn read_bytes(&self, daddr: DAddr, out: &mut [u8]) -> Result<(), MemoryFault> {
-        self.table.read_bytes(daddr, out, MemoryPermission::NONE)
+        self.table
+            .read_bytes(daddr, out, MemoryPermission::NONE, no_trap)
     }
 
     /// Copies `data` to `daddr`. Fails on the first unmapped page, after writing the bytes

@@ -931,6 +931,11 @@ impl Emitter<'_> {
                 dynasm!(self.asm ; .arch x64 ; mov Rq(d), QWORD [r13 + ST_HIGH]);
             }
             Op::Fence => dynasm!(self.asm ; .arch x64 ; mfence),
+            Op::ClearExclusive => dynasm!(self.asm
+                ; .arch x64
+                ; mov rax, QWORD [r13 + ST_RESERVATION]
+                ; mov QWORD [rax + RES_SIZE], 0
+            ),
             Op::CallSimd { word, pc } => self.call_simd(i, word, pc),
             Op::Simd(s) => self.simd(i, s),
             _ => self.memory(i, op),
