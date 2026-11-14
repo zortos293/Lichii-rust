@@ -1473,6 +1473,9 @@ impl VulkanRasterizer {
         let Some((id, mut view)) = self.texture_info(src, raw, desc.ty)? else {
             return Ok(None);
         };
+        if !desc.is_written && self.texture_cache.unwritten(id) {
+            return Ok(None);
+        }
         if desc.is_written
             && self
                 .texture_cache
@@ -1489,6 +1492,19 @@ impl VulkanRasterizer {
         }
         if let Some(format) = storage_format(desc.format) {
             view.format = format;
+        }
+        if desc.is_written {
+            let mut tx = Transfer {
+                scheduler: &mut self.scheduler,
+                staging: &mut self.staging,
+                memory: &self.handles.device,
+            };
+            self.texture_cache.bind_written(
+                &mut tx,
+                id,
+                view.base_level,
+                view.base_layer..view.base_layer + view.layers,
+            )?;
         }
         Ok(self
             .texture_cache
@@ -1536,6 +1552,9 @@ impl VulkanRasterizer {
         let Some((id, view)) = self.texture_info(src, raw, ty)? else {
             return Ok(None);
         };
+        if self.texture_cache.unwritten(id) {
+            return Ok(None);
+        }
         Ok(self
             .texture_cache
             .sampled_view(id, &view)?
