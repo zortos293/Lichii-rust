@@ -11,6 +11,7 @@ mod frame_dump;
 mod samples;
 
 use std::collections::VecDeque;
+use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -160,13 +161,27 @@ pub struct VulkanRasterizer {
     fences: VecDeque<(u64, Release)>,
     samples: samples::SampleCounter,
     unflushed: bool,
-    texture_cache: TextureCache,
-    buffer_cache: BufferCache,
+    texture_cache: ManuallyDrop<TextureCache>,
+    buffer_cache: ManuallyDrop<BufferCache>,
     draw: draw::DrawState,
     live: Option<Arc<LiveSettings>>,
     activity: Activity,
     stalls: Stalls,
     frame_dump: Option<frame_dump::FrameDump>,
+    teardown: Teardown,
+}
+
+/// The threads freeing the caches when the renderer drops, joined after every other field.
+struct Teardown(Vec<std::thread::JoinHandle<()>>);
+
+impl Drop for Teardown {
+    fn drop(&mut self) {
+        for thread in self.0.drain(..) {
+            if thread.join().is_err() {
+                tracing::error!("a renderer teardown thread panicked");
+            }
+        }
+    }
 }
 
 /// Work that runs once the host GPU finished everything recorded before it.
@@ -319,25 +334,28 @@ impl VulkanRasterizer {
         scheduler.time_waits(handles.activity.clone());
         let pipelines = PipelineCache::new(device, &GraphicsSettings::default(), None, None)?;
         let draw = draw::DrawState::new(device, pipelines, gob_layout, scheduler.record()?)?;
+        let staging = StagingRing::new(device, 32 << 20)?;
+        let samples = samples::SampleCounter::new(device)?;
         Ok(Self {
-            buffer_cache,
+            buffer_cache: ManuallyDrop::new(buffer_cache),
             draw,
             device: device.clone(),
             handles,
             scheduler,
-            staging: StagingRing::new(device, 32 << 20)?,
+            staging,
             frame_uploads: Vec::new(),
             mailbox,
             gob_layout,
             frames: Vec::new(),
             fences: VecDeque::new(),
-            samples: samples::SampleCounter::new(device)?,
+            samples,
             unflushed: true,
-            texture_cache,
+            texture_cache: ManuallyDrop::new(texture_cache),
             live: None,
             activity: Activity::default(),
             stalls: Stalls::default(),
             frame_dump: frame_dump::FrameDump::from_env(),
+            teardown: Teardown(Vec::new()),
         })
     }
 
@@ -1350,10 +1368,33 @@ impl Rasterizer for VulkanRasterizer {
 }
 
 impl Drop for VulkanRasterizer {
+    /// Waits for the GPU, then frees the texture and buffer caches on their own threads while
+    /// the other fields drop on this one.
     fn drop(&mut self) {
-        let _ = self.scheduler.finish();
+        if self.scheduler.finish().is_err() {
+            self.device.wait_idle();
+        }
         self.draw.destroy(&self.device);
         self.samples.destroy(&self.device);
+        // SAFETY: each field is taken once, here, and never used again; the GPU is idle.
+        let (texture_cache, buffer_cache) = unsafe {
+            (
+                ManuallyDrop::take(&mut self.texture_cache),
+                ManuallyDrop::take(&mut self.buffer_cache),
+            )
+        };
+        let spawn = |free: Box<dyn FnOnce() + Send>| {
+            std::thread::Builder::new()
+                .name("gpu-teardown".into())
+                .spawn(free)
+                .ok()
+        };
+        self.teardown
+            .0
+            .extend(spawn(Box::new(move || drop(texture_cache))));
+        self.teardown
+            .0
+            .extend(spawn(Box::new(move || drop(buffer_cache))));
     }
 }
 
