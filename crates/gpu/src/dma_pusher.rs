@@ -891,8 +891,10 @@ impl MacroHost for FrontMacroHost<'_> {
     /// Reads memory as of the macro's position in the stream: the work sent before it completes
     /// and what the GPU wrote to the words reaches guest memory first.
     fn dma_read(&mut self, gpu_va: u64, out: &mut [u32]) {
+        let diag_start = std::time::Instant::now();
         self.stream
             .synchronize_read(gpu_va, size_of_val(out) as u64);
+        let diag_ns = diag_start.elapsed().as_nanos() as u64;
         if let Err(fault) = self
             .memory
             .read_block(gpu_va, bytemuck::cast_slice_mut(out))
@@ -900,7 +902,8 @@ impl MacroHost for FrontMacroHost<'_> {
             tracing::warn!(?fault, "MME DMA read from unmapped GPU memory");
             out.fill(0);
         }
-        self.stream.overlay_read(out);
+        let diag_served = self.stream.overlay_read(out);
+        diag_mr::note(diag_served, diag_ns);
     }
 }
 
@@ -986,5 +989,28 @@ mod tests {
         let parameters = &channel.state.calls[0].parameters;
         assert!(parameters.is_empty());
         assert_eq!(parameters.as_ptr(), storage);
+    }
+}
+
+mod diag_mr {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    pub(super) fn note(served: bool, ns: u64) {
+        let i = if served { 0 } else { 2 };
+        N[i].fetch_add(1, Ordering::Relaxed);
+        N[i + 1].fetch_add(ns, Ordering::Relaxed);
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let now = START.get_or_init(std::time::Instant::now).elapsed().as_secs();
+        if now >= LAST.load(Ordering::Relaxed) + 5 {
+            LAST.store(now, Ordering::Relaxed);
+            tracing::info!(
+                "DIAG macro reads t={now} served={} served_ms={} synchronized={} sync_ms={}",
+                N[0].swap(0, Ordering::Relaxed),
+                N[1].swap(0, Ordering::Relaxed) / 1_000_000,
+                N[2].swap(0, Ordering::Relaxed),
+                N[3].swap(0, Ordering::Relaxed) / 1_000_000
+            );
+        }
     }
 }

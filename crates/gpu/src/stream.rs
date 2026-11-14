@@ -134,13 +134,15 @@ impl ReadOverlay {
     }
 
     /// Front: puts the overlay over `out`, the words just read, and clears it.
-    pub(crate) fn apply(&self, out: &mut [u32]) {
+    pub(crate) fn apply(&self, out: &mut [u32]) -> bool {
         let words = std::mem::take(&mut self.0.lock().words);
+        let served = words.iter().any(Option::is_some);
         for (slot, word) in out.iter_mut().zip(words) {
             if let Some(word) = word {
                 *slot = word;
             }
         }
+        served
     }
 }
 
@@ -327,8 +329,8 @@ impl Stream {
     /// Puts what semaphore releases still on their way to the host GPU write over `out`, the
     /// words the front read after [`Stream::synchronize_read`]: the back hands those values over
     /// instead of waiting for them.
-    pub(crate) fn overlay_read(&self, out: &mut [u32]) {
-        self.fetch_syncs.read_overlay.apply(out);
+    pub(crate) fn overlay_read(&self, out: &mut [u32]) -> bool {
+        self.fetch_syncs.read_overlay.apply(out)
     }
 
     /// Has the back synchronize the fetch of `[address, address + size)` as `sync` says, without
