@@ -1117,7 +1117,9 @@ impl Emitter<'_> {
         let dst = (op.ty() != Ty::Void).then(|| self.def(Value(i as u32)));
         let label = self.asm.new_dynamic_label();
         let resume = self.asm.new_dynamic_label();
-        let sites = match self.target.arena_size {
+        let diag_slow =
+            matches!(op, Op::Store { .. } | Op::StoreVec { .. }) && super::diag::nan_stores();
+        let sites = match self.target.arena_size.filter(|_| !diag_slow) {
             Some(arena) => {
                 let aligned = matches!(
                     op,

@@ -195,7 +195,7 @@ impl Translator<'_> {
         match *inst {
             Inst::Nop | Inst::Hint { .. } => {}
             Inst::SimdFp { word } => {
-                if !super::simd::lower(self, word) {
+                if super::diag::simd_interp(word) || !super::simd::lower(self, word) {
                     self.op(Op::CallSimd { word, pc });
                 }
             }

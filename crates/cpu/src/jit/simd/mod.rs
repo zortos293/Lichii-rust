@@ -97,7 +97,13 @@ pub(super) extern "sysv64" fn call(
     state: &mut JitState,
     pc: u64,
 ) -> bool {
+    let src = super::diag::before(ctx, word);
     if let Some(Ok(())) = execute(ctx, word) {
+        if let Some(src) = src {
+            // SAFETY: called from translated code while the owning Jit runs it.
+            let memory = unsafe { state.memory() };
+            super::diag::after(memory, ctx, word, pc, src);
+        }
         return false;
     }
     state.fault = Some(CpuFault::Undefined {

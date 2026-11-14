@@ -716,3 +716,71 @@ impl VulkanRasterizer {
         super::diag::append(|l| l.push_str(&s));
     }
 }
+
+pub(crate) fn cb_nan() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| flag("LICHII_DIAG_CB_NAN"))
+}
+
+fn cb_fs() -> &'static [u64] {
+    static V: OnceLock<Vec<u64>> = OnceLock::new();
+    V.get_or_init(|| hex_list("LICHII_DIAG_CB_FS"))
+}
+
+impl VulkanRasterizer {
+    /// LIRU-3: logs fragment constant buffers holding a NaN in their first 64 words, once per
+    /// (shader, slot) every 5 s, with their device and physical addresses; LICHII_DIAG_CB_FS
+    /// shaders (full hash or either 32-bit half) log every 5 s whatever they hold.
+    pub(super) fn diag_cb_nan(&self, ctx: &GraphicsContext<'_>) {
+        static SEEN: Mutex<Vec<(u64, usize, Duration)>> = Mutex::new(Vec::new());
+        let fs = self
+            .draw
+            .stages
+            .iter()
+            .flatten()
+            .find(|m| m.stage == lichii_shader::ShaderStage::Fragment)
+            .map_or(0, |m| m.hash);
+        let traced = cb_fs()
+            .iter()
+            .any(|&v| v == fs || v as u32 == fs as u32 || v as u32 == (fs >> 32) as u32);
+        for (slot, cb) in ctx.const_buffers[4].iter().enumerate() {
+            if !cb.enabled || cb.size == 0 {
+                continue;
+            }
+            let Ok(words) = ctx.memory.read::<[u32; 64]>(cb.address) else {
+                continue;
+            };
+            let n = (cb.size as usize / 4).min(64);
+            let nan: Vec<usize> = (0..n)
+                .filter(|&i| f32::from_bits(words[i]).is_nan())
+                .collect();
+            if nan.is_empty() && !traced {
+                continue;
+            }
+            let t = now();
+            let Ok(mut seen) = SEEN.lock() else {
+                return;
+            };
+            match seen.iter_mut().find(|e| e.0 == fs && e.1 == slot) {
+                Some(e) if t < e.2 + Duration::from_secs(5) => continue,
+                Some(e) => e.2 = t,
+                None => seen.push((fs, slot, t)),
+            }
+            drop(seen);
+            let dev = ctx.memory.translate(cb.address);
+            let pa = dev.and_then(|d| ctx.memory.device().physical_address(d));
+            let row: Vec<String> = words[..n.min(24)]
+                .iter()
+                .map(|w| format!("{:.4}", f32::from_bits(*w)))
+                .collect();
+            tracing::warn!(
+                "LIRU3 CBNAN t={:.3} fs={fs:016x} slot={slot} gpu={:#x} size={} dev={dev:x?} pa={pa:x?} nan={nan:?} row=[{}] w16={:08x}",
+                t.as_secs_f64(),
+                cb.address,
+                cb.size,
+                row.join(" "),
+                words[16]
+            );
+        }
+    }
+}

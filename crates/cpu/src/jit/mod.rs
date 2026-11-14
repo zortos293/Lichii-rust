@@ -6,6 +6,7 @@
 //! translated or not. See `crates/cpu/JIT.md` for the design.
 
 mod cache;
+mod diag;
 mod ir;
 mod map;
 mod passes;
@@ -261,6 +262,9 @@ extern "sysv64" fn write_slow(state: &mut JitState, addr: u64, pc: u64, size: u3
     // SAFETY: called from a slow path.
     let memory = unsafe { state.memory() };
     let value = state.scratch;
+    if diag::nan_stores() {
+        diag::store(memory, pc, addr, size, value);
+    }
     let result = match size {
         0 => memory.guest_write(addr, value as u8),
         1 => memory.guest_write(addr, value as u16),

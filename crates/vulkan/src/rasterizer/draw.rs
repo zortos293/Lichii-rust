@@ -653,6 +653,9 @@ impl VulkanRasterizer {
         if !self.render_targets(ctx)? {
             return Ok(());
         }
+        if diag::cb_nan() {
+            self.diag_cb_nan(ctx);
+        }
         if diag::with(|d| d.begin()) == Some(true) {
             self.diag_draw_state(ctx, call);
         }
