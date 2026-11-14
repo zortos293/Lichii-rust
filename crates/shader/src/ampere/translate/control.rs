@@ -1,6 +1,7 @@
 //! Control operations. Branches, calls, returns and kills end blocks and are lowered by the
-//! control flow graph; convergence barriers and scheduling hints have no effect on translated
-//! code. An indirect branch or a kill stays the last instruction of its block, so it reaches
+//! control flow graph; convergence barriers (BSSY, BSYNC and BREAK, which drops a thread from a
+//! barrier's wait) and scheduling hints have no effect on translated code, whose threads run
+//! converged. An indirect branch or a kill stays the last instruction of its block, so it reaches
 //! the translator and emits nothing, as the reference's Maxwell BRX, JMX and KIL do. EXIT writes
 //! the fragment outputs.
 
@@ -15,7 +16,7 @@ pub(super) fn translate(t: &mut Translator<'_>, op: Opcode) -> TResult {
     use Opcode::*;
     match op {
         Exit => exit(t),
-        Warpsync | Nanosleep | Yield | Nop | Bssy | Bsync => Ok(()),
+        Warpsync | Nanosleep | Yield | Nop | Bssy | Bsync | Break => Ok(()),
         Brx | Brxu | Jmx | Jmxu => Ok(()),
         Kill if t.env.stage() == ShaderStage::Fragment => Ok(()),
         _ => Err(t.unsupported()),

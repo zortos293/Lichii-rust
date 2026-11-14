@@ -2547,7 +2547,7 @@ fn overlaps_written_back_upload_only_the_layers_they_cover() {
     f.memory.write_bytes(DADDR, &pattern).unwrap();
     let (texture, _) = f.texture(&header);
     let before = f.read_image(texture);
-    let mut bytes = rt_info(128, 32, 2, GobLayout::Tegra);
+    let mut bytes = rt_info(126, 32, 2, GobLayout::Tegra);
     bytes.format = PixelFormat::R8Unorm;
     assert_eq!(bytes.size_bytes(), 4096);
     let layer_va = GPU_VA + 2 * info.layer_stride;
@@ -2565,20 +2565,18 @@ fn overlaps_written_back_upload_only_the_layers_they_cover() {
     for l in [0, 1, 3] {
         assert_eq!(after[l], before[l], "layer {l} keeps its texels");
     }
-    for (i, texel) in after[2].as_chunks::<4>().0.iter().enumerate() {
-        if i % 64 < 16 {
-            assert_eq!(
-                *texel, [255; 4],
-                "texel {i} of layer 2 takes the render target's bytes"
-            );
-        } else {
-            assert_eq!(
-                texel[..],
-                before[2][i * 4..i * 4 + 4],
-                "texel {i} of layer 2"
-            );
+    let tiling = info.surface().level_tiling(0);
+    let layer = (2 * info.layer_stride) as usize;
+    let mut tiled = pattern[layer..layer + tiling.size_bytes()].to_vec();
+    let rt = bytes.surface().level_tiling(0);
+    for y in 0..32 {
+        for x in 0..126 {
+            tiled[rt.offset(x, y, 0)] = 255;
         }
     }
+    let mut want = vec![0; 64 * 64 * 4];
+    lichii_texture::block_linear::unswizzle(&tiling, &tiled, &mut want);
+    assert_eq!(after[2], want, "layer 2 takes the render target's bytes");
     f.assert_no_validation_errors();
 }
 
@@ -2604,5 +2602,195 @@ fn cpu_writes_between_layers_upload_nothing() {
     assert_eq!(f.texture(&header).0, texture);
     assert_eq!(f.cache.traffic().upload_bytes, uploaded.upload_bytes);
     f.scheduler.finish().unwrap();
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn narrow_formats_sync_into_the_layers_they_share_on_the_gpu() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let header = tic(0x08, GPU_VA, 64, 64, 4, 1, 3);
+    let info = ImageInfo::from_texture(&header.decode().unwrap(), GobLayout::Tegra).unwrap();
+    let pattern: Vec<u8> = (0..info.size_bytes())
+        .map(|i| (i * 13 + i / 97) as u8)
+        .collect();
+    f.memory.write_bytes(DADDR, &pattern).unwrap();
+    let (texture, _) = f.texture(&header);
+    let before = f.read_image(texture);
+    let mut halves = rt_info(64, 32, 2, GobLayout::Tegra);
+    halves.format = PixelFormat::R16Unorm;
+    let mut bytes = rt_info(128, 32, 2, GobLayout::Tegra);
+    bytes.format = PixelFormat::R8Unorm;
+    let layer = |l: u64| GPU_VA + l * info.layer_stride;
+    clear_rt_at(&mut f, layer(1), &halves, [1.0, 0.0, 0.0, 0.0], Rect::ALL);
+    clear_rt_at(&mut f, layer(2), &bytes, [1.0, 0.0, 0.0, 0.0], Rect::ALL);
+    let traffic = f.cache.traffic();
+    assert_eq!(f.texture(&header).0, texture);
+    let after = f.cache.traffic();
+    assert_eq!(
+        after.downloads, traffic.downloads,
+        "no write-back to guest memory"
+    );
+    assert_eq!(
+        after.uploads, traffic.uploads,
+        "no re-upload from guest memory"
+    );
+    assert_eq!(after.gpu_syncs, traffic.gpu_syncs + 1);
+    let texels = f.read_image(texture);
+    for l in [0, 3] {
+        assert_eq!(texels[l], before[l], "layer {l} keeps its texels");
+    }
+    let tiling = info.surface().level_tiling(0);
+    for (l, rt, width) in [(1, &halves, 128), (2, &bytes, 128)] {
+        let start = (l as u64 * info.layer_stride) as usize;
+        let mut tiled = pattern[start..start + tiling.size_bytes()].to_vec();
+        let rt = rt.surface().level_tiling(0);
+        for y in 0..32 {
+            for x in 0..width {
+                tiled[rt.offset(x, y, 0)] = 255;
+            }
+        }
+        let mut want = vec![0; 64 * 64 * 4];
+        lichii_texture::block_linear::unswizzle(&tiling, &tiled, &mut want);
+        assert_eq!(texels[l], want, "layer {l} takes the render target's bytes");
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn images_split_across_device_ranges_sync_on_the_gpu() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let split = GPU_VA + (1 << 30);
+    f.gmmu
+        .map(split, DADDR + 0x10_0000, 0x1_0000, 0, false)
+        .unwrap();
+    f.gmmu
+        .map(split + 0x1_0000, DADDR + 0x30_0000, 0x1_0000, 0, false)
+        .unwrap();
+    let header = tic(0x08, split, 128, 128, 2, 1, 4);
+    let info = ImageInfo::from_texture(&header.decode().unwrap(), GobLayout::Tegra).unwrap();
+    assert_eq!(info.layer_stride, 0x1_0000);
+    let pattern: Vec<u8> = (0..0x1_0000).map(|i: u32| (i * 7 + i / 89) as u8).collect();
+    f.memory.write_bytes(DADDR + 0x10_0000, &pattern).unwrap();
+    f.memory.write_bytes(DADDR + 0x30_0000, &pattern).unwrap();
+    let (texture, _) = f.texture(&header);
+    assert_eq!(f.cache.get(texture).unwrap().segments.len(), 2);
+    let before = f.read_image(texture);
+    let target = rt_info(128, 128, 4, GobLayout::Tegra);
+    clear_rt_at(
+        &mut f,
+        GPU_VA + 0x30_0000,
+        &target,
+        [0.0, 1.0, 0.0, 1.0],
+        Rect::ALL,
+    );
+    let traffic = f.cache.traffic();
+    assert_eq!(f.texture(&header).0, texture);
+    let after = f.cache.traffic();
+    assert_eq!(
+        after.downloads, traffic.downloads,
+        "no write-back to guest memory"
+    );
+    assert_eq!(after.gpu_syncs, traffic.gpu_syncs + 1);
+    let texels = f.read_image(texture);
+    assert_eq!(texels[0], before[0], "the other range keeps its texels");
+    assert!(
+        texels[1]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|t| *t == [0, 255, 0, 255]),
+        "the shared range takes the render target's texels"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn single_slice_volumes_of_a_deeper_block_sync_on_the_gpu() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let mut header = tic(0x08, GPU_VA, 32, 32, 1, 1, 0);
+    header.0[3] |= 4 << 6;
+    header.0[4] = 31 | 2 << 23;
+    let info = ImageInfo::from_texture(&header.decode().unwrap(), GobLayout::Tegra).unwrap();
+    assert_eq!(info.kind, ImageKind::D3);
+    let pattern: Vec<u8> = (0..info.size_bytes())
+        .map(|i| (i * 11 + i / 61) as u8)
+        .collect();
+    f.memory.write_bytes(DADDR, &pattern).unwrap();
+    let (texture, _) = f.texture(&header);
+    let target = rt_info(32, 8, 0, GobLayout::Tegra);
+    clear_rt_at(&mut f, GPU_VA, &target, [0.0, 0.0, 1.0, 1.0], Rect::ALL);
+    let traffic = f.cache.traffic();
+    assert_eq!(f.texture(&header).0, texture);
+    let after = f.cache.traffic();
+    assert_eq!(
+        after.downloads, traffic.downloads,
+        "no write-back to guest memory"
+    );
+    assert_eq!(after.gpu_syncs, traffic.gpu_syncs + 1);
+    let tiling = info.surface().level_tiling(0);
+    assert_eq!(tiling.block_depth_log2, 4);
+    let mut tiled = pattern[..tiling.size_bytes()].to_vec();
+    let rt = target.surface().level_tiling(0);
+    for y in 0..8 {
+        for x in 0..32 * 4 {
+            tiled[rt.offset(x, y, 0)] = [0, 0, 255, 255][x as usize % 4];
+        }
+    }
+    let mut want = vec![0; 32 * 32 * 4];
+    lichii_texture::block_linear::unswizzle(&tiling, &tiled, &mut want);
+    assert_eq!(f.read_image(texture)[0], want);
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn subresources_split_across_device_ranges_sync_every_part() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    for va in [GPU_VA + (1 << 30), GPU_VA + (2 << 30)] {
+        f.gmmu
+            .map(va, DADDR + 0x10_0000, 0x1_0000, 0, false)
+            .unwrap();
+        f.gmmu
+            .map(va + 0x1_0000, DADDR + 0x30_0000, 0x1_0000, 0, false)
+            .unwrap();
+    }
+    let header = tic(0x08, GPU_VA + (1 << 30), 128, 256, 1, 1, 4);
+    let pattern: Vec<u8> = (0..0x1_0000).map(|i: u32| (i * 7 + i / 89) as u8).collect();
+    f.memory.write_bytes(DADDR + 0x10_0000, &pattern).unwrap();
+    f.memory.write_bytes(DADDR + 0x30_0000, &pattern).unwrap();
+    let (texture, _) = f.texture(&header);
+    assert_eq!(f.cache.get(texture).unwrap().segments.len(), 2);
+    let target = rt_info(256, 128, 4, GobLayout::Tegra);
+    let found = clear_rt_at(
+        &mut f,
+        GPU_VA + (2 << 30),
+        &target,
+        [0.0, 1.0, 0.0, 1.0],
+        Rect::ALL,
+    );
+    assert_ne!(found.id, texture);
+    let traffic = f.cache.traffic();
+    assert_eq!(f.texture(&header).0, texture);
+    let after = f.cache.traffic();
+    assert_eq!(
+        after.downloads, traffic.downloads,
+        "no write-back to guest memory"
+    );
+    assert_eq!(after.gpu_syncs, traffic.gpu_syncs + 1);
+    assert!(
+        f.read_image(texture)[0]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|t| *t == [0, 255, 0, 255]),
+        "both device ranges take the render target's texels"
+    );
     f.assert_no_validation_errors();
 }
