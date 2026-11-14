@@ -47,12 +47,6 @@ pub enum LaneOp {
     RecipEstimate,
     /// `FRSQRTE` on S lanes of `n`.
     RsqrtEstimate,
-    /// `FSQRT` on the lanes of `n`.
-    Sqrt,
-    /// `FMAX` or `FMAXNM`, which differ only on NaNs.
-    Max,
-    /// `FMIN` or `FMINNM`, which differ only on NaNs.
-    Min,
 }
 
 /// A lane-wise op on `n` and `m`, or on `n` and lane `index` of `m` for the by-element forms. It
@@ -252,8 +246,6 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         0x0e20_e400 => Some(LaneOp::CompareEq),
         0x2e20_e400 => Some(LaneOp::CompareGe),
         0x2ea0_e400 => Some(LaneOp::CompareGt),
-        0x0e20_f400 | 0x0e20_c400 => Some(LaneOp::Max),
-        0x0ea0_f400 | 0x0ea0_c400 => Some(LaneOp::Min),
         _ => None,
     };
     let by_element = |masked: u32| match masked {
@@ -268,9 +260,7 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         0x2ea1_d800 => Some(LaneOp::RsqrtEstimate),
         _ => None,
     };
-    let (op, element, lanes) = if word & 0xbfbf_fc00 == 0x2ea1_f800 {
-        (LaneOp::Sqrt, false, vector_lanes)
-    } else if let Some(op) = unary(word & 0xbfff_fc00) {
+    let (op, element, lanes) = if let Some(op) = unary(word & 0xbfff_fc00) {
         (op, false, vector_lanes)
     } else if let Some(op) =
         unary(word & 0xffff_fc00 ^ 0x5000_0000).filter(|&op| op != LaneOp::FromInt)
@@ -303,7 +293,7 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
     let n = vec(t, rn);
     let m = if matches!(
         op,
-        LaneOp::FromInt | LaneOp::RecipEstimate | LaneOp::RsqrtEstimate | LaneOp::Sqrt
+        LaneOp::FromInt | LaneOp::RecipEstimate | LaneOp::RsqrtEstimate
     ) {
         n
     } else {
@@ -344,24 +334,18 @@ impl Emitter<'_> {
             LaneOp::CompareEq | LaneOp::CompareGe | LaneOp::CompareGt
         );
         let estimate = matches!(op, LaneOp::RecipEstimate | LaneOp::RsqrtEstimate);
-        let extreme = matches!(op, LaneOp::Max | LaneOp::Min);
         let written = (1i32 << lanes) - 1;
         let element = index.map_or(written, |index| 1 << index);
         let inputs = [(n, written), (m, element), (acc.unwrap_or(n), written)];
-        let count = match (acc, op) {
-            (Some(_), _) => 3,
-            (_, LaneOp::Sqrt) => 1,
-            _ => 2,
-        };
         let inputs = Inputs::lanes(
             fp,
-            &inputs[..count],
+            &inputs[..if acc.is_some() { 3 } else { 2 }],
             matches!(op, LaneOp::Add | LaneOp::Sub | LaneOp::AddPairwise),
         );
         let slow = match op {
             _ if estimate => self.asm.new_dynamic_label(),
             LaneOp::FromInt => self.checked(true, None),
-            _ => self.checked(!compare && !extreme, Some(inputs)),
+            _ => self.checked(!compare, Some(inputs)),
         };
         let fused = matches!(
             op,
@@ -385,7 +369,8 @@ impl Emitter<'_> {
                 SCRATCH
             }
         };
-        if compare || extreme {
+        if compare {
+            let written = (1i32 << lanes) - 1;
             dynasm!(self.asm ; .arch x64 ; movaps xmm15, Rx(n));
             match fp {
                 Fp::S => {
@@ -398,7 +383,7 @@ impl Emitter<'_> {
             dynasm!(self.asm ; .arch x64 ; test eax, written ; jnz =>slow);
         }
         match op {
-            LaneOp::FromInt | LaneOp::RecipEstimate | LaneOp::RsqrtEstimate | LaneOp::Sqrt => {}
+            LaneOp::FromInt | LaneOp::RecipEstimate | LaneOp::RsqrtEstimate => {}
             LaneOp::CompareGe | LaneOp::CompareGt => {
                 dynasm!(self.asm ; .arch x64 ; movaps Rx(d), Rx(m))
             }
@@ -415,40 +400,6 @@ impl Emitter<'_> {
         }
         match (op, fp) {
             (LaneOp::FromInt, _) => dynasm!(self.asm ; .arch x64 ; cvtdq2ps Rx(d), Rx(n)),
-            (LaneOp::Sqrt, Fp::S) => dynasm!(self.asm ; .arch x64 ; sqrtps Rx(d), Rx(n)),
-            (LaneOp::Sqrt, Fp::D) => dynasm!(self.asm ; .arch x64 ; sqrtpd Rx(d), Rx(n)),
-            (LaneOp::Max, Fp::S) => dynasm!(self.asm
-                ; .arch x64
-                ; movaps xmm15, Rx(n)
-                ; cmpps xmm15, Rx(m), 4
-                ; orps xmm15, Rx(n)
-                ; maxps Rx(d), Rx(m)
-                ; andps Rx(d), xmm15
-            ),
-            (LaneOp::Max, Fp::D) => dynasm!(self.asm
-                ; .arch x64
-                ; movaps xmm15, Rx(n)
-                ; cmppd xmm15, Rx(m), 4
-                ; orps xmm15, Rx(n)
-                ; maxpd Rx(d), Rx(m)
-                ; andps Rx(d), xmm15
-            ),
-            (LaneOp::Min, Fp::S) => dynasm!(self.asm
-                ; .arch x64
-                ; movaps xmm15, Rx(n)
-                ; cmpps xmm15, Rx(m), 0
-                ; andps xmm15, Rx(n)
-                ; minps Rx(d), Rx(m)
-                ; orps Rx(d), xmm15
-            ),
-            (LaneOp::Min, Fp::D) => dynasm!(self.asm
-                ; .arch x64
-                ; movaps xmm15, Rx(n)
-                ; cmppd xmm15, Rx(m), 0
-                ; andps xmm15, Rx(n)
-                ; minpd Rx(d), Rx(m)
-                ; orps Rx(d), xmm15
-            ),
             (LaneOp::RecipEstimate | LaneOp::RsqrtEstimate, _) => {
                 self.estimate(op == LaneOp::RsqrtEstimate, lanes, d, n, slow)
             }
@@ -504,7 +455,7 @@ impl Emitter<'_> {
             }
             (LaneOp::Mls, Fp::D) => self.fma231pd(0xbc, d, n, b),
         }
-        if op != LaneOp::FromInt && !compare && !estimate && !extreme {
+        if op != LaneOp::FromInt && !compare && !estimate {
             self.check_lanes(op, fp, lanes, d, n, m, index, slow);
         }
         match (fp, lanes) {

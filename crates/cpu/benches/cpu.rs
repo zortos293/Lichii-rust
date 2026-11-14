@@ -412,27 +412,6 @@ const WORKLOADS: &[Workload] = &[
         per_iteration: 10,
     },
     Workload {
-        name: "zip widen loop",
-        code: &[
-            0x4f03f700, // fmov v0.4s, #1.5
-            0x4f03f501, // fmov v1.4s, #0.75
-            0x4e813802, // 1: zip1 v2.4s, v0.4s, v1.4s
-            0x4e817803, // zip2 v3.4s, v0.4s, v1.4s
-            0x6ea31c44, // bit v4.16b, v2.16b, v3.16b
-            0x4ea36c45, // smin v5.4s, v2.4s, v3.4s
-            0x2e641026, // uaddw v6.4s, v1.4s, v4.4h
-            0x0f10a4a7, // sshll v7.4s, v5.4h, #0
-            0x6ea1f848, // fsqrt v8.4s, v2.4s
-            0x4e23f449, // fmax v9.4s, v2.4s, v3.4s
-            0x4c007828, // st1 {v8.4s}, [x1]
-            0xf10004a5, // subs x5, x5, #1
-            0x54fffec1, // b.ne 1b
-            0xd4000001, // svc #0
-        ],
-        far: &[],
-        per_iteration: 11,
-    },
-    Workload {
         name: "saturating narrow loop",
         code: &[
             0x4f000460, // movi v0.4s, #3

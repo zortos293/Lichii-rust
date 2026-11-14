@@ -167,17 +167,9 @@ impl Emitter<'_> {
     /// Jumps to `slow` unless the FP result in `xmm15` is finite and, when `normal`, a normal
     /// number: a zero or subnormal result may have underflowed, and the Arm ARM detects tininess
     /// before rounding, so a result of exactly the smallest normal falls back too. A zero result
-    /// stays native when one of `zero_factors` (registers holding values of the given size) is
-    /// zero, because a product or quotient with a zero factor or dividend, and a conversion of a
-    /// zero, is exactly zero. Leaves the result's bits in `rax`.
-    fn check_result(
-        &mut self,
-        fp: Fp,
-        normal: bool,
-        zero_factors: (Fp, &[u8]),
-        slow: DynamicLabel,
-    ) {
-        let (factor_fp, zero_factors) = zero_factors;
+    /// stays native when one of `zero_factors` is zero, because a product or quotient with a zero
+    /// factor or dividend is exactly zero. Leaves the result's bits in `rax`.
+    fn check_result(&mut self, fp: Fp, normal: bool, zero_factors: &[u8], slow: DynamicLabel) {
         match fp {
             Fp::S => dynasm!(self.asm
                 ; .arch x64
@@ -232,13 +224,13 @@ impl Emitter<'_> {
         if let Some((&last, rest)) = zero_factors.split_last() {
             dynasm!(self.asm ; .arch x64 ; =>zero ; xorps xmm15, xmm15);
             for &f in rest {
-                match factor_fp {
+                match fp {
                     Fp::S => dynasm!(self.asm ; .arch x64 ; ucomiss xmm15, Rx(f)),
                     Fp::D => dynasm!(self.asm ; .arch x64 ; ucomisd xmm15, Rx(f)),
                 }
                 dynasm!(self.asm ; .arch x64 ; je =>done);
             }
-            match factor_fp {
+            match fp {
                 Fp::S => dynasm!(self.asm ; .arch x64 ; ucomiss xmm15, Rx(last)),
                 Fp::D => dynasm!(self.asm ; .arch x64 ; ucomisd xmm15, Rx(last)),
             }
@@ -433,9 +425,9 @@ impl Emitter<'_> {
                     (Arith::Nmul, Fp::D) => dynasm!(self.asm ; .arch x64 ; mulsd xmm15, Rx(b)),
                 }
                 match op {
-                    Arith::Add | Arith::Sub => self.check_result(fp, false, (fp, &[]), slow),
-                    Arith::Mul | Arith::Nmul => self.check_result(fp, true, (fp, &[a, b]), slow),
-                    Arith::Div => self.check_result(fp, true, (fp, &[a]), slow),
+                    Arith::Add | Arith::Sub => self.check_result(fp, false, &[], slow),
+                    Arith::Mul | Arith::Nmul => self.check_result(fp, true, &[a, b], slow),
+                    Arith::Div => self.check_result(fp, true, &[a], slow),
                     Arith::Max | Arith::Min => self.low_to_rax(fp, 15),
                 }
                 match (op, fp) {
@@ -487,7 +479,7 @@ impl Emitter<'_> {
                             dynasm!(self.asm ; .arch x64 ; vfmsub231sd xmm15, Rx(n), Rx(m))
                         }
                     }
-                    self.check_result(fp, true, (fp, &[n, m]), slow);
+                    self.check_result(fp, true, &[n, m], slow);
                     self.rax_to_low(fp, d);
                 } else {
                     dynasm!(self.asm ; .arch x64 ; jmp =>slow);
@@ -502,7 +494,7 @@ impl Emitter<'_> {
                     Fp::S => dynasm!(self.asm ; .arch x64 ; sqrtss xmm15, Rx(a)),
                     Fp::D => dynasm!(self.asm ; .arch x64 ; sqrtsd xmm15, Rx(a)),
                 }
-                self.check_result(fp, false, (fp, &[]), slow);
+                self.check_result(fp, false, &[], slow);
                 self.rax_to_low(fp, d);
                 self.finish_checked(i, slow, word, d, Ty::U128);
             }
@@ -560,7 +552,7 @@ impl Emitter<'_> {
                         Fp::S
                     }
                 };
-                self.check_result(to, narrowing, (fp, &[a]), slow);
+                self.check_result(to, narrowing, &[], slow);
                 self.rax_to_low(to, d);
                 self.finish_checked(i, slow, word, d, Ty::U128);
             }

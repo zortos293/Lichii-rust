@@ -60,21 +60,6 @@ pub enum Binary {
     /// Sums of adjacent lane pairs, those of `a` in the low half and those of `b` in the high
     /// half.
     Addp,
-    SMax,
-    SMin,
-    UMax,
-    UMin,
-}
-
-/// The bitwise selects, each `base ^ ((n ^ base) & mask)` on the destination's old value `old`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Select {
-    /// `BSL`: `m` where `old` is clear, `n` where it is set.
-    Bsl,
-    /// `BIT`: `n` where `m` is set, else `old`.
-    Bit,
-    /// `BIF`: `n` where `m` is clear, else `old`.
-    Bif,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,40 +118,6 @@ pub enum VecOp {
         n: Value,
         m: Value,
     },
-    /// `ZIP1` (`high` clear) or `ZIP2`: the lanes of the low or high halves of `n` and `m`,
-    /// interleaved with `n`'s first.
-    Zip {
-        high: bool,
-        arrangement: Arrangement,
-        n: Value,
-        m: Value,
-    },
-    /// `BSL`, `BIT` or `BIF`, over 128 bits when `q` is set and else the low 64.
-    Select {
-        op: Select,
-        q: bool,
-        old: Value,
-        n: Value,
-        m: Value,
-    },
-    /// `SADDW`/`UADDW` (and the `2` forms when `high`): `n`'s lanes of `16 << size` bits plus
-    /// the low (or high) half of `m`'s `8 << size`-bit lanes, sign- or zero-extended.
-    AddWide {
-        signed: bool,
-        size: u8,
-        high: bool,
-        n: Value,
-        m: Value,
-    },
-    /// `SSHLL`/`USHLL` (and the `2` forms when `high`): the low (or high) half of `a`'s
-    /// `8 << size`-bit lanes, sign- or zero-extended and shifted left by `shift`, below `8 << size`.
-    ShiftLong {
-        signed: bool,
-        size: u8,
-        high: bool,
-        shift: u8,
-        a: Value,
-    },
 }
 
 impl VecOp {
@@ -185,23 +136,15 @@ impl VecOp {
                 value: b,
                 ..
             }
-            | VecOp::Ext { n: a, m: b, .. }
-            | VecOp::Zip { n: a, m: b, .. }
-            | VecOp::AddWide { n: a, m: b, .. } => {
+            | VecOp::Ext { n: a, m: b, .. } => {
                 f(a);
                 f(b);
-            }
-            VecOp::Select { old, n, m, .. } => {
-                f(old);
-                f(n);
-                f(m);
             }
             VecOp::Shift(_, _, _, a)
             | VecOp::ScalarDup { vector: a, .. }
             | VecOp::Dup(_, a)
             | VecOp::Cnt(_, a)
-            | VecOp::Extract { vector: a, .. }
-            | VecOp::ShiftLong { a, .. } => f(a),
+            | VecOp::Extract { vector: a, .. } => f(a),
             VecOp::Imm(..) => {}
         }
     }
@@ -239,8 +182,6 @@ fn supported(t: &Translator, op: Binary, size: u8) -> bool {
         Binary::CmGt | Binary::CmGe => size < 3 || t.sse42,
         Binary::CmHi | Binary::CmHs => size == 0 || (size < 3 && t.sse41),
         Binary::Mul => size == 1 || (size == 2 && t.sse41),
-        Binary::SMax | Binary::SMin => size == 1 || (size < 3 && t.sse41),
-        Binary::UMax | Binary::UMin => size == 0 || (size < 3 && t.sse41),
     }
 }
 
@@ -253,13 +194,6 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
     let arrangement = Arrangement { size, q };
     let vec = |t: &mut Translator, r: u8| t.op(Op::Get(Loc::V(r)));
     let emit = |t: &mut Translator, op: VecOp| t.op(Op::Simd(SimdOp::Vec(op)));
-    if word & 0x9f20_fc00 == 0x0e20_1c00 && u && size != 0 {
-        let op = [Select::Bsl, Select::Bit, Select::Bif][size as usize - 1];
-        let (old, n, m) = (vec(t, rd), vec(t, rn), vec(t, rm));
-        let r = emit(t, VecOp::Select { op, q, old, n, m });
-        t.set(Loc::V(rd), r);
-        return true;
-    }
     if word & 0x9f20_0400 == 0x0e20_0400 {
         let opcode = field(word, 11, 5);
         let op = match (opcode, u, size) {
@@ -277,10 +211,6 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
             (0b00111, true, _) => Binary::CmHs,
             (0b10011, false, _) => Binary::Mul,
             (0b10111, false, _) => Binary::Addp,
-            (0b01100, false, _) => Binary::SMax,
-            (0b01101, false, _) => Binary::SMin,
-            (0b01100, true, _) => Binary::UMax,
-            (0b01101, true, _) => Binary::UMin,
             _ => return false,
         };
         if opcode != 0b00011 && ((size == 3 && !q) || !supported(t, op, size)) {
@@ -288,36 +218,6 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         }
         let (a, b) = (vec(t, rn), vec(t, rm));
         let r = emit(t, VecOp::Binary(op, arrangement, a, b));
-        t.set(Loc::V(rd), r);
-        return true;
-    }
-    if word & 0xbf20_bc00 == 0x0e00_3800 && (q || size < 3) {
-        let (n, m) = (vec(t, rn), vec(t, rm));
-        let high = word & 0x4000 != 0;
-        let r = emit(
-            t,
-            VecOp::Zip {
-                high,
-                arrangement,
-                n,
-                m,
-            },
-        );
-        t.set(Loc::V(rd), r);
-        return true;
-    }
-    if word & 0x9f20_fc00 == 0x0e20_1000 && size < 3 {
-        let (n, m) = (vec(t, rn), vec(t, rm));
-        let r = emit(
-            t,
-            VecOp::AddWide {
-                signed: !u,
-                size,
-                high: q,
-                n,
-                m,
-            },
-        );
         t.set(Loc::V(rd), r);
         return true;
     }
@@ -361,21 +261,6 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         let size = 7 - field(word, 19, 4).leading_zeros() as u8;
         let esize = 8u8 << size;
         let immhb = field(word, 16, 7);
-        if field(word, 11, 5) == 0b10100 && size < 3 {
-            let a = vec(t, rn);
-            let r = emit(
-                t,
-                VecOp::ShiftLong {
-                    signed: !u,
-                    size,
-                    high: q,
-                    shift: immhb - esize,
-                    a,
-                },
-            );
-            t.set(Loc::V(rd), r);
-            return true;
-        }
         let (op, amount) = match (field(word, 11, 5), u) {
             (0b00000, false) => (Shift::Sshr, 2 * esize - immhb),
             (0b00000, true) => (Shift::Ushr, 2 * esize - immhb),
@@ -755,9 +640,6 @@ enum Sse {
     Eq,
     Gt,
     MaxU,
-    MaxS,
-    MinU,
-    MinS,
     Mul,
 }
 
@@ -787,15 +669,6 @@ impl Emitter<'_> {
             (Sse::MaxU, 0) => dynasm!(self.asm ; .arch x64 ; pmaxub Rx(d), Rx(s)),
             (Sse::MaxU, 1) => dynasm!(self.asm ; .arch x64 ; pmaxuw Rx(d), Rx(s)),
             (Sse::MaxU, _) => dynasm!(self.asm ; .arch x64 ; pmaxud Rx(d), Rx(s)),
-            (Sse::MaxS, 0) => dynasm!(self.asm ; .arch x64 ; pmaxsb Rx(d), Rx(s)),
-            (Sse::MaxS, 1) => dynasm!(self.asm ; .arch x64 ; pmaxsw Rx(d), Rx(s)),
-            (Sse::MaxS, _) => dynasm!(self.asm ; .arch x64 ; pmaxsd Rx(d), Rx(s)),
-            (Sse::MinU, 0) => dynasm!(self.asm ; .arch x64 ; pminub Rx(d), Rx(s)),
-            (Sse::MinU, 1) => dynasm!(self.asm ; .arch x64 ; pminuw Rx(d), Rx(s)),
-            (Sse::MinU, _) => dynasm!(self.asm ; .arch x64 ; pminud Rx(d), Rx(s)),
-            (Sse::MinS, 0) => dynasm!(self.asm ; .arch x64 ; pminsb Rx(d), Rx(s)),
-            (Sse::MinS, 1) => dynasm!(self.asm ; .arch x64 ; pminsw Rx(d), Rx(s)),
-            (Sse::MinS, _) => dynasm!(self.asm ; .arch x64 ; pminsd Rx(d), Rx(s)),
             (Sse::Mul, 1) => dynasm!(self.asm ; .arch x64 ; pmullw Rx(d), Rx(s)),
             (Sse::Mul, _) => dynasm!(self.asm ; .arch x64 ; pmulld Rx(d), Rx(s)),
         }
@@ -844,29 +717,6 @@ impl Emitter<'_> {
             0 => dynasm!(self.asm ; .arch x64 ; packuswb Rx(d), Rx(s)),
             1 => dynasm!(self.asm ; .arch x64 ; packssdw Rx(d), Rx(s)),
             _ => dynasm!(self.asm ; .arch x64 ; shufps Rx(d), Rx(s), 0xdd_u8 as i8),
-        }
-    }
-
-    /// `d` = the low (or, when `high`, the high) half of `s`'s `8 << size`-bit lanes, each sign- or
-    /// zero-extended to twice its width. Clobbers `xmm15`.
-    fn widen(&mut self, signed: bool, size: u8, high: bool, d: u8, s: u8) {
-        if high {
-            dynasm!(self.asm ; .arch x64 ; pshufd Rx(d), Rx(s), 0xee_u8 as i8);
-        } else {
-            self.copy(d, s);
-        }
-        match (size, signed) {
-            (0, true) => dynasm!(self.asm ; .arch x64 ; punpcklbw Rx(d), Rx(d) ; psraw Rx(d), 8),
-            (0, false) => dynasm!(self.asm ; .arch x64 ; punpcklbw Rx(d), Rx(d) ; psrlw Rx(d), 8),
-            (1, true) => dynasm!(self.asm ; .arch x64 ; punpcklwd Rx(d), Rx(d) ; psrad Rx(d), 16),
-            (1, false) => dynasm!(self.asm ; .arch x64 ; punpcklwd Rx(d), Rx(d) ; psrld Rx(d), 16),
-            (_, true) => dynasm!(self.asm
-                ; .arch x64
-                ; movdqa Rx(SCRATCH), Rx(d)
-                ; psrad Rx(SCRATCH), 31
-                ; punpckldq Rx(d), Rx(SCRATCH)
-            ),
-            (_, false) => dynasm!(self.asm ; .arch x64 ; punpckldq Rx(d), Rx(d) ; psrlq Rx(d), 32),
         }
     }
 
@@ -980,10 +830,6 @@ impl Emitter<'_> {
                             Binary::Eor => Sse::Xor,
                             Binary::CmEq => Sse::Eq,
                             Binary::CmGt => Sse::Gt,
-                            Binary::SMax => Sse::MaxS,
-                            Binary::SMin => Sse::MinS,
-                            Binary::UMax => Sse::MaxU,
-                            Binary::UMin => Sse::MinU,
                             _ => Sse::Mul,
                         };
                         self.copy(d, a);
@@ -1054,82 +900,6 @@ impl Emitter<'_> {
                     );
                 }
                 (d, q)
-            }
-            VecOp::Zip {
-                high,
-                arrangement: Arrangement { size, q },
-                n,
-                m,
-            } => {
-                let (n, m) = (self.reg(n), self.reg(m));
-                let d = self.def(v);
-                self.copy(d, n);
-                match (size, high && q) {
-                    (0, false) => dynasm!(self.asm ; .arch x64 ; punpcklbw Rx(d), Rx(m)),
-                    (1, false) => dynasm!(self.asm ; .arch x64 ; punpcklwd Rx(d), Rx(m)),
-                    (2, false) => dynasm!(self.asm ; .arch x64 ; punpckldq Rx(d), Rx(m)),
-                    (_, false) => dynasm!(self.asm ; .arch x64 ; punpcklqdq Rx(d), Rx(m)),
-                    (0, true) => dynasm!(self.asm ; .arch x64 ; punpckhbw Rx(d), Rx(m)),
-                    (1, true) => dynasm!(self.asm ; .arch x64 ; punpckhwd Rx(d), Rx(m)),
-                    (2, true) => dynasm!(self.asm ; .arch x64 ; punpckhdq Rx(d), Rx(m)),
-                    (_, true) => dynasm!(self.asm ; .arch x64 ; punpckhqdq Rx(d), Rx(m)),
-                }
-                if high && !q {
-                    dynasm!(self.asm ; .arch x64 ; psrldq Rx(d), 8);
-                }
-                (d, q)
-            }
-            VecOp::Select { op, q, old, n, m } => {
-                let (old, n, m) = (self.reg(old), self.reg(n), self.reg(m));
-                let d = self.def(v);
-                let (base, mask) = match op {
-                    Select::Bsl => (m, old),
-                    Select::Bit | Select::Bif => (old, m),
-                };
-                self.copy(d, n);
-                self.sse(Sse::Xor, 0, d, base);
-                if op == Select::Bif {
-                    self.copy(SCRATCH, mask);
-                    self.sse(Sse::AndNot, 0, SCRATCH, d);
-                    self.copy(d, base);
-                    self.sse(Sse::Xor, 0, d, SCRATCH);
-                } else {
-                    self.sse(Sse::And, 0, d, mask);
-                    self.sse(Sse::Xor, 0, d, base);
-                }
-                (d, q)
-            }
-            VecOp::AddWide {
-                signed,
-                size,
-                high,
-                n,
-                m,
-            } => {
-                let (n, m) = (self.reg(n), self.reg(m));
-                let d = self.def(v);
-                self.widen(signed, size, high, d, m);
-                self.sse(Sse::Add, size + 1, d, n);
-                return;
-            }
-            VecOp::ShiftLong {
-                signed,
-                size,
-                high,
-                shift,
-                a,
-            } => {
-                let a = self.reg(a);
-                let d = self.def(v);
-                self.widen(signed, size, high, d, a);
-                let n = shift as i8;
-                match (size, shift) {
-                    (_, 0) => {}
-                    (0, _) => dynasm!(self.asm ; .arch x64 ; psllw Rx(d), n),
-                    (1, _) => dynasm!(self.asm ; .arch x64 ; pslld Rx(d), n),
-                    _ => dynasm!(self.asm ; .arch x64 ; psllq Rx(d), n),
-                }
-                return;
             }
             VecOp::Imm(imm, q) => {
                 let d = self.def(v);
