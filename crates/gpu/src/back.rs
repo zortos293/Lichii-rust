@@ -260,6 +260,7 @@ impl Back {
                 1
             }
             tag::WAIT_FOR_IDLE => {
+                self.rasterizer.release_fences(false);
                 self.rasterizer.barrier();
                 1
             }

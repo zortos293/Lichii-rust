@@ -192,17 +192,44 @@ impl HostWork {
     }
 }
 
-/// Holds the recording renderer in its barriers while closed.
-#[derive(Default)]
+/// Holds the recording renderer in every barrier past the first `open_through`.
 struct Gate {
-    closed: Mutex<bool>,
+    /// Barriers entered, and how many of them may pass.
+    state: Mutex<(usize, usize)>,
     opened: Condvar,
 }
 
+impl Default for Gate {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new((0, usize::MAX)),
+            opened: Condvar::new(),
+        }
+    }
+}
+
 impl Gate {
-    fn set_closed(&self, closed: bool) {
-        *self.closed.lock() = closed;
+    fn open_through(&self, barriers: usize) {
+        self.state.lock().1 = barriers;
         self.opened.notify_all();
+    }
+
+    fn pass(&self) {
+        let mut state = self.state.lock();
+        state.0 += 1;
+        let n = state.0;
+        self.opened.notify_all();
+        while n > state.1 {
+            self.opened.wait(&mut state);
+        }
+    }
+
+    /// Waits until the renderer entered `n` barriers.
+    fn entered(&self, n: usize) {
+        let mut state = self.state.lock();
+        while state.0 < n {
+            self.opened.wait(&mut state);
+        }
     }
 }
 
@@ -257,10 +284,7 @@ impl Rasterizer for Recorder {
     }
     fn barrier(&mut self) {
         self.log.lock().push(Event::Barrier);
-        let mut closed = self.gate.closed.lock();
-        while *closed {
-            self.gate.opened.wait(&mut closed);
-        }
+        self.gate.pass();
     }
     fn wait_for_idle(&mut self) {
         self.work.finish_all();
@@ -837,7 +861,7 @@ fn switch_1_fence_increments_after_a_wait_for_idle() {
 fn a_wait_for_idle_does_not_hold_the_front() {
     let mut rig = Rig::new(Threading::Split);
     let channel = rig.channel(HostClass::Maxwell);
-    rig.gate.set_closed(true);
+    rig.gate.open_through(0);
     let words = Pushbuffer::default()
         .bind(0, MAXWELL_3D)
         .host(host::WFI, 0)
@@ -849,11 +873,44 @@ fn a_wait_for_idle_does_not_hold_the_front() {
         assert!(!activity.is_waiting(Wait::FrontWaitingForBack));
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    rig.gate.set_closed(false);
+    rig.gate.open_through(usize::MAX);
     assert_eq!(
         rig.methods(),
         [(channel.0, EngineKind::Maxwell3d, 0x700, 1)]
     );
+}
+
+#[test]
+fn a_wait_for_idle_runs_the_fences_whose_gpu_work_finished() {
+    let mut rig = Rig::deferred(Threading::Split);
+    let channel = rig.channel(HostClass::Maxwell);
+    let id = 8;
+    rig.gate.open_through(1);
+    let entry = rig.entry(&Pushbuffer::default().host(host::SYNCPOINT_A, 0).0);
+    rig.gpu.submit(
+        channel,
+        Submission {
+            entries: &[entry],
+            wait: None,
+            increment: Some(SyncpointIncrement::fence_increment(id, false)),
+        },
+    );
+    rig.submit(
+        channel,
+        &Pushbuffer::default()
+            .host(host::WFI, 0)
+            .host(host::WFI, 0)
+            .0,
+    );
+    rig.gate.entered(2);
+    assert_eq!(rig.syncpoints.guest().value(id), Ok(0));
+    rig.work.finish_all();
+    rig.gate.open_through(2);
+    rig.gate.entered(3);
+    assert_eq!(rig.syncpoints.guest().value(id), Ok(2));
+    rig.gate.open_through(usize::MAX);
+    rig.complete();
+    assert_eq!(rig.syncpoints.guest().value(id), Ok(2));
 }
 
 #[test]
