@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 /// Directories Lichii reads and writes, laid out like the reference emulator's: a `user/`
 /// directory next to the executable makes the install portable and wins; otherwise everything
 /// lives under `%APPDATA%\lichii` on Windows, and under `lichii` in the XDG data, config and
-/// cache directories elsewhere.
+/// cache directories on Linux. macOS keeps its Application Support profile.
 #[derive(Clone, Debug)]
 pub struct UserPaths {
     pub config_dir: PathBuf,
@@ -23,6 +23,16 @@ impl UserPaths {
         {
             return Self::portable(portable);
         }
+        let project = directories::ProjectDirs::from("", "", "lichii");
+        if cfg!(target_os = "macos") {
+            let dirs = project.expect("no home directory to place Lichii's profile in");
+            return Self {
+                config_dir: dirs.config_dir().to_path_buf(),
+                data_dir: dirs.data_dir().to_path_buf(),
+                cache_dir: dirs.cache_dir().to_path_buf(),
+                legacy_data_dir: None,
+            };
+        }
         let base =
             directories::BaseDirs::new().expect("no home directory to place Lichii's profile in");
         let paths = if cfg!(windows) {
@@ -40,9 +50,7 @@ impl UserPaths {
                 &xdg("XDG_CACHE_HOME", ".cache"),
             )
         };
-        let legacy = directories::ProjectDirs::from("", "", "lichii")
-            .map(|dirs| dirs.data_dir().to_path_buf());
-        paths.with_legacy_data_dir(legacy)
+        paths.with_legacy_data_dir(project.map(|dirs| dirs.data_dir().to_path_buf()))
     }
 
     /// A portable profile: everything under `root`.
