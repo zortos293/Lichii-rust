@@ -241,9 +241,11 @@ pub(super) struct SoftwareBlitter {
 }
 
 impl SoftwareBlitter {
-    /// Performs `job` in software and reports the written range to the renderer. Blits it
-    /// cannot represent (empty or flipped rectangles, rectangles outside a block-linear
-    /// surface, oversized rectangles) are dropped with a warning.
+    /// Performs `job` in software and reports the written range to the renderer. Source
+    /// positions before the surface origin or past its end sample the edge texel, as the
+    /// hardware's clamped sampling does. Blits it cannot represent (empty or flipped rectangles,
+    /// rectangles outside a block-linear surface, oversized rectangles) are dropped with a
+    /// warning.
     pub fn blit(&mut self, ctx: &mut EngineContext<'_>, job: &Job) {
         let (Some(src_layout), Some(dst_layout)) =
             (Layout::of(job.src_format), Layout::of(job.dst_format))
@@ -266,9 +268,10 @@ impl SoftwareBlitter {
                 .min(extent.min(i32::MAX as u32) as i32),
         };
         let src_rect = Rect {
+            x0: job.src_rect.x0.max(0),
+            y0: job.src_rect.y0.max(0),
             x1: clamp(job.src_rect.x1, job.src.width),
             y1: clamp(job.src_rect.y1, job.src.height),
-            ..job.src_rect
         };
         let (Some((src_w, src_h)), Some((dst_w, dst_h))) = (src_rect.size(), job.dst_rect.size())
         else {
