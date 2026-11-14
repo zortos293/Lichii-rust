@@ -21,6 +21,7 @@ pub mod host1x;
 pub mod lazy;
 pub mod macros;
 pub mod nx2_memory;
+mod pending_releases;
 pub mod pushbuffer;
 mod ring;
 pub mod semaphore_mirror;
