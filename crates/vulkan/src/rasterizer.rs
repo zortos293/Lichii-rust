@@ -1106,7 +1106,11 @@ impl Rasterizer for VulkanRasterizer {
 
     fn synchronize_region(&mut self, addr: DAddr, size: u64) {
         let end = addr.saturating_add(size);
-        let writes = |address: DAddr, bytes: u64| address < end && addr < address + bytes;
+        let mirror = lichii_gpu::semaphore_mirror::REGION_SIZE / 2;
+        let lands = |address: DAddr, bytes: u64| address < end && addr < address + bytes;
+        let writes = |address: DAddr, bytes: u64| {
+            lands(address, bytes) || lands(address.wrapping_sub(mirror), bytes)
+        };
         let release_bytes = |size: ReleaseSize| match size {
             ReleaseSize::Four => 4,
             ReleaseSize::Eight => 8,
@@ -2181,6 +2185,24 @@ mod tests {
         assert_eq!(f.memory.read::<u32>(reduced).unwrap(), 8);
         f.rasterizer.release_fences(true);
         assert_eq!(f.syncpoints.guest().value(6).unwrap(), 1);
+        f.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn reads_of_a_first_page_wait_for_releases_mirrored_into_it() {
+        let Some(mut f) = fixture(GobLayout::Tegra) else {
+            return;
+        };
+        let first = DADDR + 0x80_0000;
+        f.syncpoints.semaphore_mirror().add_region(first);
+        f.rasterizer.barrier();
+        f.rasterizer.signal_fence(FenceAction::WriteSemaphore {
+            address: first + 0x1010,
+            value: 0x55,
+            size: ReleaseSize::Four,
+        });
+        f.rasterizer.synchronize_region(first + 0x10, 4);
+        assert_eq!(f.memory.read::<u32>(first + 0x10).unwrap(), 0x55);
         f.assert_no_validation_errors();
     }
 
