@@ -575,7 +575,8 @@ fn block_linear_overlap(
             t.layout,
         )
     };
-    if a_base != b_base || shape(&ta) != shape(&tb) {
+    let same_encoding = a.format.is_color() || a.format == b.format;
+    if a_base != b_base || shape(&ta) != shape(&tb) || !same_encoding {
         return None;
     }
     Some((

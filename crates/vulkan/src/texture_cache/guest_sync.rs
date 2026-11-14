@@ -186,7 +186,7 @@ impl TextureCache {
             || limit >= 1 << 31
             || newer.iter().any(|&o| {
                 let o = self.get(o).expect("overlaps are live");
-                o.cpu_dirty || packing(o).is_none() || !fits(o)
+                o.cpu_dirty || !o.keep_out.is_empty() || packing(o).is_none() || !fits(o)
             })
         {
             return Ok(false);

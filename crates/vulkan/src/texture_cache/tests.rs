@@ -2185,3 +2185,20 @@ fn depth_stencil_overlaps_sync_on_the_gpu() {
     }
     f.assert_no_validation_errors();
 }
+
+#[test]
+fn block_linear_aliases_need_the_same_depth_stencil_encoding() {
+    let info = |format, width| {
+        let mut info = rt_info(width, 64, 2, GobLayout::Tegra);
+        info.format = format;
+        info
+    };
+    let d24s8 = info(PixelFormat::D24UnormS8Uint, 256);
+    let s8d24 = info(PixelFormat::S8UintD24Unorm, 252);
+    assert!(block_linear_overlap(&d24s8, DADDR, &s8d24, DADDR).is_none());
+    let narrower = info(PixelFormat::D24UnormS8Uint, 252);
+    assert_eq!(
+        block_linear_overlap(&d24s8, DADDR, &narrower, DADDR),
+        Some(((0, 0), (0, 0), (252, 64)))
+    );
+}
