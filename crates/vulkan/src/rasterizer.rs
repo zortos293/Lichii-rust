@@ -125,6 +125,9 @@ enum Release {
     },
     /// A Z-pass counter reset; its earlier queries are free once the work before it completed.
     SamplesReset(u64),
+    /// Reads the Z-pass queries of `range` into the running count, freeing their slots while the
+    /// guest counts without reporting.
+    SamplesFold(samples::SampleRange),
 }
 
 /// The rectangle a clear covers: the first scissor and the clear rectangle when
@@ -990,6 +993,9 @@ impl Rasterizer for VulkanRasterizer {
                 }
                 .execute(&self.handles),
                 Release::SamplesReset(reset_at) => self.samples.retire(reset_at),
+                Release::SamplesFold(range) => {
+                    self.samples.resolve(&self.device, range);
+                }
             }
         }
     }
