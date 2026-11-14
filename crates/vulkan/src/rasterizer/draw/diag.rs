@@ -187,6 +187,33 @@ pub(crate) fn trace_fs() -> &'static [u64] {
     V.get_or_init(|| hex_list("LICHII_DIAG_TRACE_FS"))
 }
 
+/// Fragment or compute hashes whose sampled and storage images are dumped once, at the first
+/// use after LICHII_DIAG_DUMP_AT seconds, as raw level-0 texels into the draw diag directory.
+pub(crate) fn dump_due(hash: u64) -> bool {
+    static LIST: OnceLock<Vec<u64>> = OnceLock::new();
+    static AT: OnceLock<Duration> = OnceLock::new();
+    static DONE: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+    if !LIST
+        .get_or_init(|| hex_list("LICHII_DIAG_DUMP_FS"))
+        .contains(&hash)
+    {
+        return false;
+    }
+    if now() < *AT.get_or_init(|| secs("LICHII_DIAG_DUMP_AT").unwrap_or_default()) {
+        return false;
+    }
+    let mut done = DONE.lock().unwrap();
+    if done.contains(&hash) {
+        return false;
+    }
+    done.push(hash);
+    true
+}
+
+fn dump_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("LICHII_DRAW_DIAG_DIR").map(std::path::PathBuf::from)
+}
+
 pub(crate) fn state() -> Option<&'static Mutex<DrawDiag>> {
     static STATE: OnceLock<Option<Mutex<DrawDiag>>> = OnceLock::new();
     STATE
@@ -420,6 +447,7 @@ impl VulkanRasterizer {
         label: &str,
         ids: &[ImageId],
         always: bool,
+        dump: bool,
     ) {
         let log = |text: &str| {
             with(|d| {
@@ -467,6 +495,25 @@ impl VulkanRasterizer {
                     .read_bytes(daddr, &mut bytes[at..at + size as usize])
                     .is_err();
                 at += size as usize;
+            }
+            if let Some(dir) = dump.then(dump_dir).flatten()
+                && let Some(l0) = level0(&st.info, &bytes)
+            {
+                let name = format!(
+                    "dump-{:.3}-{}-{}-{:?}-{}x{}.raw",
+                    now().as_secs_f64(),
+                    label.replace(['=', ' '], "_"),
+                    format!("{id:?}")
+                        .split(' ')
+                        .nth(3)
+                        .unwrap_or("x")
+                        .trim_end_matches(','),
+                    st.info.format,
+                    st.info.width,
+                    st.info.height
+                );
+                let written = std::fs::write(dir.join(&name), &l0);
+                log(&format!("DUMP {name} {:?}", written.err()));
             }
             let text = format!(
                 "STAT {label} {id:?} {:?} {}x{}x{} lv={} gpu_mod={} fault={fault} {}",

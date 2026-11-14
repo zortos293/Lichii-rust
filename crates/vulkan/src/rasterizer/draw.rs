@@ -785,6 +785,11 @@ impl VulkanRasterizer {
             .find(|m| m.stage == ShaderStage::Fragment)
             .map_or(0, |m| m.hash);
         let traced = diag::trace_fs().contains(&traced_fs);
+        if diag::dump_due(traced_fs) {
+            let ids = self.draw.textures.clone();
+            let label = format!("fs={traced_fs:016x}");
+            self.diag_image_stats(&label, &ids, true, true);
+        }
         if traced || (diag::stats() && diag::with(|d| d.in_window()) == Some(true)) {
             let small: Vec<ImageId> = self
                 .draw
@@ -799,7 +804,7 @@ impl VulkanRasterizer {
                 .collect();
             if !small.is_empty() {
                 let label = format!("draw-in fs={traced_fs:016x}");
-                self.diag_image_stats(&label, &small, traced);
+                self.diag_image_stats(&label, &small, traced, false);
             }
         }
         let set = self.descriptor_set(set_layout)?;
@@ -2554,7 +2559,18 @@ impl VulkanRasterizer {
                 .chain(self.draw.storage_images.iter().map(|&(id, _)| id))
                 .collect();
             let label = format!("compute={:016x}", key.shader);
-            self.diag_image_stats(&label, &ids, false);
+            self.diag_image_stats(&label, &ids, false, false);
+        }
+        if diag::dump_due(key.shader) {
+            let ids: Vec<ImageId> = self
+                .draw
+                .textures
+                .iter()
+                .copied()
+                .chain(self.draw.storage_images.iter().map(|&(id, _)| id))
+                .collect();
+            let label = format!("cs={:016x}", key.shader);
+            self.diag_image_stats(&label, &ids, true, true);
         }
         Ok(())
     }
