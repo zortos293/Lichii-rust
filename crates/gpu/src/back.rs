@@ -2,7 +2,7 @@
 //! actions that need the renderer. The only code that touches the [`Rasterizer`].
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 
 use lichii_common::DAddr;
@@ -71,6 +71,8 @@ pub(crate) struct Back {
     fetch_syncs: Arc<FetchSyncs>,
     written_pages: Arc<GpuWrittenPages>,
     activity: Arc<Activity>,
+    /// Set by [`crate::Gpu::shutdown`]: the back drops what is left instead of executing it.
+    stopping: Arc<AtomicBool>,
 }
 
 impl Back {
@@ -81,6 +83,7 @@ impl Back {
         side: mpsc::Receiver<SideCommand>,
         fetch_syncs: Arc<FetchSyncs>,
         activity: Arc<Activity>,
+        stopping: Arc<AtomicBool>,
     ) -> Self {
         Self {
             rasterizer,
@@ -97,6 +100,7 @@ impl Back {
             fetch_syncs,
             written_pages: handles.written_pages.clone(),
             activity,
+            stopping,
         }
     }
 
@@ -105,6 +109,10 @@ impl Back {
         while consumer.refill() {
             self.drain_cpu_writes();
             while consumer.has_slots() {
+                if self.stopping.load(Ordering::Relaxed) {
+                    self.abandon(consumer);
+                    return;
+                }
                 let header = consumer.slot(0);
                 if header == WRAP {
                     consumer.wrap();
@@ -119,6 +127,15 @@ impl Back {
             }
             consumer.release();
         }
+    }
+
+    /// Skips every published record and drops every queued side command unexecuted, so a
+    /// [`crate::Gpu::run_in_order`] action or a synchronize still queued drops its sender and its
+    /// waiter returns.
+    fn abandon(&mut self, consumer: &mut Consumer) {
+        consumer.skip_published();
+        consumer.release();
+        while self.side.try_recv().is_ok() {}
     }
 
     /// Drops the renderer's copies of device memory the guest CPU wrote while a cache held it.
@@ -138,7 +155,7 @@ impl Back {
         let mut poll = MIN_POLL;
         loop {
             self.run(&mut consumer);
-            let fences = self.poll_fences();
+            let fences = !self.stopping.load(Ordering::Relaxed) && self.poll_fences();
             let idle = self.activity.waiting(Wait::BackIdle);
             let more = if fences {
                 consumer.wait_more_for(poll)

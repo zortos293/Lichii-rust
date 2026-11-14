@@ -1133,6 +1133,35 @@ mod tests {
     }
 
     #[test]
+    fn blit_programs_read_the_parameter_block_from_root_table_slot_24() {
+        let code = [
+            encode(
+                Opcode::Ldc,
+                Form::Bound,
+                dst(0) | ra(RZ) | (0x8 << 38) | (24 << 54) | (4 << 73),
+            ),
+            ast(0x70, 1, ra(RZ) | rb(0) | rc(RZ)),
+            exit(),
+        ];
+        let env = whole_program(
+            VertexB,
+            &code,
+            &[(0, 1 | (3 << 5) | (1 << 10)), (13, 0xf0 << 8)],
+        );
+        let ir = compile("ampere_blit_slot_24", &env);
+        assert!(!ir.contains("GetCbuf"), "{ir}");
+        let (profile, host) = (Profile::default(), HostTranslateInfo::default());
+        let options = TranslateOptions {
+            profile: &profile,
+            host: &host,
+            resolution_scale: ResolutionScale::X1,
+        };
+        let translated = crate::translate::translate(&env, options).unwrap();
+        assert!(translated.info.uses_render_area);
+        assert_eq!(translated.info.constant_buffer_mask, 0);
+    }
+
+    #[test]
     fn vertex_program_copies_an_attribute_to_the_position() {
         let code = [
             ald(0x80, 4, ra(RZ) | rb(RZ)),

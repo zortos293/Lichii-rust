@@ -222,7 +222,7 @@ impl FlowIsa for AmpereFlow {
         };
 
         Some(IndirectBranchTable {
-            cbuf_index: load.bits(54, 5) as u32,
+            cbuf_index: load.cbuf_slot(),
             cbuf_offset: load.bits(38, 16) as u32,
             num_entries: max.checked_add(1)?,
             branch_offset,

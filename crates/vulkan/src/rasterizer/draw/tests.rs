@@ -265,6 +265,253 @@ fn draws_hand_assembled_programs_and_reads_the_target_back() {
     f.assert_no_validation_errors();
 }
 
+/// Screen-linear fragment inputs interpolate linearly in screen space whatever each vertex's W:
+/// the vertex program writes them times Position.w and the fragment program unscales them.
+#[test]
+fn screen_linear_inputs_interpolate_linearly_across_vertices_of_different_w() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let mut vertex = header(1, ShaderType::VERTEX_B);
+    vertex[6] = 0x1f;
+    let vertex = program(
+        vertex,
+        &[
+            sass(
+                Opcode::Ald,
+                (3 << 47) | (RZ << 39) | (0x80 << 20) | (RZ << 8),
+            ),
+            sass(
+                Opcode::Ast,
+                (3 << 47) | (RZ << 39) | (0x70 << 20) | (RZ << 8),
+            ),
+            sass(Opcode::Ald, (RZ << 39) | (0x90 << 20) | (RZ << 8) | 4),
+            sass(Opcode::Ast, (RZ << 39) | (0x80 << 20) | (RZ << 8) | 4),
+            exit(),
+        ],
+    );
+    let mut fragment = header(2, ShaderType::PIXEL);
+    fragment[6] = 0b11;
+    fragment[18] = 0xf;
+    let fragment = program(
+        fragment,
+        &[
+            sass(Opcode::Ipa, (32 << 30) | (RZ << 8)),
+            mov_cbuf(1, 8),
+            mov_cbuf(2, 8),
+            mov_cbuf(3, 12),
+            exit(),
+        ],
+    );
+    write(&f, PROGRAMS, &vertex);
+    write(&f, PROGRAMS + u64::from(FRAGMENT), &fragment);
+    let corners = [
+        (-1.0, -1.0, 1.0, 0.0),
+        (3.0, -1.0, 4.0, 1.0),
+        (-1.0, 3.0, 2.0, 0.0),
+    ];
+    let vertices: Vec<f32> = corners
+        .iter()
+        .flat_map(|&(x, y, w, v)| [x * w, y * w, 0.0, w, v])
+        .collect();
+    write(&f, VERTICES, &f32_bytes(&vertices));
+    let mut regs = draw_regs();
+    regs.vertex_attrib_format[0] = VertexAttribute(0x1 << 21 | 0x7 << 27);
+    regs.vertex_attrib_format[1] = VertexAttribute(16 << 7 | 0x12 << 21 | 0x7 << 27);
+    regs.vertex_streams[0].bits = VertexStreamBits(20 | 1 << 12);
+    let limit = GPU_VA + VERTICES + 3 * 20 - 1;
+    regs.vertex_stream_limits[0].address_high = (limit >> 32) as u32;
+    regs.vertex_stream_limits[0].address_low = limit as u32;
+    draw(&mut f, &gmmu, &regs);
+    let texels = target(&mut f);
+    for (i, texel) in texels.iter().enumerate() {
+        let column = (i as u32 % SIZE) as f32;
+        let expected = ((column + 0.5) / 32.0 * 255.0).round() as i32;
+        assert!(
+            (i32::from(texel[0]) - expected).abs() <= 1 && texel[3] == 255,
+            "texel {i} is {texel:?}, expected red {expected}"
+        );
+    }
+    f.assert_no_validation_errors();
+}
+
+/// IPA.OFFSET of a screen-linear input interpolates linearly at the offset whatever each
+/// vertex's W: the fragment program unscales it with reciprocal W at the same offset.
+#[test]
+fn screen_linear_inputs_interpolate_at_an_offset_across_vertices_of_different_w() {
+    let Some(mut f) = fixture(GobLayout::Switch2) else {
+        return;
+    };
+    f.rasterizer.draw.pipelines.set_async_compilation(false);
+    let gmmu = gmmu(&f);
+    let attribute = |op, address: u128, count: u128, registers: u128| {
+        ampere(
+            op,
+            Form::Fixed,
+            address << 40 | (count - 1) << 74 | registers,
+        )
+    };
+    let (ald, ast) = (AmpereOpcode::Ald, AmpereOpcode::Ast);
+    let mut vertex = header(1, ShaderType::VERTEX_B);
+    vertex[6] = 0x1f;
+    vertex[13] |= 0xf0 << 8;
+    let vertex = ampere_program(
+        vertex,
+        &[
+            attribute(ald, 0x80, 4, RZ_A | 0xff << 32),
+            attribute(ast, 0x70, 4, RZ_A | 0xff << 64),
+            attribute(ald, 0x90, 1, 4 << 16 | RZ_A | 0xff << 32),
+            attribute(ast, 0x80, 1, RZ_A | 4 << 32 | 0xff << 64),
+            ampere_exit(),
+        ],
+    );
+    let mut fragment = header(2, ShaderType::PIXEL);
+    fragment[6] = 0b11;
+    fragment[18] = 0xf;
+    let half_pixel_left = u32::from((-2048i16) as u16);
+    let fragment = ampere_program(
+        fragment,
+        &[
+            ampere_mov(4, half_pixel_left),
+            ampere(
+                AmpereOpcode::Ipa,
+                Form::Fixed,
+                4 << 32 | 32 << 64 | 2 << 76 | 7 << 81,
+            ),
+            ampere_mov(1, 0),
+            ampere_mov(2, 0),
+            ampere_mov(3, 1.0f32.to_bits()),
+            ampere_exit(),
+        ],
+    );
+    let fragment_offset = 0x1000;
+    write(&f, PROGRAMS, &vertex);
+    write(&f, PROGRAMS + fragment_offset, &fragment);
+    let corners = [
+        (-1.0, -1.0, 1.0, 0.0),
+        (3.0, -1.0, 16.0, 1.0),
+        (-1.0, 3.0, 1.0, 0.0),
+    ];
+    let vertices: Vec<f32> = corners
+        .iter()
+        .flat_map(|&(x, y, w, v)| [x * w, y * w, 0.0, w, v])
+        .collect();
+    write(&f, VERTICES, &f32_bytes(&vertices));
+    let mut regs = draw_regs();
+    bind_program(&mut regs, 1, ShaderType::VERTEX_B, PROGRAMS);
+    bind_program(&mut regs, 5, ShaderType::PIXEL, PROGRAMS + fragment_offset);
+    regs.vertex_attrib_format[0] = VertexAttribute(0x1 << 21 | 0x7 << 27);
+    regs.vertex_attrib_format[1] = VertexAttribute(16 << 7 | 0x12 << 21 | 0x7 << 27);
+    regs.vertex_streams[0].bits = VertexStreamBits(20 | 1 << 12);
+    regs.words_mut()[0x600 / 4 + 1] = 3 * 20;
+    draw(&mut f, &gmmu, &regs);
+    assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
+    let texels = switch2_target(&mut f);
+    for (i, texel) in texels.iter().enumerate() {
+        let column = (i as u32 % SIZE) as f32;
+        let expected = (column / 32.0 * 255.0).round() as i32;
+        assert!(
+            (i32::from(texel[0]) - expected).abs() <= 1 && texel[3] == 255,
+            "texel {i} is {texel:?}, expected red {expected}"
+        );
+    }
+    f.assert_no_validation_errors();
+}
+
+/// NVN2 programs read root table 0 as constant buffer slot 24, which draws bind as slot 17 when
+/// the game binds nothing there. A read outside the blit parameter block reads the table.
+#[test]
+fn switch2_programs_read_root_table_0_as_slot_24() {
+    let Some(mut f) = fixture(GobLayout::Switch2) else {
+        return;
+    };
+    f.rasterizer.draw.pipelines.set_async_compilation(false);
+    let gmmu = gmmu(&f);
+    let attribute = |op, address: u128, count: u128, registers: u128| {
+        ampere(
+            op,
+            Form::Fixed,
+            address << 40 | (count - 1) << 74 | registers,
+        )
+    };
+    let mut vertex = header(1, ShaderType::VERTEX_B);
+    vertex[6] = 0xf;
+    vertex[13] |= 0xf0 << 8;
+    let vertex = ampere_program(
+        vertex,
+        &[
+            attribute(AmpereOpcode::Ald, 0x80, 4, RZ_A | 0xff << 32),
+            attribute(AmpereOpcode::Ast, 0x70, 4, RZ_A | 0xff << 64),
+            ampere_exit(),
+        ],
+    );
+    let mut fragment = header(2, ShaderType::PIXEL);
+    fragment[18] = 0xf;
+    let fragment = ampere_program(
+        fragment,
+        &[
+            ampere(
+                AmpereOpcode::Ldc,
+                Form::Bound,
+                RZ_A | 0x60 << 38 | 24 << 54 | 4 << 73,
+            ),
+            ampere_mov(1, 0),
+            ampere_mov(2, 0),
+            ampere_mov(3, 1.0f32.to_bits()),
+            ampere_exit(),
+        ],
+    );
+    let fragment_offset = 0x1000;
+    write(&f, PROGRAMS, &vertex);
+    write(&f, PROGRAMS + fragment_offset, &fragment);
+    write(
+        &f,
+        VERTICES,
+        &f32_bytes(&[
+            -1.0, -1.0, 0.0, 1.0, 3.0, -1.0, 0.0, 1.0, -1.0, 3.0, 0.0, 1.0,
+        ]),
+    );
+    let mut regs = draw_regs();
+    bind_program(&mut regs, 1, ShaderType::VERTEX_B, PROGRAMS);
+    bind_program(&mut regs, 5, ShaderType::PIXEL, PROGRAMS + fragment_offset);
+    regs.vertex_attrib_format[0] = VertexAttribute(0x1 << 21 | 0x7 << 27);
+    regs.vertex_streams[0].bits = VertexStreamBits(16 | 1 << 12);
+    regs.words_mut()[0x600 / 4 + 1] = 3 * 16;
+    let mut root_tables = [[0; 64]; 8];
+    root_tables[0][0x60 / 4] = 0.5f32.to_bits();
+    let mut dirty = DirtyState::new();
+    let const_buffers = const_buffers();
+    let mut ctx = GraphicsContext {
+        channel: ChannelId(0),
+        memory: &gmmu,
+        regs: &regs,
+        dirty: &mut dirty,
+        const_buffers: &const_buffers,
+        root_tables: &root_tables,
+    };
+    f.rasterizer.draw(
+        &mut ctx,
+        &DrawParams {
+            topology: PrimitiveTopology::TRIANGLES,
+            indexed: false,
+            first: 0,
+            count: 3,
+            base_vertex: 0,
+            base_instance: 0,
+            instance_count: 1,
+            inline_indices: None,
+        },
+    );
+    assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
+    let texels = switch2_target(&mut f);
+    assert!(
+        texels.iter().all(|&t| t == [128, 0, 0, 255]),
+        "every texel takes root table 0's word: {:?}",
+        &texels[..4]
+    );
+    f.assert_no_validation_errors();
+}
+
 #[test]
 fn cached_programs_translate_again_only_after_a_guest_write() {
     let Some((mut f, gmmu)) = draw_fixture() else {
@@ -865,6 +1112,7 @@ fn cached_samplers_follow_the_anisotropy_setting() {
     let src = StageSources {
         gmmu: &gmmu,
         cbufs: &cbufs[4],
+        root_table: None,
         pool: TexturePool {
             address: GPU_VA + TIC,
             limit: 0,
