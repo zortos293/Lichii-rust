@@ -228,10 +228,17 @@ fn parse_frames(text: &str) -> Vec<u64> {
 }
 
 impl RenderDoc {
-    fn start(&self, owner: u64) {
-        self.owner.store(owner, Ordering::Relaxed);
+    fn start(&self, owner: u64) -> bool {
+        if self
+            .owner
+            .compare_exchange(0, owner, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
         // SAFETY: null device and window capture RenderDoc's active ones.
         unsafe { (self.api.start_frame_capture)(std::ptr::null_mut(), std::ptr::null_mut()) };
+        true
     }
 
     fn end(&self, owner: u64, frames: (u64, u64)) {
@@ -326,8 +333,7 @@ impl FrameCapture {
             frame: 0,
             running: None,
         };
-        if renderdoc.frames.first() == Some(&1) {
-            renderdoc.start(capture.id);
+        if renderdoc.frames.first() == Some(&1) && renderdoc.start(capture.id) {
             capture.running = Some((Trigger::Listed, 1));
         }
         capture
@@ -351,8 +357,9 @@ impl FrameCapture {
             flush();
             self.renderdoc.end(self.id, (first, self.frame));
         }
-        if let Some(trigger) = step.start {
-            self.renderdoc.start(self.id);
+        if let Some(trigger) = step.start
+            && self.renderdoc.start(self.id)
+        {
             self.running = Some((trigger, next));
         }
     }
