@@ -788,17 +788,34 @@ impl BufferCache {
             self.gpu_written.subtract(daddr, end);
             self.disarm_written_back(daddr, end);
         }
-        self.cpu_written(daddr, size);
+        self.reupload(daddr, end);
     }
 
     /// Write tracking saw guest CPU writes in the pages of `[daddr, +size)`: they upload
     /// again before their next use, except bytes GPU work wrote. Those may lie beside the
     /// CPU's bytes on a page, so they stay until [`BufferCache::flush`] downloads them.
+    ///
+    /// With flush traps the CPU wins instead: a write to an armed page traps and downloads
+    /// first, so GPU-written bytes still on a CPU-written page were armed after the write was
+    /// made. Downloading them would put back the bytes the write replaced.
     pub fn cpu_written(&mut self, daddr: DAddr, size: u64) {
         let end = daddr.saturating_add(size).min(self.limit);
         if daddr >= end {
             return;
         }
+        if self.flush_traps {
+            let (start, stop) = (daddr & !(PAGE_SIZE - 1), end.next_multiple_of(PAGE_SIZE));
+            if self.gpu_written.intersects(start, stop) {
+                self.gpu_written.subtract(start, stop);
+                self.disarm_written_back(start, stop);
+            }
+        }
+        self.reupload(daddr, end);
+    }
+
+    /// Marks the pages of `[daddr, end)` to upload again before their next use and stops
+    /// tracking them; GPU-written bytes on them still skip the upload.
+    fn reupload(&mut self, daddr: DAddr, end: DAddr) {
         let mut page = daddr >> CACHING_PAGE_BITS;
         while page < end.div_ceil(CACHING_PAGE_SIZE) {
             let Some(id) = Self::lookup(&self.page_table, page << CACHING_PAGE_BITS) else {
@@ -2045,12 +2062,13 @@ mod tests {
         f.assert_no_validation_errors();
     }
 
-    /// A guest CPU write beside GPU-written bytes on one page, seen by write tracking for the
-    /// whole page, keeps both.
+    /// Without flush traps, a guest CPU write beside GPU-written bytes on one page, seen by
+    /// write tracking for the whole page, keeps both.
     #[test]
     fn cpu_writes_beside_gpu_writes_keep_both() {
         const CPU_VA: u64 = 0x1000_0000;
         let Some(mut f) = fixture() else { return };
+        f.cache.flush_traps = false;
         let space = Arc::new(AddressSpace::new(f.memory.physical().clone(), 39));
         space.map(CPU_VA, 0, 0x10000, MemoryPermission::READ_WRITE);
         f.memory.attach_process(space.clone());
@@ -2148,6 +2166,35 @@ mod tests {
             "without flush traps the read sees guest memory"
         );
         assert!(served.try_recv().is_err());
+        f.assert_no_validation_errors();
+    }
+
+    /// A guest write that lands before its page is armed, while GPU work recorded after it
+    /// writes the rest of the range, survives the download a later CPU read triggers.
+    #[test]
+    fn a_cpu_write_made_before_the_arm_survives_the_download() {
+        let Some(mut f) = fixture() else { return };
+        f.cache.flush_traps = true;
+        let binding = f.acquire(DADDR, 0x2000);
+        f.memory.write_bytes(DADDR + 0x1000, &[0x5a; 16]).unwrap();
+        f.gpu_fill(binding, 0, 0x2000, 0x1234_5678);
+        f.cache.mark_gpu_written(DADDR, 0x2000);
+        f.cache.cpu_written(DADDR + 0x1000, PAGE_SIZE);
+        f.cache
+            .flush_for_cpu_read(&mut f.scheduler, DADDR, PAGE_SIZE)
+            .unwrap();
+        assert!(
+            !f.cache.is_gpu_written(DADDR, 0x2000),
+            "nothing left to download"
+        );
+        let mut bytes = [0u8; 16];
+        f.memory.read_bytes(DADDR + 0x1000, &mut bytes).unwrap();
+        assert_eq!(bytes, [0x5a; 16], "the CPU's bytes stay");
+        assert_eq!(
+            f.memory.read::<u32>(DADDR).unwrap(),
+            0x1234_5678,
+            "the rest of the range downloads"
+        );
         f.assert_no_validation_errors();
     }
 

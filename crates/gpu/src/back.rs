@@ -169,6 +169,7 @@ impl Back {
     #[cold]
     fn serve_cpu_reads_now(&mut self) {
         self.flush_engine();
+        self.drain_cpu_writes();
         let _waiting = self.activity.waiting(Wait::HostGpu);
         let rasterizer = &mut *self.rasterizer;
         self.cpu_reads
