@@ -2227,21 +2227,26 @@ impl TextureCache {
         }
         self.take_from_overlaps(tx, id)?;
         if self.image(id).cpu_dirty {
-            if self.image(id).scale != ResolutionScale::X1 {
-                self.image(id).mark_dirty_whole();
-            }
-            self.rescale(tx, id, ResolutionScale::X1, false)?;
-            self.upload(tx, id)?;
-            let tick = self.tick;
-            let image = self.image(id);
-            image.cpu_dirty = false;
-            image.current = tick;
-            image.keep_out.clear();
-            for alias in &mut image.aliases {
-                alias.synced = 0;
-            }
+            self.take_cpu_writes(tx, id)?;
+            self.image(id).current = self.tick;
         }
         self.take_from_aliases(tx.scheduler, id)
+    }
+
+    /// Uploads what the guest CPU wrote into the image since its last upload.
+    fn take_cpu_writes(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
+        if self.image(id).scale != ResolutionScale::X1 {
+            self.image(id).mark_dirty_whole();
+        }
+        self.rescale(tx, id, ResolutionScale::X1, false)?;
+        self.upload(tx, id)?;
+        let image = self.image(id);
+        image.cpu_dirty = false;
+        image.keep_out.clear();
+        for alias in &mut image.aliases {
+            alias.synced = 0;
+        }
+        Ok(())
     }
 
     /// Readies an upload of what overlaps modified after the image last held their bytes:
