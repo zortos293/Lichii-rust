@@ -178,6 +178,51 @@ fn compute_exit_translates_to_nothing() {
     assert_eq!(translate(&[exit]).unwrap(), "{0}:\n");
 }
 
+/// `@P0 BREAK B1` as Donkey Kong Bananza's compute programs encode it.
+const BREAK_P0_B1: Instruction = Instruction(0x000f_e200_0380_0000_0000_0000_0001_0942);
+
+#[test]
+fn break_translates_to_nothing() {
+    assert_eq!(translate(&[BREAK_P0_B1]).unwrap(), "{0}:\n");
+    let unconditional = encode(Opcode::Break, Form::Fixed, (7 << 87) | (3 << 16));
+    assert_eq!(translate(&[unconditional]).unwrap(), "{0}:\n");
+}
+
+/// A relative BRA guarded by `@P0` (`pred` 0) or always taken (`pred` 7) to `offset` bytes past
+/// the next instruction.
+fn bra(pred: u128, offset: i64) -> Instruction {
+    let offset = ((offset >> 2) as u128 & ((1 << 48) - 1)) << 34;
+    Instruction((7 << 87) | offset | (pred << 12) | opcode_bits(Opcode::Bra, Form::Fixed))
+}
+
+/// A loop left through BREAK and a branch to its BSYNC compiles to valid SPIR-V.
+#[test]
+fn loop_left_through_break_compiles() {
+    let code = [
+        encode(Opcode::Bssy, Form::Fixed, (1 << 16) | (0x30 << 34)),
+        BREAK_P0_B1,
+        bra(0, 0x10),
+        bra(7, -0x30),
+        encode(Opcode::Bsync, Form::Fixed, (7 << 87) | (1 << 16)),
+        encode(Opcode::Exit, Form::Fixed, 7 << 87),
+    ];
+    let env = TestEnv::new(&code);
+    let profile = Profile::default();
+    let options = TranslateOptions {
+        profile: &profile,
+        host: &HostTranslateInfo::default(),
+        resolution_scale: ResolutionScale::X1,
+    };
+    let module = crate::module::compile(
+        &env,
+        options,
+        &RuntimeInfo::default(),
+        &mut Bindings::default(),
+    )
+    .expect("the loop translates");
+    crate::backend::spirv::tests::validate("ampere-break-loop", &profile, &module.spirv);
+}
+
 /// A xorshift64 generator seeded with the given state.
 fn xorshift(mut state: u64) -> impl FnMut() -> u64 {
     move || {
