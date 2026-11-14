@@ -447,6 +447,11 @@ impl Thread {
             .is_ok()
     }
 
+    /// Whether the last reference dropped and the thread gave its resources back.
+    pub(crate) fn is_finalized(&self) -> bool {
+        self.finalized.load(Ordering::SeqCst)
+    }
+
     /// Drops a reference. The last one gives the TLS slot and the thread count back to the
     /// process and detaches the thread from it, as Horizon's `KThread::Finalize` does once
     /// the thread has exited (or never started) and its last handle is closed. Freeing the slot
@@ -567,10 +572,12 @@ impl Thread {
                 drop(s);
                 self.leave_lock_wait(token);
             }
-            ThreadState::Created if !self.try_retain() => {}
-            ThreadState::Suspended | ThreadState::Created => {
+            ThreadState::Created if self.is_finalized() => {}
+            ThreadState::Created => {
+                self.retain();
                 self.scheduler.enqueue(self, &mut s, true)
             }
+            ThreadState::Suspended => self.scheduler.enqueue(self, &mut s, true),
             ThreadState::Running(core) => self.scheduler.request_reschedule(core),
             ThreadState::Runnable | ThreadState::Terminated => {}
         }

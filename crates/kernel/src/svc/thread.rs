@@ -54,7 +54,7 @@ pub(super) fn start_thread(svc: &mut SvcContext) -> Flow {
         if s.terminate_requested {
             return Err(result::TERMINATION_REQUESTED);
         }
-        if !thread.try_retain() {
+        if thread.is_finalized() || !thread.try_retain() {
             return Err(result::INVALID_HANDLE);
         }
         thread.scheduler.enqueue(&thread, &mut s, false);
