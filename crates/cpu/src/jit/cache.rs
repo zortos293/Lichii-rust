@@ -92,19 +92,26 @@ impl CodeMemory {
         Some(unsafe { self.exec.add(start) })
     }
 
-    /// Points the `jmp rel32` at executable address `site` to `target`. The offset is 4-byte
-    /// aligned, so the store is atomic and a core running the code sees the old jump or the new.
+    /// Points the `jmp rel32` at executable address `site` to `target`. The offset never crosses
+    /// a cache line, so the store is atomic and a core running the code sees the old jump or the
+    /// new.
     ///
     /// # Safety
     /// `site` must be a link site of a block in this memory.
     unsafe fn patch(&self, site: usize, target: usize) {
         let rel = target.wrapping_sub(site + 5) as i32 as u32;
+        let operand = site + 1 - self.exec as usize;
+        debug_assert!(operand % 16 <= 12, "a link offset crosses a cache line");
         // SAFETY: guaranteed by the caller; the operand follows the one-byte opcode, at the same
-        // offset in the writable view, and `x64` aligns it to 4 bytes.
+        // offset in the writable view. One `mov` writes it, and within one cache line x86 makes
+        // that unaligned 4-byte store atomic.
         unsafe {
-            let operand = self.write.add(site + 1 - self.exec as usize);
-            debug_assert_eq!(operand as usize % 4, 0);
-            (*operand.cast::<AtomicU32>()).store(rel, Ordering::Release);
+            std::arch::asm!(
+                "mov dword ptr [{ptr}], {rel:e}",
+                ptr = in(reg) self.write.add(operand),
+                rel = in(reg) rel,
+                options(nostack, preserves_flags),
+            );
         }
     }
 }
@@ -691,8 +698,14 @@ impl JitCache {
         if start == pc && index != EMPTY.1 {
             return Some(self.entries[index as usize]);
         }
+        self.lookup_slow(pc)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn lookup_slow(&mut self, pc: u64) -> Option<Entry> {
         if let Some(&index) = self.by_start.get(&pc) {
-            self.fast[slot] = (pc, index);
+            self.fast[fast_slot(pc)] = (pc, index);
             return Some(self.entries[index as usize]);
         }
         if self.sync() {

@@ -1603,12 +1603,16 @@ impl Emitter<'_> {
     /// A linkable exit to `target`: a `jmp rel32` that starts out jumping to the code right after
     /// it, which leaves to the dispatcher with the jump's address in `JitState::link`. Linking
     /// points the `jmp` at the target block; unlinking sets its offset back to zero.
-    /// The offset is 4-byte aligned, so another core can repoint it while running the block.
+    /// Blocks start 16-byte aligned and the offset never crosses a 16-byte boundary, so it sits
+    /// in one cache line and another core can repoint it with one store while running the block.
     fn link(&mut self, target: u64) {
         let site = self.asm.new_dynamic_label();
         let unlinked = self.asm.new_dynamic_label();
-        for _ in 0..(3 - self.asm.offset().0 % 4) % 4 {
-            dynasm!(self.asm ; .arch x64 ; nop);
+        match self.asm.offset().0 % 16 {
+            12 => dynasm!(self.asm ; .arch x64 ; .bytes [0x0f, 0x1f, 0x00]),
+            13 => dynasm!(self.asm ; .arch x64 ; .bytes [0x66, 0x90]),
+            14 => dynasm!(self.asm ; .arch x64 ; nop),
+            _ => {}
         }
         dynasm!(self.asm
             ; .arch x64
