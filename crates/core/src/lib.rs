@@ -293,6 +293,7 @@ impl System {
         if self.state == State::Stopped {
             return;
         }
+        self.kernel.pause();
         noting_slow("stopping the GPU", || self.gpu.shutdown());
         self.audio.set_paused(true);
         noting_slow("stopping the kernel", || self.kernel.shutdown());
