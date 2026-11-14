@@ -826,8 +826,14 @@ impl Rasterizer for VulkanRasterizer {
             tracing::warn!(address = query.address, "query to unmapped GPU memory");
             return;
         };
+        static FAKE_SAMPLES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let fake = *FAKE_SAMPLES.get_or_init(|| std::env::var_os("LICHII_DIAG_SAMPLES").is_some());
         let value = match query.kind {
             QueryKind::Payload => query.payload,
+            QueryKind::SamplesPassed if fake => {
+                static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                COUNTER.fetch_add(0x1000, std::sync::atomic::Ordering::Relaxed) + 0x1000
+            }
             _ => 0,
         };
         let action = FenceAction::WriteSemaphore {
@@ -955,6 +961,7 @@ impl Rasterizer for VulkanRasterizer {
 
     fn present(&mut self, framebuffer: &FramebufferConfig) {
         self.activity.presents += 1;
+        lichii_gpu::diag::present();
         self.handles.timestamp.frame_presented();
         self.draw.shaders.flush_disk();
         self.draw.shaders.log_stats(Instant::now());
