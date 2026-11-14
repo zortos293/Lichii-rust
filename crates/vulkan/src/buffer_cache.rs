@@ -24,7 +24,7 @@ use lichii_gpu::engines::maxwell_3d::regs::{IndexBuffer, IndexFormat, PrimitiveT
 use lichii_gpu::gmmu::{Gmmu, GpuRange, RangeTarget};
 use lichii_gpu::lazy::LazyDeviceRanges;
 use lichii_memory::{CachedPages, DeviceAddressSpace};
-use lichii_shader::ShaderArch;
+use lichii_shader::{ShaderArch, ShaderStage};
 
 use crate::commands::transfer_to_all_barrier;
 use crate::device::Device;
@@ -709,6 +709,47 @@ pub struct BufferCache {
     downloads: Vec<(vk::Buffer, u64, DAddr, u64)>,
     segments: Vec<GpuRange>,
     scratch: Vec<u32>,
+    pub diag_writer: DiagWriter,
+    pub diag_gpu_va: u64,
+    diag: DiagTraps,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DiagWriter {
+    #[default]
+    Other,
+    Shader(ShaderStage, u64),
+    Dma,
+}
+
+#[derive(Default)]
+struct DiagArea {
+    flushes: u64,
+    changed_flushes: u64,
+    changed_bytes: u64,
+    size: u64,
+    writers: Vec<(DiagWriter, u64, u64)>,
+    logged: u32,
+}
+
+struct DiagTraps {
+    writers: BTreeMap<DAddr, (DiagWriter, u64, u64, u64)>,
+    areas: std::collections::HashMap<DAddr, DiagArea>,
+    last_report: std::time::Instant,
+}
+
+impl Default for DiagTraps {
+    fn default() -> Self {
+        Self {
+            writers: BTreeMap::new(),
+            areas: Default::default(),
+            last_report: std::time::Instant::now(),
+        }
+    }
+}
+
+fn diag_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join("")
 }
 
 impl BufferCache {
@@ -743,6 +784,9 @@ impl BufferCache {
             downloads: Vec::new(),
             segments: Vec::new(),
             scratch: Vec::new(),
+            diag_writer: DiagWriter::Other,
+            diag_gpu_va: 0,
+            diag: DiagTraps::default(),
         })
     }
 
@@ -820,6 +864,8 @@ impl BufferCache {
     pub fn mark_gpu_written(&mut self, daddr: DAddr, size: u64) {
         let end = daddr.saturating_add(size).min(self.limit);
         if daddr < end {
+            let entry = self.diag.writers.entry(daddr).or_insert((self.diag_writer, self.diag_gpu_va, end - daddr, 0));
+            *entry = (self.diag_writer, self.diag_gpu_va, (end - daddr).max(entry.2), entry.3 + 1);
             self.written_pages.mark(daddr, end - daddr);
             if self.flush_traps && !self.gpu_written.covers(daddr, end) {
                 self.memory.arm_flush_traps(daddr, end - daddr);
@@ -860,7 +906,69 @@ impl BufferCache {
         size: u64,
     ) -> Result<()> {
         let (start, end) = self.gpu_written.area(daddr, daddr.saturating_add(size));
-        self.flush(scheduler, start, end - start)
+        let len = (end - start).min(1 << 20) as usize;
+        let mut before = vec![0u8; len];
+        let _ = self.memory.read_bytes(start, &mut before);
+        self.flush(scheduler, start, end - start)?;
+        let mut after = vec![0u8; len];
+        let _ = self.memory.read_bytes(start, &mut after);
+        let changed: Vec<usize> = (0..len).filter(|&i| before[i] != after[i]).collect();
+        let writers: Vec<(DiagWriter, u64, u64)> = self
+            .diag
+            .writers
+            .range(..end)
+            .rev()
+            .take_while(|(k, v)| **k + v.2 > start || **k >= start)
+            .filter(|(k, v)| **k + v.2 > start)
+            .take(4)
+            .map(|(k, v)| (v.0, v.1, *k))
+            .collect();
+        let area = self.diag.areas.entry(start).or_default();
+        area.flushes += 1;
+        area.size = area.size.max(end - start);
+        if !changed.is_empty() {
+            area.changed_flushes += 1;
+            area.changed_bytes += changed.len() as u64;
+        }
+        for w in &writers {
+            if !area.writers.contains(w) {
+                area.writers.push(*w);
+            }
+        }
+        if area.logged < 6 || (!changed.is_empty() && area.logged < 12) {
+            area.logged += 1;
+            let first = changed.first().copied().unwrap_or(0) & !15;
+            let window = first..(first + 64).min(len);
+            tracing::info!(
+                area_start = format_args!("{start:#x}"),
+                area_size = end - start,
+                trap_daddr = format_args!("{daddr:#x}"),
+                trap_size = size,
+                changed = changed.len(),
+                first_changed = format_args!("{first:#x}"),
+                before = %diag_hex(&before[window.clone()]),
+                after = %diag_hex(&after[window]),
+                writers = ?writers,
+                "DIAG flush trap"
+            );
+        }
+        if self.diag.last_report.elapsed() >= std::time::Duration::from_secs(5) {
+            self.diag.last_report = std::time::Instant::now();
+            let mut top: Vec<_> = self.diag.areas.iter().collect();
+            top.sort_by_key(|(_, a)| std::cmp::Reverse(a.flushes));
+            for (start, a) in top.into_iter().take(12) {
+                tracing::info!(
+                    area_start = format_args!("{start:#x}"),
+                    size = a.size,
+                    flushes = a.flushes,
+                    changed_flushes = a.changed_flushes,
+                    changed_bytes = a.changed_bytes,
+                    writers = ?a.writers,
+                    "DIAG trap area totals"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Copies the GPU-written bytes of `[daddr, +size)` back to guest memory, waiting for the GPU.
@@ -1333,6 +1441,7 @@ impl BufferCache {
         if gpu_va == 0 || size == 0 {
             return Ok(None);
         }
+        self.diag_gpu_va = gpu_va;
         let align = self.storage_alignment();
         let start = gpu_va & !(align - 1);
         let size = size + (gpu_va - start);
@@ -1380,6 +1489,7 @@ impl BufferCache {
         if gpu_va == 0 || size < texel {
             return Ok(None);
         }
+        self.diag_gpu_va = gpu_va;
         let Some((binding, daddr)) = self.first_run(scheduler, staging, gmmu, gpu_va, size)? else {
             return Ok(None);
         };

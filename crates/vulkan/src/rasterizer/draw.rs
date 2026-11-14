@@ -1223,6 +1223,7 @@ impl VulkanRasterizer {
 
     /// Appends `module`'s descriptors to the current draw's writes. `false` skips the draw.
     fn bind_resources(&mut self, module: &ShaderModule, src: &StageSources<'_>) -> Result<bool> {
+        self.buffer_cache.diag_writer = crate::buffer_cache::DiagWriter::Shader(module.stage, module.hash);
         let info = &module.info;
         for set in &module.resources.sets {
             for b in &set.bindings {

@@ -164,7 +164,10 @@ impl TextureCache {
             );
         }
         transfer_to_all_barrier(&device, cmd);
+        tx.buffers.diag_writer = crate::buffer_cache::DiagWriter::Dma;
+        tx.buffers.diag_gpu_va = 0;
         tx.buffers.mark_gpu_written(target.daddr, target.size);
+        tx.buffers.diag_writer = crate::buffer_cache::DiagWriter::Other;
         Ok(true)
     }
 
