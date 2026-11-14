@@ -280,6 +280,13 @@ impl PsHeader<'_> {
         ]
     }
 
+    /// One bit per generic input with a component the program interpolates screen-linear.
+    pub fn screen_linear_generics(&self) -> u32 {
+        (0..32)
+            .filter(|&i| self.generic_input_map(i).contains(&PixelImap::ScreenLinear))
+            .fold(0, |mask, i| mask | 1 << i)
+    }
+
     pub const fn is_generic_vector_active(&self, attribute: usize) -> bool {
         self.0.byte(Self::IMAP_GENERIC + attribute) != 0
     }
@@ -355,6 +362,20 @@ mod tests {
             bytes,
         };
         ProgramHeader::read(&env, env.start_address() - ProgramHeader::SIZE)
+    }
+
+    #[test]
+    fn screen_linear_generics_name_any_screen_linear_component() {
+        let mut header = ProgramHeader::default();
+        let generic = |header: &mut ProgramHeader, index: usize, bits: u32| {
+            let byte = PsHeader::IMAP_GENERIC + index;
+            header.words[byte / 4] |= bits << (byte % 4 * 8);
+        };
+        generic(&mut header, 0, 0b1010_1010);
+        generic(&mut header, 3, 0b0000_1100);
+        generic(&mut header, 31, 0b1111_1111);
+        generic(&mut header, 7, 0b0101_0101);
+        assert_eq!(header.ps().screen_linear_generics(), 1 << 3 | 1 << 31);
     }
 
     #[test]

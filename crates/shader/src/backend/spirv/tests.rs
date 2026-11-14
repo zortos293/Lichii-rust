@@ -1010,6 +1010,86 @@ fn interpolate_at_offset_follows_the_generic_input_types() {
     );
 }
 
+/// Screen-linear inputs the previous stage wrote times Position.w are read perspective-correct
+/// times FragCoord.w, however the program reads them; otherwise they keep `NoPerspective`.
+#[test]
+fn scaled_noperspective_inputs_read_times_frag_coord_w() {
+    let mut s = Synthetic::new();
+    let b = s.block();
+    s.inst(b, Opcode::Prologue, &[]);
+    let direct = s.inst(
+        b,
+        Opcode::GetAttribute,
+        &[Value::Attribute(Attribute::generic(0, 0)), Value::U32(0)],
+    );
+    let offset = s.inst(
+        b,
+        Opcode::InterpolateAtOffset,
+        &[
+            Value::Attribute(Attribute::generic(1, 0)),
+            Value::F32(0.25),
+            Value::F32(-0.25),
+        ],
+    );
+    let address = Value::U32(u32::from(Attribute::generic(2, 0).0) * 4);
+    let indexed = s.inst(b, Opcode::GetAttributeIndexed, &[address, Value::U32(0)]);
+    for (component, value) in [direct, offset, indexed].into_iter().enumerate() {
+        s.inst(
+            b,
+            Opcode::SetFragColor,
+            &[Value::U32(0), Value::U32(component as u32), value],
+        );
+    }
+    s.inst(b, Opcode::Epilogue, &[]);
+    let inputs: Vec<Attribute> = (0..3).map(|i| Attribute::generic(i, 0)).collect();
+    let mut info = ShaderInfo {
+        loads: varying(&inputs),
+        loads_indexed_attributes: true,
+        stores_frag_color: [true, false, false, false, false, false, false, false],
+        ..ShaderInfo::default()
+    };
+    info.interpolation[..3].fill(crate::info::Interpolation::NoPerspective);
+    let program = s.finish(
+        vec![SyntaxNode::Block(b), SyntaxNode::Return],
+        ShaderStage::Fragment,
+        info,
+    );
+    for scaled in [false, true] {
+        let runtime = RuntimeInfo {
+            previous_stage_stores: varying(&inputs),
+            scaled_noperspective_inputs: scaled,
+            ..RuntimeInfo::default()
+        };
+        let module = emit(
+            &format!("noperspective_scaled_{scaled}"),
+            &Profile::default(),
+            &runtime,
+            &program,
+        );
+        let noperspective = module
+            .annotations
+            .iter()
+            .filter(|i| i.operands.get(1) == Some(&Operand::Decoration(Decoration::NoPerspective)))
+            .count();
+        let frag_coord = module.annotations.iter().any(|i| {
+            i.operands.get(2) == Some(&Operand::BuiltIn(rspirv::spirv::BuiltIn::FragCoord))
+        });
+        let multiplies = module
+            .functions
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.instructions)
+            .filter(|i| i.class.opcode == Op::FMul)
+            .count();
+        if scaled {
+            assert_eq!((noperspective, frag_coord), (0, true));
+            assert_eq!(multiplies, 5, "the direct, offset and three indexed reads");
+        } else {
+            assert_eq!((noperspective, frag_coord, multiplies), (3, false, 0));
+        }
+    }
+}
+
 /// A fragment program reading the sample index and interpolating at an offset needs
 /// `SampleRateShading` and `InterpolationFunction` only while the host supports them.
 #[test]

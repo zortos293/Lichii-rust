@@ -131,6 +131,9 @@ pub(crate) enum InputGenericLoadOp {
     Bitcast,
     SToF,
     UToF,
+    /// A screen-linear input written times Position.w: read perspective-correct, times
+    /// FragCoord.w.
+    TimesFragCoordW,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1387,8 +1390,12 @@ impl<'a> EmitContext<'a> {
             self.layer = self.define_input(u32_t, false, Some(BuiltIn::Layer));
             self.decorate(self.layer, Decoration::Flat, &[]);
         }
+        let unscales_noperspective = is_fragment
+            && runtime.scaled_noperspective_inputs
+            && info.interpolation.contains(&Interpolation::NoPerspective);
         if loads.any_component(Attribute::POSITION_X)
             || info.passthrough.any_component(Attribute::POSITION_X)
+            || unscales_noperspective
         {
             if !is_fragment && profile.has_broken_spirv_position_input {
                 self.need_input_position_indirect = true;
@@ -1496,6 +1503,10 @@ impl<'a> EmitContext<'a> {
             }
             match info.interpolation[index as usize] {
                 Interpolation::Smooth => {}
+                Interpolation::NoPerspective if runtime.scaled_noperspective_inputs => {
+                    self.input_generics[index as usize].load_op =
+                        InputGenericLoadOp::TimesFragCoordW;
+                }
                 Interpolation::NoPerspective => self.decorate(id, Decoration::NoPerspective, &[]),
                 Interpolation::Flat => self.decorate(id, Decoration::Flat, &[]),
             }
@@ -2670,6 +2681,14 @@ impl<'a> EmitContext<'a> {
             InputGenericLoadOp::Bitcast => self.b.bitcast(f32_t, None, value)?,
             InputGenericLoadOp::SToF => self.b.convert_s_to_f(f32_t, None, value)?,
             InputGenericLoadOp::UToF => self.b.convert_u_to_f(f32_t, None, value)?,
+            InputGenericLoadOp::TimesFragCoordW => {
+                let w = self.const_u32(3);
+                let pointer =
+                    self.b
+                        .access_chain(self.input_f32, None, self.input_position, [w])?;
+                let w = self.b.load(f32_t, None, pointer, None, [])?;
+                self.b.f_mul(f32_t, None, value, w)?
+            }
         })
     }
 
