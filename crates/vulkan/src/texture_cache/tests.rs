@@ -1928,3 +1928,32 @@ fn sparse_images_take_the_layers_of_a_join_their_cap_admits() {
     );
     f.assert_no_validation_errors();
 }
+
+#[test]
+fn narrower_block_linear_textures_alias_their_render_target_without_a_flush() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let info = rt_info(32, 24, 1, GobLayout::Tegra);
+    let target = clear_rt(&mut f, &info, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    let header = tic(0x08, GPU_VA, 24, 24, 1, 1, 1);
+    let (texture, _) = f.texture(&header);
+    assert_ne!(texture, target.id);
+    assert!(
+        f.cache.state(target.id).is_some(),
+        "the render target stays"
+    );
+    assert!(all_texels(&f.read_image(texture)[0], [255, 0, 0, 255]));
+    clear_rt(&mut f, &info, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    assert_eq!(f.texture(&header).0, texture);
+    assert!(
+        all_texels(&f.read_image(texture)[0], [0, 255, 0, 255]),
+        "the texture takes the render target's newer texels"
+    );
+    assert_eq!(
+        f.cache.traffic().downloads,
+        0,
+        "no write-back to guest memory"
+    );
+    f.assert_no_validation_errors();
+}

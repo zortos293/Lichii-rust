@@ -46,7 +46,7 @@ use lichii_gpu::gmmu::{Gmmu, RangeTarget};
 use lichii_gpu::lazy::LazyDeviceRanges;
 use lichii_memory::{CachedPages, DeviceAddressSpace};
 use lichii_texture::PixelFormat;
-use lichii_texture::block_linear::{GobLayout, swizzle, unswizzle};
+use lichii_texture::block_linear::{GobLayout, Tiling, swizzle, unswizzle};
 use lichii_texture::tic::{SwizzleSource, TextureDescriptor};
 
 pub use info::{GuestLayout, ImageInfo, ImageKind, ViewInfo};
@@ -539,6 +539,46 @@ fn components(swizzle: [SwizzleSource; 4], host: vk::ComponentMapping) -> vk::Co
         b: map(swizzle[2]),
         a: map(swizzle[3]),
     }
+}
+
+/// The rectangle two single-level 2D block-linear images at the same address share at level 0:
+/// the same as [`pitch_overlap`], for images whose level 0 tiles alike (equal GOBs per row,
+/// block height and GOB layout) and so differ at most in width and height.
+fn block_linear_overlap(
+    a: &ImageInfo,
+    a_base: DAddr,
+    b: &ImageInfo,
+    b_base: DAddr,
+) -> Option<(Texel, Texel, Texel)> {
+    let tiling = |i: &ImageInfo| {
+        let single = matches!(i.layout, GuestLayout::BlockLinear { .. })
+            && i.format.block_width() == 1
+            && i.format.block_height() == 1
+            && i.kind == ImageKind::D2
+            && i.depth == 1
+            && i.levels == 1
+            && i.layers == 1
+            && i.samples == 1;
+        single.then(|| i.surface().level_tiling(0))
+    };
+    let (ta, tb) = (tiling(a)?, tiling(b)?);
+    let shape = |t: &Tiling| {
+        (
+            t.bytes_per_block,
+            t.block_height_log2,
+            t.block_depth_log2,
+            t.row_gobs,
+            t.layout,
+        )
+    };
+    if a_base != b_base || shape(&ta) != shape(&tb) {
+        return None;
+    }
+    Some((
+        (0, 0),
+        (0, 0),
+        (a.width.min(b.width), a.height.min(b.height)),
+    ))
 }
 
 /// Where two pitch-linear images with the same pitch share texels: the rectangle's texel
@@ -1816,6 +1856,7 @@ impl TextureCache {
                 && Self::copy_compatible(image, host, info.format)
                 && let Some((at, own, extent)) =
                     pitch_overlap(&image.info, image.base(), info, base)
+                        .or_else(|| block_linear_overlap(&image.info, image.base(), info, base))
             {
                 self.new_aliases.push(Alias {
                     id,
