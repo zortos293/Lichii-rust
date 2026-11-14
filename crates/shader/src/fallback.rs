@@ -94,7 +94,7 @@ pub(crate) fn end_program(env: &dyn crate::ShaderEnvironment) {
         && hit.iter().any(|f| f.opcode == "global_memory")
     {
         let mut code = vec![0u8; 0x10000];
-        env.read_code(env.start_address(), &mut code);
+        env.read_code(env.start_address() - 0x80, &mut code);
         let name = format!("{:?}_{:x}.bin", env.stage(), env.start_address());
         let _ = std::fs::write(std::path::Path::new(&dir).join(name), &code);
     }
