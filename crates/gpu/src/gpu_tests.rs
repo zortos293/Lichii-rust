@@ -272,6 +272,44 @@ impl Rasterizer for Recorder {
     fn release_fences(&mut self, wait: bool) {
         self.work.run_finished(wait);
     }
+    fn pending_semaphore_words(
+        &mut self,
+        addr: u64,
+        size: u64,
+        put: &mut dyn FnMut(u64, u32),
+    ) -> bool {
+        let timestamp = self.work.handles.timestamp.now();
+        for work in &self.work.pending.lock().0 {
+            match *work {
+                Pending::Fence(FenceAction::WriteSemaphore {
+                    address,
+                    value,
+                    size: release,
+                }) => {
+                    let words = [
+                        value as u32,
+                        (value >> 32) as u32,
+                        timestamp as u32,
+                        (timestamp >> 32) as u32,
+                    ];
+                    let count = match release {
+                        ReleaseSize::Four => 1,
+                        ReleaseSize::Eight => 2,
+                        ReleaseSize::Sixteen => 4,
+                    };
+                    for (i, &word) in words[..count].iter().enumerate() {
+                        let at = address + 4 * i as u64;
+                        if (addr..addr + size).contains(&at) {
+                            put(at, word);
+                        }
+                    }
+                }
+                Pending::Fence(FenceAction::IncrementSyncpoint(_)) => {}
+                _ => return false,
+            }
+        }
+        true
+    }
     fn has_pending_fences(&self) -> bool {
         self.work.fence_polls.fetch_add(1, Ordering::Relaxed);
         !self.work.pending.lock().0.is_empty()
@@ -1410,6 +1448,7 @@ fn mme_dma_read_waits_for_deferred_work_and_flushes_what_it_reads() {
         let mut rig = Rig::deferred(threading);
         let channel = rig.channel(HostClass::Ampere);
         let data = 0x24_0000;
+        rig.gpu.handles().written_pages.mark(DEVICE_BASE + data, 8);
         let words = Pushbuffer::default()
             .bind(0, AMPERE_3D)
             .load_macro(0, &masm::dma_read_program(2))
@@ -1437,6 +1476,44 @@ fn mme_dma_read_waits_for_deferred_work_and_flushes_what_it_reads() {
             .position(|e| matches!(e, Event::Method { method: 0xc00, .. }))
             .unwrap();
         assert!(flush < first_read, "{threading:?}");
+    });
+}
+
+#[test]
+fn mme_dma_read_of_a_queued_host_release_takes_its_value_without_waiting() {
+    each_mode(|threading| {
+        let mut rig = Rig::deferred(threading);
+        let channel = rig.channel(HostClass::Ampere);
+        let data = 0x24_0000;
+        let words = Pushbuffer::default()
+            .bind(0, AMPERE_3D)
+            .load_macro(0, &masm::dma_read_program(2))
+            .semaphore(data, 0x55, 1)
+            .once(0, crate::macros::MACRO_METHOD_BASE, &[0, data as u32]);
+        rig.submit(channel, &words.0);
+        let events = rig.events();
+        let read: Vec<_> = rig
+            .methods()
+            .into_iter()
+            .filter(|&(_, _, method, _)| method >= 0xc00)
+            .collect();
+        assert_eq!(
+            read,
+            [(channel.0, EngineKind::Maxwell3d, 0xc00, 0x55)],
+            "{threading:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::FlushRegion(..))),
+            "{threading:?}"
+        );
+        assert_eq!(
+            rig.read(data),
+            0,
+            "the release has not landed: {threading:?}"
+        );
+        rig.gpu.run_in_order(|r| r.release_fences(true));
+        rig.gpu.synchronize();
+        assert_eq!(rig.read(data), 0x55, "{threading:?}");
     });
 }
 

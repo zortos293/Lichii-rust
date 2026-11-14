@@ -1204,6 +1204,66 @@ impl Rasterizer for VulkanRasterizer {
         self.flush_region(addr, size);
     }
 
+    fn pending_semaphore_words(
+        &mut self,
+        addr: DAddr,
+        size: u64,
+        put: &mut dyn FnMut(DAddr, u32),
+    ) -> bool {
+        let end = addr.saturating_add(size);
+        let mirror = lichii_gpu::semaphore_mirror::REGION_SIZE / 2;
+        let lands = |address: DAddr, bytes: u64| address < end && addr < address + bytes;
+        let writes = |address: DAddr, bytes: u64| {
+            lands(address, bytes) || lands(address.wrapping_sub(mirror), bytes)
+        };
+        let release_bytes = |size: ReleaseSize| match size {
+            ReleaseSize::Four => 4,
+            ReleaseSize::Eight => 8,
+            ReleaseSize::Sixteen => 16,
+        };
+        let timestamp = self.handles.timestamp.now();
+        for &(_, release) in &self.fences {
+            match release {
+                Release::Action(FenceAction::WriteSemaphore {
+                    address,
+                    value,
+                    size,
+                }) => {
+                    let bytes = release_bytes(size);
+                    if lands(address.wrapping_sub(mirror), bytes) {
+                        return false;
+                    }
+                    let words = [
+                        value as u32,
+                        (value >> 32) as u32,
+                        timestamp as u32,
+                        (timestamp >> 32) as u32,
+                    ];
+                    for (i, &word) in words[..(bytes / 4) as usize].iter().enumerate() {
+                        let at = address + 4 * i as u64;
+                        if (addr..end).contains(&at) {
+                            put(at, word);
+                        }
+                    }
+                }
+                Release::Action(FenceAction::ReduceSemaphore { address, .. }) => {
+                    if writes(address, 4) {
+                        return false;
+                    }
+                }
+                Release::Samples { address, size, .. } => {
+                    if writes(address, release_bytes(size)) {
+                        return false;
+                    }
+                }
+                Release::Action(FenceAction::IncrementSyncpoint(_))
+                | Release::SamplesReset(_)
+                | Release::SamplesFold(_) => {}
+            }
+        }
+        true
+    }
+
     fn release_channel(&mut self, _channel: ChannelId) {
         self.texture_cache.invalidate_lookups();
     }
@@ -2280,6 +2340,58 @@ mod tests {
         assert_eq!(f.memory.read::<u32>(reduced).unwrap(), 8);
         f.rasterizer.release_fences(true);
         assert_eq!(f.syncpoints.guest().value(6).unwrap(), 1);
+        f.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn pending_release_values_are_known_and_other_pending_writes_are_not() {
+        let Some(mut f) = fixture(GobLayout::Tegra) else {
+            return;
+        };
+        let (semaphore, reduced, first) = (DADDR + 0x80_0000, DADDR + 0x80_0100, DADDR + 0x90_0000);
+        f.syncpoints.semaphore_mirror().add_region(first);
+        f.rasterizer.barrier();
+        for (value, size) in [(1, ReleaseSize::Sixteen), (2, ReleaseSize::Four)] {
+            f.rasterizer.signal_fence(FenceAction::WriteSemaphore {
+                address: semaphore,
+                value,
+                size,
+            });
+        }
+        f.rasterizer.signal_fence(FenceAction::ReduceSemaphore {
+            address: reduced,
+            op: lichii_gpu::host::Reduction::Add,
+            signed: false,
+            payload: 3,
+        });
+        f.rasterizer.signal_fence(FenceAction::WriteSemaphore {
+            address: first + 0x1010,
+            value: 0x55,
+            size: ReleaseSize::Four,
+        });
+        let mut words = Vec::new();
+        assert!(
+            f.rasterizer
+                .pending_semaphore_words(semaphore, 0x18, &mut |at, word| words.push((at, word)))
+        );
+        assert_eq!(words.len(), 5);
+        assert_eq!(words[..2], [(semaphore, 1), (semaphore + 4, 0)]);
+        assert_eq!(words[4], (semaphore, 2), "the later release comes last");
+        assert!(
+            !f.rasterizer
+                .pending_semaphore_words(reduced, 4, &mut |_, _| {})
+        );
+        assert!(
+            !f.rasterizer
+                .pending_semaphore_words(first + 0x10, 4, &mut |_, _| {})
+        );
+        f.rasterizer.release_fences(true);
+        let mut put = false;
+        assert!(
+            f.rasterizer
+                .pending_semaphore_words(semaphore, 0x18, &mut |_, _| put = true)
+        );
+        assert!(!put, "nothing is pending once the fences ran");
         f.assert_no_validation_errors();
     }
 

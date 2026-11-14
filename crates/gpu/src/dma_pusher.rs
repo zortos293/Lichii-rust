@@ -900,6 +900,7 @@ impl MacroHost for FrontMacroHost<'_> {
             tracing::warn!(?fault, "MME DMA read from unmapped GPU memory");
             out.fill(0);
         }
+        self.stream.overlay_read(out);
     }
 }
 

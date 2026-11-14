@@ -20,7 +20,9 @@ use crate::gmmu::{Gmmu, RangeTarget};
 use crate::gpu::{MAX_POLL, MIN_POLL};
 use crate::host1x::Syncpoints;
 use crate::ring::{Consumer, WRAP};
-use crate::stream::{FetchSync, FetchSyncs, MULTI_MAX_WORDS, REDUCTIONS, RELEASE_SIZES, tag};
+use crate::stream::{
+    FetchSync, FetchSyncs, MULTI_MAX_WORDS, OVERLAY_WORDS, REDUCTIONS, RELEASE_SIZES, tag,
+};
 use crate::throttle::Throttle;
 
 /// The back reports progress at least this often while it executes.
@@ -283,7 +285,15 @@ impl Back {
                 1
             }
             tag::SYNCHRONIZE_READ => {
-                self.synchronize_read(consumer.slot(1), consumer.slot(2));
+                let (address, size) = (consumer.slot(1), consumer.slot(2));
+                let pending = self.pending_releases(address, size);
+                let waits = pending.is_none();
+                self.fetch_syncs
+                    .read_overlay
+                    .set(pending.unwrap_or_default());
+                if waits {
+                    self.synchronize_read(address, size);
+                }
                 3
             }
             tag::SYNCHRONIZE_FETCH => {
@@ -417,6 +427,42 @@ impl Back {
                 RangeTarget::Device(daddr) => rasterizer.synchronize_region(daddr, range.size),
                 _ => rasterizer.release_fences(true),
             });
+    }
+
+    /// The words of `[address, address + size)` that semaphore releases still on their way write,
+    /// by index, when GPU work never wrote its pages and the renderer holds no other pending write
+    /// there: the read takes guest memory with these over it and needs no wait. None when the
+    /// read must synchronize.
+    fn pending_releases(
+        &mut self,
+        address: u64,
+        size: u64,
+    ) -> Option<[Option<u32>; OVERLAY_WORDS]> {
+        let channel = self
+            .current
+            .and_then(|index| self.channels[index].as_ref())?;
+        if !address.is_multiple_of(4) || size > 4 * OVERLAY_WORDS as u64 {
+            return None;
+        }
+        let rasterizer = &mut *self.rasterizer;
+        let written_pages = &self.written_pages;
+        let mut words = [None; OVERLAY_WORDS];
+        let mut known = true;
+        channel.setup.memory.for_each_range(address, size, |range| {
+            let RangeTarget::Device(daddr) = range.target else {
+                known = false;
+                return;
+            };
+            if !known || written_pages.may_be_written(daddr, range.size) {
+                known = false;
+                return;
+            }
+            let base = range.gpu_va - address;
+            known = rasterizer.pending_semaphore_words(daddr, range.size, &mut |at, word| {
+                words[((base + at - daddr) / 4) as usize] = Some(word);
+            });
+        });
+        (known && words.iter().any(Option::is_some)).then_some(words)
     }
 
     /// Whether GPU work may have written a page of the current channel's `[address, +size)`.
