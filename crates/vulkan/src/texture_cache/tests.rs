@@ -1662,17 +1662,21 @@ fn images_over_the_texel_limit_are_sparse_and_bind_what_the_gpu_writes() {
         "nothing is uploaded or bound for sampling"
     );
     let desc = tic(0x08, GPU_VA, 2048, 2048, 65, 1, 4).decode().unwrap();
-    let sampled = |tx: &mut Transfer<'_>, cache: &mut TextureCache| {
-        cache.texture(tx, gmmu, &desc).unwrap().map(|(id, _)| id)
-    };
     assert_eq!(
-        sampled(&mut tx, cache),
-        None,
+        cache
+            .texture(&mut tx, gmmu, &desc)
+            .unwrap()
+            .map(|(id, _)| id),
+        Some(found.id),
+        "storage writes find the image to bind"
+    );
+    assert!(
+        cache.unwritten(found.id),
         "an image nothing wrote samples as no image"
     );
-    cache.bind_written(&mut tx, found.id, 0, 3..4).unwrap();
+    assert!(cache.bind_written(&mut tx, found.id, 0, 3..4).unwrap());
     assert_eq!(memory(cache), layer, "the written layer");
-    assert_eq!(sampled(&mut tx, cache), Some(found.id));
+    assert!(!cache.unwritten(found.id));
     cache.bind_written(&mut tx, found.id, 0, 3..5).unwrap();
     assert_eq!(memory(cache), 2 * layer, "only the layer not bound yet");
     assert!(!cache.get(found.id).unwrap().downloadable());
@@ -1701,6 +1705,12 @@ fn images_over_the_texel_limit_are_sparse_and_bind_what_the_gpu_writes() {
             1,
         )
         .unwrap();
+    assert!(cache.bind_written(&mut tx, found.id, 0, 0..6).unwrap());
+    assert_eq!(
+        cache.get(found.id).unwrap().image.memory_size(),
+        6 * layer,
+        "the layers around the bound ones"
+    );
     let buffer = Buffer::new(
         &f.device,
         32 * 4,
@@ -1776,5 +1786,41 @@ fn sparse_images_take_nothing_from_overlaps_through_guest_memory() {
         0,
         "render targets inside a sparse image are not written back to refresh it"
     );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn sparse_images_bind_the_layers_they_join() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let single = rt_info(2048, 2048, 4, GobLayout::Tegra);
+    let info = ImageInfo {
+        layers: 65,
+        ..single
+    };
+    if !f.cache.can_be_sparse(&info) {
+        eprintln!("skipping: no sparse residency");
+        return;
+    }
+    let target = clear_rt(&mut f, &single, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let (mut tx, cache, gmmu) = f.tx();
+    let array = cache.find(&mut tx, gmmu, GPU_VA, &info).unwrap().unwrap();
+    assert_ne!(array.id, target.id);
+    cache.joins.push((target.id, 0, 0));
+    cache.join(&mut tx, array.id).unwrap();
+    assert!(
+        cache.get(target.id).is_none(),
+        "the target joined the array"
+    );
+    assert_eq!(
+        cache.get(array.id).unwrap().image.memory_size(),
+        2048 * 2048 * 4,
+        "the joined layer has memory"
+    );
+    assert!(all_texels(
+        &f.read_image(array.id)[0][..64],
+        [0, 255, 0, 255]
+    ));
     f.assert_no_validation_errors();
 }

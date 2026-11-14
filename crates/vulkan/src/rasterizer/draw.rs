@@ -1549,6 +1549,9 @@ impl VulkanRasterizer {
         let Some((id, view)) = self.texture_info(src, raw, ty)? else {
             return Ok(None);
         };
+        if self.texture_cache.unwritten(id) {
+            return Ok(None);
+        }
         Ok(self
             .texture_cache
             .sampled_view(id, &view)?

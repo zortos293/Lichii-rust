@@ -866,11 +866,7 @@ impl TextureCache {
         let Some(found) = self.find(tx, gmmu, desc.address, &info)? else {
             return Ok(None);
         };
-        let image = self.image(found.id);
-        if image.image.is_sparse() && image.image.memory_size() == 0 {
-            return Ok(None);
-        }
-        let scale = image.scale;
+        let scale = self.image(found.id).scale;
         if scale != ResolutionScale::X1 && scale != self.scale {
             let target = if self.can_rescale(found.id) {
                 self.scale
@@ -883,6 +879,12 @@ impl TextureCache {
         view.base_level += found.level;
         view.base_layer += found.layer;
         Ok(Some((found.id, view)))
+    }
+
+    /// Whether `id` is a sparse image nothing has written yet, which samples as no image.
+    pub fn unwritten(&self, id: ImageId) -> bool {
+        self.get(id)
+            .is_some_and(|image| image.image.is_sparse() && image.image.memory_size() == 0)
     }
 
     /// The image a render target or depth target writes, at the scale the rules allow.
@@ -1559,46 +1561,50 @@ impl TextureCache {
     }
 
     /// Gives memory to the subresources of `level` in `layers` the GPU is about to write when
-    /// `id` is sparse, cleared to the zeros unbound memory reads as.
+    /// `id` is sparse, clearing what it binds to the zeros unbound memory reads as. Returns
+    /// whether every one of them has memory; false only when the image reached its cap.
     pub fn bind_written(
         &mut self,
         tx: &mut Transfer<'_>,
         id: ImageId,
         level: u32,
         layers: std::ops::Range<u32>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let device = self.device.clone();
         let Some(image) = self.get_mut(id) else {
-            return Ok(());
+            return Ok(true);
         };
         if !image.image.is_sparse() {
-            return Ok(());
+            return Ok(true);
         }
-        let wanted = layers.len();
-        let newly = image
+        let bound = image
             .image
             .bind(tx.scheduler, level, layers, SPARSE_IMAGE_CAP)?;
-        if newly.len() < wanted && !self.sparse_capped {
+        if !bound.complete && !self.sparse_capped {
             self.sparse_capped = true;
             tracing::warn!(
                 cap = SPARSE_IMAGE_CAP,
                 "a sparse image reached its memory cap; GPU writes past it are dropped"
             );
         }
-        if newly.is_empty() {
-            return Ok(());
+        if bound.newly.is_empty() {
+            return Ok(bound.complete);
         }
         let cmd = tx.scheduler.record()?;
         let image = self.image(id);
         image.transition(&device, cmd, ImageAccess::TRANSFER_DST);
         let aspect = aspect_of(image.host.format);
-        let range = vk::ImageSubresourceRange {
-            aspect_mask: aspect,
-            base_mip_level: level,
-            level_count: 1,
-            base_array_layer: newly.start,
-            layer_count: newly.len() as u32,
-        };
+        let ranges: Vec<_> = bound
+            .newly
+            .iter()
+            .map(|&layer| vk::ImageSubresourceRange {
+                aspect_mask: aspect,
+                base_mip_level: level,
+                level_count: 1,
+                base_array_layer: layer,
+                layer_count: 1,
+            })
+            .collect();
         let raw = image.image.raw();
         // SAFETY: `cmd` is recording and the image was just made a transfer destination.
         unsafe {
@@ -1608,7 +1614,7 @@ impl TextureCache {
                     raw,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     &vk::ClearColorValue::default(),
-                    &[range],
+                    &ranges,
                 );
             } else {
                 device.raw.cmd_clear_depth_stencil_image(
@@ -1616,11 +1622,11 @@ impl TextureCache {
                     raw,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     &vk::ClearDepthStencilValue::default(),
-                    &[range],
+                    &ranges,
                 );
             }
         }
-        Ok(())
+        Ok(bound.complete)
     }
 
     fn image_desc(info: &ImageInfo, host: &HostFormat, scale: ResolutionScale) -> ImageDesc {
@@ -1891,6 +1897,17 @@ impl TextureCache {
         let device = self.device.clone();
         for &(join, level, layer) in &joins {
             self.rescale(tx, join, target, true)?;
+            let desc = *self.image(join).image.desc();
+            let mut resident = true;
+            for l in 0..desc.mip_levels {
+                resident &=
+                    self.bind_written(tx, id, level + l, layer..layer + desc.array_layers)?;
+            }
+            if !resident {
+                self.image(join).overlaps.push(id);
+                self.image(id).overlaps.push(join);
+                continue;
+            }
             let cmd = tx.scheduler.record()?;
             let (src_levels, src_layers, src_aspect) = {
                 let src = self.image(join);

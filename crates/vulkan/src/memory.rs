@@ -242,6 +242,15 @@ pub struct Image {
     sparse: Option<Box<SparseMemory>>,
 }
 
+/// What [`Image::bind`] did.
+#[derive(Debug, Default)]
+pub struct SparseBind {
+    /// Layers that got memory in this call, ascending.
+    pub newly: Vec<u32>,
+    /// Every requested layer has memory now; false when the cap stopped the binding.
+    pub complete: bool,
+}
+
 /// Device memory of a sparse image, bound subresource by subresource as they are written.
 struct SparseMemory {
     /// Bytes per sparse block, and the memory types blocks may come from.
@@ -362,22 +371,25 @@ impl Image {
     }
 
     /// Gives memory to the unbound subresources of `level` in `layers` of a sparse image, as
-    /// long as the image stays within `cap` bytes; returns the layers newly bound, whose
-    /// contents are undefined until written. A non-sparse image has nothing to bind.
+    /// long as the image stays within `cap` bytes. The layers newly bound hold undefined
+    /// contents until written. A non-sparse image has nothing to bind.
     pub fn bind(
         &mut self,
         scheduler: &mut Scheduler,
         level: u32,
         layers: std::ops::Range<u32>,
         cap: u64,
-    ) -> Result<std::ops::Range<u32>> {
+    ) -> Result<SparseBind> {
         let Some(sparse) = self.sparse.as_deref_mut() else {
-            return Ok(0..0);
+            return Ok(SparseBind::default());
         };
         let block = sparse.requirements.alignment.max(1);
         let mut image_binds = Vec::new();
         let mut opaque_binds = Vec::new();
-        let mut newly = layers.end..layers.start;
+        let mut bound = SparseBind {
+            newly: Vec::new(),
+            complete: true,
+        };
         for layer in layers {
             let index = (level * self.desc.array_layers + layer) as usize;
             if sparse.bound[index] {
@@ -415,6 +427,7 @@ impl Image {
                 bytes += size;
             }
             if sparse.bytes + bytes > cap {
+                bound.complete = false;
                 break;
             }
             for (aspect_mask, extent, size) in binds {
@@ -466,12 +479,12 @@ impl Image {
             }
             sparse.bytes += bytes;
             sparse.bound[index] = true;
-            newly = newly.start.min(layer)..newly.end.max(layer + 1);
+            bound.newly.push(layer);
         }
         if !image_binds.is_empty() || !opaque_binds.is_empty() {
             scheduler.bind_sparse(self.raw, &image_binds, &opaque_binds)?;
         }
-        Ok(if newly.is_empty() { 0..0 } else { newly })
+        Ok(bound)
     }
 
     pub fn raw(&self) -> vk::Image {
