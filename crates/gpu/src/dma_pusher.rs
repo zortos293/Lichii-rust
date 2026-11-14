@@ -938,6 +938,7 @@ mod tests {
             syncpoints: syncpoints.clone(),
             timestamp: Arc::new(GpuTimestamp::new(Arc::new(Boot), false)),
             written_pages: Arc::new(GpuWrittenPages::new(36)),
+            activity: Arc::new(crate::activity::Activity::new()),
         };
         let (producer, consumer) = ring::ring(MIN_RING_SLOTS, MIN_RING_SLOTS);
         let (side, side_receiver) = mpsc::channel();

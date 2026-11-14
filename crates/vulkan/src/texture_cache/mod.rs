@@ -27,6 +27,7 @@
 //! used images with bounded work per frame. GPU-modified ones are read back without a GPU wait
 //! and reach guest memory before they go.
 
+mod blit;
 mod clear;
 mod convert;
 mod guest_sync;
@@ -50,6 +51,7 @@ use lichii_texture::PixelFormat;
 use lichii_texture::block_linear::{GobLayout, Tiling, swizzle, unswizzle};
 use lichii_texture::tic::{SwizzleSource, TextureDescriptor};
 
+pub use blit::BlitSide;
 pub use info::{GuestLayout, ImageInfo, ImageKind, ViewInfo};
 
 use crate::commands::{ImageAccess, transfer_to_all_barrier, transition};

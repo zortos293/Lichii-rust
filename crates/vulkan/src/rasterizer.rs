@@ -21,8 +21,8 @@ use lichii_common::DAddr;
 use lichii_common::settings::{AstcRecompression, GraphicsSettings, ResolutionScale};
 use lichii_gpu::backend::ChannelId;
 use lichii_gpu::backend::{
-    ComputeContext, DrawParams, DrawTexture, FenceAction, FramebufferConfig, GpuHandles,
-    GraphicsContext, IndirectDraw, Query, QueryKind, Rasterizer, ReleaseSize,
+    Blit, BlitOperation, ComputeContext, DrawParams, DrawTexture, FenceAction, FramebufferConfig,
+    GpuHandles, GraphicsContext, IndirectDraw, Query, QueryKind, Rasterizer, ReleaseSize,
 };
 use lichii_gpu::engines::maxwell_3d::Regs;
 use lichii_gpu::engines::maxwell_3d::regs::NUM_RENDER_TARGETS;
@@ -41,7 +41,7 @@ use crate::present::{FrameImage, FrameMailbox, GuestFrame};
 use crate::scheduler::Scheduler;
 use crate::staging::StagingRing;
 use crate::texture_cache::{
-    ClearValue, ImageId, ImageInfo, ImageKind, Rect, TextureCache, Traffic, Transfer,
+    BlitSide, ClearValue, ImageId, ImageInfo, ImageKind, Rect, TextureCache, Traffic, Transfer,
 };
 
 /// The tracing target of the GPU thread's and the presenter's activity lines.
@@ -186,6 +186,37 @@ fn covers(rect: Rect, base_layer: u32, layer_count: u32, info: &ImageInfo) -> bo
         && layer_count >= layers
 }
 
+/// The source and destination rectangles of a 2D blit in texels, when `vkCmdBlitImage` with
+/// nearest filtering samples the texels the 2D engine does: each source axis starts on a whole
+/// texel and steps one texel per pixel, or, unfiltered, a whole fraction of one (an integer
+/// upscale). `None` for any other sampling, an empty destination, or coordinates past `i32`.
+fn blit_rects(blit: &Blit) -> Option<([i32; 4], [i32; 4])> {
+    const UNIT: i64 = 1 << 32;
+    if blit.dst_width <= 0 || blit.dst_height <= 0 {
+        return None;
+    }
+    let axis = |start: i64, step: i64, count: i32| {
+        if start & (UNIT - 1) != 0 || step <= 0 || UNIT % step != 0 {
+            return None;
+        }
+        let repeat = i32::try_from(UNIT / step).ok()?;
+        if count % repeat != 0 || (repeat > 1 && blit.linear_filter) {
+            return None;
+        }
+        let first = i32::try_from(start >> 32).ok()?;
+        Some([first, first.checked_add(count / repeat)?])
+    };
+    let [x0, x1] = axis(blit.src_x0, blit.du_dx, blit.dst_width)?;
+    let [y0, y1] = axis(blit.src_y0, blit.dv_dy, blit.dst_height)?;
+    let dst = [
+        blit.dst_x0,
+        blit.dst_y0,
+        blit.dst_x0.checked_add(blit.dst_width)?,
+        blit.dst_y0.checked_add(blit.dst_height)?,
+    ];
+    Some(([x0, y0, x1, y1], dst))
+}
+
 impl VulkanRasterizer {
     /// `gob_layout` is the tiling of guest textures and render targets: `Switch2` for native
     /// Switch 2 titles. Framebuffers carry their own layout.
@@ -209,6 +240,7 @@ impl VulkanRasterizer {
             AstcRecompression::Uncompressed,
         );
         let mut scheduler = Scheduler::new(device)?;
+        scheduler.time_waits(handles.activity.clone());
         let pipelines = PipelineCache::new(device, &GraphicsSettings::default(), None, None)?;
         let draw = draw::DrawState::new(device, pipelines, gob_layout, scheduler.record()?)?;
         Ok(Self {
@@ -839,6 +871,50 @@ impl Rasterizer for VulkanRasterizer {
         }
     }
 
+    fn accelerate_blit(&mut self, _channel: ChannelId, memory: &Gmmu, blit: &Blit) -> bool {
+        if blit.operation != BlitOperation::SrcCopy {
+            return false;
+        }
+        let Some((src_rect, dst_rect)) = blit_rects(blit) else {
+            return false;
+        };
+        let (Some(src), Some(dst)) = (
+            ImageInfo::from_copy_surface(&blit.src, blit.src_format, self.gob_layout),
+            ImageInfo::from_copy_surface(&blit.dst, blit.dst_format, self.gob_layout),
+        ) else {
+            return false;
+        };
+        let mut tx = Transfer {
+            scheduler: &mut self.scheduler,
+            staging: &mut self.staging,
+            memory: &self.handles.device,
+        };
+        let blitted = self.texture_cache.blit(
+            &mut tx,
+            memory,
+            &BlitSide {
+                gpu_va: blit.src.address,
+                info: src,
+                rect: src_rect,
+            },
+            &BlitSide {
+                gpu_va: blit.dst.address,
+                info: dst,
+                rect: dst_rect,
+            },
+        );
+        match blitted {
+            Ok(blitted) => {
+                self.unflushed |= blitted;
+                blitted
+            }
+            Err(error) => {
+                tracing::error!(%error, "blitting on the GPU failed; blitting in software");
+                false
+            }
+        }
+    }
+
     fn query(&mut self, _channel: ChannelId, memory: &Gmmu, query: &Query) {
         let Some(address) = memory.translate(query.address) else {
             tracing::warn!(address = query.address, "query to unmapped GPU memory");
@@ -1119,6 +1195,7 @@ mod tests {
             timestamp: Arc::new(GpuTimestamp::new(Arc::new(HostTime(Instant::now())), false)),
             written_pages: Arc::new(lichii_gpu::backend::GpuWrittenPages::new(36)),
             lazy: Arc::new(lichii_gpu::lazy::LazyDeviceRanges::new(memory.clone())),
+            activity: Arc::new(lichii_gpu::activity::Activity::new()),
         };
         let mailbox = Arc::new(FrameMailbox::default());
         let rasterizer =
@@ -1815,5 +1892,106 @@ mod tests {
             assert_eq!(*texel, want, "texel ({x}, {y}, {z})");
         }
         f.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn blits_reach_the_gpu_only_when_it_samples_as_the_engine_does() {
+        const UNIT: i64 = 1 << 32;
+        let surface = lichii_gpu::backend::CopySurface {
+            address: 0x1000,
+            width: 64,
+            height: 64,
+            depth: 1,
+            layer: 0,
+            pitch: 0,
+            block: Some((0, 3, 0)),
+            bytes_per_pixel: 4,
+        };
+        let copy = Blit {
+            src: surface,
+            dst: surface,
+            src_format: PixelFormat::A8B8G8R8Unorm,
+            dst_format: PixelFormat::A8B8G8R8Unorm,
+            src_x0: UNIT,
+            src_y0: 4 * UNIT,
+            du_dx: UNIT,
+            dv_dy: UNIT,
+            dst_x0: 3,
+            dst_y0: 5,
+            dst_width: 10,
+            dst_height: 8,
+            linear_filter: true,
+            operation: BlitOperation::SrcCopy,
+        };
+        assert_eq!(
+            blit_rects(&copy),
+            Some(([1, 4, 11, 12], [3, 5, 13, 13])),
+            "a filtered copy"
+        );
+        let upscale = Blit {
+            du_dx: UNIT / 2,
+            dv_dy: UNIT / 4,
+            linear_filter: false,
+            ..copy
+        };
+        assert_eq!(
+            blit_rects(&upscale),
+            Some(([1, 4, 6, 6], [3, 5, 13, 13])),
+            "an unfiltered integer upscale"
+        );
+        for (blit, why) in [
+            (
+                Blit {
+                    linear_filter: true,
+                    ..upscale
+                },
+                "a filtered upscale",
+            ),
+            (
+                Blit {
+                    src_x0: UNIT / 2,
+                    ..copy
+                },
+                "a fractional start",
+            ),
+            (
+                Blit {
+                    du_dx: 2 * UNIT,
+                    ..copy
+                },
+                "a downscale",
+            ),
+            (
+                Blit {
+                    du_dx: UNIT / 3,
+                    linear_filter: false,
+                    ..copy
+                },
+                "a step of no whole fraction",
+            ),
+            (
+                Blit {
+                    dst_width: 3,
+                    ..upscale
+                },
+                "an upscale ending inside a texel",
+            ),
+            (
+                Blit {
+                    dst_width: 0,
+                    ..copy
+                },
+                "an empty destination",
+            ),
+            (
+                Blit {
+                    du_dx: -UNIT,
+                    ..copy
+                },
+                "a mirrored source",
+            ),
+        ] {
+            assert_eq!(blit_rects(&blit), None, "{why}");
+        }
     }
 }
