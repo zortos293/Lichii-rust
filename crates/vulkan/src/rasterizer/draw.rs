@@ -2349,6 +2349,29 @@ impl VulkanRasterizer {
         else {
             return Ok(());
         };
+        diag::with(|d| {
+            let cb: Vec<String> = ctx
+                .const_buffers
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.enabled && c.size != 0)
+                .map(|(i, c)| {
+                    let words = ctx.memory.read::<[u32; 16]>(c.address).unwrap_or_default();
+                    let f: Vec<String> = words
+                        .iter()
+                        .map(|w| format!("{:.4}", f32::from_bits(*w)))
+                        .collect();
+                    format!("CB{i}@{:#x}/{}=[{}]", c.address, c.size, f.join(" "))
+                })
+                .collect();
+            d.event(&format!(
+                "X compute={:016x} grid={:?} block={:?} {}",
+                module.hash,
+                ctx.grid,
+                ctx.block,
+                cb.join(" ")
+            ))
+        });
         let key = ComputePipelineKey {
             shader: module.hash,
             workgroup: ctx.block,

@@ -265,6 +265,23 @@ impl VulkanRasterizer {
             regs.depth_test_func,
             regs.stencil_enable,
         );
+        for (slot, cb) in ctx.const_buffers[4].iter().enumerate() {
+            if !cb.enabled || cb.size == 0 {
+                continue;
+            }
+            let _ = write!(s, " CB{slot}@{:#x}/{}=", cb.address, cb.size);
+            match ctx.memory.read::<[u32; 64]>(cb.address) {
+                Ok(words) => {
+                    let n = (cb.size as usize / 4).min(64);
+                    let floats: Vec<String> = words[..n]
+                        .iter()
+                        .map(|w| format!("{:.4}", f32::from_bits(*w)))
+                        .collect();
+                    let _ = write!(s, "[{}]", floats.join(" "));
+                }
+                Err(_) => s.push_str("fault"),
+            }
+        }
         super::diag::append(|l| l.push_str(&s));
     }
 
