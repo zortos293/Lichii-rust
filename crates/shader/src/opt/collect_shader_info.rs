@@ -502,6 +502,7 @@ fn visit_usages(info: &mut ShaderInfo, prog: &Program, id: InstId) {
             if let Value::Attribute(attribute) = inst.arg(0) {
                 info.loads.set(attribute, true);
             }
+            info.uses_interpolate_at_offset |= op == InterpolateAtOffset;
         }
         SetAttribute => {
             if let Value::Attribute(attribute) = inst.arg(0) {

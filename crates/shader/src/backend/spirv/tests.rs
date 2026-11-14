@@ -935,7 +935,8 @@ fn generic_input_types_follow_the_vertex_attribute_formats() {
 }
 
 /// InterpolateAtOffset on a float input, an integer (flat) input and an input the previous stage
-/// does not write.
+/// does not write. The float input is perspective, so it is divided by w at the offset, from the
+/// slope of FragCoord.w.
 #[test]
 fn interpolate_at_offset_follows_the_generic_input_types() {
     let mut s = Synthetic::new();
@@ -968,6 +969,7 @@ fn interpolate_at_offset_follows_the_generic_input_types() {
     let info = ShaderInfo {
         loads: varying(&attributes),
         stores_frag_color: [true, false, false, false, false, false, false, false],
+        uses_interpolate_at_offset: true,
         ..ShaderInfo::default()
     };
     let program = s.finish(
@@ -1008,6 +1010,18 @@ fn interpolate_at_offset_follows_the_generic_input_types() {
             .iter()
             .any(|c| c.operands[0] == Operand::Capability(Capability::InterpolationFunction))
     );
+    let ops: Vec<Op> = module
+        .functions
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.instructions)
+        .map(|i| i.class.opcode)
+        .collect();
+    assert!(
+        ops.contains(&Op::DPdx) && ops.contains(&Op::DPdy),
+        "{ops:?}"
+    );
+    assert!(ops.contains(&Op::FMul), "{ops:?}");
 }
 
 /// Screen-linear inputs the previous stage wrote times Position.w are read perspective-correct
@@ -1126,6 +1140,7 @@ fn sample_rate_shading_follows_the_profile() {
         loads: varying(&[Attribute::generic(0, 0)]),
         stores_frag_color: [true, false, false, false, false, false, false, false],
         uses_sample_id: true,
+        uses_interpolate_at_offset: true,
         ..ShaderInfo::default()
     };
     let program = s.finish(

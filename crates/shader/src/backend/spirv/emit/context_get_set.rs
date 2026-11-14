@@ -8,6 +8,7 @@ use crate::backend::spirv::context::{
     CbufElement, EmitContext, InputGenericLoadOp, is_arrayed_input_stage,
 };
 use crate::backend::spirv::{EmitError, EmitResult};
+use crate::info::Interpolation;
 use crate::ir::{Attribute, InstId, Patch, Value};
 use crate::runtime::AttributeType;
 use crate::{ShaderInfo, ShaderStage};
@@ -419,9 +420,10 @@ fn load_vertex_id(ctx: &mut EmitContext<'_>) -> EmitResult<Word> {
     Ok(ctx.b.load(ctx.u32[1], None, variable, None, [])?)
 }
 
-/// A fragment program's generic input component interpolated at an offset from the pixel centre.
+/// A fragment program's generic input component interpolated at an offset from the pixel centre,
+/// as IPA.OFFSET returns it: a perspective input divided by the clip-space w at that offset.
 /// Inputs declared with integer components are flat, so they load unchanged, as does every input
-/// on a host without sample rate shading.
+/// on a host without sample rate shading (a perspective one divided by w at the centre).
 pub(super) fn interpolate_at_offset(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
     if ctx.stage != ShaderStage::Fragment {
         return Err(EmitError::UnsupportedStage(ctx.stage));
@@ -443,18 +445,25 @@ pub(super) fn interpolate_at_offset(ctx: &mut EmitContext<'_>, inst: InstId) -> 
         generic.load_op,
         InputGenericLoadOp::None | InputGenericLoadOp::TimesFragCoordW
     );
+    let perspective = generic.load_op == InputGenericLoadOp::None
+        && ctx.info.interpolation[index as usize] == Interpolation::Smooth;
+    let f32_t = ctx.f32[1];
     if !interpolates || !ctx.profile.support_sample_rate_shading {
         let value = ctx
             .b
             .load(generic.component_type, None, pointer, None, [])?;
-        return ctx.input_to_f32(generic.load_op, value);
+        let value = ctx.input_to_f32(generic.load_op, value)?;
+        if !perspective {
+            return Ok(value);
+        }
+        let w = ctx.frag_coord_w()?;
+        return Ok(ctx.b.f_mul(f32_t, None, value, w)?);
     }
     let (x, y) = (ctx.def_arg(inst, 1)?, ctx.def_arg(inst, 2)?);
     let offset = ctx.b.composite_construct(ctx.f32[2], None, [x, y])?;
     ctx.add_capability(Capability::InterpolationFunction);
-    let f32_t = ctx.f32[1];
     let value = ctx.glsl_inst(f32_t, GlslStd450Op::InterpolateAtOffset, &[pointer, offset])?;
-    if generic.load_op == InputGenericLoadOp::None {
+    if generic.load_op == InputGenericLoadOp::None && !perspective {
         return Ok(value);
     }
     let [dx, dy] = ctx.frag_w_slope;
