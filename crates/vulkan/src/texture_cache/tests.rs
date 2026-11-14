@@ -1958,7 +1958,6 @@ fn blits_scale_between_render_targets_on_the_gpu() {
             gmmu,
             &blit_side(GPU_VA, src, [0, 0, 64, 64]),
             &blit_side(dst_va, dst, [0, 0, 32, 32]),
-            false,
         )
         .unwrap();
     assert!(blitted);
@@ -2004,8 +2003,7 @@ fn blits_the_host_cannot_do_as_they_are_go_to_software() {
                 &mut tx,
                 gmmu,
                 &side,
-                &blit_side(GPU_VA + (64 << 10), integer, [0, 0, 32, 32]),
-                false
+                &blit_side(GPU_VA + (64 << 10), integer, [0, 0, 32, 32])
             )
             .unwrap(),
         "a float format into an integer one"
@@ -2016,8 +2014,7 @@ fn blits_the_host_cannot_do_as_they_are_go_to_software() {
                 &mut tx,
                 gmmu,
                 &side,
-                &blit_side(GPU_VA, src, [0, 0, 32, 32]),
-                false
+                &blit_side(GPU_VA, src, [0, 0, 32, 32])
             )
             .unwrap(),
         "one image on both sides"
@@ -2028,8 +2025,7 @@ fn blits_the_host_cannot_do_as_they_are_go_to_software() {
                 &mut tx,
                 gmmu,
                 &side,
-                &blit_side(GPU_VA + (128 << 10), src, [0, 0, 65, 64]),
-                false
+                &blit_side(GPU_VA + (128 << 10), src, [0, 0, 65, 64])
             )
             .unwrap(),
         "a rectangle leaving its image"
@@ -2055,7 +2051,6 @@ fn blits_from_guest_data_stay_in_software() {
             gmmu,
             &blit_side(GPU_VA, src, [0, 0, 64, 64]),
             &blit_side(GPU_VA + (64 << 10), dst, [0, 0, 32, 32]),
-            false,
         )
         .unwrap();
     assert!(!blitted, "an uploaded source no GPU work wrote");

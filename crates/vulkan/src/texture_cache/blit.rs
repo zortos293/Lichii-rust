@@ -22,7 +22,7 @@ pub struct BlitSide {
 }
 
 impl TextureCache {
-    /// Blits `src.rect` over `dst.rect` on the GPU, filtering linearly when `linear`.
+    /// Blits `src.rect` over `dst.rect` on the GPU, sampling the nearest texel.
     /// `Ok(false)` when the cache cannot, and the caller blits in software: a format the host
     /// does not blit as it is, a source no GPU work wrote (guest memory holds its texels, which
     /// the software blit reads without an upload), an image the lookup resolves to another
@@ -33,7 +33,6 @@ impl TextureCache {
         gmmu: &Gmmu,
         src: &BlitSide,
         dst: &BlitSide,
-        linear: bool,
     ) -> Result<bool> {
         let src_host = self.host(src.info.format);
         let dst_host = self.host(dst.info.format);
@@ -47,30 +46,21 @@ impl TextureCache {
         let Some(source) = self.find(tx, gmmu, src.gpu_va, &src.info)? else {
             return Ok(false);
         };
-        let whole = dst.rect == [0, 0, dst.info.width as i32, dst.info.height as i32];
-        let Some(target) = self.render_target(tx, gmmu, dst.gpu_va, &dst.info, whole)? else {
+        let Some(target) = self.lookup_or_create(tx, gmmu, dst.gpu_va, &dst.info)? else {
             return Ok(false);
         };
         if source.id == target.id {
             return Ok(false);
         }
+        let whole = dst.rect == [0, 0, dst.info.width as i32, dst.info.height as i32];
+        let Some(target) = self.render_target(tx, gmmu, dst.gpu_va, &dst.info, whole)? else {
+            return Ok(false);
+        };
         let (Some(src_offsets), Some(dst_offsets)) = (
             self.blit_offsets(source, src.info.format, src.rect),
             self.blit_offsets(target, dst.info.format, dst.rect),
         ) else {
             return Ok(false);
-        };
-        let filter = if linear
-            && src.info.format.is_color()
-            && !src.info.format.is_integer()
-            && self
-                .device
-                .format_features(src_host.format)
-                .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR)
-        {
-            vk::Filter::LINEAR
-        } else {
-            vk::Filter::NEAREST
         };
         let device = self.device.clone();
         let cmd = tx.scheduler.record()?;
@@ -98,7 +88,7 @@ impl TextureCache {
                 dst_image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &[region],
-                filter,
+                vk::Filter::NEAREST,
             );
         }
         self.mark_modified(target.id);
