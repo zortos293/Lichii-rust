@@ -880,6 +880,10 @@ impl Rasterizer for VulkanRasterizer {
             },
             blit.linear_filter,
         );
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 40 {
+            tracing::warn!("DIAG blit {:?} src={:#x} {:?} {}x{} {:?} dst={:#x} {:?} {}x{} {:?} rect={:?}->{:?} linear={}", blitted.as_ref().ok(), blit.src.address, blit.src_format, blit.src.width, blit.src.height, blit.src.block, blit.dst.address, blit.dst_format, blit.dst.width, blit.dst.height, blit.dst.block, src_rect, dst_rect, blit.linear_filter);
+        }
         match blitted {
             Ok(blitted) => {
                 self.unflushed |= blitted;
