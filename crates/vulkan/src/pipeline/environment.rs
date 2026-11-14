@@ -48,6 +48,20 @@ fn graphics_header(regs: &Regs, slot: usize, arch: ShaderArch) -> GpuVAddr {
     }
 }
 
+/// The header of graphics program `slot`, zero where its memory is unmapped.
+pub(crate) fn graphics_program_header(
+    ctx: &GraphicsContext<'_>,
+    slot: usize,
+    arch: ShaderArch,
+) -> ProgramHeader {
+    ProgramHeader {
+        words: ctx
+            .memory
+            .read::<[u32; 20]>(graphics_header(ctx.regs, slot, arch))
+            .unwrap_or_default(),
+    }
+}
+
 impl EnvRead {
     /// The recorded answer as a number.
     pub fn answer(&self) -> u32 {
@@ -312,12 +326,7 @@ fn mesh_state(ctx: &GraphicsContext<'_>, slot: usize, arch: ShaderArch) -> Optio
         return None;
     }
     let primitive_header = if (slot == 3 || !has_task) && regs.pipelines[4].enable() != 0 {
-        ProgramHeader {
-            words: ctx
-                .memory
-                .read::<[u32; 20]>(graphics_header(regs, 4, ShaderArch::Ampere))
-                .unwrap_or_default(),
-        }
+        graphics_program_header(ctx, 4, ShaderArch::Ampere)
     } else {
         ProgramHeader::default()
     };

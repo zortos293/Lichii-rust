@@ -5,7 +5,7 @@ use smallvec::SmallVec;
 
 use super::mesh;
 use crate::ShaderStage;
-use crate::backend::spirv::context::EmitContext;
+use crate::backend::spirv::context::{EmitContext, InputGenericLoadOp};
 use crate::backend::spirv::{EmitError, EmitResult};
 use crate::ir::{InstId, Value};
 use crate::runtime::{AttributeType, CompareFunction};
@@ -155,6 +155,16 @@ pub(super) fn prologue(ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<(
                     .store(ctx.frag_color[index], default_vector, None, [])?;
             }
         }
+    }
+    if ctx.stage == ShaderStage::Fragment
+        && ctx
+            .input_generics
+            .iter()
+            .any(|g| g.load_op == InputGenericLoadOp::TimesFragCoordW)
+    {
+        let w = ctx.frag_coord_w()?;
+        let f32_t = ctx.f32[1];
+        ctx.frag_w_slope = [ctx.b.d_pdx(f32_t, None, w)?, ctx.b.d_pdy(f32_t, None, w)?];
     }
     if ctx.stage == ShaderStage::VertexB {
         ctx.b.store(ctx.output_position, default_vector, None, [])?;

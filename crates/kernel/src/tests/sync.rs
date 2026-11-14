@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lichii_common::ConsoleGeneration;
 use lichii_cpu::ThreadContext;
@@ -694,4 +694,168 @@ fn a_woken_thread_preempts_the_mutex_owner_it_outranks() {
     test.start(test.image(), root);
     test.run_until_exit(Duration::from_secs(30));
     assert_eq!(ran.load(Ordering::SeqCst), ROUNDS, "A ran every round");
+}
+
+/// The watchdog names every object a thread in WaitSynchronization waits on, where it came from,
+/// its signal state and who signalled it last.
+#[test]
+fn the_thread_log_names_the_objects_a_thread_waits_on() {
+    let test = TestKernel::new(ConsoleGeneration::Switch2);
+    let heap = heap_base(&test);
+    let list = heap + 0x2000;
+    let host_event = Arc::new(Event::new());
+    let signaller_event = host_event.clone();
+    std::thread::Builder::new()
+        .name("test-signaller".into())
+        .spawn(move || {
+            signaller_event.signal();
+            signaller_event.clear();
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    let host_handle = Arc::new(AtomicU64::new(0));
+    let guest_handles = Arc::new(Mutex::new((0, 0)));
+    let (h, g) = (host_handle.clone(), guest_handles.clone());
+    let (signal, clear) = (guest_handles.clone(), guest_handles.clone());
+    let main = test.program(
+        Script::new()
+            .svc(0x45, |_, _| {})
+            .then(move |ctx, env| {
+                *g.lock() = (ctx.x[1], ctx.x[2]);
+                env.memory.write(list, ctx.x[2] as u32).unwrap();
+                env.memory
+                    .write(list + 4, h.load(Ordering::SeqCst) as u32)
+                    .unwrap();
+            })
+            .svc(0x11, move |ctx, _| ctx.x[0] = signal.lock().0)
+            .svc(0x12, move |ctx, _| ctx.x[0] = clear.lock().0)
+            .svc(0x18, move |ctx, _| {
+                ctx.x[1] = list;
+                ctx.x[2] = 2;
+                ctx.x[3] = u64::MAX;
+            })
+            .exit(),
+    );
+    let process = test.start(test.image(), main);
+    let host = process
+        .handles()
+        .write()
+        .add(KObject::ReadableEvent(host_event.clone()))
+        .unwrap();
+    host_handle.store(host as u64, Ordering::SeqCst);
+    test.kernel.run().unwrap();
+    let thread = process.threads()[0].id();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let waits_on = loop {
+        if let Some(waits_on) = test
+            .kernel
+            .0
+            .wait_descriptions(std::slice::from_ref(&process))
+            .remove(&thread)
+            && waits_on.matches("KReadableEvent").count() == 2
+        {
+            break waits_on;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the thread never waited on both events"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    let readable = guest_handles.lock().1;
+    let mut objects: Vec<&str> = waits_on.split(", ").collect();
+    objects.sort();
+    let mut expected = vec![
+        format!(
+            "KReadableEvent({readable:#x} origin=svcCreateEvent by thread {thread} signaled=false signals=1 last_signal=thread {thread})"
+        ),
+        format!(
+            "KReadableEvent({host:#x} origin=- signaled=false signals=1 last_signal=host test-signaller)"
+        ),
+    ];
+    expected.sort();
+    assert_eq!(objects, expected);
+    host_event.signal();
+    test.wait_for_exit(Duration::from_secs(5));
+    assert!(
+        test.kernel
+            .0
+            .wait_descriptions(std::slice::from_ref(&process))
+            .is_empty()
+    );
+}
+
+/// The guest's condition variable signals only when the key word says a thread waits on it, so
+/// a waiter must raise that flag before it lets go of the mutex. W waits on the condvar each
+/// round; S takes the mutex the moment W's wait releases it, sets the predicate, unlocks, and
+/// signals only if the key word is set. Raising the flag after the unlock lets S see 0 in that
+/// window and skip the signal, and W sleeps forever.
+#[test]
+fn a_condvar_waiter_flags_the_key_before_it_releases_the_mutex() {
+    const ROUNDS: u64 = 3000;
+    const TAG_W: u32 = 0x1234;
+    const TAG_S: u32 = 0x5678;
+    let test = TestKernel::new(ConsoleGeneration::Switch2);
+    let heap = heap_base(&test);
+    let (mutex, key, predicate, round) =
+        (heap + 0x3000, heap + 0x3004, heap + 0x3008, heap + 0x300c);
+    let w = test.program(
+        Script::new()
+            .then(|ctx, _| ctx.x[20] = 1)
+            .spin_until(move |_, env| {
+                word(env, mutex)
+                    .compare_exchange(0, TAG_W, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            })
+            .then(move |ctx, env| word(env, round).store(ctx.x[20] as u32, Ordering::SeqCst))
+            .jump_if(6, move |ctx, env| {
+                u64::from(word(env, predicate).load(Ordering::SeqCst)) >= ctx.x[20]
+            })
+            .svc(0x1c, move |ctx, _| {
+                ctx.x[0] = mutex;
+                ctx.x[1] = key;
+                ctx.x[2] = u64::from(TAG_W);
+                ctx.x[3] = u64::MAX;
+            })
+            .jump_if(3, |ctx, _| {
+                assert_eq!(ctx.x[0] as u32, 0, "WaitProcessWideKeyAtomic failed");
+                true
+            })
+            .then(move |_, env| {
+                assert_eq!(word(env, mutex).swap(0, Ordering::SeqCst), TAG_W);
+            })
+            .then(|ctx, _| ctx.x[20] += 1)
+            .jump_if(1, |ctx, _| ctx.x[20] <= ROUNDS)
+            .exit(),
+    );
+    let s = test.program(
+        Script::new()
+            .then(|ctx, _| ctx.x[20] = 1)
+            .spin_until(move |ctx, env| {
+                u64::from(word(env, round).load(Ordering::SeqCst)) == ctx.x[20]
+            })
+            .spin_until(move |_, env| {
+                word(env, mutex)
+                    .compare_exchange(0, TAG_S, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            })
+            .then(move |ctx, env| {
+                word(env, predicate).store(ctx.x[20] as u32, Ordering::SeqCst);
+                word(env, mutex).store(0, Ordering::SeqCst);
+                ctx.x[21] = u64::from(word(env, key).load(Ordering::SeqCst));
+            })
+            .jump_if(6, |ctx, _| ctx.x[21] == 0)
+            .svc(0x1d, move |ctx, _| {
+                ctx.x[0] = key;
+                ctx.x[1] = 1;
+            })
+            .then(|ctx, _| ctx.x[20] += 1)
+            .jump_if(1, |ctx, _| ctx.x[20] <= ROUNDS)
+            .exit(),
+    );
+    let main =
+        test.program(spawn_and_join_entries(heap, vec![w, s], vec![(44, 1), (44, 2)]).exit());
+    test.start(test.image(), main);
+    test.run_until_exit(Duration::from_secs(20));
 }

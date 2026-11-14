@@ -131,6 +131,9 @@ pub(crate) enum InputGenericLoadOp {
     Bitcast,
     SToF,
     UToF,
+    /// A screen-linear input written times Position.w: read perspective-correct, times
+    /// FragCoord.w.
+    TimesFragCoordW,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -371,6 +374,9 @@ pub(crate) struct EmitContext<'a> {
 
     pub need_input_position_indirect: bool,
     pub input_position: Word,
+    /// d/dx and d/dy of FragCoord.w, taken in the prologue where control flow is uniform, when
+    /// screen-linear inputs are read times FragCoord.w.
+    pub frag_w_slope: [Word; 2],
     pub input_generics: [InputGenericInfo; 32],
     pub output_point_size: Word,
     pub output_position: Word,
@@ -656,6 +662,7 @@ impl<'a> EmitContext<'a> {
             atomic_cas_global_func_u32: 0,
             need_input_position_indirect: false,
             input_position: 0,
+            frag_w_slope: [0; 2],
             input_generics: [InputGenericInfo::default(); 32],
             output_point_size: 0,
             output_position: 0,
@@ -1387,8 +1394,12 @@ impl<'a> EmitContext<'a> {
             self.layer = self.define_input(u32_t, false, Some(BuiltIn::Layer));
             self.decorate(self.layer, Decoration::Flat, &[]);
         }
+        let unscales_noperspective = is_fragment
+            && runtime.scaled_noperspective_inputs
+            && info.interpolation.contains(&Interpolation::NoPerspective);
         if loads.any_component(Attribute::POSITION_X)
             || info.passthrough.any_component(Attribute::POSITION_X)
+            || unscales_noperspective
         {
             if !is_fragment && profile.has_broken_spirv_position_input {
                 self.need_input_position_indirect = true;
@@ -1496,6 +1507,10 @@ impl<'a> EmitContext<'a> {
             }
             match info.interpolation[index as usize] {
                 Interpolation::Smooth => {}
+                Interpolation::NoPerspective if runtime.scaled_noperspective_inputs => {
+                    self.input_generics[index as usize].load_op =
+                        InputGenericLoadOp::TimesFragCoordW;
+                }
                 Interpolation::NoPerspective => self.decorate(id, Decoration::NoPerspective, &[]),
                 Interpolation::Flat => self.decorate(id, Decoration::Flat, &[]),
             }
@@ -2670,7 +2685,20 @@ impl<'a> EmitContext<'a> {
             InputGenericLoadOp::Bitcast => self.b.bitcast(f32_t, None, value)?,
             InputGenericLoadOp::SToF => self.b.convert_s_to_f(f32_t, None, value)?,
             InputGenericLoadOp::UToF => self.b.convert_u_to_f(f32_t, None, value)?,
+            InputGenericLoadOp::TimesFragCoordW => {
+                let w = self.frag_coord_w()?;
+                self.b.f_mul(f32_t, None, value, w)?
+            }
         })
+    }
+
+    /// Loads FragCoord.w, the reciprocal of the clip-space W interpolated screen-linear.
+    pub fn frag_coord_w(&mut self) -> EmitResult<Word> {
+        let w = self.const_u32(3);
+        let pointer = self
+            .b
+            .access_chain(self.input_f32, None, self.input_position, [w])?;
+        Ok(self.b.load(self.f32[1], None, pointer, None, [])?)
     }
 
     fn indexed_store_function(&mut self) -> EmitResult<Word> {

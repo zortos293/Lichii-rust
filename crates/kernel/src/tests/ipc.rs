@@ -256,7 +256,7 @@ fn cmif_round_trips_through_sm_sessions_and_domains() {
     let test = TestKernel::new(ConsoleGeneration::Switch1);
     let heap = heap_base(&test);
     let event = Arc::new(Event::new());
-    register_test_service(&test, event);
+    register_test_service(&test, event.clone());
     let replies = Replies::default();
     let (input, output) = (heap + 0x4000, heap + 0x5000);
     let mut s = connect_sm(Script::new(), heap + 0x3000);
@@ -424,6 +424,8 @@ fn cmif_round_trips_through_sm_sessions_and_domains() {
     // Close, then the session is gone.
     assert_eq!(r[16].0, 0);
     assert_eq!(r[17].0, u64::from(result::SESSION_CLOSED.0));
+    // The event remembers the command that first handed it to the guest.
+    assert_eq!(event.origin(), Some("test:u command 3"));
 }
 
 #[test]

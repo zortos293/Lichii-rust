@@ -3,11 +3,12 @@
 use std::sync::Arc;
 
 use crate::event::Event;
+use crate::handle_table::Handle;
 use crate::ipc::ClientSession;
 use crate::memory_objects::{CodeMemory, SharedMemory, TransferMemory};
 use crate::process::Process;
 use crate::resource_limit::ResourceLimit;
-use crate::sync::SyncState;
+use crate::sync::{SyncSnapshot, SyncState};
 use crate::thread::Thread;
 
 /// Anything a handle can refer to.
@@ -36,6 +37,23 @@ impl KObject {
             KObject::ReadableEvent(e) => Some(e.sync_state()),
             _ => None,
         }
+    }
+
+    /// A waitable object as the watchdog's thread log names it.
+    pub(crate) fn describe_wait(&self, handle: Handle, state: &SyncSnapshot) -> String {
+        let what = match self {
+            KObject::ReadableEvent(event) => format!("origin={}", event.origin().unwrap_or("-")),
+            KObject::Thread(thread) => format!("thread={}", thread.id()),
+            KObject::Process(process) => format!("process={}", process.name()),
+            _ => String::new(),
+        };
+        format!(
+            "{}({handle:#x} {what} signaled={} signals={} last_signal={})",
+            self.type_name(),
+            state.signaled,
+            state.signals,
+            state.last_signaller,
+        )
     }
 
     pub fn type_name(&self) -> &'static str {

@@ -439,7 +439,11 @@ pub(super) fn interpolate_at_offset(ctx: &mut EmitContext<'_>, inst: InstId) -> 
     let pointer = ctx
         .b
         .access_chain(generic.pointer_type, None, generic.id, [element])?;
-    if generic.load_op != InputGenericLoadOp::None || !ctx.profile.support_sample_rate_shading {
+    let interpolates = matches!(
+        generic.load_op,
+        InputGenericLoadOp::None | InputGenericLoadOp::TimesFragCoordW
+    );
+    if !interpolates || !ctx.profile.support_sample_rate_shading {
         let value = ctx
             .b
             .load(generic.component_type, None, pointer, None, [])?;
@@ -448,11 +452,18 @@ pub(super) fn interpolate_at_offset(ctx: &mut EmitContext<'_>, inst: InstId) -> 
     let (x, y) = (ctx.def_arg(inst, 1)?, ctx.def_arg(inst, 2)?);
     let offset = ctx.b.composite_construct(ctx.f32[2], None, [x, y])?;
     ctx.add_capability(Capability::InterpolationFunction);
-    ctx.glsl_inst(
-        ctx.f32[1],
-        GlslStd450Op::InterpolateAtOffset,
-        &[pointer, offset],
-    )
+    let f32_t = ctx.f32[1];
+    let value = ctx.glsl_inst(f32_t, GlslStd450Op::InterpolateAtOffset, &[pointer, offset])?;
+    if generic.load_op == InputGenericLoadOp::None {
+        return Ok(value);
+    }
+    let [dx, dy] = ctx.frag_w_slope;
+    let w = ctx.frag_coord_w()?;
+    let dx = ctx.b.f_mul(f32_t, None, dx, x)?;
+    let dy = ctx.b.f_mul(f32_t, None, dy, y)?;
+    let w = ctx.b.f_add(f32_t, None, w, dx)?;
+    let w = ctx.b.f_add(f32_t, None, w, dy)?;
+    Ok(ctx.b.f_mul(f32_t, None, value, w)?)
 }
 
 pub(super) fn get_attribute(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
