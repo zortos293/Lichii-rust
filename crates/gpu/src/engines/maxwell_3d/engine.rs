@@ -161,6 +161,11 @@ impl Maxwell3d {
     /// Draws with parameters in GPU memory, with the current state.
     pub fn draw_indirect(&mut self, ctx: &mut EngineContext<'_>, draw: &IndirectDraw) {
         self.flush(ctx);
+        crate::diag::add(if self.renders() {
+            crate::diag::K::eng_indirect
+        } else {
+            crate::diag::K::eng_skip_indirect
+        });
         if self.renders() {
             let draw = IndirectDraw {
                 topology: draw::topology(&self.state.regs, draw.topology),
@@ -205,6 +210,11 @@ impl Maxwell3d {
             ROOT_TABLE_SELECT => self.root_tables.select(value),
             ROOT_TABLE_LOAD => self.load_root_table(&[value]),
             CLEAR_SURFACE => {
+                crate::diag::add(if self.renders() {
+                    crate::diag::K::eng_clear
+                } else {
+                    crate::diag::K::eng_skip_clear
+                });
                 if self.renders() {
                     let start = ctx.activity.begin_call(RendererCall::Clear);
                     ctx.rasterizer.clear(&mut graphics!(self, ctx), 1);
@@ -212,6 +222,11 @@ impl Maxwell3d {
                 }
             }
             draw::DRAW_TEXTURE => {
+                crate::diag::add(if self.renders() {
+                    crate::diag::K::eng_texture
+                } else {
+                    crate::diag::K::eng_skip_texture
+                });
                 if self.renders() {
                     let texture = draw::texture(regs);
                     let start = ctx.activity.begin_call(RendererCall::Draw);
@@ -222,15 +237,52 @@ impl Maxwell3d {
             }
             REPORT_SEMAPHORE_QUERY => {
                 if let Some(query) = queries::report(regs) {
+                    use crate::diag::K;
+                    crate::diag::add(match query.kind {
+                        crate::backend::QueryKind::Payload => K::q_payload,
+                        crate::backend::QueryKind::SamplesPassed
+                            if query.size == crate::backend::ReleaseSize::Four =>
+                        {
+                            K::q_samples_short
+                        }
+                        crate::backend::QueryKind::SamplesPassed => K::q_samples,
+                        crate::backend::QueryKind::PrimitivesGenerated => K::q_prims,
+                        crate::backend::QueryKind::TransformFeedbackPrimitivesWritten => K::q_xfb,
+                        crate::backend::QueryKind::Counter(_) => K::q_counter,
+                    });
                     ctx.rasterizer.query(ctx.channel, ctx.memory, &query);
                 }
             }
             CLEAR_REPORT_VALUE => {
+                crate::diag::add(
+                    if queries::counter(regs.clear_report_value)
+                        == Some(crate::backend::QueryKind::SamplesPassed)
+                    {
+                        crate::diag::K::clear_samples
+                    } else {
+                        crate::diag::K::clear_other
+                    },
+                );
                 if let Some(kind) = queries::counter(regs.clear_report_value) {
                     ctx.rasterizer.reset_counter(kind);
                 }
             }
-            RENDER_ENABLE_MODE => self.render_enable = queries::render_enable(regs, ctx),
+            RENDER_ENABLE_MODE => {
+                self.render_enable = queries::render_enable(regs, ctx);
+                use super::regs::RenderEnableMode as M;
+                let mode = self.state.regs.render_enable.mode;
+                crate::diag::add(match (mode, self.render_enable) {
+                    (M::FALSE, _) => crate::diag::K::re_false,
+                    (M::TRUE, _) => crate::diag::K::re_true,
+                    (M::CONDITIONAL | M::IF_EQUAL | M::IF_NOT_EQUAL, true) => {
+                        crate::diag::K::re_cond_true
+                    }
+                    (M::CONDITIONAL | M::IF_EQUAL | M::IF_NOT_EQUAL, false) => {
+                        crate::diag::K::re_cond_false
+                    }
+                    _ => crate::diag::K::re_other,
+                });
+            }
             SYNC_INFO => {
                 let id = regs.sync_info.sync_point();
                 if ctx.syncpoints.host().increment(id).is_err() {
@@ -264,6 +316,11 @@ impl Maxwell3d {
         let base_vertex = regs.global_base_vertex_index as i32;
         if !self.draw.inline_indices.is_empty() {
             self.flush(ctx);
+            crate::diag::add(if self.renders() {
+                crate::diag::K::eng_draw_inline
+            } else {
+                crate::diag::K::eng_skip_draw
+            });
             if self.renders() {
                 let params = DrawParams {
                     topology,
@@ -358,6 +415,20 @@ impl Maxwell3d {
     }
 
     fn render(&mut self, ctx: &mut EngineContext<'_>, draw: &DrawParams<'_>) {
+        crate::diag::add(if self.renders() {
+            crate::diag::K::eng_draw
+        } else {
+            crate::diag::K::eng_skip_draw
+        });
+        match self.state.regs.render_enable_override {
+            super::regs::RenderEnableOverride::NEVER_RENDER => {
+                crate::diag::add(crate::diag::K::override_never)
+            }
+            super::regs::RenderEnableOverride::ALWAYS_RENDER => {
+                crate::diag::add(crate::diag::K::override_always)
+            }
+            _ => {}
+        }
         if self.renders() {
             let start = ctx.activity.begin_call(RendererCall::Draw);
             ctx.rasterizer.draw(&mut graphics!(self, ctx), draw);
