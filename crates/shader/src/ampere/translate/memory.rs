@@ -2265,4 +2265,31 @@ mod tests {
             ],
         );
     }
+
+    #[test]
+    fn uniform_pointer_plus_32_bit_register_ldg_and_stg_become_a_storage_buffer() {
+        let ugpr = f(24, 2) | f(72, 1) | f(73, 4) | f(91, 1);
+        assert_storage_buffer_form(
+            "ampere-uldc-pointer-register-offset",
+            &[
+                encode(Opcode::S2r, Form::Fixed, f(16, 2) | f(72, 33)),
+                encode(
+                    Opcode::Uldc,
+                    Form::Bound,
+                    f(16, 4) | f(38, 0x210) | f(73, 5),
+                ),
+                encode(
+                    Opcode::Ldg,
+                    Form::UniformAddress,
+                    ugpr | f(32, 4) | f(40, 0x10),
+                ),
+                encode(
+                    Opcode::Stg,
+                    Form::UniformAddress,
+                    ugpr | f(64, 4) | f(40, 0x20),
+                ),
+                encode(Opcode::Exit, Form::Fixed, f(87, 7)),
+            ],
+        );
+    }
 }

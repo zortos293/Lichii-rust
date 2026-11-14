@@ -252,6 +252,7 @@ pub fn global_memory_to_storage_buffer(
     if !has_global_memory {
         return Ok(());
     }
+    split_address_sums(prog);
     let max_ssbos = storage_buffer_limit(profile);
     let (storage, extents) = {
         let shared: &Program = prog;
@@ -324,6 +325,69 @@ pub fn global_memory_to_storage_buffer(
         replace(prog, inst, Value::U32(binding as u32), offset);
     }
     Ok(())
+}
+
+/// Rewrites each global address that sums two non-immediate 64-bit terms, such as a 32-bit
+/// register plus a 64-bit uniform pointer (`[Ra + UR.64]`), as the pair of 32-bit sums with
+/// carry that hosts without `shaderInt64` lower it to, so its halves track to the pointer the
+/// same way on every host. An immediate offset added last stays outside the pair.
+fn split_address_sums(prog: &mut Program) {
+    let accesses: Vec<InstId> = prog
+        .post_order
+        .iter()
+        .flat_map(|&block| prog.insts_of(block))
+        .filter(|&id| is_global_memory(prog.op(id)))
+        .collect();
+    for inst in accesses {
+        let mut address = prog.arg(inst, 0);
+        if let Some(add) = inst_of(prog, address)
+            && prog.op(add) == Opcode::IAdd64
+            && prog.resolve(prog.arg(add, 1)).is_immediate()
+        {
+            address = prog.arg(add, 0);
+        }
+        address_words(prog, address);
+    }
+}
+
+/// The low and high words of a 64-bit address term: a packed pair, a zero-extended word, or a
+/// sum of two such terms, which is rewritten into a packed pair.
+fn address_words(prog: &mut Program, value: Value) -> Option<(Value, Value)> {
+    let inst = inst_of(prog, value)?;
+    match prog.op(inst) {
+        Opcode::PackUint2x32 => {
+            let pair = inst_of(prog, prog.arg(inst, 0))?;
+            (prog.op(pair) == Opcode::CompositeConstructU32x2).then(|| {
+                (
+                    prog.resolve(prog.arg(pair, 0)),
+                    prog.resolve(prog.arg(pair, 1)),
+                )
+            })
+        }
+        Opcode::ConvertU64U32 => Some((prog.resolve(prog.arg(inst, 0)), Value::U32(0))),
+        Opcode::IAdd64 => {
+            let (a, b) = (prog.arg(inst, 0), prog.arg(inst, 1));
+            if prog.resolve(a).is_immediate() || prog.resolve(b).is_immediate() {
+                return None;
+            }
+            let (a_lo, a_hi) = address_words(prog, a)?;
+            let (b_lo, b_hi) = address_words(prog, b)?;
+            let mut ir = Emitter::before(prog, inst);
+            let lo = ir.iadd(a_lo, b_lo);
+            let carry = ir.get_carry_from_op(lo);
+            let carry = ir.select(carry, Value::U32(1), Value::U32(0));
+            let hi = match (a_hi, b_hi) {
+                (hi, Value::U32(0)) | (Value::U32(0), hi) => hi,
+                _ => ir.iadd(a_hi, b_hi),
+            };
+            let hi = ir.iadd(hi, carry);
+            let pair = ir.composite_construct(&[lo, hi]);
+            let packed = ir.pack_uint_2x32(pair);
+            prog.replace_uses_with(inst, packed);
+            Some((lo, hi))
+        }
+        _ => None,
+    }
 }
 
 /// Store extents per written buffer, read from the guest addresses before they are rebased.
