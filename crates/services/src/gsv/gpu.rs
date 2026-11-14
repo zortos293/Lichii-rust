@@ -89,6 +89,7 @@ impl GpuSession {
         let gpu: Weak<Gpu> = Arc::downgrade(&self.context.gpu);
         let reserve = self.context.gpu_reserve.get().cloned();
         let event = self.slot(slot).clone();
+        let (diag_cmd, diag_t) = (diag::current(), std::time::Instant::now());
         self.context
             .gpu
             .run_in_order(move |rasterizer: &mut dyn Rasterizer| {
@@ -105,6 +106,7 @@ impl GpuSession {
                         reserve.release(&done.released);
                     }
                 }
+                diag::record(diag_cmd, diag_t.elapsed());
                 event.signal();
             });
     }
@@ -149,6 +151,13 @@ impl GpuSession {
     /// thread reached the request and made the memory. A GPU shut down meanwhile drops the request,
     /// which ends the wait.
     fn create_memory(&self, ctx: &mut HleRequestContext) -> ResultCode {
+        let t = std::time::Instant::now();
+        let result = self.create_memory_inner(ctx);
+        diag::record(101, t.elapsed());
+        result
+    }
+
+    fn create_memory_inner(&self, ctx: &mut HleRequestContext) -> ResultCode {
         let words = Words::command(ctx);
         let (first, last) = (words.u64(2), words.u64(4));
         let Some(size) = last.checked_sub(first).map(|n| n + 1) else {
@@ -288,6 +297,7 @@ impl Service for GpuSession {
 
     fn handle(&self, ctx: &mut HleRequestContext) -> Option<ResultCode> {
         let command = ctx.command();
+        diag::set_current(command);
         let words = Words::command(ctx);
         Some(match command {
             0 => handshake(ctx),
@@ -425,5 +435,62 @@ impl Service for GpuSession {
             }
             _ => return None,
         })
+    }
+}
+
+mod diag {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::time::{Duration, Instant};
+
+    use parking_lot::Mutex;
+
+    const COMMANDS: [u32; 6] = [101, 102, 213, 214, 215, 216];
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    static STATS: [AtomicU64; 18] = [ZERO; 18];
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+
+    thread_local! {
+        static CURRENT: Cell<u32> = const { Cell::new(0) };
+    }
+
+    pub fn set_current(command: u32) {
+        CURRENT.set(command);
+    }
+
+    pub fn current() -> u32 {
+        CURRENT.get()
+    }
+
+    pub fn record(command: u32, took: Duration) {
+        if let Some(i) = COMMANDS.iter().position(|&c| c == command) {
+            let ns = took.as_nanos() as u64;
+            STATS[i * 3].fetch_add(1, Relaxed);
+            STATS[i * 3 + 1].fetch_add(ns, Relaxed);
+            STATS[i * 3 + 2].fetch_max(ns, Relaxed);
+        }
+        let mut last = LAST.lock();
+        let now = Instant::now();
+        let start = *last.get_or_insert(now);
+        if now - start < Duration::from_secs(5) {
+            return;
+        }
+        *last = Some(now);
+        drop(last);
+        let line: Vec<String> = COMMANDS
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let n = STATS[i * 3].swap(0, Relaxed);
+                let total = STATS[i * 3 + 1].swap(0, Relaxed);
+                let max = STATS[i * 3 + 2].swap(0, Relaxed);
+                format!(
+                    "{c}: n={n} total={:.1}ms max={:.1}ms",
+                    total as f64 / 1e6,
+                    max as f64 / 1e6
+                )
+            })
+            .collect();
+        tracing::info!("diag nx2:gpu waits {}", line.join(" | "));
     }
 }
