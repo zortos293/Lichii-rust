@@ -39,7 +39,13 @@ pub(crate) fn run_core(kernel: Arc<KernelInner>, index: usize) {
         }
         core.ctx.clone_from(&thread.context.lock());
         svc::apply_resume(&mut core.ctx, picked.resume, picked.wake);
+        if core.kernel.svc_trace {
+            tracing::info!(target: "sched", core = index, thread = thread.id(), pc = format_args!("{:#x}", core.ctx.pc), "on");
+        }
         core.run_thread(&thread);
+        if core.kernel.svc_trace {
+            tracing::info!(target: "sched", core = index, thread = thread.id(), pc = format_args!("{:#x}", core.ctx.pc), "off");
+        }
     }
 }
 
