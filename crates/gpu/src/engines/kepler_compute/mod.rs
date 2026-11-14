@@ -291,6 +291,7 @@ impl KeplerCompute {
             tracing::warn!(?fault, address, "inline QMD to unmapped GPU memory");
             return;
         }
+        crate::diag_inv::set(crate::diag_inv::COMPUTE_INLINE);
         ctx.rasterizer
             .inline_written(ctx.channel, ctx.memory, address, bytes.len() as u64);
         let qmd = bytemuck::cast_ref::<[u32; QMD_WORDS], QmdV3>(&self.regs.inline_qmd);

@@ -27,6 +27,10 @@
 //! used images with bounded work per frame. GPU-modified ones are read back without a GPU wait
 //! and reach guest memory before they go.
 
+mod diag_thrash;
+pub(crate) fn diag_thrash_set(kind: &'static str, daddr: u64, size: u64) {
+    diag_thrash::set(kind, daddr, size);
+}
 mod blit;
 mod clear;
 mod convert;
@@ -270,6 +274,7 @@ struct ViewKey {
 }
 
 struct CachedImage {
+    diag_cause: diag_thrash::Cause,
     info: ImageInfo,
     host: HostFormat,
     image: Image,
@@ -338,6 +343,7 @@ impl CachedImage {
 
     /// Guest memory must replace every texel on the next upload.
     fn mark_dirty_whole(&mut self) {
+        self.diag_cause = diag_thrash::current();
         self.cpu_dirty = true;
         self.dirty_whole = true;
     }
@@ -345,6 +351,7 @@ impl CachedImage {
     /// The guest CPU wrote `[daddr, daddr + size)`: the subresources holding those bytes upload
     /// again. Write tracking stays on the other pages, so later writes there are still seen.
     fn mark_cpu_written(&mut self, daddr: DAddr, size: u64) {
+        self.diag_cause = diag_thrash::current();
         if !self.cpu_dirty {
             self.cpu_dirty = true;
             self.dirty_whole = !self.keep_out.is_empty();
@@ -2082,6 +2089,7 @@ impl TextureCache {
             Image::new(&self.device, &desc, "guest image")?
         };
         let cached = CachedImage {
+            diag_cause: diag_thrash::Cause { kind: "new", daddr: 0, size: 0 },
             info: *info,
             host,
             image,
@@ -2228,7 +2236,22 @@ impl TextureCache {
         self.take_from_overlaps(tx, id)?;
         if self.image(id).cpu_dirty {
             if self.image(id).scale != ResolutionScale::X1 {
+                diag_thrash::set("rescale", 0, 0);
                 self.image(id).mark_dirty_whole();
+            }
+            {
+                let image = self.image(id);
+                let cause = image.diag_cause;
+                let key = image.segments[0].daddr;
+                let info = image.info;
+                let whole = image.dirty_whole;
+                let gpu = image.gpu_modified;
+                let seg = image.segments.len();
+                diag_thrash::uploaded(
+                    key ^ ((info.format as u64) << 48),
+                    || format!("{key:#x} fmt={:?} {}x{}x{} layers={} levels={} kind={:?} layout={:?} segs={seg} whole={whole} gpu_modified={gpu}", info.format, info.width, info.height, info.depth, info.layers, info.levels, info.kind, info.layout),
+                    cause,
+                );
             }
             self.rescale(tx, id, ResolutionScale::X1, false)?;
             self.upload(tx, id)?;
@@ -2262,6 +2285,8 @@ impl TextureCache {
         }
         let image = self.get(id).expect("a live image id");
         let own = image.gpu_modified && !self.covered(id, &newer);
+        let first_overlap = newer.first().and_then(|&o| self.get(o)).map_or(0, |o| o.segments[0].daddr);
+        diag_thrash::set("overlap", first_overlap, newer.len() as u64);
         let mut ranges = std::mem::take(&mut self.overlap_ranges);
         ranges.clear();
         for &o in &newer {

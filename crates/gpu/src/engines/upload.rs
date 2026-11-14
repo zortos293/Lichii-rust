@@ -112,6 +112,7 @@ impl Upload {
                 if let Err(fault) = ctx.memory.write_block(address, &self.chunk) {
                     tracing::warn!(?fault, "inline upload to unmapped GPU memory");
                 }
+                crate::diag_inv::set(crate::diag_inv::I2M);
                 ctx.rasterizer.inline_written(
                     ctx.channel,
                     ctx.memory,
@@ -157,6 +158,7 @@ impl Upload {
                     }
                     done += len;
                 }
+                crate::diag_inv::set(crate::diag_inv::I2M);
                 ctx.rasterizer
                     .inline_written(ctx.channel, ctx.memory, span, end - first);
             }

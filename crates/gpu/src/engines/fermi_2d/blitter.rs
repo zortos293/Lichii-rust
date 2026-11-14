@@ -362,6 +362,7 @@ impl SoftwareBlitter {
 
         dst_place.write(ctx.memory, &mut self.tiled, &self.dst);
         let (address, size) = dst_place.span();
+        crate::diag_inv::set(crate::diag_inv::BLIT_2D);
         ctx.rasterizer
             .inline_written(ctx.channel, ctx.memory, address, size);
         self.release_oversized();

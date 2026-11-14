@@ -20,6 +20,7 @@ pub(super) fn upload(cb: &mut ConstantBuffer, ctx: &mut EngineContext<'_>, words
         if let Err(fault) = ctx.memory.write_block(address, bytes) {
             tracing::warn!(?fault, "constant buffer upload to unmapped GPU memory");
         }
+        crate::diag_inv::set(crate::diag_inv::CB);
         ctx.rasterizer
             .inline_written(ctx.channel, ctx.memory, address, bytes.len() as u64);
     }

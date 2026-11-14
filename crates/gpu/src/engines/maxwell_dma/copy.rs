@@ -93,6 +93,7 @@ fn flush(ctx: &mut EngineContext<'_>, address: GpuVAddr, size: u64) {
 
 fn invalidate(ctx: &mut EngineContext<'_>, address: GpuVAddr, size: u64) {
     for_each_device_range(ctx, address, size, |r, daddr, len| {
+        crate::diag_inv::set(crate::diag_inv::DMA);
         r.invalidate_region(daddr, len);
     });
 }

@@ -1142,6 +1142,7 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn invalidate_region(&mut self, addr: DAddr, size: u64) {
+        crate::texture_cache::diag_thrash_set(lichii_gpu::diag_inv::take(), addr, size);
         self.buffer_cache.invalidate(addr, size);
         self.draw.shaders.invalidate(addr, size);
         let mut tx = Transfer {
@@ -1156,6 +1157,7 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn cpu_written(&mut self, addr: DAddr, size: u64) {
+        crate::texture_cache::diag_thrash_set("cpu", addr, size);
         self.buffer_cache.cpu_written(addr, size);
         self.draw.shaders.invalidate(addr, size);
         self.texture_cache.cpu_written(addr, size);
