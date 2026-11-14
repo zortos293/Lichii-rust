@@ -1561,21 +1561,21 @@ impl TextureCache {
     }
 
     /// Gives memory to the subresources of `level` in `layers` the GPU is about to write when
-    /// `id` is sparse, clearing what it binds to the zeros unbound memory reads as. Returns
-    /// whether every one of them has memory; false only when the image reached its cap.
+    /// `id` is sparse, clearing what it binds to the zeros unbound memory reads as. Writes to
+    /// what the cap leaves unbound are dropped.
     pub fn bind_written(
         &mut self,
         tx: &mut Transfer<'_>,
         id: ImageId,
         level: u32,
         layers: std::ops::Range<u32>,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         let device = self.device.clone();
         let Some(image) = self.get_mut(id) else {
-            return Ok(true);
+            return Ok(());
         };
         if !image.image.is_sparse() {
-            return Ok(true);
+            return Ok(());
         }
         let bound = image
             .image
@@ -1588,7 +1588,7 @@ impl TextureCache {
             );
         }
         if bound.newly.is_empty() {
-            return Ok(bound.complete);
+            return Ok(());
         }
         let cmd = tx.scheduler.record()?;
         let image = self.image(id);
@@ -1626,7 +1626,7 @@ impl TextureCache {
                 );
             }
         }
-        Ok(bound.complete)
+        Ok(())
     }
 
     fn image_desc(info: &ImageInfo, host: &HostFormat, scale: ResolutionScale) -> ImageDesc {
@@ -1898,15 +1898,8 @@ impl TextureCache {
         for &(join, level, layer) in &joins {
             self.rescale(tx, join, target, true)?;
             let desc = *self.image(join).image.desc();
-            let mut resident = true;
             for l in 0..desc.mip_levels {
-                resident &=
-                    self.bind_written(tx, id, level + l, layer..layer + desc.array_layers)?;
-            }
-            if !resident {
-                self.image(join).overlaps.push(id);
-                self.image(id).overlaps.push(join);
-                continue;
+                self.bind_written(tx, id, level + l, layer..layer + desc.array_layers)?;
             }
             let cmd = tx.scheduler.record()?;
             let (src_levels, src_layers, src_aspect) = {

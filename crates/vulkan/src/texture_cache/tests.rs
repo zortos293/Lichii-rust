@@ -1674,7 +1674,7 @@ fn images_over_the_texel_limit_are_sparse_and_bind_what_the_gpu_writes() {
         cache.unwritten(found.id),
         "an image nothing wrote samples as no image"
     );
-    assert!(cache.bind_written(&mut tx, found.id, 0, 3..4).unwrap());
+    cache.bind_written(&mut tx, found.id, 0, 3..4).unwrap();
     assert_eq!(memory(cache), layer, "the written layer");
     assert!(!cache.unwritten(found.id));
     cache.bind_written(&mut tx, found.id, 0, 3..5).unwrap();
@@ -1705,7 +1705,7 @@ fn images_over_the_texel_limit_are_sparse_and_bind_what_the_gpu_writes() {
             1,
         )
         .unwrap();
-    assert!(cache.bind_written(&mut tx, found.id, 0, 0..6).unwrap());
+    cache.bind_written(&mut tx, found.id, 0, 0..6).unwrap();
     assert_eq!(
         cache.get(found.id).unwrap().image.memory_size(),
         6 * layer,

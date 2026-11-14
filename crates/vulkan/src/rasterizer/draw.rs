@@ -1473,6 +1473,9 @@ impl VulkanRasterizer {
         let Some((id, mut view)) = self.texture_info(src, raw, desc.ty)? else {
             return Ok(None);
         };
+        if !desc.is_written && self.texture_cache.unwritten(id) {
+            return Ok(None);
+        }
         if desc.is_written
             && self
                 .texture_cache
