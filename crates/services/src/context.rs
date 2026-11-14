@@ -95,6 +95,8 @@ pub struct ServiceContext {
     pub(crate) user: OnceLock<[u8; 16]>,
     /// The vi state, once vi registered: am creates the application's layer in it.
     pub(crate) vi: OnceLock<Arc<crate::vi::Vi>>,
+    /// The apm performance state, once apm registered: am's SetCpuBoostMode changes it.
+    pub(crate) apm: OnceLock<Arc<crate::apm::Controller>>,
     /// Which npad has an NFC reader; hid's updater polls it so NFC sees controller changes.
     pub(crate) nfc_readers: Arc<crate::nfc::common::Readers>,
     /// Reads `set:sys`'s NFC enable flag, once set registered.
@@ -133,6 +135,7 @@ impl ServiceContext {
             hid: OnceLock::new(),
             user: OnceLock::new(),
             vi: OnceLock::new(),
+            apm: OnceLock::new(),
             nfc_readers,
             nfc_enabled: OnceLock::new(),
             installed_content: OnceLock::new(),

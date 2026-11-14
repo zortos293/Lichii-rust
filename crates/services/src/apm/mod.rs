@@ -38,6 +38,7 @@ pub(crate) fn register(context: &Arc<ServiceContext>) -> HleResult<()> {
         docked: context.settings.system.docked,
         configurations: Mutex::new([DEFAULT_CONFIGURATION; 2]),
     });
+    let _ = context.apm.set(controller.clone());
     for name in ["apm", "apm:am", "apm:p"] {
         let controller = controller.clone();
         context.register(name, "apm", move |context| Apm {
@@ -53,7 +54,7 @@ pub(crate) fn register(context: &Arc<ServiceContext>) -> HleResult<()> {
 }
 
 /// The configuration of each performance mode. The mode itself follows the docked setting.
-struct Controller {
+pub(crate) struct Controller {
     docked: bool,
     configurations: Mutex<[u32; 2]>,
 }
@@ -76,6 +77,15 @@ impl Controller {
             return;
         }
         self.configurations.lock()[slot] = configuration;
+    }
+
+    /// Sets the boost mode's configuration from a CPU boost mode, like apm:sys 6 and am's
+    /// SetCpuBoostMode.
+    pub(crate) fn set_cpu_boost_mode(&self, mode: u32) {
+        match BOOST_MODE_CONFIGURATIONS.get(mode as usize) {
+            Some(&configuration) => self.set_configuration(BOOST, configuration),
+            None => tracing::warn!(mode, "apm: invalid CPU boost mode"),
+        }
     }
 
     fn configuration(&self, mode: i32) -> u32 {
@@ -121,13 +131,7 @@ impl Service for ApmSys {
     fn handle(&self, ctx: &mut HleRequestContext) -> Option<ResultCode> {
         match ctx.command() {
             1 => ctx.push_interface(self.context.handler(Session(self.controller.clone()))),
-            6 => {
-                let mode: u32 = ctx.pop();
-                match BOOST_MODE_CONFIGURATIONS.get(mode as usize) {
-                    Some(&configuration) => self.controller.set_configuration(BOOST, configuration),
-                    None => tracing::warn!(mode, "apm:sys: invalid CPU boost mode"),
-                }
-            }
+            6 => self.controller.set_cpu_boost_mode(ctx.pop()),
             7 => {
                 let configuration = self.controller.configuration(self.controller.mode());
                 ctx.push(configuration);
