@@ -291,6 +291,7 @@ pub struct Jit {
     flushed: Instant,
     /// Set while the profile this core sent last waits to be merged.
     queued: Arc<AtomicBool>,
+    translated: u64,
 }
 
 // SAFETY: `arena` is the base of the fastmem arena owned by `config.memory`, which is `Sync`; the
@@ -386,6 +387,7 @@ impl Jit {
             passes,
             flushed: Instant::now(),
             queued: Arc::default(),
+            translated: 0,
         })
     }
 
@@ -393,6 +395,7 @@ impl Jit {
         if start & 3 != 0 {
             return Err(CpuFault::Prefetch { pc: start });
         }
+        self.translated += 1;
         let started = self.state.profile.is_some().then(Instant::now);
         let mut t = Translator {
             block: Block {
@@ -597,6 +600,11 @@ impl Drop for Jit {
     fn drop(&mut self) {
         if let Some(p) = self.state.profile_counts() {
             profile::retire(std::mem::take(p));
+            tracing::info!(
+                core = self.config.core_index,
+                translated = self.translated,
+                "JIT core totals"
+            );
         }
         map::sync();
     }
