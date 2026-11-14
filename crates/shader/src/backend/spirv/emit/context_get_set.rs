@@ -8,6 +8,7 @@ use crate::backend::spirv::context::{
     CbufElement, EmitContext, InputGenericLoadOp, is_arrayed_input_stage,
 };
 use crate::backend::spirv::{EmitError, EmitResult};
+use crate::info::Interpolation;
 use crate::ir::{Attribute, InstId, Patch, Value};
 use crate::runtime::AttributeType;
 use crate::{ShaderInfo, ShaderStage};
@@ -419,9 +420,11 @@ fn load_vertex_id(ctx: &mut EmitContext<'_>) -> EmitResult<Word> {
     Ok(ctx.b.load(ctx.u32[1], None, variable, None, [])?)
 }
 
-/// A fragment program's generic input component interpolated at an offset from the pixel centre.
-/// Inputs declared with integer components are flat, so they load unchanged, as does every input
-/// on a host without sample rate shading.
+/// A fragment program's generic input component interpolated at an offset from the pixel centre,
+/// as IPA.OFFSET returns it: an input the header maps as perspective divided by the clip-space w
+/// at that offset, whatever its type. Inputs declared with integer components are flat, so they
+/// load at the centre, as does every input on a host without sample rate shading (then divided by
+/// w at the centre).
 pub(super) fn interpolate_at_offset(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
     if ctx.stage != ShaderStage::Fragment {
         return Err(EmitError::UnsupportedStage(ctx.stage));
@@ -432,37 +435,44 @@ pub(super) fn interpolate_at_offset(ctx: &mut EmitContext<'_>, inst: InstId) -> 
     };
     let generic = ctx.input_generics[index as usize];
     let element = u32::from(attr.component());
-    if generic.id == 0 {
-        return Ok(ctx.const_f32(if element == 3 { 1.0 } else { 0.0 }));
-    }
-    let element = ctx.const_u32(element);
-    let pointer = ctx
-        .b
-        .access_chain(generic.pointer_type, None, generic.id, [element])?;
+    let f32_t = ctx.f32[1];
+    let perspective = ctx.info.interpolation[index as usize] == Interpolation::Smooth;
     let interpolates = matches!(
         generic.load_op,
         InputGenericLoadOp::None | InputGenericLoadOp::TimesFragCoordW
     );
-    if !interpolates || !ctx.profile.support_sample_rate_shading {
-        let value = ctx
-            .b
-            .load(generic.component_type, None, pointer, None, [])?;
-        return ctx.input_to_f32(generic.load_op, value);
-    }
+    let at_offset = ctx.profile.support_sample_rate_shading && (generic.id == 0 || interpolates);
     let (x, y) = (ctx.def_arg(inst, 1)?, ctx.def_arg(inst, 2)?);
-    let offset = ctx.b.composite_construct(ctx.f32[2], None, [x, y])?;
-    ctx.add_capability(Capability::InterpolationFunction);
-    let f32_t = ctx.f32[1];
-    let value = ctx.glsl_inst(f32_t, GlslStd450Op::InterpolateAtOffset, &[pointer, offset])?;
-    if generic.load_op == InputGenericLoadOp::None {
+    let value = if generic.id == 0 {
+        ctx.const_f32(if element == 3 { 1.0 } else { 0.0 })
+    } else {
+        let element = ctx.const_u32(element);
+        let pointer = ctx
+            .b
+            .access_chain(generic.pointer_type, None, generic.id, [element])?;
+        if at_offset {
+            let offset = ctx.b.composite_construct(ctx.f32[2], None, [x, y])?;
+            ctx.add_capability(Capability::InterpolationFunction);
+            ctx.glsl_inst(f32_t, GlslStd450Op::InterpolateAtOffset, &[pointer, offset])?
+        } else {
+            let value = ctx
+                .b
+                .load(generic.component_type, None, pointer, None, [])?;
+            ctx.input_to_f32(generic.load_op, value)?
+        }
+    };
+    let scaled = at_offset && generic.load_op == InputGenericLoadOp::TimesFragCoordW;
+    if !perspective && !scaled {
         return Ok(value);
     }
-    let [dx, dy] = ctx.frag_w_slope;
-    let w = ctx.frag_coord_w()?;
-    let dx = ctx.b.f_mul(f32_t, None, dx, x)?;
-    let dy = ctx.b.f_mul(f32_t, None, dy, y)?;
-    let w = ctx.b.f_add(f32_t, None, w, dx)?;
-    let w = ctx.b.f_add(f32_t, None, w, dy)?;
+    let mut w = ctx.frag_coord_w()?;
+    if at_offset {
+        let [dx, dy] = ctx.frag_w_slope;
+        let dx = ctx.b.f_mul(f32_t, None, dx, x)?;
+        let dy = ctx.b.f_mul(f32_t, None, dy, y)?;
+        w = ctx.b.f_add(f32_t, None, w, dx)?;
+        w = ctx.b.f_add(f32_t, None, w, dy)?;
+    }
     Ok(ctx.b.f_mul(f32_t, None, value, w)?)
 }
 
