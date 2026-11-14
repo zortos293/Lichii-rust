@@ -30,6 +30,7 @@
 mod blit;
 mod clear;
 mod convert;
+mod dma;
 mod guest_sync;
 mod info;
 #[cfg(test)]
@@ -54,6 +55,7 @@ use lichii_texture::tic::{SwizzleSource, TextureDescriptor};
 pub use blit::BlitSide;
 pub use info::{GuestLayout, ImageInfo, ImageKind, ViewInfo};
 
+use crate::buffer_cache::BufferCache;
 use crate::commands::{ImageAccess, transfer_to_all_barrier, transition};
 use crate::device::Device;
 use crate::error::Result;
@@ -124,6 +126,9 @@ pub struct Transfer<'a> {
     pub scheduler: &'a mut Scheduler,
     pub staging: &'a mut StagingRing,
     pub memory: &'a DeviceAddressSpace,
+    /// Holds bytes the GPU wrote to buffers ahead of guest memory: uploads flush what they
+    /// read from it first.
+    pub buffers: &'a mut BufferCache,
 }
 
 /// A rectangle in guest pixels of a render target (before resolution scaling).
@@ -1017,6 +1022,7 @@ impl TextureCache {
             image.info.levels == 1 && image.info.layers == info.layers
         };
         if discard && whole {
+            self.flush_buffered(tx, found.id)?;
             let tick = self.tick;
             let image = self.image(found.id);
             image.cpu_dirty = false;
@@ -2210,6 +2216,9 @@ impl TextureCache {
     /// the last upload, then copies in what its aliases' GPU work wrote since.
     fn refresh(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
         if self.image(id).image.is_sparse() {
+            if self.image(id).cpu_dirty {
+                self.flush_buffered(tx, id)?;
+            }
             let tick = self.tick;
             let image = self.image(id);
             image.cpu_dirty = false;
@@ -2447,7 +2456,18 @@ impl TextureCache {
         Ok(())
     }
 
+    /// Lands the bytes GPU work wrote to buffers over `id` in guest memory, so the image's own
+    /// texels, uploaded now or written back later, are the newer ones.
+    fn flush_buffered(&self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
+        for segment in &self.get(id).expect("a live image id").segments {
+            tx.buffers
+                .flush(tx.scheduler, segment.daddr, segment.size)?;
+        }
+        Ok(())
+    }
+
     fn upload(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
+        self.flush_buffered(tx, id)?;
         let device = self.device.clone();
         let Self {
             slots,

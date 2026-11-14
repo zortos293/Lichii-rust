@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use lichii_common::settings::GraphicsSettings;
+use lichii_gpu::backend::{CopySurface, ImageCopy};
 use lichii_gpu::gmmu::BigPageSize;
 use lichii_memory::PhysicalMemory;
 use lichii_texture::block_linear::{SurfaceLayout, Tiling};
@@ -21,6 +22,7 @@ struct Fixture {
     scheduler: Scheduler,
     staging: StagingRing,
     cache: TextureCache,
+    buffers: BufferCache,
 }
 
 fn fixture(gob: GobLayout, recompression: AstcRecompression) -> Option<Fixture> {
@@ -44,16 +46,13 @@ fn fixture(gob: GobLayout, recompression: AstcRecompression) -> Option<Fixture> 
     memory.map(DADDR, 0, DRAM);
     let gmmu = Gmmu::new(memory.clone(), BigPageSize::Size64K);
     gmmu.map(GPU_VA, DADDR, DRAM, 0, false).unwrap();
+    let written = Arc::new(GpuWrittenPages::new(36));
+    let lazy = Arc::new(lichii_gpu::lazy::LazyDeviceRanges::new(memory.clone()));
     Some(Fixture {
         scheduler: Scheduler::new(&device).unwrap(),
         staging: StagingRing::new(&device, 32 << 20).unwrap(),
-        cache: TextureCache::new(
-            &device,
-            Arc::new(GpuWrittenPages::new(36)),
-            Arc::new(lichii_gpu::lazy::LazyDeviceRanges::new(memory.clone())),
-            gob,
-            recompression,
-        ),
+        buffers: BufferCache::new(&device, memory.clone(), written.clone(), lazy.clone()).unwrap(),
+        cache: TextureCache::new(&device, written, lazy, gob, recompression),
         device,
         memory,
         gmmu,
@@ -67,6 +66,7 @@ impl Fixture {
                 scheduler: &mut self.scheduler,
                 staging: &mut self.staging,
                 memory: &self.memory,
+                buffers: &mut self.buffers,
             },
             &mut self.cache,
             &self.gmmu,
@@ -2330,6 +2330,162 @@ fn block_linear_aliases_need_the_same_depth_stencil_encoding() {
         block_linear_overlap(&d24s8, DADDR, &narrower, DADDR),
         Some(((0, 0), (0, 0), (252, 64)))
     );
+}
+
+fn copy_engine_setup(f: &mut Fixture) -> (ImageCopy, u64) {
+    let info = rt_info(64, 8, 0, GobLayout::Tegra);
+    clear_rt(f, &info, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    clear_rt(
+        f,
+        &info,
+        [0.0, 1.0, 0.0, 1.0],
+        Rect {
+            x: 10,
+            y: 3,
+            width: 4,
+            height: 2,
+        },
+    );
+    let copy = ImageCopy {
+        src: copy_surface(GPU_VA, 0, Some((0, 0, 0))),
+        dst: copy_surface(GPU_VA + (1 << 20), 128, None),
+        src_origin: (8, 2),
+        dst_origin: (0, 0),
+        width: 16,
+        height: 4,
+    };
+    (copy, 3 * 128 + 16 * 4)
+}
+
+fn copy_surface(address: GpuVAddr, pitch: u32, block: Option<(u32, u32, u32)>) -> CopySurface {
+    CopySurface {
+        address,
+        width: 64,
+        height: 8,
+        depth: 1,
+        layer: 0,
+        pitch,
+        block,
+        bytes_per_pixel: 4,
+    }
+}
+
+fn copied_texel(col: usize, row: usize) -> [u8; 4] {
+    if (2..6).contains(&col) && (1..3).contains(&row) {
+        [0, 255, 0, 255]
+    } else {
+        [255, 0, 0, 255]
+    }
+}
+
+#[test]
+fn copy_engine_reads_of_gpu_modified_images_stay_on_the_gpu() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let (copy, span) = copy_engine_setup(&mut f);
+    let downloads = f.cache.traffic().downloads;
+    let (mut tx, cache, gmmu) = f.tx();
+    assert!(cache.copy_to_buffer(&mut tx, gmmu, &copy).unwrap());
+    f.scheduler.finish().unwrap();
+    assert_eq!(
+        f.cache.traffic().downloads,
+        downloads,
+        "no write-back to guest memory"
+    );
+    assert!(
+        guest_texels(&f, 1 << 20, span as usize)
+            .iter()
+            .all(|&b| b == 0),
+        "guest memory waits for a read"
+    );
+    f.buffers
+        .flush(&mut f.scheduler, DADDR + (1 << 20), span)
+        .unwrap();
+    let guest = guest_texels(&f, 1 << 20, span as usize);
+    for row in 0..4 {
+        for col in 0..16 {
+            let at = row * 128 + col * 4;
+            assert_eq!(
+                guest[at..at + 4],
+                copied_texel(col, row),
+                "texel ({col}, {row})"
+            );
+        }
+    }
+    let fresh = ImageCopy {
+        src: copy_surface(GPU_VA + (2 << 20), 0, Some((0, 0, 0))),
+        ..copy
+    };
+    let (mut tx, cache, gmmu) = f.tx();
+    assert!(!cache.copy_to_buffer(&mut tx, gmmu, &fresh).unwrap());
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn textures_over_copy_engine_destinations_sample_the_copied_texels() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let (copy, _) = copy_engine_setup(&mut f);
+    let (mut tx, cache, gmmu) = f.tx();
+    assert!(cache.copy_to_buffer(&mut tx, gmmu, &copy).unwrap());
+    let (id, _) = f.texture(&pitch_tic(GPU_VA + (1 << 20), 16, 4, 128));
+    let texels = f.read_image(id).remove(0);
+    for row in 0..4 {
+        for col in 0..16 {
+            let at = (row * 16 + col) * 4;
+            assert_eq!(
+                texels[at..at + 4],
+                copied_texel(col, row),
+                "texel ({col}, {row})"
+            );
+        }
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn copy_engine_reads_addressed_with_another_block_height_copy_in_software() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let (copy, _) = copy_engine_setup(&mut f);
+    let taller = ImageCopy {
+        src: copy_surface(GPU_VA, 0, Some((0, 1, 0))),
+        ..copy
+    };
+    let (mut tx, cache, gmmu) = f.tx();
+    assert!(!cache.copy_to_buffer(&mut tx, gmmu, &taller).unwrap());
+}
+
+#[test]
+fn full_clears_over_copy_engine_destinations_stay_newer_than_the_copy() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let (copy, _) = copy_engine_setup(&mut f);
+    let (mut tx, cache, gmmu) = f.tx();
+    assert!(cache.copy_to_buffer(&mut tx, gmmu, &copy).unwrap());
+    let info = pitch_target(128, 4);
+    clear_rt_at(
+        &mut f,
+        GPU_VA + (1 << 20),
+        &info,
+        [0.0, 0.0, 1.0, 1.0],
+        Rect::ALL,
+    );
+    let (mut tx, cache, _) = f.tx();
+    cache.flush(&mut tx, DADDR + (1 << 20), 512).unwrap();
+    f.buffers
+        .flush(&mut f.scheduler, DADDR + (1 << 20), 512)
+        .unwrap();
+    f.scheduler.finish().unwrap();
+    assert!(all_texels(
+        &guest_texels(&f, 1 << 20, 512),
+        [0, 0, 255, 255]
+    ));
+    f.assert_no_validation_errors();
 }
 
 #[test]
