@@ -350,6 +350,8 @@ impl JitCache {
 
 impl Drop for JitCache {
     fn drop(&mut self) {
+        let exec = self.memory.exec as usize;
+        super::map::clear(exec, exec + CODE_SIZE);
         if let Some(slot) = self.region {
             let _guard = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
             REGION_TABLE[slot].start.store(0, Ordering::Release);
