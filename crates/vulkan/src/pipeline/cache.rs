@@ -817,6 +817,8 @@ pub struct PipelineCache {
     linking: HashMap<usize, Linking, FxBuildHasher>,
     /// Graphics lookups that found the pipeline still building, with nothing fast-linked yet.
     waits: u64,
+    diag_stored: Vec<GraphicsPipelineKey>,
+    diag_logged: u32,
     /// Pipeline count and driver compilations at the last [`Self::autosave`] write, or
     /// `None` when that write failed.
     saved: Option<(usize, u64)>,
@@ -941,6 +943,8 @@ impl PipelineCache {
             libraries: HashMap::default(),
             linking: HashMap::default(),
             waits: 0,
+            diag_stored: Vec::new(),
+            diag_logged: 0,
             saved: Some((0, 0)),
             next_save: None,
             save: Arc::new(AtomicU8::new(SAVE_IDLE)),
@@ -1157,6 +1161,38 @@ impl PipelineCache {
             "the key names other shaders"
         );
         let index = self.slots.len();
+        if link && !self.diag_stored.is_empty() && self.diag_logged < 400 {
+            self.diag_logged += 1;
+            let known = key
+                .shaders
+                .iter()
+                .filter(|&&h| h != 0 && self.diag_stored.iter().any(|k| k.shaders.contains(&h)))
+                .count();
+            let stages = key.shaders.iter().filter(|&&h| h != 0).count();
+            let nearest = self
+                .diag_stored
+                .iter()
+                .filter(|k| k.shaders == key.shaders)
+                .map(|k| {
+                    let (a, b) = (k.fixed.as_bytes(), key.fixed.as_bytes());
+                    let offsets: Vec<usize> = (0..a.len().max(b.len()))
+                        .filter(|&i| a.get(i) != b.get(i))
+                        .collect();
+                    (k.attachments != key.attachments, offsets, k.attachments)
+                })
+                .min_by_key(|(attach, offsets, _)| (*attach as usize) * 1000 + offsets.len());
+            match nearest {
+                Some((attach, offsets, stored_attachments)) => tracing::info!(
+                    "pipeline key diag: new key, same shaders as a stored key; attachments_differ={attach} fixed_offsets={offsets:?} live_attachments={:?} stored_attachments={stored_attachments:?} live_fixed={:?}",
+                    key.attachments,
+                    key.fixed.as_bytes()
+                ),
+                None => tracing::info!(
+                    "pipeline key diag: new key, no stored key with these shaders; stages={stages} known_stage_hashes={known} hashes={:x?}",
+                    key.shaders
+                ),
+            }
+        }
         self.graphics.insert(*key, index);
         let layout = self.layout(shaders.iter().flatten().map(|p| &**p));
         if let Some(layout) = &layout
@@ -1295,6 +1331,7 @@ impl PipelineCache {
             merged.call("vkMergePipelineCaches")?;
         }
         self.loaded_blob_bytes = stored.blob.len();
+        self.diag_stored = stored.graphics.clone();
         self.stored = Contents {
             blob: Vec::new(),
             ..stored
