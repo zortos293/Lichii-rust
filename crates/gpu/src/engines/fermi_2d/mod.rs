@@ -563,6 +563,29 @@ mod tests {
     }
 
     #[test]
+    fn corner_origin_downscale_starting_before_the_surface_clamps_to_the_edge() {
+        let mut h = Harness::new();
+        let mut engine = Fermi2d::new();
+        let tiling = Tiling::new(8, 8, 1, 4, 1, 0, h.gob_layout);
+        let pixels = rgba8((8, 8), |x, y| [x as u8, y as u8, 3, 9]);
+        let mut tiled = vec![0u8; tiling.size_bytes()];
+        swizzle(&tiling, &pixels, &mut tiled);
+        put(&h, 0x8000, &tiled);
+        let mut setup = Setup::copy(
+            block_surface(F::A8B8G8R8Unorm, 0x8000, (8, 8), 1),
+            pitch_surface(F::A8B8G8R8Unorm, 0x2000, (4, 4), 16),
+            (4, 4),
+        );
+        setup.du_dx = 2 << 32;
+        setup.dv_dy = 2 << 32;
+        setup.corner = true;
+        run(&mut engine, &mut h.context(), &setup);
+        let edge = |i: u32| (2 * i).saturating_sub(1) as u8;
+        let expected = rgba8((4, 4), |x, y| [edge(x), edge(y), 3, 9]);
+        assert_eq!(get(&h, 0x2000, 64), expected);
+    }
+
+    #[test]
     fn rgba_to_bgra_conversion_swaps_red_and_blue() {
         let mut h = Harness::new();
         let mut engine = Fermi2d::new();
