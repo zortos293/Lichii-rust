@@ -59,6 +59,12 @@ counters!(
     vk_recorded,
     vk_depth_only,
     vk_color,
+    tex_null_pool,
+    tex_null_addr0,
+    tex_null_cache,
+    tex_null_cube,
+    tex_null_unwritten,
+    tex_null_view,
 );
 
 static COUNTS: [AtomicU64; NAMES.len()] = [const { AtomicU64::new(0) }; NAMES.len()];
@@ -73,6 +79,18 @@ struct Sources {
     color: HashSet<u64>,
     window_start: Option<Instant>,
     presents: u64,
+}
+
+static NOTES: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+
+/// Counts one occurrence of a described event, logged with the window.
+pub fn note(key: String) {
+    *NOTES
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .entry(key)
+        .or_default() += 1;
 }
 
 static SOURCES: Mutex<Option<Sources>> = Mutex::new(None);
@@ -131,6 +149,12 @@ pub fn present() {
         shadow_only.len(),
         top.join(" ")
     );
+    let notes = NOTES.lock().unwrap().take().unwrap_or_default();
+    let mut notes: Vec<(String, u64)> = notes.into_iter().collect();
+    notes.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    for (key, n) in notes.iter().take(16) {
+        tracing::info!(target: "diag_null", "x{n} {key}");
+    }
     *s = Sources {
         window_start: Some(Instant::now()),
         ..Sources::default()

@@ -1632,12 +1632,21 @@ impl VulkanRasterizer {
             return Ok(None);
         };
         if self.texture_cache.unwritten(id) {
+            lichii_gpu::diag::add(lichii_gpu::diag::K::tex_null_unwritten);
+            let i = self.texture_cache.state(id).map(|s| s.info);
+            lichii_gpu::diag::note(format!("unwritten {i:?}"));
             return Ok(None);
         }
-        Ok(self
+        let found = self
             .texture_cache
             .sampled_view(id, &view)?
-            .map(|raw| (id, raw)))
+            .map(|raw| (id, raw));
+        if found.is_none() {
+            lichii_gpu::diag::add(lichii_gpu::diag::K::tex_null_view);
+            let i = self.texture_cache.state(id).map(|s| s.info);
+            lichii_gpu::diag::note(format!("no-view {view:?} of {i:?}"));
+        }
+        Ok(found)
     }
 
     /// The image the texture header `raw` selects and the view of it `ty` reads; `None` when
@@ -1650,18 +1659,35 @@ impl VulkanRasterizer {
     ) -> Result<Option<(ImageId, ViewInfo)>> {
         let (index, _) = src.pool.split(raw);
         if index > src.pool.limit {
+            lichii_gpu::diag::add(lichii_gpu::diag::K::tex_null_pool);
             return Ok(None);
         }
         let header = src.pool.header(src.gmmu, raw);
         if header.address == 0 {
+            lichii_gpu::diag::add(lichii_gpu::diag::K::tex_null_addr0);
             return Ok(None);
         }
+        let describe = |reason: &str| {
+            format!(
+                "{reason} {:#x} {:?} {}x{}x{} lv{} {:?} {:?}",
+                header.address,
+                header.format,
+                header.width,
+                header.height,
+                header.depth,
+                header.levels,
+                header.texture_type,
+                header.memory
+            )
+        };
         let mut tx = Transfer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
             memory: &self.handles.device,
         };
         let Some((id, mut view)) = self.texture_cache.texture(&mut tx, src.gmmu, &header)? else {
+            lichii_gpu::diag::add(lichii_gpu::diag::K::tex_null_cache);
+            lichii_gpu::diag::note(describe("no-image"));
             return Ok(None);
         };
         view.view_type = view_type(ty);
@@ -1671,7 +1697,11 @@ impl VulkanRasterizer {
             | vk::ImageViewType::TYPE_3D => 1,
             vk::ImageViewType::CUBE if view.layers >= 6 => 6,
             vk::ImageViewType::CUBE_ARRAY if view.layers >= 6 => view.layers / 6 * 6,
-            vk::ImageViewType::CUBE | vk::ImageViewType::CUBE_ARRAY => return Ok(None),
+            vk::ImageViewType::CUBE | vk::ImageViewType::CUBE_ARRAY => {
+                lichii_gpu::diag::add(lichii_gpu::diag::K::tex_null_cube);
+                lichii_gpu::diag::note(describe("cube-layers"));
+                return Ok(None);
+            }
             _ => view.layers,
         };
         Ok(Some((id, view)))
