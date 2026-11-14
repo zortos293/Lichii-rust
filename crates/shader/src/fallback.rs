@@ -90,6 +90,14 @@ pub(crate) fn end_program(env: &dyn crate::ShaderEnvironment) {
             None => format!("{}/{}", f.opcode, f.variant),
         })
         .collect();
+    if let Some(dir) = std::env::var_os("LICHII_DUMP_DIR")
+        && hit.iter().any(|f| f.opcode == "global_memory")
+    {
+        let mut code = vec![0u8; 0x10000];
+        env.read_code(env.start_address(), &mut code);
+        let name = format!("{:?}_{:x}.bin", env.stage(), env.start_address());
+        let _ = std::fs::write(std::path::Path::new(&dir).join(name), &code);
+    }
     tracing::info!(
         target: "shader_fallback",
         stage = ?env.stage(),
