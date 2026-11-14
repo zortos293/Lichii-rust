@@ -30,6 +30,7 @@
 mod blit;
 mod clear;
 mod convert;
+mod guest_sync;
 mod info;
 #[cfg(test)]
 mod tests;
@@ -47,7 +48,7 @@ use lichii_gpu::gmmu::{Gmmu, RangeTarget};
 use lichii_gpu::lazy::LazyDeviceRanges;
 use lichii_memory::{CachedPages, DeviceAddressSpace};
 use lichii_texture::PixelFormat;
-use lichii_texture::block_linear::{GobLayout, swizzle, unswizzle};
+use lichii_texture::block_linear::{GobLayout, Tiling, swizzle, unswizzle};
 use lichii_texture::tic::{SwizzleSource, TextureDescriptor};
 
 pub use blit::BlitSide;
@@ -182,6 +183,8 @@ pub struct Traffic {
     /// GPU-modified images written back to guest memory, and their guest bytes.
     pub downloads: u64,
     pub download_bytes: u64,
+    /// Overlap syncs done on the GPU instead of through guest memory.
+    pub gpu_syncs: u64,
 }
 
 /// What the collector did since the cache was created.
@@ -489,6 +492,7 @@ pub struct TextureCache {
     readback: Option<Buffer>,
     downloads: Vec<Download>,
     clear_pipelines: Option<ClearPipelines>,
+    guest_sync: Option<guest_sync::GuestSync>,
     vram_usage: VramUsage,
     /// Frames presented so far.
     frame: u64,
@@ -541,6 +545,47 @@ fn components(swizzle: [SwizzleSource; 4], host: vk::ComponentMapping) -> vk::Co
         b: map(swizzle[2]),
         a: map(swizzle[3]),
     }
+}
+
+/// The rectangle two single-level 2D block-linear images at the same address share at level 0:
+/// the same as [`pitch_overlap`], for images whose level 0 tiles alike (equal GOBs per row,
+/// block height and GOB layout) and so differ at most in width and height.
+fn block_linear_overlap(
+    a: &ImageInfo,
+    a_base: DAddr,
+    b: &ImageInfo,
+    b_base: DAddr,
+) -> Option<(Texel, Texel, Texel)> {
+    let tiling = |i: &ImageInfo| {
+        let single = matches!(i.layout, GuestLayout::BlockLinear { .. })
+            && i.format.block_width() == 1
+            && i.format.block_height() == 1
+            && i.kind == ImageKind::D2
+            && i.depth == 1
+            && i.levels == 1
+            && i.layers == 1
+            && i.samples == 1;
+        single.then(|| i.surface().level_tiling(0))
+    };
+    let (ta, tb) = (tiling(a)?, tiling(b)?);
+    let shape = |t: &Tiling| {
+        (
+            t.bytes_per_block,
+            t.block_height_log2,
+            t.block_depth_log2,
+            t.row_gobs,
+            t.layout,
+        )
+    };
+    let same_encoding = a.format.is_color() || a.format == b.format;
+    if a_base != b_base || shape(&ta) != shape(&tb) || !same_encoding {
+        return None;
+    }
+    Some((
+        (0, 0),
+        (0, 0),
+        (a.width.min(b.width), a.height.min(b.height)),
+    ))
 }
 
 /// Where two pitch-linear images with the same pitch share texels: the rectangle's texel
@@ -744,6 +789,7 @@ impl TextureCache {
             readback: None,
             downloads: Vec::new(),
             clear_pipelines: None,
+            guest_sync: None,
             vram_usage: VramUsage::default(),
             frame: 0,
             lru_head: NIL,
@@ -1818,6 +1864,7 @@ impl TextureCache {
                 && Self::copy_compatible(image, host, info.format)
                 && let Some((at, own, extent)) =
                     pitch_overlap(&image.info, image.base(), info, base)
+                        .or_else(|| block_linear_overlap(&image.info, image.base(), info, base))
             {
                 self.new_aliases.push(Alias {
                     id,
@@ -2137,10 +2184,11 @@ impl TextureCache {
             self.get(o)
                 .is_some_and(|o| o.modified > current && !o.image.is_sparse())
         }));
-        if newer.is_empty() {
+        if newer.is_empty() || self.sync_on_gpu(tx, id, &mut newer)? {
             self.overlap_scratch = newer;
             return Ok(());
         }
+        let image = self.get(id).expect("a live image id");
         let own = image.gpu_modified && !self.covered(id, &newer);
         newer.retain(|&o| self.get(o).is_some_and(|o| o.gpu_modified));
         if own {

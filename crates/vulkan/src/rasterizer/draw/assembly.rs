@@ -11,11 +11,11 @@ use lichii_gpu::backend::IndirectDraw;
 use lichii_gpu::engines::maxwell_3d::regs::{IndexFormat, PrimitiveTopology, Regs};
 use lichii_gpu::gmmu::Gmmu;
 
-use super::host_compute::{HostCompute, storage};
 use super::{IndirectBuffers, Warning};
 use crate::buffer_cache::{BufferBinding, IndexBinding, bound_index_capacity};
 use crate::device::Device;
 use crate::error::Result;
+use crate::host_compute::{HostCompute, storage};
 use crate::memory::Buffer;
 use crate::rasterizer::VulkanRasterizer;
 use crate::shaders;
