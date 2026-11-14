@@ -7,6 +7,7 @@
 
 mod cache;
 mod ir;
+mod map;
 mod passes;
 pub(crate) mod profile;
 mod simd;
@@ -443,8 +444,15 @@ impl Jit {
         self.passes.run(&mut block);
         let compiled = x64::compile(&block, start, &self.target);
         let code_bytes = compiled.code.len();
+        let mapped = map::enabled().then(|| compiled.code.clone());
         let generation = self.cache.generation();
         let entry = self.cache.insert(start, len, Ok(compiled));
+        if let (Some(code), cache::Code::Native(host)) = (mapped, entry.code) {
+            let words: Vec<u32> = (0..len / 4)
+                .map(|i| self.config.memory.read::<u32>(start + 4 * i).unwrap_or(0))
+                .collect();
+            map::record(host as usize, &code, start, &words);
+        }
         if let (Some(p), Some(started)) = (self.state.profile.as_deref_mut(), started) {
             p.translated(started.elapsed(), len / 4, code_bytes);
             if self.cache.generation() != generation {
