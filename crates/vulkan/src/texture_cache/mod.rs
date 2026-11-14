@@ -962,6 +962,7 @@ impl TextureCache {
             image.info.levels == 1 && image.info.layers == info.layers
         };
         if discard && whole {
+            self.flush_buffered(tx, found.id)?;
             let tick = self.tick;
             let image = self.image(found.id);
             image.cpu_dirty = false;
@@ -2155,6 +2156,9 @@ impl TextureCache {
     /// the last upload, then copies in what its aliases' GPU work wrote since.
     fn refresh(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
         if self.image(id).image.is_sparse() {
+            if self.image(id).cpu_dirty {
+                self.flush_buffered(tx, id)?;
+            }
             let tick = self.tick;
             let image = self.image(id);
             image.cpu_dirty = false;
@@ -2379,11 +2383,18 @@ impl TextureCache {
         Ok(())
     }
 
-    fn upload(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
+    /// Lands the bytes GPU work wrote to buffers over `id` in guest memory, so the image's own
+    /// texels, uploaded now or written back later, are the newer ones.
+    fn flush_buffered(&self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
         for segment in &self.get(id).expect("a live image id").segments {
             tx.buffers
                 .flush(tx.scheduler, segment.daddr, segment.size)?;
         }
+        Ok(())
+    }
+
+    fn upload(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
+        self.flush_buffered(tx, id)?;
         let device = self.device.clone();
         let Self {
             slots,

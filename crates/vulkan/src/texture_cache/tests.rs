@@ -2458,3 +2458,32 @@ fn copy_engine_reads_addressed_with_another_block_height_copy_in_software() {
     let (mut tx, cache, gmmu) = f.tx();
     assert!(!cache.copy_to_buffer(&mut tx, gmmu, &taller).unwrap());
 }
+
+#[test]
+fn full_clears_over_copy_engine_destinations_stay_newer_than_the_copy() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let (copy, _) = copy_engine_setup(&mut f);
+    let (mut tx, cache, gmmu) = f.tx();
+    assert!(cache.copy_to_buffer(&mut tx, gmmu, &copy).unwrap());
+    let info = pitch_target(128, 4);
+    clear_rt_at(
+        &mut f,
+        GPU_VA + (1 << 20),
+        &info,
+        [0.0, 0.0, 1.0, 1.0],
+        Rect::ALL,
+    );
+    let (mut tx, cache, _) = f.tx();
+    cache.flush(&mut tx, DADDR + (1 << 20), 512).unwrap();
+    f.buffers
+        .flush(&mut f.scheduler, DADDR + (1 << 20), 512)
+        .unwrap();
+    f.scheduler.finish().unwrap();
+    assert!(all_texels(
+        &guest_texels(&f, 1 << 20, 512),
+        [0, 0, 255, 255]
+    ));
+    f.assert_no_validation_errors();
+}
