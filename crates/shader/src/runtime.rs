@@ -82,7 +82,13 @@ pub struct RuntimeInfo {
     pub previous_stage_stores: VaryingState,
     pub previous_stage_legacy_stores_mapping: Vec<(crate::ir::Attribute, crate::ir::Attribute)>,
     pub per_primitive_generics: u32,
+    /// Last pre-rasterisation stage: generic outputs the fragment stage reads screen-linear.
+    /// They are written times Position.w, and the fragment stage reads them perspective-correct
+    /// times FragCoord.w, so a primitive clipped close to the camera interpolates them right.
     pub noperspective_outputs: u32,
+    /// Fragment stage: the previous stage writes its screen-linear inputs times Position.w, as
+    /// `noperspective_outputs` describes.
+    pub scaled_noperspective_inputs: bool,
     /// Remap depth from [-1, 1] to [0, 1] in the last pre-rasterisation stage.
     pub convert_depth_mode: bool,
     pub force_early_z: bool,
