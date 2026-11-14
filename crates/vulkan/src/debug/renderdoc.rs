@@ -8,7 +8,7 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use libloading::Library;
 
@@ -55,6 +55,9 @@ pub struct RenderDoc {
     /// Guest frames to capture, 1-based, sorted.
     frames: Vec<u64>,
     toggle: AtomicBool,
+    /// The renderer whose capture is running, 0 for none: a renderer still tearing down never
+    /// ends the capture of a newer one.
+    owner: AtomicU64,
     _library: Library,
 }
 
@@ -160,6 +163,7 @@ unsafe fn load(frames: Vec<u64>) -> Result<RenderDoc, String> {
         layer,
         frames,
         toggle: AtomicBool::new(false),
+        owner: AtomicU64::new(0),
         _library: library,
     })
 }
@@ -224,12 +228,20 @@ fn parse_frames(text: &str) -> Vec<u64> {
 }
 
 impl RenderDoc {
-    fn start(&self) {
+    fn start(&self, owner: u64) {
+        self.owner.store(owner, Ordering::Relaxed);
         // SAFETY: null device and window capture RenderDoc's active ones.
         unsafe { (self.api.start_frame_capture)(std::ptr::null_mut(), std::ptr::null_mut()) };
     }
 
-    fn end(&self, frames: (u64, u64)) {
+    fn end(&self, owner: u64, frames: (u64, u64)) {
+        if self
+            .owner
+            .compare_exchange(owner, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
         // SAFETY: as in `start`; a capture is running.
         let captured =
             unsafe { (self.api.end_frame_capture)(std::ptr::null_mut(), std::ptr::null_mut()) };
@@ -299,6 +311,7 @@ fn step(running: Option<Trigger>, toggled: bool, next_listed: bool) -> Step {
 /// The renderer's side of captures: counts guest presents and starts and ends captures there.
 pub(crate) struct FrameCapture {
     renderdoc: &'static RenderDoc,
+    id: u64,
     /// Guest frames presented so far.
     frame: u64,
     running: Option<(Trigger, u64)>,
@@ -306,13 +319,15 @@ pub(crate) struct FrameCapture {
 
 impl FrameCapture {
     pub(crate) fn new(renderdoc: &'static RenderDoc) -> Self {
+        static RENDERERS: AtomicU64 = AtomicU64::new(0);
         let mut capture = Self {
             renderdoc,
+            id: RENDERERS.fetch_add(1, Ordering::Relaxed) + 1,
             frame: 0,
             running: None,
         };
         if renderdoc.frames.first() == Some(&1) {
-            renderdoc.start();
+            renderdoc.start(capture.id);
             capture.running = Some((Trigger::Listed, 1));
         }
         capture
@@ -334,10 +349,10 @@ impl FrameCapture {
             && let Some((_, first)) = self.running.take()
         {
             flush();
-            self.renderdoc.end((first, self.frame));
+            self.renderdoc.end(self.id, (first, self.frame));
         }
         if let Some(trigger) = step.start {
-            self.renderdoc.start();
+            self.renderdoc.start(self.id);
             self.running = Some((trigger, next));
         }
     }
@@ -346,7 +361,7 @@ impl FrameCapture {
     /// file is written and the next session starts with none running.
     pub(crate) fn finish(&mut self) {
         if let Some((_, first)) = self.running.take() {
-            self.renderdoc.end((first, self.frame.max(first)));
+            self.renderdoc.end(self.id, (first, self.frame.max(first)));
         }
     }
 }
