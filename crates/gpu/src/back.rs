@@ -18,7 +18,7 @@ use crate::engines::kepler_compute::pcas::QmdScheduler;
 use crate::engines::{Engine, EngineContext, EngineFactory, EngineKind};
 use crate::gmmu::{Gmmu, RangeTarget};
 use crate::gpu::{MAX_POLL, MIN_POLL};
-use crate::host_releases::HostReleases;
+use crate::host_releases::{HostReleases, Pending};
 use crate::host1x::Syncpoints;
 use crate::ring::{Consumer, WRAP};
 use crate::stream::{FetchSync, FetchSyncs, MULTI_MAX_WORDS, REDUCTIONS, RELEASE_SIZES, tag};
@@ -434,7 +434,7 @@ impl Back {
         let mut words = [(0u32, 0u32); 16];
         let mut len = 0;
         let mut plain = true;
-        let mut any = false;
+        let mut known = false;
         channel.setup.memory.for_each_range(address, size, |range| {
             let RangeTarget::Device(daddr) = range.target else {
                 plain = false;
@@ -445,7 +445,7 @@ impl Back {
                 return;
             }
             let base = range.gpu_va - address;
-            any |= self.releases.pending(
+            match self.releases.pending(
                 landings,
                 daddr,
                 range.size,
@@ -456,10 +456,14 @@ impl Back {
                     }
                     len += 1;
                 },
-            );
+            ) {
+                Pending::Nothing => {}
+                Pending::Known => known = true,
+                Pending::Unknown => plain = false,
+            }
         });
         plain
-            && any
+            && known
             && len <= words.len()
             && self
                 .fetch_syncs
@@ -511,7 +515,7 @@ impl Back {
             return;
         };
         self.releases
-            .forget(self.syncpoints.semaphore_waiters().landings(), daddr, 8);
+            .reduce(self.syncpoints.semaphore_waiters().landings(), daddr);
         self.rasterizer.signal_fence(FenceAction::ReduceSemaphore {
             address: daddr,
             op,

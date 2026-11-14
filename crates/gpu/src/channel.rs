@@ -228,7 +228,7 @@ impl SemaphoreWaiters {
     /// stands in for the 64-bit word a wide acquire reads.
     #[inline]
     pub(crate) fn written(&self, device: &DeviceAddressSpace, address: DAddr, size: u64) {
-        self.landings.written(address, size);
+        self.landings.written(address);
         if self.count.load(Ordering::Acquire) == 0 {
             return;
         }
