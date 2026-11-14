@@ -1,13 +1,17 @@
 //! Events (`KEvent` with its readable and writable ends).
 
+use std::sync::OnceLock;
+
 use crate::resource_limit::Reservation;
 use crate::sync::SyncState;
+use crate::thread::ThreadId;
 
 /// An event. Services hold an `Arc<Event>` and signal it from any host thread; the guest waits
 /// on its readable end.
 #[derive(Default)]
 pub struct Event {
     sync: SyncState,
+    origin: OnceLock<Box<str>>,
     observer: Option<Box<dyn Fn() + Send + Sync>>,
     _reservation: Option<Reservation>,
 }
@@ -42,6 +46,14 @@ impl Event {
         }
     }
 
+    /// Signals the event from a guest thread (`SignalEvent`).
+    pub(crate) fn signal_from_guest(&self, thread: ThreadId) {
+        self.sync.signal_from_guest(thread);
+        if let Some(observer) = &self.observer {
+            observer();
+        }
+    }
+
     /// Clears the signal (`ClearEvent`).
     pub fn clear(&self) {
         self.sync.reset();
@@ -58,5 +70,16 @@ impl Event {
 
     pub(crate) fn sync_state(&self) -> &SyncState {
         &self.sync
+    }
+
+    /// Where the guest got the event (`svcCreateEvent` or the service command that returned it),
+    /// once known.
+    pub(crate) fn origin(&self) -> Option<&str> {
+        self.origin.get().map(|origin| &**origin)
+    }
+
+    /// Records where the guest got the event, unless it is already known.
+    pub(crate) fn note_origin(&self, origin: impl FnOnce() -> String) {
+        self.origin.get_or_init(|| origin().into());
     }
 }
