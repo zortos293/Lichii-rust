@@ -1,6 +1,6 @@
 //! Guest threads.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use lichii_common::{ResultCode, VAddr};
@@ -88,6 +88,9 @@ pub(crate) struct Sched {
     /// Pinned to its core by an interrupt that found preemption disabled; it keeps the core until
     /// `svcSynchronizePreemptionState`.
     pub pinned: bool,
+    /// Its TLS slot and thread count went back to the process: no handle refers to it and it
+    /// never runs again.
+    pub finalized: bool,
 }
 
 /// Held while a process changes its mutex ownership links (`lock_waiters`, `lock_owner`) and the
@@ -109,6 +112,8 @@ pub struct Thread {
     pub(crate) context: Mutex<ThreadContext>,
     pub(crate) sched: Mutex<Sched>,
     wait_token: AtomicU64,
+    /// Handle-table entries that refer to the thread.
+    handles: AtomicUsize,
     pub(crate) sync: SyncState,
     /// Threads waiting for mutexes this thread owns; they lend it their priority.
     lock_waiters: Mutex<Vec<LockWaiter>>,
@@ -174,8 +179,10 @@ impl Thread {
                 cancel_pending: false,
                 terminate_requested: false,
                 pinned: false,
+                finalized: false,
             }),
             wait_token: AtomicU64::new(0),
+            handles: AtomicUsize::new(0),
             sync: SyncState::default(),
             lock_waiters: Mutex::default(),
             lock_owner: Mutex::default(),
@@ -425,6 +432,35 @@ impl Thread {
 
     pub fn set_context(&self, context: ThreadContext) {
         *self.context.lock() = context;
+    }
+
+    /// Counts a handle-table entry that refers to the thread.
+    pub(crate) fn open_handle(&self) {
+        self.handles.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Drops a handle-table entry that referred to the thread.
+    pub(crate) fn close_handle(&self) {
+        if self.handles.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.finalize_if_unreferenced();
+        }
+    }
+
+    /// Gives the TLS slot and the thread count back to the process once no handle refers to the
+    /// thread and it is not running (never started, or exited), as Horizon's `KThread::Finalize`
+    /// does. Freeing them at exit instead would hand a new thread the slot of one whose handle
+    /// is still open.
+    pub(crate) fn finalize_if_unreferenced(&self) {
+        let mut s = self.sched.lock();
+        if s.finalized
+            || self.handles.load(Ordering::SeqCst) != 0
+            || !matches!(s.state, ThreadState::Created | ThreadState::Terminated)
+        {
+            return;
+        }
+        s.finalized = true;
+        drop(s);
+        crate::svc::release_thread_resources(self);
     }
 
     /// Whether the thread terminated. Threads are signalled when they exit.

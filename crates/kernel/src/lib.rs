@@ -826,7 +826,7 @@ impl KernelInner {
         thread.mark_terminated();
         self.scheduler.clear_running(core);
         thread.sync.signal();
-        svc::release_thread_resources(thread);
+        thread.finalize_if_unreferenced();
         let process = thread.process();
         if process.remove_thread(thread) {
             process.finalize();

@@ -48,6 +48,9 @@ pub(super) fn create_thread(svc: &mut SvcContext) -> Flow {
 pub(super) fn start_thread(svc: &mut SvcContext) -> Flow {
     let result = svc.typed::<Thread>(svc.arg32(0)).and_then(|thread| {
         let mut s = thread.sched.lock();
+        if s.finalized {
+            return Err(result::INVALID_HANDLE);
+        }
         if s.state != ThreadState::Created {
             return Err(result::INVALID_STATE);
         }
@@ -285,7 +288,7 @@ pub(super) fn get_thread_context3(svc: &mut SvcContext) -> Flow {
     svc.finish(result)
 }
 
-pub(crate) fn release_thread_resources(thread: &Arc<Thread>) {
+pub(crate) fn release_thread_resources(thread: &Thread) {
     let process = thread.process();
     process.page_table().free_tls(thread.tls_address());
     process
