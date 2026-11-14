@@ -224,9 +224,11 @@ fn ensure(
 
 impl TextureCache {
     /// Brings `id` up to date with `newer`, the overlaps modified after it last held the
-    /// shared bytes, on the GPU. Returns false, having recorded nothing, when the pass can't
-    /// move one of the images or `id` must take guest memory as it is (the CPU wrote it, or
-    /// removed overlaps left their texels only there).
+    /// shared bytes, on the GPU. What the guest CPU wrote into `id` or an overlap since its
+    /// last upload is uploaded first, so the pass moves the CPU's bytes along with the GPU's.
+    /// Returns false, having recorded nothing, when the pass can't move one of the images, an
+    /// overlap the CPU wrote is stale itself, or removed overlaps left their texels only in
+    /// guest memory.
     pub(super) fn sync_on_gpu(
         &mut self,
         tx: &mut Transfer<'_>,
@@ -235,15 +237,13 @@ impl TextureCache {
     ) -> Result<bool> {
         let image = self.get(id).expect("a live image id");
         let movable = |o: &CachedImage| {
-            !o.cpu_dirty
-                && o.keep_out.is_empty()
-                && o.info.size_bytes() < 1 << 31
-                && packing(o).is_some()
+            o.keep_out.is_empty() && o.info.size_bytes() < 1 << 31 && packing(o).is_some()
         };
         if !movable(image)
-            || newer
-                .iter()
-                .any(|&o| !movable(self.get(o).expect("overlaps are live")))
+            || newer.iter().any(|&o| {
+                let overlap = self.get(o).expect("overlaps are live");
+                !movable(overlap) || overlap.cpu_dirty && self.stale(o)
+            })
         {
             return Ok(false);
         }
@@ -279,6 +279,14 @@ impl TextureCache {
         }
         if window.0 >= window.1 {
             return Ok(false);
+        }
+        for &o in newer.iter() {
+            if self.image(o).cpu_dirty {
+                self.refresh(tx, o)?;
+            }
+        }
+        if self.image(id).cpu_dirty {
+            self.take_cpu_writes(tx, id)?;
         }
         newer.sort_by_key(|&o| self.get(o).map_or(0, |o| o.modified));
         let mut linear = 4;
