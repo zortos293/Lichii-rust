@@ -599,8 +599,26 @@ impl VulkanRasterizer {
         if !self.graphics_stages(ctx, host_topology) {
             return Ok(());
         }
+        {
+            let hash_of = |stage: ShaderStage| {
+                self.draw
+                    .stages
+                    .iter()
+                    .flatten()
+                    .find(|m| m.stage == stage)
+                    .map_or(0, |m| m.hash)
+            };
+            if diag::skip_fs().contains(&hash_of(ShaderStage::Fragment))
+                || diag::skip_vs().contains(&hash_of(ShaderStage::VertexB))
+            {
+                return Ok(());
+            }
+        }
         if !self.render_targets(ctx)? {
             return Ok(());
+        }
+        if diag::with(|d| d.begin()) == Some(true) {
+            self.diag_draw_state(ctx, call);
         }
 
         let draw = &mut self.draw;
@@ -610,8 +628,11 @@ impl VulkanRasterizer {
         let colors: [vk::Format; 8] = draw
             .colors
             .map(|t| t.map_or(vk::Format::UNDEFINED, |t| t.format));
-        let samples =
-            mvk::sample_count(regs.anti_alias_samples_mode).unwrap_or(vk::SampleCountFlags::TYPE_1);
+        let samples = if diag::samples1() {
+            vk::SampleCountFlags::TYPE_1
+        } else {
+            mvk::sample_count(regs.anti_alias_samples_mode).unwrap_or(vk::SampleCountFlags::TYPE_1)
+        };
         let attachments = AttachmentState::new(
             &colors,
             draw.depth.map_or(vk::Format::UNDEFINED, |t| t.format),
@@ -619,6 +640,7 @@ impl VulkanRasterizer {
         );
         let key = GraphicsPipelineKey::new(&draw.stages, attachments, &fixed);
         let Some(pipeline) = draw.pipelines.graphics(&key, &draw.stages) else {
+            diag::with(|d| d.finish("no-pipeline"));
             return Ok(());
         };
         let pipeline_raw = pipeline.raw();
@@ -642,6 +664,7 @@ impl VulkanRasterizer {
             self.draw.image_scaling = ScalingBits::default();
             self.draw.storage_images.clear();
             self.draw.texel_views.clear();
+            diag::append(|l| l.push_str(" |BIND"));
             for &(slot, host) in &GRAPHICS_SLOTS {
                 let Some(module) = self.draw.stages[host].clone() else {
                     continue;
@@ -709,8 +732,10 @@ impl VulkanRasterizer {
             }
         };
         if index.is_some_and(|i: IndexBinding| i.index_count == 0) {
+            diag::with(|d| d.finish("zero-index"));
             return Ok(());
         }
+        diag::with(|d| d.finish("ok"));
         let set = self.descriptor_set(set_layout)?;
 
         let task = self.draw.stages[0]
@@ -1243,6 +1268,14 @@ impl VulkanRasterizer {
                             } else {
                                 self.texture_view(src, raw, desc.ty)?
                             };
+                            self.diag_texture(
+                                module,
+                                src,
+                                b.descriptor,
+                                i,
+                                raw,
+                                texture.map(|t| t.0),
+                            );
                             let scale = texture
                                 .and_then(|(id, _)| self.texture_cache.state(id))
                                 .map_or(ResolutionScale::X1, |s| s.scale);
@@ -1671,6 +1704,14 @@ impl VulkanRasterizer {
         } else {
             [0; 8]
         };
+        let mut words = words;
+        diag::append(|l| {
+            let _ = std::fmt::Write::write_fmt(l, format_args!(" tsc[{index}]={words:08x?}"));
+        });
+        if diag::lod0() {
+            words[1] &= !(0x1fff << 12);
+            words[2] = (words[2] & !0xff_ffff) | (0xfff << 12);
+        }
         let key = (words, self.draw.anisotropy as u8);
         if let Some(&sampler) = self.draw.samplers.get(&key) {
             return Ok(sampler);
@@ -2217,8 +2258,10 @@ impl VulkanRasterizer {
                     .cmd_set_logic_op_enable(cmd, features.logic_op && regs.logic_op.enable != 0);
             }
             if features.dynamic_alpha_to_coverage {
-                draw.eds3
-                    .cmd_set_alpha_to_coverage_enable(cmd, alpha.alpha_to_coverage() != 0);
+                draw.eds3.cmd_set_alpha_to_coverage_enable(
+                    cmd,
+                    alpha.alpha_to_coverage() != 0 && !diag::no_a2c(),
+                );
             }
             if features.dynamic_alpha_to_one {
                 draw.eds3.cmd_set_alpha_to_one_enable(
@@ -2521,6 +2564,7 @@ fn storage_pointer(
 }
 
 mod assembly;
+pub(super) mod diag;
 mod dispatch_grid;
 mod frame_decode;
 mod mesh_indirect;

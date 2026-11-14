@@ -284,7 +284,10 @@ impl VulkanRasterizer {
             texture_cache,
             live: None,
             activity: Activity::default(),
-            frame_dump: frame_dump::FrameDump::from_env(),
+            frame_dump: {
+                draw::diag::init();
+                frame_dump::FrameDump::from_env()
+            },
         })
     }
 
@@ -1220,6 +1223,7 @@ impl Rasterizer for VulkanRasterizer {
         if let Err(error) = result {
             tracing::error!(%error, "presenting a guest frame failed");
         }
+        draw::diag::with(|d| d.event(&format!("PRESENT addr={:#x}", framebuffer.address)));
         if let Some(path) = self
             .frame_dump
             .as_mut()
