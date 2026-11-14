@@ -234,6 +234,9 @@ impl RenderDoc {
             .compare_exchange(0, owner, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
         {
+            tracing::warn!(
+                "RenderDoc: a stopping renderer still holds a capture; skipped this one"
+            );
             return false;
         }
         // SAFETY: null device and window capture RenderDoc's active ones.
