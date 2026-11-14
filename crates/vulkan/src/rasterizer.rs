@@ -7,6 +7,7 @@
 //! dispatches (see [`draw`]).
 
 mod draw;
+mod frame_dump;
 mod samples;
 
 use std::collections::VecDeque;
@@ -27,8 +28,8 @@ use lichii_gpu::backend::{
 use lichii_gpu::engines::maxwell_3d::Regs;
 use lichii_gpu::engines::maxwell_3d::regs::NUM_RENDER_TARGETS;
 use lichii_gpu::gmmu::Gmmu;
-use lichii_texture::block_linear::{GobLayout, Tiling};
-use lichii_texture::{Aspect, Numeric};
+use lichii_texture::block_linear::{GobLayout, Tiling, unswizzle};
+use lichii_texture::{Aspect, Numeric, PixelFormat};
 
 use crate::buffer_cache::{BufferBinding, BufferCache, BufferCacheStats};
 use crate::commands::{COLOR_RANGE, ImageAccess, transition};
@@ -111,6 +112,7 @@ pub struct VulkanRasterizer {
     draw: draw::DrawState,
     live: Option<Arc<LiveSettings>>,
     activity: Activity,
+    frame_dump: Option<frame_dump::FrameDump>,
 }
 
 /// Work that runs once the host GPU finished everything recorded before it.
@@ -263,6 +265,7 @@ impl VulkanRasterizer {
             texture_cache,
             live: None,
             activity: Activity::default(),
+            frame_dump: frame_dump::FrameDump::from_env(),
         })
     }
 
@@ -725,6 +728,54 @@ impl VulkanRasterizer {
         Ok(index)
     }
 
+    /// Writes the guest framebuffer `fb` to `path` as a BMP, after writing back what the GPU
+    /// rendered into it.
+    fn dump_frame(&mut self, fb: &FramebufferConfig, path: &Path) -> std::io::Result<()> {
+        let rgba = match fb.format {
+            PixelFormat::A8B8G8R8Unorm | PixelFormat::A8B8G8R8Srgb => true,
+            PixelFormat::B8G8R8A8Unorm | PixelFormat::B8G8R8A8Srgb => false,
+            format => {
+                return Err(std::io::Error::other(format!(
+                    "{format:?} frames are not dumped"
+                )));
+            }
+        };
+        let tiling = fb.block_height_log2.map(|block_height_log2| {
+            Tiling::new(
+                fb.width,
+                fb.height,
+                1,
+                4,
+                block_height_log2,
+                0,
+                fb.gob_layout,
+            )
+        });
+        let size = tiling.map_or(fb.stride as usize * fb.height as usize, |t| t.size_bytes());
+        let mut tx = Transfer {
+            scheduler: &mut self.scheduler,
+            staging: &mut self.staging,
+            memory: &self.handles.device,
+        };
+        self.texture_cache
+            .flush(&mut tx, fb.address, size as u64)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let mut guest = vec![0; size];
+        self.handles
+            .device
+            .read_bytes(fb.address, &mut guest)
+            .map_err(|fault| std::io::Error::other(format!("{fault:?}")))?;
+        let (texels, pitch) = match tiling {
+            Some(tiling) => {
+                let mut linear = vec![0; tiling.linear_size_bytes()];
+                unswizzle(&tiling, &guest, &mut linear);
+                (linear, fb.width as usize * 4)
+            }
+            None => (guest, fb.stride as usize),
+        };
+        frame_dump::write_bmp(path, fb.width, fb.height, pitch, &texels, rgba)
+    }
+
     fn upload_frame(&mut self, fb: &FramebufferConfig) -> Result<()> {
         let info = fb.format.info();
         let host = host_format(&self.device, fb.format, AstcRecompression::Uncompressed);
@@ -1117,6 +1168,14 @@ impl Rasterizer for VulkanRasterizer {
         };
         if let Err(error) = result {
             tracing::error!(%error, "presenting a guest frame failed");
+        }
+        if let Some(path) = self
+            .frame_dump
+            .as_mut()
+            .and_then(frame_dump::FrameDump::due)
+            && let Err(error) = self.dump_frame(framebuffer, &path)
+        {
+            tracing::warn!(%error, ?path, "dumping a frame failed");
         }
         self.release_fences(false);
         let mut tx = Transfer {
