@@ -25,6 +25,7 @@ pub(in crate::rasterizer) struct Probe {
     values: HashMap<String, Vec<u8>>,
     pub(super) frame: u64,
     draws: u64,
+    window: (Instant, Duration, Duration),
 }
 
 impl Probe {
@@ -49,6 +50,11 @@ impl Probe {
             values: HashMap::new(),
             frame: 0,
             draws: 0,
+            window: (
+                Instant::now(),
+                secs("LICHII_PROBE_FROM", 0),
+                secs("LICHII_PROBE_TO", u64::MAX / 4),
+            ),
         })
     }
 
@@ -107,7 +113,11 @@ impl Probe {
             self.frame += 1;
             self.collecting = false;
         }
+        let (start, from, to) = self.window;
+        let now = start.elapsed();
         if self.dir.is_some()
+            && now >= from
+            && now <= to
             && self
                 .last
                 .is_none_or(|t| t.elapsed() >= Duration::from_secs(2))
@@ -163,4 +173,13 @@ fn show(value: &[u8], format: vk::Format) -> String {
         }
         _ => value.iter().map(|b| format!("{b:02x}")).collect(),
     }
+}
+
+fn secs(name: &str, default: u64) -> Duration {
+    Duration::from_secs(
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default),
+    )
 }
