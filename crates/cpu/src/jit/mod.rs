@@ -465,6 +465,20 @@ impl Jit {
         let mapped = map::enabled().then(|| compiled.code.clone());
         let generation = self.cache.generation();
         let entry = self.cache.insert(start, len, Ok(compiled));
+        static DELAY: std::sync::LazyLock<Option<std::time::Duration>> =
+            std::sync::LazyLock::new(|| {
+                std::env::var("LICHII_JIT_DELAY_US")
+                    .ok()?
+                    .parse()
+                    .ok()
+                    .map(std::time::Duration::from_micros)
+            });
+        if let Some(delay) = *DELAY {
+            let until = std::time::Instant::now() + delay;
+            while std::time::Instant::now() < until {
+                std::hint::spin_loop();
+            }
+        }
         if let (Some(code), cache::Code::Native(host)) = (mapped, entry.code) {
             let words: Vec<u32> = (0..len / 4)
                 .map(|i| self.config.memory.read::<u32>(start + 4 * i).unwrap_or(0))
