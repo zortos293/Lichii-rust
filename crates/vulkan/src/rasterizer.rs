@@ -494,6 +494,14 @@ impl VulkanRasterizer {
                 && host.conversion == Conversion::None
                 && order(source.swizzle) == order(host.swizzle)
                 && state.info.format.bytes_per_block() == fb.format.bytes_per_block());
+        let same_format = same_format && std::env::var_os("LICHII_DIAG_PRESENT_BLIT").is_none();
+        {
+            static LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+            let key = i64::from(state.format.as_raw()) << 32 | i64::from(host.format.as_raw());
+            if LAST.swap(key, std::sync::atomic::Ordering::Relaxed) != key {
+                tracing::info!(image = ?state.format, guest = ?state.info.format, frame = ?host.format, fb = ?fb.format, copy = same_format, "LIRU14 present_cached");
+            }
+        }
         if !same_format
             && !(self.device.format_features(state.format).contains(blit)
                 && self.device.format_features(host.format).contains(blit))

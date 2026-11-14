@@ -5,7 +5,7 @@ use lichii_gpu::backend::{CopySurface, ImageCopy};
 use lichii_gpu::gmmu::BigPageSize;
 use lichii_memory::PhysicalMemory;
 use lichii_texture::block_linear::{SurfaceLayout, Tiling};
-use lichii_texture::tic::TicEntry;
+use lichii_texture::tic::{TextureType, TicEntry};
 use lichii_texture::{Compression, astc, bcn, etc};
 
 use super::*;
