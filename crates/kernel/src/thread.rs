@@ -114,6 +114,8 @@ pub struct Thread {
     lock_waiters: Mutex<Vec<LockWaiter>>,
     /// The owner of the mutex this thread waits for.
     lock_owner: Mutex<LockOwner>,
+    /// diag: the last supervisor call (imm << 32 | w0).
+    pub(crate) last_svc: AtomicU64,
 }
 
 /// Link from a waiter to the owner it lends its priority to, for the waiter's wait `token`.
@@ -179,6 +181,7 @@ impl Thread {
             sync: SyncState::default(),
             lock_waiters: Mutex::default(),
             lock_owner: Mutex::default(),
+            last_svc: AtomicU64::new(0),
         })
     }
 

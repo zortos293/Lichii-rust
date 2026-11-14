@@ -310,7 +310,29 @@ impl System {
             return;
         }
         let started = Instant::now();
-        match self.exit.wait(Some(timeout)) {
+        let mut dumped_request = false;
+        let mut exiting_since: Option<Instant> = None;
+        let mut dumped_exiting = false;
+        while self.exit.wait(Some(Duration::from_millis(50))).is_none()
+            && started.elapsed() < timeout
+        {
+            if !dumped_request && started.elapsed() >= Duration::from_secs(1) {
+                dumped_request = true;
+                tracing::info!("diag exit: 1 s after the exit request; logging every thread");
+                self.kernel.log_threads();
+            }
+            if self.process.state() == lichii_kernel::process::ProcessState::Exiting {
+                let since = *exiting_since.get_or_insert_with(Instant::now);
+                if !dumped_exiting && since.elapsed() >= Duration::from_millis(200) {
+                    dumped_exiting = true;
+                    tracing::info!(
+                        "diag exit: still exiting 200 ms after termination; logging every thread"
+                    );
+                    self.kernel.log_threads();
+                }
+            }
+        }
+        match self.exit.wait(Some(Duration::ZERO)) {
             Some(_) => tracing::info!(took = ?started.elapsed(), "the title exited on request"),
             None => tracing::warn!(?timeout, "the title did not exit on request; stopping it"),
         }

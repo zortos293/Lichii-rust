@@ -147,6 +147,10 @@ impl SvcContext<'_> {
 }
 
 pub(crate) fn dispatch(svc: &mut SvcContext, imm: u32) -> Flow {
+    svc.thread.last_svc.store(
+        (u64::from(imm) << 32) | (svc.ctx.x[0] & 0xffff_ffff),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     if !svc.kernel.svc_trace {
         return call(svc, imm);
     }

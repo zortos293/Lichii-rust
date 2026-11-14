@@ -415,6 +415,11 @@ impl Kernel {
         self.0.scheduler.is_paused()
     }
 
+    /// diag: logs every thread.
+    pub fn log_threads(&self) {
+        self.0.log_thread_states();
+    }
+
     /// Asks every thread of `process` to terminate.
     pub fn terminate_process(&self, process: &Arc<Process>) {
         self.0.terminate_process(process);
@@ -486,10 +491,27 @@ impl KernelInner {
         for process in processes {
             for thread in process.threads() {
                 let waits_on = waits.get(&thread.id()).map(String::as_str);
+                let last = thread.last_svc.load(Ordering::Relaxed);
+                let (imm, w0) = ((last >> 32) as u32, last as u32);
+                let mut request = String::new();
+                if imm == 0x21 {
+                    let session = match process.handles().read().get(w0) {
+                        Some(KObject::ClientSession(session)) => session.name(),
+                        _ => "?".into(),
+                    };
+                    let mut words = [0u32; 16];
+                    for (i, word) in words.iter_mut().enumerate() {
+                        *word = process
+                            .memory()
+                            .read::<u32>(thread.tls_address() + 4 * i as u64)
+                            .unwrap_or(0);
+                    }
+                    request = format!(" request={session} tls={words:x?}");
+                }
                 tracing::info!(
                     target: "threads",
                     process = process.name(),
-                    "{}",
+                    "{} last_svc={imm:#x}({w0:#x}){request}",
                     thread.describe(waits_on)
                 );
             }
@@ -786,6 +808,10 @@ impl KernelInner {
     }
 
     pub(crate) fn terminate_process(&self, process: &Arc<Process>) {
+        tracing::info!(
+            threads = process.threads().len(),
+            "diag exit: terminating the process"
+        );
         process.set_state(ProcessState::Exiting);
         for thread in process.threads() {
             thread.request_termination();
@@ -822,6 +848,13 @@ impl KernelInner {
 
     /// Called on the core that ran the thread when it exits.
     pub(crate) fn exit_thread(&self, core: usize, thread: &Arc<Thread>) {
+        if thread.process().state() == ProcessState::Exiting {
+            tracing::info!(
+                thread = thread.id(),
+                core,
+                "diag exit: thread exited after the termination request"
+            );
+        }
         thread.mark_terminated();
         self.scheduler.clear_running(core);
         thread.sync.signal();
