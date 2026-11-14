@@ -341,6 +341,14 @@ impl FrameCapture {
             self.running = Some((trigger, next));
         }
     }
+
+    /// Ends a running capture when the renderer stops, once its work finished, so the capture
+    /// file is written and the next session starts with none running.
+    pub(crate) fn finish(&mut self) {
+        if let Some((_, first)) = self.running.take() {
+            self.renderdoc.end((first, self.frame.max(first)));
+        }
+    }
 }
 
 #[cfg(test)]

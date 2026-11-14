@@ -1471,6 +1471,9 @@ impl Drop for VulkanRasterizer {
         if self.scheduler.finish().is_err() {
             self.device.wait_idle();
         }
+        if let Some(capture) = &mut self.capture {
+            capture.finish();
+        }
         self.draw.destroy(&self.device);
         self.samples.destroy(&self.device);
         // SAFETY: each field is taken once, here, and never used again; the GPU is idle.
