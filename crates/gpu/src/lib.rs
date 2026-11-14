@@ -25,6 +25,7 @@ pub mod pushbuffer;
 mod ring;
 pub mod semaphore_mirror;
 mod stream;
+pub mod throttle;
 mod written_pages;
 
 #[cfg(test)]

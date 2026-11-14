@@ -27,6 +27,7 @@ use lichii_gpu::backend::{
 use lichii_gpu::engines::maxwell_3d::Regs;
 use lichii_gpu::engines::maxwell_3d::regs::NUM_RENDER_TARGETS;
 use lichii_gpu::gmmu::Gmmu;
+use lichii_gpu::throttle::Throttle;
 use lichii_texture::block_linear::{GobLayout, Tiling};
 use lichii_texture::{Aspect, Numeric};
 
@@ -920,7 +921,14 @@ impl Rasterizer for VulkanRasterizer {
 
     fn query(&mut self, _channel: ChannelId, memory: &Gmmu, query: &Query) {
         let Some(address) = memory.translate(query.address) else {
-            tracing::warn!(address = query.address, "query to unmapped GPU memory");
+            static UNMAPPED: Throttle = Throttle::new();
+            if let Some(dropped) = UNMAPPED.allow() {
+                tracing::warn!(
+                    address = query.address,
+                    dropped,
+                    "query to unmapped GPU memory"
+                );
+            }
             return;
         };
         let value = match query.kind {
