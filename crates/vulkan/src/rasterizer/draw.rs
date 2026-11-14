@@ -389,6 +389,14 @@ fn compare_function(regs: &Regs) -> CompareFunction {
     }
 }
 
+/// The components of each colour output the fragment program writes, as RGBA bits. The guest
+/// leaves the others untouched, while Vulkan writes undefined values, so they are masked out.
+fn fragment_output_components(stages: &GraphicsShaders) -> [u8; 8] {
+    stages[4]
+        .as_ref()
+        .map_or([0; 8], |fragment| fragment.info.frag_color_components)
+}
+
 fn input_topology(topology: vk::PrimitiveTopology) -> InputTopology {
     use vk::PrimitiveTopology as T;
     match topology {
@@ -604,9 +612,13 @@ impl VulkanRasterizer {
         }
 
         let draw = &mut self.draw;
-        let fixed = *draw
+        let mut fixed = *draw
             .fixed
             .refresh(regs, ctx.dirty, assembled_topology(call.topology()));
+        let outputs = fragment_output_components(&draw.stages);
+        for (blend, components) in fixed.blend.iter_mut().zip(outputs) {
+            blend.write_mask &= components;
+        }
         let colors: [vk::Format; 8] = draw
             .colors
             .map(|t| t.map_or(vk::Format::UNDEFINED, |t| t.format));
@@ -2142,10 +2154,12 @@ impl VulkanRasterizer {
                 draw.blend_equations.clear();
                 draw.write_masks.clear();
                 let common = regs.color_mask_common != 0;
+                let outputs = fragment_output_components(&draw.stages);
                 for index in 0..attachments as usize {
                     let mask = regs.color_mask[if common { 0 } else { index }];
                     draw.write_masks.push(vk::ColorComponentFlags::from_raw(
-                        mask.r() | mask.g() << 1 | mask.b() << 2 | mask.a() << 3,
+                        (mask.r() | mask.g() << 1 | mask.b() << 2 | mask.a() << 3)
+                            & u32::from(outputs[index]),
                     ));
                     let b = &regs.blend;
                     let t = &regs.blend_per_target[index];
