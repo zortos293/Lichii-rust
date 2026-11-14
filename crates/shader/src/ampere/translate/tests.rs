@@ -566,3 +566,34 @@ fn random_task_and_mesh_programs_compile_to_valid_spirv() {
         );
     }
 }
+
+#[test]
+#[ignore]
+fn diag_dump_ir_of_file() {
+    let bytes = std::fs::read(std::env::var("DUMP").unwrap()).unwrap();
+    let stage = match std::env::var("STAGE").as_deref() {
+        Ok("compute") => ShaderStage::Compute,
+        _ => ShaderStage::VertexB,
+    };
+    let code: Vec<Instruction> = bytes[0x80..]
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .map(|c| Instruction(u128::from_le_bytes(*c)))
+        .collect();
+    let mut env = TestEnv::new(&code);
+    env.stage = stage;
+    for (i, w) in bytes[..0x50].as_chunks::<4>().0.iter().enumerate() {
+        env.header[i] = u32::from_le_bytes(*w);
+    }
+    let profile = Profile::default();
+    let host = HostTranslateInfo::default();
+    let options = TranslateOptions {
+        profile: &profile,
+        host: &host,
+        resolution_scale: ResolutionScale::X1,
+    };
+    let ir = crate::translate::translate(&env, options).unwrap().ir.dump();
+    println!("{ir}");
+}
+
