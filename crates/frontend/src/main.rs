@@ -96,7 +96,11 @@ fn main() -> ExitCode {
         cli,
         event_loop.create_proxy(),
     );
-    match event_loop.run_app(&mut app) {
+    let result = event_loop.run_app(&mut app);
+    tracing::info!("diag close: event loop returned");
+    drop(app);
+    tracing::info!("diag close: app dropped");
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("lichii: {e}");

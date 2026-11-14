@@ -1182,7 +1182,10 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let consumed = response.is_some_and(|r| r.consumed);
         match event {
-            WindowEvent::CloseRequested => self.exit_requested = true,
+            WindowEvent::CloseRequested => {
+                tracing::info!("diag close: CloseRequested");
+                self.exit_requested = true
+            }
             WindowEvent::Resized(size) => {
                 let ui = &mut self.settings.ui;
                 ui.window_maximized = window.is_maximized();
@@ -1250,7 +1253,10 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        tracing::info!("diag close: exiting, dropping the session");
         self.session = None;
+        tracing::info!("diag close: session dropped");
         self.save_settings();
+        tracing::info!("diag close: settings saved");
     }
 }
