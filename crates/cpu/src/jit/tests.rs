@@ -2039,6 +2039,160 @@ fn zero_factor_products_stay_native() {
     }
 }
 
+/// Values at the FZ flush boundary: normals whose sums and products are tiny, exactly the
+/// smallest normal or just above it, values at and just below the floor of a native sum's inputs
+/// (2^-103 and 2^-970), subnormals and zeros.
+const FZ_S: [u32; 12] = [
+    0x0c00_0000,
+    0x0c00_0001,
+    0x8bff_ffff,
+    0x0080_0001,
+    0x0080_0000,
+    0x8080_0000,
+    0x0100_0000,
+    0x3f7f_ffff,
+    0x3f00_0000,
+    0x0000_0001,
+    0x8000_0000,
+    0x4000_0000,
+];
+
+const FZ_D: [u64; 12] = [
+    0x0350_0000_0000_0000,
+    0x0350_0000_0000_0001,
+    0x834f_ffff_ffff_ffff,
+    0x0010_0000_0000_0001,
+    0x0010_0000_0000_0000,
+    0x8010_0000_0000_0000,
+    0x0020_0000_0000_0000,
+    0x3fef_ffff_ffff_ffff,
+    0x3fe0_0000_0000_0000,
+    1,
+    0x8000_0000_0000_0000,
+    0x4000_0000_0000_0000,
+];
+
+/// Under FPCR.FZ, the checked FP ops on every pair of values at the flush boundary: a tiny sum or
+/// product of normal inputs is flushed with UFC, a subnormal input is flushed with IDC, and a sum
+/// of exactly the smallest normal stays as it is.
+#[test]
+fn flush_to_zero_boundaries_match_the_interpreter() {
+    const SCALAR: [u32; 8] = [
+        0x1e22_2820, // fadd s0, s1, s2
+        0x1e22_3820, // fsub s0, s1, s2
+        0x1e22_0820, // fmul s0, s1, s2
+        0x1e22_1820, // fdiv s0, s1, s2
+        0x1f02_0c20, // fmadd s0, s1, s2, s3
+        0x1e22_2020, // fcmp s1, s2
+        0x1e22_4820, // fmax s0, s1, s2
+        0x1e38_0020, // fcvtzs w0, s1
+    ];
+    const S_VECTOR: [u32; 7] = [
+        0x4e22_d420, // fadd v0.4s, v1.4s, v2.4s
+        0x4ea2_d420, // fsub v0.4s, v1.4s, v2.4s
+        0x6e22_d420, // faddp v0.4s, v1.4s, v2.4s
+        0x6e22_dc20, // fmul v0.4s, v1.4s, v2.4s
+        0x4e22_cc20, // fmla v0.4s, v1.4s, v2.4s
+        0x4fa2_9820, // fmul v0.4s, v1.4s, v2.s[3]
+        0x6e22_e420, // fcmge v0.4s, v1.4s, v2.4s
+    ];
+    const D_VECTOR: [u32; 4] = [
+        0x4e62_d420, // fadd v0.2d, v1.2d, v2.2d
+        0x6e62_dc20, // fmul v0.2d, v1.2d, v2.2d
+        0x4e62_cc20, // fmla v0.2d, v1.2d, v2.2d
+        0x4fc2_9820, // fmul v0.2d, v1.2d, v2.d[1]
+    ];
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    let s_values: Vec<u64> = FZ_S.iter().map(|&s| s as u64).collect();
+    let d_scalar: Vec<u32> = SCALAR.iter().map(|&op| op | 1 << 22).collect();
+    for (ops, values, bits) in [
+        (SCALAR.as_slice(), s_values.as_slice(), 32),
+        (&d_scalar, FZ_D.as_slice(), 64),
+        (&S_VECTOR, s_values.as_slice(), 32),
+        (&D_VECTOR, FZ_D.as_slice(), 64),
+    ] {
+        let len = values.len();
+        let vector = |f: &dyn Fn(usize) -> usize| {
+            (0..128 / bits).fold(0u128, |v, k| v | (values[f(k) % len] as u128) << (bits * k))
+        };
+        for &op in ops {
+            for i in 0..len {
+                for j in 0..len {
+                    for fpsr in [0, 0x10] {
+                        let mut ctx = ThreadContext {
+                            pc: CODE,
+                            fpcr: 1 << 24,
+                            fpsr,
+                            ..Default::default()
+                        };
+                        ctx.v[0] = vector(&|k| i * 7 + j + k);
+                        ctx.v[1] = vector(&|k| i + k);
+                        ctx.v[2] = vector(&|k| j + 5 * k);
+                        ctx.v[3] = vector(&|k| i + j + 3 * k);
+                        compare(machines, &[op, BRK], &ctx, &data);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Under FPCR.FZ with FPSR.IXC set, checked FP ops on normal inputs never take their slow path,
+/// even where a lane the instruction does not read holds a subnormal.
+#[test]
+fn flush_to_zero_stays_native_on_normal_inputs() {
+    const PROGRAM: [u32; 23] = [
+        0x1e22_2820, // fadd s0, s1, s2
+        0x1e22_3820, // fsub s0, s1, s2
+        0x1e22_0820, // fmul s0, s1, s2
+        0x1f02_0c20, // fmadd s0, s1, s2, s3
+        0x1e22_2020, // fcmp s1, s2
+        0x1e21_c020, // fsqrt s0, s1
+        0x1e22_c020, // fcvt d0, s1
+        0x1e38_0020, // fcvtzs w0, s1
+        0x1e22_4820, // fmax s0, s1, s2
+        0x1e62_2820, // fadd d0, d1, d2
+        0x1e62_0820, // fmul d0, d1, d2
+        0x4e22_d420, // fadd v0.4s, v1.4s, v2.4s
+        0x6e22_dc20, // fmul v0.4s, v1.4s, v2.4s
+        0x4e22_cc20, // fmla v0.4s, v1.4s, v2.4s
+        0x6e22_d420, // faddp v0.4s, v1.4s, v2.4s
+        0x4e21_d820, // scvtf v0.4s, v1.4s
+        0x4fa2_9820, // fmul v0.4s, v1.4s, v2.s[3]
+        0x0f84_1060, // fmla v0.2s, v3.2s, v4.s[0]
+        0x5f84_9060, // fmul s0, s3, v4.s[0]
+        0x0e23_d460, // fadd v0.2s, v3.2s, v3.2s
+        0x1e24_2860, // fadd s0, s3, s4
+        0x6e22_e420, // fcmge v0.4s, v1.4s, v2.4s
+        BRK,
+    ];
+    let s = |lanes: [u32; 4]| (0..4).fold(0u128, |v, k| v | (lanes[k] as u128) << (32 * k));
+    let mut ctx = ThreadContext {
+        pc: CODE,
+        fpcr: 1 << 24,
+        fpsr: 0x10,
+        ..Default::default()
+    };
+    ctx.v[0] = s([1.0f32.to_bits(); 4]);
+    ctx.v[1] = s([1.5, 2.5, 3.5, -4.5].map(f32::to_bits));
+    ctx.v[2] = s([2.0, 0.75, -1.25, 8.0].map(f32::to_bits));
+    ctx.v[3] = s([1.25f32.to_bits(), (-0.5f32).to_bits(), 1, 0x807f_ffff]);
+    ctx.v[4] = s([3.0f32.to_bits(), 0x0000_0002, 0x8000_0003, 0x007f_ffff]);
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+    ];
+    compare(machines, &PROGRAM, &ctx, &vec![0u8; DATA_SIZE as usize]);
+    let table = run_profiled(&PROGRAM, ctx, true).2.unwrap();
+    if std::arch::is_x86_feature_detected!("fma") {
+        assert!(!table.contains("native FP slow paths"), "{table}");
+    }
+}
+
 #[test]
 fn profile_counts_without_changing_results() {
     const PROGRAM: [u32; 10] = [
@@ -2056,7 +2210,7 @@ fn profile_counts_without_changing_results() {
     let run = |profile: bool| {
         let mut ctx = ThreadContext {
             pc: CODE,
-            fpcr: 1 << 24,
+            fpcr: 1 << 22,
             ..Default::default()
         };
         ctx.x[0] = 3;
