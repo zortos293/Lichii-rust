@@ -124,7 +124,9 @@ struct Teardown(Vec<std::thread::JoinHandle<()>>);
 
 impl Drop for Teardown {
     fn drop(&mut self) {
+        let start = Instant::now();
         for thread in self.0.drain(..) {
+            tracing::info!("diag drop: joining teardown waited={:?}", start.elapsed());
             if thread.join().is_err() {
                 tracing::error!("a renderer teardown thread panicked");
             }
@@ -1333,10 +1335,18 @@ impl Drop for VulkanRasterizer {
         };
         self.teardown
             .0
-            .extend(spawn(Box::new(move || drop(texture_cache))));
+            .extend(spawn(Box::new(move || {
+                let start = Instant::now();
+                drop(texture_cache);
+                tracing::info!("diag drop: texture cache freed took={:?}", start.elapsed());
+            })));
         self.teardown
             .0
-            .extend(spawn(Box::new(move || drop(buffer_cache))));
+            .extend(spawn(Box::new(move || {
+                let start = Instant::now();
+                drop(buffer_cache);
+                tracing::info!("diag drop: buffer cache freed took={:?}", start.elapsed());
+            })));
     }
 }
 
