@@ -78,8 +78,8 @@ struct Stalls {
     last_present: Option<Instant>,
     worst_frame: Duration,
     presents: u32,
-    /// Shader and pipeline waits when the window started.
-    waits_at: (u64, u64),
+    /// Shader and pipeline skips and blocking waits when the window started.
+    waits_at: [u64; 4],
 }
 
 impl Stalls {
@@ -90,17 +90,30 @@ impl Stalls {
             self.worst_frame = self.worst_frame.max(now - last);
         }
         self.presents += 1;
-        let waits = (shaders.waits(), pipelines.waits());
+        let waits = [
+            shaders.waits(),
+            pipelines.waits(),
+            shaders.blocked(),
+            pipelines.blocked(),
+        ];
         let since = *self.since.get_or_insert(now);
         if now - since < Duration::from_secs(1) {
             return;
         }
-        let skipped_shader = waits.0 - self.waits_at.0;
-        let skipped_pipeline = waits.1 - self.waits_at.1;
-        if skipped_shader + skipped_pipeline > 0 || self.worst_frame >= Self::SLOW_FRAME {
+        let [
+            skipped_shader,
+            skipped_pipeline,
+            waited_shader,
+            waited_pipeline,
+        ] = std::array::from_fn(|i| waits[i] - self.waits_at[i]);
+        if skipped_shader + skipped_pipeline + waited_shader + waited_pipeline > 0
+            || self.worst_frame >= Self::SLOW_FRAME
+        {
             tracing::info!(
                 skipped_shader,
                 skipped_pipeline,
+                waited_shader,
+                waited_pipeline,
                 worst_frame_ms = self.worst_frame.as_secs_f32() * 1000.0,
                 presents = self.presents,
                 seconds = (now - since).as_secs_f32(),
@@ -1396,7 +1409,10 @@ impl Rasterizer for VulkanRasterizer {
             .texture_cache
             .presentable(&mut self.scheduler, framebuffer)
         {
-            Ok(Some(id)) => self.present_cached(framebuffer, id),
+            Ok(Some(id)) => {
+                self.draw.presented(id);
+                self.present_cached(framebuffer, id)
+            }
             Ok(None) => Ok(false),
             Err(error) => Err(error),
         };

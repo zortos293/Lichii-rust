@@ -356,7 +356,7 @@ impl ConfigWindow {
                     row(ui, "", |ui| {
                         ui.checkbox(
                             &mut d.graphics.async_shader_compilation,
-                            "Build shaders asynchronously",
+                            "Build shaders asynchronously (less stutter, but can corrupt some scenes)",
                         )
                     });
                     row(ui, "", |ui| {

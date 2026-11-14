@@ -5,7 +5,8 @@
 // and GobLayout). Words whose guest offset falls outside [guest_floor, guest_limit) are skipped,
 // so a slice can be painted into the bytes of a smaller image it overlaps, one run of shared
 // device memory at a time. Depth-stencil packings combine a
-// depth word per texel with stencil bytes packed four to a word.
+// depth word per texel with stencil bytes packed four to a word. With depth_float the host's depth word is a
+// float, converted to and from the guest's 24-bit unorm exactly as the CPU path's f64 arithmetic does.
 
 #version 460
 
@@ -33,7 +34,35 @@ layout(push_constant) uniform P {
     uint direction;
     uint packing;
     uint stencil_pitch;
+    uint depth_float;
 } p;
+
+const float D24_MAX = 16777215.0;
+const uint D24_INV_BITS = 0x33800001u;
+
+float d24_to_float(uint d) {
+    float inv = uintBitsToFloat(D24_INV_BITS);
+    precise float x = float(d);
+    precise float q = x * inv;
+    precise float r = fma(-q, D24_MAX, x);
+    precise float f = fma(r, inv, q);
+    return f;
+}
+
+uint float_to_d24(float depth) {
+    float f = depth >= 0.0 ? min(depth, 1.0) : 0.0;
+    precise float product = f * D24_MAX;
+    precise float error = fma(f, D24_MAX, -product);
+    float nearest = roundEven(product);
+    precise float frac = (product - nearest) + error;
+    uint d = uint(nearest);
+    if (frac >= 0.5) {
+        d += 1u;
+    } else if (frac < -0.5) {
+        d -= 1u;
+    }
+    return d;
+}
 
 void main() {
     uint x = gl_GlobalInvocationID.x;
@@ -64,6 +93,9 @@ void main() {
         uint value = linear_words[texel];
         if (p.packing != PLAIN) {
             uint s = (stencil_words[s_index >> 2u] >> s_shift) & 0xFFu;
+            if (p.depth_float != 0u) {
+                value = float_to_d24(uintBitsToFloat(value));
+            }
             value = p.packing == DEPTH_LOW_STENCIL_HIGH ? (value & 0xFFFFFFu) | (s << 24u)
                                                         : s | ((value & 0xFFFFFFu) << 8u);
         }
@@ -75,7 +107,7 @@ void main() {
         } else {
             uint d = p.packing == DEPTH_LOW_STENCIL_HIGH ? value & 0xFFFFFFu : value >> 8u;
             uint s = p.packing == DEPTH_LOW_STENCIL_HIGH ? value >> 24u : value & 0xFFu;
-            linear_words[texel] = d;
+            linear_words[texel] = p.depth_float != 0u ? floatBitsToUint(d24_to_float(d)) : d;
             atomicOr(stencil_words[s_index >> 2u], s << s_shift);
         }
     }
