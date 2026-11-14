@@ -1,7 +1,8 @@
 //! Advanced SIMD floating-point arithmetic on S and D lanes, compiled as checked ops: every lane is
 //! computed on the host, and the whole instruction falls back to `CallSimd` unless each lane the
-//! instruction writes passes the scalar checks (finite, and above the smallest normal or an exact
-//! zero for the ops that can underflow).
+//! instruction writes passes the scalar checks (no subnormal input lane under FPCR.FZ; a finite
+//! result, which for sums is a zero or a normal number and for the ops that can underflow is above
+//! the smallest normal or an exact zero).
 
 #![allow(
     clippy::useless_conversion,
@@ -12,8 +13,9 @@ use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
 
 use super::super::ir::{Loc, Op, Ty, Value};
 use super::super::translate::Translator;
-use super::super::x64::Emitter;
+use super::super::x64::{CTX_FPCR, Emitter};
 use super::ir::{Fp, SimdOp};
+use super::x64::FZ;
 use crate::interpreter::simd::softfloat::{recip_estimate_u9, recip_sqrt_estimate_u9};
 
 const SCRATCH: u8 = 15;
@@ -166,9 +168,9 @@ static RECIP_FRACTIONS: [u8; 256] = {
     table
 };
 
-/// The absolute-value mask, infinity and the smallest normal in every lane, for S then D.
+/// The absolute-value mask, infinity, the smallest normal and zero in every lane, for S then D.
 #[repr(align(16))]
-struct Bounds([u32; 24]);
+struct Bounds([u32; 32]);
 
 static BOUNDS: Bounds = Bounds([
     0x7fff_ffff,
@@ -183,6 +185,10 @@ static BOUNDS: Bounds = Bounds([
     0x0080_0000,
     0x0080_0000,
     0x0080_0000,
+    0,
+    0,
+    0,
+    0,
     0xffff_ffff,
     0x7fff_ffff,
     0xffff_ffff,
@@ -195,7 +201,16 @@ static BOUNDS: Bounds = Bounds([
     0x0010_0000,
     0x0000_0000,
     0x0010_0000,
+    0,
+    0,
+    0,
+    0,
 ]);
+
+/// The `BOUNDS` rows for `fp`.
+fn bounds(fp: Fp) -> i64 {
+    BOUNDS.0.as_ptr() as i64 + if fp == Fp::D { 64 } else { 0 }
+}
 
 const fn field(word: u32, low: u32, bits: u32) -> u8 {
     ((word >> low) & ((1 << bits) - 1)) as u8
@@ -323,6 +338,12 @@ impl Emitter<'_> {
             dynasm!(self.asm ; .arch x64 ; jmp =>slow);
             self.finish_checked(i, slow, word, d, Ty::U128);
             return;
+        }
+        if op != LaneOp::FromInt && !estimate {
+            let written = (1i32 << lanes) - 1;
+            let element = index.map_or(written, |index| 1 << index);
+            let inputs = [(n, written), (m, element), (acc.unwrap_or(n), written)];
+            self.subnormal_lanes(fp, &inputs[..if acc.is_some() { 3 } else { 2 }], slow);
         }
         let b = match (index, fp) {
             (None, _) => m,
@@ -523,9 +544,34 @@ impl Emitter<'_> {
         }
     }
 
-    /// Jumps to `slow` unless every written lane of the result in `xmm d` is finite and, for the
-    /// ops that can underflow, above the smallest normal or a zero whose product had a zero
-    /// factor. Clobbers `xmm15`, `rax`, `rcx` and `rdx`.
+    /// Jumps to `slow` while FPCR.FZ is set if a lane of an input `xmm` that its mask selects is
+    /// subnormal, because FZ flushes it to zero and raises IDC. Clobbers `xmm15`, `rax` and `rcx`.
+    fn subnormal_lanes(&mut self, fp: Fp, inputs: &[(u8, i32)], slow: dynasmrt::DynamicLabel) {
+        const LT: i8 = 1;
+        const NEQ: i8 = 4;
+        const RCX: u8 = 1;
+        let skip = self.asm.new_dynamic_label();
+        dynasm!(self.asm
+            ; .arch x64
+            ; test DWORD [r15 + CTX_FPCR], FZ
+            ; jz =>skip
+            ; mov rax, QWORD bounds(fp)
+        );
+        for &(src, mask) in inputs {
+            dynasm!(self.asm ; .arch x64 ; movaps xmm15, Rx(src) ; andps xmm15, [rax]);
+            self.compare_bound(fp, 32, LT);
+            dynasm!(self.asm ; .arch x64 ; andps xmm15, Rx(src));
+            self.compare_bound(fp, 48, NEQ);
+            self.lane_mask(fp, RCX);
+            dynasm!(self.asm ; .arch x64 ; test ecx, mask ; jnz =>slow);
+        }
+        dynasm!(self.asm ; .arch x64 ; =>skip);
+    }
+
+    /// Jumps to `slow` unless every written lane of the result in `xmm d` is finite and, for
+    /// sums, a zero or a normal number, or, for the ops that can underflow, above the smallest
+    /// normal or a zero whose product had a zero factor. Clobbers `xmm15`, `rax`, `rcx` and
+    /// `rdx`.
     #[allow(clippy::too_many_arguments)]
     fn check_lanes(
         &mut self,
@@ -538,21 +584,29 @@ impl Emitter<'_> {
         index: Option<u8>,
         slow: dynasmrt::DynamicLabel,
     ) {
-        let bounds = BOUNDS.0.as_ptr() as i64 + if fp == Fp::D { 48 } else { 0 };
         let written = (1i32 << lanes) - 1;
         const LT: i8 = 1;
+        const NLT: i8 = 5;
         const NLE: i8 = 6;
         const RAX: u8 = 0;
         const RCX: u8 = 1;
         const RDX: u8 = 2;
         dynasm!(self.asm
             ; .arch x64
-            ; mov rax, QWORD bounds
+            ; mov rax, QWORD bounds(fp)
             ; movaps xmm15, Rx(d)
             ; andps xmm15, [rax]
         );
         self.compare_bound(fp, 16, LT);
         self.lane_mask(fp, RCX);
+        if matches!(op, LaneOp::Add | LaneOp::Sub | LaneOp::AddPairwise) {
+            dynasm!(self.asm ; .arch x64 ; movaps xmm15, Rx(d) ; andps xmm15, [rax]);
+            self.compare_bound(fp, 32, NLT);
+            self.lane_mask(fp, RDX);
+            dynasm!(self.asm ; .arch x64 ; and ecx, edx);
+            self.zero_lanes(fp, d, RDX);
+            dynasm!(self.asm ; .arch x64 ; or ecx, edx);
+        }
         if matches!(op, LaneOp::Mul | LaneOp::Mla | LaneOp::Mls) {
             dynasm!(self.asm ; .arch x64 ; movaps xmm15, Rx(d) ; andps xmm15, [rax]);
             self.compare_bound(fp, 32, NLE);

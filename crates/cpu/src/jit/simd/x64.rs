@@ -1,10 +1,10 @@
 //! x86-64 code for `Op::Simd`.
 //!
 //! A checked op computes on the host only where the host's result is the Arm ARM's: FPCR selects
-//! round to nearest without flush to zero, FPSR.IXC is already set when the op can be inexact,
-//! and the result is not a NaN, an infinity or (for ops that can underflow) below the normal
-//! range. Any other case takes the op's slow path, which runs the instruction through
-//! `CallSimd` and reloads its result from the context.
+//! round to nearest, FPSR.IXC is already set when the op can be inexact, no input is subnormal
+//! while FPCR.FZ is set, and the result is not a NaN, an infinity or (for ops that can underflow)
+//! below the normal range. Any other case takes the op's slow path, which runs the instruction
+//! through `CallSimd` and reloads its result from the context.
 
 #![allow(
     clippy::useless_conversion,
@@ -17,8 +17,11 @@ use super::super::ir::{Loc, Ty, Value};
 use super::super::x64::{CTX_FPCR, CTX_FPSR, CTX_PSTATE, Emitter, loc_offset};
 use super::ir::{Arith, Fp, Fused, SimdOp};
 
-/// FPCR.RMode and FPCR.FZ.
-pub(super) const HOST_FPCR: i32 = 3 << 22 | 1 << 24;
+/// FPCR.RMode.
+pub(super) const RMODE: i32 = 3 << 22;
+/// FPCR.FZ. It changes no result of a checked op whose inputs are not subnormal: a result FZ would
+/// flush is below the normal range, which falls back anyway.
+pub(super) const FZ: i32 = 1 << 24;
 /// FPSR.IXC.
 pub(super) const IXC: i8 = 0x10;
 /// An H value with exponent 31 (an infinity or a NaN, or under FPCR.AHP a normal number) falls
@@ -32,6 +35,17 @@ pub(super) const IXC: i8 = 0x10;
 struct HalfScale([u32; 4]);
 
 static HALF_SCALE: HalfScale = HalfScale([0x7780_0000, 0, 0, 0x7ef0_0000]);
+
+/// The results a checked op keeps native.
+#[derive(Clone, Copy)]
+enum Native<'a> {
+    /// Every finite result, for an op whose result is never below the normal range.
+    Finite,
+    /// Zeros and normal numbers, for a sum: one below the normal range is exact, but FZ flushes it.
+    ZeroOrNormal,
+    /// Numbers above the smallest normal, and zeros when one of these factors is zero.
+    Normal(&'a [u8]),
+}
 
 #[derive(Default)]
 pub(in super::super) struct State {
@@ -66,13 +80,13 @@ impl Emitter<'_> {
     }
 
     /// Starts a checked op and returns its slow-path label. The host computes only under round to
-    /// nearest without flush to zero, and only reports inexact results by leaving FPSR.IXC alone,
-    /// so an op that can be inexact also falls back while IXC is clear.
+    /// nearest, and only reports inexact results by leaving FPSR.IXC alone, so an op that can be
+    /// inexact also falls back while IXC is clear.
     pub(super) fn checked(&mut self, inexact: bool) -> DynamicLabel {
         let slow = self.asm.new_dynamic_label();
         dynasm!(self.asm
             ; .arch x64
-            ; test DWORD [r15 + CTX_FPCR], HOST_FPCR
+            ; test DWORD [r15 + CTX_FPCR], RMODE
             ; jnz =>slow
         );
         if inexact {
@@ -85,12 +99,45 @@ impl Emitter<'_> {
         slow
     }
 
-    /// Jumps to `slow` unless the FP result in `xmm15` is finite and, when `normal`, a normal
-    /// number: a zero or subnormal result may have underflowed, and the Arm ARM detects tininess
+    /// Jumps to `slow` while FPCR.FZ is set if the low element of one of `inputs` is subnormal,
+    /// because FZ flushes it to zero and raises IDC. Clobbers `rax` and `rdx`.
+    pub(super) fn subnormal_inputs(&mut self, fp: Fp, inputs: &[u8], slow: DynamicLabel) {
+        let skip = self.asm.new_dynamic_label();
+        dynasm!(self.asm
+            ; .arch x64
+            ; test DWORD [r15 + CTX_FPCR], FZ
+            ; jz =>skip
+        );
+        for &x in inputs {
+            match fp {
+                Fp::S => dynasm!(self.asm
+                    ; .arch x64
+                    ; movd eax, Rx(x)
+                    ; add eax, eax
+                    ; sub eax, 2
+                    ; cmp eax, 0x00ff_fffc
+                    ; jbe =>slow
+                ),
+                Fp::D => dynasm!(self.asm
+                    ; .arch x64
+                    ; movq rax, Rx(x)
+                    ; add rax, rax
+                    ; sub rax, 2
+                    ; mov rdx, QWORD 0x001f_ffff_ffff_fffc
+                    ; cmp rax, rdx
+                    ; jbe =>slow
+                ),
+            }
+        }
+        dynasm!(self.asm ; .arch x64 ; =>skip);
+    }
+
+    /// Jumps to `slow` unless the FP result in `xmm15` is finite and in the `native` range. A
+    /// product's zero or subnormal result may have underflowed, and the Arm ARM detects tininess
     /// before rounding, so a result of exactly the smallest normal falls back too. A zero result
-    /// stays native when one of `zero_factors` is zero, because a product or quotient with a zero
+    /// stays native when one of the factors is zero, because a product or quotient with a zero
     /// factor or dividend is exactly zero. Leaves the result's bits in `rax`.
-    fn check_result(&mut self, fp: Fp, normal: bool, zero_factors: &[u8], slow: DynamicLabel) {
+    fn check_result(&mut self, fp: Fp, native: Native, slow: DynamicLabel) {
         match fp {
             Fp::S => dynasm!(self.asm
                 ; .arch x64
@@ -105,18 +152,46 @@ impl Emitter<'_> {
                 ; btr rcx, 63
             ),
         }
-        if !normal {
-            match fp {
-                Fp::S => dynasm!(self.asm ; .arch x64 ; cmp ecx, 0x7f7f_ffff ; ja =>slow),
-                Fp::D => dynasm!(self.asm
-                    ; .arch x64
-                    ; mov rdx, QWORD 0x7fef_ffff_ffff_ffff
-                    ; cmp rcx, rdx
-                    ; ja =>slow
-                ),
+        let zero_factors = match native {
+            Native::Finite => {
+                match fp {
+                    Fp::S => dynasm!(self.asm ; .arch x64 ; cmp ecx, 0x7f7f_ffff ; ja =>slow),
+                    Fp::D => dynasm!(self.asm
+                        ; .arch x64
+                        ; mov rdx, QWORD 0x7fef_ffff_ffff_ffff
+                        ; cmp rcx, rdx
+                        ; ja =>slow
+                    ),
+                }
+                return;
             }
-            return;
-        }
+            Native::ZeroOrNormal => {
+                let done = self.asm.new_dynamic_label();
+                match fp {
+                    Fp::S => dynasm!(self.asm
+                        ; .arch x64
+                        ; test ecx, ecx
+                        ; jz =>done
+                        ; sub ecx, 0x0080_0000
+                        ; cmp ecx, 0x7f7f_ffff - 0x0080_0000
+                        ; ja =>slow
+                    ),
+                    Fp::D => dynasm!(self.asm
+                        ; .arch x64
+                        ; test rcx, rcx
+                        ; jz =>done
+                        ; mov rdx, QWORD 0x0010_0000_0000_0000
+                        ; sub rcx, rdx
+                        ; mov rdx, QWORD 0x7fef_ffff_ffff_ffff - 0x0010_0000_0000_0000
+                        ; cmp rcx, rdx
+                        ; ja =>slow
+                    ),
+                }
+                dynasm!(self.asm ; .arch x64 ; =>done);
+                return;
+            }
+            Native::Normal(zero_factors) => zero_factors,
+        };
         let (zero, done) = (self.asm.new_dynamic_label(), self.asm.new_dynamic_label());
         let below = if zero_factors.is_empty() { slow } else { zero };
         match fp {
@@ -296,6 +371,7 @@ impl Emitter<'_> {
                 let d = self.def(v);
                 let extreme = matches!(op, Arith::Max | Arith::Min);
                 let slow = self.checked(!extreme);
+                self.subnormal_inputs(fp, &[a, b], slow);
                 dynasm!(self.asm ; .arch x64 ; movaps xmm15, Rx(a));
                 match (op, fp) {
                     (Arith::Max | Arith::Min, _) => self.min_max(op == Arith::Max, fp, a, b, slow),
@@ -311,9 +387,11 @@ impl Emitter<'_> {
                     (Arith::Nmul, Fp::D) => dynasm!(self.asm ; .arch x64 ; mulsd xmm15, Rx(b)),
                 }
                 match op {
-                    Arith::Add | Arith::Sub => self.check_result(fp, false, &[], slow),
-                    Arith::Mul | Arith::Nmul => self.check_result(fp, true, &[a, b], slow),
-                    Arith::Div => self.check_result(fp, true, &[a], slow),
+                    Arith::Add | Arith::Sub => self.check_result(fp, Native::ZeroOrNormal, slow),
+                    Arith::Mul | Arith::Nmul => {
+                        self.check_result(fp, Native::Normal(&[a, b]), slow)
+                    }
+                    Arith::Div => self.check_result(fp, Native::Normal(&[a]), slow),
                     Arith::Max | Arith::Min => self.low_to_rax(fp, 15),
                 }
                 match (op, fp) {
@@ -338,6 +416,7 @@ impl Emitter<'_> {
                 let d = self.def(v);
                 let slow = self.checked(true);
                 if self.target.fma {
+                    self.subnormal_inputs(fp, &[n, m, a], slow);
                     dynasm!(self.asm ; .arch x64 ; movaps xmm15, Rx(a));
                     match (op, fp) {
                         (Fused::Madd, Fp::S) => {
@@ -365,7 +444,7 @@ impl Emitter<'_> {
                             dynasm!(self.asm ; .arch x64 ; vfmsub231sd xmm15, Rx(n), Rx(m))
                         }
                     }
-                    self.check_result(fp, true, &[n, m], slow);
+                    self.check_result(fp, Native::Normal(&[n, m]), slow);
                     self.rax_to_low(fp, d);
                 } else {
                     dynasm!(self.asm ; .arch x64 ; jmp =>slow);
@@ -376,11 +455,12 @@ impl Emitter<'_> {
                 let a = self.reg(a);
                 let d = self.def(v);
                 let slow = self.checked(true);
+                self.subnormal_inputs(fp, &[a], slow);
                 match fp {
                     Fp::S => dynasm!(self.asm ; .arch x64 ; sqrtss xmm15, Rx(a)),
                     Fp::D => dynasm!(self.asm ; .arch x64 ; sqrtsd xmm15, Rx(a)),
                 }
-                self.check_result(fp, false, &[], slow);
+                self.check_result(fp, Native::Finite, slow);
                 self.rax_to_low(fp, d);
                 self.finish_checked(i, slow, word, d, Ty::U128);
             }
@@ -428,6 +508,7 @@ impl Emitter<'_> {
                 let d = self.def(v);
                 let narrowing = fp == Fp::D;
                 let slow = self.checked(narrowing);
+                self.subnormal_inputs(fp, &[a], slow);
                 let to = match fp {
                     Fp::S => {
                         dynasm!(self.asm ; .arch x64 ; cvtss2sd xmm15, Rx(a));
@@ -438,7 +519,12 @@ impl Emitter<'_> {
                         Fp::S
                     }
                 };
-                self.check_result(to, narrowing, &[], slow);
+                let native = if narrowing {
+                    Native::Normal(&[])
+                } else {
+                    Native::Finite
+                };
+                self.check_result(to, native, slow);
                 self.rax_to_low(to, d);
                 self.finish_checked(i, slow, word, d, Ty::U128);
             }
@@ -482,6 +568,7 @@ impl Emitter<'_> {
                 let a = self.reg(a);
                 let d = self.def(v);
                 let slow = self.checked(true);
+                self.subnormal_inputs(fp, &[a], slow);
                 match (fp, signed && !wide) {
                     (Fp::S, true) => dynasm!(self.asm ; .arch x64 ; cvttss2si eax, Rx(a)),
                     (Fp::D, true) => dynasm!(self.asm ; .arch x64 ; cvttsd2si eax, Rx(a)),
@@ -526,6 +613,8 @@ impl Emitter<'_> {
                 };
                 let d = self.def(v);
                 let slow = self.checked(false);
+                let inputs = [a, b];
+                self.subnormal_inputs(fp, &inputs[..if b == 15 { 1 } else { 2 }], slow);
                 self.compare_flags(fp, a, b, d, slow);
                 self.finish_checked(i, slow, word, d, Ty::Nzcv);
             }
@@ -542,6 +631,7 @@ impl Emitter<'_> {
                 let (skip, done) = (self.asm.new_dynamic_label(), self.asm.new_dynamic_label());
                 dynasm!(self.asm ; .arch x64 ; test Rd(c), Rd(c) ; jz =>skip);
                 let slow = self.checked(false);
+                self.subnormal_inputs(fp, &[a, b], slow);
                 self.compare_flags(fp, a, b, d, slow);
                 dynasm!(self.asm
                     ; .arch x64
