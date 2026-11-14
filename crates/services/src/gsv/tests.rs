@@ -349,7 +349,7 @@ fn gpu_session_slots_devices_and_partitions() {
 }
 
 #[test]
-fn gpu_memory_handles_come_back_before_the_back_thread_makes_the_memory() {
+fn fresh_gpu_memory_is_mapped_before_the_reply_without_the_back_thread() {
     let (context, client, gsv) = gsv();
     let gpu = session(&client, gsv, 497);
     let process = client.process().clone();
@@ -367,11 +367,52 @@ fn gpu_memory_handles_come_back_before_the_back_thread_makes_the_memory() {
     let mut reply = client.send(gpu, &create).unwrap();
     assert_eq!(reply.result, ResultCode::SUCCESS);
     assert_ne!(reply.pop::<u32>(), 0);
-    assert!(gmmu.translate(heap).is_none(), "made in order, later");
-
+    assert_eq!(
+        gmmu.read::<u32>(heap + 4).unwrap(),
+        0x1234_5678,
+        "the front thread finds the memory as soon as the title has the handle"
+    );
     context.gpu.pause(false);
-    context.gpu.synchronize();
-    assert_eq!(gmmu.read::<u32>(heap + 4).unwrap(), 0x1234_5678);
+}
+
+#[test]
+fn gpu_memory_over_queued_changes_is_made_in_order() {
+    let (context, client, gsv) = gsv();
+    let gpu = session(&client, gsv, 497);
+    let process = client.process().clone();
+    let heap = process.page_table().set_heap_size(2 << 20).unwrap();
+    process.memory().write(heap + 4, 0x1234_5678u32).unwrap();
+    let gmmu = context
+        .gpu
+        .create_address_space(lichii_gpu::gmmu::BigPageSize::Size64K);
+    let last = heap + 0x1_0000 - 1;
+
+    let mut sparse = vec![0];
+    sparse.extend(split(heap));
+    sparse.extend(split(last));
+    sparse.extend([0x200, 0, 0, 0, 11]);
+    client
+        .send(gpu, &words(Request::tipc(214), &sparse))
+        .unwrap();
+    let mut unmap = vec![0];
+    unmap.extend(split(heap));
+    unmap.extend(split(last));
+    unmap.extend([0, 10]);
+    client
+        .send(gpu, &words(Request::tipc(213), &unmap))
+        .unwrap();
+    let create = words(
+        Request::tipc(101),
+        &[split(heap), split(last), [0, 0]].concat(),
+    );
+    let mut reply = client.send(gpu, &create).unwrap();
+    assert_eq!(reply.result, ResultCode::SUCCESS);
+    assert_ne!(reply.pop::<u32>(), 0);
+    assert_eq!(
+        gmmu.read::<u32>(heap + 4).unwrap(),
+        0x1234_5678,
+        "the region and the unmap queued before 101 landed first"
+    );
 }
 
 #[test]
@@ -430,7 +471,6 @@ fn gpu_memory_is_mapped_for_every_address_space() {
     let mut reply = client.send(gpu, &create).unwrap();
     assert_eq!(reply.result, ResultCode::SUCCESS);
     let handle = reply.pop::<u32>();
-    context.gpu.synchronize();
     assert_eq!(
         gmmu.read::<u32>(heap + 0x1004).unwrap(),
         0xdead_beef,
@@ -806,7 +846,6 @@ fn an_unmap_waits_for_the_gpu_work_queued_before_it() {
         &[split(heap), split(heap + 0xffff), [0, 0]].concat(),
     );
     let handle = client.send(gpu, &create).unwrap().pop::<u32>();
-    context.gpu.synchronize();
 
     let (release, queued_work) = std::sync::mpsc::channel::<()>();
     let (seen, reads) = std::sync::mpsc::channel();

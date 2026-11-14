@@ -20,7 +20,7 @@
 //! stays whole ([`Reserve`]). Tiles mapped into the region and unmapped again show what was
 //! written there again, and 215 gives the blocks back.
 
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, OnceLock, Weak, mpsc};
 
 use lichii_common::{GpuVAddr, ResultCode};
 use lichii_gpu::Gpu;
@@ -61,6 +61,34 @@ struct State {
     /// Made on the first request that needs one; none before nvdrv, which allocates syncpoints,
     /// is registered.
     fence: OnceLock<Option<Arc<Fence>>>,
+    pending: Mutex<Pending>,
+}
+
+/// The GPU VA ranges of requests queued for the back thread whose change has not landed yet.
+#[derive(Default)]
+struct Pending {
+    last_id: u64,
+    ranges: Vec<(u64, GpuVAddr, GpuVAddr)>,
+}
+
+impl Pending {
+    fn add(&mut self, first: GpuVAddr, last: GpuVAddr) -> u64 {
+        self.last_id += 1;
+        self.ranges.push((self.last_id, first, last));
+        self.last_id
+    }
+
+    fn remove(&mut self, id: u64) {
+        if let Some(index) = self.ranges.iter().position(|&(other, ..)| other == id) {
+            self.ranges.swap_remove(index);
+        }
+    }
+
+    fn overlaps(&self, first: GpuVAddr, last: GpuVAddr) -> bool {
+        self.ranges
+            .iter()
+            .any(|&(_, start, end)| start <= last && first <= end)
+    }
 }
 
 /// A syncpoint the session counts the requests on whose job slots wait for the host GPU.
@@ -85,8 +113,13 @@ impl Fence {
     }
 
     /// Runs `action` once the host GPU finished the work the back thread submitted so far,
-    /// without waiting for it.
-    fn after_gpu(&self, rasterizer: &mut dyn Rasterizer, action: impl FnOnce() + Send + 'static) {
+    /// without waiting for it. The action keeps the fence, so the syncpoint is retired only once
+    /// no increment of it is still on the way.
+    fn after_gpu(
+        self: &Arc<Self>,
+        rasterizer: &mut dyn Rasterizer,
+        action: impl FnOnce() + Send + 'static,
+    ) {
         let Ok(threshold) = self.syncpoints.increase_max(self.id, 1) else {
             rasterizer.wait_for_idle();
             action();
@@ -94,6 +127,11 @@ impl Fence {
         };
         rasterizer.signal_fence(FenceAction::IncrementSyncpoint(self.id));
         rasterizer.flush_commands();
+        let fence = self.clone();
+        let action = move || {
+            action();
+            drop(fence);
+        };
         if self
             .syncpoints
             .guest()
@@ -119,6 +157,7 @@ impl GpuSession {
                 slots: std::array::from_fn(|_| Arc::new(Event::new())),
                 devices: Mutex::new([false; DEVICES]),
                 fence: OnceLock::new(),
+                pending: Mutex::default(),
             }),
         }
     }
@@ -136,16 +175,21 @@ impl GpuSession {
     /// change released to the [`Reserve`] and signals job slot `slot`. When a `destructive`
     /// change unmapped something, or the change released blocks, that waits until the host GPU
     /// finished the work before it, since the title or the pool reuses that memory right after.
+    /// `range` is the inclusive GPU VA range the change may map or unmap, which 101 checks
+    /// until the change landed.
     fn in_order(
         &self,
         slot: Option<u32>,
         destructive: bool,
+        range: Option<(GpuVAddr, GpuVAddr)>,
         change: impl FnOnce(&Nx2GpuMemory, &mut Change) + Send + 'static,
     ) {
         let gpu: Weak<Gpu> = Arc::downgrade(&self.context.gpu);
         let reserve = self.context.gpu_reserve.get().cloned();
         let event = slot.map(|slot| self.slot(slot).clone());
         let fence = destructive.then(|| self.fence()).flatten();
+        let pending = range.map(|(first, last)| self.state.pending.lock().add(first, last));
+        let state = self.state.clone();
         self.context
             .gpu
             .run_in_order(move |rasterizer: &mut dyn Rasterizer| {
@@ -156,11 +200,17 @@ impl GpuSession {
                         rasterizer.unmap_region(range.range.daddr, range.range.size);
                     }
                 }
+                if let Some(id) = pending {
+                    state.pending.lock().remove(id);
+                }
                 let wait = (destructive && !done.unmapped.is_empty()) || !done.released.is_empty();
-                let released = done.released;
+                let detached = reserve
+                    .as_ref()
+                    .map(|reserve| reserve.detach(&done.released))
+                    .unwrap_or_default();
                 let complete = move || {
                     if let Some(reserve) = reserve {
-                        reserve.release(&released);
+                        reserve.free(detached);
                     }
                     if let Some(event) = event {
                         event.signal();
@@ -193,8 +243,12 @@ impl GpuSession {
             .gpu_reserve
             .get_or_init(|| Reserve::start(&self.context));
         reserve.refill(&self.context.process);
-        self.in_order(Some(slot), false, move |memory, done| {
-            match memory.create_lazy_region(start, size) {
+        let range = (start, start.saturating_add(size.saturating_sub(1)));
+        self.in_order(
+            Some(slot),
+            false,
+            Some(range),
+            move |memory, done| match memory.create_lazy_region(start, size) {
                 Ok((daddr, replaced)) => {
                     tracing::info!(
                         "nx2:gpu 214: GPU-only region {start:#x}+{size:#x} at device {daddr:#x}, \
@@ -205,8 +259,8 @@ impl GpuSession {
                 Err(err) => {
                     tracing::warn!("nx2:gpu 214: GPU-only region {start:#x}+{size:#x}: {err}")
                 }
-            }
-        });
+            },
+        );
     }
 
     fn create_device(&self, ctx: &mut HleRequestContext) -> ResultCode {
@@ -220,8 +274,10 @@ impl GpuSession {
     }
 
     /// 101(first u64, last u64, flags): makes process memory GPU accessible at GPU VA == CPU VA.
-    /// Reply word 3 is the GpuMemoryHandle later requests name. The handle is reserved here and
-    /// the reply goes out at once; the memory is made in order on the back thread.
+    /// Reply word 3 is the GpuMemoryHandle later requests name. Memory over GPU VAs nothing maps
+    /// and no queued request changes is made here, so the front thread and other services find it
+    /// as soon as the title has the handle. Otherwise it would change mappings queued GPU work may
+    /// still use, so it is made in order and the reply waits for the back thread.
     fn create_memory(&self, ctx: &mut HleRequestContext) -> ResultCode {
         let words = Words::command(ctx);
         let (first, last) = (words.u64(2), words.u64(4));
@@ -229,20 +285,48 @@ impl GpuSession {
             tracing::warn!("nx2:gpu 101: empty range [{first:#x}, {last:#x}]");
             return lichii_kernel::result::INVALID_SIZE;
         };
-        let Some(Ok(handle)) = self.memory().map(Nx2GpuMemory::reserve_handle) else {
+        let Some(memory) = self.memory() else {
+            return lichii_kernel::result::NOT_FOUND;
+        };
+        let Ok(handle) = memory.reserve_handle() else {
             tracing::warn!("nx2:gpu 101 [{first:#x}, {last:#x}]: no memory handle left");
             return lichii_kernel::result::OUT_OF_RESOURCE;
         };
-        let process = self.context.process.clone();
-        self.in_order(None, false, move |memory, done| {
-            let space: &AddressSpace = process.memory();
-            match memory.create_gpu_accessible_memory_as(handle, space, first, size) {
-                Ok(replaced) => done.unmapped = replaced,
-                Err(err) => tracing::warn!("nx2:gpu 101 [{first:#x}, {last:#x}]: {err}"),
+        let pending = self.state.pending.lock();
+        let created = if pending.overlaps(first, last) || memory.in_use(first, size) {
+            drop(pending);
+            let (sender, created) = mpsc::sync_channel(1);
+            let process = self.context.process.clone();
+            self.in_order(None, false, Some((first, last)), move |memory, done| {
+                let space: &AddressSpace = process.memory();
+                let result = memory.create_gpu_accessible_memory_as(handle, space, first, size);
+                let _ = sender.send(result.map(|replaced| done.unmapped = replaced));
+            });
+            let Ok(created) = created.recv() else {
+                tracing::warn!("nx2:gpu 101: the GPU stopped");
+                return lichii_kernel::result::OUT_OF_RESOURCE;
+            };
+            created
+        } else {
+            let result = memory.create_gpu_accessible_memory_as(
+                handle,
+                self.context.process.memory(),
+                first,
+                size,
+            );
+            drop(pending);
+            result.map(|replaced| debug_assert!(replaced.is_empty()))
+        };
+        match created {
+            Ok(()) => {
+                ctx.push(handle.raw());
+                ResultCode::SUCCESS
             }
-        });
-        ctx.push(handle.raw());
-        ResultCode::SUCCESS
+            Err(err) => {
+                tracing::warn!("nx2:gpu 101 [{first:#x}, {last:#x}]: {err}");
+                lichii_kernel::result::OUT_OF_RESOURCE
+            }
+        }
     }
 
     /// 216: an A buffer of SparseMapRequests, a B buffer that gets the kind applied to each.
@@ -273,7 +357,14 @@ impl GpuSession {
             let kinds: Vec<u8> = requests.iter().map(|r| r.kind).collect();
             let _ = ctx.write_buffer(0, &kinds);
         }
-        self.in_order(Some(slot), true, move |memory, done| {
+        let hull = requests
+            .iter()
+            .filter_map(|r| {
+                let last = r.size.checked_sub(1).and_then(|n| r.va.checked_add(n))?;
+                Some((r.va, last))
+            })
+            .reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)));
+        self.in_order(Some(slot), true, hull, move |memory, done| {
             for SparseMap {
                 va,
                 size,
@@ -398,9 +489,13 @@ impl Service for GpuSession {
                     101 => self.create_memory(ctx),
                     102 => {
                         let handle = GpuMemoryHandle::new(words.u32(2));
-                        self.in_order(Some(words.u32(3)), true, move |memory, done| match handle {
-                            Some(handle) => done.unmapped = logged("102", memory.destroy(handle)),
-                            None => tracing::warn!("nx2:gpu 102: memory handle 0"),
+                        self.in_order(Some(words.u32(3)), true, None, move |memory, done| {
+                            match handle {
+                                Some(handle) => {
+                                    done.unmapped = logged("102", memory.destroy(handle))
+                                }
+                                None => tracing::warn!("nx2:gpu 102: memory handle 0"),
+                            }
                         });
                         ResultCode::SUCCESS
                     }
@@ -409,6 +504,7 @@ impl Service for GpuSession {
                         self.in_order(
                             Some(words.u32(17)),
                             false,
+                            Some(range),
                             move |memory, done| match handle {
                                 Some(handle) => {
                                     done.unmapped = logged(
@@ -423,7 +519,7 @@ impl Service for GpuSession {
                     }
                     212 => {
                         let wanted = (words.u32(7) & 0xff) as u8;
-                        self.in_order(Some(words.u32(10)), false, move |memory, _| {
+                        self.in_order(Some(words.u32(10)), false, Some(range), move |memory, _| {
                             if let Err(err) = memory.modify_kind(range.0, range.1, wanted) {
                                 tracing::warn!("nx2:gpu 212: {err}");
                             }
@@ -433,9 +529,14 @@ impl Service for GpuSession {
                     }
                     213 => {
                         let (first, last) = range;
-                        self.in_order(Some(words.u32(8)), true, move |memory, done| {
-                            done.unmapped = logged("213", memory.unmap_4k(first, last));
-                        });
+                        self.in_order(
+                            Some(words.u32(8)),
+                            true,
+                            Some((first, last)),
+                            move |memory, done| {
+                                done.unmapped = logged("213", memory.unmap_4k(first, last));
+                            },
+                        );
                         ResultCode::SUCCESS
                     }
                     214 => {
@@ -443,7 +544,7 @@ impl Service for GpuSession {
                         let size = last.wrapping_sub(first).wrapping_add(1);
                         let slot = words.u32(11);
                         if words.u32(7) & SPARSE_REGION != 0 {
-                            self.in_order(Some(slot), false, move |memory, done| {
+                            self.in_order(Some(slot), false, Some(range), move |memory, done| {
                                 done.unmapped =
                                     logged("214", memory.create_sparse_region(first, size));
                             });
@@ -455,24 +556,29 @@ impl Service for GpuSession {
                     215 => {
                         let (first, last) = range;
                         let size = last.wrapping_sub(first).wrapping_add(1);
-                        self.in_order(Some(words.u32(8)), true, move |memory, done| {
-                            let result = match memory.destroy_lazy_region(first, size) {
-                                Ok(destroyed) => {
-                                    done.released = destroyed.backed;
-                                    Ok(destroyed.unmapped)
-                                }
-                                Err(Nx2MemoryError::NoSuchRegion { .. }) => {
-                                    match memory.destroy_sparse_region(first, size) {
-                                        Err(Nx2MemoryError::NoSuchRegion { .. }) => {
-                                            memory.unmap_4k(first, last)
-                                        }
-                                        result => result,
+                        self.in_order(
+                            Some(words.u32(8)),
+                            true,
+                            Some((first, last)),
+                            move |memory, done| {
+                                let result = match memory.destroy_lazy_region(first, size) {
+                                    Ok(destroyed) => {
+                                        done.released = destroyed.backed;
+                                        Ok(destroyed.unmapped)
                                     }
-                                }
-                                Err(err) => Err(err),
-                            };
-                            done.unmapped.extend(logged("215", result));
-                        });
+                                    Err(Nx2MemoryError::NoSuchRegion { .. }) => {
+                                        match memory.destroy_sparse_region(first, size) {
+                                            Err(Nx2MemoryError::NoSuchRegion { .. }) => {
+                                                memory.unmap_4k(first, last)
+                                            }
+                                            result => result,
+                                        }
+                                    }
+                                    Err(err) => Err(err),
+                                };
+                                done.unmapped.extend(logged("215", result));
+                            },
+                        );
                         ResultCode::SUCCESS
                     }
                     _ => self.sparse_map(ctx),
@@ -480,5 +586,25 @@ impl Service for GpuSession {
             }
             _ => return None,
         })
+    }
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::Pending;
+
+    #[test]
+    fn pending_ranges_overlap_inclusively_until_removed() {
+        let mut pending = Pending::default();
+        let a = pending.add(0x1000, 0x1fff);
+        let b = pending.add(0x4000, 0x4fff);
+        assert!(pending.overlaps(0x1fff, 0x2fff));
+        assert!(!pending.overlaps(0x2000, 0x3fff));
+        assert!(pending.overlaps(0x0, 0x1000));
+        pending.remove(a);
+        assert!(!pending.overlaps(0x1000, 0x1fff));
+        assert!(pending.overlaps(0x4800, 0x4800));
+        pending.remove(b);
+        assert!(!pending.overlaps(0, u64::MAX));
     }
 }

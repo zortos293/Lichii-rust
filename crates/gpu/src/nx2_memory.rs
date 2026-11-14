@@ -264,6 +264,11 @@ impl Nx2GpuMemory {
         Ok(replaced)
     }
 
+    /// Whether [`va`, +`size`) overlaps a region or a mapping.
+    pub fn in_use(&self, va: GpuVAddr, size: u64) -> bool {
+        self.state.lock().in_use(va, size)
+    }
+
     /// Destroys GPU memory (gpu sub 102): unmaps every GPU range that reaches it, wherever it is
     /// mapped and in every address space (parts of sparse regions read zero again), then frees
     /// its device range. Returns the mappings removed.
