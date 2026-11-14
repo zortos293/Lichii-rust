@@ -451,7 +451,7 @@ impl Jit {
             let words: Vec<u32> = (0..len / 4)
                 .map(|i| self.config.memory.read::<u32>(start + 4 * i).unwrap_or(0))
                 .collect();
-            map::record(host as usize, &code, start, &words);
+            map::record(host as usize, code, start, words);
         }
         if let (Some(p), Some(started)) = (self.state.profile.as_deref_mut(), started) {
             p.translated(started.elapsed(), len / 4, code_bytes);
