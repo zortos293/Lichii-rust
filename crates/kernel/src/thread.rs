@@ -572,10 +572,12 @@ impl Thread {
                 drop(s);
                 self.leave_lock_wait(token);
             }
-            ThreadState::Created if self.is_finalized() || !self.try_retain() => {}
-            ThreadState::Suspended | ThreadState::Created => {
+            ThreadState::Created if self.is_finalized() => {}
+            ThreadState::Created => {
+                self.retain();
                 self.scheduler.enqueue(self, &mut s, true)
             }
+            ThreadState::Suspended => self.scheduler.enqueue(self, &mut s, true),
             ThreadState::Running(core) => self.scheduler.request_reschedule(core),
             ThreadState::Runnable | ThreadState::Terminated => {}
         }
