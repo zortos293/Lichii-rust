@@ -2331,3 +2331,96 @@ fn block_linear_aliases_need_the_same_depth_stencil_encoding() {
         Some(((0, 0), (0, 0), (252, 64)))
     );
 }
+
+#[test]
+fn copy_engine_reads_of_gpu_modified_images_stay_on_the_gpu() {
+    use crate::buffer_cache::BufferBinding;
+    use lichii_gpu::backend::{CopySurface, ImageCopy};
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let info = rt_info(64, 8, 0, GobLayout::Tegra);
+    clear_rt(&mut f, &info, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    clear_rt(
+        &mut f,
+        &info,
+        [0.0, 1.0, 0.0, 1.0],
+        Rect {
+            x: 10,
+            y: 3,
+            width: 4,
+            height: 2,
+        },
+    );
+    let surface = |address, pitch, block| CopySurface {
+        address,
+        width: 64,
+        height: 8,
+        depth: 1,
+        layer: 0,
+        pitch,
+        block,
+        bytes_per_pixel: 4,
+    };
+    let copy = ImageCopy {
+        src: surface(GPU_VA, 0, Some((0, 0, 0))),
+        dst: surface(GPU_VA + (1 << 20), 128, None),
+        src_origin: (8, 2),
+        dst_origin: (0, 0),
+        width: 16,
+        height: 4,
+    };
+    let span = 3 * 128 + 16 * 4;
+    let buffer = Buffer::new(
+        &f.device,
+        span,
+        vk::BufferUsageFlags::TRANSFER_DST,
+        MemoryLocation::GpuToCpu,
+        "copy engine target",
+    )
+    .unwrap();
+    let raw = buffer.raw();
+    let downloads = f.cache.traffic().downloads;
+    let (mut tx, cache, gmmu) = f.tx();
+    let copied = cache
+        .copy_to_buffer(&mut tx, gmmu, &copy, |_, _, size| {
+            Ok(BufferBinding {
+                buffer: raw,
+                offset: 0,
+                size,
+            })
+        })
+        .unwrap();
+    assert_eq!(copied, Some((DADDR + (1 << 20), span)));
+    f.scheduler.finish().unwrap();
+    assert_eq!(
+        f.cache.traffic().downloads,
+        downloads,
+        "no write-back to guest memory"
+    );
+    let data = buffer.mapped().unwrap();
+    for row in 0..4 {
+        for col in 0..16 {
+            let at = row * 128 + col * 4;
+            let green = (2..6).contains(&col) && (1..3).contains(&row);
+            let want = if green {
+                [0, 255, 0, 255]
+            } else {
+                [255, 0, 0, 255]
+            };
+            assert_eq!(data[at..at + 4], want, "texel ({col}, {row})");
+        }
+    }
+    let fresh = ImageCopy {
+        src: surface(GPU_VA + (2 << 20), 0, Some((0, 0, 0))),
+        ..copy
+    };
+    let (mut tx, cache, gmmu) = f.tx();
+    let skipped = cache
+        .copy_to_buffer(&mut tx, gmmu, &fresh, |_, _, _| {
+            unreachable!("no GPU-modified source")
+        })
+        .unwrap();
+    assert_eq!(skipped, None);
+    f.assert_no_validation_errors();
+}

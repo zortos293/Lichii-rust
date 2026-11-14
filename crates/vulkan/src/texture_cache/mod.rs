@@ -30,6 +30,7 @@
 mod blit;
 mod clear;
 mod convert;
+mod dma;
 mod guest_sync;
 mod info;
 #[cfg(test)]

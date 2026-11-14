@@ -23,7 +23,8 @@ use lichii_common::settings::{AstcRecompression, GraphicsSettings, ResolutionSca
 use lichii_gpu::backend::ChannelId;
 use lichii_gpu::backend::{
     Blit, BlitOperation, ComputeContext, DrawParams, DrawTexture, FenceAction, FramebufferConfig,
-    GpuHandles, GraphicsContext, IndirectDraw, Query, QueryKind, Rasterizer, ReleaseSize,
+    GpuHandles, GraphicsContext, ImageCopy, IndirectDraw, Query, QueryKind, Rasterizer,
+    ReleaseSize,
 };
 use lichii_gpu::engines::maxwell_3d::Regs;
 use lichii_gpu::engines::maxwell_3d::regs::NUM_RENDER_TARGETS;
@@ -976,6 +977,37 @@ impl Rasterizer for VulkanRasterizer {
             }
             Err(error) => {
                 tracing::error!(%error, "blitting on the GPU failed; blitting in software");
+                false
+            }
+        }
+    }
+
+    fn accelerate_image_copy(
+        &mut self,
+        _channel: ChannelId,
+        memory: &Gmmu,
+        copy: &ImageCopy,
+    ) -> bool {
+        let mut tx = Transfer {
+            scheduler: &mut self.scheduler,
+            staging: &mut self.staging,
+            memory: &self.handles.device,
+        };
+        let buffers = &mut self.buffer_cache;
+        let copied = self
+            .texture_cache
+            .copy_to_buffer(&mut tx, memory, copy, |tx, daddr, size| {
+                buffers.acquire(tx.scheduler, tx.staging, daddr, size)
+            });
+        match copied {
+            Ok(Some((daddr, size))) => {
+                self.buffer_cache.mark_gpu_written(daddr, size);
+                self.unflushed = true;
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                tracing::error!(%error, "copying an image to a buffer on the GPU failed; copying in software");
                 false
             }
         }
