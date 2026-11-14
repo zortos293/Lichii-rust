@@ -95,7 +95,11 @@ impl ImageInfo {
             TextureMemory::Buffer => return None,
         };
         let switch2 = gob == GobLayout::Switch2;
-        let base = if switch2 { 0 } else { desc.base_layer };
+        let base = if switch2 && !diag_keep_layer() {
+            0
+        } else {
+            desc.base_layer
+        };
         let arrayed = !switch2 && (desc.depth > 1 || base != 0);
         let (kind, height, depth, layers, mut rescaleable) = match desc.texture_type {
             TextureType::D1 if !arrayed => (ImageKind::D1, 1, 1, 1, false),
@@ -518,6 +522,11 @@ impl ViewInfo {
         );
         let base_layer = match desc.texture_type {
             TextureType::D3 => 0,
+            TextureType::D1Array | TextureType::D2Array | TextureType::CubeArray
+                if diag_keep_layer() =>
+            {
+                desc.base_layer
+            }
             _ if switch2 => 0,
             _ => desc.base_layer,
         };
@@ -531,4 +540,9 @@ impl ViewInfo {
             layers: layers.min(info.layers.saturating_sub(base_layer)).max(1),
         }
     }
+}
+
+fn diag_keep_layer() -> bool {
+    static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KEEP.get_or_init(|| std::env::var_os("LICHII_DIAG_KEEP_LAYER").is_some())
 }
