@@ -217,6 +217,8 @@ pub struct ShaderCache {
     pending: HashMap<u64, Arc<AtomicU64>, FxBuildHasher>,
     code_check: cache::CodeCheck,
     stats: ShaderCacheStats,
+    /// Lookups that returned no module because its translation was still queued or running.
+    waits: u64,
     /// The counts the last INFO line showed, and when it was written.
     logged: (ShaderCacheStats, Option<Instant>),
 }
@@ -238,6 +240,7 @@ impl ShaderCache {
             pending: HashMap::default(),
             code_check: cache::CodeCheck::default(),
             stats: ShaderCacheStats::default(),
+            waits: 0,
             logged: (ShaderCacheStats::default(), None),
         }
     }
@@ -248,6 +251,16 @@ impl ShaderCache {
 
     pub fn stats(&self) -> ShaderCacheStats {
         self.stats
+    }
+
+    /// Lookups since the cache was created that found the module still translating.
+    pub fn waits(&self) -> u64 {
+        self.waits
+    }
+
+    /// Translations queued or running.
+    pub fn translating(&self) -> usize {
+        self.pending.len()
     }
 
     /// Writes the counts as an INFO line when they changed since the last one and at least
@@ -384,6 +397,7 @@ impl ShaderCache {
                 Some(module)
             }
             None if self.workers.is_some() && env.stage() != ShaderStage::Compute => {
+                self.waits += 1;
                 self.request(a, env, state, runtime, first);
                 return None;
             }

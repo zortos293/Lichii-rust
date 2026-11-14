@@ -769,6 +769,11 @@ fn draws_skip_while_workers_translate_their_programs() {
         target(&mut f).iter().all(|&t| t == [0; 4]),
         "draws whose programs are queued draw nothing"
     );
+    assert_eq!(
+        f.rasterizer.draw.shaders.waits(),
+        2,
+        "both draws are counted as waiting on a translation"
+    );
     let mut rounds = 0;
     while target(&mut f).iter().any(|&t| t != [255, 128, 0, 255]) {
         rounds += 1;

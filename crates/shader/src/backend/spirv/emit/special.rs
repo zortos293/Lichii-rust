@@ -157,10 +157,11 @@ pub(super) fn prologue(ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<(
         }
     }
     if ctx.stage == ShaderStage::Fragment
-        && ctx
-            .input_generics
-            .iter()
-            .any(|g| g.load_op == InputGenericLoadOp::TimesFragCoordW)
+        && (ctx.info.uses_interpolate_at_offset
+            || ctx
+                .input_generics
+                .iter()
+                .any(|g| g.load_op == InputGenericLoadOp::TimesFragCoordW))
     {
         let w = ctx.frag_coord_w()?;
         let f32_t = ctx.f32[1];

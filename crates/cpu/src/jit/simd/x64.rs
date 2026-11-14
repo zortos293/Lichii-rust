@@ -14,7 +14,9 @@
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 
 use super::super::ir::{Loc, Ty, Value};
-use super::super::x64::{CTX_FPCR, CTX_FPSR, CTX_PSTATE, Emitter, loc_offset};
+use super::super::x64::{
+    CTX_FPCR, CTX_FPSR, CTX_PSTATE, Emitter, ST_SCRATCH, ST_SCRATCH2, loc_offset,
+};
 use super::ir::{Arith, Fp, Fused, SimdOp};
 
 /// FPCR.RMode.
@@ -39,6 +41,18 @@ static HALF_SCALE: HalfScale = HalfScale([0x7780_0000, 0, 0, 0x7ef0_0000]);
 pub(in super::super) struct State {
     slow: Vec<Slow>,
     flush: Vec<Flush>,
+    exact: Vec<Exact>,
+}
+
+/// The out-of-line check of an arithmetic op that ran while FPSR.IXC was clear: it sets IXC when
+/// the op's result, whose bits are in `rax`, is not the exact value of `a op b`.
+struct Exact {
+    label: DynamicLabel,
+    resume: DynamicLabel,
+    op: Arith,
+    fp: Fp,
+    a: u8,
+    b: u8,
 }
 
 /// The inputs of a checked op that FPCR.FZ changes. FZ flushes a subnormal input to zero and
@@ -417,7 +431,9 @@ impl Emitter<'_> {
                 let d = self.def(v);
                 let extreme = matches!(op, Arith::Max | Arith::Min);
                 let sum = matches!(op, Arith::Add | Arith::Sub);
-                let slow = self.checked(!extreme, Some(Inputs::scalar(fp, &[a, b], sum)));
+                let exact = sum || fp == Fp::S && !extreme;
+                let inputs = Inputs::scalar(fp, &[a, b], sum);
+                let slow = self.checked(!extreme && !exact, Some(inputs));
                 dynasm!(self.asm ; .arch x64 ; movaps xmm15, Rx(a));
                 match (op, fp) {
                     (Arith::Max | Arith::Min, _) => self.min_max(op == Arith::Max, fp, a, b, slow),
@@ -437,6 +453,24 @@ impl Emitter<'_> {
                     Arith::Mul | Arith::Nmul => self.check_result(fp, true, (fp, &[a, b]), slow),
                     Arith::Div => self.check_result(fp, true, (fp, &[a]), slow),
                     Arith::Max | Arith::Min => self.low_to_rax(fp, 15),
+                }
+                if exact {
+                    let (label, resume) =
+                        (self.asm.new_dynamic_label(), self.asm.new_dynamic_label());
+                    dynasm!(self.asm
+                        ; .arch x64
+                        ; test BYTE [r15 + CTX_FPSR], IXC
+                        ; jz =>label
+                        ; =>resume
+                    );
+                    self.simd.exact.push(Exact {
+                        label,
+                        resume,
+                        op,
+                        fp,
+                        a,
+                        b,
+                    });
                 }
                 match (op, fp) {
                     (Arith::Nmul, Fp::S) => {
@@ -682,8 +716,127 @@ impl Emitter<'_> {
         }
     }
 
+    /// Jumps to `e.resume` when the result bits in `rax` are the exact value of `a op b`, and
+    /// falls through when they are rounded. A sum's rounding error comes from 2Sum, which is exact
+    /// for finite results, so it is zero only for an exact sum. An S product or quotient is exact
+    /// when `a * b`, or `q * b` against `a`, matches in D, where the product of two S values is
+    /// exact. Clobbers `xmm15`, `rcx` and the state's scratch.
+    fn exactness(&mut self, e: &Exact) {
+        let (a, b) = (e.a, e.b);
+        match (e.op, e.fp) {
+            (Arith::Add, Fp::S) => dynasm!(self.asm
+                ; .arch x64
+                ; movd xmm15, eax
+                ; subss xmm15, Rx(a)
+                ; movss [r13 + ST_SCRATCH], xmm15
+                ; movd xmm15, eax
+                ; subss xmm15, [r13 + ST_SCRATCH]
+                ; movss [r13 + ST_SCRATCH + 4], xmm15
+                ; movaps xmm15, Rx(a)
+                ; subss xmm15, [r13 + ST_SCRATCH + 4]
+                ; movss [r13 + ST_SCRATCH + 4], xmm15
+                ; movaps xmm15, Rx(b)
+                ; subss xmm15, [r13 + ST_SCRATCH]
+                ; addss xmm15, [r13 + ST_SCRATCH + 4]
+                ; movd ecx, xmm15
+                ; add ecx, ecx
+                ; jz =>e.resume
+            ),
+            (Arith::Add, Fp::D) => dynasm!(self.asm
+                ; .arch x64
+                ; movq xmm15, rax
+                ; subsd xmm15, Rx(a)
+                ; movsd [r13 + ST_SCRATCH], xmm15
+                ; movq xmm15, rax
+                ; subsd xmm15, [r13 + ST_SCRATCH]
+                ; movsd [r13 + ST_SCRATCH + 8], xmm15
+                ; movaps xmm15, Rx(a)
+                ; subsd xmm15, [r13 + ST_SCRATCH + 8]
+                ; movsd [r13 + ST_SCRATCH + 8], xmm15
+                ; movaps xmm15, Rx(b)
+                ; subsd xmm15, [r13 + ST_SCRATCH]
+                ; addsd xmm15, [r13 + ST_SCRATCH + 8]
+                ; movq rcx, xmm15
+                ; add rcx, rcx
+                ; jz =>e.resume
+            ),
+            (Arith::Sub, Fp::S) => dynasm!(self.asm
+                ; .arch x64
+                ; mov [r13 + ST_SCRATCH2], eax
+                ; movaps xmm15, Rx(a)
+                ; subss xmm15, [r13 + ST_SCRATCH2]
+                ; movss [r13 + ST_SCRATCH], xmm15
+                ; movd xmm15, eax
+                ; addss xmm15, [r13 + ST_SCRATCH]
+                ; movss [r13 + ST_SCRATCH + 4], xmm15
+                ; movaps xmm15, Rx(a)
+                ; subss xmm15, [r13 + ST_SCRATCH + 4]
+                ; movss [r13 + ST_SCRATCH + 4], xmm15
+                ; movss xmm15, [r13 + ST_SCRATCH]
+                ; subss xmm15, Rx(b)
+                ; addss xmm15, [r13 + ST_SCRATCH + 4]
+                ; movd ecx, xmm15
+                ; add ecx, ecx
+                ; jz =>e.resume
+            ),
+            (Arith::Sub, Fp::D) => dynasm!(self.asm
+                ; .arch x64
+                ; mov [r13 + ST_SCRATCH2], rax
+                ; movaps xmm15, Rx(a)
+                ; subsd xmm15, [r13 + ST_SCRATCH2]
+                ; movsd [r13 + ST_SCRATCH], xmm15
+                ; movq xmm15, rax
+                ; addsd xmm15, [r13 + ST_SCRATCH]
+                ; movsd [r13 + ST_SCRATCH + 8], xmm15
+                ; movaps xmm15, Rx(a)
+                ; subsd xmm15, [r13 + ST_SCRATCH + 8]
+                ; movsd [r13 + ST_SCRATCH + 8], xmm15
+                ; movsd xmm15, [r13 + ST_SCRATCH]
+                ; subsd xmm15, Rx(b)
+                ; addsd xmm15, [r13 + ST_SCRATCH + 8]
+                ; movq rcx, xmm15
+                ; add rcx, rcx
+                ; jz =>e.resume
+            ),
+            (Arith::Mul | Arith::Nmul, Fp::S) => dynasm!(self.asm
+                ; .arch x64
+                ; cvtss2sd xmm15, Rx(b)
+                ; movsd [r13 + ST_SCRATCH], xmm15
+                ; cvtss2sd xmm15, Rx(a)
+                ; mulsd xmm15, [r13 + ST_SCRATCH]
+                ; movsd [r13 + ST_SCRATCH], xmm15
+                ; movd xmm15, eax
+                ; cvtss2sd xmm15, xmm15
+                ; ucomisd xmm15, [r13 + ST_SCRATCH]
+                ; je =>e.resume
+            ),
+            (Arith::Div, Fp::S) => dynasm!(self.asm
+                ; .arch x64
+                ; cvtss2sd xmm15, Rx(b)
+                ; movsd [r13 + ST_SCRATCH], xmm15
+                ; movd xmm15, eax
+                ; cvtss2sd xmm15, xmm15
+                ; mulsd xmm15, [r13 + ST_SCRATCH]
+                ; movsd [r13 + ST_SCRATCH], xmm15
+                ; cvtss2sd xmm15, Rx(a)
+                ; ucomisd xmm15, [r13 + ST_SCRATCH]
+                ; je =>e.resume
+            ),
+            _ => unreachable!("only sums and S products and quotients are checked for exactness"),
+        }
+    }
+
     /// Emits the slow paths and FZ input checks of every checked op in the block.
     pub(in super::super) fn simd_slow_paths(&mut self) {
+        for exact in std::mem::take(&mut self.simd.exact) {
+            dynasm!(self.asm ; .arch x64 ; =>exact.label);
+            self.exactness(&exact);
+            dynasm!(self.asm
+                ; .arch x64
+                ; or BYTE [r15 + CTX_FPSR], IXC
+                ; jmp =>exact.resume
+            );
+        }
         for flush in std::mem::take(&mut self.simd.flush) {
             dynasm!(self.asm
                 ; .arch x64
