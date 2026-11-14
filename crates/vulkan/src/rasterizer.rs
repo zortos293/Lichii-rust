@@ -282,19 +282,21 @@ impl VulkanRasterizer {
         scheduler.time_waits(handles.activity.clone());
         let pipelines = PipelineCache::new(device, &GraphicsSettings::default(), None, None)?;
         let draw = draw::DrawState::new(device, pipelines, gob_layout, scheduler.record()?)?;
+        let staging = StagingRing::new(device, 32 << 20)?;
+        let samples = samples::SampleCounter::new(device)?;
         Ok(Self {
             buffer_cache: ManuallyDrop::new(buffer_cache),
             draw,
             device: device.clone(),
             handles,
             scheduler,
-            staging: StagingRing::new(device, 32 << 20)?,
+            staging,
             frame_uploads: Vec::new(),
             mailbox,
             gob_layout,
             frames: Vec::new(),
             fences: VecDeque::new(),
-            samples: samples::SampleCounter::new(device)?,
+            samples,
             unflushed: true,
             texture_cache: ManuallyDrop::new(texture_cache),
             live: None,
