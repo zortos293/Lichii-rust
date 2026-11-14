@@ -36,7 +36,9 @@ use lichii_texture::block_linear::GobLayout;
 use lichii_texture::tic::TextureMemory;
 use lichii_texture::{Numeric, PixelFormat};
 
+use super::Release;
 use super::VulkanRasterizer;
+use super::samples::SampleCounter;
 use crate::buffer_cache::{BufferBinding, IndexBinding, assembled_topology, vertex_stream_range};
 use crate::commands::ImageAccess;
 use crate::descriptors::DescriptorAllocator;
@@ -748,11 +750,16 @@ impl VulkanRasterizer {
             0 => None,
             _ => {
                 let slot = self.samples.reserve(&self.device, cmd, scale);
-                if slot.is_none() {
-                    self.draw.warn_once(
+                match slot {
+                    None => self.draw.warn_once(
                         Warning::SampleQueries,
-                        "every occlusion query waits for a report to read it; draws go uncounted",
-                    );
+                        "every occlusion query waits for its draw to finish; draws go uncounted",
+                    ),
+                    Some(slot) if SampleCounter::starts_block(slot) => self.fences.push_back((
+                        self.scheduler.tick(),
+                        Release::SamplesFold(self.samples.report()),
+                    )),
+                    Some(_) => {}
                 }
                 slot
             }
