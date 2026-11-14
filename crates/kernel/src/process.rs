@@ -432,15 +432,21 @@ impl Process {
 
     /// Frees everything the process owns once its last thread is gone.
     pub(crate) fn finalize(&self) {
+        let t = std::time::Instant::now();
         let objects = self.handles.write().clear();
+        let n = objects.len();
         drop(objects);
+        let handles = t.elapsed();
         if let Some((addr, size)) = self.main_stack.lock().take() {
             let _ = self
                 .page_table
                 .unmap_and_free(addr, size, MemoryState::STACK);
         }
+        let stack = t.elapsed();
         self.page_table.release_all();
+        let pages = t.elapsed();
         self.shared_mappings.lock().clear();
+        tracing::info!(n, ?handles, ?stack, ?pages, total = ?t.elapsed(), "diag exit: finalize");
         self.set_state(ProcessState::Exited);
         self.sync.signal();
     }
