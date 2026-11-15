@@ -455,6 +455,9 @@ impl VulkanRasterizer {
                 continue;
             };
             let modified = self.texture_cache.diag_modified(id).unwrap_or(0);
+            if !always && modified == 0 {
+                continue;
+            }
             if !always && stat_seen(id, modified) {
                 log(&format!("STAT {label} {id:?} same m={modified}"));
                 continue;
