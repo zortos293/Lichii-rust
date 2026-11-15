@@ -27,6 +27,7 @@ pub const KEYS: &[&str] = &[
     "graphics.speed_limit",
     "graphics.gpu_accuracy",
     "graphics.anisotropic_filtering",
+    "graphics.fast_gpu_time",
     "graphics.astc_decode",
     "graphics.astc_recompression",
     "graphics.vram_usage",

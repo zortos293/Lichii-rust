@@ -233,6 +233,9 @@ impl GameConfigWindow {
                             combo(ui, "game aniso", &mut d.graphics.anisotropic_filtering);
                         },
                     );
+                    r.row(ui, "graphics.fast_gpu_time", "GPU clocks", |ui, d| {
+                        combo(ui, "game gpu clocks", &mut d.graphics.fast_gpu_time);
+                    });
                     r.row(ui, "graphics.astc_decode", "ASTC decoding", |ui, d| {
                         combo(ui, "game astc decode", &mut d.graphics.astc_decode);
                     });

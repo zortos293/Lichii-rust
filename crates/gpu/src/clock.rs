@@ -10,6 +10,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
+use lichii_common::settings::GpuClock;
+
 /// Guest time, as core timing keeps it.
 pub trait GuestTime: Send + Sync {
     /// Nanoseconds of guest time since boot.
@@ -24,6 +26,16 @@ pub enum GpuClockSpeed {
     Normal = 0,
     Boost = 1,
     Overclock = 2,
+}
+
+impl From<GpuClock> for GpuClockSpeed {
+    fn from(clock: GpuClock) -> Self {
+        match clock {
+            GpuClock::Normal => Self::Normal,
+            GpuClock::Boost => Self::Boost,
+            GpuClock::Overclock => Self::Overclock,
+        }
+    }
 }
 
 impl GpuClockSpeed {

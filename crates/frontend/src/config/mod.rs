@@ -344,6 +344,9 @@ impl ConfigWindow {
                     row(ui, "Anisotropic filtering", |ui| {
                         combo(ui, "aniso", &mut d.graphics.anisotropic_filtering)
                     });
+                    row(ui, "GPU clocks", |ui| {
+                        combo(ui, "gpu clocks", &mut d.graphics.fast_gpu_time)
+                    });
                     row(ui, "ASTC decoding", |ui| {
                         combo(ui, "astc decode", &mut d.graphics.astc_decode)
                     });
