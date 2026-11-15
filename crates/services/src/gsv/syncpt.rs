@@ -327,6 +327,7 @@ impl SyncptSession {
         let (event, generation) = self.cancel(&mut self.slots.lock(), slot);
         event.clear();
         let guest = self.syncpoints.guest();
+        tracing::info!("diag syncpt 201 slot {slot} syncpoint {id} value {threshold} now {:?}", guest.value(id));
         if guest.value(id).is_err() {
             tracing::warn!("nx2:syncpt 201: syncpoint {id:#x} out of range, signalling");
             event.signal();

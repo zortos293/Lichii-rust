@@ -349,9 +349,15 @@ impl VideoDecoderService {
                 return UNKNOWN;
             };
             state.free.push_back(Some(Handout { image, release }));
-            for _ in 0..state.drain_after_end() {
+            let drained = state.drain_after_end();
+            for _ in 0..drained {
                 shared.increment();
             }
+            tracing::info!(
+                "diag vdec {} image {image} release {release:?} fence {value} drained {drained} ended {} running {} inputs {} decoded {} free {} outputs {} now {:?}",
+                ctx.command(), state.stream_ended, state.running, state.inputs.len(), state.decoded.len(),
+                state.free.len(), state.outputs.len(), shared.syncpoints.guest().value(shared.syncpoint)
+            );
             value
         };
         tracing::debug!(
@@ -419,8 +425,10 @@ impl VideoDecoderService {
     /// u32 height, u32 colour space, u64 pts in ns, u32 end of stream.
     fn output_info(&self, ctx: &mut HleRequestContext) -> ResultCode {
         let Some(output) = self.shared.state.lock().outputs.pop_front() else {
+            tracing::info!("diag vdec 213 empty");
             return NO_OUTPUT;
         };
+        tracing::info!("diag vdec 213 image {} {}x{} pts {} end {}", output.image, output.width, output.height, output.pts, output.end);
         for word in [
             output.image,
             output.width,
@@ -444,6 +452,11 @@ impl VideoDecoderService {
     fn stop(&self, command: u32) -> ResultCode {
         let shared = &self.shared;
         let mut state = shared.state.lock();
+        tracing::info!(
+            "diag vdec stop {command} ended {} inputs {} decoded {} free {} outputs {} now {:?} max {:?}",
+            state.stream_ended, state.inputs.len(), state.decoded.len(), state.free.len(), state.outputs.len(),
+            shared.syncpoints.guest().value(shared.syncpoint), shared.syncpoints.max(shared.syncpoint)
+        );
         state.flush();
         if command == 8 {
             drop(state);
@@ -827,9 +840,14 @@ impl Shared {
                         state.end_frame = (width, height, decoded.pts);
                     }
                     self.increment();
-                    for _ in 0..state.drain_after_end() {
+                    let drained = state.drain_after_end();
+                    for _ in 0..drained {
                         self.increment();
                     }
+                    if state.stream_ended { tracing::info!(
+                        "diag vdec frame out end {} drained {drained} inputs {} decoded {} free {} outputs {}",
+                        state.stream_ended, state.inputs.len(), state.decoded.len(), state.free.len(), state.outputs.len()
+                    ); }
                     continue;
                 }
                 wake = Some(host_now + Duration::from_micros(due - now));
