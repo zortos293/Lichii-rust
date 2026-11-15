@@ -572,7 +572,9 @@ pub(super) fn interp_hook(memory: &AddressSpace, ctx: &ThreadContext) {
     if !interp_pc(ctx.pc) {
         return;
     }
-    let nan: Vec<usize> = (0..31).filter(|&i| nan32(ctx.x[i] as u32)).collect();
+    let nan: Vec<usize> = (0..31)
+        .filter(|&i| ctx.x[i] >> 32 == 0 && nan32(ctx.x[i] as u32))
+        .collect();
     if nan.is_empty() {
         return;
     }
@@ -591,13 +593,24 @@ pub(super) fn interp_hook(memory: &AddressSpace, ctx: &ThreadContext) {
         .enumerate()
         .map(|(i, v)| format!("x{i}={v:x}"))
         .collect();
+    let around: Vec<String> = (0..31)
+        .filter(|&i| memory.read::<u32>(ctx.x[i]).is_ok() && i != 29 && i != 30)
+        .map(|i| {
+            let at = ctx.x[i].wrapping_sub(0x40) & !3;
+            format!(
+                "x{i}@{at:#x}:[{}]",
+                bytes(memory, at, 48).unwrap_or_default()
+            )
+        })
+        .collect();
     tracing::warn!(
-        "LIRU3 INTERP t={:.3} pc={:#x} nanregs={nan:?} tls={:#x} sp={:#x} {} bt=[{}]",
+        "LIRU3 INTERP t={:.3} pc={:#x} nanregs={nan:?} tls={:#x} sp={:#x} {} bt=[{}] mem={}",
         t(),
         ctx.pc,
         ctx.tpidr_el0,
         ctx.sp,
         x.join(" "),
-        backtrace(memory, ctx)
+        backtrace(memory, ctx),
+        around.join(" ")
     );
 }
