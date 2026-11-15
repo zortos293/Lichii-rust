@@ -57,6 +57,9 @@ impl AppletFrontend for UiApplets {
     }
 
     fn select_profile(&self, request: &ProfileSelectRequest) -> ProfileSelectAnswer {
+        if let Some(uid) = profile::selectable_user(request) {
+            return ProfileSelectAnswer::Selected(uid);
+        }
         self.ask(|reply| Request::Profile(request.clone(), reply))
             .unwrap_or(ProfileSelectAnswer::Cancelled)
     }
@@ -105,15 +108,13 @@ pub struct AppletDialogs {
     /// The inline keyboard while the title shows it; it draws under any applet dialog.
     inline: Option<InlineKeyboard>,
     wake: Arc<dyn Fn() + Send + Sync>,
-    /// The nickname of the user acc signed in, which the profile selector offers.
-    username: String,
     open: Option<Dialog>,
 }
 
 impl AppletDialogs {
-    /// Dialogs for a session whose user is `username`. Their frontend calls `wake` when a title
-    /// opens an applet, so the UI redraws.
-    pub fn new(username: impl Into<String>, wake: impl Fn() + Send + Sync + 'static) -> Self {
+    /// Dialogs for a session. Their frontend calls `wake` when a title opens an applet, so the
+    /// UI redraws.
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
         let (sender, requests) = crossbeam_channel::unbounded();
         let (inline_sender, inline_msgs) = crossbeam_channel::unbounded();
         Self {
@@ -123,7 +124,6 @@ impl AppletDialogs {
             inline_msgs,
             inline: None,
             wake: Arc::new(wake),
-            username: username.into(),
             open: None,
         }
     }
@@ -185,7 +185,7 @@ impl AppletDialogs {
                     Dialog::Keyboard(KeyboardDialog::new(request, reply))
                 }
                 Request::Profile(request, reply) => {
-                    Dialog::Profile(ProfileDialog::new(request, reply, &self.username))
+                    Dialog::Profile(ProfileDialog::new(request, reply))
                 }
                 Request::Controller(request, reply) => {
                     Dialog::Controller(ControllerDialog::new(request, reply, controls))

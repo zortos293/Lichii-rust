@@ -7,6 +7,7 @@
 //! dispatches (see [`draw`]).
 
 mod draw;
+mod fence_waiter;
 mod frame_dump;
 mod samples;
 
@@ -187,6 +188,7 @@ pub struct VulkanRasterizer {
     gob_layout: GobLayout,
     frames: Vec<Arc<FrameImage>>,
     fences: VecDeque<(u64, Release)>,
+    fence_waiter: Option<fence_waiter::FenceWaiter>,
     samples: samples::SampleCounter,
     unflushed: bool,
     texture_cache: ManuallyDrop<TextureCache>,
@@ -378,6 +380,7 @@ impl VulkanRasterizer {
             gob_layout,
             frames: Vec::new(),
             fences: VecDeque::new(),
+            fence_waiter: None,
             samples,
             unflushed: true,
             texture_cache: ManuallyDrop::new(texture_cache),
@@ -1239,6 +1242,23 @@ impl Rasterizer for VulkanRasterizer {
                 }
             }
         }
+        if let Some(waiter) = &mut self.fence_waiter
+            && let Some(&(tick, _)) = self.fences.front()
+            && tick < self.scheduler.tick()
+        {
+            waiter.wait_for(tick);
+        }
+    }
+
+    fn set_fence_wake(&mut self, wake: Box<dyn Fn() + Send + Sync>) {
+        match fence_waiter::FenceWaiter::spawn(
+            self.device.clone(),
+            self.scheduler.shared_timeline(),
+            wake,
+        ) {
+            Ok(waiter) => self.fence_waiter = Some(waiter),
+            Err(error) => tracing::warn!(%error, "no fence wake thread; fences are polled"),
+        }
     }
 
     fn has_pending_fences(&self) -> bool {
@@ -1391,10 +1411,6 @@ impl Rasterizer for VulkanRasterizer {
         self.buffer_cache.invalidate(addr, size);
         self.draw.shaders.invalidate(addr, size);
         self.texture_cache.unmap(&mut self.scheduler, addr, size);
-    }
-
-    fn invalidate_gpu_caches(&mut self) {
-        self.texture_cache.invalidate_lookups();
     }
 
     fn barrier(&mut self) {
@@ -2101,6 +2117,38 @@ mod tests {
         f.rasterizer.release_fences(true);
         assert!(!f.rasterizer.has_pending_fences());
         assert_eq!(f.syncpoints.guest().value(4).unwrap(), 1);
+    }
+
+    #[test]
+    fn fence_wake_fires_once_the_timeline_reaches_the_tick() {
+        let Some(f) = fixture(GobLayout::Tegra) else {
+            return;
+        };
+        let device = f.rasterizer.device.clone();
+        let timeline = Scheduler::new(&device).unwrap().shared_timeline();
+        let (woke, wakes) = std::sync::mpsc::channel();
+        let woke = std::sync::Mutex::new(woke);
+        let mut waiter = fence_waiter::FenceWaiter::spawn(
+            device.clone(),
+            timeline.clone(),
+            Box::new(move || woke.lock().unwrap().send(()).unwrap()),
+        )
+        .unwrap();
+        waiter.wait_for(1);
+        assert!(
+            wakes
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "no wake before the timeline reaches the tick"
+        );
+        let signal = vk::SemaphoreSignalInfo::default()
+            .semaphore(timeline.raw())
+            .value(1);
+        // SAFETY: nothing submitted signals this timeline; the host moves it to 1.
+        unsafe { device.raw.signal_semaphore(&signal).unwrap() };
+        wakes
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the wake fires once the tick is reached");
     }
 
     #[test]

@@ -28,7 +28,7 @@ impl Harness {
         let counter = wakes.clone();
         Self {
             ctx: egui::Context::default(),
-            dialogs: AppletDialogs::new("Lichii", move || {
+            dialogs: AppletDialogs::new(move || {
                 counter.fetch_add(1, Ordering::Relaxed);
             }),
             wakes,

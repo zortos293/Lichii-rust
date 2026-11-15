@@ -3234,3 +3234,78 @@ fn subresources_split_across_device_ranges_sync_every_part() {
     );
     f.assert_no_validation_errors();
 }
+
+#[test]
+fn cached_misses_end_when_the_gmmu_maps_their_address() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let unmapped = GPU_VA + 2 * DRAM;
+    let info = rt_info(64, 64, 4, GobLayout::Tegra);
+    for _ in 0..2 {
+        let (mut tx, cache, gmmu) = f.tx();
+        assert!(
+            cache
+                .find(&mut tx, gmmu, unmapped, &info)
+                .unwrap()
+                .is_none()
+        );
+    }
+    let miss = f.cache.lookup.iter().find(|(k, _)| k.gpu_va == unmapped);
+    assert!(
+        miss.is_some_and(|(_, e)| e.found.is_none()),
+        "the miss is cached"
+    );
+    f.gmmu.map(unmapped, DADDR, 1 << 20, 0, false).unwrap();
+    let (mut tx, cache, gmmu) = f.tx();
+    assert!(
+        cache
+            .find(&mut tx, gmmu, unmapped, &info)
+            .unwrap()
+            .is_some(),
+        "a GMMU map ends the cached miss"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn cached_misses_end_when_an_image_is_created() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let unmapped = GPU_VA + 2 * DRAM;
+    let info = rt_info(64, 64, 4, GobLayout::Tegra);
+    let miss = |cache: &TextureCache| {
+        cache
+            .lookup
+            .iter()
+            .find(|(k, _)| k.gpu_va == unmapped)
+            .map(|(_, e)| (e.found.is_none(), e.creations == cache.creations))
+    };
+    let (mut tx, cache, gmmu) = f.tx();
+    assert!(
+        cache
+            .find(&mut tx, gmmu, unmapped, &info)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(miss(cache), Some((true, true)));
+    assert!(cache.find(&mut tx, gmmu, GPU_VA, &info).unwrap().is_some());
+    assert_eq!(
+        miss(cache),
+        Some((true, false)),
+        "a created image ends the cached miss"
+    );
+    assert!(
+        cache
+            .find(&mut tx, gmmu, unmapped, &info)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        miss(cache),
+        Some((true, true)),
+        "the next lookup caches the miss again"
+    );
+    f.assert_no_validation_errors();
+}
