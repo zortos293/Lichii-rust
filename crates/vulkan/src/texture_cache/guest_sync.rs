@@ -33,6 +33,15 @@ enum Packing {
     DepthLowStencilHigh = 1,
     /// S8 in the low byte, D24 above it (S8UintD24Unorm).
     StencilLowDepthHigh = 2,
+    /// D24 in the low bits and a zero high byte, with no stencil plane (X8D24Unorm).
+    DepthLowZeroHigh = 3,
+}
+
+impl Packing {
+    /// Whether the host texel has a stencil plane the guest word holds.
+    fn stencil(self) -> bool {
+        matches!(self, Self::DepthLowStencilHigh | Self::StencilLowDepthHigh)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -90,8 +99,8 @@ impl GuestSync {
 
 /// How `image` packs into guest words on the GPU, or `None` when the pass can't move it: only
 /// block-linear 2D images (or 3D ones one slice deep) at native scale whose rows are whole
-/// 32-bit words at every level, laid out as the guest's, or D24S8 kept as the host's D24S8 or
-/// D32S8 and mapped whole.
+/// 32-bit words at every level, laid out as the guest's, D24S8 kept as the host's D24S8 or
+/// D32S8 and mapped whole, or X8D24 kept as the host's X8D24 or D32.
 fn packing(image: &CachedImage) -> Option<Packing> {
     let info = &image.info;
     let bytes = info.format.bytes_per_block();
@@ -117,6 +126,14 @@ fn packing(image: &CachedImage) -> Option<Packing> {
         }
         PixelFormat::S8UintD24Unorm if depth_stencil_host(host) => {
             image.contiguous().then_some(Packing::StencilLowDepthHigh)
+        }
+        PixelFormat::X8D24Unorm
+            if matches!(
+                host,
+                vk::Format::X8_D24_UNORM_PACK32 | vk::Format::D32_SFLOAT
+            ) =>
+        {
+            Some(Packing::DepthLowZeroHigh)
         }
         _ if image.host.conversion == Conversion::None
             && !aspect_of(host).contains(vk::ImageAspectFlags::STENCIL) =>
@@ -276,7 +293,7 @@ impl TextureCache {
             return Ok(false);
         }
         let mut window = whole;
-        if packing(image) == Some(Packing::Plain) {
+        if packing(image).is_some_and(|p| !p.stencil()) {
             window = (u64::MAX, 0);
             for &o in newer.iter() {
                 if !shared_runs(live(o), image, whole, scratch) {
@@ -457,7 +474,7 @@ impl TextureCache {
                             &[region(main_aspect)],
                         );
                     }
-                    if packing != Packing::Plain {
+                    if packing.stencil() {
                         match direction {
                             Direction::ToGuest => device.raw.cmd_copy_image_to_buffer(
                                 cmd,
@@ -492,7 +509,13 @@ impl TextureCache {
                             direction: direction as u32,
                             packing: packing as u32,
                             stencil_pitch: w,
-                            depth_float: u32::from(host == vk::Format::D32_SFLOAT_S8_UINT),
+                            depth_float: u32::from(
+                                packing != Packing::Plain
+                                    && matches!(
+                                        host,
+                                        vk::Format::D32_SFLOAT | vk::Format::D32_SFLOAT_S8_UINT
+                                    ),
+                            ),
                         };
                         sync.compute.dispatch(
                             cmd,
@@ -512,7 +535,7 @@ impl TextureCache {
                             layout,
                             &[region(main_aspect)],
                         );
-                        if packing != Packing::Plain {
+                        if packing.stencil() {
                             device.raw.cmd_copy_buffer_to_image(
                                 cmd,
                                 stencil,

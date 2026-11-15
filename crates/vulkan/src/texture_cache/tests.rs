@@ -2345,6 +2345,180 @@ fn depth_stencil_overlaps_sync_on_the_gpu() {
 }
 
 #[test]
+fn x8d24_overlaps_sync_on_the_gpu_converting_as_the_cpu_does() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let (w, h) = (256, 64);
+    let mut depth = rt_info(w, h, 2, GobLayout::Tegra);
+    depth.format = PixelFormat::X8D24Unorm;
+    let colour = rt_info(64, 64, 2, GobLayout::Tegra);
+    let inside = |k: usize| (8..24).contains(&(k % 64)) && (40..48).contains(&(k / 64));
+    let depth_tiling = depth.surface().level_tiling(0);
+    let colour_tiling = colour.surface().level_tiling(0);
+    let mut tiled = vec![0; depth_tiling.size_bytes()];
+    let numbered: Vec<u8> = (1..=64 * 64u32).flat_map(u32::to_le_bytes).collect();
+    swizzle(
+        &colour_tiling,
+        &numbered,
+        &mut tiled[..colour_tiling.size_bytes()],
+    );
+    let mut numbered_in_depth = vec![0; depth_tiling.linear_size_bytes()];
+    unswizzle(&depth_tiling, &tiled, &mut numbered_in_depth);
+    let colour_texel: Vec<Option<usize>> = numbered_in_depth
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&n| (u32::from_le_bytes(n) as usize).checked_sub(1))
+        .collect();
+    let d24 = |i: u32| match i % 4 {
+        0 => i / 4,
+        1 => 0xff_ffff - i / 4,
+        _ => i.wrapping_mul(0x9e37_79b9) >> 8,
+    };
+    let words: Vec<u32> = (0..w * h)
+        .map(|i| d24(i) | (i.wrapping_mul(37) & 0xff) << 24)
+        .collect();
+    let float_host = HostFormat {
+        format: vk::Format::D32_SFLOAT,
+        conversion: Conversion::Convert,
+        swizzle: vk::ComponentMapping::default(),
+        attachable: true,
+        storage: false,
+    };
+    let native = host_format(&f.device, depth.format, AstcRecompression::Uncompressed);
+    for host in [float_host, native] {
+        let float = match host.format {
+            vk::Format::D32_SFLOAT => true,
+            vk::Format::X8_D24_UNORM_PACK32 => false,
+            other => {
+                eprintln!("skipping X8D24 held as {other:?}");
+                continue;
+            }
+        };
+        f.cache.host_formats[depth.format as usize] = Some(host);
+        let to_host = |word: u32| {
+            let d = word & 0xff_ffff;
+            if float {
+                ((f64::from(d) / 16_777_215.0) as f32).to_bits()
+            } else {
+                d
+            }
+        };
+        let host_word = |word: [u8; 4]| {
+            let word = u32::from_le_bytes(word);
+            if float { word } else { word & 0xff_ffff }
+        };
+        let to_guest = |host: u32| {
+            if float {
+                (f64::from(f32::from_bits(host)).clamp(0.0, 1.0) * 16_777_215.0).round() as u32
+            } else {
+                host & 0xff_ffff
+            }
+        };
+        let linear: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut guest = vec![0; depth_tiling.size_bytes()];
+        swizzle(&depth_tiling, &linear, &mut guest);
+        f.memory.write_bytes(DADDR, &guest).unwrap();
+        let (mut tx, cache, gmmu) = f.tx();
+        let target = cache
+            .render_target(&mut tx, gmmu, GPU_VA, &depth, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(f.cache.get(target.id).unwrap().host.format, host.format);
+        let uploaded = f.read_plane(target.id, vk::ImageAspectFlags::DEPTH, 4);
+        for (i, &texel) in uploaded.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(host_word(texel), to_host(words[i]), "uploaded texel {i}");
+        }
+        let blue = 0x4433_2211;
+        clear_rt(
+            &mut f,
+            &colour,
+            [0x11u8, 0x22, 0x33, 0x44].map(|c| f32::from(c) / 255.0),
+            Rect {
+                x: 8,
+                y: 40,
+                width: 16,
+                height: 8,
+            },
+        );
+        let before = f.cache.traffic();
+        let (mut tx, cache, gmmu) = f.tx();
+        let synced = cache
+            .render_target(&mut tx, gmmu, GPU_VA, &depth, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(synced.id, target.id);
+        assert!(f.cache.traffic().gpu_syncs > before.gpu_syncs, "{host:?}");
+        assert_eq!(f.cache.traffic().downloads, before.downloads, "{host:?}");
+        let synced = f.read_plane(target.id, vk::ImageAspectFlags::DEPTH, 4);
+        for (i, &texel) in synced.as_chunks::<4>().0.iter().enumerate() {
+            let from = match colour_texel[i] {
+                Some(k) if inside(k) => blue,
+                _ => words[i],
+            };
+            assert_eq!(host_word(texel), to_host(from), "{host:?}: texel {i}");
+        }
+
+        let (mut tx, cache, gmmu) = f.tx();
+        let target = cache
+            .render_target(&mut tx, gmmu, GPU_VA, &depth, false)
+            .unwrap()
+            .unwrap();
+        cache
+            .clear(
+                &mut tx,
+                target,
+                ClearValue::DepthStencil {
+                    depth: Some(0.3),
+                    stencil: None,
+                    stencil_mask: 0,
+                },
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 32,
+                    height: 4,
+                },
+                0,
+                1,
+            )
+            .unwrap();
+        let newest: Vec<u32> = f
+            .read_plane(target.id, vk::ImageAspectFlags::DEPTH, 4)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&t| host_word(t))
+            .collect();
+        let before = f.cache.traffic();
+        let (mut tx, cache, gmmu) = f.tx();
+        let taken = cache
+            .render_target(&mut tx, gmmu, GPU_VA, &colour, false)
+            .unwrap()
+            .unwrap();
+        assert!(f.cache.traffic().gpu_syncs > before.gpu_syncs, "{host:?}");
+        assert_eq!(f.cache.traffic().downloads, before.downloads, "{host:?}");
+        let texels = f.read_image(taken.id).remove(0);
+        let mut expected = vec![0; 64 * 64];
+        for (i, k) in colour_texel.iter().enumerate() {
+            if let Some(k) = *k {
+                expected[k] = to_guest(newest[i]);
+            }
+        }
+        for (k, &texel) in texels.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(
+                u32::from_le_bytes(texel),
+                expected[k],
+                "{host:?}: guest word of colour texel {k}"
+            );
+        }
+        f.cache.unmap(&mut f.scheduler, DADDR, 1 << 20);
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
 fn block_linear_aliases_need_the_same_depth_stencil_encoding() {
     let info = |format, width| {
         let mut info = rt_info(width, 64, 2, GobLayout::Tegra);
