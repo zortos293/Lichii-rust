@@ -10,8 +10,8 @@ use lichii_texture::PixelFormat;
 use lichii_texture::block_linear::GobLayout;
 
 use super::{
-    CachedImage, GuestLayout, ImageId, ImageInfo, ImageKind, ResolutionScale, Segment, TextureCache,
-    Transfer,
+    CachedImage, GuestLayout, ImageId, ImageInfo, ImageKind, ResolutionScale, Segment,
+    TextureCache, Transfer,
 };
 use crate::commands::ImageAccess;
 use crate::descriptors::DescriptorAllocator;
@@ -297,10 +297,7 @@ fn moved_bytes(info: &ImageInfo, levels: u32, lo: u64, hi: u64, out: &mut Vec<(u
 /// offset that moves a byte there keeps it, as when the runs were painted one after another in
 /// image order. `moved` pushes, in order, the image offsets in `[lo, hi)` the shader moves, so
 /// a run's padding claims nothing. Leaves the runs sorted by image offset.
-fn trim_aliases(
-    scratch: &mut RunScratch,
-    mut moved: impl FnMut(u64, u64, &mut Vec<(u64, u64)>),
-) {
+fn trim_aliases(scratch: &mut RunScratch, mut moved: impl FnMut(u64, u64, &mut Vec<(u64, u64)>)) {
     let RunScratch {
         runs,
         claimed,
@@ -1028,12 +1025,14 @@ mod tests {
                     }
                 }
             }
-            for (lo, hi) in [(0, size), (100, size / 2 + 6), (size / 3, size - 4), (513, 515)] {
+            for (lo, hi) in [
+                (0, size),
+                (100, size / 2 + 6),
+                (size / 3, size - 4),
+                (513, 515),
+            ] {
                 let mut expected: Vec<(u64, u64)> = Vec::new();
-                for at in lo..hi {
-                    if !moved[at] {
-                        continue;
-                    }
+                for (at, _) in moved.iter().enumerate().take(hi).skip(lo).filter(|m| *m.1) {
                     match expected.last_mut() {
                         Some(last) if last.1 == at as u64 => last.1 += 1,
                         _ => expected.push((at as u64, at as u64 + 1)),
