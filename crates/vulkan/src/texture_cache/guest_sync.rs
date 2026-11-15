@@ -184,7 +184,7 @@ fn shared_runs(
     window: (u64, u64),
     scratch: &mut RunScratch,
 ) -> bool {
-    let RunScratch { targets, runs } = scratch;
+    let RunScratch { targets, runs, .. } = scratch;
     targets.clear();
     targets.extend_from_slice(&target.segments);
     targets.sort_unstable_by_key(|t| t.daddr);
