@@ -11,13 +11,18 @@ use lichii_kernel::object::KObject;
 use lichii_kernel::testing::{IpcClient, Request};
 use lichii_memory::MemoryPermission;
 
+use super::vdec::MARIO_KART_WORLD;
 use crate::ServiceContext;
 use crate::testing::{SWITCH2_TITLE, context};
 
 const CURRENT_PROCESS: Handle = 0xffff_8001;
 
 fn gsv() -> (Arc<ServiceContext>, IpcClient, Handle) {
-    let (context, client) = context(SWITCH2_TITLE, Settings::default());
+    gsv_for(SWITCH2_TITLE)
+}
+
+fn gsv_for(program_id: u64) -> (Arc<ServiceContext>, IpcClient, Handle) {
+    let (context, client) = context(program_id, Settings::default());
     crate::am::register(&context).unwrap();
     let service = client.connect("appletOE").unwrap();
     let open = Request::new(0)
@@ -1319,7 +1324,12 @@ impl Vdec {
     /// A decoder service through gsv 902, initialized (200), configured (101) for a 1280x720
     /// VP9 movie and started (6), as Mario Tennis Fever opens its movie.
     fn open() -> Self {
-        let (context, client, gsv) = gsv();
+        Self::open_for(SWITCH2_TITLE)
+    }
+
+    /// `open` for the title `program_id`.
+    fn open_for(program_id: u64) -> Self {
+        let (context, client, gsv) = gsv_for(program_id);
         crate::nvdrv::register(&context).unwrap();
         let decoder = session(&client, gsv, 902);
         let service = session(&client, decoder, 1);
@@ -1533,7 +1543,7 @@ fn video_decoder_plays_a_movie_at_its_pts_pace_and_ends_it() {
 
 #[test]
 fn video_decoder_completes_the_images_still_handed_out_at_the_end_of_stream() {
-    let vdec = Vdec::open();
+    let vdec = Vdec::open_for(MARIO_KART_WORLD);
     let fences: Vec<_> = (1..=5).map(|image| vdec.hand_out(311, image)).collect();
     let (syncpoint, last) = fences[4];
     for pts in [0, 20_000] {
@@ -1556,7 +1566,7 @@ fn video_decoder_completes_the_images_still_handed_out_at_the_end_of_stream() {
 
 #[test]
 fn video_decoder_completes_an_image_handed_out_after_the_end_of_stream_at_once() {
-    let vdec = Vdec::open();
+    let vdec = Vdec::open_for(MARIO_KART_WORLD);
     let (syncpoint, first) = vdec.hand_out(311, 1);
     assert_eq!(vdec.submit(30_000, true).result, ResultCode::SUCCESS);
     vdec.wait(syncpoint, first);
@@ -1571,6 +1581,29 @@ fn video_decoder_completes_an_image_handed_out_after_the_end_of_stream_at_once()
     );
     assert_eq!(vdec.output(), Some((2, 1280, 30_000_000, true)));
     assert_eq!(vdec.output(), None);
+    vdec.close(syncpoint);
+}
+
+#[test]
+fn video_decoder_keeps_images_handed_out_after_the_end_of_stream_for_the_next_stream() {
+    let vdec = Vdec::open();
+    let (syncpoint, first) = vdec.hand_out(311, 1);
+    assert_eq!(vdec.submit(30_000, true).result, ResultCode::SUCCESS);
+    vdec.wait(syncpoint, first);
+    assert_eq!(vdec.output(), Some((1, 1280, 30_000_000, true)));
+
+    let (_, kept) = vdec.hand_out(314, 2);
+    let guest = vdec.context.gpu.host1x().syncpoints.guest();
+    assert!(
+        !guest.is_reached(syncpoint, kept).unwrap(),
+        "the image waits for the next stream"
+    );
+    assert_eq!(vdec.output(), None);
+
+    assert_eq!(vdec.send(&Request::tipc(8)).result, ResultCode::SUCCESS);
+    assert_eq!(vdec.submit(0, false).result, ResultCode::SUCCESS);
+    vdec.wait(syncpoint, kept);
+    assert_eq!(vdec.output(), Some((2, 1280, 0, false)));
     vdec.close(syncpoint);
 }
 
