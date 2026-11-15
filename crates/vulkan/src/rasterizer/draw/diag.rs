@@ -80,6 +80,12 @@ pub(crate) fn skip_vs() -> &'static [u64] {
     V.get_or_init(|| hex_list("LICHII_DIAG_SKIP_VS"))
 }
 
+/// LICHII_DIAG_SKIP_D16_VS: skip draws with these vertex shaders only while a D16 depth target is bound.
+pub(crate) fn skip_d16_vs() -> &'static [u64] {
+    static V: OnceLock<Vec<u64>> = OnceLock::new();
+    V.get_or_init(|| hex_list("LICHII_DIAG_SKIP_D16_VS"))
+}
+
 pub(crate) fn lod0() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| flag("LICHII_DIAG_LOD0"))

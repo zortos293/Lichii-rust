@@ -725,6 +725,9 @@ impl VulkanRasterizer {
             };
             if diag::skip_fs().contains(&hash_of(ShaderStage::Fragment))
                 || diag::skip_vs().contains(&hash_of(ShaderStage::VertexB))
+                || (regs.zeta_enable != 0
+                    && regs.zeta.format == 0x13
+                    && diag::skip_d16_vs().contains(&hash_of(ShaderStage::VertexB)))
             {
                 return Ok(());
             }
