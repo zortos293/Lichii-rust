@@ -3,7 +3,7 @@ use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use ash::{ext, khr, vk};
+use ash::{ext, khr, nv, vk};
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 use gpu_allocator::{AllocationSizes, AllocatorDebugSettings};
 use lichii_common::settings::GraphicsSettings;
@@ -172,6 +172,8 @@ pub struct Device {
     /// What the shader translator may emit for this device.
     pub shader_profile: Profile,
     pub shader_host: HostTranslateInfo,
+    /// Debug names and labels, with `debug.vulkan_labels`.
+    pub(crate) labels: Option<ext::debug_utils::Device>,
 }
 
 struct Candidate {
@@ -503,15 +505,44 @@ impl Device {
             demote_to_helper_invocation: on(v13.shader_demote_to_helper_invocation),
         };
 
+        let aftermath = crate::debug::aftermath::get().is_some()
+            && has(nv::device_diagnostics_config::NAME)
+            && {
+                let mut diagnostics = vk::PhysicalDeviceDiagnosticsConfigFeaturesNV::default();
+                let mut query = vk::PhysicalDeviceFeatures2::default().push_next(&mut diagnostics);
+                // SAFETY: the device reports the extension the struct belongs to.
+                unsafe { raw_instance.get_physical_device_features2(physical, &mut query) };
+                diagnostics.diagnostics_config != vk::FALSE
+            };
+        if aftermath {
+            names.push(nv::device_diagnostics_config::NAME.as_ptr());
+            if has(nv::device_diagnostic_checkpoints::NAME) {
+                names.push(nv::device_diagnostic_checkpoints::NAME.as_ptr());
+            }
+            tracing::info!("Nsight Aftermath: device diagnostics on");
+        }
+        let mut diagnostics_features =
+            vk::PhysicalDeviceDiagnosticsConfigFeaturesNV::default().diagnostics_config(true);
+        let mut diagnostics = vk::DeviceDiagnosticsConfigCreateInfoNV::default().flags(
+            vk::DeviceDiagnosticsConfigFlagsNV::ENABLE_SHADER_DEBUG_INFO
+                | vk::DeviceDiagnosticsConfigFlagsNV::ENABLE_RESOURCE_TRACKING
+                | vk::DeviceDiagnosticsConfigFlagsNV::ENABLE_AUTOMATIC_CHECKPOINTS,
+        );
+
         let priorities = [1.0];
         let queue_info = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(candidate.queue_family)
             .queue_priorities(&priorities)];
         let mut enabled = chain!(core);
-        let info = vk::DeviceCreateInfo::default()
+        let mut info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
             .enabled_extension_names(&names)
             .push_next(&mut enabled);
+        if aftermath {
+            info = info
+                .push_next(&mut diagnostics_features)
+                .push_next(&mut diagnostics);
+        }
         // SAFETY: the extensions and features requested were all reported by the device.
         let raw = unsafe {
             raw_instance
@@ -598,6 +629,9 @@ impl Device {
             }
         };
 
+        let labels = instance
+            .labels
+            .then(|| ext::debug_utils::Device::new(raw_instance, &raw));
         Ok(Arc::new(Self {
             instance,
             physical,
@@ -611,6 +645,7 @@ impl Device {
             memory_properties,
             shader_profile,
             shader_host,
+            labels,
         }))
     }
 

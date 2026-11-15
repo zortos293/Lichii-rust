@@ -4,6 +4,7 @@
 
 pub mod buffer_cache;
 pub mod commands;
+pub mod debug;
 pub mod descriptors;
 pub mod device;
 mod error;

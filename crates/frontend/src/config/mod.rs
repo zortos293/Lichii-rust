@@ -493,13 +493,28 @@ impl ConfigWindow {
                     row(ui, "", |ui| {
                         ui.checkbox(&mut d.debug.dump_shaders, "Dump shaders")
                     });
+                    row(ui, "", |ui| {
+                        ui.checkbox(
+                            &mut d.debug.renderdoc_hotkey,
+                            "Enable the RenderDoc capture hotkey",
+                        )
+                    });
+                    row(ui, "", |ui| {
+                        ui.checkbox(
+                            &mut d.debug.nsight_aftermath,
+                            "Nsight Aftermath GPU crash dumps (NVIDIA)",
+                        )
+                    });
+                    row(ui, "", |ui| {
+                        ui.checkbox(&mut d.debug.vulkan_labels, "Vulkan debug names and labels")
+                    });
                     row(ui, "GDB stub port", |ui| {
                         optional_number(ui, &mut d.debug.gdb_stub_port, 6543)
                     });
                 });
                 note(
                     ui,
-                    "The log filter takes effect on the next start. It uses tracing's EnvFilter syntax, e.g. \"info,lichii_kernel=debug\".",
+                    "The log filter and the RenderDoc, Aftermath and label options take effect on the next start. The log filter uses tracing's EnvFilter syntax, e.g. \"info,lichii_kernel=debug\". Bind the RenderDoc hotkey under Hotkeys.",
                 );
             }
         }

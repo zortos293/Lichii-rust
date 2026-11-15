@@ -2128,6 +2128,20 @@ impl TextureCache {
         } else {
             Image::new(&self.device, &desc, "guest image")?
         };
+        self.device.name(
+            image.raw(),
+            format_args!(
+                "guest {:?} {:?} {}x{}x{} levels {} layers {} @ {:#x}",
+                info.kind,
+                info.format,
+                info.width,
+                info.height,
+                info.depth,
+                info.levels,
+                info.layers,
+                segments.first().map_or(0, |segment| segment.daddr)
+            ),
+        );
         let cached = CachedImage {
             info: *info,
             host,

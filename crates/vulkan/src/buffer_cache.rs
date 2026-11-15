@@ -1120,14 +1120,19 @@ impl BufferCache {
         if !pages.is_multiple_of(64) {
             *dirty.last_mut().expect("a buffer has pages") = (1 << (pages % 64)) - 1;
         }
+        let buffer = Buffer::new(
+            &self.device,
+            size,
+            CACHED_USAGE,
+            MemoryLocation::GpuOnly,
+            "guest buffer",
+        )?;
+        self.device.name(
+            buffer.raw(),
+            format_args!("guest buffer {begin:#x}-{end:#x}"),
+        );
         let mut new = CachedBuffer {
-            buffer: Buffer::new(
-                &self.device,
-                size,
-                CACHED_USAGE,
-                MemoryLocation::GpuOnly,
-                "guest buffer",
-            )?,
+            buffer,
             daddr: begin,
             size,
             dirty,
