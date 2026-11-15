@@ -1,5 +1,6 @@
 //! Types shared by every Lichii crate.
 
+pub mod diag_ring;
 pub mod paths;
 pub mod perf;
 pub mod result;

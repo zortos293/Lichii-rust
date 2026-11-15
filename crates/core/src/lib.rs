@@ -150,6 +150,15 @@ impl System {
             modules = program.modules.len(),
             "booting"
         );
+        for module in &program.modules {
+            tracing::info!(
+                "diag module {} offset={:#x} size={:#x} build_id={:02x?}",
+                module.name,
+                module.offset,
+                module.size,
+                &module.build_id[..8]
+            );
+        }
 
         let timing = Arc::new(CoreTiming::new(program.generation));
         let exit = Arc::new(ExitSignal::default());

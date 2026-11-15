@@ -435,6 +435,7 @@ impl NvdrvService {
             return result;
         }
         let result = device.ioctl(files, &mut buffers.args(variant, ioctl));
+        lichii_common::diag_ring::push(device.name(), ioctl.0, result as u32);
         if self.nvdrv.ipc_trace {
             tracing::info!(
                 target: "ipc",
