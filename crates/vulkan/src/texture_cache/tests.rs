@@ -2420,6 +2420,35 @@ fn gpu_overlap_syncs_move_texels_through_the_guest_layout() {
 }
 
 #[test]
+fn gpu_overlap_syncs_skip_overlaps_of_block_padding_alone() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let padded = rt_info(16, 16, 4, GobLayout::Tegra);
+    let small = rt_info(16, 8, 0, GobLayout::Tegra);
+    assert!(padded.size_bytes() >= 5 << 10);
+    let target = clear_rt(&mut f, &padded, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    let expected = f.read_image(target.id).remove(0);
+    clear_rt_at(
+        &mut f,
+        GPU_VA + (4 << 10),
+        &small,
+        [0.0, 1.0, 0.0, 1.0],
+        Rect::ALL,
+    );
+    let syncs = f.cache.traffic().gpu_syncs;
+    let (mut tx, cache, gmmu) = f.tx();
+    let synced = cache
+        .render_target(&mut tx, gmmu, GPU_VA, &padded, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(synced.id, target.id);
+    assert!(f.cache.traffic().gpu_syncs > syncs);
+    assert_eq!(f.read_image(target.id).remove(0), expected);
+    f.assert_no_validation_errors();
+}
+
+#[test]
 fn depth_stencil_overlaps_sync_on_the_gpu() {
     let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
         return;

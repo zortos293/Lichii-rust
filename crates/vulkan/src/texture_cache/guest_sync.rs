@@ -172,6 +172,7 @@ struct RunScratch {
     targets: Vec<Segment>,
     runs: Vec<Run>,
     words: Vec<[u32; 4]>,
+    spans: Vec<(u64, u64)>,
 }
 
 /// Fills `scratch.runs`, by image offset, with where the bytes of `image` land in the
@@ -430,6 +431,13 @@ impl TextureCache {
                 .iter()
                 .map(|r| [r.from as u32, r.size as u32, r.at as u32, 0]),
         );
+        scratch.spans.clear();
+        scratch
+            .spans
+            .extend(scratch.runs.iter().map(|r| (r.at, r.at + r.size)));
+        scratch.spans.sort_unstable();
+        let serial =
+            direction == Direction::ToGuest && scratch.spans.windows(2).any(|s| s[0].1 > s[1].0);
         let run_bytes: &[u8] = bytemuck::cast_slice(&scratch.words);
         ensure(
             &device,
@@ -485,6 +493,9 @@ impl TextureCache {
                     - start;
                 let y0 = ((lo / block_bytes) as u32 * block_rows).min(h);
                 let y1 = (((hi - 1) / block_bytes + 1) as u32 * block_rows).min(h);
+                if y0 >= y1 {
+                    continue;
+                }
                 let band = (
                     start + u64::from(y0 / block_rows) * block_bytes,
                     (start + u64::from(y1.div_ceil(block_rows)) * block_bytes).min(end),
@@ -538,40 +549,48 @@ impl TextureCache {
                         }
                     }
                     barrier(&device, cmd);
-                    let set = sync
-                        .descriptors
-                        .allocate(tx.scheduler, sync.compute.set_layout)?;
-                    let params = Params {
-                        row_words,
-                        height: h,
-                        row_gobs: tiling.row_gobs,
-                        block_height_log2: tiling.block_height_log2,
-                        block_depth_log2: tiling.block_depth_log2,
-                        switch2_layout: u32::from(tiling.layout == GobLayout::Switch2),
-                        subresource: start as u32,
-                        run_first: first as u32,
-                        run_count: count as u32,
-                        y_base: y0,
-                        direction: direction as u32,
-                        packing: packing as u32,
-                        stencil_pitch: w,
-                        depth_float: u32::from(
-                            packing != Packing::Plain
-                                && matches!(
-                                    host,
-                                    vk::Format::D32_SFLOAT | vk::Format::D32_SFLOAT_S8_UINT
-                                ),
-                        ),
-                    };
-                    sync.compute.dispatch(
-                        cmd,
-                        set,
-                        &buffers,
-                        bytemuck::bytes_of(&params),
-                        groups,
-                        all,
-                    );
-                    barrier(&device, cmd);
+                    let passes = if serial { count } else { 1 };
+                    for pass in 0..passes {
+                        let (run_first, run_count) = if serial {
+                            (first + pass, 1)
+                        } else {
+                            (first, count)
+                        };
+                        let set = sync
+                            .descriptors
+                            .allocate(tx.scheduler, sync.compute.set_layout)?;
+                        let params = Params {
+                            row_words,
+                            height: h,
+                            row_gobs: tiling.row_gobs,
+                            block_height_log2: tiling.block_height_log2,
+                            block_depth_log2: tiling.block_depth_log2,
+                            switch2_layout: u32::from(tiling.layout == GobLayout::Switch2),
+                            subresource: start as u32,
+                            run_first: run_first as u32,
+                            run_count: run_count as u32,
+                            y_base: y0,
+                            direction: direction as u32,
+                            packing: packing as u32,
+                            stencil_pitch: w,
+                            depth_float: u32::from(
+                                packing != Packing::Plain
+                                    && matches!(
+                                        host,
+                                        vk::Format::D32_SFLOAT | vk::Format::D32_SFLOAT_S8_UINT
+                                    ),
+                            ),
+                        };
+                        sync.compute.dispatch(
+                            cmd,
+                            set,
+                            &buffers,
+                            bytemuck::bytes_of(&params),
+                            groups,
+                            all,
+                        );
+                        barrier(&device, cmd);
+                    }
                     if direction == Direction::FromGuest {
                         device
                             .raw
