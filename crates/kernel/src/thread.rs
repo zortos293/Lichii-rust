@@ -492,8 +492,13 @@ impl Thread {
         token != 0 && self.wait_token.load(Ordering::Acquire) == token
     }
 
+<<<<<<< HEAD
     pub(crate) fn diag_cancel_pending(&self) -> bool {
         self.sched.lock().cancel_pending
+=======
+    pub(crate) fn termination_requested(&self) -> bool {
+        self.sched.lock().terminate_requested
+>>>>>>> 51af16b (kernel: address waits are not cancellable, and a signaled object wins over a pending cancel)
     }
 
     /// Starts a wait from the thread itself. Fails with the pending result when the wait is

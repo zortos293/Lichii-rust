@@ -263,7 +263,10 @@ impl Arbiter {
         if timeout_zero {
             return Ok(WaitOutcome::Done(result::TIMED_OUT));
         }
-        let token = match thread.begin_wait(crate::thread::Resume::Result, true) {
+        if thread.diag_cancel_pending() {
+            tracing::warn!(thread = ?thread.id(), "diag address wait ignores a pending cancel");
+        }
+        let token = match thread.begin_wait(crate::thread::Resume::Result, false) {
             Ok(token) => token,
             Err(code) => return Ok(WaitOutcome::Done(code)),
         };
