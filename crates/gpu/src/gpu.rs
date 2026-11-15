@@ -21,6 +21,7 @@ use crate::back::{Back, SideCommand};
 use crate::backend::{ChannelId, FramebufferConfig, GpuHandles, Rasterizer};
 use crate::channel::{ChannelConfig, GpEntry, Submission, SyncpointFence, SyncpointIncrement};
 use crate::clock::{GpuTimestamp, GuestTime};
+use crate::cpu_reads::{CpuReadFlusher, CpuReads};
 use crate::dma_pusher::{FrontChannel, FrontShared, Work};
 use crate::engines::{EngineFactory, create_engine};
 use crate::gmmu::{BigPageSize, Gmmu};
@@ -355,6 +356,14 @@ impl Front {
     }
 }
 
+/// Whether guest CPU accesses to memory the GPU modified trap until the GPU writes it back.
+/// `LICHII_FLUSH_TRAPS=0` turns them off: no handler is installed and the renderer arms nothing,
+/// so such reads see what guest memory held, as before flush traps.
+pub fn flush_traps_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("LICHII_FLUSH_TRAPS").is_none_or(|value| value != "0"))
+}
+
 /// How long [`Gpu::shutdown`] waits for the GPU threads, which a renderer call that never
 /// returns can hold forever.
 const STOP_TIMEOUT: Duration = Duration::from_millis(500);
@@ -378,6 +387,8 @@ pub struct Gpu {
     thread_ids: Vec<ThreadId>,
     /// Tells the back to drop its stream once `shutdown` starts.
     stopping: Arc<AtomicBool>,
+    /// Guest CPU accesses to GPU-modified memory waiting for the back.
+    cpu_reads: Arc<CpuReads>,
 }
 
 const _: () = {
@@ -420,6 +431,16 @@ impl Gpu {
         let fetch_syncs = Arc::new(FetchSyncs::new(inbox.clone()));
         let activity = handles.activity.clone();
         let stopping = Arc::new(AtomicBool::new(false));
+        let cpu_reads = Arc::new(CpuReads::new(match config.threading {
+            Threading::Split => {
+                let kick = consumer.kick();
+                Box::new(move || kick.kick())
+            }
+            Threading::Single => {
+                let inbox = inbox.clone();
+                Box::new(move || inbox.wake())
+            }
+        }));
         let back = Back::new(
             rasterizer,
             &handles,
@@ -428,6 +449,7 @@ impl Gpu {
             fetch_syncs.clone(),
             activity.clone(),
             stopping.clone(),
+            cpu_reads.clone(),
         );
         let (link, back) = match config.threading {
             Threading::Split => {
@@ -466,9 +488,25 @@ impl Gpu {
             .spawn({
                 let activity = activity.clone();
                 let syncpoints = handles.syncpoints.clone();
-                move || activity.report_until_stopped(threaded, &*back_progress, &syncpoints)
+                let device = handles.device.clone();
+                move || {
+                    activity.report_until_stopped(threaded, &*back_progress, &syncpoints, &device)
+                }
             })
             .expect("failed to start the GPU activity thread");
+        let thread_ids: Vec<ThreadId> = [Some(&front), back.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|thread| thread.thread().id())
+            .collect();
+        if flush_traps_enabled() {
+            handles
+                .device
+                .set_flush_trap_handler(Some(Arc::new(CpuReadFlusher {
+                    reads: Arc::downgrade(&cpu_reads),
+                    gpu_threads: thread_ids.clone(),
+                })));
+        }
         Self {
             activity,
             host1x,
@@ -479,11 +517,8 @@ impl Gpu {
             next_channel: AtomicU32::new(0),
             references: Mutex::new(HashMap::new()),
             stopping,
-            thread_ids: [Some(&front), back.as_ref()]
-                .into_iter()
-                .flatten()
-                .map(|thread| thread.thread().id())
-                .collect(),
+            cpu_reads,
+            thread_ids,
             threads: Mutex::new(
                 [Some(front), back, Some(reporter)]
                     .into_iter()
@@ -668,6 +703,8 @@ impl Gpu {
     /// From a GPU thread (a [`Gpu::run_in_order`] action) it closes the GPU without joining.
     pub fn shutdown(&self) {
         self.stopping.store(true, Ordering::Relaxed);
+        self.handles.device.set_flush_trap_handler(None);
+        self.cpu_reads.close();
         self.inbox.close();
         self.activity.stop();
         if self.thread_ids.contains(&std::thread::current().id()) {

@@ -2283,10 +2283,11 @@ fn depth_stencil_overlaps_sync_on_the_gpu() {
         wide.format = format;
         narrow.format = format;
         let target = clear(&mut f, &wide, 0.5, 0x5a, Rect::ALL);
-        if f.cache.get(target.id).unwrap().host.format != vk::Format::D24_UNORM_S8_UINT {
-            eprintln!("skipping: no host D24S8");
-            return;
-        }
+        let float_depth = match f.cache.get(target.id).unwrap().host.format {
+            vk::Format::D24_UNORM_S8_UINT => false,
+            vk::Format::D32_SFLOAT_S8_UINT => true,
+            host => panic!("{format:?} held as {host:?}"),
+        };
         clear(
             &mut f,
             &narrow,
@@ -2319,7 +2320,12 @@ fn depth_stencil_overlaps_sync_on_the_gpu() {
             } else {
                 (0x80_0000, 0x5a)
             };
-            let d = u32::from_le_bytes(*word) & 0xff_ffff;
+            let word = u32::from_le_bytes(*word);
+            let d = if float_depth {
+                (f64::from(f32::from_bits(word)) * 16_777_215.0).round() as u32
+            } else {
+                word & 0xff_ffff
+            };
             assert!(
                 d.abs_diff(want_depth) <= 1,
                 "{format:?}: depth {d:#x} at ({x}, {y})"

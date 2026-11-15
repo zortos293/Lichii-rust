@@ -294,6 +294,8 @@ pub enum Op {
     Ticks,
     /// `DMB`/`DSB`.
     Fence,
+    /// `CLREX`: drops this core's reservation.
+    ClearExclusive,
     /// One instruction of the SIMD/FP data-processing group, run by the interpreter's
     /// `simd::execute` on the live `ThreadContext`. It may read and write any guest state, and
     /// faults with `CpuFault::Undefined` on an unallocated encoding.
@@ -314,6 +316,7 @@ impl Op {
             | Op::StoreVec { .. }
             | Op::ZeroBlock { .. }
             | Op::Fence
+            | Op::ClearExclusive
             | Op::CallSimd { .. }
             | Op::SetLazyNzcv(..) => Ty::Void,
             Op::Get(loc) => loc.ty(),
@@ -352,7 +355,12 @@ impl Op {
     pub fn is_pure(&self) -> bool {
         match self {
             Op::Simd(s) => s.is_pure(),
-            _ => !matches!(self, Op::Set(..) | Op::SetLazyNzcv(..) | Op::Fence) && !self.may_exit(),
+            _ => {
+                !matches!(
+                    self,
+                    Op::Set(..) | Op::SetLazyNzcv(..) | Op::Fence | Op::ClearExclusive
+                ) && !self.may_exit()
+            }
         }
     }
 
@@ -364,6 +372,7 @@ impl Op {
             | Op::Get(_)
             | Op::Ticks
             | Op::Fence
+            | Op::ClearExclusive
             | Op::High
             | Op::CallSimd { .. } => {}
             Op::Simd(s) => s.for_each_arg(&mut f),

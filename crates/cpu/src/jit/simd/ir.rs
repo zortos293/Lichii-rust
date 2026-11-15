@@ -107,7 +107,8 @@ pub enum SimdOp {
     },
     /// `FCVTZS`/`FCVTZU` to a W (`wide` false) or X register, zero-extended; also `FCVTNS`,
     /// `FCVTPS`, `FCVTMS`, `FCVTAS` and their unsigned forms, which round as `word`'s RMode
-    /// field (and, for `FCVTAS`, its opcode) says first.
+    /// field (and, for `FCVTAS`, its opcode) says first, and the fixed-point `FCVTZS`/`FCVTZU`
+    /// (`word` bit 21 clear), which scale by `2^fbits` first.
     ToInt {
         fp: Fp,
         signed: bool,
@@ -133,7 +134,7 @@ pub enum SimdOp {
         word: u32,
     },
     /// `SQXTN` and `SQXTN2` to B (`size` 0) or H (`size` 1) lanes: the lanes of `n` narrowed with
-    /// signed saturation, in the low half over zeros, or for `SQXTN2` in the high half over the
+    /// signed saturation (unsigned for `SQXTUN`/`SQXTUN2`, `word` bit 29 set), in the low half over zeros, or for `SQXTN2` in the high half over the
     /// low half of `low`. It sets FPSR.QC itself when a lane saturates, so like a checked op it
     /// carries `word` and passes treat it as writing FPSR.
     SatNarrow {

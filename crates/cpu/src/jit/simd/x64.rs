@@ -662,6 +662,24 @@ impl Emitter<'_> {
                 let d = self.def(v);
                 let slow = self.checked(true, Some(Inputs::scalar(fp, &[a], false)));
                 let src = match word >> 19 & 3 {
+                    3 if word & 1 << 21 == 0 => {
+                        let fbits = 64 - (word >> 10 & 0x3f) as i64;
+                        match fp {
+                            Fp::S => dynasm!(self.asm
+                                ; .arch x64
+                                ; mov eax, ((127 + fbits) << 23) as i32
+                                ; movd xmm15, eax
+                                ; mulss xmm15, Rx(a)
+                            ),
+                            Fp::D => dynasm!(self.asm
+                                ; .arch x64
+                                ; mov rax, QWORD (1023 + fbits) << 52
+                                ; movq xmm15, rax
+                                ; mulsd xmm15, Rx(a)
+                            ),
+                        }
+                        15
+                    }
                     3 => a,
                     0 if word & 1 << 18 != 0 => {
                         self.round_away(fp, a);
@@ -748,7 +766,9 @@ impl Emitter<'_> {
                 );
                 self.finish_checked(i, slow, word, d, Ty::Nzcv);
             }
-            SimdOp::SatNarrow { size, n, low, .. } => self.sat_narrow(i, size, n, low),
+            SimdOp::SatNarrow { size, n, low, word } => {
+                self.sat_narrow(i, size, word >> 29 & 1 != 0, n, low)
+            }
             SimdOp::Vec(op) => self.vector(i, op),
             SimdOp::Lanes(lanes) => self.lanes(i, lanes),
         }

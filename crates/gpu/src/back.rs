@@ -14,6 +14,7 @@ use crate::backend::{
     ChannelId, FenceAction, FramebufferConfig, GpuHandles, GpuWrittenPages, Rasterizer, ReleaseSize,
 };
 use crate::clock::GpuTimestamp;
+use crate::cpu_reads::CpuReads;
 use crate::engines::kepler_compute::pcas::QmdScheduler;
 use crate::engines::{Engine, EngineContext, EngineFactory, EngineKind};
 use crate::gmmu::{Gmmu, RangeTarget};
@@ -57,6 +58,12 @@ struct BackChannel {
     engines: [Option<Box<dyn Engine>>; EngineKind::COUNT],
 }
 
+/// How much of the device memory around a GPFIFO entry one fetch sync writes back. Switch 2
+/// titles fetch command lists GPU work wrote moments before, often hundreds of small ones per
+/// frame side by side (DKB: about 1,500 entries of 20 bytes in eleven 64 KiB blocks), so one
+/// write-back covers the entries after it until GPU work writes the block again.
+const FETCH_SYNC_WINDOW: u64 = 64 * 1024;
+
 /// Executes the stream.
 pub(crate) struct Back {
     rasterizer: Box<dyn Rasterizer>,
@@ -76,9 +83,19 @@ pub(crate) struct Back {
     activity: Arc<Activity>,
     /// Set by [`crate::Gpu::shutdown`]: the back drops what is left instead of executing it.
     stopping: Arc<AtomicBool>,
+    cpu_reads: Arc<CpuReads>,
+    /// Scratch for [`CpuReads::serve`].
+    cpu_read_ranges: Vec<(DAddr, u64)>,
+}
+
+impl Drop for Back {
+    fn drop(&mut self) {
+        self.cpu_reads.close();
+    }
 }
 
 impl Back {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         rasterizer: Box<dyn Rasterizer>,
         handles: &GpuHandles,
@@ -87,6 +104,7 @@ impl Back {
         fetch_syncs: Arc<FetchSyncs>,
         activity: Arc<Activity>,
         stopping: Arc<AtomicBool>,
+        cpu_reads: Arc<CpuReads>,
     ) -> Self {
         Self {
             rasterizer,
@@ -104,11 +122,15 @@ impl Back {
             written_pages: handles.written_pages.clone(),
             activity,
             stopping,
+            cpu_reads,
+            cpu_read_ranges: Vec::new(),
         }
     }
 
-    /// Executes everything published, until the ring is empty.
+    /// Executes everything published, until the ring is empty. Guest CPU reads are served first
+    /// and between records.
     pub(crate) fn run(&mut self, consumer: &mut Consumer) {
+        self.serve_cpu_reads();
         while consumer.refill() {
             self.drain_cpu_writes();
             while consumer.has_slots() {
@@ -116,6 +138,7 @@ impl Back {
                     self.abandon(consumer);
                     return;
                 }
+                self.serve_cpu_reads();
                 let header = consumer.slot(0);
                 if header == WRAP {
                     consumer.wrap();
@@ -139,6 +162,25 @@ impl Back {
         consumer.skip_published();
         consumer.release();
         while self.side.try_recv().is_ok() {}
+    }
+
+    /// Writes back the ranges guest CPU threads wait for, from the work executed so far.
+    #[inline]
+    fn serve_cpu_reads(&mut self) {
+        if self.cpu_reads.pending() {
+            self.serve_cpu_reads_now();
+        }
+    }
+
+    #[cold]
+    fn serve_cpu_reads_now(&mut self) {
+        self.flush_engine();
+        let _waiting = self.activity.waiting(Wait::HostGpu);
+        let rasterizer = &mut *self.rasterizer;
+        self.cpu_reads
+            .serve(&mut self.cpu_read_ranges, |daddr, size| {
+                rasterizer.flush_for_cpu_read(daddr, size)
+            });
     }
 
     /// Drops the renderer's copies of device memory the guest CPU wrote while a cache held it.
@@ -292,7 +334,7 @@ impl Back {
                     .read_overlay
                     .set(pending.unwrap_or_default());
                 if waits {
-                    self.synchronize_read(address, size);
+                    self.synchronize_read(address, size, 1);
                 }
                 3
             }
@@ -304,7 +346,7 @@ impl Back {
                     _ => false,
                 };
                 if host {
-                    self.synchronize_read(address, size);
+                    self.synchronize_read(address, size, FETCH_SYNC_WINDOW);
                 }
                 self.fetch_syncs.complete();
                 3
@@ -412,8 +454,9 @@ impl Back {
     }
 
     /// The front is about to read `[address, address + size)`: the GPU work before it completes,
-    /// its fences and queries land, and GPU-written data in the range goes back to guest memory.
-    fn synchronize_read(&mut self, address: u64, size: u64) {
+    /// its fences and queries land, and GPU-written data goes back to guest memory over the
+    /// device range widened to whole `window`-aligned blocks (a power of two; 1 is the range).
+    fn synchronize_read(&mut self, address: u64, size: u64, window: u64) {
         let _waiting = self.activity.waiting(Wait::HostGpu);
         let Some(channel) = self.current.and_then(|index| self.channels[index].as_ref()) else {
             self.rasterizer.release_fences(true);
@@ -424,7 +467,11 @@ impl Back {
             .setup
             .memory
             .for_each_range(address, size, |range| match range.target {
-                RangeTarget::Device(daddr) => rasterizer.synchronize_region(daddr, range.size),
+                RangeTarget::Device(daddr) => {
+                    let start = daddr & !(window - 1);
+                    let end = (daddr + range.size).next_multiple_of(window);
+                    rasterizer.synchronize_region(start, end - start);
+                }
                 _ => rasterizer.release_fences(true),
             });
     }

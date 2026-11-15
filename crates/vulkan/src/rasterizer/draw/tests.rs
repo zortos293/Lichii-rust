@@ -223,6 +223,23 @@ fn draw_with(f: &mut Fixture, gmmu: &Arc<Gmmu>, regs: &Regs, const_buffers: &Gra
 }
 
 /// The render target's texels after writing it back to guest memory.
+/// Marks the draw target of `regs` as shown by a present, so draws into it alone may skip.
+fn present_target(f: &mut Fixture, gmmu: &Arc<Gmmu>, regs: &Regs) {
+    let mut dirty = DirtyState::new();
+    let root_tables = [[0; 64]; 8];
+    let ctx = GraphicsContext {
+        channel: ChannelId(0),
+        memory: gmmu,
+        regs,
+        dirty: &mut dirty,
+        const_buffers: &const_buffers(),
+        root_tables: &root_tables,
+    };
+    assert!(f.rasterizer.render_targets(&ctx).unwrap());
+    let id = f.rasterizer.draw.colors[0].as_ref().unwrap().id;
+    f.rasterizer.draw.presented(id);
+}
+
 fn target(f: &mut Fixture) -> Vec<[u8; 4]> {
     let tiling = Tiling::new(SIZE, SIZE, 1, 4, 1, 0, GobLayout::Tegra);
     f.rasterizer.flush_region(DADDR, tiling.size_bytes() as u64);
@@ -763,11 +780,12 @@ fn draws_skip_while_workers_translate_their_programs() {
     );
     f.rasterizer.draw.shaders.set_async(true);
     let regs = draw_regs();
+    present_target(&mut f, &gmmu, &regs);
     draw(&mut f, &gmmu, &regs);
     draw(&mut f, &gmmu, &regs);
     assert!(
         target(&mut f).iter().all(|&t| t == [0; 4]),
-        "draws whose programs are queued draw nothing"
+        "draws into the presented frame whose programs are queued draw nothing"
     );
     assert_eq!(
         f.rasterizer.draw.shaders.waits(),
@@ -786,6 +804,36 @@ fn draws_skip_while_workers_translate_their_programs() {
         (stats.translated, stats.failed),
         (2, 0),
         "each program translated once however many draws asked"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn draws_into_targets_no_present_showed_translate_in_place_instead_of_skipping() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    f.rasterizer.draw.shaders.set_async(true);
+    let regs = draw_regs();
+    draw(&mut f, &gmmu, &regs);
+    assert!(
+        target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]),
+        "a later pass may read this target, so the first draw already lands"
+    );
+    let shaders = &f.rasterizer.draw.shaders;
+    assert_eq!(
+        (shaders.waits(), shaders.blocked()),
+        (0, 2),
+        "nothing skipped; the vertex and fragment programs translated in place"
+    );
+    assert!(
+        shaders.stalled() > std::time::Duration::ZERO,
+        "the translations are timed"
     );
     f.assert_no_validation_errors();
 }

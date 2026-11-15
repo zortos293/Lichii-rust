@@ -7,6 +7,7 @@
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use lichii_memory::{DeviceAddressSpace, FlushTrapStats};
 use parking_lot::{Condvar, Mutex};
 
 use crate::host1x::{SYNCPOINT_COUNT, Syncpoints, is_reached};
@@ -192,6 +193,7 @@ impl Activity {
         threaded: bool,
         back: &dyn BackView,
         syncpoints: &Syncpoints,
+        device: &DeviceAddressSpace,
     ) {
         let mut since = Instant::now();
         let mut watch = StallWatch::default();
@@ -209,7 +211,7 @@ impl Activity {
             if since.elapsed() >= REPORT_PERIOD {
                 let elapsed = since.elapsed();
                 since = Instant::now();
-                self.report(elapsed, threaded);
+                self.report(elapsed, threaded, device.take_flush_trap_stats());
             }
         }
     }
@@ -234,7 +236,7 @@ impl Activity {
         self.stop.notify_all();
     }
 
-    fn report(&self, elapsed: Duration, threaded: bool) {
+    fn report(&self, elapsed: Duration, threaded: bool, traps: FlushTrapStats) {
         let now = self.now();
         let [front_idle, front_waiting, back_idle, host_wait] =
             self.waits.each_ref().map(|clock| clock.take(now));
@@ -260,6 +262,10 @@ impl Activity {
             front_waiting_for_back = share(front_waiting),
             back_idle,
             back_waiting_for_host_gpu = share(host_wait),
+            trap_flushes = traps.traps,
+            trap_arms = traps.arms,
+            trap_disarms = traps.disarms,
+            trap_protects = traps.protects,
             "GPU activity"
         );
     }
@@ -423,7 +429,7 @@ mod tests {
             activity.calls[RendererCall::Present as usize].load(Ordering::Relaxed),
             1
         );
-        activity.report(REPORT_PERIOD, true);
+        activity.report(REPORT_PERIOD, true, FlushTrapStats::default());
         assert!(
             activity
                 .calls
@@ -483,7 +489,10 @@ mod tests {
         }
         let reporter = std::thread::spawn({
             let activity = activity.clone();
-            move || activity.report_until_stopped(true, &Idle, &Syncpoints::new())
+            let physical =
+                std::sync::Arc::new(lichii_memory::PhysicalMemory::new(1 << 16).unwrap());
+            let device = DeviceAddressSpace::new(physical, 36);
+            move || activity.report_until_stopped(true, &Idle, &Syncpoints::new(), &device)
         });
         activity.stop();
         reporter.join().unwrap();

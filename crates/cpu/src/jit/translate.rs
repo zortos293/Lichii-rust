@@ -626,6 +626,9 @@ impl Translator<'_> {
                 self.op(Op::Fence);
             }
             Inst::Barrier { .. } => {}
+            Inst::Clrex => {
+                self.op(Op::ClearExclusive);
+            }
             Inst::Mrs { rt, reg } => {
                 let v = match reg {
                     SysReg::Nzcv => {

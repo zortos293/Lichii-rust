@@ -174,7 +174,8 @@ pub enum VecOp {
         m: Value,
     },
     /// `SSHLL`/`USHLL` (and the `2` forms when `high`): the low (or high) half of `a`'s
-    /// `8 << size`-bit lanes, sign- or zero-extended and shifted left by `shift`, below `8 << size`.
+    /// `8 << size`-bit lanes, sign- or zero-extended and shifted left by `shift`, up to `8 << size`
+    /// (`SHLL`).
     ShiftLong {
         signed: bool,
         size: u8,
@@ -212,6 +213,18 @@ pub enum VecOp {
         a: Value,
         low: Option<Value>,
     },
+    /// `UZP1`/`UZP2` (`transpose` clear) or `TRN1`/`TRN2` on S or D lanes: the even lanes of
+    /// `n` and `m`, or the odd ones when `odd`, concatenated or interleaved.
+    Permute {
+        transpose: bool,
+        odd: bool,
+        arrangement: Arrangement,
+        n: Value,
+        m: Value,
+    },
+    /// `SMAXV`, `SMINV`, `UMAXV` or `UMINV` (`op` the matching `Binary`) on H or S lanes: the
+    /// extreme lane in the low lane and zero above.
+    MinMaxAcross(Binary, Arrangement, Value),
     /// `REV64` on H or S lanes: the lanes of each 64-bit half in reverse order.
     Rev64(Arrangement, Value),
     /// `TBL` with one table register: byte `i` is byte `index[i]` of `table`, or zero from 16 on,
@@ -243,6 +256,7 @@ impl VecOp {
             | VecOp::Zip { n: a, m: b, .. }
             | VecOp::AddWide { n: a, m: b, .. }
             | VecOp::Ushl(_, a, b)
+            | VecOp::Permute { n: a, m: b, .. }
             | VecOp::Table {
                 table: a, index: b, ..
             } => {
@@ -261,6 +275,7 @@ impl VecOp {
             | VecOp::Extract { vector: a, .. }
             | VecOp::ShiftLong { a, .. }
             | VecOp::AddAcross(_, a)
+            | VecOp::MinMaxAcross(_, _, a)
             | VecOp::Rev64(_, a) => f(a),
             VecOp::Narrow { a, low, .. } => {
                 f(a);
@@ -362,6 +377,60 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         let a = vec(t, rn);
         let low = q.then(|| vec(t, rd));
         let r = emit(t, VecOp::Narrow { size, a, low });
+        t.set(Loc::V(rd), r);
+        return true;
+    }
+    if word & 0xbf20_8c00 == 0x0e00_0800
+        && matches!(field(word, 12, 3), 1 | 2 | 5 | 6)
+        && (size == 2 || (size == 3 && q))
+    {
+        let (n, m) = (vec(t, rn), vec(t, rm));
+        let r = emit(
+            t,
+            VecOp::Permute {
+                transpose: word & 0x2000 != 0,
+                odd: word & 0x4000 != 0,
+                arrangement,
+                n,
+                m,
+            },
+        );
+        t.set(Loc::V(rd), r);
+        return true;
+    }
+    if word & 0x9f3e_fc00 == 0x0e30_a800 && (size == 1 || (size == 2 && q)) {
+        let op = match (u, word & 0x1_0000 != 0) {
+            (false, false) => Binary::SMax,
+            (false, true) => Binary::SMin,
+            (true, false) => Binary::UMax,
+            (true, true) => Binary::UMin,
+        };
+        if supported(t, op, size) {
+            let a = vec(t, rn);
+            let r = emit(t, VecOp::MinMaxAcross(op, arrangement, a));
+            t.set(Loc::V(rd), r);
+            return true;
+        }
+    }
+    if word & 0xbf3f_fc00 == 0x2e21_3800 && size < 3 {
+        let a = vec(t, rn);
+        let r = emit(
+            t,
+            VecOp::ShiftLong {
+                signed: false,
+                size,
+                high: q,
+                shift: 8 << size,
+                a,
+            },
+        );
+        t.set(Loc::V(rd), r);
+        return true;
+    }
+    if word & 0xbf3f_fc00 == 0x2e21_2800 && (size == 0 || (size == 1 && t.sse41)) {
+        let n = vec(t, rn);
+        let low = q.then(|| vec(t, rd));
+        let r = t.op(Op::Simd(SimdOp::SatNarrow { size, n, low, word }));
         t.set(Loc::V(rd), r);
         return true;
     }
@@ -1088,16 +1157,26 @@ impl Emitter<'_> {
         }
     }
 
-    /// `SQXTN`/`SQXTN2`: packs `n` with signed saturation, and sets FPSR.QC unless sign-extending
-    /// the packed lanes again gives back every lane of `n`.
-    pub(super) fn sat_narrow(&mut self, i: usize, size: u8, n: Value, low: Option<Value>) {
+    /// `SQXTN`/`SQXTN2`, or `SQXTUN`/`SQXTUN2` when `unsigned`: packs `n` with signed or unsigned
+    /// saturation, and sets FPSR.QC unless sign- or zero-extending the packed lanes again gives
+    /// back every lane of `n`.
+    pub(super) fn sat_narrow(
+        &mut self,
+        i: usize,
+        size: u8,
+        unsigned: bool,
+        n: Value,
+        low: Option<Value>,
+    ) {
         let n = self.reg(n);
         let low = low.map(|low| self.reg(low));
         let d = self.def(Value(i as u32));
         dynasm!(self.asm ; .arch x64 ; movaps xmm15, Rx(n));
-        match size {
-            0 => dynasm!(self.asm ; .arch x64 ; packsswb xmm15, xmm15),
-            _ => dynasm!(self.asm ; .arch x64 ; packssdw xmm15, xmm15),
+        match (size, unsigned) {
+            (0, false) => dynasm!(self.asm ; .arch x64 ; packsswb xmm15, xmm15),
+            (_, false) => dynasm!(self.asm ; .arch x64 ; packssdw xmm15, xmm15),
+            (0, true) => dynasm!(self.asm ; .arch x64 ; packuswb xmm15, xmm15),
+            (_, true) => dynasm!(self.asm ; .arch x64 ; packusdw xmm15, xmm15),
         }
         match low {
             Some(low) => dynasm!(self.asm
@@ -1108,18 +1187,14 @@ impl Emitter<'_> {
             None => dynasm!(self.asm ; .arch x64 ; movq Rx(d), xmm15),
         }
         match size {
-            0 => dynasm!(self.asm
-                ; .arch x64
-                ; punpcklbw xmm15, xmm15
-                ; psraw xmm15, 8
-                ; pcmpeqw xmm15, Rx(n)
-            ),
-            _ => dynasm!(self.asm
-                ; .arch x64
-                ; punpcklwd xmm15, xmm15
-                ; psrad xmm15, 16
-                ; pcmpeqd xmm15, Rx(n)
-            ),
+            0 => dynasm!(self.asm ; .arch x64 ; punpcklbw xmm15, xmm15),
+            _ => dynasm!(self.asm ; .arch x64 ; punpcklwd xmm15, xmm15),
+        }
+        match (size, unsigned) {
+            (0, false) => dynasm!(self.asm ; .arch x64 ; psraw xmm15, 8 ; pcmpeqw xmm15, Rx(n)),
+            (_, false) => dynasm!(self.asm ; .arch x64 ; psrad xmm15, 16 ; pcmpeqd xmm15, Rx(n)),
+            (0, true) => dynasm!(self.asm ; .arch x64 ; psrlw xmm15, 8 ; pcmpeqw xmm15, Rx(n)),
+            (_, true) => dynasm!(self.asm ; .arch x64 ; psrld xmm15, 16 ; pcmpeqd xmm15, Rx(n)),
         }
         let exact = self.asm.new_dynamic_label();
         dynasm!(self.asm
@@ -1496,6 +1571,63 @@ impl Emitter<'_> {
                     }
                     None => dynasm!(self.asm ; .arch x64 ; movq Rx(d), Rx(SCRATCH)),
                 }
+                (d, true)
+            }
+            VecOp::Permute {
+                transpose,
+                odd,
+                arrangement: Arrangement { size, q },
+                n,
+                m,
+            } => {
+                let (n, m) = (self.reg(n), self.reg(m));
+                let d = self.def(v);
+                self.copy(d, n);
+                match (size, q) {
+                    (3, _) if odd => dynasm!(self.asm ; .arch x64 ; punpckhqdq Rx(d), Rx(m)),
+                    (3, _) => dynasm!(self.asm ; .arch x64 ; punpcklqdq Rx(d), Rx(m)),
+                    (_, false) => {
+                        dynasm!(self.asm ; .arch x64 ; unpcklps Rx(d), Rx(m));
+                        if odd {
+                            dynasm!(self.asm ; .arch x64 ; psrldq Rx(d), 8);
+                        }
+                    }
+                    (_, true) => {
+                        let lanes = if odd { 0xdd } else { 0x88 };
+                        dynasm!(self.asm ; .arch x64 ; shufps Rx(d), Rx(m), lanes as i8);
+                        if transpose {
+                            dynasm!(self.asm ; .arch x64 ; pshufd Rx(d), Rx(d), 0xd8u8 as i8);
+                        }
+                    }
+                }
+                (d, q)
+            }
+            VecOp::MinMaxAcross(op, Arrangement { size, q }, a) => {
+                let a = self.reg(a);
+                let d = self.def(v);
+                let op = match op {
+                    Binary::SMax => Sse::MaxS,
+                    Binary::SMin => Sse::MinS,
+                    Binary::UMax => Sse::MaxU,
+                    _ => Sse::MinU,
+                };
+                self.copy(d, a);
+                if q {
+                    dynasm!(self.asm ; .arch x64 ; pshufd Rx(SCRATCH), Rx(d), 0x4e);
+                    self.sse(op, size, d, SCRATCH);
+                }
+                if size == 1 {
+                    dynasm!(self.asm ; .arch x64 ; pshuflw Rx(SCRATCH), Rx(d), 0x4e);
+                    self.sse(op, size, d, SCRATCH);
+                    dynasm!(self.asm ; .arch x64 ; pshuflw Rx(SCRATCH), Rx(d), 0xb1u8 as i8);
+                    self.sse(op, size, d, SCRATCH);
+                    dynasm!(self.asm ; .arch x64 ; movd eax, Rx(d) ; movzx eax, ax);
+                } else {
+                    dynasm!(self.asm ; .arch x64 ; pshufd Rx(SCRATCH), Rx(d), 0xb1u8 as i8);
+                    self.sse(op, size, d, SCRATCH);
+                    dynasm!(self.asm ; .arch x64 ; movd eax, Rx(d));
+                }
+                dynasm!(self.asm ; .arch x64 ; movd Rx(d), eax);
                 (d, true)
             }
             VecOp::Rev64(Arrangement { size, q }, a) => {

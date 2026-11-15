@@ -327,6 +327,113 @@ mod faults {
     }
 
     #[test]
+    fn armed_pages_fault_on_every_access_until_disarmed() {
+        let faults = AtomicU64::new(0);
+        let Some((space, device)) = tracked_space() else {
+            return;
+        };
+        let fastmem = space.fastmem().unwrap();
+        let base = fastmem.base();
+        space.map(0x4000_0000, 0x10_0000, 0x2000, MemoryPermission::READ_WRITE);
+        device
+            .map_process(0x1_0000_0000, &space, 0x4000_0000, 0x2000)
+            .unwrap();
+        space.write(0x4000_0008, 7u64).unwrap();
+        fastmem.set_fault_handler(Some(skip_load_quietly), 0xdead);
+
+        device.arm_flush_traps(0x1_0000_0000, 0x1000);
+        assert_eq!(
+            load(base, 0x4000_0008),
+            0xdead,
+            "an armed page is inaccessible"
+        );
+        assert_eq!(load(base, 0x4000_1008), 0, "the page beside it is not");
+        let cached = device.cache_pages(0x1_0000_0000, 0x1000);
+        space.protect(0x4000_0000, 0x2000, MemoryPermission::READ);
+        space.protect(0x4000_0000, 0x2000, MemoryPermission::READ_WRITE);
+        assert_eq!(
+            load(base, 0x4000_0008),
+            0xdead,
+            "tracking and protect keep it inaccessible"
+        );
+        space.map(0x5000_0000, 0x10_0000, 0x1000, MemoryPermission::READ_WRITE);
+        assert_eq!(
+            load(base, 0x5000_0008),
+            if cfg!(windows) { 7 } else { 0xdead },
+            "a new alias is trapped too, except where its view is briefly accessible: there the              map writes the page back first, which with no handler only disarms it"
+        );
+
+        device.disarm_flush_traps(0x1_0000_0000, 0x1000);
+        assert_eq!(load(base, 0x4000_0008), 7, "disarmed, it reads again");
+        assert_eq!(load(base, 0x5000_0008), 7);
+        fastmem.set_fault_handler(Some(count_store), &faults as *const AtomicU64 as usize);
+        store(base, 0x4000_0010, 1);
+        assert_eq!(
+            faults.load(Ordering::SeqCst),
+            1,
+            "a tracked page stays write-protected after disarming"
+        );
+        drop(cached);
+        space.unmap(0x5000_0000, 0x1000);
+    }
+
+    /// Records each flush and disarms what it flushed.
+    struct Recorder {
+        calls: parking_lot::Mutex<Vec<(u64, u64)>>,
+        device: std::sync::Weak<DeviceAddressSpace>,
+    }
+
+    impl crate::FlushTrapHandler for Recorder {
+        fn flush_for_cpu(&self, daddr: u64, size: u64) {
+            self.calls.lock().push((daddr, size));
+            if let Some(device) = self.device.upgrade() {
+                device.disarm_flush_traps(daddr, size);
+            }
+        }
+    }
+
+    #[test]
+    fn rebuilding_a_view_writes_its_trapped_pages_back_first() {
+        let Some((space, device)) = tracked_space() else {
+            return;
+        };
+        let device = Arc::new(device);
+        let recorder = Arc::new(Recorder {
+            calls: Default::default(),
+            device: Arc::downgrade(&device),
+        });
+        device.set_flush_trap_handler(Some(recorder.clone()));
+        space.map(0x4000_0000, 0x10_0000, 0x4000, MemoryPermission::READ_WRITE);
+        device
+            .map_process(0x1_0000_0000, &space, 0x4000_0000, 0x4000)
+            .unwrap();
+        device.arm_flush_traps(0x1_0000_1000, 0x1000);
+
+        space.protect(0x4000_0000, 0x4000, MemoryPermission::READ);
+        assert!(
+            recorder.calls.lock().is_empty(),
+            "protecting a whole view rebuilds nothing"
+        );
+        space.protect(0x4000_3000, 0x1000, MemoryPermission::READ_WRITE);
+        let rebuilt = cfg!(windows).then_some((0x1_0000_1000, 0x1000));
+        assert_eq!(
+            recorder.calls.lock().as_slice(),
+            rebuilt.as_slice(),
+            "splitting the view writes back its trapped page only where the split exposes it"
+        );
+
+        recorder.calls.lock().clear();
+        device.arm_flush_traps(0x1_0000_1000, 0x1000);
+        space.map(0x5000_0000, 0x10_1000, 0x1000, MemoryPermission::READ_WRITE);
+        assert_eq!(
+            recorder.calls.lock().as_slice(),
+            rebuilt.as_slice(),
+            "a new alias writes back its trapped page only where the new view is briefly accessible"
+        );
+        space.unmap(0x5000_0000, 0x1000);
+    }
+
+    #[test]
     fn views_mapped_again_over_tracked_pages_publish_them() {
         let faults = AtomicU64::new(0);
         let Some((space, device)) = tracked_space() else {
@@ -380,8 +487,12 @@ mod faults {
         device.take_cpu_writes(|daddr, size| found.push((daddr, size)));
         assert_eq!(
             found,
-            [(0x1_0000_1000, 0x1000)],
-            "a new alias was briefly writable"
+            if cfg!(windows) {
+                &[(0x1_0000_1000, 0x1000)][..]
+            } else {
+                &[]
+            },
+            "only Windows maps a new alias writable before it can protect it"
         );
         space.unmap(0x5000_0000, 0x1000);
     }

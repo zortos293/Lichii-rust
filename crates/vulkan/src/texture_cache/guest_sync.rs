@@ -57,6 +57,7 @@ struct Params {
     direction: u32,
     packing: u32,
     stencil_pitch: u32,
+    depth_float: u32,
 }
 
 /// The pass and its buffers, grown to the largest image synced.
@@ -89,8 +90,8 @@ impl GuestSync {
 
 /// How `image` packs into guest words on the GPU, or `None` when the pass can't move it: only
 /// block-linear 2D images (or 3D ones one slice deep) at native scale whose rows are whole
-/// 32-bit words at every level, laid out as the guest's, or D24S8 kept as the host's D24S8 and
-/// mapped whole.
+/// 32-bit words at every level, laid out as the guest's, or D24S8 kept as the host's D24S8 or
+/// D32S8 and mapped whole.
 fn packing(image: &CachedImage) -> Option<Packing> {
     let info = &image.info;
     let bytes = info.format.bytes_per_block();
@@ -111,10 +112,10 @@ fn packing(image: &CachedImage) -> Option<Packing> {
     }
     let host = image.host.format;
     match info.format {
-        PixelFormat::D24UnormS8Uint if host == vk::Format::D24_UNORM_S8_UINT => {
+        PixelFormat::D24UnormS8Uint if depth_stencil_host(host) => {
             image.contiguous().then_some(Packing::DepthLowStencilHigh)
         }
-        PixelFormat::S8UintD24Unorm if host == vk::Format::D24_UNORM_S8_UINT => {
+        PixelFormat::S8UintD24Unorm if depth_stencil_host(host) => {
             image.contiguous().then_some(Packing::StencilLowDepthHigh)
         }
         _ if image.host.conversion == Conversion::None
@@ -124,6 +125,15 @@ fn packing(image: &CachedImage) -> Option<Packing> {
         }
         _ => None,
     }
+}
+
+/// Host formats a guest D24S8 texel moves through on the GPU: D24S8 itself, or the D32S8 that
+/// drivers without D24S8 hold it in, whose float depth `guest_bytes.comp` converts.
+fn depth_stencil_host(host: vk::Format) -> bool {
+    matches!(
+        host,
+        vk::Format::D24_UNORM_S8_UINT | vk::Format::D32_SFLOAT_S8_UINT
+    )
 }
 
 /// Bytes `image` shares with the guest bytes buffer: its offsets `[from, from + size)` are the
@@ -482,6 +492,7 @@ impl TextureCache {
                             direction: direction as u32,
                             packing: packing as u32,
                             stencil_pitch: w,
+                            depth_float: u32::from(host == vk::Format::D32_SFLOAT_S8_UINT),
                         };
                         sync.compute.dispatch(
                             cmd,

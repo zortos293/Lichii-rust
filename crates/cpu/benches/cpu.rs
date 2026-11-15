@@ -243,6 +243,28 @@ const WORKLOADS: &[Workload] = &[
         per_iteration: 10,
     },
     Workload {
+        name: "simd permute loop",
+        code: &[
+            0x4f03f607, // fmov v7.4s, #1.0
+            0x1e2e100a, // fmov s10, #1.0
+            0x1e21100b, // fmov s11, #3.0
+            0x1e2b194c, // fdiv s12, s10, s11
+            0x6e21d8e0, // 1: ucvtf v0.4s, v7.4s
+            0x7e30d801, // faddp s1, v0.2s
+            0x4e812802, // trn1 v2.4s, v0.4s, v1.4s
+            0x4e825843, // uzp2 v3.4s, v2.4s, v2.4s
+            0x4eb1a864, // sminv s4, v3.4s
+            0x2e613885, // shll v5.4s, v4.4h, #16
+            0x2e6128a6, // sqxtun v6.4h, v5.4s
+            0xd503305f, // clrex
+            0xf10004a5, // subs x5, x5, #1
+            0x54fffee1, // b.ne 1b
+            0xd4000001, // svc #0
+        ],
+        far: &[],
+        per_iteration: 10,
+    },
+    Workload {
         name: "exclusive pair loop",
         code: &[
             0xc87f1823, // 1: ldxp x3, x6, [x1]

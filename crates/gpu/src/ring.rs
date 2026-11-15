@@ -107,6 +107,8 @@ struct Shared {
     /// The producer waits here for the consumer to make progress.
     progress: Signal,
     closed: AtomicBool,
+    /// Set by [`Kick::kick`]: ends the consumer's wait with nothing published.
+    kicked: AtomicBool,
     consumer_alive: AtomicBool,
     /// Header of the record the consumer executes, for the producer's report of a stalled
     /// consumer.
@@ -124,6 +126,7 @@ pub(crate) fn ring(slots: usize, min_slots: usize) -> (Producer, Consumer) {
         more: Signal::new(),
         progress: Signal::new(),
         closed: AtomicBool::new(false),
+        kicked: AtomicBool::new(false),
         consumer_alive: AtomicBool::new(true),
         executing: Padded(AtomicU64::new(WRAP)),
     });
@@ -376,6 +379,7 @@ impl Consumer {
             || {
                 shared.published.0.load(Ordering::Acquire) != read
                     || shared.closed.load(Ordering::Acquire)
+                    || shared.kicked.swap(false, Ordering::Acquire)
             },
             deadline,
         );
@@ -386,10 +390,25 @@ impl Consumer {
         Some(self.refill() || !closed)
     }
 
+    /// A handle that wakes the consumer from [`Consumer::wait_more`] without publishing.
+    pub(crate) fn kick(&self) -> Kick {
+        Kick(self.shared.clone())
+    }
+
     /// A guard that marks the consumer gone when dropped (its thread ended or panicked), so a
     /// waiting producer stops waiting.
     pub(crate) fn liveness(&self) -> ConsumerLiveness {
         ConsumerLiveness(self.shared.clone())
+    }
+}
+
+/// Wakes the consumer: its wait returns as if more were published.
+pub(crate) struct Kick(Arc<Shared>);
+
+impl Kick {
+    pub(crate) fn kick(&self) {
+        self.0.kicked.store(true, Ordering::Release);
+        self.0.more.notify();
     }
 }
 

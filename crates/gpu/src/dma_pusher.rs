@@ -952,6 +952,7 @@ mod tests {
             fetch_syncs.clone(),
             Arc::new(crate::activity::Activity::new()),
             Arc::default(),
+            Arc::new(crate::cpu_reads::CpuReads::new(Box::new(|| {}))),
         );
         let mut shared = FrontShared {
             stream: Stream::new(

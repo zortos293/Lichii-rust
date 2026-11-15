@@ -69,18 +69,22 @@ struct Activity {
     buffers: BufferCacheStats,
 }
 
-/// Draws skipped while their shaders translated or their pipelines built, and the longest time
-/// between two presents, over the second since the last `draw stalls` line. The line is
-/// written at INFO, at most once a second, only for a second that skipped draws or held a
-/// present back for [`Stalls::SLOW_FRAME`] or more, so scene loads show up and steady play does not.
+/// Draws skipped while their shaders translated or their pipelines built, draws that waited
+/// for them, the render-thread time spent translating and building in place or waiting, and
+/// the longest time between two presents, over the second since the last `draw stalls` line.
+/// The line is written at INFO, at most once a second, only for a second that skipped or
+/// waited, compiled on the render thread for a millisecond or more, or held a present back for
+/// [`Stalls::SLOW_FRAME`] or more, so scene loads show up and steady play does not.
 #[derive(Default)]
 struct Stalls {
     since: Option<Instant>,
     last_present: Option<Instant>,
     worst_frame: Duration,
     presents: u32,
-    /// Shader and pipeline waits when the window started.
-    waits_at: (u64, u64),
+    /// Shader and pipeline skips and blocking waits when the window started.
+    waits_at: [u64; 4],
+    /// Shader and pipeline render-thread compile time when the window started.
+    stalled_at: [Duration; 2],
 }
 
 impl Stalls {
@@ -91,17 +95,36 @@ impl Stalls {
             self.worst_frame = self.worst_frame.max(now - last);
         }
         self.presents += 1;
-        let waits = (shaders.waits(), pipelines.waits());
+        let waits = [
+            shaders.waits(),
+            pipelines.waits(),
+            shaders.blocked(),
+            pipelines.blocked(),
+        ];
+        let stalled = [shaders.stalled(), pipelines.stalled()];
         let since = *self.since.get_or_insert(now);
         if now - since < Duration::from_secs(1) {
             return;
         }
-        let skipped_shader = waits.0 - self.waits_at.0;
-        let skipped_pipeline = waits.1 - self.waits_at.1;
-        if skipped_shader + skipped_pipeline > 0 || self.worst_frame >= Self::SLOW_FRAME {
+        let [shader_ms, pipeline_ms] =
+            std::array::from_fn(|i| (stalled[i] - self.stalled_at[i]).as_secs_f32() * 1000.0);
+        let [
+            skipped_shader,
+            skipped_pipeline,
+            waited_shader,
+            waited_pipeline,
+        ] = std::array::from_fn(|i| waits[i] - self.waits_at[i]);
+        if skipped_shader + skipped_pipeline + waited_shader + waited_pipeline > 0
+            || shader_ms + pipeline_ms >= 1.0
+            || self.worst_frame >= Self::SLOW_FRAME
+        {
             tracing::info!(
                 skipped_shader,
                 skipped_pipeline,
+                waited_shader,
+                waited_pipeline,
+                shader_ms,
+                pipeline_ms,
                 worst_frame_ms = self.worst_frame.as_secs_f32() * 1000.0,
                 presents = self.presents,
                 seconds = (now - since).as_secs_f32(),
@@ -114,6 +137,7 @@ impl Stalls {
             since: Some(now),
             last_present: Some(now),
             waits_at: waits,
+            stalled_at: stalled,
             ..Self::default()
         };
     }
@@ -444,16 +468,10 @@ impl VulkanRasterizer {
                     regs.color_mask[if regs.color_mask_common != 0 { 0 } else { index }].0,
                 ))
             });
-            let mask = regs.color_mask[if regs.color_mask_common != 0 {
-                0
-            } else {
-                index
-            }];
-            let enabled = [mask.r(), mask.g(), mask.b(), mask.a()];
-            let written = channels.iter().zip(enabled).enumerate().fold(
+            let written = channels.iter().enumerate().fold(
                 vk::ColorComponentFlags::empty(),
-                |written, (i, (&c, m))| {
-                    if c & m != 0 {
+                |written, (i, &c)| {
+                    if c != 0 {
                         written | vk::ColorComponentFlags::from_raw(1 << i)
                     } else {
                         written
@@ -1405,6 +1423,16 @@ impl Rasterizer for VulkanRasterizer {
         }
     }
 
+    fn flush_for_cpu_read(&mut self, addr: DAddr, size: u64) {
+        if let Err(error) = self
+            .buffer_cache
+            .flush_for_cpu_read(&mut self.scheduler, addr, size)
+        {
+            tracing::error!(%error, "flushing GPU-written buffers for a CPU read failed");
+        }
+        self.flush_region(addr, size);
+    }
+
     fn unmap_region(&mut self, addr: DAddr, size: u64) {
         self.buffer_cache.invalidate(addr, size);
         self.draw.shaders.invalidate(addr, size);
@@ -1473,7 +1501,10 @@ impl Rasterizer for VulkanRasterizer {
             .texture_cache
             .presentable(&mut self.scheduler, framebuffer)
         {
-            Ok(Some(id)) => self.present_cached(framebuffer, id),
+            Ok(Some(id)) => {
+                self.draw.presented(id);
+                self.present_cached(framebuffer, id)
+            }
             Ok(None) => Ok(false),
             Err(error) => Err(error),
         };
@@ -2167,13 +2198,22 @@ mod tests {
 
     #[test]
     fn masked_colour_clears_keep_the_unwritten_channels() {
-        // G and A written, through the colour mask (UNORM) and through the clear's own channel
-        // selection (UINT, integer outputs).
+        // The clear's own channel selection decides what is written; the colour write mask
+        // does not apply to clears, so a whole clear under a G+A mask still writes all four.
         let cases = [
             (
                 0xd5,
                 ColorMask(0x1010),
                 ClearSurface(0b1111 << 2),
+                [1.0, 0.5, 0.25, 0.0],
+                [0.0, 0.2, 1.0, 1.0],
+                [255, 128, 64, 0],
+                [0, 51, 255, 255],
+            ),
+            (
+                0xd5,
+                ColorMask(0x0111),
+                ClearSurface(1 << 3 | 1 << 5),
                 [1.0, 0.5, 0.25, 0.0],
                 [0.0, 0.2, 1.0, 1.0],
                 [255, 128, 64, 0],
