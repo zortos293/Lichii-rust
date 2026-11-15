@@ -500,6 +500,7 @@ impl Thread {
             return Err(crate::result::TERMINATION_REQUESTED);
         }
         if cancellable && std::mem::take(&mut s.cancel_pending) {
+            tracing::warn!(thread = ?self.id(), resume = ?resume, "diag cancel consumed by a new wait");
             return Err(crate::result::CANCELLED);
         }
         let token = s.next_token;
@@ -565,6 +566,7 @@ impl Thread {
     /// Wakes the thread from the cancellable wait it is in, or makes its next one fail.
     pub(crate) fn cancel_synchronization(self: &Arc<Self>) {
         let mut s = self.sched.lock();
+        tracing::warn!(target_thread = ?self.id(), waiting = s.wait != 0, cancellable = s.cancellable, resume = ?s.resume, state = ?s.state, pending = s.cancel_pending, "diag cancel");
         if s.wait == 0 || !s.cancellable {
             s.cancel_pending = true;
             return;
