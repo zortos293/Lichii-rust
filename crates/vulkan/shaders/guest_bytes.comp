@@ -2,9 +2,10 @@
 
 // Moves one 2D block-linear slice (the first of its block depth) between a pitch-linear buffer and a buffer of
 // guest bytes, one 32-bit word per invocation. Mirrors lichii_texture::block_linear (Tiling::offset
-// and GobLayout). Words whose guest offset falls outside [guest_floor, guest_limit) are skipped,
-// so a slice can be painted into the bytes of a smaller image it overlaps, one run of shared
-// device memory at a time. Depth-stencil packings combine a
+// and GobLayout). Each word's image offset is looked up in the runs of shared device memory, so a
+// slice can be painted into the bytes of a smaller image it overlaps in one pass; words outside
+// every run are skipped. Rows start at y_base, so a pass covers only the block rows the runs
+// touch. Depth-stencil packings combine a
 // depth word per texel with stencil bytes packed four to a word; X8D24 keeps its high byte zero and has no stencil.
 // With depth_float the host's depth word is a float, converted to and from the guest's 24-bit unorm exactly as
 // the CPU path's f64 arithmetic does.
@@ -16,6 +17,8 @@ layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
 layout(set = 0, binding = 0) buffer Guest { uint guest[]; };
 layout(set = 0, binding = 1) buffer Linear { uint linear_words[]; };
 layout(set = 0, binding = 2) buffer Stencil { uint stencil_words[]; };
+// (image offset, size, guest buffer offset, unused) per run, sorted by image offset.
+layout(set = 0, binding = 3) readonly buffer Runs { uvec4 runs[]; };
 
 const uint TO_GUEST = 0u;
 const uint PLAIN = 0u;
@@ -30,9 +33,10 @@ layout(push_constant) uniform P {
     uint block_height_log2;
     uint block_depth_log2;
     uint switch2_layout;
-    int guest_offset;
-    uint guest_floor;
-    uint guest_limit;
+    uint subresource;
+    uint run_first;
+    uint run_count;
+    uint y_base;
     uint direction;
     uint packing;
     uint stencil_pitch;
@@ -68,7 +72,7 @@ uint float_to_d24(float depth) {
 
 void main() {
     uint x = gl_GlobalInvocationID.x;
-    uint y = gl_GlobalInvocationID.y;
+    uint y = gl_GlobalInvocationID.y + p.y_base;
     if (x >= p.row_words || y >= p.height) {
         return;
     }
@@ -83,11 +87,22 @@ void main() {
         uint differ = ((in_gob >> 5u) ^ (in_gob >> 6u)) & 1u;
         in_gob ^= (differ << 5u) | (differ << 6u);
     }
-    int at = p.guest_offset + int(base + in_gob);
-    if (at < int(p.guest_floor) || uint(at) >= p.guest_limit) {
+    uint offset = p.subresource + base + in_gob;
+    uint lo = p.run_first;
+    uint hi = p.run_first + p.run_count;
+    while (lo + 1u < hi) {
+        uint mid = (lo + hi) >> 1u;
+        if (runs[mid].x <= offset) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    uvec4 run = runs[lo];
+    if (offset < run.x || offset - run.x >= run.y) {
         return;
     }
-    uint word = uint(at) >> 2u;
+    uint word = (run.z + offset - run.x) >> 2u;
     uint texel = y * p.row_words + x;
     uint s_index = y * p.stencil_pitch + x;
     uint s_shift = (s_index & 3u) * 8u;
@@ -113,6 +128,7 @@ void main() {
             linear_words[texel] = p.depth_float != 0u ? floatBitsToUint(d24_to_float(d)) : d;
             if (p.packing != DEPTH_LOW_ZERO_HIGH) {
                 uint s = p.packing == DEPTH_LOW_STENCIL_HIGH ? value >> 24u : value & 0xFFu;
+                atomicAnd(stencil_words[s_index >> 2u], ~(0xFFu << s_shift));
                 atomicOr(stencil_words[s_index >> 2u], s << s_shift);
             }
         }

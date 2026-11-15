@@ -60,9 +60,10 @@ struct Params {
     block_height_log2: u32,
     block_depth_log2: u32,
     switch2_layout: u32,
-    guest_offset: i32,
-    guest_floor: u32,
-    guest_limit: u32,
+    subresource: u32,
+    run_first: u32,
+    run_count: u32,
+    y_base: u32,
     direction: u32,
     packing: u32,
     stencil_pitch: u32,
@@ -76,6 +77,7 @@ pub(super) struct GuestSync {
     guest: Option<Buffer>,
     linear: Option<Buffer>,
     stencil: Option<Buffer>,
+    runs: Option<Buffer>,
     scratch: RunScratch,
 }
 
@@ -85,13 +87,14 @@ impl GuestSync {
             compute: HostCompute::new(
                 device,
                 shaders::GUEST_BYTES_COMP,
-                3,
+                4,
                 size_of::<Params>() as u32,
             )?,
             descriptors: DescriptorAllocator::new(device)?,
             guest: None,
             linear: None,
             stencil: None,
+            runs: None,
             scratch: RunScratch::default(),
         })
     }
@@ -162,11 +165,14 @@ struct Run {
     at: u64,
 }
 
-/// Reused storage for [`shared_runs`]: the target's segments by device address, and the runs.
+/// Reused storage for [`shared_runs`]: the target's segments by device address, the runs, and
+/// the runs as `guest_bytes.comp` reads them.
 #[derive(Default)]
 struct RunScratch {
     targets: Vec<Segment>,
     runs: Vec<Run>,
+    words: Vec<[u32; 4]>,
+    spans: Vec<(u64, u64)>,
 }
 
 /// Fills `scratch.runs`, by image offset, with where the bytes of `image` land in the
@@ -179,7 +185,7 @@ fn shared_runs(
     window: (u64, u64),
     scratch: &mut RunScratch,
 ) -> bool {
-    let RunScratch { targets, runs } = scratch;
+    let RunScratch { targets, runs, .. } = scratch;
     targets.clear();
     targets.extend_from_slice(&target.segments);
     targets.sort_unstable_by_key(|t| t.daddr);
@@ -417,14 +423,45 @@ impl TextureCache {
         let sync = guest_sync.as_mut().expect("created by sync_on_gpu");
         let placed = shared_runs(image, target, window, &mut sync.scratch);
         debug_assert!(placed, "checked by sync_on_gpu");
+        let scratch = &mut sync.scratch;
+        scratch.words.clear();
+        scratch.words.extend(
+            scratch
+                .runs
+                .iter()
+                .map(|r| [r.from as u32, r.size as u32, r.at as u32, 0]),
+        );
+        scratch.spans.clear();
+        scratch
+            .spans
+            .extend(scratch.runs.iter().map(|r| (r.at, r.at + r.size)));
+        scratch.spans.sort_unstable();
+        let serial =
+            direction == Direction::ToGuest && scratch.spans.windows(2).any(|s| s[0].1 > s[1].0);
+        let run_bytes: &[u8] = bytemuck::cast_slice(&scratch.words);
+        ensure(
+            &device,
+            tx,
+            &mut sync.runs,
+            run_bytes.len() as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            "guest sync runs",
+        )?;
+        let runs_buffer = sync.runs.as_ref().expect("ensured").raw();
+        for (at, chunk) in (0u64..).step_by(65536).zip(run_bytes.chunks(65536)) {
+            // SAFETY: `cmd` is recording outside any rendering, the buffer holds `run_bytes`, and
+            // the barrier above orders this write after the last pass that read the buffer.
+            unsafe { device.raw.cmd_update_buffer(cmd, runs_buffer, at, chunk) };
+        }
         let guest = sync.guest.as_ref().expect("ensured").raw();
         let linear = sync.linear.as_ref().expect("ensured").raw();
         let stencil = sync.stencil.as_ref().expect("ensured").raw();
-        let buffers = [guest, linear, stencil].map(|buffer| vk::DescriptorBufferInfo {
-            buffer,
-            offset: 0,
-            range: vk::WHOLE_SIZE,
-        });
+        let buffers =
+            [guest, linear, stencil, runs_buffer].map(|buffer| vk::DescriptorBufferInfo {
+                buffer,
+                offset: 0,
+                range: vk::WHOLE_SIZE,
+            });
         let all = (
             vk::PipelineStageFlags2::ALL_COMMANDS,
             vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
@@ -439,60 +476,86 @@ impl TextureCache {
                 if count == 0 {
                     continue;
                 }
-                let shared = first..first + count;
+                let shared = &runs[first..first + count];
                 let tiling = info.surface().level_tiling(level);
                 let (w, h, _) = info.level_extent(level);
                 let row_words = w * tiling.bytes_per_block / 4;
-                let region = |aspect_mask| vk::BufferImageCopy {
+                let block_rows = 8u32 << tiling.block_height_log2;
+                let block_bytes = u64::from(tiling.row_gobs)
+                    << (9 + tiling.block_height_log2 + tiling.block_depth_log2);
+                let lo = shared[0].from.max(start) - start;
+                let hi = shared
+                    .iter()
+                    .map(|r| r.from + r.size)
+                    .max()
+                    .expect("count > 0")
+                    .min(end)
+                    - start;
+                let y0 = ((lo / block_bytes) as u32 * block_rows).min(h);
+                let y1 = (((hi - 1) / block_bytes + 1) as u32 * block_rows).min(h);
+                if y0 >= y1 {
+                    continue;
+                }
+                let band = (
+                    start + u64::from(y0 / block_rows) * block_bytes,
+                    (start + u64::from(y1.div_ceil(block_rows)) * block_bytes).min(end),
+                );
+                let region = |aspect_mask, texel_bytes: u64| vk::BufferImageCopy {
+                    buffer_offset: u64::from(y0) * u64::from(w) * texel_bytes,
                     image_subresource: vk::ImageSubresourceLayers {
                         aspect_mask,
                         mip_level: level,
                         base_array_layer: layer,
                         layer_count: 1,
                     },
+                    image_offset: vk::Offset3D {
+                        x: 0,
+                        y: y0 as i32,
+                        z: 0,
+                    },
                     image_extent: vk::Extent3D {
                         width: w,
-                        height: h,
+                        height: y1 - y0,
                         depth: 1,
                     },
                     ..Default::default()
                 };
-                let groups = [row_words.div_ceil(GROUP[0]), h.div_ceil(GROUP[1]), 1];
+                let main = region(main_aspect, u64::from(tiling.bytes_per_block));
+                let stencil_region = region(vk::ImageAspectFlags::STENCIL, 1);
+                let groups = [
+                    row_words.div_ceil(GROUP[0]),
+                    (y1 - y0).div_ceil(GROUP[1]),
+                    1,
+                ];
                 let keep = direction == Direction::ToGuest
-                    || !sync.scratch.runs[shared.clone()]
+                    || !shared
                         .iter()
-                        .any(|r| r.from <= start && end <= r.from + r.size);
+                        .any(|r| r.from <= band.0 && band.1 <= r.from + r.size);
                 // SAFETY: `cmd` is recording outside any rendering; the image is in `layout`,
                 // which copies both ways allow, and every buffer holds the subresource's texels.
                 unsafe {
                     if keep {
-                        device.raw.cmd_copy_image_to_buffer(
-                            cmd,
-                            raw,
-                            layout,
-                            linear,
-                            &[region(main_aspect)],
-                        );
-                    }
-                    if packing.stencil() {
-                        match direction {
-                            Direction::ToGuest => device.raw.cmd_copy_image_to_buffer(
+                        device
+                            .raw
+                            .cmd_copy_image_to_buffer(cmd, raw, layout, linear, &[main]);
+                        if packing.stencil() {
+                            device.raw.cmd_copy_image_to_buffer(
                                 cmd,
                                 raw,
                                 layout,
                                 stencil,
-                                &[region(vk::ImageAspectFlags::STENCIL)],
-                            ),
-                            Direction::FromGuest => {
-                                device
-                                    .raw
-                                    .cmd_fill_buffer(cmd, stencil, 0, vk::WHOLE_SIZE, 0);
-                            }
+                                &[stencil_region],
+                            );
                         }
                     }
                     barrier(&device, cmd);
-                    for index in shared.clone() {
-                        let run = sync.scratch.runs[index];
+                    let passes = if serial { count } else { 1 };
+                    for pass in 0..passes {
+                        let (run_first, run_count) = if serial {
+                            (first + pass, 1)
+                        } else {
+                            (first, count)
+                        };
                         let set = sync
                             .descriptors
                             .allocate(tx.scheduler, sync.compute.set_layout)?;
@@ -503,9 +566,10 @@ impl TextureCache {
                             block_height_log2: tiling.block_height_log2,
                             block_depth_log2: tiling.block_depth_log2,
                             switch2_layout: u32::from(tiling.layout == GobLayout::Switch2),
-                            guest_offset: (run.at as i64 + start as i64 - run.from as i64) as i32,
-                            guest_floor: run.at as u32,
-                            guest_limit: (run.at + run.size) as u32,
+                            subresource: start as u32,
+                            run_first: run_first as u32,
+                            run_count: run_count as u32,
+                            y_base: y0,
                             direction: direction as u32,
                             packing: packing as u32,
                             stencil_pitch: w,
@@ -528,20 +592,16 @@ impl TextureCache {
                         barrier(&device, cmd);
                     }
                     if direction == Direction::FromGuest {
-                        device.raw.cmd_copy_buffer_to_image(
-                            cmd,
-                            linear,
-                            raw,
-                            layout,
-                            &[region(main_aspect)],
-                        );
+                        device
+                            .raw
+                            .cmd_copy_buffer_to_image(cmd, linear, raw, layout, &[main]);
                         if packing.stencil() {
                             device.raw.cmd_copy_buffer_to_image(
                                 cmd,
                                 stencil,
                                 raw,
                                 layout,
-                                &[region(vk::ImageAspectFlags::STENCIL)],
+                                &[stencil_region],
                             );
                         }
                         barrier(&device, cmd);
