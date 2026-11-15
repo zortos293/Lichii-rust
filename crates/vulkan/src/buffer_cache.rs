@@ -973,6 +973,19 @@ impl BufferCache {
         if !self.gpu_written.intersects(daddr, end) {
             return Ok(());
         }
+        let dctx = lichii_common::diag_sync::CTX.load(std::sync::atomic::Ordering::Relaxed);
+        let entry = (
+            lichii_common::diag_sync::ENTRY[0].load(std::sync::atomic::Ordering::Relaxed),
+            lichii_common::diag_sync::ENTRY[1].load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let mut entry_old = Vec::new();
+        if dctx >= 2 && entry.0 != 0 {
+            if self.gpu_written.intersects(entry.0, entry.0 + entry.1) {
+                lichii_common::diag_sync::add(dctx, 9, 1);
+            }
+            entry_old = vec![0u8; entry.1 as usize];
+            let _ = self.memory.read_bytes(entry.0, &mut entry_old);
+        }
         let Self {
             page_table,
             buffers,
@@ -1056,6 +1069,13 @@ impl BufferCache {
                 );
             }
             offset += len;
+        }
+        if !entry_old.is_empty() {
+            let mut entry_new = vec![0u8; entry.1 as usize];
+            let _ = self.memory.read_bytes(entry.0, &mut entry_new);
+            if entry_new != entry_old {
+                lichii_common::diag_sync::add(dctx, 10, 1);
+            }
         }
         self.gpu_written.subtract(daddr, end);
         self.disarm_written_back(daddr, end);

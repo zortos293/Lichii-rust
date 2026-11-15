@@ -2,7 +2,8 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::time::Instant;
 
 pub static CTX: AtomicU8 = AtomicU8::new(0);
-pub static C: [[AtomicU64; 9]; 4] = [const { [const { AtomicU64::new(0) }; 9] }; 4];
+pub static C: [[AtomicU64; 11]; 4] = [const { [const { AtomicU64::new(0) }; 11] }; 4];
+pub static ENTRY: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 pub static BIND: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static LAST: AtomicU64 = AtomicU64::new(0);
 
@@ -36,8 +37,8 @@ pub fn maybe_report() {
     for (i, row) in C.iter().enumerate() {
         let v: Vec<u64> = row.iter().map(|a| a.swap(0, Relaxed)).collect();
         s += &format!(
-            " {}: calls={} ms={:.1} flushes={} aside={} finish={} kb={} changed_kb={} wait_ms={:.1} same_chunks={} |",
-            names[i], v[0], v[1] as f64 / 1e6, v[2], v[3], v[4], v[5] / 1024, v[6] / 1024, v[7] as f64 / 1e6, v[8]
+            " {}: calls={} ms={:.1} flushes={} aside={} finish={} kb={} changed_kb={} wait_ms={:.1} same_chunks={} exact_hits={} entry_changed={} |",
+            names[i], v[0], v[1] as f64 / 1e6, v[2], v[3], v[4], v[5] / 1024, v[6] / 1024, v[7] as f64 / 1e6, v[8], v[9], v[10]
         );
     }
     let b: Vec<u64> = BIND.iter().map(|a| a.swap(0, Relaxed)).collect();

@@ -353,6 +353,13 @@ impl Back {
                 };
                 if host {
                     let ctx = if method == FetchSync::Host as u32 { 2 } else { 3 };
+                    let daddr = self
+                        .current
+                        .and_then(|index| self.channels[index].as_ref())
+                        .and_then(|channel| channel.setup.memory.translate(address))
+                        .unwrap_or(0);
+                    lichii_common::diag_sync::ENTRY[0].store(daddr, Ordering::Relaxed);
+                    lichii_common::diag_sync::ENTRY[1].store(size, Ordering::Relaxed);
                     lichii_common::diag_sync::CTX.store(ctx, Ordering::Relaxed);
                     let t = std::time::Instant::now();
                     self.synchronize_read(address, size, FETCH_SYNC_WINDOW);
