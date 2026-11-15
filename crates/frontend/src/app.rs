@@ -544,7 +544,7 @@ impl App {
             ..LoadOptions::default()
         };
         let proxy = self.proxy.clone();
-        let applets = AppletDialogs::new(self.settings.system.username.clone(), move || {
+        let applets = AppletDialogs::new(move || {
             let _ = proxy.send_event(UserEvent::Wake);
         });
         let booted = match restart {
