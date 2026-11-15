@@ -165,8 +165,9 @@ impl Page {
                 tracing::warn!("nx2:syncpt page header write faulted");
             }
         }
+        let guest = page.syncpoints.guest();
         for id in 0..count {
-            page.mirror(id);
+            let _ = guest.publish(id);
         }
         page
     }
@@ -181,24 +182,11 @@ impl Page {
         }
     }
 
-    /// Copies a syncpoint's value into the page and returns it, with whether the page held an
-    /// older one. `None` for ids the page has no slot for.
-    fn mirror(&self, id: u32) -> Option<(u32, bool)> {
-        if id >= self.count {
-            return None;
-        }
-        let value = self.syncpoints.guest().value(id).ok()?;
-        let address = self.ro + VALUES + u64::from(id) * 8;
-        let changed = self.read(address) != u64::from(value);
-        if changed {
-            self.write(address, u64::from(value));
-        }
-        Some((value, changed))
-    }
-
-    /// Answers every armed wait whose page value is stale, and watches the rest.
+    /// Answers every armed wait whose page value changed since its last answer, and watches the
+    /// rest. Values reach the page only through the bank's mirror, which orders them.
     fn serve(self: &Arc<Self>) {
         self.request.clear();
+        let guest = self.syncpoints.guest();
         let mut watch = Vec::new();
         let mut answered = false;
         {
@@ -220,14 +208,13 @@ impl Page {
                     let bit = 1u64 << pending.trailing_zeros();
                     pending &= !bit;
                     let id = word as u32 * 64 + bit.trailing_zeros();
-                    match self.mirror(id) {
-                        Some((value, false)) if fresh.load(Ordering::SeqCst) & bit == 0 => {
-                            if *watching & bit == 0 {
-                                *watching |= bit;
-                                watch.push((id, value));
-                            }
-                        }
-                        _ => answer |= bit,
+                    let mirrored = id < self.count && guest.publish(id).is_ok();
+                    let value = guest.value(id).unwrap_or(0);
+                    if !mirrored || fresh.load(Ordering::SeqCst) & bit != 0 {
+                        answer |= bit;
+                    } else if *watching & bit == 0 {
+                        *watching |= bit;
+                        watch.push((id, value));
                     }
                 }
                 fresh.fetch_and(!answer, Ordering::SeqCst);

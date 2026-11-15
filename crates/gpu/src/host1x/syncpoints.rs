@@ -226,6 +226,7 @@ impl SyncpointBank {
     ) -> Result<Option<ActionHandle>, InvalidSyncpoint> {
         let slot = self.slot(id)?;
         if is_reached(slot.value.load(Ordering::Acquire), threshold) {
+            slot.publish(id);
             action();
             return Ok(None);
         }
@@ -234,6 +235,7 @@ impl SyncpointBank {
         if is_reached(slot.value.load(Ordering::SeqCst), threshold) {
             drop(actions);
             slot.interest.fetch_sub(1, Ordering::SeqCst);
+            slot.publish(id);
             action();
             return Ok(None);
         }
@@ -247,8 +249,9 @@ impl SyncpointBank {
     }
 
     /// Calls `mirror(id, value)` after each increment of every id below `count`, with the value
-    /// the id holds then, before the actions that increment satisfies run. Replaces the mirror
-    /// those ids had.
+    /// the id holds then, before the actions that increment satisfies run, and again before an
+    /// action registered on an already reached value runs. Calls for one id never overlap.
+    /// Replaces the mirror those ids had.
     pub fn set_mirror(
         &self,
         count: u32,
@@ -267,6 +270,13 @@ impl SyncpointBank {
             }
         }
         MirrorHandle { serial, count }
+    }
+
+    /// Runs `id`'s mirror, if it has one, with the value it holds now. It runs in turn with the
+    /// mirror runs of increments, so a value read before an increment never lands after it.
+    pub fn publish(&self, id: u32) -> Result<(), InvalidSyncpoint> {
+        self.slot(id)?.publish(id);
+        Ok(())
     }
 
     /// Drops the mirror `handle` names from the ids no later mirror replaced it on.
@@ -318,11 +328,15 @@ impl SyncpointBank {
 }
 
 impl Slot {
-    #[cold]
-    fn wake(&self, id: u32, value: u32) {
+    fn publish(&self, id: u32) {
         if let Some((_, mirror)) = &*self.mirror.lock() {
             mirror(id, self.value.load(Ordering::SeqCst));
         }
+    }
+
+    #[cold]
+    fn wake(&self, id: u32, value: u32) {
+        self.publish(id);
         let ready: Vec<PendingAction> = {
             let mut actions = self.actions.lock();
             self.changed.notify_all();
@@ -501,5 +515,23 @@ mod tests {
         bank.increment(3).unwrap();
         assert_eq!(seen.lock().len(), 1);
         assert_eq!(bank.next_action_threshold(3), Ok(None));
+    }
+
+    #[test]
+    fn an_action_on_a_reached_value_runs_after_the_mirror() {
+        let syncpoints = Syncpoints::new();
+        let bank = syncpoints.guest();
+        bank.increment(4).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mirror = seen.clone();
+        bank.set_mirror(8, move |id, value| mirror.lock().push((id, value)));
+        let action = seen.clone();
+        bank.register_action(4, 1, move || action.lock().push((99, 0)))
+            .unwrap();
+        assert_eq!(
+            *seen.lock(),
+            [(4, 1), (99, 0)],
+            "the incrementing thread may not have mirrored yet"
+        );
     }
 }
