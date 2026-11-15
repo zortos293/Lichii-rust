@@ -443,7 +443,13 @@ impl ShaderCache {
                 self.stats.translated += 1;
                 self.stalled += start.elapsed();
                 match result {
-                    Ok(module) => Some(module),
+                    Ok(module) => {
+                        let (start, len) = env.code_range();
+                        let mut code = Vec::new();
+                        hash_program(env.gmmu(), start, len, &mut code);
+                        super::shader_workers::diag_dump_shader(module.hash, env, options, &code);
+                        Some(module)
+                    }
                     Err(error) => {
                         self.stats.failed += 1;
                         *bindings = first;

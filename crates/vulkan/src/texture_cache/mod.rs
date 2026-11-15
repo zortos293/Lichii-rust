@@ -1278,6 +1278,9 @@ impl TextureCache {
         if let Some(image) = self.get(id) {
             for s in &image.segments {
                 self.written_pages.mark(s.daddr, s.size);
+                crate::rasterizer::draw::diag::watch_dev_with("mark_modified", s.daddr, s.size, || {
+                    format!("{id:?} {:?}", image.info)
+                });
             }
         }
         self.tick += 1;

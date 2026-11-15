@@ -200,6 +200,17 @@ pub(crate) fn watch_dev(kind: &str, daddr: u64, size: u64) {
     watch_hit(kind, daddr, size, true, "");
 }
 
+/// [`watch_dev`] whose detail is built only on a hit.
+pub(crate) fn watch_dev_with(kind: &str, daddr: u64, size: u64, extra: impl FnOnce() -> String) {
+    let end = daddr.saturating_add(size.max(1));
+    let hit = watch()
+        .lock()
+        .is_ok_and(|l| l.iter().any(|&(_, d)| d.is_some_and(|t| t + 16 > daddr && t < end)));
+    if hit {
+        watch_hit(kind, daddr, size, true, &extra());
+    }
+}
+
 /// LICHII_DIAG_FLUSH_ALL=<bytes>: at every present, write GPU-modified images up to that
 /// many guest bytes, and every GPU-written buffer, back to guest memory.
 pub(crate) fn flush_all() -> Option<u64> {
