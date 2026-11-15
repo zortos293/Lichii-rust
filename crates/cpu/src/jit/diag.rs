@@ -545,3 +545,59 @@ pub(super) fn fix_nan(ctx: &mut ThreadContext, word: u32, pc: u64) {
         tracing::warn!("LIRU3 FIXNAN t={:.3} pc={pc:#x} -> {bits:08x}", t());
     }
 }
+
+fn interp_pcs() -> &'static [u64] {
+    static V: OnceLock<Vec<u64>> = OnceLock::new();
+    V.get_or_init(|| {
+        let v: Vec<u64> = std::env::var("LICHII_DIAG_INTERP_PC")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .collect();
+        tracing::warn!(?v, "LIRU3 diag interp pcs");
+        v
+    })
+}
+
+/// LICHII_DIAG_INTERP_PC: comma-separated pcs that never translate, so they run one at a time on
+/// the interpreter with an exact context.
+pub(super) fn interp_pc(pc: u64) -> bool {
+    let pcs = interp_pcs();
+    !pcs.is_empty() && pcs.contains(&pc)
+}
+
+/// Before an LICHII_DIAG_INTERP_PC instruction runs: when any of its general registers' low 32
+/// bits holds an f32 NaN, logs every register and a backtrace (first 300 hits).
+pub(super) fn interp_hook(memory: &AddressSpace, ctx: &ThreadContext) {
+    if !interp_pc(ctx.pc) {
+        return;
+    }
+    let nan: Vec<usize> = (0..31).filter(|&i| nan32(ctx.x[i] as u32)).collect();
+    if nan.is_empty() {
+        return;
+    }
+    static COUNT: Mutex<u32> = Mutex::new(0);
+    let Ok(mut c) = COUNT.lock() else {
+        return;
+    };
+    *c += 1;
+    if *c > 300 {
+        return;
+    }
+    drop(c);
+    let x: Vec<String> = ctx
+        .x
+        .iter()
+        .enumerate()
+        .map(|(i, v)| format!("x{i}={v:x}"))
+        .collect();
+    tracing::warn!(
+        "LIRU3 INTERP t={:.3} pc={:#x} nanregs={nan:?} tls={:#x} sp={:#x} {} bt=[{}]",
+        t(),
+        ctx.pc,
+        ctx.tpidr_el0,
+        ctx.sp,
+        x.join(" "),
+        backtrace(memory, ctx)
+    );
+}

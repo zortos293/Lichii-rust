@@ -459,7 +459,12 @@ impl Jit {
                 .map_err(|_| CpuFault::Prefetch { pc: start })?;
             let inst = decode(word);
             let mark = t.block.ops.len();
-            match t.translate(&inst, pc) {
+            let step = if diag::interp_pc(pc) {
+                Step::Rejected
+            } else {
+                t.translate(&inst, pc)
+            };
+            match step {
                 Step::Next => {}
                 Step::End(terminal) => {
                     t.block.terminal = terminal;
@@ -581,6 +586,7 @@ impl Jit {
                     if let Some(p) = self.state.profile.as_deref_mut() {
                         p.fallback(&inst);
                     }
+                    diag::interp_hook(&self.config.memory, ctx);
                     let exit = Interpreter::execute(&self.config, ctx, &[inst]);
                     if let Some(halt) = self.apply(exit) {
                         return halt;
