@@ -316,7 +316,7 @@ impl VideoDecoderService {
                 end_queued: false,
                 stream_ended: false,
                 end_frame: (0, 0, 0),
-                drain_at_end: context.program.program_id == MARIO_KART_WORLD,
+                drain_at_end: context.program.program_id == MARIO_KART_WORLD && std::env::var_os("LICHII_DIAG_NO_DRAIN").is_none(),
                 writing: false,
                 stops: 0,
                 quit: false,
