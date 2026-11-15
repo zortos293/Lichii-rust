@@ -5,6 +5,10 @@
 //! no texel crosses to the host, where a write-back and re-upload through guest memory would.
 
 use ash::vk;
+
+thread_local! {
+    static DIAG_SYNC_WHY: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
 use gpu_allocator::MemoryLocation;
 use lichii_texture::PixelFormat;
 use lichii_texture::block_linear::GobLayout;
@@ -434,6 +438,10 @@ impl TextureCache {
     /// Returns false, having recorded nothing, when the pass can't move one of the images, an
     /// overlap the CPU wrote is stale itself, or removed overlaps left their texels only in
     /// guest memory.
+    pub(super) fn diag_sync_why() -> &'static str {
+        DIAG_SYNC_WHY.with(std::cell::Cell::get)
+    }
+
     pub(super) fn sync_on_gpu(
         &mut self,
         tx: &mut Transfer<'_>,
@@ -441,16 +449,41 @@ impl TextureCache {
         newer: &mut [ImageId],
     ) -> Result<bool> {
         let image = self.get(id).expect("a live image id");
-        let movable = |o: &CachedImage| {
-            o.keep_out.is_empty() && o.info.size_bytes() < 1 << 31 && packing(o).is_some()
+        let why = |o: &CachedImage| {
+            if !o.keep_out.is_empty() {
+                Some("keep_out")
+            } else if o.info.size_bytes() >= 1 << 31 {
+                Some("size>=2GiB")
+            } else if packing(o).is_none() {
+                Some("no packing")
+            } else {
+                None
+            }
         };
-        if !movable(image)
-            || newer.iter().any(|&o| {
-                let overlap = self.get(o).expect("overlaps are live");
-                !movable(overlap) || overlap.cpu_dirty && self.stale(o)
-            })
-        {
+        let set = |w: &'static str| DIAG_SYNC_WHY.with(|c| c.set(w));
+        set("ok");
+        if let Some(w) = why(image) {
+            set(match w {
+                "keep_out" => "self unmovable: keep_out",
+                "size>=2GiB" => "self unmovable: size",
+                _ => "self unmovable: packing",
+            });
             return Ok(false);
+        }
+        for &o in newer.iter() {
+            let overlap = self.get(o).expect("overlaps are live");
+            if let Some(w) = why(overlap) {
+                set(match w {
+                    "keep_out" => "overlap unmovable: keep_out",
+                    "size>=2GiB" => "overlap unmovable: size",
+                    _ => "overlap unmovable: packing",
+                });
+                return Ok(false);
+            }
+            if overlap.cpu_dirty && self.stale(o) {
+                set("overlap cpu_dirty && stale");
+                return Ok(false);
+            }
         }
         if self.guest_sync.is_none() {
             self.guest_sync = Some(GuestSync::new(&self.device)?);
@@ -468,6 +501,7 @@ impl TextureCache {
         let image = live(id);
         let whole = (0, image.info.size_bytes());
         if !shared_runs(image, image, whole, scratch) {
+            DIAG_SYNC_WHY.with(|c| c.set("shared_runs false (self)"));
             return Ok(false);
         }
         let mut window = whole;
@@ -475,6 +509,7 @@ impl TextureCache {
             window = (u64::MAX, 0);
             for &o in newer.iter() {
                 if !shared_runs(live(o), image, whole, scratch) {
+                    DIAG_SYNC_WHY.with(|c| c.set("shared_runs false (overlap)"));
                     return Ok(false);
                 }
                 for r in &scratch.runs {
@@ -483,6 +518,7 @@ impl TextureCache {
             }
         }
         if window.0 >= window.1 {
+            DIAG_SYNC_WHY.with(|c| c.set("empty window"));
             return Ok(false);
         }
         for &o in newer.iter() {

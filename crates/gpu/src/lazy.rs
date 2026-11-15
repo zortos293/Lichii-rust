@@ -137,6 +137,21 @@ impl LazyDeviceRanges {
             .collect()
     }
 
+    /// For diagnostics: the lazy region holding `daddr` as its start, size, backed blocks,
+    /// blocks and dropped writes.
+    pub fn diag_region(&self, daddr: DAddr) -> Option<(DAddr, u64, usize, usize, u64)> {
+        let state = self.state.lock();
+        let (start, _) = state.block_at(daddr)?;
+        let region = &state.regions[&start];
+        Some((
+            start,
+            region.size,
+            region.backed.iter().filter(|&&b| b).count(),
+            region.backed.len(),
+            region.dropped,
+        ))
+    }
+
     /// Whether `[daddr, daddr + size)` overlaps a lazy range. Takes no lock.
     pub fn is_lazy(&self, daddr: DAddr, size: u64) -> bool {
         if size == 0 {

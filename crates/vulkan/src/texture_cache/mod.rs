@@ -535,6 +535,25 @@ fn diag_watched(info: &ImageInfo) -> bool {
         .any(|&(w, h, d)| info.width == w && info.height == h && info.depth == d)
 }
 
+fn diag_late() -> bool {
+    static FROM: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    let from = *FROM.get_or_init(|| {
+        std::env::var("LICHII_DIAG_WATCH_FROM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(f64::MAX)
+    });
+    crate::rasterizer::draw::diag::now().as_secs_f64() >= from
+}
+
+fn diag_late_log(what: &str, detail: String) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 300 {
+        return;
+    }
+    tracing::warn!(what, detail, "diag late");
+}
+
 fn diag_watch_log(what: &str, detail: String) {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 400 {
@@ -1102,7 +1121,37 @@ impl TextureCache {
         let Some(info) = ImageInfo::from_texture(desc, self.gob_layout) else {
             return Ok(None);
         };
-        let Some(found) = self.find(tx, gmmu, desc.address, &info)? else {
+        let late = diag_late() && diag_watched(&info);
+        let before = self.traffic;
+        let found = self.find(tx, gmmu, desc.address, &info);
+        if late {
+            let state = match &found {
+                Ok(Some(f)) => {
+                    let first = self.get(f.id).and_then(|i| i.overlaps.first().copied());
+                    let others: Vec<String> = self
+                        .get(f.id)
+                        .map(|i| i.overlaps.clone())
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|&o| self.diag_state(o, Some(f.id)))
+                        .collect();
+                    format!(
+                        "found={f:?} self=[{}] overlaps={others:?}",
+                        self.diag_state(f.id, first)
+                    )
+                }
+                Ok(None) => "none".into(),
+                Err(e) => format!("error={e}"),
+            };
+            diag_late_log(
+                "texture lookup",
+                format!(
+                    "gpu={:#x} traffic_before={before:?} traffic_after={:?} {state}",
+                    desc.address, self.traffic
+                ),
+            );
+        }
+        let Some(found) = found? else {
             return Ok(None);
         };
         let scale = self.image(found.id).scale;
@@ -1334,6 +1383,9 @@ impl TextureCache {
     /// Marks a cached image as written by the GPU, and its device pages in the written-pages
     /// bitmap. Called when the writing work is recorded.
     pub fn mark_modified(&mut self, id: ImageId) {
+        if diag_late() && self.get(id).is_some_and(|i| diag_watched(&i.info)) {
+            diag_late_log("mark_modified", self.diag_state(id, None));
+        }
         if let Some(image) = self.get(id) {
             for s in &image.segments {
                 self.written_pages.mark(s.daddr, s.size);
@@ -1460,6 +1512,49 @@ impl TextureCache {
 
     /// Diagnostic only: writes `id` back to guest memory when it is GPU-modified, and returns the
     /// guest spans it occupies.
+    /// For diagnostics: the overlap-sync state of `id`, and whether it lists `other`.
+    fn diag_state(&self, id: ImageId, other: Option<ImageId>) -> String {
+        let Some(i) = self.get(id) else {
+            return format!("{id:?} gone");
+        };
+        let mut regions: Vec<(DAddr, u64, usize, usize, u64)> = Vec::new();
+        let mut lazy_segs = 0;
+        for s in &i.segments {
+            if self.lazy.is_lazy(s.daddr, s.size) {
+                lazy_segs += 1;
+                if let Some(r) = self.lazy.diag_region(s.daddr)
+                    && !regions.iter().any(|x| x.0 == r.0)
+                {
+                    regions.push(r);
+                }
+            }
+        }
+        format!(
+            "{id:?} {:?} {}x{}x{} L{} lv{} scale={:?} cache_scale={:?} lists_other={:?} modified={} current={} written={} overlaps_newest={} tick={} gpu_mod={} cpu_dirty={} keep_out={} overlaps={} aliases={} segs={} lazy_segs={lazy_segs} lazy_regions(start,size,backed,blocks,dropped)={regions:x?} sparse={}",
+            i.info.format,
+            i.info.width,
+            i.info.height,
+            i.info.depth,
+            i.info.layers,
+            i.info.levels,
+            i.scale,
+            self.scale,
+            other.map(|o| i.overlaps.contains(&o)),
+            i.modified,
+            i.current,
+            i.written,
+            i.overlaps_newest,
+            self.tick,
+            i.gpu_modified,
+            i.cpu_dirty,
+            i.keep_out.len(),
+            i.overlaps.len(),
+            i.aliases.len(),
+            i.segments.len(),
+            i.image.is_sparse(),
+        )
+    }
+
     /// Level 0 of every layer of an image, copied straight from the host image in host layout,
     /// for diagnostics.
     pub fn diag_host_level0(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<Vec<Vec<u8>>> {
@@ -2164,8 +2259,8 @@ impl TextureCache {
             if let Some((level, layer)) = candidate
                 && self.view_compatible(id, info.format)
             {
-                if diag_watched(info) {
-                    diag_watch_log(
+                if diag_late() && diag_watched(info) {
+                    diag_late_log(
                         "find_slow reuse",
                         format!("{id:?} level={level} layer={layer} for gpu={gpu_va:#x} {info:?}"),
                     );
@@ -2618,7 +2713,30 @@ impl TextureCache {
                 );
             }
         }
-        if newer.is_empty() || self.sync_on_gpu(tx, id, &mut newer)? {
+        if newer.is_empty() {
+            self.overlap_scratch = newer;
+            return Ok(());
+        }
+        let late = diag_late() && self.get(id).is_some_and(|i| diag_watched(&i.info));
+        let before = self.traffic;
+        let gpu = self.sync_on_gpu(tx, id, &mut newer);
+        if late {
+            let states: Vec<String> = newer
+                .iter()
+                .map(|&o| self.diag_state(o, Some(id)))
+                .collect();
+            diag_late_log(
+                "take_from_overlaps sync_on_gpu",
+                format!(
+                    "result={:?} why={} traffic_before={before:?} traffic_after={:?} self=[{}] newer={states:?}",
+                    gpu.as_ref().map_err(ToString::to_string),
+                    Self::diag_sync_why(),
+                    self.traffic,
+                    self.diag_state(id, newer.first().copied()),
+                ),
+            );
+        }
+        if gpu? {
             self.overlap_scratch = newer;
             return Ok(());
         }
@@ -2638,6 +2756,18 @@ impl TextureCache {
             newer.push(id);
         }
         let result = self.download(tx, &newer, None);
+        if late {
+            diag_late_log(
+                "take_from_overlaps download fallback",
+                format!(
+                    "result={:?} own={own} downloaded={newer:?} ranges={} traffic={:?} self=[{}]",
+                    result.as_ref().map_err(ToString::to_string),
+                    ranges.len(),
+                    self.traffic,
+                    self.diag_state(id, None),
+                ),
+            );
+        }
         self.overlap_scratch = newer;
         if result.is_ok() {
             let image = self.image(id);

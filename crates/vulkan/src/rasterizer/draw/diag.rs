@@ -650,13 +650,25 @@ impl VulkanRasterizer {
             let mut bytes = vec![0u8; total as usize];
             let mut at = 0usize;
             let mut fault = false;
+            let mut faults = 0u32;
             for (daddr, size) in spans {
-                fault |= self
+                if let Err(error) = self
                     .handles
                     .device
                     .read_bytes(daddr, &mut bytes[at..at + size as usize])
-                    .is_err();
+                {
+                    if !fault {
+                        log(&format!(
+                            "STATFAULT {label} {id:?} first span {daddr:#x}/{size:#x}: {error:?}"
+                        ));
+                    }
+                    fault = true;
+                    faults += 1;
+                }
                 at += size as usize;
+            }
+            if faults > 0 {
+                log(&format!("STATFAULT {label} {id:?} spans_faulted={faults}"));
             }
             if let Some(dir) = dump.then(dump_dir).flatten()
                 && let Some(l0) = level0(&st.info, &bytes)
