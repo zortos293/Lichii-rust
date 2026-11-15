@@ -535,7 +535,8 @@ impl VulkanRasterizer {
                 log(&format!("DUMP {name} {:?}", written.err()));
             }
             let text = format!(
-                "STAT {label} {id:?} {:?} {}x{}x{} lv={} gpu_mod={} fault={fault} {}",
+                "STAT {label} {id:?} dev={:x?} {:?} {}x{}x{} lv={} gpu_mod={} fault={fault} {}",
+                self.texture_cache.diag_base(id),
                 st.info.format,
                 st.info.width,
                 st.info.height,
@@ -602,8 +603,9 @@ impl VulkanRasterizer {
             let mask = regs.color_mask[if regs.color_mask_common != 0 { 0 } else { i }];
             let _ = write!(
                 s,
-                " C{i}[id={:?} rt{idx} fmt={:#x} {}x{} addr={:#x} host={:?} {}x{} blend={} mask={:#x}]",
+                " C{i}[id={:?} dev={:x?} rt{idx} fmt={:#x} {}x{} addr={:#x} host={:?} {}x{} blend={} mask={:#x}]",
                 t.id,
+                self.texture_cache.diag_base(t.id),
                 rt.format,
                 rt.width,
                 rt.height,

@@ -960,6 +960,11 @@ impl TextureCache {
         })
     }
 
+    /// Diagnostic only: the device address of the image's first guest segment.
+    pub fn diag_base(&self, id: ImageId) -> Option<DAddr> {
+        self.get(id).map(CachedImage::base)
+    }
+
     /// How many images have been removed so far. A lookup removes the overlapping images it
     /// cannot reuse, so ids taken before a lookup that changes this may name removed images.
     pub fn removals(&self) -> u64 {
