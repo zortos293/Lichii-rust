@@ -30,6 +30,11 @@ fn secs(name: &str) -> Option<Duration> {
         .and_then(|v| Duration::try_from_secs_f64(v.trim().parse().ok()?).ok())
 }
 
+fn vb_fs() -> &'static [u64] {
+    static V: OnceLock<Vec<u64>> = OnceLock::new();
+    V.get_or_init(|| hex_list("LICHII_DIAG_VB_FS"))
+}
+
 fn hex_list(name: &str) -> Vec<u64> {
     std::env::var(name)
         .unwrap_or_default()
@@ -798,6 +803,42 @@ impl VulkanRasterizer {
             regs.rt_layer.layer(),
             regs.rt_layer.control()
         );
+        let fs_hash = self
+            .draw
+            .stages
+            .iter()
+            .flatten()
+            .find(|m| m.stage == lichii_shader::ShaderStage::Fragment)
+            .map_or(0, |m| m.hash);
+        if vb_fs().contains(&fs_hash) {
+            let ib = &regs.index_buffer;
+            let indices = ctx.memory.read::<[u32; 4]>(ib.start_addr());
+            let _ = write!(
+                s,
+                " IB[{:#x} fmt={:?} first={} count={} raw={:x?}]",
+                ib.start_addr(),
+                ib.format,
+                ib.first,
+                ib.count,
+                indices.ok()
+            );
+            for (i, vs) in regs.vertex_streams.iter().enumerate().take(4) {
+                if vs.enable() == 0 {
+                    continue;
+                }
+                let words = ctx.memory.read::<[f32; 24]>(vs.address());
+                let _ = write!(
+                    s,
+                    " VS{i}[{:#x} stride={} data={:?}]",
+                    vs.address(),
+                    vs.stride(),
+                    words.ok()
+                );
+            }
+            for (i, a) in regs.vertex_attrib_format.iter().enumerate().take(4) {
+                let _ = write!(s, " VA{i}={:#x}", bytemuck::cast::<_, u32>(*a));
+            }
+        }
         let vt0 = &regs.viewport_transform[0];
         let sc0 = &regs.scissor_test[0];
         let _ = write!(

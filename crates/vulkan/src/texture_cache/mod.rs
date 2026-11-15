@@ -1163,10 +1163,63 @@ impl TextureCache {
             };
             self.rescale(tx, found.id, target, true)?;
         }
+        self.diag_poke(tx, found.id)?;
         let mut view = ViewInfo::from_texture(desc, &info);
         view.base_level += found.level;
         view.base_layer += found.layer;
         Ok(Some((found.id, view)))
+    }
+
+    /// Clears an image whose size LICHII_DIAG_POKE_IMG names (`WxHxLAYERS:r/g/b/a;...`) to that
+    /// constant, for diagnostics.
+    fn diag_poke(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
+        static P: std::sync::OnceLock<Vec<((u32, u32, u32), [f32; 4])>> =
+            std::sync::OnceLock::new();
+        let pokes = P.get_or_init(|| {
+            std::env::var("LICHII_DIAG_POKE_IMG")
+                .unwrap_or_default()
+                .split(';')
+                .filter_map(|one| {
+                    let (dims, value) = one.split_once(':')?;
+                    let mut d = dims.split('x').filter_map(|s| s.trim().parse().ok());
+                    let mut v = value.split('/').filter_map(|s| s.trim().parse().ok());
+                    Some((
+                        (d.next()?, d.next()?, d.next()?),
+                        [v.next()?, v.next()?, v.next()?, v.next()?],
+                    ))
+                })
+                .collect()
+        });
+        if pokes.is_empty() {
+            return Ok(());
+        }
+        let info = self.image(id).info;
+        let Some(&(_, value)) = pokes
+            .iter()
+            .find(|&&((w, h, l), _)| info.width == w && info.height == h && info.layers == l)
+        else {
+            return Ok(());
+        };
+        let device = self.device.clone();
+        let cmd = tx.scheduler.record()?;
+        let image = self.image(id);
+        image.transition(&device, cmd, ImageAccess::TRANSFER_DST);
+        let raw = image.image.raw();
+        let range = image.image.full_range();
+        // SAFETY: the image is in TRANSFER_DST layout and the range is the whole image.
+        unsafe {
+            device.raw.cmd_clear_color_image(
+                cmd,
+                raw,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &vk::ClearColorValue { float32: value },
+                &[range],
+            )
+        };
+        if diag_late() {
+            diag_late_log("poke", format!("{id:?} {value:?}"));
+        }
+        Ok(())
     }
 
     /// Whether `id` is a sparse image nothing has written yet, which samples as no image.
@@ -1212,6 +1265,7 @@ impl TextureCache {
             found.level,
             found.layer..found.layer + info.layers,
         )?;
+        self.diag_poke(tx, found.id)?;
         Ok(Some(found))
     }
 
