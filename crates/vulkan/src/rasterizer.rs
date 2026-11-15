@@ -1747,6 +1747,16 @@ mod tests {
         regs.scissor_test[0].bits1 = ScissorTestBits1(y0 | y1 << 16);
     }
 
+    /// Whether an 8-bit UNORM `texel` matches `want`, where a 128 written from 0.5 may also
+    /// read 127: 0.5 * 255 lies halfway between them and Vulkan lets the conversion round to
+    /// either (NVIDIA stores 127, lavapipe 128).
+    pub(super) fn unorm8_eq(texel: [u8; 4], want: [u8; 4]) -> bool {
+        texel
+            .iter()
+            .zip(want)
+            .all(|(&t, w)| t == w || (w == 128 && t == 127))
+    }
+
     pub(super) fn guest_linear(f: &Fixture, address: DAddr, tiling: &Tiling) -> Vec<u8> {
         let mut tiled = vec![0; tiling.size_bytes()];
         f.memory.read_bytes(address, &mut tiled).unwrap();
@@ -1998,7 +2008,7 @@ mod tests {
             } else {
                 [0, 128, 255, 255]
             };
-            assert_eq!(*texel, want, "texel ({x}, {y})");
+            assert!(unorm8_eq(*texel, want), "texel ({x}, {y}): {texel:?}");
         }
 
         let depth_va = GPU_VA + 0x10_0000;
@@ -2265,7 +2275,10 @@ mod tests {
                 } else {
                     outside
                 };
-                assert_eq!(*texel, want, "format {format:#x}, texel ({x}, {y})");
+                assert!(
+                    unorm8_eq(*texel, want),
+                    "format {format:#x}, texel ({x}, {y}): {texel:?}"
+                );
             }
             f.assert_no_validation_errors();
         }
@@ -2667,10 +2680,10 @@ mod tests {
         );
         let tiling = Tiling::new(width, height, 1, 4, 2, 0, GobLayout::Switch2);
         f.rasterizer.synchronize_region(DADDR + 0x100, 16);
-        assert_eq!(
-            guest_linear(&f, DADDR, &tiling)[..4],
-            [255, 128, 64, 0],
-            "the read lands the target's texels"
+        let texel = guest_linear(&f, DADDR, &tiling)[..4].try_into().unwrap();
+        assert!(
+            unorm8_eq(texel, [255, 128, 64, 0]),
+            "the read lands the target's texels: {texel:?}"
         );
         f.assert_no_validation_errors();
     }
