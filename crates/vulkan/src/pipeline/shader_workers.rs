@@ -273,7 +273,12 @@ pub(crate) fn diag_shader_listed(hash: u64) -> bool {
     .contains(&hash)
 }
 
-pub(crate) fn diag_dump_shader(hash: u64, env: &ProgramEnv<'_>, options: TranslateOptions<'_>, code: &[u8]) {
+pub(crate) fn diag_dump_shader(
+    hash: u64,
+    env: &ProgramEnv<'_>,
+    options: TranslateOptions<'_>,
+    code: &[u8],
+) {
     use lichii_shader::ShaderEnvironment;
     if !diag_shader_listed(hash) {
         return;

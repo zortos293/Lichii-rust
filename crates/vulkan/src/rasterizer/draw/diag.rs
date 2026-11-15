@@ -204,7 +204,8 @@ pub(crate) fn watch_dev(kind: &str, daddr: u64, size: u64) {
 /// readback ring) joins the watch list at every dispatch.
 pub(crate) fn ring_shader(hash: u64) -> bool {
     static LIST: OnceLock<Vec<u64>> = OnceLock::new();
-    LIST.get_or_init(|| hex_list("LICHII_DIAG_RING_SHADER")).contains(&hash)
+    LIST.get_or_init(|| hex_list("LICHII_DIAG_RING_SHADER"))
+        .contains(&hash)
 }
 
 /// LICHII_DIAG_POKE=<gpu>=<f32>,...: device addresses (resolved through the watch list, so each
@@ -269,12 +270,18 @@ pub(crate) fn watch_values(read: impl Fn(u64) -> Option<u32>) {
             Some((_, v)) if *v == value => {}
             Some((_, v)) => {
                 *v = value;
-                let text = format!("WATCH value gpu={gpu:#x} dev={d:#x} {value:#010x} f={}", f32::from_bits(value));
+                let text = format!(
+                    "WATCH value gpu={gpu:#x} dev={d:#x} {value:#010x} f={}",
+                    f32::from_bits(value)
+                );
                 with(|s| s.always(&text));
             }
             None => {
                 last.push((d, value));
-                let text = format!("WATCH value gpu={gpu:#x} dev={d:#x} {value:#010x} f={} (first)", f32::from_bits(value));
+                let text = format!(
+                    "WATCH value gpu={gpu:#x} dev={d:#x} {value:#010x} f={} (first)",
+                    f32::from_bits(value)
+                );
                 with(|s| s.always(&text));
             }
         }
@@ -284,9 +291,10 @@ pub(crate) fn watch_values(read: impl Fn(u64) -> Option<u32>) {
 /// [`watch_dev`] whose detail is built only on a hit.
 pub(crate) fn watch_dev_with(kind: &str, daddr: u64, size: u64, extra: impl FnOnce() -> String) {
     let end = daddr.saturating_add(size.max(1));
-    let hit = watch()
-        .lock()
-        .is_ok_and(|l| l.iter().any(|&(_, d)| d.is_some_and(|t| t + 16 > daddr && t < end)));
+    let hit = watch().lock().is_ok_and(|l| {
+        l.iter()
+            .any(|&(_, d)| d.is_some_and(|t| t + 16 > daddr && t < end))
+    });
     if hit {
         watch_hit(kind, daddr, size, true, &extra());
     }
@@ -685,6 +693,58 @@ impl VulkanRasterizer {
             log(&text);
         }
     }
+
+    /// Logs per-layer level-0 texel statistics read straight from each host image, bypassing
+    /// the guest-memory readback.
+    pub(in crate::rasterizer) fn diag_host_stats(&mut self, label: &str, ids: &[ImageId]) {
+        for &id in ids {
+            let Some(st) = self.texture_cache.state(id) else {
+                continue;
+            };
+            let info = st.info;
+            if info.size_bytes() > 256 << 20 {
+                with(|d| {
+                    d.always(&format!(
+                        "HOSTSTAT {label} {id:?} {:?} too large",
+                        info.format
+                    ))
+                });
+                continue;
+            }
+            let mut tx = Transfer {
+                scheduler: &mut self.scheduler,
+                staging: &mut self.staging,
+                memory: &self.handles.device,
+                buffers: &mut self.buffer_cache,
+            };
+            let lines = match self.texture_cache.diag_host_level0(&mut tx, id) {
+                Ok(layers) if layers.is_empty() => {
+                    vec![format!(
+                        "HOSTSTAT {label} {id:?} {:?} not downloadable",
+                        info.format
+                    )]
+                }
+                Ok(layers) => layers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, bytes)| {
+                        format!(
+                            "HOSTSTAT {label} {id:?} {:?} {}x{}x{} layer={i} {}",
+                            info.format,
+                            info.width,
+                            info.height,
+                            info.layers,
+                            texel_stats(info.format, bytes)
+                        )
+                    })
+                    .collect(),
+                Err(error) => vec![format!("HOSTSTAT {label} {id:?} failed: {error}")],
+            };
+            for line in &lines {
+                with(|d| d.always(line));
+            }
+        }
+    }
 }
 
 impl VulkanRasterizer {
@@ -725,6 +785,25 @@ impl VulkanRasterizer {
             " RTL={}/{}",
             regs.rt_layer.layer(),
             regs.rt_layer.control()
+        );
+        let vt0 = &regs.viewport_transform[0];
+        let sc0 = &regs.scissor_test[0];
+        let _ = write!(
+            s,
+            " SC={},{} {}x{} VP=sx{}/tx{} sy{}/ty{} SCIS={} {}..{} {}..{}",
+            regs.surface_clip.x(),
+            regs.surface_clip.y(),
+            regs.surface_clip.width(),
+            regs.surface_clip.height(),
+            vt0.scale_x,
+            vt0.translate_x,
+            vt0.scale_y,
+            vt0.translate_y,
+            sc0.enable,
+            sc0.min_x(),
+            sc0.max_x(),
+            sc0.min_y(),
+            sc0.max_y()
         );
         let _ = write!(
             s,

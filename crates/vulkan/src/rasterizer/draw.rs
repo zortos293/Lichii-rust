@@ -1012,6 +1012,7 @@ impl VulkanRasterizer {
             ids.extend(self.draw.colors.iter().flatten().map(|t| t.id));
             let label = format!("fs={traced_fs:016x}");
             self.diag_image_stats(&label, &ids, true, true);
+            self.diag_host_stats(&label, &ids);
         }
         if traced || (diag::stats() && diag::with(|d| d.in_window()) == Some(true)) {
             let small: Vec<ImageId> = self
@@ -1546,7 +1547,12 @@ impl VulkanRasterizer {
                         rt.format,
                         bytemuck::cast::<_, u32>(regs.rt_layer),
                         ImageInfo::from_render_target(rt, msaa, gob),
-                        self.draw.stages.iter().flatten().map(|m| m.hash).collect::<Vec<_>>(),
+                        self.draw
+                            .stages
+                            .iter()
+                            .flatten()
+                            .map(|m| m.hash)
+                            .collect::<Vec<_>>(),
                     ),
                 );
             }
@@ -3019,7 +3025,10 @@ impl VulkanRasterizer {
                     }
                     let mut words = vec![0u32; (c.size as usize / 4).min(512)];
                     for (n, w) in words.iter_mut().enumerate() {
-                        *w = ctx.memory.read::<u32>(c.address + n as u64 * 4).unwrap_or(0);
+                        *w = ctx
+                            .memory
+                            .read::<u32>(c.address + n as u64 * 4)
+                            .unwrap_or(0);
                     }
                     let hex: Vec<String> = words.iter().map(|w| format!("{w:08x}")).collect();
                     tracing::warn!(

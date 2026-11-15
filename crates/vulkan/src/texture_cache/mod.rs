@@ -519,18 +519,25 @@ impl Hasher for FxHasher {
 type FxBuild = BuildHasherDefault<FxHasher>;
 
 fn diag_watched(info: &ImageInfo) -> bool {
-    static W: std::sync::OnceLock<Option<(u32, u32, u32)>> = std::sync::OnceLock::new();
-    let watch = *W.get_or_init(|| {
-        let v = std::env::var("LICHII_DIAG_WATCH").ok()?;
-        let mut it = v.split('x').filter_map(|s| s.trim().parse().ok());
-        Some((it.next()?, it.next()?, it.next()?))
+    static W: std::sync::OnceLock<Vec<(u32, u32, u32)>> = std::sync::OnceLock::new();
+    let watch = W.get_or_init(|| {
+        std::env::var("LICHII_DIAG_WATCH_IMG")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|one| {
+                let mut it = one.split('x').filter_map(|s| s.trim().parse().ok());
+                Some((it.next()?, it.next()?, it.next()?))
+            })
+            .collect()
     });
-    watch.is_some_and(|(w, h, d)| info.width == w && info.height == h && info.depth == d)
+    watch
+        .iter()
+        .any(|&(w, h, d)| info.width == w && info.height == h && info.depth == d)
 }
 
 fn diag_watch_log(what: &str, detail: String) {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 80 {
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 400 {
         return;
     }
     let trace = std::backtrace::Backtrace::force_capture().to_string();
@@ -1330,9 +1337,12 @@ impl TextureCache {
         if let Some(image) = self.get(id) {
             for s in &image.segments {
                 self.written_pages.mark(s.daddr, s.size);
-                crate::rasterizer::draw::diag::watch_dev_with("mark_modified", s.daddr, s.size, || {
-                    format!("{id:?} {:?}", image.info)
-                });
+                crate::rasterizer::draw::diag::watch_dev_with(
+                    "mark_modified",
+                    s.daddr,
+                    s.size,
+                    || format!("{id:?} {:?}", image.info),
+                );
             }
         }
         self.tick += 1;
@@ -1450,6 +1460,48 @@ impl TextureCache {
 
     /// Diagnostic only: writes `id` back to guest memory when it is GPU-modified, and returns the
     /// guest spans it occupies.
+    /// Level 0 of every layer of an image, copied straight from the host image in host layout,
+    /// for diagnostics.
+    pub fn diag_host_level0(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<Vec<Vec<u8>>> {
+        let Some(image) = self.get(id) else {
+            return Ok(Vec::new());
+        };
+        if !image.downloadable() {
+            return Ok(Vec::new());
+        }
+        let info = image.info;
+        let host = image.host;
+        let levels = image.image.desc().mip_levels;
+        let align = alignment(&host, info.format) as usize;
+        let mut downloads = [Download {
+            id,
+            offset: 0,
+            modified: 0,
+        }];
+        let mut readback = self.readback.take();
+        let result = self
+            .record_downloads(tx, &mut downloads, &mut readback)
+            .and_then(|()| tx.scheduler.finish());
+        let mut out = Vec::new();
+        if result.is_ok()
+            && let Some(data) = readback.as_ref().and_then(Buffer::mapped)
+        {
+            let mut offset = downloads[0].offset as usize;
+            for _ in 0..info.layers {
+                for level in 0..levels {
+                    let layout = convert::host_layout(info.format, &host, info.level_extent(level));
+                    offset = offset.next_multiple_of(align);
+                    if level == 0 {
+                        out.push(data[offset..offset + layout.main].to_vec());
+                    }
+                    offset += layout.total();
+                }
+            }
+        }
+        self.readback = readback;
+        result.map(|()| out)
+    }
+
     pub fn diag_download(
         &mut self,
         tx: &mut Transfer<'_>,
@@ -2112,6 +2164,12 @@ impl TextureCache {
             if let Some((level, layer)) = candidate
                 && self.view_compatible(id, info.format)
             {
+                if diag_watched(info) {
+                    diag_watch_log(
+                        "find_slow reuse",
+                        format!("{id:?} level={level} layer={layer} for gpu={gpu_va:#x} {info:?}"),
+                    );
+                }
                 return Ok(Some(Found { id, level, layer }));
             }
         }
@@ -2121,8 +2179,31 @@ impl TextureCache {
         self.dropped.clear();
         let host = self.host(info.format);
         let overlaps = std::mem::take(&mut self.ids);
+        let watching = diag_watched(info)
+            || overlaps
+                .iter()
+                .any(|&o| self.get(o).is_some_and(|o| diag_watched(&o.info)));
+        let mut decisions: Vec<String> = Vec::new();
         for &id in &overlaps {
             let image = self.get(id).expect("a live image id");
+            let mut decide = |what: &str| {
+                if watching {
+                    decisions.push(format!(
+                        "{id:?} {what} {:?} {}x{}x{} layers={} levels={} contiguous={} gpu_mod={} segs={} first={:x?} last={:x?}",
+                        image.info.format,
+                        image.info.width,
+                        image.info.height,
+                        image.info.depth,
+                        image.info.layers,
+                        image.info.levels,
+                        image.contiguous(),
+                        image.gpu_modified,
+                        image.segments.len(),
+                        image.segments.first().map(|s| (s.daddr, s.size)),
+                        image.segments.last().map(|s| (s.daddr, s.size)),
+                    ));
+                }
+            };
             if contiguous
                 && image.contiguous()
                 && image.scale == ResolutionScale::X1
@@ -2131,6 +2212,7 @@ impl TextureCache {
                     pitch_overlap(&image.info, image.base(), info, base)
                         .or_else(|| block_linear_overlap(&image.info, image.base(), info, base))
             {
+                decide("alias");
                 self.new_aliases.push(Alias {
                     id,
                     at,
@@ -2149,10 +2231,17 @@ impl TextureCache {
                         && Self::copy_compatible(image, host, info.format)
                         && !self.stale(id) =>
                 {
+                    decide("join");
                     self.joins.push((id, level, layer));
                 }
-                Some(_) if !image.gpu_modified => self.dropped.push(id),
-                _ => self.new_overlaps.push(id),
+                Some(_) if !image.gpu_modified => {
+                    decide("drop");
+                    self.dropped.push(id)
+                }
+                _ => {
+                    decide("overlap");
+                    self.new_overlaps.push(id)
+                }
             }
         }
         self.ids = overlaps;
@@ -2184,6 +2273,18 @@ impl TextureCache {
             self.image(id).aliases.push(*alias);
         }
         self.new_aliases = new_aliases;
+        if watching {
+            let segs = &self.image(id).segments;
+            diag_watch_log(
+                "find_slow create",
+                format!(
+                    "new={id:?} gpu={gpu_va:#x} {info:?} contiguous={contiguous} segs={} first={:x?} last={:x?} decisions={decisions:?}",
+                    segs.len(),
+                    segs.first().map(|s| (s.daddr, s.size)),
+                    segs.last().map(|s| (s.daddr, s.size)),
+                ),
+            );
+        }
         if !self.joins.is_empty() {
             self.refresh(tx, id)?;
             self.join(tx, id)?;
@@ -2492,13 +2593,19 @@ impl TextureCache {
         if !newer.is_empty() {
             let image = self.get(id).expect("a live image id");
             let watched = diag_watched(&image.info)
-                || newer.iter().any(|&o| self.get(o).is_some_and(|o| diag_watched(&o.info)));
+                || newer
+                    .iter()
+                    .any(|&o| self.get(o).is_some_and(|o| diag_watched(&o.info)));
             if watched {
                 let others: Vec<String> = newer
                     .iter()
                     .map(|&o| {
                         let o2 = self.get(o).expect("overlaps are live");
-                        format!("{o:?} {:?} seg={:x?}", o2.info, o2.segments.first().map(|s| (s.daddr, s.size)))
+                        format!(
+                            "{o:?} {:?} seg={:x?}",
+                            o2.info,
+                            o2.segments.first().map(|s| (s.daddr, s.size))
+                        )
                     })
                     .collect();
                 diag_watch_log(
@@ -2613,7 +2720,10 @@ impl TextureCache {
         for alias in &newer {
             if diag_watched(&self.image(id).info) || diag_watched(&self.image(alias.id).info) {
                 let (a, b) = (self.image(id).info, self.image(alias.id).info);
-                diag_watch_log("take_from_aliases", format!("{id:?} {a:?} <- {:?} {b:?}", alias.id));
+                diag_watch_log(
+                    "take_from_aliases",
+                    format!("{id:?} {a:?} <- {:?} {b:?}", alias.id),
+                );
             }
             result = self.copy_texels(scheduler, alias.id, alias.at, id, alias.own, alias.extent);
             if result.is_err() {
