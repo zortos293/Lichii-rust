@@ -221,6 +221,8 @@ pub struct ShaderCache {
     waits: u64,
     /// Graphics lookups that translated in place because they could not be skipped.
     blocked: u64,
+    /// Render-thread time spent translating programs in place.
+    stalled: Duration,
     /// The counts the last INFO line showed, and when it was written.
     logged: (ShaderCacheStats, Option<Instant>),
 }
@@ -244,6 +246,7 @@ impl ShaderCache {
             stats: ShaderCacheStats::default(),
             waits: 0,
             blocked: 0,
+            stalled: Duration::ZERO,
             logged: (ShaderCacheStats::default(), None),
         }
     }
@@ -265,6 +268,11 @@ impl ShaderCache {
     /// were not allowed to skip, while workers translate the others.
     pub fn blocked(&self) -> u64 {
         self.blocked
+    }
+
+    /// Render-thread time since the cache was created spent translating programs in place.
+    pub fn stalled(&self) -> Duration {
+        self.stalled
     }
 
     /// Translations queued or running.
@@ -417,6 +425,7 @@ impl ShaderCache {
                 if self.workers.is_some() && env.stage() != ShaderStage::Compute {
                     self.blocked += 1;
                 }
+                let start = Instant::now();
                 let result = match (&mut self.disk, a) {
                     (Some(disk), a) => match a {
                         Some(a) => cache::compile_dual_vertex(a, env, options, &runtime, bindings),
@@ -432,6 +441,7 @@ impl ShaderCache {
                     (None, None) => compile(env, options, &runtime, bindings).map(Arc::new),
                 };
                 self.stats.translated += 1;
+                self.stalled += start.elapsed();
                 match result {
                     Ok(module) => Some(module),
                     Err(error) => {

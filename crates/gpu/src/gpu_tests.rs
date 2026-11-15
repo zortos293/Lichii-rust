@@ -2013,6 +2013,14 @@ fn list_written_by_a_release(rig: &mut Rig) -> (GpEntry, GpEntry) {
     (writer, list)
 }
 
+/// The write-back a fetch sync of `entry` asks for: the 64 KiB device blocks around its words.
+fn fetch_window(entry: GpEntry) -> Event {
+    let daddr = DEVICE_BASE + entry.address();
+    let start = daddr & !0xffff;
+    let end = (daddr + u64::from(entry.words()) * 4).next_multiple_of(0x1_0000);
+    Event::FlushRegion(start, end - start)
+}
+
 /// A rig whose channels fetch the entries of [`list_written_by_a_release`] after the work before
 /// them completed on the host GPU: Switch 2, with the list's words on a page GPU work wrote.
 fn rig_with_written_list(threading: Threading) -> (Rig, GpEntry, GpEntry) {
@@ -2092,11 +2100,7 @@ fn a_switch_2_sync_entry_on_a_page_the_work_before_it_marks_waits_for_the_host_g
             [(channel.0, EngineKind::Maxwell3d, 0x701, 0x1234)],
             "{threading:?}: the list is read with the released word"
         );
-        assert!(
-            rig.events()
-                .contains(&Event::FlushRegion(DEVICE_BASE + list.address(), 8)),
-            "{threading:?}"
-        );
+        assert!(rig.events().contains(&fetch_window(list)), "{threading:?}");
     });
 }
 
@@ -2160,7 +2164,7 @@ fn switch_2_fetches_an_entry_on_gpu_written_pages_after_the_work_before_it() {
             .unwrap_or_else(|| panic!("{threading:?}: the list is read with the released word"));
         let flush = events
             .iter()
-            .position(|e| *e == Event::FlushRegion(DEVICE_BASE + list.address(), 8))
+            .position(|e| *e == fetch_window(list))
             .unwrap_or_else(|| panic!("{threading:?}: the list's words are flushed"));
         assert!(flush < read, "{threading:?}");
     });
