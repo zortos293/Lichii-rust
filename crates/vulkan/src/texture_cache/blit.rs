@@ -253,6 +253,10 @@ impl TextureCache {
         let cmd = tx.scheduler.record()?;
         let src_image = self.prepare_live(cmd, source.id, ImageAccess::TRANSFER_SRC);
         let dst_image = self.prepare_live(cmd, target.id, ImageAccess::TRANSFER_DST);
+        // NVIDIA 610.88 copies stale texels out of a source written earlier in the command
+        // buffer when another image's first upload sits between, although the image barrier
+        // orders them; only a memory barrier into every stage's reads fixes it.
+        barrier(&device, cmd);
         let aspect_mask = aspect_of(host.format);
         let subresource = |found: Found| vk::ImageSubresourceLayers {
             aspect_mask,
