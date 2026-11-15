@@ -343,7 +343,6 @@ impl CachedImage {
             .collect();
     }
 
-    /// Guest memory must replace every texel on the next upload.
     /// Makes every alias rectangle copy in again on the next refresh, after the image's own
     /// texels were replaced from guest memory.
     fn retake_aliases(&mut self) {
@@ -353,6 +352,7 @@ impl CachedImage {
         }
     }
 
+    /// Guest memory must replace every texel on the next upload.
     fn mark_dirty_whole(&mut self) {
         self.cpu_dirty = true;
         self.dirty_whole = true;
