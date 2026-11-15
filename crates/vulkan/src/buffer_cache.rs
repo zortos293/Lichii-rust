@@ -857,6 +857,15 @@ impl BufferCache {
         if daddr >= end {
             return None;
         }
+        crate::rasterizer::draw::diag::watch_dev_with("gpu-buffer-write", daddr, end - daddr, || {
+            std::backtrace::Backtrace::force_capture()
+                .to_string()
+                .lines()
+                .filter(|l| l.contains("lichii") && !l.contains("diag"))
+                .take(8)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        });
         self.written_pages.mark(daddr, end - daddr);
         if self.flush_traps && !self.gpu_written.covers(daddr, end) {
             self.memory.arm_flush_traps(daddr, end - daddr);
