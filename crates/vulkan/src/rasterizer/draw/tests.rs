@@ -1369,7 +1369,7 @@ fn a_geometry_program_selects_the_layer_of_an_array_target_it_draws() {
         "layer 0 stays untouched"
     );
     assert!(
-        second.iter().all(|&t| t == [255, 128, 0, 255]),
+        second.iter().all(|&t| unorm8_eq(t, ORANGE)),
         "the selected layer holds the draw"
     );
     f.assert_no_validation_errors();
@@ -1396,7 +1396,7 @@ fn layered_draws_bind_every_layer_of_an_array_depth_target() {
     assert_eq!(f.rasterizer.draw.layers(), 2);
     let [first, second] = target_layers(&mut f);
     assert!(first.iter().all(|&t| t == [0; 4]));
-    assert!(second.iter().all(|&t| t == [255, 128, 0, 255]));
+    assert!(second.iter().all(|&t| unorm8_eq(t, ORANGE)));
     f.assert_no_validation_errors();
 }
 
