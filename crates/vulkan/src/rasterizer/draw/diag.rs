@@ -80,6 +80,12 @@ pub(crate) fn skip_vs() -> &'static [u64] {
     V.get_or_init(|| hex_list("LICHII_DIAG_SKIP_VS"))
 }
 
+/// LICHII_DIAG_D16_NOCLAMP: disable depth clamp while a D16 depth target is bound.
+pub(crate) fn d16_noclamp() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| flag("LICHII_DIAG_D16_NOCLAMP"))
+}
+
 /// LICHII_DIAG_SKIP_D16_VS: skip draws with these vertex shaders only while a D16 depth target is bound.
 pub(crate) fn skip_d16_vs() -> &'static [u64] {
     static V: OnceLock<Vec<u64>> = OnceLock::new();
@@ -671,6 +677,18 @@ impl VulkanRasterizer {
             vt.translate_z,
             regs.viewports[0].depth_range_near,
             regs.viewports[0].depth_range_far,
+        );
+        let _ = write!(
+            s,
+            " RS[cull={}/{:?} front={:?} flipy={} clip={:?} raw={:#x} poly={:?}/{:?}]",
+            regs.gl_cull_test_enabled,
+            regs.gl_cull_face,
+            regs.gl_front_face,
+            regs.window_origin.flip_y(),
+            regs.viewport_clip_control.geometry_clip(),
+            regs.viewport_clip_control.0,
+            regs.polygon_mode_front,
+            regs.polygon_mode_back,
         );
         let sc = &regs.scissor_test[0];
         let _ = write!(

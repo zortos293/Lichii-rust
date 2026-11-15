@@ -2581,7 +2581,9 @@ impl VulkanRasterizer {
                     regs.viewport_clip_control.geometry_clip(),
                     G::PASSTHROUGH | G::FRUSTUM_XYZ | G::FRUSTUM_Z
                 );
-                let clamp = features.depth_clamp && clamps;
+                let clamp = features.depth_clamp
+                    && clamps
+                    && !(diag::d16_noclamp() && regs.zeta_enable != 0 && regs.zeta.format == 0x13);
                 shadow.set(Slot::DepthClampEnable, clamp, || {
                     draw.eds3.cmd_set_depth_clamp_enable(cmd, clamp)
                 });
