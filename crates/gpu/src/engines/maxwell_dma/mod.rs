@@ -118,6 +118,21 @@ impl MaxwellDma {
             }
         };
         let semaphore = &self.regs.semaphore;
+        if ctx.memory.translate(semaphore.address.address()).is_none() {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 12 || n.is_power_of_two() {
+                let words = bytemuck::cast_slice::<Regs, u32>(std::slice::from_ref(&*self.regs));
+                tracing::warn!(
+                    n,
+                    channel = ?ctx.channel,
+                    launch = format_args!("{:#010x}", words[0x300 / 4]),
+                    sem = format_args!("{:08x?}", &words[0x240 / 4..0x254 / 4]),
+                    offset_in = format_args!("{:08x?}", &words[0x400 / 4..0x420 / 4]),
+                    "diag: DMA semaphore release to an unmapped address"
+                );
+            }
+        }
         ctx.rasterizer.query(
             ctx.channel,
             ctx.memory,
