@@ -32,9 +32,9 @@ pub(super) fn emit(
         return Err(EmitError::UnsupportedStage(program.stage));
     }
     mesh::check_support(profile, runtime, program.stage, &program.info.mesh)?;
-    let mut ctx = EmitContext::new(profile, runtime, program, bindings)?;
-    let main = define_main(&mut ctx)?;
-    ctx.define_deferred_functions()?;
+    let mut ctx = crate::stage(12, || EmitContext::new(profile, runtime, program, bindings))?;
+    let main = crate::stage(13, || define_main(&mut ctx))?;
+    crate::stage(14, || ctx.define_deferred_functions())?;
     tensor::define_functions(&mut ctx)?;
     define_entry_point(&mut ctx, main);
     if profile.support_float_controls {
@@ -47,8 +47,8 @@ pub(super) fn emit(
         ctx.add_capability(Capability::TransformFeedback);
         ctx.b.execution_mode(main, ExecutionMode::Xfb, []);
     }
-    patch_phis(&mut ctx)?;
-    Ok(ctx.b.module().assemble())
+    crate::stage(15, || patch_phis(&mut ctx))?;
+    Ok(crate::stage(16, || ctx.b.module().assemble()))
 }
 
 fn define_main(ctx: &mut EmitContext<'_>) -> EmitResult<Word> {

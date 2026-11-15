@@ -449,8 +449,9 @@ fn phi_candidates(prog: &Program, order: &[BlockId], idom: &[u32]) -> (Vec<u32>,
 /// Rewrites every context read into SSA form. Needs `Program::post_order`.
 pub fn ssa_rewrite(prog: &mut Program) {
     let order: Vec<BlockId> = prog.post_order.iter().rev().copied().collect();
-    let idom = immediate_dominators(prog, &order);
-    let (phi_start, phi_vars) = phi_candidates(prog, &order, &idom);
+    let idom = crate::stage(17, || immediate_dominators(prog, &order));
+    let (phi_start, phi_vars) = crate::stage(18, || phi_candidates(prog, &order, &idom));
+    let main_start = std::time::Instant::now();
     let mut pass = Pass {
         sealed: vec![false; prog.num_blocks()],
         defs: vec![Vec::new(); GOTO_BASE as usize],
@@ -496,6 +497,10 @@ pub fn ssa_rewrite(prog: &mut Program) {
         }
         pass.seal(prog, block);
     }
+    crate::STAGE_NS[19].fetch_add(
+        main_start.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     for block in order.into_iter().rev() {
         let mut cur = prog.block(block).last();
         while let Some(id) = cur {
