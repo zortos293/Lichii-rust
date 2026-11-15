@@ -779,6 +779,7 @@ impl KernelInner {
             .write()
             .add(KObject::Thread(thread.clone()))?;
         thread.context.lock().x[1] = handle as u64;
+        crate::thread::publish_handle(process, &thread, handle);
         thread.retain();
         process.set_state(ProcessState::Running);
         let mut s = thread.sched.lock();

@@ -597,3 +597,24 @@ impl Thread {
         }
     }
 }
+
+/// Offset of `current_thread_handle` in the kernel's part of the thread local region (after
+/// the 0x100-byte IPC message: `disable_count` 0x100, `interrupt_flag` 0x102,
+/// `cache_maintenance_flag` 0x104, `thread_cpu_time` 0x108).
+pub const TLS_CURRENT_THREAD_HANDLE: u64 = 0x110;
+
+/// Writes `handle` where the thread's own code reads its handle: the SDK's critical sections
+/// tag their owner with it (`nn::os::detail::InternalCriticalSection` reads TLS+0x110). Left at
+/// 0, a free lock (word 0) reads as held by the current thread, and the first contended lock
+/// aborts (Ocarina of Time, Switch 2: `pthread_mutex_lock` in the allocator during
+/// `__nnmusl_init_dso`).
+pub(crate) fn publish_handle(process: &crate::process::Process, thread: &Thread, handle: u32) {
+    let at = thread.tls_address() + TLS_CURRENT_THREAD_HANDLE;
+    if let Err(fault) = process.memory().write::<u32>(at, handle) {
+        tracing::warn!(
+            ?fault,
+            at = format_args!("{at:#x}"),
+            "thread handle not written to TLS"
+        );
+    }
+}
