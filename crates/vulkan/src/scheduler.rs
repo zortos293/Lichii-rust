@@ -36,6 +36,22 @@ pub struct Scheduler {
     activity: Option<Arc<Activity>>,
     /// Tick of a sparse binding the next submission must wait for.
     bound: Option<u64>,
+    /// The dynamic rendering open in `current`, which later draws with the same attachments
+    /// continue instead of beginning their own.
+    rendering: Option<RenderingKey>,
+    /// Dynamic renderings begun so far.
+    renderings: u64,
+    /// The command buffer and fence of [`Scheduler::run_aside`], made on first use.
+    aside: Option<(vk::CommandBuffer, vk::Fence)>,
+}
+
+/// The attachments and area of a dynamic rendering. Draws whose key matches the open
+/// rendering record into it; anything else ends it first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenderingKey {
+    pub colors: [vk::ImageView; 8],
+    pub depth: vk::ImageView,
+    pub extent: vk::Extent2D,
 }
 
 impl Scheduler {
@@ -80,6 +96,9 @@ impl Scheduler {
             garbage: VecDeque::new(),
             activity: None,
             bound: None,
+            rendering: None,
+            renderings: 0,
+            aside: None,
         })
     }
 
@@ -109,8 +128,52 @@ impl Scheduler {
         self.tick
     }
 
-    /// The command buffer being recorded, begun on first use after a flush.
+    /// The command buffer being recorded, begun on first use after a flush, outside any
+    /// rendering: an open one ends here.
     pub fn record(&mut self) -> Result<vk::CommandBuffer> {
+        let cmd = self.command_buffer()?;
+        self.end_rendering(cmd);
+        Ok(cmd)
+    }
+
+    /// The command buffer being recorded, inside a dynamic rendering of `key`: the open one when
+    /// its key matches, else a new one begun with `info`. `true` when it began one.
+    pub fn record_rendering(
+        &mut self,
+        key: RenderingKey,
+        info: &vk::RenderingInfo<'_>,
+    ) -> Result<(vk::CommandBuffer, bool)> {
+        let cmd = self.command_buffer()?;
+        if self.rendering == Some(key) {
+            return Ok((cmd, false));
+        }
+        self.end_rendering(cmd);
+        // SAFETY: `cmd` is recording outside any rendering, and the caller built `info` from
+        // live attachment views in their attachment layouts.
+        unsafe { self.device.raw.cmd_begin_rendering(cmd, info) };
+        self.rendering = Some(key);
+        self.renderings += 1;
+        Ok((cmd, true))
+    }
+
+    /// The key of the open dynamic rendering.
+    pub fn rendering(&self) -> Option<RenderingKey> {
+        self.rendering
+    }
+
+    /// Dynamic renderings begun so far.
+    pub fn renderings(&self) -> u64 {
+        self.renderings
+    }
+
+    fn end_rendering(&mut self, cmd: vk::CommandBuffer) {
+        if self.rendering.take().is_some() {
+            // SAFETY: `cmd` is recording inside the rendering `record_rendering` began.
+            unsafe { self.device.raw.cmd_end_rendering(cmd) };
+        }
+    }
+
+    fn command_buffer(&mut self) -> Result<vk::CommandBuffer> {
         if let Some(cmd) = self.current {
             return Ok(cmd);
         }
@@ -162,6 +225,9 @@ impl Scheduler {
         signals: &[vk::Semaphore],
     ) -> Result<u64> {
         let tick = self.tick;
+        if let Some(cmd) = self.current {
+            self.end_rendering(cmd);
+        }
         let cmd = self.current.take();
         if let Some(cmd) = cmd {
             // SAFETY: `cmd` is in the recording state.
@@ -303,6 +369,71 @@ impl Scheduler {
         self.wait(tick)
     }
 
+    /// Runs what `record` records in a command buffer of its own, submitted ahead of the work
+    /// being recorded, and waits for it alone. For a read whose writers were all submitted
+    /// already: the wait covers neither the recorded work nor its submission. The recorded
+    /// commands must not depend on work recorded since the last flush.
+    pub fn run_aside(&mut self, record: impl FnOnce(vk::CommandBuffer)) -> Result<()> {
+        let (cmd, fence) = match self.aside {
+            Some(aside) => aside,
+            None => {
+                let info = vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1);
+                // SAFETY: the pool belongs to this scheduler and this thread.
+                let cmd = unsafe {
+                    self.device
+                        .raw
+                        .allocate_command_buffers(&info)
+                        .call("vkAllocateCommandBuffers")?[0]
+                };
+                // SAFETY: valid create info on a live device.
+                let fence = unsafe {
+                    self.device
+                        .raw
+                        .create_fence(&vk::FenceCreateInfo::default(), None)
+                        .call("vkCreateFence")?
+                };
+                self.aside = Some((cmd, fence));
+                (cmd, fence)
+            }
+        };
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        // SAFETY: `cmd` is not pending: every earlier use was waited for below.
+        unsafe {
+            self.device
+                .raw
+                .begin_command_buffer(cmd, &begin)
+                .call("vkBeginCommandBuffer")?
+        };
+        record(cmd);
+        // SAFETY: `cmd` is in the recording state.
+        unsafe {
+            self.device
+                .raw
+                .end_command_buffer(cmd)
+                .call("vkEndCommandBuffer")?
+        };
+        let cmd_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
+        let submit = vk::SubmitInfo2::default().command_buffer_infos(&cmd_infos);
+        self.device.submit(&[submit], fence)?;
+        let _waiting = self.activity.as_deref().map(|a| a.waiting(Wait::HostGpu));
+        // SAFETY: the fence belongs to this scheduler and was just submitted.
+        unsafe {
+            self.device
+                .raw
+                .wait_for_fences(&[fence], true, u64::MAX)
+                .call("vkWaitForFences")?;
+            self.device
+                .raw
+                .reset_fences(&[fence])
+                .call("vkResetFences")?;
+        }
+        Ok(())
+    }
+
     /// Recycles the command buffers and drops the retired objects of the work the GPU
     /// finished; returns the last finished tick.
     pub fn collect(&mut self) -> u64 {
@@ -347,6 +478,9 @@ impl Drop for Scheduler {
         self.garbage.clear();
         // SAFETY: all submissions finished; the pool frees its command buffers.
         unsafe {
+            if let Some((_, fence)) = self.aside {
+                self.device.raw.destroy_fence(fence, None);
+            }
             self.device.raw.destroy_command_pool(self.pool, None);
         }
     }
@@ -368,5 +502,74 @@ impl Drop for Timeline {
     fn drop(&mut self) {
         // SAFETY: no holder remains, so no pending submission waits on or signals it.
         unsafe { self.device.raw.destroy_semaphore(self.raw, None) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use lichii_common::settings::GraphicsSettings;
+
+    use super::*;
+    use crate::{Instance, SurfaceSupport};
+
+    fn device() -> Option<Arc<Device>> {
+        let instance = match Instance::new(true, SurfaceSupport::None) {
+            Ok(instance) => Arc::new(instance),
+            Err(error) => {
+                eprintln!("skipping: {error}");
+                return None;
+            }
+        };
+        match Device::new(instance, &GraphicsSettings::default(), None) {
+            Ok(device) => Some(device),
+            Err(error) => {
+                eprintln!("skipping: {error}");
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn draws_with_one_key_share_a_rendering_until_other_work_records() {
+        let Some(device) = device() else { return };
+        let mut scheduler = Scheduler::new(&device).unwrap();
+        let key = |size| RenderingKey {
+            colors: [vk::ImageView::null(); 8],
+            depth: vk::ImageView::null(),
+            extent: vk::Extent2D {
+                width: size,
+                height: size,
+            },
+        };
+        let info = |size| {
+            vk::RenderingInfo::default()
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D {
+                        width: size,
+                        height: size,
+                    },
+                })
+                .layer_count(1)
+        };
+
+        let (cmd, began) = scheduler.record_rendering(key(16), &info(16)).unwrap();
+        assert!(began);
+        assert_eq!(
+            scheduler.record_rendering(key(16), &info(16)).unwrap(),
+            (cmd, false)
+        );
+        assert!(scheduler.record_rendering(key(8), &info(8)).unwrap().1);
+        assert_eq!(scheduler.rendering(), Some(key(8)));
+
+        assert_eq!(scheduler.record().unwrap(), cmd);
+        assert_eq!(scheduler.rendering(), None);
+        assert!(scheduler.record_rendering(key(8), &info(8)).unwrap().1);
+
+        scheduler.finish().unwrap();
+        assert_eq!(scheduler.rendering(), None);
+        assert_eq!(scheduler.renderings(), 3);
+        assert!(scheduler.record_rendering(key(8), &info(8)).unwrap().1);
+        scheduler.finish().unwrap();
     }
 }

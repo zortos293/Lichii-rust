@@ -544,7 +544,7 @@ impl App {
             ..LoadOptions::default()
         };
         let proxy = self.proxy.clone();
-        let applets = AppletDialogs::new(self.settings.system.username.clone(), move || {
+        let applets = AppletDialogs::new(move || {
             let _ = proxy.send_event(UserEvent::Wake);
         });
         let booted = match restart {
@@ -932,6 +932,15 @@ Dump prod.keys and title.keys \
                 let accuracy = self.current().graphics.gpu_accuracy.next();
                 self.set_graphics(|g| g.gpu_accuracy = accuracy);
                 self.toast(format!("GPU accuracy: {}", accuracy.label()));
+            }
+            HotkeyAction::ToggleRenderdocCapture => {
+                if self.settings.debug.renderdoc_hotkey {
+                    self.toast(if lichii_vulkan::debug::renderdoc::request_toggle() {
+                        "RenderDoc capture toggled at the next frame"
+                    } else {
+                        "RenderDoc is not loaded"
+                    });
+                }
             }
             HotkeyAction::Exit => self.exit_requested = true,
         }

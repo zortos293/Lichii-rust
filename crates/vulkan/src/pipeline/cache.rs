@@ -33,6 +33,7 @@ use super::{
     ComputePipelineKey, FxBuildHasher, GraphicsPipelineKey, GraphicsShaders, PipelineFeatures,
     descriptor_type, stage_flags,
 };
+use crate::debug::{Program, Programs};
 use crate::device::Device;
 use crate::error::{Result, VkResultExt};
 
@@ -346,12 +347,31 @@ impl Context {
                 programs,
                 layout,
                 part,
-            } => (self.build_graphics(&key, &programs, &layout, part), layout),
+            } => {
+                let result = self.build_graphics(&key, &programs, &layout, part);
+                if let Ok((raw, _)) = result {
+                    let kind = if library {
+                        "graphics library"
+                    } else {
+                        "graphics"
+                    };
+                    self.device
+                        .name(raw, format_args!("{kind} {}", Programs(&programs)));
+                }
+                (result, layout)
+            }
             Build::Compute {
                 key,
                 program,
                 layout,
-            } => (self.build_compute(&key, &program, &layout), layout),
+            } => {
+                let result = self.build_compute(&key, &program, &layout);
+                if let Ok((raw, _)) = result {
+                    self.device
+                        .name(raw, format_args!("compute {}", Program(&program)));
+                }
+                (result, layout)
+            }
         };
         match result {
             Ok((raw, _)) if library => {
@@ -389,6 +409,11 @@ impl Context {
             let module = unsafe { self.device.raw.create_shader_module(&info, None) }
                 .call("vkCreateShaderModule")
                 .map_err(|e| e.to_string())?;
+            self.device
+                .name(module, format_args!("{}", Program(program)));
+            if let Some(aftermath) = crate::debug::aftermath::get() {
+                aftermath.save_shader(&program.spirv);
+            }
             modules.stages.push((stage_flags(program.stage), module));
         }
         Ok(modules)
@@ -864,6 +889,13 @@ pub struct PipelineCache {
     linking: HashMap<usize, Linking, FxBuildHasher>,
     /// Graphics lookups that found the pipeline still building, with nothing fast-linked yet.
     waits: u64,
+    /// [`Self::graphics_waiting`] lookups that waited for a pipeline still building.
+    blocked: u64,
+    /// Render-thread time spent creating, linking or waiting for graphics pipelines.
+    stalled: Duration,
+    /// Run by tests when a [`Self::graphics_waiting`] lookup is about to wait.
+    #[cfg(test)]
+    on_block: Option<Box<dyn FnOnce() + Send>>,
     /// Pipeline count and driver compilations at the last [`Self::autosave`] write, or
     /// `None` when that write failed.
     saved: Option<(usize, u64)>,
@@ -988,6 +1020,10 @@ impl PipelineCache {
             libraries: HashMap::default(),
             linking: HashMap::default(),
             waits: 0,
+            blocked: 0,
+            stalled: Duration::ZERO,
+            #[cfg(test)]
+            on_block: None,
             saved: Some((0, 0)),
             next_save: None,
             save: Arc::new(AtomicU8::new(SAVE_IDLE)),
@@ -1025,7 +1061,7 @@ impl PipelineCache {
     ) -> Option<&Pipeline> {
         let index = match self.graphics.get(key) {
             Some(&index) => index,
-            None => self.insert_graphics(key, shaders, true),
+            None => self.timed_insert(key, shaders),
         };
         if self.async_compile && self.slots[index].get().is_none() {
             if self.ctx.features.fast_link && self.fast_linked(index, key, shaders).is_some() {
@@ -1038,6 +1074,62 @@ impl PipelineCache {
             return None;
         }
         self.ready(index)
+    }
+
+    /// As [`Self::graphics`], but a pipeline still building is waited for instead of skipped:
+    /// the fast-linked one once its libraries are built when the device links fast, else the
+    /// pipeline itself. `None` only when it failed to build.
+    pub fn graphics_waiting(
+        &mut self,
+        key: &GraphicsPipelineKey,
+        shaders: &GraphicsShaders,
+    ) -> Option<&Pipeline> {
+        let index = match self.graphics.get(key) {
+            Some(&index) => index,
+            None => self.timed_insert(key, shaders),
+        };
+        if self.async_compile && self.slots[index].get().is_none() {
+            self.blocked += 1;
+            #[cfg(test)]
+            if let Some(on_block) = self.on_block.take() {
+                on_block();
+            }
+            if self.ctx.features.fast_link && self.fast_linked(index, key, shaders).is_none() {
+                if let Some(Linking::Parts(parts, _)) = self.linking.get(&index) {
+                    let start = Instant::now();
+                    for part in parts {
+                        part.wait();
+                    }
+                    self.stalled += start.elapsed();
+                }
+                let _ = self.fast_linked(index, key, shaders);
+            }
+            if let Some(Linking::Linked(pipeline)) = self.linking.get(&index) {
+                return Some(pipeline);
+            }
+            let start = Instant::now();
+            self.slots[index].wait();
+            self.stalled += start.elapsed();
+        }
+        self.slots[index].wait().as_ref()
+    }
+
+    fn timed_insert(&mut self, key: &GraphicsPipelineKey, shaders: &GraphicsShaders) -> usize {
+        let start = Instant::now();
+        let index = self.insert_graphics(key, shaders, true);
+        self.stalled += start.elapsed();
+        index
+    }
+
+    /// Render-thread time since the cache was created spent creating graphics pipelines and
+    /// libraries in place, fast-linking them, and waiting for workers to build them.
+    pub fn stalled(&self) -> Duration {
+        self.stalled
+    }
+
+    /// Graphics lookups since the cache was created that waited for a pipeline still building.
+    pub fn blocked(&self) -> u64 {
+        self.blocked
     }
 
     /// Graphics lookups since the cache was created that found the pipeline still building.
@@ -1068,7 +1160,10 @@ impl PipelineCache {
                     Some(Some(library)) => *raw = library.raw,
                 }
             }
-            *linking = match self.ctx.link(&libraries[..parts.len()], layout) {
+            let start = Instant::now();
+            let linked = self.ctx.link(&libraries[..parts.len()], layout);
+            self.stalled += start.elapsed();
+            *linking = match linked {
                 Ok(pipeline) => {
                     self.ctx.shared.fast_linked.fetch_add(1, Ordering::Relaxed);
                     Linking::Linked(pipeline)
@@ -2367,6 +2462,35 @@ mod tests {
         release.send(()).unwrap();
         drop(workers);
         assert_eq!(*order.lock(), ["library", "pipeline", "prebuild"]);
+    }
+
+    #[test]
+    fn waiting_lookups_return_a_pipeline_while_it_builds() {
+        let Some(device) = device() else { return };
+        let mut cache = PipelineCache::new(&device, &settings(true), None, None).unwrap();
+        let shaders = present_shaders();
+        let key = key(&cache, &Regs::with_defaults(), &shaders);
+        let ctx = cache.ctx.clone();
+        let (paused, wait) = std::sync::mpsc::channel();
+        let (release, hold) = std::sync::mpsc::channel();
+        let gate = std::thread::spawn(move || {
+            let _paused = ctx.gate.write();
+            paused.send(()).unwrap();
+            hold.recv().unwrap();
+        });
+        wait.recv().unwrap();
+        cache.on_block = Some(Box::new(move || release.send(()).unwrap()));
+        assert!(
+            cache.graphics_waiting(&key, &shaders).is_some(),
+            "fast-linked or built once the paused builds run, never skipped"
+        );
+        gate.join().unwrap();
+        assert_eq!((cache.blocked(), cache.waits()), (1, 0));
+        assert!(cache.stalled() > Duration::ZERO, "the wait is timed");
+        cache.wait_for_builds();
+        assert!(cache.graphics_waiting(&key, &shaders).is_some());
+        assert_eq!(cache.blocked(), 1, "a built pipeline needs no wait");
+        assert_eq!(device.instance().validation_errors(), 0);
     }
 
     #[test]

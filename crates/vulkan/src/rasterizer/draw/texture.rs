@@ -317,9 +317,13 @@ impl VulkanRasterizer {
         unsafe { self.device.raw.update_descriptor_sets(&[write], &[]) };
 
         let cmd = self.scheduler.record()?;
+        self.texture_cache.prepare(
+            &mut self.scheduler,
+            target.id,
+            ImageAccess::COLOR_ATTACHMENT,
+        )?;
         self.texture_cache
-            .prepare(cmd, target.id, ImageAccess::COLOR_ATTACHMENT);
-        self.texture_cache.prepare(cmd, texture, SHADER_SAMPLED);
+            .prepare(&mut self.scheduler, texture, SHADER_SAMPLED)?;
         let attachments = [vk::RenderingAttachmentInfo::default()
             .image_view(target.view)
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)

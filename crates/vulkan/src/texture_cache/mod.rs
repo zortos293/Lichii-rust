@@ -52,7 +52,7 @@ use lichii_texture::PixelFormat;
 use lichii_texture::block_linear::{GobLayout, Tiling, swizzle, unswizzle};
 use lichii_texture::tic::{SwizzleSource, TextureDescriptor};
 
-pub use blit::BlitSide;
+pub use blit::{BlitSide, NearestSampling};
 pub use info::{GuestLayout, ImageInfo, ImageKind, ViewInfo};
 
 use crate::buffer_cache::BufferCache;
@@ -433,6 +433,9 @@ impl CachedImage {
     }
 
     fn transition(&mut self, device: &Device, cmd: vk::CommandBuffer, to: ImageAccess) {
+        if self.absorb(to) {
+            return;
+        }
         transition(
             device,
             cmd,
@@ -442,6 +445,17 @@ impl CachedImage {
             to,
         );
         self.access = to;
+    }
+
+    /// Folds a read `to` into the current read access when no barrier must separate them, so
+    /// a later writer's barrier waits for both; `false` when one must.
+    fn absorb(&mut self, to: ImageAccess) -> bool {
+        if self.access.hazards(&to) {
+            return false;
+        }
+        self.access.stage |= to.stage;
+        self.access.access |= to.access;
+        true
     }
 }
 
@@ -495,10 +509,13 @@ struct LookupKey {
     info: ImageInfo,
 }
 
+/// What a lookup found, valid while the GMMU keeps its `generation`. A miss (`found` is
+/// `None`) also dies once an image is created, as it was looked up before `creations`.
 #[derive(Clone, Copy)]
 struct LookupEntry {
     generation: u64,
-    found: Found,
+    creations: u64,
+    found: Option<Found>,
 }
 
 struct Slot {
@@ -538,6 +555,8 @@ pub struct TextureCache {
     traffic: Traffic,
     /// Images removed so far; see [`TextureCache::removals`].
     removals: u64,
+    /// Images created so far; a cached miss is only good until the next one.
+    creations: u64,
     ids: Vec<ImageId>,
     joins: Vec<(ImageId, u32, u32)>,
     new_aliases: Vec<Alias>,
@@ -557,6 +576,7 @@ pub struct TextureCache {
     downloads: Vec<Download>,
     clear_pipelines: Option<ClearPipelines>,
     guest_sync: Option<guest_sync::GuestSync>,
+    gather: Option<blit::Gather>,
     vram_usage: VramUsage,
     /// Frames presented so far.
     frame: u64,
@@ -838,6 +858,7 @@ impl TextureCache {
             visit: 0,
             traffic: Traffic::default(),
             removals: 0,
+            creations: 0,
             ids: Vec::new(),
             joins: Vec::new(),
             new_aliases: Vec::new(),
@@ -855,6 +876,7 @@ impl TextureCache {
             downloads: Vec::new(),
             clear_pipelines: None,
             guest_sync: None,
+            gather: None,
             vram_usage: VramUsage::default(),
             frame: 0,
             lru_head: NIL,
@@ -1170,22 +1192,35 @@ impl TextureCache {
         Ok(raw)
     }
 
-    /// Records the barrier that makes the image ready for `access` and returns it; `None`, with
-    /// a warning, once the image was removed.
+    /// Records the barrier, if any, that makes the image ready for `access` and returns it;
+    /// `None`, with a warning, once the image was removed. Only a barrier takes the command
+    /// buffer, so a read that needs none leaves an open rendering open.
     pub fn prepare(
         &mut self,
-        cmd: vk::CommandBuffer,
+        scheduler: &mut Scheduler,
         id: ImageId,
         access: ImageAccess,
-    ) -> Option<vk::Image> {
+    ) -> Result<Option<vk::Image>> {
         if self.get(id).is_none() {
             tracing::warn!(
                 ?id,
                 "preparing a removed texture cache image; skipping its barrier"
             );
-            return None;
+            return Ok(None);
         }
-        Some(self.prepare_live(cmd, id, access))
+        self.touch(id);
+        let device = self.device.clone();
+        let image = self.image(id);
+        if !image.absorb(access) {
+            image.transition(&device, scheduler.record()?, access);
+        }
+        Ok(Some(image.image.raw()))
+    }
+
+    /// Whether the image is in exactly `access`, as an attachment of the open rendering that
+    /// nothing else touched since it began.
+    pub fn is_in(&self, id: ImageId, access: ImageAccess) -> bool {
+        self.get(id).is_some_and(|image| image.access == access)
     }
 
     fn prepare_live(
@@ -1331,7 +1366,9 @@ impl TextureCache {
         self.ids = ids;
     }
 
-    /// Texture descriptors may have changed: forget the address lookups (images stay).
+    /// A channel was released, and its GMMU, which keys the lookups by address, may be freed and
+    /// another take its place: forget the address lookups (images stay). Descriptor changes need
+    /// no forgetting, as a lookup is keyed by the whole image info.
     pub fn invalidate_lookups(&mut self) {
         self.lookup.clear();
     }
@@ -1855,22 +1892,33 @@ impl TextureCache {
             info: *info,
         };
         let generation = gmmu.generation();
-        if let Some(entry) = self.lookup.get(&key)
+        if let Some(&entry) = self.lookup.get(&key)
             && entry.generation == generation
-            && self.get(entry.found.id).is_some()
         {
-            let found = entry.found;
-            self.touch(found.id);
-            return Ok(Some(found));
+            match entry.found {
+                Some(found) if self.get(found.id).is_some() => {
+                    self.touch(found.id);
+                    return Ok(Some(found));
+                }
+                None if entry.creations == self.creations => return Ok(None),
+                _ => {}
+            }
         }
         let found = self.find_slow(tx, gmmu, gpu_va, info)?;
         if let Some(found) = found {
             self.touch(found.id);
-            if self.lookup.len() >= MAX_LOOKUPS {
-                self.lookup.clear();
-            }
-            self.lookup.insert(key, LookupEntry { generation, found });
         }
+        if self.lookup.len() >= MAX_LOOKUPS {
+            self.lookup.clear();
+        }
+        self.lookup.insert(
+            key,
+            LookupEntry {
+                generation,
+                creations: self.creations,
+                found,
+            },
+        );
         Ok(found)
     }
 
@@ -2114,6 +2162,7 @@ impl TextureCache {
     }
 
     fn create(&mut self, info: &ImageInfo, segments: Vec<Segment>) -> Result<ImageId> {
+        self.creations += 1;
         let host = self.host(info.format);
         let desc = Self::image_desc(info, &host, ResolutionScale::X1);
         let image = if info.texels() > MAX_TEXELS {
@@ -2121,6 +2170,20 @@ impl TextureCache {
         } else {
             Image::new(&self.device, &desc, "guest image")?
         };
+        self.device.name(
+            image.raw(),
+            format_args!(
+                "guest {:?} {:?} {}x{}x{} levels {} layers {} @ {:#x}",
+                info.kind,
+                info.format,
+                info.width,
+                info.height,
+                info.depth,
+                info.levels,
+                info.layers,
+                segments.first().map_or(0, |segment| segment.daddr)
+            ),
+        );
         let cached = CachedImage {
             info: *info,
             host,

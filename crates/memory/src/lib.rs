@@ -17,7 +17,7 @@ mod physical;
 pub mod tracking;
 
 pub use address_space::{
-    AddressSpace, Fastmem, FastmemError, FaultKind, MemoryFault, MemoryPermission,
+    AddressSpace, Fastmem, FastmemError, FaultKind, FlushTrapStats, MemoryFault, MemoryPermission,
 };
 pub use device::DeviceAddressSpace;
 pub use exclusive::{ExclusiveMonitor, ReservationSlot};

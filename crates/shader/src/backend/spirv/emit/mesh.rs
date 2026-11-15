@@ -150,14 +150,9 @@ pub(crate) fn define(ctx: &mut EmitContext<'_>) {
         );
     }
     ctx.mesh.threads = ctx.translated.workgroup_size[0].max(1);
-    let payload_class = if emulated {
-        StorageClass::Workgroup
-    } else {
-        StorageClass::TaskPayloadWorkgroupEXT
-    };
-    let payload_type = ctx.type_array(u32_t, mesh.payload_words.max(1));
-    ctx.mesh.payload = variable(ctx, payload_type, payload_class, None, "task_payload");
-    ctx.mesh.payload_u32 = ctx.type_pointer(payload_class, u32_t);
+    if emulated || ctx.stage == ShaderStage::Task {
+        define_payload(ctx);
+    }
     if ctx.stage == ShaderStage::Task {
         return;
     }
@@ -467,7 +462,25 @@ fn clamped(ctx: &mut EmitContext<'_>, index: Word, count: u32) -> EmitResult<Wor
     umin_imm(ctx, index, count.max(1) - 1)
 }
 
+/// The task payload: plain workgroup memory under the emulation, else
+/// `TaskPayloadWorkgroupEXT`. A native mesh program defines it on its first read, so one that
+/// never reads it, or runs without a task stage, declares none.
+fn define_payload(ctx: &mut EmitContext<'_>) {
+    let u32_t = ctx.u32[1];
+    let payload_class = if ctx.runtime.mesh_emulation.is_some() {
+        StorageClass::Workgroup
+    } else {
+        StorageClass::TaskPayloadWorkgroupEXT
+    };
+    let payload_type = ctx.type_array(u32_t, ctx.info.mesh.payload_words.max(1));
+    ctx.mesh.payload = variable(ctx, payload_type, payload_class, None, "task_payload");
+    ctx.mesh.payload_u32 = ctx.type_pointer(payload_class, u32_t);
+}
+
 fn payload_word(ctx: &mut EmitContext<'_>, index: Word) -> EmitResult<Word> {
+    if ctx.mesh.payload == 0 {
+        define_payload(ctx);
+    }
     let index = clamped(ctx, index, ctx.info.mesh.payload_words)?;
     Ok(ctx
         .b
@@ -906,7 +919,7 @@ fn clear_positions(ctx: &mut EmitContext<'_>, invocation: Word) -> EmitResult<()
 }
 
 /// A task program's input region holds its workgroup index; a mesh program's holds its own
-/// index at byte 0 and the task's payload after it.
+/// index at byte 0 and the task's payload after it, zero without a task stage.
 pub(super) fn isbe_read(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
     if !is_mesh_stage(ctx.stage) {
         return Err(EmitError::UnsupportedOpcode(Opcode::IsbeRead));
@@ -921,9 +934,13 @@ pub(super) fn isbe_read(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<W
         workgroup
     };
     let address = ctx.def_arg(inst, 0)?;
-    let index = shift_right_imm(ctx, address, 2)?;
-    let pointer = payload_word(ctx, index)?;
-    let word = load_u32(ctx, pointer)?;
+    let word = if ctx.runtime.mesh_emulation.is_none() && !ctx.runtime.task_stage {
+        ctx.u32_zero_value
+    } else {
+        let index = shift_right_imm(ctx, address, 2)?;
+        let pointer = payload_word(ctx, index)?;
+        load_u32(ctx, pointer)?
+    };
     let is_own_index = ctx.b.i_equal(ctx.u1, None, address, ctx.u32_zero_value)?;
     Ok(ctx
         .b

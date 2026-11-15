@@ -159,6 +159,9 @@ struct CachedBuffer {
     /// Write tracking over each uploaded range (start, end), so a guest CPU write to it marks
     /// the pages dirty.
     tracked: Vec<(DAddr, DAddr, CachedPages)>,
+    /// The scheduler tick of the newest recorded work that wrote GPU-written bytes into it, or
+    /// that created it from older buffers.
+    written_tick: u64,
 }
 
 impl CachedBuffer {
@@ -275,6 +278,30 @@ impl RangeSet {
                 break;
             }
         }
+    }
+
+    fn covers(&self, start: u64, end: u64) -> bool {
+        self.ranges
+            .range(..=start)
+            .next_back()
+            .is_some_and(|(_, &e)| e >= end)
+    }
+
+    /// The smallest range holding `[start, end)` and every range of the set it touches.
+    fn area(&self, start: u64, end: u64) -> (u64, u64) {
+        let first = self
+            .ranges
+            .range(..start)
+            .next_back()
+            .filter(|(_, e)| **e > start)
+            .map_or(start, |(&s, _)| s);
+        let last = self
+            .ranges
+            .range(..end)
+            .next_back()
+            .filter(|(_, e)| **e > start)
+            .map_or(end, |(_, &e)| e.max(end));
+        (first, last)
     }
 
     fn intersects(&self, start: u64, end: u64) -> bool {
@@ -670,6 +697,9 @@ pub struct BufferCache {
     buffers: Vec<Option<CachedBuffer>>,
     free_slots: Vec<usize>,
     gpu_written: RangeSet,
+    /// Whether GPU-written ranges trap guest CPU accesses until they are downloaded
+    /// ([`lichii_gpu::gpu::flush_traps_enabled`]).
+    flush_traps: bool,
     stream: StreamRing,
     readback: Option<Buffer>,
     luts: [QuadLut; 2],
@@ -682,6 +712,10 @@ pub struct BufferCache {
     downloads: Vec<(vk::Buffer, u64, DAddr, u64)>,
     segments: Vec<GpuRange>,
     scratch: Vec<u32>,
+    raced: Vec<(DAddr, DAddr)>,
+    /// Ranges bound for writing by the draw or dispatch being prepared, stamped with the tick of
+    /// the work it is recorded into by [`BufferCache::commit_writes`].
+    pending_writes: Vec<(DAddr, DAddr)>,
 }
 
 impl BufferCache {
@@ -703,6 +737,7 @@ impl BufferCache {
             buffers: Vec::new(),
             free_slots: Vec::new(),
             gpu_written: RangeSet::default(),
+            flush_traps: lichii_gpu::gpu::flush_traps_enabled(),
             stream: StreamRing::new(device, STREAM_RING_SIZE)?,
             readback: None,
             luts: Default::default(),
@@ -715,6 +750,8 @@ impl BufferCache {
             downloads: Vec::new(),
             segments: Vec::new(),
             scratch: Vec::new(),
+            raced: Vec::new(),
+            pending_writes: Vec::new(),
         })
     }
 
@@ -758,6 +795,7 @@ impl BufferCache {
         }
         if self.gpu_written.intersects(daddr, end) {
             self.gpu_written.subtract(daddr, end);
+            self.disarm_written_back(daddr, end);
         }
         self.cpu_written(daddr, size);
     }
@@ -785,14 +823,141 @@ impl BufferCache {
     }
 
     /// The GPU wrote `[daddr, +size)` (storage writes, transform feedback, copies): the bytes
-    /// stay in the host buffer until [`BufferCache::flush`] downloads them, and the pages are
-    /// marked in the written-pages bitmap. Called when the writing work is recorded.
-    pub fn mark_gpu_written(&mut self, daddr: DAddr, size: u64) {
-        let end = daddr.saturating_add(size).min(self.limit);
-        if daddr < end {
-            self.written_pages.mark(daddr, end - daddr);
-            self.gpu_written.insert(daddr, end);
+    /// stay in the host buffer until [`BufferCache::flush`] downloads them, the pages are marked
+    /// in the written-pages bitmap, and guest CPU accesses to them trap until then. Called when
+    /// the writing work is recorded, with the tick it completes at ([`Scheduler::tick`]), which
+    /// the buffers holding the range note for [`BufferCache::flush`].
+    pub fn mark_gpu_written(&mut self, tick: u64, daddr: DAddr, size: u64) {
+        if let Some(end) = self.track_gpu_write(daddr, size) {
+            self.stamp_writer(tick, daddr, end);
         }
+    }
+
+    /// The draw or dispatch whose writable bindings were prepared since the last call is
+    /// recorded in the work completing at `tick`: the buffers those bindings write note it for
+    /// [`BufferCache::flush`]. Preparing bindings can submit recorded work (sparse binds, waits),
+    /// so the tick is only known once the draw or dispatch is recorded.
+    pub fn commit_writes(&mut self, tick: u64) {
+        let mut pending = std::mem::take(&mut self.pending_writes);
+        for &(daddr, end) in &pending {
+            self.stamp_writer(tick, daddr, end);
+        }
+        pending.clear();
+        self.pending_writes = pending;
+    }
+
+    fn bind_gpu_write(&mut self, daddr: DAddr, size: u64) {
+        if let Some(end) = self.track_gpu_write(daddr, size) {
+            self.pending_writes.push((daddr, end));
+        }
+    }
+
+    fn track_gpu_write(&mut self, daddr: DAddr, size: u64) -> Option<DAddr> {
+        let end = daddr.saturating_add(size).min(self.limit);
+        if daddr >= end {
+            return None;
+        }
+        self.written_pages.mark(daddr, end - daddr);
+        if self.flush_traps && !self.gpu_written.covers(daddr, end) {
+            self.memory.arm_flush_traps(daddr, end - daddr);
+        }
+        self.gpu_written.insert(daddr, end);
+        Some(end)
+    }
+
+    fn stamp_writer(&mut self, tick: u64, daddr: DAddr, end: DAddr) {
+        let mut addr = daddr;
+        while addr < end {
+            let Some(id) = Self::lookup(&self.page_table, addr) else {
+                addr = (addr + 1).next_multiple_of(CACHING_PAGE_SIZE);
+                continue;
+            };
+            let buffer = self.buffers[id].as_mut().expect("live buffer");
+            buffer.written_tick = tick;
+            addr = buffer.end();
+        }
+    }
+
+    /// Readies `[daddr, +size)` for GPU work about to be recorded that writes it: arms its flush
+    /// traps, then uploads the pages the guest CPU wrote since write tracking was last drained.
+    /// Such a write may have landed after the upload that fed the binding; once uploaded, the
+    /// range's download gives it back instead of the bytes it replaced, and writes after the arm
+    /// trap. Without flush traps, or over a range already GPU-written (and so armed), it does
+    /// nothing.
+    pub fn prepare_gpu_write(
+        &mut self,
+        scheduler: &mut Scheduler,
+        staging: &mut StagingRing,
+        daddr: DAddr,
+        size: u64,
+    ) -> Result<()> {
+        let end = daddr.saturating_add(size).min(self.limit);
+        if !self.flush_traps || daddr >= end || self.gpu_written.covers(daddr, end) {
+            return Ok(());
+        }
+        self.memory.arm_flush_traps(daddr, end - daddr);
+        if !self.memory.has_cpu_writes() {
+            return Ok(());
+        }
+        let mut raced = std::mem::take(&mut self.raced);
+        self.memory
+            .for_each_cpu_written_page(daddr, end - daddr, |page| match raced.last_mut() {
+                Some((_, stop)) if *stop == page => *stop += PAGE_SIZE,
+                _ => raced.push((page, page + PAGE_SIZE)),
+            });
+        let mut result = Ok(());
+        for &(start, stop) in &raced {
+            let (start, stop) = (start.max(daddr & !(PAGE_SIZE - 1)), stop.min(self.limit));
+            let Some(id) = Self::lookup(&self.page_table, start) else {
+                continue;
+            };
+            let buffer = self.buffers[id].as_mut().expect("live buffer");
+            let stop = stop.min(buffer.end());
+            buffer.mark_dirty(start, stop);
+            buffer.untrack(&self.memory, start, stop);
+            result = self.synchronize(scheduler, staging, id, start, stop - start);
+            if result.is_err() {
+                break;
+            }
+        }
+        raced.clear();
+        self.raced = raced;
+        result
+    }
+
+    /// Ends the flush traps of the pages of `[daddr, end)` no GPU-written byte is left on.
+    fn disarm_written_back(&self, daddr: DAddr, end: DAddr) {
+        if !self.flush_traps {
+            return;
+        }
+        let mut run: Option<DAddr> = None;
+        let mut page = daddr & !(PAGE_SIZE - 1);
+        while page < end {
+            let next = page + PAGE_SIZE;
+            if self.gpu_written.intersects(page, next) {
+                if let Some(start) = run.take() {
+                    self.memory.disarm_flush_traps(start, page - start);
+                }
+            } else {
+                run.get_or_insert(page);
+            }
+            page = next;
+        }
+        if let Some(start) = run {
+            self.memory.disarm_flush_traps(start, page - start);
+        }
+    }
+
+    /// A guest CPU thread waits on a flush trap in `[daddr, +size)`: downloads the whole
+    /// GPU-written range around it, so a CPU pass over the rest of the range traps no more.
+    pub fn flush_for_cpu_read(
+        &mut self,
+        scheduler: &mut Scheduler,
+        daddr: DAddr,
+        size: u64,
+    ) -> Result<()> {
+        let (start, end) = self.gpu_written.area(daddr, daddr.saturating_add(size));
+        self.flush(scheduler, start, end - start)
     }
 
     /// Copies the GPU-written bytes of `[daddr, +size)` back to guest memory, waiting for the GPU.
@@ -810,6 +975,7 @@ impl BufferCache {
         } = self;
         downloads.clear();
         let mut total = 0;
+        let mut newest = 0;
         gpu_written.for_each_in(daddr, end, |start, end| {
             let mut addr = start;
             while addr < end {
@@ -820,6 +986,7 @@ impl BufferCache {
                 let buffer = buffers[id].as_ref().expect("live buffer");
                 let len = end.min(buffer.end()) - addr;
                 downloads.push((buffer.buffer.raw(), addr - buffer.daddr, addr, len));
+                newest = newest.max(buffer.written_tick);
                 total += len;
                 addr += len;
             }
@@ -834,20 +1001,26 @@ impl BufferCache {
             )?);
         }
         let readback = self.readback.as_ref().expect("just ensured");
-        let cmd = scheduler.record()?;
-        before_transfer(&self.device, cmd);
-        let mut offset = 0;
-        for &(src, src_offset, _, len) in &self.downloads {
-            let region = [vk::BufferCopy {
-                src_offset,
-                dst_offset: offset,
-                size: len,
-            }];
-            copy_buffer(&self.device, cmd, src, readback.raw(), &region);
-            offset += len;
+        let record = |cmd| {
+            before_transfer(&self.device, cmd);
+            let mut offset = 0;
+            for &(src, src_offset, _, len) in &self.downloads {
+                let region = [vk::BufferCopy {
+                    src_offset,
+                    dst_offset: offset,
+                    size: len,
+                }];
+                copy_buffer(&self.device, cmd, src, readback.raw(), &region);
+                offset += len;
+            }
+            transfer_to_all_barrier(&self.device, cmd);
+        };
+        if newest < scheduler.tick() {
+            scheduler.run_aside(record)?;
+        } else {
+            record(scheduler.record()?);
+            scheduler.finish()?;
         }
-        transfer_to_all_barrier(&self.device, cmd);
-        scheduler.finish()?;
         let data = readback.mapped().expect("readback memory is host visible");
         let mut offset = 0;
         for &(_, _, daddr, len) in &self.downloads {
@@ -862,6 +1035,7 @@ impl BufferCache {
             offset += len;
         }
         self.gpu_written.subtract(daddr, end);
+        self.disarm_written_back(daddr, end);
         self.stats.downloaded_bytes += total;
         Ok(())
     }
@@ -1002,14 +1176,19 @@ impl BufferCache {
         if !pages.is_multiple_of(64) {
             *dirty.last_mut().expect("a buffer has pages") = (1 << (pages % 64)) - 1;
         }
+        let buffer = Buffer::new(
+            &self.device,
+            size,
+            CACHED_USAGE,
+            MemoryLocation::GpuOnly,
+            "guest buffer",
+        )?;
+        self.device.name(
+            buffer.raw(),
+            format_args!("guest buffer {begin:#x}-{end:#x}"),
+        );
         let mut new = CachedBuffer {
-            buffer: Buffer::new(
-                &self.device,
-                size,
-                CACHED_USAGE,
-                MemoryLocation::GpuOnly,
-                "guest buffer",
-            )?,
+            buffer,
             daddr: begin,
             size,
             dirty,
@@ -1017,6 +1196,7 @@ impl BufferCache {
             stream_score: 0,
             views: Vec::new(),
             tracked: Vec::new(),
+            written_tick: scheduler.tick(),
         };
         if !self.overlaps.is_empty() {
             let cmd = scheduler.record()?;
@@ -1274,7 +1454,8 @@ impl BufferCache {
         }
         if let Some(daddr) = contiguous(gmmu, start, size) {
             let binding = self.acquire(scheduler, staging, daddr, size)?;
-            self.mark_gpu_written(daddr, size);
+            self.prepare_gpu_write(scheduler, staging, daddr, size)?;
+            self.bind_gpu_write(daddr, size);
             return Ok(Some(binding));
         }
         if !self.warned_scattered_write {
@@ -1288,7 +1469,8 @@ impl BufferCache {
         let Some((binding, daddr)) = self.first_run(scheduler, staging, gmmu, start, size)? else {
             return Ok(None);
         };
-        self.mark_gpu_written(daddr, binding.size);
+        self.prepare_gpu_write(scheduler, staging, daddr, binding.size)?;
+        self.bind_gpu_write(daddr, binding.size);
         Ok(Some(binding))
     }
 
@@ -1321,7 +1503,8 @@ impl BufferCache {
         }
         let range = elements * texel;
         if written {
-            self.mark_gpu_written(daddr, range);
+            self.prepare_gpu_write(scheduler, staging, daddr, range)?;
+            self.bind_gpu_write(daddr, range);
         }
         let id = Self::lookup(&self.page_table, daddr).expect("an acquired range has a buffer");
         let key = (binding.offset, range, format.as_raw());
@@ -1976,6 +2159,77 @@ mod tests {
         f.assert_no_validation_errors();
     }
 
+    /// GPU-written bytes whose writer was submitted download ahead of the work recorded since,
+    /// which stays unsubmitted; a writer still being recorded is submitted with the download.
+    #[test]
+    fn downloads_wait_only_for_submitted_writers() {
+        let Some(mut f) = fixture() else { return };
+        let binding = f.acquire(DADDR, 0x1000);
+        f.gpu_fill(binding, 0, 0x100, 0x1111_1111);
+        f.cache.mark_gpu_written(f.scheduler.tick(), DADDR, 0x100);
+        f.scheduler.flush().unwrap();
+        f.gpu_fill(binding, 0x800, 0x100, 0x2222_2222);
+        let tick = f.scheduler.tick();
+        f.cache.flush(&mut f.scheduler, DADDR, 0x100).unwrap();
+        assert_eq!(
+            f.scheduler.tick(),
+            tick,
+            "the recorded work stays unsubmitted"
+        );
+        assert_eq!(
+            f.guest(DADDR, 0x100),
+            0x1111_1111_u32.to_le_bytes().repeat(0x40)
+        );
+        f.cache
+            .mark_gpu_written(f.scheduler.tick(), DADDR + 0x800, 0x100);
+        f.cache
+            .flush(&mut f.scheduler, DADDR + 0x800, 0x100)
+            .unwrap();
+        assert!(
+            f.scheduler.tick() > tick,
+            "a recorded writer is submitted with the download"
+        );
+        assert_eq!(
+            f.guest(DADDR + 0x800, 0x100),
+            0x2222_2222_u32.to_le_bytes().repeat(0x40)
+        );
+        f.assert_no_validation_errors();
+    }
+
+    /// A writable binding prepared before a submission belongs to the work its draw is recorded
+    /// into, not to the work submitted while the bindings were prepared.
+    #[test]
+    fn writable_bindings_belong_to_the_work_they_are_recorded_into() {
+        let Some(mut f) = fixture() else { return };
+        f.gmmu.map(GPU_VA, DADDR, PAGE_SIZE, 0, false).unwrap();
+        let binding = f
+            .cache
+            .storage_buffer(
+                &mut f.scheduler,
+                &mut f.staging,
+                &f.gmmu,
+                GPU_VA,
+                0x100,
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        f.scheduler.flush().unwrap();
+        f.gpu_fill(binding, 0, 0x100, 0x3333_3333);
+        let tick = f.scheduler.tick();
+        f.cache.commit_writes(tick);
+        f.cache.flush(&mut f.scheduler, DADDR, 0x100).unwrap();
+        assert!(
+            f.scheduler.tick() > tick,
+            "the draw's work is submitted with the download"
+        );
+        assert_eq!(
+            f.guest(DADDR, 0x100),
+            0x3333_3333_u32.to_le_bytes().repeat(0x40)
+        );
+        f.assert_no_validation_errors();
+    }
+
     /// A guest CPU write beside GPU-written bytes on one page, seen by write tracking for the
     /// whole page, keeps both.
     #[test]
@@ -1989,7 +2243,8 @@ mod tests {
         space.write_bytes(CPU_VA + 0x2000, &original).unwrap();
         let binding = f.acquire(DADDR + 0x2000, 0x3000);
         f.gpu_fill(binding, 0x40, 0x100, 0xdead_beef);
-        f.cache.mark_gpu_written(DADDR + 0x2040, 0x100);
+        f.cache
+            .mark_gpu_written(f.scheduler.tick(), DADDR + 0x2040, 0x100);
         let cpu = [0x5a; 16];
         space.write_bytes(CPU_VA + 0x2400, &cpu).unwrap();
         let memory = f.memory.clone();
@@ -2008,6 +2263,156 @@ mod tests {
         f.assert_no_validation_errors();
     }
 
+    /// Serves flush traps the way the GPU back does, on the test's thread: a guest CPU thread
+    /// that meets one sends its range and waits for the reply.
+    struct BackThread(parking_lot::Mutex<std::sync::mpsc::Sender<(DAddr, u64, SyncSender<()>)>>);
+
+    type SyncSender<T> = std::sync::mpsc::SyncSender<T>;
+
+    impl lichii_memory::FlushTrapHandler for BackThread {
+        fn flush_for_cpu(&self, daddr: DAddr, size: u64) {
+            let (done, wait) = std::sync::mpsc::sync_channel(1);
+            self.0.lock().send((daddr, size, done)).unwrap();
+            let _ = wait.recv();
+        }
+    }
+
+    /// GPU work writes a buffer, and a guest CPU read of it gets the GPU's bytes: the read traps,
+    /// the whole GPU-written range is downloaded once, and the next GPU write arms it again.
+    #[test]
+    fn cpu_reads_of_gpu_written_buffers_trap_until_downloaded() {
+        const CPU_VA: u64 = 0x1000_0000;
+        let Some(mut f) = fixture() else { return };
+        f.cache.flush_traps = true;
+        let space = Arc::new(AddressSpace::new(f.memory.physical().clone(), 39));
+        space.map(CPU_VA, 0, 0x10000, MemoryPermission::READ_WRITE);
+        f.memory.attach_process(space.clone());
+        let (requests, served) = std::sync::mpsc::channel();
+        f.memory
+            .set_flush_trap_handler(Some(Arc::new(BackThread(parking_lot::Mutex::new(
+                requests,
+            )))));
+        let read = |offset: u64| {
+            let (done, value) = std::sync::mpsc::channel();
+            let space = space.clone();
+            std::thread::spawn(move || done.send(space.read::<u32>(CPU_VA + offset).unwrap()));
+            value
+        };
+        let timeout = std::time::Duration::from_secs(5);
+        let binding = f.acquire(DADDR, 0x3000);
+
+        for value in [0xc0ff_ee01, 0xc0ff_ee02] {
+            f.gpu_fill(binding, 0, 0x2000, value);
+            f.cache.mark_gpu_written(f.scheduler.tick(), DADDR, 0x2000);
+            let reader = read(0x1004);
+            let (daddr, size, done) = served.recv_timeout(timeout).expect("the read trapped");
+            assert_eq!((daddr, size), (DADDR + 0x1000, PAGE_SIZE));
+            f.cache
+                .flush_for_cpu_read(&mut f.scheduler, daddr, size)
+                .unwrap();
+            done.send(()).unwrap();
+            assert_eq!(reader.recv_timeout(timeout).unwrap(), value);
+            assert_eq!(
+                read(0x10).recv_timeout(timeout).unwrap(),
+                value,
+                "the first page was downloaded with the second"
+            );
+            assert!(served.try_recv().is_err(), "nothing else trapped");
+        }
+        assert_eq!(
+            read(0x2000).recv_timeout(timeout).unwrap(),
+            0,
+            "never GPU-written"
+        );
+
+        f.cache.flush_traps = false;
+        f.gpu_fill(binding, 0, 0x2000, 0xc0ff_ee03);
+        f.cache.mark_gpu_written(f.scheduler.tick(), DADDR, 0x2000);
+        assert_eq!(
+            read(0x1004).recv_timeout(timeout).unwrap(),
+            0xc0ff_ee02,
+            "without flush traps the read sees guest memory"
+        );
+        assert!(served.try_recv().is_err());
+        f.assert_no_validation_errors();
+    }
+
+    /// A guest CPU write that lands after a written binding's upload but before GPU work that
+    /// writes part of the binding is recorded keeps its bytes, beside and inside the binding,
+    /// and the GPU's bytes download around them.
+    #[test]
+    fn a_cpu_write_before_the_arm_survives_the_download_beside_gpu_writes() {
+        const CPU_VA: u64 = 0x1000_0000;
+        let Some(mut f) = fixture() else { return };
+        f.cache.flush_traps = true;
+        let space = Arc::new(AddressSpace::new(f.memory.physical().clone(), 39));
+        space.map(CPU_VA, 0, 0x10000, MemoryPermission::READ_WRITE);
+        f.memory.attach_process(space.clone());
+        let original = pattern(0x2000, 4);
+        space.write_bytes(CPU_VA, &original).unwrap();
+        let binding = f.acquire(DADDR, 0x1000);
+        let cpu = [0x5a; 16];
+        space.write_bytes(CPU_VA + 0x800, &cpu).unwrap();
+        f.cache
+            .prepare_gpu_write(&mut f.scheduler, &mut f.staging, DADDR, 0x1000)
+            .unwrap();
+        f.gpu_fill(binding, 0, 0x100, 0xdead_beef);
+        f.cache.mark_gpu_written(f.scheduler.tick(), DADDR, 0x1000);
+        f.cache.flush(&mut f.scheduler, DADDR, 0x1000).unwrap();
+        let mut expected = original[..0x1000].to_vec();
+        expected[..0x100].copy_from_slice(&0xdead_beef_u32.to_le_bytes().repeat(0x40));
+        expected[0x800..0x810].copy_from_slice(&cpu);
+        assert_eq!(f.guest(DADDR, 0x1000), expected);
+        assert!(
+            f.memory.has_cpu_writes(),
+            "the write still reaches the next drain"
+        );
+        f.assert_no_validation_errors();
+    }
+
+    /// A download of part of a page's GPU-written bytes leaves the page trapped for the rest.
+    #[test]
+    fn a_partial_download_keeps_the_trap_of_a_page_still_gpu_written() {
+        const CPU_VA: u64 = 0x1000_0000;
+        let Some(mut f) = fixture() else { return };
+        f.cache.flush_traps = true;
+        let space = Arc::new(AddressSpace::new(f.memory.physical().clone(), 39));
+        space.map(CPU_VA, 0, 0x10000, MemoryPermission::READ_WRITE);
+        f.memory.attach_process(space.clone());
+        let binding = f.acquire(DADDR, 0x2000);
+        f.gpu_fill(binding, 0, 0x2000, 0x1234_5678);
+        f.cache.mark_gpu_written(f.scheduler.tick(), DADDR, 0x2000);
+        f.cache.flush(&mut f.scheduler, DADDR, 0x1800).unwrap();
+        let before = f.memory.take_flush_trap_stats();
+        assert_eq!((before.arms, before.disarms), (1, 1), "{before:?}");
+        f.cache
+            .flush(&mut f.scheduler, DADDR + 0x1800, 0x800)
+            .unwrap();
+        assert_eq!(
+            f.memory.take_flush_trap_stats().disarms,
+            1,
+            "the second page last"
+        );
+        f.cache.mark_gpu_written(f.scheduler.tick(), DADDR, 0x2000);
+        f.cache
+            .mark_gpu_written(f.scheduler.tick(), DADDR + 0x100, 0x100);
+        assert_eq!(
+            f.memory.take_flush_trap_stats().arms,
+            1,
+            "a range already GPU-written arms nothing"
+        );
+        f.cache.flush(&mut f.scheduler, DADDR, 0x2000).unwrap();
+        let before = allocations();
+        f.memory.arm_flush_traps(DADDR, 0x2000);
+        f.memory.disarm_flush_traps(DADDR, 0x2000);
+        assert_eq!(
+            allocations() - before,
+            0,
+            "arming and disarming again reuse their scratch"
+        );
+        f.assert_no_validation_errors();
+    }
+
     /// A page GPU work wrote whole uploads nothing after a CPU write, yet stays tracked: once
     /// flushed, the next CPU write to it reaches the buffer.
     #[test]
@@ -2019,7 +2424,8 @@ mod tests {
         f.memory.attach_process(space.clone());
         let binding = f.acquire(DADDR, PAGE_SIZE);
         f.gpu_fill(binding, 0, PAGE_SIZE, 0x0102_0304);
-        f.cache.mark_gpu_written(DADDR, PAGE_SIZE);
+        f.cache
+            .mark_gpu_written(f.scheduler.tick(), DADDR, PAGE_SIZE);
         let memory = f.memory.clone();
         for byte in [7, 9] {
             space.write_bytes(CPU_VA + 0x10, &[byte; 8]).unwrap();
@@ -2088,9 +2494,11 @@ mod tests {
         );
         assert_eq!(f.acquire(DADDR + 0xff00, 0x100).buffer, a.buffer);
         f.gpu_fill(a, 0, 0x100, 0xaabb_ccdd);
-        f.cache.mark_gpu_written(DADDR + 0x1000, 0x100);
+        f.cache
+            .mark_gpu_written(f.scheduler.tick(), DADDR + 0x1000, 0x100);
         f.gpu_fill(b, 0, 0x100, 0x1122_3344);
-        f.cache.mark_gpu_written(DADDR + 0x10100, 0x100);
+        f.cache
+            .mark_gpu_written(f.scheduler.tick(), DADDR + 0x10100, 0x100);
         let uploaded = f.cache.stats().uploaded_bytes;
 
         let spanning = f.acquire(DADDR + 0xf800, 0x1000);
@@ -2125,7 +2533,8 @@ mod tests {
         f.memory.write_bytes(DADDR + 0x2000, &original).unwrap();
         let binding = f.acquire(DADDR + 0x2000, 0x3000);
         f.gpu_fill(binding, 0x40, 0x100, 0xdead_beef);
-        f.cache.mark_gpu_written(DADDR + 0x2040, 0x100);
+        f.cache
+            .mark_gpu_written(f.scheduler.tick(), DADDR + 0x2040, 0x100);
 
         let cpu = [0x5a; 16];
         f.memory.write_bytes(DADDR + 0x2400, &cpu).unwrap();
@@ -2151,7 +2560,8 @@ mod tests {
         );
 
         f.gpu_fill(binding, 0x40, 0x100, 0x0102_0304);
-        f.cache.mark_gpu_written(DADDR + 0x2040, 0x100);
+        f.cache
+            .mark_gpu_written(f.scheduler.tick(), DADDR + 0x2040, 0x100);
         let newer = pattern(0x100, 5);
         f.memory.write_bytes(DADDR + 0x2040, &newer).unwrap();
         f.cache.invalidate(DADDR + 0x2040, 0x100);

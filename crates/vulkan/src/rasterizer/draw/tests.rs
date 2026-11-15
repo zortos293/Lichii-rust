@@ -10,10 +10,11 @@ use lichii_gpu::backend::{
     ReleaseSize,
 };
 use lichii_gpu::engines::maxwell_3d::regs::{
-    BlendEquation, BlendFactor, ClearSurface, DepthMode, IndexFormat, MAX_CONST_BUFFERS,
+    BlendEquation, BlendFactor, ClearSurface, ColorMask, DepthMode, IndexFormat, MAX_CONST_BUFFERS,
     MAX_SHADER_STAGE, MESH_CONTROL, MESH_INIT_SHADER, MESH_SHADER_A, MESH_SHADER_B, PipelineBits,
-    PrimitiveTopology, RenderTargetConfigBits, RtControl, ScissorTestBits, ScissorTestBits1,
-    ShaderType, SurfaceClipBits, SurfaceClipBits1, TileMode, VertexAttribute, VertexStreamBits,
+    PrimitiveTopology, RenderTargetConfigBits, RtControl, RtLayer, RtLayerControl, ScissorTestBits,
+    ScissorTestBits1, ShaderType, SurfaceClipBits, SurfaceClipBits1, TileMode, VertexAttribute,
+    VertexStreamBits, ZetaSizeBits,
 };
 use lichii_gpu::engines::maxwell_3d::{DirtyState, Regs};
 use lichii_gpu::gmmu::Gmmu;
@@ -223,6 +224,23 @@ fn draw_with(f: &mut Fixture, gmmu: &Arc<Gmmu>, regs: &Regs, const_buffers: &Gra
 }
 
 /// The render target's texels after writing it back to guest memory.
+/// Marks the draw target of `regs` as shown by a present, so draws into it alone may skip.
+fn present_target(f: &mut Fixture, gmmu: &Arc<Gmmu>, regs: &Regs) {
+    let mut dirty = DirtyState::new();
+    let root_tables = [[0; 64]; 8];
+    let ctx = GraphicsContext {
+        channel: ChannelId(0),
+        memory: gmmu,
+        regs,
+        dirty: &mut dirty,
+        const_buffers: &const_buffers(),
+        root_tables: &root_tables,
+    };
+    assert!(f.rasterizer.render_targets(&ctx).unwrap());
+    let id = f.rasterizer.draw.colors[0].as_ref().unwrap().id;
+    f.rasterizer.draw.presented(id);
+}
+
 fn target(f: &mut Fixture) -> Vec<[u8; 4]> {
     let tiling = Tiling::new(SIZE, SIZE, 1, 4, 1, 0, GobLayout::Tegra);
     f.rasterizer.flush_region(DADDR, tiling.size_bytes() as u64);
@@ -763,11 +781,12 @@ fn draws_skip_while_workers_translate_their_programs() {
     );
     f.rasterizer.draw.shaders.set_async(true);
     let regs = draw_regs();
+    present_target(&mut f, &gmmu, &regs);
     draw(&mut f, &gmmu, &regs);
     draw(&mut f, &gmmu, &regs);
     assert!(
         target(&mut f).iter().all(|&t| t == [0; 4]),
-        "draws whose programs are queued draw nothing"
+        "draws into the presented frame whose programs are queued draw nothing"
     );
     assert_eq!(
         f.rasterizer.draw.shaders.waits(),
@@ -786,6 +805,36 @@ fn draws_skip_while_workers_translate_their_programs() {
         (stats.translated, stats.failed),
         (2, 0),
         "each program translated once however many draws asked"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn draws_into_targets_no_present_showed_translate_in_place_instead_of_skipping() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    f.rasterizer.draw.shaders.set_async(true);
+    let regs = draw_regs();
+    draw(&mut f, &gmmu, &regs);
+    assert!(
+        target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]),
+        "a later pass may read this target, so the first draw already lands"
+    );
+    let shaders = &f.rasterizer.draw.shaders;
+    assert_eq!(
+        (shaders.waits(), shaders.blocked()),
+        (0, 2),
+        "nothing skipped; the vertex and fragment programs translated in place"
+    );
+    assert!(
+        shaders.stalled() > std::time::Duration::ZERO,
+        "the translations are timed"
     );
     f.assert_no_validation_errors();
 }
@@ -956,6 +1005,71 @@ fn activity_counts_draws_submits_and_texture_uploads() {
 
 /// A guest address space mapping `size` bytes of the fixture's DRAM at each (va, offset), whose
 /// writes the fixture's device tracks.
+#[test]
+fn draws_into_one_target_share_a_rendering() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(&f, PROGRAMS + u64::from(FRAGMENT), &sampling_program());
+    uniform_texture(&f, 0, TEXTURE, [10, 200, 30, 255]);
+    let regs = sampling_regs();
+    draw(&mut f, &gmmu, &regs);
+    let renderings = f.rasterizer.scheduler.renderings();
+    draw(&mut f, &gmmu, &regs);
+    draw(&mut f, &gmmu, &regs);
+    assert_eq!(
+        f.rasterizer.scheduler.renderings(),
+        renderings,
+        "later draws sampling the same texture continue the first draw's rendering"
+    );
+    assert_eq!(target(&mut f)[0], [10, 200, 30, 255]);
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn a_draw_continuing_a_rendering_records_the_state_that_changed() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    let mut regs = draw_regs();
+    regs.color_mask[0] = ColorMask(0);
+    draw(&mut f, &gmmu, &regs);
+    let renderings = f.rasterizer.scheduler.renderings();
+    regs.color_mask[0] = ColorMask(0x1111);
+    draw(&mut f, &gmmu, &regs);
+    assert_eq!(f.rasterizer.scheduler.renderings(), renderings);
+    assert!(
+        target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]),
+        "the second draw writes with the colour mask it set"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn draws_sampling_their_own_target_render_in_the_general_layout() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(&f, PROGRAMS + u64::from(FRAGMENT), &sampling_program());
+    write(&f, TIC, bytemuck::cast_slice(&tic(GPU_VA, SIZE, SIZE)));
+    let regs = sampling_regs();
+    draw(&mut f, &gmmu, &regs);
+    draw(&mut f, &gmmu, &regs);
+    let draw = &f.rasterizer.draw;
+    assert_eq!(
+        draw.textures.first(),
+        draw.colors[0].map(|t| t.id).as_ref(),
+        "the draw samples its render target"
+    );
+    f.rasterizer.flush_commands();
+    f.assert_no_validation_errors();
+}
+
 fn cpu_space(f: &Fixture, maps: &[(u64, u64)], size: u64) -> Arc<AddressSpace> {
     let space = Arc::new(AddressSpace::new(f.memory.physical().clone(), 39));
     for &(va, offset) in maps {
@@ -1152,6 +1266,163 @@ fn draws_back_only_the_layer_they_render_of_an_array_target() {
         "a target one layer up does not replace the first"
     );
     f.assert_no_validation_errors();
+}
+
+const LAYERED_GEOMETRY: u32 = 0x400;
+
+/// A geometry program that passes each triangle through to render target layer `layer`.
+fn layer_select_geometry_program(layer: u32) -> Vec<u8> {
+    let mut header = header(1, ShaderType::GEOMETRY);
+    header[2] |= 1 << 24;
+    header[3] |= 7 << 24;
+    header[4] = 3;
+    header[5] |= 0xf0 << 24;
+    header[13] |= 0xf2 << 8;
+    let mut code = vec![mov_u32(5, layer)];
+    for vertex in 0..3u64 {
+        let vertex_reg = match vertex {
+            0 => RZ,
+            _ => {
+                code.push(mov_u32(6, vertex as u32));
+                6
+            }
+        };
+        code.push(sass(
+            Opcode::Ald,
+            (3 << 47) | (vertex_reg << 39) | (0x70 << 20) | (RZ << 8),
+        ));
+        code.push(sass(
+            Opcode::Ast,
+            (3 << 47) | (RZ << 39) | (0x70 << 20) | (RZ << 8),
+        ));
+        code.push(sass(Opcode::Ast, (RZ << 39) | (0x64 << 20) | (RZ << 8) | 5));
+        code.push(sass(Opcode::OutImm, (1 << 39) | 7));
+    }
+    code.push(exit());
+    program(header, &code)
+}
+
+/// `draw_regs` with a two-layer colour target whose layer the geometry program selects.
+fn layered_regs() -> Box<Regs> {
+    let mut regs = draw_regs();
+    regs.rt[0].bits = RenderTargetConfigBits(2);
+    regs.rt[0].array_pitch = SIZE * SIZE;
+    regs.rt_layer = RtLayer(RtLayerControl::GEOMETRY_SHADER_SELECTS_LAYER.0 << 16);
+    regs.pipelines[4].bits = PipelineBits(1 | ShaderType::GEOMETRY.0 << 4);
+    regs.pipelines[4].offset = LAYERED_GEOMETRY;
+    regs
+}
+
+fn layered_fixture(layer: u32) -> Option<(Fixture, Arc<Gmmu>)> {
+    let (f, gmmu) = draw_fixture()?;
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    write(
+        &f,
+        PROGRAMS + u64::from(LAYERED_GEOMETRY),
+        &layer_select_geometry_program(layer),
+    );
+    Some((f, gmmu))
+}
+
+/// Both layers of the two-layer target at `GPU_VA`.
+fn target_layers(f: &mut Fixture) -> [Vec<[u8; 4]>; 2] {
+    let tiling = Tiling::new(SIZE, SIZE, 1, 4, 1, 0, GobLayout::Tegra);
+    let layer = u64::from(SIZE * SIZE * 4);
+    f.rasterizer.flush_region(DADDR, 2 * layer);
+    [0, 1].map(|i| {
+        guest_linear(f, DADDR + i * layer, &tiling)
+            .as_chunks::<4>()
+            .0
+            .to_vec()
+    })
+}
+
+fn render_targets_of(f: &mut Fixture, gmmu: &Arc<Gmmu>, regs: &Regs) {
+    let mut dirty = DirtyState::new();
+    let root_tables = [[0; 64]; 8];
+    let ctx = GraphicsContext {
+        channel: ChannelId(0),
+        memory: gmmu,
+        regs,
+        dirty: &mut dirty,
+        const_buffers: &const_buffers(),
+        root_tables: &root_tables,
+    };
+    assert!(f.rasterizer.render_targets(&ctx).unwrap());
+}
+
+#[test]
+fn a_geometry_program_selects_the_layer_of_an_array_target_it_draws() {
+    let Some((mut f, gmmu)) = layered_fixture(1) else {
+        return;
+    };
+    draw(&mut f, &gmmu, &layered_regs());
+    let [first, second] = target_layers(&mut f);
+    assert!(
+        first.iter().all(|&t| t == [0; 4]),
+        "layer 0 stays untouched"
+    );
+    assert!(
+        second.iter().all(|&t| t == [255, 128, 0, 255]),
+        "the selected layer holds the draw"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn layered_draws_bind_every_layer_of_an_array_depth_target() {
+    let Some((mut f, gmmu)) = layered_fixture(1) else {
+        return;
+    };
+    let mut regs = layered_regs();
+    let depth = GPU_VA + 0x8000;
+    regs.zeta.address_high = (depth >> 32) as u32;
+    regs.zeta.address_low = depth as u32;
+    regs.zeta.format = 0x0a;
+    regs.zeta.tile_mode = TileMode(1 << 4);
+    regs.zeta.array_pitch = SIZE * SIZE;
+    regs.zeta_size.width = SIZE;
+    regs.zeta_size.height = SIZE;
+    regs.zeta_size.bits = ZetaSizeBits(2);
+    regs.zeta_enable = 1;
+    draw(&mut f, &gmmu, &regs);
+    assert_eq!(f.rasterizer.draw.depth.map(|d| d.layers), Some(2));
+    assert_eq!(f.rasterizer.draw.layers(), 2);
+    let [first, second] = target_layers(&mut f);
+    assert!(first.iter().all(|&t| t == [0; 4]));
+    assert!(second.iter().all(|&t| t == [255, 128, 0, 255]));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn renderings_span_the_fewest_layers_any_target_has() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let mut regs = layered_regs();
+    render_targets_of(&mut f, &gmmu, &regs);
+    assert_eq!(f.rasterizer.draw.layers(), 2);
+    let second = GPU_VA + 0x8000;
+    regs.rt[1] = regs.rt[0];
+    regs.rt[1].address_high = (second >> 32) as u32;
+    regs.rt[1].address_low = second as u32;
+    regs.rt[1].bits = RenderTargetConfigBits(1);
+    regs.rt_control = RtControl(2 | 1 << 7);
+    render_targets_of(&mut f, &gmmu, &regs);
+    assert_eq!(f.rasterizer.draw.colors[0].map(|t| t.layers), Some(2));
+    assert_eq!(f.rasterizer.draw.colors[1].map(|t| t.layers), Some(1));
+    assert_eq!(f.rasterizer.draw.layers(), 1);
+    regs.rt_layer = RtLayer(0);
+    render_targets_of(&mut f, &gmmu, &regs);
+    assert_eq!(
+        f.rasterizer.draw.colors[0].map(|t| t.layers),
+        Some(1),
+        "without geometry layer selection a draw binds one layer"
+    );
 }
 
 #[test]

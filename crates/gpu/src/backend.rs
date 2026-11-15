@@ -559,12 +559,18 @@ pub trait Rasterizer: Send {
     /// and deferred [`Query`] writes landed.
     fn release_fences(&mut self, wait: bool);
 
+    /// Gives the renderer `wake`, which ends an idle GPU's wait at once: a renderer whose fences
+    /// wait for host GPU work calls it when the work of the oldest submitted fence finished, so the
+    /// GPU runs [`release_fences(false)`](Self::release_fences) then instead of at its next poll.
+    /// Called once, before any other call. The default ignores it.
+    fn set_fence_wake(&mut self, _wake: Box<dyn Fn() + Send + Sync>) {}
+
     /// Whether fences signalled earlier may still wait for their host GPU work, or recorded work
     /// is not submitted yet. While this holds, an idle GPU calls
     /// [`flush_commands`](Self::flush_commands) and then
-    /// [`release_fences(false)`](Self::release_fences) about every millisecond, so recorded work
-    /// reaches the host GPU and a syncpoint or semaphore the guest CPU waits on lands without more
-    /// GPU work behind it. The default, true, suits any renderer that defers work; a renderer that
+    /// [`release_fences(false)`](Self::release_fences) about every millisecond, and whenever the
+    /// [`set_fence_wake`](Self::set_fence_wake) wake fires, so recorded work reaches the host GPU
+    /// and a syncpoint or semaphore the guest CPU waits on lands without more GPU work behind it. The default, true, suits any renderer that defers work; a renderer that
     /// knows it has nothing recorded or queued can return false and idle without polling.
     fn has_pending_fences(&self) -> bool {
         true
@@ -582,6 +588,15 @@ pub trait Rasterizer: Send {
 
     /// Write GPU-modified data in `[addr, addr + size)` back to guest memory.
     fn flush_region(&mut self, addr: DAddr, size: u64);
+
+    /// A guest CPU thread touched `[addr, addr + size)`, a page under a flush trap the renderer
+    /// armed ([`DeviceAddressSpace::arm_flush_traps`](lichii_memory::DeviceAddressSpace::arm_flush_traps)),
+    /// and waits: write its GPU-modified data back and disarm what was written back. A renderer
+    /// may write back the whole GPU-written area around the page, so a CPU pass over a large
+    /// buffer traps once. The default writes back the range.
+    fn flush_for_cpu_read(&mut self, addr: DAddr, size: u64) {
+        self.flush_region(addr, size);
+    }
 
     /// The front is about to read `[addr, addr + size)`: every GPU writer of the range lands in
     /// guest memory first (releases still waiting for host GPU work, and cached buffers and

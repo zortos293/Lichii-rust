@@ -190,6 +190,12 @@ impl DirtyPages {
         self.pending.load(Ordering::Acquire)
     }
 
+    /// Whether the page holding `pa` is marked.
+    pub(crate) fn test(&self, pa: PAddr) -> bool {
+        let page = (pa >> PAGE_BITS) as usize;
+        self.words[page / 64].load(Ordering::Acquire) & (1 << (page % 64)) != 0
+    }
+
     /// Clears the marks and calls `f` with each run of marked physical pages, as (address, size).
     pub(crate) fn take(&self, mut f: impl FnMut(PAddr, u64)) {
         if !self.pending.swap(false, Ordering::AcqRel) {
@@ -746,5 +752,43 @@ mod flush_trap_tests {
         device.arm_flush_traps(DADDR + 0x3000, 0x1000);
         assert_eq!(process.read::<u32>(VA + 0x3000).unwrap(), 5);
         assert!(flusher.take().is_empty());
+    }
+
+    #[test]
+    fn a_page_stays_trapped_while_another_device_alias_of_it_is_armed() {
+        const ALIAS: u64 = DADDR + 0x10_0000;
+        let (process, device, flusher) = spaces(Duration::ZERO);
+        device.map_process(ALIAS, &process, VA, 0x4000).unwrap();
+        device.arm_flush_traps(DADDR + 0x1000, 0x1000);
+        device.arm_flush_traps(ALIAS + 0x1000, 0x1000);
+        device.disarm_flush_traps(DADDR + 0x1000, 0x1000);
+        assert_eq!(process.read::<u32>(VA + 0x1010).unwrap(), GPU);
+        let mut calls = flusher.take();
+        calls.sort_unstable();
+        assert_eq!(
+            calls,
+            [(DADDR + 0x1000, 0x1000), (ALIAS + 0x1000, 0x1000)],
+            "the alias still armed kept the trap"
+        );
+        device.disarm_flush_traps(ALIAS + 0x1000, 0x1000);
+        process.read::<u32>(VA + 0x1010).unwrap();
+        assert!(flusher.take().is_empty());
+    }
+
+    #[test]
+    fn remapping_an_armed_device_page_lets_its_trap_clear_itself() {
+        let (process, device, flusher) = spaces(Duration::ZERO);
+        device.arm_flush_traps(DADDR + 0x2000, 0x1000);
+        device.unmap(DADDR + 0x2000, 0x1000);
+        device
+            .map_process(DADDR + 0x2000, &process, VA + 0x2000, 0x1000)
+            .unwrap();
+        assert_eq!(process.read::<u32>(VA + 0x2000).unwrap(), GPU);
+        assert_eq!(flusher.take(), [(DADDR + 0x2000, 0x1000)]);
+        process.read::<u32>(VA + 0x2000).unwrap();
+        assert!(
+            flusher.take().is_empty(),
+            "no armed device page maps it any more, so the trap removed itself"
+        );
     }
 }

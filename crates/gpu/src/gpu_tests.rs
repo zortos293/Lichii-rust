@@ -73,6 +73,8 @@ enum Event {
     /// An engine finished the work it held back.
     Flush(EngineKind),
     FlushRegion(u64, u64),
+    /// A guest CPU thread waited for the back to write back a trapped page.
+    CpuRead(u64, u64),
     Draw {
         topology: PrimitiveTopology,
         count: u32,
@@ -319,6 +321,14 @@ impl Rasterizer for Recorder {
     }
     fn flush_region(&mut self, addr: u64, size: u64) {
         self.log.lock().push(Event::FlushRegion(addr, size));
+    }
+    fn flush_for_cpu_read(&mut self, addr: u64, size: u64) {
+        self.log.lock().push(Event::CpuRead(addr, size));
+        let device = &self.work.handles.device;
+        for offset in (0..size).step_by(4) {
+            device.write(addr + offset, GPU_DATA).unwrap();
+        }
+        device.disarm_flush_traps(addr, size);
     }
     fn barrier(&mut self) {
         self.log.lock().push(Event::Barrier);
@@ -2003,6 +2013,14 @@ fn list_written_by_a_release(rig: &mut Rig) -> (GpEntry, GpEntry) {
     (writer, list)
 }
 
+/// The write-back a fetch sync of `entry` asks for: the 64 KiB device blocks around its words.
+fn fetch_window(entry: GpEntry) -> Event {
+    let daddr = DEVICE_BASE + entry.address();
+    let start = daddr & !0xffff;
+    let end = (daddr + u64::from(entry.words()) * 4).next_multiple_of(0x1_0000);
+    Event::FlushRegion(start, end - start)
+}
+
 /// A rig whose channels fetch the entries of [`list_written_by_a_release`] after the work before
 /// them completed on the host GPU: Switch 2, with the list's words on a page GPU work wrote.
 fn rig_with_written_list(threading: Threading) -> (Rig, GpEntry, GpEntry) {
@@ -2082,11 +2100,7 @@ fn a_switch_2_sync_entry_on_a_page_the_work_before_it_marks_waits_for_the_host_g
             [(channel.0, EngineKind::Maxwell3d, 0x701, 0x1234)],
             "{threading:?}: the list is read with the released word"
         );
-        assert!(
-            rig.events()
-                .contains(&Event::FlushRegion(DEVICE_BASE + list.address(), 8)),
-            "{threading:?}"
-        );
+        assert!(rig.events().contains(&fetch_window(list)), "{threading:?}");
     });
 }
 
@@ -2150,7 +2164,7 @@ fn switch_2_fetches_an_entry_on_gpu_written_pages_after_the_work_before_it() {
             .unwrap_or_else(|| panic!("{threading:?}: the list is read with the released word"));
         let flush = events
             .iter()
-            .position(|e| *e == Event::FlushRegion(DEVICE_BASE + list.address(), 8))
+            .position(|e| *e == fetch_window(list))
             .unwrap_or_else(|| panic!("{threading:?}: the list's words are flushed"));
         assert!(flush < read, "{threading:?}");
     });
@@ -2425,5 +2439,113 @@ fn shutdown_drops_actions_queued_behind_a_busy_back() {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
             "{threading:?}"
         );
+    });
+}
+
+/// What the recording renderer writes back to a trapped page.
+const GPU_DATA: u32 = 0x6b70_7567;
+/// A GPU address whose page GPU work modified, by the tests' account.
+const GPU_WRITTEN: u64 = 0x38_0000;
+
+impl Rig {
+    /// Arms the flush trap of the page at GPU address `address`, as a renderer does when GPU work
+    /// writes it.
+    fn arm(&self, address: u64) {
+        self.gpu
+            .handles()
+            .device
+            .arm_flush_traps(DEVICE_BASE + address, 0x1000);
+    }
+
+    /// Reads the word at GPU address `address` from a guest CPU thread, through the process's
+    /// mapping of it; panics when the read takes longer than five seconds.
+    fn cpu_read(&self, address: u64) -> u32 {
+        let (done, read) = std::sync::mpsc::channel();
+        let space = self.space.clone();
+        std::thread::spawn(move || {
+            let _ = done.send(space.read::<u32>(CPU_VA + address).unwrap());
+        });
+        read.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the CPU read finished")
+    }
+
+    fn cpu_reads(&self) -> Vec<(u64, u64)> {
+        self.log
+            .lock()
+            .iter()
+            .filter_map(|event| match *event {
+                Event::CpuRead(addr, size) => Some((addr, size)),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+#[test]
+fn a_cpu_read_of_an_armed_page_gets_what_the_back_writes_back() {
+    each_mode(|threading| {
+        let rig = Rig::new(threading);
+        rig.arm(GPU_WRITTEN);
+        assert_eq!(rig.cpu_read(GPU_WRITTEN + 0x10), GPU_DATA, "{threading:?}");
+        assert_eq!(rig.cpu_reads(), [(DEVICE_BASE + GPU_WRITTEN, 0x1000)]);
+        assert_eq!(rig.cpu_read(GPU_WRITTEN + 0x20), GPU_DATA);
+        assert_eq!(rig.cpu_reads().len(), 1, "the write-back disarmed the page");
+        assert_eq!(rig.cpu_read(GPU_WRITTEN + 0x1000), 0);
+        assert_eq!(rig.cpu_reads().len(), 1, "the next page was never armed");
+    });
+}
+
+#[test]
+fn a_cpu_read_completes_while_a_channel_waits_on_a_semaphore_the_reader_releases_after_it() {
+    each_mode(|threading| {
+        let mut rig = Rig::new(threading);
+        let channel = rig.channel(HostClass::Maxwell);
+        let words = Pushbuffer::default()
+            .bind(0, MAXWELL_3D)
+            .host(host::SEMAPHORE_A, (SEMAPHORE >> 32) as u32)
+            .host(host::SEMAPHORE_B, SEMAPHORE as u32)
+            .host(host::SEMAPHORE_C, 7)
+            .host(host::SEMAPHORE_D, 1)
+            .inc(0, 0x701, &[2]);
+        rig.submit(channel, &words.0);
+        rig.arm(GPU_WRITTEN);
+        assert_eq!(rig.cpu_read(GPU_WRITTEN), GPU_DATA, "{threading:?}");
+        assert!(
+            rig.methods().is_empty(),
+            "{threading:?}: the acquire still holds"
+        );
+        rig.memory.write(SEMAPHORE, 7u32).unwrap();
+        rig.gpu.wake();
+        assert_eq!(
+            rig.methods(),
+            [(channel.0, EngineKind::Maxwell3d, 0x701, 2)],
+            "{threading:?}"
+        );
+    });
+}
+
+#[test]
+fn a_cpu_read_does_not_wait_for_queued_submissions() {
+    let mut rig = Rig::new(Threading::Split);
+    let channel = rig.channel(HostClass::Maxwell);
+    rig.gpu.synchronize();
+    rig.gpu.pause(true);
+    rig.submit(channel, &Pushbuffer::default().upload(0x20_0000, &[7]).0);
+    rig.arm(GPU_WRITTEN);
+    assert_eq!(rig.cpu_read(GPU_WRITTEN), GPU_DATA);
+    assert_eq!(rig.read(0x20_0000), 0, "the queued submission has not run");
+    rig.gpu.pause(false);
+    rig.gpu.synchronize();
+    assert_eq!(rig.read(0x20_0000), 7);
+}
+
+#[test]
+fn a_cpu_read_after_shutdown_returns_without_the_back() {
+    each_mode(|threading| {
+        let rig = Rig::new(threading);
+        rig.arm(GPU_WRITTEN);
+        rig.gpu.shutdown();
+        assert_eq!(rig.cpu_read(GPU_WRITTEN), 0, "{threading:?}");
+        assert!(rig.cpu_reads().is_empty());
     });
 }

@@ -16,8 +16,8 @@ use lichii_gpu::backend::{
 };
 use lichii_gpu::engines::maxwell_3d::Regs;
 use lichii_gpu::engines::maxwell_3d::regs::{
-    DepthMode, IndexFormat, PrimitiveTopology, ProvokingVertex, StencilOp, VertexAttributeType,
-    WindowOriginMode,
+    DepthMode, IndexFormat, PrimitiveTopology, ProvokingVertex, RtLayerControl, StencilOp,
+    VertexAttributeType, WindowOriginMode,
 };
 use lichii_gpu::engines::maxwell_3d::regs::{MESH_CONTROL, MESH_SHADER_A};
 use lichii_shader::backend::Bindings;
@@ -41,6 +41,7 @@ use super::VulkanRasterizer;
 use super::samples::SampleCounter;
 use crate::buffer_cache::{BufferBinding, IndexBinding, assembled_topology, vertex_stream_range};
 use crate::commands::ImageAccess;
+use crate::debug::{Program, Programs};
 use crate::descriptors::DescriptorAllocator;
 use crate::device::Device;
 use crate::error::Result;
@@ -56,7 +57,9 @@ use crate::pipeline::{
     AttachmentState, ComputePipelineKey, FixedStateTracker, FxBuildHasher, GraphicsPipelineKey,
     GraphicsShaders, PipelineCache, PipelineFeatures,
 };
+use crate::scheduler::RenderingKey;
 use crate::texture_cache::{DEPTH_ATTACHMENT, ImageId, ImageInfo, Transfer, ViewInfo};
+use dynamic::{DynamicShadow, Slot};
 
 const NULL_BUFFER_SIZE: u64 = 64 << 10;
 /// The constant buffer slot NVN2 graphics programs read root table 0 from (their slot 24).
@@ -70,6 +73,28 @@ const SHADER_SAMPLED: ImageAccess = ImageAccess {
     layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
     stage: vk::PipelineStageFlags2::ALL_COMMANDS,
     access: vk::AccessFlags2::SHADER_SAMPLED_READ,
+};
+
+/// A colour target the same draw samples, in the one layout both uses allow.
+const FEEDBACK_COLOR: ImageAccess = ImageAccess {
+    layout: vk::ImageLayout::GENERAL,
+    stage: vk::PipelineStageFlags2::ALL_COMMANDS,
+    access: vk::AccessFlags2::from_raw(
+        vk::AccessFlags2::COLOR_ATTACHMENT_READ.as_raw()
+            | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE.as_raw()
+            | vk::AccessFlags2::SHADER_SAMPLED_READ.as_raw(),
+    ),
+};
+
+/// A depth target the same draw samples, in the one layout both uses allow.
+const FEEDBACK_DEPTH: ImageAccess = ImageAccess {
+    layout: vk::ImageLayout::GENERAL,
+    stage: vk::PipelineStageFlags2::ALL_COMMANDS,
+    access: vk::AccessFlags2::from_raw(
+        vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ.as_raw()
+            | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE.as_raw()
+            | vk::AccessFlags2::SHADER_SAMPLED_READ.as_raw(),
+    ),
 };
 
 const SHADER_STORAGE: ImageAccess = ImageAccess {
@@ -155,6 +180,7 @@ struct Target {
     view: vk::ImageView,
     format: vk::Format,
     extent: vk::Extent2D,
+    layers: u32,
 }
 
 /// Draw and dispatch state of the renderer, beside the caches it shares with clears and copies.
@@ -178,6 +204,10 @@ pub(super) struct DrawState {
     stages: GraphicsShaders,
     colors: [Option<Target>; 8],
     depth: Option<Target>,
+    /// The images the last [`PRESENTED`] presents showed. Only a draw into them alone may be
+    /// skipped while its program translates or its pipeline builds: one frame shows it missing.
+    /// A draw into any other target waits, so no later pass reads a target a skip left stale.
+    presented: [Option<ImageId>; PRESENTED],
     textures: Vec<ImageId>,
     texture_scaling: ScalingBits<{ NUM_TEXTURE_SCALING_WORDS as usize }>,
     /// Storage images of the current draw and whether it writes them.
@@ -204,6 +234,9 @@ pub(super) struct DrawState {
     vertex_bindings: Vec<vk::VertexInputBindingDescription2EXT<'static>>,
     vertex_attributes: Vec<vk::VertexInputAttributeDescription2EXT<'static>>,
     attachments: Vec<vk::RenderingAttachmentInfo<'static>>,
+    /// The graphics pipeline the open rendering last bound.
+    bound_pipeline: vk::Pipeline,
+    dynamic: DynamicShadow,
     blend_enables: Vec<vk::Bool32>,
     blend_equations: Vec<vk::ColorBlendEquationEXT>,
     write_masks: Vec<vk::ColorComponentFlags>,
@@ -214,7 +247,41 @@ pub(super) struct DrawState {
     mesh_indirect: Option<mesh_indirect::MeshIndirectPass>,
 }
 
+/// Presents whose images count as the presented frame for [`DrawState::presented_only`].
+const PRESENTED: usize = 3;
+
 impl DrawState {
+    /// Notes that a present showed `image`.
+    pub(super) fn presented(&mut self, image: ImageId) {
+        if !self.presented.contains(&Some(image)) {
+            self.presented.rotate_right(1);
+            self.presented[0] = Some(image);
+        }
+    }
+
+    /// Whether the draw's bound colour targets are all images a recent present showed, so
+    /// skipping it only leaves a gap in one shown frame.
+    fn presented_only(&self) -> bool {
+        let mut colors = self.colors.iter().flatten().peekable();
+        colors.peek().is_some() && colors.all(|t| self.presented.contains(&Some(t.id)))
+    }
+
+    /// The layers a rendering into the draw's targets spans: the fewest any target has.
+    fn layers(&self) -> u32 {
+        self.colors
+            .iter()
+            .flatten()
+            .chain(&self.depth)
+            .map(|t| t.layers)
+            .min()
+            .unwrap_or(1)
+    }
+
+    /// Whether `id` is one of the draw's colour or depth targets.
+    fn is_target(&self, id: ImageId) -> bool {
+        self.colors.iter().flatten().any(|t| t.id == id) || self.depth.is_some_and(|d| d.id == id)
+    }
+
     pub(super) fn new(
         device: &Arc<Device>,
         pipelines: PipelineCache,
@@ -267,6 +334,7 @@ impl DrawState {
             stages: GraphicsShaders::default(),
             colors: [None; 8],
             depth: None,
+            presented: [None; PRESENTED],
             textures: Vec::new(),
             texture_scaling: ScalingBits::default(),
             storage_images: Vec::new(),
@@ -286,6 +354,8 @@ impl DrawState {
             vertex_bindings: Vec::new(),
             vertex_attributes: Vec::new(),
             attachments: Vec::new(),
+            bound_pipeline: vk::Pipeline::null(),
+            dynamic: DynamicShadow::default(),
             blend_enables: Vec::new(),
             blend_equations: Vec::new(),
             write_masks: Vec::new(),
@@ -449,6 +519,8 @@ struct StageState {
     color_outputs: [AttributeType; 8],
     noperspective_outputs: u32,
     scaled_noperspective_inputs: bool,
+    /// The previous stage is a task program, so this mesh program reads its payload.
+    task_stage: bool,
 }
 
 impl StageState {
@@ -474,6 +546,7 @@ impl StageState {
             color_outputs: [AttributeType::Float; 8],
             noperspective_outputs: 0,
             scaled_noperspective_inputs: false,
+            task_stage: previous.is_some_and(|m| m.stage == ShaderStage::Task),
         };
         if slot == 1 {
             state.generic_inputs = std::array::from_fn(|i| attribute_type(regs, i));
@@ -519,6 +592,7 @@ impl StageState {
             color_output_types: self.color_outputs,
             noperspective_outputs: self.noperspective_outputs,
             scaled_noperspective_inputs: self.scaled_noperspective_inputs,
+            task_stage: self.task_stage,
             ..RuntimeInfo::default()
         };
         if let Some((func, reference)) = self.alpha_test {
@@ -631,7 +705,11 @@ impl VulkanRasterizer {
             false => mvk::primitive_topology(assembled_topology(call.topology()))
                 .unwrap_or(vk::PrimitiveTopology::TRIANGLE_LIST),
         };
-        if !self.graphics_stages(ctx, host_topology) {
+        if !self.render_targets(ctx)? {
+            return Ok(());
+        }
+        let may_skip = self.draw.presented_only();
+        if !self.graphics_stages(ctx, host_topology, may_skip) {
             self.diag_skip(ctx, "shader");
             return Ok(());
         }
@@ -649,9 +727,6 @@ impl VulkanRasterizer {
             {
                 return Ok(());
             }
-        }
-        if !self.render_targets(ctx)? {
-            return Ok(());
         }
         if diag::cb_nan() {
             self.diag_cb_nan(ctx);
@@ -682,7 +757,11 @@ impl VulkanRasterizer {
             samples,
         );
         let key = GraphicsPipelineKey::new(&draw.stages, attachments, &fixed);
-        let Some(pipeline) = draw.pipelines.graphics(&key, &draw.stages) else {
+        let pipeline = match may_skip {
+            true => draw.pipelines.graphics(&key, &draw.stages),
+            false => draw.pipelines.graphics_waiting(&key, &draw.stages),
+        };
+        let Some(pipeline) = pipeline else {
             diag::with(|d| d.finish("no-pipeline"));
             self.diag_skip(ctx, "pipeline");
             return Ok(());
@@ -816,39 +895,38 @@ impl VulkanRasterizer {
             .as_ref()
             .is_some_and(|m| m.stage == ShaderStage::Task);
         let mesh_limit = self.device.properties.mesh_group_limit[usize::from(task)];
-        let cmd = self.scheduler.record()?;
         let (index, indirect) = match (call, indirect) {
             (DrawCall::Indirect(draw), Some(inputs)) if mesh => {
+                let cmd = self.scheduler.record()?;
                 let commands = self.rewrite_mesh_indirect(cmd, draw, &inputs, mesh_limit)?;
                 (None, Some(commands))
             }
             (DrawCall::Indirect(draw), Some(inputs))
                 if assembled_topology(draw.topology) != draw.topology =>
             {
+                let cmd = self.scheduler.record()?;
                 let (index, commands) = self.assemble_indirect(cmd, regs, draw, &inputs)?;
                 (Some(index), Some(commands))
             }
             (_, indirect) => (index, indirect),
         };
-        let draw = &mut self.draw;
-        for target in draw.colors.iter().flatten() {
+        for &id in &self.draw.textures {
+            if !self.draw.is_target(id) {
+                self.texture_cache
+                    .prepare(&mut self.scheduler, id, SHADER_SAMPLED)?;
+            }
+        }
+        for &(id, _) in &self.draw.storage_images {
             self.texture_cache
-                .prepare(cmd, target.id, ImageAccess::COLOR_ATTACHMENT);
-        }
-        if let Some(depth) = draw.depth {
-            self.texture_cache.prepare(cmd, depth.id, DEPTH_ATTACHMENT);
-        }
-        for &id in &draw.textures {
-            self.texture_cache.prepare(cmd, id, SHADER_SAMPLED);
-        }
-        for &(id, _) in &draw.storage_images {
-            self.texture_cache.prepare(cmd, id, SHADER_STORAGE);
+                .prepare(&mut self.scheduler, id, SHADER_STORAGE)?;
         }
         let scale = self.target_scale();
         let query = match regs.zpass_pixel_count_enable {
             0 => None,
             _ => {
-                let slot = self.samples.reserve(&self.device, cmd, scale);
+                let slot = self
+                    .samples
+                    .reserve(&self.device, &mut self.scheduler, scale)?;
                 match slot {
                     None => self.draw.warn_once(
                         Warning::SampleQueries,
@@ -864,6 +942,36 @@ impl VulkanRasterizer {
             }
         };
         let extent = self.render_area(regs);
+        let key = RenderingKey {
+            colors: self
+                .draw
+                .colors
+                .map(|t| t.map_or(vk::ImageView::null(), |t| t.view)),
+            depth: self.draw.depth.map_or(vk::ImageView::null(), |d| d.view),
+            extent,
+        };
+        let draw = &self.draw;
+        let colors = draw.colors.map(|t| {
+            t.map(|t| match draw.textures.contains(&t.id) {
+                true => (t.id, FEEDBACK_COLOR),
+                false => (t.id, ImageAccess::COLOR_ATTACHMENT),
+            })
+        });
+        let depth = draw.depth.map(|d| match draw.textures.contains(&d.id) {
+            true => (d.id, FEEDBACK_DEPTH),
+            false => (d.id, DEPTH_ATTACHMENT),
+        });
+        let continues = self.scheduler.rendering() == Some(key)
+            && colors.iter().flatten().chain(&depth).all(|&(id, access)| {
+                ![FEEDBACK_COLOR, FEEDBACK_DEPTH].contains(&access)
+                    && self.texture_cache.is_in(id, access)
+            });
+        if !continues {
+            for &(id, access) in colors.iter().flatten().chain(&depth) {
+                self.texture_cache
+                    .prepare(&mut self.scheduler, id, access)?;
+            }
+        }
         let raw = &self.device.raw;
         let draw = &mut self.draw;
         draw.attachments.clear();
@@ -872,19 +980,21 @@ impl VulkanRasterizer {
             .iter()
             .rposition(Option::is_some)
             .map_or(0, |i| i + 1);
-        for target in &draw.colors[..last] {
+        for (target, access) in draw.colors[..last].iter().zip(colors) {
+            let layout =
+                access.map_or(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, |(_, a)| a.layout);
             draw.attachments.push(
                 vk::RenderingAttachmentInfo::default()
                     .image_view(target.map_or(vk::ImageView::null(), |t| t.view))
-                    .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .image_layout(layout)
                     .load_op(vk::AttachmentLoadOp::LOAD)
                     .store_op(vk::AttachmentStoreOp::STORE),
             );
         }
-        let depth_attachment = draw.depth.map(|depth| {
+        let depth_attachment = draw.depth.zip(depth).map(|(target, (_, access))| {
             vk::RenderingAttachmentInfo::default()
-                .image_view(depth.view)
-                .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                .image_view(target.view)
+                .image_layout(access.layout)
                 .load_op(vk::AttachmentLoadOp::LOAD)
                 .store_op(vk::AttachmentStoreOp::STORE)
         });
@@ -894,7 +1004,7 @@ impl VulkanRasterizer {
                 offset: vk::Offset2D::default(),
                 extent,
             })
-            .layer_count(1)
+            .layer_count(draw.layers())
             .color_attachments(&draw.attachments);
         let has_depth = !matches!(depth_format, vk::Format::UNDEFINED | vk::Format::S8_UINT);
         let has_stencil = matches!(
@@ -910,15 +1020,29 @@ impl VulkanRasterizer {
         if let Some(stencil) = depth_attachment.as_ref().filter(|_| has_stencil) {
             rendering = rendering.stencil_attachment(stencil);
         }
-        // SAFETY: `cmd` is recording outside any rendering; every view, buffer and descriptor
-        // set is live until the scheduler's current tick completes, and the pipeline was built
-        // for these attachment formats.
+        let (cmd, began) = self.scheduler.record_rendering(key, &rendering)?;
+        self.buffer_cache.commit_writes(self.scheduler.tick());
+        self.device.begin_label(
+            cmd,
+            format_args!(
+                "draw {} -> {}x{}",
+                Programs(&draw.stages),
+                extent.width,
+                extent.height
+            ),
+        );
+        // SAFETY: `cmd` is recording inside the rendering of this draw's attachments; every
+        // view, buffer and descriptor set is live until the scheduler's current tick completes,
+        // and the pipeline was built for these attachment formats.
         unsafe {
-            raw.cmd_begin_rendering(cmd, &rendering);
             if let Some(slot) = query {
                 self.samples.begin(&self.device, cmd, slot);
             }
-            raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline_raw);
+            draw.dynamic.begin(began, mesh);
+            if began || draw.bound_pipeline != pipeline_raw {
+                raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline_raw);
+                draw.bound_pipeline = pipeline_raw;
+            }
             if let Some(set) = set {
                 raw.cmd_bind_descriptor_sets(
                     cmd,
@@ -1043,8 +1167,8 @@ impl VulkanRasterizer {
             if let Some(slot) = query {
                 self.samples.end(&self.device, cmd, slot);
             }
-            raw.cmd_end_rendering(cmd);
         }
+        self.device.end_label(cmd);
         let written: [Option<ImageId>; 9] = std::array::from_fn(|i| match i {
             8 => draw.depth.map(|t| t.id),
             i => draw.colors[i].map(|t| t.id),
@@ -1067,6 +1191,7 @@ impl VulkanRasterizer {
         &mut self,
         ctx: &GraphicsContext<'_>,
         topology: vk::PrimitiveTopology,
+        may_skip: bool,
     ) -> bool {
         let regs = ctx.regs;
         let mesh = is_mesh_draw(regs, self.draw.arch);
@@ -1140,6 +1265,7 @@ impl VulkanRasterizer {
                 state.key(),
                 || state.runtime(previous.as_deref().map(|m| &m.info)),
                 &mut bindings,
+                may_skip,
             );
             let Some(module) = module else {
                 return false;
@@ -1160,6 +1286,8 @@ impl VulkanRasterizer {
         self.draw.colors = [None; 8];
         self.draw.depth = None;
         let count = (regs.rt_control.count() as usize).min(8);
+        let layered = regs.rt_layer.control() == RtLayerControl::GEOMETRY_SHADER_SELECTS_LAYER.0;
+        let layers = |info: ImageInfo| if layered { info } else { info.with_layers(1) };
         let mut tx = Transfer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
@@ -1168,10 +1296,9 @@ impl VulkanRasterizer {
         };
         for i in 0..count {
             let rt = &regs.rt[render_target_index(regs, i)];
-            let Some(info) = ImageInfo::from_render_target(rt, msaa, gob) else {
+            let Some(info) = ImageInfo::from_render_target(rt, msaa, gob).map(layers) else {
                 continue;
             };
-            let info = info.with_layers(1);
             let Some(found) = self.texture_cache.render_target(
                 &mut tx,
                 ctx.memory,
@@ -1185,8 +1312,8 @@ impl VulkanRasterizer {
             self.draw.colors[i] = Self::target_view(&mut self.texture_cache, found, &info)?;
         }
         if regs.zeta_enable != 0
-            && let Some(info) = ImageInfo::from_zeta(&regs.zeta, &regs.zeta_size, msaa, gob)
-                .map(|info| info.with_layers(1))
+            && let Some(info) =
+                ImageInfo::from_zeta(&regs.zeta, &regs.zeta_size, msaa, gob).map(layers)
             && let Some(found) = self.texture_cache.render_target(
                 &mut tx,
                 ctx.memory,
@@ -1212,8 +1339,11 @@ impl VulkanRasterizer {
         view.base_level += found.level;
         view.levels = 1;
         view.base_layer += found.layer;
-        view.layers = 1;
-        view.view_type = vk::ImageViewType::TYPE_2D;
+        view.layers = info.layers;
+        view.view_type = match info.layers {
+            1 => vk::ImageViewType::TYPE_2D,
+            _ => vk::ImageViewType::TYPE_2D_ARRAY,
+        };
         let Some(raw) = cache.view(found.id, &view)? else {
             return Ok(None);
         };
@@ -1226,6 +1356,7 @@ impl VulkanRasterizer {
             view: raw,
             format: state.format,
             extent,
+            layers: info.layers,
         }))
     }
 
@@ -1375,7 +1506,12 @@ impl VulkanRasterizer {
                             let (view, layout) = match texture {
                                 Some((id, view)) => {
                                     self.draw.textures.push(id);
-                                    (view, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                                    let feedback = module.stage != ShaderStage::Compute
+                                        && self.draw.is_target(id);
+                                    match feedback {
+                                        true => (view, vk::ImageLayout::GENERAL),
+                                        false => (view, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                                    }
                                 }
                                 None => {
                                     let format = match (desc.is_depth, desc.is_integer) {
@@ -2118,33 +2254,57 @@ impl VulkanRasterizer {
             regs.depth_bounds[0].clamp(0.0, 1.0),
             regs.depth_bounds[1].clamp(0.0, 1.0),
         );
+        let shadow = &mut draw.dynamic;
         // SAFETY: `cmd` is recording inside a dynamic rendering with a pipeline that declares
         // these dynamic states; extension commands run only when their feature is on.
         unsafe {
-            raw.cmd_set_line_width(cmd, line_width);
-            raw.cmd_set_depth_bias(
-                cmd,
+            shadow.set(Slot::LineWidth, line_width, || {
+                raw.cmd_set_line_width(cmd, line_width)
+            });
+            let bias = (
                 regs.depth_bias,
                 regs.depth_bias_clamp,
                 regs.slope_scale_depth_bias,
             );
-            raw.cmd_set_blend_constants(cmd, &[color.r, color.g, color.b, color.a]);
-            raw.cmd_set_depth_bounds(cmd, min_bound, max_bound.max(min_bound));
-            raw.cmd_set_stencil_compare_mask(cmd, F::FRONT, regs.stencil_front_func_mask);
-            raw.cmd_set_stencil_compare_mask(cmd, F::BACK, back_func);
-            raw.cmd_set_stencil_write_mask(cmd, F::FRONT, regs.stencil_front_mask);
-            raw.cmd_set_stencil_write_mask(cmd, F::BACK, back_write);
-            raw.cmd_set_stencil_reference(cmd, F::FRONT, regs.stencil_front_ref);
-            raw.cmd_set_stencil_reference(cmd, F::BACK, back_ref);
+            shadow.set(Slot::DepthBias, bias, || {
+                raw.cmd_set_depth_bias(cmd, bias.0, bias.1, bias.2)
+            });
+            let constants = [color.r, color.g, color.b, color.a];
+            shadow.set(Slot::BlendConstants, constants, || {
+                raw.cmd_set_blend_constants(cmd, &constants)
+            });
+            let bounds = (min_bound, max_bound.max(min_bound));
+            shadow.set(Slot::DepthBounds, bounds, || {
+                raw.cmd_set_depth_bounds(cmd, bounds.0, bounds.1)
+            });
+            let compare = (regs.stencil_front_func_mask, back_func);
+            shadow.set(Slot::StencilCompareMask, compare, || {
+                raw.cmd_set_stencil_compare_mask(cmd, F::FRONT, compare.0);
+                raw.cmd_set_stencil_compare_mask(cmd, F::BACK, compare.1);
+            });
+            let write = (regs.stencil_front_mask, back_write);
+            shadow.set(Slot::StencilWriteMask, write, || {
+                raw.cmd_set_stencil_write_mask(cmd, F::FRONT, write.0);
+                raw.cmd_set_stencil_write_mask(cmd, F::BACK, write.1);
+            });
+            let reference = (regs.stencil_front_ref, back_ref);
+            shadow.set(Slot::StencilReference, reference, || {
+                raw.cmd_set_stencil_reference(cmd, F::FRONT, reference.0);
+                raw.cmd_set_stencil_reference(cmd, F::BACK, reference.1);
+            });
             if features.extended_dynamic_state {
-                raw.cmd_set_viewport_with_count(cmd, &[viewport]);
-                raw.cmd_set_scissor_with_count(cmd, &[scissor]);
+                shadow.set(Slot::Viewport, viewport, || {
+                    raw.cmd_set_viewport_with_count(cmd, &[viewport])
+                });
+                shadow.set(Slot::Scissor, scissor, || {
+                    raw.cmd_set_scissor_with_count(cmd, &[scissor])
+                });
                 let cull = if regs.gl_cull_test_enabled != 0 {
                     mvk::cull_mode(regs.gl_cull_face).unwrap_or(vk::CullModeFlags::BACK)
                 } else {
                     vk::CullModeFlags::NONE
                 };
-                raw.cmd_set_cull_mode(cmd, cull);
+                shadow.set(Slot::CullMode, cull, || raw.cmd_set_cull_mode(cmd, cull));
                 let mut face =
                     mvk::front_face(regs.gl_front_face).unwrap_or(vk::FrontFace::COUNTER_CLOCKWISE);
                 if regs.window_origin.flip_y() != 0 {
@@ -2154,21 +2314,33 @@ impl VulkanRasterizer {
                         vk::FrontFace::CLOCKWISE
                     };
                 }
-                raw.cmd_set_front_face(cmd, face);
+                shadow.set(Slot::FrontFace, face, || raw.cmd_set_front_face(cmd, face));
                 if !mesh {
-                    raw.cmd_set_primitive_topology(cmd, topology);
+                    shadow.set(Slot::PrimitiveTopology, topology, || {
+                        raw.cmd_set_primitive_topology(cmd, topology)
+                    });
                 }
-                raw.cmd_set_depth_test_enable(cmd, regs.depth_test_enable != 0);
-                raw.cmd_set_depth_write_enable(cmd, regs.depth_write_enabled != 0);
-                raw.cmd_set_depth_compare_op(
-                    cmd,
-                    mvk::comparison_op(regs.depth_test_func).unwrap_or(vk::CompareOp::ALWAYS),
-                );
-                raw.cmd_set_depth_bounds_test_enable(
-                    cmd,
-                    features.depth_bounds && regs.depth_bounds_enable != 0,
-                );
-                raw.cmd_set_stencil_test_enable(cmd, regs.stencil_enable != 0);
+                let depth_test = regs.depth_test_enable != 0;
+                shadow.set(Slot::DepthTestEnable, depth_test, || {
+                    raw.cmd_set_depth_test_enable(cmd, depth_test)
+                });
+                let depth_write = regs.depth_write_enabled != 0;
+                shadow.set(Slot::DepthWriteEnable, depth_write, || {
+                    raw.cmd_set_depth_write_enable(cmd, depth_write)
+                });
+                let depth_op =
+                    mvk::comparison_op(regs.depth_test_func).unwrap_or(vk::CompareOp::ALWAYS);
+                shadow.set(Slot::DepthCompareOp, depth_op, || {
+                    raw.cmd_set_depth_compare_op(cmd, depth_op)
+                });
+                let bounds_test = features.depth_bounds && regs.depth_bounds_enable != 0;
+                shadow.set(Slot::DepthBoundsTestEnable, bounds_test, || {
+                    raw.cmd_set_depth_bounds_test_enable(cmd, bounds_test)
+                });
+                let stencil_test = regs.stencil_enable != 0;
+                shadow.set(Slot::StencilTestEnable, stencil_test, || {
+                    raw.cmd_set_stencil_test_enable(cmd, stencil_test)
+                });
                 let op = |o: &StencilOp| {
                     let s = |op| mvk::stencil_op(op).unwrap_or(vk::StencilOp::KEEP);
                     (
@@ -2184,15 +2356,24 @@ impl VulkanRasterizer {
                 } else {
                     front
                 };
-                raw.cmd_set_stencil_op(cmd, F::FRONT, front.0, front.1, front.2, front.3);
-                raw.cmd_set_stencil_op(cmd, F::BACK, back.0, back.1, back.2, back.3);
+                shadow.set(Slot::StencilOp, (front, back), || {
+                    raw.cmd_set_stencil_op(cmd, F::FRONT, front.0, front.1, front.2, front.3);
+                    raw.cmd_set_stencil_op(cmd, F::BACK, back.0, back.1, back.2, back.3);
+                });
             } else {
-                raw.cmd_set_viewport(cmd, 0, &[viewport]);
-                raw.cmd_set_scissor(cmd, 0, &[scissor]);
+                shadow.set(Slot::Viewport, viewport, || {
+                    raw.cmd_set_viewport(cmd, 0, &[viewport])
+                });
+                shadow.set(Slot::Scissor, scissor, || {
+                    raw.cmd_set_scissor(cmd, 0, &[scissor])
+                });
             }
             if features.extended_dynamic_state2 {
                 use vk::PrimitiveTopology as T;
-                raw.cmd_set_rasterizer_discard_enable(cmd, regs.rasterize_enable == 0);
+                let discard = regs.rasterize_enable == 0;
+                shadow.set(Slot::RasterizerDiscardEnable, discard, || {
+                    raw.cmd_set_rasterizer_discard_enable(cmd, discard)
+                });
                 let offset = match topology {
                     T::POINT_LIST => regs.polygon_offset_point_enable,
                     T::LINE_LIST
@@ -2200,8 +2381,10 @@ impl VulkanRasterizer {
                     | T::LINE_LIST_WITH_ADJACENCY
                     | T::LINE_STRIP_WITH_ADJACENCY => regs.polygon_offset_line_enable,
                     _ => regs.polygon_offset_fill_enable,
-                };
-                raw.cmd_set_depth_bias_enable(cmd, offset != 0);
+                } != 0;
+                shadow.set(Slot::DepthBiasEnable, offset, || {
+                    raw.cmd_set_depth_bias_enable(cmd, offset)
+                });
                 if !mesh {
                     let restartable = matches!(
                         topology,
@@ -2211,25 +2394,37 @@ impl VulkanRasterizer {
                             | T::LINE_STRIP_WITH_ADJACENCY
                             | T::TRIANGLE_STRIP_WITH_ADJACENCY
                     );
-                    raw.cmd_set_primitive_restart_enable(
-                        cmd,
-                        restartable && regs.primitive_restart.enabled != 0,
-                    );
+                    let restart = restartable && regs.primitive_restart.enabled != 0;
+                    shadow.set(Slot::PrimitiveRestartEnable, restart, || {
+                        raw.cmd_set_primitive_restart_enable(cmd, restart)
+                    });
                 }
             }
             if !draw.vertex_buffers.is_empty() {
-                if features.extended_dynamic_state && !features.dynamic_vertex_input {
-                    raw.cmd_bind_vertex_buffers2(
-                        cmd,
-                        0,
-                        &draw.vertex_buffers,
-                        &draw.vertex_offsets,
-                        None,
-                        Some(&draw.vertex_strides),
-                    );
-                } else {
-                    raw.cmd_bind_vertex_buffers(cmd, 0, &draw.vertex_buffers, &draw.vertex_offsets);
-                }
+                let buffers = (
+                    draw.vertex_buffers.as_slice(),
+                    draw.vertex_offsets.as_slice(),
+                    draw.vertex_strides.as_slice(),
+                );
+                shadow.set(Slot::VertexBuffers, buffers, || {
+                    if features.extended_dynamic_state && !features.dynamic_vertex_input {
+                        raw.cmd_bind_vertex_buffers2(
+                            cmd,
+                            0,
+                            &draw.vertex_buffers,
+                            &draw.vertex_offsets,
+                            None,
+                            Some(&draw.vertex_strides),
+                        );
+                    } else {
+                        raw.cmd_bind_vertex_buffers(
+                            cmd,
+                            0,
+                            &draw.vertex_buffers,
+                            &draw.vertex_offsets,
+                        );
+                    }
+                });
             }
             if features.dynamic_vertex_input && !mesh {
                 draw.vertex_bindings.clear();
@@ -2263,11 +2458,17 @@ impl VulkanRasterizer {
                             .divisor(1),
                     );
                 }
-                draw.vertex_input.cmd_set_vertex_input(
-                    cmd,
-                    &draw.vertex_bindings,
-                    &draw.vertex_attributes,
+                let input = (
+                    draw.vertex_bindings.as_slice(),
+                    draw.vertex_attributes.as_slice(),
                 );
+                shadow.set(Slot::VertexInput, input, || {
+                    draw.vertex_input.cmd_set_vertex_input(
+                        cmd,
+                        &draw.vertex_bindings,
+                        &draw.vertex_attributes,
+                    )
+                });
             }
             let attachments = draw.attachments.len() as u32;
             if features.dynamic_blend && attachments > 0 {
@@ -2330,12 +2531,26 @@ impl VulkanRasterizer {
                         alpha_blend_op: op(alpha_op),
                     });
                 }
-                draw.eds3
-                    .cmd_set_color_blend_enable(cmd, 0, &draw.blend_enables);
-                draw.eds3
-                    .cmd_set_color_blend_equation(cmd, 0, &draw.blend_equations);
-                draw.eds3
-                    .cmd_set_color_write_mask(cmd, 0, &draw.write_masks);
+                shadow.set(
+                    Slot::ColorBlendEnable,
+                    draw.blend_enables.as_slice(),
+                    || {
+                        draw.eds3
+                            .cmd_set_color_blend_enable(cmd, 0, &draw.blend_enables)
+                    },
+                );
+                shadow.set(
+                    Slot::ColorBlendEquation,
+                    draw.blend_equations.as_slice(),
+                    || {
+                        draw.eds3
+                            .cmd_set_color_blend_equation(cmd, 0, &draw.blend_equations)
+                    },
+                );
+                shadow.set(Slot::ColorWriteMask, draw.write_masks.as_slice(), || {
+                    draw.eds3
+                        .cmd_set_color_write_mask(cmd, 0, &draw.write_masks)
+                });
             }
             let alpha = regs.anti_alias_alpha_control;
             if features.dynamic_depth_clamp {
@@ -2344,24 +2559,28 @@ impl VulkanRasterizer {
                     regs.viewport_clip_control.geometry_clip(),
                     G::PASSTHROUGH | G::FRUSTUM_XYZ | G::FRUSTUM_Z
                 );
-                draw.eds3
-                    .cmd_set_depth_clamp_enable(cmd, features.depth_clamp && clamps);
+                let clamp = features.depth_clamp && clamps;
+                shadow.set(Slot::DepthClampEnable, clamp, || {
+                    draw.eds3.cmd_set_depth_clamp_enable(cmd, clamp)
+                });
             }
             if features.dynamic_logic_op_enable {
-                draw.eds3
-                    .cmd_set_logic_op_enable(cmd, features.logic_op && regs.logic_op.enable != 0);
+                let logic = features.logic_op && regs.logic_op.enable != 0;
+                shadow.set(Slot::LogicOpEnable, logic, || {
+                    draw.eds3.cmd_set_logic_op_enable(cmd, logic)
+                });
             }
             if features.dynamic_alpha_to_coverage {
-                draw.eds3.cmd_set_alpha_to_coverage_enable(
-                    cmd,
-                    alpha.alpha_to_coverage() != 0 && !diag::no_a2c(),
-                );
+                let coverage = alpha.alpha_to_coverage() != 0 && !diag::no_a2c();
+                shadow.set(Slot::AlphaToCoverageEnable, coverage, || {
+                    draw.eds3.cmd_set_alpha_to_coverage_enable(cmd, coverage)
+                });
             }
             if features.dynamic_alpha_to_one {
-                draw.eds3.cmd_set_alpha_to_one_enable(
-                    cmd,
-                    features.alpha_to_one && alpha.alpha_to_one() != 0,
-                );
+                let one = features.alpha_to_one && alpha.alpha_to_one() != 0;
+                shadow.set(Slot::AlphaToOneEnable, one, || {
+                    draw.eds3.cmd_set_alpha_to_one_enable(cmd, one)
+                });
             }
             if features.dynamic_polygon_mode {
                 let mode = if features.fill_mode_non_solid {
@@ -2369,25 +2588,28 @@ impl VulkanRasterizer {
                 } else {
                     vk::PolygonMode::FILL
                 };
-                draw.eds3.cmd_set_polygon_mode(cmd, mode);
+                shadow.set(Slot::PolygonMode, mode, || {
+                    draw.eds3.cmd_set_polygon_mode(cmd, mode)
+                });
             }
             if features.dynamic_depth_clip_negative_one_to_one {
-                draw.eds3.cmd_set_depth_clip_negative_one_to_one(
-                    cmd,
-                    regs.depth_mode == DepthMode::MINUS_ONE_TO_ONE,
-                );
+                let negative = regs.depth_mode == DepthMode::MINUS_ONE_TO_ONE;
+                shadow.set(Slot::DepthClipNegativeOneToOne, negative, || {
+                    draw.eds3
+                        .cmd_set_depth_clip_negative_one_to_one(cmd, negative)
+                });
             }
             if features.dynamic_provoking_vertex {
-                draw.eds3.cmd_set_provoking_vertex_mode(
-                    cmd,
-                    if regs.provoking_vertex == ProvokingVertex::LAST
-                        && features.provoking_vertex_last
-                    {
-                        vk::ProvokingVertexModeEXT::LAST_VERTEX
-                    } else {
-                        vk::ProvokingVertexModeEXT::FIRST_VERTEX
-                    },
-                );
+                let provoking = if regs.provoking_vertex == ProvokingVertex::LAST
+                    && features.provoking_vertex_last
+                {
+                    vk::ProvokingVertexModeEXT::LAST_VERTEX
+                } else {
+                    vk::ProvokingVertexModeEXT::FIRST_VERTEX
+                };
+                shadow.set(Slot::ProvokingVertexMode, provoking, || {
+                    draw.eds3.cmd_set_provoking_vertex_mode(cmd, provoking)
+                });
             }
         }
     }
@@ -2398,7 +2620,7 @@ impl VulkanRasterizer {
         let Some(module) =
             self.draw
                 .shaders
-                .module(None, &env, 0, RuntimeInfo::default, &mut bindings)
+                .module(None, &env, 0, RuntimeInfo::default, &mut bindings, true)
         else {
             return Ok(());
         };
@@ -2496,6 +2718,7 @@ impl VulkanRasterizer {
         };
         let set = self.descriptor_set(set_layout)?;
         let cmd = self.scheduler.record()?;
+        self.buffer_cache.commit_writes(self.scheduler.tick());
         let align = self.buffer_cache.storage_alignment();
         let grid = match grid {
             Some((binding, grid)) => Some(self.unpack_grid(
@@ -2507,10 +2730,12 @@ impl VulkanRasterizer {
             None => None,
         };
         for &id in &self.draw.textures {
-            self.texture_cache.prepare(cmd, id, SHADER_SAMPLED);
+            self.texture_cache
+                .prepare(&mut self.scheduler, id, SHADER_SAMPLED)?;
         }
         for &(id, _) in &self.draw.storage_images {
-            self.texture_cache.prepare(cmd, id, SHADER_STORAGE);
+            self.texture_cache
+                .prepare(&mut self.scheduler, id, SHADER_STORAGE)?;
         }
         let raw = &self.device.raw;
         let [x, y, z] = ctx.grid;
@@ -2535,6 +2760,15 @@ impl VulkanRasterizer {
             .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
             .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
             .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE);
+        match grid {
+            Some(_) => self
+                .device
+                .begin_label(cmd, format_args!("dispatch indirect {}", Program(&module))),
+            None => self.device.begin_label(
+                cmd,
+                format_args!("dispatch {x}x{y}x{z} {}", Program(&module)),
+            ),
+        }
         let raw = &self.device.raw;
         // SAFETY: as above.
         unsafe {
@@ -2542,6 +2776,7 @@ impl VulkanRasterizer {
                 Some(command) => raw.cmd_dispatch_indirect(cmd, command, 0),
                 None => raw.cmd_dispatch(cmd, x, y, z),
             }
+            self.device.end_label(cmd);
             raw.cmd_pipeline_barrier2(
                 cmd,
                 &vk::DependencyInfo::default().memory_barriers(&[barrier]),
@@ -2697,6 +2932,7 @@ fn storage_pointer(
 mod assembly;
 pub(super) mod diag;
 mod dispatch_grid;
+mod dynamic;
 mod frame_decode;
 mod mesh_indirect;
 mod null;

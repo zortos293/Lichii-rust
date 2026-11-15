@@ -81,6 +81,8 @@ fn main() -> ExitCode {
     for warning in warnings {
         tracing::warn!("{}: {warning}", settings_path.display());
     }
+    // SAFETY: no other thread has started and no Vulkan instance exists yet.
+    unsafe { lichii_vulkan::debug::init(&settings.debug, &paths.data_dir.join("gpucrash")) };
 
     let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
         Ok(event_loop) => event_loop,

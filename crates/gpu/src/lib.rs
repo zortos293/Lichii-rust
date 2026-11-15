@@ -11,6 +11,7 @@ pub mod backend;
 mod bits;
 pub mod channel;
 pub mod clock;
+mod cpu_reads;
 pub mod device_memory;
 mod dma_pusher;
 pub mod engines;
