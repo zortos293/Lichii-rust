@@ -1496,6 +1496,35 @@ fn a_geometry_program_selects_the_layer_of_an_array_target_it_draws() {
     f.assert_no_validation_errors();
 }
 
+/// Without geometry layer selection the layer register picks the one layer of an array target
+/// a draw renders.
+#[test]
+fn the_layer_register_selects_the_layer_of_an_array_target_a_draw_renders() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    let mut regs = draw_regs();
+    regs.rt[0].bits = RenderTargetConfigBits(2);
+    regs.rt[0].array_pitch = SIZE * SIZE;
+    regs.rt_layer = RtLayer(1);
+    draw(&mut f, &gmmu, &regs);
+    let [first, second] = target_layers(&mut f);
+    assert!(
+        first.iter().all(|&t| t == [0; 4]),
+        "layer 0 stays untouched"
+    );
+    assert!(
+        second.iter().all(|&t| unorm8_eq(t, ORANGE)),
+        "the selected layer holds the draw"
+    );
+    f.assert_no_validation_errors();
+}
+
 #[test]
 fn layered_draws_bind_every_layer_of_an_array_depth_target() {
     let Some((mut f, gmmu)) = layered_fixture(1) else {

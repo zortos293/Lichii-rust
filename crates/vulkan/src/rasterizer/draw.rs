@@ -186,7 +186,7 @@ impl<const N: usize> ScalingBits<N> {
 struct TargetsKey {
     channel: ChannelId,
     msaa: u32,
-    layered: bool,
+    rt_layer: u32,
     zeta_size: u32,
     memory: u64,
     cache: u64,
@@ -1421,7 +1421,7 @@ impl VulkanRasterizer {
         let key = TargetsKey {
             channel: ctx.channel,
             msaa,
-            layered,
+            rt_layer: regs.rt_layer.0,
             zeta_size: regs.zeta_size.bits.0,
             memory: ctx.memory.generation(),
             cache: self.texture_cache.generation(),
@@ -1438,7 +1438,17 @@ impl VulkanRasterizer {
         self.draw.colors = [None; 8];
         self.draw.depth = None;
         let count = (regs.rt_control.count() as usize).min(8);
-        let layers = |info: ImageInfo| if layered { info } else { info.with_layers(1) };
+        let selected = |address: GpuVAddr, info: ImageInfo| {
+            if layered {
+                return (address, info);
+            }
+            let layer = regs.rt_layer.layer();
+            let address = match layer < info.layers {
+                true => address + u64::from(layer) * info.layer_stride,
+                false => address,
+            };
+            (address, info.with_layers(1))
+        };
         let mut tx = Transfer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
@@ -1447,16 +1457,14 @@ impl VulkanRasterizer {
         };
         for i in 0..count {
             let rt = &regs.rt[render_target_index(regs, i)];
-            let Some(info) = ImageInfo::from_render_target(rt, msaa, gob).map(layers) else {
+            let Some((address, info)) = ImageInfo::from_render_target(rt, msaa, gob)
+                .map(|info| selected(rt.address(), info))
+            else {
                 continue;
             };
-            let Some(found) = self.texture_cache.render_target(
-                &mut tx,
-                ctx.memory,
-                rt.address(),
-                &info,
-                false,
-            )?
+            let Some(found) = self
+                .texture_cache
+                .render_target(&mut tx, ctx.memory, address, &info, false)?
             else {
                 continue;
             };
@@ -1464,15 +1472,12 @@ impl VulkanRasterizer {
                 Self::target_view(&mut self.texture_cache, found, &info, layered)?;
         }
         if regs.zeta_enable != 0
-            && let Some(info) =
-                ImageInfo::from_zeta(&regs.zeta, &regs.zeta_size, msaa, gob).map(layers)
-            && let Some(found) = self.texture_cache.render_target(
-                &mut tx,
-                ctx.memory,
-                regs.zeta.address(),
-                &info,
-                false,
-            )?
+            && let Some((address, info)) =
+                ImageInfo::from_zeta(&regs.zeta, &regs.zeta_size, msaa, gob)
+                    .map(|info| selected(regs.zeta.address(), info))
+            && let Some(found) = self
+                .texture_cache
+                .render_target(&mut tx, ctx.memory, address, &info, false)?
         {
             self.draw.depth = Self::target_view(&mut self.texture_cache, found, &info, layered)?;
         }
