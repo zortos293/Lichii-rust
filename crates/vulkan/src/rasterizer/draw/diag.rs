@@ -608,9 +608,28 @@ pub(crate) fn texel_stats(format: PixelFormat, bytes: &[u8]) -> String {
             }
         }
         let mean = if n == 0 { 0.0 } else { sum / n as f64 };
+        let mut finite: Vec<f32> = lanes
+            .iter()
+            .skip(c)
+            .step_by(channels)
+            .copied()
+            .filter(|v| v.is_finite())
+            .collect();
+        finite.sort_unstable_by(f32::total_cmp);
+        let pct = |p: usize| {
+            finite
+                .get(finite.len().saturating_sub(1) * p / 100)
+                .copied()
+                .unwrap_or(0.0)
+        };
+        let big = finite.iter().filter(|&&v| v >= 1000.0).count();
         let _ = write!(
             out,
-            " c{c}[nan={nan} inf={inf} neg={neg} zero={zero} min={lo:.4e} max={hi:.4e} mean={mean:.4e}]"
+            " c{c}[nan={nan} inf={inf} neg={neg} zero={zero} min={lo:.4e} max={hi:.4e} mean={mean:.4e} p10={:.4e} p50={:.4e} p90={:.4e} p99={:.4e} ge1e3={big}]",
+            pct(10),
+            pct(50),
+            pct(90),
+            pct(99)
         );
     }
     out
@@ -799,8 +818,18 @@ impl VulkanRasterizer {
     /// Logs the scene target's host-side stats each time the bound render targets change after
     /// a pass that drew into it, with the pass's draw count and fragment shaders.
     fn diag_pass_track(&mut self, ctx: &GraphicsContext<'_>) {
-        type Pass = (Vec<u64>, u32, Vec<u64>, Option<ImageId>, u32);
+        struct Pass {
+            key: Vec<u64>,
+            draws: u32,
+            fss: Vec<u64>,
+            colors: Vec<ImageId>,
+            n: u32,
+        }
         static PASS: Mutex<Option<Pass>> = Mutex::new(None);
+        let every = std::env::var("LICHII_DIAG_PASS_EVERY")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
         if std::env::var_os("LICHII_DIAG_PASSES").is_none() {
             return;
         }
@@ -832,34 +861,58 @@ impl VulkanRasterizer {
                     && t.extent.height == 932
             })
             .map(|t| t.id);
+        let colors: Vec<ImageId> = self.draw.colors.iter().flatten().map(|t| t.id).collect();
         let flush = {
             let mut pass = PASS
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match pass.take() {
-                Some((pkey, draws, fss, pscene, n)) if pkey != key => {
-                    *pass = Some((key, 1, vec![fs], None, n + 1));
-                    pscene.or(scene).map(|id| (id, draws, fss, n))
+                Some(p) if p.key != key => {
+                    *pass = Some(Pass {
+                        key,
+                        draws: 1,
+                        fss: vec![fs],
+                        colors,
+                        n: p.n + 1,
+                    });
+                    let label = format!(
+                        "PASS{} END draws={} fs={:?}",
+                        p.n,
+                        p.draws,
+                        p.fss
+                            .iter()
+                            .map(|h| format!("{h:016x}"))
+                            .collect::<Vec<_>>()
+                    );
+                    Some((label, p.colors))
                 }
-                Some((pkey, draws, mut fss, pscene, n)) => {
-                    if !fss.contains(&fs) {
-                        fss.push(fs);
+                Some(mut p) => {
+                    if !p.fss.contains(&fs) {
+                        p.fss.push(fs);
                     }
-                    *pass = Some((pkey, draws + 1, fss, pscene.or(scene), n));
-                    None
+                    let done = p.draws;
+                    p.draws += 1;
+                    let label = format!("PASS{} AT draws={done} next_fs={fs:016x}", p.n);
+                    *pass = Some(p);
+                    (every > 0 && done % every == 0)
+                        .then_some(())
+                        .and(scene)
+                        .map(|id| (label, vec![id]))
                 }
                 None => {
-                    *pass = Some((key, 1, vec![fs], None, 0));
+                    *pass = Some(Pass {
+                        key,
+                        draws: 1,
+                        fss: vec![fs],
+                        colors,
+                        n: 0,
+                    });
                     None
                 }
             }
         };
-        if let Some((id, draws, fss, n)) = flush {
-            let label = format!(
-                "PASS{n} draws={draws} fs={:?}",
-                fss.iter().map(|h| format!("{h:016x}")).collect::<Vec<_>>()
-            );
-            self.diag_host_stats(&label, &[id]);
+        if let Some((label, ids)) = flush {
+            self.diag_host_stats(&label, &ids);
         }
     }
 
