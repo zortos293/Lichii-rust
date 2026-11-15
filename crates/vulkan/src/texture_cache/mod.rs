@@ -433,6 +433,9 @@ impl CachedImage {
     }
 
     fn transition(&mut self, device: &Device, cmd: vk::CommandBuffer, to: ImageAccess) {
+        if self.absorb(to) {
+            return;
+        }
         transition(
             device,
             cmd,
@@ -442,6 +445,17 @@ impl CachedImage {
             to,
         );
         self.access = to;
+    }
+
+    /// Folds a read `to` into the current read access when no barrier must separate them, so
+    /// a later writer's barrier waits for both; `false` when one must.
+    fn absorb(&mut self, to: ImageAccess) -> bool {
+        if self.access.hazards(&to) {
+            return false;
+        }
+        self.access.stage |= to.stage;
+        self.access.access |= to.access;
+        true
     }
 }
 
@@ -1165,22 +1179,35 @@ impl TextureCache {
         Ok(raw)
     }
 
-    /// Records the barrier that makes the image ready for `access` and returns it; `None`, with
-    /// a warning, once the image was removed.
+    /// Records the barrier, if any, that makes the image ready for `access` and returns it;
+    /// `None`, with a warning, once the image was removed. Only a barrier takes the command
+    /// buffer, so a read that needs none leaves an open rendering open.
     pub fn prepare(
         &mut self,
-        cmd: vk::CommandBuffer,
+        scheduler: &mut Scheduler,
         id: ImageId,
         access: ImageAccess,
-    ) -> Option<vk::Image> {
+    ) -> Result<Option<vk::Image>> {
         if self.get(id).is_none() {
             tracing::warn!(
                 ?id,
                 "preparing a removed texture cache image; skipping its barrier"
             );
-            return None;
+            return Ok(None);
         }
-        Some(self.prepare_live(cmd, id, access))
+        self.touch(id);
+        let device = self.device.clone();
+        let image = self.image(id);
+        if !image.absorb(access) {
+            image.transition(&device, scheduler.record()?, access);
+        }
+        Ok(Some(image.image.raw()))
+    }
+
+    /// Whether the image is in exactly `access`, as an attachment of the open rendering that
+    /// nothing else touched since it began.
+    pub fn is_in(&self, id: ImageId, access: ImageAccess) -> bool {
+        self.get(id).is_some_and(|image| image.access == access)
     }
 
     fn prepare_live(

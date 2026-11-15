@@ -10,7 +10,7 @@ use lichii_gpu::backend::{
     ReleaseSize,
 };
 use lichii_gpu::engines::maxwell_3d::regs::{
-    BlendEquation, BlendFactor, ClearSurface, DepthMode, IndexFormat, MAX_CONST_BUFFERS,
+    BlendEquation, BlendFactor, ClearSurface, ColorMask, DepthMode, IndexFormat, MAX_CONST_BUFFERS,
     MAX_SHADER_STAGE, MESH_CONTROL, MESH_INIT_SHADER, MESH_SHADER_A, MESH_SHADER_B, PipelineBits,
     PrimitiveTopology, RenderTargetConfigBits, RtControl, ScissorTestBits, ScissorTestBits1,
     ShaderType, SurfaceClipBits, SurfaceClipBits1, TileMode, VertexAttribute, VertexStreamBits,
@@ -1004,6 +1004,71 @@ fn activity_counts_draws_submits_and_texture_uploads() {
 
 /// A guest address space mapping `size` bytes of the fixture's DRAM at each (va, offset), whose
 /// writes the fixture's device tracks.
+#[test]
+fn draws_into_one_target_share_a_rendering() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(&f, PROGRAMS + u64::from(FRAGMENT), &sampling_program());
+    uniform_texture(&f, 0, TEXTURE, [10, 200, 30, 255]);
+    let regs = sampling_regs();
+    draw(&mut f, &gmmu, &regs);
+    let renderings = f.rasterizer.scheduler.renderings();
+    draw(&mut f, &gmmu, &regs);
+    draw(&mut f, &gmmu, &regs);
+    assert_eq!(
+        f.rasterizer.scheduler.renderings(),
+        renderings,
+        "later draws sampling the same texture continue the first draw's rendering"
+    );
+    assert_eq!(target(&mut f)[0], [10, 200, 30, 255]);
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn a_draw_continuing_a_rendering_records_the_state_that_changed() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    let mut regs = draw_regs();
+    regs.color_mask[0] = ColorMask(0);
+    draw(&mut f, &gmmu, &regs);
+    let renderings = f.rasterizer.scheduler.renderings();
+    regs.color_mask[0] = ColorMask(0x1111);
+    draw(&mut f, &gmmu, &regs);
+    assert_eq!(f.rasterizer.scheduler.renderings(), renderings);
+    assert!(
+        target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]),
+        "the second draw writes with the colour mask it set"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn draws_sampling_their_own_target_render_in_the_general_layout() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(&f, PROGRAMS + u64::from(FRAGMENT), &sampling_program());
+    write(&f, TIC, bytemuck::cast_slice(&tic(GPU_VA, SIZE, SIZE)));
+    let regs = sampling_regs();
+    draw(&mut f, &gmmu, &regs);
+    draw(&mut f, &gmmu, &regs);
+    let draw = &f.rasterizer.draw;
+    assert_eq!(
+        draw.textures.first(),
+        draw.colors[0].map(|t| t.id).as_ref(),
+        "the draw samples its render target"
+    );
+    f.rasterizer.flush_commands();
+    f.assert_no_validation_errors();
+}
+
 fn cpu_space(f: &Fixture, maps: &[(u64, u64)], size: u64) -> Arc<AddressSpace> {
     let space = Arc::new(AddressSpace::new(f.memory.physical().clone(), 39));
     for &(va, offset) in maps {

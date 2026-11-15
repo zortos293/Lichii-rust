@@ -67,6 +67,8 @@ struct Activity {
     submits: u32,
     textures: Traffic,
     buffers: BufferCacheStats,
+    /// Dynamic renderings the scheduler had begun when the line's second started.
+    renderings: u64,
 }
 
 /// Draws skipped while their shaders translated or their pipelines built, draws that waited
@@ -594,9 +596,9 @@ impl VulkanRasterizer {
         let height = scale.scale(fb.height).min(state.extent.height);
         let frame = self.frame_image(width, height, &host)?;
         let cmd = self.scheduler.record()?;
-        let Some(source) = self
-            .texture_cache
-            .prepare(cmd, id, ImageAccess::TRANSFER_SRC)
+        let Some(source) =
+            self.texture_cache
+                .prepare(&mut self.scheduler, id, ImageAccess::TRANSFER_SRC)?
         else {
             return Ok(false);
         };
@@ -724,6 +726,7 @@ impl VulkanRasterizer {
             a.since = Some(now);
             a.textures = self.texture_cache.traffic();
             a.buffers = self.buffer_cache.stats();
+            a.renderings = self.scheduler.renderings();
             return;
         };
         if now - since < Duration::from_secs(1) {
@@ -736,6 +739,7 @@ impl VulkanRasterizer {
             seconds = (now - since).as_secs_f32(),
             submits = a.submits,
             draws = a.draws,
+            renderings = self.scheduler.renderings() - a.renderings,
             texture_draws = a.texture_draws,
             clears = a.clears,
             dispatches = a.dispatches,
@@ -759,6 +763,7 @@ impl VulkanRasterizer {
             since: Some(now),
             textures,
             buffers,
+            renderings: self.scheduler.renderings(),
             ..Activity::default()
         };
     }

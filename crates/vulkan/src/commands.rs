@@ -5,7 +5,7 @@ use ash::vk;
 use crate::device::Device;
 
 /// One side of an image layout transition.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImageAccess {
     pub layout: vk::ImageLayout,
     pub stage: vk::PipelineStageFlags2,
@@ -54,6 +54,21 @@ impl ImageAccess {
         stage: vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
         access: vk::AccessFlags2::NONE,
     };
+
+    /// Whether a barrier must separate this access from a later `to`: anything but two reads
+    /// in one layout.
+    pub fn hazards(&self, to: &ImageAccess) -> bool {
+        const WRITES: vk::AccessFlags2 = vk::AccessFlags2::from_raw(
+            vk::AccessFlags2::SHADER_WRITE.as_raw()
+                | vk::AccessFlags2::SHADER_STORAGE_WRITE.as_raw()
+                | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE.as_raw()
+                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE.as_raw()
+                | vk::AccessFlags2::TRANSFER_WRITE.as_raw()
+                | vk::AccessFlags2::HOST_WRITE.as_raw()
+                | vk::AccessFlags2::MEMORY_WRITE.as_raw(),
+        );
+        self.layout != to.layout || self.access.intersects(WRITES) || to.access.intersects(WRITES)
+    }
 }
 
 /// Records a layout transition with the matching execution and memory dependency.
@@ -103,3 +118,23 @@ pub const COLOR_RANGE: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
     base_array_layer: 0,
     layer_count: 1,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_reads_in_one_layout_need_no_barrier() {
+        let sampled = ImageAccess::SHADER_READ;
+        let sampled_anywhere = ImageAccess {
+            stage: vk::PipelineStageFlags2::ALL_COMMANDS,
+            ..sampled
+        };
+        assert!(!sampled.hazards(&sampled_anywhere));
+        assert!(!ImageAccess::TRANSFER_SRC.hazards(&ImageAccess::TRANSFER_SRC));
+        assert!(sampled.hazards(&ImageAccess::TRANSFER_SRC));
+        assert!(ImageAccess::COLOR_ATTACHMENT.hazards(&ImageAccess::COLOR_ATTACHMENT));
+        assert!(ImageAccess::TRANSFER_DST.hazards(&sampled));
+        assert!(sampled.hazards(&ImageAccess::STORAGE_WRITE));
+    }
+}
