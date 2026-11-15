@@ -132,8 +132,10 @@ specially built session; `push_interface` is the usual way.
 - **Domains:** `SendMessage` routes to the object id in the domain header;
   `CloseVirtualHandle` drops the object. Object ids start at 1 and freed ids are reused. Domain
   replies carry the domain header and list the new object ids after the data.
-- **Close (CMIF type 2, TIPC type 15):** closes the session. Later requests on it fail with
-  `SessionClosed`.
+- **Close (CMIF type 2, TIPC type 15):** closes the session and answers the close request
+  itself with `SessionClosed`, as the console and the C++ reference do (`service.cpp`). The SDK
+  checks for it: Mario Kart World aborts (2162-0001) when its decoder session's TIPC close
+  answers success. Later requests on the session fail with `SessionClosed` too.
 - **TIPC replies:** the header type repeats the request's, then one result word, then the data.
   This avoids Eden's two-word CMIF result in TIPC replies (NX2_NOTES row 22).
 - **`sm:` (CMIF and TIPC, same ids):** 0 `RegisterClient`, 1 `GetServiceHandle` (fails with

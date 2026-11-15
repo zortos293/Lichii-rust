@@ -172,7 +172,7 @@ impl ServiceThread {
         ctx.request.parse(&ctx.message, domain)?;
         if matches!(ctx.request.ty, CommandType::Close | CommandType::TipcClose) {
             session.close();
-            thread.wake(pending.token, WakeResult::SUCCESS);
+            thread.wake(pending.token, WakeResult::error(result::SESSION_CLOSED));
             return Ok(());
         }
         ctx.domain = domain;

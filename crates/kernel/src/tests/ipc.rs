@@ -422,8 +422,8 @@ fn cmif_round_trips_through_sm_sessions_and_domains() {
     assert_eq!(ok(13)[4..13], [0, 0, 0, 0, SFCO, 0, 0, 0, 1]);
     assert_eq!(ok(14)[10], 0);
     assert_eq!(ok(15)[10], result::NOT_FOUND.0);
-    // Close, then the session is gone.
-    assert_eq!(r[16].0, 0);
+    // Close answers SessionClosed, as the session is gone.
+    assert_eq!(r[16].0, u64::from(result::SESSION_CLOSED.0));
     assert_eq!(r[17].0, u64::from(result::SESSION_CLOSED.0));
     // The event remembers the command that first handed it to the guest.
     assert_eq!(event.origin(), Some("test:u command 3"));
@@ -467,13 +467,18 @@ fn tipc_replies_have_a_one_word_result() {
     test.start(test.image(), main);
     test.run_until_exit(Duration::from_secs(10));
     let r = replies.lock().clone();
-    assert!(r[..8].iter().all(|(svc, _)| *svc == 0));
+    assert!(r[..7].iter().all(|(svc, _)| *svc == 0));
     assert_eq!(r[0].1[..3], [17, 1, crate::sm::INVALID_CLIENT.0]);
     assert_eq!(r[1].1[..3], [16, 1, 0]);
     assert_eq!(r[2].1[..5], [17, 1 | 1 << 31, 1 << 5, r[2].1[3], 0]);
     assert_eq!(r[3].1[..5], [17, 3, 0, 12, 0]);
     assert_eq!(r[5].1[..4], [16, 2, 0, 1]);
     assert_eq!(r[6].1[..3], [17, 1, crate::sm::INVALID_SERVICE_NAME.0]);
+    assert_eq!(
+        r[7].0,
+        u64::from(result::SESSION_CLOSED.0),
+        "the close request"
+    );
     assert_eq!(r[8].0, u64::from(result::SESSION_CLOSED.0));
 }
 
@@ -630,7 +635,7 @@ fn user_buffers_clones_and_deferred_move_handles() {
     // Closing a clone leaves the original open.
     assert_eq!(r[3].0, 0);
     assert_eq!(r[3].1[2], 1 << 5);
-    assert_eq!(r[4].0, 0);
+    assert_eq!(r[4].0, u64::from(result::SESSION_CLOSED.0));
     assert_eq!((r[5].0, r[5].1[8]), (0, 2));
     assert_eq!(r[6].0, u64::from(result::SESSION_CLOSED.0));
     // A deferred request keeps the object of its move handle for the retry.
