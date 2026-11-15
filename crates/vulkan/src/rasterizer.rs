@@ -6,7 +6,7 @@
 //! through the [`TextureCache`], its collector once per presented frame, and draws and compute
 //! dispatches (see [`draw`]).
 
-mod draw;
+pub(crate) mod draw;
 mod fence_waiter;
 mod frame_dump;
 mod samples;
@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use ash::vk;
 use gpu_allocator::MemoryLocation;
 use lichii_common::DAddr;
+use lichii_common::GpuVAddr;
 use lichii_common::settings::{AstcRecompression, GraphicsSettings, ResolutionScale};
 use lichii_gpu::backend::ChannelId;
 use lichii_gpu::backend::{
@@ -387,7 +388,10 @@ impl VulkanRasterizer {
             live: None,
             activity: Activity::default(),
             stalls: Stalls::default(),
-            frame_dump: frame_dump::FrameDump::from_env(),
+            frame_dump: {
+                draw::diag::init();
+                frame_dump::FrameDump::from_env()
+            },
             capture: renderdoc::get().map(FrameCapture::new),
             teardown: Teardown(Vec::new()),
         })
@@ -420,12 +424,12 @@ impl VulkanRasterizer {
     /// pipelines compile asynchronously.
     pub fn apply_settings(&mut self, settings: &GraphicsSettings) {
         self.draw.set_anisotropy(settings.anisotropic_filtering);
-        self.draw
-            .pipelines
-            .set_async_compilation(settings.async_shader_compilation);
+        self.draw.pipelines.set_async_compilation(
+            settings.async_shader_compilation && !draw::diag::sync_compile(),
+        );
         self.draw
             .shaders
-            .set_async(settings.async_shader_compilation);
+            .set_async(settings.async_shader_compilation && !draw::diag::sync_compile());
         self.draw
             .shaders
             .set_resolution_scale(settings.resolution_scale);
@@ -465,6 +469,15 @@ impl VulkanRasterizer {
         })
         .flatten();
         if let Some((address, info, width, height)) = color_target {
+            draw::diag::with(|d| {
+                d.event(&format!(
+                    "CLEAR rt{index} addr={:#x} {width}x{height} fmt={:?} color={:?} mask={:#x} z={use_depth}",
+                    address,
+                    info.format,
+                    regs.clear_color,
+                    regs.color_mask[if regs.color_mask_common != 0 { 0 } else { index }].0,
+                ))
+            });
             let written = channels.iter().enumerate().fold(
                 vk::ColorComponentFlags::empty(),
                 |written, (i, &c)| {
@@ -590,6 +603,14 @@ impl VulkanRasterizer {
                 && host.conversion == Conversion::None
                 && order(source.swizzle) == order(host.swizzle)
                 && state.info.format.bytes_per_block() == fb.format.bytes_per_block());
+        let same_format = same_format && std::env::var_os("LICHII_DIAG_PRESENT_BLIT").is_none();
+        {
+            static LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+            let key = i64::from(state.format.as_raw()) << 32 | i64::from(host.format.as_raw());
+            if LAST.swap(key, std::sync::atomic::Ordering::Relaxed) != key {
+                tracing::info!(image = ?state.format, guest = ?state.info.format, frame = ?host.format, fb = ?fb.format, copy = same_format, "LIRU14 present_cached");
+            }
+        }
         if !same_format
             && !(self.device.format_features(state.format).contains(blit)
                 && self.device.format_features(host.format).contains(blit))
@@ -1024,6 +1045,7 @@ impl VulkanRasterizer {
 impl Rasterizer for VulkanRasterizer {
     fn draw(&mut self, ctx: &mut GraphicsContext<'_>, draw: &DrawParams<'_>) {
         self.activity.draws += 1;
+        draw::diag::watch_resolve(ctx.memory);
         if let Err(error) = self.draw_graphics(ctx, draw::DrawCall::Direct(draw)) {
             tracing::error!(%error, "recording a draw failed");
         }
@@ -1057,7 +1079,59 @@ impl Rasterizer for VulkanRasterizer {
         }
     }
 
+    fn accelerate_buffer_copy(
+        &mut self,
+        _channel: ChannelId,
+        _memory: &Gmmu,
+        src: GpuVAddr,
+        dst: GpuVAddr,
+        size: u64,
+    ) -> bool {
+        draw::diag::watch_gpu("dma-copy-dst", dst, size, &format!("src={src:#x}"));
+        draw::diag::watch_gpu("dma-copy-src", src, size, &format!("dst={dst:#x}"));
+        false
+    }
+
+    fn accelerate_buffer_clear(
+        &mut self,
+        _channel: ChannelId,
+        _memory: &Gmmu,
+        dst: GpuVAddr,
+        size: u64,
+        value: u32,
+    ) -> bool {
+        draw::diag::watch_gpu("dma-clear", dst, size, &format!("value={value:#x}"));
+        false
+    }
+
+    fn inline_written(&mut self, _channel: ChannelId, memory: &Gmmu, address: GpuVAddr, size: u64) {
+        let first = memory
+            .translate(address)
+            .and_then(|d| self.handles.device.read::<u32>(d).ok())
+            .unwrap_or(0);
+        draw::diag::watch_gpu(
+            "inline",
+            address,
+            size,
+            &format!("word0={first:#x} f={}", f32::from_bits(first)),
+        );
+        memory.for_each_range(address, size, |range| {
+            if let lichii_gpu::gmmu::RangeTarget::Device(daddr) = range.target {
+                self.invalidate_region(daddr, range.size);
+            }
+        });
+    }
+
     fn accelerate_blit(&mut self, _channel: ChannelId, memory: &Gmmu, blit: &Blit) -> bool {
+        draw::diag::watch_gpu(
+            "blit-dst",
+            blit.dst.address,
+            u64::from(blit.dst.pitch.max(blit.dst.width * 16)) * u64::from(blit.dst.height.max(1)),
+            &format!(
+                "src={:#x} {:?}->{:?}",
+                blit.src.address, blit.src_format, blit.dst_format
+            ),
+        );
         if blit.operation != BlitOperation::SrcCopy {
             return false;
         }
@@ -1136,6 +1210,12 @@ impl Rasterizer for VulkanRasterizer {
         memory: &Gmmu,
         copy: &ImageCopy,
     ) -> bool {
+        draw::diag::watch_gpu(
+            "image-copy-dst",
+            copy.dst.address,
+            u64::from(copy.dst.pitch.max(copy.dst.width * 16)) * u64::from(copy.dst.height.max(1)),
+            &format!("src={:#x}", copy.src.address),
+        );
         let mut tx = Transfer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
@@ -1156,6 +1236,7 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn query(&mut self, _channel: ChannelId, memory: &Gmmu, query: &Query) {
+        draw::diag::watch_gpu("query", query.address, 16, &format!("{:?}", query.kind));
         let Some(address) = memory.translate(query.address) else {
             static UNMAPPED: Throttle = Throttle::new();
             if let Some(dropped) = UNMAPPED.allow() {
@@ -1363,6 +1444,7 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn invalidate_region(&mut self, addr: DAddr, size: u64) {
+        draw::diag::watch_dev("invalidate", addr, size);
         self.buffer_cache.invalidate(addr, size);
         self.draw.shaders.invalidate(addr, size);
         let mut tx = Transfer {
@@ -1377,12 +1459,14 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn cpu_written(&mut self, addr: DAddr, size: u64) {
+        draw::diag::watch_dev("cpu-written", addr, size);
         self.buffer_cache.cpu_written(addr, size);
         self.draw.shaders.invalidate(addr, size);
         self.texture_cache.cpu_written(addr, size);
     }
 
     fn flush_region(&mut self, addr: DAddr, size: u64) {
+        draw::diag::watch_dev("flush", addr, size);
         if let Err(error) = self.buffer_cache.flush(&mut self.scheduler, addr, size) {
             tracing::error!(%error, "flushing GPU-written buffers failed");
         }
@@ -1452,6 +1536,9 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn present(&mut self, framebuffer: &FramebufferConfig) {
+        if let Some(max_bytes) = draw::diag::flush_all() {
+            self.diag_flush_all(max_bytes);
+        }
         self.activity.presents += 1;
         let now = Instant::now();
         self.stalls
@@ -1487,6 +1574,7 @@ impl Rasterizer for VulkanRasterizer {
         if let Err(error) = result {
             tracing::error!(%error, "presenting a guest frame failed");
         }
+        draw::diag::with(|d| d.event(&format!("PRESENT addr={:#x}", framebuffer.address)));
         if let Some(path) = self
             .frame_dump
             .as_mut()

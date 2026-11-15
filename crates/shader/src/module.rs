@@ -52,9 +52,22 @@ fn finish(
     program.hash.hash(&mut hasher);
     format!("{runtime:?}").hash(&mut hasher);
     incoming.hash(&mut hasher);
+    let hash = hasher.finish();
+    if let Some(dir) = std::env::var_os("LICHII_DIAG_IR_DIR") {
+        let name = format!("{hash:016x}");
+        let wanted = std::env::var("LICHII_DIAG_IR_FS")
+            .is_ok_and(|v| v == "all" || v.split(',').any(|p| !p.is_empty() && name.starts_with(p)));
+        if wanted {
+            let dir = std::path::PathBuf::from(dir);
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join(format!("{name}.ir.txt")), program.ir.dump());
+            let bytes: Vec<u8> = spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let _ = std::fs::write(dir.join(format!("{name}.spv")), bytes);
+        }
+    }
     Ok(ShaderModule {
         spirv,
-        hash: hasher.finish(),
+        hash,
         stage: program.stage,
         resources,
         info: program.info,

@@ -1312,6 +1312,41 @@ impl TextureCache {
         result
     }
 
+    /// Diagnostic only: writes every GPU-modified image of at most max_bytes guest bytes back
+    /// to guest memory, and returns how many.
+    pub fn diag_flush_all(&mut self, tx: &mut Transfer<'_>, max_bytes: u64) -> Result<usize> {
+        let ids: Vec<ImageId> = (0..self.slots.len())
+            .filter_map(|index| {
+                let slot = &self.slots[index];
+                let image = slot.image.as_ref()?;
+                (image.gpu_modified && image.downloadable() && image.info.size_bytes() <= max_bytes)
+                    .then_some(ImageId {
+                        index: index as u32,
+                        generation: slot.generation,
+                    })
+            })
+            .collect();
+        self.download(tx, &ids, None)?;
+        Ok(ids.len())
+    }
+
+    /// Diagnostic only: writes `id` back to guest memory when it is GPU-modified, and returns the
+    /// guest spans it occupies.
+    pub fn diag_download(
+        &mut self,
+        tx: &mut Transfer<'_>,
+        id: ImageId,
+    ) -> Result<Vec<(DAddr, u64)>> {
+        let Some(image) = self.get(id) else {
+            return Ok(Vec::new());
+        };
+        let spans = image.segments.iter().map(|s| (s.daddr, s.size)).collect();
+        if image.gpu_modified && image.downloadable() {
+            self.download(tx, &[id], None)?;
+        }
+        Ok(spans)
+    }
+
     /// Device memory `[daddr, daddr + size)` was unmapped: drop the images in it.
     pub fn unmap(&mut self, scheduler: &mut Scheduler, daddr: DAddr, size: u64) {
         self.collect_overlaps(&[Segment {
@@ -2707,12 +2742,33 @@ impl TextureCache {
             }
         }
         let mut readback = self.readback.take();
+        let dl_start = std::time::Instant::now();
+        let dl_what: Vec<String> = downloads
+            .iter()
+            .map(|d| {
+                let i = self.image(d.id);
+                format!(
+                    "{:?}/{:?}/{:?} {}x{}",
+                    i.info.format, i.host.format, i.host.conversion, i.info.width, i.info.height
+                )
+            })
+            .collect();
         let result = if downloads.is_empty() {
             Ok(())
         } else {
             self.record_downloads(tx, &mut downloads, &mut readback)
                 .and_then(|()| tx.scheduler.finish())
         };
+        if !dl_what.is_empty() {
+            crate::rasterizer::draw::diag::with(|d| {
+                d.event(&format!(
+                    "DOWNLOAD n={} ms={:.2} {:?}",
+                    dl_what.len(),
+                    dl_start.elapsed().as_secs_f64() * 1e3,
+                    dl_what
+                ))
+            });
+        }
         if result.is_ok()
             && let Some(data) = readback.as_ref().and_then(Buffer::mapped)
         {

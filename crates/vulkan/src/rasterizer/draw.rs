@@ -447,14 +447,6 @@ fn compare_function(regs: &Regs) -> CompareFunction {
     }
 }
 
-/// The components of each colour output the fragment program writes, as RGBA bits. The guest
-/// leaves the others untouched, while Vulkan writes undefined values, so they are masked out.
-fn fragment_output_components(stages: &GraphicsShaders) -> [u8; 8] {
-    stages[4]
-        .as_ref()
-        .map_or([0; 8], |fragment| fragment.info.frag_color_components)
-}
-
 /// Whether render target 0 blends with the fragment program's second colour output.
 fn blends_second_source(regs: &Regs) -> bool {
     if regs.blend.enable[0] == 0 {
@@ -472,6 +464,17 @@ fn blends_second_source(regs: &Regs) -> bool {
             Some(F::SRC1_COLOR | F::ONE_MINUS_SRC1_COLOR | F::SRC1_ALPHA | F::ONE_MINUS_SRC1_ALPHA)
         )
     })
+}
+
+/// The components of each colour output the fragment program writes, as RGBA bits. The guest
+/// leaves the others untouched, while Vulkan writes undefined values, so they are masked out.
+fn fragment_output_components(stages: &GraphicsShaders) -> [u8; 8] {
+    if diag::no_cmask() {
+        return [0xf; 8];
+    }
+    stages[4]
+        .as_ref()
+        .map_or([0; 8], |fragment| fragment.info.frag_color_components)
 }
 
 fn input_topology(topology: vk::PrimitiveTopology) -> InputTopology {
@@ -549,7 +552,8 @@ impl StageState {
             if regs.alpha_test_enabled != 0 {
                 state.alpha_test = Some((compare_function(regs), regs.alpha_test_ref.to_bits()));
             }
-            state.dual_source_blend = features.dual_src_blend && blends_second_source(regs);
+            state.dual_source_blend =
+                features.dual_src_blend && blends_second_source(regs) && !diag::no_dual();
             state.color_outputs = color_outputs;
         }
         state
@@ -688,9 +692,29 @@ impl VulkanRasterizer {
         if !self.render_targets(ctx)? {
             return Ok(());
         }
-        let may_skip = self.draw.presented_only();
+        let may_skip = self.draw.presented_only() || diag::old_skip();
+        let shaders_blocked = self.draw.shaders.blocked();
         if !self.graphics_stages(ctx, host_topology, may_skip) {
+            self.diag_skip(ctx, "shader");
             return Ok(());
+        }
+        {
+            let hash_of = |stage: ShaderStage| {
+                self.draw
+                    .stages
+                    .iter()
+                    .flatten()
+                    .find(|m| m.stage == stage)
+                    .map_or(0, |m| m.hash)
+            };
+            if diag::skip_fs().contains(&hash_of(ShaderStage::Fragment))
+                || diag::skip_vs().contains(&hash_of(ShaderStage::VertexB))
+            {
+                return Ok(());
+            }
+        }
+        if diag::with(|d| d.begin()) == Some(true) {
+            self.diag_draw_state(ctx, call);
         }
 
         let draw = &mut self.draw;
@@ -704,19 +728,44 @@ impl VulkanRasterizer {
         let colors: [vk::Format; 8] = draw
             .colors
             .map(|t| t.map_or(vk::Format::UNDEFINED, |t| t.format));
-        let samples =
-            mvk::sample_count(regs.anti_alias_samples_mode).unwrap_or(vk::SampleCountFlags::TYPE_1);
+        let samples = if diag::samples1() {
+            vk::SampleCountFlags::TYPE_1
+        } else {
+            mvk::sample_count(regs.anti_alias_samples_mode).unwrap_or(vk::SampleCountFlags::TYPE_1)
+        };
         let attachments = AttachmentState::new(
             &colors,
             draw.depth.map_or(vk::Format::UNDEFINED, |t| t.format),
             samples,
         );
         let key = GraphicsPipelineKey::new(&draw.stages, attachments, &fixed);
+        if diag::waits() && !may_skip {
+            use std::fmt::Write as _;
+            let shader_wait = draw.shaders.blocked() != shaders_blocked;
+            let pipeline_wait = draw.pipelines.graphics(&key, &draw.stages).is_none();
+            if shader_wait || pipeline_wait {
+                let mut s = format!("WAIT shader={shader_wait} pipeline={pipeline_wait}");
+                for m in draw.stages.iter().flatten() {
+                    let _ = write!(s, " {:?}={:016x}", m.stage, m.hash);
+                }
+                for (i, t) in draw.colors.iter().enumerate() {
+                    if let Some(t) = t {
+                        let _ = write!(s, " C{i}={:?}/{:?}", t.id, t.format);
+                    }
+                }
+                if let Some(t) = draw.depth {
+                    let _ = write!(s, " Z={:?}/{:?}", t.id, t.format);
+                }
+                diag::with(|d| d.always(&s));
+            }
+        }
         let pipeline = match may_skip {
             true => draw.pipelines.graphics(&key, &draw.stages),
             false => draw.pipelines.graphics_waiting(&key, &draw.stages),
         };
         let Some(pipeline) = pipeline else {
+            diag::with(|d| d.finish("no-pipeline"));
+            self.diag_skip(ctx, "pipeline");
             return Ok(());
         };
         let pipeline_raw = pipeline.raw();
@@ -740,6 +789,7 @@ impl VulkanRasterizer {
             self.draw.image_scaling = ScalingBits::default();
             self.draw.storage_images.clear();
             self.draw.texel_views.clear();
+            diag::append(|l| l.push_str(" |BIND"));
             for &(slot, host) in &GRAPHICS_SLOTS {
                 let Some(module) = self.draw.stages[host].clone() else {
                     continue;
@@ -807,7 +857,40 @@ impl VulkanRasterizer {
             }
         };
         if index.is_some_and(|i: IndexBinding| i.index_count == 0) {
+            diag::with(|d| d.finish("zero-index"));
             return Ok(());
+        }
+        diag::with(|d| d.finish("ok"));
+        let traced_fs = self
+            .draw
+            .stages
+            .iter()
+            .flatten()
+            .find(|m| m.stage == ShaderStage::Fragment)
+            .map_or(0, |m| m.hash);
+        let traced = diag::trace_fs().contains(&traced_fs);
+        if diag::dump_due(traced_fs) {
+            let mut ids = self.draw.textures.clone();
+            ids.extend(self.draw.colors.iter().flatten().map(|t| t.id));
+            let label = format!("fs={traced_fs:016x}");
+            self.diag_image_stats(&label, &ids, true, true);
+        }
+        if traced || (diag::stats() && diag::with(|d| d.in_window()) == Some(true)) {
+            let small: Vec<ImageId> = self
+                .draw
+                .textures
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    self.texture_cache.state(id).is_some_and(|s| {
+                        s.info.width * s.info.height <= if traced { 1 << 17 } else { 4096 }
+                    })
+                })
+                .collect();
+            if !small.is_empty() {
+                let label = format!("draw-in fs={traced_fs:016x}");
+                self.diag_image_stats(&label, &small, traced, false);
+            }
         }
         let set = self.descriptor_set(set_layout)?;
 
@@ -1358,6 +1441,12 @@ impl VulkanRasterizer {
                                 size,
                                 desc.is_written,
                             )?;
+                            diag::append(|l| {
+                                l.push_str(&format!(
+                                    " SB{descriptor}.{i}@{address:#x}/{size} w={}",
+                                    desc.is_written
+                                ))
+                            });
                             self.push_buffer(binding);
                         }
                     }
@@ -1388,6 +1477,14 @@ impl VulkanRasterizer {
                             } else {
                                 self.texture_view(src, raw, desc.ty)?
                             };
+                            self.diag_texture(
+                                module,
+                                src,
+                                b.descriptor,
+                                i,
+                                raw,
+                                texture.map(|t| t.0),
+                            );
                             let scale = texture
                                 .and_then(|(id, _)| self.texture_cache.state(id))
                                 .map_or(ResolutionScale::X1, |s| s.scale);
@@ -1538,6 +1635,18 @@ impl VulkanRasterizer {
                                     "a draw binds a storage image array mixing rescaled and native images; skipping it",
                                 );
                                 return Ok(false);
+                            }
+                            if let Some(st) = self.texture_cache.state(id) {
+                                diag::append(|l| {
+                                    l.push_str(&format!(
+                                        " SI{descriptor}.{i} raw={raw:#x} -> {id:?} {:?} {:?} {}x{} w={}",
+                                        st.info.format,
+                                        st.info.layout,
+                                        st.extent.width,
+                                        st.extent.height,
+                                        desc.is_written
+                                    ))
+                                });
                             }
                             self.draw.storage_images.push((id, desc.is_written));
                             self.draw.image_infos.push(vk::DescriptorImageInfo {
@@ -1821,6 +1930,14 @@ impl VulkanRasterizer {
         } else {
             [0; 8]
         };
+        let mut words = words;
+        diag::append(|l| {
+            let _ = std::fmt::Write::write_fmt(l, format_args!(" tsc[{index}]={words:08x?}"));
+        });
+        if diag::lod0() {
+            words[1] &= !(0x1fff << 12);
+            words[2] = (words[2] & !0xff_ffff) | (0xfff << 12);
+        }
         let key = (words, self.draw.anisotropy as u8);
         if let Some(&sampler) = self.draw.samplers.get(&key) {
             return Ok(sampler);
@@ -2452,7 +2569,7 @@ impl VulkanRasterizer {
                 });
             }
             if features.dynamic_alpha_to_coverage {
-                let coverage = alpha.alpha_to_coverage() != 0;
+                let coverage = alpha.alpha_to_coverage() != 0 && !diag::no_a2c();
                 shadow.set(Slot::AlphaToCoverageEnable, coverage, || {
                     draw.eds3.cmd_set_alpha_to_coverage_enable(cmd, coverage)
                 });
@@ -2505,6 +2622,31 @@ impl VulkanRasterizer {
         else {
             return Ok(());
         };
+        if diag::with(|d| d.begin()) == Some(true) {
+            let cb: Vec<String> = ctx
+                .const_buffers
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.enabled && c.size != 0)
+                .map(|(i, c)| {
+                    let words = ctx.memory.read::<[u32; 16]>(c.address).unwrap_or_default();
+                    let f: Vec<String> = words
+                        .iter()
+                        .map(|w| format!("{:.4}", f32::from_bits(*w)))
+                        .collect();
+                    format!("CB{i}@{:#x}/{}=[{}]", c.address, c.size, f.join(" "))
+                })
+                .collect();
+            diag::append(|l| {
+                l.push_str(&format!(
+                    "X compute={:016x} grid={:?} block={:?} {}",
+                    module.hash,
+                    ctx.grid,
+                    ctx.block,
+                    cb.join(" ")
+                ))
+            });
+        }
         let key = ComputePipelineKey {
             shader: module.hash,
             workgroup: ctx.block,
@@ -2557,6 +2699,7 @@ impl VulkanRasterizer {
             };
             let removed = self.texture_cache.removals() != removals;
             if self.buffer_cache.stats().merged_buffers == merged && !self.draw.rebind && !removed {
+                diag::with(|d| d.finish("compute"));
                 break grid;
             }
             if removed {
@@ -2643,6 +2786,28 @@ impl VulkanRasterizer {
             }
         }
         self.unflushed = true;
+        if diag::stats() && diag::with(|d| d.in_window()) == Some(true) {
+            let ids: Vec<ImageId> = self
+                .draw
+                .textures
+                .iter()
+                .copied()
+                .chain(self.draw.storage_images.iter().map(|&(id, _)| id))
+                .collect();
+            let label = format!("compute={:016x}", key.shader);
+            self.diag_image_stats(&label, &ids, false, false);
+        }
+        if diag::dump_due(key.shader) {
+            let ids: Vec<ImageId> = self
+                .draw
+                .textures
+                .iter()
+                .copied()
+                .chain(self.draw.storage_images.iter().map(|&(id, _)| id))
+                .collect();
+            let label = format!("cs={:016x}", key.shader);
+            self.diag_image_stats(&label, &ids, true, true);
+        }
         Ok(())
     }
 }
@@ -2774,6 +2939,7 @@ fn storage_pointer(
 }
 
 mod assembly;
+pub(crate) mod diag;
 mod dispatch_grid;
 mod dynamic;
 mod frame_decode;
