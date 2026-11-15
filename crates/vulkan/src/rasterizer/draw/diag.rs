@@ -193,13 +193,20 @@ pub(crate) fn dump_due(hash: u64) -> bool {
     static LIST: OnceLock<Vec<u64>> = OnceLock::new();
     static AT: OnceLock<Duration> = OnceLock::new();
     static DONE: Mutex<Vec<u64>> = Mutex::new(Vec::new());
-    if !LIST
-        .get_or_init(|| hex_list("LICHII_DIAG_DUMP_FS"))
-        .contains(&hash)
+    static ALL: OnceLock<bool> = OnceLock::new();
+    static TO: OnceLock<Duration> = OnceLock::new();
+    let all = *ALL.get_or_init(|| std::env::var("LICHII_DIAG_DUMP_FS").is_ok_and(|v| v == "all"));
+    if !all
+        && !LIST
+            .get_or_init(|| hex_list("LICHII_DIAG_DUMP_FS"))
+            .contains(&hash)
     {
         return false;
     }
     if now() < *AT.get_or_init(|| secs("LICHII_DIAG_DUMP_AT").unwrap_or_default()) {
+        return false;
+    }
+    if all && now() > *TO.get_or_init(|| secs("LICHII_DIAG_DUMP_TO").unwrap_or(Duration::MAX)) {
         return false;
     }
     let mut done = DONE.lock().unwrap();
