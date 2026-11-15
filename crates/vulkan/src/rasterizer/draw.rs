@@ -6,6 +6,7 @@
 //! shaders, pipeline, images and samplers are cached allocates nothing.
 
 use std::collections::HashMap;
+use std::mem::offset_of;
 use std::sync::Arc;
 
 use ash::vk;
@@ -15,8 +16,9 @@ use lichii_gpu::backend::{
     ChannelId, ComputeContext, ConstBufferBinding, DrawParams, GraphicsContext, IndirectDraw,
 };
 use lichii_gpu::engines::maxwell_3d::regs::{
-    DepthMode, IndexFormat, PrimitiveTopology, ProvokingVertex, RtLayerControl, StencilOp,
-    VertexAttributeType, WindowOriginMode,
+    AttributePointSize, Blend, BlendPerTarget, ComparisonOp, DepthMode, IndexFormat,
+    PrimitiveTopology, ProgramRegion, ProvokingVertex, RtLayerControl, SamplerBinding, StencilOp,
+    TexHeader, VertexAttribute, VertexAttributeType, WindowOrigin, WindowOriginMode,
 };
 use lichii_gpu::engines::maxwell_3d::regs::{MESH_CONTROL, MESH_SHADER_A};
 use lichii_gpu::engines::maxwell_3d::{Regs, dirty};
@@ -28,11 +30,13 @@ use lichii_shader::backend::spirv::{
 };
 use lichii_shader::info::{HandleSource, ImageDescriptor, StorageBufferDescriptor};
 use lichii_shader::ir::{Attribute, ImageFormat, TextureType};
+use lichii_shader::maxwell::header::ProgramHeader;
 use lichii_shader::runtime::{AttributeType, CompareFunction, InputTopology};
 use lichii_shader::{
     DescriptorKind, RuntimeInfo, ShaderArch, ShaderInfo, ShaderModule, ShaderStage,
 };
 use lichii_texture::block_linear::GobLayout;
+use lichii_texture::guest::RenderTargetFormat;
 use lichii_texture::tic::TextureMemory;
 use lichii_texture::{Numeric, PixelFormat};
 
@@ -52,7 +56,7 @@ use crate::pipeline::environment::{
 use crate::pipeline::fixed_state::flags;
 use crate::pipeline::maxwell_to_vk as mvk;
 use crate::pipeline::sampler::{SamplerCaps, SamplerParams, Tsc};
-use crate::pipeline::shader_cache::ShaderCache;
+use crate::pipeline::shader_cache::{ModuleKey, ShaderCache};
 use crate::pipeline::{
     AttachmentState, ComputePipelineKey, FixedStateTracker, FxBuildHasher, GraphicsPipelineKey,
     GraphicsShaders, PipelineCache, PipelineFeatures,
@@ -186,6 +190,65 @@ struct TargetsKey {
     cache: u64,
 }
 
+/// `(first word, words)` of each register `graphics_stages` reads, except the programs (the
+/// `SHADERS` dirty flag covers those) and the render targets (compared as colour outputs).
+const STAGE_REGISTERS: [(usize, usize); 17] = {
+    const fn field<T>(offset: usize) -> (usize, usize) {
+        (offset / 4, size_of::<T>() / 4)
+    }
+    [
+        field::<ProgramRegion>(offset_of!(Regs, program_region)),
+        field::<WindowOrigin>(offset_of!(Regs, window_origin)),
+        field::<DepthMode>(offset_of!(Regs, depth_mode)),
+        field::<AttributePointSize>(offset_of!(Regs, point_size_attribute)),
+        field::<f32>(offset_of!(Regs, point_size)),
+        field::<u32>(offset_of!(Regs, alpha_test_enabled)),
+        field::<f32>(offset_of!(Regs, alpha_test_ref)),
+        field::<ComparisonOp>(offset_of!(Regs, alpha_test_func)),
+        field::<Blend>(offset_of!(Regs, blend)),
+        field::<BlendPerTarget>(offset_of!(Regs, blend_per_target)),
+        field::<u32>(offset_of!(Regs, blend_per_target_enabled)),
+        field::<[VertexAttribute; 0x20]>(offset_of!(Regs, vertex_attrib_format)),
+        field::<TexHeader>(offset_of!(Regs, tex_header)),
+        field::<SamplerBinding>(offset_of!(Regs, sampler_binding)),
+        field::<u32>(offset_of!(Regs, viewport_scale_offset_enabled)),
+        field::<u32>(offset_of!(Regs, bindless_texture_const_buffer_slot)),
+        (MESH_CONTROL, 4),
+    ]
+};
+
+const STAGE_REGISTER_WORDS: usize = {
+    let mut words = 0;
+    let mut i = 0;
+    while i < STAGE_REGISTERS.len() {
+        words += STAGE_REGISTERS[i].1;
+        i += 1;
+    }
+    words
+};
+
+/// Everything `graphics_stages` finds its modules from besides the programs' registers: equal
+/// inputs and a clear `SHADERS` flag find the same modules, as long as each one's variant
+/// still answers its translation's queries.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StageInputs {
+    channel: ChannelId,
+    topology: vk::PrimitiveTopology,
+    /// GPU mappings and program bytes the module keys were hashed through.
+    memory: u64,
+    programs: u64,
+    color_outputs: [AttributeType; 8],
+    registers: [u32; STAGE_REGISTER_WORDS],
+    /// The header of each program slot in use, zero for the others.
+    headers: [[u32; 20]; 6],
+}
+
+/// The stages of the last draw and what they were found from.
+struct StagesMemo {
+    inputs: StageInputs,
+    keys: [Option<ModuleKey>; 5],
+}
+
 /// One bound render target of the current draw.
 #[derive(Clone, Copy)]
 struct Target {
@@ -220,6 +283,8 @@ pub(super) struct DrawState {
     /// What `colors` and `depth` were resolved from beyond the registers the
     /// `RENDER_TARGETS` dirty flag covers; `None` until the next resolve.
     targets_key: Option<TargetsKey>,
+    /// What `stages` were found from; `None` until the next lookup.
+    stages_memo: Option<StagesMemo>,
     /// The images the last [`PRESENTED`] presents showed. Only a draw into them alone may be
     /// skipped while its program translates or its pipeline builds: one frame shows it missing.
     /// A draw into any other target waits, so no later pass reads a target a skip left stale.
@@ -350,6 +415,7 @@ impl DrawState {
             stages: GraphicsShaders::default(),
             colors: [None; 8],
             targets_key: None,
+            stages_memo: None,
             depth: None,
             presented: [None; PRESENTED],
             textures: Vec::new(),
@@ -1142,7 +1208,7 @@ impl VulkanRasterizer {
     /// draw.
     fn graphics_stages(
         &mut self,
-        ctx: &GraphicsContext<'_>,
+        ctx: &mut GraphicsContext<'_>,
         topology: vk::PrimitiveTopology,
         may_skip: bool,
     ) -> bool {
@@ -1163,34 +1229,71 @@ impl VulkanRasterizer {
             }
             false => slot == 1 || regs.pipelines[slot].enable() != 0,
         };
-        let last_pre_raster = (1..5).rev().find(|&s| enabled(s)).unwrap_or(1);
         let color_outputs: [AttributeType; 8] = std::array::from_fn(|i| {
             let count = (regs.rt_control.count() as usize).min(8);
             if i >= count {
                 return AttributeType::Float;
             }
             let rt = &regs.rt[render_target_index(regs, i)];
-            match ImageInfo::from_render_target(rt, 0, self.texture_cache.gob_layout())
-                .map(|info| info.format.numeric())
+            if rt.address() == 0 || rt.width == 0 || rt.height == 0 {
+                return AttributeType::Float;
+            }
+            match RenderTargetFormat::try_from(rt.format)
+                .ok()
+                .and_then(PixelFormat::from_render_target)
+                .map(PixelFormat::numeric)
             {
                 Some(Numeric::Uint) => AttributeType::UnsignedInt,
                 Some(Numeric::Sint) => AttributeType::SignedInt,
                 _ => AttributeType::Float,
             }
         });
-        let features = *self.draw.pipelines.features();
         let arch = self.draw.arch;
-        let passthrough_geometry =
-            enabled(4) && graphics_program_header(ctx, 4, arch).geometry_passthrough();
+        let words = regs.words();
+        let mut inputs = StageInputs {
+            channel: ctx.channel,
+            topology,
+            memory: ctx.memory.generation(),
+            programs: self.draw.shaders.generation(),
+            color_outputs,
+            registers: [0; STAGE_REGISTER_WORDS],
+            headers: [[0; 20]; 6],
+        };
+        let mut at = 0;
+        for (first, len) in STAGE_REGISTERS {
+            inputs.registers[at..at + len].copy_from_slice(&words[first..first + len]);
+            at += len;
+        }
+        for (slot, header) in inputs.headers.iter_mut().enumerate() {
+            if slot == 1 || regs.pipelines[slot].enable() != 0 {
+                *header = graphics_program_header(ctx, slot, arch).words;
+            }
+        }
+        if !ctx.dirty.is_set(dirty::SHADERS) && self.reuse_stages(ctx, mesh, &inputs) {
+            return true;
+        }
+        self.draw.stages_memo = None;
+
+        let last_pre_raster = (1..5).rev().find(|&s| enabled(s)).unwrap_or(1);
+        let features = *self.draw.pipelines.features();
+        let passthrough_geometry = enabled(4)
+            && ProgramHeader {
+                words: inputs.headers[4],
+            }
+            .geometry_passthrough();
         let noperspective = if mesh || !enabled(5) || passthrough_geometry {
             0
         } else {
-            graphics_program_header(ctx, 5, arch)
-                .ps()
-                .screen_linear_generics()
+            ProgramHeader {
+                words: inputs.headers[5],
+            }
+            .ps()
+            .screen_linear_generics()
         };
         let mut bindings = Bindings::default();
         let mut previous: Option<Arc<ShaderModule>> = None;
+        let mut keys = [None; 5];
+        let mut tracked = true;
         for (slot, host) in GRAPHICS_SLOTS {
             if !enabled(slot) {
                 self.draw.stages[host] = None;
@@ -1199,6 +1302,10 @@ impl VulkanRasterizer {
             let env = ProgramEnv::graphics(ctx, slot, arch);
             let vertex_a = (slot == 1 && !mesh && regs.pipelines[0].enable() != 0)
                 .then(|| ProgramEnv::graphics(ctx, 0, arch));
+            tracked &= [Some(&env), vertex_a.as_ref()]
+                .into_iter()
+                .flatten()
+                .all(|env| ctx.memory.translate(env.code_start()).is_some());
             let mut state = StageState::new(
                 regs,
                 slot,
@@ -1212,7 +1319,7 @@ impl VulkanRasterizer {
                 state.noperspective_outputs = noperspective;
             }
             state.scaled_noperspective_inputs = slot == 5 && noperspective != 0;
-            let module = self.draw.shaders.module(
+            let found = self.draw.shaders.module(
                 vertex_a.as_ref(),
                 &env,
                 state.key(),
@@ -1220,15 +1327,51 @@ impl VulkanRasterizer {
                 &mut bindings,
                 may_skip,
             );
-            let Some(module) = module else {
+            let Some((key, module)) = found else {
                 return false;
             };
             if slot != 5 {
                 previous = Some(module.clone());
             }
+            keys[host] = Some(key);
             self.draw.stages[host] = Some(module);
         }
+        if tracked {
+            self.draw.stages_memo = Some(StagesMemo { inputs, keys });
+            ctx.dirty.clear(dirty::SHADERS);
+        }
         true
+    }
+
+    /// Whether the stages of the last draw are this draw's: its inputs match and every
+    /// program's variant still answers its translation's queries.
+    fn reuse_stages(
+        &mut self,
+        ctx: &GraphicsContext<'_>,
+        mesh: bool,
+        inputs: &StageInputs,
+    ) -> bool {
+        let draw = &mut self.draw;
+        let Some(memo) = draw
+            .stages_memo
+            .as_ref()
+            .filter(|memo| memo.inputs == *inputs)
+        else {
+            return false;
+        };
+        let regs = ctx.regs;
+        GRAPHICS_SLOTS.into_iter().all(|(slot, host)| {
+            let Some(key) = &memo.keys[host] else {
+                return true;
+            };
+            let env = ProgramEnv::graphics(ctx, slot, draw.arch);
+            let vertex_a = (slot == 1 && !mesh && regs.pipelines[0].enable() != 0)
+                .then(|| ProgramEnv::graphics(ctx, 0, draw.arch));
+            let found = draw.shaders.find(key, vertex_a.as_ref(), &env);
+            found
+                .zip(draw.stages[host].as_ref())
+                .is_some_and(|(found, current)| Arc::ptr_eq(&found, current))
+        })
     }
 
     /// Finds the colour and depth targets in the texture cache. `false` skips the draw.
@@ -2557,7 +2700,7 @@ impl VulkanRasterizer {
     pub(super) fn dispatch(&mut self, ctx: &ComputeContext<'_>) -> Result<()> {
         let env = ProgramEnv::compute(ctx);
         let mut bindings = Bindings::default();
-        let Some(module) =
+        let Some((_, module)) =
             self.draw
                 .shaders
                 .module(None, &env, 0, RuntimeInfo::default, &mut bindings, true)

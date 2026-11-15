@@ -14,9 +14,9 @@ use lichii_gpu::engines::maxwell_3d::regs::{
     MAX_SHADER_STAGE, MESH_CONTROL, MESH_INIT_SHADER, MESH_SHADER_A, MESH_SHADER_B, PipelineBits,
     PrimitiveTopology, RenderTargetConfigBits, RtControl, RtLayer, RtLayerControl, ScissorTestBits,
     ScissorTestBits1, ShaderType, SurfaceClipBits, SurfaceClipBits1, TileMode, VertexAttribute,
-    VertexStreamBits, ZetaSizeBits,
+    VertexAttributeType, VertexStreamBits, ZetaSizeBits,
 };
-use lichii_gpu::engines::maxwell_3d::{DirtyState, Regs};
+use lichii_gpu::engines::maxwell_3d::{DirtyState, Regs, dirty};
 use lichii_gpu::gmmu::Gmmu;
 use lichii_memory::{AddressSpace, MemoryPermission};
 use lichii_shader::ampere::{
@@ -1208,6 +1208,83 @@ fn cpu_writes_to_cached_programs_translate_them_again() {
     );
     assert_eq!(colours[1], original, "the first program again");
     assert_eq!(f.rasterizer.draw.shaders.stats().translated, 3);
+    f.assert_no_validation_errors();
+}
+
+/// Draws that keep one dirty state reuse the last draw's modules while its `SHADERS` flag
+/// stays clear, but a guest write to a program and a register the stages read still find the
+/// module those translate to.
+#[test]
+fn unchanged_programs_are_found_again_after_a_write_or_a_stage_register_change() {
+    const CPU_VA: u64 = 0x1000_0000;
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let space = cpu_space(&f, &[(CPU_VA, PROGRAMS)], 0x1_0000);
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    let mut regs = draw_regs();
+    let mut flags = DirtyState::new();
+    let (const_buffers, root_tables) = (const_buffers(), [[0; 64]; 8]);
+    let mut draw = |f: &mut Fixture, regs: &Regs| {
+        let mut ctx = GraphicsContext {
+            channel: ChannelId(0),
+            memory: &gmmu,
+            regs,
+            dirty: &mut flags,
+            const_buffers: &const_buffers,
+            root_tables: &root_tables,
+        };
+        f.rasterizer.draw(
+            &mut ctx,
+            &DrawParams {
+                topology: PrimitiveTopology::TRIANGLES,
+                indexed: false,
+                first: 0,
+                count: 3,
+                base_vertex: 0,
+                base_instance: 0,
+                instance_count: 1,
+                inline_indices: None,
+            },
+        );
+        assert!(
+            !ctx.dirty.is_set(dirty::SHADERS),
+            "the lookup took the flag"
+        );
+        target(f)
+    };
+    let translated = |f: &Fixture| f.rasterizer.draw.shaders.stats().translated;
+    let original = draw(&mut f, &regs);
+    assert_eq!(translated(&f), 2);
+    assert_eq!(draw(&mut f, &regs), original);
+    assert_eq!(translated(&f), 2, "an unchanged draw reuses its modules");
+
+    space
+        .write_bytes(CPU_VA + u64::from(FRAGMENT), &fragment_program([4, 0]))
+        .unwrap();
+    drain_cpu_writes(&mut f);
+    assert!(
+        draw(&mut f, &regs)
+            .iter()
+            .all(|&t| unorm8_eq(t, [128, 255, 0, 255])),
+        "the rewritten program's colour"
+    );
+    assert_eq!(translated(&f), 3);
+
+    let vertex = f.rasterizer.draw.stages[0].clone().unwrap();
+    regs.vertex_attrib_format[1] = VertexAttribute(VertexAttributeType::S_INT.0 << 27 | 0x4 << 21);
+    draw(&mut f, &regs);
+    assert_eq!(
+        translated(&f),
+        4,
+        "the vertex program translates for its new input types"
+    );
+    let other = f.rasterizer.draw.stages[0].clone().unwrap();
+    assert!(!Arc::ptr_eq(&vertex, &other));
     f.assert_no_validation_errors();
 }
 

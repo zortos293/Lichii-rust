@@ -80,8 +80,9 @@ struct ProgramBytes {
     tracked: Vec<CachedPages>,
 }
 
+/// What [`ShaderCache::module`] finds a module under, besides the answers of its variants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct ModuleKey {
+pub struct ModuleKey {
     /// Hashes of the VertexA program (0 without one) and of the program.
     code: [u64; 2],
     state: u64,
@@ -208,6 +209,8 @@ pub struct ShaderCache {
     /// its length.
     segments: BTreeMap<(DAddr, DAddr), u64>,
     longest: u64,
+    /// Bumped by every guest write to a known program's bytes and every resolution scale change.
+    generation: u64,
     modules: HashMap<ModuleKey, Variants, FxBuildHasher>,
     disk: Option<ShaderDisk>,
     bytes: Vec<u8>,
@@ -236,6 +239,7 @@ impl ShaderCache {
             programs: HashMap::default(),
             segments: BTreeMap::new(),
             longest: 0,
+            generation: 0,
             modules: HashMap::default(),
             disk: None,
             bytes: Vec::new(),
@@ -326,6 +330,14 @@ impl ShaderCache {
     /// Programs translate for `scale` from now on (resolution rescaling patches them).
     pub fn set_resolution_scale(&mut self, scale: ResolutionScale) {
         self.scale = scale;
+        self.generation += 1;
+    }
+
+    /// Changes whenever a guest write touches the bytes of a program the cache knows, or the
+    /// resolution scale changes: a [`ModuleKey`] [`Self::module`] returned is still the key
+    /// it would compute for the same registers while this stays the same.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// The guest wrote `[daddr, +size)`: programs any of whose device ranges it touches are
@@ -339,6 +351,7 @@ impl ShaderCache {
             {
                 program.stale = true;
                 program.tracked.clear();
+                self.generation += 1;
             }
         }
     }
@@ -348,7 +361,8 @@ impl ShaderCache {
     /// what `state` hashes. `bindings` carries the next free binding from stage to stage.
     /// With workers, a graphics program not translated yet is queued for them and `None`
     /// returned when `may_skip`, else translated in place. `None` also when the program does
-    /// not translate: skip the draw.
+    /// not translate: skip the draw. The key returned finds the module again through
+    /// [`Self::find`].
     pub fn module(
         &mut self,
         a: Option<&ProgramEnv<'_>>,
@@ -357,7 +371,7 @@ impl ShaderCache {
         runtime: impl FnOnce() -> RuntimeInfo,
         bindings: &mut Bindings,
         may_skip: bool,
-    ) -> Option<Arc<ShaderModule>> {
+    ) -> Option<(ModuleKey, Arc<ShaderModule>)> {
         self.drain();
         let mut hasher = FxHasher::default();
         (state, *bindings, self.scale, env.state_words()).hash(&mut hasher);
@@ -368,16 +382,9 @@ impl ShaderCache {
                 code: [a_code, code],
                 state,
             };
-            let found = self.modules.get(&key).and_then(|variants| {
-                variants.find(&mut self.answers, |side, read| match (side, a) {
-                    (0, Some(a)) => a.answer(read),
-                    _ => env.answer(read),
-                })
-            });
-            if let Some(variant) = found {
-                self.stats.hits += 1;
+            if let Some(variant) = self.variant(&key, a, env) {
                 *bindings = variant.bindings;
-                return variant.module.clone();
+                return variant.module.clone().map(|module| (key, module));
             }
         }
 
@@ -466,7 +473,35 @@ impl ShaderCache {
             reads = Default::default();
         }
         self.remember(key, reads, *bindings, module.clone());
-        module
+        module.map(|module| (key, module))
+    }
+
+    /// The module [`Self::module`] returned under `key` if the environments still answer
+    /// its translation's queries as they did, else `None`.
+    pub(crate) fn find(
+        &mut self,
+        key: &ModuleKey,
+        a: Option<&ProgramEnv<'_>>,
+        env: &ProgramEnv<'_>,
+    ) -> Option<Arc<ShaderModule>> {
+        self.variant(key, a, env)?.module.clone()
+    }
+
+    fn variant(
+        &mut self,
+        key: &ModuleKey,
+        a: Option<&ProgramEnv<'_>>,
+        env: &ProgramEnv<'_>,
+    ) -> Option<&Variant> {
+        let variant = self
+            .modules
+            .get(key)?
+            .find(&mut self.answers, |side, read| match (side, a) {
+                (0, Some(a)) => a.answer(read),
+                _ => env.answer(read),
+            })?;
+        self.stats.hits += 1;
+        Some(variant)
     }
 
     fn remember(
