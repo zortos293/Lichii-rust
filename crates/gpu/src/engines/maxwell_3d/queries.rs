@@ -11,6 +11,10 @@ use crate::gmmu::RangeTarget;
 
 /// The write REPORT_SEMAPHORE.QUERY asks for. Acquires are waited on by the front thread and
 /// traps are not emulated, so both give `None`.
+///
+/// Releases to address 0 also give `None`: NVN2 titles release fences to a null address every
+/// frame (Mario Tennis Fever: three per present), which the reference drops silently because
+/// GPU address 0 is never mapped.
 pub(super) fn report(regs: &Regs) -> Option<Query> {
     let semaphore = &regs.report_semaphore;
     let query = semaphore.query;
@@ -18,6 +22,9 @@ pub(super) fn report(regs: &Regs) -> Option<Query> {
     if operation != ReportSemaphoreOperation::RELEASE
         && operation != ReportSemaphoreOperation::REPORT_ONLY
     {
+        return None;
+    }
+    if semaphore.address() == 0 {
         return None;
     }
     let kind = match query.report() {

@@ -678,6 +678,16 @@ fn query_release_and_report() {
 }
 
 #[test]
+fn null_address_reports_are_dropped() {
+    let mut b = Bench::new();
+    let semaphore = reg_index!(Regs, report_semaphore);
+    b.call(semaphore + 2, 1);
+    b.call(REPORT_SEMAPHORE_QUERY, 1 << 28);
+    b.call(REPORT_SEMAPHORE_QUERY, 2 | 2 << 23);
+    assert!(b.take().is_empty());
+}
+
+#[test]
 fn same_value_writes_set_no_dirty_flags_and_keep_the_pending_draw() {
     let mut b = Bench::new();
     consume(&mut b.engine.state.dirty);
