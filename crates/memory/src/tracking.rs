@@ -190,6 +190,12 @@ impl DirtyPages {
         self.pending.load(Ordering::Acquire)
     }
 
+    /// Whether the page holding `pa` is marked.
+    pub(crate) fn test(&self, pa: PAddr) -> bool {
+        let page = (pa >> PAGE_BITS) as usize;
+        self.words[page / 64].load(Ordering::Acquire) & (1 << (page % 64)) != 0
+    }
+
     /// Clears the marks and calls `f` with each run of marked physical pages, as (address, size).
     pub(crate) fn take(&self, mut f: impl FnMut(PAddr, u64)) {
         if !self.pending.swap(false, Ordering::AcqRel) {

@@ -672,6 +672,12 @@ impl AddressSpace {
         self.dirty.pending()
     }
 
+    /// Whether the CPU wrote physical page `pa` while it was tracked, since the last
+    /// [`AddressSpace::take_cpu_writes`].
+    pub(crate) fn is_cpu_written(&self, pa: PAddr) -> bool {
+        self.dirty.test(pa)
+    }
+
     /// Calls `f` with each run of physical pages the CPU wrote while they were tracked, as
     /// (address, size), and forgets them.
     pub(crate) fn take_cpu_writes(&self, f: impl FnMut(PAddr, u64)) {

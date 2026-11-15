@@ -831,6 +831,10 @@ fn draws_into_targets_no_present_showed_translate_in_place_instead_of_skipping()
         (0, 2),
         "nothing skipped; the vertex and fragment programs translated in place"
     );
+    assert!(
+        shaders.stalled() > std::time::Duration::ZERO,
+        "the translations are timed"
+    );
     f.assert_no_validation_errors();
 }
 
@@ -1000,6 +1004,47 @@ fn activity_counts_draws_submits_and_texture_uploads() {
 
 /// A guest address space mapping `size` bytes of the fixture's DRAM at each (va, offset), whose
 /// writes the fixture's device tracks.
+#[test]
+fn draws_into_one_target_share_a_rendering() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(&f, PROGRAMS + u64::from(FRAGMENT), &sampling_program());
+    uniform_texture(&f, 0, TEXTURE, [10, 200, 30, 255]);
+    let regs = sampling_regs();
+    draw(&mut f, &gmmu, &regs);
+    let renderings = f.rasterizer.scheduler.renderings();
+    draw(&mut f, &gmmu, &regs);
+    draw(&mut f, &gmmu, &regs);
+    assert_eq!(
+        f.rasterizer.scheduler.renderings(),
+        renderings,
+        "later draws sampling the same texture continue the first draw's rendering"
+    );
+    assert_eq!(target(&mut f)[0], [10, 200, 30, 255]);
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn draws_sampling_their_own_target_render_in_the_general_layout() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(&f, PROGRAMS + u64::from(FRAGMENT), &sampling_program());
+    write(&f, TIC, bytemuck::cast_slice(&tic(GPU_VA, SIZE, SIZE)));
+    let regs = sampling_regs();
+    draw(&mut f, &gmmu, &regs);
+    draw(&mut f, &gmmu, &regs);
+    let draw = &f.rasterizer.draw;
+    assert_eq!(
+        draw.textures.first(),
+        draw.colors[0].map(|t| t.id).as_ref(),
+        "the draw samples its render target"
+    );
+    f.rasterizer.flush_commands();
+    f.assert_no_validation_errors();
+}
+
 fn cpu_space(f: &Fixture, maps: &[(u64, u64)], size: u64) -> Arc<AddressSpace> {
     let space = Arc::new(AddressSpace::new(f.memory.physical().clone(), 39));
     for &(va, offset) in maps {

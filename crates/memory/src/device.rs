@@ -229,6 +229,21 @@ impl DeviceAddressSpace {
         }
     }
 
+    /// Calls `f` with each mapped page of `[daddr, daddr + size)` the attached process wrote while
+    /// it was tracked and [`DeviceAddressSpace::take_cpu_writes`] has not taken yet. Takes
+    /// nothing: the writes still reach the next `take`.
+    pub fn for_each_cpu_written_page(&self, daddr: DAddr, size: u64, mut f: impl FnMut(DAddr)) {
+        let Some(process) = self.process.get() else {
+            return;
+        };
+        self.for_each_page(daddr, size, |page, pa| {
+            if process.is_cpu_written(pa) {
+                f(page);
+            }
+            true
+        });
+    }
+
     /// Width of the device address space in bits.
     pub fn address_space_bits(&self) -> u32 {
         self.table.bits()

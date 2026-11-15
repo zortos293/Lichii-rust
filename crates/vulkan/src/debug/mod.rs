@@ -23,7 +23,7 @@ static LABELS: AtomicBool = AtomicBool::new(false);
 /// # Safety
 ///
 /// Call it once, before the first Vulkan instance and while no other thread runs: loading
-/// RenderDoc from a folder adds its layer to `VK_ADD_LAYER_PATH` in this process's environment.
+/// RenderDoc from a folder adds its layer to `VK_ADD_IMPLICIT_LAYER_PATH` in this process's environment.
 pub unsafe fn init(settings: &DebugSettings, crash_dumps: &Path) {
     LABELS.store(settings.vulkan_labels, Ordering::Relaxed);
     // SAFETY: the caller guarantees no other thread runs.

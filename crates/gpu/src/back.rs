@@ -58,6 +58,12 @@ struct BackChannel {
     engines: [Option<Box<dyn Engine>>; EngineKind::COUNT],
 }
 
+/// How much of the device memory around a GPFIFO entry one fetch sync writes back. Switch 2
+/// titles fetch command lists GPU work wrote moments before, often hundreds of small ones per
+/// frame side by side (DKB: about 1,500 entries of 20 bytes in eleven 64 KiB blocks), so one
+/// write-back covers the entries after it until GPU work writes the block again.
+const FETCH_SYNC_WINDOW: u64 = 64 * 1024;
+
 /// Executes the stream.
 pub(crate) struct Back {
     rasterizer: Box<dyn Rasterizer>,
@@ -328,7 +334,7 @@ impl Back {
                     .read_overlay
                     .set(pending.unwrap_or_default());
                 if waits {
-                    self.synchronize_read(address, size);
+                    self.synchronize_read(address, size, 1);
                 }
                 3
             }
@@ -340,7 +346,7 @@ impl Back {
                     _ => false,
                 };
                 if host {
-                    self.synchronize_read(address, size);
+                    self.synchronize_read(address, size, FETCH_SYNC_WINDOW);
                 }
                 self.fetch_syncs.complete();
                 3
@@ -448,8 +454,9 @@ impl Back {
     }
 
     /// The front is about to read `[address, address + size)`: the GPU work before it completes,
-    /// its fences and queries land, and GPU-written data in the range goes back to guest memory.
-    fn synchronize_read(&mut self, address: u64, size: u64) {
+    /// its fences and queries land, and GPU-written data goes back to guest memory over the
+    /// device range widened to whole `window`-aligned blocks (a power of two; 1 is the range).
+    fn synchronize_read(&mut self, address: u64, size: u64, window: u64) {
         let _waiting = self.activity.waiting(Wait::HostGpu);
         let Some(channel) = self.current.and_then(|index| self.channels[index].as_ref()) else {
             self.rasterizer.release_fences(true);
@@ -460,7 +467,11 @@ impl Back {
             .setup
             .memory
             .for_each_range(address, size, |range| match range.target {
-                RangeTarget::Device(daddr) => rasterizer.synchronize_region(daddr, range.size),
+                RangeTarget::Device(daddr) => {
+                    let start = daddr & !(window - 1);
+                    let end = (daddr + range.size).next_multiple_of(window);
+                    rasterizer.synchronize_region(start, end - start);
+                }
                 _ => rasterizer.release_fences(true),
             });
     }

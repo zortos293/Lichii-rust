@@ -67,12 +67,16 @@ struct Activity {
     submits: u32,
     textures: Traffic,
     buffers: BufferCacheStats,
+    /// Dynamic renderings the scheduler had begun when the line's second started.
+    renderings: u64,
 }
 
-/// Draws skipped while their shaders translated or their pipelines built, and the longest time
-/// between two presents, over the second since the last `draw stalls` line. The line is
-/// written at INFO, at most once a second, only for a second that skipped draws or held a
-/// present back for [`Stalls::SLOW_FRAME`] or more, so scene loads show up and steady play does not.
+/// Draws skipped while their shaders translated or their pipelines built, draws that waited
+/// for them, the render-thread time spent translating and building in place or waiting, and
+/// the longest time between two presents, over the second since the last `draw stalls` line.
+/// The line is written at INFO, at most once a second, only for a second that skipped or
+/// waited, compiled on the render thread for a millisecond or more, or held a present back for
+/// [`Stalls::SLOW_FRAME`] or more, so scene loads show up and steady play does not.
 #[derive(Default)]
 struct Stalls {
     since: Option<Instant>,
@@ -81,6 +85,8 @@ struct Stalls {
     presents: u32,
     /// Shader and pipeline skips and blocking waits when the window started.
     waits_at: [u64; 4],
+    /// Shader and pipeline render-thread compile time when the window started.
+    stalled_at: [Duration; 2],
 }
 
 impl Stalls {
@@ -97,10 +103,13 @@ impl Stalls {
             shaders.blocked(),
             pipelines.blocked(),
         ];
+        let stalled = [shaders.stalled(), pipelines.stalled()];
         let since = *self.since.get_or_insert(now);
         if now - since < Duration::from_secs(1) {
             return;
         }
+        let [shader_ms, pipeline_ms] =
+            std::array::from_fn(|i| (stalled[i] - self.stalled_at[i]).as_secs_f32() * 1000.0);
         let [
             skipped_shader,
             skipped_pipeline,
@@ -108,6 +117,7 @@ impl Stalls {
             waited_pipeline,
         ] = std::array::from_fn(|i| waits[i] - self.waits_at[i]);
         if skipped_shader + skipped_pipeline + waited_shader + waited_pipeline > 0
+            || shader_ms + pipeline_ms >= 1.0
             || self.worst_frame >= Self::SLOW_FRAME
         {
             tracing::info!(
@@ -115,6 +125,8 @@ impl Stalls {
                 skipped_pipeline,
                 waited_shader,
                 waited_pipeline,
+                shader_ms,
+                pipeline_ms,
                 worst_frame_ms = self.worst_frame.as_secs_f32() * 1000.0,
                 presents = self.presents,
                 seconds = (now - since).as_secs_f32(),
@@ -127,6 +139,7 @@ impl Stalls {
             since: Some(now),
             last_present: Some(now),
             waits_at: waits,
+            stalled_at: stalled,
             ..Self::default()
         };
     }
@@ -448,16 +461,10 @@ impl VulkanRasterizer {
         })
         .flatten();
         if let Some((address, info, width, height)) = color_target {
-            let mask = regs.color_mask[if regs.color_mask_common != 0 {
-                0
-            } else {
-                index
-            }];
-            let enabled = [mask.r(), mask.g(), mask.b(), mask.a()];
-            let written = channels.iter().zip(enabled).enumerate().fold(
+            let written = channels.iter().enumerate().fold(
                 vk::ColorComponentFlags::empty(),
-                |written, (i, (&c, m))| {
-                    if c & m != 0 {
+                |written, (i, &c)| {
+                    if c != 0 {
                         written | vk::ColorComponentFlags::from_raw(1 << i)
                     } else {
                         written
@@ -590,9 +597,9 @@ impl VulkanRasterizer {
         let height = scale.scale(fb.height).min(state.extent.height);
         let frame = self.frame_image(width, height, &host)?;
         let cmd = self.scheduler.record()?;
-        let Some(source) = self
-            .texture_cache
-            .prepare(cmd, id, ImageAccess::TRANSFER_SRC)
+        let Some(source) =
+            self.texture_cache
+                .prepare(&mut self.scheduler, id, ImageAccess::TRANSFER_SRC)?
         else {
             return Ok(false);
         };
@@ -720,6 +727,7 @@ impl VulkanRasterizer {
             a.since = Some(now);
             a.textures = self.texture_cache.traffic();
             a.buffers = self.buffer_cache.stats();
+            a.renderings = self.scheduler.renderings();
             return;
         };
         if now - since < Duration::from_secs(1) {
@@ -732,6 +740,7 @@ impl VulkanRasterizer {
             seconds = (now - since).as_secs_f32(),
             submits = a.submits,
             draws = a.draws,
+            renderings = self.scheduler.renderings() - a.renderings,
             texture_draws = a.texture_draws,
             clears = a.clears,
             dispatches = a.dispatches,
@@ -755,6 +764,7 @@ impl VulkanRasterizer {
             since: Some(now),
             textures,
             buffers,
+            renderings: self.scheduler.renderings(),
             ..Activity::default()
         };
     }
@@ -2119,13 +2129,22 @@ mod tests {
 
     #[test]
     fn masked_colour_clears_keep_the_unwritten_channels() {
-        // G and A written, through the colour mask (UNORM) and through the clear's own channel
-        // selection (UINT, integer outputs).
+        // The clear's own channel selection decides what is written; the colour write mask
+        // does not apply to clears, so a whole clear under a G+A mask still writes all four.
         let cases = [
             (
                 0xd5,
                 ColorMask(0x1010),
                 ClearSurface(0b1111 << 2),
+                [1.0, 0.5, 0.25, 0.0],
+                [0.0, 0.2, 1.0, 1.0],
+                [255, 128, 64, 0],
+                [0, 51, 255, 255],
+            ),
+            (
+                0xd5,
+                ColorMask(0x0111),
+                ClearSurface(1 << 3 | 1 << 5),
                 [1.0, 0.5, 0.25, 0.0],
                 [0.0, 0.2, 1.0, 1.0],
                 [255, 128, 64, 0],
