@@ -26,6 +26,14 @@ struct Fixture {
 }
 
 fn fixture(gob: GobLayout, recompression: AstcRecompression) -> Option<Fixture> {
+    fixture_with_dram(gob, recompression, DRAM)
+}
+
+fn fixture_with_dram(
+    gob: GobLayout,
+    recompression: AstcRecompression,
+    dram: u64,
+) -> Option<Fixture> {
     let instance = match Instance::new(true, SurfaceSupport::None) {
         Ok(instance) => Arc::new(instance),
         Err(error) => {
@@ -40,12 +48,12 @@ fn fixture(gob: GobLayout, recompression: AstcRecompression) -> Option<Fixture> 
             return None;
         }
     };
-    let physical = Arc::new(PhysicalMemory::new(DRAM).unwrap());
-    physical.commit(0, DRAM).unwrap();
+    let physical = Arc::new(PhysicalMemory::new(dram).unwrap());
+    physical.commit(0, dram).unwrap();
     let memory = Arc::new(DeviceAddressSpace::new(physical, 36));
-    memory.map(DADDR, 0, DRAM);
+    memory.map(DADDR, 0, dram);
     let gmmu = Gmmu::new(memory.clone(), BigPageSize::Size64K);
-    gmmu.map(GPU_VA, DADDR, DRAM, 0, false).unwrap();
+    gmmu.map(GPU_VA, DADDR, dram, 0, false).unwrap();
     let written = Arc::new(GpuWrittenPages::new(36));
     let lazy = Arc::new(lichii_gpu::lazy::LazyDeviceRanges::new(memory.clone()));
     Some(Fixture {
@@ -3949,6 +3957,175 @@ fn mkw_npot_array_layers_rendered_as_targets_form_and_render_into_the_array() {
             );
             assert_eq!(f.texture(&header).0, id, "{case}");
             check(&f.read_image(id), 191);
+            f.assert_no_validation_errors();
+        }
+    }
+}
+
+const CHUNK: u64 = 1 << 20;
+
+/// Maps `size` bytes at `gpu_va` to the device pages at `daddr` in 1 MiB chunks, chunk `i`
+/// to device chunk `place(i, chunks)`: device backing scattered as Mario Kart World's 16 MiB
+/// chunks are. Returns the device offset of each chunk.
+fn map_scattered(
+    f: &Fixture,
+    gpu_va: GpuVAddr,
+    daddr: DAddr,
+    size: u64,
+    place: fn(u64, u64) -> u64,
+) -> Vec<u64> {
+    let chunks = size.div_ceil(CHUNK);
+    (0..chunks)
+        .map(|i| {
+            let at = place(i, chunks) * CHUNK;
+            f.gmmu
+                .map(gpu_va + i * CHUNK, daddr + at, CHUNK, 0, false)
+                .unwrap();
+            at
+        })
+        .collect()
+}
+
+/// `bytes` written through the mapping `from` and read back through the mapping `to`, both
+/// chunk maps from [`map_scattered`]; device bytes `from` does not reach read `fill`.
+fn remap(bytes: &[u8], from: &[u64], to: &[u64], fill: u8) -> Vec<u8> {
+    let chunk = CHUNK as usize;
+    let mut device = vec![fill; (from.iter().chain(to).max().unwrap() + CHUNK) as usize];
+    for (i, &at) in from.iter().enumerate() {
+        let src = &bytes[(i * chunk).min(bytes.len())..((i + 1) * chunk).min(bytes.len())];
+        device[at as usize..at as usize + src.len()].copy_from_slice(src);
+    }
+    to.iter()
+        .flat_map(|&at| device[at as usize..at as usize + chunk].to_vec())
+        .collect()
+}
+
+/// The guest bytes a single-level render target holding `linear` stores.
+fn target_bytes(info: &ImageInfo, linear: &[u8]) -> Vec<u8> {
+    let tiling = info.surface().level_tiling(0);
+    let mut tiled = vec![0; info.size_bytes() as usize];
+    swizzle(&tiling, linear, &mut tiled[..tiling.size_bytes()]);
+    tiled
+}
+
+/// Every subresource of `info` read from guest bytes `bytes`, layer-major.
+fn subresources_of(info: &ImageInfo, bytes: &[u8]) -> Vec<Vec<u8>> {
+    let surface = info.surface();
+    let mut out = Vec::new();
+    for layer in 0..info.layers {
+        for level in 0..info.levels {
+            let tiling = surface.level_tiling(level);
+            let at = info.subresource_offset(level, layer) as usize;
+            let mut linear = vec![0; tiling.linear_size_bytes()];
+            unswizzle(&tiling, &bytes[at..at + tiling.size_bytes()], &mut linear);
+            out.push(linear);
+        }
+    }
+    out
+}
+
+/// Mario Kart World's street light grid, scaled down 4x: a single-sample A8B8G8R8 Snorm
+/// 6144x6144 target written through one GPU mapping, and a 3072x3072x2 array of 4 levels in
+/// the same format sampled through another mapping of the same device pages, scattered in
+/// chunks. The array reads the target's bytes in its own layout.
+#[test]
+fn arrays_sampled_through_another_mapping_of_a_target_read_its_bytes_in_their_layout() {
+    for scale in [ResolutionScale::X1, ResolutionScale::X2] {
+        read_target_through_another_mapping(768, 64 << 20, scale);
+    }
+}
+
+/// The same at Mario Kart World's own size.
+#[test]
+fn mkw_light_grid_sampled_through_another_mapping_reads_its_target_bytes() {
+    read_target_through_another_mapping(3072, 192 << 20, ResolutionScale::X1);
+}
+
+fn read_target_through_another_mapping(size: u32, dram: u64, scale: ResolutionScale) {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        for array_first in [true, false] {
+            let Some(mut f) = fixture_with_dram(gob, AstcRecompression::Uncompressed, dram) else {
+                return;
+            };
+            f.cache.set_resolution_scale(scale);
+            let (writer, reader) = (GPU_VA + (1 << 30), GPU_VA + (2 << 30));
+            let target = mkw_target(0xd7, 2 * size, 2 * size, 4, 0, gob);
+            assert_eq!(target.format, PixelFormat::A8B8G8R8Snorm);
+            let mut header = tic(0x08, reader, size, size, 2, 4, 4);
+            header.0[0] = (header.0[0] & !(0xfff << 7)) | 1 << 7 | 1 << 10 | 1 << 13 | 1 << 16;
+            let array = ImageInfo::from_texture(&header.decode().unwrap(), gob).unwrap();
+            assert!(array.size_bytes() < target.size_bytes());
+            let from = map_scattered(
+                &f,
+                writer,
+                DADDR + (16 << 20),
+                target.size_bytes(),
+                |i, n| n - 1 - i,
+            );
+            let to = map_scattered(&f, reader, DADDR + (16 << 20), array.size_bytes(), |i, _| i);
+            let case = format!("{gob:?} {scale:?} array_first {array_first}");
+            let early = array_first.then(|| f.texture(&header).0);
+            let quarter = |f: &mut Fixture, color: [f32; 4]| {
+                clear_rt_at(f, writer, &target, [0.5, -0.5, 0.25, 1.0], Rect::ALL);
+                clear_rt_at(
+                    f,
+                    writer,
+                    &target,
+                    color,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: size,
+                        height: size,
+                    },
+                )
+            };
+            for color in [[-1.0, 1.0, 0.0, 0.5], [0.75, 0.0, -0.75, 1.0]] {
+                let rt = quarter(&mut f, color);
+                let host = f.read_image(rt.id).swap_remove(0);
+                let (inside, outside) = (&host[..4], &host[host.len() - 4..]);
+                let written: Vec<u8> = (0..4 * size * size)
+                    .flat_map(|i| {
+                        let (x, y) = (i % (2 * size), i / (2 * size));
+                        if x < size && y < size {
+                            inside
+                        } else {
+                            outside
+                        }
+                        .to_vec()
+                    })
+                    .collect();
+                let expected = subresources_of(
+                    &array,
+                    &remap(&target_bytes(&target, &written), &from, &to, 0),
+                );
+                let (id, _) = f.texture(&header);
+                assert_eq!(early.unwrap_or(id), id, "{case}");
+                let got = f.read_image(id);
+                assert_eq!(got.len(), expected.len(), "{case}");
+                for (i, (got, expected)) in got.iter().zip(&expected).enumerate() {
+                    let (layer, level) = (i as u32 / 4, i as u32 % 4);
+                    let wrong = got
+                        .chunks(4)
+                        .zip(expected.chunks(4))
+                        .filter(|(g, e)| g != e)
+                        .count();
+                    assert_eq!(
+                        wrong,
+                        0,
+                        "{case} {color:?}: layer {layer} level {level}: {wrong} of {} texels differ, first {:?} vs {:?}",
+                        got.len() / 4,
+                        &got[..4],
+                        &expected[..4]
+                    );
+                }
+            }
+            {
+                let (mut tx, cache, _) = f.tx();
+                cache
+                    .flush(&mut tx, DADDR + (16 << 20), target.size_bytes())
+                    .unwrap();
+            }
             f.assert_no_validation_errors();
         }
     }
