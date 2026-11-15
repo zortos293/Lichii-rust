@@ -135,6 +135,16 @@ pub(super) fn wait_synchronization(svc: &mut SvcContext) -> Flow {
         Ok(token) => token,
         Err(code) => return svc.finish(Err(code)),
     };
+    if lichii_common::crit::on() {
+        for i in 0..count {
+            lichii_common::crit::ev(
+                lichii_common::crit::KWOBJ,
+                svc.thread.id() as u64,
+                i as u64,
+                sync(i) as *const _ as u64,
+            );
+        }
+    }
     for i in 0..count {
         let waiter = Waiter {
             thread: svc.thread.clone(),

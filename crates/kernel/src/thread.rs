@@ -538,6 +538,12 @@ impl Thread {
     }
 
     pub(crate) fn wake_locked(self: &Arc<Self>, s: &mut Sched, wake: WakeResult) {
+        lichii_common::crit::ev(
+            lichii_common::crit::KWAKE,
+            self.id() as u64,
+            wake.index as u64,
+            0,
+        );
         s.wait = 0;
         s.wake = wake;
         self.wait_token.store(0, Ordering::Release);

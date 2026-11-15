@@ -298,6 +298,12 @@ impl Back {
                 if self.syncpoints.host().increment(argument).is_err() {
                     tracing::warn!(id = argument, "GPU increments an invalid syncpoint");
                 } else {
+                    lichii_common::crit::ev(
+                        lichii_common::crit::BINC,
+                        u64::from(argument),
+                        u64::from(self.syncpoints.host().value(argument).unwrap_or(0)),
+                        0,
+                    );
                     self.rasterizer
                         .signal_fence(FenceAction::IncrementSyncpoint(argument));
                 }

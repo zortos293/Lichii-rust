@@ -98,6 +98,7 @@ impl SyncState {
 
     /// Sets the object signaled and wakes every waiter, noting the host thread as the signaller.
     pub fn signal(&self) {
+        lichii_common::crit::ev(lichii_common::crit::KSIG, self as *const Self as u64, 0, 0);
         let mut inner = self.inner.lock();
         HOST_THREAD_NAME.with(|name| {
             if !matches!(&inner.last_signaller, Signaller::Host(last) if Arc::ptr_eq(last, name)) {
@@ -109,6 +110,7 @@ impl SyncState {
 
     /// Sets the object signaled on behalf of a guest thread and wakes every waiter.
     pub(crate) fn signal_from_guest(&self, thread: ThreadId) {
+        lichii_common::crit::ev(lichii_common::crit::KSIG, self as *const Self as u64, 1, 0);
         let mut inner = self.inner.lock();
         inner.last_signaller = Signaller::Guest(thread);
         inner.signal();

@@ -241,6 +241,12 @@ pub(crate) fn wait_guest_syncpoint(
             result => break result,
         }
     };
+    lichii_common::crit::ev(
+        lichii_common::crit::SWAIT,
+        u64::from(id),
+        u64::from(threshold),
+        started.elapsed().as_nanos() as u64,
+    );
     if stalled {
         tracing::warn!(
             syncpoint = id,

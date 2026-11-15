@@ -50,6 +50,7 @@ struct NativeEvents {
 
 impl NativeEvents {
     fn vblank(&self) {
+        lichii_common::crit::ev(lichii_common::crit::VBLANK, 0, 0, 0);
         let vsync = self.vsync.load(Ordering::Acquire);
         let slots = self.slots.lock();
         for (index, event) in slots.iter().enumerate() {

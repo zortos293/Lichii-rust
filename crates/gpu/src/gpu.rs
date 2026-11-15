@@ -635,6 +635,12 @@ impl Gpu {
                 },
             ))
         });
+        lichii_common::crit::ev(
+            lichii_common::crit::GSUB,
+            u64::from(channel.0),
+            submission.entries.len() as u64,
+            fence.map_or(u64::MAX, |f| (u64::from(f.id) << 32) | u64::from(f.value)),
+        );
         fence
     }
 

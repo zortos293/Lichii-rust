@@ -279,7 +279,21 @@ impl Ctrl {
         let action = self
             .syncpoints()
             .guest()
-            .register_action(fence_id, target, move || shared.signal(generation));
+            .register_action(fence_id, target, move || {
+                lichii_common::crit::ev(
+                    lichii_common::crit::EVSIG,
+                    u64::from(fence_id),
+                    u64::from(target),
+                    u64::from(slot),
+                );
+                shared.signal(generation)
+            });
+        lichii_common::crit::ev(
+            lichii_common::crit::EVREG,
+            u64::from(fence_id),
+            u64::from(target),
+            u64::from(slot),
+        );
         event.wait = action.ok().flatten();
         NvResult::Timeout
     }

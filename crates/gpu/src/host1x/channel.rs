@@ -241,6 +241,12 @@ impl CommandStream {
                 let id = argument & 0xff;
                 let _ = self.syncpoints.guest().increment(id);
                 let _ = self.syncpoints.host().increment(id);
+                lichii_common::crit::ev(
+                    lichii_common::crit::GINC,
+                    u64::from(id),
+                    u64::from(self.syncpoints.guest().value(id).unwrap_or(0)),
+                    1,
+                );
             }
             THI_METHOD_0 => self.engine_method = argument,
             THI_METHOD_1 => self.engine.write(self.engine_method, argument),

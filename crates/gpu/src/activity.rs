@@ -109,12 +109,19 @@ pub struct Waiting<'a> {
     activity: &'a Activity,
     wait: Wait,
     nested: bool,
+    crit_start: u64,
 }
 
 impl Drop for Waiting<'_> {
     fn drop(&mut self) {
         if self.nested {
             return;
+        }
+        if self.crit_start != 0 {
+            let ns = lichii_common::crit::now().saturating_sub(self.crit_start);
+            if ns >= 20_000 {
+                lichii_common::crit::ev(lichii_common::crit::GWAIT, self.wait as u64, ns, 0);
+            }
         }
         let clock = &self.activity.waits[self.wait as usize];
         let since = clock.since.swap(NOT_WAITING, Ordering::AcqRel);
@@ -166,6 +173,9 @@ impl Activity {
     pub fn renderer_call(&self, kind: RendererCall, start: Instant) {
         self.call_since.store(NOT_WAITING, Ordering::Release);
         let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if kind == RendererCall::Present || ns >= 500_000 {
+            lichii_common::crit::ev(lichii_common::crit::RCALL, kind as u64, ns, 0);
+        }
         self.calls[kind as usize].fetch_add(1, Ordering::Relaxed);
         self.renderer_ns.fetch_add(ns, Ordering::Relaxed);
         self.longest_ns.fetch_max(ns, Ordering::Relaxed);
@@ -182,6 +192,11 @@ impl Activity {
             activity: self,
             wait,
             nested,
+            crit_start: if lichii_common::crit::on() {
+                lichii_common::crit::now()
+            } else {
+                0
+            },
         }
     }
 

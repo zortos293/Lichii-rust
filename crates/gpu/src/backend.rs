@@ -426,6 +426,12 @@ impl FenceAction {
                 if handles.syncpoints.guest().increment(id).is_err() {
                     tracing::warn!(id, "fence increments an invalid syncpoint");
                 }
+                lichii_common::crit::ev(
+                    lichii_common::crit::GINC,
+                    u64::from(id),
+                    u64::from(handles.syncpoints.guest().value(id).unwrap_or(0)),
+                    0,
+                );
             }
         }
     }

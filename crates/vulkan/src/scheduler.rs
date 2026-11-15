@@ -36,7 +36,15 @@ pub struct Scheduler {
     activity: Option<Arc<Activity>>,
     /// Tick of a sparse binding the next submission must wait for.
     bound: Option<u64>,
+    /// DIAG: a timestamp query pool and nanoseconds per tick, the next pair, the pair of the
+    /// buffer being recorded, and the stamped submissions in flight (tick, pair, host ns).
+    stamps: Option<(vk::QueryPool, f64)>,
+    stamp_next: u32,
+    stamp_current: Option<u32>,
+    stamped: VecDeque<(u64, u32, u64)>,
 }
+
+const STAMP_PAIRS: u32 = 4096;
 
 impl Scheduler {
     pub fn new(device: &Arc<Device>) -> Result<Self> {
@@ -80,12 +88,27 @@ impl Scheduler {
             garbage: VecDeque::new(),
             activity: None,
             bound: None,
+            stamps: None,
+            stamp_next: 0,
+            stamp_current: None,
+            stamped: VecDeque::new(),
         })
     }
 
     /// Times every blocking [`Scheduler::wait`] from now on in `activity`.
     pub fn time_waits(&mut self, activity: Arc<Activity>) {
         self.activity = Some(activity);
+        if std::env::var_os("LICHII_CRIT_TRACE").is_some()
+            && self.device.properties.timestamp_valid_bits != 0
+        {
+            let info = vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::TIMESTAMP)
+                .query_count(STAMP_PAIRS * 2);
+            // SAFETY: valid create info on a live device.
+            if let Ok(pool) = unsafe { self.device.raw.create_query_pool(&info, None) } {
+                self.stamps = Some((pool, f64::from(self.device.properties.timestamp_period)));
+            }
+        }
     }
 
     pub fn device(&self) -> &Arc<Device> {
@@ -140,6 +163,21 @@ impl Scheduler {
                 .begin_command_buffer(cmd, &begin)
                 .call("vkBeginCommandBuffer")?
         };
+        if let Some((pool, _)) = self.stamps {
+            let pair = self.stamp_next;
+            self.stamp_next = (pair + 1) % STAMP_PAIRS;
+            // SAFETY: `cmd` is recording outside a render pass; the pair is not in flight.
+            unsafe {
+                self.device.raw.cmd_reset_query_pool(cmd, pool, pair * 2, 2);
+                self.device.raw.cmd_write_timestamp(
+                    cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    pool,
+                    pair * 2,
+                );
+            }
+            self.stamp_current = Some(pair);
+        }
         self.current = Some(cmd);
         Ok(cmd)
     }
@@ -163,6 +201,21 @@ impl Scheduler {
     ) -> Result<u64> {
         let tick = self.tick;
         let cmd = self.current.take();
+        if let (Some(cmd), Some((pool, _)), Some(pair)) =
+            (cmd, self.stamps, self.stamp_current.take())
+        {
+            // SAFETY: `cmd` is recording; the pair was reset at its start.
+            unsafe {
+                self.device.raw.cmd_write_timestamp(
+                    cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    pool,
+                    pair * 2 + 1,
+                );
+            }
+            self.stamped
+                .push_back((tick, pair, lichii_common::crit::now()));
+        }
         if let Some(cmd) = cmd {
             // SAFETY: `cmd` is in the recording state.
             unsafe {
@@ -307,6 +360,33 @@ impl Scheduler {
     /// finished; returns the last finished tick.
     pub fn collect(&mut self) -> u64 {
         let completed = self.completed();
+        if let Some((pool, period)) = self.stamps {
+            while let Some(&(tick, pair, submitted)) = self.stamped.front() {
+                if tick > completed {
+                    break;
+                }
+                self.stamped.pop_front();
+                let mut data = [0u64; 2];
+                // SAFETY: the pair's submission completed, so both queries are available.
+                if unsafe {
+                    self.device.raw.get_query_pool_results(
+                        pool,
+                        pair * 2,
+                        &mut data,
+                        vk::QueryResultFlags::TYPE_64,
+                    )
+                }
+                .is_ok()
+                {
+                    lichii_common::crit::ev(
+                        lichii_common::crit::GPUCB,
+                        submitted,
+                        (data[0] as f64 * period) as u64,
+                        (data[1] as f64 * period) as u64,
+                    );
+                }
+            }
+        }
         while let Some(&(tick, cmd)) = self.in_flight.front() {
             if tick > completed {
                 break;
@@ -347,6 +427,9 @@ impl Drop for Scheduler {
         self.garbage.clear();
         // SAFETY: all submissions finished; the pool frees its command buffers.
         unsafe {
+            if let Some((pool, _)) = self.stamps {
+                self.device.raw.destroy_query_pool(pool, None);
+            }
             self.device.raw.destroy_command_pool(self.pool, None);
         }
     }

@@ -19,6 +19,10 @@ struct Core {
     current_cpu: Option<ProcessId>,
     seen_exits: u64,
     ctx: ThreadContext,
+    guest_ns: u64,
+    park_ns: u64,
+    svc_ns: u64,
+    reported: std::time::Instant,
 }
 
 pub(crate) fn run_core(kernel: Arc<KernelInner>, index: usize) {
@@ -29,10 +33,38 @@ pub(crate) fn run_core(kernel: Arc<KernelInner>, index: usize) {
         current_cpu: None,
         seen_exits: 0,
         ctx: ThreadContext::default(),
+        guest_ns: 0,
+        park_ns: 0,
+        svc_ns: 0,
+        reported: std::time::Instant::now(),
     };
-    while let Some(picked) = core.kernel.scheduler.next(index) {
+    loop {
+        let park_start = std::time::Instant::now();
+        let Some(picked) = core.kernel.scheduler.next(index) else {
+            break;
+        };
+        let parked = park_start.elapsed().as_nanos() as u64;
+        core.park_ns += parked;
+        if parked >= 20_000 {
+            lichii_common::crit::ev(lichii_common::crit::PARK, index as u64, parked, 0);
+        }
+        if core.reported.elapsed() >= std::time::Duration::from_secs(1) {
+            core.reported = std::time::Instant::now();
+            lichii_common::crit::ev(
+                lichii_common::crit::CORE,
+                (core.svc_ns << 8) | index as u64,
+                core.guest_ns,
+                core.park_ns,
+            );
+        }
         core.retire_exited_processes();
         let thread = picked.thread;
+        lichii_common::crit::ev(
+            lichii_common::crit::KRUN,
+            thread.id() as u64,
+            index as u64,
+            0,
+        );
         if picked.terminate {
             core.kernel.exit_thread(index, &thread);
             continue;
@@ -95,7 +127,9 @@ impl Core {
         self.cpus[slot].1.clear_exclusive();
         loop {
             let halt = if self.kernel.scheduler.enter_guest(self.index) {
+                let guest_start = std::time::Instant::now();
                 let halt = self.cpus[slot].1.run(&mut self.ctx);
+                self.guest_ns += guest_start.elapsed().as_nanos() as u64;
                 self.kernel.scheduler.leave_guest(self.index);
                 halt
             } else {
@@ -109,7 +143,27 @@ impl Core {
                         thread,
                         ctx: &mut self.ctx,
                     };
-                    svc::dispatch(&mut svc, imm)
+                    let svc_start = std::time::Instant::now();
+                    let flow = svc::dispatch(&mut svc, imm);
+                    let svc_ns = svc_start.elapsed().as_nanos() as u64;
+                    self.svc_ns += svc_ns;
+                    if svc_ns >= 50_000 {
+                        lichii_common::crit::ev(
+                            lichii_common::crit::SVC,
+                            thread.id() as u64,
+                            u64::from(imm),
+                            svc_ns,
+                        );
+                    }
+                    if flow == Flow::Switch {
+                        lichii_common::crit::ev(
+                            lichii_common::crit::KBLOCK,
+                            thread.id() as u64,
+                            u64::from(imm),
+                            self.index as u64,
+                        );
+                    }
+                    flow
                 }
                 HaltReason::InvalidateCode { addr, size } => {
                     self.kernel
