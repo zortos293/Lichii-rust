@@ -7,6 +7,7 @@
 //! dispatches (see [`draw`]).
 
 mod draw;
+mod fence_waiter;
 mod frame_dump;
 mod samples;
 
@@ -183,6 +184,7 @@ pub struct VulkanRasterizer {
     gob_layout: GobLayout,
     frames: Vec<Arc<FrameImage>>,
     fences: VecDeque<(u64, Release)>,
+    fence_waiter: Option<fence_waiter::FenceWaiter>,
     samples: samples::SampleCounter,
     unflushed: bool,
     texture_cache: ManuallyDrop<TextureCache>,
@@ -372,6 +374,7 @@ impl VulkanRasterizer {
             gob_layout,
             frames: Vec::new(),
             fences: VecDeque::new(),
+            fence_waiter: None,
             samples,
             unflushed: true,
             texture_cache: ManuallyDrop::new(texture_cache),
@@ -1200,6 +1203,23 @@ impl Rasterizer for VulkanRasterizer {
                     self.samples.resolve(&self.device, range);
                 }
             }
+        }
+        if let Some(waiter) = &mut self.fence_waiter
+            && let Some(&(tick, _)) = self.fences.front()
+            && tick < self.scheduler.tick()
+        {
+            waiter.wait_for(tick);
+        }
+    }
+
+    fn set_fence_wake(&mut self, wake: Box<dyn Fn() + Send + Sync>) {
+        match fence_waiter::FenceWaiter::spawn(
+            self.device.clone(),
+            self.scheduler.shared_timeline(),
+            wake,
+        ) {
+            Ok(waiter) => self.fence_waiter = Some(waiter),
+            Err(error) => tracing::warn!(%error, "no fence wake thread; fences are polled"),
         }
     }
 
@@ -2053,6 +2073,27 @@ mod tests {
         f.rasterizer.release_fences(true);
         assert!(!f.rasterizer.has_pending_fences());
         assert_eq!(f.syncpoints.guest().value(4).unwrap(), 1);
+    }
+
+    #[test]
+    fn fence_wake_fires_once_the_fence_work_finished() {
+        let Some(mut f) = fixture(GobLayout::Tegra) else {
+            return;
+        };
+        let (woke, wakes) = std::sync::mpsc::channel();
+        let woke = std::sync::Mutex::new(woke);
+        f.rasterizer
+            .set_fence_wake(Box::new(move || woke.lock().unwrap().send(()).unwrap()));
+        f.rasterizer
+            .signal_fence(FenceAction::IncrementSyncpoint(3));
+        f.rasterizer.flush_commands();
+        f.rasterizer.release_fences(false);
+        wakes
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the fence wake fires");
+        f.rasterizer.release_fences(false);
+        assert_eq!(f.syncpoints.guest().value(3).unwrap(), 1);
+        assert!(!f.rasterizer.has_pending_fences());
     }
 
     #[test]
