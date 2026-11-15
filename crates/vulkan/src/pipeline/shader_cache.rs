@@ -299,7 +299,7 @@ impl ShaderCache {
             .zip(&lichii_shader::STAGE_NS)
             .map(|(n, v)| {
                 let v = v.load(std::sync::atomic::Ordering::Relaxed);
-                if *n == "programs" { format!("{n}={v}") } else { format!("{n}={:.1}", v as f64 / 1e6) }
+                if n.starts_with("programs") { format!("{n}={v}") } else { format!("{n}={:.1}", v as f64 / 1e6) }
             })
             .collect();
         tracing::info!("translate stages ms: {}", stages.join(" "));

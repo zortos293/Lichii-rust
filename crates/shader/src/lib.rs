@@ -49,11 +49,12 @@ pub mod profile;
 pub mod runtime;
 pub mod translate;
 
-pub static STAGE_NS: [std::sync::atomic::AtomicU64; 20] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 20];
-pub const STAGE_NAMES: [&str; 20] = [
+pub static STAGE_NS: [std::sync::atomic::AtomicU64; 24] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 24];
+pub const STAGE_NAMES: [&str; 24] = [
     "cfg", "structure", "ssa", "constprop", "gmem", "texture", "dce", "other_opt", "info", "spirv", "total", "programs",
     "spv_ctx", "spv_main", "spv_deferred", "spv_phis", "spv_assemble", "ssa_idom", "ssa_phicand", "ssa_main",
+    "inplace_multi", "inplace_all", "programs_draws_multi", "programs_draws_any",
 ];
 pub fn stage<R>(i: usize, f: impl FnOnce() -> R) -> R {
     let start = std::time::Instant::now();

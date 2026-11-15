@@ -654,7 +654,21 @@ impl VulkanRasterizer {
             return Ok(());
         }
         let may_skip = self.draw.presented_only();
-        if !self.graphics_stages(ctx, host_topology, may_skip) {
+        let before = (self.draw.shaders.blocked(), self.draw.shaders.stalled());
+        let staged = self.graphics_stages(ctx, host_topology, may_skip);
+        let translated = self.draw.shaders.blocked() - before.0;
+        if translated > 0 {
+            use std::sync::atomic::Ordering::Relaxed;
+            let ns = (self.draw.shaders.stalled() - before.1).as_nanos() as u64;
+            let s = &lichii_shader::STAGE_NS;
+            s[21].fetch_add(ns, Relaxed);
+            s[23].fetch_add(1, Relaxed);
+            if translated >= 2 {
+                s[20].fetch_add(ns, Relaxed);
+                s[22].fetch_add(1, Relaxed);
+            }
+        }
+        if !staged {
             return Ok(());
         }
 
