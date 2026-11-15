@@ -1488,6 +1488,23 @@ impl VulkanRasterizer {
                                     desc.is_written
                                 ))
                             });
+                            if diag::watch_va(address)
+                                || diag::watch_va(address + size.saturating_sub(1))
+                            {
+                                diag::watch_log(
+                                    "sb bind",
+                                    format!(
+                                        "SB{descriptor}.{i}@{address:#x}/{size} w={} stage={:?}",
+                                        desc.is_written,
+                                        std::backtrace::Backtrace::force_capture()
+                                            .to_string()
+                                            .lines()
+                                            .filter(|l| l.contains("lichii"))
+                                            .take(6)
+                                            .collect::<Vec<_>>()
+                                    ),
+                                );
+                            }
                             self.push_buffer(binding);
                         }
                     }
