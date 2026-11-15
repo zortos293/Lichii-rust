@@ -354,6 +354,9 @@ impl CachedImage {
 
     /// Guest memory must replace every texel on the next upload.
     fn mark_dirty_whole(&mut self) {
+        if self.info.format.is_astc() {
+            diag_astc::dirty(self.segments.first().map_or(0, |s| s.daddr), 4, 0, 0);
+        }
         self.cpu_dirty = true;
         self.dirty_whole = true;
     }
@@ -361,6 +364,14 @@ impl CachedImage {
     /// The guest CPU wrote `[daddr, daddr + size)`: the subresources holding those bytes upload
     /// again. Write tracking stays on the other pages, so later writes there are still seen.
     fn mark_cpu_written(&mut self, daddr: DAddr, size: u64) {
+        if self.info.format.is_astc() {
+            diag_astc::dirty(
+                self.segments.first().map_or(0, |s| s.daddr),
+                diag_astc::CAUSE.get(),
+                daddr,
+                size,
+            );
+        }
         if !self.cpu_dirty {
             self.cpu_dirty = true;
             self.dirty_whole = !self.keep_out.is_empty();
@@ -1338,6 +1349,7 @@ impl TextureCache {
                 result = result.and(written_back);
             }
             let image = self.image(id);
+            diag_astc::CAUSE.set(1);
             image.mark_cpu_written(daddr, size);
             image.gpu_modified = false;
         }
@@ -1359,6 +1371,7 @@ impl TextureCache {
         for &id in &ids {
             let image = self.image(id);
             if !image.gpu_modified {
+                diag_astc::CAUSE.set(2);
                 image.mark_cpu_written(daddr, size);
             }
         }
@@ -2191,6 +2204,17 @@ impl TextureCache {
 
     fn create(&mut self, info: &ImageInfo, segments: Vec<Segment>) -> Result<ImageId> {
         self.creations += 1;
+        if info.format.is_astc() {
+            diag_astc::line(format_args!(
+                "create {:#x} {}x{} layers {} levels {} {:?}",
+                segments.first().map_or(0, |s| s.daddr),
+                info.width,
+                info.height,
+                info.layers,
+                info.levels,
+                info.format
+            ));
+        }
         let host = self.host(info.format);
         let desc = Self::image_desc(info, &host, ResolutionScale::X1);
         let image = if info.texels() > MAX_TEXELS {
@@ -2292,6 +2316,12 @@ impl TextureCache {
             }
         }
         self.removals += 1;
+        if image.info.format.is_astc() {
+            diag_astc::line(format_args!(
+                "remove {:#x}",
+                image.segments.first().map_or(0, |s| s.daddr)
+            ));
+        }
         self.free.push(id.index);
         for s in &image.segments {
             for page in pages(s.daddr, s.size) {
@@ -2425,6 +2455,7 @@ impl TextureCache {
         if result.is_ok() {
             let image = self.image(id);
             image.gpu_modified = false;
+            diag_astc::CAUSE.set(3);
             for &(daddr, size) in &ranges {
                 image.mark_cpu_written(daddr, size);
             }
@@ -2656,6 +2687,14 @@ impl TextureCache {
         }
         if total == 0 {
             return Ok(());
+        }
+        if format.is_astc() {
+            diag_astc::upload(
+                image.segments.first().map_or(0, |s| s.daddr),
+                (info.width, info.height, info.layers, levels),
+                total,
+                image.dirty_whole,
+            );
         }
         traffic.uploads += 1;
         traffic.upload_bytes += total;
@@ -3199,6 +3238,14 @@ impl TextureCache {
 
     fn evict(&mut self, scheduler: &mut Scheduler, id: ImageId) {
         let bytes = self.get(id).map_or(0, |i| i.image.memory_size());
+        if let Some(i) = self.get(id).filter(|i| i.info.format.is_astc()) {
+            diag_astc::line(format_args!(
+                "evict {:#x} frame {} last_use {}",
+                i.segments.first().map_or(0, |s| s.daddr),
+                self.frame,
+                i.last_use
+            ));
+        }
         self.remove(scheduler, id);
         self.sentenced.push_back((scheduler.tick(), bytes));
         self.sentenced_bytes += bytes;
@@ -3317,4 +3364,51 @@ fn blit_image(
             filter,
         )
     };
+}
+
+mod diag_astc {
+    use std::cell::Cell;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    thread_local! {
+        pub static CAUSE: Cell<u8> = const { Cell::new(0) };
+    }
+
+    static LINES: AtomicU64 = AtomicU64::new(0);
+    static CAUSES: Mutex<Option<HashMap<u64, (u32, u64)>>> = Mutex::new(None);
+
+    pub fn line(args: std::fmt::Arguments<'_>) {
+        if LINES.fetch_add(1, Ordering::Relaxed) < 400_000 {
+            tracing::info!("diag astc {args}");
+        }
+    }
+
+    pub fn dirty(image: u64, cause: u8, daddr: u64, size: u64) {
+        let mut map = CAUSES.lock().unwrap();
+        let e = map.get_or_insert_with(HashMap::new).entry(image).or_insert((0, 0));
+        let first = e.0 & (1 << cause) == 0;
+        e.0 |= 1 << cause;
+        e.1 += 1;
+        drop(map);
+        if first {
+            line(format_args!(
+                "dirty {image:#x} cause {cause} write {daddr:#x}+{size:#x}"
+            ));
+        }
+    }
+
+    pub fn upload(image: u64, dims: (u32, u32, u32, u32), bytes: u64, whole: bool) {
+        let (causes, marks) = CAUSES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .remove(&image)
+            .unwrap_or((0, 0));
+        line(format_args!(
+            "upload {image:#x} {}x{} layers {} levels {} bytes {bytes} whole {whole} causes {causes:#b} marks {marks}",
+            dims.0, dims.1, dims.2, dims.3
+        ));
+    }
 }
