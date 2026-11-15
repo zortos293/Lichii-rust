@@ -52,7 +52,7 @@ use lichii_texture::PixelFormat;
 use lichii_texture::block_linear::{GobLayout, Tiling, swizzle, unswizzle};
 use lichii_texture::tic::{SwizzleSource, TextureDescriptor};
 
-pub use blit::BlitSide;
+pub use blit::{BlitSide, NearestSampling};
 pub use info::{GuestLayout, ImageInfo, ImageKind, ViewInfo};
 
 use crate::buffer_cache::BufferCache;
@@ -576,6 +576,7 @@ pub struct TextureCache {
     downloads: Vec<Download>,
     clear_pipelines: Option<ClearPipelines>,
     guest_sync: Option<guest_sync::GuestSync>,
+    gather: Option<blit::Gather>,
     vram_usage: VramUsage,
     /// Frames presented so far.
     frame: u64,
@@ -875,6 +876,7 @@ impl TextureCache {
             downloads: Vec::new(),
             clear_pipelines: None,
             guest_sync: None,
+            gather: None,
             vram_usage: VramUsage::default(),
             frame: 0,
             lru_head: NIL,

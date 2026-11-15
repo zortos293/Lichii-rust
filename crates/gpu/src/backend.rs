@@ -559,12 +559,18 @@ pub trait Rasterizer: Send {
     /// and deferred [`Query`] writes landed.
     fn release_fences(&mut self, wait: bool);
 
+    /// Gives the renderer `wake`, which ends an idle GPU's wait at once: a renderer whose fences
+    /// wait for host GPU work calls it when the work of the oldest submitted fence finished, so the
+    /// GPU runs [`release_fences(false)`](Self::release_fences) then instead of at its next poll.
+    /// Called once, before any other call. The default ignores it.
+    fn set_fence_wake(&mut self, _wake: Box<dyn Fn() + Send + Sync>) {}
+
     /// Whether fences signalled earlier may still wait for their host GPU work, or recorded work
     /// is not submitted yet. While this holds, an idle GPU calls
     /// [`flush_commands`](Self::flush_commands) and then
-    /// [`release_fences(false)`](Self::release_fences) about every millisecond, so recorded work
-    /// reaches the host GPU and a syncpoint or semaphore the guest CPU waits on lands without more
-    /// GPU work behind it. The default, true, suits any renderer that defers work; a renderer that
+    /// [`release_fences(false)`](Self::release_fences) about every millisecond, and whenever the
+    /// [`set_fence_wake`](Self::set_fence_wake) wake fires, so recorded work reaches the host GPU
+    /// and a syncpoint or semaphore the guest CPU waits on lands without more GPU work behind it. The default, true, suits any renderer that defers work; a renderer that
     /// knows it has nothing recorded or queued can return false and idle without polling.
     fn has_pending_fences(&self) -> bool {
         true

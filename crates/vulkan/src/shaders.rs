@@ -94,6 +94,8 @@ pub static EGUI_FRAG: &[u32] = spirv!("egui.frag");
 pub static BLOCK_LINEAR_UNSWIZZLE_COMP: &[u32] = spirv!("block_linear_unswizzle.comp");
 /// `guest_bytes.comp`: One 2D block-linear slice between a pitch-linear buffer and a buffer of guest bytes, either way, skipping words outside the guest buffer; packs and unpacks D24S8 depth and stencil. Local size 32x8.
 pub static GUEST_BYTES_COMP: &[u32] = spirv!("guest_bytes.comp");
+/// `blit_gather.comp`: A nearest-filtered 2D engine blit between buffers of raw texels of one format, sampling at the engine's 32.32 positions clamped to the box of source texels the software blit reads. Local size 8x8.
+pub static BLIT_GATHER_COMP: &[u32] = spirv!("blit_gather.comp");
 /// `indirect_assemble.comp`: Quads, quad strips and line loops of indirect draws as u32 triangle list or line strip indices and patched `VkDrawIndexedIndirectCommand`s, one 64-invocation workgroup per guest command.
 pub static INDIRECT_ASSEMBLE_COMP: &[u32] = spirv!("indirect_assemble.comp");
 /// `dispatch_grid.comp`: The packed grid words of a version 1.x launch descriptor as a `VkDispatchIndirectCommand`, clamped to the device's workgroup count limits; one invocation.
@@ -134,6 +136,7 @@ pub static ALL: &[(&str, &[u32])] = &[
     ("egui.frag", EGUI_FRAG),
     ("block_linear_unswizzle.comp", BLOCK_LINEAR_UNSWIZZLE_COMP),
     ("guest_bytes.comp", GUEST_BYTES_COMP),
+    ("blit_gather.comp", BLIT_GATHER_COMP),
     ("indirect_assemble.comp", INDIRECT_ASSEMBLE_COMP),
     ("dispatch_grid.comp", DISPATCH_GRID_COMP),
     ("mesh_indirect.comp", MESH_INDIRECT_COMP),
