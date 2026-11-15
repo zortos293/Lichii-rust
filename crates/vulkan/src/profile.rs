@@ -126,9 +126,45 @@ pub(crate) fn shader_profile(
         support_float16: features.shader_float16,
         support_int64: features.shader_int64,
         support_viewport_index_layer: profile.support_viewport_index_layer_non_geometry,
+        // Barriers stay in loops and branches, where a workgroup's warps sharing memory need
+        // them; Intel drivers do not run them reliably there.
+        support_conditional_barrier: !matches!(
+            v12.driver_id,
+            vk::DriverId::INTEL_PROPRIETARY_WINDOWS | vk::DriverId::INTEL_OPEN_SOURCE_MESA
+        ),
         support_handle_programs: true,
         support_handle_table_arrays: features.sampled_image_array_non_uniform_indexing,
         ..HostTranslateInfo::default()
     };
     (profile, host)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conditional_barriers(driver_id: vk::DriverId) -> bool {
+        let limits = vk::PhysicalDeviceLimits::default();
+        let vulkan11 = vk::PhysicalDeviceVulkan11Properties::default();
+        let vulkan12 = vk::PhysicalDeviceVulkan12Properties::default().driver_id(driver_id);
+        let queries = ShaderQueries {
+            api_version: vk::API_VERSION_1_3,
+            limits: &limits,
+            vulkan11: &vulkan11,
+            vulkan12: &vulkan12,
+        };
+        let (_, host) = shader_profile(&DeviceFeatures::default(), &queries);
+        host.support_conditional_barrier
+    }
+
+    #[test]
+    fn barriers_stay_in_conditional_control_flow_except_on_intel() {
+        assert!(conditional_barriers(vk::DriverId::AMD_PROPRIETARY));
+        assert!(conditional_barriers(vk::DriverId::MESA_RADV));
+        assert!(conditional_barriers(vk::DriverId::NVIDIA_PROPRIETARY));
+        assert!(!conditional_barriers(
+            vk::DriverId::INTEL_PROPRIETARY_WINDOWS
+        ));
+        assert!(!conditional_barriers(vk::DriverId::INTEL_OPEN_SOURCE_MESA));
+    }
 }
