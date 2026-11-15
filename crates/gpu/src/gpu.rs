@@ -407,10 +407,16 @@ impl Gpu {
         config: GpuConfig,
         renderer: impl FnOnce(GpuHandles) -> Box<dyn Rasterizer>,
     ) -> Self {
+        let timestamp = Arc::new(GpuTimestamp::new(time, config.console == Console::Switch2));
+        match std::env::var("LICHII_DIAG_GPU_CLOCK").as_deref() {
+            Ok("boost") => timestamp.set_speed(crate::clock::GpuClockSpeed::Boost),
+            Ok("overclock") => timestamp.set_speed(crate::clock::GpuClockSpeed::Overclock),
+            _ => {}
+        }
         let handles = GpuHandles {
             device: host1x.memory.clone(),
             syncpoints: host1x.syncpoints.clone(),
-            timestamp: Arc::new(GpuTimestamp::new(time, config.console == Console::Switch2)),
+            timestamp,
             written_pages: host1x.written_pages.clone(),
             lazy: host1x.lazy.clone(),
             activity: Arc::new(Activity::new()),
