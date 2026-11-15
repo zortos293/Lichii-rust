@@ -158,21 +158,23 @@ fn depth_stencil_host(host: vk::Format) -> bool {
 
 /// Bytes `image` shares with the guest bytes buffer: its offsets `[from, from + size)` are the
 /// buffer's bytes from `at`.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Run {
     from: u64,
     size: u64,
     at: u64,
 }
 
-/// Reused storage for [`shared_runs`]: the target's segments by device address, the runs, and
-/// the runs as `guest_bytes.comp` reads them.
+/// Reused storage for [`shared_runs`] and [`trim_aliases`]: the target's segments by device
+/// address, the runs, the guest bytes already claimed and the trimmed runs, and the runs as
+/// `guest_bytes.comp` reads them.
 #[derive(Default)]
 struct RunScratch {
     targets: Vec<Segment>,
     runs: Vec<Run>,
+    claimed: Vec<(u64, u64)>,
+    trimmed: Vec<Run>,
     words: Vec<[u32; 4]>,
-    spans: Vec<(u64, u64)>,
 }
 
 /// Fills `scratch.runs`, by image offset, with where the bytes of `image` land in the
@@ -214,6 +216,50 @@ fn shared_runs(
     }
     runs.sort_unstable_by_key(|r| r.from);
     true
+}
+
+/// Trims `scratch.runs` so every guest byte has one source run: where runs of an image whose
+/// segments alias device memory land on the same guest bytes, the run with the highest image
+/// offset keeps them, as when the runs were painted one after another in image order. Leaves
+/// the runs sorted by image offset.
+fn trim_aliases(scratch: &mut RunScratch) {
+    let RunScratch {
+        runs,
+        claimed,
+        trimmed,
+        ..
+    } = scratch;
+    claimed.clear();
+    trimmed.clear();
+    for run in runs.iter().rev() {
+        let (start, end) = (run.at, run.at + run.size);
+        let first = claimed.partition_point(|c| c.1 < start);
+        let last = claimed.partition_point(|c| c.0 <= end);
+        let mut at = start;
+        for &(lo, hi) in &claimed[first..last] {
+            if lo > at {
+                trimmed.push(Run {
+                    from: run.from + (at - start),
+                    size: lo.min(end) - at,
+                    at,
+                });
+            }
+            at = at.max(hi);
+        }
+        if at < end {
+            trimmed.push(Run {
+                from: run.from + (at - start),
+                size: end - at,
+                at,
+            });
+        }
+        let merged = claimed[first..last]
+            .iter()
+            .fold((start, end), |(lo, hi), c| (lo.min(c.0), hi.max(c.1)));
+        claimed.splice(first..last, [merged]);
+    }
+    trimmed.sort_unstable_by_key(|r| r.from);
+    std::mem::swap(runs, trimmed);
 }
 
 pub(super) fn barrier(device: &Device, cmd: vk::CommandBuffer) {
@@ -424,6 +470,9 @@ impl TextureCache {
         let placed = shared_runs(image, target, window, &mut sync.scratch);
         debug_assert!(placed, "checked by sync_on_gpu");
         let scratch = &mut sync.scratch;
+        if direction == Direction::ToGuest {
+            trim_aliases(scratch);
+        }
         scratch.words.clear();
         scratch.words.extend(
             scratch
@@ -431,13 +480,6 @@ impl TextureCache {
                 .iter()
                 .map(|r| [r.from as u32, r.size as u32, r.at as u32, 0]),
         );
-        scratch.spans.clear();
-        scratch
-            .spans
-            .extend(scratch.runs.iter().map(|r| (r.at, r.at + r.size)));
-        scratch.spans.sort_unstable();
-        let serial =
-            direction == Direction::ToGuest && scratch.spans.windows(2).any(|s| s[0].1 > s[1].0);
         let run_bytes: &[u8] = bytemuck::cast_slice(&scratch.words);
         ensure(
             &device,
@@ -549,48 +591,40 @@ impl TextureCache {
                         }
                     }
                     barrier(&device, cmd);
-                    let passes = if serial { count } else { 1 };
-                    for pass in 0..passes {
-                        let (run_first, run_count) = if serial {
-                            (first + pass, 1)
-                        } else {
-                            (first, count)
-                        };
-                        let set = sync
-                            .descriptors
-                            .allocate(tx.scheduler, sync.compute.set_layout)?;
-                        let params = Params {
-                            row_words,
-                            height: h,
-                            row_gobs: tiling.row_gobs,
-                            block_height_log2: tiling.block_height_log2,
-                            block_depth_log2: tiling.block_depth_log2,
-                            switch2_layout: u32::from(tiling.layout == GobLayout::Switch2),
-                            subresource: start as u32,
-                            run_first: run_first as u32,
-                            run_count: run_count as u32,
-                            y_base: y0,
-                            direction: direction as u32,
-                            packing: packing as u32,
-                            stencil_pitch: w,
-                            depth_float: u32::from(
-                                packing != Packing::Plain
-                                    && matches!(
-                                        host,
-                                        vk::Format::D32_SFLOAT | vk::Format::D32_SFLOAT_S8_UINT
-                                    ),
-                            ),
-                        };
-                        sync.compute.dispatch(
-                            cmd,
-                            set,
-                            &buffers,
-                            bytemuck::bytes_of(&params),
-                            groups,
-                            all,
-                        );
-                        barrier(&device, cmd);
-                    }
+                    let set = sync
+                        .descriptors
+                        .allocate(tx.scheduler, sync.compute.set_layout)?;
+                    let params = Params {
+                        row_words,
+                        height: h,
+                        row_gobs: tiling.row_gobs,
+                        block_height_log2: tiling.block_height_log2,
+                        block_depth_log2: tiling.block_depth_log2,
+                        switch2_layout: u32::from(tiling.layout == GobLayout::Switch2),
+                        subresource: start as u32,
+                        run_first: first as u32,
+                        run_count: count as u32,
+                        y_base: y0,
+                        direction: direction as u32,
+                        packing: packing as u32,
+                        stencil_pitch: w,
+                        depth_float: u32::from(
+                            packing != Packing::Plain
+                                && matches!(
+                                    host,
+                                    vk::Format::D32_SFLOAT | vk::Format::D32_SFLOAT_S8_UINT
+                                ),
+                        ),
+                    };
+                    sync.compute.dispatch(
+                        cmd,
+                        set,
+                        &buffers,
+                        bytemuck::bytes_of(&params),
+                        groups,
+                        all,
+                    );
+                    barrier(&device, cmd);
                     if direction == Direction::FromGuest {
                         device
                             .raw
@@ -610,5 +644,117 @@ impl TextureCache {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GUEST: usize = 16 << 10;
+
+    fn source_byte(offset: u64) -> u8 {
+        (offset * 7 + offset / 13) as u8
+    }
+
+    fn paint_in_order(runs: &[Run]) -> Vec<u8> {
+        let mut guest = vec![0; GUEST];
+        for r in runs {
+            for i in 0..r.size {
+                guest[(r.at + i) as usize] = source_byte(r.from + i);
+            }
+        }
+        guest
+    }
+
+    #[test]
+    fn aliased_runs_trim_to_one_writer_per_byte_with_the_serial_result() {
+        let runs = vec![
+            Run {
+                from: 0,
+                size: 4096,
+                at: 4096,
+            },
+            Run {
+                from: 4096,
+                size: 4096,
+                at: 4096,
+            },
+            Run {
+                from: 8192,
+                size: 4096,
+                at: 6144,
+            },
+            Run {
+                from: 12288,
+                size: 2048,
+                at: 0,
+            },
+            Run {
+                from: 14336,
+                size: 2048,
+                at: 12288,
+            },
+        ];
+        let serial = paint_in_order(&runs);
+        let reversed: Vec<Run> = runs.iter().rev().copied().collect();
+        assert_ne!(
+            paint_in_order(&reversed),
+            serial,
+            "untrimmed, one pass over aliased runs depends on which run writes last"
+        );
+
+        let mut scratch = RunScratch {
+            runs: runs.clone(),
+            ..RunScratch::default()
+        };
+        trim_aliases(&mut scratch);
+        let trimmed = scratch.runs;
+        assert!(
+            trimmed
+                .windows(2)
+                .all(|w| w[0].from + w[0].size <= w[1].from),
+            "trimmed runs stay sorted and disjoint by image offset: {trimmed:?}"
+        );
+        let mut writers = vec![0u8; GUEST];
+        for r in &trimmed {
+            for i in r.at..r.at + r.size {
+                writers[i as usize] += 1;
+            }
+        }
+        assert!(
+            writers.iter().all(|&n| n <= 1),
+            "a guest byte has two runs: {trimmed:?}"
+        );
+        assert_eq!(paint_in_order(&trimmed), serial);
+        let reversed: Vec<Run> = trimmed.iter().rev().copied().collect();
+        assert_eq!(paint_in_order(&reversed), serial);
+    }
+
+    #[test]
+    fn runs_without_aliases_trim_to_themselves() {
+        let runs = vec![
+            Run {
+                from: 0,
+                size: 4096,
+                at: 8192,
+            },
+            Run {
+                from: 4096,
+                size: 4096,
+                at: 0,
+            },
+            Run {
+                from: 8192,
+                size: 1024,
+                at: 4096,
+            },
+        ];
+        let mut scratch = RunScratch {
+            runs: runs.clone(),
+            ..RunScratch::default()
+        };
+        trim_aliases(&mut scratch);
+        assert_eq!(scratch.runs, runs);
     }
 }
