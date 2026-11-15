@@ -85,6 +85,25 @@ pub fn front_face(face: FrontFace) -> Option<vk::FrontFace> {
     })
 }
 
+/// The depth compare op for `op`, with EQUAL replaced as LICHII_DIAG_DEPTH_EQUAL asks
+/// (`always` or `lequal`), for diagnostics.
+pub fn depth_comparison_op(op: ComparisonOp) -> Option<vk::CompareOp> {
+    static OVERRIDE: std::sync::OnceLock<Option<vk::CompareOp>> = std::sync::OnceLock::new();
+    let over =
+        *OVERRIDE.get_or_init(
+            || match std::env::var("LICHII_DIAG_DEPTH_EQUAL").as_deref() {
+                Ok("always") => Some(vk::CompareOp::ALWAYS),
+                Ok("lequal") => Some(vk::CompareOp::LESS_OR_EQUAL),
+                _ => None,
+            },
+        );
+    let base = comparison_op(op)?;
+    Some(match over {
+        Some(o) if base == vk::CompareOp::EQUAL => o,
+        _ => base,
+    })
+}
+
 pub fn comparison_op(op: ComparisonOp) -> Option<vk::CompareOp> {
     Some(match op {
         ComparisonOp::NEVER_D3D | ComparisonOp::NEVER_GL => vk::CompareOp::NEVER,

@@ -30,6 +30,37 @@ fn secs(name: &str) -> Option<Duration> {
         .and_then(|v| Duration::try_from_secs_f64(v.trim().parse().ok()?).ok())
 }
 
+fn writers() -> &'static Mutex<Vec<(ImageId, String)>> {
+    static W: Mutex<Vec<(ImageId, String)>> = Mutex::new(Vec::new());
+    &W
+}
+
+/// Whether writers of RGBA16F 832x466 images are tracked (LICHII_DIAG_SCRUB_IMG is set).
+pub(crate) fn track_writers() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("LICHII_DIAG_SCRUB_IMG").is_some())
+}
+
+/// Records the last writer of a tracked image.
+pub(crate) fn note_writer(id: ImageId, what: String) {
+    let mut w = writers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    w.retain(|(i, _)| *i != id);
+    w.push((id, format!("{what} t={:.3}", now().as_secs_f64())));
+    if w.len() > 64 {
+        w.remove(0);
+    }
+}
+
+/// The last writer recorded for `id`.
+pub(crate) fn last_writer(id: ImageId) -> Option<String> {
+    let w = writers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    w.iter().find(|(i, _)| *i == id).map(|(_, s)| s.clone())
+}
+
 fn vb_fs() -> &'static [u64] {
     static V: OnceLock<Vec<u64>> = OnceLock::new();
     V.get_or_init(|| hex_list("LICHII_DIAG_VB_FS"))
@@ -1009,10 +1040,25 @@ impl VulkanRasterizer {
             regs.viewports[0].depth_range_near,
             regs.viewports[0].depth_range_far,
         );
-        let max_words: usize = std::env::var("LICHII_DIAG_CB_WORDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(64);
+        let first_of_fs = vb_fs().contains(&fs_hash) && {
+            static SEEN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+            let mut seen = SEEN
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let first = !seen.contains(&fs_hash);
+            if first {
+                seen.push(fs_hash);
+            }
+            first
+        };
+        let max_words: usize = if first_of_fs {
+            16384
+        } else {
+            std::env::var("LICHII_DIAG_CB_WORDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64)
+        };
         for (stage, prefix) in [(4usize, "CB"), (0, "VCB")] {
             if stage == 0 && max_words <= 64 {
                 continue;

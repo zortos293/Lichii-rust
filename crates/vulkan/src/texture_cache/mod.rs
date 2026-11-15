@@ -1286,7 +1286,10 @@ impl TextureCache {
         if diag_late() {
             diag_late_log(
                 "scrub",
-                format!("{id:?} modified={modified} nan_or_inf_halves={bad}"),
+                format!(
+                    "{id:?} modified={modified} nan_or_inf_halves={bad} last_writer={:?}",
+                    crate::rasterizer::draw::diag::last_writer(id)
+                ),
             );
         }
         if bad == 0 {

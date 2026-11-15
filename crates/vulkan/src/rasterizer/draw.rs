@@ -1323,6 +1323,31 @@ impl VulkanRasterizer {
                 self.texture_cache.mark_modified(id);
             }
         }
+        if diag::track_writers() {
+            let hashes: Vec<String> = self
+                .draw
+                .stages
+                .iter()
+                .flatten()
+                .map(|m| format!("{:?}={:016x}", m.stage, m.hash))
+                .collect();
+            let tracked: Vec<ImageId> = self
+                .draw
+                .colors
+                .iter()
+                .flatten()
+                .filter(|t| {
+                    t.format == vk::Format::R16G16B16A16_SFLOAT
+                        && t.extent.width == 832
+                        && t.extent.height == 466
+                })
+                .map(|t| t.id)
+                .chain(self.draw.storage_images.iter().filter(|s| s.1).map(|s| s.0))
+                .collect();
+            for id in tracked {
+                diag::note_writer(id, format!("draw {hashes:?}"));
+            }
+        }
         self.unflushed = true;
         Ok(())
     }
@@ -2677,7 +2702,7 @@ impl VulkanRasterizer {
                     raw.cmd_set_depth_write_enable(cmd, depth_write)
                 });
                 let depth_op =
-                    mvk::comparison_op(regs.depth_test_func).unwrap_or(vk::CompareOp::ALWAYS);
+                    mvk::depth_comparison_op(regs.depth_test_func).unwrap_or(vk::CompareOp::ALWAYS);
                 shadow.set(Slot::DepthCompareOp, depth_op, || {
                     raw.cmd_set_depth_compare_op(cmd, depth_op)
                 });
@@ -3206,6 +3231,9 @@ impl VulkanRasterizer {
         for &(id, written) in &self.draw.storage_images {
             if written {
                 self.texture_cache.mark_modified(id);
+                if diag::track_writers() {
+                    diag::note_writer(id, format!("compute {:016x}", key.shader));
+                }
             }
         }
         self.unflushed = true;

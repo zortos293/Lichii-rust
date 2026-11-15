@@ -511,7 +511,7 @@ impl FixedStateTracker {
         }
         s.depth = depth;
         s.depth_compare = byte(
-            mvk::comparison_op(regs.depth_test_func)
+            mvk::depth_comparison_op(regs.depth_test_func)
                 .unwrap_or(vk::CompareOp::ALWAYS)
                 .as_raw(),
         );
