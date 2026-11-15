@@ -765,7 +765,75 @@ impl VulkanRasterizer {
 }
 
 impl VulkanRasterizer {
+    /// Logs the scene target's host-side stats each time the bound render targets change after
+    /// a pass that drew into it, with the pass's draw count and fragment shaders.
+    fn diag_pass_track(&mut self, ctx: &GraphicsContext<'_>) {
+        type Pass = (Vec<u64>, u32, Vec<u64>, Option<ImageId>, u32);
+        static PASS: Mutex<Option<Pass>> = Mutex::new(None);
+        if std::env::var_os("LICHII_DIAG_PASSES").is_none() {
+            return;
+        }
+        let regs = ctx.regs;
+        let count = (regs.rt_control.0 & 0xf) as usize;
+        let key: Vec<u64> = (0..count)
+            .map(|i| regs.rt[render_target_index(regs, i)].address())
+            .chain(std::iter::once(if regs.zeta_enable != 0 {
+                regs.zeta.address()
+            } else {
+                0
+            }))
+            .collect();
+        let fs = self
+            .draw
+            .stages
+            .iter()
+            .flatten()
+            .find(|m| m.stage == lichii_shader::ShaderStage::Fragment)
+            .map_or(0, |m| m.hash);
+        let scene = self
+            .draw
+            .colors
+            .iter()
+            .flatten()
+            .find(|t| {
+                t.format == ash::vk::Format::B10G11R11_UFLOAT_PACK32
+                    && t.extent.width == 1664
+                    && t.extent.height == 932
+            })
+            .map(|t| t.id);
+        let flush = {
+            let mut pass = PASS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match pass.take() {
+                Some((pkey, draws, fss, pscene, n)) if pkey != key => {
+                    *pass = Some((key, 1, vec![fs], None, n + 1));
+                    pscene.or(scene).map(|id| (id, draws, fss, n))
+                }
+                Some((pkey, draws, mut fss, pscene, n)) => {
+                    if !fss.contains(&fs) {
+                        fss.push(fs);
+                    }
+                    *pass = Some((pkey, draws + 1, fss, pscene.or(scene), n));
+                    None
+                }
+                None => {
+                    *pass = Some((key, 1, vec![fs], None, 0));
+                    None
+                }
+            }
+        };
+        if let Some((id, draws, fss, n)) = flush {
+            let label = format!(
+                "PASS{n} draws={draws} fs={:?}",
+                fss.iter().map(|h| format!("{h:016x}")).collect::<Vec<_>>()
+            );
+            self.diag_host_stats(&label, &[id]);
+        }
+    }
+
     pub(super) fn diag_draw_state(&mut self, ctx: &GraphicsContext<'_>, call: DrawCall<'_>) {
+        self.diag_pass_track(ctx);
         let regs = ctx.regs;
         let mut s = String::new();
         for m in self.draw.stages.iter().flatten() {

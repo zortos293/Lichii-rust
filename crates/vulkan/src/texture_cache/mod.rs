@@ -1173,52 +1173,165 @@ impl TextureCache {
     /// Clears an image whose size LICHII_DIAG_POKE_IMG names (`WxHxLAYERS:r/g/b/a;...`) to that
     /// constant, for diagnostics.
     fn diag_poke(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
-        static P: std::sync::OnceLock<Vec<((u32, u32, u32), [f32; 4])>> =
-            std::sync::OnceLock::new();
+        type Poke = ((u32, u32, u32), Option<String>, [f32; 4]);
+        static P: std::sync::OnceLock<Vec<Poke>> = std::sync::OnceLock::new();
         let pokes = P.get_or_init(|| {
             std::env::var("LICHII_DIAG_POKE_IMG")
                 .unwrap_or_default()
                 .split(';')
                 .filter_map(|one| {
-                    let (dims, value) = one.split_once(':')?;
+                    let (key, value) = one.split_once(':')?;
+                    let (dims, format) = match key.split_once('@') {
+                        Some((d, f)) => (d, Some(f.trim().to_string())),
+                        None => (key, None),
+                    };
                     let mut d = dims.split('x').filter_map(|s| s.trim().parse().ok());
                     let mut v = value.split('/').filter_map(|s| s.trim().parse().ok());
                     Some((
                         (d.next()?, d.next()?, d.next()?),
+                        format,
                         [v.next()?, v.next()?, v.next()?, v.next()?],
                     ))
                 })
                 .collect()
         });
-        if pokes.is_empty() {
-            return Ok(());
-        }
         let info = self.image(id).info;
-        let Some(&(_, value)) = pokes
-            .iter()
-            .find(|&&((w, h, l), _)| info.width == w && info.height == h && info.layers == l)
-        else {
+        let format_name = format!("{:?}", info.format);
+        if let Some((_, _, value)) = pokes.iter().find(|((w, h, l), f, _)| {
+            info.width == *w
+                && info.height == *h
+                && info.layers == *l
+                && f.as_ref().is_none_or(|f| *f == format_name)
+        }) {
+            let value = *value;
+            let device = self.device.clone();
+            let cmd = tx.scheduler.record()?;
+            let image = self.image(id);
+            image.transition(&device, cmd, ImageAccess::TRANSFER_DST);
+            let raw = image.image.raw();
+            let range = image.image.full_range();
+            let depth = range.aspect_mask.contains(vk::ImageAspectFlags::DEPTH);
+            // SAFETY: the image is in TRANSFER_DST layout and the range is the whole image.
+            unsafe {
+                if depth {
+                    device.raw.cmd_clear_depth_stencil_image(
+                        cmd,
+                        raw,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &vk::ClearDepthStencilValue {
+                            depth: value[0],
+                            stencil: 0,
+                        },
+                        &[range],
+                    )
+                } else {
+                    device.raw.cmd_clear_color_image(
+                        cmd,
+                        raw,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &vk::ClearColorValue { float32: value },
+                        &[range],
+                    )
+                }
+            };
+            if diag_late() {
+                diag_late_log("poke", format!("{id:?} {format_name} {value:?}"));
+            }
+        }
+        self.diag_scrub(tx, id, &format_name)
+    }
+
+    /// Replaces NaN and Inf in level 0 of an RGBA16F image LICHII_DIAG_SCRUB_IMG names
+    /// (`WxHxL@Format`) with 0, once per GPU write, and logs how many there were.
+    fn diag_scrub(&mut self, tx: &mut Transfer<'_>, id: ImageId, format_name: &str) -> Result<()> {
+        static S: std::sync::OnceLock<Option<(u32, u32, u32, String)>> = std::sync::OnceLock::new();
+        static DONE: std::sync::Mutex<Vec<(ImageId, u64)>> = std::sync::Mutex::new(Vec::new());
+        let spec = S.get_or_init(|| {
+            let v = std::env::var("LICHII_DIAG_SCRUB_IMG").ok()?;
+            let (dims, format) = v.split_once('@')?;
+            let mut d = dims.split('x').filter_map(|s| s.trim().parse().ok());
+            Some((d.next()?, d.next()?, d.next()?, format.trim().to_string()))
+        });
+        let Some((w, h, l, f)) = spec else {
             return Ok(());
         };
+        let image = self.image(id);
+        let info = image.info;
+        if info.width != *w || info.height != *h || info.layers != *l || format_name != f {
+            return Ok(());
+        }
+        let modified = image.modified;
+        {
+            let mut done = DONE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if done.iter().any(|&(i, m)| i == id && m == modified) {
+                return Ok(());
+            }
+            done.retain(|&(i, _)| i != id);
+            done.push((id, modified));
+        }
+        let mut layers = self.diag_host_level0(tx, id)?;
+        let Some(bytes) = layers.first_mut() else {
+            return Ok(());
+        };
+        let mut bad = 0u64;
+        for half in bytes.chunks_exact_mut(2) {
+            if u16::from_le_bytes([half[0], half[1]]) & 0x7c00 == 0x7c00 {
+                half[0] = 0;
+                half[1] = 0;
+                bad += 1;
+            }
+        }
+        if diag_late() {
+            diag_late_log(
+                "scrub",
+                format!("{id:?} modified={modified} nan_or_inf_halves={bad}"),
+            );
+        }
+        if bad == 0 {
+            return Ok(());
+        }
+        let mut staging = Buffer::new(
+            &self.device,
+            bytes.len() as u64,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            MemoryLocation::CpuToGpu,
+            "diag scrub",
+        )?;
+        if let Some(mapped) = staging.mapped_mut() {
+            mapped[..bytes.len()].copy_from_slice(bytes);
+        }
         let device = self.device.clone();
         let cmd = tx.scheduler.record()?;
         let image = self.image(id);
         image.transition(&device, cmd, ImageAccess::TRANSFER_DST);
         let raw = image.image.raw();
-        let range = image.image.full_range();
-        // SAFETY: the image is in TRANSFER_DST layout and the range is the whole image.
+        let aspect = image.image.full_range().aspect_mask;
+        // SAFETY: the image is in TRANSFER_DST layout and the buffer holds level 0 of layer 0.
         unsafe {
-            device.raw.cmd_clear_color_image(
+            device.raw.cmd_copy_buffer_to_image(
                 cmd,
+                staging.raw(),
                 raw,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &vk::ClearColorValue { float32: value },
-                &[range],
+                &[vk::BufferImageCopy {
+                    image_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: aspect,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    image_extent: vk::Extent3D {
+                        width: info.width,
+                        height: info.height,
+                        depth: 1,
+                    },
+                    ..Default::default()
+                }],
             )
         };
-        if diag_late() {
-            diag_late_log("poke", format!("{id:?} {value:?}"));
-        }
+        tx.scheduler.retire(staging);
         Ok(())
     }
 
@@ -1265,7 +1378,6 @@ impl TextureCache {
             found.level,
             found.layer..found.layer + info.layers,
         )?;
-        self.diag_poke(tx, found.id)?;
         Ok(Some(found))
     }
 
