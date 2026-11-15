@@ -758,6 +758,41 @@ impl VulkanRasterizer {
             samples,
         );
         let key = GraphicsPipelineKey::new(&draw.stages, attachments, &fixed);
+        if draw
+            .stages
+            .iter()
+            .flatten()
+            .any(|m| m.stage == ShaderStage::Geometry && diag::gs_log().contains(&m.hash))
+        {
+            use std::fmt::Write as _;
+            let mut s = String::from("GS");
+            for m in draw.stages.iter().flatten() {
+                let _ = write!(s, " {:?}={:016x}", m.stage, m.hash);
+            }
+            for (i, t) in draw.colors.iter().enumerate() {
+                let Some(t) = t else { continue };
+                let rt = &regs.rt[render_target_index(regs, i)];
+                let info = self.texture_cache.state(t.id).map(|st| st.info);
+                let _ = write!(
+                    s,
+                    " C{i}[{:?} {:?} {}x{} view_layers={} rt={}x{} depth={} volume={} pitch={:#x} base={} addr={:#x} info={:?}]",
+                    t.id,
+                    t.format,
+                    t.extent.width,
+                    t.extent.height,
+                    t.layers,
+                    rt.width,
+                    rt.height,
+                    rt.bits.depth(),
+                    rt.bits.volume(),
+                    rt.array_pitch,
+                    rt.base_layer,
+                    rt.address(),
+                    info.map(|i| (i.kind, i.width, i.height, i.depth, i.layers, i.levels)),
+                );
+            }
+            diag::with(|d| d.always(&s));
+        }
         if diag::waits() && !may_skip {
             use std::fmt::Write as _;
             let shader_wait = draw.shaders.blocked() != shaders_blocked;

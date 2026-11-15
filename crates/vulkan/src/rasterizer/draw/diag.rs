@@ -80,6 +80,12 @@ pub(crate) fn skip_vs() -> &'static [u64] {
     V.get_or_init(|| hex_list("LICHII_DIAG_SKIP_VS"))
 }
 
+/// LICHII_DIAG_GS: geometry hashes whose draws log their render targets' layer setup at any time.
+pub(crate) fn gs_log() -> &'static [u64] {
+    static V: OnceLock<Vec<u64>> = OnceLock::new();
+    V.get_or_init(|| hex_list("LICHII_DIAG_GS"))
+}
+
 /// LICHII_DIAG_D16_NOCLAMP: disable depth clamp while a D16 depth target is bound.
 pub(crate) fn d16_noclamp() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
