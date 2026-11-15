@@ -1360,6 +1360,7 @@ impl Rasterizer for VulkanRasterizer {
 
     fn release_channel(&mut self, _channel: ChannelId) {
         self.texture_cache.invalidate_lookups();
+        self.draw.forget_bound_textures();
     }
 
     fn invalidate_region(&mut self, addr: DAddr, size: u64) {

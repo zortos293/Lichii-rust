@@ -367,6 +367,12 @@ pub(super) struct DrawState {
 const PRESENTED: usize = 3;
 
 impl DrawState {
+    /// Forgets the textures headers bound: a released channel's GMMU, which keys them, may be
+    /// freed and another take its place at the same address and mapping generation.
+    pub(super) fn forget_bound_textures(&mut self) {
+        self.bound_textures.bound.clear();
+    }
+
     /// Notes that a present showed `image`.
     pub(super) fn presented(&mut self, image: ImageId) {
         if !self.presented.contains(&Some(image)) {

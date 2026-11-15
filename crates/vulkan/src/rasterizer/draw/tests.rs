@@ -2124,6 +2124,22 @@ fn draws_sample_what_their_texture_alias_rendered_since_they_last_sampled_it() {
     f.assert_no_validation_errors();
 }
 
+/// Releasing a channel forgets the textures draws bound through its GMMU, which another may
+/// replace at the same address.
+#[test]
+fn released_channels_forget_the_textures_draws_bound() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(&f, PROGRAMS + u64::from(FRAGMENT), &sampling_program());
+    uniform_texture(&f, 0, TEXTURE, [10, 200, 30, 255]);
+    draw(&mut f, &gmmu, &sampling_regs());
+    assert_eq!(f.rasterizer.draw.bound_textures.bound.len(), 1);
+    f.rasterizer.release_channel(ChannelId(0));
+    assert!(f.rasterizer.draw.bound_textures.bound.is_empty());
+    f.assert_no_validation_errors();
+}
+
 /// Draws the 16x16 target with `code` as the fragment program and the texture handle
 /// `handle` in c[0][0x40].
 fn read_with(f: &mut Fixture, gmmu: &Arc<Gmmu>, regs: &mut Regs, code: &[u8], handle: u32) {
