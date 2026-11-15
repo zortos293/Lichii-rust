@@ -344,6 +344,15 @@ impl CachedImage {
     }
 
     /// Guest memory must replace every texel on the next upload.
+    /// Makes every alias rectangle copy in again on the next refresh, after the image's own
+    /// texels were replaced from guest memory.
+    fn retake_aliases(&mut self) {
+        self.aliases_newest = u64::MAX;
+        for alias in &mut self.aliases {
+            alias.synced = 0;
+        }
+    }
+
     fn mark_dirty_whole(&mut self) {
         self.cpu_dirty = true;
         self.dirty_whole = true;
@@ -2334,10 +2343,7 @@ impl TextureCache {
         let image = self.image(id);
         image.cpu_dirty = false;
         image.keep_out.clear();
-        image.aliases_newest = u64::MAX;
-        for alias in &mut image.aliases {
-            alias.synced = 0;
-        }
+        image.retake_aliases();
         Ok(())
     }
 
