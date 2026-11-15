@@ -7,17 +7,19 @@
 //! making the read-only acknowledge bit equal again and signalling the notify event; the client
 //! then rereads the value and rearms when its threshold isn't reached yet.
 //!
-//! The reference polls the page every 500 us and mirrors every guest increment into it. Here a
-//! request runs the server at once (the request event is observed), an armed syncpoint whose page
-//! value is already stale is answered right away, and the rest are answered by a syncpoint action
-//! on their next increment, so nothing runs while nobody waits. Values are mirrored when a wait is
-//! answered or a slot is signalled, which is what a woken client reads.
+//! Every guest increment is mirrored into the page as it happens, before the waits it satisfies
+//! are answered, as the reference does: the client's TryWaitNativeSync reads the page without a
+//! request, and Mario Kart World aborts (2162-0001) when vdec's Stop moves a syncpoint the page
+//! still shows at its old value. A request runs the server at once (the request event is
+//! observed), an armed syncpoint whose value changed since its last answer is answered right away,
+//! and the rest are answered by a syncpoint action on their next increment.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use lichii_common::{ResultCode, VAddr};
-use lichii_gpu::host1x::{ActionHandle, Syncpoints};
+use lichii_gpu::host1x::{ActionHandle, MirrorHandle, Syncpoints};
 use lichii_kernel::Event;
 use lichii_kernel::ipc::HleRequestContext;
 use lichii_kernel::memory_objects::TransferMemory;
@@ -40,19 +42,9 @@ const MAX_SYNCPOINTS: u32 = ((RO_SUMMARY - VALUES) / 8) as u32;
 const WORDS: usize = MAX_SYNCPOINTS.div_ceil(64) as usize;
 const RO_SIZE: u64 = 0x2000;
 
-/// The page gsv 204 attached, if any. Shared with the slot sessions so a signalled slot mirrors
-/// its value before the client reads it.
+/// The page gsv 204 attached, if any.
 #[derive(Default)]
 pub(super) struct PageSlot(Mutex<Option<Arc<Page>>>);
-
-impl PageSlot {
-    fn mirror(&self, id: u32) {
-        let page = self.0.lock().clone();
-        if let Some(page) = page {
-            page.slot_mirror(id);
-        }
-    }
-}
 
 /// gsv 204(version u32, max syncpoints u32; copy handles: writable then read-only transfer
 /// memory). Lays out the read-only header and returns the request event (writable end, the client
@@ -96,18 +88,33 @@ struct Page {
     syncpoints: Arc<Syncpoints>,
     request: Arc<Event>,
     notify: Arc<Event>,
+    /// Syncpoints whose page value changed since a wait on them was last answered. A wait on a
+    /// fresh id is answered even when the page value looks current: the client may have read it
+    /// before the change.
+    fresh: Arc<[AtomicU64; WORDS]>,
+    mirrored: MirrorHandle,
     watches: Mutex<Watches>,
 }
 
-/// Syncpoints with an action registered for their next increment, and those whose page value
-/// changed since a wait on them was last answered (a watched increment, or a slot signal that
-/// mirrored first). A wait on a fresh id is answered even when the page value looks current: the
-/// client may have read it before the change.
+/// Syncpoints with an action registered for their next increment.
 #[derive(Default)]
 struct Watches {
     watching: [u64; WORDS],
-    fresh: [u64; WORDS],
     handles: HashMap<u32, ActionHandle>,
+}
+
+/// Writes `value` into the page's slot for `id` and marks the id fresh when the slot held an
+/// older value. Runs on every guest increment, so it allocates nothing and takes no lock.
+fn write_value(memory: &AddressSpace, ro: VAddr, fresh: &[AtomicU64; WORDS], id: u32, value: u32) {
+    let address = ro + VALUES + u64::from(id) * 8;
+    if memory.read::<u64>(address).ok() == Some(u64::from(value)) {
+        return;
+    }
+    if memory.write(address, u64::from(value)).is_err() {
+        tracing::warn!("nx2:syncpt page write at {address:#x} faulted");
+        return;
+    }
+    fresh[id as usize / 64].fetch_or(1 << (id % 64), Ordering::SeqCst);
 }
 
 impl Page {
@@ -117,10 +124,16 @@ impl Page {
         count: u32,
         syncpoints: Arc<Syncpoints>,
     ) -> Arc<Self> {
+        let memory = ro.owner().memory().clone();
+        let fresh: Arc<[AtomicU64; WORDS]> = Arc::new(std::array::from_fn(|_| AtomicU64::new(0)));
+        let mirrored = syncpoints.guest().set_mirror(count, {
+            let (memory, ro, fresh) = (memory.clone(), ro.address(), fresh.clone());
+            move |id, value| write_value(&memory, ro, &fresh, id, value)
+        });
         let page = Arc::new_cyclic(|this: &Weak<Page>| {
             let this = this.clone();
             Self {
-                memory: ro.owner().memory().clone(),
+                memory,
                 rw: rw.address(),
                 ro: ro.address(),
                 _transfer: [rw, ro],
@@ -132,6 +145,8 @@ impl Page {
                     }
                 })),
                 notify: Arc::new(Event::new()),
+                fresh,
+                mirrored,
                 watches: Mutex::default(),
             }
         });
@@ -150,8 +165,9 @@ impl Page {
                 tracing::warn!("nx2:syncpt page header write faulted");
             }
         }
+        let guest = page.syncpoints.guest();
         for id in 0..count {
-            page.mirror(id);
+            let _ = guest.publish(id);
         }
         page
     }
@@ -166,44 +182,20 @@ impl Page {
         }
     }
 
-    /// Copies a syncpoint's value into the page and returns it, with whether the page held an
-    /// older one. `None` for ids the page has no slot for.
-    fn mirror(&self, id: u32) -> Option<(u32, bool)> {
-        if id >= self.count {
-            return None;
-        }
-        let value = self.syncpoints.guest().value(id).ok()?;
-        let address = self.ro + VALUES + u64::from(id) * 8;
-        let changed = self.read(address) != u64::from(value);
-        if changed {
-            self.write(address, u64::from(value));
-        }
-        Some((value, changed))
-    }
-
-    /// Mirrors a syncpoint a slot request reached, and marks it fresh so a wait on it that the
-    /// server has not seen yet is answered.
-    fn slot_mirror(&self, id: u32) {
-        let mut watches = self.watches.lock();
-        if let Some((_, true)) = self.mirror(id) {
-            watches.fresh[id as usize / 64] |= 1 << (id % 64);
-        }
-    }
-
-    /// Answers every armed wait whose page value is stale, and watches the rest.
+    /// Answers every armed wait whose page value changed since its last answer, and watches the
+    /// rest. Values reach the page only through the bank's mirror, which orders them.
     fn serve(self: &Arc<Self>) {
         self.request.clear();
+        let guest = self.syncpoints.guest();
         let mut watch = Vec::new();
         let mut answered = false;
         {
             let mut watches = self.watches.lock();
-            let Watches {
-                watching, fresh, ..
-            } = &mut *watches;
             let words = self.count.div_ceil(64) as usize;
-            for (word, (watching, fresh)) in watching
+            for (word, (watching, fresh)) in watches
+                .watching
                 .iter_mut()
-                .zip(fresh.iter_mut())
+                .zip(self.fresh.iter())
                 .enumerate()
                 .take(words)
             {
@@ -216,17 +208,16 @@ impl Page {
                     let bit = 1u64 << pending.trailing_zeros();
                     pending &= !bit;
                     let id = word as u32 * 64 + bit.trailing_zeros();
-                    match self.mirror(id) {
-                        Some((value, false)) if *fresh & bit == 0 => {
-                            if *watching & bit == 0 {
-                                *watching |= bit;
-                                watch.push((id, value));
-                            }
-                        }
-                        _ => answer |= bit,
+                    let mirrored = id < self.count && guest.publish(id).is_ok();
+                    let value = guest.value(id).unwrap_or(0);
+                    if !mirrored || fresh.load(Ordering::SeqCst) & bit != 0 {
+                        answer |= bit;
+                    } else if *watching & bit == 0 {
+                        *watching |= bit;
+                        watch.push((id, value));
                     }
                 }
-                *fresh &= !answer;
+                fresh.fetch_and(!answer, Ordering::SeqCst);
                 if answer != 0 {
                     self.write(acknowledged_at, acknowledged ^ answer);
                     answered = true;
@@ -262,7 +253,6 @@ impl Page {
             let mut watches = self.watches.lock();
             let (word, bit) = (id as usize / 64, 1u64 << (id % 64));
             watches.watching[word] &= !bit;
-            watches.fresh[word] |= bit;
             watches.handles.remove(&id);
         }
         self.serve();
@@ -272,6 +262,7 @@ impl Page {
 impl Drop for Page {
     fn drop(&mut self) {
         let guest = self.syncpoints.guest();
+        guest.clear_mirror(self.mirrored);
         for handle in self.watches.get_mut().handles.values() {
             guest.cancel(*handle);
         }
@@ -282,7 +273,6 @@ impl Drop for Page {
 /// slot when a syncpoint reaches a value.
 pub(super) struct SyncptSession {
     syncpoints: Arc<Syncpoints>,
-    page: Arc<PageSlot>,
     slots: Arc<Mutex<HashMap<u32, Slot>>>,
 }
 
@@ -294,10 +284,9 @@ struct Slot {
 }
 
 impl SyncptSession {
-    pub fn new(context: &Arc<ServiceContext>, page: Arc<PageSlot>) -> Self {
+    pub fn new(context: &Arc<ServiceContext>) -> Self {
         Self {
             syncpoints: context.gpu.host1x().syncpoints.clone(),
-            page,
             slots: Arc::default(),
         }
     }
@@ -333,10 +322,8 @@ impl SyncptSession {
             return ResultCode::SUCCESS;
         }
         let slots = Arc::downgrade(&self.slots);
-        let page = self.page.clone();
         let signal = event.clone();
         let registered = guest.register_action(id, threshold, move || {
-            page.mirror(id);
             let Some(slots) = slots.upgrade() else {
                 return;
             };
