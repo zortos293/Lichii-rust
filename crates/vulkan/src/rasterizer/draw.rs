@@ -2705,6 +2705,29 @@ impl VulkanRasterizer {
                 ))
             });
         }
+        if crate::pipeline::shader_workers::diag_shader_listed(module.hash) {
+            static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                for (i, c) in ctx.const_buffers.iter().enumerate() {
+                    if !c.enabled || c.size == 0 {
+                        continue;
+                    }
+                    let mut words = vec![0u32; (c.size as usize / 4).min(512)];
+                    for (n, w) in words.iter_mut().enumerate() {
+                        *w = ctx.memory.read::<u32>(c.address + n as u64 * 4).unwrap_or(0);
+                    }
+                    let hex: Vec<String> = words.iter().map(|w| format!("{w:08x}")).collect();
+                    tracing::warn!(
+                        hash = format!("{:016x}", module.hash),
+                        cb = i,
+                        address = format!("{:#x}", c.address),
+                        size = c.size,
+                        words = hex.join(" "),
+                        "diag shader cb"
+                    );
+                }
+            }
+        }
         let key = ComputePipelineKey {
             shader: module.hash,
             workgroup: ctx.block,

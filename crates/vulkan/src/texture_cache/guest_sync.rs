@@ -542,9 +542,7 @@ impl TextureCache {
         let image = self.image(id);
         image.current = tick;
         image.gpu_modified = true;
-        for alias in &mut image.aliases {
-            alias.synced = 0;
-        }
+        image.retake_aliases();
         self.traffic.gpu_syncs += 1;
         Ok(true)
     }

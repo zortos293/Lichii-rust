@@ -236,6 +236,9 @@ fn translate(job: &Job, profile: &Profile, host: &HostTranslateInfo) -> Option<T
         a.as_ref().map(ProgramEnv::take_reads).unwrap_or_default(),
         env.take_reads(),
     ];
+    if let Ok((module, _)) = &result {
+        diag_dump_shader(module.hash, &env, options, &bytes);
+    }
     let (module, entry) = match result {
         Ok((module, entry)) => (Ok(module), entry),
         Err(error) => {
@@ -254,6 +257,47 @@ fn translate(job: &Job, profile: &Profile, host: &HostTranslateInfo) -> Option<T
         code,
         bindings,
     })
+}
+
+/// LICHII_DIAG_DUMP_SHADER=<module hashes>: writes each listed module's guest code and its
+/// translation's storage buffer tracking and final IR into LICHII_DRAW_DIAG_DIR (never merge).
+pub(crate) fn diag_shader_listed(hash: u64) -> bool {
+    static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        std::env::var("LICHII_DIAG_DUMP_SHADER")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
+            .collect()
+    })
+    .contains(&hash)
+}
+
+fn diag_dump_shader(hash: u64, env: &ProgramEnv<'_>, options: TranslateOptions<'_>, code: &[u8]) {
+    use lichii_shader::ShaderEnvironment;
+    if !diag_shader_listed(hash) {
+        return;
+    }
+    let Some(dir) = std::env::var_os("LICHII_DRAW_DIAG_DIR").map(std::path::PathBuf::from) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join(format!("shader-{hash:016x}.bin")), code);
+    let text = match lichii_shader::translate::translate(env, options) {
+        Ok(p) => format!(
+            "start={:#x} range={:?} stage={:?}\nuses_global_memory={} native_global_bounds={}\nstorage_buffers={:#?}\n\n{}",
+            env.start_address(),
+            env.code_range(),
+            p.stage,
+            p.info.uses_global_memory,
+            p.info.native_global_bounds,
+            p.info.storage_buffers_descriptors,
+            p.ir.dump()
+        ),
+        Err(error) => format!("translate failed: {error:?}"),
+    };
+    let _ = std::fs::write(dir.join(format!("shader-{hash:016x}.txt")), text);
+    tracing::warn!(hash = format!("{hash:016x}"), "diag shader dumped");
 }
 
 #[cfg(test)]
