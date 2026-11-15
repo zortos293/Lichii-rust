@@ -296,6 +296,22 @@ fn define_entry_point(ctx: &mut EmitContext<'_>, main: Word) {
         ShaderStage::Task | ShaderStage::Mesh => mesh::define_entry_point(ctx, main),
         ShaderStage::VertexA | ShaderStage::VertexB => ExecutionModel::Vertex,
     };
+    let info = &program.info;
+    // Compute only: warp-synchronous guest code lives there, and AMD's driver (amdvlk 2.0.416)
+    // crashes building some graphics pipelines whose shaders ask for it.
+    if profile.support_maximal_reconvergence
+        && program.stage == ShaderStage::Compute
+        && ctx.supports_subgroups()
+        && (info.uses_subgroup_vote
+            || info.uses_subgroup_invocation_id
+            || info.uses_subgroup_shuffles
+            || info.uses_subgroup_mask
+            || info.uses_quad_shuffles)
+    {
+        ctx.add_extension("SPV_KHR_maximal_reconvergence");
+        ctx.b
+            .execution_mode(main, ExecutionMode::MaximallyReconvergesKHR, []);
+    }
     let interfaces = std::mem::take(&mut ctx.interfaces);
     ctx.b.entry_point(model, main, "main", &interfaces);
 }

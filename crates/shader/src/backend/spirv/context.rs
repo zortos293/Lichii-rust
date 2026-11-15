@@ -411,6 +411,61 @@ pub(crate) struct EmitContext<'a> {
     pub(crate) mesh: MeshState,
     /// The software TENSOR_MUL_ADD functions (K=8, K=16), defined after the entry point.
     pub(crate) tensor_functions: [Word; 4],
+    /// Shared memory bytes the module declares: the program's, and the cooperative HMMA scratch
+    /// after them.
+    pub(crate) shared_memory_size: u32,
+    /// The word in shared memory where each subgroup's three 16x16 fp16 HMMA tiles start
+    /// (384 words a subgroup), when HMMA.F16 goes through a cooperative matrix.
+    pub(crate) tensor_scratch_word: Option<u32>,
+    /// The cooperative matrix types (A, B, accumulator) and the SubgroupId input, made on first
+    /// use.
+    pub(crate) cooperative_hmma: Option<CooperativeHmma>,
+    /// The module uses the Vulkan memory model (cooperative HMMA needs it).
+    pub(crate) vulkan_memory_model: bool,
+}
+
+/// What the cooperative HMMA path declares once per module.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CooperativeHmma {
+    pub matrix_a: Word,
+    pub matrix_b: Word,
+    pub matrix_c: Word,
+    pub subgroup_id: Word,
+}
+
+/// Guest warp lanes; cooperative HMMA needs workgroups of whole warps.
+const GUEST_WARP_LANES: u32 = 32;
+
+/// Shared memory words one subgroup's cooperative HMMA tiles take: A, B and C, 16x16 fp16 each.
+pub(crate) const COOPERATIVE_HMMA_TILE_WORDS: u32 = 384;
+
+/// The shared memory word the cooperative HMMA scratch starts at and the module's shared memory
+/// size with it, when HMMA.F16 of this program can go through a cooperative matrix: a compute
+/// program of whole warps that needs no coherent memory, within the device's shared memory.
+pub(crate) fn cooperative_hmma_scratch(
+    profile: &Profile,
+    translated: &TranslatedProgram,
+) -> Option<(u32, u32)> {
+    let info = &translated.info;
+    let [x, y, z] = translated.workgroup_size;
+    if !profile.support_cooperative_hmma_16x16x16
+        || translated.stage != ShaderStage::Compute
+        || !info.uses_hmma_f16
+        || x == 0
+        || !x.is_multiple_of(GUEST_WARP_LANES)
+        || info.requires_coherent_global_memory
+        || info.requires_coherent_image_memory
+    {
+        return None;
+    }
+    let subgroups = x * y * z / GUEST_WARP_LANES;
+    let offset = translated.shared_memory_size.next_multiple_of(16);
+    let total = offset + subgroups * COOPERATIVE_HMMA_TILE_WORDS * 4;
+    if profile.max_compute_shared_memory_size != 0 && total > profile.max_compute_shared_memory_size
+    {
+        return None;
+    }
+    Some((offset / 4, total))
 }
 
 /// Stages whose inputs are arrays indexed by vertex.
@@ -514,7 +569,15 @@ impl<'a> EmitContext<'a> {
             ((profile.supported_spirv >> 16) & 0xff) as u8,
             ((profile.supported_spirv >> 8) & 0xff) as u8,
         );
-        b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+        let scratch = cooperative_hmma_scratch(profile, translated);
+        // Cooperative matrices need the Vulkan memory model; shared memory accesses and barriers
+        // then say what they make available and visible (see `load_shared`).
+        let memory_model = if scratch.is_some() {
+            spirv::MemoryModel::Vulkan
+        } else {
+            spirv::MemoryModel::GLSL450
+        };
+        b.memory_model(spirv::AddressingModel::Logical, memory_model);
         let glsl = b.ext_inst_import("GLSL.std.450");
         let program = &translated.ir;
         let info = &translated.info;
@@ -688,7 +751,21 @@ impl<'a> EmitContext<'a> {
             sparse_result_types: FxHashMap::default(),
             mesh: MeshState::default(),
             tensor_functions: [0; 4],
+            shared_memory_size: translated.shared_memory_size,
+            tensor_scratch_word: None,
+            cooperative_hmma: None,
+            vulkan_memory_model: false,
         };
+        if let Some((word, size)) = scratch {
+            ctx.tensor_scratch_word = Some(word);
+            ctx.shared_memory_size = size;
+            ctx.vulkan_memory_model = true;
+            if profile.supported_spirv < 0x0001_0500 {
+                ctx.add_extension("SPV_KHR_vulkan_memory_model");
+            }
+            ctx.add_capability(Capability::VulkanMemoryModel);
+            ctx.add_capability(Capability::VulkanMemoryModelDeviceScope);
+        }
         let unified = profile.unified_descriptor_binding;
         ctx.add_capability(Capability::Shader);
         ctx.define_common_types();
@@ -744,6 +821,84 @@ impl<'a> EmitContext<'a> {
             self.stage
         };
         self.profile.supports_subgroup_stage(stage)
+    }
+
+    /// The memory operands of a shared memory access: none in the GLSL450 memory model; in the
+    /// Vulkan model a non-private pointer that makes the access available (stores) or visible
+    /// (loads) at workgroup scope, as the guest's shared memory always is.
+    pub(crate) fn shared_access(
+        &mut self,
+        store: bool,
+    ) -> (Option<spirv::MemoryAccess>, Option<Operand>) {
+        if !self.vulkan_memory_model {
+            return (None, None);
+        }
+        let availability = if store {
+            spirv::MemoryAccess::MAKE_POINTER_AVAILABLE
+        } else {
+            spirv::MemoryAccess::MAKE_POINTER_VISIBLE
+        };
+        let scope = self.const_u32(spirv::Scope::Workgroup as u32);
+        (
+            Some(availability | spirv::MemoryAccess::NON_PRIVATE_POINTER),
+            Some(Operand::IdScope(scope)),
+        )
+    }
+
+    /// Loads `ty` from a shared memory pointer.
+    pub(crate) fn load_shared(&mut self, ty: Word, pointer: Word) -> EmitResult<Word> {
+        let (access, scope) = self.shared_access(false);
+        Ok(self.b.load(ty, None, pointer, access, scope)?)
+    }
+
+    /// Stores `value` through a shared memory pointer.
+    pub(crate) fn store_shared(&mut self, pointer: Word, value: Word) -> EmitResult<()> {
+        let (access, scope) = self.shared_access(true);
+        Ok(self.b.store(pointer, value, access, scope)?)
+    }
+
+    /// Barrier memory semantics, which in the Vulkan memory model also make memory available
+    /// and visible.
+    pub(crate) fn barrier_semantics(&self, semantics: spirv::MemorySemantics) -> u32 {
+        let semantics = if self.vulkan_memory_model {
+            semantics
+                | spirv::MemorySemantics::MAKE_AVAILABLE
+                | spirv::MemorySemantics::MAKE_VISIBLE
+        } else {
+            semantics
+        };
+        semantics.bits()
+    }
+
+    /// The cooperative HMMA types and the SubgroupId input, declared on first use.
+    pub(crate) fn cooperative_hmma(&mut self) -> CooperativeHmma {
+        if let Some(declared) = self.cooperative_hmma {
+            return declared;
+        }
+        self.add_extension("SPV_KHR_cooperative_matrix");
+        self.add_capability(Capability::CooperativeMatrixKHR);
+        self.add_capability(Capability::Float16);
+        self.add_capability(Capability::GroupNonUniform);
+        let f16 = self.b.type_float(16, None);
+        let scope = self.const_u32(rspirv::spirv::Scope::Subgroup as u32);
+        let sixteen = self.const_u32(16);
+        let mut matrix = |usage: rspirv::spirv::CooperativeMatrixUse| {
+            let usage = self.const_u32(usage as u32);
+            self.b
+                .type_cooperative_matrix_khr(f16, scope, sixteen, sixteen, usage)
+        };
+        let matrix_a = matrix(rspirv::spirv::CooperativeMatrixUse::MatrixAKHR);
+        let matrix_b = matrix(rspirv::spirv::CooperativeMatrixUse::MatrixBKHR);
+        let matrix_c = matrix(rspirv::spirv::CooperativeMatrixUse::MatrixAccumulatorKHR);
+        let subgroup_id = self.define_input(self.u32[1], false, Some(BuiltIn::SubgroupId));
+        let declared = CooperativeHmma {
+            matrix_a,
+            matrix_b,
+            matrix_c,
+            subgroup_id,
+        };
+        self.cooperative_hmma = Some(declared);
+        declared
     }
 
     /// The SubgroupLocalInvocationId input, defined on first use when the shader info flags did
@@ -1770,7 +1925,7 @@ impl<'a> EmitContext<'a> {
             && !matches!(self.stage, ShaderStage::Task | ShaderStage::Mesh)
             && (!info.uses_int8 || profile.support_workgroup_layout_8bit_access)
             && (!info.uses_int16 || profile.support_workgroup_layout_16bit_access);
-        let size = self.translated.shared_memory_size;
+        let size = self.shared_memory_size;
         if size == 0 {
             return Ok(());
         }
@@ -1816,7 +1971,7 @@ impl<'a> EmitContext<'a> {
     /// A workgroup block of `element` aliasing the other views of shared memory: the variable,
     /// the pointer type to one element and the pointer type to the block.
     fn explicit_shared(&mut self, element: Word, element_size: u32) -> (Word, Word, Word) {
-        let count = self.translated.shared_memory_size.div_ceil(element_size);
+        let count = self.shared_memory_size.div_ceil(element_size);
         let array = self.type_array(element, count);
         self.decorate(array, Decoration::ArrayStride, &[element_size]);
         let block = self.b.type_struct([array]);
@@ -1857,7 +2012,7 @@ impl<'a> EmitContext<'a> {
         let word_pointer =
             self.b
                 .access_chain(self.shared_u32, None, self.shared_memory_u32, [word_offset])?;
-        let initial = self.b.load(u32_t, None, word_pointer, None, [])?;
+        let initial = self.load_shared(u32_t, word_pointer)?;
         self.b.store(expected_var, initial, None, [])?;
         self.b.branch(loop_header)?;
         self.begin_label(loop_header)?;
@@ -1993,7 +2148,11 @@ impl<'a> EmitContext<'a> {
         } else {
             self.b.access_chain(element_pointer, None, base, [index])?
         };
-        let initial = self.b.load(u32_t, None, word_pointer, None, [])?;
+        let initial = if is_shared {
+            self.load_shared(u32_t, word_pointer)?
+        } else {
+            self.b.load(u32_t, None, word_pointer, None, [])?
+        };
         self.b.store(expected_var, initial, None, [])?;
         self.b.branch(loop_header)?;
         self.begin_label(loop_header)?;

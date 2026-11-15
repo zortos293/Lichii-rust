@@ -391,6 +391,75 @@ mod tests {
         validate("ampere_tensor", &profile, &module.spirv);
     }
 
+    /// The opcodes of a SPIR-V module's instructions.
+    fn opcodes(spirv: &[u32]) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut at = 5;
+        while at < spirv.len() {
+            let count = (spirv[at] >> 16) as usize;
+            out.push(spirv[at] & 0xffff);
+            at += count.max(1);
+        }
+        out
+    }
+
+    /// With 16x16x16 cooperative matrices, HMMA.F16 of a whole-warp compute program goes through
+    /// shared memory scratch into one cooperative-matrix multiply-add, and the module validates.
+    #[test]
+    fn hmma_goes_through_a_cooperative_matrix_when_the_host_has_one() {
+        let code = [
+            encode(
+                Opcode::Hmma,
+                Form::Fixed,
+                f(16, 12) | f(24, 4) | f(32, 8) | f(64, 0xff) | f(75, 1),
+            ),
+            encode(
+                Opcode::Sts,
+                Form::UniformAddress,
+                f(24, 2) | f(32, 12) | f(73, 5),
+            ),
+            encode(Opcode::Exit, Form::Fixed, 7 << 87),
+        ];
+        let mut env = TestEnv::new(&code);
+        env.shared_memory = 0x1000;
+        env.workgroup = [64, 1, 1];
+        let profile = Profile {
+            support_cooperative_hmma_16x16x16: true,
+            supported_spirv: 0x0001_0600,
+            ..Profile::default()
+        };
+        let host = HostTranslateInfo::default();
+        let options = TranslateOptions {
+            profile: &profile,
+            host: &host,
+            resolution_scale: ResolutionScale::X1,
+        };
+        let module = crate::module::compile(
+            &env,
+            options,
+            &RuntimeInfo::default(),
+            &mut Bindings::default(),
+        )
+        .unwrap();
+        let ops = opcodes(&module.spirv);
+        // OpCooperativeMatrixLoadKHR, OpCooperativeMatrixStoreKHR, OpCooperativeMatrixMulAddKHR.
+        assert_eq!(ops.iter().filter(|&&op| op == 4457).count(), 3);
+        assert_eq!(ops.iter().filter(|&&op| op == 4458).count(), 1);
+        assert_eq!(ops.iter().filter(|&&op| op == 4459).count(), 1);
+        validate("ampere_tensor_cooperative", &profile, &module.spirv);
+
+        // A workgroup that is not whole warps keeps the emulation.
+        env.workgroup = [48, 1, 1];
+        let module = crate::module::compile(
+            &env,
+            options,
+            &RuntimeInfo::default(),
+            &mut Bindings::default(),
+        )
+        .unwrap();
+        assert!(!opcodes(&module.spirv).contains(&4459));
+    }
+
     /// The same with an f32 accumulator, stored as four words.
     #[test]
     fn f32_tensor_program_compiles() {

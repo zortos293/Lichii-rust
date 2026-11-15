@@ -320,6 +320,8 @@ pub struct ShaderInfo {
     pub uses_subgroup_invocation_id: bool,
     pub uses_subgroup_shuffles: bool,
     pub uses_quad_shuffles: bool,
+    /// HMMA with half accumulators (TENSOR_MUL_ADD).
+    pub uses_hmma_f16: bool,
     pub uses_patches: [bool; 30],
 
     pub interpolation: [Interpolation; 32],

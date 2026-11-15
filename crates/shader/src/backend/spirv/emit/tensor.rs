@@ -6,7 +6,8 @@
 //! nothing rounds to half.
 
 use rspirv::spirv::{
-    Capability, Decoration, FunctionControl, GlslStd450Op, LoopControl, Scope, StorageClass, Word,
+    Capability, Decoration, FunctionControl, GlslStd450Op, LoopControl, MemorySemantics, Scope,
+    StorageClass, Word,
 };
 
 use crate::backend::spirv::context::EmitContext;
@@ -34,6 +35,9 @@ pub(super) fn tensor_mul_add(
     f32_accumulators: bool,
 ) -> EmitResult<Word> {
     let variant = variant(ctx.flags(inst), f32_accumulators)?;
+    if !f32_accumulators && let Some(scratch) = ctx.tensor_scratch_word {
+        return cooperative_mul_add(ctx, inst, scratch);
+    }
     if !ctx.supports_subgroups() || ctx.profile.has_broken_spirv_subgroup_shuffle {
         return Err(EmitError::Unsupported(
             "software HMMA without subgroup shuffles",
@@ -52,6 +56,150 @@ pub(super) fn tensor_mul_add(
     Ok(ctx
         .b
         .function_call(result_type, None, function, [a, b, c])?)
+}
+
+/// The pointer to shared memory word `index`.
+fn shared_word(ctx: &mut EmitContext<'_>, index: Word) -> EmitResult<Word> {
+    let (pointer_type, array) = (ctx.shared_u32, ctx.shared_memory_u32);
+    Ok(if ctx.uses_explicit_workgroup_layout {
+        let zero = ctx.u32_zero_value;
+        ctx.b
+            .access_chain(pointer_type, None, array, [zero, index])?
+    } else {
+        ctx.b.access_chain(pointer_type, None, array, [index])?
+    })
+}
+
+fn subgroup_barrier(ctx: &mut EmitContext<'_>) -> EmitResult<()> {
+    let scope = ctx.const_u32(Scope::Subgroup as u32);
+    let semantics =
+        ctx.barrier_semantics(MemorySemantics::ACQUIRE_RELEASE | MemorySemantics::WORKGROUP_MEMORY);
+    let semantics = ctx.const_u32(semantics);
+    Ok(ctx.b.control_barrier(scope, scope, semantics)?)
+}
+
+/// HMMA.F16 (K=16, or K=8 with zero upper halves) of a 32-lane warp as one cooperative-matrix
+/// multiply-add on 16x16x16 fp16 matrices, for hosts without a 16x8x16 shape (AMD RDNA):
+/// each lane stores its fragments to row-major A, column-major B (columns 8-15 zero) and
+/// row-major C tiles in this subgroup's shared memory scratch, the subgroup multiplies, stores D
+/// over C, and each lane reads its two D words back from where it wrote C.
+fn cooperative_mul_add(ctx: &mut EmitContext<'_>, inst: InstId, scratch: u32) -> EmitResult<Word> {
+    let types = ctx.cooperative_hmma();
+    let a = ctx.def_arg(inst, 0)?;
+    let b = ctx.def_arg(inst, 1)?;
+    let c = ctx.def_arg(inst, 2)?;
+    let (u32_t, u32x2) = (ctx.u32[1], ctx.u32[2]);
+    let local = ctx.subgroup_invocation_id();
+    let local = ctx.b.load(u32_t, None, local, None, [])?;
+    let lane = imm_and(ctx, local, 31)?;
+    let subgroup = ctx.b.load(u32_t, None, types.subgroup_id, None, [])?;
+    let tile_words = ctx.const_u32(super::super::context::COOPERATIVE_HMMA_TILE_WORDS);
+    let offset = ctx.b.i_mul(u32_t, None, subgroup, tile_words)?;
+    let tile_a = add_imm(ctx, offset, scratch)?;
+    let tile_b = add_imm(ctx, tile_a, 128)?;
+    let tile_c = add_imm(ctx, tile_a, 256)?;
+    let two = ctx.const_u32(2);
+    let three = ctx.const_u32(3);
+    let g = ctx.b.shift_right_logical(u32_t, None, lane, two)?;
+    let t = imm_and(ctx, lane, 3)?;
+    // Word of (row g, columns 2t and 2t+1) in a 16x16 fp16 tile of 8 words a row.
+    let g8 = ctx.b.shift_left_logical(u32_t, None, g, three)?;
+    let row_lo = add(ctx, g8, t)?;
+    let row_hi = add_imm(ctx, row_lo, 64)?;
+    let row_lo_k8 = add_imm(ctx, row_lo, 4)?;
+    let row_hi_k8 = add_imm(ctx, row_hi, 4)?;
+    let store = |ctx: &mut EmitContext<'_>, tile: Word, word: Word, value: Word| {
+        let index = add(ctx, tile, word)?;
+        let pointer = shared_word(ctx, index)?;
+        ctx.store_shared(pointer, value)
+    };
+    let word = |ctx: &mut EmitContext<'_>, vector: Word, index: u32| {
+        ctx.b.composite_extract(u32_t, None, vector, [index])
+    };
+    let a0 = word(ctx, a, 0)?;
+    let a1 = word(ctx, a, 1)?;
+    let a2 = word(ctx, a, 2)?;
+    let a3 = word(ctx, a, 3)?;
+    store(ctx, tile_a, row_lo, a0)?;
+    store(ctx, tile_a, row_hi, a1)?;
+    store(ctx, tile_a, row_lo_k8, a2)?;
+    store(ctx, tile_a, row_hi_k8, a3)?;
+    // B column g holds k pairs t (b0) and t+4 (b1); columns 8-15 (words 64-127) are zero.
+    let b0 = word(ctx, b, 0)?;
+    let b1 = word(ctx, b, 1)?;
+    store(ctx, tile_b, row_lo, b0)?;
+    store(ctx, tile_b, row_lo_k8, b1)?;
+    let zero = ctx.u32_zero_value;
+    let lane_64 = add_imm(ctx, lane, 64)?;
+    let lane_96 = add_imm(ctx, lane, 96)?;
+    store(ctx, tile_b, lane_64, zero)?;
+    store(ctx, tile_b, lane_96, zero)?;
+    let c0 = word(ctx, c, 0)?;
+    let c1 = word(ctx, c, 1)?;
+    store(ctx, tile_c, row_lo, c0)?;
+    store(ctx, tile_c, row_hi, c1)?;
+    subgroup_barrier(ctx)?;
+    let stride = ctx.const_u32(8);
+    let row_major = ctx.const_u32(0);
+    let column_major = ctx.const_u32(1);
+    let pointer_a = shared_word(ctx, tile_a)?;
+    let pointer_b = shared_word(ctx, tile_b)?;
+    let pointer_c = shared_word(ctx, tile_c)?;
+    let (access, scope) = ctx.shared_access(false);
+    let matrix_a = ctx.b.cooperative_matrix_load_khr(
+        types.matrix_a,
+        None,
+        pointer_a,
+        row_major,
+        Some(stride),
+        access,
+        scope,
+    )?;
+    let (access, scope) = ctx.shared_access(false);
+    let matrix_b = ctx.b.cooperative_matrix_load_khr(
+        types.matrix_b,
+        None,
+        pointer_b,
+        column_major,
+        Some(stride),
+        access,
+        scope,
+    )?;
+    let (access, scope) = ctx.shared_access(false);
+    let matrix_c = ctx.b.cooperative_matrix_load_khr(
+        types.matrix_c,
+        None,
+        pointer_c,
+        row_major,
+        Some(stride),
+        access,
+        scope,
+    )?;
+    let matrix_d = ctx.b.cooperative_matrix_mul_add_khr(
+        types.matrix_c,
+        None,
+        matrix_a,
+        matrix_b,
+        matrix_c,
+        None,
+    )?;
+    let (access, scope) = ctx.shared_access(true);
+    ctx.b.cooperative_matrix_store_khr(
+        pointer_c,
+        matrix_d,
+        row_major,
+        Some(stride),
+        access,
+        scope,
+    )?;
+    subgroup_barrier(ctx)?;
+    let index_lo = add(ctx, tile_c, row_lo)?;
+    let pointer_lo = shared_word(ctx, index_lo)?;
+    let d0 = ctx.load_shared(u32_t, pointer_lo)?;
+    let index_hi = add(ctx, tile_c, row_hi)?;
+    let pointer_hi = shared_word(ctx, index_hi)?;
+    let d1 = ctx.load_shared(u32_t, pointer_hi)?;
+    Ok(ctx.b.composite_construct(u32x2, None, [d0, d1])?)
 }
 
 /// Emits the bodies of the multiply-add functions [`tensor_mul_add`] called.

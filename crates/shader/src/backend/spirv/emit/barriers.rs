@@ -14,7 +14,8 @@ fn memory_barrier(ctx: &mut EmitContext<'_>, scope: Scope) -> EmitResult<()> {
         | MemorySemantics::ATOMIC_COUNTER_MEMORY
         | MemorySemantics::IMAGE_MEMORY;
     let scope = ctx.const_u32(scope as u32);
-    let semantics = ctx.const_u32(semantics.bits());
+    let semantics = ctx.barrier_semantics(semantics);
+    let semantics = ctx.const_u32(semantics);
     Ok(ctx.b.memory_barrier(scope, semantics)?)
 }
 
@@ -34,7 +35,8 @@ pub(super) fn barrier(ctx: &mut EmitContext<'_>, _inst: InstId) -> EmitResult<()
             if ctx.requires_coherent_image_memory {
                 semantics |= MemorySemantics::IMAGE_MEMORY;
             }
-            let semantics = ctx.const_u32(semantics.bits());
+            let semantics = ctx.barrier_semantics(semantics);
+            let semantics = ctx.const_u32(semantics);
             Ok(ctx.b.control_barrier(workgroup, workgroup, semantics)?)
         }
         ShaderStage::TessellationControl => {

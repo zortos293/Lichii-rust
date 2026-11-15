@@ -735,13 +735,28 @@ impl Context {
         let mut feedback_info = vk::PipelineCreationFeedbackCreateInfo::default()
             .pipeline_creation_feedback(&mut feedback)
             .pipeline_stage_creation_feedbacks(&mut stage_feedback);
+        // Guest compute shaders are written for 32-lane warps: run them in 32-wide subgroups when
+        // the device allows it for this workgroup size.
+        let features = &self.device.features;
+        let invocations = x * y * z;
+        let mut subgroup_32 = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+            .required_subgroup_size(32);
+        let mut stage_info = vk::PipelineShaderStageCreateInfo::default()
+            .stage(stage)
+            .module(module)
+            .name(ENTRY);
+        if features.compute_subgroup_32
+            && invocations.div_ceil(32) <= features.max_compute_workgroup_subgroups
+        {
+            stage_info = stage_info.push_next(&mut subgroup_32);
+            // Whole warps run as whole subgroups, which cooperative-matrix HMMA needs.
+            if features.compute_full_subgroups && x.is_multiple_of(32) {
+                stage_info =
+                    stage_info.flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS);
+            }
+        }
         let info = vk::ComputePipelineCreateInfo::default()
-            .stage(
-                vk::PipelineShaderStageCreateInfo::default()
-                    .stage(stage)
-                    .module(module)
-                    .name(ENTRY),
-            )
+            .stage(stage_info)
             .layout(layout.raw)
             .push_next(&mut feedback_info);
         // SAFETY: every referenced object is live; the cache is internally synchronised.
