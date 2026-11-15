@@ -509,10 +509,13 @@ struct LookupKey {
     info: ImageInfo,
 }
 
+/// What a lookup found, valid while the GMMU keeps its `generation`. A miss (`found` is
+/// `None`) also dies once an image is created, as it was looked up before `creations`.
 #[derive(Clone, Copy)]
 struct LookupEntry {
     generation: u64,
-    found: Found,
+    creations: u64,
+    found: Option<Found>,
 }
 
 struct Slot {
@@ -552,6 +555,8 @@ pub struct TextureCache {
     traffic: Traffic,
     /// Images removed so far; see [`TextureCache::removals`].
     removals: u64,
+    /// Images created so far; a cached miss is only good until the next one.
+    creations: u64,
     ids: Vec<ImageId>,
     joins: Vec<(ImageId, u32, u32)>,
     new_aliases: Vec<Alias>,
@@ -852,6 +857,7 @@ impl TextureCache {
             visit: 0,
             traffic: Traffic::default(),
             removals: 0,
+            creations: 0,
             ids: Vec::new(),
             joins: Vec::new(),
             new_aliases: Vec::new(),
@@ -1318,7 +1324,9 @@ impl TextureCache {
         self.ids = ids;
     }
 
-    /// Texture descriptors may have changed: forget the address lookups (images stay).
+    /// A channel was released, and its GMMU, which keys the lookups by address, may be freed and
+    /// another take its place: forget the address lookups (images stay). Descriptor changes need
+    /// no forgetting, as a lookup is keyed by the whole image info.
     pub fn invalidate_lookups(&mut self) {
         self.lookup.clear();
     }
@@ -1842,22 +1850,33 @@ impl TextureCache {
             info: *info,
         };
         let generation = gmmu.generation();
-        if let Some(entry) = self.lookup.get(&key)
+        if let Some(&entry) = self.lookup.get(&key)
             && entry.generation == generation
-            && self.get(entry.found.id).is_some()
         {
-            let found = entry.found;
-            self.touch(found.id);
-            return Ok(Some(found));
+            match entry.found {
+                Some(found) if self.get(found.id).is_some() => {
+                    self.touch(found.id);
+                    return Ok(Some(found));
+                }
+                None if entry.creations == self.creations => return Ok(None),
+                _ => {}
+            }
         }
         let found = self.find_slow(tx, gmmu, gpu_va, info)?;
         if let Some(found) = found {
             self.touch(found.id);
-            if self.lookup.len() >= MAX_LOOKUPS {
-                self.lookup.clear();
-            }
-            self.lookup.insert(key, LookupEntry { generation, found });
         }
+        if self.lookup.len() >= MAX_LOOKUPS {
+            self.lookup.clear();
+        }
+        self.lookup.insert(
+            key,
+            LookupEntry {
+                generation,
+                creations: self.creations,
+                found,
+            },
+        );
         Ok(found)
     }
 
@@ -2101,6 +2120,7 @@ impl TextureCache {
     }
 
     fn create(&mut self, info: &ImageInfo, segments: Vec<Segment>) -> Result<ImageId> {
+        self.creations += 1;
         let host = self.host(info.format);
         let desc = Self::image_desc(info, &host, ResolutionScale::X1);
         let image = if info.texels() > MAX_TEXELS {

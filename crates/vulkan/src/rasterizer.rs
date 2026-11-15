@@ -1360,10 +1360,6 @@ impl Rasterizer for VulkanRasterizer {
         self.texture_cache.unmap(&mut self.scheduler, addr, size);
     }
 
-    fn invalidate_gpu_caches(&mut self) {
-        self.texture_cache.invalidate_lookups();
-    }
-
     fn barrier(&mut self) {
         let cmd = match self.scheduler.record() {
             Ok(cmd) => cmd,
