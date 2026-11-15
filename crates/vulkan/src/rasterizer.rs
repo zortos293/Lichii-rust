@@ -1536,6 +1536,12 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn present(&mut self, framebuffer: &FramebufferConfig) {
+        for (dev, bits) in draw::diag::pokes() {
+            if self.handles.device.read::<u32>(dev).ok() != Some(bits) {
+                let _ = self.handles.device.write::<u32>(dev, bits);
+                self.texture_cache.cpu_written(dev, 4);
+            }
+        }
         draw::diag::watch_values(|d| self.handles.device.read::<u32>(d).ok());
         if let Some(max_bytes) = draw::diag::flush_all() {
             self.diag_flush_all(max_bytes);

@@ -207,6 +207,38 @@ pub(crate) fn ring_shader(hash: u64) -> bool {
     LIST.get_or_init(|| hex_list("LICHII_DIAG_RING_SHADER")).contains(&hash)
 }
 
+/// LICHII_DIAG_POKE=<gpu>=<f32>,...: device addresses (resolved through the watch list, so each
+/// GPU address must also be watched) and the value written there at every present.
+pub(crate) fn pokes() -> Vec<(u64, u32)> {
+    static POKES: OnceLock<Vec<(u64, f32)>> = OnceLock::new();
+    let pokes = POKES.get_or_init(|| {
+        std::env::var("LICHII_DIAG_POKE")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|p| {
+                let (a, v) = p.split_once('=')?;
+                Some((
+                    u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?,
+                    v.trim().parse().ok()?,
+                ))
+            })
+            .collect()
+    });
+    if pokes.is_empty() {
+        return Vec::new();
+    }
+    let Ok(list) = watch().lock() else {
+        return Vec::new();
+    };
+    pokes
+        .iter()
+        .filter_map(|&(gpu, value)| {
+            let dev = list.iter().find(|&&(g, _)| g == gpu)?.1?;
+            Some((dev, value.to_bits()))
+        })
+        .collect()
+}
+
 /// Adds a device address to the watch list (at most 512 entries).
 pub(crate) fn watch_add_dev(daddr: u64) {
     if let Ok(mut list) = watch().lock()
