@@ -144,6 +144,7 @@ impl Buffer {
                 .bind_buffer_memory(raw, allocation.memory(), allocation.offset())
                 .call("vkBindBufferMemory")
         };
+        device.name(raw, format_args!("{name}"));
         let buffer = Self {
             device: device.clone(),
             raw,
@@ -299,6 +300,7 @@ impl Image {
                 .bind_image_memory(raw, allocation.memory(), allocation.offset())
                 .call("vkBindImageMemory")
         };
+        device.name(raw, format_args!("{name}"));
         let image = Self {
             device: device.clone(),
             raw,
