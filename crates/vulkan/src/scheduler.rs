@@ -41,6 +41,8 @@ pub struct Scheduler {
     rendering: Option<RenderingKey>,
     /// Dynamic renderings begun so far.
     renderings: u64,
+    /// The command buffer and fence of [`Scheduler::run_aside`], made on first use.
+    aside: Option<(vk::CommandBuffer, vk::Fence)>,
 }
 
 /// The attachments and area of a dynamic rendering. Draws whose key matches the open
@@ -96,6 +98,7 @@ impl Scheduler {
             bound: None,
             rendering: None,
             renderings: 0,
+            aside: None,
         })
     }
 
@@ -366,6 +369,71 @@ impl Scheduler {
         self.wait(tick)
     }
 
+    /// Runs what `record` records in a command buffer of its own, submitted ahead of the work
+    /// being recorded, and waits for it alone. For a read whose writers were all submitted
+    /// already: the wait covers neither the recorded work nor its submission. The recorded
+    /// commands must not depend on work recorded since the last flush.
+    pub fn run_aside(&mut self, record: impl FnOnce(vk::CommandBuffer)) -> Result<()> {
+        let (cmd, fence) = match self.aside {
+            Some(aside) => aside,
+            None => {
+                let info = vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1);
+                // SAFETY: the pool belongs to this scheduler and this thread.
+                let cmd = unsafe {
+                    self.device
+                        .raw
+                        .allocate_command_buffers(&info)
+                        .call("vkAllocateCommandBuffers")?[0]
+                };
+                // SAFETY: valid create info on a live device.
+                let fence = unsafe {
+                    self.device
+                        .raw
+                        .create_fence(&vk::FenceCreateInfo::default(), None)
+                        .call("vkCreateFence")?
+                };
+                self.aside = Some((cmd, fence));
+                (cmd, fence)
+            }
+        };
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        // SAFETY: `cmd` is not pending: every earlier use was waited for below.
+        unsafe {
+            self.device
+                .raw
+                .begin_command_buffer(cmd, &begin)
+                .call("vkBeginCommandBuffer")?
+        };
+        record(cmd);
+        // SAFETY: `cmd` is in the recording state.
+        unsafe {
+            self.device
+                .raw
+                .end_command_buffer(cmd)
+                .call("vkEndCommandBuffer")?
+        };
+        let cmd_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
+        let submit = vk::SubmitInfo2::default().command_buffer_infos(&cmd_infos);
+        self.device.submit(&[submit], fence)?;
+        let _waiting = self.activity.as_deref().map(|a| a.waiting(Wait::HostGpu));
+        // SAFETY: the fence belongs to this scheduler and was just submitted.
+        unsafe {
+            self.device
+                .raw
+                .wait_for_fences(&[fence], true, u64::MAX)
+                .call("vkWaitForFences")?;
+            self.device
+                .raw
+                .reset_fences(&[fence])
+                .call("vkResetFences")?;
+        }
+        Ok(())
+    }
+
     /// Recycles the command buffers and drops the retired objects of the work the GPU
     /// finished; returns the last finished tick.
     pub fn collect(&mut self) -> u64 {
@@ -410,6 +478,9 @@ impl Drop for Scheduler {
         self.garbage.clear();
         // SAFETY: all submissions finished; the pool frees its command buffers.
         unsafe {
+            if let Some((_, fence)) = self.aside {
+                self.device.raw.destroy_fence(fence, None);
+            }
             self.device.raw.destroy_command_pool(self.pool, None);
         }
     }

@@ -2557,7 +2557,8 @@ mod tests {
                     .cmd_fill_buffer(cmd, binding.buffer, binding.offset, 256, 0xabab_abab);
             }
             crate::commands::transfer_to_all_barrier(&r.device, cmd);
-            r.buffer_cache.mark_gpu_written(daddr, 256);
+            r.buffer_cache
+                .mark_gpu_written(r.scheduler.tick(), daddr, 256);
         }
         f.memory.write_bytes(inline, &[7; 256]).unwrap();
         f.rasterizer.invalidate_region(inline, 256);
