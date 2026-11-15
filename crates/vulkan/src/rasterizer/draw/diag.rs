@@ -42,6 +42,24 @@ fn flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v == "1")
 }
 
+/// `LICHII_DIAG_WATCH_VA=<hex>`: true for addresses in the 4 MiB from it.
+pub(crate) fn watch_va(addr: u64) -> bool {
+    static V: OnceLock<Option<u64>> = OnceLock::new();
+    let base = *V.get_or_init(|| {
+        let v = std::env::var("LICHII_DIAG_WATCH_VA").ok()?;
+        u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()
+    });
+    base.is_some_and(|b| (b..b + (4 << 20)).contains(&addr))
+}
+
+/// Logs the first 200 watch events.
+pub(crate) fn watch_log(what: &str, detail: String) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+        tracing::warn!(what, detail, "diag watch");
+    }
+}
+
 pub(crate) fn skips() -> bool {
     flag("LICHII_DIAG_SKIPS")
 }

@@ -1315,6 +1315,26 @@ impl VulkanRasterizer {
         };
         for i in 0..count {
             let rt = &regs.rt[render_target_index(regs, i)];
+            let watched = diag::watch_va(rt.address());
+            if watched {
+                diag::watch_log(
+                    "rt bind",
+                    format!(
+                        "i={i} addr={:#x} {}x{} depth={} base_layer={} array_pitch={:#x} tile_mode={:#x} fmt={:#x} rt_layer={:#x} layered={layered} info={:?} stages={:x?}",
+                        rt.address(),
+                        rt.width,
+                        rt.height,
+                        rt.depth(),
+                        rt.base_layer,
+                        rt.array_pitch,
+                        bytemuck::cast::<_, u32>(rt.tile_mode),
+                        rt.format,
+                        bytemuck::cast::<_, u32>(regs.rt_layer),
+                        ImageInfo::from_render_target(rt, msaa, gob),
+                        self.draw.stages.iter().flatten().map(|m| m.hash).collect::<Vec<_>>(),
+                    ),
+                );
+            }
             let Some(info) = ImageInfo::from_render_target(rt, msaa, gob).map(layers) else {
                 continue;
             };
