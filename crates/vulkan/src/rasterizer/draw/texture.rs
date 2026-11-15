@@ -192,7 +192,7 @@ fn scaled(value: f32, scale: ResolutionScale) -> i64 {
 impl VulkanRasterizer {
     pub(in crate::rasterizer) fn record_draw_texture(
         &mut self,
-        ctx: &GraphicsContext<'_>,
+        ctx: &mut GraphicsContext<'_>,
         draw: &DrawTexture,
     ) -> Result<()> {
         self.render_targets(ctx)?;
