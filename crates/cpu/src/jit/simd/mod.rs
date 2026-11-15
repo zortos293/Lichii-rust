@@ -98,6 +98,11 @@ pub(super) extern "sysv64" fn call(
     pc: u64,
 ) -> bool {
     let src = super::diag::before(ctx, word);
+    {
+        // SAFETY: called from translated code while the owning Jit runs it.
+        let memory = unsafe { state.memory() };
+        super::diag::trap(memory, ctx, pc, word);
+    }
     if let Some(Ok(())) = execute(ctx, word) {
         if let Some(src) = src {
             // SAFETY: called from translated code while the owning Jit runs it.

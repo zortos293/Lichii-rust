@@ -275,3 +275,99 @@ pub(super) fn after(
         )
     });
 }
+
+fn trap_pcs() -> &'static [u64] {
+    static V: OnceLock<Vec<u64>> = OnceLock::new();
+    V.get_or_init(|| {
+        let v: Vec<u64> = std::env::var("LICHII_DIAG_TRAP_PC")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+            .collect();
+        tracing::warn!(?v, "LIRU3 diag trap pcs");
+        v
+    })
+}
+
+fn bytes(memory: &AddressSpace, va: u64, words: u64) -> Option<String> {
+    let w: Vec<String> = (0..words)
+        .map(|i| memory.read::<u32>(va + 4 * i).map(|w| format!("{w:08x}")))
+        .collect::<Result<_, _>>()
+        .ok()?;
+    Some(w.join(" "))
+}
+
+/// LICHII_DIAG_TRAP_PC: comma-separated pcs of CallSimd words whose first 3 runs log every
+/// register, a frame-pointer backtrace with code around each return address, and 64 bytes at
+/// each register that points at mapped memory. The words must run on CallSimd
+/// (LICHII_DIAG_SIMD_INTERP).
+pub(super) fn trap(memory: &AddressSpace, ctx: &ThreadContext, pc: u64, word: u32) {
+    let pcs = trap_pcs();
+    if pcs.is_empty() || !pcs.contains(&pc) {
+        return;
+    }
+    static HITS: Mutex<Vec<(u64, u32)>> = Mutex::new(Vec::new());
+    let Ok(mut hits) = HITS.lock() else {
+        return;
+    };
+    let n = match hits.iter_mut().find(|h| h.0 == pc) {
+        Some(h) => {
+            h.1 += 1;
+            h.1
+        }
+        None => {
+            hits.push((pc, 1));
+            1
+        }
+    };
+    drop(hits);
+    if n > 3 {
+        return;
+    }
+    let x: Vec<String> = ctx
+        .x
+        .iter()
+        .enumerate()
+        .map(|(i, v)| format!("x{i}={v:x}"))
+        .collect();
+    let v: Vec<String> = ctx
+        .v
+        .iter()
+        .enumerate()
+        .map(|(i, v)| format!("v{i}={v:032x}"))
+        .collect();
+    tracing::warn!(
+        "LIRU3 TRAP t={:.3} hit={n} pc={pc:#x} word={word:08x} sp={:#x} {} {}",
+        t(),
+        ctx.sp,
+        x.join(" "),
+        v.join(" ")
+    );
+    tracing::warn!(
+        "LIRU3 TRAPCODE pc={pc:#x} from={:#x} [{}]",
+        pc - 4 * 400,
+        bytes(memory, pc - 4 * 400, 432).unwrap_or_default()
+    );
+    let mut fp = ctx.x[29];
+    let mut lr = ctx.x[30];
+    for depth in 0..16 {
+        tracing::warn!(
+            "LIRU3 TRAPFRAME pc={pc:#x} depth={depth} fp={fp:#x} lr={lr:#x} code_from={:#x} [{}]",
+            lr.wrapping_sub(4 * 96),
+            bytes(memory, lr.wrapping_sub(4 * 96), 104).unwrap_or_default()
+        );
+        let (Ok(next), Ok(ret)) = (memory.read::<u64>(fp), memory.read::<u64>(fp + 8)) else {
+            break;
+        };
+        if next <= fp {
+            break;
+        }
+        fp = next;
+        lr = ret;
+    }
+    for (i, &r) in ctx.x.iter().chain([&ctx.sp]).enumerate() {
+        if let Some(b) = bytes(memory, r & !3, 32) {
+            tracing::warn!("LIRU3 TRAPMEM pc={pc:#x} reg={i} at={:#x} [{b}]", r & !3);
+        }
+    }
+}
