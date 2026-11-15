@@ -1532,6 +1532,49 @@ fn video_decoder_plays_a_movie_at_its_pts_pace_and_ends_it() {
 }
 
 #[test]
+fn video_decoder_completes_the_images_still_handed_out_at_the_end_of_stream() {
+    let vdec = Vdec::open();
+    let fences: Vec<_> = (1..=5).map(|image| vdec.hand_out(311, image)).collect();
+    let (syncpoint, last) = fences[4];
+    for pts in [0, 20_000] {
+        assert_eq!(vdec.submit(pts, false).result, ResultCode::SUCCESS);
+    }
+    assert_eq!(vdec.submit(40_000, true).result, ResultCode::SUCCESS);
+    vdec.wait(syncpoint, last);
+    assert_eq!(vdec.output(), Some((1, 1280, 0, false)));
+    assert_eq!(vdec.output(), Some((2, 1280, 20_000_000, false)));
+    for image in 3..=5 {
+        assert_eq!(
+            vdec.output(),
+            Some((image, 1280, 40_000_000, true)),
+            "image {image} completes as an end-of-stream frame"
+        );
+    }
+    assert_eq!(vdec.output(), None);
+    vdec.close(syncpoint);
+}
+
+#[test]
+fn video_decoder_completes_an_image_handed_out_after_the_end_of_stream_at_once() {
+    let vdec = Vdec::open();
+    let (syncpoint, first) = vdec.hand_out(311, 1);
+    assert_eq!(vdec.submit(30_000, true).result, ResultCode::SUCCESS);
+    vdec.wait(syncpoint, first);
+    assert_eq!(vdec.output(), Some((1, 1280, 30_000_000, true)));
+
+    let (_, value) = vdec.hand_out(314, 2);
+    assert_eq!(value, first + 1);
+    let guest = vdec.context.gpu.host1x().syncpoints.guest();
+    assert!(
+        guest.is_reached(syncpoint, value).unwrap(),
+        "the fence is reached when 314 replies"
+    );
+    assert_eq!(vdec.output(), Some((2, 1280, 30_000_000, true)));
+    assert_eq!(vdec.output(), None);
+    vdec.close(syncpoint);
+}
+
+#[test]
 fn video_decoder_counts_unregistered_images_off_in_turn() {
     let vdec = Vdec::open();
     let fences: Vec<_> = (1..=3).map(|image| vdec.hand_out(311, image)).collect();

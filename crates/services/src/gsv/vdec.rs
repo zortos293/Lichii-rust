@@ -10,7 +10,10 @@
 //! (the order the client acquires them from its own ring) in the layout gsv 961 describes, drops
 //! the renderer's cached copies of it (the title may have drawn into the image, which write
 //! tracking leaves alone), and increments the syncpoint; 213 then reports the frame. An end-of-stream input completes after
-//! the pictures the decoder still holds, and Stop and Finalize complete every fence handed out.
+//! the pictures the decoder still holds; the images still handed out then complete as
+//! end-of-stream frames, as does each image handed out before the next input, Flush or Stop.
+//! Stop and Finalize
+//! complete every fence handed out.
 //!
 //! Without FFmpeg, or for a codec it cannot decode, every input becomes one frame without a
 //! picture, so a movie still plays at its pace (black) and ends.
@@ -170,6 +173,8 @@ struct State {
     end_queued: bool,
     /// The end-of-stream frame is out and nothing was submitted since.
     stream_ended: bool,
+    /// The width, height and pts of the end-of-stream frame, for the images drained after it.
+    end_frame: (u32, u32, u64),
     /// The worker is writing an image with the state unlocked.
     writing: bool,
     /// Stops and Finalizes so far: a write that sees this change took an image they completed.
@@ -211,6 +216,31 @@ impl State {
         self.stream_ended = false;
         self.end_queued = false;
         self.clock = MovieClock::default();
+    }
+
+    /// Once the end-of-stream frame is out and nothing is left to decode, every image still
+    /// handed out completes as another end-of-stream frame: clients acquire a frame for each
+    /// fence they were handed, and Mario Kart World aborts when it tears a movie down with
+    /// images missing. Returns how many fences complete.
+    fn drain_after_end(&mut self) -> u32 {
+        if !self.stream_ended || !self.inputs.is_empty() || !self.decoded.is_empty() {
+            return 0;
+        }
+        let (width, height, pts) = self.end_frame;
+        let mut fences = 0;
+        for handout in self.free.drain(..) {
+            if let Some(handout) = handout {
+                self.outputs.push_back(Output {
+                    image: handout.image,
+                    width,
+                    height,
+                    pts,
+                    end: true,
+                });
+            }
+            fences += 1;
+        }
+        fences
     }
 }
 
@@ -276,6 +306,7 @@ impl VideoDecoderService {
                 running: true,
                 end_queued: false,
                 stream_ended: false,
+                end_frame: (0, 0, 0),
                 writing: false,
                 stops: 0,
                 quit: false,
@@ -318,6 +349,9 @@ impl VideoDecoderService {
                 return UNKNOWN;
             };
             state.free.push_back(Some(Handout { image, release }));
+            for _ in 0..state.drain_after_end() {
+                shared.increment();
+            }
             value
         };
         tracing::debug!(
@@ -790,8 +824,12 @@ impl Shared {
                         state.stream_ended = true;
                         state.end_queued = false;
                         state.clock = MovieClock::default();
+                        state.end_frame = (width, height, decoded.pts);
                     }
                     self.increment();
+                    for _ in 0..state.drain_after_end() {
+                        self.increment();
+                    }
                     continue;
                 }
                 wake = Some(host_now + Duration::from_micros(due - now));
