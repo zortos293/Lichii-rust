@@ -56,7 +56,7 @@ fn finish(
     if let Some(dir) = std::env::var_os("LICHII_DIAG_IR_DIR") {
         let name = format!("{hash:016x}");
         let wanted = std::env::var("LICHII_DIAG_IR_FS")
-            .is_ok_and(|v| v.split(',').any(|p| !p.is_empty() && name.starts_with(p)));
+            .is_ok_and(|v| v == "all" || v.split(',').any(|p| !p.is_empty() && name.starts_with(p)));
         if wanted {
             let dir = std::path::PathBuf::from(dir);
             let _ = std::fs::create_dir_all(&dir);
