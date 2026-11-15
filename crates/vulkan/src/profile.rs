@@ -128,7 +128,8 @@ pub(crate) fn shader_profile(
         support_viewport_index_layer: profile.support_viewport_index_layer_non_geometry,
         support_handle_programs: true,
         support_handle_table_arrays: features.sampled_image_array_non_uniform_indexing,
-        support_conditional_barrier: v12.driver_id != vk::DriverId::INTEL_PROPRIETARY_WINDOWS,
+        support_conditional_barrier: v12.driver_id != vk::DriverId::INTEL_PROPRIETARY_WINDOWS
+            && std::env::var_os("LICHII_DIAG_STRIP_COND_BARRIER").is_none(),
         ..HostTranslateInfo::default()
     };
     (profile, host)
