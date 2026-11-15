@@ -9,7 +9,7 @@ use lichii_gpu::engines::maxwell_3d::regs::{
     ZetaSizeDimensionControl,
 };
 use lichii_texture::PixelFormat;
-use lichii_texture::block_linear::{GobLayout, SurfaceLayout};
+use lichii_texture::block_linear::{GobLayout, SurfaceLayout, Tiling};
 use lichii_texture::guest::{DepthFormat, RenderTargetFormat};
 use lichii_texture::tic::{MsaaMode, SwizzleSource, TextureDescriptor, TextureMemory, TextureType};
 
@@ -459,6 +459,53 @@ impl ImageInfo {
                 && surface.level_tiling(level + l) == other_surface.level_tiling(l)
         });
         (fits && same_levels).then_some((level, layer))
+    }
+
+    /// Where `other`, starting `offset` bytes into this volume, lies as one of its slices: the
+    /// level and slice, when `other` is a single slice tiled as the volume's slices at that
+    /// level are. Slices inside one block of a deep block start a GOB row apart, so a target
+    /// there shares the block's GOBs with the slices around it.
+    pub fn find_slice(&self, other: &Self, offset: u64) -> Option<(u32, u32)> {
+        let (GuestLayout::BlockLinear { .. }, GuestLayout::BlockLinear { .. }) =
+            (self.layout, other.layout)
+        else {
+            return None;
+        };
+        if self.kind != ImageKind::D3
+            || other.kind == ImageKind::D1
+            || (other.levels, other.layers, other.depth, other.samples) != (1, 1, 1, 1)
+            || self.format.bytes_per_block() != other.format.bytes_per_block()
+            || self.format.block_width() != other.format.block_width()
+            || self.format.block_height() != other.format.block_height()
+        {
+            return None;
+        }
+        let surface = self.surface();
+        let level = (0..self.levels)
+            .rev()
+            .find(|&l| surface.level_offset(l) <= offset)?;
+        let tiling = surface.level_tiling(level);
+        let in_level = offset - surface.level_offset(level);
+        let slabs = u64::from(tiling.depth.div_ceil(1 << tiling.block_depth_log2));
+        let slab = tiling.size_bytes() as u64 / slabs;
+        let gob_rows = 9 + tiling.block_height_log2;
+        let slice =
+            ((in_level / slab) << tiling.block_depth_log2) + ((in_level % slab) >> gob_rows);
+        let slice = u32::try_from(slice).ok().filter(|&z| z < tiling.depth)?;
+        let own = other.surface().level_tiling(0);
+        let shape = |t: &Tiling| {
+            (
+                t.width,
+                t.height,
+                t.bytes_per_block,
+                t.block_height_log2,
+                t.block_depth_log2,
+                t.row_gobs,
+                t.layout,
+            )
+        };
+        (tiling.slice_offset(slice) as u64 == in_level && shape(&tiling) == shape(&own))
+            .then_some((level, slice))
     }
 }
 

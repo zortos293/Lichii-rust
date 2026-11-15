@@ -364,7 +364,7 @@ impl TextureCache {
         let Some(source) = self.find(tx, gmmu, src_va, src)? else {
             return Ok(None);
         };
-        let Some(target) = self.lookup_or_create(tx, gmmu, dst.gpu_va, &dst.info)? else {
+        let Some(target) = self.lookup_or_create(tx, gmmu, dst.gpu_va, &dst.info, false)? else {
             return Ok(None);
         };
         if source.id == target.id {
