@@ -1260,6 +1260,7 @@ impl BufferCache {
             }
             if captures.head + len > CAPTURE_RING_SIZE {
                 captures.head = 0;
+                before_transfer(device, cmd);
             }
             let offset = captures.head;
             captures
