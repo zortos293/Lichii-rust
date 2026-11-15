@@ -657,7 +657,8 @@ impl VulkanRasterizer {
         if !self.render_targets(ctx)? {
             return Ok(());
         }
-        let may_skip = self.draw.presented_only();
+        let may_skip = self.draw.presented_only() || diag::old_skip();
+        let shaders_blocked = self.draw.shaders.blocked();
         if !self.graphics_stages(ctx, host_topology, may_skip) {
             self.diag_skip(ctx, "shader");
             return Ok(());
@@ -703,6 +704,26 @@ impl VulkanRasterizer {
             samples,
         );
         let key = GraphicsPipelineKey::new(&draw.stages, attachments, &fixed);
+        if diag::waits() && !may_skip {
+            use std::fmt::Write as _;
+            let shader_wait = draw.shaders.blocked() != shaders_blocked;
+            let pipeline_wait = draw.pipelines.graphics(&key, &draw.stages).is_none();
+            if shader_wait || pipeline_wait {
+                let mut s = format!("WAIT shader={shader_wait} pipeline={pipeline_wait}");
+                for m in draw.stages.iter().flatten() {
+                    let _ = write!(s, " {:?}={:016x}", m.stage, m.hash);
+                }
+                for (i, t) in draw.colors.iter().enumerate() {
+                    if let Some(t) = t {
+                        let _ = write!(s, " C{i}={:?}/{:?}", t.id, t.format);
+                    }
+                }
+                if let Some(t) = draw.depth {
+                    let _ = write!(s, " Z={:?}/{:?}", t.id, t.format);
+                }
+                diag::with(|d| d.always(&s));
+            }
+        }
         let pipeline = match may_skip {
             true => draw.pipelines.graphics(&key, &draw.stages),
             false => draw.pipelines.graphics_waiting(&key, &draw.stages),

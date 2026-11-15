@@ -105,6 +105,18 @@ pub(crate) fn samples1() -> bool {
     *V.get_or_init(|| flag("LICHII_DIAG_SAMPLES1"))
 }
 
+/// LICHII_DIAG_OLD_SKIP: every draw may be skipped while compiling, as before #352.
+pub(crate) fn old_skip() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| flag("LICHII_DIAG_OLD_SKIP"))
+}
+
+/// LICHII_DIAG_WAITS: log each draw that blocked on a translation or pipeline build.
+pub(crate) fn waits() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| flag("LICHII_DIAG_WAITS"))
+}
+
 pub(crate) fn stats() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| flag("LICHII_DIAG_STATS"))
