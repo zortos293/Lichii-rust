@@ -2915,6 +2915,34 @@ impl VulkanRasterizer {
             shared_memory: ctx.shared_memory_size,
         };
         let Some(pipeline) = self.draw.pipelines.compute(&key, &module) else {
+            if diag::skips() {
+                static SEEN: std::sync::Mutex<Vec<(u64, u32)>> = std::sync::Mutex::new(Vec::new());
+                let mut seen = SEEN.lock().unwrap();
+                let n = match seen.iter_mut().find(|(h, _)| *h == module.hash) {
+                    Some((_, n)) => {
+                        *n += 1;
+                        *n
+                    }
+                    None => {
+                        seen.push((module.hash, 1));
+                        1
+                    }
+                };
+                if n <= 3 || n.is_power_of_two() {
+                    let c0 = ctx
+                        .memory
+                        .read::<[u32; 16]>(ctx.const_buffers[0].address)
+                        .unwrap_or_default();
+                    tracing::warn!(
+                        hash = format!("{:016x}", module.hash),
+                        count = n,
+                        grid = ?ctx.grid,
+                        block = ?ctx.block,
+                        c0 = format!("{c0:08x?}"),
+                        "diag dispatch skipped: pipeline not ready"
+                    );
+                }
+            }
             return Ok(());
         };
         let pipeline_raw = pipeline.raw();
