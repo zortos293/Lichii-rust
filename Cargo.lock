@@ -1783,6 +1783,7 @@ dependencies = [
  "bytemuck",
  "egui",
  "gpu-allocator",
+ "libloading",
  "lichii-common",
  "lichii-gpu",
  "lichii-memory",

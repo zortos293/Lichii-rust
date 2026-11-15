@@ -933,6 +933,15 @@ Dump prod.keys and title.keys \
                 self.set_graphics(|g| g.gpu_accuracy = accuracy);
                 self.toast(format!("GPU accuracy: {}", accuracy.label()));
             }
+            HotkeyAction::ToggleRenderdocCapture => {
+                if self.settings.debug.renderdoc_hotkey {
+                    self.toast(if lichii_vulkan::debug::renderdoc::request_toggle() {
+                        "RenderDoc capture toggled at the next frame"
+                    } else {
+                        "RenderDoc is not loaded"
+                    });
+                }
+            }
             HotkeyAction::Exit => self.exit_requested = true,
         }
     }

@@ -36,6 +36,7 @@ use lichii_texture::{Aspect, Numeric, PixelFormat};
 
 use crate::buffer_cache::{BufferBinding, BufferCache, BufferCacheStats};
 use crate::commands::{COLOR_RANGE, ImageAccess, transition};
+use crate::debug::renderdoc::{self, FrameCapture};
 use crate::device::Device;
 use crate::error::Result;
 use crate::format::{Conversion, host_format};
@@ -194,6 +195,8 @@ pub struct VulkanRasterizer {
     activity: Activity,
     stalls: Stalls,
     frame_dump: Option<frame_dump::FrameDump>,
+    /// RenderDoc captures of whole guest frames, when RenderDoc is loaded.
+    capture: Option<FrameCapture>,
     teardown: Teardown,
 }
 
@@ -381,6 +384,7 @@ impl VulkanRasterizer {
             activity: Activity::default(),
             stalls: Stalls::default(),
             frame_dump: frame_dump::FrameDump::from_env(),
+            capture: renderdoc::get().map(FrameCapture::new),
             teardown: Teardown(Vec::new()),
         })
     }
@@ -1360,10 +1364,6 @@ impl Rasterizer for VulkanRasterizer {
         self.texture_cache.unmap(&mut self.scheduler, addr, size);
     }
 
-    fn invalidate_gpu_caches(&mut self) {
-        self.texture_cache.invalidate_lookups();
-    }
-
     fn barrier(&mut self) {
         let cmd = match self.scheduler.record() {
             Ok(cmd) => cmd,
@@ -1460,6 +1460,13 @@ impl Rasterizer for VulkanRasterizer {
         {
             tracing::error!(%error, "collecting cached images failed");
         }
+        if let Some(capture) = &mut self.capture {
+            capture.presented(|| {
+                if let Err(error) = self.scheduler.flush() {
+                    tracing::error!(%error, "submitting a captured frame failed");
+                }
+            });
+        }
     }
 }
 
@@ -1469,6 +1476,9 @@ impl Drop for VulkanRasterizer {
     fn drop(&mut self) {
         if self.scheduler.finish().is_err() {
             self.device.wait_idle();
+        }
+        if let Some(capture) = &mut self.capture {
+            capture.finish();
         }
         self.draw.destroy(&self.device);
         self.samples.destroy(&self.device);

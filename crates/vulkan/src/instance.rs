@@ -26,6 +26,8 @@ pub struct Instance {
     pub(crate) surface: Option<khr::surface::Instance>,
     pub(crate) headless: Option<ext::headless_surface::Instance>,
     debug: Option<(ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
+    /// `VK_EXT_debug_utils` is on for debug names and labels (`debug.vulkan_labels`).
+    pub(crate) labels: bool,
     validation_errors: Box<AtomicU32>,
     #[cfg(test)]
     _serial: test_serial::Token,
@@ -111,7 +113,8 @@ impl Instance {
                 }
             }
         }
-        if validation {
+        let labels = crate::debug::labels_requested() && has_extension(ext::debug_utils::NAME);
+        if validation || labels {
             enabled.push(ext::debug_utils::NAME.as_ptr());
         }
         let portability = has_extension(khr::portability_enumeration::NAME);
@@ -168,6 +171,7 @@ impl Instance {
             surface,
             headless,
             debug: debug.flatten(),
+            labels,
             validation_errors,
             #[cfg(test)]
             _serial: serial,

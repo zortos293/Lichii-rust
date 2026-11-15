@@ -2345,6 +2345,180 @@ fn depth_stencil_overlaps_sync_on_the_gpu() {
 }
 
 #[test]
+fn x8d24_overlaps_sync_on_the_gpu_converting_as_the_cpu_does() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let (w, h) = (256, 64);
+    let mut depth = rt_info(w, h, 2, GobLayout::Tegra);
+    depth.format = PixelFormat::X8D24Unorm;
+    let colour = rt_info(64, 64, 2, GobLayout::Tegra);
+    let inside = |k: usize| (8..24).contains(&(k % 64)) && (40..48).contains(&(k / 64));
+    let depth_tiling = depth.surface().level_tiling(0);
+    let colour_tiling = colour.surface().level_tiling(0);
+    let mut tiled = vec![0; depth_tiling.size_bytes()];
+    let numbered: Vec<u8> = (1..=64 * 64u32).flat_map(u32::to_le_bytes).collect();
+    swizzle(
+        &colour_tiling,
+        &numbered,
+        &mut tiled[..colour_tiling.size_bytes()],
+    );
+    let mut numbered_in_depth = vec![0; depth_tiling.linear_size_bytes()];
+    unswizzle(&depth_tiling, &tiled, &mut numbered_in_depth);
+    let colour_texel: Vec<Option<usize>> = numbered_in_depth
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&n| (u32::from_le_bytes(n) as usize).checked_sub(1))
+        .collect();
+    let d24 = |i: u32| match i % 4 {
+        0 => i / 4,
+        1 => 0xff_ffff - i / 4,
+        _ => i.wrapping_mul(0x9e37_79b9) >> 8,
+    };
+    let words: Vec<u32> = (0..w * h)
+        .map(|i| d24(i) | (i.wrapping_mul(37) & 0xff) << 24)
+        .collect();
+    let float_host = HostFormat {
+        format: vk::Format::D32_SFLOAT,
+        conversion: Conversion::Convert,
+        swizzle: vk::ComponentMapping::default(),
+        attachable: true,
+        storage: false,
+    };
+    let native = host_format(&f.device, depth.format, AstcRecompression::Uncompressed);
+    for host in [float_host, native] {
+        let float = match host.format {
+            vk::Format::D32_SFLOAT => true,
+            vk::Format::X8_D24_UNORM_PACK32 => false,
+            other => {
+                eprintln!("skipping X8D24 held as {other:?}");
+                continue;
+            }
+        };
+        f.cache.host_formats[depth.format as usize] = Some(host);
+        let to_host = |word: u32| {
+            let d = word & 0xff_ffff;
+            if float {
+                ((f64::from(d) / 16_777_215.0) as f32).to_bits()
+            } else {
+                d
+            }
+        };
+        let host_word = |word: [u8; 4]| {
+            let word = u32::from_le_bytes(word);
+            if float { word } else { word & 0xff_ffff }
+        };
+        let to_guest = |host: u32| {
+            if float {
+                (f64::from(f32::from_bits(host)).clamp(0.0, 1.0) * 16_777_215.0).round() as u32
+            } else {
+                host & 0xff_ffff
+            }
+        };
+        let linear: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut guest = vec![0; depth_tiling.size_bytes()];
+        swizzle(&depth_tiling, &linear, &mut guest);
+        f.memory.write_bytes(DADDR, &guest).unwrap();
+        let (mut tx, cache, gmmu) = f.tx();
+        let target = cache
+            .render_target(&mut tx, gmmu, GPU_VA, &depth, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(f.cache.get(target.id).unwrap().host.format, host.format);
+        let uploaded = f.read_plane(target.id, vk::ImageAspectFlags::DEPTH, 4);
+        for (i, &texel) in uploaded.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(host_word(texel), to_host(words[i]), "uploaded texel {i}");
+        }
+        let blue = 0x4433_2211;
+        clear_rt(
+            &mut f,
+            &colour,
+            [0x11u8, 0x22, 0x33, 0x44].map(|c| f32::from(c) / 255.0),
+            Rect {
+                x: 8,
+                y: 40,
+                width: 16,
+                height: 8,
+            },
+        );
+        let before = f.cache.traffic();
+        let (mut tx, cache, gmmu) = f.tx();
+        let synced = cache
+            .render_target(&mut tx, gmmu, GPU_VA, &depth, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(synced.id, target.id);
+        assert!(f.cache.traffic().gpu_syncs > before.gpu_syncs, "{host:?}");
+        assert_eq!(f.cache.traffic().downloads, before.downloads, "{host:?}");
+        let synced = f.read_plane(target.id, vk::ImageAspectFlags::DEPTH, 4);
+        for (i, &texel) in synced.as_chunks::<4>().0.iter().enumerate() {
+            let from = match colour_texel[i] {
+                Some(k) if inside(k) => blue,
+                _ => words[i],
+            };
+            assert_eq!(host_word(texel), to_host(from), "{host:?}: texel {i}");
+        }
+
+        let (mut tx, cache, gmmu) = f.tx();
+        let target = cache
+            .render_target(&mut tx, gmmu, GPU_VA, &depth, false)
+            .unwrap()
+            .unwrap();
+        cache
+            .clear(
+                &mut tx,
+                target,
+                ClearValue::DepthStencil {
+                    depth: Some(0.3),
+                    stencil: None,
+                    stencil_mask: 0,
+                },
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 32,
+                    height: 4,
+                },
+                0,
+                1,
+            )
+            .unwrap();
+        let newest: Vec<u32> = f
+            .read_plane(target.id, vk::ImageAspectFlags::DEPTH, 4)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&t| host_word(t))
+            .collect();
+        let before = f.cache.traffic();
+        let (mut tx, cache, gmmu) = f.tx();
+        let taken = cache
+            .render_target(&mut tx, gmmu, GPU_VA, &colour, false)
+            .unwrap()
+            .unwrap();
+        assert!(f.cache.traffic().gpu_syncs > before.gpu_syncs, "{host:?}");
+        assert_eq!(f.cache.traffic().downloads, before.downloads, "{host:?}");
+        let texels = f.read_image(taken.id).remove(0);
+        let mut expected = vec![0; 64 * 64];
+        for (i, k) in colour_texel.iter().enumerate() {
+            if let Some(k) = *k {
+                expected[k] = to_guest(newest[i]);
+            }
+        }
+        for (k, &texel) in texels.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(
+                u32::from_le_bytes(texel),
+                expected[k],
+                "{host:?}: guest word of colour texel {k}"
+            );
+        }
+        f.cache.unmap(&mut f.scheduler, DADDR, 1 << 20);
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
 fn block_linear_aliases_need_the_same_depth_stencil_encoding() {
     let info = |format, width| {
         let mut info = rt_info(width, 64, 2, GobLayout::Tegra);
@@ -2892,6 +3066,81 @@ fn subresources_split_across_device_ranges_sync_every_part() {
             .iter()
             .all(|t| *t == [0, 255, 0, 255]),
         "both device ranges take the render target's texels"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn cached_misses_end_when_the_gmmu_maps_their_address() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let unmapped = GPU_VA + 2 * DRAM;
+    let info = rt_info(64, 64, 4, GobLayout::Tegra);
+    for _ in 0..2 {
+        let (mut tx, cache, gmmu) = f.tx();
+        assert!(
+            cache
+                .find(&mut tx, gmmu, unmapped, &info)
+                .unwrap()
+                .is_none()
+        );
+    }
+    let miss = f.cache.lookup.iter().find(|(k, _)| k.gpu_va == unmapped);
+    assert!(
+        miss.is_some_and(|(_, e)| e.found.is_none()),
+        "the miss is cached"
+    );
+    f.gmmu.map(unmapped, DADDR, 1 << 20, 0, false).unwrap();
+    let (mut tx, cache, gmmu) = f.tx();
+    assert!(
+        cache
+            .find(&mut tx, gmmu, unmapped, &info)
+            .unwrap()
+            .is_some(),
+        "a GMMU map ends the cached miss"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn cached_misses_end_when_an_image_is_created() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let unmapped = GPU_VA + 2 * DRAM;
+    let info = rt_info(64, 64, 4, GobLayout::Tegra);
+    let miss = |cache: &TextureCache| {
+        cache
+            .lookup
+            .iter()
+            .find(|(k, _)| k.gpu_va == unmapped)
+            .map(|(_, e)| (e.found.is_none(), e.creations == cache.creations))
+    };
+    let (mut tx, cache, gmmu) = f.tx();
+    assert!(
+        cache
+            .find(&mut tx, gmmu, unmapped, &info)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(miss(cache), Some((true, true)));
+    assert!(cache.find(&mut tx, gmmu, GPU_VA, &info).unwrap().is_some());
+    assert_eq!(
+        miss(cache),
+        Some((true, false)),
+        "a created image ends the cached miss"
+    );
+    assert!(
+        cache
+            .find(&mut tx, gmmu, unmapped, &info)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        miss(cache),
+        Some((true, true)),
+        "the next lookup caches the miss again"
     );
     f.assert_no_validation_errors();
 }
