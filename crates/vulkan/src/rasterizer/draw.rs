@@ -1450,6 +1450,15 @@ impl VulkanRasterizer {
                                 }
                                 _ => None,
                             };
+                            diag::append(|l| {
+                                l.push_str(&format!(
+                                    " UB{:?}{index}@{:#x}/{}->{:?}",
+                                    module.stage,
+                                    cbuf.address,
+                                    cbuf.size,
+                                    binding.map(|b| (b.buffer, b.offset, b.size))
+                                ));
+                            });
                             self.push_buffer(binding);
                         }
                     }

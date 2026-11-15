@@ -576,8 +576,15 @@ impl VulkanRasterizer {
             DrawCall::Direct(p) => {
                 let _ = write!(
                     s,
-                    " direct topo={:?} idx={} count={} inst={}",
-                    p.topology, p.indexed, p.count, p.instance_count
+                    " direct topo={:?} idx={} count={} inst={} first={} basev={} basei={} inline={}",
+                    p.topology,
+                    p.indexed,
+                    p.count,
+                    p.instance_count,
+                    p.first,
+                    p.base_vertex,
+                    p.base_instance,
+                    p.inline_indices.is_some()
                 );
             }
             DrawCall::Indirect(p) => {
@@ -714,12 +721,16 @@ impl VulkanRasterizer {
         let ib = &regs.index_buffer;
         let _ = write!(
             s,
-            " IB[{:#x} fmt={:?} first={} count={} basev={}]",
+            " IB[{:#x} fmt={:?} first={} count={} basev={} basei={} vbfirst={} restart={}/{:#x}]",
             (u64::from(ib.start_addr_high) << 32) | u64::from(ib.start_addr_low),
             ib.format,
             ib.first,
             ib.count,
             regs.global_base_vertex_index,
+            regs.global_base_instance_index,
+            regs.vertex_buffer.first,
+            regs.primitive_restart.enabled,
+            regs.primitive_restart.index,
         );
         for (i, a) in regs.vertex_attrib_format.iter().enumerate().take(16) {
             if a.size() == lichii_gpu::engines::maxwell_3d::regs::VertexAttributeSize::INVALID {
