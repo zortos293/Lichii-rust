@@ -3592,3 +3592,33 @@ fn slice_targets_render_into_the_volume_sampled_before_them() {
         }
     }
 }
+
+#[test]
+fn blits_into_a_volume_slice_address_stay_off_the_volume() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+            return;
+        };
+        let (volume, _) = f.texture(&mkw_lut());
+        let slice = mkw_lut_slice(false, gob);
+        let slice_va = GPU_VA + 0x200;
+        let (mut tx, cache, gmmu) = f.tx();
+        let found = cache
+            .render_target(&mut tx, gmmu, slice_va, &slice, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!((found.id, found.layer), (volume, 1));
+        let src_va = GPU_VA + (1 << 20);
+        clear_rt_at(&mut f, src_va, &slice, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+        let (mut tx, cache, gmmu) = f.tx();
+        cache
+            .blit(
+                &mut tx,
+                gmmu,
+                &blit_side(src_va, slice, [0, 0, 32, 32]),
+                &blit_side(slice_va, slice, [0, 0, 32, 32]),
+            )
+            .unwrap();
+        f.assert_no_validation_errors();
+    }
+}

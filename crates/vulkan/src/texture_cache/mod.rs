@@ -1105,7 +1105,21 @@ impl TextureCache {
         info: &ImageInfo,
         discard: bool,
     ) -> Result<Option<Found>> {
-        let Some(found) = self.lookup_or_create(tx, gmmu, gpu_va, info, true)? else {
+        self.prepare_target(tx, gmmu, gpu_va, info, discard, true)
+    }
+
+    /// [`TextureCache::render_target`], resolving a single slice into its volume only with
+    /// `slices`: transfers address a found layer as an array layer, never a volume's depth.
+    fn prepare_target(
+        &mut self,
+        tx: &mut Transfer<'_>,
+        gmmu: &Gmmu,
+        gpu_va: GpuVAddr,
+        info: &ImageInfo,
+        discard: bool,
+        slices: bool,
+    ) -> Result<Option<Found>> {
+        let Some(found) = self.lookup_or_create(tx, gmmu, gpu_va, info, slices)? else {
             return Ok(None);
         };
         let whole = found.level == 0 && found.layer == 0 && {
