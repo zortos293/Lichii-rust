@@ -240,14 +240,31 @@ fn syncpt_slots_mirror_the_value_into_the_page_before_signalling() {
     let request = Request::tipc(201).arg(0u32).arg(!9u32).arg(2u64).arg(0u32);
     page.client.send(syncpt, &request).unwrap();
     guest.increment(9).unwrap();
-    assert_eq!(
-        page.value(9),
-        0,
-        "the page is not written on every increment"
-    );
+    assert_eq!(page.value(9), 1);
+    assert!(!slot.is_signaled());
     guest.increment(9).unwrap();
     assert!(slot.is_signaled());
     assert_eq!(page.value(9), 2);
+}
+
+#[test]
+fn syncpt_page_mirrors_increments_nobody_waits_on() {
+    let (context, page) = syncpt_page();
+    let guest = context.gpu.host1x().syncpoints.guest();
+    for _ in 0..3 {
+        guest.increment(12).unwrap();
+    }
+    assert_eq!(
+        page.value(12),
+        3,
+        "a client reads the page without a request"
+    );
+    assert!(!page.notify.is_signaled());
+    page.arm(12);
+    assert!(
+        page.acknowledged(12),
+        "a wait on a value that changed since its last answer is answered"
+    );
 }
 
 #[test]
