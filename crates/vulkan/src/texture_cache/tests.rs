@@ -3622,3 +3622,28 @@ fn blits_into_a_volume_slice_address_stay_off_the_volume() {
         f.assert_no_validation_errors();
     }
 }
+
+#[test]
+fn slice_targets_join_with_their_aliases_newer_texels() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+            return;
+        };
+        let slice = mkw_lut_slice(false, gob);
+        let narrow = ImageInfo { width: 31, ..slice };
+        clear_rt_at(&mut f, GPU_VA, &slice, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+        clear_rt_at(&mut f, GPU_VA, &narrow, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+        let (volume, _) = f.texture(&mkw_lut());
+        let texels = f.read_image(volume).remove(0);
+        let green = [0, 0, 0, 60, 0, 0, 0, 60];
+        let red = [0, 60, 0, 0, 0, 0, 0, 60];
+        let wrong = (0..32 * 32)
+            .filter(|&i| {
+                let want = if i % 32 < 31 { green } else { red };
+                texels[i * 8..i * 8 + 8] != want
+            })
+            .count();
+        assert_eq!(wrong, 0, "{gob:?}: slice 0 texels");
+        f.assert_no_validation_errors();
+    }
+}
