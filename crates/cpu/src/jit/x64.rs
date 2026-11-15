@@ -1118,7 +1118,7 @@ impl Emitter<'_> {
         let label = self.asm.new_dynamic_label();
         let resume = self.asm.new_dynamic_label();
         let diag_slow =
-            matches!(op, Op::Store { .. } | Op::StoreVec { .. }) && super::diag::nan_stores();
+            matches!(op, Op::Store { .. } | Op::StoreVec { .. }) && super::diag::slow_stores();
         let sites = match self.target.arena_size.filter(|_| !diag_slow) {
             Some(arena) => {
                 let aligned = matches!(

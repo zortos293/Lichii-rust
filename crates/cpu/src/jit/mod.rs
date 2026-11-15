@@ -79,6 +79,8 @@ pub(super) struct JitState {
     /// Lazy NZCV write-backs the native stub made, counted only while profiling.
     materialized: u64,
     profile: Option<Box<Profile>>,
+    /// LIRU-3 diag: the context of the block running now.
+    diag_ctx: *const ThreadContext,
 }
 
 // SAFETY: `memory`, `clock` and `interrupt` point into `Arc`s the owning `Jit` keeps, and all
@@ -265,6 +267,11 @@ extern "sysv64" fn write_slow(state: &mut JitState, addr: u64, pc: u64, size: u3
     if diag::nan_stores() {
         diag::store(memory, pc, addr, size, value);
     }
+    if diag::slow_stores() {
+        // SAFETY: set by the dispatcher to the context of the block running now.
+        let ctx = unsafe { state.diag_ctx.as_ref() };
+        diag::watch_store(memory, ctx, pc, addr, size, value);
+    }
     let result = match size {
         0 => memory.guest_write(addr, value as u8),
         1 => memory.guest_write(addr, value as u16),
@@ -379,6 +386,7 @@ impl Jit {
             materialize: cache.materialize(),
             materialized: 0,
             profile: profile.then(Box::default),
+            diag_ctx: std::ptr::null(),
         });
         if profile {
             profile::register();
@@ -588,6 +596,7 @@ impl Jit {
             let enter = self.cache.trampoline();
             // SAFETY: `code` is a compiled block in this core's code memory; it only touches
             // `ctx`, the state, and the arena behind the bounds check.
+            self.state.diag_ctx = std::ptr::from_ref(ctx);
             let exit = unsafe { enter(ctx, &mut *self.state, self.arena, code) };
             self.state.materialize_nzcv(ctx);
             let state = &mut *self.state;

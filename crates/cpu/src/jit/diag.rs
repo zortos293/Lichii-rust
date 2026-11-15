@@ -9,6 +9,7 @@
 //! NaN or infinity lane that none of its sources held.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -291,7 +292,11 @@ fn trap_pcs() -> &'static [u64] {
 
 fn bytes(memory: &AddressSpace, va: u64, words: u64) -> Option<String> {
     let w: Vec<String> = (0..words)
-        .map(|i| memory.read::<u32>(va + 4 * i).map(|w| format!("{w:08x}")))
+        .map(|i| {
+            memory
+                .read::<u32>(va.wrapping_add(4 * i))
+                .map(|w| format!("{w:08x}"))
+        })
         .collect::<Result<_, _>>()
         .ok()?;
     Some(w.join(" "))
@@ -306,6 +311,7 @@ pub(super) fn trap(memory: &AddressSpace, ctx: &ThreadContext, pc: u64, word: u3
     if pcs.is_empty() || !pcs.contains(&pc) {
         return;
     }
+    arm(memory, ctx, pc);
     static HITS: Mutex<Vec<(u64, u32)>> = Mutex::new(Vec::new());
     let Ok(mut hits) = HITS.lock() else {
         return;
@@ -346,7 +352,7 @@ pub(super) fn trap(memory: &AddressSpace, ctx: &ThreadContext, pc: u64, word: u3
     tracing::warn!(
         "LIRU3 TRAPCODE pc={pc:#x} from={:#x} [{}]",
         pc - 4 * 400,
-        bytes(memory, pc - 4 * 400, 432).unwrap_or_default()
+        bytes(memory, pc - 4 * 400, 800).unwrap_or_default()
     );
     let mut fp = ctx.x[29];
     let mut lr = ctx.x[30];
@@ -356,7 +362,10 @@ pub(super) fn trap(memory: &AddressSpace, ctx: &ThreadContext, pc: u64, word: u3
             lr.wrapping_sub(4 * 96),
             bytes(memory, lr.wrapping_sub(4 * 96), 104).unwrap_or_default()
         );
-        let (Ok(next), Ok(ret)) = (memory.read::<u64>(fp), memory.read::<u64>(fp + 8)) else {
+        let (Ok(next), Ok(ret)) = (
+            memory.read::<u64>(fp),
+            memory.read::<u64>(fp.wrapping_add(8)),
+        ) else {
             break;
         };
         if next <= fp {
@@ -370,4 +379,139 @@ pub(super) fn trap(memory: &AddressSpace, ctx: &ThreadContext, pc: u64, word: u3
             tracing::warn!("LIRU3 TRAPMEM pc={pc:#x} reg={i} at={:#x} [{b}]", r & !3);
         }
     }
+}
+
+fn watch_env() -> &'static [(u64, u64)] {
+    static V: OnceLock<Vec<(u64, u64)>> = OnceLock::new();
+    V.get_or_init(|| {
+        let hex = |s: &str| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+        let v: Vec<(u64, u64)> = std::env::var("LICHII_DIAG_WATCH_VA")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|p| {
+                let (a, n) = p.split_once(':')?;
+                Some((hex(a)?, hex(n)?))
+            })
+            .collect();
+        tracing::warn!(?v, "LIRU3 diag watch va");
+        v
+    })
+}
+
+/// LICHII_DIAG_DEREF_WATCH: semicolon-separated pc:reg:len:off:off.. hex; when the trap at pc
+/// runs (its word must run on CallSimd), x[reg] is followed through a u64 load at each offset and
+/// [result, result + len) joins the watched ranges.
+fn deref_env() -> &'static [Vec<u64>] {
+    static V: OnceLock<Vec<Vec<u64>>> = OnceLock::new();
+    V.get_or_init(|| {
+        let v: Vec<Vec<u64>> = std::env::var("LICHII_DIAG_DEREF_WATCH")
+            .unwrap_or_default()
+            .split(';')
+            .map(|s| {
+                s.split(':')
+                    .filter_map(|p| u64::from_str_radix(p.trim().trim_start_matches("0x"), 16).ok())
+                    .collect::<Vec<u64>>()
+            })
+            .filter(|v| v.len() >= 3)
+            .collect();
+        tracing::warn!(?v, "LIRU3 diag deref watch");
+        v
+    })
+}
+
+static DYNAMIC: [(AtomicU64, AtomicU64); 16] =
+    [const { (AtomicU64::new(0), AtomicU64::new(0)) }; 16];
+static ARMED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+fn watched(addr: u64, end: u64) -> bool {
+    let hit = |a: u64, n: u64| n != 0 && addr < a.wrapping_add(n) && a < end;
+    watch_env().iter().any(|&(a, n)| hit(a, n))
+        || DYNAMIC
+            .iter()
+            .any(|(a, n)| hit(a.load(Ordering::Relaxed), n.load(Ordering::Relaxed)))
+}
+
+fn arm(memory: &AddressSpace, ctx: &ThreadContext, pc: u64) {
+    for spec in deref_env().iter().filter(|s| s[0] == pc) {
+        let Some(mut a) = ctx.x.get(spec[1] as usize).copied() else {
+            continue;
+        };
+        let mut ok = true;
+        for off in &spec[3..] {
+            match memory.read::<u64>(a.wrapping_add(*off)) {
+                Ok(v) => a = v,
+                Err(_) => ok = false,
+            }
+        }
+        let Ok(mut d) = ARMED.lock() else {
+            return;
+        };
+        if ok && !d.contains(&(a, spec[2])) && d.len() < DYNAMIC.len() {
+            DYNAMIC[d.len()].0.store(a, Ordering::Relaxed);
+            DYNAMIC[d.len()].1.store(spec[2], Ordering::Relaxed);
+            d.push((a, spec[2]));
+            tracing::warn!(
+                "LIRU3 WATCHARM t={:.3} pc={pc:#x} va={a:#x} len={:#x}",
+                t(),
+                spec[2]
+            );
+        }
+    }
+}
+
+/// Whether every guest store takes the slow path.
+pub(super) fn slow_stores() -> bool {
+    nan_stores() || !watch_env().is_empty() || !deref_env().is_empty()
+}
+
+fn backtrace(memory: &AddressSpace, ctx: &ThreadContext) -> String {
+    let mut out = vec![format!("lr={:#x}", ctx.x[30])];
+    let mut fp = ctx.x[29];
+    for _ in 0..12 {
+        let (Ok(next), Ok(ret)) = (
+            memory.read::<u64>(fp),
+            memory.read::<u64>(fp.wrapping_add(8)),
+        ) else {
+            break;
+        };
+        out.push(format!("{ret:#x}"));
+        if next <= fp {
+            break;
+        }
+        fp = next;
+    }
+    out.join(" ")
+}
+
+/// LICHII_DIAG_WATCH_VA: comma-separated addr:len hex ranges; the first 400 guest stores that
+/// touch one log pc, value, code and a frame-pointer backtrace from the context as last committed.
+pub(super) fn watch_store(
+    memory: &AddressSpace,
+    ctx: Option<&ThreadContext>,
+    pc: u64,
+    addr: u64,
+    size: u32,
+    value: u128,
+) {
+    if !watched(addr, addr.wrapping_add(1u64 << size)) {
+        return;
+    }
+    static COUNT: Mutex<u32> = Mutex::new(0);
+    let Ok(mut c) = COUNT.lock() else {
+        return;
+    };
+    *c += 1;
+    if *c > 400 {
+        return;
+    }
+    drop(c);
+    let bytes = 1usize << size;
+    let v = value & (u128::MAX >> (128 - 8 * bytes));
+    let width = 2 * bytes;
+    let bt = ctx.map_or_else(String::new, |ctx| backtrace(memory, ctx));
+    tracing::warn!(
+        "LIRU3 WATCHVA t={:.3} pc={pc:#x} va={addr:#x} size={bytes} value={v:0width$x} bt=[{bt}] code=[{}]",
+        t(),
+        code(memory, pc, 40)
+    );
 }
