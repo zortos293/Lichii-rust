@@ -343,8 +343,9 @@ pub(super) fn trap(memory: &AddressSpace, ctx: &ThreadContext, pc: u64, word: u3
         .map(|(i, v)| format!("v{i}={v:032x}"))
         .collect();
     tracing::warn!(
-        "LIRU3 TRAP t={:.3} hit={n} pc={pc:#x} word={word:08x} sp={:#x} {} {}",
+        "LIRU3 TRAP t={:.3} hit={n} pc={pc:#x} word={word:08x} tls={:#x} sp={:#x} {} {}",
         t(),
+        ctx.tpidr_el0,
         ctx.sp,
         x.join(" "),
         v.join(" ")
@@ -508,7 +509,9 @@ pub(super) fn watch_store(
     let bytes = 1usize << size;
     let v = value & (u128::MAX >> (128 - 8 * bytes));
     let width = 2 * bytes;
-    let bt = ctx.map_or_else(String::new, |ctx| backtrace(memory, ctx));
+    let bt = ctx.map_or_else(String::new, |ctx| {
+        format!("tls={:#x} {}", ctx.tpidr_el0, backtrace(memory, ctx))
+    });
     tracing::warn!(
         "LIRU3 WATCHVA t={:.3} pc={pc:#x} va={addr:#x} size={bytes} value={v:0width$x} bt=[{bt}] code=[{}]",
         t(),
