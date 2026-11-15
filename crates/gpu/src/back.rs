@@ -334,8 +334,14 @@ impl Back {
                     .read_overlay
                     .set(pending.unwrap_or_default());
                 if waits {
+                    lichii_common::diag_sync::CTX.store(1, Ordering::Relaxed);
+                    let t = std::time::Instant::now();
                     self.synchronize_read(address, size, 1);
+                    lichii_common::diag_sync::add(1, 0, 1);
+                    lichii_common::diag_sync::add(1, 1, t.elapsed().as_nanos() as u64);
+                    lichii_common::diag_sync::CTX.store(0, Ordering::Relaxed);
                 }
+                lichii_common::diag_sync::maybe_report();
                 3
             }
             tag::SYNCHRONIZE_FETCH => {
@@ -346,8 +352,15 @@ impl Back {
                     _ => false,
                 };
                 if host {
+                    let ctx = if method == FetchSync::Host as u32 { 2 } else { 3 };
+                    lichii_common::diag_sync::CTX.store(ctx, Ordering::Relaxed);
+                    let t = std::time::Instant::now();
                     self.synchronize_read(address, size, FETCH_SYNC_WINDOW);
+                    lichii_common::diag_sync::add(ctx, 0, 1);
+                    lichii_common::diag_sync::add(ctx, 1, t.elapsed().as_nanos() as u64);
+                    lichii_common::diag_sync::CTX.store(0, Ordering::Relaxed);
                 }
+                lichii_common::diag_sync::maybe_report();
                 self.fetch_syncs.complete();
                 3
             }

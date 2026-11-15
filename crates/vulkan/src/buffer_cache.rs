@@ -847,6 +847,13 @@ impl BufferCache {
     }
 
     fn bind_gpu_write(&mut self, daddr: DAddr, size: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        lichii_common::diag_sync::BIND[0].fetch_add(1, Relaxed);
+        lichii_common::diag_sync::BIND[1].fetch_add(size, Relaxed);
+        if size >= 0x10000 {
+            lichii_common::diag_sync::BIND[2].fetch_add(1, Relaxed);
+            lichii_common::diag_sync::BIND[3].fetch_add(size, Relaxed);
+        }
         if let Some(end) = self.track_gpu_write(daddr, size) {
             self.pending_writes.push((daddr, end));
         }
@@ -1015,16 +1022,32 @@ impl BufferCache {
             }
             transfer_to_all_barrier(&self.device, cmd);
         };
+        let ctx = lichii_common::diag_sync::CTX.load(std::sync::atomic::Ordering::Relaxed);
+        let t = std::time::Instant::now();
         if newest < scheduler.tick() {
             scheduler.run_aside(record)?;
+            lichii_common::diag_sync::add(ctx, 3, 1);
         } else {
             record(scheduler.record()?);
             scheduler.finish()?;
+            lichii_common::diag_sync::add(ctx, 4, 1);
         }
+        lichii_common::diag_sync::add(ctx, 7, t.elapsed().as_nanos() as u64);
+        lichii_common::diag_sync::add(ctx, 2, 1);
+        lichii_common::diag_sync::add(ctx, 5, total);
         let data = readback.mapped().expect("readback memory is host visible");
         let mut offset = 0;
         for &(_, _, daddr, len) in &self.downloads {
             let bytes = &data[offset as usize..(offset + len) as usize];
+            let mut old = vec![0u8; len as usize];
+            let changed = match self.memory.read_bytes(daddr, &mut old) {
+                Ok(_) => old.iter().zip(bytes).filter(|(a, b)| a != b).count() as u64,
+                Err(_) => len,
+            };
+            lichii_common::diag_sync::add(ctx, 6, changed);
+            if changed == 0 {
+                lichii_common::diag_sync::add(ctx, 8, 1);
+            }
             if let Err(fault) = self.lazy.write(daddr, bytes) {
                 tracing::warn!(
                     ?fault,
