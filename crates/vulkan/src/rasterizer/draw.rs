@@ -941,6 +941,7 @@ impl VulkanRasterizer {
             rendering = rendering.stencil_attachment(stencil);
         }
         let (cmd, began) = self.scheduler.record_rendering(key, &rendering)?;
+        self.buffer_cache.commit_writes(self.scheduler.tick());
         self.device.begin_label(
             cmd,
             format_args!(
@@ -2572,6 +2573,7 @@ impl VulkanRasterizer {
         };
         let set = self.descriptor_set(set_layout)?;
         let cmd = self.scheduler.record()?;
+        self.buffer_cache.commit_writes(self.scheduler.tick());
         let align = self.buffer_cache.storage_alignment();
         let grid = match grid {
             Some((binding, grid)) => Some(self.unpack_grid(

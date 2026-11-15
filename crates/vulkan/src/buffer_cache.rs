@@ -713,6 +713,9 @@ pub struct BufferCache {
     segments: Vec<GpuRange>,
     scratch: Vec<u32>,
     raced: Vec<(DAddr, DAddr)>,
+    /// Ranges bound for writing by the draw or dispatch being prepared, stamped with the tick of
+    /// the work it is recorded into by [`BufferCache::commit_writes`].
+    pending_writes: Vec<(DAddr, DAddr)>,
 }
 
 impl BufferCache {
@@ -748,6 +751,7 @@ impl BufferCache {
             segments: Vec::new(),
             scratch: Vec::new(),
             raced: Vec::new(),
+            pending_writes: Vec::new(),
         })
     }
 
@@ -824,15 +828,44 @@ impl BufferCache {
     /// the writing work is recorded, with the tick it completes at ([`Scheduler::tick`]), which
     /// the buffers holding the range note for [`BufferCache::flush`].
     pub fn mark_gpu_written(&mut self, tick: u64, daddr: DAddr, size: u64) {
+        if let Some(end) = self.track_gpu_write(daddr, size) {
+            self.stamp_writer(tick, daddr, end);
+        }
+    }
+
+    /// The draw or dispatch whose writable bindings were prepared since the last call is
+    /// recorded in the work completing at `tick`: the buffers those bindings write note it for
+    /// [`BufferCache::flush`]. Preparing bindings can submit recorded work (sparse binds, waits),
+    /// so the tick is only known once the draw or dispatch is recorded.
+    pub fn commit_writes(&mut self, tick: u64) {
+        let mut pending = std::mem::take(&mut self.pending_writes);
+        for &(daddr, end) in &pending {
+            self.stamp_writer(tick, daddr, end);
+        }
+        pending.clear();
+        self.pending_writes = pending;
+    }
+
+    fn bind_gpu_write(&mut self, daddr: DAddr, size: u64) {
+        if let Some(end) = self.track_gpu_write(daddr, size) {
+            self.pending_writes.push((daddr, end));
+        }
+    }
+
+    fn track_gpu_write(&mut self, daddr: DAddr, size: u64) -> Option<DAddr> {
         let end = daddr.saturating_add(size).min(self.limit);
         if daddr >= end {
-            return;
+            return None;
         }
         self.written_pages.mark(daddr, end - daddr);
         if self.flush_traps && !self.gpu_written.covers(daddr, end) {
             self.memory.arm_flush_traps(daddr, end - daddr);
         }
         self.gpu_written.insert(daddr, end);
+        Some(end)
+    }
+
+    fn stamp_writer(&mut self, tick: u64, daddr: DAddr, end: DAddr) {
         let mut addr = daddr;
         while addr < end {
             let Some(id) = Self::lookup(&self.page_table, addr) else {
@@ -1422,7 +1455,7 @@ impl BufferCache {
         if let Some(daddr) = contiguous(gmmu, start, size) {
             let binding = self.acquire(scheduler, staging, daddr, size)?;
             self.prepare_gpu_write(scheduler, staging, daddr, size)?;
-            self.mark_gpu_written(scheduler.tick(), daddr, size);
+            self.bind_gpu_write(daddr, size);
             return Ok(Some(binding));
         }
         if !self.warned_scattered_write {
@@ -1437,7 +1470,7 @@ impl BufferCache {
             return Ok(None);
         };
         self.prepare_gpu_write(scheduler, staging, daddr, binding.size)?;
-        self.mark_gpu_written(scheduler.tick(), daddr, binding.size);
+        self.bind_gpu_write(daddr, binding.size);
         Ok(Some(binding))
     }
 
@@ -1471,7 +1504,7 @@ impl BufferCache {
         let range = elements * texel;
         if written {
             self.prepare_gpu_write(scheduler, staging, daddr, range)?;
-            self.mark_gpu_written(scheduler.tick(), daddr, range);
+            self.bind_gpu_write(daddr, range);
         }
         let id = Self::lookup(&self.page_table, daddr).expect("an acquired range has a buffer");
         let key = (binding.offset, range, format.as_raw());
@@ -2159,6 +2192,40 @@ mod tests {
         assert_eq!(
             f.guest(DADDR + 0x800, 0x100),
             0x2222_2222_u32.to_le_bytes().repeat(0x40)
+        );
+        f.assert_no_validation_errors();
+    }
+
+    /// A writable binding prepared before a submission belongs to the work its draw is recorded
+    /// into, not to the work submitted while the bindings were prepared.
+    #[test]
+    fn writable_bindings_belong_to_the_work_they_are_recorded_into() {
+        let Some(mut f) = fixture() else { return };
+        f.gmmu.map(GPU_VA, DADDR, PAGE_SIZE, 0, false).unwrap();
+        let binding = f
+            .cache
+            .storage_buffer(
+                &mut f.scheduler,
+                &mut f.staging,
+                &f.gmmu,
+                GPU_VA,
+                0x100,
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        f.scheduler.flush().unwrap();
+        f.gpu_fill(binding, 0, 0x100, 0x3333_3333);
+        let tick = f.scheduler.tick();
+        f.cache.commit_writes(tick);
+        f.cache.flush(&mut f.scheduler, DADDR, 0x100).unwrap();
+        assert!(
+            f.scheduler.tick() > tick,
+            "the draw's work is submitted with the download"
+        );
+        assert_eq!(
+            f.guest(DADDR, 0x100),
+            0x3333_3333_u32.to_le_bytes().repeat(0x40)
         );
         f.assert_no_validation_errors();
     }
