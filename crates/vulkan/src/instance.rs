@@ -121,20 +121,7 @@ impl Instance {
         if portability {
             enabled.push(khr::portability_enumeration::NAME.as_ptr());
         }
-        let mut layer_names = Vec::new();
-        if validation {
-            layer_names.push(VALIDATION_LAYER.as_ptr());
-        }
-        if let Some(renderdoc) = crate::debug::renderdoc::layer() {
-            if layers
-                .iter()
-                .any(|l| l.layer_name_as_c_str() == Ok(renderdoc))
-            {
-                layer_names.push(renderdoc.as_ptr());
-            } else {
-                tracing::warn!("RenderDoc's Vulkan layer is missing, so nothing will be captured");
-            }
-        }
+        let layer_names = [VALIDATION_LAYER.as_ptr()];
         let app = vk::ApplicationInfo::default()
             .application_name(c"Lichii")
             .engine_name(c"Lichii")
@@ -142,7 +129,7 @@ impl Instance {
         let mut info = vk::InstanceCreateInfo::default()
             .application_info(&app)
             .enabled_extension_names(&enabled);
-        if !layer_names.is_empty() {
+        if validation {
             info = info.enabled_layer_names(&layer_names);
         }
         if portability {

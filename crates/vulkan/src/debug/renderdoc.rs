@@ -19,7 +19,6 @@ const LIBRARY: &str = "renderdoc.dll";
 #[cfg(not(windows))]
 const LIBRARY: &str = "librenderdoc.so";
 const LAYER_MANIFESTS: [&str; 2] = ["renderdoc.json", "renderdoc_capture.json"];
-const LAYER: &CStr = c"VK_LAYER_RENDERDOC_Capture";
 const API_VERSION_1_6_0: c_int = 10600;
 
 type GetApi = unsafe extern "C" fn(c_int, *mut *mut c_void) -> c_int;
@@ -50,8 +49,6 @@ struct Api {
 /// The loaded RenderDoc.
 pub struct RenderDoc {
     api: &'static Api,
-    /// Loaded from a folder rather than injected: the instance enables its layer by name.
-    layer: bool,
     /// Guest frames to capture, 1-based, sorted.
     frames: Vec<u64>,
     toggle: AtomicBool,
@@ -77,11 +74,6 @@ pub fn request_toggle() -> bool {
     })
 }
 
-/// RenderDoc's Vulkan layer, when the instance must enable it by name.
-pub(crate) fn layer() -> Option<&'static CStr> {
-    get().filter(|renderdoc| renderdoc.layer).map(|_| LAYER)
-}
-
 /// # Safety
 ///
 /// No other thread may run: see [`super::init`].
@@ -105,8 +97,8 @@ pub(super) unsafe fn init(hotkey: bool) {
 ///
 /// As [`init`].
 unsafe fn load(frames: Vec<u64>) -> Result<RenderDoc, String> {
-    let (library, layer, source) = match injected() {
-        Some(library) => (library, false, "attached to this process".to_string()),
+    let (library, source) = match injected() {
+        Some(library) => (library, "attached to this process".to_string()),
         None => {
             let program_files = cfg!(windows)
                 .then(|| std::env::var_os("ProgramFiles"))
@@ -124,15 +116,15 @@ unsafe fn load(frames: Vec<u64>) -> Result<RenderDoc, String> {
                      or name its folder in LICHII_RENDERDOC_DIR"
                 )
             })?;
-            // SAFETY: forwarded from the caller.
-            let layer = dir
-                .as_deref()
-                .is_some_and(|dir| unsafe { add_layer_path(dir) });
+            if let Some(dir) = &dir {
+                // SAFETY: forwarded from the caller.
+                unsafe { add_layer_path(dir) };
+            }
             let source = dir.map_or_else(
                 || "from the library path".to_string(),
                 |dir| format!("from {}", dir.display()),
             );
-            (library, layer, source)
+            (library, source)
         }
     };
     // SAFETY: every RenderDoc release exports RENDERDOC_GetAPI with this signature.
@@ -160,7 +152,6 @@ unsafe fn load(frames: Vec<u64>) -> Result<RenderDoc, String> {
     );
     Ok(RenderDoc {
         api,
-        layer,
         frames,
         toggle: AtomicBool::new(false),
         owner: AtomicU64::new(0),
@@ -186,24 +177,28 @@ fn injected() -> Option<Library> {
 }
 
 /// Lets the Vulkan loader find RenderDoc's layer in `dir`, which holds its manifest when
-/// RenderDoc was unpacked rather than installed.
+/// RenderDoc was unpacked rather than installed. The layer only works as the implicit layer its
+/// manifest describes, which `ENABLE_VULKAN_RENDERDOC_CAPTURE` turns on: enabled by name it fails
+/// instance creation.
 ///
 /// # Safety
 ///
 /// No other thread may run.
-unsafe fn add_layer_path(dir: &Path) -> bool {
+unsafe fn add_layer_path(dir: &Path) {
     if !LAYER_MANIFESTS.iter().any(|name| dir.join(name).is_file()) {
-        return false;
+        return;
     }
-    let existing = std::env::var_os("VK_ADD_LAYER_PATH");
+    let existing = std::env::var_os("VK_ADD_IMPLICIT_LAYER_PATH");
     let paths =
         std::iter::once(dir.to_path_buf()).chain(existing.iter().flat_map(std::env::split_paths));
     let Ok(joined) = std::env::join_paths(paths) else {
-        return false;
+        return;
     };
     // SAFETY: the caller guarantees no other thread reads the environment.
-    unsafe { std::env::set_var("VK_ADD_LAYER_PATH", joined) };
-    true
+    unsafe {
+        std::env::set_var("VK_ADD_IMPLICIT_LAYER_PATH", joined);
+        std::env::set_var("ENABLE_VULKAN_RENDERDOC_CAPTURE", "1");
+    }
 }
 
 fn set_capture_dir(api: &Api, dir: &Path) -> Result<(), String> {
