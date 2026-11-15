@@ -1108,6 +1108,8 @@ impl Rasterizer for VulkanRasterizer {
                         y0: blit.src_y0,
                         du: blit.du_dx,
                         dv: blit.dv_dy,
+                        width: blit.src.width,
+                        height: blit.src.height,
                     },
                 ),
                 _ => Ok(false),

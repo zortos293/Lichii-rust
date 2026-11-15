@@ -27,32 +27,35 @@ pub struct BlitSide {
     pub rect: [i32; 4],
 }
 
-/// Where a nearest-filtered blit samples its source, as the 2D engine does: destination texel
-/// `i` along an axis, counted from the destination rectangle's start, takes source texel
-/// `(start + i * step) >> 32`, clamped to the source. Starts and steps are 32.32 fixed point.
+/// Where a nearest-filtered blit samples its source, as the software blit does: destination
+/// texel `i` along an axis, counted from the destination rectangle's start, takes source texel
+/// `(start + i * step) >> 32`, clamped to the texels from the start position's (at least 0) up
+/// to the end position's, `(start + count * step) >> 32`, at most `width` or `height`, the
+/// source surface's extent. Starts and steps are 32.32 fixed point and wrap.
 #[derive(Clone, Copy, Debug)]
 pub struct NearestSampling {
     pub x0: i64,
     pub y0: i64,
     pub du: i64,
     pub dv: i64,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// The workgroup size of `blit_gather.comp`.
 const GATHER_GROUP: u32 = 8;
 
-/// The push constants of `blit_gather.comp`. 64-bit values are low word first.
+/// The push constants of `blit_gather.comp`. 64-bit values are low word first; `padding`
+/// aligns them.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GatherParams {
     dst_width: u32,
     dst_height: u32,
     words: u32,
-    src_width: u32,
-    src_height: u32,
-    box_x: u32,
-    box_y: u32,
     box_width: u32,
+    box_height: u32,
+    padding: u32,
     x0: [u32; 2],
     du: [u32; 2],
     y0: [u32; 2],
@@ -83,10 +86,13 @@ impl Gather {
     }
 }
 
-/// The source texel `start + i * step` falls in along an axis of `extent` texels, clamped.
-fn sample_index(start: i64, step: i64, i: u32, extent: u32) -> u32 {
-    (start.wrapping_add(step.wrapping_mul(i64::from(i))) >> 32).clamp(0, i64::from(extent) - 1)
-        as u32
+/// The source texels `[first, end)` an axis of `count` samples may read, as the software blit
+/// bounds them, or `None` when that range is empty, as for a reversed or zero step.
+fn axis_span(start: i64, step: i64, count: u32, extent: u32) -> Option<(u32, u32)> {
+    let first = ((start >> 32) as i32).max(0);
+    let end = (start.wrapping_add(step.wrapping_mul(i64::from(count))) >> 32) as i32;
+    let end = end.min(extent.min(i32::MAX as u32) as i32);
+    (first < end).then_some((first as u32, end as u32))
 }
 
 fn words(value: i64) -> [u32; 2] {
@@ -187,11 +193,18 @@ impl TextureCache {
             || y0 < 0
             || x1 <= x0
             || y1 <= y0
-            || src.width == 0
-            || src.height == 0
+            || sampling.width == 0
+            || sampling.height == 0
         {
             return Ok(false);
         }
+        let (width, height) = ((x1 - x0) as u32, (y1 - y0) as u32);
+        let (Some((box_x, box_x1)), Some((box_y, box_y1))) = (
+            axis_span(sampling.x0, sampling.du, width, sampling.width),
+            axis_span(sampling.y0, sampling.dv, height, sampling.height),
+        ) else {
+            return Ok(false);
+        };
         let Some((source, target)) = self.blit_images(tx, gmmu, src_va, src, dst)? else {
             return Ok(false);
         };
@@ -204,17 +217,9 @@ impl TextureCache {
                     && height <= extent.height
             })
         };
-        if !holds(source, src.width, src.height) || !holds(target, x1 as u32, y1 as u32) {
+        if !holds(source, box_x1, box_y1) || !holds(target, x1 as u32, y1 as u32) {
             return Ok(false);
         }
-        let (width, height) = ((x1 - x0) as u32, (y1 - y0) as u32);
-        let span = |start: i64, step: i64, count: u32, extent: u32| {
-            let first = sample_index(start, step, 0, extent);
-            let last = sample_index(start, step, count - 1, extent);
-            (first.min(last), first.max(last) + 1)
-        };
-        let (box_x, box_x1) = span(sampling.x0, sampling.du, width, src.width);
-        let (box_y, box_y1) = span(sampling.y0, sampling.dv, height, src.height);
         let (box_width, box_height) = (box_x1 - box_x, box_y1 - box_y);
         let device = self.device.clone();
         if self.gather.is_none() {
@@ -259,14 +264,12 @@ impl TextureCache {
             dst_width: width,
             dst_height: height,
             words: bytes / 4,
-            src_width: src.width,
-            src_height: src.height,
-            box_x,
-            box_y,
             box_width,
-            x0: words(sampling.x0),
+            box_height,
+            padding: 0,
+            x0: words(sampling.x0.wrapping_sub(i64::from(box_x) << 32)),
             du: words(sampling.du),
-            y0: words(sampling.y0),
+            y0: words(sampling.y0.wrapping_sub(i64::from(box_y) << 32)),
             dv: words(sampling.dv),
         };
         let buffers = [src_buffer, dst_buffer].map(|buffer| vk::DescriptorBufferInfo {

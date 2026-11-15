@@ -2128,7 +2128,7 @@ fn blits_from_guest_data_stay_in_software() {
 }
 
 #[test]
-fn nearest_blits_gather_the_texels_the_engine_samples_on_the_gpu() {
+fn nearest_blits_gather_the_texels_the_software_blit_samples_on_the_gpu() {
     let gob = GobLayout::Tegra;
     let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
         return;
@@ -2147,17 +2147,25 @@ fn nearest_blits_gather_the_texels_the_engine_samples_on_the_gpu() {
         y0: -0x0144_0000,
         du: 4 * UNIT,
         dv: 0x4_0288_0000,
+        width: 64,
+        height: 64,
     };
-    let mirrored = NearestSampling {
-        x0: 70 * UNIT + UNIT / 3,
-        y0: -3 * UNIT / 2,
-        du: -3 * UNIT,
-        dv: 5 * UNIT / 2,
+    let narrower = NearestSampling {
+        width: 50,
+        ..quarter
+    };
+    let clamped = NearestSampling {
+        x0: -3 * UNIT / 2,
+        y0: UNIT / 4,
+        du: 3 * UNIT,
+        dv: UNIT / 4,
+        width: 64,
+        height: 64,
     };
     for (format, sampling) in [
         (PixelFormat::A8B8G8R8Unorm, quarter),
-        (PixelFormat::R32Float, quarter),
-        (PixelFormat::R16G16B16A16Float, mirrored),
+        (PixelFormat::R32Float, narrower),
+        (PixelFormat::R16G16B16A16Float, clamped),
         (PixelFormat::R32G32B32A32Float, quarter),
     ] {
         let (sw, sh, dw, dh) = (64u32, 64u32, 16u32, 16u32);
@@ -2196,13 +2204,15 @@ fn nearest_blits_gather_the_texels_the_engine_samples_on_the_gpu() {
         let (mut tx, cache, gmmu) = f.tx();
         let target = cache.find(&mut tx, gmmu, dst_va, &dst).unwrap().unwrap();
         let texels = f.read_image(target.id).remove(0);
-        let index = |start: i64, step: i64, i: usize, extent: u32| {
-            ((start + step * i as i64) >> 32).clamp(0, i64::from(extent) - 1) as usize
+        let index = |start: i64, step: i64, i: usize, count: u32, extent: u32| {
+            let first = (start >> 32).max(0);
+            let end = ((start + step * i64::from(count)) >> 32).min(i64::from(extent));
+            ((start + step * i as i64) >> 32).clamp(first, end - 1) as usize
         };
         for y in 0..dh as usize {
-            let row = index(sampling.y0, sampling.dv, y, sh);
+            let row = index(sampling.y0, sampling.dv, y, dh, sampling.height);
             for x in 0..dw as usize {
-                let column = index(sampling.x0, sampling.du, x, sw);
+                let column = index(sampling.x0, sampling.du, x, dw, sampling.width);
                 let from = (row * sw as usize + column) * bytes;
                 let to = ((y + 2) * 24 + x + 3) * bytes;
                 assert_eq!(
@@ -2230,20 +2240,35 @@ fn nearest_blits_the_gather_cannot_do_go_to_software() {
         y0: 0,
         du: 4 << 32,
         dv: 4 << 32,
+        width: 64,
+        height: 64,
     };
     let integer = ImageInfo {
         format: PixelFormat::A8B8G8R8Uint,
         ..rt_info(16, 16, 2, gob)
     };
+    let reversed = NearestSampling {
+        x0: 63 << 32,
+        du: -(4 << 32),
+        ..sampling
+    };
+    let wrapping = NearestSampling {
+        du: 1 << 62,
+        ..sampling
+    };
+    let small = rt_info(16, 16, 2, gob);
     let (mut tx, cache, gmmu) = f.tx();
-    for (dst, rect, why) in [
-        (integer, [0, 0, 16, 16], "another format"),
-        (src, [0, 0, 16, 16], "one image on both sides"),
+    for (dst, rect, sampling, why) in [
+        (integer, [0, 0, 16, 16], sampling, "another format"),
+        (src, [0, 0, 16, 16], sampling, "one image on both sides"),
         (
-            rt_info(16, 16, 2, gob),
+            small,
             [0, 0, 17, 16],
+            sampling,
             "a rectangle leaving its image",
         ),
+        (small, [0, 0, 16, 16], reversed, "a reversed step"),
+        (small, [0, 0, 16, 16], wrapping, "a step whose end wraps"),
     ] {
         let va = if why == "one image on both sides" {
             GPU_VA
