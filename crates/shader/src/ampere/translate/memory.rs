@@ -269,9 +269,9 @@ fn byte_address(t: &mut Translator<'_>, ureg: Reg, scaled: bool) -> Value {
     }
 }
 
-/// `LDC Rd, c[bank][Ra + imm]`; `.IS` (mode 2) takes the buffer from `Ra[31:16]` plus
-/// `bank` and the offset from `Ra[15:0]` plus `imm`. Modes 1 (`.IL`) and 3 (`.ISL`) are
-/// unsupported: neither NAK nor the C++ defines them.
+/// `LDC Rd, c[bank][Ra + imm]`; `.IS` (mode 2) adds `imm` to `Ra` first, then takes the
+/// buffer from the sum's high half plus `bank` and the offset from its low half. Modes 1
+/// (`.IL`) and 3 (`.ISL`) are unsupported: neither NAK nor the C++ defines them.
 fn ldc(t: &mut Translator<'_>) -> TResult {
     if t.form != Form::Bound {
         return Err(t.unsupported());
@@ -285,15 +285,12 @@ fn ldc(t: &mut Translator<'_>) -> TResult {
     let (index, offset) = match t.insn.bits(78, 2) {
         0 => (Value::U32(bank), add_u32(t, reg, imm)),
         2 => {
-            let base = t.x(reg);
+            let address = add_u32(t, reg, imm);
             let high =
-                t.ir.bit_field_extract(base, Value::U32(16), Value::U32(16), false);
+                t.ir.bit_field_extract(address, Value::U32(16), Value::U32(16), false);
             let low =
-                t.ir.bit_field_extract(base, Value::U32(0), Value::U32(16), false);
-            (
-                t.ir.iadd(high, Value::U32(bank)),
-                t.ir.iadd(low, Value::U32(imm)),
-            )
+                t.ir.bit_field_extract(address, Value::U32(0), Value::U32(16), false);
+            (t.ir.iadd(high, Value::U32(bank)), low)
         }
         _ => return Err(t.unsupported()),
     };
@@ -967,11 +964,34 @@ mod tests {
             translate(&[insn]).unwrap(),
             "{0}:\n\
              \x20 %0 = GetRegister R5\n\
-             \x20 %1 = BitFieldUExtract %0, #0x10, #0x10\n\
-             \x20 %2 = BitFieldUExtract %0, #0x0, #0x10\n\
-             \x20 %3 = IAdd32 %1, #0x1\n\
-             \x20 %4 = IAdd32 %2, #0x8\n\
-             \x20 %5 = GetCbufS8 %3, %4\n\
+             \x20 %1 = IAdd32 %0, #0x8\n\
+             \x20 %2 = BitFieldUExtract %1, #0x10, #0x10\n\
+             \x20 %3 = BitFieldUExtract %1, #0x0, #0x10\n\
+             \x20 %4 = IAdd32 %2, #0x1\n\
+             \x20 %5 = GetCbufS8 %4, %3\n\
+             \x20 SetRegister R1, %5\n"
+        );
+    }
+
+    /// LDC.IS addresses every bound buffer as one flat space: the immediate is added to Ra
+    /// before the buffer (high half) and offset (low half) are split, so an offset that carries
+    /// past 0xffff moves into the next buffer (C++ `load_constant.cpp` `Slot`, Mode::IS).
+    #[test]
+    fn ldc_is_adds_the_immediate_before_splitting_the_address() {
+        let insn = encode(
+            Opcode::Ldc,
+            Form::Bound,
+            f(16, 1) | f(24, 5) | f(38, 0x10) | f(54, 1) | f(73, 4) | f(78, 2),
+        );
+        assert_eq!(
+            translate(&[insn]).unwrap(),
+            "{0}:\n\
+             \x20 %0 = GetRegister R5\n\
+             \x20 %1 = IAdd32 %0, #0x10\n\
+             \x20 %2 = BitFieldUExtract %1, #0x10, #0x10\n\
+             \x20 %3 = BitFieldUExtract %1, #0x0, #0x10\n\
+             \x20 %4 = IAdd32 %2, #0x1\n\
+             \x20 %5 = GetCbufU32 %4, %3\n\
              \x20 SetRegister R1, %5\n"
         );
     }
