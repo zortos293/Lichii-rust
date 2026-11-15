@@ -32,6 +32,15 @@ pub struct ActionHandle {
     serial: u64,
 }
 
+/// Identifies a mirror for [`SyncpointBank::clear_mirror`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MirrorHandle {
+    serial: u64,
+    count: u32,
+}
+
+type Mirror = Arc<dyn Fn(u32, u32) + Send + Sync>;
+
 /// Both syncpoint banks, as yuzu's SyncpointManager keeps them, and the maximum value each id is
 /// expected to reach: the one record nvhost-ctrl, nvhost-gpu submits and the Switch 2 syncpoint
 /// sessions share.
@@ -116,6 +125,7 @@ struct Slot {
     interest: AtomicU32,
     actions: Mutex<Vec<PendingAction>>,
     changed: Condvar,
+    mirror: Mutex<Option<(u64, Mirror)>>,
 }
 
 struct PendingAction {
@@ -139,6 +149,7 @@ impl SyncpointBank {
                     interest: AtomicU32::new(0),
                     actions: Mutex::new(Vec::new()),
                     changed: Condvar::new(),
+                    mirror: Mutex::new(None),
                 })
                 .collect(),
             next_serial: AtomicU64::new(0),
@@ -161,7 +172,7 @@ impl SyncpointBank {
         let slot = self.slot(id)?;
         let value = slot.value.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
         if slot.interest.load(Ordering::SeqCst) != 0 {
-            slot.wake(value);
+            slot.wake(id, value);
         }
         Ok(value)
     }
@@ -235,6 +246,43 @@ impl SyncpointBank {
         Ok(Some(ActionHandle { id, serial }))
     }
 
+    /// Calls `mirror(id, value)` after each increment of every id below `count`, with the value
+    /// the id holds then, before the actions that increment satisfies run. Replaces the mirror
+    /// those ids had.
+    pub fn set_mirror(
+        &self,
+        count: u32,
+        mirror: impl Fn(u32, u32) + Send + Sync + 'static,
+    ) -> MirrorHandle {
+        let serial = self.next_serial.fetch_add(1, Ordering::Relaxed);
+        let mirror: Mirror = Arc::new(mirror);
+        for slot in self.slots.iter().take(count as usize) {
+            if slot
+                .mirror
+                .lock()
+                .replace((serial, mirror.clone()))
+                .is_none()
+            {
+                slot.interest.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        MirrorHandle { serial, count }
+    }
+
+    /// Drops the mirror `handle` names from the ids no later mirror replaced it on.
+    pub fn clear_mirror(&self, handle: MirrorHandle) {
+        for slot in self.slots.iter().take(handle.count as usize) {
+            let mut mirror = slot.mirror.lock();
+            if mirror
+                .as_ref()
+                .is_some_and(|(serial, _)| *serial == handle.serial)
+            {
+                *mirror = None;
+                slot.interest.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+
     /// The threshold of the registered action on `id` that is nearest ahead of its value.
     pub fn next_action_threshold(&self, id: u32) -> Result<Option<u32>, InvalidSyncpoint> {
         let slot = self.slot(id)?;
@@ -271,7 +319,10 @@ impl SyncpointBank {
 
 impl Slot {
     #[cold]
-    fn wake(&self, value: u32) {
+    fn wake(&self, id: u32, value: u32) {
+        if let Some((_, mirror)) = &*self.mirror.lock() {
+            mirror(id, self.value.load(Ordering::SeqCst));
+        }
         let ready: Vec<PendingAction> = {
             let mut actions = self.actions.lock();
             self.changed.notify_all();
@@ -415,5 +466,40 @@ mod tests {
         }
         incrementer.join().unwrap();
         assert_eq!(ran.load(Ordering::SeqCst), 2000);
+    }
+
+    #[test]
+    fn mirrors_see_each_increment_before_its_actions() {
+        let bank = Syncpoints::new();
+        let bank = bank.guest();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = |tag: &'static str| {
+            let seen = seen.clone();
+            move |id, value| seen.lock().push((tag, id, value))
+        };
+        let first = bank.set_mirror(8, record("first"));
+        let action = seen.clone();
+        bank.register_action(3, 2, move || action.lock().push(("action", 3, 2)))
+            .unwrap();
+        bank.increment(3).unwrap();
+        bank.increment(3).unwrap();
+        bank.increment(8).unwrap();
+        assert_eq!(
+            *seen.lock(),
+            [("first", 3, 1), ("first", 3, 2), ("action", 3, 2)],
+            "ids past the count are not mirrored"
+        );
+
+        seen.lock().clear();
+        let second = bank.set_mirror(4, record("second"));
+        bank.clear_mirror(first);
+        bank.increment(3).unwrap();
+        bank.increment(5).unwrap();
+        assert_eq!(*seen.lock(), [("second", 3, 3)]);
+
+        bank.clear_mirror(second);
+        bank.increment(3).unwrap();
+        assert_eq!(seen.lock().len(), 1);
+        assert_eq!(bank.next_action_threshold(3), Ok(None));
     }
 }
