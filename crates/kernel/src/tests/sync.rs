@@ -165,6 +165,162 @@ fn cancel_synchronization_interrupts_a_wait() {
     assert_eq!(*results.lock(), vec![result::CANCELLED.0 as u64]);
 }
 
+/// A thread waiting on an address is not cancellable, as on the console: `CancelSynchronization`
+/// leaves the wait to time out, and the thread's next `WaitSynchronization` fails with
+/// `Cancelled` instead.
+#[test]
+fn cancel_synchronization_leaves_an_address_wait_alone() {
+    let test = TestKernel::new(ConsoleGeneration::Switch2);
+    let heap = heap_base(&test);
+    let results = Arc::new(Mutex::new(Vec::new()));
+    let (r, r2) = (results.clone(), results.clone());
+    let handles = heap + 0x1000;
+    let list = heap + 0x2000;
+    let address = heap + 0x3000;
+    let handle = Arc::new(AtomicU64::new(0));
+    let h = handle.clone();
+    let waiter = test.program(
+        Script::new()
+            .svc(0x34, move |ctx, _| {
+                ctx.x[0] = address;
+                ctx.x[1] = 2;
+                ctx.x[2] = 0;
+                ctx.x[3] = 100_000_000;
+            })
+            .then(move |ctx, env| {
+                r.lock().push(ctx.x[0]);
+                env.memory
+                    .write(list, h.load(Ordering::SeqCst) as u32)
+                    .unwrap()
+            })
+            .svc(0x18, move |ctx, _| {
+                ctx.x[1] = list;
+                ctx.x[2] = 1;
+                ctx.x[3] = 100_000_000;
+            })
+            .then(move |ctx, _| r2.lock().push(ctx.x[0]))
+            .exit(),
+    );
+    let main = test.program(
+        Script::new()
+            .svc(0x08, move |ctx, _| {
+                ctx.x[1] = waiter;
+                ctx.x[3] = heap + 0x10_0000;
+                ctx.x[4] = 40;
+                ctx.x[5] = 1;
+            })
+            .then(move |ctx, env| env.memory.write(handles, ctx.x[1] as u32).unwrap())
+            .svc(0x09, move |ctx, env| {
+                ctx.x[0] = env.memory.read::<u32>(handles).unwrap() as u64
+            })
+            .svc(0x0b, |ctx, _| ctx.x[0] = 10_000_000)
+            .svc(0x19, move |ctx, env| {
+                ctx.x[0] = env.memory.read::<u32>(handles).unwrap() as u64
+            })
+            .svc(0x18, move |ctx, _| {
+                ctx.x[1] = handles;
+                ctx.x[2] = 1;
+                ctx.x[3] = u64::MAX;
+            })
+            .exit(),
+    );
+    let process = test.start(test.image(), main);
+    handle.store(
+        process
+            .handles()
+            .write()
+            .add(KObject::ReadableEvent(Arc::new(Event::new())))
+            .unwrap() as u64,
+        Ordering::SeqCst,
+    );
+    test.run_until_exit(Duration::from_secs(10));
+    assert_eq!(
+        *results.lock(),
+        vec![result::TIMED_OUT.0 as u64, result::CANCELLED.0 as u64]
+    );
+}
+
+/// A cancel that arrived while the thread was not waiting fails its next wait only when no
+/// object of that wait is signaled yet, as on the console: a signaled object wins and the cancel
+/// stays pending for the wait after.
+#[test]
+fn a_pending_cancel_does_not_hide_a_signaled_object() {
+    let test = TestKernel::new(ConsoleGeneration::Switch2);
+    let heap = heap_base(&test);
+    let results = Arc::new(Mutex::new(Vec::new()));
+    let (r, r2) = (results.clone(), results.clone());
+    let handles = heap + 0x1000;
+    let signaled = heap + 0x2000;
+    let unsignaled = heap + 0x2100;
+    let handle = Arc::new(AtomicU64::new(0));
+    let other = Arc::new(AtomicU64::new(0));
+    let (h, o) = (handle.clone(), other.clone());
+    let waiter = test.program(
+        Script::new()
+            .svc(0x0b, |ctx, _| ctx.x[0] = 30_000_000)
+            .then(move |_, env| {
+                env.memory
+                    .write(signaled, h.load(Ordering::SeqCst) as u32)
+                    .unwrap();
+                env.memory
+                    .write(unsignaled, o.load(Ordering::SeqCst) as u32)
+                    .unwrap()
+            })
+            .svc(0x18, move |ctx, _| {
+                ctx.x[1] = signaled;
+                ctx.x[2] = 1;
+                ctx.x[3] = u64::MAX;
+            })
+            .then(move |ctx, _| r.lock().push(ctx.x[0]))
+            .svc(0x18, move |ctx, _| {
+                ctx.x[1] = unsignaled;
+                ctx.x[2] = 1;
+                ctx.x[3] = 100_000_000;
+            })
+            .then(move |ctx, _| r2.lock().push(ctx.x[0]))
+            .exit(),
+    );
+    let main = test.program(
+        Script::new()
+            .svc(0x08, move |ctx, _| {
+                ctx.x[1] = waiter;
+                ctx.x[3] = heap + 0x10_0000;
+                ctx.x[4] = 40;
+                ctx.x[5] = 1;
+            })
+            .then(move |ctx, env| env.memory.write(handles, ctx.x[1] as u32).unwrap())
+            .svc(0x09, move |ctx, env| {
+                ctx.x[0] = env.memory.read::<u32>(handles).unwrap() as u64
+            })
+            .svc(0x19, move |ctx, env| {
+                ctx.x[0] = env.memory.read::<u32>(handles).unwrap() as u64
+            })
+            .svc(0x18, move |ctx, _| {
+                ctx.x[1] = handles;
+                ctx.x[2] = 1;
+                ctx.x[3] = u64::MAX;
+            })
+            .exit(),
+    );
+    let process = test.start(test.image(), main);
+    let ready = Arc::new(Event::new());
+    ready.signal();
+    let mut table = process.handles().write();
+    handle.store(
+        table.add(KObject::ReadableEvent(ready)).unwrap() as u64,
+        Ordering::SeqCst,
+    );
+    other.store(
+        table
+            .add(KObject::ReadableEvent(Arc::new(Event::new())))
+            .unwrap() as u64,
+        Ordering::SeqCst,
+    );
+    drop(table);
+    test.run_until_exit(Duration::from_secs(10));
+    assert_eq!(*results.lock(), vec![0, result::CANCELLED.0 as u64]);
+}
+
 /// Two threads on two cores hand a token back and forth through `WaitForAddress` /
 /// `SignalToAddress`, the job-system pattern of NX2_NOTES row 109.
 #[test]
