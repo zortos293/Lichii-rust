@@ -652,21 +652,40 @@ impl VulkanRasterizer {
             regs.viewports[0].depth_range_near,
             regs.viewports[0].depth_range_far,
         );
-        for (slot, cb) in ctx.const_buffers[4].iter().enumerate() {
-            if !cb.enabled || cb.size == 0 {
+        let max_words: usize = std::env::var("LICHII_DIAG_CB_WORDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64);
+        for (stage, prefix) in [(4usize, "CB"), (0, "VCB")] {
+            if stage == 0 && max_words <= 64 {
                 continue;
             }
-            let _ = write!(s, " CB{slot}@{:#x}/{}=", cb.address, cb.size);
-            match ctx.memory.read::<[u32; 64]>(cb.address) {
-                Ok(words) => {
-                    let n = (cb.size as usize / 4).min(64);
-                    let floats: Vec<String> = words[..n]
-                        .iter()
-                        .map(|w| format!("{:.4}", f32::from_bits(*w)))
-                        .collect();
+            for (slot, cb) in ctx.const_buffers[stage].iter().enumerate() {
+                if !cb.enabled || cb.size == 0 {
+                    continue;
+                }
+                let _ = write!(s, " {prefix}{slot}@{:#x}/{}=", cb.address, cb.size);
+                let n = (cb.size as usize / 4).min(max_words);
+                let mut floats: Vec<String> = Vec::with_capacity(n);
+                let mut fault = false;
+                for chunk in 0..n.div_ceil(64) {
+                    match ctx.memory.read::<[u32; 64]>(cb.address + chunk as u64 * 256) {
+                        Ok(words) => floats.extend(
+                            words[..(n - chunk * 64).min(64)]
+                                .iter()
+                                .map(|w| format!("{:.6e}", f32::from_bits(*w))),
+                        ),
+                        Err(_) => {
+                            fault = true;
+                            break;
+                        }
+                    }
+                }
+                if fault {
+                    s.push_str("fault");
+                } else {
                     let _ = write!(s, "[{}]", floats.join(" "));
                 }
-                Err(_) => s.push_str("fault"),
             }
         }
         super::diag::append(|l| l.push_str(&s));
