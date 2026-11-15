@@ -573,6 +573,8 @@ pub struct TextureCache {
     removals: u64,
     /// Images created so far; a cached miss is only good until the next one.
     creations: u64,
+    /// Host images replaced by a rescale, and resolution scale changes, so far.
+    replacements: u64,
     ids: Vec<ImageId>,
     joins: Vec<(ImageId, u32, u32)>,
     new_aliases: Vec<Alias>,
@@ -875,6 +877,7 @@ impl TextureCache {
             traffic: Traffic::default(),
             removals: 0,
             creations: 0,
+            replacements: 0,
             ids: Vec::new(),
             joins: Vec::new(),
             new_aliases: Vec::new(),
@@ -914,6 +917,7 @@ impl TextureCache {
     /// next bound as render targets.
     pub fn set_resolution_scale(&mut self, scale: ResolutionScale) {
         self.scale = scale;
+        self.replacements += 1;
     }
 
     pub fn resolution_scale(&self) -> ResolutionScale {
@@ -980,6 +984,35 @@ impl TextureCache {
     /// cannot reuse, so ids taken before a lookup that changes this may name removed images.
     pub fn removals(&self) -> u64 {
         self.removals
+    }
+
+    /// Changes whenever an image is created or removed or its host image is replaced: an image
+    /// id, lookup result or view taken while this stays the same is still current.
+    pub fn generation(&self) -> u64 {
+        self.creations + self.removals + self.replacements
+    }
+
+    /// Whether [`TextureCache::render_target`] would return `id` as it is: it holds every
+    /// write of its guest bytes, overlaps and aliases, at the scale the rules give it. Marks it
+    /// used this frame when it does.
+    pub fn keep_target(&mut self, id: ImageId) -> bool {
+        let Some(image) = self.get(id) else {
+            return false;
+        };
+        let scale = if self.can_rescale(id) {
+            self.scale
+        } else {
+            ResolutionScale::X1
+        };
+        let kept = !image.image.is_sparse()
+            && !image.cpu_dirty
+            && image.overlaps_newest <= image.current
+            && image.aliases_newest <= image.written
+            && image.scale == scale;
+        if kept {
+            self.touch(id);
+        }
+        kept
     }
 
     /// Number of live images.
@@ -2309,6 +2342,7 @@ impl TextureCache {
         image.scale = scale;
         image.access = access;
         tx.scheduler.retire((views, old));
+        self.replacements += 1;
         Ok(())
     }
 
