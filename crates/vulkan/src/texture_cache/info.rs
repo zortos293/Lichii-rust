@@ -389,11 +389,19 @@ impl ImageInfo {
         }
     }
 
-    /// Guest bytes the image covers.
+    /// Guest bytes the image covers. A single level ends at its last slice's GOBs, so a slice
+    /// tiled with a deep block ends before the planes after it, which other slices own.
     pub fn size_bytes(&self) -> u64 {
         match self.layout {
             GuestLayout::BlockLinear { .. } if self.layers > 1 => {
                 self.layer_stride * u64::from(self.layers)
+            }
+            GuestLayout::BlockLinear { .. } if self.levels == 1 => {
+                let surface = self.surface();
+                let planes = 1u32 << surface.block_depth_log2;
+                let used = surface.depth - (surface.depth.div_ceil(planes) - 1) * planes;
+                surface.level_offset(1)
+                    - (u64::from(planes - used) << (9 + surface.block_height_log2))
             }
             GuestLayout::BlockLinear { .. } => self.surface().level_offset(self.levels),
             GuestLayout::Pitch { pitch } => u64::from(pitch) * self.pitch_rows(),

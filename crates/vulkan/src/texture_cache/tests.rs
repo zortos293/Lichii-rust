@@ -3272,7 +3272,7 @@ fn single_slice_volumes_of_a_deeper_block_sync_on_the_gpu() {
     header.0[4] = 31 | 2 << 23;
     let info = ImageInfo::from_texture(&header.decode().unwrap(), GobLayout::Tegra).unwrap();
     assert_eq!(info.kind, ImageKind::D3);
-    let pattern: Vec<u8> = (0..info.size_bytes())
+    let pattern: Vec<u8> = (0..info.surface().level_tiling(0).size_bytes())
         .map(|i| (i * 11 + i / 61) as u8)
         .collect();
     f.memory.write_bytes(DADDR, &pattern).unwrap();
@@ -3457,6 +3457,10 @@ fn render_mkw_lut(
     value: fn(u32) -> f32,
 ) -> Vec<Found> {
     let info = mkw_lut_slice(volume, gob);
+    let past_lut = GPU_VA + 0x4_0000;
+    f.gmmu
+        .map(past_lut, DADDR + (DRAM >> 1), 0x1_0000, 0, false)
+        .unwrap();
     let mut founds = Vec::new();
     for draw in 0..4 {
         let (mut tx, cache, gmmu) = f.tx();
