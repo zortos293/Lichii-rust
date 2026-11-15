@@ -912,7 +912,7 @@ fn clears_flush_as_swizzled_texels_and_scaled_targets_downscale() {
         f.cache.set_resolution_scale(scale);
         let (w, h) = (64, 640);
         let info = rt_info(w, h, 4, gob);
-        clear_rt(&mut f, &info, [1.0, 0.5, 0.25, 0.0], Rect::ALL);
+        clear_rt(&mut f, &info, [1.0, 128.0 / 255.0, 0.25, 0.0], Rect::ALL);
         let inner = Rect {
             x: 8,
             y: 16,

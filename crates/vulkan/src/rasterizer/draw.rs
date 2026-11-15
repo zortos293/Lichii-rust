@@ -16,8 +16,8 @@ use lichii_gpu::backend::{
 };
 use lichii_gpu::engines::maxwell_3d::Regs;
 use lichii_gpu::engines::maxwell_3d::regs::{
-    DepthMode, IndexFormat, PrimitiveTopology, ProvokingVertex, StencilOp, VertexAttributeType,
-    WindowOriginMode,
+    DepthMode, IndexFormat, PrimitiveTopology, ProvokingVertex, RtLayerControl, StencilOp,
+    VertexAttributeType, WindowOriginMode,
 };
 use lichii_gpu::engines::maxwell_3d::regs::{MESH_CONTROL, MESH_SHADER_A};
 use lichii_shader::backend::Bindings;
@@ -180,6 +180,7 @@ struct Target {
     view: vk::ImageView,
     format: vk::Format,
     extent: vk::Extent2D,
+    layers: u32,
 }
 
 /// Draw and dispatch state of the renderer, beside the caches it shares with clears and copies.
@@ -263,6 +264,17 @@ impl DrawState {
     fn presented_only(&self) -> bool {
         let mut colors = self.colors.iter().flatten().peekable();
         colors.peek().is_some() && colors.all(|t| self.presented.contains(&Some(t.id)))
+    }
+
+    /// The layers a rendering into the draw's targets spans: the fewest any target has.
+    fn layers(&self) -> u32 {
+        self.colors
+            .iter()
+            .flatten()
+            .chain(&self.depth)
+            .map(|t| t.layers)
+            .min()
+            .unwrap_or(1)
     }
 
     /// Whether `id` is one of the draw's colour or depth targets.
@@ -928,7 +940,7 @@ impl VulkanRasterizer {
                 offset: vk::Offset2D::default(),
                 extent,
             })
-            .layer_count(1)
+            .layer_count(draw.layers())
             .color_attachments(&draw.attachments);
         let has_depth = !matches!(depth_format, vk::Format::UNDEFINED | vk::Format::S8_UINT);
         let has_stencil = matches!(
@@ -1210,6 +1222,8 @@ impl VulkanRasterizer {
         self.draw.colors = [None; 8];
         self.draw.depth = None;
         let count = (regs.rt_control.count() as usize).min(8);
+        let layered = regs.rt_layer.control() == RtLayerControl::GEOMETRY_SHADER_SELECTS_LAYER.0;
+        let layers = |info: ImageInfo| if layered { info } else { info.with_layers(1) };
         let mut tx = Transfer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
@@ -1218,10 +1232,9 @@ impl VulkanRasterizer {
         };
         for i in 0..count {
             let rt = &regs.rt[render_target_index(regs, i)];
-            let Some(info) = ImageInfo::from_render_target(rt, msaa, gob) else {
+            let Some(info) = ImageInfo::from_render_target(rt, msaa, gob).map(layers) else {
                 continue;
             };
-            let info = info.with_layers(1);
             let Some(found) = self.texture_cache.render_target(
                 &mut tx,
                 ctx.memory,
@@ -1235,8 +1248,8 @@ impl VulkanRasterizer {
             self.draw.colors[i] = Self::target_view(&mut self.texture_cache, found, &info)?;
         }
         if regs.zeta_enable != 0
-            && let Some(info) = ImageInfo::from_zeta(&regs.zeta, &regs.zeta_size, msaa, gob)
-                .map(|info| info.with_layers(1))
+            && let Some(info) =
+                ImageInfo::from_zeta(&regs.zeta, &regs.zeta_size, msaa, gob).map(layers)
             && let Some(found) = self.texture_cache.render_target(
                 &mut tx,
                 ctx.memory,
@@ -1262,8 +1275,11 @@ impl VulkanRasterizer {
         view.base_level += found.level;
         view.levels = 1;
         view.base_layer += found.layer;
-        view.layers = 1;
-        view.view_type = vk::ImageViewType::TYPE_2D;
+        view.layers = info.layers;
+        view.view_type = match info.layers {
+            1 => vk::ImageViewType::TYPE_2D,
+            _ => vk::ImageViewType::TYPE_2D_ARRAY,
+        };
         let Some(raw) = cache.view(found.id, &view)? else {
             return Ok(None);
         };
@@ -1276,6 +1292,7 @@ impl VulkanRasterizer {
             view: raw,
             format: state.format,
             extent,
+            layers: info.layers,
         }))
     }
 
