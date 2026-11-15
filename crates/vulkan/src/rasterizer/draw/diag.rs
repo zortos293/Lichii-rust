@@ -414,6 +414,15 @@ impl DrawDiag {
         let open = self.in_window();
         if text.starts_with("PRESENT") && t >= self.from {
             self.presents += 1;
+            if let Some(n) = self.frames
+                && self.presents >= n
+                && let Some(from2) = secs("LICHII_DRAW_DIAG_FROM2")
+                && self.from < from2
+            {
+                let _ = writeln!(self.out, "WINDOW2 from={:.1}", from2.as_secs_f64());
+                self.from = from2;
+                self.presents = 0;
+            }
         }
         if open
             || (self.frames.is_none() && t >= self.from && t <= self.to + Duration::from_secs(1))
@@ -713,6 +722,12 @@ impl VulkanRasterizer {
         );
         let _ = write!(
             s,
+            " RTL={}/{}",
+            regs.rt_layer.layer(),
+            regs.rt_layer.control()
+        );
+        let _ = write!(
+            s,
             " dual={} fsout={:x?}",
             super::blends_second_source(regs),
             self.draw.stages[4]
@@ -728,12 +743,16 @@ impl VulkanRasterizer {
             let mask = regs.color_mask[if regs.color_mask_common != 0 { 0 } else { i }];
             let _ = write!(
                 s,
-                " C{i}[id={:?} rt{idx} fmt={:#x} {}x{} addr={:#x} host={:?} {}x{} blend={} mask={:#x}]",
+                " C{i}[id={:?} rt{idx} fmt={:#x} {}x{} addr={:#x} d={} vol={} apitch={:#x} base={} host={:?} {}x{} blend={} mask={:#x}]",
                 t.id,
                 rt.format,
                 rt.width,
                 rt.height,
                 rt.address(),
+                rt.depth(),
+                rt.volume(),
+                rt.array_pitch,
+                rt.base_layer,
                 t.format,
                 t.extent.width,
                 t.extent.height,
