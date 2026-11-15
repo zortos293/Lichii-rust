@@ -1015,6 +1015,25 @@ impl TextureCache {
         kept
     }
 
+    /// Whether [`TextureCache::texture`] would return `id` as it is: it holds every write of its
+    /// guest bytes, overlaps and aliases, at a scale sampling keeps. Marks it used this frame
+    /// when it does.
+    pub fn keep_texture(&mut self, id: ImageId) -> bool {
+        let scale = self.scale;
+        let Some(image) = self.get(id) else {
+            return false;
+        };
+        let kept = !image.image.is_sparse()
+            && !image.cpu_dirty
+            && image.overlaps_newest <= image.current
+            && image.aliases_newest <= image.written
+            && (image.scale == ResolutionScale::X1 || image.scale == scale);
+        if kept {
+            self.touch(id);
+        }
+        kept
+    }
+
     /// Number of live images.
     pub fn len(&self) -> usize {
         self.slots.iter().filter(|s| s.image.is_some()).count()

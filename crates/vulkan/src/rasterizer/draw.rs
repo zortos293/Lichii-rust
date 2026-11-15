@@ -28,7 +28,9 @@ use lichii_shader::backend::spirv::{
     RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, RESCALING_LAYOUT_IMAGES_OFFSET,
     RESCALING_LAYOUT_TEXTURES_OFFSET,
 };
-use lichii_shader::info::{HandleSource, ImageDescriptor, StorageBufferDescriptor};
+use lichii_shader::info::{
+    HandleSource, ImageDescriptor, StorageBufferDescriptor, TextureDescriptor,
+};
 use lichii_shader::ir::{Attribute, ImageFormat, TextureType};
 use lichii_shader::maxwell::header::ProgramHeader;
 use lichii_shader::runtime::{AttributeType, CompareFunction, InputTopology};
@@ -249,6 +251,37 @@ struct StagesMemo {
     keys: [Option<ModuleKey>; 5],
 }
 
+/// A texture header a draw sampled, with what its descriptor asked of it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct TextureKey {
+    gmmu: usize,
+    header: [u32; 8],
+    ty: TextureType,
+    /// The descriptor's handle came from a handle program, so the header's type and numeric
+    /// kind were checked against `ty` and `integer`.
+    checked: bool,
+    integer: bool,
+}
+
+/// What a texture header bound: the image, its sampled view and whether it is rescaled.
+#[derive(Clone, Copy)]
+struct BoundTexture {
+    memory: u64,
+    id: ImageId,
+    view: vk::ImageView,
+    rescaled: bool,
+}
+
+/// Sampled textures by header while the texture cache's images stay the same.
+#[derive(Default)]
+struct TextureMemo {
+    cache: u64,
+    bound: HashMap<TextureKey, BoundTexture, FxBuildHasher>,
+}
+
+/// Textures [`TextureMemo`] keeps before it starts over.
+const MAX_BOUND_TEXTURES: usize = 4096;
+
 /// One bound render target of the current draw.
 #[derive(Clone, Copy)]
 struct Target {
@@ -290,6 +323,8 @@ pub(super) struct DrawState {
     /// A draw into any other target waits, so no later pass reads a target a skip left stale.
     presented: [Option<ImageId>; PRESENTED],
     textures: Vec<ImageId>,
+    /// What texture headers bound, reused while their images need no refresh.
+    bound_textures: TextureMemo,
     texture_scaling: ScalingBits<{ NUM_TEXTURE_SCALING_WORDS as usize }>,
     /// Storage images of the current draw and whether it writes them.
     storage_images: Vec<(ImageId, bool)>,
@@ -419,6 +454,7 @@ impl DrawState {
             depth: None,
             presented: [None; PRESENTED],
             textures: Vec::new(),
+            bound_textures: TextureMemo::default(),
             texture_scaling: ScalingBits::default(),
             storage_images: Vec::new(),
             element_handles: Vec::new(),
@@ -1580,20 +1616,9 @@ impl VulkanRasterizer {
                                 self.draw.image_infos.push(info);
                                 continue;
                             }
-                            let readable = desc.handle_program.is_none_or(|_| {
-                                let header = src.pool.header(src.gmmu, raw);
-                                texture_type(&header) == desc.ty
-                                    && header.format.is_integer() == desc.is_integer
-                            });
-                            let texture = if desc.handle_is_pointer_word || !readable {
-                                None
-                            } else {
-                                self.texture_view(src, raw, desc.ty)?
-                            };
-                            let scale = texture
-                                .and_then(|(id, _)| self.texture_cache.state(id))
-                                .map_or(ResolutionScale::X1, |s| s.scale);
-                            let rescaled = scale != ResolutionScale::X1;
+                            let bound = self.sampled_texture(src, raw, &desc)?;
+                            let rescaled = bound.is_some_and(|b| b.rescaled);
+                            let texture = bound.map(|b| (b.id, b.view));
                             if texture.is_some()
                                 && *array_rescaled.get_or_insert(rescaled) != rescaled
                             {
@@ -1954,6 +1979,74 @@ impl VulkanRasterizer {
             },
         };
         self.draw.buffer_infos.push(info);
+    }
+
+    /// The texture handle `raw` binds for `desc`; `None` binds a null texture. A header bound
+    /// before is bound again without a lookup while its image needs no refresh.
+    fn sampled_texture(
+        &mut self,
+        src: &StageSources<'_>,
+        raw: u32,
+        desc: &TextureDescriptor,
+    ) -> Result<Option<BoundTexture>> {
+        if desc.handle_is_pointer_word {
+            return Ok(None);
+        }
+        let (index, _) = src.pool.split(raw);
+        let key = (index <= src.pool.limit)
+            .then(|| {
+                src.gmmu
+                    .read::<[u32; 8]>(src.pool.address + u64::from(index) * 32)
+                    .ok()
+            })
+            .flatten()
+            .map(|header| TextureKey {
+                gmmu: std::ptr::from_ref(src.gmmu) as usize,
+                header,
+                ty: desc.ty,
+                checked: desc.handle_program.is_some(),
+                integer: desc.is_integer,
+            });
+        let memory = src.gmmu.generation();
+        let memo = &mut self.draw.bound_textures;
+        if memo.cache != self.texture_cache.generation() {
+            memo.cache = self.texture_cache.generation();
+            memo.bound.clear();
+        }
+        if let Some(bound) = key.and_then(|key| memo.bound.get(&key).copied())
+            && bound.memory == memory
+            && self.texture_cache.keep_texture(bound.id)
+        {
+            return Ok(Some(bound));
+        }
+        let readable = desc.handle_program.is_none_or(|_| {
+            let header = src.pool.header(src.gmmu, raw);
+            texture_type(&header) == desc.ty && header.format.is_integer() == desc.is_integer
+        });
+        if !readable {
+            return Ok(None);
+        }
+        let Some((id, view)) = self.texture_view(src, raw, desc.ty)? else {
+            return Ok(None);
+        };
+        let bound = BoundTexture {
+            memory,
+            id,
+            view,
+            rescaled: self
+                .texture_cache
+                .state(id)
+                .is_some_and(|s| s.scale != ResolutionScale::X1),
+        };
+        let memo = &mut self.draw.bound_textures;
+        if memo.cache != self.texture_cache.generation() || memo.bound.len() >= MAX_BOUND_TEXTURES {
+            memo.cache = self.texture_cache.generation();
+            memo.bound.clear();
+        }
+        if let Some(key) = key {
+            memo.bound.insert(key, bound);
+        }
+        Ok(Some(bound))
     }
 
     /// The image and view of the texture `raw` selects, read as `ty`; `None` when nothing
