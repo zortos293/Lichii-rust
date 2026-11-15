@@ -262,6 +262,21 @@ fn trim_aliases(scratch: &mut RunScratch) {
     std::mem::swap(runs, trimmed);
 }
 
+/// Fills `scratch.words` with `scratch.runs` as `guest_bytes.comp` reads them, trimmed first
+/// when the image's bytes go to the guest, so one pass gives every guest byte one writer.
+fn run_words(scratch: &mut RunScratch, direction: Direction) {
+    if direction == Direction::ToGuest {
+        trim_aliases(scratch);
+    }
+    scratch.words.clear();
+    scratch.words.extend(
+        scratch
+            .runs
+            .iter()
+            .map(|r| [r.from as u32, r.size as u32, r.at as u32, 0]),
+    );
+}
+
 pub(super) fn barrier(device: &Device, cmd: vk::CommandBuffer) {
     let barrier = vk::MemoryBarrier2::default()
         .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
@@ -470,16 +485,7 @@ impl TextureCache {
         let placed = shared_runs(image, target, window, &mut sync.scratch);
         debug_assert!(placed, "checked by sync_on_gpu");
         let scratch = &mut sync.scratch;
-        if direction == Direction::ToGuest {
-            trim_aliases(scratch);
-        }
-        scratch.words.clear();
-        scratch.words.extend(
-            scratch
-                .runs
-                .iter()
-                .map(|r| [r.from as u32, r.size as u32, r.at as u32, 0]),
-        );
+        run_words(scratch, direction);
         let run_bytes: &[u8] = bytemuck::cast_slice(&scratch.words);
         ensure(
             &device,
@@ -708,8 +714,16 @@ mod tests {
             runs: runs.clone(),
             ..RunScratch::default()
         };
-        trim_aliases(&mut scratch);
-        let trimmed = scratch.runs;
+        run_words(&mut scratch, Direction::ToGuest);
+        let trimmed: Vec<Run> = scratch
+            .words
+            .iter()
+            .map(|w| Run {
+                from: w[0].into(),
+                size: w[1].into(),
+                at: w[2].into(),
+            })
+            .collect();
         assert!(
             trimmed
                 .windows(2)
