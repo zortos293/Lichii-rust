@@ -146,9 +146,42 @@ impl SvcContext<'_> {
     }
 }
 
+pub(crate) struct DiagSvc {
+    pub micros: u64,
+    pub thread: u64,
+    pub imm: u32,
+    pub args: [u64; 4],
+    pub out: [u64; 4],
+}
+
+pub(crate) static DIAG_SVCS: parking_lot::Mutex<std::collections::VecDeque<DiagSvc>> =
+    parking_lot::Mutex::new(std::collections::VecDeque::new());
+
+pub(crate) fn diag_epoch() -> &'static std::time::Instant {
+    static E: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    E.get_or_init(std::time::Instant::now)
+}
+
 pub(crate) fn dispatch(svc: &mut SvcContext, imm: u32) -> Flow {
     if !svc.kernel.svc_trace {
-        return call(svc, imm);
+        let args: [u64; 4] = svc.ctx.x[..4].try_into().unwrap();
+        let thread = svc.thread.id();
+        let flow = call(svc, imm);
+        if !matches!(imm, 0x1e | 0x10 | 0x0b | 0x27) {
+            let entry = DiagSvc {
+                micros: diag_epoch().elapsed().as_micros() as u64,
+                thread,
+                imm,
+                args,
+                out: svc.ctx.x[..4].try_into().unwrap(),
+            };
+            let mut ring = DIAG_SVCS.lock();
+            if ring.len() >= 160 {
+                ring.pop_front();
+            }
+            ring.push_back(entry);
+        }
+        return flow;
     }
     let args: [u64; 8] = svc.ctx.x[..8].try_into().unwrap();
     let flow = call(svc, imm);
