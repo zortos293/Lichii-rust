@@ -104,6 +104,7 @@ pub(super) extern "sysv64" fn call(
         super::diag::trap(memory, ctx, pc, word);
     }
     if let Some(Ok(())) = execute(ctx, word) {
+        super::diag::fix_nan(ctx, word, pc);
         if let Some(src) = src {
             // SAFETY: called from translated code while the owning Jit runs it.
             let memory = unsafe { state.memory() };

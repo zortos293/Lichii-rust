@@ -518,3 +518,30 @@ pub(super) fn watch_store(
         code(memory, pc, 40)
     );
 }
+
+/// LICHII_DIAG_FIX_NAN: comma-separated pc:bits hex; after CallSimd runs the word at pc, an f32
+/// NaN in lane 0 of its destination becomes bits.
+pub(super) fn fix_nan(ctx: &mut ThreadContext, word: u32, pc: u64) {
+    static V: OnceLock<Vec<(u64, u32)>> = OnceLock::new();
+    let list = V.get_or_init(|| {
+        let hex = |s: &str| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+        let v: Vec<(u64, u32)> = std::env::var("LICHII_DIAG_FIX_NAN")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|p| {
+                let (a, b) = p.split_once(':')?;
+                Some((hex(a)?, hex(b)? as u32))
+            })
+            .collect();
+        tracing::warn!(?v, "LIRU3 diag fix nan");
+        v
+    });
+    let Some(&(_, bits)) = list.iter().find(|e| e.0 == pc) else {
+        return;
+    };
+    let rd = (word & 31) as usize;
+    if f32::from_bits(ctx.v[rd] as u32).is_nan() {
+        ctx.v[rd] = ctx.v[rd] & !0xffff_ffff | u128::from(bits);
+        tracing::warn!("LIRU3 FIXNAN t={:.3} pc={pc:#x} -> {bits:08x}", t());
+    }
+}
