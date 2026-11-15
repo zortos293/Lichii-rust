@@ -938,6 +938,11 @@ impl TextureCache {
         })
     }
 
+    /// Diagnostic: the cache tick of the image's last GPU write.
+    pub fn diag_modified(&self, id: ImageId) -> Option<u64> {
+        Some(self.get(id)?.modified)
+    }
+
     /// How many images have been removed so far. A lookup removes the overlapping images it
     /// cannot reuse, so ids taken before a lookup that changes this may name removed images.
     pub fn removals(&self) -> u64 {

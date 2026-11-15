@@ -44,6 +44,26 @@ pub(crate) fn skips() -> bool {
     flag("LICHII_DIAG_SKIPS")
 }
 
+/// LICHII_DIAG_STATS_TEXELS: largest draw input (width x height) that gets a STAT line; 4096 by
+/// default.
+pub(crate) fn stats_texels() -> u32 {
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("LICHII_DIAG_STATS_TEXELS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(4096)
+    })
+}
+
+fn stat_seen(id: ImageId, modified: u64) -> bool {
+    static V: OnceLock<Mutex<std::collections::HashMap<ImageId, u64>>> = OnceLock::new();
+    let Ok(mut seen) = V.get_or_init(Default::default).lock() else {
+        return false;
+    };
+    seen.insert(id, modified) == Some(modified)
+}
+
 pub(crate) fn sync_compile() -> bool {
     flag("LICHII_DIAG_SYNC_COMPILE")
 }
@@ -434,6 +454,11 @@ impl VulkanRasterizer {
             let Some(st) = self.texture_cache.state(id) else {
                 continue;
             };
+            let modified = self.texture_cache.diag_modified(id).unwrap_or(0);
+            if !always && stat_seen(id, modified) {
+                log(&format!("STAT {label} {id:?} same m={modified}"));
+                continue;
+            }
             let mut tx = Transfer {
                 scheduler: &mut self.scheduler,
                 staging: &mut self.staging,
@@ -469,7 +494,7 @@ impl VulkanRasterizer {
                 at += size as usize;
             }
             let text = format!(
-                "STAT {label} {id:?} {:?} {}x{}x{} lv={} gpu_mod={} fault={fault} {}",
+                "STAT {label} {id:?} m={modified} {:?} {}x{}x{} lv={} gpu_mod={} fault={fault} {}",
                 st.info.format,
                 st.info.width,
                 st.info.height,

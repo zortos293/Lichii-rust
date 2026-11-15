@@ -796,7 +796,12 @@ impl VulkanRasterizer {
                 .copied()
                 .filter(|&id| {
                     self.texture_cache.state(id).is_some_and(|s| {
-                        s.info.width * s.info.height <= if traced { 1 << 17 } else { 4096 }
+                        s.info.width * s.info.height
+                            <= if traced {
+                                1 << 17
+                            } else {
+                                diag::stats_texels()
+                            }
                     })
                 })
                 .collect();
