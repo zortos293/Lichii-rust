@@ -82,8 +82,27 @@ pub(super) fn attach(
     let page = Page::new(rw, ro, count, context.gpu.host1x().syncpoints.clone());
     ctx.push_copy_object(KObject::WritableEvent(page.request.clone()));
     ctx.push_copy_object(KObject::ReadableEvent(page.notify.clone()));
+    *DIAG_PAGE.lock() = Some(Arc::downgrade(&page));
     *slot.0.lock() = Some(page);
     ResultCode::SUCCESS
+}
+
+static DIAG_PAGE: Mutex<Option<Weak<Page>>> = Mutex::new(None);
+
+/// Diag: logs the page's copy of syncpoint `id` against the guest value, and with
+/// `LICHII_DIAG_PAGE_MIRROR` mirrors it.
+pub(super) fn diag_page_check(what: &str, id: u32) {
+    let Some(page) = DIAG_PAGE.lock().as_ref().and_then(Weak::upgrade) else {
+        tracing::info!("diag page {what}: no page attached");
+        return;
+    };
+    let page_value = if id < page.count { page.read(page.ro + VALUES + u64::from(id) * 8) } else { u64::MAX };
+    let guest = page.syncpoints.guest().value(id);
+    let mirror = std::env::var_os("LICHII_DIAG_PAGE_MIRROR").is_some();
+    tracing::info!("diag page {what}: syncpoint {id} page {page_value} guest {guest:?} count {} mirror {mirror}", page.count);
+    if mirror {
+        page.mirror(id);
+    }
 }
 
 struct Page {

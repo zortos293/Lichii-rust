@@ -485,6 +485,7 @@ impl VideoDecoderService {
         while guest.is_reached(shared.syncpoint, target) == Ok(false) {
             let _ = guest.increment(shared.syncpoint);
         }
+        super::syncpt::diag_page_check(if command == 207 { "after stop" } else { "after finalize" }, shared.syncpoint);
         drop(state);
         shared.wake.notify_one();
         ResultCode::SUCCESS
