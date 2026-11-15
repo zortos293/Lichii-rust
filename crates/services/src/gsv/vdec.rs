@@ -467,6 +467,10 @@ struct Media {
     pictures: u64,
     decodes: u64,
     decode_time: Duration,
+    /// The pts of the stream's latest picture. An end of stream without a picture of its own
+    /// reports it, as the C++ reference does: the input's pts is often `u64::MAX`, which 213's
+    /// conversion to nanoseconds overflows.
+    last_pts: Option<u64>,
 }
 
 impl Media {
@@ -516,6 +520,7 @@ impl Media {
                 break;
             }
             let pts = frame.picture().map_or(input.pts, |p| p.pts.max(0) as u64);
+            self.last_pts = Some(pts);
             self.decoded.push(Decoded {
                 frame: Some(frame),
                 pts,
@@ -537,7 +542,7 @@ impl Media {
                 Some(last) => last.end = true,
                 None => self.decoded.push(Decoded {
                     frame: None,
-                    pts: input.pts,
+                    pts: self.last_pts.unwrap_or(input.pts),
                     end: true,
                 }),
             }
@@ -548,6 +553,7 @@ impl Media {
         if let Some(decoder) = &mut self.decoder {
             decoder.flush();
         }
+        self.last_pts = None;
     }
 }
 
@@ -693,6 +699,7 @@ impl Shared {
             pictures: 0,
             decodes: 0,
             decode_time: Duration::ZERO,
+            last_pts: None,
         };
         let mut release_wait: Option<((u32, u32), Instant)> = None;
         let mut state = self.state.lock();

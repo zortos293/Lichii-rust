@@ -16,8 +16,8 @@ use lichii_memory::{DeviceAddressSpace, PhysicalMemory};
 
 pub use channel::{DECODE_TIME, EngineChannel, VideoEngine};
 pub use syncpoints::{
-    ActionHandle, InvalidSyncpoint, SYNCPOINT_COUNT, SyncpointBank, SyncpointWaitError, Syncpoints,
-    is_reached,
+    ActionHandle, InvalidSyncpoint, MirrorHandle, SYNCPOINT_COUNT, SyncpointBank,
+    SyncpointWaitError, Syncpoints, is_reached,
 };
 
 use crate::backend::GpuWrittenPages;

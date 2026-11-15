@@ -235,14 +235,31 @@ fn syncpt_slots_mirror_the_value_into_the_page_before_signalling() {
     let request = Request::tipc(201).arg(0u32).arg(!9u32).arg(2u64).arg(0u32);
     page.client.send(syncpt, &request).unwrap();
     guest.increment(9).unwrap();
-    assert_eq!(
-        page.value(9),
-        0,
-        "the page is not written on every increment"
-    );
+    assert_eq!(page.value(9), 1);
+    assert!(!slot.is_signaled());
     guest.increment(9).unwrap();
     assert!(slot.is_signaled());
     assert_eq!(page.value(9), 2);
+}
+
+#[test]
+fn syncpt_page_mirrors_increments_nobody_waits_on() {
+    let (context, page) = syncpt_page();
+    let guest = context.gpu.host1x().syncpoints.guest();
+    for _ in 0..3 {
+        guest.increment(12).unwrap();
+    }
+    assert_eq!(
+        page.value(12),
+        3,
+        "a client reads the page without a request"
+    );
+    assert!(!page.notify.is_signaled());
+    page.arm(12);
+    assert!(
+        page.acknowledged(12),
+        "a wait on a value that changed since its last answer is answered"
+    );
 }
 
 #[test]
@@ -1532,6 +1549,29 @@ fn video_decoder_plays_a_movie_at_its_pts_pace_and_ends_it() {
 }
 
 #[test]
+fn video_decoder_keeps_images_handed_out_after_the_end_of_stream_for_the_next_stream() {
+    let vdec = Vdec::open();
+    let (syncpoint, first) = vdec.hand_out(311, 1);
+    assert_eq!(vdec.submit(30_000, true).result, ResultCode::SUCCESS);
+    vdec.wait(syncpoint, first);
+    assert_eq!(vdec.output(), Some((1, 1280, 30_000_000, true)));
+
+    let (_, kept) = vdec.hand_out(314, 2);
+    let guest = vdec.context.gpu.host1x().syncpoints.guest();
+    assert!(
+        !guest.is_reached(syncpoint, kept).unwrap(),
+        "the image waits for the next stream"
+    );
+    assert_eq!(vdec.output(), None);
+
+    assert_eq!(vdec.send(&Request::tipc(8)).result, ResultCode::SUCCESS);
+    assert_eq!(vdec.submit(0, false).result, ResultCode::SUCCESS);
+    vdec.wait(syncpoint, kept);
+    assert_eq!(vdec.output(), Some((2, 1280, 0, false)));
+    vdec.close(syncpoint);
+}
+
+#[test]
 fn video_decoder_counts_unregistered_images_off_in_turn() {
     let vdec = Vdec::open();
     let fences: Vec<_> = (1..=3).map(|image| vdec.hand_out(311, image)).collect();
@@ -1630,6 +1670,42 @@ fn video_decoder_writes_decoded_pictures_into_nv12_images() {
         assert_eq!(luma, 40 + 30 * frame as u8, "frame {frame} luma");
         assert_eq!(chroma, [90, 200 - 15 * frame as u8], "frame {frame} chroma");
     }
+    vdec.close(syncpoint);
+}
+
+#[test]
+fn video_decoder_gives_an_end_of_stream_without_a_picture_the_last_pictures_pts() {
+    if !lichii_video::available() {
+        eprintln!("FFmpeg is not installed; skipping");
+        return;
+    }
+    let vdec = Vdec::open();
+    let (_, pool) = vdec.decoder_pool(1, NV12_IMAGE_SIZE);
+    let fences: Vec<_> = (0..3).map(|i| vdec.hand_out(311, pool + i)).collect();
+    let stream = ivf_frames(include_bytes!(
+        "../../../video/tests/data/quadrants.vp9.ivf"
+    ));
+    for (frame, data) in stream.iter().take(3).enumerate() {
+        let reply = vdec.submit_frame(data, frame as u64 * 33_333);
+        assert_eq!(reply.result, ResultCode::SUCCESS);
+    }
+    let (syncpoint, last) = fences[2];
+    vdec.wait(syncpoint, last);
+    for frame in 0..3u64 {
+        assert_eq!(
+            vdec.output(),
+            Some((pool + frame as u32, 64, frame * 33_333_000, false))
+        );
+    }
+
+    let (_, end) = vdec.hand_out(311, pool);
+    assert_eq!(vdec.submit(u64::MAX, true).result, ResultCode::SUCCESS);
+    vdec.wait(syncpoint, end);
+    assert_eq!(
+        vdec.output(),
+        Some((pool, 1280, 66_666_000, true)),
+        "the end of stream carries the last picture's pts, not the input's u64::MAX"
+    );
     vdec.close(syncpoint);
 }
 

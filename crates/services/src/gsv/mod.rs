@@ -45,7 +45,7 @@ pub(crate) fn open(context: &Arc<ServiceContext>, ctx: &mut HleRequestContext) -
         ctx,
         GraphicsSystem {
             context: context.clone(),
-            syncpt: Arc::default(),
+            syncpt: syncpt::PageSlot::default(),
             objects: Arc::default(),
             state: Mutex::default(),
         },
@@ -110,7 +110,7 @@ fn push_readable(ctx: &mut HleRequestContext, event: &Arc<Event>) -> ResultCode 
 
 struct GraphicsSystem {
     context: Arc<ServiceContext>,
-    syncpt: Arc<syncpt::PageSlot>,
+    syncpt: syncpt::PageSlot,
     objects: Arc<Mutex<native::NativeObjects>>,
     state: Mutex<State>,
 }
@@ -152,11 +152,7 @@ impl Service for GraphicsSystem {
             201 | 301 | 401..=403 | 494 | 801 | 1101 | 1102 | 1501..=1503 | 1601 => {
                 ResultCode::SUCCESS
             }
-            202 => push_session(
-                context,
-                ctx,
-                syncpt::SyncptSession::new(context, self.syncpt.clone()),
-            ),
+            202 => push_session(context, ctx, syncpt::SyncptSession::new(context)),
             204 => syncpt::attach(context, ctx, &self.syncpt),
             305 => push_session_on(
                 context,
