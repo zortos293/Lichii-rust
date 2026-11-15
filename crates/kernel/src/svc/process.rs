@@ -59,6 +59,39 @@ pub(super) fn break_(svc: &mut SvcContext) -> Flow {
         fp = next;
     }
     lichii_common::diag_ring::dump();
+    let me = svc.thread.id();
+    tracing::error!("diag break thread {me} sp={:#x} x={:x?}", svc.ctx.sp, &svc.ctx.x[..31]);
+    let mut fp = svc.ctx.x[29];
+    for depth in 0..12 {
+        let mut frame = [0u8; 16];
+        if fp == 0 || svc.process().memory().read_bytes(fp, &mut frame).is_err() {
+            break;
+        }
+        let next = u64::from_le_bytes(frame[..8].try_into().unwrap());
+        let lr = u64::from_le_bytes(frame[8..].try_into().unwrap());
+        if (3..=9).contains(&depth) {
+            let mut code = [0u8; 160];
+            let _ = svc.process().memory().read_bytes(lr - 128, &mut code);
+            tracing::error!("diag break code {depth} at {:#x}: {}", lr - 128, code.iter().map(|b| format!("{b:02x}")).collect::<String>());
+            let mut stack = [0u8; 128];
+            let _ = svc.process().memory().read_bytes(fp, &mut stack);
+            let words: Vec<String> = stack.chunks(8).map(|c| format!("{:x}", u64::from_le_bytes(c.try_into().unwrap()))).collect();
+            tracing::error!("diag break stack {depth} fp={fp:#x}: {}", words.join(" "));
+        }
+        fp = next;
+    }
+    let now = super::diag_epoch().elapsed().as_micros() as u64;
+    for e in super::DIAG_SVCS.lock().iter() {
+        tracing::error!(
+            "diag svc -{}us thread {}{} svc {:#04x} args {:x?} out {:x?}",
+            now.saturating_sub(e.micros),
+            e.thread,
+            if e.thread == me { "*" } else { "" },
+            e.imm,
+            e.args,
+            e.out
+        );
+    }
     svc.kernel.terminate_process(svc.process());
     Flow::ExitThread
 }
