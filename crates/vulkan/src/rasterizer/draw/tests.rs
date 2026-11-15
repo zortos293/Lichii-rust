@@ -2075,6 +2075,120 @@ fn draws_sample_a_texture_over_their_render_target_without_replacing_it() {
     f.assert_no_validation_errors();
 }
 
+/// A draw samples a texture, a draw into a render target of another shape over the texture's
+/// memory rewrites it, and the next draw samples what that one rendered, also when the second
+/// rewrite creates no image.
+#[test]
+fn draws_sample_what_a_target_over_their_texture_rendered_since_they_last_sampled_it() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(&f, PROGRAMS + u64::from(FRAGMENT), &sampling_program());
+    write(&f, PROGRAMS + u64::from(READER), &fragment_program([0, 4]));
+    uniform_texture(&f, 0, TEXTURE, [10, 200, 30, 255]);
+    let regs = sampling_regs();
+    draw(&mut f, &gmmu, &regs);
+    assert_eq!(target(&mut f)[0], [10, 200, 30, 255]);
+    let mut painter = target_regs(TEXTURE, (2 * SIZE, SIZE / 2));
+    painter.pipelines[5].offset = READER;
+    draw(&mut f, &gmmu, &painter);
+    draw(&mut f, &gmmu, &regs);
+    assert!(
+        target(&mut f).iter().all(|&t| unorm8_eq(t, ORANGE)),
+        "the texture holds what the 32x8 target rendered over it"
+    );
+    write(&f, FRAGMENT_CBUF, &f32_bytes(&[0.0, 0.0, 1.0, 1.0]));
+    f.rasterizer.invalidate_region(DADDR + FRAGMENT_CBUF, 16);
+    let generation = f.rasterizer.texture_cache.generation();
+    draw(&mut f, &gmmu, &painter);
+    draw(&mut f, &gmmu, &regs);
+    assert_eq!(
+        f.rasterizer.texture_cache.generation(),
+        generation,
+        "both images stay live, so only their contents changed"
+    );
+    assert!(
+        target(&mut f)
+            .iter()
+            .all(|&t| unorm8_eq(t, [0, 0, 255, 255])),
+        "the texture holds what the 32x8 target rendered over it the second time"
+    );
+    f.assert_no_validation_errors();
+}
+
+/// A render target is painted, a narrower texture over its texels samples it, and after the
+/// target is painted again the next draw samples the new texels from it, with no image created.
+#[test]
+fn draws_sample_what_their_texture_alias_rendered_since_they_last_sampled_it() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(&f, PROGRAMS + u64::from(FRAGMENT), &sampling_program());
+    write(&f, PROGRAMS + u64::from(READER), &fragment_program([0, 4]));
+    let mut painter = target_regs(TEXTURE, (32, 24));
+    painter.pipelines[5].offset = READER;
+    draw(&mut f, &gmmu, &painter);
+    let header = tic(GPU_VA + TEXTURE, 24, 24);
+    write(&f, TIC, bytemuck::cast_slice(&header));
+    let regs = sampling_regs();
+    draw(&mut f, &gmmu, &regs);
+    assert!(target(&mut f).iter().all(|&t| unorm8_eq(t, ORANGE)));
+    write(&f, FRAGMENT_CBUF, &f32_bytes(&[0.0, 0.0, 1.0, 1.0]));
+    f.rasterizer.invalidate_region(DADDR + FRAGMENT_CBUF, 16);
+    let generation = f.rasterizer.texture_cache.generation();
+    draw(&mut f, &gmmu, &painter);
+    draw(&mut f, &gmmu, &regs);
+    assert_eq!(f.rasterizer.texture_cache.generation(), generation);
+    assert!(
+        target(&mut f)
+            .iter()
+            .all(|&t| unorm8_eq(t, [0, 0, 255, 255])),
+        "the texture takes the target's newer texels"
+    );
+    f.assert_no_validation_errors();
+}
+
+/// An address space with the texture pages at `TEXTURE` backed by `backing`, after as many
+/// mapping changes as any other.
+fn texture_space(f: &Fixture, backing: u64) -> Arc<Gmmu> {
+    let gmmu = Arc::new(Gmmu::new(
+        f.memory.clone(),
+        lichii_gpu::gmmu::BigPageSize::Size64K,
+    ));
+    gmmu.map(GPU_VA, DADDR, 16 << 20, 0, false).unwrap();
+    gmmu.map(GPU_VA + TEXTURE, DADDR + backing, 0x1_0000, 0, false)
+        .unwrap();
+    gmmu
+}
+
+/// A draw through a new address space samples what it maps, though the texture header and the
+/// mapping generation match those a draw sampled through an address space now freed.
+#[test]
+fn draws_through_a_new_address_space_sample_what_it_maps() {
+    let Some((mut f, _)) = draw_fixture() else {
+        return;
+    };
+    write(&f, PROGRAMS + u64::from(FRAGMENT), &sampling_program());
+    uniform_texture(&f, 0, OTHER_TEXTURE, [5, 6, 250, 255]);
+    uniform_texture(&f, 0, TEXTURE, [10, 200, 30, 255]);
+    let regs = sampling_regs();
+    let first = texture_space(&f, TEXTURE);
+    draw(&mut f, &first, &regs);
+    assert_eq!(target(&mut f)[0], [10, 200, 30, 255]);
+    let freed = Arc::as_ptr(&first);
+    drop(first);
+    f.rasterizer.release_channel(ChannelId(0));
+    let second = texture_space(&f, OTHER_TEXTURE);
+    assert_ne!(
+        Arc::as_ptr(&second),
+        freed,
+        "the renderer still holds the freed address space's allocation"
+    );
+    draw(&mut f, &second, &regs);
+    assert_eq!(target(&mut f)[0], [5, 6, 250, 255]);
+    f.assert_no_validation_errors();
+}
+
 /// Draws the 16x16 target with `code` as the fragment program and the texture handle
 /// `handle` in c[0][0x40].
 fn read_with(f: &mut Fixture, gmmu: &Arc<Gmmu>, regs: &mut Regs, code: &[u8], handle: u32) {
