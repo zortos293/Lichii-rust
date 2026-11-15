@@ -10,7 +10,8 @@ use lichii_texture::PixelFormat;
 use lichii_texture::block_linear::GobLayout;
 
 use super::{
-    CachedImage, GuestLayout, ImageId, ImageKind, ResolutionScale, Segment, TextureCache, Transfer,
+    CachedImage, GuestLayout, ImageId, ImageInfo, ImageKind, ResolutionScale, Segment, TextureCache,
+    Transfer,
 };
 use crate::commands::ImageAccess;
 use crate::descriptors::DescriptorAllocator;
@@ -166,13 +167,15 @@ struct Run {
 }
 
 /// Reused storage for [`shared_runs`] and [`trim_aliases`]: the target's segments by device
-/// address, the runs, the guest bytes already claimed and the trimmed runs, and the runs as
-/// `guest_bytes.comp` reads them.
+/// address, the runs, the guest bytes already claimed, the bytes one run moves, the claims
+/// being merged and the trimmed runs, and the runs as `guest_bytes.comp` reads them.
 #[derive(Default)]
 struct RunScratch {
     targets: Vec<Segment>,
     runs: Vec<Run>,
     claimed: Vec<(u64, u64)>,
+    moved: Vec<(u64, u64)>,
+    merged: Vec<(u64, u64)>,
     trimmed: Vec<Run>,
     words: Vec<[u32; 4]>,
 }
@@ -218,14 +221,91 @@ fn shared_runs(
     true
 }
 
+/// Pushes onto `out`, in order and merged, the image offsets in `[lo, hi)` that
+/// `guest_bytes.comp` moves for the first `levels` levels of every layer of `info`: the words
+/// of texels, never the padding of rows, GOBs or blocks.
+fn moved_bytes(info: &ImageInfo, levels: u32, lo: u64, hi: u64, out: &mut Vec<(u64, u64)>) {
+    let mut push = |a: u64, b: u64| {
+        let (a, b) = (a.max(lo), b.min(hi));
+        if a >= b {
+            return;
+        }
+        match out.last_mut() {
+            Some(last) if last.1 == a => last.1 = b,
+            _ => out.push((a, b)),
+        }
+    };
+    for layer in 0..info.layers {
+        for level in 0..levels {
+            let start = info.subresource_offset(level, layer);
+            if start >= hi || start + info.level_size(level) <= lo {
+                continue;
+            }
+            let tiling = info.surface().level_tiling(level);
+            let (w, h, _) = info.level_extent(level);
+            let row_bytes = w * tiling.bytes_per_block / 4 * 4;
+            let bh = tiling.block_height_log2;
+            let column = 1u64 << (9 + bh + tiling.block_depth_log2);
+            let block_bytes = u64::from(tiling.row_gobs) * column;
+            let (full_cols, cols) = (row_bytes / 64, row_bytes.div_ceil(64));
+            let (full_rows, rows) = (h / 8, h.div_ceil(8));
+            let dense = full_cols == tiling.row_gobs && tiling.block_depth_log2 == 0;
+            let blocks = u64::from(rows.div_ceil(1 << bh));
+            for block in lo.saturating_sub(start) / block_bytes..blocks {
+                let row = start + block * block_bytes;
+                if row >= hi {
+                    break;
+                }
+                let gob_y = (block as u32) << bh;
+                if dense && gob_y + (1 << bh) <= full_rows {
+                    push(row, row + block_bytes);
+                    continue;
+                }
+                for c in 0..cols {
+                    let base = row + u64::from(c) * column;
+                    if base >= hi {
+                        break;
+                    }
+                    for g in gob_y..(gob_y + (1 << bh)).min(rows) {
+                        let gob = base + (u64::from(g - gob_y) << 9);
+                        if c < full_cols && g < full_rows {
+                            push(gob, gob + 512);
+                            continue;
+                        }
+                        let mut words = 0u128;
+                        for y in g * 8..(g * 8 + 8).min(h) {
+                            for x in (c * 64..(c * 64 + 64).min(row_bytes)).step_by(4) {
+                                let at = start + tiling.offset(x, y, 0) as u64 - gob;
+                                words |= 1 << (at / 4);
+                            }
+                        }
+                        while words != 0 {
+                            let bit = words.trailing_zeros();
+                            let len = (words >> bit).trailing_ones();
+                            push(gob + u64::from(bit) * 4, gob + u64::from(bit + len) * 4);
+                            words &= !(u128::MAX >> (128 - len) << bit);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Trims `scratch.runs` so every guest byte has one source run: where runs of an image whose
 /// segments alias device memory land on the same guest bytes, the run with the highest image
-/// offset keeps them, as when the runs were painted one after another in image order. Leaves
-/// the runs sorted by image offset.
-fn trim_aliases(scratch: &mut RunScratch) {
+/// offset that moves a byte there keeps it, as when the runs were painted one after another in
+/// image order. `moved` pushes, in order, the image offsets in `[lo, hi)` the shader moves, so
+/// a run's padding claims nothing. Leaves the runs sorted by image offset.
+fn trim_aliases(
+    scratch: &mut RunScratch,
+    mut moved: impl FnMut(u64, u64, &mut Vec<(u64, u64)>),
+) {
     let RunScratch {
         runs,
         claimed,
+        moved: moves,
+        merged,
         trimmed,
         ..
     } = scratch;
@@ -233,14 +313,14 @@ fn trim_aliases(scratch: &mut RunScratch) {
     trimmed.clear();
     for run in runs.iter().rev() {
         let (start, end) = (run.at, run.at + run.size);
-        let first = claimed.partition_point(|c| c.1 < start);
-        let last = claimed.partition_point(|c| c.0 <= end);
+        let first = claimed.partition_point(|c| c.1 <= start);
+        let last = claimed.partition_point(|c| c.0 < end);
         let mut at = start;
         for &(lo, hi) in &claimed[first..last] {
             if lo > at {
                 trimmed.push(Run {
                     from: run.from + (at - start),
-                    size: lo.min(end) - at,
+                    size: lo - at,
                     at,
                 });
             }
@@ -253,10 +333,39 @@ fn trim_aliases(scratch: &mut RunScratch) {
                 at,
             });
         }
-        let merged = claimed[first..last]
+        moves.clear();
+        moved(run.from, run.from + run.size, moves);
+        if moves.is_empty() {
+            continue;
+        }
+        merged.clear();
+        let mut next = moves
             .iter()
-            .fold((start, end), |(lo, hi), c| (lo.min(c.0), hi.max(c.1)));
-        claimed.splice(first..last, [merged]);
+            .map(|&(lo, hi)| (lo - run.from + start, hi - run.from + start))
+            .peekable();
+        let mut i = 0;
+        loop {
+            let item = match (claimed.get(i), next.peek()) {
+                (Some(&c), Some(&m)) if c.0 <= m.0 => {
+                    i += 1;
+                    c
+                }
+                (_, Some(&m)) => {
+                    next.next();
+                    m
+                }
+                (Some(&c), None) => {
+                    i += 1;
+                    c
+                }
+                (None, None) => break,
+            };
+            match merged.last_mut() {
+                Some(last) if item.0 <= last.1 => last.1 = last.1.max(item.1),
+                _ => merged.push(item),
+            }
+        }
+        std::mem::swap(claimed, merged);
     }
     trimmed.sort_unstable_by_key(|r| r.from);
     std::mem::swap(runs, trimmed);
@@ -264,9 +373,14 @@ fn trim_aliases(scratch: &mut RunScratch) {
 
 /// Fills `scratch.words` with `scratch.runs` as `guest_bytes.comp` reads them, trimmed first
 /// when the image's bytes go to the guest, so one pass gives every guest byte one writer.
-fn run_words(scratch: &mut RunScratch, direction: Direction) {
+/// `moved` is as for [`trim_aliases`].
+fn run_words(
+    scratch: &mut RunScratch,
+    direction: Direction,
+    moved: impl FnMut(u64, u64, &mut Vec<(u64, u64)>),
+) {
     if direction == Direction::ToGuest {
-        trim_aliases(scratch);
+        trim_aliases(scratch, moved);
     }
     scratch.words.clear();
     scratch.words.extend(
@@ -485,7 +599,9 @@ impl TextureCache {
         let placed = shared_runs(image, target, window, &mut sync.scratch);
         debug_assert!(placed, "checked by sync_on_gpu");
         let scratch = &mut sync.scratch;
-        run_words(scratch, direction);
+        run_words(scratch, direction, |lo, hi, out| {
+            moved_bytes(&info, levels, lo, hi, out)
+        });
         let run_bytes: &[u8] = bytemuck::cast_slice(&scratch.words);
         ensure(
             &device,
@@ -659,23 +775,80 @@ mod tests {
 
     const GUEST: usize = 16 << 10;
 
+    type Moved = fn(u64, u64, &mut Vec<(u64, u64)>);
+
     fn source_byte(offset: u64) -> u8 {
         (offset * 7 + offset / 13) as u8
     }
 
-    fn paint_in_order(runs: &[Run]) -> Vec<u8> {
+    fn all_moved(lo: u64, hi: u64, out: &mut Vec<(u64, u64)>) {
+        out.push((lo, hi));
+    }
+
+    fn paint_in_order(runs: &[Run], moved: Moved) -> Vec<u8> {
         let mut guest = vec![0; GUEST];
+        let mut spans = Vec::new();
         for r in runs {
-            for i in 0..r.size {
-                guest[(r.at + i) as usize] = source_byte(r.from + i);
+            spans.clear();
+            moved(r.from, r.from + r.size, &mut spans);
+            for &(lo, hi) in &spans {
+                for offset in lo..hi {
+                    guest[(r.at + offset - r.from) as usize] = source_byte(offset);
+                }
             }
         }
         guest
     }
 
+    fn dispatched(runs: &[Run], moved: Moved) -> Vec<Run> {
+        let mut scratch = RunScratch {
+            runs: runs.to_vec(),
+            ..RunScratch::default()
+        };
+        run_words(&mut scratch, Direction::ToGuest, moved);
+        scratch
+            .words
+            .iter()
+            .map(|w| Run {
+                from: w[0].into(),
+                size: w[1].into(),
+                at: w[2].into(),
+            })
+            .collect()
+    }
+
+    fn assert_one_writer_with_the_serial_result(runs: &[Run], moved: Moved) {
+        let serial = paint_in_order(runs, moved);
+        let trimmed = dispatched(runs, moved);
+        assert!(
+            trimmed
+                .windows(2)
+                .all(|w| w[0].from + w[0].size <= w[1].from),
+            "trimmed runs stay sorted and disjoint by image offset: {trimmed:?}"
+        );
+        let mut writers = vec![0u8; GUEST];
+        let mut spans = Vec::new();
+        for r in &trimmed {
+            spans.clear();
+            moved(r.from, r.from + r.size, &mut spans);
+            for &(lo, hi) in &spans {
+                for offset in lo..hi {
+                    writers[(r.at + offset - r.from) as usize] += 1;
+                }
+            }
+        }
+        assert!(
+            writers.iter().all(|&n| n <= 1),
+            "a guest byte has two runs: {trimmed:?}"
+        );
+        assert_eq!(paint_in_order(&trimmed, moved), serial);
+        let reversed: Vec<Run> = trimmed.iter().rev().copied().collect();
+        assert_eq!(paint_in_order(&reversed, moved), serial);
+    }
+
     #[test]
     fn aliased_runs_trim_to_one_writer_per_byte_with_the_serial_result() {
-        let runs = vec![
+        let runs = [
             Run {
                 from: 0,
                 size: 4096,
@@ -702,52 +875,48 @@ mod tests {
                 at: 12288,
             },
         ];
-        let serial = paint_in_order(&runs);
         let reversed: Vec<Run> = runs.iter().rev().copied().collect();
         assert_ne!(
-            paint_in_order(&reversed),
-            serial,
+            paint_in_order(&reversed, all_moved),
+            paint_in_order(&runs, all_moved),
             "untrimmed, one pass over aliased runs depends on which run writes last"
         );
+        assert_one_writer_with_the_serial_result(&runs, all_moved);
+    }
 
-        let mut scratch = RunScratch {
-            runs: runs.clone(),
-            ..RunScratch::default()
-        };
-        run_words(&mut scratch, Direction::ToGuest);
-        let trimmed: Vec<Run> = scratch
-            .words
-            .iter()
-            .map(|w| Run {
-                from: w[0].into(),
-                size: w[1].into(),
-                at: w[2].into(),
-            })
-            .collect();
-        assert!(
-            trimmed
-                .windows(2)
-                .all(|w| w[0].from + w[0].size <= w[1].from),
-            "trimmed runs stay sorted and disjoint by image offset: {trimmed:?}"
-        );
-        let mut writers = vec![0u8; GUEST];
-        for r in &trimmed {
-            for i in r.at..r.at + r.size {
-                writers[i as usize] += 1;
+    #[test]
+    fn padding_of_a_later_alias_leaves_the_bytes_to_the_earlier_run() {
+        fn texels(lo: u64, hi: u64, out: &mut Vec<(u64, u64)>) {
+            for (a, b) in [(0, 1024), (4096, 4608)] {
+                if a.max(lo) < b.min(hi) {
+                    out.push((a.max(lo), b.min(hi)));
+                }
             }
         }
-        assert!(
-            writers.iter().all(|&n| n <= 1),
-            "a guest byte has two runs: {trimmed:?}"
+        let runs = [
+            Run {
+                from: 0,
+                size: 4096,
+                at: 0,
+            },
+            Run {
+                from: 4096,
+                size: 4096,
+                at: 0,
+            },
+        ];
+        let serial = paint_in_order(&runs, texels);
+        assert_ne!(
+            paint_in_order(&dispatched(&runs, all_moved), texels),
+            serial,
+            "claiming a later run's padding drops the earlier run's texels"
         );
-        assert_eq!(paint_in_order(&trimmed), serial);
-        let reversed: Vec<Run> = trimmed.iter().rev().copied().collect();
-        assert_eq!(paint_in_order(&reversed), serial);
+        assert_one_writer_with_the_serial_result(&runs, texels);
     }
 
     #[test]
     fn runs_without_aliases_trim_to_themselves() {
-        let runs = vec![
+        let runs = [
             Run {
                 from: 0,
                 size: 4096,
@@ -764,11 +933,116 @@ mod tests {
                 at: 4096,
             },
         ];
-        let mut scratch = RunScratch {
-            runs: runs.clone(),
-            ..RunScratch::default()
+        assert_eq!(dispatched(&runs, all_moved), runs);
+    }
+
+    fn block_linear_info(
+        format: PixelFormat,
+        (width, height): (u32, u32),
+        levels: u32,
+        layers: u32,
+        bh: u32,
+        gob: GobLayout,
+    ) -> ImageInfo {
+        let mut info = ImageInfo {
+            format,
+            kind: ImageKind::D2,
+            layout: GuestLayout::BlockLinear {
+                block_height_log2: bh,
+                block_depth_log2: 0,
+                tile_width_spacing: 0,
+                gob,
+            },
+            width,
+            height,
+            depth: 1,
+            levels,
+            layers,
+            samples: 1,
+            layer_stride: 0,
+            rescaleable: false,
+            downscaleable: false,
         };
-        trim_aliases(&mut scratch);
-        assert_eq!(scratch.runs, runs);
+        info.layer_stride = info.surface().layer_stride();
+        info
+    }
+
+    #[test]
+    fn moved_bytes_are_the_words_of_texels() {
+        let images = [
+            block_linear_info(
+                PixelFormat::A8B8G8R8Unorm,
+                (16, 16),
+                1,
+                1,
+                4,
+                GobLayout::Tegra,
+            ),
+            block_linear_info(
+                PixelFormat::A8B8G8R8Unorm,
+                (64, 64),
+                1,
+                1,
+                0,
+                GobLayout::Tegra,
+            ),
+            block_linear_info(
+                PixelFormat::A8B8G8R8Unorm,
+                (12, 10),
+                1,
+                1,
+                1,
+                GobLayout::Tegra,
+            ),
+            block_linear_info(PixelFormat::R8Unorm, (70, 21), 2, 2, 2, GobLayout::Switch2),
+            block_linear_info(
+                PixelFormat::R16G16B16A16Float,
+                (40, 40),
+                3,
+                2,
+                3,
+                GobLayout::Tegra,
+            ),
+            block_linear_info(
+                PixelFormat::A8B8G8R8Unorm,
+                (128, 136),
+                2,
+                1,
+                4,
+                GobLayout::Switch2,
+            ),
+        ];
+        for info in images {
+            let size = info.size_bytes() as usize;
+            let mut moved = vec![false; size];
+            for layer in 0..info.layers {
+                for level in 0..info.levels {
+                    let start = info.subresource_offset(level, layer) as usize;
+                    let tiling = info.surface().level_tiling(level);
+                    let (w, h, _) = info.level_extent(level);
+                    for y in 0..h {
+                        for x in (0..w * tiling.bytes_per_block / 4 * 4).step_by(4) {
+                            let at = start + tiling.offset(x, y, 0);
+                            moved[at..at + 4].fill(true);
+                        }
+                    }
+                }
+            }
+            for (lo, hi) in [(0, size), (100, size / 2 + 6), (size / 3, size - 4), (513, 515)] {
+                let mut expected: Vec<(u64, u64)> = Vec::new();
+                for at in lo..hi {
+                    if !moved[at] {
+                        continue;
+                    }
+                    match expected.last_mut() {
+                        Some(last) if last.1 == at as u64 => last.1 += 1,
+                        _ => expected.push((at as u64, at as u64 + 1)),
+                    }
+                }
+                let mut out = Vec::new();
+                moved_bytes(&info, info.levels, lo as u64, hi as u64, &mut out);
+                assert_eq!(out, expected, "{info:?} over {lo}..{hi}");
+            }
+        }
     }
 }
