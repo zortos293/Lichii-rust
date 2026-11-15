@@ -492,6 +492,10 @@ impl Thread {
         token != 0 && self.wait_token.load(Ordering::Acquire) == token
     }
 
+    pub(crate) fn diag_cancel_pending(&self) -> bool {
+        self.sched.lock().cancel_pending
+    }
+
     /// Starts a wait from the thread itself. Fails with the pending result when the wait is
     /// cancellable and a cancel or termination is pending.
     pub(crate) fn begin_wait(&self, resume: Resume, cancellable: bool) -> Result<u64, ResultCode> {
@@ -566,7 +570,9 @@ impl Thread {
     /// Wakes the thread from the cancellable wait it is in, or makes its next one fail.
     pub(crate) fn cancel_synchronization(self: &Arc<Self>) {
         let mut s = self.sched.lock();
-        tracing::warn!(target_thread = ?self.id(), waiting = s.wait != 0, cancellable = s.cancellable, resume = ?s.resume, state = ?s.state, pending = s.cancel_pending, "diag cancel");
+        if s.wait == 0 || !s.cancellable {
+            tracing::warn!(target_thread = ?self.id(), waiting = s.wait != 0, cancellable = s.cancellable, resume = ?s.resume, state = ?s.state, pending = s.cancel_pending, "diag cancel left pending");
+        }
         if s.wait == 0 || !s.cancellable {
             s.cancel_pending = true;
             return;

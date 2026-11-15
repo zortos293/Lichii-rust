@@ -131,6 +131,10 @@ pub(super) fn wait_synchronization(svc: &mut SvcContext) -> Flow {
             None => svc.finish(Err(result::TIMED_OUT)),
         };
     }
+    if svc.thread.diag_cancel_pending() {
+        let signaled: Vec<usize> = (0..count).filter(|&i| sync(i).is_signaled()).collect();
+        tracing::warn!(thread = ?svc.thread.id(), pc = format_args!("{:#x}", svc.ctx.pc), lr = format_args!("{:#x}", svc.ctx.x[30]), count, timeout, ?signaled, "diag wait meets a pending cancel");
+    }
     let token = match svc.thread.begin_wait(Resume::ResultAndIndex, true) {
         Ok(token) => token,
         Err(code) => return svc.finish(Err(code)),
@@ -152,9 +156,15 @@ pub(super) fn wait_synchronization(svc: &mut SvcContext) -> Flow {
 
 /// `svcCancelSynchronization(thread handle w0)`.
 pub(super) fn cancel_synchronization(svc: &mut SvcContext) -> Flow {
+    let caller = (svc.thread.id(), svc.ctx.x[30]);
     let result = svc
         .typed::<Thread>(svc.arg32(0))
-        .map(|thread| thread.cancel_synchronization());
+        .map(|thread| {
+            if thread.diag_cancel_pending() {
+                tracing::warn!(caller = ?caller.0, lr = format_args!("{:#x}", caller.1), target = ?thread.id(), "diag cancel while one is pending");
+            }
+            thread.cancel_synchronization()
+        });
     svc.finish(result)
 }
 
