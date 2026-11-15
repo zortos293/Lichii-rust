@@ -60,6 +60,7 @@ pub struct GpuTimestamp {
     /// Guest time of the last present shifted left by 2, with the speed latched then in the low
     /// bits: one word so both change together.
     anchor: AtomicU64,
+    logged: AtomicU64,
 }
 
 impl GpuTimestamp {
@@ -70,6 +71,7 @@ impl GpuTimestamp {
             ampere,
             speed: AtomicU8::new(GpuClockSpeed::Normal as u8),
             anchor: AtomicU64::new(0),
+            logged: AtomicU64::new(0),
         }
     }
 
@@ -81,6 +83,10 @@ impl GpuTimestamp {
     /// A frame was presented: Ampere timestamps scale only the time after this point.
     pub fn frame_presented(&self) {
         let now = self.time.global_time_ns();
+        let prev = self.anchor.load(Ordering::Relaxed) >> 2;
+        if prev != 0 && now > prev + 200_000_000 {
+            tracing::warn!(now, prev, gap_ms = (now - prev) / 1_000_000, "diag ts present gap");
+        }
         let speed = self.speed.load(Ordering::Relaxed);
         self.anchor
             .store(now << 2 | u64::from(speed), Ordering::Relaxed);
@@ -96,7 +102,11 @@ impl GpuTimestamp {
                 return now;
             }
             let speed = GpuClockSpeed::from_bits((anchor & 3) as u8);
-            return present + (now - present) / speed.ampere_divisor();
+            let ts = present + (now - present) / speed.ampere_divisor();
+            if now - ts > 100_000_000 && self.logged.swap(present, Ordering::Relaxed) != present {
+                tracing::warn!(now, present, ts, lag_ms = (now - ts) / 1_000_000, "diag ts lag");
+            }
+            return ts;
         }
         let ticks = (u128::from(now) * 384 / 625) as u64;
         ticks / GpuClockSpeed::from_bits(self.speed.load(Ordering::Relaxed)).maxwell_divisor()

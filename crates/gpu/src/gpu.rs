@@ -410,7 +410,14 @@ impl Gpu {
         let handles = GpuHandles {
             device: host1x.memory.clone(),
             syncpoints: host1x.syncpoints.clone(),
-            timestamp: Arc::new(GpuTimestamp::new(time, config.console == Console::Switch2)),
+            timestamp: {
+                let t = Arc::new(GpuTimestamp::new(time, config.console == Console::Switch2));
+                if std::env::var("LICHII_DIAG_GPU_CLOCK").as_deref() == Ok("boost") {
+                    tracing::warn!("diag gpu clock: boost");
+                    t.set_speed(crate::clock::GpuClockSpeed::Boost);
+                }
+                t
+            },
             written_pages: host1x.written_pages.clone(),
             lazy: host1x.lazy.clone(),
             activity: Arc::new(Activity::new()),
