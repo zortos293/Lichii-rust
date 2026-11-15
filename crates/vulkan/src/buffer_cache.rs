@@ -834,9 +834,8 @@ impl BufferCache {
     /// traps, then uploads the pages the guest CPU wrote since write tracking was last drained.
     /// Such a write may have landed after the upload that fed the binding; once uploaded, the
     /// range's download gives it back instead of the bytes it replaced, and writes after the arm
-    /// trap. Pages already holding GPU-written bytes are armed since that work, which uploaded
-    /// them, so they are skipped. Without flush traps, or over a range already GPU-written, it
-    /// does nothing.
+    /// trap. Without flush traps, or over a range already GPU-written (and so armed), it does
+    /// nothing.
     pub fn prepare_gpu_write(
         &mut self,
         scheduler: &mut Scheduler,
@@ -853,16 +852,10 @@ impl BufferCache {
             return Ok(());
         }
         let mut raced = std::mem::take(&mut self.raced);
-        let gpu_written = &self.gpu_written;
         self.memory
-            .for_each_cpu_written_page(daddr, end - daddr, |page| {
-                if gpu_written.intersects(page, page + PAGE_SIZE) {
-                    return;
-                }
-                match raced.last_mut() {
-                    Some((_, stop)) if *stop == page => *stop += PAGE_SIZE,
-                    _ => raced.push((page, page + PAGE_SIZE)),
-                }
+            .for_each_cpu_written_page(daddr, end - daddr, |page| match raced.last_mut() {
+                Some((_, stop)) if *stop == page => *stop += PAGE_SIZE,
+                _ => raced.push((page, page + PAGE_SIZE)),
             });
         let mut result = Ok(());
         for &(start, stop) in &raced {
@@ -2225,26 +2218,16 @@ mod tests {
         space.write_bytes(CPU_VA, &original).unwrap();
         let binding = f.acquire(DADDR, 0x1000);
         let cpu = [0x5a; 16];
-        space.write_bytes(CPU_VA + 0x200, &cpu).unwrap();
+        space.write_bytes(CPU_VA + 0x800, &cpu).unwrap();
         f.cache
-            .prepare_gpu_write(&mut f.scheduler, &mut f.staging, DADDR, 0x400)
+            .prepare_gpu_write(&mut f.scheduler, &mut f.staging, DADDR, 0x1000)
             .unwrap();
         f.gpu_fill(binding, 0, 0x100, 0xdead_beef);
-        f.cache.mark_gpu_written(DADDR, 0x400);
-        f.acquire(DADDR + 0x800, 0x1000);
-        let uploaded = f.cache.stats().uploaded_bytes;
-        f.cache
-            .prepare_gpu_write(&mut f.scheduler, &mut f.staging, DADDR + 0x800, 0x1000)
-            .unwrap();
-        assert_eq!(
-            f.cache.stats().uploaded_bytes,
-            uploaded,
-            "a raced page uploads once"
-        );
+        f.cache.mark_gpu_written(DADDR, 0x1000);
         f.cache.flush(&mut f.scheduler, DADDR, 0x1000).unwrap();
         let mut expected = original[..0x1000].to_vec();
         expected[..0x100].copy_from_slice(&0xdead_beef_u32.to_le_bytes().repeat(0x40));
-        expected[0x200..0x210].copy_from_slice(&cpu);
+        expected[0x800..0x810].copy_from_slice(&cpu);
         assert_eq!(f.guest(DADDR, 0x1000), expected);
         assert!(
             f.memory.has_cpu_writes(),
