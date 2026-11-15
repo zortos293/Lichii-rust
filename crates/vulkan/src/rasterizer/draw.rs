@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::mem::offset_of;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use ash::vk;
 use lichii_common::GpuVAddr;
@@ -254,7 +254,6 @@ struct StagesMemo {
 /// A texture header a draw sampled, with what its descriptor asked of it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct TextureKey {
-    gmmu: usize,
     header: [u32; 8],
     ty: TextureType,
     /// The descriptor's handle came from a handle program, so the header's type and numeric
@@ -272,10 +271,14 @@ struct BoundTexture {
     rescaled: bool,
 }
 
-/// Sampled textures by header while the texture cache's images stay the same.
+/// Sampled textures by header while the texture cache's images and the address space stay the
+/// same.
 #[derive(Default)]
 struct TextureMemo {
     cache: u64,
+    /// The address space the headers were read from. Holding it keeps its allocation, so no
+    /// later address space can take its place.
+    gmmu: Weak<lichii_gpu::gmmu::Gmmu>,
     bound: HashMap<TextureKey, BoundTexture, FxBuildHasher>,
 }
 
@@ -367,12 +370,6 @@ pub(super) struct DrawState {
 const PRESENTED: usize = 3;
 
 impl DrawState {
-    /// Forgets the textures headers bound: a released channel's GMMU, which keys them, may be
-    /// freed and another take its place at the same address and mapping generation.
-    pub(super) fn forget_bound_textures(&mut self) {
-        self.bound_textures.bound.clear();
-    }
-
     /// Notes that a present showed `image`.
     pub(super) fn presented(&mut self, image: ImageId) {
         if !self.presented.contains(&Some(image)) {
@@ -796,7 +793,7 @@ fn read_cbuf<T: bytemuck::Pod + Default>(
 
 /// Where a stage reads its resources from.
 struct StageSources<'a> {
-    gmmu: &'a lichii_gpu::gmmu::Gmmu,
+    gmmu: &'a Arc<lichii_gpu::gmmu::Gmmu>,
     cbufs: &'a [ConstBufferBinding],
     /// Root table 0, which NVN2 graphics programs read as constant buffer slot 17.
     root_table: Option<&'a [u32; 64]>,
@@ -2007,7 +2004,6 @@ impl VulkanRasterizer {
             })
             .flatten()
             .map(|header| TextureKey {
-                gmmu: std::ptr::from_ref(src.gmmu) as usize,
                 header,
                 ty: desc.ty,
                 checked: desc.handle_program.is_some(),
@@ -2015,8 +2011,11 @@ impl VulkanRasterizer {
             });
         let memory = src.gmmu.generation();
         let memo = &mut self.draw.bound_textures;
-        if memo.cache != self.texture_cache.generation() {
+        if memo.cache != self.texture_cache.generation()
+            || memo.gmmu.as_ptr() != Arc::as_ptr(src.gmmu)
+        {
             memo.cache = self.texture_cache.generation();
+            memo.gmmu = Arc::downgrade(src.gmmu);
             memo.bound.clear();
         }
         if let Some(bound) = key.and_then(|key| memo.bound.get(&key).copied())

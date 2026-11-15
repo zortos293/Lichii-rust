@@ -2124,19 +2124,44 @@ fn draws_sample_what_their_texture_alias_rendered_since_they_last_sampled_it() {
     f.assert_no_validation_errors();
 }
 
-/// Releasing a channel forgets the textures draws bound through its GMMU, which another may
-/// replace at the same address.
+/// An address space with the texture pages at `TEXTURE` backed by `backing`, after as many
+/// mapping changes as any other.
+fn texture_space(f: &Fixture, backing: u64) -> Arc<Gmmu> {
+    let gmmu = Arc::new(Gmmu::new(
+        f.memory.clone(),
+        lichii_gpu::gmmu::BigPageSize::Size64K,
+    ));
+    gmmu.map(GPU_VA, DADDR, 16 << 20, 0, false).unwrap();
+    gmmu.map(GPU_VA + TEXTURE, DADDR + backing, 0x1_0000, 0, false)
+        .unwrap();
+    gmmu
+}
+
+/// A draw through a new address space samples what it maps, though the texture header and the
+/// mapping generation match those a draw sampled through an address space now freed.
 #[test]
-fn released_channels_forget_the_textures_draws_bound() {
-    let Some((mut f, gmmu)) = draw_fixture() else {
+fn draws_through_a_new_address_space_sample_what_it_maps() {
+    let Some((mut f, _)) = draw_fixture() else {
         return;
     };
     write(&f, PROGRAMS + u64::from(FRAGMENT), &sampling_program());
+    uniform_texture(&f, 0, OTHER_TEXTURE, [5, 6, 250, 255]);
     uniform_texture(&f, 0, TEXTURE, [10, 200, 30, 255]);
-    draw(&mut f, &gmmu, &sampling_regs());
-    assert_eq!(f.rasterizer.draw.bound_textures.bound.len(), 1);
+    let regs = sampling_regs();
+    let first = texture_space(&f, TEXTURE);
+    draw(&mut f, &first, &regs);
+    assert_eq!(target(&mut f)[0], [10, 200, 30, 255]);
+    let freed = Arc::as_ptr(&first);
+    drop(first);
     f.rasterizer.release_channel(ChannelId(0));
-    assert!(f.rasterizer.draw.bound_textures.bound.is_empty());
+    let second = texture_space(&f, OTHER_TEXTURE);
+    assert_ne!(
+        Arc::as_ptr(&second),
+        freed,
+        "the renderer still holds the freed address space's allocation"
+    );
+    draw(&mut f, &second, &regs);
+    assert_eq!(target(&mut f)[0], [5, 6, 250, 255]);
     f.assert_no_validation_errors();
 }
 
