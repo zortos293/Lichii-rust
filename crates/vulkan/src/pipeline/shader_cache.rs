@@ -413,6 +413,12 @@ impl ShaderCache {
         let module = match stored {
             Some((module, after)) => {
                 self.stats.disk_hits += 1;
+                if super::shader_workers::diag_shader_listed(module.hash) {
+                    let (start, len) = env.code_range();
+                    let mut code = Vec::new();
+                    hash_program(env.gmmu(), start, len, &mut code);
+                    super::shader_workers::diag_dump_shader(module.hash, env, options, &code);
+                }
                 *bindings = after;
                 Some(module)
             }
