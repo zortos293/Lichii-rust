@@ -16,6 +16,8 @@ pub(crate) struct DrawDiag {
     to: Duration,
     seq: u64,
     always: u32,
+    frames: Option<u32>,
+    presents: u32,
     pub active: bool,
     pub line: String,
 }
@@ -246,6 +248,10 @@ pub(crate) fn state() -> Option<&'static Mutex<DrawDiag>> {
                 to: secs("LICHII_DRAW_DIAG_TO").unwrap_or(Duration::MAX),
                 seq: 0,
                 always: 0,
+                frames: std::env::var("LICHII_DRAW_DIAG_FRAMES")
+                    .ok()
+                    .and_then(|v| v.trim().parse().ok()),
+                presents: 0,
                 active: false,
                 line: String::new(),
             }))
@@ -259,7 +265,7 @@ impl DrawDiag {
             let _ = writeln!(self.out, "{} END=aborted", self.line);
         }
         let t = now();
-        self.active = t >= self.from && t <= self.to;
+        self.active = self.in_window();
         if self.active {
             self.seq += 1;
             self.line.clear();
@@ -277,7 +283,11 @@ impl DrawDiag {
 
     pub(crate) fn in_window(&self) -> bool {
         let t = now();
-        t >= self.from && t <= self.to
+        t >= self.from
+            && match self.frames {
+                Some(n) => self.presents < n,
+                None => t <= self.to,
+            }
     }
 
     /// Writes `text` whatever the window, up to a fixed number of lines.
@@ -291,7 +301,13 @@ impl DrawDiag {
 
     pub(crate) fn event(&mut self, text: &str) {
         let t = now();
-        if t >= self.from && t <= self.to + Duration::from_secs(1) {
+        let open = self.in_window();
+        if text.starts_with("PRESENT") && t >= self.from {
+            self.presents += 1;
+        }
+        if open
+            || (self.frames.is_none() && t >= self.from && t <= self.to + Duration::from_secs(1))
+        {
             let _ = writeln!(self.out, "{text} t={:.4}", t.as_secs_f64());
             let _ = self.out.flush();
         }
@@ -681,7 +697,10 @@ impl VulkanRasterizer {
                 let mut floats: Vec<String> = Vec::with_capacity(n);
                 let mut fault = false;
                 for chunk in 0..n.div_ceil(64) {
-                    match ctx.memory.read::<[u32; 64]>(cb.address + chunk as u64 * 256) {
+                    match ctx
+                        .memory
+                        .read::<[u32; 64]>(cb.address + chunk as u64 * 256)
+                    {
                         Ok(words) => floats.extend(
                             words[..(n - chunk * 64).min(64)]
                                 .iter()
