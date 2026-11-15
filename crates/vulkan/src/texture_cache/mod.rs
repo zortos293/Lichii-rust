@@ -1287,13 +1287,9 @@ impl TextureCache {
         };
         image.gpu_modified = true;
         image.cpu_dirty = false;
-<<<<<<< HEAD
-        image.modified = tick;
         if diag_watched(&image.info) {
             diag_watch_log("mark_modified", format!("{id:?} {:?}", image.info));
         }
-=======
->>>>>>> origin/main
         image.written = tick;
         image.current = tick;
         image.keep_out.clear();
@@ -2436,7 +2432,7 @@ impl TextureCache {
                 o.modified > current
             })
         }));
-<<<<<<< HEAD
+        self.image(id).overlaps_newest = newest;
         if !newer.is_empty() {
             let image = self.get(id).expect("a live image id");
             let watched = diag_watched(&image.info)
@@ -2459,9 +2455,6 @@ impl TextureCache {
                 );
             }
         }
-=======
-        self.image(id).overlaps_newest = newest;
->>>>>>> origin/main
         if newer.is_empty() || self.sync_on_gpu(tx, id, &mut newer)? {
             self.overlap_scratch = newer;
             return Ok(());
