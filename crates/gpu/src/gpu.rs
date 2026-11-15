@@ -408,10 +408,26 @@ impl Gpu {
         renderer: impl FnOnce(GpuHandles) -> Box<dyn Rasterizer>,
     ) -> Self {
         let timestamp = Arc::new(GpuTimestamp::new(time, config.console == Console::Switch2));
-        match std::env::var("LICHII_DIAG_GPU_CLOCK").as_deref() {
-            Ok("boost") => timestamp.set_speed(crate::clock::GpuClockSpeed::Boost),
-            Ok("overclock") => timestamp.set_speed(crate::clock::GpuClockSpeed::Overclock),
-            _ => {}
+        let speed = match std::env::var("LICHII_DIAG_GPU_CLOCK").as_deref() {
+            Ok("boost") => Some(crate::clock::GpuClockSpeed::Boost),
+            Ok("overclock") => Some(crate::clock::GpuClockSpeed::Overclock),
+            _ => None,
+        };
+        let at = std::env::var("LICHII_DIAG_GPU_CLOCK_AT")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok());
+        if let Some(speed) = speed {
+            match at {
+                Some(secs) => {
+                    let clock = timestamp.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs_f64(secs));
+                        clock.set_speed(speed);
+                        tracing::info!(?speed, secs, "diag: GPU clock speed changed");
+                    });
+                }
+                None => timestamp.set_speed(speed),
+            }
         }
         let handles = GpuHandles {
             device: host1x.memory.clone(),
