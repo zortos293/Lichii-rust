@@ -35,7 +35,8 @@ jobs:
         run: |
           sudo apt-get update
           libavcodec=$(apt-cache pkgnames libavcodec | grep -E '^libavcodec[0-9]+(t64)?$' | sort -V | tail -1)
-          sudo apt-get install -y libvulkan-dev mesa-vulkan-drivers libudev-dev libasound2-dev "$libavcodec" libxkbcommon-dev libwayland-dev spirv-tools
+          sudo apt-get install -y libvulkan-dev mesa-vulkan-drivers libudev-dev libasound2-dev "$libavcodec" libxkbcommon-dev libwayland-dev spirv-tools vulkan-validationlayers
+          echo LICHII_REQUIRE_VALIDATION=1 >> "$GITHUB_ENV"
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Fetch FFmpeg
@@ -48,3 +49,8 @@ jobs:
         env:
           LICHII_REQUIRE_FFMPEG: 1
           LICHII_FFMPEG_DIR: ${{ github.workspace }}/ffmpeg
+      - name: Show the Vulkan validation layer is active
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo test --workspace --test foundation selects_devices_by_name_and_falls_back -- --nocapture 2>&1 | tee /dev/stderr | grep 'validation layers: true'

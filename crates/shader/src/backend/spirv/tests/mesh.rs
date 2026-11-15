@@ -2,7 +2,9 @@
 //! emulation's vertex and distribution modules, and the software TENSOR_MUL_ADD.
 
 use rspirv::dr;
-use rspirv::spirv::{BuiltIn, Capability, Decoration, ExecutionMode, ExecutionModel, Op};
+use rspirv::spirv::{
+    BuiltIn, Capability, Decoration, ExecutionMode, ExecutionModel, Op, StorageClass,
+};
 
 use super::{Synthetic, count_ops, emit, validate};
 use crate::backend::Bindings;
@@ -275,6 +277,35 @@ fn native_mesh_program_for_every_topology() {
             assert!(builtins.contains(&builtin), "{name}: {builtin:?}");
         }
         assert_eq!(per_primitive_decorations(&module), 4, "{name}");
+    }
+}
+
+#[test]
+fn native_mesh_program_declares_a_task_payload_only_beside_a_task_stage() {
+    for (name, task_stage) in [
+        ("native_mesh_without_task", false),
+        ("native_mesh_with_task", true),
+    ] {
+        let runtime = RuntimeInfo {
+            task_stage,
+            ..RuntimeInfo::default()
+        };
+        let module = emit(
+            name,
+            &mesh_profile(),
+            &runtime,
+            &mesh_program(mesh_info(TOPOLOGY_TRIANGLES)),
+        );
+        let payloads = module
+            .types_global_values
+            .iter()
+            .filter(|i| {
+                i.class.opcode == Op::Variable
+                    && i.operands[0]
+                        == dr::Operand::StorageClass(StorageClass::TaskPayloadWorkgroupEXT)
+            })
+            .count();
+        assert_eq!(payloads, usize::from(task_stage), "{name}");
     }
 }
 
