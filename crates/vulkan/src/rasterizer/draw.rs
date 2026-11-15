@@ -174,12 +174,14 @@ impl<const N: usize> ScalingBits<N> {
 }
 
 /// The state a draw's render targets resolve from that the `RENDER_TARGETS` dirty flag does
-/// not cover: the sample mode, layered rendering, and the GPU mappings and texture cache images
-/// the lookups went through.
+/// not cover: the channel whose flags those are, the sample mode, layered rendering, the depth
+/// target's layer count, and the GPU mappings and texture cache images the lookups went through.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct TargetsKey {
+    channel: ChannelId,
     msaa: u32,
     layered: bool,
+    zeta_size: u32,
     memory: u64,
     cache: u64,
 }
@@ -1235,8 +1237,10 @@ impl VulkanRasterizer {
         let msaa = regs.anti_alias_samples_mode.0;
         let layered = regs.rt_layer.control() == RtLayerControl::GEOMETRY_SHADER_SELECTS_LAYER.0;
         let key = TargetsKey {
+            channel: ctx.channel,
             msaa,
             layered,
+            zeta_size: regs.zeta_size.bits.0,
             memory: ctx.memory.generation(),
             cache: self.texture_cache.generation(),
         };
