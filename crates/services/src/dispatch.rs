@@ -50,6 +50,7 @@ impl<S: Service> SessionHandler for Dispatch<S> {
                 UNKNOWN_COMMAND_ID
             }
         });
+        lichii_common::diag_ring::push(self.service.name(), ctx.command(), result.0);
         if flags.ipc_trace {
             tracing::info!(
                 target: "ipc",
