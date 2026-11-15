@@ -210,7 +210,7 @@ fn shared_runs(
     true
 }
 
-fn barrier(device: &Device, cmd: vk::CommandBuffer) {
+pub(super) fn barrier(device: &Device, cmd: vk::CommandBuffer) {
     let barrier = vk::MemoryBarrier2::default()
         .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
         .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
@@ -226,7 +226,7 @@ fn barrier(device: &Device, cmd: vk::CommandBuffer) {
 }
 
 /// Grows `slot` to at least `size` bytes, retiring the buffer it replaces.
-fn ensure(
+pub(super) fn ensure(
     device: &std::sync::Arc<Device>,
     tx: &mut Transfer<'_>,
     slot: &mut Option<Buffer>,

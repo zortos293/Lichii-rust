@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// Nearest-filtered 2D engine blit between two images of one format, sampling as the software blit
+// does. The source buffer holds the box of source texels the blit may read, box_width texels per
+// row, and the starts are relative to the box. Destination texel (x, y) copies the box texel at
+// (start + i * step) >> 32 per axis, in wrapping 32.32 fixed point, clamped to the box. Texels move
+// as raw words, so the target holds the source's bits.
+
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Src { uint src[]; };
+layout(set = 0, binding = 1) writeonly buffer Dst { uint dst[]; };
+
+layout(push_constant) uniform P {
+    uint dst_width;
+    uint dst_height;
+    uint words;
+    uint box_width;
+    uint box_height;
+    uint padding;
+    uvec2 x0;
+    uvec2 du;
+    uvec2 y0;
+    uvec2 dv;
+} p;
+
+uint sample_index(uint i, uvec2 start, uvec2 step, uint extent) {
+    uint product_hi;
+    uint product_lo;
+    umulExtended(i, step.x, product_hi, product_lo);
+    product_hi += i * step.y;
+    uint carry;
+    uaddCarry(product_lo, start.x, carry);
+    int whole = int(product_hi + start.y + carry);
+    return uint(clamp(whole, 0, int(extent) - 1));
+}
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= p.dst_width || y >= p.dst_height) {
+        return;
+    }
+    uint column = sample_index(x, p.x0, p.du, p.box_width);
+    uint row = sample_index(y, p.y0, p.dv, p.box_height);
+    uint from = (row * p.box_width + column) * p.words;
+    uint to = (y * p.dst_width + x) * p.words;
+    for (uint word = 0u; word < p.words; word++) {
+        dst[to + word] = src[from + word];
+    }
+}

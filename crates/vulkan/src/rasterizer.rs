@@ -7,6 +7,7 @@
 //! dispatches (see [`draw`]).
 
 mod draw;
+mod fence_waiter;
 mod frame_dump;
 mod samples;
 
@@ -47,7 +48,8 @@ use crate::present::{FrameImage, FrameMailbox, GuestFrame};
 use crate::scheduler::Scheduler;
 use crate::staging::StagingRing;
 use crate::texture_cache::{
-    BlitSide, ClearValue, ImageId, ImageInfo, ImageKind, Rect, TextureCache, Traffic, Transfer,
+    BlitSide, ClearValue, ImageId, ImageInfo, ImageKind, NearestSampling, Rect, TextureCache,
+    Traffic, Transfer,
 };
 
 /// The tracing target of the GPU thread's and the presenter's activity lines.
@@ -186,6 +188,7 @@ pub struct VulkanRasterizer {
     gob_layout: GobLayout,
     frames: Vec<Arc<FrameImage>>,
     fences: VecDeque<(u64, Release)>,
+    fence_waiter: Option<fence_waiter::FenceWaiter>,
     samples: samples::SampleCounter,
     unflushed: bool,
     texture_cache: ManuallyDrop<TextureCache>,
@@ -377,6 +380,7 @@ impl VulkanRasterizer {
             gob_layout,
             frames: Vec::new(),
             fences: VecDeque::new(),
+            fence_waiter: None,
             samples,
             unflushed: true,
             texture_cache: ManuallyDrop::new(texture_cache),
@@ -1057,9 +1061,10 @@ impl Rasterizer for VulkanRasterizer {
         if blit.operation != BlitOperation::SrcCopy {
             return false;
         }
-        let Some((src_rect, dst_rect)) = blit_rects(blit) else {
+        let rects = blit_rects(blit);
+        if rects.is_none() && blit.linear_filter {
             return false;
-        };
+        }
         let (Some(src), Some(dst)) = (
             ImageInfo::from_copy_surface(&blit.src, blit.src_format, self.gob_layout),
             ImageInfo::from_copy_surface(&blit.dst, blit.dst_format, self.gob_layout),
@@ -1072,20 +1077,47 @@ impl Rasterizer for VulkanRasterizer {
             memory: &self.handles.device,
             buffers: &mut self.buffer_cache,
         };
-        let blitted = self.texture_cache.blit(
-            &mut tx,
-            memory,
-            &BlitSide {
-                gpu_va: blit.src.address,
-                info: src,
-                rect: src_rect,
+        let blitted = match rects {
+            Some((src_rect, dst_rect)) => self.texture_cache.blit(
+                &mut tx,
+                memory,
+                &BlitSide {
+                    gpu_va: blit.src.address,
+                    info: src,
+                    rect: src_rect,
+                },
+                &BlitSide {
+                    gpu_va: blit.dst.address,
+                    info: dst,
+                    rect: dst_rect,
+                },
+            ),
+            None => match (
+                blit.dst_x0.checked_add(blit.dst_width),
+                blit.dst_y0.checked_add(blit.dst_height),
+            ) {
+                (Some(x1), Some(y1)) => self.texture_cache.gather(
+                    &mut tx,
+                    memory,
+                    blit.src.address,
+                    &src,
+                    &BlitSide {
+                        gpu_va: blit.dst.address,
+                        info: dst,
+                        rect: [blit.dst_x0, blit.dst_y0, x1, y1],
+                    },
+                    &NearestSampling {
+                        x0: blit.src_x0,
+                        y0: blit.src_y0,
+                        du: blit.du_dx,
+                        dv: blit.dv_dy,
+                        width: blit.src.width,
+                        height: blit.src.height,
+                    },
+                ),
+                _ => Ok(false),
             },
-            &BlitSide {
-                gpu_va: blit.dst.address,
-                info: dst,
-                rect: dst_rect,
-            },
-        );
+        };
         match blitted {
             Ok(blitted) => {
                 self.unflushed |= blitted;
@@ -1209,6 +1241,23 @@ impl Rasterizer for VulkanRasterizer {
                     self.samples.resolve(&self.device, range);
                 }
             }
+        }
+        if let Some(waiter) = &mut self.fence_waiter
+            && let Some(&(tick, _)) = self.fences.front()
+            && tick < self.scheduler.tick()
+        {
+            waiter.wait_for(tick);
+        }
+    }
+
+    fn set_fence_wake(&mut self, wake: Box<dyn Fn() + Send + Sync>) {
+        match fence_waiter::FenceWaiter::spawn(
+            self.device.clone(),
+            self.scheduler.shared_timeline(),
+            wake,
+        ) {
+            Ok(waiter) => self.fence_waiter = Some(waiter),
+            Err(error) => tracing::warn!(%error, "no fence wake thread; fences are polled"),
         }
     }
 
@@ -2068,6 +2117,38 @@ mod tests {
         f.rasterizer.release_fences(true);
         assert!(!f.rasterizer.has_pending_fences());
         assert_eq!(f.syncpoints.guest().value(4).unwrap(), 1);
+    }
+
+    #[test]
+    fn fence_wake_fires_once_the_timeline_reaches_the_tick() {
+        let Some(f) = fixture(GobLayout::Tegra) else {
+            return;
+        };
+        let device = f.rasterizer.device.clone();
+        let timeline = Scheduler::new(&device).unwrap().shared_timeline();
+        let (woke, wakes) = std::sync::mpsc::channel();
+        let woke = std::sync::Mutex::new(woke);
+        let mut waiter = fence_waiter::FenceWaiter::spawn(
+            device.clone(),
+            timeline.clone(),
+            Box::new(move || woke.lock().unwrap().send(()).unwrap()),
+        )
+        .unwrap();
+        waiter.wait_for(1);
+        assert!(
+            wakes
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "no wake before the timeline reaches the tick"
+        );
+        let signal = vk::SemaphoreSignalInfo::default()
+            .semaphore(timeline.raw())
+            .value(1);
+        // SAFETY: nothing submitted signals this timeline; the host moves it to 1.
+        unsafe { device.raw.signal_semaphore(&signal).unwrap() };
+        wakes
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the wake fires once the tick is reached");
     }
 
     #[test]

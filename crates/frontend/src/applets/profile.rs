@@ -1,87 +1,50 @@
 //! The profile selector, after Lichii's QtProfileSelectionDialog. acc signs in one user per
-//! boot, the one the Username setting names, so that is the user a title can be given.
+//! boot, the one the Username setting names. As the reference skips its selector when there is
+//! a single user, the title gets that user without a dialog; the dialog only shows when the
+//! title does not allow it.
 
 use crossbeam_channel::Sender;
 use egui::{Key, RichText};
 use lichii_services::applets::{ProfileSelectAnswer, ProfileSelectRequest};
 
+/// The signed-in user, unless the title does not allow it.
+pub(super) fn selectable_user(request: &ProfileSelectRequest) -> Option<[u8; 16]> {
+    request
+        .current_user
+        .filter(|uid| *uid != [0; 16] && !request.invalid_users.contains(uid))
+}
+
+/// Tells the user that no user can be chosen, and cancels.
 pub(super) struct ProfileDialog {
     request: ProfileSelectRequest,
     pub reply: Sender<ProfileSelectAnswer>,
-    /// The signed-in user, unless the title does not allow it.
-    user: Option<[u8; 16]>,
-    nickname: String,
-    selected: bool,
 }
 
 impl ProfileDialog {
-    pub fn new(
-        request: ProfileSelectRequest,
-        reply: Sender<ProfileSelectAnswer>,
-        nickname: &str,
-    ) -> Self {
-        let user = request
-            .current_user
-            .filter(|uid| *uid != [0; 16] && !request.invalid_users.contains(uid));
-        Self {
-            selected: user.is_some(),
-            user,
-            nickname: nickname.to_owned(),
-            request,
-            reply,
-        }
+    pub fn new(request: ProfileSelectRequest, reply: Sender<ProfileSelectAnswer>) -> Self {
+        Self { request, reply }
     }
 
     pub fn show(&mut self, ctx: &egui::Context) -> Option<ProfileSelectAnswer> {
-        let (enter, escape) =
-            ctx.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
-        let mut clicked = None;
+        let mut cancel = ctx.input(|i| i.key_pressed(Key::Escape));
         egui::Modal::new(egui::Id::unique("profile selector")).show(ctx, |ui| {
             ui.set_width(360.0);
             ui.heading(title(self.request.mode));
             ui.label(instruction(self.request.purpose));
             ui.add_space(6.0);
-            match self.user {
-                Some(uid) => {
-                    let text = format!("{}\n{}", self.nickname, uid_text(&uid));
-                    let row = ui.selectable_label(self.selected, text);
-                    if row.clicked() {
-                        self.selected = true;
-                    }
-                    if row.double_clicked() {
-                        clicked = Some(true);
-                    }
-                }
-                None => {
-                    ui.label(
-                        RichText::new(
-                            "No user can be chosen. Lichii signs in the user the Username \
-                             setting names, and this title does not allow that user.",
-                        )
-                        .weak(),
-                    );
-                }
-            }
+            ui.label(
+                RichText::new(
+                    "No user can be chosen. Lichii signs in the user the Username setting \
+                     names, and this title does not allow that user.",
+                )
+                .weak(),
+            );
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("Cancel").clicked() {
-                    clicked = Some(false);
-                }
-                if ui
-                    .add_enabled(self.selected, egui::Button::new("OK"))
-                    .clicked()
-                {
-                    clicked = Some(true);
-                }
-            });
+            if ui.button("Cancel").clicked() {
+                cancel = true;
+            }
         });
-        let ok = clicked
-            .or((enter && self.selected).then_some(true))
-            .or(escape.then_some(false))?;
-        Some(match (ok, self.user) {
-            (true, Some(uid)) => ProfileSelectAnswer::Selected(uid),
-            _ => ProfileSelectAnswer::Cancelled,
-        })
+        cancel.then_some(ProfileSelectAnswer::Cancelled)
     }
 }
 
@@ -111,10 +74,6 @@ fn instruction(purpose: u32) -> &'static str {
     }
 }
 
-fn uid_text(uid: &[u8; 16]) -> String {
-    uid.iter().map(|b| format!("{b:02X}")).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::thread::JoinHandle;
@@ -136,22 +95,12 @@ mod tests {
     }
 
     #[test]
-    fn enter_selects_the_signed_in_user() {
+    fn the_signed_in_user_is_selected_without_a_dialog() {
         let mut ui = Harness::new();
-        let answer = select(&ui, request());
+        let answer = ui.dialogs.frontend().select_profile(&request());
+        assert_eq!(answer, ProfileSelectAnswer::Selected(USER));
         ui.frame(Vec::new());
-        ui.key(Key::Enter);
-        assert_eq!(answer.join().unwrap(), ProfileSelectAnswer::Selected(USER));
         assert!(!ui.dialogs.is_open());
-    }
-
-    #[test]
-    fn escape_cancels() {
-        let mut ui = Harness::new();
-        let answer = select(&ui, request());
-        ui.frame(Vec::new());
-        ui.key(Key::Escape);
-        assert_eq!(answer.join().unwrap(), ProfileSelectAnswer::Cancelled);
     }
 
     #[test]

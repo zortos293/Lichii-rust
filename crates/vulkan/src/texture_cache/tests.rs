@@ -2128,6 +2128,171 @@ fn blits_from_guest_data_stay_in_software() {
 }
 
 #[test]
+fn nearest_blits_gather_the_texels_the_software_blit_samples_on_the_gpu() {
+    let gob = GobLayout::Tegra;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let info = |format: PixelFormat, width: u32, height: u32| {
+        let s = surface(format, width, height, 1, 1, 2, gob);
+        ImageInfo {
+            format,
+            layer_stride: s.layer_stride(),
+            ..rt_info(width, height, 2, gob)
+        }
+    };
+    const UNIT: i64 = 1 << 32;
+    let quarter = NearestSampling {
+        x0: 0,
+        y0: -0x0144_0000,
+        du: 4 * UNIT,
+        dv: 0x4_0288_0000,
+        width: 64,
+        height: 64,
+    };
+    let narrower = NearestSampling {
+        width: 50,
+        ..quarter
+    };
+    let clamped = NearestSampling {
+        x0: -3 * UNIT / 2,
+        y0: UNIT / 4,
+        du: 3 * UNIT,
+        dv: UNIT / 4,
+        width: 64,
+        height: 64,
+    };
+    for (format, sampling) in [
+        (PixelFormat::A8B8G8R8Unorm, quarter),
+        (PixelFormat::R32Float, narrower),
+        (PixelFormat::R16G16B16A16Float, clamped),
+        (PixelFormat::R32G32B32A32Float, quarter),
+    ] {
+        let (sw, sh, dw, dh) = (64u32, 64u32, 16u32, 16u32);
+        let src = info(format, sw, sh);
+        let dst = info(format, 24, 20);
+        let dst_va = GPU_VA + (128 << 10);
+        let bytes = format.bytes_per_block() as usize;
+        let s = surface(format, sw, sh, 1, 1, 2, gob);
+        let data = level_data(&s, format as u32);
+        write_surface(&f.memory, &s, &data);
+        let (mut tx, cache, gmmu) = f.tx();
+        let source = cache
+            .render_target(&mut tx, gmmu, GPU_VA, &src, false)
+            .unwrap()
+            .unwrap();
+        cache.mark_modified(source.id);
+        let rect = [3, 2, 3 + dw as i32, 2 + dh as i32];
+        let before = f.cache.traffic();
+        let (mut tx, cache, gmmu) = f.tx();
+        let blitted = cache
+            .gather(
+                &mut tx,
+                gmmu,
+                GPU_VA,
+                &src,
+                &blit_side(dst_va, dst, rect),
+                &sampling,
+            )
+            .unwrap();
+        assert!(blitted, "{format:?}");
+        assert_eq!(
+            f.cache.traffic().downloads,
+            before.downloads,
+            "{format:?}: no write-back"
+        );
+        let (mut tx, cache, gmmu) = f.tx();
+        let target = cache.find(&mut tx, gmmu, dst_va, &dst).unwrap().unwrap();
+        let texels = f.read_image(target.id).remove(0);
+        let index = |start: i64, step: i64, i: usize, count: u32, extent: u32| {
+            let first = (start >> 32).max(0);
+            let end = ((start + step * i64::from(count)) >> 32).min(i64::from(extent));
+            ((start + step * i as i64) >> 32).clamp(first, end - 1) as usize
+        };
+        for y in 0..dh as usize {
+            let row = index(sampling.y0, sampling.dv, y, dh, sampling.height);
+            for x in 0..dw as usize {
+                let column = index(sampling.x0, sampling.du, x, dw, sampling.width);
+                let from = (row * sw as usize + column) * bytes;
+                let to = ((y + 2) * 24 + x + 3) * bytes;
+                assert_eq!(
+                    texels[to..to + bytes],
+                    data[0][from..from + bytes],
+                    "{format:?}: texel ({x}, {y}) should be source ({column}, {row})"
+                );
+            }
+        }
+        f.cache.unmap(&mut f.scheduler, DADDR, 1 << 20);
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn nearest_blits_the_gather_cannot_do_go_to_software() {
+    let gob = GobLayout::Tegra;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let src = rt_info(64, 64, 2, gob);
+    clear_rt(&mut f, &src, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let sampling = NearestSampling {
+        x0: 0,
+        y0: 0,
+        du: 4 << 32,
+        dv: 4 << 32,
+        width: 64,
+        height: 64,
+    };
+    let integer = ImageInfo {
+        format: PixelFormat::A8B8G8R8Uint,
+        ..rt_info(16, 16, 2, gob)
+    };
+    let reversed = NearestSampling {
+        x0: 63 << 32,
+        du: -(4 << 32),
+        ..sampling
+    };
+    let wrapping = NearestSampling {
+        du: 1 << 62,
+        ..sampling
+    };
+    let small = rt_info(16, 16, 2, gob);
+    let (mut tx, cache, gmmu) = f.tx();
+    for (dst, rect, sampling, why) in [
+        (integer, [0, 0, 16, 16], sampling, "another format"),
+        (src, [0, 0, 16, 16], sampling, "one image on both sides"),
+        (
+            small,
+            [0, 0, 17, 16],
+            sampling,
+            "a rectangle leaving its image",
+        ),
+        (small, [0, 0, 16, 16], reversed, "a reversed step"),
+        (small, [0, 0, 16, 16], wrapping, "a step whose end wraps"),
+    ] {
+        let va = if why == "one image on both sides" {
+            GPU_VA
+        } else {
+            GPU_VA + (64 << 10)
+        };
+        assert!(
+            !cache
+                .gather(
+                    &mut tx,
+                    gmmu,
+                    GPU_VA,
+                    &src,
+                    &blit_side(va, dst, rect),
+                    &sampling
+                )
+                .unwrap(),
+            "{why}"
+        );
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
 fn narrower_block_linear_textures_alias_their_render_target_without_a_flush() {
     let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
         return;
