@@ -664,6 +664,63 @@ impl VulkanRasterizer {
             regs.viewports[0].depth_range_near,
             regs.viewports[0].depth_range_far,
         );
+        let sc = &regs.scissor_test[0];
+        let _ = write!(
+            s,
+            " VP[s={},{} t={},{} swz={:?}/{:?}/{:?}/{:?} origin={:?} clip={}x{} sc={}:{}..{},{}..{}]",
+            vt.scale_x,
+            vt.scale_y,
+            vt.translate_x,
+            vt.translate_y,
+            vt.swizzle.x(),
+            vt.swizzle.y(),
+            vt.swizzle.z(),
+            vt.swizzle.w(),
+            regs.window_origin.mode(),
+            regs.surface_clip.bits.width(),
+            regs.surface_clip.bits1.height(),
+            sc.enable,
+            sc.min_x(),
+            sc.max_x(),
+            sc.min_y(),
+            sc.max_y(),
+        );
+        let ib = &regs.index_buffer;
+        let _ = write!(
+            s,
+            " IB[{:#x} fmt={:?} first={} count={} basev={}]",
+            (u64::from(ib.start_addr_high) << 32) | u64::from(ib.start_addr_low),
+            ib.format,
+            ib.first,
+            ib.count,
+            regs.global_base_vertex_index,
+        );
+        for (i, a) in regs.vertex_attrib_format.iter().enumerate().take(16) {
+            if a.size() == lichii_gpu::engines::maxwell_3d::regs::VertexAttributeSize::INVALID {
+                continue;
+            }
+            let _ = write!(
+                s,
+                " A{i}[b={} c={} o={} {:?} {:?}]",
+                a.buffer(),
+                a.constant(),
+                a.offset(),
+                a.size(),
+                a.type_()
+            );
+        }
+        for (i, v) in regs.vertex_streams.iter().enumerate().take(16) {
+            if v.bits.enable() == 0 {
+                continue;
+            }
+            let _ = write!(
+                s,
+                " VS{i}[{:#x} stride={} freq={}]",
+                v.address(),
+                v.bits.stride(),
+                v.frequency
+            );
+        }
         let max_words: usize = std::env::var("LICHII_DIAG_CB_WORDS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -681,7 +738,10 @@ impl VulkanRasterizer {
                 let mut floats: Vec<String> = Vec::with_capacity(n);
                 let mut fault = false;
                 for chunk in 0..n.div_ceil(64) {
-                    match ctx.memory.read::<[u32; 64]>(cb.address + chunk as u64 * 256) {
+                    match ctx
+                        .memory
+                        .read::<[u32; 64]>(cb.address + chunk as u64 * 256)
+                    {
                         Ok(words) => floats.extend(
                             words[..(n - chunk * 64).min(64)]
                                 .iter()
