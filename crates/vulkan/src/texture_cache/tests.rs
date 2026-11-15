@@ -3666,3 +3666,290 @@ fn level_and_face_targets_render_into_the_mipmapped_cube_sampled_before_them() {
         }
     }
 }
+
+/// A single-layer block-linear colour target as a draw's register state gives it.
+fn mkw_target(format: u32, w: u32, h: u32, bh: u32, array_pitch: u32, gob: GobLayout) -> ImageInfo {
+    use lichii_gpu::engines::maxwell_3d::regs::{RenderTargetConfig, TileMode};
+    let mut rt: RenderTargetConfig = bytemuck::Zeroable::zeroed();
+    rt.address_low = 0x10_0000;
+    rt.width = w;
+    rt.height = h;
+    rt.format = format;
+    rt.tile_mode = TileMode(bh << 4);
+    rt.bits.0 = 1;
+    rt.array_pitch = array_pitch;
+    ImageInfo::from_render_target(&rt, 0, gob).unwrap()
+}
+
+/// Mario Kart World's light-probe cube array: two B10G11R11 128x128 cubes of 4 levels, 12
+/// layers 0x16000 apart. Each draw renders one level of one cube with its six faces bound as
+/// C0..C5, every face a single-layer target at its layer and level offset; the forward
+/// shaders then sample the whole cube array.
+fn mkw_cube_array(gob: GobLayout) -> (TicEntry, ImageInfo) {
+    let mut header = tic(0x21, GPU_VA, 128, 128, 2, 4, 4);
+    header.0[0] = (header.0[0] & !(0xfff << 7)) | 7 << 7 | 7 << 10 | 7 << 13 | 7 << 16;
+    header.0[4] = (header.0[4] & !(0xf << 23)) | 8 << 23;
+    let desc = header.decode().unwrap();
+    assert_eq!(desc.texture_type, TextureType::CubeArray);
+    let array = ImageInfo::from_texture(&desc, gob).unwrap();
+    assert_eq!((array.layers, array.levels), (12, 4));
+    assert_eq!(array.layer_stride, 0x16000, "{gob:?}");
+    assert_eq!(
+        [1, 2, 3].map(|l| array.subresource_offset(l, 0)),
+        [0x10000, 0x14000, 0x15000],
+        "{gob:?}"
+    );
+    assert_eq!(array.subresource_offset(0, 6), 0x84000, "{gob:?}");
+    (header, array)
+}
+
+/// Renders every level of both cubes as six-target draws, resolving all six faces before
+/// clearing any as a draw binds them. Returns, per subresource, the image, level and layer
+/// each face resolved to.
+fn render_mkw_cube_faces(
+    f: &mut Fixture,
+    array: &ImageInfo,
+    target_bh: impl Fn(u32) -> u32,
+    green: f32,
+    gob: GobLayout,
+) -> Vec<Found> {
+    let layout = array.surface();
+    let mut founds = Vec::new();
+    for cube in 0..2 {
+        for level in 0..4 {
+            let size = 128 >> level;
+            let bh = target_bh(layout.level_tiling(level).block_height_log2);
+            let info = mkw_target(0xe0, size, size, bh, 0x5800, gob);
+            let (mut tx, cache, gmmu) = f.tx();
+            let faces: Vec<Found> = (0..6)
+                .map(|face| {
+                    let address = GPU_VA + array.subresource_offset(level, cube * 6 + face);
+                    cache
+                        .render_target(&mut tx, gmmu, address, &info, false)
+                        .unwrap()
+                        .unwrap()
+                })
+                .collect();
+            for (face, &target) in faces.iter().enumerate() {
+                assert!(
+                    cache.state(target.id).is_some(),
+                    "{gob:?} cube {cube} level {level}: C{face}'s image died resolving the later faces"
+                );
+                let value = ((cube * 6 + face as u32) * 4 + level + 1) as f32 / 64.0;
+                cache
+                    .clear(
+                        &mut tx,
+                        target,
+                        ClearValue::Color {
+                            value: vk::ClearColorValue {
+                                float32: [value, green, 1.0 - value, 1.0],
+                            },
+                            mask: vk::ColorComponentFlags::RGBA,
+                        },
+                        Rect::ALL,
+                        0,
+                        1,
+                    )
+                    .unwrap();
+            }
+            founds.extend(faces);
+        }
+    }
+    founds
+}
+
+/// Whether every subresource of the cube array reads back uniform, nonzero and distinct
+/// from the others and from `before`; the failures as text.
+fn check_mkw_cube(texels: &[Vec<u8>], before: Option<&[Vec<u8>]>) -> Vec<String> {
+    let mut seen = Vec::new();
+    let mut failures = Vec::new();
+    for layer in 0..12 {
+        for level in 0..4 {
+            let i = (layer * 4 + level) as usize;
+            let got = &texels[i];
+            let first = &got[..4];
+            if first.iter().all(|&b| b == 0)
+                || !got.chunks(4).all(|t| t == first)
+                || seen.contains(&first.to_vec())
+                || before.is_some_and(|b| &b[i][..4] == first)
+            {
+                failures.push(format!("layer {layer} level {level} holds {first:?}"));
+            }
+            seen.push(first.to_vec());
+        }
+    }
+    failures
+}
+
+#[test]
+fn mkw_cube_array_faces_rendered_before_the_array_join_it_and_then_render_into_it() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+            return;
+        };
+        let (header, array) = mkw_cube_array(gob);
+        let faces = render_mkw_cube_faces(&mut f, &array, |bh| bh, 0.25, gob);
+        assert!(faces.iter().all(|t| (t.level, t.layer) == (0, 0)));
+        let (id, view) = f.texture(&header);
+        assert_eq!(
+            (view.view_type, view.base_layer, view.layers, view.levels),
+            (vk::ImageViewType::CUBE_ARRAY, 0, 12, 4)
+        );
+        let live: Vec<_> = faces
+            .iter()
+            .filter(|t| t.id != id && f.cache.state(t.id).is_some())
+            .collect();
+        assert!(
+            live.is_empty(),
+            "{gob:?}: face targets left beside the array: {live:?}"
+        );
+        let first = f.read_image(id);
+        let failures = check_mkw_cube(&first, None);
+        assert!(failures.is_empty(), "{gob:?} joined: {failures:#?}");
+        let again = render_mkw_cube_faces(&mut f, &array, |bh| bh, 0.5, gob);
+        for (i, t) in again.iter().enumerate() {
+            let (cube, level, face) = (i as u32 / 24, i as u32 / 6 % 4, i as u32 % 6);
+            assert_eq!(
+                (t.id, t.level, t.layer),
+                (id, level, cube * 6 + face),
+                "{gob:?} cube {cube} level {level} face {face}"
+            );
+        }
+        assert_eq!(f.texture(&header).0, id);
+        let failures = check_mkw_cube(&f.read_image(id), Some(&first));
+        assert!(failures.is_empty(), "{gob:?} second frame: {failures:#?}");
+        f.assert_no_validation_errors();
+    }
+}
+
+#[test]
+fn mkw_cube_array_faces_render_into_the_array_sampled_before_them() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+            return;
+        };
+        let (header, array) = mkw_cube_array(gob);
+        let (id, _) = f.texture(&header);
+        let faces = render_mkw_cube_faces(&mut f, &array, |bh| bh, 0.25, gob);
+        for (i, t) in faces.iter().enumerate() {
+            let (cube, level, face) = (i as u32 / 24, i as u32 / 6 % 4, i as u32 % 6);
+            assert_eq!(
+                (t.id, t.level, t.layer),
+                (id, level, cube * 6 + face),
+                "{gob:?} cube {cube} level {level} face {face}"
+            );
+        }
+        assert_eq!(f.texture(&header).0, id);
+        let failures = check_mkw_cube(&f.read_image(id), None);
+        assert!(failures.is_empty(), "{gob:?}: {failures:#?}");
+        f.assert_no_validation_errors();
+    }
+}
+
+/// The same with every level's targets keeping the base level's block height, as a target
+/// set up from the cube's own header would. The C++ texture cache does not compare block
+/// sizes when it matches a target to a level.
+#[test]
+fn mkw_cube_array_level_targets_at_the_base_block_height_render_into_the_array() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+            return;
+        };
+        let (header, array) = mkw_cube_array(gob);
+        let (id, _) = f.texture(&header);
+        let faces = render_mkw_cube_faces(&mut f, &array, |_| 4, 0.25, gob);
+        let mut failures = Vec::new();
+        for (i, t) in faces.iter().enumerate() {
+            let (cube, level, face) = (i as u32 / 24, i as u32 / 6 % 4, i as u32 % 6);
+            if (t.id, t.level, t.layer) != (id, level, cube * 6 + face) {
+                failures.push(format!("cube {cube} level {level} face {face} -> {t:?}"));
+            }
+        }
+        assert_eq!(f.texture(&header).0, id);
+        failures.extend(check_mkw_cube(&f.read_image(id), None));
+        assert!(failures.is_empty(), "{gob:?} (array {id:?}): {failures:#?}");
+        f.assert_no_validation_errors();
+    }
+}
+
+/// Mario Kart World's 832x466x2 A8B8G8R8 array: each layer is rendered as its own target,
+/// layer 1 at the padded layer stride 0x1a0000, and the pair sampled as a 2D array.
+#[test]
+fn mkw_npot_array_layers_rendered_as_targets_form_and_render_into_the_array() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        for sample_first in [false, true] {
+            let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+                return;
+            };
+            let header = tic(0x08, GPU_VA, 832, 466, 2, 1, 4);
+            let desc = header.decode().unwrap();
+            let array = ImageInfo::from_texture(&desc, gob).unwrap();
+            assert_eq!((array.layers, array.layer_stride), (2, 0x1a0000), "{gob:?}");
+            let info = mkw_target(0xd5, 832, 466, 4, 0x1a0000 / 4, gob);
+            let early = sample_first.then(|| f.texture(&header).0);
+            let render = |f: &mut Fixture, blue: f32| -> Vec<Found> {
+                (0..2u32)
+                    .map(|layer| {
+                        clear_rt_at(
+                            f,
+                            GPU_VA + u64::from(layer) * 0x1a0000,
+                            &info,
+                            [(layer + 1) as f32 / 4.0, 0.0, blue, 1.0],
+                            Rect::ALL,
+                        )
+                    })
+                    .collect()
+            };
+            let founds = render(&mut f, 0.25);
+            let (id, view) = f.texture(&header);
+            let case = format!("{gob:?} sample_first {sample_first}");
+            assert_eq!(early.unwrap_or(id), id, "{case}");
+            assert_eq!((view.base_layer, view.layers), (0, 2), "{case}");
+            if sample_first {
+                assert_eq!(
+                    founds
+                        .iter()
+                        .map(|t| (t.id, t.level, t.layer))
+                        .collect::<Vec<_>>(),
+                    [(id, 0, 0), (id, 0, 1)],
+                    "{case}"
+                );
+            } else {
+                let live: Vec<_> = founds
+                    .iter()
+                    .filter(|t| t.id != id && f.cache.state(t.id).is_some())
+                    .collect();
+                assert!(
+                    live.is_empty(),
+                    "{case}: targets left beside the array: {live:?}"
+                );
+            }
+            let check = |texels: &[Vec<u8>], blue: u8| {
+                for (layer, got) in texels.iter().enumerate() {
+                    let red = ((layer + 1) as f32 / 4.0 * 255.0).round() as u8;
+                    assert!(
+                        got.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .all(|&t| unorm8_close(t, [red, 0, blue, 255])),
+                        "{case}: layer {layer} holds {:?}",
+                        &got[..4]
+                    );
+                }
+            };
+            check(&f.read_image(id), 64);
+            let again = render(&mut f, 0.75);
+            assert_eq!(
+                again
+                    .iter()
+                    .map(|t| (t.id, t.level, t.layer))
+                    .collect::<Vec<_>>(),
+                [(id, 0, 0), (id, 0, 1)],
+                "{case} second frame"
+            );
+            assert_eq!(f.texture(&header).0, id, "{case}");
+            check(&f.read_image(id), 191);
+            f.assert_no_validation_errors();
+        }
+    }
+}
