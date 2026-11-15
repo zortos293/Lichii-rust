@@ -303,6 +303,13 @@ struct CachedImage {
     /// Tick up to which the image holds what its overlaps wrote: its last GPU write, upload or
     /// whole overwrite. An overlap modified after it makes the shared texels stale.
     current: u64,
+    /// At least the newest `modified` of the overlaps, so a refresh skips scanning them while
+    /// it is no newer than `current`; `u64::MAX` until a scan computes it.
+    overlaps_newest: u64,
+    /// At least the newest `written` of the aliases that wrote since this image took them, so
+    /// a refresh skips scanning them while it is no newer than `written`; `u64::MAX` until a
+    /// scan computes it.
+    aliases_newest: u64,
     /// Device ranges of removed overlaps modified after this image: write-backs skip them.
     keep_out: Vec<(DAddr, DAddr)>,
 }
@@ -334,6 +341,15 @@ impl CachedImage {
             .iter()
             .map(|s| memory.cache_pages(s.daddr, s.size))
             .collect();
+    }
+
+    /// Makes every alias rectangle copy in again on the next refresh, after the image's own
+    /// texels were replaced from guest memory.
+    fn retake_aliases(&mut self) {
+        self.aliases_newest = u64::MAX;
+        for alias in &mut self.aliases {
+            alias.synced = 0;
+        }
     }
 
     /// Guest memory must replace every texel on the next upload.
@@ -557,6 +573,8 @@ pub struct TextureCache {
     removals: u64,
     /// Images created so far; a cached miss is only good until the next one.
     creations: u64,
+    /// Host images replaced by a rescale, and resolution scale changes, so far.
+    replacements: u64,
     ids: Vec<ImageId>,
     joins: Vec<(ImageId, u32, u32)>,
     new_aliases: Vec<Alias>,
@@ -859,6 +877,7 @@ impl TextureCache {
             traffic: Traffic::default(),
             removals: 0,
             creations: 0,
+            replacements: 0,
             ids: Vec::new(),
             joins: Vec::new(),
             new_aliases: Vec::new(),
@@ -898,6 +917,7 @@ impl TextureCache {
     /// next bound as render targets.
     pub fn set_resolution_scale(&mut self, scale: ResolutionScale) {
         self.scale = scale;
+        self.replacements += 1;
     }
 
     pub fn resolution_scale(&self) -> ResolutionScale {
@@ -964,6 +984,35 @@ impl TextureCache {
     /// cannot reuse, so ids taken before a lookup that changes this may name removed images.
     pub fn removals(&self) -> u64 {
         self.removals
+    }
+
+    /// Changes whenever an image is created or removed or its host image is replaced: an image
+    /// id, lookup result or view taken while this stays the same is still current.
+    pub fn generation(&self) -> u64 {
+        self.creations + self.removals + self.replacements
+    }
+
+    /// Whether [`TextureCache::render_target`] would return `id` as it is: it holds every
+    /// write of its guest bytes, overlaps and aliases, at the scale the rules give it. Marks it
+    /// used this frame when it does.
+    pub fn keep_target(&mut self, id: ImageId) -> bool {
+        let Some(image) = self.get(id) else {
+            return false;
+        };
+        let scale = if self.can_rescale(id) {
+            self.scale
+        } else {
+            ResolutionScale::X1
+        };
+        let kept = !image.image.is_sparse()
+            && !image.cpu_dirty
+            && image.overlaps_newest <= image.current
+            && image.aliases_newest <= image.written
+            && image.scale == scale;
+        if kept {
+            self.touch(id);
+        }
+        kept
     }
 
     /// Number of live images.
@@ -1246,10 +1295,29 @@ impl TextureCache {
         };
         image.gpu_modified = true;
         image.cpu_dirty = false;
-        image.modified = tick;
         image.written = tick;
         image.current = tick;
         image.keep_out.clear();
+        let aliases = std::mem::take(&mut image.aliases);
+        for alias in &aliases {
+            if let Some(other) = self.get_mut(alias.id) {
+                other.aliases_newest = other.aliases_newest.max(tick);
+            }
+        }
+        self.image(id).aliases = aliases;
+        self.raise_modified(id, tick);
+    }
+
+    /// Raises `id`'s `modified` to `modified` and its overlaps' `overlaps_newest` with it.
+    fn raise_modified(&mut self, id: ImageId, modified: u64) {
+        let image = self.image(id);
+        image.modified = image.modified.max(modified);
+        let overlaps = std::mem::take(&mut image.overlaps);
+        for &o in &overlaps {
+            let o = self.image(o);
+            o.overlaps_newest = o.overlaps_newest.max(modified);
+        }
+        self.image(id).overlaps = overlaps;
     }
 
     /// The guest CPU wrote `[daddr, daddr + size)`: overlapping images re-upload on next use.
@@ -2164,6 +2232,8 @@ impl TextureCache {
             written: 0,
             overlaps: Vec::new(),
             current: 0,
+            overlaps_newest: u64::MAX,
+            aliases_newest: u64::MAX,
             keep_out: Vec::new(),
         };
         let index = match self.free.pop() {
@@ -2272,6 +2342,7 @@ impl TextureCache {
         image.scale = scale;
         image.access = access;
         tx.scheduler.retire((views, old));
+        self.replacements += 1;
         Ok(())
     }
 
@@ -2306,9 +2377,7 @@ impl TextureCache {
         let image = self.image(id);
         image.cpu_dirty = false;
         image.keep_out.clear();
-        for alias in &mut image.aliases {
-            alias.synced = 0;
-        }
+        image.retake_aliases();
         Ok(())
     }
 
@@ -2316,14 +2385,25 @@ impl TextureCache {
     /// writes back the GPU-modified ones, and its own texels around theirs unless they cover
     /// all of it, then marks the subresources under the overlaps for upload.
     fn take_from_overlaps(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
+        let image = self.get(id).expect("a live image id");
+        let current = image.current;
+        if image.overlaps_newest <= current {
+            return Ok(());
+        }
         let mut newer = std::mem::take(&mut self.overlap_scratch);
         newer.clear();
         let image = self.get(id).expect("a live image id");
-        let current = image.current;
+        let mut newest = 0;
         newer.extend(image.overlaps.iter().copied().filter(|&o| {
-            self.get(o)
-                .is_some_and(|o| o.modified > current && !o.image.is_sparse())
+            self.get(o).is_some_and(|o| {
+                if o.image.is_sparse() {
+                    return false;
+                }
+                newest = newest.max(o.modified);
+                o.modified > current
+            })
         }));
+        self.image(id).overlaps_newest = newest;
         if newer.is_empty() || self.sync_on_gpu(tx, id, &mut newer)? {
             self.overlap_scratch = newer;
             return Ok(());
@@ -2400,15 +2480,24 @@ impl TextureCache {
     /// since this image last took them or wrote itself. Texels an alias only copied in come
     /// straight from the alias that wrote them, which shares them too.
     fn take_from_aliases(&mut self, scheduler: &mut Scheduler, id: ImageId) -> Result<()> {
-        let mut newer = std::mem::take(&mut self.alias_scratch);
-        newer.clear();
         let image = self.get(id).expect("a live image id");
         let written = image.written;
-        newer.extend(image.aliases.iter().copied());
+        if image.aliases_newest <= written {
+            return Ok(());
+        }
+        let mut newer = std::mem::take(&mut self.alias_scratch);
+        newer.clear();
+        newer.extend(self.image(id).aliases.iter().copied());
+        let mut newest = 0;
         newer.retain(|a| {
-            self.get(a.id)
-                .is_some_and(|other| other.gpu_modified && other.written > a.synced.max(written))
+            self.get(a.id).is_some_and(|other| {
+                if other.written > a.synced {
+                    newest = newest.max(other.written);
+                }
+                other.gpu_modified && other.written > a.synced.max(written)
+            })
         });
+        self.image(id).aliases_newest = newest;
         newer.sort_by_key(|a| self.get(a.id).map_or(0, |other| other.written));
         let mut result = Ok(());
         for alias in &newer {
@@ -2419,8 +2508,8 @@ impl TextureCache {
             let other = self.image(alias.id);
             let (tick, modified) = (other.written, other.modified);
             Self::set_synced(other, id, written);
+            self.raise_modified(id, modified);
             let image = self.image(id);
-            image.modified = image.modified.max(modified);
             image.gpu_modified = true;
             Self::set_synced(image, alias.id, tick);
         }
@@ -2455,8 +2544,8 @@ impl TextureCache {
                 tracing::error!(%error, "copying an image into its alias failed");
                 continue;
             }
+            self.raise_modified(alias.id, modified);
             let other = self.image(alias.id);
-            other.modified = other.modified.max(modified);
             other.gpu_modified |= unwritten;
             Self::set_synced(other, id, written);
         }
@@ -2465,6 +2554,9 @@ impl TextureCache {
 
     fn set_synced(image: &mut CachedImage, alias: ImageId, tick: u64) {
         if let Some(link) = image.aliases.iter_mut().find(|a| a.id == alias) {
+            if tick < link.synced {
+                image.aliases_newest = u64::MAX;
+            }
             link.synced = tick;
         }
     }

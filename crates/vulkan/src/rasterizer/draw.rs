@@ -14,12 +14,12 @@ use lichii_common::settings::{Anisotropy, ResolutionScale};
 use lichii_gpu::backend::{
     ChannelId, ComputeContext, ConstBufferBinding, DrawParams, GraphicsContext, IndirectDraw,
 };
-use lichii_gpu::engines::maxwell_3d::Regs;
 use lichii_gpu::engines::maxwell_3d::regs::{
     DepthMode, IndexFormat, PrimitiveTopology, ProvokingVertex, RtLayerControl, StencilOp,
     VertexAttributeType, WindowOriginMode,
 };
 use lichii_gpu::engines::maxwell_3d::regs::{MESH_CONTROL, MESH_SHADER_A};
+use lichii_gpu::engines::maxwell_3d::{Regs, dirty};
 use lichii_shader::backend::Bindings;
 use lichii_shader::backend::spirv::{
     NUM_IMAGE_SCALING_WORDS, NUM_TEXTURE_SCALING_WORDS, RENDER_AREA_LAYOUT_OFFSET,
@@ -173,6 +173,19 @@ impl<const N: usize> ScalingBits<N> {
     }
 }
 
+/// The state a draw's render targets resolve from that the `RENDER_TARGETS` dirty flag does
+/// not cover: the channel whose flags those are, the sample mode, layered rendering, the depth
+/// target's layer count, and the GPU mappings and texture cache images the lookups went through.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TargetsKey {
+    channel: ChannelId,
+    msaa: u32,
+    layered: bool,
+    zeta_size: u32,
+    memory: u64,
+    cache: u64,
+}
+
 /// One bound render target of the current draw.
 #[derive(Clone, Copy)]
 struct Target {
@@ -204,6 +217,9 @@ pub(super) struct DrawState {
     stages: GraphicsShaders,
     colors: [Option<Target>; 8],
     depth: Option<Target>,
+    /// What `colors` and `depth` were resolved from beyond the registers the
+    /// `RENDER_TARGETS` dirty flag covers; `None` until the next resolve.
+    targets_key: Option<TargetsKey>,
     /// The images the last [`PRESENTED`] presents showed. Only a draw into them alone may be
     /// skipped while its program translates or its pipeline builds: one frame shows it missing.
     /// A draw into any other target waits, so no later pass reads a target a skip left stale.
@@ -333,6 +349,7 @@ impl DrawState {
             warned: 0,
             stages: GraphicsShaders::default(),
             colors: [None; 8],
+            targets_key: None,
             depth: None,
             presented: [None; PRESENTED],
             textures: Vec::new(),
@@ -1215,14 +1232,30 @@ impl VulkanRasterizer {
     }
 
     /// Finds the colour and depth targets in the texture cache. `false` skips the draw.
-    fn render_targets(&mut self, ctx: &GraphicsContext<'_>) -> Result<bool> {
+    fn render_targets(&mut self, ctx: &mut GraphicsContext<'_>) -> Result<bool> {
         let regs = ctx.regs;
         let msaa = regs.anti_alias_samples_mode.0;
+        let layered = regs.rt_layer.control() == RtLayerControl::GEOMETRY_SHADER_SELECTS_LAYER.0;
+        let key = TargetsKey {
+            channel: ctx.channel,
+            msaa,
+            layered,
+            zeta_size: regs.zeta_size.bits.0,
+            memory: ctx.memory.generation(),
+            cache: self.texture_cache.generation(),
+        };
+        if !ctx.dirty.is_set(dirty::RENDER_TARGETS) && self.draw.targets_key == Some(key) {
+            let draw = &self.draw;
+            let cache = &mut self.texture_cache;
+            let mut targets = draw.colors.iter().flatten().chain(draw.depth.iter());
+            if targets.all(|t| cache.keep_target(t.id)) {
+                return Ok(true);
+            }
+        }
         let gob = self.texture_cache.gob_layout();
         self.draw.colors = [None; 8];
         self.draw.depth = None;
         let count = (regs.rt_control.count() as usize).min(8);
-        let layered = regs.rt_layer.control() == RtLayerControl::GEOMETRY_SHADER_SELECTS_LAYER.0;
         let layers = |info: ImageInfo| if layered { info } else { info.with_layers(1) };
         let mut tx = Transfer {
             scheduler: &mut self.scheduler,
@@ -1260,6 +1293,11 @@ impl VulkanRasterizer {
         {
             self.draw.depth = Self::target_view(&mut self.texture_cache, found, &info)?;
         }
+        ctx.dirty.clear(dirty::RENDER_TARGETS);
+        self.draw.targets_key = Some(TargetsKey {
+            cache: self.texture_cache.generation(),
+            ..key
+        });
         Ok(true)
     }
 

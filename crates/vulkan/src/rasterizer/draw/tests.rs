@@ -228,7 +228,7 @@ fn draw_with(f: &mut Fixture, gmmu: &Arc<Gmmu>, regs: &Regs, const_buffers: &Gra
 fn present_target(f: &mut Fixture, gmmu: &Arc<Gmmu>, regs: &Regs) {
     let mut dirty = DirtyState::new();
     let root_tables = [[0; 64]; 8];
-    let ctx = GraphicsContext {
+    let mut ctx = GraphicsContext {
         channel: ChannelId(0),
         memory: gmmu,
         regs,
@@ -236,7 +236,7 @@ fn present_target(f: &mut Fixture, gmmu: &Arc<Gmmu>, regs: &Regs) {
         const_buffers: &const_buffers(),
         root_tables: &root_tables,
     };
-    assert!(f.rasterizer.render_targets(&ctx).unwrap());
+    assert!(f.rasterizer.render_targets(&mut ctx).unwrap());
     let id = f.rasterizer.draw.colors[0].as_ref().unwrap().id;
     f.rasterizer.draw.presented(id);
 }
@@ -1128,6 +1128,50 @@ fn cpu_writes_beside_a_render_target_keep_its_texels() {
     f.assert_no_validation_errors();
 }
 
+/// A draw whose render-target registers did not change reuses the resolved targets, and
+/// resolves them again once a guest CPU write reached a target.
+#[test]
+fn unchanged_render_targets_resolve_again_after_a_cpu_write() {
+    const CPU_VA: u64 = 0x1000_0000;
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let space = cpu_space(&f, &[(CPU_VA, 0)], 0x1_0000);
+    let regs = draw_regs();
+    let mut dirty = DirtyState::new();
+    let (const_buffers, root_tables) = (const_buffers(), [[0; 64]; 8]);
+    let mut resolve = |f: &mut Fixture| {
+        let mut ctx = GraphicsContext {
+            channel: ChannelId(0),
+            memory: &gmmu,
+            regs: &regs,
+            dirty: &mut dirty,
+            const_buffers: &const_buffers,
+            root_tables: &root_tables,
+        };
+        assert!(f.rasterizer.render_targets(&mut ctx).unwrap());
+        f.rasterizer.draw.colors[0].unwrap().id
+    };
+    let first = resolve(&mut f);
+    let uploads = f.rasterizer.texture_cache.traffic().uploads;
+    assert_eq!(resolve(&mut f), first);
+    assert_eq!(
+        f.rasterizer.texture_cache.traffic().uploads,
+        uploads,
+        "an unchanged target is reused as it is"
+    );
+    space.write_bytes(CPU_VA, &[0x5a; 16]).unwrap();
+    assert!(f.memory.has_cpu_writes(), "the target's pages are tracked");
+    drain_cpu_writes(&mut f);
+    assert_eq!(resolve(&mut f), first);
+    assert_eq!(
+        f.rasterizer.texture_cache.traffic().uploads,
+        uploads + 1,
+        "the target uploads the CPU's bytes"
+    );
+    f.assert_no_validation_errors();
+}
+
 /// A guest CPU write to a program's bytes comes back through write tracking and translates the
 /// program again, and so does a second write after it was hashed anew.
 #[test]
@@ -1346,7 +1390,7 @@ fn target_layers(f: &mut Fixture) -> [Vec<[u8; 4]>; 2] {
 fn render_targets_of(f: &mut Fixture, gmmu: &Arc<Gmmu>, regs: &Regs) {
     let mut dirty = DirtyState::new();
     let root_tables = [[0; 64]; 8];
-    let ctx = GraphicsContext {
+    let mut ctx = GraphicsContext {
         channel: ChannelId(0),
         memory: gmmu,
         regs,
@@ -1354,7 +1398,7 @@ fn render_targets_of(f: &mut Fixture, gmmu: &Arc<Gmmu>, regs: &Regs) {
         const_buffers: &const_buffers(),
         root_tables: &root_tables,
     };
-    assert!(f.rasterizer.render_targets(&ctx).unwrap());
+    assert!(f.rasterizer.render_targets(&mut ctx).unwrap());
 }
 
 #[test]
