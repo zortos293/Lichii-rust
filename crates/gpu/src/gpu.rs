@@ -35,7 +35,8 @@ pub const DEFAULT_RING_SLOTS: usize = 1 << 20;
 /// How long the front first sleeps while every channel with work waits, doubling up to
 /// [`MAX_POLL`]. A semaphore write that meets a waiter, a syncpoint increment or [`Gpu::wake`]
 /// ends the sleep at once; the poll only catches memory the guest CPU wrote. An idle back polls
-/// the renderer's pending fences at the same pace.
+/// the renderer's pending fences at the same pace, and at once when the renderer's fence wake
+/// fires.
 pub(crate) const MIN_POLL: Duration = Duration::from_micros(50);
 pub(crate) const MAX_POLL: Duration = Duration::from_millis(1);
 /// How long a channel stays suspended, or the front waits for the back, before it is reported.
@@ -422,7 +423,7 @@ impl Gpu {
                 host1x.lazy.clone(),
             )
         });
-        let rasterizer = renderer(handles.clone());
+        let mut rasterizer = renderer(handles.clone());
         let inbox = Arc::new(Inbox::new());
         handles.syncpoints.semaphore_waiters().attach(&inbox);
         let (producer, consumer) = ring::ring(config.ring_slots, MIN_RING_SLOTS);
@@ -431,16 +432,20 @@ impl Gpu {
         let fetch_syncs = Arc::new(FetchSyncs::new(inbox.clone()));
         let activity = handles.activity.clone();
         let stopping = Arc::new(AtomicBool::new(false));
-        let cpu_reads = Arc::new(CpuReads::new(match config.threading {
-            Threading::Split => {
-                let kick = consumer.kick();
-                Box::new(move || kick.kick())
+        let wake = || -> Box<dyn Fn() + Send + Sync> {
+            match config.threading {
+                Threading::Split => {
+                    let kick = consumer.kick();
+                    Box::new(move || kick.kick())
+                }
+                Threading::Single => {
+                    let inbox = inbox.clone();
+                    Box::new(move || inbox.wake())
+                }
             }
-            Threading::Single => {
-                let inbox = inbox.clone();
-                Box::new(move || inbox.wake())
-            }
-        }));
+        };
+        rasterizer.set_fence_wake(wake());
+        let cpu_reads = Arc::new(CpuReads::new(wake()));
         let back = Back::new(
             rasterizer,
             &handles,

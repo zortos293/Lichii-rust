@@ -166,7 +166,8 @@ impl TextureCache {
             );
         }
         transfer_to_all_barrier(&device, cmd);
-        tx.buffers.mark_gpu_written(target.daddr, target.size);
+        tx.buffers
+            .mark_gpu_written(tx.scheduler.tick(), target.daddr, target.size);
         Ok(true)
     }
 

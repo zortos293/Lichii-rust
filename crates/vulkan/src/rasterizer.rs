@@ -7,6 +7,7 @@
 //! dispatches (see [`draw`]).
 
 pub(crate) mod draw;
+mod fence_waiter;
 mod frame_dump;
 mod samples;
 
@@ -37,6 +38,7 @@ use lichii_texture::{Aspect, Numeric, PixelFormat};
 
 use crate::buffer_cache::{BufferBinding, BufferCache, BufferCacheStats};
 use crate::commands::{COLOR_RANGE, ImageAccess, transition};
+use crate::debug::renderdoc::{self, FrameCapture};
 use crate::device::Device;
 use crate::error::Result;
 use crate::format::{Conversion, host_format};
@@ -47,7 +49,8 @@ use crate::present::{FrameImage, FrameMailbox, GuestFrame};
 use crate::scheduler::Scheduler;
 use crate::staging::StagingRing;
 use crate::texture_cache::{
-    BlitSide, ClearValue, ImageId, ImageInfo, ImageKind, Rect, TextureCache, Traffic, Transfer,
+    BlitSide, ClearValue, ImageId, ImageInfo, ImageKind, NearestSampling, Rect, TextureCache,
+    Traffic, Transfer,
 };
 
 /// The tracing target of the GPU thread's and the presenter's activity lines.
@@ -67,6 +70,8 @@ struct Activity {
     submits: u32,
     textures: Traffic,
     buffers: BufferCacheStats,
+    /// Dynamic renderings the scheduler had begun when the line's second started.
+    renderings: u64,
 }
 
 /// Draws skipped while their shaders translated or their pipelines built, draws that waited
@@ -184,6 +189,7 @@ pub struct VulkanRasterizer {
     gob_layout: GobLayout,
     frames: Vec<Arc<FrameImage>>,
     fences: VecDeque<(u64, Release)>,
+    fence_waiter: Option<fence_waiter::FenceWaiter>,
     samples: samples::SampleCounter,
     unflushed: bool,
     texture_cache: ManuallyDrop<TextureCache>,
@@ -193,6 +199,8 @@ pub struct VulkanRasterizer {
     activity: Activity,
     stalls: Stalls,
     frame_dump: Option<frame_dump::FrameDump>,
+    /// RenderDoc captures of whole guest frames, when RenderDoc is loaded.
+    capture: Option<FrameCapture>,
     teardown: Teardown,
 }
 
@@ -373,6 +381,7 @@ impl VulkanRasterizer {
             gob_layout,
             frames: Vec::new(),
             fences: VecDeque::new(),
+            fence_waiter: None,
             samples,
             unflushed: true,
             texture_cache: ManuallyDrop::new(texture_cache),
@@ -383,6 +392,7 @@ impl VulkanRasterizer {
                 draw::diag::init();
                 frame_dump::FrameDump::from_env()
             },
+            capture: renderdoc::get().map(FrameCapture::new),
             teardown: Teardown(Vec::new()),
         })
     }
@@ -612,9 +622,9 @@ impl VulkanRasterizer {
         let height = scale.scale(fb.height).min(state.extent.height);
         let frame = self.frame_image(width, height, &host)?;
         let cmd = self.scheduler.record()?;
-        let Some(source) = self
-            .texture_cache
-            .prepare(cmd, id, ImageAccess::TRANSFER_SRC)
+        let Some(source) =
+            self.texture_cache
+                .prepare(&mut self.scheduler, id, ImageAccess::TRANSFER_SRC)?
         else {
             return Ok(false);
         };
@@ -742,6 +752,7 @@ impl VulkanRasterizer {
             a.since = Some(now);
             a.textures = self.texture_cache.traffic();
             a.buffers = self.buffer_cache.stats();
+            a.renderings = self.scheduler.renderings();
             return;
         };
         if now - since < Duration::from_secs(1) {
@@ -754,6 +765,7 @@ impl VulkanRasterizer {
             seconds = (now - since).as_secs_f32(),
             submits = a.submits,
             draws = a.draws,
+            renderings = self.scheduler.renderings() - a.renderings,
             texture_draws = a.texture_draws,
             clears = a.clears,
             dispatches = a.dispatches,
@@ -777,6 +789,7 @@ impl VulkanRasterizer {
             since: Some(now),
             textures,
             buffers,
+            renderings: self.scheduler.renderings(),
             ..Activity::default()
         };
     }
@@ -1122,9 +1135,10 @@ impl Rasterizer for VulkanRasterizer {
         if blit.operation != BlitOperation::SrcCopy {
             return false;
         }
-        let Some((src_rect, dst_rect)) = blit_rects(blit) else {
+        let rects = blit_rects(blit);
+        if rects.is_none() && blit.linear_filter {
             return false;
-        };
+        }
         let (Some(src), Some(dst)) = (
             ImageInfo::from_copy_surface(&blit.src, blit.src_format, self.gob_layout),
             ImageInfo::from_copy_surface(&blit.dst, blit.dst_format, self.gob_layout),
@@ -1137,20 +1151,47 @@ impl Rasterizer for VulkanRasterizer {
             memory: &self.handles.device,
             buffers: &mut self.buffer_cache,
         };
-        let blitted = self.texture_cache.blit(
-            &mut tx,
-            memory,
-            &BlitSide {
-                gpu_va: blit.src.address,
-                info: src,
-                rect: src_rect,
+        let blitted = match rects {
+            Some((src_rect, dst_rect)) => self.texture_cache.blit(
+                &mut tx,
+                memory,
+                &BlitSide {
+                    gpu_va: blit.src.address,
+                    info: src,
+                    rect: src_rect,
+                },
+                &BlitSide {
+                    gpu_va: blit.dst.address,
+                    info: dst,
+                    rect: dst_rect,
+                },
+            ),
+            None => match (
+                blit.dst_x0.checked_add(blit.dst_width),
+                blit.dst_y0.checked_add(blit.dst_height),
+            ) {
+                (Some(x1), Some(y1)) => self.texture_cache.gather(
+                    &mut tx,
+                    memory,
+                    blit.src.address,
+                    &src,
+                    &BlitSide {
+                        gpu_va: blit.dst.address,
+                        info: dst,
+                        rect: [blit.dst_x0, blit.dst_y0, x1, y1],
+                    },
+                    &NearestSampling {
+                        x0: blit.src_x0,
+                        y0: blit.src_y0,
+                        du: blit.du_dx,
+                        dv: blit.dv_dy,
+                        width: blit.src.width,
+                        height: blit.src.height,
+                    },
+                ),
+                _ => Ok(false),
             },
-            &BlitSide {
-                gpu_va: blit.dst.address,
-                info: dst,
-                rect: dst_rect,
-            },
-        );
+        };
         match blitted {
             Ok(blitted) => {
                 self.unflushed |= blitted;
@@ -1281,6 +1322,23 @@ impl Rasterizer for VulkanRasterizer {
                     self.samples.resolve(&self.device, range);
                 }
             }
+        }
+        if let Some(waiter) = &mut self.fence_waiter
+            && let Some(&(tick, _)) = self.fences.front()
+            && tick < self.scheduler.tick()
+        {
+            waiter.wait_for(tick);
+        }
+    }
+
+    fn set_fence_wake(&mut self, wake: Box<dyn Fn() + Send + Sync>) {
+        match fence_waiter::FenceWaiter::spawn(
+            self.device.clone(),
+            self.scheduler.shared_timeline(),
+            wake,
+        ) {
+            Ok(waiter) => self.fence_waiter = Some(waiter),
+            Err(error) => tracing::warn!(%error, "no fence wake thread; fences are polled"),
         }
     }
 
@@ -1439,10 +1497,6 @@ impl Rasterizer for VulkanRasterizer {
         self.texture_cache.unmap(&mut self.scheduler, addr, size);
     }
 
-    fn invalidate_gpu_caches(&mut self) {
-        self.texture_cache.invalidate_lookups();
-    }
-
     fn barrier(&mut self) {
         let cmd = match self.scheduler.record() {
             Ok(cmd) => cmd,
@@ -1543,6 +1597,13 @@ impl Rasterizer for VulkanRasterizer {
         {
             tracing::error!(%error, "collecting cached images failed");
         }
+        if let Some(capture) = &mut self.capture {
+            capture.presented(|| {
+                if let Err(error) = self.scheduler.flush() {
+                    tracing::error!(%error, "submitting a captured frame failed");
+                }
+            });
+        }
     }
 }
 
@@ -1552,6 +1613,9 @@ impl Drop for VulkanRasterizer {
     fn drop(&mut self) {
         if self.scheduler.finish().is_err() {
             self.device.wait_idle();
+        }
+        if let Some(capture) = &mut self.capture {
+            capture.finish();
         }
         self.draw.destroy(&self.device);
         self.samples.destroy(&self.device);
@@ -1769,6 +1833,16 @@ mod tests {
         regs.scissor_test[0].enable = 1;
         regs.scissor_test[0].bits = ScissorTestBits(x0 | x1 << 16);
         regs.scissor_test[0].bits1 = ScissorTestBits1(y0 | y1 << 16);
+    }
+
+    /// Whether an 8-bit UNORM `texel` matches `want`, where a 128 written from 0.5 may also
+    /// read 127: 0.5 * 255 lies halfway between them and Vulkan lets the conversion round to
+    /// either (NVIDIA stores 127, lavapipe 128).
+    pub(super) fn unorm8_eq(texel: [u8; 4], want: [u8; 4]) -> bool {
+        texel
+            .iter()
+            .zip(want)
+            .all(|(&t, w)| t == w || (w == 128 && t == 127))
     }
 
     pub(super) fn guest_linear(f: &Fixture, address: DAddr, tiling: &Tiling) -> Vec<u8> {
@@ -2022,7 +2096,7 @@ mod tests {
             } else {
                 [0, 128, 255, 255]
             };
-            assert_eq!(*texel, want, "texel ({x}, {y})");
+            assert!(unorm8_eq(*texel, want), "texel ({x}, {y}): {texel:?}");
         }
 
         let depth_va = GPU_VA + 0x10_0000;
@@ -2144,6 +2218,38 @@ mod tests {
     }
 
     #[test]
+    fn fence_wake_fires_once_the_timeline_reaches_the_tick() {
+        let Some(f) = fixture(GobLayout::Tegra) else {
+            return;
+        };
+        let device = f.rasterizer.device.clone();
+        let timeline = Scheduler::new(&device).unwrap().shared_timeline();
+        let (woke, wakes) = std::sync::mpsc::channel();
+        let woke = std::sync::Mutex::new(woke);
+        let mut waiter = fence_waiter::FenceWaiter::spawn(
+            device.clone(),
+            timeline.clone(),
+            Box::new(move || woke.lock().unwrap().send(()).unwrap()),
+        )
+        .unwrap();
+        waiter.wait_for(1);
+        assert!(
+            wakes
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "no wake before the timeline reaches the tick"
+        );
+        let signal = vk::SemaphoreSignalInfo::default()
+            .semaphore(timeline.raw())
+            .value(1);
+        // SAFETY: nothing submitted signals this timeline; the host moves it to 1.
+        unsafe { device.raw.signal_semaphore(&signal).unwrap() };
+        wakes
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the wake fires once the tick is reached");
+    }
+
+    #[test]
     fn fences_and_queries_complete_after_submitted_work() {
         let Some(mut f) = fixture(GobLayout::Tegra) else {
             return;
@@ -2257,7 +2363,10 @@ mod tests {
                 } else {
                     outside
                 };
-                assert_eq!(*texel, want, "format {format:#x}, texel ({x}, {y})");
+                assert!(
+                    unorm8_eq(*texel, want),
+                    "format {format:#x}, texel ({x}, {y}): {texel:?}"
+                );
             }
             f.assert_no_validation_errors();
         }
@@ -2630,7 +2739,8 @@ mod tests {
                     .cmd_fill_buffer(cmd, binding.buffer, binding.offset, 256, 0xabab_abab);
             }
             crate::commands::transfer_to_all_barrier(&r.device, cmd);
-            r.buffer_cache.mark_gpu_written(daddr, 256);
+            r.buffer_cache
+                .mark_gpu_written(r.scheduler.tick(), daddr, 256);
         }
         f.memory.write_bytes(inline, &[7; 256]).unwrap();
         f.rasterizer.invalidate_region(inline, 256);
@@ -2658,10 +2768,10 @@ mod tests {
         );
         let tiling = Tiling::new(width, height, 1, 4, 2, 0, GobLayout::Switch2);
         f.rasterizer.synchronize_region(DADDR + 0x100, 16);
-        assert_eq!(
-            guest_linear(&f, DADDR, &tiling)[..4],
-            [255, 128, 64, 0],
-            "the read lands the target's texels"
+        let texel = guest_linear(&f, DADDR, &tiling)[..4].try_into().unwrap();
+        assert!(
+            unorm8_eq(texel, [255, 128, 64, 0]),
+            "the read lands the target's texels: {texel:?}"
         );
         f.assert_no_validation_errors();
     }
