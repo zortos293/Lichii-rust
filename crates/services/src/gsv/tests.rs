@@ -1710,6 +1710,42 @@ fn video_decoder_writes_decoded_pictures_into_nv12_images() {
 }
 
 #[test]
+fn video_decoder_gives_an_end_of_stream_without_a_picture_the_last_pictures_pts() {
+    if !lichii_video::available() {
+        eprintln!("FFmpeg is not installed; skipping");
+        return;
+    }
+    let vdec = Vdec::open();
+    let (_, pool) = vdec.decoder_pool(1, NV12_IMAGE_SIZE);
+    let fences: Vec<_> = (0..3).map(|i| vdec.hand_out(311, pool + i)).collect();
+    let stream = ivf_frames(include_bytes!(
+        "../../../video/tests/data/quadrants.vp9.ivf"
+    ));
+    for (frame, data) in stream.iter().take(3).enumerate() {
+        let reply = vdec.submit_frame(data, frame as u64 * 33_333);
+        assert_eq!(reply.result, ResultCode::SUCCESS);
+    }
+    let (syncpoint, last) = fences[2];
+    vdec.wait(syncpoint, last);
+    for frame in 0..3u64 {
+        assert_eq!(
+            vdec.output(),
+            Some((pool + frame as u32, 64, frame * 33_333_000, false))
+        );
+    }
+
+    let (_, end) = vdec.hand_out(311, pool);
+    assert_eq!(vdec.submit(u64::MAX, true).result, ResultCode::SUCCESS);
+    vdec.wait(syncpoint, end);
+    assert_eq!(
+        vdec.output(),
+        Some((pool, 1280, 66_666_000, true)),
+        "the end of stream carries the last picture's pts, not the input's u64::MAX"
+    );
+    vdec.close(syncpoint);
+}
+
+#[test]
 fn video_decoder_writes_an_image_only_after_its_release_fence_and_never_after_stop() {
     if !lichii_video::available() {
         eprintln!("FFmpeg is not installed; skipping");
