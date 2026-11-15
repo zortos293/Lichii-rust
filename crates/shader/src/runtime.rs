@@ -108,6 +108,9 @@ pub struct RuntimeInfo {
     /// [`crate::backend::spirv::emit_mesh_emulation_vertex`] to draw. `None` emits native
     /// `SPV_EXT_mesh_shader` stages.
     pub mesh_emulation: Option<MeshEmulation>,
+    /// Native mesh programs: the pipeline has a task stage, whose payload the program reads.
+    /// Without one the payload reads as zero and the program declares no task payload.
+    pub task_stage: bool,
 }
 
 /// Storage buffers (descriptor set 0) of the mesh emulation.

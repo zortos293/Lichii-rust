@@ -61,8 +61,12 @@ unsafe extern "system" fn debug_callback(
 
 impl Instance {
     /// Loads Vulkan and creates an instance. Validation is enabled when `validation` is set
-    /// and the Khronos layer is installed; otherwise it is skipped with a warning.
+    /// and the Khronos layer is installed; otherwise it is skipped with a warning, unless
+    /// `LICHII_REQUIRE_VALIDATION` is set (as CI does), which turns a requested but inactive
+    /// layer into a panic so validation-checking tests cannot pass without it.
     pub fn new(validation: bool, surfaces: SurfaceSupport) -> Result<Self> {
+        let require_validation =
+            validation && std::env::var_os("LICHII_REQUIRE_VALIDATION").is_some();
         #[cfg(test)]
         let serial = test_serial::Token::acquire();
         // SAFETY: loading the system Vulkan library runs its initialisation code, which is
@@ -163,6 +167,11 @@ impl Instance {
                 .ok()
                 .map(|messenger| (loader, messenger))
         });
+        let debug = debug.flatten();
+        assert!(
+            !require_validation || debug.is_some(),
+            "LICHII_REQUIRE_VALIDATION is set but the validation layer is not active (layer installed: {has_layer})"
+        );
         let surface = want_surface.then(|| khr::surface::Instance::new(&entry, &raw));
         let headless = want_headless.then(|| ext::headless_surface::Instance::new(&entry, &raw));
         Ok(Self {
@@ -170,7 +179,7 @@ impl Instance {
             raw,
             surface,
             headless,
-            debug: debug.flatten(),
+            debug,
             labels,
             validation_errors,
             #[cfg(test)]

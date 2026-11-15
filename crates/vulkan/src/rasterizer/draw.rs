@@ -504,6 +504,8 @@ struct StageState {
     color_outputs: [AttributeType; 8],
     noperspective_outputs: u32,
     scaled_noperspective_inputs: bool,
+    /// The previous stage is a task program, so this mesh program reads its payload.
+    task_stage: bool,
 }
 
 impl StageState {
@@ -529,6 +531,7 @@ impl StageState {
             color_outputs: [AttributeType::Float; 8],
             noperspective_outputs: 0,
             scaled_noperspective_inputs: false,
+            task_stage: previous.is_some_and(|m| m.stage == ShaderStage::Task),
         };
         if slot == 1 {
             state.generic_inputs = std::array::from_fn(|i| attribute_type(regs, i));
@@ -573,6 +576,7 @@ impl StageState {
             color_output_types: self.color_outputs,
             noperspective_outputs: self.noperspective_outputs,
             scaled_noperspective_inputs: self.scaled_noperspective_inputs,
+            task_stage: self.task_stage,
             ..RuntimeInfo::default()
         };
         if let Some((func, reference)) = self.alpha_test {

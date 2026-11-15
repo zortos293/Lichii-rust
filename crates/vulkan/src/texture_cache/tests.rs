@@ -2449,6 +2449,91 @@ fn gpu_overlap_syncs_skip_overlaps_of_block_padding_alone() {
 }
 
 #[test]
+fn gpu_overlap_syncs_give_aliased_bytes_to_the_last_source_page() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let info = rt_info(64, 64, 0, GobLayout::Tegra);
+    assert_eq!(info.size_bytes(), 16 << 10);
+    let alias = GPU_VA + DRAM;
+    f.gmmu.map(alias, DADDR + 0x1000, 0x1000, 0, false).unwrap();
+    f.gmmu
+        .map(alias + 0x1000, DADDR + 0x1000, 0x3000, 0, false)
+        .unwrap();
+    let (red, green, blue) = (
+        [1.0, 0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0, 1.0],
+    );
+    let target = clear_rt(&mut f, &info, red, Rect::ALL);
+    clear_rt_at(&mut f, alias, &info, green, Rect::ALL);
+    clear_rt_at(
+        &mut f,
+        alias,
+        &info,
+        blue,
+        Rect {
+            x: 0,
+            y: 16,
+            width: 64,
+            height: 16,
+        },
+    );
+    let syncs = f.cache.traffic().gpu_syncs;
+    let (mut tx, cache, gmmu) = f.tx();
+    let synced = cache
+        .render_target(&mut tx, gmmu, GPU_VA, &info, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(synced.id, target.id);
+    assert!(f.cache.traffic().gpu_syncs > syncs);
+    let texels = f.read_image(target.id).remove(0);
+    let wrong: Vec<(usize, [u8; 4])> = (0..64 * 64)
+        .filter_map(|i| {
+            let expected = match i / 64 {
+                0..16 => [255, 0, 0, 255],
+                16..32 => [0, 0, 255, 255],
+                _ => [0, 255, 0, 255],
+            };
+            let got: [u8; 4] = texels[i * 4..i * 4 + 4].try_into().unwrap();
+            (got != expected).then_some((i, got))
+        })
+        .take(8)
+        .collect();
+    assert!(wrong.is_empty(), "texels differ: {wrong:?}");
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn gpu_overlap_syncs_keep_texels_whose_later_alias_is_padding() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let info = rt_info(16, 16, 4, GobLayout::Tegra);
+    assert_eq!(info.size_bytes(), 8 << 10);
+    let alias = GPU_VA + DRAM;
+    f.gmmu.map(alias, DADDR, 0x1000, 0, false).unwrap();
+    f.gmmu.map(alias + 0x1000, DADDR, 0x1000, 0, false).unwrap();
+    let target = clear_rt(&mut f, &info, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    clear_rt_at(&mut f, alias, &info, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let syncs = f.cache.traffic().gpu_syncs;
+    let (mut tx, cache, gmmu) = f.tx();
+    let synced = cache
+        .render_target(&mut tx, gmmu, GPU_VA, &info, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(synced.id, target.id);
+    assert!(f.cache.traffic().gpu_syncs > syncs);
+    let texels = f.read_image(target.id).remove(0);
+    assert!(
+        texels.chunks(4).all(|t| t == [0, 255, 0, 255]),
+        "the source's texels reach the target: {:?}",
+        &texels[..16]
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
 fn depth_stencil_overlaps_sync_on_the_gpu() {
     let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
         return;
