@@ -42,6 +42,7 @@ pub struct DeviceExtensions {
     pub index_type_uint8: bool,
     pub line_rasterization: bool,
     pub shader_stencil_export: bool,
+    pub maximal_reconvergence: bool,
 }
 
 type ExtensionFlag = fn(&mut DeviceExtensions) -> &mut bool;
@@ -75,6 +76,9 @@ const OPTIONAL_EXTENSIONS: &[(&CStr, ExtensionFlag)] = &[
     (ext::line_rasterization::NAME, |e| &mut e.line_rasterization),
     (ext::shader_stencil_export::NAME, |e| {
         &mut e.shader_stencil_export
+    }),
+    (khr::shader_maximal_reconvergence::NAME, |e| {
+        &mut e.maximal_reconvergence
     }),
 ];
 
@@ -132,6 +136,15 @@ pub struct DeviceFeatures {
     pub storage_buffer_16bit: bool,
     pub uniform_and_storage_buffer_16bit: bool,
     pub demote_to_helper_invocation: bool,
+    /// Compute pipelines can require 32-wide subgroups (`subgroupSizeControl`): guest compute
+    /// shaders then run in the 32-lane warps they were written for. Off with
+    /// `LICHII_COMPUTE_WAVE32=0`.
+    pub compute_subgroup_32: bool,
+    /// `VK_KHR_shader_maximal_reconvergence`: subgroup operations see invocations reconverged
+    /// where the guest warp would be (`LICHII_MAXIMAL_RECONVERGENCE=0` turns it off).
+    pub maximal_reconvergence: bool,
+    /// `maxComputeWorkgroupSubgroups`, the most subgroups a workgroup may span at that size.
+    pub max_compute_workgroup_subgroups: u32,
 }
 
 /// Facts about the physical device the renderer needs at run time.
@@ -345,6 +358,7 @@ impl Device {
         let mut clip_enable = vk::PhysicalDeviceDepthClipEnableFeaturesEXT::default();
         let mut uint8 = vk::PhysicalDeviceIndexTypeUint8FeaturesKHR::default();
         let mut lines = vk::PhysicalDeviceLineRasterizationFeaturesKHR::default();
+        let mut reconvergence = vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR::default();
 
         macro_rules! chain {
             ($features:expr) => {{
@@ -364,6 +378,7 @@ impl Device {
                 clip_enable.p_next = std::ptr::null_mut();
                 uint8.p_next = std::ptr::null_mut();
                 lines.p_next = std::ptr::null_mut();
+                reconvergence.p_next = std::ptr::null_mut();
                 let mut features = vk::PhysicalDeviceFeatures2::default()
                     .push_next(&mut v11)
                     .push_next(&mut v12)
@@ -407,6 +422,9 @@ impl Device {
                 if extensions.line_rasterization {
                     features = features.push_next(&mut lines);
                 }
+                if extensions.maximal_reconvergence {
+                    features = features.push_next(&mut reconvergence);
+                }
                 features.features = $features;
                 features
             }};
@@ -433,7 +451,7 @@ impl Device {
         mesh.primitive_fragment_shading_rate_mesh_shader = vk::FALSE;
         mesh.mesh_shader_queries = vk::FALSE;
         let on = |b: vk::Bool32| b != vk::FALSE;
-        let features = DeviceFeatures {
+        let mut features = DeviceFeatures {
             extensions,
             sampler_anisotropy: on(core.sampler_anisotropy),
             texture_compression_bc: on(core.texture_compression_bc),
@@ -503,7 +521,35 @@ impl Device {
             storage_buffer_16bit: on(v11.storage_buffer16_bit_access),
             uniform_and_storage_buffer_16bit: on(v11.uniform_and_storage_buffer16_bit_access),
             demote_to_helper_invocation: on(v13.shader_demote_to_helper_invocation),
+            compute_subgroup_32: false,
+            max_compute_workgroup_subgroups: 0,
+            maximal_reconvergence: extensions.maximal_reconvergence
+                && on(reconvergence.shader_maximal_reconvergence)
+                && std::env::var("LICHII_MAXIMAL_RECONVERGENCE").map_or(true, |v| v.trim() != "0"),
         };
+        {
+            let mut v13_properties = vk::PhysicalDeviceVulkan13Properties::default();
+            let mut properties =
+                vk::PhysicalDeviceProperties2::default().push_next(&mut v13_properties);
+            // SAFETY: a property query on the physical device this device is made from.
+            unsafe { raw_instance.get_physical_device_properties2(physical, &mut properties) };
+            let allowed = std::env::var("LICHII_COMPUTE_WAVE32").map_or(true, |v| v.trim() != "0");
+            features.compute_subgroup_32 = allowed
+                && on(v13.subgroup_size_control)
+                && (v13_properties.min_subgroup_size..=v13_properties.max_subgroup_size)
+                    .contains(&32)
+                && v13_properties
+                    .required_subgroup_size_stages
+                    .contains(vk::ShaderStageFlags::COMPUTE);
+            features.max_compute_workgroup_subgroups =
+                v13_properties.max_compute_workgroup_subgroups;
+            tracing::info!(
+                "compute shaders: {}-wide subgroups by default, 32-wide required: {}, maximal reconvergence: {}",
+                v13_properties.max_subgroup_size,
+                features.compute_subgroup_32,
+                features.maximal_reconvergence
+            );
+        }
 
         let aftermath = crate::debug::aftermath::get().is_some()
             && has(nv::device_diagnostics_config::NAME)

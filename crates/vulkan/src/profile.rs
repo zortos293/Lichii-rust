@@ -77,6 +77,7 @@ pub(crate) fn shader_profile(
         support_vote: subgroup_ops.contains(vk::SubgroupFeatureFlags::VOTE),
         support_shuffle_relative: subgroup_ops.contains(vk::SubgroupFeatureFlags::SHUFFLE_RELATIVE),
         support_quad_shuffles: subgroup_ops.contains(vk::SubgroupFeatureFlags::QUAD),
+        support_maximal_reconvergence: features.maximal_reconvergence,
         supported_subgroup_stages: stage_bits,
         warp_size_potentially_larger_than_guest: v11.subgroup_size > 32,
         max_subgroup_size: v11.subgroup_size,

@@ -41,6 +41,10 @@ pub struct Profile {
     pub support_shuffle_relative: bool,
     pub support_quad_shuffles: bool,
     pub support_shader_quad_control: bool,
+    /// `SPV_KHR_maximal_reconvergence`: compute shaders using subgroup operations ask that
+    /// diverged invocations reconverge where the guest warp would, as NVIDIA's warp-synchronous
+    /// code (shuffles, votes, tensor ops) expects.
+    pub support_maximal_reconvergence: bool,
     /// Bit per [`crate::ShaderStage`] index where subgroup operations are available.
     pub supported_subgroup_stages: u32,
     pub warp_size_potentially_larger_than_guest: bool,
@@ -138,6 +142,7 @@ impl Default for Profile {
             support_shuffle_relative: true,
             support_quad_shuffles: true,
             support_shader_quad_control: false,
+            support_maximal_reconvergence: false,
             supported_subgroup_stages: 0x7f,
             warp_size_potentially_larger_than_guest: false,
             max_subgroup_size: 32,

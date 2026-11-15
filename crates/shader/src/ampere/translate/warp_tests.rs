@@ -248,6 +248,72 @@ fn shfl_down_with_registers() {
     assert_eq!(translate(&[inst]).unwrap(), expected);
 }
 
+#[test]
+fn shuffles_ask_for_maximal_reconvergence_when_the_host_has_it() {
+    use super::super::tests::TestEnv;
+    use crate::backend::Bindings;
+    use crate::backend::spirv::tests::validate;
+    use crate::profile::HostTranslateInfo;
+    use crate::translate::TranslateOptions;
+    use crate::{Profile, RuntimeInfo};
+    use lichii_common::settings::ResolutionScale;
+
+    // SHFL.IDX R4, R1, 2, 0x1f; STS [UR5 + R2], R4; EXIT.
+    let code = [
+        encode(
+            Opcode::Shfl,
+            Form::ImmImm,
+            dst(4) | a(1) | (2 << 53) | (0x1f << 40) | pred(81, PT),
+        ),
+        encode(
+            Opcode::Sts,
+            Form::UniformAddress,
+            (2 << 24) | (4 << 32) | (5 << 73),
+        ),
+        encode(Opcode::Exit, Form::Fixed, 7 << 87),
+    ];
+    let mut env = TestEnv::new(&code);
+    env.shared_memory = 0x100;
+    env.workgroup = [32, 1, 1];
+    let host = HostTranslateInfo::default();
+    let reconverges = |profile: &Profile| {
+        let options = TranslateOptions {
+            profile,
+            host: &host,
+            resolution_scale: ResolutionScale::X1,
+        };
+        let module = crate::module::compile(
+            &env,
+            options,
+            &RuntimeInfo::default(),
+            &mut Bindings::default(),
+        )
+        .unwrap();
+        // OpExecutionMode (16) with MaximallyReconvergesKHR (6023).
+        let mut words = &module.spirv[5..];
+        let mut found = false;
+        while let [first, ..] = words {
+            let count = (first >> 16) as usize;
+            found |= first & 0xffff == 16 && words.get(2) == Some(&6023);
+            words = &words[count.max(1)..];
+        }
+        (found, module.spirv)
+    };
+    let profile = Profile {
+        support_maximal_reconvergence: true,
+        supported_spirv: 0x0001_0600,
+        ..Profile::default()
+    };
+    let (found, spirv) = reconverges(&profile);
+    assert!(found);
+    validate("ampere_shfl_maximal_reconvergence", &profile, &spirv);
+    let profile = Profile {
+        supported_spirv: 0x0001_0600,
+        ..Profile::default()
+    };
+    assert!(!reconverges(&profile).0);
+}
+
 // MATCH
 
 #[test]
