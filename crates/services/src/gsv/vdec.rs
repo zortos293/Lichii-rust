@@ -10,10 +10,7 @@
 //! (the order the client acquires them from its own ring) in the layout gsv 961 describes, drops
 //! the renderer's cached copies of it (the title may have drawn into the image, which write
 //! tracking leaves alone), and increments the syncpoint; 213 then reports the frame. An end-of-stream input completes after
-//! the pictures the decoder still holds. For Mario Kart World the images still handed out then
-//! complete as end-of-stream frames, as does each image handed out before the next input, Flush
-//! or Stop; other titles keep them for the next stream (Donkey Kong Bananza loops its guide clips
-//! that way). Stop and Finalize complete every fence handed out.
+//! the pictures the decoder still holds, and Stop and Finalize complete every fence handed out.
 //!
 //! Without FFmpeg, or for a codec it cannot decode, every input becomes one frame without a
 //! picture, so a movie still plays at its pace (black) and ends.
@@ -65,8 +62,6 @@ const RELEASE_SLICE: Duration = Duration::from_millis(10);
 /// A release fence still pending after this lost its increment somewhere: the image is written
 /// anyway, so the movie does not freeze. GPU reads of a frame end long before.
 const RELEASE_LIMIT: Duration = Duration::from_secs(1);
-/// Mario Kart World's program id: the one title known to drain its images at a movie's end.
-pub(super) const MARIO_KART_WORLD: u64 = 0x0400_C3F0_0006_E000;
 
 /// gsv 902, 905, 906 and 1002. Without the decoder service its TIPC 1 creates,
 /// `InitializeVp9Decoder` fails with InvalidHandle and the movie player aborts.
@@ -175,10 +170,6 @@ struct State {
     end_queued: bool,
     /// The end-of-stream frame is out and nothing was submitted since.
     stream_ended: bool,
-    /// The width, height and pts of the end-of-stream frame, for the images drained after it.
-    end_frame: (u32, u32, u64),
-    /// The title drains the images it holds at the end of a stream (Mario Kart World).
-    drain_at_end: bool,
     /// The worker is writing an image with the state unlocked.
     writing: bool,
     /// Stops and Finalizes so far: a write that sees this change took an image they completed.
@@ -220,36 +211,6 @@ impl State {
         self.stream_ended = false;
         self.end_queued = false;
         self.clock = MovieClock::default();
-    }
-
-    /// For Mario Kart World, once the end-of-stream frame is out and nothing is left to decode,
-    /// every image still handed out completes as another end-of-stream frame: it acquires a frame
-    /// for each fence it was handed after a movie. Donkey Kong Bananza aborts if its looping
-    /// guide clips get these, since it hands the images to the next stream. Returns how many
-    /// fences complete.
-    fn drain_after_end(&mut self) -> u32 {
-        if !self.drain_at_end
-            || !self.stream_ended
-            || !self.inputs.is_empty()
-            || !self.decoded.is_empty()
-        {
-            return 0;
-        }
-        let (width, height, pts) = self.end_frame;
-        let mut fences = 0;
-        for handout in self.free.drain(..) {
-            if let Some(handout) = handout {
-                self.outputs.push_back(Output {
-                    image: handout.image,
-                    width,
-                    height,
-                    pts,
-                    end: true,
-                });
-            }
-            fences += 1;
-        }
-        fences
     }
 }
 
@@ -315,8 +276,6 @@ impl VideoDecoderService {
                 running: true,
                 end_queued: false,
                 stream_ended: false,
-                end_frame: (0, 0, 0),
-                drain_at_end: context.program.program_id == MARIO_KART_WORLD,
                 writing: false,
                 stops: 0,
                 quit: false,
@@ -359,9 +318,6 @@ impl VideoDecoderService {
                 return UNKNOWN;
             };
             state.free.push_back(Some(Handout { image, release }));
-            for _ in 0..state.drain_after_end() {
-                shared.increment();
-            }
             value
         };
         tracing::debug!(
@@ -511,8 +467,9 @@ struct Media {
     pictures: u64,
     decodes: u64,
     decode_time: Duration,
-    /// The pts of the stream's latest picture: an end of stream without a picture of its own
-    /// reports it, as the input's pts is often `u64::MAX` (Mario Kart World aborts on that).
+    /// The pts of the stream's latest picture. An end of stream without a picture of its own
+    /// reports it, as the C++ reference does: the input's pts is often `u64::MAX`, which 213's
+    /// conversion to nanoseconds overflows.
     last_pts: Option<u64>,
 }
 
@@ -840,12 +797,8 @@ impl Shared {
                         state.stream_ended = true;
                         state.end_queued = false;
                         state.clock = MovieClock::default();
-                        state.end_frame = (width, height, decoded.pts);
                     }
                     self.increment();
-                    for _ in 0..state.drain_after_end() {
-                        self.increment();
-                    }
                     continue;
                 }
                 wake = Some(host_now + Duration::from_micros(due - now));
