@@ -44,6 +44,21 @@ pub(super) fn break_(svc: &mut SvcContext) -> Flow {
         lr = format_args!("{:#x}", svc.ctx.x[30]),
         "svcBreak"
     );
+    let mut words = [0u8; 16];
+    let _ = svc.process().memory().read_bytes(info, &mut words);
+    tracing::error!("diag break info bytes {:02x?}", words);
+    let mut fp = svc.ctx.x[29];
+    for depth in 0..32 {
+        let mut frame = [0u8; 16];
+        if fp == 0 || svc.process().memory().read_bytes(fp, &mut frame).is_err() {
+            break;
+        }
+        let next = u64::from_le_bytes(frame[..8].try_into().unwrap());
+        let lr = u64::from_le_bytes(frame[8..].try_into().unwrap());
+        tracing::error!("diag break frame {depth} fp={fp:#x} lr={lr:#x}");
+        fp = next;
+    }
+    lichii_common::diag_ring::dump();
     svc.kernel.terminate_process(svc.process());
     Flow::ExitThread
 }
