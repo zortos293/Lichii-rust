@@ -455,16 +455,10 @@ impl VulkanRasterizer {
         })
         .flatten();
         if let Some((address, info, width, height)) = color_target {
-            let mask = regs.color_mask[if regs.color_mask_common != 0 {
-                0
-            } else {
-                index
-            }];
-            let enabled = [mask.r(), mask.g(), mask.b(), mask.a()];
-            let written = channels.iter().zip(enabled).enumerate().fold(
+            let written = channels.iter().enumerate().fold(
                 vk::ColorComponentFlags::empty(),
-                |written, (i, (&c, m))| {
-                    if c & m != 0 {
+                |written, (i, &c)| {
+                    if c != 0 {
                         written | vk::ColorComponentFlags::from_raw(1 << i)
                     } else {
                         written
@@ -2116,13 +2110,22 @@ mod tests {
 
     #[test]
     fn masked_colour_clears_keep_the_unwritten_channels() {
-        // G and A written, through the colour mask (UNORM) and through the clear's own channel
-        // selection (UINT, integer outputs).
+        // The clear's own channel selection decides what is written; the colour write mask
+        // does not apply to clears, so a whole clear under a G+A mask still writes all four.
         let cases = [
             (
                 0xd5,
                 ColorMask(0x1010),
                 ClearSurface(0b1111 << 2),
+                [1.0, 0.5, 0.25, 0.0],
+                [0.0, 0.2, 1.0, 1.0],
+                [255, 128, 64, 0],
+                [0, 51, 255, 255],
+            ),
+            (
+                0xd5,
+                ColorMask(0x0111),
+                ClearSurface(1 << 3 | 1 << 5),
                 [1.0, 0.5, 0.25, 0.0],
                 [0.0, 0.2, 1.0, 1.0],
                 [255, 128, 64, 0],
