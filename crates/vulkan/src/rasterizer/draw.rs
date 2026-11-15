@@ -64,7 +64,7 @@ use crate::pipeline::{
     GraphicsShaders, PipelineCache, PipelineFeatures,
 };
 use crate::scheduler::RenderingKey;
-use crate::texture_cache::{DEPTH_ATTACHMENT, ImageId, ImageInfo, Transfer, ViewInfo};
+use crate::texture_cache::{DEPTH_ATTACHMENT, ImageId, ImageInfo, ImageKind, Transfer, ViewInfo};
 use dynamic::{DynamicShadow, Slot};
 
 const NULL_BUFFER_SIZE: u64 = 64 << 10;
@@ -1460,7 +1460,8 @@ impl VulkanRasterizer {
             else {
                 continue;
             };
-            self.draw.colors[i] = Self::target_view(&mut self.texture_cache, found, &info)?;
+            self.draw.colors[i] =
+                Self::target_view(&mut self.texture_cache, found, &info, layered)?;
         }
         if regs.zeta_enable != 0
             && let Some(info) =
@@ -1473,7 +1474,7 @@ impl VulkanRasterizer {
                 false,
             )?
         {
-            self.draw.depth = Self::target_view(&mut self.texture_cache, found, &info)?;
+            self.draw.depth = Self::target_view(&mut self.texture_cache, found, &info, layered)?;
         }
         ctx.dirty.clear(dirty::RENDER_TARGETS);
         self.draw.targets_key = Some(TargetsKey {
@@ -1487,6 +1488,7 @@ impl VulkanRasterizer {
         cache: &mut crate::texture_cache::TextureCache,
         found: crate::texture_cache::Found,
         info: &ImageInfo,
+        layered: bool,
     ) -> Result<Option<Target>> {
         let Some(state) = cache.state(found.id) else {
             return Ok(None);
@@ -1495,8 +1497,13 @@ impl VulkanRasterizer {
         view.base_level += found.level;
         view.levels = 1;
         view.base_layer += found.layer;
-        view.layers = info.layers;
-        view.view_type = match info.layers {
+        view.layers = match state.info.kind {
+            ImageKind::D3 if layered => (state.extent.depth >> found.level)
+                .saturating_sub(view.base_layer)
+                .max(1),
+            _ => info.layers,
+        };
+        view.view_type = match view.layers {
             1 => vk::ImageViewType::TYPE_2D,
             _ => vk::ImageViewType::TYPE_2D_ARRAY,
         };
@@ -1512,7 +1519,7 @@ impl VulkanRasterizer {
             view: raw,
             format: state.format,
             extent,
-            layers: info.layers,
+            layers: view.layers,
         }))
     }
 

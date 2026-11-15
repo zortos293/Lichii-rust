@@ -13,8 +13,8 @@ use lichii_gpu::engines::maxwell_3d::regs::{
     BlendEquation, BlendFactor, ClearSurface, ColorMask, DepthMode, IndexFormat, MAX_CONST_BUFFERS,
     MAX_SHADER_STAGE, MESH_CONTROL, MESH_INIT_SHADER, MESH_SHADER_A, MESH_SHADER_B, PipelineBits,
     PrimitiveTopology, RenderTargetConfigBits, RtControl, RtLayer, RtLayerControl, ScissorTestBits,
-    ScissorTestBits1, ShaderType, SurfaceClipBits, SurfaceClipBits1, TileMode, VertexAttribute,
-    VertexAttributeType, VertexStreamBits, ZetaSizeBits,
+    ScissorTestBits1, ShaderType, SurfaceClipBits, SurfaceClipBits1, TileMode,
+    TileModeDimensionControl, VertexAttribute, VertexAttributeType, VertexStreamBits, ZetaSizeBits,
 };
 use lichii_gpu::engines::maxwell_3d::{DirtyState, Regs, dirty};
 use lichii_gpu::gmmu::Gmmu;
@@ -1518,6 +1518,30 @@ fn layered_draws_bind_every_layer_of_an_array_depth_target() {
     let [first, second] = target_layers(&mut f);
     assert!(first.iter().all(|&t| t == [0; 4]));
     assert!(second.iter().all(|&t| unorm8_eq(t, ORANGE)));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn a_geometry_program_selects_the_slice_of_a_volume_target_it_draws() {
+    let Some((mut f, gmmu)) = layered_fixture(1) else {
+        return;
+    };
+    let mut regs = layered_regs();
+    regs.rt[0].tile_mode = TileMode(1 << 4 | TileModeDimensionControl::DEFINE_DEPTH_SIZE.0 << 16);
+    draw(&mut f, &gmmu, &regs);
+    assert_eq!(f.rasterizer.draw.colors[0].map(|t| t.layers), Some(2));
+    let tiling = Tiling::new(SIZE, SIZE, 2, 4, 1, 0, GobLayout::Tegra);
+    f.rasterizer.flush_region(DADDR, tiling.size_bytes() as u64);
+    let volume = guest_linear(&f, DADDR, &tiling);
+    let (first, second) = volume.as_chunks::<4>().0.split_at((SIZE * SIZE) as usize);
+    assert!(
+        first.iter().all(|&t| t == [0; 4]),
+        "slice 0 stays untouched"
+    );
+    assert!(
+        second.iter().all(|&t| unorm8_eq(t, ORANGE)),
+        "the selected slice holds the draw"
+    );
     f.assert_no_validation_errors();
 }
 
