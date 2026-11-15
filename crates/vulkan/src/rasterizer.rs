@@ -1536,6 +1536,7 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn present(&mut self, framebuffer: &FramebufferConfig) {
+        draw::diag::watch_values(|d| self.handles.device.read::<u32>(d).ok());
         if let Some(max_bytes) = draw::diag::flush_all() {
             self.diag_flush_all(max_bytes);
         }

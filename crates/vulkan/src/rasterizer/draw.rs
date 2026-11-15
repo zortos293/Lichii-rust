@@ -2886,6 +2886,25 @@ impl VulkanRasterizer {
                 ))
             });
         }
+        if diag::ring_shader(module.hash) {
+            static RING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = RING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let c0 = ctx
+                .memory
+                .read::<[u32; 16]>(ctx.const_buffers[0].address)
+                .unwrap_or_default();
+            let ring = u64::from(c0[12]) | u64::from(c0[13]) << 32;
+            if let Some(daddr) = ctx.memory.translate(ring) {
+                diag::watch_add_dev(daddr);
+                if n < 8 || n.is_power_of_two() || n % 256 == 0 {
+                    let text = format!(
+                        "WATCH ring-dispatch n={n} gpu={ring:#x} dev={daddr:#x} size={:#x}",
+                        c0[14]
+                    );
+                    diag::with(|s| s.always(&text));
+                }
+            }
+        }
         if crate::pipeline::shader_workers::diag_shader_listed(module.hash) {
             static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {

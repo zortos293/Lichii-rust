@@ -200,6 +200,55 @@ pub(crate) fn watch_dev(kind: &str, daddr: u64, size: u64) {
     watch_hit(kind, daddr, size, true, "");
 }
 
+/// LICHII_DIAG_RING_SHADER=<module hashes>: compute shaders whose c0[0x30] storage buffer (a
+/// readback ring) joins the watch list at every dispatch.
+pub(crate) fn ring_shader(hash: u64) -> bool {
+    static LIST: OnceLock<Vec<u64>> = OnceLock::new();
+    LIST.get_or_init(|| hex_list("LICHII_DIAG_RING_SHADER")).contains(&hash)
+}
+
+/// Adds a device address to the watch list (at most 512 entries).
+pub(crate) fn watch_add_dev(daddr: u64) {
+    if let Ok(mut list) = watch().lock()
+        && list.len() < 512
+        && !list.iter().any(|&(_, d)| d == Some(daddr))
+    {
+        list.push((0, Some(daddr)));
+    }
+}
+
+/// Logs each watched GPU address whose 32-bit guest value changed since the last call.
+pub(crate) fn watch_values(read: impl Fn(u64) -> Option<u32>) {
+    static LAST: Mutex<Vec<(u64, u32)>> = Mutex::new(Vec::new());
+    let Ok(list) = watch().lock() else {
+        return;
+    };
+    let Ok(mut last) = LAST.lock() else {
+        return;
+    };
+    for &(gpu, dev) in list.iter() {
+        let (true, Some(d)) = (gpu != 0, dev) else {
+            continue;
+        };
+        let Some(value) = read(d) else {
+            continue;
+        };
+        match last.iter_mut().find(|(a, _)| *a == d) {
+            Some((_, v)) if *v == value => {}
+            Some((_, v)) => {
+                *v = value;
+                let text = format!("WATCH value gpu={gpu:#x} dev={d:#x} {value:#010x} f={}", f32::from_bits(value));
+                with(|s| s.always(&text));
+            }
+            None => {
+                last.push((d, value));
+                let text = format!("WATCH value gpu={gpu:#x} dev={d:#x} {value:#010x} f={} (first)", f32::from_bits(value));
+                with(|s| s.always(&text));
+            }
+        }
+    }
+}
+
 /// [`watch_dev`] whose detail is built only on a hit.
 pub(crate) fn watch_dev_with(kind: &str, daddr: u64, size: u64, extra: impl FnOnce() -> String) {
     let end = daddr.saturating_add(size.max(1));
