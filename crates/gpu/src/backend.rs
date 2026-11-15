@@ -583,6 +583,15 @@ pub trait Rasterizer: Send {
     /// Write GPU-modified data in `[addr, addr + size)` back to guest memory.
     fn flush_region(&mut self, addr: DAddr, size: u64);
 
+    /// A guest CPU thread touched `[addr, addr + size)`, a page under a flush trap the renderer
+    /// armed ([`DeviceAddressSpace::arm_flush_traps`](lichii_memory::DeviceAddressSpace::arm_flush_traps)),
+    /// and waits: write its GPU-modified data back and disarm what was written back. A renderer
+    /// may write back the whole GPU-written area around the page, so a CPU pass over a large
+    /// buffer traps once. The default writes back the range.
+    fn flush_for_cpu_read(&mut self, addr: DAddr, size: u64) {
+        self.flush_region(addr, size);
+    }
+
     /// The front is about to read `[addr, addr + size)`: every GPU writer of the range lands in
     /// guest memory first (releases still waiting for host GPU work, and cached buffers and
     /// images). The default waits for every fence, then writes the range back; a renderer that

@@ -14,6 +14,7 @@ use crate::backend::{
     ChannelId, FenceAction, FramebufferConfig, GpuHandles, GpuWrittenPages, Rasterizer, ReleaseSize,
 };
 use crate::clock::GpuTimestamp;
+use crate::cpu_reads::CpuReads;
 use crate::engines::kepler_compute::pcas::QmdScheduler;
 use crate::engines::{Engine, EngineContext, EngineFactory, EngineKind};
 use crate::gmmu::{Gmmu, RangeTarget};
@@ -82,9 +83,19 @@ pub(crate) struct Back {
     activity: Arc<Activity>,
     /// Set by [`crate::Gpu::shutdown`]: the back drops what is left instead of executing it.
     stopping: Arc<AtomicBool>,
+    cpu_reads: Arc<CpuReads>,
+    /// Scratch for [`CpuReads::serve`].
+    cpu_read_ranges: Vec<(DAddr, u64)>,
+}
+
+impl Drop for Back {
+    fn drop(&mut self) {
+        self.cpu_reads.close();
+    }
 }
 
 impl Back {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         rasterizer: Box<dyn Rasterizer>,
         handles: &GpuHandles,
@@ -93,6 +104,7 @@ impl Back {
         fetch_syncs: Arc<FetchSyncs>,
         activity: Arc<Activity>,
         stopping: Arc<AtomicBool>,
+        cpu_reads: Arc<CpuReads>,
     ) -> Self {
         Self {
             rasterizer,
@@ -110,11 +122,15 @@ impl Back {
             written_pages: handles.written_pages.clone(),
             activity,
             stopping,
+            cpu_reads,
+            cpu_read_ranges: Vec::new(),
         }
     }
 
-    /// Executes everything published, until the ring is empty.
+    /// Executes everything published, until the ring is empty. Guest CPU reads are served first
+    /// and between records.
     pub(crate) fn run(&mut self, consumer: &mut Consumer) {
+        self.serve_cpu_reads();
         while consumer.refill() {
             self.drain_cpu_writes();
             while consumer.has_slots() {
@@ -122,6 +138,7 @@ impl Back {
                     self.abandon(consumer);
                     return;
                 }
+                self.serve_cpu_reads();
                 let header = consumer.slot(0);
                 if header == WRAP {
                     consumer.wrap();
@@ -145,6 +162,25 @@ impl Back {
         consumer.skip_published();
         consumer.release();
         while self.side.try_recv().is_ok() {}
+    }
+
+    /// Writes back the ranges guest CPU threads wait for, from the work executed so far.
+    #[inline]
+    fn serve_cpu_reads(&mut self) {
+        if self.cpu_reads.pending() {
+            self.serve_cpu_reads_now();
+        }
+    }
+
+    #[cold]
+    fn serve_cpu_reads_now(&mut self) {
+        self.flush_engine();
+        let _waiting = self.activity.waiting(Wait::HostGpu);
+        let rasterizer = &mut *self.rasterizer;
+        self.cpu_reads
+            .serve(&mut self.cpu_read_ranges, |daddr, size| {
+                rasterizer.flush_for_cpu_read(daddr, size)
+            });
     }
 
     /// Drops the renderer's copies of device memory the guest CPU wrote while a cache held it.

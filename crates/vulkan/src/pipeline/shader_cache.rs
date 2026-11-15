@@ -219,6 +219,10 @@ pub struct ShaderCache {
     stats: ShaderCacheStats,
     /// Lookups that returned no module because its translation was still queued or running.
     waits: u64,
+    /// Graphics lookups that translated in place because they could not be skipped.
+    blocked: u64,
+    /// Render-thread time spent translating programs in place.
+    stalled: Duration,
     /// The counts the last INFO line showed, and when it was written.
     logged: (ShaderCacheStats, Option<Instant>),
 }
@@ -241,6 +245,8 @@ impl ShaderCache {
             code_check: cache::CodeCheck::default(),
             stats: ShaderCacheStats::default(),
             waits: 0,
+            blocked: 0,
+            stalled: Duration::ZERO,
             logged: (ShaderCacheStats::default(), None),
         }
     }
@@ -256,6 +262,17 @@ impl ShaderCache {
     /// Lookups since the cache was created that found the module still translating.
     pub fn waits(&self) -> u64 {
         self.waits
+    }
+
+    /// Lookups since the cache was created that translated in place a graphics program they
+    /// were not allowed to skip, while workers translate the others.
+    pub fn blocked(&self) -> u64 {
+        self.blocked
+    }
+
+    /// Render-thread time since the cache was created spent translating programs in place.
+    pub fn stalled(&self) -> Duration {
+        self.stalled
     }
 
     /// Translations queued or running.
@@ -329,7 +346,9 @@ impl ShaderCache {
     /// The module for the program `env` describes (VertexA `a` and VertexB `env` make one
     /// module), translated with the runtime info `runtime` builds, which must depend only on
     /// what `state` hashes. `bindings` carries the next free binding from stage to stage.
-    /// `None` when the program does not translate: skip the draw.
+    /// With workers, a graphics program not translated yet is queued for them and `None`
+    /// returned when `may_skip`, else translated in place. `None` also when the program does
+    /// not translate: skip the draw.
     pub fn module(
         &mut self,
         a: Option<&ProgramEnv<'_>>,
@@ -337,6 +356,7 @@ impl ShaderCache {
         state: u64,
         runtime: impl FnOnce() -> RuntimeInfo,
         bindings: &mut Bindings,
+        may_skip: bool,
     ) -> Option<Arc<ShaderModule>> {
         self.drain();
         let mut hasher = FxHasher::default();
@@ -396,12 +416,16 @@ impl ShaderCache {
                 *bindings = after;
                 Some(module)
             }
-            None if self.workers.is_some() && env.stage() != ShaderStage::Compute => {
+            None if may_skip && self.workers.is_some() && env.stage() != ShaderStage::Compute => {
                 self.waits += 1;
                 self.request(a, env, state, runtime, first);
                 return None;
             }
             None => {
+                if self.workers.is_some() && env.stage() != ShaderStage::Compute {
+                    self.blocked += 1;
+                }
+                let start = Instant::now();
                 let result = match (&mut self.disk, a) {
                     (Some(disk), a) => match a {
                         Some(a) => cache::compile_dual_vertex(a, env, options, &runtime, bindings),
@@ -417,6 +441,7 @@ impl ShaderCache {
                     (None, None) => compile(env, options, &runtime, bindings).map(Arc::new),
                 };
                 self.stats.translated += 1;
+                self.stalled += start.elapsed();
                 match result {
                     Ok(module) => Some(module),
                     Err(error) => {

@@ -68,18 +68,22 @@ struct Activity {
     buffers: BufferCacheStats,
 }
 
-/// Draws skipped while their shaders translated or their pipelines built, and the longest time
-/// between two presents, over the second since the last `draw stalls` line. The line is
-/// written at INFO, at most once a second, only for a second that skipped draws or held a
-/// present back for [`Stalls::SLOW_FRAME`] or more, so scene loads show up and steady play does not.
+/// Draws skipped while their shaders translated or their pipelines built, draws that waited
+/// for them, the render-thread time spent translating and building in place or waiting, and
+/// the longest time between two presents, over the second since the last `draw stalls` line.
+/// The line is written at INFO, at most once a second, only for a second that skipped or
+/// waited, compiled on the render thread for a millisecond or more, or held a present back for
+/// [`Stalls::SLOW_FRAME`] or more, so scene loads show up and steady play does not.
 #[derive(Default)]
 struct Stalls {
     since: Option<Instant>,
     last_present: Option<Instant>,
     worst_frame: Duration,
     presents: u32,
-    /// Shader and pipeline waits when the window started.
-    waits_at: (u64, u64),
+    /// Shader and pipeline skips and blocking waits when the window started.
+    waits_at: [u64; 4],
+    /// Shader and pipeline render-thread compile time when the window started.
+    stalled_at: [Duration; 2],
 }
 
 impl Stalls {
@@ -90,17 +94,36 @@ impl Stalls {
             self.worst_frame = self.worst_frame.max(now - last);
         }
         self.presents += 1;
-        let waits = (shaders.waits(), pipelines.waits());
+        let waits = [
+            shaders.waits(),
+            pipelines.waits(),
+            shaders.blocked(),
+            pipelines.blocked(),
+        ];
+        let stalled = [shaders.stalled(), pipelines.stalled()];
         let since = *self.since.get_or_insert(now);
         if now - since < Duration::from_secs(1) {
             return;
         }
-        let skipped_shader = waits.0 - self.waits_at.0;
-        let skipped_pipeline = waits.1 - self.waits_at.1;
-        if skipped_shader + skipped_pipeline > 0 || self.worst_frame >= Self::SLOW_FRAME {
+        let [shader_ms, pipeline_ms] =
+            std::array::from_fn(|i| (stalled[i] - self.stalled_at[i]).as_secs_f32() * 1000.0);
+        let [
+            skipped_shader,
+            skipped_pipeline,
+            waited_shader,
+            waited_pipeline,
+        ] = std::array::from_fn(|i| waits[i] - self.waits_at[i]);
+        if skipped_shader + skipped_pipeline + waited_shader + waited_pipeline > 0
+            || shader_ms + pipeline_ms >= 1.0
+            || self.worst_frame >= Self::SLOW_FRAME
+        {
             tracing::info!(
                 skipped_shader,
                 skipped_pipeline,
+                waited_shader,
+                waited_pipeline,
+                shader_ms,
+                pipeline_ms,
                 worst_frame_ms = self.worst_frame.as_secs_f32() * 1000.0,
                 presents = self.presents,
                 seconds = (now - since).as_secs_f32(),
@@ -113,6 +136,7 @@ impl Stalls {
             since: Some(now),
             last_present: Some(now),
             waits_at: waits,
+            stalled_at: stalled,
             ..Self::default()
         };
     }
@@ -1321,6 +1345,16 @@ impl Rasterizer for VulkanRasterizer {
         }
     }
 
+    fn flush_for_cpu_read(&mut self, addr: DAddr, size: u64) {
+        if let Err(error) = self
+            .buffer_cache
+            .flush_for_cpu_read(&mut self.scheduler, addr, size)
+        {
+            tracing::error!(%error, "flushing GPU-written buffers for a CPU read failed");
+        }
+        self.flush_region(addr, size);
+    }
+
     fn unmap_region(&mut self, addr: DAddr, size: u64) {
         self.buffer_cache.invalidate(addr, size);
         self.draw.shaders.invalidate(addr, size);
@@ -1386,7 +1420,10 @@ impl Rasterizer for VulkanRasterizer {
             .texture_cache
             .presentable(&mut self.scheduler, framebuffer)
         {
-            Ok(Some(id)) => self.present_cached(framebuffer, id),
+            Ok(Some(id)) => {
+                self.draw.presented(id);
+                self.present_cached(framebuffer, id)
+            }
             Ok(None) => Ok(false),
             Err(error) => Err(error),
         };

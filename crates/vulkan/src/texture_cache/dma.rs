@@ -118,6 +118,8 @@ impl TextureCache {
         let binding = tx
             .buffers
             .acquire(tx.scheduler, tx.staging, target.daddr, target.size)?;
+        tx.buffers
+            .prepare_gpu_write(tx.scheduler, tx.staging, target.daddr, target.size)?;
         let device = self.device.clone();
         let cmd = tx.scheduler.record()?;
         let raw = self.prepare_live(cmd, id, ImageAccess::TRANSFER_SRC);

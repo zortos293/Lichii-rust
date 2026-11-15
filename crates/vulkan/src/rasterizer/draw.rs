@@ -178,6 +178,10 @@ pub(super) struct DrawState {
     stages: GraphicsShaders,
     colors: [Option<Target>; 8],
     depth: Option<Target>,
+    /// The images the last [`PRESENTED`] presents showed. Only a draw into them alone may be
+    /// skipped while its program translates or its pipeline builds: one frame shows it missing.
+    /// A draw into any other target waits, so no later pass reads a target a skip left stale.
+    presented: [Option<ImageId>; PRESENTED],
     textures: Vec<ImageId>,
     texture_scaling: ScalingBits<{ NUM_TEXTURE_SCALING_WORDS as usize }>,
     /// Storage images of the current draw and whether it writes them.
@@ -214,7 +218,25 @@ pub(super) struct DrawState {
     mesh_indirect: Option<mesh_indirect::MeshIndirectPass>,
 }
 
+/// Presents whose images count as the presented frame for [`DrawState::presented_only`].
+const PRESENTED: usize = 3;
+
 impl DrawState {
+    /// Notes that a present showed `image`.
+    pub(super) fn presented(&mut self, image: ImageId) {
+        if !self.presented.contains(&Some(image)) {
+            self.presented.rotate_right(1);
+            self.presented[0] = Some(image);
+        }
+    }
+
+    /// Whether the draw's bound colour targets are all images a recent present showed, so
+    /// skipping it only leaves a gap in one shown frame.
+    fn presented_only(&self) -> bool {
+        let mut colors = self.colors.iter().flatten().peekable();
+        colors.peek().is_some() && colors.all(|t| self.presented.contains(&Some(t.id)))
+    }
+
     pub(super) fn new(
         device: &Arc<Device>,
         pipelines: PipelineCache,
@@ -267,6 +289,7 @@ impl DrawState {
             stages: GraphicsShaders::default(),
             colors: [None; 8],
             depth: None,
+            presented: [None; PRESENTED],
             textures: Vec::new(),
             texture_scaling: ScalingBits::default(),
             storage_images: Vec::new(),
@@ -627,10 +650,11 @@ impl VulkanRasterizer {
             false => mvk::primitive_topology(assembled_topology(call.topology()))
                 .unwrap_or(vk::PrimitiveTopology::TRIANGLE_LIST),
         };
-        if !self.graphics_stages(ctx, host_topology) {
+        if !self.render_targets(ctx)? {
             return Ok(());
         }
-        if !self.render_targets(ctx)? {
+        let may_skip = self.draw.presented_only();
+        if !self.graphics_stages(ctx, host_topology, may_skip) {
             return Ok(());
         }
 
@@ -653,7 +677,11 @@ impl VulkanRasterizer {
             samples,
         );
         let key = GraphicsPipelineKey::new(&draw.stages, attachments, &fixed);
-        let Some(pipeline) = draw.pipelines.graphics(&key, &draw.stages) else {
+        let pipeline = match may_skip {
+            true => draw.pipelines.graphics(&key, &draw.stages),
+            false => draw.pipelines.graphics_waiting(&key, &draw.stages),
+        };
+        let Some(pipeline) = pipeline else {
             return Ok(());
         };
         let pipeline_raw = pipeline.raw();
@@ -1003,6 +1031,7 @@ impl VulkanRasterizer {
         &mut self,
         ctx: &GraphicsContext<'_>,
         topology: vk::PrimitiveTopology,
+        may_skip: bool,
     ) -> bool {
         let regs = ctx.regs;
         let mesh = is_mesh_draw(regs, self.draw.arch);
@@ -1076,6 +1105,7 @@ impl VulkanRasterizer {
                 state.key(),
                 || state.runtime(previous.as_deref().map(|m| &m.info)),
                 &mut bindings,
+                may_skip,
             );
             let Some(module) = module else {
                 return false;
@@ -2298,7 +2328,7 @@ impl VulkanRasterizer {
         let Some(module) =
             self.draw
                 .shaders
-                .module(None, &env, 0, RuntimeInfo::default, &mut bindings)
+                .module(None, &env, 0, RuntimeInfo::default, &mut bindings, true)
         else {
             return Ok(());
         };

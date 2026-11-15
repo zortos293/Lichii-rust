@@ -5,7 +5,9 @@
 //! [`FLUSH_INTERVAL`], it sends the counts down a channel unless its previous counts are still
 //! queued, so dispatch takes no lock and the channel holds at most one message per core. The frame
 //! view's [`summary`] and dropping cores lock the process-wide total and drain the channel into it.
-//! The last profiled core to drop logs the total as a table.
+//! The last profiled core to drop logs the total as a table. With `LICHII_JIT_PROFILE_EVERY` set to
+//! a number of seconds, a background thread also logs the running total at that interval, for runs
+//! that end without dropping their cores.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -13,7 +15,7 @@ use std::fmt::Write;
 use std::mem::{Discriminant, discriminant};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Once};
 use std::time::{Duration, Instant};
 
 use crate::decoder::Inst;
@@ -23,6 +25,14 @@ const TABLE_ROWS: usize = 40;
 
 static ENABLED: LazyLock<bool> = LazyLock::new(|| {
     std::env::var_os("LICHII_JIT_PROFILE").is_some_and(|v| !v.is_empty() && v != "0")
+});
+
+static EVERY: LazyLock<Option<Duration>> = LazyLock::new(|| {
+    let secs = std::env::var("LICHII_JIT_PROFILE_EVERY")
+        .ok()?
+        .parse::<u64>()
+        .ok()?;
+    (secs > 0).then(|| Duration::from_secs(secs))
 });
 
 static SINK: LazyLock<Sink> = LazyLock::new(|| {
@@ -323,12 +333,39 @@ fn global() -> MutexGuard<'static, Global> {
     SINK.global.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Counts a new profiled core.
+/// Counts a new profiled core, and starts the periodic log on the first one when
+/// `LICHII_JIT_PROFILE_EVERY` asks for it.
 pub(super) fn register() {
     let mut g = global();
     g.live += 1;
     g.cores += 1;
     g.started.get_or_insert_with(Instant::now);
+    drop(g);
+    let Some(every) = *EVERY else {
+        return;
+    };
+    static PERIODIC: Once = Once::new();
+    PERIODIC.call_once(|| {
+        let spawned = std::thread::Builder::new()
+            .name("jit-profile".to_owned())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(every);
+                    let mut g = global();
+                    g.drain();
+                    if g.live == 0 {
+                        continue;
+                    }
+                    let wall = g.started.map_or(Duration::ZERO, |t| t.elapsed());
+                    let table = g.total.table(g.cores, wall);
+                    drop(g);
+                    tracing::info!("{table}");
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!("JIT profile: periodic log not started: {e}");
+        }
+    });
 }
 
 /// Sends a running core's counts towards the total, unless the ones it sent last are still queued

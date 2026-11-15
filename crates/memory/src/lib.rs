@@ -17,13 +17,13 @@ mod physical;
 pub mod tracking;
 
 pub use address_space::{
-    AddressSpace, Fastmem, FastmemError, FaultKind, MemoryFault, MemoryPermission,
+    AddressSpace, Fastmem, FastmemError, FaultKind, FlushTrapStats, MemoryFault, MemoryPermission,
 };
 pub use device::DeviceAddressSpace;
 pub use exclusive::{ExclusiveMonitor, ReservationSlot};
 pub use fault::{FaultHandler, HostFault};
 pub use physical::{PhysicalMemory, PhysicalMemoryError};
-pub use tracking::CachedPages;
+pub use tracking::{CachedPages, FlushTrapHandler};
 
 #[cfg(test)]
 mod fastmem_tests;
