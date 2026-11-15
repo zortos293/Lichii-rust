@@ -638,6 +638,20 @@ impl VulkanRasterizer {
             regs.depth_test_func,
             regs.stencil_enable,
         );
+        let vt = &regs.viewport_transform[0];
+        let _ = write!(
+            s,
+            " ZB[off={} bias={} slope={} clamp={} mode={:?} vz={}+{} range={}..{}]",
+            regs.polygon_offset_fill_enable,
+            regs.depth_bias,
+            regs.slope_scale_depth_bias,
+            regs.depth_bias_clamp,
+            regs.depth_mode,
+            vt.scale_z,
+            vt.translate_z,
+            regs.viewports[0].depth_range_near,
+            regs.viewports[0].depth_range_far,
+        );
         for (slot, cb) in ctx.const_buffers[4].iter().enumerate() {
             if !cb.enabled || cb.size == 0 {
                 continue;
