@@ -7,15 +7,15 @@ use super::regs::{
 use crate::activity::Wait;
 use crate::backend::{Query, QueryKind, ReleaseSize};
 use crate::engines::EngineContext;
-use crate::gmmu::RangeTarget;
+use crate::gmmu::{Gmmu, RangeTarget};
 
 /// The write REPORT_SEMAPHORE.QUERY asks for. Acquires are waited on by the front thread and
 /// traps are not emulated, so both give `None`.
 ///
-/// Releases to address 0 also give `None`: NVN2 titles release fences to a null address every
-/// frame (Mario Tennis Fever: three per present), which the reference drops silently because
-/// GPU address 0 is never mapped.
-pub(super) fn report(regs: &Regs) -> Option<Query> {
+/// Releases to address 0 also give `None` while it is unmapped: NVN2 titles release fences to a
+/// null address every frame (Mario Tennis Fever: three per present), which the reference drops
+/// silently. A guest that maps address 0 still gets its reports.
+pub(super) fn report(regs: &Regs, memory: &Gmmu) -> Option<Query> {
     let semaphore = &regs.report_semaphore;
     let query = semaphore.query;
     let operation = query.operation();
@@ -24,7 +24,7 @@ pub(super) fn report(regs: &Regs) -> Option<Query> {
     {
         return None;
     }
-    if semaphore.address() == 0 {
+    if semaphore.address() == 0 && memory.translate(0).is_none() {
         return None;
     }
     let kind = match query.report() {
