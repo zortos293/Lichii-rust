@@ -12,8 +12,9 @@ use lichii_gpu::backend::{
 use lichii_gpu::engines::maxwell_3d::regs::{
     BlendEquation, BlendFactor, ClearSurface, ColorMask, DepthMode, IndexFormat, MAX_CONST_BUFFERS,
     MAX_SHADER_STAGE, MESH_CONTROL, MESH_INIT_SHADER, MESH_SHADER_A, MESH_SHADER_B, PipelineBits,
-    PrimitiveTopology, RenderTargetConfigBits, RtControl, ScissorTestBits, ScissorTestBits1,
-    ShaderType, SurfaceClipBits, SurfaceClipBits1, TileMode, VertexAttribute, VertexStreamBits,
+    PrimitiveTopology, RenderTargetConfigBits, RtControl, RtLayer, RtLayerControl, ScissorTestBits,
+    ScissorTestBits1, ShaderType, SurfaceClipBits, SurfaceClipBits1, TileMode, VertexAttribute,
+    VertexStreamBits, ZetaSizeBits,
 };
 use lichii_gpu::engines::maxwell_3d::{DirtyState, Regs};
 use lichii_gpu::gmmu::Gmmu;
@@ -25,7 +26,7 @@ use lichii_shader::maxwell::opcode::Opcode;
 use lichii_shader::{DescriptorKind, ShaderStage};
 use lichii_texture::block_linear::{GobLayout, Tiling, swizzle};
 
-use super::super::tests::{DADDR, Fixture, GPU_VA, fixture, gmmu, guest_linear};
+use super::super::tests::{DADDR, Fixture, GPU_VA, fixture, gmmu, guest_linear, unorm8_eq};
 use super::{StageSources, Warning};
 use crate::pipeline::environment::TexturePool;
 use crate::pipeline::shader_cache::{ShaderCache, ShaderCacheStats};
@@ -260,7 +261,7 @@ fn draws_hand_assembled_programs_and_reads_the_target_back() {
     draw(&mut f, &gmmu, &regs);
     let texels = target(&mut f);
     assert!(
-        texels.iter().all(|&t| t == [255, 128, 0, 255]),
+        texels.iter().all(|&t| unorm8_eq(t, ORANGE)),
         "every texel takes the fragment program's colour: {:?}",
         &texels[..4]
     );
@@ -302,7 +303,7 @@ fn components_the_fragment_program_does_not_output_keep_their_texels() {
     draw(&mut f, &gmmu, &regs);
     let texels = target(&mut f);
     assert!(
-        texels.iter().all(|&t| t == [255, 128, 0, 0x40]),
+        texels.iter().all(|&t| unorm8_eq(t, [255, 128, 0, 0x40])),
         "red, green and blue drawn, alpha kept: {:?}",
         &texels[..4]
     );
@@ -339,7 +340,7 @@ fn second_source_blend_factors_read_the_second_colour_output() {
     draw(&mut f, &gmmu, &regs);
     let texels = target(&mut f);
     assert!(
-        texels.iter().all(|&t| t == [128, 128, 0, 255]),
+        texels.iter().all(|&t| unorm8_eq(t, [128, 128, 0, 255])),
         "colour 0 times colour 1 everywhere: {:?}",
         &texels[..4]
     );
@@ -684,7 +685,7 @@ fn switch2_programs_read_root_table_0_as_slot_24() {
     assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
     let texels = switch2_target(&mut f);
     assert!(
-        texels.iter().all(|&t| t == [128, 0, 0, 255]),
+        texels.iter().all(|&t| unorm8_eq(t, [128, 0, 0, 255])),
         "every texel takes root table 0's word: {:?}",
         &texels[..4]
     );
@@ -720,7 +721,9 @@ fn cached_programs_translate_again_only_after_a_guest_write() {
         "only the rewritten fragment program translates again"
     );
     assert!(
-        target(&mut f).iter().all(|&t| t == [128, 255, 0, 255]),
+        target(&mut f)
+            .iter()
+            .all(|&t| unorm8_eq(t, [128, 255, 0, 255])),
         "the new program's colour"
     );
     f.assert_no_validation_errors();
@@ -793,7 +796,7 @@ fn draws_skip_while_workers_translate_their_programs() {
         "both draws are counted as waiting on a translation"
     );
     let mut rounds = 0;
-    while target(&mut f).iter().any(|&t| t != [255, 128, 0, 255]) {
+    while target(&mut f).iter().any(|&t| !unorm8_eq(t, ORANGE)) {
         rounds += 1;
         assert!(rounds <= 3, "the vertex then the fragment program land");
         f.rasterizer.draw.shaders.finish_translations();
@@ -822,7 +825,7 @@ fn draws_into_targets_no_present_showed_translate_in_place_instead_of_skipping()
     let regs = draw_regs();
     draw(&mut f, &gmmu, &regs);
     assert!(
-        target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]),
+        target(&mut f).iter().all(|&t| unorm8_eq(t, ORANGE)),
         "a later pass may read this target, so the first draw already lands"
     );
     let shaders = &f.rasterizer.draw.shaders;
@@ -878,7 +881,7 @@ fn a_fragment_program_after_another_vertex_program_with_the_same_outputs_is_not_
         "the fragment module reads the same outputs"
     );
     assert_eq!(f.rasterizer.draw.shaders.stats().translated, 3);
-    assert!(target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]));
+    assert!(target(&mut f).iter().all(|&t| unorm8_eq(t, ORANGE)));
     f.assert_no_validation_errors();
 }
 
@@ -1043,7 +1046,7 @@ fn a_draw_continuing_a_rendering_records_the_state_that_changed() {
     draw(&mut f, &gmmu, &regs);
     assert_eq!(f.rasterizer.scheduler.renderings(), renderings);
     assert!(
-        target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]),
+        target(&mut f).iter().all(|&t| unorm8_eq(t, ORANGE)),
         "the second draw writes with the colour mask it set"
     );
     f.assert_no_validation_errors();
@@ -1106,7 +1109,7 @@ fn cpu_writes_beside_a_render_target_keep_its_texels() {
     assert!(f.memory.has_cpu_writes(), "the target's pages are tracked");
     drain_cpu_writes(&mut f);
     assert!(
-        target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]),
+        target(&mut f).iter().all(|&t| unorm8_eq(t, ORANGE)),
         "the drawn texels"
     );
     space.write_bytes(CPU_VA, &[0x5a; 16]).unwrap();
@@ -1156,7 +1159,7 @@ fn cpu_writes_to_cached_programs_translate_them_again() {
         colours.push(target(&mut f));
     }
     assert!(
-        colours[0].iter().all(|&t| t == [128, 255, 0, 255]),
+        colours[0].iter().all(|&t| unorm8_eq(t, [128, 255, 0, 255])),
         "the rewritten program's colour"
     );
     assert_eq!(colours[1], original, "the first program again");
@@ -1185,7 +1188,7 @@ fn draws_read_uniform_buffers_the_cpu_rewrote() {
         let regs = draw_regs();
         draw_with(&mut f, &gmmu, &regs, &const_buffers);
         assert!(
-            target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]),
+            target(&mut f).iter().all(|&t| unorm8_eq(t, ORANGE)),
             "{size:#x}"
         );
         for (values, colour) in [
@@ -1267,6 +1270,163 @@ fn draws_back_only_the_layer_they_render_of_an_array_target() {
     f.assert_no_validation_errors();
 }
 
+const LAYERED_GEOMETRY: u32 = 0x400;
+
+/// A geometry program that passes each triangle through to render target layer `layer`.
+fn layer_select_geometry_program(layer: u32) -> Vec<u8> {
+    let mut header = header(1, ShaderType::GEOMETRY);
+    header[2] |= 1 << 24;
+    header[3] |= 7 << 24;
+    header[4] = 3;
+    header[5] |= 0xf0 << 24;
+    header[13] |= 0xf2 << 8;
+    let mut code = vec![mov_u32(5, layer)];
+    for vertex in 0..3u64 {
+        let vertex_reg = match vertex {
+            0 => RZ,
+            _ => {
+                code.push(mov_u32(6, vertex as u32));
+                6
+            }
+        };
+        code.push(sass(
+            Opcode::Ald,
+            (3 << 47) | (vertex_reg << 39) | (0x70 << 20) | (RZ << 8),
+        ));
+        code.push(sass(
+            Opcode::Ast,
+            (3 << 47) | (RZ << 39) | (0x70 << 20) | (RZ << 8),
+        ));
+        code.push(sass(Opcode::Ast, (RZ << 39) | (0x64 << 20) | (RZ << 8) | 5));
+        code.push(sass(Opcode::OutImm, (1 << 39) | 7));
+    }
+    code.push(exit());
+    program(header, &code)
+}
+
+/// `draw_regs` with a two-layer colour target whose layer the geometry program selects.
+fn layered_regs() -> Box<Regs> {
+    let mut regs = draw_regs();
+    regs.rt[0].bits = RenderTargetConfigBits(2);
+    regs.rt[0].array_pitch = SIZE * SIZE;
+    regs.rt_layer = RtLayer(RtLayerControl::GEOMETRY_SHADER_SELECTS_LAYER.0 << 16);
+    regs.pipelines[4].bits = PipelineBits(1 | ShaderType::GEOMETRY.0 << 4);
+    regs.pipelines[4].offset = LAYERED_GEOMETRY;
+    regs
+}
+
+fn layered_fixture(layer: u32) -> Option<(Fixture, Arc<Gmmu>)> {
+    let (f, gmmu) = draw_fixture()?;
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    write(
+        &f,
+        PROGRAMS + u64::from(LAYERED_GEOMETRY),
+        &layer_select_geometry_program(layer),
+    );
+    Some((f, gmmu))
+}
+
+/// Both layers of the two-layer target at `GPU_VA`.
+fn target_layers(f: &mut Fixture) -> [Vec<[u8; 4]>; 2] {
+    let tiling = Tiling::new(SIZE, SIZE, 1, 4, 1, 0, GobLayout::Tegra);
+    let layer = u64::from(SIZE * SIZE * 4);
+    f.rasterizer.flush_region(DADDR, 2 * layer);
+    [0, 1].map(|i| {
+        guest_linear(f, DADDR + i * layer, &tiling)
+            .as_chunks::<4>()
+            .0
+            .to_vec()
+    })
+}
+
+fn render_targets_of(f: &mut Fixture, gmmu: &Arc<Gmmu>, regs: &Regs) {
+    let mut dirty = DirtyState::new();
+    let root_tables = [[0; 64]; 8];
+    let ctx = GraphicsContext {
+        channel: ChannelId(0),
+        memory: gmmu,
+        regs,
+        dirty: &mut dirty,
+        const_buffers: &const_buffers(),
+        root_tables: &root_tables,
+    };
+    assert!(f.rasterizer.render_targets(&ctx).unwrap());
+}
+
+#[test]
+fn a_geometry_program_selects_the_layer_of_an_array_target_it_draws() {
+    let Some((mut f, gmmu)) = layered_fixture(1) else {
+        return;
+    };
+    draw(&mut f, &gmmu, &layered_regs());
+    let [first, second] = target_layers(&mut f);
+    assert!(
+        first.iter().all(|&t| t == [0; 4]),
+        "layer 0 stays untouched"
+    );
+    assert!(
+        second.iter().all(|&t| unorm8_eq(t, ORANGE)),
+        "the selected layer holds the draw"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn layered_draws_bind_every_layer_of_an_array_depth_target() {
+    let Some((mut f, gmmu)) = layered_fixture(1) else {
+        return;
+    };
+    let mut regs = layered_regs();
+    let depth = GPU_VA + 0x8000;
+    regs.zeta.address_high = (depth >> 32) as u32;
+    regs.zeta.address_low = depth as u32;
+    regs.zeta.format = 0x0a;
+    regs.zeta.tile_mode = TileMode(1 << 4);
+    regs.zeta.array_pitch = SIZE * SIZE;
+    regs.zeta_size.width = SIZE;
+    regs.zeta_size.height = SIZE;
+    regs.zeta_size.bits = ZetaSizeBits(2);
+    regs.zeta_enable = 1;
+    draw(&mut f, &gmmu, &regs);
+    assert_eq!(f.rasterizer.draw.depth.map(|d| d.layers), Some(2));
+    assert_eq!(f.rasterizer.draw.layers(), 2);
+    let [first, second] = target_layers(&mut f);
+    assert!(first.iter().all(|&t| t == [0; 4]));
+    assert!(second.iter().all(|&t| unorm8_eq(t, ORANGE)));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn renderings_span_the_fewest_layers_any_target_has() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let mut regs = layered_regs();
+    render_targets_of(&mut f, &gmmu, &regs);
+    assert_eq!(f.rasterizer.draw.layers(), 2);
+    let second = GPU_VA + 0x8000;
+    regs.rt[1] = regs.rt[0];
+    regs.rt[1].address_high = (second >> 32) as u32;
+    regs.rt[1].address_low = second as u32;
+    regs.rt[1].bits = RenderTargetConfigBits(1);
+    regs.rt_control = RtControl(2 | 1 << 7);
+    render_targets_of(&mut f, &gmmu, &regs);
+    assert_eq!(f.rasterizer.draw.colors[0].map(|t| t.layers), Some(2));
+    assert_eq!(f.rasterizer.draw.colors[1].map(|t| t.layers), Some(1));
+    assert_eq!(f.rasterizer.draw.layers(), 1);
+    regs.rt_layer = RtLayer(0);
+    render_targets_of(&mut f, &gmmu, &regs);
+    assert_eq!(
+        f.rasterizer.draw.colors[0].map(|t| t.layers),
+        Some(1),
+        "without geometry layer selection a draw binds one layer"
+    );
+}
+
 #[test]
 fn guest_barriers_record_between_draws() {
     let Some((mut f, gmmu)) = draw_fixture() else {
@@ -1282,7 +1442,7 @@ fn guest_barriers_record_between_draws() {
     f.rasterizer.barrier();
     draw(&mut f, &gmmu, &regs);
     f.rasterizer.barrier();
-    assert!(target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]));
+    assert!(target(&mut f).iter().all(|&t| unorm8_eq(t, ORANGE)));
     f.assert_no_validation_errors();
 }
 
@@ -1336,7 +1496,7 @@ fn indirect_draws_rebind_buffers_their_commands_merged() {
         r.draw.vertex_buffers[0], current.buffer,
         "the vertex binding points at the merged buffer"
     );
-    assert!(target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]));
+    assert!(target(&mut f).iter().all(|&t| unorm8_eq(t, ORANGE)));
     f.assert_no_validation_errors();
 }
 
@@ -1442,7 +1602,7 @@ fn writes_to_any_page_of_a_scattered_program_translate_it_again() {
     let mut regs = draw_regs();
     regs.pipelines[5].offset = (start - PROGRAMS) as u32;
     draw(&mut f, &gmmu, &regs);
-    assert!(target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]));
+    assert!(target(&mut f).iter().all(|&t| unorm8_eq(t, ORANGE)));
 
     let swapped = fragment([4, 0]);
     let second_page = &swapped[0x60..];
@@ -1455,7 +1615,11 @@ fn writes_to_any_page_of_a_scattered_program_translate_it_again() {
         3,
         "the write to the second page's device memory reached the program"
     );
-    assert!(target(&mut f).iter().all(|&t| t == [128, 255, 0, 255]));
+    assert!(
+        target(&mut f)
+            .iter()
+            .all(|&t| unorm8_eq(t, [128, 255, 0, 255]))
+    );
     f.assert_no_validation_errors();
 }
 
@@ -2531,7 +2695,7 @@ fn render(
         .map(|row| {
             row.iter()
                 .map(|&t| match t {
-                    ORANGE => '#',
+                    t if unorm8_eq(t, ORANGE) => '#',
                     [0, 0, 0, 0] => '.',
                     _ => '?',
                 })
@@ -3213,7 +3377,7 @@ fn unbound_textures_of_every_type_read_zeros() {
         f.rasterizer
             .invalidate_region(DADDR + PROGRAMS + u64::from(FRAGMENT), 0x100);
         draw(&mut f, &gmmu, &regs);
-        assert!(target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]));
+        assert!(target(&mut f).iter().all(|&t| unorm8_eq(t, ORANGE)));
         let program = typed_table_sampling_program(ty);
         write(&f, PROGRAMS + u64::from(FRAGMENT), &program);
         f.rasterizer
@@ -3595,7 +3759,7 @@ fn the_disk_cache_serves_programs_and_pipelines_of_an_earlier_run() {
     let stats = f.rasterizer.draw.shaders.stats();
     assert_eq!((stats.translated, stats.disk_hits), (0, 2));
     assert_eq!(f.rasterizer.draw.pipelines.stats().built, 1);
-    assert!(target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]));
+    assert!(target(&mut f).iter().all(|&t| unorm8_eq(t, ORANGE)));
     f.assert_no_validation_errors();
     drop(f);
 
@@ -3607,7 +3771,11 @@ fn the_disk_cache_serves_programs_and_pipelines_of_an_earlier_run() {
         (1, 1),
         "a changed fragment program translates again; the vertex program is reused"
     );
-    assert!(target(&mut f).iter().all(|&t| t == [128, 255, 0, 255]));
+    assert!(
+        target(&mut f)
+            .iter()
+            .all(|&t| unorm8_eq(t, [128, 255, 0, 255]))
+    );
     f.assert_no_validation_errors();
     drop(f);
     let _ = std::fs::remove_dir_all(&dir);
@@ -3622,7 +3790,7 @@ fn the_disk_cache_serves_programs_the_workers_translated_in_an_earlier_run() {
     f.rasterizer.draw.shaders.set_async(true);
     let regs = draw_regs();
     let mut rounds = 0;
-    while target(&mut f).iter().any(|&t| t != [255, 128, 0, 255]) {
+    while target(&mut f).iter().any(|&t| !unorm8_eq(t, ORANGE)) {
         rounds += 1;
         assert!(rounds <= 4, "the vertex then the fragment program land");
         draw(&mut f, &gmmu, &regs);
@@ -3639,7 +3807,7 @@ fn the_disk_cache_serves_programs_the_workers_translated_in_an_earlier_run() {
         (0, 2),
         "a second run finds both programs on disk"
     );
-    assert!(target(&mut f).iter().all(|&t| t == [255, 128, 0, 255]));
+    assert!(target(&mut f).iter().all(|&t| unorm8_eq(t, ORANGE)));
     f.assert_no_validation_errors();
     drop(f);
     let _ = std::fs::remove_dir_all(&dir);
@@ -3916,7 +4084,7 @@ fn mesh_draws_rasterize_the_primitives_their_mesh_program_writes() {
     mesh_draw(&mut f, &gmmu, &regs, 1);
     let texels = switch2_target(&mut f);
     assert!(
-        texels.iter().all(|&t| t == [255, 128, 0, 255]),
+        texels.iter().all(|&t| unorm8_eq(t, ORANGE)),
         "the triangle covers the target: {:?}",
         &texels[..4]
     );
@@ -3933,7 +4101,7 @@ fn task_programs_launch_the_mesh_workgroups_they_count() {
     mesh_draw(&mut f, &gmmu, &regs, 1);
     let texels = switch2_target(&mut f);
     assert!(
-        texels.iter().all(|&t| t == [255, 128, 0, 255]),
+        texels.iter().all(|&t| unorm8_eq(t, ORANGE)),
         "the task's mesh workgroup covers the target: {:?}",
         &texels[..4]
     );
@@ -4023,7 +4191,7 @@ fn mesh_indirect_draw(
         },
     );
     let texels = switch2_target(f);
-    let covered = texels.iter().all(|&t| t == [255, 128, 0, 255]);
+    let covered = texels.iter().all(|&t| unorm8_eq(t, ORANGE));
     assert!(
         covered || texels.iter().all(|&t| t == [0; 4]),
         "all or nothing: {:?}",
