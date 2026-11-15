@@ -502,6 +502,31 @@ impl Hasher for FxHasher {
 
 type FxBuild = BuildHasherDefault<FxHasher>;
 
+fn diag_watched(info: &ImageInfo) -> bool {
+    static W: std::sync::OnceLock<Option<(u32, u32, u32)>> = std::sync::OnceLock::new();
+    let watch = *W.get_or_init(|| {
+        let v = std::env::var("LICHII_DIAG_WATCH").ok()?;
+        let mut it = v.split('x').filter_map(|s| s.trim().parse().ok());
+        Some((it.next()?, it.next()?, it.next()?))
+    });
+    watch.is_some_and(|(w, h, d)| info.width == w && info.height == h && info.depth == d)
+}
+
+fn diag_watch_log(what: &str, detail: String) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 80 {
+        return;
+    }
+    let trace = std::backtrace::Backtrace::force_capture().to_string();
+    let frames: Vec<&str> = trace
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.contains("lichii_") && !l.contains("diag_watch"))
+        .take(12)
+        .collect();
+    tracing::warn!(what, detail, frames = frames.join(" | "), "diag watch");
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct LookupKey {
     gmmu: usize,
@@ -1247,6 +1272,9 @@ impl TextureCache {
         image.gpu_modified = true;
         image.cpu_dirty = false;
         image.modified = tick;
+        if diag_watched(&image.info) {
+            diag_watch_log("mark_modified", format!("{id:?} {:?}", image.info));
+        }
         image.written = tick;
         image.current = tick;
         image.keep_out.clear();
@@ -2359,9 +2387,34 @@ impl TextureCache {
             self.get(o)
                 .is_some_and(|o| o.modified > current && !o.image.is_sparse())
         }));
+        if !newer.is_empty() {
+            let image = self.get(id).expect("a live image id");
+            let watched = diag_watched(&image.info)
+                || newer.iter().any(|&o| self.get(o).is_some_and(|o| diag_watched(&o.info)));
+            if watched {
+                let others: Vec<String> = newer
+                    .iter()
+                    .map(|&o| {
+                        let o2 = self.get(o).expect("overlaps are live");
+                        format!("{o:?} {:?} seg={:x?}", o2.info, o2.segments.first().map(|s| (s.daddr, s.size)))
+                    })
+                    .collect();
+                diag_watch_log(
+                    "take_from_overlaps",
+                    format!(
+                        "{id:?} {:?} seg={:x?} newer={others:?}",
+                        image.info,
+                        image.segments.first().map(|s| (s.daddr, s.size))
+                    ),
+                );
+            }
+        }
         if newer.is_empty() || self.sync_on_gpu(tx, id, &mut newer)? {
             self.overlap_scratch = newer;
             return Ok(());
+        }
+        if self.get(id).is_some_and(|i| diag_watched(&i.info)) {
+            diag_watch_log("take_from_overlaps fell back to the CPU", format!("{id:?}"));
         }
         let image = self.get(id).expect("a live image id");
         let own = image.gpu_modified && !self.covered(id, &newer);
@@ -2447,6 +2500,10 @@ impl TextureCache {
         newer.sort_by_key(|a| self.get(a.id).map_or(0, |other| other.written));
         let mut result = Ok(());
         for alias in &newer {
+            if diag_watched(&self.image(id).info) || diag_watched(&self.image(alias.id).info) {
+                let (a, b) = (self.image(id).info, self.image(alias.id).info);
+                diag_watch_log("take_from_aliases", format!("{id:?} {a:?} <- {:?} {b:?}", alias.id));
+            }
             result = self.copy_texels(scheduler, alias.id, alias.at, id, alias.own, alias.extent);
             if result.is_err() {
                 break;
