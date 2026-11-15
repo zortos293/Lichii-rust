@@ -882,6 +882,13 @@ impl Shared {
                     media.drop_queued();
                     let dropped = media.decoded.drain(..).filter_map(|d| d.frame);
                     state.frames.extend(dropped);
+                } else if std::env::var_os("LICHII_DIAG_EOS_MERGE").is_some()
+                    && matches!(media.decoded[..], [Decoded { frame: None, end: true, .. }])
+                    && let Some(last) = state.decoded.back_mut()
+                {
+                    tracing::info!("diag vdec end of stream marks the pending frame at pts {}", last.pts);
+                    last.end = true;
+                    media.decoded.clear();
                 } else {
                     state.decoded.extend(media.decoded.drain(..));
                 }
