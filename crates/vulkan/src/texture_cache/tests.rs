@@ -3423,3 +3423,246 @@ fn cached_misses_end_when_an_image_is_created() {
     );
     f.assert_no_validation_errors();
 }
+
+/// Colour targets bound one layer at a time, at their layer's address, which a later 2D-array
+/// or cube texture over the same memory samples as its layers.
+#[test]
+fn layer_targets_rendered_one_at_a_time_form_the_array_and_cube_textures_over_them() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        for (layers, texture_type, size, bh) in [(5, 5, 128, 4), (6, 3, 64, 3), (2, 5, 256, 4)] {
+            let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+                return;
+            };
+            let mut header = tic(0x08, GPU_VA, size, size, layers, 1, bh);
+            header.0[4] = (header.0[4] & !(0xf << 23)) | texture_type << 23;
+            let desc = header.decode().unwrap();
+            let array = ImageInfo::from_texture(&desc, gob).unwrap();
+            let info = rt_info(size, size, bh, gob);
+            for layer in 0..layers {
+                let value = (layer + 1) as f32 / 8.0;
+                clear_rt_at(
+                    &mut f,
+                    GPU_VA + u64::from(layer) * array.layer_stride,
+                    &info,
+                    [value, 0.0, 1.0 - value, 1.0],
+                    Rect::ALL,
+                );
+            }
+            let (id, view) = f.texture(&header);
+            let texels = f.read_image(id);
+            for layer in 0..layers {
+                let value = ((layer + 1) as f32 / 8.0 * 255.0).round() as u8;
+                let got = &texels[(view.base_layer + layer) as usize];
+                assert!(
+                    got.as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|&t| unorm8_close(t, [value, 0, 255 - value, 255])),
+                    "{gob:?} {size}x{size}x{layers} type {texture_type}: layer {layer} holds {:?}",
+                    &got[..4]
+                );
+            }
+            f.assert_no_validation_errors();
+        }
+    }
+}
+
+fn unorm8_close(a: [u8; 4], b: [u8; 4]) -> bool {
+    a.iter().zip(b).all(|(&x, y)| x.abs_diff(y) <= 1)
+}
+
+/// The same as above for the formats MKW's light probes use, whose targets read back as one
+/// uniform value per layer, distinct between layers and never zero.
+#[test]
+fn layer_targets_of_float_and_snorm_formats_form_the_textures_over_them() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        for (format, code, kind) in [
+            (PixelFormat::R16G16B16A16Float, 0x03, 7),
+            (PixelFormat::B10G11R11Float, 0x21, 7),
+            (PixelFormat::R8Snorm, 0x1d, 1),
+        ] {
+            for (layers, texture_type, size, bh) in [(5, 5, 128, 4), (6, 3, 64, 3)] {
+                let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+                    return;
+                };
+                let mut header = tic(code, GPU_VA, size, size, layers, 1, bh);
+                header.0[0] = (header.0[0] & !(0xfff << 7))
+                    | kind << 7
+                    | kind << 10
+                    | kind << 13
+                    | kind << 16;
+                header.0[4] = (header.0[4] & !(0xf << 23)) | texture_type << 23;
+                let desc = header.decode().unwrap();
+                let array = ImageInfo::from_texture(&desc, gob).unwrap();
+                assert_eq!(array.format, format);
+                let s = surface(format, size, size, 1, 1, bh, gob);
+                let info = ImageInfo {
+                    format,
+                    layers: 1,
+                    layer_stride: s.layer_stride(),
+                    ..rt_info(size, size, bh, gob)
+                };
+                for layer in 0..layers {
+                    let value = (layer + 1) as f32 / 8.0;
+                    clear_rt_at(
+                        &mut f,
+                        GPU_VA + u64::from(layer) * array.layer_stride,
+                        &info,
+                        [value, 0.25, 1.0 - value, 1.0],
+                        Rect::ALL,
+                    );
+                }
+                let (id, view) = f.texture(&header);
+                let texels = f.read_image(id);
+                let texel = format.bytes_per_block() as usize;
+                let mut seen = Vec::new();
+                for layer in 0..layers {
+                    let got = &texels[(view.base_layer + layer) as usize];
+                    let first = &got[..texel];
+                    assert!(
+                        first.iter().any(|&b| b != 0)
+                            && got.chunks(texel).all(|t| t == first)
+                            && !seen.contains(&first.to_vec()),
+                        "{gob:?} {format:?} {size}x{size}x{layers} type {texture_type}: layer {layer} holds {first:?}"
+                    );
+                    seen.push(first.to_vec());
+                }
+                f.assert_no_validation_errors();
+            }
+        }
+    }
+}
+
+/// Every level of every face of a mipmapped cube rendered as its own target, at the address
+/// and block height the level has in the cube, then sampled as the cube.
+#[test]
+fn level_and_face_targets_form_the_mipmapped_cube_over_them() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        for (format, code, kind) in [
+            (PixelFormat::A8B8G8R8Unorm, 0x08, 2),
+            (PixelFormat::B10G11R11Float, 0x21, 7),
+            (PixelFormat::R16G16B16A16Float, 0x03, 7),
+        ] {
+            let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+                return;
+            };
+            let (size, levels, bh) = (64, 7, 3);
+            let mut header = tic(code, GPU_VA, size, size, 1, levels, bh);
+            header.0[0] =
+                (header.0[0] & !(0xfff << 7)) | kind << 7 | kind << 10 | kind << 13 | kind << 16;
+            header.0[4] = (header.0[4] & !(0xf << 23)) | 3 << 23;
+            let desc = header.decode().unwrap();
+            let cube = ImageInfo::from_texture(&desc, gob).unwrap();
+            assert_eq!((cube.layers, cube.levels), (6, levels));
+            let layout = cube.surface();
+            for layer in 0..6 {
+                for level in 0..levels {
+                    let tiling = layout.level_tiling(level);
+                    let (w, h) = ((size >> level).max(1), (size >> level).max(1));
+                    let s = surface(format, w, h, 1, 1, tiling.block_height_log2, gob);
+                    let info = ImageInfo {
+                        format,
+                        width: w,
+                        height: h,
+                        layer_stride: s.layer_stride(),
+                        ..rt_info(w, h, tiling.block_height_log2, gob)
+                    };
+                    let value = (layer * levels + level + 1) as f32 / 64.0;
+                    clear_rt_at(
+                        &mut f,
+                        GPU_VA + cube.subresource_offset(level, layer),
+                        &info,
+                        [value, 0.25, 1.0 - value, 1.0],
+                        Rect::ALL,
+                    );
+                }
+            }
+            let (id, view) = f.texture(&header);
+            assert_eq!(view.base_layer, 0);
+            let texels = f.read_image(id);
+            let texel = format.bytes_per_block() as usize;
+            let mut seen = Vec::new();
+            for layer in 0..6 {
+                for level in 0..levels {
+                    let got = &texels[(layer * levels + level) as usize];
+                    let first = &got[..texel];
+                    assert!(
+                        first.iter().any(|&b| b != 0)
+                            && got.chunks(texel).all(|t| t == first)
+                            && !seen.contains(&first.to_vec()),
+                        "{gob:?} {format:?}: face {layer} level {level} holds {first:?}"
+                    );
+                    seen.push(first.to_vec());
+                }
+            }
+            f.assert_no_validation_errors();
+        }
+    }
+}
+/// The same with the cube sampled before its faces and levels are rendered.
+#[test]
+fn level_and_face_targets_render_into_the_mipmapped_cube_sampled_before_them() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        for (format, code, kind) in [
+            (PixelFormat::A8B8G8R8Unorm, 0x08, 2),
+            (PixelFormat::B10G11R11Float, 0x21, 7),
+            (PixelFormat::R16G16B16A16Float, 0x03, 7),
+        ] {
+            let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+                return;
+            };
+            let (size, levels, bh) = (64, 7, 3);
+            let mut header = tic(code, GPU_VA, size, size, 1, levels, bh);
+            header.0[0] =
+                (header.0[0] & !(0xfff << 7)) | kind << 7 | kind << 10 | kind << 13 | kind << 16;
+            header.0[4] = (header.0[4] & !(0xf << 23)) | 3 << 23;
+            let desc = header.decode().unwrap();
+            let cube = ImageInfo::from_texture(&desc, gob).unwrap();
+            assert_eq!((cube.layers, cube.levels), (6, levels));
+            let layout = cube.surface();
+            let (first, _) = f.texture(&header);
+            for layer in 0..6 {
+                for level in 0..levels {
+                    let tiling = layout.level_tiling(level);
+                    let (w, h) = ((size >> level).max(1), (size >> level).max(1));
+                    let s = surface(format, w, h, 1, 1, tiling.block_height_log2, gob);
+                    let info = ImageInfo {
+                        format,
+                        width: w,
+                        height: h,
+                        layer_stride: s.layer_stride(),
+                        ..rt_info(w, h, tiling.block_height_log2, gob)
+                    };
+                    let value = (layer * levels + level + 1) as f32 / 64.0;
+                    clear_rt_at(
+                        &mut f,
+                        GPU_VA + cube.subresource_offset(level, layer),
+                        &info,
+                        [value, 0.25, 1.0 - value, 1.0],
+                        Rect::ALL,
+                    );
+                }
+            }
+            let (id, view) = f.texture(&header);
+            assert_eq!(id, first, "the faces render into the cube");
+            assert_eq!(view.base_layer, 0);
+            let texels = f.read_image(id);
+            let texel = format.bytes_per_block() as usize;
+            let mut seen = Vec::new();
+            for layer in 0..6 {
+                for level in 0..levels {
+                    let got = &texels[(layer * levels + level) as usize];
+                    let first = &got[..texel];
+                    assert!(
+                        first.iter().any(|&b| b != 0)
+                            && got.chunks(texel).all(|t| t == first)
+                            && !seen.contains(&first.to_vec()),
+                        "{gob:?} {format:?}: face {layer} level {level} holds {first:?}"
+                    );
+                    seen.push(first.to_vec());
+                }
+            }
+            f.assert_no_validation_errors();
+        }
+    }
+}
