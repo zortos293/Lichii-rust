@@ -2679,12 +2679,33 @@ impl TextureCache {
             }
         }
         let mut readback = self.readback.take();
+        let dl_start = std::time::Instant::now();
+        let dl_what: Vec<String> = downloads
+            .iter()
+            .map(|d| {
+                let i = self.image(d.id);
+                format!(
+                    "{:?}/{:?}/{:?} {}x{}",
+                    i.info.format, i.host.format, i.host.conversion, i.info.width, i.info.height
+                )
+            })
+            .collect();
         let result = if downloads.is_empty() {
             Ok(())
         } else {
             self.record_downloads(tx, &mut downloads, &mut readback)
                 .and_then(|()| tx.scheduler.finish())
         };
+        if !dl_what.is_empty() {
+            crate::rasterizer::draw::diag::with(|d| {
+                d.event(&format!(
+                    "DOWNLOAD n={} ms={:.2} {:?}",
+                    dl_what.len(),
+                    dl_start.elapsed().as_secs_f64() * 1e3,
+                    dl_what
+                ))
+            });
+        }
         if result.is_ok()
             && let Some(data) = readback.as_ref().and_then(Buffer::mapped)
         {

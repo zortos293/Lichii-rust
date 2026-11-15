@@ -2734,7 +2734,7 @@ fn storage_pointer(
 }
 
 mod assembly;
-pub(super) mod diag;
+pub(crate) mod diag;
 mod dispatch_grid;
 mod frame_decode;
 mod mesh_indirect;

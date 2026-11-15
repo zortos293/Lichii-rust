@@ -6,7 +6,7 @@
 //! through the [`TextureCache`], its collector once per presented frame, and draws and compute
 //! dispatches (see [`draw`]).
 
-mod draw;
+pub(crate) mod draw;
 mod frame_dump;
 mod samples;
 
