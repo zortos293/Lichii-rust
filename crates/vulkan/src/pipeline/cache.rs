@@ -414,7 +414,11 @@ impl Context {
             if let Some(aftermath) = crate::debug::aftermath::get() {
                 aftermath.save_shader(&program.spirv);
             }
-            modules.stages.push((stage_flags(program.stage), module));
+            let guest_warp = self.device.shader_profile.runs_guest_warp(program.stage)
+                && program.info.uses_warp_size();
+            modules
+                .stages
+                .push((stage_flags(program.stage), module, guest_warp));
         }
         Ok(modules)
     }
@@ -459,16 +463,8 @@ impl Context {
             }
         }
         let modules = self.modules(programs.iter().flatten().map(|p| &**p))?;
-        let stages: Vec<_> = modules
-            .stages
-            .iter()
-            .map(|&(stage, module)| {
-                vk::PipelineShaderStageCreateInfo::default()
-                    .stage(stage)
-                    .module(module)
-                    .name(ENTRY)
-            })
-            .collect();
+        let mut warp = vec![guest_warp_size(); modules.stages.len()];
+        let stages = modules.stage_infos(&mut warp);
 
         let limits = &self.device.properties.limits;
         let mut attributes = Vec::new();
@@ -729,19 +725,15 @@ impl Context {
             ));
         }
         let modules = self.modules([program])?;
-        let (stage, module) = modules.stages[0];
+        let mut warp = [guest_warp_size()];
+        let stage = modules.stage_infos(&mut warp).remove(0);
         let mut feedback = vk::PipelineCreationFeedback::default();
         let mut stage_feedback = [vk::PipelineCreationFeedback::default()];
         let mut feedback_info = vk::PipelineCreationFeedbackCreateInfo::default()
             .pipeline_creation_feedback(&mut feedback)
             .pipeline_stage_creation_feedbacks(&mut stage_feedback);
         let info = vk::ComputePipelineCreateInfo::default()
-            .stage(
-                vk::PipelineShaderStageCreateInfo::default()
-                    .stage(stage)
-                    .module(module)
-                    .name(ENTRY),
-            )
+            .stage(stage)
             .layout(layout.raw)
             .push_next(&mut feedback_info);
         // SAFETY: every referenced object is live; the cache is internally synchronised.
@@ -766,12 +758,42 @@ fn cache_hit(feedback: &vk::PipelineCreationFeedback) -> bool {
 /// Shader modules of one build, destroyed once the pipeline is created.
 struct Modules<'a> {
     device: &'a Device,
-    stages: Vec<(vk::ShaderStageFlags, vk::ShaderModule)>,
+    /// Each stage, its module, and whether it must run at the guest's 32-lane warp.
+    stages: Vec<(vk::ShaderStageFlags, vk::ShaderModule, bool)>,
+}
+
+impl Modules<'_> {
+    /// Stage create infos for the modules; `warp` holds one subgroup size request per stage.
+    fn stage_infos<'b>(
+        &self,
+        warp: &'b mut [vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo<'static>],
+    ) -> Vec<vk::PipelineShaderStageCreateInfo<'b>> {
+        self.stages
+            .iter()
+            .zip(warp)
+            .map(|(&(stage, module, guest_warp), warp)| {
+                let info = vk::PipelineShaderStageCreateInfo::default()
+                    .stage(stage)
+                    .module(module)
+                    .name(ENTRY);
+                if guest_warp {
+                    info.push_next(warp)
+                } else {
+                    info
+                }
+            })
+            .collect()
+    }
+}
+
+/// A request for the guest's 32-lane subgroups.
+fn guest_warp_size() -> vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo<'static> {
+    vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(32)
 }
 
 impl Drop for Modules<'_> {
     fn drop(&mut self) {
-        for &(_, module) in &self.stages {
+        for &(_, module, _) in &self.stages {
             // SAFETY: pipeline creation finished; modules are not needed afterwards.
             unsafe { self.device.raw.destroy_shader_module(module, None) };
         }
