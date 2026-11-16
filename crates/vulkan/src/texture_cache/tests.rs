@@ -841,7 +841,7 @@ fn stale_overlaps_are_not_joined_over_newer_whole_clears() {
 }
 
 #[test]
-fn stale_overlaps_take_newer_texels_before_they_are_drawn_into() {
+fn targets_drawn_into_keep_their_own_texels_over_newer_overlaps() {
     let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
         return;
     };
@@ -849,12 +849,35 @@ fn stale_overlaps_take_newer_texels_before_they_are_drawn_into() {
     let small = rt_info(32, 32, 2, GobLayout::Tegra);
     let a = clear_rt(&mut f, &big, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
     let b = clear_rt(&mut f, &small, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    let before = f.cache.traffic();
     let (mut tx, cache, gmmu) = f.tx();
     let found = cache
         .render_target(&mut tx, gmmu, GPU_VA, &big, false)
         .unwrap()
         .unwrap();
     assert_eq!(found.id, a.id);
+    assert_eq!(f.cache.traffic(), before, "no sync, upload or write-back");
+    assert!(
+        all_texels(&f.read_image(a.id)[0], GREEN),
+        "the target's own texels"
+    );
+    assert!(all_texels(&f.read_image(b.id)[0], RED));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn sampled_images_still_take_newer_overlaps() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let big = rt_info(64, 64, 3, GobLayout::Tegra);
+    let small = rt_info(32, 32, 2, GobLayout::Tegra);
+    let a = clear_rt(&mut f, &big, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let b = clear_rt(&mut f, &small, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    let syncs = f.cache.traffic().gpu_syncs;
+    let (id, _) = f.texture(&tic(0x08, GPU_VA, 64, 64, 1, 1, 3));
+    assert_eq!(id, a.id);
+    assert_eq!(f.cache.traffic().gpu_syncs, syncs + 1);
     let read = f.read_image(a.id);
     assert_eq!(
         count_texels(&read[0], RED),
@@ -2575,10 +2598,7 @@ fn gpu_overlap_syncs_move_texels_through_the_guest_layout() {
     let syncs = f.cache.traffic().gpu_syncs;
     let downloads = f.cache.traffic().downloads;
     let (mut tx, cache, gmmu) = f.tx();
-    let synced = cache
-        .render_target(&mut tx, gmmu, GPU_VA, &wide, false)
-        .unwrap()
-        .unwrap();
+    let synced = cache.find(&mut tx, gmmu, GPU_VA, &wide).unwrap().unwrap();
     assert_eq!(synced.id, target.id);
     let texels = f.read_image(target.id).remove(0);
     assert!(f.cache.traffic().gpu_syncs > syncs);
@@ -2610,10 +2630,7 @@ fn gpu_overlap_syncs_skip_overlaps_of_block_padding_alone() {
     );
     let syncs = f.cache.traffic().gpu_syncs;
     let (mut tx, cache, gmmu) = f.tx();
-    let synced = cache
-        .render_target(&mut tx, gmmu, GPU_VA, &padded, false)
-        .unwrap()
-        .unwrap();
+    let synced = cache.find(&mut tx, gmmu, GPU_VA, &padded).unwrap().unwrap();
     assert_eq!(synced.id, target.id);
     assert!(f.cache.traffic().gpu_syncs > syncs);
     assert_eq!(f.read_image(target.id).remove(0), expected);
@@ -2653,10 +2670,7 @@ fn gpu_overlap_syncs_give_aliased_bytes_to_the_last_source_page() {
     );
     let syncs = f.cache.traffic().gpu_syncs;
     let (mut tx, cache, gmmu) = f.tx();
-    let synced = cache
-        .render_target(&mut tx, gmmu, GPU_VA, &info, false)
-        .unwrap()
-        .unwrap();
+    let synced = cache.find(&mut tx, gmmu, GPU_VA, &info).unwrap().unwrap();
     assert_eq!(synced.id, target.id);
     assert!(f.cache.traffic().gpu_syncs > syncs);
     let texels = f.read_image(target.id).remove(0);
@@ -2694,10 +2708,7 @@ fn aliased_sources_whose_rows_end_inside_a_word_write_back_through_guest_memory(
     clear_rt_at(&mut f, alias, &bytes, [1.0, 0.0, 0.0, 0.0], Rect::ALL);
     let before = f.cache.traffic();
     let (mut tx, cache, gmmu) = f.tx();
-    let synced = cache
-        .render_target(&mut tx, gmmu, GPU_VA, &info, false)
-        .unwrap()
-        .unwrap();
+    let synced = cache.find(&mut tx, gmmu, GPU_VA, &info).unwrap().unwrap();
     assert_eq!(synced.id, target.id);
     let after = f.cache.traffic();
     assert_eq!(after.gpu_syncs, before.gpu_syncs, "no GPU sync");
@@ -2719,10 +2730,7 @@ fn gpu_overlap_syncs_keep_texels_whose_later_alias_is_padding() {
     clear_rt_at(&mut f, alias, &info, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
     let syncs = f.cache.traffic().gpu_syncs;
     let (mut tx, cache, gmmu) = f.tx();
-    let synced = cache
-        .render_target(&mut tx, gmmu, GPU_VA, &info, false)
-        .unwrap()
-        .unwrap();
+    let synced = cache.find(&mut tx, gmmu, GPU_VA, &info).unwrap().unwrap();
     assert_eq!(synced.id, target.id);
     assert!(f.cache.traffic().gpu_syncs > syncs);
     let texels = f.read_image(target.id).remove(0);
@@ -2787,10 +2795,7 @@ fn depth_stencil_overlaps_sync_on_the_gpu() {
         let syncs = f.cache.traffic().gpu_syncs;
         let downloads = f.cache.traffic().downloads;
         let (mut tx, cache, gmmu) = f.tx();
-        let synced = cache
-            .render_target(&mut tx, gmmu, GPU_VA, &wide, false)
-            .unwrap()
-            .unwrap();
+        let synced = cache.find(&mut tx, gmmu, GPU_VA, &wide).unwrap().unwrap();
         assert_eq!(synced.id, target.id);
         assert!(f.cache.traffic().gpu_syncs > syncs, "{format:?}");
         assert_eq!(f.cache.traffic().downloads, downloads, "{format:?}");
@@ -2924,10 +2929,7 @@ fn x8d24_overlaps_sync_on_the_gpu_converting_as_the_cpu_does() {
         );
         let before = f.cache.traffic();
         let (mut tx, cache, gmmu) = f.tx();
-        let synced = cache
-            .render_target(&mut tx, gmmu, GPU_VA, &depth, false)
-            .unwrap()
-            .unwrap();
+        let synced = cache.find(&mut tx, gmmu, GPU_VA, &depth).unwrap().unwrap();
         assert_eq!(synced.id, target.id);
         assert!(f.cache.traffic().gpu_syncs > before.gpu_syncs, "{host:?}");
         assert_eq!(f.cache.traffic().downloads, before.downloads, "{host:?}");
@@ -2973,10 +2975,7 @@ fn x8d24_overlaps_sync_on_the_gpu_converting_as_the_cpu_does() {
             .collect();
         let before = f.cache.traffic();
         let (mut tx, cache, gmmu) = f.tx();
-        let taken = cache
-            .render_target(&mut tx, gmmu, GPU_VA, &colour, false)
-            .unwrap()
-            .unwrap();
+        let taken = cache.find(&mut tx, gmmu, GPU_VA, &colour).unwrap().unwrap();
         assert!(f.cache.traffic().gpu_syncs > before.gpu_syncs, "{host:?}");
         assert_eq!(f.cache.traffic().downloads, before.downloads, "{host:?}");
         let texels = f.read_image(taken.id).remove(0);
