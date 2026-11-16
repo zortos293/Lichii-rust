@@ -988,6 +988,14 @@ impl VulkanRasterizer {
                 }
             }
             crate::pipeline::environment::LIRU14_DRAW.set(false);
+            if shirt {
+                eprintln!(
+                    "LIRU14 shirt ids textures={:?} depth={:?} colors={:?}",
+                    self.draw.textures.iter().map(|t| t.index).collect::<Vec<_>>(),
+                    self.draw.depth.map(|t| t.id.index),
+                    self.draw.colors.map(|t| t.map(|t| t.id.index))
+                );
+            }
             if mesh {
                 self.draw.vertex_buffers.clear();
                 self.draw.vertex_offsets.clear();
