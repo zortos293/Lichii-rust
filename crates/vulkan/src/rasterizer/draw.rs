@@ -2748,10 +2748,10 @@ impl VulkanRasterizer {
             });
             let phase = liru14_phase(regs);
             let bias = match phase {
-                1 => (
-                    regs.depth_bias * 25.0,
+                2 => (
+                    regs.depth_bias * 2000.0,
                     regs.depth_bias_clamp,
-                    regs.slope_scale_depth_bias * 4.0,
+                    regs.slope_scale_depth_bias * 20.0,
                 ),
                 _ => (
                     regs.depth_bias / 2.0,
@@ -2798,9 +2798,7 @@ impl VulkanRasterizer {
                     vk::CullModeFlags::NONE
                 };
                 let cull = match (phase, cull) {
-                    (2, vk::CullModeFlags::BACK) => vk::CullModeFlags::FRONT,
-                    (2, vk::CullModeFlags::FRONT) => vk::CullModeFlags::BACK,
-                    (2, vk::CullModeFlags::NONE) => vk::CullModeFlags::FRONT,
+                    (9, _) => vk::CullModeFlags::FRONT,
                     _ => cull,
                 };
                 shadow.set(Slot::CullMode, cull, || raw.cmd_set_cull_mode(cmd, cull));
@@ -3058,7 +3056,7 @@ impl VulkanRasterizer {
                     regs.viewport_clip_control.geometry_clip(),
                     G::PASSTHROUGH | G::FRUSTUM_XYZ | G::FRUSTUM_Z
                 );
-                let clamp = features.depth_clamp && clamps;
+                let clamp = features.depth_clamp && clamps && phase != 1;
                 shadow.set(Slot::DepthClampEnable, clamp, || {
                     draw.eds3.cmd_set_depth_clamp_enable(cmd, clamp)
                 });
