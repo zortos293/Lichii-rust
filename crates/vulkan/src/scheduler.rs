@@ -138,7 +138,7 @@ impl Scheduler {
         let loc = std::panic::Location::caller();
         let cmd = self.command_buffer()?;
         self.end_rendering(cmd);
-        if let Some(gt) = self.gt.as_mut() { gt.locate(loc); }
+        if let Some(gt) = self.gt.as_mut() { gt.locate(&self.device, cmd, loc); }
         Ok(cmd)
     }
 
@@ -697,12 +697,19 @@ mod gputime {
             }
         }
 
-        pub(super) fn locate(&mut self, loc: &'static Location<'static>) {
-            if let Some(cur) = self.cur.as_mut()
-                && !cur.located
-                && cur.label.starts_with('O')
-            {
-                cur.label = format!("O {}:{}", loc.file().rsplit(['/', '\\']).next().unwrap_or(""), loc.line());
+        pub(super) fn locate(&mut self, device: &Device, cmd: vk::CommandBuffer, loc: &'static Location<'static>) {
+            let label = format!("O {}:{}", loc.file().rsplit(['/', '\\']).next().unwrap_or(""), loc.line());
+            let Some(cur) = self.cur.as_mut() else { return };
+            if !cur.label.starts_with('O') || cur.label == label {
+                return;
+            }
+            if !cur.located {
+                cur.label = label;
+                cur.located = true;
+                return;
+            }
+            self.mark(device, cmd, label);
+            if let Some(cur) = self.cur.as_mut() {
                 cur.located = true;
             }
         }
