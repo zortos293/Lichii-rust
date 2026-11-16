@@ -902,6 +902,59 @@ impl VulkanRasterizer {
             return Ok(());
         }
         let liru14_idx = LIRU14_SHIDX.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some(dir) = std::env::var_os("LIRU14_SMDUMP")
+            && LIRU14_LATE.load(std::sync::atomic::Ordering::Relaxed)
+            && regs.rt[render_target_index(regs, 0)].address() == 0x511cf0000
+        {
+            static DONE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 200 {
+                let dir = std::path::PathBuf::from(dir);
+                let scene_bh = regs.zeta.tile_mode.block_height();
+                eprintln!("LIRU14 smdump scene_zeta={:#x} bh={scene_bh} tile={:?}", regs.zeta.address(), regs.zeta.tile_mode);
+                let b3 = ctx.const_buffers[4][3];
+                let mut words = vec![0u8; 0x310];
+                let _ = ctx.memory.read_block(b3.address, &mut words);
+                let floats: Vec<String> = words
+                    .chunks_exact(4)
+                    .map(|c| format!("{}", f32::from_le_bytes(c.try_into().unwrap())))
+                    .collect();
+                let _ = std::fs::write(dir.join("rcv_cb3.txt"), floats.join("\n"));
+                for (va, width, height, bpp, bh, name) in [
+                    (0x523270000u64, 2048u32, 2048u32, 2u32, 4u32, "shadow_d16.raw"),
+                    (regs.zeta.address(), 1920, 1080, 4, scene_bh, "scene_d32.raw"),
+                ] {
+                    let tiling = lichii_texture::block_linear::Tiling {
+                        width,
+                        height,
+                        depth: 1,
+                        bytes_per_block: bpp,
+                        block_height_log2: bh,
+                        block_depth_log2: 0,
+                        row_gobs: (width * bpp).div_ceil(64),
+                        layout: lichii_texture::block_linear::GobLayout::Tegra,
+                    };
+                    let gobs_h = 8u32 << bh;
+                    let size = u64::from(tiling.row_gobs) * 512 * u64::from(height.div_ceil(gobs_h)) * u64::from(1u32 << bh);
+                    if let Some(daddr) = ctx.memory.translate(va) {
+                        let mut tx = crate::texture_cache::Transfer {
+                            scheduler: &mut self.scheduler,
+                            staging: &mut self.staging,
+                            memory: &self.handles.device,
+                            buffers: &mut self.buffer_cache,
+                        };
+                        if let Err(e) = self.texture_cache.flush(&mut tx, daddr, size) {
+                            eprintln!("LIRU14 smdump flush failed {e}");
+                        }
+                    }
+                    let mut tiled = vec![0u8; size as usize];
+                    let _ = ctx.memory.read_block(va, &mut tiled);
+                    let mut linear = vec![0u8; (width * height * bpp) as usize];
+                    lichii_texture::block_linear::unswizzle(&tiling, &tiled, &mut linear);
+                    let _ = std::fs::write(dir.join(name), &linear);
+                    eprintln!("LIRU14 smdump wrote {name} size={size}");
+                }
+            }
+        }
         if (11..=13).contains(&liru14_idx) {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 60 {
