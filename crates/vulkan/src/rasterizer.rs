@@ -519,8 +519,7 @@ impl VulkanRasterizer {
                 let discard = written == vk::ColorComponentFlags::RGBA
                     && covers(rect, base_layer, layer_count, &info);
                 if matches!((info.width, info.height), (2560, 1440) | (1280, 720)) {
-                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 300 {
+                    if { static T: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new(); let e = T.get_or_init(std::time::Instant::now).elapsed().as_secs_f32(); (150.0..151.5).contains(&e) } {
                         tracing::info!("tgtdiag clear {}x{} {:?} rt={} written={:?} rect={:?} layers={}+{} discard={} scissor_use={} clear_rect_use={}", info.width, info.height, info.format, index, written, rect, base_layer, layer_count, discard, regs.clear_control.use_scissor(), regs.clear_control.use_clear_rect());
                     }
                 }

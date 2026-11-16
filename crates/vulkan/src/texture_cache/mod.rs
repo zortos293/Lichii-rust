@@ -1317,8 +1317,7 @@ impl TextureCache {
             image.current = tick;
         }
         if matches!((info.width, info.height), (2560, 1440) | (1280, 720)) {
-            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 600 {
+            if { static T: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new(); let e = T.get_or_init(std::time::Instant::now).elapsed().as_secs_f32(); (150.0..151.5).contains(&e) } {
                 let image = self.get(found.id).expect("a live image id");
                 tracing::info!("tgtdiag bind {}x{} {:?} id={} discard={} whole={} tick={} current={} modified={} overlaps_newest={}", info.width, info.height, info.format, found.id.index, discard, whole, self.tick, image.current, image.modified, image.overlaps_newest);
             }

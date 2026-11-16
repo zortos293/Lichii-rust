@@ -587,6 +587,7 @@ impl TextureCache {
             let desc = |i: &ImageInfo| format!("{}x{}x{} l{} {:?} {:?}", i.width, i.height, i.layers, i.levels, i.format, i.layout);
             let info = &self.get(id).expect("a live image id").info;
             let newer_desc: Vec<String> = newer.iter().map(|&o| desc(&self.get(o).expect("a live image id").info)).collect();
+            if { static T: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new(); let e = T.get_or_init(std::time::Instant::now).elapsed().as_secs_f32(); (150.0..151.5).contains(&e) } { tracing::info!("tgtdiag sync id={} ctx={} {}x{}", id.index, super::SYNC_CTX.with(|c| c.get()), info.width, info.height); }
             sync_diag_finish(format!("ctx={} {} window={}KB newer=[{}]", super::SYNC_CTX.with(|c| c.get()), desc(info), (window.1 - window.0) >> 10, newer_desc.join(" ; ")));
         }
         let tick = self.tick;
