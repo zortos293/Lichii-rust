@@ -420,6 +420,13 @@ fn special_register(t: &mut Translator<'_>, sr: u64) -> Value {
         59 => t.ir.inst(Ir::SubgroupGtMask, &[]),
         60 => t.ir.inst(Ir::SubgroupGeMask, &[]),
         132 => Value::U32(VARIABLE_RATE_1X1),
+        80..=83 => {
+            tracing::warn!(
+                sr,
+                "(stubbed) SR_CLOCK/SR_GLOBALTIMER read as 0: a title reads the shader clock"
+            );
+            Value::U32(0)
+        }
         _ => Value::U32(0),
     }
 }

@@ -159,6 +159,26 @@ fn switch2_proxy_getters_and_auto_stubs() {
 }
 
 #[test]
+fn default_display_resolution_is_the_handheld_panel() {
+    for (title, handheld) in [(SWITCH1_TITLE, [1280, 720]), (SWITCH2_TITLE, [1920, 1080])] {
+        for (docked, expected) in [(false, handheld), (true, [1920, 1080])] {
+            let mut settings = Settings::default();
+            settings.system.docked = docked;
+            let (context, client) = context(title, settings);
+            register(&context).unwrap();
+            let state = interface(&client, open(&client, 0), 0);
+            let mut reply = client.send(state, &Request::new(60)).unwrap();
+            assert_eq!(reply.result, ResultCode::SUCCESS);
+            assert_eq!(
+                reply.pop::<[i32; 2]>(),
+                expected,
+                "{title:#x} docked {docked}"
+            );
+        }
+    }
+}
+
+#[test]
 fn switch1_unknown_commands_are_reported() {
     let (_context, client, proxy) = booted(SWITCH1_TITLE);
     let functions = interface(&client, proxy, 20);

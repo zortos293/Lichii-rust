@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use lichii_common::ResultCode;
+use lichii_common::{ConsoleGeneration, ResultCode};
 use lichii_kernel::Event;
 use lichii_kernel::ipc::HleRequestContext;
 
@@ -99,7 +99,12 @@ impl Service for CommonStateGetter {
             52 | 900 => ResultCode::SUCCESS,
             55 => push_bool(ctx, false),
             60 => {
-                let resolution: [i32; 2] = if docked { [1920, 1080] } else { [1280, 720] };
+                let switch2 = self.context.program.generation == ConsoleGeneration::Switch2;
+                let resolution: [i32; 2] = if docked || switch2 {
+                    [1920, 1080]
+                } else {
+                    [1280, 720]
+                };
                 ctx.push(resolution);
                 ResultCode::SUCCESS
             }
