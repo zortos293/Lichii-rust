@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // Moves one 2D block-linear slice (the first of its block depth) between a pitch-linear buffer and a buffer of
-// guest bytes, one 32-bit word per invocation. Mirrors lichii_texture::block_linear (Tiling::offset
+// guest bytes, one 32-bit word per invocation. A row's last word may hold fewer texel bytes than four: the move
+// to the guest writes only those and keeps the guest's other bytes. Mirrors lichii_texture::block_linear (Tiling::offset
 // and GobLayout). Each word's image offset is looked up in the runs of shared device memory, so a
 // slice can be painted into the bytes of a smaller image it overlaps in one pass; words outside
 // every run are skipped. Rows start at y_base, so a pass covers only the block rows the runs
@@ -28,6 +29,7 @@ const uint DEPTH_LOW_ZERO_HIGH = 3u;
 
 layout(push_constant) uniform P {
     uint row_words;
+    uint row_bytes;
     uint height;
     uint row_gobs;
     uint block_height_log2;
@@ -117,6 +119,11 @@ void main() {
                 uint s = (stencil_words[s_index >> 2u] >> s_shift) & 0xFFu;
                 value = p.packing == DEPTH_LOW_STENCIL_HIGH ? value | (s << 24u) : s | (value << 8u);
             }
+        }
+        uint texel_bytes = p.row_bytes - xb;
+        if (texel_bytes < 4u) {
+            uint mask = (1u << (texel_bytes * 8u)) - 1u;
+            value = (guest[word] & ~mask) | (value & mask);
         }
         guest[word] = value;
     } else {

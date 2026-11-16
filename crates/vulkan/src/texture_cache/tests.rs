@@ -3033,8 +3033,11 @@ fn overlaps_written_back_upload_only_the_layers_they_cover() {
     f.memory.write_bytes(DADDR, &pattern).unwrap();
     let (texture, _) = f.texture(&header);
     let before = f.read_image(texture);
-    let mut bytes = rt_info(126, 32, 2, GobLayout::Tegra);
-    bytes.format = PixelFormat::R8Unorm;
+    let bytes = ImageInfo {
+        format: PixelFormat::R8Unorm,
+        layout: GuestLayout::Pitch { pitch: 128 },
+        ..rt_info(126, 32, 2, GobLayout::Tegra)
+    };
     assert_eq!(bytes.size_bytes(), 4096);
     let layer_va = GPU_VA + 2 * info.layer_stride;
     let target = clear_rt_at(&mut f, layer_va, &bytes, [1.0, 0.0, 0.0, 0.0], Rect::ALL);
@@ -3054,10 +3057,9 @@ fn overlaps_written_back_upload_only_the_layers_they_cover() {
     let tiling = info.surface().level_tiling(0);
     let layer = (2 * info.layer_stride) as usize;
     let mut tiled = pattern[layer..layer + tiling.size_bytes()].to_vec();
-    let rt = bytes.surface().level_tiling(0);
     for y in 0..32 {
         for x in 0..126 {
-            tiled[rt.offset(x, y, 0)] = 255;
+            tiled[y * 128 + x] = 255;
         }
     }
     let mut want = vec![0; 64 * 64 * 4];
@@ -3129,6 +3131,59 @@ fn narrow_formats_sync_into_the_layers_they_share_on_the_gpu() {
     }
     let tiling = info.surface().level_tiling(0);
     for (l, rt, width) in [(1, &halves, 128), (2, &bytes, 128)] {
+        let start = (l as u64 * info.layer_stride) as usize;
+        let mut tiled = pattern[start..start + tiling.size_bytes()].to_vec();
+        let rt = rt.surface().level_tiling(0);
+        for y in 0..32 {
+            for x in 0..width {
+                tiled[rt.offset(x, y, 0)] = 255;
+            }
+        }
+        let mut want = vec![0; 64 * 64 * 4];
+        lichii_texture::block_linear::unswizzle(&tiling, &tiled, &mut want);
+        assert_eq!(texels[l], want, "layer {l} takes the render target's bytes");
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn rows_ending_inside_a_word_sync_on_the_gpu_and_keep_the_bytes_past_them() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let header = tic(0x08, GPU_VA, 64, 64, 4, 1, 3);
+    let info = ImageInfo::from_texture(&header.decode().unwrap(), GobLayout::Tegra).unwrap();
+    let pattern: Vec<u8> = (0..info.size_bytes())
+        .map(|i| (i * 13 + i / 97) as u8)
+        .collect();
+    f.memory.write_bytes(DADDR, &pattern).unwrap();
+    let (texture, _) = f.texture(&header);
+    let before = f.read_image(texture);
+    let mut halves = rt_info(63, 32, 2, GobLayout::Tegra);
+    halves.format = PixelFormat::R16Unorm;
+    let mut bytes = rt_info(125, 32, 2, GobLayout::Tegra);
+    bytes.format = PixelFormat::R8Unorm;
+    let layer = |l: u64| GPU_VA + l * info.layer_stride;
+    clear_rt_at(&mut f, layer(1), &halves, [1.0, 0.0, 0.0, 0.0], Rect::ALL);
+    clear_rt_at(&mut f, layer(2), &bytes, [1.0, 0.0, 0.0, 0.0], Rect::ALL);
+    let traffic = f.cache.traffic();
+    assert_eq!(f.texture(&header).0, texture);
+    let after = f.cache.traffic();
+    assert_eq!(
+        after.downloads, traffic.downloads,
+        "no write-back to guest memory"
+    );
+    assert_eq!(
+        after.uploads, traffic.uploads,
+        "no re-upload from guest memory"
+    );
+    assert_eq!(after.gpu_syncs, traffic.gpu_syncs + 1);
+    let texels = f.read_image(texture);
+    for l in [0, 3] {
+        assert_eq!(texels[l], before[l], "layer {l} keeps its texels");
+    }
+    let tiling = info.surface().level_tiling(0);
+    for (l, rt, width) in [(1, &halves, 126), (2, &bytes, 125)] {
         let start = (l as u64 * info.layer_stride) as usize;
         let mut tiled = pattern[start..start + tiling.size_bytes()].to_vec();
         let rt = rt.surface().level_tiling(0);
