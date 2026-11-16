@@ -1497,6 +1497,11 @@ impl BufferCache {
     }
 
     /// Whether any device memory behind `[gpu_va, +size)` holds GPU-written bytes.
+    #[doc(hidden)]
+    pub fn liru14_gpu_written(&self, gmmu: &Gmmu, gpu_va: GpuVAddr, size: u64) -> bool {
+        self.gpu_written_in(gmmu, gpu_va, size)
+    }
+
     fn gpu_written_in(&self, gmmu: &Gmmu, gpu_va: GpuVAddr, size: u64) -> bool {
         if self.gpu_written.is_empty() {
             return false;
@@ -1690,6 +1695,7 @@ impl BufferCache {
         if gpu_va == 0 || size == 0 {
             return Ok(None);
         }
+        lichii_gpu::gmmu::liru14_watch(if written { "ssbo-w" } else { "ssbo-r" }, gpu_va, size);
         let align = self.storage_alignment();
         let start = gpu_va & !(align - 1);
         let size = size + (gpu_va - start);

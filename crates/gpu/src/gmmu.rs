@@ -380,6 +380,7 @@ impl Gmmu {
     /// Writes `data` across any number of mappings. Writes to sparse memory are dropped; the
     /// first unmapped or read-only address is the error, with the rest still written.
     pub fn write_block(&self, gpu_va: GpuVAddr, data: &[u8]) -> Result<(), GpuFault> {
+        liru14_watch("gmmu-write", gpu_va, data.len() as u64);
         let mut fault = None;
         let mut done = 0;
         self.for_each_range(gpu_va, data.len() as u64, |range| {
@@ -1042,5 +1043,19 @@ mod tests {
         }
         stop.store(true, Ordering::Relaxed);
         reader.join().unwrap();
+    }
+}
+
+#[doc(hidden)]
+pub fn liru14_watch(what: &str, gpu_va: GpuVAddr, size: u64) {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static WATCH: OnceLock<Option<u64>> = OnceLock::new();
+    static LINES: AtomicUsize = AtomicUsize::new(0);
+    let Some(w) = *WATCH.get_or_init(|| std::env::var("LIRU14_WATCH").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())) else {
+        return;
+    };
+    if gpu_va < w + 9216 && w < gpu_va + size && LINES.fetch_add(1, Ordering::Relaxed) < 300 {
+        tracing::info!("LIRU14 watch {what} va={gpu_va:#x} size={size:#x}");
     }
 }

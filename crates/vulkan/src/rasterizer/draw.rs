@@ -543,6 +543,49 @@ const GRAPHICS_SLOTS: [(usize, usize); 5] = [(1, 0), (2, 1), (3, 2), (4, 3), (5,
 
 /// Whether the draw runs task and mesh programs (SET_MESH_CONTROL, NVN2 only), whose
 /// workgroup count is the draw's vertex count.
+fn liru14_cb9(cache: &crate::buffer_cache::BufferCache, gmmu: &lichii_gpu::gmmu::Gmmu, va: u64, size: u32) {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    static LINES: AtomicUsize = AtomicUsize::new(0);
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let mut bytes = vec![0u8; size as usize];
+    let _ = gmmu.read_block(va, &mut bytes);
+    let cells = bytes.chunks_exact(16).filter(|c| c[..4] != [0xff; 4]).count() as u64;
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static SCANNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let start = *START.get_or_init(std::time::Instant::now);
+    if start.elapsed().as_secs() >= 60 && !SCANNED.swap(true, Ordering::Relaxed) {
+        let pat: [u32; 7] = [0xc2c80000, 0xbf000000, 0xc2c80000, 0, 0x3dcccccd, 0x3f800000, 0x3dcccccd];
+        let mut chunk = vec![0u8; 0x10000 + 32];
+        let mut found = 0;
+        let mut base = va.saturating_sub(0x1000_0000) & !0xffff;
+        while base < va + 0x1000_0000 {
+            if gmmu.read_block(base, &mut chunk).is_ok() {
+                for off in (0..0x10000).step_by(4) {
+                    let w = |i: usize| u32::from_le_bytes(chunk[off + i * 4..off + i * 4 + 4].try_into().unwrap());
+                    if (0..7).all(|i| w(i) == pat[i]) {
+                        let hdr = base + off as u64;
+                        let block = hdr.wrapping_sub(8800);
+                        let mut grid = vec![0u8; 6400];
+                        let _ = gmmu.read_block(block, &mut grid);
+                        let cells = grid.chunks_exact(16).filter(|c| c[..4] != [0xff; 4]).count();
+                        found += 1;
+                        if found < 40 {
+                            tracing::info!("LIRU14 scan header at {hdr:#x} block {block:#x} grid_nonempty={cells}");
+                        }
+                    }
+                }
+            }
+            base += 0x10000;
+        }
+        tracing::info!("LIRU14 scan done found={found}");
+    }
+    let written = cache.liru14_gpu_written(gmmu, va, u64::from(size));
+    let key = va ^ (cells << 48) ^ (u64::from(written) << 63);
+    if LAST.swap(key, Ordering::Relaxed) != key && LINES.fetch_add(1, Ordering::Relaxed) < 400 {
+        tracing::info!("LIRU14 cb9 va={va:#x} nonempty={cells} gpu_written={written}");
+    }
+}
+
 fn liru14_skip(regs: &Regs) -> bool {
     use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
     static ZETA: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -2016,6 +2059,9 @@ impl VulkanRasterizer {
                                 .copied()
                                 .unwrap_or_default();
                             let index = (desc.index + i) as usize;
+                            if cbuf.enabled && index == 9 && cbuf.size == 9216 && std::env::var_os("LIRU14_CB9").is_some() {
+                                liru14_cb9(&self.buffer_cache, src.gmmu, cbuf.address, cbuf.size);
+                            }
                             let binding = match src.root_table {
                                 _ if cbuf.enabled => self.buffer_cache.uniform_buffer(
                                     &mut self.scheduler,
