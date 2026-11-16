@@ -243,6 +243,7 @@ impl MemoryManager {
         drop(list);
         self.commit(&runs)?;
         self.zero(&dirty);
+        self.log_usage();
         Ok(PageGroup { runs })
     }
 
@@ -262,6 +263,7 @@ impl MemoryManager {
         drop(list);
         self.commit(&[(start, size)])?;
         self.zero(&dirty);
+        self.log_usage();
         Ok(start)
     }
 
@@ -295,6 +297,34 @@ impl MemoryManager {
             .find(|p| start >= p.start && start + size <= p.start + p.size)
             .unwrap_or_else(|| panic!("freeing {start:#x}+{size:#x} outside every pool"));
         pool.free.lock().give(start, size);
+        self.log_usage();
+    }
+
+    fn log_usage(&self) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let (mut used, mut dirty) = ([0u64; 4], 0u64);
+        for (i, pool) in self.pools.iter().enumerate() {
+            let list = pool.free.lock();
+            used[i] = pool.size - list.free;
+            dirty += list.dirty.values().sum::<u64>();
+        }
+        let total: u64 = used.iter().sum();
+        let last = LAST.load(Ordering::Relaxed);
+        if total.abs_diff(last) < 32 * MIB {
+            return;
+        }
+        LAST.store(total, Ordering::Relaxed);
+        tracing::info!(
+            "memstats used_mib={} app_mib={} applet_mib={} system_mib={} nonsecure_mib={} freed_dirty_mib={} host_mib={}",
+            total / MIB,
+            used[0] / MIB,
+            used[1] / MIB,
+            used[2] / MIB,
+            used[3] / MIB,
+            dirty / MIB,
+            self.physical.host_bytes() / MIB
+        );
     }
 
     pub fn free_group(&self, group: &PageGroup) {

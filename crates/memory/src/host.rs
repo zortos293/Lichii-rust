@@ -103,6 +103,11 @@ impl Backing {
     pub(crate) fn supports_views(&self) -> bool {
         self.sys.supports_views()
     }
+
+    /// Host memory currently backing guest DRAM, in bytes.
+    pub(crate) fn host_bytes(&self) -> u64 {
+        self.sys.host_bytes()
+    }
 }
 
 impl Drop for Backing {
@@ -371,6 +376,20 @@ mod sys {
             Ok(())
         }
 
+        pub fn host_bytes(&self) -> u64 {
+            if self.fd < 0 {
+                return 0;
+            }
+            // SAFETY: fstat on our own fd into a zeroed stat buffer.
+            unsafe {
+                let mut st: libc::stat = std::mem::zeroed();
+                if libc::fstat(self.fd, &mut st) != 0 {
+                    return 0;
+                }
+                st.st_blocks as u64 * 512
+            }
+        }
+
         pub fn discard(&self, ptr: *mut u8, offset: usize, len: usize) {
             #[cfg(any(target_os = "linux", target_os = "android"))]
             if self.fd >= 0 {
@@ -611,6 +630,15 @@ mod sys {
 
         pub fn supports_views(&self) -> bool {
             true
+        }
+
+        pub fn host_bytes(&self) -> u64 {
+            let chunks: u32 = self
+                .committed
+                .iter()
+                .map(|w| w.load(Ordering::Relaxed).count_ones())
+                .sum();
+            chunks as u64 * CHUNK as u64
         }
 
         fn is_committed(&self, chunk: usize) -> bool {

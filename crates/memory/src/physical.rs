@@ -68,6 +68,12 @@ impl PhysicalMemory {
         self.backing.supports_views()
     }
 
+    /// Host memory currently backing DRAM, in bytes: committed on Windows, allocated in the
+    /// memfd on Linux.
+    pub fn host_bytes(&self) -> u64 {
+        self.backing.host_bytes()
+    }
+
     pub(crate) fn backing(&self) -> &Backing {
         &self.backing
     }
