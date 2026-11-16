@@ -87,3 +87,6 @@ mod tests {
         assert_eq!(align_down(0x1fff, PAGE_SIZE), 0x1000);
     }
 }
+
+pub static DIAG381: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+pub fn diag381(i: usize, v: u64) { DIAG381[i].fetch_add(v, std::sync::atomic::Ordering::Relaxed); }

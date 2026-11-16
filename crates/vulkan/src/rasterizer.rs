@@ -134,6 +134,7 @@ impl Stalls {
                 seconds = (now - since).as_secs_f32(),
                 translating = shaders.translating(),
                 building = pipelines.building(),
+                q381 = ?lichii_common::DIAG381.iter().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed)).collect::<Vec<_>>(),
                 diag381 = ?crate::rasterizer::draw::DIAG381.iter().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed)).collect::<Vec<_>>(),
                 "draw stalls"
             );
@@ -1239,12 +1240,20 @@ impl Rasterizer for VulkanRasterizer {
                     address,
                     size,
                     range,
-                } => FenceAction::WriteSemaphore {
-                    address,
-                    value: self.samples.resolve(&self.device, range),
-                    size,
+                } => {
+                    let value = self.samples.resolve(&self.device, range);
+                    lichii_common::diag381(3, 1);
+                    if value == 0 {
+                        lichii_common::diag381(4, 1);
+                    }
+                    lichii_common::diag381(5, value.min(1 << 40));
+                    FenceAction::WriteSemaphore {
+                        address,
+                        value,
+                        size,
+                    }
+                    .execute(&self.handles)
                 }
-                .execute(&self.handles),
                 Release::SamplesReset(reset_at) => self.samples.retire(reset_at),
                 Release::SamplesFold(range) => {
                     self.samples.resolve(&self.device, range);

@@ -373,7 +373,11 @@ impl Maxwell3d {
 
     #[inline]
     fn renders(&self) -> bool {
-        queries::renders(&self.state.regs, self.render_enable)
+        let r = queries::renders(&self.state.regs, self.render_enable);
+        if !r {
+            lichii_common::diag381(2, 1);
+        }
+        r
     }
 }
 

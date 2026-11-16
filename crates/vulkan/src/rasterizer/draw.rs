@@ -1004,6 +1004,11 @@ impl VulkanRasterizer {
                 let slot = self
                     .samples
                     .reserve(&self.device, &mut self.scheduler, scale)?;
+                if slot.is_none() {
+                    lichii_common::diag381(7, 1);
+                } else {
+                    lichii_common::diag381(6, 1);
+                }
                 match slot {
                     None => self.draw.warn_once(
                         Warning::SampleQueries,

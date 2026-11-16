@@ -84,6 +84,7 @@ pub(super) fn render_enable(regs: &Regs, ctx: &mut EngineContext<'_>) -> bool {
         return true;
     }
     let address = regs.render_enable.address();
+    lichii_common::diag381(0, 1);
     ctx.rasterizer.flush_commands();
     let waiting = ctx.activity.waiting(Wait::HostGpu);
     ctx.rasterizer.release_fences(true);
@@ -104,13 +105,17 @@ pub(super) fn render_enable(regs: &Regs, ctx: &mut EngineContext<'_>) -> bool {
             bytemuck::Zeroable::zeroed()
         });
     drop(waiting);
-    match mode {
+    let r = match mode {
         RenderEnableMode::CONDITIONAL => c.initial_sequence != 0 && c.initial_mode != 0,
         RenderEnableMode::IF_EQUAL => {
             c.initial_sequence == c.current_sequence && c.initial_mode == c.current_mode
         }
         _ => c.initial_sequence != c.current_sequence || c.initial_mode != c.current_mode,
+    };
+    if !r {
+        lichii_common::diag381(1, 1);
     }
+    r
 }
 
 /// Whether draws and clears run: the override register wins over the evaluated condition.
