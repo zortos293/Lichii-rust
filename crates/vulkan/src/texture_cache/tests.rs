@@ -4497,3 +4497,33 @@ fn segments_alias_when_any_two_share_device_memory() {
     ]));
     assert!(self_aliased(&[s(0x1000, 0x1000), s(0x1000, 0x1000)]));
 }
+
+#[test]
+fn sampled_mip_chains_that_run_out_of_memory_keep_the_levels_that_fit() {
+    let gob = GobLayout::Tegra;
+    let header = tic(0x08, GPU_VA, 256, 256, 1, 9, 2);
+    let info = ImageInfo::from_texture(&header.decode().unwrap(), gob).unwrap();
+    let pattern: Vec<u8> = (0..info.size_bytes())
+        .map(|i| (i * 7 + i / 251) as u8)
+        .collect();
+    let Some(mut reference) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    reference.memory.write_bytes(DADDR, &pattern).unwrap();
+    let (full, _) = reference.texture(&header);
+    let want = reference.read_image(full);
+    let full_size = reference.cache.get(full).unwrap().image.memory_size();
+    drop(reference);
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    f.memory.write_bytes(DADDR, &pattern).unwrap();
+    f.cache.trim_to = 128 << 10;
+    f.cache.allocation_cap = full_size - 1;
+    let (id, _) = f.texture(&header);
+    let image = f.cache.get(id).unwrap();
+    assert_eq!(image.trim, 1, "keeps the levels from 1 on");
+    assert!(image.image.memory_size() < full_size);
+    assert_eq!(f.read_image(id), want[1..]);
+    f.assert_no_validation_errors();
+}
