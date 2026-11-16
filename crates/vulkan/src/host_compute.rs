@@ -109,13 +109,6 @@ impl HostCompute {
         groups: [u32; 3],
         reads: (vk::PipelineStageFlags2, vk::AccessFlags2),
     ) {
-        let writes: [_; MAX_BINDINGS] = std::array::from_fn(|binding| {
-            vk::WriteDescriptorSet::default()
-                .dst_set(set)
-                .dst_binding(binding as u32)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(buffers.get(binding).map_or(&[], std::slice::from_ref))
-        });
         let before = vk::MemoryBarrier2::default()
             .src_stage_mask(reads.0)
             .src_access_mask(reads.1)
@@ -126,15 +119,50 @@ impl HostCompute {
             .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
             .dst_stage_mask(reads.0)
             .dst_access_mask(reads.1);
+        self.write_set(set, buffers);
         let raw = &self.device.raw;
-        // SAFETY: the set is live and unused by recorded work; `cmd` is recording outside any
-        // rendering, and every bound buffer lives until the scheduler's current tick completes.
+        // SAFETY: `cmd` is recording outside any rendering.
         unsafe {
-            raw.update_descriptor_sets(&writes[..buffers.len()], &[]);
             raw.cmd_pipeline_barrier2(
                 cmd,
                 &vk::DependencyInfo::default().memory_barriers(&[before]),
             );
+        }
+        self.bind(cmd, set);
+        self.dispatch_bound(cmd, params, groups);
+        // SAFETY: as above.
+        unsafe {
+            raw.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().memory_barriers(&[after]),
+            );
+        }
+    }
+
+    /// Writes `buffers` into `set`, allocated with [`HostCompute::set_layout`] and not yet used
+    /// by recorded work.
+    pub(crate) fn write_set(&self, set: vk::DescriptorSet, buffers: &[vk::DescriptorBufferInfo]) {
+        let writes: [_; MAX_BINDINGS] = std::array::from_fn(|binding| {
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(binding as u32)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(buffers.get(binding).map_or(&[], std::slice::from_ref))
+        });
+        // SAFETY: the set is live and no recorded work uses it yet.
+        unsafe {
+            self.device
+                .raw
+                .update_descriptor_sets(&writes[..buffers.len()], &[])
+        };
+    }
+
+    /// Binds the pipeline and `set` on `cmd` for [`HostCompute::dispatch_bound`].
+    pub(crate) fn bind(&self, cmd: vk::CommandBuffer, set: vk::DescriptorSet) {
+        let raw = &self.device.raw;
+        // SAFETY: `cmd` is recording outside any rendering; the set's buffers live until the
+        // scheduler's current tick completes.
+        unsafe {
             raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline);
             raw.cmd_bind_descriptor_sets(
                 cmd,
@@ -144,12 +172,17 @@ impl HostCompute {
                 &[set],
                 &[],
             );
+        }
+    }
+
+    /// Records `groups` workgroups with `params` as push constants, with the pipeline and set
+    /// [`HostCompute::bind`] bound. The caller orders the pass's memory accesses.
+    pub(crate) fn dispatch_bound(&self, cmd: vk::CommandBuffer, params: &[u8], groups: [u32; 3]) {
+        let raw = &self.device.raw;
+        // SAFETY: `cmd` is recording with this pipeline bound.
+        unsafe {
             raw.cmd_push_constants(cmd, self.layout, vk::ShaderStageFlags::COMPUTE, 0, params);
             raw.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
-            raw.cmd_pipeline_barrier2(
-                cmd,
-                &vk::DependencyInfo::default().memory_barriers(&[after]),
-            );
         }
     }
 }

@@ -27,6 +27,7 @@
 //! used images with bounded work per frame. GPU-modified ones are read back without a GPU wait
 //! and reach guest memory before they go.
 
+mod astc;
 mod blit;
 mod clear;
 mod convert;
@@ -42,7 +43,7 @@ use std::sync::Arc;
 
 use ash::vk;
 use gpu_allocator::MemoryLocation;
-use lichii_common::settings::{AstcRecompression, ResolutionScale, VramUsage};
+use lichii_common::settings::{AstcDecode, AstcRecompression, ResolutionScale, VramUsage};
 use lichii_common::{DAddr, GpuVAddr, PAGE_SIZE};
 use lichii_gpu::backend::{FramebufferConfig, GpuWrittenPages};
 use lichii_gpu::gmmu::{Gmmu, RangeTarget};
@@ -585,6 +586,7 @@ struct Scratch {
     linear: Vec<u8>,
     convert: Vec<u8>,
     regions: Vec<vk::BufferImageCopy>,
+    astc_levels: Vec<astc::AstcLevel>,
 }
 
 /// Host images for guest images. Owned by the rasterizer on the GPU thread.
@@ -596,6 +598,11 @@ pub struct TextureCache {
     lazy: Arc<LazyDeviceRanges>,
     gob_layout: GobLayout,
     recompression: AstcRecompression,
+    astc_decode: AstcDecode,
+    /// The GPU ASTC decoder, created by the first upload that needs it.
+    astc: Option<astc::AstcDecoder>,
+    /// Device memory the decoder's scratch buffer takes at most: [`astc::SCRATCH_BYTES`].
+    astc_scratch: u64,
     scale: ResolutionScale,
     slots: Vec<Slot>,
     free: Vec<u32>,
@@ -965,6 +972,9 @@ impl TextureCache {
             lazy,
             gob_layout,
             recompression,
+            astc_decode: AstcDecode::default(),
+            astc: None,
+            astc_scratch: astc::SCRATCH_BYTES,
             scale: ResolutionScale::X1,
             slots: Vec::new(),
             free: Vec::new(),
@@ -1032,6 +1042,12 @@ impl TextureCache {
         self.host_formats.fill(None);
     }
 
+    /// Where ASTC textures the device cannot sample decode from now on: on the GPU, or on the
+    /// CPU for [`AstcDecode::Cpu`] and [`AstcDecode::CpuAsync`].
+    pub fn set_astc_decode(&mut self, decode: AstcDecode) {
+        self.astc_decode = decode;
+    }
+
     /// How much of the device budget the collector lets images use.
     pub fn set_vram_usage(&mut self, vram_usage: VramUsage) {
         self.vram_usage = vram_usage;
@@ -1049,6 +1065,30 @@ impl TextureCache {
     pub(crate) fn host(&mut self, format: PixelFormat) -> HostFormat {
         let slot = &mut self.host_formats[format as usize];
         *slot.get_or_insert_with(|| host_format(&self.device, format, self.recompression))
+    }
+
+    /// The host format of a new image of `info`: [`TextureCache::host`], except that with GPU
+    /// ASTC decoding a 2D ASTC image whose RGBA8 decode passes [`TRIM_ABOVE`] stays RGBA8 even
+    /// when other ASTC images are recompressed to BC, as Lichii keeps its huge ASTC arrays: such
+    /// an array keeps only its smaller levels instead.
+    fn image_host(&mut self, info: &ImageInfo) -> HostFormat {
+        let host = self.host(info.format);
+        if !matches!(host.conversion, Conversion::DecodeToBc(_))
+            || self.astc_decode != AstcDecode::Gpu
+            || info.kind != ImageKind::D2
+        {
+            return host;
+        }
+        let rgba8: u64 = (0..info.levels)
+            .map(|level| {
+                let (w, h, _) = info.level_extent(level);
+                u64::from(w) * u64::from(h) * 4
+            })
+            .sum();
+        if rgba8 * u64::from(info.layers) <= self.trim_above {
+            return host;
+        }
+        host_format(&self.device, info.format, AstcRecompression::Uncompressed)
     }
 
     fn get(&self, id: ImageId) -> Option<&CachedImage> {
@@ -1937,7 +1977,7 @@ impl TextureCache {
         if info.kind != ImageKind::D2 || info.levels == 1 || !info.format.is_color() {
             return 0;
         }
-        let host = self.host(info.format);
+        let host = self.image_host(info);
         let bytes = |level| {
             convert::host_layout(info.format, &host, info.level_extent(level)).total() as u64
                 * u64::from(info.layers)
@@ -1956,7 +1996,7 @@ impl TextureCache {
 
     /// Whether the device can create `info` as a sparse image (2D, single-sampled).
     fn can_be_sparse(&mut self, info: &ImageInfo) -> bool {
-        let host = self.host(info.format);
+        let host = self.image_host(info);
         let desc = Self::image_desc(info, &host, ResolutionScale::X1);
         desc.image_type == vk::ImageType::TYPE_2D
             && self
@@ -2448,7 +2488,7 @@ impl TextureCache {
         sparse_va: Option<GpuVAddr>,
     ) -> Result<ImageId> {
         self.creations += 1;
-        let host = self.host(info.format);
+        let host = self.image_host(info);
         let mut desc = Self::image_desc(info, &host, ResolutionScale::X1);
         if trim > 0 {
             desc.extent.width = (desc.extent.width >> trim).max(1);
@@ -2924,11 +2964,14 @@ impl TextureCache {
     fn upload(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
         self.flush_buffered(tx, id)?;
         let device = self.device.clone();
+        let gpu_decode = self.astc_decode == AstcDecode::Gpu;
+        let astc_scratch = self.astc_scratch;
         let Self {
             slots,
             scratch,
             traffic,
             lazy,
+            astc,
             ..
         } = self;
         let image = slots[id.index as usize]
@@ -2939,6 +2982,19 @@ impl TextureCache {
         let info = image.info;
         let host = image.host;
         let format = info.format;
+        let gpu_astc = gpu_decode
+            && format.is_astc()
+            && matches!(
+                host.conversion,
+                Conversion::Decode | Conversion::DecodeToBc(_)
+            );
+        let staged = |extent| {
+            if gpu_astc {
+                convert::guest_level_bytes(format, extent)
+            } else {
+                convert::host_layout(format, &host, extent).total()
+            }
+        };
         let levels = image.trim..image.trim + image.image.desc().mip_levels;
         let align = alignment(&host, format);
         let mut total = 0u64;
@@ -2947,8 +3003,7 @@ impl TextureCache {
                 .clone()
                 .filter(|&level| image.upload_due(layer, level))
             {
-                let layout = convert::host_layout(format, &host, info.level_extent(level));
-                total = total.next_multiple_of(align) + layout.total() as u64;
+                total = total.next_multiple_of(align) + staged(info.level_extent(level)) as u64;
                 total = total.next_multiple_of(align);
             }
         }
@@ -2960,10 +3015,11 @@ impl TextureCache {
         let slice = tx.staging.alloc(tx.scheduler, total, align)?;
         let (buffer, base_offset) = (slice.buffer, slice.offset);
         scratch.regions.clear();
+        scratch.astc_levels.clear();
         let mut offset = 0usize;
         let [main_aspect, stencil_aspect] = aspects_of(host.format);
-        let direct =
-            host.conversion == Conversion::None && convert::depth_planes(host.format).is_none();
+        let direct = gpu_astc
+            || host.conversion == Conversion::None && convert::depth_planes(host.format).is_none();
         for layer in 0..info.layers {
             for level in levels
                 .clone()
@@ -2971,8 +3027,9 @@ impl TextureCache {
             {
                 let extent = info.level_extent(level);
                 let layout = convert::host_layout(format, &host, extent);
+                let size = staged(extent);
                 offset = offset.next_multiple_of(align as usize);
-                let out = &mut slice.data[offset..offset + layout.total()];
+                let out = &mut slice.data[offset..offset + size];
                 let guest_offset = info.subresource_offset(level, layer);
                 let linear_len = convert::guest_level_bytes(format, extent);
                 match info.layout {
@@ -3037,6 +3094,16 @@ impl TextureCache {
                 {
                     tracing::warn!(%error, "texture upload conversion failed");
                 }
+                if gpu_astc {
+                    scratch.astc_levels.push(astc::AstcLevel {
+                        staging: base_offset + offset as u64,
+                        layer,
+                        level: level - image.trim,
+                        extent,
+                    });
+                    offset += size;
+                    continue;
+                }
                 let (w, h, d) = extent;
                 let copy = |buffer_offset: usize, aspect_mask| vk::BufferImageCopy {
                     buffer_offset: base_offset + buffer_offset as u64,
@@ -3067,6 +3134,26 @@ impl TextureCache {
             image.access.layout = vk::ImageLayout::UNDEFINED;
         }
         image.transition(&device, cmd, ImageAccess::TRANSFER_DST);
+        if gpu_astc {
+            let bc = match host.conversion {
+                Conversion::DecodeToBc(bc) => Some(bc),
+                _ => None,
+            };
+            let decoder = match astc {
+                Some(decoder) => decoder,
+                None => astc.insert(astc::AstcDecoder::new(&device)?),
+            };
+            return decoder.record(
+                tx,
+                buffer,
+                base_offset + total,
+                &scratch.astc_levels,
+                format,
+                bc,
+                image.image.raw(),
+                astc_scratch,
+            );
+        }
         // SAFETY: the image is in TRANSFER_DST layout and every region reads staged bytes the
         // host layout sized.
         unsafe {
