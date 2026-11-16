@@ -943,6 +943,10 @@ impl VulkanRasterizer {
                         .iter()
                         .map(|t| (t.handle.cbuf_index, t.handle.cbuf_offset))
                         .eq(offsets.iter().map(|&o| (2, o)))
+                        && std::env::var("LIRU14_FS")
+                            .ok()
+                            .and_then(|h| u64::from_str_radix(&h, 16).ok())
+                            .is_none_or(|h| h == m.hash)
                 });
             if shirt {
                 eprintln!(
