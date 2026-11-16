@@ -509,6 +509,12 @@ impl ConfigWindow {
                         )
                     });
                     row(ui, "", |ui| {
+                        ui.checkbox(
+                            &mut d.debug.gpu_fault_report,
+                            "Report the GPU fault when the device is lost",
+                        )
+                    });
+                    row(ui, "", |ui| {
                         ui.checkbox(&mut d.debug.vulkan_labels, "Vulkan debug names and labels")
                     });
                     row(ui, "GDB stub port", |ui| {
