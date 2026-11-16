@@ -638,6 +638,9 @@ pub struct TextureCache {
     /// [`TRIM_ABOVE`], and the bytes from [`TRIM_TO_SHARE`] of device-local memory.
     trim_above: u64,
     trim_to: u64,
+    /// Image allocations larger than this fail as out of device memory.
+    #[cfg(test)]
+    allocation_cap: u64,
     keep: Vec<(DAddr, DAddr)>,
     segments: Vec<Segment>,
     scratch: Scratch,
@@ -1020,6 +1023,8 @@ impl TextureCache {
             trim_above: TRIM_ABOVE,
             trim_to: (device.memory_usage().device_local / TRIM_TO_SHARE)
                 .clamp(TRIM_TO_MIN, TRIM_TO_MAX),
+            #[cfg(test)]
+            allocation_cap: u64::MAX,
             keep: Vec::new(),
             segments: Vec::new(),
             scratch: Scratch::default(),
@@ -1990,11 +1995,11 @@ impl TextureCache {
     }
 
     /// The first guest level the host keeps of an image sampled as `info`: 0, or for a mip
-    /// chain over [`TRIM_ABOVE`] host bytes, the first level whose chain fits in the share of
+    /// chain over `trim_above` host bytes, the first level whose chain fits in the share of
     /// device memory [`TRIM_TO_SHARE`] sets.
     /// Sampling still addresses the levels by normalized coordinates and derivatives; an
     /// explicit LOD lands `trim` levels coarser.
-    fn host_level_offset(&mut self, info: &ImageInfo) -> u32 {
+    fn host_level_offset(&mut self, info: &ImageInfo, trim_above: u64) -> u32 {
         if info.kind != ImageKind::D2 || info.levels == 1 || !info.format.is_color() {
             return 0;
         }
@@ -2004,7 +2009,7 @@ impl TextureCache {
                 * u64::from(info.layers)
         };
         let mut chain: u64 = (0..info.levels).map(bytes).sum();
-        if chain <= self.trim_above {
+        if chain <= trim_above {
             return 0;
         }
         let mut trim = 0;
@@ -2183,10 +2188,22 @@ impl TextureCache {
                 _ => {}
             }
         }
-        let found = match self.find_slow(tx, gmmu, gpu_va, info, usage) {
-            Err(Error::Allocation(error)) if self.evict_unused(tx, RECLAIM_ON_OOM)? > 0 => {
-                tracing::warn!(%error, "image allocation failed; retrying after evicting unused images");
-                self.find_slow(tx, gmmu, gpu_va, info, usage)?
+        let found = match self.find_slow(tx, gmmu, gpu_va, info, usage, self.trim_above) {
+            Err(Error::Allocation(error)) => {
+                let freed = self.evict_unused(tx, RECLAIM_ON_OOM)?;
+                tracing::warn!(%error, freed, "image allocation failed; retrying after evicting unused images");
+                let retried = if freed > 0 {
+                    self.find_slow(tx, gmmu, gpu_va, info, usage, self.trim_above)
+                } else {
+                    Err(Error::Allocation(error))
+                };
+                match retried {
+                    Err(Error::Allocation(error)) if usage == Usage::Sample => {
+                        tracing::warn!(%error, ?info, "sampled image allocation failed again; keeping the levels that fit");
+                        self.find_slow(tx, gmmu, gpu_va, info, usage, 0)?
+                    }
+                    found => found?,
+                }
             }
             found => found?,
         };
@@ -2244,6 +2261,7 @@ impl TextureCache {
         gpu_va: GpuVAddr,
         info: &ImageInfo,
         usage: Usage,
+        trim_above: u64,
     ) -> Result<Option<Found>> {
         let size = info.size_bytes();
         self.segments.clear();
@@ -2271,7 +2289,7 @@ impl TextureCache {
             return Ok(None);
         }
         let trim = if usage == Usage::Sample {
-            self.host_level_offset(info)
+            self.host_level_offset(info, trim_above)
         } else {
             0
         };
@@ -2528,6 +2546,12 @@ impl TextureCache {
         } else {
             Image::new(&self.device, &desc, "guest image")?
         };
+        #[cfg(test)]
+        if image.memory_size() > self.allocation_cap {
+            return Err(Error::Allocation(
+                gpu_allocator::AllocationError::OutOfMemory,
+            ));
+        }
         self.device.name(
             image.raw(),
             format_args!(
