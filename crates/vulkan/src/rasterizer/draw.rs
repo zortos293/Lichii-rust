@@ -601,7 +601,8 @@ fn liru14_phase(regs: &Regs) -> u8 {
     };
     if LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 400 == 0 {
         eprintln!(
-            "LIRU14 phase={phase} secs={secs} cull_on={} cull={:?} front={:?} flip_y={}",
+            "LIRU14 phase={phase} secs={secs} depth_mode={:?} cull_on={} cull={:?} front={:?} flip_y={}",
+            regs.depth_mode,
             regs.gl_cull_test_enabled,
             regs.gl_cull_face,
             regs.gl_front_face,
@@ -3154,8 +3155,20 @@ impl VulkanRasterizer {
                     draw.eds3.cmd_set_polygon_mode(cmd, mode)
                 });
             }
+            {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    eprintln!(
+                        "LIRU14 ndc features dynamic={} clip_control={}",
+                        features.dynamic_depth_clip_negative_one_to_one, features.depth_clip_control
+                    )
+                });
+            }
             if features.dynamic_depth_clip_negative_one_to_one {
-                let negative = regs.depth_mode == DepthMode::MINUS_ONE_TO_ONE;
+                let negative = match phase {
+                    1 => false,
+                    _ => regs.depth_mode == DepthMode::MINUS_ONE_TO_ONE,
+                };
                 shadow.set(Slot::DepthClipNegativeOneToOne, negative, || {
                     draw.eds3
                         .cmd_set_depth_clip_negative_one_to_one(cmd, negative)
