@@ -110,6 +110,7 @@ fn packing(image: &CachedImage) -> Option<Packing> {
     let bytes = info.format.bytes_per_block();
     let shape = matches!(info.layout, GuestLayout::BlockLinear { .. })
         && image.scale == ResolutionScale::X1
+        && image.trim == 0
         && match info.kind {
             ImageKind::D2 => true,
             ImageKind::D3 => info.layers == 1,

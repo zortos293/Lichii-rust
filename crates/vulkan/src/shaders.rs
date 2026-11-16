@@ -96,6 +96,10 @@ pub static BLOCK_LINEAR_UNSWIZZLE_COMP: &[u32] = spirv!("block_linear_unswizzle.
 pub static GUEST_BYTES_COMP: &[u32] = spirv!("guest_bytes.comp");
 /// `blit_gather.comp`: A nearest-filtered 2D engine blit between buffers of raw texels of one format, sampling at the engine's 32.32 positions clamped to the box of source texels the software blit reads. Local size 8x8.
 pub static BLIT_GATHER_COMP: &[u32] = spirv!("blit_gather.comp");
+/// `astc_decode.comp`: A band of linear 2D ASTC blocks (`blocks_x` per row from `uvec4` index `in_offset`) as packed RGBA8 words, `width` per row from word `out_offset`, in the LDR or sRGB profile, bit-exact with `lichii_texture::astc::decode_rgba8`. One block per invocation, local size 8x8.
+pub static ASTC_DECODE_COMP: &[u32] = spirv!("astc_decode.comp");
+/// `bc_encode.comp`: A band of packed RGBA8 words (`width` per row from word `in_offset`) as BC1 or BC3 blocks from block `out_offset` (8-byte units), one 4x4 block per invocation, local size 8x8.
+pub static BC_ENCODE_COMP: &[u32] = spirv!("bc_encode.comp");
 /// `indirect_assemble.comp`: Quads, quad strips and line loops of indirect draws as u32 triangle list or line strip indices and patched `VkDrawIndexedIndirectCommand`s, one 64-invocation workgroup per guest command.
 pub static INDIRECT_ASSEMBLE_COMP: &[u32] = spirv!("indirect_assemble.comp");
 /// `dispatch_grid.comp`: The packed grid words of a version 1.x launch descriptor as a `VkDispatchIndirectCommand`, clamped to the device's workgroup count limits; one invocation.
@@ -137,6 +141,8 @@ pub static ALL: &[(&str, &[u32])] = &[
     ("block_linear_unswizzle.comp", BLOCK_LINEAR_UNSWIZZLE_COMP),
     ("guest_bytes.comp", GUEST_BYTES_COMP),
     ("blit_gather.comp", BLIT_GATHER_COMP),
+    ("astc_decode.comp", ASTC_DECODE_COMP),
+    ("bc_encode.comp", BC_ENCODE_COMP),
     ("indirect_assemble.comp", INDIRECT_ASSEMBLE_COMP),
     ("dispatch_grid.comp", DISPATCH_GRID_COMP),
     ("mesh_indirect.comp", MESH_INDIRECT_COMP),
