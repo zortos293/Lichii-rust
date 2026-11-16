@@ -950,8 +950,17 @@ impl VulkanRasterizer {
                 });
             if shirt {
                 eprintln!(
-                    "LIRU14 shirt draw fs={:x}",
-                    self.draw.stages[4].as_ref().map_or(0, |m| m.hash)
+                    "LIRU14 shirt draw fs={:x} zeta_enable={} zeta={:#x} zfmt={:#x} ztest={} zwrite={} zfunc={:?} rt0={:#x} rt_count={} depth_target={:?}",
+                    self.draw.stages[4].as_ref().map_or(0, |m| m.hash),
+                    regs.zeta_enable,
+                    regs.zeta.address(),
+                    regs.zeta.format,
+                    regs.depth_test_enable,
+                    regs.depth_write_enabled,
+                    regs.depth_test_func,
+                    regs.rt[render_target_index(regs, 0)].address(),
+                    regs.rt_control.count(),
+                    self.draw.depth.map(|t| t.format)
                 );
             }
             crate::pipeline::environment::LIRU14_DRAW.set(shirt);
