@@ -275,26 +275,31 @@ fn back_owned(owned: &MethodSet, method: u32) -> bool {
 /// to reach this point of the stream. Rare: macros seldom read what a macro on the back wrote.
 #[cold]
 fn fetch_back_owned(graphics: &mut RegisterState, owned: &mut MethodSet, stream: &mut Stream) {
-    let methods = owned.take();
     static FETCHES: crate::throttle::Throttle = crate::throttle::Throttle::new();
-    if let Some(dropped) = FETCHES.allow() {
-        tracing::info!(
-            ?methods,
-            dropped,
-            "front fetches registers a macro on the back wrote"
-        );
-    }
-    let (reply, values) = std::sync::mpsc::sync_channel(1);
-    stream.side(SideCommand::Registers(methods, reply));
-    stream.drain();
-    match values.recv() {
-        Ok(values) => {
-            for (method, value, shadow) in values {
-                graphics.restore(method, (value, shadow));
-            }
+    let fetched = stream.fetch_registers(|words| {
+        owned.drain(|method| words.push((method, graphics.word(method))));
+        if let Some(dropped) = FETCHES.allow() {
+            let methods: Vec<u32> = words.iter().map(|&(method, _)| method).collect();
+            tracing::info!(
+                ?methods,
+                dropped,
+                "front fetches registers a macro on the back wrote"
+            );
         }
-        Err(_) => tracing::error!("GPU back dropped a register fetch"),
+    });
+    for &(method, word) in fetched.iter() {
+        graphics.restore(method, word);
     }
+}
+
+/// Whether a write takes register `method` back from the back ([`BackMacros::owned`]): only
+/// tracking shadow RAM modes write both the register and its shadow RAM copy.
+#[inline]
+fn write_owns(state: &RegisterState) -> bool {
+    matches!(
+        state.shadow_ram_control(),
+        ShadowRamControl::TRACK | ShadowRamControl::TRACK_WITH_FILTER
+    )
 }
 
 /// A shadow run on the front (see [`BackMacros`]): writes go to the mirror with an undo record, and
@@ -303,7 +308,8 @@ struct ShadowHost<'a> {
     graphics: &'a mut RegisterState,
     owned: &'a mut MethodSet,
     undo: &'a mut Vec<Undo>,
-    /// The call read a register the back holds, so its run here may differ from the back's.
+    /// The call read a register the back holds or never receives (LOAD_MME), so its run here may
+    /// differ from the back's.
     blocked: bool,
 }
 
@@ -316,7 +322,7 @@ impl ShadowHost<'_> {
 
 impl MacroHost for ShadowHost<'_> {
     fn read_register(&mut self, method: u32) -> u32 {
-        self.blocked |= back_owned(self.owned, method);
+        self.blocked |= is_load_mme(method) || back_owned(self.owned, method);
         self.graphics
             .regs
             .words()
@@ -335,9 +341,7 @@ impl MacroHost for ShadowHost<'_> {
         } else if method == FALCON_4 {
             self.save(SHADOW_SCRATCH_0 as u32);
         }
-        if self.owned.contains(method)
-            && self.graphics.shadow_ram_control() != ShadowRamControl::REPLAY
-        {
+        if self.owned.contains(method) && write_owns(self.graphics) {
             self.owned.remove(method);
             self.undo.push(Undo::Disowned(method));
         }
@@ -1067,7 +1071,7 @@ fn send_graphics(
 ) {
     let changed = mirror_graphics(state, method, argument);
     if owned.contains(method) {
-        if state.shadow_ram_control() != ShadowRamControl::REPLAY {
+        if write_owns(state) {
             owned.remove(method);
         }
     } else if !changed {

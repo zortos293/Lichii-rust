@@ -53,9 +53,9 @@ pub(crate) enum SideCommand {
     Run(RasterizerAction),
     /// The macro code the current channel's [`tag::MACRO`] records run.
     MacroCode(Box<MacroEngine>),
-    /// Replies with the current channel's 3D registers the methods name, each with its value and
-    /// its shadow RAM copy.
-    Registers(Vec<u32>, mpsc::SyncSender<Vec<(u32, u32, u32)>>),
+    /// Puts the current channel's 3D registers into [`FetchSyncs::registers`]
+    /// (see [`Stream::fetch_registers`](crate::stream::Stream::fetch_registers)).
+    Registers,
     /// Reports that everything before it executed.
     Signal(mpsc::SyncSender<()>),
 }
@@ -634,23 +634,17 @@ impl Back {
                     channel.macros = Some(code);
                 }
             }
-            SideCommand::Registers(methods, reply) => {
+            SideCommand::Registers => {
+                let fetch_syncs = self.fetch_syncs.clone();
                 let state = self
                     .channel()
                     .and_then(|channel| channel.engines[EngineKind::Maxwell3d.index()].as_deref())
                     .and_then(|engine| engine.graphics_state());
-                let values = state
-                    .map(|state| {
-                        methods
-                            .iter()
-                            .map(|&method| {
-                                let (value, shadow) = state.word(method);
-                                (method, value, shadow)
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let _ = reply.send(values);
+                if let Some(state) = state {
+                    for (method, word) in fetch_syncs.registers.lock().iter_mut() {
+                        *word = state.word(*method);
+                    }
+                }
             }
             SideCommand::Signal(done) => {
                 let _ = done.send(());

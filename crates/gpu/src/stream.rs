@@ -98,6 +98,9 @@ pub(crate) struct FetchSyncs {
     front: Arc<Inbox>,
     /// What pending semaphore releases write over the read [`Stream::synchronize_read`] last sent.
     pub(crate) read_overlay: ReadOverlay,
+    /// The 3D registers [`Stream::fetch_registers`] asks for, each with its value and shadow RAM
+    /// copy; the back fills them in.
+    pub(crate) registers: Mutex<Vec<(u32, (u32, u32))>>,
 }
 
 impl FetchSyncs {
@@ -106,6 +109,7 @@ impl FetchSyncs {
             completed: AtomicU64::new(0),
             front,
             read_overlay: ReadOverlay::default(),
+            registers: Mutex::new(Vec::new()),
         }
     }
 
@@ -344,6 +348,23 @@ impl Stream {
     pub(crate) fn synchronize_read(&mut self, address: GpuVAddr, size: u64) {
         self.record(&[header(tag::SYNCHRONIZE_READ, 0, 0, 0), address, size]);
         self.drain();
+    }
+
+    /// Waits until the back executed everything sent so far, and returns the current channel's 3D
+    /// registers `request` adds, each with the back's word (the front's word stays when the back
+    /// has no 3D engine).
+    pub(crate) fn fetch_registers(
+        &mut self,
+        request: impl FnOnce(&mut Vec<(u32, (u32, u32))>),
+    ) -> parking_lot::MutexGuard<'_, Vec<(u32, (u32, u32))>> {
+        {
+            let mut registers = self.fetch_syncs.registers.lock();
+            registers.clear();
+            request(&mut registers);
+        }
+        self.side(SideCommand::Registers);
+        self.drain();
+        self.fetch_syncs.registers.lock()
     }
 
     /// Puts what semaphore releases still on their way to the host GPU write over `out`, the

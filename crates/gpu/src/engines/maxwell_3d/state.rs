@@ -289,16 +289,14 @@ impl MethodSet {
         self.0[m >> 6] &= !(1 << (m & 63));
     }
 
-    /// Empties the set and returns its methods in order.
-    pub fn take(&mut self) -> Vec<u32> {
-        let mut methods = Vec::new();
+    /// Empties the set, passing its methods to `f` in order.
+    pub fn drain(&mut self, mut f: impl FnMut(u32)) {
         for (index, word) in self.0.iter_mut().enumerate() {
             while *word != 0 {
-                methods.push((index * 64) as u32 + word.trailing_zeros());
+                f((index * 64) as u32 + word.trailing_zeros());
                 *word &= *word - 1;
             }
         }
-        methods
     }
 
     pub fn insert_range(&mut self, first: u32, count: u32) {

@@ -1423,6 +1423,36 @@ fn mme_dma_reads_run_on_the_back_and_the_front_fetches_what_they_wrote() {
 }
 
 #[test]
+fn a_register_stays_the_backs_until_a_write_sets_its_shadow_copy() {
+    each_mode(|threading| {
+        let mut rig = Rig::new(threading);
+        let channel = rig.channel(HostClass::Ampere);
+        let data = 0x24_0000;
+        let read = crate::macros::MACRO_METHOD_BASE;
+        let shadow_ram_control = reg_index!(Regs, shadow_ram_control);
+        let words = Pushbuffer::default()
+            .bind(0, AMPERE_3D)
+            .load_macro(0, &masm::dma_read_program(2))
+            .upload(data, &[0x11, 0x22])
+            .once(0, read, &[0, data as u32])
+            .upload(data, &[0x33, 0x44])
+            .once(0, read, &[0, data as u32])
+            .inc(0, shadow_ram_control, &[2])
+            .inc(0, 0xc00, &[0x11])
+            .inc(0, shadow_ram_control, &[3])
+            .inc(0, 0xc00, &[0x99]);
+        rig.submit(channel, &words.0);
+        let writes: Vec<_> = rig
+            .methods()
+            .into_iter()
+            .filter(|&(_, _, method, _)| method == 0xc00)
+            .map(|(_, _, _, argument)| argument)
+            .collect();
+        assert_eq!(writes, [0x11, 0x33, 0x11, 0x99], "{threading:?}");
+    });
+}
+
+#[test]
 fn a_small_ring_wraps_and_keeps_order() {
     each_mode(|threading| {
         let mut rig = Rig::with_ring(threading, MIN_RING_SLOTS);
