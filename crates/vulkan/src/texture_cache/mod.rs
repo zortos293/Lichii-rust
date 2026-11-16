@@ -1315,23 +1315,26 @@ impl TextureCache {
         };
         if discard && whole {
             self.flush_buffered(tx, found.id)?;
-            self.image(found.id).cpu_dirty = false;
+            let tick = self.tick;
+            let image = self.image(found.id);
+            image.cpu_dirty = false;
+            image.current = tick;
         }
         let keep_own = usage == Usage::Target
-            && self.image(found.id).modified != 0
-            && self.newer_overlaps_reinterpret(found.id);
-        if (discard && whole) || keep_own {
-            let tick = self.tick;
-            self.image(found.id).current = tick;
-        }
-        if matches!((info.width, info.height), (2560, 1440) | (1280, 720)) {
-            if diag_window() {
-                let image = self.get(found.id).expect("a live image id");
-                tracing::info!("tgtdiag bind {}x{} {:?} id={} discard={} whole={} tick={} current={} modified={} overlaps_newest={}", info.width, info.height, info.format, found.id.index, discard, whole, self.tick, image.current, image.modified, image.overlaps_newest);
+            && {
+                let image = self.image(found.id);
+                image.modified != 0 && !image.image.is_sparse()
             }
-        }
+            && self.newer_overlaps_reinterpret(found.id);
         SYNC_CTX.with(|c| c.set(if discard && whole { "target discard" } else if discard { "target discard-not-whole" } else { "target keep" }));
-        self.refresh(tx, found.id)?;
+        if keep_own {
+            if self.image(found.id).cpu_dirty {
+                self.take_cpu_writes(tx, found.id)?;
+            }
+            self.take_from_aliases(tx.scheduler, found.id)?;
+        } else {
+            self.refresh(tx, found.id)?;
+        }
         let target = if self.can_rescale(found.id) {
             self.scale
         } else {
@@ -2859,6 +2862,9 @@ impl TextureCache {
     /// on another grid (row width, block or tiling), so its bytes are no texels of `id`.
     fn newer_overlaps_reinterpret(&self, id: ImageId) -> bool {
         let image = self.get(id).expect("a live image id");
+        if image.overlaps_newest <= image.current {
+            return true;
+        }
         let grid = |info: &ImageInfo| {
             let format = info.format;
             (

@@ -862,6 +862,14 @@ fn targets_drawn_into_keep_their_own_texels_over_newer_overlaps() {
         "the target's own texels"
     );
     assert!(all_texels(&f.read_image(b.id)[0], RED));
+    let (id, _) = f.texture(&tic(0x08, GPU_VA, 64, 64, 1, 1, 3));
+    assert_eq!(id, a.id);
+    assert_eq!(
+        f.cache.traffic().gpu_syncs,
+        before.gpu_syncs + 1,
+        "a bind with no draw leaves the newer overlap to the next read"
+    );
+    assert_eq!(count_texels(&f.read_image(a.id)[0], RED), 32 * 32);
     f.assert_no_validation_errors();
 }
 
