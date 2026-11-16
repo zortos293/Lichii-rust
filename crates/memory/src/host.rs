@@ -1015,8 +1015,13 @@ mod sys {
                     view.len,
                     MEM_RELEASE | MEM_SPLIT_PLACEHOLDER,
                 );
+                let section = backing.section(view.backing_offset >> CHUNK_BITS);
+                crate::DIAG_PLACES.fetch_add(1, Ordering::Relaxed);
+                if section == backing.scratch {
+                    crate::DIAG_SCRATCH.fetch_add(1, Ordering::Relaxed);
+                }
                 let mapped = MapViewOfFile3(
-                    backing.section(view.backing_offset >> CHUNK_BITS),
+                    section,
                     GetCurrentProcess(),
                     base.add(offset).cast(),
                     (view.backing_offset % CHUNK) as u64,

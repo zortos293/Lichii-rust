@@ -27,3 +27,8 @@ pub use tracking::{CachedPages, FlushTrapHandler};
 
 #[cfg(test)]
 mod fastmem_tests;
+
+#[doc(hidden)]
+pub static DIAG_PLACES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[doc(hidden)]
+pub static DIAG_SCRATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

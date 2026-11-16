@@ -398,7 +398,7 @@ impl MemoryManager {
         LAST.store(total, Ordering::Relaxed);
         LAST_HOST.store(host, Ordering::Relaxed);
         tracing::info!(
-            "memstats used_mib={} app_mib={} applet_mib={} system_mib={} nonsecure_mib={} freed_dirty_mib={} host_mib={} frees={} freed_total_mib={} release_ms={} released_total_mib={}",
+            "memstats used_mib={} app_mib={} applet_mib={} system_mib={} nonsecure_mib={} freed_dirty_mib={} host_mib={} frees={} freed_total_mib={} release_ms={} released_total_mib={} places={} scratch_places={}",
             total / MIB,
             used[0] / MIB,
             used[1] / MIB,
@@ -409,7 +409,9 @@ impl MemoryManager {
             FREES.load(Ordering::Relaxed),
             FREED.load(Ordering::Relaxed) / MIB,
             RELEASE_NS.load(Ordering::Relaxed) / 1_000_000,
-            RELEASED.load(Ordering::Relaxed) / MIB
+            RELEASED.load(Ordering::Relaxed) / MIB,
+            lichii_memory::DIAG_PLACES.load(Ordering::Relaxed),
+            lichii_memory::DIAG_SCRATCH.load(Ordering::Relaxed)
         );
     }
 }
