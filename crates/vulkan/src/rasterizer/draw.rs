@@ -576,6 +576,8 @@ fn liru14_skip(regs: &Regs) -> bool {
 static LIRU14_SHIDX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 static LIRU14_LATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static LIRU14_CB8: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LIRU14_LIGHT: [std::sync::atomic::AtomicU32; 3] = [const { std::sync::atomic::AtomicU32::new(0) }; 3];
+static LIRU14_LIGHT_PREV: [std::sync::atomic::AtomicU32; 3] = [const { std::sync::atomic::AtomicU32::new(0) }; 3];
 
 fn liru14_phase(regs: &Regs) -> u8 {
     static ZETA: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -1082,6 +1084,50 @@ impl VulkanRasterizer {
                 && cb8 != 0
                 && LIRU14_LATE.load(std::sync::atomic::Ordering::Relaxed)
                 && cb8 == LIRU14_CB8.load(std::sync::atomic::Ordering::Relaxed);
+            if liru14_idx == 12 {
+                let b = &ctx.const_buffers[0][3];
+                let mut bytes = [0u8; 176];
+                let _ = gmmu.read_block(b.address, &mut bytes);
+                let f = |i: usize| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+                for (k, i) in [15usize, 19, 23].into_iter().enumerate() {
+                    let prev = LIRU14_LIGHT[k].swap(f(i), std::sync::atomic::Ordering::Relaxed);
+                    LIRU14_LIGHT_PREV[k].store(prev, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            let rcv = std::env::var("LIRU14_RCV")
+                .ok()
+                .and_then(|v| u64::from_str_radix(&v, 16).ok())
+                .is_some_and(|want| regs.rt[render_target_index(regs, 0)].address() == want)
+                && LIRU14_LATE.load(std::sync::atomic::Ordering::Relaxed);
+            if rcv {
+                static R: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if R.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 30 {
+                    let load = |a: &[std::sync::atomic::AtomicU32; 3]| {
+                        a.iter().map(|x| f32::from_bits(x.load(std::sync::atomic::Ordering::Relaxed))).collect::<Vec<_>>()
+                    };
+                    let cur = load(&LIRU14_LIGHT);
+                    let prev = load(&LIRU14_LIGHT_PREV);
+                    let mut hits = Vec::new();
+                    for (i, b) in ctx.const_buffers[4].iter().enumerate() {
+                        if !b.enabled || b.size == 0 {
+                            continue;
+                        }
+                        let mut bytes = vec![0u8; b.size.min(4096) as usize];
+                        let _ = gmmu.read_block(b.address, &mut bytes);
+                        for (o, c) in bytes.chunks_exact(4).enumerate() {
+                            let v = f32::from_le_bytes(c.try_into().unwrap());
+                            if cur.iter().chain(&prev).any(|t| (v - t).abs() < 0.5) {
+                                hits.push(format!("cb{i}+{:#x}={v:.4}", o * 4));
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "LIRU14 rcv fs={:x} cur={cur:?} prev={prev:?} hits={hits:?} cbufs={:?}",
+                        self.draw.stages[4].as_ref().map_or(0, |m| m.hash),
+                        ctx.const_buffers[4].iter().enumerate().filter(|(_, b)| b.enabled).map(|(i, b)| (i, format!("{:#x}", b.address), b.size)).collect::<Vec<_>>()
+                    );
+                }
+            }
             if [11, 12, 17, 19].contains(&liru14_idx) || (same_bones && regs.zeta.address() == 0x528170000) {
                 static F: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if F.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
