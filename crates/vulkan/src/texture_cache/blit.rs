@@ -2,6 +2,8 @@
 //! bilinear filtered, for formats the host blits as they are, or a gather of raw texels at the engine's own nearest sample
 //! positions, which `vkCmdBlitImage` can't reproduce.
 
+thread_local! { pub static WHY: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) }; }
+pub fn why(s: String) { WHY.with(|w| *w.borrow_mut() = s); }
 use ash::vk;
 use lichii_common::GpuVAddr;
 use lichii_gpu::gmmu::{Gmmu, RangeTarget};
@@ -135,6 +137,7 @@ impl TextureCache {
             || !self.blittable(src.info.format, src_host, dst.info.format, dst_host)
             || (filter == vk::Filter::LINEAR && !self.filterable(src.info.format, src_host))
         {
+            why(format!("fmt blittable={} filterable={} {:?}->{:?}", self.blittable(src.info.format, src_host, dst.info.format, dst_host), self.filterable(src.info.format, src_host), src_host.format, dst_host.format));
             return Ok(false);
         }
         let Some((source, target)) =
@@ -146,6 +149,7 @@ impl TextureCache {
             self.blit_offsets(source, src.info.format, src.rect),
             self.blit_offsets(target, dst.info.format, dst.rect),
         ) else {
+            why(format!("offsets {:?} {:?}", src.rect, dst.rect));
             return Ok(false);
         };
         let device = self.device.clone();
@@ -391,6 +395,7 @@ impl TextureCache {
         if !self.cached_over(gmmu, src_va, src.size_bytes(), |image| image.gpu_modified)
             && !self.cached_over(gmmu, dst.gpu_va, dst.info.size_bytes(), |_| true)
         {
+            why("guest src, uncached dst".into());
             return Ok(None);
         }
         let Some(source) = self.find(tx, gmmu, src_va, src)? else {
@@ -404,6 +409,7 @@ impl TextureCache {
         if source.id == target.id
             && (!share || (source.level, source.layer) == (target.level, target.layer))
         {
+            why("same subresource".into());
             return Ok(None);
         }
         let whole = dst.rect == [0, 0, dst.info.width as i32, dst.info.height as i32];
