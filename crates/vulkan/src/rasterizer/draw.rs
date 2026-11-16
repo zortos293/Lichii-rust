@@ -1540,6 +1540,19 @@ impl VulkanRasterizer {
             self.draw.colors[i] =
                 Self::target_view(&mut self.texture_cache, found, &info, layered)?;
         }
+        if regs.zeta_enable != 0
+            && std::env::var_os("LIRU14_Z16").is_some()
+            && regs.zeta_size.width == 1024
+            && ImageInfo::from_zeta(&regs.zeta, &regs.zeta_size, msaa, gob)
+                .is_some_and(|i| i.format == lichii_texture::PixelFormat::D16Unorm)
+        {
+            let _ = crate::texture_cache::LIRU14_LEARNED.compare_exchange(
+                0,
+                regs.zeta.address(),
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         if regs.zeta_enable != 0 && crate::texture_cache::liru14_va(regs.zeta.address()) {
             eprintln!(
                 "LIRU14 zeta addr={:#x} format={:#x} tile_mode={:?} array_pitch={:#x} size={:?} layered={layered} viewport0={:?} rt_count={}",

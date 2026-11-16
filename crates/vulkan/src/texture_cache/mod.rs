@@ -666,14 +666,18 @@ pub struct TextureCache {
 /// A depth or stencil view returns its value in R and leaves G undefined, while guest
 /// swizzles of depth formats (S8D24 among them) read the depth from G.
 /// LIRU-14 diag: the address `LIRU14_VA` names, and a shared log budget.
+pub static LIRU14_LEARNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn liru14_va(va: u64) -> bool {
     static WANT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     static LOGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let learned = LIRU14_LEARNED.load(std::sync::atomic::Ordering::Relaxed);
     WANT.get_or_init(|| {
         std::env::var("LIRU14_VA")
             .ok()
             .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
     })
+    .or((learned != 0).then_some(learned))
     .is_some_and(|want| va.abs_diff(want) < 0x80_0000)
         && LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 1500
 }
