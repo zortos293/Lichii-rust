@@ -2108,7 +2108,10 @@ fn linear_blits_average_the_source_texels_on_the_gpu() {
         let (x, y) = (i % 32, i / 32);
         let want = if x == 0 { [128, 128, 0, 255] } else { GREEN };
         assert!(
-            texel.iter().zip(want).all(|(&got, want)| got.abs_diff(want) <= 1),
+            texel
+                .iter()
+                .zip(want)
+                .all(|(&got, want)| got.abs_diff(want) <= 1),
             "texel ({x}, {y}) is {texel:?}, not {want:?}"
         );
     }
