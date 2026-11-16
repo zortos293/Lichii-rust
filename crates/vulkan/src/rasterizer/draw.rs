@@ -925,6 +925,21 @@ impl VulkanRasterizer {
             self.draw.image_scaling = ScalingBits::default();
             self.draw.storage_images.clear();
             self.draw.texel_views.clear();
+            let shirt = std::env::var_os("LIRU14_SHIRT").is_some()
+                && self.draw.stages[4].as_ref().is_some_and(|m| {
+                    m.info
+                        .texture_descriptors
+                        .iter()
+                        .map(|t| (t.handle.cbuf_index, t.handle.cbuf_offset))
+                        .eq([32, 40, 56, 64, 128, 160, 168, 216, 224].map(|o| (2, o)))
+                });
+            if shirt {
+                eprintln!(
+                    "LIRU14 shirt draw fs={:x}",
+                    self.draw.stages[4].as_ref().map_or(0, |m| m.hash)
+                );
+            }
+            crate::pipeline::environment::LIRU14_DRAW.set(shirt);
             for &(slot, host) in &GRAPHICS_SLOTS {
                 let Some(module) = self.draw.stages[host].clone() else {
                     continue;

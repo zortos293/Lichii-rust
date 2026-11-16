@@ -159,6 +159,15 @@ impl TexturePool {
                 .ok()
                 .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok())
         });
+        if LIRU14_DRAW.get()
+            && LIRU14_TIC_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 400
+        {
+            let d = entry.map(|e| e.decode());
+            eprintln!(
+                "LIRU14 shirt tex raw={raw:#x} index={index:#x} {:?}",
+                d.map(|d| d.map(|d| (d.format, d.width, d.height, d.levels, d.address, d.texture_type, d.swizzle)))
+            );
+        }
         if want == Some(index)
             && LIRU14_TIC_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4
         {
@@ -170,6 +179,11 @@ impl TexturePool {
         }
         entry.and_then(|e| e.decode().ok()).unwrap_or(NULL_TEXTURE)
     }
+}
+
+thread_local! {
+    /// LIRU-14 diag: the draw being bound uses the Splatoon shirt fragment program.
+    pub static LIRU14_DRAW: Cell<bool> = const { Cell::new(false) };
 }
 
 const NULL_TEXTURE: TextureDescriptor = TextureDescriptor {
