@@ -45,6 +45,10 @@ pub struct Profile {
     pub supported_subgroup_stages: u32,
     pub warp_size_potentially_larger_than_guest: bool,
     pub max_subgroup_size: u32,
+    /// Bit per [`crate::ShaderStage`] index whose modules the renderer runs at a required
+    /// subgroup size of 32 when they [use the warp size](crate::ShaderInfo::uses_warp_size).
+    /// Those stages are emitted for 32-lane subgroups, without the wider-warp emulation.
+    pub guest_warp_stages: u32,
 
     pub support_vertex_instance_id: bool,
     pub support_viewport_index_layer_non_geometry: bool,
@@ -141,6 +145,7 @@ impl Default for Profile {
             supported_subgroup_stages: 0x7f,
             warp_size_potentially_larger_than_guest: false,
             max_subgroup_size: 32,
+            guest_warp_stages: 0,
             support_vertex_instance_id: false,
             support_viewport_index_layer_non_geometry: false,
             support_viewport_mask: false,
@@ -191,6 +196,11 @@ impl Default for Profile {
 impl Profile {
     pub fn supports_subgroup_stage(&self, stage: crate::ShaderStage) -> bool {
         self.supported_subgroup_stages & (1 << stage as u32) != 0
+    }
+
+    /// Whether modules of `stage` that use the warp size run at exactly 32 lanes.
+    pub fn runs_guest_warp(&self, stage: crate::ShaderStage) -> bool {
+        self.guest_warp_stages & (1 << stage as u32) != 0
     }
 
     /// Bits of the capabilities that change the translated IR, for shader cache keys.
