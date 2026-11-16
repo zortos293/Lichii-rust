@@ -1,7 +1,7 @@
 use super::masm::*;
 use super::{TestHost, engine_with};
 use crate::macros::{
-    MACRO_METHOD_BASE, MacroDataRam, MacroEngine, MacroError, MacroErrorKind, MacroIsa,
+    MACRO_METHOD_BASE, MacroDataRam, MacroEngine, MacroError, MacroErrorKind, MacroIsa, ReadTaint,
 };
 
 fn engine(program: &[Inst]) -> MacroEngine {
@@ -414,6 +414,104 @@ fn dma_read_fifoed_underflow() {
     let error = run(&fifoed_program(1), &[0x1_0001, 0x1000], &mut host).unwrap_err();
     assert_eq!(error.kind, MacroErrorKind::FifoUnderflow);
     assert_eq!(error.pc, 3);
+}
+
+fn shadow(
+    program: &[Inst],
+    parameters: &[u32],
+    data_ram: &mut MacroDataRam,
+) -> (Result<(), MacroError>, TestHost, ReadTaint) {
+    let mut host = TestHost::default();
+    let mut taint = ReadTaint::new();
+    let result = engine(program).shadow_execute(
+        MACRO_METHOD_BASE,
+        parameters,
+        data_ram,
+        &mut host,
+        &mut taint,
+    );
+    (result, host, taint)
+}
+
+#[test]
+fn shadow_run_leaves_fifoed_words_unknown() {
+    let (result, host, taint) = shadow(
+        &fifoed_program(2),
+        &[0x1_0001, 0x1000],
+        &mut MacroDataRam::new(),
+    );
+    result.unwrap();
+    assert!(host.dma_reads.is_empty());
+    assert_eq!(
+        host.writes,
+        [(0x154, 0x1_0001), (0x155, 0x1000), (0x158, 2)]
+    );
+    assert_eq!(host.unknown, [0xC00, 0xC01]);
+    assert!(!taint.any_ram_unknown());
+}
+
+#[test]
+fn shadow_run_tracks_data_ram_words_it_read() {
+    let program = [
+        inst(imm(0x1154), nop())
+            .out0(IMM0, OUT_LOAD0)
+            .out1(NONE, OUT_LOAD1),
+        inst(imm(0x20), imm(3)).out0(NONE, IMM0).out1(NONE, IMM1),
+        inst(alu(DREAD, 0, IMM, ZERO, 0x21), imm(0x1B00)).out0(IMM1, NONE),
+        inst(alu(ADD, 1, 0, ZERO, 0), alu(DREAD, 2, IMM, ZERO, 0x30))
+            .out0(NONE, ALU0)
+            .out1(NONE, ALU1)
+            .end(),
+        inst(nop(), nop()),
+    ];
+    let mut data_ram = MacroDataRam::new();
+    data_ram.words_mut()[0x30] = 0x77;
+    let (result, host, taint) = shadow(&program, &[0xFFFF_0001, 0x1000], &mut data_ram);
+    result.unwrap();
+    assert!(host.dma_reads.is_empty());
+    assert_eq!(host.unknown, [0xB00]);
+    assert_eq!(host.writes.last(), Some(&(0xB01, 0x77)));
+    assert!((0x20..0x23).all(|address| taint.ram_unknown(address)));
+    assert!(!taint.ram_unknown(0x23));
+}
+
+#[test]
+fn shadow_run_stops_where_a_read_steers_it() {
+    let program = [
+        inst(imm(0x1154), nop())
+            .out0(IMM0, OUT_LOAD0)
+            .out1(NONE, OUT_LOAD1),
+        inst(imm(0x0158), imm(1)).out0(IMM0, IMM1),
+        inst(alu(EXTENDED, ZERO, IMM, IMM, 0x1000), nop()),
+        inst(
+            alu(BEQ, ZERO, LOAD0, ZERO, branch_imm(true, false, 2)),
+            nop(),
+        ),
+        inst(imm(0x1), nop()).out0(NONE, IMM0).end(),
+        inst(nop(), nop()),
+    ];
+    let (result, _, _) = shadow(&program, &[0x1_0001, 0x1000], &mut MacroDataRam::new());
+    let error = result.unwrap_err();
+    assert_eq!(error.kind, MacroErrorKind::DependsOnRead);
+    assert_eq!(error.pc, 3);
+}
+
+#[test]
+fn engine_remembers_macros_that_read_memory() {
+    let mut engine = engine(&fifoed_program(2));
+    assert!(!engine.reads_memory(MACRO_METHOD_BASE));
+    let (mut host, _) = dma_host(&[0x11, 0x22]);
+    engine
+        .execute(
+            MACRO_METHOD_BASE,
+            &[0x1_0001, 0x1000],
+            &mut MacroDataRam::new(),
+            &mut host,
+        )
+        .unwrap();
+    assert!(engine.reads_memory(MACRO_METHOD_BASE));
+    super::upload(&mut engine, 4, &[1, 2, 3]);
+    assert!(!engine.reads_memory(MACRO_METHOD_BASE));
 }
 
 #[test]

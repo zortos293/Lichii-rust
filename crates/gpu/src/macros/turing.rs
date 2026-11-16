@@ -6,8 +6,7 @@
 
 use super::{
     CallRecord, DATA_RAM_WORDS, DMA_READ_MAX_WORDS, Fault, LOAD_FIFO_MAX_WORDS, MACRO_METHOD_BASE,
-    ReadTaint,
-    MME_DMA_READ, MME_DMA_READ_FIFOED, MacroDataRam, MacroErrorKind, MacroHost,
+    MME_DMA_READ, MME_DMA_READ_FIFOED, MacroDataRam, MacroErrorKind, MacroHost, ReadTaint,
     SET_MME_DATA_RAM_ADDRESS, SET_MME_MEM_ADDRESS_A, SET_MME_MEM_ADDRESS_B,
 };
 

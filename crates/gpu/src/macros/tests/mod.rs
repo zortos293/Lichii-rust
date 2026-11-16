@@ -20,6 +20,8 @@ struct TestHost {
     register_reads: u32,
     memory: HashMap<u64, u32>,
     dma_reads: Vec<(u64, usize)>,
+    /// Methods a shadow run wrote with values from its DMA reads.
+    unknown: Vec<u32>,
 }
 
 impl MacroHost for TestHost {
@@ -42,6 +44,11 @@ impl MacroHost for TestHost {
                 .copied()
                 .unwrap_or(0);
         }
+    }
+
+    fn write_unknown(&mut self, method: u32) -> bool {
+        self.unknown.push(method);
+        true
     }
 }
 
