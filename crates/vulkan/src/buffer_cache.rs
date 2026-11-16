@@ -1745,11 +1745,25 @@ impl BufferCache {
         let limits = &self.device.properties.limits;
         let elements = (binding.size / texel).min(u64::from(limits.max_texel_buffer_elements));
         lichii_common::diag381(1, 1);
-        let texel_align = if std::env::var_os("LICHII_DIAG_TEXEL_ALIGN16").is_some() { limits.min_texel_buffer_offset_alignment.max(16) } else { limits.min_texel_buffer_offset_alignment };
+        let texel_align = if std::env::var_os("LICHII_DIAG_TEXEL_ALIGN16").is_some() {
+            limits.min_texel_buffer_offset_alignment.max(16)
+        } else {
+            limits.min_texel_buffer_offset_alignment
+        };
         if elements != 0 && binding.offset % texel_align != 0 {
             lichii_common::diag381(0, 1);
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(offset = binding.offset, gpu_va, size, ?format, written, align = limits.min_texel_buffer_offset_alignment, "DIAG381 misaligned texel buffer dropped"));
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    offset = binding.offset,
+                    gpu_va,
+                    size,
+                    ?format,
+                    written,
+                    align = limits.min_texel_buffer_offset_alignment,
+                    "DIAG381 misaligned texel buffer dropped"
+                )
+            });
         }
         if elements == 0 || binding.offset % texel_align != 0 {
             return Ok(None);

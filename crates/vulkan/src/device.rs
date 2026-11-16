@@ -583,7 +583,12 @@ impl Device {
             l.min_storage_buffer_offset_alignment = l.min_storage_buffer_offset_alignment.max(16);
             l.min_uniform_buffer_offset_alignment = l.min_uniform_buffer_offset_alignment.max(64);
             l.min_texel_buffer_offset_alignment = l.min_texel_buffer_offset_alignment.max(16);
-            tracing::warn!("DIAG381 NVIDIA alignments forced: ssbo={} ubo={} texel={}", l.min_storage_buffer_offset_alignment, l.min_uniform_buffer_offset_alignment, l.min_texel_buffer_offset_alignment);
+            tracing::warn!(
+                "DIAG381 NVIDIA alignments forced: ssbo={} ubo={} texel={}",
+                l.min_storage_buffer_offset_alignment,
+                l.min_uniform_buffer_offset_alignment,
+                l.min_texel_buffer_offset_alignment
+            );
         }
         let (mut shader_profile, shader_host) = shader_profile(
             &features,
@@ -595,7 +600,10 @@ impl Device {
                 vulkan13: &v13_properties,
             },
         );
-        if let Some(mask) = std::env::var("LICHII_DIAG381_PROFILE").ok().and_then(|v| v.parse::<u32>().ok()) {
+        if let Some(mask) = std::env::var("LICHII_DIAG381_PROFILE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+        {
             if mask & 1 != 0 {
                 shader_profile.support_quad_divergent_implicit_lod = false;
             }

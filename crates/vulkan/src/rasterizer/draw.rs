@@ -872,6 +872,47 @@ impl VulkanRasterizer {
             crate::rasterizer::draw::DIAG381[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         };
+        {
+            let instanced = match call {
+                DrawCall::Direct(params) => params.instance_count > 1,
+                DrawCall::Indirect(_) => true,
+            };
+            let modules = || draw.stages.iter().flatten();
+            let pre_fragment = || modules().filter(|m| m.stage != ShaderStage::Fragment);
+            let has_gs = modules().any(|m| m.stage == ShaderStage::Geometry);
+            let warp = modules().any(|m| {
+                let i = &m.info;
+                i.uses_subgroup_invocation_id
+                    || i.uses_subgroup_shuffles
+                    || i.uses_subgroup_vote
+                    || i.uses_subgroup_mask
+            });
+            let vs_ssbo = pre_fragment().any(|m| !m.info.storage_buffers_descriptors.is_empty());
+            let vs_tex = pre_fragment().any(|m| {
+                !m.info.texture_descriptors.is_empty()
+                    || !m.info.texture_buffer_descriptors.is_empty()
+            });
+            let cats = [instanced, has_gs, warp, vs_ssbo, vs_tex];
+            for (i, &c) in cats.iter().enumerate() {
+                if c {
+                    lichii_common::diag381(i, 1);
+                }
+            }
+            static MASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            let mask = *MASK.get_or_init(|| {
+                std::env::var("LICHII_DIAG381_SKIP")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0)
+            });
+            if cats
+                .iter()
+                .enumerate()
+                .any(|(i, &c)| c && mask & (1 << i) != 0)
+            {
+                return Ok(());
+            }
+        }
         let pipeline_raw = pipeline.raw();
         let layout = pipeline.layout();
         let layout_raw = layout.raw();
@@ -912,7 +953,8 @@ impl VulkanRasterizer {
                     sampler_limit: regs.tex_sampler.limit,
                 };
                 if !self.bind_resources(&module, &sources)? {
-                    crate::rasterizer::draw::DIAG381[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::rasterizer::draw::DIAG381[4]
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Ok(());
                 }
             }
@@ -937,7 +979,11 @@ impl VulkanRasterizer {
             let indirect = match call {
                 DrawCall::Indirect(draw) => match self.indirect_buffers(gmmu, regs, draw, mesh)? {
                     Some(buffers) => Some(buffers),
-                    None => { crate::rasterizer::draw::DIAG381[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed); return Ok(()) },
+                    None => {
+                        crate::rasterizer::draw::DIAG381[5]
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Ok(());
+                    }
                 },
                 DrawCall::Direct(_) => None,
             };
@@ -952,11 +998,13 @@ impl VulkanRasterizer {
                         Warning::ImageChurn,
                         "a draw's render targets and textures keep replacing each other in the texture cache; skipping it",
                     );
-                    crate::rasterizer::draw::DIAG381[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::rasterizer::draw::DIAG381[6]
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Ok(());
                 }
                 if !self.render_targets(ctx)? {
-                    crate::rasterizer::draw::DIAG381[7].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::rasterizer::draw::DIAG381[7]
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Ok(());
                 }
                 removals = self.texture_cache.removals();
@@ -3118,4 +3166,5 @@ mod texture;
 
 #[cfg(test)]
 mod tests;
-pub(crate) static DIAG381: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+pub(crate) static DIAG381: [std::sync::atomic::AtomicU64; 9] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 9];
