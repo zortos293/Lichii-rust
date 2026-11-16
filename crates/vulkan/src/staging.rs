@@ -16,6 +16,11 @@ pub struct StagingSlice<'a> {
     pub data: &'a mut [u8],
 }
 
+/// Staging memory feeds transfers and the compute passes that decode uploads on the GPU.
+const STAGING_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
+    vk::BufferUsageFlags::TRANSFER_SRC.as_raw() | vk::BufferUsageFlags::STORAGE_BUFFER.as_raw(),
+);
+
 /// A ring of host-visible memory for uploads. Each allocation is tagged with the scheduler tick
 /// that consumes it and reused once that tick completed, so steady-state uploads allocate
 /// nothing. Requests larger than a quarter of the ring get a buffer of their own, freed the same
@@ -35,7 +40,7 @@ impl StagingRing {
         let ring = Buffer::new(
             device,
             capacity,
-            vk::BufferUsageFlags::TRANSFER_SRC,
+            STAGING_USAGE,
             MemoryLocation::CpuToGpu,
             "staging ring",
         )?;
@@ -62,7 +67,7 @@ impl StagingRing {
             let buffer = Buffer::new(
                 &self.device,
                 size,
-                vk::BufferUsageFlags::TRANSFER_SRC,
+                STAGING_USAGE,
                 MemoryLocation::CpuToGpu,
                 "staging (oversized)",
             )?;

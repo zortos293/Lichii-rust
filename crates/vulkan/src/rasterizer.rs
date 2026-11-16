@@ -415,9 +415,9 @@ impl VulkanRasterizer {
     }
 
     /// Applies the settings the renderer reads while running: the resolution scale render
-    /// targets use from their next binding on, the ASTC fallback format of new textures, and
-    /// how much device memory the texture cache may fill, sampler anisotropy and whether
-    /// pipelines compile asynchronously.
+    /// targets use from their next binding on, the ASTC fallback format of new textures and where
+    /// they decode, how much device memory the texture cache may fill, sampler anisotropy and
+    /// whether pipelines compile asynchronously.
     pub fn apply_settings(&mut self, settings: &GraphicsSettings) {
         self.draw.set_anisotropy(settings.anisotropic_filtering);
         self.draw
@@ -434,6 +434,7 @@ impl VulkanRasterizer {
             .set_resolution_scale(settings.resolution_scale);
         self.texture_cache
             .set_astc_recompression(settings.astc_recompression);
+        self.texture_cache.set_astc_decode(settings.astc_decode);
     }
 
     /// Applies the settings `live` receives from now on, at each command flush.

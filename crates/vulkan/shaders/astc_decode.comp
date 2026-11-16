@@ -1,0 +1,675 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// Decodes a band of linear (deswizzled) 2D ASTC blocks to RGBA8 in the LDR or LDR sRGB profile,
+// one block per invocation, bit-exact with lichii_texture::astc::decode_rgba8. Texels are packed
+// words (R in the low byte), width per row; texels of edge blocks outside the band are dropped.
+// Illegal encodings and HDR endpoints decode to opaque magenta, as on the CPU.
+
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Blocks { uvec4 blocks[]; };
+layout(set = 0, binding = 1) writeonly buffer Texels { uint texels[]; };
+
+layout(push_constant) uniform P {
+    uint blocks_x;
+    uint blocks_y;
+    uint width;
+    uint height;
+    uint block_w;
+    uint block_h;
+    uint srgb;
+    uint in_offset;
+    uint out_offset;
+} p;
+
+const uint BITS = 0u;
+const uint TRITS = 1u;
+const uint QUINTS = 2u;
+
+const uint ISE_BITS[21] = uint[](1u, 0u, 2u, 0u, 1u, 3u, 1u, 2u, 4u, 2u, 3u, 5u, 3u, 4u, 6u, 4u,
+                                 5u, 7u, 5u, 6u, 8u);
+const uint ISE_KIND[21] = uint[](BITS, TRITS, BITS, QUINTS, TRITS, BITS, QUINTS, TRITS, BITS,
+                                 QUINTS, TRITS, BITS, QUINTS, TRITS, BITS, QUINTS, TRITS, BITS,
+                                 QUINTS, TRITS, BITS);
+const uint QUANT_6 = 4u;
+const uint ERROR_COLOR = 0xFFFF00FFu;
+
+uvec4 block;
+uvec4 reversed;
+
+uint bit(uint value, uint n) {
+    return (value >> n) & 1u;
+}
+
+uint bits(uint value, uint lo, uint count) {
+    return (value >> lo) & ((1u << count) - 1u);
+}
+
+// Bits [pos, pos + count) of b, count <= 32; bits past 128 read as zero.
+uint read128(uvec4 b, uint pos, uint count) {
+    if (count == 0u || pos >= 128u) {
+        return 0u;
+    }
+    uint word = pos >> 5u;
+    uint shift = pos & 31u;
+    uint value = b[word] >> shift;
+    if (shift != 0u && word < 3u) {
+        value |= b[word + 1u] << (32u - shift);
+    }
+    return count >= 32u ? value : value & ((1u << count) - 1u);
+}
+
+uint read(uint pos, uint count) {
+    return read128(block, pos, count);
+}
+
+// As read128, with the bits from end on reading as zero.
+uint read_until(uvec4 b, uint pos, uint count, uint end) {
+    if (pos >= end) {
+        return 0u;
+    }
+    return read128(b, pos, min(count, end - pos));
+}
+
+uint ise_bit_count(uint count, uint level) {
+    uint n = ISE_BITS[level];
+    uint kind = ISE_KIND[level];
+    uint extra = kind == TRITS ? (8u * count + 4u) / 5u : (kind == QUINTS ? (7u * count + 2u) / 3u : 0u);
+    return n * count + extra;
+}
+
+uint trit_digit(uint t, uint j) {
+    uint c;
+    uint t4;
+    uint t3;
+    if (bits(t, 2u, 3u) == 7u) {
+        c = (bits(t, 5u, 3u) << 2u) | bits(t, 0u, 2u);
+        t4 = 2u;
+        t3 = 2u;
+    } else if (bits(t, 5u, 2u) == 3u) {
+        c = bits(t, 0u, 5u);
+        t4 = 2u;
+        t3 = bit(t, 7u);
+    } else {
+        c = bits(t, 0u, 5u);
+        t4 = bit(t, 7u);
+        t3 = bits(t, 5u, 2u);
+    }
+    uint t2;
+    uint t1;
+    uint t0;
+    if (bits(c, 0u, 2u) == 3u) {
+        t2 = 2u;
+        t1 = bit(c, 4u);
+        t0 = (bit(c, 3u) << 1u) | (bit(c, 2u) & ~bit(c, 3u) & 1u);
+    } else if (bits(c, 2u, 2u) == 3u) {
+        t2 = 2u;
+        t1 = 2u;
+        t0 = bits(c, 0u, 2u);
+    } else {
+        t2 = bit(c, 4u);
+        t1 = bits(c, 2u, 2u);
+        t0 = (bit(c, 1u) << 1u) | (bit(c, 0u) & ~bit(c, 1u) & 1u);
+    }
+    uint digits[5] = uint[](t0, t1, t2, t3, t4);
+    return digits[j];
+}
+
+uint quint_digit(uint q, uint j) {
+    uint q2;
+    uint q1;
+    uint q0;
+    if (bits(q, 1u, 2u) == 3u && bits(q, 5u, 2u) == 0u) {
+        uint not0 = ~bit(q, 0u) & 1u;
+        q2 = (bit(q, 0u) << 2u) | ((bit(q, 4u) & not0) << 1u) | (bit(q, 3u) & not0);
+        q1 = 4u;
+        q0 = 4u;
+    } else {
+        uint c;
+        if (bits(q, 1u, 2u) == 3u) {
+            q2 = 4u;
+            c = (bits(q, 3u, 2u) << 3u) | ((~bits(q, 5u, 2u) & 3u) << 1u) | bit(q, 0u);
+        } else {
+            q2 = bits(q, 5u, 2u);
+            c = bits(q, 0u, 5u);
+        }
+        if (bits(c, 0u, 3u) == 5u) {
+            q1 = 4u;
+            q0 = bits(c, 3u, 2u);
+        } else {
+            q1 = bits(c, 3u, 2u);
+            q0 = bits(c, 0u, 3u);
+        }
+    }
+    uint digits[3] = uint[](q0, q1, q2);
+    return digits[j];
+}
+
+// Integer i of the bounded integer sequence of level in bits [start, end) of b.
+uint ise_value(uvec4 b, uint start, uint end, uint level, uint i) {
+    uint n = ISE_BITS[level];
+    uint kind = ISE_KIND[level];
+    if (kind == BITS) {
+        return read_until(b, start + i * n, n, end);
+    }
+    if (kind == TRITS) {
+        uint base = start + (i / 5u) * (5u * n + 8u);
+        uint j = i % 5u;
+        uint packed = read_until(b, base + n, 2u, end)
+            | (read_until(b, base + 2u * n + 2u, 2u, end) << 2u)
+            | (read_until(b, base + 3u * n + 4u, 1u, end) << 4u)
+            | (read_until(b, base + 4u * n + 5u, 2u, end) << 5u)
+            | (read_until(b, base + 5u * n + 7u, 1u, end) << 7u);
+        uint low[5] = uint[](0u, n + 2u, 2u * n + 4u, 3u * n + 5u, 4u * n + 7u);
+        return (trit_digit(packed, j) << n) | read_until(b, base + low[j], n, end);
+    }
+    uint base = start + (i / 3u) * (3u * n + 7u);
+    uint j = i % 3u;
+    uint packed = read_until(b, base + n, 3u, end)
+        | (read_until(b, base + 2u * n + 3u, 2u, end) << 3u)
+        | (read_until(b, base + 3u * n + 5u, 2u, end) << 5u);
+    uint low[3] = uint[](0u, n + 3u, 2u * n + 5u);
+    return (quint_digit(packed, j) << n) | read_until(b, base + low[j], n, end);
+}
+
+uint replicate(uint value, uint from, uint to) {
+    uint result = 0u;
+    uint filled = 0u;
+    while (filled < to) {
+        result = (result << from) | value;
+        filled += from;
+    }
+    return result >> (filled - to);
+}
+
+uint color_unquant(uint level, uint v) {
+    uint n = ISE_BITS[level];
+    uint kind = ISE_KIND[level];
+    if (kind == BITS) {
+        return replicate(v, n, 8u) & 0xFFu;
+    }
+    uint m = v & ((1u << n) - 1u);
+    uint b = bit(m, 1u);
+    uint c = bit(m, 2u);
+    uint d = bit(m, 3u);
+    uint e = bit(m, 4u);
+    uint f = bit(m, 5u);
+    uint big_b;
+    uint big_c;
+    bool trits = kind == TRITS;
+    if (n == 1u) {
+        big_b = 0u;
+        big_c = trits ? 204u : 113u;
+    } else if (n == 2u) {
+        big_b = trits ? ((b << 8u) | (b << 4u) | (b << 2u) | (b << 1u)) : ((b << 8u) | (b << 3u) | (b << 2u));
+        big_c = trits ? 93u : 54u;
+    } else if (n == 3u) {
+        big_b = trits ? ((c << 8u) | (b << 7u) | (c << 3u) | (b << 2u) | (c << 1u) | b)
+                      : ((c << 8u) | (b << 7u) | (c << 2u) | (b << 1u) | c);
+        big_c = trits ? 44u : 26u;
+    } else if (n == 4u) {
+        big_b = trits ? ((d << 8u) | (c << 7u) | (b << 6u) | (d << 2u) | (c << 1u) | b)
+                      : ((d << 8u) | (c << 7u) | (b << 6u) | (d << 1u) | c);
+        big_c = trits ? 22u : 13u;
+    } else if (n == 5u) {
+        big_b = trits ? ((e << 8u) | (d << 7u) | (c << 6u) | (b << 5u) | (e << 1u) | d)
+                      : ((e << 8u) | (d << 7u) | (c << 6u) | (b << 5u) | e);
+        big_c = trits ? 11u : 6u;
+    } else {
+        big_b = (f << 8u) | (e << 7u) | (d << 6u) | (c << 5u) | (b << 4u) | f;
+        big_c = 5u;
+    }
+    uint a = bit(m, 0u) == 1u ? 0x1FFu : 0u;
+    uint t = ((v >> n) * big_c + big_b) ^ a;
+    return ((a & 0x80u) | (t >> 2u)) & 0xFFu;
+}
+
+uint weight_unquant(uint level, uint v) {
+    uint n = ISE_BITS[level];
+    uint kind = ISE_KIND[level];
+    uint m = v & ((1u << n) - 1u);
+    uint d = v >> n;
+    uint b = bit(m, 1u);
+    uint c = bit(m, 2u);
+    uint unquant;
+    if (kind == BITS) {
+        unquant = replicate(v, n, 6u);
+    } else if (n == 0u) {
+        uint trit_values[3] = uint[](0u, 32u, 63u);
+        uint quint_values[5] = uint[](0u, 16u, 32u, 47u, 63u);
+        unquant = kind == TRITS ? trit_values[min(d, 2u)] : quint_values[min(d, 4u)];
+    } else {
+        bool trits = kind == TRITS;
+        uint big_b;
+        uint big_c;
+        if (n == 1u) {
+            big_b = 0u;
+            big_c = trits ? 50u : 28u;
+        } else if (n == 2u) {
+            big_b = trits ? ((b << 6u) | (b << 2u) | b) : ((b << 6u) | (b << 1u));
+            big_c = trits ? 23u : 13u;
+        } else {
+            big_b = (c << 6u) | (b << 5u) | (c << 1u) | b;
+            big_c = 11u;
+        }
+        uint a = bit(m, 0u) == 1u ? 0x7Fu : 0u;
+        uint t = (d * big_c + big_b) ^ a;
+        unquant = (a & 0x20u) | (t >> 2u);
+    }
+    return unquant > 32u ? unquant + 1u : unquant;
+}
+
+uint grid_w;
+uint grid_h;
+bool dual_plane;
+uint weight_level;
+uint weight_bits;
+
+bool decode_block_mode(uint mode) {
+    uint a = bits(mode, 5u, 2u);
+    dual_plane = bit(mode, 10u) == 1u;
+    bool high_precision = bit(mode, 9u) == 1u;
+    uint low = bits(mode, 0u, 2u);
+    uint range = low != 0u ? low : bits(mode, 2u, 2u);
+    if (range == 0u) {
+        return false;
+    }
+    if (low != 0u) {
+        uint b = bits(mode, 7u, 2u);
+        uint kind = bits(mode, 2u, 2u);
+        if (kind == 0u) {
+            grid_w = b + 4u;
+            grid_h = a + 2u;
+        } else if (kind == 1u) {
+            grid_w = b + 8u;
+            grid_h = a + 2u;
+        } else if (kind == 2u) {
+            grid_w = a + 2u;
+            grid_h = b + 8u;
+        } else if (bit(mode, 8u) == 1u) {
+            grid_w = (b & 1u) + 2u;
+            grid_h = a + 2u;
+        } else {
+            grid_w = a + 2u;
+            grid_h = (b & 1u) + 6u;
+        }
+    } else {
+        uint kind = bits(mode, 7u, 2u);
+        if (kind == 0u) {
+            grid_w = 12u;
+            grid_h = a + 2u;
+        } else if (kind == 1u) {
+            grid_w = a + 2u;
+            grid_h = 12u;
+        } else if (kind == 2u) {
+            dual_plane = false;
+            high_precision = false;
+            grid_w = a + 6u;
+            grid_h = bits(mode, 9u, 2u) + 6u;
+        } else if (a == 0u) {
+            grid_w = 6u;
+            grid_h = 10u;
+        } else if (a == 1u) {
+            grid_w = 10u;
+            grid_h = 6u;
+        } else {
+            return false;
+        }
+    }
+    weight_level = ((range << 1u) | bit(mode, 4u)) - 2u + (high_precision ? 6u : 0u);
+    uint count = grid_w * grid_h * (dual_plane ? 2u : 1u);
+    weight_bits = ise_bit_count(count, weight_level);
+    return count <= 64u && weight_bits >= 24u && weight_bits <= 96u;
+}
+
+uint weights[16];
+
+uint weight_at(uint index) {
+    return (weights[index >> 2u] >> ((index & 3u) * 8u)) & 0xFFu;
+}
+
+// Weight index of one plane of the grid; past the grid it reads zero.
+uint grid_weight(uint plane, uint index) {
+    if (index >= grid_w * grid_h) {
+        return 0u;
+    }
+    return weight_at(dual_plane ? index * 2u + plane : index);
+}
+
+uint infill(uint plane, uint s, uint t, uint bw, uint bh) {
+    if (grid_w == bw && grid_h == bh) {
+        return grid_weight(plane, t * bw + s);
+    }
+    uint ds = (1024u + bw / 2u) / (bw - 1u);
+    uint dt = (1024u + bh / 2u) / (bh - 1u);
+    uint gs = (ds * s * (grid_w - 1u) + 32u) >> 6u;
+    uint gt = (dt * t * (grid_h - 1u) + 32u) >> 6u;
+    uint js = gs >> 4u;
+    uint fs = gs & 0xFu;
+    uint jt = gt >> 4u;
+    uint ft = gt & 0xFu;
+    uint v0 = js + jt * grid_w;
+    uint w11 = (fs * ft + 8u) >> 4u;
+    uint w10 = ft - w11;
+    uint w01 = fs - w11;
+    uint w00 = 16u + w11 - fs - ft;
+    uint sum = grid_weight(plane, v0) * w00 + grid_weight(plane, v0 + 1u) * w01
+        + grid_weight(plane, v0 + grid_w) * w10 + grid_weight(plane, v0 + grid_w + 1u) * w11;
+    return (sum + 8u) >> 4u;
+}
+
+uint hash52(uint x) {
+    x ^= x >> 15u;
+    x -= x << 17u;
+    x += x << 7u;
+    x += x << 4u;
+    x ^= x >> 5u;
+    x += x << 16u;
+    x ^= x >> 7u;
+    x ^= x >> 3u;
+    x ^= x << 6u;
+    x ^= x >> 17u;
+    return x;
+}
+
+uint seeds[8];
+uint seed_offsets[4];
+uint partition_count;
+uint partition_shift;
+
+void partition_selector(uint index, uint texel_count) {
+    uint seed = index + (partition_count - 1u) * 1024u;
+    uint rnum = hash52(seed);
+    uint sh1;
+    uint sh2;
+    if ((seed & 1u) == 1u) {
+        sh1 = (seed & 2u) != 0u ? 4u : 5u;
+        sh2 = partition_count == 3u ? 6u : 5u;
+    } else {
+        sh1 = partition_count == 3u ? 6u : 5u;
+        sh2 = (seed & 2u) != 0u ? 4u : 5u;
+    }
+    for (uint i = 0u; i < 8u; ++i) {
+        uint s = (rnum >> (4u * i)) & 0xFu;
+        seeds[i] = (s * s) >> ((i % 2u) == 0u ? sh1 : sh2);
+    }
+    seed_offsets[0] = rnum >> 14u;
+    seed_offsets[1] = rnum >> 10u;
+    seed_offsets[2] = rnum >> 6u;
+    seed_offsets[3] = rnum >> 2u;
+    partition_shift = texel_count < 31u ? 1u : 0u;
+}
+
+uint select_partition(uint x, uint y) {
+    x <<= partition_shift;
+    y <<= partition_shift;
+    uint a = (seeds[0] * x + seeds[1] * y + seed_offsets[0]) & 0x3Fu;
+    uint b = (seeds[2] * x + seeds[3] * y + seed_offsets[1]) & 0x3Fu;
+    uint c = partition_count >= 3u ? (seeds[4] * x + seeds[5] * y + seed_offsets[2]) & 0x3Fu : 0u;
+    uint d = partition_count >= 4u ? (seeds[6] * x + seeds[7] * y + seed_offsets[3]) & 0x3Fu : 0u;
+    if (a >= b && a >= c && a >= d) {
+        return 0u;
+    }
+    if (b >= c && b >= d) {
+        return 1u;
+    }
+    return c >= d ? 2u : 3u;
+}
+
+uint values[18];
+uint value_base;
+uint value_count;
+
+int v(uint i) {
+    return i < value_count ? int(values[value_base + i]) : 0;
+}
+
+// (signed delta, base) of the raw (a, b) pair of a base+offset mode.
+ivec2 bit_transfer_signed(int a, int b) {
+    b = (b >> 1) | (a & 0x80);
+    a = (a >> 1) & 0x3F;
+    return ivec2((a & 0x20) != 0 ? a - 0x40 : a, b);
+}
+
+ivec4 blue_contract(ivec4 c) {
+    return ivec4((c.r + c.b) >> 1, (c.g + c.b) >> 1, c.b, c.a);
+}
+
+const ivec4 MAGENTA = ivec4(0xFF, 0x00, 0xFF, 0xFF);
+
+// The 8-bit endpoints of an LDR color endpoint mode; HDR modes give magenta.
+void unpack_endpoints(uint cem, out ivec4 e0, out ivec4 e1) {
+    if (cem == 0u) {
+        e0 = ivec4(v(0u), v(0u), v(0u), 0xFF);
+        e1 = ivec4(v(1u), v(1u), v(1u), 0xFF);
+    } else if (cem == 1u) {
+        int l0 = (v(0u) >> 2) | (v(1u) & 0xC0);
+        int l1 = min(l0 + (v(1u) & 0x3F), 0xFF);
+        e0 = ivec4(l0, l0, l0, 0xFF);
+        e1 = ivec4(l1, l1, l1, 0xFF);
+    } else if (cem == 4u) {
+        e0 = ivec4(v(0u), v(0u), v(0u), v(2u));
+        e1 = ivec4(v(1u), v(1u), v(1u), v(3u));
+    } else if (cem == 5u) {
+        ivec2 l = bit_transfer_signed(v(1u), v(0u));
+        ivec2 a = bit_transfer_signed(v(3u), v(2u));
+        int l1 = clamp(l.y + l.x, 0, 0xFF);
+        int a1 = clamp(a.y + a.x, 0, 0xFF);
+        e0 = ivec4(l.y, l.y, l.y, a.y);
+        e1 = ivec4(l1, l1, l1, a1);
+    } else if (cem == 6u || cem == 10u) {
+        int s = v(3u);
+        int a0 = cem == 6u ? 0xFF : v(4u);
+        int a1 = cem == 6u ? 0xFF : v(5u);
+        e0 = ivec4((v(0u) * s) >> 8, (v(1u) * s) >> 8, (v(2u) * s) >> 8, a0);
+        e1 = ivec4(v(0u), v(1u), v(2u), a1);
+    } else if (cem == 8u || cem == 12u) {
+        int a0 = cem == 8u ? 0xFF : v(6u);
+        int a1 = cem == 8u ? 0xFF : v(7u);
+        ivec4 c0 = ivec4(v(0u), v(2u), v(4u), a0);
+        ivec4 c1 = ivec4(v(1u), v(3u), v(5u), a1);
+        if (v(1u) + v(3u) + v(5u) >= v(0u) + v(2u) + v(4u)) {
+            e0 = c0;
+            e1 = c1;
+        } else {
+            e0 = blue_contract(c1);
+            e1 = blue_contract(c0);
+        }
+    } else if (cem == 9u || cem == 13u) {
+        ivec4 base;
+        ivec4 delta;
+        for (uint i = 0u; i < 4u; ++i) {
+            ivec2 pair = bit_transfer_signed(v(2u * i + 1u), v(2u * i));
+            delta[i] = pair.x;
+            base[i] = pair.y;
+        }
+        ivec4 c0 = base;
+        ivec4 c1 = base + delta;
+        if (cem == 9u) {
+            c0.a = 0xFF;
+            c1.a = 0xFF;
+        }
+        if (delta.r + delta.g + delta.b >= 0) {
+            e0 = c0;
+            e1 = c1;
+        } else {
+            e0 = blue_contract(c1);
+            e1 = blue_contract(c0);
+        }
+        e0 = clamp(e0, 0, 0xFF);
+        e1 = clamp(e1, 0, 0xFF);
+    } else {
+        e0 = MAGENTA;
+        e1 = MAGENTA;
+    }
+}
+
+ivec4 expand(ivec4 e) {
+    return p.srgb != 0u ? ((e << 8) | 0x80) : e * 257;
+}
+
+void write_texel(uvec2 origin, uint s, uint t, uint color) {
+    uint x = origin.x + s;
+    uint y = origin.y + t;
+    if (x < p.width && y < p.height) {
+        texels[p.out_offset + y * p.width + x] = color;
+    }
+}
+
+void fill(uvec2 origin, uint color) {
+    for (uint t = 0u; t < p.block_h; ++t) {
+        for (uint s = 0u; s < p.block_w; ++s) {
+            write_texel(origin, s, t, color);
+        }
+    }
+}
+
+uint pack_texel(ivec4 color) {
+    uvec4 c = uvec4(color >> 8) & 0xFFu;
+    return c.r | (c.g << 8u) | (c.b << 16u) | (c.a << 24u);
+}
+
+// Decodes block into the band, or returns false for an illegal encoding.
+bool decode(uvec2 origin) {
+    uint bw = p.block_w;
+    uint bh = p.block_h;
+    uint mode = read(0u, 11u);
+    if ((mode & 0x1FFu) == 0x1FCu) {
+        if (read(10u, 2u) != 3u) {
+            return false;
+        }
+        uint s0 = read(12u, 13u);
+        uint s1 = read(25u, 13u);
+        uint t0 = read(38u, 13u);
+        uint t1 = read(51u, 13u);
+        bool all_ones = (s0 & s1 & t0 & t1) == 0x1FFFu;
+        if (!all_ones && (s0 >= s1 || t0 >= t1)) {
+            return false;
+        }
+        if (bit(mode, 9u) == 1u) {
+            return false;
+        }
+        uint color = bits(block.z, 8u, 8u) | (bits(block.z, 24u, 8u) << 8u)
+            | (bits(block.w, 8u, 8u) << 16u) | (bits(block.w, 24u, 8u) << 24u);
+        fill(origin, color);
+        return true;
+    }
+
+    if (!decode_block_mode(mode) || grid_w > bw || grid_h > bh) {
+        return false;
+    }
+    partition_count = read(11u, 2u) + 1u;
+    if (dual_plane && partition_count == 4u) {
+        return false;
+    }
+
+    uint below_weights = 128u - weight_bits;
+    uint cems[4] = uint[](0u, 0u, 0u, 0u);
+    uint config_start;
+    if (partition_count == 1u) {
+        cems[0] = read(13u, 4u);
+        config_start = 17u;
+    } else {
+        uint encoded = read(23u, 6u);
+        if ((encoded & 3u) == 0u) {
+            for (uint i = 0u; i < 4u; ++i) {
+                cems[i] = encoded >> 2u;
+            }
+        } else {
+            uint high_bits = 3u * partition_count - 4u;
+            below_weights -= high_bits;
+            encoded |= read(below_weights, high_bits) << 6u;
+            uint base_class = (encoded & 3u) - 1u;
+            for (uint i = 0u; i < partition_count; ++i) {
+                uint cls = base_class + bit(encoded, 2u + i);
+                cems[i] = (cls << 2u) | bits(encoded, 2u + partition_count + 2u * i, 2u);
+            }
+        }
+        config_start = 29u;
+    }
+
+    uint total_values = 0u;
+    for (uint i = 0u; i < partition_count; ++i) {
+        total_values += ((cems[i] >> 2u) + 1u) * 2u;
+    }
+    if (total_values > 18u) {
+        return false;
+    }
+    uint plane2_component = 4u;
+    if (dual_plane) {
+        below_weights -= 2u;
+        plane2_component = read(below_weights, 2u);
+    }
+    uint color_bits = below_weights > config_start ? below_weights - config_start : 0u;
+    uint color_level = 0u;
+    bool found = false;
+    for (uint level = 20u; level >= QUANT_6; --level) {
+        if (ise_bit_count(total_values, level) <= color_bits) {
+            color_level = level;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        return false;
+    }
+
+    uint color_end = config_start + ise_bit_count(total_values, color_level);
+    for (uint i = 0u; i < total_values; ++i) {
+        values[i] = color_unquant(color_level, ise_value(block, config_start, color_end, color_level, i));
+    }
+
+    ivec4 base[4];
+    ivec4 delta[4];
+    value_base = 0u;
+    for (uint i = 0u; i < partition_count; ++i) {
+        value_count = ((cems[i] >> 2u) + 1u) * 2u;
+        ivec4 e0;
+        ivec4 e1;
+        unpack_endpoints(cems[i], e0, e1);
+        base[i] = expand(e0);
+        delta[i] = expand(e1) - base[i];
+        value_base += value_count;
+    }
+
+    uint weight_count = grid_w * grid_h * (dual_plane ? 2u : 1u);
+    for (uint i = 0u; i < 16u; ++i) {
+        weights[i] = 0u;
+    }
+    for (uint i = 0u; i < weight_count; ++i) {
+        uint w = weight_unquant(weight_level, ise_value(reversed, 0u, weight_bits, weight_level, i));
+        weights[i >> 2u] |= w << ((i & 3u) * 8u);
+    }
+
+    if (partition_count > 1u) {
+        partition_selector(read(13u, 10u), bw * bh);
+    }
+    for (uint t = 0u; t < bh; ++t) {
+        for (uint s = 0u; s < bw; ++s) {
+            uint part = partition_count > 1u ? select_partition(s, t) : 0u;
+            ivec4 w = ivec4(int(infill(0u, s, t, bw, bh)));
+            if (dual_plane) {
+                w[plane2_component & 3u] = int(infill(1u, s, t, bw, bh));
+            }
+            ivec4 color = base[part] + ((delta[part] * w + 32) >> 6);
+            write_texel(origin, s, t, pack_texel(color));
+        }
+    }
+    return true;
+}
+
+void main() {
+    uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= p.blocks_x || id.y >= p.blocks_y) {
+        return;
+    }
+    block = blocks[p.in_offset + id.y * p.blocks_x + id.x];
+    reversed = uvec4(bitfieldReverse(block.w), bitfieldReverse(block.z), bitfieldReverse(block.y),
+                     bitfieldReverse(block.x));
+    uvec2 origin = id * uvec2(p.block_w, p.block_h);
+    if (!decode(origin)) {
+        fill(origin, ERROR_COLOR);
+    }
+}

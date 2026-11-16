@@ -64,7 +64,9 @@ use crate::pipeline::{
     GraphicsShaders, PipelineCache, PipelineFeatures,
 };
 use crate::scheduler::RenderingKey;
-use crate::texture_cache::{DEPTH_ATTACHMENT, ImageId, ImageInfo, ImageKind, Transfer, ViewInfo};
+use crate::texture_cache::{
+    DEPTH_ATTACHMENT, ImageId, ImageInfo, ImageKind, Transfer, Usage, ViewInfo,
+};
 use dynamic::{DynamicShadow, Slot};
 
 const NULL_BUFFER_SIZE: u64 = 64 << 10;
@@ -1927,7 +1929,7 @@ impl VulkanRasterizer {
         raw: u32,
         desc: &ImageDescriptor,
     ) -> Result<Option<(ImageId, vk::ImageView)>> {
-        let Some((id, mut view)) = self.texture_info(src, raw, desc.ty)? else {
+        let Some((id, mut view)) = self.texture_info(src, raw, desc.ty, Usage::Storage)? else {
             return Ok(None);
         };
         if !desc.is_written && self.texture_cache.unwritten(id) {
@@ -2078,7 +2080,7 @@ impl VulkanRasterizer {
         raw: u32,
         ty: TextureType,
     ) -> Result<Option<(ImageId, vk::ImageView)>> {
-        let Some((id, view)) = self.texture_info(src, raw, ty)? else {
+        let Some((id, view)) = self.texture_info(src, raw, ty, Usage::Sample)? else {
             return Ok(None);
         };
         if self.texture_cache.unwritten(id) {
@@ -2097,6 +2099,7 @@ impl VulkanRasterizer {
         src: &StageSources<'_>,
         raw: u32,
         ty: TextureType,
+        usage: Usage,
     ) -> Result<Option<(ImageId, ViewInfo)>> {
         let (index, _) = src.pool.split(raw);
         if index > src.pool.limit {
@@ -2112,7 +2115,10 @@ impl VulkanRasterizer {
             memory: &self.handles.device,
             buffers: &mut self.buffer_cache,
         };
-        let Some((id, mut view)) = self.texture_cache.texture(&mut tx, src.gmmu, &header)? else {
+        let Some((id, mut view)) = self
+            .texture_cache
+            .texture(&mut tx, src.gmmu, &header, usage)?
+        else {
             return Ok(None);
         };
         view.view_type = view_type(ty);
@@ -2459,7 +2465,7 @@ impl VulkanRasterizer {
                 raw.cmd_set_line_width(cmd, line_width)
             });
             let bias = (
-                regs.depth_bias,
+                regs.depth_bias / 2.0,
                 regs.depth_bias_clamp,
                 regs.slope_scale_depth_bias,
             );
