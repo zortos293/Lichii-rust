@@ -219,6 +219,7 @@ fn translate(job: &Job, profile: &Profile, host: &HostTranslateInfo) -> Option<T
     if let Ok((module, _)) = &result {
         env.liru14_dump(module.hash);
     }
+    let result = result.map(|(module, entry)| (env.liru14_swap(module), entry));
     let mut bytes = Vec::new();
     let mut code = |env: &ProgramEnv<'_>| {
         let (start, len) = env.code_range();

@@ -580,6 +580,27 @@ impl<'a> ProgramEnv<'a> {
 
     /// Takes the queries of the last translation.
     #[doc(hidden)]
+    pub fn liru14_swap(&self, module: Arc<lichii_shader::ShaderModule>) -> Arc<lichii_shader::ShaderModule> {
+        let Some(dir) = std::env::var_os("LIRU14_SWAP_DIR") else {
+            return module;
+        };
+        if self.stage != ShaderStage::Fragment {
+            return module;
+        }
+        let path = std::path::PathBuf::from(dir).join(format!("fs-{:016x}.cxx.spv", module.hash));
+        let Ok(bytes) = std::fs::read(&path) else {
+            return module;
+        };
+        tracing::info!("LIRU14 swapped fs {:016x} for the C++ module", module.hash);
+        let mut swapped = (*module).clone();
+        swapped.spirv = bytes
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+            .collect();
+        Arc::new(swapped)
+    }
+
+    #[doc(hidden)]
     pub fn liru14_dump(&self, hash: u64) {
         use std::fmt::Write as _;
         let Some(dir) = std::env::var_os("LIRU14_DUMP_DIR") else {
