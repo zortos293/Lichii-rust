@@ -577,8 +577,15 @@ impl Device {
                 raw_instance.get_physical_device_memory_properties(physical),
             )
         };
-        let base = properties2.properties;
-        let (shader_profile, shader_host) = shader_profile(
+        let mut base = properties2.properties;
+        if std::env::var_os("LICHII_DIAG_NV_ALIGN").is_some() {
+            let l = &mut base.limits;
+            l.min_storage_buffer_offset_alignment = l.min_storage_buffer_offset_alignment.max(16);
+            l.min_uniform_buffer_offset_alignment = l.min_uniform_buffer_offset_alignment.max(64);
+            l.min_texel_buffer_offset_alignment = l.min_texel_buffer_offset_alignment.max(16);
+            tracing::warn!("DIAG381 NVIDIA alignments forced: ssbo={} ubo={} texel={}", l.min_storage_buffer_offset_alignment, l.min_uniform_buffer_offset_alignment, l.min_texel_buffer_offset_alignment);
+        }
+        let (mut shader_profile, shader_host) = shader_profile(
             &features,
             &ShaderQueries {
                 api_version: base.api_version,
@@ -588,6 +595,24 @@ impl Device {
                 vulkan13: &v13_properties,
             },
         );
+        if let Some(mask) = std::env::var("LICHII_DIAG381_PROFILE").ok().and_then(|v| v.parse::<u32>().ok()) {
+            if mask & 1 != 0 {
+                shader_profile.support_quad_divergent_implicit_lod = false;
+            }
+            if mask & 2 != 0 {
+                shader_profile.support_separate_denorm_behavior = false;
+                shader_profile.support_separate_rounding_mode = false;
+                shader_profile.support_fp16_denorm_preserve = false;
+                shader_profile.support_fp16_signed_zero_nan_preserve = false;
+            }
+            if mask & 4 != 0 {
+                shader_profile.guest_warp_stages = 0;
+            }
+            if mask & 8 != 0 {
+                shader_profile.warp_size_potentially_larger_than_guest = true;
+            }
+            tracing::warn!("DIAG381 profile mask {mask}: {shader_profile:?}");
+        }
         let properties = DeviceProperties {
             name: candidate.name,
             device_type: base.device_type,
