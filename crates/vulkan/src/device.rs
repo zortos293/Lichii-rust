@@ -15,6 +15,7 @@ use lichii_shader::profile::HostTranslateInfo;
 use crate::error::{Error, Result, VkResultExt};
 use crate::instance::Instance;
 use crate::profile::{ShaderQueries, shader_profile};
+use crate::video::{self, VideoQueue};
 
 /// Device memory blocks are 64 MiB: with 256 MiB blocks ~38% of device memory sat empty in
 /// half-used blocks and evictions never lowered the driver's usage (NX2_NOTES row 114).
@@ -175,6 +176,8 @@ pub struct Device {
     pub shader_host: HostTranslateInfo,
     /// Debug names and labels, with `debug.vulkan_labels`.
     pub(crate) labels: Option<ext::debug_utils::Device>,
+    /// The video decode queue, when the device decodes AV1 on one of its own.
+    pub video: Option<VideoQueue>,
 }
 
 struct Candidate {
@@ -294,7 +297,9 @@ impl Device {
             return Err(Error::NoDevice);
         }
         let candidate = candidates.swap_remove(chosen);
-        Self::create(instance, candidate, surface.is_some())
+        let device = Self::create(instance, candidate, surface.is_some())?;
+        crate::video_av1::register(&device);
+        Ok(device)
     }
 
     fn create(
@@ -328,6 +333,20 @@ impl Device {
                 *flag(&mut extensions) = true;
                 names.push(name.as_ptr());
             }
+        }
+        // A queue family of its own that decodes AV1: movies decode on the video engine.
+        let video_family = video::AV1_EXTENSIONS
+            .iter()
+            .all(|name| has(name))
+            .then(|| {
+                video::decode_family(
+                    &video::queue_families(raw_instance, physical),
+                    candidate.queue_family,
+                )
+            })
+            .flatten();
+        if video_family.is_some() {
+            names.extend(video::AV1_EXTENSIONS.iter().map(|name| name.as_ptr()));
         }
 
         let mut v11 = vk::PhysicalDeviceVulkan11Features::default();
@@ -532,9 +551,18 @@ impl Device {
         );
 
         let priorities = [1.0];
-        let queue_info = [vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(candidate.queue_family)
-            .queue_priorities(&priorities)];
+        let mut queue_info = vec![
+            vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(candidate.queue_family)
+                .queue_priorities(&priorities),
+        ];
+        if let Some(family) = video_family {
+            queue_info.push(
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(family)
+                    .queue_priorities(&priorities),
+            );
+        }
         let mut enabled = chain!(core);
         let mut info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
@@ -639,6 +667,36 @@ impl Device {
             }
         };
 
+        let video = video_family.and_then(|family| {
+            let av1 = video::av1_capabilities(&instance.entry, raw_instance, physical)?;
+            // SAFETY: the device was created with one queue of this family.
+            let queue = unsafe { raw.get_device_queue(family, 0) };
+            tracing::info!(
+                "Vulkan video: AV1 decode on queue family {family}: Main 4:2:0 8-bit up to {}x{}, \
+                 level {}, {} DPB slots, {} references, film grain {}, DPB and output {}, \
+                 output formats {:?}",
+                av1.max_extent.width,
+                av1.max_extent.height,
+                av1.level_name(),
+                av1.max_dpb_slots,
+                av1.max_active_references,
+                if av1.film_grain {
+                    "on the GPU"
+                } else {
+                    "not applied"
+                },
+                match (av1.dpb_and_output_coincide, av1.dpb_and_output_distinct) {
+                    (true, true) => "shared or apart",
+                    (true, false) => "shared",
+                    _ => "apart",
+                },
+                av1.output_formats,
+            );
+            Some(VideoQueue::new(family, queue, av1))
+        });
+        if video.is_none() {
+            tracing::info!("Vulkan video: no AV1 decode queue on this device");
+        }
         let labels = instance
             .labels
             .then(|| ext::debug_utils::Device::new(raw_instance, &raw));
@@ -656,6 +714,7 @@ impl Device {
             shader_profile,
             shader_host,
             labels,
+            video,
         }))
     }
 
@@ -723,7 +782,9 @@ impl Device {
     /// Blocks until the device finished all work.
     pub fn wait_idle(&self) {
         let _queue = self.queue.lock();
-        // SAFETY: holding the queue lock keeps other threads from submitting meanwhile.
+        let _video = self.video.as_ref().map(|video| video.queue());
+        // SAFETY: holding the universal and video queue locks (in that order, as everywhere)
+        // keeps other threads from submitting to any queue of the device meanwhile.
         if let Err(error) = unsafe { self.raw.device_wait_idle() } {
             tracing::error!("vkDeviceWaitIdle: {error}");
         }
