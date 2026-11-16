@@ -4,7 +4,54 @@
 //! for the host GPU. It tells a slow title's GPU threads apart from its CPU side, and a renderer
 //! that never draws from one that draws nothing visible.
 
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+pub(crate) static LIRU6_READS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LIRU6_READ_NS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LIRU6_READ_WORDS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LIRU6_BACK_WAITS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LIRU6_BACK_OVERLAY: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LIRU6_BACK_SYNC_NS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LIRU6_FETCH_HOST: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LIRU6_FETCH_NS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LIRU6_MACRO: AtomicU32 = AtomicU32::new(0);
+pub(crate) static LIRU6_BY_MACRO: std::sync::Mutex<Vec<(u32, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static LIRU6_TRACE: AtomicU32 = AtomicU32::new(0);
+pub(crate) static LIRU6_PARAMS: [AtomicU32; 17] = [const { AtomicU32::new(0) }; 17];
+pub(crate) static LIRU6_TRACED: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+pub(crate) fn liru6_params(p: &[u32]) {
+    LIRU6_PARAMS[16].store(p.len() as u32, Ordering::Relaxed);
+    for (i, v) in p.iter().take(16).enumerate() { LIRU6_PARAMS[i].store(*v, Ordering::Relaxed); }
+}
+pub(crate) fn liru6_trace_read(gpu_va: u64, out: &[u32]) {
+    let start = LIRU6_MACRO.load(Ordering::Relaxed);
+    let mut v = LIRU6_TRACED.lock().unwrap();
+    let n = match v.iter_mut().find(|e| e.0 == start) { Some(e) => { e.1 += 1; e.1 } None => { v.push((start, 1)); 1 } };
+    if !(n <= 3 || n == 50 || n == 1000) { return; }
+    let len = (LIRU6_PARAMS[16].load(Ordering::Relaxed) as usize).min(16);
+    let params: Vec<String> = (0..len).map(|i| format!("{:#x}", LIRU6_PARAMS[i].load(Ordering::Relaxed))).collect();
+    let words: Vec<String> = out.iter().take(24).map(|w| format!("{w:#x}")).collect();
+    tracing::warn!(start = format!("{start:#x}"), call = n, gpu_va = format!("{gpu_va:#x}"), count = out.len(), ?params, ?words, "LIRU6DIAG macro dma_read");
+    LIRU6_TRACE.store(40, Ordering::Relaxed);
+}
+pub(crate) static LIRU6_SHADOW: std::sync::Mutex<Vec<(u32, String, u64)>> = std::sync::Mutex::new(Vec::new());
+pub(crate) fn liru6_shadow(start: u32, outcome: String) {
+    let mut v = LIRU6_SHADOW.lock().unwrap();
+    match v.iter_mut().find(|e| e.0 == start && e.1 == outcome) {
+        Some(e) => e.2 += 1,
+        None => v.push((start, outcome, 1)),
+    }
+}
+pub(crate) fn liru6_read(words: u64, ns: u64) {
+    LIRU6_READS.fetch_add(1, Ordering::Relaxed);
+    LIRU6_READ_NS.fetch_add(ns, Ordering::Relaxed);
+    LIRU6_READ_WORDS.fetch_add(words, Ordering::Relaxed);
+    let start = LIRU6_MACRO.load(Ordering::Relaxed);
+    let mut v = LIRU6_BY_MACRO.lock().unwrap();
+    match v.iter_mut().find(|e| e.0 == start) {
+        Some(e) => { e.1 += 1; e.2 += ns; }
+        None => v.push((start, 1, ns)),
+    }
+}
 use std::time::{Duration, Instant};
 
 use lichii_memory::{DeviceAddressSpace, FlushTrapStats};
@@ -268,6 +315,24 @@ impl Activity {
             trap_protects = traps.protects,
             "GPU activity"
         );
+        let t = |c: &AtomicU64| c.swap(0, Ordering::Relaxed);
+        let mut by: Vec<(u32, u64, u64)> = std::mem::take(&mut *LIRU6_BY_MACRO.lock().unwrap());
+        by.sort_by_key(|e| std::cmp::Reverse(e.2));
+        let by: Vec<String> = by.iter().take(6).map(|e| format!("{:#x}:{}x/{}us", e.0, e.1, e.2 / 1000)).collect();
+        tracing::warn!(
+            reads = t(&LIRU6_READS),
+            read_ms = t(&LIRU6_READ_NS) / 1_000_000,
+            words = t(&LIRU6_READ_WORDS),
+            back_waits = t(&LIRU6_BACK_WAITS),
+            back_overlay = t(&LIRU6_BACK_OVERLAY),
+            back_sync_ms = t(&LIRU6_BACK_SYNC_NS) / 1_000_000,
+            fetch_host = t(&LIRU6_FETCH_HOST),
+            fetch_ms = t(&LIRU6_FETCH_NS) / 1_000_000,
+            by_macro = ?by,
+            "LIRU6DIAG dma_read"
+        );
+        let shadow: Vec<String> = std::mem::take(&mut *LIRU6_SHADOW.lock().unwrap()).iter().map(|e| format!("{:#x} {} x{}", e.0, e.1, e.2)).collect();
+        tracing::warn!(?shadow, "LIRU6DIAG shadow");
     }
 }
 

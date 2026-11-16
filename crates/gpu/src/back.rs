@@ -334,7 +334,12 @@ impl Back {
                     .read_overlay
                     .set(pending.unwrap_or_default());
                 if waits {
+                    let liru6 = std::time::Instant::now();
                     self.synchronize_read(address, size, 1);
+                    crate::activity::LIRU6_BACK_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::activity::LIRU6_BACK_SYNC_NS.fetch_add(liru6.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    crate::activity::LIRU6_BACK_OVERLAY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 3
             }
@@ -346,7 +351,10 @@ impl Back {
                     _ => false,
                 };
                 if host {
+                    let liru6 = std::time::Instant::now();
                     self.synchronize_read(address, size, FETCH_SYNC_WINDOW);
+                    crate::activity::LIRU6_FETCH_HOST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::activity::LIRU6_FETCH_NS.fetch_add(liru6.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 self.fetch_syncs.complete();
                 3

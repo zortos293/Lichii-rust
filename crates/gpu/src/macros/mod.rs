@@ -385,6 +385,9 @@ impl MacroEngine {
         host: &mut H,
     ) -> Result<(), MacroError> {
         self.stats.calls += 1;
+        crate::activity::LIRU6_MACRO.store(start, std::sync::atomic::Ordering::Relaxed);
+        crate::activity::LIRU6_TRACE.store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::activity::liru6_params(parameters);
         if self.memo_enabled {
             self.memo.synchronize(self.code_generation);
             if let Some(replay) = self.memo.find(start, parameters, &data_ram.words[..]) {

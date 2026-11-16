@@ -801,6 +801,25 @@ impl Dispatch<'_> {
             (HostClass::Ampere, _) => shared.shared_macros.as_mut(),
         };
         if let Some(engine) = engine {
+            if engine.reads_memory(pending.method) {
+                struct DiagHost<'a> { regs: &'a [u32], unknown: Vec<u32> }
+                impl crate::macros::MacroHost for DiagHost<'_> {
+                    fn read_register(&mut self, method: u32) -> u32 { self.regs.get(method as usize).copied().unwrap_or(0) }
+                    fn write_method(&mut self, _method: u32, _argument: u32) {}
+                    fn dma_read(&mut self, _gpu_va: u64, _out: &mut [u32]) {}
+                    fn write_unknown(&mut self, method: u32) -> bool { self.unknown.push(method); true }
+                }
+                let mut scratch = data_ram.clone();
+                let mut taint = crate::macros::ReadTaint::new();
+                let regs: &[u32] = match target { MacroTarget::Graphics => graphics.regs.words(), MacroTarget::Compute => compute };
+                let mut diag = DiagHost { regs, unknown: Vec::new() };
+                let outcome = match engine.shadow_execute(pending.method, &pending.parameters, &mut scratch, &mut diag, &mut taint) {
+                    Ok(()) => { diag.unknown.sort_unstable(); diag.unknown.dedup(); format!("ok unknown={:x?} ram_unknown={}", diag.unknown, taint.any_ram_unknown()) }
+                    Err(e) => format!("err {:?} pc={:#x}", e.kind, e.pc),
+                };
+                let index = (pending.method.wrapping_sub(crate::macros::MACRO_METHOD_BASE) >> 1) as usize;
+                crate::activity::liru6_shadow(index as u32, outcome);
+            }
             let mut host = FrontMacroHost {
                 target,
                 graphics,
@@ -875,6 +894,10 @@ impl MacroHost for FrontMacroHost<'_> {
 
     #[inline]
     fn write_method(&mut self, method: u32, argument: u32) {
+        if crate::activity::LIRU6_TRACE.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            crate::activity::LIRU6_TRACE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(method = format!("{method:#x}"), argument = format!("{argument:#x}"), "LIRU6DIAG macro emit");
+        }
         if is_load_mme(method) {
             tracing::debug!(method, "macro writes LOAD_MME; ignored");
             return;
@@ -891,8 +914,10 @@ impl MacroHost for FrontMacroHost<'_> {
     /// Reads memory as of the macro's position in the stream: the work sent before it completes
     /// and what the GPU wrote to the words reaches guest memory first.
     fn dma_read(&mut self, gpu_va: u64, out: &mut [u32]) {
+        let liru6 = Instant::now();
         self.stream
             .synchronize_read(gpu_va, size_of_val(out) as u64);
+        crate::activity::liru6_read(out.len() as u64, liru6.elapsed().as_nanos() as u64);
         if let Err(fault) = self
             .memory
             .read_block(gpu_va, bytemuck::cast_slice_mut(out))
@@ -901,6 +926,7 @@ impl MacroHost for FrontMacroHost<'_> {
             out.fill(0);
         }
         self.stream.overlay_read(out);
+        crate::activity::liru6_trace_read(gpu_va, out);
     }
 }
 
