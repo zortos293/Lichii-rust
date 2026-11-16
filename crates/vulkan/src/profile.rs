@@ -7,18 +7,34 @@ use lichii_shader::profile::HostTranslateInfo;
 
 use crate::device::DeviceFeatures;
 
+/// The Vulkan stage of each [`lichii_shader::ShaderStage`] index.
+const STAGES: [vk::ShaderStageFlags; 9] = [
+    vk::ShaderStageFlags::VERTEX,
+    vk::ShaderStageFlags::VERTEX,
+    vk::ShaderStageFlags::TESSELLATION_CONTROL,
+    vk::ShaderStageFlags::TESSELLATION_EVALUATION,
+    vk::ShaderStageFlags::GEOMETRY,
+    vk::ShaderStageFlags::FRAGMENT,
+    vk::ShaderStageFlags::COMPUTE,
+    vk::ShaderStageFlags::TASK_EXT,
+    vk::ShaderStageFlags::MESH_EXT,
+];
+
 /// What [`shader_profile`] reads from the device besides its features.
 pub(crate) struct ShaderQueries<'a> {
     pub api_version: u32,
     pub limits: &'a vk::PhysicalDeviceLimits,
     pub vulkan11: &'a vk::PhysicalDeviceVulkan11Properties<'a>,
     pub vulkan12: &'a vk::PhysicalDeviceVulkan12Properties<'a>,
+    pub vulkan13: &'a vk::PhysicalDeviceVulkan13Properties<'a>,
 }
 
 /// The translator profile and host info of a device with `features`, every one of which the
 /// device enabled. Constant buffers are word arrays, which needs `uniformBufferStandardLayout`
 /// (required at device creation); storage buffers bind at their address rounded down to
 /// `minStorageBufferOffsetAlignment`, which the profile passes on so shaders add the rest.
+/// Stages that can require a subgroup size of 32 run the guest warp natively, except task and
+/// mesh, which the mesh emulation may run as compute.
 pub(crate) fn shader_profile(
     features: &DeviceFeatures,
     queries: &ShaderQueries<'_>,
@@ -29,22 +45,20 @@ pub(crate) fn shader_profile(
     let on = |b: vk::Bool32| b != vk::FALSE;
     let subgroup_ops = v11.subgroup_supported_operations;
     let subgroup_stages = v11.subgroup_supported_stages;
-    let stage_bits = [
-        vk::ShaderStageFlags::VERTEX,
-        vk::ShaderStageFlags::VERTEX,
-        vk::ShaderStageFlags::TESSELLATION_CONTROL,
-        vk::ShaderStageFlags::TESSELLATION_EVALUATION,
-        vk::ShaderStageFlags::GEOMETRY,
-        vk::ShaderStageFlags::FRAGMENT,
-        vk::ShaderStageFlags::COMPUTE,
-        vk::ShaderStageFlags::TASK_EXT,
-        vk::ShaderStageFlags::MESH_EXT,
-    ]
-    .iter()
-    .enumerate()
-    .fold(0, |bits, (i, &stage)| {
-        bits | u32::from(subgroup_stages.contains(stage)) << i
-    });
+    let v13 = queries.vulkan13;
+    let guest_warp = if features.subgroup_size_control
+        && (v13.min_subgroup_size..=v13.max_subgroup_size).contains(&32)
+    {
+        v13.required_subgroup_size_stages
+            & !(vk::ShaderStageFlags::TASK_EXT | vk::ShaderStageFlags::MESH_EXT)
+    } else {
+        vk::ShaderStageFlags::empty()
+    };
+    let stage_bits = |stages: vk::ShaderStageFlags| {
+        STAGES.iter().enumerate().fold(0, |bits, (i, &stage)| {
+            bits | u32::from(stages.contains(stage)) << i
+        })
+    };
     let profile = Profile {
         supported_spirv: if queries.api_version >= vk::API_VERSION_1_3 {
             0x0001_0600
@@ -77,9 +91,10 @@ pub(crate) fn shader_profile(
         support_vote: subgroup_ops.contains(vk::SubgroupFeatureFlags::VOTE),
         support_shuffle_relative: subgroup_ops.contains(vk::SubgroupFeatureFlags::SHUFFLE_RELATIVE),
         support_quad_shuffles: subgroup_ops.contains(vk::SubgroupFeatureFlags::QUAD),
-        supported_subgroup_stages: stage_bits,
+        supported_subgroup_stages: stage_bits(subgroup_stages),
         warp_size_potentially_larger_than_guest: v11.subgroup_size > 32,
         max_subgroup_size: v11.subgroup_size,
+        guest_warp_stages: stage_bits(guest_warp),
         support_viewport_index_layer_non_geometry: features.shader_output_layer
             && features.shader_output_viewport_index,
         support_multi_viewport: features.multi_viewport,
@@ -142,11 +157,13 @@ mod tests {
         let limits = vk::PhysicalDeviceLimits::default();
         let vulkan11 = vk::PhysicalDeviceVulkan11Properties::default();
         let vulkan12 = vk::PhysicalDeviceVulkan12Properties::default().driver_id(driver_id);
+        let vulkan13 = vk::PhysicalDeviceVulkan13Properties::default();
         let queries = ShaderQueries {
             api_version: vk::API_VERSION_1_3,
             limits: &limits,
             vulkan11: &vulkan11,
             vulkan12: &vulkan12,
+            vulkan13: &vulkan13,
         };
         shader_profile(&DeviceFeatures::default(), &queries).1
     }
@@ -169,5 +186,40 @@ mod tests {
         assert!(
             !host_with_driver(vk::DriverId::INTEL_PROPRIETARY_WINDOWS).support_conditional_barrier
         );
+    }
+    fn guest_warp_stages(
+        subgroup_size_control: bool,
+        min: u32,
+        required: vk::ShaderStageFlags,
+    ) -> u32 {
+        let limits = vk::PhysicalDeviceLimits::default();
+        let vulkan11 = vk::PhysicalDeviceVulkan11Properties::default().subgroup_size(64);
+        let vulkan12 = vk::PhysicalDeviceVulkan12Properties::default();
+        let vulkan13 = vk::PhysicalDeviceVulkan13Properties::default()
+            .min_subgroup_size(min)
+            .max_subgroup_size(64)
+            .required_subgroup_size_stages(required);
+        let queries = ShaderQueries {
+            api_version: vk::API_VERSION_1_3,
+            limits: &limits,
+            vulkan11: &vulkan11,
+            vulkan12: &vulkan12,
+            vulkan13: &vulkan13,
+        };
+        let features = DeviceFeatures {
+            subgroup_size_control,
+            ..DeviceFeatures::default()
+        };
+        shader_profile(&features, &queries).0.guest_warp_stages
+    }
+
+    #[test]
+    fn stages_that_can_require_32_lane_subgroups_run_the_guest_warp() {
+        use vk::ShaderStageFlags as S;
+        let radv = S::FRAGMENT | S::COMPUTE | S::MESH_EXT | S::TASK_EXT;
+        assert_eq!(guest_warp_stages(true, 32, radv), 1 << 5 | 1 << 6);
+        assert_eq!(guest_warp_stages(true, 32, S::VERTEX), 0b11);
+        assert_eq!(guest_warp_stages(false, 32, radv), 0);
+        assert_eq!(guest_warp_stages(true, 64, radv), 0);
     }
 }
