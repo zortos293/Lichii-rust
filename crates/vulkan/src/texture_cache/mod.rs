@@ -71,6 +71,11 @@ const PAGE_BITS: u32 = 20;
 /// texture would take ~23 GB (NX2_NOTES row 87): the subresources the GPU writes get memory,
 /// and nothing is uploaded or written back.
 const MAX_TEXELS: u64 = 1 << 28;
+/// Host bytes over which a sampled mip chain keeps only its smaller levels on the host
+/// (Mario Kart World's 8192x8192x68 terrain arrays: 23 GB each as decoded ASTC).
+const TRIM_ABOVE: u64 = 1 << 30;
+/// Host bytes the levels a trimmed chain keeps fit in.
+const TRIM_TO: u64 = 512 << 20;
 /// Device memory one sparse image may bind by default; writes to subresources past it are
 /// dropped.
 const SPARSE_IMAGE_CAP: u64 = 2 << 30;
@@ -312,6 +317,11 @@ struct CachedImage {
     aliases_newest: u64,
     /// Device ranges of removed overlaps modified after this image: write-backs skip them.
     keep_out: Vec<(DAddr, DAddr)>,
+    /// Guest levels the host leaves out: host level 0 holds guest level `trim`.
+    trim: u32,
+    /// The GPU address of an image over sparse pages, which a later mapping may back: a lookup
+    /// there takes this image and its new pages.
+    sparse_va: Option<GpuVAddr>,
 }
 
 /// A live image that shares a rectangle of texels with another, at level 0 of layer 0:
@@ -361,6 +371,18 @@ impl CachedImage {
     /// The guest CPU wrote `[daddr, daddr + size)`: the subresources holding those bytes upload
     /// again. Write tracking stays on the other pages, so later writes there are still seen.
     fn mark_cpu_written(&mut self, daddr: DAddr, size: u64) {
+        let end = daddr.saturating_add(size);
+        for i in 0..self.segments.len() {
+            let s = self.segments[i];
+            let (lo, hi) = (daddr.max(s.daddr), end.min(s.daddr + s.size));
+            if lo < hi {
+                self.mark_bytes_dirty(s.offset + (lo - s.daddr), s.offset + (hi - s.daddr));
+            }
+        }
+    }
+
+    /// The subresources holding image bytes `[lo, hi)` upload again.
+    fn mark_bytes_dirty(&mut self, lo: u64, hi: u64) {
         if !self.cpu_dirty {
             self.cpu_dirty = true;
             self.dirty_whole = !self.keep_out.is_empty();
@@ -371,43 +393,37 @@ impl CachedImage {
         }
         let info = self.info;
         let levels = self.image.desc().mip_levels;
+        let trim = self.trim;
         let count = info.layers as usize * levels as usize;
         self.dirty_subresources.resize(count.div_ceil(64), 0);
-        let end = daddr.saturating_add(size);
-        for s in &self.segments {
-            let (lo, hi) = (daddr.max(s.daddr), end.min(s.daddr + s.size));
-            if lo >= hi {
-                continue;
+        let layers = match lo.checked_div(info.layer_stride) {
+            Some(first) if info.layers > 1 => {
+                let last = ((hi - 1) / info.layer_stride).min(u64::from(info.layers) - 1);
+                first as u32..last as u32 + 1
             }
-            let (lo, hi) = (s.offset + (lo - s.daddr), s.offset + (hi - s.daddr));
-            let layers = match lo.checked_div(info.layer_stride) {
-                Some(first) if info.layers > 1 => {
-                    let last = ((hi - 1) / info.layer_stride).min(u64::from(info.layers) - 1);
-                    first as u32..last as u32 + 1
-                }
-                _ => 0..info.layers,
-            };
-            for layer in layers {
-                for level in 0..levels {
-                    let start = info.subresource_offset(level, layer);
-                    if start < hi && lo < start + info.level_size(level) {
-                        let bit = (layer * levels + level) as usize;
-                        self.dirty_subresources[bit / 64] |= 1 << (bit % 64);
-                    }
+            _ => 0..info.layers,
+        };
+        for layer in layers {
+            for level in trim..trim + levels {
+                let start = info.subresource_offset(level, layer);
+                if start < hi && lo < start + info.level_size(level) {
+                    let bit = (layer * levels + level - trim) as usize;
+                    self.dirty_subresources[bit / 64] |= 1 << (bit % 64);
                 }
             }
         }
     }
 
-    /// Whether the next upload refreshes `level` of `layer`.
+    /// Whether the next upload refreshes guest `level` of `layer`, one the host keeps.
     fn upload_due(&self, layer: u32, level: u32) -> bool {
-        let bit = (layer * self.image.desc().mip_levels + level) as usize;
+        let bit = (layer * self.image.desc().mip_levels + level - self.trim) as usize;
         self.dirty_whole || self.dirty_subresources[bit / 64] & (1 << (bit % 64)) != 0
     }
 
     /// Whether the guest format can be written back from the host image.
     fn downloadable(&self) -> bool {
         !self.image.is_sparse()
+            && self.trim == 0
             && !matches!(
                 self.host.conversion,
                 Conversion::Decode | Conversion::DecodeToBc(_)
@@ -523,7 +539,18 @@ struct LookupKey {
     gmmu: usize,
     gpu_va: GpuVAddr,
     info: ImageInfo,
-    slices: bool,
+    usage: Usage,
+}
+
+/// What a lookup is for, which decides what an image may stand in for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Usage {
+    /// Sampled: an image too big for the host keeps only its smaller levels there.
+    Sample,
+    /// Rendered into: a single slice resolves into the volume it is a slice of.
+    Target,
+    /// Copied to or from by level and array layer.
+    Transfer,
 }
 
 /// What a lookup found, valid while the GMMU keeps its `generation`. A miss (`found` is
@@ -588,6 +615,9 @@ pub struct TextureCache {
     sparse_capped: bool,
     /// Device memory one sparse image may bind.
     sparse_cap: u64,
+    /// [`TRIM_ABOVE`] and [`TRIM_TO`].
+    trim_above: u64,
+    trim_to: u64,
     keep: Vec<(DAddr, DAddr)>,
     segments: Vec<Segment>,
     scratch: Scratch,
@@ -785,6 +815,38 @@ fn read_guest(
     }
 }
 
+/// An ASTC void-extent block of transparent black: unmapped sparse pages of an ASTC image
+/// sample as zero, which all-zero bytes would decode as the error colour instead.
+const ASTC_TRANSPARENT_BLACK: [u8; 16] = [
+    0xfc, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// Fills the bytes of `out`, image bytes from `offset` on, that no segment maps with
+/// `block`. Gaps start and end on block boundaries, as pages do.
+fn fill_unmapped(segments: &[Segment], offset: u64, out: &mut [u8], block: &[u8; 16]) {
+    let end = offset + out.len() as u64;
+    let mut at = offset;
+    let mut fill = |from: u64, to: u64| {
+        let span = &mut out[(from - offset) as usize..(to - offset) as usize];
+        for chunk in span.chunks_mut(16) {
+            chunk.copy_from_slice(&block[..chunk.len()]);
+        }
+    };
+    for s in segments {
+        let (start, stop) = (s.offset.max(offset), (s.offset + s.size).min(end));
+        if start >= stop {
+            continue;
+        }
+        if at < start {
+            fill(at, start);
+        }
+        at = at.max(stop);
+    }
+    if at < end {
+        fill(at, end);
+    }
+}
+
 /// Writes guest bytes of an image, except those at device addresses in `keep`; bytes over
 /// unmapped gaps are dropped, and blocks of lazy device ranges get memory.
 fn write_guest(
@@ -889,6 +951,8 @@ impl TextureCache {
             overlap_ranges: Vec::new(),
             sparse_capped: false,
             sparse_cap: SPARSE_IMAGE_CAP,
+            trim_above: TRIM_ABOVE,
+            trim_to: TRIM_TO,
             keep: Vec::new(),
             segments: Vec::new(),
             scratch: Scratch::default(),
@@ -1054,7 +1118,18 @@ impl TextureCache {
         gpu_va: GpuVAddr,
         info: &ImageInfo,
     ) -> Result<Option<Found>> {
-        let found = self.lookup_or_create(tx, gmmu, gpu_va, info, false)?;
+        self.find_for(tx, gmmu, gpu_va, info, Usage::Transfer)
+    }
+
+    fn find_for(
+        &mut self,
+        tx: &mut Transfer<'_>,
+        gmmu: &Gmmu,
+        gpu_va: GpuVAddr,
+        info: &ImageInfo,
+        usage: Usage,
+    ) -> Result<Option<Found>> {
+        let found = self.lookup_or_create(tx, gmmu, gpu_va, info, usage)?;
         if let Some(found) = found {
             self.refresh(tx, found.id)?;
         }
@@ -1071,7 +1146,7 @@ impl TextureCache {
         let Some(info) = ImageInfo::from_texture(desc, self.gob_layout) else {
             return Ok(None);
         };
-        let Some(found) = self.find(tx, gmmu, desc.address, &info)? else {
+        let Some(found) = self.find_for(tx, gmmu, desc.address, &info, Usage::Sample)? else {
             return Ok(None);
         };
         let scale = self.image(found.id).scale;
@@ -1105,11 +1180,11 @@ impl TextureCache {
         info: &ImageInfo,
         discard: bool,
     ) -> Result<Option<Found>> {
-        self.prepare_target(tx, gmmu, gpu_va, info, discard, true)
+        self.prepare_target(tx, gmmu, gpu_va, info, discard, Usage::Target)
     }
 
-    /// [`TextureCache::render_target`], resolving a single slice into its volume only with
-    /// `slices`: transfers address a found layer as an array layer, never a volume's depth.
+    /// [`TextureCache::render_target`] for `usage`: transfers address a found layer as an
+    /// array layer, never a volume's depth, so they resolve no slices.
     fn prepare_target(
         &mut self,
         tx: &mut Transfer<'_>,
@@ -1117,9 +1192,9 @@ impl TextureCache {
         gpu_va: GpuVAddr,
         info: &ImageInfo,
         discard: bool,
-        slices: bool,
+        usage: Usage,
     ) -> Result<Option<Found>> {
-        let Some(found) = self.lookup_or_create(tx, gmmu, gpu_va, info, slices)? else {
+        let Some(found) = self.lookup_or_create(tx, gmmu, gpu_va, info, usage)? else {
             return Ok(None);
         };
         let whole = found.level == 0 && found.layer == 0 && {
@@ -1181,13 +1256,23 @@ impl TextureCache {
             a if a.contains(vk::ImageAspectFlags::DEPTH) => vk::ImageAspectFlags::DEPTH,
             a => a,
         };
+        let (base_level, levels) = if image.trim == 0 {
+            (view.base_level, view.levels)
+        } else {
+            let kept = image.image.desc().mip_levels;
+            let base = view.base_level.saturating_sub(image.trim).min(kept - 1);
+            let end = (view.base_level + view.levels)
+                .saturating_sub(image.trim)
+                .clamp(base + 1, kept);
+            (base, end - base)
+        };
         let key = ViewKey {
             format: host.format.as_raw(),
             view_type: view.view_type.as_raw(),
             components: [mapping.r, mapping.g, mapping.b, mapping.a].map(|c| c.as_raw()),
             aspect: aspect.as_raw(),
-            base_level: view.base_level,
-            levels: view.levels,
+            base_level,
+            levels,
             base_layer: view.base_layer,
             layers: view.layers,
         };
@@ -1806,6 +1891,31 @@ impl TextureCache {
             && self.can_blit(image.host.format)
     }
 
+    /// The first guest level the host keeps of an image sampled as `info`: 0, or for a mip
+    /// chain over [`TRIM_ABOVE`] host bytes, the first level whose chain fits in [`TRIM_TO`].
+    /// Sampling still addresses the levels by normalized coordinates and derivatives; an
+    /// explicit LOD lands `trim` levels coarser.
+    fn host_level_offset(&mut self, info: &ImageInfo) -> u32 {
+        if info.kind != ImageKind::D2 || info.levels == 1 || !info.format.is_color() {
+            return 0;
+        }
+        let host = self.host(info.format);
+        let bytes = |level| {
+            convert::host_layout(info.format, &host, info.level_extent(level)).total() as u64
+                * u64::from(info.layers)
+        };
+        let mut chain: u64 = (0..info.levels).map(bytes).sum();
+        if chain <= self.trim_above {
+            return 0;
+        }
+        let mut trim = 0;
+        while trim + 1 < info.levels && chain > self.trim_to {
+            chain -= bytes(trim);
+            trim += 1;
+        }
+        trim
+    }
+
     /// Whether the device can create `info` as a sparse image (2D, single-sampled).
     fn can_be_sparse(&mut self, info: &ImageInfo) -> bool {
         let host = self.host(info.format);
@@ -1943,22 +2053,23 @@ impl TextureCache {
         }
     }
 
-    /// The image holding `info` at `gpu_va`, created when none does. With `slices`, a single
-    /// slice resolves into the volume it is a slice of, at that slice: render targets draw
-    /// into a slice through a 2D view, which nothing else can use.
+    /// The image holding `info` at `gpu_va` for `usage`, created when none does. For a
+    /// target, a single slice resolves into the volume it is a slice of, at that slice: render
+    /// targets draw into a slice through a 2D view, which nothing else can use. Only samples
+    /// take an image that keeps a subset of its levels on the host.
     fn lookup_or_create(
         &mut self,
         tx: &mut Transfer<'_>,
         gmmu: &Gmmu,
         gpu_va: GpuVAddr,
         info: &ImageInfo,
-        slices: bool,
+        usage: Usage,
     ) -> Result<Option<Found>> {
         let key = LookupKey {
             gmmu: std::ptr::from_ref(gmmu) as usize,
             gpu_va,
             info: *info,
-            slices,
+            usage,
         };
         let generation = gmmu.generation();
         if let Some(&entry) = self.lookup.get(&key)
@@ -1973,7 +2084,7 @@ impl TextureCache {
                 _ => {}
             }
         }
-        let found = self.find_slow(tx, gmmu, gpu_va, info, slices)?;
+        let found = self.find_slow(tx, gmmu, gpu_va, info, usage)?;
         if let Some(found) = found {
             self.touch(found.id);
         }
@@ -2027,31 +2138,44 @@ impl TextureCache {
         gmmu: &Gmmu,
         gpu_va: GpuVAddr,
         info: &ImageInfo,
-        slices: bool,
+        usage: Usage,
     ) -> Result<Option<Found>> {
         let size = info.size_bytes();
         self.segments.clear();
         let mut offset = 0;
+        let mut leading = None;
+        let mut holes = false;
         let segments = &mut self.segments;
         gmmu.for_each_range(gpu_va, size, |range| {
-            if let RangeTarget::Device(daddr) = range.target {
-                segments.push(Segment {
+            leading.get_or_insert(range.target);
+            match range.target {
+                RangeTarget::Device(daddr) => segments.push(Segment {
                     offset,
                     daddr,
                     size: range.size,
-                });
+                }),
+                RangeTarget::Sparse => holes = true,
+                RangeTarget::Unmapped | RangeTarget::SyncpointShim => {}
             }
             offset += range.size;
         });
-        if self.segments.first().is_none_or(|s| s.offset != 0) {
-            tracing::debug!(gpu_va, "image at unmapped GPU memory is not cached");
+        if !matches!(leading, Some(RangeTarget::Device(_) | RangeTarget::Sparse))
+            || self.segments.is_empty()
+        {
+            tracing::debug!(gpu_va, "image without mapped GPU memory is not cached");
             return Ok(None);
         }
-        if info.texels() > MAX_TEXELS && !self.can_be_sparse(info) {
+        let trim = if usage == Usage::Sample {
+            self.host_level_offset(info)
+        } else {
+            0
+        };
+        if trim == 0 && info.texels() > MAX_TEXELS && !self.can_be_sparse(info) {
             tracing::warn!(?info, "image too large to back on the host; not cached");
             return Ok(None);
         }
-        let base = self.segments[0].daddr;
+        let sparse_va = holes.then_some(gpu_va);
+        let base = self.segments.first().map_or(0, |s| s.daddr);
         let contiguous = self.segments.len() == 1 && self.segments[0].size == size;
         let ranges = std::mem::take(&mut self.segments);
         self.collect_overlaps(&ranges);
@@ -2059,12 +2183,15 @@ impl TextureCache {
         for i in 0..self.ids.len() {
             let id = self.ids[i];
             let image = self.get(id).expect("a live image id");
-            let candidate = if image.segments == self.segments && image.info.same_layout(info) {
+            let moved = image.sparse_va == Some(gpu_va) && image.segments != self.segments;
+            let candidate = if image.trim > 0 && usage != Usage::Sample {
+                None
+            } else if (image.segments == self.segments || moved) && image.info.same_layout(info) {
                 Some((0, 0))
             } else if contiguous && image.contiguous() && base >= image.base() {
                 let offset = base - image.base();
                 image.info.find_subresource(info, offset).or_else(|| {
-                    slices
+                    (usage == Usage::Target)
                         .then(|| image.info.find_slice(info, offset))
                         .flatten()
                 })
@@ -2074,6 +2201,9 @@ impl TextureCache {
             if let Some((level, layer)) = candidate
                 && self.view_compatible(id, info.format)
             {
+                if moved {
+                    self.remap(id);
+                }
                 return Ok(Some(Found { id, level, layer }));
             }
         }
@@ -2133,6 +2263,9 @@ impl TextureCache {
                 self.new_overlaps.push(joins.remove(i).0);
             }
         }
+        if trim > 0 {
+            self.new_overlaps.extend(joins.drain(..).map(|(id, ..)| id));
+        }
         self.joins = joins;
         let dropped = std::mem::take(&mut self.dropped);
         for &other in &dropped {
@@ -2140,7 +2273,7 @@ impl TextureCache {
         }
         self.dropped = dropped;
         let segments = self.segments.clone();
-        let id = self.create(info, segments)?;
+        let id = self.create(info, segments, trim, sparse_va)?;
         let new_overlaps = std::mem::take(&mut self.new_overlaps);
         for &other in &new_overlaps {
             self.image(other).overlaps.push(id);
@@ -2263,11 +2396,27 @@ impl TextureCache {
         Ok(())
     }
 
-    fn create(&mut self, info: &ImageInfo, segments: Vec<Segment>) -> Result<ImageId> {
+    fn create(
+        &mut self,
+        info: &ImageInfo,
+        segments: Vec<Segment>,
+        trim: u32,
+        sparse_va: Option<GpuVAddr>,
+    ) -> Result<ImageId> {
         self.creations += 1;
         let host = self.host(info.format);
-        let desc = Self::image_desc(info, &host, ResolutionScale::X1);
-        let image = if info.texels() > MAX_TEXELS {
+        let mut desc = Self::image_desc(info, &host, ResolutionScale::X1);
+        if trim > 0 {
+            desc.extent.width = (desc.extent.width >> trim).max(1);
+            desc.extent.height = (desc.extent.height >> trim).max(1);
+            desc.mip_levels = desc.mip_levels.saturating_sub(trim).max(1);
+            tracing::info!(
+                ?info,
+                trim,
+                "sampled array too large for the host keeps its levels from {trim} on"
+            );
+        }
+        let image = if trim == 0 && info.texels() > MAX_TEXELS {
             Image::new_sparse(&self.device, &desc)?
         } else {
             Image::new(&self.device, &desc, "guest image")?
@@ -2309,6 +2458,8 @@ impl TextureCache {
             overlaps_newest: u64::MAX,
             aliases_newest: u64::MAX,
             keep_out: Vec::new(),
+            trim,
+            sparse_va,
         };
         let index = match self.free.pop() {
             Some(index) => index,
@@ -2335,6 +2486,37 @@ impl TextureCache {
         slot.image = Some(cached);
         self.lru_push(index);
         Ok(id)
+    }
+
+    /// Moves an image over sparse pages onto the device pages its range maps now (`segments`):
+    /// the subresources over pages that changed upload again, and the ones that went back to
+    /// sparse read as zero.
+    fn remap(&mut self, id: ImageId) {
+        let segments = self.segments.clone();
+        let old = std::mem::replace(&mut self.image(id).segments, segments.clone());
+        for s in &old {
+            for page in pages(s.daddr, s.size) {
+                if let Some(bucket) = self.pages.get_mut(&page) {
+                    bucket.retain(|&other| other != id);
+                    if bucket.is_empty() {
+                        self.pages.remove(&page);
+                    }
+                }
+            }
+        }
+        for s in &segments {
+            for page in pages(s.daddr, s.size) {
+                self.pages.entry(page).or_default().push(id);
+            }
+        }
+        let image = self.image(id);
+        image.tracked.clear();
+        for s in old.iter().filter(|s| !segments.contains(s)) {
+            image.mark_bytes_dirty(s.offset, s.offset + s.size);
+        }
+        for s in segments.iter().filter(|s| !old.contains(s)) {
+            image.mark_bytes_dirty(s.offset, s.offset + s.size);
+        }
     }
 
     fn remove(&mut self, scheduler: &mut Scheduler, id: ImageId) {
@@ -2718,11 +2900,14 @@ impl TextureCache {
         let info = image.info;
         let host = image.host;
         let format = info.format;
-        let levels = image.image.desc().mip_levels;
+        let levels = image.trim..image.trim + image.image.desc().mip_levels;
         let align = alignment(&host, format);
         let mut total = 0u64;
         for layer in 0..info.layers {
-            for level in (0..levels).filter(|&level| image.upload_due(layer, level)) {
+            for level in levels
+                .clone()
+                .filter(|&level| image.upload_due(layer, level))
+            {
                 let layout = convert::host_layout(format, &host, info.level_extent(level));
                 total = total.next_multiple_of(align) + layout.total() as u64;
                 total = total.next_multiple_of(align);
@@ -2741,7 +2926,10 @@ impl TextureCache {
         let direct =
             host.conversion == Conversion::None && convert::depth_planes(host.format).is_none();
         for layer in 0..info.layers {
-            for level in (0..levels).filter(|&level| image.upload_due(layer, level)) {
+            for level in levels
+                .clone()
+                .filter(|&level| image.upload_due(layer, level))
+            {
                 let extent = info.level_extent(level);
                 let layout = convert::host_layout(format, &host, extent);
                 offset = offset.next_multiple_of(align as usize);
@@ -2759,6 +2947,14 @@ impl TextureCache {
                             guest_offset,
                             &mut scratch.tiled,
                         );
+                        if image.sparse_va.is_some() && format.is_astc() {
+                            fill_unmapped(
+                                &image.segments,
+                                guest_offset,
+                                &mut scratch.tiled,
+                                &ASTC_TRANSPARENT_BLACK,
+                            );
+                        }
                         if direct {
                             unswizzle(&tiling, &scratch.tiled, out);
                         } else {
@@ -2807,7 +3003,7 @@ impl TextureCache {
                     buffer_offset: base_offset + buffer_offset as u64,
                     image_subresource: vk::ImageSubresourceLayers {
                         aspect_mask,
-                        mip_level: level,
+                        mip_level: level - image.trim,
                         base_array_layer: layer,
                         layer_count: 1,
                     },

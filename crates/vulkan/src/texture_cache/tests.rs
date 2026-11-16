@@ -3647,3 +3647,166 @@ fn slice_targets_join_with_their_aliases_newer_texels() {
         f.assert_no_validation_errors();
     }
 }
+
+/// The TIC of a `w`x`h` array of `layers` layers and `levels` levels in `raw` format with
+/// `float` components (BC6H) or sRGB (ASTC).
+fn array_tic(
+    raw: u32,
+    srgb: bool,
+    float: bool,
+    gpu_va: GpuVAddr,
+    size: (u32, u32, u32, u32),
+) -> TicEntry {
+    let (w, h, layers, levels) = size;
+    let mut header = tic(raw, gpu_va, w, h, layers, levels, 3);
+    if float {
+        header.0[0] =
+            raw | 7 << 7 | 7 << 10 | 7 << 13 | 7 << 16 | 2 << 19 | 3 << 22 | 4 << 25 | 5 << 28;
+    }
+    if srgb {
+        header.0[4] |= 1 << 22;
+    }
+    header
+}
+
+#[test]
+fn sampled_arrays_too_large_for_the_host_keep_their_smaller_levels_over_sparse_pages() {
+    let gob = GobLayout::Switch2;
+    for (raw, srgb, float, format, trim) in [
+        (0x44, true, false, PixelFormat::Astc8x8Srgb, 2),
+        (0x11, false, true, PixelFormat::Bc6hUfloat, 1),
+    ] {
+        let size = (512, 512, 4, 6);
+        let (w, h, layers, levels) = size;
+        let s = surface(format, w, h, levels, layers, 3, gob);
+        let data = level_data(&s, 5);
+        let Some(mut reference) = fixture(gob, AstcRecompression::Uncompressed) else {
+            return;
+        };
+        write_surface(&reference.memory, &s, &data);
+        let (full, _) = reference.texture(&array_tic(raw, srgb, float, GPU_VA, size));
+        let want = reference.read_image(full);
+        drop(reference);
+        let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+            return;
+        };
+        write_surface(&f.memory, &s, &data);
+        f.cache.trim_above = 1 << 20;
+        f.cache.trim_to = 512 << 10;
+        let va = GPU_VA + DRAM;
+        let page = 0x1000;
+        let bytes = s.size_bytes().next_multiple_of(page);
+        f.gmmu.map_sparse(va, bytes, false).unwrap();
+        let map_layer = |f: &mut Fixture, layer: u32, from: u32| {
+            let lo = s.subresource_offset(from, layer) / page * page;
+            let hi = (s.subresource_offset(levels - 1, layer) + s.level_size(levels - 1))
+                .next_multiple_of(page);
+            f.gmmu.map(va + lo, DADDR + lo, hi - lo, 0, false).unwrap();
+        };
+        for layer in [0, 1, 3] {
+            map_layer(&mut f, layer, trim);
+        }
+        let header = array_tic(raw, srgb, float, va, size);
+        let (id, view) = f.texture(&header);
+        let extent = f.cache.state(id).unwrap().extent;
+        let kept = levels - trim;
+        for (base, want_base, want_levels) in [(0, 0, kept), (trim + 1, 1, kept - 1)] {
+            let view = ViewInfo {
+                base_level: base,
+                levels: levels - base,
+                ..view
+            };
+            assert!(f.cache.view(id, &view).unwrap().is_some(), "{format:?}");
+            let key = f.cache.get(id).unwrap().views.last().unwrap().0;
+            assert_eq!(
+                (key.base_level, key.levels),
+                (want_base, want_levels),
+                "{format:?}: guest levels {base}.. view host levels from {want_base}"
+            );
+        }
+        assert_eq!(
+            extent.width,
+            w >> trim,
+            "{format:?}: keeps levels from {trim}"
+        );
+        assert_eq!(extent.height, h >> trim);
+        let check = |f: &mut Fixture, unmapped: &[u32]| {
+            let got = f.read_image(id);
+            assert_eq!(got.len(), (layers * kept) as usize, "{format:?}");
+            for layer in 0..layers {
+                for level in trim..levels {
+                    let texels = &got[(layer * kept + level - trim) as usize];
+                    let reference = &want[(layer * levels + level) as usize];
+                    if unmapped.contains(&layer) {
+                        assert!(
+                            texels.iter().all(|&b| b == 0),
+                            "{format:?}: unmapped layer {layer} level {level} reads zero"
+                        );
+                    } else {
+                        assert!(
+                            texels == reference,
+                            "{format:?}: layer {layer} level {level} holds guest level {level}"
+                        );
+                    }
+                }
+            }
+        };
+        check(&mut f, &[2]);
+        map_layer(&mut f, 2, trim);
+        let (again, _) = f.texture(&header);
+        assert_eq!(again, id, "{format:?}: newly mapped pages join the image");
+        check(&mut f, &[]);
+        f.assert_no_validation_errors();
+    }
+}
+
+#[test]
+fn sampled_arrays_whose_leading_pages_are_sparse_read_zero_there() {
+    let gob = GobLayout::Switch2;
+    for (raw, srgb, float, format) in [
+        (0x44, true, false, PixelFormat::Astc8x8Srgb),
+        (0x11, false, true, PixelFormat::Bc6hUfloat),
+    ] {
+        let size = (256, 256, 2, 3);
+        let (w, h, layers, levels) = size;
+        let s = surface(format, w, h, levels, layers, 3, gob);
+        let data = level_data(&s, 9);
+        let Some(mut reference) = fixture(gob, AstcRecompression::Uncompressed) else {
+            return;
+        };
+        write_surface(&reference.memory, &s, &data);
+        let (full, _) = reference.texture(&array_tic(raw, srgb, float, GPU_VA, size));
+        let want = reference.read_image(full);
+        drop(reference);
+        let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+            return;
+        };
+        write_surface(&f.memory, &s, &data);
+        let va = GPU_VA + DRAM;
+        let page = 0x1000;
+        let bytes = s.size_bytes().next_multiple_of(page);
+        let hole = s.subresource_offset(0, 1) / page * page;
+        assert!(
+            hole >= s.level_size(0),
+            "{format:?}: layer 0 level 0 is unmapped"
+        );
+        f.gmmu.map_sparse(va, bytes, false).unwrap();
+        f.gmmu
+            .map(va + hole, DADDR + hole, bytes - hole, 0, false)
+            .unwrap();
+        let (id, _) = f.texture(&array_tic(raw, srgb, float, va, size));
+        let got = f.read_image(id);
+        assert!(
+            got[0].iter().all(|&b| b == 0),
+            "{format:?}: the unmapped level reads zero"
+        );
+        for level in 0..levels {
+            let i = (levels + level) as usize;
+            assert!(
+                got[i] == want[i],
+                "{format:?}: mapped layer 1 level {level}"
+            );
+        }
+        f.assert_no_validation_errors();
+    }
+}
