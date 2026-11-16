@@ -22,6 +22,23 @@ use crate::host_compute::HostCompute;
 use crate::memory::{Buffer, aspect_of};
 use crate::shaders;
 
+static SYNC_DIAG: std::sync::Mutex<Option<(std::time::Instant, std::collections::HashMap<String, u64>)>> = std::sync::Mutex::new(None);
+
+fn sync_diag_finish(key: String) {
+    let mut g = SYNC_DIAG.lock().unwrap();
+    let (since, map) = g.get_or_insert_with(|| (std::time::Instant::now(), std::collections::HashMap::new()));
+    *map.entry(key).or_default() += 1;
+    if since.elapsed().as_secs() >= 5 {
+        let mut all: Vec<_> = map.drain().collect();
+        all.sort_by(|a, b| b.1.cmp(&a.1));
+        tracing::warn!("syncdiag batch keys={} syncs={}", all.len(), all.iter().map(|a| a.1).sum::<u64>());
+        for (k, n) in all.iter().take(12) {
+            tracing::warn!("syncdiag {n} {k}");
+        }
+        *since = std::time::Instant::now();
+    }
+}
+
 /// The workgroup size of `guest_bytes.comp`.
 const GROUP: [u32; 2] = [32, 8];
 
@@ -566,6 +583,12 @@ impl TextureCache {
             self.paint(tx, cmd, o, id, window, Direction::ToGuest)?;
         }
         self.paint(tx, cmd, id, id, window, Direction::FromGuest)?;
+        {
+            let desc = |i: &ImageInfo| format!("{}x{}x{} l{} {:?} {:?}", i.width, i.height, i.layers, i.levels, i.format, i.layout);
+            let info = &self.get(id).expect("a live image id").info;
+            let newer_desc: Vec<String> = newer.iter().map(|&o| desc(&self.get(o).expect("a live image id").info)).collect();
+            sync_diag_finish(format!("{} window={}KB newer=[{}]", desc(info), (window.1 - window.0) >> 10, newer_desc.join(" ; ")));
+        }
         let tick = self.tick;
         let image = self.image(id);
         image.current = tick;
