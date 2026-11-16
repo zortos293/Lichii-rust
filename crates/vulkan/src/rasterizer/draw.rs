@@ -974,9 +974,11 @@ impl VulkanRasterizer {
                     sampler_limit: regs.tex_sampler.limit,
                 };
                 if !self.bind_resources(&module, &sources)? {
+                    crate::pipeline::environment::LIRU14_DRAW.set(false);
                     return Ok(());
                 }
             }
+            crate::pipeline::environment::LIRU14_DRAW.set(false);
             if mesh {
                 self.draw.vertex_buffers.clear();
                 self.draw.vertex_offsets.clear();
@@ -2119,6 +2121,16 @@ impl VulkanRasterizer {
                 integer: desc.is_integer,
             });
         let memory = src.gmmu.generation();
+        if crate::pipeline::environment::LIRU14_DRAW.get() {
+            static LOGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 600 {
+                let h = src.pool.header(src.gmmu, raw);
+                eprintln!(
+                    "LIRU14 bind off={} raw={raw:#x} {:?} {}x{} lv={} va={:#x} {:?} {:?}",
+                    desc.handle.cbuf_offset, h.format, h.width, h.height, h.levels, h.address, h.texture_type, h.swizzle
+                );
+            }
+        }
         let memo = &mut self.draw.bound_textures;
         if memo.cache != self.texture_cache.generation()
             || memo.gmmu.as_ptr() != Arc::as_ptr(src.gmmu)
