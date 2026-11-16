@@ -70,6 +70,46 @@ pub trait MacroHost {
     /// Reads `out.len()` words of guest GPU memory at `gpu_va` (`MME_DMA_READ*`). This is a
     /// front/back synchronisation point for a split GPU thread.
     fn dma_read(&mut self, gpu_va: u64, out: &mut [u32]);
+    /// A shadow run ([`MacroEngine::shadow_execute`]) writes `method` with a value that comes from
+    /// its DMA reads, so the host does not know it. Returns whether the run may go on.
+    fn write_unknown(&mut self, _method: u32) -> bool {
+        false
+    }
+}
+
+/// Which values of a shadow run ([`MacroEngine::shadow_execute`]) come from the words its DMA
+/// reads return: MME64 registers, and data RAM words (set the ones the caller does not know
+/// before the run). After the run, the data RAM words still marked hold unknown values.
+#[derive(Clone)]
+pub struct ReadTaint {
+    registers: u32,
+    ram: [u64; DATA_RAM_WORDS / 64],
+}
+
+impl ReadTaint {
+    /// Nothing unknown.
+    pub fn new() -> Self {
+        Self {
+            registers: 0,
+            ram: [0; DATA_RAM_WORDS / 64],
+        }
+    }
+
+    /// Whether data RAM word `address` holds a value from a DMA read.
+    pub fn ram_unknown(&self, address: usize) -> bool {
+        address < DATA_RAM_WORDS && self.ram[address / 64] & (1 << (address % 64)) != 0
+    }
+
+    /// Whether any data RAM word holds a value from a DMA read.
+    pub fn any_ram_unknown(&self) -> bool {
+        self.ram.iter().any(|&word| word != 0)
+    }
+}
+
+impl Default for ReadTaint {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// The instruction set a macro engine runs, fixed when the engine is created.
@@ -179,6 +219,9 @@ pub enum MacroErrorKind {
     /// The call emitted a method in the macro range.
     #[error("macro emitted a macro method")]
     MacroMethodEmit,
+    /// A shadow run reached a branch, address or method that depends on its DMA reads.
+    #[error("depends on a DMA read")]
+    DependsOnRead,
 }
 
 /// A failed macro call: what went wrong, the call's start address and the failing instruction.
@@ -221,6 +264,8 @@ pub struct MacroEngine {
     load_fifo: Vec<u32>,
     step_limit: u32,
     stats: MacroStats,
+    /// Start addresses whose calls read guest memory since the code last changed.
+    memory_readers: std::collections::HashSet<u32>,
 }
 
 enum Code {
@@ -246,6 +291,7 @@ impl MacroEngine {
             load_fifo: Vec::with_capacity(LOAD_FIFO_MAX_WORDS),
             step_limit: DEFAULT_STEP_LIMIT,
             stats: MacroStats::default(),
+            memory_readers: std::collections::HashSet::new(),
         }
     }
 
@@ -289,6 +335,7 @@ impl MacroEngine {
         };
         if changed {
             self.code_generation += 1;
+            self.memory_readers.clear();
         }
     }
 
@@ -373,8 +420,12 @@ impl MacroEngine {
                     record: &mut self.record,
                 },
                 self.step_limit,
+                &mut turing::Untracked,
             ),
         };
+        if self.record.read_memory {
+            self.memory_readers.insert(start);
+        }
         match result {
             Ok(()) => {
                 if self.record.cacheable() {
@@ -391,6 +442,56 @@ impl MacroEngine {
                 })
             }
         }
+    }
+
+    /// Whether the macro `method` starts read guest memory (`MME_DMA_READ*`) on a call since its
+    /// code last changed.
+    pub fn reads_memory(&self, method: u32) -> bool {
+        let index = (method.wrapping_sub(MACRO_METHOD_BASE) >> 1) as usize % START_ADDRESS_SLOTS;
+        self.memory_readers.contains(&self.start_addresses[index])
+    }
+
+    /// Runs the MME64 macro `method` starts without guest memory: its DMA reads return no words,
+    /// and every value that comes from them is tracked in `taint`. Writes with known values go to
+    /// `host.write_method`, writes with unknown ones to `host.write_unknown`. Fails with
+    /// [`MacroErrorKind::DependsOnRead`] when a value from a read steers the call (a branch,
+    /// predicate, loop count, method, register or data RAM address). Nothing is remembered.
+    pub fn shadow_execute<H: MacroHost>(
+        &mut self,
+        method: u32,
+        parameters: &[u32],
+        data_ram: &mut MacroDataRam,
+        host: &mut H,
+        taint: &mut ReadTaint,
+    ) -> Result<(), MacroError> {
+        let index = (method.wrapping_sub(MACRO_METHOD_BASE) >> 1) as usize % START_ADDRESS_SLOTS;
+        let start = self.start_addresses[index];
+        let Code::Mme64(code) = &self.code else {
+            return Err(MacroError {
+                kind: MacroErrorKind::DependsOnRead,
+                start,
+                pc: start,
+            });
+        };
+        self.record.begin(false);
+        turing::run(
+            code,
+            start,
+            turing::Io {
+                parameters,
+                load_fifo: &mut self.load_fifo,
+                data_ram,
+                host,
+                record: &mut self.record,
+            },
+            self.step_limit,
+            taint,
+        )
+        .map_err(|fault| MacroError {
+            kind: fault.kind,
+            start,
+            pc: fault.pc,
+        })
     }
 
     /// Turns the memo on or off; off forgets every remembered call.
@@ -450,6 +551,8 @@ struct Fault {
 /// guest memory or records too much. The buffers are allocated at that bound up front.
 struct CallRecord {
     recording: bool,
+    /// The call read guest memory (`MME_DMA_READ*`).
+    read_memory: bool,
     writes: Vec<u32>,
     data_ram_reads: Vec<u32>,
     data_ram_writes: Vec<u32>,
@@ -459,6 +562,7 @@ impl CallRecord {
     fn with_capacity(words: usize) -> Self {
         Self {
             recording: false,
+            read_memory: false,
             writes: Vec::with_capacity(words),
             data_ram_reads: Vec::with_capacity(words),
             data_ram_writes: Vec::with_capacity(words),
@@ -467,6 +571,7 @@ impl CallRecord {
 
     fn begin(&mut self, recording: bool) {
         self.recording = recording;
+        self.read_memory = false;
         self.writes.clear();
         self.data_ram_reads.clear();
         self.data_ram_writes.clear();
