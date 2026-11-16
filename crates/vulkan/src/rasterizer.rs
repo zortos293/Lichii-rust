@@ -1066,76 +1066,81 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn accelerate_blit(&mut self, _channel: ChannelId, memory: &Gmmu, blit: &Blit) -> bool {
-        if blit.operation != BlitOperation::SrcCopy {
-            return false;
-        }
-        let rects = blit_rects(blit);
-        if rects.is_none() && blit.linear_filter {
-            return false;
-        }
-        let (Some(src), Some(dst)) = (
-            ImageInfo::from_copy_surface(&blit.src, blit.src_format, self.gob_layout),
-            ImageInfo::from_copy_surface(&blit.dst, blit.dst_format, self.gob_layout),
-        ) else {
-            return false;
-        };
-        let mut tx = Transfer {
-            scheduler: &mut self.scheduler,
-            staging: &mut self.staging,
-            memory: &self.handles.device,
-            buffers: &mut self.buffer_cache,
-        };
-        let blitted = match rects {
-            Some((src_rect, dst_rect)) => self.texture_cache.blit(
-                &mut tx,
-                memory,
-                &BlitSide {
-                    gpu_va: blit.src.address,
-                    info: src,
-                    rect: src_rect,
-                },
-                &BlitSide {
-                    gpu_va: blit.dst.address,
-                    info: dst,
-                    rect: dst_rect,
-                },
-            ),
-            None => match (
-                blit.dst_x0.checked_add(blit.dst_width),
-                blit.dst_y0.checked_add(blit.dst_height),
-            ) {
-                (Some(x1), Some(y1)) => self.texture_cache.gather(
+        #[allow(clippy::redundant_closure_call)]
+        let done = (|| {
+            if blit.operation != BlitOperation::SrcCopy {
+                return false;
+            }
+            let rects = blit_rects(blit);
+            if rects.is_none() && blit.linear_filter {
+                return false;
+            }
+            let (Some(src), Some(dst)) = (
+                ImageInfo::from_copy_surface(&blit.src, blit.src_format, self.gob_layout),
+                ImageInfo::from_copy_surface(&blit.dst, blit.dst_format, self.gob_layout),
+            ) else {
+                return false;
+            };
+            let mut tx = Transfer {
+                scheduler: &mut self.scheduler,
+                staging: &mut self.staging,
+                memory: &self.handles.device,
+                buffers: &mut self.buffer_cache,
+            };
+            let blitted = match rects {
+                Some((src_rect, dst_rect)) => self.texture_cache.blit(
                     &mut tx,
                     memory,
-                    blit.src.address,
-                    &src,
+                    &BlitSide {
+                        gpu_va: blit.src.address,
+                        info: src,
+                        rect: src_rect,
+                    },
                     &BlitSide {
                         gpu_va: blit.dst.address,
                         info: dst,
-                        rect: [blit.dst_x0, blit.dst_y0, x1, y1],
-                    },
-                    &NearestSampling {
-                        x0: blit.src_x0,
-                        y0: blit.src_y0,
-                        du: blit.du_dx,
-                        dv: blit.dv_dy,
-                        width: blit.src.width,
-                        height: blit.src.height,
+                        rect: dst_rect,
                     },
                 ),
-                _ => Ok(false),
-            },
-        };
-        match blitted {
-            Ok(blitted) => {
-                self.unflushed |= blitted;
-                blitted
+                None => match (
+                    blit.dst_x0.checked_add(blit.dst_width),
+                    blit.dst_y0.checked_add(blit.dst_height),
+                ) {
+                    (Some(x1), Some(y1)) => self.texture_cache.gather(
+                        &mut tx,
+                        memory,
+                        blit.src.address,
+                        &src,
+                        &BlitSide {
+                            gpu_va: blit.dst.address,
+                            info: dst,
+                            rect: [blit.dst_x0, blit.dst_y0, x1, y1],
+                        },
+                        &NearestSampling {
+                            x0: blit.src_x0,
+                            y0: blit.src_y0,
+                            du: blit.du_dx,
+                            dv: blit.dv_dy,
+                            width: blit.src.width,
+                            height: blit.src.height,
+                        },
+                    ),
+                    _ => Ok(false),
+                },
+            };
+            match blitted {
+                Ok(blitted) => {
+                    self.unflushed |= blitted;
+                    blitted
+                }
+                Err(error) => {
+                    tracing::error!(%error, "blitting on the GPU failed; blitting in software");
+                    false
+                }
             }
-            Err(error) => {
-                tracing::error!(%error, "blitting on the GPU failed; blitting in software");
-                false
-            }
-        }
+        })();
+        blit_diag::record(blit, done, blit_rects(blit).is_some());
+        done
     }
 
     fn accelerate_image_copy(
@@ -2694,5 +2699,47 @@ mod tests {
             "the read lands the target's texels: {texel:?}"
         );
         f.assert_no_validation_errors();
+    }
+}
+
+mod blit_diag {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    use lichii_gpu::backend::Blit;
+
+    static STATE: Mutex<Option<(Instant, HashMap<String, u64>)>> = Mutex::new(None);
+
+    pub(super) fn record(blit: &Blit, done: bool, rects: bool) {
+        let unit = (1u64 << 32) as f64;
+        let key = format!(
+            "gpu={done} op={:?} linear={} rects={rects} {:?}->{:?} du={:.3} dv={:.3} src={}x{} blk={} dst={}x{}->{}x{} blk={}",
+            blit.operation,
+            blit.linear_filter,
+            blit.src_format,
+            blit.dst_format,
+            blit.du_dx as f64 / unit,
+            blit.dv_dy as f64 / unit,
+            blit.src.width,
+            blit.src.height,
+            blit.src.block.is_some(),
+            blit.dst.width,
+            blit.dst.height,
+            blit.dst_width,
+            blit.dst_height,
+            blit.dst.block.is_some(),
+        );
+        let mut state = STATE.lock().unwrap();
+        let (since, counts) = state.get_or_insert_with(|| (Instant::now(), HashMap::new()));
+        *counts.entry(key).or_default() += 1;
+        if since.elapsed().as_secs() >= 5 {
+            let mut all: Vec<_> = counts.drain().collect();
+            all.sort_by(|a, b| b.1.cmp(&a.1));
+            for (key, n) in all.iter().take(14) {
+                tracing::warn!("blit diag {n} {key}");
+            }
+            *since = Instant::now();
+        }
     }
 }
