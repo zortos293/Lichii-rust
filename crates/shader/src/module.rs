@@ -59,6 +59,10 @@ fn finish(
         let name = format!("fs-{:016x}", hasher.clone().finish());
         let _ = std::fs::write(dir.join(format!("{name}.ir")), program.ir.dump());
         let _ = std::fs::write(
+            dir.join(format!("{name}.sass")),
+            crate::LIRU14_TRACE.with(|s| std::mem::take(&mut *s.borrow_mut())),
+        );
+        let _ = std::fs::write(
             dir.join(format!("{name}.info")),
             format!("{:#?}\n{runtime:#?}", program.info),
         );

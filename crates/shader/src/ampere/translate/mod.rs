@@ -86,6 +86,13 @@ pub fn translate_block(
             });
         };
         t.form = decoded.form;
+        if env.stage() == ShaderStage::Fragment && std::env::var_os("LIRU14_DUMP_DIR").is_some() {
+            let line = format!(
+                "{:05x} {:?} {:?} {:032x}\n",
+                t.pc, decoded.opcode, decoded.form, t.insn.0
+            );
+            crate::LIRU14_TRACE.with(|s| s.borrow_mut().push_str(&line));
+        }
         dispatch(&mut t, decoded.opcode)?;
     }
     Ok(())

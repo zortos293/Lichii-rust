@@ -34,6 +34,11 @@ macro_rules! test_gpu_state {
     };
 }
 
+thread_local! {
+    #[doc(hidden)]
+    pub static LIRU14_TRACE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
 pub mod ampere;
 pub mod backend;
 pub mod cache;
