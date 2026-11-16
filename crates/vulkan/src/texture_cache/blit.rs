@@ -1,5 +1,5 @@
-//! 2D engine blits on the GPU: one scaled `vkCmdBlitImage` between two cached images, for formats
-//! the host blits as they are, or a gather of raw texels at the engine's own nearest sample
+//! 2D engine blits on the GPU: one scaled `vkCmdBlitImage` between two cached images, nearest or
+//! bilinear filtered, for formats the host blits as they are, or a gather of raw texels at the engine's own nearest sample
 //! positions, which `vkCmdBlitImage` can't reproduce.
 
 use ash::vk;
@@ -100,9 +100,11 @@ fn words(value: i64) -> [u32; 2] {
 }
 
 impl TextureCache {
-    /// Blits `src.rect` over `dst.rect` on the GPU, sampling the nearest texel.
+    /// Blits `src.rect` over `dst.rect` on the GPU with `filter`, mapping destination texel
+    /// centres onto the source rectangle as the host sampler does.
     /// `Ok(false)` when the cache cannot, and the caller blits in software: a format the host
-    /// does not blit as it is, a source no GPU work wrote (guest memory holds its texels, which
+    /// does not blit as it is, a linear filter over a source that is not a filterable float or
+    /// normalized colour format, a source no GPU work wrote (guest memory holds its texels, which
     /// the software blit reads without an upload), an image the lookup resolves to another
     /// format, a rectangle outside its image, or one image on both sides.
     pub fn blit(
@@ -111,12 +113,14 @@ impl TextureCache {
         gmmu: &Gmmu,
         src: &BlitSide,
         dst: &BlitSide,
+        filter: vk::Filter,
     ) -> Result<bool> {
         let src_host = self.host(src.info.format);
         let dst_host = self.host(dst.info.format);
         if src.info.kind != ImageKind::D2
             || dst.info.kind != ImageKind::D2
             || !self.blittable(src.info.format, src_host, dst.info.format, dst_host)
+            || (filter == vk::Filter::LINEAR && !self.filterable(src.info.format, src_host))
         {
             return Ok(false);
         }
@@ -155,7 +159,7 @@ impl TextureCache {
                 dst_image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &[region],
-                vk::Filter::NEAREST,
+                filter,
             );
         }
         self.mark_modified(target.id);
@@ -431,6 +435,17 @@ impl TextureCache {
             && plain(&dst_host)
             && self.can_blit(src_host.format)
             && self.can_blit(dst_host.format)
+    }
+
+    /// Whether `vkCmdBlitImage` may filter `format` texels linearly: a colour format that is
+    /// neither integer class and whose host format supports linear filtering.
+    fn filterable(&self, format: PixelFormat, host: HostFormat) -> bool {
+        format.is_color()
+            && !matches!(format.numeric(), Numeric::Uint | Numeric::Sint)
+            && self
+                .device
+                .format_features(host.format)
+                .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR)
     }
 
     /// `rect` of the found image's subresource in host texels, at the image's scale; `None`
