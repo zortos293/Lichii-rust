@@ -104,6 +104,11 @@ pub struct BufferCacheStats {
     pub uploaded_bytes: u64,
     /// GPU-written bytes copied back to guest memory.
     pub downloaded_bytes: u64,
+    /// Of [`BufferCacheStats::downloaded_bytes`], bytes served from copies taken when their
+    /// writers were submitted ([`BufferCache::capture`]).
+    pub captured_bytes: u64,
+    /// GPU-written bytes [`BufferCache::capture`] copied, read back or not.
+    pub capture_copy_bytes: u64,
     /// Bytes written to the stream ring: small uniforms, gathered ranges, converted indices.
     pub streamed_bytes: u64,
     pub created_buffers: u64,
@@ -322,6 +327,75 @@ impl RangeSet {
         for (&s, &e) in self.ranges.range(first..end) {
             f(s.max(start), e.min(end));
         }
+    }
+}
+
+/// Size of the ring [`BufferCache::capture`] copies GPU-written ranges into.
+const CAPTURE_RING_SIZE: u64 = 8 << 20;
+/// The longest GPU-written range a download marks for capture.
+const CAPTURE_MAX: u64 = CAPTURE_RING_SIZE / 8;
+
+/// A copy of the GPU-written device bytes `[daddr, end)` at `offset` in the capture ring,
+/// taken at the end of the work completing at `tick`.
+#[derive(Clone, Copy)]
+struct Capture {
+    daddr: DAddr,
+    end: DAddr,
+    offset: u64,
+    tick: u64,
+}
+
+/// GPU-written ranges that guest CPU reads come back to, copied to host memory at the end of
+/// the work that writes them. A read of a captured range waits at most for that work, instead
+/// of submitting a copy behind everything queued since and waiting for all of it.
+#[derive(Default)]
+struct Captures {
+    ring: Option<Buffer>,
+    head: u64,
+    /// Ranges downloads read GPU-written bytes from: their later GPU writes are captured.
+    hot: RangeSet,
+    /// Hot ranges of writes recorded since the last capture.
+    queued: Vec<(DAddr, DAddr)>,
+    /// Disjoint copies of current GPU-written bytes: a write recorded over one drops it.
+    live: Vec<Capture>,
+    /// Parts of live captures left over after a drop.
+    split: Vec<Capture>,
+}
+
+impl Captures {
+    /// GPU work writing `[daddr, end)` is being recorded: copies taken before it are stale.
+    fn drop_overlapping(&mut self, daddr: DAddr, end: DAddr) {
+        if self.live.is_empty() {
+            return;
+        }
+        let split = &mut self.split;
+        self.live.retain(|capture| {
+            if capture.end <= daddr || end <= capture.daddr {
+                return true;
+            }
+            if capture.daddr < daddr {
+                split.push(Capture {
+                    end: daddr,
+                    ..*capture
+                });
+            }
+            if end < capture.end {
+                split.push(Capture {
+                    daddr: end,
+                    offset: capture.offset + (end - capture.daddr),
+                    ..*capture
+                });
+            }
+            false
+        });
+        self.live.append(split);
+    }
+
+    /// The live capture holding `daddr`.
+    fn find(&self, daddr: DAddr) -> Option<&Capture> {
+        self.live
+            .iter()
+            .find(|capture| capture.daddr <= daddr && daddr < capture.end)
     }
 }
 
@@ -702,6 +776,7 @@ pub struct BufferCache {
     flush_traps: bool,
     stream: StreamRing,
     readback: Option<Buffer>,
+    captures: Captures,
     luts: [QuadLut; 2],
     widen_u8: bool,
     warned_scattered_write: bool,
@@ -740,6 +815,7 @@ impl BufferCache {
             flush_traps: lichii_gpu::gpu::flush_traps_enabled(),
             stream: StreamRing::new(device, STREAM_RING_SIZE)?,
             readback: None,
+            captures: Captures::default(),
             luts: Default::default(),
             widen_u8: !device.features.index_type_uint8,
             warned_scattered_write: false,
@@ -858,6 +934,7 @@ impl BufferCache {
             return None;
         }
         self.written_pages.mark(daddr, end - daddr);
+        self.captures.drop_overlapping(daddr, end);
         if self.flush_traps && !self.gpu_written.covers(daddr, end) {
             self.memory.arm_flush_traps(daddr, end - daddr);
         }
@@ -866,6 +943,14 @@ impl BufferCache {
     }
 
     fn stamp_writer(&mut self, tick: u64, daddr: DAddr, end: DAddr) {
+        let captures = &mut self.captures;
+        captures.drop_overlapping(daddr, end);
+        if captures.hot.intersects(daddr, end) {
+            let queued = &mut captures.queued;
+            captures
+                .hot
+                .for_each_in(daddr, end, |start, end| queued.push((start, end)));
+        }
         let mut addr = daddr;
         while addr < end {
             let Some(id) = Self::lookup(&self.page_table, addr) else {
@@ -963,7 +1048,7 @@ impl BufferCache {
     /// Copies the GPU-written bytes of `[daddr, +size)` back to guest memory, waiting for the GPU.
     pub fn flush(&mut self, scheduler: &mut Scheduler, daddr: DAddr, size: u64) -> Result<()> {
         let end = daddr.saturating_add(size).min(self.limit);
-        if !self.gpu_written.intersects(daddr, end) {
+        if !self.gpu_written.intersects(daddr, end) || self.read_captured(scheduler, daddr, end)? {
             return Ok(());
         }
         let Self {
@@ -971,6 +1056,7 @@ impl BufferCache {
             buffers,
             gpu_written,
             downloads,
+            captures,
             ..
         } = self;
         downloads.clear();
@@ -988,6 +1074,9 @@ impl BufferCache {
                 downloads.push((buffer.buffer.raw(), addr - buffer.daddr, addr, len));
                 newest = newest.max(buffer.written_tick);
                 total += len;
+                if len <= CAPTURE_MAX {
+                    captures.hot.insert(addr, addr + len);
+                }
                 addr += len;
             }
         });
@@ -1037,6 +1126,163 @@ impl BufferCache {
         self.gpu_written.subtract(daddr, end);
         self.disarm_written_back(daddr, end);
         self.stats.downloaded_bytes += total;
+        Ok(())
+    }
+
+    /// Serves [`BufferCache::flush`] of `[daddr, end)` from captures when they hold every
+    /// GPU-written byte there, waiting only for the work they were taken at the end of. `false`
+    /// when they do not, leaving everything as it was.
+    fn read_captured(
+        &mut self,
+        scheduler: &mut Scheduler,
+        daddr: DAddr,
+        end: DAddr,
+    ) -> Result<bool> {
+        let Self {
+            gpu_written,
+            captures,
+            lazy,
+            ..
+        } = self;
+        let Some(ring) = captures.ring.as_ref().filter(|_| !captures.live.is_empty()) else {
+            return Ok(false);
+        };
+        let mut newest = 0;
+        let mut covered = true;
+        gpu_written.for_each_in(daddr, end, |start, end| {
+            let mut addr = start;
+            while covered && addr < end {
+                match captures.find(addr) {
+                    Some(capture) => {
+                        newest = newest.max(capture.tick);
+                        addr = capture.end;
+                    }
+                    None => covered = false,
+                }
+            }
+        });
+        if !covered || newest >= scheduler.tick() {
+            return Ok(false);
+        }
+        scheduler.wait(newest)?;
+        let data = ring.mapped().expect("capture memory is host visible");
+        let mut total = 0;
+        gpu_written.for_each_in(daddr, end, |start, end| {
+            let mut addr = start;
+            while addr < end {
+                let capture = captures.find(addr).expect("covered above");
+                let stop = end.min(capture.end);
+                let from = (capture.offset + (addr - capture.daddr)) as usize;
+                if let Err(fault) = lazy.write(addr, &data[from..from + (stop - addr) as usize]) {
+                    tracing::warn!(
+                        ?fault,
+                        daddr = addr,
+                        "GPU-written buffer data over unmapped memory"
+                    );
+                }
+                total += stop - addr;
+                addr = stop;
+            }
+        });
+        captures.drop_overlapping(daddr, end);
+        self.gpu_written.subtract(daddr, end);
+        self.disarm_written_back(daddr, end);
+        self.stats.downloaded_bytes += total;
+        self.stats.captured_bytes += total;
+        Ok(true)
+    }
+
+    /// Copies the GPU-written bytes of hot ranges that the work being recorded writes into the
+    /// capture ring, at the end of that work, so a guest CPU read of them once it completes
+    /// needs no GPU work of its own. Call right before the recorded work is submitted.
+    pub fn capture(&mut self, scheduler: &mut Scheduler) -> Result<()> {
+        if self.captures.queued.is_empty() {
+            return Ok(());
+        }
+        if self.captures.ring.is_none() {
+            self.captures.ring = Some(Buffer::new(
+                &self.device,
+                CAPTURE_RING_SIZE,
+                vk::BufferUsageFlags::TRANSFER_DST,
+                MemoryLocation::GpuToCpu,
+                "buffer cache capture ring",
+            )?);
+        }
+        let Self {
+            device,
+            page_table,
+            buffers,
+            gpu_written,
+            captures,
+            downloads,
+            ..
+        } = self;
+        let queued = &mut captures.queued;
+        queued.sort_unstable_by_key(|&(start, _)| start);
+        let mut merged: usize = 0;
+        for i in 0..queued.len() {
+            let (start, end) = queued[i];
+            match merged.checked_sub(1).map(|last| &mut queued[last]) {
+                Some((_, last_end)) if *last_end >= start => *last_end = (*last_end).max(end),
+                _ => {
+                    queued[merged] = (start, end);
+                    merged += 1;
+                }
+            }
+        }
+        downloads.clear();
+        for &(start, end) in &queued[..merged] {
+            gpu_written.for_each_in(start, end, |start, end| {
+                let mut addr = start;
+                while addr < end {
+                    let Some(id) = Self::lookup(page_table, addr) else {
+                        addr = (addr + 1).next_multiple_of(CACHING_PAGE_SIZE).min(end);
+                        continue;
+                    };
+                    let buffer = buffers[id].as_ref().expect("live buffer");
+                    let len = end.min(buffer.end()) - addr;
+                    downloads.push((buffer.buffer.raw(), addr - buffer.daddr, addr, len));
+                    addr += len;
+                }
+            });
+        }
+        queued.clear();
+        if downloads.is_empty() {
+            return Ok(());
+        }
+        let ring = captures.ring.as_ref().expect("just ensured").raw();
+        let tick = scheduler.tick();
+        let cmd = scheduler.record()?;
+        before_transfer(device, cmd);
+        for &(src, src_offset, daddr, len) in downloads.iter() {
+            if len > CAPTURE_RING_SIZE {
+                continue;
+            }
+            if captures.head + len > CAPTURE_RING_SIZE {
+                captures.head = 0;
+                before_transfer(device, cmd);
+            }
+            let offset = captures.head;
+            captures
+                .live
+                .retain(|c| c.offset + (c.end - c.daddr) <= offset || offset + len <= c.offset);
+            captures.drop_overlapping(daddr, daddr + len);
+            let region = [vk::BufferCopy {
+                src_offset,
+                dst_offset: offset,
+                size: len,
+            }];
+            copy_buffer(device, cmd, src, ring, &region);
+            self.stats.capture_copy_bytes += len;
+            captures.live.push(Capture {
+                daddr,
+                end: daddr + len,
+                offset,
+                tick,
+            });
+            captures.head = (offset + len).next_multiple_of(16);
+        }
+        transfer_to_all_barrier(device, cmd);
         Ok(())
     }
 
@@ -1927,6 +2173,26 @@ mod tests {
             transfer_to_all_barrier(&self.device, cmd);
         }
 
+        /// Submits the recorded work the way the rasterizer does.
+        fn submit(&mut self) {
+            self.cache.capture(&mut self.scheduler).unwrap();
+            self.scheduler.flush().unwrap();
+        }
+
+        /// Makes `[daddr, +size)` of `binding` hot: GPU-written, then downloaded.
+        fn read_once(&mut self, binding: BufferBinding, daddr: DAddr, size: u64) {
+            self.gpu_fill(binding, daddr - DADDR - binding.offset, size, 0x0101_0101);
+            self.cache
+                .mark_gpu_written(self.scheduler.tick(), daddr, size);
+            self.submit();
+            self.cache.flush(&mut self.scheduler, daddr, size).unwrap();
+            assert_eq!(
+                self.cache.stats().captured_bytes,
+                0,
+                "nothing was captured yet"
+            );
+        }
+
         fn guest(&self, daddr: DAddr, size: usize) -> Vec<u8> {
             let mut out = vec![0; size];
             self.memory.read_bytes(daddr, &mut out).unwrap();
@@ -2227,6 +2493,107 @@ mod tests {
             f.guest(DADDR, 0x100),
             0x3333_3333_u32.to_le_bytes().repeat(0x40)
         );
+        f.assert_no_validation_errors();
+    }
+
+    fn words(value: u32, bytes: usize) -> Vec<u8> {
+        value.to_le_bytes().repeat(bytes / 4)
+    }
+
+    /// A GPU write to a range a download read before is copied out at the end of its work: once
+    /// that work is submitted, a download of the range takes the copy, behind no work recorded
+    /// since.
+    #[test]
+    fn submitted_writes_to_read_ranges_download_from_their_capture() {
+        let Some(mut f) = fixture() else { return };
+        let binding = f.acquire(DADDR, 0x1000);
+        f.read_once(binding, DADDR, 0x100);
+        f.gpu_fill(binding, 0, 0x100, 0x2222_2222);
+        f.cache.mark_gpu_written(f.scheduler.tick(), DADDR, 0x100);
+        f.submit();
+        f.gpu_fill(binding, 0x800, 0x100, 0x3333_3333);
+        f.cache
+            .mark_gpu_written(f.scheduler.tick(), DADDR + 0x800, 0x100);
+        let tick = f.scheduler.tick();
+        f.cache.flush(&mut f.scheduler, DADDR, 0x100).unwrap();
+        assert_eq!(f.cache.stats().captured_bytes, 0x100);
+        assert_eq!(
+            f.scheduler.tick(),
+            tick,
+            "the recorded work stays unsubmitted"
+        );
+        assert_eq!(f.guest(DADDR, 0x100), words(0x2222_2222, 0x100));
+        assert!(!f.cache.is_gpu_written(DADDR, 0x100));
+        f.assert_no_validation_errors();
+    }
+
+    /// A GPU write recorded after a range's capture, not yet submitted, makes the capture stale
+    /// where it lands: a download there waits for the write, and the rest still downloads from
+    /// the capture.
+    #[test]
+    fn writes_recorded_after_a_capture_download_their_own_bytes() {
+        let Some(mut f) = fixture() else { return };
+        let binding = f.acquire(DADDR, 0x1000);
+        f.read_once(binding, DADDR, 0x100);
+        f.gpu_fill(binding, 0, 0x100, 0x2222_2222);
+        f.cache.mark_gpu_written(f.scheduler.tick(), DADDR, 0x100);
+        f.submit();
+        f.gpu_fill(binding, 0x40, 0x40, 0x4444_4444);
+        f.cache
+            .mark_gpu_written(f.scheduler.tick(), DADDR + 0x40, 0x40);
+        f.cache.flush(&mut f.scheduler, DADDR + 0x80, 0x80).unwrap();
+        assert_eq!(f.cache.stats().captured_bytes, 0x80);
+        assert_eq!(f.guest(DADDR + 0x80, 0x80), words(0x2222_2222, 0x80));
+        let tick = f.scheduler.tick();
+        f.cache.flush(&mut f.scheduler, DADDR, 0x100).unwrap();
+        assert_eq!(
+            f.cache.stats().captured_bytes,
+            0x80,
+            "the capture was stale"
+        );
+        assert!(
+            f.scheduler.tick() > tick,
+            "the write was submitted with the download"
+        );
+        let mut expected = words(0x2222_2222, 0x100);
+        expected[0x40..0x80].copy_from_slice(&words(0x4444_4444, 0x40));
+        assert_eq!(f.guest(DADDR, 0x100), expected);
+        f.assert_no_validation_errors();
+    }
+
+    /// A writable binding prepared before a submission that captured its range, its draw
+    /// recorded after: the capture predates the draw, so a download waits for the draw.
+    #[test]
+    fn captures_taken_while_a_draw_is_prepared_do_not_hide_it() {
+        let Some(mut f) = fixture() else { return };
+        f.gmmu.map(GPU_VA, DADDR, PAGE_SIZE, 0, false).unwrap();
+        let binding = f.acquire(DADDR, 0x100);
+        f.read_once(binding, DADDR, 0x100);
+        f.gpu_fill(binding, 0, 0x100, 0x2222_2222);
+        f.cache.mark_gpu_written(f.scheduler.tick(), DADDR, 0x100);
+        let storage = f
+            .cache
+            .storage_buffer(
+                &mut f.scheduler,
+                &mut f.staging,
+                &f.gmmu,
+                GPU_VA,
+                0x100,
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        f.submit();
+        f.gpu_fill(storage, 0, 0x100, 0x5555_5555);
+        let tick = f.scheduler.tick();
+        f.cache.commit_writes(tick);
+        f.cache.flush(&mut f.scheduler, DADDR, 0x100).unwrap();
+        assert_eq!(f.cache.stats().captured_bytes, 0);
+        assert!(
+            f.scheduler.tick() > tick,
+            "the draw was submitted with the download"
+        );
+        assert_eq!(f.guest(DADDR, 0x100), words(0x5555_5555, 0x100));
         f.assert_no_validation_errors();
     }
 

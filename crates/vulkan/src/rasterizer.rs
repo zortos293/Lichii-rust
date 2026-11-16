@@ -674,6 +674,7 @@ impl VulkanRasterizer {
             ImageAccess::TRANSFER_DST,
             ImageAccess::SHADER_READ,
         );
+        self.buffer_cache.capture(&mut self.scheduler)?;
         let tick = self.scheduler.flush()?;
         self.unflushed = false;
         self.publish(fb, frame, tick, scale);
@@ -714,6 +715,9 @@ impl VulkanRasterizer {
             return;
         }
         self.unflushed = false;
+        if let Err(error) = self.buffer_cache.capture(&mut self.scheduler) {
+            tracing::error!(%error, "capturing GPU-written buffers failed");
+        }
         if let Err(error) = self.scheduler.flush() {
             tracing::error!(%error, "submitting GPU work failed");
         }
@@ -757,6 +761,8 @@ impl VulkanRasterizer {
             texture_gpu_syncs = textures.gpu_syncs - a.textures.gpu_syncs,
             buffer_upload_bytes = buffers.uploaded_bytes - a.buffers.uploaded_bytes,
             buffer_download_bytes = buffers.downloaded_bytes - a.buffers.downloaded_bytes,
+            buffer_captured_bytes = buffers.captured_bytes - a.buffers.captured_bytes,
+            buffer_capture_copy_bytes = buffers.capture_copy_bytes - a.buffers.capture_copy_bytes,
             buffer_stream_bytes = buffers.streamed_bytes - a.buffers.streamed_bytes,
             cached_images = self.texture_cache.len(),
             created_buffers = buffers.created_buffers,
@@ -1015,6 +1021,7 @@ impl VulkanRasterizer {
             ImageAccess::TRANSFER_DST,
             ImageAccess::SHADER_READ,
         );
+        self.buffer_cache.capture(&mut self.scheduler)?;
         let tick = self.scheduler.flush()?;
         self.unflushed = false;
         self.publish(fb, frame, tick, ResolutionScale::X1);
