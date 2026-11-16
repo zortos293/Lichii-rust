@@ -14,7 +14,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant, SystemTime};
 
 use lichii_audio::sink::Sink;
-use lichii_common::settings::{AudioSettings, Settings};
+use lichii_common::settings::{AudioSettings, GpuClock, Settings};
 use lichii_common::{ConsoleGeneration, ResultCode, VAddr};
 use lichii_gpu::backend::{GpuHandles, NullRasterizer, Rasterizer};
 use lichii_gpu::host1x::Host1x;
@@ -182,6 +182,9 @@ impl System {
 
         let gpu = Self::start_gpu(&kernel, &program, &timing, renderer);
         gpu.host1x().memory.attach_process(process.memory().clone());
+        gpu.handles()
+            .timestamp
+            .set_speed(settings.graphics.fast_gpu_time.into());
         let audio = Arc::new(Sink::new(&settings.audio));
         let services = ServiceContext::new(ServiceParts {
             kernel: kernel.clone(),
@@ -381,6 +384,12 @@ impl System {
     /// chosen at boot, so changing it takes a new session.
     pub fn set_audio_volume(&self, audio: &AudioSettings) {
         self.audio.set_host_volume(audio.volume, audio.muted);
+    }
+
+    /// Sets how fast GPU work looks to the title: Switch 2 titles see it from the next present,
+    /// Switch 1 titles at once, with timestamps continuing from their current value.
+    pub fn set_gpu_clock(&self, clock: GpuClock) {
+        self.gpu.handles().timestamp.set_speed(clock.into());
     }
 
     pub fn npad(&self) -> &Arc<NpadHub> {

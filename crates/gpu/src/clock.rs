@@ -1,6 +1,7 @@
 //! The GPU timestamp clock that 16-byte releases and query reports write.
 //!
-//! Switch 1 (Maxwell) timestamps are GPU ticks at 614.4 MHz derived from guest time. Switch 2
+//! Switch 1 (Maxwell) timestamps are GPU ticks at 614.4 MHz derived from guest time, divided by the
+//! clock speed; a speed change keeps them continuous from the value they had when it happened. Switch 2
 //! (Ampere) titles read report timestamps as nanoseconds and calibrate them against CPU time, so
 //! the clock speed setting only shrinks the time since the last present: GPU durations within a
 //! frame look shorter, but a timestamp never runs ahead of the CPU clock. Before the first present
@@ -9,6 +10,8 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
+use lichii_common::settings::GpuClock;
 
 /// Guest time, as core timing keeps it.
 pub trait GuestTime: Send + Sync {
@@ -24,6 +27,16 @@ pub enum GpuClockSpeed {
     Normal = 0,
     Boost = 1,
     Overclock = 2,
+}
+
+impl From<GpuClock> for GpuClockSpeed {
+    fn from(clock: GpuClock) -> Self {
+        match clock {
+            GpuClock::Normal => Self::Normal,
+            GpuClock::Boost => Self::Boost,
+            GpuClock::Overclock => Self::Overclock,
+        }
+    }
 }
 
 impl GpuClockSpeed {
@@ -60,6 +73,9 @@ pub struct GpuTimestamp {
     /// Guest time of the last present shifted left by 2, with the speed latched then in the low
     /// bits: one word so both change together.
     anchor: AtomicU64,
+    /// Maxwell only: the signed tick offset that keeps timestamps continuous across speed
+    /// changes, shifted left by 2, with the speed it belongs to in the low bits.
+    maxwell: AtomicU64,
 }
 
 impl GpuTimestamp {
@@ -70,12 +86,28 @@ impl GpuTimestamp {
             ampere,
             speed: AtomicU8::new(GpuClockSpeed::Normal as u8),
             anchor: AtomicU64::new(0),
+            maxwell: AtomicU64::new(GpuClockSpeed::Normal as u64),
         }
     }
 
-    /// Changes the clock speed setting. Ampere timestamps pick it up at the next present.
+    /// Changes the clock speed setting. Ampere timestamps pick it up at the next present; Maxwell
+    /// timestamps change rate at once, continuing from the value they have now.
     pub fn set_speed(&self, speed: GpuClockSpeed) {
         self.speed.store(speed as u8, Ordering::Relaxed);
+        if self.ampere {
+            return;
+        }
+        let ticks = self.maxwell_ticks();
+        self.maxwell
+            .update(Ordering::Relaxed, Ordering::Relaxed, |word| {
+                let reported = maxwell_timestamp(ticks, word);
+                let offset = reported - (ticks / speed.maxwell_divisor()) as i64;
+                (offset << 2) as u64 | speed as u64
+            });
+    }
+
+    fn maxwell_ticks(&self) -> u64 {
+        (u128::from(self.time.global_time_ns()) * 384 / 625) as u64
     }
 
     /// A frame was presented: Ampere timestamps scale only the time after this point.
@@ -98,9 +130,13 @@ impl GpuTimestamp {
             let speed = GpuClockSpeed::from_bits((anchor & 3) as u8);
             return present + (now - present) / speed.ampere_divisor();
         }
-        let ticks = (u128::from(now) * 384 / 625) as u64;
-        ticks / GpuClockSpeed::from_bits(self.speed.load(Ordering::Relaxed)).maxwell_divisor()
+        maxwell_timestamp(self.maxwell_ticks(), self.maxwell.load(Ordering::Relaxed)) as u64
     }
+}
+
+fn maxwell_timestamp(ticks: u64, word: u64) -> i64 {
+    let speed = GpuClockSpeed::from_bits((word & 3) as u8);
+    (ticks / speed.maxwell_divisor()) as i64 + ((word as i64) >> 2)
 }
 
 #[cfg(test)]
@@ -125,8 +161,32 @@ mod tests {
         let (time, clock) = clock(false);
         time.0.store(1_000_000_000, Ordering::Relaxed);
         assert_eq!(clock.now(), 614_400_000);
+    }
+
+    #[test]
+    fn maxwell_boost_from_boot_divides_ticks_by_256() {
+        let (time, clock) = clock(false);
         clock.set_speed(GpuClockSpeed::Boost);
+        time.0.store(1_000_000_000, Ordering::Relaxed);
         assert_eq!(clock.now(), 614_400_000 / 256);
+    }
+
+    #[test]
+    fn maxwell_speed_changes_keep_ticks_continuous() {
+        let (time, clock) = clock(false);
+        time.0.store(1_000_000_000, Ordering::Relaxed);
+        clock.set_speed(GpuClockSpeed::Boost);
+        assert_eq!(clock.now(), 614_400_000);
+        time.0.store(2_000_000_000, Ordering::Relaxed);
+        assert_eq!(clock.now(), 614_400_000 + 2_400_000);
+        clock.set_speed(GpuClockSpeed::Overclock);
+        assert_eq!(clock.now(), 616_800_000);
+        time.0.store(3_000_000_000, Ordering::Relaxed);
+        assert_eq!(clock.now(), 616_800_000 + 1_200_000);
+        clock.set_speed(GpuClockSpeed::Normal);
+        assert_eq!(clock.now(), 618_000_000);
+        time.0.store(4_000_000_000, Ordering::Relaxed);
+        assert_eq!(clock.now(), 618_000_000 + 614_400_000);
     }
 
     #[test]

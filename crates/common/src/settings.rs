@@ -411,6 +411,8 @@ pub struct GraphicsSettings {
     pub speed_limit: Option<u16>,
     pub gpu_accuracy: GpuAccuracy,
     pub anisotropic_filtering: Anisotropy,
+    /// How fast GPU work looks to the title through its timestamps.
+    pub fast_gpu_time: GpuClock,
     pub astc_decode: AstcDecode,
     pub astc_recompression: AstcRecompression,
     /// Compiles shaders and pipelines on worker threads. Only a draw into the presented frame
@@ -436,6 +438,7 @@ impl Default for GraphicsSettings {
             speed_limit: Some(100),
             gpu_accuracy: GpuAccuracy::Normal,
             anisotropic_filtering: Anisotropy::Auto,
+            fast_gpu_time: GpuClock::Boost,
             astc_decode: AstcDecode::Gpu,
             astc_recompression: AstcRecompression::Bc3,
             async_shader_compilation: true,
@@ -584,6 +587,17 @@ pub enum GpuAccuracy {
     #[default]
     Normal,
     High,
+}
+
+/// GPU timestamp speed: Boost and Overclock divide the GPU time a title measures within a
+/// frame by 4 and 16 on Switch 2 (by 256 and 512 on Switch 1), so titles that size their
+/// rendering by measured GPU time keep full resolution.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GpuClock {
+    Normal,
+    #[default]
+    Boost,
+    Overclock,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1389,6 +1403,13 @@ mod tests {
         let zone = |text: &str| load(text).0.system.time_zone;
         assert_eq!(zone("[system]\ntime_zone = \"\"\n"), TIME_ZONE_AUTO);
         assert_eq!(zone("[system]\ntime_zone = \"AUTO\"\n"), TIME_ZONE_AUTO);
+    }
+
+    #[test]
+    fn gpu_time_is_boosted_unless_set() {
+        assert_eq!(load("").0.graphics.fast_gpu_time, GpuClock::Boost);
+        let text = "[graphics]\nfast_gpu_time = \"Normal\"\n";
+        assert_eq!(load(text).0.graphics.fast_gpu_time, GpuClock::Normal);
     }
 
     #[test]

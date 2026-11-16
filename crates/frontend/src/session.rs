@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lichii_common::ConsoleGeneration;
-use lichii_common::settings::{AudioSettings, ControlSettings, Settings};
+use lichii_common::settings::{AudioSettings, ControlSettings, GpuClock, Settings};
 use lichii_core::{ExitReason, Handover, Host, PROGRAM_INDEX_MASK, System, SystemError};
 use lichii_crypto::KeyError;
 use lichii_loader::LoadOptions;
@@ -183,6 +183,11 @@ impl Session {
     /// Applies volume and mute to the running title's audio.
     pub fn set_audio_volume(&self, audio: &AudioSettings) {
         self.system.set_audio_volume(audio);
+    }
+
+    /// Applies the GPU clock setting to the running title.
+    pub fn set_gpu_clock(&self, clock: GpuClock) {
+        self.system.set_gpu_clock(clock);
     }
 
     /// Shows the library applet the title is waiting on, if any. Returns the controls when the
