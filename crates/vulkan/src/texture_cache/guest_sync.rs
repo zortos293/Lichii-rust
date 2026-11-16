@@ -56,6 +56,7 @@ enum Direction {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Params {
     row_words: u32,
+    row_bytes: u32,
     height: u32,
     row_gobs: u32,
     block_height_log2: u32,
@@ -102,9 +103,11 @@ impl GuestSync {
 }
 
 /// How `image` packs into guest words on the GPU, or `None` when the pass can't move it: only
-/// block-linear 2D images (or 3D ones one slice deep) at native scale whose rows are whole
-/// 32-bit words at every level, laid out as the guest's, D24S8 kept as the host's D24S8 or
-/// D32S8 and mapped whole, or X8D24 kept as the host's X8D24 or D32.
+/// block-linear 2D images (or 3D ones one slice deep) at native scale whose texels are whole
+/// 32-bit words or pack whole into one, laid out as the guest's, D24S8 kept as the host's D24S8
+/// or D32S8 and mapped whole, or X8D24 kept as the host's X8D24 or D32. Rows that end inside
+/// a word need segments that share no device memory: alias trimming gives whole words to one
+/// source, which would drop an earlier alias's bytes in a partly written word.
 fn packing(image: &CachedImage) -> Option<Packing> {
     let info = &image.info;
     let bytes = info.format.bytes_per_block();
@@ -120,7 +123,10 @@ fn packing(image: &CachedImage) -> Option<Packing> {
         && info.samples == 1
         && info.format.block_width() == 1
         && info.format.block_height() == 1
-        && (0..info.levels).all(|level| (info.level_extent(level).0 * bytes).is_multiple_of(4));
+        && (4 % bytes == 0 || bytes.is_multiple_of(4))
+        && !(image.self_aliased
+            && (0..info.levels)
+                .any(|level| !(info.level_extent(level).0 * bytes).is_multiple_of(4)));
     if !shape {
         return None;
     }
@@ -224,7 +230,9 @@ fn shared_runs(
 
 /// Pushes onto `out`, in order and merged, the image offsets in `[lo, hi)` that
 /// `guest_bytes.comp` moves for the first `levels` levels of every layer of `info`: the words
-/// of texels, never the padding of rows, GOBs or blocks.
+/// that hold texels, never the padding of rows past their last word, of GOBs or of blocks. The
+/// shader writes only the texel bytes of a row's last word; its other bytes count as moved so
+/// runs stay whole words.
 fn moved_bytes(info: &ImageInfo, levels: u32, lo: u64, hi: u64, out: &mut Vec<(u64, u64)>) {
     let mut push = |a: u64, b: u64| {
         let (a, b) = (a.max(lo), b.min(hi));
@@ -244,7 +252,7 @@ fn moved_bytes(info: &ImageInfo, levels: u32, lo: u64, hi: u64, out: &mut Vec<(u
             }
             let tiling = info.surface().level_tiling(level);
             let (w, h, _) = info.level_extent(level);
-            let row_bytes = w * tiling.bytes_per_block / 4 * 4;
+            let row_bytes = (w * tiling.bytes_per_block).next_multiple_of(4);
             let bh = tiling.block_height_log2;
             let column = 1u64 << (9 + bh + tiling.block_depth_log2);
             let block_bytes = u64::from(tiling.row_gobs) * column;
@@ -491,8 +499,8 @@ impl TextureCache {
         for &o in newer.iter().chain(std::iter::once(&id)) {
             let info = &self.get(o).expect("a live image id").info;
             let (w, h, _) = info.level_extent(0);
-            linear =
-                linear.max(u64::from(w) * u64::from(h) * u64::from(info.format.bytes_per_block()));
+            let row = (w * info.format.bytes_per_block()).next_multiple_of(4);
+            linear = linear.max(u64::from(row) * u64::from(h));
             stencil = stencil.max((u64::from(w) * u64::from(h)).next_multiple_of(4));
         }
         let range = u64::from(self.device.properties.limits.max_storage_buffer_range);
@@ -654,7 +662,8 @@ impl TextureCache {
                 let shared = &runs[first..first + count];
                 let tiling = info.surface().level_tiling(level);
                 let (w, h, _) = info.level_extent(level);
-                let row_words = w * tiling.bytes_per_block / 4;
+                let row_bytes = w * tiling.bytes_per_block;
+                let row_words = row_bytes.div_ceil(4);
                 let block_rows = 8u32 << tiling.block_height_log2;
                 let block_bytes = u64::from(tiling.row_gobs)
                     << (9 + tiling.block_height_log2 + tiling.block_depth_log2);
@@ -675,8 +684,9 @@ impl TextureCache {
                     start + u64::from(y0 / block_rows) * block_bytes,
                     (start + u64::from(y1.div_ceil(block_rows)) * block_bytes).min(end),
                 );
-                let region = |aspect_mask, texel_bytes: u64| vk::BufferImageCopy {
-                    buffer_offset: u64::from(y0) * u64::from(w) * texel_bytes,
+                let region = |aspect_mask, row_texels: u32, texel_bytes: u32| vk::BufferImageCopy {
+                    buffer_offset: u64::from(y0) * u64::from(row_texels * texel_bytes),
+                    buffer_row_length: row_texels,
                     image_subresource: vk::ImageSubresourceLayers {
                         aspect_mask,
                         mip_level: level,
@@ -695,8 +705,12 @@ impl TextureCache {
                     },
                     ..Default::default()
                 };
-                let main = region(main_aspect, u64::from(tiling.bytes_per_block));
-                let stencil_region = region(vk::ImageAspectFlags::STENCIL, 1);
+                let main = region(
+                    main_aspect,
+                    row_words * 4 / tiling.bytes_per_block,
+                    tiling.bytes_per_block,
+                );
+                let stencil_region = region(vk::ImageAspectFlags::STENCIL, w, 1);
                 let groups = [
                     row_words.div_ceil(GROUP[0]),
                     (y1 - y0).div_ceil(GROUP[1]),
@@ -729,6 +743,7 @@ impl TextureCache {
                         .allocate(tx.scheduler, sync.compute.set_layout)?;
                     let params = Params {
                         row_words,
+                        row_bytes,
                         height: h,
                         row_gobs: tiling.row_gobs,
                         block_height_log2: tiling.block_height_log2,
@@ -1032,7 +1047,7 @@ mod tests {
                     let tiling = info.surface().level_tiling(level);
                     let (w, h, _) = info.level_extent(level);
                     for y in 0..h {
-                        for x in (0..w * tiling.bytes_per_block / 4 * 4).step_by(4) {
+                        for x in (0..w * tiling.bytes_per_block).step_by(4) {
                             let at = start + tiling.offset(x, y, 0);
                             moved[at..at + 4].fill(true);
                         }

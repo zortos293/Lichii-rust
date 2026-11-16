@@ -62,8 +62,11 @@ pub enum Console {
 /// How the GPU is built.
 #[derive(Clone)]
 pub struct GpuConfig {
-    /// Picks the timestamp clock, the Switch 2 memory registry and the channel defaults.
+    /// Picks the Switch 2 memory registry and the channel defaults.
     pub console: Console,
+    /// Report timestamps count nanoseconds, as Switch 2 titles read them, instead of Maxwell
+    /// GPU ticks. Defaults to `console == Console::Switch2`; see [`crate::clock::keeps_tick_timestamps`].
+    pub nanosecond_timestamps: bool,
     /// Split (the default) or one GPU thread.
     pub threading: Threading,
     /// Slots of the front-to-back ring (rounded up to a power of two).
@@ -77,6 +80,7 @@ impl GpuConfig {
     pub fn new(console: Console) -> Self {
         Self {
             console,
+            nanosecond_timestamps: console == Console::Switch2,
             threading: Threading::default(),
             ring_slots: DEFAULT_RING_SLOTS,
             engines: Arc::new(create_engine),
@@ -410,7 +414,7 @@ impl Gpu {
         let handles = GpuHandles {
             device: host1x.memory.clone(),
             syncpoints: host1x.syncpoints.clone(),
-            timestamp: Arc::new(GpuTimestamp::new(time, config.console == Console::Switch2)),
+            timestamp: Arc::new(GpuTimestamp::new(time, config.nanosecond_timestamps)),
             written_pages: host1x.written_pages.clone(),
             lazy: host1x.lazy.clone(),
             activity: Arc::new(Activity::new()),

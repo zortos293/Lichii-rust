@@ -73,5 +73,13 @@ pub fn emit_spirv(
     program: &TranslatedProgram,
     bindings: &mut Bindings,
 ) -> Result<Vec<u32>, EmitError> {
+    if profile.warp_size_potentially_larger_than_guest && profile.runs_guest_warp(program.stage) {
+        let guest_warp = Profile {
+            warp_size_potentially_larger_than_guest: false,
+            max_subgroup_size: 32,
+            ..profile.clone()
+        };
+        return driver::emit(&guest_warp, runtime, program, bindings);
+    }
     driver::emit(profile, runtime, program, bindings)
 }
