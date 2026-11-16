@@ -1118,7 +1118,7 @@ Dump prod.keys and title.keys \
         }
         self.next_fps_log = now + FPS_LOG_PERIOD;
         tracing::info!(
-            game_fps = snap.game_frame_times_ms.len() as f32 / FPS_LOG_PERIOD.as_secs_f32(),
+            game_fps = snap.game_frame_times_ms.len() as f64 / FPS_LOG_PERIOD.as_secs_f64(),
             speed_pct = (snap.emulation_speed * 100.0).round() as u32,
             host_fps = snap.fps,
             "frame rate"
