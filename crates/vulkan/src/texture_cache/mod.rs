@@ -290,6 +290,8 @@ struct CachedImage {
     scale: ResolutionScale,
     access: ImageAccess,
     segments: Vec<Segment>,
+    /// Two of its segments map the same device memory.
+    self_aliased: bool,
     views: Vec<(ViewKey, ImageView)>,
     /// Guest memory changed since the last upload.
     cpu_dirty: bool,
@@ -841,6 +843,21 @@ const ASTC_TRANSPARENT_BLACK: [u8; 16] = [
 
 /// Fills the bytes of `out`, image bytes from `offset` on, that no segment maps with
 /// `block`. Gaps start and end on block boundaries, as pages do.
+/// Whether two of `segments` map the same device memory.
+fn self_aliased(segments: &[Segment]) -> bool {
+    let mut spans: Vec<_> = segments
+        .iter()
+        .map(|s| (s.daddr, s.daddr + s.size))
+        .collect();
+    spans.sort_unstable();
+    let mut end = spans.first().map_or(0, |&(lo, _)| lo);
+    spans.iter().any(|&(lo, hi)| {
+        let shared = lo < end;
+        end = end.max(hi);
+        shared
+    })
+}
+
 fn fill_unmapped(segments: &[Segment], offset: u64, out: &mut [u8], block: &[u8; 16]) {
     let end = offset + out.len() as u64;
     let mut at = offset;
@@ -2531,6 +2548,7 @@ impl TextureCache {
             image,
             scale: ResolutionScale::X1,
             access: ImageAccess::UNDEFINED,
+            self_aliased: self_aliased(&segments),
             segments,
             views: Vec::new(),
             cpu_dirty: true,
@@ -2594,6 +2612,7 @@ impl TextureCache {
         self.image(id).overlaps_newest = u64::MAX;
         let segments = self.segments.clone();
         let old = std::mem::replace(&mut self.image(id).segments, segments.clone());
+        self.image(id).self_aliased = self_aliased(&segments);
         for s in &old {
             for page in pages(s.daddr, s.size) {
                 if let Some(bucket) = self.pages.get_mut(&page) {
