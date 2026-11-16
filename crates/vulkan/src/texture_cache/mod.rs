@@ -1316,6 +1316,13 @@ impl TextureCache {
             image.cpu_dirty = false;
             image.current = tick;
         }
+        if matches!((info.width, info.height), (2560, 1440) | (1280, 720)) {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 600 {
+                let image = self.get(found.id).expect("a live image id");
+                tracing::info!("tgtdiag bind {}x{} {:?} id={} discard={} whole={} tick={} current={} modified={} overlaps_newest={}", info.width, info.height, info.format, found.id.index, discard, whole, self.tick, image.current, image.modified, image.overlaps_newest);
+            }
+        }
         SYNC_CTX.with(|c| c.set(if discard && whole { "target discard" } else if discard { "target discard-not-whole" } else { "target keep" }));
         self.refresh(tx, found.id)?;
         let target = if self.can_rescale(found.id) {
