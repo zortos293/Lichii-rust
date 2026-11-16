@@ -819,6 +819,7 @@ impl VulkanRasterizer {
         ctx: &mut GraphicsContext<'_>,
         call: DrawCall<'_>,
     ) -> Result<()> {
+        crate::rasterizer::draw::DIAG381[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.draw.channel != Some(ctx.channel) {
             self.draw.channel = Some(ctx.channel);
             ctx.dirty.set_all();
@@ -835,10 +836,12 @@ impl VulkanRasterizer {
                 .unwrap_or(vk::PrimitiveTopology::TRIANGLE_LIST),
         };
         if !self.render_targets(ctx)? {
+            crate::rasterizer::draw::DIAG381[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         }
         let may_skip = self.draw.presented_only();
         if !self.graphics_stages(ctx, host_topology, may_skip) {
+            crate::rasterizer::draw::DIAG381[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         }
 
@@ -866,6 +869,7 @@ impl VulkanRasterizer {
             false => draw.pipelines.graphics_waiting(&key, &draw.stages),
         };
         let Some(pipeline) = pipeline else {
+            crate::rasterizer::draw::DIAG381[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         };
         let pipeline_raw = pipeline.raw();
@@ -908,6 +912,7 @@ impl VulkanRasterizer {
                     sampler_limit: regs.tex_sampler.limit,
                 };
                 if !self.bind_resources(&module, &sources)? {
+                    crate::rasterizer::draw::DIAG381[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Ok(());
                 }
             }
@@ -932,7 +937,7 @@ impl VulkanRasterizer {
             let indirect = match call {
                 DrawCall::Indirect(draw) => match self.indirect_buffers(gmmu, regs, draw, mesh)? {
                     Some(buffers) => Some(buffers),
-                    None => return Ok(()),
+                    None => { crate::rasterizer::draw::DIAG381[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed); return Ok(()) },
                 },
                 DrawCall::Direct(_) => None,
             };
@@ -947,15 +952,18 @@ impl VulkanRasterizer {
                         Warning::ImageChurn,
                         "a draw's render targets and textures keep replacing each other in the texture cache; skipping it",
                     );
+                    crate::rasterizer::draw::DIAG381[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Ok(());
                 }
                 if !self.render_targets(ctx)? {
+                    crate::rasterizer::draw::DIAG381[7].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Ok(());
                 }
                 removals = self.texture_cache.removals();
             }
         };
         if index.is_some_and(|i: IndexBinding| i.index_count == 0) {
+            crate::rasterizer::draw::DIAG381[8].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         }
         let set = self.descriptor_set(set_layout)?;
@@ -3105,3 +3113,4 @@ mod texture;
 
 #[cfg(test)]
 mod tests;
+pub(crate) static DIAG381: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];

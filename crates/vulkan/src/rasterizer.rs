@@ -134,6 +134,7 @@ impl Stalls {
                 seconds = (now - since).as_secs_f32(),
                 translating = shaders.translating(),
                 building = pipelines.building(),
+                diag381 = ?crate::rasterizer::draw::DIAG381.iter().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed)).collect::<Vec<_>>(),
                 "draw stalls"
             );
         }
