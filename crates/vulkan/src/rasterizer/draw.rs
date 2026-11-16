@@ -828,6 +828,26 @@ impl VulkanRasterizer {
             FixedStateTracker::register_dirty_flags(ctx.dirty);
         }
         let regs = ctx.regs;
+        static LIRU14_RT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        static LIRU14_RT_LOGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let liru14 = LIRU14_RT
+            .get_or_init(|| {
+                std::env::var("LIRU14_VA")
+                    .ok()
+                    .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+            })
+            .is_some_and(|want| {
+                (0..(regs.rt_control.count() as usize).min(8))
+                    .any(|i| regs.rt[render_target_index(regs, i)].address() == want)
+            })
+            && LIRU14_RT_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40;
+        if liru14 {
+            eprintln!(
+                "LIRU14 rtdraw start rt_count={} rt0={:#x}",
+                regs.rt_control.count(),
+                regs.rt[render_target_index(regs, 0)].address()
+            );
+        }
         let mesh = is_mesh_draw(regs, self.draw.arch);
         let host_topology = match mesh {
             true => mesh_topology(regs),
@@ -839,7 +859,17 @@ impl VulkanRasterizer {
         }
         let may_skip = self.draw.presented_only();
         if !self.graphics_stages(ctx, host_topology, may_skip) {
+            if liru14 {
+                eprintln!("LIRU14 rtdraw no stages may_skip={may_skip}");
+            }
             return Ok(());
+        }
+        if liru14 {
+            eprintln!(
+                "LIRU14 rtdraw stages={:x?} colors={:?}",
+                self.draw.stages.each_ref().map(|s| s.as_ref().map(|m| m.hash)),
+                self.draw.colors.map(|t| t.map(|t| t.format))
+            );
         }
 
         let draw = &mut self.draw;
@@ -866,8 +896,14 @@ impl VulkanRasterizer {
             false => draw.pipelines.graphics_waiting(&key, &draw.stages),
         };
         let Some(pipeline) = pipeline else {
+            if liru14 {
+                eprintln!("LIRU14 rtdraw no pipeline may_skip={may_skip}");
+            }
             return Ok(());
         };
+        if liru14 {
+            eprintln!("LIRU14 rtdraw pipeline ok blend={:?}", fixed.blend[0]);
+        }
         let pipeline_raw = pipeline.raw();
         let layout = pipeline.layout();
         let layout_raw = layout.raw();
