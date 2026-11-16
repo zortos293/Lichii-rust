@@ -566,6 +566,7 @@ fn liru14_skip(regs: &Regs) -> bool {
     }
     let idx = RUN.fetch_add(1, Relaxed);
     LIRU14_SHIDX.store(if secs >= 120 { idx } else { u32::MAX - 1 }, Relaxed);
+    LIRU14_LATE.store(secs >= 120, Relaxed);
     match secs {
         133..153 => idx == 12,
         _ => false,
@@ -573,6 +574,8 @@ fn liru14_skip(regs: &Regs) -> bool {
 }
 
 static LIRU14_SHIDX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+static LIRU14_LATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LIRU14_CB8: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn liru14_phase(regs: &Regs) -> u8 {
     static ZETA: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -1068,11 +1071,20 @@ impl VulkanRasterizer {
                 }
             }
             crate::pipeline::environment::LIRU14_DRAW.set(false);
-            if liru14_idx == 12 || shirt {
+            let cb8 = self.draw.stages[0]
+                .as_ref()
+                .filter(|m| m.info.constant_buffer_mask & (1 << 8) != 0)
+                .map_or(0, |_| ctx.const_buffers[0][8].address);
+            if liru14_idx == 12 {
+                LIRU14_CB8.store(cb8, std::sync::atomic::Ordering::Relaxed);
+            }
+            let same_bones = liru14_idx != 12
+                && cb8 != 0
+                && LIRU14_LATE.load(std::sync::atomic::Ordering::Relaxed)
+                && cb8 == LIRU14_CB8.load(std::sync::atomic::Ordering::Relaxed);
+            if liru14_idx == 12 || same_bones {
                 static V: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                static VS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                let budget = if shirt { &VS } else { &V };
-                if budget.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 30 {
+                if V.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 120 {
                     let vs = self.draw.stages[0].as_ref();
                     let streams: Vec<_> = regs
                         .vertex_streams
@@ -1098,7 +1110,7 @@ impl VulkanRasterizer {
                     eprintln!(
                         "LIRU14 vdata secs={:?} who={} fs={:x} vs={:x} ib={:#x} ifmt={:?} streams={streams:?} cb={cb:?} ssbo={} global={} attribs={attribs:?}",
                         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() % 100_000).unwrap_or(0),
-                        if shirt { "shirt" } else { "caster12" },
+                        if liru14_idx == 12 { "caster12".to_string() } else { format!("other zeta={:#x} idx={liru14_idx}", regs.zeta.address()) },
                         self.draw.stages[4].as_ref().map_or(0, |m| m.hash),
                         vs.map_or(0, |m| m.hash),
                         regs.index_buffer.start_addr(),
