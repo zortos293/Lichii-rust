@@ -1024,6 +1024,7 @@ Dump prod.keys and title.keys \
         self.poll_install();
         self.check_exit();
         self.sync_guest_input();
+        self.report_frame_rate();
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + MINIMIZED_POLL));
     }
 
@@ -1072,8 +1073,8 @@ Dump prod.keys and title.keys \
         }
         self.sync_guest_input();
 
+        self.report_frame_rate();
         let running = self.session.as_ref().is_some_and(|s| !s.is_paused());
-        self.report_frame_rate(running);
         let delay = output
             .viewport_output
             .get(&egui::ViewportId::ROOT)
@@ -1095,7 +1096,9 @@ Dump prod.keys and title.keys \
 
     /// Puts the game frame rate in the window title once a second, and logs it every
     /// [`FPS_LOG_PERIOD`] averaged over that period, so a run can be read without its window.
-    fn report_frame_rate(&mut self, running: bool) {
+    /// Minimized windows keep reporting: the title may still be running.
+    fn report_frame_rate(&mut self) {
+        let running = self.session.as_ref().is_some_and(|s| !s.is_paused());
         let now = Instant::now();
         if now < self.next_title_fps {
             return;
@@ -1115,7 +1118,7 @@ Dump prod.keys and title.keys \
         }
         self.next_fps_log = now + FPS_LOG_PERIOD;
         tracing::info!(
-            game_fps = (average_fps(&snap.game_frame_times_ms) * 10.0).round() / 10.0,
+            game_fps = snap.game_frame_times_ms.len() as f32 / FPS_LOG_PERIOD.as_secs_f32(),
             speed_pct = (snap.emulation_speed * 100.0).round() as u32,
             host_fps = snap.fps,
             "frame rate"
@@ -1165,16 +1168,6 @@ Dump prod.keys and title.keys \
         self.display = Some(display);
         self.window = Some(window);
         Ok(())
-    }
-}
-
-/// Frames per second over consecutive frame-to-frame times; 0 without any.
-fn average_fps(frame_times_ms: &[f32]) -> f32 {
-    let total: f32 = frame_times_ms.iter().sum();
-    if total > 0.0 {
-        frame_times_ms.len() as f32 * 1000.0 / total
-    } else {
-        0.0
     }
 }
 
@@ -1316,17 +1309,5 @@ impl ApplicationHandler<UserEvent> for App {
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.session = None;
         self.save_settings();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn average_fps_is_frames_over_their_total_time() {
-        assert!((average_fps(&[33.3; 10]) - 30.0).abs() < 0.1);
-        assert!((average_fps(&[16.0, 17.4, 16.6]) - 60.0).abs() < 0.1);
-        assert_eq!(average_fps(&[]), 0.0);
     }
 }
