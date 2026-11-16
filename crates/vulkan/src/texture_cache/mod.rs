@@ -553,6 +553,7 @@ struct LookupKey {
     usage: Usage,
 }
 
+pub(crate) fn diag_window() -> bool { static T: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new(); let e = T.get_or_init(std::time::Instant::now).elapsed().as_secs_f32(); (150.0..151.5).contains(&e) }
 thread_local! { pub(super) static SYNC_CTX: std::cell::Cell<&'static str> = const { std::cell::Cell::new("?") }; }
 
 /// What a lookup is for, which decides what an image may stand in for it.
@@ -1317,7 +1318,7 @@ impl TextureCache {
             image.current = tick;
         }
         if matches!((info.width, info.height), (2560, 1440) | (1280, 720)) {
-            if { static T: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new(); let e = T.get_or_init(std::time::Instant::now).elapsed().as_secs_f32(); (150.0..151.5).contains(&e) } {
+            if diag_window() {
                 let image = self.get(found.id).expect("a live image id");
                 tracing::info!("tgtdiag bind {}x{} {:?} id={} discard={} whole={} tick={} current={} modified={} overlaps_newest={}", info.width, info.height, info.format, found.id.index, discard, whole, self.tick, image.current, image.modified, image.overlaps_newest);
             }
