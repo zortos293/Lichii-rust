@@ -2,6 +2,8 @@
 //! bilinear filtered, for formats the host blits as they are, or a gather of raw texels at the engine's own nearest sample
 //! positions, which `vkCmdBlitImage` can't reproduce.
 
+thread_local! { pub static WHY: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) }; }
+pub fn why(s: String) { WHY.with(|w| *w.borrow_mut() = s); }
 use ash::vk;
 use lichii_common::GpuVAddr;
 use lichii_gpu::gmmu::{Gmmu, RangeTarget};
@@ -122,6 +124,7 @@ impl TextureCache {
             || !self.blittable(src.info.format, src_host, dst.info.format, dst_host)
             || (filter == vk::Filter::LINEAR && !self.filterable(src.info.format, src_host))
         {
+            why(format!("fmt kind={:?}/{:?} blittable={} filterable={} src_host={:?} dst_host={:?}", src.info.kind, dst.info.kind, self.blittable(src.info.format, src_host, dst.info.format, dst_host), self.filterable(src.info.format, src_host), src_host.format, dst_host.format));
             return Ok(false);
         }
         let Some((source, target)) = self.blit_images(tx, gmmu, src.gpu_va, &src.info, dst)? else {
@@ -131,6 +134,7 @@ impl TextureCache {
             self.blit_offsets(source, src.info.format, src.rect),
             self.blit_offsets(target, dst.info.format, dst.rect),
         ) else {
+            why(format!("offsets src_rect={:?} dst_rect={:?}", src.rect, dst.rect));
             return Ok(false);
         };
         let device = self.device.clone();
@@ -363,17 +367,21 @@ impl TextureCache {
         dst: &BlitSide,
     ) -> Result<Option<(Found, Found)>> {
         if !self.gpu_holds(gmmu, src_va, src.size_bytes()) {
+            why("src not gpu-modified".into());
             return Ok(None);
         }
         let Some(source) = self.find(tx, gmmu, src_va, src)? else {
+            why("src find none".into());
             return Ok(None);
         };
         let Some(target) =
             self.lookup_or_create(tx, gmmu, dst.gpu_va, &dst.info, Usage::Transfer)?
         else {
+            why("dst lookup none".into());
             return Ok(None);
         };
         if source.id == target.id {
+            why(format!("same image level {} -> {}", source.level, target.level));
             return Ok(None);
         }
         let whole = dst.rect == [0, 0, dst.info.width as i32, dst.info.height as i32];

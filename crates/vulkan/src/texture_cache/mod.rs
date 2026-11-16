@@ -28,7 +28,7 @@
 //! and reach guest memory before they go.
 
 mod astc;
-mod blit;
+pub mod blit;
 mod clear;
 mod convert;
 mod dma;

@@ -1091,6 +1091,9 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn accelerate_blit(&mut self, _channel: ChannelId, memory: &Gmmu, blit: &Blit) -> bool {
+        crate::texture_cache::blit::why("rasterizer".into());
+        #[allow(clippy::redundant_closure_call)]
+        let done = (|| {
         if blit.operation != BlitOperation::SrcCopy {
             return false;
         }
@@ -1098,7 +1101,7 @@ impl Rasterizer for VulkanRasterizer {
             Some(rects) => (Some(rects), vk::Filter::NEAREST),
             None if blit.linear_filter => match filtered_rects(blit) {
                 Some(rects) => (Some(rects), vk::Filter::LINEAR),
-                None => return false,
+                None => { crate::texture_cache::blit::why("filtered_rects none".into()); return false },
             },
             None => (None, vk::Filter::NEAREST),
         };
@@ -1166,6 +1169,9 @@ impl Rasterizer for VulkanRasterizer {
                 false
             }
         }
+        })();
+        blit_diag::record(blit, done);
+        done
     }
 
     fn accelerate_image_copy(
@@ -2816,5 +2822,41 @@ mod tests {
             "the read lands the target's texels: {texel:?}"
         );
         f.assert_no_validation_errors();
+    }
+}
+
+mod blit_diag {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    use lichii_gpu::backend::Blit;
+
+    static STATE: Mutex<Option<(Instant, HashMap<String, u64>)>> = Mutex::new(None);
+
+    pub(super) fn record(blit: &Blit, done: bool) {
+        let unit = (1u64 << 32) as f64;
+        let why = if done { String::new() } else { crate::texture_cache::blit::WHY.with(|w| w.borrow().clone()) };
+        let key = format!(
+            "gpu={done} op={:?} linear={} {:?}->{:?} x0={:.3} y0={:.3} du={:.3} dv={:.3} src={}x{} p={} blk={:?} @{:x} dst={}x{}+{}+{} {}x{} p={} blk={:?} @{:x} why=[{why}]",
+            blit.operation, blit.linear_filter, blit.src_format, blit.dst_format,
+            blit.src_x0 as f64 / unit, blit.src_y0 as f64 / unit,
+            blit.du_dx as f64 / unit, blit.dv_dy as f64 / unit,
+            blit.src.width, blit.src.height, blit.src.pitch, blit.src.block, blit.src.address & 0xfff,
+            blit.dst_width, blit.dst_height, blit.dst_x0, blit.dst_y0,
+            blit.dst.width, blit.dst.height, blit.dst.pitch, blit.dst.block, blit.dst.address & 0xfff,
+        );
+        let mut state = STATE.lock().unwrap();
+        let (since, counts) = state.get_or_insert_with(|| (Instant::now(), HashMap::new()));
+        *counts.entry(key).or_default() += 1;
+        if since.elapsed().as_secs() >= 5 {
+            let mut all: Vec<_> = counts.drain().collect();
+            all.sort_by(|a, b| b.1.cmp(&a.1));
+            tracing::warn!("blit diag batch keys={} total={} sw={}", all.len(), all.iter().map(|k| k.1).sum::<u64>(), all.iter().filter(|k| k.0.starts_with("gpu=false")).map(|k| k.1).sum::<u64>());
+            for (key, n) in all.iter().take(14) {
+                tracing::warn!("blit diag {n} {key}");
+            }
+            *since = Instant::now();
+        }
     }
 }
