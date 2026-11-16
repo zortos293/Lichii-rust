@@ -74,8 +74,12 @@ const MAX_TEXELS: u64 = 1 << 28;
 /// Host bytes over which a sampled mip chain keeps only its smaller levels on the host
 /// (Mario Kart World's 8192x8192x68 terrain arrays: 23 GB each as decoded ASTC).
 const TRIM_ABOVE: u64 = 1 << 30;
-/// Host bytes the levels a trimmed chain keeps fit in.
-const TRIM_TO: u64 = 512 << 20;
+/// The share of device-local memory the levels a trimmed chain keeps fit in, within
+/// [`TRIM_TO_MIN`] and [`TRIM_TO_MAX`]: on a 10 GB card with ASTC decoded to RGBA8, 512 MiB per
+/// array (three in Mario Kart World's courses) ran the device out of memory.
+const TRIM_TO_SHARE: u64 = 32;
+const TRIM_TO_MIN: u64 = 128 << 20;
+const TRIM_TO_MAX: u64 = 512 << 20;
 /// Device memory one sparse image may bind by default; writes to subresources past it are
 /// dropped.
 const SPARSE_IMAGE_CAP: u64 = 2 << 30;
@@ -615,7 +619,7 @@ pub struct TextureCache {
     sparse_capped: bool,
     /// Device memory one sparse image may bind.
     sparse_cap: u64,
-    /// [`TRIM_ABOVE`] and [`TRIM_TO`].
+    /// [`TRIM_ABOVE`], and the bytes from [`TRIM_TO_SHARE`] of device-local memory.
     trim_above: u64,
     trim_to: u64,
     keep: Vec<(DAddr, DAddr)>,
@@ -847,6 +851,34 @@ fn fill_unmapped(segments: &[Segment], offset: u64, out: &mut [u8], block: &[u8;
     }
 }
 
+/// Calls `changed` with each range of image bytes that `old` and `new` map differently: to
+/// another device address, or mapped in one and not the other. Both are sorted by offset.
+fn remapped_bytes(old: &[Segment], new: &[Segment], mut changed: impl FnMut(u64, u64)) {
+    let (mut i, mut j, mut at) = (0, 0, 0);
+    loop {
+        while old.get(i).is_some_and(|s| s.offset + s.size <= at) {
+            i += 1;
+        }
+        while new.get(j).is_some_and(|s| s.offset + s.size <= at) {
+            j += 1;
+        }
+        let edge = |s: Option<&Segment>| match s {
+            None => (u64::MAX, None),
+            Some(s) if s.offset > at => (s.offset, None),
+            Some(s) => (s.offset + s.size, Some(s.daddr + (at - s.offset))),
+        };
+        let ((a, from), (b, to)) = (edge(old.get(i)), edge(new.get(j)));
+        let next = a.min(b);
+        if next == u64::MAX {
+            return;
+        }
+        if from != to {
+            changed(at, next);
+        }
+        at = next;
+    }
+}
+
 /// Writes guest bytes of an image, except those at device addresses in `keep`; bytes over
 /// unmapped gaps are dropped, and blocks of lazy device ranges get memory.
 fn write_guest(
@@ -952,7 +984,8 @@ impl TextureCache {
             sparse_capped: false,
             sparse_cap: SPARSE_IMAGE_CAP,
             trim_above: TRIM_ABOVE,
-            trim_to: TRIM_TO,
+            trim_to: (device.memory_usage().device_local / TRIM_TO_SHARE)
+                .clamp(TRIM_TO_MIN, TRIM_TO_MAX),
             keep: Vec::new(),
             segments: Vec::new(),
             scratch: Scratch::default(),
@@ -1892,7 +1925,8 @@ impl TextureCache {
     }
 
     /// The first guest level the host keeps of an image sampled as `info`: 0, or for a mip
-    /// chain over [`TRIM_ABOVE`] host bytes, the first level whose chain fits in [`TRIM_TO`].
+    /// chain over [`TRIM_ABOVE`] host bytes, the first level whose chain fits in the share of
+    /// device memory [`TRIM_TO_SHARE`] sets.
     /// Sampling still addresses the levels by normalized coordinates and derivatives; an
     /// explicit LOD lands `trim` levels coarser.
     fn host_level_offset(&mut self, info: &ImageInfo) -> u32 {
@@ -2511,12 +2545,7 @@ impl TextureCache {
         }
         let image = self.image(id);
         image.tracked.clear();
-        for s in old.iter().filter(|s| !segments.contains(s)) {
-            image.mark_bytes_dirty(s.offset, s.offset + s.size);
-        }
-        for s in segments.iter().filter(|s| !old.contains(s)) {
-            image.mark_bytes_dirty(s.offset, s.offset + s.size);
-        }
+        remapped_bytes(&old, &segments, |lo, hi| image.mark_bytes_dirty(lo, hi));
     }
 
     fn remove(&mut self, scheduler: &mut Scheduler, id: ImageId) {

@@ -3810,3 +3810,28 @@ fn sampled_arrays_whose_leading_pages_are_sparse_read_zero_there() {
         f.assert_no_validation_errors();
     }
 }
+
+#[test]
+fn a_remap_dirties_only_the_bytes_whose_mapping_changed() {
+    let seg = |offset, daddr, size| Segment {
+        offset,
+        daddr,
+        size,
+    };
+    let old = [
+        seg(0, 0x1000, 100),
+        seg(200, 0x5000, 100),
+        seg(400, 0x9000, 50),
+    ];
+    let new = [
+        seg(0, 0x1000, 150),
+        seg(200, 0x7000, 100),
+        seg(400, 0x9000, 50),
+    ];
+    let mut changed = Vec::new();
+    remapped_bytes(&old, &new, |lo, hi| changed.push((lo, hi)));
+    assert_eq!(changed, [(100, 150), (200, 300)]);
+    changed.clear();
+    remapped_bytes(&new, &old[..1], |lo, hi| changed.push((lo, hi)));
+    assert_eq!(changed, [(100, 150), (200, 300), (400, 450)]);
+}
