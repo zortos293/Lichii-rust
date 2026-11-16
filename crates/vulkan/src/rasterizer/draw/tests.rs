@@ -4572,3 +4572,46 @@ fn indirect_task_draws_launch_the_mesh_workgroups_their_tasks_count() {
     assert_eq!(mesh_stages(&f), TASK_STAGES);
     f.assert_no_validation_errors();
 }
+
+#[test]
+fn fragment_stages_read_what_a_passthrough_geometry_stage_passes_through() {
+    use lichii_shader::ir::Attribute;
+    use lichii_shader::{ResourceLayout, ShaderInfo, ShaderModule};
+
+    let mut info = ShaderInfo::default();
+    info.stores.set(Attribute::LAYER, true);
+    for component in 0..4 {
+        info.passthrough
+            .set(Attribute::POSITION_X.offset(component), true);
+        info.passthrough.set(Attribute::generic(3, component), true);
+    }
+    let geometry = ShaderModule {
+        spirv: Vec::new(),
+        hash: 1,
+        stage: ShaderStage::Geometry,
+        resources: ResourceLayout::default(),
+        info,
+    };
+    let state = |previous: &ShaderModule| {
+        super::StageState::new(
+            &draw_regs(),
+            5,
+            false,
+            Some(previous),
+            vk::PrimitiveTopology::TRIANGLE_LIST,
+            [lichii_shader::runtime::AttributeType::Float; 8],
+            &Default::default(),
+        )
+    };
+    let runtime = state(&geometry).runtime(Some(&geometry.info));
+    assert!(runtime.previous_stage_stores.generic(3));
+    assert!(runtime.previous_stage_stores.get(Attribute::LAYER));
+    assert!(!runtime.previous_stage_stores.generic(2));
+    let mut storing = geometry.clone();
+    storing.info.passthrough = Default::default();
+    assert_ne!(
+        state(&geometry).key(),
+        state(&storing).key(),
+        "the fragment module is keyed by what passes through"
+    );
+}

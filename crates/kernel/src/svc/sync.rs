@@ -121,15 +121,15 @@ pub(super) fn wait_synchronization(svc: &mut SvcContext) -> Flow {
             .and_then(KObject::sync)
             .expect("waitable")
     };
+    if svc.thread.termination_requested() {
+        return svc.finish(Err(result::TERMINATION_REQUESTED));
+    }
+    if let Some(i) = (0..count).find(|&i| sync(i).is_signaled()) {
+        svc.set(1, i as u64);
+        return svc.finish(Ok(()));
+    }
     if timeout == 0 {
-        let signaled = (0..count).find(|&i| sync(i).is_signaled());
-        return match signaled {
-            Some(i) => {
-                svc.set(1, i as u64);
-                svc.finish(Ok(()))
-            }
-            None => svc.finish(Err(result::TIMED_OUT)),
-        };
+        return svc.finish(Err(result::TIMED_OUT));
     }
     let token = match svc.thread.begin_wait(Resume::ResultAndIndex, true) {
         Ok(token) => token,
