@@ -433,9 +433,7 @@ impl TextureCache {
         });
         self.collect_overlaps(&ranges);
         self.segments = ranges;
-        self.ids
-            .iter()
-            .any(|&id| self.get(id).is_some_and(&pick))
+        self.ids.iter().any(|&id| self.get(id).is_some_and(&pick))
     }
 
     /// Whether `vkCmdBlitImage` turns `src` texels into `dst` ones as the guest does: host

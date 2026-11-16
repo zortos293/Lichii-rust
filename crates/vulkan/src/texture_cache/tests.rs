@@ -2290,7 +2290,10 @@ fn guest_data_blits_into_a_cached_image_on_the_gpu() {
             vk::Filter::NEAREST,
         )
         .unwrap();
-    assert!(blitted, "the GPU reads the target, so the source uploads once");
+    assert!(
+        blitted,
+        "the GPU reads the target, so the source uploads once"
+    );
     assert_eq!(f.read_image(target.id)[0], nearest_halving(&data[0]));
     f.assert_no_validation_errors();
 }
