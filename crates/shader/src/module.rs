@@ -52,6 +52,19 @@ fn finish(
     program.hash.hash(&mut hasher);
     format!("{runtime:?}").hash(&mut hasher);
     incoming.hash(&mut hasher);
+    if let Some(dir) = std::env::var_os("LIRU14_DUMP_DIR")
+        && program.stage == ShaderStage::Fragment
+    {
+        let dir = std::path::PathBuf::from(dir);
+        let name = format!("fs-{:016x}", hasher.clone().finish());
+        let _ = std::fs::write(dir.join(format!("{name}.ir")), program.ir.dump());
+        let _ = std::fs::write(
+            dir.join(format!("{name}.info")),
+            format!("{:#?}\n{runtime:#?}", program.info),
+        );
+        let bytes: Vec<u8> = spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let _ = std::fs::write(dir.join(format!("{name}.spv")), bytes);
+    }
     Ok(ShaderModule {
         spirv,
         hash: hasher.finish(),
