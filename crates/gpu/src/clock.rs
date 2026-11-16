@@ -13,6 +13,16 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use lichii_common::settings::GpuClock;
 
+/// Whether a Switch 2 title keeps GPU tick timestamps instead of nanoseconds. Mario Kart World
+/// sizes its dynamic resolution from GPU timestamps: with nanoseconds the emulator's GPU latency
+/// reads as a nearly full frame budget, the resolution changes every few frames, and each change
+/// recreates its render targets.
+pub fn keeps_tick_timestamps(program_id: u64) -> bool {
+    program_id == MARIO_KART_WORLD
+}
+
+const MARIO_KART_WORLD: u64 = 0x0400_c3f0_0006_e000;
+
 /// Guest time, as core timing keeps it.
 pub trait GuestTime: Send + Sync {
     /// Nanoseconds of guest time since boot.
@@ -79,7 +89,7 @@ pub struct GpuTimestamp {
 }
 
 impl GpuTimestamp {
-    /// A clock for Switch 2 titles when `ampere`, Switch 1 titles otherwise.
+    /// A nanosecond clock when `ampere`, the Maxwell tick clock otherwise.
     pub fn new(time: Arc<dyn GuestTime>, ampere: bool) -> Self {
         Self {
             time,
@@ -187,6 +197,13 @@ mod tests {
         assert_eq!(clock.now(), 618_000_000);
         time.0.store(4_000_000_000, Ordering::Relaxed);
         assert_eq!(clock.now(), 618_000_000 + 614_400_000);
+    }
+
+    #[test]
+    fn only_mario_kart_world_keeps_tick_timestamps() {
+        assert!(keeps_tick_timestamps(0x0400_c3f0_0006_e000));
+        assert!(!keeps_tick_timestamps(0));
+        assert!(!keeps_tick_timestamps(0x0400_4860_24de_c000));
     }
 
     #[test]
