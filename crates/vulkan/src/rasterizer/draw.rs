@@ -565,12 +565,11 @@ fn liru14_skip(regs: &Regs) -> bool {
         return false;
     }
     let idx = RUN.fetch_add(1, Relaxed);
-    let bit = match secs {
-        133..183 => (secs - 133) / 5,
-        _ => return false,
-    };
-    idx & (1 << bit) != 0
+    LIRU14_SHIDX.store(idx, Relaxed);
+    matches!(secs, 133..153) && idx == 16
 }
+
+static LIRU14_SHIDX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 
 fn liru14_phase(regs: &Regs) -> u8 {
     static ZETA: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -889,8 +888,22 @@ impl VulkanRasterizer {
             FixedStateTracker::register_dirty_flags(ctx.dirty);
         }
         let regs = ctx.regs;
+        LIRU14_SHIDX.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
         if liru14_skip(regs) {
             return Ok(());
+        }
+        let liru14_idx = LIRU14_SHIDX.load(std::sync::atomic::Ordering::Relaxed);
+        if (14..=18).contains(&liru14_idx) {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 60 {
+                match &call {
+                    DrawCall::Direct(p) => eprintln!(
+                        "LIRU14 caster idx={liru14_idx} direct topo={:?} indexed={} first={} count={} base_vertex={} instances={} inline={}",
+                        p.topology, p.indexed, p.first, p.count, p.base_vertex, p.instance_count, p.inline_indices.is_some()
+                    ),
+                    DrawCall::Indirect(p) => eprintln!("LIRU14 caster idx={liru14_idx} indirect {p:?}"),
+                }
+            }
         }
         static LIRU14_RT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
         static LIRU14_RT_LOGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1052,6 +1065,22 @@ impl VulkanRasterizer {
                 }
             }
             crate::pipeline::environment::LIRU14_DRAW.set(false);
+            if (14..=18).contains(&liru14_idx) {
+                static M: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if M.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 60 {
+                    eprintln!(
+                        "LIRU14 caster idx={liru14_idx} stages={:x?} tex={:?} cull_on={} cull={:?} rt_count={} cw={:#x} alpha_test={} vb0={:#x}",
+                        self.draw.stages.iter().map(|m| m.as_ref().map_or(0, |m| m.hash)).collect::<Vec<_>>(),
+                        self.draw.stages[4].as_ref().map(|m| m.info.texture_descriptors.iter().map(|t| (t.handle.cbuf_index, t.handle.cbuf_offset)).collect::<Vec<_>>()),
+                        regs.gl_cull_test_enabled,
+                        regs.gl_cull_face,
+                        regs.rt_control.count(),
+                        regs.color_mask[0].0,
+                        regs.alpha_test_enabled,
+                        regs.vertex_streams[0].address()
+                    );
+                }
+            }
             if shirt {
                 eprintln!(
                     "LIRU14 shirt ids textures={:?} depth={:?} colors={:?}",
