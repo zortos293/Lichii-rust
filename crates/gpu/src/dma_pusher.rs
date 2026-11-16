@@ -157,9 +157,11 @@ struct BackMacros {
     owned: MethodSet,
     /// The code generation of the 3D macros the back holds for this channel.
     code: Option<u64>,
-    /// Start addresses whose calls run on the front, for code generation `refused_generation`.
+    /// Start addresses whose calls run on the front, and those that ran on the back, for code
+    /// generation `generation`.
     refused: Vec<u32>,
-    refused_generation: u64,
+    sent: Vec<u32>,
+    generation: u64,
     /// What the shadow run being made changed, to undo it.
     undo: Vec<Undo>,
 }
@@ -177,7 +179,8 @@ impl BackMacros {
             owned: MethodSet::empty(),
             code: None,
             refused: Vec::new(),
-            refused_generation: 0,
+            sent: Vec::new(),
+            generation: 0,
             undo: Vec::new(),
         }
     }
@@ -198,9 +201,10 @@ impl BackMacros {
             return false;
         }
         let generation = engine.code_generation();
-        if self.refused_generation != generation {
+        if self.generation != generation {
             self.refused.clear();
-            self.refused_generation = generation;
+            self.sent.clear();
+            self.generation = generation;
         }
         let start = engine.start_of(call.method);
         if self.refused.contains(&start) {
@@ -231,7 +235,7 @@ impl BackMacros {
                         MacroErrorKind::DependsOnRead | MacroErrorKind::UsesDataRam
                     )
                 {
-                    tracing::debug!(%error, "macro reads memory and runs on the front");
+                    tracing::info!(%error, "3D macro reads memory and runs on the front");
                     self.refused.push(start);
                 }
                 self.undo(graphics);
@@ -241,6 +245,10 @@ impl BackMacros {
         if let Some(code) = code {
             stream.side(SideCommand::MacroCode(Box::new(code)));
             self.code = Some(generation);
+        }
+        if !self.sent.contains(&start) {
+            self.sent.push(start);
+            tracing::info!(start, "3D macro reads memory and runs on the back");
         }
         stream.macro_call(EngineKind::Maxwell3d, start, &call.parameters);
         true
@@ -268,10 +276,14 @@ fn back_owned(owned: &MethodSet, method: u32) -> bool {
 #[cold]
 fn fetch_back_owned(graphics: &mut RegisterState, owned: &mut MethodSet, stream: &mut Stream) {
     let methods = owned.take();
-    tracing::debug!(
-        ?methods,
-        "front fetches registers a macro on the back wrote"
-    );
+    static FETCHES: crate::throttle::Throttle = crate::throttle::Throttle::new();
+    if let Some(dropped) = FETCHES.allow() {
+        tracing::info!(
+            ?methods,
+            dropped,
+            "front fetches registers a macro on the back wrote"
+        );
+    }
     let (reply, values) = std::sync::mpsc::sync_channel(1);
     stream.side(SideCommand::Registers(methods, reply));
     stream.drain();
