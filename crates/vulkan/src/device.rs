@@ -132,6 +132,7 @@ pub struct DeviceFeatures {
     pub storage_buffer_16bit: bool,
     pub uniform_and_storage_buffer_16bit: bool,
     pub demote_to_helper_invocation: bool,
+    pub subgroup_size_control: bool,
 }
 
 /// Facts about the physical device the renderer needs at run time.
@@ -503,6 +504,7 @@ impl Device {
             storage_buffer_16bit: on(v11.storage_buffer16_bit_access),
             uniform_and_storage_buffer_16bit: on(v11.uniform_and_storage_buffer16_bit_access),
             demote_to_helper_invocation: on(v13.shader_demote_to_helper_invocation),
+            subgroup_size_control: on(v13.subgroup_size_control),
         };
 
         let aftermath = crate::debug::aftermath::get().is_some()
@@ -552,12 +554,14 @@ impl Device {
 
         let mut v11_properties = vk::PhysicalDeviceVulkan11Properties::default();
         let mut v12_properties = vk::PhysicalDeviceVulkan12Properties::default();
+        let mut v13_properties = vk::PhysicalDeviceVulkan13Properties::default();
         let mut mesh_properties = vk::PhysicalDeviceMeshShaderPropertiesEXT::default();
         let mut library_properties =
             vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT::default();
         let mut properties2 = vk::PhysicalDeviceProperties2::default()
             .push_next(&mut v11_properties)
-            .push_next(&mut v12_properties);
+            .push_next(&mut v12_properties)
+            .push_next(&mut v13_properties);
         if features.mesh_shader {
             properties2 = properties2.push_next(&mut mesh_properties);
         }
@@ -581,6 +585,7 @@ impl Device {
                 limits: &base.limits,
                 vulkan11: &v11_properties,
                 vulkan12: &v12_properties,
+                vulkan13: &v13_properties,
             },
         );
         let properties = DeviceProperties {
@@ -610,6 +615,11 @@ impl Device {
             vk::api_version_major(properties.api_version),
             vk::api_version_minor(properties.api_version),
             vk::api_version_patch(properties.api_version),
+        );
+        tracing::info!(
+            "subgroups: {} lanes, guest warp native in stages {:#x}",
+            v11_properties.subgroup_size,
+            shader_profile.guest_warp_stages,
         );
 
         let allocator = Allocator::new(&AllocatorCreateDesc {

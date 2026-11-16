@@ -422,6 +422,18 @@ impl ShaderInfo {
     pub const MAX_CBUFS: usize = 18;
     pub const MAX_INDIRECT_CBUFS: usize = 14;
     pub const MAX_SSBOS: usize = 64;
+
+    /// The program observes the 32-lane guest warp: votes, ballots, shuffles, lane ids, or a
+    /// divergent barrier whose removal relies on the warp running in step.
+    pub fn uses_warp_size(&self) -> bool {
+        self.uses_subgroup_vote
+            || self.uses_subgroup_mask
+            || self.uses_subgroup_invocation_id
+            || self.uses_subgroup_shuffles
+            || self.uses_quad_shuffles
+            || self.uses_fswzadd
+            || self.removed_conditional_barrier
+    }
 }
 
 /// Pixel format of a texture descriptor (TIC), as far as translation cares.

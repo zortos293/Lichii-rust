@@ -773,6 +773,34 @@ fn warp_operations_on_native_and_emulated_subgroups() {
 }
 
 #[test]
+fn guest_warp_stages_emit_native_warp_operations_on_wide_hosts() {
+    let program = warp_program(true);
+    let compute = 1 << ShaderStage::Compute as u32;
+    let wide = Profile {
+        warp_size_potentially_larger_than_guest: true,
+        max_subgroup_size: 64,
+        guest_warp_stages: compute,
+        ..Profile::default()
+    };
+    let module = emit("warp_guest", &wide, &RuntimeInfo::default(), &program);
+    assert_eq!(count_ops(&module, Op::GroupNonUniformAll), 1);
+    assert_eq!(count_ops(&module, Op::VectorExtractDynamic), 2);
+
+    let other_stage = Profile {
+        guest_warp_stages: !compute,
+        ..wide
+    };
+    let module = emit(
+        "warp_other",
+        &other_stage,
+        &RuntimeInfo::default(),
+        &program,
+    );
+    assert_eq!(count_ops(&module, Op::GroupNonUniformAll), 0);
+    assert!(count_ops(&module, Op::VectorExtractDynamic) > 2);
+}
+
+#[test]
 fn quad_shuffles_without_host_quad_support_define_the_invocation_id() {
     let mut s = Synthetic::new();
     let (b, x) = compute_block(&mut s);
