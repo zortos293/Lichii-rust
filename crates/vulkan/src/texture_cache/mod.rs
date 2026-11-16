@@ -553,9 +553,12 @@ struct LookupKey {
 
 /// What a lookup is for, which decides what an image may stand in for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum Usage {
+pub enum Usage {
     /// Sampled: an image too big for the host keeps only its smaller levels there.
     Sample,
+    /// Bound as a storage image: loads and stores address texels of a level, so the image
+    /// keeps every level.
+    Storage,
     /// Rendered into: a single slice resolves into the volume it is a slice of.
     Target,
     /// Copied to or from by level and array layer.
@@ -1219,11 +1222,12 @@ impl TextureCache {
         tx: &mut Transfer<'_>,
         gmmu: &Gmmu,
         desc: &TextureDescriptor,
+        usage: Usage,
     ) -> Result<Option<(ImageId, ViewInfo)>> {
         let Some(info) = ImageInfo::from_texture(desc, self.gob_layout) else {
             return Ok(None);
         };
-        let Some(found) = self.find_for(tx, gmmu, desc.address, &info, Usage::Sample)? else {
+        let Some(found) = self.find_for(tx, gmmu, desc.address, &info, usage)? else {
             return Ok(None);
         };
         let scale = self.image(found.id).scale;
@@ -2267,7 +2271,9 @@ impl TextureCache {
         for i in 0..self.ids.len() {
             let id = self.ids[i];
             let image = self.get(id).expect("a live image id");
-            let moved = image.sparse_va == Some(gpu_va) && image.segments != self.segments;
+            let moved = image.sparse_va == Some(gpu_va)
+                && image.segments != self.segments
+                && image.info.same_layout(info);
             let candidate = if image.trim > 0 && usage != Usage::Sample {
                 None
             } else if (image.segments == self.segments || moved) && image.info.same_layout(info) {
@@ -2574,8 +2580,18 @@ impl TextureCache {
 
     /// Moves an image over sparse pages onto the device pages its range maps now (`segments`):
     /// the subresources over pages that changed upload again, and the ones that went back to
-    /// sparse read as zero.
+    /// sparse read as zero. Images over the new pages (`ids`) become its overlaps, so newer
+    /// GPU writes there reach it on its next refresh.
     fn remap(&mut self, id: ImageId) {
+        let ids = std::mem::take(&mut self.ids);
+        for &other in &ids {
+            if other != id && !self.image(id).overlaps.contains(&other) {
+                self.image(other).overlaps.push(id);
+                self.image(id).overlaps.push(other);
+            }
+        }
+        self.ids = ids;
+        self.image(id).overlaps_newest = u64::MAX;
         let segments = self.segments.clone();
         let old = std::mem::replace(&mut self.image(id).segments, segments.clone());
         for s in &old {
