@@ -386,7 +386,8 @@ impl System {
         self.audio.set_host_volume(audio.volume, audio.muted);
     }
 
-    /// Sets how fast GPU work looks to the title; it takes effect at the next present.
+    /// Sets how fast GPU work looks to the title: Switch 2 titles see it from the next present,
+    /// Switch 1 titles at once, with timestamps continuing from their current value.
     pub fn set_gpu_clock(&self, clock: GpuClock) {
         self.gpu.handles().timestamp.set_speed(clock.into());
     }
