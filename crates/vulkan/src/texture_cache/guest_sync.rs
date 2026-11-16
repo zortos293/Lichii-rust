@@ -105,10 +105,19 @@ impl GuestSync {
 /// How `image` packs into guest words on the GPU, or `None` when the pass can't move it: only
 /// block-linear 2D images (or 3D ones one slice deep) at native scale whose texels are whole
 /// 32-bit words or pack whole into one, laid out as the guest's, D24S8 kept as the host's D24S8
-/// or D32S8 and mapped whole, or X8D24 kept as the host's X8D24 or D32.
+/// or D32S8 and mapped whole, or X8D24 kept as the host's X8D24 or D32. Rows that end inside
+/// a word need segments that share no device memory: alias trimming gives whole words to one
+/// source, which would drop an earlier alias's bytes in a partly written word.
 fn packing(image: &CachedImage) -> Option<Packing> {
     let info = &image.info;
     let bytes = info.format.bytes_per_block();
+    let partial_rows =
+        (0..info.levels).any(|level| !(info.level_extent(level).0 * bytes).is_multiple_of(4));
+    let aliased = image.segments.iter().enumerate().any(|(i, a)| {
+        image.segments[i + 1..]
+            .iter()
+            .any(|b| a.daddr < b.daddr + b.size && b.daddr < a.daddr + a.size)
+    });
     let shape = matches!(info.layout, GuestLayout::BlockLinear { .. })
         && image.scale == ResolutionScale::X1
         && image.trim == 0
@@ -121,7 +130,8 @@ fn packing(image: &CachedImage) -> Option<Packing> {
         && info.samples == 1
         && info.format.block_width() == 1
         && info.format.block_height() == 1
-        && (4 % bytes == 0 || bytes.is_multiple_of(4));
+        && (4 % bytes == 0 || bytes.is_multiple_of(4))
+        && !(partial_rows && aliased);
     if !shape {
         return None;
     }

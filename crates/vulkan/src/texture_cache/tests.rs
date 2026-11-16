@@ -2509,6 +2509,35 @@ fn gpu_overlap_syncs_give_aliased_bytes_to_the_last_source_page() {
 }
 
 #[test]
+fn aliased_sources_whose_rows_end_inside_a_word_write_back_through_guest_memory() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let info = rt_info(64, 64, 0, GobLayout::Tegra);
+    let mut bytes = rt_info(125, 64, 0, GobLayout::Tegra);
+    bytes.format = PixelFormat::R8Unorm;
+    assert_eq!(bytes.size_bytes(), 8 << 10);
+    let alias = GPU_VA + DRAM;
+    f.gmmu.map(alias, DADDR + 0x1000, 0x1000, 0, false).unwrap();
+    f.gmmu
+        .map(alias + 0x1000, DADDR + 0x1000, 0x1000, 0, false)
+        .unwrap();
+    let target = clear_rt(&mut f, &info, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    clear_rt_at(&mut f, alias, &bytes, [1.0, 0.0, 0.0, 0.0], Rect::ALL);
+    let before = f.cache.traffic();
+    let (mut tx, cache, gmmu) = f.tx();
+    let synced = cache
+        .render_target(&mut tx, gmmu, GPU_VA, &info, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(synced.id, target.id);
+    let after = f.cache.traffic();
+    assert_eq!(after.gpu_syncs, before.gpu_syncs, "no GPU sync");
+    assert!(after.downloads > before.downloads, "written back instead");
+    f.assert_no_validation_errors();
+}
+
+#[test]
 fn gpu_overlap_syncs_keep_texels_whose_later_alias_is_padding() {
     let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
         return;
