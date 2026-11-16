@@ -2859,9 +2859,14 @@ impl TextureCache {
     }
 
     /// Whether every overlap modified since `id` last held the shared bytes lays its texels out
-    /// on another grid (row width, block or tiling), so its bytes are no texels of `id`.
+    /// on another grid (row width, block or tiling), so its bytes are no texels of `id`. Like
+    /// the C++ cache's bad overlaps, only single-level images qualify: a smaller image can be a
+    /// level of a mip chain at another grid.
     fn newer_overlaps_reinterpret(&self, id: ImageId) -> bool {
         let image = self.get(id).expect("a live image id");
+        if image.info.levels != 1 {
+            return false;
+        }
         if image.overlaps_newest <= image.current {
             return true;
         }
@@ -2878,7 +2883,9 @@ impl TextureCache {
         let own = grid(&image.info);
         image.overlaps.iter().all(|&o| {
             let o = self.get(o).expect("overlaps are live");
-            o.image.is_sparse() || o.modified <= image.current || grid(&o.info) != own
+            o.image.is_sparse()
+                || o.modified <= image.current
+                || (o.info.levels == 1 && grid(&o.info) != own)
         })
     }
 
