@@ -29,7 +29,7 @@ use lichii_shader::backend::spirv::{
     RESCALING_LAYOUT_TEXTURES_OFFSET,
 };
 use lichii_shader::info::{
-    HandleSource, ImageDescriptor, StorageBufferDescriptor, TextureDescriptor,
+    HandleSource, ImageDescriptor, StorageBufferDescriptor, TextureDescriptor, VaryingState,
 };
 use lichii_shader::ir::{Attribute, ImageFormat, TextureType};
 use lichii_shader::maxwell::header::ProgramHeader;
@@ -719,11 +719,11 @@ impl StageState {
         }
         match previous {
             Some(previous) => {
-                info.previous_stage_stores = previous.stores;
+                info.previous_stage_stores = previous_stores(previous);
                 info.previous_stage_legacy_stores_mapping = previous.legacy_stores_mapping.clone();
                 info.per_primitive_generics = per_primitive_generics(previous);
             }
-            None => info.previous_stage_stores = lichii_shader::info::VaryingState([u64::MAX; 8]),
+            None => info.previous_stage_stores = VaryingState([u64::MAX; 8]),
         }
         info
     }
@@ -734,12 +734,21 @@ fn previous_outputs(info: &ShaderInfo) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = crate::pipeline::FxHasher::default();
     (
-        info.stores,
+        previous_stores(info),
         &info.legacy_stores_mapping,
         per_primitive_generics(info),
     )
         .hash(&mut hasher);
     hasher.finish()
+}
+
+/// The attributes the next stage can read from the stage `info` describes: those it stores,
+/// and those a passthrough geometry stage passes through, which a host running it natively
+/// never stores itself.
+fn previous_stores(info: &ShaderInfo) -> VaryingState {
+    VaryingState(std::array::from_fn(|i| {
+        info.stores.0[i] | info.passthrough.0[i]
+    }))
 }
 
 /// The generic outputs the previous stage writes per primitive, as a mask.

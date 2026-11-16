@@ -3272,7 +3272,7 @@ fn single_slice_volumes_of_a_deeper_block_sync_on_the_gpu() {
     header.0[4] = 31 | 2 << 23;
     let info = ImageInfo::from_texture(&header.decode().unwrap(), GobLayout::Tegra).unwrap();
     assert_eq!(info.kind, ImageKind::D3);
-    let pattern: Vec<u8> = (0..info.size_bytes())
+    let pattern: Vec<u8> = (0..info.surface().level_tiling(0).size_bytes())
         .map(|i| (i * 11 + i / 61) as u8)
         .collect();
     f.memory.write_bytes(DADDR, &pattern).unwrap();
@@ -3422,4 +3422,228 @@ fn cached_misses_end_when_an_image_is_created() {
         "the next lookup caches the miss again"
     );
     f.assert_no_validation_errors();
+}
+
+/// Mario Kart World's colour-grading LUTs: a 32x32x32 RGBA16F volume whose blocks are one GOB
+/// tall and 16 deep, rendered four draws of eight targets at a time, each target a single slice
+/// at the volume's base plus the slice's offset inside the 16-slice block.
+fn mkw_lut() -> TicEntry {
+    let mut header = tic(0x03, GPU_VA, 32, 32, 1, 1, 0);
+    header.0[0] = (header.0[0] & !(0xfff << 7)) | 7 << 7 | 7 << 10 | 7 << 13 | 7 << 16;
+    header.0[3] |= 4 << 6;
+    header.0[4] = 31 | 2 << 23;
+    header.0[5] = 31 | 31 << 16;
+    header
+}
+
+fn mkw_lut_slice(volume: bool, gob: GobLayout) -> ImageInfo {
+    use lichii_gpu::engines::maxwell_3d::regs::{RenderTargetConfig, TileMode};
+    let mut rt: RenderTargetConfig = bytemuck::Zeroable::zeroed();
+    rt.address_low = 0x10_0000;
+    rt.width = 32;
+    rt.height = 32;
+    rt.format = 0xca;
+    rt.tile_mode = TileMode(4 << 8 | u32::from(volume) << 16);
+    rt.bits.0 = 1;
+    ImageInfo::from_render_target(&rt, 0, gob).unwrap()
+}
+
+/// Renders every slice of the LUT as MKW does, eight targets resolved per draw before any is
+/// cleared, slice `z` to `[value(z), 0.5, 1 - value(z), 1]`.
+fn render_mkw_lut(
+    f: &mut Fixture,
+    volume: bool,
+    gob: GobLayout,
+    value: fn(u32) -> f32,
+) -> Vec<Found> {
+    let info = mkw_lut_slice(volume, gob);
+    let past_lut = GPU_VA + 0x4_0000;
+    f.gmmu
+        .map(past_lut, DADDR + (DRAM >> 1), 0x1_0000, 0, false)
+        .unwrap();
+    let mut founds = Vec::new();
+    for draw in 0..4 {
+        let (mut tx, cache, gmmu) = f.tx();
+        let targets: Vec<Found> = (0..8)
+            .map(|i| {
+                let z = draw * 8 + i;
+                let address = GPU_VA + u64::from(z / 16) * 0x2_0000 + u64::from(z % 16) * 0x200;
+                cache
+                    .render_target(&mut tx, gmmu, address, &info, false)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        for (i, &target) in targets.iter().enumerate() {
+            let z = draw * 8 + i as u32;
+            assert!(cache.state(target.id).is_some(), "slice {z}'s image died");
+            cache
+                .clear(
+                    &mut tx,
+                    target,
+                    ClearValue::Color {
+                        value: vk::ClearColorValue {
+                            float32: [value(z), 0.5, 1.0 - value(z), 1.0],
+                        },
+                        mask: vk::ColorComponentFlags::RGBA,
+                    },
+                    Rect::ALL,
+                    0,
+                    1,
+                )
+                .unwrap();
+        }
+        founds.extend(targets);
+    }
+    founds
+}
+
+/// The slices of the LUT that do not read back uniform at the value slice `z` was rendered.
+fn wrong_lut_slices(f: &mut Fixture, id: ImageId, value: fn(u32) -> f32) -> Vec<String> {
+    let texels = f.read_image(id).swap_remove(0);
+    let slice = 32 * 32 * 8;
+    assert_eq!(texels.len(), 32 * slice);
+    let half = |v: f32| {
+        let bits = v.to_bits();
+        let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+        let half = ((bits >> 16) & 0x8000) | ((exponent as u32) << 10) | ((bits >> 13) & 0x3ff);
+        (half as u16).to_le_bytes()
+    };
+    (0..32u32)
+        .filter_map(|z| {
+            let want: Vec<u8> = [value(z), 0.5, 1.0 - value(z), 1.0]
+                .iter()
+                .flat_map(|&v| half(v))
+                .collect();
+            let got = &texels[z as usize * slice..(z as usize + 1) * slice];
+            let wrong = got.chunks(8).filter(|t| *t != want.as_slice()).count();
+            (wrong != 0).then(|| {
+                format!(
+                    "slice {z}: {wrong} of 1024 texels wrong, first {:?}",
+                    &got[..8]
+                )
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn slice_targets_rendered_before_a_volume_form_it() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        for volume in [false, true] {
+            let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+                return;
+            };
+            let header = mkw_lut();
+            let info = ImageInfo::from_texture(&header.decode().unwrap(), gob).unwrap();
+            assert_eq!((info.kind, info.depth, info.levels), (ImageKind::D3, 32, 1));
+            assert_eq!(info.surface().level_tiling(0).block_depth_log2, 4);
+            let value = |z: u32| (z + 1) as f32 / 64.0;
+            render_mkw_lut(&mut f, volume, gob, value);
+            let (id, _) = f.texture(&header);
+            let wrong = wrong_lut_slices(&mut f, id, value);
+            assert!(wrong.is_empty(), "{gob:?} volume {volume}: {wrong:#?}");
+            assert!(
+                f.cache.state(id).unwrap().gpu_modified,
+                "{gob:?} volume {volume}"
+            );
+            let again = render_mkw_lut(&mut f, volume, gob, |z| (z + 33) as f32 / 128.0);
+            for (z, t) in again.iter().enumerate() {
+                assert_eq!(
+                    (t.id, t.level, t.layer),
+                    (id, 0, z as u32),
+                    "{gob:?} volume {volume}"
+                );
+            }
+            assert_eq!(f.texture(&header).0, id);
+            let wrong = wrong_lut_slices(&mut f, id, |z| (z + 33) as f32 / 128.0);
+            assert!(
+                wrong.is_empty(),
+                "{gob:?} volume {volume} second frame: {wrong:#?}"
+            );
+            f.assert_no_validation_errors();
+        }
+    }
+}
+
+#[test]
+fn slice_targets_render_into_the_volume_sampled_before_them() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        for volume in [false, true] {
+            let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+                return;
+            };
+            let header = mkw_lut();
+            let (id, _) = f.texture(&header);
+            let value = |z: u32| (z + 1) as f32 / 64.0;
+            let founds = render_mkw_lut(&mut f, volume, gob, value);
+            for (z, t) in founds.iter().enumerate() {
+                assert_eq!(
+                    (t.id, t.level, t.layer),
+                    (id, 0, z as u32),
+                    "{gob:?} volume {volume}"
+                );
+            }
+            assert!(f.cache.state(id).unwrap().gpu_modified);
+            assert_eq!(f.texture(&header).0, id);
+            let wrong = wrong_lut_slices(&mut f, id, value);
+            assert!(wrong.is_empty(), "{gob:?} volume {volume}: {wrong:#?}");
+            f.assert_no_validation_errors();
+        }
+    }
+}
+
+#[test]
+fn blits_into_a_volume_slice_address_stay_off_the_volume() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+            return;
+        };
+        let (volume, _) = f.texture(&mkw_lut());
+        let slice = mkw_lut_slice(false, gob);
+        let slice_va = GPU_VA + 0x200;
+        let (mut tx, cache, gmmu) = f.tx();
+        let found = cache
+            .render_target(&mut tx, gmmu, slice_va, &slice, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!((found.id, found.layer), (volume, 1));
+        let src_va = GPU_VA + (1 << 20);
+        clear_rt_at(&mut f, src_va, &slice, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+        let (mut tx, cache, gmmu) = f.tx();
+        cache
+            .blit(
+                &mut tx,
+                gmmu,
+                &blit_side(src_va, slice, [0, 0, 32, 32]),
+                &blit_side(slice_va, slice, [0, 0, 32, 32]),
+            )
+            .unwrap();
+        f.assert_no_validation_errors();
+    }
+}
+
+#[test]
+fn slice_targets_join_with_their_aliases_newer_texels() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+            return;
+        };
+        let slice = mkw_lut_slice(false, gob);
+        let narrow = ImageInfo { width: 31, ..slice };
+        clear_rt_at(&mut f, GPU_VA, &slice, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+        clear_rt_at(&mut f, GPU_VA, &narrow, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+        let (volume, _) = f.texture(&mkw_lut());
+        let texels = f.read_image(volume).remove(0);
+        let green = [0, 0, 0, 60, 0, 0, 0, 60];
+        let red = [0, 60, 0, 0, 0, 0, 0, 60];
+        let wrong = (0..32 * 32)
+            .filter(|&i| {
+                let want = if i % 32 < 31 { green } else { red };
+                texels[i * 8..i * 8 + 8] != want
+            })
+            .count();
+        assert_eq!(wrong, 0, "{gob:?}: slice 0 texels");
+        f.assert_no_validation_errors();
+    }
 }

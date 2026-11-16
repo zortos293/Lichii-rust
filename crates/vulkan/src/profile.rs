@@ -128,7 +128,46 @@ pub(crate) fn shader_profile(
         support_viewport_index_layer: profile.support_viewport_index_layer_non_geometry,
         support_handle_programs: true,
         support_handle_table_arrays: features.sampled_image_array_non_uniform_indexing,
+        support_conditional_barrier: v12.driver_id != vk::DriverId::INTEL_PROPRIETARY_WINDOWS,
         ..HostTranslateInfo::default()
     };
     (profile, host)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host_with_driver(driver_id: vk::DriverId) -> HostTranslateInfo {
+        let limits = vk::PhysicalDeviceLimits::default();
+        let vulkan11 = vk::PhysicalDeviceVulkan11Properties::default();
+        let vulkan12 = vk::PhysicalDeviceVulkan12Properties::default().driver_id(driver_id);
+        let queries = ShaderQueries {
+            api_version: vk::API_VERSION_1_3,
+            limits: &limits,
+            vulkan11: &vulkan11,
+            vulkan12: &vulkan12,
+        };
+        shader_profile(&DeviceFeatures::default(), &queries).1
+    }
+
+    #[test]
+    fn barriers_stay_in_conditional_control_flow_except_on_intel_windows() {
+        for driver in [
+            vk::DriverId::NVIDIA_PROPRIETARY,
+            vk::DriverId::MESA_RADV,
+            vk::DriverId::AMD_PROPRIETARY,
+            vk::DriverId::INTEL_OPEN_SOURCE_MESA,
+            vk::DriverId::QUALCOMM_PROPRIETARY,
+            vk::DriverId::MOLTENVK,
+        ] {
+            assert!(
+                host_with_driver(driver).support_conditional_barrier,
+                "{driver:?}"
+            );
+        }
+        assert!(
+            !host_with_driver(vk::DriverId::INTEL_PROPRIETARY_WINDOWS).support_conditional_barrier
+        );
+    }
 }
