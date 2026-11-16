@@ -866,9 +866,15 @@ impl VulkanRasterizer {
         }
         if liru14 {
             eprintln!(
-                "LIRU14 rtdraw stages={:x?} colors={:?}",
+                "LIRU14 rtdraw stages={:x?} colors={:?} mask_common={} mask0={:#x} frag_components={:?}",
                 self.draw.stages.each_ref().map(|s| s.as_ref().map(|m| m.hash)),
-                self.draw.colors.map(|t| t.map(|t| t.format))
+                self.draw.colors.map(|t| t.map(|t| t.format)),
+                regs.color_mask_common,
+                {
+                    let m = regs.color_mask[0];
+                    m.r() | m.g() << 1 | m.b() << 2 | m.a() << 3
+                },
+                fragment_output_components(&self.draw.stages)
             );
         }
 
