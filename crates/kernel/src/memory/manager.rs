@@ -11,6 +11,11 @@ use crate::result;
 
 const MIB: u64 = 1 << 20;
 
+static FREES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FREED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RELEASE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RELEASED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// DRAM Switch 2 consoles get beyond their own for the memory the graphics server keeps itself
 /// (nx2:gpu 214 GPU-only regions, NX2_NOTES row 57). It joins the non-secure system pool, so the
 /// application pool a title sizes its heap from stays whole.
@@ -257,6 +262,7 @@ impl MemoryManager {
         drop(list);
         self.commit(&runs)?;
         self.zero(&dirty);
+        self.log_usage(false);
         Ok(PageGroup { runs })
     }
 
@@ -276,6 +282,7 @@ impl MemoryManager {
         drop(list);
         self.commit(&[(start, size)])?;
         self.zero(&dirty);
+        self.log_usage(false);
         Ok(start)
     }
 
@@ -310,6 +317,9 @@ impl MemoryManager {
             .find(|p| start >= p.start && start + size <= p.start + p.size)
             .unwrap_or_else(|| panic!("freeing {start:#x}+{size:#x} outside every pool"));
         pool.free.lock().give(start, size);
+        FREES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        FREED.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+        self.log_usage(false);
     }
 
     pub fn free_group(&self, group: &PageGroup) {
@@ -335,7 +345,16 @@ impl MemoryManager {
                     .expect("dirty pages are free");
                 let from = align_down(start, granule).max(run);
                 let to = align_up(start + size, granule).min(run + run_size);
+                let t = std::time::Instant::now();
                 let released = self.physical.release(from, to - from);
+                RELEASE_NS.fetch_add(
+                    t.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                RELEASED.fetch_add(
+                    released.end - released.start,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 let end = start + size;
                 if start < released.start {
                     insert_coalescing(&mut kept, start, end.min(released.start) - start);
@@ -356,6 +375,42 @@ impl MemoryManager {
             }
             list.aged = kept;
         }
+        self.log_usage(true);
+    }
+
+    fn log_usage(&self, trim: bool) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        static LAST_HOST: AtomicU64 = AtomicU64::new(0);
+        let (mut used, mut dirty) = ([0u64; 4], 0u64);
+        for (i, pool) in self.pools.iter().enumerate() {
+            let list = pool.free.lock();
+            used[i] = pool.size - list.free;
+            dirty += list.dirty.values().sum::<u64>() + list.aged.values().sum::<u64>();
+        }
+        let total: u64 = used.iter().sum();
+        let host = self.physical.host_bytes();
+        if total.abs_diff(LAST.load(Ordering::Relaxed)) < 32 * MIB
+            && !(trim && host.abs_diff(LAST_HOST.load(Ordering::Relaxed)) >= 32 * MIB)
+        {
+            return;
+        }
+        LAST.store(total, Ordering::Relaxed);
+        LAST_HOST.store(host, Ordering::Relaxed);
+        tracing::info!(
+            "memstats used_mib={} app_mib={} applet_mib={} system_mib={} nonsecure_mib={} freed_dirty_mib={} host_mib={} frees={} freed_total_mib={} release_ms={} released_total_mib={}",
+            total / MIB,
+            used[0] / MIB,
+            used[1] / MIB,
+            used[2] / MIB,
+            used[3] / MIB,
+            dirty / MIB,
+            host / MIB,
+            FREES.load(Ordering::Relaxed),
+            FREED.load(Ordering::Relaxed) / MIB,
+            RELEASE_NS.load(Ordering::Relaxed) / 1_000_000,
+            RELEASED.load(Ordering::Relaxed) / MIB
+        );
     }
 }
 
