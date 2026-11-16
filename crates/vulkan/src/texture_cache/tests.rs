@@ -3872,8 +3872,9 @@ fn an_allocation_out_of_memory_evicts_clean_images_unused_this_frame() {
         "images used this frame stay"
     );
     assert!(f.cache.get(modified).is_some(), "GPU-modified images stay");
-    let (mut tx, cache, _) = f.tx();
-    assert_eq!(cache.evict_unused(&mut tx, u64::MAX).unwrap(), 0);
-    drop(tx);
+    {
+        let (mut tx, cache, _) = f.tx();
+        assert_eq!(cache.evict_unused(&mut tx, u64::MAX).unwrap(), 0);
+    }
     f.assert_no_validation_errors();
 }
