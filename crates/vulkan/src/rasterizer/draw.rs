@@ -565,8 +565,12 @@ fn liru14_skip(regs: &Regs) -> bool {
         return false;
     }
     let idx = RUN.fetch_add(1, Relaxed);
-    LIRU14_SHIDX.store(idx, Relaxed);
-    matches!(secs, 133..153) && idx == 16
+    LIRU14_SHIDX.store(if secs >= 120 { idx } else { u32::MAX - 1 }, Relaxed);
+    match secs {
+        133..138 => (16..=20).contains(&idx),
+        138..163 => (16..=20).contains(&idx) && idx != 16 + (secs as u32 - 138) / 5,
+        _ => false,
+    }
 }
 
 static LIRU14_SHIDX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
@@ -893,7 +897,7 @@ impl VulkanRasterizer {
             return Ok(());
         }
         let liru14_idx = LIRU14_SHIDX.load(std::sync::atomic::Ordering::Relaxed);
-        if (14..=18).contains(&liru14_idx) {
+        if (16..=20).contains(&liru14_idx) {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 60 {
                 match &call {
@@ -1065,7 +1069,7 @@ impl VulkanRasterizer {
                 }
             }
             crate::pipeline::environment::LIRU14_DRAW.set(false);
-            if (14..=18).contains(&liru14_idx) {
+            if (16..=20).contains(&liru14_idx) {
                 static M: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if M.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 60 {
                     eprintln!(
