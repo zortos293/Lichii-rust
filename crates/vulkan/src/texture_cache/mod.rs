@@ -1275,8 +1275,8 @@ impl TextureCache {
 
     /// The image a render target or depth target writes, at the scale the rules allow.
     /// `discard` skips uploading guest data the caller overwrites entirely (a full clear).
-    /// It keeps its own texels where incompatible overlaps wrote the shared bytes since, as
-    /// the host does with images it cannot alias: only reads of the image take them.
+    /// It keeps its own texels where incompatible overlaps wrote the shared bytes since, as the
+    /// C++ cache does with bad overlaps: only reads of the image take them.
     pub fn render_target(
         &mut self,
         tx: &mut Transfer<'_>,
