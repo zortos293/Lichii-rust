@@ -168,9 +168,12 @@ impl<H: MacroHost> Io<'_, H> {
             return Err(MacroErrorKind::MacroMethodEmit);
         }
         let dma = method == MME_DMA_READ || method == MME_DMA_READ_FIFOED;
-        if T::TRACKS && tainted {
-            if dma || !self.host.write_unknown(method) {
+        if T::TRACKS && (tainted || taint.forked()) {
+            if (dma && tainted) || !self.host.write_unknown(method) {
                 return Err(MacroErrorKind::DependsOnRead);
+            }
+            if dma {
+                self.dma_read(method == MME_DMA_READ_FIFOED, value, taint)?;
             }
             return Ok(());
         }
@@ -194,9 +197,13 @@ impl<H: MacroHost> Io<'_, H> {
     ) -> Result<(), MacroErrorKind> {
         self.record.uncacheable();
         self.record.read_memory = true;
-        let high = self.host.read_register(SET_MME_MEM_ADDRESS_A) & 0x1_FFFF;
-        let low = self.host.read_register(SET_MME_MEM_ADDRESS_B);
-        let gpu_va = (u64::from(high) << 32) | u64::from(low);
+        let gpu_va = if T::TRACKS {
+            0
+        } else {
+            let high = self.host.read_register(SET_MME_MEM_ADDRESS_A) & 0x1_FFFF;
+            let low = self.host.read_register(SET_MME_MEM_ADDRESS_B);
+            (u64::from(high) << 32) | u64::from(low)
+        };
         let count = (count as usize).min(DMA_READ_MAX_WORDS);
         if fifoed {
             let len = self.load_fifo.len();
@@ -238,6 +245,10 @@ pub(super) trait Taint {
     fn mark_ram(&mut self, first: usize, end: usize);
     fn clear_ram(&mut self, address: u32);
     fn data_ram(&self) -> bool;
+    /// A branch or predicate on a value from a read: which way this run goes, or None to stop.
+    fn decide(&mut self) -> Option<bool>;
+    /// Whether the run took a branch or predicate on a value from a read.
+    fn forked(&self) -> bool;
 }
 
 /// A normal run: every value is known.
@@ -262,6 +273,14 @@ impl Taint for Untracked {
     #[inline(always)]
     fn data_ram(&self) -> bool {
         true
+    }
+    #[inline(always)]
+    fn decide(&mut self) -> Option<bool> {
+        None
+    }
+    #[inline(always)]
+    fn forked(&self) -> bool {
+        false
     }
 }
 
@@ -294,6 +313,17 @@ impl Taint for ReadTaint {
     }
     fn data_ram(&self) -> bool {
         self.data_ram
+    }
+    fn decide(&mut self) -> Option<bool> {
+        let fork = self.forks;
+        if fork >= u64::BITS {
+            return None;
+        }
+        self.forks += 1;
+        Some(fork < self.fixed && self.decisions & (1 << fork) != 0)
+    }
+    fn forked(&self) -> bool {
+        self.forks != 0
     }
 }
 
@@ -345,14 +375,22 @@ pub(super) fn run<H: MacroHost, T: Taint>(
                     .ok_or(fail(MacroErrorKind::FifoUnderflow))?;
             }
         }
+        let predicate = if T::TRACKS
+            && d.pred_mode != 0
+            && match d.pred_reg {
+                REG_LOAD0 => load_t[0],
+                REG_LOAD1 => load_t[1],
+                register => taint.register(register),
+            } {
+            Some(taint.decide().ok_or(fail(MacroErrorKind::DependsOnRead))?)
+        } else {
+            None
+        };
         let source_t = |register: u8| match register {
             REG_LOAD0 => load_t[0],
             REG_LOAD1 => load_t[1],
             _ => taint.register(register),
         };
-        if T::TRACKS && d.pred_mode != 0 && source_t(d.pred_reg) {
-            return Err(fail(MacroErrorKind::DependsOnRead));
-        }
         let read = |register: u8, lane: usize| -> Result<u32, Fault> {
             match register {
                 0..=23 if initialized & (1 << register) != 0 => Ok(regs[register as usize]),
@@ -366,8 +404,10 @@ pub(super) fn run<H: MacroHost, T: Taint>(
                 _ => Err(fail(MacroErrorKind::InvalidSource)),
             }
         };
-        let mask = match d.pred_mode {
-            0 => 0xF,
+        let mask = match (d.pred_mode, predicate) {
+            (0, _) => 0xF,
+            (_, Some(true)) => d.mask_true,
+            (_, Some(false)) => d.mask_false,
             _ if read(d.pred_reg, 0)? != 0 => d.mask_true,
             _ => d.mask_false,
         };
@@ -397,14 +437,18 @@ pub(super) fn run<H: MacroHost, T: Taint>(
             let (x, y, imm, op) = (xs[lane], ys[lane], d.imm[lane], d.op[lane]);
             let (xt, yt) = (xts[lane], yts[lane]);
             let mut vt = xt || yt;
+            let mut branch = None;
             if T::TRACKS {
                 let steers = match op {
                     7 | 23 | 30 | 31 => xt,
-                    22 | 25..=29 => xt || yt,
+                    22 => xt || yt,
                     _ => false,
                 };
                 if steers {
                     return Err(fail(MacroErrorKind::DependsOnRead));
+                }
+                if matches!(op, 25..=29) && (xt || yt) {
+                    branch = Some(taint.decide().ok_or(fail(MacroErrorKind::DependsOnRead))?);
                 }
                 match op {
                     0 | 2 | 4 | 6 => carry_t = vt,
@@ -493,7 +537,7 @@ pub(super) fn run<H: MacroHost, T: Taint>(
                     0
                 }
                 25..=29 => {
-                    if condition(op, x, y) == (imm & 0x8000 != 0) {
+                    if branch.unwrap_or_else(|| condition(op, x, y) == (imm & 0x8000 != 0)) {
                         let offset = ((imm << 19) as i32) >> 19;
                         if offset == BRANCH_STOP {
                             stopped = true;

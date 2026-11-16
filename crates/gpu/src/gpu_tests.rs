@@ -1211,6 +1211,7 @@ mod masm {
     pub const ADD: u8 = 0;
     pub const EXTENDED: u8 = 7;
     pub const STATE: u8 = 22;
+    pub const BEQ: u8 = 29;
     pub const ZERO: u8 = 24;
     pub const IMM: u8 = 25;
     pub const LOAD0: u8 = 28;
@@ -1292,6 +1293,30 @@ mod masm {
     pub fn emit_program(method: u16, value: u16) -> Vec<u32> {
         [
             inst(imm(method), imm(value)).out0(IMM0, IMM1).end(),
+            inst(nop(), nop()),
+        ]
+        .iter()
+        .flat_map(Inst::encode)
+        .collect()
+    }
+
+    pub fn branch_imm(when: bool, offset: i32) -> u16 {
+        (u16::from(when) << 15) | (offset as u16 & 0x1FFF)
+    }
+
+    /// Reads one word at the address in parameters 0 (high) and 1 (low) and sends 1 to method
+    /// 0xc00 when it is zero, else 2.
+    pub fn branch_on_read_program() -> Vec<u32> {
+        [
+            inst(imm(0x1154), nop())
+                .out0(IMM0, OUT_LOAD0)
+                .out1(NONE, OUT_LOAD1),
+            inst(imm(0x0158), imm(1)).out0(IMM0, IMM1),
+            inst(alu(EXTENDED, ZERO, IMM, IMM, 0x1000), imm(0x0c00)).out1(IMM1, NONE),
+            inst(alu(BEQ, ZERO, LOAD0, ZERO, branch_imm(true, 3)), nop()),
+            inst(imm(2), nop()).out0(NONE, IMM0).end(),
+            inst(nop(), nop()),
+            inst(imm(1), nop()).out0(NONE, IMM0).end(),
             inst(nop(), nop()),
         ]
         .iter()
@@ -1449,6 +1474,35 @@ fn a_register_stays_the_backs_until_a_write_sets_its_shadow_copy() {
             .map(|(_, _, _, argument)| argument)
             .collect();
         assert_eq!(writes, [0x11, 0x33, 0x11, 0x99], "{threading:?}");
+    });
+}
+
+#[test]
+fn mme_dma_reads_that_branch_on_the_words_run_on_the_back() {
+    each_mode(|threading| {
+        let mut rig = Rig::new(threading);
+        let channel = rig.channel(HostClass::Ampere);
+        let data = 0x24_0000;
+        let read = crate::macros::MACRO_METHOD_BASE;
+        let mut words = Pushbuffer::default()
+            .bind(0, AMPERE_3D)
+            .load_macro(0, &masm::branch_on_read_program());
+        for word in [5, 0, 5] {
+            words = words.upload(data, &[word]).once(0, read, &[0, data as u32]);
+        }
+        rig.submit(channel, &words.0);
+        let all = rig.methods();
+        let address_writes = all.iter().filter(|m| m.2 == 0x154).count();
+        assert_eq!(
+            address_writes, 2,
+            "the later calls run on the back: {threading:?}"
+        );
+        let writes: Vec<_> = all
+            .into_iter()
+            .filter(|&(_, _, method, _)| method == 0xc00)
+            .map(|(_, _, _, argument)| argument)
+            .collect();
+        assert_eq!(writes, [2, 1, 2], "{threading:?}");
     });
 }
 

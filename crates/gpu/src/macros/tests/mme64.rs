@@ -497,21 +497,65 @@ fn shadow_run_without_data_ram_stops_before_it() {
     assert!(data_ram.words().iter().all(|&word| word == 0));
 }
 
-#[test]
-fn shadow_run_stops_where_a_read_steers_it() {
-    let program = [
+fn read_then(steer: Inst, after: Inst) -> [Inst; 7] {
+    [
         inst(imm(0x1154), nop())
             .out0(IMM0, OUT_LOAD0)
             .out1(NONE, OUT_LOAD1),
         inst(imm(0x0158), imm(1)).out0(IMM0, IMM1),
         inst(alu(EXTENDED, ZERO, IMM, IMM, 0x1000), nop()),
+        steer,
+        after,
+        inst(nop(), nop()).end(),
+        inst(nop(), nop()),
+    ]
+}
+
+#[test]
+fn shadow_runs_take_each_way_of_a_branch_on_a_read() {
+    let program = read_then(
         inst(
             alu(BEQ, ZERO, LOAD0, ZERO, branch_imm(true, false, 2)),
-            nop(),
-        ),
+            imm(0xB00),
+        )
+        .out1(IMM1, NONE),
         inst(imm(0x1), nop()).out0(NONE, IMM0).end(),
-        inst(nop(), nop()),
-    ];
+    );
+    let mut engine = engine(&program);
+    let mut taint = ReadTaint::new();
+    let mut paths = Vec::new();
+    loop {
+        let mut host = TestHost::default();
+        engine
+            .shadow_execute(
+                MACRO_METHOD_BASE,
+                &[0x1_0001, 0x1000],
+                &mut MacroDataRam::new(),
+                &mut host,
+                &mut taint,
+            )
+            .unwrap();
+        assert!(host.dma_reads.is_empty());
+        assert_eq!(
+            host.writes,
+            [(0x154, 0x1_0001), (0x155, 0x1000), (0x158, 1)]
+        );
+        paths.push(host.unknown);
+        let Some(next) = taint.next_path() else {
+            break;
+        };
+        taint = next;
+    }
+    assert_eq!(paths.len(), 2);
+    assert_eq!(paths[0], [0xB00]);
+}
+
+#[test]
+fn shadow_run_stops_where_a_read_counts_a_loop() {
+    let program = read_then(
+        inst(alu(LOOP, ZERO, LOAD0, ZERO, 2), nop()),
+        inst(imm(0x1), nop()).out0(NONE, IMM0).end(),
+    );
     let (result, _, _) = shadow(&program, &[0x1_0001, 0x1000], &mut MacroDataRam::new());
     let error = result.unwrap_err();
     assert_eq!(error.kind, MacroErrorKind::DependsOnRead);

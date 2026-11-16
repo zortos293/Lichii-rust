@@ -211,36 +211,61 @@ impl BackMacros {
             return false;
         }
         self.undo.clear();
-        let mut host = ShadowHost {
-            graphics,
-            owned: &mut self.owned,
-            undo: &mut self.undo,
-            blocked: false,
-        };
-        let result = engine.shadow_execute(
-            call.method,
-            &call.parameters,
-            data_ram,
-            &mut host,
-            &mut ReadTaint::without_data_ram(),
-        );
-        let blocked = host.blocked;
-        let code = match result {
-            Ok(()) if !blocked && self.code == Some(generation) => None,
-            Ok(()) if !blocked => engine.code_copy(),
-            result => {
-                if let Err(error) = result
-                    && matches!(
-                        error.kind,
-                        MacroErrorKind::DependsOnRead | MacroErrorKind::UsesDataRam
-                    )
-                {
-                    tracing::info!(%error, "3D macro reads memory and runs on the front");
-                    self.refused.push(start);
-                }
-                self.undo(graphics);
-                return false;
+        let mut taint = ReadTaint::without_data_ram();
+        let mut paths = 0;
+        let mut too_many = false;
+        let outcome = loop {
+            paths += 1;
+            let mut host = ShadowHost {
+                graphics: &mut *graphics,
+                owned: &mut self.owned,
+                undo: &mut self.undo,
+                replay: paths > 1,
+                blocked: false,
+            };
+            let result = engine.shadow_execute(
+                call.method,
+                &call.parameters,
+                data_ram,
+                &mut host,
+                &mut taint,
+            );
+            match result {
+                Err(error) => break Err(Some(error)),
+                Ok(()) if host.blocked => break Err(None),
+                Ok(()) => {}
             }
+            match taint.next_path() {
+                None => break Ok(()),
+                Some(_) if paths == MAX_SHADOW_PATHS => {
+                    too_many = true;
+                    break Err(None);
+                }
+                Some(next) => taint = next,
+            }
+        };
+        if let Err(error) = outcome {
+            if too_many {
+                tracing::info!(
+                    start,
+                    "3D macro reads memory and has too many ways to run on the back"
+                );
+                self.refused.push(start);
+            } else if let Some(error) = error
+                && matches!(
+                    error.kind,
+                    MacroErrorKind::DependsOnRead | MacroErrorKind::UsesDataRam
+                )
+            {
+                tracing::info!(%error, "3D macro reads memory and runs on the front");
+                self.refused.push(start);
+            }
+            self.undo(graphics);
+            return false;
+        }
+        let code = match self.code {
+            Some(sent) if sent == generation => None,
+            _ => engine.code_copy(),
         };
         if let Some(code) = code {
             stream.side(SideCommand::MacroCode(Box::new(code)));
@@ -248,7 +273,7 @@ impl BackMacros {
         }
         if !self.sent.contains(&start) {
             self.sent.push(start);
-            tracing::info!(start, "3D macro reads memory and runs on the back");
+            tracing::info!(start, paths, "3D macro reads memory and runs on the back");
         }
         stream.macro_call(EngineKind::Maxwell3d, start, &call.parameters);
         true
@@ -264,6 +289,9 @@ impl BackMacros {
         }
     }
 }
+
+/// The ways through branches on read values a shadow run follows before a call stays on the front.
+const MAX_SHADOW_PATHS: usize = 16;
 
 /// Whether the back holds register `method` (see [`BackMacros::owned`]).
 #[inline]
@@ -308,6 +336,9 @@ struct ShadowHost<'a> {
     graphics: &'a mut RegisterState,
     owned: &'a mut MethodSet,
     undo: &'a mut Vec<Undo>,
+    /// A later way through the call (see [`ReadTaint::next_path`]): its writes before its first
+    /// branch on a read are the ones the first way already applied.
+    replay: bool,
     /// The call read a register the back holds or never receives (LOAD_MME), so its run here may
     /// differ from the back's.
     blocked: bool,
@@ -332,7 +363,7 @@ impl MacroHost for ShadowHost<'_> {
     }
 
     fn write_method(&mut self, method: u32, argument: u32) {
-        if is_load_mme(method) || method >= MACRO_REGISTERS_START {
+        if self.replay || is_load_mme(method) || method >= MACRO_REGISTERS_START {
             return;
         }
         self.save(method);

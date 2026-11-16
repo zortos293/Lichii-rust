@@ -91,6 +91,11 @@ pub struct ReadTaint {
     registers: u32,
     ram: [u64; DATA_RAM_WORDS / 64],
     data_ram: bool,
+    /// Which way the run goes at each branch or predicate on a read value (bit n for the n-th);
+    /// the first `fixed` are set by the caller, the others go the not-taken way.
+    decisions: u64,
+    fixed: u32,
+    forks: u32,
 }
 
 impl ReadTaint {
@@ -100,7 +105,26 @@ impl ReadTaint {
             registers: 0,
             ram: [0; DATA_RAM_WORDS / 64],
             data_ram: true,
+            decisions: 0,
+            fixed: 0,
+            forks: 0,
         }
+    }
+
+    /// For a call whose shadow run went the ways this one went: the taint of its next way
+    /// through the branches and predicates on read values, in depth-first order, or None after
+    /// the last. Every way writes the same until its first such branch; from there on a shadow
+    /// run reports every write as unknown ([`MacroHost::write_unknown`]).
+    pub fn next_path(&self) -> Option<Self> {
+        let fork = (0..self.forks.min(u64::BITS))
+            .rev()
+            .find(|&fork| self.decisions & (1 << fork) == 0)?;
+        Some(Self {
+            data_ram: self.data_ram,
+            decisions: (self.decisions & ((1 << fork) - 1)) | (1 << fork),
+            fixed: fork + 1,
+            ..Self::new()
+        })
     }
 
     /// Nothing unknown, and the run stops with [`MacroErrorKind::UsesDataRam`] before it reads or
