@@ -736,9 +736,11 @@ impl Device {
                 false
             })
         };
-        shader_profile.support_cooperative_hmma = features.cooperative_hmma_f16 && self_test(false);
+        let off = |name: &str| std::env::var(name).is_ok_and(|v| v == "0");
+        shader_profile.support_cooperative_hmma =
+            !off("LIRU14_COOP_F16") && features.cooperative_hmma_f16 && self_test(false);
         shader_profile.support_cooperative_hmma_f32 =
-            features.cooperative_hmma_f32 && self_test(true);
+            !off("LIRU14_COOP_F32") && features.cooperative_hmma_f32 && self_test(true);
         if features.extensions.cooperative_matrix {
             tracing::info!(
                 "cooperative matrices for guest HMMA.16816: f16 accumulators {}, f32 accumulators {}",
