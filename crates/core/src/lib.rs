@@ -18,7 +18,7 @@ use lichii_common::settings::{AudioSettings, GpuClock, Settings};
 use lichii_common::{ConsoleGeneration, ResultCode, VAddr};
 use lichii_gpu::backend::{GpuHandles, NullRasterizer, Rasterizer};
 use lichii_gpu::host1x::Host1x;
-use lichii_gpu::{Console, Gpu, GpuConfig};
+use lichii_gpu::{Console, Gpu, GpuConfig, clock};
 use lichii_input::hub::NpadHub;
 use lichii_kernel::process::Process;
 use lichii_kernel::{Kernel, KernelConfig, KernelError, KernelEvents};
@@ -234,8 +234,19 @@ impl System {
             ConsoleGeneration::Switch2 => (Console::Switch2, 36),
         };
         let host1x = Host1x::new(kernel.physical_memory().clone(), address_space_bits);
-        let gpu = Gpu::new(host1x, timing.clone(), GpuConfig::new(console), renderer);
-        tracing::info!(?console, address_space_bits, "gpu up");
+        let config = GpuConfig {
+            nanosecond_timestamps: console == Console::Switch2
+                && !clock::keeps_tick_timestamps(program.program_id),
+            ..GpuConfig::new(console)
+        };
+        let nanosecond_timestamps = config.nanosecond_timestamps;
+        let gpu = Gpu::new(host1x, timing.clone(), config, renderer);
+        tracing::info!(
+            ?console,
+            address_space_bits,
+            nanosecond_timestamps,
+            "gpu up"
+        );
         Arc::new(gpu)
     }
 
