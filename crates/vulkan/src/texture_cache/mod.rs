@@ -1279,8 +1279,8 @@ impl TextureCache {
 
     /// The image a render target or depth target writes, at the scale the rules allow.
     /// `discard` skips uploading guest data the caller overwrites entirely (a full clear).
-    /// It keeps its own texels where incompatible overlaps wrote the shared bytes since, as the
-    /// C++ cache does with bad overlaps: only reads of the image take them.
+    /// An image the GPU wrote before keeps its own texels where incompatible overlaps wrote the
+    /// shared bytes since, as the C++ cache does with bad overlaps: only reads of it take them.
     pub fn render_target(
         &mut self,
         tx: &mut Transfer<'_>,
@@ -1316,7 +1316,8 @@ impl TextureCache {
             self.flush_buffered(tx, found.id)?;
             self.image(found.id).cpu_dirty = false;
         }
-        if (discard && whole) || usage == Usage::Target {
+        let drawn_before = usage == Usage::Target && self.image(found.id).modified != 0;
+        if (discard && whole) || drawn_before {
             let tick = self.tick;
             self.image(found.id).current = tick;
         }

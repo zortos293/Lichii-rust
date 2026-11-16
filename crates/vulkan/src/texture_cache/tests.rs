@@ -866,6 +866,32 @@ fn targets_drawn_into_keep_their_own_texels_over_newer_overlaps() {
 }
 
 #[test]
+fn new_targets_take_newer_overlaps_before_they_are_drawn_into() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let big = rt_info(64, 64, 3, GobLayout::Tegra);
+    let small = rt_info(32, 32, 2, GobLayout::Tegra);
+    let a = clear_rt(&mut f, &big, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let corner = Rect {
+        x: 0,
+        y: 0,
+        width: 8,
+        height: 8,
+    };
+    let b = clear_rt(&mut f, &small, [1.0, 0.0, 0.0, 1.0], corner);
+    assert_ne!(a.id, b.id);
+    let read = f.read_image(b.id);
+    assert_eq!(count_texels(&read[0], RED), 8 * 8);
+    assert_eq!(
+        count_texels(&read[0], GREEN),
+        32 * 32 - 8 * 8,
+        "the older target's texels"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
 fn sampled_images_still_take_newer_overlaps() {
     let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
         return;
@@ -2517,7 +2543,7 @@ fn narrower_block_linear_textures_alias_their_render_target_without_a_flush() {
 }
 
 #[test]
-fn overlaps_of_another_layout_sync_on_the_gpu_without_a_flush() {
+fn overlaps_of_another_layout_drawn_into_in_turn_keep_their_own_texels() {
     let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
         return;
     };
@@ -2552,10 +2578,9 @@ fn overlaps_of_another_layout_sync_on_the_gpu_without_a_flush() {
         after.uploads, before.uploads,
         "no re-upload from guest memory"
     );
-    assert!(
-        after.gpu_syncs >= before.gpu_syncs + 6,
-        "each switch synced on the GPU"
-    );
+    assert_eq!(after.gpu_syncs, before.gpu_syncs, "no switch synced");
+    assert!(all_texels(&f.read_image(first.id)[0], RED));
+    assert!(all_texels(&f.read_image(second.id)[0], GREEN));
     f.assert_no_validation_errors();
 }
 
