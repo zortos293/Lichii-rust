@@ -1068,6 +1068,39 @@ impl VulkanRasterizer {
                 }
             }
             crate::pipeline::environment::LIRU14_DRAW.set(false);
+            if liru14_idx == 12 || shirt {
+                static V: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if V.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
+                    let vs = self.draw.stages[0].as_ref();
+                    let streams: Vec<_> = regs
+                        .vertex_streams
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| s.bits.enable() != 0)
+                        .map(|(i, s)| (i, format!("{:#x}", s.address()), s.bits.stride(), s.frequency))
+                        .collect();
+                    let attribs: Vec<_> = regs.vertex_attrib_format[..16]
+                        .iter()
+                        .map(|a| format!("{a:?}"))
+                        .collect();
+                    let cb: Vec<_> = (0..18)
+                        .filter(|&i| vs.is_some_and(|m| m.info.constant_buffer_mask & (1 << i) != 0))
+                        .map(|i| {
+                            let b = &ctx.const_buffers[0][i];
+                            (i, format!("{:#x}", b.address), b.size, vs.map_or(0, |m| m.info.constant_buffer_used_sizes[i]))
+                        })
+                        .collect();
+                    eprintln!(
+                        "LIRU14 vdata who={} vs={:x} ib={:#x} ifmt={:?} streams={streams:?} cb={cb:?} ssbo={} global={} attribs={attribs:?}",
+                        if shirt { "shirt" } else { "caster12" },
+                        vs.map_or(0, |m| m.hash),
+                        regs.index_buffer.start_addr(),
+                        regs.index_buffer.format,
+                        vs.map_or(0, |m| m.info.storage_buffers_descriptors.len()),
+                        vs.is_some_and(|m| m.info.uses_global_memory),
+                    );
+                }
+            }
             if (11..=13).contains(&liru14_idx) {
                 static M: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if M.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 60 {
