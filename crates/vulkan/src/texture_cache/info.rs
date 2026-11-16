@@ -227,7 +227,8 @@ impl ImageInfo {
 
     /// The image one side of a 2D engine blit reads or writes, laid out as a render target of
     /// that surface would be. `None` for what blits there do not cover: volume surfaces, a layer
-    /// other than the first, and blocks wider or deeper than one GOB.
+    /// other than the first, and blocks wider than one GOB. A block depth clamps to the one
+    /// slice, as the software blit's does.
     pub fn from_copy_surface(
         surface: &CopySurface,
         format: PixelFormat,
@@ -241,11 +242,11 @@ impl ImageInfo {
         {
             return None;
         }
-        let Some((block_width, block_height_log2, block_depth_log2)) = surface.block else {
+        let Some((block_width, block_height_log2, _)) = surface.block else {
             return (surface.pitch != 0)
                 .then(|| Self::pitch(format, surface.pitch, surface.height));
         };
-        if block_width != 0 || block_depth_log2 != 0 {
+        if block_width != 0 {
             return None;
         }
         let layout = GuestLayout::BlockLinear {

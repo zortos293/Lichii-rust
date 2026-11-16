@@ -351,7 +351,10 @@ fn filtered_rects(blit: &Blit) -> Option<([i32; 4], [i32; 4])> {
     }
     let axis = |start: i64, step: i64, count: i32| {
         let end = start.checked_add(step.checked_mul(i64::from(count))?)?;
-        let (first, last) = (i32::try_from(start >> 32).ok()?, i32::try_from(end >> 32).ok()?);
+        let (first, last) = (
+            i32::try_from(start >> 32).ok()?,
+            i32::try_from(end >> 32).ok()?,
+        );
         (step > 0 && first < last).then_some([first, last])
     };
     let [x0, x1] = axis(blit.src_x0, blit.du_dx, blit.dst_width)?;
