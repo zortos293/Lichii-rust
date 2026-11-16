@@ -543,6 +543,38 @@ const GRAPHICS_SLOTS: [(usize, usize); 5] = [(1, 0), (2, 1), (3, 2), (4, 3), (5,
 
 /// Whether the draw runs task and mesh programs (SET_MESH_CONTROL, NVN2 only), whose
 /// workgroup count is the draw's vertex count.
+fn liru14_phase(regs: &Regs) -> u8 {
+    static ZETA: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static LOGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let Some(want) = *ZETA.get_or_init(|| {
+        std::env::var("LIRU14_SHZ")
+            .ok()
+            .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+    }) else {
+        return 0;
+    };
+    let secs = START.get_or_init(std::time::Instant::now).elapsed().as_secs();
+    if regs.zeta_enable == 0 || regs.zeta.address() != want {
+        return 0;
+    }
+    let phase = match secs {
+        125..140 => 1,
+        140..155 => 2,
+        _ => 0,
+    };
+    if LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 400 == 0 {
+        eprintln!(
+            "LIRU14 phase={phase} secs={secs} cull_on={} cull={:?} front={:?} flip_y={}",
+            regs.gl_cull_test_enabled,
+            regs.gl_cull_face,
+            regs.gl_front_face,
+            regs.window_origin.flip_y()
+        );
+    }
+    phase
+}
+
 fn is_mesh_draw(regs: &Regs, arch: ShaderArch) -> bool {
     arch == ShaderArch::Ampere && regs.words()[MESH_CONTROL] & 1 != 0
 }
@@ -2598,11 +2630,19 @@ impl VulkanRasterizer {
             shadow.set(Slot::LineWidth, line_width, || {
                 raw.cmd_set_line_width(cmd, line_width)
             });
-            let bias = (
-                regs.depth_bias / 2.0,
-                regs.depth_bias_clamp,
-                regs.slope_scale_depth_bias,
-            );
+            let phase = liru14_phase(regs);
+            let bias = match phase {
+                1 => (
+                    regs.depth_bias * 25.0,
+                    regs.depth_bias_clamp,
+                    regs.slope_scale_depth_bias * 4.0,
+                ),
+                _ => (
+                    regs.depth_bias / 2.0,
+                    regs.depth_bias_clamp,
+                    regs.slope_scale_depth_bias,
+                ),
+            };
             shadow.set(Slot::DepthBias, bias, || {
                 raw.cmd_set_depth_bias(cmd, bias.0, bias.1, bias.2)
             });
@@ -2640,6 +2680,12 @@ impl VulkanRasterizer {
                     mvk::cull_mode(regs.gl_cull_face).unwrap_or(vk::CullModeFlags::BACK)
                 } else {
                     vk::CullModeFlags::NONE
+                };
+                let cull = match (phase, cull) {
+                    (2, vk::CullModeFlags::BACK) => vk::CullModeFlags::FRONT,
+                    (2, vk::CullModeFlags::FRONT) => vk::CullModeFlags::BACK,
+                    (2, vk::CullModeFlags::NONE) => vk::CullModeFlags::FRONT,
+                    _ => cull,
                 };
                 shadow.set(Slot::CullMode, cull, || raw.cmd_set_cull_mode(cmd, cull));
                 let mut face =
