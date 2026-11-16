@@ -568,7 +568,7 @@ fn liru14_skip(regs: &Regs) -> bool {
     LIRU14_SHIDX.store(if secs >= 120 { idx } else { u32::MAX - 1 }, Relaxed);
     LIRU14_LATE.store(secs >= 120, Relaxed);
     match secs {
-        133..153 => idx == 12,
+        133..153 => idx == 12 && std::env::var_os("LIRU14_SKIP12").is_some(),
         _ => false,
     }
 }
