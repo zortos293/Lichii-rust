@@ -2207,6 +2207,23 @@ impl TextureCache {
             }
             found => found?,
         };
+        static LIRU14_VA: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        static LIRU14_VA_LOGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if let Some(want) = *LIRU14_VA.get_or_init(|| {
+            std::env::var("LIRU14_VA")
+                .ok()
+                .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+        }) && gpu_va.abs_diff(want) < 0x40_0000
+            && LIRU14_VA_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200
+        {
+            let state = found.and_then(|f| self.get(f.id)).map(|i| {
+                (i.info, i.host.format, i.gpu_modified, i.modified, i.cpu_dirty)
+            });
+            eprintln!(
+                "LIRU14 va={gpu_va:#x} usage={usage:?} tick={} info={info:?} found={found:?} image={state:?}",
+                self.tick
+            );
+        }
         if let Some(found) = found {
             self.touch(found.id);
         }
