@@ -577,12 +577,48 @@ impl TextureCache {
         self.traffic.gpu_syncs += 1;
         {
             use std::fmt::Write;
-            let d = |i: &ImageInfo| format!("{:?} {}x{}x{} L{} A{} {:?}", i.format, i.width, i.height, i.depth, i.levels, i.layers, i.kind);
-            let mut key = format!("{} <=", d(&self.get(id).expect("live").info));
+            let d = |i: &ImageInfo| {
+                format!(
+                    "{:?} {}x{}x{} L{} A{} {:?}",
+                    i.format, i.width, i.height, i.depth, i.levels, i.layers, i.kind
+                )
+            };
+            let me = self.get(id).expect("live");
+            let mut key = format!("{} {:?} <=", d(&me.info), me.info.layout);
             for &o in newer.iter() {
-                let _ = write!(key, " [{}]", d(&self.get(o).expect("live").info));
+                let other = self.get(o).expect("live");
+                let off = other.base() as i64 - me.base() as i64;
+                let sub = (off >= 0)
+                    .then(|| me.info.find_subresource(&other.info, off as u64))
+                    .flatten();
+                let tiling = (off >= 0)
+                    .then(|| {
+                        let surface = me.info.surface();
+                        (0..me.info.levels)
+                            .rev()
+                            .find(|&l| {
+                                surface.level_offset(l)
+                                    <= (off as u64) % me.info.layer_stride.max(1)
+                            })
+                            .map(|l| {
+                                (
+                                    l,
+                                    me.info.level_extent(l),
+                                    surface.level_tiling(l).block_height_log2,
+                                )
+                            })
+                    })
+                    .flatten();
+                let _ = write!(
+                    key,
+                    " [{} off={off:#x} sub={sub:?} lvl={tiling:?} {:?}]",
+                    d(&other.info),
+                    other.info.layout
+                );
             }
-            static SYNCS: std::sync::LazyLock<parking_lot::Mutex<(u64, std::collections::HashMap<String, (u64, u64)>)>> = std::sync::LazyLock::new(Default::default);
+            static SYNCS: std::sync::LazyLock<
+                parking_lot::Mutex<(u64, std::collections::HashMap<String, (u64, u64)>)>,
+            > = std::sync::LazyLock::new(Default::default);
             let mut m = SYNCS.lock();
             m.0 += 1;
             let e = m.1.entry(key).or_default();
