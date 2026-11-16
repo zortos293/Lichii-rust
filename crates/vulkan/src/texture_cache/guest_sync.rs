@@ -70,6 +70,7 @@ struct Params {
     packing: u32,
     stencil_pitch: u32,
     depth_float: u32,
+    z_base: u32,
 }
 
 /// The pass and its buffers, grown to the largest image synced.
@@ -103,7 +104,7 @@ impl GuestSync {
 }
 
 /// How `image` packs into guest words on the GPU, or `None` when the pass can't move it: only
-/// block-linear 2D images (or 3D ones one slice deep) at native scale whose texels are whole
+/// block-linear 2D images or 3D ones of one layer at native scale whose texels are whole
 /// 32-bit words or pack whole into one, laid out as the guest's, D24S8 kept as the host's D24S8
 /// or D32S8 and mapped whole, or X8D24 kept as the host's X8D24 or D32. Rows that end inside
 /// a word need segments that share no device memory: alias trimming gives whole words to one
@@ -119,7 +120,6 @@ fn packing(image: &CachedImage) -> Option<Packing> {
             ImageKind::D3 => info.layers == 1,
             ImageKind::D1 => false,
         }
-        && info.depth == 1
         && info.samples == 1
         && info.format.block_width() == 1
         && info.format.block_height() == 1
@@ -251,48 +251,60 @@ fn moved_bytes(info: &ImageInfo, levels: u32, lo: u64, hi: u64, out: &mut Vec<(u
                 continue;
             }
             let tiling = info.surface().level_tiling(level);
-            let (w, h, _) = info.level_extent(level);
+            let (w, h, d) = info.level_extent(level);
             let row_bytes = (w * tiling.bytes_per_block).next_multiple_of(4);
-            let bh = tiling.block_height_log2;
-            let column = 1u64 << (9 + bh + tiling.block_depth_log2);
+            let (bh, bd) = (tiling.block_height_log2, tiling.block_depth_log2);
+            let column = 1u64 << (9 + bh + bd);
             let block_bytes = u64::from(tiling.row_gobs) * column;
             let (full_cols, cols) = (row_bytes / 64, row_bytes.div_ceil(64));
             let (full_rows, rows) = (h / 8, h.div_ceil(8));
-            let dense = full_cols == tiling.row_gobs && tiling.block_depth_log2 == 0;
             let blocks = u64::from(rows.div_ceil(1 << bh));
-            for block in lo.saturating_sub(start) / block_bytes..blocks {
-                let row = start + block * block_bytes;
-                if row >= hi {
+            let slab = blocks * block_bytes;
+            let first_slab = (lo.saturating_sub(start) / slab) as u32;
+            for z0 in (first_slab << bd..d).step_by(1 << bd) {
+                let slab_start = start + u64::from(z0 >> bd) * slab;
+                if slab_start >= hi {
                     break;
                 }
-                let gob_y = (block as u32) << bh;
-                if dense && gob_y + (1 << bh) <= full_rows {
-                    push(row, row + block_bytes);
-                    continue;
-                }
-                for c in 0..cols {
-                    let base = row + u64::from(c) * column;
-                    if base >= hi {
+                let slices = (d - z0).min(1 << bd);
+                let dense = full_cols == tiling.row_gobs && slices == 1 << bd;
+                for block in lo.saturating_sub(slab_start) / block_bytes..blocks {
+                    let row = slab_start + block * block_bytes;
+                    if row >= hi {
                         break;
                     }
-                    for g in gob_y..(gob_y + (1 << bh)).min(rows) {
-                        let gob = base + (u64::from(g - gob_y) << 9);
-                        if c < full_cols && g < full_rows {
-                            push(gob, gob + 512);
-                            continue;
+                    let gob_y = (block as u32) << bh;
+                    if dense && gob_y + (1 << bh) <= full_rows {
+                        push(row, row + block_bytes);
+                        continue;
+                    }
+                    for c in 0..cols {
+                        let base = row + u64::from(c) * column;
+                        if base >= hi {
+                            break;
                         }
-                        let mut words = 0u128;
-                        for y in g * 8..(g * 8 + 8).min(h) {
-                            for x in (c * 64..(c * 64 + 64).min(row_bytes)).step_by(4) {
-                                let at = start + tiling.offset(x, y, 0) as u64 - gob;
-                                words |= 1 << (at / 4);
+                        for z in 0..slices {
+                            for g in gob_y..(gob_y + (1 << bh)).min(rows) {
+                                let gob =
+                                    base + (((u64::from(z) << bh) + u64::from(g - gob_y)) << 9);
+                                if c < full_cols && g < full_rows {
+                                    push(gob, gob + 512);
+                                    continue;
+                                }
+                                let mut words = 0u128;
+                                for y in g * 8..(g * 8 + 8).min(h) {
+                                    for x in (c * 64..(c * 64 + 64).min(row_bytes)).step_by(4) {
+                                        let at = start + tiling.offset(x, y, z0 + z) as u64 - gob;
+                                        words |= 1 << (at / 4);
+                                    }
+                                }
+                                while words != 0 {
+                                    let bit = words.trailing_zeros();
+                                    let len = (words >> bit).trailing_ones();
+                                    push(gob + u64::from(bit) * 4, gob + u64::from(bit + len) * 4);
+                                    words &= !(u128::MAX >> (128 - len) << bit);
+                                }
                             }
-                        }
-                        while words != 0 {
-                            let bit = words.trailing_zeros();
-                            let len = (words >> bit).trailing_ones();
-                            push(gob + u64::from(bit) * 4, gob + u64::from(bit + len) * 4);
-                            words &= !(u128::MAX >> (128 - len) << bit);
                         }
                     }
                 }
@@ -507,9 +519,9 @@ impl TextureCache {
         let mut stencil = 4;
         for &o in newer.iter().chain(std::iter::once(&id)) {
             let info = &self.get(o).expect("a live image id").info;
-            let (w, h, _) = info.level_extent(0);
+            let (w, h, d) = info.level_extent(0);
             let row = (w * info.format.bytes_per_block()).next_multiple_of(4);
-            linear = linear.max(u64::from(row) * u64::from(h));
+            linear = linear.max(u64::from(row) * u64::from(h) * u64::from(d));
             stencil = stencil.max((u64::from(w) * u64::from(h)).next_multiple_of(4));
         }
         let device = self.device.clone();
@@ -552,6 +564,9 @@ impl TextureCache {
         image.current = tick;
         image.gpu_modified = true;
         image.retake_aliases();
+        for &o in newer.iter() {
+            self.hand_off(tx.scheduler, o);
+        }
         self.traffic.gpu_syncs += 1;
         Ok(true)
     }
@@ -646,7 +661,7 @@ impl TextureCache {
                 }
                 let shared = &runs[first..first + count];
                 let tiling = info.surface().level_tiling(level);
-                let (w, h, _) = info.level_extent(level);
+                let (w, h, d) = info.level_extent(level);
                 let row_bytes = w * tiling.bytes_per_block;
                 let row_words = row_bytes.div_ceil(4);
                 let block_rows = 8u32 << tiling.block_height_log2;
@@ -660,18 +675,32 @@ impl TextureCache {
                     .expect("count > 0")
                     .min(end)
                     - start;
-                let y0 = ((lo / block_bytes) as u32 * block_rows).min(h);
-                let y1 = (((hi - 1) / block_bytes + 1) as u32 * block_rows).min(h);
-                if y0 >= y1 {
+                let (y0, y1, z0, z1, band) = if d == 1 {
+                    let y0 = ((lo / block_bytes) as u32 * block_rows).min(h);
+                    let y1 = (((hi - 1) / block_bytes + 1) as u32 * block_rows).min(h);
+                    let band = (
+                        start + u64::from(y0 / block_rows) * block_bytes,
+                        (start + u64::from(y1.div_ceil(block_rows)) * block_bytes).min(end),
+                    );
+                    (y0, y1, 0, 1, band)
+                } else {
+                    let slices = 1u32 << tiling.block_depth_log2;
+                    let slab = u64::from(h.div_ceil(block_rows)) * block_bytes;
+                    let z0 = (lo / slab) as u32 * slices;
+                    let z1 = (((hi - 1) / slab + 1) as u32 * slices).min(d);
+                    let band = (
+                        start + u64::from(z0 / slices) * slab,
+                        (start + u64::from(z1.div_ceil(slices)) * slab).min(end),
+                    );
+                    (0, h, z0, z1, band)
+                };
+                if y0 >= y1 || z0 >= z1 {
                     continue;
                 }
-                let band = (
-                    start + u64::from(y0 / block_rows) * block_bytes,
-                    (start + u64::from(y1.div_ceil(block_rows)) * block_bytes).min(end),
-                );
                 let region = |aspect_mask, row_texels: u32, texel_bytes: u32| vk::BufferImageCopy {
-                    buffer_offset: u64::from(y0) * u64::from(row_texels * texel_bytes),
+                    buffer_offset: u64::from(z0 * h + y0) * u64::from(row_texels * texel_bytes),
                     buffer_row_length: row_texels,
+                    buffer_image_height: h,
                     image_subresource: vk::ImageSubresourceLayers {
                         aspect_mask,
                         mip_level: level,
@@ -681,14 +710,13 @@ impl TextureCache {
                     image_offset: vk::Offset3D {
                         x: 0,
                         y: y0 as i32,
-                        z: 0,
+                        z: z0 as i32,
                     },
                     image_extent: vk::Extent3D {
                         width: w,
                         height: y1 - y0,
-                        depth: 1,
+                        depth: z1 - z0,
                     },
-                    ..Default::default()
                 };
                 let main = region(
                     main_aspect,
@@ -699,7 +727,7 @@ impl TextureCache {
                 let groups = [
                     row_words.div_ceil(GROUP[0]),
                     (y1 - y0).div_ceil(GROUP[1]),
-                    1,
+                    z1 - z0,
                 ];
                 let keep = direction == Direction::ToGuest
                     || !shared
@@ -727,6 +755,7 @@ impl TextureCache {
                         .descriptors
                         .allocate(tx.scheduler, sync.compute.set_layout)?;
                     let params = Params {
+                        z_base: z0,
                         row_words,
                         row_bytes,
                         height: h,
@@ -1023,18 +1052,52 @@ mod tests {
                 GobLayout::Switch2,
             ),
         ];
-        for info in images {
+        let volume = |format, (width, height, depth), levels, bh, bd, gob| {
+            let mut info = block_linear_info(format, (width, height), levels, 1, bh, gob);
+            info.kind = ImageKind::D3;
+            info.depth = depth;
+            info.layout = GuestLayout::BlockLinear {
+                block_height_log2: bh,
+                block_depth_log2: bd,
+                tile_width_spacing: 0,
+                gob,
+            };
+            info.layer_stride = info.surface().layer_stride();
+            info
+        };
+        let volumes = [
+            volume(
+                PixelFormat::R16G16B16A16Float,
+                (56, 32, 40),
+                1,
+                0,
+                4,
+                GobLayout::Switch2,
+            ),
+            volume(PixelFormat::R8Unorm, (57, 20, 9), 2, 1, 2, GobLayout::Tegra),
+            volume(
+                PixelFormat::A8B8G8R8Unorm,
+                (32, 32, 32),
+                3,
+                0,
+                4,
+                GobLayout::Tegra,
+            ),
+        ];
+        for info in images.into_iter().chain(volumes) {
             let size = info.size_bytes() as usize;
             let mut moved = vec![false; size];
             for layer in 0..info.layers {
                 for level in 0..info.levels {
                     let start = info.subresource_offset(level, layer) as usize;
                     let tiling = info.surface().level_tiling(level);
-                    let (w, h, _) = info.level_extent(level);
-                    for y in 0..h {
-                        for x in (0..w * tiling.bytes_per_block).step_by(4) {
-                            let at = start + tiling.offset(x, y, 0);
-                            moved[at..at + 4].fill(true);
+                    let (w, h, d) = info.level_extent(level);
+                    for z in 0..d {
+                        for y in 0..h {
+                            for x in (0..w * tiling.bytes_per_block).step_by(4) {
+                                let at = start + tiling.offset(x, y, z);
+                                moved[at..at + 4].fill(true);
+                            }
                         }
                     }
                 }
