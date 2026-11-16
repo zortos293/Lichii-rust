@@ -616,6 +616,11 @@ impl Device {
             vk::api_version_minor(properties.api_version),
             vk::api_version_patch(properties.api_version),
         );
+        tracing::info!(
+            "subgroups: {} lanes, guest warp native in stages {:#x}",
+            v11_properties.subgroup_size,
+            shader_profile.guest_warp_stages,
+        );
 
         let allocator = Allocator::new(&AllocatorCreateDesc {
             instance: raw_instance.clone(),
