@@ -576,6 +576,8 @@ fn liru14_skip(regs: &Regs) -> bool {
 static LIRU14_SHIDX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 static LIRU14_LATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static LIRU14_CB8: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LIRU14_SHADOW_CB3: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+static LIRU14_CAMERA_CB3: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
 static LIRU14_LIGHT: [std::sync::atomic::AtomicU32; 3] = [const { std::sync::atomic::AtomicU32::new(0) }; 3];
 static LIRU14_LIGHT_PREV: [std::sync::atomic::AtomicU32; 3] = [const { std::sync::atomic::AtomicU32::new(0) }; 3];
 
@@ -919,6 +921,14 @@ impl VulkanRasterizer {
                     .map(|c| format!("{}", f32::from_le_bytes(c.try_into().unwrap())))
                     .collect();
                 let _ = std::fs::write(dir.join("rcv_cb3.txt"), floats.join("\n"));
+                for (slot, name) in [(&LIRU14_SHADOW_CB3, "shadow_cb3.txt"), (&LIRU14_CAMERA_CB3, "camera_cb3.txt")] {
+                    let bytes = slot.lock().unwrap().clone();
+                    let floats: Vec<String> = bytes
+                        .chunks_exact(4)
+                        .map(|c| format!("{}", f32::from_le_bytes(c.try_into().unwrap())))
+                        .collect();
+                    let _ = std::fs::write(dir.join(name), floats.join("\n"));
+                }
                 for (va, width, height, bpp, bh, name) in [
                     (0x523270000u64, 2048u32, 2048u32, 2u32, 4u32, "shadow_d16.raw"),
                     (regs.zeta.address(), 1920, 1080, 4, scene_bh, "scene_d32.raw"),
@@ -1138,6 +1148,15 @@ impl VulkanRasterizer {
                 && cb8 != 0
                 && LIRU14_LATE.load(std::sync::atomic::Ordering::Relaxed)
                 && cb8 == LIRU14_CB8.load(std::sync::atomic::Ordering::Relaxed);
+            if (liru14_idx == 12 || (same_bones && regs.zeta.address() == 0x528170000))
+                && LIRU14_LATE.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                let b = &ctx.const_buffers[0][3];
+                let mut bytes = vec![0u8; 176];
+                let _ = gmmu.read_block(b.address, &mut bytes);
+                let slot = if liru14_idx == 12 { &LIRU14_SHADOW_CB3 } else { &LIRU14_CAMERA_CB3 };
+                *slot.lock().unwrap() = bytes;
+            }
             if liru14_idx == 12 {
                 let b = &ctx.const_buffers[0][3];
                 let mut bytes = [0u8; 176];
