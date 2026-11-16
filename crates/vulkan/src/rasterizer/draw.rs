@@ -543,6 +543,35 @@ const GRAPHICS_SLOTS: [(usize, usize); 5] = [(1, 0), (2, 1), (3, 2), (4, 3), (5,
 
 /// Whether the draw runs task and mesh programs (SET_MESH_CONTROL, NVN2 only), whose
 /// workgroup count is the draw's vertex count.
+fn liru14_skip(regs: &Regs) -> bool {
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    static ZETA: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static RUN: AtomicU32 = AtomicU32::new(0);
+    static LOGS: AtomicU32 = AtomicU32::new(0);
+    let Some(want) = *ZETA.get_or_init(|| {
+        std::env::var("LIRU14_SKIPZ")
+            .ok()
+            .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+    }) else {
+        return false;
+    };
+    let secs = START.get_or_init(std::time::Instant::now).elapsed().as_secs();
+    if regs.zeta_enable == 0 || regs.zeta.address() != want {
+        let n = RUN.swap(0, Relaxed);
+        if n != 0 && LOGS.fetch_add(1, Relaxed) % 200 == 0 {
+            eprintln!("LIRU14 skip pass secs={secs} draws={n}");
+        }
+        return false;
+    }
+    let idx = RUN.fetch_add(1, Relaxed);
+    let bit = match secs {
+        133..183 => (secs - 133) / 5,
+        _ => return false,
+    };
+    idx & (1 << bit) != 0
+}
+
 fn liru14_phase(regs: &Regs) -> u8 {
     static ZETA: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -860,6 +889,9 @@ impl VulkanRasterizer {
             FixedStateTracker::register_dirty_flags(ctx.dirty);
         }
         let regs = ctx.regs;
+        if liru14_skip(regs) {
+            return Ok(());
+        }
         static LIRU14_RT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
         static LIRU14_RT_LOGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let liru14 = LIRU14_RT
