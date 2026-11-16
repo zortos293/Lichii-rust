@@ -2039,6 +2039,7 @@ fn blits_scale_between_render_targets_on_the_gpu() {
             gmmu,
             &blit_side(GPU_VA, src, [0, 0, 64, 64]),
             &blit_side(dst_va, dst, [0, 0, 32, 32]),
+            vk::Filter::NEAREST,
         )
         .unwrap();
     assert!(blitted);
@@ -2065,6 +2066,89 @@ fn blits_scale_between_render_targets_on_the_gpu() {
 }
 
 #[test]
+fn linear_blits_average_the_source_texels_on_the_gpu() {
+    let gob = GobLayout::Tegra;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let src = rt_info(64, 64, 3, gob);
+    let dst = rt_info(32, 32, 2, gob);
+    let dst_va = GPU_VA + (64 << 10);
+    clear_rt(&mut f, &src, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let column = Rect {
+        x: 0,
+        y: 0,
+        width: 1,
+        height: 64,
+    };
+    clear_rt(&mut f, &src, [1.0, 0.0, 0.0, 1.0], column);
+    let before = f.cache.traffic();
+    let (mut tx, cache, gmmu) = f.tx();
+    let blitted = cache
+        .blit(
+            &mut tx,
+            gmmu,
+            &blit_side(GPU_VA, src, [0, 0, 64, 64]),
+            &blit_side(dst_va, dst, [0, 0, 32, 32]),
+            vk::Filter::LINEAR,
+        )
+        .unwrap();
+    assert!(blitted);
+    assert_eq!(f.cache.traffic(), before, "the downscale stays on the GPU");
+    let (mut tx, cache, _) = f.tx();
+    cache
+        .flush(&mut tx, DADDR + (64 << 10), dst.size_bytes())
+        .unwrap();
+    let tiling = Tiling::new(32, 32, 1, 4, 2, 0, gob);
+    let mut tiled = vec![0; tiling.size_bytes()];
+    f.memory.read_bytes(DADDR + (64 << 10), &mut tiled).unwrap();
+    let mut linear = vec![0; tiling.linear_size_bytes()];
+    unswizzle(&tiling, &tiled, &mut linear);
+    for (i, texel) in linear.as_chunks::<4>().0.iter().enumerate() {
+        let (x, y) = (i % 32, i / 32);
+        let want = if x == 0 { [128, 128, 0, 255] } else { GREEN };
+        assert!(
+            texel
+                .iter()
+                .zip(want)
+                .all(|(&got, want)| got.abs_diff(want) <= 1),
+            "texel ({x}, {y}) is {texel:?}, not {want:?}"
+        );
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn linear_blits_of_integer_texels_go_to_software() {
+    let gob = GobLayout::Tegra;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let integer = |width, height, bh| ImageInfo {
+        format: PixelFormat::A8B8G8R8Uint,
+        ..rt_info(width, height, bh, gob)
+    };
+    let (src, dst) = (integer(64, 64, 3), integer(32, 32, 2));
+    clear_rt(&mut f, &src, [0.0; 4], Rect::ALL);
+    let (mut tx, cache, gmmu) = f.tx();
+    let side = blit_side(GPU_VA, src, [0, 0, 64, 64]);
+    let target = blit_side(GPU_VA + (64 << 10), dst, [0, 0, 32, 32]);
+    assert!(
+        !cache
+            .blit(&mut tx, gmmu, &side, &target, vk::Filter::LINEAR)
+            .unwrap(),
+        "integer texels have no linear filter"
+    );
+    assert!(
+        cache
+            .blit(&mut tx, gmmu, &side, &target, vk::Filter::NEAREST)
+            .unwrap(),
+        "but blit nearest"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
 fn blits_the_host_cannot_do_as_they_are_go_to_software() {
     let gob = GobLayout::Tegra;
     let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
@@ -2084,7 +2168,8 @@ fn blits_the_host_cannot_do_as_they_are_go_to_software() {
                 &mut tx,
                 gmmu,
                 &side,
-                &blit_side(GPU_VA + (64 << 10), integer, [0, 0, 32, 32])
+                &blit_side(GPU_VA + (64 << 10), integer, [0, 0, 32, 32]),
+                vk::Filter::NEAREST,
             )
             .unwrap(),
         "a float format into an integer one"
@@ -2095,7 +2180,8 @@ fn blits_the_host_cannot_do_as_they_are_go_to_software() {
                 &mut tx,
                 gmmu,
                 &side,
-                &blit_side(GPU_VA, src, [0, 0, 32, 32])
+                &blit_side(GPU_VA, src, [0, 0, 32, 32]),
+                vk::Filter::NEAREST,
             )
             .unwrap(),
         "one image on both sides"
@@ -2106,7 +2192,8 @@ fn blits_the_host_cannot_do_as_they_are_go_to_software() {
                 &mut tx,
                 gmmu,
                 &side,
-                &blit_side(GPU_VA + (128 << 10), src, [0, 0, 65, 64])
+                &blit_side(GPU_VA + (128 << 10), src, [0, 0, 65, 64]),
+                vk::Filter::NEAREST,
             )
             .unwrap(),
         "a rectangle leaving its image"
@@ -2132,10 +2219,83 @@ fn blits_from_guest_data_stay_in_software() {
             gmmu,
             &blit_side(GPU_VA, src, [0, 0, 64, 64]),
             &blit_side(GPU_VA + (64 << 10), dst, [0, 0, 32, 32]),
+            vk::Filter::NEAREST,
         )
         .unwrap();
     assert!(!blitted, "an uploaded source no GPU work wrote");
     assert_eq!(f.cache.traffic(), before, "no upload for a software blit");
+    f.assert_no_validation_errors();
+}
+
+/// Texel `(2x + 1, 2y + 1)` of a 64-texel-wide RGBA8 level for each texel of the 32x32 level a
+/// nearest 2:1 `vkCmdBlitImage` makes of it.
+fn nearest_halving(level: &[u8]) -> Vec<u8> {
+    (0..32 * 32)
+        .flat_map(|i| {
+            let (x, y) = (i % 32, i / 32);
+            let at = ((2 * y + 1) * 64 + 2 * x + 1) * 4;
+            level[at..at + 4].to_vec()
+        })
+        .collect()
+}
+
+#[test]
+fn guest_data_blits_into_a_cached_image_on_the_gpu() {
+    let gob = GobLayout::Tegra;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let s = surface(PixelFormat::A8B8G8R8Unorm, 64, 64, 1, 1, 3, gob);
+    let data = level_data(&s, 7);
+    write_surface(&f.memory, &s, &data);
+    let src = rt_info(64, 64, 3, gob);
+    let dst = rt_info(32, 32, 2, gob);
+    let dst_va = GPU_VA + (64 << 10);
+    let target = clear_rt_at(&mut f, dst_va, &dst, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let (mut tx, cache, gmmu) = f.tx();
+    let blitted = cache
+        .blit(
+            &mut tx,
+            gmmu,
+            &blit_side(GPU_VA, src, [0, 0, 64, 64]),
+            &blit_side(dst_va, dst, [0, 0, 32, 32]),
+            vk::Filter::NEAREST,
+        )
+        .unwrap();
+    assert!(
+        blitted,
+        "the GPU reads the target, so the source uploads once"
+    );
+    assert_eq!(f.read_image(target.id)[0], nearest_halving(&data[0]));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn mip_chain_levels_blit_into_each_other_on_the_gpu() {
+    let gob = GobLayout::Tegra;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let s = surface(PixelFormat::A8B8G8R8Unorm, 64, 64, 2, 1, 3, gob);
+    let data = level_data(&s, 9);
+    write_surface(&f.memory, &s, &data);
+    let (chain, view) = f.texture(&tic(0x08, GPU_VA, 64, 64, 1, 2, 3));
+    assert_eq!(view.levels, 2);
+    let level_va = GPU_VA + s.level_offset(1);
+    let (mut tx, cache, gmmu) = f.tx();
+    let blitted = cache
+        .blit(
+            &mut tx,
+            gmmu,
+            &blit_side(GPU_VA, rt_info(64, 64, 3, gob), [0, 0, 64, 64]),
+            &blit_side(level_va, rt_info(32, 32, 2, gob), [0, 0, 32, 32]),
+            vk::Filter::NEAREST,
+        )
+        .unwrap();
+    assert!(blitted, "level 0 into level 1 of one image");
+    let read = f.read_image(chain);
+    assert_eq!(read[0], data[0]);
+    assert_eq!(read[1], nearest_halving(&data[0]));
     f.assert_no_validation_errors();
 }
 
@@ -4460,6 +4620,7 @@ fn blits_into_a_volume_slice_address_stay_off_the_volume() {
                 gmmu,
                 &blit_side(src_va, slice, [0, 0, 32, 32]),
                 &blit_side(slice_va, slice, [0, 0, 32, 32]),
+                vk::Filter::NEAREST,
             )
             .unwrap();
         f.assert_no_validation_errors();
