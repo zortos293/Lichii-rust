@@ -121,7 +121,7 @@ impl Xci {
         if header.root_offset >= image.size() {
             return Err(corrupt(FORMAT, "root partition past the end of the image"));
         }
-        let root = PartitionFs::open(&slice(
+        let root = PartitionFs::open_root(&slice(
             &image,
             header.root_offset,
             image.size() - header.root_offset,
@@ -247,6 +247,17 @@ mod tests {
             assert!(secure.entries().iter().all(|e| secure.verify(e).unwrap()));
             check_application(xci.index());
         }
+    }
+
+    #[test]
+    fn opens_cards_whose_root_pads_the_secure_partition_past_the_end() {
+        let mut image = game_card(false).read_all().unwrap();
+        let record = 0x400 + 0x10 + 2 * 0x40;
+        let size = u64::from_le_bytes(image[record + 8..record + 16].try_into().unwrap());
+        image[record + 8..record + 16].copy_from_slice(&(size + 0x200).to_le_bytes());
+        let mut keys = key_set();
+        let xci = Xci::open(&file(image), &mut keys).unwrap();
+        check_application(xci.index());
     }
 
     #[test]
