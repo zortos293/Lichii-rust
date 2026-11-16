@@ -109,7 +109,7 @@ impl Placement {
             depth,
             bytes_per_pixel,
             block_height,
-            block_depth.min(depth.next_power_of_two().trailing_zeros()),
+            block_depth,
             gob_layout,
         );
         let region = Region {

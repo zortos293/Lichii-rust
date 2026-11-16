@@ -253,6 +253,8 @@ mod tests {
     enum Layout {
         Pitch(u32),
         Block(u32),
+        /// Log2 block height and depth in GOBs.
+        Deep(u32, u32),
     }
 
     struct Setup {
@@ -296,6 +298,7 @@ mod tests {
         let (linear, pitch, bits) = match s.layout {
             Layout::Pitch(pitch) => (1, pitch, 0),
             Layout::Block(height) => (0, 0, height << 4),
+            Layout::Deep(height, depth) => (0, 0, height << 4 | depth << 8),
         };
         write(engine, ctx, base, s.format as u32);
         write(engine, ctx, base + 1, linear);
@@ -539,6 +542,37 @@ mod tests {
             }
         }
         assert_eq!(h.rasterizer.inline_writes.len(), 1);
+    }
+
+    #[test]
+    fn deep_blocks_put_a_one_slice_surface_at_its_gob_of_the_block() {
+        let mut h = Harness::new();
+        let mut engine = Fermi2d::new();
+        let tiling = Tiling::new(16, 16, 2, 4, 0, 1, h.gob_layout);
+        let pixels = rgba8((16, 16), |x, y| [x as u8 + 1, y as u8 + 1, 5, 0xff]);
+        for y in 0..16 {
+            put(&h, 0x1000 + y * 64, &pixels[y as usize * 64..][..64]);
+        }
+        let slice = Surf {
+            format: F::A8B8G8R8Unorm,
+            address: 0x8000 + 512,
+            width: 16,
+            height: 16,
+            layout: Layout::Deep(0, 1),
+        };
+        let setup = Setup::copy(
+            pitch_surface(F::A8B8G8R8Unorm, 0x1000, (16, 16), 64),
+            slice,
+            (16, 16),
+        );
+        run(&mut engine, &mut h.context(), &setup);
+
+        let tiled = get(&h, 0x8000, tiling.size_bytes());
+        let mut linear = vec![0u8; tiling.linear_size_bytes()];
+        unswizzle(&tiling, &tiled, &mut linear);
+        let (first, second) = linear.split_at(16 * 16 * 4);
+        assert!(first.iter().all(|&b| b == 0), "slice 0 keeps its texels");
+        assert_eq!(second, &pixels[..], "slice 1 of a volume two GOBs deep");
     }
 
     #[test]

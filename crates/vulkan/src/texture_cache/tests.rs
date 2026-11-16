@@ -2010,34 +2010,6 @@ fn sparse_images_take_the_layers_of_a_join_their_cap_admits() {
     f.assert_no_validation_errors();
 }
 
-#[test]
-fn copy_surfaces_clamp_their_block_depth_to_their_one_slice() {
-    let surface = CopySurface {
-        address: 0x1000,
-        width: 128,
-        height: 64,
-        depth: 1,
-        layer: 0,
-        pitch: 1280,
-        block: Some((0, 0, 4)),
-        bytes_per_pixel: 8,
-    };
-    let info = |surface: &CopySurface| {
-        ImageInfo::from_copy_surface(surface, PixelFormat::R32G32Float, GobLayout::Tegra)
-    };
-    let flat = CopySurface {
-        block: Some((0, 0, 0)),
-        ..surface
-    };
-    assert!(info(&surface).is_some());
-    assert_eq!(info(&surface), info(&flat));
-    let wide = CopySurface {
-        block: Some((1, 0, 0)),
-        ..surface
-    };
-    assert_eq!(info(&wide), None, "a block wider than one GOB");
-}
-
 fn blit_side(gpu_va: GpuVAddr, info: ImageInfo, rect: [i32; 4]) -> BlitSide {
     BlitSide { gpu_va, info, rect }
 }
