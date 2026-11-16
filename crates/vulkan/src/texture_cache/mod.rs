@@ -841,8 +841,6 @@ const ASTC_TRANSPARENT_BLACK: [u8; 16] = [
     0xfc, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 
-/// Fills the bytes of `out`, image bytes from `offset` on, that no segment maps with
-/// `block`. Gaps start and end on block boundaries, as pages do.
 /// Whether two of `segments` map the same device memory.
 fn self_aliased(segments: &[Segment]) -> bool {
     let mut spans: Vec<_> = segments
@@ -858,6 +856,8 @@ fn self_aliased(segments: &[Segment]) -> bool {
     })
 }
 
+/// Fills the bytes of `out`, image bytes from `offset` on, that no segment maps with
+/// `block`. Gaps start and end on block boundaries, as pages do.
 fn fill_unmapped(segments: &[Segment], offset: u64, out: &mut [u8], block: &[u8; 16]) {
     let end = offset + out.len() as u64;
     let mut at = offset;
