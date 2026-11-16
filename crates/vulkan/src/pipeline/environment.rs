@@ -152,6 +152,22 @@ impl TexturePool {
                     .ok()
             })
             .flatten();
+        static LIRU14_TIC: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        static LIRU14_TIC_LOGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let want = *LIRU14_TIC.get_or_init(|| {
+            std::env::var("LIRU14_TIC")
+                .ok()
+                .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+        });
+        if want == Some(index)
+            && LIRU14_TIC_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4
+        {
+            eprintln!(
+                "LIRU14 tic raw={raw:#x} index={index:#x} words={:08x?} decoded={:?}",
+                entry.map(|e| e.0),
+                entry.map(|e| e.decode())
+            );
+        }
         entry.and_then(|e| e.decode().ok()).unwrap_or(NULL_TEXTURE)
     }
 }
