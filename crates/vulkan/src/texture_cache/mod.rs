@@ -2847,6 +2847,9 @@ impl TextureCache {
     /// on another grid (row width, block or tiling), so its bytes are no texels of `id`.
     fn newer_overlaps_reinterpret(&self, id: ImageId) -> bool {
         let image = self.get(id).expect("a live image id");
+        if image.overlaps_newest <= image.current {
+            return true;
+        }
         let grid = |info: &ImageInfo| {
             let format = info.format;
             (
