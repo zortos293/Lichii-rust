@@ -665,6 +665,19 @@ pub struct TextureCache {
 
 /// A depth or stencil view returns its value in R and leaves G undefined, while guest
 /// swizzles of depth formats (S8D24 among them) read the depth from G.
+/// LIRU-14 diag: the address `LIRU14_VA` names, and a shared log budget.
+pub fn liru14_va(va: u64) -> bool {
+    static WANT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    static LOGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    WANT.get_or_init(|| {
+        std::env::var("LIRU14_VA")
+            .ok()
+            .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+    })
+    .is_some_and(|want| va.abs_diff(want) < 0x80_0000)
+        && LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 1500
+}
+
 fn sampled_swizzle(
     swizzle: [SwizzleSource; 4],
     aspect: vk::ImageAspectFlags,
@@ -1261,6 +1274,14 @@ impl TextureCache {
             };
             self.rescale(tx, found.id, target, true)?;
         }
+        if liru14_va(desc.address) {
+            let i = self.get(found.id).expect("a live image id");
+            eprintln!(
+                "LIRU14 tc sample va={:#x} frame={} tick={} want={}x{}x{} -> id={} layer={} img={}x{}x{} modified={} gpu={}",
+                desc.address, self.frame, self.tick, info.width, info.height, info.layers,
+                found.id.index, found.layer, i.info.width, i.info.height, i.info.layers, i.modified, i.gpu_modified
+            );
+        }
         let mut view = ViewInfo::from_texture(desc, &info);
         view.base_level += found.level;
         view.base_layer += found.layer;
@@ -1300,6 +1321,14 @@ impl TextureCache {
         let Some(found) = self.lookup_or_create(tx, gmmu, gpu_va, info, usage)? else {
             return Ok(None);
         };
+        if liru14_va(gpu_va) {
+            let i = self.get(found.id).expect("a live image id");
+            eprintln!(
+                "LIRU14 tc target va={gpu_va:#x} frame={} tick={} want={}x{}x{} {:?} -> id={} layer={} img={}x{}x{} discard={discard}",
+                self.frame, self.tick, info.width, info.height, info.layers, info.format,
+                found.id.index, found.layer, i.info.width, i.info.height, i.info.layers
+            );
+        }
         let whole = found.level == 0 && found.layer == 0 && {
             let image = self.image(found.id);
             image.info.levels == 1
