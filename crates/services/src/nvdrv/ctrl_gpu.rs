@@ -316,8 +316,6 @@ impl CtrlGpu {
         gc.implementation = 0xE;
         gc.l2_cache_size = 0x10_0000;
         gc.num_tpc_per_gpc = 0x6;
-        gc.big_page_size = 0x10000;
-        gc.compression_page_size = 0x10000;
         gc.sm_arch_warp_count = 0x30;
         gc.sm_arch_sm_version = 0x808;
         gc.sm_arch_spa_version = 0x808;
