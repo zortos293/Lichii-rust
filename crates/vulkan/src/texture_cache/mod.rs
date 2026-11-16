@@ -679,6 +679,14 @@ pub fn liru14_va(va: u64) -> bool {
     })
     .or((learned != 0).then_some(learned))
     .is_some_and(|want| va.abs_diff(want) < 0x80_0000)
+        && {
+            static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let from = std::env::var("LIRU14_FROM")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0u64);
+            START.get_or_init(std::time::Instant::now).elapsed().as_secs() >= from
+        }
         && LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 1500
 }
 
