@@ -1,13 +1,15 @@
 //! Host virtual memory: the guest DRAM backing and reserved regions that map views of it.
 //!
-//! The backing is a shareable memory object (a memfd on Linux, a pagefile section on Windows) of
-//! the full DRAM size. Nothing is committed up front: Linux allocates pages on first touch, and
-//! Windows reserves the section (`SEC_RESERVE`) and commits 2 MiB chunks when the kernel first
-//! maps them. Arenas are reserved, inaccessible host ranges into which pages of the backing are
-//! mapped as views, so one physical page can appear at several host addresses.
+//! The backing is shareable memory of the full DRAM size: a memfd on Linux, one pagefile section
+//! per 2 MiB chunk on Windows. Nothing is committed up front and freed memory goes back: Linux
+//! allocates pages on first touch and punches out the pages the kernel frees, and Windows creates
+//! a chunk's section when the kernel first hands out its pages and closes it once they are all
+//! free. Arenas are reserved, inaccessible host ranges into which pages of the backing are mapped
+//! as views, so one physical page can appear at several host addresses.
 
 use std::collections::BTreeMap;
 use std::io;
+use std::ops::Range;
 
 use lichii_common::PAGE_SIZE;
 use parking_lot::Mutex;
@@ -100,6 +102,24 @@ impl Backing {
         self.sys.discard(self.ptr, offset, len)
     }
 
+    /// Gives the host memory behind `[offset, offset + len)`, which holds nothing anyone
+    /// needs, back to the OS, in whole [`Self::release_granule`]s. Returns the part given back,
+    /// which reads as zero once committed again.
+    pub(crate) fn release(&self, offset: usize, len: usize) -> Range<usize> {
+        self.sys.release(self.ptr, offset, len)
+    }
+
+    /// The unit [`Self::release`] gives memory back in.
+    pub(crate) fn release_granule(&self) -> usize {
+        self.sys.release_granule()
+    }
+
+    /// Host memory backing guest DRAM now, in bytes: committed on Windows, allocated in the
+    /// shared memory object on Unix.
+    pub(crate) fn host_bytes(&self) -> u64 {
+        self.sys.host_bytes()
+    }
+
     pub(crate) fn supports_views(&self) -> bool {
         self.sys.supports_views()
     }
@@ -107,7 +127,7 @@ impl Backing {
 
 impl Drop for Backing {
     fn drop(&mut self) {
-        self.sys.release(self.ptr, self.size);
+        self.sys.destroy(self.ptr, self.size);
     }
 }
 
@@ -280,8 +300,9 @@ mod sys {
     pub const EXPOSES_NEW_VIEWS: bool = false;
 
     use std::io;
+    use std::ops::Range;
 
-    use super::{HostProtection, Restricted, protection_runs};
+    use super::{HostProtection, PAGE, Restricted, protection_runs};
 
     fn check(ret: libc::c_int) -> io::Result<()> {
         if ret == 0 {
@@ -301,6 +322,25 @@ mod sys {
 
     pub struct Backing {
         fd: libc::c_int,
+    }
+
+    /// Frees and zeroes `[offset, offset + len)` of a shared memory object in every view.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn punch_hole(fd: libc::c_int, offset: usize, len: usize) -> bool {
+        // SAFETY: plain system call on our own descriptor.
+        unsafe {
+            libc::fallocate(
+                fd,
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                offset as libc::off_t,
+                len as libc::off_t,
+            ) == 0
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn punch_hole(_fd: libc::c_int, _offset: usize, _len: usize) -> bool {
+        false
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -371,28 +411,44 @@ mod sys {
             Ok(())
         }
 
-        pub fn discard(&self, ptr: *mut u8, offset: usize, len: usize) {
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            if self.fd >= 0 {
-                // SAFETY: punching a hole in our own memfd frees and zeroes those pages in every
-                // view.
-                let ret = unsafe {
-                    libc::fallocate(
-                        self.fd,
-                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                        offset as libc::off_t,
-                        len as libc::off_t,
-                    )
-                };
-                if ret == 0 {
-                    return;
+        pub fn release_granule(&self) -> usize {
+            PAGE
+        }
+
+        pub fn host_bytes(&self) -> u64 {
+            if self.fd < 0 {
+                return 0;
+            }
+            // SAFETY: fstat of our own descriptor into a zeroed buffer.
+            unsafe {
+                let mut st: libc::stat = std::mem::zeroed();
+                if libc::fstat(self.fd, &mut st) != 0 {
+                    return 0;
                 }
+                st.st_blocks as u64 * 512
+            }
+        }
+
+        pub fn release(&self, ptr: *mut u8, offset: usize, len: usize) -> Range<usize> {
+            let released = if self.fd >= 0 {
+                punch_hole(self.fd, offset, len)
+            } else {
+                // SAFETY: the range is inside our private anonymous mapping, whose pages read as
+                // zero again after MADV_DONTNEED.
+                unsafe { libc::madvise(ptr.add(offset).cast(), len, libc::MADV_DONTNEED) == 0 }
+            };
+            offset..if released { offset + len } else { offset }
+        }
+
+        pub fn discard(&self, ptr: *mut u8, offset: usize, len: usize) {
+            if self.fd >= 0 && punch_hole(self.fd, offset, len) {
+                return;
             }
             // SAFETY: the range is inside the backing view.
             unsafe { std::ptr::write_bytes(ptr.add(offset), 0, len) };
         }
 
-        pub fn release(&mut self, ptr: *mut u8, size: usize) {
+        pub fn destroy(&mut self, ptr: *mut u8, size: usize) {
             // SAFETY: ptr/size is the mapping created in create; fd is ours.
             unsafe {
                 libc::munmap(ptr.cast(), size);
@@ -527,16 +583,16 @@ mod sys {
 
     use std::collections::BTreeMap;
     use std::io;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use parking_lot::Mutex;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Memory::{
-        CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEM_COMMIT, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
-        MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_MAPPED_VIEW_ADDRESS,
-        MapViewOfFile, MapViewOfFile3, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY,
-        PAGE_READWRITE, SEC_RESERVE, UnmapViewOfFile, UnmapViewOfFile2, VirtualAlloc,
-        VirtualAlloc2, VirtualFree, VirtualProtect,
+        CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER,
+        MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
+        PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE, SEC_COMMIT,
+        UnmapViewOfFile2, VirtualAlloc2, VirtualFree, VirtualProtect,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -563,58 +619,148 @@ mod sys {
         }
     }
 
+    enum Slot {
+        /// Part of the reserved range, never committed.
+        Reserved,
+        Committed(HANDLE),
+        /// Freed whole: its section is closed and the scratch section shows in its place.
+        Scratch,
+    }
+
+    /// DRAM as one pagefile-backed section per chunk, each mapped into its slot of one reserved
+    /// range when the kernel first hands out its pages. A chunk the kernel frees whole closes its
+    /// section, which gives its commit and RAM back, and maps the shared scratch section in its
+    /// place, so a late host access to freed memory lands somewhere harmless instead of faulting.
     pub struct Backing {
-        section: HANDLE,
         size: usize,
         committed: Box<[AtomicU64]>,
-        commit_lock: Mutex<()>,
+        committed_chunks: AtomicUsize,
+        slots: Mutex<Box<[Slot]>>,
+        scratch: HANDLE,
+    }
+
+    fn create_section(len: usize) -> io::Result<HANDLE> {
+        let len = len as u64;
+        // SAFETY: creates an unnamed pagefile-backed section; the caller owns the handle.
+        let section = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_COMMIT,
+                (len >> 32) as u32,
+                len as u32,
+                std::ptr::null(),
+            )
+        };
+        if section.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(section)
+    }
+
+    /// Maps `section` over the free placeholder at `at`.
+    ///
+    /// # Safety
+    /// `[at, at + len)` must be exactly one free placeholder of ours.
+    unsafe fn map_over(section: HANDLE, at: *mut u8, len: usize) -> io::Result<()> {
+        // SAFETY: the caller guarantees [at, at + len) is one free placeholder.
+        let view = unsafe {
+            MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                at.cast(),
+                0,
+                len,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if view.Value.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Unmaps the view at `at`, leaving its placeholder.
+    ///
+    /// # Safety
+    /// `at` must be the base of a view we mapped over a placeholder.
+    unsafe fn unmap_view(at: *mut u8) -> io::Result<()> {
+        // SAFETY: the caller guarantees at is one of our views.
+        check(unsafe {
+            UnmapViewOfFile2(
+                GetCurrentProcess(),
+                MEMORY_MAPPED_VIEW_ADDRESS { Value: at.cast() },
+                MEM_PRESERVE_PLACEHOLDER,
+            )
+        })
     }
 
     impl Backing {
         pub fn create(size: usize) -> io::Result<(Self, *mut u8)> {
-            let size64 = size as u64;
-            // SAFETY: creates a pagefile-backed section that is only reserved, never committed as
-            // a whole, then maps one view of it.
-            unsafe {
-                let section = CreateFileMappingW(
-                    INVALID_HANDLE_VALUE,
+            let scratch = create_section(CHUNK)?;
+            // SAFETY: reserves one placeholder covering all of DRAM; chunks are split out of it
+            // as they are committed.
+            let base = unsafe {
+                VirtualAlloc2(
+                    GetCurrentProcess(),
                     std::ptr::null(),
-                    PAGE_READWRITE | SEC_RESERVE,
-                    (size64 >> 32) as u32,
-                    size64 as u32,
-                    std::ptr::null(),
-                );
-                if section.is_null() {
-                    return Err(io::Error::last_os_error());
-                }
-                let view = MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, size);
-                if view.Value.is_null() {
-                    let err = io::Error::last_os_error();
-                    CloseHandle(section);
-                    return Err(err);
-                }
-                let chunks = size.div_ceil(CHUNK);
-                let committed = (0..chunks.div_ceil(64))
-                    .map(|_| AtomicU64::new(0))
-                    .collect();
-                Ok((
-                    Self {
-                        section,
-                        size,
-                        committed,
-                        commit_lock: Mutex::new(()),
-                    },
-                    view.Value.cast(),
-                ))
+                    size,
+                    MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                    PAGE_NOACCESS,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if base.is_null() {
+                let err = io::Error::last_os_error();
+                // SAFETY: scratch is our own handle.
+                unsafe { CloseHandle(scratch) };
+                return Err(err);
             }
+            let chunks = size.div_ceil(CHUNK);
+            Ok((
+                Self {
+                    size,
+                    committed: (0..chunks.div_ceil(64))
+                        .map(|_| AtomicU64::new(0))
+                        .collect(),
+                    committed_chunks: AtomicUsize::new(0),
+                    slots: Mutex::new((0..chunks).map(|_| Slot::Reserved).collect()),
+                    scratch,
+                },
+                base.cast(),
+            ))
         }
 
         pub fn supports_views(&self) -> bool {
             true
         }
 
+        pub fn host_bytes(&self) -> u64 {
+            (self.committed_chunks.load(Ordering::Relaxed) * CHUNK) as u64
+        }
+
+        pub fn release_granule(&self) -> usize {
+            CHUNK
+        }
+
         fn is_committed(&self, chunk: usize) -> bool {
             self.committed[chunk / 64].load(Ordering::Acquire) & (1 << (chunk % 64)) != 0
+        }
+
+        fn chunk_len(&self, chunk: usize) -> usize {
+            CHUNK.min(self.size - chunk * CHUNK)
+        }
+
+        /// The section whose view belongs at `chunk`: its own once committed, else scratch.
+        fn section(&self, chunk: usize) -> HANDLE {
+            match self.slots.lock()[chunk] {
+                Slot::Committed(section) => section,
+                Slot::Reserved | Slot::Scratch => self.scratch,
+            }
         }
 
         pub fn commit(&self, ptr: *mut u8, offset: usize, len: usize) -> io::Result<()> {
@@ -626,22 +772,66 @@ mod sys {
             if (first..=last).all(|c| self.is_committed(c)) {
                 return Ok(());
             }
-            let _guard = self.commit_lock.lock();
+            let mut slots = self.slots.lock();
             for chunk in first..=last {
                 if self.is_committed(chunk) {
                     continue;
                 }
-                let start = chunk * CHUNK;
-                let len = CHUNK.min(self.size - start);
-                // SAFETY: commits pages of our own reserved section view.
-                let ret =
-                    unsafe { VirtualAlloc(ptr.add(start).cast(), len, MEM_COMMIT, PAGE_READWRITE) };
-                if ret.is_null() {
-                    return Err(io::Error::last_os_error());
+                let (len, at) = (self.chunk_len(chunk), ptr.wrapping_add(chunk * CHUNK));
+                let section = create_section(len)?;
+                // SAFETY: the slot holds the scratch view, which unmapping turns back into the
+                // chunk's own placeholder, or lies in the reserved range, from which the split
+                // carves it out (and fails harmlessly once it is split). Either way [at, at + len)
+                // is then one free placeholder.
+                let mapped = unsafe {
+                    match slots[chunk] {
+                        Slot::Scratch => unmap_view(at),
+                        _ => {
+                            VirtualFree(at.cast(), len, MEM_RELEASE | MEM_SPLIT_PLACEHOLDER);
+                            Ok(())
+                        }
+                    }
+                    .and_then(|()| map_over(section, at, len))
+                };
+                if let Err(err) = mapped {
+                    slots[chunk] = Slot::Reserved;
+                    // SAFETY: the section is ours and mapped nowhere.
+                    unsafe { CloseHandle(section) };
+                    return Err(err);
                 }
+                slots[chunk] = Slot::Committed(section);
                 self.committed[chunk / 64].fetch_or(1 << (chunk % 64), Ordering::Release);
+                self.committed_chunks.fetch_add(1, Ordering::Relaxed);
             }
             Ok(())
+        }
+
+        pub fn release(&self, ptr: *mut u8, offset: usize, len: usize) -> Range<usize> {
+            let first = offset.div_ceil(CHUNK);
+            let last = ((offset + len) / CHUNK).max(first);
+            let mut slots = self.slots.lock();
+            for chunk in first..last {
+                let Slot::Committed(section) = slots[chunk] else {
+                    continue;
+                };
+                let (len, at) = (self.chunk_len(chunk), ptr.wrapping_add(chunk * CHUNK));
+                // SAFETY: at is the chunk's own view; unmapping it leaves the chunk's placeholder.
+                if unsafe { unmap_view(at) }.is_err() {
+                    return offset..offset;
+                }
+                self.committed[chunk / 64].fetch_and(!(1 << (chunk % 64)), Ordering::Release);
+                self.committed_chunks.fetch_sub(1, Ordering::Relaxed);
+                // SAFETY: the section is ours; views elsewhere keep it alive until they are
+                // unmapped too. [at, at + len) is the free placeholder the unmap left.
+                slots[chunk] = unsafe {
+                    CloseHandle(section);
+                    match map_over(self.scratch, at, len) {
+                        Ok(()) => Slot::Scratch,
+                        Err(_) => Slot::Reserved,
+                    }
+                };
+            }
+            first * CHUNK..(last * CHUNK).min(self.size).max(first * CHUNK)
         }
 
         pub fn discard(&self, ptr: *mut u8, offset: usize, len: usize) {
@@ -657,11 +847,29 @@ mod sys {
             }
         }
 
-        pub fn release(&mut self, ptr: *mut u8, _size: usize) {
-            // SAFETY: unmaps the view made in create and closes our section handle.
+        pub fn destroy(&mut self, ptr: *mut u8, size: usize) {
+            for (chunk, slot) in self.slots.get_mut().iter().enumerate() {
+                let at = ptr.wrapping_add(chunk * CHUNK);
+                // SAFETY: committed and scratch slots hold our views; unmapping keeps their
+                // placeholders, which the coalesce below joins so one release frees the range.
+                unsafe {
+                    match *slot {
+                        Slot::Committed(section) => {
+                            let _ = unmap_view(at);
+                            CloseHandle(section);
+                        }
+                        Slot::Scratch => {
+                            let _ = unmap_view(at);
+                        }
+                        Slot::Reserved => {}
+                    }
+                }
+            }
+            // SAFETY: every view is gone, so the range is placeholders only.
             unsafe {
-                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: ptr.cast() });
-                CloseHandle(self.section);
+                VirtualFree(ptr.cast(), size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+                VirtualFree(ptr.cast(), 0, MEM_RELEASE);
+                CloseHandle(self.scratch);
             }
         }
     }
@@ -759,7 +967,34 @@ mod sys {
             }
         }
 
+        /// Maps `view` at `offset` as one view per backing chunk it spans, since each chunk is a
+        /// section of its own.
         fn place(
+            &self,
+            base: *mut u8,
+            backing: &Backing,
+            views: &mut BTreeMap<usize, View>,
+            mut offset: usize,
+            mut view: View,
+            restricted: &Restricted,
+        ) -> io::Result<()> {
+            loop {
+                let in_chunk = CHUNK - view.backing_offset % CHUNK;
+                if view.len <= in_chunk {
+                    return self.place_one(base, backing, views, offset, view, restricted);
+                }
+                let head = View {
+                    len: in_chunk,
+                    ..view
+                };
+                self.place_one(base, backing, views, offset, head, restricted)?;
+                offset += in_chunk;
+                view.len -= in_chunk;
+                view.backing_offset += in_chunk;
+            }
+        }
+
+        fn place_one(
             &self,
             base: *mut u8,
             backing: &Backing,
@@ -781,10 +1016,10 @@ mod sys {
                     MEM_RELEASE | MEM_SPLIT_PLACEHOLDER,
                 );
                 let mapped = MapViewOfFile3(
-                    backing.section,
+                    backing.section(view.backing_offset >> CHUNK_BITS),
                     GetCurrentProcess(),
                     base.add(offset).cast(),
-                    view.backing_offset as u64,
+                    (view.backing_offset % CHUNK) as u64,
                     view.len,
                     MEM_REPLACE_PLACEHOLDER,
                     PAGE_READWRITE,
