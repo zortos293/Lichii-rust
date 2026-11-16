@@ -437,7 +437,7 @@ impl Default for GraphicsSettings {
             gpu_accuracy: GpuAccuracy::Normal,
             anisotropic_filtering: Anisotropy::Auto,
             astc_decode: AstcDecode::Gpu,
-            astc_recompression: AstcRecompression::Uncompressed,
+            astc_recompression: AstcRecompression::Bc3,
             async_shader_compilation: true,
             disk_shader_cache: true,
             vram_usage: VramUsage::Conservative,
@@ -607,9 +607,9 @@ pub enum AstcDecode {
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AstcRecompression {
-    #[default]
     Uncompressed,
     Bc1,
+    #[default]
     Bc3,
 }
 
