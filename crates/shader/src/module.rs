@@ -4,7 +4,7 @@
 use std::hash::{Hash, Hasher};
 
 use crate::backend::Bindings;
-use crate::backend::spirv::emit_spirv;
+use crate::backend::spirv::{emit_spirv, uses_cooperative_hmma};
 use crate::hash::StableHasher;
 use crate::translate::{TranslateOptions, TranslatedProgram, translate, translate_dual_vertex};
 use crate::{RuntimeInfo, ShaderEnvironment, ShaderInfo, ShaderStage, TranslateError};
@@ -46,6 +46,7 @@ fn finish(
     let incoming = *bindings;
     let first_binding = bindings.unified;
     let spirv = emit_spirv(options.profile, runtime, &program, bindings)?;
+    let uses_cooperative_matrix = uses_cooperative_hmma(options.profile, &program);
     let resources = ResourceLayout::for_module(&program.info, first_binding);
     debug_assert_eq!(resources.next_binding(first_binding), bindings.unified);
     let mut hasher = StableHasher::new();
@@ -57,7 +58,10 @@ fn finish(
         hash: hasher.finish(),
         stage: program.stage,
         resources,
-        info: program.info,
+        info: ShaderInfo {
+            uses_cooperative_matrix,
+            ..program.info
+        },
     })
 }
 

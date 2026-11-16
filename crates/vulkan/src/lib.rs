@@ -4,6 +4,7 @@
 
 pub mod buffer_cache;
 pub mod commands;
+mod cooperative_hmma;
 pub mod debug;
 pub mod descriptors;
 pub mod device;

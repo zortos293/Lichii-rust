@@ -49,6 +49,12 @@ pub struct Profile {
     /// subgroup size of 32 when they [use the warp size](crate::ShaderInfo::uses_warp_size).
     /// Those stages are emitted for 32-lane subgroups, without the wider-warp emulation.
     pub guest_warp_stages: u32,
+    /// HMMA.16816 with f16 accumulators runs on 16x8x16 cooperative matrices whose lane-local
+    /// elements follow the guest's registers; the renderer checks that with
+    /// [`crate::backend::spirv::cooperative_hmma_test`] before it sets this.
+    pub support_cooperative_hmma: bool,
+    /// The same with f32 accumulators.
+    pub support_cooperative_hmma_f32: bool,
 
     pub support_vertex_instance_id: bool,
     pub support_viewport_index_layer_non_geometry: bool,
@@ -146,6 +152,8 @@ impl Default for Profile {
             warp_size_potentially_larger_than_guest: false,
             max_subgroup_size: 32,
             guest_warp_stages: 0,
+            support_cooperative_hmma: false,
+            support_cooperative_hmma_f32: false,
             support_vertex_instance_id: false,
             support_viewport_index_layer_non_geometry: false,
             support_viewport_mask: false,

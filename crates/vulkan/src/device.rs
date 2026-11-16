@@ -42,6 +42,8 @@ pub struct DeviceExtensions {
     pub index_type_uint8: bool,
     pub line_rasterization: bool,
     pub shader_stencil_export: bool,
+    /// `VK_KHR_cooperative_matrix`, enabled only when the guest's HMMA can use it.
+    pub cooperative_matrix: bool,
 }
 
 type ExtensionFlag = fn(&mut DeviceExtensions) -> &mut bool;
@@ -133,6 +135,11 @@ pub struct DeviceFeatures {
     pub uniform_and_storage_buffer_16bit: bool,
     pub demote_to_helper_invocation: bool,
     pub subgroup_size_control: bool,
+    /// Cooperative matrices of the guest's HMMA.16816 shape with half accumulators, in compute
+    /// subgroups of exactly 32 lanes. The renderer's self-test decides whether programs use them.
+    pub cooperative_hmma_f16: bool,
+    /// The same with f32 accumulators, for HMMA.16816.F32.
+    pub cooperative_hmma_f32: bool,
 }
 
 /// Facts about the physical device the renderer needs at run time.
@@ -329,6 +336,7 @@ impl Device {
                 names.push(name.as_ptr());
             }
         }
+        extensions.cooperative_matrix = has(khr::cooperative_matrix::NAME);
 
         let mut v11 = vk::PhysicalDeviceVulkan11Features::default();
         let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
@@ -346,6 +354,7 @@ impl Device {
         let mut clip_enable = vk::PhysicalDeviceDepthClipEnableFeaturesEXT::default();
         let mut uint8 = vk::PhysicalDeviceIndexTypeUint8FeaturesKHR::default();
         let mut lines = vk::PhysicalDeviceLineRasterizationFeaturesKHR::default();
+        let mut cooperative = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
 
         macro_rules! chain {
             ($features:expr) => {{
@@ -365,6 +374,7 @@ impl Device {
                 clip_enable.p_next = std::ptr::null_mut();
                 uint8.p_next = std::ptr::null_mut();
                 lines.p_next = std::ptr::null_mut();
+                cooperative.p_next = std::ptr::null_mut();
                 let mut features = vk::PhysicalDeviceFeatures2::default()
                     .push_next(&mut v11)
                     .push_next(&mut v12)
@@ -408,6 +418,9 @@ impl Device {
                 if extensions.line_rasterization {
                     features = features.push_next(&mut lines);
                 }
+                if extensions.cooperative_matrix {
+                    features = features.push_next(&mut cooperative);
+                }
                 features.features = $features;
                 features
             }};
@@ -434,7 +447,7 @@ impl Device {
         mesh.primitive_fragment_shading_rate_mesh_shader = vk::FALSE;
         mesh.mesh_shader_queries = vk::FALSE;
         let on = |b: vk::Bool32| b != vk::FALSE;
-        let features = DeviceFeatures {
+        let mut features = DeviceFeatures {
             extensions,
             sampler_anisotropy: on(core.sampler_anisotropy),
             texture_compression_bc: on(core.texture_compression_bc),
@@ -505,7 +518,94 @@ impl Device {
             uniform_and_storage_buffer_16bit: on(v11.uniform_and_storage_buffer16_bit_access),
             demote_to_helper_invocation: on(v13.shader_demote_to_helper_invocation),
             subgroup_size_control: on(v13.subgroup_size_control),
+            cooperative_hmma_f16: false,
+            cooperative_hmma_f32: false,
         };
+
+        let mut v11_properties = vk::PhysicalDeviceVulkan11Properties::default();
+        let mut v12_properties = vk::PhysicalDeviceVulkan12Properties::default();
+        let mut v13_properties = vk::PhysicalDeviceVulkan13Properties::default();
+        let mut mesh_properties = vk::PhysicalDeviceMeshShaderPropertiesEXT::default();
+        let mut library_properties =
+            vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT::default();
+        let mut cooperative_properties =
+            vk::PhysicalDeviceCooperativeMatrixPropertiesKHR::default();
+        let mut shading_rate_properties =
+            vk::PhysicalDeviceFragmentShadingRatePropertiesKHR::default();
+        let shading_rate = has(khr::fragment_shading_rate::NAME);
+        let mut properties2 = vk::PhysicalDeviceProperties2::default()
+            .push_next(&mut v11_properties)
+            .push_next(&mut v12_properties)
+            .push_next(&mut v13_properties);
+        if features.mesh_shader {
+            properties2 = properties2.push_next(&mut mesh_properties);
+        }
+        if features.graphics_pipeline_library {
+            properties2 = properties2.push_next(&mut library_properties);
+        }
+        if extensions.cooperative_matrix {
+            properties2 = properties2.push_next(&mut cooperative_properties);
+        }
+        if shading_rate {
+            properties2 = properties2.push_next(&mut shading_rate_properties);
+        }
+        // SAFETY: every struct in the chain belongs to an extension the device reports.
+        unsafe { raw_instance.get_physical_device_properties2(physical, &mut properties2) };
+        let base = properties2.properties;
+
+        let guest_shapes = if extensions.cooperative_matrix {
+            let loader = khr::cooperative_matrix::Instance::new(&instance.entry, raw_instance);
+            // SAFETY: the device reports the extension.
+            let shapes =
+                unsafe { loader.get_physical_device_cooperative_matrix_properties(physical) }
+                    .unwrap_or_default();
+            [vk::ComponentTypeKHR::FLOAT16, vk::ComponentTypeKHR::FLOAT32]
+                .map(|accumulator| crate::cooperative_hmma::has_guest_shape(&shapes, accumulator))
+        } else {
+            [false; 2]
+        };
+        let driver = v12_properties.driver_id;
+        // AMD drivers advertise cooperative matrices on GPUs without matrix cores, emulated,
+        // and amdvlk crashes building them on RDNA2; RDNA3 brought matrix cores together with
+        // accelerated mixed-signedness dot4, which the driver reports.
+        let emulated_matrices = matches!(
+            driver,
+            vk::DriverId::AMD_PROPRIETARY | vk::DriverId::AMD_OPEN_SOURCE | vk::DriverId::MESA_RADV
+        ) && !on(
+            v13_properties.integer_dot_product4x8_bit_packed_mixed_signedness_accelerated
+        );
+        // NVIDIA's compiler miscompiles some cooperative matrix shaders on Turing only, which the
+        // self-test does not catch (C++ Lichii #1102). Turing is the one architecture with
+        // fragment shading rates but without primitive rates across viewports.
+        let turing = driver == vk::DriverId::NVIDIA_PROPRIETARY
+            && shading_rate
+            && !on(shading_rate_properties.primitive_fragment_shading_rate_with_multiple_viewports);
+        let cooperative_subgroups = extensions.cooperative_matrix
+            && !emulated_matrices
+            && !turing
+            && on(cooperative.cooperative_matrix)
+            && cooperative_properties
+                .cooperative_matrix_supported_stages
+                .contains(vk::ShaderStageFlags::COMPUTE)
+            && features.shader_float16
+            && on(v12.vulkan_memory_model)
+            && on(v12.vulkan_memory_model_device_scope)
+            && on(v13.compute_full_subgroups)
+            && v11_properties
+                .subgroup_supported_stages
+                .contains(vk::ShaderStageFlags::COMPUTE)
+            && v11_properties.subgroup_size == 32
+            && v13_properties.min_subgroup_size == 32
+            && v13_properties.max_subgroup_size == 32;
+        features.cooperative_hmma_f16 = cooperative_subgroups && guest_shapes[0];
+        features.cooperative_hmma_f32 = cooperative_subgroups && guest_shapes[1];
+        extensions.cooperative_matrix =
+            features.cooperative_hmma_f16 || features.cooperative_hmma_f32;
+        features.extensions.cooperative_matrix = extensions.cooperative_matrix;
+        if extensions.cooperative_matrix {
+            names.push(khr::cooperative_matrix::NAME.as_ptr());
+            cooperative.cooperative_matrix_robust_buffer_access = vk::FALSE;
+        }
 
         let aftermath = crate::debug::aftermath::get().is_some()
             && has(nv::device_diagnostics_config::NAME)
@@ -552,33 +652,15 @@ impl Device {
                 .call("vkCreateDevice")?
         };
 
-        let mut v11_properties = vk::PhysicalDeviceVulkan11Properties::default();
-        let mut v12_properties = vk::PhysicalDeviceVulkan12Properties::default();
-        let mut v13_properties = vk::PhysicalDeviceVulkan13Properties::default();
-        let mut mesh_properties = vk::PhysicalDeviceMeshShaderPropertiesEXT::default();
-        let mut library_properties =
-            vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT::default();
-        let mut properties2 = vk::PhysicalDeviceProperties2::default()
-            .push_next(&mut v11_properties)
-            .push_next(&mut v12_properties)
-            .push_next(&mut v13_properties);
-        if features.mesh_shader {
-            properties2 = properties2.push_next(&mut mesh_properties);
-        }
-        if features.graphics_pipeline_library {
-            properties2 = properties2.push_next(&mut library_properties);
-        }
         // SAFETY: valid physical device and queue family.
         let (queue, families, memory_properties) = unsafe {
-            raw_instance.get_physical_device_properties2(physical, &mut properties2);
             (
                 raw.get_device_queue(candidate.queue_family, 0),
                 raw_instance.get_physical_device_queue_family_properties(physical),
                 raw_instance.get_physical_device_memory_properties(physical),
             )
         };
-        let base = properties2.properties;
-        let (shader_profile, shader_host) = shader_profile(
+        let (mut shader_profile, shader_host) = shader_profile(
             &features,
             &ShaderQueries {
                 api_version: base.api_version,
@@ -638,6 +720,32 @@ impl Device {
                 return Err(error.into());
             }
         };
+
+        let spirv_version = shader_profile.supported_spirv;
+        let self_test = |f32_accumulators| {
+            crate::cooperative_hmma::passes(
+                &raw,
+                queue,
+                candidate.queue_family,
+                &memory_properties,
+                spirv_version,
+                f32_accumulators,
+            )
+            .unwrap_or_else(|error| {
+                tracing::warn!("cooperative matrix self-test: {error}");
+                false
+            })
+        };
+        shader_profile.support_cooperative_hmma = features.cooperative_hmma_f16 && self_test(false);
+        shader_profile.support_cooperative_hmma_f32 =
+            features.cooperative_hmma_f32 && self_test(true);
+        if features.extensions.cooperative_matrix {
+            tracing::info!(
+                "cooperative matrices for guest HMMA.16816: f16 accumulators {}, f32 accumulators {}",
+                shader_profile.support_cooperative_hmma,
+                shader_profile.support_cooperative_hmma_f32,
+            );
+        }
 
         let labels = instance
             .labels

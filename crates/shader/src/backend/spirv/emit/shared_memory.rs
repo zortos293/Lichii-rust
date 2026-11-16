@@ -54,7 +54,7 @@ fn word_pointers(ctx: &mut EmitContext<'_>, offset: Word, count: u32) -> EmitRes
 fn load_word(ctx: &mut EmitContext<'_>, offset: Word) -> EmitResult<Word> {
     let [pointer, ..] = word_pointers(ctx, offset, 1)?;
     let u32_t = ctx.u32[1];
-    Ok(ctx.b.load(u32_t, None, pointer, None, [])?)
+    ctx.load_shared(u32_t, pointer)
 }
 
 #[derive(Clone, Copy)]
@@ -78,7 +78,7 @@ fn load_small(
             (ctx.u16, ctx.shared_u16, ctx.shared_memory_u16, 1)
         };
         let pointer = explicit_pointer(ctx, pointer_type, array, offset, shift)?;
-        let value = ctx.b.load(ty, None, pointer, None, [])?;
+        let value = ctx.load_shared(ty, pointer)?;
         return Ok(match extend {
             Extend::Zero => ctx.b.u_convert(u32_t, None, value)?,
             Extend::Sign => ctx.b.s_convert(u32_t, None, value)?,
@@ -106,13 +106,13 @@ fn load_vector(ctx: &mut EmitContext<'_>, inst: InstId, words: u32) -> EmitResul
             (ctx.shared_u32x4, ctx.shared_memory_u32x4, 4)
         };
         let pointer = explicit_pointer(ctx, pointer_type, array, offset, shift)?;
-        return Ok(ctx.b.load(ty, None, pointer, None, [])?);
+        return ctx.load_shared(ty, pointer);
     }
     let pointers = word_pointers(ctx, offset, words)?;
     let u32_t = ctx.u32[1];
     let mut values = [0; 4];
     for (value, &pointer) in values.iter_mut().zip(&pointers).take(words as usize) {
-        *value = ctx.b.load(u32_t, None, pointer, None, [])?;
+        *value = ctx.load_shared(u32_t, pointer)?;
     }
     Ok(ctx
         .b
@@ -130,7 +130,7 @@ fn write_small(ctx: &mut EmitContext<'_>, inst: InstId, bits: u32) -> EmitResult
         };
         let pointer = explicit_pointer(ctx, pointer_type, array, offset, shift)?;
         let narrow = ctx.b.u_convert(ty, None, value)?;
-        return Ok(ctx.b.store(pointer, narrow, None, [])?);
+        return ctx.store_shared(pointer, narrow);
     }
     let func = if bits == 8 {
         ctx.shared_store_u8_func
@@ -152,7 +152,7 @@ fn write_vector(ctx: &mut EmitContext<'_>, inst: InstId, words: u32) -> EmitResu
             (ctx.shared_u32x4, ctx.shared_memory_u32x4, 4)
         };
         let pointer = explicit_pointer(ctx, pointer_type, array, offset, shift)?;
-        return Ok(ctx.b.store(pointer, value, None, [])?);
+        return ctx.store_shared(pointer, value);
     }
     let pointers = word_pointers(ctx, offset, words)?;
     let u32_t = ctx.u32[1];
@@ -160,7 +160,7 @@ fn write_vector(ctx: &mut EmitContext<'_>, inst: InstId, words: u32) -> EmitResu
         let part = ctx
             .b
             .composite_extract(u32_t, None, value, [index as u32])?;
-        ctx.b.store(pointer, part, None, [])?;
+        ctx.store_shared(pointer, part)?;
     }
     Ok(())
 }
@@ -188,7 +188,7 @@ pub(super) fn load_shared_u32(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitRe
     }
     let (u32_t, pointer_type, array) = (ctx.u32[1], ctx.shared_u32, ctx.shared_memory_u32);
     let pointer = explicit_pointer(ctx, pointer_type, array, offset, 2)?;
-    Ok(ctx.b.load(u32_t, None, pointer, None, [])?)
+    ctx.load_shared(u32_t, pointer)
 }
 
 pub(super) fn load_shared_u64(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<Word> {
@@ -216,7 +216,7 @@ pub(super) fn write_shared_u32(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitR
     } else {
         word_pointers(ctx, offset, 1)?[0]
     };
-    Ok(ctx.b.store(pointer, value, None, [])?)
+    ctx.store_shared(pointer, value)
 }
 
 pub(super) fn write_shared_u64(ctx: &mut EmitContext<'_>, inst: InstId) -> EmitResult<()> {
