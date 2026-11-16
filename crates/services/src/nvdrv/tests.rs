@@ -940,8 +940,8 @@ fn ctrl_gpu_characteristics_switch2() {
             u32_at(gc, 0x2C),
             u32_at(gc, 0x44)
         ),
-        (6, 0x10000, 0x10000, 0x30),
-        "TPCs per GPC, Ampere big and compression pages, warps per SM"
+        (6, 0x20000, 0x20000, 0x30),
+        "TPCs per GPC, the big and compression pages the address space uses, warps per SM"
     );
 
     let masks = nv.ioctl3(
