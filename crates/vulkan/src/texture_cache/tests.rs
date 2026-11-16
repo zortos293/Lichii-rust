@@ -2010,6 +2010,34 @@ fn sparse_images_take_the_layers_of_a_join_their_cap_admits() {
     f.assert_no_validation_errors();
 }
 
+#[test]
+fn copy_surfaces_clamp_their_block_depth_to_their_one_slice() {
+    let surface = CopySurface {
+        address: 0x1000,
+        width: 128,
+        height: 64,
+        depth: 1,
+        layer: 0,
+        pitch: 1280,
+        block: Some((0, 0, 4)),
+        bytes_per_pixel: 8,
+    };
+    let info = |surface: &CopySurface| {
+        ImageInfo::from_copy_surface(surface, PixelFormat::R32G32Float, GobLayout::Tegra)
+    };
+    let flat = CopySurface {
+        block: Some((0, 0, 0)),
+        ..surface
+    };
+    assert!(info(&surface).is_some());
+    assert_eq!(info(&surface), info(&flat));
+    let wide = CopySurface {
+        block: Some((1, 0, 0)),
+        ..surface
+    };
+    assert_eq!(info(&wide), None, "a block wider than one GOB");
+}
+
 fn blit_side(gpu_va: GpuVAddr, info: ImageInfo, rect: [i32; 4]) -> BlitSide {
     BlitSide { gpu_va, info, rect }
 }
@@ -2224,6 +2252,75 @@ fn blits_from_guest_data_stay_in_software() {
         .unwrap();
     assert!(!blitted, "an uploaded source no GPU work wrote");
     assert_eq!(f.cache.traffic(), before, "no upload for a software blit");
+    f.assert_no_validation_errors();
+}
+
+/// Texel `(2x + 1, 2y + 1)` of a 64-texel-wide RGBA8 level for each texel of the 32x32 level a
+/// nearest 2:1 `vkCmdBlitImage` makes of it.
+fn nearest_halving(level: &[u8]) -> Vec<u8> {
+    (0..32 * 32)
+        .flat_map(|i| {
+            let (x, y) = (i % 32, i / 32);
+            let at = ((2 * y + 1) * 64 + 2 * x + 1) * 4;
+            level[at..at + 4].to_vec()
+        })
+        .collect()
+}
+
+#[test]
+fn guest_data_blits_into_a_cached_image_on_the_gpu() {
+    let gob = GobLayout::Tegra;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let s = surface(PixelFormat::A8B8G8R8Unorm, 64, 64, 1, 1, 3, gob);
+    let data = level_data(&s, 7);
+    write_surface(&f.memory, &s, &data);
+    let src = rt_info(64, 64, 3, gob);
+    let dst = rt_info(32, 32, 2, gob);
+    let dst_va = GPU_VA + (64 << 10);
+    let target = clear_rt_at(&mut f, dst_va, &dst, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let (mut tx, cache, gmmu) = f.tx();
+    let blitted = cache
+        .blit(
+            &mut tx,
+            gmmu,
+            &blit_side(GPU_VA, src, [0, 0, 64, 64]),
+            &blit_side(dst_va, dst, [0, 0, 32, 32]),
+            vk::Filter::NEAREST,
+        )
+        .unwrap();
+    assert!(blitted, "the GPU reads the target, so the source uploads once");
+    assert_eq!(f.read_image(target.id)[0], nearest_halving(&data[0]));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn mip_chain_levels_blit_into_each_other_on_the_gpu() {
+    let gob = GobLayout::Tegra;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let s = surface(PixelFormat::A8B8G8R8Unorm, 64, 64, 2, 1, 3, gob);
+    let data = level_data(&s, 9);
+    write_surface(&f.memory, &s, &data);
+    let (chain, view) = f.texture(&tic(0x08, GPU_VA, 64, 64, 1, 2, 3));
+    assert_eq!(view.levels, 2);
+    let level_va = GPU_VA + s.level_offset(1);
+    let (mut tx, cache, gmmu) = f.tx();
+    let blitted = cache
+        .blit(
+            &mut tx,
+            gmmu,
+            &blit_side(GPU_VA, rt_info(64, 64, 3, gob), [0, 0, 64, 64]),
+            &blit_side(level_va, rt_info(32, 32, 2, gob), [0, 0, 32, 32]),
+            vk::Filter::NEAREST,
+        )
+        .unwrap();
+    assert!(blitted, "level 0 into level 1 of one image");
+    let read = f.read_image(chain);
+    assert_eq!(read[0], data[0]);
+    assert_eq!(read[1], nearest_halving(&data[0]));
     f.assert_no_validation_errors();
 }
 
