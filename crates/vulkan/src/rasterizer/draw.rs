@@ -1557,6 +1557,20 @@ impl VulkanRasterizer {
         }
         if regs.zeta_enable != 0 && crate::texture_cache::liru14_va(regs.zeta.address()) {
             eprintln!(
+                "LIRU14 bias fill={} line={} point={} units={} slope={} clamp={} depth_mode={:?} clip={:?} test={} write={} func={:?}",
+                regs.polygon_offset_fill_enable,
+                regs.polygon_offset_line_enable,
+                regs.polygon_offset_point_enable,
+                regs.depth_bias,
+                regs.slope_scale_depth_bias,
+                regs.depth_bias_clamp,
+                regs.depth_mode,
+                regs.viewport_clip_control,
+                regs.depth_test_enable,
+                regs.depth_write_enabled,
+                regs.depth_test_func
+            );
+            eprintln!(
                 "LIRU14 zeta addr={:#x} format={:#x} tile_mode={:?} array_pitch={:#x} size={:?} layered={layered} viewport0={:?} rt_count={}",
                 regs.zeta.address(),
                 regs.zeta.format,
