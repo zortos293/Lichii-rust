@@ -909,12 +909,7 @@ fn targets_drawn_into_take_newer_mip_chains_over_them() {
         &mut f,
         &rt_info(64, 64, 3, GobLayout::Tegra),
         [1.0, 0.0, 0.0, 1.0],
-        Rect {
-            x: 0,
-            y: 0,
-            width: 64,
-            height: 63,
-        },
+        Rect::ALL,
     );
     assert_eq!(level.id, chain, "the chain's level 0 is drawn into");
     let (mut tx, cache, gmmu) = f.tx();
