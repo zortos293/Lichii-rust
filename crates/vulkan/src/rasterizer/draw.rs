@@ -931,13 +931,18 @@ impl VulkanRasterizer {
             self.draw.image_scaling = ScalingBits::default();
             self.draw.storage_images.clear();
             self.draw.texel_views.clear();
-            let shirt = std::env::var_os("LIRU14_SHIRT").is_some()
+            let offsets: Vec<u32> = std::env::var("LIRU14_SHIRT")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|o| o.parse().ok())
+                .collect();
+            let shirt = !offsets.is_empty()
                 && self.draw.stages[4].as_ref().is_some_and(|m| {
                     m.info
                         .texture_descriptors
                         .iter()
                         .map(|t| (t.handle.cbuf_index, t.handle.cbuf_offset))
-                        .eq([32, 40, 56, 64, 128, 160, 168, 216, 224].map(|o| (2, o)))
+                        .eq(offsets.iter().map(|&o| (2, o)))
                 });
             if shirt {
                 eprintln!(
