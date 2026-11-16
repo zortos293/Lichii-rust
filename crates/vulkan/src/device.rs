@@ -15,6 +15,7 @@ use lichii_shader::profile::HostTranslateInfo;
 use crate::error::{Error, Result, VkResultExt};
 use crate::instance::Instance;
 use crate::profile::{ShaderQueries, shader_profile};
+use crate::video;
 
 /// Device memory blocks are 64 MiB: with 256 MiB blocks ~38% of device memory sat empty in
 /// half-used blocks and evictions never lowered the driver's usage (NX2_NOTES row 114).
@@ -175,6 +176,8 @@ pub struct Device {
     pub shader_host: HostTranslateInfo,
     /// Debug names and labels, with `debug.vulkan_labels`.
     pub(crate) labels: Option<ext::debug_utils::Device>,
+    /// The video decode queue, when the device decodes AV1 or VP9 on one of its own.
+    pub video: Option<Arc<video::VideoDevice>>,
 }
 
 struct Candidate {
@@ -294,7 +297,9 @@ impl Device {
             return Err(Error::NoDevice);
         }
         let candidate = candidates.swap_remove(chosen);
-        Self::create(instance, candidate, surface.is_some())
+        let device = Self::create(instance, candidate, surface.is_some())?;
+        crate::video_decode::register(&device);
+        Ok(device)
     }
 
     fn create(
@@ -310,7 +315,13 @@ impl Device {
                 .enumerate_device_extension_properties(physical)
                 .call("vkEnumerateDeviceExtensionProperties")?
         };
+        let disabled = video::disabled_extensions();
         let has = |name: &CStr| {
+            let lower = name.to_string_lossy().to_ascii_lowercase();
+            if disabled.iter().any(|d| lower.contains(d.as_str())) {
+                tracing::info!("Vulkan: {} not enabled (LICHII_VULKAN_DISABLE)", lower);
+                return false;
+            }
             available
                 .iter()
                 .any(|e| e.extension_name_as_c_str() == Ok(name))
@@ -329,7 +340,6 @@ impl Device {
                 names.push(name.as_ptr());
             }
         }
-
         let mut v11 = vk::PhysicalDeviceVulkan11Features::default();
         let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
         let mut v13 = vk::PhysicalDeviceVulkan13Features::default();
@@ -639,6 +649,10 @@ impl Device {
             }
         };
 
+        let video = video::VideoDevice::new(&instance, physical, candidate.queue_family);
+        if video.is_none() {
+            tracing::info!("Vulkan video: no AV1 or VP9 decode queue on this device");
+        }
         let labels = instance
             .labels
             .then(|| ext::debug_utils::Device::new(raw_instance, &raw));
@@ -656,6 +670,7 @@ impl Device {
             shader_profile,
             shader_host,
             labels,
+            video,
         }))
     }
 

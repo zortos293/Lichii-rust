@@ -1,11 +1,12 @@
-//! A software decoder for one compressed stream, on FFmpeg.
+//! A decoder for one compressed stream: on the host GPU's video engine when the renderer
+//! registered one for the codec ([`set_gpu_video`]), else in software on FFmpeg.
 //!
-//! The types here are what a later host GPU decoder (d3d11va, Vulkan video) would also produce:
 //! [`Frame`] holds a decoded picture and [`Picture`] is a backend-neutral view of its planes,
-//! so callers never see FFmpeg.
+//! so callers never see which decoder made it.
 
 use std::ffi::{CStr, c_int, c_void};
 use std::ptr;
+use std::sync::{Arc, RwLock};
 
 use crate::ffmpeg::{
     self, AVBufferPool, AVCodecContext, AVERROR_EAGAIN, AVERROR_EOF, AVFrame, AVPacket, Api,
@@ -19,6 +20,8 @@ pub enum Codec {
     H264,
     Vp8,
     Vp9,
+    /// AV1, as temporal units of OBUs. Decoded on the host GPU only.
+    Av1,
 }
 
 impl Codec {
@@ -27,6 +30,8 @@ impl Codec {
         let mime = mime.to_ascii_lowercase();
         if mime.contains("vp9") {
             Some(Self::Vp9)
+        } else if mime.contains("av1") || mime.contains("av01") {
+            Some(Self::Av1)
         } else if mime.contains("vp8") {
             Some(Self::Vp8)
         } else if mime.contains("avc") || mime.contains("264") {
@@ -36,11 +41,13 @@ impl Codec {
         }
     }
 
-    fn decoder_name(self) -> &'static CStr {
+    /// The FFmpeg decoder, `None` for codecs only the host GPU decodes.
+    fn decoder_name(self) -> Option<&'static CStr> {
         match self {
-            Self::H264 => c"h264",
-            Self::Vp8 => c"vp8",
-            Self::Vp9 => c"vp9",
+            Self::H264 => Some(c"h264"),
+            Self::Vp8 => Some(c"vp8"),
+            Self::Vp9 => Some(c"vp9"),
+            Self::Av1 => None,
         }
     }
 }
@@ -72,6 +79,66 @@ pub enum VideoError {
     /// An FFmpeg call failed with this AVERROR code: corrupt input, or out of memory.
     #[error("FFmpeg error {0}")]
     Ffmpeg(i32),
+    /// The host GPU decoder failed: a Vulkan error code, or 0 for input it cannot decode.
+    #[error("GPU video decoder error {0}")]
+    Gpu(i32),
+}
+
+/// A picture the host GPU decoded, brought to CPU memory as NV12: `width` x `height` luma
+/// bytes, then interleaved UV rows of `width` bytes for `height.div_ceil(2)` rows.
+#[derive(Clone, Debug, Default)]
+pub struct OwnedPicture {
+    pub width: u32,
+    pub height: u32,
+    pub pts: i64,
+    pub data: Vec<u8>,
+    pub color: Color,
+}
+
+impl OwnedPicture {
+    /// The stride of both planes: the width rounded up to whole chroma samples.
+    pub fn stride(&self) -> usize {
+        self.width.next_multiple_of(2) as usize
+    }
+
+    /// Bytes the NV12 picture takes.
+    pub fn size(width: u32, height: u32) -> usize {
+        let stride = width.next_multiple_of(2) as usize;
+        stride * height as usize + stride * height.div_ceil(2) as usize
+    }
+}
+
+/// One stream decoding on the host GPU, with the [`Decoder`] calls.
+pub trait GpuStream: Send {
+    fn send(&mut self, data: &[u8], pts: i64) -> Result<(), VideoError>;
+    /// The stream ends: pictures still held come out of [`GpuStream::receive`].
+    fn end_of_stream(&mut self);
+    /// The next picture in display order into `out`; false when none is ready.
+    fn receive(&mut self, out: &mut OwnedPicture) -> Result<bool, VideoError>;
+    /// Drops queued input and held pictures, for a seek.
+    fn flush(&mut self);
+}
+
+/// The host GPU's video decoder, as the renderer registers it.
+pub trait GpuVideo: Send + Sync {
+    /// A stream for `codec`, or `None` when the GPU does not decode it.
+    fn open(&self, codec: Codec) -> Option<Box<dyn GpuStream>>;
+}
+
+static GPU_VIDEO: RwLock<Option<Arc<dyn GpuVideo>>> = RwLock::new(None);
+
+/// Registers the host GPU's video decoder (or none): decoders opened from now on use it for the
+/// codecs it decodes.
+pub fn set_gpu_video(video: Option<Arc<dyn GpuVideo>>) {
+    *GPU_VIDEO.write().unwrap_or_else(|e| e.into_inner()) = video;
+}
+
+fn gpu_stream(codec: Codec) -> Option<Box<dyn GpuStream>> {
+    let video = GPU_VIDEO
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()?;
+    video.open(codec)
 }
 
 fn check(code: c_int) -> Result<c_int, VideoError> {
@@ -85,11 +152,87 @@ fn check(code: c_int) -> Result<c_int, VideoError> {
 /// Packet buffers start at this size and grow to the next power of two that holds a packet.
 const MIN_PACKET_BUFFER: usize = 64 * 1024;
 
-/// One open decoder. Packets are copied into pooled buffers, so steady-state decoding allocates
-/// nothing on this side.
+/// One open decoder, on the host GPU or on FFmpeg.
 pub struct Decoder {
-    api: &'static Api,
     codec: Codec,
+    inner: Inner,
+}
+
+enum Inner {
+    Gpu(Box<dyn GpuStream>),
+    Ffmpeg(FfmpegDecoder),
+}
+
+impl Decoder {
+    /// Opens a decoder for `codec`: the host GPU's when it decodes the codec, else FFmpeg's.
+    /// Fails with [`VideoError::Unavailable`] when FFmpeg is needed but not installed (logged
+    /// once per process) and [`VideoError::NoDecoder`] when no decoder takes the codec.
+    pub fn new(codec: Codec, latency: Latency) -> Result<Self, VideoError> {
+        let inner = match gpu_stream(codec) {
+            Some(stream) => Inner::Gpu(stream),
+            None => Inner::Ffmpeg(FfmpegDecoder::new(codec, latency)?),
+        };
+        Ok(Self { codec, inner })
+    }
+
+    /// The codec this decoder was opened for.
+    pub fn codec(&self) -> Codec {
+        self.codec
+    }
+
+    /// Whether the host GPU decodes this stream.
+    pub fn on_gpu(&self) -> bool {
+        matches!(self.inner, Inner::Gpu(_))
+    }
+
+    /// Queues one compressed frame. A corrupt frame fails here or decodes damaged, and the decoder
+    /// goes on with the next one.
+    pub fn send(&mut self, data: &[u8], pts: i64) -> Result<(), VideoError> {
+        match &mut self.inner {
+            Inner::Gpu(stream) => stream.send(data, pts),
+            Inner::Ffmpeg(decoder) => decoder.send(data, pts),
+        }
+    }
+
+    /// Ends the stream: the pictures the decoder still holds come out of [`Self::receive`], and
+    /// the decoder then starts over.
+    pub fn end_of_stream(&mut self) {
+        match &mut self.inner {
+            Inner::Gpu(stream) => stream.end_of_stream(),
+            Inner::Ffmpeg(decoder) => decoder.end_of_stream(),
+        }
+    }
+
+    /// Takes the next decoded picture into `frame`, replacing what it held. Returns false when
+    /// the decoder needs more input (or finished draining, after which it takes a new stream).
+    pub fn receive(&mut self, frame: &mut Frame) -> Result<bool, VideoError> {
+        match &mut self.inner {
+            Inner::Gpu(stream) => {
+                frame.clear();
+                let got = stream.receive(&mut frame.owned)?;
+                if got {
+                    frame.source = Source::Owned;
+                    frame.color = frame.owned.color;
+                }
+                Ok(got)
+            }
+            Inner::Ffmpeg(decoder) => decoder.receive(frame),
+        }
+    }
+
+    /// Drops every queued frame, for a seek.
+    pub fn flush(&mut self) {
+        match &mut self.inner {
+            Inner::Gpu(stream) => stream.flush(),
+            Inner::Ffmpeg(decoder) => decoder.flush(),
+        }
+    }
+}
+
+/// FFmpeg's decoder. Packets are copied into pooled buffers, so steady-state decoding allocates
+/// nothing on this side.
+struct FfmpegDecoder {
+    api: &'static Api,
     context: *mut AVCodecContext,
     packet: *mut AVPacket,
     pool: *mut AVBufferPool,
@@ -97,23 +240,21 @@ pub struct Decoder {
 }
 
 // SAFETY: the decoder's FFmpeg objects are owned by it alone and only used through `&mut self`.
-unsafe impl Send for Decoder {}
+unsafe impl Send for FfmpegDecoder {}
 
-impl Decoder {
-    /// Opens a decoder for `codec`. Fails with [`VideoError::Unavailable`] when FFmpeg is not
-    /// installed (logged once per process) and [`VideoError::NoDecoder`] when it lacks the codec.
-    pub fn new(codec: Codec, latency: Latency) -> Result<Self, VideoError> {
+impl FfmpegDecoder {
+    fn new(codec: Codec, latency: Latency) -> Result<Self, VideoError> {
+        let name = codec.decoder_name().ok_or(VideoError::NoDecoder(codec))?;
         let api = ffmpeg::api().ok_or(VideoError::Unavailable)?;
         // SAFETY: plain FFmpeg allocation calls; every pointer is checked before use and owned by
         // the returned decoder, whose Drop frees it.
         unsafe {
-            let found = (api.avcodec_find_decoder_by_name)(codec.decoder_name().as_ptr());
+            let found = (api.avcodec_find_decoder_by_name)(name.as_ptr());
             if found.is_null() {
                 return Err(VideoError::NoDecoder(codec));
             }
             let decoder = Self {
                 api,
-                codec,
                 context: (api.avcodec_alloc_context3)(found),
                 packet: (api.av_packet_alloc)(),
                 pool: ptr::null_mut(),
@@ -138,14 +279,7 @@ impl Decoder {
         }
     }
 
-    /// The codec this decoder was opened for.
-    pub fn codec(&self) -> Codec {
-        self.codec
-    }
-
-    /// Queues one compressed frame. A corrupt frame fails here or decodes damaged, and the decoder
-    /// goes on with the next one.
-    pub fn send(&mut self, data: &[u8], pts: i64) -> Result<(), VideoError> {
+    fn send(&mut self, data: &[u8], pts: i64) -> Result<(), VideoError> {
         let api = self.api;
         let needed = data.len() + PADDING;
         // SAFETY: the pool hands out buffers of `pool_size >= needed` bytes, written only within
@@ -181,20 +315,21 @@ impl Decoder {
         }
     }
 
-    /// Ends the stream: the pictures the decoder still holds come out of [`Self::receive`], and
-    /// the decoder then starts over.
-    pub fn end_of_stream(&mut self) {
+    fn end_of_stream(&mut self) {
         // SAFETY: a null packet is FFmpeg's drain request.
         unsafe { (self.api.avcodec_send_packet)(self.context, ptr::null()) };
     }
 
-    /// Takes the next decoded picture into `frame`, replacing what it held. Returns false when
-    /// the decoder needs more input (or finished draining, after which it takes a new stream).
-    pub fn receive(&mut self, frame: &mut Frame) -> Result<bool, VideoError> {
+    fn receive(&mut self, frame: &mut Frame) -> Result<bool, VideoError> {
         let api = self.api;
+        frame.source = Source::Empty;
+        let raw = match &frame.ff {
+            Some(ff) => ff.raw,
+            None => frame.ff.insert(FfFrame::new(api)?).raw,
+        };
         // SAFETY: both objects are live FFmpeg allocations owned by their wrappers.
         unsafe {
-            match (api.avcodec_receive_frame)(self.context, frame.raw) {
+            match (api.avcodec_receive_frame)(self.context, raw) {
                 AVERROR_EAGAIN => Ok(false),
                 AVERROR_EOF => {
                     (api.avcodec_flush_buffers)(self.context);
@@ -203,14 +338,14 @@ impl Decoder {
                 code => {
                     check(code)?;
                     frame.color = self.color();
+                    frame.source = Source::Ffmpeg;
                     Ok(true)
                 }
             }
         }
     }
 
-    /// Drops every queued frame, for a seek.
-    pub fn flush(&mut self) {
+    fn flush(&mut self) {
         // SAFETY: the context is open.
         unsafe { (self.api.avcodec_flush_buffers)(self.context) };
     }
@@ -238,7 +373,7 @@ impl Decoder {
     }
 }
 
-impl Drop for Decoder {
+impl Drop for FfmpegDecoder {
     fn drop(&mut self) {
         // SAFETY: each pointer is owned here; the free functions accept null.
         unsafe {
@@ -266,10 +401,43 @@ pub struct Color {
     pub full_range: bool,
 }
 
-/// Storage for one decoded picture. Reuse frames: receiving into a frame recycles its buffers.
-pub struct Frame {
+/// FFmpeg's frame inside a [`Frame`], allocated on the first FFmpeg picture.
+struct FfFrame {
     api: &'static Api,
     raw: *mut AVFrame,
+}
+
+impl FfFrame {
+    fn new(api: &'static Api) -> Result<Self, VideoError> {
+        // SAFETY: a plain allocation, checked.
+        let raw = unsafe { (api.av_frame_alloc)() };
+        if raw.is_null() {
+            return Err(VideoError::Ffmpeg(-12));
+        }
+        Ok(Self { api, raw })
+    }
+}
+
+impl Drop for FfFrame {
+    fn drop(&mut self) {
+        // SAFETY: the frame is owned here.
+        unsafe { (self.api.av_frame_free)(&mut self.raw) };
+    }
+}
+
+/// Which decoder filled a [`Frame`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Source {
+    Empty,
+    Ffmpeg,
+    Owned,
+}
+
+/// Storage for one decoded picture. Reuse frames: receiving into a frame recycles its buffers.
+pub struct Frame {
+    ff: Option<FfFrame>,
+    owned: OwnedPicture,
+    source: Source,
     color: Color,
 }
 
@@ -279,38 +447,69 @@ unsafe impl Send for Frame {}
 unsafe impl Sync for Frame {}
 
 impl Frame {
-    /// An empty frame. Fails with [`VideoError::Unavailable`] when FFmpeg is not installed.
+    /// An empty frame. It takes FFmpeg's buffers only once FFmpeg decodes into it.
     pub fn new() -> Result<Self, VideoError> {
-        let api = ffmpeg::api().ok_or(VideoError::Unavailable)?;
-        // SAFETY: a plain allocation, checked.
-        let raw = unsafe { (api.av_frame_alloc)() };
-        if raw.is_null() {
-            return Err(VideoError::Ffmpeg(-12));
-        }
         Ok(Self {
-            api,
-            raw,
+            ff: None,
+            owned: OwnedPicture::default(),
+            source: Source::Empty,
             color: Color::default(),
         })
     }
 
     /// Releases the picture, keeping the frame for reuse.
     pub fn clear(&mut self) {
-        // SAFETY: the frame is a live allocation.
-        unsafe { (self.api.av_frame_unref)(self.raw) };
+        if let Some(ff) = &self.ff {
+            // SAFETY: the frame is a live allocation.
+            unsafe { (ff.api.av_frame_unref)(ff.raw) };
+        }
+        self.source = Source::Empty;
     }
 
     /// The picture this frame holds, or `None` when it is empty or in a pixel format the converters
     /// do not read.
     pub fn picture(&self) -> Option<Picture<'_>> {
+        match self.source {
+            Source::Empty => None,
+            Source::Owned => self.owned_picture(),
+            Source::Ffmpeg => self.ffmpeg_picture(),
+        }
+    }
+
+    fn owned_picture(&self) -> Option<Picture<'_>> {
+        let o = &self.owned;
+        let stride = o.stride();
+        let luma = stride * o.height as usize;
+        if o.width == 0 || o.height == 0 || o.data.len() < OwnedPicture::size(o.width, o.height) {
+            return None;
+        }
+        let (y, uv) = o.data.split_at(luma);
+        let mut planes = [Plane::EMPTY; 3];
+        planes[0] = Plane { data: y, stride };
+        planes[1] = Plane {
+            data: &uv[..stride * o.height.div_ceil(2) as usize],
+            stride,
+        };
+        Some(Picture {
+            width: o.width,
+            height: o.height,
+            pts: o.pts,
+            format: PixelFormat::Nv12,
+            planes,
+            color: self.color,
+        })
+    }
+
+    fn ffmpeg_picture(&self) -> Option<Picture<'_>> {
+        let ff = self.ff.as_ref()?;
         // SAFETY: the frame is a live allocation; a decoded frame's planes hold `linesize` bytes per
         // row for each of their rows, and stay valid while the frame is borrowed.
         unsafe {
-            let raw = &*self.raw;
+            let raw = &*ff.raw;
             if raw.data[0].is_null() || raw.width <= 0 || raw.height <= 0 {
                 return None;
             }
-            let formats = &self.api.formats;
+            let formats = &ff.api.formats;
             let (format, plane_count) = match raw.format {
                 f if f == formats.yuv420p || f == formats.yuvj420p => (PixelFormat::Yuv420, 3),
                 f if f == formats.nv12 => (PixelFormat::Nv12, 2),
@@ -345,13 +544,6 @@ impl Frame {
                 color,
             })
         }
-    }
-}
-
-impl Drop for Frame {
-    fn drop(&mut self) {
-        // SAFETY: the frame is owned here.
-        unsafe { (self.api.av_frame_free)(&mut self.raw) };
     }
 }
 
@@ -414,5 +606,71 @@ mod tests {
         assert_eq!(Codec::from_mime("video/avc"), Some(Codec::H264));
         assert_eq!(Codec::from_mime("video/H264"), Some(Codec::H264));
         assert_eq!(Codec::from_mime("video/hevc"), None);
+        assert_eq!(Codec::from_mime("video/av1"), Some(Codec::Av1));
+        assert_eq!(Codec::from_mime("video/AV01"), Some(Codec::Av1));
+    }
+
+    struct FakeStream {
+        sent: Vec<i64>,
+    }
+
+    impl GpuStream for FakeStream {
+        fn send(&mut self, _data: &[u8], pts: i64) -> Result<(), VideoError> {
+            self.sent.push(pts);
+            Ok(())
+        }
+
+        fn end_of_stream(&mut self) {}
+
+        fn receive(&mut self, out: &mut OwnedPicture) -> Result<bool, VideoError> {
+            let Some(pts) = self.sent.pop() else {
+                return Ok(false);
+            };
+            *out = OwnedPicture {
+                width: 3,
+                height: 3,
+                pts,
+                data: (0..OwnedPicture::size(3, 3) as u8).collect(),
+                color: Color::default(),
+            };
+            Ok(true)
+        }
+
+        fn flush(&mut self) {
+            self.sent.clear();
+        }
+    }
+
+    struct FakeGpu;
+
+    impl GpuVideo for FakeGpu {
+        fn open(&self, codec: Codec) -> Option<Box<dyn GpuStream>> {
+            (codec == Codec::Av1).then(|| Box::new(FakeStream { sent: Vec::new() }) as _)
+        }
+    }
+
+    #[test]
+    fn av1_decodes_on_the_registered_gpu_into_nv12_pictures() {
+        set_gpu_video(None);
+        assert_eq!(
+            Decoder::new(Codec::Av1, Latency::Immediate).err(),
+            Some(VideoError::NoDecoder(Codec::Av1))
+        );
+        set_gpu_video(Some(Arc::new(FakeGpu)));
+        let mut decoder = Decoder::new(Codec::Av1, Latency::Immediate).unwrap();
+        assert!(decoder.on_gpu());
+        let mut frame = Frame::new().unwrap();
+        assert!(frame.picture().is_none());
+        decoder.send(&[1, 2, 3], 42).unwrap();
+        assert_eq!(decoder.receive(&mut frame), Ok(true));
+        let picture = frame.picture().unwrap();
+        assert_eq!((picture.width, picture.height, picture.pts), (3, 3, 42));
+        assert_eq!(picture.format, PixelFormat::Nv12);
+        assert_eq!(picture.planes[0].stride, 4);
+        assert_eq!(picture.planes[0].row(2), &[8, 9, 10, 11]);
+        assert_eq!(picture.planes[1].row(1), &[16, 17, 18, 19]);
+        assert_eq!(decoder.receive(&mut frame), Ok(false));
+        assert!(frame.picture().is_none());
+        set_gpu_video(None);
     }
 }

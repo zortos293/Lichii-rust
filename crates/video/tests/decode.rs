@@ -62,6 +62,7 @@ fn stream(codec: Codec) -> Vec<&'static [u8]> {
         Codec::Vp9 => ivf_frames(include_bytes!("data/quadrants.vp9.ivf")),
         Codec::Vp8 => ivf_frames(include_bytes!("data/quadrants.vp8.ivf")),
         Codec::H264 => access_units(include_bytes!("data/quadrants.h264")),
+        Codec::Av1 => unreachable!("AV1 decodes on the host GPU only"),
     }
 }
 
