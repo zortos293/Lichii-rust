@@ -897,6 +897,40 @@ fn targets_drawn_into_take_newer_overlaps_on_their_texel_grid() {
 }
 
 #[test]
+fn targets_drawn_into_take_newer_mip_chains_over_them() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let small = rt_info(32, 32, 2, GobLayout::Tegra);
+    let b = clear_rt(&mut f, &small, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let (chain, _) = f.texture(&tic(0x08, GPU_VA, 64, 64, 1, 3, 3));
+    assert_ne!(chain, b.id);
+    let level = clear_rt(
+        &mut f,
+        &rt_info(64, 64, 3, GobLayout::Tegra),
+        [1.0, 0.0, 0.0, 1.0],
+        Rect {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 63,
+        },
+    );
+    assert_eq!(level.id, chain, "the chain's level 0 is drawn into");
+    let (mut tx, cache, gmmu) = f.tx();
+    let found = cache
+        .render_target(&mut tx, gmmu, GPU_VA, &small, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.id, b.id);
+    assert!(
+        all_texels(&f.read_image(b.id)[0], RED),
+        "the chain's newer texels"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
 fn new_targets_take_newer_overlaps_before_they_are_drawn_into() {
     let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
         return;
