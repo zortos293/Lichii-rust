@@ -414,6 +414,9 @@ impl Context {
             if let Some(aftermath) = crate::debug::aftermath::get() {
                 aftermath.save_shader(&program.spirv);
             }
+            if program.info.uses_cooperative_matrix {
+                tracing::info!("LIRU14 cooperative matrix pipeline: {}", Program(program));
+            }
             let guest_warp = self.device.shader_profile.runs_guest_warp(program.stage)
                 && program.info.uses_warp_size();
             modules.stages.push((
