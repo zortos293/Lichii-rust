@@ -112,13 +112,6 @@ impl GuestSync {
 fn packing(image: &CachedImage) -> Option<Packing> {
     let info = &image.info;
     let bytes = info.format.bytes_per_block();
-    let partial_rows =
-        (0..info.levels).any(|level| !(info.level_extent(level).0 * bytes).is_multiple_of(4));
-    let aliased = image.segments.iter().enumerate().any(|(i, a)| {
-        image.segments[i + 1..]
-            .iter()
-            .any(|b| a.daddr < b.daddr + b.size && b.daddr < a.daddr + a.size)
-    });
     let shape = matches!(info.layout, GuestLayout::BlockLinear { .. })
         && image.scale == ResolutionScale::X1
         && image.trim == 0
@@ -131,7 +124,9 @@ fn packing(image: &CachedImage) -> Option<Packing> {
         && info.format.block_width() == 1
         && info.format.block_height() == 1
         && (4 % bytes == 0 || bytes.is_multiple_of(4))
-        && !(partial_rows && aliased);
+        && !(image.self_aliased
+            && (0..info.levels)
+                .any(|level| !(info.level_extent(level).0 * bytes).is_multiple_of(4)));
     if !shape {
         return None;
     }

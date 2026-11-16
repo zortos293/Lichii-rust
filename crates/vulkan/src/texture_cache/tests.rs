@@ -4477,3 +4477,23 @@ fn a_remapped_array_takes_newer_gpu_writes_over_its_new_pages() {
     );
     f.assert_no_validation_errors();
 }
+
+#[test]
+fn segments_alias_when_any_two_share_device_memory() {
+    let s = |daddr, size| Segment {
+        offset: 0,
+        daddr,
+        size,
+    };
+    assert!(!self_aliased(&[
+        s(0x2000, 0x1000),
+        s(0x1000, 0x1000),
+        s(0x4000, 0x10)
+    ]));
+    assert!(self_aliased(&[
+        s(0x1000, 0x3000),
+        s(0x8000, 0x1000),
+        s(0x3fff, 1)
+    ]));
+    assert!(self_aliased(&[s(0x1000, 0x1000), s(0x1000, 0x1000)]));
+}
