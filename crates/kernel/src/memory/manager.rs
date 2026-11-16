@@ -11,6 +11,9 @@ use crate::result;
 
 const MIB: u64 = 1 << 20;
 
+static FREES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FREED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// DRAM Switch 2 consoles get beyond their own for the memory the graphics server keeps itself
 /// (nx2:gpu 214 GPU-only regions, NX2_NOTES row 57). It joins the non-secure system pool, so the
 /// application pool a title sizes its heap from stays whole.
@@ -297,6 +300,8 @@ impl MemoryManager {
             .find(|p| start >= p.start && start + size <= p.start + p.size)
             .unwrap_or_else(|| panic!("freeing {start:#x}+{size:#x} outside every pool"));
         pool.free.lock().give(start, size);
+        FREES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        FREED.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
         self.log_usage();
     }
 
@@ -316,14 +321,16 @@ impl MemoryManager {
         }
         LAST.store(total, Ordering::Relaxed);
         tracing::info!(
-            "memstats used_mib={} app_mib={} applet_mib={} system_mib={} nonsecure_mib={} freed_dirty_mib={} host_mib={}",
+            "memstats used_mib={} app_mib={} applet_mib={} system_mib={} nonsecure_mib={} freed_dirty_mib={} host_mib={} frees={} freed_total_mib={}",
             total / MIB,
             used[0] / MIB,
             used[1] / MIB,
             used[2] / MIB,
             used[3] / MIB,
             dirty / MIB,
-            self.physical.host_bytes() / MIB
+            self.physical.host_bytes() / MIB,
+            FREES.load(Ordering::Relaxed),
+            FREED.load(Ordering::Relaxed) / MIB
         );
     }
 
