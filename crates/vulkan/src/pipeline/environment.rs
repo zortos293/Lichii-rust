@@ -636,10 +636,12 @@ impl<'a> ProgramEnv<'a> {
         let Some(dir) = std::env::var_os("LIRU14_DUMP_DIR") else {
             return;
         };
-        if self.stage != ShaderStage::Fragment {
+        if !matches!(self.stage, ShaderStage::Fragment | ShaderStage::VertexB) {
             return;
         }
+        let prefix = if self.stage == ShaderStage::Fragment { "fs" } else { "vs" };
         let mut out = String::new();
+        let _ = writeln!(out, "stage {prefix}");
         let (start, len) = self.code_range();
         let header = self.start - header_size(self.arch);
         let _ = writeln!(out, "start {:#x} code_start {:#x} len {:#x} header {:#x}", self.start, start, len, header);
@@ -674,7 +676,7 @@ impl<'a> ProgramEnv<'a> {
                 other => writeln!(out, "other {other:?}"),
             };
         }
-        let path = std::path::PathBuf::from(dir).join(format!("fs-{hash:016x}.env"));
+        let path = std::path::PathBuf::from(dir).join(format!("{prefix}-{hash:016x}.env"));
         let _ = std::fs::write(path, out);
     }
 

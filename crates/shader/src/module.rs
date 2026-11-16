@@ -53,10 +53,11 @@ fn finish(
     format!("{runtime:?}").hash(&mut hasher);
     incoming.hash(&mut hasher);
     if let Some(dir) = std::env::var_os("LIRU14_DUMP_DIR")
-        && program.stage == ShaderStage::Fragment
+        && matches!(program.stage, ShaderStage::Fragment | ShaderStage::VertexB)
     {
         let dir = std::path::PathBuf::from(dir);
-        let name = format!("fs-{:016x}", hasher.clone().finish());
+        let prefix = if program.stage == ShaderStage::Fragment { "fs" } else { "vs" };
+        let name = format!("{prefix}-{:016x}", hasher.clone().finish());
         let _ = std::fs::write(dir.join(format!("{name}.ir")), program.ir.dump());
         let _ = std::fs::write(
             dir.join(format!("{name}.sass")),
