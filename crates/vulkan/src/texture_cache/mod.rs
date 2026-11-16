@@ -1311,16 +1311,25 @@ impl TextureCache {
         };
         if discard && whole {
             self.flush_buffered(tx, found.id)?;
-            self.image(found.id).cpu_dirty = false;
+            let tick = self.tick;
+            let image = self.image(found.id);
+            image.cpu_dirty = false;
+            image.current = tick;
         }
         let keep_own = usage == Usage::Target
-            && self.image(found.id).modified != 0
+            && {
+                let image = self.image(found.id);
+                image.modified != 0 && !image.image.is_sparse()
+            }
             && self.newer_overlaps_reinterpret(found.id);
-        if (discard && whole) || keep_own {
-            let tick = self.tick;
-            self.image(found.id).current = tick;
+        if keep_own {
+            if self.image(found.id).cpu_dirty {
+                self.take_cpu_writes(tx, found.id)?;
+            }
+            self.take_from_aliases(tx.scheduler, found.id)?;
+        } else {
+            self.refresh(tx, found.id)?;
         }
-        self.refresh(tx, found.id)?;
         let target = if self.can_rescale(found.id) {
             self.scale
         } else {
