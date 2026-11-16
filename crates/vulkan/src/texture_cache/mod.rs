@@ -58,7 +58,7 @@ pub use info::{GuestLayout, ImageInfo, ImageKind, ViewInfo};
 use crate::buffer_cache::BufferCache;
 use crate::commands::{ImageAccess, transfer_to_all_barrier, transition};
 use crate::device::Device;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::format::{Conversion, HostFormat, host_format};
 use crate::memory::{Buffer, Image, ImageDesc, ImageView, MemoryUsage, aspect_of};
 use crate::scheduler::Scheduler;
@@ -96,6 +96,10 @@ const RECENT_AGE: u64 = 10;
 /// [`VISITS_PER_EVICTION`] times as many at most.
 const NORMAL_EVICTIONS: u32 = 20;
 const AGGRESSIVE_EVICTIONS: u32 = 40;
+/// Bytes of images unused this frame an image allocation that ran out of device memory frees
+/// before it retries: a course load in Mario Kart World creates ~1800 textures in a few frames,
+/// faster than the per-frame collector evicts.
+const RECLAIM_ON_OOM: u64 = 512 << 20;
 const VISITS_PER_EVICTION: u32 = 8;
 /// Readback bytes of GPU-modified images the collector starts flushing per frame (always at
 /// least one image).
@@ -2118,7 +2122,13 @@ impl TextureCache {
                 _ => {}
             }
         }
-        let found = self.find_slow(tx, gmmu, gpu_va, info, usage)?;
+        let found = match self.find_slow(tx, gmmu, gpu_va, info, usage) {
+            Err(Error::Allocation(error)) if self.evict_unused(tx, RECLAIM_ON_OOM)? > 0 => {
+                tracing::warn!(%error, "image allocation failed; retrying after evicting unused images");
+                self.find_slow(tx, gmmu, gpu_va, info, usage)?
+            }
+            found => found?,
+        };
         if let Some(found) = found {
             self.touch(found.id);
         }
@@ -3494,6 +3504,36 @@ impl TextureCache {
             bytes: queued_bytes,
         });
         Ok(())
+    }
+
+    /// Evicts images no work of this frame used and the GPU did not modify, least recently used
+    /// first, until `bytes` went, then waits for the GPU so their memory is free. Returns the
+    /// bytes evicted.
+    fn evict_unused(&mut self, tx: &mut Transfer<'_>, bytes: u64) -> Result<u64> {
+        let mut freed = 0;
+        let mut cursor = self.lru_head;
+        while cursor != NIL && freed < bytes {
+            let slot = &self.slots[cursor as usize];
+            let id = ImageId {
+                index: cursor,
+                generation: slot.generation,
+            };
+            cursor = slot.next;
+            let image = slot.image.as_ref().expect("listed slots hold images");
+            if image.last_use >= self.frame {
+                break;
+            }
+            if image.gpu_modified {
+                continue;
+            }
+            freed += image.image.memory_size();
+            self.evict(tx.scheduler, id);
+        }
+        if freed > 0 {
+            tx.scheduler.finish()?;
+            tx.scheduler.collect();
+        }
+        Ok(freed)
     }
 
     fn evict(&mut self, scheduler: &mut Scheduler, id: ImageId) {

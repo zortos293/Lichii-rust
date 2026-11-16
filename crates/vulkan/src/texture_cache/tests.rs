@@ -3835,3 +3835,45 @@ fn a_remap_dirties_only_the_bytes_whose_mapping_changed() {
     remapped_bytes(&new, &old[..1], |lo, hi| changed.push((lo, hi)));
     assert_eq!(changed, [(100, 150), (200, 300), (400, 450)]);
 }
+
+#[test]
+fn an_allocation_out_of_memory_evicts_clean_images_unused_this_frame() {
+    let gob = GobLayout::Switch2;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let tics: Vec<_> = (0..6)
+        .map(|i| tic(0x08, GPU_VA + i * 0x1_0000, 64, 64, 1, 1, 2))
+        .collect();
+    let ids: Vec<_> = tics.iter().map(|t| f.texture(t).0).collect();
+    let info = rt_info(64, 64, 2, gob);
+    let modified = clear_rt_at(
+        &mut f,
+        GPU_VA + 0x10_0000,
+        &info,
+        [0.0, 1.0, 0.0, 1.0],
+        Rect::ALL,
+    )
+    .id;
+    f.tick(HUGE_BUDGET);
+    for t in &tics[4..] {
+        f.texture(t);
+    }
+    let size = f.cache.get(ids[0]).unwrap().image.memory_size();
+    let freed = {
+        let (mut tx, cache, _) = f.tx();
+        cache.evict_unused(&mut tx, u64::MAX).unwrap()
+    };
+    assert_eq!(freed, 4 * size);
+    let live: Vec<bool> = ids.iter().map(|&id| f.cache.get(id).is_some()).collect();
+    assert_eq!(
+        live,
+        [false, false, false, false, true, true],
+        "images used this frame stay"
+    );
+    assert!(f.cache.get(modified).is_some(), "GPU-modified images stay");
+    let (mut tx, cache, _) = f.tx();
+    assert_eq!(cache.evict_unused(&mut tx, u64::MAX).unwrap(), 0);
+    drop(tx);
+    f.assert_no_validation_errors();
+}
