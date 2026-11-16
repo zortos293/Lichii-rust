@@ -1082,6 +1082,25 @@ impl VulkanRasterizer {
                 && cb8 != 0
                 && LIRU14_LATE.load(std::sync::atomic::Ordering::Relaxed)
                 && cb8 == LIRU14_CB8.load(std::sync::atomic::Ordering::Relaxed);
+            if [11, 12, 17, 19].contains(&liru14_idx) || (same_bones && regs.zeta.address() == 0x528170000) {
+                static F: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if F.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
+                    let b = &ctx.const_buffers[0][3];
+                    let mut bytes = vec![0u8; 176];
+                    let _ = gmmu.read_block(b.address, &mut bytes);
+                    let floats: Vec<String> = bytes
+                        .chunks_exact(4)
+                        .map(|c| format!("{:.4}", f32::from_le_bytes(c.try_into().unwrap())))
+                        .collect();
+                    eprintln!(
+                        "LIRU14 cb3 idx={liru14_idx} zeta={:#x} vs={:x} addr={:#x} cb8={cb8:#x} f=[{}]",
+                        regs.zeta.address(),
+                        self.draw.stages[0].as_ref().map_or(0, |m| m.hash),
+                        b.address,
+                        floats.join(",")
+                    );
+                }
+            }
             if liru14_idx == 12 || same_bones {
                 static V: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if V.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 120 {
