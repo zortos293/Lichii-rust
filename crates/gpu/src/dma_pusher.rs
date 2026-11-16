@@ -802,19 +802,19 @@ impl Dispatch<'_> {
         };
         if let Some(engine) = engine {
             if engine.reads_memory(pending.method) {
-                struct DiagHost<'a> { regs: &'a [u32], unknown: Vec<u32> }
+                struct DiagHost<'a> { regs: &'a [u32], unknown: Vec<u32>, reads: Vec<u32>, writes: Vec<u32> }
                 impl crate::macros::MacroHost for DiagHost<'_> {
-                    fn read_register(&mut self, method: u32) -> u32 { self.regs.get(method as usize).copied().unwrap_or(0) }
-                    fn write_method(&mut self, _method: u32, _argument: u32) {}
+                    fn read_register(&mut self, method: u32) -> u32 { self.reads.push(method); self.regs.get(method as usize).copied().unwrap_or(0) }
+                    fn write_method(&mut self, method: u32, _argument: u32) { self.writes.push(method); }
                     fn dma_read(&mut self, _gpu_va: u64, _out: &mut [u32]) {}
                     fn write_unknown(&mut self, method: u32) -> bool { self.unknown.push(method); true }
                 }
                 let mut scratch = data_ram.clone();
                 let mut taint = crate::macros::ReadTaint::new();
                 let regs: &[u32] = match target { MacroTarget::Graphics => graphics.regs.words(), MacroTarget::Compute => compute };
-                let mut diag = DiagHost { regs, unknown: Vec::new() };
+                let mut diag = DiagHost { regs, unknown: Vec::new(), reads: Vec::new(), writes: Vec::new() };
                 let outcome = match engine.shadow_execute(pending.method, &pending.parameters, &mut scratch, &mut diag, &mut taint) {
-                    Ok(()) => { diag.unknown.sort_unstable(); diag.unknown.dedup(); format!("ok unknown={:x?} ram_unknown={}", diag.unknown, taint.any_ram_unknown()) }
+                    Ok(()) => { for v in [&mut diag.unknown, &mut diag.reads, &mut diag.writes] { v.sort_unstable(); v.dedup(); } let ram_changed = scratch.words() != data_ram.words(); format!("ok unknown={:x?} ram_unknown={} ram_changed={} reads={:x?} writes={:x?}", diag.unknown, taint.any_ram_unknown(), ram_changed, diag.reads, diag.writes) }
                     Err(e) => format!("err {:?} pc={:#x}", e.kind, e.pc),
                 };
                 let index = (pending.method.wrapping_sub(crate::macros::MACRO_METHOD_BASE) >> 1) as usize;
