@@ -1122,6 +1122,22 @@ impl VulkanRasterizer {
                             }
                         }
                     }
+                    let b3 = &ctx.const_buffers[4][3];
+                    let mut tail = [0u8; 0x40];
+                    let _ = gmmu.read_block(b3.address + 0x2d0, &mut tail);
+                    let tail: Vec<String> = tail
+                        .chunks_exact(4)
+                        .enumerate()
+                        .map(|(i, c)| format!("{:#x}={}", 0x2d0 + i * 4, f32::from_le_bytes(c.try_into().unwrap())))
+                        .collect();
+                    let mut head = [0u8; 0x100];
+                    let _ = gmmu.read_block(b3.address, &mut head);
+                    let head: Vec<String> = head
+                        .chunks_exact(4)
+                        .map(|c| format!("{:.4}", f32::from_le_bytes(c.try_into().unwrap())))
+                        .collect();
+                    eprintln!("LIRU14 rcvcb3 tail={tail:?} head=[{}]", head.join(","));
+                    let hits: Vec<String> = Vec::new();
                     eprintln!(
                         "LIRU14 rcv fs={:x} cur={cur:?} prev={prev:?} hits={hits:?} cbufs={:?}",
                         self.draw.stages[4].as_ref().map_or(0, |m| m.hash),
@@ -1139,9 +1155,14 @@ impl VulkanRasterizer {
                         .chunks_exact(4)
                         .map(|c| format!("{:.4}", f32::from_le_bytes(c.try_into().unwrap())))
                         .collect();
+                    let vt = &regs.viewport_transform[0];
                     eprintln!(
-                        "LIRU14 cb3 idx={liru14_idx} zeta={:#x} vs={:x} addr={:#x} cb8={cb8:#x} f=[{}]",
+                        "LIRU14 cb3 idx={liru14_idx} zeta={:#x} mode={:?} vz=({},{}) clip={:?} vs={:x} addr={:#x} cb8={cb8:#x} f=[{}]",
                         regs.zeta.address(),
+                        regs.depth_mode,
+                        vt.scale_z,
+                        vt.translate_z,
+                        regs.viewport_clip_control,
                         self.draw.stages[0].as_ref().map_or(0, |m| m.hash),
                         b.address,
                         floats.join(",")
