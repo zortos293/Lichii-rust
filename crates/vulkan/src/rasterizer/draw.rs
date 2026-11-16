@@ -2465,7 +2465,7 @@ impl VulkanRasterizer {
                 raw.cmd_set_line_width(cmd, line_width)
             });
             let bias = (
-                regs.depth_bias,
+                regs.depth_bias / 2.0,
                 regs.depth_bias_clamp,
                 regs.slope_scale_depth_bias,
             );
