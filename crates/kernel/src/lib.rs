@@ -595,7 +595,9 @@ impl KernelInner {
         while !self.scheduler.is_shut_down() {
             std::thread::park_timeout(WATCH_PERIOD);
             let now = Instant::now();
-            if now.duration_since(trimmed) >= TRIM_PERIOD {
+            if now.duration_since(trimmed) >= TRIM_PERIOD
+                && std::env::var_os("LICHII_NO_TRIM").is_none()
+            {
                 trimmed = now;
                 self.memory.trim();
             }
