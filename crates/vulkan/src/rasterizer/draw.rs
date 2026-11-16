@@ -1070,7 +1070,9 @@ impl VulkanRasterizer {
             crate::pipeline::environment::LIRU14_DRAW.set(false);
             if liru14_idx == 12 || shirt {
                 static V: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                if V.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
+                static VS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let budget = if shirt { &VS } else { &V };
+                if budget.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 30 {
                     let vs = self.draw.stages[0].as_ref();
                     let streams: Vec<_> = regs
                         .vertex_streams
@@ -1087,12 +1089,17 @@ impl VulkanRasterizer {
                         .filter(|&i| vs.is_some_and(|m| m.info.constant_buffer_mask & (1 << i) != 0))
                         .map(|i| {
                             let b = &ctx.const_buffers[0][i];
-                            (i, format!("{:#x}", b.address), b.size, vs.map_or(0, |m| m.info.constant_buffer_used_sizes[i]))
+                            let mut bytes = vec![0u8; b.size.min(4096) as usize];
+                            let _ = gmmu.read_block(b.address, &mut bytes);
+                            let sum = bytes.iter().fold(0xcbf29ce484222325u64, |h, &x| (h ^ u64::from(x)).wrapping_mul(0x100000001b3));
+                            (i, format!("{:#x}", b.address), b.size, vs.map_or(0, |m| m.info.constant_buffer_used_sizes[i]), format!("{sum:016x}"))
                         })
                         .collect();
                     eprintln!(
-                        "LIRU14 vdata who={} vs={:x} ib={:#x} ifmt={:?} streams={streams:?} cb={cb:?} ssbo={} global={} attribs={attribs:?}",
+                        "LIRU14 vdata secs={:?} who={} fs={:x} vs={:x} ib={:#x} ifmt={:?} streams={streams:?} cb={cb:?} ssbo={} global={} attribs={attribs:?}",
+                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() % 100_000).unwrap_or(0),
                         if shirt { "shirt" } else { "caster12" },
+                        self.draw.stages[4].as_ref().map_or(0, |m| m.hash),
                         vs.map_or(0, |m| m.hash),
                         regs.index_buffer.start_addr(),
                         regs.index_buffer.format,
