@@ -203,6 +203,8 @@ impl Scheduler {
                 .begin_command_buffer(cmd, &begin)
                 .call("vkBeginCommandBuffer")?
         };
+        self.device
+            .checkpoint(cmd, format_args!("commands of tick {}", self.tick));
         self.current = Some(cmd);
         Ok(cmd)
     }

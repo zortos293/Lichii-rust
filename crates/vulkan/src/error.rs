@@ -30,7 +30,7 @@ impl<T> VkResultExt<T> for Result<T, vk::Result> {
     fn call(self, call: &'static str) -> Result<T> {
         self.map_err(|result| {
             if result == vk::Result::ERROR_DEVICE_LOST {
-                crate::debug::aftermath::device_lost();
+                crate::debug::device_lost();
             }
             Error::Vulkan { call, result }
         })
