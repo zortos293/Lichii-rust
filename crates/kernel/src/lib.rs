@@ -595,9 +595,20 @@ impl KernelInner {
         while !self.scheduler.is_shut_down() {
             std::thread::park_timeout(WATCH_PERIOD);
             let now = Instant::now();
-            if now.duration_since(trimmed) >= TRIM_PERIOD {
+            if now.duration_since(trimmed) >= TRIM_PERIOD
+                && std::env::var_os("LICHII_NO_TRIM").is_none()
+            {
                 trimmed = now;
+                let before = self.memory.physical().host_bytes();
                 self.memory.trim();
+                let after = self.memory.physical().host_bytes();
+                if after < before {
+                    tracing::info!(
+                        released_kib = (before - after) >> 10,
+                        host_mib = after >> 20,
+                        "liru5diag trim"
+                    );
+                }
             }
             let outranked = if self.scheduler.is_paused() {
                 0
