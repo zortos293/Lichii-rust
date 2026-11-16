@@ -94,6 +94,36 @@ impl Program {
         out
     }
 
+    #[doc(hidden)]
+    pub fn liru14_dump_after(&self, block: super::BlockId, after: Option<InstId>) -> String {
+        let mut names: FxHashMap<InstId, usize> = FxHashMap::default();
+        let mut out = String::new();
+        let mut cur = match after {
+            Some(id) => self.inst(id).next(),
+            None => self.block(block).first(),
+        };
+        while let Some(id) = cur {
+            let inst = self.inst(id);
+            cur = inst.next();
+            names.insert(id, id.0 as usize);
+            for &arg in inst.args() {
+                if let Value::Inst(a) = arg {
+                    names.insert(a, a.0 as usize);
+                }
+            }
+            let _ = write!(out, "      %{} = {}", id.0, inst.op.name());
+            for (i, &arg) in inst.args().iter().enumerate() {
+                out.push_str(if i == 0 { " " } else { ", " });
+                self.write_value(&mut out, &mut names, arg);
+            }
+            if inst.flags != 0 {
+                let _ = write!(out, " (flags {:#x})", inst.flags);
+            }
+            out.push('\n');
+        }
+        out
+    }
+
     fn write_value(&self, out: &mut String, names: &mut FxHashMap<InstId, usize>, value: Value) {
         let _ = match value {
             Value::Void => write!(out, "void"),

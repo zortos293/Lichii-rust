@@ -355,7 +355,19 @@ pub fn translate_block(
         }
         t.pc = pc;
         t.insn = Instruction(env.read_u64(base + u64::from(pc)));
+        let trace = env.stage() == crate::ShaderStage::Fragment
+            && std::env::var_os("LIRU14_DUMP_DIR").is_some();
+        let before = t.ir.prog.block(t.ir.block).last();
         translate_instruction(&mut t)?;
+        if trace {
+            let line = format!(
+                "{pc:05x} {:?} {:016x}\n{}",
+                t.insn.opcode(),
+                t.insn.0,
+                t.ir.prog.liru14_dump_after(t.ir.block, before)
+            );
+            crate::LIRU14_TRACE.with(|s| s.borrow_mut().push_str(&line));
+        }
         pc += 8;
     }
     Ok(())
