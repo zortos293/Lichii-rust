@@ -175,6 +175,8 @@ pub struct Device {
     pub shader_host: HostTranslateInfo,
     /// Debug names and labels, with `debug.vulkan_labels`.
     pub(crate) labels: Option<ext::debug_utils::Device>,
+    /// Checkpoints and fault queries for the device-lost report, with `debug.gpu_fault_report`.
+    pub(crate) faults: Option<Arc<crate::debug::fault::Reporter>>,
 }
 
 struct Candidate {
@@ -518,10 +520,33 @@ impl Device {
             };
         if aftermath {
             names.push(nv::device_diagnostics_config::NAME.as_ptr());
-            if has(nv::device_diagnostic_checkpoints::NAME) {
-                names.push(nv::device_diagnostic_checkpoints::NAME.as_ptr());
-            }
             tracing::info!("Nsight Aftermath: device diagnostics on");
+        }
+        let fault_report = crate::debug::fault_report_requested();
+        let checkpoints =
+            (aftermath || fault_report) && has(nv::device_diagnostic_checkpoints::NAME);
+        if checkpoints {
+            names.push(nv::device_diagnostic_checkpoints::NAME.as_ptr());
+        }
+        let mut fault_features = vk::PhysicalDeviceFaultFeaturesEXT::default();
+        if fault_report && has(ext::device_fault::NAME) {
+            let mut query = vk::PhysicalDeviceFeatures2::default().push_next(&mut fault_features);
+            // SAFETY: the device reports the extension the struct belongs to.
+            unsafe { raw_instance.get_physical_device_features2(physical, &mut query) };
+            fault_features.p_next = std::ptr::null_mut();
+        }
+        let device_fault = fault_features.device_fault != vk::FALSE;
+        if device_fault {
+            names.push(ext::device_fault::NAME.as_ptr());
+        }
+        if fault_report {
+            tracing::info!(
+                device_fault,
+                vendor_binary =
+                    device_fault && fault_features.device_fault_vendor_binary != vk::FALSE,
+                checkpoints,
+                "GPU fault report on"
+            );
         }
         let mut diagnostics_features =
             vk::PhysicalDeviceDiagnosticsConfigFeaturesNV::default().diagnostics_config(true);
@@ -544,6 +569,9 @@ impl Device {
             info = info
                 .push_next(&mut diagnostics_features)
                 .push_next(&mut diagnostics);
+        }
+        if device_fault {
+            info = info.push_next(&mut fault_features);
         }
         // SAFETY: the extensions and features requested were all reported by the device.
         let raw = unsafe {
@@ -642,6 +670,15 @@ impl Device {
         let labels = instance
             .labels
             .then(|| ext::debug_utils::Device::new(raw_instance, &raw));
+        let faults = (device_fault || (fault_report && checkpoints)).then(|| {
+            crate::debug::fault::Reporter::register(
+                raw_instance,
+                &raw,
+                queue,
+                device_fault.then_some(fault_features.device_fault_vendor_binary != vk::FALSE),
+                fault_report && checkpoints,
+            )
+        });
         Ok(Arc::new(Self {
             instance,
             physical,
@@ -656,6 +693,7 @@ impl Device {
             shader_profile,
             shader_host,
             labels,
+            faults,
         }))
     }
 
@@ -724,8 +762,8 @@ impl Device {
     pub fn wait_idle(&self) {
         let _queue = self.queue.lock();
         // SAFETY: holding the queue lock keeps other threads from submitting meanwhile.
-        if let Err(error) = unsafe { self.raw.device_wait_idle() } {
-            tracing::error!("vkDeviceWaitIdle: {error}");
+        if let Err(error) = unsafe { self.raw.device_wait_idle() }.call("vkDeviceWaitIdle") {
+            tracing::error!("{error}");
         }
     }
 
@@ -754,6 +792,9 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
+        if let Some(faults) = &self.faults {
+            faults.unregister();
+        }
         // SAFETY: every object created from the device holds an Arc to it and is gone; the
         // allocator frees its blocks before the device is destroyed.
         unsafe {
