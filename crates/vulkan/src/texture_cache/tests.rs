@@ -866,6 +866,29 @@ fn targets_drawn_into_keep_their_own_texels_over_newer_overlaps() {
 }
 
 #[test]
+fn targets_drawn_into_take_newer_overlaps_on_their_texel_grid() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let one = rt_info(32, 32, 2, GobLayout::Tegra);
+    let two = ImageInfo { layers: 2, ..one };
+    let a = clear_rt(&mut f, &one, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let b = clear_rt(&mut f, &two, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    assert_ne!(a.id, b.id);
+    let (mut tx, cache, gmmu) = f.tx();
+    let found = cache
+        .render_target(&mut tx, gmmu, GPU_VA, &one, false)
+        .unwrap()
+        .unwrap();
+    let read = f.read_image(found.id);
+    assert!(
+        all_texels(&read[found.layer as usize], RED),
+        "the newer layered target's texels"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
 fn new_targets_take_newer_overlaps_before_they_are_drawn_into() {
     let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
         return;

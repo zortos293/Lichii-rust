@@ -1275,8 +1275,9 @@ impl TextureCache {
 
     /// The image a render target or depth target writes, at the scale the rules allow.
     /// `discard` skips uploading guest data the caller overwrites entirely (a full clear).
-    /// An image the GPU wrote before keeps its own texels where incompatible overlaps wrote the
-    /// shared bytes since, as the C++ cache does with bad overlaps: only reads of it take them.
+    /// An image the GPU wrote before keeps its own texels where overlaps that lay the shared
+    /// bytes out on another texel grid wrote them since, as the C++ cache does with bad
+    /// overlaps: only reads of it take them.
     pub fn render_target(
         &mut self,
         tx: &mut Transfer<'_>,
@@ -1312,8 +1313,10 @@ impl TextureCache {
             self.flush_buffered(tx, found.id)?;
             self.image(found.id).cpu_dirty = false;
         }
-        let drawn_before = usage == Usage::Target && self.image(found.id).modified != 0;
-        if (discard && whole) || drawn_before {
+        let keep_own = usage == Usage::Target
+            && self.image(found.id).modified != 0
+            && self.newer_overlaps_reinterpret(found.id);
+        if (discard && whole) || keep_own {
             let tick = self.tick;
             self.image(found.id).current = tick;
         }
@@ -2838,6 +2841,27 @@ impl TextureCache {
             .overlaps
             .iter()
             .any(|&o| self.get(o).expect("overlaps are live").modified > image.current)
+    }
+
+    /// Whether every overlap modified since `id` last held the shared bytes lays its texels out
+    /// on another grid (row width, block or tiling), so its bytes are no texels of `id`.
+    fn newer_overlaps_reinterpret(&self, id: ImageId) -> bool {
+        let image = self.get(id).expect("a live image id");
+        let grid = |info: &ImageInfo| {
+            let format = info.format;
+            (
+                info.layout,
+                info.width,
+                format.bytes_per_block(),
+                format.block_width(),
+                format.block_height(),
+            )
+        };
+        let own = grid(&image.info);
+        image.overlaps.iter().all(|&o| {
+            let o = self.get(o).expect("overlaps are live");
+            o.image.is_sparse() || o.modified <= image.current || grid(&o.info) != own
+        })
     }
 
     /// Whether the segments of the `newer` images cover every byte of `id`.
