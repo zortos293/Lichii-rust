@@ -1,4 +1,5 @@
 use std::io;
+use std::ops::Range;
 
 use lichii_common::PAddr;
 
@@ -19,8 +20,9 @@ pub enum PhysicalMemoryError {
 /// Guest DRAM. Physical addresses are offsets into it.
 ///
 /// Creating it only reserves host address space; host memory is committed as the kernel hands
-/// out pages ([`PhysicalMemory::commit`], also done by every map), so a 12 GiB Switch 2 layout
-/// costs only what the title touches (NX2_NOTES row 128).
+/// out pages ([`PhysicalMemory::commit`], also done by every map) and given back as it frees them
+/// ([`PhysicalMemory::release`]), so a 12 GiB Switch 2 layout costs only what the title uses
+/// (NX2_NOTES row 128).
 pub struct PhysicalMemory {
     backing: Backing,
 }
@@ -61,6 +63,25 @@ impl PhysicalMemory {
     pub fn discard(&self, pa: PAddr, size: u64) {
         assert!(pa + size <= self.size(), "discard past the end of DRAM");
         self.backing.discard(pa as usize, size as usize);
+    }
+
+    /// Gives the host memory behind `[pa, pa + size)`, which must be free DRAM nobody reads,
+    /// back to the OS. Only whole [`Self::release_granule`]s go back; returns the range that did,
+    /// which reads as zero once committed again.
+    pub fn release(&self, pa: PAddr, size: u64) -> Range<PAddr> {
+        assert!(pa + size <= self.size(), "release past the end of DRAM");
+        let released = self.backing.release(pa as usize, size as usize);
+        released.start as PAddr..released.end as PAddr
+    }
+
+    /// The unit host memory is given back in: a page on Unix, a 2 MiB section on Windows.
+    pub fn release_granule(&self) -> u64 {
+        self.backing.release_granule() as u64
+    }
+
+    /// Host memory backing DRAM now, in bytes: committed on Windows, allocated on Unix.
+    pub fn host_bytes(&self) -> u64 {
+        self.backing.host_bytes()
     }
 
     /// Whether pages can also be mapped as views elsewhere (fastmem).

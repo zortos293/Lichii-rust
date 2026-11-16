@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use lichii_common::{ConsoleGeneration, HleResult, PAGE_SIZE, PAddr, align_up};
+use lichii_common::{ConsoleGeneration, HleResult, PAGE_SIZE, PAddr, align_down, align_up};
 use lichii_memory::PhysicalMemory;
 use parking_lot::Mutex;
 
@@ -81,9 +81,12 @@ impl PoolLayout {
 struct FreeList {
     ranges: BTreeMap<PAddr, u64>,
     free: u64,
-    /// Freed ranges that still hold their old contents. They are zeroed when allocated again,
-    /// so memory nobody reuses (a whole process at shutdown) is never written.
+    /// Freed ranges that still hold their old contents, freed since the last
+    /// [`MemoryManager::trim`]. They are zeroed when allocated again, so memory nobody reuses is
+    /// never written.
     dirty: BTreeMap<PAddr, u64>,
+    /// Dirty ranges freed before the last trim. The next trim gives their host memory back.
+    aged: BTreeMap<PAddr, u64>,
 }
 
 impl FreeList {
@@ -113,23 +116,33 @@ impl FreeList {
 
     /// Removes the dirty parts of `[start, start + size)` and appends them to `out`.
     fn take_dirty(&mut self, start: PAddr, size: u64, out: &mut Vec<(PAddr, u64)>) {
-        let end = start + size;
-        while let Some((&run, &len)) = self
-            .dirty
-            .range(..end)
-            .next_back()
-            .filter(|&(&run, &len)| run + len > start)
-        {
-            self.dirty.remove(&run);
-            if run < start {
-                self.dirty.insert(run, start - run);
-            }
-            if run + len > end {
-                self.dirty.insert(end, run + len - end);
-            }
-            let from = run.max(start);
-            out.push((from, (run + len).min(end) - from));
+        cut(&mut self.dirty, start, size, |run| out.push(run));
+        cut(&mut self.aged, start, size, |run| out.push(run));
+    }
+}
+
+/// Removes `[start, start + size)` from `ranges`, passing each part it held to `found`.
+fn cut(
+    ranges: &mut BTreeMap<PAddr, u64>,
+    start: PAddr,
+    size: u64,
+    mut found: impl FnMut((PAddr, u64)),
+) {
+    let end = start + size;
+    while let Some((&run, &len)) = ranges
+        .range(..end)
+        .next_back()
+        .filter(|&(&run, &len)| run + len > start)
+    {
+        ranges.remove(&run);
+        if run < start {
+            ranges.insert(run, start - run);
         }
+        if run + len > end {
+            ranges.insert(end, run + len - end);
+        }
+        let from = run.max(start);
+        found((from, (run + len).min(end) - from));
     }
 }
 
@@ -194,6 +207,7 @@ impl MemoryManager {
                     ranges,
                     free: size,
                     dirty: BTreeMap::new(),
+                    aged: BTreeMap::new(),
                 }),
             };
             start += size;
@@ -284,7 +298,8 @@ impl MemoryManager {
         }
     }
 
-    /// Returns pages to their pool. They are zeroed when allocated again.
+    /// Returns pages to their pool. They are zeroed when allocated again, and their host memory
+    /// goes back to the OS at the second [`Self::trim`] that finds them still free.
     pub fn free(&self, start: PAddr, size: u64) {
         if size == 0 {
             return;
@@ -300,6 +315,46 @@ impl MemoryManager {
     pub fn free_group(&self, group: &PageGroup) {
         for &(start, size) in &group.runs {
             self.free(start, size);
+        }
+    }
+
+    /// Gives the host memory of pages that stayed free since the previous trim back to the OS,
+    /// in whole release granules. The kernel trims about once a second, so pages a title frees
+    /// and soon takes again (MKW maps and unmaps physical memory all the time) keep their host
+    /// memory, and pages that stay free stop costing any.
+    pub fn trim(&self) {
+        let granule = self.physical.release_granule();
+        for pool in &self.pools {
+            let mut list = pool.free.lock();
+            let mut kept = BTreeMap::new();
+            for (start, size) in std::mem::take(&mut list.aged) {
+                let (&run, &run_size) = list
+                    .ranges
+                    .range(..=start)
+                    .next_back()
+                    .expect("dirty pages are free");
+                let from = align_down(start, granule).max(run);
+                let to = align_up(start + size, granule).min(run + run_size);
+                let released = self.physical.release(from, to - from);
+                let end = start + size;
+                if start < released.start {
+                    insert_coalescing(&mut kept, start, end.min(released.start) - start);
+                }
+                if released.end < end {
+                    let at = start.max(released.end);
+                    insert_coalescing(&mut kept, at, end - at);
+                }
+                cut(
+                    &mut list.dirty,
+                    released.start,
+                    released.end - released.start,
+                    |_| {},
+                );
+            }
+            for (start, size) in std::mem::take(&mut list.dirty) {
+                insert_coalescing(&mut kept, start, size);
+            }
+            list.aged = kept;
         }
     }
 }
@@ -390,6 +445,77 @@ mod tests {
             vec![(0x1000, 0x1000)]
         );
         assert_eq!(byte_at(&mm, 0x1fff), 0);
+    }
+
+    #[test]
+    fn host_memory_goes_back_once_pages_stay_free_for_a_trim() {
+        let mm = manager();
+        let host = || mm.physical().host_bytes();
+        assert_eq!(host(), 0, "nothing is backed before the first allocation");
+
+        let a = mm.allocate(Pool::Application, 8 * MIB).unwrap();
+        fill(&mm, 0, 8 * MIB, 0x55);
+        assert!(host() >= 8 * MIB, "touched pages are backed: {:#x}", host());
+        let b = mm.allocate(Pool::Applet, PAGE_SIZE).unwrap();
+        fill(&mm, b.runs[0].0, PAGE_SIZE, 0x66);
+
+        mm.trim();
+        mm.free_group(&a);
+        mm.trim();
+        assert!(
+            host() >= 8 * MIB,
+            "pages freed since the last trim keep their host memory"
+        );
+        let again = mm.allocate(Pool::Application, 4 * MIB).unwrap();
+        assert_eq!(byte_at(&mm, 0), 0, "reused pages are zeroed");
+        mm.free_group(&again);
+
+        mm.trim();
+        mm.trim();
+        assert!(
+            host() <= 2 * MIB,
+            "pages free for a whole trim go back: {:#x}",
+            host()
+        );
+        assert_eq!(byte_at(&mm, b.runs[0].0), 0x66);
+        mm.free_group(&b);
+        mm.trim();
+        mm.trim();
+        assert_eq!(host(), 0, "freeing everything gives everything back");
+
+        let c = mm.allocate(Pool::Application, 8 * MIB).unwrap();
+        assert_eq!(c.runs, vec![(0, 8 * MIB)]);
+        assert!(
+            (0..8 * MIB)
+                .step_by(PAGE_SIZE as usize)
+                .all(|pa| byte_at(&mm, pa) == 0)
+        );
+    }
+
+    #[test]
+    fn pages_freed_beside_live_ones_are_zeroed_when_reused_and_released_once_free_whole() {
+        let mm = manager();
+        let granule = mm.physical().release_granule().max(2 * MIB);
+        let keep = mm.allocate(Pool::Application, PAGE_SIZE).unwrap();
+        let rest = mm.allocate(Pool::Application, granule - PAGE_SIZE).unwrap();
+        fill(&mm, 0, granule, 0x77);
+        mm.free_group(&rest);
+        mm.trim();
+        mm.trim();
+        assert_eq!(byte_at(&mm, 0), 0x77, "live pages keep their contents");
+        let again = mm.allocate(Pool::Application, granule - PAGE_SIZE).unwrap();
+        assert_eq!(again.runs, rest.runs);
+        assert!(
+            (PAGE_SIZE..granule)
+                .step_by(PAGE_SIZE as usize)
+                .all(|pa| byte_at(&mm, pa) == 0)
+        );
+        mm.free_group(&again);
+        mm.trim();
+        mm.free_group(&keep);
+        mm.trim();
+        mm.trim();
+        assert_eq!(mm.physical().host_bytes(), 0);
     }
 
     #[test]
