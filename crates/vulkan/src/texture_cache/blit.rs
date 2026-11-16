@@ -399,11 +399,13 @@ impl TextureCache {
             return Ok(None);
         }
         let Some(source) = self.find(tx, gmmu, src_va, src)? else {
+            why("find none".into());
             return Ok(None);
         };
         let Some(target) =
             self.lookup_or_create(tx, gmmu, dst.gpu_va, &dst.info, Usage::Transfer)?
         else {
+            why("dst lookup none".into());
             return Ok(None);
         };
         if source.id == target.id

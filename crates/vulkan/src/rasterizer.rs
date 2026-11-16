@@ -1112,6 +1112,7 @@ impl Rasterizer for VulkanRasterizer {
             ImageInfo::from_copy_surface(&blit.src, blit.src_format, self.gob_layout),
             ImageInfo::from_copy_surface(&blit.dst, blit.dst_format, self.gob_layout),
         ) else {
+            crate::texture_cache::blit::why("copy surface".into());
             return false;
         };
         let mut tx = Transfer {
@@ -2841,13 +2842,14 @@ mod blit_diag {
         let unit = (1u64 << 32) as f64;
         let why = if done { String::new() } else { crate::texture_cache::blit::WHY.with(|w| w.borrow().clone()) };
         let key = format!(
-            "gpu={done} op={:?} linear={} {:?}->{:?} x0={:.3} y0={:.3} du={:.3} dv={:.3} src={}x{} p={} blk={:?} @{:x} dst={}x{}+{}+{} {}x{} p={} blk={:?} @{:x} why=[{why}]",
+            "gpu={done} op={:?} linear={} {:?}->{:?} x0={:.3} y0={:.3} du={:.3} dv={:.3} src={}x{} p={} blk={:?} @{:x} dst={}x{}+{}+{} {}x{} p={} blk={:?} @{:x} d={} l={} why=[{why}]",
             blit.operation, blit.linear_filter, blit.src_format, blit.dst_format,
             blit.src_x0 as f64 / unit, blit.src_y0 as f64 / unit,
             blit.du_dx as f64 / unit, blit.dv_dy as f64 / unit,
             blit.src.width, blit.src.height, blit.src.pitch, blit.src.block, blit.src.address & 0xfff,
             blit.dst_width, blit.dst_height, blit.dst_x0, blit.dst_y0,
             blit.dst.width, blit.dst.height, blit.dst.pitch, blit.dst.block, blit.dst.address & 0xfff,
+            blit.dst.depth, blit.dst.layer,
         );
         let mut state = STATE.lock().unwrap();
         let (since, counts) = state.get_or_insert_with(|| (Instant::now(), HashMap::new()));
