@@ -132,7 +132,8 @@ impl Tiling {
             * self.depth as usize
     }
 
-    const fn slice_offset(&self, z: u32) -> usize {
+    /// Tiled offset of slice `z`'s first byte.
+    pub const fn slice_offset(&self, z: u32) -> usize {
         let mask = (1 << self.block_depth_log2) - 1;
         (z >> self.block_depth_log2) as usize * self.slice_size()
             + (((z & mask) as usize) << (GOB_SIZE_LOG2 + self.block_height_log2))

@@ -106,6 +106,7 @@ choices!(Anisotropy {
     X8 => "8x",
     X16 => "16x",
 });
+choices!(GpuClock { Normal => "Normal", Boost => "Boost", Overclock => "Overclock" });
 choices!(AstcDecode { Cpu => "CPU", Gpu => "GPU", CpuAsync => "CPU Asynchronously" });
 choices!(AstcRecompression {
     Uncompressed => "Uncompressed (best quality)",
@@ -165,5 +166,6 @@ mod tests {
         check::<ResolutionScale>();
         check::<ControllerType>();
         check::<Anisotropy>();
+        check::<GpuClock>();
     }
 }

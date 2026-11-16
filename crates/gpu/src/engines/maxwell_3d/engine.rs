@@ -221,24 +221,7 @@ impl Maxwell3d {
                 }
             }
             REPORT_SEMAPHORE_QUERY => {
-                if let Some(query) = queries::report(regs) {
-                    if ctx.memory.translate(query.address).is_none() {
-                        static N: std::sync::atomic::AtomicU32 =
-                            std::sync::atomic::AtomicU32::new(0);
-                        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if n < 12 || n.is_power_of_two() {
-                            let s = &regs.report_semaphore;
-                            tracing::warn!(
-                                n,
-                                channel = ?ctx.channel,
-                                high = format_args!("{:#x}", s.address_high),
-                                low = format_args!("{:#x}", s.address_low),
-                                payload = format_args!("{:#x}", s.payload),
-                                query = ?query,
-                                "diag: 3D report semaphore to an unmapped address"
-                            );
-                        }
-                    }
+                if let Some(query) = queries::report(regs, ctx.memory) {
                     ctx.rasterizer.query(ctx.channel, ctx.memory, &query);
                 }
             }

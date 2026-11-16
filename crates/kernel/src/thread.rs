@@ -492,6 +492,10 @@ impl Thread {
         token != 0 && self.wait_token.load(Ordering::Acquire) == token
     }
 
+    pub(crate) fn termination_requested(&self) -> bool {
+        self.sched.lock().terminate_requested
+    }
+
     /// Starts a wait from the thread itself. Fails with the pending result when the wait is
     /// cancellable and a cancel or termination is pending.
     pub(crate) fn begin_wait(&self, resume: Resume, cancellable: bool) -> Result<u64, ResultCode> {

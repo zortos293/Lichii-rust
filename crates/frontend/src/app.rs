@@ -425,6 +425,9 @@ impl App {
         if let Some(display) = &mut self.display {
             display.set_settings(&graphics);
         }
+        if let Some(session) = &self.session {
+            session.set_gpu_clock(graphics.fast_gpu_time);
+        }
     }
 
     fn apply_settings(&mut self, settings: Settings) {

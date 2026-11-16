@@ -523,6 +523,7 @@ struct LookupKey {
     gmmu: usize,
     gpu_va: GpuVAddr,
     info: ImageInfo,
+    slices: bool,
 }
 
 /// What a lookup found, valid while the GMMU keeps its `generation`. A miss (`found` is
@@ -1020,6 +1021,25 @@ impl TextureCache {
         kept
     }
 
+    /// Whether [`TextureCache::texture`] would return `id` as it is: it holds every write of its
+    /// guest bytes, overlaps and aliases, at a scale sampling keeps. Marks it used this frame
+    /// when it does.
+    pub fn keep_texture(&mut self, id: ImageId) -> bool {
+        let scale = self.scale;
+        let Some(image) = self.get(id) else {
+            return false;
+        };
+        let kept = !image.image.is_sparse()
+            && !image.cpu_dirty
+            && image.overlaps_newest <= image.current
+            && image.aliases_newest <= image.written
+            && (image.scale == ResolutionScale::X1 || image.scale == scale);
+        if kept {
+            self.touch(id);
+        }
+        kept
+    }
+
     /// Number of live images.
     pub fn len(&self) -> usize {
         self.slots.iter().filter(|s| s.image.is_some()).count()
@@ -1039,7 +1059,7 @@ impl TextureCache {
         gpu_va: GpuVAddr,
         info: &ImageInfo,
     ) -> Result<Option<Found>> {
-        let found = self.lookup_or_create(tx, gmmu, gpu_va, info)?;
+        let found = self.lookup_or_create(tx, gmmu, gpu_va, info, false)?;
         if let Some(found) = found {
             self.refresh(tx, found.id)?;
         }
@@ -1090,12 +1110,28 @@ impl TextureCache {
         info: &ImageInfo,
         discard: bool,
     ) -> Result<Option<Found>> {
-        let Some(found) = self.lookup_or_create(tx, gmmu, gpu_va, info)? else {
+        self.prepare_target(tx, gmmu, gpu_va, info, discard, true)
+    }
+
+    /// [`TextureCache::render_target`], resolving a single slice into its volume only with
+    /// `slices`: transfers address a found layer as an array layer, never a volume's depth.
+    fn prepare_target(
+        &mut self,
+        tx: &mut Transfer<'_>,
+        gmmu: &Gmmu,
+        gpu_va: GpuVAddr,
+        info: &ImageInfo,
+        discard: bool,
+        slices: bool,
+    ) -> Result<Option<Found>> {
+        let Some(found) = self.lookup_or_create(tx, gmmu, gpu_va, info, slices)? else {
             return Ok(None);
         };
         let whole = found.level == 0 && found.layer == 0 && {
             let image = self.image(found.id);
-            image.info.levels == 1 && image.info.layers == info.layers
+            image.info.levels == 1
+                && image.info.layers == info.layers
+                && image.info.depth == info.depth
         };
         if discard && whole {
             self.flush_buffered(tx, found.id)?;
@@ -1947,17 +1983,22 @@ impl TextureCache {
         }
     }
 
+    /// The image holding `info` at `gpu_va`, created when none does. With `slices`, a single
+    /// slice resolves into the volume it is a slice of, at that slice: render targets draw
+    /// into a slice through a 2D view, which nothing else can use.
     fn lookup_or_create(
         &mut self,
         tx: &mut Transfer<'_>,
         gmmu: &Gmmu,
         gpu_va: GpuVAddr,
         info: &ImageInfo,
+        slices: bool,
     ) -> Result<Option<Found>> {
         let key = LookupKey {
             gmmu: std::ptr::from_ref(gmmu) as usize,
             gpu_va,
             info: *info,
+            slices,
         };
         let generation = gmmu.generation();
         if let Some(&entry) = self.lookup.get(&key)
@@ -1972,7 +2013,7 @@ impl TextureCache {
                 _ => {}
             }
         }
-        let found = self.find_slow(tx, gmmu, gpu_va, info)?;
+        let found = self.find_slow(tx, gmmu, gpu_va, info, slices)?;
         if let Some(found) = found {
             self.touch(found.id);
         }
@@ -2026,6 +2067,7 @@ impl TextureCache {
         gmmu: &Gmmu,
         gpu_va: GpuVAddr,
         info: &ImageInfo,
+        slices: bool,
     ) -> Result<Option<Found>> {
         let size = info.size_bytes();
         self.segments.clear();
@@ -2060,7 +2102,12 @@ impl TextureCache {
             let candidate = if image.segments == self.segments && image.info.same_layout(info) {
                 Some((0, 0))
             } else if contiguous && image.contiguous() && base >= image.base() {
-                image.info.find_subresource(info, base - image.base())
+                let offset = base - image.base();
+                image.info.find_subresource(info, offset).or_else(|| {
+                    slices
+                        .then(|| image.info.find_slice(info, offset))
+                        .flatten()
+                })
             } else {
                 None
             };
@@ -2096,13 +2143,15 @@ impl TextureCache {
                 continue;
             }
             let subresource = (contiguous && image.contiguous() && image.base() >= base)
-                .then(|| info.find_subresource(&image.info, image.base() - base))
+                .then(|| {
+                    let offset = image.base() - base;
+                    info.find_subresource(&image.info, offset)
+                        .or_else(|| info.find_slice(&image.info, offset))
+                })
                 .flatten();
             match subresource {
                 Some((level, layer))
-                    if image.gpu_modified
-                        && Self::copy_compatible(image, host, info.format)
-                        && !self.stale(id) =>
+                    if image.gpu_modified && Self::copy_compatible(image, host, info.format) =>
                 {
                     self.joins.push((id, level, layer));
                 }
@@ -2111,6 +2160,20 @@ impl TextureCache {
             }
         }
         self.ids = overlaps;
+        let mut joins = std::mem::take(&mut self.joins);
+        for i in (0..joins.len()).rev() {
+            let image = self.get(joins[i].0).expect("a live image id");
+            let stale = image.overlaps.iter().any(|&o| {
+                self.get(o).expect("overlaps are live").modified > image.current
+                    && !joins.iter().any(|&(j, level, layer)| {
+                        j == o && (level, layer) != (joins[i].1, joins[i].2)
+                    })
+            });
+            if stale {
+                self.new_overlaps.push(joins.remove(i).0);
+            }
+        }
+        self.joins = joins;
         let dropped = std::mem::take(&mut self.dropped);
         for &other in &dropped {
             self.remove(tx.scheduler, other);
@@ -2183,6 +2246,7 @@ impl TextureCache {
                 let desc = src.image.desc();
                 (desc.mip_levels, desc.array_layers, aspect_of(desc.format))
             };
+            let volume = self.image(id).info.kind == ImageKind::D3;
             let mut regions = Vec::with_capacity(src_levels as usize);
             for l in 0..src_levels {
                 let extent = self.image(join).host_extent(l);
@@ -2192,6 +2256,11 @@ impl TextureCache {
                     base_array_layer: base,
                     layer_count: src_layers,
                 };
+                let (dst_layer, dst_z) = if volume {
+                    (0, layer as i32)
+                } else {
+                    (layer, 0)
+                };
                 regions.push(vk::ImageCopy {
                     src_subresource: vk::ImageSubresourceLayers {
                         mip_level: l,
@@ -2199,7 +2268,12 @@ impl TextureCache {
                     },
                     dst_subresource: vk::ImageSubresourceLayers {
                         mip_level: level + l,
-                        ..layers(layer)
+                        ..layers(dst_layer)
+                    },
+                    dst_offset: vk::Offset3D {
+                        x: 0,
+                        y: 0,
+                        z: dst_z,
                     },
                     extent,
                     ..Default::default()

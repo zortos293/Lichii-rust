@@ -364,7 +364,7 @@ impl TextureCache {
         let Some(source) = self.find(tx, gmmu, src_va, src)? else {
             return Ok(None);
         };
-        let Some(target) = self.lookup_or_create(tx, gmmu, dst.gpu_va, &dst.info)? else {
+        let Some(target) = self.lookup_or_create(tx, gmmu, dst.gpu_va, &dst.info, false)? else {
             return Ok(None);
         };
         if source.id == target.id {
@@ -372,7 +372,7 @@ impl TextureCache {
         }
         let whole = dst.rect == [0, 0, dst.info.width as i32, dst.info.height as i32];
         Ok(self
-            .render_target(tx, gmmu, dst.gpu_va, &dst.info, whole)?
+            .prepare_target(tx, gmmu, dst.gpu_va, &dst.info, whole, false)?
             .map(|target| (source, target)))
     }
 
