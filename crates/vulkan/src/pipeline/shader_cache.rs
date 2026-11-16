@@ -461,6 +461,9 @@ impl ShaderCache {
                 }
             }
         };
+        if let Some(module) = &module {
+            env.liru14_dump(module.hash);
+        }
         let key = ModuleKey {
             code: [a.map_or(0, |a| self.learn(a)), self.learn(env)],
             state,

@@ -579,6 +579,54 @@ impl<'a> ProgramEnv<'a> {
     }
 
     /// Takes the queries of the last translation.
+    #[doc(hidden)]
+    pub fn liru14_dump(&self, hash: u64) {
+        use std::fmt::Write as _;
+        let Some(dir) = std::env::var_os("LIRU14_DUMP_DIR") else {
+            return;
+        };
+        if self.stage != ShaderStage::Fragment {
+            return;
+        }
+        let mut out = String::new();
+        let (start, len) = self.code_range();
+        let header = self.start - header_size(self.arch);
+        let _ = writeln!(out, "start {:#x} code_start {:#x} len {:#x} header {:#x}", self.start, start, len, header);
+        let _ = writeln!(out, "texture_bound {}", self.texture_bound);
+        let _ = writeln!(out, "viewport {}", self.viewport_transform);
+        let _ = writeln!(out, "local {}", self.local_memory);
+        out.push_str("program");
+        let mut address = header;
+        while address < self.start + len.max(8) + 0x200 {
+            let _ = write!(out, " {:08x}", self.word(address));
+            address += 4;
+        }
+        out.push('\n');
+        for (index, cbuf) in self.const_buffers.iter().enumerate() {
+            if !cbuf.enabled || cbuf.size == 0 {
+                continue;
+            }
+            let size = cbuf.size.min(0x10000);
+            let _ = write!(out, "cbuf {index} {size}");
+            for offset in (0..size).step_by(4) {
+                let _ = write!(out, " {:08x}", self.cbuf_word(index as u32, offset));
+            }
+            out.push('\n');
+        }
+        for read in self.reads.borrow().iter() {
+            let _ = match read {
+                EnvRead::Type(handle, ty) => writeln!(out, "type {handle:#x} {ty:?}"),
+                EnvRead::PixelFormat(handle, format) => {
+                    writeln!(out, "format {handle:#x} {}", *format as u32)
+                }
+                EnvRead::Integer(handle, integer) => writeln!(out, "integer {handle:#x} {integer}"),
+                other => writeln!(out, "other {other:?}"),
+            };
+        }
+        let path = std::path::PathBuf::from(dir).join(format!("fs-{hash:016x}.env"));
+        let _ = std::fs::write(path, out);
+    }
+
     pub fn take_reads(&self) -> Vec<EnvRead> {
         self.reads.take()
     }
