@@ -587,7 +587,7 @@ impl TextureCache {
             let desc = |i: &ImageInfo| format!("{}x{}x{} l{} {:?} {:?}", i.width, i.height, i.layers, i.levels, i.format, i.layout);
             let info = &self.get(id).expect("a live image id").info;
             let newer_desc: Vec<String> = newer.iter().map(|&o| desc(&self.get(o).expect("a live image id").info)).collect();
-            sync_diag_finish(format!("{} window={}KB newer=[{}]", desc(info), (window.1 - window.0) >> 10, newer_desc.join(" ; ")));
+            sync_diag_finish(format!("ctx={} {} window={}KB newer=[{}]", super::SYNC_CTX.with(|c| c.get()), desc(info), (window.1 - window.0) >> 10, newer_desc.join(" ; ")));
         }
         let tick = self.tick;
         let image = self.image(id);

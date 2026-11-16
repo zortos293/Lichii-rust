@@ -553,6 +553,8 @@ struct LookupKey {
     usage: Usage,
 }
 
+thread_local! { pub(super) static SYNC_CTX: std::cell::Cell<&'static str> = const { std::cell::Cell::new("?") }; }
+
 /// What a lookup is for, which decides what an image may stand in for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Usage {
@@ -1233,6 +1235,7 @@ impl TextureCache {
     ) -> Result<Option<Found>> {
         let found = self.lookup_or_create(tx, gmmu, gpu_va, info, usage)?;
         if let Some(found) = found {
+            SYNC_CTX.with(|c| c.set(match usage { Usage::Sample => "find sample", Usage::Storage => "find storage", Usage::Target => "find target", Usage::Transfer => "find transfer" }));
             self.refresh(tx, found.id)?;
         }
         Ok(found)
@@ -1313,6 +1316,7 @@ impl TextureCache {
             image.cpu_dirty = false;
             image.current = tick;
         }
+        SYNC_CTX.with(|c| c.set(if discard && whole { "target discard" } else if discard { "target discard-not-whole" } else { "target keep" }));
         self.refresh(tx, found.id)?;
         let target = if self.can_rescale(found.id) {
             self.scale
@@ -2421,6 +2425,7 @@ impl TextureCache {
         }
         self.new_aliases = new_aliases;
         if !self.joins.is_empty() {
+            SYNC_CTX.with(|c| c.set("create join"));
             self.refresh(tx, id)?;
             self.join(tx, id)?;
         }
