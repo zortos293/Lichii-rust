@@ -1279,6 +1279,8 @@ impl TextureCache {
 
     /// The image a render target or depth target writes, at the scale the rules allow.
     /// `discard` skips uploading guest data the caller overwrites entirely (a full clear).
+    /// It keeps its own texels where incompatible overlaps wrote the shared bytes since, as the
+    /// C++ cache does with bad overlaps: only reads of the image take them.
     pub fn render_target(
         &mut self,
         tx: &mut Transfer<'_>,
@@ -1312,10 +1314,11 @@ impl TextureCache {
         };
         if discard && whole {
             self.flush_buffered(tx, found.id)?;
+            self.image(found.id).cpu_dirty = false;
+        }
+        if (discard && whole) || usage == Usage::Target {
             let tick = self.tick;
-            let image = self.image(found.id);
-            image.cpu_dirty = false;
-            image.current = tick;
+            self.image(found.id).current = tick;
         }
         if matches!((info.width, info.height), (2560, 1440) | (1280, 720)) {
             if diag_window() {
