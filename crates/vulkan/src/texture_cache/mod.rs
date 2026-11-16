@@ -31,6 +31,7 @@ mod astc;
 mod blit;
 mod clear;
 mod convert;
+pub mod diag_dl;
 mod dma;
 mod guest_sync;
 mod info;
@@ -1535,6 +1536,7 @@ impl TextureCache {
         let mut result = Ok(());
         for &id in &ids {
             if self.image(id).gpu_modified {
+                diag_dl::set_cache("invalidate");
                 let written_back =
                     self.download(tx, &[id], Some((daddr, daddr.saturating_add(size))));
                 result = result.and(written_back);
@@ -1576,6 +1578,7 @@ impl TextureCache {
         }]);
         let mut modified = std::mem::take(&mut self.ids);
         modified.retain(|&id| self.get(id).is_some_and(|i| i.gpu_modified));
+        diag_dl::set_cache("flush");
         let result = self.download(tx, &modified, None);
         modified.clear();
         self.ids = modified;
@@ -2759,6 +2762,19 @@ impl TextureCache {
             self.overlap_scratch = newer;
             return Ok(());
         }
+        {
+            let mut key = format!(
+                "OVL reason={} target {} <- ",
+                diag_dl::reason(),
+                diag_dl::desc(self.get(id).unwrap())
+            );
+            for &o in newer.iter().take(4) {
+                key.push_str(&format!("[{}] ", diag_dl::desc(self.get(o).unwrap())));
+            }
+            key.push_str(&format!("n{}", newer.len()));
+            diag_dl::hit(key);
+            diag_dl::set_cache("overlap");
+        }
         let image = self.get(id).expect("a live image id");
         let own = image.gpu_modified && !self.covered(id, &newer);
         let mut ranges = std::mem::take(&mut self.overlap_ranges);
@@ -3200,6 +3216,7 @@ impl TextureCache {
         for &id in ids {
             let image = self.image(id);
             if image.downloadable() {
+                diag_dl::download(image);
                 downloads.push(Download {
                     id,
                     offset: 0,

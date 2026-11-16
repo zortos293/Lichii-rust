@@ -445,13 +445,39 @@ impl TextureCache {
         let movable = |o: &CachedImage| {
             o.keep_out.is_empty() && o.info.size_bytes() < 1 << 31 && packing(o).is_some()
         };
-        if !movable(image)
-            || newer.iter().any(|&o| {
-                let overlap = self.get(o).expect("overlaps are live");
-                !movable(overlap) || overlap.cpu_dirty && self.stale(o)
-            })
-        {
+        let why = |o: &CachedImage| {
+            if !o.keep_out.is_empty() {
+                "keep_out"
+            } else if o.info.size_bytes() >= 1 << 31 {
+                "size>=2G"
+            } else if packing(o).is_none() {
+                "no-packing"
+            } else {
+                ""
+            }
+        };
+        if !movable(image) {
+            super::diag_dl::set_reason(match why(image) {
+                "keep_out" => "target-keep_out",
+                "size>=2G" => "target-size>=2G",
+                _ => "target-no-packing",
+            });
             return Ok(false);
+        }
+        for &o in newer.iter() {
+            let overlap = self.get(o).expect("overlaps are live");
+            if !movable(overlap) {
+                super::diag_dl::set_reason(match why(overlap) {
+                    "keep_out" => "overlap-keep_out",
+                    "size>=2G" => "overlap-size>=2G",
+                    _ => "overlap-no-packing",
+                });
+                return Ok(false);
+            }
+            if overlap.cpu_dirty && self.stale(o) {
+                super::diag_dl::set_reason("overlap-cpu-dirty-stale");
+                return Ok(false);
+            }
         }
         if self.guest_sync.is_none() {
             self.guest_sync = Some(GuestSync::new(&self.device)?);
@@ -469,6 +495,7 @@ impl TextureCache {
         let image = live(id);
         let whole = (0, image.info.size_bytes());
         if !shared_runs(image, image, whole, scratch) {
+            super::diag_dl::set_reason("target-shared-runs");
             return Ok(false);
         }
         let mut window = whole;
@@ -476,6 +503,7 @@ impl TextureCache {
             window = (u64::MAX, 0);
             for &o in newer.iter() {
                 if !shared_runs(live(o), image, whole, scratch) {
+                    super::diag_dl::set_reason("overlap-shared-runs");
                     return Ok(false);
                 }
                 for r in &scratch.runs {
@@ -484,6 +512,7 @@ impl TextureCache {
             }
         }
         if window.0 >= window.1 {
+            super::diag_dl::set_reason("empty-window");
             return Ok(false);
         }
         for &o in newer.iter() {

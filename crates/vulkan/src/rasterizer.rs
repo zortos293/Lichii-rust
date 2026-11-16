@@ -1296,7 +1296,9 @@ impl Rasterizer for VulkanRasterizer {
             }
         }
         self.release_fences(false);
+        crate::texture_cache::diag_dl::set_rast("sync-region");
         self.flush_region(addr, size);
+        crate::texture_cache::diag_dl::set_rast("trait-flush");
     }
 
     fn pending_semaphore_words(
@@ -1372,7 +1374,10 @@ impl Rasterizer for VulkanRasterizer {
             memory: &self.handles.device,
             buffers: &mut self.buffer_cache,
         };
-        if let Err(error) = self.texture_cache.invalidate(&mut tx, addr, size) {
+        crate::texture_cache::diag_dl::set_rast("invalidate-region");
+        let invalidated = self.texture_cache.invalidate(&mut tx, addr, size);
+        crate::texture_cache::diag_dl::set_rast("trait-flush");
+        if let Err(error) = invalidated {
             tracing::error!(%error, "writing back GPU-modified images before a CPU write failed");
         }
     }
@@ -1405,7 +1410,9 @@ impl Rasterizer for VulkanRasterizer {
         {
             tracing::error!(%error, "flushing GPU-written buffers for a CPU read failed");
         }
+        crate::texture_cache::diag_dl::set_rast("cpu-read");
         self.flush_region(addr, size);
+        crate::texture_cache::diag_dl::set_rast("trait-flush");
     }
 
     fn unmap_region(&mut self, addr: DAddr, size: u64) {
@@ -1480,7 +1487,9 @@ impl Rasterizer for VulkanRasterizer {
             Ok(true) => Ok(()),
             Ok(false) => {
                 let info = ImageInfo::from_framebuffer(framebuffer);
+                crate::texture_cache::diag_dl::set_rast("present");
                 self.flush_region(framebuffer.address, info.size_bytes());
+                crate::texture_cache::diag_dl::set_rast("trait-flush");
                 self.upload_frame(framebuffer)
             }
             Err(error) => Err(error),
