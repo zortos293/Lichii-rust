@@ -57,6 +57,12 @@ const LOAD_FIFO_MAX_WORDS: usize = 0x8000;
 /// Words of method writes or data RAM accesses a memoised call may record.
 const RECORD_MAX_WORDS: usize = 0x4000;
 
+/// Whether `method` is one of the LOAD_MME methods that upload code and bind start addresses.
+#[inline]
+pub fn is_load_mme(method: u32) -> bool {
+    (LOAD_MME_INSTRUCTION_RAM_POINTER..=LOAD_MME_START_ADDRESS_RAM).contains(&method)
+}
+
 /// What a macro call runs against: a register mirror plus a method sink. Every call comes from
 /// the macro hot path, so keep them cheap; [`MacroEngine::execute`] is generic over the host, so
 /// they are monomorphised and inlined.
@@ -84,6 +90,7 @@ pub trait MacroHost {
 pub struct ReadTaint {
     registers: u32,
     ram: [u64; DATA_RAM_WORDS / 64],
+    data_ram: bool,
 }
 
 impl ReadTaint {
@@ -92,6 +99,16 @@ impl ReadTaint {
         Self {
             registers: 0,
             ram: [0; DATA_RAM_WORDS / 64],
+            data_ram: true,
+        }
+    }
+
+    /// Nothing unknown, and the run stops with [`MacroErrorKind::UsesDataRam`] before it reads or
+    /// writes the data RAM, which it then leaves as it was.
+    pub fn without_data_ram() -> Self {
+        Self {
+            data_ram: false,
+            ..Self::new()
         }
     }
 
@@ -222,6 +239,9 @@ pub enum MacroErrorKind {
     /// A shadow run reached a branch, address or method that depends on its DMA reads.
     #[error("depends on a DMA read")]
     DependsOnRead,
+    /// A shadow run started with [`ReadTaint::without_data_ram`] reached the data RAM.
+    #[error("uses the data RAM")]
+    UsesDataRam,
 }
 
 /// A failed macro call: what went wrong, the call's start address and the failing instruction.
@@ -447,8 +467,27 @@ impl MacroEngine {
     /// Whether the macro `method` starts read guest memory (`MME_DMA_READ*`) on a call since its
     /// code last changed.
     pub fn reads_memory(&self, method: u32) -> bool {
+        self.memory_readers.contains(&self.start_of(method))
+    }
+
+    /// The start address of the macro `method` (in the [`MACRO_METHOD_BASE`] range) calls.
+    pub fn start_of(&self, method: u32) -> u32 {
         let index = (method.wrapping_sub(MACRO_METHOD_BASE) >> 1) as usize % START_ADDRESS_SLOTS;
-        self.memory_readers.contains(&self.start_addresses[index])
+        self.start_addresses[index]
+    }
+
+    /// An MME64 engine with this one's code and nothing else, for [`MacroEngine::call`]s made
+    /// elsewhere: no start addresses, no memo. None for Fermi code.
+    pub fn code_copy(&self) -> Option<MacroEngine> {
+        let Code::Mme64(code) = &self.code else {
+            return None;
+        };
+        let mut copy = MacroEngine::new(MacroIsa::Mme64);
+        copy.code = Code::Mme64(code.clone());
+        copy.code_generation = self.code_generation;
+        copy.memo_enabled = false;
+        copy.step_limit = self.step_limit;
+        Some(copy)
     }
 
     /// Runs the MME64 macro `method` starts without guest memory: its DMA reads return no words,

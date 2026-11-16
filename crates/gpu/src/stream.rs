@@ -48,6 +48,10 @@ pub(crate) mod tag {
     pub const SYNCHRONIZE_FETCH: u8 = 15;
     /// Then the GPU address the engine's next DATA_UPLOAD word comes from.
     pub const UPLOAD_SOURCE: u8 = 16;
+    /// A macro call the back runs with the code
+    /// [`SideCommand::MacroCode`](crate::back::SideCommand::MacroCode) gave the channel. Method:
+    /// its start address; argument: parameter count; the parameters follow, two per slot.
+    pub const MACRO: u8 = 17;
 }
 
 /// How far the fetch of a GPFIFO entry waits for the work before it.
@@ -144,6 +148,13 @@ impl ReadOverlay {
     }
 }
 
+fn push_pairs(producer: &mut Producer, words: &[u32]) {
+    for pair in words.chunks(2) {
+        let high = pair.get(1).copied().unwrap_or(0);
+        producer.push(u64::from(pair[0]) | u64::from(high) << 32);
+    }
+}
+
 /// Where the back runs.
 pub(crate) enum Link {
     /// On its own thread, reading the ring concurrently.
@@ -215,13 +226,24 @@ impl Stream {
             self.reserve(1 + count.div_ceil(2));
             self.producer
                 .push(header(tag::MULTI, engine, method, count as u32));
-            for pair in self.words.chunks(2) {
-                let high = pair.get(1).copied().unwrap_or(0);
-                self.producer
-                    .push(u64::from(pair[0]) | u64::from(high) << 32);
-            }
+            push_pairs(&mut self.producer, &self.words);
         }
         self.words.clear();
+        self.maybe_publish();
+    }
+
+    /// Has the back run the macro at instruction `start` with `parameters` (at most
+    /// [`MULTI_MAX_WORDS`]), its writes going to `engine`, at this point of the stream.
+    pub(crate) fn macro_call(&mut self, engine: EngineKind, start: u32, parameters: &[u32]) {
+        self.flush_pending();
+        self.reserve(1 + parameters.len().div_ceil(2));
+        self.producer.push(header(
+            tag::MACRO,
+            engine.index() as u8,
+            start,
+            parameters.len() as u32,
+        ));
+        push_pairs(&mut self.producer, parameters);
         self.maybe_publish();
     }
 

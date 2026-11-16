@@ -476,6 +476,28 @@ fn shadow_run_tracks_data_ram_words_it_read() {
 }
 
 #[test]
+fn shadow_run_without_data_ram_stops_before_it() {
+    let program = [
+        inst(imm(0x20), imm(0x7)).out0(NONE, IMM0),
+        inst(alu(DWRITE, ZERO, IMM, IMM, 0x20), nop()).end(),
+        inst(nop(), nop()),
+    ];
+    let mut data_ram = MacroDataRam::new();
+    let mut host = TestHost::default();
+    let error = engine(&program)
+        .shadow_execute(
+            MACRO_METHOD_BASE,
+            &[1],
+            &mut data_ram,
+            &mut host,
+            &mut ReadTaint::without_data_ram(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind, MacroErrorKind::UsesDataRam);
+    assert!(data_ram.words().iter().all(|&word| word == 0));
+}
+
+#[test]
 fn shadow_run_stops_where_a_read_steers_it() {
     let program = [
         inst(imm(0x1154), nop())

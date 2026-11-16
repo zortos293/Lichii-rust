@@ -16,10 +16,12 @@ use crate::backend::{
 use crate::clock::GpuTimestamp;
 use crate::cpu_reads::CpuReads;
 use crate::engines::kepler_compute::pcas::QmdScheduler;
+use crate::engines::maxwell_3d::MACRO_REGISTERS_START;
 use crate::engines::{Engine, EngineContext, EngineFactory, EngineKind};
 use crate::gmmu::{Gmmu, RangeTarget};
 use crate::gpu::{MAX_POLL, MIN_POLL};
 use crate::host1x::Syncpoints;
+use crate::macros::{MacroDataRam, MacroEngine, MacroHost, is_load_mme};
 use crate::ring::{Consumer, WRAP};
 use crate::stream::{
     FetchSync, FetchSyncs, MULTI_MAX_WORDS, OVERLAY_WORDS, REDUCTIONS, RELEASE_SIZES, tag,
@@ -49,6 +51,11 @@ pub(crate) enum SideCommand {
     UnmapRegion(DAddr, u64),
     Present(FramebufferConfig),
     Run(RasterizerAction),
+    /// The macro code the current channel's [`tag::MACRO`] records run.
+    MacroCode(Box<MacroEngine>),
+    /// Replies with the current channel's 3D registers the methods name, each with its value and
+    /// its shadow RAM copy.
+    Registers(Vec<u32>, mpsc::SyncSender<Vec<(u32, u32, u32)>>),
     /// Reports that everything before it executed.
     Signal(mpsc::SyncSender<()>),
 }
@@ -56,6 +63,7 @@ pub(crate) enum SideCommand {
 struct BackChannel {
     setup: BackChannelSetup,
     engines: [Option<Box<dyn Engine>>; EngineKind::COUNT],
+    macros: Option<Box<MacroEngine>>,
 }
 
 /// How much of the device memory around a GPFIFO entry one fetch sync writes back. Switch 2
@@ -86,6 +94,8 @@ pub(crate) struct Back {
     cpu_reads: Arc<CpuReads>,
     /// Scratch for [`CpuReads::serve`].
     cpu_read_ranges: Vec<(DAddr, u64)>,
+    /// The data RAM of macros the back runs: the front sends only calls that never use it.
+    data_ram: MacroDataRam,
 }
 
 impl Drop for Back {
@@ -124,6 +134,7 @@ impl Back {
             stopping,
             cpu_reads,
             cpu_read_ranges: Vec::new(),
+            data_ram: MacroDataRam::new(),
         }
     }
 
@@ -235,7 +246,10 @@ impl Back {
         let method = (header >> 16) as u32 & 0xffff;
         let argument = (header >> 32) as u32;
         let record = header as u8;
-        if matches!(record, tag::METHOD | tag::MULTI | tag::UPLOAD_SOURCE) {
+        if matches!(
+            record,
+            tag::METHOD | tag::MULTI | tag::UPLOAD_SOURCE | tag::MACRO
+        ) {
             let target = self.current.map(|index| (index, engine));
             if self.last != target {
                 self.flush_engine();
@@ -252,17 +266,16 @@ impl Back {
                 1
             }
             tag::MULTI => {
-                let count = argument as usize;
-                let slots = count.div_ceil(2);
-                self.words.clear();
-                for index in 0..slots {
-                    let slot = consumer.slot(1 + index);
-                    self.words.push(slot as u32);
-                    self.words.push((slot >> 32) as u32);
-                }
-                self.words.truncate(count);
+                let slots = self.collect_words(argument as usize, consumer);
                 let words = std::mem::take(&mut self.words);
                 self.with_engine(engine, |engine, ctx| engine.call_multi(ctx, method, &words));
+                self.words = words;
+                1 + slots
+            }
+            tag::MACRO => {
+                let slots = self.collect_words(argument as usize, consumer);
+                let words = std::mem::take(&mut self.words);
+                self.run_macro(engine, method, &words);
                 self.words = words;
                 1 + slots
             }
@@ -359,6 +372,51 @@ impl Back {
                 1
             }
             other => unreachable!("GPU stream record with tag {other}"),
+        }
+    }
+
+    /// Copies the `count` words after the header into `words`; returns the slots they took.
+    #[inline]
+    fn collect_words(&mut self, count: usize, consumer: &Consumer) -> usize {
+        let slots = count.div_ceil(2);
+        self.words.clear();
+        for index in 0..slots {
+            let slot = consumer.slot(1 + index);
+            self.words.push(slot as u32);
+            self.words.push((slot >> 32) as u32);
+        }
+        self.words.truncate(count);
+        slots
+    }
+
+    /// Runs a macro call the front sent (`tag::MACRO`) against the current channel's `engine`.
+    fn run_macro(&mut self, engine: u8, start: u32, parameters: &[u32]) {
+        let Some(channel) = self.current.and_then(|index| self.channels[index].as_mut()) else {
+            return;
+        };
+        let Some(code) = channel.macros.as_deref_mut() else {
+            tracing::error!(start, "macro call on the back before its code");
+            return;
+        };
+        let Some(instance) = channel.engines[usize::from(engine)].as_deref_mut() else {
+            return;
+        };
+        let mut ctx = EngineContext {
+            channel: channel.setup.id,
+            memory: &channel.setup.memory,
+            rasterizer: &mut *self.rasterizer,
+            syncpoints: &self.syncpoints,
+            gob_layout: channel.setup.gob_layout,
+            qmd_scheduler: &mut self.qmd_scheduler,
+            written_pages: &self.written_pages,
+            activity: &self.activity,
+        };
+        let mut host = BackMacroHost {
+            engine: instance,
+            ctx: &mut ctx,
+        };
+        if let Err(error) = code.call(start, parameters, &mut self.data_ram, &mut host) {
+            tracing::warn!(%error, "macro call on the back failed");
         }
     }
 
@@ -462,18 +520,13 @@ impl Back {
             self.rasterizer.release_fences(true);
             return;
         };
-        let rasterizer = &mut *self.rasterizer;
-        channel
-            .setup
-            .memory
-            .for_each_range(address, size, |range| match range.target {
-                RangeTarget::Device(daddr) => {
-                    let start = daddr & !(window - 1);
-                    let end = (daddr + range.size).next_multiple_of(window);
-                    rasterizer.synchronize_region(start, end - start);
-                }
-                _ => rasterizer.release_fences(true),
-            });
+        synchronize_range(
+            &channel.setup.memory,
+            &mut *self.rasterizer,
+            address,
+            size,
+            window,
+        );
     }
 
     /// The words of `[address, address + size)` that semaphore releases still on their way write,
@@ -488,28 +541,13 @@ impl Back {
         let channel = self
             .current
             .and_then(|index| self.channels[index].as_ref())?;
-        if !address.is_multiple_of(4) || size > 4 * OVERLAY_WORDS as u64 {
-            return None;
-        }
-        let rasterizer = &mut *self.rasterizer;
-        let written_pages = &self.written_pages;
-        let mut words = [None; OVERLAY_WORDS];
-        let mut known = true;
-        channel.setup.memory.for_each_range(address, size, |range| {
-            let RangeTarget::Device(daddr) = range.target else {
-                known = false;
-                return;
-            };
-            if !known || written_pages.may_be_written(daddr, range.size) {
-                known = false;
-                return;
-            }
-            let base = range.gpu_va - address;
-            known = rasterizer.pending_semaphore_words(daddr, range.size, &mut |at, word| {
-                words[((base + at - daddr) / 4) as usize] = Some(word);
-            });
-        });
-        (known && words.iter().any(Option::is_some)).then_some(words)
+        pending_words(
+            &channel.setup.memory,
+            &mut *self.rasterizer,
+            &self.written_pages,
+            address,
+            size,
+        )
     }
 
     /// Whether GPU work may have written a page of the current channel's `[address, +size)`.
@@ -556,6 +594,7 @@ impl Back {
                 self.channels[index] = Some(BackChannel {
                     setup,
                     engines: Default::default(),
+                    macros: None,
                 });
             }
             SideCommand::DestroyChannel(id) => {
@@ -590,8 +629,133 @@ impl Back {
                 self.timestamp.frame_presented();
             }
             SideCommand::Run(action) => action(&mut *self.rasterizer),
+            SideCommand::MacroCode(code) => {
+                if let Some(channel) = self.channel() {
+                    channel.macros = Some(code);
+                }
+            }
+            SideCommand::Registers(methods, reply) => {
+                let state = self
+                    .channel()
+                    .and_then(|channel| channel.engines[EngineKind::Maxwell3d.index()].as_deref())
+                    .and_then(|engine| engine.graphics_state());
+                let values = state
+                    .map(|state| {
+                        methods
+                            .iter()
+                            .map(|&method| {
+                                let (value, shadow) = state.word(method);
+                                (method, value, shadow)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let _ = reply.send(values);
+            }
             SideCommand::Signal(done) => {
                 let _ = done.send(());
+            }
+        }
+    }
+}
+
+/// Has the GPU work before it complete and GPU-written data in `[address, address + size)` reach
+/// guest memory, over the device range widened to whole `window`-aligned blocks (a power of two;
+/// 1 is the range).
+fn synchronize_range(
+    memory: &Gmmu,
+    rasterizer: &mut dyn Rasterizer,
+    address: u64,
+    size: u64,
+    window: u64,
+) {
+    memory.for_each_range(address, size, |range| match range.target {
+        RangeTarget::Device(daddr) => {
+            let start = daddr & !(window - 1);
+            let end = (daddr + range.size).next_multiple_of(window);
+            rasterizer.synchronize_region(start, end - start);
+        }
+        _ => rasterizer.release_fences(true),
+    });
+}
+
+/// The words of `[address, address + size)` that semaphore releases still on their way write,
+/// by index, when GPU work never wrote its pages and the renderer holds no other pending write
+/// there. None when a read must synchronize.
+fn pending_words(
+    memory: &Gmmu,
+    rasterizer: &mut dyn Rasterizer,
+    written_pages: &GpuWrittenPages,
+    address: u64,
+    size: u64,
+) -> Option<[Option<u32>; OVERLAY_WORDS]> {
+    if !address.is_multiple_of(4) || size > 4 * OVERLAY_WORDS as u64 {
+        return None;
+    }
+    let mut words = [None; OVERLAY_WORDS];
+    let mut known = true;
+    memory.for_each_range(address, size, |range| {
+        let RangeTarget::Device(daddr) = range.target else {
+            known = false;
+            return;
+        };
+        if !known || written_pages.may_be_written(daddr, range.size) {
+            known = false;
+            return;
+        }
+        let base = range.gpu_va - address;
+        known = rasterizer.pending_semaphore_words(daddr, range.size, &mut |at, word| {
+            words[((base + at - daddr) / 4) as usize] = Some(word);
+        });
+    });
+    (known && words.iter().any(Option::is_some)).then_some(words)
+}
+
+/// What a macro the back runs (`tag::MACRO`) runs against: the channel's engine itself.
+struct BackMacroHost<'a, 'c> {
+    engine: &'a mut dyn Engine,
+    ctx: &'a mut EngineContext<'c>,
+}
+
+impl MacroHost for BackMacroHost<'_, '_> {
+    fn read_register(&mut self, method: u32) -> u32 {
+        self.engine
+            .graphics_state()
+            .and_then(|state| state.regs.words().get(method as usize).copied())
+            .unwrap_or(0)
+    }
+
+    fn write_method(&mut self, method: u32, argument: u32) {
+        if is_load_mme(method) || method >= MACRO_REGISTERS_START {
+            return;
+        }
+        self.engine.call_method(self.ctx, method, argument);
+    }
+
+    /// Reads memory as the front would after a drain: the engine submits what it holds, and the
+    /// words wait for the host GPU unless semaphore releases on their way hold them.
+    fn dma_read(&mut self, gpu_va: u64, out: &mut [u32]) {
+        self.engine.flush(self.ctx);
+        let size = size_of_val(out) as u64;
+        let memory = self.ctx.memory;
+        let pending = pending_words(
+            memory,
+            &mut *self.ctx.rasterizer,
+            self.ctx.written_pages,
+            gpu_va,
+            size,
+        );
+        if pending.is_none() {
+            let _waiting = self.ctx.activity.waiting(Wait::HostGpu);
+            synchronize_range(memory, &mut *self.ctx.rasterizer, gpu_va, size, 1);
+        }
+        if let Err(fault) = memory.read_block(gpu_va, bytemuck::cast_slice_mut(out)) {
+            tracing::warn!(?fault, "MME DMA read from unmapped GPU memory");
+            out.fill(0);
+        }
+        for (slot, word) in out.iter_mut().zip(pending.unwrap_or_default()) {
+            if let Some(word) = word {
+                *slot = word;
             }
         }
     }

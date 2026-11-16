@@ -100,6 +100,7 @@ impl Instruction {
 }
 
 /// MME64 code RAM and its decoded instructions, kept in step on every upload.
+#[derive(Clone)]
 pub(super) struct Mme64Code {
     words: Box<[u32]>,
     decoded: Box<[Instruction]>,
@@ -207,6 +208,9 @@ impl<H: MacroHost> Io<'_, H> {
                 self.host.dma_read(gpu_va, &mut self.load_fifo[len..]);
             }
         } else {
+            if !taint.data_ram() {
+                return Err(MacroErrorKind::UsesDataRam);
+            }
             let first = self.host.read_register(SET_MME_DATA_RAM_ADDRESS) as usize;
             if first < DATA_RAM_WORDS {
                 let end = first.saturating_add(count).min(DATA_RAM_WORDS);
@@ -233,6 +237,7 @@ pub(super) trait Taint {
     fn ram(&self, address: u32) -> bool;
     fn mark_ram(&mut self, first: usize, end: usize);
     fn clear_ram(&mut self, address: u32);
+    fn data_ram(&self) -> bool;
 }
 
 /// A normal run: every value is known.
@@ -254,6 +259,10 @@ impl Taint for Untracked {
     fn mark_ram(&mut self, _first: usize, _end: usize) {}
     #[inline(always)]
     fn clear_ram(&mut self, _address: u32) {}
+    #[inline(always)]
+    fn data_ram(&self) -> bool {
+        true
+    }
 }
 
 impl Taint for ReadTaint {
@@ -282,6 +291,9 @@ impl Taint for ReadTaint {
         if a < DATA_RAM_WORDS {
             self.ram[a / 64] &= !(1 << (a % 64));
         }
+    }
+    fn data_ram(&self) -> bool {
+        self.data_ram
     }
 }
 
@@ -493,6 +505,9 @@ pub(super) fn run<H: MacroHost, T: Taint>(
                     0
                 }
                 30 => {
+                    if T::TRACKS && !taint.data_ram() {
+                        return Err(fail(MacroErrorKind::UsesDataRam));
+                    }
                     let value = *io
                         .data_ram
                         .words()
@@ -502,6 +517,9 @@ pub(super) fn run<H: MacroHost, T: Taint>(
                     value
                 }
                 31 => {
+                    if T::TRACKS && !taint.data_ram() {
+                        return Err(fail(MacroErrorKind::UsesDataRam));
+                    }
                     let slot = io
                         .data_ram
                         .words_mut()

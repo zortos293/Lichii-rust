@@ -92,6 +92,11 @@ pub trait Engine: Send {
     /// word after it comes from the next address. The front sends it for compute on Switch 1, and
     /// again wherever the words stop being contiguous.
     fn upload_source(&mut self, _address: GpuVAddr) {}
+
+    /// The 3D engine's registers, which macros the back runs read.
+    fn graphics_state(&self) -> Option<&maxwell_3d::RegisterState> {
+        None
+    }
 }
 
 impl Engine for kepler_memory::KeplerMemory {
@@ -127,6 +132,10 @@ impl Engine for maxwell_3d::Maxwell3d {
 
     fn flush(&mut self, ctx: &mut EngineContext<'_>) {
         maxwell_3d::Maxwell3d::flush(self, ctx);
+    }
+
+    fn graphics_state(&self) -> Option<&maxwell_3d::RegisterState> {
+        Some(&self.state)
     }
 }
 
