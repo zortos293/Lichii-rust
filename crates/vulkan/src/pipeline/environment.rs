@@ -691,6 +691,15 @@ impl ShaderEnvironment for ProgramEnv<'_> {
 
     fn read_cbuf(&self, index: u32, offset: u32) -> u32 {
         let value = self.cbuf_word(index, offset);
+        if index == 1 && std::env::var_os("LIRU14_LOG1").is_some() {
+            let size = self.const_buffers.get(1).map_or(0, |c| c.size);
+            tracing::info!(
+                "LIRU14 bank1 {:?} tb={} +{offset:#x} = {value:#x} ({}) size={size:#x}",
+                self.stage,
+                self.texture_bound,
+                f32::from_bits(value)
+            );
+        }
         self.record(EnvRead::Cbuf {
             index,
             offset,
@@ -765,6 +774,11 @@ impl ShaderEnvironment for ProgramEnv<'_> {
 
     fn has_hle_macro_state(&self) -> bool {
         false
+    }
+
+    fn is_proprietary_driver(&self) -> bool {
+        std::env::var_os("LIRU14_FOLD").is_some_and(|v| v == "1")
+            && (self.arch == ShaderArch::Ampere || self.texture_bound == 2)
     }
 }
 
