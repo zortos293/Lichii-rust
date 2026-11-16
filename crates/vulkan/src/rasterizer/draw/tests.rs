@@ -10,11 +10,12 @@ use lichii_gpu::backend::{
     ReleaseSize,
 };
 use lichii_gpu::engines::maxwell_3d::regs::{
-    BlendEquation, BlendFactor, ClearSurface, ColorMask, DepthMode, IndexFormat, MAX_CONST_BUFFERS,
-    MAX_SHADER_STAGE, MESH_CONTROL, MESH_INIT_SHADER, MESH_SHADER_A, MESH_SHADER_B, PipelineBits,
-    PrimitiveTopology, RenderTargetConfigBits, RtControl, RtLayer, RtLayerControl, ScissorTestBits,
-    ScissorTestBits1, ShaderType, SurfaceClipBits, SurfaceClipBits1, TileMode,
-    TileModeDimensionControl, VertexAttribute, VertexAttributeType, VertexStreamBits, ZetaSizeBits,
+    BlendEquation, BlendFactor, ClearSurface, ColorMask, ComparisonOp, DepthMode, IndexFormat,
+    MAX_CONST_BUFFERS, MAX_SHADER_STAGE, MESH_CONTROL, MESH_INIT_SHADER, MESH_SHADER_A,
+    MESH_SHADER_B, PipelineBits, PrimitiveTopology, RenderTargetConfigBits, RtControl, RtLayer,
+    RtLayerControl, ScissorTestBits, ScissorTestBits1, ShaderType, SurfaceClipBits,
+    SurfaceClipBits1, TileMode, TileModeDimensionControl, VertexAttribute, VertexAttributeType,
+    VertexStreamBits, ZetaSizeBits,
 };
 use lichii_gpu::engines::maxwell_3d::{DirtyState, Regs, dirty};
 use lichii_gpu::gmmu::Gmmu;
@@ -4614,4 +4615,48 @@ fn fragment_stages_read_what_a_passthrough_geometry_stage_passes_through() {
         state(&storing).key(),
         "the fragment module is keyed by what passes through"
     );
+}
+
+#[test]
+fn depth_bias_constants_offset_by_half_the_register_value() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    let mut regs = draw_regs();
+    let depth = GPU_VA + 0x8000;
+    regs.zeta.address_high = (depth >> 32) as u32;
+    regs.zeta.address_low = depth as u32;
+    regs.zeta.format = 0x13;
+    regs.zeta.tile_mode = TileMode(1 << 4);
+    regs.zeta_size.width = SIZE;
+    regs.zeta_size.height = SIZE;
+    regs.zeta_size.bits = ZetaSizeBits(1 | 1 << 16);
+    regs.zeta_enable = 1;
+    regs.depth_test_enable = 1;
+    regs.depth_write_enabled = 1;
+    regs.depth_test_func = ComparisonOp::ALWAYS_GL;
+    regs.polygon_offset_fill_enable = 1;
+    regs.depth_bias = 8.0;
+    draw(&mut f, &gmmu, &regs);
+    let tiling = Tiling::new(SIZE, SIZE, 1, 2, 1, 0, GobLayout::Tegra);
+    f.rasterizer
+        .flush_region(DADDR + 0x8000, tiling.size_bytes() as u64);
+    let texels = guest_linear(&f, DADDR + 0x8000, &tiling);
+    let depths: Vec<u16> = texels
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&d| u16::from_le_bytes(d))
+        .collect();
+    assert!(
+        depths.iter().all(|&d| d == 4),
+        "a bias register of 8 offsets z = 0 by 4 units of D16: {:?}",
+        &depths[..4]
+    );
+    f.assert_no_validation_errors();
 }

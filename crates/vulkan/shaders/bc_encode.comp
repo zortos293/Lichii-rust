@@ -1,0 +1,371 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// Compresses a band of RGBA8 texels (astc_decode.comp's output, width per row) to BC1 or BC3, one
+// 4x4 block per invocation, so recompressed ASTC never round-trips through the CPU. A port of the
+// CPU encoder (lichii_texture::bcn::encode_bc1/encode_bc3): colour endpoints from the principal
+// axis of the block's colours, refined once by least squares, uniform blocks from exact
+// single-colour tables, every texel on its nearest palette entry. Values are encoded as stored
+// (sRGB data stays sRGB). Edge blocks repeat the last row and column. Float steps are precise, so
+// only division rounding can move an endpoint away from the CPU's.
+
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Texels { uint rgba[]; };
+layout(set = 0, binding = 1) writeonly buffer Blocks { uvec2 blocks[]; };
+
+layout(push_constant) uniform P {
+    uint blocks_x;
+    uint blocks_y;
+    uint width;
+    uint height;
+    uint bc3;
+    uint in_offset;
+    uint out_offset;
+} p;
+
+// For each 8-bit value, the endpoint pair (hi | lo << 8, 5 or 6 bits) whose two-thirds point
+// decodes closest, the smaller spread breaking ties: the CPU encoder's SingleColorTable.
+const uint SINGLE5[256] = uint[](
+    0x0000u, 0x0000u, 0x0100u, 0x0100u, 0x0100u, 0x0001u, 0x0001u, 0x0101u,
+    0x0101u, 0x0101u, 0x0201u, 0x0201u, 0x0201u, 0x0102u, 0x0102u, 0x0202u,
+    0x0202u, 0x0202u, 0x0302u, 0x0302u, 0x0302u, 0x0203u, 0x0203u, 0x0203u,
+    0x0303u, 0x0303u, 0x0303u, 0x0403u, 0x0403u, 0x0304u, 0x0304u, 0x0304u,
+    0x0404u, 0x0404u, 0x0404u, 0x0504u, 0x0504u, 0x0504u, 0x0405u, 0x0405u,
+    0x0505u, 0x0505u, 0x0505u, 0x0605u, 0x0605u, 0x0605u, 0x0506u, 0x0506u,
+    0x0606u, 0x0606u, 0x0606u, 0x0706u, 0x0706u, 0x0706u, 0x0607u, 0x0607u,
+    0x0607u, 0x0707u, 0x0707u, 0x0707u, 0x0807u, 0x0807u, 0x0708u, 0x0708u,
+    0x0708u, 0x0808u, 0x0808u, 0x0808u, 0x0908u, 0x0908u, 0x0908u, 0x0809u,
+    0x0809u, 0x0909u, 0x0909u, 0x0909u, 0x0A09u, 0x0A09u, 0x0A09u, 0x090Au,
+    0x090Au, 0x0A0Au, 0x0A0Au, 0x0A0Au, 0x0B0Au, 0x0B0Au, 0x0B0Au, 0x0A0Bu,
+    0x0A0Bu, 0x0B0Bu, 0x0B0Bu, 0x0B0Bu, 0x0C0Bu, 0x0C0Bu, 0x0C0Bu, 0x0B0Cu,
+    0x0B0Cu, 0x0B0Cu, 0x0C0Cu, 0x0C0Cu, 0x0C0Cu, 0x0D0Cu, 0x0D0Cu, 0x0C0Du,
+    0x0C0Du, 0x0C0Du, 0x0D0Du, 0x0D0Du, 0x0D0Du, 0x0E0Du, 0x0E0Du, 0x0E0Du,
+    0x0D0Eu, 0x0D0Eu, 0x0E0Eu, 0x0E0Eu, 0x0E0Eu, 0x0F0Eu, 0x0F0Eu, 0x0F0Eu,
+    0x0E0Fu, 0x0E0Fu, 0x0F0Fu, 0x0F0Fu, 0x0F0Fu, 0x100Fu, 0x100Fu, 0x100Fu,
+    0x0F10u, 0x0F10u, 0x0F10u, 0x1010u, 0x1010u, 0x1010u, 0x1110u, 0x1110u,
+    0x1011u, 0x1011u, 0x1011u, 0x1111u, 0x1111u, 0x1111u, 0x1211u, 0x1211u,
+    0x1211u, 0x1112u, 0x1112u, 0x1212u, 0x1212u, 0x1212u, 0x1312u, 0x1312u,
+    0x1312u, 0x1213u, 0x1213u, 0x1313u, 0x1313u, 0x1313u, 0x1413u, 0x1413u,
+    0x1413u, 0x1314u, 0x1314u, 0x1314u, 0x1414u, 0x1414u, 0x1414u, 0x1514u,
+    0x1514u, 0x1415u, 0x1415u, 0x1415u, 0x1515u, 0x1515u, 0x1515u, 0x1615u,
+    0x1615u, 0x1516u, 0x1516u, 0x1516u, 0x1616u, 0x1616u, 0x1616u, 0x1716u,
+    0x1716u, 0x1716u, 0x1617u, 0x1617u, 0x1717u, 0x1717u, 0x1717u, 0x1817u,
+    0x1817u, 0x1817u, 0x1718u, 0x1718u, 0x1818u, 0x1818u, 0x1818u, 0x1918u,
+    0x1918u, 0x1918u, 0x1819u, 0x1819u, 0x1819u, 0x1919u, 0x1919u, 0x1919u,
+    0x1A19u, 0x1A19u, 0x191Au, 0x191Au, 0x191Au, 0x1A1Au, 0x1A1Au, 0x1A1Au,
+    0x1B1Au, 0x1B1Au, 0x1B1Au, 0x1A1Bu, 0x1A1Bu, 0x1B1Bu, 0x1B1Bu, 0x1B1Bu,
+    0x1C1Bu, 0x1C1Bu, 0x1C1Bu, 0x1B1Cu, 0x1B1Cu, 0x1C1Cu, 0x1C1Cu, 0x1C1Cu,
+    0x1D1Cu, 0x1D1Cu, 0x1D1Cu, 0x1C1Du, 0x1C1Du, 0x1C1Du, 0x1D1Du, 0x1D1Du,
+    0x1D1Du, 0x1E1Du, 0x1E1Du, 0x1D1Eu, 0x1D1Eu, 0x1D1Eu, 0x1E1Eu, 0x1E1Eu,
+    0x1E1Eu, 0x1F1Eu, 0x1F1Eu, 0x1F1Eu, 0x1E1Fu, 0x1E1Fu, 0x1F1Fu, 0x1F1Fu);
+
+const uint SINGLE6[256] = uint[](
+    0x0000u, 0x0100u, 0x0100u, 0x0001u, 0x0101u, 0x0201u, 0x0201u, 0x0102u,
+    0x0202u, 0x0302u, 0x0302u, 0x0203u, 0x0303u, 0x0403u, 0x0403u, 0x0304u,
+    0x0404u, 0x0404u, 0x0504u, 0x0405u, 0x0505u, 0x0505u, 0x0605u, 0x0506u,
+    0x0606u, 0x0606u, 0x0706u, 0x0607u, 0x0707u, 0x0707u, 0x0807u, 0x0708u,
+    0x0808u, 0x0808u, 0x0908u, 0x0809u, 0x0909u, 0x0909u, 0x0A09u, 0x090Au,
+    0x0A0Au, 0x0A0Au, 0x0B0Au, 0x0A0Bu, 0x0B0Bu, 0x0B0Bu, 0x0C0Bu, 0x0B0Cu,
+    0x0C0Cu, 0x0C0Cu, 0x0D0Cu, 0x0C0Du, 0x0D0Du, 0x0D0Du, 0x0E0Du, 0x0D0Eu,
+    0x0E0Eu, 0x0E0Eu, 0x0F0Eu, 0x0E0Fu, 0x0F0Fu, 0x0F0Fu, 0x100Fu, 0x0F10u,
+    0x1010u, 0x1010u, 0x1110u, 0x1011u, 0x1111u, 0x1111u, 0x1211u, 0x1211u,
+    0x1112u, 0x1212u, 0x1312u, 0x1312u, 0x1213u, 0x1313u, 0x1413u, 0x1413u,
+    0x1314u, 0x1414u, 0x1514u, 0x1514u, 0x1415u, 0x1515u, 0x1615u, 0x1615u,
+    0x1516u, 0x1616u, 0x1716u, 0x1716u, 0x1617u, 0x1717u, 0x1817u, 0x1817u,
+    0x1718u, 0x1818u, 0x1918u, 0x1918u, 0x1819u, 0x1919u, 0x1919u, 0x1A19u,
+    0x191Au, 0x1A1Au, 0x1A1Au, 0x1B1Au, 0x1A1Bu, 0x1B1Bu, 0x1B1Bu, 0x1C1Bu,
+    0x1B1Cu, 0x1C1Cu, 0x1C1Cu, 0x1D1Cu, 0x1C1Du, 0x1D1Du, 0x1D1Du, 0x1E1Du,
+    0x1D1Eu, 0x1E1Eu, 0x1E1Eu, 0x1F1Eu, 0x1E1Fu, 0x1F1Fu, 0x1F1Fu, 0x201Fu,
+    0x1F20u, 0x2020u, 0x2020u, 0x2120u, 0x2021u, 0x2121u, 0x2121u, 0x2221u,
+    0x2122u, 0x2222u, 0x2222u, 0x2322u, 0x2223u, 0x2323u, 0x2323u, 0x2423u,
+    0x2324u, 0x2424u, 0x2424u, 0x2524u, 0x2425u, 0x2525u, 0x2525u, 0x2625u,
+    0x2526u, 0x2626u, 0x2626u, 0x2726u, 0x2726u, 0x2627u, 0x2727u, 0x2827u,
+    0x2827u, 0x2728u, 0x2828u, 0x2928u, 0x2928u, 0x2829u, 0x2929u, 0x2A29u,
+    0x2A29u, 0x292Au, 0x2A2Au, 0x2B2Au, 0x2B2Au, 0x2A2Bu, 0x2B2Bu, 0x2C2Bu,
+    0x2C2Bu, 0x2B2Cu, 0x2C2Cu, 0x2D2Cu, 0x2D2Cu, 0x2C2Du, 0x2D2Du, 0x2E2Du,
+    0x2E2Du, 0x2D2Eu, 0x2E2Eu, 0x2E2Eu, 0x2F2Eu, 0x2E2Fu, 0x2F2Fu, 0x2F2Fu,
+    0x302Fu, 0x2F30u, 0x3030u, 0x3030u, 0x3130u, 0x3031u, 0x3131u, 0x3131u,
+    0x3231u, 0x3132u, 0x3232u, 0x3232u, 0x3332u, 0x3233u, 0x3333u, 0x3333u,
+    0x3433u, 0x3334u, 0x3434u, 0x3434u, 0x3534u, 0x3435u, 0x3535u, 0x3535u,
+    0x3635u, 0x3536u, 0x3636u, 0x3636u, 0x3736u, 0x3637u, 0x3737u, 0x3737u,
+    0x3837u, 0x3738u, 0x3838u, 0x3838u, 0x3938u, 0x3839u, 0x3939u, 0x3939u,
+    0x3A39u, 0x393Au, 0x3A3Au, 0x3A3Au, 0x3B3Au, 0x3A3Bu, 0x3B3Bu, 0x3B3Bu,
+    0x3C3Bu, 0x3C3Bu, 0x3B3Cu, 0x3C3Cu, 0x3D3Cu, 0x3D3Cu, 0x3C3Du, 0x3D3Du,
+    0x3E3Du, 0x3E3Du, 0x3D3Eu, 0x3E3Eu, 0x3F3Eu, 0x3F3Eu, 0x3E3Fu, 0x3F3Fu);
+
+const uint ALPHA_THRESHOLD = 128u;
+// A palette value no texel can be nearest to, standing in for the transparent fourth entry.
+const int UNREACHABLE = 1 << 12;
+
+uvec4 texels[16];
+
+uint div_round(uint n, uint d) {
+    return (2u * n + d) / (2u * d);
+}
+
+uint quantize(float v, float max_value) {
+    precise float scaled = clamp(v, 0.0, 255.0) * (max_value / 255.0) + 0.5;
+    return uint(scaled);
+}
+
+uint quantize565(vec3 c) {
+    return quantize(c.r, 31.0) << 11u | quantize(c.g, 63.0) << 5u | quantize(c.b, 31.0);
+}
+
+struct Fit {
+    uint c0;
+    uint c1;
+    uint indices;
+    uint error;
+};
+
+// Orders the endpoints for the mode and picks each texel's nearest palette entry. Texels in
+// transparent take index 3, which only the three-colour mode decodes as transparent.
+Fit fit_indices(uint transparent, uint c0, uint c1) {
+    bool three_color = transparent != 0u;
+    if (three_color == (c0 > c1)) {
+        uint t = c0;
+        c0 = c1;
+        c1 = t;
+    }
+    bool four_color = c0 > c1;
+    uvec3 q0 = uvec3(c0 >> 11u, (c0 >> 5u) & 63u, c0 & 31u);
+    uvec3 q1 = uvec3(c1 >> 11u, (c1 >> 5u) & 63u, c1 & 31u);
+    const uvec3 m = uvec3(31u, 63u, 31u);
+    ivec3 palette[4];
+    for (int c = 0; c < 3; ++c) {
+        palette[0][c] = int(div_round(q0[c] * 255u, m[c]));
+        palette[1][c] = int(div_round(q1[c] * 255u, m[c]));
+        if (four_color) {
+            palette[2][c] = int(div_round((2u * q0[c] + q1[c]) * 255u, 3u * m[c]));
+            palette[3][c] = int(div_round((q0[c] + 2u * q1[c]) * 255u, 3u * m[c]));
+        } else {
+            palette[2][c] = int(div_round((q0[c] + q1[c]) * 255u, 2u * m[c]));
+            palette[3][c] = UNREACHABLE;
+        }
+    }
+    Fit fit = Fit(c0, c1, 0u, 0u);
+    for (uint t = 0u; t < 16u; ++t) {
+        if ((transparent & (1u << t)) != 0u) {
+            fit.indices |= 3u << (2u * t);
+            continue;
+        }
+        ivec3 texel = ivec3(texels[t].rgb);
+        ivec3 d = texel - palette[0];
+        int best = d.r * d.r + d.g * d.g + d.b * d.b;
+        uint best_index = 0u;
+        for (uint i = 1u; i < 4u; ++i) {
+            d = texel - palette[i];
+            int distance = d.r * d.r + d.g * d.g + d.b * d.b;
+            if (distance < best) {
+                best = distance;
+                best_index = i;
+            }
+        }
+        fit.error += uint(best);
+        fit.indices |= best_index << (2u * t);
+    }
+    return fit;
+}
+
+// Least-squares endpoints for the texels' current palette indices; false when every texel uses
+// one blend.
+bool refine(uint transparent, Fit fit, out vec3 e0, out vec3 e1) {
+    bool four_color = fit.c0 > fit.c1;
+    precise float aa = 0.0;
+    precise float bb = 0.0;
+    precise float ab = 0.0;
+    precise vec3 ax = vec3(0.0);
+    precise vec3 bx = vec3(0.0);
+    for (uint t = 0u; t < 16u; ++t) {
+        if ((transparent & (1u << t)) != 0u) {
+            continue;
+        }
+        uint index = (fit.indices >> (2u * t)) & 3u;
+        precise float a = index == 0u ? 1.0
+            : index == 1u ? 0.0
+            : !four_color ? 0.5
+            : index == 2u ? 2.0 / 3.0 : 1.0 / 3.0;
+        precise float b = 1.0 - a;
+        aa += a * a;
+        bb += b * b;
+        ab += a * b;
+        precise vec3 texel = vec3(texels[t].rgb);
+        ax += a * texel;
+        bx += b * texel;
+    }
+    precise float det = aa * bb - ab * ab;
+    if (abs(det) < 1e-3) {
+        return false;
+    }
+    precise vec3 n0 = ax * bb - bx * ab;
+    precise vec3 n1 = bx * aa - ax * ab;
+    e0 = n0 / det;
+    e1 = n1 / det;
+    return true;
+}
+
+Fit encode_color(uint transparent) {
+    if (transparent == 0xFFFFu) {
+        return Fit(0u, 0u, 0xFFFFFFFFu, 0u);
+    }
+    vec3 points[16];
+    uint count = 0u;
+    uvec3 lo = uvec3(255u);
+    uvec3 hi = uvec3(0u);
+    for (uint t = 0u; t < 16u; ++t) {
+        if ((transparent & (1u << t)) != 0u) {
+            continue;
+        }
+        lo = min(lo, texels[t].rgb);
+        hi = max(hi, texels[t].rgb);
+        points[count] = vec3(texels[t].rgb);
+        ++count;
+    }
+
+    if (lo == hi) {
+        if (transparent != 0u) {
+            uint c = quantize565(vec3(lo));
+            return fit_indices(transparent, c, c);
+        }
+        uint r = SINGLE5[lo.r];
+        uint g = SINGLE6[lo.g];
+        uint b = SINGLE5[lo.b];
+        uint c0 = (r & 0xFFu) << 11u | (g & 0xFFu) << 5u | (b & 0xFFu);
+        uint c1 = (r >> 8u) << 11u | (g >> 8u) << 5u | (b >> 8u);
+        return fit_indices(transparent, c0, c1);
+    }
+
+    precise float inv = 1.0 / float(count);
+    precise vec3 sum = vec3(0.0);
+    for (uint i = 0u; i < count; ++i) {
+        sum += points[i];
+    }
+    precise vec3 mean = sum * inv;
+    precise float cov[6] = float[](0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    for (uint i = 0u; i < count; ++i) {
+        precise vec3 d = points[i] - mean;
+        cov[0] += d.r * d.r;
+        cov[1] += d.r * d.g;
+        cov[2] += d.r * d.b;
+        cov[3] += d.g * d.g;
+        cov[4] += d.g * d.b;
+        cov[5] += d.b * d.b;
+    }
+    precise vec3 fallback = vec3(hi - lo);
+    precise vec3 axis = fallback;
+    for (int i = 0; i < 4; ++i) {
+        precise vec3 next = vec3(
+            cov[0] * axis.r + cov[1] * axis.g + cov[2] * axis.b,
+            cov[1] * axis.r + cov[3] * axis.g + cov[4] * axis.b,
+            cov[2] * axis.r + cov[4] * axis.g + cov[5] * axis.b);
+        precise float scale = max(max(max(0.0, abs(next.r)), abs(next.g)), abs(next.b));
+        if (scale < 1e-6) {
+            axis = fallback;
+            break;
+        }
+        axis = next / scale;
+    }
+    vec3 min_p = points[0];
+    vec3 max_p = points[0];
+    precise float first = points[0].r * axis.r + points[0].g * axis.g + points[0].b * axis.b;
+    precise float min_d = first;
+    precise float max_d = first;
+    for (uint i = 1u; i < count; ++i) {
+        precise float d = points[i].r * axis.r + points[i].g * axis.g + points[i].b * axis.b;
+        if (d < min_d) {
+            min_d = d;
+            min_p = points[i];
+        }
+        if (d > max_d) {
+            max_d = d;
+            max_p = points[i];
+        }
+    }
+
+    Fit fit = fit_indices(transparent, quantize565(max_p), quantize565(min_p));
+    vec3 e0;
+    vec3 e1;
+    if (!refine(transparent, fit, e0, e1)) {
+        return fit;
+    }
+    Fit refined = fit_indices(transparent, quantize565(e0), quantize565(e1));
+    return refined.error < fit.error ? refined : fit;
+}
+
+uvec2 color_words(Fit fit) {
+    return uvec2(fit.c0 | (fit.c1 << 16u), fit.indices);
+}
+
+// A BC3 alpha block: alpha0 the block's largest alpha, alpha1 its smallest, every texel on the
+// nearest of the eight-value palette.
+uvec2 encode_alpha() {
+    uint lo = 255u;
+    uint hi = 0u;
+    for (uint t = 0u; t < 16u; ++t) {
+        lo = min(lo, texels[t].a);
+        hi = max(hi, texels[t].a);
+    }
+    uint header = hi | (lo << 8u);
+    if (lo == hi) {
+        return uvec2(header, 0u);
+    }
+    uint palette[8];
+    palette[0] = hi;
+    palette[1] = lo;
+    for (uint k = 1u; k < 7u; ++k) {
+        palette[k + 1u] = ((7u - k) * hi + k * lo + 1u) / 7u;
+    }
+    uint low_bits = 0u;
+    uint high_bits = 0u;
+    for (uint t = 0u; t < 16u; ++t) {
+        uint best = 0xFFu;
+        uint best_index = 0u;
+        for (uint i = 0u; i < 8u; ++i) {
+            uint d = uint(abs(int(palette[i]) - int(texels[t].a)));
+            if (d < best) {
+                best = d;
+                best_index = i;
+            }
+        }
+        uint at = 3u * t;
+        if (at + 3u <= 32u) {
+            low_bits |= best_index << at;
+        } else if (at >= 32u) {
+            high_bits |= best_index << (at - 32u);
+        } else {
+            low_bits |= best_index << at;
+            high_bits |= best_index >> (32u - at);
+        }
+    }
+    return uvec2(header | (low_bits << 16u), (low_bits >> 16u) | (high_bits << 16u));
+}
+
+void main() {
+    uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= p.blocks_x || id.y >= p.blocks_y) {
+        return;
+    }
+    uvec2 last = uvec2(p.width, p.height) - 1u;
+    uint transparent = 0u;
+    for (uint y = 0u; y < 4u; ++y) {
+        for (uint x = 0u; x < 4u; ++x) {
+            uvec2 at = min(id * 4u + uvec2(x, y), last);
+            uint word = rgba[p.in_offset + at.y * p.width + at.x];
+            uvec4 texel = uvec4(word & 0xFFu, (word >> 8u) & 0xFFu, (word >> 16u) & 0xFFu, word >> 24u);
+            texels[y * 4u + x] = texel;
+            if (texel.a < ALPHA_THRESHOLD) {
+                transparent |= 1u << (y * 4u + x);
+            }
+        }
+    }
+    uint index = id.y * p.blocks_x + id.x;
+    if (p.bc3 != 0u) {
+        blocks[p.out_offset + index * 2u] = encode_alpha();
+        blocks[p.out_offset + index * 2u + 1u] = color_words(encode_color(0u));
+    } else {
+        blocks[p.out_offset + index] = color_words(encode_color(transparent));
+    }
+}

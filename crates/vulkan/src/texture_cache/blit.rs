@@ -8,7 +8,7 @@ use lichii_gpu::gmmu::{Gmmu, RangeTarget};
 use lichii_texture::{Numeric, PixelFormat};
 
 use super::guest_sync::{barrier, ensure};
-use super::{Found, ImageInfo, ImageKind, ResolutionScale, Segment, TextureCache, Transfer};
+use super::{Found, ImageInfo, ImageKind, ResolutionScale, Segment, TextureCache, Transfer, Usage};
 use crate::commands::ImageAccess;
 use crate::descriptors::DescriptorAllocator;
 use crate::device::Device;
@@ -364,7 +364,9 @@ impl TextureCache {
         let Some(source) = self.find(tx, gmmu, src_va, src)? else {
             return Ok(None);
         };
-        let Some(target) = self.lookup_or_create(tx, gmmu, dst.gpu_va, &dst.info, false)? else {
+        let Some(target) =
+            self.lookup_or_create(tx, gmmu, dst.gpu_va, &dst.info, Usage::Transfer)?
+        else {
             return Ok(None);
         };
         if source.id == target.id {
@@ -372,7 +374,7 @@ impl TextureCache {
         }
         let whole = dst.rect == [0, 0, dst.info.width as i32, dst.info.height as i32];
         Ok(self
-            .prepare_target(tx, gmmu, dst.gpu_va, &dst.info, whole, false)?
+            .prepare_target(tx, gmmu, dst.gpu_va, &dst.info, whole, Usage::Transfer)?
             .map(|target| (source, target)))
     }
 
