@@ -61,6 +61,17 @@ pub struct PartitionFs {
 
 impl PartitionFs {
     pub fn open(file: &FileRef) -> FsResult<Self> {
+        Self::parse(file, false)
+    }
+
+    /// Opens a game card's root HFS0. Card dumps can end before the padding of the last
+    /// partition, so an entry that runs past the end of the file keeps the bytes that exist.
+    /// The partitions inside are opened with [`PartitionFs::open`] and stay strictly bounded.
+    pub fn open_root(file: &FileRef) -> FsResult<Self> {
+        Self::parse(file, true)
+    }
+
+    fn parse(file: &FileRef, clamp_past_end: bool) -> FsResult<Self> {
         let head: [u8; HEADER_SIZE] = file.read_array(0)?;
         let kind = match &head[..4] {
             b"PFS0" => PartitionKind::Pfs0,
@@ -99,12 +110,16 @@ impl PartitionFs {
                     .get(name_offset..)
                     .map(crate::bytes::c_string)
                     .ok_or_else(|| corrupt(format, "name offset past the string table"))?;
-                if offset.checked_add(size).is_none_or(|end| end > data_size) {
-                    return Err(corrupt(
-                        format,
-                        format!("{name} extends past the end of the file"),
-                    ));
-                }
+                let size = match offset.checked_add(size) {
+                    Some(end) if end <= data_size => size,
+                    Some(_) if clamp_past_end && offset <= data_size => data_size - offset,
+                    _ => {
+                        return Err(corrupt(
+                            format,
+                            format!("{name} extends past the end of the file"),
+                        ));
+                    }
+                };
                 let hash = (kind == PartitionKind::Hfs0).then(|| HfsHash {
                     hashed_size: u32_at(record, 20),
                     sha256: array_at(record, 32),
@@ -279,5 +294,30 @@ mod tests {
         );
         assert!(PartitionFs::open(&MemFile::from_bytes(vec![0u8; 3])).is_err());
         assert_eq!(image.size(), bytes.len() as u64);
+    }
+
+    #[test]
+    fn root_keeps_the_bytes_of_an_entry_that_runs_past_the_end() {
+        let image = build_partition(PartitionKind::Hfs0, &files()[..2]).unwrap();
+        let header_size = PartitionFs::open(&image).unwrap().header_size();
+        let mut bytes = image.read_all().unwrap();
+        let record = HEADER_SIZE + PartitionKind::Hfs0.entry_size();
+        bytes[record + 8..record + 16].copy_from_slice(&(5u64 + 0x200).to_le_bytes());
+        let padded = MemFile::from_bytes(bytes.clone());
+        assert!(PartitionFs::open(&padded).is_err());
+        let root = PartitionFs::open_root(&padded).unwrap();
+        assert_eq!(root.entries()[1].size, 5);
+        assert_eq!(
+            root.open_file("main.npdm")
+                .unwrap()
+                .unwrap()
+                .read_all()
+                .unwrap(),
+            vec![7u8; 5]
+        );
+
+        let data_size = bytes.len() as u64 - header_size;
+        bytes[record..record + 8].copy_from_slice(&(data_size + 1).to_le_bytes());
+        assert!(PartitionFs::open_root(&MemFile::from_bytes(bytes)).is_err());
     }
 }
