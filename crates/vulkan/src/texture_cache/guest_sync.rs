@@ -575,6 +575,28 @@ impl TextureCache {
             self.hand_off(tx.scheduler, o);
         }
         self.traffic.gpu_syncs += 1;
+        {
+            use std::fmt::Write;
+            let d = |i: &ImageInfo| format!("{:?} {}x{}x{} L{} A{} {:?}", i.format, i.width, i.height, i.depth, i.levels, i.layers, i.kind);
+            let mut key = format!("{} <=", d(&self.get(id).expect("live").info));
+            for &o in newer.iter() {
+                let _ = write!(key, " [{}]", d(&self.get(o).expect("live").info));
+            }
+            static SYNCS: std::sync::LazyLock<parking_lot::Mutex<(u64, std::collections::HashMap<String, (u64, u64)>)>> = std::sync::LazyLock::new(Default::default);
+            let mut m = SYNCS.lock();
+            m.0 += 1;
+            let e = m.1.entry(key).or_default();
+            e.0 += 1;
+            e.1 += window.1 - window.0;
+            if m.0 % 5000 == 0 {
+                let mut v: Vec<_> = m.1.iter().map(|(k, &(c, b))| (c, b, k.clone())).collect();
+                v.sort_by(|a, b| b.0.cmp(&a.0));
+                for (c, b, k) in v.iter().take(12) {
+                    tracing::warn!("DIAG395 sync count={c} window_mib={} {k}", b >> 20);
+                }
+                m.1.clear();
+            }
+        }
         Ok(true)
     }
 
