@@ -469,6 +469,47 @@ impl ImageInfo {
         (fits && same_levels).then_some((level, layer))
     }
 
+    /// Where `other`, a single-level single-layer target starting `offset` bytes into this
+    /// image, covers one mip level below the base as a wider or taller GOB-padded rectangle: the
+    /// level and layer, when the target spans the level's GOBs exactly and its own GOBs lie
+    /// where the level's do. Mip levels narrower than a GOB are rendered this way, as targets
+    /// one GOB wide. The base level never matches, since a wider target over it can be an image
+    /// of its own whose extra texels are read back.
+    pub fn find_padded_level(&self, other: &Self, offset: u64) -> Option<(u32, u32)> {
+        let (GuestLayout::BlockLinear { .. }, GuestLayout::BlockLinear { .. }) =
+            (self.layout, other.layout)
+        else {
+            return None;
+        };
+        if self.kind != ImageKind::D2
+            || other.kind != ImageKind::D2
+            || (other.levels, other.layers, other.samples) != (1, 1, self.samples)
+            || self.format.bytes_per_block() != other.format.bytes_per_block()
+            || self.format.block_width() != other.format.block_width()
+            || self.format.block_height() != other.format.block_height()
+        {
+            return None;
+        }
+        let layer = (offset / self.layer_stride.max(1)) as u32;
+        if layer >= self.layers {
+            return None;
+        }
+        let in_layer = offset - u64::from(layer) * self.layer_stride;
+        let surface = self.surface();
+        let level = (1..self.levels).find(|&l| surface.level_offset(l) == in_layer)?;
+        let (width, height, _) = self.level_extent(level);
+        let level_tiling = surface.level_tiling(level);
+        let own = other.surface().level_tiling(0);
+        let same_gobs = own.layout == level_tiling.layout
+            && own.depth == 1
+            && level_tiling.depth == 1
+            && own.block_depth_log2 == 0
+            && own.row_gobs == level_tiling.row_gobs
+            && own.size_bytes() == level_tiling.size_bytes()
+            && (own.block_height_log2 == level_tiling.block_height_log2 || own.row_gobs == 1);
+        (same_gobs && other.width >= width && other.height >= height).then_some((level, layer))
+    }
+
     /// Where `other`, starting `offset` bytes into this volume, lies as one of its slices: the
     /// level and slice, when `other` is a single slice tiled as the volume's slices at that
     /// level are. Slices inside one block of a deep block start a GOB row apart, so a target

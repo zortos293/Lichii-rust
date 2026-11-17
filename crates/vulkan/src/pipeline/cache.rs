@@ -412,7 +412,7 @@ impl Context {
             self.device
                 .name(module, format_args!("{}", Program(program)));
             if let Some(aftermath) = crate::debug::aftermath::get() {
-                aftermath.save_shader(&program.spirv);
+                aftermath.save_shader(program);
             }
             let guest_warp = self.device.shader_profile.runs_guest_warp(program.stage)
                 && program.info.uses_warp_size();
