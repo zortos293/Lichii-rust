@@ -349,7 +349,10 @@ pub(super) fn tensor_mul_add(
     inst: InstId,
     f32_accumulators: bool,
 ) -> EmitResult<Word> {
-    if ctx.vulkan_memory_model && cooperative(ctx.profile, ctx.program.op(inst), ctx.flags(inst)) {
+    if ctx.vulkan_memory_model
+        && std::env::var_os("LIRU14_COOP_SOFT").is_none()
+        && cooperative(ctx.profile, ctx.program.op(inst), ctx.flags(inst))
+    {
         return cooperative_tensor_mul_add(ctx, inst, f32_accumulators);
     }
     let variant = variant(ctx.flags(inst), f32_accumulators)?;
