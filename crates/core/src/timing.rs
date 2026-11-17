@@ -135,15 +135,16 @@ fn calibrate_tsc() -> Option<Calibration> {
 
 /// Whether the TSCs of every processor guest threads may run on agree, tested the way Linux's
 /// `check_tsc_warp` does. One thread per processor, pinned to it where [`probe_processors`]
-/// names one, starts behind a barrier; for 10 ms the threads take turns under one spin lock to
-/// read the TSC, and a read below the one before it means its processor's TSC lags another's.
-/// `false` too when a thread could not be pinned or took fewer than 10 turns, since then its
-/// processor went unchecked.
+/// names one, starts behind a barrier; the threads take turns in ticket order to read the TSC,
+/// and a read below the one before it means its processor's TSC lags another's. Each thread
+/// takes turns for at least 10 ms and until it has had 10, for at most 50 ms. `false` too when a
+/// thread could not be pinned or had fewer than 10 turns, since then its processor went
+/// unchecked.
 fn tsc_is_synchronized() -> bool {
     let Some(processors) = probe_processors() else {
         return false;
     };
-    let lock = AtomicBool::new(false);
+    let (next, serving) = (AtomicU64::new(0), AtomicU64::new(0));
     let last = AtomicU64::new(0);
     let warped = AtomicBool::new(false);
     let start = Barrier::new(processors.len());
@@ -151,25 +152,25 @@ fn tsc_is_synchronized() -> bool {
         let probes: Vec<_> = processors
             .iter()
             .map(|&processor| {
-                let (lock, last, warped, start) = (&lock, &last, &warped, &start);
+                let (next, serving, last, warped, start) =
+                    (&next, &serving, &last, &warped, &start);
                 scope.spawn(move || {
                     let pinned = processor.is_none_or(pin_current_thread);
                     start.wait();
                     if !pinned {
                         return 0;
                     }
-                    let end = Instant::now() + Duration::from_millis(10);
+                    let begun = Instant::now();
                     let mut turns = 0;
-                    while Instant::now() < end && !warped.load(Ordering::Relaxed) {
-                        while lock
-                            .compare_exchange_weak(
-                                false,
-                                true,
-                                Ordering::Acquire,
-                                Ordering::Relaxed,
-                            )
-                            .is_err()
+                    while !warped.load(Ordering::Relaxed) {
+                        let elapsed = begun.elapsed();
+                        if elapsed >= Duration::from_millis(50)
+                            || (elapsed >= Duration::from_millis(10) && turns >= 10)
                         {
+                            break;
+                        }
+                        let ticket = next.fetch_add(1, Ordering::Relaxed);
+                        while serving.load(Ordering::Acquire) != ticket {
                             std::hint::spin_loop();
                         }
                         let now = read_tsc().unwrap_or(0);
@@ -177,7 +178,7 @@ fn tsc_is_synchronized() -> bool {
                             warped.store(true, Ordering::Relaxed);
                         }
                         last.store(now, Ordering::Relaxed);
-                        lock.store(false, Ordering::Release);
+                        serving.store(ticket + 1, Ordering::Release);
                         turns += 1;
                     }
                     turns
