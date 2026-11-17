@@ -439,7 +439,7 @@ impl Device {
         let mut queried = chain!(Default::default());
         // SAFETY: every struct in the chain belongs to an extension the device reports.
         unsafe { raw_instance.get_physical_device_features2(physical, &mut queried) };
-        let mut core = queried.features;
+        let core = queried.features;
         if v12.timeline_semaphore == vk::FALSE
             || v12.uniform_buffer_standard_layout == vk::FALSE
             || v13.dynamic_rendering == vk::FALSE
@@ -448,9 +448,7 @@ impl Device {
             return Err(Error::NoDevice);
         }
 
-        core.robust_buffer_access = vk::FALSE;
         v11.protected_memory = vk::FALSE;
-        v13.robust_image_access = vk::FALSE;
         robustness2.robust_buffer_access2 = vk::FALSE;
         robustness2.robust_image_access2 = vk::FALSE;
         mesh.multiview_mesh_shader &= v11.multiview;
