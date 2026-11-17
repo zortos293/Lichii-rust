@@ -30,10 +30,12 @@ const BOTTOM_MARKER: vk::DeviceSize = 4;
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 static REPORTER: StdMutex<Option<Arc<Reporter>>> = StdMutex::new(None);
 
-pub(super) fn init(crash_dumps: &Path) {
-    let dir = std::env::var_os("LICHII_GPU_FAULT_DIR")
-        .map_or_else(|| crash_dumps.to_path_buf(), PathBuf::from);
-    let _ = DIR.set(dir);
+/// Sets the report folder, `LICHII_GPU_FAULT_DIR` or else `crash_dumps`, and returns it.
+pub(super) fn init(crash_dumps: &Path) -> &'static Path {
+    DIR.get_or_init(|| {
+        std::env::var_os("LICHII_GPU_FAULT_DIR")
+            .map_or_else(|| crash_dumps.to_path_buf(), PathBuf::from)
+    })
 }
 
 /// The fault-report extensions a device turned on.

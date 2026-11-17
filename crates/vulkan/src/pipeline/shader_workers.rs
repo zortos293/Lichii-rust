@@ -23,6 +23,7 @@ use parking_lot::{Condvar, Mutex};
 
 use super::environment::{EnvRead, EnvSnapshot, ProgramEnv};
 use super::shader_cache::{hash_program, warn_failed};
+use crate::debug::shader_dump;
 
 /// Presents a queued job may go unrequested before workers drop it.
 pub(crate) const STALE_FRAMES: u64 = 2;
@@ -216,22 +217,30 @@ fn translate(job: &Job, profile: &Profile, host: &HostTranslateInfo) -> Option<T
             compile(&env, options, runtime, &mut bindings).map(|module| (Arc::new(module), None))
         }
     };
-    let mut bytes = Vec::new();
-    let mut code = |env: &ProgramEnv<'_>| {
+    let code = |env: &ProgramEnv<'_>, bytes: &mut Vec<u8>| {
         let (start, len) = env.code_range();
-        let hash = hash_program(env.gmmu(), start, len, &mut bytes);
-        env.consumed_unchanged(start, &bytes).then(|| ProgramCode {
+        let hash = hash_program(env.gmmu(), start, len, bytes);
+        env.consumed_unchanged(start, bytes).then(|| ProgramCode {
             gmmu: env.memory().clone(),
             start,
             len,
             hash,
         })
     };
+    let (mut a_bytes, mut bytes) = (Vec::new(), Vec::new());
     let vertex_a = match &a {
-        Some(a) => Some(code(a)?),
+        Some(a) => Some(code(a, &mut a_bytes)?),
         None => None,
     };
-    let code = [vertex_a, Some(code(&env)?)];
+    let code = [vertex_a, Some(code(&env, &mut bytes)?)];
+    if let Ok((module, _)) = &result {
+        shader_dump::write(
+            module.hash,
+            &module.spirv,
+            &bytes,
+            a.is_some().then_some(&a_bytes[..]),
+        );
+    }
     let mut reads = [
         a.as_ref().map(ProgramEnv::take_reads).unwrap_or_default(),
         env.take_reads(),
