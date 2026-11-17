@@ -327,6 +327,20 @@ impl Taint for ReadTaint {
     }
 }
 
+thread_local! {
+    pub static LIRU6_TRACE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+fn liru6(event: std::fmt::Arguments<'_>) {
+    LIRU6_TRACE.with(|t| {
+        let mut t = t.borrow_mut();
+        if t.len() < 4000 {
+            use std::fmt::Write;
+            let _ = write!(t, "{event};");
+        }
+    });
+}
+
 #[inline]
 fn condition(op: u8, x: u32, y: u32) -> bool {
     match op {
@@ -370,6 +384,9 @@ pub(super) fn run<H: MacroHost, T: Taint>(
         for lane in 0..2 {
             if d.load[lane] {
                 load_t[lane] = T::TRACKS && consumed >= io.parameters.len();
+                if load_t[lane] {
+                    liru6(format_args!("pc{pc} L{lane}=w{}", consumed - io.parameters.len()));
+                }
                 load[lane] = io
                     .pop(&mut consumed)
                     .ok_or(fail(MacroErrorKind::FifoUnderflow))?;
@@ -382,6 +399,7 @@ pub(super) fn run<H: MacroHost, T: Taint>(
                 REG_LOAD1 => load_t[1],
                 register => taint.register(register),
             } {
+            liru6(format_args!("pc{pc} P{}m{}", d.pred_reg, d.pred_mode));
             Some(taint.decide().ok_or(fail(MacroErrorKind::DependsOnRead))?)
         } else {
             None
@@ -438,6 +456,17 @@ pub(super) fn run<H: MacroHost, T: Taint>(
             let (xt, yt) = (xts[lane], yts[lane]);
             let mut vt = xt || yt;
             let mut branch = None;
+            if T::TRACKS && (xt || yt || (op == 30 && taint.ram(x))) {
+                liru6(format_args!(
+                    "pc{pc} l{lane} op{op} a{}{} b{}{} d{} i{:x}",
+                    d.src_a[lane],
+                    if xt { "*".to_string() } else { format!("={x:x}") },
+                    d.src_b[lane],
+                    if yt { "*".to_string() } else { format!("={y:x}") },
+                    d.dst[lane],
+                    imm
+                ));
+            }
             if T::TRACKS {
                 let steers = match op {
                     7 | 23 | 30 | 31 => xt,
@@ -623,6 +652,9 @@ pub(super) fn run<H: MacroHost, T: Taint>(
             if d.out_emit[lane] != 0 {
                 let value = output(d.out_emit[lane])?;
                 let tainted = T::TRACKS && output_t(d.out_emit[lane]);
+                if T::TRACKS && (tainted || taint.forked()) {
+                    liru6(format_args!("pc{pc} E{method:x}{}", if tainted { "*".to_string() } else { format!("={value:x}") }));
+                }
                 io.emit(method, value, tainted, taint).map_err(fail)?;
                 method = method.wrapping_add(increment);
             }

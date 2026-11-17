@@ -139,6 +139,18 @@ impl SampleCounter {
 
     /// What a report recorded now sums.
     pub(super) fn report(&self) -> SampleRange {
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static HIST: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+            static N: AtomicU64 = AtomicU64::new(0);
+            let len = self.next - self.reset_at;
+            let b = match len { 0 => 0, 1 => 1, 2 => 2, 3..=4 => 3, 5..=8 => 4, _ => 5 };
+            HIST[b].fetch_add(1, Ordering::Relaxed);
+            if N.fetch_add(1, Ordering::Relaxed) % 4096 == 4095 {
+                let h: Vec<u64> = HIST.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+                tracing::warn!(?h, "LIRU6DIAG samples report lengths [0,1,2,3-4,5-8,9+]");
+            }
+        }
         SampleRange {
             from: self.reset_at,
             to: self.next,

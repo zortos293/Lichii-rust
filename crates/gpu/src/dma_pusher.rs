@@ -214,8 +214,10 @@ impl BackMacros {
         let mut taint = ReadTaint::without_data_ram();
         let mut paths = 0;
         let mut too_many = false;
+        crate::macros::liru6_trace_clear();
         let outcome = loop {
             paths += 1;
+            crate::macros::liru6_trace_mark(paths);
             let mut host = ShadowHost {
                 graphics: &mut *graphics,
                 owned: &mut self.owned,
@@ -244,6 +246,7 @@ impl BackMacros {
                 Some(next) => taint = next,
             }
         };
+        crate::macros::liru6_trace_log(start, paths, outcome.is_ok());
         if let Err(error) = outcome {
             if too_many {
                 tracing::info!(

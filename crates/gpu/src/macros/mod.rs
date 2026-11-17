@@ -694,3 +694,25 @@ impl CallRecord {
         }
     }
 }
+
+pub(crate) fn liru6_trace_clear() {
+    turing::LIRU6_TRACE.with(|t| t.borrow_mut().clear());
+}
+
+pub(crate) fn liru6_trace_mark(path: usize) {
+    turing::LIRU6_TRACE.with(|t| {
+        use std::fmt::Write;
+        let _ = write!(t.borrow_mut(), " |path{path}| ");
+    });
+}
+
+pub(crate) fn liru6_trace_log(start: u32, paths: usize, ok: bool) {
+    static SEEN: std::sync::Mutex<Vec<(u32, String)>> = std::sync::Mutex::new(Vec::new());
+    let trace = turing::LIRU6_TRACE.with(|t| t.borrow().clone());
+    let mut seen = SEEN.lock().unwrap();
+    if seen.len() >= 24 || seen.iter().any(|(s, t)| *s == start && *t == trace) {
+        return;
+    }
+    seen.push((start, trace.clone()));
+    tracing::warn!(start, paths, ok, %trace, "LIRU6DIAG shadow trace");
+}
