@@ -139,6 +139,7 @@ impl Core {
                         lr = format_args!("{:#x}", self.ctx.x[30]),
                         "unhandled guest fault: {fault:?}"
                     );
+                    log_fault_state(thread, &self.ctx);
                     self.kernel.terminate_process(thread.process());
                     Flow::ExitThread
                 }
@@ -186,4 +187,41 @@ impl Core {
             Preempt::Terminate => Flow::ExitThread,
         }
     }
+}
+
+/// Logs the instructions around the faulting `pc` (the faulting one in brackets) and the general
+/// registers, so a fault in a title can be read without a debugger.
+fn log_fault_state(thread: &Thread, ctx: &ThreadContext) {
+    let start = ctx.pc.wrapping_sub(16);
+    let mut bytes = [0u8; 32];
+    let code = match thread.process().memory().read_bytes(start, &mut bytes) {
+        Ok(()) => bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .enumerate()
+            .map(|(i, &word)| {
+                let word = u32::from_le_bytes(word);
+                if i == 4 {
+                    format!("[{word:08x}]")
+                } else {
+                    format!("{word:08x}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        Err(_) => "unreadable".to_owned(),
+    };
+    let registers = ctx
+        .x
+        .iter()
+        .enumerate()
+        .map(|(i, x)| format!("x{i}={x:#x}"))
+        .chain([format!("sp={:#x}", ctx.sp)])
+        .collect::<Vec<_>>()
+        .join(" ");
+    tracing::error!(
+        code_from = format_args!("{start:#x}"),
+        "guest fault state: code {code}; {registers}"
+    );
 }
