@@ -300,6 +300,9 @@ impl Front {
                     self.shared.inbox.recycle(entries);
                     return;
                 };
+                if let Some(increment) = increment {
+                    crate::diag427::front_received(increment.id);
+                }
                 if let Some(fence) = wait {
                     channel.push(Work::SyncpointWait(fence));
                 }

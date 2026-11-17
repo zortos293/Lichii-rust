@@ -632,6 +632,7 @@ impl FrontChannel {
                     for _ in 0..increment.count {
                         dispatch.shared.stream.syncpoint_increment(increment.id);
                     }
+                    crate::diag427::front_pushed(increment.id);
                 }
                 Work::EndOfSubmission => {
                     self.queue.pop_front();

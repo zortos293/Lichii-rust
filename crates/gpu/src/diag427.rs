@@ -11,7 +11,10 @@ use parking_lot::Mutex;
 
 #[derive(Default)]
 struct Point {
-    submits: VecDeque<(u32, Instant, u32)>,
+    submits: VecDeque<(u32, Instant, Option<Instant>, Option<Instant>)>,
+    stage: [Duration; 3],
+    stage_max: [Duration; 3],
+    staged: u64,
     reached: VecDeque<(u32, Instant)>,
     waits: Vec<(u32, Instant, bool)>,
     channels: u64,
@@ -50,7 +53,7 @@ pub fn submitted(id: u32, value: u32, channel: u32) {
     let p = s.points.entry(id).or_default();
     p.n_submit += 1;
     p.channels |= 1 << (channel % 64);
-    p.submits.push_back((value, Instant::now(), channel));
+    p.submits.push_back((value, Instant::now(), None, None));
     if p.submits.len() > 4096 {
         p.submits.pop_front();
     }
@@ -62,7 +65,7 @@ pub fn host_reached(id: u32, value: u32) {
     let p = s.points.entry(id).or_default();
     p.n_reach += 1;
     p.host = value;
-    while let Some(&(v, t, _)) = p.submits.front() {
+    while let Some(&(v, t, t1, t2)) = p.submits.front() {
         if !reached(value, v) {
             break;
         }
@@ -71,6 +74,13 @@ pub fn host_reached(id: u32, value: u32) {
             let d = now - t;
             p.queue += d;
             p.queue_max = p.queue_max.max(d);
+            if let (Some(t1), Some(t2)) = (t1, t2) {
+                for (i, d) in [t1 - t, t2 - t1, now - t2].into_iter().enumerate() {
+                    p.stage[i] += d;
+                    p.stage_max[i] = p.stage_max[i].max(d);
+                }
+                p.staged += 1;
+            }
         }
     }
     p.reached.push_back((value, now));
@@ -112,6 +122,26 @@ pub fn guest_released(id: u32, value: u32) {
     maybe_log(&mut s, now);
 }
 
+pub fn front_received(id: u32) {
+    let mut s = STATE.lock();
+    let p = s.points.entry(id).or_default();
+    if let Some(e) = p.submits.iter_mut().find(|e| e.2.is_none()) {
+        e.2 = Some(Instant::now());
+    }
+}
+
+pub fn front_pushed(id: u32) {
+    let mut s = STATE.lock();
+    let p = s.points.entry(id).or_default();
+    if let Some(e) = p
+        .submits
+        .iter_mut()
+        .find(|e| e.2.is_some() && e.3.is_none())
+    {
+        e.3 = Some(Instant::now());
+    }
+}
+
 pub fn guest_wait(id: u32, threshold: u32) {
     let mut s = STATE.lock();
     let p = s.points.entry(id).or_default();
@@ -139,7 +169,7 @@ fn maybe_log(s: &mut State, now: Instant) {
         }
         let _ = write!(
             out,
-            "\n  sp{id} ch={:#x} submits={} reached={} released={} submit_to_back_ms avg={:.2} max={:.1} back_to_guest_ms avg={:.2} max={:.1} waits={} wait_ms avg={:.2} max={:.1} waits_back_not_there={}",
+            "\n  sp{id} ch={:#x} submits={} reached={} released={} submit_to_back_ms avg={:.2} max={:.1} back_to_guest_ms avg={:.2} max={:.1} waits={} wait_ms avg={:.2} max={:.1} waits_back_not_there={} staged={} inbox_ms avg={:.2} max={:.1} front_ms avg={:.2} max={:.1} ring_back_ms avg={:.2} max={:.1}",
             p.channels,
             p.n_submit,
             p.n_reach,
@@ -151,8 +181,18 @@ fn maybe_log(s: &mut State, now: Instant) {
             p.n_wait,
             ms(p.wait) / p.n_wait.max(1) as f64,
             ms(p.wait_max),
-            p.wait_unreached
+            p.wait_unreached,
+            p.staged,
+            ms(p.stage[0]) / p.staged.max(1) as f64,
+            ms(p.stage_max[0]),
+            ms(p.stage[1]) / p.staged.max(1) as f64,
+            ms(p.stage_max[1]),
+            ms(p.stage[2]) / p.staged.max(1) as f64,
+            ms(p.stage_max[2])
         );
+        p.stage = [Duration::ZERO; 3];
+        p.stage_max = [Duration::ZERO; 3];
+        p.staged = 0;
         p.n_submit = 0;
         p.n_reach = 0;
         p.n_release = 0;
