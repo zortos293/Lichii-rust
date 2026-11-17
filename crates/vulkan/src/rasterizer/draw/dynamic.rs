@@ -133,6 +133,7 @@ raw_words!(
     vk::StencilOp,
     vk::PolygonMode,
     vk::ProvokingVertexModeEXT,
+    vk::DepthBiasRepresentationEXT,
     vk::BlendFactor,
     vk::BlendOp,
     vk::VertexInputRate,
