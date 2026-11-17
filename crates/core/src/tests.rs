@@ -92,6 +92,23 @@ fn boots_an_nso_and_runs_it_to_exit() {
 }
 
 #[test]
+fn switch1_titles_get_the_switch1_memory_layout_on_either_console() {
+    for console in [ConsoleGeneration::Switch1, ConsoleGeneration::Switch2] {
+        let file = TempFile::new("layout.nso", &nso(&exit_program()));
+        let mut system = System::boot(settings(console), &file.0, Host::headless()).unwrap();
+        assert_eq!(
+            system
+                .kernel()
+                .memory_manager()
+                .size(lichii_kernel::Pool::Application),
+            3285 << 20
+        );
+        assert!(system.program().modules.iter().all(|m| m.image.is_empty()));
+        system.stop();
+    }
+}
+
+#[test]
 fn pause_freezes_guest_time() {
     let file = TempFile::new(
         "pause.nso",

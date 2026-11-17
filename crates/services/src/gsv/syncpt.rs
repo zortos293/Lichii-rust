@@ -7,8 +7,13 @@
 //! making the read-only acknowledge bit equal again and signalling the notify event; the client
 //! then rereads the value and rearms when its threshold isn't reached yet.
 //!
-//! Every guest increment is mirrored into the page as it happens, before the waits it satisfies
-//! are answered, as the reference does: the client's TryWaitNativeSync reads the page without a
+//! Slot and page waits release when the command processor reaches the increment (the host bank),
+//! before the host GPU finished the work in front of it: nx2_gsv waits on the reference's guest
+//! syncpoint, which SignalSyncPoint increments as the method executes. Switch 1's nvhost-ctrl
+//! keeps waiting for host completion.
+//!
+//! Every increment is mirrored into the page as it is reached, before the waits it satisfies are
+//! answered, as the reference does: the client's TryWaitNativeSync reads the page without a
 //! request, and Mario Kart World aborts (2162-0001) when vdec's Stop moves a syncpoint the page
 //! still shows at its old value. A request runs the server at once (the request event is
 //! observed), an armed syncpoint whose value changed since its last answer is answered right away,
@@ -104,7 +109,7 @@ struct Watches {
 }
 
 /// Writes `value` into the page's slot for `id` and marks the id fresh when the slot held an
-/// older value. Runs on every guest increment, so it allocates nothing and takes no lock.
+/// older value. Runs on every mirrored increment, so it allocates nothing and takes no lock.
 fn write_value(memory: &AddressSpace, ro: VAddr, fresh: &[AtomicU64; WORDS], id: u32, value: u32) {
     let address = ro + VALUES + u64::from(id) * 8;
     if memory.read::<u64>(address).ok() == Some(u64::from(value)) {
@@ -126,7 +131,7 @@ impl Page {
     ) -> Arc<Self> {
         let memory = ro.owner().memory().clone();
         let fresh: Arc<[AtomicU64; WORDS]> = Arc::new(std::array::from_fn(|_| AtomicU64::new(0)));
-        let mirrored = syncpoints.guest().set_mirror(count, {
+        let mirrored = syncpoints.host().set_mirror(count, {
             let (memory, ro, fresh) = (memory.clone(), ro.address(), fresh.clone());
             move |id, value| write_value(&memory, ro, &fresh, id, value)
         });
@@ -165,9 +170,9 @@ impl Page {
                 tracing::warn!("nx2:syncpt page header write faulted");
             }
         }
-        let guest = page.syncpoints.guest();
+        let bank = page.syncpoints.host();
         for id in 0..count {
-            let _ = guest.publish(id);
+            let _ = bank.publish(id);
         }
         page
     }
@@ -186,7 +191,7 @@ impl Page {
     /// rest. Values reach the page only through the bank's mirror, which orders them.
     fn serve(self: &Arc<Self>) {
         self.request.clear();
-        let guest = self.syncpoints.guest();
+        let bank = self.syncpoints.host();
         let mut watch = Vec::new();
         let mut answered = false;
         {
@@ -208,8 +213,8 @@ impl Page {
                     let bit = 1u64 << pending.trailing_zeros();
                     pending &= !bit;
                     let id = word as u32 * 64 + bit.trailing_zeros();
-                    let mirrored = id < self.count && guest.publish(id).is_ok();
-                    let value = guest.value(id).unwrap_or(0);
+                    let mirrored = id < self.count && bank.publish(id).is_ok();
+                    let value = bank.value(id).unwrap_or(0);
                     if !mirrored || fresh.load(Ordering::SeqCst) & bit != 0 {
                         answer |= bit;
                     } else if *watching & bit == 0 {
@@ -236,9 +241,9 @@ impl Page {
     /// Watches for the increment after `value`, the value the wait was checked against, so an
     /// increment since then runs the action at once.
     fn watch(self: &Arc<Self>, id: u32, value: u32) {
-        let guest = self.syncpoints.guest();
+        let bank = self.syncpoints.host();
         let this = Arc::downgrade(self);
-        let registered = guest.register_action(id, value.wrapping_add(1), move || {
+        let registered = bank.register_action(id, value.wrapping_add(1), move || {
             if let Some(page) = this.upgrade() {
                 page.incremented(id);
             }
@@ -261,10 +266,10 @@ impl Page {
 
 impl Drop for Page {
     fn drop(&mut self) {
-        let guest = self.syncpoints.guest();
-        guest.clear_mirror(self.mirrored);
+        let bank = self.syncpoints.host();
+        bank.clear_mirror(self.mirrored);
         for handle in self.watches.get_mut().handles.values() {
-            guest.cancel(*handle);
+            bank.cancel(*handle);
         }
     }
 }
@@ -300,7 +305,7 @@ impl SyncptSession {
     fn cancel(&self, slots: &mut HashMap<u32, Slot>, slot: u32) -> (Arc<Event>, u64) {
         let slot = slots.entry(slot).or_default();
         if let Some((_, handle)) = slot.request.take() {
-            self.syncpoints.guest().cancel(handle);
+            self.syncpoints.host().cancel(handle);
         }
         slot.generation += 1;
         (slot.event.clone(), slot.generation)
@@ -315,15 +320,15 @@ impl SyncptSession {
         let threshold = ctx.pop::<u64>() as u32;
         let (event, generation) = self.cancel(&mut self.slots.lock(), slot);
         event.clear();
-        let guest = self.syncpoints.guest();
-        if guest.value(id).is_err() {
+        let bank = self.syncpoints.host();
+        if bank.value(id).is_err() {
             tracing::warn!("nx2:syncpt 201: syncpoint {id:#x} out of range, signalling");
             event.signal();
             return ResultCode::SUCCESS;
         }
         let slots = Arc::downgrade(&self.slots);
         let signal = event.clone();
-        let registered = guest.register_action(id, threshold, move || {
+        let registered = bank.register_action(id, threshold, move || {
             let Some(slots) = slots.upgrade() else {
                 return;
             };
@@ -338,7 +343,7 @@ impl SyncptSession {
             match slots.get_mut(&slot).filter(|s| s.generation == generation) {
                 Some(slot) => slot.request = Some((id, handle)),
                 None => {
-                    guest.cancel(handle);
+                    bank.cancel(handle);
                 }
             }
         }
@@ -348,10 +353,10 @@ impl SyncptSession {
 
 impl Drop for SyncptSession {
     fn drop(&mut self) {
-        let guest = self.syncpoints.guest();
+        let bank = self.syncpoints.host();
         for slot in self.slots.lock().values_mut() {
             if let Some((_, handle)) = slot.request.take() {
-                guest.cancel(handle);
+                bank.cancel(handle);
             }
             slot.generation += 1;
         }
@@ -377,7 +382,7 @@ impl Service for SyncptSession {
             }
             103 => {
                 let id = !ctx.pop::<u32>();
-                let value = self.syncpoints.guest().value(id).unwrap_or(0);
+                let value = self.syncpoints.host().value(id).unwrap_or(0);
                 ctx.push(u64::from(value));
                 ctx.push(0u32);
                 ResultCode::SUCCESS

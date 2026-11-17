@@ -29,7 +29,8 @@ use lichii_shader::ShaderArch;
 use crate::commands::transfer_to_all_barrier;
 use crate::device::Device;
 use crate::error::Result;
-use crate::memory::{Buffer, BufferView};
+use crate::host_budget::{Oversized, RING_OVERSIZED_CAP, Readback};
+use crate::memory::{Buffer, BufferView, LiveMemory};
 use crate::scheduler::Scheduler;
 use crate::staging::{StagingRing, StagingSlice};
 
@@ -43,6 +44,15 @@ const STREAM_LEAP_THRESHOLD: u32 = 16;
 const STREAM_LEAP_BYTES: u64 = 128 * CACHING_PAGE_SIZE;
 /// Scattered reads at least this large bind their first contiguous run instead of a gathered copy.
 const MAX_GATHER_SIZE: u64 = 64 << 20;
+/// Scattered read-only storage ranges at least this large gather into a cached device-local
+/// buffer that later binds reuse while their sources are unchanged; smaller ones gather into
+/// stream memory on every bind.
+const GATHER_CACHE_MIN: u64 = CACHING_PAGE_SIZE;
+/// The most cached gathers kept: the least recently bound go first.
+const GATHER_CACHE_ENTRIES: usize = 64;
+/// The device-local bytes cached gathers may own, evicted ones the GPU may still read included.
+/// A range larger than this gathers into stream memory on every bind instead.
+const GATHER_CACHE_BYTES: u64 = 256 << 20;
 
 const CACHED_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
     vk::BufferUsageFlags::VERTEX_BUFFER.as_raw()
@@ -60,6 +70,11 @@ const STREAM_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
         | vk::BufferUsageFlags::INDEX_BUFFER.as_raw()
         | vk::BufferUsageFlags::UNIFORM_BUFFER.as_raw()
         | vk::BufferUsageFlags::STORAGE_BUFFER.as_raw()
+        | vk::BufferUsageFlags::TRANSFER_SRC.as_raw()
+        | vk::BufferUsageFlags::TRANSFER_DST.as_raw(),
+);
+const GATHER_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
+    vk::BufferUsageFlags::STORAGE_BUFFER.as_raw()
         | vk::BufferUsageFlags::TRANSFER_SRC.as_raw()
         | vk::BufferUsageFlags::TRANSFER_DST.as_raw(),
 );
@@ -111,6 +126,10 @@ pub struct BufferCacheStats {
     pub capture_copy_bytes: u64,
     /// Bytes written to the stream ring: small uniforms, gathered ranges, converted indices.
     pub streamed_bytes: u64,
+    /// Bytes gathered into cached device-local buffers for large scattered storage reads.
+    pub gathered_bytes: u64,
+    /// Large scattered storage reads bound from a cached gather with nothing to copy.
+    pub gather_cache_hits: u64,
     pub created_buffers: u64,
     /// Buffers absorbed into a grown one.
     pub merged_buffers: u64,
@@ -167,6 +186,23 @@ struct CachedBuffer {
     /// The scheduler tick of the newest recorded work that wrote GPU-written bytes into it, or
     /// that created it from older buffers.
     written_tick: u64,
+    /// The cache's write epoch when bytes last landed in it: set on creation, on every upload,
+    /// and when GPU work writing it is recorded. Epochs only grow, so the newest of a gather's
+    /// sources changes whenever any source does.
+    modified: u64,
+}
+
+/// A large scattered storage range gathered into a buffer of its own, reused while
+/// `segments` and the newest write epoch of their sources (`stamp`) stay the same.
+struct GatheredRange {
+    gpu_va: GpuVAddr,
+    size: u64,
+    segments: Vec<GpuRange>,
+    stamp: u64,
+    last_used: u64,
+    /// The scheduler tick of the newest work it was bound for.
+    tick: u64,
+    buffer: Buffer,
 }
 
 impl CachedBuffer {
@@ -400,8 +436,8 @@ impl Captures {
 }
 
 /// Host-visible memory the GPU reads directly: streamed uniforms, gathered ranges and converted
-/// indices. Allocations are reused once the tick that consumed them completed, as in the
-/// [`StagingRing`].
+/// indices. Allocations are reused once the tick that consumed them completed, and oversized ones
+/// bounded, as in the [`StagingRing`].
 struct StreamRing {
     device: Arc<Device>,
     ring: Buffer,
@@ -409,11 +445,11 @@ struct StreamRing {
     head: u64,
     /// In-flight regions in ring order: (start, end, tick).
     regions: VecDeque<(u64, u64, u64)>,
-    oversized: VecDeque<(u64, Buffer)>,
+    oversized: Oversized,
 }
 
 impl StreamRing {
-    fn new(device: &Arc<Device>, capacity: u64) -> Result<Self> {
+    fn new(device: &Arc<Device>, capacity: u64, oversized_cap: u64) -> Result<Self> {
         let ring = Buffer::new(
             device,
             capacity,
@@ -427,7 +463,7 @@ impl StreamRing {
             capacity,
             head: 0,
             regions: VecDeque::new(),
-            oversized: VecDeque::new(),
+            oversized: Oversized::new(oversized_cap),
         })
     }
 
@@ -439,15 +475,13 @@ impl StreamRing {
     ) -> Result<StagingSlice<'_>> {
         if size > self.capacity / 4 {
             self.reclaim(scheduler);
-            let buffer = Buffer::new(
+            let buffer = self.oversized.alloc(
                 &self.device,
+                scheduler,
                 size,
                 STREAM_USAGE,
-                MemoryLocation::CpuToGpu,
                 "buffer cache stream (oversized)",
             )?;
-            self.oversized.push_back((scheduler.tick(), buffer));
-            let (_, buffer) = self.oversized.back_mut().expect("just pushed");
             return Ok(StagingSlice {
                 buffer: buffer.raw(),
                 offset: 0,
@@ -498,13 +532,7 @@ impl StreamRing {
         if self.regions.is_empty() {
             self.head = 0;
         }
-        while self
-            .oversized
-            .front()
-            .is_some_and(|(tick, _)| scheduler.is_complete(*tick))
-        {
-            self.oversized.pop_front();
-        }
+        self.oversized.reclaim(scheduler);
     }
 }
 
@@ -775,7 +803,7 @@ pub struct BufferCache {
     /// ([`lichii_gpu::gpu::flush_traps_enabled`]).
     flush_traps: bool,
     stream: StreamRing,
-    readback: Option<Buffer>,
+    readback: Readback,
     captures: Captures,
     luts: [QuadLut; 2],
     widen_u8: bool,
@@ -791,6 +819,16 @@ pub struct BufferCache {
     /// Ranges bound for writing by the draw or dispatch being prepared, stamped with the tick of
     /// the work it is recorded into by [`BufferCache::commit_writes`].
     pending_writes: Vec<(DAddr, DAddr)>,
+    /// The newest [`CachedBuffer::modified`] handed out.
+    write_epoch: u64,
+    gathered: Vec<GatheredRange>,
+    /// Counts cached gather binds, for least-recently-bound eviction.
+    gather_clock: u64,
+    /// Bytes of the buffers in [`BufferCache::gathered`].
+    gather_held: u64,
+    /// Evicted gather buffers, with the tick after which the GPU no longer reads them.
+    gather_retired: VecDeque<(u64, Buffer)>,
+    gather_retired_bytes: u64,
 }
 
 impl BufferCache {
@@ -813,8 +851,8 @@ impl BufferCache {
             free_slots: Vec::new(),
             gpu_written: RangeSet::default(),
             flush_traps: lichii_gpu::gpu::flush_traps_enabled(),
-            stream: StreamRing::new(device, STREAM_RING_SIZE)?,
-            readback: None,
+            stream: StreamRing::new(device, STREAM_RING_SIZE, RING_OVERSIZED_CAP)?,
+            readback: Readback::default(),
             captures: Captures::default(),
             luts: Default::default(),
             widen_u8: !device.features.index_type_uint8,
@@ -828,6 +866,12 @@ impl BufferCache {
             scratch: Vec::new(),
             raced: Vec::new(),
             pending_writes: Vec::new(),
+            write_epoch: 0,
+            gathered: Vec::new(),
+            gather_clock: 0,
+            gather_held: 0,
+            gather_retired: VecDeque::new(),
+            gather_retired_bytes: 0,
         })
     }
 
@@ -835,11 +879,22 @@ impl BufferCache {
         self.stats
     }
 
+    /// Whether the work being recorded at `tick` holds half the stream ring's oversized cap or
+    /// more ([`Oversized::should_submit`]).
+    pub(crate) fn should_submit(&self, tick: u64) -> bool {
+        self.stream.oversized.should_submit(tick)
+    }
+
     /// Whether GPU work wrote bytes of `[daddr, +size)` that [`BufferCache::flush`] has not
     /// downloaded yet.
     pub fn is_gpu_written(&self, daddr: DAddr, size: u64) -> bool {
         self.gpu_written
             .intersects(daddr, daddr.saturating_add(size))
+    }
+
+    /// The oversized stream buffers not freed yet.
+    pub fn oversized_stream(&self) -> LiveMemory {
+        self.stream.oversized.live()
     }
 
     /// The alignment storage bindings start at: [`BufferCache::storage_buffer`] rounds the
@@ -951,6 +1006,7 @@ impl BufferCache {
                 .hot
                 .for_each_in(daddr, end, |start, end| queued.push((start, end)));
         }
+        self.write_epoch += 1;
         let mut addr = daddr;
         while addr < end {
             let Some(id) = Self::lookup(&self.page_table, addr) else {
@@ -959,6 +1015,7 @@ impl BufferCache {
             };
             let buffer = self.buffers[id].as_mut().expect("live buffer");
             buffer.written_tick = tick;
+            buffer.modified = self.write_epoch;
             addr = buffer.end();
         }
     }
@@ -1082,16 +1139,15 @@ impl BufferCache {
                 addr += len;
             }
         });
-        if total > self.readback.as_ref().map_or(0, Buffer::size) {
-            self.readback = Some(Buffer::new(
+        let readback = self
+            .readback
+            .ensure(
                 &self.device,
-                total.next_power_of_two().max(CACHING_PAGE_SIZE),
-                vk::BufferUsageFlags::TRANSFER_DST,
-                MemoryLocation::GpuToCpu,
+                scheduler,
+                total.max(CACHING_PAGE_SIZE),
                 "buffer cache readback",
-            )?);
-        }
-        let readback = self.readback.as_ref().expect("just ensured");
+            )?
+            .raw();
         let record = |cmd| {
             before_transfer(&self.device, cmd);
             let mut offset = 0;
@@ -1101,7 +1157,7 @@ impl BufferCache {
                     dst_offset: offset,
                     size: len,
                 }];
-                copy_buffer(&self.device, cmd, src, readback.raw(), &region);
+                copy_buffer(&self.device, cmd, src, readback, &region);
                 offset += len;
             }
             transfer_to_all_barrier(&self.device, cmd);
@@ -1112,7 +1168,11 @@ impl BufferCache {
             record(scheduler.record()?);
             scheduler.finish()?;
         }
-        let data = readback.mapped().expect("readback memory is host visible");
+        let data = self
+            .readback
+            .buffer()
+            .and_then(Buffer::mapped)
+            .expect("readback memory is host visible");
         let mut offset = 0;
         for &(_, _, daddr, len) in &self.downloads {
             let bytes = &data[offset as usize..(offset + len) as usize];
@@ -1125,6 +1185,7 @@ impl BufferCache {
             }
             offset += len;
         }
+        self.readback.release();
         self.gpu_written.subtract(daddr, end);
         self.disarm_written_back(daddr, end);
         self.stats.downloaded_bytes += total;
@@ -1329,6 +1390,7 @@ impl BufferCache {
             uploads,
             copies,
             gpu_written,
+            write_epoch,
             ..
         } = self;
         let memory = &self.memory;
@@ -1356,6 +1418,8 @@ impl BufferCache {
         if uploads.is_empty() {
             return Ok(());
         }
+        *write_epoch += 1;
+        buffer.modified = *write_epoch;
         let dst = buffer.buffer.raw();
         let total = uploads.iter().map(|&(_, len)| len).sum();
         let slice = staging.alloc(scheduler, total, 16)?;
@@ -1435,6 +1499,7 @@ impl BufferCache {
             buffer.raw(),
             format_args!("guest buffer {begin:#x}-{end:#x}"),
         );
+        self.write_epoch += 1;
         let mut new = CachedBuffer {
             buffer,
             daddr: begin,
@@ -1445,6 +1510,7 @@ impl BufferCache {
             views: Vec::new(),
             tracked: Vec::new(),
             written_tick: scheduler.tick(),
+            modified: self.write_epoch,
         };
         if !self.overlaps.is_empty() {
             let cmd = scheduler.record()?;
@@ -1512,8 +1578,8 @@ impl BufferCache {
         written
     }
 
-    /// Copies a GPU range that is not one device range into stream memory: device runs from
-    /// their cached buffers, everything else as zero.
+    /// Copies a GPU range that is not one device range into stream memory (see
+    /// [`BufferCache::record_gather`]).
     fn gather(
         &mut self,
         scheduler: &mut Scheduler,
@@ -1525,10 +1591,172 @@ impl BufferCache {
     ) -> Result<BufferBinding> {
         self.segments.clear();
         gmmu.for_each_range(gpu_va, size, |range| self.segments.push(range));
-        let slice = self.stream.alloc(scheduler, size, align)?;
-        slice.data.fill(0);
+        let slice = self
+            .stream
+            .alloc(scheduler, size.next_multiple_of(4), align.max(4))?;
         let (dst, dst_offset) = (slice.buffer, slice.offset);
-        before_transfer(&self.device, scheduler.record()?);
+        self.record_gather(scheduler, staging, gpu_va, dst, dst_offset)?;
+        self.stats.streamed_bytes += size;
+        Ok(BufferBinding {
+            buffer: dst,
+            offset: dst_offset,
+            size,
+        })
+    }
+
+    /// A scattered read-only storage range `[gpu_va, +size)` gathered into a cached
+    /// device-local buffer. The gather is copied again only when the range's segments or the
+    /// buffers holding its device runs changed since it was last copied; otherwise the bind
+    /// records nothing.
+    fn cached_gather(
+        &mut self,
+        scheduler: &mut Scheduler,
+        staging: &mut StagingRing,
+        gmmu: &Gmmu,
+        gpu_va: GpuVAddr,
+        size: u64,
+    ) -> Result<BufferBinding> {
+        self.segments.clear();
+        gmmu.for_each_range(gpu_va, size, |range| self.segments.push(range));
+        for i in 0..self.segments.len() {
+            let segment = self.segments[i];
+            if let RangeTarget::Device(daddr) = segment.target {
+                self.acquire(scheduler, staging, daddr, segment.size)?;
+            }
+        }
+        let mut stamp = 0;
+        for segment in &self.segments {
+            if let RangeTarget::Device(daddr) = segment.target {
+                let id =
+                    Self::lookup(&self.page_table, daddr).expect("an acquired range has a buffer");
+                stamp = stamp.max(self.buffer(id).modified);
+            }
+        }
+        self.gather_clock += 1;
+        let index = match self
+            .gathered
+            .iter()
+            .position(|entry| entry.gpu_va == gpu_va && entry.size == size)
+        {
+            Some(index) => index,
+            None => {
+                let Some(buffer) = self.gather_buffer(scheduler, size.next_multiple_of(4))? else {
+                    let align = self.storage_alignment();
+                    return self.gather(scheduler, staging, gmmu, gpu_va, size, align);
+                };
+                self.gather_held += buffer.size();
+                self.gathered.push(GatheredRange {
+                    gpu_va,
+                    size,
+                    segments: Vec::new(),
+                    stamp: 0,
+                    last_used: 0,
+                    tick: 0,
+                    buffer,
+                });
+                self.gathered.len() - 1
+            }
+        };
+        let entry = &mut self.gathered[index];
+        entry.last_used = self.gather_clock;
+        entry.tick = scheduler.tick();
+        let binding = BufferBinding {
+            buffer: entry.buffer.raw(),
+            offset: 0,
+            size,
+        };
+        if entry.stamp == stamp && entry.segments == self.segments {
+            self.stats.gather_cache_hits += 1;
+            return Ok(binding);
+        }
+        entry.stamp = stamp;
+        entry.segments.clone_from(&self.segments);
+        self.record_gather(scheduler, staging, gpu_va, binding.buffer, 0)?;
+        self.stats.gathered_bytes += size;
+        Ok(binding)
+    }
+
+    /// A device-local buffer of at least `size` bytes for a new cached gather. Evicts the least
+    /// recently bound gathers until [`GATHER_CACHE_BYTES`] fits it beside the rest and the
+    /// evicted buffers the GPU may still read, and takes over an evicted buffer large enough that
+    /// no work being prepared can still read. `None` when nothing is left to evict and it still
+    /// does not fit.
+    fn gather_buffer(&mut self, scheduler: &mut Scheduler, size: u64) -> Result<Option<Buffer>> {
+        while self
+            .gather_retired
+            .front()
+            .is_some_and(|&(tick, _)| scheduler.is_complete(tick))
+        {
+            let (_, buffer) = self.gather_retired.pop_front().expect("checked above");
+            self.gather_retired_bytes -= buffer.size();
+        }
+        loop {
+            if self.gathered.len() < GATHER_CACHE_ENTRIES
+                && self.gather_held + self.gather_retired_bytes + size <= GATHER_CACHE_BYTES
+            {
+                return Buffer::new(
+                    &self.device,
+                    size,
+                    GATHER_USAGE,
+                    MemoryLocation::GpuOnly,
+                    "gathered storage range",
+                )
+                .map(Some);
+            }
+            let Some(oldest) = (0..self.gathered.len()).min_by_key(|&i| self.gathered[i].last_used)
+            else {
+                return Ok(None);
+            };
+            let evicted = self.gathered.swap_remove(oldest);
+            self.gather_held -= evicted.buffer.size();
+            if evicted.buffer.size() >= size && evicted.tick < scheduler.tick() {
+                return Ok(Some(evicted.buffer));
+            }
+            if scheduler.is_complete(evicted.tick) {
+                continue;
+            }
+            self.gather_retired_bytes += evicted.buffer.size();
+            self.gather_retired
+                .push_back((evicted.tick, evicted.buffer));
+        }
+    }
+
+    /// Records the copy of [`BufferCache::segments`], which cover a GPU range from `gpu_va`,
+    /// into `dst` from `dst_offset`: device runs from their cached buffers, everything else as
+    /// zero. The GPU writes the zeros, so a gather costs the host nothing per byte. `dst` holds
+    /// the range's size rounded up to 4 bytes.
+    fn record_gather(
+        &mut self,
+        scheduler: &mut Scheduler,
+        staging: &mut StagingRing,
+        gpu_va: GpuVAddr,
+        dst: vk::Buffer,
+        dst_offset: u64,
+    ) -> Result<()> {
+        let cmd = scheduler.record()?;
+        before_transfer(&self.device, cmd);
+        let mut holes = false;
+        let device = |range: &GpuRange| matches!(range.target, RangeTarget::Device(_));
+        for run in self.segments.chunk_by(|a, b| device(a) == device(b)) {
+            if device(&run[0]) {
+                continue;
+            }
+            let last = run[run.len() - 1];
+            let start = (run[0].gpu_va - gpu_va) & !3;
+            let end = (last.gpu_va + last.size - gpu_va).next_multiple_of(4);
+            // SAFETY: `cmd` is recording and `[start, end)` lies inside the padded slice, at
+            // 4-byte aligned offsets. Runs between holes are whole GMMU pages, so no two widened
+            // holes overlap.
+            unsafe {
+                self.device
+                    .raw
+                    .cmd_fill_buffer(cmd, dst, dst_offset + start, end - start, 0)
+            };
+            holes = true;
+        }
+        if holes {
+            before_transfer(&self.device, cmd);
+        }
         for i in 0..self.segments.len() {
             let segment = self.segments[i];
             let RangeTarget::Device(daddr) = segment.target else {
@@ -1543,12 +1771,7 @@ impl BufferCache {
             copy_buffer(&self.device, scheduler.record()?, src.buffer, dst, &region);
         }
         transfer_to_all_barrier(&self.device, scheduler.record()?);
-        self.stats.streamed_bytes += size;
-        Ok(BufferBinding {
-            buffer: dst,
-            offset: dst_offset,
-            size,
-        })
+        Ok(())
     }
 
     /// `[gpu_va, +size)` for reading: its cached buffer when it is one device range at an
@@ -1679,7 +1902,9 @@ impl BufferCache {
     /// A storage buffer binding for `[gpu_va, +size)`, starting at `gpu_va` rounded down to
     /// [`BufferCache::storage_alignment`]. With `written`, the range is marked GPU-written; a
     /// written range over scattered memory binds only its first contiguous run (as Lichii does
-    /// without sparse binding).
+    /// without sparse binding). A read-only range from [`GATHER_CACHE_MIN`] to
+    /// [`GATHER_CACHE_BYTES`] over scattered memory binds a cached gather of it, copied again
+    /// only when its mapping or the buffers behind it changed.
     pub fn storage_buffer(
         &mut self,
         scheduler: &mut Scheduler,
@@ -1695,9 +1920,20 @@ impl BufferCache {
         let align = self.storage_alignment();
         let start = gpu_va & !(align - 1);
         let size = size + (gpu_va - start);
-        if !written {
+        if !written && !(GATHER_CACHE_MIN..=GATHER_CACHE_BYTES).contains(&size) {
             return self
                 .read_range(scheduler, staging, gmmu, start, size, align)
+                .map(Some);
+        }
+        if !written {
+            if let Some(daddr) = contiguous(gmmu, start, size) {
+                let binding = self.acquire(scheduler, staging, daddr, size)?;
+                if binding.offset % align == 0 {
+                    return Ok(Some(binding));
+                }
+            }
+            return self
+                .cached_gather(scheduler, staging, gmmu, start, size)
                 .map(Some);
         }
         if let Some(daddr) = contiguous(gmmu, start, size) {
@@ -2097,7 +2333,7 @@ mod tests {
         memory.map(DADDR, 0, DRAM);
         Some(Fixture {
             scheduler: Scheduler::new(&device).unwrap(),
-            staging: StagingRing::new(&device, 8 << 20).unwrap(),
+            staging: StagingRing::new(&device, 8 << 20, RING_OVERSIZED_CAP).unwrap(),
             cache: BufferCache::new(
                 &device,
                 memory.clone(),
@@ -2195,6 +2431,49 @@ mod tests {
             );
         }
 
+        fn storage_read(&mut self, gpu_va: GpuVAddr, size: u64) -> BufferBinding {
+            self.cache
+                .storage_buffer(
+                    &mut self.scheduler,
+                    &mut self.staging,
+                    &self.gmmu,
+                    gpu_va,
+                    size,
+                    false,
+                )
+                .unwrap()
+                .unwrap()
+        }
+
+        /// Maps five 64 KiB chunks from `gpu_va`: two unrelated device runs, a sparse chunk,
+        /// an unmapped one and a third device run. The device memory around each run holds
+        /// distinct bytes. Returns the range's size and the bytes a binding of it reads.
+        fn map_scattered(&mut self, gpu_va: GpuVAddr) -> (u64, Vec<u8>) {
+            const CHUNK: u64 = CACHING_PAGE_SIZE;
+            let mut expected = Vec::new();
+            for (chunk, target) in [
+                (0, Some(0x40_0000)),
+                (1, Some(0x10_0000)),
+                (2, None),
+                (3, None),
+                (4, Some(0x80_0000)),
+            ] {
+                let va = gpu_va + chunk * CHUNK;
+                let Some(offset) = target else {
+                    if chunk == 2 {
+                        self.gmmu.map_sparse(va, CHUNK, false).unwrap();
+                    }
+                    expected.extend_from_slice(&[0; CHUNK as usize]);
+                    continue;
+                };
+                let data = pattern(2 * CHUNK as usize, chunk as u32 * 7 + 3);
+                self.memory.write_bytes(DADDR + offset, &data).unwrap();
+                self.gmmu.map(va, DADDR + offset, CHUNK, 0, false).unwrap();
+                expected.extend_from_slice(&data[..CHUNK as usize]);
+            }
+            (5 * CHUNK, expected)
+        }
+
         fn guest(&self, daddr: DAddr, size: usize) -> Vec<u8> {
             let mut out = vec![0; size];
             self.memory.read_bytes(daddr, &mut out).unwrap();
@@ -2244,6 +2523,43 @@ mod tests {
             instance_count: 1,
             inline_indices: None,
         }
+    }
+
+    #[test]
+    fn oversized_stream_floods_stay_within_their_cap_on_a_lagging_gpu() {
+        let Some(device) = crate::host_budget::testing::device() else {
+            return;
+        };
+        const CAP: u64 = 8 << 20;
+        const SIZE: u64 = 3 << 19;
+        let mut ring = StreamRing::new(&device, 1 << 20, CAP).unwrap();
+        let ops = 64;
+        let result = crate::host_budget::testing::flood(
+            &device,
+            &mut ring,
+            ops,
+            |ring, scheduler| {
+                let slice = ring.alloc(scheduler, SIZE, 4).unwrap();
+                assert_eq!(slice.data.len() as u64, SIZE);
+            },
+            |ring| ring.oversized.live().bytes,
+            |ring, tick| ring.oversized.should_submit(tick),
+        );
+        assert!(
+            u64::from(ops) * SIZE > 8 * CAP,
+            "the flood is many times the cap"
+        );
+        assert!(result.lagged > 0, "allocations ran ahead of the GPU");
+        assert!(
+            result.peak > CAP / 2,
+            "the cap bound the flood: {}",
+            result.peak
+        );
+        assert!(
+            result.peak <= CAP,
+            "{} in flight passed the cap",
+            result.peak
+        );
     }
 
     #[test]
@@ -2941,6 +3257,356 @@ mod tests {
             "a later CPU write wins"
         );
         assert_eq!(f.cache.stats().downloaded_bytes, 0x100);
+        f.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn gathered_holes_read_zero_over_reused_stream_memory() {
+        let Some(mut f) = fixture() else { return };
+        let mut contents = Vec::new();
+        for (page, daddr) in [(0, 0x40000), (1, 0x10000), (2, 0x80000)] {
+            f.gmmu
+                .map(
+                    GPU_VA + page * PAGE_SIZE,
+                    DADDR + daddr,
+                    PAGE_SIZE,
+                    0,
+                    false,
+                )
+                .unwrap();
+            let data = pattern(PAGE_SIZE as usize, page as u32 + 20);
+            f.memory.write_bytes(DADDR + daddr, &data).unwrap();
+            contents.push(data);
+        }
+        let holed = GPU_VA + 8 * PAGE_SIZE;
+        for (page, daddr) in [(0, 0x40000), (2, 0x80000)] {
+            f.gmmu
+                .map(holed + page * PAGE_SIZE, DADDR + daddr, PAGE_SIZE, 0, false)
+                .unwrap();
+        }
+
+        let dirty = f
+            .cache
+            .vertex_buffer(
+                &mut f.scheduler,
+                &mut f.staging,
+                &f.gmmu,
+                GPU_VA,
+                3 * PAGE_SIZE,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(f.read_binding(dirty), contents.concat());
+
+        let gathered = f
+            .cache
+            .vertex_buffer(
+                &mut f.scheduler,
+                &mut f.staging,
+                &f.gmmu,
+                holed + 0x802,
+                2 * PAGE_SIZE,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (gathered.buffer, gathered.offset),
+            (dirty.buffer, dirty.offset),
+            "the second gather reuses the stream memory the first one filled"
+        );
+        let mut expected = contents[0][0x802..].to_vec();
+        expected.extend_from_slice(&[0; PAGE_SIZE as usize]);
+        expected.extend_from_slice(&contents[2][..0x802]);
+        assert!(
+            f.read_binding(gathered) == expected,
+            "the hole reads zero and the unaligned edges keep their device bytes"
+        );
+
+        let mixed = GPU_VA + 16 * PAGE_SIZE;
+        f.gmmu.map_sparse(mixed, PAGE_SIZE, false).unwrap();
+        f.gmmu
+            .map(mixed + 2 * PAGE_SIZE, DADDR + 0x80000, PAGE_SIZE, 0, false)
+            .unwrap();
+        let gathered = f
+            .cache
+            .vertex_buffer(
+                &mut f.scheduler,
+                &mut f.staging,
+                &f.gmmu,
+                mixed + 2,
+                2 * PAGE_SIZE,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(gathered.offset, dirty.offset);
+        let mut expected = vec![0; 2 * PAGE_SIZE as usize - 2];
+        expected.extend_from_slice(&contents[2][..2]);
+        assert!(
+            f.read_binding(gathered) == expected,
+            "adjacent sparse and unmapped pages read zero as one hole"
+        );
+        f.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn large_scattered_storage_reads_gather_their_runs_and_zero_their_holes() {
+        let Some(mut f) = fixture() else { return };
+        let (size, expected) = f.map_scattered(GPU_VA);
+        let binding = f.storage_read(GPU_VA, size);
+        assert_eq!((binding.offset, binding.size), (0, size));
+        assert!(
+            f.read_binding(binding) == expected,
+            "each run reads its own device bytes and the sparse and unmapped chunks read zero"
+        );
+        let stats = f.cache.stats();
+        assert_eq!(stats.gathered_bytes, size);
+        assert_eq!(
+            stats.streamed_bytes, 0,
+            "nothing goes through stream memory"
+        );
+        f.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn unchanged_gathered_storage_reads_reuse_their_copy() {
+        let Some(mut f) = fixture() else { return };
+        let (size, expected) = f.map_scattered(GPU_VA);
+        let first = f.storage_read(GPU_VA, size);
+        let before = f.cache.stats();
+        let allocated = allocations();
+        let second = f.storage_read(GPU_VA, size);
+        assert_eq!(
+            allocations(),
+            allocated,
+            "a reused gather allocates nothing"
+        );
+        assert_eq!(second, first);
+        let after = f.cache.stats();
+        assert_eq!(after.gather_cache_hits, before.gather_cache_hits + 1);
+        assert_eq!(
+            after.gathered_bytes, before.gathered_bytes,
+            "nothing is copied again"
+        );
+        assert_eq!(after.streamed_bytes, 0);
+        assert_eq!(after.uploaded_bytes, before.uploaded_bytes);
+        assert!(f.read_binding(second) == expected);
+        f.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn cpu_writes_to_a_gathered_source_gather_again() {
+        const CPU_VA: u64 = 0x1000_0000;
+        let Some(mut f) = fixture() else { return };
+        let (size, mut expected) = f.map_scattered(GPU_VA);
+        let space = Arc::new(AddressSpace::new(f.memory.physical().clone(), 39));
+        space.map(
+            CPU_VA,
+            0x10_0000,
+            CACHING_PAGE_SIZE,
+            MemoryPermission::READ_WRITE,
+        );
+        f.memory.attach_process(space.clone());
+        f.storage_read(GPU_VA, size);
+        let gathered = f.cache.stats().gathered_bytes;
+        space.write_bytes(CPU_VA + 0x1230, &[0xee; 16]).unwrap();
+        assert!(f.memory.has_cpu_writes(), "the write was tracked");
+        let memory = f.memory.clone();
+        memory.take_cpu_writes(|daddr, size| f.cache.cpu_written(daddr, size));
+        let binding = f.storage_read(GPU_VA, size);
+        assert_eq!(f.cache.stats().gathered_bytes, gathered + size);
+        let at = (CACHING_PAGE_SIZE + 0x1230) as usize;
+        expected[at..at + 16].fill(0xee);
+        assert!(
+            f.read_binding(binding) == expected,
+            "the second run reads the CPU's bytes"
+        );
+        f.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn gpu_writes_to_a_gathered_source_gather_again() {
+        let Some(mut f) = fixture() else { return };
+        let (size, mut expected) = f.map_scattered(GPU_VA);
+        let written = f
+            .cache
+            .storage_buffer(
+                &mut f.scheduler,
+                &mut f.staging,
+                &f.gmmu,
+                GPU_VA,
+                0x100,
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        let read = f.storage_read(GPU_VA, size);
+        assert!(
+            f.read_binding(read) == expected,
+            "a read bound beside the write, before the work runs, holds the old bytes"
+        );
+        f.gpu_fill(written, 0, 0x100, 0x5555_5555);
+        f.cache.commit_writes(f.scheduler.tick());
+        let gathered = f.cache.stats().gathered_bytes;
+        let binding = f.storage_read(GPU_VA, size);
+        assert_eq!(f.cache.stats().gathered_bytes, gathered + size);
+        expected[..0x100].fill(0x55);
+        assert!(
+            f.read_binding(binding) == expected,
+            "the next read sees the GPU's bytes"
+        );
+        f.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn remapped_gathered_storage_reads_see_the_new_mapping() {
+        let Some(mut f) = fixture() else { return };
+        let (size, mut expected) = f.map_scattered(GPU_VA);
+        f.storage_read(GPU_VA, size);
+        let chunk = CACHING_PAGE_SIZE as usize;
+        f.gmmu
+            .unmap(GPU_VA + CACHING_PAGE_SIZE, CACHING_PAGE_SIZE)
+            .unwrap();
+        f.gmmu
+            .map(
+                GPU_VA + CACHING_PAGE_SIZE,
+                DADDR + 0x40_0000,
+                CACHING_PAGE_SIZE,
+                0,
+                false,
+            )
+            .unwrap();
+        let binding = f.storage_read(GPU_VA, size);
+        expected.copy_within(..chunk, chunk);
+        assert!(
+            f.read_binding(binding) == expected,
+            "the chunk remapped onto the first run's unchanged memory reads it"
+        );
+
+        let data = pattern(chunk, 99);
+        f.memory.write_bytes(DADDR + 0xc0_0000, &data).unwrap();
+        f.gmmu
+            .unmap(GPU_VA + 3 * CACHING_PAGE_SIZE, CACHING_PAGE_SIZE)
+            .unwrap();
+        f.gmmu
+            .map(
+                GPU_VA + 3 * CACHING_PAGE_SIZE,
+                DADDR + 0xc0_0000,
+                CACHING_PAGE_SIZE,
+                0,
+                false,
+            )
+            .unwrap();
+        let binding = f.storage_read(GPU_VA, size);
+        expected[3 * chunk..4 * chunk].copy_from_slice(&data);
+        assert!(
+            f.read_binding(binding) == expected,
+            "the unmapped chunk, now mapped, reads its device bytes"
+        );
+        f.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn gathered_storage_reads_evict_the_least_recently_bound() {
+        let Some(mut f) = fixture() else { return };
+        let size = 2 * CACHING_PAGE_SIZE;
+        let va = |i: usize| GPU_VA + i as u64 * 4 * CACHING_PAGE_SIZE;
+        f.memory
+            .write_bytes(DADDR, &pattern(CACHING_PAGE_SIZE as usize, 5))
+            .unwrap();
+        for i in 0..=GATHER_CACHE_ENTRIES {
+            f.gmmu
+                .map(va(i), DADDR, CACHING_PAGE_SIZE, 0, false)
+                .unwrap();
+            f.storage_read(va(i), size);
+        }
+        assert_eq!(f.cache.gathered.len(), GATHER_CACHE_ENTRIES);
+        let stats = f.cache.stats();
+        f.storage_read(va(GATHER_CACHE_ENTRIES), size);
+        assert_eq!(
+            f.cache.stats().gather_cache_hits,
+            stats.gather_cache_hits + 1,
+            "the newest range is still cached"
+        );
+        f.storage_read(va(0), size);
+        assert_eq!(
+            f.cache.stats().gathered_bytes,
+            stats.gathered_bytes + size,
+            "the oldest range was evicted and gathers again"
+        );
+        f.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn gathered_storage_reads_stay_within_their_byte_budget() {
+        let Some(mut f) = fixture() else { return };
+        let va = |i: u64| GPU_VA + i * (512 << 20);
+        for i in 0..6 {
+            let data = pattern(CACHING_PAGE_SIZE as usize, i as u32 + 40);
+            f.memory
+                .write_bytes(DADDR + i * CACHING_PAGE_SIZE, &data)
+                .unwrap();
+            f.gmmu
+                .map(
+                    va(i),
+                    DADDR + i * CACHING_PAGE_SIZE,
+                    CACHING_PAGE_SIZE,
+                    0,
+                    false,
+                )
+                .unwrap();
+        }
+        let owned = |f: &Fixture| f.cache.gather_held + f.cache.gather_retired_bytes;
+        let (large, larger) = (96 << 20, 112 << 20);
+
+        f.storage_read(va(0), large);
+        f.storage_read(va(1), large);
+        assert_eq!((f.cache.gathered.len(), owned(&f)), (2, 2 * large));
+        let streamed = f.cache.stats().streamed_bytes;
+        f.storage_read(va(2), larger);
+        assert!(
+            f.cache.gathered.is_empty() && owned(&f) == 2 * large,
+            "both gathers are evicted, and the GPU may still read them"
+        );
+        assert_eq!(
+            f.cache.stats().streamed_bytes,
+            streamed + larger,
+            "a range that does not fit beside them gathers into stream memory"
+        );
+
+        f.scheduler.finish().unwrap();
+        f.storage_read(va(2), larger);
+        assert_eq!(
+            (f.cache.gather_retired_bytes, f.cache.gather_held),
+            (0, larger),
+            "the evicted buffers are freed once their work completed"
+        );
+        f.storage_read(va(3), larger);
+        assert_eq!(owned(&f), 2 * larger);
+
+        f.scheduler.finish().unwrap();
+        let gathered = f.cache.stats().gathered_bytes;
+        let binding = f.storage_read(va(4), large);
+        assert_eq!(
+            owned(&f),
+            2 * larger,
+            "the oldest gather's buffer is taken over, nothing is allocated"
+        );
+        assert_eq!(f.cache.stats().gathered_bytes, gathered + large);
+        let mut expected = pattern(CACHING_PAGE_SIZE as usize, 44);
+        expected.resize(2 * CACHING_PAGE_SIZE as usize, 0);
+        assert!(
+            f.read_back(binding.buffer, 0, 2 * CACHING_PAGE_SIZE) == expected,
+            "the taken-over buffer holds the new range"
+        );
+
+        let streamed = f.cache.stats().streamed_bytes;
+        f.storage_read(va(5), GATHER_CACHE_BYTES + CACHING_PAGE_SIZE);
+        assert_eq!(
+            f.cache.stats().streamed_bytes,
+            streamed + GATHER_CACHE_BYTES + CACHING_PAGE_SIZE,
+            "a range larger than the budget gathers into stream memory"
+        );
+        assert_eq!((f.cache.gathered.len(), owned(&f)), (2, 2 * larger));
         f.assert_no_validation_errors();
     }
 

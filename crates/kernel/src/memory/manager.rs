@@ -228,7 +228,9 @@ impl MemoryManager {
         self.pools[pool as usize].free.lock().free
     }
 
-    /// Allocates `size` bytes, contiguous when possible.
+    /// Allocates `size` bytes. Free pages that still hold host memory go first, so a title
+    /// that frees and allocates again reuses what it already costs the host instead of committing
+    /// more; the rest is contiguous when possible.
     pub fn allocate(&self, pool: Pool, size: u64) -> HleResult<PageGroup> {
         assert_eq!(size % PAGE_SIZE, 0);
         let mut list = self.pools[pool as usize].free.lock();
@@ -236,25 +238,47 @@ impl MemoryManager {
             return Err(result::OUT_OF_MEMORY);
         }
         let mut runs = Vec::new();
-        if let Some((&start, _)) = list.ranges.iter().find(|(_, s)| **s >= size) {
-            runs.push((start, size));
-        } else {
-            let mut left = size;
-            for (&start, &run) in &list.ranges {
-                let take = run.min(left);
-                runs.push((start, take));
-                left -= take;
-                if left == 0 {
-                    break;
-                }
+        let mut left = size;
+        for (&start, &run) in list.dirty.iter().chain(&list.aged) {
+            if left == 0 {
+                break;
             }
+            let take = run.min(left);
+            runs.push((start, take));
+            left -= take;
         }
         let mut dirty = Vec::new();
         for &(start, run) in &runs {
             list.take(start, run);
             list.take_dirty(start, run, &mut dirty);
         }
+        let reused = runs.len();
+        if left > 0 {
+            if let Some((&start, _)) = list.ranges.iter().find(|(_, s)| **s >= left) {
+                runs.push((start, left));
+            } else {
+                for (&start, &run) in &list.ranges {
+                    let take = run.min(left);
+                    runs.push((start, take));
+                    left -= take;
+                    if left == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        for &(start, run) in &runs[reused..] {
+            list.take(start, run);
+        }
         drop(list);
+        runs.sort_unstable();
+        runs.dedup_by(|next, run| {
+            let joins = run.0 + run.1 == next.0;
+            if joins {
+                run.1 += next.1;
+            }
+            joins
+        });
         self.commit(&runs)?;
         self.zero(&dirty);
         Ok(PageGroup { runs })
@@ -384,7 +408,7 @@ mod tests {
         assert_eq!(b.runs, vec![(0x3000, 0x1000)]);
         mm.free_group(&a);
         let c = mm.allocate(Pool::Application, 0x4000).unwrap();
-        assert_eq!(c.runs, vec![(0x4000, 0x4000)]);
+        assert_eq!(c.runs, vec![(0, 0x3000), (0x4000, 0x1000)]);
         mm.free_group(&b);
         mm.free_group(&c);
         assert_eq!(mm.free_size(Pool::Application), 32 * MIB);
@@ -419,6 +443,31 @@ mod tests {
     fn byte_at(mm: &MemoryManager, pa: PAddr) -> u8 {
         // SAFETY: pa is committed DRAM inside the backing.
         unsafe { *mm.physical().pointer(pa) }
+    }
+
+    #[test]
+    fn allocations_reuse_freed_pages_before_backing_new_ones() {
+        let mm = manager();
+        let host = || mm.physical().host_bytes();
+        let a = mm.allocate(Pool::Application, 4 * MIB).unwrap();
+        let b = mm.allocate(Pool::Application, PAGE_SIZE).unwrap();
+        fill(&mm, 0, 4 * MIB + PAGE_SIZE, 0x33);
+        mm.free_group(&a);
+        let backed = host();
+        let c = mm.allocate(Pool::Application, 6 * MIB).unwrap();
+        assert_eq!(c.runs[0], (0, 4 * MIB), "the freed pages come first");
+        assert_eq!(c.size(), 6 * MIB);
+        for &(start, size) in &c.runs {
+            fill(&mm, start, size, 0x44);
+        }
+        assert!(
+            host() <= backed + 2 * MIB + mm.physical().release_granule(),
+            "only the part the freed pages could not cover is new: {:#x} -> {:#x}",
+            backed,
+            host()
+        );
+        mm.free_group(&b);
+        mm.free_group(&c);
     }
 
     #[test]

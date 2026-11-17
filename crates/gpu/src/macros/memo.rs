@@ -118,6 +118,12 @@ impl MacroMemo {
         self.last.fill((0, NO_RECORD));
     }
 
+    /// Heap bytes the arena and the map hold.
+    #[cfg(test)]
+    pub(super) fn reserved_bytes(&self) -> usize {
+        self.arena.capacity() * size_of::<u32>() + self.entries.capacity() * size_of::<(u64, u32)>()
+    }
+
     pub(super) fn stats(&self) -> MemoStats {
         MemoStats {
             entries: self.entries.len() as u64,
