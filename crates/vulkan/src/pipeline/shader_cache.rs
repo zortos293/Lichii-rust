@@ -902,6 +902,143 @@ mod tests {
         );
     }
 
+    /// Over a random stream of texture header and handle rewrites, the variant the cache finds
+    /// while keeping header answers from lookup to lookup is the one a lookup that keeps nothing
+    /// finds.
+    #[test]
+    fn kept_header_answers_find_the_variant_a_fresh_lookup_finds() {
+        use lichii_gpu::backend::{ChannelId, ComputeContext, ConstBufferBinding, QmdVersion};
+        use lichii_gpu::gmmu::BigPageSize;
+        use lichii_memory::{DeviceAddressSpace, PhysicalMemory};
+        use lichii_shader::info::HandleSource;
+        use lichii_texture::tic::TicEntry;
+
+        fn tic(format: u32, component: u32, ty: u32) -> TicEntry {
+            let mut w = [0u32; 8];
+            w[0] = format | (component * 0o1111) << 7 | 0o5432 << 19;
+            w[2] = 3 << 21;
+            w[4] = 63 | ty << 23;
+            w[5] = 63 | 1 << 31;
+            TicEntry(w)
+        }
+
+        const SIZE: u64 = 1 << 20;
+        const DADDR: u64 = 0x1_0000_0000;
+        const GPU_VA: GpuVAddr = 0x4_0000_0000;
+        const TIC: GpuVAddr = GPU_VA + 0x1_0000;
+        const CBUF: GpuVAddr = GPU_VA + 0x2_0000;
+        const LIMIT: u32 = 7;
+        let physical = Arc::new(PhysicalMemory::new(SIZE).unwrap());
+        physical.commit(0, SIZE).unwrap();
+        let memory = Arc::new(DeviceAddressSpace::new(physical, 36));
+        memory.map(DADDR, 0, SIZE);
+        let gmmu = Arc::new(Gmmu::new(memory, BigPageSize::Size64K));
+        gmmu.map(GPU_VA, DADDR, SIZE, 0, false).unwrap();
+        let headers = [
+            tic(0x08, 2, 1),
+            tic(0x08, 4, 1),
+            tic(0x24, 2, 5),
+            tic(0x0f, 7, 3),
+        ];
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let rewrite = |next: &mut dyn FnMut(u64) -> u64| match next(3) {
+            0 => {
+                let t = next(3);
+                gmmu.write(CBUF + t * 8, next(u64::from(LIMIT) + 3) as u32)
+                    .unwrap();
+            }
+            _ => {
+                let index = next(u64::from(LIMIT) + 1);
+                gmmu.write(TIC + index * 32, headers[next(4) as usize])
+                    .unwrap();
+            }
+        };
+        for _ in 0..64 {
+            rewrite(&mut next);
+        }
+        let const_buffers = [ConstBufferBinding {
+            address: CBUF,
+            size: 0x100,
+            enabled: true,
+        }; 8];
+        let qmd = [0u32; 64];
+        let ctx = ComputeContext {
+            channel: ChannelId(0),
+            memory: &gmmu,
+            program: GPU_VA,
+            grid: [1; 3],
+            block: [1; 3],
+            shared_memory_size: 0,
+            local_memory_size: 0,
+            const_buffers: &const_buffers,
+            texture_headers: TIC,
+            texture_header_limit: LIMIT,
+            samplers: 0,
+            sampler_limit: 0,
+            linked_samplers: false,
+            qmd_version: QmdVersion::V3,
+            qmd: &qmd,
+            indirect_grid: None,
+            indirect: None,
+        };
+        let source = |t: u32| HandleSource {
+            cbuf_index: 0,
+            cbuf_offset: t * 8,
+            shift_left: 0,
+            secondary: None,
+        };
+        let key = ModuleKey {
+            code: [0, 1],
+            state: 0,
+        };
+        let mut cache = ShaderCache::new(Profile::default(), HostTranslateInfo::default());
+        for variant in 0..24 {
+            let env = ProgramEnv::compute(&ctx);
+            for t in 0..2 + variant % 2 {
+                env.texture_type_of(source(t));
+                env.is_texture_pixel_format_integer_of(source(t));
+                if t == 0 {
+                    env.texture_pixel_format_of(source(t));
+                }
+            }
+            env.texture_type(1);
+            let bindings = Bindings {
+                uniform_buffer: variant,
+                ..Bindings::default()
+            };
+            cache.remember(key, [Vec::new(), env.take_reads()], bindings, None);
+            for _ in 0..3 {
+                rewrite(&mut next);
+            }
+        }
+        assert_eq!(cache.modules[&key].shapes.len(), 2);
+        let (mut hits, mut misses) = (0, 0);
+        for _ in 0..5000 {
+            rewrite(&mut next);
+            let env = ProgramEnv::compute(&ctx);
+            let found = cache
+                .variant(&key, None, &env)
+                .map(|v| v.bindings.uniform_buffer);
+            let fresh = cache.modules[&key]
+                .find(&mut Vec::new(), |_, read| {
+                    env.answer(read, &mut TextureAnswers::default())
+                })
+                .map(|v| v.bindings.uniform_buffer);
+            assert_eq!(found, fresh);
+            match found {
+                Some(_) => hits += 1,
+                None => misses += 1,
+            }
+        }
+        assert!(hits > 500 && misses > 500, "{hits} hits, {misses} misses");
+    }
+
     /// The back thread's cost of re-checking the variants of three stages whose translations
     /// asked 8 to 12 questions each, nearly all of texture headers:
     /// `cargo test --release -p lichii-vulkan --lib variant_check_cost -- --ignored --nocapture`.

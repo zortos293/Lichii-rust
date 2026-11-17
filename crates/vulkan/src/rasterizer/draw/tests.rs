@@ -17,7 +17,7 @@ use lichii_gpu::engines::maxwell_3d::regs::{
     SurfaceClipBits1, TileMode, TileModeDimensionControl, VertexAttribute, VertexAttributeType,
     VertexStreamBits, ZetaSizeBits,
 };
-use lichii_gpu::engines::maxwell_3d::{DirtyState, Regs, dirty};
+use lichii_gpu::engines::maxwell_3d::{DirtyState, Regs};
 use lichii_gpu::gmmu::Gmmu;
 use lichii_memory::{AddressSpace, MemoryPermission};
 use lichii_shader::ampere::{
@@ -1465,9 +1465,9 @@ fn cpu_writes_to_cached_programs_translate_them_again() {
     f.assert_no_validation_errors();
 }
 
-/// Draws that keep one dirty state reuse the last draw's modules while its `SHADERS` flag
-/// stays clear, but a guest write to a program and a register the stages read still find the
-/// module those translate to.
+/// Draws reuse the last draw's modules while the registers they were found from keep their
+/// values, rewritten or not, but a guest write to a program and a register the stages read
+/// still find the module those translate to.
 #[test]
 fn unchanged_programs_are_found_again_after_a_write_or_a_stage_register_change() {
     const CPU_VA: u64 = 0x1000_0000;
@@ -1505,17 +1505,28 @@ fn unchanged_programs_are_found_again_after_a_write_or_a_stage_register_change()
                 inline_indices: None,
             },
         );
-        assert!(
-            !ctx.dirty.is_set(dirty::SHADERS),
-            "the lookup took the flag"
-        );
         target(f)
     };
     let translated = |f: &Fixture| f.rasterizer.draw.shaders.stats().translated;
+    let hits = |f: &Fixture| f.rasterizer.draw.shaders.stats().hits;
     let original = draw(&mut f, &regs);
     assert_eq!(translated(&f), 2);
     assert_eq!(draw(&mut f, &regs), original);
     assert_eq!(translated(&f), 2, "an unchanged draw reuses its modules");
+    let stages = f.rasterizer.draw.stages.clone();
+    let before = hits(&f);
+    self::draw(&mut f, &gmmu, &regs);
+    assert_eq!(
+        hits(&f) - before,
+        2,
+        "program registers rewritten with their values reuse the modules, one lookup each"
+    );
+    assert!(
+        stages
+            .iter()
+            .zip(&f.rasterizer.draw.stages)
+            .all(|(a, b)| a.as_ref().map(Arc::as_ptr) == b.as_ref().map(Arc::as_ptr))
+    );
 
     space
         .write_bytes(CPU_VA + u64::from(FRAGMENT), &fragment_program([4, 0]))
@@ -1540,6 +1551,147 @@ fn unchanged_programs_are_found_again_after_a_write_or_a_stage_register_change()
     let other = f.rasterizer.draw.stages[0].clone().unwrap();
     assert!(!Arc::ptr_eq(&vertex, &other));
     f.assert_no_validation_errors();
+}
+
+/// Over a random stream of program, register, texture header and handle changes, the stages a
+/// draw keeps from the last one are the stages a lookup that keeps nothing finds.
+#[test]
+fn kept_stages_are_the_stages_a_fresh_lookup_finds() {
+    const SAMPLING: u32 = 0x400;
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    write(&f, PROGRAMS + u64::from(SAMPLING), &sampling_program());
+    uniform_texture(&f, 0, TEXTURE, [255, 0, 0, 255]);
+    uniform_texture(&f, 1, OTHER_TEXTURE, [0, 255, 0, 255]);
+    let mut regs = sampling_regs();
+    let (const_buffers, root_tables) = (const_buffers(), [[0; 64]; 8]);
+    let stages = |f: &mut Fixture, regs: &Regs| {
+        let mut dirty = DirtyState::new();
+        let mut ctx = GraphicsContext {
+            channel: ChannelId(0),
+            memory: &gmmu,
+            regs,
+            dirty: &mut dirty,
+            const_buffers: &const_buffers,
+            root_tables: &root_tables,
+        };
+        let drawn =
+            f.rasterizer
+                .graphics_stages(&mut ctx, vk::PrimitiveTopology::TRIANGLE_LIST, false);
+        let stages = f
+            .rasterizer
+            .draw
+            .stages
+            .each_ref()
+            .map(|s| s.as_ref().map(Arc::as_ptr));
+        (drawn, stages)
+    };
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    let mut kept = 0;
+    for _ in 0..300 {
+        match next(5) {
+            0 => regs.pipelines[5].offset = [FRAGMENT, SAMPLING][next(2) as usize],
+            1 => regs.pipelines[5].register_count = next(3) as u32,
+            2 => {
+                regs.vertex_attrib_format[1] = match next(2) {
+                    0 => VertexAttribute(0),
+                    _ => VertexAttribute(VertexAttributeType::S_INT.0 << 27 | 0x4 << 21),
+                }
+            }
+            3 => {
+                let index = next(2);
+                let mut header = tic(
+                    GPU_VA + [TEXTURE, OTHER_TEXTURE][index as usize],
+                    SIZE,
+                    SIZE,
+                );
+                let component = [2, 4][next(2) as usize];
+                header[0] = header[0] & !(0o7777 << 7) | (component * 0o1111) << 7;
+                header[4] = (SIZE - 1) | [1, 5][next(2) as usize] << 23;
+                write(&f, TIC + index * 32, bytemuck::cast_slice(&header));
+            }
+            _ => write(&f, FRAGMENT_CBUF + 0x40, &(next(2) as u32).to_le_bytes()),
+        }
+        let translated = f.rasterizer.draw.shaders.stats().translated;
+        let found = stages(&mut f, &regs);
+        f.rasterizer.draw.stages_memo = None;
+        let fresh = stages(&mut f, &regs);
+        assert_eq!(found, fresh);
+        if f.rasterizer.draw.shaders.stats().translated == translated && found.0 {
+            kept += 1;
+        }
+    }
+    assert!(kept > 200, "{kept} draws found translated stages");
+    f.assert_no_validation_errors();
+}
+
+/// The back thread's cost of finding the stages of a redrawn sampling draw, after the guest
+/// rewrote its program registers with the values they held and with them untouched:
+/// `cargo test --release -p lichii-vulkan --lib stage_lookup_cost -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn stage_lookup_cost_of_a_redrawn_sampling_draw() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    use lichii_gpu::engines::maxwell_3d::dirty;
+
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(&f, PROGRAMS + u64::from(FRAGMENT), &sampling_program());
+    uniform_texture(&f, 0, TEXTURE, [255, 0, 0, 255]);
+    let regs = sampling_regs();
+    let (const_buffers, root_tables) = (const_buffers(), [[0; 64]; 8]);
+    let mut flags = DirtyState::new();
+    let mut lookup = |f: &mut Fixture, rewritten: bool| {
+        if rewritten {
+            flags.set(dirty::SHADERS);
+        }
+        let mut ctx = GraphicsContext {
+            channel: ChannelId(0),
+            memory: &gmmu,
+            regs: &regs,
+            dirty: &mut flags,
+            const_buffers: &const_buffers,
+            root_tables: &root_tables,
+        };
+        assert!(f.rasterizer.graphics_stages(
+            &mut ctx,
+            vk::PrimitiveTopology::TRIANGLE_LIST,
+            false
+        ));
+    };
+    lookup(&mut f, true);
+    const CALLS: u32 = 2000;
+    for (what, rewritten) in [("rewritten", true), ("untouched", false)] {
+        let mut times = Vec::new();
+        for _ in 0..101 {
+            let start = Instant::now();
+            for _ in 0..CALLS {
+                lookup(black_box(&mut f), rewritten);
+            }
+            times.push(start.elapsed() / CALLS);
+        }
+        times.sort();
+        eprintln!(
+            "stage lookup, program registers {what}: median {:?}, min {:?}",
+            times[times.len() / 2],
+            times[0]
+        );
+    }
 }
 
 /// The guest CPU rewrites a bound uniform buffer between draws: the next draw reads the new

@@ -200,24 +200,69 @@ impl TexturePool {
     /// The decoded header a raw handle selects. Handles past the pool and undecodable headers
     /// read as a plain 2D RGBA8 texture, which is what the null view bound for them samples.
     pub fn header(&self, gmmu: &Gmmu, raw: u32) -> TextureDescriptor {
+        self.entry(gmmu, raw)
+            .and_then(|entry| entry.decode().ok())
+            .unwrap_or(NULL_TEXTURE)
+    }
+
+    /// The entry a raw handle selects, `None` past the pool or where it is unmapped.
+    fn entry(&self, gmmu: &Gmmu, raw: u32) -> Option<TicEntry> {
         let (index, _) = self.split(raw);
-        if index <= self.limit
-            && let Ok(entry) = gmmu.read::<TicEntry>(self.address + u64::from(index) * 32)
-            && let Ok(desc) = entry.decode()
-        {
-            return desc;
+        if index > self.limit {
+            return None;
         }
-        NULL_TEXTURE
+        gmmu.read::<TicEntry>(self.address + u64::from(index) * 32)
+            .ok()
     }
 
     /// What the shader questions read of [`Self::header`].
     fn answers(&self, gmmu: &Gmmu, raw: u32) -> HeaderAnswers {
-        let desc = self.header(gmmu, raw);
-        HeaderAnswers {
-            ty: texture_type(&desc),
-            format: shader_pixel_format(desc.format),
-            integer: matches!(desc.format.numeric(), Numeric::Uint | Numeric::Sint),
+        header_answers(&self.header(gmmu, raw))
+    }
+}
+
+fn header_answers(desc: &TextureDescriptor) -> HeaderAnswers {
+    HeaderAnswers {
+        ty: texture_type(desc),
+        format: shader_pixel_format(desc.format),
+        integer: matches!(desc.format.numeric(), Numeric::Uint | Numeric::Sint),
+    }
+}
+
+/// What the shader questions read of the header `entry` decodes to.
+fn entry_answers(entry: TicEntry) -> HeaderAnswers {
+    header_answers(&entry.decode().unwrap_or(NULL_TEXTURE))
+}
+
+/// Slots of [`HeaderMemo`], a power of two.
+const MEMO_SLOTS: usize = 256;
+
+/// Header answers by the 32 bytes they were decoded from, kept across lookups, so a header the
+/// guest left as it was answers with a compare instead of a decode. The answers depend on the
+/// bytes alone, so a slot holds whichever entry last hashed to it.
+struct HeaderMemo {
+    slots: Box<[(TicEntry, HeaderAnswers); MEMO_SLOTS]>,
+}
+
+impl Default for HeaderMemo {
+    fn default() -> Self {
+        let empty = TicEntry::default();
+        Self {
+            slots: Box::new([(empty, entry_answers(empty)); MEMO_SLOTS]),
         }
+    }
+}
+
+impl HeaderMemo {
+    fn answers(&mut self, entry: TicEntry) -> HeaderAnswers {
+        let hash = entry.0.iter().fold(0u32, |h, &w| {
+            (h.rotate_left(5) ^ w).wrapping_mul(0x9e37_79b9)
+        });
+        let slot = &mut self.slots[(hash >> (32 - MEMO_SLOTS.trailing_zeros())) as usize];
+        if slot.0 != entry {
+            *slot = (entry, entry_answers(entry));
+        }
+        slot.1
     }
 }
 
@@ -241,10 +286,12 @@ enum TextureRef {
 const KNOWN_TEXTURES: usize = 16;
 
 /// What [`ProgramEnv::answer`] found for the textures one environment's questions named, so
-/// the type, format and integer questions about one texture read its handle and header once.
+/// the type, format and integer questions about one texture read its handle and header once,
+/// and the answers of the headers it decoded.
 pub struct TextureAnswers {
     known: [(TextureRef, HeaderAnswers); KNOWN_TEXTURES],
     len: usize,
+    headers: HeaderMemo,
 }
 
 impl Default for TextureAnswers {
@@ -257,11 +304,13 @@ impl Default for TextureAnswers {
         Self {
             known: [(TextureRef::Handle(0), unused); KNOWN_TEXTURES],
             len: 0,
+            headers: HeaderMemo::default(),
         }
     }
 }
 
 impl TextureAnswers {
+    /// Forgets the textures; the header answers stay, as they hold for the same bytes.
     pub fn clear(&mut self) {
         self.len = 0;
     }
@@ -726,7 +775,10 @@ impl<'a> ProgramEnv<'a> {
                     TextureRef::Handle(handle) => handle,
                     TextureRef::Words(source) => self.handle(source),
                 };
-                let answers = self.pool.answers(self.gmmu, handle);
+                let answers = match self.pool.entry(self.gmmu, handle) {
+                    Some(entry) => textures.headers.answers(entry),
+                    None => header_answers(&NULL_TEXTURE),
+                };
                 if let Some(slot) = textures.known.get_mut(textures.len) {
                     *slot = (texture, answers);
                     textures.len += 1;
@@ -1192,6 +1244,103 @@ mod tests {
         assert_eq!(env.answer(&read, &mut textures), 0, "kept until cleared");
         textures.clear();
         assert_eq!(env.answer(&read, &mut textures), 1);
+    }
+
+    /// Over a random stream of header rewrites, answers kept across lookups match a fresh decode
+    /// of every header, for more distinct headers than the kept answers have slots.
+    #[test]
+    fn kept_header_answers_match_a_fresh_decode_over_random_rewrites() {
+        const LIMIT: u32 = 63;
+        const TIC: GpuVAddr = GPU_VA + 0x1_0000;
+        let physical = Arc::new(PhysicalMemory::new(SIZE).unwrap());
+        physical.commit(0, SIZE).unwrap();
+        let memory = Arc::new(DeviceAddressSpace::new(physical, 36));
+        memory.map(DADDR, 0, SIZE);
+        let gmmu = Arc::new(Gmmu::new(memory, BigPageSize::Size64K));
+        gmmu.map(GPU_VA, DADDR, SIZE, 0, false).unwrap();
+        let const_buffers = [ConstBufferBinding {
+            address: CBUF,
+            size: 0x100,
+            enabled: true,
+        }];
+        let pool = TexturePool {
+            address: TIC,
+            limit: LIMIT,
+            via_header_index: false,
+            switch2: true,
+        };
+        let env = env(&gmmu, &const_buffers, pool);
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        fn random_header(next: &mut dyn FnMut() -> u64) -> TicEntry {
+            let pick = |n: u64, next: &mut dyn FnMut() -> u64| (next() % n) as u32;
+            let mut entry = tic(
+                [0x08, 0x24, 0x0f, 0x1d, 0x17, 0x2f, 0x43][pick(7, next) as usize],
+                pick(8, next),
+                pick(6, next),
+                pick(10, next),
+                pick(2, next) == 1,
+                pick(8, next),
+                2,
+            );
+            entry.0[1] = next() as u32;
+            if pick(8, next) == 0 {
+                entry.0 = std::array::from_fn(|_| next() as u32);
+            }
+            entry
+        }
+        let mut textures = TextureAnswers::default();
+        let mut seen = HashSet::new();
+        let ty = TextureType::Color2D;
+        let format = TexturePixelFormat::A8b8g8r8Unorm;
+        for _ in 0..20_000 {
+            let index = (next() % u64::from(LIMIT + 1)) as u32;
+            let entry = random_header(&mut next);
+            seen.insert(entry);
+            gmmu.write(TIC + u64::from(index) * 32, entry).unwrap();
+            textures.clear();
+            for handle in [index, (next() % u64::from(LIMIT + 8)) as u32] {
+                gmmu.write(CBUF, handle).unwrap();
+                let desc = pool.header(&gmmu, handle);
+                let expected = [
+                    texture_type(&desc) as u32,
+                    shader_pixel_format(desc.format) as u32,
+                    u32::from(matches!(
+                        desc.format.numeric(),
+                        Numeric::Uint | Numeric::Sint
+                    )),
+                ];
+                let source = HandleSource {
+                    cbuf_index: 0,
+                    cbuf_offset: 0,
+                    shift_left: 0,
+                    secondary: None,
+                };
+                textures.clear();
+                let asked = [
+                    env.answer(&EnvRead::Type(handle, ty), &mut textures),
+                    env.answer(&EnvRead::PixelFormat(handle, format), &mut textures),
+                    env.answer(&EnvRead::Integer(handle, false), &mut textures),
+                ];
+                assert_eq!(asked, expected, "handle {handle}");
+                textures.clear();
+                let asked = [
+                    env.answer(&EnvRead::TypeOf(source, ty), &mut textures),
+                    env.answer(&EnvRead::PixelFormatOf(source, format), &mut textures),
+                    env.answer(&EnvRead::IntegerOf(source, false), &mut textures),
+                ];
+                assert_eq!(
+                    asked, expected,
+                    "handle {handle} through the constant buffer"
+                );
+            }
+        }
+        assert!(seen.len() > 16 * MEMO_SLOTS, "{} headers", seen.len());
     }
 
     #[test]
