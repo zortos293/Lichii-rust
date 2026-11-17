@@ -75,6 +75,15 @@ impl EnvRead {
         }
     }
 
+    /// Whether it asks if a storage pointer is mapped: the questions a failure keeps, since a
+    /// pointer that was null when the program failed to translate may route once it is mapped.
+    pub fn is_storage_pointer(&self) -> bool {
+        matches!(
+            self,
+            EnvRead::StoragePointer { .. } | EnvRead::IndirectStoragePointer { .. }
+        )
+    }
+
     /// Whether both ask the same question, whatever their answers.
     pub fn same_question(&self, other: &EnvRead) -> bool {
         use EnvRead::*;

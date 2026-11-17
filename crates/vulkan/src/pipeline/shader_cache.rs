@@ -13,9 +13,10 @@
 //! holds: a page table lookup, the questions and three map lookups. It allocates nothing and
 //! takes no lock. Failed translations are cached too: their draws are skipped without translating again.
 //! A failure no texture header can have caused ([`TranslateError::depends_on_textures`]) is
-//! remembered without the reads that led to it, so a constant buffer word that changes from
-//! draw to draw (a per-material bindless handle) does not translate the failing program again
-//! on every draw; one that changes a jump table does not either. A failure a texture header may
+//! remembered with only its storage pointer questions, so a constant buffer word that changes
+//! from draw to draw (a per-material bindless handle) does not translate the failing program
+//! again on every draw; one that changes a jump table does not either. A Switch 2 pointer that
+//! was null when the program failed translates it again once it is mapped. A failure a texture header may
 //! have caused keeps its reads and translates again under other headers. Each key keeps at most
 //! [`MAX_VARIANTS`] variants.
 //!
@@ -484,7 +485,7 @@ impl ShaderCache {
             env.take_reads(),
         ];
         if wildcard {
-            reads = Default::default();
+            keep_failure_questions(&mut reads);
         }
         self.remember(key, reads, *bindings, module.clone());
         module.map(|module| (key, module))
@@ -760,6 +761,14 @@ fn hash_code(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// Drops the questions a failure no texture header caused is not remembered by: all but whether
+/// its storage pointers were mapped.
+pub(super) fn keep_failure_questions(reads: &mut [Vec<EnvRead>; 2]) {
+    reads
+        .iter_mut()
+        .for_each(|reads| reads.retain(EnvRead::is_storage_pointer));
+}
+
 pub(super) fn warn_failed(env: &ProgramEnv<'_>, error: &TranslateError) {
     let (stage, address) = (env.stage(), env.start_address());
     match error {
@@ -833,6 +842,32 @@ mod tests {
         assert_eq!(find(&variants, [31, 7]), (Some(31), 2));
         assert_eq!(find(&variants, [0, 7]), (Some(0), 2));
         assert_eq!(find(&variants, [5, 8]), (None, 2));
+    }
+
+    #[test]
+    fn a_failure_keeps_only_its_pointer_questions() {
+        let null = EnvRead::StoragePointer {
+            index: 0,
+            offset: 0x40,
+            mapped: false,
+        };
+        let mut failed = reads([1, 2]);
+        failed[1].push(null);
+        keep_failure_questions(&mut failed);
+        assert_eq!(failed, [Vec::new(), vec![null]]);
+
+        let mut variants = Variants::default();
+        variants.insert(failed, Bindings::default(), None);
+        let lookup = |mapped: u32| {
+            variants
+                .find(&mut Vec::new(), |_, read| {
+                    assert!(read.is_storage_pointer());
+                    mapped
+                })
+                .is_some()
+        };
+        assert!(lookup(0), "the failure is reused while the pointer is null");
+        assert!(!lookup(1), "a mapped pointer translates again");
     }
 
     #[test]
