@@ -178,8 +178,9 @@ struct Run {
 }
 
 /// Reused storage for [`shared_runs`] and [`trim_aliases`]: the target's segments by device
-/// address, the runs, the guest bytes already claimed, the bytes one run moves, the claims
-/// being merged and the trimmed runs, and the runs as `guest_bytes.comp` reads them.
+/// address when they come in another order, the runs, the guest bytes already claimed, the
+/// bytes one run moves, the claims being merged and the trimmed runs, and the runs as
+/// `guest_bytes.comp` reads them.
 #[derive(Default)]
 struct RunScratch {
     targets: Vec<Segment>,
@@ -191,20 +192,25 @@ struct RunScratch {
     words: Vec<[u32; 4]>,
 }
 
-/// Fills `scratch.runs`, by image offset, with where the bytes of `image` land in the
-/// guest bytes buffer, which holds the offsets `window` of `target`: one run per pair of
-/// their segments sharing device memory. False when two of the target's segments share device
-/// memory, which the search can't place.
+/// Fills `scratch.runs`, by image offset, with where the bytes of an image over `segments`
+/// land in the guest bytes buffer, which holds the offsets `window` of an image over `target`:
+/// one run per pair of their segments sharing device memory. False when two of the target's
+/// segments share device memory, which the search can't place.
 fn shared_runs(
-    image: &CachedImage,
-    target: &CachedImage,
+    segments: &[Segment],
+    target: &[Segment],
     window: (u64, u64),
     scratch: &mut RunScratch,
 ) -> bool {
     let RunScratch { targets, runs, .. } = scratch;
-    targets.clear();
-    targets.extend_from_slice(&target.segments);
-    targets.sort_unstable_by_key(|t| t.daddr);
+    let targets = if target.is_sorted_by_key(|t| t.daddr) {
+        target
+    } else {
+        targets.clear();
+        targets.extend_from_slice(target);
+        targets.sort_unstable_by_key(|t| t.daddr);
+        targets
+    };
     if targets
         .windows(2)
         .any(|t| t[0].daddr + t[0].size > t[1].daddr)
@@ -212,7 +218,7 @@ fn shared_runs(
         return false;
     }
     runs.clear();
-    for s in &image.segments {
+    for s in segments {
         let end = s.daddr + s.size;
         let first = targets.partition_point(|t| t.daddr + t.size <= s.daddr);
         for t in targets[first..].iter().take_while(|t| t.daddr < end) {
@@ -238,6 +244,21 @@ fn shared_runs(
 /// shader writes only the texel bytes of a row's last word; its other bytes count as moved so
 /// runs stay whole words.
 fn moved_bytes(info: &ImageInfo, levels: u32, lo: u64, hi: u64, out: &mut Vec<(u64, u64)>) {
+    let layers = match info.layout {
+        GuestLayout::BlockLinear { .. } => {
+            let chain = info.surface().level_offset(levels);
+            let stride = info.layer_stride;
+            let (first, last) = match stride {
+                0 if lo < chain => (0, u64::MAX),
+                0 => (0, 0),
+                _ if lo < chain => (0, hi.div_ceil(stride)),
+                _ => ((lo - chain) / stride + 1, hi.div_ceil(stride)),
+            };
+            let layers = u64::from(info.layers);
+            first.min(layers) as u32..last.min(layers) as u32
+        }
+        GuestLayout::Pitch { .. } => 0..info.layers,
+    };
     let mut push = |a: u64, b: u64| {
         let (a, b) = (a.max(lo), b.min(hi));
         if a >= b {
@@ -248,7 +269,7 @@ fn moved_bytes(info: &ImageInfo, levels: u32, lo: u64, hi: u64, out: &mut Vec<(u
             _ => out.push((a, b)),
         }
     };
-    for layer in 0..info.layers {
+    for layer in layers {
         for level in 0..levels {
             let start = info.subresource_offset(level, layer);
             if start >= hi || start + info.level_size(level) <= lo {
@@ -321,7 +342,8 @@ fn moved_bytes(info: &ImageInfo, levels: u32, lo: u64, hi: u64, out: &mut Vec<(u
 /// segments alias device memory land on the same guest bytes, the run with the highest image
 /// offset that moves a byte there keeps it, as when the runs were painted one after another in
 /// image order. `moved` pushes, in order, the image offsets in `[lo, hi)` the shader moves, so
-/// a run's padding claims nothing. Leaves the runs sorted by image offset.
+/// a run's padding claims nothing; it runs only when runs share guest bytes, and never for the
+/// first run, which no run is trimmed against. Takes and leaves the runs sorted by image offset.
 fn trim_aliases(scratch: &mut RunScratch, mut moved: impl FnMut(u64, u64, &mut Vec<(u64, u64)>)) {
     let RunScratch {
         runs,
@@ -331,9 +353,16 @@ fn trim_aliases(scratch: &mut RunScratch, mut moved: impl FnMut(u64, u64, &mut V
         trimmed,
         ..
     } = scratch;
+    debug_assert!(runs.is_sorted_by_key(|r| r.from));
+    trimmed.clear();
+    trimmed.extend_from_slice(runs);
+    trimmed.sort_unstable_by_key(|r| r.at);
+    if trimmed.windows(2).all(|r| r[0].at + r[0].size <= r[1].at) {
+        return;
+    }
     claimed.clear();
     trimmed.clear();
-    for run in runs.iter().rev() {
+    for (i, run) in runs.iter().enumerate().rev() {
         let (start, end) = (run.at, run.at + run.size);
         let first = claimed.partition_point(|c| c.1 <= start);
         let last = claimed.partition_point(|c| c.0 < end);
@@ -354,6 +383,9 @@ fn trim_aliases(scratch: &mut RunScratch, mut moved: impl FnMut(u64, u64, &mut V
                 size: end - at,
                 at,
             });
+        }
+        if i == 0 {
+            break;
         }
         moves.clear();
         moved(run.from, run.from + run.size, moves);
@@ -781,14 +813,14 @@ impl TextureCache {
         let scratch = &mut guest_sync.as_mut().expect("just created").scratch;
         let image = live(id);
         let whole = (0, image.info.size_bytes());
-        if !shared_runs(image, image, whole, scratch) {
+        if !shared_runs(&image.segments, &image.segments, whole, scratch) {
             return Ok(false);
         }
         let mut window = whole;
         if packing(image).is_some_and(|p| !p.stencil()) {
             window = (u64::MAX, 0);
             for &o in newer.iter() {
-                if !shared_runs(live(o), image, whole, scratch) {
+                if !shared_runs(&live(o).segments, &image.segments, whole, scratch) {
                     return Ok(false);
                 }
                 for r in &scratch.runs {
@@ -889,7 +921,7 @@ impl TextureCache {
                 .expect("a live image id");
             let info = image.info;
             let levels = info.levels.min(image.image.desc().mip_levels);
-            let placed = shared_runs(image, target, window, &mut sync.scratch);
+            let placed = shared_runs(&image.segments, &target.segments, window, &mut sync.scratch);
             debug_assert!(placed, "checked by sync_on_gpu");
             run_words(&mut sync.scratch, direction, |lo, hi, out| {
                 moved_bytes(&info, levels, lo, hi, out)
@@ -1377,6 +1409,664 @@ mod tests {
                 moved_bytes(&info, info.levels, lo as u64, hi as u64, &mut out);
                 assert_eq!(out, expected, "{info:?} over {lo}..{hi}");
             }
+        }
+    }
+
+    /// The run planning before it skipped trimming runs that share no guest bytes and the
+    /// layers a range misses: the output the planning must keep, and the baseline it is
+    /// timed against.
+    mod reference {
+        use super::super::{Direction, ImageInfo, Run, RunScratch, Segment};
+
+        pub(super) fn shared_runs(
+            image: &[Segment],
+            target: &[Segment],
+            window: (u64, u64),
+            scratch: &mut RunScratch,
+        ) -> bool {
+            let RunScratch { targets, runs, .. } = scratch;
+            targets.clear();
+            targets.extend_from_slice(target);
+            targets.sort_unstable_by_key(|t| t.daddr);
+            if targets
+                .windows(2)
+                .any(|t| t[0].daddr + t[0].size > t[1].daddr)
+            {
+                return false;
+            }
+            runs.clear();
+            for s in image {
+                let end = s.daddr + s.size;
+                let first = targets.partition_point(|t| t.daddr + t.size <= s.daddr);
+                for t in targets[first..].iter().take_while(|t| t.daddr < end) {
+                    let (lo, hi) = (s.daddr.max(t.daddr), end.min(t.daddr + t.size));
+                    let offset = t.offset + (lo - t.daddr);
+                    let (from, to) = (offset.max(window.0), (offset + (hi - lo)).min(window.1));
+                    if from < to {
+                        runs.push(Run {
+                            from: s.offset + (lo - s.daddr) + (from - offset),
+                            size: to - from,
+                            at: from - window.0,
+                        });
+                    }
+                }
+            }
+            runs.sort_unstable_by_key(|r| r.from);
+            true
+        }
+
+        pub(super) fn moved_bytes(
+            info: &ImageInfo,
+            levels: u32,
+            lo: u64,
+            hi: u64,
+            out: &mut Vec<(u64, u64)>,
+        ) {
+            let mut push = |a: u64, b: u64| {
+                let (a, b) = (a.max(lo), b.min(hi));
+                if a >= b {
+                    return;
+                }
+                match out.last_mut() {
+                    Some(last) if last.1 == a => last.1 = b,
+                    _ => out.push((a, b)),
+                }
+            };
+            for layer in 0..info.layers {
+                for level in 0..levels {
+                    let start = info.subresource_offset(level, layer);
+                    if start >= hi || start + info.level_size(level) <= lo {
+                        continue;
+                    }
+                    let tiling = info.surface().level_tiling(level);
+                    let (w, h, d) = info.level_extent(level);
+                    let row_bytes = (w * tiling.bytes_per_block).next_multiple_of(4);
+                    let (bh, bd) = (tiling.block_height_log2, tiling.block_depth_log2);
+                    let column = 1u64 << (9 + bh + bd);
+                    let block_bytes = u64::from(tiling.row_gobs) * column;
+                    let (full_cols, cols) = (row_bytes / 64, row_bytes.div_ceil(64));
+                    let (full_rows, rows) = (h / 8, h.div_ceil(8));
+                    let blocks = u64::from(rows.div_ceil(1 << bh));
+                    let slab = blocks * block_bytes;
+                    let first_slab = (lo.saturating_sub(start) / slab) as u32;
+                    for z0 in (first_slab << bd..d).step_by(1 << bd) {
+                        let slab_start = start + u64::from(z0 >> bd) * slab;
+                        if slab_start >= hi {
+                            break;
+                        }
+                        let slices = (d - z0).min(1 << bd);
+                        let dense = full_cols == tiling.row_gobs && slices == 1 << bd;
+                        for block in lo.saturating_sub(slab_start) / block_bytes..blocks {
+                            let row = slab_start + block * block_bytes;
+                            if row >= hi {
+                                break;
+                            }
+                            let gob_y = (block as u32) << bh;
+                            if dense && gob_y + (1 << bh) <= full_rows {
+                                push(row, row + block_bytes);
+                                continue;
+                            }
+                            for c in 0..cols {
+                                let base = row + u64::from(c) * column;
+                                if base >= hi {
+                                    break;
+                                }
+                                for z in 0..slices {
+                                    for g in gob_y..(gob_y + (1 << bh)).min(rows) {
+                                        let gob = base
+                                            + (((u64::from(z) << bh) + u64::from(g - gob_y)) << 9);
+                                        if c < full_cols && g < full_rows {
+                                            push(gob, gob + 512);
+                                            continue;
+                                        }
+                                        let mut words = 0u128;
+                                        for y in g * 8..(g * 8 + 8).min(h) {
+                                            for x in
+                                                (c * 64..(c * 64 + 64).min(row_bytes)).step_by(4)
+                                            {
+                                                let at = start + tiling.offset(x, y, z0 + z) as u64
+                                                    - gob;
+                                                words |= 1 << (at / 4);
+                                            }
+                                        }
+                                        while words != 0 {
+                                            let bit = words.trailing_zeros();
+                                            let len = (words >> bit).trailing_ones();
+                                            push(
+                                                gob + u64::from(bit) * 4,
+                                                gob + u64::from(bit + len) * 4,
+                                            );
+                                            words &= !(u128::MAX >> (128 - len) << bit);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        fn trim_aliases(
+            scratch: &mut RunScratch,
+            mut moved: impl FnMut(u64, u64, &mut Vec<(u64, u64)>),
+        ) {
+            let RunScratch {
+                runs,
+                claimed,
+                moved: moves,
+                merged,
+                trimmed,
+                ..
+            } = scratch;
+            claimed.clear();
+            trimmed.clear();
+            for run in runs.iter().rev() {
+                let (start, end) = (run.at, run.at + run.size);
+                let first = claimed.partition_point(|c| c.1 <= start);
+                let last = claimed.partition_point(|c| c.0 < end);
+                let mut at = start;
+                for &(lo, hi) in &claimed[first..last] {
+                    if lo > at {
+                        trimmed.push(Run {
+                            from: run.from + (at - start),
+                            size: lo - at,
+                            at,
+                        });
+                    }
+                    at = at.max(hi);
+                }
+                if at < end {
+                    trimmed.push(Run {
+                        from: run.from + (at - start),
+                        size: end - at,
+                        at,
+                    });
+                }
+                moves.clear();
+                moved(run.from, run.from + run.size, moves);
+                if moves.is_empty() {
+                    continue;
+                }
+                merged.clear();
+                let mut next = moves
+                    .iter()
+                    .map(|&(lo, hi)| (lo - run.from + start, hi - run.from + start))
+                    .peekable();
+                let mut i = 0;
+                loop {
+                    let item = match (claimed.get(i), next.peek()) {
+                        (Some(&c), Some(&m)) if c.0 <= m.0 => {
+                            i += 1;
+                            c
+                        }
+                        (_, Some(&m)) => {
+                            next.next();
+                            m
+                        }
+                        (Some(&c), None) => {
+                            i += 1;
+                            c
+                        }
+                        (None, None) => break,
+                    };
+                    match merged.last_mut() {
+                        Some(last) if item.0 <= last.1 => last.1 = last.1.max(item.1),
+                        _ => merged.push(item),
+                    }
+                }
+                std::mem::swap(claimed, merged);
+            }
+            trimmed.sort_unstable_by_key(|r| r.from);
+            std::mem::swap(runs, trimmed);
+        }
+
+        pub(super) fn run_words(
+            scratch: &mut RunScratch,
+            direction: Direction,
+            moved: impl FnMut(u64, u64, &mut Vec<(u64, u64)>),
+        ) {
+            if direction == Direction::ToGuest {
+                trim_aliases(scratch, moved);
+            }
+            scratch.words.clear();
+            scratch.words.extend(
+                scratch
+                    .runs
+                    .iter()
+                    .map(|r| [r.from as u32, r.size as u32, r.at as u32, 0]),
+            );
+        }
+    }
+
+    /// One way to plan a paint: [`shared_runs`] then [`run_words`], counting the calls of
+    /// [`moved_bytes`] into `calls`.
+    trait Planning {
+        fn plan(
+            image: &Layout,
+            target: &Layout,
+            window: (u64, u64),
+            direction: Direction,
+            scratch: &mut RunScratch,
+            calls: &mut u32,
+        ) -> bool;
+    }
+
+    struct Current;
+    struct Reference;
+
+    impl Planning for Current {
+        fn plan(
+            image: &Layout,
+            target: &Layout,
+            window: (u64, u64),
+            direction: Direction,
+            scratch: &mut RunScratch,
+            calls: &mut u32,
+        ) -> bool {
+            if !shared_runs(&image.segments, &target.segments, window, scratch) {
+                return false;
+            }
+            let info = &image.info;
+            run_words(scratch, direction, |lo, hi, out| {
+                *calls += 1;
+                moved_bytes(info, info.levels, lo, hi, out)
+            });
+            true
+        }
+    }
+
+    impl Planning for Reference {
+        fn plan(
+            image: &Layout,
+            target: &Layout,
+            window: (u64, u64),
+            direction: Direction,
+            scratch: &mut RunScratch,
+            calls: &mut u32,
+        ) -> bool {
+            if !reference::shared_runs(&image.segments, &target.segments, window, scratch) {
+                return false;
+            }
+            let info = &image.info;
+            reference::run_words(scratch, direction, |lo, hi, out| {
+                *calls += 1;
+                reference::moved_bytes(info, info.levels, lo, hi, out)
+            });
+            true
+        }
+    }
+
+    struct Layout {
+        info: ImageInfo,
+        segments: Vec<Segment>,
+    }
+
+    /// How an image's 64 KiB pages map device memory.
+    #[derive(Clone, Copy, Debug)]
+    enum Memory {
+        Contiguous,
+        /// Every pair of pages swapped, so the segments are out of device order.
+        Swapped,
+        /// Every pair of pages on the first one's device page.
+        Mirrored,
+    }
+
+    const PAGE: u64 = 64 << 10;
+    const DEVICE: u64 = 0x4000_0000;
+
+    /// The segments of an image over the `size` bytes at `offset` of a mapping of `memory`.
+    fn mapped(offset: u64, size: u64, memory: Memory) -> Vec<Segment> {
+        let page = |i: u64| match memory {
+            Memory::Contiguous => i,
+            Memory::Swapped => i ^ 1,
+            Memory::Mirrored => i & !1,
+        };
+        let mut out: Vec<Segment> = Vec::new();
+        let mut at = offset;
+        while at < offset + size {
+            let end = (at / PAGE + 1) * PAGE;
+            let end = end.min(offset + size);
+            let daddr = DEVICE + page(at / PAGE) * PAGE + at % PAGE;
+            match out.last_mut() {
+                Some(s) if s.daddr + s.size == daddr => s.size += end - at,
+                _ => out.push(Segment {
+                    offset: at - offset,
+                    daddr,
+                    size: end - at,
+                }),
+            }
+            at = end;
+        }
+        out
+    }
+
+    fn layout(info: ImageInfo, offset: u64, memory: Memory) -> Layout {
+        Layout {
+            info,
+            segments: mapped(offset, info.size_bytes(), memory),
+        }
+    }
+
+    /// A GPU sync of `image` from `newer`, painted in that order.
+    struct Sync {
+        image: Layout,
+        newer: Vec<Layout>,
+        window: (u64, u64),
+    }
+
+    impl Sync {
+        /// The window as [`TextureCache::sync_on_gpu`] picks it: every byte of an image with
+        /// stencil, else the bytes the newer images share with it.
+        fn new(image: Layout, newer: Vec<Layout>, stencil: bool) -> Self {
+            let whole = (0, image.info.size_bytes());
+            let mut window = whole;
+            if !stencil {
+                let mut scratch = RunScratch::default();
+                window = (u64::MAX, 0);
+                for o in &newer {
+                    assert!(reference::shared_runs(
+                        &o.segments,
+                        &image.segments,
+                        whole,
+                        &mut scratch
+                    ));
+                    for r in &scratch.runs {
+                        window = (window.0.min(r.at), window.1.max(r.at + r.size));
+                    }
+                }
+            }
+            assert!(window.0 < window.1);
+            Self {
+                image,
+                newer,
+                window,
+            }
+        }
+
+        fn paints(&self) -> impl Iterator<Item = (&Layout, Direction)> {
+            std::iter::once((&self.image, Direction::ToGuest))
+                .chain(self.newer.iter().map(|o| (o, Direction::ToGuest)))
+                .chain(std::iter::once((&self.image, Direction::FromGuest)))
+        }
+
+        /// Plans every paint of the sync with `P`, returning how often it called
+        /// [`moved_bytes`].
+        fn plan<P: Planning>(&self, scratch: &mut RunScratch) -> u32 {
+            let mut calls = 0;
+            for (image, direction) in self.paints() {
+                let placed = P::plan(
+                    image,
+                    &self.image,
+                    self.window,
+                    direction,
+                    scratch,
+                    &mut calls,
+                );
+                assert!(placed);
+                std::hint::black_box(&scratch.words);
+            }
+            calls
+        }
+    }
+
+    /// A 128x128 B10G11R11Float cube or cube array of 8 levels in Switch 2 GOBs, block height
+    /// 16, as Donkey Kong Bananza syncs them.
+    fn dkb_cube(layers: u32) -> ImageInfo {
+        let info = block_linear_info(
+            PixelFormat::B10G11R11Float,
+            (128, 128),
+            8,
+            layers,
+            4,
+            GobLayout::Switch2,
+        );
+        assert_eq!(info.layer_stride, 0x16000);
+        info
+    }
+
+    /// The cube and the padded 16-texel-wide targets its mip tail is rendered to: `level`
+    /// of `layer` for each pair of `tails`.
+    fn dkb_sync(layers: u32, tails: &[(u32, u32)], memory: Memory) -> Sync {
+        let cube = dkb_cube(layers);
+        let newer = tails
+            .iter()
+            .map(|&(level, layer)| {
+                let target = block_linear_info(
+                    PixelFormat::B10G11R11Float,
+                    (16, 8 >> (level - 4)),
+                    1,
+                    1,
+                    0,
+                    GobLayout::Switch2,
+                );
+                layout(target, cube.subresource_offset(level, layer), memory)
+            })
+            .collect();
+        Sync::new(layout(cube, 0, memory), newer, false)
+    }
+
+    const CUBE_TAILS: [(u32, u32); 4] = [(4, 1), (5, 2), (6, 3), (7, 4)];
+    const ARRAY_TAILS: [(u32, u32); 4] = [(4, 5), (5, 10), (6, 15), (7, 20)];
+
+    fn odd_syncs() -> Vec<Sync> {
+        let mut syncs = Vec::new();
+        for memory in [Memory::Contiguous, Memory::Swapped] {
+            for layers in [6, 24] {
+                syncs.push(dkb_sync(
+                    layers,
+                    if layers == 6 {
+                        &CUBE_TAILS
+                    } else {
+                        &ARRAY_TAILS
+                    },
+                    memory,
+                ));
+            }
+            let mut tail = dkb_sync(24, &[(4, 3), (5, 3), (6, 3), (7, 3)], memory);
+            let wide = block_linear_info(
+                PixelFormat::A8B8G8R8Unorm,
+                (128, 512),
+                1,
+                1,
+                4,
+                GobLayout::Switch2,
+            );
+            tail.newer.push(layout(wide, 0x4_0000, Memory::Mirrored));
+            syncs.push(Sync::new(tail.image, tail.newer, false));
+            let mut volume = block_linear_info(
+                PixelFormat::R16G16B16A16Float,
+                (56, 32),
+                2,
+                1,
+                0,
+                GobLayout::Switch2,
+            );
+            volume.kind = ImageKind::D3;
+            volume.depth = 40;
+            volume.layout = GuestLayout::BlockLinear {
+                block_height_log2: 0,
+                block_depth_log2: 4,
+                tile_width_spacing: 0,
+                gob: GobLayout::Switch2,
+            };
+            volume.layer_stride = volume.surface().layer_stride();
+            let slice = block_linear_info(
+                PixelFormat::A8B8G8R8Unorm,
+                (64, 64),
+                1,
+                1,
+                2,
+                GobLayout::Tegra,
+            );
+            let mut pitch = block_linear_info(
+                PixelFormat::A8B8G8R8Unorm,
+                (60, 100),
+                1,
+                1,
+                0,
+                GobLayout::Tegra,
+            );
+            pitch.layout = GuestLayout::Pitch { pitch: 256 };
+            syncs.push(Sync::new(
+                layout(volume, 0, memory),
+                vec![
+                    layout(slice, 0x1_0200, memory),
+                    layout(pitch, 0x2_8000, memory),
+                    layout(slice, 0x1_0200, Memory::Mirrored),
+                ],
+                false,
+            ));
+            let depth = block_linear_info(
+                PixelFormat::D24UnormS8Uint,
+                (300, 200),
+                3,
+                2,
+                3,
+                GobLayout::Tegra,
+            );
+            syncs.push(Sync::new(
+                layout(depth, 0, memory),
+                vec![
+                    layout(depth, 0x8000, Memory::Mirrored),
+                    layout(slice, 0x1_0000, memory),
+                ],
+                true,
+            ));
+        }
+        syncs
+    }
+
+    #[test]
+    fn planning_matches_the_reference() {
+        let mut trimmed = 0;
+        for (i, sync) in odd_syncs().iter().enumerate() {
+            let (mut ours, mut theirs) = (RunScratch::default(), RunScratch::default());
+            for (image, direction) in sync.paints() {
+                let (mut a, mut b) = (0, 0);
+                let placed = Current::plan(
+                    image,
+                    &sync.image,
+                    sync.window,
+                    direction,
+                    &mut ours,
+                    &mut a,
+                );
+                let expected = Reference::plan(
+                    image,
+                    &sync.image,
+                    sync.window,
+                    direction,
+                    &mut theirs,
+                    &mut b,
+                );
+                assert_eq!(placed, expected, "sync {i}");
+                assert_eq!(ours.runs, theirs.runs, "sync {i}: {:?}", image.info);
+                assert_eq!(ours.words, theirs.words, "sync {i}: {:?}", image.info);
+                let mut untrimmed = RunScratch::default();
+                reference::shared_runs(
+                    &image.segments,
+                    &sync.image.segments,
+                    sync.window,
+                    &mut untrimmed,
+                );
+                trimmed += usize::from(untrimmed.runs != theirs.runs);
+            }
+            for image in std::iter::once(&sync.image).chain(&sync.newer) {
+                let info = &image.info;
+                let size = info.size_bytes();
+                let mut ranges = vec![(0, size), (1, size - 1), (513, 515), (size / 3, size)];
+                ranges.extend((0..64).map(|k| {
+                    let lo = (k * 0x9e37_79b9) % size;
+                    (lo, (lo + (k + 1) * 0x777).min(size))
+                }));
+                for (lo, hi) in ranges {
+                    let (mut ours, mut theirs) = (Vec::new(), Vec::new());
+                    moved_bytes(info, info.levels, lo, hi, &mut ours);
+                    reference::moved_bytes(info, info.levels, lo, hi, &mut theirs);
+                    assert_eq!(ours, theirs, "sync {i}: {info:?} over {lo}..{hi}");
+                }
+            }
+        }
+        assert!(trimmed > 0, "some paint trims aliased runs");
+    }
+
+    /// Median nanoseconds of `batch` calls of `f` over 101 samples.
+    fn median_ns(batch: u32, mut f: impl FnMut()) -> f64 {
+        let mut samples: Vec<f64> = (0..101)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                for _ in 0..batch {
+                    f();
+                }
+                start.elapsed().as_nanos() as f64 / f64::from(batch)
+            })
+            .collect();
+        samples.sort_by(f64::total_cmp);
+        samples[50]
+    }
+
+    /// Times the run planning of one GPU sync of the Donkey Kong Bananza cubes from four mip
+    /// tail targets: `cargo test --release -p lichii-vulkan --lib planning_timing -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore = "timing"]
+    fn planning_timing() {
+        let mut syncs = Vec::new();
+        for memory in [Memory::Contiguous, Memory::Swapped] {
+            for (layers, tails) in [(6, &CUBE_TAILS), (24, &ARRAY_TAILS)] {
+                syncs.push((
+                    format!("{layers:2} layers, {memory:?}"),
+                    dkb_sync(layers, tails, memory),
+                ));
+            }
+        }
+        let aliased = dkb_sync(24, &ARRAY_TAILS, Memory::Contiguous);
+        let wide = block_linear_info(
+            PixelFormat::B10G11R11Float,
+            (128, 512),
+            1,
+            1,
+            4,
+            GobLayout::Switch2,
+        );
+        let mut newer = aliased.newer;
+        newer.push(layout(wide, 0x10_0000, Memory::Mirrored));
+        syncs.push((
+            "24 layers, Contiguous, and a mirrored 128x512 overlap".into(),
+            Sync::new(aliased.image, newer, false),
+        ));
+        for (name, sync) in syncs {
+            let mut scratch = RunScratch::default();
+            let calls = (
+                sync.plan::<Reference>(&mut scratch),
+                sync.plan::<Current>(&mut scratch),
+            );
+            let runs: Vec<usize> = sync
+                .paints()
+                .map(|(image, direction)| {
+                    Current::plan(
+                        image,
+                        &sync.image,
+                        sync.window,
+                        direction,
+                        &mut scratch,
+                        &mut 0,
+                    );
+                    scratch.runs.len()
+                })
+                .collect();
+            let reference = median_ns(20, || {
+                sync.plan::<Reference>(&mut scratch);
+            });
+            let current = median_ns(200, || {
+                sync.plan::<Current>(&mut scratch);
+            });
+            println!(
+                "{name}: window {:#x}..{:#x}, runs per paint {runs:?}, \
+                     moved_bytes calls {} -> {}, per sync {reference:.0} ns -> {current:.0} ns",
+                sync.window.0, sync.window.1, calls.0, calls.1
+            );
         }
     }
 }
