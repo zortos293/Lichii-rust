@@ -205,6 +205,11 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
+    fn new(raw: vk::Pipeline, layout: Arc<PipelineLayout>) -> Self {
+        layout.device.pipelines.fetch_add(1, Ordering::Relaxed);
+        Self { raw, layout }
+    }
+
     pub fn raw(&self) -> vk::Pipeline {
         self.raw
     }
@@ -218,6 +223,7 @@ impl Drop for Pipeline {
     fn drop(&mut self) {
         // SAFETY: the cache drops pipelines only after the device went idle.
         unsafe { self.layout.device.raw.destroy_pipeline(self.raw, None) };
+        self.layout.device.pipelines.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -376,7 +382,7 @@ impl Context {
         match result {
             Ok((raw, _)) if library => {
                 self.shared.libraries.fetch_add(1, Ordering::Relaxed);
-                Some(Pipeline { raw, layout })
+                Some(Pipeline::new(raw, layout))
             }
             Ok((raw, cache_hit)) => {
                 self.shared.built.fetch_add(1, Ordering::Relaxed);
@@ -385,7 +391,7 @@ impl Context {
                 } else {
                     self.shared.compiled.fetch_add(1, Ordering::Relaxed);
                 }
-                Some(Pipeline { raw, layout })
+                Some(Pipeline::new(raw, layout))
             }
             Err(error) => {
                 self.shared.failed.fetch_add(1, Ordering::Relaxed);
@@ -696,10 +702,7 @@ impl Context {
                 .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
         };
         let raw = pipelines.map_err(|(_, result)| format!("linking a pipeline: {result}"))?[0];
-        Ok(Pipeline {
-            raw,
-            layout: layout.clone(),
-        })
+        Ok(Pipeline::new(raw, layout.clone()))
     }
 
     fn build_compute(
@@ -2313,6 +2316,11 @@ mod tests {
             );
             let stats = cache.stats();
             assert_eq!((stats.libraries, stats.fast_linked), (5, 1));
+            assert_eq!(
+                device.pipelines(),
+                stats.built + stats.libraries + 1,
+                "the fast-linked pipeline is live"
+            );
             let texels = draw(
                 &device,
                 &features,
@@ -2335,6 +2343,12 @@ mod tests {
         assert_ne!(built, fast, "the built pipeline replaces the linked one");
         assert_eq!(cache.replaced().count(), 1);
         assert_eq!(cache.stats().built, 2);
+        let stats = cache.stats();
+        assert_eq!(
+            device.pipelines(),
+            stats.built + stats.libraries,
+            "the replaced fast-linked pipeline was destroyed"
+        );
         assert_eq!(device.instance().validation_errors(), 0);
     }
 

@@ -9,6 +9,7 @@ use lichii_texture::tic::{TextureType, TicEntry};
 use lichii_texture::{Compression, astc, bcn, etc};
 
 use super::*;
+use crate::host_budget::RING_OVERSIZED_CAP;
 use crate::{Instance, SurfaceSupport};
 
 const DRAM: u64 = 64 << 20;
@@ -58,7 +59,7 @@ fn fixture_with_dram(
     let lazy = Arc::new(lichii_gpu::lazy::LazyDeviceRanges::new(memory.clone()));
     Some(Fixture {
         scheduler: Scheduler::new(&device).unwrap(),
-        staging: StagingRing::new(&device, 32 << 20).unwrap(),
+        staging: StagingRing::new(&device, 32 << 20, RING_OVERSIZED_CAP).unwrap(),
         buffers: BufferCache::new(&device, memory.clone(), written.clone(), lazy.clone()).unwrap(),
         cache: TextureCache::new(&device, written, lazy, gob, recompression),
         device,

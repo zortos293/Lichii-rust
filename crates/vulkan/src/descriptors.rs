@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use ash::vk;
 
@@ -105,17 +106,22 @@ fn create_pool(device: &Device) -> Result<vk::DescriptorPool> {
         .max_sets(SETS_PER_POOL)
         .pool_sizes(&POOL_SIZES);
     // SAFETY: valid create info.
-    unsafe {
+    let pool = unsafe {
         device
             .raw
             .create_descriptor_pool(&info, None)
-            .call("vkCreateDescriptorPool")
-    }
+            .call("vkCreateDescriptorPool")?
+    };
+    device.descriptor_pools.fetch_add(1, Ordering::Relaxed);
+    Ok(pool)
 }
 
 impl Drop for DescriptorAllocator {
     fn drop(&mut self) {
         self.device.wait_idle();
+        self.device
+            .descriptor_pools
+            .fetch_sub(1 + self.retired.len() as u64, Ordering::Relaxed);
         // SAFETY: the device is idle, so no pending work uses these pools' sets.
         unsafe {
             self.device.raw.destroy_descriptor_pool(self.current, None);

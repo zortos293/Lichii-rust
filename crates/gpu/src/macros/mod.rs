@@ -590,7 +590,9 @@ impl MacroEngine {
         let mut copy = MacroEngine::new(MacroIsa::Mme64);
         copy.code = Code::Mme64(code.clone());
         copy.code_generation = self.code_generation;
+        copy.memo = MacroMemo::new(0);
         copy.memo_enabled = false;
+        copy.record = CallRecord::with_capacity(0);
         copy.step_limit = self.step_limit;
         Some(copy)
     }
@@ -730,6 +732,16 @@ impl MacroEngine {
     /// Instructions a call may run before it fails (default [`DEFAULT_STEP_LIMIT`]).
     pub fn set_step_limit(&mut self, steps: u32) {
         self.step_limit = steps;
+    }
+
+    /// Heap bytes the memo and the call record hold.
+    #[cfg(test)]
+    pub(crate) fn memo_bytes(&self) -> usize {
+        self.memo.reserved_bytes()
+            + (self.record.writes.capacity()
+                + self.record.data_ram_reads.capacity()
+                + self.record.data_ram_writes.capacity())
+                * size_of::<u32>()
     }
 
     /// Call and memo counters.

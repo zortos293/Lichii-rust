@@ -192,10 +192,6 @@ fn new_shared_memory(context: &ServiceContext, size: u64) -> HleResult<Arc<Share
         MemoryPermission::NONE,
         MemoryPermission::READ,
     )?;
-    let zero = [0u8; 0x1000];
-    for offset in (0..memory.size()).step_by(zero.len()) {
-        memory.write(offset, &zero);
-    }
     Ok(Arc::new(memory))
 }
 
