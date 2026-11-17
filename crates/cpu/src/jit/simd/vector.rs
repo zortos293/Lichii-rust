@@ -87,6 +87,13 @@ pub enum Binary {
     Rhadd(bool),
     /// `|a - b|`, signed or unsigned.
     Abd(bool),
+    /// `SMAXP`, `SMINP`, `UMAXP` or `UMINP`: the larger (or, unless `max`, the smaller) of
+    /// each adjacent lane pair, signed or unsigned, those of `a` in the low half and those of `b`
+    /// in the high half.
+    MinMaxP {
+        max: bool,
+        signed: bool,
+    },
 }
 
 /// The bitwise selects, each `base ^ ((n ^ base) & mask)` on the destination's old value `old`.
@@ -373,7 +380,9 @@ fn supported(t: &Translator, op: Binary, size: u8) -> bool {
         Binary::CmTst => size < 3 || t.sse41,
         Binary::Hadd(_) | Binary::Rhadd(true) => size == 1 || size == 2,
         Binary::Rhadd(false) => size < 3,
-        Binary::Abd(signed) => supported(t, if signed { Binary::SMax } else { Binary::UMax }, size),
+        Binary::Abd(signed) | Binary::MinMaxP { signed, .. } => {
+            supported(t, if signed { Binary::SMax } else { Binary::UMax }, size)
+        }
     }
 }
 
@@ -568,6 +577,14 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
             (0b00000, _, _) => Binary::Hadd(!u),
             (0b00010, _, _) => Binary::Rhadd(!u),
             (0b01110, _, _) => Binary::Abd(!u),
+            (0b10100, _, _) => Binary::MinMaxP {
+                max: true,
+                signed: !u,
+            },
+            (0b10101, _, _) => Binary::MinMaxP {
+                max: false,
+                signed: !u,
+            },
             _ => return false,
         };
         if opcode != 0b00011 && ((size == 3 && !q) || !supported(t, op, size)) {
@@ -1410,6 +1427,66 @@ impl Emitter<'_> {
         }
     }
 
+    /// `d` = `op` of the even and odd lanes of `8 << size` bits of `a` followed by `b`, so each lane
+    /// pair of `a` lands in the low half and each of `b` in the high half. Without `q`, only the low
+    /// halves of `a` and `b` count and the high half of `d` is left undefined. Clobbers `xmm15`.
+    fn min_max_pairs(&mut self, op: Sse, size: u8, q: bool, d: u8, a: u8, b: u8) {
+        let (a, b) = if q {
+            (a, b)
+        } else {
+            let x = self.temp();
+            self.copy(x, a);
+            dynasm!(self.asm ; .arch x64 ; punpcklqdq Rx(x), Rx(b));
+            (x, x)
+        };
+        match size {
+            0 => {
+                let t = self.temp();
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; pcmpeqw Rx(t), Rx(t)
+                    ; psrlw Rx(t), 8
+                    ; movdqa Rx(d), Rx(a)
+                    ; pand Rx(d), Rx(t)
+                    ; movdqa Rx(SCRATCH), Rx(b)
+                    ; pand Rx(SCRATCH), Rx(t)
+                    ; packuswb Rx(d), Rx(SCRATCH)
+                    ; movdqa Rx(SCRATCH), Rx(a)
+                    ; psrlw Rx(SCRATCH), 8
+                    ; movdqa Rx(t), Rx(b)
+                    ; psrlw Rx(t), 8
+                    ; packuswb Rx(SCRATCH), Rx(t)
+                );
+            }
+            1 => {
+                let t = self.temp();
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; movdqa Rx(d), Rx(a)
+                    ; pslld Rx(d), 16
+                    ; psrad Rx(d), 16
+                    ; movdqa Rx(SCRATCH), Rx(b)
+                    ; pslld Rx(SCRATCH), 16
+                    ; psrad Rx(SCRATCH), 16
+                    ; packssdw Rx(d), Rx(SCRATCH)
+                    ; movdqa Rx(SCRATCH), Rx(a)
+                    ; psrad Rx(SCRATCH), 16
+                    ; movdqa Rx(t), Rx(b)
+                    ; psrad Rx(t), 16
+                    ; packssdw Rx(SCRATCH), Rx(t)
+                );
+            }
+            _ => dynasm!(self.asm
+                ; .arch x64
+                ; movdqa Rx(d), Rx(a)
+                ; shufps Rx(d), Rx(b), 0x88_u8 as i8
+                ; movdqa Rx(SCRATCH), Rx(a)
+                ; shufps Rx(SCRATCH), Rx(b), 0xdd_u8 as i8
+            ),
+        }
+        self.sse(op, size, d, SCRATCH);
+    }
+
     /// `SQADD`, `UQADD`, `SQSUB` or `UQSUB` (by `word`) on B or H lanes, setting FPSR.QC when
     /// any lane of the arrangement saturated, that is when the wrapping result differs.
     pub(super) fn sat_arith(
@@ -1578,6 +1655,15 @@ impl Emitter<'_> {
                         self.sse(Sse::Eq, size, d, a);
                     }
                     Binary::Addp => self.addp(size, q, d, a, b),
+                    Binary::MinMaxP { max, signed } => {
+                        let op = match (max, signed) {
+                            (true, true) => Sse::MaxS,
+                            (true, false) => Sse::MaxU,
+                            (false, true) => Sse::MinS,
+                            (false, false) => Sse::MinU,
+                        };
+                        self.min_max_pairs(op, size, q, d, a, b);
+                    }
                     Binary::CmTst => {
                         self.copy(d, a);
                         self.sse(Sse::And, size, d, b);
