@@ -449,6 +449,10 @@ impl Device {
         }
 
         v11.protected_memory = vk::FALSE;
+        v12.descriptor_binding_uniform_buffer_update_after_bind = vk::FALSE;
+        v12.descriptor_binding_storage_buffer_update_after_bind = vk::FALSE;
+        v12.descriptor_binding_uniform_texel_buffer_update_after_bind = vk::FALSE;
+        v12.descriptor_binding_storage_texel_buffer_update_after_bind = vk::FALSE;
         robustness2.robust_buffer_access2 = vk::FALSE;
         robustness2.robust_image_access2 = vk::FALSE;
         mesh.multiview_mesh_shader &= v11.multiview;
