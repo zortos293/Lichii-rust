@@ -412,7 +412,7 @@ impl Context {
             self.device
                 .name(module, format_args!("{}", Program(program)));
             if let Some(aftermath) = crate::debug::aftermath::get() {
-                aftermath.save_shader(&program.spirv);
+                aftermath.save_shader(program);
             }
             if program.info.uses_cooperative_matrix {
                 tracing::info!("LIRU14 cooperative matrix pipeline: {}", Program(program));

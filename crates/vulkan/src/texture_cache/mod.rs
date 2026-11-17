@@ -2405,7 +2405,12 @@ impl TextureCache {
                 let offset = base - image.base();
                 image.info.find_subresource(info, offset).or_else(|| {
                     (usage == Usage::Target)
-                        .then(|| image.info.find_slice(info, offset))
+                        .then(|| {
+                            image
+                                .info
+                                .find_slice(info, offset)
+                                .or_else(|| image.info.find_padded_level(info, offset))
+                        })
                         .flatten()
                 })
             } else {
@@ -2450,6 +2455,7 @@ impl TextureCache {
                     let offset = image.base() - base;
                     info.find_subresource(&image.info, offset)
                         .or_else(|| info.find_slice(&image.info, offset))
+                        .or_else(|| info.find_padded_level(&image.info, offset))
                 })
                 .flatten();
             match subresource {
@@ -2555,7 +2561,15 @@ impl TextureCache {
             let volume = self.image(id).info.kind == ImageKind::D3;
             let mut regions = Vec::with_capacity(src_levels as usize);
             for l in 0..src_levels {
-                let extent = self.image(join).host_extent(l);
+                let (src, dst) = (
+                    self.image(join).host_extent(l),
+                    self.image(id).host_extent(level + l),
+                );
+                let extent = vk::Extent3D {
+                    width: src.width.min(dst.width),
+                    height: src.height.min(dst.height),
+                    depth: src.depth,
+                };
                 let layers = |base| vk::ImageSubresourceLayers {
                     aspect_mask: src_aspect,
                     mip_level: 0,

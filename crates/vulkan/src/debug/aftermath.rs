@@ -15,6 +15,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use libloading::Library;
 
+use lichii_shader::ShaderModule;
+
+use super::Program;
 use super::library;
 
 #[cfg(windows)]
@@ -164,9 +167,10 @@ fn load(root: &Path) -> Result<Aftermath, String> {
 }
 
 impl Aftermath {
-    /// Keeps `spirv` beside the dumps, named by Aftermath's hash, so a dump can show the
-    /// shader that faulted.
-    pub(crate) fn save_shader(&self, spirv: &[u32]) {
+    /// Keeps `program`'s SPIR-V beside the dumps, named by Aftermath's hash, so a dump can
+    /// show the shader that faulted, and logs which program the hash stands for.
+    pub(crate) fn save_shader(&self, program: &ShaderModule) {
+        let spirv = &program.spirv[..];
         let code = SpirvCode {
             data: spirv.as_ptr().cast(),
             size: size_of_val(spirv) as u32,
@@ -179,10 +183,16 @@ impl Aftermath {
             return;
         }
         let path = self.dir.join(format!("source_{hash:016x}.spv"));
-        if !path.exists()
-            && let Err(error) = std::fs::write(&path, bytemuck::cast_slice::<u32, u8>(spirv))
-        {
-            tracing::warn!(?path, %error, "Nsight Aftermath: saving a shader failed");
+        if path.exists() {
+            return;
+        }
+        match std::fs::write(&path, bytemuck::cast_slice::<u32, u8>(spirv)) {
+            Ok(()) => tracing::info!(
+                program = %Program(program),
+                aftermath = format_args!("{hash:016x}"),
+                "Nsight Aftermath: shader saved"
+            ),
+            Err(error) => tracing::warn!(?path, %error, "Nsight Aftermath: saving a shader failed"),
         }
     }
 

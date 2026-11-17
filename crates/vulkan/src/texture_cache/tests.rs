@@ -5546,3 +5546,141 @@ fn sampled_mip_chains_that_run_out_of_memory_keep_the_levels_that_fit() {
     assert_eq!(f.read_image(id), want[1..]);
     f.assert_no_validation_errors();
 }
+
+#[test]
+fn padded_level_targets_match_only_depth_free_levels_below_the_base() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        let mut chain = ImageInfo {
+            levels: 2,
+            ..rt_info(16, 16, 0, gob)
+        };
+        chain.layer_stride = chain.surface().layer_stride();
+        let level_1 = chain.surface().level_offset(1);
+        let padded = rt_info(16, 8, 0, gob);
+        assert_eq!(chain.find_subresource(&padded, level_1), None, "{gob:?}");
+        assert_eq!(
+            chain.find_padded_level(&padded, level_1),
+            Some((1, 0)),
+            "{gob:?}"
+        );
+        assert_eq!(
+            rt_info(8, 8, 0, gob).find_padded_level(&padded, 0),
+            None,
+            "{gob:?}: a wider target over a base level keeps its own texels"
+        );
+        let GuestLayout::BlockLinear {
+            block_height_log2,
+            tile_width_spacing,
+            ..
+        } = padded.layout
+        else {
+            unreachable!()
+        };
+        let deep = ImageInfo {
+            layout: GuestLayout::BlockLinear {
+                block_height_log2,
+                block_depth_log2: 1,
+                tile_width_spacing,
+                gob,
+            },
+            ..padded
+        };
+        assert_eq!(
+            chain.find_padded_level(&deep, level_1),
+            None,
+            "{gob:?}: the target's block depth moves its GOBs"
+        );
+    }
+}
+
+/// Mario Kart World's light-probe cube arrays at their full 7 levels: levels 4 to 6 (8x8,
+/// 4x4, 2x2) are rendered as targets one GOB wide (16x8, 16x4, 16x2 at block height 1),
+/// which cover exactly the GOB each of those levels is stored in.
+#[test]
+fn mkw_cube_array_levels_narrower_than_a_gob_render_into_the_array() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        for sample_first in [true, false] {
+            let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+                return;
+            };
+            let levels = 7;
+            let mut header = tic(0x21, GPU_VA, 128, 128, 2, levels, 4);
+            header.0[0] = (header.0[0] & !(0xfff << 7)) | 7 << 7 | 7 << 10 | 7 << 13 | 7 << 16;
+            header.0[4] = (header.0[4] & !(0xf << 23)) | 8 << 23;
+            let array = ImageInfo::from_texture(&header.decode().unwrap(), gob).unwrap();
+            assert_eq!((array.layers, array.levels), (12, levels));
+            let pitch = (array.layer_stride / 4) as u32;
+            let target = |level: u32| {
+                let size = 128 >> level;
+                match level {
+                    0..4 => mkw_target(
+                        0xe0,
+                        size,
+                        size,
+                        array.surface().level_tiling(level).block_height_log2,
+                        pitch,
+                        gob,
+                    ),
+                    _ => mkw_target(0xe0, 16, size, 0, pitch, gob),
+                }
+            };
+            let early = sample_first.then(|| f.texture(&header).0);
+            let mut founds = Vec::new();
+            for level in 0..levels {
+                let info = target(level);
+                for layer in 0..12 {
+                    let value = (layer * levels + level + 1) as f32 / 128.0;
+                    let found = clear_rt_at(
+                        &mut f,
+                        GPU_VA + array.subresource_offset(level, layer),
+                        &info,
+                        [value, 0.25, 1.0 - value, 1.0],
+                        Rect::ALL,
+                    );
+                    founds.push((level, layer, found));
+                }
+            }
+            let (id, _) = f.texture(&header);
+            let case = format!("{gob:?} sample_first {sample_first}");
+            assert_eq!(early.unwrap_or(id), id, "{case}");
+            let strays: Vec<_> = founds
+                .iter()
+                .filter(|(_, _, t)| t.id != id && f.cache.state(t.id).is_some())
+                .collect();
+            assert!(
+                strays.is_empty(),
+                "{case}: targets left beside the array: {strays:?}"
+            );
+            let texels = f.read_image(id);
+            let mut seen = Vec::new();
+            for layer in 0..12 {
+                for level in 0..levels {
+                    let got = &texels[(layer * levels + level) as usize];
+                    let first = &got[..4];
+                    assert!(
+                        first.iter().any(|&b| b != 0)
+                            && got.chunks(4).all(|t| t == first)
+                            && !seen.contains(&first.to_vec()),
+                        "{case}: layer {layer} level {level} holds {first:?}"
+                    );
+                    seen.push(first.to_vec());
+                }
+            }
+            for level in 4..levels {
+                let t = clear_rt_at(
+                    &mut f,
+                    GPU_VA + array.subresource_offset(level, 7),
+                    &target(level),
+                    [0.5, 0.5, 0.5, 1.0],
+                    Rect::ALL,
+                );
+                assert_eq!(
+                    (t.id, t.level, t.layer),
+                    (id, level, 7),
+                    "{case} second frame"
+                );
+            }
+            f.assert_no_validation_errors();
+        }
+    }
+}
