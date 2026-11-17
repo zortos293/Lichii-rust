@@ -268,6 +268,14 @@ impl Activity {
             trap_protects = traps.protects,
             "GPU activity"
         );
+        let ms: Vec<u64> = LIRU6_NS.iter().map(|c| c.swap(0, Ordering::Relaxed) / 1_000_000).collect();
+        let n: Vec<u64> = LIRU6_N.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
+        let modes: Vec<u64> = LIRU6_MODES.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
+        tracing::warn!("LIRU6DIAG host sites [cpu_reads, front_read, fetch_sync, macro_dma_sync, macro_dma_pending, render_enable] ms={ms:?} n={n:?} render_enable_modes={modes:?}");
+        let pairs = std::mem::take(&mut *LIRU6_PAIRS.lock().unwrap());
+        for (address, dma, mode, count) in pairs {
+            tracing::warn!("LIRU6DIAG render_enable address={address:#x} last_macro_dma={dma:#x} mode={mode} count={count}");
+        }
     }
 }
 
@@ -586,5 +594,25 @@ mod tests {
         }
         watch.check(&syncpoints, true);
         assert!(watch.stuck.is_empty());
+    }
+}
+
+pub(crate) static LIRU6_NS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+pub(crate) static LIRU6_N: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+pub(crate) static LIRU6_MODES: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+pub(crate) static LIRU6_LAST_DMA: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LIRU6_PAIRS: std::sync::Mutex<Vec<(u64, u64, u32, u64)>> = std::sync::Mutex::new(Vec::new());
+pub(crate) fn liru6_site(site: usize, start: std::time::Instant) {
+    LIRU6_NS[site].fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    LIRU6_N[site].fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn liru6_mode(mode: u32, address: u64) {
+    LIRU6_MODES[(mode as usize).min(5)].fetch_add(1, Ordering::Relaxed);
+    let dma = LIRU6_LAST_DMA.load(Ordering::Relaxed);
+    let mut v = LIRU6_PAIRS.lock().unwrap();
+    if let Some(e) = v.iter_mut().find(|e| e.0 == address && e.1 == dma && e.2 == mode) {
+        e.3 += 1;
+    } else if v.len() < 24 {
+        v.push((address, dma, mode, 1));
     }
 }

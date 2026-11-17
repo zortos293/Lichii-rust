@@ -230,7 +230,11 @@ impl Maxwell3d {
                     ctx.rasterizer.reset_counter(kind);
                 }
             }
-            RENDER_ENABLE_MODE => self.render_enable = queries::render_enable(regs, ctx),
+            RENDER_ENABLE_MODE => {
+                crate::activity::liru6_mode(regs.render_enable.mode.0, regs.render_enable.address());
+                let _liru6 = crate::back::Liru6Site(5, std::time::Instant::now());
+                self.render_enable = queries::render_enable(regs, ctx)
+            }
             SYNC_INFO => {
                 let id = regs.sync_info.sync_point();
                 if ctx.syncpoints.host().increment(id).is_err() {

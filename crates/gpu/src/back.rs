@@ -186,6 +186,7 @@ impl Back {
     #[cold]
     fn serve_cpu_reads_now(&mut self) {
         self.flush_engine();
+        let _liru6 = Liru6Site(0, std::time::Instant::now());
         let _waiting = self.activity.waiting(Wait::HostGpu);
         let rasterizer = &mut *self.rasterizer;
         self.cpu_reads
@@ -515,6 +516,7 @@ impl Back {
     /// its fences and queries land, and GPU-written data goes back to guest memory over the
     /// device range widened to whole `window`-aligned blocks (a power of two; 1 is the range).
     fn synchronize_read(&mut self, address: u64, size: u64, window: u64) {
+        let _liru6 = Liru6Site(if window == 1 { 1 } else { 2 }, std::time::Instant::now());
         let _waiting = self.activity.waiting(Wait::HostGpu);
         let Some(channel) = self.current.and_then(|index| self.channels[index].as_ref()) else {
             self.rasterizer.release_fences(true);
@@ -739,9 +741,13 @@ impl MacroHost for BackMacroHost<'_, '_> {
             gpu_va,
             size,
         );
+        crate::activity::LIRU6_LAST_DMA.store(gpu_va, std::sync::atomic::Ordering::Relaxed);
         if pending.is_none() {
+            let _liru6 = Liru6Site(3, std::time::Instant::now());
             let _waiting = self.ctx.activity.waiting(Wait::HostGpu);
             synchronize_range(memory, &mut *self.ctx.rasterizer, gpu_va, size, 1);
+        } else {
+            crate::activity::liru6_site(4, std::time::Instant::now());
         }
         if let Err(fault) = memory.read_block(gpu_va, bytemuck::cast_slice_mut(out)) {
             tracing::warn!(?fault, "MME DMA read from unmapped GPU memory");
@@ -752,5 +758,12 @@ impl MacroHost for BackMacroHost<'_, '_> {
                 *slot = word;
             }
         }
+    }
+}
+
+pub(crate) struct Liru6Site(pub usize, pub std::time::Instant);
+impl Drop for Liru6Site {
+    fn drop(&mut self) {
+        crate::activity::liru6_site(self.0, self.1);
     }
 }
