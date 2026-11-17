@@ -542,6 +542,7 @@ impl Thread {
     }
 
     pub(crate) fn wake_locked(self: &Arc<Self>, s: &mut Sched, wake: WakeResult) {
+        crate::diag427::woken(self.id());
         s.wait = 0;
         s.wake = wake;
         self.wait_token.store(0, Ordering::Release);

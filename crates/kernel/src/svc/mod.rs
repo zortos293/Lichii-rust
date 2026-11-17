@@ -147,6 +147,33 @@ impl SvcContext<'_> {
 }
 
 pub(crate) fn dispatch(svc: &mut SvcContext, imm: u32) -> Flow {
+    let id = svc.thread.id();
+    if matches!(imm, 0x0b | 0x18 | 0x1a | 0x1c | 0x21 | 0x22 | 0x34) {
+        let a: [u64; 4] = svc.ctx.x[..4].try_into().unwrap();
+        let label = match imm {
+            0x0b => format!("sleep {}", if a[0] as i64 <= 0 { "yield" } else { "timed" }),
+            0x18 => format!(
+                "waitsync n={} h0={:#x} t={}",
+                a[2] as u32,
+                svc.process().memory().read::<u32>(a[1]).unwrap_or(0),
+                if (a[3] as i64) < 0 { "inf" } else { "timed" }
+            ),
+            0x1a => "arbitrate_lock".to_string(),
+            0x1c => format!("condvar key={:#x}", a[1]),
+            0x34 => format!("wait_for_address {:#x} type={}", a[0], a[1]),
+            _ => "ipc".to_string(),
+        };
+        crate::diag427::blocked(id, label);
+        let flow = dispatch_traced(svc, imm);
+        if flow != Flow::Switch {
+            crate::diag427::unblocked(id);
+        }
+        return flow;
+    }
+    dispatch_traced(svc, imm)
+}
+
+fn dispatch_traced(svc: &mut SvcContext, imm: u32) -> Flow {
     if !svc.kernel.svc_trace {
         return call(svc, imm);
     }

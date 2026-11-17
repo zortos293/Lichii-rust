@@ -9,6 +9,7 @@
 mod alarm;
 pub mod arbiter;
 mod cpu_manager;
+mod diag427;
 pub mod event;
 pub mod handle_table;
 pub mod ipc;

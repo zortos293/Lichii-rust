@@ -175,6 +175,10 @@ impl ServiceThread {
             thread.wake(pending.token, WakeResult::error(result::SESSION_CLOSED));
             return Ok(());
         }
+        crate::diag427::relabel(
+            thread.id(),
+            format!("ipc {} #{}", self.name(), ctx.request.command),
+        );
         ctx.domain = domain;
         ctx.cursor = 0;
         ctx.thread = Some(thread.clone());

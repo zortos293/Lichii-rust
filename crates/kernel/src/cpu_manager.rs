@@ -90,6 +90,9 @@ impl Core {
     }
 
     fn run_thread(&mut self, thread: &Arc<Thread>) {
+        let started = std::time::Instant::now();
+        crate::diag427::set_current(thread.id());
+        crate::diag427::resumed(thread.id());
         let slot = self.cpu_slot(thread);
         self.apply_invalidations();
         self.cpus[slot].1.clear_exclusive();
@@ -153,8 +156,14 @@ impl Core {
                     self.apply_invalidations();
                     continue;
                 }
-                Flow::Switch => return,
+                Flow::Switch => {
+                    crate::diag427::ran(thread.id(), started.elapsed(), true);
+                    crate::diag427::set_current(0);
+                    return;
+                }
                 Flow::ExitThread => {
+                    crate::diag427::ran(thread.id(), started.elapsed(), false);
+                    crate::diag427::set_current(0);
                     self.kernel.exit_thread(self.index, thread);
                     return;
                 }

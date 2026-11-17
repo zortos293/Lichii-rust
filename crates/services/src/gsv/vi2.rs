@@ -243,6 +243,7 @@ impl Vi2 {
                 timing.swap_interval
             );
         }
+        let liru6_t0 = Instant::now();
         if let Some((id, value)) = presents.previous_fence.replace(fence) {
             let guest = self.context.gpu.host1x().syncpoints.guest();
             if let Err(err @ SyncpointWaitError::TimedOut { .. }) =
@@ -259,12 +260,15 @@ impl Vi2 {
                 tracing::warn!("nx2:vi2 229: previous frame's fence ({id}, {value:#x}): {err}");
             }
         }
+        let liru6_t1 = Instant::now();
         self.composite(image, drawn, fence);
         self.context
             .perf
             .record_guest_frame(Instant::now(), timing.target_hz());
         let interval = timing.interval(self.context.settings.graphics.speed_limit);
+        let liru6_t2 = Instant::now();
         pace(&mut presents, interval);
+        liru6_present(liru6_t0, liru6_t1, liru6_t2, Instant::now());
         ctx.push([AVAILABLE_SLOTS, 0, 0]);
         ResultCode::SUCCESS
     }
@@ -444,5 +448,66 @@ mod tests {
                 "{word:#x}"
             );
         }
+    }
+}
+
+fn liru6_present(t0: Instant, t1: Instant, t2: Instant, t3: Instant) {
+    struct Acc {
+        since: Option<Instant>,
+        last: Option<Instant>,
+        n: u32,
+        fence: Duration,
+        fence_max: Duration,
+        composite: Duration,
+        pace: Duration,
+        gap: Duration,
+        gap_max: Duration,
+    }
+    static ACC: Mutex<Acc> = Mutex::new(Acc {
+        since: None,
+        last: None,
+        n: 0,
+        fence: Duration::ZERO,
+        fence_max: Duration::ZERO,
+        composite: Duration::ZERO,
+        pace: Duration::ZERO,
+        gap: Duration::ZERO,
+        gap_max: Duration::ZERO,
+    });
+    let mut a = ACC.lock();
+    let since = *a.since.get_or_insert(t0);
+    if let Some(last) = a.last {
+        let gap = t0.saturating_duration_since(last);
+        a.gap += gap;
+        a.gap_max = a.gap_max.max(gap);
+    }
+    a.last = Some(t3);
+    a.n += 1;
+    a.fence += t1 - t0;
+    a.fence_max = a.fence_max.max(t1 - t0);
+    a.composite += t2 - t1;
+    a.pace += t3 - t2;
+    if t3 - since >= Duration::from_secs(5) {
+        let n = a.n.max(1) as f64;
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        tracing::info!(
+            "LIRU6PRESENT n={} period_ms={:.0} fence_wait_ms_avg={:.2} fence_wait_ms_max={:.1} composite_ms_avg={:.2} pace_ms_avg={:.2} guest_gap_ms_avg={:.2} guest_gap_ms_max={:.1}",
+            a.n,
+            ms(t3 - since),
+            ms(a.fence) / n,
+            ms(a.fence_max),
+            ms(a.composite) / n,
+            ms(a.pace) / n,
+            ms(a.gap) / (n - 1.0).max(1.0),
+            ms(a.gap_max)
+        );
+        a.since = Some(t3);
+        a.n = 0;
+        a.fence = Duration::ZERO;
+        a.fence_max = Duration::ZERO;
+        a.composite = Duration::ZERO;
+        a.pace = Duration::ZERO;
+        a.gap = Duration::ZERO;
+        a.gap_max = Duration::ZERO;
     }
 }
