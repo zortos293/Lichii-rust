@@ -563,6 +563,7 @@ impl Shared {
     }
 
     fn increment(&self) {
+        let _ = self.syncpoints.host().increment(self.syncpoint);
         if self.syncpoints.guest().increment(self.syncpoint).is_err() {
             tracing::warn!("nx2:vdecsvc: syncpoint {} is out of range", self.syncpoint);
         }
