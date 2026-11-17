@@ -296,7 +296,7 @@ fn simd(rng: &mut Rng) -> u32 {
     }
 }
 
-const VECTOR: [&str; 26] = [
+const VECTOR: [&str; 28] = [
     "0xx01110xx1xxxxx0110x1xxxxxxxxxx",
     "0xx01110xx1xxxxx000x01xxxxxxxxxx",
     "0xx01110xx1xxxxx00x011xxxxxxxxxx",
@@ -323,6 +323,8 @@ const VECTOR: [&str; 26] = [
     "0xx0111100000xxxxxxx01xxxxxxxxxx",
     "0x001110xx1xxxxx101111xxxxxxxxxx",
     "0x00111000100000010110xxxxxxxxxx",
+    "0xx011110xxxxxxx111xx1xxxxxxxxxx",
+    "01x111110xxxxxxx111xx1xxxxxxxxxx",
 ];
 
 /// An Advanced SIMD integer three-same (halving, saturating, absolute-difference and pairwise max/min forms
@@ -1066,6 +1068,64 @@ fn fp_edge_cases_match_the_interpreter() {
                 ctx.x[1] = x;
                 ctx.v[1] = 0x5a5a_5a5a_5a5a_5a5a << 64 | x as u128;
                 compare(machines, &[op | fp, BRK], &ctx, &data);
+            }
+        }
+    }
+}
+
+/// The fixed-point `SCVTF`, `UCVTF`, `FCVTZS` and `FCVTZU` by immediate, vector and scalar, at the
+/// ends of the fbits range on integer and FP edge values, under the FPCR settings that change
+/// results and with FPSR.IXC both clear and already set.
+#[test]
+fn fixed_point_conversions_match_the_interpreter() {
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+        ("jit without sse4", Machine::new(Backend::NoSse4)),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    let lanes: Vec<u32> = [
+        0,
+        1,
+        u32::MAX,
+        1 << 31,
+        i32::MAX as u32,
+        0x0100_0001,
+        0xffff_ff80,
+    ]
+    .into_iter()
+    .chain(FP_S)
+    .collect();
+    let ops = [
+        0x4f00_e420,
+        0x6f00_e420,
+        0x4f00_fc20,
+        0x6f00_fc20,
+        0x5f00_e420,
+        0x7f00_e420,
+        0x5f00_fc20,
+        0x7f00_fc20,
+    ];
+    for op in ops {
+        for fbits in [1, 16, 31, 32] {
+            let word = op | (64 - fbits) << 16;
+            for k in 0..lanes.len() {
+                let v = (0..4).fold(0u128, |v, j| {
+                    v | (lanes[(k + j) % lanes.len()] as u128) << (32 * j)
+                });
+                for fpcr in [0, 1 << 24, 1 << 25, 3 << 22] {
+                    for fpsr in [0, 0x10] {
+                        let mut ctx = ThreadContext {
+                            pc: CODE,
+                            fpcr,
+                            fpsr,
+                            ..Default::default()
+                        };
+                        ctx.v[0] = !v;
+                        ctx.v[1] = v;
+                        compare(machines, &[word, BRK], &ctx, &data);
+                    }
+                }
             }
         }
     }
