@@ -49,6 +49,39 @@ fn finish(
     let uses_cooperative_matrix = uses_cooperative_hmma(options.profile, &program);
     let resources = ResourceLayout::for_module(&program.info, first_binding);
     debug_assert_eq!(resources.next_binding(first_binding), bindings.unified);
+    if uses_cooperative_matrix {
+        let ir = &program.ir;
+        let hmma = ir
+            .post_order
+            .iter()
+            .flat_map(|&block| ir.insts_of(block))
+            .filter(|&id| {
+                matches!(
+                    ir.op(id),
+                    crate::ir::Opcode::TensorMulAdd | crate::ir::Opcode::TensorMulAddF32
+                )
+            })
+            .count();
+        eprintln!(
+            "LIRU14 coop program {:016x} wg {:?} shared {} local {} hmma {hmma} blocks {}",
+            program.hash,
+            program.workgroup_size,
+            program.shared_memory_size,
+            program.local_memory_size,
+            ir.post_order.len()
+        );
+        if let Some(dir) = std::env::var_os("LIRU14_DUMP_DIR") {
+            let dir = std::path::PathBuf::from(dir);
+            let name = format!("cs-{:016x}", program.hash);
+            let _ = std::fs::write(dir.join(format!("{name}.ir")), ir.dump());
+            let _ = std::fs::write(
+                dir.join(format!("{name}.info")),
+                format!("{:#?}", program.info),
+            );
+            let bytes: Vec<u8> = spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let _ = std::fs::write(dir.join(format!("{name}.spv")), bytes);
+        }
+    }
     let mut hasher = StableHasher::new();
     program.hash.hash(&mut hasher);
     format!("{runtime:?}").hash(&mut hasher);

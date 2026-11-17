@@ -43,6 +43,15 @@ pub(crate) fn uses_cooperative_hmma(profile: &Profile, program: &TranslatedProgr
     {
         return false;
     }
+    let listed = |name: &str| {
+        std::env::var(name).ok().map(|list| {
+            list.split(',')
+                .any(|h| u64::from_str_radix(h.trim(), 16).ok() == Some(program.hash))
+        })
+    };
+    if listed("LIRU14_COOP_ONLY") == Some(false) || listed("LIRU14_COOP_SKIP") == Some(true) {
+        return false;
+    }
     let ir = &program.ir;
     ir.post_order
         .iter()
