@@ -31,13 +31,73 @@ fn allocate(
     location: MemoryLocation,
     linear: bool,
 ) -> Result<Allocation> {
-    let allocation = device.allocator.lock().allocate(&AllocationCreateDesc {
+    let mut allocator = device.allocator.lock();
+    let result = allocator.allocate(&AllocationCreateDesc {
         name,
         requirements,
         location,
         linear,
         allocation_scheme: AllocationScheme::GpuAllocatorManaged,
-    })?;
+    });
+    if let Err(error) = &result {
+        let report = allocator.generate_report();
+        drop(allocator);
+        let mib = |bytes: u64| bytes >> 20;
+        let (mut general, mut general_used, mut empty, mut personal, mut personal_bytes) =
+            (0u32, 0u64, 0u32, 0u32, 0u64);
+        let (mut largest_gap, mut fitting_gaps) = (0u64, 0u32);
+        for block in &report.blocks {
+            let mut allocations: Vec<_> = report.allocations[block.allocations.clone()]
+                .iter()
+                .map(|a| (a.offset, a.size))
+                .collect();
+            if block.size != (64 << 20) && block.size != (32 << 20) {
+                personal += 1;
+                personal_bytes += block.size;
+                continue;
+            }
+            general += 1;
+            allocations.sort_unstable();
+            let used: u64 = allocations.iter().map(|a| a.1).sum();
+            general_used += used;
+            if allocations.is_empty() {
+                empty += 1;
+            }
+            let mut cursor = 0u64;
+            for (offset, size) in allocations.into_iter().chain([(block.size, 0)]) {
+                let gap =
+                    offset.saturating_sub(cursor.next_multiple_of(requirements.alignment.max(1)));
+                largest_gap = largest_gap.max(offset.saturating_sub(cursor));
+                if gap >= requirements.size {
+                    fitting_gaps += 1;
+                }
+                cursor = cursor.max(offset + size);
+            }
+        }
+        let usage = device.memory_usage();
+        tracing::warn!(
+            %error,
+            name,
+            size_kib = requirements.size >> 10,
+            alignment = requirements.alignment,
+            type_bits = requirements.memory_type_bits,
+            linear,
+            ?location,
+            general,
+            general_mib = mib(u64::from(general) * (64 << 20)),
+            general_used_mib = mib(general_used),
+            empty,
+            largest_gap_kib = largest_gap >> 10,
+            fitting_gaps,
+            personal,
+            personal_mib = mib(personal_bytes),
+            allocations = report.allocations.len(),
+            driver_used_mib = mib(usage.used + usage.slack),
+            budget_mib = mib(usage.budget),
+            "liru5diag allocation failed"
+        );
+    }
+    let allocation = result?;
     device
         .allocated
         .fetch_add(allocation.size(), Ordering::Relaxed);
