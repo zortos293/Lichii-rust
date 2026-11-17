@@ -905,9 +905,11 @@ mod tests {
         let Some(device) = device(true) else {
             return;
         };
-        let formats = (0..CORE_FORMATS + 4)
-            .chain([1_000_340_000, 1_000_340_001, 1_000_054_000])
-            .map(vk::Format::from_raw);
+        let formats = (0..CORE_FORMATS).map(vk::Format::from_raw).chain([
+            vk::Format::G8_B8R8_2PLANE_420_UNORM,
+            vk::Format::A4R4G4B4_UNORM_PACK16,
+            vk::Format::A4B4G4R4_UNORM_PACK16,
+        ]);
         for format in formats {
             let driver = driver_properties(&device, format);
             assert_eq!(
@@ -921,6 +923,7 @@ mod tests {
                 "{format:?}"
             );
         }
+        assert_eq!(device.instance().validation_errors(), 0);
     }
 
     /// The per-target blend check of every draw, asked of the driver and of the table:
