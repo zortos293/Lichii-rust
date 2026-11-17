@@ -2393,7 +2393,7 @@ impl VulkanRasterizer {
                 ),
             }
         }
-        debug_assert_eq!(
+        assert_eq!(
             draw.descriptor_infos.len(),
             template.descriptors,
             "the draw's writes cover its layout's set 0"
