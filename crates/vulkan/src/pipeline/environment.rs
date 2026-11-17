@@ -146,13 +146,69 @@ impl TexturePool {
     /// read as a plain 2D RGBA8 texture, which is what the null view bound for them samples.
     pub fn header(&self, gmmu: &Gmmu, raw: u32) -> TextureDescriptor {
         let (index, _) = self.split(raw);
-        let entry = (index <= self.limit)
-            .then(|| {
-                gmmu.read::<TicEntry>(self.address + u64::from(index) * 32)
-                    .ok()
-            })
-            .flatten();
-        entry.and_then(|e| e.decode().ok()).unwrap_or(NULL_TEXTURE)
+        if index <= self.limit
+            && let Ok(entry) = gmmu.read::<TicEntry>(self.address + u64::from(index) * 32)
+            && let Ok(desc) = entry.decode()
+        {
+            return desc;
+        }
+        NULL_TEXTURE
+    }
+
+    /// What the shader questions read of [`Self::header`].
+    fn answers(&self, gmmu: &Gmmu, raw: u32) -> HeaderAnswers {
+        let desc = self.header(gmmu, raw);
+        HeaderAnswers {
+            ty: texture_type(&desc),
+            format: shader_pixel_format(desc.format),
+            integer: matches!(desc.format.numeric(), Numeric::Uint | Numeric::Sint),
+        }
+    }
+}
+
+/// The answers to the texture questions about one handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HeaderAnswers {
+    ty: TextureType,
+    format: TexturePixelFormat,
+    integer: bool,
+}
+
+/// How a texture question names its texture: by raw handle, or by the constant buffer words
+/// that hold the handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextureRef {
+    Handle(u32),
+    Words(HandleSource),
+}
+
+/// Textures whose answers [`TextureAnswers`] keeps; questions about others read the guest.
+const KNOWN_TEXTURES: usize = 16;
+
+/// What [`ProgramEnv::answer`] found for the textures one environment's questions named, so
+/// the type, format and integer questions about one texture read its handle and header once.
+pub struct TextureAnswers {
+    known: [(TextureRef, HeaderAnswers); KNOWN_TEXTURES],
+    len: usize,
+}
+
+impl Default for TextureAnswers {
+    fn default() -> Self {
+        let unused = HeaderAnswers {
+            ty: TextureType::Color2D,
+            format: TexturePixelFormat::A8b8g8r8Unorm,
+            integer: false,
+        };
+        Self {
+            known: [(TextureRef::Handle(0), unused); KNOWN_TEXTURES],
+            len: 0,
+        }
+    }
+}
+
+impl TextureAnswers {
+    pub fn clear(&mut self) {
+        self.len = 0;
     }
 }
 
@@ -584,16 +640,40 @@ impl<'a> ProgramEnv<'a> {
     }
 
     /// The answer `read`'s question gets now, in the form [`EnvRead::answer`] gives the
-    /// recorded one. Records nothing.
-    pub fn answer(&self, read: &EnvRead) -> u32 {
+    /// recorded one. Records nothing. `textures` keeps what earlier questions about the same
+    /// texture found; clear it before asking another environment or after guest memory changed.
+    pub fn answer(&self, read: &EnvRead, textures: &mut TextureAnswers) -> u32 {
+        let texture = match *read {
+            EnvRead::Type(handle, _)
+            | EnvRead::PixelFormat(handle, _)
+            | EnvRead::Integer(handle, _) => TextureRef::Handle(handle),
+            EnvRead::TypeOf(source, _)
+            | EnvRead::PixelFormatOf(source, _)
+            | EnvRead::IntegerOf(source, _) => TextureRef::Words(source),
+            EnvRead::Cbuf { index, offset, .. } => return self.cbuf_word(index, offset),
+        };
+        let known = textures.known[..textures.len]
+            .iter()
+            .find(|(t, _)| *t == texture);
+        let answers = match known {
+            Some(&(_, answers)) => answers,
+            None => {
+                let handle = match texture {
+                    TextureRef::Handle(handle) => handle,
+                    TextureRef::Words(source) => self.handle(source),
+                };
+                let answers = self.pool.answers(self.gmmu, handle);
+                if let Some(slot) = textures.known.get_mut(textures.len) {
+                    *slot = (texture, answers);
+                    textures.len += 1;
+                }
+                answers
+            }
+        };
         match *read {
-            EnvRead::Type(handle, _) => self.query_type(handle) as u32,
-            EnvRead::PixelFormat(handle, _) => self.query_format(handle) as u32,
-            EnvRead::Integer(handle, _) => u32::from(self.query_integer(handle)),
-            EnvRead::TypeOf(source, _) => self.query_type(self.handle(source)) as u32,
-            EnvRead::PixelFormatOf(source, _) => self.query_format(self.handle(source)) as u32,
-            EnvRead::IntegerOf(source, _) => u32::from(self.query_integer(self.handle(source))),
-            EnvRead::Cbuf { index, offset, .. } => self.cbuf_word(index, offset),
+            EnvRead::Type(..) | EnvRead::TypeOf(..) => answers.ty as u32,
+            EnvRead::PixelFormat(..) | EnvRead::PixelFormatOf(..) => answers.format as u32,
+            _ => u32::from(answers.integer),
         }
     }
 
@@ -603,18 +683,15 @@ impl<'a> ProgramEnv<'a> {
     }
 
     fn query_type(&self, handle: u32) -> TextureType {
-        texture_type(&self.pool.header(self.gmmu, handle))
+        self.pool.answers(self.gmmu, handle).ty
     }
 
     fn query_format(&self, handle: u32) -> TexturePixelFormat {
-        shader_pixel_format(self.pool.header(self.gmmu, handle).format)
+        self.pool.answers(self.gmmu, handle).format
     }
 
     fn query_integer(&self, handle: u32) -> bool {
-        matches!(
-            self.pool.header(self.gmmu, handle).format.numeric(),
-            Numeric::Uint | Numeric::Sint
-        )
+        self.pool.answers(self.gmmu, handle).integer
     }
 
     fn cbuf_word(&self, index: u32, offset: u32) -> u32 {
@@ -770,6 +847,8 @@ impl ShaderEnvironment for ProgramEnv<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use lichii_gpu::gmmu::BigPageSize;
     use lichii_memory::{DeviceAddressSpace, PhysicalMemory};
 
@@ -823,5 +902,185 @@ mod tests {
         assert_eq!(worker.read_cbuf(0, 8), 0x1234);
         assert_eq!(worker.read_cbuf(0, 0x10), 0, "past the binding");
         assert_eq!(draw.read_cbuf(0, 8), 0x5678);
+    }
+
+    fn env<'a>(
+        gmmu: &'a Arc<Gmmu>,
+        const_buffers: &'a [ConstBufferBinding],
+        pool: TexturePool,
+    ) -> ProgramEnv<'a> {
+        ProgramEnv {
+            arch: ShaderArch::Maxwell,
+            stage: ShaderStage::Fragment,
+            start: GPU_VA,
+            gmmu,
+            const_buffers,
+            const_data: &[],
+            pool,
+            viewport_transform: 0,
+            texture_bound: 0,
+            local_memory: 0,
+            shared_memory: 0,
+            workgroup: [1; 3],
+            mesh: None,
+            reads: RefCell::new(Vec::new()),
+            extent: Cell::new((GPU_VA, GPU_VA)),
+            code_log: None,
+        }
+    }
+
+    /// Packs a header from its format, one component type for all four, header version,
+    /// texture type, normalized coordinates, multisample mode and red swizzle source.
+    fn tic(
+        format: u32,
+        component: u32,
+        version: u32,
+        ty: u32,
+        normalized: bool,
+        msaa: u32,
+        red: u32,
+    ) -> TicEntry {
+        let mut w = [0; 8];
+        w[0] = format | (component * 0o1111) << 7 | (0o5430 | red) << 19;
+        w[2] = version << 21;
+        w[4] = ty << 23;
+        w[5] = u32::from(normalized) << 31;
+        w[7] = msaa << 8;
+        TicEntry(w)
+    }
+
+    #[test]
+    fn answers_agree_with_the_decoded_headers() {
+        const MAPPED: u32 = 24;
+        const LIMIT: u32 = 40;
+        const TIC: GpuVAddr = GPU_VA + SIZE - MAPPED as u64 * 32;
+        let physical = Arc::new(PhysicalMemory::new(SIZE).unwrap());
+        physical.commit(0, SIZE).unwrap();
+        let memory = Arc::new(DeviceAddressSpace::new(physical, 36));
+        memory.map(DADDR, 0, SIZE);
+        let gmmu = Arc::new(Gmmu::new(memory, BigPageSize::Size64K));
+        gmmu.map(GPU_VA, DADDR, SIZE, 0, false).unwrap();
+        let headers = [
+            tic(0x08, 2, 3, 1, true, 0, 2),
+            tic(0x08, 4, 3, 1, true, 0, 2),
+            tic(0x08, 3, 2, 7, false, 0, 2),
+            tic(0x08, 2, 3, 1, false, 0, 2),
+            tic(0x24, 2, 3, 3, true, 0, 2),
+            tic(0x0f, 7, 3, 5, true, 2, 2),
+            tic(0x1d, 4, 0, 6, true, 0, 2),
+            tic(0x2f, 7, 3, 1, true, 0, 2),
+            tic(0x17, 2, 4, 2, true, 0, 2),
+            tic(0x08, 6, 1, 4, true, 0, 2),
+            tic(0x0c, 3, 3, 8, true, 0, 2),
+            tic(0x08, 2, 3, 0, true, 0, 2),
+            tic(0x08, 2, 3, 9, true, 0, 2),
+            tic(0x08, 2, 5, 1, true, 0, 2),
+            tic(0x08, 2, 3, 1, true, 7, 2),
+            tic(0x08, 2, 3, 1, true, 0, 1),
+            tic(0x43, 2, 3, 1, true, 0, 2),
+            tic(0x08, 0, 3, 1, true, 0, 2),
+            TicEntry::default(),
+        ];
+        for i in 0..MAPPED {
+            gmmu.write(TIC + u64::from(i) * 32, headers[i as usize % headers.len()])
+                .unwrap();
+        }
+        let handles: Vec<u32> = (0..48)
+            .flat_map(|i| [i, i | 5 << 20, i * 32, 0xf_ffff])
+            .collect();
+        for (i, &handle) in handles.iter().enumerate() {
+            gmmu.write(CBUF + i as u64 * 8, handle & 0xf_ffff).unwrap();
+            gmmu.write(CBUF + i as u64 * 8 + 4, handle & !0xf_ffff)
+                .unwrap();
+        }
+        let const_buffers = [ConstBufferBinding {
+            address: CBUF,
+            size: 0x1000,
+            enabled: true,
+        }];
+        let source = |i: usize| HandleSource {
+            cbuf_index: 0,
+            cbuf_offset: i as u32 * 8,
+            shift_left: 0,
+            secondary: (i % 2 == 1).then_some((0, i as u32 * 8 + 4, 0)),
+        };
+        let ty = TextureType::Color2D;
+        let format = TexturePixelFormat::A8b8g8r8Unorm;
+        let mut textures = TextureAnswers::default();
+        for (switch2, via_header_index) in [(false, false), (true, true), (true, false)] {
+            let pool = TexturePool {
+                address: TIC,
+                limit: LIMIT,
+                via_header_index,
+                switch2,
+            };
+            let env = env(&gmmu, &const_buffers, pool);
+            let expected = |handle: u32| {
+                let desc = pool.header(&gmmu, handle);
+                [
+                    texture_type(&desc) as u32,
+                    shader_pixel_format(desc.format) as u32,
+                    u32::from(matches!(
+                        desc.format.numeric(),
+                        Numeric::Uint | Numeric::Sint
+                    )),
+                ]
+            };
+            textures.clear();
+            let mut seen = HashSet::new();
+            for _ in 0..2 {
+                for (i, &handle) in handles.iter().enumerate() {
+                    let words = if i % 2 == 1 {
+                        handle
+                    } else {
+                        handle & 0xf_ffff
+                    };
+                    seen.insert(expected(handle));
+                    let questions = [
+                        (EnvRead::Type(handle, ty), expected(handle)[0]),
+                        (EnvRead::PixelFormat(handle, format), expected(handle)[1]),
+                        (EnvRead::Integer(handle, false), expected(handle)[2]),
+                        (EnvRead::TypeOf(source(i), ty), expected(words)[0]),
+                        (
+                            EnvRead::PixelFormatOf(source(i), format),
+                            expected(words)[1],
+                        ),
+                        (EnvRead::IntegerOf(source(i), false), expected(words)[2]),
+                    ];
+                    for (read, answer) in questions {
+                        assert_eq!(env.answer(&read, &mut textures), answer, "{read:?}");
+                    }
+                    assert_eq!(
+                        [
+                            env.texture_type(handle) as u32,
+                            env.texture_pixel_format(handle) as u32,
+                            u32::from(env.is_texture_pixel_format_integer(handle)),
+                        ],
+                        expected(handle)
+                    );
+                }
+            }
+            assert!(seen.len() >= 8, "{} kinds of answers", seen.len());
+        }
+        let distinct = handles.iter().collect::<HashSet<_>>().len();
+        assert!(
+            distinct > KNOWN_TEXTURES,
+            "questions past what the answers keep"
+        );
+
+        let pool = TexturePool {
+            address: TIC,
+            limit: LIMIT,
+            via_header_index: false,
+            switch2: false,
+        };
+        let env = env(&gmmu, &const_buffers, pool);
+        textures.clear();
+        let read = EnvRead::Integer(0, false);
+        assert_eq!(env.answer(&read, &mut textures), 0);
+        gmmu.write(TIC, headers[1]).unwrap();
+        assert_eq!(env.answer(&read, &mut textures), 0, "kept until cleared");
+        textures.clear();
+        assert_eq!(env.answer(&read, &mut textures), 1);
     }
 }
