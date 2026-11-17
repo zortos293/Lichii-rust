@@ -50,6 +50,39 @@ struct ShiftMasks([u32; 8], [u64; 4]);
 static SHIFT_MASKS: ShiftMasks =
     ShiftMasks([0xff, 0xff, 0xff, 0xff, 1, 1, 1, 1], [0xff, 0xff, 1, 1]);
 
+/// For shifts by immediate on B lanes, indexed by the shift: the bits a left shift keeps, the
+/// bits a right shift keeps, and the sign bit after a right shift.
+#[repr(align(16))]
+struct ByteShifts([[u8; 16]; 8], [[u8; 16]; 9], [[u8; 16]; 8]);
+
+static BYTE_SHIFTS: ByteShifts = {
+    let (mut left, mut right, mut sign) = ([[0; 16]; 8], [[0; 16]; 9], [[0; 16]; 8]);
+    let mut n = 0;
+    while n < 9 {
+        right[n] = [(0xff_u16 >> n) as u8; 16];
+        if n < 8 {
+            left[n] = [0xff << n; 16];
+            sign[n] = [0x80 >> n; 16];
+        }
+        n += 1;
+    }
+    ByteShifts(left, right, sign)
+};
+
+/// For arithmetic shifts of D lanes, indexed by the shift: the sign bit after a logical shift.
+#[repr(align(16))]
+struct DoubleSigns([[u64; 2]; 64]);
+
+static DOUBLE_SIGNS: DoubleSigns = {
+    let mut sign = [[0; 2]; 64];
+    let mut n = 0;
+    while n < 64 {
+        sign[n] = [1 << 63 >> n; 2];
+        n += 1;
+    }
+    DoubleSigns(sign)
+};
+
 /// Lane-wise operations on two vectors. Comparisons give all ones in a lane where they hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Binary {
@@ -756,8 +789,20 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         t.set(Loc::V(rd), r);
         return true;
     }
-    if word & 0x9f80_0400 == 0x0f00_0400 {
+    let scalar = word & 0xdf80_0400 == 0x5f00_0400;
+    if word & 0x9f80_0400 == 0x0f00_0400
+        || (scalar
+            && word & 0x0040_0000 != 0
+            && matches!(
+                field(word, 11, 5),
+                0b00000 | 0b00010 | 0b00100 | 0b00110 | 0b01000 | 0b01010
+            ))
+    {
+        let q = q && !scalar;
         let size = 7 - field(word, 19, 4).leading_zeros() as u8;
+        if size == 3 && !q && !scalar {
+            return false;
+        }
         let esize = 8u8 << size;
         let immhb = field(word, 16, 7);
         if field(word, 11, 5) == 0b10100 && size < 3 {
@@ -776,7 +821,7 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
             return true;
         }
         let opcode = field(word, 11, 5);
-        if matches!(opcode, 0b00100 | 0b00110) && size != 0 && (size < 3 || (u && q)) {
+        if matches!(opcode, 0b00100 | 0b00110) {
             let a = vec(t, rn);
             let acc = (opcode == 0b00110).then(|| vec(t, rd));
             let r = emit(
@@ -793,12 +838,8 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
             return true;
         }
         let right = 2 * esize - immhb;
-        let shiftable = |op: Shift| size != 0 && (size < 3 || (q && op != Shift::Sshr));
         if opcode == 0b00010 {
             let op = if u { Shift::Ushr } else { Shift::Sshr };
-            if !shiftable(op) {
-                return false;
-            }
             let (acc, a) = (vec(t, rd), vec(t, rn));
             let arrangement = Arrangement { size, q };
             let shifted = emit(t, VecOp::Shift(op, arrangement, right, a));
@@ -812,15 +853,13 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
             } else {
                 (Shift::Shl, immhb - esize)
             };
-            if !shiftable(op) {
-                return false;
-            }
             let ones = u64::MAX >> (64 - esize);
             let mask = match op {
                 Shift::Shl => ones << amount & ones,
                 _ => ones.checked_shr(amount as u32).unwrap_or(0),
             };
             let lanes = match size {
+                0 => mask * 0x0101_0101_0101_0101,
                 1 => mask * 0x0001_0001_0001_0001,
                 2 => mask * 0x0000_0001_0000_0001,
                 _ => mask,
@@ -887,9 +926,6 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
             (0b01010, false) => (Shift::Shl, immhb - esize),
             _ => return false,
         };
-        if size == 0 || (size == 3 && (!q || op == Shift::Sshr)) {
-            return false;
-        }
         let a = vec(t, rn);
         let r = emit(t, VecOp::Shift(op, Arrangement { size, q }, amount, a));
         t.set(Loc::V(rd), r);
@@ -1438,10 +1474,51 @@ impl Emitter<'_> {
         );
     }
 
-    /// Shifts each lane of `8 << size` bits of `xmm d` by `amount`; `Sshr` takes H and S lanes.
+    /// Shifts each lane of `8 << size` bits of `xmm d` by `amount`. B lanes, and arithmetic shifts
+    /// of D lanes, shift wider lanes and fix the result up with constants; they clobber `rax`.
     fn shift_imm(&mut self, op: Shift, size: u8, d: u8, amount: u8) {
         let n = amount as i8;
         match (op, size) {
+            (_, 0) => {
+                let k = if op == Shift::Sshr {
+                    amount.min(7)
+                } else {
+                    amount
+                } as usize;
+                let keep = match op {
+                    Shift::Shl => {
+                        dynasm!(self.asm ; .arch x64 ; psllw Rx(d), k as i8);
+                        &BYTE_SHIFTS.0[k]
+                    }
+                    _ => {
+                        dynasm!(self.asm ; .arch x64 ; psrlw Rx(d), k as i8);
+                        &BYTE_SHIFTS.1[k]
+                    }
+                };
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; mov rax, QWORD keep.as_ptr() as i64
+                    ; pand Rx(d), [rax]
+                );
+                if op == Shift::Sshr {
+                    dynasm!(self.asm
+                        ; .arch x64
+                        ; mov rax, QWORD BYTE_SHIFTS.2[k].as_ptr() as i64
+                        ; pxor Rx(d), [rax]
+                        ; psubb Rx(d), [rax]
+                    );
+                }
+            }
+            (Shift::Sshr, 3) => {
+                let k = amount.min(63);
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; psrlq Rx(d), k as i8
+                    ; mov rax, QWORD DOUBLE_SIGNS.0[k as usize].as_ptr() as i64
+                    ; pxor Rx(d), [rax]
+                    ; psubq Rx(d), [rax]
+                );
+            }
             (Shift::Shl, 1) => dynasm!(self.asm ; .arch x64 ; psllw Rx(d), n),
             (Shift::Shl, 2) => dynasm!(self.asm ; .arch x64 ; pslld Rx(d), n),
             (Shift::Shl, _) => dynasm!(self.asm ; .arch x64 ; psllq Rx(d), n),
