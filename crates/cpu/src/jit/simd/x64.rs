@@ -288,7 +288,7 @@ impl Emitter<'_> {
     }
 
     /// The NZCV of an ordered compare of `xmm a` with `xmm b` in `d`; unordered jumps to `slow`.
-    /// Clobbers `rax`, `rcx` and `rdx`.
+    /// Clobbers `rax` and `rcx`.
     fn compare_flags(&mut self, fp: Fp, a: u8, b: u8, d: u8, slow: DynamicLabel) {
         match fp {
             Fp::S => dynasm!(self.asm ; .arch x64 ; ucomiss Rx(a), Rx(b)),
@@ -297,14 +297,12 @@ impl Emitter<'_> {
         dynasm!(self.asm
             ; .arch x64
             ; jp =>slow
-            ; setb al
             ; setz cl
-            ; movzx eax, al
+            ; sbb eax, eax
             ; movzx ecx, cl
-            ; lea edx, [rax * 8]
-            ; lea edx, [rdx + rcx * 4]
-            ; xor eax, 1
-            ; lea Rd(d), [rdx + rax * 2]
+            ; and eax, 6
+            ; add eax, 2
+            ; lea Rd(d), [rax + rcx * 4]
         );
     }
 
