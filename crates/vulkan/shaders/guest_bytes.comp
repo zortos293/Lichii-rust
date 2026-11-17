@@ -44,6 +44,8 @@ layout(push_constant) uniform P {
     uint stencil_pitch;
     uint depth_float;
     uint z_base;
+    uint linear_base;
+    uint stencil_base;
 } p;
 
 const float D24_MAX = 16777215.0;
@@ -109,8 +111,9 @@ void main() {
         return;
     }
     uint word = (run.z + offset - run.x) >> 2u;
-    uint texel = (z * p.height + y) * p.row_words + x;
-    uint s_index = y * p.stencil_pitch + x;
+    uint row = z * p.height + y;
+    uint texel = p.linear_base + row * p.row_words + x;
+    uint s_index = p.stencil_base + row * p.stencil_pitch + x;
     uint s_shift = (s_index & 3u) * 8u;
     if (p.direction == TO_GUEST) {
         uint value = linear_words[texel];
