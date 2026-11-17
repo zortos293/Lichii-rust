@@ -3,8 +3,9 @@
 /// This process's memory as the OS counts it, in bytes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProcessMemory {
-    /// Memory only this process can use: private bytes (commit) on Windows, anonymous resident
-    /// plus swapped pages on Linux. Guest DRAM is shared memory, so it is not in here.
+    /// Memory only this process can use: private bytes (the commit charge, `PagefileUsage`) on
+    /// Windows, anonymous resident plus swapped pages on Linux. Guest DRAM is shared memory, so
+    /// it is not in here.
     pub private: u64,
     /// Every resident page, guest DRAM included: the working set on Windows, the RSS on Linux.
     pub resident: u64,
@@ -40,29 +41,13 @@ mod sys {
 
 #[cfg(windows)]
 mod sys {
-    use windows_sys::Win32::System::ProcessStatus::{
-        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
-    };
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-
     use super::ProcessMemory;
 
     pub fn process_memory() -> Option<ProcessMemory> {
-        // SAFETY: an all-zero PROCESS_MEMORY_COUNTERS_EX is a valid plain-data struct.
-        let mut counters: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
-        let size = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
-        counters.cb = size;
-        // SAFETY: the pseudo handle of the current process and a counters struct of `size` bytes.
-        let ok = unsafe {
-            GetProcessMemoryInfo(
-                GetCurrentProcess(),
-                (&raw mut counters).cast::<PROCESS_MEMORY_COUNTERS>(),
-                size,
-            )
-        };
-        (ok != 0).then(|| ProcessMemory {
-            private: counters.PrivateUsage as u64,
-            resident: counters.WorkingSetSize as u64,
+        let stats = memory_stats::memory_stats()?;
+        Some(ProcessMemory {
+            private: stats.virtual_mem as u64,
+            resident: stats.physical_mem as u64,
         })
     }
 }
