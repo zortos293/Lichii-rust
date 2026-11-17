@@ -63,6 +63,9 @@ struct Renderer {
     conditions: Vec<Option<RenderCondition>>,
     /// What every predicate evaluates to.
     predicate_value: bool,
+    /// A word read from GPU memory at each inline write, as a writeback at that point would see it.
+    probe: Option<GpuVAddr>,
+    probed: Vec<u32>,
 }
 
 impl Renderer {
@@ -124,7 +127,10 @@ impl Rasterizer for Renderer {
     fn predicate_value(&mut self, _predicate: GpuPredicate) -> bool {
         self.predicate_value
     }
-    fn inline_written(&mut self, _: ChannelId, _: &Gmmu, address: GpuVAddr, size: u64) {
+    fn inline_written(&mut self, _: ChannelId, memory: &Gmmu, address: GpuVAddr, size: u64) {
+        if let Some(probe) = self.probe {
+            self.probed.push(memory.read::<u32>(probe).unwrap());
+        }
         self.events.push(Event::InlineWrite(address, size));
     }
     fn query(&mut self, _channel: ChannelId, _memory: &Gmmu, query: &Query) {
@@ -401,19 +407,78 @@ fn const_buffer_data_lands_in_memory_and_advances_the_offset() {
         .unwrap();
     assert_eq!(words, [1, 2, 3, 4]);
     assert_eq!(b.engine.state.regs.const_buffer.offset, 0x20);
-    assert_eq!(
-        b.take(),
-        [
-            Event::InlineWrite(0x2_0010, 12),
-            Event::InlineWrite(0x2_001c, 4)
-        ]
-    );
+    b.flush();
+    assert_eq!(b.take(), [Event::InlineWrite(0x2_0010, 16)]);
 
     b.call(CB_SIZE + 3, 0xf8);
     b.multi(CB_DATA_FIRST, &[7, 8, 9]);
     assert_eq!(b.engine.state.regs.const_buffer.offset, 0x104);
+    b.flush();
     assert_eq!(b.take(), [Event::InlineWrite(0x2_00f8, 8)]);
     assert_eq!(b.h.memory.read::<u32>(0x2_0100).unwrap(), 0);
+}
+
+#[test]
+fn const_buffer_writes_reach_the_renderer_once_per_run() {
+    let mut b = Bench::new();
+    select_const_buffer(&mut b, 0x3_0000, 0x100, 0);
+    b.take();
+    b.multi(CB_DATA_FIRST, &[1, 2]);
+    b.call(CB_SIZE + 3, 8);
+    b.call(CB_DATA_FIRST, 3);
+    b.call(CB_SIZE + 3, 0);
+    b.multi(CB_DATA_FIRST, &[9]);
+    assert!(b.take().is_empty(), "selector writes keep the run open");
+    b.call(DEPTH_TEST_ENABLE, 1);
+    assert_eq!(b.take(), [Event::InlineWrite(0x3_0000, 12)]);
+
+    b.multi(CB_DATA_FIRST, &[5]);
+    b.call(CB_SIZE + 3, 0x40);
+    b.multi(CB_DATA_FIRST, &[6]);
+    assert_eq!(
+        b.take(),
+        [Event::InlineWrite(0x3_0004, 4)],
+        "a write apart from the run ends it"
+    );
+    b.flush();
+    assert_eq!(b.take(), [Event::InlineWrite(0x3_0040, 4)]);
+}
+
+#[test]
+fn a_const_buffer_range_is_announced_before_a_write_apart_from_it() {
+    let mut b = Bench::new();
+    select_const_buffer(&mut b, 0x3_0000, 0x100, 8);
+    b.renderer.probe = Some(0x3_0040);
+    b.multi(CB_DATA_FIRST, &[1]);
+    b.call(CB_SIZE + 3, 0x40);
+    b.multi(CB_DATA_FIRST, &[2]);
+    assert_eq!(b.take(), [Event::InlineWrite(0x3_0008, 4)]);
+    assert_eq!(
+        b.renderer.probed,
+        [0],
+        "a writeback for the first range must not cover the second write"
+    );
+}
+
+#[test]
+fn const_buffer_writes_reach_the_renderer_before_the_draws_around_them() {
+    let mut b = Bench::new();
+    select_const_buffer(&mut b, 0x3_0000, 0x100, 0);
+    b.call(draw::VERTEX_BUFFER_COUNT, 3);
+    b.take();
+    b.multi(CB_DATA_FIRST, &[1, 2]);
+    b.begin(PrimitiveTopology::TRIANGLES, false);
+    b.end();
+    b.multi(CB_DATA_FIRST, &[3]);
+    let events = b.take();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[0], Event::InlineWrite(0x3_0000, 8));
+    assert!(
+        matches!(events[1], Event::Draw { .. }),
+        "the held draw renders before its constant buffer changes"
+    );
+    b.flush();
+    assert_eq!(b.take(), [Event::InlineWrite(0x3_0008, 4)]);
 }
 
 #[test]

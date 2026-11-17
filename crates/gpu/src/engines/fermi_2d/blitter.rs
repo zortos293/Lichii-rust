@@ -227,8 +227,9 @@ impl Placement {
     }
 }
 
-/// Bytes a scratch buffer keeps between blits: a 4K RGBA32F frame's worth.
-const KEEP_BYTES: usize = 3840 * 2160 * 16;
+/// Bytes a scratch buffer keeps between blits: a 1080p RGBA8 frame's worth. Converting blits
+/// decode two source rows and one destination row at a time, so no f32 frame is ever held.
+const KEEP_BYTES: usize = 16 << 20;
 
 /// The software blitter and its scratch buffers.
 #[derive(Default)]
@@ -236,8 +237,11 @@ pub(super) struct SoftwareBlitter {
     src: Vec<u8>,
     dst: Vec<u8>,
     tiled: Vec<u8>,
-    ir_src: Vec<f32>,
-    ir_dst: Vec<f32>,
+    /// Decoded source rows and the source row each holds.
+    ir_rows: [Vec<f32>; 2],
+    ir_row_ids: [usize; 2],
+    /// One destination row before it is encoded.
+    ir_out: Vec<f32>,
 }
 
 impl SoftwareBlitter {
@@ -336,28 +340,13 @@ impl SoftwareBlitter {
                 &sampling,
             );
         } else {
-            self.ir_src.resize(src_w as usize * src_h as usize * 4, 0.0);
-            self.ir_dst.resize(dst_w as usize * dst_h as usize * 4, 0.0);
-            src_layout.decode(&self.src, &mut self.ir_src);
-            if filter {
-                bilinear(
-                    &self.ir_src,
-                    &mut self.ir_dst,
-                    (src_w, src_h),
-                    (dst_w, dst_h),
-                    &sampling,
-                );
-            } else {
-                nearest(
-                    &self.ir_src,
-                    &mut self.ir_dst,
-                    4,
-                    (src_w, src_h),
-                    (dst_w, dst_h),
-                    &sampling,
-                );
-            }
-            dst_layout.encode(&self.ir_dst, &mut self.dst);
+            self.convert(
+                (src_layout, dst_layout),
+                (src_w, src_h),
+                (dst_w, dst_h),
+                &sampling,
+                filter,
+            );
         }
 
         dst_place.write(ctx.memory, &mut self.tiled, &self.dst);
@@ -365,6 +354,54 @@ impl SoftwareBlitter {
         ctx.rasterizer
             .inline_written(ctx.channel, ctx.memory, address, size);
         self.release_oversized();
+    }
+
+    /// Converts `self.src` into `self.dst` through f32 texels, one destination row at a time:
+    /// each row decodes the (at most two) source rows it samples, reusing the rows the previous
+    /// destination row decoded.
+    fn convert(
+        &mut self,
+        (src_layout, dst_layout): (Layout, Layout),
+        from: (u32, u32),
+        to: (u32, u32),
+        sampling: &Sampling,
+        filter: bool,
+    ) {
+        let src_pitch = from.0 as usize * src_layout.bytes;
+        let dst_pitch = to.0 as usize * dst_layout.bytes;
+        for row in &mut self.ir_rows {
+            row.resize(from.0 as usize * 4, 0.0);
+        }
+        self.ir_row_ids = [usize::MAX; 2];
+        self.ir_out.resize(to.0 as usize * 4, 0.0);
+        for (y, dst_row) in self.dst.chunks_exact_mut(dst_pitch).enumerate() {
+            let (y0, y1, wy) = bilinear_axis(sampling.y0, sampling.dv_dy, y, from.1);
+            let pair = [y0, y1];
+            let wanted = if filter && y1 != y0 {
+                &pair[..]
+            } else {
+                &pair[..1]
+            };
+            if self.ir_row_ids[1] == y0 && self.ir_row_ids[0] != y0 {
+                self.ir_rows.swap(0, 1);
+                self.ir_row_ids.swap(0, 1);
+            }
+            for (slot, &source) in wanted.iter().enumerate() {
+                if self.ir_row_ids[slot] != source {
+                    let bytes = &self.src[source * src_pitch..(source + 1) * src_pitch];
+                    src_layout.decode(bytes, &mut self.ir_rows[slot]);
+                    self.ir_row_ids[slot] = source;
+                }
+            }
+            let top = &self.ir_rows[0];
+            let bottom = &self.ir_rows[wanted.len() - 1];
+            if filter {
+                bilinear_row(top, bottom, wy, &mut self.ir_out, from.0, sampling);
+            } else {
+                nearest_row(top, &mut self.ir_out, from.0, sampling);
+            }
+            dst_layout.encode(&self.ir_out, dst_row);
+        }
     }
 
     /// Frees scratch buffers past [`KEEP_BYTES`]: full-frame blits reuse theirs, a rare
@@ -378,8 +415,10 @@ impl SoftwareBlitter {
         release(&mut self.src);
         release(&mut self.dst);
         release(&mut self.tiled);
-        release(&mut self.ir_src);
-        release(&mut self.ir_dst);
+        for row in &mut self.ir_rows {
+            release(row);
+        }
+        release(&mut self.ir_out);
     }
 }
 
@@ -411,35 +450,58 @@ fn nearest<T: Copy>(
     }
 }
 
-/// Bilinear scale of four-channel texels: each destination pixel blends the four texels around
-/// its 32.32 source position, with the neighbours clamped to the source.
-fn bilinear(src: &[f32], dst: &mut [f32], from: (u32, u32), to: (u32, u32), sampling: &Sampling) {
-    let texel = |x: usize, y: usize| -> &[f32] {
-        let at = (y * from.0 as usize + x) * 4;
-        &src[at..at + 4]
+/// The two source texels around destination index `i`'s 32.32 position along one axis, clamped
+/// to the source, and the weight of the second.
+fn bilinear_axis(start: i64, step: i64, i: usize, extent: u32) -> (usize, usize, f32) {
+    let position = position(start, step, i as u32);
+    let last = i64::from(extent) - 1;
+    let first = (position >> 32).clamp(0, last);
+    let weight = if position < 0 || position >> 32 > last {
+        0.0
+    } else {
+        (position & 0xffff_ffff) as f32 / 4_294_967_296.0
     };
-    let axis = |start: i64, step: i64, i: usize, extent: u32| {
-        let position = position(start, step, i as u32);
-        let last = i64::from(extent) - 1;
-        let first = (position >> 32).clamp(0, last);
-        let weight = if position < 0 || position >> 32 > last {
-            0.0
-        } else {
-            (position & 0xffff_ffff) as f32 / 4_294_967_296.0
-        };
-        (first as usize, (first + 1).min(last) as usize, weight)
-    };
-    for (y, row) in dst.chunks_exact_mut(to.0 as usize * 4).enumerate() {
-        let (y0, y1, wy) = axis(sampling.y0, sampling.dv_dy, y, from.1);
-        for (x, out) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-            let (x0, x1, wx) = axis(sampling.x0, sampling.du_dx, x, from.0);
-            let (p00, p10, p01, p11) = (texel(x0, y0), texel(x1, y0), texel(x0, y1), texel(x1, y1));
-            for c in 0..4 {
-                let top = p00[c] + (p10[c] - p00[c]) * wx;
-                let bottom = p01[c] + (p11[c] - p01[c]) * wx;
-                out[c] = top + (bottom - top) * wy;
-            }
+    (first as usize, (first + 1).min(last) as usize, weight)
+}
+
+/// One destination row of a bilinear scale of four-channel texels: each pixel blends the four
+/// texels around its 32.32 source position from the source rows `top` and `bottom`, weighted by
+/// `wy`, with the neighbours clamped to the row.
+fn bilinear_row(
+    top: &[f32],
+    bottom: &[f32],
+    wy: f32,
+    out: &mut [f32],
+    width: u32,
+    sampling: &Sampling,
+) {
+    for (x, out) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let (x0, x1, wx) = bilinear_axis(sampling.x0, sampling.du_dx, x, width);
+        let (p00, p10) = (&top[x0 * 4..x0 * 4 + 4], &top[x1 * 4..x1 * 4 + 4]);
+        let (p01, p11) = (&bottom[x0 * 4..x0 * 4 + 4], &bottom[x1 * 4..x1 * 4 + 4]);
+        for c in 0..4 {
+            let upper = p00[c] + (p10[c] - p00[c]) * wx;
+            let lower = p01[c] + (p11[c] - p01[c]) * wx;
+            out[c] = upper + (lower - upper) * wy;
         }
+    }
+}
+
+/// One destination row of a nearest-neighbor scale of four-channel texels from source row `row`.
+fn nearest_row(row: &[f32], out: &mut [f32], width: u32, sampling: &Sampling) {
+    for (x, out) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let (at, _, _) = bilinear_axis(sampling.x0, sampling.du_dx, x, width);
+        out.copy_from_slice(&row[at * 4..at * 4 + 4]);
+    }
+}
+
+/// Bilinear scale of whole four-channel frames, row by row.
+#[cfg(test)]
+fn bilinear(src: &[f32], dst: &mut [f32], from: (u32, u32), to: (u32, u32), sampling: &Sampling) {
+    let row = |y: usize| &src[y * from.0 as usize * 4..(y + 1) * from.0 as usize * 4];
+    for (y, out) in dst.chunks_exact_mut(to.0 as usize * 4).enumerate() {
+        let (y0, y1, wy) = bilinear_axis(sampling.y0, sampling.dv_dy, y, from.1);
+        bilinear_row(row(y0), row(y1), wy, out, from.0, sampling);
     }
 }
 
@@ -688,12 +750,80 @@ mod tests {
     }
 
     #[test]
+    fn scratch_keeps_a_1080p_frame() {
+        let bytes = 1920 * 1080 * 4;
+        let mut blitter = SoftwareBlitter::default();
+        blitter.src.reserve_exact(bytes);
+        blitter.release_oversized();
+        assert!(blitter.src.capacity() >= bytes);
+    }
+
+    #[test]
+    fn converting_blits_hold_rows_not_frames() {
+        let mut h = Harness::new();
+        let (width, height) = (512, 256);
+        let surface = |address| CopySurface {
+            address,
+            width,
+            height,
+            depth: 1,
+            layer: 0,
+            pitch: width * 4,
+            block: None,
+            bytes_per_pixel: 4,
+        };
+        let rect = Rect {
+            x0: 0,
+            y0: 0,
+            x1: width as i32,
+            y1: height as i32,
+        };
+        let pixels: Vec<u32> = (0..width * height)
+            .map(|i| i.wrapping_mul(0x0101_0103))
+            .collect();
+        h.memory
+            .write_block(0, bytemuck::cast_slice(&pixels))
+            .unwrap();
+        let job = Job {
+            src: surface(0),
+            dst: surface(0x10_0000),
+            src_format: F::A8B8G8R8Unorm,
+            dst_format: F::A8R8G8B8Unorm,
+            src_rect: rect,
+            dst_rect: rect,
+            sampling: sampling(0, 0, UNIT, UNIT),
+            linear_filter: false,
+        };
+        let mut blitter = SoftwareBlitter::default();
+        blitter.blit(&mut h.context(), &job);
+        let mut out = vec![0u32; pixels.len()];
+        h.memory
+            .read_block(0x10_0000, bytemuck::cast_slice_mut(&mut out))
+            .unwrap();
+        let swapped = |p: u32| (p & 0xff00_ff00) | (p & 0xff) << 16 | (p >> 16) & 0xff;
+        assert!(out.iter().zip(&pixels).all(|(&o, &p)| o == swapped(p)));
+        let row_floats = width as usize * 4;
+        assert!(
+            blitter
+                .ir_rows
+                .iter()
+                .all(|row| row.capacity() < 2 * row_floats)
+        );
+        assert!(blitter.ir_out.capacity() < 2 * row_floats);
+        assert_eq!(
+            blitter.ir_row_ids[1],
+            usize::MAX,
+            "a nearest conversion decodes each source row once"
+        );
+    }
+
+    #[test]
     fn oversized_scratch_is_released_after_the_blit() {
         let mut blitter = SoftwareBlitter::default();
-        blitter.ir_src.reserve(KEEP_BYTES / 4 + 1);
+        blitter.ir_out.reserve(KEEP_BYTES / 4 + 1);
         blitter.src.reserve(1024);
         blitter.release_oversized();
-        assert_eq!(blitter.ir_src.capacity(), 0);
+        assert_eq!(blitter.ir_out.capacity(), 0);
         assert!(blitter.src.capacity() >= 1024);
     }
 }

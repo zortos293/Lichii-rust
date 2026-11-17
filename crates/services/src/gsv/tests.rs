@@ -81,7 +81,7 @@ fn router_grants_features_and_hands_out_sessions() {
 fn syncpt_slots_signal_when_the_syncpoint_is_reached() {
     let (context, client, gsv) = gsv();
     let syncpt = session(&client, gsv, 202);
-    let guest = context.gpu.host1x().syncpoints.guest();
+    let reached = context.gpu.host1x().syncpoints.host();
     let reply = client.send(syncpt, &Request::tipc(22).arg(3u32)).unwrap();
     let slot = event(&client, reply.copy_handles[0]);
     slot.signal();
@@ -92,9 +92,9 @@ fn syncpt_slots_signal_when_the_syncpoint_is_reached() {
         ResultCode::SUCCESS
     );
     assert!(!slot.is_signaled(), "a new request starts unsignalled");
-    guest.increment(7).unwrap();
+    reached.increment(7).unwrap();
     assert!(!slot.is_signaled());
-    guest.increment(7).unwrap();
+    reached.increment(7).unwrap();
     assert!(slot.is_signaled());
 
     let mut reply = client.send(syncpt, &Request::tipc(103).arg(!7u32)).unwrap();
@@ -107,7 +107,7 @@ fn syncpt_slots_signal_when_the_syncpoint_is_reached() {
     assert!(slot.is_signaled(), "a cancel signals the slot");
     slot.clear();
     for _ in 0..7 {
-        guest.increment(7).unwrap();
+        reached.increment(7).unwrap();
     }
     assert!(!slot.is_signaled(), "a cancelled request never signals");
 }
@@ -182,6 +182,39 @@ fn syncpt_page() -> (Arc<ServiceContext>, SyncptPage) {
 }
 
 #[test]
+fn switch2_waits_release_when_the_back_reaches_the_increment() {
+    let (context, page) = syncpt_page();
+    let syncpoints = &context.gpu.host1x().syncpoints;
+    let syncpt = session(&page.client, page.gsv, 202);
+    let reply = page
+        .client
+        .send(syncpt, &Request::tipc(22).arg(0u32))
+        .unwrap();
+    let slot = event(&page.client, reply.copy_handles[0]);
+    let request = Request::tipc(201).arg(0u32).arg(!9u32).arg(1u64).arg(0u32);
+    page.client.send(syncpt, &request).unwrap();
+    page.arm(9);
+
+    syncpoints.host().increment(9).unwrap();
+    assert_eq!(
+        syncpoints.guest().value(9),
+        Ok(0),
+        "the host GPU has not finished the work in front of the increment"
+    );
+    assert!(slot.is_signaled());
+    assert!(page.acknowledged(9));
+    assert_eq!(page.value(9), 1);
+    let mut reply = page
+        .client
+        .send(syncpt, &Request::tipc(103).arg(!9u32))
+        .unwrap();
+    assert_eq!(reply.pop::<u64>(), 1);
+
+    syncpoints.guest().increment(9).unwrap();
+    assert_eq!(page.value(9), 1, "host completion does not move the page");
+}
+
+#[test]
 fn syncpt_page_header_describes_the_layout() {
     let (_context, page) = syncpt_page();
     let header: Vec<u32> = page
@@ -196,17 +229,17 @@ fn syncpt_page_header_describes_the_layout() {
 #[test]
 fn syncpt_page_answers_armed_waits_on_the_next_increment() {
     let (context, page) = syncpt_page();
-    let guest = context.gpu.host1x().syncpoints.guest();
+    let reached = context.gpu.host1x().syncpoints.host();
     page.arm(70);
     assert!(!page.acknowledged(70), "nothing changed yet");
     assert!(!page.notify.is_signaled());
-    guest.increment(70).unwrap();
+    reached.increment(70).unwrap();
     assert!(page.acknowledged(70));
     assert!(page.notify.is_signaled());
     assert_eq!(page.value(70), 1);
 
     page.notify.clear();
-    guest.increment(5).unwrap();
+    reached.increment(5).unwrap();
     page.arm(5);
     assert!(
         page.acknowledged(5),
@@ -225,7 +258,7 @@ fn syncpt_page_answers_armed_waits_on_the_next_increment() {
 #[test]
 fn syncpt_slots_mirror_the_value_into_the_page_before_signalling() {
     let (context, page) = syncpt_page();
-    let guest = context.gpu.host1x().syncpoints.guest();
+    let reached = context.gpu.host1x().syncpoints.host();
     let syncpt = session(&page.client, page.gsv, 202);
     let reply = page
         .client
@@ -234,10 +267,10 @@ fn syncpt_slots_mirror_the_value_into_the_page_before_signalling() {
     let slot = event(&page.client, reply.copy_handles[0]);
     let request = Request::tipc(201).arg(0u32).arg(!9u32).arg(2u64).arg(0u32);
     page.client.send(syncpt, &request).unwrap();
-    guest.increment(9).unwrap();
+    reached.increment(9).unwrap();
     assert_eq!(page.value(9), 1);
     assert!(!slot.is_signaled());
-    guest.increment(9).unwrap();
+    reached.increment(9).unwrap();
     assert!(slot.is_signaled());
     assert_eq!(page.value(9), 2);
 }
@@ -245,9 +278,9 @@ fn syncpt_slots_mirror_the_value_into_the_page_before_signalling() {
 #[test]
 fn syncpt_page_mirrors_increments_nobody_waits_on() {
     let (context, page) = syncpt_page();
-    let guest = context.gpu.host1x().syncpoints.guest();
+    let reached = context.gpu.host1x().syncpoints.host();
     for _ in 0..3 {
-        guest.increment(12).unwrap();
+        reached.increment(12).unwrap();
     }
     assert_eq!(
         page.value(12),
@@ -265,12 +298,12 @@ fn syncpt_page_mirrors_increments_nobody_waits_on() {
 #[test]
 fn a_slot_signal_does_not_swallow_a_page_wait_on_the_same_syncpoint() {
     let (context, page) = syncpt_page();
-    let guest = context.gpu.host1x().syncpoints.guest();
+    let reached = context.gpu.host1x().syncpoints.host();
     let syncpt = session(&page.client, page.gsv, 202);
     let request = Request::tipc(201).arg(0u32).arg(!9u32).arg(1u64).arg(0u32);
     page.client.send(syncpt, &request).unwrap();
     page.arm(9);
-    guest.increment(9).unwrap();
+    reached.increment(9).unwrap();
     assert_eq!(page.value(9), 1);
     assert!(page.acknowledged(9));
     assert!(page.notify.is_signaled());
@@ -279,7 +312,7 @@ fn a_slot_signal_does_not_swallow_a_page_wait_on_the_same_syncpoint() {
 #[test]
 fn slots_past_the_page_count_leave_the_page_alone() {
     let (context, page) = syncpt_page();
-    let guest = context.gpu.host1x().syncpoints.guest();
+    let reached = context.gpu.host1x().syncpoints.host();
     let syncpt = session(&page.client, page.gsv, 202);
     let request = Request::tipc(201)
         .arg(0u32)
@@ -287,14 +320,14 @@ fn slots_past_the_page_count_leave_the_page_alone() {
         .arg(1u64)
         .arg(0u32);
     page.client.send(syncpt, &request).unwrap();
-    guest.increment(600).unwrap();
+    reached.increment(600).unwrap();
     assert_eq!(page.value(600), 0);
 }
 
 #[test]
 fn a_wait_armed_before_a_slot_mirrors_is_answered_when_the_request_comes() {
     let (context, page) = syncpt_page();
-    let guest = context.gpu.host1x().syncpoints.guest();
+    let reached = context.gpu.host1x().syncpoints.host();
     let syncpt = session(&page.client, page.gsv, 202);
     let request = Request::tipc(201).arg(0u32).arg(!9u32).arg(1u64).arg(0u32);
     page.client.send(syncpt, &request).unwrap();
@@ -302,7 +335,7 @@ fn a_wait_armed_before_a_slot_mirrors_is_answered_when_the_request_comes() {
     let memory = page.client.process().memory();
     let bits: u64 = memory.read(address).unwrap();
     memory.write(address, bits ^ (1 << 9)).unwrap();
-    guest.increment(9).unwrap();
+    reached.increment(9).unwrap();
     assert_eq!(page.value(9), 1, "the slot mirrored the value");
     page.request.signal();
     assert!(page.acknowledged(9));
@@ -1615,8 +1648,13 @@ fn video_decoder_stop_completes_handed_fences_and_full_queues_are_busy() {
     let fences: Vec<_> = (1..=3).map(|image| vdec.hand_out(311, image)).collect();
     let (syncpoint, last) = fences[2];
     assert_eq!(vdec.send(&Request::tipc(207)).result, ResultCode::SUCCESS);
-    let guest = vdec.context.gpu.host1x().syncpoints.guest();
+    let syncpoints = &vdec.context.gpu.host1x().syncpoints;
+    let guest = syncpoints.guest();
     assert!(guest.is_reached(syncpoint, last).unwrap());
+    assert!(
+        syncpoints.host().is_reached(syncpoint, last).unwrap(),
+        "gsv slot and page waits on the stopped images release"
+    );
     std::thread::sleep(Duration::from_millis(20));
     assert_eq!(
         guest.value(syncpoint).unwrap(),

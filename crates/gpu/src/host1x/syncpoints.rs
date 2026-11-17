@@ -95,13 +95,14 @@ impl Syncpoints {
     }
 
     /// Values the guest sees: incremented once the work before an increment has completed on
-    /// the host GPU. nvhost-ctrl waits, fences and the Switch 2 syncpoint shim read these.
+    /// the host GPU. nvhost-ctrl waits, fences, vdec and the Switch 2 syncpoint shim read these.
     pub fn guest(&self) -> &SyncpointBank {
         &self.guest
     }
 
     /// Values the command processor has reached: incremented when it executes an increment,
-    /// before the host GPU work behind it has finished.
+    /// before the host GPU work behind it has finished. The Switch 2 syncpoint slots and page
+    /// read these.
     pub fn host(&self) -> &SyncpointBank {
         &self.host
     }

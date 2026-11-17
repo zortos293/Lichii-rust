@@ -6,7 +6,8 @@ use gpu_allocator::MemoryLocation;
 
 use crate::device::Device;
 use crate::error::Result;
-use crate::memory::Buffer;
+use crate::host_budget::Oversized;
+use crate::memory::{Buffer, LiveMemory};
 use crate::scheduler::Scheduler;
 
 /// Host-visible upload memory handed out for one transfer.
@@ -24,7 +25,7 @@ const STAGING_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
 /// A ring of host-visible memory for uploads. Each allocation is tagged with the scheduler tick
 /// that consumes it and reused once that tick completed, so steady-state uploads allocate
 /// nothing. Requests larger than a quarter of the ring get a buffer of their own, freed the same
-/// way.
+/// way, at most `oversized_cap` bytes of them in flight ([`Oversized`]).
 pub struct StagingRing {
     device: Arc<Device>,
     ring: Buffer,
@@ -32,11 +33,11 @@ pub struct StagingRing {
     head: u64,
     /// In-flight regions in ring order: (start, end, tick).
     regions: VecDeque<(u64, u64, u64)>,
-    oversized: VecDeque<(u64, Buffer)>,
+    oversized: Oversized,
 }
 
 impl StagingRing {
-    pub fn new(device: &Arc<Device>, capacity: u64) -> Result<Self> {
+    pub fn new(device: &Arc<Device>, capacity: u64, oversized_cap: u64) -> Result<Self> {
         let ring = Buffer::new(
             device,
             capacity,
@@ -50,8 +51,13 @@ impl StagingRing {
             capacity,
             head: 0,
             regions: VecDeque::new(),
-            oversized: VecDeque::new(),
+            oversized: Oversized::new(oversized_cap),
         })
+    }
+
+    /// The oversized buffers not freed yet.
+    pub fn oversized(&self) -> LiveMemory {
+        self.oversized.live()
     }
 
     /// `size` bytes aligned to `align` (a power of two), valid until the work recorded in
@@ -64,15 +70,13 @@ impl StagingRing {
     ) -> Result<StagingSlice<'_>> {
         if size > self.capacity / 4 {
             self.reclaim(scheduler);
-            let buffer = Buffer::new(
+            let buffer = self.oversized.alloc(
                 &self.device,
+                scheduler,
                 size,
                 STAGING_USAGE,
-                MemoryLocation::CpuToGpu,
                 "staging (oversized)",
             )?;
-            self.oversized.push_back((scheduler.tick(), buffer));
-            let (_, buffer) = self.oversized.back_mut().expect("just pushed");
             return Ok(StagingSlice {
                 buffer: buffer.raw(),
                 offset: 0,
@@ -127,12 +131,53 @@ impl StagingRing {
         if self.regions.is_empty() {
             self.head = 0;
         }
-        while self
-            .oversized
-            .front()
-            .is_some_and(|(tick, _)| scheduler.is_complete(*tick))
-        {
-            self.oversized.pop_front();
-        }
+        self.oversized.reclaim(scheduler);
+    }
+
+    /// Whether the work being recorded at `tick` holds half the oversized cap or more
+    /// ([`Oversized::should_submit`]).
+    pub(crate) fn should_submit(&self, tick: u64) -> bool {
+        self.oversized.should_submit(tick)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host_budget::testing::{device, flood};
+
+    #[test]
+    fn oversized_staging_floods_stay_within_their_cap_on_a_lagging_gpu() {
+        let Some(device) = device() else { return };
+        const CAP: u64 = 8 << 20;
+        const SIZE: u64 = 3 << 19;
+        let mut ring = StagingRing::new(&device, 1 << 20, CAP).unwrap();
+        let ops = 64;
+        let result = flood(
+            &device,
+            &mut ring,
+            ops,
+            |ring, scheduler| {
+                let slice = ring.alloc(scheduler, SIZE, 16).unwrap();
+                assert_eq!(slice.data.len() as u64, SIZE);
+            },
+            |ring| ring.oversized().bytes,
+            StagingRing::should_submit,
+        );
+        assert!(
+            u64::from(ops) * SIZE > 8 * CAP,
+            "the flood is many times the cap"
+        );
+        assert!(result.lagged > 0, "allocations ran ahead of the GPU");
+        assert!(
+            result.peak > CAP / 2,
+            "the cap bound the flood: {}",
+            result.peak
+        );
+        assert!(
+            result.peak <= CAP,
+            "{} in flight passed the cap",
+            result.peak
+        );
     }
 }

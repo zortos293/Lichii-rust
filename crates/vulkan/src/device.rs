@@ -14,6 +14,7 @@ use lichii_shader::profile::HostTranslateInfo;
 
 use crate::error::{Error, Result, VkResultExt};
 use crate::instance::Instance;
+use crate::memory::MemoryCounters;
 use crate::profile::{ShaderQueries, shader_profile};
 
 /// Device memory blocks are 64 MiB: with 256 MiB blocks ~38% of device memory sat empty in
@@ -183,8 +184,12 @@ pub struct Device {
     pub(crate) queue_family: u32,
     queue: Mutex<vk::Queue>,
     pub(crate) allocator: ManuallyDrop<Mutex<Allocator>>,
-    /// Bytes handed out by the allocator; it reports only block capacity cheaply.
-    pub(crate) allocated: AtomicU64,
+    /// Live allocations by memory location.
+    pub(crate) memory_counters: MemoryCounters,
+    /// Live [`crate::pipeline::cache::Pipeline`]s: built, libraries and fast-linked ones.
+    pub(crate) pipelines: AtomicU64,
+    /// Live descriptor pools of the [`crate::descriptors::DescriptorAllocator`]s.
+    pub(crate) descriptor_pools: AtomicU64,
     pub(crate) memory_properties: vk::PhysicalDeviceMemoryProperties,
     /// What the shader translator may emit for this device.
     pub shader_profile: Profile,
@@ -728,7 +733,9 @@ impl Device {
             queue_family: candidate.queue_family,
             queue: Mutex::new(queue),
             allocator: ManuallyDrop::new(Mutex::new(allocator)),
-            allocated: AtomicU64::new(0),
+            memory_counters: MemoryCounters::default(),
+            pipelines: AtomicU64::new(0),
+            descriptor_pools: AtomicU64::new(0),
             memory_properties,
             shader_profile,
             shader_host,

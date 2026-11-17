@@ -61,6 +61,7 @@ use crate::commands::{ImageAccess, transfer_to_all_barrier, transition};
 use crate::device::Device;
 use crate::error::{Error, Result};
 use crate::format::{Conversion, HostFormat, host_format};
+use crate::host_budget::Readback;
 use crate::memory::{Buffer, Image, ImageDesc, ImageView, MemoryUsage, aspect_of};
 use crate::scheduler::Scheduler;
 use crate::staging::StagingRing;
@@ -688,7 +689,7 @@ pub struct TextureCache {
     keep: Vec<(DAddr, DAddr)>,
     segments: Vec<Segment>,
     scratch: Scratch,
-    readback: Option<Buffer>,
+    readback: Readback,
     downloads: Vec<Download>,
     /// Downloads served from captures.
     captured: Vec<Download>,
@@ -709,7 +710,7 @@ pub struct TextureCache {
     sentenced_bytes: u64,
     pending: Option<PendingEvictions>,
     pending_downloads: Vec<Download>,
-    eviction_readback: Option<Buffer>,
+    eviction_readback: Readback,
     stats: CollectorStats,
 }
 
@@ -1079,7 +1080,7 @@ impl TextureCache {
             keep: Vec::new(),
             segments: Vec::new(),
             scratch: Scratch::default(),
-            readback: None,
+            readback: Readback::default(),
             downloads: Vec::new(),
             captured: Vec::new(),
             captures: Captures::default(),
@@ -1095,7 +1096,7 @@ impl TextureCache {
             sentenced_bytes: 0,
             pending: None,
             pending_downloads: Vec::new(),
-            eviction_readback: None,
+            eviction_readback: Readback::default(),
             stats: CollectorStats::default(),
         }
     }
@@ -3517,17 +3518,18 @@ impl TextureCache {
             }
             self.captures.ring = ring;
         }
-        let mut readback = self.readback.take();
+        let mut readback = std::mem::take(&mut self.readback);
         if result.is_ok() && !downloads.is_empty() {
             result = self
                 .record_downloads(tx, &mut downloads, &mut readback)
                 .and_then(|()| tx.scheduler.finish());
             if result.is_ok()
-                && let Some(data) = readback.as_ref().and_then(Buffer::mapped)
+                && let Some(data) = readback.buffer().and_then(Buffer::mapped)
             {
                 for download in &downloads {
                     self.finish_download(tx, download.id, &data[download.offset as usize..], keep);
                 }
+                readback.release();
             }
         }
         self.readback = readback;
@@ -3691,13 +3693,13 @@ impl TextureCache {
         result
     }
 
-    /// Records copies of the images in `downloads` into `readback` (grown when too small), and
+    /// Records copies of the images in `downloads` into `readback` ([`Readback::ensure`]), and
     /// sets each one's offset there. The copies are visible to the host once they complete.
     fn record_downloads(
         &mut self,
         tx: &mut Transfer<'_>,
         downloads: &mut [Download],
-        readback: &mut Option<Buffer>,
+        readback: &mut Readback,
     ) -> Result<()> {
         let mut total = 0u64;
         for download in downloads.iter_mut() {
@@ -3708,20 +3710,14 @@ impl TextureCache {
             download.offset = total.next_multiple_of(align);
             total = download.offset + size;
         }
-        let size = total.max(16);
-        if readback.as_ref().is_none_or(|b| b.size() < size) {
-            let buffer = Buffer::new(
+        let buffer = readback
+            .ensure(
                 &self.device,
-                size.next_power_of_two(),
-                vk::BufferUsageFlags::TRANSFER_DST,
-                MemoryLocation::GpuToCpu,
+                tx.scheduler,
+                total.max(16),
                 "texture readback",
-            )?;
-            if let Some(old) = readback.replace(buffer) {
-                tx.scheduler.retire(old);
-            }
-        }
-        let buffer = readback.as_ref().expect("just created").raw();
+            )?
+            .raw();
         let cmd = tx.scheduler.record()?;
         for download in downloads.iter() {
             self.record_download(tx, cmd, download.id, buffer, download.offset)?;
@@ -3935,9 +3931,9 @@ impl TextureCache {
         }
         self.pending = None;
         let downloads = std::mem::take(&mut self.pending_downloads);
-        let readback = self.eviction_readback.take();
+        let mut readback = std::mem::take(&mut self.eviction_readback);
         let data = readback
-            .as_ref()
+            .buffer()
             .and_then(Buffer::mapped)
             .expect("readback memory is host visible");
         for download in &downloads {
@@ -3962,6 +3958,7 @@ impl TextureCache {
             }
             self.evict(tx.scheduler, download.id);
         }
+        readback.release();
         self.eviction_readback = readback;
         self.pending_downloads = downloads;
     }
@@ -4041,7 +4038,7 @@ impl TextureCache {
             return Ok(());
         }
         let mut downloads = std::mem::take(&mut self.pending_downloads);
-        let mut readback = self.eviction_readback.take();
+        let mut readback = std::mem::take(&mut self.eviction_readback);
         let recorded = self.record_downloads(tx, &mut downloads, &mut readback);
         self.eviction_readback = readback;
         self.pending_downloads = downloads;
