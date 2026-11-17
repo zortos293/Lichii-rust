@@ -43,7 +43,7 @@ pub(crate) const MAX_POLL: Duration = Duration::from_millis(1);
 /// How long the front spins once a channel suspends on a semaphore before it sleeps: a guest CPU
 /// write that releases it wakes nothing, and a timed sleep lasts at least the host timer's period
 /// (1 ms or more on Windows), so a release written soon after the acquire is seen at once.
-const RELEASE_SPIN: Duration = Duration::from_micros(250);
+pub(crate) const RELEASE_SPIN: Duration = Duration::from_micros(250);
 /// How long a channel stays suspended, or the front waits for the back, before it is reported.
 pub(crate) const LONG_WAIT: Duration = Duration::from_secs(2);
 
@@ -82,6 +82,9 @@ pub struct GpuConfig {
     /// on what only the guest CPU releases; the sleep doubles up to [`MAX_POLL`] or this,
     /// whichever is longer. Defaults to [`MIN_POLL`].
     pub semaphore_poll: Duration,
+    /// How long the front spins for a guest CPU release once a channel suspends on a
+    /// semaphore, before it sleeps. Defaults to [`RELEASE_SPIN`].
+    pub release_spin: Duration,
 }
 
 impl GpuConfig {
@@ -94,6 +97,7 @@ impl GpuConfig {
             ring_slots: DEFAULT_RING_SLOTS,
             engines: Arc::new(create_engine),
             semaphore_poll: MIN_POLL,
+            release_spin: RELEASE_SPIN,
         }
     }
 }
@@ -235,6 +239,8 @@ struct Front {
     activity: Arc<Activity>,
     /// [`GpuConfig::semaphore_poll`].
     first_poll: Duration,
+    /// [`GpuConfig::release_spin`].
+    release_spin: Duration,
 }
 
 impl Front {
@@ -274,7 +280,7 @@ impl Front {
             }
             if busy || resumed {
                 poll = self.first_poll;
-                spin_until = Some(Instant::now() + RELEASE_SPIN);
+                spin_until = Some(Instant::now() + self.release_spin);
             } else if waiting || fences {
                 if waiting && poll == max_poll {
                     self.shared.stream.release_fences();
@@ -286,7 +292,7 @@ impl Front {
     }
 
     /// Spins until `until` while a channel waits on a semaphore, or until a channel can run or the
-    /// inbox has work. Whether it ended early. Each suspension spins for [`RELEASE_SPIN`] from the
+    /// inbox has work. Whether it ended early. Each suspension spins for [`Front::release_spin`] from the
     /// pass that ran it, across wakes that leave the channels waiting.
     fn spin_for_release(&self, inbox: &Inbox, until: Instant) -> bool {
         let channels = || self.channels.iter().flatten();
@@ -537,6 +543,7 @@ impl Gpu {
             held: VecDeque::new(),
             activity: activity.clone(),
             first_poll: config.semaphore_poll,
+            release_spin: config.release_spin,
         };
         let front_inbox = inbox.clone();
         let front = std::thread::Builder::new()

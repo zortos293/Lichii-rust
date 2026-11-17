@@ -437,11 +437,17 @@ impl Rig {
             completion,
             engines,
             crate::gpu::MIN_POLL,
+            crate::gpu::RELEASE_SPIN,
         )
     }
 
-    /// A rig whose front first sleeps `semaphore_poll` between looks at semaphores.
-    fn polling(threading: Threading, semaphore_poll: std::time::Duration) -> Self {
+    /// A rig whose front spins `release_spin` for a release once a channel suspends, then first
+    /// sleeps `semaphore_poll` between looks at semaphores.
+    fn polling(
+        threading: Threading,
+        semaphore_poll: std::time::Duration,
+        release_spin: std::time::Duration,
+    ) -> Self {
         Self::configured(
             Console::Switch1,
             threading,
@@ -449,6 +455,7 @@ impl Rig {
             Completion::Immediate,
             Engines::Recording,
             semaphore_poll,
+            release_spin,
         )
     }
 
@@ -459,6 +466,7 @@ impl Rig {
         completion: Completion,
         engines: Engines,
         semaphore_poll: std::time::Duration,
+        release_spin: std::time::Duration,
     ) -> Self {
         let physical = Arc::new(PhysicalMemory::new(1 << 24).unwrap());
         let space = Arc::new(AddressSpace::new(physical.clone(), 39));
@@ -494,6 +502,7 @@ impl Rig {
                     })),
                 }),
                 semaphore_poll,
+                release_spin,
                 ..GpuConfig::new(console)
             },
             |handles| {
@@ -1058,14 +1067,14 @@ fn ran(log: &Log, method: u32, value: u32) -> bool {
 
 /// A semaphore the guest CPU writes right after a channel suspends on it resumes the channel
 /// without waiting for the front's next look, however long the front sleeps between looks.
-/// Each attempt writes once the back ran the work before the acquire; one of five landing in
-/// the front's spin is enough, and a ten-second poll fails them all.
+/// Each attempt writes once the back ran the work before the acquire, well inside a five-second
+/// spin however late a loaded host schedules the test; a ten-second poll fails them all.
 #[test]
 fn a_cpu_release_after_the_acquire_does_not_wait_for_the_poll() {
     use std::time::{Duration, Instant};
 
     each_mode(|threading| {
-        let mut rig = Rig::polling(threading, Duration::from_secs(10));
+        let mut rig = Rig::polling(threading, Duration::from_secs(10), Duration::from_secs(5));
         let channel = rig.channel(HostClass::Maxwell);
         rig.submit(channel, &Pushbuffer::default().bind(0, MAXWELL_3D).0);
         let log = rig.log.clone();
