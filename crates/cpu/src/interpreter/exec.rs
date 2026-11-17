@@ -311,14 +311,15 @@ impl Exec<'_> {
     }
 
     /// Runs `op` on the host pointer for an atomic access of `bytes` bytes, which must be
-    /// naturally aligned, so it lies in one mapped page.
+    /// naturally aligned or, as FEAT_LSE2 allows, within one 16-byte block, so it lies in one
+    /// mapped page.
     fn atomic<R>(
         &self,
         addr: VAddr,
         bytes: u64,
         op: impl FnOnce(*mut u8) -> R,
     ) -> Result<R, HaltReason> {
-        if addr & (bytes - 1) != 0 {
+        if !atomic_alignment_ok(addr, bytes) {
             return Err(self.fault(CpuFault::Alignment { pc: self.pc, addr }));
         }
         self.cfg
@@ -952,8 +953,13 @@ impl Exec<'_> {
                 let (o0, o1) = if size == 2 {
                     let expected = (e1 << 32) | (e0 & 0xffff_ffff);
                     let new = (n1 << 32) | (n0 & 0xffff_ffff);
+                    let addr = self.x(rn);
+                    if addr & 7 != 0 {
+                        // CASP keeps natural alignment even with FEAT_LSE2.
+                        return Err(self.fault(CpuFault::Alignment { pc: self.pc, addr }));
+                    }
                     // SAFETY: as for `AtomicRmw`.
-                    let old = self.atomic(self.x(rn), 2 << size, |ptr| unsafe {
+                    let old = self.atomic(addr, 2 << size, |ptr| unsafe {
                         atomic_cas(ptr, 3, expected, new)
                     })?;
                     (old & 0xffff_ffff, old >> 32)
@@ -1101,6 +1107,102 @@ impl Exec<'_> {
     }
 }
 
+/// Whether an atomic access of `bytes` bytes at `addr` is allowed: naturally aligned, or (as
+/// FEAT_LSE2 allows, which titles rely on) within one 16-byte aligned block.
+pub(crate) fn atomic_alignment_ok(addr: u64, bytes: u64) -> bool {
+    addr & (bytes - 1) == 0 || (addr & 15) + bytes <= 16
+}
+
+/// An atomic update of the `bytes`-byte value at `ptr`, which is not naturally aligned but lies
+/// within one 16-byte aligned block: a compare-and-swap loop on the smallest aligned block holding
+/// it (8 bytes when it fits in one, else 16). Returns the value before the update.
+///
+/// The block's host atomic overlaps the narrower ones other guest atomics on the same bytes use,
+/// which the Rust memory model leaves undefined. On x86-64 hosts (the JIT's only target) every
+/// locked read-modify-write (`lock cmpxchg` or `lock cmpxchg16b` here, `lock xadd` and the like
+/// for aligned guest atomics) is atomic with respect to every other one whatever their sizes,
+/// which is the guarantee LSE2 gives the guest.
+///
+/// # Safety
+/// The aligned block holding `ptr` must be valid; host and guest addresses agree modulo 16
+/// (guest pages map to host pages).
+unsafe fn unaligned_update(ptr: *mut u8, bytes: u64, update: impl Fn(u64) -> u64) -> u64 {
+    let offset = ptr as usize & 7;
+    if offset as u64 + bytes <= 8 {
+        // SAFETY: the caller vouches for the block, which is 8-byte aligned.
+        let block = unsafe { AtomicU64::from_ptr(ptr.sub(offset).cast()) };
+        let mask = if bytes == 8 {
+            u64::MAX
+        } else {
+            (1u64 << (bytes * 8)) - 1
+        };
+        let shift = offset * 8;
+        let mut current = block.load(Ordering::SeqCst);
+        loop {
+            let old = (current >> shift) & mask;
+            let next = (current & !(mask << shift)) | ((update(old) & mask) << shift);
+            match block.compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return old,
+                Err(seen) => current = seen,
+            }
+        }
+    }
+    let offset = ptr as usize & 15;
+    // SAFETY: the caller vouches for the block.
+    let block = unsafe { portable_atomic::AtomicU128::from_ptr(ptr.sub(offset).cast()) };
+    let mask = if bytes >= 8 {
+        u128::from(u64::MAX)
+    } else {
+        (1u128 << (bytes * 8)) - 1
+    };
+    let shift = offset * 8;
+    let mut current = block.load(Ordering::SeqCst);
+    loop {
+        let old = ((current >> shift) & mask) as u64;
+        let new = u128::from(update(old)) & mask;
+        let next = (current & !(mask << shift)) | (new << shift);
+        match block.compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return old,
+            Err(seen) => current = seen,
+        }
+    }
+}
+
+/// `op` of `operand` on `old`, both `bytes` wide.
+fn rmw_value(op: AtomicOp, old: u64, operand: u64, bytes: u64) -> u64 {
+    let bits = bytes * 8;
+    let signed = |v: u64| ((v << (64 - bits)) as i64) >> (64 - bits);
+    let mask = if bits == 64 {
+        u64::MAX
+    } else {
+        (1 << bits) - 1
+    };
+    let (old, operand) = (old & mask, operand & mask);
+    match op {
+        AtomicOp::Add => old.wrapping_add(operand),
+        AtomicOp::Clr => old & !operand,
+        AtomicOp::Eor => old ^ operand,
+        AtomicOp::Set => old | operand,
+        AtomicOp::Smax => {
+            if signed(old) >= signed(operand) {
+                old
+            } else {
+                operand
+            }
+        }
+        AtomicOp::Smin => {
+            if signed(old) <= signed(operand) {
+                old
+            } else {
+                operand
+            }
+        }
+        AtomicOp::Umax => old.max(operand),
+        AtomicOp::Umin => old.min(operand),
+        AtomicOp::Swp => operand,
+    }
+}
+
 macro_rules! rmw {
     ($unsigned:ty, $signed:ty, $u:ty, $i:ty, $ptr:expr, $op:expr, $operand:expr) => {{
         // SAFETY: guaranteed by `atomic_rmw`'s caller.
@@ -1127,8 +1229,14 @@ macro_rules! rmw {
 }
 
 /// # Safety
-/// `ptr` must be valid for `1 << size` bytes and aligned to them.
+/// `ptr` must be valid for `1 << size` bytes and aligned to them, or lie with them within one
+/// valid 16-byte aligned block.
 pub(crate) unsafe fn atomic_rmw(ptr: *mut u8, size: u8, op: AtomicOp, operand: u64) -> u64 {
+    let bytes = 1u64 << size;
+    if ptr as usize & (bytes as usize - 1) != 0 {
+        // SAFETY: guaranteed by the caller.
+        return unsafe { unaligned_update(ptr, bytes, |old| rmw_value(op, old, operand, bytes)) };
+    }
     match size {
         0 => rmw!(AtomicU8, AtomicI8, u8, i8, ptr, op, operand),
         1 => rmw!(AtomicU16, AtomicI16, u16, i16, ptr, op, operand),
@@ -1140,8 +1248,22 @@ pub(crate) unsafe fn atomic_rmw(ptr: *mut u8, size: u8, op: AtomicOp, operand: u
 /// Returns the value memory held before the compare-and-swap.
 ///
 /// # Safety
-/// `ptr` must be valid for `1 << size` bytes and aligned to them.
+/// `ptr` must be valid for `1 << size` bytes and aligned to them, or lie with them within one
+/// valid 16-byte aligned block.
 pub(crate) unsafe fn atomic_cas(ptr: *mut u8, size: u8, expected: u64, new: u64) -> u64 {
+    let bytes = 1u64 << size;
+    if ptr as usize & (bytes as usize - 1) != 0 {
+        let mask = if bytes == 8 {
+            u64::MAX
+        } else {
+            (1 << (bytes * 8)) - 1
+        };
+        let (expected, new) = (expected & mask, new & mask);
+        // SAFETY: guaranteed by the caller.
+        return unsafe {
+            unaligned_update(ptr, bytes, |old| if old == expected { new } else { old })
+        };
+    }
     macro_rules! cas {
         ($atomic:ty) => {{
             // SAFETY: guaranteed by the caller.

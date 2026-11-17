@@ -284,6 +284,8 @@ pub enum Op {
         expected: Value,
         new: Value,
         pc: u64,
+        /// A CASP of two words: it keeps natural alignment even with FEAT_LSE2.
+        pair: bool,
     },
     /// `DC ZVA`: zeroes the 64 bytes at `addr`, which is 64-byte aligned.
     ZeroBlock {

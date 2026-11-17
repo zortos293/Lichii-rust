@@ -32,6 +32,8 @@ pub(super) const EXIT_INTERRUPT: u64 = 1;
 pub(super) const EXIT_FAULT: u64 = 2;
 /// The `info` operation code of a `CAS` slow path; `LD<op>` uses the `AtomicOp` discriminant.
 pub(super) const ATOMIC_CAS: i32 = 15;
+/// Bit of an atomic slow path's `info` set when the access keeps natural alignment (CASP).
+pub(super) const NATURAL_SHIFT: i32 = 16;
 
 /// Allocatable general-purpose registers, callee-saved ones first so slow paths save less.
 const GPRS: [u8; 9] = [3, 5, 12, 6, 7, 8, 9, 10, 11];
@@ -1151,7 +1153,10 @@ impl Emitter<'_> {
             Op::Load { .. } | Op::LoadVec { .. } => (self.target.read, size as i32),
             Op::Store { .. } | Op::StoreVec { .. } => (self.target.write, size as i32),
             Op::AtomicRmw { op, .. } => (self.target.atomic, size as i32 | (op as i32) << 8),
-            Op::Cas { .. } => (self.target.atomic, size as i32 | ATOMIC_CAS << 8),
+            Op::Cas { pair, .. } => (
+                self.target.atomic,
+                size as i32 | ATOMIC_CAS << 8 | i32::from(pair) << NATURAL_SHIFT,
+            ),
             Op::LoadExclusive { .. } => (self.target.exclusive, size as i32),
             Op::StoreExclusive { .. } | Op::StoreExclusive128 { .. } => {
                 (self.target.exclusive, size as i32 | 1 << 8)

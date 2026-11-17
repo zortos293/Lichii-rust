@@ -851,6 +851,7 @@ impl Translator<'_> {
                     expected,
                     new,
                     pc,
+                    pair: false,
                 });
                 self.set_x(rs, old);
             }
@@ -936,6 +937,7 @@ impl Translator<'_> {
                     expected,
                     new,
                     pc,
+                    pair: true,
                 });
                 self.split32(old, Reg(rs), Reg(rs + 1));
             }

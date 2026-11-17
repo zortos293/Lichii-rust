@@ -157,12 +157,14 @@ const ATOMIC_OPS: [AtomicOp; 9] = [
 /// and the operation above it; the operands are in `scratch` and `scratch2`.
 extern "sysv64" fn atomic_slow(state: &mut JitState, addr: u64, pc: u64, info: u32) -> bool {
     let size = info as u8;
-    if addr & ((1 << size) - 1) != 0 {
+    let natural = info >> x64::NATURAL_SHIFT & 1 != 0;
+    let aligned = addr & ((1 << size) - 1) == 0;
+    if !aligned && (natural || !crate::interpreter::atomic_alignment_ok(addr, 1 << size)) {
         state.fault = Some(CpuFault::Alignment { pc, addr });
         return true;
     }
     let (scratch, scratch2) = (state.scratch, state.scratch2);
-    let op = (info >> 8) as i32;
+    let op = (info >> 8 & 0xff) as i32;
     // SAFETY: called from a slow path.
     let memory = unsafe { state.memory() };
     let result = memory.write_with(addr, MemoryPermission::READ_WRITE, |ptr| {

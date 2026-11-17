@@ -324,8 +324,9 @@ fn narrow_signed_atomics_compare_signed_values() {
 fn misaligned_exclusives_and_atomics_fault() {
     for (word, addr) in [
         (0xc85f7c20u32, DATA + 4), // ldxr x0, [x1]
-        (0xb8200022, DATA + 2),    // ldadd w0, w2, [x1]
+        (0xb8200022, DATA + 14),   // ldadd w0, w2, [x1], across a 16-byte block
         (0x48227c24, DATA + 8),    // casp x2, x3, x4, x5, [x1]
+        (0x08227c24, DATA + 4),    // casp w2, w3, w4, w5, [x1], within a 16-byte block
     ] {
         let mut h = harness(&[word]);
         h.ctx.x[1] = addr;
@@ -335,4 +336,31 @@ fn misaligned_exclusives_and_atomics_fault() {
             "{word:#010x}"
         );
     }
+}
+
+/// FEAT_LSE2: an atomic that is not naturally aligned but stays within one 16-byte block runs
+/// atomically, and leaves the bytes around it alone.
+#[test]
+fn misaligned_atomics_within_sixteen_bytes_run() {
+    let mut h = harness(&[
+        0xb8200022, // ldadd w0, w2, [x1]
+        0x88a07c64, // cas w0, w4, [x3]
+        0xd4200000, // brk #0
+    ]);
+    h.mem.write(DATA, 0u64).unwrap();
+    h.mem.write(DATA + 8, 0u64).unwrap();
+    h.mem.write(DATA + 1, 0x1234_5678u32).unwrap();
+    h.mem.write(DATA + 10, 0xaabb_ccddu32).unwrap();
+    h.ctx.x[0] = 1;
+    h.ctx.x[1] = DATA + 1;
+    h.ctx.x[3] = DATA + 10;
+    h.ctx.x[4] = 0x0102_0304;
+    assert_eq!(h.core.run(&mut h.ctx), HaltReason::Breakpoint(0));
+    assert_eq!(h.ctx.x[2], 0x1234_5678);
+    assert_eq!(h.mem.read::<u32>(DATA + 1).unwrap(), 0x1234_5679);
+    assert_eq!(h.mem.read::<u8>(DATA).unwrap(), 0);
+    assert_eq!(h.mem.read::<u8>(DATA + 5).unwrap(), 0);
+    // The compare (1) fails against 0xaabbccdd: memory keeps it and w0 gets it.
+    assert_eq!(h.ctx.x[0], 0xaabb_ccdd);
+    assert_eq!(h.mem.read::<u32>(DATA + 10).unwrap(), 0xaabb_ccdd);
 }
