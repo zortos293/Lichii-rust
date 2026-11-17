@@ -251,15 +251,11 @@ impl<I: Input> FrameStream<I> {
     }
 
     /// Decodes blocks into `dst` until at least `target` bytes are out or the frame ends, and
-    /// returns how many bytes are decoded. Before each block `dst` must hold [`BLOCK_SIZE_MAX`]
-    /// bytes past what is decoded, or the whole declared content, so a caller can grow it as it
-    /// goes.
+    /// returns how many bytes are decoded. `dst` may grow between calls: it needs room for the
+    /// blocks this call decodes, [`BLOCK_SIZE_MAX`] past `target` or up to the end of the content,
+    /// and a block that does not fit fails with [`ZstdError::OutputTooSmall`].
     pub fn decode_to(&mut self, dst: &mut [u8], target: usize) -> Result<usize> {
         while !self.finished && self.decoded < target {
-            let room = (self.decoded + BLOCK_SIZE_MAX) as u64;
-            if (dst.len() as u64) < self.header.content_size.map_or(room, |size| size.min(room)) {
-                return Err(ZstdError::OutputTooSmall);
-            }
             let last;
             (self.decoded, last) = self.decoder.decode_next_block(
                 &mut self.input,
@@ -1237,6 +1233,24 @@ fn xxh64(data: &[u8], seed: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streams_a_frame_without_a_content_size_into_an_exact_buffer() {
+        let data: Vec<u8> = (0..100u8).collect();
+        let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00];
+        frame.extend(&(1u32 | (data.len() as u32) << 3).to_le_bytes()[..3]);
+        frame.extend(&data);
+        let input = Cursor {
+            data: &frame,
+            pos: 0,
+        };
+        let mut stream = FrameStream::new(Variant::Zstd, input).unwrap();
+        assert_eq!(stream.content_size(), None);
+        let mut dst = vec![0; data.len()];
+        assert_eq!(stream.decode_to(&mut dst, data.len()).unwrap(), data.len());
+        assert!(stream.is_finished());
+        assert_eq!(dst, data);
+    }
 
     struct Rng(u64);
 

@@ -971,9 +971,11 @@ impl ZstdFile {
             }
         };
         let room = (target + BLOCK_SIZE_MAX).min(self.size as usize);
-        if member.data.len() < room {
+        if room > member.data.capacity() {
             let capacity = room.max((2 * member.data.capacity()).min(self.size as usize));
             member.data.reserve_exact(capacity - member.data.len());
+        }
+        if room > member.data.len() {
             member.data.resize(room, 0);
         }
         member.decoded = frame.decode_to(&mut member.data, target)?;
@@ -1094,7 +1096,9 @@ impl DecodeCache {
         }
         cached.used = clock;
         cached.read_at = now;
-        cached.member.clone()
+        let member = cached.member.clone();
+        state.evict(index, now);
+        member
     }
 
     /// Charges a file what its decoding left it holding, then evicts other files to fit. A file
@@ -1108,16 +1112,24 @@ impl DecodeCache {
             state.bytes = state.bytes - cached.charge + charge;
             cached.charge = charge;
         }
-        let mut victims = state.by_use.iter();
+        state.evict(index, now);
+    }
+}
+
+impl CacheState {
+    /// Evicts files other than `keep`, least recently read first, until the cache is within
+    /// [`DECODE_BUDGET`], sparing files read within [`RECENT`] while it is within [`DECODE_LIMIT`].
+    fn evict(&mut self, keep: usize, now: Instant) {
         let mut evict = Vec::new();
-        let mut bytes = state.bytes;
+        let mut bytes = self.bytes;
+        let mut victims = self.by_use.iter();
         while bytes > DECODE_BUDGET
             && let Some((&used, &victim)) = victims.next()
         {
-            if victim == index {
+            if victim == keep {
                 continue;
             }
-            let cached = &state.members[&victim];
+            let cached = &self.members[&victim];
             if now.duration_since(cached.read_at) < RECENT && bytes <= DECODE_LIMIT {
                 break;
             }
@@ -1125,9 +1137,9 @@ impl DecodeCache {
             evict.push((used, victim));
         }
         for (used, victim) in evict {
-            state.by_use.remove(&used);
-            if let Some(evicted) = state.members.remove(&victim) {
-                state.bytes -= evicted.charge;
+            self.by_use.remove(&used);
+            if let Some(evicted) = self.members.remove(&victim) {
+                self.bytes -= evicted.charge;
             }
         }
     }
@@ -1699,6 +1711,12 @@ mod tests {
         );
 
         let later = start + RECENT + Duration::from_secs(1);
+        cache.member(2, later);
+        assert_eq!(
+            cached(),
+            (vec![2], 40),
+            "a cached read evicts idle files too"
+        );
         fill(3, 10 * MIB, later);
         assert_eq!(cached(), (vec![2, 3], 50), "idle files go, oldest first");
 
