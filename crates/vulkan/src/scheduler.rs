@@ -555,7 +555,7 @@ impl Drop for Scheduler {
             let _ = self.flush();
         }
         let last = self.tick - 1;
-        if let Err(error) = self.wait(last) {
+        if let Err(error) = self.wait(last).and_then(|()| self.wait_part(self.part)) {
             tracing::error!("waiting for the GPU on shutdown: {error}");
             self.device.wait_idle();
         }
