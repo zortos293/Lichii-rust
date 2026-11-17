@@ -19,6 +19,10 @@ const NO_RECORD: u32 = u32::MAX;
 /// Direct-mapped slots of the last record found or stored per start address: nearly half the
 /// calls repeat the previous call of the same macro, and its record is still in the cache.
 const LAST_SLOTS: usize = 256;
+/// Direct-mapped slots of the records found or stored recently, indexed by call hash: the map
+/// spreads even a small working set over all its reserved buckets, while these 32 KiB stay in
+/// cache.
+const HOT_SLOTS: usize = 4096;
 /// Arena words per map entry the memo reserves: a store that would need more entries clears
 /// the memo instead of growing the map. Small arenas get at least `MIN_ENTRIES`.
 const WORDS_PER_ENTRY: usize = 32;
@@ -31,6 +35,8 @@ pub struct MemoStats {
     pub hits: u64,
     /// Hits found through the last-call slot, without hashing.
     pub slot_hits: u64,
+    /// Hits found through the hot hash slots, without probing the map.
+    pub hot_hits: u64,
     /// Calls with no record.
     pub misses: u64,
     /// Calls whose record's data RAM reads no longer held (or whose hash collided).
@@ -82,6 +88,8 @@ pub(super) struct MacroMemo {
     arena: Vec<u32>,
     max_entries: usize,
     last: Box<[(u32, u32); LAST_SLOTS]>,
+    /// The (high hash half, record offset) of a recent call per hash slot.
+    hot: Box<[(u32, u32); HOT_SLOTS]>,
     generation: u64,
     max_words: usize,
     stats: MemoStats,
@@ -95,6 +103,7 @@ impl MacroMemo {
             arena: Vec::with_capacity(max_words),
             max_entries,
             last: Box::new([(0, NO_RECORD); LAST_SLOTS]),
+            hot: Box::new([(0, NO_RECORD); HOT_SLOTS]),
             generation: 0,
             max_words,
             stats: MemoStats::default(),
@@ -116,6 +125,7 @@ impl MacroMemo {
         self.arena.clear();
         self.entries.clear();
         self.last.fill((0, NO_RECORD));
+        self.hot.fill((0, NO_RECORD));
     }
 
     /// Heap bytes the arena and the map hold.
@@ -149,14 +159,27 @@ impl MacroMemo {
             self.stats.slot_hits += 1;
             return Some(self.replay(last_offset));
         }
-        let Some(&offset) = self.entries.get(&key(start, parameters)) else {
-            self.stats.misses += 1;
-            return None;
+        let hash = key(start, parameters);
+        let hot = hot_slot(hash);
+        let (tag, hot_offset) = self.hot[hot];
+        let offset = if tag == hash_tag(hash)
+            && hot_offset != NO_RECORD
+            && self.matches(hot_offset, start, parameters, data_ram)
+        {
+            self.stats.hot_hits += 1;
+            hot_offset
+        } else {
+            let Some(&offset) = self.entries.get(&hash) else {
+                self.stats.misses += 1;
+                return None;
+            };
+            if !self.matches(offset, start, parameters, data_ram) {
+                self.stats.guard_failures += 1;
+                return None;
+            }
+            self.hot[hot] = (hash_tag(hash), offset);
+            offset
         };
-        if !self.matches(offset, start, parameters, data_ram) {
-            self.stats.guard_failures += 1;
-            return None;
-        }
         self.last[slot] = (start, offset);
         self.stats.hits += 1;
         Some(self.replay(offset))
@@ -213,6 +236,7 @@ impl MacroMemo {
                     at += words.len();
                 }
                 self.last[slot] = (start, offset);
+                self.hot[hot_slot(hash)] = (hash_tag(hash), offset);
                 self.stats.stores += 1;
                 self.stats.overwrites += 1;
                 return;
@@ -239,6 +263,7 @@ impl MacroMemo {
         }
         self.entries.insert(hash, offset);
         self.last[slot] = (start, offset);
+        self.hot[hot_slot(hash)] = (hash_tag(hash), offset);
         self.stats.stores += 1;
     }
 
@@ -266,12 +291,21 @@ impl MacroMemo {
         }
         self.arena.truncate(write);
         self.last.fill((0, NO_RECORD));
+        self.hot.fill((0, NO_RECORD));
         self.stats.compactions += 1;
         if self.arena.len() + incoming > self.max_words / 4 * 3 {
             self.clear();
             self.stats.clears += 1;
         }
     }
+}
+
+fn hot_slot(hash: u64) -> usize {
+    hash as usize % HOT_SLOTS
+}
+
+fn hash_tag(hash: u64) -> u32 {
+    (hash >> 32) as u32
 }
 
 /// The hash of a call's start address and parameters, mixed for use as the map's hash.
