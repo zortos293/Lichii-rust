@@ -2393,7 +2393,7 @@ impl VulkanRasterizer {
                 ),
             }
         }
-        assert_eq!(
+        debug_assert_eq!(
             draw.descriptor_infos.len(),
             template.descriptors,
             "the draw's writes cover its layout's set 0"
@@ -2403,7 +2403,9 @@ impl VulkanRasterizer {
         };
         let set = draw.descriptors.allocate(&mut self.scheduler, layout)?;
         // SAFETY: `descriptor_infos` holds the template's `descriptors` infos in its entries'
-        // order and stride; the set is live and unused by recorded work.
+        // order and stride: the layout merges the bindings of the draw's modules, and
+        // `bind_resources` writes all `count` elements of every one of them or skips the draw.
+        // The set is live and unused by recorded work.
         unsafe {
             self.device.raw.update_descriptor_set_with_template(
                 set,
