@@ -1532,14 +1532,17 @@ impl BufferCache {
         let cmd = scheduler.record()?;
         before_transfer(&self.device, cmd);
         let mut holes = false;
-        for segment in &self.segments {
-            if matches!(segment.target, RangeTarget::Device(_)) {
+        let device = |range: &GpuRange| matches!(range.target, RangeTarget::Device(_));
+        for run in self.segments.chunk_by(|a, b| device(a) == device(b)) {
+            if device(&run[0]) {
                 continue;
             }
-            let start = (segment.gpu_va - gpu_va) & !3;
-            let end = (segment.gpu_va - gpu_va + segment.size).next_multiple_of(4);
+            let last = run[run.len() - 1];
+            let start = (run[0].gpu_va - gpu_va) & !3;
+            let end = (last.gpu_va + last.size - gpu_va).next_multiple_of(4);
             // SAFETY: `cmd` is recording and `[start, end)` lies inside the padded slice, at
-            // 4-byte aligned offsets.
+            // 4-byte aligned offsets. Runs between holes are whole GMMU pages, so no two widened
+            // holes overlap.
             unsafe {
                 self.device
                     .raw
@@ -3025,6 +3028,30 @@ mod tests {
         assert!(
             f.read_binding(gathered) == expected,
             "the hole reads zero and the unaligned edges keep their device bytes"
+        );
+
+        let mixed = GPU_VA + 16 * PAGE_SIZE;
+        f.gmmu.map_sparse(mixed, PAGE_SIZE, false).unwrap();
+        f.gmmu
+            .map(mixed + 2 * PAGE_SIZE, DADDR + 0x80000, PAGE_SIZE, 0, false)
+            .unwrap();
+        let gathered = f
+            .cache
+            .vertex_buffer(
+                &mut f.scheduler,
+                &mut f.staging,
+                &f.gmmu,
+                mixed + 2,
+                2 * PAGE_SIZE,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(gathered.offset, dirty.offset);
+        let mut expected = vec![0; 2 * PAGE_SIZE as usize - 2];
+        expected.extend_from_slice(&contents[2][..2]);
+        assert!(
+            f.read_binding(gathered) == expected,
+            "adjacent sparse and unmapped pages read zero as one hole"
         );
         f.assert_no_validation_errors();
     }
