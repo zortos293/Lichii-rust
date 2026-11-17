@@ -1556,6 +1556,7 @@ impl Rasterizer for VulkanRasterizer {
 
     fn flush_for_cpu_read(&mut self, addr: DAddr, size: u64) {
         if crate::debug::device_is_lost() {
+            self.handles.device.disarm_flush_traps(addr, size);
             return;
         }
         let end = addr.saturating_add(size);
