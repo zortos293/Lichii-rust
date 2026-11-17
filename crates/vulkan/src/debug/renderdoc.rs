@@ -343,7 +343,8 @@ impl FrameCapture {
         self.frame += 1;
         let toggled = self.renderdoc.toggle.swap(false, Ordering::Relaxed);
         let next = self.frame + 1;
-        let next_listed = self.renderdoc.frames.binary_search(&next).is_ok();
+        let next_listed =
+            self.renderdoc.frames.binary_search(&next).is_ok() || liru14_capture_due();
         let step = step(
             self.running.map(|(trigger, _)| trigger),
             toggled,
@@ -369,6 +370,23 @@ impl FrameCapture {
             self.renderdoc.end(self.id, (first, self.frame.max(first)));
         }
     }
+}
+
+fn liru14_capture_due() -> bool {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    static DONE: AtomicBool = AtomicBool::new(false);
+    let Some(at) = std::env::var("LIRU14_CAPTURE_AT")
+        .ok()
+        .and_then(|text| text.trim().parse::<f64>().ok())
+    else {
+        return false;
+    };
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs_f64()
+        >= at
+        && !DONE.swap(true, Ordering::Relaxed)
 }
 
 #[cfg(test)]

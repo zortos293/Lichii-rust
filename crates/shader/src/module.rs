@@ -45,7 +45,25 @@ fn finish(
 ) -> Result<ShaderModule, TranslateError> {
     let incoming = *bindings;
     let first_binding = bindings.unified;
-    let spirv = emit_spirv(options.profile, runtime, &program, bindings)?;
+    let spirv = match emit_spirv(options.profile, runtime, &program, bindings) {
+        Ok(spirv) => spirv,
+        Err(error) => {
+            eprintln!(
+                "LIRU14 failed program {:016x} stage {:?}: {error}",
+                program.hash, program.stage
+            );
+            if let Some(dir) = std::env::var_os("LIRU14_DUMP_DIR") {
+                let dir = std::path::PathBuf::from(dir);
+                let name = format!("failed-{:016x}", program.hash);
+                let _ = std::fs::write(dir.join(format!("{name}.ir")), program.ir.dump());
+                let _ = std::fs::write(
+                    dir.join(format!("{name}.info")),
+                    format!("{:#?}", program.info),
+                );
+            }
+            return Err(error.into());
+        }
+    };
     let resources = ResourceLayout::for_module(&program.info, first_binding);
     debug_assert_eq!(resources.next_binding(first_binding), bindings.unified);
     let mut hasher = StableHasher::new();
