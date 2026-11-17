@@ -486,7 +486,7 @@ impl Presenter {
             cmd,
             output.image,
             COLOR_RANGE,
-            ImageAccess::UNDEFINED,
+            ImageAccess::ACQUIRED,
             ImageAccess::COLOR_ATTACHMENT,
         );
         begin_rendering(

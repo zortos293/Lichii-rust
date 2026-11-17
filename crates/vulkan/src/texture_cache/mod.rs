@@ -58,6 +58,7 @@ pub use blit::{BlitSide, NearestSampling};
 pub use info::{GuestLayout, ImageInfo, ImageKind, ViewInfo};
 
 use crate::buffer_cache::BufferCache;
+use crate::chunk_mask::ChunkMask;
 use crate::commands::{ImageAccess, transfer_to_all_barrier, transition};
 use crate::device::Device;
 use crate::error::{Error, Result};
@@ -661,7 +662,9 @@ pub struct TextureCache {
     scale: ResolutionScale,
     slots: Vec<Slot>,
     free: Vec<u32>,
-    pages: HashMap<u64, Vec<ImageId>>,
+    pages: HashMap<u64, Vec<ImageId>, FxBuild>,
+    /// The chunks of `pages`, so writes away from every image skip its lookups.
+    chunks: ChunkMask,
     lookup: HashMap<LookupKey, LookupEntry, FxBuild>,
     host_formats: Vec<Option<HostFormat>>,
     tick: u64,
@@ -1070,7 +1073,8 @@ impl TextureCache {
             scale: ResolutionScale::X1,
             slots: Vec::new(),
             free: Vec::new(),
-            pages: HashMap::new(),
+            pages: HashMap::default(),
+            chunks: ChunkMask::default(),
             lookup: HashMap::default(),
             host_formats: vec![None; PixelFormat::ALL.len()],
             tick: 0,
@@ -1674,6 +1678,9 @@ impl TextureCache {
     /// GPU-modified images first write their other texels back, so only the CPU's bytes replace
     /// GPU data.
     pub fn invalidate(&mut self, tx: &mut Transfer<'_>, daddr: DAddr, size: u64) -> Result<()> {
+        if !self.chunks.any(daddr, size) {
+            return Ok(());
+        }
         self.collect_overlaps(&[Segment {
             offset: 0,
             daddr,
@@ -2361,6 +2368,9 @@ impl TextureCache {
         let visit = self.visit;
         self.ids.clear();
         for range in ranges {
+            if !self.chunks.any(range.daddr, range.size) {
+                continue;
+            }
             for page in pages(range.daddr, range.size) {
                 let Some(bucket) = self.pages.get(&page) else {
                     continue;
@@ -2815,17 +2825,12 @@ impl TextureCache {
                 self.slots.len() as u32 - 1
             }
         };
-        let slot = &mut self.slots[index as usize];
         let id = ImageId {
             index,
-            generation: slot.generation,
+            generation: self.slots[index as usize].generation,
         };
-        for s in &cached.segments {
-            for page in pages(s.daddr, s.size) {
-                self.pages.entry(page).or_default().push(id);
-            }
-        }
-        slot.image = Some(cached);
+        self.index_pages(id, &cached.segments);
+        self.slots[index as usize].image = Some(cached);
         self.lru_push(index);
         Ok(id)
     }
@@ -2847,21 +2852,8 @@ impl TextureCache {
         let segments = self.segments.clone();
         let old = std::mem::replace(&mut self.image(id).segments, segments.clone());
         self.image(id).self_aliased = self_aliased(&segments);
-        for s in &old {
-            for page in pages(s.daddr, s.size) {
-                if let Some(bucket) = self.pages.get_mut(&page) {
-                    bucket.retain(|&other| other != id);
-                    if bucket.is_empty() {
-                        self.pages.remove(&page);
-                    }
-                }
-            }
-        }
-        for s in &segments {
-            for page in pages(s.daddr, s.size) {
-                self.pages.entry(page).or_default().push(id);
-            }
-        }
+        self.unindex_pages(id, &old);
+        self.index_pages(id, &segments);
         let image = self.image(id);
         image.tracked.clear();
         remapped_bytes(&old, &segments, |lo, hi| image.mark_bytes_dirty(lo, hi));
@@ -2897,7 +2889,25 @@ impl TextureCache {
         }
         self.removals += 1;
         self.free.push(id.index);
-        for s in &image.segments {
+        self.unindex_pages(id, &image.segments);
+        self.lru_unlink(id.index);
+        scheduler.retire((image.views, image.image));
+    }
+
+    /// Adds `id` to the page lookups of `segments`.
+    fn index_pages(&mut self, id: ImageId, segments: &[Segment]) {
+        for s in segments {
+            self.chunks.insert(s.daddr, s.size);
+            for page in pages(s.daddr, s.size) {
+                self.pages.entry(page).or_default().push(id);
+            }
+        }
+    }
+
+    /// Drops `id` from the page lookups of `segments`, and the chunks no other image's segment
+    /// touches from `chunks`.
+    fn unindex_pages(&mut self, id: ImageId, segments: &[Segment]) {
+        for s in segments {
             for page in pages(s.daddr, s.size) {
                 if let Some(bucket) = self.pages.get_mut(&page) {
                     bucket.retain(|&other| other != id);
@@ -2906,9 +2916,25 @@ impl TextureCache {
                     }
                 }
             }
+            let (lookups, slots) = (&self.pages, &self.slots);
+            self.chunks.retain(s.daddr, s.size, |lo, hi| {
+                pages(lo, hi - lo).any(|page| {
+                    lookups.get(&page).is_some_and(|bucket| {
+                        bucket.iter().any(|other| {
+                            slots[other.index as usize]
+                                .image
+                                .as_ref()
+                                .is_some_and(|image| {
+                                    image
+                                        .segments
+                                        .iter()
+                                        .any(|o| o.daddr < hi && o.daddr + o.size.max(1) > lo)
+                                })
+                        })
+                    })
+                })
+            });
         }
-        self.lru_unlink(id.index);
-        scheduler.retire((image.views, image.image));
     }
 
     /// Replaces the host image with one at `scale`; `blit` carries the contents over.
@@ -3664,11 +3690,15 @@ impl TextureCache {
             return;
         }
         let start = daddr & !(PAGE_SIZE - 1);
+        let size = end.next_multiple_of(PAGE_SIZE) - start;
+        if !self.chunks.any(start, size) {
+            return;
+        }
         std::mem::swap(&mut self.ids, &mut self.rearm_ids);
         self.collect_overlaps(&[Segment {
             offset: 0,
             daddr: start,
-            size: end.next_multiple_of(PAGE_SIZE) - start,
+            size,
         }]);
         let memory = self.flush_traps.as_ref().expect("checked above");
         for &id in &self.ids {

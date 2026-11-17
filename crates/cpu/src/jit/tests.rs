@@ -296,7 +296,7 @@ fn simd(rng: &mut Rng) -> u32 {
     }
 }
 
-const VECTOR: [&str; 24] = [
+const VECTOR: [&str; 25] = [
     "0xx01110xx1xxxxx0110x1xxxxxxxxxx",
     "0xx01110xx1xxxxx000x01xxxxxxxxxx",
     "0xx01110xx1xxxxx00x011xxxxxxxxxx",
@@ -307,6 +307,7 @@ const VECTOR: [&str; 24] = [
     "0xx01110011xxxxx101101xxxxxxxxxx",
     "0xx01110xx1xxxxx1010x1xxxxxxxxxx",
     "0xx011110xxxxxxx101001xxxxxxxxxx",
+    "0xx011110xxxxxxx100xx1xxxxxxxxxx",
     "0x001110xx100001010010xxxxxxxxxx",
     "01011110000xxxxx000001xxxxxxxxxx",
     "0x101110000xxxxx0xxxx0xxxxxxxxxx",
@@ -324,7 +325,7 @@ const VECTOR: [&str; 24] = [
 ];
 
 /// An Advanced SIMD integer three-same (halving, saturating, absolute-difference and pairwise max/min forms
-/// too), compare against zero, `CNT`, shift by immediate (long too), `ZIP1`/`ZIP2`, three-different (`SADDL`, `SMLAL` and the rest), integer by-element, `SQDMULH`/`SQRDMULH`, copy or modified-immediate instruction, or an `LD1`..`LD4`/`ST1`..`ST4` of one to four registers on `X20`..`X23` or
+/// too), compare against zero, `CNT`, shift by immediate (long, accumulating, inserting and narrowing too), `ZIP1`/`ZIP2`, three-different (`SADDL`, `SMLAL` and the rest), integer by-element, `SQDMULH`/`SQRDMULH`, copy or modified-immediate instruction, or an `LD1`..`LD4`/`ST1`..`ST4` of one to four registers on `X20`..`X23` or
 /// `SP`, offset or post-indexed by an immediate or `X24`/`X26`.
 fn vector(rng: &mut Rng) -> u32 {
     if rng.below(3) == 0 {
@@ -740,6 +741,18 @@ fn saturating_doubling_long_multiplies_match_the_interpreter() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn shift_inserts_at_the_lane_width_match_the_interpreter() {
+    const DUP_V0_X0: u32 = 0x4e08_0c00;
+    const DUP_V1_X1: u32 = 0x4e08_0c21;
+    for op in [0x6f40_4420, 0x6f40_5420, 0x6f20_4420, 0x6f10_5420] {
+        directed(
+            &[DUP_V0_X0, DUP_V1_X1, op],
+            &[(0, 0x0123_4567_89ab_cdef), (1, 0xfedc_ba98_7654_3210)],
+        );
     }
 }
 

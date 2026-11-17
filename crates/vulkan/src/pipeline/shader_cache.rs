@@ -55,6 +55,7 @@ use super::environment::{EnvRead, ProgramEnv, TextureAnswers};
 use super::shader_disk::ShaderDisk;
 use super::shader_workers::{Job, Workers};
 use super::{FxBuildHasher, FxHasher};
+use crate::chunk_mask::ChunkMask;
 use crate::debug::shader_dump;
 
 /// Counts since the cache was created.
@@ -211,6 +212,8 @@ pub struct ShaderCache {
     /// its length.
     segments: BTreeMap<(DAddr, DAddr), u64>,
     longest: u64,
+    /// The chunks of `segments`, so writes away from every program skip their lookup.
+    chunks: ChunkMask,
     /// Bumped by every guest write to a known program's bytes and every resolution scale change.
     generation: u64,
     modules: HashMap<ModuleKey, Variants, FxBuildHasher>,
@@ -243,6 +246,7 @@ impl ShaderCache {
             programs: HashMap::default(),
             segments: BTreeMap::new(),
             longest: 0,
+            chunks: ChunkMask::default(),
             generation: 0,
             modules: HashMap::default(),
             disk: None,
@@ -348,6 +352,9 @@ impl ShaderCache {
     /// The guest wrote `[daddr, +size)`: programs any of whose device ranges it touches are
     /// hashed again before their next use.
     pub fn invalidate(&mut self, daddr: DAddr, size: u64) {
+        if !self.chunks.any(daddr, size) {
+            return;
+        }
         let end = daddr.saturating_add(size);
         let from = (daddr.saturating_sub(self.longest), 0);
         for (&(start, key), &len) in self.segments.range(from..(end, 0)) {
@@ -686,6 +693,7 @@ impl ShaderCache {
         for &(daddr, size) in &segments {
             self.longest = self.longest.max(size);
             self.segments.insert((daddr, key), size);
+            self.chunks.insert(daddr, size);
         }
         let program = ProgramBytes {
             len,
@@ -696,10 +704,16 @@ impl ShaderCache {
         };
         if let Some(old) = self.programs.insert(key, program) {
             let current = &self.programs[&key].segments;
-            for &(daddr, _) in &old.segments {
+            for &(daddr, size) in &old.segments {
                 if !current.iter().any(|&(d, _)| d == daddr) {
                     self.segments.remove(&(daddr, key));
                 }
+                let (segments, longest) = (&self.segments, self.longest);
+                self.chunks.retain(daddr, size, |lo, hi| {
+                    segments
+                        .range((lo.saturating_sub(longest), 0)..(hi, 0))
+                        .any(|(&(start, _), &len)| start + len.max(1) > lo)
+                });
             }
         }
         hash
@@ -778,6 +792,9 @@ pub(super) fn warn_failed(env: &ProgramEnv<'_>, error: &TranslateError) {
         _ => tracing::error!(?stage, address, "translating a program failed: {error}"),
     }
 }
+
+#[cfg(test)]
+mod invalidate_tests;
 
 #[cfg(test)]
 mod tests {
