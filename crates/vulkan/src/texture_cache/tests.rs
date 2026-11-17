@@ -26,6 +26,14 @@ struct Fixture {
 }
 
 fn fixture(gob: GobLayout, recompression: AstcRecompression) -> Option<Fixture> {
+    fixture_with_dram(gob, recompression, DRAM)
+}
+
+fn fixture_with_dram(
+    gob: GobLayout,
+    recompression: AstcRecompression,
+    dram: u64,
+) -> Option<Fixture> {
     let instance = match Instance::new(true, SurfaceSupport::None) {
         Ok(instance) => Arc::new(instance),
         Err(error) => {
@@ -40,12 +48,12 @@ fn fixture(gob: GobLayout, recompression: AstcRecompression) -> Option<Fixture> 
             return None;
         }
     };
-    let physical = Arc::new(PhysicalMemory::new(DRAM).unwrap());
-    physical.commit(0, DRAM).unwrap();
+    let physical = Arc::new(PhysicalMemory::new(dram).unwrap());
+    physical.commit(0, dram).unwrap();
     let memory = Arc::new(DeviceAddressSpace::new(physical, 36));
-    memory.map(DADDR, 0, DRAM);
+    memory.map(DADDR, 0, dram);
     let gmmu = Gmmu::new(memory.clone(), BigPageSize::Size64K);
-    gmmu.map(GPU_VA, DADDR, DRAM, 0, false).unwrap();
+    gmmu.map(GPU_VA, DADDR, dram, 0, false).unwrap();
     let written = Arc::new(GpuWrittenPages::new(36));
     let lazy = Arc::new(lichii_gpu::lazy::LazyDeviceRanges::new(memory.clone()));
     Some(Fixture {
@@ -833,7 +841,7 @@ fn stale_overlaps_are_not_joined_over_newer_whole_clears() {
 }
 
 #[test]
-fn stale_overlaps_take_newer_texels_before_they_are_drawn_into() {
+fn targets_drawn_into_keep_their_own_texels_over_newer_overlaps() {
     let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
         return;
     };
@@ -841,12 +849,188 @@ fn stale_overlaps_take_newer_texels_before_they_are_drawn_into() {
     let small = rt_info(32, 32, 2, GobLayout::Tegra);
     let a = clear_rt(&mut f, &big, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
     let b = clear_rt(&mut f, &small, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    let before = f.cache.traffic();
     let (mut tx, cache, gmmu) = f.tx();
     let found = cache
         .render_target(&mut tx, gmmu, GPU_VA, &big, false)
         .unwrap()
         .unwrap();
     assert_eq!(found.id, a.id);
+    assert_eq!(f.cache.traffic(), before, "no sync, upload or write-back");
+    assert!(
+        all_texels(&f.read_image(a.id)[0], GREEN),
+        "the target's own texels"
+    );
+    assert!(all_texels(&f.read_image(b.id)[0], RED));
+    let (id, _) = f.texture(&tic(0x08, GPU_VA, 64, 64, 1, 1, 3));
+    assert_eq!(id, a.id);
+    assert_eq!(
+        f.cache.traffic().gpu_syncs,
+        before.gpu_syncs + 1,
+        "a bind with no draw leaves the newer overlap to the next read"
+    );
+    assert_eq!(count_texels(&f.read_image(a.id)[0], RED), 32 * 32);
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn targets_drawn_into_take_newer_overlaps_on_their_texel_grid() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let one = rt_info(32, 32, 2, GobLayout::Tegra);
+    let two = ImageInfo { layers: 2, ..one };
+    let a = clear_rt(&mut f, &one, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let b = clear_rt(&mut f, &two, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    assert_ne!(a.id, b.id);
+    let (mut tx, cache, gmmu) = f.tx();
+    let found = cache
+        .render_target(&mut tx, gmmu, GPU_VA, &one, false)
+        .unwrap()
+        .unwrap();
+    let read = f.read_image(found.id);
+    assert!(
+        all_texels(&read[found.layer as usize], RED),
+        "the newer layered target's texels"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn depth_arrays_cleared_a_layer_at_a_time_join_into_one_image() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let format = PixelFormat::X8D24Unorm;
+    let array = ImageInfo {
+        format,
+        layers: 4,
+        layer_stride: surface(format, 64, 64, 1, 4, 2, GobLayout::Tegra).layer_stride(),
+        ..rt_info(64, 64, 2, GobLayout::Tegra)
+    };
+    let depths = [0.25, 0.5, 0.75, 1.0];
+    let mut last = None;
+    for (layer, depth) in (0u32..).zip(depths) {
+        let (mut tx, cache, gmmu) = f.tx();
+        let target = cache
+            .render_target(
+                &mut tx,
+                gmmu,
+                GPU_VA,
+                &array.with_layers(layer + 1),
+                layer == 0,
+            )
+            .unwrap()
+            .unwrap();
+        cache
+            .clear(
+                &mut tx,
+                target,
+                ClearValue::DepthStencil {
+                    depth: Some(depth),
+                    stencil: None,
+                    stencil_mask: 0xff,
+                },
+                Rect::ALL,
+                layer,
+                1,
+            )
+            .unwrap();
+        last = Some(target.id);
+    }
+    assert_eq!(f.cache.len(), 1, "each larger array joins the smaller one");
+    let traffic = f.cache.traffic();
+    for layers in 1..=4 {
+        let (mut tx, cache, gmmu) = f.tx();
+        let found = cache
+            .render_target(&mut tx, gmmu, GPU_VA, &array.with_layers(layers), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!((Some(found.id), found.layer), (last, 0));
+    }
+    assert_eq!(f.cache.traffic(), traffic, "binds sync nothing");
+    let (mut tx, cache, _) = f.tx();
+    cache.flush(&mut tx, DADDR, array.size_bytes()).unwrap();
+    let stride = array.layer_stride as usize;
+    let guest = guest_texels(&f, 0, stride * 4);
+    for (layer, depth) in depths.into_iter().enumerate() {
+        let expected = (f64::from(depth) * 16_777_215.0).round() as u32;
+        for &texel in guest[layer * stride..][..64 * 64 * 4].as_chunks::<4>().0 {
+            let d = u32::from_le_bytes(texel) & 0xff_ffff;
+            assert!(d.abs_diff(expected) <= 1, "layer {layer} depth {d:#x}");
+        }
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn targets_drawn_into_take_newer_mip_chains_over_them() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let small = rt_info(32, 32, 2, GobLayout::Tegra);
+    let b = clear_rt(&mut f, &small, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let (chain, _) = f.texture(&tic(0x08, GPU_VA, 64, 64, 1, 3, 3));
+    assert_ne!(chain, b.id);
+    let level = clear_rt(
+        &mut f,
+        &rt_info(64, 64, 3, GobLayout::Tegra),
+        [1.0, 0.0, 0.0, 1.0],
+        Rect::ALL,
+    );
+    assert_eq!(level.id, chain, "the chain's level 0 is drawn into");
+    let (mut tx, cache, gmmu) = f.tx();
+    let found = cache
+        .render_target(&mut tx, gmmu, GPU_VA, &small, false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.id, b.id);
+    assert!(
+        all_texels(&f.read_image(b.id)[0], RED),
+        "the chain's newer texels"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn new_targets_take_newer_overlaps_before_they_are_drawn_into() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let big = rt_info(64, 64, 3, GobLayout::Tegra);
+    let small = rt_info(32, 32, 2, GobLayout::Tegra);
+    let a = clear_rt(&mut f, &big, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let corner = Rect {
+        x: 0,
+        y: 0,
+        width: 8,
+        height: 8,
+    };
+    let b = clear_rt(&mut f, &small, [1.0, 0.0, 0.0, 1.0], corner);
+    assert_ne!(a.id, b.id);
+    let read = f.read_image(b.id);
+    assert_eq!(count_texels(&read[0], RED), 8 * 8);
+    assert_eq!(
+        count_texels(&read[0], GREEN),
+        32 * 32 - 8 * 8,
+        "the older target's texels"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn sampled_images_still_take_newer_overlaps() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let big = rt_info(64, 64, 3, GobLayout::Tegra);
+    let small = rt_info(32, 32, 2, GobLayout::Tegra);
+    let a = clear_rt(&mut f, &big, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let b = clear_rt(&mut f, &small, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    let syncs = f.cache.traffic().gpu_syncs;
+    let (id, _) = f.texture(&tic(0x08, GPU_VA, 64, 64, 1, 1, 3));
+    assert_eq!(id, a.id);
+    assert_eq!(f.cache.traffic().gpu_syncs, syncs + 1);
     let read = f.read_image(a.id);
     assert_eq!(
         count_texels(&read[0], RED),
@@ -2031,6 +2215,7 @@ fn blits_scale_between_render_targets_on_the_gpu() {
             gmmu,
             &blit_side(GPU_VA, src, [0, 0, 64, 64]),
             &blit_side(dst_va, dst, [0, 0, 32, 32]),
+            vk::Filter::NEAREST,
         )
         .unwrap();
     assert!(blitted);
@@ -2057,6 +2242,89 @@ fn blits_scale_between_render_targets_on_the_gpu() {
 }
 
 #[test]
+fn linear_blits_average_the_source_texels_on_the_gpu() {
+    let gob = GobLayout::Tegra;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let src = rt_info(64, 64, 3, gob);
+    let dst = rt_info(32, 32, 2, gob);
+    let dst_va = GPU_VA + (64 << 10);
+    clear_rt(&mut f, &src, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let column = Rect {
+        x: 0,
+        y: 0,
+        width: 1,
+        height: 64,
+    };
+    clear_rt(&mut f, &src, [1.0, 0.0, 0.0, 1.0], column);
+    let before = f.cache.traffic();
+    let (mut tx, cache, gmmu) = f.tx();
+    let blitted = cache
+        .blit(
+            &mut tx,
+            gmmu,
+            &blit_side(GPU_VA, src, [0, 0, 64, 64]),
+            &blit_side(dst_va, dst, [0, 0, 32, 32]),
+            vk::Filter::LINEAR,
+        )
+        .unwrap();
+    assert!(blitted);
+    assert_eq!(f.cache.traffic(), before, "the downscale stays on the GPU");
+    let (mut tx, cache, _) = f.tx();
+    cache
+        .flush(&mut tx, DADDR + (64 << 10), dst.size_bytes())
+        .unwrap();
+    let tiling = Tiling::new(32, 32, 1, 4, 2, 0, gob);
+    let mut tiled = vec![0; tiling.size_bytes()];
+    f.memory.read_bytes(DADDR + (64 << 10), &mut tiled).unwrap();
+    let mut linear = vec![0; tiling.linear_size_bytes()];
+    unswizzle(&tiling, &tiled, &mut linear);
+    for (i, texel) in linear.as_chunks::<4>().0.iter().enumerate() {
+        let (x, y) = (i % 32, i / 32);
+        let want = if x == 0 { [128, 128, 0, 255] } else { GREEN };
+        assert!(
+            texel
+                .iter()
+                .zip(want)
+                .all(|(&got, want)| got.abs_diff(want) <= 1),
+            "texel ({x}, {y}) is {texel:?}, not {want:?}"
+        );
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn linear_blits_of_integer_texels_go_to_software() {
+    let gob = GobLayout::Tegra;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let integer = |width, height, bh| ImageInfo {
+        format: PixelFormat::A8B8G8R8Uint,
+        ..rt_info(width, height, bh, gob)
+    };
+    let (src, dst) = (integer(64, 64, 3), integer(32, 32, 2));
+    clear_rt(&mut f, &src, [0.0; 4], Rect::ALL);
+    let (mut tx, cache, gmmu) = f.tx();
+    let side = blit_side(GPU_VA, src, [0, 0, 64, 64]);
+    let target = blit_side(GPU_VA + (64 << 10), dst, [0, 0, 32, 32]);
+    assert!(
+        !cache
+            .blit(&mut tx, gmmu, &side, &target, vk::Filter::LINEAR)
+            .unwrap(),
+        "integer texels have no linear filter"
+    );
+    assert!(
+        cache
+            .blit(&mut tx, gmmu, &side, &target, vk::Filter::NEAREST)
+            .unwrap(),
+        "but blit nearest"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
 fn blits_the_host_cannot_do_as_they_are_go_to_software() {
     let gob = GobLayout::Tegra;
     let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
@@ -2076,7 +2344,8 @@ fn blits_the_host_cannot_do_as_they_are_go_to_software() {
                 &mut tx,
                 gmmu,
                 &side,
-                &blit_side(GPU_VA + (64 << 10), integer, [0, 0, 32, 32])
+                &blit_side(GPU_VA + (64 << 10), integer, [0, 0, 32, 32]),
+                vk::Filter::NEAREST,
             )
             .unwrap(),
         "a float format into an integer one"
@@ -2087,7 +2356,8 @@ fn blits_the_host_cannot_do_as_they_are_go_to_software() {
                 &mut tx,
                 gmmu,
                 &side,
-                &blit_side(GPU_VA, src, [0, 0, 32, 32])
+                &blit_side(GPU_VA, src, [0, 0, 32, 32]),
+                vk::Filter::NEAREST,
             )
             .unwrap(),
         "one image on both sides"
@@ -2098,7 +2368,8 @@ fn blits_the_host_cannot_do_as_they_are_go_to_software() {
                 &mut tx,
                 gmmu,
                 &side,
-                &blit_side(GPU_VA + (128 << 10), src, [0, 0, 65, 64])
+                &blit_side(GPU_VA + (128 << 10), src, [0, 0, 65, 64]),
+                vk::Filter::NEAREST,
             )
             .unwrap(),
         "a rectangle leaving its image"
@@ -2124,10 +2395,83 @@ fn blits_from_guest_data_stay_in_software() {
             gmmu,
             &blit_side(GPU_VA, src, [0, 0, 64, 64]),
             &blit_side(GPU_VA + (64 << 10), dst, [0, 0, 32, 32]),
+            vk::Filter::NEAREST,
         )
         .unwrap();
     assert!(!blitted, "an uploaded source no GPU work wrote");
     assert_eq!(f.cache.traffic(), before, "no upload for a software blit");
+    f.assert_no_validation_errors();
+}
+
+/// Texel `(2x + 1, 2y + 1)` of a 64-texel-wide RGBA8 level for each texel of the 32x32 level a
+/// nearest 2:1 `vkCmdBlitImage` makes of it.
+fn nearest_halving(level: &[u8]) -> Vec<u8> {
+    (0..32 * 32)
+        .flat_map(|i| {
+            let (x, y) = (i % 32, i / 32);
+            let at = ((2 * y + 1) * 64 + 2 * x + 1) * 4;
+            level[at..at + 4].to_vec()
+        })
+        .collect()
+}
+
+#[test]
+fn guest_data_blits_into_a_cached_image_on_the_gpu() {
+    let gob = GobLayout::Tegra;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let s = surface(PixelFormat::A8B8G8R8Unorm, 64, 64, 1, 1, 3, gob);
+    let data = level_data(&s, 7);
+    write_surface(&f.memory, &s, &data);
+    let src = rt_info(64, 64, 3, gob);
+    let dst = rt_info(32, 32, 2, gob);
+    let dst_va = GPU_VA + (64 << 10);
+    let target = clear_rt_at(&mut f, dst_va, &dst, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    let (mut tx, cache, gmmu) = f.tx();
+    let blitted = cache
+        .blit(
+            &mut tx,
+            gmmu,
+            &blit_side(GPU_VA, src, [0, 0, 64, 64]),
+            &blit_side(dst_va, dst, [0, 0, 32, 32]),
+            vk::Filter::NEAREST,
+        )
+        .unwrap();
+    assert!(
+        blitted,
+        "the GPU reads the target, so the source uploads once"
+    );
+    assert_eq!(f.read_image(target.id)[0], nearest_halving(&data[0]));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn mip_chain_levels_blit_into_each_other_on_the_gpu() {
+    let gob = GobLayout::Tegra;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let s = surface(PixelFormat::A8B8G8R8Unorm, 64, 64, 2, 1, 3, gob);
+    let data = level_data(&s, 9);
+    write_surface(&f.memory, &s, &data);
+    let (chain, view) = f.texture(&tic(0x08, GPU_VA, 64, 64, 1, 2, 3));
+    assert_eq!(view.levels, 2);
+    let level_va = GPU_VA + s.level_offset(1);
+    let (mut tx, cache, gmmu) = f.tx();
+    let blitted = cache
+        .blit(
+            &mut tx,
+            gmmu,
+            &blit_side(GPU_VA, rt_info(64, 64, 3, gob), [0, 0, 64, 64]),
+            &blit_side(level_va, rt_info(32, 32, 2, gob), [0, 0, 32, 32]),
+            vk::Filter::NEAREST,
+        )
+        .unwrap();
+    assert!(blitted, "level 0 into level 1 of one image");
+    let read = f.read_image(chain);
+    assert_eq!(read[0], data[0]);
+    assert_eq!(read[1], nearest_halving(&data[0]));
     f.assert_no_validation_errors();
 }
 
@@ -2326,7 +2670,7 @@ fn narrower_block_linear_textures_alias_their_render_target_without_a_flush() {
 }
 
 #[test]
-fn overlaps_of_another_layout_sync_on_the_gpu_without_a_flush() {
+fn overlaps_of_another_layout_drawn_into_in_turn_keep_their_own_texels() {
     let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
         return;
     };
@@ -2361,10 +2705,9 @@ fn overlaps_of_another_layout_sync_on_the_gpu_without_a_flush() {
         after.uploads, before.uploads,
         "no re-upload from guest memory"
     );
-    assert!(
-        after.gpu_syncs >= before.gpu_syncs + 6,
-        "each switch synced on the GPU"
-    );
+    assert_eq!(after.gpu_syncs, before.gpu_syncs, "no switch synced");
+    assert!(all_texels(&f.read_image(first.id)[0], RED));
+    assert!(all_texels(&f.read_image(second.id)[0], GREEN));
     f.assert_no_validation_errors();
 }
 
@@ -2407,10 +2750,7 @@ fn gpu_overlap_syncs_move_texels_through_the_guest_layout() {
     let syncs = f.cache.traffic().gpu_syncs;
     let downloads = f.cache.traffic().downloads;
     let (mut tx, cache, gmmu) = f.tx();
-    let synced = cache
-        .render_target(&mut tx, gmmu, GPU_VA, &wide, false)
-        .unwrap()
-        .unwrap();
+    let synced = cache.find(&mut tx, gmmu, GPU_VA, &wide).unwrap().unwrap();
     assert_eq!(synced.id, target.id);
     let texels = f.read_image(target.id).remove(0);
     assert!(f.cache.traffic().gpu_syncs > syncs);
@@ -2442,10 +2782,7 @@ fn gpu_overlap_syncs_skip_overlaps_of_block_padding_alone() {
     );
     let syncs = f.cache.traffic().gpu_syncs;
     let (mut tx, cache, gmmu) = f.tx();
-    let synced = cache
-        .render_target(&mut tx, gmmu, GPU_VA, &padded, false)
-        .unwrap()
-        .unwrap();
+    let synced = cache.find(&mut tx, gmmu, GPU_VA, &padded).unwrap().unwrap();
     assert_eq!(synced.id, target.id);
     assert!(f.cache.traffic().gpu_syncs > syncs);
     assert_eq!(f.read_image(target.id).remove(0), expected);
@@ -2485,10 +2822,7 @@ fn gpu_overlap_syncs_give_aliased_bytes_to_the_last_source_page() {
     );
     let syncs = f.cache.traffic().gpu_syncs;
     let (mut tx, cache, gmmu) = f.tx();
-    let synced = cache
-        .render_target(&mut tx, gmmu, GPU_VA, &info, false)
-        .unwrap()
-        .unwrap();
+    let synced = cache.find(&mut tx, gmmu, GPU_VA, &info).unwrap().unwrap();
     assert_eq!(synced.id, target.id);
     assert!(f.cache.traffic().gpu_syncs > syncs);
     let texels = f.read_image(target.id).remove(0);
@@ -2526,10 +2860,7 @@ fn aliased_sources_whose_rows_end_inside_a_word_write_back_through_guest_memory(
     clear_rt_at(&mut f, alias, &bytes, [1.0, 0.0, 0.0, 0.0], Rect::ALL);
     let before = f.cache.traffic();
     let (mut tx, cache, gmmu) = f.tx();
-    let synced = cache
-        .render_target(&mut tx, gmmu, GPU_VA, &info, false)
-        .unwrap()
-        .unwrap();
+    let synced = cache.find(&mut tx, gmmu, GPU_VA, &info).unwrap().unwrap();
     assert_eq!(synced.id, target.id);
     let after = f.cache.traffic();
     assert_eq!(after.gpu_syncs, before.gpu_syncs, "no GPU sync");
@@ -2551,10 +2882,7 @@ fn gpu_overlap_syncs_keep_texels_whose_later_alias_is_padding() {
     clear_rt_at(&mut f, alias, &info, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
     let syncs = f.cache.traffic().gpu_syncs;
     let (mut tx, cache, gmmu) = f.tx();
-    let synced = cache
-        .render_target(&mut tx, gmmu, GPU_VA, &info, false)
-        .unwrap()
-        .unwrap();
+    let synced = cache.find(&mut tx, gmmu, GPU_VA, &info).unwrap().unwrap();
     assert_eq!(synced.id, target.id);
     assert!(f.cache.traffic().gpu_syncs > syncs);
     let texels = f.read_image(target.id).remove(0);
@@ -2619,10 +2947,7 @@ fn depth_stencil_overlaps_sync_on_the_gpu() {
         let syncs = f.cache.traffic().gpu_syncs;
         let downloads = f.cache.traffic().downloads;
         let (mut tx, cache, gmmu) = f.tx();
-        let synced = cache
-            .render_target(&mut tx, gmmu, GPU_VA, &wide, false)
-            .unwrap()
-            .unwrap();
+        let synced = cache.find(&mut tx, gmmu, GPU_VA, &wide).unwrap().unwrap();
         assert_eq!(synced.id, target.id);
         assert!(f.cache.traffic().gpu_syncs > syncs, "{format:?}");
         assert_eq!(f.cache.traffic().downloads, downloads, "{format:?}");
@@ -2756,10 +3081,7 @@ fn x8d24_overlaps_sync_on_the_gpu_converting_as_the_cpu_does() {
         );
         let before = f.cache.traffic();
         let (mut tx, cache, gmmu) = f.tx();
-        let synced = cache
-            .render_target(&mut tx, gmmu, GPU_VA, &depth, false)
-            .unwrap()
-            .unwrap();
+        let synced = cache.find(&mut tx, gmmu, GPU_VA, &depth).unwrap().unwrap();
         assert_eq!(synced.id, target.id);
         assert!(f.cache.traffic().gpu_syncs > before.gpu_syncs, "{host:?}");
         assert_eq!(f.cache.traffic().downloads, before.downloads, "{host:?}");
@@ -2805,10 +3127,7 @@ fn x8d24_overlaps_sync_on_the_gpu_converting_as_the_cpu_does() {
             .collect();
         let before = f.cache.traffic();
         let (mut tx, cache, gmmu) = f.tx();
-        let taken = cache
-            .render_target(&mut tx, gmmu, GPU_VA, &colour, false)
-            .unwrap()
-            .unwrap();
+        let taken = cache.find(&mut tx, gmmu, GPU_VA, &colour).unwrap().unwrap();
         assert!(f.cache.traffic().gpu_syncs > before.gpu_syncs, "{host:?}");
         assert_eq!(f.cache.traffic().downloads, before.downloads, "{host:?}");
         let texels = f.read_image(taken.id).remove(0);
@@ -3560,6 +3879,705 @@ fn cached_misses_end_when_an_image_is_created() {
     f.assert_no_validation_errors();
 }
 
+/// Colour targets bound one layer at a time, at their layer's address, which a later 2D-array
+/// or cube texture over the same memory samples as its layers.
+#[test]
+fn layer_targets_rendered_one_at_a_time_form_the_array_and_cube_textures_over_them() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        for (layers, texture_type, size, bh) in [(5, 5, 128, 4), (6, 3, 64, 3), (2, 5, 256, 4)] {
+            let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+                return;
+            };
+            let mut header = tic(0x08, GPU_VA, size, size, layers, 1, bh);
+            header.0[4] = (header.0[4] & !(0xf << 23)) | texture_type << 23;
+            let desc = header.decode().unwrap();
+            let array = ImageInfo::from_texture(&desc, gob).unwrap();
+            let info = rt_info(size, size, bh, gob);
+            for layer in 0..layers {
+                let value = (layer + 1) as f32 / 8.0;
+                clear_rt_at(
+                    &mut f,
+                    GPU_VA + u64::from(layer) * array.layer_stride,
+                    &info,
+                    [value, 0.0, 1.0 - value, 1.0],
+                    Rect::ALL,
+                );
+            }
+            let (id, view) = f.texture(&header);
+            let texels = f.read_image(id);
+            for layer in 0..layers {
+                let value = ((layer + 1) as f32 / 8.0 * 255.0).round() as u8;
+                let got = &texels[(view.base_layer + layer) as usize];
+                assert!(
+                    got.as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|&t| unorm8_close(t, [value, 0, 255 - value, 255])),
+                    "{gob:?} {size}x{size}x{layers} type {texture_type}: layer {layer} holds {:?}",
+                    &got[..4]
+                );
+            }
+            f.assert_no_validation_errors();
+        }
+    }
+}
+
+fn unorm8_close(a: [u8; 4], b: [u8; 4]) -> bool {
+    a.iter().zip(b).all(|(&x, y)| x.abs_diff(y) <= 1)
+}
+
+/// The same as above for the formats MKW's light probes use, whose targets read back as one
+/// uniform value per layer, distinct between layers and never zero.
+#[test]
+fn layer_targets_of_float_and_snorm_formats_form_the_textures_over_them() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        for (format, code, kind) in [
+            (PixelFormat::R16G16B16A16Float, 0x03, 7),
+            (PixelFormat::B10G11R11Float, 0x21, 7),
+            (PixelFormat::R8Snorm, 0x1d, 1),
+        ] {
+            for (layers, texture_type, size, bh) in [(5, 5, 128, 4), (6, 3, 64, 3)] {
+                let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+                    return;
+                };
+                let mut header = tic(code, GPU_VA, size, size, layers, 1, bh);
+                header.0[0] = (header.0[0] & !(0xfff << 7))
+                    | kind << 7
+                    | kind << 10
+                    | kind << 13
+                    | kind << 16;
+                header.0[4] = (header.0[4] & !(0xf << 23)) | texture_type << 23;
+                let desc = header.decode().unwrap();
+                let array = ImageInfo::from_texture(&desc, gob).unwrap();
+                assert_eq!(array.format, format);
+                let s = surface(format, size, size, 1, 1, bh, gob);
+                let info = ImageInfo {
+                    format,
+                    layers: 1,
+                    layer_stride: s.layer_stride(),
+                    ..rt_info(size, size, bh, gob)
+                };
+                for layer in 0..layers {
+                    let value = (layer + 1) as f32 / 8.0;
+                    clear_rt_at(
+                        &mut f,
+                        GPU_VA + u64::from(layer) * array.layer_stride,
+                        &info,
+                        [value, 0.25, 1.0 - value, 1.0],
+                        Rect::ALL,
+                    );
+                }
+                let (id, view) = f.texture(&header);
+                let texels = f.read_image(id);
+                let texel = format.bytes_per_block() as usize;
+                let mut seen = Vec::new();
+                for layer in 0..layers {
+                    let got = &texels[(view.base_layer + layer) as usize];
+                    let first = &got[..texel];
+                    assert!(
+                        first.iter().any(|&b| b != 0)
+                            && got.chunks(texel).all(|t| t == first)
+                            && !seen.contains(&first.to_vec()),
+                        "{gob:?} {format:?} {size}x{size}x{layers} type {texture_type}: layer {layer} holds {first:?}"
+                    );
+                    seen.push(first.to_vec());
+                }
+                f.assert_no_validation_errors();
+            }
+        }
+    }
+}
+
+/// Every level of every face of a mipmapped cube rendered as its own target, at the address
+/// and block height the level has in the cube, then sampled as the cube.
+#[test]
+fn level_and_face_targets_form_the_mipmapped_cube_over_them() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        for (format, code, kind) in [
+            (PixelFormat::A8B8G8R8Unorm, 0x08, 2),
+            (PixelFormat::B10G11R11Float, 0x21, 7),
+            (PixelFormat::R16G16B16A16Float, 0x03, 7),
+        ] {
+            let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+                return;
+            };
+            let (size, levels, bh) = (64, 7, 3);
+            let mut header = tic(code, GPU_VA, size, size, 1, levels, bh);
+            header.0[0] =
+                (header.0[0] & !(0xfff << 7)) | kind << 7 | kind << 10 | kind << 13 | kind << 16;
+            header.0[4] = (header.0[4] & !(0xf << 23)) | 3 << 23;
+            let desc = header.decode().unwrap();
+            let cube = ImageInfo::from_texture(&desc, gob).unwrap();
+            assert_eq!((cube.layers, cube.levels), (6, levels));
+            let layout = cube.surface();
+            for layer in 0..6 {
+                for level in 0..levels {
+                    let tiling = layout.level_tiling(level);
+                    let (w, h) = ((size >> level).max(1), (size >> level).max(1));
+                    let s = surface(format, w, h, 1, 1, tiling.block_height_log2, gob);
+                    let info = ImageInfo {
+                        format,
+                        width: w,
+                        height: h,
+                        layer_stride: s.layer_stride(),
+                        ..rt_info(w, h, tiling.block_height_log2, gob)
+                    };
+                    let value = (layer * levels + level + 1) as f32 / 64.0;
+                    clear_rt_at(
+                        &mut f,
+                        GPU_VA + cube.subresource_offset(level, layer),
+                        &info,
+                        [value, 0.25, 1.0 - value, 1.0],
+                        Rect::ALL,
+                    );
+                }
+            }
+            let (id, view) = f.texture(&header);
+            assert_eq!(view.base_layer, 0);
+            let texels = f.read_image(id);
+            let texel = format.bytes_per_block() as usize;
+            let mut seen = Vec::new();
+            for layer in 0..6 {
+                for level in 0..levels {
+                    let got = &texels[(layer * levels + level) as usize];
+                    let first = &got[..texel];
+                    assert!(
+                        first.iter().any(|&b| b != 0)
+                            && got.chunks(texel).all(|t| t == first)
+                            && !seen.contains(&first.to_vec()),
+                        "{gob:?} {format:?}: face {layer} level {level} holds {first:?}"
+                    );
+                    seen.push(first.to_vec());
+                }
+            }
+            f.assert_no_validation_errors();
+        }
+    }
+}
+/// The same with the cube sampled before its faces and levels are rendered.
+#[test]
+fn level_and_face_targets_render_into_the_mipmapped_cube_sampled_before_them() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        for (format, code, kind) in [
+            (PixelFormat::A8B8G8R8Unorm, 0x08, 2),
+            (PixelFormat::B10G11R11Float, 0x21, 7),
+            (PixelFormat::R16G16B16A16Float, 0x03, 7),
+        ] {
+            let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+                return;
+            };
+            let (size, levels, bh) = (64, 7, 3);
+            let mut header = tic(code, GPU_VA, size, size, 1, levels, bh);
+            header.0[0] =
+                (header.0[0] & !(0xfff << 7)) | kind << 7 | kind << 10 | kind << 13 | kind << 16;
+            header.0[4] = (header.0[4] & !(0xf << 23)) | 3 << 23;
+            let desc = header.decode().unwrap();
+            let cube = ImageInfo::from_texture(&desc, gob).unwrap();
+            assert_eq!((cube.layers, cube.levels), (6, levels));
+            let layout = cube.surface();
+            let (first, _) = f.texture(&header);
+            for layer in 0..6 {
+                for level in 0..levels {
+                    let tiling = layout.level_tiling(level);
+                    let (w, h) = ((size >> level).max(1), (size >> level).max(1));
+                    let s = surface(format, w, h, 1, 1, tiling.block_height_log2, gob);
+                    let info = ImageInfo {
+                        format,
+                        width: w,
+                        height: h,
+                        layer_stride: s.layer_stride(),
+                        ..rt_info(w, h, tiling.block_height_log2, gob)
+                    };
+                    let value = (layer * levels + level + 1) as f32 / 64.0;
+                    clear_rt_at(
+                        &mut f,
+                        GPU_VA + cube.subresource_offset(level, layer),
+                        &info,
+                        [value, 0.25, 1.0 - value, 1.0],
+                        Rect::ALL,
+                    );
+                }
+            }
+            let (id, view) = f.texture(&header);
+            assert_eq!(id, first, "the faces render into the cube");
+            assert_eq!(view.base_layer, 0);
+            let texels = f.read_image(id);
+            let texel = format.bytes_per_block() as usize;
+            let mut seen = Vec::new();
+            for layer in 0..6 {
+                for level in 0..levels {
+                    let got = &texels[(layer * levels + level) as usize];
+                    let first = &got[..texel];
+                    assert!(
+                        first.iter().any(|&b| b != 0)
+                            && got.chunks(texel).all(|t| t == first)
+                            && !seen.contains(&first.to_vec()),
+                        "{gob:?} {format:?}: face {layer} level {level} holds {first:?}"
+                    );
+                    seen.push(first.to_vec());
+                }
+            }
+            f.assert_no_validation_errors();
+        }
+    }
+}
+
+/// A single-layer block-linear colour target as a draw's register state gives it.
+fn mkw_target(format: u32, w: u32, h: u32, bh: u32, array_pitch: u32, gob: GobLayout) -> ImageInfo {
+    use lichii_gpu::engines::maxwell_3d::regs::{RenderTargetConfig, TileMode};
+    let mut rt: RenderTargetConfig = bytemuck::Zeroable::zeroed();
+    rt.address_low = 0x10_0000;
+    rt.width = w;
+    rt.height = h;
+    rt.format = format;
+    rt.tile_mode = TileMode(bh << 4);
+    rt.bits.0 = 1;
+    rt.array_pitch = array_pitch;
+    ImageInfo::from_render_target(&rt, 0, gob).unwrap()
+}
+
+/// Mario Kart World's light-probe cube array: two B10G11R11 128x128 cubes of 4 levels, 12
+/// layers 0x16000 apart. Each draw renders one level of one cube with its six faces bound as
+/// C0..C5, every face a single-layer target at its layer and level offset; the forward
+/// shaders then sample the whole cube array.
+fn mkw_cube_array(gob: GobLayout) -> (TicEntry, ImageInfo) {
+    let mut header = tic(0x21, GPU_VA, 128, 128, 2, 4, 4);
+    header.0[0] = (header.0[0] & !(0xfff << 7)) | 7 << 7 | 7 << 10 | 7 << 13 | 7 << 16;
+    header.0[4] = (header.0[4] & !(0xf << 23)) | 8 << 23;
+    let desc = header.decode().unwrap();
+    assert_eq!(desc.texture_type, TextureType::CubeArray);
+    let array = ImageInfo::from_texture(&desc, gob).unwrap();
+    assert_eq!((array.layers, array.levels), (12, 4));
+    assert_eq!(array.layer_stride, 0x16000, "{gob:?}");
+    assert_eq!(
+        [1, 2, 3].map(|l| array.subresource_offset(l, 0)),
+        [0x10000, 0x14000, 0x15000],
+        "{gob:?}"
+    );
+    assert_eq!(array.subresource_offset(0, 6), 0x84000, "{gob:?}");
+    (header, array)
+}
+
+/// Renders every level of both cubes as six-target draws, resolving all six faces before
+/// clearing any as a draw binds them. Returns, per subresource, the image, level and layer
+/// each face resolved to.
+fn render_mkw_cube_faces(
+    f: &mut Fixture,
+    array: &ImageInfo,
+    target_bh: impl Fn(u32) -> u32,
+    green: f32,
+    gob: GobLayout,
+) -> Vec<Found> {
+    let layout = array.surface();
+    let mut founds = Vec::new();
+    for cube in 0..2 {
+        for level in 0..4 {
+            let size = 128 >> level;
+            let bh = target_bh(layout.level_tiling(level).block_height_log2);
+            let info = mkw_target(0xe0, size, size, bh, 0x5800, gob);
+            let (mut tx, cache, gmmu) = f.tx();
+            let faces: Vec<Found> = (0..6)
+                .map(|face| {
+                    let address = GPU_VA + array.subresource_offset(level, cube * 6 + face);
+                    cache
+                        .render_target(&mut tx, gmmu, address, &info, false)
+                        .unwrap()
+                        .unwrap()
+                })
+                .collect();
+            for (face, &target) in faces.iter().enumerate() {
+                assert!(
+                    cache.state(target.id).is_some(),
+                    "{gob:?} cube {cube} level {level}: C{face}'s image died resolving the later faces"
+                );
+                let value = ((cube * 6 + face as u32) * 4 + level + 1) as f32 / 64.0;
+                cache
+                    .clear(
+                        &mut tx,
+                        target,
+                        ClearValue::Color {
+                            value: vk::ClearColorValue {
+                                float32: [value, green, 1.0 - value, 1.0],
+                            },
+                            mask: vk::ColorComponentFlags::RGBA,
+                        },
+                        Rect::ALL,
+                        0,
+                        1,
+                    )
+                    .unwrap();
+            }
+            founds.extend(faces);
+        }
+    }
+    founds
+}
+
+/// Whether every subresource of the cube array reads back uniform, nonzero and distinct
+/// from the others and from `before`; the failures as text.
+fn check_mkw_cube(texels: &[Vec<u8>], before: Option<&[Vec<u8>]>) -> Vec<String> {
+    let mut seen = Vec::new();
+    let mut failures = Vec::new();
+    for layer in 0..12 {
+        for level in 0..4 {
+            let i = (layer * 4 + level) as usize;
+            let got = &texels[i];
+            let first = &got[..4];
+            if first.iter().all(|&b| b == 0)
+                || !got.chunks(4).all(|t| t == first)
+                || seen.contains(&first.to_vec())
+                || before.is_some_and(|b| &b[i][..4] == first)
+            {
+                failures.push(format!("layer {layer} level {level} holds {first:?}"));
+            }
+            seen.push(first.to_vec());
+        }
+    }
+    failures
+}
+
+#[test]
+fn mkw_cube_array_faces_rendered_before_the_array_join_it_and_then_render_into_it() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+            return;
+        };
+        let (header, array) = mkw_cube_array(gob);
+        let faces = render_mkw_cube_faces(&mut f, &array, |bh| bh, 0.25, gob);
+        assert!(faces.iter().all(|t| (t.level, t.layer) == (0, 0)));
+        let (id, view) = f.texture(&header);
+        assert_eq!(
+            (view.view_type, view.base_layer, view.layers, view.levels),
+            (vk::ImageViewType::CUBE_ARRAY, 0, 12, 4)
+        );
+        let live: Vec<_> = faces
+            .iter()
+            .filter(|t| t.id != id && f.cache.state(t.id).is_some())
+            .collect();
+        assert!(
+            live.is_empty(),
+            "{gob:?}: face targets left beside the array: {live:?}"
+        );
+        let first = f.read_image(id);
+        let failures = check_mkw_cube(&first, None);
+        assert!(failures.is_empty(), "{gob:?} joined: {failures:#?}");
+        let again = render_mkw_cube_faces(&mut f, &array, |bh| bh, 0.5, gob);
+        for (i, t) in again.iter().enumerate() {
+            let (cube, level, face) = (i as u32 / 24, i as u32 / 6 % 4, i as u32 % 6);
+            assert_eq!(
+                (t.id, t.level, t.layer),
+                (id, level, cube * 6 + face),
+                "{gob:?} cube {cube} level {level} face {face}"
+            );
+        }
+        assert_eq!(f.texture(&header).0, id);
+        let failures = check_mkw_cube(&f.read_image(id), Some(&first));
+        assert!(failures.is_empty(), "{gob:?} second frame: {failures:#?}");
+        f.assert_no_validation_errors();
+    }
+}
+
+#[test]
+fn mkw_cube_array_faces_render_into_the_array_sampled_before_them() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+            return;
+        };
+        let (header, array) = mkw_cube_array(gob);
+        let (id, _) = f.texture(&header);
+        let faces = render_mkw_cube_faces(&mut f, &array, |bh| bh, 0.25, gob);
+        for (i, t) in faces.iter().enumerate() {
+            let (cube, level, face) = (i as u32 / 24, i as u32 / 6 % 4, i as u32 % 6);
+            assert_eq!(
+                (t.id, t.level, t.layer),
+                (id, level, cube * 6 + face),
+                "{gob:?} cube {cube} level {level} face {face}"
+            );
+        }
+        assert_eq!(f.texture(&header).0, id);
+        let failures = check_mkw_cube(&f.read_image(id), None);
+        assert!(failures.is_empty(), "{gob:?}: {failures:#?}");
+        f.assert_no_validation_errors();
+    }
+}
+
+/// The same with every level's targets keeping the base level's block height, as a target
+/// set up from the cube's own header would. The C++ texture cache does not compare block
+/// sizes when it matches a target to a level.
+#[test]
+fn mkw_cube_array_level_targets_at_the_base_block_height_render_into_the_array() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+            return;
+        };
+        let (header, array) = mkw_cube_array(gob);
+        let (id, _) = f.texture(&header);
+        let faces = render_mkw_cube_faces(&mut f, &array, |_| 4, 0.25, gob);
+        let mut failures = Vec::new();
+        for (i, t) in faces.iter().enumerate() {
+            let (cube, level, face) = (i as u32 / 24, i as u32 / 6 % 4, i as u32 % 6);
+            if (t.id, t.level, t.layer) != (id, level, cube * 6 + face) {
+                failures.push(format!("cube {cube} level {level} face {face} -> {t:?}"));
+            }
+        }
+        assert_eq!(f.texture(&header).0, id);
+        failures.extend(check_mkw_cube(&f.read_image(id), None));
+        assert!(failures.is_empty(), "{gob:?} (array {id:?}): {failures:#?}");
+        f.assert_no_validation_errors();
+    }
+}
+
+/// Mario Kart World's 832x466x2 A8B8G8R8 array: each layer is rendered as its own target,
+/// layer 1 at the padded layer stride 0x1a0000, and the pair sampled as a 2D array.
+#[test]
+fn mkw_npot_array_layers_rendered_as_targets_form_and_render_into_the_array() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        for sample_first in [false, true] {
+            let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+                return;
+            };
+            let header = tic(0x08, GPU_VA, 832, 466, 2, 1, 4);
+            let desc = header.decode().unwrap();
+            let array = ImageInfo::from_texture(&desc, gob).unwrap();
+            assert_eq!((array.layers, array.layer_stride), (2, 0x1a0000), "{gob:?}");
+            let info = mkw_target(0xd5, 832, 466, 4, 0x1a0000 / 4, gob);
+            let early = sample_first.then(|| f.texture(&header).0);
+            let render = |f: &mut Fixture, blue: f32| -> Vec<Found> {
+                (0..2u32)
+                    .map(|layer| {
+                        clear_rt_at(
+                            f,
+                            GPU_VA + u64::from(layer) * 0x1a0000,
+                            &info,
+                            [(layer + 1) as f32 / 4.0, 0.0, blue, 1.0],
+                            Rect::ALL,
+                        )
+                    })
+                    .collect()
+            };
+            let founds = render(&mut f, 0.25);
+            let (id, view) = f.texture(&header);
+            let case = format!("{gob:?} sample_first {sample_first}");
+            assert_eq!(early.unwrap_or(id), id, "{case}");
+            assert_eq!((view.base_layer, view.layers), (0, 2), "{case}");
+            if sample_first {
+                assert_eq!(
+                    founds
+                        .iter()
+                        .map(|t| (t.id, t.level, t.layer))
+                        .collect::<Vec<_>>(),
+                    [(id, 0, 0), (id, 0, 1)],
+                    "{case}"
+                );
+            } else {
+                let live: Vec<_> = founds
+                    .iter()
+                    .filter(|t| t.id != id && f.cache.state(t.id).is_some())
+                    .collect();
+                assert!(
+                    live.is_empty(),
+                    "{case}: targets left beside the array: {live:?}"
+                );
+            }
+            let check = |texels: &[Vec<u8>], blue: u8| {
+                for (layer, got) in texels.iter().enumerate() {
+                    let red = ((layer + 1) as f32 / 4.0 * 255.0).round() as u8;
+                    assert!(
+                        got.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .all(|&t| unorm8_close(t, [red, 0, blue, 255])),
+                        "{case}: layer {layer} holds {:?}",
+                        &got[..4]
+                    );
+                }
+            };
+            check(&f.read_image(id), 64);
+            let again = render(&mut f, 0.75);
+            assert_eq!(
+                again
+                    .iter()
+                    .map(|t| (t.id, t.level, t.layer))
+                    .collect::<Vec<_>>(),
+                [(id, 0, 0), (id, 0, 1)],
+                "{case} second frame"
+            );
+            assert_eq!(f.texture(&header).0, id, "{case}");
+            check(&f.read_image(id), 191);
+            f.assert_no_validation_errors();
+        }
+    }
+}
+
+const CHUNK: u64 = 1 << 20;
+
+/// Maps `size` bytes at `gpu_va` to the device pages at `daddr` in 1 MiB chunks, chunk `i`
+/// to device chunk `place(i, chunks)`: device backing scattered as Mario Kart World's 16 MiB
+/// chunks are. Returns the device offset of each chunk.
+fn map_scattered(
+    f: &Fixture,
+    gpu_va: GpuVAddr,
+    daddr: DAddr,
+    size: u64,
+    place: fn(u64, u64) -> u64,
+) -> Vec<u64> {
+    let chunks = size.div_ceil(CHUNK);
+    (0..chunks)
+        .map(|i| {
+            let at = place(i, chunks) * CHUNK;
+            f.gmmu
+                .map(gpu_va + i * CHUNK, daddr + at, CHUNK, 0, false)
+                .unwrap();
+            at
+        })
+        .collect()
+}
+
+/// `bytes` written through the mapping `from` and read back through the mapping `to`, both
+/// chunk maps from [`map_scattered`]; device bytes `from` does not reach read `fill`.
+fn remap(bytes: &[u8], from: &[u64], to: &[u64], fill: u8) -> Vec<u8> {
+    let chunk = CHUNK as usize;
+    let mut device = vec![fill; (from.iter().chain(to).max().unwrap() + CHUNK) as usize];
+    for (i, &at) in from.iter().enumerate() {
+        let src = &bytes[(i * chunk).min(bytes.len())..((i + 1) * chunk).min(bytes.len())];
+        device[at as usize..at as usize + src.len()].copy_from_slice(src);
+    }
+    to.iter()
+        .flat_map(|&at| device[at as usize..at as usize + chunk].to_vec())
+        .collect()
+}
+
+/// The guest bytes a single-level render target holding `linear` stores.
+fn target_bytes(info: &ImageInfo, linear: &[u8]) -> Vec<u8> {
+    let tiling = info.surface().level_tiling(0);
+    let mut tiled = vec![0; info.size_bytes() as usize];
+    swizzle(&tiling, linear, &mut tiled[..tiling.size_bytes()]);
+    tiled
+}
+
+/// Every subresource of `info` read from guest bytes `bytes`, layer-major.
+fn subresources_of(info: &ImageInfo, bytes: &[u8]) -> Vec<Vec<u8>> {
+    let surface = info.surface();
+    let mut out = Vec::new();
+    for layer in 0..info.layers {
+        for level in 0..info.levels {
+            let tiling = surface.level_tiling(level);
+            let at = info.subresource_offset(level, layer) as usize;
+            let mut linear = vec![0; tiling.linear_size_bytes()];
+            unswizzle(&tiling, &bytes[at..at + tiling.size_bytes()], &mut linear);
+            out.push(linear);
+        }
+    }
+    out
+}
+
+/// Mario Kart World's street light grid, scaled down 4x: a single-sample A8B8G8R8 Snorm
+/// 6144x6144 target written through one GPU mapping, and a 3072x3072x2 array of 4 levels in
+/// the same format sampled through another mapping of the same device pages, scattered in
+/// chunks. The array reads the target's bytes in its own layout.
+#[test]
+fn arrays_sampled_through_another_mapping_of_a_target_read_its_bytes_in_their_layout() {
+    for scale in [ResolutionScale::X1, ResolutionScale::X2] {
+        read_target_through_another_mapping(768, 64 << 20, scale);
+    }
+}
+
+/// The same at Mario Kart World's own size.
+#[test]
+fn mkw_light_grid_sampled_through_another_mapping_reads_its_target_bytes() {
+    read_target_through_another_mapping(3072, 192 << 20, ResolutionScale::X1);
+}
+
+fn read_target_through_another_mapping(size: u32, dram: u64, scale: ResolutionScale) {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        for array_first in [true, false] {
+            let Some(mut f) = fixture_with_dram(gob, AstcRecompression::Uncompressed, dram) else {
+                return;
+            };
+            f.cache.set_resolution_scale(scale);
+            let (writer, reader) = (GPU_VA + (1 << 30), GPU_VA + (2 << 30));
+            let target = mkw_target(0xd7, 2 * size, 2 * size, 4, 0, gob);
+            assert_eq!(target.format, PixelFormat::A8B8G8R8Snorm);
+            let mut header = tic(0x08, reader, size, size, 2, 4, 4);
+            header.0[0] = (header.0[0] & !(0xfff << 7)) | 1 << 7 | 1 << 10 | 1 << 13 | 1 << 16;
+            let array = ImageInfo::from_texture(&header.decode().unwrap(), gob).unwrap();
+            assert!(array.size_bytes() < target.size_bytes());
+            let from = map_scattered(
+                &f,
+                writer,
+                DADDR + (16 << 20),
+                target.size_bytes(),
+                |i, n| n - 1 - i,
+            );
+            let to = map_scattered(&f, reader, DADDR + (16 << 20), array.size_bytes(), |i, _| i);
+            let case = format!("{gob:?} {scale:?} array_first {array_first}");
+            let early = array_first.then(|| f.texture(&header).0);
+            let quarter = |f: &mut Fixture, color: [f32; 4]| {
+                clear_rt_at(f, writer, &target, [0.5, -0.5, 0.25, 1.0], Rect::ALL);
+                clear_rt_at(
+                    f,
+                    writer,
+                    &target,
+                    color,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: size,
+                        height: size,
+                    },
+                )
+            };
+            for color in [[-1.0, 1.0, 0.0, 0.5], [0.75, 0.0, -0.75, 1.0]] {
+                let rt = quarter(&mut f, color);
+                let host = f.read_image(rt.id).swap_remove(0);
+                let (inside, outside) = (&host[..4], &host[host.len() - 4..]);
+                let written: Vec<u8> = (0..4 * size * size)
+                    .flat_map(|i| {
+                        let (x, y) = (i % (2 * size), i / (2 * size));
+                        if x < size && y < size {
+                            inside
+                        } else {
+                            outside
+                        }
+                        .to_vec()
+                    })
+                    .collect();
+                let expected = subresources_of(
+                    &array,
+                    &remap(&target_bytes(&target, &written), &from, &to, 0),
+                );
+                let (id, _) = f.texture(&header);
+                assert_eq!(early.unwrap_or(id), id, "{case}");
+                let got = f.read_image(id);
+                assert_eq!(got.len(), expected.len(), "{case}");
+                for (i, (got, expected)) in got.iter().zip(&expected).enumerate() {
+                    let (layer, level) = (i as u32 / 4, i as u32 % 4);
+                    let wrong = got
+                        .chunks(4)
+                        .zip(expected.chunks(4))
+                        .filter(|(g, e)| g != e)
+                        .count();
+                    assert_eq!(
+                        wrong,
+                        0,
+                        "{case} {color:?}: layer {layer} level {level}: {wrong} of {} texels differ, first {:?} vs {:?}",
+                        got.len() / 4,
+                        &got[..4],
+                        &expected[..4]
+                    );
+                }
+            }
+            {
+                let (mut tx, cache, _) = f.tx();
+                cache
+                    .flush(&mut tx, DADDR + (16 << 20), target.size_bytes())
+                    .unwrap();
+            }
+            f.assert_no_validation_errors();
+        }
+    }
+}
+
 /// Mario Kart World's colour-grading LUTs: a 32x32x32 RGBA16F volume whose blocks are one GOB
 /// tall and 16 deep, rendered four draws of eight targets at a time, each target a single slice
 /// at the volume's base plus the slice's offset inside the 16-slice block.
@@ -3753,6 +4771,7 @@ fn blits_into_a_volume_slice_address_stay_off_the_volume() {
                 gmmu,
                 &blit_side(src_va, slice, [0, 0, 32, 32]),
                 &blit_side(slice_va, slice, [0, 0, 32, 32]),
+                vk::Filter::NEAREST,
             )
             .unwrap();
         f.assert_no_validation_errors();
@@ -4496,4 +5515,34 @@ fn segments_alias_when_any_two_share_device_memory() {
         s(0x3fff, 1)
     ]));
     assert!(self_aliased(&[s(0x1000, 0x1000), s(0x1000, 0x1000)]));
+}
+
+#[test]
+fn sampled_mip_chains_that_run_out_of_memory_keep_the_levels_that_fit() {
+    let gob = GobLayout::Tegra;
+    let header = tic(0x08, GPU_VA, 256, 256, 1, 9, 2);
+    let info = ImageInfo::from_texture(&header.decode().unwrap(), gob).unwrap();
+    let pattern: Vec<u8> = (0..info.size_bytes())
+        .map(|i| (i * 7 + i / 251) as u8)
+        .collect();
+    let Some(mut reference) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    reference.memory.write_bytes(DADDR, &pattern).unwrap();
+    let (full, _) = reference.texture(&header);
+    let want = reference.read_image(full);
+    let full_size = reference.cache.get(full).unwrap().image.memory_size();
+    drop(reference);
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    f.memory.write_bytes(DADDR, &pattern).unwrap();
+    f.cache.trim_to = 128 << 10;
+    f.cache.allocation_cap = full_size - 1;
+    let (id, _) = f.texture(&header);
+    let image = f.cache.get(id).unwrap();
+    assert_eq!(image.trim, 1, "keeps the levels from 1 on");
+    assert!(image.image.memory_size() < full_size);
+    assert_eq!(f.read_image(id), want[1..]);
+    f.assert_no_validation_errors();
 }

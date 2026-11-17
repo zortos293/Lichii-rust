@@ -113,6 +113,7 @@ pub(crate) fn shader_profile(
         support_storage_texel_buffer_array_nonuniform_indexing: features
             .storage_texel_buffer_array_non_uniform_indexing,
         support_native_ndc: features.depth_clip_control,
+        support_geometry_shader_passthrough: features.extensions.geometry_shader_passthrough,
         max_user_clip_distances: limits.max_clip_distances,
         max_compute_shared_memory_size: limits.max_compute_shared_memory_size,
         min_ssbo_alignment: limits.min_storage_buffer_offset_alignment,
@@ -141,6 +142,7 @@ pub(crate) fn shader_profile(
         support_float16: features.shader_float16,
         support_int64: features.shader_int64,
         support_viewport_index_layer: profile.support_viewport_index_layer_non_geometry,
+        support_geometry_shader_passthrough: profile.support_geometry_shader_passthrough,
         support_handle_programs: true,
         support_handle_table_arrays: features.sampled_image_array_non_uniform_indexing,
         support_conditional_barrier: v12.driver_id != vk::DriverId::INTEL_PROPRIETARY_WINDOWS,

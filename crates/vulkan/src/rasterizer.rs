@@ -340,6 +340,34 @@ fn blit_rects(blit: &Blit) -> Option<([i32; 4], [i32; 4])> {
     Some(([x0, y0, x1, y1], dst))
 }
 
+/// The source and destination rectangles of a bilinear 2D blit that [`blit_rects`] does not
+/// take, as Lichii blits them: the source from the texel its start falls in to the one its last
+/// step ends in, mapped over the destination by the host sampler's texel centres, as a mip or
+/// bloom chain's downscale expects. `None` for a mirrored or empty rectangle, or coordinates
+/// past `i32`.
+fn filtered_rects(blit: &Blit) -> Option<([i32; 4], [i32; 4])> {
+    if blit.dst_width <= 0 || blit.dst_height <= 0 {
+        return None;
+    }
+    let axis = |start: i64, step: i64, count: i32| {
+        let end = start.checked_add(step.checked_mul(i64::from(count))?)?;
+        let (first, last) = (
+            i32::try_from(start >> 32).ok()?,
+            i32::try_from(end >> 32).ok()?,
+        );
+        (step > 0 && first < last).then_some([first, last])
+    };
+    let [x0, x1] = axis(blit.src_x0, blit.du_dx, blit.dst_width)?;
+    let [y0, y1] = axis(blit.src_y0, blit.dv_dy, blit.dst_height)?;
+    let dst = [
+        blit.dst_x0,
+        blit.dst_y0,
+        blit.dst_x0.checked_add(blit.dst_width)?,
+        blit.dst_y0.checked_add(blit.dst_height)?,
+    ];
+    Some(([x0, y0, x1, y1], dst))
+}
+
 impl VulkanRasterizer {
     /// `gob_layout` is the tiling of guest textures and render targets: `Switch2` for native
     /// Switch 2 titles. Framebuffers carry their own layout.
@@ -355,13 +383,16 @@ impl VulkanRasterizer {
             handles.written_pages.clone(),
             handles.lazy.clone(),
         )?;
-        let texture_cache = TextureCache::new(
+        let mut texture_cache = TextureCache::new(
             device,
             handles.written_pages.clone(),
             handles.lazy.clone(),
             gob_layout,
             AstcRecompression::Uncompressed,
         );
+        if lichii_gpu::gpu::flush_traps_enabled() {
+            texture_cache.set_flush_traps(handles.device.clone());
+        }
         let mut scheduler = Scheduler::new(device)?;
         scheduler.time_waits(handles.activity.clone());
         let pipelines = PipelineCache::new(device, &GraphicsSettings::default(), None, None)?;
@@ -674,7 +705,7 @@ impl VulkanRasterizer {
             ImageAccess::TRANSFER_DST,
             ImageAccess::SHADER_READ,
         );
-        self.buffer_cache.capture(&mut self.scheduler)?;
+        self.capture()?;
         let tick = self.scheduler.flush()?;
         self.unflushed = false;
         self.publish(fb, frame, tick, scale);
@@ -710,13 +741,26 @@ impl VulkanRasterizer {
         });
     }
 
+    /// Copies the GPU-written buffer ranges and images guest CPU reads come back to at the end of
+    /// the recorded work. Call right before it is submitted.
+    fn capture(&mut self) -> Result<()> {
+        self.buffer_cache.capture(&mut self.scheduler)?;
+        let mut tx = Transfer {
+            scheduler: &mut self.scheduler,
+            staging: &mut self.staging,
+            memory: &self.handles.device,
+            buffers: &mut self.buffer_cache,
+        };
+        self.texture_cache.capture(&mut tx)
+    }
+
     fn flush(&mut self) {
         if !self.unflushed {
             return;
         }
         self.unflushed = false;
-        if let Err(error) = self.buffer_cache.capture(&mut self.scheduler) {
-            tracing::error!(%error, "capturing GPU-written buffers failed");
+        if let Err(error) = self.capture() {
+            tracing::error!(%error, "capturing GPU-written buffers and images failed");
         }
         if let Err(error) = self.scheduler.flush() {
             tracing::error!(%error, "submitting GPU work failed");
@@ -759,6 +803,7 @@ impl VulkanRasterizer {
             texture_downloads = textures.downloads - a.textures.downloads,
             texture_download_bytes = textures.download_bytes - a.textures.download_bytes,
             texture_gpu_syncs = textures.gpu_syncs - a.textures.gpu_syncs,
+            texture_captured_downloads = textures.captured_downloads - a.textures.captured_downloads,
             buffer_upload_bytes = buffers.uploaded_bytes - a.buffers.uploaded_bytes,
             buffer_download_bytes = buffers.downloaded_bytes - a.buffers.downloaded_bytes,
             buffer_captured_bytes = buffers.captured_bytes - a.buffers.captured_bytes,
@@ -1021,7 +1066,7 @@ impl VulkanRasterizer {
             ImageAccess::TRANSFER_DST,
             ImageAccess::SHADER_READ,
         );
-        self.buffer_cache.capture(&mut self.scheduler)?;
+        self.capture()?;
         let tick = self.scheduler.flush()?;
         self.unflushed = false;
         self.publish(fb, frame, tick, ResolutionScale::X1);
@@ -1069,10 +1114,14 @@ impl Rasterizer for VulkanRasterizer {
         if blit.operation != BlitOperation::SrcCopy {
             return false;
         }
-        let rects = blit_rects(blit);
-        if rects.is_none() && blit.linear_filter {
-            return false;
-        }
+        let (rects, filter) = match blit_rects(blit) {
+            Some(rects) => (Some(rects), vk::Filter::NEAREST),
+            None if blit.linear_filter => match filtered_rects(blit) {
+                Some(rects) => (Some(rects), vk::Filter::LINEAR),
+                None => return false,
+            },
+            None => (None, vk::Filter::NEAREST),
+        };
         let (Some(src), Some(dst)) = (
             ImageInfo::from_copy_surface(&blit.src, blit.src_format, self.gob_layout),
             ImageInfo::from_copy_surface(&blit.dst, blit.dst_format, self.gob_layout),
@@ -1099,6 +1148,7 @@ impl Rasterizer for VulkanRasterizer {
                     info: dst,
                     rect: dst_rect,
                 },
+                filter,
             ),
             None => match (
                 blit.dst_x0.checked_add(blit.dst_width),
@@ -1382,6 +1432,7 @@ impl Rasterizer for VulkanRasterizer {
         if let Err(error) = self.texture_cache.invalidate(&mut tx, addr, size) {
             tracing::error!(%error, "writing back GPU-modified images before a CPU write failed");
         }
+        self.texture_cache.rearm(addr, addr.saturating_add(size));
     }
 
     fn cpu_written(&mut self, addr: DAddr, size: u64) {
@@ -1403,16 +1454,24 @@ impl Rasterizer for VulkanRasterizer {
         if let Err(error) = self.texture_cache.flush(&mut tx, addr, size) {
             tracing::error!(%error, "flushing GPU-modified images failed");
         }
+        self.texture_cache.rearm(addr, addr.saturating_add(size));
     }
 
     fn flush_for_cpu_read(&mut self, addr: DAddr, size: u64) {
-        if let Err(error) = self
+        let end = addr.saturating_add(size);
+        let area = match self
             .buffer_cache
             .flush_for_cpu_read(&mut self.scheduler, addr, size)
         {
-            tracing::error!(%error, "flushing GPU-written buffers for a CPU read failed");
-        }
+            Ok(area) => area,
+            Err(error) => {
+                tracing::error!(%error, "flushing GPU-written buffers for a CPU read failed");
+                (addr, end)
+            }
+        };
         self.flush_region(addr, size);
+        self.buffer_cache.disarm_written_back(addr, end);
+        self.texture_cache.rearm(area.0.min(addr), area.1.max(end));
     }
 
     fn unmap_region(&mut self, addr: DAddr, size: u64) {
@@ -2495,6 +2554,98 @@ mod tests {
             ),
         ] {
             assert_eq!(blit_rects(&blit), None, "{why}");
+        }
+    }
+
+    #[test]
+    fn filtered_blits_take_the_source_rectangle_their_steps_cover() {
+        const UNIT: i64 = 1 << 32;
+        let surface = lichii_gpu::backend::CopySurface {
+            address: 0x1000,
+            width: 128,
+            height: 128,
+            depth: 1,
+            layer: 0,
+            pitch: 0,
+            block: Some((0, 3, 0)),
+            bytes_per_pixel: 4,
+        };
+        let halve = Blit {
+            src: surface,
+            dst: surface,
+            src_format: PixelFormat::A8B8G8R8Unorm,
+            dst_format: PixelFormat::A8B8G8R8Unorm,
+            src_x0: 0,
+            src_y0: 0,
+            du_dx: 2 * UNIT,
+            dv_dy: 2 * UNIT,
+            dst_x0: 0,
+            dst_y0: 0,
+            dst_width: 64,
+            dst_height: 64,
+            linear_filter: true,
+            operation: BlitOperation::SrcCopy,
+        };
+        assert_eq!(blit_rects(&halve), None);
+        assert_eq!(
+            filtered_rects(&halve),
+            Some(([0, 0, 128, 128], [0, 0, 64, 64])),
+            "a mip chain's halving"
+        );
+        assert_eq!(
+            filtered_rects(&Blit {
+                src_x0: 8 * UNIT + UNIT / 2,
+                du_dx: UNIT * 3 / 2,
+                dst_x0: 4,
+                dst_width: 10,
+                ..halve
+            }),
+            Some(([8, 0, 23, 128], [4, 0, 14, 64])),
+            "a fractional start and step keep the texels they cover"
+        );
+        assert_eq!(
+            filtered_rects(&Blit {
+                du_dx: UNIT / 2,
+                dv_dy: UNIT / 2,
+                ..halve
+            }),
+            Some(([0, 0, 32, 32], [0, 0, 64, 64])),
+            "a filtered upscale"
+        );
+        for (blit, why) in [
+            (
+                Blit {
+                    du_dx: -UNIT,
+                    src_x0: 64 * UNIT,
+                    ..halve
+                },
+                "a mirrored source",
+            ),
+            (Blit { du_dx: 0, ..halve }, "a zero step"),
+            (
+                Blit {
+                    dst_height: 0,
+                    ..halve
+                },
+                "an empty destination",
+            ),
+            (
+                Blit {
+                    du_dx: UNIT / 1024,
+                    dst_width: 512,
+                    ..halve
+                },
+                "steps that stay inside one texel",
+            ),
+            (
+                Blit {
+                    src_x0: i64::MAX - UNIT,
+                    ..halve
+                },
+                "an end past the fixed-point range",
+            ),
+        ] {
+            assert_eq!(filtered_rects(&blit), None, "{why}");
         }
     }
 

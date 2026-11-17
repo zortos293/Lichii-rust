@@ -29,11 +29,20 @@ impl Device {
         }
     }
 
-    /// Opens a label around the commands recorded next into `cmd`.
+    /// Opens a label around the commands recorded next into `cmd`, and with
+    /// `debug.gpu_fault_report` leaves a checkpoint the fault report names it by.
     #[inline]
     pub(crate) fn begin_label(&self, cmd: vk::CommandBuffer, label: fmt::Arguments<'_>) {
-        if let Some(labels) = &self.labels {
-            begin_label(labels, cmd, label);
+        if self.labels.is_some() || self.faults.is_some() {
+            begin_label(self, cmd, label);
+        }
+    }
+
+    /// Leaves a checkpoint named `label` in `cmd` for the fault report, without a label.
+    #[inline]
+    pub(crate) fn checkpoint(&self, cmd: vk::CommandBuffer, label: fmt::Arguments<'_>) {
+        if let Some(faults) = &self.faults {
+            faults.checkpoint(cmd, Text::from(label));
         }
     }
 
@@ -63,35 +72,42 @@ fn set_name(
 }
 
 #[cold]
-fn begin_label(
-    labels: &ext::debug_utils::Device,
-    cmd: vk::CommandBuffer,
-    label: fmt::Arguments<'_>,
-) {
+fn begin_label(device: &Device, cmd: vk::CommandBuffer, label: fmt::Arguments<'_>) {
     let text = Text::from(label);
-    let info = vk::DebugUtilsLabelEXT::default().label_name(text.as_c_str());
-    // SAFETY: `cmd` is recording.
-    unsafe { labels.cmd_begin_debug_utils_label(cmd, &info) };
+    if let Some(labels) = &device.labels {
+        let info = vk::DebugUtilsLabelEXT::default().label_name(text.as_c_str());
+        // SAFETY: `cmd` is recording.
+        unsafe { labels.cmd_begin_debug_utils_label(cmd, &info) };
+    }
+    if let Some(faults) = &device.faults {
+        faults.checkpoint(cmd, text);
+    }
 }
 
 /// A name formatted into a NUL-terminated stack buffer, cut at [`MAX_TEXT`] bytes.
-struct Text {
+pub(super) struct Text {
     bytes: [u8; MAX_TEXT + 1],
     len: usize,
 }
 
 impl Text {
-    fn from(args: fmt::Arguments<'_>) -> Self {
-        let mut text = Self {
-            bytes: [0; MAX_TEXT + 1],
-            len: 0,
-        };
+    pub(super) const EMPTY: Self = Self {
+        bytes: [0; MAX_TEXT + 1],
+        len: 0,
+    };
+
+    pub(super) fn from(args: fmt::Arguments<'_>) -> Self {
+        let mut text = Self::EMPTY;
         let _ = text.write_fmt(args);
         text
     }
 
     fn as_c_str(&self) -> &CStr {
         CStr::from_bytes_until_nul(&self.bytes[..=self.len]).unwrap_or(c"")
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len]).unwrap_or("")
     }
 }
 

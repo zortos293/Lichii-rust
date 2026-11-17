@@ -428,6 +428,8 @@ const WATCH_PERIOD: Duration = Duration::from_millis(250);
 const STALLED_AFTER: Duration = Duration::from_secs(2);
 /// How often the watchdog logs every thread under `debug.svc_trace` or `LICHII_LIVE_PC`.
 const TRACE_LOG_PERIOD: Duration = Duration::from_secs(5);
+/// How often the watchdog trims DRAM: pages free for a whole period give their host memory back.
+const TRIM_PERIOD: Duration = Duration::from_secs(1);
 /// How many consecutive block boundaries the watchdog samples on each core running guest code.
 const LIVE_PC_SAMPLES: usize = 16;
 /// How long the watchdog waits for a core to reach a block boundary.
@@ -583,14 +585,20 @@ impl KernelInner {
     /// The kernel watchdog: logs every thread once when a core has kept running a thread that its
     /// best queued thread outranks (or idled with a queued thread) for [`STALLED_AFTER`], and
     /// every [`TRACE_LOG_PERIOD`] under `debug.svc_trace` or `LICHII_LIVE_PC`. Each look is
-    /// one uncontended `try_lock` per core; the cores' own paths do no watchdog work.
+    /// one uncontended `try_lock` per core; the cores' own paths do no watchdog work. Every
+    /// [`TRIM_PERIOD`] it also trims DRAM ([`MemoryManager::trim`]), off the guest's threads.
     fn watch(&self) {
         let mut stalled_since: Vec<Option<Instant>> = vec![None; self.scheduler.core_count()];
         let mut warned = false;
         let mut logged = Instant::now();
+        let mut trimmed = Instant::now();
         while !self.scheduler.is_shut_down() {
             std::thread::park_timeout(WATCH_PERIOD);
             let now = Instant::now();
+            if now.duration_since(trimmed) >= TRIM_PERIOD {
+                trimmed = now;
+                self.memory.trim();
+            }
             let outranked = if self.scheduler.is_paused() {
                 0
             } else {

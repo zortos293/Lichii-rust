@@ -105,12 +105,86 @@ fn retired_pages_keep_their_views_until_the_arena_is_released() {
 #[test]
 fn physical_memory_is_committed_lazily() {
     let physical = PhysicalMemory::new(12 << 30).unwrap();
+    assert_eq!(physical.host_bytes(), 0);
     physical.commit(0x1000_0000, 0x10_0000).unwrap();
+    assert!(
+        physical.host_bytes() <= 0x20_0000,
+        "{:#x}",
+        physical.host_bytes()
+    );
     // SAFETY: the page was just committed.
     unsafe { physical.pointer(0x1000_0000).write(1) };
     physical.discard(0x1000_0000, 0x1000);
     // SAFETY: as above.
     assert_eq!(unsafe { physical.pointer(0x1000_0000).read() }, 0);
+}
+
+fn fill(physical: &PhysicalMemory, pa: u64, len: u64, byte: u8) {
+    // SAFETY: the caller committed the range.
+    unsafe { std::ptr::write_bytes(physical.pointer(pa), byte, len as usize) };
+}
+
+fn byte(physical: &PhysicalMemory, pa: u64) -> u8 {
+    // SAFETY: the caller committed the page, or released it to scratch.
+    unsafe { physical.pointer(pa).read_volatile() }
+}
+
+#[test]
+fn released_memory_goes_back_to_the_host_and_reads_zero_when_committed_again() {
+    const MIB: u64 = 1 << 20;
+    let physical = PhysicalMemory::new(64 * MIB).unwrap();
+    let granule = physical.release_granule();
+    physical.commit(0, 8 * MIB).unwrap();
+    fill(&physical, 0, 8 * MIB, 0xaa);
+    assert!(physical.host_bytes() >= 8 * MIB);
+
+    let partial = physical.release(0x1000, 4 * MIB);
+    assert_eq!(partial.start, 0x1000_u64.next_multiple_of(granule));
+    assert_eq!(partial.end, (4 * MIB + 0x1000) / granule * granule);
+    assert_eq!(
+        byte(&physical, 0),
+        0xaa,
+        "pages outside the range keep their contents"
+    );
+
+    assert_eq!(physical.release(0, 8 * MIB), 0..8 * MIB);
+    assert_eq!(physical.host_bytes(), 0);
+    let _ = byte(&physical, 4 * MIB);
+
+    physical.commit(2 * MIB, 4 * MIB).unwrap();
+    assert!(
+        (2 * MIB..6 * MIB)
+            .step_by(0x1000)
+            .all(|pa| byte(&physical, pa) == 0)
+    );
+    fill(&physical, 2 * MIB, 4 * MIB, 0xbb);
+    assert!(physical.host_bytes() >= 4 * MIB && physical.host_bytes() <= 6 * MIB);
+}
+
+#[test]
+fn views_span_backing_chunks_and_survive_releases_elsewhere() {
+    let Some(space) = fastmem_space() else {
+        return;
+    };
+    let physical = space.physical().clone();
+    space.map(
+        0x8000_0000,
+        0x1f_f000,
+        0x40_2000,
+        MemoryPermission::READ_WRITE,
+    );
+    for va in [0x8000_0000, 0x8000_1000, 0x8020_1000, 0x8040_1000] {
+        space.write(va + 8, va as u32).unwrap();
+        assert_eq!(host_read::<u32>(&space, va + 8), va as u32);
+    }
+    space.protect(0x8000_0000, 0x40_2000, MemoryPermission::READ);
+    assert_eq!(host_read::<u32>(&space, 0x8020_1008), 0x8020_1000);
+    space.protect(0x8000_0000, 0x40_2000, MemoryPermission::READ_WRITE);
+
+    physical.commit(0x100_0000, 0x40_0000).unwrap();
+    physical.release(0x100_0000, 0x40_0000);
+    assert_eq!(host_read::<u32>(&space, 0x8040_1008), 0x8040_1000);
+    space.unmap(0x8000_0000, 0x40_2000);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -658,8 +732,8 @@ mod placement {
         space.map(0x8000_0000, 0, 0x400_0000, rw);
         assert_eq!(
             arena.calls.take(),
-            (1, 0, 0),
-            "the whole arena is one gap again"
+            (32, 0, 0),
+            "the whole arena is one gap again, filled with one view per 2 MiB backing section"
         );
     }
 
@@ -686,8 +760,8 @@ mod placement {
         space.map(0x8000_0000, 0, 0x400_0000, rw);
         assert_eq!(
             arena.calls.take(),
-            (1, 0, 0),
-            "the whole arena is one gap again"
+            (32, 0, 0),
+            "the whole arena is one gap again, filled with one view per 2 MiB backing section"
         );
     }
 }

@@ -102,6 +102,8 @@ pub struct UiState {
 pub const TOAST_TIME: Duration = Duration::from_secs(3);
 /// How often the window redraws a running title that presents no frames, for its status bar.
 const RUNNING_REDRAW: Duration = Duration::from_millis(250);
+const TITLE_FPS_PERIOD: Duration = Duration::from_secs(1);
+const FPS_LOG_PERIOD: Duration = Duration::from_secs(5);
 /// How often a minimized window still polls the game list, installs and the title's exit.
 const MINIMIZED_POLL: Duration = Duration::from_millis(100);
 
@@ -144,6 +146,10 @@ pub struct App {
     saved_speed_limit: u16,
     paused_for_focus: bool,
     exit_requested: bool,
+    /// The game frame rate in the window title, while a title runs.
+    title_fps: Option<u32>,
+    next_title_fps: Instant,
+    next_fps_log: Instant,
     /// What the input thread was last told about guest input.
     guest_input: bool,
 }
@@ -200,6 +206,9 @@ impl App {
             start_fullscreen: cli.fullscreen,
             paused_for_focus: false,
             exit_requested: false,
+            title_fps: None,
+            next_title_fps: Instant::now(),
+            next_fps_log: Instant::now() + FPS_LOG_PERIOD,
             guest_input: false,
         };
         app.refresh_games();
@@ -478,7 +487,10 @@ impl App {
             Some(s) if s.is_paused() => {
                 format!("Lichii {version} | {} (paused)", s.display_title())
             }
-            Some(s) => format!("Lichii {version} | {}", s.display_title()),
+            Some(s) => match self.title_fps {
+                Some(fps) => format!("Lichii {version} | {} | Game: {fps} FPS", s.display_title()),
+                None => format!("Lichii {version} | {}", s.display_title()),
+            },
             None => format!("Lichii {version}"),
         };
         window.set_title(&title);
@@ -1012,6 +1024,7 @@ Dump prod.keys and title.keys \
         self.poll_install();
         self.check_exit();
         self.sync_guest_input();
+        self.report_frame_rate();
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + MINIMIZED_POLL));
     }
 
@@ -1060,6 +1073,7 @@ Dump prod.keys and title.keys \
         }
         self.sync_guest_input();
 
+        self.report_frame_rate();
         let running = self.session.as_ref().is_some_and(|s| !s.is_paused());
         let delay = output
             .viewport_output
@@ -1078,6 +1092,37 @@ Dump prod.keys and title.keys \
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
+    }
+
+    /// Puts the game frame rate in the window title once a second, and logs it every
+    /// [`FPS_LOG_PERIOD`] averaged over that period, so a run can be read without its window.
+    /// Minimized windows keep reporting: the title may still be running.
+    fn report_frame_rate(&mut self) {
+        let running = self.session.as_ref().is_some_and(|s| !s.is_paused());
+        let now = Instant::now();
+        if now < self.next_title_fps {
+            return;
+        }
+        self.next_title_fps = now + TITLE_FPS_PERIOD;
+        let snap = running.then(|| self.perf.snapshot(now, FPS_LOG_PERIOD));
+        let fps = snap.as_ref().map(|s| s.game_fps.round() as u32);
+        if fps != self.title_fps {
+            self.title_fps = fps;
+            self.update_title();
+        }
+        let Some(snap) = snap else {
+            return;
+        };
+        if now < self.next_fps_log {
+            return;
+        }
+        self.next_fps_log = now + FPS_LOG_PERIOD;
+        tracing::info!(
+            game_fps = snap.game_frame_times_ms.len() as f64 / FPS_LOG_PERIOD.as_secs_f64(),
+            speed_pct = (snap.emulation_speed * 100.0).round() as u32,
+            host_fps = snap.fps,
+            "frame rate"
+        );
     }
 
     fn apply_theme(&self) {
