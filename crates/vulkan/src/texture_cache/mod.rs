@@ -2319,9 +2319,19 @@ impl TextureCache {
         let ranges = std::mem::take(&mut self.segments);
         self.collect_overlaps(&ranges);
         self.segments = ranges;
+        let zdiag = info.format == PixelFormat::X8D24Unorm && info.width == 1024 && {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 600
+        };
+        if zdiag {
+            tracing::warn!("zdiag slow layers={} stride={} usage={:?} contiguous={} segs={} base={:#x} overlaps={} tick={}", info.layers, info.layer_stride, usage, contiguous, self.segments.len(), base, self.ids.len(), self.tick);
+        }
         for i in 0..self.ids.len() {
             let id = self.ids[i];
             let image = self.get(id).expect("a live image id");
+            if zdiag {
+                tracing::warn!("zdiag cand id={} {}x{}x{} l{} {:?} stride={} base={:#x} trim={} sameseg={} samelayout={} contig={} gpumod={} mod={} cur={} sub={:?}", id.index, image.info.width, image.info.height, image.info.layers, image.info.levels, image.info.format, image.info.layer_stride, image.base(), image.trim, image.segments == self.segments, image.info.same_layout(info), image.contiguous(), image.gpu_modified, image.modified, image.current, (base >= image.base()).then(|| image.info.find_subresource(info, base - image.base())));
+            }
             let moved = image.sparse_va == Some(gpu_va)
                 && image.segments != self.segments
                 && image.info.same_layout(info);
@@ -2344,6 +2354,9 @@ impl TextureCache {
             {
                 if moved {
                     self.remap(id);
+                }
+                if zdiag {
+                    tracing::warn!("zdiag hit id={} level={} layer={}", id.index, level, layer);
                 }
                 return Ok(Some(Found { id, level, layer }));
             }
@@ -2380,6 +2393,9 @@ impl TextureCache {
                         .or_else(|| info.find_slice(&image.info, offset))
                 })
                 .flatten();
+            if zdiag {
+                tracing::warn!("zdiag class id={} sub={:?} gpumod={} copyc={}", id.index, subresource, image.gpu_modified, Self::copy_compatible(image, host, info.format));
+            }
             match subresource {
                 Some((level, layer))
                     if image.gpu_modified && Self::copy_compatible(image, host, info.format) =>
@@ -2401,6 +2417,9 @@ impl TextureCache {
                     })
             });
             if stale {
+                if zdiag {
+                    tracing::warn!("zdiag stale id={}", joins[i].0.index);
+                }
                 self.new_overlaps.push(joins.remove(i).0);
             }
         }
@@ -2415,6 +2434,9 @@ impl TextureCache {
         self.dropped = dropped;
         let segments = self.segments.clone();
         let id = self.create(info, segments, trim, sparse_va)?;
+        if zdiag {
+            tracing::warn!("zdiag create id={} joins={:?} overlaps={:?} aliases={}", id.index, self.joins.iter().map(|j| (j.0.index, j.1, j.2)).collect::<Vec<_>>(), self.new_overlaps.iter().map(|o| o.index).collect::<Vec<_>>(), self.new_aliases.len());
+        }
         let new_overlaps = std::mem::take(&mut self.new_overlaps);
         for &other in &new_overlaps {
             self.image(other).overlaps.push(id);
@@ -2526,6 +2548,9 @@ impl TextureCache {
                     &regions,
                 )
             };
+            if self.image(id).info.format == PixelFormat::X8D24Unorm {
+                tracing::warn!("zdiag join into={} from={} resident={}", id.index, join.index, resident);
+            }
             if resident {
                 self.remove(tx.scheduler, join);
             } else {
