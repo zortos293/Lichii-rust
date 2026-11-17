@@ -100,6 +100,23 @@ pub enum Select {
     Bif,
 }
 
+/// The arithmetic of `VecOp::Long`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Long {
+    /// `SADDL`: `n + m`.
+    Add,
+    /// `SSUBL`: `n - m`.
+    Sub,
+    /// `SADDW`: `n`, already wide, plus `m`.
+    AddWide,
+    /// `SSUBW`: `n`, already wide, minus `m`.
+    SubWide,
+    /// `SABDL`: `|n - m|`.
+    Abd,
+    /// `SMULL`: `n * m`.
+    Mul,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shift {
     Shl,
@@ -172,14 +189,18 @@ pub enum VecOp {
         n: Value,
         m: Value,
     },
-    /// `SADDW`/`UADDW` (and the `2` forms when `high`): `n`'s lanes of `16 << size` bits plus
-    /// the low (or high) half of `m`'s `8 << size`-bit lanes, sign- or zero-extended.
-    AddWide {
+    /// An integer three-different op (the `2` form when `high`) on the low (or high) half of the
+    /// `8 << size`-bit lanes of `m`, and of `n` too unless the op is a wide one, sign- or
+    /// zero-extended to `16 << size` bits. With `acc`, the result is added to the accumulator, or
+    /// subtracted from it when its flag is set (`SABAL`, `SMLAL`, `SMLSL` and the unsigned forms).
+    Long {
+        op: Long,
         signed: bool,
         size: u8,
         high: bool,
         n: Value,
         m: Value,
+        acc: Option<(Value, bool)>,
     },
     /// `SSHLL`/`USHLL` (and the `2` forms when `high`): the low (or high) half of `a`'s
     /// `8 << size`-bit lanes, sign- or zero-extended and shifted left by `shift`, up to `8 << size`
@@ -262,7 +283,6 @@ impl VecOp {
             }
             | VecOp::Ext { n: a, m: b, .. }
             | VecOp::Zip { n: a, m: b, .. }
-            | VecOp::AddWide { n: a, m: b, .. }
             | VecOp::Ushl(_, a, b)
             | VecOp::Permute { n: a, m: b, .. }
             | VecOp::Table {
@@ -290,6 +310,13 @@ impl VecOp {
                 if let Some(low) = low {
                     f(low);
                 }
+            }
+            VecOp::Long { n, m, acc, .. } => {
+                if let Some((acc, _)) = acc {
+                    f(acc);
+                }
+                f(n);
+                f(m);
             }
             VecOp::RoundShift { acc, a, .. } => {
                 if let Some(acc) = acc {
@@ -544,16 +571,40 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         t.set(Loc::V(rd), r);
         return true;
     }
-    if word & 0x9f20_fc00 == 0x0e20_1000 && size < 3 {
+    if word & 0x9f20_0c00 == 0x0e20_0000 && size < 3 {
+        let signed = !u;
+        let (op, acc) = match field(word, 12, 4) {
+            0b0000 => (Long::Add, None),
+            0b0001 => (Long::AddWide, None),
+            0b0010 => (Long::Sub, None),
+            0b0011 => (Long::SubWide, None),
+            0b0101 => (Long::Abd, Some(false)),
+            0b0111 => (Long::Abd, None),
+            0b1000 => (Long::Mul, Some(false)),
+            0b1010 => (Long::Mul, Some(true)),
+            0b1100 => (Long::Mul, None),
+            _ => return false,
+        };
+        let native = match op {
+            Long::Abd => supported(t, Binary::Abd(signed), size),
+            Long::Mul => size < 2 || !signed || t.sse41,
+            _ => true,
+        };
+        if !native {
+            return false;
+        }
+        let acc = acc.map(|sub| (vec(t, rd), sub));
         let (n, m) = (vec(t, rn), vec(t, rm));
         let r = emit(
             t,
-            VecOp::AddWide {
-                signed: !u,
+            VecOp::Long {
+                op,
+                signed,
                 size,
                 high: q,
                 n,
                 m,
+                acc,
             },
         );
         t.set(Loc::V(rd), r);
@@ -1176,6 +1227,53 @@ impl Emitter<'_> {
         }
     }
 
+    /// `d` = `a - d` on lanes of `8 << size` bits.
+    fn sub_from(&mut self, size: u8, d: u8, a: u8) {
+        self.copy(SCRATCH, a);
+        self.sse(Sse::Sub, size, SCRATCH, d);
+        self.copy(d, SCRATCH);
+    }
+
+    /// `d` = the products of the low (or, when `high`, the high) halves of `n`'s and `m`'s
+    /// `8 << size`-bit lanes, each twice as wide, signed or unsigned. Clobbers `xmm15`.
+    fn mul_long(&mut self, signed: bool, size: u8, high: bool, d: u8, n: u8, m: u8) {
+        match size {
+            0 => {
+                self.widen(signed, 0, high, d, n);
+                self.widen(signed, 0, high, SCRATCH, m);
+                self.sse(Sse::Mul, 1, d, SCRATCH);
+            }
+            1 => {
+                self.copy(d, n);
+                self.sse(Sse::Mul, 1, d, m);
+                self.copy(SCRATCH, n);
+                if signed {
+                    dynasm!(self.asm ; .arch x64 ; pmulhw Rx(SCRATCH), Rx(m));
+                } else {
+                    dynasm!(self.asm ; .arch x64 ; pmulhuw Rx(SCRATCH), Rx(m));
+                }
+                if high {
+                    dynasm!(self.asm ; .arch x64 ; punpckhwd Rx(d), Rx(SCRATCH));
+                } else {
+                    dynasm!(self.asm ; .arch x64 ; punpcklwd Rx(d), Rx(SCRATCH));
+                }
+            }
+            _ => {
+                let lanes = if high { 0xfa_u8 } else { 0x50 } as i8;
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; pshufd Rx(d), Rx(n), lanes
+                    ; pshufd Rx(SCRATCH), Rx(m), lanes
+                );
+                if signed {
+                    dynasm!(self.asm ; .arch x64 ; pmuldq Rx(d), Rx(SCRATCH));
+                } else {
+                    dynasm!(self.asm ; .arch x64 ; pmuludq Rx(d), Rx(SCRATCH));
+                }
+            }
+        }
+    }
+
     fn addp(&mut self, size: u8, q: bool, d: u8, a: u8, b: u8) {
         if size == 3 {
             dynasm!(self.asm
@@ -1499,17 +1597,55 @@ impl Emitter<'_> {
                 }
                 (d, q)
             }
-            VecOp::AddWide {
+            VecOp::Long {
+                op,
                 signed,
                 size,
                 high,
                 n,
                 m,
+                acc,
             } => {
                 let (n, m) = (self.reg(n), self.reg(m));
+                let acc = acc.map(|(acc, sub)| (self.reg(acc), sub));
                 let d = self.def(v);
-                self.widen(signed, size, high, d, m);
-                self.sse(Sse::Add, size + 1, d, n);
+                let wide = size + 1;
+                match op {
+                    Long::Add | Long::Sub => {
+                        let t = self.temp();
+                        self.widen(signed, size, high, d, n);
+                        self.widen(signed, size, high, t, m);
+                        let op = if op == Long::Add { Sse::Add } else { Sse::Sub };
+                        self.sse(op, wide, d, t);
+                    }
+                    Long::AddWide => {
+                        self.widen(signed, size, high, d, m);
+                        self.sse(Sse::Add, wide, d, n);
+                    }
+                    Long::SubWide => {
+                        self.widen(signed, size, high, d, m);
+                        self.sub_from(wide, d, n);
+                    }
+                    Long::Abd => {
+                        let (max, min) = if signed {
+                            (Sse::MaxS, Sse::MinS)
+                        } else {
+                            (Sse::MaxU, Sse::MinU)
+                        };
+                        self.copy(SCRATCH, n);
+                        self.sse(min, size, SCRATCH, m);
+                        self.copy(d, n);
+                        self.sse(max, size, d, m);
+                        self.sse(Sse::Sub, size, d, SCRATCH);
+                        self.widen(false, size, high, d, d);
+                    }
+                    Long::Mul => self.mul_long(signed, size, high, d, n, m),
+                }
+                match acc {
+                    Some((acc, true)) => self.sub_from(wide, d, acc),
+                    Some((acc, false)) => self.sse(Sse::Add, wide, d, acc),
+                    None => {}
+                }
                 return;
             }
             VecOp::ShiftLong {
