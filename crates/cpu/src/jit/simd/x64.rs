@@ -15,7 +15,7 @@ use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 
 use super::super::ir::{Loc, Ty, Value};
 use super::super::x64::{
-    CTX_FPCR, CTX_FPSR, CTX_PSTATE, Emitter, ST_SCRATCH, ST_SCRATCH2, loc_offset,
+    CTX_BIAS, CTX_FPCR, CTX_FPSR, CTX_PSTATE, Emitter, ST_SCRATCH, ST_SCRATCH2, loc_offset,
 };
 use super::ir::{Arith, Fp, Fused, SimdOp};
 
@@ -962,7 +962,7 @@ impl Emitter<'_> {
             self.save(slow.saved);
             dynasm!(self.asm
                 ; .arch x64
-                ; mov rdi, r15
+                ; lea rdi, [r15 - CTX_BIAS]
                 ; mov esi, slow.word as i32
                 ; mov rdx, r13
                 ; xor ecx, ecx

@@ -39,6 +39,20 @@ use crate::{
 /// Runtime state translated code reaches through `r13`.
 #[repr(C, align(16))]
 pub(super) struct JitState {
+    /// The interrupt flag every block checks on entry.
+    interrupt: *const AtomicBool,
+    /// The `jmp` the last block left through, for the dispatcher to link; 0 when none.
+    link: usize,
+    /// NZCV a block left unpacked: the [`Cmp::lazy_code`] of the flags, 0 when the context holds
+    /// them, and the operands they come from.
+    lazy_nzcv: u32,
+    lazy_a: u64,
+    lazy_b: u64,
+    /// `x64::materialize_stub` in the code cache.
+    materialize: usize,
+    /// For each access of `1 << n` bytes, the highest arena offset it may start at; 0 without
+    /// fastmem. Translated code compares addresses against these.
+    fastmem_limit: [u64; 7],
     /// Values passed between slow paths and their helpers.
     scratch: u128,
     scratch2: u128,
@@ -61,20 +75,9 @@ pub(super) struct JitState {
     core_index: usize,
     /// This core's slot in `monitor`.
     reservation: *const ReservationSlot,
-    /// The interrupt flag every block checks on entry.
-    interrupt: *const AtomicBool,
     /// The indirect-branch table of the cache.
     table: *const (u64, usize),
-    /// The `jmp` the last block left through, for the dispatcher to link; 0 when none.
-    link: usize,
     fault: Option<CpuFault>,
-    /// NZCV a block left unpacked: the [`Cmp::lazy_code`] of the flags, 0 when the context holds
-    /// them, and the operands they come from.
-    lazy_nzcv: u32,
-    lazy_a: u64,
-    lazy_b: u64,
-    /// `x64::materialize_stub` in the code cache.
-    materialize: usize,
     /// Lazy NZCV write-backs the native stub made, counted only while profiling.
     materialized: u64,
     profile: Option<Box<Profile>>,
@@ -361,6 +364,9 @@ impl Jit {
             fastmem.set_fault_handler(Some(cache::on_fault), 0);
         }
         let state = Box::new(JitState {
+            fastmem_limit: std::array::from_fn(|n| {
+                fastmem.map_or(0, |f| (f.size() as u64).saturating_sub(1 << n))
+            }),
             scratch: 0,
             scratch2: 0,
             save_xmm: [0; 16],
