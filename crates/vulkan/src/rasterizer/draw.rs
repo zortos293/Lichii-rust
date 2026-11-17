@@ -22,6 +22,7 @@ use lichii_gpu::engines::maxwell_3d::regs::{
 };
 use lichii_gpu::engines::maxwell_3d::regs::{MESH_CONTROL, MESH_SHADER_A};
 use lichii_gpu::engines::maxwell_3d::{Regs, dirty};
+use lichii_gpu::gmmu::RangeTarget;
 use lichii_shader::backend::Bindings;
 use lichii_shader::backend::spirv::{
     NUM_IMAGE_SCALING_WORDS, NUM_TEXTURE_SCALING_WORDS, RENDER_AREA_LAYOUT_OFFSET,
@@ -3131,23 +3132,63 @@ fn numeric_mismatch(
 }
 
 /// The GPU address and size of storage buffer `element` of `desc`: 16-byte NVN descriptors in
-/// the constant buffer, or (indirect) a pointer table the constant buffer points to.
+/// the constant buffer, bare Switch 2 pointers, or (indirect) a pointer table the constant
+/// buffer points to.
+///
+/// - A read-only table entry is the base of a pool read anywhere in it (Ocarina of Time's grass
+///   lies 12-18 MiB past its entry, its light probes about 130 MiB): it reaches to the end of
+///   its contiguous device run, at most [`STORAGE_REACH`]. A written one keeps 64 KiB, since a
+///   write marks the whole binding GPU-written.
+/// - A Switch 2 pointer is bare: the word after it is another parameter, not a size, so it
+///   binds [`BARE_POINTER_SIZE`]. A read-only compute binding whose next word looks like a
+///   larger size takes it, up to the end of the pointer's contiguous device run (Mario Kart
+///   World's lighting reads past 8 MiB). Compute stages are the ones without a root table.
+///
+/// Every size here stays within [`STORAGE_REACH`], the cached gather budget, and the long ones
+/// end where their device run does, so the buffer cache binds them in place.
 fn storage_pointer(
     src: &StageSources<'_>,
     desc: &StorageBufferDescriptor,
     element: u32,
 ) -> (GpuVAddr, u64) {
+    const STORAGE_REACH: u64 = 256 << 20;
+    const BARE_POINTER_SIZE: u64 = 8 << 20;
+    const TABLE_ENTRY_SIZE: u64 = 64 << 10;
+    let device_run = |address: GpuVAddr, limit: u64| {
+        let mut first = None;
+        src.gmmu.for_each_range(address, limit, |range| {
+            first.get_or_insert(range);
+        });
+        match first {
+            Some(range) if matches!(range.target, RangeTarget::Device(_)) => range.size,
+            _ => 0,
+        }
+    };
     let offset = desc.cbuf_offset + element * 16;
     let pointer: u64 = read_cbuf(src.gmmu, src.cbufs, desc.cbuf_index, offset);
-    if desc.indirect_offset == StorageBufferDescriptor::DIRECT {
-        let size: u32 = read_cbuf(src.gmmu, src.cbufs, desc.cbuf_index, offset + 8);
-        return (pointer, u64::from(size));
+    if desc.indirect_offset != StorageBufferDescriptor::DIRECT {
+        let address = src
+            .gmmu
+            .read::<u64>(pointer + u64::from(desc.indirect_offset))
+            .unwrap_or(0);
+        if desc.is_written || address == 0 {
+            return (address, TABLE_ENTRY_SIZE);
+        }
+        return (
+            address,
+            device_run(address, STORAGE_REACH).max(TABLE_ENTRY_SIZE),
+        );
     }
-    let address = src
-        .gmmu
-        .read::<u64>(pointer + u64::from(desc.indirect_offset))
-        .unwrap_or(0);
-    (address, 64 << 10)
+    let next: u64 = read_cbuf(src.gmmu, src.cbufs, desc.cbuf_index, offset + 8);
+    if !src.pool.switch2 {
+        return (pointer, next & 0xffff_ffff);
+    }
+    let compute = src.root_table.is_none();
+    if compute && !desc.is_written && pointer != 0 && next >> 32 == 0 && next > BARE_POINTER_SIZE {
+        let run = device_run(pointer, next.min(STORAGE_REACH));
+        return (pointer, run.max(BARE_POINTER_SIZE));
+    }
+    (pointer, BARE_POINTER_SIZE)
 }
 
 mod assembly;
