@@ -256,6 +256,10 @@ struct Download {
     modified: u64,
 }
 
+/// The ticks that change when an image's texels do: its own GPU writes (`written`), what it took
+/// from aliases (`modified`), and what it took from overlaps (`current`).
+type Version = (u64, u64, u64);
+
 /// Size of the ring [`TextureCache::capture`] copies read-back images into.
 const CAPTURE_RING_SIZE: u64 = 8 << 20;
 /// The largest readback of an image a download marks for capture.
@@ -264,12 +268,11 @@ const CAPTURE_MAX: u64 = CAPTURE_RING_SIZE / 8;
 const CAPTURE_HOT_MAX: usize = 16;
 
 /// A copy of image `id`'s texels at `offset` in the capture ring, taken at the end of the work
-/// completing at `tick`, when the image's `written` and `modified` were these.
+/// completing at `tick`, when the image's `version` was this.
 #[derive(Clone, Copy)]
 struct Capture {
     id: ImageId,
-    written: u64,
-    modified: u64,
+    version: Version,
     offset: u64,
     end: u64,
     tick: u64,
@@ -385,6 +388,10 @@ struct Alias {
 type Texel = (u32, u32);
 
 impl CachedImage {
+    fn version(&self) -> Version {
+        (self.written, self.modified, self.current)
+    }
+
     fn base(&self) -> DAddr {
         self.segments[0].daddr
     }
@@ -3355,15 +3362,17 @@ impl TextureCache {
                 image.track(tx.memory);
                 continue;
             }
-            let (written, modified) = (image.written, image.modified);
+            let version = image.version();
             let download = Download {
                 id,
                 offset: 0,
-                modified,
+                modified: image.modified,
             };
-            let capture = self.captures.live.iter().find(|c| {
-                c.id == id && c.written == written && c.modified == modified && c.tick < submitted
-            });
+            let capture = self
+                .captures
+                .live
+                .iter()
+                .find(|c| c.id == id && c.version == version && c.tick < submitted);
             match capture {
                 Some(capture) => {
                     newest = newest.max(capture.tick);
@@ -3441,6 +3450,29 @@ impl TextureCache {
         }
     }
 
+    /// Arms flush traps again over the GPU-modified images on the pages of `[daddr, end)`: a
+    /// buffer write-back there ends the traps of the pages it shares with them.
+    pub fn rearm(&mut self, daddr: DAddr, end: DAddr) {
+        if self.flush_traps.is_none() || daddr >= end {
+            return;
+        }
+        let start = daddr & !(PAGE_SIZE - 1);
+        self.collect_overlaps(&[Segment {
+            offset: 0,
+            daddr: start,
+            size: end.next_multiple_of(PAGE_SIZE) - start,
+        }]);
+        let memory = self.flush_traps.as_ref().expect("checked above");
+        for &id in &self.ids {
+            let image = self.get(id).expect("overlaps are live");
+            if image.gpu_modified && image.downloadable() {
+                for s in &image.segments {
+                    memory.arm_flush_traps(s.daddr, s.size);
+                }
+            }
+        }
+    }
+
     /// Ends the flush traps of the whole pages image `id`, just written back, covers, unless a
     /// GPU-modified image over the same bytes still needs them. Pages GPU-written buffer bytes
     /// share keep theirs, and the pages at the image's ends trap once more at most.
@@ -3490,13 +3522,13 @@ impl TextureCache {
         let mut result = Ok(());
         for &id in &hot {
             let image = self.get(id).expect("hot images are live");
-            let (written, modified) = (image.written, image.modified);
+            let version = image.version();
             let current = self
                 .captures
                 .live
                 .iter()
-                .any(|c| c.id == id && c.written == written && c.modified == modified);
-            if !image.gpu_modified || image.aliases_newest > written || current {
+                .any(|c| c.id == id && c.version == version);
+            if !image.gpu_modified || image.aliases_newest > image.written || current {
                 continue;
             }
             let (size, align) = image.readback_size();
@@ -3524,8 +3556,7 @@ impl TextureCache {
             }
             self.captures.live.push(Capture {
                 id,
-                written,
-                modified,
+                version,
                 offset,
                 end: offset + size,
                 tick,

@@ -1035,14 +1035,16 @@ impl BufferCache {
 
     /// A guest CPU thread waits on a flush trap in `[daddr, +size)`: downloads the whole
     /// GPU-written range around it, so a CPU pass over the rest of the range traps no more.
+    /// Returns that range.
     pub fn flush_for_cpu_read(
         &mut self,
         scheduler: &mut Scheduler,
         daddr: DAddr,
         size: u64,
-    ) -> Result<()> {
+    ) -> Result<(DAddr, DAddr)> {
         let (start, end) = self.gpu_written.area(daddr, daddr.saturating_add(size));
-        self.flush(scheduler, start, end - start)
+        self.flush(scheduler, start, end - start)?;
+        Ok((start, end))
     }
 
     /// Copies the GPU-written bytes of `[daddr, +size)` back to guest memory, waiting for the GPU.

@@ -3056,6 +3056,7 @@ impl VulkanRasterizer {
                 return Ok(raw);
             };
             self.buffer_cache.flush(&mut self.scheduler, daddr, 4)?;
+            self.texture_cache.rearm(daddr, daddr + 4);
             self.draw.rebind = true;
         }
     }

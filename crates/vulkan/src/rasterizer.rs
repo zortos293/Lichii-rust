@@ -1432,6 +1432,7 @@ impl Rasterizer for VulkanRasterizer {
         if let Err(error) = self.texture_cache.invalidate(&mut tx, addr, size) {
             tracing::error!(%error, "writing back GPU-modified images before a CPU write failed");
         }
+        self.texture_cache.rearm(addr, addr.saturating_add(size));
     }
 
     fn cpu_written(&mut self, addr: DAddr, size: u64) {
@@ -1453,18 +1454,24 @@ impl Rasterizer for VulkanRasterizer {
         if let Err(error) = self.texture_cache.flush(&mut tx, addr, size) {
             tracing::error!(%error, "flushing GPU-modified images failed");
         }
+        self.texture_cache.rearm(addr, addr.saturating_add(size));
     }
 
     fn flush_for_cpu_read(&mut self, addr: DAddr, size: u64) {
-        if let Err(error) = self
+        let end = addr.saturating_add(size);
+        let area = match self
             .buffer_cache
             .flush_for_cpu_read(&mut self.scheduler, addr, size)
         {
-            tracing::error!(%error, "flushing GPU-written buffers for a CPU read failed");
-        }
+            Ok(area) => area,
+            Err(error) => {
+                tracing::error!(%error, "flushing GPU-written buffers for a CPU read failed");
+                (addr, end)
+            }
+        };
         self.flush_region(addr, size);
-        self.buffer_cache
-            .disarm_written_back(addr, addr.saturating_add(size));
+        self.buffer_cache.disarm_written_back(addr, end);
+        self.texture_cache.rearm(area.0.min(addr), area.1.max(end));
     }
 
     fn unmap_region(&mut self, addr: DAddr, size: u64) {
