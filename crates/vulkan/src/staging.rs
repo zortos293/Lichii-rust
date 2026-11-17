@@ -6,7 +6,7 @@ use gpu_allocator::MemoryLocation;
 
 use crate::device::Device;
 use crate::error::Result;
-use crate::memory::Buffer;
+use crate::memory::{Buffer, LiveMemory};
 use crate::scheduler::Scheduler;
 
 /// Host-visible upload memory handed out for one transfer.
@@ -52,6 +52,11 @@ impl StagingRing {
             regions: VecDeque::new(),
             oversized: VecDeque::new(),
         })
+    }
+
+    /// The oversized buffers not freed yet.
+    pub fn oversized(&self) -> LiveMemory {
+        live_oversized(&self.oversized)
     }
 
     /// `size` bytes aligned to `align` (a power of two), valid until the work recorded in
@@ -134,5 +139,12 @@ impl StagingRing {
         {
             self.oversized.pop_front();
         }
+    }
+}
+/// Bytes and count of oversized ring buffers not freed yet, for the activity log.
+pub(crate) fn live_oversized(buffers: &VecDeque<(u64, Buffer)>) -> LiveMemory {
+    LiveMemory {
+        bytes: buffers.iter().map(|(_, buffer)| buffer.size()).sum(),
+        count: buffers.len() as u64,
     }
 }
