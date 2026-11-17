@@ -160,6 +160,18 @@ pub enum SimdOp {
         b: Value,
         word: u32,
     },
+    /// `SQDMULL` (and the `2` form when `high`) on H or S lanes (`size` 1 or 2): the doubled
+    /// products of the low (or high) halves of `n` and `m`, twice as wide and saturated. With
+    /// `acc`, `SQDMLAL`, or `SQDMLSL` when its flag is set: those added to or subtracted from the
+    /// accumulator with signed saturation. Sets FPSR.QC when either step saturates.
+    SatMulLong {
+        size: u8,
+        high: bool,
+        n: Value,
+        m: Value,
+        acc: Option<(Value, bool)>,
+        word: u32,
+    },
     /// Advanced SIMD integer and element-move ops.
     Vec(VecOp),
     /// Advanced SIMD FP arithmetic on S or D lanes, checked like the scalar ops.
@@ -195,7 +207,8 @@ impl SimdOp {
             | SimdOp::CondCompare { word, .. }
             | SimdOp::SatNarrow { word, .. }
             | SimdOp::SatArith { word, .. }
-            | SimdOp::SatMulHigh { word, .. } => Some(word),
+            | SimdOp::SatMulHigh { word, .. }
+            | SimdOp::SatMulLong { word, .. } => Some(word),
             SimdOp::Lanes(lanes) => Some(lanes.word),
             _ => None,
         }
@@ -247,6 +260,13 @@ impl SimdOp {
             SimdOp::SatArith { a, b, .. } | SimdOp::SatMulHigh { a, b, .. } => {
                 f(a);
                 f(b);
+            }
+            SimdOp::SatMulLong { n, m, acc, .. } => {
+                if let Some((acc, _)) = acc {
+                    f(acc);
+                }
+                f(n);
+                f(m);
             }
             SimdOp::Vec(op) => op.for_each_arg(f),
             SimdOp::Lanes(lanes) => lanes.for_each_arg(f),

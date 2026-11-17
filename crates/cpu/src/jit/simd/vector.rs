@@ -610,6 +610,28 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         t.set(Loc::V(rd), r);
         return true;
     }
+    if word & 0xbf20_0c00 == 0x0e20_0000
+        && matches!(field(word, 12, 4), 0b1001 | 0b1011 | 0b1101)
+        && (size == 1 || (size == 2 && t.sse41))
+    {
+        let acc = match field(word, 12, 4) {
+            0b1001 => Some(false),
+            0b1011 => Some(true),
+            _ => None,
+        };
+        let acc = acc.map(|sub| (vec(t, rd), sub));
+        let (n, m) = (vec(t, rn), vec(t, rm));
+        let r = t.op(Op::Simd(SimdOp::SatMulLong {
+            size,
+            high: q,
+            n,
+            m,
+            acc,
+            word,
+        }));
+        t.set(Loc::V(rd), r);
+        return true;
+    }
     if word & 0x9f20_dc00 == 0x0e20_4000 && size < 3 {
         let (n, m) = (vec(t, rn), vec(t, rm));
         let wide = Arrangement {
@@ -899,6 +921,24 @@ fn by_element(t: &mut Translator, word: u32) -> bool {
                     acc,
                 },
             )
+        }
+        (false, 0b0011 | 0b0111 | 0b1011) if size == 1 || t.sse41 => {
+            let acc = match opcode {
+                0b0011 => Some(false),
+                0b0111 => Some(true),
+                _ => None,
+            };
+            let acc = acc.map(|sub| (vec(t, rd), sub));
+            let n = vec(t, rn);
+            let m = lane(t);
+            t.op(Op::Simd(SimdOp::SatMulLong {
+                size,
+                high: q,
+                n,
+                m,
+                acc,
+                word,
+            }))
         }
         (false, 0b1100 | 0b1101) if size == 1 && t.sse41 => {
             let a = vec(t, rn);
@@ -1597,6 +1637,87 @@ impl Emitter<'_> {
         if !q {
             dynasm!(self.asm ; .arch x64 ; movq Rx(d), Rx(d));
         }
+    }
+
+    /// Sets FPSR.QC when any byte of `mask` is nonzero.
+    fn qc_if_any(&mut self, mask: u8) {
+        let exact = self.asm.new_dynamic_label();
+        dynasm!(self.asm
+            ; .arch x64
+            ; pmovmskb eax, Rx(mask)
+            ; test eax, eax
+            ; jz =>exact
+            ; or DWORD [r15 + CTX_FPSR], QC
+            ; =>exact
+        );
+    }
+
+    /// Each lane of `16 << size` bits of `x` replaced by copies of its sign bit (`size` 1 or 2).
+    fn lane_signs(&mut self, size: u8, x: u8) {
+        dynasm!(self.asm ; .arch x64 ; psrad Rx(x), 31);
+        if size == 2 {
+            dynasm!(self.asm ; .arch x64 ; pshufd Rx(x), Rx(x), 0xf5_u8 as i8);
+        }
+    }
+
+    /// `SQDMULL`, `SQDMLAL` or `SQDMLSL` (see `SimdOp::SatMulLong`). Only `MIN * MIN` overflows
+    /// the doubling, and it alone gives `MIN` there, so those lanes become `MAX`. The accumulate
+    /// overflows where the operands' signs say it must, and saturates towards the accumulator's sign.
+    pub(super) fn sat_mul_long(
+        &mut self,
+        i: usize,
+        size: u8,
+        high: bool,
+        n: Value,
+        m: Value,
+        acc: Option<(Value, bool)>,
+    ) {
+        let (n, m) = (self.reg(n), self.reg(m));
+        let acc = acc.map(|(acc, sub)| (self.reg(acc), sub));
+        let d = self.def(Value(i as u32));
+        let (t, u) = (self.temp(), self.temp());
+        let wide = size + 1;
+        self.mul_long(true, size, high, d, n, m);
+        self.sse(Sse::Add, wide, d, d);
+        dynasm!(self.asm ; .arch x64 ; pcmpeqd Rx(t), Rx(t));
+        if size == 1 {
+            dynasm!(self.asm ; .arch x64 ; pslld Rx(t), 31);
+        } else {
+            dynasm!(self.asm ; .arch x64 ; psllq Rx(t), 63);
+        }
+        self.sse(Sse::Eq, wide, t, d);
+        self.sse(Sse::Xor, wide, d, t);
+        self.qc_if_any(t);
+        let Some((acc, sub)) = acc else {
+            return;
+        };
+        self.copy(SCRATCH, acc);
+        self.copy(t, acc);
+        if sub {
+            self.sse(Sse::Sub, wide, SCRATCH, d);
+            self.sse(Sse::Xor, wide, t, d);
+            self.copy(d, acc);
+            self.sse(Sse::Xor, wide, d, SCRATCH);
+        } else {
+            self.sse(Sse::Add, wide, SCRATCH, d);
+            self.sse(Sse::Xor, wide, t, SCRATCH);
+            self.sse(Sse::Xor, wide, d, SCRATCH);
+        }
+        self.sse(Sse::And, wide, t, d);
+        self.lane_signs(size, t);
+        dynasm!(self.asm ; .arch x64 ; pcmpeqd Rx(u), Rx(u));
+        if size == 1 {
+            dynasm!(self.asm ; .arch x64 ; psrld Rx(u), 1);
+        } else {
+            dynasm!(self.asm ; .arch x64 ; psrlq Rx(u), 1);
+        }
+        self.copy(d, acc);
+        self.lane_signs(size, d);
+        self.sse(Sse::Xor, wide, d, u);
+        self.sse(Sse::Xor, wide, d, SCRATCH);
+        self.sse(Sse::And, wide, d, t);
+        self.sse(Sse::Xor, wide, d, SCRATCH);
+        self.qc_if_any(t);
     }
 
     /// `SQXTN`/`SQXTN2`, or `SQXTUN`/`SQXTUN2` when `unsigned`: packs `n` with signed or unsigned

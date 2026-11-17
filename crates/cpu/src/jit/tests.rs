@@ -698,6 +698,52 @@ fn saturating_doubling_multiplies_match_the_interpreter() {
 }
 
 #[test]
+fn saturating_doubling_long_multiplies_match_the_interpreter() {
+    const H: [u64; 5] = [0, 1, 0x7fff, 0x8000, 0xffff];
+    const S: [u64; 5] = [0, 1, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff];
+    const ACC_S: [u64; 4] = [1, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff];
+    const ACC_D: [u64; 4] = [1, i64::MAX as u64, i64::MIN as u64, u64::MAX];
+    let sizes = [
+        (
+            [0x4e02_0c21, 0x4e02_0c42, 0x4e04_0c60],
+            &H,
+            &ACC_S,
+            [
+                0x0e62_d020,
+                0x0e62_9020,
+                0x0e62_b020,
+                0x4e62_9020,
+                0x0f52_3020,
+            ],
+        ),
+        (
+            [0x4e04_0c21, 0x4e04_0c42, 0x4e08_0c60],
+            &S,
+            &ACC_D,
+            [
+                0x0ea2_d020,
+                0x0ea2_9020,
+                0x0ea2_b020,
+                0x4ea2_b020,
+                0x4fa2_7820,
+            ],
+        ),
+    ];
+    for (dups, values, accs, ops) in sizes {
+        for op in ops {
+            for (a, b) in values.iter().flat_map(|&a| values.map(|b| (a, b))) {
+                for &acc in accs {
+                    directed(
+                        &[dups[0], dups[1], dups[2], op],
+                        &[(1, a), (2, b), (3, acc)],
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn fused_conditions_match_the_interpreter() {
     const VALUES: [u64; 5] = [0, 1, 0x8000_0000, 1 << 63, u64::MAX];
     let setters = [0xeb01_001f, 0xab01_001f, 0xea01_001f];
