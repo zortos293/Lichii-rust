@@ -422,6 +422,13 @@ impl Emitter<'_> {
         }
     }
 
+    /// A vector register the current op may clobber, locked until the op is finished.
+    pub(super) fn temp(&mut self) -> u8 {
+        let r = self.alloc(Class::Xmm);
+        self.locked[Class::Xmm as usize] |= 1 << r;
+        r
+    }
+
     pub(super) fn def(&mut self, v: Value) -> u8 {
         let class = self.class(v);
         let r = self.alloc(class);

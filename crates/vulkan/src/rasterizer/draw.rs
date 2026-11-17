@@ -48,10 +48,11 @@ use super::samples::SampleCounter;
 use crate::buffer_cache::{BufferBinding, IndexBinding, assembled_topology, vertex_stream_range};
 use crate::commands::ImageAccess;
 use crate::debug::{Program, Programs};
-use crate::descriptors::DescriptorAllocator;
+use crate::descriptors::{DescriptorAllocator, DescriptorInfo};
 use crate::device::{Device, DeviceFeatures};
 use crate::error::Result;
 use crate::memory::{Buffer, BufferView};
+use crate::pipeline::cache::SetTemplate;
 use crate::pipeline::environment::{
     ProgramEnv, TexturePool, graphics_program_header, texture_type,
 };
@@ -313,6 +314,7 @@ pub(super) struct DrawState {
     vertex_input: ash::ext::vertex_input_dynamic_state::Device,
     mesh: ash::ext::mesh_shader::Device,
     depth_bias_control: ash::ext::depth_bias_control::Device,
+    push_descriptor: ash::khr::push_descriptor::Device,
     null_buffer: Buffer,
     null_images: null::NullImages,
     arch: ShaderArch,
@@ -351,7 +353,8 @@ pub(super) struct DrawState {
     buffer_infos: Vec<vk::DescriptorBufferInfo>,
     image_infos: Vec<vk::DescriptorImageInfo>,
     writes: Vec<Write>,
-    vk_writes: Vec<vk::WriteDescriptorSet<'static>>,
+    /// The data of the current draw's [`SetTemplate`].
+    descriptor_infos: Vec<DescriptorInfo>,
     vertex_buffers: Vec<vk::Buffer>,
     vertex_offsets: Vec<u64>,
     vertex_strides: Vec<u64>,
@@ -450,6 +453,10 @@ impl DrawState {
                 &device.instance.raw,
                 &device.raw,
             ),
+            push_descriptor: ash::khr::push_descriptor::Device::new(
+                &device.instance.raw,
+                &device.raw,
+            ),
             null_buffer,
             null_images: null::NullImages::default(),
             arch: if gob_layout == GobLayout::Switch2 {
@@ -478,7 +485,7 @@ impl DrawState {
             buffer_infos: Vec::new(),
             image_infos: Vec::new(),
             writes: Vec::new(),
-            vk_writes: Vec::new(),
+            descriptor_infos: Vec::new(),
             vertex_buffers: Vec::new(),
             vertex_offsets: Vec::new(),
             vertex_strides: Vec::new(),
@@ -915,7 +922,7 @@ impl VulkanRasterizer {
         let layout = pipeline.layout();
         let layout_raw = layout.raw();
         let push = layout.push_constants();
-        let set_layout = layout.set_layouts().first().copied();
+        let template = layout.set_template();
         let features = *draw.pipelines.features();
 
         let gmmu = ctx.memory;
@@ -1001,7 +1008,7 @@ impl VulkanRasterizer {
         if index.is_some_and(|i: IndexBinding| i.index_count == 0) {
             return Ok(());
         }
-        let set = self.descriptor_set(set_layout)?;
+        let set = self.descriptor_set(template)?;
 
         let task = self.draw.stages[0]
             .as_ref()
@@ -1155,15 +1162,25 @@ impl VulkanRasterizer {
                 raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline_raw);
                 draw.bound_pipeline = pipeline_raw;
             }
-            if let Some(set) = set {
-                raw.cmd_bind_descriptor_sets(
+            match (set, template) {
+                (Some(set), _) => raw.cmd_bind_descriptor_sets(
                     cmd,
                     vk::PipelineBindPoint::GRAPHICS,
                     layout_raw,
                     0,
                     &[set],
                     &[],
-                );
+                ),
+                (None, Some(template)) => {
+                    draw.push_descriptor.cmd_push_descriptor_set_with_template(
+                        cmd,
+                        template.raw,
+                        layout_raw,
+                        0,
+                        draw.descriptor_infos.as_ptr().cast(),
+                    )
+                }
+                (None, None) => {}
             }
         }
         let render_area = self
@@ -2334,42 +2351,68 @@ impl VulkanRasterizer {
         }))
     }
 
-    /// Allocates and writes the draw's descriptor set.
+    /// Gathers the draw's descriptors into `descriptor_infos` in `template`'s binding order and,
+    /// when the template writes an allocated set, allocates and writes it. `None`: there is no
+    /// set to bind, because the layout has no descriptors or the template pushes them.
     fn descriptor_set(
         &mut self,
-        layout: Option<vk::DescriptorSetLayout>,
+        template: Option<SetTemplate>,
     ) -> Result<Option<vk::DescriptorSet>> {
-        let Some(layout) = layout else {
+        let Some(template) = template else {
             return Ok(None);
         };
-        let set = self
-            .draw
-            .descriptors
-            .allocate(&mut self.scheduler, layout)?;
         let draw = &mut self.draw;
-        draw.vk_writes.clear();
+        draw.writes
+            .sort_unstable_by_key(|write| (write.binding, write.first));
+        draw.descriptor_infos.clear();
+        let mut last = None;
         for write in &draw.writes {
-            let mut vk_write = vk::WriteDescriptorSet {
-                dst_set: set,
-                dst_binding: write.binding,
-                descriptor_count: write.count,
-                descriptor_type: crate::pipeline::descriptor_type(write.kind),
-                ..Default::default()
-            };
-            match write.kind {
-                DescriptorKind::UniformBuffer | DescriptorKind::StorageBuffer => {
-                    vk_write.p_buffer_info = draw.buffer_infos[write.first..].as_ptr();
-                }
-                DescriptorKind::UniformTexelBuffer | DescriptorKind::StorageTexelBuffer => {
-                    vk_write.p_texel_buffer_view = draw.texel_views[write.first..].as_ptr();
-                }
-                _ => vk_write.p_image_info = draw.image_infos[write.first..].as_ptr(),
+            let range = write.first..write.first + write.count as usize;
+            if last == Some(write.binding) {
+                let len = draw.descriptor_infos.len();
+                draw.descriptor_infos.truncate(len - range.len());
             }
-            draw.vk_writes.push(vk_write);
+            last = Some(write.binding);
+            let infos = &mut draw.descriptor_infos;
+            match write.kind {
+                DescriptorKind::UniformBuffer | DescriptorKind::StorageBuffer => infos.extend(
+                    draw.buffer_infos[range]
+                        .iter()
+                        .map(|&buffer| DescriptorInfo { buffer }),
+                ),
+                DescriptorKind::UniformTexelBuffer | DescriptorKind::StorageTexelBuffer => infos
+                    .extend(
+                        draw.texel_views[range]
+                            .iter()
+                            .map(|&texel| DescriptorInfo { texel }),
+                    ),
+                _ => infos.extend(
+                    draw.image_infos[range]
+                        .iter()
+                        .map(|&image| DescriptorInfo { image }),
+                ),
+            }
         }
-        // SAFETY: every write points into the draw's info lists, which outlive the call and
-        // hold `count` infos from `first`; the set is live and unused by recorded work.
-        unsafe { self.device.raw.update_descriptor_sets(&draw.vk_writes, &[]) };
+        assert_eq!(
+            draw.descriptor_infos.len(),
+            template.descriptors,
+            "the draw's writes cover its layout's set 0"
+        );
+        let Some(layout) = template.allocate else {
+            return Ok(None);
+        };
+        let set = draw.descriptors.allocate(&mut self.scheduler, layout)?;
+        // SAFETY: `descriptor_infos` holds the template's `descriptors` infos in its entries'
+        // order and stride: the layout merges the bindings of the draw's modules, and
+        // `bind_resources` writes all `count` elements of every one of them or skips the draw.
+        // The set is live and unused by recorded work.
+        unsafe {
+            self.device.raw.update_descriptor_set_with_template(
+                set,
+                template.raw,
+                draw.descriptor_infos.as_ptr().cast(),
+            )
+        };
         Ok(Some(set))
     }
 
@@ -2896,7 +2939,7 @@ impl VulkanRasterizer {
         let pipeline_raw = pipeline.raw();
         let layout_raw = pipeline.layout().raw();
         let push = pipeline.layout().push_constants();
-        let set_layout = pipeline.layout().set_layouts().first().copied();
+        let template = pipeline.layout().set_template();
         let sources = StageSources {
             gmmu: ctx.memory,
             cbufs: ctx.const_buffers,
@@ -2951,7 +2994,7 @@ impl VulkanRasterizer {
                 removals = self.texture_cache.removals();
             }
         };
-        let set = self.descriptor_set(set_layout)?;
+        let set = self.descriptor_set(template)?;
         let cmd = self.scheduler.record()?;
         self.buffer_cache.commit_writes(self.scheduler.tick());
         let align = self.buffer_cache.storage_alignment();
@@ -2978,15 +3021,26 @@ impl VulkanRasterizer {
         // until the scheduler's current tick completes.
         unsafe {
             raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline_raw);
-            if let Some(set) = set {
-                raw.cmd_bind_descriptor_sets(
+            match (set, template) {
+                (Some(set), _) => raw.cmd_bind_descriptor_sets(
                     cmd,
                     vk::PipelineBindPoint::COMPUTE,
                     layout_raw,
                     0,
                     &[set],
                     &[],
-                );
+                ),
+                (None, Some(template)) => self
+                    .draw
+                    .push_descriptor
+                    .cmd_push_descriptor_set_with_template(
+                        cmd,
+                        template.raw,
+                        layout_raw,
+                        0,
+                        self.draw.descriptor_infos.as_ptr().cast(),
+                    ),
+                (None, None) => {}
             }
         }
         self.push_constants(cmd, layout_raw, push, None, ResolutionScale::X1);

@@ -79,6 +79,14 @@ pub enum Binary {
     SMin,
     UMax,
     UMin,
+    /// All ones in a lane where `a & b` is nonzero.
+    CmTst,
+    /// `(a + b) >> 1` without overflow, signed or unsigned.
+    Hadd(bool),
+    /// `(a + b + 1) >> 1` without overflow, signed or unsigned.
+    Rhadd(bool),
+    /// `|a - b|`, signed or unsigned.
+    Abd(bool),
 }
 
 /// The bitwise selects, each `base ^ ((n ^ base) & mask)` on the destination's old value `old`.
@@ -90,6 +98,23 @@ pub enum Select {
     Bit,
     /// `BIF`: `n` where `m` is clear, else `old`.
     Bif,
+}
+
+/// The arithmetic of `VecOp::Long`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Long {
+    /// `SADDL`: `n + m`.
+    Add,
+    /// `SSUBL`: `n - m`.
+    Sub,
+    /// `SADDW`: `n`, already wide, plus `m`.
+    AddWide,
+    /// `SSUBW`: `n`, already wide, minus `m`.
+    SubWide,
+    /// `SABDL`: `|n - m|`.
+    Abd,
+    /// `SMULL`: `n * m`.
+    Mul,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,14 +189,18 @@ pub enum VecOp {
         n: Value,
         m: Value,
     },
-    /// `SADDW`/`UADDW` (and the `2` forms when `high`): `n`'s lanes of `16 << size` bits plus
-    /// the low (or high) half of `m`'s `8 << size`-bit lanes, sign- or zero-extended.
-    AddWide {
+    /// An integer three-different op (the `2` form when `high`) on the low (or high) half of the
+    /// `8 << size`-bit lanes of `m`, and of `n` too unless the op is a wide one, sign- or
+    /// zero-extended to `16 << size` bits. With `acc`, the result is added to the accumulator, or
+    /// subtracted from it when its flag is set (`SABAL`, `SMLAL`, `SMLSL` and the unsigned forms).
+    Long {
+        op: Long,
         signed: bool,
         size: u8,
         high: bool,
         n: Value,
         m: Value,
+        acc: Option<(Value, bool)>,
     },
     /// `SSHLL`/`USHLL` (and the `2` forms when `high`): the low (or high) half of `a`'s
     /// `8 << size`-bit lanes, sign- or zero-extended and shifted left by `shift`, up to `8 << size`
@@ -254,7 +283,6 @@ impl VecOp {
             }
             | VecOp::Ext { n: a, m: b, .. }
             | VecOp::Zip { n: a, m: b, .. }
-            | VecOp::AddWide { n: a, m: b, .. }
             | VecOp::Ushl(_, a, b)
             | VecOp::Permute { n: a, m: b, .. }
             | VecOp::Table {
@@ -282,6 +310,13 @@ impl VecOp {
                 if let Some(low) = low {
                     f(low);
                 }
+            }
+            VecOp::Long { n, m, acc, .. } => {
+                if let Some((acc, _)) = acc {
+                    f(acc);
+                }
+                f(n);
+                f(m);
             }
             VecOp::RoundShift { acc, a, .. } => {
                 if let Some(acc) = acc {
@@ -328,6 +363,10 @@ fn supported(t: &Translator, op: Binary, size: u8) -> bool {
         Binary::Mul => size == 1 || (size == 2 && t.sse41),
         Binary::SMax | Binary::SMin => size == 1 || (size < 3 && t.sse41),
         Binary::UMax | Binary::UMin => size == 0 || (size < 3 && t.sse41),
+        Binary::CmTst => size < 3 || t.sse41,
+        Binary::Hadd(_) | Binary::Rhadd(true) => size == 1 || size == 2,
+        Binary::Rhadd(false) => size < 3,
+        Binary::Abd(signed) => supported(t, if signed { Binary::SMax } else { Binary::UMax }, size),
     }
 }
 
@@ -471,6 +510,17 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         t.set(Loc::V(rd), r);
         return true;
     }
+    if word & 0x9f20_dc00 == 0x0e20_0c00 && size < 2 {
+        let (a, b) = (vec(t, rn), vec(t, rm));
+        let r = t.op(Op::Simd(SimdOp::SatArith {
+            arrangement,
+            a,
+            b,
+            word,
+        }));
+        t.set(Loc::V(rd), r);
+        return true;
+    }
     if word & 0x9f20_0400 == 0x0e20_0400 {
         let opcode = field(word, 11, 5);
         let op = match (opcode, u, size) {
@@ -492,6 +542,10 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
             (0b01101, false, _) => Binary::SMin,
             (0b01100, true, _) => Binary::UMax,
             (0b01101, true, _) => Binary::UMin,
+            (0b10001, false, _) => Binary::CmTst,
+            (0b00000, _, _) => Binary::Hadd(!u),
+            (0b00010, _, _) => Binary::Rhadd(!u),
+            (0b01110, _, _) => Binary::Abd(!u),
             _ => return false,
         };
         if opcode != 0b00011 && ((size == 3 && !q) || !supported(t, op, size)) {
@@ -517,16 +571,40 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         t.set(Loc::V(rd), r);
         return true;
     }
-    if word & 0x9f20_fc00 == 0x0e20_1000 && size < 3 {
+    if word & 0x9f20_0c00 == 0x0e20_0000 && size < 3 {
+        let signed = !u;
+        let (op, acc) = match field(word, 12, 4) {
+            0b0000 => (Long::Add, None),
+            0b0001 => (Long::AddWide, None),
+            0b0010 => (Long::Sub, None),
+            0b0011 => (Long::SubWide, None),
+            0b0101 => (Long::Abd, Some(false)),
+            0b0111 => (Long::Abd, None),
+            0b1000 => (Long::Mul, Some(false)),
+            0b1010 => (Long::Mul, Some(true)),
+            0b1100 => (Long::Mul, None),
+            _ => return false,
+        };
+        let native = match op {
+            Long::Abd => supported(t, Binary::Abd(signed), size),
+            Long::Mul => size < 2 || !signed || t.sse41,
+            _ => true,
+        };
+        if !native {
+            return false;
+        }
+        let acc = acc.map(|sub| (vec(t, rd), sub));
         let (n, m) = (vec(t, rn), vec(t, rm));
         let r = emit(
             t,
-            VecOp::AddWide {
-                signed: !u,
+            VecOp::Long {
+                op,
+                signed,
                 size,
                 high: q,
                 n,
                 m,
+                acc,
             },
         );
         t.set(Loc::V(rd), r);
@@ -1008,6 +1086,11 @@ enum Sse {
     MinU,
     MinS,
     Mul,
+    /// Unsigned `(d + s + 1) >> 1`, B and H lanes.
+    AvgU,
+    /// Saturating add or subtract, signed or unsigned, B and H lanes.
+    AddSat(bool),
+    SubSat(bool),
 }
 
 impl Emitter<'_> {
@@ -1047,6 +1130,16 @@ impl Emitter<'_> {
             (Sse::MinS, _) => dynasm!(self.asm ; .arch x64 ; pminsd Rx(d), Rx(s)),
             (Sse::Mul, 1) => dynasm!(self.asm ; .arch x64 ; pmullw Rx(d), Rx(s)),
             (Sse::Mul, _) => dynasm!(self.asm ; .arch x64 ; pmulld Rx(d), Rx(s)),
+            (Sse::AvgU, 0) => dynasm!(self.asm ; .arch x64 ; pavgb Rx(d), Rx(s)),
+            (Sse::AvgU, _) => dynasm!(self.asm ; .arch x64 ; pavgw Rx(d), Rx(s)),
+            (Sse::AddSat(true), 0) => dynasm!(self.asm ; .arch x64 ; paddsb Rx(d), Rx(s)),
+            (Sse::AddSat(true), _) => dynasm!(self.asm ; .arch x64 ; paddsw Rx(d), Rx(s)),
+            (Sse::AddSat(false), 0) => dynasm!(self.asm ; .arch x64 ; paddusb Rx(d), Rx(s)),
+            (Sse::AddSat(false), _) => dynasm!(self.asm ; .arch x64 ; paddusw Rx(d), Rx(s)),
+            (Sse::SubSat(true), 0) => dynasm!(self.asm ; .arch x64 ; psubsb Rx(d), Rx(s)),
+            (Sse::SubSat(true), _) => dynasm!(self.asm ; .arch x64 ; psubsw Rx(d), Rx(s)),
+            (Sse::SubSat(false), 0) => dynasm!(self.asm ; .arch x64 ; psubusb Rx(d), Rx(s)),
+            (Sse::SubSat(false), _) => dynasm!(self.asm ; .arch x64 ; psubusw Rx(d), Rx(s)),
         }
     }
 
@@ -1134,6 +1227,53 @@ impl Emitter<'_> {
         }
     }
 
+    /// `d` = `a - d` on lanes of `8 << size` bits.
+    fn sub_from(&mut self, size: u8, d: u8, a: u8) {
+        self.copy(SCRATCH, a);
+        self.sse(Sse::Sub, size, SCRATCH, d);
+        self.copy(d, SCRATCH);
+    }
+
+    /// `d` = the products of the low (or, when `high`, the high) halves of `n`'s and `m`'s
+    /// `8 << size`-bit lanes, each twice as wide, signed or unsigned. Clobbers `xmm15`.
+    fn mul_long(&mut self, signed: bool, size: u8, high: bool, d: u8, n: u8, m: u8) {
+        match size {
+            0 => {
+                self.widen(signed, 0, high, d, n);
+                self.widen(signed, 0, high, SCRATCH, m);
+                self.sse(Sse::Mul, 1, d, SCRATCH);
+            }
+            1 => {
+                self.copy(d, n);
+                self.sse(Sse::Mul, 1, d, m);
+                self.copy(SCRATCH, n);
+                if signed {
+                    dynasm!(self.asm ; .arch x64 ; pmulhw Rx(SCRATCH), Rx(m));
+                } else {
+                    dynasm!(self.asm ; .arch x64 ; pmulhuw Rx(SCRATCH), Rx(m));
+                }
+                if high {
+                    dynasm!(self.asm ; .arch x64 ; punpckhwd Rx(d), Rx(SCRATCH));
+                } else {
+                    dynasm!(self.asm ; .arch x64 ; punpcklwd Rx(d), Rx(SCRATCH));
+                }
+            }
+            _ => {
+                let lanes = if high { 0xfa_u8 } else { 0x50 } as i8;
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; pshufd Rx(d), Rx(n), lanes
+                    ; pshufd Rx(SCRATCH), Rx(m), lanes
+                );
+                if signed {
+                    dynasm!(self.asm ; .arch x64 ; pmuldq Rx(d), Rx(SCRATCH));
+                } else {
+                    dynasm!(self.asm ; .arch x64 ; pmuludq Rx(d), Rx(SCRATCH));
+                }
+            }
+        }
+    }
+
     fn addp(&mut self, size: u8, q: bool, d: u8, a: u8, b: u8) {
         if size == 3 {
             dynasm!(self.asm
@@ -1154,6 +1294,44 @@ impl Emitter<'_> {
             self.pair_sums(size, SCRATCH, d);
             self.pack_sums(size, SCRATCH, SCRATCH);
             self.copy(d, SCRATCH);
+        }
+    }
+
+    /// `SQADD`, `UQADD`, `SQSUB` or `UQSUB` (by `word`) on B or H lanes, setting FPSR.QC when
+    /// any lane of the arrangement saturated, that is when the wrapping result differs.
+    pub(super) fn sat_arith(
+        &mut self,
+        i: usize,
+        arrangement: Arrangement,
+        a: Value,
+        b: Value,
+        word: u32,
+    ) {
+        let Arrangement { size, q } = arrangement;
+        let (signed, sub) = (word & 0x2000_0000 == 0, word & 0x2000 != 0);
+        let (a, b) = (self.reg(a), self.reg(b));
+        let d = self.def(Value(i as u32));
+        let (wrap, sat) = match sub {
+            false => (Sse::Add, Sse::AddSat(signed)),
+            true => (Sse::Sub, Sse::SubSat(signed)),
+        };
+        self.copy(SCRATCH, a);
+        self.sse(wrap, size, SCRATCH, b);
+        self.copy(d, a);
+        self.sse(sat, size, d, b);
+        self.sse(Sse::Eq, size, SCRATCH, d);
+        let (exact, all) = (self.asm.new_dynamic_label(), if q { 0xffff } else { 0xff });
+        dynasm!(self.asm
+            ; .arch x64
+            ; pmovmskb eax, Rx(SCRATCH)
+            ; and eax, all
+            ; cmp eax, all
+            ; je =>exact
+            ; or DWORD [r15 + CTX_FPSR], QC
+            ; =>exact
+        );
+        if !q {
+            dynasm!(self.asm ; .arch x64 ; movq Rx(d), Rx(d));
         }
     }
 
@@ -1241,6 +1419,43 @@ impl Emitter<'_> {
                         self.sse(Sse::Eq, size, d, a);
                     }
                     Binary::Addp => self.addp(size, q, d, a, b),
+                    Binary::CmTst => {
+                        self.copy(d, a);
+                        self.sse(Sse::And, size, d, b);
+                        dynasm!(self.asm ; .arch x64 ; pxor Rx(SCRATCH), Rx(SCRATCH));
+                        self.sse(Sse::Eq, size, d, SCRATCH);
+                        self.invert(d);
+                    }
+                    Binary::Rhadd(false) if size < 2 => {
+                        self.copy(d, a);
+                        self.sse(Sse::AvgU, size, d, b);
+                    }
+                    Binary::Hadd(signed) | Binary::Rhadd(signed) => {
+                        let shift = if signed { Shift::Sshr } else { Shift::Ushr };
+                        self.copy(SCRATCH, a);
+                        self.sse(Sse::Xor, size, SCRATCH, b);
+                        self.shift_imm(shift, size, SCRATCH, 1);
+                        self.copy(d, a);
+                        if matches!(op, Binary::Hadd(_)) {
+                            self.sse(Sse::And, size, d, b);
+                            self.sse(Sse::Add, size, d, SCRATCH);
+                        } else {
+                            self.sse(Sse::Or, size, d, b);
+                            self.sse(Sse::Sub, size, d, SCRATCH);
+                        }
+                    }
+                    Binary::Abd(signed) => {
+                        let (max, min) = if signed {
+                            (Sse::MaxS, Sse::MinS)
+                        } else {
+                            (Sse::MaxU, Sse::MinU)
+                        };
+                        self.copy(SCRATCH, a);
+                        self.sse(min, size, SCRATCH, b);
+                        self.copy(d, a);
+                        self.sse(max, size, d, b);
+                        self.sse(Sse::Sub, size, d, SCRATCH);
+                    }
                     _ => {
                         let op = match op {
                             Binary::Add => Sse::Add,
@@ -1382,17 +1597,55 @@ impl Emitter<'_> {
                 }
                 (d, q)
             }
-            VecOp::AddWide {
+            VecOp::Long {
+                op,
                 signed,
                 size,
                 high,
                 n,
                 m,
+                acc,
             } => {
                 let (n, m) = (self.reg(n), self.reg(m));
+                let acc = acc.map(|(acc, sub)| (self.reg(acc), sub));
                 let d = self.def(v);
-                self.widen(signed, size, high, d, m);
-                self.sse(Sse::Add, size + 1, d, n);
+                let wide = size + 1;
+                match op {
+                    Long::Add | Long::Sub => {
+                        let t = self.temp();
+                        self.widen(signed, size, high, d, n);
+                        self.widen(signed, size, high, t, m);
+                        let op = if op == Long::Add { Sse::Add } else { Sse::Sub };
+                        self.sse(op, wide, d, t);
+                    }
+                    Long::AddWide => {
+                        self.widen(signed, size, high, d, m);
+                        self.sse(Sse::Add, wide, d, n);
+                    }
+                    Long::SubWide => {
+                        self.widen(signed, size, high, d, m);
+                        self.sub_from(wide, d, n);
+                    }
+                    Long::Abd => {
+                        let (max, min) = if signed {
+                            (Sse::MaxS, Sse::MinS)
+                        } else {
+                            (Sse::MaxU, Sse::MinU)
+                        };
+                        self.copy(SCRATCH, n);
+                        self.sse(min, size, SCRATCH, m);
+                        self.copy(d, n);
+                        self.sse(max, size, d, m);
+                        self.sse(Sse::Sub, size, d, SCRATCH);
+                        self.widen(false, size, high, d, d);
+                    }
+                    Long::Mul => self.mul_long(signed, size, high, d, n, m),
+                }
+                match acc {
+                    Some((acc, true)) => self.sub_from(wide, d, acc),
+                    Some((acc, false)) => self.sse(Sse::Add, wide, d, acc),
+                    None => {}
+                }
                 return;
             }
             VecOp::ShiftLong {
