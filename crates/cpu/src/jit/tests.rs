@@ -296,7 +296,7 @@ fn simd(rng: &mut Rng) -> u32 {
     }
 }
 
-const VECTOR: [&str; 25] = [
+const VECTOR: [&str; 26] = [
     "0xx01110xx1xxxxx0110x1xxxxxxxxxx",
     "0xx01110xx1xxxxx000x01xxxxxxxxxx",
     "0xx01110xx1xxxxx00x011xxxxxxxxxx",
@@ -317,7 +317,8 @@ const VECTOR: [&str; 25] = [
     "0xx01110xx1xxxxx100011xxxxxxxxxx",
     "0xx01110xx1xxxxx100111xxxxxxxxxx",
     "0xx01110xx100000100x10xxxxxxxxxx",
-    "0xx011110xxxxxxx0x0x01xxxxxxxxxx",
+    "0xx011110xxxxxxx0xxx01xxxxxxxxxx",
+    "01x111110xxxxxxx0xxx01xxxxxxxxxx",
     "0xx01110000xxxxx0xxxx1xxxxxxxxxx",
     "0xx0111100000xxxxxxx01xxxxxxxxxx",
     "0x001110xx1xxxxx101111xxxxxxxxxx",
@@ -325,7 +326,7 @@ const VECTOR: [&str; 25] = [
 ];
 
 /// An Advanced SIMD integer three-same (halving, saturating, absolute-difference and pairwise max/min forms
-/// too), compare against zero, `CNT`, shift by immediate (long, accumulating, inserting and narrowing too), `ZIP1`/`ZIP2`, three-different (`SADDL`, `SMLAL` and the rest), integer by-element, `SQDMULH`/`SQRDMULH`, copy or modified-immediate instruction, or an `LD1`..`LD4`/`ST1`..`ST4` of one to four registers on `X20`..`X23` or
+/// too), compare against zero, `CNT`, shift by immediate (long, rounding, accumulating, inserting, narrowing and scalar too), `ZIP1`/`ZIP2`, three-different (`SADDL`, `SMLAL` and the rest), integer by-element, `SQDMULH`/`SQRDMULH`, copy or modified-immediate instruction, or an `LD1`..`LD4`/`ST1`..`ST4` of one to four registers on `X20`..`X23` or
 /// `SP`, offset or post-indexed by an immediate or `X24`/`X26`.
 fn vector(rng: &mut Rng) -> u32 {
     if rng.below(3) == 0 {
@@ -753,6 +754,64 @@ fn shift_inserts_at_the_lane_width_match_the_interpreter() {
             &[DUP_V0_X0, DUP_V1_X1, op],
             &[(0, 0x0123_4567_89ab_cdef), (1, 0xfedc_ba98_7654_3210)],
         );
+    }
+}
+
+#[test]
+fn byte_and_double_shifts_at_the_lane_width_match_the_interpreter() {
+    const DUP_V0_X0: u32 = 0x4e08_0c00;
+    const DUP_V1_X1: u32 = 0x4e08_0c21;
+    const VALUES: [u64; 2] = [0x8123_4567_89ab_cdef, 0x4fdc_ba98_f654_3210];
+    let ops = [
+        0x4f40_0420,
+        0x4f41_0420,
+        0x4f40_1420,
+        0x4f40_2420,
+        0x4f08_0420,
+        0x4f09_0420,
+        0x6f08_0420,
+        0x5f40_0420,
+        0x5f41_3420,
+    ];
+    for op in ops {
+        for (a, b) in [(VALUES[0], VALUES[1]), (VALUES[1], VALUES[0])] {
+            directed(&[DUP_V0_X0, DUP_V1_X1, op], &[(0, a), (1, b)]);
+        }
+    }
+}
+
+#[test]
+fn saturating_left_shifts_at_the_lane_edges_match_the_interpreter() {
+    const DUP_V0_X0: u32 = 0x4e08_0c00;
+    const DUP_V1_X1: u32 = 0x4e08_0c21;
+    const VALUES: [u64; 8] = [
+        0,
+        1,
+        u64::MAX,
+        1 << 63,
+        u64::MAX >> 1,
+        0x3f40_7f80_c0ff_0001,
+        0x4000_3fff_c000_bfff,
+        0x0001_0080_ff7f_8100,
+    ];
+    let ops = [
+        0x4f00_7420,
+        0x6f00_7420,
+        0x6f00_6420,
+        0x5f00_7420,
+        0x7f00_7420,
+        0x7f00_6420,
+    ];
+    for op in ops {
+        for size in 0..4 {
+            let esize = 8u32 << size;
+            for shift in [0, 1, esize / 2, esize - 1] {
+                let word = op | (esize + shift) << 16;
+                for a in VALUES {
+                    directed(&[DUP_V0_X0, DUP_V1_X1, word], &[(0, !a), (1, a)]);
+                }
+            }
+        }
     }
 }
 

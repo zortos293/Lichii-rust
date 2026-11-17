@@ -69,6 +69,7 @@ use crate::scheduler::RenderingKey;
 use crate::texture_cache::{
     DEPTH_ATTACHMENT, ImageId, ImageInfo, ImageKind, Transfer, Usage, ViewInfo,
 };
+use compute_batch::ComputeBatch;
 use dynamic::{DynamicShadow, Slot};
 
 const NULL_BUFFER_SIZE: u64 = 64 << 10;
@@ -353,6 +354,10 @@ pub(super) struct DrawState {
     /// Views of the null buffer for unbound texel buffers, by host format.
     null_texel_views: Vec<(vk::Format, BufferView)>,
     buffer_infos: Vec<vk::DescriptorBufferInfo>,
+    /// The storage buffers of `buffer_infos` the shader writes.
+    written_buffers: Vec<vk::DescriptorBufferInfo>,
+    /// The dispatches recorded since the last compute barrier.
+    compute_batch: ComputeBatch,
     image_infos: Vec<vk::DescriptorImageInfo>,
     writes: Vec<Write>,
     /// The data of the current draw's [`SetTemplate`].
@@ -485,6 +490,8 @@ impl DrawState {
             texel_formats: vec![None; PixelFormat::ALL.len()],
             null_texel_views: Vec::new(),
             buffer_infos: Vec::new(),
+            written_buffers: Vec::new(),
+            compute_batch: ComputeBatch::default(),
             image_infos: Vec::new(),
             writes: Vec::new(),
             descriptor_infos: Vec::new(),
@@ -934,6 +941,7 @@ impl VulkanRasterizer {
             let merged = self.buffer_cache.stats().merged_buffers;
             self.draw.rebind = false;
             self.draw.buffer_infos.clear();
+            self.draw.written_buffers.clear();
             self.draw.image_infos.clear();
             self.draw.writes.clear();
             self.draw.textures.clear();
@@ -1667,7 +1675,7 @@ impl VulkanRasterizer {
                                 }
                                 _ => None,
                             };
-                            self.push_buffer(binding);
+                            self.push_buffer(binding, false);
                         }
                     }
                     DescriptorKind::StorageBuffer => {
@@ -1683,7 +1691,7 @@ impl VulkanRasterizer {
                                 size,
                                 desc.is_written,
                             )?;
-                            self.push_buffer(binding);
+                            self.push_buffer(binding, desc.is_written);
                         }
                     }
                     DescriptorKind::CombinedImageSampler => {
@@ -2052,7 +2060,7 @@ impl VulkanRasterizer {
             .view(&self.device, || scheduler.record(), view_type, format)
     }
 
-    fn push_buffer(&mut self, binding: Option<crate::buffer_cache::BufferBinding>) {
+    fn push_buffer(&mut self, binding: Option<crate::buffer_cache::BufferBinding>, written: bool) {
         let info = match binding {
             Some(b) => vk::DescriptorBufferInfo {
                 buffer: b.buffer,
@@ -2065,6 +2073,9 @@ impl VulkanRasterizer {
                 range: NULL_BUFFER_SIZE,
             },
         };
+        if written {
+            self.draw.written_buffers.push(info);
+        }
         self.draw.buffer_infos.push(info);
     }
 
@@ -2956,6 +2967,7 @@ impl VulkanRasterizer {
             let merged = self.buffer_cache.stats().merged_buffers;
             self.draw.rebind = false;
             self.draw.buffer_infos.clear();
+            self.draw.written_buffers.clear();
             self.draw.image_infos.clear();
             self.draw.writes.clear();
             self.draw.textures.clear();
@@ -2997,7 +3009,20 @@ impl VulkanRasterizer {
             }
         };
         let set = self.descriptor_set(template)?;
-        let cmd = self.scheduler.record()?;
+        let batched = grid.is_none()
+            && self.draw.texel_views.is_empty()
+            && compute_batch::bounded_by_bindings(&module.info, env.pool().switch2);
+        let draw = &self.draw;
+        let cmd = if batched
+            && self.scheduler.compute_barrier_owed()
+            && draw
+                .compute_batch
+                .admits(&draw.buffer_infos, &draw.written_buffers)
+        {
+            self.scheduler.record_beside_dispatches()?
+        } else {
+            self.scheduler.record()?
+        };
         self.buffer_cache.commit_writes(self.scheduler.tick());
         let align = self.buffer_cache.storage_alignment();
         let grid = match grid {
@@ -3046,11 +3071,6 @@ impl VulkanRasterizer {
             }
         }
         self.push_constants(cmd, layout_raw, push, None, ResolutionScale::X1);
-        let barrier = vk::MemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-            .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-            .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE);
         match grid {
             Some(_) => self
                 .device
@@ -3068,10 +3088,17 @@ impl VulkanRasterizer {
                 None => raw.cmd_dispatch(cmd, x, y, z),
             }
             self.device.end_label(cmd);
-            raw.cmd_pipeline_barrier2(
-                cmd,
-                &vk::DependencyInfo::default().memory_barriers(&[barrier]),
-            );
+        }
+        if !self.scheduler.compute_barrier_owed() {
+            self.draw.compute_batch.clear();
+        }
+        self.scheduler.owe_compute_barrier();
+        if batched {
+            let draw = &mut self.draw;
+            draw.compute_batch
+                .add(&draw.buffer_infos, &draw.written_buffers);
+        } else {
+            self.scheduler.record()?;
         }
         for &(id, written) in &self.draw.storage_images {
             if written {
@@ -3267,6 +3294,7 @@ fn storage_range_limit(rasterizer: &VulkanRasterizer) -> u64 {
 }
 
 mod assembly;
+mod compute_batch;
 mod dispatch_grid;
 mod dynamic;
 mod frame_decode;
