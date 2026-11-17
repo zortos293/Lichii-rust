@@ -1520,6 +1520,14 @@ impl TextureCache {
         image.image.raw()
     }
 
+    pub fn liru14_arm(&mut self, memory: &DeviceAddressSpace, id: ImageId) {
+        if let Some(image) = self.get(id) {
+            for s in &image.segments {
+                memory.arm_flush_traps(s.daddr, s.size);
+            }
+        }
+    }
+
     /// Marks a cached image as written by the GPU, and its device pages in the written-pages
     /// bitmap. Called when the writing work is recorded.
     pub fn mark_modified(&mut self, id: ImageId) {

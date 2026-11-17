@@ -1446,6 +1446,14 @@ impl Rasterizer for VulkanRasterizer {
             tracing::error!(%error, "flushing GPU-written buffers for a CPU read failed");
         }
         self.flush_region(addr, size);
+        if std::env::var_os("LIRU14_IMGTRAP").is_some() && !self.buffer_cache.is_gpu_written(addr, size) {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 50 || n.is_multiple_of(2000) {
+                eprintln!("LIRU14 imgtrap #{n} daddr={addr:#x} size={size:#x} downloads={}", self.texture_cache.traffic().downloads);
+            }
+            self.handles.device.disarm_flush_traps(addr, size);
+        }
     }
 
     fn unmap_region(&mut self, addr: DAddr, size: u64) {

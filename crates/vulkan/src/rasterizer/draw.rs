@@ -1242,12 +1242,19 @@ impl VulkanRasterizer {
             8 => draw.depth.map(|t| t.id),
             i => draw.colors[i].map(|t| t.id),
         });
+        let arm = std::env::var_os("LIRU14_IMGTRAP").is_some() && lichii_gpu::gpu::flush_traps_enabled();
         for id in written.into_iter().flatten() {
             self.texture_cache.mark_modified(id);
+            if arm {
+                self.texture_cache.liru14_arm(&self.handles.device, id);
+            }
         }
         for &(id, written) in &self.draw.storage_images {
             if written {
                 self.texture_cache.mark_modified(id);
+                if arm {
+                    self.texture_cache.liru14_arm(&self.handles.device, id);
+                }
             }
         }
         self.unflushed = true;
