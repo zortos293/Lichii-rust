@@ -3,7 +3,7 @@ use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use ash::{ext, khr, nv, vk};
+use ash::{amd, ext, khr, nv, vk};
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 use gpu_allocator::{AllocationSizes, AllocatorDebugSettings};
 use lichii_common::settings::GraphicsSettings;
@@ -543,12 +543,21 @@ impl Device {
         if device_fault {
             names.push(ext::device_fault::NAME.as_ptr());
         }
+        let buffer_marker = fault_report && has(amd::buffer_marker::NAME);
+        if buffer_marker {
+            names.push(amd::buffer_marker::NAME.as_ptr());
+        }
+        let fault_support = crate::debug::fault::FaultSupport {
+            fault: device_fault.then_some(fault_features.device_fault_vendor_binary != vk::FALSE),
+            checkpoints: fault_report && checkpoints,
+            buffer_marker,
+        };
         if fault_report {
             tracing::info!(
                 device_fault,
-                vendor_binary =
-                    device_fault && fault_features.device_fault_vendor_binary != vk::FALSE,
+                vendor_binary = fault_support.fault == Some(true),
                 checkpoints,
+                buffer_marker,
                 "GPU fault report on"
             );
         }
@@ -674,15 +683,18 @@ impl Device {
         let labels = instance
             .labels
             .then(|| ext::debug_utils::Device::new(raw_instance, &raw));
-        let faults = (device_fault || (fault_report && checkpoints)).then(|| {
-            crate::debug::fault::Reporter::register(
-                raw_instance,
-                &raw,
-                queue,
-                device_fault.then_some(fault_features.device_fault_vendor_binary != vk::FALSE),
-                fault_report && checkpoints,
-            )
-        });
+        let faults = (fault_support.fault.is_some()
+            || fault_support.checkpoints
+            || fault_support.buffer_marker)
+            .then(|| {
+                crate::debug::fault::Reporter::register(
+                    raw_instance,
+                    &raw,
+                    &memory_properties,
+                    queue,
+                    fault_support,
+                )
+            });
         Ok(Arc::new(Self {
             instance,
             physical,
@@ -796,13 +808,13 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
-        if let Some(faults) = &self.faults {
-            faults.unregister();
-        }
         // SAFETY: every object created from the device holds an Arc to it and is gone; the
         // allocator frees its blocks before the device is destroyed.
         unsafe {
             let _ = self.raw.device_wait_idle();
+            if let Some(faults) = &self.faults {
+                faults.destroy(&self.raw);
+            }
             ManuallyDrop::drop(&mut self.allocator);
             self.raw.destroy_device(None);
         }
