@@ -20,6 +20,8 @@ use crate::profile::{ShaderQueries, shader_profile};
 /// half-used blocks and evictions never lowered the driver's usage (NX2_NOTES row 114).
 const DEVICE_BLOCK_SIZE: u64 = 64 << 20;
 const HOST_BLOCK_SIZE: u64 = 32 << 20;
+/// Vulkan 1.0's formats, `UNDEFINED` to `ASTC_12X12_SRGB_BLOCK`, numbered from 0 without gaps.
+const CORE_FORMATS: i32 = vk::Format::ASTC_12X12_SRGB_BLOCK.as_raw() + 1;
 
 /// Device extensions the renderer uses when present.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -186,6 +188,8 @@ pub struct Device {
     /// Bytes handed out by the allocator; it reports only block capacity cheaply.
     pub(crate) allocated: AtomicU64,
     pub(crate) memory_properties: vk::PhysicalDeviceMemoryProperties,
+    /// Properties of the core formats, indexed by format value: draws ask for them per target.
+    format_properties: Box<[vk::FormatProperties]>,
     /// What the shader translator may emit for this device.
     pub shader_profile: Profile,
     pub shader_host: HostTranslateInfo,
@@ -719,6 +723,17 @@ impl Device {
                     fault_support,
                 )
             });
+        let format_properties = (0..CORE_FORMATS)
+            .map(|format| {
+                // SAFETY: valid physical device.
+                unsafe {
+                    raw_instance.get_physical_device_format_properties(
+                        physical,
+                        vk::Format::from_raw(format),
+                    )
+                }
+            })
+            .collect();
         Ok(Arc::new(Self {
             instance,
             physical,
@@ -730,6 +745,7 @@ impl Device {
             allocator: ManuallyDrop::new(Mutex::new(allocator)),
             allocated: AtomicU64::new(0),
             memory_properties,
+            format_properties,
             shader_profile,
             shader_host,
             labels,
@@ -817,24 +833,28 @@ impl Device {
 
     /// Format support for `format` in texel buffers.
     pub fn buffer_features(&self, format: vk::Format) -> vk::FormatFeatureFlags {
-        // SAFETY: valid physical device.
-        unsafe {
-            self.instance
-                .raw
-                .get_physical_device_format_properties(self.physical, format)
-        }
-        .buffer_features
+        self.format_properties(format).buffer_features
     }
 
     /// Format support for `format` with optimal tiling.
     pub fn format_features(&self, format: vk::Format) -> vk::FormatFeatureFlags {
+        self.format_properties(format).optimal_tiling_features
+    }
+
+    /// The driver's properties of `format`, read at device creation for the core formats.
+    fn format_properties(&self, format: vk::Format) -> vk::FormatProperties {
+        if let Some(&properties) = usize::try_from(format.as_raw())
+            .ok()
+            .and_then(|index| self.format_properties.get(index))
+        {
+            return properties;
+        }
         // SAFETY: valid physical device.
         unsafe {
             self.instance
                 .raw
                 .get_physical_device_format_properties(self.physical, format)
         }
-        .optimal_tiling_features
     }
 }
 
@@ -850,5 +870,83 @@ impl Drop for Device {
             ManuallyDrop::drop(&mut self.allocator);
             self.raw.destroy_device(None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    use super::*;
+    use crate::instance::SurfaceSupport;
+
+    fn device(validation: bool) -> Option<Arc<Device>> {
+        let instance = Instance::new(validation, SurfaceSupport::None)
+            .inspect_err(|error| eprintln!("skipping: {error}"))
+            .ok()?;
+        Device::new(Arc::new(instance), &GraphicsSettings::default(), None)
+            .inspect_err(|error| eprintln!("skipping: {error}"))
+            .ok()
+    }
+
+    fn driver_properties(device: &Device, format: vk::Format) -> vk::FormatProperties {
+        // SAFETY: valid physical device.
+        unsafe {
+            device
+                .instance
+                .raw
+                .get_physical_device_format_properties(device.physical, format)
+        }
+    }
+
+    #[test]
+    fn format_features_are_the_drivers_for_core_and_extension_formats() {
+        let Some(device) = device(true) else {
+            return;
+        };
+        let formats = (0..CORE_FORMATS + 4)
+            .chain([1_000_340_000, 1_000_340_001, 1_000_054_000])
+            .map(vk::Format::from_raw);
+        for format in formats {
+            let driver = driver_properties(&device, format);
+            assert_eq!(
+                device.format_features(format),
+                driver.optimal_tiling_features,
+                "{format:?}"
+            );
+            assert_eq!(
+                device.buffer_features(format),
+                driver.buffer_features,
+                "{format:?}"
+            );
+        }
+    }
+
+    /// The per-target blend check of every draw, asked of the driver and of the table:
+    /// `cargo test --release -p lichii-vulkan --lib format_features_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn format_features_cost_per_query() {
+        let Some(device) = device(false) else {
+            return;
+        };
+        const CALLS: u32 = 1_000_000;
+        let formats = [
+            vk::Format::R8G8B8A8_UNORM,
+            vk::Format::B10G11R11_UFLOAT_PACK32,
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::Format::D32_SFLOAT,
+        ];
+        let time = |query: &dyn Fn(vk::Format) -> vk::FormatFeatureFlags| {
+            let start = Instant::now();
+            for i in 0..CALLS {
+                black_box(query(black_box(formats[i as usize % formats.len()])));
+            }
+            start.elapsed() / CALLS
+        };
+        let driver = time(&|f| driver_properties(&device, f).optimal_tiling_features);
+        let cached = time(&|f| device.format_features(f));
+        eprintln!("format features per query: driver {driver:?}, cached {cached:?}");
     }
 }
