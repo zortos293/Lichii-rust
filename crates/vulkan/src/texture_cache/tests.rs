@@ -5480,6 +5480,52 @@ fn sampled_mip_chains_that_run_out_of_memory_keep_the_levels_that_fit() {
     f.assert_no_validation_errors();
 }
 
+#[test]
+fn padded_level_targets_match_only_depth_free_levels_below_the_base() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        let mut chain = ImageInfo {
+            levels: 2,
+            ..rt_info(16, 16, 0, gob)
+        };
+        chain.layer_stride = chain.surface().layer_stride();
+        let level_1 = chain.surface().level_offset(1);
+        let padded = rt_info(16, 8, 0, gob);
+        assert_eq!(chain.find_subresource(&padded, level_1), None, "{gob:?}");
+        assert_eq!(
+            chain.find_padded_level(&padded, level_1),
+            Some((1, 0)),
+            "{gob:?}"
+        );
+        assert_eq!(
+            rt_info(8, 8, 0, gob).find_padded_level(&padded, 0),
+            None,
+            "{gob:?}: a wider target over a base level keeps its own texels"
+        );
+        let GuestLayout::BlockLinear {
+            block_height_log2,
+            tile_width_spacing,
+            ..
+        } = padded.layout
+        else {
+            unreachable!()
+        };
+        let deep = ImageInfo {
+            layout: GuestLayout::BlockLinear {
+                block_height_log2,
+                block_depth_log2: 1,
+                tile_width_spacing,
+                gob,
+            },
+            ..padded
+        };
+        assert_eq!(
+            chain.find_padded_level(&deep, level_1),
+            None,
+            "{gob:?}: the target's block depth moves its GOBs"
+        );
+    }
+}
+
 /// Mario Kart World's light-probe cube arrays at their full 7 levels: levels 4 to 6 (8x8,
 /// 4x4, 2x2) are rendered as targets one GOB wide (16x8, 16x4, 16x2 at block height 1),
 /// which cover exactly the GOB each of those levels is stored in.

@@ -470,9 +470,11 @@ impl ImageInfo {
     }
 
     /// Where `other`, a single-level single-layer target starting `offset` bytes into this
-    /// image, covers one level as a wider or taller GOB-padded rectangle: the level and layer,
-    /// when the target spans the level's GOBs exactly and its own GOBs lie where the level's
-    /// do. Mip levels narrower than a GOB are rendered this way, as targets one GOB wide.
+    /// image, covers one mip level below the base as a wider or taller GOB-padded rectangle: the
+    /// level and layer, when the target spans the level's GOBs exactly and its own GOBs lie
+    /// where the level's do. Mip levels narrower than a GOB are rendered this way, as targets
+    /// one GOB wide. The base level never matches, since a wider target over it can be an image
+    /// of its own whose extra texels are read back.
     pub fn find_padded_level(&self, other: &Self, offset: u64) -> Option<(u32, u32)> {
         let (GuestLayout::BlockLinear { .. }, GuestLayout::BlockLinear { .. }) =
             (self.layout, other.layout)
@@ -494,13 +496,14 @@ impl ImageInfo {
         }
         let in_layer = offset - u64::from(layer) * self.layer_stride;
         let surface = self.surface();
-        let level = (0..self.levels).find(|&l| surface.level_offset(l) == in_layer)?;
+        let level = (1..self.levels).find(|&l| surface.level_offset(l) == in_layer)?;
         let (width, height, _) = self.level_extent(level);
         let level_tiling = surface.level_tiling(level);
         let own = other.surface().level_tiling(0);
         let same_gobs = own.layout == level_tiling.layout
             && own.depth == 1
             && level_tiling.depth == 1
+            && own.block_depth_log2 == 0
             && own.row_gobs == level_tiling.row_gobs
             && own.size_bytes() == level_tiling.size_bytes()
             && (own.block_height_log2 == level_tiling.block_height_log2 || own.row_gobs == 1);
