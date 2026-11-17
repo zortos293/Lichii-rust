@@ -792,6 +792,95 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
             t.set(Loc::V(rd), r);
             return true;
         }
+        let right = 2 * esize - immhb;
+        let shiftable = |op: Shift| size != 0 && (size < 3 || (q && op != Shift::Sshr));
+        if opcode == 0b00010 {
+            let op = if u { Shift::Ushr } else { Shift::Sshr };
+            if !shiftable(op) {
+                return false;
+            }
+            let (acc, a) = (vec(t, rd), vec(t, rn));
+            let arrangement = Arrangement { size, q };
+            let shifted = emit(t, VecOp::Shift(op, arrangement, right, a));
+            let r = emit(t, VecOp::Binary(Binary::Add, arrangement, acc, shifted));
+            t.set(Loc::V(rd), r);
+            return true;
+        }
+        if u && matches!(opcode, 0b01000 | 0b01010) {
+            let (op, amount) = if opcode == 0b01000 {
+                (Shift::Ushr, right)
+            } else {
+                (Shift::Shl, immhb - esize)
+            };
+            if !shiftable(op) {
+                return false;
+            }
+            let ones = u64::MAX >> (64 - esize);
+            let mask = match op {
+                Shift::Shl => ones << amount & ones,
+                _ => ones.checked_shr(amount as u32).unwrap_or(0),
+            };
+            let lanes = match size {
+                1 => mask * 0x0001_0001_0001_0001,
+                2 => mask * 0x0000_0001_0000_0001,
+                _ => mask,
+            };
+            let arrangement = Arrangement { size, q };
+            let (old, a) = (vec(t, rd), vec(t, rn));
+            let shifted = emit(t, VecOp::Shift(op, arrangement, amount, a));
+            let mask = emit(t, VecOp::Imm(lanes, q));
+            let kept = emit(t, VecOp::Binary(Binary::Bic, arrangement, old, mask));
+            let r = emit(t, VecOp::Binary(Binary::Orr, arrangement, kept, shifted));
+            t.set(Loc::V(rd), r);
+            return true;
+        }
+        if opcode & 0b11100 == 0b10000 && size < 3 {
+            let (round, saturate) = (opcode & 1 != 0, opcode & 0b10 != 0 || u);
+            let sat_narrow = !u || size == 0 || (size == 1 && t.sse41);
+            if (opcode & 0b10 != 0 && u) || (saturate && (size == 2 || !sat_narrow)) {
+                return false;
+            }
+            let wide = Arrangement {
+                size: size + 1,
+                q: true,
+            };
+            let a = vec(t, rn);
+            let shifted = if round {
+                emit(
+                    t,
+                    VecOp::RoundShift {
+                        signed: saturate,
+                        arrangement: wide,
+                        shift: right,
+                        acc: None,
+                        a,
+                    },
+                )
+            } else {
+                let op = if saturate { Shift::Sshr } else { Shift::Ushr };
+                emit(t, VecOp::Shift(op, wide, right, a))
+            };
+            let low = q.then(|| vec(t, rd));
+            let r = if saturate {
+                t.op(Op::Simd(SimdOp::SatNarrow {
+                    size,
+                    n: shifted,
+                    low,
+                    word,
+                }))
+            } else {
+                emit(
+                    t,
+                    VecOp::Narrow {
+                        size,
+                        a: shifted,
+                        low,
+                    },
+                )
+            };
+            t.set(Loc::V(rd), r);
+            return true;
+        }
         let (op, amount) = match (opcode, u) {
             (0b00000, false) => (Shift::Sshr, 2 * esize - immhb),
             (0b00000, true) => (Shift::Ushr, 2 * esize - immhb),
