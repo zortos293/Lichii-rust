@@ -145,12 +145,12 @@ fn shared_exchange_words(ctx: &mut EmitContext<'_>, offset: Word, value: Word) -
     let u32x2 = ctx.u32[2];
     let low = shared_pointer(ctx, offset, 0)?;
     let high = shared_pointer(ctx, offset, 1)?;
-    let old_low = ctx.b.load(u32_t, None, low, None, [])?;
-    let old_high = ctx.b.load(u32_t, None, high, None, [])?;
+    let old_low = ctx.load_shared(u32_t, low)?;
+    let old_high = ctx.load_shared(u32_t, high)?;
     let new_low = ctx.b.composite_extract(u32_t, None, value, [0])?;
     let new_high = ctx.b.composite_extract(u32_t, None, value, [1])?;
-    ctx.b.store(low, new_low, None, [])?;
-    ctx.b.store(high, new_high, None, [])?;
+    ctx.store_shared(low, new_low)?;
+    ctx.store_shared(high, new_high)?;
     Ok(ctx
         .b
         .composite_construct(u32x2, None, [old_low, old_high])?)
@@ -374,8 +374,8 @@ pub(super) fn shared_atomic_compare_exchange64(
     tracing::warn!("shared int64 atomics not supported, falling back to non-atomic");
     let low = shared_pointer(ctx, offset, 0)?;
     let high = shared_pointer(ctx, offset, 1)?;
-    let old_low = ctx.b.load(u32_t, None, low, None, [])?;
-    let old_high = ctx.b.load(u32_t, None, high, None, [])?;
+    let old_low = ctx.load_shared(u32_t, low)?;
+    let old_high = ctx.load_shared(u32_t, high)?;
     let old_words = ctx
         .b
         .composite_construct(u32x2, None, [old_low, old_high])?;
@@ -385,8 +385,8 @@ pub(super) fn shared_atomic_compare_exchange64(
     let new_words = ctx.b.bitcast(u32x2, None, new)?;
     let new_low = ctx.b.composite_extract(u32_t, None, new_words, [0])?;
     let new_high = ctx.b.composite_extract(u32_t, None, new_words, [1])?;
-    ctx.b.store(low, new_low, None, [])?;
-    ctx.b.store(high, new_high, None, [])?;
+    ctx.store_shared(low, new_low)?;
+    ctx.store_shared(high, new_high)?;
     Ok(old)
 }
 
