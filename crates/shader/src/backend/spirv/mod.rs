@@ -14,6 +14,9 @@ pub(crate) mod tests;
 
 use rspirv::dr;
 
+pub(crate) use emit::tensor::uses_cooperative_hmma;
+pub use emit::tensor::{COOPERATIVE_HMMA_TEST_LANE_WORDS, cooperative_hmma_test};
+
 pub use mesh_emulation::{
     MESH_EMULATION_ARGS_BASE, MESH_EMULATION_ARGS_REQUESTED, MESH_EMULATION_ARGS_TASKS,
     MESH_EMULATION_ARGS_WORDS, MESH_EMULATION_DRAW_ARGS_OFFSET, MeshEmulationDistributionConstants,

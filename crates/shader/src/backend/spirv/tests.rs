@@ -24,6 +24,7 @@ use crate::{Profile, RuntimeInfo, ShaderInfo, ShaderStage};
 mod arith;
 mod image;
 mod mesh;
+mod tensor;
 
 const PT: u64 = 7 << 16;
 

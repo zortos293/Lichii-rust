@@ -416,9 +416,12 @@ impl Context {
             }
             let guest_warp = self.device.shader_profile.runs_guest_warp(program.stage)
                 && program.info.uses_warp_size();
-            modules
-                .stages
-                .push((stage_flags(program.stage), module, guest_warp));
+            modules.stages.push((
+                stage_flags(program.stage),
+                module,
+                guest_warp,
+                program.info.uses_cooperative_matrix,
+            ));
         }
         Ok(modules)
     }
@@ -758,8 +761,9 @@ fn cache_hit(feedback: &vk::PipelineCreationFeedback) -> bool {
 /// Shader modules of one build, destroyed once the pipeline is created.
 struct Modules<'a> {
     device: &'a Device,
-    /// Each stage, its module, and whether it must run at the guest's 32-lane warp.
-    stages: Vec<(vk::ShaderStageFlags, vk::ShaderModule, bool)>,
+    /// Each stage, its module, whether it must run at the guest's 32-lane warp, and whether
+    /// its subgroups must be full (cooperative matrices).
+    stages: Vec<(vk::ShaderStageFlags, vk::ShaderModule, bool, bool)>,
 }
 
 impl Modules<'_> {
@@ -771,8 +775,14 @@ impl Modules<'_> {
         self.stages
             .iter()
             .zip(warp)
-            .map(|(&(stage, module, guest_warp), warp)| {
+            .map(|(&(stage, module, guest_warp, full_subgroups), warp)| {
+                let flags = if full_subgroups {
+                    vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS
+                } else {
+                    vk::PipelineShaderStageCreateFlags::empty()
+                };
                 let info = vk::PipelineShaderStageCreateInfo::default()
+                    .flags(flags)
                     .stage(stage)
                     .module(module)
                     .name(ENTRY);
@@ -793,7 +803,7 @@ fn guest_warp_size() -> vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo<'s
 
 impl Drop for Modules<'_> {
     fn drop(&mut self) {
-        for &(_, module, _) in &self.stages {
+        for &(_, module, ..) in &self.stages {
             // SAFETY: pipeline creation finished; modules are not needed afterwards.
             unsafe { self.device.raw.destroy_shader_module(module, None) };
         }

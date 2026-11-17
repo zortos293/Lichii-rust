@@ -9,13 +9,15 @@
 use rspirv::dr::{self, Builder, Operand};
 use rspirv::spirv::{
     self, BuiltIn, Capability, Decoration, Dim, FunctionControl, GlslStd450Op,
-    ImageFormat as SpvFormat, LoopControl, Scope, SelectionControl, StorageClass, Word,
+    ImageFormat as SpvFormat, LoopControl, MemoryAccess, MemorySemantics, Scope, SelectionControl,
+    StorageClass, Word,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use super::emit::context_get_set::{get_cbuf_u32_at, get_cbuf_u32x2_at};
 use super::emit::mesh::{self, MeshState};
+use super::emit::tensor::uses_cooperative_hmma;
 use super::{
     EmitError, EmitResult, NUM_IMAGE_SCALING_WORDS, NUM_TEXTURE_SCALING_WORDS,
     RENDER_AREA_LAYOUT_OFFSET, RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, RESCALING_LAYOUT_IMAGES_OFFSET,
@@ -336,6 +338,9 @@ pub(crate) struct EmitContext<'a> {
     pub local_memory: Word,
 
     pub uses_explicit_workgroup_layout: bool,
+    /// The module uses the Vulkan memory model, which cooperative matrices need: shared memory
+    /// accesses are non-private and barriers make memory available and visible.
+    pub vulkan_memory_model: bool,
     pub shared_memory_u8: Word,
     pub shared_memory_u16: Word,
     pub shared_memory_u32: Word,
@@ -514,7 +519,15 @@ impl<'a> EmitContext<'a> {
             ((profile.supported_spirv >> 16) & 0xff) as u8,
             ((profile.supported_spirv >> 8) & 0xff) as u8,
         );
-        b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+        let vulkan_memory_model = uses_cooperative_hmma(profile, translated);
+        b.memory_model(
+            spirv::AddressingModel::Logical,
+            if vulkan_memory_model {
+                spirv::MemoryModel::Vulkan
+            } else {
+                spirv::MemoryModel::GLSL450
+            },
+        );
         let glsl = b.ext_inst_import("GLSL.std.450");
         let program = &translated.ir;
         let info = &translated.info;
@@ -628,6 +641,7 @@ impl<'a> EmitContext<'a> {
             render_area_member_index: 0,
             local_memory: 0,
             uses_explicit_workgroup_layout: false,
+            vulkan_memory_model,
             shared_memory_u8: 0,
             shared_memory_u16: 0,
             shared_memory_u32: 0,
@@ -691,6 +705,9 @@ impl<'a> EmitContext<'a> {
         };
         let unified = profile.unified_descriptor_binding;
         ctx.add_capability(Capability::Shader);
+        if vulkan_memory_model {
+            ctx.enable_cooperative_matrices();
+        }
         ctx.define_common_types();
         ctx.define_common_constants();
         ctx.define_inputs()?;
@@ -731,6 +748,46 @@ impl<'a> EmitContext<'a> {
         if self.extensions.insert(extension) {
             self.b.extension(extension);
         }
+    }
+
+    /// Memory access operands of a shared memory load (`MAKE_POINTER_VISIBLE`) or store
+    /// (`MAKE_POINTER_AVAILABLE`): none in the GLSL450 memory model; in the Vulkan memory model
+    /// the access is non-private, so barriers order it between invocations.
+    fn shared_access(
+        &mut self,
+        availability: MemoryAccess,
+    ) -> (Option<MemoryAccess>, Option<Operand>) {
+        if !self.vulkan_memory_model {
+            return (None, None);
+        }
+        let workgroup = self.const_u32(Scope::Workgroup as u32);
+        (
+            Some(availability | MemoryAccess::NON_PRIVATE_POINTER),
+            Some(Operand::IdScope(workgroup)),
+        )
+    }
+
+    /// Loads `ty` from a shared memory `pointer`.
+    pub fn load_shared(&mut self, ty: Word, pointer: Word) -> EmitResult<Word> {
+        let (access, scope) = self.shared_access(MemoryAccess::MAKE_POINTER_VISIBLE);
+        Ok(self.b.load(ty, None, pointer, access, scope)?)
+    }
+
+    /// Stores `value` to a shared memory `pointer`.
+    pub fn store_shared(&mut self, pointer: Word, value: Word) -> EmitResult<()> {
+        let (access, scope) = self.shared_access(MemoryAccess::MAKE_POINTER_AVAILABLE);
+        Ok(self.b.store(pointer, value, access, scope)?)
+    }
+
+    /// Barrier semantics: in the Vulkan memory model they also make memory available and
+    /// visible, as the GLSL450 model's barriers do implicitly.
+    pub fn barrier_semantics(&mut self, semantics: MemorySemantics) -> Word {
+        let semantics = if self.vulkan_memory_model {
+            semantics | MemorySemantics::MAKE_AVAILABLE | MemorySemantics::MAKE_VISIBLE
+        } else {
+            semantics
+        };
+        self.const_u32(semantics.bits())
     }
 
     /// Whether this stage may use subgroup operations; the mesh emulation runs task and mesh
@@ -1857,7 +1914,7 @@ impl<'a> EmitContext<'a> {
         let word_pointer =
             self.b
                 .access_chain(self.shared_u32, None, self.shared_memory_u32, [word_offset])?;
-        let initial = self.b.load(u32_t, None, word_pointer, None, [])?;
+        let initial = self.load_shared(u32_t, word_pointer)?;
         self.b.store(expected_var, initial, None, [])?;
         self.b.branch(loop_header)?;
         self.begin_label(loop_header)?;
@@ -1993,7 +2050,11 @@ impl<'a> EmitContext<'a> {
         } else {
             self.b.access_chain(element_pointer, None, base, [index])?
         };
-        let initial = self.b.load(u32_t, None, word_pointer, None, [])?;
+        let initial = if is_shared {
+            self.load_shared(u32_t, word_pointer)?
+        } else {
+            self.b.load(u32_t, None, word_pointer, None, [])?
+        };
         self.b.store(expected_var, initial, None, [])?;
         self.b.branch(loop_header)?;
         self.begin_label(loop_header)?;

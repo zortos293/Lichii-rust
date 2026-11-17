@@ -4,14 +4,321 @@
 //! subgroup shuffles and accumulate in f32, rounding to half after every K=8 group as the
 //! hardware does. TENSOR_MUL_ADD_F32 is the .F32 form: C and D are four f32 words each, and
 //! nothing rounds to half.
+//!
+//! With [`Profile::support_cooperative_hmma`] a compute program's HMMA.16816 instead runs on a
+//! 16x8x16 cooperative matrix, which needs the Vulkan memory model for the whole module.
 
+use rspirv::binary::Assemble;
+use rspirv::dr::{self, Builder, Operand};
 use rspirv::spirv::{
-    Capability, Decoration, FunctionControl, GlslStd450Op, LoopControl, Scope, StorageClass, Word,
+    AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode, ExecutionModel,
+    FunctionControl, GlslStd450Op, LoopControl, MemoryModel, Scope, StorageClass, Word,
 };
 
 use crate::backend::spirv::context::EmitContext;
 use crate::backend::spirv::{EmitError, EmitResult};
-use crate::ir::InstId;
+use crate::ir::{InstId, Opcode};
+use crate::translate::TranslatedProgram;
+use crate::{Profile, ShaderStage};
+
+const WARP: u32 = 32;
+const MATRIX_A: u32 = 0;
+const MATRIX_B: u32 = 1;
+const MATRIX_ACCUMULATOR: u32 = 2;
+
+/// Words of one lane in the buffer of [`cooperative_hmma_test`]: A in 0..4, B in 4..6, C in
+/// 6..10 (6..8 with f16 accumulators) and D, which the test writes, in 10..14 (10..12).
+pub const COOPERATIVE_HMMA_TEST_LANE_WORDS: u32 = 16;
+
+/// Whether `program` runs its HMMA.16816 on cooperative matrices: a compute program whose
+/// workgroup rows fill whole warps, since the pipeline runs with full subgroups, and that needs
+/// no coherent memory, which the Vulkan memory model cannot express.
+pub(crate) fn uses_cooperative_hmma(profile: &Profile, program: &TranslatedProgram) -> bool {
+    if !(profile.support_cooperative_hmma || profile.support_cooperative_hmma_f32)
+        || program.stage != ShaderStage::Compute
+        || program.workgroup_size[0] == 0
+        || !program.workgroup_size[0].is_multiple_of(WARP)
+        || program.info.requires_coherent_global_memory
+        || program.info.requires_coherent_image_memory
+    {
+        return false;
+    }
+    let ir = &program.ir;
+    ir.post_order
+        .iter()
+        .flat_map(|&block| ir.insts_of(block))
+        .any(|id| cooperative(profile, ir.op(id), ir.inst(id).flags))
+}
+
+fn cooperative(profile: &Profile, op: Opcode, depth: u32) -> bool {
+    depth == 16
+        && match op {
+            Opcode::TensorMulAdd => profile.support_cooperative_hmma,
+            Opcode::TensorMulAddF32 => profile.support_cooperative_hmma_f32,
+            _ => false,
+        }
+}
+
+/// The types of one cooperative HMMA.16816: A is 16x16, B and the accumulator 16x8.
+struct CooperativeTypes {
+    u32: Word,
+    f16: Word,
+    f16x2: Word,
+    f32: Word,
+    a: Word,
+    b: Word,
+    c: Word,
+    result: Word,
+    f32_accumulators: bool,
+}
+
+/// Defines the matrix types; `constant` returns a u32 constant.
+fn cooperative_types(
+    b: &mut Builder,
+    u32_t: Word,
+    f32_t: Word,
+    f32_accumulators: bool,
+    mut constant: impl FnMut(&mut Builder, u32) -> Word,
+) -> CooperativeTypes {
+    let f16 = b.type_float(16, None);
+    let f16x2 = b.type_vector(f16, 2);
+    let scope = constant(b, Scope::Subgroup as u32);
+    let rows = constant(b, 16);
+    let mut matrix = |b: &mut Builder, component, columns, usage| {
+        let columns = constant(b, columns);
+        let usage = constant(b, usage);
+        b.type_cooperative_matrix_khr(component, scope, rows, columns, usage)
+    };
+    let a = matrix(b, f16, 16, MATRIX_A);
+    let bm = matrix(b, f16, 8, MATRIX_B);
+    let accumulator = if f32_accumulators { f32_t } else { f16 };
+    let c = matrix(b, accumulator, 8, MATRIX_ACCUMULATOR);
+    let result = b.type_vector(u32_t, if f32_accumulators { 4 } else { 2 });
+    CooperativeTypes {
+        u32: u32_t,
+        f16,
+        f16x2,
+        f32: f32_t,
+        a,
+        b: bm,
+        c,
+        result,
+        f32_accumulators,
+    }
+}
+
+/// Inserts the two halves of word `word` of `vector` as elements `2 * slot` and `2 * slot + 1`.
+fn insert_halves(
+    b: &mut Builder,
+    t: &CooperativeTypes,
+    matrix_type: Word,
+    mut matrix: Word,
+    vector: Word,
+    word: u32,
+    slot: u32,
+) -> Result<Word, dr::Error> {
+    let packed = b.composite_extract(t.u32, None, vector, [word])?;
+    let halves = b.bitcast(t.f16x2, None, packed)?;
+    for half in 0..2 {
+        let element = b.composite_extract(t.f16, None, halves, [half])?;
+        matrix = b.composite_insert(matrix_type, None, element, matrix, [slot * 2 + half])?;
+    }
+    Ok(matrix)
+}
+
+/// HMMA.16816 on cooperative matrices. Each lane already holds its share of the matrices, so
+/// nothing moves between lanes: the lane's words become the matrices' local elements. Vulkan
+/// leaves their order to the driver; NVIDIA's is the guest's except that A's middle words swap,
+/// which [`cooperative_hmma_test`] checks on the device.
+fn cooperative_mul_add(
+    b: &mut Builder,
+    t: &CooperativeTypes,
+    a: Word,
+    bm: Word,
+    c: Word,
+) -> Result<Word, dr::Error> {
+    let mut matrix_a = b.undef(t.a, None);
+    for (slot, word) in [0, 2, 1, 3].into_iter().enumerate() {
+        matrix_a = insert_halves(b, t, t.a, matrix_a, a, word, slot as u32)?;
+    }
+    let mut matrix_b = b.undef(t.b, None);
+    for slot in 0..2 {
+        matrix_b = insert_halves(b, t, t.b, matrix_b, bm, slot, slot)?;
+    }
+    let mut matrix_c = b.undef(t.c, None);
+    if t.f32_accumulators {
+        for element in 0..4 {
+            let word = b.composite_extract(t.u32, None, c, [element])?;
+            let value = b.bitcast(t.f32, None, word)?;
+            matrix_c = b.composite_insert(t.c, None, value, matrix_c, [element])?;
+        }
+    } else {
+        for slot in 0..2 {
+            matrix_c = insert_halves(b, t, t.c, matrix_c, c, slot, slot)?;
+        }
+    }
+    let d = b.cooperative_matrix_mul_add_khr(t.c, None, matrix_a, matrix_b, matrix_c, None)?;
+    let mut words = [0; 4];
+    if t.f32_accumulators {
+        for (element, word) in words.iter_mut().enumerate() {
+            let value = b.composite_extract(t.f32, None, d, [element as u32])?;
+            *word = b.bitcast(t.u32, None, value)?;
+        }
+        return b.composite_construct(t.result, None, words);
+    }
+    for (index, word) in words.iter_mut().take(2).enumerate() {
+        let index = index as u32;
+        let low = b.composite_extract(t.f16, None, d, [index * 2])?;
+        let high = b.composite_extract(t.f16, None, d, [index * 2 + 1])?;
+        let halves = b.composite_construct(t.f16x2, None, [low, high])?;
+        *word = b.bitcast(t.u32, None, halves)?;
+    }
+    b.composite_construct(t.result, None, words[..2].iter().copied())
+}
+
+/// A compute shader of one 32-lane workgroup for the renderer's self-test: each lane reads its
+/// guest registers for HMMA.16816 from word `lane * COOPERATIVE_HMMA_TEST_LANE_WORDS` of the
+/// storage buffer at set 0, binding 0, multiplies on cooperative matrices exactly as translated
+/// programs do, and writes D after them. The pipeline needs full subgroups.
+pub fn cooperative_hmma_test(spirv_version: u32, f32_accumulators: bool) -> Vec<u32> {
+    let mut b = Builder::new();
+    b.set_version(
+        ((spirv_version >> 16) & 0xff) as u8,
+        ((spirv_version >> 8) & 0xff) as u8,
+    );
+    for capability in [
+        Capability::Shader,
+        Capability::GroupNonUniform,
+        Capability::CooperativeMatrixKHR,
+        Capability::Float16,
+        Capability::VulkanMemoryModel,
+        Capability::VulkanMemoryModelDeviceScope,
+    ] {
+        b.capability(capability);
+    }
+    b.extension("SPV_KHR_cooperative_matrix");
+    if spirv_version < 0x0001_0500 {
+        b.extension("SPV_KHR_vulkan_memory_model");
+    }
+    b.memory_model(AddressingModel::Logical, MemoryModel::Vulkan);
+    let void = b.type_void();
+    let u32_t = b.type_int(32, 0);
+    let f32_t = b.type_float(32, None);
+    let u32x2 = b.type_vector(u32_t, 2);
+    let u32x4 = b.type_vector(u32_t, 4);
+    let t = cooperative_types(&mut b, u32_t, f32_t, f32_accumulators, |b, value| {
+        b.constant_bit32(u32_t, value)
+    });
+    let words = b.type_runtime_array(u32_t);
+    b.decorate(words, Decoration::ArrayStride, [Operand::LiteralBit32(4)]);
+    let block = b.type_struct([words]);
+    b.decorate(block, Decoration::Block, []);
+    b.member_decorate(block, 0, Decoration::Offset, [Operand::LiteralBit32(0)]);
+    let block_pointer = b.type_pointer(None, StorageClass::StorageBuffer, block);
+    let buffer = b.variable(block_pointer, None, StorageClass::StorageBuffer, None);
+    b.decorate(
+        buffer,
+        Decoration::DescriptorSet,
+        [Operand::LiteralBit32(0)],
+    );
+    b.decorate(buffer, Decoration::Binding, [Operand::LiteralBit32(0)]);
+    let input_u32 = b.type_pointer(None, StorageClass::Input, u32_t);
+    let lane_variable = b.variable(input_u32, None, StorageClass::Input, None);
+    b.decorate(
+        lane_variable,
+        Decoration::BuiltIn,
+        [Operand::BuiltIn(BuiltIn::SubgroupLocalInvocationId)],
+    );
+    let word_pointer = b.type_pointer(None, StorageClass::StorageBuffer, u32_t);
+    let zero = b.constant_bit32(u32_t, 0);
+    let lane_words = b.constant_bit32(u32_t, COOPERATIVE_HMMA_TEST_LANE_WORDS);
+    let indices: Vec<Word> = (0..COOPERATIVE_HMMA_TEST_LANE_WORDS)
+        .map(|index| b.constant_bit32(u32_t, index))
+        .collect();
+    let function_type = b.type_function(void, []);
+    let main = b
+        .begin_function(void, None, FunctionControl::NONE, function_type)
+        .expect("no function is open");
+    let mut body = || -> Result<(), dr::Error> {
+        b.begin_block(None)?;
+        let lane = b.load(u32_t, None, lane_variable, None, [])?;
+        let base = b.i_mul(u32_t, None, lane, lane_words)?;
+        let word_at = |b: &mut Builder, index: u32| -> Result<Word, dr::Error> {
+            let offset = b.i_add(u32_t, None, base, indices[index as usize])?;
+            b.access_chain(word_pointer, None, buffer, [zero, offset])
+        };
+        let load = |b: &mut Builder, first: u32, count: u32| -> Result<Word, dr::Error> {
+            let mut values = Vec::new();
+            for index in first..first + count {
+                let pointer = word_at(b, index)?;
+                values.push(b.load(u32_t, None, pointer, None, [])?);
+            }
+            b.composite_construct(if count == 4 { u32x4 } else { u32x2 }, None, values)
+        };
+        let accumulator_words = if f32_accumulators { 4 } else { 2 };
+        let a = load(&mut b, 0, 4)?;
+        let bm = load(&mut b, 4, 2)?;
+        let c = load(&mut b, 6, accumulator_words)?;
+        let d = cooperative_mul_add(&mut b, &t, a, bm, c)?;
+        for word in 0..accumulator_words {
+            let value = b.composite_extract(u32_t, None, d, [word])?;
+            let pointer = word_at(&mut b, 10 + word)?;
+            b.store(pointer, value, None, [])?;
+        }
+        b.ret()?;
+        b.end_function()
+    };
+    body().expect("the test shader is well formed");
+    let mut interfaces = vec![lane_variable];
+    if spirv_version >= 0x0001_0400 {
+        interfaces.push(buffer);
+    }
+    b.entry_point(ExecutionModel::GLCompute, main, "main", interfaces);
+    b.execution_mode(main, ExecutionMode::LocalSize, [WARP, 1, 1]);
+    b.module().assemble()
+}
+
+impl EmitContext<'_> {
+    /// Declares what cooperative matrices need, for a module [`uses_cooperative_hmma`] picked.
+    pub(crate) fn enable_cooperative_matrices(&mut self) {
+        self.add_capability(Capability::CooperativeMatrixKHR);
+        self.add_capability(Capability::Float16);
+        self.add_capability(Capability::VulkanMemoryModel);
+        self.add_capability(Capability::VulkanMemoryModelDeviceScope);
+        self.add_extension("SPV_KHR_cooperative_matrix");
+        if self.profile.supported_spirv < 0x0001_0500 {
+            self.add_extension("SPV_KHR_vulkan_memory_model");
+        }
+    }
+}
+
+fn cooperative_tensor_mul_add(
+    ctx: &mut EmitContext<'_>,
+    inst: InstId,
+    f32_accumulators: bool,
+) -> EmitResult<Word> {
+    let (u32_t, f32_t) = (ctx.u32[1], ctx.f32[1]);
+    let constants = [
+        Scope::Subgroup as u32,
+        16,
+        8,
+        MATRIX_A,
+        MATRIX_B,
+        MATRIX_ACCUMULATOR,
+    ]
+    .map(|value| (value, ctx.const_u32(value)));
+    let constant = |_: &mut Builder, value: u32| {
+        constants
+            .iter()
+            .find(|&&(known, _)| known == value)
+            .map_or(0, |&(_, id)| id)
+    };
+    let t = cooperative_types(&mut ctx.b, u32_t, f32_t, f32_accumulators, constant);
+    let a = ctx.def_arg(inst, 0)?;
+    let b = ctx.def_arg(inst, 1)?;
+    let c = ctx.def_arg(inst, 2)?;
+    Ok(cooperative_mul_add(&mut ctx.b, &t, a, b, c)?)
+}
 
 /// The function index of a multiply depth: 0 for K=8, 1 for K=16; 2 and 3 with F32
 /// accumulators.
@@ -33,6 +340,9 @@ pub(super) fn tensor_mul_add(
     inst: InstId,
     f32_accumulators: bool,
 ) -> EmitResult<Word> {
+    if ctx.vulkan_memory_model && cooperative(ctx.profile, ctx.program.op(inst), ctx.flags(inst)) {
+        return cooperative_tensor_mul_add(ctx, inst, f32_accumulators);
+    }
     let variant = variant(ctx.flags(inst), f32_accumulators)?;
     if !ctx.supports_subgroups() || ctx.profile.has_broken_spirv_subgroup_shuffle {
         return Err(EmitError::Unsupported(

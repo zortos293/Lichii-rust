@@ -383,6 +383,8 @@ pub struct ShaderInfo {
     pub uses_cbuf_indirect: bool,
     pub uses_render_area: bool,
     pub removed_conditional_barrier: bool,
+    /// HMMA runs on cooperative matrices, so the compute pipeline needs full subgroups.
+    pub uses_cooperative_matrix: bool,
     /// Some global accesses stayed global with several bound candidate buffers; the backend
     /// picks the buffer at run time from the bound pointers (Switch 2 native programs).
     pub native_global_bounds: bool,
@@ -433,6 +435,7 @@ impl ShaderInfo {
             || self.uses_quad_shuffles
             || self.uses_fswzadd
             || self.removed_conditional_barrier
+            || self.uses_cooperative_matrix
     }
 }
 
