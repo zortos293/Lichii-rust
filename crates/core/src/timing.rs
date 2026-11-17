@@ -54,48 +54,106 @@ fn scaled(tsc: u64, mul: u64) -> u64 {
     ((u128::from(tsc) * u128::from(mul)) >> SHIFT) as u64
 }
 
-/// The host TSC frequency, measured once per process; `None` unless the TSC is invariant, `rdtscp`
-/// can read it, and the OS itself keeps time with it, which is its guarantee that the TSC agrees
-/// across cores.
+/// The host TSC frequency, measured once per process; `None` unless the TSC is invariant,
+/// `rdtscp` can read it, the OS does not keep time with another clock, and the startup calibration
+/// passes. Without it, every counter read calls [`GuestClock::ticks`].
 fn trusted_tsc_hz() -> Option<u64> {
     static HZ: OnceLock<Option<u64>> = OnceLock::new();
-    *HZ.get_or_init(|| {
-        if tsc_is_usable() && os_clock_is_tsc() {
-            measure_tsc_hz()
-        } else {
-            None
-        }
-    })
+    *HZ.get_or_init(|| accepted_tsc_hz(tsc_is_usable() && os_clock_may_be_tsc(), calibrate_tsc))
 }
 
+/// What the startup calibration measured: the TSC rate against [`Instant`] over two back-to-back
+/// 10 ms windows, and whether a TSC read ever came out behind a read another thread made before it.
+struct Calibration {
+    rates: [u64; 2],
+    warped: bool,
+}
+
+/// The TSC frequency to count guest time with, or `None` to fall back to [`Instant`]. The TSC
+/// has to be invariant, keep one rate across both windows (within 0.1%) and never warp between
+/// threads; `calibrate` runs only for an invariant TSC.
+fn accepted_tsc_hz(
+    invariant: bool,
+    calibrate: impl FnOnce() -> Option<Calibration>,
+) -> Option<u64> {
+    if !invariant {
+        return None;
+    }
+    let Calibration {
+        rates: [first, second],
+        warped,
+    } = calibrate()?;
+    (!warped && first.abs_diff(second) <= first / 1000).then_some(first / 2 + second / 2)
+}
+
+/// Linux names the clocksource it keeps time with, and switches away from the TSC when its own
+/// checks find it unsynchronized across cores.
 #[cfg(target_os = "linux")]
-fn os_clock_is_tsc() -> bool {
+fn os_clock_may_be_tsc() -> bool {
     std::fs::read_to_string("/sys/devices/system/clocksource/clocksource0/current_clocksource")
         .is_ok_and(|source| source.trim() == "tsc")
 }
 
+/// Windows and macOS don't say which clock they keep time with, so the calibration alone decides.
 #[cfg(not(target_os = "linux"))]
-fn os_clock_is_tsc() -> bool {
-    false
+fn os_clock_may_be_tsc() -> bool {
+    true
 }
 
-/// The TSC frequency against [`Instant`] over 20 ms. Each endpoint is an `Instant` read between
-/// two TSC reads at most 100 000 cycles apart, so a preempted sample is retried instead of skewing
-/// the rate.
-fn measure_tsc_hz() -> Option<u64> {
+/// Each sample is an `Instant` read between two TSC reads at most 10 000 cycles apart, so a
+/// preempted sample is retried instead of skewing a rate.
+fn calibrate_tsc() -> Option<Calibration> {
     let sample = || {
         (0..100).find_map(|_| {
             let before = read_tsc()?;
             let now = Instant::now();
             let after = read_tsc()?;
-            (after - before < 100_000).then(|| (now, before + (after - before) / 2))
+            (after - before < 10_000).then(|| (now, before + (after - before) / 2))
         })
     };
-    let (start, start_tsc) = sample()?;
-    std::thread::sleep(Duration::from_millis(20));
-    let (end, end_tsc) = sample()?;
-    let ns = end.duration_since(start).as_nanos();
-    u64::try_from(u128::from(end_tsc - start_tsc) * 1_000_000_000 / ns).ok()
+    let rate = |(start, start_tsc): (Instant, u64), (end, end_tsc): (Instant, u64)| {
+        let ns = end.duration_since(start).as_nanos();
+        u64::try_from(u128::from(end_tsc - start_tsc) * 1_000_000_000 / ns).ok()
+    };
+    let first = sample()?;
+    std::thread::sleep(Duration::from_millis(10));
+    let middle = sample()?;
+    std::thread::sleep(Duration::from_millis(10));
+    let last = sample()?;
+    Some(Calibration {
+        rates: [rate(first, middle)?, rate(middle, last)?],
+        warped: tsc_warps(),
+    })
+}
+
+/// Whether the TSCs of the cores this process runs on disagree, as Linux's `check_tsc_warp`
+/// tests it: for 5 ms, threads take turns under one lock to read the TSC, and a read below the
+/// one before it means its core's TSC lags the other's.
+fn tsc_warps() -> bool {
+    let last = Mutex::new(0u64);
+    let warped = std::sync::atomic::AtomicBool::new(false);
+    let threads = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 4));
+    let end = Instant::now() + Duration::from_millis(5);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                while Instant::now() < end && !warped.load(Ordering::Relaxed) {
+                    let mut last = last.lock();
+                    let now = read_tsc().unwrap_or(0);
+                    if now < *last {
+                        warped.store(true, Ordering::Relaxed);
+                    }
+                    *last = now;
+                }
+            });
+        }
+    });
+    warped.into_inner()
+}
+
+#[cfg(test)]
+fn measure_tsc_hz() -> Option<u64> {
+    calibrate_tsc().map(|calibration| calibration.rates[0])
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -305,6 +363,66 @@ mod tests {
     thread_local! {
         /// Cycles this thread's TSC reads run ahead, standing in for a core whose TSC is skewed.
         pub(super) static SKEW: Cell<u64> = const { Cell::new(0) };
+    }
+
+    #[test]
+    fn zz_scratch_calibration() {
+        let hz = measure_tsc_hz().unwrap();
+        for _ in 0..3 {
+            let call = CoreTiming::with_tsc_hz(ConsoleGeneration::Switch2, None);
+            let inline = CoreTiming::with_tsc_hz(ConsoleGeneration::Switch2, Some(hz));
+            let scale = inline.host_tsc_scale().unwrap();
+            let n = 10_000_000u64;
+            let t = Instant::now();
+            let mut acc = 0u64;
+            for _ in 0..n {
+                acc = acc.wrapping_add(std::hint::black_box(&call).ticks());
+            }
+            let call_ns = t.elapsed().as_nanos() as f64 / n as f64;
+            let t = Instant::now();
+            for _ in 0..n {
+                acc = acc.wrapping_add(scale.ticks(read_tsc().unwrap()));
+            }
+            let inline_ns = t.elapsed().as_nanos() as f64 / n as f64;
+            println!("SCRATCH call {call_ns:.1} ns/read inline {inline_ns:.1} ns/read {acc}");
+        }
+        for _ in 0..5 {
+            let t = Instant::now();
+            let c = tsc_is_usable().then(calibrate_tsc).flatten();
+            let took = t.elapsed();
+            match c {
+                Some(c) => println!(
+                    "SCRATCH rates {:?} warped {} diff_ppm {} took {:?}",
+                    c.rates,
+                    c.warped,
+                    c.rates[0].abs_diff(c.rates[1]) * 1_000_000 / c.rates[0],
+                    took
+                ),
+                None => println!("SCRATCH none usable={}", tsc_is_usable()),
+            }
+        }
+    }
+
+    #[test]
+    fn the_tsc_is_trusted_only_when_invariant_and_calibrated() {
+        let calibration = |rates, warped| move || Some(Calibration { rates, warped });
+        let hz = 3_000_000_000;
+        assert_eq!(
+            accepted_tsc_hz(false, || panic!("calibrated a variant TSC")),
+            None
+        );
+        assert_eq!(accepted_tsc_hz(true, || None), None);
+        assert_eq!(accepted_tsc_hz(true, calibration([hz, hz], true)), None);
+        assert_eq!(
+            accepted_tsc_hz(true, calibration([hz, hz + hz / 999], false)),
+            None
+        );
+        assert_eq!(
+            accepted_tsc_hz(true, calibration([hz, hz + 2_000], false)),
+            Some(hz + 1_000)
+        );
+        let timing = CoreTiming::with_tsc_hz(ConsoleGeneration::Switch2, None);
+        assert!(timing.host_tsc_scale().is_none());
     }
 
     #[test]
