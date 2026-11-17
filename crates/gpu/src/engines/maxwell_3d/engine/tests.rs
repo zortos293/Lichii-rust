@@ -63,6 +63,9 @@ struct Renderer {
     conditions: Vec<Option<RenderCondition>>,
     /// What every predicate evaluates to.
     predicate_value: bool,
+    /// A word read from GPU memory at each inline write, as a writeback at that point would see it.
+    probe: Option<GpuVAddr>,
+    probed: Vec<u32>,
 }
 
 impl Renderer {
@@ -124,7 +127,10 @@ impl Rasterizer for Renderer {
     fn predicate_value(&mut self, _predicate: GpuPredicate) -> bool {
         self.predicate_value
     }
-    fn inline_written(&mut self, _: ChannelId, _: &Gmmu, address: GpuVAddr, size: u64) {
+    fn inline_written(&mut self, _: ChannelId, memory: &Gmmu, address: GpuVAddr, size: u64) {
+        if let Some(probe) = self.probe {
+            self.probed.push(memory.read::<u32>(probe).unwrap());
+        }
         self.events.push(Event::InlineWrite(address, size));
     }
     fn query(&mut self, _channel: ChannelId, _memory: &Gmmu, query: &Query) {
@@ -436,6 +442,22 @@ fn const_buffer_writes_reach_the_renderer_once_per_run() {
     );
     b.flush();
     assert_eq!(b.take(), [Event::InlineWrite(0x3_0040, 4)]);
+}
+
+#[test]
+fn a_const_buffer_range_is_announced_before_a_write_apart_from_it() {
+    let mut b = Bench::new();
+    select_const_buffer(&mut b, 0x3_0000, 0x100, 8);
+    b.renderer.probe = Some(0x3_0040);
+    b.multi(CB_DATA_FIRST, &[1]);
+    b.call(CB_SIZE + 3, 0x40);
+    b.multi(CB_DATA_FIRST, &[2]);
+    assert_eq!(b.take(), [Event::InlineWrite(0x3_0008, 4)]);
+    assert_eq!(
+        b.renderer.probed,
+        [0],
+        "a writeback for the first range must not cover the second write"
+    );
 }
 
 #[test]

@@ -29,17 +29,21 @@ impl Written {
         }
     }
 
-    fn add(&mut self, ctx: &mut EngineContext<'_>, start: GpuVAddr, end: GpuVAddr) {
-        match &mut self.0 {
-            Some((from, to)) if start <= *to && end >= *from => {
-                *from = (*from).min(start);
-                *to = (*to).max(end);
-            }
-            _ => {
-                self.flush(ctx);
-                self.0 = Some((start, end));
-            }
+    /// Writes `bytes` at `start` and adds them to the range. A range they don't touch is announced
+    /// before the write: announcing lets the renderer write GPU-modified images back over memory
+    /// outside the announced bytes.
+    fn write(&mut self, ctx: &mut EngineContext<'_>, start: GpuVAddr, bytes: &[u8]) {
+        let end = start + bytes.len() as u64;
+        if self.0.is_some_and(|(from, to)| start > to || end < from) {
+            self.flush(ctx);
         }
+        if let Err(fault) = ctx.memory.write_block(start, bytes) {
+            tracing::warn!(?fault, "constant buffer upload to unmapped GPU memory");
+        }
+        self.0 = Some(
+            self.0
+                .map_or((start, end), |(from, to)| (from.min(start), to.max(end))),
+        );
     }
 }
 
@@ -56,11 +60,7 @@ pub(super) fn upload(
     let written = &words[..words.len().min(room)];
     if !written.is_empty() {
         let address = cb.address() + u64::from(offset);
-        let bytes: &[u8] = bytemuck::cast_slice(written);
-        if let Err(fault) = ctx.memory.write_block(address, bytes) {
-            tracing::warn!(?fault, "constant buffer upload to unmapped GPU memory");
-        }
-        written_ranges.add(ctx, address, address + bytes.len() as u64);
+        written_ranges.write(ctx, address, bytemuck::cast_slice(written));
     }
     if written.len() != words.len() {
         tracing::debug!(
