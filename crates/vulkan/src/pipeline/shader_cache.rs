@@ -50,7 +50,7 @@ use lichii_shader::{
     compile_dual_vertex,
 };
 
-use super::environment::{EnvRead, ProgramEnv};
+use super::environment::{EnvRead, ProgramEnv, TextureAnswers};
 use super::shader_disk::ShaderDisk;
 use super::shader_workers::{Job, Workers};
 use super::{FxBuildHasher, FxHasher};
@@ -215,6 +215,8 @@ pub struct ShaderCache {
     disk: Option<ShaderDisk>,
     bytes: Vec<u8>,
     answers: Vec<u32>,
+    /// What the VertexA program's and the program's questions found of their textures.
+    textures: [TextureAnswers; 2],
     workers: Option<Workers>,
     /// Translations queued or running, by request key, with the last frame a draw asked.
     pending: HashMap<u64, Arc<AtomicU64>, FxBuildHasher>,
@@ -244,6 +246,7 @@ impl ShaderCache {
             disk: None,
             bytes: Vec::new(),
             answers: Vec::new(),
+            textures: Default::default(),
             workers: None,
             pending: HashMap::default(),
             code_check: cache::CodeCheck::default(),
@@ -493,12 +496,14 @@ impl ShaderCache {
         a: Option<&ProgramEnv<'_>>,
         env: &ProgramEnv<'_>,
     ) -> Option<&Variant> {
+        let textures = &mut self.textures;
+        textures.iter_mut().for_each(TextureAnswers::clear);
         let variant = self
             .modules
             .get(key)?
             .find(&mut self.answers, |side, read| match (side, a) {
-                (0, Some(a)) => a.answer(read),
-                _ => env.answer(read),
+                (0, Some(a)) => a.answer(read, &mut textures[0]),
+                _ => env.answer(read, &mut textures[1]),
             })?;
         self.stats.hits += 1;
         Some(variant)
@@ -811,6 +816,182 @@ mod tests {
             find(&variants, [9, 9]),
             (Some(0), 2),
             "a variant without questions matches anything"
+        );
+    }
+
+    /// The back thread's cost of re-checking the variants of three stages whose translations
+    /// asked 8 to 12 questions each, nearly all of texture headers:
+    /// `cargo test --release -p lichii-vulkan --lib variant_check_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn variant_check_cost_of_three_texturing_stages() {
+        use std::hint::black_box;
+
+        use lichii_gpu::backend::{ChannelId, ComputeContext, ConstBufferBinding, QmdVersion};
+        use lichii_gpu::gmmu::BigPageSize;
+        use lichii_memory::{DeviceAddressSpace, PhysicalMemory};
+        use lichii_shader::info::HandleSource;
+        use lichii_texture::tic::TicEntry;
+
+        use crate::pipeline::environment::TexturePool;
+
+        fn tic(format: u32, component: u32, ty: u32, normalized: bool) -> TicEntry {
+            let mut w = [0u32; 8];
+            w[0] = format | (component * 0o1111) << 7 | 0o5432 << 19;
+            w[2] = 3 << 21;
+            w[4] = 63 | ty << 23;
+            w[5] = 63 | u32::from(normalized) << 31;
+            TicEntry(w)
+        }
+
+        const SIZE: u64 = 1 << 20;
+        const DADDR: u64 = 0x1_0000_0000;
+        const GPU_VA: GpuVAddr = 0x4_0000_0000;
+        const TIC: GpuVAddr = GPU_VA + 0x1_0000;
+        const CBUF: GpuVAddr = GPU_VA + 0x2_0000;
+        const LIMIT: u32 = 63;
+        let physical = Arc::new(PhysicalMemory::new(SIZE).unwrap());
+        physical.commit(0, SIZE).unwrap();
+        let memory = Arc::new(DeviceAddressSpace::new(physical, 36));
+        memory.map(DADDR, 0, SIZE);
+        let gmmu = Arc::new(Gmmu::new(memory, BigPageSize::Size64K));
+        gmmu.map(GPU_VA, DADDR, SIZE, 0, false).unwrap();
+        let headers = [
+            tic(0x08, 2, 1, true),
+            tic(0x08, 4, 1, true),
+            tic(0x24, 2, 1, true),
+            tic(0x17, 2, 3, true),
+            tic(0x0f, 7, 5, true),
+            tic(0x1d, 4, 2, true),
+            tic(0x08, 2, 1, false),
+            tic(0x00, 2, 1, true),
+        ];
+        for i in 0..=LIMIT {
+            gmmu.write(TIC + u64::from(i) * 32, headers[i as usize % headers.len()])
+                .unwrap();
+        }
+        let textures = [3usize, 5, 4];
+        let mut const_buffers = [[ConstBufferBinding::default(); 8]; 3];
+        for (stage, &count) in textures.iter().enumerate() {
+            let cbuf = CBUF + stage as u64 * 0x1000;
+            const_buffers[stage][0] = ConstBufferBinding {
+                address: cbuf,
+                size: 0x1000,
+                enabled: true,
+            };
+            for t in 0..count as u32 {
+                let index = 1 + stage as u32 * 8 + t;
+                let handle = if t == 1 { index * 32 } else { index | 3 << 20 };
+                gmmu.write(cbuf + u64::from(t) * 8, handle).unwrap();
+            }
+        }
+        let qmd = [0u32; 64];
+        let ctx = |stage: usize| ComputeContext {
+            channel: ChannelId(0),
+            memory: &gmmu,
+            program: GPU_VA,
+            grid: [1; 3],
+            block: [1; 3],
+            shared_memory_size: 0,
+            local_memory_size: 0,
+            const_buffers: &const_buffers[stage],
+            texture_headers: TIC,
+            texture_header_limit: LIMIT,
+            samplers: 0,
+            sampler_limit: 0,
+            linked_samplers: false,
+            qmd_version: QmdVersion::V3,
+            qmd: &qmd,
+            indirect_grid: None,
+            indirect: None,
+        };
+        let source = |t: u32| HandleSource {
+            cbuf_index: 0,
+            cbuf_offset: t * 8,
+            shift_left: 0,
+            secondary: (t == 2).then_some((0, t * 8 + 4, 0)),
+        };
+        let mut cache = ShaderCache::new(Profile::default(), HostTranslateInfo::default());
+        let mut keys = Vec::new();
+        let mut questions = 0;
+        for (stage, &count) in textures.iter().enumerate() {
+            let ctx = ctx(stage);
+            let env = ProgramEnv::compute(&ctx);
+            for t in 0..count as u32 {
+                env.texture_type_of(source(t));
+                env.is_texture_pixel_format_integer_of(source(t));
+                if t % 3 == 0 {
+                    env.texture_pixel_format_of(source(t));
+                }
+            }
+            if stage == 0 {
+                env.read_cbuf(0, 0x100);
+            }
+            if stage == 2 {
+                env.texture_type(60);
+                env.texture_type(100);
+            }
+            let reads = env.take_reads();
+            assert!((8..=12).contains(&reads.len()), "{}", reads.len());
+            questions += reads.len();
+            let key = ModuleKey {
+                code: [0, stage as u64],
+                state: 0,
+            };
+            cache.remember(key, [Vec::new(), reads], Bindings::default(), None);
+            keys.push(key);
+        }
+        let contexts = [ctx(0), ctx(1), ctx(2)];
+        let check = |cache: &mut ShaderCache| {
+            contexts.iter().zip(&keys).all(|(ctx, key)| {
+                let env = ProgramEnv::compute(black_box(ctx));
+                cache.variant(key, None, &env).is_some()
+            })
+        };
+        assert!(check(&mut cache), "every stage finds its variant");
+        let time = |what: &str, calls: u32, run: &mut dyn FnMut()| {
+            let mut times = Vec::new();
+            for _ in 0..201 {
+                let start = Instant::now();
+                run();
+                times.push(start.elapsed() / calls);
+            }
+            times.sort();
+            eprintln!(
+                "{what}: median {:?}, min {:?}, p90 {:?}",
+                times[times.len() / 2],
+                times[0],
+                times[times.len() * 9 / 10]
+            );
+        };
+        const CHECKS: u32 = 2000;
+        time(
+            &format!("variant check of 3 stages, {questions} questions"),
+            CHECKS,
+            &mut || {
+                for _ in 0..CHECKS {
+                    assert!(black_box(check(&mut cache)));
+                }
+            },
+        );
+        let pool = TexturePool {
+            address: TIC,
+            limit: LIMIT,
+            via_header_index: false,
+            switch2: true,
+        };
+        let handles = 0..LIMIT + 8;
+        let rounds = 500;
+        time(
+            &format!("TexturePool::header over {} handles", handles.len()),
+            rounds * handles.len() as u32,
+            &mut || {
+                for _ in 0..rounds {
+                    for handle in handles.clone() {
+                        black_box(pool.header(&gmmu, black_box(handle)));
+                    }
+                }
+            },
         );
     }
 }

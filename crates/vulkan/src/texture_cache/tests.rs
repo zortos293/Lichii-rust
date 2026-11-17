@@ -5684,3 +5684,82 @@ fn mkw_cube_array_levels_narrower_than_a_gob_render_into_the_array() {
         }
     }
 }
+
+#[test]
+fn cube_levels_take_newer_overlaps_in_one_gpu_sync() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+            return;
+        };
+        let levels = 8;
+        let mut header = tic(0x08, GPU_VA, 128, 128, 1, levels, 4);
+        header.0[4] = (header.0[4] & !(0xf << 23)) | 8 << 23;
+        let cube = ImageInfo::from_texture(&header.decode().unwrap(), gob).unwrap();
+        assert_eq!((cube.layers, cube.levels), (6, levels));
+        let own =
+            |level: u32, layer: u32| [(layer * levels + level + 1) as u8 * 4, 0x40, 0x80, 0xff];
+        for layer in 0..6 {
+            for level in 0..levels {
+                let bytes: Vec<u8> = own(level, layer)
+                    .into_iter()
+                    .cycle()
+                    .take(cube.level_size(level) as usize)
+                    .collect();
+                f.memory
+                    .write_bytes(DADDR + cube.subresource_offset(level, layer), &bytes)
+                    .unwrap();
+            }
+        }
+        let (id, _) = f.texture(&header);
+        let mut expected: Vec<[u8; 4]> = (0..6)
+            .flat_map(|layer| (0..levels).map(move |level| own(level, layer)))
+            .collect();
+        let mut paint = |f: &mut Fixture, overlaps: &[(u32, u32, u32, [u8; 4])]| {
+            for &(first, last, layer, color) in overlaps {
+                let start = cube.subresource_offset(first, layer);
+                let end = cube.subresource_offset(last, layer) + cube.level_size(last);
+                let target = clear_rt_at(
+                    f,
+                    GPU_VA + start,
+                    &rt_info(16, ((end - start) / 64) as u32, 0, gob),
+                    color.map(|c| f32::from(c) / 255.0),
+                    Rect::ALL,
+                );
+                assert_ne!(target.id, id, "{gob:?}: an incompatible overlap");
+                for level in first..=last {
+                    expected[(layer * levels + level) as usize] = color;
+                }
+            }
+            let syncs = f.cache.traffic().gpu_syncs;
+            let (again, _) = f.texture(&header);
+            assert_eq!(again, id, "{gob:?}");
+            assert_eq!(f.cache.traffic().gpu_syncs, syncs + 1, "{gob:?}");
+        };
+        paint(
+            &mut f,
+            &[
+                (0, 0, 0, [255, 0, 0, 255]),
+                (1, 1, 2, [0, 255, 0, 255]),
+                (4, 7, 3, [0, 0, 255, 255]),
+                (0, 0, 5, [255, 255, 0, 255]),
+            ],
+        );
+        paint(
+            &mut f,
+            &[(2, 3, 1, [0, 255, 255, 255]), (5, 6, 4, [255, 0, 255, 255])],
+        );
+        let texels = f.read_image(id);
+        for layer in 0..6 {
+            for level in 0..levels {
+                let i = (layer * levels + level) as usize;
+                assert!(
+                    texels[i].chunks(4).all(|t| t == expected[i]),
+                    "{gob:?}: layer {layer} level {level} holds {:?}, not {:?}",
+                    &texels[i][..4],
+                    expected[i]
+                );
+            }
+        }
+        f.assert_no_validation_errors();
+    }
+}
