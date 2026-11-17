@@ -773,6 +773,13 @@ impl Emitter<'_> {
                 b,
                 word,
             } => self.sat_arith(i, arrangement, a, b, word),
+            SimdOp::SatMulHigh {
+                round,
+                arrangement,
+                a,
+                b,
+                ..
+            } => self.sat_mul_high(i, round, arrangement, a, b),
             SimdOp::Vec(op) => self.vector(i, op),
             SimdOp::Lanes(lanes) => self.lanes(i, lanes),
         }

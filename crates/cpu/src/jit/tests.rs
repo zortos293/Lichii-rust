@@ -296,13 +296,15 @@ fn simd(rng: &mut Rng) -> u32 {
     }
 }
 
-const VECTOR: [&str; 21] = [
+const VECTOR: [&str; 23] = [
     "0xx01110xx1xxxxx0110x1xxxxxxxxxx",
     "0xx01110xx1xxxxx000x01xxxxxxxxxx",
     "0xx01110xx1xxxxx00x011xxxxxxxxxx",
     "0xx01110xx1xxxxx011101xxxxxxxxxx",
     "0x001110xx0xxxxx0x1110xxxxxxxxxx",
     "0xx01110xx1xxxxxxxxx00xxxxxxxxxx",
+    "0xx01111xxxxxxxxxxxxx0xxxxxxxxxx",
+    "0xx01110011xxxxx101101xxxxxxxxxx",
     "0xx011110xxxxxxx101001xxxxxxxxxx",
     "0x001110xx100001010010xxxxxxxxxx",
     "01011110000xxxxx000001xxxxxxxxxx",
@@ -321,7 +323,7 @@ const VECTOR: [&str; 21] = [
 ];
 
 /// An Advanced SIMD integer three-same (halving, saturating and absolute-difference forms
-/// too), compare against zero, `CNT`, shift by immediate (long too), `ZIP1`/`ZIP2`, three-different (`SADDL`, `SMLAL` and the rest), copy or modified-immediate instruction, or an `LD1`..`LD4`/`ST1`..`ST4` of one to four registers on `X20`..`X23` or
+/// too), compare against zero, `CNT`, shift by immediate (long too), `ZIP1`/`ZIP2`, three-different (`SADDL`, `SMLAL` and the rest), integer by-element, `SQDMULH`/`SQRDMULH`, copy or modified-immediate instruction, or an `LD1`..`LD4`/`ST1`..`ST4` of one to four registers on `X20`..`X23` or
 /// `SP`, offset or post-indexed by an immediate or `X24`/`X26`.
 fn vector(rng: &mut Rng) -> u32 {
     if rng.below(3) == 0 {
@@ -680,6 +682,18 @@ fn directed(code: &[u32], regs: &[(usize, u64)]) {
         ("jit without sse4", Machine::new(Backend::NoSse4)),
     ];
     compare(&mut machines, &code, &ctx, &data);
+}
+
+#[test]
+fn saturating_doubling_multiplies_match_the_interpreter() {
+    const VALUES: [u64; 7] = [0, 1, 0x4000, 0x7fff, 0x8000, 0x8001, 0xffff];
+    const DUP_V1_W1: u32 = 0x4e02_0c21;
+    const DUP_V2_W2: u32 = 0x4e02_0c42;
+    for op in [0x4e62_b420, 0x6e62_b420, 0x4f42_c020, 0x4f42_d020] {
+        for (a, b) in VALUES.into_iter().flat_map(|a| VALUES.map(|b| (a, b))) {
+            directed(&[DUP_V1_W1, DUP_V2_W2, op], &[(1, a), (2, b)]);
+        }
+    }
 }
 
 #[test]
