@@ -22,7 +22,7 @@ use lichii_shader::{
 use parking_lot::{Condvar, Mutex};
 
 use super::environment::{EnvRead, EnvSnapshot, ProgramEnv};
-use super::shader_cache::{hash_program, warn_failed};
+use super::shader_cache::{dump, hash_program, translated_ranges, warn_failed};
 
 /// Presents a queued job may go unrequested before workers drop it.
 pub(crate) const STALE_FRAMES: u64 = 2;
@@ -216,6 +216,14 @@ fn translate(job: &Job, profile: &Profile, host: &HostTranslateInfo) -> Option<T
             compile(&env, options, runtime, &mut bindings).map(|module| (Arc::new(module), None))
         }
     };
+    if let Ok((module, _)) = &result {
+        dump(
+            module,
+            a.as_ref(),
+            &env,
+            translated_ranges(a.as_ref(), &env),
+        );
+    }
     let mut bytes = Vec::new();
     let mut code = |env: &ProgramEnv<'_>| {
         let (start, len) = env.code_range();

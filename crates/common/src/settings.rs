@@ -1354,6 +1354,9 @@ pub struct DebugSettings {
     /// Answer unknown service commands with an empty success instead of stopping.
     pub auto_stub: bool,
     pub gdb_stub_port: Option<u16>,
+    /// Writes each translated shader's SPIR-V and guest code, once per module hash, to
+    /// `shaders/` in the GPU fault report folder (`LICHII_GPU_FAULT_DIR`, else `gpucrash/` in
+    /// the data folder). Applies at the next start.
     pub dump_shaders: bool,
     /// Loads RenderDoc's in-application API at startup and lets the "Toggle Renderdoc Capture"
     /// hotkey start and stop captures. Applies at the next start.
