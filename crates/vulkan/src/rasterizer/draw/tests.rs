@@ -30,7 +30,7 @@ use lichii_texture::block_linear::{GobLayout, Tiling, swizzle};
 use super::super::tests::{
     DADDR, Fixture, GPU_VA, fixture, fixture_with, gmmu, guest_linear, unorm8_eq,
 };
-use super::{StageSources, Warning};
+use super::{StageSources, Warning, storage_pointer};
 use crate::device::DeviceFeatures;
 use crate::pipeline::environment::TexturePool;
 use crate::pipeline::shader_cache::{ShaderCache, ShaderCacheStats};
@@ -5151,4 +5151,124 @@ fn render_conditions_test_occlusion_reports_on_the_host_gpu() {
         );
     }
     f.assert_no_validation_errors();
+}
+
+/// Storage buffer sizes: NVN descriptors take their size word; Switch 2 pointers are bare (8 MiB),
+/// except a read-only compute binding with a larger size word; a read-only pointer table entry
+/// reaches to the end of its contiguous device run. None reaches past its run when long, or past
+/// the host's range limit.
+#[test]
+fn storage_pointer_sizes_follow_the_pointer_kind() {
+    use lichii_memory::{DeviceAddressSpace, PhysicalMemory};
+    use lichii_shader::info::{StorageBufferDescriptor, StorageWriteExtent};
+
+    const MIB: u64 = 1 << 20;
+    const RUN: u64 = 20 * MIB;
+    let physical = Arc::new(PhysicalMemory::new(32 * MIB).unwrap());
+    physical.commit(0, 32 * MIB).unwrap();
+    let memory = Arc::new(DeviceAddressSpace::new(physical, 36));
+    memory.map(DADDR, 0, 32 * MIB);
+    let gmmu = Arc::new(Gmmu::new(memory, lichii_gpu::gmmu::BigPageSize::Size64K));
+    gmmu.map(GPU_VA, DADDR, RUN, 0, false).unwrap();
+    gmmu.map(GPU_VA + RUN, DADDR + RUN + 4 * MIB, 4 * MIB, 0, false)
+        .unwrap();
+    let pool = GPU_VA + MIB;
+    let table = GPU_VA + 0x1000;
+    gmmu.write(table + 8, pool).unwrap();
+    let cbuf = |pointer: u64, next: u64| {
+        gmmu.write(GPU_VA, pointer).unwrap();
+        gmmu.write(GPU_VA + 8, next).unwrap();
+    };
+    let cbufs = [ConstBufferBinding {
+        address: GPU_VA,
+        size: 0x100,
+        enabled: true,
+    }];
+    let root = [0u32; 64];
+    let sources = |switch2: bool, compute: bool| StageSources {
+        gmmu: &gmmu,
+        cbufs: &cbufs,
+        root_table: (!compute).then_some(&root),
+        pool: TexturePool {
+            address: 0,
+            limit: 0,
+            via_header_index: false,
+            switch2,
+        },
+        samplers: 0,
+        sampler_limit: 0,
+    };
+    let desc = |is_written: bool, indirect_offset: u32| StorageBufferDescriptor {
+        cbuf_index: 0,
+        cbuf_offset: 0,
+        count: 1,
+        is_written,
+        indirect_offset,
+        write_extent: StorageWriteExtent::default(),
+    };
+    let direct = StorageBufferDescriptor::DIRECT;
+    let size = |switch2, compute, is_written, indirect| {
+        storage_pointer(
+            &sources(switch2, compute),
+            &desc(is_written, indirect),
+            0,
+            u64::MAX,
+        )
+    };
+
+    cbuf(pool, 0x300);
+    assert_eq!(
+        size(false, true, false, direct),
+        (pool, 0x300),
+        "NVN size word"
+    );
+    assert_eq!(
+        size(true, false, false, direct),
+        (pool, 8 * MIB),
+        "bare graphics"
+    );
+    assert_eq!(
+        size(true, true, true, direct),
+        (pool, 8 * MIB),
+        "bare written"
+    );
+    cbuf(pool, 12 * MIB);
+    assert_eq!(
+        size(true, true, false, direct),
+        (pool, 12 * MIB),
+        "a read-only compute binding takes a larger size word"
+    );
+    assert_eq!(size(true, false, false, direct), (pool, 8 * MIB));
+    cbuf(pool, 200 * MIB);
+    assert_eq!(
+        size(true, true, false, direct),
+        (pool, RUN - MIB),
+        "a size word past the device run stops where the run does"
+    );
+    cbuf(pool, pool);
+    assert_eq!(
+        size(true, true, false, direct),
+        (pool, 8 * MIB),
+        "a next word with a high half is another pointer"
+    );
+
+    cbuf(table, 0);
+    assert_eq!(
+        size(true, true, false, 8),
+        (pool, RUN - MIB),
+        "a read-only table entry reaches to the end of its device run"
+    );
+    assert_eq!(size(true, true, true, 8), (pool, 64 << 10), "written");
+    let host_limit = 10 * MIB - 0x100;
+    assert_eq!(
+        storage_pointer(&sources(true, true), &desc(false, 8), 0, host_limit),
+        (pool, host_limit),
+        "no binding passes the host's storage buffer range"
+    );
+    gmmu.write(table + 8, GPU_VA + RUN - 0x1000).unwrap();
+    assert_eq!(
+        size(true, true, false, 8),
+        (GPU_VA + RUN - 0x1000, 64 << 10),
+        "a short run keeps 64 KiB"
+    );
 }
