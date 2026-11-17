@@ -867,8 +867,16 @@ fn targets_drawn_into_keep_their_own_texels_over_newer_overlaps() {
     assert_eq!(id, a.id);
     assert_eq!(
         f.cache.traffic().gpu_syncs,
+        before.gpu_syncs,
+        "samples keep them too"
+    );
+    let (mut tx, cache, gmmu) = f.tx();
+    let found = cache.find(&mut tx, gmmu, GPU_VA, &big).unwrap().unwrap();
+    assert_eq!(found.id, a.id);
+    assert_eq!(
+        f.cache.traffic().gpu_syncs,
         before.gpu_syncs + 1,
-        "a bind with no draw leaves the newer overlap to the next read"
+        "a bind with no draw leaves the newer overlap to the next transfer"
     );
     assert_eq!(count_texels(&f.read_image(a.id)[0], RED), 32 * 32);
     f.assert_no_validation_errors();
