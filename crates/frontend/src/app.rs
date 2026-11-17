@@ -13,7 +13,7 @@ use lichii_common::settings::{
 use lichii_core::{ExitReason, Host};
 use lichii_crypto::KeySet as ConsoleKeys;
 use lichii_input::{Key, KeyChord, KeySet, MouseButton};
-use lichii_loader::LoadOptions;
+use lichii_loader::{LoadOptions, ModOptions};
 use lichii_vulkan::present::{UiFrame, Viewport};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, StartCause, WindowEvent};
@@ -556,6 +556,10 @@ impl App {
         let options = LoadOptions {
             keys: Some(self.keys()),
             installed: self.installed_content(),
+            mods: ModOptions {
+                builtin_patches: self.settings.system.builtin_game_patches,
+                ..ModOptions::default()
+            },
             ..LoadOptions::default()
         };
         let proxy = self.proxy.clone();

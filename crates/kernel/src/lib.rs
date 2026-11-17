@@ -187,7 +187,7 @@ impl Kernel {
             application_limit: Arc::new(ResourceLimit::application(memory.size(Pool::Application))),
             physical,
             memory,
-            scheduler: Arc::new(Scheduler::new(cores)),
+            scheduler: Arc::new(Scheduler::new(cores, idle_poll(config.console))),
             timer: Timer::default(),
             arbiter: Arbiter::default(),
             monitor: Arc::new(ExclusiveMonitor::new(cores)),
@@ -441,6 +441,21 @@ const LIVE_PC_TIMEOUT: Duration = Duration::from_millis(50);
 const SLOW_JOIN: Duration = Duration::from_secs(2);
 /// How long [`Kernel::shutdown`] waits for all service threads before leaving the busy ones.
 const SERVICE_STOP_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// How long an idle core polls for work before it parks. Switch 2 job systems hand work between
+/// cores many times a frame, and the reference measured Mario Kart World at 42 ms a frame parking
+/// at once and 34 ms polling up to 100 µs. Switch 1 titles park at once, as they do there.
+/// `LICHII_IDLE_POLL_US` overrides it; 0 turns polling off.
+fn idle_poll(console: ConsoleGeneration) -> Duration {
+    let us = std::env::var("LICHII_IDLE_POLL_US")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(match console {
+            ConsoleGeneration::Switch1 => 0,
+            ConsoleGeneration::Switch2 => 100,
+        });
+    Duration::from_micros(us)
+}
 
 fn join_noting_slow(thread: JoinHandle<()>) {
     let started = Instant::now();

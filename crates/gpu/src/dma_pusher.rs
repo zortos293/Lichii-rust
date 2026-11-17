@@ -489,6 +489,11 @@ impl FrontChannel {
         self.wait.is_some()
     }
 
+    /// Whether the channel waits on a semaphore acquire.
+    pub(crate) fn waits_on_semaphore(&self) -> bool {
+        matches!(self.wait, Some(Wait::Semaphore { .. }))
+    }
+
     /// Whether the channel is parked until the back synchronised an entry's fetch.
     pub(crate) fn waits_for_fetch(&self) -> bool {
         matches!(self.wait, Some(Wait::Fetch(_)))
@@ -868,10 +873,11 @@ impl Dispatch<'_> {
         Flow::Continue
     }
 
-    /// An acquire the word in memory does not meet yet may be met by a release still queued for
-    /// the back: drain it and look again, then suspend the channel (NX2_NOTES row 50). The
-    /// channel waits from before its first look, so a release that lands and is overwritten at
-    /// any point before the second look still latches it.
+    /// An acquire the word in memory does not meet yet suspends the channel (NX2_NOTES row 50)
+    /// without waiting for the back: a release still queued for it latches the channel when it
+    /// lands, and the front parses the other channels meanwhile. The channel waits from before
+    /// its look, so a release that lands and is overwritten at any point after it still latches
+    /// it.
     fn acquire(
         &mut self,
         method: u32,
@@ -883,18 +889,6 @@ impl Dispatch<'_> {
         if let Some(device) = self.memory.translate(address) {
             self.shared.waiters.add(self.id, device, payload, op, wide);
         }
-        if semaphore_met(
-            self.memory,
-            self.shared.syncpoints.semaphore_mirror(),
-            address,
-            payload,
-            op,
-            wide,
-        ) {
-            self.shared.waiters.remove(self.id);
-            return Flow::Continue;
-        }
-        self.shared.stream.drain();
         if semaphore_met(
             self.memory,
             self.shared.syncpoints.semaphore_mirror(),

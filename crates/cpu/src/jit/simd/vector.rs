@@ -87,6 +87,13 @@ pub enum Binary {
     Rhadd(bool),
     /// `|a - b|`, signed or unsigned.
     Abd(bool),
+    /// `SMAXP`, `SMINP`, `UMAXP` or `UMINP`: the larger (or, unless `max`, the smaller) of
+    /// each adjacent lane pair, signed or unsigned, those of `a` in the low half and those of `b`
+    /// in the high half.
+    MinMaxP {
+        max: bool,
+        signed: bool,
+    },
 }
 
 /// The bitwise selects, each `base ^ ((n ^ base) & mask)` on the destination's old value `old`.
@@ -373,7 +380,9 @@ fn supported(t: &Translator, op: Binary, size: u8) -> bool {
         Binary::CmTst => size < 3 || t.sse41,
         Binary::Hadd(_) | Binary::Rhadd(true) => size == 1 || size == 2,
         Binary::Rhadd(false) => size < 3,
-        Binary::Abd(signed) => supported(t, if signed { Binary::SMax } else { Binary::UMax }, size),
+        Binary::Abd(signed) | Binary::MinMaxP { signed, .. } => {
+            supported(t, if signed { Binary::SMax } else { Binary::UMax }, size)
+        }
     }
 }
 
@@ -568,6 +577,14 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
             (0b00000, _, _) => Binary::Hadd(!u),
             (0b00010, _, _) => Binary::Rhadd(!u),
             (0b01110, _, _) => Binary::Abd(!u),
+            (0b10100, _, _) => Binary::MinMaxP {
+                max: true,
+                signed: !u,
+            },
+            (0b10101, _, _) => Binary::MinMaxP {
+                max: false,
+                signed: !u,
+            },
             _ => return false,
         };
         if opcode != 0b00011 && ((size == 3 && !q) || !supported(t, op, size)) {
@@ -590,6 +607,56 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
                 m,
             },
         );
+        t.set(Loc::V(rd), r);
+        return true;
+    }
+    if word & 0xbf20_0c00 == 0x0e20_0000
+        && matches!(field(word, 12, 4), 0b1001 | 0b1011 | 0b1101)
+        && (size == 1 || (size == 2 && t.sse41))
+    {
+        let acc = match field(word, 12, 4) {
+            0b1001 => Some(false),
+            0b1011 => Some(true),
+            _ => None,
+        };
+        let acc = acc.map(|sub| (vec(t, rd), sub));
+        let (n, m) = (vec(t, rn), vec(t, rm));
+        let r = t.op(Op::Simd(SimdOp::SatMulLong {
+            size,
+            high: q,
+            n,
+            m,
+            acc,
+            word,
+        }));
+        t.set(Loc::V(rd), r);
+        return true;
+    }
+    if word & 0x9f20_dc00 == 0x0e20_4000 && size < 3 {
+        let (n, m) = (vec(t, rn), vec(t, rm));
+        let wide = Arrangement {
+            size: size + 1,
+            q: true,
+        };
+        let op = if word & 0x2000 != 0 {
+            Binary::Sub
+        } else {
+            Binary::Add
+        };
+        let mut x = emit(t, VecOp::Binary(op, wide, n, m));
+        if u {
+            let half = 1u64 << ((8 << size) - 1);
+            let lanes = match size {
+                0 => half * 0x0001_0001_0001_0001,
+                1 => half * 0x0000_0001_0000_0001,
+                _ => half,
+            };
+            let round = emit(t, VecOp::Imm(lanes, true));
+            x = emit(t, VecOp::Binary(Binary::Add, wide, x, round));
+        }
+        let high = emit(t, VecOp::Shift(Shift::Ushr, wide, 8 << size, x));
+        let low = q.then(|| vec(t, rd));
+        let r = emit(t, VecOp::Narrow { size, a: high, low });
         t.set(Loc::V(rd), r);
         return true;
     }
@@ -854,6 +921,24 @@ fn by_element(t: &mut Translator, word: u32) -> bool {
                     acc,
                 },
             )
+        }
+        (false, 0b0011 | 0b0111 | 0b1011) if size == 1 || t.sse41 => {
+            let acc = match opcode {
+                0b0011 => Some(false),
+                0b0111 => Some(true),
+                _ => None,
+            };
+            let acc = acc.map(|sub| (vec(t, rd), sub));
+            let n = vec(t, rn);
+            let m = lane(t);
+            t.op(Op::Simd(SimdOp::SatMulLong {
+                size,
+                high: q,
+                n,
+                m,
+                acc,
+                word,
+            }))
         }
         (false, 0b1100 | 0b1101) if size == 1 && t.sse41 => {
             let a = vec(t, rn);
@@ -1410,6 +1495,66 @@ impl Emitter<'_> {
         }
     }
 
+    /// `d` = `op` of the even and odd lanes of `8 << size` bits of `a` followed by `b`, so each lane
+    /// pair of `a` lands in the low half and each of `b` in the high half. Without `q`, only the low
+    /// halves of `a` and `b` count and the high half of `d` is left undefined. Clobbers `xmm15`.
+    fn min_max_pairs(&mut self, op: Sse, size: u8, q: bool, d: u8, a: u8, b: u8) {
+        let (a, b) = if q {
+            (a, b)
+        } else {
+            let x = self.temp();
+            self.copy(x, a);
+            dynasm!(self.asm ; .arch x64 ; punpcklqdq Rx(x), Rx(b));
+            (x, x)
+        };
+        match size {
+            0 => {
+                let t = self.temp();
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; pcmpeqw Rx(t), Rx(t)
+                    ; psrlw Rx(t), 8
+                    ; movdqa Rx(d), Rx(a)
+                    ; pand Rx(d), Rx(t)
+                    ; movdqa Rx(SCRATCH), Rx(b)
+                    ; pand Rx(SCRATCH), Rx(t)
+                    ; packuswb Rx(d), Rx(SCRATCH)
+                    ; movdqa Rx(SCRATCH), Rx(a)
+                    ; psrlw Rx(SCRATCH), 8
+                    ; movdqa Rx(t), Rx(b)
+                    ; psrlw Rx(t), 8
+                    ; packuswb Rx(SCRATCH), Rx(t)
+                );
+            }
+            1 => {
+                let t = self.temp();
+                dynasm!(self.asm
+                    ; .arch x64
+                    ; movdqa Rx(d), Rx(a)
+                    ; pslld Rx(d), 16
+                    ; psrad Rx(d), 16
+                    ; movdqa Rx(SCRATCH), Rx(b)
+                    ; pslld Rx(SCRATCH), 16
+                    ; psrad Rx(SCRATCH), 16
+                    ; packssdw Rx(d), Rx(SCRATCH)
+                    ; movdqa Rx(SCRATCH), Rx(a)
+                    ; psrad Rx(SCRATCH), 16
+                    ; movdqa Rx(t), Rx(b)
+                    ; psrad Rx(t), 16
+                    ; packssdw Rx(SCRATCH), Rx(t)
+                );
+            }
+            _ => dynasm!(self.asm
+                ; .arch x64
+                ; movdqa Rx(d), Rx(a)
+                ; shufps Rx(d), Rx(b), 0x88_u8 as i8
+                ; movdqa Rx(SCRATCH), Rx(a)
+                ; shufps Rx(SCRATCH), Rx(b), 0xdd_u8 as i8
+            ),
+        }
+        self.sse(op, size, d, SCRATCH);
+    }
+
     /// `SQADD`, `UQADD`, `SQSUB` or `UQSUB` (by `word`) on B or H lanes, setting FPSR.QC when
     /// any lane of the arrangement saturated, that is when the wrapping result differs.
     pub(super) fn sat_arith(
@@ -1492,6 +1637,87 @@ impl Emitter<'_> {
         if !q {
             dynasm!(self.asm ; .arch x64 ; movq Rx(d), Rx(d));
         }
+    }
+
+    /// Sets FPSR.QC when any byte of `mask` is nonzero.
+    fn qc_if_any(&mut self, mask: u8) {
+        let exact = self.asm.new_dynamic_label();
+        dynasm!(self.asm
+            ; .arch x64
+            ; pmovmskb eax, Rx(mask)
+            ; test eax, eax
+            ; jz =>exact
+            ; or DWORD [r15 + CTX_FPSR], QC
+            ; =>exact
+        );
+    }
+
+    /// Each lane of `16 << size` bits of `x` replaced by copies of its sign bit (`size` 1 or 2).
+    fn lane_signs(&mut self, size: u8, x: u8) {
+        dynasm!(self.asm ; .arch x64 ; psrad Rx(x), 31);
+        if size == 2 {
+            dynasm!(self.asm ; .arch x64 ; pshufd Rx(x), Rx(x), 0xf5_u8 as i8);
+        }
+    }
+
+    /// `SQDMULL`, `SQDMLAL` or `SQDMLSL` (see `SimdOp::SatMulLong`). Only `MIN * MIN` overflows
+    /// the doubling, and it alone gives `MIN` there, so those lanes become `MAX`. The accumulate
+    /// overflows where the operands' signs say it must, and saturates towards the accumulator's sign.
+    pub(super) fn sat_mul_long(
+        &mut self,
+        i: usize,
+        size: u8,
+        high: bool,
+        n: Value,
+        m: Value,
+        acc: Option<(Value, bool)>,
+    ) {
+        let (n, m) = (self.reg(n), self.reg(m));
+        let acc = acc.map(|(acc, sub)| (self.reg(acc), sub));
+        let d = self.def(Value(i as u32));
+        let (t, u) = (self.temp(), self.temp());
+        let wide = size + 1;
+        self.mul_long(true, size, high, d, n, m);
+        self.sse(Sse::Add, wide, d, d);
+        dynasm!(self.asm ; .arch x64 ; pcmpeqd Rx(t), Rx(t));
+        if size == 1 {
+            dynasm!(self.asm ; .arch x64 ; pslld Rx(t), 31);
+        } else {
+            dynasm!(self.asm ; .arch x64 ; psllq Rx(t), 63);
+        }
+        self.sse(Sse::Eq, wide, t, d);
+        self.sse(Sse::Xor, wide, d, t);
+        self.qc_if_any(t);
+        let Some((acc, sub)) = acc else {
+            return;
+        };
+        self.copy(SCRATCH, acc);
+        self.copy(t, acc);
+        if sub {
+            self.sse(Sse::Sub, wide, SCRATCH, d);
+            self.sse(Sse::Xor, wide, t, d);
+            self.copy(d, acc);
+            self.sse(Sse::Xor, wide, d, SCRATCH);
+        } else {
+            self.sse(Sse::Add, wide, SCRATCH, d);
+            self.sse(Sse::Xor, wide, t, SCRATCH);
+            self.sse(Sse::Xor, wide, d, SCRATCH);
+        }
+        self.sse(Sse::And, wide, t, d);
+        self.lane_signs(size, t);
+        dynasm!(self.asm ; .arch x64 ; pcmpeqd Rx(u), Rx(u));
+        if size == 1 {
+            dynasm!(self.asm ; .arch x64 ; psrld Rx(u), 1);
+        } else {
+            dynasm!(self.asm ; .arch x64 ; psrlq Rx(u), 1);
+        }
+        self.copy(d, acc);
+        self.lane_signs(size, d);
+        self.sse(Sse::Xor, wide, d, u);
+        self.sse(Sse::Xor, wide, d, SCRATCH);
+        self.sse(Sse::And, wide, d, t);
+        self.sse(Sse::Xor, wide, d, SCRATCH);
+        self.qc_if_any(t);
     }
 
     /// `SQXTN`/`SQXTN2`, or `SQXTUN`/`SQXTUN2` when `unsigned`: packs `n` with signed or unsigned
@@ -1578,6 +1804,15 @@ impl Emitter<'_> {
                         self.sse(Sse::Eq, size, d, a);
                     }
                     Binary::Addp => self.addp(size, q, d, a, b),
+                    Binary::MinMaxP { max, signed } => {
+                        let op = match (max, signed) {
+                            (true, true) => Sse::MaxS,
+                            (true, false) => Sse::MaxU,
+                            (false, true) => Sse::MinS,
+                            (false, false) => Sse::MinU,
+                        };
+                        self.min_max_pairs(op, size, q, d, a, b);
+                    }
                     Binary::CmTst => {
                         self.copy(d, a);
                         self.sse(Sse::And, size, d, b);

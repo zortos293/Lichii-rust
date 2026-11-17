@@ -780,6 +780,14 @@ impl Emitter<'_> {
                 b,
                 ..
             } => self.sat_mul_high(i, round, arrangement, a, b),
+            SimdOp::SatMulLong {
+                size,
+                high,
+                n,
+                m,
+                acc,
+                ..
+            } => self.sat_mul_long(i, size, high, n, m, acc),
             SimdOp::Vec(op) => self.vector(i, op),
             SimdOp::Lanes(lanes) => self.lanes(i, lanes),
         }

@@ -296,7 +296,7 @@ fn simd(rng: &mut Rng) -> u32 {
     }
 }
 
-const VECTOR: [&str; 23] = [
+const VECTOR: [&str; 24] = [
     "0xx01110xx1xxxxx0110x1xxxxxxxxxx",
     "0xx01110xx1xxxxx000x01xxxxxxxxxx",
     "0xx01110xx1xxxxx00x011xxxxxxxxxx",
@@ -305,6 +305,7 @@ const VECTOR: [&str; 23] = [
     "0xx01110xx1xxxxxxxxx00xxxxxxxxxx",
     "0xx01111xxxxxxxxxxxxx0xxxxxxxxxx",
     "0xx01110011xxxxx101101xxxxxxxxxx",
+    "0xx01110xx1xxxxx1010x1xxxxxxxxxx",
     "0xx011110xxxxxxx101001xxxxxxxxxx",
     "0x001110xx100001010010xxxxxxxxxx",
     "01011110000xxxxx000001xxxxxxxxxx",
@@ -322,7 +323,7 @@ const VECTOR: [&str; 23] = [
     "0x00111000100000010110xxxxxxxxxx",
 ];
 
-/// An Advanced SIMD integer three-same (halving, saturating and absolute-difference forms
+/// An Advanced SIMD integer three-same (halving, saturating, absolute-difference and pairwise max/min forms
 /// too), compare against zero, `CNT`, shift by immediate (long too), `ZIP1`/`ZIP2`, three-different (`SADDL`, `SMLAL` and the rest), integer by-element, `SQDMULH`/`SQRDMULH`, copy or modified-immediate instruction, or an `LD1`..`LD4`/`ST1`..`ST4` of one to four registers on `X20`..`X23` or
 /// `SP`, offset or post-indexed by an immediate or `X24`/`X26`.
 fn vector(rng: &mut Rng) -> u32 {
@@ -692,6 +693,52 @@ fn saturating_doubling_multiplies_match_the_interpreter() {
     for op in [0x4e62_b420, 0x6e62_b420, 0x4f42_c020, 0x4f42_d020] {
         for (a, b) in VALUES.into_iter().flat_map(|a| VALUES.map(|b| (a, b))) {
             directed(&[DUP_V1_W1, DUP_V2_W2, op], &[(1, a), (2, b)]);
+        }
+    }
+}
+
+#[test]
+fn saturating_doubling_long_multiplies_match_the_interpreter() {
+    const H: [u64; 5] = [0, 1, 0x7fff, 0x8000, 0xffff];
+    const S: [u64; 5] = [0, 1, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff];
+    const ACC_S: [u64; 4] = [1, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff];
+    const ACC_D: [u64; 4] = [1, i64::MAX as u64, i64::MIN as u64, u64::MAX];
+    let sizes = [
+        (
+            [0x4e02_0c21, 0x4e02_0c42, 0x4e04_0c60],
+            &H,
+            &ACC_S,
+            [
+                0x0e62_d020,
+                0x0e62_9020,
+                0x0e62_b020,
+                0x4e62_9020,
+                0x0f52_3020,
+            ],
+        ),
+        (
+            [0x4e04_0c21, 0x4e04_0c42, 0x4e08_0c60],
+            &S,
+            &ACC_D,
+            [
+                0x0ea2_d020,
+                0x0ea2_9020,
+                0x0ea2_b020,
+                0x4ea2_b020,
+                0x4fa2_7820,
+            ],
+        ),
+    ];
+    for (dups, values, accs, ops) in sizes {
+        for op in ops {
+            for (a, b) in values.iter().flat_map(|&a| values.map(|b| (a, b))) {
+                for &acc in accs {
+                    directed(
+                        &[dups[0], dups[1], dups[2], op],
+                        &[(1, a), (2, b), (3, acc)],
+                    );
+                }
+            }
         }
     }
 }
