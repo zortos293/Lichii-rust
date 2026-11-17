@@ -1494,6 +1494,9 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn invalidate_region(&mut self, addr: DAddr, size: u64) {
+        if crate::debug::device_is_lost() {
+            return;
+        }
         self.buffer_cache.invalidate(addr, size);
         self.draw.shaders.invalidate(addr, size);
         let mut tx = Transfer {
@@ -1515,6 +1518,9 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn flush_region(&mut self, addr: DAddr, size: u64) {
+        if crate::debug::device_is_lost() {
+            return;
+        }
         if let Err(error) = self.buffer_cache.flush(&mut self.scheduler, addr, size) {
             tracing::error!(%error, "flushing GPU-written buffers failed");
         }
@@ -1531,6 +1537,10 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn flush_for_cpu_read(&mut self, addr: DAddr, size: u64) {
+        if crate::debug::device_is_lost() {
+            self.handles.device.disarm_flush_traps(addr, size);
+            return;
+        }
         let end = addr.saturating_add(size);
         let area = match self
             .buffer_cache
