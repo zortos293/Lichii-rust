@@ -383,13 +383,16 @@ impl VulkanRasterizer {
             handles.written_pages.clone(),
             handles.lazy.clone(),
         )?;
-        let texture_cache = TextureCache::new(
+        let mut texture_cache = TextureCache::new(
             device,
             handles.written_pages.clone(),
             handles.lazy.clone(),
             gob_layout,
             AstcRecompression::Uncompressed,
         );
+        if lichii_gpu::gpu::flush_traps_enabled() {
+            texture_cache.set_flush_traps(handles.device.clone());
+        }
         let mut scheduler = Scheduler::new(device)?;
         scheduler.time_waits(handles.activity.clone());
         let pipelines = PipelineCache::new(device, &GraphicsSettings::default(), None, None)?;
@@ -702,7 +705,7 @@ impl VulkanRasterizer {
             ImageAccess::TRANSFER_DST,
             ImageAccess::SHADER_READ,
         );
-        self.buffer_cache.capture(&mut self.scheduler)?;
+        self.capture()?;
         let tick = self.scheduler.flush()?;
         self.unflushed = false;
         self.publish(fb, frame, tick, scale);
@@ -738,13 +741,26 @@ impl VulkanRasterizer {
         });
     }
 
+    /// Copies the GPU-written buffer ranges and images guest CPU reads come back to at the end of
+    /// the recorded work. Call right before it is submitted.
+    fn capture(&mut self) -> Result<()> {
+        self.buffer_cache.capture(&mut self.scheduler)?;
+        let mut tx = Transfer {
+            scheduler: &mut self.scheduler,
+            staging: &mut self.staging,
+            memory: &self.handles.device,
+            buffers: &mut self.buffer_cache,
+        };
+        self.texture_cache.capture(&mut tx)
+    }
+
     fn flush(&mut self) {
         if !self.unflushed {
             return;
         }
         self.unflushed = false;
-        if let Err(error) = self.buffer_cache.capture(&mut self.scheduler) {
-            tracing::error!(%error, "capturing GPU-written buffers failed");
+        if let Err(error) = self.capture() {
+            tracing::error!(%error, "capturing GPU-written buffers and images failed");
         }
         if let Err(error) = self.scheduler.flush() {
             tracing::error!(%error, "submitting GPU work failed");
@@ -787,6 +803,7 @@ impl VulkanRasterizer {
             texture_downloads = textures.downloads - a.textures.downloads,
             texture_download_bytes = textures.download_bytes - a.textures.download_bytes,
             texture_gpu_syncs = textures.gpu_syncs - a.textures.gpu_syncs,
+            texture_captured_downloads = textures.captured_downloads - a.textures.captured_downloads,
             buffer_upload_bytes = buffers.uploaded_bytes - a.buffers.uploaded_bytes,
             buffer_download_bytes = buffers.downloaded_bytes - a.buffers.downloaded_bytes,
             buffer_captured_bytes = buffers.captured_bytes - a.buffers.captured_bytes,
@@ -1049,7 +1066,7 @@ impl VulkanRasterizer {
             ImageAccess::TRANSFER_DST,
             ImageAccess::SHADER_READ,
         );
-        self.buffer_cache.capture(&mut self.scheduler)?;
+        self.capture()?;
         let tick = self.scheduler.flush()?;
         self.unflushed = false;
         self.publish(fb, frame, tick, ResolutionScale::X1);
@@ -1446,6 +1463,8 @@ impl Rasterizer for VulkanRasterizer {
             tracing::error!(%error, "flushing GPU-written buffers for a CPU read failed");
         }
         self.flush_region(addr, size);
+        self.buffer_cache
+            .disarm_written_back(addr, addr.saturating_add(size));
     }
 
     fn unmap_region(&mut self, addr: DAddr, size: u64) {

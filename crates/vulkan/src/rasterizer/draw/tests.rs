@@ -1129,6 +1129,75 @@ fn cpu_writes_beside_a_render_target_keep_its_texels() {
     f.assert_no_validation_errors();
 }
 
+/// Serves flush traps the way the GPU back does, on the test's thread: a guest CPU thread that
+/// meets one sends its range and waits for the reply.
+struct BackThread(
+    parking_lot::Mutex<std::sync::mpsc::Sender<(u64, u64, std::sync::mpsc::SyncSender<()>)>>,
+);
+
+impl lichii_memory::FlushTrapHandler for BackThread {
+    fn flush_for_cpu(&self, daddr: u64, size: u64) {
+        let (done, wait) = std::sync::mpsc::sync_channel(1);
+        self.0.lock().send((daddr, size, done)).unwrap();
+        let _ = wait.recv();
+    }
+}
+
+/// A guest CPU read of a render target a draw wrote gets the drawn texels: the read traps and
+/// the target is written back. Once read back, the target is copied when the work of its next
+/// draw is submitted, and the next read is served from that copy.
+#[test]
+fn cpu_reads_of_a_drawn_target_get_its_texels() {
+    const CPU_VA: u64 = 0x1000_0000;
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let space = cpu_space(&f, &[(CPU_VA, 0)], 0x1_0000);
+    let (requests, served) = std::sync::mpsc::channel();
+    f.memory
+        .set_flush_trap_handler(Some(Arc::new(BackThread(parking_lot::Mutex::new(
+            requests,
+        )))));
+    let read = || {
+        let (done, value) = std::sync::mpsc::channel();
+        let space = space.clone();
+        std::thread::spawn(move || done.send(space.read::<[u8; 4]>(CPU_VA).unwrap()));
+        value
+    };
+    let timeout = std::time::Duration::from_secs(5);
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    let regs = draw_regs();
+    for (values, colour, captured) in [
+        ([1.0, 0.5, 0.0, 1.0], ORANGE, 0),
+        ([0.0, 1.0, 1.0, 1.0], [0, 255, 255, 255], 1),
+    ] {
+        write(&f, FRAGMENT_CBUF, &f32_bytes(&values));
+        draw(&mut f, &gmmu, &regs);
+        f.rasterizer.flush_commands();
+        let reader = read();
+        let (daddr, size, done) = served.recv_timeout(timeout).expect("the read trapped");
+        assert_eq!(daddr, DADDR);
+        f.rasterizer.flush_for_cpu_read(daddr, size);
+        done.send(()).unwrap();
+        let texel = reader.recv_timeout(timeout).unwrap();
+        assert!(unorm8_eq(texel, colour), "{texel:?} {colour:?}");
+        assert_eq!(
+            f.rasterizer.texture_cache.traffic().captured_downloads,
+            captured
+        );
+        assert!(unorm8_eq(read().recv_timeout(timeout).unwrap(), colour));
+        assert!(
+            served.try_recv().is_err(),
+            "the written-back page traps no more"
+        );
+    }
+    f.assert_no_validation_errors();
+}
+
 /// A draw whose render-target registers did not change reuses the resolved targets, and
 /// resolves them again once a guest CPU write reached a target.
 #[test]

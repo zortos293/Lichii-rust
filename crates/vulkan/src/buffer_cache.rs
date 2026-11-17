@@ -1011,7 +1011,7 @@ impl BufferCache {
     }
 
     /// Ends the flush traps of the pages of `[daddr, end)` no GPU-written byte is left on.
-    fn disarm_written_back(&self, daddr: DAddr, end: DAddr) {
+    pub(crate) fn disarm_written_back(&self, daddr: DAddr, end: DAddr) {
         if !self.flush_traps {
             return;
         }
