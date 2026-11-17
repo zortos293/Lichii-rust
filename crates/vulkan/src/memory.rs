@@ -24,19 +24,25 @@ pub struct MemoryUsage {
     pub slack: u64,
 }
 
+/// Images at least this large get their own `VkDeviceMemory`, so evicting one returns its
+/// memory to the driver. Inside a shared 64 MiB block the space would only become allocator
+/// slack until the whole block empties, and under VRAM pressure that never happens (ZOR-384).
+const DEDICATED_IMAGE_BYTES: u64 = 8 << 20;
+
 fn allocate(
     device: &Device,
     name: &str,
     requirements: vk::MemoryRequirements,
     location: MemoryLocation,
     linear: bool,
+    allocation_scheme: AllocationScheme,
 ) -> Result<Allocation> {
     let allocation = device.allocator.lock().allocate(&AllocationCreateDesc {
         name,
         requirements,
         location,
         linear,
-        allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        allocation_scheme,
     })?;
     device
         .allocated
@@ -129,7 +135,14 @@ impl Buffer {
         };
         // SAFETY: `raw` was just created on this device.
         let requirements = unsafe { device.raw.get_buffer_memory_requirements(raw) };
-        let allocation = match allocate(device, name, requirements, location, true) {
+        let allocation = match allocate(
+            device,
+            name,
+            requirements,
+            location,
+            true,
+            AllocationScheme::GpuAllocatorManaged,
+        ) {
             Ok(allocation) => allocation,
             Err(error) => {
                 // SAFETY: the buffer is unused.
@@ -284,8 +297,19 @@ impl Image {
         let raw = unsafe { device.raw.create_image(&info, None).call("vkCreateImage")? };
         // SAFETY: `raw` was just created on this device.
         let requirements = unsafe { device.raw.get_image_memory_requirements(raw) };
-        let allocation = match allocate(device, name, requirements, MemoryLocation::GpuOnly, false)
-        {
+        let allocation_scheme = if requirements.size >= DEDICATED_IMAGE_BYTES {
+            AllocationScheme::DedicatedImage(raw)
+        } else {
+            AllocationScheme::GpuAllocatorManaged
+        };
+        let allocation = match allocate(
+            device,
+            name,
+            requirements,
+            MemoryLocation::GpuOnly,
+            false,
+            allocation_scheme,
+        ) {
             Ok(allocation) => allocation,
             Err(error) => {
                 // SAFETY: the image is unused.
@@ -442,6 +466,7 @@ impl Image {
                     },
                     MemoryLocation::GpuOnly,
                     false,
+                    AllocationScheme::GpuAllocatorManaged,
                 )?;
                 image_binds.push(
                     vk::SparseImageMemoryBind::default()
@@ -467,6 +492,7 @@ impl Image {
                     },
                     MemoryLocation::GpuOnly,
                     false,
+                    AllocationScheme::GpuAllocatorManaged,
                 )?;
                 opaque_binds.push(
                     vk::SparseMemoryBind::default()
