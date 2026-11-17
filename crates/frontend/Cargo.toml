@@ -34,3 +34,6 @@ zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 [dev-dependencies]
 lichii-kernel = { workspace = true, features = ["testing"] }
 lichii-loader = { workspace = true, features = ["testing"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Media"] }
