@@ -4505,7 +4505,8 @@ mod tests {
 
     /// Binds of a typical Mario Kart World draw: two scene uniforms at fixed addresses, three
     /// per-object uniforms and a per-object storage read that move with the object, and one
-    /// fixed storage read, in a frame where GPU work wrote other buffers. Over big pages and over
+    /// fixed storage read, in a frame where GPU work wrote other buffers; then a 64 KiB uniform
+    /// the guest writes a page of before every draw. Over big pages and over
     /// a table split into scattered 16 KiB runs:
     /// `cargo test --release -p lichii-vulkan --lib bind_cost -- --ignored --nocapture`.
     #[test]
@@ -4532,6 +4533,7 @@ mod tests {
         for (name, base) in [("big pages", big), ("scattered 16 KiB runs", small)] {
             let mut uniform_ns = Vec::new();
             let mut storage_ns = Vec::new();
+            let mut dirty_ns = Vec::new();
             for frame in 0..=FRAMES {
                 let start = Instant::now();
                 for object in 0..OBJECTS {
@@ -4568,19 +4570,39 @@ mod tests {
                     }
                 }
                 let storage = start.elapsed().as_nanos() as f64 / OBJECTS as f64;
+                let start = Instant::now();
+                for object in 0..OBJECTS {
+                    let cbuf = base + 0x3c_0000;
+                    let page = cbuf + (object % 16) * PAGE_SIZE;
+                    if let Some(daddr) = walked(&f.gmmu, page, 0x100) {
+                        f.cache.invalidate(daddr, 0x100);
+                    }
+                    f.cache
+                        .uniform_buffer(&mut f.scheduler, &mut f.staging, &f.gmmu, cbuf, 0x10000)
+                        .unwrap()
+                        .unwrap();
+                }
+                let dirty = start.elapsed().as_nanos() as f64 / OBJECTS as f64;
                 f.scheduler.finish().unwrap();
                 if frame > 0 {
                     uniform_ns.push(uniforms);
                     storage_ns.push(storage);
+                    dirty_ns.push(dirty);
                 }
             }
             uniform_ns.sort_by(f64::total_cmp);
             storage_ns.sort_by(f64::total_cmp);
+            dirty_ns.sort_by(f64::total_cmp);
             let half = uniform_ns.len() / 2;
             eprintln!(
                 "{name}: per draw (best / median frame), 5 uniform binds {:.0} / {:.0} ns, \
-                 2 storage binds {:.0} / {:.0} ns",
-                uniform_ns[0], uniform_ns[half], storage_ns[0], storage_ns[half],
+                 2 storage binds {:.0} / {:.0} ns, 1 CPU-written 64 KiB uniform {:.0} / {:.0} ns",
+                uniform_ns[0],
+                uniform_ns[half],
+                storage_ns[0],
+                storage_ns[half],
+                dirty_ns[0],
+                dirty_ns[half],
             );
         }
         f.assert_no_validation_errors();
