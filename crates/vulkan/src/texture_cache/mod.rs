@@ -665,6 +665,9 @@ pub struct TextureCache {
     /// Host images replaced by a rescale, and resolution scale changes, so far.
     replacements: u64,
     ids: Vec<ImageId>,
+    /// The overlaps [`TextureCache::rearm`] collects, apart from `ids`, which its callers may
+    /// be holding.
+    rearm_ids: Vec<ImageId>,
     joins: Vec<(ImageId, u32, u32)>,
     new_aliases: Vec<Alias>,
     alias_scratch: Vec<Alias>,
@@ -1058,6 +1061,7 @@ impl TextureCache {
             creations: 0,
             replacements: 0,
             ids: Vec::new(),
+            rearm_ids: Vec::new(),
             joins: Vec::new(),
             new_aliases: Vec::new(),
             alias_scratch: Vec::new(),
@@ -3123,10 +3127,13 @@ impl TextureCache {
 
     /// Lands the bytes GPU work wrote to buffers over `id` in guest memory, so the image's own
     /// texels, uploaded now or written back later, are the newer ones.
-    fn flush_buffered(&self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
-        for segment in &self.get(id).expect("a live image id").segments {
-            tx.buffers
-                .flush(tx.scheduler, segment.daddr, segment.size)?;
+    fn flush_buffered(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
+        for i in 0..self.image(id).segments.len() {
+            let Segment { daddr, size, .. } = self.image(id).segments[i];
+            if tx.buffers.is_gpu_written(daddr, size) {
+                tx.buffers.flush(tx.scheduler, daddr, size)?;
+                self.rearm(daddr, daddr + size);
+            }
         }
         Ok(())
     }
@@ -3457,6 +3464,7 @@ impl TextureCache {
             return;
         }
         let start = daddr & !(PAGE_SIZE - 1);
+        std::mem::swap(&mut self.ids, &mut self.rearm_ids);
         self.collect_overlaps(&[Segment {
             offset: 0,
             daddr: start,
@@ -3471,6 +3479,7 @@ impl TextureCache {
                 }
             }
         }
+        std::mem::swap(&mut self.ids, &mut self.rearm_ids);
     }
 
     /// Ends the flush traps of the whole pages image `id`, just written back, covers, unless a
