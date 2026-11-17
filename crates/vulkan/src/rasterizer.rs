@@ -1783,6 +1783,12 @@ mod tests {
     }
 
     pub(super) fn fixture(gob_layout: GobLayout) -> Option<Fixture> {
+        fixture_with(gob_layout, true)
+    }
+
+    /// A fixture whose device reports no push descriptors without `push_descriptors`, so every
+    /// pipeline layout writes allocated sets.
+    pub(super) fn fixture_with(gob_layout: GobLayout, push_descriptors: bool) -> Option<Fixture> {
         let instance = match Instance::new(true, SurfaceSupport::None) {
             Ok(instance) => Arc::new(instance),
             Err(error) => {
@@ -1790,13 +1796,19 @@ mod tests {
                 return None;
             }
         };
-        let device = match Device::new(instance, &GraphicsSettings::default(), None) {
+        let mut device = match Device::new(instance, &GraphicsSettings::default(), None) {
             Ok(device) => device,
             Err(error) => {
                 eprintln!("skipping: {error}");
                 return None;
             }
         };
+        if !push_descriptors {
+            Arc::get_mut(&mut device)
+                .expect("nothing shares the new device")
+                .properties
+                .max_push_descriptors = 0;
+        }
         let physical = Arc::new(PhysicalMemory::new(DRAM).unwrap());
         physical.commit(0, DRAM).unwrap();
         let memory = Arc::new(DeviceAddressSpace::new(physical, 36));

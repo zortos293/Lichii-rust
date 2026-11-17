@@ -27,6 +27,16 @@ const fn pool_size(ty: vk::DescriptorType, descriptor_count: u32) -> vk::Descrip
     }
 }
 
+/// One descriptor of a [`crate::pipeline::cache::SetTemplate`]'s data: the info its
+/// descriptor type reads. Every entry has this stride, so one array holds a whole set.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union DescriptorInfo {
+    pub image: vk::DescriptorImageInfo,
+    pub buffer: vk::DescriptorBufferInfo,
+    pub texel: vk::BufferView,
+}
+
 /// Hands out descriptor sets for one scheduler's command stream. Sets live until the tick they
 /// were allocated in completes; then their whole pool is reset in one call, so no set is ever
 /// freed individually.

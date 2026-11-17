@@ -173,6 +173,10 @@ pub struct DeviceProperties {
     pub mesh_group_limit: [u32; 2],
     /// Linking pipelines from graphics pipeline libraries is fast enough to do at draw time.
     pub fast_pipeline_linking: bool,
+    /// The most descriptors a push descriptor set layout holds (0 without
+    /// `VK_KHR_push_descriptor`). Pipeline layouts whose set 0 holds more write it to allocated
+    /// sets instead.
+    pub max_push_descriptors: u32,
 }
 
 /// The logical device, its single universal queue and the memory allocator. Shared between
@@ -634,6 +638,7 @@ impl Device {
         let mut mesh_properties = vk::PhysicalDeviceMeshShaderPropertiesEXT::default();
         let mut library_properties =
             vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT::default();
+        let mut push_properties = vk::PhysicalDevicePushDescriptorPropertiesKHR::default();
         let mut properties2 = vk::PhysicalDeviceProperties2::default()
             .push_next(&mut v11_properties)
             .push_next(&mut v12_properties)
@@ -643,6 +648,9 @@ impl Device {
         }
         if features.graphics_pipeline_library {
             properties2 = properties2.push_next(&mut library_properties);
+        }
+        if features.extensions.push_descriptor {
+            properties2 = properties2.push_next(&mut push_properties);
         }
         // SAFETY: valid physical device and queue family.
         let (queue, families, memory_properties) = unsafe {
@@ -682,6 +690,7 @@ impl Device {
             ],
             fast_pipeline_linking: library_properties.graphics_pipeline_library_fast_linking
                 != vk::FALSE,
+            max_push_descriptors: push_properties.max_push_descriptors,
         };
         tracing::info!(
             "Vulkan device: {} ({:?}, driver {:?}, API {}.{}.{})",

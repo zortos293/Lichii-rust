@@ -27,7 +27,9 @@ use lichii_shader::maxwell::opcode::Opcode;
 use lichii_shader::{DescriptorKind, ShaderStage};
 use lichii_texture::block_linear::{GobLayout, Tiling, swizzle};
 
-use super::super::tests::{DADDR, Fixture, GPU_VA, fixture, gmmu, guest_linear, unorm8_eq};
+use super::super::tests::{
+    DADDR, Fixture, GPU_VA, fixture, fixture_with, gmmu, guest_linear, unorm8_eq,
+};
 use super::{StageSources, Warning};
 use crate::device::DeviceFeatures;
 use crate::pipeline::environment::TexturePool;
@@ -166,7 +168,12 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
 
 /// Memory for `draw_regs`: the vertices, both constant buffers and the vertex program.
 fn draw_fixture() -> Option<(Fixture, Arc<Gmmu>)> {
-    let mut f = fixture(GobLayout::Tegra)?;
+    draw_fixture_with(true)
+}
+
+/// `draw_fixture` on a device that reports no push descriptors without `push_descriptors`.
+fn draw_fixture_with(push_descriptors: bool) -> Option<(Fixture, Arc<Gmmu>)> {
+    let mut f = fixture_with(GobLayout::Tegra, push_descriptors)?;
     f.rasterizer.draw.pipelines.set_async_compilation(false);
     let gmmu = gmmu(&f);
     write(
@@ -2844,6 +2851,54 @@ fn draws_mark_the_pages_of_their_writable_storage_buffers() {
     f.assert_no_validation_errors();
 }
 
+/// Asserts the fixture's layouts push their descriptors exactly when it asked for push
+/// descriptors and the device has them.
+fn assert_descriptor_path(f: &Fixture, push_descriptors: bool) {
+    let device = &f.rasterizer.device;
+    assert_eq!(
+        device.properties.max_push_descriptors > 0,
+        push_descriptors && device.features.extensions.push_descriptor,
+    );
+}
+
+#[test]
+fn draws_bind_the_same_descriptors_pushed_or_written_to_sets() {
+    for push in [true, false] {
+        let Some((mut f, gmmu)) = draw_fixture_with(push) else {
+            return;
+        };
+        assert_descriptor_path(&f, push);
+        write(&f, PROGRAMS + u64::from(FRAGMENT), &sampling_program());
+        uniform_texture(&f, 0, TEXTURE, [10, 200, 30, 255]);
+        draw(&mut f, &gmmu, &sampling_regs());
+        assert!(
+            target(&mut f).iter().all(|&t| t == [10, 200, 30, 255]),
+            "push {push}: the vertex uniform buffer places the triangle and the texture fills it"
+        );
+        f.assert_no_validation_errors();
+        drop(f);
+
+        let Some((mut f, gmmu)) = draw_fixture_with(push) else {
+            return;
+        };
+        let buffer = SSBO + PAGE;
+        let mut binding = (GPU_VA + buffer).to_le_bytes().to_vec();
+        binding.extend_from_slice(&0x100u32.to_le_bytes());
+        write(&f, FRAGMENT_CBUF + 0x110, &binding);
+        write(&f, PROGRAMS + u64::from(FRAGMENT), &storing_program());
+        draw(&mut f, &gmmu, &draw_regs());
+        f.rasterizer.flush_region(DADDR + buffer, 4);
+        let mut word = [0; 4];
+        f.memory.read_bytes(DADDR + buffer, &mut word).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(word),
+            0xdead_beef,
+            "push {push}: the program stored through its storage buffer"
+        );
+        f.assert_no_validation_errors();
+    }
+}
+
 #[test]
 fn draws_clears_and_texture_draws_mark_their_targets() {
     let Some((mut f, gmmu)) = draw_fixture() else {
@@ -3543,6 +3598,22 @@ fn counted(f: &mut Fixture) -> [u32; 2] {
         .read_bytes(DADDR + COUNTER, bytemuck::cast_slice_mut(&mut words))
         .unwrap();
     words
+}
+
+#[test]
+fn dispatches_bind_the_same_descriptors_pushed_or_written_to_sets() {
+    for push in [true, false] {
+        let Some((mut f, gmmu)) = draw_fixture_with(push) else {
+            return;
+        };
+        assert_descriptor_path(&f, push);
+        write(&f, COUNTING, &counting_program());
+        storage_binding(&f, COUNTER_CBUF, COUNTER);
+        write(&f, COUNTER, &[0; 8]);
+        launch(&mut f, &gmmu, COUNTING, COUNTER_CBUF, [2, 3, 1], None);
+        assert_eq!(counted(&mut f), [6, 2 * (1 + 2)], "push {push}");
+        f.assert_no_validation_errors();
+    }
 }
 
 #[test]

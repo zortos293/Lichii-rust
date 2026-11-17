@@ -46,6 +46,9 @@ pub struct Scheduler {
     renderings: u64,
     /// The command buffer and fence of [`Scheduler::run_aside`], made on first use.
     aside: Option<(vk::CommandBuffer, vk::Fence)>,
+    /// A timeline semaphore each [`Scheduler::submit_part`] signals the next value of.
+    parts: vk::Semaphore,
+    part: u64,
 }
 
 /// The attachments and area of a dynamic rendering. Draws whose key matches the open
@@ -81,6 +84,13 @@ impl Scheduler {
             raw,
         });
         // SAFETY: valid create info on a live device.
+        let parts = unsafe {
+            device
+                .raw
+                .create_semaphore(&semaphore_info, None)
+                .call("vkCreateSemaphore")?
+        };
+        // SAFETY: valid create info on a live device.
         let pool = unsafe {
             device
                 .raw
@@ -102,6 +112,8 @@ impl Scheduler {
             rendering: None,
             renderings: 0,
             aside: None,
+            parts,
+            part: 0,
         })
     }
 
@@ -232,10 +244,77 @@ impl Scheduler {
         waits: &[SemaphoreWait],
         signals: &[vk::Semaphore],
     ) -> Result<u64> {
+        let tick = self.tick;
+        let mut signal_infos = vec![
+            vk::SemaphoreSubmitInfo::default()
+                .semaphore(self.timeline.raw)
+                .value(tick)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
+        ];
+        signal_infos.extend(signals.iter().map(|&s| {
+            vk::SemaphoreSubmitInfo::default()
+                .semaphore(s)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        }));
+        let bound = self.bound.take();
+        self.submit(waits, bound, &signal_infos)?;
+        self.tick += 1;
+        Ok(tick)
+    }
+
+    /// Submits the work recorded so far without ending the tick, and returns the part
+    /// [`Scheduler::wait_part`] waits for. Everything tagged with or retired against the tick
+    /// stays alive until the tick's own submission completes, so an operation still being set up
+    /// can submit in the middle: allocations it made earlier and has not recorded its use of yet
+    /// stay valid. Commands recorded later go to a new command buffer of the same tick.
+    pub fn submit_part(&mut self) -> Result<u64> {
+        let part = self.part + 1;
+        let signal = [vk::SemaphoreSubmitInfo::default()
+            .semaphore(self.parts)
+            .value(part)
+            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+        self.submit(&[], self.bound, &signal)?;
+        self.part = part;
+        Ok(part)
+    }
+
+    /// Blocks until the work [`Scheduler::submit_part`] submitted as `part` finished.
+    pub fn wait_part(&mut self, part: u64) -> Result<()> {
+        // SAFETY: the semaphore belongs to this scheduler.
+        if unsafe { self.device.raw.get_semaphore_counter_value(self.parts) }
+            .is_ok_and(|done| done >= part)
+        {
+            return Ok(());
+        }
         if crate::debug::device_is_lost() {
             return Err(Error::DeviceLost);
         }
-        let tick = self.tick;
+        let semaphores = [self.parts];
+        let values = [part];
+        let info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+        let _waiting = self.activity.as_deref().map(|a| a.waiting(Wait::HostGpu));
+        // SAFETY: the semaphore belongs to this scheduler and `part` was submitted.
+        unsafe {
+            self.device
+                .raw
+                .wait_semaphores(&info, u64::MAX)
+                .call("vkWaitSemaphores")
+        }
+    }
+
+    /// Ends and submits the command buffer being recorded (possibly none) after `waits` and
+    /// the sparse binding `bound`, signalling `signals`.
+    fn submit(
+        &mut self,
+        waits: &[SemaphoreWait],
+        bound: Option<u64>,
+        signals: &[vk::SemaphoreSubmitInfo<'_>],
+    ) -> Result<()> {
+        if crate::debug::device_is_lost() {
+            return Err(Error::DeviceLost);
+        }
         if let Some(cmd) = self.current {
             self.end_rendering(cmd);
         }
@@ -249,7 +328,7 @@ impl Scheduler {
                     .call("vkEndCommandBuffer")?
             };
         }
-        let bound = self.bound.take().map(|value| SemaphoreWait {
+        let bound = bound.map(|value| SemaphoreWait {
             semaphore: self.timeline.raw,
             value,
             stage: vk::PipelineStageFlags2::ALL_COMMANDS,
@@ -264,17 +343,6 @@ impl Scheduler {
                     .stage_mask(w.stage)
             })
             .collect();
-        let mut signal_infos = vec![
-            vk::SemaphoreSubmitInfo::default()
-                .semaphore(self.timeline.raw)
-                .value(tick)
-                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
-        ];
-        signal_infos.extend(signals.iter().map(|&s| {
-            vk::SemaphoreSubmitInfo::default()
-                .semaphore(s)
-                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-        }));
         let cmd_infos: Vec<_> = cmd
             .iter()
             .map(|&c| vk::CommandBufferSubmitInfo::default().command_buffer(c))
@@ -282,13 +350,12 @@ impl Scheduler {
         let submit = vk::SubmitInfo2::default()
             .wait_semaphore_infos(&wait_infos)
             .command_buffer_infos(&cmd_infos)
-            .signal_semaphore_infos(&signal_infos);
+            .signal_semaphore_infos(signals);
         self.device.submit(&[submit], vk::Fence::null())?;
         if let Some(cmd) = cmd {
-            self.in_flight.push_back((tick, cmd));
+            self.in_flight.push_back((self.tick, cmd));
         }
-        self.tick += 1;
-        Ok(tick)
+        Ok(())
     }
 
     /// Binds sparse memory to `image` after the work recorded so far and before any recorded
@@ -488,7 +555,7 @@ impl Drop for Scheduler {
             let _ = self.flush();
         }
         let last = self.tick - 1;
-        if let Err(error) = self.wait(last) {
+        if let Err(error) = self.wait(last).and_then(|()| self.wait_part(self.part)) {
             tracing::error!("waiting for the GPU on shutdown: {error}");
             self.device.wait_idle();
         }
@@ -498,6 +565,7 @@ impl Drop for Scheduler {
             if let Some((_, fence)) = self.aside {
                 self.device.raw.destroy_fence(fence, None);
             }
+            self.device.raw.destroy_semaphore(self.parts, None);
             self.device.raw.destroy_command_pool(self.pool, None);
         }
     }

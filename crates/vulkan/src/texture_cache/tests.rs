@@ -6067,3 +6067,278 @@ fn cube_tail_targets_retire_drawn_single_level_images_the_cube_took_texels_from(
         f.assert_no_validation_errors();
     }
 }
+
+/// A block-linear texture header of `texture_type` (1 2D, 2 3D, 5 2D array) whose `depth` is the
+/// layer count or the 3D depth.
+#[allow(clippy::too_many_arguments)]
+fn tic_typed(
+    format: u32,
+    texture_type: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+    levels: u32,
+    block_height_log2: u32,
+    block_depth_log2: u32,
+) -> TicEntry {
+    let mut entry = tic(
+        format,
+        GPU_VA,
+        width,
+        height,
+        depth,
+        levels,
+        block_height_log2,
+    );
+    entry.0[3] |= block_depth_log2 << 6;
+    entry.0[4] = (width - 1) | texture_type << 23;
+    entry
+}
+
+/// One upload case of [`gpu_untiling_uploads_the_bytes_the_cpu_path_does`].
+struct UntileCase {
+    raw: u32,
+    format: PixelFormat,
+    texture_type: u32,
+    size: (u32, u32, u32),
+    levels: u32,
+    block: (u32, u32),
+    gob: GobLayout,
+}
+
+impl UntileCase {
+    fn surface(&self) -> SurfaceLayout {
+        let three_d = self.texture_type == 2;
+        let (w, h, d) = self.size;
+        SurfaceLayout {
+            format: self.format,
+            width: w,
+            height: h,
+            depth: if three_d { d } else { 1 },
+            levels: self.levels,
+            layers: if three_d { 1 } else { d },
+            block_height_log2: self.block.0,
+            block_depth_log2: self.block.1,
+            tile_width_spacing: 0,
+            layout: self.gob,
+        }
+    }
+
+    /// Uploads the case with the untiling on the GPU or on the CPU; the texels and the
+    /// subresources the GPU untiled.
+    fn upload(&self, on_gpu: bool) -> Option<(Vec<Vec<u8>>, u64)> {
+        let mut f = fixture(self.gob, AstcRecompression::Uncompressed)?;
+        f.cache.unswizzle_on_gpu = on_gpu;
+        let s = self.surface();
+        write_surface(&f.memory, &s, &level_data(&s, self.raw));
+        let (w, h, d) = self.size;
+        let header = tic_typed(
+            self.raw,
+            self.texture_type,
+            w,
+            h,
+            d,
+            self.levels,
+            self.block.0,
+            self.block.1,
+        );
+        let (id, _) = f.texture(&header);
+        let texels = f.read_image(id);
+        f.assert_no_validation_errors();
+        Some((texels, f.cache.traffic().gpu_untiled))
+    }
+}
+
+#[test]
+fn gpu_untiling_uploads_the_bytes_the_cpu_path_does() {
+    let case = |raw, format, texture_type, size, levels, block, gob| UntileCase {
+        raw,
+        format,
+        texture_type,
+        size,
+        levels,
+        block,
+        gob,
+    };
+    let cases = [
+        case(
+            0x08,
+            PixelFormat::A8B8G8R8Unorm,
+            5,
+            (70, 40, 3),
+            4,
+            (2, 0),
+            GobLayout::Tegra,
+        ),
+        case(
+            0x08,
+            PixelFormat::A8B8G8R8Unorm,
+            5,
+            (70, 40, 3),
+            4,
+            (2, 0),
+            GobLayout::Switch2,
+        ),
+        case(
+            0x08,
+            PixelFormat::A8B8G8R8Unorm,
+            2,
+            (32, 16, 20),
+            3,
+            (1, 2),
+            GobLayout::Tegra,
+        ),
+        case(
+            0x1d,
+            PixelFormat::R8Unorm,
+            1,
+            (100, 33, 1),
+            4,
+            (1, 0),
+            GobLayout::Tegra,
+        ),
+        case(
+            0x18,
+            PixelFormat::R8G8Unorm,
+            1,
+            (50, 30, 1),
+            3,
+            (3, 0),
+            GobLayout::Switch2,
+        ),
+        case(
+            0x24,
+            PixelFormat::Bc1RgbaUnorm,
+            1,
+            (256, 128, 1),
+            4,
+            (3, 0),
+            GobLayout::Tegra,
+        ),
+        case(
+            0x24,
+            PixelFormat::Bc1RgbaUnorm,
+            5,
+            (64, 64, 2),
+            2,
+            (2, 0),
+            GobLayout::Switch2,
+        ),
+        case(
+            0x17,
+            PixelFormat::Bc7Unorm,
+            1,
+            (96, 64, 1),
+            3,
+            (2, 0),
+            GobLayout::Tegra,
+        ),
+        case(
+            0x44,
+            PixelFormat::Astc8x8Unorm,
+            1,
+            (80, 48, 1),
+            2,
+            (1, 0),
+            GobLayout::Tegra,
+        ),
+    ];
+    for c in &cases {
+        let Some((gpu, untiled)) = c.upload(true) else {
+            return;
+        };
+        let (cpu, none) = c.upload(false).expect("the device came up once");
+        assert_eq!(
+            none, 0,
+            "{:?}: the CPU path untiles nothing on the GPU",
+            c.format
+        );
+        assert_eq!(gpu.len(), cpu.len());
+        for (i, (got, want)) in gpu.iter().zip(&cpu).enumerate() {
+            assert!(
+                got == want,
+                "{:?} {:?} {:?}: subresource {i} differs",
+                c.format,
+                c.size,
+                c.gob
+            );
+        }
+        let s = c.surface();
+        let fits = (0..s.levels)
+            .filter(|&level| {
+                let tiling = s.level_tiling(level);
+                (tiling.width * tiling.bytes_per_block).is_multiple_of(4)
+            })
+            .count() as u64
+            * u64::from(s.layers);
+        let f = fixture(c.gob, AstcRecompression::Uncompressed).expect("the device came up once");
+        let host = host_format(&f.device, c.format, AstcRecompression::Uncompressed);
+        let direct = host.conversion == Conversion::None
+            || c.format.is_astc() && host.conversion == Conversion::Decode;
+        let expected = if direct { fits } else { 0 };
+        assert_eq!(
+            untiled, expected,
+            "{:?} {:?}: every level with word rows untiles on the GPU",
+            c.format, c.size
+        );
+    }
+}
+
+#[test]
+#[ignore = "microbenchmark: cargo test --release -p lichii-vulkan --lib -- --ignored --nocapture untiling_cost"]
+fn measures_untiling_cost_on_the_back() {
+    let cases = [
+        (
+            "1024x1024 RGBA8",
+            0x08,
+            PixelFormat::A8B8G8R8Unorm,
+            1024,
+            1024,
+            4,
+        ),
+        (
+            "2048x1024 BC1",
+            0x24,
+            PixelFormat::Bc1RgbaUnorm,
+            2048,
+            1024,
+            4,
+        ),
+        ("1024x1024 BC7", 0x17, PixelFormat::Bc7Unorm, 1024, 1024, 4),
+    ];
+    for (name, raw, format, w, h, bh) in cases {
+        for on_gpu in [false, true] {
+            let Some(mut f) = fixture(GobLayout::Switch2, AstcRecompression::Uncompressed) else {
+                return;
+            };
+            f.cache.unswizzle_on_gpu = on_gpu;
+            let s = surface(format, w, h, 1, 1, bh, GobLayout::Switch2);
+            let data = level_data(&s, 3);
+            write_surface(&f.memory, &s, &data);
+            let header = tic(raw, GPU_VA, w, h, 1, 1, bh);
+            f.texture(&header);
+            f.scheduler.finish().unwrap();
+            let bytes = s.level_tiling(0).linear_size_bytes() as u64;
+            let rounds = 30;
+            let mut spent = std::time::Duration::ZERO;
+            for _ in 0..rounds {
+                {
+                    let (mut tx, cache, _) = f.tx();
+                    cache.invalidate(&mut tx, DADDR, 4).unwrap();
+                }
+                let start = Instant::now();
+                f.texture(&header);
+                spent += start.elapsed();
+                f.scheduler.finish().unwrap();
+            }
+            let per = spent.as_secs_f64() / f64::from(rounds);
+            eprintln!(
+                "{name} ({:.1} MB), untiled on the {}: {:.3} ms of back time per upload ({:.2} GB/s)",
+                bytes as f64 / 1e6,
+                if on_gpu { "GPU" } else { "CPU" },
+                per * 1e3,
+                bytes as f64 / per / 1e9
+            );
+        }
+    }
+}
