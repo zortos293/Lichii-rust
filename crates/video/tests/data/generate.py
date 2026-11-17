@@ -2,7 +2,7 @@
 """Regenerates the synthetic test streams in this directory.
 
 Each stream encodes six 64x48 frames whose four 32x24 quadrants are flat colours that change with
-the frame index (see quadrant() and tests/decode.rs). Needs the ffmpeg CLI with libvpx, libx264 and libaom.
+the frame index (see quadrant() and tests/decode.rs). Needs the ffmpeg CLI with libvpx, libx264, libx265 and libaom.
 """
 
 import os
@@ -36,6 +36,10 @@ STREAMS = {
         "-f", "ivf",
     ],
     "quadrants.vp8.ivf": ["-c:v", "libvpx", "-qmin", "0", "-qmax", "2", "-b:v", "2M", "-f", "ivf"],
+    "quadrants.hevc": [
+        "-c:v", "libx265", "-x265-params", "lossless=1:bframes=0:keyint=6:aud=1:log-level=error",
+        "-f", "hevc",
+    ],
     "quadrants.h264": [
         "-c:v", "libx264", "-profile:v", "high", "-qp", "1", "-bf", "2", "-g", "6",
         "-x264-params", "b-pyramid=0:open-gop=0", "-bsf:v", "h264_metadata=aud=insert",

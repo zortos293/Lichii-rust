@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Cross-builds the FFmpeg DLLs Lichii loads on Windows (avcodec and avutil) with mingw-w64.
 #
-# The build is LGPL-2.1-or-later: decoders only (H.264, VP8, VP9, and AV1 through dav1d), no
+# The build is LGPL-2.1-or-later: decoders only (H.264, HEVC, VP8, VP9, and AV1 through dav1d), no
 # --enable-gpl and no --enable-nonfree. dav1d (BSD-2-Clause) is the one external library, linked
 # statically into avcodec, because FFmpeg's own AV1 decoder only decodes through a GPU hwaccel.
 # The output directory gets the DLLs, both licences and a source note naming the exact sources and
@@ -30,7 +30,7 @@ CONFIGURE=(
     --disable-programs --disable-doc --disable-network --disable-debug
     --disable-everything --disable-avdevice --disable-avformat --disable-avfilter
     --disable-swscale --disable-swresample
-    --enable-libdav1d --enable-decoder=h264,vp8,vp9,libdav1d
+    --enable-libdav1d --enable-decoder=h264,hevc,vp8,vp9,libdav1d
     --pkg-config=pkg-config --pkg-config-flags=--static
     --extra-ldflags=-static-libgcc
 )

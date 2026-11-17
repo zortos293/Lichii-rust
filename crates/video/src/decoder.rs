@@ -17,6 +17,8 @@ use crate::ffmpeg::{
 pub enum Codec {
     /// H.264 (AVC), Annex B byte stream.
     H264,
+    /// H.265 (HEVC), Annex B byte stream.
+    Hevc,
     Vp8,
     Vp9,
     /// AV1 temporal units of low-overhead OBUs, decoded by dav1d through FFmpeg.
@@ -33,6 +35,8 @@ impl Codec {
             Some(Self::Vp8)
         } else if mime.contains("av01") || mime.contains("av1") {
             Some(Self::Av1)
+        } else if mime.contains("hevc") || mime.contains("265") {
+            Some(Self::Hevc)
         } else if mime.contains("avc") || mime.contains("264") {
             Some(Self::H264)
         } else {
@@ -45,6 +49,7 @@ impl Codec {
     fn decoder_names(self) -> &'static [&'static CStr] {
         match self {
             Self::H264 => &[c"h264"],
+            Self::Hevc => &[c"hevc"],
             Self::Vp8 => &[c"vp8"],
             Self::Vp9 => &[c"vp9"],
             Self::Av1 => &[c"libdav1d", c"libaom-av1"],
@@ -426,6 +431,7 @@ mod tests {
         assert_eq!(Codec::from_mime("video/H264"), Some(Codec::H264));
         assert_eq!(Codec::from_mime("video/av01"), Some(Codec::Av1));
         assert_eq!(Codec::from_mime("video/AV1"), Some(Codec::Av1));
-        assert_eq!(Codec::from_mime("video/hevc"), None);
+        assert_eq!(Codec::from_mime("video/hevc"), Some(Codec::Hevc));
+        assert_eq!(Codec::from_mime("video/H265"), Some(Codec::Hevc));
     }
 }
