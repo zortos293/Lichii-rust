@@ -1976,13 +1976,17 @@ impl TextureCache {
             && own.compression() == format.compression()
     }
 
-    /// Whether `image` can be copied into a new image of `format` on the GPU.
+    /// Whether `image` can be copied into a new image of `format` on the GPU. Depth images of
+    /// one guest format share their host fallback's texels too, as X8D24 kept in D32 does where
+    /// the host has no X8D24 attachment (RADV).
     fn copy_compatible(image: &CachedImage, host: HostFormat, format: PixelFormat) -> bool {
         let own = image.info.format;
         let aspects_match = own.is_color() == format.is_color()
             && (own.is_color() || image.host.format == host.format);
-        image.host.conversion == Conversion::None
-            && host.conversion == Conversion::None
+        let unconverted =
+            image.host.conversion == Conversion::None && host.conversion == Conversion::None;
+        let converted_alike = !own.is_color() && own == format;
+        (unconverted || converted_alike)
             && aspects_match
             && own.bytes_per_block() == format.bytes_per_block()
             && own.block_width() == format.block_width()
