@@ -797,7 +797,7 @@ fn condition_shape(
         writes.clear();
         let mut condition = ReadCondition::new(differs == 1);
         let mut host = ConditionHost {
-            engine: &*engine,
+            engine,
             ctx: &mut *ctx,
             writes,
         };
@@ -807,9 +807,7 @@ fn condition_shape(
         {
             return None;
         }
-        let Some(tested) = condition.tested() else {
-            return None;
-        };
+        let tested = condition.tested()?;
         let mut words = [None; 2];
         for (address, expected) in tested {
             let first = *words[0].get_or_insert(address);
@@ -825,9 +823,7 @@ fn condition_shape(
         }
         count = words[0];
     }
-    let Some(count) = count else {
-        return None;
-    };
+    let count = count?;
     let [zero, nonzero] = &*writes;
     if zero.len() != nonzero.len() {
         return None;
