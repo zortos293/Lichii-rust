@@ -11,15 +11,23 @@ pub mod renderdoc;
 pub(crate) mod shader_dump;
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+use ash::vk;
 
 use lichii_common::settings::DebugSettings;
 
 pub(crate) use labels::{Program, Programs};
 
+use crate::error::VkResultExt;
+
 static LABELS: AtomicBool = AtomicBool::new(false);
 static FAULT_REPORT: AtomicBool = AtomicBool::new(false);
-static DEVICE_LOST: AtomicBool = AtomicBool::new(false);
+static DEVICE: AtomicU8 = AtomicU8::new(HEALTHY);
+
+const HEALTHY: u8 = 0;
+const LOST: u8 = 1;
+const REPORTED: u8 = 2;
 
 /// Sets up the tools `settings` turns on: loads RenderDoc (also when
 /// `LICHII_RENDERDOC_CAPTURE_FRAME` asks for captures), enables Aftermath crash dumps into a new
@@ -53,10 +61,13 @@ pub(crate) fn fault_report_requested() -> bool {
     FAULT_REPORT.load(Ordering::Relaxed)
 }
 
-/// Logs the loss of the device once, reports the fault and, with Aftermath on, waits for its
-/// crash dump.
-pub(crate) fn device_lost() {
-    if DEVICE_LOST.swap(true, Ordering::Relaxed) {
+/// Marks the device lost, so the renderer records, submits and reads back nothing more, then
+/// logs the loss once, reports the fault and, with Aftermath on, waits for its crash dump.
+pub(crate) fn lose_device() {
+    if DEVICE
+        .compare_exchange(HEALTHY, LOST, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
         return;
     }
     tracing::error!("the Vulkan device was lost");
@@ -64,4 +75,24 @@ pub(crate) fn device_lost() {
     if let Some(aftermath) = aftermath::get() {
         aftermath.wait_for_dump();
     }
+    DEVICE.store(REPORTED, Ordering::Release);
+}
+
+/// Whether a Vulkan call returned `VK_ERROR_DEVICE_LOST`, even while its fault report is being
+/// written.
+pub(crate) fn device_is_lost() -> bool {
+    DEVICE.load(Ordering::Relaxed) != HEALTHY
+}
+
+/// Whether the Vulkan device was lost and its fault report and crash dump are written. The
+/// renderer has stopped recording, submitting and reading back by then; the caller ends the
+/// session, since nothing it draws or reads from the GPU is valid any more.
+pub fn device_lost() -> bool {
+    DEVICE.load(Ordering::Acquire) == REPORTED
+}
+
+/// Takes the path a `VK_ERROR_DEVICE_LOST` result from any Vulkan call takes, for tests.
+#[doc(hidden)]
+pub fn inject_device_lost() {
+    let _ = Err::<(), _>(vk::Result::ERROR_DEVICE_LOST).call("injected device loss");
 }
