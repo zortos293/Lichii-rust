@@ -4950,7 +4950,8 @@ fn render_conditions_test_occlusion_reports_on_the_host_gpu() {
 
 /// Storage buffer sizes: NVN descriptors take their size word; Switch 2 pointers are bare (8 MiB),
 /// except a read-only compute binding with a larger size word; a read-only pointer table entry
-/// reaches to the end of its contiguous device run. None reaches past its run when long.
+/// reaches to the end of its contiguous device run. None reaches past its run when long, or past
+/// the host's range limit.
 #[test]
 fn storage_pointer_sizes_follow_the_pointer_kind() {
     use lichii_memory::{DeviceAddressSpace, PhysicalMemory};
@@ -5002,7 +5003,12 @@ fn storage_pointer_sizes_follow_the_pointer_kind() {
     };
     let direct = StorageBufferDescriptor::DIRECT;
     let size = |switch2, compute, is_written, indirect| {
-        storage_pointer(&sources(switch2, compute), &desc(is_written, indirect), 0)
+        storage_pointer(
+            &sources(switch2, compute),
+            &desc(is_written, indirect),
+            0,
+            u64::MAX,
+        )
     };
 
     cbuf(pool, 0x300);
@@ -5048,6 +5054,12 @@ fn storage_pointer_sizes_follow_the_pointer_kind() {
         "a read-only table entry reaches to the end of its device run"
     );
     assert_eq!(size(true, true, true, 8), (pool, 64 << 10), "written");
+    let host_limit = 10 * MIB - 0x100;
+    assert_eq!(
+        storage_pointer(&sources(true, true), &desc(false, 8), 0, host_limit),
+        (pool, host_limit),
+        "no binding passes the host's storage buffer range"
+    );
     gmmu.write(table + 8, GPU_VA + RUN - 0x1000).unwrap();
     assert_eq!(
         size(true, true, false, 8),

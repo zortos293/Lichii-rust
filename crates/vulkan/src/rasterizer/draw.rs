@@ -1654,7 +1654,8 @@ impl VulkanRasterizer {
                     DescriptorKind::StorageBuffer => {
                         let desc = info.storage_buffers_descriptors[descriptor];
                         for i in 0..b.count {
-                            let (address, size) = storage_pointer(src, &desc, i);
+                            let limit = storage_range_limit(self);
+                            let (address, size) = storage_pointer(src, &desc, i, limit);
                             let binding = self.buffer_cache.storage_buffer(
                                 &mut self.scheduler,
                                 &mut self.staging,
@@ -3076,6 +3077,7 @@ impl VulkanRasterizer {
         element: u32,
     ) -> Result<u32> {
         let align = self.buffer_cache.storage_alignment();
+        let limit = storage_range_limit(self);
         loop {
             let cache = &self.buffer_cache;
             let mut stale = None;
@@ -3088,7 +3090,7 @@ impl VulkanRasterizer {
                 }) else {
                     return 0;
                 };
-                let (address, size) = storage_pointer(src, desc, element);
+                let (address, size) = storage_pointer(src, desc, element, limit);
                 let base = address & !(align - 1);
                 let word = base + u64::from(offset);
                 if address == 0 || word + 4 > address + size {
@@ -3144,16 +3146,19 @@ fn numeric_mismatch(
 ///   larger size takes it, up to the end of the pointer's contiguous device run (Mario Kart
 ///   World's lighting reads past 8 MiB). Compute stages are the ones without a root table.
 ///
-/// Every size here stays within [`STORAGE_REACH`], the cached gather budget, and the long ones
-/// end where their device run does, so the buffer cache binds them in place.
+/// Every size here stays within [`STORAGE_REACH`], the cached gather budget, and `limit`, the
+/// largest range the host binds after alignment; the long ones end where their device run does,
+/// so the buffer cache binds them in place.
 fn storage_pointer(
     src: &StageSources<'_>,
     desc: &StorageBufferDescriptor,
     element: u32,
+    limit: u64,
 ) -> (GpuVAddr, u64) {
     const STORAGE_REACH: u64 = 256 << 20;
     const BARE_POINTER_SIZE: u64 = 8 << 20;
     const TABLE_ENTRY_SIZE: u64 = 64 << 10;
+    let reach = STORAGE_REACH.min(limit);
     let device_run = |address: GpuVAddr, limit: u64| {
         let mut first = None;
         src.gmmu.for_each_range(address, limit, |range| {
@@ -3166,29 +3171,41 @@ fn storage_pointer(
     };
     let offset = desc.cbuf_offset + element * 16;
     let pointer: u64 = read_cbuf(src.gmmu, src.cbufs, desc.cbuf_index, offset);
-    if desc.indirect_offset != StorageBufferDescriptor::DIRECT {
+    let (address, size) = if desc.indirect_offset != StorageBufferDescriptor::DIRECT {
         let address = src
             .gmmu
             .read::<u64>(pointer + u64::from(desc.indirect_offset))
             .unwrap_or(0);
-        if desc.is_written || address == 0 {
-            return (address, TABLE_ENTRY_SIZE);
+        match desc.is_written || address == 0 {
+            true => (address, TABLE_ENTRY_SIZE),
+            false => (address, device_run(address, reach).max(TABLE_ENTRY_SIZE)),
         }
-        return (
-            address,
-            device_run(address, STORAGE_REACH).max(TABLE_ENTRY_SIZE),
-        );
-    }
-    let next: u64 = read_cbuf(src.gmmu, src.cbufs, desc.cbuf_index, offset + 8);
-    if !src.pool.switch2 {
-        return (pointer, next & 0xffff_ffff);
-    }
-    let compute = src.root_table.is_none();
-    if compute && !desc.is_written && pointer != 0 && next >> 32 == 0 && next > BARE_POINTER_SIZE {
-        let run = device_run(pointer, next.min(STORAGE_REACH));
-        return (pointer, run.max(BARE_POINTER_SIZE));
-    }
-    (pointer, BARE_POINTER_SIZE)
+    } else {
+        let next: u64 = read_cbuf(src.gmmu, src.cbufs, desc.cbuf_index, offset + 8);
+        let compute = src.root_table.is_none();
+        if !src.pool.switch2 {
+            (pointer, next & 0xffff_ffff)
+        } else if compute
+            && !desc.is_written
+            && pointer != 0
+            && next >> 32 == 0
+            && next > BARE_POINTER_SIZE
+        {
+            let run = device_run(pointer, next.min(reach));
+            (pointer, run.max(BARE_POINTER_SIZE))
+        } else {
+            (pointer, BARE_POINTER_SIZE)
+        }
+    };
+    (address, size.min(limit))
+}
+
+/// The largest storage buffer range a binding may ask for: the host's limit, less the bytes
+/// [`BufferCache::storage_buffer`](crate::buffer_cache::BufferCache::storage_buffer) adds when it
+/// aligns the start down.
+fn storage_range_limit(rasterizer: &VulkanRasterizer) -> u64 {
+    let range = u64::from(rasterizer.device.properties.limits.max_storage_buffer_range);
+    range.saturating_sub(rasterizer.buffer_cache.storage_alignment())
 }
 
 mod assembly;
