@@ -3147,7 +3147,51 @@ fn storage_pointer(
         .gmmu
         .read::<u64>(pointer + u64::from(desc.indirect_offset))
         .unwrap_or(0);
+    if !desc.is_written
+        && address != 0
+        && let Some(reach) = liru14_table_reach()
+    {
+        let size = liru14_mapped_run(src.gmmu, address, reach);
+        if size > 64 << 10 {
+            return (address, size);
+        }
+    }
     (address, 64 << 10)
+}
+
+fn liru14_table_reach() -> Option<u64> {
+    static REACH: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *REACH.get_or_init(|| {
+        let reach = std::env::var("LIRU14_TABLE_REACH_MIB")
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .map(|mib| mib << 20);
+        eprintln!("LIRU14 table pointer reach {reach:?}");
+        reach
+    })
+}
+
+fn liru14_mapped_run(gmmu: &lichii_gpu::gmmu::Gmmu, address: GpuVAddr, reach: u64) -> u64 {
+    thread_local! {
+        static RUNS: std::cell::RefCell<std::collections::HashMap<(u64, u64), u64>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let key = (address, gmmu.generation());
+    if let Some(size) = RUNS.with(|runs| runs.borrow().get(&key).copied()) {
+        return size;
+    }
+    let mut size = None;
+    gmmu.for_each_range(address, reach, |range| {
+        if size.is_none() {
+            size = Some(match range.target {
+                lichii_gpu::gmmu::RangeTarget::Device(_) => range.size,
+                _ => 0,
+            });
+        }
+    });
+    let size = size.unwrap_or(0);
+    RUNS.with(|runs| runs.borrow_mut().insert(key, size));
+    size
 }
 
 mod assembly;
