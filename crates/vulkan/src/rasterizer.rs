@@ -2990,4 +2990,117 @@ mod tests {
         );
         f.assert_no_validation_errors();
     }
+
+    /// One inline constant buffer write through `invalidate_region` among a race's cached
+    /// objects: 2000 sampled textures, 300 shader programs and 200 GPU-written buffer ranges
+    /// over 512 MiB of device memory, with flush traps on. Misses land in a constant buffer
+    /// region none of them shares a page with; hits land on textures and programs. Run with
+    /// `cargo test --release -p lichii-vulkan --lib invalidate_region_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn invalidate_region_cost_of_inline_constant_buffer_writes() {
+        use std::hint::black_box;
+
+        use lichii_texture::tic::TicEntry;
+
+        const SPAN: u64 = 512 << 20;
+        const TEXTURES: u64 = 2000;
+        const PROGRAMS: u64 = 300;
+        const WRITTEN: u64 = 200;
+        const CBUFS: u64 = 8 << 20;
+        const WRITES: u64 = 200_000;
+        let Some(mut f) = fixture(GobLayout::Tegra) else {
+            return;
+        };
+        for alias in 1..SPAN / DRAM {
+            f.memory.map(DADDR + alias * DRAM, 0, DRAM);
+        }
+        let gmmu = Gmmu::new(f.memory.clone(), BigPageSize::Size64K);
+        gmmu.map(GPU_VA, DADDR, SPAN, 0, false).unwrap();
+        let r = &mut f.rasterizer;
+        r.texture_cache.set_flush_traps(f.memory.clone());
+        let mut textures = Vec::new();
+        for i in 0..TEXTURES {
+            let offset = (16 << 20) + i * (128 << 10);
+            let gpu_va = GPU_VA + offset;
+            let desc = TicEntry([
+                0x08 | 2 << 7 | 2 << 10 | 2 << 13 | 2 << 16 | 2 << 19 | 3 << 22 | 4 << 25 | 5 << 28,
+                gpu_va as u32,
+                (gpu_va >> 32) as u32 | 3 << 21,
+                0,
+                63 | 1 << 23,
+                63,
+                0,
+                0,
+            ])
+            .decode()
+            .unwrap();
+            let mut tx = Transfer {
+                scheduler: &mut r.scheduler,
+                staging: &mut r.staging,
+                memory: &r.handles.device,
+                buffers: &mut r.buffer_cache,
+            };
+            r.texture_cache
+                .texture(&mut tx, &gmmu, &desc, crate::texture_cache::Usage::Sample)
+                .unwrap()
+                .expect("a cached texture");
+            textures.push(DADDR + offset);
+        }
+        r.scheduler.finish().unwrap();
+        let mut programs = Vec::new();
+        for i in 0..PROGRAMS {
+            let offset = (300 << 20) + i * (64 << 10);
+            r.draw
+                .shaders
+                .track_program(&gmmu, GPU_VA + offset, (4 << 10) * (1 + i % 4));
+            programs.push(DADDR + offset);
+        }
+        for i in 0..WRITTEN {
+            let daddr = DADDR + (400 << 20) + i * (256 << 10);
+            r.buffer_cache.mark_gpu_written(1, daddr, 4 << 10);
+        }
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut misses = Vec::new();
+        for _ in 0..WRITES {
+            let size = (64 + next() % 193) & !3;
+            let offset = (next() % ((1 << 20) - size)) & !3;
+            misses.push((DADDR + CBUFS + offset, size));
+        }
+        let hits: Vec<_> = (0..WRITES)
+            .map(|i| {
+                let size = (64 + next() % 193) & !3;
+                let base = if i % 4 == 0 {
+                    programs[(next() % PROGRAMS) as usize]
+                } else {
+                    textures[(next() % TEXTURES) as usize]
+                };
+                (base + ((next() % 2048) & !3), size)
+            })
+            .collect();
+        for (name, writes) in [("miss", &misses), ("hit", &hits)] {
+            for &(daddr, size) in writes.iter().take(1000) {
+                r.invalidate_region(daddr, size);
+            }
+            let best = (0..10)
+                .map(|_| {
+                    let start = Instant::now();
+                    for &(daddr, size) in writes {
+                        r.invalidate_region(black_box(daddr), black_box(size));
+                    }
+                    start.elapsed() / writes.len() as u32
+                })
+                .min()
+                .unwrap();
+            eprintln!(
+                "invalidate_region of a 64-256 byte constant buffer write ({name}): best of 10 {best:?}"
+            );
+        }
+    }
 }

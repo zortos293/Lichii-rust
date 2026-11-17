@@ -18,6 +18,13 @@ impl ImageAccess {
         stage: vk::PipelineStageFlags2::TOP_OF_PIPE,
         access: vk::AccessFlags2::NONE,
     };
+    /// A swapchain image whose acquire semaphore is waited at COLOR_ATTACHMENT_OUTPUT: the
+    /// transition out of it starts at that stage, so it follows the present engine's read.
+    pub const ACQUIRED: Self = Self {
+        layout: vk::ImageLayout::UNDEFINED,
+        stage: vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+        access: vk::AccessFlags2::NONE,
+    };
     pub const TRANSFER_DST: Self = Self {
         layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         stage: vk::PipelineStageFlags2::ALL_TRANSFER,

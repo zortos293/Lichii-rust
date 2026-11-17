@@ -14,6 +14,7 @@ use std::thread::{JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
 use lichii_common::DAddr;
+use lichii_common::thread::{ThreadPriority, set_current_thread_priority};
 use parking_lot::{Condvar, Mutex};
 
 use crate::activity::{Activity, Wait};
@@ -511,7 +512,10 @@ impl Gpu {
             Threading::Split => {
                 let thread = std::thread::Builder::new()
                     .name("gpu-back".into())
-                    .spawn(move || back.run_thread(consumer))
+                    .spawn(move || {
+                        set_current_thread_priority(ThreadPriority::AboveNormal);
+                        back.run_thread(consumer)
+                    })
                     .expect("failed to start the GPU back thread");
                 (Link::Thread, Some(thread))
             }
@@ -537,7 +541,10 @@ impl Gpu {
         let front_inbox = inbox.clone();
         let front = std::thread::Builder::new()
             .name("gpu-front".into())
-            .spawn(move || front.run(front_inbox))
+            .spawn(move || {
+                set_current_thread_priority(ThreadPriority::AboveNormal);
+                front.run(front_inbox)
+            })
             .expect("failed to start the GPU front thread");
         let threaded = config.threading == Threading::Split;
         let reporter = std::thread::Builder::new()

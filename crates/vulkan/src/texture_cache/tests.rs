@@ -6068,6 +6068,187 @@ fn cube_tail_targets_retire_drawn_single_level_images_the_cube_took_texels_from(
     }
 }
 
+/// The images the page lookup [`TextureCache::collect_overlaps`] ran before the chunk reject
+/// finds for `[daddr, +size)`, in its order.
+fn scanned(cache: &TextureCache, daddr: DAddr, size: u64) -> Vec<ImageId> {
+    let mut found = Vec::new();
+    for page in pages(daddr, size) {
+        let Some(bucket) = cache.pages.get(&page) else {
+            continue;
+        };
+        for &id in bucket {
+            if let Some(image) = cache.get(id)
+                && !found.contains(&id)
+                && image.overlaps(daddr, size)
+            {
+                found.push(id);
+            }
+        }
+    }
+    found.sort_by_key(|&id| cache.get(id).unwrap().modified);
+    found
+}
+
+fn live_images(cache: &TextureCache) -> Vec<ImageId> {
+    (0..cache.slots.len() as u32)
+        .filter_map(|index| {
+            let slot = &cache.slots[index as usize];
+            slot.image.as_ref().map(|_| ImageId {
+                index,
+                generation: slot.generation,
+            })
+        })
+        .collect()
+}
+
+/// What a guest write can change of an image.
+fn write_state(image: &CachedImage) -> (bool, bool, bool, Vec<u64>) {
+    (
+        image.gpu_modified,
+        image.cpu_dirty,
+        image.dirty_whole,
+        image.dirty_subresources.clone(),
+    )
+}
+
+/// A seeded random stream of image creations (block-linear textures across 64 KiB chunk and
+/// 1 MiB lookup page edges, up to 4 MiB), removals, GPU modifications and guest writes (empty,
+/// 64-256 bytes, chunk edges, up to 4 MiB, misses) through `invalidate` and `rearm` as
+/// `invalidate_region` makes them: for every write and its rearm range, the overlaps collected
+/// are the unguarded page lookup's, in its order, and a scan over every image's; the images the
+/// write overlaps are written back and dirty while the others keep their state; and the chunk
+/// mask holds exactly the chunks of the live images' segments.
+#[test]
+fn writes_invalidate_and_rearm_the_images_the_unguarded_lookup_finds() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    f.cache.set_flush_traps(f.memory.clone());
+    let mut seed = 0x5eed_0430_1234_5678u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let (mut hits, mut misses, mut written_back) = (0, 0, 0);
+    for step in 0..1500 {
+        let live = live_images(&f.cache);
+        match next() % 10 {
+            0..=2 => {
+                let (width, height) = match next() % 8 {
+                    0 => (1024, 1024),
+                    1..=3 => (1 + next() % 256, 1 + next() % 64),
+                    _ => (1 + next() % 32, 1 + next() % 32),
+                };
+                let offset = match next() % 3 {
+                    0 => ((next() % 48) << 20) + (1 << 20) - 0x200 * (1 + next() % 8),
+                    1 => ((next() % 768) << 16).saturating_sub(0x200 * (next() % 4)),
+                    _ => (next() % (48 << 20)) & !0x1ff,
+                };
+                f.texture(&tic(
+                    0x08,
+                    GPU_VA + offset,
+                    width as u32,
+                    height as u32,
+                    1,
+                    1,
+                    (next() % 3) as u32,
+                ));
+            }
+            3 if !live.is_empty() => {
+                let id = live[(next() % live.len() as u64) as usize];
+                f.cache.remove(&mut f.scheduler, id);
+            }
+            4 if !live.is_empty() => {
+                let id = live[(next() % live.len() as u64) as usize];
+                f.cache.image(id).gpu_modified = true;
+            }
+            _ => {
+                let daddr = match next() % 4 {
+                    0 => DADDR + ((next() % 1024) << 16) - next() % 0x40,
+                    1 if !live.is_empty() => {
+                        let image = f
+                            .cache
+                            .get(live[(next() % live.len() as u64) as usize])
+                            .unwrap();
+                        let s = image.segments[(next() % image.segments.len() as u64) as usize];
+                        s.daddr + next() % s.size.max(1)
+                    }
+                    2 => DADDR + (56 << 20) + next() % (8 << 20),
+                    _ => DADDR + next() % (60 << 20),
+                };
+                let size = match next() % 6 {
+                    0 => 0,
+                    1 => next() % (4 << 20),
+                    _ => 64 + next() % 193,
+                };
+                let end = daddr.saturating_add(size);
+                let rearm_start = daddr & !(PAGE_SIZE - 1);
+                let rearm_size = end.next_multiple_of(PAGE_SIZE) - rearm_start;
+                let at = format!("step {step}: [{daddr:#x}, +{size:#x})");
+                for (daddr, size) in [(daddr, size), (rearm_start, rearm_size)] {
+                    let expected = scanned(&f.cache, daddr, size);
+                    let brute: Vec<ImageId> = live
+                        .iter()
+                        .copied()
+                        .filter(|&id| f.cache.get(id).unwrap().overlaps(daddr, size))
+                        .collect();
+                    f.cache.collect_overlaps(&[Segment {
+                        offset: 0,
+                        daddr,
+                        size,
+                    }]);
+                    assert_eq!(f.cache.ids, expected, "{at}");
+                    let mut sorted = expected.clone();
+                    sorted.sort_by_key(|id| id.index);
+                    assert_eq!(sorted, brute, "{at}");
+                }
+                let overlapping = scanned(&f.cache, daddr, size);
+                let before: Vec<_> = live
+                    .iter()
+                    .map(|&id| (id, write_state(f.cache.get(id).unwrap())))
+                    .collect();
+                let handed_off = overlapping
+                    .iter()
+                    .any(|&id| f.cache.get(id).unwrap().gpu_modified);
+                let (mut tx, cache, _) = f.tx();
+                cache.invalidate(&mut tx, daddr, size).unwrap();
+                cache.rearm(daddr, end);
+                for (id, state) in before {
+                    let image = f.cache.get(id).unwrap();
+                    if overlapping.contains(&id) {
+                        assert!(!image.gpu_modified, "{at}");
+                        let touched = image
+                            .segments
+                            .iter()
+                            .any(|s| daddr.max(s.daddr) < end.min(s.daddr + s.size));
+                        assert!(!touched || image.cpu_dirty, "{at}");
+                        written_back += usize::from(state.0);
+                    } else if !handed_off {
+                        assert_eq!(write_state(image), state, "{at}");
+                    }
+                }
+                if overlapping.is_empty() {
+                    misses += 1;
+                } else {
+                    hits += 1;
+                }
+            }
+        }
+        let occupied: std::collections::BTreeSet<DAddr> = live_images(&f.cache)
+            .iter()
+            .flat_map(|&id| f.cache.get(id).unwrap().segments.clone())
+            .flat_map(|s| crate::chunk_mask::chunks_of(s.daddr, s.size))
+            .collect();
+        assert_eq!(f.cache.chunks.marked(), occupied, "step {step}");
+    }
+    f.scheduler.finish().unwrap();
+    eprintln!("{hits} writes hit images, {misses} missed, {written_back} wrote GPU texels back");
+    assert!(hits > 100 && misses > 100 && written_back > 5);
+    f.assert_no_validation_errors();
+}
+
 /// A block-linear texture header of `texture_type` (1 2D, 2 3D, 5 2D array) whose `depth` is the
 /// layer count or the 3D depth.
 #[allow(clippy::too_many_arguments)]

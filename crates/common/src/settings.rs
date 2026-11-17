@@ -278,7 +278,8 @@ pub struct SystemSettings {
     /// (`LockExit`) to save and exit after it gets the exit request; 0 stops it at once.
     pub exit_timeout_ms: u32,
     /// Patches Lichii applies to known game builds, as the C++ Lichii does: Ocarina of Time's
-    /// Max Resolution with the Texture Pool x2 it needs. Off turns them all off.
+    /// Max Resolution with the Texture Pool x2 it needs, and its Dynamic FPS. Off turns them all
+    /// off.
     pub builtin_game_patches: bool,
 }
 
