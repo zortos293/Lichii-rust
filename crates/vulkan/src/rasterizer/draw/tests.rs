@@ -5424,3 +5424,153 @@ fn storage_pointer_sizes_follow_the_pointer_kind() {
         "a short run keeps 64 KiB"
     );
 }
+
+const COPYING: u64 = 0x10_a000;
+const SLOTS: u64 = 0x78_0000;
+const COPY_CBUFS: u64 = 0x77_0000;
+
+/// Copies the word at the storage buffer c[0][0x110] to the storage buffer c[0][0x120].
+fn copy_program() -> Vec<u8> {
+    compute_code(&[
+        mov_cbuf(4, 0x110),
+        mov_cbuf(5, 0x114),
+        sass(Opcode::Ldg, (4 << 48) | (1 << 45) | (4 << 8) | 6),
+        mov_cbuf(8, 0x120),
+        mov_cbuf(9, 0x124),
+        sass(Opcode::Stg, (1 << 45) | (4 << 48) | (8 << 8) | 6),
+        exit(),
+    ])
+}
+
+/// The guest address of word slot `slot`, each in its own 4 KiB page.
+fn slot(slot: u64) -> u64 {
+    SLOTS + slot * 0x1000
+}
+
+/// Dispatches `copy_program` once per `(from, to)` slot pair, the `i`th with constant buffer
+/// `i`.
+fn copy_slots(f: &mut Fixture, gmmu: &Arc<Gmmu>, copies: &[(u64, u64)]) {
+    write(f, COPYING, &copy_program());
+    for (i, &(from, to)) in copies.iter().enumerate() {
+        let cbuf = COPY_CBUFS + i as u64 * 0x200;
+        for (offset, target) in [(0x110, from), (0x120, to)] {
+            let mut binding = (GPU_VA + slot(target)).to_le_bytes().to_vec();
+            binding.extend_from_slice(&0x100u32.to_le_bytes());
+            write(f, cbuf + offset, &binding);
+        }
+        launch(f, gmmu, COPYING, cbuf, [1; 3], None);
+    }
+}
+
+fn slot_word(f: &mut Fixture, index: u64) -> u32 {
+    f.rasterizer.flush_region(DADDR + slot(index), 4);
+    let mut word = [0u8; 4];
+    f.memory.read_bytes(DADDR + slot(index), &mut word).unwrap();
+    u32::from_le_bytes(word)
+}
+
+#[test]
+fn dispatches_share_a_barrier_until_one_touches_what_another_wrote() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    for (index, value) in [(0, 11u32), (1, 0), (2, 0), (3, 22), (4, 0), (5, 33)] {
+        write(&f, slot(index), &value.to_le_bytes());
+    }
+    let copies = [(0, 1), (3, 4), (1, 2), (5, 1)];
+    copy_slots(&mut f, &gmmu, &copies);
+    let before = f.rasterizer.scheduler.compute_barriers();
+    copy_slots(&mut f, &gmmu, &copies);
+    assert_eq!(
+        f.rasterizer.scheduler.compute_barriers() - before,
+        3,
+        "before 0->1, which rewrites what the last copy wrote; before 1->2, which reads it; \
+         before 5->1, which overwrites what 1->2 read; 3->4 records beside 0->1"
+    );
+    assert_eq!(
+        [1, 2, 4].map(|index| slot_word(&mut f, index)),
+        [33, 11, 22],
+        "1->2 reads what 0->1 wrote, and 5->1 overwrites it only after"
+    );
+    assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
+    f.assert_no_validation_errors();
+}
+
+/// Records rounds of 16 independent copies and reports the cost of a dispatch, recorded and
+/// run.
+#[test]
+#[ignore = "benchmark"]
+fn measures_independent_dispatch_cost() {
+    use std::time::Instant;
+
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let copies: Vec<(u64, u64)> = (0..16).map(|i| (i, 16 + i)).collect();
+    for i in 0..16 {
+        write(&f, slot(i), &(i as u32 + 1).to_le_bytes());
+    }
+    copy_slots(&mut f, &gmmu, &copies);
+    f.rasterizer.scheduler.finish().unwrap();
+    let rounds = 2000;
+    let barriers = f.rasterizer.scheduler.compute_barriers();
+    let start = Instant::now();
+    for _ in 0..rounds {
+        copy_slots(&mut f, &gmmu, &copies);
+    }
+    let recorded = start.elapsed();
+    f.rasterizer.scheduler.finish().unwrap();
+    let total = start.elapsed();
+    let dispatches = (rounds * copies.len()) as f64;
+    eprintln!(
+        "{dispatches} dispatches: {:.2} us recorded, {:.2} us recorded and run each; {} compute barriers",
+        recorded.as_secs_f64() * 1e6 / dispatches,
+        total.as_secs_f64() * 1e6 / dispatches,
+        f.rasterizer.scheduler.compute_barriers() - barriers,
+    );
+    assert_eq!(slot_word(&mut f, 31), 16);
+}
+
+/// Stores 0x55 at the 64-bit pointer the storage buffer c[0][0x110] holds: a store through a
+/// pointer read from memory, which no binding bounds.
+fn pointer_chasing_program() -> Vec<u8> {
+    compute_code(&[
+        mov_cbuf(4, 0x110),
+        mov_cbuf(5, 0x114),
+        sass(Opcode::Ldg, (5 << 48) | (1 << 45) | (4 << 8) | 6),
+        mov_u32(8, 0x55),
+        sass(Opcode::Stg, (4 << 48) | (1 << 45) | (6 << 8) | 8),
+        exit(),
+    ])
+}
+
+#[test]
+fn dispatches_through_unbounded_pointers_record_their_barrier_at_once() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    const CHASING: u64 = 0x10_b000;
+    write(&f, CHASING, &pointer_chasing_program());
+    let cbufs = [COPY_CBUFS, COPY_CBUFS + 0x200];
+    for (i, cbuf) in cbufs.into_iter().enumerate() {
+        let (table, target) = (slot(6 + i as u64), slot(8 + i as u64));
+        write(&f, table, &(GPU_VA + target).to_le_bytes());
+        write(&f, target, &[0; 4]);
+        let mut binding = (GPU_VA + table).to_le_bytes().to_vec();
+        binding.extend_from_slice(&0x100u32.to_le_bytes());
+        write(&f, cbuf + 0x110, &binding);
+    }
+    for _ in 0..2 {
+        let before = f.rasterizer.scheduler.compute_barriers();
+        for cbuf in cbufs {
+            launch(&mut f, &gmmu, CHASING, cbuf, [1; 3], None);
+        }
+        assert_eq!(
+            f.rasterizer.scheduler.compute_barriers() - before,
+            2,
+            "the store may land outside every binding, so no dispatch records beside another"
+        );
+    }
+    assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
+    f.assert_no_validation_errors();
+}
