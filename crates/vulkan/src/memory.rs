@@ -162,6 +162,12 @@ impl Device {
         }
     }
 
+    /// Live pipelines the pipeline cache built or fast-linked, retired ones included until they
+    /// are destroyed.
+    pub fn pipelines(&self) -> u64 {
+        self.pipelines.load(Ordering::Relaxed)
+    }
+
     /// Live descriptor pools of the [`crate::descriptors::DescriptorAllocator`]s.
     pub fn descriptor_pools(&self) -> u64 {
         self.descriptor_pools.load(Ordering::Relaxed)

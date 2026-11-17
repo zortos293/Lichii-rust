@@ -186,6 +186,8 @@ pub struct Device {
     pub(crate) allocator: ManuallyDrop<Mutex<Allocator>>,
     /// Live allocations by memory location.
     pub(crate) memory_counters: MemoryCounters,
+    /// Live [`crate::pipeline::cache::Pipeline`]s: built, libraries and fast-linked ones.
+    pub(crate) pipelines: AtomicU64,
     /// Live descriptor pools of the [`crate::descriptors::DescriptorAllocator`]s.
     pub(crate) descriptor_pools: AtomicU64,
     pub(crate) memory_properties: vk::PhysicalDeviceMemoryProperties,
@@ -732,6 +734,7 @@ impl Device {
             queue: Mutex::new(queue),
             allocator: ManuallyDrop::new(Mutex::new(allocator)),
             memory_counters: MemoryCounters::default(),
+            pipelines: AtomicU64::new(0),
             descriptor_pools: AtomicU64::new(0),
             memory_properties,
             shader_profile,

@@ -826,7 +826,6 @@ impl VulkanRasterizer {
             self.buffer_cache.oversized_stream(),
             self.staging.oversized(),
         );
-        let pipelines = self.draw.pipelines.stats();
         tracing::debug!(
             target: ACTIVITY_TARGET,
             gpu_only_mib = counts.gpu_only.bytes >> 20,
@@ -839,8 +838,7 @@ impl VulkanRasterizer {
             oversized_stream_buffers = stream.count,
             oversized_staging_mib = staging.bytes >> 20,
             oversized_staging_buffers = staging.count,
-            pipelines = pipelines.built,
-            pipeline_libraries = pipelines.libraries,
+            pipelines = self.device.pipelines(),
             descriptor_pools = self.device.descriptor_pools(),
             "GPU memory"
         );
