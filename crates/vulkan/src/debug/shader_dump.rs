@@ -44,14 +44,19 @@ fn write_into(dir: &Path, hash: u64, spirv: &[u32], program: &[u8], vertex_a: Op
     };
     let words: Vec<u8> = spirv.iter().flat_map(|word| word.to_le_bytes()).collect();
     let code = [("b", Some(program)), ("a", vertex_a)];
+    let bin = |side: &str| dir.join(format!("{hash:016x}.{side}.bin"));
     let result = file.write_all(&words).and_then(|()| {
         code.into_iter().try_for_each(|(side, bytes)| match bytes {
-            Some(bytes) => std::fs::write(dir.join(format!("{hash:016x}.{side}.bin")), bytes),
+            Some(bytes) => std::fs::write(bin(side), bytes),
             None => Ok(()),
         })
     });
     if let Err(error) = result {
         tracing::warn!(path = ?spv, %error, "dumping a shader failed");
+        drop(file);
+        for path in [spv, bin("b"), bin("a")] {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -73,6 +78,12 @@ mod tests {
         write_into(&dir, 1, &[1], &[6], None);
         assert_eq!(read("0000000000000001.b.bin"), [6]);
         assert!(!dir.join("0000000000000001.a.bin").exists());
+        std::fs::create_dir(dir.join("0000000000000002.b.bin")).unwrap();
+        write_into(&dir, 2, &[1], &[6], None);
+        assert!(
+            !dir.join("0000000000000002.spv").exists(),
+            "a failed dump leaves no claim, so a later one retries"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -719,7 +719,7 @@ pub(super) fn hash_program(gmmu: &Gmmu, start: GpuVAddr, len: u64, bytes: &mut V
 /// With `dump_shaders` on, dumps `module` with the guest code it came from: `ranges` holds the
 /// bytes of VertexA `a` and of `env` as offsets from each program's first instruction and
 /// lengths, as [`lichii_shader::cache::CacheEntry::code_ranges`] gives them.
-pub(super) fn dump(
+fn dump(
     module: &ShaderModule,
     a: Option<&ProgramEnv<'_>>,
     env: &ProgramEnv<'_>,
@@ -744,11 +744,8 @@ pub(super) fn dump(
     );
 }
 
-/// The ranges [`dump`] takes for programs just translated: what translation read.
-pub(super) fn translated_ranges(
-    a: Option<&ProgramEnv<'_>>,
-    env: &ProgramEnv<'_>,
-) -> [(i64, u64); 2] {
+/// The ranges [`dump`] takes for programs just translated in place: what translation read.
+fn translated_ranges(a: Option<&ProgramEnv<'_>>, env: &ProgramEnv<'_>) -> [(i64, u64); 2] {
     let range = |env: &ProgramEnv<'_>| {
         let (start, len) = env.code_range();
         (start.wrapping_sub(env.start_address()) as i64, len)
