@@ -272,6 +272,9 @@ impl Activity {
         let n: Vec<u64> = LIRU6_N.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
         let modes: Vec<u64> = LIRU6_MODES.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
         tracing::warn!("LIRU6DIAG host sites [cpu_reads, front_read, fetch_sync, macro_dma_sync, macro_dma_pending, render_enable] ms={ms:?} n={n:?} render_enable_modes={modes:?}");
+        for (key, count) in std::mem::take(&mut *LIRU6_DECISIONS.lock().unwrap()) {
+            tracing::warn!("LIRU6DIAG macro decision {key} count={count}");
+        }
         let pairs = std::mem::take(&mut *LIRU6_PAIRS.lock().unwrap());
         for (address, dma, mode, count) in pairs {
             tracing::warn!("LIRU6DIAG render_enable address={address:#x} last_macro_dma={dma:#x} mode={mode} count={count}");
@@ -615,4 +618,14 @@ pub(crate) fn liru6_mode(mode: u32, address: u64) {
     } else if v.len() < 24 {
         v.push((address, dma, mode, 1));
     }
+}
+
+pub(crate) static LIRU6_READ: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static LIRU6_DECISIONS: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
+pub(crate) fn liru6_decision(mode: u32) {
+    let words = LIRU6_READ.lock().unwrap().clone();
+    let shape: Vec<String> = words.iter().map(|&w| match w { 0 => "0".into(), 1 => "1".into(), w if w < 0x100 => "<256".into(), w if w < 0x10000 => "<64K".into(), _ => "big".into() }).collect();
+    let key = format!("n={} words={:?} mode={mode}", words.len(), shape);
+    let mut v = LIRU6_DECISIONS.lock().unwrap();
+    if let Some(e) = v.iter_mut().find(|e| e.0 == key) { e.1 += 1; } else if v.len() < 32 { v.push((key, 1)); }
 }

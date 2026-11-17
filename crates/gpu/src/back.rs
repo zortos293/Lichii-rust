@@ -725,6 +725,9 @@ impl MacroHost for BackMacroHost<'_, '_> {
         if is_load_mme(method) || method >= MACRO_REGISTERS_START {
             return;
         }
+        if method == 0x556 {
+            crate::activity::liru6_decision(argument);
+        }
         self.engine.call_method(self.ctx, method, argument);
     }
 
@@ -758,6 +761,7 @@ impl MacroHost for BackMacroHost<'_, '_> {
                 *slot = word;
             }
         }
+        *crate::activity::LIRU6_READ.lock().unwrap() = out.to_vec();
     }
 }
 
