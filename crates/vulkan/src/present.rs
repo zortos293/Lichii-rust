@@ -23,6 +23,7 @@ use crate::commands::{COLOR_RANGE, ImageAccess, transition};
 use crate::descriptors::DescriptorAllocator;
 use crate::device::Device;
 use crate::error::{Result, VkResultExt};
+use crate::host_budget::PRESENT_OVERSIZED_CAP;
 use crate::memory::{Image, ImageDesc, ImageView};
 use crate::rasterizer::ACTIVITY_TARGET;
 use crate::scheduler::{Scheduler, SemaphoreWait, Timeline};
@@ -288,7 +289,7 @@ impl Presenter {
         perf: Arc<PerfStats>,
     ) -> Result<Self> {
         let mut scheduler = Scheduler::new(device)?;
-        let mut staging = StagingRing::new(device, 16 << 20)?;
+        let mut staging = StagingRing::new(device, 16 << 20, PRESENT_OVERSIZED_CAP)?;
         let sampler = |filter: vk::Filter| {
             let info = vk::SamplerCreateInfo::default()
                 .mag_filter(filter)
@@ -1514,7 +1515,7 @@ mod tests {
         let Some(mut h) = Harness::new() else { return };
         let device = h.presenter.device.clone();
         let mut producer = Scheduler::new(&device).unwrap();
-        let mut staging = StagingRing::new(&device, 1 << 20).unwrap();
+        let mut staging = StagingRing::new(&device, 1 << 20, PRESENT_OVERSIZED_CAP).unwrap();
         let texels = quadrant_texels(16, 16);
         let image = upload_image(
             &device,

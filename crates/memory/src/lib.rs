@@ -15,6 +15,7 @@ mod host;
 mod page_table;
 mod physical;
 pub mod tracking;
+mod usage;
 
 pub use address_space::{
     AddressSpace, Fastmem, FastmemError, FaultKind, FlushTrapStats, MemoryFault, MemoryPermission,
@@ -24,6 +25,7 @@ pub use exclusive::{ExclusiveMonitor, ReservationSlot};
 pub use fault::{FaultHandler, HostFault};
 pub use physical::{PhysicalMemory, PhysicalMemoryError};
 pub use tracking::{CachedPages, FlushTrapHandler};
+pub use usage::{ProcessMemory, process_memory};
 
 #[cfg(test)]
 mod fastmem_tests;

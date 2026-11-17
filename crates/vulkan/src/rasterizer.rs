@@ -42,6 +42,7 @@ use crate::debug::renderdoc::{self, FrameCapture};
 use crate::device::Device;
 use crate::error::Result;
 use crate::format::{Conversion, host_format};
+use crate::host_budget::RING_OVERSIZED_CAP;
 use crate::memory::{Buffer, Image, ImageDesc};
 use crate::pipeline::PipelineCache;
 use crate::pipeline::shader_cache::ShaderCache;
@@ -400,7 +401,7 @@ impl VulkanRasterizer {
         scheduler.time_waits(handles.activity.clone());
         let pipelines = PipelineCache::new(device, &GraphicsSettings::default(), None, None)?;
         let draw = draw::DrawState::new(device, pipelines, gob_layout, scheduler.record()?)?;
-        let staging = StagingRing::new(device, 32 << 20)?;
+        let staging = StagingRing::new(device, 32 << 20, RING_OVERSIZED_CAP)?;
         let samples = samples::SampleCounter::new(device)?;
         let conditions = conditions::Conditions::new(device)?;
         Ok(Self {
@@ -774,6 +775,17 @@ impl VulkanRasterizer {
         self.log_activity();
     }
 
+    /// Submits the recorded work between operations once the oversized stream or staging
+    /// buffers it holds reach half their cap, so later allocations past the cap can wait for it
+    /// instead of growing past it ([`Oversized`](crate::host_budget::Oversized)).
+    fn bound_oversized(&mut self) {
+        let tick = self.scheduler.tick();
+        if self.staging.should_submit(tick) || self.buffer_cache.should_submit(tick) {
+            self.unflushed = true;
+            self.flush();
+        }
+    }
+
     /// Logs [`Activity`] once a second while it is enabled.
     fn log_activity(&mut self) {
         if !tracing::enabled!(target: ACTIVITY_TARGET, tracing::Level::DEBUG) {
@@ -820,6 +832,27 @@ impl VulkanRasterizer {
             vram_slack_mib = memory.slack >> 20,
             vram_budget_mib = memory.budget >> 20,
             "GPU thread"
+        );
+        let counts = self.device.memory_counts();
+        let (stream, staging) = (
+            self.buffer_cache.oversized_stream(),
+            self.staging.oversized(),
+        );
+        tracing::debug!(
+            target: ACTIVITY_TARGET,
+            gpu_only_mib = counts.gpu_only.bytes >> 20,
+            gpu_only_allocations = counts.gpu_only.count,
+            cpu_to_gpu_mib = counts.cpu_to_gpu.bytes >> 20,
+            cpu_to_gpu_allocations = counts.cpu_to_gpu.count,
+            gpu_to_cpu_mib = counts.gpu_to_cpu.bytes >> 20,
+            gpu_to_cpu_allocations = counts.gpu_to_cpu.count,
+            oversized_stream_mib = stream.bytes >> 20,
+            oversized_stream_buffers = stream.count,
+            oversized_staging_mib = staging.bytes >> 20,
+            oversized_staging_buffers = staging.count,
+            pipelines = self.device.pipelines(),
+            descriptor_pools = self.device.descriptor_pools(),
+            "GPU memory"
         );
         *a = Activity {
             since: Some(now),
@@ -1081,6 +1114,7 @@ impl VulkanRasterizer {
 
 impl Rasterizer for VulkanRasterizer {
     fn draw(&mut self, ctx: &mut GraphicsContext<'_>, draw: &DrawParams<'_>) {
+        self.bound_oversized();
         self.activity.draws += 1;
         if let Err(error) = self.draw_graphics(ctx, draw::DrawCall::Direct(draw)) {
             tracing::error!(%error, "recording a draw failed");
@@ -1088,6 +1122,7 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn draw_indirect(&mut self, ctx: &mut GraphicsContext<'_>, draw: &IndirectDraw) {
+        self.bound_oversized();
         self.activity.draws += 1;
         if let Err(error) = self.draw_graphics(ctx, draw::DrawCall::Indirect(draw)) {
             tracing::error!(%error, "recording an indirect draw failed");
@@ -1095,6 +1130,7 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn draw_texture(&mut self, ctx: &mut GraphicsContext<'_>, draw: &DrawTexture) {
+        self.bound_oversized();
         self.activity.texture_draws += 1;
         if let Err(error) = self.record_draw_texture(ctx, draw) {
             tracing::error!(%error, "recording a texture draw failed");
@@ -1102,6 +1138,7 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn clear(&mut self, ctx: &mut GraphicsContext<'_>, layer_count: u32) {
+        self.bound_oversized();
         self.activity.clears += 1;
         if let Err(error) = self.clear_targets(ctx, layer_count) {
             tracing::error!(%error, "clearing render targets failed");
@@ -1109,6 +1146,7 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn dispatch_compute(&mut self, ctx: &ComputeContext<'_>) {
+        self.bound_oversized();
         self.activity.dispatches += 1;
         if let Err(error) = self.dispatch(ctx) {
             tracing::error!(%error, "recording a compute dispatch failed");
@@ -1116,6 +1154,7 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn accelerate_blit(&mut self, _channel: ChannelId, memory: &Gmmu, blit: &Blit) -> bool {
+        self.bound_oversized();
         if blit.operation != BlitOperation::SrcCopy {
             return false;
         }
@@ -1199,6 +1238,7 @@ impl Rasterizer for VulkanRasterizer {
         memory: &Gmmu,
         copy: &ImageCopy,
     ) -> bool {
+        self.bound_oversized();
         let mut tx = Transfer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,

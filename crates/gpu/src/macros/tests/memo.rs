@@ -144,6 +144,22 @@ fn small_memo_compacts_and_stays_correct() {
 }
 
 #[test]
+fn code_copies_hold_no_memo() {
+    let memo = differential(MacroIsa::Mme64, None);
+    assert!(
+        memo.memo_bytes() > 16 << 20,
+        "the engine keeps its preallocated memo"
+    );
+    let copy = memo.code_copy().unwrap();
+    assert!(
+        copy.memo_bytes() < 16 << 10,
+        "a code copy holds {} bytes of memo and call record",
+        copy.memo_bytes()
+    );
+    assert!(!copy.memo_enabled());
+}
+
+#[test]
 fn memo_switch_turns_replay_off() {
     let (code, starts) = mme64_program();
     let mut engine = MacroEngine::new(MacroIsa::Mme64);

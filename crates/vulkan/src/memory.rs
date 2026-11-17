@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ash::vk;
 use gpu_allocator::MemoryLocation;
@@ -24,6 +24,67 @@ pub struct MemoryUsage {
     pub slack: u64,
 }
 
+/// Live allocations of one memory location.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LiveMemory {
+    pub bytes: u64,
+    pub count: u64,
+}
+
+/// Live allocations by memory location ([`Device::memory_counts`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryCounts {
+    /// Device-local memory: images and cached buffers.
+    pub gpu_only: LiveMemory,
+    /// Host-visible upload memory: staging and stream rings, their oversized buffers.
+    pub cpu_to_gpu: LiveMemory,
+    /// Host-visible readback memory: readbacks and capture rings.
+    pub gpu_to_cpu: LiveMemory,
+}
+
+/// Live allocation bytes and counts by memory location, kept where [`allocate`] and [`free`]
+/// run: relaxed atomics, so counting takes no lock.
+#[derive(Default)]
+pub(crate) struct MemoryCounters {
+    bytes: [AtomicU64; 3],
+    count: [AtomicU64; 3],
+}
+
+impl MemoryCounters {
+    fn slot(location: MemoryLocation) -> usize {
+        match location {
+            MemoryLocation::Unknown | MemoryLocation::GpuOnly => 0,
+            MemoryLocation::CpuToGpu => 1,
+            MemoryLocation::GpuToCpu => 2,
+        }
+    }
+
+    fn add(&self, location: MemoryLocation, bytes: u64) {
+        let slot = Self::slot(location);
+        self.bytes[slot].fetch_add(bytes, Ordering::Relaxed);
+        self.count[slot].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn sub(&self, location: MemoryLocation, bytes: u64) {
+        let slot = Self::slot(location);
+        self.bytes[slot].fetch_sub(bytes, Ordering::Relaxed);
+        self.count[slot].fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Bytes handed out by the allocator, which reports only block capacity cheaply.
+    fn total_bytes(&self) -> u64 {
+        self.bytes.iter().map(|b| b.load(Ordering::Relaxed)).sum()
+    }
+
+    fn live(&self, location: MemoryLocation) -> LiveMemory {
+        let slot = Self::slot(location);
+        LiveMemory {
+            bytes: self.bytes[slot].load(Ordering::Relaxed),
+            count: self.count[slot].load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Images at least this large get their own `VkDeviceMemory`, so evicting one returns its
 /// memory to the driver. Inside a shared 64 MiB block the space would only become allocator
 /// slack until the whole block empties, and under VRAM pressure that never happens (ZOR-384).
@@ -44,16 +105,12 @@ fn allocate(
         linear,
         allocation_scheme,
     })?;
-    device
-        .allocated
-        .fetch_add(allocation.size(), Ordering::Relaxed);
+    device.memory_counters.add(location, allocation.size());
     Ok(allocation)
 }
 
-fn free(device: &Device, allocation: Allocation) {
-    device
-        .allocated
-        .fetch_sub(allocation.size(), Ordering::Relaxed);
+fn free(device: &Device, allocation: Allocation, location: MemoryLocation) {
+    device.memory_counters.sub(location, allocation.size());
     if let Err(error) = device.allocator.lock().free(allocation) {
         tracing::error!("freeing device memory: {error}");
     }
@@ -70,9 +127,10 @@ impl Device {
             .map(|i| heaps[i].size)
             .sum();
         let capacity = self.allocator.lock().capacity();
-        let slack = capacity.saturating_sub(self.allocated.load(Ordering::Relaxed));
+        let allocated = self.memory_counters.total_bytes();
+        let slack = capacity.saturating_sub(allocated);
         if !self.features.extensions.memory_budget {
-            let used = self.allocated.load(Ordering::Relaxed);
+            let used = allocated;
             return MemoryUsage {
                 used,
                 budget: device_local,
@@ -103,6 +161,27 @@ impl Device {
             slack,
         }
     }
+
+    /// Live pipelines the pipeline cache built or fast-linked, retired ones included until they
+    /// are destroyed.
+    pub fn pipelines(&self) -> u64 {
+        self.pipelines.load(Ordering::Relaxed)
+    }
+
+    /// Live descriptor pools of the [`crate::descriptors::DescriptorAllocator`]s.
+    pub fn descriptor_pools(&self) -> u64 {
+        self.descriptor_pools.load(Ordering::Relaxed)
+    }
+
+    /// Live allocations by memory location. Lock-free, for the activity log.
+    pub fn memory_counts(&self) -> MemoryCounts {
+        let counters = &self.memory_counters;
+        MemoryCounts {
+            gpu_only: counters.live(MemoryLocation::GpuOnly),
+            cpu_to_gpu: counters.live(MemoryLocation::CpuToGpu),
+            gpu_to_cpu: counters.live(MemoryLocation::GpuToCpu),
+        }
+    }
 }
 
 /// A buffer with its memory. Dropping it frees both, so drop it only once the GPU is done with
@@ -111,6 +190,7 @@ pub struct Buffer {
     device: Arc<Device>,
     raw: vk::Buffer,
     allocation: Option<Allocation>,
+    location: MemoryLocation,
     size: u64,
 }
 
@@ -162,6 +242,7 @@ impl Buffer {
             device: device.clone(),
             raw,
             allocation: Some(allocation),
+            location,
             size,
         };
         bound.map(|()| buffer)
@@ -193,7 +274,7 @@ impl Drop for Buffer {
         // SAFETY: the owner guarantees the GPU no longer uses the buffer.
         unsafe { self.device.raw.destroy_buffer(self.raw, None) };
         if let Some(allocation) = self.allocation.take() {
-            free(&self.device, allocation);
+            free(&self.device, allocation, self.location);
         }
     }
 }
@@ -594,11 +675,11 @@ impl Drop for Image {
         // SAFETY: the owner guarantees the GPU no longer uses the image.
         unsafe { self.device.raw.destroy_image(self.raw, None) };
         if let Some(allocation) = self.allocation.take() {
-            free(&self.device, allocation);
+            free(&self.device, allocation, MemoryLocation::GpuOnly);
         }
         if let Some(sparse) = self.sparse.take() {
             for allocation in sparse.allocations {
-                free(&self.device, allocation);
+                free(&self.device, allocation, MemoryLocation::GpuOnly);
             }
         }
     }
@@ -702,5 +783,81 @@ impl Drop for ImageView {
     fn drop(&mut self) {
         // SAFETY: the owner guarantees the GPU no longer uses the view.
         unsafe { self.device.raw.destroy_image_view(self.raw, None) };
+    }
+}
+#[cfg(test)]
+mod tests {
+    use lichii_common::settings::GraphicsSettings;
+
+    use super::*;
+    use crate::descriptors::DescriptorAllocator;
+    use crate::{Instance, SurfaceSupport};
+
+    fn device() -> Option<Arc<Device>> {
+        let instance = match Instance::new(true, SurfaceSupport::None) {
+            Ok(instance) => Arc::new(instance),
+            Err(error) => {
+                eprintln!("skipping: {error}");
+                return None;
+            }
+        };
+        match Device::new(instance, &GraphicsSettings::default(), None) {
+            Ok(device) => Some(device),
+            Err(error) => {
+                eprintln!("skipping: {error}");
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn counters_follow_allocations_and_frees_of_each_location() {
+        let Some(device) = device() else { return };
+        let before = device.memory_counts();
+        let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+        let new = |location, size| Buffer::new(&device, size, usage, location, "test").unwrap();
+        let buffers = [
+            new(MemoryLocation::GpuOnly, 1 << 20),
+            new(MemoryLocation::CpuToGpu, 2 << 20),
+            new(MemoryLocation::CpuToGpu, 3 << 20),
+            new(MemoryLocation::GpuToCpu, 4 << 20),
+        ];
+        let image = Image::new(
+            &device,
+            &ImageDesc::d2(
+                vk::Format::R8G8B8A8_UNORM,
+                256,
+                256,
+                vk::ImageUsageFlags::SAMPLED,
+            ),
+            "test",
+        )
+        .unwrap();
+        let during = device.memory_counts();
+        let grew = |after: LiveMemory, before: LiveMemory| {
+            (after.bytes - before.bytes, after.count - before.count)
+        };
+        let (gpu_only_bytes, gpu_only_count) = grew(during.gpu_only, before.gpu_only);
+        assert_eq!(gpu_only_count, 2, "a buffer and an image");
+        assert!(gpu_only_bytes >= (1 << 20) + 256 * 256 * 4);
+        let (upload_bytes, upload_count) = grew(during.cpu_to_gpu, before.cpu_to_gpu);
+        assert_eq!(upload_count, 2);
+        assert!(upload_bytes >= 5 << 20);
+        let (readback_bytes, readback_count) = grew(during.gpu_to_cpu, before.gpu_to_cpu);
+        assert_eq!(readback_count, 1);
+        assert!(readback_bytes >= 4 << 20);
+        drop(buffers);
+        drop(image);
+        assert_eq!(device.memory_counts(), before, "every free is counted");
+    }
+
+    #[test]
+    fn descriptor_pools_are_counted_until_their_allocator_drops() {
+        let Some(device) = device() else { return };
+        let before = device.descriptor_pools();
+        let descriptors = DescriptorAllocator::new(&device).unwrap();
+        assert_eq!(device.descriptor_pools(), before + 1);
+        drop(descriptors);
+        assert_eq!(device.descriptor_pools(), before);
     }
 }

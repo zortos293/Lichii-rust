@@ -9,6 +9,7 @@ pub mod descriptors;
 pub mod device;
 mod error;
 pub mod format;
+pub mod host_budget;
 mod host_compute;
 pub mod instance;
 pub mod memory;
