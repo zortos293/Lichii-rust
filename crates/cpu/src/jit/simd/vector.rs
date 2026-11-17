@@ -593,6 +593,34 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         t.set(Loc::V(rd), r);
         return true;
     }
+    if word & 0x9f20_dc00 == 0x0e20_4000 && size < 3 {
+        let (n, m) = (vec(t, rn), vec(t, rm));
+        let wide = Arrangement {
+            size: size + 1,
+            q: true,
+        };
+        let op = if word & 0x2000 != 0 {
+            Binary::Sub
+        } else {
+            Binary::Add
+        };
+        let mut x = emit(t, VecOp::Binary(op, wide, n, m));
+        if u {
+            let half = 1u64 << ((8 << size) - 1);
+            let lanes = match size {
+                0 => half * 0x0001_0001_0001_0001,
+                1 => half * 0x0000_0001_0000_0001,
+                _ => half,
+            };
+            let round = emit(t, VecOp::Imm(lanes, true));
+            x = emit(t, VecOp::Binary(Binary::Add, wide, x, round));
+        }
+        let high = emit(t, VecOp::Shift(Shift::Ushr, wide, 8 << size, x));
+        let low = q.then(|| vec(t, rd));
+        let r = emit(t, VecOp::Narrow { size, a: high, low });
+        t.set(Loc::V(rd), r);
+        return true;
+    }
     if word & 0x9f20_0c00 == 0x0e20_0000 && size < 3 {
         let signed = !u;
         let (op, acc) = match field(word, 12, 4) {
