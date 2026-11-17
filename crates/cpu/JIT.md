@@ -82,7 +82,7 @@ Both host OSes use one ABI. The entry trampoline and every helper the JIT calls 
 
 ## Atomics and exclusives
 
-- `LDADD` is `lock xadd` and `SWP` is `xchg`. `LDCLR`, `LDEOR`, `LDSET` and the min/max ops are `lock cmpxchg` loops. `CAS` is `lock cmpxchg` and `CASP` is `lock cmpxchg8b`/`cmpxchg16b`. All of them work on the fastmem pointer after an inline alignment check, so a misaligned access gives `CpuFault::Alignment` exactly as in the interpreter. This replaces dynarmic's exclusive retry loops (notes row 3).
+- `LDADD` is `lock xadd` and `SWP` is `xchg`. `LDCLR`, `LDEOR`, `LDSET` and the min/max ops are `lock cmpxchg` loops. `CAS` is `lock cmpxchg` and `CASP` is `lock cmpxchg8b`/`cmpxchg16b`. All of them work on the fastmem pointer after an inline alignment check. A misaligned access goes to the slow path, which runs it as the interpreter does: as a 16-byte `cmpxchg16b` loop over its granule when it fits inside one 16-byte granule (FEAT_LSE2 behaviour, which Switch 2 titles rely on), and as `CpuFault::Alignment` when it crosses one. This replaces dynarmic's exclusive retry loops (notes row 3).
 - `LDXR`/`STXR` call `ExclusiveMonitor::read`/`write` as helpers in the first version. That is correct against the monitor's 128-bit CAS (bb474c6) and against plain stores from other cores. Inlining them needs the monitor contract change proposed below.
 
 ## Dispatch, linking and interrupts

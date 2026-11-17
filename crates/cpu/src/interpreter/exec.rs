@@ -6,7 +6,7 @@ use std::sync::atomic::{
 };
 
 use lichii_common::VAddr;
-use lichii_memory::MemoryPermission;
+use lichii_memory::{AddressSpace, MemoryPermission};
 
 use super::simd;
 use crate::decoder::*;
@@ -310,21 +310,11 @@ impl Exec<'_> {
         }
     }
 
-    /// Runs `op` on the host pointer for an atomic access of `bytes` bytes, which must be
-    /// naturally aligned, so it lies in one mapped page.
-    fn atomic<R>(
-        &self,
-        addr: VAddr,
-        bytes: u64,
-        op: impl FnOnce(*mut u8) -> R,
-    ) -> Result<R, HaltReason> {
-        if addr & (bytes - 1) != 0 {
-            return Err(self.fault(CpuFault::Alignment { pc: self.pc, addr }));
-        }
-        self.cfg
-            .memory
-            .write_with(addr, MemoryPermission::READ_WRITE, op)
-            .map_err(|_| self.data_fault(addr, true))
+    fn lse(&self, addr: VAddr, size: u8, access: Lse) -> Result<u64, HaltReason> {
+        lse_atomic(&self.cfg.memory, addr, size, access).map_err(|fault| match fault {
+            LseFault::Alignment => self.fault(CpuFault::Alignment { pc: self.pc, addr }),
+            LseFault::Data => self.data_fault(addr, true),
+        })
     }
 
     fn check_exclusive_alignment(&self, addr: VAddr, bytes: u64) -> Result<(), HaltReason> {
@@ -926,22 +916,17 @@ impl Exec<'_> {
                 rn,
                 ..
             } => {
-                let operand = self.x(rs);
-                // SAFETY: `atomic` checked that the access is naturally aligned and inside one
-                // mapped guest page, which outlives this call.
-                let old = self.atomic(self.x(rn), 1 << size, |ptr| unsafe {
-                    atomic_rmw(ptr, size, op, operand)
-                })?;
+                let old = self.lse(self.x(rn), size, Lse::Rmw(op, self.x(rs)))?;
                 self.set(rt, old);
             }
             Inst::Cas {
                 size, rs, rt, rn, ..
             } => {
-                let (expected, new) = (self.x(rs), self.x(rt));
-                // SAFETY: as for `AtomicRmw`.
-                let old = self.atomic(self.x(rn), 1 << size, |ptr| unsafe {
-                    atomic_cas(ptr, size, expected, new)
-                })?;
+                let access = Lse::Cas {
+                    expected: self.x(rs),
+                    new: self.x(rt),
+                };
+                let old = self.lse(self.x(rn), size, access)?;
                 self.set(rs, old);
             }
             Inst::Casp {
@@ -950,20 +935,28 @@ impl Exec<'_> {
                 let pair = |r: u8| (self.x(Reg(r)), self.x(Reg(r + 1)));
                 let ((e0, e1), (n0, n1)) = (pair(rs), pair(rt));
                 let (o0, o1) = if size == 2 {
-                    let expected = (e1 << 32) | (e0 & 0xffff_ffff);
-                    let new = (n1 << 32) | (n0 & 0xffff_ffff);
-                    // SAFETY: as for `AtomicRmw`.
-                    let old = self.atomic(self.x(rn), 2 << size, |ptr| unsafe {
-                        atomic_cas(ptr, 3, expected, new)
-                    })?;
+                    let access = Lse::Cas {
+                        expected: (e1 << 32) | (e0 & 0xffff_ffff),
+                        new: (n1 << 32) | (n0 & 0xffff_ffff),
+                    };
+                    let old = self.lse(self.x(rn), 3, access)?;
                     (old & 0xffff_ffff, old >> 32)
                 } else {
                     let expected = (e1 as u128) << 64 | e0 as u128;
                     let new = (n1 as u128) << 64 | n0 as u128;
-                    // SAFETY: `atomic` checked 16-byte alignment, so the pair lies in one page.
-                    let old = self.atomic(self.x(rn), 2 << size, |ptr| unsafe {
-                        cas128(ptr, expected, new)
-                    })?;
+                    let addr = self.x(rn);
+                    if addr & 15 != 0 {
+                        return Err(self.fault(CpuFault::Alignment { pc, addr }));
+                    }
+                    let old = self
+                        .cfg
+                        .memory
+                        .write_with(addr, MemoryPermission::READ_WRITE, |ptr| {
+                            // SAFETY: the pair is 16-byte aligned, so it lies in one mapped guest
+                            // page, which outlives this call.
+                            unsafe { cas128(ptr, expected, new) }
+                        })
+                        .map_err(|_| self.data_fault(addr, true))?;
                     (old as u64, (old >> 64) as u64)
                 };
                 self.set(Reg(rs), o0);
@@ -1128,7 +1121,7 @@ macro_rules! rmw {
 
 /// # Safety
 /// `ptr` must be valid for `1 << size` bytes and aligned to them.
-pub(crate) unsafe fn atomic_rmw(ptr: *mut u8, size: u8, op: AtomicOp, operand: u64) -> u64 {
+unsafe fn atomic_rmw(ptr: *mut u8, size: u8, op: AtomicOp, operand: u64) -> u64 {
     match size {
         0 => rmw!(AtomicU8, AtomicI8, u8, i8, ptr, op, operand),
         1 => rmw!(AtomicU16, AtomicI16, u16, i16, ptr, op, operand),
@@ -1141,7 +1134,7 @@ pub(crate) unsafe fn atomic_rmw(ptr: *mut u8, size: u8, op: AtomicOp, operand: u
 ///
 /// # Safety
 /// `ptr` must be valid for `1 << size` bytes and aligned to them.
-pub(crate) unsafe fn atomic_cas(ptr: *mut u8, size: u8, expected: u64, new: u64) -> u64 {
+unsafe fn atomic_cas(ptr: *mut u8, size: u8, expected: u64, new: u64) -> u64 {
     macro_rules! cas {
         ($atomic:ty) => {{
             // SAFETY: guaranteed by the caller.
@@ -1155,6 +1148,94 @@ pub(crate) unsafe fn atomic_cas(ptr: *mut u8, size: u8, expected: u64, new: u64)
         1 => cas!(AtomicU16),
         2 => cas!(AtomicU32),
         _ => cas!(AtomicU64),
+    }
+}
+
+/// An `LD<op>`, `SWP` or `CAS` of at most 8 bytes.
+#[derive(Clone, Copy)]
+pub(crate) enum Lse {
+    Rmw(AtomicOp, u64),
+    Cas { expected: u64, new: u64 },
+}
+
+/// Why [`lse_atomic`] did not run.
+pub(crate) enum LseFault {
+    Alignment,
+    Data,
+}
+
+/// Runs `access` on the `1 << size` bytes at `addr` and returns the value they held. As with
+/// FEAT_LSE2, an access that is not naturally aligned is still single-copy atomic while it stays
+/// inside one 16-byte granule, and one that crosses a granule is an alignment fault. Switch 2
+/// titles rely on this: OoT increments a reference count at an odd address.
+pub(crate) fn lse_atomic(
+    memory: &AddressSpace,
+    addr: VAddr,
+    size: u8,
+    access: Lse,
+) -> Result<u64, LseFault> {
+    let bytes = 1u64 << size;
+    let offset = addr & 15;
+    if offset + bytes > 16 {
+        return Err(LseFault::Alignment);
+    }
+    let aligned = addr & (bytes - 1) == 0;
+    let at = if aligned { addr } else { addr & !15 };
+    memory
+        .write_with(at, MemoryPermission::READ_WRITE, |ptr| {
+            // SAFETY: `ptr` is either the naturally aligned access itself or the 16-byte granule
+            // holding it; neither leaves the mapped guest page of `ptr`.
+            unsafe {
+                match (aligned, access) {
+                    (true, Lse::Rmw(op, operand)) => atomic_rmw(ptr, size, op, operand),
+                    (true, Lse::Cas { expected, new }) => atomic_cas(ptr, size, expected, new),
+                    (false, _) => granule_atomic(ptr, offset as u32, size, access),
+                }
+            }
+        })
+        .map_err(|_| LseFault::Data)
+}
+
+/// Runs `access` on the `1 << size` bytes at byte `offset` of `granule` with a 16-byte
+/// compare-and-swap loop.
+///
+/// # Safety
+/// `granule` must be valid for 16 bytes and 16-byte aligned, and the access must fit inside it.
+unsafe fn granule_atomic(granule: *mut u8, offset: u32, size: u8, access: Lse) -> u64 {
+    // SAFETY: guaranteed by the caller.
+    let a = unsafe { portable_atomic::AtomicU128::from_ptr(granule.cast()) };
+    let bits = 8 << size;
+    let width = width_bits(bits);
+    let shift = offset * 8;
+    let mask = u128::from(width) << shift;
+    let signed = |v: u64| ((v << (64 - bits)) as i64) >> (64 - bits);
+    let mut current = a.load(Ordering::SeqCst);
+    loop {
+        let old = ((current & mask) >> shift) as u64;
+        let new = match access {
+            Lse::Cas { expected, .. } if old != expected & width => return old,
+            Lse::Cas { new, .. } => new,
+            Lse::Rmw(op, operand) => {
+                let operand = operand & width;
+                match op {
+                    AtomicOp::Add => old.wrapping_add(operand),
+                    AtomicOp::Clr => old & !operand,
+                    AtomicOp::Eor => old ^ operand,
+                    AtomicOp::Set => old | operand,
+                    AtomicOp::Smax if signed(operand) > signed(old) => operand,
+                    AtomicOp::Smin if signed(operand) < signed(old) => operand,
+                    AtomicOp::Smax | AtomicOp::Smin => old,
+                    AtomicOp::Umax => old.max(operand),
+                    AtomicOp::Umin => old.min(operand),
+                    AtomicOp::Swp => operand,
+                }
+            }
+        };
+        let next = current & !mask | (u128::from(new) << shift) & mask;
+        match a.compare_exchange_weak(current, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return old,
+            Err(seen) => current = seen,
+        }
     }
 }
 

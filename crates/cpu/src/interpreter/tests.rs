@@ -321,10 +321,72 @@ fn narrow_signed_atomics_compare_signed_values() {
 }
 
 #[test]
+fn unaligned_atomics_inside_a_granule_run() {
+    let mut h = harness(&[
+        0xb8290108, // ldadd w9, w8, [x8]
+        0xf8210283, // ldadd x1, x3, [x20]
+        0x88aa7eab, // cas w10, w11, [x21]
+        0x88ac7ecd, // cas w12, w13, [x22]
+        0x782e42ef, // ldsmaxh w14, w15, [x23]
+        0xd4200000, // brk #0
+    ]);
+    h.mem.write_bytes(DATA + 0x50, &[0xaa; 0x40]).unwrap();
+    h.mem.write(DATA + 0x51, 5u32).unwrap();
+    h.mem.write(DATA + 0x63, 0x1122_3344_5566_7788u64).unwrap();
+    h.mem.write(DATA + 0x71, 7u32).unwrap();
+    h.mem.write(DATA + 0x75, 3u32).unwrap();
+    h.mem.write(DATA + 0x7b, 0xfff0u16).unwrap();
+    for (reg, value) in [
+        (8, DATA + 0x51),
+        (9, 1),
+        (20, DATA + 0x63),
+        (1, 0x100),
+        (21, DATA + 0x71),
+        (10, 7),
+        (11, 9),
+        (22, DATA + 0x75),
+        (12, 4),
+        (13, 100),
+        (23, DATA + 0x7b),
+        (14, 5),
+    ] {
+        h.ctx.x[reg] = value;
+    }
+    assert_eq!(h.core.run(&mut h.ctx), HaltReason::Breakpoint(0));
+    assert_eq!(
+        (h.ctx.x[8], h.mem.read::<u32>(DATA + 0x51).unwrap()),
+        (5, 6)
+    );
+    assert_eq!(
+        (h.ctx.x[3], h.mem.read::<u64>(DATA + 0x63).unwrap()),
+        (0x1122_3344_5566_7788, 0x1122_3344_5566_7888)
+    );
+    assert_eq!(
+        (h.ctx.x[10], h.mem.read::<u32>(DATA + 0x71).unwrap()),
+        (7, 9)
+    );
+    assert_eq!(
+        (h.ctx.x[12], h.mem.read::<u32>(DATA + 0x75).unwrap()),
+        (3, 3)
+    );
+    assert_eq!(
+        (h.ctx.x[15], h.mem.read::<u16>(DATA + 0x7b).unwrap()),
+        (0xfff0, 5)
+    );
+    for untouched in [0x50, 0x55, 0x62, 0x6b, 0x70, 0x79, 0x7a, 0x7d] {
+        assert_eq!(
+            h.mem.read::<u8>(DATA + untouched).unwrap(),
+            0xaa,
+            "{untouched:#x}"
+        );
+    }
+}
+
+#[test]
 fn misaligned_exclusives_and_atomics_fault() {
     for (word, addr) in [
         (0xc85f7c20u32, DATA + 4), // ldxr x0, [x1]
-        (0xb8200022, DATA + 2),    // ldadd w0, w2, [x1]
+        (0xb8200022, DATA + 14),   // ldadd w0, w2, [x1]
         (0x48227c24, DATA + 8),    // casp x2, x3, x4, x5, [x1]
     ] {
         let mut h = harness(&[word]);
