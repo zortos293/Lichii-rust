@@ -424,8 +424,11 @@ impl MaskedRangeSet {
         self.chunks.any(start, end.saturating_sub(start)) && self.ranges.intersects(start, end)
     }
 
+    #[inline]
     fn for_each_in(&self, start: u64, end: u64, f: impl FnMut(u64, u64)) {
-        self.ranges.for_each_in(start, end, f);
+        if self.chunks.any(start, end.saturating_sub(start)) {
+            self.ranges.for_each_in(start, end, f);
+        }
     }
 }
 
@@ -2387,8 +2390,8 @@ mod tests {
     use crate::{Instance, SurfaceSupport};
 
     /// A seeded random stream of GPU-written range insertions and write-backs: the masked set
-    /// answers every intersection test as the plain set does, and its chunk mask holds exactly
-    /// the chunks of its ranges.
+    /// answers every intersection test and reports the same parts of every range as the plain
+    /// set does, and its chunk mask holds exactly the chunks of its ranges.
     #[test]
     fn masked_ranges_intersect_as_the_plain_set() {
         let mut seed = 0xdead_beef_cafe_f00du64;
@@ -2429,6 +2432,13 @@ mod tests {
                         "step {step}: [{start:#x}, {end:#x})"
                     );
                     hits += usize::from(expected);
+                    let (mut masked_parts, mut plain_parts) = (Vec::new(), Vec::new());
+                    masked.for_each_in(start, end, |s, e| masked_parts.push((s, e)));
+                    plain.for_each_in(start, end, |s, e| plain_parts.push((s, e)));
+                    assert_eq!(
+                        masked_parts, plain_parts,
+                        "step {step}: [{start:#x}, {end:#x})"
+                    );
                 }
             }
             if step % 64 == 0 {
