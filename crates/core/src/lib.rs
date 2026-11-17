@@ -123,6 +123,7 @@ impl System {
         let options = LoadOptions {
             mods: ModOptions {
                 builtin_patches: settings.system.builtin_game_patches,
+                mkw_dynamic_fps: settings.system.mkw_dynamic_fps,
                 ..ModOptions::default()
             },
             ..LoadOptions::default()

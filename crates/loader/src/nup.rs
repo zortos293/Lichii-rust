@@ -921,7 +921,7 @@ pub(crate) fn load(path: &Path, options: &LoadOptions) -> LoaderResult<ProgramIm
     let mods = Mods::find(&options.mods, program.title_id)?;
     let exefs = mods.layer_exefs(selection.exefs.clone())?;
     let (npdm, mut modules) = load_exefs(exefs.as_ref(), options.hashes)?;
-    mods.patch_modules(&mut modules)?;
+    let present_interval = mods.patch_modules(&mut modules)?;
     let meta = nup.metadata(&selection);
     let nacp = build_nacp(&meta, program.title_id, &nup.display_version(&selection));
     let romfs = mods.layer_romfs(nup.merged_romfs(&selection)?)?;
@@ -929,6 +929,7 @@ pub(crate) fn load(path: &Path, options: &LoadOptions) -> LoaderResult<ProgramIm
     image.icon = icon(&meta, options.language);
     image.version = nup.packages[selection.update.unwrap_or(selection.program)].version;
     image.add_ons = nup.add_ons();
+    image.present_interval = present_interval;
     Ok(image)
 }
 

@@ -130,6 +130,7 @@ pub fn program_image(program_id: u64) -> ProgramImage {
         version: 0,
         pseudo_device_seed: program_id,
         add_ons: Vec::new(),
+        present_interval: None,
     }
 }
 

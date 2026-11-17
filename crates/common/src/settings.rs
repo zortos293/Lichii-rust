@@ -281,6 +281,10 @@ pub struct SystemSettings {
     /// Max Resolution with the Texture Pool x2 it needs, and its Dynamic FPS. Off turns them all
     /// off.
     pub builtin_game_patches: bool,
+    /// Mario Kart World's dynamic FPS mode, as the C++ Lichii's `mkw_dynamic_fps`: the game takes
+    /// one or two 1/60 s steps a frame to keep real speed at any frame rate, instead of playing a
+    /// slow frame in slow motion. Off by default, as there.
+    pub mkw_dynamic_fps: bool,
 }
 
 /// The [`SystemSettings::time_zone`] value that follows the host's time zone.
@@ -301,6 +305,7 @@ impl Default for SystemSettings {
             enforce_service_access: false,
             exit_timeout_ms: 2000,
             builtin_game_patches: true,
+            mkw_dynamic_fps: false,
         }
     }
 }

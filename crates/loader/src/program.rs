@@ -177,6 +177,9 @@ pub struct ProgramImage {
     /// Seed for `GetPseudoDeviceId`: the NACP's, or the program id when there is no NACP.
     pub pseudo_device_seed: u64,
     pub add_ons: Vec<AddOnContent>,
+    /// The swap interval a patch made the title's presents follow, overriding the one each
+    /// present names: 1 under Mario Kart World's dynamic FPS mode.
+    pub present_interval: Option<u32>,
 }
 
 impl ProgramImage {
@@ -220,6 +223,7 @@ impl ProgramImage {
             version: 0,
             pseudo_device_seed,
             add_ons: Vec::new(),
+            present_interval: None,
         }
     }
 
