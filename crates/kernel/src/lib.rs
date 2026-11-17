@@ -119,6 +119,8 @@ pub enum KernelError {
 
 pub(crate) struct KernelInner {
     pub console: ConsoleGeneration,
+    /// How long an idle service thread polls before it parks ([`service_poll`]).
+    service_poll: Duration,
     pub physical: Arc<PhysicalMemory>,
     pub memory: Arc<MemoryManager>,
     pub scheduler: Arc<Scheduler>,
@@ -170,7 +172,8 @@ impl Kernel {
         let memory = Arc::new(MemoryManager::new(physical.clone(), layout));
         let cores = config.console.core_count();
         let service_manager = Arc::new(ServiceManager::new(config.enforce_service_access));
-        let sm_thread = ServiceThread::new("sm");
+        let service_poll = service_poll(config.console);
+        let sm_thread = ServiceThread::new("sm", service_poll);
         let named_ports = vec![(
             "sm:".to_string(),
             sm_thread.clone(),
@@ -184,6 +187,7 @@ impl Kernel {
             named_ports: Mutex::new(named_ports),
             service_manager,
             console: config.console,
+            service_poll,
             application_limit: Arc::new(ResourceLimit::application(memory.size(Pool::Application))),
             physical,
             memory,
@@ -263,7 +267,7 @@ impl Kernel {
     /// A new host thread for HLE sessions. It starts with [`Kernel::run`] (at once when the
     /// kernel already runs); requests queue until then.
     pub fn create_service_thread(&self, name: &str) -> Result<ServiceThread, KernelError> {
-        let thread = ServiceThread::new(name);
+        let thread = ServiceThread::new(name, self.0.service_poll);
         let mut services = self.0.services.lock();
         if services.running {
             let join = thread.spawn().map_err(KernelError::Spawn)?;
@@ -448,6 +452,21 @@ const SERVICE_STOP_TIMEOUT: Duration = Duration::from_millis(300);
 /// `LICHII_IDLE_POLL_US` overrides it; 0 turns polling off.
 fn idle_poll(console: ConsoleGeneration) -> Duration {
     let us = std::env::var("LICHII_IDLE_POLL_US")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(match console {
+            ConsoleGeneration::Switch1 => 0,
+            ConsoleGeneration::Switch2 => 100,
+        });
+    Duration::from_micros(us)
+}
+
+/// How long an idle service thread polls for its next request before it parks. A guest IPC then
+/// reaches its service without a host thread wake-up, the same cost [`idle_poll`] takes off
+/// cross-core handoffs; Switch 1 titles park at once. `LICHII_SERVICE_POLL_US` overrides it; 0
+/// turns polling off.
+fn service_poll(console: ConsoleGeneration) -> Duration {
+    let us = std::env::var("LICHII_SERVICE_POLL_US")
         .ok()
         .and_then(|value| value.trim().parse().ok())
         .unwrap_or(match console {

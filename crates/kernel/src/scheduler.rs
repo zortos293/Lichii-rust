@@ -283,7 +283,7 @@ impl Scheduler {
             let poll = c.poll_ns.load(Ordering::Relaxed);
             let polled = poll != 0
                 && !self.paused.load(Ordering::Acquire)
-                && poll_for_wake(c, start + Duration::from_nanos(poll));
+                && poll_flag(&c.woken, start + Duration::from_nanos(poll));
             let mut notified = c.notified.lock();
             if !polled && !*notified && !self.shutdown.load(Ordering::Acquire) {
                 c.wakeup.wait_for(&mut notified, PARK_TIMEOUT);
@@ -548,12 +548,12 @@ enum Take {
     Empty,
 }
 
-/// Waits for [`Scheduler::unpark`] on `core` until `deadline`: pauses between reads of the flag,
-/// and yields the host core now and then so an idle guest core never starves a host thread.
-fn poll_for_wake(core: &Core, deadline: Instant) -> bool {
+/// Waits until `flag` is set or `deadline` passes, and returns whether it was set: pauses between
+/// reads of the flag, and yields the host core now and then so a poll never starves a host thread.
+pub(crate) fn poll_flag(flag: &AtomicBool, deadline: Instant) -> bool {
     let mut spins = 0u32;
     loop {
-        if core.woken.load(Ordering::Acquire) {
+        if flag.load(Ordering::Acquire) {
             return true;
         }
         spins = spins.wrapping_add(1);
@@ -572,7 +572,7 @@ fn poll_for_wake(core: &Core, deadline: Instant) -> bool {
 /// reference's `NextPollWindow` adapt it: an idle period the poll caught keeps the window, one a
 /// longer poll would have caught doubles it up to `limit`, and one past the limit halves it, down
 /// to an eighth of the limit.
-fn next_poll_window(poll: u64, waited: u64, limit: u64) -> u64 {
+pub(crate) fn next_poll_window(poll: u64, waited: u64, limit: u64) -> u64 {
     if waited <= poll {
         poll
     } else if waited <= limit {
