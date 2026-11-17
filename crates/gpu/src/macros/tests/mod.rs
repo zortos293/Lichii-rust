@@ -22,6 +22,8 @@ struct TestHost {
     dma_reads: Vec<(u64, usize)>,
     /// Methods a shadow run wrote with values from its DMA reads.
     unknown: Vec<u32>,
+    /// Words a tracked run's DMA reads know without waiting.
+    known: HashMap<u64, u32>,
 }
 
 impl MacroHost for TestHost {
@@ -49,6 +51,17 @@ impl MacroHost for TestHost {
     fn write_unknown(&mut self, method: u32) -> bool {
         self.unknown.push(method);
         true
+    }
+
+    fn dma_peek(&mut self, gpu_va: u64, out: &mut [u32]) -> u64 {
+        let mut known = 0;
+        for (i, word) in out.iter_mut().enumerate().take(64) {
+            if let Some(&value) = self.known.get(&(gpu_va + 4 * i as u64)) {
+                *word = value;
+                known |= 1 << i;
+            }
+        }
+        known
     }
 }
 

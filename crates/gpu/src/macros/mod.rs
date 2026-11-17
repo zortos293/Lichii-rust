@@ -81,6 +81,74 @@ pub trait MacroHost {
     fn write_unknown(&mut self, _method: u32) -> bool {
         false
     }
+    /// A tracked run's DMA read of `out.len()` words at `gpu_va`: fills the words whose values
+    /// are known without waiting for the GPU, and returns them as a mask (bit n for word n, the
+    /// first 64 only). The default knows none.
+    fn dma_peek(&mut self, _gpu_va: u64, _out: &mut [u32]) -> u64 {
+        0
+    }
+}
+
+/// FIFOed read words a condition run ([`MacroEngine::condition_execute`]) follows.
+const READ_WORDS: usize = 64;
+
+/// A condition run ([`MacroEngine::condition_execute`]): the call's FIFOed read words are known
+/// where [`MacroHost::dma_peek`] knows them, and the run may test the others once, for whether
+/// they all equal values it compares them with. The run takes that test the way it is told.
+#[derive(Clone)]
+pub struct ReadCondition {
+    registers: [turing::Tag; 24],
+    read_known: u64,
+    read_at: [u64; READ_WORDS],
+    expected: [u32; READ_WORDS],
+    expecting: u64,
+    tested: Option<u64>,
+    differs: bool,
+}
+
+impl ReadCondition {
+    /// A run whose test goes the way it goes when some tested word differs from the value the
+    /// call compares it with (`differs`), or when they all equal theirs.
+    pub fn new(differs: bool) -> Self {
+        Self {
+            registers: [turing::Tag::Known; 24],
+            read_known: 0,
+            read_at: [0; READ_WORDS],
+            expected: [0; READ_WORDS],
+            expecting: 0,
+            tested: None,
+            differs,
+        }
+    }
+
+    /// The words the run's test compared, as their GPU addresses with the values the call
+    /// compared them with; None when the run tested none.
+    pub fn tested(&self) -> Option<impl Iterator<Item = (u64, u32)> + '_> {
+        let words = self.tested?;
+        Some(
+            (0..READ_WORDS)
+                .filter(move |&word| words & (1 << word) != 0)
+                .map(|word| (self.read_at[word], self.expected[word])),
+        )
+    }
+
+    /// The read words a zero test of a value tagged `tag` compares with the values the call
+    /// expects of them, recording those values; None when the value is no such comparison.
+    fn equal_words(&mut self, tag: turing::Tag) -> Option<u64> {
+        match tag {
+            turing::Tag::Equal { words } => Some(words),
+            turing::Tag::Word { word, xor } => {
+                let bit = 1u64 << word;
+                if self.expecting & bit != 0 && self.expected[word as usize] != xor {
+                    return None;
+                }
+                self.expecting |= bit;
+                self.expected[word as usize] = xor;
+                Some(bit)
+            }
+            turing::Tag::Known | turing::Tag::Opaque => None,
+        }
+    }
 }
 
 /// Which values of a shadow run ([`MacroEngine::shadow_execute`]) come from the words its DMA
@@ -549,6 +617,48 @@ impl MacroEngine {
             },
             self.step_limit,
             taint,
+        )
+        .map_err(|fault| MacroError {
+            kind: fault.kind,
+            start,
+            pc: fault.pc,
+        })
+    }
+
+    /// Runs the MME64 macro at `start` as a condition run (`condition`): FIFOed read words come
+    /// from [`MacroHost::dma_peek`], and the one test of the others it may make goes the way
+    /// `condition` says. Every write goes to `host.write_method`. Fails with
+    /// [`MacroErrorKind::DependsOnRead`] when unknown read words steer the call any other way or
+    /// reach a write, and with [`MacroErrorKind::UsesDataRam`] at the data RAM, which it leaves
+    /// as it was. Nothing is remembered.
+    pub fn condition_execute<H: MacroHost>(
+        &mut self,
+        start: u32,
+        parameters: &[u32],
+        data_ram: &mut MacroDataRam,
+        host: &mut H,
+        condition: &mut ReadCondition,
+    ) -> Result<(), MacroError> {
+        let Code::Mme64(code) = &self.code else {
+            return Err(MacroError {
+                kind: MacroErrorKind::DependsOnRead,
+                start,
+                pc: start,
+            });
+        };
+        self.record.begin(false);
+        turing::run(
+            code,
+            start,
+            turing::Io {
+                parameters,
+                load_fifo: &mut self.load_fifo,
+                data_ram,
+                host,
+                record: &mut self.record,
+            },
+            self.step_limit,
+            condition,
         )
         .map_err(|fault| MacroError {
             kind: fault.kind,

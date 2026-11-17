@@ -1,7 +1,8 @@
 use super::masm::*;
 use super::{TestHost, engine_with};
 use crate::macros::{
-    MACRO_METHOD_BASE, MacroDataRam, MacroEngine, MacroError, MacroErrorKind, MacroIsa, ReadTaint,
+    MACRO_METHOD_BASE, MacroDataRam, MacroEngine, MacroError, MacroErrorKind, MacroIsa,
+    ReadCondition, ReadTaint,
 };
 
 fn engine(program: &[Inst]) -> MacroEngine {
@@ -647,4 +648,138 @@ fn errors_never_panic() {
         (run_off.kind, run_off.pc),
         (MacroErrorKind::OutsideCode, 0x2AAA)
     );
+}
+
+const REPORT_VA: u64 = (0x1_0001u64 << 32) | 0x1000;
+
+/// Reads six words at the report address and writes RENDER_ENABLE_MODE 0 when the 64-bit value
+/// at word 0 equals the one at word 4 and 1 otherwise, ignoring words 2 and 3 (an occlusion
+/// test's macro); `steer` replaces the comparison.
+fn occlusion_program(steer: [Inst; 2]) -> [Inst; 10] {
+    [
+        inst(imm(0x1154), nop())
+            .out0(IMM0, OUT_LOAD0)
+            .out1(NONE, OUT_LOAD1),
+        inst(imm(0x0158), imm(6)).out0(IMM0, IMM1),
+        inst(alu(EXTENDED, ZERO, IMM, IMM, 0x1000), nop()),
+        inst(alu(ADD, 1, LOAD0, ZERO, 0), alu(ADD, 0, LOAD1, ZERO, 0)),
+        inst(alu(ADD, ZERO, LOAD0, LOAD1, 0), nop()),
+        steer[0],
+        steer[1],
+        inst(imm(0), imm(1))
+            .out0(NONE, IMM0)
+            .out1(NONE, IMM1)
+            .pred(9, 1)
+            .end(),
+        inst(nop(), nop()),
+        inst(nop(), nop()),
+    ]
+}
+
+fn compare_with_word_4() -> [Inst; 2] {
+    [
+        inst(alu(XOR, 1, 1, LOAD0, 0), alu(XOR, 0, 0, LOAD1, 0)),
+        inst(alu(OR, 1, 1, 0, 0), imm(0x556)).out1(IMM1, NONE),
+    ]
+}
+
+fn condition_run(
+    program: &[Inst],
+    known: &[(u64, u32)],
+    differs: bool,
+) -> (Result<(), MacroError>, TestHost, ReadCondition) {
+    let mut host = TestHost::default();
+    host.known.extend(known.iter().copied());
+    let mut condition = ReadCondition::new(differs);
+    let result = engine(program).condition_execute(
+        0,
+        &[0x1_0001, 0x1000],
+        &mut MacroDataRam::new(),
+        &mut host,
+        &mut condition,
+    );
+    (result, host, condition)
+}
+
+#[test]
+fn condition_runs_take_a_zero_test_of_read_words_each_way() {
+    let program = occlusion_program(compare_with_word_4());
+    let known = [(REPORT_VA + 16, 0), (REPORT_VA + 20, 0)];
+    for (differs, mode) in [(false, 0), (true, 1)] {
+        let (result, host, condition) = condition_run(&program, &known, differs);
+        result.unwrap();
+        assert!(host.dma_reads.is_empty());
+        assert!(host.unknown.is_empty());
+        assert_eq!(
+            host.writes,
+            [
+                (0x154, 0x1_0001),
+                (0x155, 0x1000),
+                (0x158, 6),
+                (0x556, mode)
+            ]
+        );
+        let tested: Vec<_> = condition.tested().unwrap().collect();
+        assert_eq!(tested, [(REPORT_VA, 0), (REPORT_VA + 4, 0)]);
+    }
+}
+
+#[test]
+fn condition_runs_compare_with_the_words_they_know() {
+    let program = occlusion_program(compare_with_word_4());
+    let known = [(REPORT_VA + 16, 7), (REPORT_VA + 20, 0)];
+    let (result, _, condition) = condition_run(&program, &known, false);
+    result.unwrap();
+    let tested: Vec<_> = condition.tested().unwrap().collect();
+    assert_eq!(tested, [(REPORT_VA, 7), (REPORT_VA + 4, 0)]);
+}
+
+#[test]
+fn condition_runs_stop_where_unknown_words_meet() {
+    let program = occlusion_program(compare_with_word_4());
+    let (result, _, _) = condition_run(&program, &[(REPORT_VA + 16, 0)], false);
+    assert_eq!(result.unwrap_err().kind, MacroErrorKind::DependsOnRead);
+}
+
+#[test]
+fn condition_runs_stop_at_tests_other_than_zero() {
+    let threshold = [
+        inst(alu(SLTU, 1, 1, IMM, 5), nop()),
+        inst(nop(), imm(0x556)).out1(IMM1, NONE),
+    ];
+    let (result, _, _) = condition_run(&occlusion_program(threshold), &[], false);
+    assert_eq!(result.unwrap_err().kind, MacroErrorKind::DependsOnRead);
+
+    let nonzero = [
+        inst(alu(SLTU, 1, ZERO, 1, 0), nop()),
+        inst(nop(), imm(0x556)).out1(IMM1, NONE),
+    ];
+    for (differs, mode) in [(false, 0), (true, 1)] {
+        let (result, host, _) = condition_run(&occlusion_program(nonzero), &[], differs);
+        result.unwrap();
+        assert_eq!(host.writes.last(), Some(&(0x556, mode)));
+    }
+}
+
+#[test]
+fn condition_runs_stop_where_read_words_are_written() {
+    let write = [
+        inst(nop(), imm(0x556)).out1(IMM1, NONE),
+        inst(alu(ADD, 2, 1, ZERO, 0), nop()).out0(NONE, ALU0),
+    ];
+    let (result, host, _) = condition_run(&occlusion_program(write), &[], false);
+    assert_eq!(result.unwrap_err().kind, MacroErrorKind::DependsOnRead);
+    assert!(host.unknown.is_empty());
+}
+
+#[test]
+fn condition_runs_without_a_test_report_none() {
+    let none = [
+        inst(nop(), imm(0x556)).out1(IMM1, NONE),
+        inst(alu(ADD, 1, ZERO, IMM, 1), nop()),
+    ];
+    let (result, host, condition) = condition_run(&occlusion_program(none), &[], false);
+    result.unwrap();
+    assert_eq!(host.writes.last(), Some(&(0x556, 1)));
+    assert!(condition.tested().is_none());
 }
