@@ -38,7 +38,7 @@ use lichii_shader::{
     DescriptorKind, RuntimeInfo, ShaderArch, ShaderInfo, ShaderModule, ShaderStage,
 };
 use lichii_texture::block_linear::GobLayout;
-use lichii_texture::guest::RenderTargetFormat;
+use lichii_texture::guest::{DepthFormat, RenderTargetFormat};
 use lichii_texture::tic::TextureMemory;
 use lichii_texture::{Numeric, PixelFormat};
 
@@ -49,7 +49,7 @@ use crate::buffer_cache::{BufferBinding, IndexBinding, assembled_topology, verte
 use crate::commands::ImageAccess;
 use crate::debug::{Program, Programs};
 use crate::descriptors::DescriptorAllocator;
-use crate::device::Device;
+use crate::device::{Device, DeviceFeatures};
 use crate::error::Result;
 use crate::memory::{Buffer, BufferView};
 use crate::pipeline::environment::{
@@ -310,6 +310,7 @@ pub(super) struct DrawState {
     eds3: ash::ext::extended_dynamic_state3::Device,
     vertex_input: ash::ext::vertex_input_dynamic_state::Device,
     mesh: ash::ext::mesh_shader::Device,
+    depth_bias_control: ash::ext::depth_bias_control::Device,
     null_buffer: Buffer,
     null_images: null::NullImages,
     arch: ShaderArch,
@@ -443,6 +444,10 @@ impl DrawState {
                 &device.raw,
             ),
             mesh: ash::ext::mesh_shader::Device::new(&device.instance.raw, &device.raw),
+            depth_bias_control: ash::ext::depth_bias_control::Device::new(
+                &device.instance.raw,
+                &device.raw,
+            ),
             null_buffer,
             null_images: null::NullImages::default(),
             arch: if gob_layout == GobLayout::Switch2 {
@@ -760,6 +765,42 @@ fn per_primitive_generics(info: &ShaderInfo) -> u32 {
         .iter()
         .filter_map(|&line| Attribute(line as u16).generic_index())
         .fold(0, |mask, generic| mask | 1 << generic)
+}
+
+/// The constant, clamp, slope and representation of the draw's depth bias. The constant is
+/// half the register in units of the guest depth format's minimum resolvable difference.
+///
+/// A unorm guest format's units hold whatever host format stands in for it: the float
+/// representation turns them into absolute depth, and the force-unorm one keeps them at
+/// 2^-n over the whole range. Force-unorm takes n from the host attachment (24 for a float
+/// one), so only a guest D16 on a float host would get 2^-24 units; D16 is native on every
+/// driver we run. Float guest formats, and devices with neither representation, use the host
+/// format's own units.
+fn depth_bias(
+    regs: &Regs,
+    features: &DeviceFeatures,
+) -> (f32, f32, f32, vk::DepthBiasRepresentationEXT) {
+    use DepthFormat as D;
+    use vk::DepthBiasRepresentationEXT as R;
+    let units = regs.depth_bias / 2.0;
+    let unorm_bits = match DepthFormat::try_from(regs.zeta.format) {
+        Ok(D::Z16Unorm) => Some(16),
+        Ok(D::Z24UnormS8Uint | D::X8Z24Unorm | D::S8Z24Unorm | D::V8Z24Unorm) => Some(24),
+        _ => None,
+    };
+    let (constant, representation) = match unorm_bits {
+        Some(bits) if features.depth_bias_float => (units / (1u32 << bits) as f32, R::FLOAT),
+        Some(_) if features.depth_bias_force_unorm => {
+            (units, R::LEAST_REPRESENTABLE_VALUE_FORCE_UNORM)
+        }
+        _ => (units, R::LEAST_REPRESENTABLE_VALUE_FORMAT),
+    };
+    (
+        constant,
+        regs.depth_bias_clamp,
+        regs.slope_scale_depth_bias,
+        representation,
+    )
 }
 
 /// The guest render area in pixels: the surface clip, or render target 0 without one.
@@ -2464,13 +2505,22 @@ impl VulkanRasterizer {
             shadow.set(Slot::LineWidth, line_width, || {
                 raw.cmd_set_line_width(cmd, line_width)
             });
-            let bias = (
-                regs.depth_bias / 2.0,
-                regs.depth_bias_clamp,
-                regs.slope_scale_depth_bias,
-            );
+            let device_features = &self.device.features;
+            let bias = depth_bias(regs, device_features);
             shadow.set(Slot::DepthBias, bias, || {
-                raw.cmd_set_depth_bias(cmd, bias.0, bias.1, bias.2)
+                let (constant, clamp, slope, representation) = bias;
+                if !device_features.depth_bias_control {
+                    return raw.cmd_set_depth_bias(cmd, constant, clamp, slope);
+                }
+                let mut representation = vk::DepthBiasRepresentationInfoEXT::default()
+                    .depth_bias_representation(representation)
+                    .depth_bias_exact(device_features.depth_bias_exact);
+                let info = vk::DepthBiasInfoEXT::default()
+                    .depth_bias_constant_factor(constant)
+                    .depth_bias_clamp(clamp)
+                    .depth_bias_slope_factor(slope)
+                    .push_next(&mut representation);
+                (draw.depth_bias_control.fp().cmd_set_depth_bias2_ext)(cmd, &info)
             });
             let constants = [color.r, color.g, color.b, color.a];
             shadow.set(Slot::BlendConstants, constants, || {

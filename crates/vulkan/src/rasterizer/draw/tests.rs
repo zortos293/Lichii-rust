@@ -29,6 +29,7 @@ use lichii_texture::block_linear::{GobLayout, Tiling, swizzle};
 
 use super::super::tests::{DADDR, Fixture, GPU_VA, fixture, gmmu, guest_linear, unorm8_eq};
 use super::{StageSources, Warning};
+use crate::device::DeviceFeatures;
 use crate::pipeline::environment::TexturePool;
 use crate::pipeline::shader_cache::{ShaderCache, ShaderCacheStats};
 use crate::rasterizer::VulkanRasterizer;
@@ -4770,4 +4771,78 @@ fn depth_bias_constants_offset_by_half_the_register_value() {
         &depths[..4]
     );
     f.assert_no_validation_errors();
+}
+
+/// Draws the full-target triangle at depth `z` into a 32-bit depth target of guest
+/// `format` with a depth bias register of 8 and reads the target back. `None` without a
+/// device whose features meet `exact`, the condition for an exact bias in `format`.
+fn biased_depth_words(format: u32, z: f32, exact: fn(&DeviceFeatures) -> bool) -> Option<Vec<u32>> {
+    let (mut f, gmmu) = draw_fixture()?;
+    if !exact(&f.rasterizer.device.features) {
+        return None;
+    }
+    write(&f, VERTEX_CBUF, &f32_bytes(&[z, 1.0]));
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    let mut regs = draw_regs();
+    let depth = GPU_VA + 0x8000;
+    regs.zeta.address_high = (depth >> 32) as u32;
+    regs.zeta.address_low = depth as u32;
+    regs.zeta.format = format;
+    regs.zeta.tile_mode = TileMode(1 << 4);
+    regs.zeta_size.width = SIZE;
+    regs.zeta_size.height = SIZE;
+    regs.zeta_size.bits = ZetaSizeBits(1 | 1 << 16);
+    regs.zeta_enable = 1;
+    regs.depth_test_enable = 1;
+    regs.depth_write_enabled = 1;
+    regs.depth_test_func = ComparisonOp::ALWAYS_GL;
+    regs.polygon_offset_fill_enable = 1;
+    regs.depth_bias = 8.0;
+    draw(&mut f, &gmmu, &regs);
+    let tiling = Tiling::new(SIZE, SIZE, 1, 4, 1, 0, GobLayout::Tegra);
+    f.rasterizer
+        .flush_region(DADDR + 0x8000, tiling.size_bytes() as u64);
+    let words = guest_linear(&f, DADDR + 0x8000, &tiling)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&d| u32::from_le_bytes(d))
+        .collect();
+    f.assert_no_validation_errors();
+    Some(words)
+}
+
+#[test]
+fn depth_bias_constants_count_guest_d24_units_whatever_the_host_format() {
+    let Some(words) = biased_depth_words(0x14, 0.0, |d| {
+        d.depth_bias_control
+            && d.depth_bias_exact
+            && (d.depth_bias_float || d.depth_bias_force_unorm)
+    }) else {
+        return;
+    };
+    let depths: Vec<u32> = words.iter().map(|&w| w >> 8).collect();
+    assert!(
+        depths.iter().all(|&d| d == 4),
+        "a bias register of 8 offsets z = 0 by 4 units of D24: {:?}",
+        &depths[..4]
+    );
+}
+
+#[test]
+fn depth_bias_constants_count_d32f_units_at_the_primitive_exponent() {
+    let Some(words) = biased_depth_words(0x0a, 0.5, |d| d.depth_bias_control && d.depth_bias_exact)
+    else {
+        return;
+    };
+    let want = 0.5f32.to_bits() + 4;
+    assert!(
+        words.iter().all(|&d| d == want),
+        "a bias register of 8 offsets z = 0.5 by 4 ulps of D32F: {:#x?}",
+        &words[..4]
+    );
 }
