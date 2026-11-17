@@ -16,7 +16,7 @@ use lichii_gpu::backend::{
     ChannelId, ComputeContext, ConstBufferBinding, DrawParams, GraphicsContext, IndirectDraw,
 };
 use lichii_gpu::engines::maxwell_3d::regs::{
-    AttributePointSize, Blend, BlendPerTarget, ComparisonOp, DepthMode, IndexFormat,
+    AttributePointSize, Blend, BlendPerTarget, ComparisonOp, DepthMode, IndexFormat, Pipeline,
     PrimitiveTopology, ProgramRegion, ProvokingVertex, RtLayerControl, SamplerBinding, StencilOp,
     TexHeader, VertexAttribute, VertexAttributeType, WindowOrigin, WindowOriginMode,
 };
@@ -196,14 +196,16 @@ struct TargetsKey {
     cache: u64,
 }
 
-/// `(first word, words)` of each register `graphics_stages` reads, except the programs (the
-/// `SHADERS` dirty flag covers those) and the render targets (compared as colour outputs).
-const STAGE_REGISTERS: [(usize, usize); 17] = {
+/// `(first word, words)` of each register `graphics_stages` reads, except the render targets
+/// (compared as colour outputs). The program registers are compared by value, so a draw after a
+/// guest rewrote them unchanged still reuses the last draw's modules.
+const STAGE_REGISTERS: [(usize, usize); 18] = {
     const fn field<T>(offset: usize) -> (usize, usize) {
         (offset / 4, size_of::<T>() / 4)
     }
     [
         field::<ProgramRegion>(offset_of!(Regs, program_region)),
+        field::<[Pipeline; 6]>(offset_of!(Regs, pipelines)),
         field::<WindowOrigin>(offset_of!(Regs, window_origin)),
         field::<DepthMode>(offset_of!(Regs, depth_mode)),
         field::<AttributePointSize>(offset_of!(Regs, point_size_attribute)),
@@ -233,9 +235,8 @@ const STAGE_REGISTER_WORDS: usize = {
     words
 };
 
-/// Everything `graphics_stages` finds its modules from besides the programs' registers: equal
-/// inputs and a clear `SHADERS` flag find the same modules, as long as each one's variant
-/// still answers its translation's queries.
+/// Everything `graphics_stages` finds its modules from: equal inputs find the same modules, as
+/// long as each one's variant still answers its translation's queries.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct StageInputs {
     channel: ChannelId,
@@ -1384,7 +1385,7 @@ impl VulkanRasterizer {
                 *header = graphics_program_header(ctx, slot, arch).words;
             }
         }
-        if !ctx.dirty.is_set(dirty::SHADERS) && self.reuse_stages(ctx, mesh, &inputs) {
+        if self.reuse_stages(ctx, mesh, &inputs) {
             return true;
         }
         self.draw.stages_memo = None;
@@ -1453,7 +1454,6 @@ impl VulkanRasterizer {
         }
         if tracked {
             self.draw.stages_memo = Some(StagesMemo { inputs, keys });
-            ctx.dirty.clear(dirty::SHADERS);
         }
         true
     }

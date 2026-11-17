@@ -158,6 +158,12 @@ pub enum VecOp {
         signed: Option<W>,
         vector: Value,
     },
+    /// Lane `index` of `8 << size` bits (H or S) of `vector` in every lane.
+    DupLane {
+        size: u8,
+        index: u8,
+        vector: Value,
+    },
     /// Scalar `DUP` (`MOV` from an element): lane `index` of `8 << size` bits, with every other
     /// bit zero.
     ScalarDup {
@@ -298,6 +304,7 @@ impl VecOp {
             }
             VecOp::Shift(_, _, _, a)
             | VecOp::ScalarDup { vector: a, .. }
+            | VecOp::DupLane { vector: a, .. }
             | VecOp::Dup(_, a)
             | VecOp::Cnt(_, a)
             | VecOp::Extract { vector: a, .. }
@@ -379,6 +386,21 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
     let arrangement = Arrangement { size, q };
     let vec = |t: &mut Translator, r: u8| t.op(Op::Get(Loc::V(r)));
     let emit = |t: &mut Translator, op: VecOp| t.op(Op::Simd(SimdOp::Vec(op)));
+    if word & 0x9f00_0400 == 0x0f00_0000 && by_element(t, word) {
+        return true;
+    }
+    if word & 0x9f20_fc00 == 0x0e20_b400 && size == 1 && t.sse41 {
+        let (a, b) = (vec(t, rn), vec(t, rm));
+        let r = t.op(Op::Simd(SimdOp::SatMulHigh {
+            round: u,
+            arrangement,
+            a,
+            b,
+            word,
+        }));
+        t.set(Loc::V(rd), r);
+        return true;
+    }
     if word & 0xbfe0_fc00 == 0x0e00_0000 && t.sse41 {
         let (table, index) = (vec(t, rn), vec(t, rm));
         let r = emit(t, VecOp::Table { q, table, index });
@@ -757,6 +779,97 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         return true;
     }
     false
+}
+
+/// The integer multiplies by element: `MUL`, `MLA`, `MLS`, the long `SMULL`, `SMLAL` and
+/// `SMLSL` with their unsigned forms, and `SQDMULH`/`SQRDMULH` on H lanes.
+fn by_element(t: &mut Translator, word: u32) -> bool {
+    let (rd, rn) = (field(word, 0, 5), field(word, 5, 5));
+    let (q, u, size) = (word >> 30 & 1 != 0, word >> 29 & 1 != 0, field(word, 22, 2));
+    let (index, rm) = match size {
+        1 => (
+            field(word, 11, 1) << 2 | field(word, 20, 2),
+            field(word, 16, 4),
+        ),
+        2 => (
+            field(word, 11, 1) << 1 | field(word, 21, 1),
+            field(word, 16, 5),
+        ),
+        _ => return false,
+    };
+    let arrangement = Arrangement { size, q };
+    let opcode = field(word, 12, 4);
+    let vec = |t: &mut Translator, r: u8| t.op(Op::Get(Loc::V(r)));
+    let emit = |t: &mut Translator, op: VecOp| t.op(Op::Simd(SimdOp::Vec(op)));
+    let lane = |t: &mut Translator| {
+        let vector = vec(t, rm);
+        emit(
+            t,
+            VecOp::DupLane {
+                size,
+                index,
+                vector,
+            },
+        )
+    };
+    let r = match (u, opcode) {
+        (false, 0b1000) if supported(t, Binary::Mul, size) => {
+            let n = vec(t, rn);
+            let m = lane(t);
+            emit(t, VecOp::Binary(Binary::Mul, arrangement, n, m))
+        }
+        (true, 0b0000 | 0b0100) if supported(t, Binary::Mul, size) => {
+            let (acc, n) = (vec(t, rd), vec(t, rn));
+            let m = lane(t);
+            let sub = opcode == 0b0100;
+            emit(
+                t,
+                VecOp::MulAcc {
+                    sub,
+                    arrangement,
+                    acc,
+                    n,
+                    m,
+                },
+            )
+        }
+        (_, 0b0010 | 0b0110 | 0b1010) if size == 1 || u || t.sse41 => {
+            let acc = match opcode {
+                0b0010 => Some(false),
+                0b0110 => Some(true),
+                _ => None,
+            };
+            let acc = acc.map(|sub| (vec(t, rd), sub));
+            let n = vec(t, rn);
+            let m = lane(t);
+            emit(
+                t,
+                VecOp::Long {
+                    op: Long::Mul,
+                    signed: !u,
+                    size,
+                    high: q,
+                    n,
+                    m,
+                    acc,
+                },
+            )
+        }
+        (false, 0b1100 | 0b1101) if size == 1 && t.sse41 => {
+            let a = vec(t, rn);
+            let b = lane(t);
+            t.op(Op::Simd(SimdOp::SatMulHigh {
+                round: opcode == 0b1101,
+                arrangement,
+                a,
+                b,
+                word,
+            }))
+        }
+        _ => return false,
+    };
+    t.set(Loc::V(rd), r);
+    true
 }
 
 /// DUP, INS, SMOV and UMOV.
@@ -1327,6 +1440,52 @@ impl Emitter<'_> {
             ; and eax, all
             ; cmp eax, all
             ; je =>exact
+            ; or DWORD [r15 + CTX_FPSR], QC
+            ; =>exact
+        );
+        if !q {
+            dynasm!(self.asm ; .arch x64 ; movq Rx(d), Rx(d));
+        }
+    }
+
+    /// `SQDMULH`, or `SQRDMULH` when `round`, on H lanes: the high half of each doubled product,
+    /// rounded when `round`. Only `-0x8000 * -0x8000` gives `-0x8000` there, which saturates to `0x7fff`
+    /// and sets FPSR.QC.
+    pub(super) fn sat_mul_high(
+        &mut self,
+        i: usize,
+        round: bool,
+        arrangement: Arrangement,
+        a: Value,
+        b: Value,
+    ) {
+        let q = arrangement.q;
+        let (a, b) = (self.reg(a), self.reg(b));
+        let d = self.def(Value(i as u32));
+        self.copy(d, a);
+        if round {
+            dynasm!(self.asm ; .arch x64 ; pmulhrsw Rx(d), Rx(b));
+        } else {
+            dynasm!(self.asm
+                ; .arch x64
+                ; pmulhw Rx(d), Rx(b)
+                ; psllw Rx(d), 1
+                ; movdqa Rx(SCRATCH), Rx(a)
+                ; pmullw Rx(SCRATCH), Rx(b)
+                ; psrlw Rx(SCRATCH), 15
+                ; por Rx(d), Rx(SCRATCH)
+            );
+        }
+        let (exact, all) = (self.asm.new_dynamic_label(), if q { 0xffff } else { 0xff });
+        dynasm!(self.asm
+            ; .arch x64
+            ; pcmpeqw Rx(SCRATCH), Rx(SCRATCH)
+            ; psllw Rx(SCRATCH), 15
+            ; pcmpeqw Rx(SCRATCH), Rx(d)
+            ; pxor Rx(d), Rx(SCRATCH)
+            ; pmovmskb eax, Rx(SCRATCH)
+            ; test eax, all
+            ; jz =>exact
             ; or DWORD [r15 + CTX_FPSR], QC
             ; =>exact
         );
@@ -1918,6 +2077,29 @@ impl Emitter<'_> {
                     ; pand Rx(d), [rax + 32]
                 );
                 (d, q)
+            }
+            VecOp::DupLane {
+                size,
+                index,
+                vector,
+            } => {
+                let s = self.reg(vector);
+                let d = self.def(v);
+                let lanes = ((index & 3) * 0x55) as i8;
+                match (size, index >= 4) {
+                    (1, false) => dynasm!(self.asm
+                        ; .arch x64
+                        ; pshuflw Rx(d), Rx(s), lanes
+                        ; punpcklqdq Rx(d), Rx(d)
+                    ),
+                    (1, true) => dynasm!(self.asm
+                        ; .arch x64
+                        ; pshufhw Rx(d), Rx(s), lanes
+                        ; punpckhqdq Rx(d), Rx(d)
+                    ),
+                    _ => dynasm!(self.asm ; .arch x64 ; pshufd Rx(d), Rx(s), lanes),
+                }
+                return;
             }
             VecOp::Dup(Arrangement { size, q }, x) => {
                 let x = self.reg(x);

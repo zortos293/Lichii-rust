@@ -152,6 +152,14 @@ pub enum SimdOp {
         b: Value,
         word: u32,
     },
+    /// `SQDMULH`, or `SQRDMULH` when `round`, on H lanes, setting FPSR.QC when a lane saturates.
+    SatMulHigh {
+        round: bool,
+        arrangement: Arrangement,
+        a: Value,
+        b: Value,
+        word: u32,
+    },
     /// Advanced SIMD integer and element-move ops.
     Vec(VecOp),
     /// Advanced SIMD FP arithmetic on S or D lanes, checked like the scalar ops.
@@ -186,7 +194,8 @@ impl SimdOp {
             | SimdOp::Compare { word, .. }
             | SimdOp::CondCompare { word, .. }
             | SimdOp::SatNarrow { word, .. }
-            | SimdOp::SatArith { word, .. } => Some(word),
+            | SimdOp::SatArith { word, .. }
+            | SimdOp::SatMulHigh { word, .. } => Some(word),
             SimdOp::Lanes(lanes) => Some(lanes.word),
             _ => None,
         }
@@ -235,7 +244,7 @@ impl SimdOp {
                     f(low);
                 }
             }
-            SimdOp::SatArith { a, b, .. } => {
+            SimdOp::SatArith { a, b, .. } | SimdOp::SatMulHigh { a, b, .. } => {
                 f(a);
                 f(b);
             }
