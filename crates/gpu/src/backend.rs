@@ -677,6 +677,17 @@ pub trait Rasterizer: Send {
     /// Submits recorded host GPU work (end of a GPFIFO submission).
     fn flush_commands(&mut self) {}
 
+    /// The end of a GPFIFO submission. A renderer may hold the recorded work back to submit it
+    /// with later work, so submissions that end close together reach the host GPU in one; while
+    /// it does, [`has_pending_fences`](Self::has_pending_fences) and
+    /// [`has_unsubmitted_fences`](Self::has_unsubmitted_fences) hold, so an idle GPU submits it
+    /// through [`flush_commands`](Self::flush_commands) at its next poll, and every call that
+    /// waits for the work (`release_fences(true)`, `synchronize_region`, `flush_region`,
+    /// `present`) submits it first. The default submits at once.
+    fn end_submission(&mut self) {
+        self.flush_commands();
+    }
+
     /// Block until the host GPU finished all submitted work.
     fn wait_for_idle(&mut self);
 

@@ -71,6 +71,8 @@ struct Activity {
     dispatches: u32,
     presents: u32,
     submits: u32,
+    /// Ends of GPFIFO submissions whose work waited to be submitted with later work.
+    deferred: u32,
     /// Queue submissions the scheduler had made when the line's second started.
     queue_submits: u64,
     textures: Traffic,
@@ -199,6 +201,13 @@ pub struct VulkanRasterizer {
     /// Render conditions the host GPU tests; None when the device cannot.
     conditions: Option<conditions::Conditions>,
     unflushed: bool,
+    /// The recorded work waits for later work to share its submission: a GPFIFO submission
+    /// ended within [`VulkanRasterizer::submit_window`] of the last submission.
+    deferred: bool,
+    /// How long after a submission the end of a GPFIFO submission holds its work back, so
+    /// work recorded close together goes to the host GPU in one submission. Zero submits at
+    /// every end; `LICHII_SUBMIT_WINDOW_US` sets it.
+    submit_window: Duration,
     texture_cache: ManuallyDrop<TextureCache>,
     buffer_cache: ManuallyDrop<BufferCache>,
     draw: draw::DrawState,
@@ -243,6 +252,16 @@ enum Release {
 
 /// The part of `fb` the display shows, as left, top, right and bottom in texels: its crop
 /// clamped to the framebuffer, or all of it when the crop is empty.
+/// [`VulkanRasterizer::submit_window`]: `LICHII_SUBMIT_WINDOW_US` microseconds, else 500, the
+/// window the C++ reference batches fence flushes in (its `EDEN_NX2_FENCE_FLUSH_US`).
+fn submit_window() -> Duration {
+    let micros = std::env::var("LICHII_SUBMIT_WINDOW_US")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(500);
+    Duration::from_micros(micros)
+}
+
 fn displayed_rect(fb: &FramebufferConfig) -> [u32; 4] {
     let (width, height) = (fb.width, fb.height);
     fb.crop
@@ -424,6 +443,8 @@ impl VulkanRasterizer {
             samples,
             conditions,
             unflushed: true,
+            deferred: false,
+            submit_window: submit_window(),
             texture_cache: ManuallyDrop::new(texture_cache),
             live: None,
             activity: Activity::default(),
@@ -718,6 +739,7 @@ impl VulkanRasterizer {
         self.capture()?;
         let tick = self.scheduler.flush()?;
         self.unflushed = false;
+        self.deferred = false;
         self.publish(fb, frame, tick, scale);
         Ok(true)
     }
@@ -771,6 +793,7 @@ impl VulkanRasterizer {
             return;
         }
         self.unflushed = false;
+        self.deferred = false;
         let tick = self.scheduler.tick();
         if self.scheduler.submitted_tick().is_some()
             && !self.fences.back().is_some_and(|&(t, _)| t >= tick)
@@ -789,12 +812,22 @@ impl VulkanRasterizer {
 
     /// Submits the recorded work between operations once the oversized stream or staging
     /// buffers it holds reach half their cap, so later allocations past the cap can wait for it
-    /// instead of growing past it ([`Oversized`](crate::host_budget::Oversized)).
-    fn bound_oversized(&mut self) {
+    /// instead of growing past it ([`Oversized`](crate::host_budget::Oversized)), and once
+    /// deferred work waited a whole submit window, so the host GPU gets it in bounded time while
+    /// the GPU thread stays busy.
+    fn bound_unsubmitted(&mut self) {
         let tick = self.scheduler.tick();
         if self.staging.should_submit(tick) || self.buffer_cache.should_submit(tick) {
             self.unflushed = true;
             self.flush();
+        } else if self.deferred && self.scheduler.submitted_at().elapsed() >= self.submit_window {
+            self.flush();
+        }
+    }
+
+    fn apply_live_settings(&mut self) {
+        if let Some(settings) = self.live.as_ref().and_then(|live| live.take()) {
+            self.apply_settings(&settings);
         }
     }
 
@@ -823,6 +856,7 @@ impl VulkanRasterizer {
             seconds = (now - since).as_secs_f32(),
             submits = a.submits,
             queue_submits = self.scheduler.submits() - a.queue_submits,
+            deferred_submits = a.deferred,
             draws = a.draws,
             renderings = self.scheduler.renderings() - a.renderings,
             texture_draws = a.texture_draws,
@@ -1122,6 +1156,7 @@ impl VulkanRasterizer {
         self.capture()?;
         let tick = self.scheduler.flush()?;
         self.unflushed = false;
+        self.deferred = false;
         self.publish(fb, frame, tick, ResolutionScale::X1);
         Ok(())
     }
@@ -1129,7 +1164,7 @@ impl VulkanRasterizer {
 
 impl Rasterizer for VulkanRasterizer {
     fn draw(&mut self, ctx: &mut GraphicsContext<'_>, draw: &DrawParams<'_>) {
-        self.bound_oversized();
+        self.bound_unsubmitted();
         self.activity.draws += 1;
         if let Err(error) = self.draw_graphics(ctx, draw::DrawCall::Direct(draw)) {
             tracing::error!(%error, "recording a draw failed");
@@ -1137,7 +1172,7 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn draw_indirect(&mut self, ctx: &mut GraphicsContext<'_>, draw: &IndirectDraw) {
-        self.bound_oversized();
+        self.bound_unsubmitted();
         self.activity.draws += 1;
         if let Err(error) = self.draw_graphics(ctx, draw::DrawCall::Indirect(draw)) {
             tracing::error!(%error, "recording an indirect draw failed");
@@ -1145,7 +1180,7 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn draw_texture(&mut self, ctx: &mut GraphicsContext<'_>, draw: &DrawTexture) {
-        self.bound_oversized();
+        self.bound_unsubmitted();
         self.activity.texture_draws += 1;
         if let Err(error) = self.record_draw_texture(ctx, draw) {
             tracing::error!(%error, "recording a texture draw failed");
@@ -1153,7 +1188,7 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn clear(&mut self, ctx: &mut GraphicsContext<'_>, layer_count: u32) {
-        self.bound_oversized();
+        self.bound_unsubmitted();
         self.activity.clears += 1;
         if let Err(error) = self.clear_targets(ctx, layer_count) {
             tracing::error!(%error, "clearing render targets failed");
@@ -1161,7 +1196,7 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn dispatch_compute(&mut self, ctx: &ComputeContext<'_>) {
-        self.bound_oversized();
+        self.bound_unsubmitted();
         self.activity.dispatches += 1;
         if let Err(error) = self.dispatch(ctx) {
             tracing::error!(%error, "recording a compute dispatch failed");
@@ -1169,7 +1204,7 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn accelerate_blit(&mut self, _channel: ChannelId, memory: &Gmmu, blit: &Blit) -> bool {
-        self.bound_oversized();
+        self.bound_unsubmitted();
         if blit.operation != BlitOperation::SrcCopy {
             return false;
         }
@@ -1253,7 +1288,7 @@ impl Rasterizer for VulkanRasterizer {
         memory: &Gmmu,
         copy: &ImageCopy,
     ) -> bool {
-        self.bound_oversized();
+        self.bound_unsubmitted();
         let mut tx = Transfer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
@@ -1387,13 +1422,15 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn has_pending_fences(&self) -> bool {
-        !self.fences.is_empty()
+        self.deferred || !self.fences.is_empty()
     }
 
     fn has_unsubmitted_fences(&self) -> bool {
-        self.fences
-            .back()
-            .is_some_and(|&(tick, _)| tick >= self.scheduler.tick())
+        self.deferred
+            || self
+                .fences
+                .back()
+                .is_some_and(|&(tick, _)| tick >= self.scheduler.tick())
     }
 
     fn synchronize_region(&mut self, addr: DAddr, size: u64) {
@@ -1642,9 +1679,17 @@ impl Rasterizer for VulkanRasterizer {
 
     fn flush_commands(&mut self) {
         self.flush();
-        if let Some(settings) = self.live.as_ref().and_then(|live| live.take()) {
-            self.apply_settings(&settings);
+        self.apply_live_settings();
+    }
+
+    fn end_submission(&mut self) {
+        if self.unflushed && self.scheduler.submitted_at().elapsed() < self.submit_window {
+            self.deferred = true;
+            self.activity.deferred += 1;
+        } else {
+            self.flush();
         }
+        self.apply_live_settings();
     }
 
     fn wait_for_idle(&mut self) {

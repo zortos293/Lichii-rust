@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Instant;
 
 use ash::vk;
 use lichii_gpu::activity::{Activity, Wait};
@@ -55,6 +56,8 @@ pub struct Scheduler {
     /// A guest barrier asked for while nothing was being recorded, recorded at the start of the
     /// next command buffer instead.
     barrier: bool,
+    /// When the last submission of recorded work went to the queue.
+    submitted_at: Instant,
     /// Queue submissions and sparse bindings made so far.
     submits: u64,
     /// Reused submit infos, so a submission allocates nothing.
@@ -127,6 +130,7 @@ impl Scheduler {
             part: 0,
             recorded: false,
             barrier: false,
+            submitted_at: Instant::now(),
             submits: 0,
             wait_infos: Vec::new(),
             signal_infos: Vec::new(),
@@ -164,6 +168,12 @@ impl Scheduler {
     /// of for a submission of its own.
     pub fn submitted_tick(&self) -> Option<u64> {
         (!self.recorded).then(|| self.tick - 1)
+    }
+
+    /// When the last submission of recorded work ([`Scheduler::flush`], [`Scheduler::submit_part`])
+    /// went to the queue.
+    pub fn submitted_at(&self) -> Instant {
+        self.submitted_at
     }
 
     /// Queue submissions and sparse bindings made so far, [`Scheduler::run_aside`]'s included.
@@ -412,6 +422,7 @@ impl Scheduler {
             .command_buffer_infos(cmd_info.as_slice())
             .signal_semaphore_infos(signals);
         self.submits += 1;
+        self.submitted_at = Instant::now();
         self.device.submit(&[submit], vk::Fence::null())?;
         if let Some(cmd) = cmd {
             self.in_flight.push_back((self.tick, cmd));

@@ -360,7 +360,7 @@ impl Back {
                 1
             }
             tag::FLUSH_COMMANDS => {
-                self.rasterizer.flush_commands();
+                self.rasterizer.end_submission();
                 1
             }
             tag::SYNCHRONIZE_READ => {
