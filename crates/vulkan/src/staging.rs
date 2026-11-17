@@ -26,6 +26,12 @@ const STAGING_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
 /// that consumes it and reused once that tick completed, so steady-state uploads allocate
 /// nothing. Requests larger than a quarter of the ring get a buffer of their own, freed the same
 /// way, at most `oversized_cap` bytes of them in flight ([`Oversized`]).
+///
+/// The ring asks the GPU which ticks completed once per scheduler tick, and again only when an
+/// allocation does not fit. A tick's newest region stays until the tick completes, so within one
+/// tick a reclaim can neither empty the ring nor move where the next allocation lands: it only
+/// frees space an allocation that fits does not need. Allocations land where reclaiming before
+/// each of them would put them.
 pub struct StagingRing {
     device: Arc<Device>,
     ring: Buffer,
@@ -33,24 +39,45 @@ pub struct StagingRing {
     head: u64,
     /// In-flight regions in ring order: (start, end, tick).
     regions: VecDeque<(u64, u64, u64)>,
+    /// The tick being recorded when the ring last reclaimed before an allocation in it; that
+    /// allocation's region holds the tick.
+    polled: u64,
+    usage: vk::BufferUsageFlags,
+    oversized_name: &'static str,
     oversized: Oversized,
 }
 
 impl StagingRing {
     pub fn new(device: &Arc<Device>, capacity: u64, oversized_cap: u64) -> Result<Self> {
-        let ring = Buffer::new(
+        Self::with_usage(
             device,
             capacity,
+            oversized_cap,
             STAGING_USAGE,
-            MemoryLocation::CpuToGpu,
             "staging ring",
-        )?;
+            "staging (oversized)",
+        )
+    }
+
+    /// A ring of buffers made for `usage`, named `name` and `oversized_name`.
+    pub(crate) fn with_usage(
+        device: &Arc<Device>,
+        capacity: u64,
+        oversized_cap: u64,
+        usage: vk::BufferUsageFlags,
+        name: &'static str,
+        oversized_name: &'static str,
+    ) -> Result<Self> {
+        let ring = Buffer::new(device, capacity, usage, MemoryLocation::CpuToGpu, name)?;
         Ok(Self {
             device: device.clone(),
             ring,
             capacity,
             head: 0,
             regions: VecDeque::new(),
+            polled: u64::MAX,
+            usage,
+            oversized_name,
             oversized: Oversized::new(oversized_cap),
         })
     }
@@ -74,8 +101,8 @@ impl StagingRing {
                 &self.device,
                 scheduler,
                 size,
-                STAGING_USAGE,
-                "staging (oversized)",
+                self.usage,
+                self.oversized_name,
             )?;
             return Ok(StagingSlice {
                 buffer: buffer.raw(),
@@ -83,8 +110,12 @@ impl StagingRing {
                 data: buffer.mapped_mut().expect("staging memory is host visible"),
             });
         }
+        let mut stale = self.polled != scheduler.tick();
         let start = loop {
-            self.reclaim(scheduler);
+            if stale {
+                self.reclaim(scheduler);
+                self.polled = scheduler.tick();
+            }
             let aligned = self.head.next_multiple_of(align);
             let start = if aligned + size <= self.capacity {
                 aligned
@@ -94,8 +125,11 @@ impl StagingRing {
             if self.fits(start, size) {
                 break start;
             }
-            let (_, _, oldest) = *self.regions.front().expect("a full ring has regions");
-            scheduler.wait(oldest)?;
+            if stale {
+                let (_, _, oldest) = *self.regions.front().expect("a full ring has regions");
+                scheduler.wait(oldest)?;
+            }
+            stale = true;
         };
         let tick = scheduler.tick();
         let end = start + size;
@@ -151,6 +185,110 @@ impl StagingRing {
 mod tests {
     use super::*;
     use crate::host_budget::testing::{device, flood};
+    use crate::scheduler::SemaphoreWait;
+
+    /// A seeded random schedule of ring and oversized allocations, submissions held back by a
+    /// host-signalled gate, and gate releases between allocations: every allocation lands where
+    /// it lands in a ring that reclaims before each one.
+    #[test]
+    fn allocations_land_where_reclaiming_before_each_would_put_them() {
+        let Some(device) = device() else { return };
+        const CAPACITY: u64 = 64 << 10;
+        let mut lazy = StagingRing::new(&device, CAPACITY, 1 << 20).unwrap();
+        let mut eager = StagingRing::new(&device, CAPACITY, 1 << 20).unwrap();
+        let mut scheduler = Scheduler::new(&device).unwrap();
+        let mut kind = vk::SemaphoreTypeCreateInfo::default()
+            .semaphore_type(vk::SemaphoreType::TIMELINE)
+            .initial_value(0);
+        let info = vk::SemaphoreCreateInfo::default().push_next(&mut kind);
+        // SAFETY: valid create info on a live device.
+        let gate = unsafe { device.raw.create_semaphore(&info, None) }.unwrap();
+        let mut gated = Vec::new();
+        let mut released = 0;
+        let release = |scheduler: &mut Scheduler, released: &mut usize, gated: &[u64], value| {
+            if value <= *released {
+                return;
+            }
+            *released = value;
+            let info = vk::SemaphoreSignalInfo::default()
+                .semaphore(gate)
+                .value(value as u64);
+            // SAFETY: the gate is a live timeline semaphore below `value`.
+            unsafe { device.raw.signal_semaphore(&info) }.unwrap();
+            scheduler.wait(gated[value - 1]).unwrap();
+        };
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let (mut allocs, mut reused) = (0, 0);
+        for step in 0..20_000 {
+            match next() % 16 {
+                0 => {
+                    let wait = SemaphoreWait {
+                        semaphore: gate,
+                        value: gated.len() as u64 + 1,
+                        stage: vk::PipelineStageFlags2::ALL_COMMANDS,
+                    };
+                    gated.push(scheduler.flush_with(&[wait], &[]).unwrap());
+                }
+                1 | 2 => {
+                    let value = match next() % 4 {
+                        0 => gated.len(),
+                        _ => released + (next() % 3) as usize,
+                    };
+                    release(
+                        &mut scheduler,
+                        &mut released,
+                        &gated,
+                        value.min(gated.len()),
+                    );
+                }
+                3 | 4 => {
+                    let size = CAPACITY / 4 + 1 + next() % CAPACITY;
+                    eager.reclaim(&mut scheduler);
+                    if eager.oversized().bytes + 2 * size > 1 << 20 {
+                        release(&mut scheduler, &mut released, &gated, gated.len());
+                    }
+                    eager.alloc(&mut scheduler, size, 16).unwrap();
+                    lazy.alloc(&mut scheduler, size, 16).unwrap();
+                }
+                _ => {
+                    let size = 1 + next() % (CAPACITY / 4);
+                    let align = [1, 4, 16, 256][(next() % 4) as usize];
+                    eager.reclaim(&mut scheduler);
+                    let aligned = eager.head.next_multiple_of(align);
+                    let start = if aligned + size <= CAPACITY {
+                        aligned
+                    } else {
+                        0
+                    };
+                    if !eager.fits(start, size) {
+                        release(&mut scheduler, &mut released, &gated, gated.len());
+                    }
+                    reused += u64::from(start < eager.head);
+                    let expected = eager.alloc(&mut scheduler, size, align).unwrap().offset;
+                    let offset = lazy.alloc(&mut scheduler, size, align).unwrap().offset;
+                    assert_eq!(
+                        offset, expected,
+                        "step {step}: {size:#x} aligned to {align}"
+                    );
+                    allocs += 1;
+                }
+            }
+        }
+        assert!(
+            allocs > 10_000 && reused > 100,
+            "{allocs} allocations, {reused} wraps"
+        );
+        release(&mut scheduler, &mut released, &gated, gated.len());
+        scheduler.finish().unwrap();
+        // SAFETY: every submission waiting on the gate completed.
+        unsafe { device.raw.destroy_semaphore(gate, None) };
+    }
 
     #[test]
     fn oversized_staging_floods_stay_within_their_cap_on_a_lagging_gpu() {

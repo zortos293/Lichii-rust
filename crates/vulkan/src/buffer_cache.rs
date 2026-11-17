@@ -30,7 +30,7 @@ use crate::chunk_mask::ChunkMask;
 use crate::commands::transfer_to_all_barrier;
 use crate::device::Device;
 use crate::error::Result;
-use crate::host_budget::{Oversized, RING_OVERSIZED_CAP, Readback};
+use crate::host_budget::{RING_OVERSIZED_CAP, Readback};
 use crate::memory::{Buffer, BufferView, LiveMemory};
 use crate::scheduler::Scheduler;
 use crate::staging::{StagingRing, StagingSlice};
@@ -424,8 +424,11 @@ impl MaskedRangeSet {
         self.chunks.any(start, end.saturating_sub(start)) && self.ranges.intersects(start, end)
     }
 
+    #[inline]
     fn for_each_in(&self, start: u64, end: u64, f: impl FnMut(u64, u64)) {
-        self.ranges.for_each_in(start, end, f);
+        if self.chunks.any(start, end.saturating_sub(start)) {
+            self.ranges.for_each_in(start, end, f);
+        }
     }
 }
 
@@ -495,107 +498,6 @@ impl Captures {
         self.live
             .iter()
             .find(|capture| capture.daddr <= daddr && daddr < capture.end)
-    }
-}
-
-/// Host-visible memory the GPU reads directly: streamed uniforms, gathered ranges and converted
-/// indices. Allocations are reused once the tick that consumed them completed, and oversized ones
-/// bounded, as in the [`StagingRing`].
-struct StreamRing {
-    device: Arc<Device>,
-    ring: Buffer,
-    capacity: u64,
-    head: u64,
-    /// In-flight regions in ring order: (start, end, tick).
-    regions: VecDeque<(u64, u64, u64)>,
-    oversized: Oversized,
-}
-
-impl StreamRing {
-    fn new(device: &Arc<Device>, capacity: u64, oversized_cap: u64) -> Result<Self> {
-        let ring = Buffer::new(
-            device,
-            capacity,
-            STREAM_USAGE,
-            MemoryLocation::CpuToGpu,
-            "buffer cache stream",
-        )?;
-        Ok(Self {
-            device: device.clone(),
-            ring,
-            capacity,
-            head: 0,
-            regions: VecDeque::new(),
-            oversized: Oversized::new(oversized_cap),
-        })
-    }
-
-    fn alloc(
-        &mut self,
-        scheduler: &mut Scheduler,
-        size: u64,
-        align: u64,
-    ) -> Result<StagingSlice<'_>> {
-        if size > self.capacity / 4 {
-            self.reclaim(scheduler);
-            let buffer = self.oversized.alloc(
-                &self.device,
-                scheduler,
-                size,
-                STREAM_USAGE,
-                "buffer cache stream (oversized)",
-            )?;
-            return Ok(StagingSlice {
-                buffer: buffer.raw(),
-                offset: 0,
-                data: buffer.mapped_mut().expect("stream memory is host visible"),
-            });
-        }
-        let start = loop {
-            self.reclaim(scheduler);
-            let aligned = self.head.next_multiple_of(align);
-            let start = if aligned + size <= self.capacity {
-                aligned
-            } else {
-                0
-            };
-            let end = start + size;
-            if self.regions.iter().all(|&(s, e, _)| end <= s || start >= e) {
-                break start;
-            }
-            let (_, _, oldest) = *self.regions.front().expect("a full ring has regions");
-            scheduler.wait(oldest)?;
-        };
-        let tick = scheduler.tick();
-        let end = start + size;
-        match self.regions.back_mut() {
-            Some(last) if last.2 == tick && last.1 <= start => last.1 = end,
-            _ => self.regions.push_back((start, end, tick)),
-        }
-        self.head = end;
-        let buffer = self.ring.raw();
-        let data = &mut self
-            .ring
-            .mapped_mut()
-            .expect("stream memory is host visible")[start as usize..end as usize];
-        Ok(StagingSlice {
-            buffer,
-            offset: start,
-            data,
-        })
-    }
-
-    fn reclaim(&mut self, scheduler: &mut Scheduler) {
-        while let Some(&(_, _, tick)) = self.regions.front() {
-            if !scheduler.is_complete(tick) {
-                break;
-            }
-            self.regions.pop_front();
-        }
-        if self.regions.is_empty() {
-            self.head = 0;
-        }
-        self.oversized.reclaim(scheduler);
     }
 }
 
@@ -949,7 +851,9 @@ pub struct BufferCache {
     /// Whether GPU-written ranges trap guest CPU accesses until they are downloaded
     /// ([`lichii_gpu::gpu::flush_traps_enabled`]).
     flush_traps: bool,
-    stream: StreamRing,
+    /// Host-visible memory the GPU reads directly: streamed uniforms, gathered ranges and
+    /// converted indices.
+    stream: StagingRing,
     sync_slices: Option<SyncSlices>,
     readback: Readback,
     captures: Captures,
@@ -1000,7 +904,14 @@ impl BufferCache {
             free_slots: Vec::new(),
             gpu_written: MaskedRangeSet::default(),
             flush_traps: lichii_gpu::gpu::flush_traps_enabled(),
-            stream: StreamRing::new(device, STREAM_RING_SIZE, RING_OVERSIZED_CAP)?,
+            stream: StagingRing::with_usage(
+                device,
+                STREAM_RING_SIZE,
+                RING_OVERSIZED_CAP,
+                STREAM_USAGE,
+                "buffer cache stream",
+                "buffer cache stream (oversized)",
+            )?,
             sync_slices: None,
             readback: Readback::default(),
             captures: Captures::default(),
@@ -1031,9 +942,9 @@ impl BufferCache {
     }
 
     /// Whether the work being recorded at `tick` holds half the stream ring's oversized cap or
-    /// more ([`Oversized::should_submit`]).
+    /// more ([`StagingRing::should_submit`]).
     pub(crate) fn should_submit(&self, tick: u64) -> bool {
-        self.stream.oversized.should_submit(tick)
+        self.stream.should_submit(tick)
     }
 
     /// Whether GPU work wrote bytes of `[daddr, +size)` that [`BufferCache::flush`] has not
@@ -1045,7 +956,7 @@ impl BufferCache {
 
     /// The oversized stream buffers not freed yet.
     pub fn oversized_stream(&self) -> LiveMemory {
-        self.stream.oversized.live()
+        self.stream.oversized()
     }
 
     /// The alignment storage bindings start at: [`BufferCache::storage_buffer`] rounds the
@@ -1532,7 +1443,8 @@ impl BufferCache {
     /// upload that shares the staging ring takes one slice of it; a larger one goes through the
     /// two [`SyncSlices`] in pieces of at most [`SYNC_SLICE`] bytes, each submitted as a part of
     /// the tick. So whatever the upload's size, it holds at most `2 * SYNC_SLICE` (16 MiB) of
-    /// host-visible memory beside the ring and takes nothing from the [`Oversized`] budget.
+    /// host-visible memory beside the ring and takes nothing from the
+    /// [`Oversized`](crate::host_budget::Oversized) budget.
     /// The parts never end the tick: what the operation being set up allocated before stays
     /// valid, and its commands keep their order.
     fn synchronize(
@@ -1976,7 +1888,9 @@ impl BufferCache {
     }
 
     /// `[gpu_va, +size)` for reading: its cached buffer when it is one device range at an
-    /// `align`-aligned offset, else a gathered copy.
+    /// `align`-aligned offset, else a gathered copy. `run` is the range's
+    /// [`TranslationMemo::contiguous`].
+    #[allow(clippy::too_many_arguments)]
     fn read_range(
         &mut self,
         scheduler: &mut Scheduler,
@@ -1984,9 +1898,10 @@ impl BufferCache {
         gmmu: &Arc<Gmmu>,
         gpu_va: GpuVAddr,
         size: u64,
+        run: Option<DAddr>,
         align: u64,
     ) -> Result<BufferBinding> {
-        if let Some(daddr) = self.translations.contiguous(gmmu, gpu_va, size) {
+        if let Some(daddr) = run {
             let binding = self.acquire(scheduler, staging, daddr, size)?;
             if binding.offset % align == 0 {
                 return Ok(binding);
@@ -2084,7 +1999,7 @@ impl BufferCache {
             self.stats.streamed_bytes += size;
             return Ok(Some(binding));
         }
-        self.read_range(scheduler, staging, gmmu, gpu_va, size, align)
+        self.read_range(scheduler, staging, gmmu, gpu_va, size, run, align)
             .map(Some)
     }
 
@@ -2133,8 +2048,9 @@ impl BufferCache {
         let start = gpu_va & !(align - 1);
         let size = size + (gpu_va - start);
         if !written && !(GATHER_CACHE_MIN..=GATHER_CACHE_BYTES).contains(&size) {
+            let run = self.translations.contiguous(gmmu, start, size);
             return self
-                .read_range(scheduler, staging, gmmu, start, size, align)
+                .read_range(scheduler, staging, gmmu, start, size, run, align)
                 .map(Some);
         }
         if !written {
@@ -2264,7 +2180,8 @@ impl BufferCache {
         }
         if assembly == Assembly::Direct && !(self.widen_u8 && width == 1) {
             let size = (first + u64::from(count)) * width;
-            let binding = self.read_range(scheduler, staging, gmmu, start, size, width)?;
+            let run = self.translations.contiguous(gmmu, start, size);
+            let binding = self.read_range(scheduler, staging, gmmu, start, size, run, width)?;
             return Ok(Some(IndexBinding {
                 buffer: binding.buffer,
                 offset: binding.offset,
@@ -2478,8 +2395,8 @@ mod tests {
     use crate::{Instance, SurfaceSupport};
 
     /// A seeded random stream of GPU-written range insertions and write-backs: the masked set
-    /// answers every intersection test as the plain set does, and its chunk mask holds exactly
-    /// the chunks of its ranges.
+    /// answers every intersection test and reports the same parts of every range as the plain
+    /// set does, and its chunk mask holds exactly the chunks of its ranges.
     #[test]
     fn masked_ranges_intersect_as_the_plain_set() {
         let mut seed = 0xdead_beef_cafe_f00du64;
@@ -2520,6 +2437,13 @@ mod tests {
                         "step {step}: [{start:#x}, {end:#x})"
                     );
                     hits += usize::from(expected);
+                    let (mut masked_parts, mut plain_parts) = (Vec::new(), Vec::new());
+                    masked.for_each_in(start, end, |s, e| masked_parts.push((s, e)));
+                    plain.for_each_in(start, end, |s, e| plain_parts.push((s, e)));
+                    assert_eq!(
+                        masked_parts, plain_parts,
+                        "step {step}: [{start:#x}, {end:#x})"
+                    );
                 }
             }
             if step % 64 == 0 {
@@ -2807,7 +2731,15 @@ mod tests {
         };
         const CAP: u64 = 8 << 20;
         const SIZE: u64 = 3 << 19;
-        let mut ring = StreamRing::new(&device, 1 << 20, CAP).unwrap();
+        let mut ring = StagingRing::with_usage(
+            &device,
+            1 << 20,
+            CAP,
+            STREAM_USAGE,
+            "test stream",
+            "test stream (oversized)",
+        )
+        .unwrap();
         let ops = 64;
         let result = crate::host_budget::testing::flood(
             &device,
@@ -2817,8 +2749,8 @@ mod tests {
                 let slice = ring.alloc(scheduler, SIZE, 4).unwrap();
                 assert_eq!(slice.data.len() as u64, SIZE);
             },
-            |ring| ring.oversized.live().bytes,
-            |ring, tick| ring.oversized.should_submit(tick),
+            |ring| ring.oversized().bytes,
+            |ring, tick| ring.should_submit(tick),
         );
         assert!(
             u64::from(ops) * SIZE > 8 * CAP,
@@ -4413,14 +4345,29 @@ mod tests {
                 let mut expected = vec![0; size as usize];
                 let _ = f.gmmu.read_block(gpu_va, &mut expected);
                 assert!(f.read_binding(vertex) == expected, "{gpu_va:#x}+{size:#x}");
-                if size <= UNIFORM_STREAM_MAX {
-                    let uniform = f
-                        .cache
-                        .uniform_buffer(&mut f.scheduler, &mut f.staging, &f.gmmu, gpu_va, size)
-                        .unwrap()
-                        .unwrap();
-                    assert!(f.read_binding(uniform) == expected, "{gpu_va:#x}+{size:#x}");
+                let uniform = f
+                    .cache
+                    .uniform_buffer(&mut f.scheduler, &mut f.staging, &f.gmmu, gpu_va, size)
+                    .unwrap()
+                    .unwrap();
+                if let Some(daddr) = daddr
+                    && uniform.size > UNIFORM_STREAM_MAX
+                {
+                    let expected = f.acquire(daddr, uniform.size);
+                    let align = f
+                        .device
+                        .properties
+                        .limits
+                        .min_uniform_buffer_offset_alignment;
+                    if expected.offset % align == 0 {
+                        assert_eq!(uniform, expected, "{gpu_va:#x}+{size:#x}");
+                    }
                 }
+                let read = f.read_binding(uniform);
+                assert!(
+                    read == expected[..uniform.size as usize],
+                    "{gpu_va:#x}+{size:#x}"
+                );
             }
         }
 
@@ -4440,6 +4387,18 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(vertex, f.acquire(DADDR + 0x38_0100, 0x200));
+        let uniform = f
+            .cache
+            .uniform_buffer(
+                &mut f.scheduler,
+                &mut f.staging,
+                &f.gmmu,
+                GPU_VA + 0x100,
+                0x2000,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(uniform, f.acquire(DADDR + 0x38_0100, 0x2000));
         f.assert_no_validation_errors();
     }
 
@@ -4505,7 +4464,8 @@ mod tests {
 
     /// Binds of a typical Mario Kart World draw: two scene uniforms at fixed addresses, three
     /// per-object uniforms and a per-object storage read that move with the object, and one
-    /// fixed storage read, in a frame where GPU work wrote other buffers. Over big pages and over
+    /// fixed storage read, in a frame where GPU work wrote other buffers; then a 64 KiB uniform
+    /// the guest writes a page of before every draw. Over big pages and over
     /// a table split into scattered 16 KiB runs:
     /// `cargo test --release -p lichii-vulkan --lib bind_cost -- --ignored --nocapture`.
     #[test]
@@ -4532,6 +4492,7 @@ mod tests {
         for (name, base) in [("big pages", big), ("scattered 16 KiB runs", small)] {
             let mut uniform_ns = Vec::new();
             let mut storage_ns = Vec::new();
+            let mut dirty_ns = Vec::new();
             for frame in 0..=FRAMES {
                 let start = Instant::now();
                 for object in 0..OBJECTS {
@@ -4568,19 +4529,39 @@ mod tests {
                     }
                 }
                 let storage = start.elapsed().as_nanos() as f64 / OBJECTS as f64;
+                let start = Instant::now();
+                for object in 0..OBJECTS {
+                    let cbuf = base + 0x3c_0000;
+                    let page = cbuf + (object % 16) * PAGE_SIZE;
+                    if let Some(daddr) = walked(&f.gmmu, page, 0x100) {
+                        f.cache.invalidate(daddr, 0x100);
+                    }
+                    f.cache
+                        .uniform_buffer(&mut f.scheduler, &mut f.staging, &f.gmmu, cbuf, 0x10000)
+                        .unwrap()
+                        .unwrap();
+                }
+                let dirty = start.elapsed().as_nanos() as f64 / OBJECTS as f64;
                 f.scheduler.finish().unwrap();
                 if frame > 0 {
                     uniform_ns.push(uniforms);
                     storage_ns.push(storage);
+                    dirty_ns.push(dirty);
                 }
             }
             uniform_ns.sort_by(f64::total_cmp);
             storage_ns.sort_by(f64::total_cmp);
+            dirty_ns.sort_by(f64::total_cmp);
             let half = uniform_ns.len() / 2;
             eprintln!(
                 "{name}: per draw (best / median frame), 5 uniform binds {:.0} / {:.0} ns, \
-                 2 storage binds {:.0} / {:.0} ns",
-                uniform_ns[0], uniform_ns[half], storage_ns[0], storage_ns[half],
+                 2 storage binds {:.0} / {:.0} ns, 1 CPU-written 64 KiB uniform {:.0} / {:.0} ns",
+                uniform_ns[0],
+                uniform_ns[half],
+                storage_ns[0],
+                storage_ns[half],
+                dirty_ns[0],
+                dirty_ns[half],
             );
         }
         f.assert_no_validation_errors();
