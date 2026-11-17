@@ -11,6 +11,8 @@ mod draw;
 mod fence_waiter;
 mod frame_dump;
 mod samples;
+#[cfg(test)]
+mod submit_tests;
 
 use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
@@ -69,6 +71,8 @@ struct Activity {
     dispatches: u32,
     presents: u32,
     submits: u32,
+    /// Queue submissions the scheduler had made when the line's second started.
+    queue_submits: u64,
     textures: Traffic,
     buffers: BufferCacheStats,
     /// Dynamic renderings the scheduler had begun when the line's second started.
@@ -760,11 +764,19 @@ impl VulkanRasterizer {
         self.texture_cache.capture(&mut tx)
     }
 
+    /// Submits the recorded work and every fence waiting for it, unless all of it went to the
+    /// host GPU already (a CPU read's flush submitted it, or only fences came since).
     fn flush(&mut self) {
         if !self.unflushed {
             return;
         }
         self.unflushed = false;
+        let tick = self.scheduler.tick();
+        if self.scheduler.submitted_tick().is_some()
+            && !self.fences.back().is_some_and(|&(t, _)| t >= tick)
+        {
+            return;
+        }
         if let Err(error) = self.capture() {
             tracing::error!(%error, "capturing GPU-written buffers and images failed");
         }
@@ -798,6 +810,7 @@ impl VulkanRasterizer {
             a.textures = self.texture_cache.traffic();
             a.buffers = self.buffer_cache.stats();
             a.renderings = self.scheduler.renderings();
+            a.queue_submits = self.scheduler.submits();
             return;
         };
         if now - since < Duration::from_secs(1) {
@@ -809,6 +822,7 @@ impl VulkanRasterizer {
             target: ACTIVITY_TARGET,
             seconds = (now - since).as_secs_f32(),
             submits = a.submits,
+            queue_submits = self.scheduler.submits() - a.queue_submits,
             draws = a.draws,
             renderings = self.scheduler.renderings() - a.renderings,
             texture_draws = a.texture_draws,
@@ -859,6 +873,7 @@ impl VulkanRasterizer {
             textures,
             buffers,
             renderings: self.scheduler.renderings(),
+            queue_submits: self.scheduler.submits(),
             ..Activity::default()
         };
     }
@@ -1309,14 +1324,21 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn signal_fence(&mut self, action: FenceAction) {
-        self.fences
-            .push_back((self.scheduler.tick(), Release::Action(action)));
-        self.unflushed = true;
+        let tick = match self.scheduler.submitted_tick() {
+            Some(tick) if !self.unflushed => tick,
+            _ => {
+                self.unflushed = true;
+                self.scheduler.tick()
+            }
+        };
+        self.fences.push_back((tick, Release::Action(action)));
     }
 
     fn release_fences(&mut self, wait: bool) {
         if wait && let Some(&(tick, _)) = self.fences.back() {
-            self.flush();
+            if tick >= self.scheduler.tick() {
+                self.flush();
+            }
             if let Err(error) = self.scheduler.wait(tick) {
                 tracing::error!(%error, "waiting for GPU work failed");
             }
@@ -1398,7 +1420,9 @@ impl Rasterizer for VulkanRasterizer {
             hit.then_some(tick)
         });
         if let Some(tick) = last {
-            self.flush();
+            if tick >= self.scheduler.tick() {
+                self.flush();
+            }
             if let Err(error) = self.scheduler.wait(tick) {
                 tracing::error!(%error, "waiting for GPU work failed");
             }
@@ -1610,26 +1634,10 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn barrier(&mut self) {
-        let cmd = match self.scheduler.record() {
-            Ok(cmd) => cmd,
-            Err(error) => {
-                tracing::error!(%error, "recording a guest barrier failed");
-                return;
-            }
-        };
-        let barrier = vk::MemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-            .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-            .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE);
-        // SAFETY: `cmd` is recording outside any rendering; draws begin and end theirs.
-        unsafe {
-            self.device.raw.cmd_pipeline_barrier2(
-                cmd,
-                &vk::DependencyInfo::default().memory_barriers(&[barrier]),
-            );
+        match self.scheduler.barrier() {
+            Ok(recorded) => self.unflushed |= recorded,
+            Err(error) => tracing::error!(%error, "recording a guest barrier failed"),
         }
-        self.unflushed = true;
     }
 
     fn flush_commands(&mut self) {
@@ -1779,7 +1787,7 @@ mod tests {
         pub(super) rasterizer: VulkanRasterizer,
         mailbox: Arc<FrameMailbox>,
         pub(super) memory: Arc<DeviceAddressSpace>,
-        syncpoints: Arc<Syncpoints>,
+        pub(super) syncpoints: Arc<Syncpoints>,
     }
 
     pub(super) fn fixture(gob_layout: GobLayout) -> Option<Fixture> {
@@ -1835,7 +1843,7 @@ mod tests {
 
     impl Fixture {
         /// Reads the published frame's image back as tightly packed texels.
-        fn read_frame(&mut self) -> (GuestFrame, Vec<u8>) {
+        pub(super) fn read_frame(&mut self) -> (GuestFrame, Vec<u8>) {
             let frame = self.mailbox.latest().expect("a published frame");
             let r = &mut self.rasterizer;
             let desc = *frame.image.image.desc();
@@ -1911,7 +1919,7 @@ mod tests {
 
     /// 3D engine state with colour target 0 at `GPU_VA` (A8B8G8R8, block height `1 << bh`
     /// GOBs) and all channels selected for clearing.
-    fn clear_regs(width: u32, height: u32, bh: u32, color: [f32; 4]) -> Box<Regs> {
+    pub(super) fn clear_regs(width: u32, height: u32, bh: u32, color: [f32; 4]) -> Box<Regs> {
         let mut regs = Box::new(<Regs as bytemuck::Zeroable>::zeroed());
         let rt = &mut regs.rt[0];
         rt.address_high = (GPU_VA >> 32) as u32;
@@ -1928,7 +1936,7 @@ mod tests {
         regs
     }
 
-    fn clear(f: &mut Fixture, gmmu: &Arc<Gmmu>, regs: &Regs) {
+    pub(super) fn clear(f: &mut Fixture, gmmu: &Arc<Gmmu>, regs: &Regs) {
         clear_layers(f, gmmu, regs, 1);
     }
 
@@ -1987,7 +1995,7 @@ mod tests {
         }
     }
 
-    fn framebuffer(width: u32, height: u32) -> FramebufferConfig {
+    pub(super) fn framebuffer(width: u32, height: u32) -> FramebufferConfig {
         FramebufferConfig {
             address: DADDR,
             width,
@@ -2321,6 +2329,8 @@ mod tests {
         };
         f.rasterizer.flush_commands();
         assert!(!f.rasterizer.has_pending_fences());
+        let gmmu = gmmu(&f);
+        clear(&mut f, &gmmu, &clear_regs(64, 64, 2, [1.0, 0.0, 0.0, 1.0]));
         f.rasterizer.barrier();
         assert!(
             !f.rasterizer.has_pending_fences() && !f.rasterizer.has_unsubmitted_fences(),
