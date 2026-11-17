@@ -29,9 +29,9 @@ use lichii_shader::ShaderArch;
 use crate::commands::transfer_to_all_barrier;
 use crate::device::Device;
 use crate::error::Result;
-use crate::memory::{Buffer, BufferView};
+use crate::memory::{Buffer, BufferView, LiveMemory};
 use crate::scheduler::Scheduler;
-use crate::staging::{StagingRing, StagingSlice};
+use crate::staging::{StagingRing, StagingSlice, live_oversized};
 
 const CACHING_PAGE_BITS: u32 = 16;
 const CACHING_PAGE_SIZE: u64 = 1 << CACHING_PAGE_BITS;
@@ -840,6 +840,11 @@ impl BufferCache {
     pub fn is_gpu_written(&self, daddr: DAddr, size: u64) -> bool {
         self.gpu_written
             .intersects(daddr, daddr.saturating_add(size))
+    }
+
+    /// The oversized stream buffers not freed yet.
+    pub fn oversized_stream(&self) -> LiveMemory {
+        live_oversized(&self.stream.oversized)
     }
 
     /// The alignment storage bindings start at: [`BufferCache::storage_buffer`] rounds the
