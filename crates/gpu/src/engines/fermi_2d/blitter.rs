@@ -227,8 +227,9 @@ impl Placement {
     }
 }
 
-/// Bytes a scratch buffer keeps between blits: a 4K RGBA32F frame's worth.
-const KEEP_BYTES: usize = 3840 * 2160 * 16;
+/// Bytes a scratch buffer keeps between blits: a 1080p RGBA8 frame fits, the f32 intermediate of
+/// a converting full-frame blit is freed after it.
+const KEEP_BYTES: usize = 16 << 20;
 
 /// The software blitter and its scratch buffers.
 #[derive(Default)]
@@ -685,6 +686,17 @@ mod tests {
             .read_block(0x1000, bytemuck::cast_slice_mut(&mut out))
             .unwrap();
         assert_eq!(out[..3], [4.5, 5.5, 6.5]);
+    }
+
+    #[test]
+    fn scratch_keeps_a_1080p_frame_but_not_its_f32_intermediate() {
+        let pixels = 1920 * 1080;
+        let mut blitter = SoftwareBlitter::default();
+        blitter.src.reserve_exact(pixels * 4);
+        blitter.ir_src.reserve_exact(pixels * 4);
+        blitter.release_oversized();
+        assert!(blitter.src.capacity() >= pixels * 4);
+        assert_eq!(blitter.ir_src.capacity(), 0);
     }
 
     #[test]

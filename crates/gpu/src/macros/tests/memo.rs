@@ -144,6 +144,30 @@ fn small_memo_compacts_and_stays_correct() {
 }
 
 #[test]
+fn memo_memory_follows_what_it_remembers() {
+    let fresh = MacroEngine::new(MacroIsa::Mme64).memo_bytes();
+    assert!(fresh <= 256 << 10, "a fresh engine holds {fresh} bytes");
+    let memo = differential(MacroIsa::Mme64, None);
+    assert!(memo.memo_bytes() > fresh);
+    assert!(
+        memo.memo_bytes() < 4 << 20,
+        "{} bytes for a few hundred distinct calls",
+        memo.memo_bytes()
+    );
+    let small = differential(MacroIsa::Mme64, Some(256));
+    assert!(
+        small.memo_bytes() <= fresh + (16 << 10),
+        "a 256-word memo holds {} bytes",
+        small.memo_bytes()
+    );
+    assert_eq!(
+        memo.code_copy().unwrap().memo_bytes(),
+        0,
+        "code copies never remember calls"
+    );
+}
+
+#[test]
 fn memo_switch_turns_replay_off() {
     let (code, starts) = mme64_program();
     let mut engine = MacroEngine::new(MacroIsa::Mme64);
