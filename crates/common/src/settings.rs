@@ -277,6 +277,9 @@ pub struct SystemSettings {
     /// How long closing waits, in milliseconds, for a title that holds the exit lock
     /// (`LockExit`) to save and exit after it gets the exit request; 0 stops it at once.
     pub exit_timeout_ms: u32,
+    /// Patches Lichii applies to known game builds, as the C++ Lichii does: Ocarina of Time's
+    /// Max Resolution with the Texture Pool x2 it needs. Off turns them all off.
+    pub builtin_game_patches: bool,
 }
 
 /// The [`SystemSettings::time_zone`] value that follows the host's time zone.
@@ -296,6 +299,7 @@ impl Default for SystemSettings {
             network_enabled: false,
             enforce_service_access: false,
             exit_timeout_ms: 2000,
+            builtin_game_patches: true,
         }
     }
 }

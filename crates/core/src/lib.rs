@@ -22,7 +22,7 @@ use lichii_gpu::{Console, Gpu, GpuConfig, clock};
 use lichii_input::hub::NpadHub;
 use lichii_kernel::process::Process;
 use lichii_kernel::{Kernel, KernelConfig, KernelError, KernelEvents};
-use lichii_loader::{LoadOptions, LoaderError, ProgramImage};
+use lichii_loader::{LoadOptions, LoaderError, ModOptions, ProgramImage};
 use lichii_services::{ServiceContext, ServiceParts, SessionEvents};
 use parking_lot::{Condvar, Mutex};
 
@@ -120,7 +120,14 @@ impl System {
     /// Loads the title at `path` and boots it up to the point where [`System::run`] starts it.
     pub fn boot(settings: Arc<Settings>, path: &Path, host: Host) -> Result<Self, SystemError> {
         tracing::info!(path = %path.display(), "loading title");
-        let image = lichii_loader::load(path, &LoadOptions::default())?;
+        let options = LoadOptions {
+            mods: ModOptions {
+                builtin_patches: settings.system.builtin_game_patches,
+                ..ModOptions::default()
+            },
+            ..LoadOptions::default()
+        };
+        let image = lichii_loader::load(path, &options)?;
         Self::from_image(settings, image, host)
     }
 

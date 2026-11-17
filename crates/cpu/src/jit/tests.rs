@@ -296,7 +296,7 @@ fn simd(rng: &mut Rng) -> u32 {
     }
 }
 
-const VECTOR: [&str; 23] = [
+const VECTOR: [&str; 24] = [
     "0xx01110xx1xxxxx0110x1xxxxxxxxxx",
     "0xx01110xx1xxxxx000x01xxxxxxxxxx",
     "0xx01110xx1xxxxx00x011xxxxxxxxxx",
@@ -305,6 +305,7 @@ const VECTOR: [&str; 23] = [
     "0xx01110xx1xxxxxxxxx00xxxxxxxxxx",
     "0xx01111xxxxxxxxxxxxx0xxxxxxxxxx",
     "0xx01110011xxxxx101101xxxxxxxxxx",
+    "0xx01110xx1xxxxx1010x1xxxxxxxxxx",
     "0xx011110xxxxxxx101001xxxxxxxxxx",
     "0x001110xx100001010010xxxxxxxxxx",
     "01011110000xxxxx000001xxxxxxxxxx",
@@ -322,7 +323,7 @@ const VECTOR: [&str; 23] = [
     "0x00111000100000010110xxxxxxxxxx",
 ];
 
-/// An Advanced SIMD integer three-same (halving, saturating and absolute-difference forms
+/// An Advanced SIMD integer three-same (halving, saturating, absolute-difference and pairwise max/min forms
 /// too), compare against zero, `CNT`, shift by immediate (long too), `ZIP1`/`ZIP2`, three-different (`SADDL`, `SMLAL` and the rest), integer by-element, `SQDMULH`/`SQRDMULH`, copy or modified-immediate instruction, or an `LD1`..`LD4`/`ST1`..`ST4` of one to four registers on `X20`..`X23` or
 /// `SP`, offset or post-indexed by an immediate or `X24`/`X26`.
 fn vector(rng: &mut Rng) -> u32 {
