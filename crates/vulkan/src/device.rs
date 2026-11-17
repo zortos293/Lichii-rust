@@ -42,6 +42,7 @@ pub struct DeviceExtensions {
     pub index_type_uint8: bool,
     pub line_rasterization: bool,
     pub shader_stencil_export: bool,
+    pub geometry_shader_passthrough: bool,
 }
 
 type ExtensionFlag = fn(&mut DeviceExtensions) -> &mut bool;
@@ -75,6 +76,9 @@ const OPTIONAL_EXTENSIONS: &[(&CStr, ExtensionFlag)] = &[
     (ext::line_rasterization::NAME, |e| &mut e.line_rasterization),
     (ext::shader_stencil_export::NAME, |e| {
         &mut e.shader_stencil_export
+    }),
+    (nv::geometry_shader_passthrough::NAME, |e| {
+        &mut e.geometry_shader_passthrough
     }),
 ];
 
