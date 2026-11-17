@@ -29,6 +29,7 @@ use lichii_texture::block_linear::{GobLayout, Tiling, swizzle};
 
 use super::super::tests::{DADDR, Fixture, GPU_VA, fixture, gmmu, guest_linear, unorm8_eq};
 use super::{StageSources, Warning};
+use crate::device::DeviceFeatures;
 use crate::pipeline::environment::TexturePool;
 use crate::pipeline::shader_cache::{ShaderCache, ShaderCacheStats};
 use crate::rasterizer::VulkanRasterizer;
@@ -4663,11 +4664,10 @@ fn depth_bias_constants_offset_by_half_the_register_value() {
 
 /// Draws the full-target triangle at depth `z` into a 32-bit depth target of guest
 /// `format` with a depth bias register of 8 and reads the target back. `None` without a
-/// device that applies the bias exactly in a float representation.
-fn biased_depth_words(format: u32, z: f32) -> Option<Vec<u32>> {
+/// device whose features meet `exact`, the condition for an exact bias in `format`.
+fn biased_depth_words(format: u32, z: f32, exact: fn(&DeviceFeatures) -> bool) -> Option<Vec<u32>> {
     let (mut f, gmmu) = draw_fixture()?;
-    let features = &f.rasterizer.device.features;
-    if !(features.depth_bias_float && features.depth_bias_exact) {
+    if !exact(&f.rasterizer.device.features) {
         return None;
     }
     write(&f, VERTEX_CBUF, &f32_bytes(&[z, 1.0]));
@@ -4707,7 +4707,11 @@ fn biased_depth_words(format: u32, z: f32) -> Option<Vec<u32>> {
 
 #[test]
 fn depth_bias_constants_count_guest_d24_units_whatever_the_host_format() {
-    let Some(words) = biased_depth_words(0x14, 0.0) else {
+    let Some(words) = biased_depth_words(0x14, 0.0, |d| {
+        d.depth_bias_control
+            && d.depth_bias_exact
+            && (d.depth_bias_float || d.depth_bias_force_unorm)
+    }) else {
         return;
     };
     let depths: Vec<u32> = words.iter().map(|&w| w >> 8).collect();
@@ -4720,7 +4724,8 @@ fn depth_bias_constants_count_guest_d24_units_whatever_the_host_format() {
 
 #[test]
 fn depth_bias_constants_count_d32f_units_at_the_primitive_exponent() {
-    let Some(words) = biased_depth_words(0x0a, 0.5) else {
+    let Some(words) = biased_depth_words(0x0a, 0.5, |d| d.depth_bias_control && d.depth_bias_exact)
+    else {
         return;
     };
     let want = 0.5f32.to_bits() + 4;

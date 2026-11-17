@@ -127,9 +127,14 @@ pub struct DeviceFeatures {
     pub provoking_vertex_last: bool,
     pub index_type_uint8: bool,
     pub depth_clip_control: bool,
-    /// `vkCmdSetDepthBias2EXT` with a float depth bias representation, so a bias can be given
-    /// in absolute depth units whatever the host depth format.
+    /// `vkCmdSetDepthBias2EXT`, which picks how the constant depth bias is represented.
+    pub depth_bias_control: bool,
+    /// The float depth bias representation: a constant in absolute depth units, whatever the
+    /// host depth format.
     pub depth_bias_float: bool,
+    /// The force-unorm depth bias representation: a constant in units of a minimum resolvable
+    /// difference that stays the same over the whole depth range, even on a float attachment.
+    pub depth_bias_force_unorm: bool,
     /// The driver applies the depth bias without scaling the minimum resolvable difference.
     pub depth_bias_exact: bool,
     pub transform_feedback: bool,
@@ -451,8 +456,9 @@ impl Device {
         mesh.multiview_mesh_shader &= v11.multiview;
         mesh.primitive_fragment_shading_rate_mesh_shader = vk::FALSE;
         mesh.mesh_shader_queries = vk::FALSE;
-        bias_control.least_representable_value_force_unorm_representation = vk::FALSE;
         let on = |b: vk::Bool32| b != vk::FALSE;
+        let depth_bias_control =
+            extensions.depth_bias_control && on(bias_control.depth_bias_control);
         let features = DeviceFeatures {
             extensions,
             sampler_anisotropy: on(core.sampler_anisotropy),
@@ -511,12 +517,11 @@ impl Device {
             index_type_uint8: extensions.index_type_uint8 && on(uint8.index_type_uint8),
             depth_clip_control: extensions.depth_clip_control
                 && on(clip_control.depth_clip_control),
-            depth_bias_float: extensions.depth_bias_control
-                && on(bias_control.depth_bias_control)
-                && on(bias_control.float_representation),
-            depth_bias_exact: extensions.depth_bias_control
-                && on(bias_control.depth_bias_control)
-                && on(bias_control.depth_bias_exact),
+            depth_bias_control,
+            depth_bias_float: depth_bias_control && on(bias_control.float_representation),
+            depth_bias_force_unorm: depth_bias_control
+                && on(bias_control.least_representable_value_force_unorm_representation),
+            depth_bias_exact: depth_bias_control && on(bias_control.depth_bias_exact),
             transform_feedback: extensions.transform_feedback && on(xfb.transform_feedback),
             conditional_rendering: extensions.conditional_rendering
                 && on(conditional.conditional_rendering),

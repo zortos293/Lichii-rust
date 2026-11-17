@@ -49,7 +49,7 @@ use crate::buffer_cache::{BufferBinding, IndexBinding, assembled_topology, verte
 use crate::commands::ImageAccess;
 use crate::debug::{Program, Programs};
 use crate::descriptors::DescriptorAllocator;
-use crate::device::Device;
+use crate::device::{Device, DeviceFeatures};
 use crate::error::Result;
 use crate::memory::{Buffer, BufferView};
 use crate::pipeline::environment::{
@@ -768,14 +768,20 @@ fn per_primitive_generics(info: &ShaderInfo) -> u32 {
 }
 
 /// The constant, clamp, slope and representation of the draw's depth bias. The constant is
-/// half the register in units of the guest depth format's minimum resolvable difference. With
-/// `float_representation`, a unorm guest format's units become absolute depth, so the bias
-/// holds whatever host format stands in for it; otherwise the units are the host format's.
+/// half the register in units of the guest depth format's minimum resolvable difference.
+///
+/// A unorm guest format's units hold whatever host format stands in for it: the float
+/// representation turns them into absolute depth, and the force-unorm one keeps them at
+/// 2^-n over the whole range. Force-unorm takes n from the host attachment (24 for a float
+/// one), so only a guest D16 on a float host would get 2^-24 units; D16 is native on every
+/// driver we run. Float guest formats, and devices with neither representation, use the host
+/// format's own units.
 fn depth_bias(
     regs: &Regs,
-    float_representation: bool,
+    features: &DeviceFeatures,
 ) -> (f32, f32, f32, vk::DepthBiasRepresentationEXT) {
     use DepthFormat as D;
+    use vk::DepthBiasRepresentationEXT as R;
     let units = regs.depth_bias / 2.0;
     let unorm_bits = match DepthFormat::try_from(regs.zeta.format) {
         Ok(D::Z16Unorm) => Some(16),
@@ -783,14 +789,11 @@ fn depth_bias(
         _ => None,
     };
     let (constant, representation) = match unorm_bits {
-        Some(bits) if float_representation => (
-            units / (1u32 << bits) as f32,
-            vk::DepthBiasRepresentationEXT::FLOAT,
-        ),
-        _ => (
-            units,
-            vk::DepthBiasRepresentationEXT::LEAST_REPRESENTABLE_VALUE_FORMAT,
-        ),
+        Some(bits) if features.depth_bias_float => (units / (1u32 << bits) as f32, R::FLOAT),
+        Some(_) if features.depth_bias_force_unorm => {
+            (units, R::LEAST_REPRESENTABLE_VALUE_FORCE_UNORM)
+        }
+        _ => (units, R::LEAST_REPRESENTABLE_VALUE_FORMAT),
     };
     (
         constant,
@@ -2502,16 +2505,16 @@ impl VulkanRasterizer {
             shadow.set(Slot::LineWidth, line_width, || {
                 raw.cmd_set_line_width(cmd, line_width)
             });
-            let float_bias = self.device.features.depth_bias_float;
-            let bias = depth_bias(regs, float_bias);
+            let device_features = &self.device.features;
+            let bias = depth_bias(regs, device_features);
             shadow.set(Slot::DepthBias, bias, || {
                 let (constant, clamp, slope, representation) = bias;
-                if !float_bias {
+                if !device_features.depth_bias_control {
                     return raw.cmd_set_depth_bias(cmd, constant, clamp, slope);
                 }
                 let mut representation = vk::DepthBiasRepresentationInfoEXT::default()
                     .depth_bias_representation(representation)
-                    .depth_bias_exact(self.device.features.depth_bias_exact);
+                    .depth_bias_exact(device_features.depth_bias_exact);
                 let info = vk::DepthBiasInfoEXT::default()
                     .depth_bias_constant_factor(constant)
                     .depth_bias_clamp(clamp)
