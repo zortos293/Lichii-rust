@@ -25,7 +25,7 @@ use lichii_common::{PAGE_MASK, VAddr};
 use lichii_memory::{AddressSpace, ExclusiveMonitor, MemoryPermission, ReservationSlot};
 
 use self::cache::{Code, Entry, JitCache};
-use self::ir::{Block, Cmp, Terminal};
+use self::ir::{Block, Cmp, LAZY_PACKED, Terminal};
 pub(crate) use self::passes::Passes;
 use self::profile::{Flush, Profile};
 use self::translate::{Step, Translator};
@@ -100,8 +100,13 @@ impl JitState {
     fn materialize_nzcv(&mut self, ctx: &mut ThreadContext) {
         let code = std::mem::take(&mut self.lazy_nzcv);
         if code != 0 {
-            let (kind, w) = Cmp::from_lazy_code(code);
-            let nzcv = passes::flags_of(kind, w, self.lazy_a, self.lazy_b) as u32;
+            let nzcv = match code {
+                LAZY_PACKED => self.lazy_a as u32 & 0xf,
+                _ => {
+                    let (kind, w) = Cmp::from_lazy_code(code);
+                    passes::flags_of(kind, w, self.lazy_a, self.lazy_b) as u32
+                }
+            };
             ctx.pstate = ctx.pstate & 0x0fff_ffff | nzcv << 28;
             if let Some(p) = self.profile.as_deref_mut() {
                 p.materialized(0, 1);

@@ -2063,6 +2063,57 @@ fn lazy_flags_cross_linked_blocks() {
 }
 
 #[test]
+fn fp_compare_flags_in_and_across_blocks() {
+    const DOUBLE: [u32; 3] = [0x9e67_0000, 0x9e67_0021, 0x1e61_2000];
+    const SINGLE: [u32; 3] = [0x1e27_0000, 0x1e27_0021, 0x1e21_2000];
+    const ZERO: [u32; 3] = [0x9e67_0000, 0x9e67_0021, 0x1e60_2008];
+    const DOUBLES: [u64; 6] = [
+        0,
+        0x8000_0000_0000_0000,
+        0x3ff0_0000_0000_0000,
+        0x4000_0000_0000_0000,
+        0xbff0_0000_0000_0000,
+        0x7ff8_0000_0000_0000,
+    ];
+    const SINGLES: [u64; 5] = [0, 0x8000_0000, 0x3f80_0000, 0x4000_0000, 0x7fc0_0000];
+    for (compare, values) in [
+        (DOUBLE, &DOUBLES[..]),
+        (SINGLE, &SINGLES[..]),
+        (ZERO, &DOUBLES[..]),
+    ] {
+        let across = [
+            compare[0],
+            compare[1],
+            compare[2],
+            0x1400_0001,
+            0xd53b_4204,
+            0x8b04_00a5,
+            0xd100_0529,
+            0xb5ff_ff29,
+        ];
+        for &a in values {
+            for &b in values {
+                directed(&across, &[(0, a), (1, b), (9, 4)]);
+                for cond in 0..14 {
+                    let within = [
+                        compare[0],
+                        compare[1],
+                        compare[2],
+                        0x5400_0040 | cond,
+                        0x9100_0442,
+                        0xd53b_4204,
+                        0x8b04_00a5,
+                        0xd100_0529,
+                        0xb5ff_ff09,
+                    ];
+                    directed(&within, &[(0, a), (1, b), (9, 4)]);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn guest_stores_to_read_only_pages_fault_on_every_backend() {
     const STR_X1_X2: u32 = 0xf900_0041;
     const STADD_W1_X2: u32 = 0xb821_005f;

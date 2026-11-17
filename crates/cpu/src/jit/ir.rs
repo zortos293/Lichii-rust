@@ -74,12 +74,16 @@ impl Cmp {
         1 + 2 * kind + (w == W::W64) as u32
     }
 
-    /// The flags and width a nonzero [`Cmp::lazy_code`] stands for.
+    /// The flags and width a nonzero [`Cmp::lazy_code`] other than [`LAZY_PACKED`] stands for.
     pub fn from_lazy_code(code: u32) -> (Cmp, W) {
         let kind = [Cmp::Add, Cmp::Sub, Cmp::Test][(code as usize - 1) / 2];
         (kind, if code & 1 == 0 { W::W64 } else { W::W32 })
     }
 }
+
+/// The lazy code of NZCV a `Set` left already computed: `JitState::lazy_a` holds it in bits 0-3,
+/// so writing it costs two stores and packing it into `pstate` waits until something reads it.
+pub const LAZY_PACKED: u32 = 7;
 
 /// What an op produces. Every type but `U128` and `Void` lives in a general-purpose host
 /// register; `U128` lives in a vector register.

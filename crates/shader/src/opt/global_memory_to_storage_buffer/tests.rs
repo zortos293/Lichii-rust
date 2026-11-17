@@ -556,6 +556,48 @@ fn native_pointer_loaded_from_a_table_binds_both_buffers() {
 }
 
 #[test]
+fn atomic_through_a_table_pointer_is_routable_only_in_a_native_program() {
+    let build = || {
+        let mut b = Builder::new();
+        let table = b.pair_address(0, 0x50, 8);
+        let loaded = b.inst(Opcode::LoadGlobal64, &[table]);
+        let low = b.inst(Opcode::CompositeExtractU32x2, &[loaded, Value::U32(0)]);
+        let high = b.inst(Opcode::CompositeExtractU32x2, &[loaded, Value::U32(1)]);
+        let address = b.address(low, high, 4);
+        let atomic = b
+            .inst(Opcode::GlobalAtomicIAdd32, &[address, Value::U32(1)])
+            .inst()
+            .unwrap();
+        (b, atomic)
+    };
+
+    let (mut b, atomic) = build();
+    let info = b.run(&Env::default(), &profile()).unwrap();
+    assert!(!info.native_global_bounds);
+    assert_eq!(
+        info.storage_buffers_descriptors,
+        vec![descriptor(0, 0x50, false)],
+        "only the table load is bound: the atomic has nothing to route to"
+    );
+    assert_eq!(b.prog.op(atomic), Opcode::GlobalAtomicIAdd32);
+
+    let (mut b, atomic) = build();
+    let env = Env {
+        native: true,
+        ..Env::default()
+    };
+    let info = b.run(&env, &profile()).unwrap();
+    let mut entry = descriptor(0, 0x50, true);
+    entry.indirect_offset = 8;
+    assert_eq!(
+        info.storage_buffers_descriptors,
+        vec![entry, descriptor(0, 0x50, false)]
+    );
+    assert!(info.native_global_bounds);
+    assert_eq!(b.prog.op(atomic), Opcode::GlobalAtomicIAdd32);
+}
+
+#[test]
 fn too_many_buffers_is_an_error() {
     let mut b = Builder::new();
     for i in 0..3 {

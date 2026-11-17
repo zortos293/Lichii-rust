@@ -18,7 +18,7 @@ use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, VecAssembler, dynasm};
 
 use lichii_memory::ReservationSlot;
 
-use super::ir::{Block, Cmp, Loc, Op, Terminal, Ty, Value, W};
+use super::ir::{Block, Cmp, LAZY_PACKED, Loc, Op, Terminal, Ty, Value, W};
 use super::{JitState, simd};
 use crate::decoder::AtomicOp;
 use crate::interpreter::{condition_holds, crc_table};
@@ -1073,27 +1073,17 @@ impl Emitter<'_> {
                 dynasm!(self.asm ; .arch x64 ; movdqu [r15 + offset], Rx(r));
             }
             Loc::Nzcv => {
-                dynasm!(self.asm
-                    ; .arch x64
-                    ; mov eax, DWORD [r15 + offset]
-                    ; and eax, 0x0fff_ffff
-                );
-                match self.block.constant(x) {
-                    Some(c) => dynasm!(self.asm ; .arch x64 ; or eax, ((c as u32) << 28) as i32),
-                    None => {
-                        let r = self.reg(x);
-                        dynasm!(self.asm
-                            ; .arch x64
-                            ; mov ecx, Rd(r)
-                            ; shl ecx, 28
-                            ; or eax, ecx
-                        );
+                match self.src(x, W::W32) {
+                    Src::Imm(i) => {
+                        dynasm!(self.asm ; .arch x64 ; mov QWORD [BYTE r13 + ST_LAZY_A], i)
+                    }
+                    Src::Reg(r) => {
+                        dynasm!(self.asm ; .arch x64 ; mov QWORD [BYTE r13 + ST_LAZY_A], Rq(r))
                     }
                 }
                 dynasm!(self.asm
                     ; .arch x64
-                    ; mov DWORD [r15 + offset], eax
-                    ; mov DWORD [BYTE r13 + ST_LAZY_NZCV], 0
+                    ; mov DWORD [BYTE r13 + ST_LAZY_NZCV], LAZY_PACKED as i32
                 );
             }
             Loc::Fpcr | Loc::Fpsr => match self.src(x, W::W32) {
@@ -1943,7 +1933,11 @@ pub(super) fn materialize_stub(profile: bool) -> Vec<u8> {
     if profile {
         dynasm!(asm ; .arch x64 ; inc QWORD [r13 + ST_MATERIALIZED]);
     }
-    let pack = asm.new_dynamic_label();
+    let (pack, packed, shift) = (
+        asm.new_dynamic_label(),
+        asm.new_dynamic_label(),
+        asm.new_dynamic_label(),
+    );
     let ops: [(Cmp, W); 6] = [
         (Cmp::Sub, W::W64),
         (Cmp::Sub, W::W32),
@@ -1959,12 +1953,20 @@ pub(super) fn materialize_stub(profile: bool) -> Vec<u8> {
         ; mov rcx, QWORD [BYTE r13 + ST_LAZY_A]
         ; mov rdx, QWORD [BYTE r13 + ST_LAZY_B]
         ; mov DWORD [BYTE r13 + ST_LAZY_NZCV], 0
+        ; cmp eax, LAZY_PACKED as i32
+        ; je =>packed
     );
     for (&(kind, w), &label) in ops.iter().zip(&labels) {
         let code = kind.lazy_code(w) as i32;
         dynasm!(asm ; .arch x64 ; cmp eax, code ; je =>label);
     }
-    dynasm!(asm ; .arch x64 ; ud2);
+    dynasm!(asm
+        ; .arch x64
+        ; ud2
+        ; =>packed
+        ; mov eax, ecx
+        ; jmp =>shift
+    );
     for (&(kind, w), &label) in ops.iter().zip(&labels) {
         dynasm!(asm ; .arch x64 ; =>label);
         match (kind, w) {
@@ -1995,6 +1997,7 @@ pub(super) fn materialize_stub(profile: bool) -> Vec<u8> {
         ; shr ecx, 7
         ; and ecx, 1
         ; lea eax, [rax + rcx * 8]
+        ; =>shift
         ; shl eax, 28
         ; mov ecx, DWORD [r15 + CTX_PSTATE]
         ; and ecx, 0x0fff_ffff
