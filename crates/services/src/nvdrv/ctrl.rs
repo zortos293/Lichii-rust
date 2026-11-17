@@ -194,6 +194,7 @@ impl Ctrl {
     /// Blocks until the guest value reaches the threshold; a negative timeout (milliseconds)
     /// waits for good.
     fn syncpt_wait(&self, params: &mut SyncptWait) -> NvResult {
+        lichii_gpu::diag427::guest_wait(params.id, params.threshold);
         let timeout = u64::try_from(params.timeout)
             .ok()
             .map(Duration::from_millis);
@@ -271,6 +272,7 @@ impl Ctrl {
             return NvResult::Success;
         }
 
+        lichii_gpu::diag427::guest_wait(fence_id, target);
         let shared = event.slot.clone().expect("registered events have a slot");
         let generation = shared.arm();
         event.syncpoint = fence_id;

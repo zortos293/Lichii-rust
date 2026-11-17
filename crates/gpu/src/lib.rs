@@ -13,6 +13,7 @@ pub mod channel;
 pub mod clock;
 mod cpu_reads;
 pub mod device_memory;
+pub mod diag427;
 mod dma_pusher;
 pub mod engines;
 pub mod gmmu;

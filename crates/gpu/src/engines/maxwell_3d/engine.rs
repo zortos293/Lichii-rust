@@ -238,9 +238,12 @@ impl Maxwell3d {
             }
             SYNC_INFO => {
                 let id = regs.sync_info.sync_point();
-                if ctx.syncpoints.host().increment(id).is_err() {
-                    tracing::warn!(id, "3D sync point increments an invalid syncpoint");
-                    return;
+                match ctx.syncpoints.host().increment(id) {
+                    Ok(value) => crate::diag427::host_reached(id, value),
+                    Err(_) => {
+                        tracing::warn!(id, "3D sync point increments an invalid syncpoint");
+                        return;
+                    }
                 }
                 ctx.rasterizer
                     .signal_fence(FenceAction::IncrementSyncpoint(id));

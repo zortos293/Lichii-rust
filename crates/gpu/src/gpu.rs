@@ -623,10 +623,13 @@ impl Gpu {
                     .syncpoints
                     .increase_max(increment.id, increment.count)
                 {
-                    Ok(value) => Some(SyncpointFence {
-                        id: increment.id,
-                        value,
-                    }),
+                    Ok(value) => {
+                        crate::diag427::submitted(increment.id, value, channel.0);
+                        Some(SyncpointFence {
+                            id: increment.id,
+                            value,
+                        })
+                    }
                     Err(error) => {
                         tracing::warn!(%error, "submission increments an invalid syncpoint");
                         None

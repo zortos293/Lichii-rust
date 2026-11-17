@@ -434,11 +434,10 @@ impl FenceAction {
                     mirror_release(handles, page, address - semaphore_mirror::PAGE, &[after]);
                 }
             }
-            Self::IncrementSyncpoint(id) => {
-                if handles.syncpoints.guest().increment(id).is_err() {
-                    tracing::warn!(id, "fence increments an invalid syncpoint");
-                }
-            }
+            Self::IncrementSyncpoint(id) => match handles.syncpoints.guest().increment(id) {
+                Ok(value) => crate::diag427::guest_released(id, value),
+                Err(_) => tracing::warn!(id, "fence increments an invalid syncpoint"),
+            },
         }
     }
 }

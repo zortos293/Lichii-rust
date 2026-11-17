@@ -313,11 +313,13 @@ impl Back {
                 2
             }
             tag::SYNCPOINT_INCREMENT => {
-                if self.syncpoints.host().increment(argument).is_err() {
-                    tracing::warn!(id = argument, "GPU increments an invalid syncpoint");
-                } else {
-                    self.rasterizer
-                        .signal_fence(FenceAction::IncrementSyncpoint(argument));
+                match self.syncpoints.host().increment(argument) {
+                    Ok(value) => {
+                        crate::diag427::host_reached(argument, value);
+                        self.rasterizer
+                            .signal_fence(FenceAction::IncrementSyncpoint(argument));
+                    }
+                    Err(_) => tracing::warn!(id = argument, "GPU increments an invalid syncpoint"),
                 }
                 1
             }
