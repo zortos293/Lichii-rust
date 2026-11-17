@@ -712,6 +712,7 @@ fn incompatible_overlaps_stay_live_and_new_images_take_newer_texels_on_the_gpu()
 
 const GREEN: [u8; 4] = [0, 255, 0, 255];
 const RED: [u8; 4] = [255, 0, 0, 255];
+const BLUE: [u8; 4] = [0, 0, 255, 255];
 
 fn guest_texels(f: &Fixture, offset: u64, len: usize) -> Vec<u8> {
     let mut guest = vec![0; len];
@@ -1039,6 +1040,58 @@ fn sampled_images_still_take_newer_overlaps() {
     );
     assert_eq!(count_texels(&read[0], GREEN), 64 * 64 - 32 * 32);
     assert!(all_texels(&f.read_image(b.id)[0], RED));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn clears_of_a_whole_level_take_no_overlap_bytes_inside_it() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let (chain, _) = f.texture(&tic(0x08, GPU_VA, 64, 64, 1, 2, 3));
+    let level_zero = rt_info(64, 64, 3, GobLayout::Tegra);
+    let overlap = rt_info(128, 32, 2, GobLayout::Tegra);
+    assert_eq!(overlap.size_bytes(), level_zero.size_bytes());
+    clear_rt(&mut f, &overlap, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    let syncs = f.cache.traffic().gpu_syncs;
+    let level = clear_rt(&mut f, &level_zero, [0.0, 0.0, 1.0, 1.0], Rect::ALL);
+    assert_eq!((level.id, level.level), (chain, 0));
+    assert_eq!(
+        f.cache.traffic().gpu_syncs,
+        syncs,
+        "the overlap's bytes all lie in the cleared level"
+    );
+    assert!(all_texels(&f.read_image(chain)[0], BLUE));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn clears_of_a_whole_level_still_take_overlap_bytes_past_it() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let (chain, _) = f.texture(&tic(0x08, GPU_VA, 64, 64, 1, 2, 3));
+    clear_rt(
+        &mut f,
+        &rt_info(128, 64, 3, GobLayout::Tegra),
+        [1.0, 0.0, 0.0, 1.0],
+        Rect::ALL,
+    );
+    let syncs = f.cache.traffic().gpu_syncs;
+    let level = clear_rt(
+        &mut f,
+        &rt_info(64, 64, 3, GobLayout::Tegra),
+        [0.0, 0.0, 1.0, 1.0],
+        Rect::ALL,
+    );
+    assert_eq!((level.id, level.level), (chain, 0));
+    assert_eq!(f.cache.traffic().gpu_syncs, syncs + 1);
+    let read = f.read_image(chain);
+    assert!(all_texels(&read[0], BLUE));
+    assert!(
+        all_texels(&read[1], RED),
+        "level 1 takes the overlap's bytes"
+    );
     f.assert_no_validation_errors();
 }
 
