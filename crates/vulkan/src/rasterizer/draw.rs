@@ -2203,7 +2203,7 @@ impl VulkanRasterizer {
     }
 
     /// Binds every vertex stream an enabled attribute reads, into the draw's vertex lists.
-    fn vertex_buffers(&mut self, gmmu: &lichii_gpu::gmmu::Gmmu, regs: &Regs) -> Result<()> {
+    fn vertex_buffers(&mut self, gmmu: &Arc<lichii_gpu::gmmu::Gmmu>, regs: &Regs) -> Result<()> {
         let used = regs
             .vertex_attrib_format
             .iter()
@@ -2242,7 +2242,7 @@ impl VulkanRasterizer {
     /// Assembled draws read the guest indices in their assembly pass instead.
     fn indirect_index_buffer(
         &mut self,
-        gmmu: &lichii_gpu::gmmu::Gmmu,
+        gmmu: &Arc<lichii_gpu::gmmu::Gmmu>,
         regs: &Regs,
         draw: &IndirectDraw,
     ) -> Result<Option<IndexBinding>> {
@@ -2273,7 +2273,7 @@ impl VulkanRasterizer {
     /// The buffers an indirect draw (a task/mesh one with `mesh`) reads. `None` skips the draw.
     fn indirect_buffers(
         &mut self,
-        gmmu: &lichii_gpu::gmmu::Gmmu,
+        gmmu: &Arc<lichii_gpu::gmmu::Gmmu>,
         regs: &Regs,
         draw: &IndirectDraw,
         mesh: bool,
