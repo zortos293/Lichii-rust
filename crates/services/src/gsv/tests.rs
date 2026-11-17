@@ -1648,8 +1648,13 @@ fn video_decoder_stop_completes_handed_fences_and_full_queues_are_busy() {
     let fences: Vec<_> = (1..=3).map(|image| vdec.hand_out(311, image)).collect();
     let (syncpoint, last) = fences[2];
     assert_eq!(vdec.send(&Request::tipc(207)).result, ResultCode::SUCCESS);
-    let guest = vdec.context.gpu.host1x().syncpoints.guest();
+    let syncpoints = &vdec.context.gpu.host1x().syncpoints;
+    let guest = syncpoints.guest();
     assert!(guest.is_reached(syncpoint, last).unwrap());
+    assert!(
+        syncpoints.host().is_reached(syncpoint, last).unwrap(),
+        "gsv slot and page waits on the stopped images release"
+    );
     std::thread::sleep(Duration::from_millis(20));
     assert_eq!(
         guest.value(syncpoint).unwrap(),

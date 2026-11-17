@@ -423,10 +423,11 @@ impl VideoDecoderService {
         while state.writing {
             shared.idle.wait(&mut state);
         }
-        let guest = shared.syncpoints.guest();
         let target = shared.syncpoints.max(shared.syncpoint).unwrap_or(0);
-        while guest.is_reached(shared.syncpoint, target) == Ok(false) {
-            let _ = guest.increment(shared.syncpoint);
+        for bank in [shared.syncpoints.host(), shared.syncpoints.guest()] {
+            while bank.is_reached(shared.syncpoint, target) == Ok(false) {
+                let _ = bank.increment(shared.syncpoint);
+            }
         }
         drop(state);
         shared.wake.notify_one();
