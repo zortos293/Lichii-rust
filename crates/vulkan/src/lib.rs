@@ -3,6 +3,7 @@
 //! Requires Vulkan 1.3 (timeline semaphores, dynamic rendering, synchronization2).
 
 pub mod buffer_cache;
+mod chunk_mask;
 pub mod commands;
 pub mod debug;
 pub mod descriptors;

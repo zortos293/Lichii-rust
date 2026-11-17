@@ -26,6 +26,7 @@ use lichii_gpu::lazy::LazyDeviceRanges;
 use lichii_memory::{CachedPages, DeviceAddressSpace};
 use lichii_shader::ShaderArch;
 
+use crate::chunk_mask::ChunkMask;
 use crate::commands::transfer_to_all_barrier;
 use crate::device::Device;
 use crate::error::Result;
@@ -380,6 +381,51 @@ impl RangeSet {
         for (&s, &e) in self.ranges.range(first..end) {
             f(s.max(start), e.min(end));
         }
+    }
+}
+
+/// A [`RangeSet`] with the chunks its ranges touch, so tests of ranges away from all of them
+/// skip the tree.
+#[derive(Default)]
+struct MaskedRangeSet {
+    ranges: RangeSet,
+    chunks: ChunkMask,
+}
+
+impl MaskedRangeSet {
+    fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    fn insert(&mut self, start: u64, end: u64) {
+        self.ranges.insert(start, end);
+        self.chunks.insert(start, end.saturating_sub(start));
+    }
+
+    fn subtract(&mut self, start: u64, end: u64) {
+        self.ranges.subtract(start, end);
+        let ranges = &self.ranges;
+        self.chunks
+            .retain(start, end.saturating_sub(start), |lo, hi| {
+                ranges.intersects(lo, hi)
+            });
+    }
+
+    fn covers(&self, start: u64, end: u64) -> bool {
+        self.ranges.covers(start, end)
+    }
+
+    fn area(&self, start: u64, end: u64) -> (u64, u64) {
+        self.ranges.area(start, end)
+    }
+
+    #[inline]
+    fn intersects(&self, start: u64, end: u64) -> bool {
+        self.chunks.any(start, end.saturating_sub(start)) && self.ranges.intersects(start, end)
+    }
+
+    fn for_each_in(&self, start: u64, end: u64, f: impl FnMut(u64, u64)) {
+        self.ranges.for_each_in(start, end, f);
     }
 }
 
@@ -899,7 +945,7 @@ pub struct BufferCache {
     page_table: Vec<u32>,
     buffers: Vec<Option<CachedBuffer>>,
     free_slots: Vec<usize>,
-    gpu_written: RangeSet,
+    gpu_written: MaskedRangeSet,
     /// Whether GPU-written ranges trap guest CPU accesses until they are downloaded
     /// ([`lichii_gpu::gpu::flush_traps_enabled`]).
     flush_traps: bool,
@@ -952,7 +998,7 @@ impl BufferCache {
             page_table: vec![0; (limit >> CACHING_PAGE_BITS) as usize],
             buffers: Vec::new(),
             free_slots: Vec::new(),
-            gpu_written: RangeSet::default(),
+            gpu_written: MaskedRangeSet::default(),
             flush_traps: lichii_gpu::gpu::flush_traps_enabled(),
             stream: StreamRing::new(device, STREAM_RING_SIZE, RING_OVERSIZED_CAP)?,
             sync_slices: None,
@@ -2430,6 +2476,64 @@ mod tests {
 
     use super::*;
     use crate::{Instance, SurfaceSupport};
+
+    /// A seeded random stream of GPU-written range insertions and write-backs: the masked set
+    /// answers every intersection test as the plain set does, and its chunk mask holds exactly
+    /// the chunks of its ranges.
+    #[test]
+    fn masked_ranges_intersect_as_the_plain_set() {
+        let mut seed = 0xdead_beef_cafe_f00du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut masked = MaskedRangeSet::default();
+        let mut plain = RangeSet::default();
+        let mut hits = 0;
+        for step in 0..50_000 {
+            let start = match next() % 3 {
+                0 => ((next() % 0x400) << 16).saturating_sub(next() % 0x80),
+                _ => next() % (64 << 20),
+            };
+            let size = match next() % 6 {
+                0 => 0,
+                1 => next() % (2 << 20),
+                _ => next() % 0x2000,
+            };
+            let end = start + size;
+            match next() % 4 {
+                0 if size > 0 => {
+                    masked.insert(start, end);
+                    plain.insert(start, end);
+                }
+                1 => {
+                    masked.subtract(start, end);
+                    plain.subtract(start, end);
+                }
+                _ => {
+                    let expected = plain.intersects(start, end);
+                    assert_eq!(
+                        masked.intersects(start, end),
+                        expected,
+                        "step {step}: [{start:#x}, {end:#x})"
+                    );
+                    hits += usize::from(expected);
+                }
+            }
+            if step % 64 == 0 {
+                assert_eq!(masked.ranges.ranges, plain.ranges, "step {step}");
+                let occupied: std::collections::BTreeSet<DAddr> = plain
+                    .ranges
+                    .iter()
+                    .flat_map(|(&s, &e)| crate::chunk_mask::chunks_of(s, e - s))
+                    .collect();
+                assert_eq!(masked.chunks.marked(), occupied, "step {step}");
+            }
+        }
+        assert!(hits > 1000, "the stream hits ranges: {hits}");
+    }
 
     thread_local! {
         static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
