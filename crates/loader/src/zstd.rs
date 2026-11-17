@@ -16,7 +16,7 @@ const ZSTD_MAGIC: u32 = 0xFD2F_B528;
 const ZBIC_MAGIC: u32 = 0x4349_425A;
 const SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
 const SKIPPABLE_MASK: u32 = 0xFFFF_FFF0;
-const BLOCK_SIZE_MAX: usize = 128 * 1024;
+pub(crate) const BLOCK_SIZE_MAX: usize = 128 * 1024;
 const MIN_LITERALS_FOR_4_STREAMS: usize = 6;
 const HUFFMAN_LOG_MAX: u32 = 12;
 const HUFFMAN_WEIGHT_LOG_MAX: u32 = 6;
@@ -251,14 +251,15 @@ impl<I: Input> FrameStream<I> {
     }
 
     /// Decodes blocks into `dst` until at least `target` bytes are out or the frame ends, and
-    /// returns how many bytes are decoded.
+    /// returns how many bytes are decoded. Before each block `dst` must hold [`BLOCK_SIZE_MAX`]
+    /// bytes past what is decoded, or the whole declared content, so a caller can grow it as it
+    /// goes.
     pub fn decode_to(&mut self, dst: &mut [u8], target: usize) -> Result<usize> {
-        if let Some(size) = self.header.content_size
-            && size > dst.len() as u64
-        {
-            return Err(ZstdError::OutputTooSmall);
-        }
         while !self.finished && self.decoded < target {
+            let room = (self.decoded + BLOCK_SIZE_MAX) as u64;
+            if (dst.len() as u64) < self.header.content_size.map_or(room, |size| size.min(room)) {
+                return Err(ZstdError::OutputTooSmall);
+            }
             let last;
             (self.decoded, last) = self.decoder.decode_next_block(
                 &mut self.input,
