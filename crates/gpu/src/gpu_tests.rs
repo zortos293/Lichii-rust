@@ -878,6 +878,108 @@ fn acquire_latches_a_release_overwritten_before_the_front_looks() {
     });
 }
 
+/// An acquire the semaphore does not meet suspends its channel without waiting for the back,
+/// even while the back has not run the work before it, and the release queued behind that work
+/// resumes the channel once it lands.
+#[test]
+fn an_unmet_acquire_does_not_hold_the_front_behind_the_back() {
+    let mut rig = Rig::new(Threading::Split);
+    let busy = rig.channel(HostClass::Maxwell);
+    let waiter = rig.channel(HostClass::Ampere);
+    let releaser = rig.channel(HostClass::Ampere);
+    rig.gate.open_through(0);
+    let words = Pushbuffer::default()
+        .bind(0, MAXWELL_3D)
+        .host(host::WFI, 0)
+        .inc(0, 0x700, &[1]);
+    rig.submit(busy, &words.0);
+    rig.gate.entered(1);
+    let words = Pushbuffer::default()
+        .bind(0, AMPERE_3D)
+        .semaphore(SEMAPHORE, 1, 2)
+        .inc(0, 0x701, &[2]);
+    rig.submit(waiter, &words.0);
+    rig.submit(
+        releaser,
+        &Pushbuffer::default().semaphore(SEMAPHORE, 1, 1).0,
+    );
+    let activity = rig.work.handles.activity.clone();
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_millis(200) {
+        assert!(!activity.is_waiting(Wait::FrontWaitingForBack));
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    rig.gate.open_through(usize::MAX);
+    assert_eq!(
+        rig.methods(),
+        [
+            (busy.0, EngineKind::Maxwell3d, 0x700, 1),
+            (waiter.0, EngineKind::Maxwell3d, 0x701, 2),
+        ]
+    );
+}
+
+/// The time to run rounds where one channel does work and releases a counter that another
+/// channel acquires before its own work, as NVN queues gate each other:
+/// `cargo test --release -p lichii-gpu --lib acquire_rounds_cost -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn acquire_rounds_cost_of_two_gated_channels() {
+    const ROUNDS: u32 = 200;
+    const WRITES: u32 = 4;
+    const WORDS: u32 = 128;
+    let work = |mut words: Pushbuffer, round: u32| {
+        for write in 0..WRITES {
+            let values: Vec<u32> = (0..WORDS)
+                .map(|i| (round * WRITES + write) * WORDS + i)
+                .collect();
+            words = words.inc(0, STATE_REGISTER, &values);
+        }
+        words
+    };
+    let mut times = Vec::new();
+    for _ in 0..21 {
+        let mut rig = Rig::new(Threading::Split);
+        let producer = rig.channel(HostClass::Ampere);
+        let consumer = rig.channel(HostClass::Ampere);
+        let bound = |round: u32| match round {
+            1 => Pushbuffer::default().bind(0, AMPERE_3D),
+            _ => Pushbuffer::default(),
+        };
+        let mut entries = Vec::new();
+        for round in 1..=ROUNDS {
+            let produce = work(bound(round), round).semaphore(SEMAPHORE, round, 1);
+            let consume = work(bound(round).semaphore(SEMAPHORE, round, 2), round);
+            entries.push((rig.entry(&produce.0), rig.entry(&consume.0)));
+        }
+        let start = std::time::Instant::now();
+        for &(produce, consume) in &entries {
+            rig.gpu.submit(producer, Submission::new(&[produce]));
+            rig.gpu.submit(consumer, Submission::new(&[consume]));
+        }
+        rig.gpu.synchronize();
+        times.push(start.elapsed());
+        let methods = rig
+            .log
+            .lock()
+            .iter()
+            .filter(|event| matches!(event, Event::Method { .. }))
+            .count();
+        assert_eq!(
+            methods,
+            (2 * ROUNDS * WRITES * WORDS) as usize,
+            "every method ran"
+        );
+    }
+    times.sort();
+    eprintln!(
+        "{ROUNDS} gated rounds of {} methods per channel: median {:?}, min {:?}",
+        WRITES * WORDS,
+        times[times.len() / 2],
+        times[0]
+    );
+}
+
 #[test]
 fn acquire_released_by_the_cpu_resumes() {
     each_mode(|threading| {
