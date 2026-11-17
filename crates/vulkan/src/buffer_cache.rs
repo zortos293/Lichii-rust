@@ -1888,7 +1888,9 @@ impl BufferCache {
     }
 
     /// `[gpu_va, +size)` for reading: its cached buffer when it is one device range at an
-    /// `align`-aligned offset, else a gathered copy.
+    /// `align`-aligned offset, else a gathered copy. `run` is the range's
+    /// [`TranslationMemo::contiguous`].
+    #[allow(clippy::too_many_arguments)]
     fn read_range(
         &mut self,
         scheduler: &mut Scheduler,
@@ -1896,9 +1898,10 @@ impl BufferCache {
         gmmu: &Arc<Gmmu>,
         gpu_va: GpuVAddr,
         size: u64,
+        run: Option<DAddr>,
         align: u64,
     ) -> Result<BufferBinding> {
-        if let Some(daddr) = self.translations.contiguous(gmmu, gpu_va, size) {
+        if let Some(daddr) = run {
             let binding = self.acquire(scheduler, staging, daddr, size)?;
             if binding.offset % align == 0 {
                 return Ok(binding);
@@ -1996,7 +1999,7 @@ impl BufferCache {
             self.stats.streamed_bytes += size;
             return Ok(Some(binding));
         }
-        self.read_range(scheduler, staging, gmmu, gpu_va, size, align)
+        self.read_range(scheduler, staging, gmmu, gpu_va, size, run, align)
             .map(Some)
     }
 
@@ -2045,8 +2048,9 @@ impl BufferCache {
         let start = gpu_va & !(align - 1);
         let size = size + (gpu_va - start);
         if !written && !(GATHER_CACHE_MIN..=GATHER_CACHE_BYTES).contains(&size) {
+            let run = self.translations.contiguous(gmmu, start, size);
             return self
-                .read_range(scheduler, staging, gmmu, start, size, align)
+                .read_range(scheduler, staging, gmmu, start, size, run, align)
                 .map(Some);
         }
         if !written {
@@ -2176,7 +2180,8 @@ impl BufferCache {
         }
         if assembly == Assembly::Direct && !(self.widen_u8 && width == 1) {
             let size = (first + u64::from(count)) * width;
-            let binding = self.read_range(scheduler, staging, gmmu, start, size, width)?;
+            let run = self.translations.contiguous(gmmu, start, size);
+            let binding = self.read_range(scheduler, staging, gmmu, start, size, run, width)?;
             return Ok(Some(IndexBinding {
                 buffer: binding.buffer,
                 offset: binding.offset,
@@ -4340,14 +4345,29 @@ mod tests {
                 let mut expected = vec![0; size as usize];
                 let _ = f.gmmu.read_block(gpu_va, &mut expected);
                 assert!(f.read_binding(vertex) == expected, "{gpu_va:#x}+{size:#x}");
-                if size <= UNIFORM_STREAM_MAX {
-                    let uniform = f
-                        .cache
-                        .uniform_buffer(&mut f.scheduler, &mut f.staging, &f.gmmu, gpu_va, size)
-                        .unwrap()
-                        .unwrap();
-                    assert!(f.read_binding(uniform) == expected, "{gpu_va:#x}+{size:#x}");
+                let uniform = f
+                    .cache
+                    .uniform_buffer(&mut f.scheduler, &mut f.staging, &f.gmmu, gpu_va, size)
+                    .unwrap()
+                    .unwrap();
+                if let Some(daddr) = daddr
+                    && uniform.size > UNIFORM_STREAM_MAX
+                {
+                    let expected = f.acquire(daddr, uniform.size);
+                    let align = f
+                        .device
+                        .properties
+                        .limits
+                        .min_uniform_buffer_offset_alignment;
+                    if expected.offset % align == 0 {
+                        assert_eq!(uniform, expected, "{gpu_va:#x}+{size:#x}");
+                    }
                 }
+                let read = f.read_binding(uniform);
+                assert!(
+                    read == expected[..uniform.size as usize],
+                    "{gpu_va:#x}+{size:#x}"
+                );
             }
         }
 
@@ -4367,6 +4387,18 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(vertex, f.acquire(DADDR + 0x38_0100, 0x200));
+        let uniform = f
+            .cache
+            .uniform_buffer(
+                &mut f.scheduler,
+                &mut f.staging,
+                &f.gmmu,
+                GPU_VA + 0x100,
+                0x2000,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(uniform, f.acquire(DADDR + 0x38_0100, 0x2000));
         f.assert_no_validation_errors();
     }
 
