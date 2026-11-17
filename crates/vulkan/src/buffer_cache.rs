@@ -29,6 +29,7 @@ use lichii_shader::ShaderArch;
 use crate::commands::transfer_to_all_barrier;
 use crate::device::Device;
 use crate::error::Result;
+use crate::host_budget::{Oversized, RING_OVERSIZED_CAP, Readback};
 use crate::memory::{Buffer, BufferView};
 use crate::scheduler::Scheduler;
 use crate::staging::{StagingRing, StagingSlice};
@@ -400,8 +401,8 @@ impl Captures {
 }
 
 /// Host-visible memory the GPU reads directly: streamed uniforms, gathered ranges and converted
-/// indices. Allocations are reused once the tick that consumed them completed, as in the
-/// [`StagingRing`].
+/// indices. Allocations are reused once the tick that consumed them completed, and oversized ones
+/// bounded, as in the [`StagingRing`].
 struct StreamRing {
     device: Arc<Device>,
     ring: Buffer,
@@ -409,11 +410,11 @@ struct StreamRing {
     head: u64,
     /// In-flight regions in ring order: (start, end, tick).
     regions: VecDeque<(u64, u64, u64)>,
-    oversized: VecDeque<(u64, Buffer)>,
+    oversized: Oversized,
 }
 
 impl StreamRing {
-    fn new(device: &Arc<Device>, capacity: u64) -> Result<Self> {
+    fn new(device: &Arc<Device>, capacity: u64, oversized_cap: u64) -> Result<Self> {
         let ring = Buffer::new(
             device,
             capacity,
@@ -427,7 +428,7 @@ impl StreamRing {
             capacity,
             head: 0,
             regions: VecDeque::new(),
-            oversized: VecDeque::new(),
+            oversized: Oversized::new(oversized_cap),
         })
     }
 
@@ -439,15 +440,13 @@ impl StreamRing {
     ) -> Result<StagingSlice<'_>> {
         if size > self.capacity / 4 {
             self.reclaim(scheduler);
-            let buffer = Buffer::new(
+            let buffer = self.oversized.alloc(
                 &self.device,
+                scheduler,
                 size,
                 STREAM_USAGE,
-                MemoryLocation::CpuToGpu,
                 "buffer cache stream (oversized)",
             )?;
-            self.oversized.push_back((scheduler.tick(), buffer));
-            let (_, buffer) = self.oversized.back_mut().expect("just pushed");
             return Ok(StagingSlice {
                 buffer: buffer.raw(),
                 offset: 0,
@@ -498,13 +497,7 @@ impl StreamRing {
         if self.regions.is_empty() {
             self.head = 0;
         }
-        while self
-            .oversized
-            .front()
-            .is_some_and(|(tick, _)| scheduler.is_complete(*tick))
-        {
-            self.oversized.pop_front();
-        }
+        self.oversized.reclaim(scheduler);
     }
 }
 
@@ -775,7 +768,7 @@ pub struct BufferCache {
     /// ([`lichii_gpu::gpu::flush_traps_enabled`]).
     flush_traps: bool,
     stream: StreamRing,
-    readback: Option<Buffer>,
+    readback: Readback,
     captures: Captures,
     luts: [QuadLut; 2],
     widen_u8: bool,
@@ -813,8 +806,8 @@ impl BufferCache {
             free_slots: Vec::new(),
             gpu_written: RangeSet::default(),
             flush_traps: lichii_gpu::gpu::flush_traps_enabled(),
-            stream: StreamRing::new(device, STREAM_RING_SIZE)?,
-            readback: None,
+            stream: StreamRing::new(device, STREAM_RING_SIZE, RING_OVERSIZED_CAP)?,
+            readback: Readback::default(),
             captures: Captures::default(),
             luts: Default::default(),
             widen_u8: !device.features.index_type_uint8,
@@ -833,6 +826,17 @@ impl BufferCache {
 
     pub fn stats(&self) -> BufferCacheStats {
         self.stats
+    }
+
+    /// Bytes of oversized stream buffers not freed yet.
+    pub fn oversized_stream_bytes(&self) -> u64 {
+        self.stream.oversized.bytes()
+    }
+
+    /// Whether the work being recorded at `tick` holds half the stream ring's oversized cap or
+    /// more ([`Oversized::should_submit`]).
+    pub(crate) fn should_submit(&self, tick: u64) -> bool {
+        self.stream.oversized.should_submit(tick)
     }
 
     /// Whether GPU work wrote bytes of `[daddr, +size)` that [`BufferCache::flush`] has not
@@ -1082,16 +1086,15 @@ impl BufferCache {
                 addr += len;
             }
         });
-        if total > self.readback.as_ref().map_or(0, Buffer::size) {
-            self.readback = Some(Buffer::new(
+        let readback = self
+            .readback
+            .ensure(
                 &self.device,
-                total.next_power_of_two().max(CACHING_PAGE_SIZE),
-                vk::BufferUsageFlags::TRANSFER_DST,
-                MemoryLocation::GpuToCpu,
+                scheduler,
+                total.max(CACHING_PAGE_SIZE),
                 "buffer cache readback",
-            )?);
-        }
-        let readback = self.readback.as_ref().expect("just ensured");
+            )?
+            .raw();
         let record = |cmd| {
             before_transfer(&self.device, cmd);
             let mut offset = 0;
@@ -1101,7 +1104,7 @@ impl BufferCache {
                     dst_offset: offset,
                     size: len,
                 }];
-                copy_buffer(&self.device, cmd, src, readback.raw(), &region);
+                copy_buffer(&self.device, cmd, src, readback, &region);
                 offset += len;
             }
             transfer_to_all_barrier(&self.device, cmd);
@@ -1112,7 +1115,11 @@ impl BufferCache {
             record(scheduler.record()?);
             scheduler.finish()?;
         }
-        let data = readback.mapped().expect("readback memory is host visible");
+        let data = self
+            .readback
+            .buffer()
+            .and_then(Buffer::mapped)
+            .expect("readback memory is host visible");
         let mut offset = 0;
         for &(_, _, daddr, len) in &self.downloads {
             let bytes = &data[offset as usize..(offset + len) as usize];
@@ -1125,6 +1132,7 @@ impl BufferCache {
             }
             offset += len;
         }
+        self.readback.release();
         self.gpu_written.subtract(daddr, end);
         self.disarm_written_back(daddr, end);
         self.stats.downloaded_bytes += total;
@@ -2121,7 +2129,7 @@ mod tests {
         memory.map(DADDR, 0, DRAM);
         Some(Fixture {
             scheduler: Scheduler::new(&device).unwrap(),
-            staging: StagingRing::new(&device, 8 << 20).unwrap(),
+            staging: StagingRing::new(&device, 8 << 20, RING_OVERSIZED_CAP).unwrap(),
             cache: BufferCache::new(
                 &device,
                 memory.clone(),
@@ -2268,6 +2276,43 @@ mod tests {
             instance_count: 1,
             inline_indices: None,
         }
+    }
+
+    #[test]
+    fn oversized_stream_floods_stay_within_their_cap_on_a_lagging_gpu() {
+        let Some(device) = crate::host_budget::testing::device() else {
+            return;
+        };
+        const CAP: u64 = 8 << 20;
+        const SIZE: u64 = 3 << 19;
+        let mut ring = StreamRing::new(&device, 1 << 20, CAP).unwrap();
+        let ops = 64;
+        let result = crate::host_budget::testing::flood(
+            &device,
+            &mut ring,
+            ops,
+            |ring, scheduler| {
+                let slice = ring.alloc(scheduler, SIZE, 4).unwrap();
+                assert_eq!(slice.data.len() as u64, SIZE);
+            },
+            |ring| ring.oversized.bytes(),
+            |ring, tick| ring.oversized.should_submit(tick),
+        );
+        assert!(
+            u64::from(ops) * SIZE > 8 * CAP,
+            "the flood is many times the cap"
+        );
+        assert!(result.lagged > 0, "allocations ran ahead of the GPU");
+        assert!(
+            result.peak > CAP / 2,
+            "the cap bound the flood: {}",
+            result.peak
+        );
+        assert!(
+            result.peak <= CAP,
+            "{} in flight passed the cap",
+            result.peak
+        );
     }
 
     #[test]

@@ -10,6 +10,7 @@ use lichii_common::settings::{AstcRecompression, GraphicsSettings, PresentMode};
 use lichii_texture::PixelFormat;
 use lichii_vulkan::commands::{COLOR_RANGE, ImageAccess, transfer_to_all_barrier, transition};
 use lichii_vulkan::format::{Conversion, host_format};
+use lichii_vulkan::host_budget::RING_OVERSIZED_CAP;
 use lichii_vulkan::memory::{Buffer, Image, ImageDesc};
 use lichii_vulkan::scheduler::{Scheduler, SemaphoreWait};
 use lichii_vulkan::staging::StagingRing;
@@ -175,7 +176,7 @@ fn staging_ring_wraps_within_one_submission() {
 fn staging_round_trip(flush_every: u64) {
     let Some(device) = device() else { return };
     let mut scheduler = Scheduler::new(&device).unwrap();
-    let mut ring = StagingRing::new(&device, 64 << 10).unwrap();
+    let mut ring = StagingRing::new(&device, 64 << 10, RING_OVERSIZED_CAP).unwrap();
     const CHUNK: u64 = 7000;
     const CHUNKS: u64 = 60;
     let target = Buffer::new(
@@ -272,7 +273,7 @@ fn images_round_trip_through_staging() {
     let _serial = serial();
     let Some(device) = device() else { return };
     let mut scheduler = Scheduler::new(&device).unwrap();
-    let mut ring = StagingRing::new(&device, 1 << 20).unwrap();
+    let mut ring = StagingRing::new(&device, 1 << 20, RING_OVERSIZED_CAP).unwrap();
     let (w, h) = (37u32, 21u32);
     let image = Image::new(
         &device,
