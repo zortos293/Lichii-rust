@@ -664,6 +664,8 @@ pub struct TextureCache {
     creations: u64,
     /// Host images replaced by a rescale, and resolution scale changes, so far.
     replacements: u64,
+    /// Times the address lookups were forgotten so far.
+    lookup_clears: u64,
     ids: Vec<ImageId>,
     /// The overlaps [`TextureCache::rearm`] collects, apart from `ids`, which its callers may
     /// be holding.
@@ -1060,6 +1062,7 @@ impl TextureCache {
             removals: 0,
             creations: 0,
             replacements: 0,
+            lookup_clears: 0,
             ids: Vec::new(),
             rearm_ids: Vec::new(),
             joins: Vec::new(),
@@ -1218,6 +1221,14 @@ impl TextureCache {
     /// id, lookup result or view taken while this stays the same is still current.
     pub fn generation(&self) -> u64 {
         self.creations + self.removals + self.replacements
+    }
+
+    /// Changes whenever a host image is replaced or the address lookups are forgotten. While
+    /// it and the GMMU's generation stay the same, [`TextureCache::texture`] gives a texture
+    /// header the image and view it gave before, as long as [`TextureCache::keep_texture`]
+    /// keeps that image: creating and removing other images changes neither.
+    pub fn texture_generation(&self) -> u64 {
+        self.replacements + self.lookup_clears
     }
 
     /// Whether [`TextureCache::render_target`] would return `id` as it is: it holds every
@@ -1721,6 +1732,7 @@ impl TextureCache {
     /// no forgetting, as a lookup is keyed by the whole image info.
     pub fn invalidate_lookups(&mut self) {
         self.lookup.clear();
+        self.lookup_clears += 1;
     }
 
     /// A GPU-modified image whose first byte is the framebuffer's and that holds at least the
@@ -2314,6 +2326,7 @@ impl TextureCache {
         }
         if self.lookup.len() >= MAX_LOOKUPS {
             self.lookup.clear();
+            self.lookup_clears += 1;
         }
         self.lookup.insert(
             key,

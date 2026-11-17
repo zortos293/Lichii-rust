@@ -1007,6 +1007,140 @@ fn activity_counts_draws_submits_and_texture_uploads() {
     f.assert_no_validation_errors();
 }
 
+/// Sampling another texture creates its image, which leaves the first texture's binding
+/// standing; once the first texture's image is removed, the next draw finds it again.
+#[test]
+fn sampled_textures_stay_bound_across_other_images_until_theirs_is_removed() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    write(&f, PROGRAMS + u64::from(FRAGMENT), &sampling_program());
+    uniform_texture(&f, 0, TEXTURE, [10, 200, 30, 255]);
+    uniform_texture(&f, 1, OTHER_TEXTURE, [50, 60, 70, 255]);
+    let regs = sampling_regs();
+    let sample = |f: &mut Fixture, handle: u32| {
+        write(f, FRAGMENT_CBUF + 0x40, &handle.to_le_bytes());
+        f.rasterizer
+            .invalidate_region(DADDR + FRAGMENT_CBUF + 0x40, 4);
+        draw(f, &gmmu, &regs);
+        target(f)[0]
+    };
+    assert_eq!(sample(&mut f, 0), [10, 200, 30, 255]);
+    let generation = f.rasterizer.texture_cache.generation();
+    assert_eq!(sample(&mut f, 1), [50, 60, 70, 255]);
+    assert_ne!(
+        f.rasterizer.texture_cache.generation(),
+        generation,
+        "texture 1 got an image"
+    );
+    assert_eq!(
+        f.rasterizer.draw.bound_textures.bound.len(),
+        2,
+        "creating texture 1's image kept texture 0's binding"
+    );
+    let uploads = f.rasterizer.texture_cache.traffic().uploads;
+    assert_eq!(sample(&mut f, 0), [10, 200, 30, 255]);
+    assert_eq!(f.rasterizer.texture_cache.traffic().uploads, uploads);
+    let r = &mut f.rasterizer;
+    r.texture_cache
+        .unmap(&mut r.scheduler, DADDR + TEXTURE, 0x1000);
+    assert_eq!(
+        sample(&mut f, 0),
+        [10, 200, 30, 255],
+        "texture 0 gets a new image"
+    );
+    assert_eq!(f.rasterizer.texture_cache.traffic().uploads, uploads + 1);
+    f.assert_no_validation_errors();
+}
+
+/// Binding cost of eight sampled textures after each creation and removal of an image none of
+/// them samples, as render targets and overlaps come and go during a frame:
+/// `cargo test --release -p lichii-vulkan --lib texture_binding_cost -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn texture_binding_cost_across_other_images() {
+    use std::hint::black_box;
+    use std::time::{Duration, Instant};
+
+    use lichii_shader::info::{HandleSource, TextureDescriptor};
+    use lichii_shader::ir::TextureType;
+
+    const TEXTURES: u32 = 8;
+    const ROUNDS: u32 = 2000;
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    for i in 0..=TEXTURES {
+        uniform_texture(
+            &f,
+            u64::from(i),
+            TEXTURE + u64::from(i) * 0x1000,
+            [10, 20, 30, 255],
+        );
+    }
+    let cbufs = const_buffers();
+    let src = StageSources {
+        gmmu: &gmmu,
+        cbufs: &cbufs[4],
+        root_table: None,
+        pool: TexturePool {
+            address: GPU_VA + TIC,
+            limit: TEXTURES,
+            via_header_index: false,
+            switch2: false,
+        },
+        samplers: GPU_VA + TSC,
+        sampler_limit: 0,
+    };
+    let desc = TextureDescriptor {
+        ty: TextureType::Color2D,
+        is_depth: false,
+        is_multisample: false,
+        is_integer: false,
+        handle: HandleSource {
+            cbuf_index: 0,
+            cbuf_offset: 0x40,
+            shift_left: 0,
+            secondary: None,
+        },
+        count: 1,
+        size_shift: 0,
+        is_descriptor_array: false,
+        handle_is_pointer_word: false,
+        handle_program: None,
+    };
+    let r = &mut f.rasterizer;
+    let bind = |r: &mut VulkanRasterizer, churn: bool| {
+        if churn {
+            r.sampled_texture(&src, TEXTURES, &desc).unwrap();
+            let scratch = DADDR + TEXTURE + u64::from(TEXTURES) * 0x1000;
+            r.texture_cache.unmap(&mut r.scheduler, scratch, 0x1000);
+        }
+        let start = Instant::now();
+        for raw in 0..TEXTURES {
+            black_box(r.sampled_texture(&src, raw, &desc).unwrap()).unwrap();
+        }
+        start.elapsed()
+    };
+    for churn in [false, true] {
+        let mut total = Duration::ZERO;
+        for round in 0..ROUNDS {
+            total += bind(r, churn);
+            if round % 100 == 99 {
+                r.scheduler.finish().unwrap();
+            }
+        }
+        let per = total / (ROUNDS * TEXTURES);
+        let what = if churn {
+            "after an image churn"
+        } else {
+            "steady"
+        };
+        eprintln!("sampled texture binding, {what}: {per:?}");
+    }
+    f.assert_no_validation_errors();
+}
+
 /// A guest address space mapping `size` bytes of the fixture's DRAM at each (va, offset), whose
 /// writes the fixture's device tracks.
 #[test]
