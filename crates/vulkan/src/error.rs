@@ -10,6 +10,8 @@ pub enum Error {
         call: &'static str,
         result: vk::Result,
     },
+    #[error("the Vulkan device was lost")]
+    DeviceLost,
     #[error("no Vulkan 1.3 device with graphics and the required features")]
     NoDevice,
     #[error("the surface supports no usable format")]
@@ -30,7 +32,7 @@ impl<T> VkResultExt<T> for Result<T, vk::Result> {
     fn call(self, call: &'static str) -> Result<T> {
         self.map_err(|result| {
             if result == vk::Result::ERROR_DEVICE_LOST {
-                crate::debug::device_lost();
+                crate::debug::lose_device();
             }
             Error::Vulkan { call, result }
         })

@@ -5,7 +5,7 @@ use ash::vk;
 use lichii_gpu::activity::{Activity, Wait};
 
 use crate::device::Device;
-use crate::error::{Result, VkResultExt};
+use crate::error::{Error, Result, VkResultExt};
 
 /// A semaphore a submission waits on: binary when `value` is 0, timeline otherwise.
 #[derive(Clone, Copy, Debug)]
@@ -22,6 +22,9 @@ pub struct SemaphoreWait {
 /// One scheduler belongs to one thread: the GPU thread's rasterizer and the presenter each own
 /// one, sharing only the device's queue lock, so presentation cannot race the rasterizer's
 /// command recording (NX2_NOTES row 118).
+///
+/// Once the device is lost it records, submits and waits for nothing: those calls return
+/// [`Error::DeviceLost`].
 pub struct Scheduler {
     device: Arc<Device>,
     timeline: Arc<Timeline>,
@@ -207,6 +210,9 @@ impl Scheduler {
     }
 
     fn command_buffer(&mut self) -> Result<vk::CommandBuffer> {
+        if crate::debug::device_is_lost() {
+            return Err(Error::DeviceLost);
+        }
         if let Some(cmd) = self.current {
             return Ok(cmd);
         }
@@ -262,6 +268,9 @@ impl Scheduler {
         waits: &[SemaphoreWait],
         signals: &[vk::Semaphore],
     ) -> Result<u64> {
+        if crate::debug::device_is_lost() {
+            return Err(Error::DeviceLost);
+        }
         let tick = self.tick;
         if let Some(cmd) = self.current {
             self.end_rendering(cmd);
@@ -383,6 +392,9 @@ impl Scheduler {
         if self.is_complete(tick) {
             return Ok(());
         }
+        if crate::debug::device_is_lost() {
+            return Err(Error::DeviceLost);
+        }
         let t0 = std::time::Instant::now();
         if tick >= self.tick {
             self.flush()?;
@@ -422,6 +434,9 @@ impl Scheduler {
     /// already: the wait covers neither the recorded work nor its submission. The recorded
     /// commands must not depend on work recorded since the last flush.
     pub fn run_aside(&mut self, record: impl FnOnce(vk::CommandBuffer)) -> Result<()> {
+        if crate::debug::device_is_lost() {
+            return Err(Error::DeviceLost);
+        }
         let (cmd, fence) = match self.aside {
             Some(aside) => aside,
             None => {

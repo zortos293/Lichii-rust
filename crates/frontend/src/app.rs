@@ -606,8 +606,22 @@ Dump prod.keys and title.keys \
         self.update_title();
     }
 
-    /// Ends the session once its title has exited, saying why when it crashed.
+    /// Ends the session once its title has exited, saying why when it crashed. A lost Vulkan
+    /// device ends Lichii too: nothing it draws or reads back is valid any more.
     fn check_exit(&mut self) {
+        if !self.exit_requested && lichii_vulkan::debug::device_lost() {
+            self.stop();
+            rfd::MessageDialog::new()
+                .set_title("Lichii")
+                .set_description(
+                    "The GPU stopped responding (Vulkan device lost), so Lichii stopped the title \
+                     and will close. The log names the GPU fault report.",
+                )
+                .set_level(rfd::MessageLevel::Error)
+                .show();
+            self.exit_requested = true;
+            return;
+        }
         let Some(reason) = self.session.as_ref().and_then(Session::exit_reason) else {
             return;
         };
@@ -1025,6 +1039,10 @@ Dump prod.keys and title.keys \
         self.check_exit();
         self.sync_guest_input();
         self.report_frame_rate();
+        if self.exit_requested {
+            event_loop.exit();
+            return;
+        }
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + MINIMIZED_POLL));
     }
 
@@ -1036,13 +1054,17 @@ Dump prod.keys and title.keys \
             self.idle(event_loop);
             return;
         }
-        let Some(mut egui_state) = self.egui_state.take() else {
-            return;
-        };
         self.games.poll();
         self.poll_install();
         self.poll_firmware();
         self.check_exit();
+        if self.exit_requested {
+            event_loop.exit();
+            return;
+        }
+        let Some(mut egui_state) = self.egui_state.take() else {
+            return;
+        };
         let raw = egui_state.take_egui_input(&window);
         let ctx = self.egui_ctx.clone();
         let mut actions = Vec::new();
