@@ -30,7 +30,7 @@ use crate::chunk_mask::ChunkMask;
 use crate::commands::transfer_to_all_barrier;
 use crate::device::Device;
 use crate::error::Result;
-use crate::host_budget::{Oversized, RING_OVERSIZED_CAP, Readback};
+use crate::host_budget::{RING_OVERSIZED_CAP, Readback};
 use crate::memory::{Buffer, BufferView, LiveMemory};
 use crate::scheduler::Scheduler;
 use crate::staging::{StagingRing, StagingSlice};
@@ -498,107 +498,6 @@ impl Captures {
     }
 }
 
-/// Host-visible memory the GPU reads directly: streamed uniforms, gathered ranges and converted
-/// indices. Allocations are reused once the tick that consumed them completed, and oversized ones
-/// bounded, as in the [`StagingRing`].
-struct StreamRing {
-    device: Arc<Device>,
-    ring: Buffer,
-    capacity: u64,
-    head: u64,
-    /// In-flight regions in ring order: (start, end, tick).
-    regions: VecDeque<(u64, u64, u64)>,
-    oversized: Oversized,
-}
-
-impl StreamRing {
-    fn new(device: &Arc<Device>, capacity: u64, oversized_cap: u64) -> Result<Self> {
-        let ring = Buffer::new(
-            device,
-            capacity,
-            STREAM_USAGE,
-            MemoryLocation::CpuToGpu,
-            "buffer cache stream",
-        )?;
-        Ok(Self {
-            device: device.clone(),
-            ring,
-            capacity,
-            head: 0,
-            regions: VecDeque::new(),
-            oversized: Oversized::new(oversized_cap),
-        })
-    }
-
-    fn alloc(
-        &mut self,
-        scheduler: &mut Scheduler,
-        size: u64,
-        align: u64,
-    ) -> Result<StagingSlice<'_>> {
-        if size > self.capacity / 4 {
-            self.reclaim(scheduler);
-            let buffer = self.oversized.alloc(
-                &self.device,
-                scheduler,
-                size,
-                STREAM_USAGE,
-                "buffer cache stream (oversized)",
-            )?;
-            return Ok(StagingSlice {
-                buffer: buffer.raw(),
-                offset: 0,
-                data: buffer.mapped_mut().expect("stream memory is host visible"),
-            });
-        }
-        let start = loop {
-            self.reclaim(scheduler);
-            let aligned = self.head.next_multiple_of(align);
-            let start = if aligned + size <= self.capacity {
-                aligned
-            } else {
-                0
-            };
-            let end = start + size;
-            if self.regions.iter().all(|&(s, e, _)| end <= s || start >= e) {
-                break start;
-            }
-            let (_, _, oldest) = *self.regions.front().expect("a full ring has regions");
-            scheduler.wait(oldest)?;
-        };
-        let tick = scheduler.tick();
-        let end = start + size;
-        match self.regions.back_mut() {
-            Some(last) if last.2 == tick && last.1 <= start => last.1 = end,
-            _ => self.regions.push_back((start, end, tick)),
-        }
-        self.head = end;
-        let buffer = self.ring.raw();
-        let data = &mut self
-            .ring
-            .mapped_mut()
-            .expect("stream memory is host visible")[start as usize..end as usize];
-        Ok(StagingSlice {
-            buffer,
-            offset: start,
-            data,
-        })
-    }
-
-    fn reclaim(&mut self, scheduler: &mut Scheduler) {
-        while let Some(&(_, _, tick)) = self.regions.front() {
-            if !scheduler.is_complete(tick) {
-                break;
-            }
-            self.regions.pop_front();
-        }
-        if self.regions.is_empty() {
-            self.head = 0;
-        }
-        self.oversized.reclaim(scheduler);
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Assembly {
     Direct,
@@ -949,7 +848,9 @@ pub struct BufferCache {
     /// Whether GPU-written ranges trap guest CPU accesses until they are downloaded
     /// ([`lichii_gpu::gpu::flush_traps_enabled`]).
     flush_traps: bool,
-    stream: StreamRing,
+    /// Host-visible memory the GPU reads directly: streamed uniforms, gathered ranges and
+    /// converted indices.
+    stream: StagingRing,
     sync_slices: Option<SyncSlices>,
     readback: Readback,
     captures: Captures,
@@ -1000,7 +901,14 @@ impl BufferCache {
             free_slots: Vec::new(),
             gpu_written: MaskedRangeSet::default(),
             flush_traps: lichii_gpu::gpu::flush_traps_enabled(),
-            stream: StreamRing::new(device, STREAM_RING_SIZE, RING_OVERSIZED_CAP)?,
+            stream: StagingRing::with_usage(
+                device,
+                STREAM_RING_SIZE,
+                RING_OVERSIZED_CAP,
+                STREAM_USAGE,
+                "buffer cache stream",
+                "buffer cache stream (oversized)",
+            )?,
             sync_slices: None,
             readback: Readback::default(),
             captures: Captures::default(),
@@ -1031,9 +939,9 @@ impl BufferCache {
     }
 
     /// Whether the work being recorded at `tick` holds half the stream ring's oversized cap or
-    /// more ([`Oversized::should_submit`]).
+    /// more ([`StagingRing::should_submit`]).
     pub(crate) fn should_submit(&self, tick: u64) -> bool {
-        self.stream.oversized.should_submit(tick)
+        self.stream.should_submit(tick)
     }
 
     /// Whether GPU work wrote bytes of `[daddr, +size)` that [`BufferCache::flush`] has not
@@ -1045,7 +953,7 @@ impl BufferCache {
 
     /// The oversized stream buffers not freed yet.
     pub fn oversized_stream(&self) -> LiveMemory {
-        self.stream.oversized.live()
+        self.stream.oversized()
     }
 
     /// The alignment storage bindings start at: [`BufferCache::storage_buffer`] rounds the
@@ -1532,7 +1440,8 @@ impl BufferCache {
     /// upload that shares the staging ring takes one slice of it; a larger one goes through the
     /// two [`SyncSlices`] in pieces of at most [`SYNC_SLICE`] bytes, each submitted as a part of
     /// the tick. So whatever the upload's size, it holds at most `2 * SYNC_SLICE` (16 MiB) of
-    /// host-visible memory beside the ring and takes nothing from the [`Oversized`] budget.
+    /// host-visible memory beside the ring and takes nothing from the
+    /// [`Oversized`](crate::host_budget::Oversized) budget.
     /// The parts never end the tick: what the operation being set up allocated before stays
     /// valid, and its commands keep their order.
     fn synchronize(
@@ -2807,7 +2716,15 @@ mod tests {
         };
         const CAP: u64 = 8 << 20;
         const SIZE: u64 = 3 << 19;
-        let mut ring = StreamRing::new(&device, 1 << 20, CAP).unwrap();
+        let mut ring = StagingRing::with_usage(
+            &device,
+            1 << 20,
+            CAP,
+            STREAM_USAGE,
+            "test stream",
+            "test stream (oversized)",
+        )
+        .unwrap();
         let ops = 64;
         let result = crate::host_budget::testing::flood(
             &device,
@@ -2817,8 +2734,8 @@ mod tests {
                 let slice = ring.alloc(scheduler, SIZE, 4).unwrap();
                 assert_eq!(slice.data.len() as u64, SIZE);
             },
-            |ring| ring.oversized.live().bytes,
-            |ring, tick| ring.oversized.should_submit(tick),
+            |ring| ring.oversized().bytes,
+            |ring, tick| ring.should_submit(tick),
         );
         assert!(
             u64::from(ops) * SIZE > 8 * CAP,
