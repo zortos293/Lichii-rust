@@ -209,9 +209,9 @@ impl CtrlGpu {
             (Variant::One, (b'G', 0x4)) => args.fixed(|p| self.zbc_query(p)),
             (Variant::One, (b'G', 0x5)) => args.fixed(|p| self.characteristics(p)),
             (Variant::Three, (b'G', 0x5)) => self.characteristics_inline(args),
-            (Variant::One, (b'G', 0x6)) => args.fixed(Self::tpc_masks),
+            (Variant::One, (b'G', 0x6)) => args.fixed(|p| self.tpc_masks(p)),
             (Variant::Three, (b'G', 0x6)) => {
-                let result = args.fixed(Self::tpc_masks);
+                let result = args.fixed(|p| self.tpc_masks(p));
                 let masks: TpcMasks = read_struct(args.output);
                 write_struct(args.inline_output, &masks.tpc_mask);
                 result
@@ -262,9 +262,10 @@ impl CtrlGpu {
         NvResult::Success
     }
 
-    fn tpc_masks(params: &mut TpcMasks) -> NvResult {
+    /// The TPCs of the one GPC: GM20B's two, or T239's six.
+    fn tpc_masks(&self, params: &mut TpcMasks) -> NvResult {
         if params.mask_buffer_size != 0 {
-            params.tpc_mask = 3;
+            params.tpc_mask = if self.nvdrv.nx2 { 0x3F } else { 0x3 };
         }
         NvResult::Success
     }
@@ -313,7 +314,9 @@ impl CtrlGpu {
         }
         gc.arch = 0x170;
         gc.implementation = 0xE;
+        gc.l2_cache_size = 0x10_0000;
         gc.num_tpc_per_gpc = 0x6;
+        gc.sm_arch_warp_count = 0x60;
         gc.sm_arch_sm_version = 0x808;
         gc.sm_arch_spa_version = 0x808;
         gc.threed_class = 0xC797;

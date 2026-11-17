@@ -216,6 +216,8 @@ impl Scheduler {
                 .begin_command_buffer(cmd, &begin)
                 .call("vkBeginCommandBuffer")?
         };
+        self.device
+            .checkpoint(cmd, format_args!("commands of tick {}", self.tick));
         self.current = Some(cmd);
         if let Some(gt) = self.gt.as_mut() { gt.begin(&self.device, cmd); }
         Ok(cmd)

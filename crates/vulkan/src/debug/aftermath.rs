@@ -101,7 +101,6 @@ pub(crate) struct Aftermath {
 }
 
 static AFTERMATH: OnceLock<Aftermath> = OnceLock::new();
-static DEVICE_LOST: AtomicBool = AtomicBool::new(false);
 
 /// Aftermath, when crash dumps are enabled.
 pub(crate) fn get() -> Option<&'static Aftermath> {
@@ -278,7 +277,7 @@ impl Aftermath {
     }
 
     /// Waits until Aftermath finished the dump of a lost device, at most [`DUMP_WAIT`].
-    fn wait_for_dump(&self) {
+    pub(super) fn wait_for_dump(&self) {
         let deadline = Instant::now() + DUMP_WAIT;
         let mut status = 0;
         while Instant::now() < deadline {
@@ -297,17 +296,6 @@ impl Aftermath {
             status,
             "Nsight Aftermath: crash dump collection ended"
         );
-    }
-}
-
-/// Logs the loss of the device once and, with Aftermath on, waits for its crash dump.
-pub(crate) fn device_lost() {
-    if DEVICE_LOST.swap(true, Ordering::Relaxed) {
-        return;
-    }
-    tracing::error!("the Vulkan device was lost");
-    if let Some(aftermath) = get() {
-        aftermath.wait_for_dump();
     }
 }
 
