@@ -4662,9 +4662,14 @@ fn depth_bias_constants_offset_by_half_the_register_value() {
 }
 
 /// Draws the full-target triangle at depth `z` into a 32-bit depth target of guest
-/// `format` with a depth bias register of 8 and reads the target back.
+/// `format` with a depth bias register of 8 and reads the target back. `None` without a
+/// device that applies the bias exactly in a float representation.
 fn biased_depth_words(format: u32, z: f32) -> Option<Vec<u32>> {
     let (mut f, gmmu) = draw_fixture()?;
+    let features = &f.rasterizer.device.features;
+    if !(features.depth_bias_float && features.depth_bias_exact) {
+        return None;
+    }
     write(&f, VERTEX_CBUF, &f32_bytes(&[z, 1.0]));
     write(
         &f,
