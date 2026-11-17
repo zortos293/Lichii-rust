@@ -19,7 +19,7 @@ jobs:
       - name: Build FFmpeg
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
-          sudo apt-get update && sudo apt-get install -y mingw-w64 nasm
+          sudo apt-get update && sudo apt-get install -y mingw-w64 nasm meson ninja-build pkg-config
           scripts/build-ffmpeg-windows.sh ffmpeg-windows
       - uses: actions/upload-artifact@v4
         with:
