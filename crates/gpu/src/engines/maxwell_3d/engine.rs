@@ -390,11 +390,8 @@ impl Maxwell3d {
         match self.draw_condition() {
             None => false,
             Some(None) => true,
-            Some(Some(_)) => {
-                let RenderEnable::Gpu { condition, count } = self.render_enable else {
-                    unreachable!("only a GPU render enable gives a condition");
-                };
-                let renders = queries::count_condition(ctx, count, condition.inverted);
+            Some(Some(condition)) => {
+                let renders = queries::host_condition(ctx, condition);
                 self.render_enable = RenderEnable::Host(renders);
                 renders
             }
@@ -402,17 +399,16 @@ impl Maxwell3d {
     }
 
     /// A macro the back ran wrote RENDER_ENABLE_MODE as `mode`, which holds only where
-    /// `condition` does on the host GPU: on the SamplesPassed count at GPU address `count`.
+    /// `condition` does on the host GPU.
     pub fn set_render_condition(
         &mut self,
         ctx: &mut EngineContext<'_>,
         mode: u32,
         condition: RenderCondition,
-        count: u64,
     ) {
         self.flush(ctx);
         self.state.write(RENDER_ENABLE_MODE, mode);
-        self.render_enable = RenderEnable::Gpu { condition, count };
+        self.render_enable = RenderEnable::Gpu(condition);
     }
 }
 

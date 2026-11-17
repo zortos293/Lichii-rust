@@ -776,7 +776,7 @@ fn run_as_condition(
     if zero.len() != nonzero.len() {
         return false;
     }
-    let mut modes = None;
+    let mut tests = false;
     for (&(method, a), &(other, b)) in zero.iter().zip(nonzero) {
         if method != other {
             return false;
@@ -787,35 +787,36 @@ fn run_as_condition(
         if method != RENDER_ENABLE_MODE || !matches!((a, b), (0, 1) | (1, 0)) {
             return false;
         }
-        modes = Some((a, b));
+        tests = true;
     }
-    let condition = match modes {
-        None => None,
-        Some((zero_mode, _)) => {
+    let predicate = match tests {
+        false => None,
+        true => {
             let Some(predicate) = ctx
                 .memory
                 .translate(count)
-                .and_then(|daddr| ctx.rasterizer.samples_predicate(daddr))
+                .and_then(|daddr| ctx.rasterizer.samples_predicate(ctx.channel, daddr))
             else {
                 return false;
             };
-            Some(RenderCondition {
-                predicate,
-                inverted: zero_mode == 1,
-            })
+            Some(predicate)
         }
     };
     static LOGGED: AtomicBool = AtomicBool::new(false);
-    if condition.is_some() && !LOGGED.swap(true, Ordering::Relaxed) {
+    if predicate.is_some() && !LOGGED.swap(true, Ordering::Relaxed) {
         tracing::info!(start, "3D macro's occlusion test runs on the host GPU");
     }
     for (&(method, value), &(_, nonzero_value)) in zero.iter().zip(nonzero) {
         if is_load_mme(method) || method >= MACRO_REGISTERS_START {
             continue;
         }
-        match condition {
-            Some(condition) if method == RENDER_ENABLE_MODE && value != nonzero_value => {
-                engine.set_render_condition(ctx, nonzero_value, condition, count);
+        match predicate {
+            Some(predicate) if method == RENDER_ENABLE_MODE && value != nonzero_value => {
+                let condition = RenderCondition {
+                    predicate,
+                    inverted: value == 1,
+                };
+                engine.set_render_condition(ctx, nonzero_value, condition);
             }
             _ => engine.call_method(ctx, method, value),
         }

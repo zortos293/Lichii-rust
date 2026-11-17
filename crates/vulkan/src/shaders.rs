@@ -106,7 +106,7 @@ pub static INDIRECT_ASSEMBLE_COMP: &[u32] = spirv!("indirect_assemble.comp");
 pub static DISPATCH_GRID_COMP: &[u32] = spirv!("dispatch_grid.comp");
 /// `mesh_indirect.comp`: The guest commands of an indirect task/mesh draw as `VkDrawMeshTasksIndirectCommandEXT`s launching their first word's groups, clamped to the device's limit; one invocation a command.
 pub static MESH_INDIRECT_COMP: &[u32] = spirv!("mesh_indirect.comp");
-/// `conditional_reduce.comp`: Predicate `slot` for conditional rendering, nonzero exactly when one of `count` 32-bit occlusion query results is; one 64-invocation workgroup.
+/// `conditional_reduce.comp`: Predicate `slot` for conditional rendering and its host-visible copy, nonzero exactly when one of `count` 32-bit occlusion query results is; one 64-invocation workgroup.
 pub static CONDITIONAL_REDUCE_COMP: &[u32] = spirv!("conditional_reduce.comp");
 /// `clear.vert`: Fullscreen triangle from `gl_VertexIndex` 0..2 with no outputs, for masked clears.
 pub static CLEAR_VERT: &[u32] = spirv!("clear.vert");

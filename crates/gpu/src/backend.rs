@@ -635,10 +635,17 @@ pub trait Rasterizer: Send {
 
     /// A predicate on the SamplesPassed report that is the last write still waiting in the
     /// renderer's fences for `addr`: nonzero exactly when the count the report writes there is.
-    /// None when no such report is pending at `addr` or the renderer cannot evaluate predicates;
-    /// the caller then reads the count.
-    fn samples_predicate(&mut self, _addr: DAddr) -> Option<GpuPredicate> {
+    /// It stays valid while it is `channel`'s latest predicate. None when no such report is
+    /// pending at `addr` or the renderer cannot evaluate predicates; the caller then reads the
+    /// count.
+    fn samples_predicate(&mut self, _channel: ChannelId, _addr: DAddr) -> Option<GpuPredicate> {
         None
+    }
+
+    /// Whether `predicate`, which this renderer made, is nonzero, waiting for the host GPU to
+    /// compute it. Renderers that make no predicates are never asked.
+    fn predicate_value(&mut self, _predicate: GpuPredicate) -> bool {
+        true
     }
 
     /// Draws and indirect draws recorded from now on run only while `condition` holds; None runs

@@ -4662,7 +4662,8 @@ fn depth_bias_constants_offset_by_half_the_register_value() {
 }
 
 /// Draws under a render condition run only where the SamplesPassed report its predicate was made
-/// from counts samples (or, inverted, counts none), the queries summed on the host GPU.
+/// from counts samples (or, inverted, counts none), the queries summed on the host GPU. Each
+/// channel's latest predicate outlives any number of other channels' predicates.
 #[test]
 fn render_conditions_test_occlusion_reports_on_the_host_gpu() {
     const REPORT: u64 = 0x40_0000;
@@ -4705,17 +4706,33 @@ fn render_conditions_test_occlusion_reports_on_the_host_gpu() {
     report(&mut f, 0x20, QueryKind::SamplesPassed);
     report(&mut f, 0x20, QueryKind::Payload);
     regs.zpass_pixel_count_enable = 0;
-    let counted = f.rasterizer.samples_predicate(DADDR + REPORT).unwrap();
+    let counted = f
+        .rasterizer
+        .samples_predicate(ChannelId(0), DADDR + REPORT)
+        .unwrap();
     let empty = f
         .rasterizer
-        .samples_predicate(DADDR + REPORT + 0x10)
+        .samples_predicate(ChannelId(1), DADDR + REPORT + 0x10)
         .unwrap();
     assert_eq!(
-        f.rasterizer.samples_predicate(DADDR + REPORT + 0x20),
+        f.rasterizer
+            .samples_predicate(ChannelId(2), DADDR + REPORT + 0x20),
         None,
         "a later release overwrites the report"
     );
-    assert_eq!(f.rasterizer.samples_predicate(DADDR + REPORT + 0x30), None);
+    assert_eq!(
+        f.rasterizer
+            .samples_predicate(ChannelId(2), DADDR + REPORT + 0x30),
+        None
+    );
+    for i in 0..2100 {
+        let offset = if i % 2 == 0 { 0x10 } else { 0 };
+        f.rasterizer
+            .samples_predicate(ChannelId(2), DADDR + REPORT + offset)
+            .unwrap();
+    }
+    assert!(f.rasterizer.predicate_value(counted));
+    assert!(!f.rasterizer.predicate_value(empty));
     for (predicate, inverted, drawn) in [
         (empty, false, false),
         (empty, true, true),

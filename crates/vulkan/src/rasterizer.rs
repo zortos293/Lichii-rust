@@ -1404,7 +1404,7 @@ impl Rasterizer for VulkanRasterizer {
         true
     }
 
-    fn samples_predicate(&mut self, addr: DAddr) -> Option<GpuPredicate> {
+    fn samples_predicate(&mut self, channel: ChannelId, addr: DAddr) -> Option<GpuPredicate> {
         self.conditions.as_ref()?;
         let end = addr + 8;
         let mirror = lichii_gpu::semaphore_mirror::REGION_SIZE / 2;
@@ -1442,7 +1442,25 @@ impl Rasterizer for VulkanRasterizer {
             }
         };
         self.unflushed = true;
-        self.conditions.as_mut()?.samples(cmd, &self.samples, range)
+        let tick = self.scheduler.tick();
+        self.conditions
+            .as_mut()?
+            .samples(channel, cmd, tick, &self.samples, range)
+    }
+
+    fn predicate_value(&mut self, predicate: GpuPredicate) -> bool {
+        let Some(tick) = self.conditions.as_ref().map(|c| c.tick(predicate)) else {
+            return true;
+        };
+        if tick >= self.scheduler.tick() {
+            self.flush();
+        }
+        if let Err(error) = self.scheduler.wait(tick) {
+            tracing::error!(%error, "waiting for a render predicate failed");
+        }
+        self.conditions
+            .as_ref()
+            .is_none_or(|conditions| conditions.value(predicate))
     }
 
     fn set_render_condition(&mut self, condition: Option<RenderCondition>) {
@@ -1451,8 +1469,11 @@ impl Rasterizer for VulkanRasterizer {
         }
     }
 
-    fn release_channel(&mut self, _channel: ChannelId) {
+    fn release_channel(&mut self, channel: ChannelId) {
         self.texture_cache.invalidate_lookups();
+        if let Some(conditions) = &mut self.conditions {
+            conditions.release(channel);
+        }
     }
 
     fn invalidate_region(&mut self, addr: DAddr, size: u64) {

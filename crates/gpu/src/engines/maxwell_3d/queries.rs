@@ -70,12 +70,8 @@ pub(super) fn counter(clear: ClearReport) -> Option<QueryKind> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RenderEnable {
     Host(bool),
-    /// The renderer tests `condition` on the host GPU: it holds where the SamplesPassed count
-    /// at GPU address `count` does.
-    Gpu {
-        condition: RenderCondition,
-        count: u64,
-    },
+    /// The renderer tests `condition` on the host GPU.
+    Gpu(RenderCondition),
 }
 
 /// Evaluates RENDER_ENABLE when its mode is written; conditional modes compare the two
@@ -101,10 +97,11 @@ pub(super) fn render_enable(regs: &Regs, ctx: &mut EngineContext<'_>) -> bool {
     }
 }
 
-/// Evaluates a GPU render condition on the host: whether the SamplesPassed count at `count` is
-/// nonzero, inverted as the condition says.
-pub(super) fn count_condition(ctx: &mut EngineContext<'_>, count: u64, inverted: bool) -> bool {
-    (read_synchronized::<u64>(ctx, count) != 0) != inverted
+/// Evaluates a GPU render condition on the host, waiting for the host GPU to compute its
+/// predicate.
+pub(super) fn host_condition(ctx: &mut EngineContext<'_>, condition: RenderCondition) -> bool {
+    let _waiting = ctx.activity.waiting(Wait::HostGpu);
+    ctx.rasterizer.predicate_value(condition.predicate) != condition.inverted
 }
 
 /// Reads a `T` at `address` once the renderer wrote everything it holds for it.
@@ -139,6 +136,6 @@ pub(super) fn renders(regs: &Regs, render_enable: RenderEnable) -> Option<Option
         (RenderEnableOverride::NEVER_RENDER, _) => None,
         (_, RenderEnable::Host(true)) => Some(None),
         (_, RenderEnable::Host(false)) => None,
-        (_, RenderEnable::Gpu { condition, .. }) => Some(Some(condition)),
+        (_, RenderEnable::Gpu(condition)) => Some(Some(condition)),
     }
 }

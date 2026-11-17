@@ -99,14 +99,12 @@ pub trait Engine: Send {
     }
 
     /// A macro the back ran wrote the 3D engine's RENDER_ENABLE_MODE as `mode`, which holds only
-    /// where `condition` does on the host GPU: on the SamplesPassed count at GPU address
-    /// `count`. Other engines ignore it.
+    /// where `condition` does on the host GPU. Other engines ignore it.
     fn set_render_condition(
         &mut self,
         _ctx: &mut EngineContext<'_>,
         _mode: u32,
         _condition: RenderCondition,
-        _count: u64,
     ) {
     }
 }
@@ -147,9 +145,8 @@ impl Engine for maxwell_3d::Maxwell3d {
         ctx: &mut EngineContext<'_>,
         mode: u32,
         condition: RenderCondition,
-        count: u64,
     ) {
-        maxwell_3d::Maxwell3d::set_render_condition(self, ctx, mode, condition, count);
+        maxwell_3d::Maxwell3d::set_render_condition(self, ctx, mode, condition);
     }
 
     fn flush(&mut self, ctx: &mut EngineContext<'_>) {
