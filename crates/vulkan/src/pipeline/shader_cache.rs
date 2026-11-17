@@ -705,6 +705,13 @@ impl ShaderCache {
         hash
     }
 
+    /// Registers the `len` program bytes at `start` as a translation would.
+    #[cfg(test)]
+    pub(crate) fn track_program(&mut self, gmmu: &Gmmu, start: GpuVAddr, len: u64) {
+        let key = gmmu.translate(start).expect("a mapped program");
+        self.track(gmmu, start, len, key);
+    }
+
     fn hash_bytes(&mut self, gmmu: &Gmmu, start: GpuVAddr, len: u64) -> u64 {
         hash_program(gmmu, start, len, &mut self.bytes)
     }
