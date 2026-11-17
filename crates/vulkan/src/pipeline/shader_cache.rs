@@ -450,7 +450,10 @@ impl ShaderCache {
                 self.stats.translated += 1;
                 self.stalled += start.elapsed();
                 match result {
-                    Ok(module) => Some(module),
+                    Ok(module) => {
+                        dump(&module, a, env);
+                        Some(module)
+                    }
                     Err(error) => {
                         self.stats.failed += 1;
                         *bindings = first;
@@ -698,6 +701,45 @@ pub(super) fn hash_program(gmmu: &Gmmu, start: GpuVAddr, len: u64, bytes: &mut V
     bytes.resize(len as usize, 0);
     let _ = gmmu.read_block(start, bytes);
     hash_code(bytes)
+}
+
+/// The folder `LICHII_SHADER_DUMP_DIR` names, where translated programs are dumped for offline
+/// study: the guest code each read as `<module>.<a|b>.bin` and the SPIR-V as `<module>.spv`.
+fn dump_dir() -> Option<&'static PathBuf> {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = PathBuf::from(std::env::var_os("LICHII_SHADER_DUMP_DIR")?);
+        std::fs::create_dir_all(&dir)
+            .inspect_err(|error| tracing::warn!(?dir, %error, "creating the shader dump folder"))
+            .ok()?;
+        Some(dir)
+    })
+    .as_ref()
+}
+
+/// Writes `module`'s guest code (`<module>.a.bin` for VertexA, `<module>.b.bin` for the program)
+/// and SPIR-V (`<module>.spv`) to the dump folder, when there is one.
+pub(super) fn dump(module: &ShaderModule, a: Option<&ProgramEnv<'_>>, env: &ProgramEnv<'_>) {
+    let Some(dir) = dump_dir() else {
+        return;
+    };
+    let mut bytes = Vec::new();
+    let spirv: Vec<u8> = module.spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let code = |env: &ProgramEnv<'_>, bytes: &mut Vec<u8>| {
+        let (start, len) = env.code_range();
+        hash_program(env.gmmu(), start, len, bytes);
+        bytes.clone()
+    };
+    let mut files = vec![("b.bin", code(env, &mut bytes)), ("spv", spirv)];
+    if let Some(a) = a {
+        files.push(("a.bin", code(a, &mut bytes)));
+    }
+    for (suffix, contents) in files {
+        let path = dir.join(format!("{:016x}.{suffix}", module.hash));
+        if let Err(error) = std::fs::write(&path, contents) {
+            tracing::warn!(?path, %error, "dumping a translated program");
+        }
+    }
 }
 
 fn hash_code(bytes: &[u8]) -> u64 {

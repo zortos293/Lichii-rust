@@ -22,7 +22,7 @@ use lichii_shader::{
 use parking_lot::{Condvar, Mutex};
 
 use super::environment::{EnvRead, EnvSnapshot, ProgramEnv};
-use super::shader_cache::{hash_program, warn_failed};
+use super::shader_cache::{dump, hash_program, warn_failed};
 
 /// Presents a queued job may go unrequested before workers drop it.
 pub(crate) const STALE_FRAMES: u64 = 2;
@@ -227,6 +227,9 @@ fn translate(job: &Job, profile: &Profile, host: &HostTranslateInfo) -> Option<T
             hash,
         })
     };
+    if let Ok((module, _)) = &result {
+        dump(module, a.as_ref(), &env);
+    }
     let vertex_a = match &a {
         Some(a) => Some(code(a)?),
         None => None,
