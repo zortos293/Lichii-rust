@@ -4585,4 +4585,61 @@ mod tests {
         }
         f.assert_no_validation_errors();
     }
+
+    /// Back-thread time of one CPU-read download of 4 KiB of GPU-written bytes whose writer
+    /// already finished: copied aside behind an idle queue, copied aside behind 32 MiB of later
+    /// unrelated work, and served from a capture with the same work queued. Each read checks it
+    /// got the writer's bytes:
+    /// `cargo test --release -p lichii-vulkan --lib cpu_read_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing"]
+    fn cpu_read_cost() {
+        const READS: u32 = 32;
+        const SIZE: usize = 0x1000;
+        const LATER: u64 = 32 << 20;
+        let Some(mut f) = fixture_with(64 << 20) else {
+            return;
+        };
+        let read = f.acquire(DADDR, 0x10000);
+        let later = f.acquire(DADDR + (16 << 20), LATER);
+        f.scheduler.finish().unwrap();
+        for (name, captured, queued) in [
+            ("aside copy, idle queue", false, false),
+            ("aside copy, 32 MiB of later work queued", false, true),
+            ("capture, 32 MiB of later work queued", true, true),
+        ] {
+            let mut us = Vec::new();
+            for i in 0..=READS {
+                if !captured {
+                    f.cache.captures.hot = RangeSet::default();
+                }
+                let value = 0x0101_0101 * (i % 0xff + 1);
+                f.gpu_fill(read, 0, SIZE as u64, value);
+                f.cache
+                    .mark_gpu_written(f.scheduler.tick(), DADDR, SIZE as u64);
+                f.submit();
+                f.scheduler.wait(f.scheduler.tick() - 1).unwrap();
+                if queued {
+                    f.gpu_fill(later, 0, LATER, value);
+                    f.submit();
+                }
+                let start = Instant::now();
+                f.cache.flush(&mut f.scheduler, DADDR, SIZE as u64).unwrap();
+                let elapsed = start.elapsed().as_secs_f64() * 1e6;
+                assert_eq!(f.guest(DADDR, SIZE), words(value, SIZE));
+                f.scheduler.finish().unwrap();
+                if i > 0 {
+                    us.push(elapsed);
+                }
+            }
+            us.sort_by(f64::total_cmp);
+            eprintln!(
+                "{name}: per read (best / median / worst) {:.0} / {:.0} / {:.0} us",
+                us[0],
+                us[us.len() / 2],
+                us[us.len() - 1],
+            );
+        }
+        f.assert_no_validation_errors();
+    }
 }
