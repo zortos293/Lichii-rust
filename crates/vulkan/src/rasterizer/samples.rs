@@ -145,6 +145,43 @@ impl SampleCounter {
         }
     }
 
+    /// Records copies of the 32-bit results of the queries of `range`, in order, to `buffer`
+    /// from offset 0, each waiting for its query on the host GPU; returns how many it copies.
+    /// None when some of their slots may already hold other queries.
+    pub(super) fn copy_results(
+        &self,
+        device: &Device,
+        cmd: vk::CommandBuffer,
+        range: SampleRange,
+        buffer: vk::Buffer,
+    ) -> Option<u32> {
+        let count = range.to - range.from;
+        if range.from < self.released || count > SLOTS {
+            return None;
+        }
+        let mut copied = 0;
+        while copied < count {
+            let first = (range.from + copied) % SLOTS;
+            let n = (count - copied).min(SLOTS - first);
+            // SAFETY: `cmd` is recording outside any rendering; every query of the range ended
+            // in recorded work and no reset reaches its slot before `released` passes it.
+            unsafe {
+                device.raw.cmd_copy_query_pool_results(
+                    cmd,
+                    self.pool,
+                    first as u32,
+                    n as u32,
+                    buffer,
+                    copied * 4,
+                    4,
+                    vk::QueryResultFlags::WAIT,
+                );
+            }
+            copied += n;
+        }
+        Some(count as u32)
+    }
+
     /// The counter value at `range`. Call it for reports in recording order, once the work
     /// recorded before each completed.
     pub(super) fn resolve(&mut self, device: &Device, range: SampleRange) -> u64 {

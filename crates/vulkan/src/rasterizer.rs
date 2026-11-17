@@ -6,6 +6,7 @@
 //! through the [`TextureCache`], its collector once per presented frame, and draws and compute
 //! dispatches (see [`draw`]).
 
+mod conditions;
 mod draw;
 mod fence_waiter;
 mod frame_dump;
@@ -25,8 +26,8 @@ use lichii_common::settings::{AstcRecompression, GraphicsSettings, ResolutionSca
 use lichii_gpu::backend::ChannelId;
 use lichii_gpu::backend::{
     Blit, BlitOperation, ComputeContext, DrawParams, DrawTexture, FenceAction, FramebufferConfig,
-    GpuHandles, GraphicsContext, ImageCopy, IndirectDraw, Query, QueryKind, Rasterizer,
-    ReleaseSize,
+    GpuHandles, GpuPredicate, GraphicsContext, ImageCopy, IndirectDraw, Query, QueryKind,
+    Rasterizer, ReleaseSize, RenderCondition,
 };
 use lichii_gpu::engines::maxwell_3d::Regs;
 use lichii_gpu::engines::maxwell_3d::regs::NUM_RENDER_TARGETS;
@@ -190,6 +191,8 @@ pub struct VulkanRasterizer {
     fences: VecDeque<(u64, Release)>,
     fence_waiter: Option<fence_waiter::FenceWaiter>,
     samples: samples::SampleCounter,
+    /// Render conditions the host GPU tests; None when the device cannot.
+    conditions: Option<conditions::Conditions>,
     unflushed: bool,
     texture_cache: ManuallyDrop<TextureCache>,
     buffer_cache: ManuallyDrop<BufferCache>,
@@ -399,6 +402,7 @@ impl VulkanRasterizer {
         let draw = draw::DrawState::new(device, pipelines, gob_layout, scheduler.record()?)?;
         let staging = StagingRing::new(device, 32 << 20)?;
         let samples = samples::SampleCounter::new(device)?;
+        let conditions = conditions::Conditions::new(device)?;
         Ok(Self {
             buffer_cache: ManuallyDrop::new(buffer_cache),
             draw,
@@ -413,6 +417,7 @@ impl VulkanRasterizer {
             fences: VecDeque::new(),
             fence_waiter: None,
             samples,
+            conditions,
             unflushed: true,
             texture_cache: ManuallyDrop::new(texture_cache),
             live: None,
@@ -1416,8 +1421,76 @@ impl Rasterizer for VulkanRasterizer {
         true
     }
 
-    fn release_channel(&mut self, _channel: ChannelId) {
+    fn samples_predicate(&mut self, channel: ChannelId, addr: DAddr) -> Option<GpuPredicate> {
+        self.conditions.as_ref()?;
+        let end = addr + 8;
+        let mirror = lichii_gpu::semaphore_mirror::REGION_SIZE / 2;
+        let lands = |address: DAddr, bytes: u64| address < end && addr < address + bytes;
+        let writes = |address: DAddr, bytes: u64| {
+            lands(address, bytes) || lands(address.wrapping_sub(mirror), bytes)
+        };
+        let bytes = |size: ReleaseSize| match size {
+            ReleaseSize::Four => 4,
+            ReleaseSize::Eight => 8,
+            ReleaseSize::Sixteen => 16,
+        };
+        let range = self
+            .fences
+            .iter()
+            .rev()
+            .find_map(|&(_, release)| match release {
+                Release::Samples { address, range, .. } if address == addr => Some(Some(range)),
+                Release::Samples { address, size, .. }
+                | Release::Action(FenceAction::WriteSemaphore { address, size, .. }) => {
+                    writes(address, bytes(size)).then_some(None)
+                }
+                Release::Action(FenceAction::ReduceSemaphore { address, .. }) => {
+                    writes(address, 4).then_some(None)
+                }
+                Release::Action(FenceAction::IncrementSyncpoint(_))
+                | Release::SamplesReset(_)
+                | Release::SamplesFold(_) => None,
+            })??;
+        let cmd = match self.scheduler.record() {
+            Ok(cmd) => cmd,
+            Err(error) => {
+                tracing::error!(%error, "recording a render predicate failed");
+                return None;
+            }
+        };
+        self.unflushed = true;
+        let tick = self.scheduler.tick();
+        self.conditions
+            .as_mut()?
+            .samples(channel, cmd, tick, &self.samples, range)
+    }
+
+    fn predicate_value(&mut self, predicate: GpuPredicate) -> bool {
+        let Some(tick) = self.conditions.as_ref().map(|c| c.tick(predicate)) else {
+            return true;
+        };
+        if tick >= self.scheduler.tick() {
+            self.flush();
+        }
+        if let Err(error) = self.scheduler.wait(tick) {
+            tracing::error!(%error, "waiting for a render predicate failed");
+        }
+        self.conditions
+            .as_ref()
+            .is_none_or(|conditions| conditions.value(predicate))
+    }
+
+    fn set_render_condition(&mut self, condition: Option<RenderCondition>) {
+        if let Some(conditions) = &mut self.conditions {
+            conditions.set(condition);
+        }
+    }
+
+    fn release_channel(&mut self, channel: ChannelId) {
         self.texture_cache.invalidate_lookups();
+        if let Some(conditions) = &mut self.conditions {
+            conditions.release(channel);
+        }
     }
 
     fn invalidate_region(&mut self, addr: DAddr, size: u64) {

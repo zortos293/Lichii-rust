@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// Writes predicate `slot` for conditional rendering, and its host-visible copy: nonzero exactly
+// when one of the `count` 32-bit occlusion query results in `results` is, so a SamplesPassed
+// report summing them is nonzero. One 64-invocation workgroup.
+
+#version 460
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Results { uint results[]; };
+layout(set = 0, binding = 1) writeonly buffer Predicates { uint predicates[]; };
+layout(set = 0, binding = 2) writeonly buffer Readback { uint readback[]; };
+
+layout(push_constant) uniform P {
+    uint count;
+    uint slot;
+} p;
+
+shared uint any_nonzero;
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    if (lane == 0u) {
+        any_nonzero = 0u;
+    }
+    barrier();
+    uint value = 0u;
+    for (uint i = lane; i < p.count; i += 64u) {
+        value |= results[i];
+    }
+    if (value != 0u) {
+        atomicOr(any_nonzero, 1u);
+    }
+    barrier();
+    if (lane == 0u) {
+        predicates[p.slot] = any_nonzero;
+        readback[p.slot] = any_nonzero;
+    }
+}

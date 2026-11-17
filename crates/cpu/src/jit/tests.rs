@@ -1494,6 +1494,35 @@ fn atomics_fault_like_the_interpreter() {
     }
 }
 
+#[test]
+fn unaligned_atomics_inside_a_granule_match_the_interpreter() {
+    const LDADD_W9_W8_X8: u32 = 0xb829_0108;
+    const LDADD_X1_X3_X20: u32 = 0xf821_0283;
+    const CAS_W1_W3_X20: u32 = 0x88a1_7e83;
+    for addr in [DATA + 0x151, DATA + 0x15b, DATA + 0x15c, DATA + 0x15d] {
+        directed(&[LDADD_W9_W8_X8], &[(8, addr), (9, 1)]);
+        directed(&[LDADD_X1_X3_X20], &[(20, addr), (1, 0x8000_0081)]);
+        directed(&[CAS_W1_W3_X20], &[(20, addr), (1, 0x5a5a_5a5a), (3, 7)]);
+    }
+    let ctx = ThreadContext {
+        pc: CODE,
+        x: std::array::from_fn(|r| match r {
+            8 => DATA + 0x151,
+            9 => 1,
+            _ => 0,
+        }),
+        ..Default::default()
+    };
+    let data = vec![0x5a; DATA_SIZE as usize];
+    let outcome = Machine::new(Backend::Jit(Passes::ALL)).run(&[LDADD_W9_W8_X8, BRK], &ctx, &data);
+    assert_eq!(outcome.halt, HaltReason::Breakpoint(0));
+    assert_eq!(outcome.ctx.x[8], 0x5a5a_5a5a);
+    assert_eq!(
+        outcome.data[0x150..0x156],
+        [0x5a, 0x5b, 0x5a, 0x5a, 0x5a, 0x5a]
+    );
+}
+
 /// Keeps a value live in the first allocatable register (`rbx`) until `ADD_X10_X22_1`, so the
 /// address of a `cmpxchg16b` between them lands elsewhere.
 const MOV_X9_X22: u32 = 0xaa16_03e9;

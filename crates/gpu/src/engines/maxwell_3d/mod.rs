@@ -7,7 +7,7 @@ mod queries;
 pub mod regs;
 pub mod state;
 
-pub use engine::Maxwell3d;
+pub use engine::{Maxwell3d, RENDER_ENABLE_MODE};
 pub use regs::Regs;
 pub use state::{
     DirtyState, MACRO_REGISTERS_START, MethodSet, ROOT_TABLE_LOAD, ROOT_TABLE_SELECT,

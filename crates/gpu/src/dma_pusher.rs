@@ -31,20 +31,20 @@ use crate::backend::{ChannelId, GpuWrittenPages, ReleaseSize};
 use crate::channel::{ChannelConfig, SemaphoreWaiters, SyncpointFence, SyncpointIncrement};
 use crate::engines::EngineKind;
 use crate::engines::kepler_compute::Regs as ComputeRegs;
-use crate::engines::maxwell_3d::{MACRO_REGISTERS_START, RegisterState, Regs};
+use crate::engines::maxwell_3d::regs::{NUM_REGS, ShadowRamControl};
+use crate::engines::maxwell_3d::{MACRO_REGISTERS_START, MethodSet, RegisterState, Regs};
 use crate::gmmu::{Gmmu, GpuFault, RangeTarget};
 use crate::gpu::{Inbox, LONG_WAIT};
 use crate::host::{AcquireOp, FIRST_ENGINE_METHOD, HostAction, HostClass, HostState, ReleaseKind};
 use crate::host1x::{Syncpoints, is_reached};
 use crate::macros::{
-    LOAD_MME_INSTRUCTION_RAM_POINTER, LOAD_MME_START_ADDRESS_RAM,
-    LOAD_MME_START_ADDRESS_RAM_POINTER, MACRO_METHOD_BASE, MacroDataRam, MacroEngine, MacroHost,
-    MacroIsa,
+    LOAD_MME_INSTRUCTION_RAM_POINTER, LOAD_MME_START_ADDRESS_RAM_POINTER, MACRO_METHOD_BASE,
+    MacroDataRam, MacroEngine, MacroErrorKind, MacroHost, MacroIsa, ReadTaint, is_load_mme,
 };
 use crate::pushbuffer::{CommandParser, Flow, GpEntry, MethodCall, MethodHandler};
 use crate::reg_index;
 use crate::semaphore_mirror::SemaphoreMirror;
-use crate::stream::{FetchSync, Stream};
+use crate::stream::{FetchSync, MULTI_MAX_WORDS, Stream};
 
 /// Engines every channel has bound before any SET_OBJECT: NVN uses subchannel 2 as
 /// inline-to-memory without binding it (NX2_NOTES row 49).
@@ -56,6 +56,7 @@ const CONST_BUFFER_OFFSET: usize = reg_index!(Regs, const_buffer.offset) as usiz
 const FALCON_4: u32 = reg_index!(Regs, falcon) + 4;
 const COMPUTE_DATA_UPLOAD: u32 = reg_index!(ComputeRegs, data_upload);
 const SHADOW_SCRATCH_0: usize = reg_index!(Regs, shadow_scratch) as usize;
+const SHADOW_RAM_CONTROL: u32 = reg_index!(Regs, shadow_ram_control);
 
 /// What the front's channels share.
 pub(crate) struct FrontShared {
@@ -142,6 +143,264 @@ struct ChannelState {
     /// Switch 2: the compute class set a macro instruction or start-address pointer, so its
     /// uploads and calls use [`FrontShared::compute_macros`] from then on.
     compute_macros: bool,
+    back_macros: BackMacros,
+}
+
+/// Switch 2: 3D macro calls that read guest memory run on the back, at their point of the stream,
+/// so the front never waits for the work before them. The front runs each such call first
+/// without the words it reads ([`MacroEngine::shadow_execute`]): when no value from them steers
+/// the call and it never uses the data RAM, the mirror takes the writes whose values it knows,
+/// and the registers written with values from the reads become the back's.
+struct BackMacros {
+    /// 3D registers a macro on the back wrote with values only the back knows: the mirror's
+    /// copies are stale until the front writes them or fetches them from the back.
+    owned: MethodSet,
+    /// The code generation of the 3D macros the back holds for this channel.
+    code: Option<u64>,
+    /// Start addresses whose calls run on the front, and those that ran on the back, for code
+    /// generation `generation`.
+    refused: Vec<u32>,
+    sent: Vec<u32>,
+    generation: u64,
+    /// What the shadow run being made changed, to undo it.
+    undo: Vec<Undo>,
+}
+
+#[derive(Clone, Copy)]
+enum Undo {
+    Word(u32, (u32, u32)),
+    Owned(u32),
+    Disowned(u32),
+}
+
+impl BackMacros {
+    fn new() -> Self {
+        Self {
+            owned: MethodSet::empty(),
+            code: None,
+            refused: Vec::new(),
+            sent: Vec::new(),
+            generation: 0,
+            undo: Vec::new(),
+        }
+    }
+
+    /// Sends the call to the back if it can run there; false leaves it to the front.
+    fn try_send(
+        &mut self,
+        engine: &mut MacroEngine,
+        call: &MacroCall,
+        graphics: &mut RegisterState,
+        data_ram: &mut MacroDataRam,
+        stream: &mut Stream,
+    ) -> bool {
+        if engine.isa() != MacroIsa::Mme64
+            || call.parameters.len() > MULTI_MAX_WORDS
+            || !engine.reads_memory(call.method)
+        {
+            return false;
+        }
+        let generation = engine.code_generation();
+        if self.generation != generation {
+            self.refused.clear();
+            self.sent.clear();
+            self.generation = generation;
+        }
+        let start = engine.start_of(call.method);
+        if self.refused.contains(&start) {
+            return false;
+        }
+        self.undo.clear();
+        let mut taint = ReadTaint::without_data_ram();
+        let mut paths = 0;
+        let mut too_many = false;
+        let outcome = loop {
+            paths += 1;
+            let mut host = ShadowHost {
+                graphics: &mut *graphics,
+                owned: &mut self.owned,
+                undo: &mut self.undo,
+                replay: paths > 1,
+                blocked: false,
+            };
+            let result = engine.shadow_execute(
+                call.method,
+                &call.parameters,
+                data_ram,
+                &mut host,
+                &mut taint,
+            );
+            match result {
+                Err(error) => break Err(Some(error)),
+                Ok(()) if host.blocked => break Err(None),
+                Ok(()) => {}
+            }
+            match taint.next_path() {
+                None => break Ok(()),
+                Some(_) if paths == MAX_SHADOW_PATHS => {
+                    too_many = true;
+                    break Err(None);
+                }
+                Some(next) => taint = next,
+            }
+        };
+        if let Err(error) = outcome {
+            if too_many {
+                tracing::info!(
+                    start,
+                    "3D macro reads memory and has too many ways to run on the back"
+                );
+                self.refused.push(start);
+            } else if let Some(error) = error
+                && matches!(
+                    error.kind,
+                    MacroErrorKind::DependsOnRead | MacroErrorKind::UsesDataRam
+                )
+            {
+                tracing::info!(%error, "3D macro reads memory and runs on the front");
+                self.refused.push(start);
+            }
+            self.undo(graphics);
+            return false;
+        }
+        let code = match self.code {
+            Some(sent) if sent == generation => None,
+            _ => engine.code_copy(),
+        };
+        if let Some(code) = code {
+            stream.side(SideCommand::MacroCode(Box::new(code)));
+            self.code = Some(generation);
+        }
+        if !self.sent.contains(&start) {
+            self.sent.push(start);
+            tracing::info!(start, paths, "3D macro reads memory and runs on the back");
+        }
+        stream.macro_call(EngineKind::Maxwell3d, start, &call.parameters);
+        true
+    }
+
+    fn undo(&mut self, graphics: &mut RegisterState) {
+        for undo in self.undo.drain(..).rev() {
+            match undo {
+                Undo::Word(method, word) => graphics.restore(method, word),
+                Undo::Owned(method) => self.owned.remove(method),
+                Undo::Disowned(method) => self.owned.insert(method),
+            }
+        }
+    }
+}
+
+/// The ways through branches on read values a shadow run follows before a call stays on the front.
+const MAX_SHADOW_PATHS: usize = 16;
+
+/// Whether the back holds register `method` (see [`BackMacros::owned`]).
+#[inline]
+fn back_owned(owned: &MethodSet, method: u32) -> bool {
+    (method as usize) < NUM_REGS && owned.contains(method)
+}
+
+/// Brings the mirror's copies of the registers the back holds up to date, waiting for the back
+/// to reach this point of the stream. Rare: macros seldom read what a macro on the back wrote.
+#[cold]
+fn fetch_back_owned(graphics: &mut RegisterState, owned: &mut MethodSet, stream: &mut Stream) {
+    static FETCHES: crate::throttle::Throttle = crate::throttle::Throttle::new();
+    let fetched = stream.fetch_registers(|words| {
+        owned.drain(|method| words.push((method, graphics.word(method))));
+        if let Some(dropped) = FETCHES.allow() {
+            let methods: Vec<u32> = words.iter().map(|&(method, _)| method).collect();
+            tracing::info!(
+                ?methods,
+                dropped,
+                "front fetches registers a macro on the back wrote"
+            );
+        }
+    });
+    for &(method, word) in fetched.iter() {
+        graphics.restore(method, word);
+    }
+}
+
+/// Whether a write takes register `method` back from the back ([`BackMacros::owned`]): only
+/// tracking shadow RAM modes write both the register and its shadow RAM copy.
+#[inline]
+fn write_owns(state: &RegisterState) -> bool {
+    matches!(
+        state.shadow_ram_control(),
+        ShadowRamControl::TRACK | ShadowRamControl::TRACK_WITH_FILTER
+    )
+}
+
+/// A shadow run on the front (see [`BackMacros`]): writes go to the mirror with an undo record, and
+/// none reaches the stream.
+struct ShadowHost<'a> {
+    graphics: &'a mut RegisterState,
+    owned: &'a mut MethodSet,
+    undo: &'a mut Vec<Undo>,
+    /// A later way through the call (see [`ReadTaint::next_path`]): its writes before its first
+    /// branch on a read are the ones the first way already applied.
+    replay: bool,
+    /// The call read a register the back holds or never receives (LOAD_MME), so its run here may
+    /// differ from the back's.
+    blocked: bool,
+}
+
+impl ShadowHost<'_> {
+    fn save(&mut self, method: u32) {
+        self.undo
+            .push(Undo::Word(method, self.graphics.word(method)));
+    }
+}
+
+impl MacroHost for ShadowHost<'_> {
+    fn read_register(&mut self, method: u32) -> u32 {
+        self.blocked |= is_load_mme(method) || back_owned(self.owned, method);
+        self.graphics
+            .regs
+            .words()
+            .get(method as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn write_method(&mut self, method: u32, argument: u32) {
+        if self.replay || is_load_mme(method) || method >= MACRO_REGISTERS_START {
+            return;
+        }
+        self.save(method);
+        if method.wrapping_sub(CONST_BUFFER_DATA) < 16 {
+            self.save(CONST_BUFFER_OFFSET as u32);
+        } else if method == FALCON_4 {
+            self.save(SHADOW_SCRATCH_0 as u32);
+        }
+        if self.owned.contains(method) && write_owns(self.graphics) {
+            self.owned.remove(method);
+            self.undo.push(Undo::Disowned(method));
+        }
+        mirror_graphics(self.graphics, method, argument);
+    }
+
+    fn dma_read(&mut self, _gpu_va: u64, _out: &mut [u32]) {}
+
+    /// The value only the back will know: the register becomes the back's, unless the front
+    /// itself needs the value (a shadow RAM mode, a constant buffer position or a scratch flag
+    /// the mirror keeps).
+    fn write_unknown(&mut self, method: u32) -> bool {
+        if is_load_mme(method) || method >= MACRO_REGISTERS_START {
+            return true;
+        }
+        if method == SHADOW_RAM_CONTROL
+            || method == FALCON_4
+            || method == CONST_BUFFER_OFFSET as u32
+            || method.wrapping_sub(CONST_BUFFER_DATA) < 16
+        {
+            return false;
+        }
+        if !self.owned.contains(method) {
+            self.owned.insert(method);
+            self.undo.push(Undo::Owned(method));
+        }
+        true
+    }
 }
 
 /// Parameters one macro call can have: the words of one command (a 13-bit count).
@@ -204,6 +463,7 @@ impl FrontChannel {
                 calls: [MacroCall::new(), MacroCall::new()],
                 upload_next: None,
                 compute_macros: false,
+                back_macros: BackMacros::new(),
             },
             queue: VecDeque::new(),
             offset: 0,
@@ -723,6 +983,7 @@ impl Dispatch<'_> {
         }
         send_graphics(
             &mut state.graphics,
+            &mut state.back_macros.owned,
             &mut self.shared.stream,
             method,
             call.argument,
@@ -782,6 +1043,7 @@ impl Dispatch<'_> {
             macros,
             calls,
             compute_macros,
+            back_macros,
             ..
         } = &mut *self.state;
         let pending = &mut calls[target as usize];
@@ -801,9 +1063,17 @@ impl Dispatch<'_> {
             (HostClass::Ampere, _) => shared.shared_macros.as_mut(),
         };
         if let Some(engine) = engine {
+            if target == MacroTarget::Graphics
+                && host.class() == HostClass::Ampere
+                && back_macros.try_send(engine, pending, graphics, data_ram, &mut shared.stream)
+            {
+                pending.parameters.clear();
+                return;
+            }
             let mut host = FrontMacroHost {
                 target,
                 graphics,
+                owned: &mut back_macros.owned,
                 compute,
                 stream: &mut shared.stream,
                 memory: self.memory,
@@ -818,21 +1088,37 @@ impl Dispatch<'_> {
     }
 }
 
-#[inline]
-fn is_load_mme(method: u32) -> bool {
-    (LOAD_MME_INSTRUCTION_RAM_POINTER..=LOAD_MME_START_ADDRESS_RAM).contains(&method)
-}
-
 /// Writes a 3D register in the mirror and sends it, unless it changed nothing: a state register
 /// written with the value it holds, through shadow RAM, is dropped here (NX2_NOTES rows 135, 144).
 /// The mirror also does what the back's engine does to registers on its own.
+/// A register the back holds ([`BackMacros::owned`]) is always sent.
 #[inline]
-fn send_graphics(state: &mut RegisterState, stream: &mut Stream, method: u32, argument: u32) {
+fn send_graphics(
+    state: &mut RegisterState,
+    owned: &mut MethodSet,
+    stream: &mut Stream,
+    method: u32,
+    argument: u32,
+) {
+    let changed = mirror_graphics(state, method, argument);
+    if owned.contains(method) {
+        if write_owns(state) {
+            owned.remove(method);
+        }
+    } else if !changed {
+        return;
+    }
+    stream.engine_word(EngineKind::Maxwell3d, method, argument);
+}
+
+/// Writes a 3D register in the mirror as [`send_graphics`] does; returns whether the write
+/// changed anything or runs an action.
+#[inline]
+fn mirror_graphics(state: &mut RegisterState, method: u32, argument: u32) -> bool {
     let index = method as usize;
     let before = (state.regs.words()[index], state.shadow(method));
     match state.write(method, argument) {
-        None if (state.regs.words()[index], state.shadow(method)) == before => return,
-        None => {}
+        None => (state.regs.words()[index], state.shadow(method)) != before,
         Some(_) => {
             if method.wrapping_sub(CONST_BUFFER_DATA) < 16 {
                 let offset = &mut state.regs.words_mut()[CONST_BUFFER_OFFSET];
@@ -840,9 +1126,9 @@ fn send_graphics(state: &mut RegisterState, stream: &mut Stream, method: u32, ar
             } else if method == FALCON_4 {
                 state.regs.words_mut()[SHADOW_SCRATCH_0] = 1;
             }
+            true
         }
     }
-    stream.engine_word(EngineKind::Maxwell3d, method, argument);
 }
 
 #[inline]
@@ -858,6 +1144,7 @@ fn send_compute(registers: &mut [u32], stream: &mut Stream, method: u32, argumen
 struct FrontMacroHost<'a> {
     target: MacroTarget,
     graphics: &'a mut RegisterState,
+    owned: &'a mut MethodSet,
     compute: &'a mut [u32],
     stream: &'a mut Stream,
     memory: &'a Gmmu,
@@ -866,6 +1153,9 @@ struct FrontMacroHost<'a> {
 impl MacroHost for FrontMacroHost<'_> {
     #[inline]
     fn read_register(&mut self, method: u32) -> u32 {
+        if self.target == MacroTarget::Graphics && back_owned(self.owned, method) {
+            fetch_back_owned(self.graphics, self.owned, self.stream);
+        }
         let registers: &[u32] = match self.target {
             MacroTarget::Graphics => self.graphics.regs.words(),
             MacroTarget::Compute => self.compute,
@@ -881,7 +1171,7 @@ impl MacroHost for FrontMacroHost<'_> {
         }
         match self.target {
             MacroTarget::Graphics if method < MACRO_REGISTERS_START => {
-                send_graphics(self.graphics, self.stream, method, argument);
+                send_graphics(self.graphics, self.owned, self.stream, method, argument);
             }
             MacroTarget::Graphics => {}
             MacroTarget::Compute => send_compute(self.compute, self.stream, method, argument),
