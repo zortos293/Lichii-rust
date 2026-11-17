@@ -767,6 +767,12 @@ impl Emitter<'_> {
             SimdOp::SatNarrow { size, n, low, word } => {
                 self.sat_narrow(i, size, word >> 29 & 1 != 0, n, low)
             }
+            SimdOp::SatArith {
+                arrangement,
+                a,
+                b,
+                word,
+            } => self.sat_arith(i, arrangement, a, b, word),
             SimdOp::Vec(op) => self.vector(i, op),
             SimdOp::Lanes(lanes) => self.lanes(i, lanes),
         }

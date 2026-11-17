@@ -2,7 +2,7 @@
 
 use super::super::ir::{Ty, Value};
 use super::fp_vector::Lanes;
-use super::vector::VecOp;
+use super::vector::{Arrangement, VecOp};
 
 /// Scalar floating-point element size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,6 +143,15 @@ pub enum SimdOp {
         low: Option<Value>,
         word: u32,
     },
+    /// `SQADD`, `UQADD`, `SQSUB` or `UQSUB` (by `word`) on B or H lanes. It sets FPSR.QC itself
+    /// when a lane saturates, so like `SatNarrow` it carries `word` and passes treat it as writing
+    /// FPSR.
+    SatArith {
+        arrangement: Arrangement,
+        a: Value,
+        b: Value,
+        word: u32,
+    },
     /// Advanced SIMD integer and element-move ops.
     Vec(VecOp),
     /// Advanced SIMD FP arithmetic on S or D lanes, checked like the scalar ops.
@@ -176,7 +185,8 @@ impl SimdOp {
             | SimdOp::ToInt { word, .. }
             | SimdOp::Compare { word, .. }
             | SimdOp::CondCompare { word, .. }
-            | SimdOp::SatNarrow { word, .. } => Some(word),
+            | SimdOp::SatNarrow { word, .. }
+            | SimdOp::SatArith { word, .. } => Some(word),
             SimdOp::Lanes(lanes) => Some(lanes.word),
             _ => None,
         }
@@ -224,6 +234,10 @@ impl SimdOp {
                 if let Some(low) = low {
                     f(low);
                 }
+            }
+            SimdOp::SatArith { a, b, .. } => {
+                f(a);
+                f(b);
             }
             SimdOp::Vec(op) => op.for_each_arg(f),
             SimdOp::Lanes(lanes) => lanes.for_each_arg(f),

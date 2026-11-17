@@ -92,6 +92,8 @@ pub static EGUI_VERT: &[u32] = spirv!("egui.vert");
 pub static EGUI_FRAG: &[u32] = spirv!("egui.frag");
 /// `block_linear_unswizzle.comp`: Block-linear to pitch-linear copy of one 2D slice, one word per invocation, local size 32x8. Matches `lichii_texture::block_linear` for both GOB layouts.
 pub static BLOCK_LINEAR_UNSWIZZLE_COMP: &[u32] = spirv!("block_linear_unswizzle.comp");
+/// `texture_unswizzle.comp`: Block-linear to tightly packed linear copy of one texture level, every depth slice, one word per invocation, local size 32x8. Rows must be whole words. Matches `lichii_texture::block_linear` for both GOB layouts and any block depth.
+pub static TEXTURE_UNSWIZZLE_COMP: &[u32] = spirv!("texture_unswizzle.comp");
 /// `guest_bytes.comp`: One 2D block-linear slice between a pitch-linear buffer and a buffer of guest bytes, either way, skipping words outside the guest buffer; packs and unpacks D24S8 depth and stencil. Local size 32x8.
 pub static GUEST_BYTES_COMP: &[u32] = spirv!("guest_bytes.comp");
 /// `blit_gather.comp`: A nearest-filtered 2D engine blit between buffers of raw texels of one format, sampling at the engine's 32.32 positions clamped to the box of source texels the software blit reads. Local size 8x8.
@@ -141,6 +143,7 @@ pub static ALL: &[(&str, &[u32])] = &[
     ("egui.vert", EGUI_VERT),
     ("egui.frag", EGUI_FRAG),
     ("block_linear_unswizzle.comp", BLOCK_LINEAR_UNSWIZZLE_COMP),
+    ("texture_unswizzle.comp", TEXTURE_UNSWIZZLE_COMP),
     ("guest_bytes.comp", GUEST_BYTES_COMP),
     ("blit_gather.comp", BLIT_GATHER_COMP),
     ("astc_decode.comp", ASTC_DECODE_COMP),

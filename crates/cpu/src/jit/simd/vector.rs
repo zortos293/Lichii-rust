@@ -79,6 +79,14 @@ pub enum Binary {
     SMin,
     UMax,
     UMin,
+    /// All ones in a lane where `a & b` is nonzero.
+    CmTst,
+    /// `(a + b) >> 1` without overflow, signed or unsigned.
+    Hadd(bool),
+    /// `(a + b + 1) >> 1` without overflow, signed or unsigned.
+    Rhadd(bool),
+    /// `|a - b|`, signed or unsigned.
+    Abd(bool),
 }
 
 /// The bitwise selects, each `base ^ ((n ^ base) & mask)` on the destination's old value `old`.
@@ -328,6 +336,10 @@ fn supported(t: &Translator, op: Binary, size: u8) -> bool {
         Binary::Mul => size == 1 || (size == 2 && t.sse41),
         Binary::SMax | Binary::SMin => size == 1 || (size < 3 && t.sse41),
         Binary::UMax | Binary::UMin => size == 0 || (size < 3 && t.sse41),
+        Binary::CmTst => size < 3 || t.sse41,
+        Binary::Hadd(_) | Binary::Rhadd(true) => size == 1 || size == 2,
+        Binary::Rhadd(false) => size < 3,
+        Binary::Abd(signed) => supported(t, if signed { Binary::SMax } else { Binary::UMax }, size),
     }
 }
 
@@ -471,6 +483,17 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         t.set(Loc::V(rd), r);
         return true;
     }
+    if word & 0x9f20_dc00 == 0x0e20_0c00 && size < 2 {
+        let (a, b) = (vec(t, rn), vec(t, rm));
+        let r = t.op(Op::Simd(SimdOp::SatArith {
+            arrangement,
+            a,
+            b,
+            word,
+        }));
+        t.set(Loc::V(rd), r);
+        return true;
+    }
     if word & 0x9f20_0400 == 0x0e20_0400 {
         let opcode = field(word, 11, 5);
         let op = match (opcode, u, size) {
@@ -492,6 +515,10 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
             (0b01101, false, _) => Binary::SMin,
             (0b01100, true, _) => Binary::UMax,
             (0b01101, true, _) => Binary::UMin,
+            (0b10001, false, _) => Binary::CmTst,
+            (0b00000, _, _) => Binary::Hadd(!u),
+            (0b00010, _, _) => Binary::Rhadd(!u),
+            (0b01110, _, _) => Binary::Abd(!u),
             _ => return false,
         };
         if opcode != 0b00011 && ((size == 3 && !q) || !supported(t, op, size)) {
@@ -1008,6 +1035,11 @@ enum Sse {
     MinU,
     MinS,
     Mul,
+    /// Unsigned `(d + s + 1) >> 1`, B and H lanes.
+    AvgU,
+    /// Saturating add or subtract, signed or unsigned, B and H lanes.
+    AddSat(bool),
+    SubSat(bool),
 }
 
 impl Emitter<'_> {
@@ -1047,6 +1079,16 @@ impl Emitter<'_> {
             (Sse::MinS, _) => dynasm!(self.asm ; .arch x64 ; pminsd Rx(d), Rx(s)),
             (Sse::Mul, 1) => dynasm!(self.asm ; .arch x64 ; pmullw Rx(d), Rx(s)),
             (Sse::Mul, _) => dynasm!(self.asm ; .arch x64 ; pmulld Rx(d), Rx(s)),
+            (Sse::AvgU, 0) => dynasm!(self.asm ; .arch x64 ; pavgb Rx(d), Rx(s)),
+            (Sse::AvgU, _) => dynasm!(self.asm ; .arch x64 ; pavgw Rx(d), Rx(s)),
+            (Sse::AddSat(true), 0) => dynasm!(self.asm ; .arch x64 ; paddsb Rx(d), Rx(s)),
+            (Sse::AddSat(true), _) => dynasm!(self.asm ; .arch x64 ; paddsw Rx(d), Rx(s)),
+            (Sse::AddSat(false), 0) => dynasm!(self.asm ; .arch x64 ; paddusb Rx(d), Rx(s)),
+            (Sse::AddSat(false), _) => dynasm!(self.asm ; .arch x64 ; paddusw Rx(d), Rx(s)),
+            (Sse::SubSat(true), 0) => dynasm!(self.asm ; .arch x64 ; psubsb Rx(d), Rx(s)),
+            (Sse::SubSat(true), _) => dynasm!(self.asm ; .arch x64 ; psubsw Rx(d), Rx(s)),
+            (Sse::SubSat(false), 0) => dynasm!(self.asm ; .arch x64 ; psubusb Rx(d), Rx(s)),
+            (Sse::SubSat(false), _) => dynasm!(self.asm ; .arch x64 ; psubusw Rx(d), Rx(s)),
         }
     }
 
@@ -1157,6 +1199,44 @@ impl Emitter<'_> {
         }
     }
 
+    /// `SQADD`, `UQADD`, `SQSUB` or `UQSUB` (by `word`) on B or H lanes, setting FPSR.QC when
+    /// any lane of the arrangement saturated, that is when the wrapping result differs.
+    pub(super) fn sat_arith(
+        &mut self,
+        i: usize,
+        arrangement: Arrangement,
+        a: Value,
+        b: Value,
+        word: u32,
+    ) {
+        let Arrangement { size, q } = arrangement;
+        let (signed, sub) = (word & 0x2000_0000 == 0, word & 0x2000 != 0);
+        let (a, b) = (self.reg(a), self.reg(b));
+        let d = self.def(Value(i as u32));
+        let (wrap, sat) = match sub {
+            false => (Sse::Add, Sse::AddSat(signed)),
+            true => (Sse::Sub, Sse::SubSat(signed)),
+        };
+        self.copy(SCRATCH, a);
+        self.sse(wrap, size, SCRATCH, b);
+        self.copy(d, a);
+        self.sse(sat, size, d, b);
+        self.sse(Sse::Eq, size, SCRATCH, d);
+        let (exact, all) = (self.asm.new_dynamic_label(), if q { 0xffff } else { 0xff });
+        dynasm!(self.asm
+            ; .arch x64
+            ; pmovmskb eax, Rx(SCRATCH)
+            ; and eax, all
+            ; cmp eax, all
+            ; je =>exact
+            ; or DWORD [r15 + CTX_FPSR], QC
+            ; =>exact
+        );
+        if !q {
+            dynasm!(self.asm ; .arch x64 ; movq Rx(d), Rx(d));
+        }
+    }
+
     /// `SQXTN`/`SQXTN2`, or `SQXTUN`/`SQXTUN2` when `unsigned`: packs `n` with signed or unsigned
     /// saturation, and sets FPSR.QC unless sign- or zero-extending the packed lanes again gives
     /// back every lane of `n`.
@@ -1241,6 +1321,43 @@ impl Emitter<'_> {
                         self.sse(Sse::Eq, size, d, a);
                     }
                     Binary::Addp => self.addp(size, q, d, a, b),
+                    Binary::CmTst => {
+                        self.copy(d, a);
+                        self.sse(Sse::And, size, d, b);
+                        dynasm!(self.asm ; .arch x64 ; pxor Rx(SCRATCH), Rx(SCRATCH));
+                        self.sse(Sse::Eq, size, d, SCRATCH);
+                        self.invert(d);
+                    }
+                    Binary::Rhadd(false) if size < 2 => {
+                        self.copy(d, a);
+                        self.sse(Sse::AvgU, size, d, b);
+                    }
+                    Binary::Hadd(signed) | Binary::Rhadd(signed) => {
+                        let shift = if signed { Shift::Sshr } else { Shift::Ushr };
+                        self.copy(SCRATCH, a);
+                        self.sse(Sse::Xor, size, SCRATCH, b);
+                        self.shift_imm(shift, size, SCRATCH, 1);
+                        self.copy(d, a);
+                        if matches!(op, Binary::Hadd(_)) {
+                            self.sse(Sse::And, size, d, b);
+                            self.sse(Sse::Add, size, d, SCRATCH);
+                        } else {
+                            self.sse(Sse::Or, size, d, b);
+                            self.sse(Sse::Sub, size, d, SCRATCH);
+                        }
+                    }
+                    Binary::Abd(signed) => {
+                        let (max, min) = if signed {
+                            (Sse::MaxS, Sse::MinS)
+                        } else {
+                            (Sse::MaxU, Sse::MinU)
+                        };
+                        self.copy(SCRATCH, a);
+                        self.sse(min, size, SCRATCH, b);
+                        self.copy(d, a);
+                        self.sse(max, size, d, b);
+                        self.sse(Sse::Sub, size, d, SCRATCH);
+                    }
                     _ => {
                         let op = match op {
                             Binary::Add => Sse::Add,
