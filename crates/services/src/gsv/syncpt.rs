@@ -109,7 +109,7 @@ struct Watches {
 }
 
 /// Writes `value` into the page's slot for `id` and marks the id fresh when the slot held an
-/// older value. Runs on every increment the page mirrors, so it allocates nothing and takes no lock.
+/// older value. Runs on every mirrored increment, so it allocates nothing and takes no lock.
 fn write_value(memory: &AddressSpace, ro: VAddr, fresh: &[AtomicU64; WORDS], id: u32, value: u32) {
     let address = ro + VALUES + u64::from(id) * 8;
     if memory.read::<u64>(address).ok() == Some(u64::from(value)) {
