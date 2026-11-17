@@ -34,6 +34,7 @@ use super::{
     descriptor_type, stage_flags,
 };
 use crate::debug::{Program, Programs};
+use crate::descriptors::DescriptorInfo;
 use crate::device::Device;
 use crate::error::{Result, VkResultExt};
 
@@ -50,12 +51,25 @@ pub struct LayoutBinding {
     pub stages: vk::ShaderStageFlags,
 }
 
+/// How draws write set 0 of a [`PipelineLayout`]: a descriptor update template reading one
+/// [`DescriptorInfo`] per descriptor, binding after binding in binding order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetTemplate {
+    pub raw: vk::DescriptorUpdateTemplate,
+    /// The layout to allocate the set with, updating it through the template; `None` when set 0
+    /// is a push descriptor layout and the template pushes it into the command buffer.
+    pub allocate: Option<vk::DescriptorSetLayout>,
+    /// The infos the template reads.
+    pub descriptors: usize,
+}
+
 /// Descriptor set layouts and the pipeline layout shared by pipelines whose stages bind the
 /// same resources.
 pub struct PipelineLayout {
     device: Arc<Device>,
     raw: vk::PipelineLayout,
     set_layouts: Vec<vk::DescriptorSetLayout>,
+    template: Option<SetTemplate>,
     bindings: Vec<LayoutBinding>,
     push_constants: (vk::ShaderStageFlags, u32),
 }
@@ -68,6 +82,11 @@ impl PipelineLayout {
     /// One layout per set index up to the highest set any stage uses.
     pub fn set_layouts(&self) -> &[vk::DescriptorSetLayout] {
         &self.set_layouts
+    }
+
+    /// How set 0 is written; `None` when it has no descriptors.
+    pub fn set_template(&self) -> Option<SetTemplate> {
+        self.template
     }
 
     /// Every binding, sorted by set and binding.
@@ -87,6 +106,11 @@ impl Drop for PipelineLayout {
     fn drop(&mut self) {
         // SAFETY: every pipeline using this layout holds an Arc to it and is gone.
         unsafe {
+            if let Some(template) = self.template {
+                self.device
+                    .raw
+                    .destroy_descriptor_update_template(template.raw, None);
+            }
             self.device.raw.destroy_pipeline_layout(self.raw, None);
             for &set in &self.set_layouts {
                 self.device.raw.destroy_descriptor_set_layout(set, None);
@@ -151,10 +175,14 @@ impl LayoutDesc {
             device: device.clone(),
             raw: vk::PipelineLayout::null(),
             set_layouts: Vec::new(),
+            template: None,
             bindings: self.bindings,
             push_constants: self.push_constants,
         };
         let sets = layout.bindings.iter().map(|b| b.set + 1).max().unwrap_or(0);
+        let set0 = || layout.bindings.iter().filter(|b| b.set == 0);
+        let descriptors: u32 = set0().map(|b| b.count).sum();
+        let push = descriptors > 0 && descriptors <= device.properties.max_push_descriptors;
         for set in 0..sets {
             let bindings: Vec<_> = layout
                 .bindings
@@ -168,7 +196,13 @@ impl LayoutDesc {
                         .stage_flags(b.stages)
                 })
                 .collect();
-            let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+            let flags = match push && set == 0 {
+                true => vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR,
+                false => vk::DescriptorSetLayoutCreateFlags::empty(),
+            };
+            let info = vk::DescriptorSetLayoutCreateInfo::default()
+                .flags(flags)
+                .bindings(&bindings);
             // SAFETY: valid create info; the layout's Drop destroys what was created so far.
             let set_layout = unsafe {
                 device
@@ -194,6 +228,60 @@ impl LayoutDesc {
                 .create_pipeline_layout(&info, None)
                 .call("vkCreatePipelineLayout")?
         };
+        if descriptors == 0 {
+            return Ok(layout);
+        }
+        let stride = size_of::<DescriptorInfo>();
+        let mut first = 0;
+        let entries: Vec<_> = set0()
+            .map(|b| {
+                let entry = vk::DescriptorUpdateTemplateEntry {
+                    dst_binding: b.binding,
+                    dst_array_element: 0,
+                    descriptor_count: b.count,
+                    descriptor_type: descriptor_type(b.kind),
+                    offset: first * stride,
+                    stride,
+                };
+                first += b.count as usize;
+                entry
+            })
+            .collect();
+        let bind_point = match layout
+            .bindings
+            .iter()
+            .any(|b| b.stages.contains(vk::ShaderStageFlags::COMPUTE))
+        {
+            true => vk::PipelineBindPoint::COMPUTE,
+            false => vk::PipelineBindPoint::GRAPHICS,
+        };
+        let (template_type, allocate) = match push {
+            true => (vk::DescriptorUpdateTemplateType::PUSH_DESCRIPTORS_KHR, None),
+            false => (
+                vk::DescriptorUpdateTemplateType::DESCRIPTOR_SET,
+                Some(layout.set_layouts[0]),
+            ),
+        };
+        let info = vk::DescriptorUpdateTemplateCreateInfo::default()
+            .descriptor_update_entries(&entries)
+            .template_type(template_type)
+            .descriptor_set_layout(layout.set_layouts[0])
+            .pipeline_bind_point(bind_point)
+            .pipeline_layout(layout.raw)
+            .set(0);
+        // SAFETY: valid create info naming set 0 of the live pipeline layout; every entry
+        // matches one of its bindings.
+        let raw = unsafe {
+            device
+                .raw
+                .create_descriptor_update_template(&info, None)
+                .call("vkCreateDescriptorUpdateTemplate")?
+        };
+        layout.template = Some(SetTemplate {
+            raw,
+            allocate,
+            descriptors: descriptors as usize,
+        });
         Ok(layout)
     }
 }
@@ -1750,6 +1838,11 @@ mod tests {
     const SIZE: u32 = 4;
 
     fn device() -> Option<Arc<Device>> {
+        device_with(true)
+    }
+
+    /// A device that reports no push descriptors without `push_descriptors`.
+    fn device_with(push_descriptors: bool) -> Option<Arc<Device>> {
         let instance = match Instance::new(true, SurfaceSupport::None) {
             Ok(instance) => Arc::new(instance),
             Err(error) => {
@@ -1757,13 +1850,265 @@ mod tests {
                 return None;
             }
         };
-        match Device::new(instance, &GraphicsSettings::default(), None) {
-            Ok(device) => Some(device),
+        let mut device = match Device::new(instance, &GraphicsSettings::default(), None) {
+            Ok(device) => device,
             Err(error) => {
                 eprintln!("skipping: {error}");
-                None
+                return None;
             }
+        };
+        if !push_descriptors {
+            Arc::get_mut(&mut device)
+                .expect("nothing shares the new device")
+                .properties
+                .max_push_descriptors = 0;
         }
+        Some(device)
+    }
+
+    /// Set 0 with `textures` combined image samplers at binding 0, then one uniform buffer.
+    fn texture_layout(textures: u32) -> LayoutDesc {
+        let binding = |binding, kind, count| LayoutBinding {
+            set: 0,
+            binding,
+            kind,
+            count,
+            stages: vk::ShaderStageFlags::FRAGMENT,
+        };
+        LayoutDesc {
+            bindings: vec![
+                binding(0, DescriptorKind::CombinedImageSampler, textures),
+                binding(1, DescriptorKind::UniformBuffer, 1),
+            ],
+            push_constants: (vk::ShaderStageFlags::empty(), 0),
+        }
+    }
+
+    #[test]
+    fn layouts_push_set_0_only_when_it_fits_the_push_descriptor_limit() {
+        let Some(device) = device() else { return };
+        let limit = device.properties.max_push_descriptors;
+        assert_eq!(limit > 0, device.features.extensions.push_descriptor);
+        if limit > 1 {
+            let pushed = texture_layout(limit - 1).create(&device).unwrap();
+            let template = pushed.set_template().unwrap();
+            assert_eq!(template.allocate, None, "{limit} descriptors push");
+            assert_eq!(template.descriptors, limit as usize);
+        }
+        let over = texture_layout(limit).create(&device).unwrap();
+        let template = over.set_template().unwrap();
+        assert_eq!(template.allocate, Some(over.set_layouts()[0]));
+        assert_eq!(template.descriptors, limit as usize + 1);
+        let empty = LayoutDesc {
+            bindings: Vec::new(),
+            push_constants: (vk::ShaderStageFlags::empty(), 0),
+        };
+        assert_eq!(empty.create(&device).unwrap().set_template(), None);
+        assert_eq!(device.instance.validation_errors(), 0);
+    }
+
+    /// The per-draw cost of writing and binding a typical set (4 uniform buffers, 8 combined
+    /// image samplers, 2 storage buffers) whose first uniform buffer moves every draw, as
+    /// streamed uniforms do: `cargo test --release -p lichii-vulkan --lib descriptor_write_timing
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing"]
+    fn descriptor_write_timing() {
+        use crate::descriptors::DescriptorAllocator;
+        use crate::memory::{Buffer, Image, ImageDesc};
+
+        const DRAWS: u32 = 2000;
+        let Ok(instance) = Instance::new(false, SurfaceSupport::None) else {
+            return;
+        };
+        let instance = Arc::new(instance);
+        let bench_device = |push: bool| {
+            let mut device = Device::new(instance.clone(), &GraphicsSettings::default(), None)
+                .expect("a Vulkan device");
+            if !push {
+                Arc::get_mut(&mut device)
+                    .unwrap()
+                    .properties
+                    .max_push_descriptors = 0;
+            }
+            device
+        };
+        let devices = [bench_device(false), bench_device(true)];
+        let kinds = [DescriptorKind::UniformBuffer; 4]
+            .into_iter()
+            .chain([DescriptorKind::CombinedImageSampler; 8])
+            .chain([DescriptorKind::StorageBuffer; 2]);
+        let desc = LayoutDesc {
+            bindings: kinds
+                .enumerate()
+                .map(|(binding, kind)| LayoutBinding {
+                    set: 0,
+                    binding: binding as u32,
+                    kind,
+                    count: 1,
+                    stages: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                })
+                .collect(),
+            push_constants: (vk::ShaderStageFlags::empty(), 0),
+        };
+
+        let mut results = Vec::new();
+        for (path, device) in [("before", 0), ("template", 0), ("push", 1)] {
+            let device = &devices[device];
+            let raw = &device.raw;
+            let layout = desc.clone().create(device).unwrap();
+            let template = layout.set_template().unwrap();
+            assert_eq!(template.allocate.is_none(), path == "push");
+            let buffer_usage =
+                vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::STORAGE_BUFFER;
+            let buffer = Buffer::new(
+                device,
+                1 << 20,
+                buffer_usage,
+                MemoryLocation::GpuOnly,
+                "bench",
+            )
+            .unwrap();
+            let usage = vk::ImageUsageFlags::SAMPLED;
+            let image = Image::new(device, &ImageDesc::d2(TARGET, 4, 4, usage), "bench").unwrap();
+            let view = image
+                .view(vk::ImageViewType::TYPE_2D, vk::ComponentMapping::default())
+                .unwrap();
+            // SAFETY: valid create info; destroyed below after the device went idle.
+            let sampler =
+                unsafe { raw.create_sampler(&vk::SamplerCreateInfo::default(), None) }.unwrap();
+            let mut buffer_infos = [vk::DescriptorBufferInfo {
+                buffer: buffer.raw(),
+                offset: 0,
+                range: 256,
+            }; 6];
+            let image_infos = [vk::DescriptorImageInfo {
+                sampler,
+                image_view: view.raw(),
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            }; 8];
+            let mut writes: Vec<vk::WriteDescriptorSet<'static>> = Vec::new();
+            let mut infos: Vec<DescriptorInfo> = Vec::new();
+            let pushes = ash::khr::push_descriptor::Device::new(&device.instance.raw, raw);
+            let mut scheduler = Scheduler::new(device).unwrap();
+            let mut allocator = DescriptorAllocator::new(device).unwrap();
+            let mut samples = Vec::new();
+            for _ in 0..30 {
+                let cmd = scheduler.record().unwrap();
+                let start = Instant::now();
+                for draw in 0..DRAWS {
+                    buffer_infos[0].offset = u64::from(draw % 4096) * 256;
+                    let set = match path {
+                        "push" => None,
+                        _ => Some(
+                            allocator
+                                .allocate(&mut scheduler, template.allocate.unwrap())
+                                .unwrap(),
+                        ),
+                    };
+                    if path == "before" {
+                        writes.clear();
+                        for b in layout.bindings() {
+                            let mut write = vk::WriteDescriptorSet {
+                                dst_set: set.unwrap(),
+                                dst_binding: b.binding,
+                                descriptor_count: b.count,
+                                descriptor_type: descriptor_type(b.kind),
+                                ..Default::default()
+                            };
+                            match b.binding {
+                                0..4 => write.p_buffer_info = &buffer_infos[b.binding as usize],
+                                4..12 => write.p_image_info = &image_infos[b.binding as usize - 4],
+                                _ => write.p_buffer_info = &buffer_infos[b.binding as usize - 8],
+                            }
+                            writes.push(write);
+                        }
+                    } else {
+                        infos.clear();
+                        infos.extend(
+                            buffer_infos[..4]
+                                .iter()
+                                .map(|&buffer| DescriptorInfo { buffer }),
+                        );
+                        infos.extend(image_infos.iter().map(|&image| DescriptorInfo { image }));
+                        infos.extend(
+                            buffer_infos[4..]
+                                .iter()
+                                .map(|&buffer| DescriptorInfo { buffer }),
+                        );
+                    }
+                    // SAFETY: the set, buffer, view and sampler are live; the writes and
+                    // infos point into arrays that outlive the calls; `cmd` is recording.
+                    unsafe {
+                        match (path, set) {
+                            ("before", Some(_)) => raw.update_descriptor_sets(&writes, &[]),
+                            (_, Some(set)) => raw.update_descriptor_set_with_template(
+                                set,
+                                template.raw,
+                                infos.as_ptr().cast(),
+                            ),
+                            _ => {}
+                        }
+                        match set {
+                            Some(set) => raw.cmd_bind_descriptor_sets(
+                                cmd,
+                                vk::PipelineBindPoint::GRAPHICS,
+                                layout.raw(),
+                                0,
+                                &[set],
+                                &[],
+                            ),
+                            None => pushes.cmd_push_descriptor_set_with_template(
+                                cmd,
+                                template.raw,
+                                layout.raw(),
+                                0,
+                                infos.as_ptr().cast(),
+                            ),
+                        }
+                    }
+                }
+                samples.push(start.elapsed().as_nanos() as f64 / f64::from(DRAWS));
+                scheduler.finish().unwrap();
+            }
+            samples.sort_by(f64::total_cmp);
+            results.push((path, samples[samples.len() / 2]));
+            drop(allocator);
+            // SAFETY: `finish` waited for every use of the sampler.
+            unsafe { raw.destroy_sampler(sampler, None) };
+        }
+        let before = results[0].1;
+        for (path, ns) in results {
+            println!(
+                "{path:>8}: {ns:6.0} ns per draw ({:.2}x the old path) on {}",
+                before / ns,
+                devices[0].properties.name
+            );
+        }
+    }
+
+    #[test]
+    fn draws_write_allocated_sets_without_push_descriptors() {
+        let Some(device) = device_with(false) else {
+            return;
+        };
+        let mut cache = PipelineCache::new(&device, &settings(false), None, None).unwrap();
+        let features = *cache.features();
+        let shaders = present_shaders();
+        let present = key(&cache, &Regs::with_defaults(), &shaders);
+        let pipeline = cache.graphics(&present, &shaders).unwrap();
+        let template = pipeline.layout().set_template().unwrap();
+        assert_eq!(template.allocate, Some(pipeline.layout().set_layouts()[0]));
+        let texels = draw(&device, &features, pipeline, [0.0, 1.0, 1.0, 1.0]);
+        assert!(
+            texels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|t| *t == [0, 255, 255, 255]),
+            "{texels:?}"
+        );
+        assert_eq!(device.instance.validation_errors(), 0);
     }
 
     fn settings(async_compile: bool) -> GraphicsSettings {
@@ -2058,22 +2403,30 @@ mod tests {
                 raw.create_sampler(&sampler_info, None).unwrap(),
             )
         };
-        let set_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(pool)
-            .set_layouts(layout.set_layouts());
-        // SAFETY: the pool has room for the one set.
-        let set = unsafe { raw.allocate_descriptor_sets(&set_info).unwrap()[0] };
-        let image_info = [vk::DescriptorImageInfo {
-            sampler,
-            image_view: texture_view.raw(),
-            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        let template = layout
+            .set_template()
+            .expect("the copy pass samples a texture");
+        let infos = [DescriptorInfo {
+            image: vk::DescriptorImageInfo {
+                sampler,
+                image_view: texture_view.raw(),
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            },
         }];
-        let write = vk::WriteDescriptorSet::default()
-            .dst_set(set)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(&image_info);
-        // SAFETY: the set and image view are live.
-        unsafe { raw.update_descriptor_sets(&[write], &[]) };
+        let set = template.allocate.map(|set_layout| {
+            let set_layouts = [set_layout];
+            let set_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(pool)
+                .set_layouts(&set_layouts);
+            // SAFETY: the pool has room for the one set; the set, sampler and image view are
+            // live and `infos` matches the template.
+            unsafe {
+                let set = raw.allocate_descriptor_sets(&set_info).unwrap()[0];
+                raw.update_descriptor_set_with_template(set, template.raw, infos.as_ptr().cast());
+                set
+            }
+        });
+        let pushes = ash::khr::push_descriptor::Device::new(&device.instance.raw, raw);
 
         let cmd = scheduler.record().unwrap();
         transition(
@@ -2137,14 +2490,23 @@ mod tests {
         unsafe {
             raw.cmd_begin_rendering(cmd, &rendering);
             raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline.raw());
-            raw.cmd_bind_descriptor_sets(
-                cmd,
-                vk::PipelineBindPoint::GRAPHICS,
-                layout.raw(),
-                0,
-                &[set],
-                &[],
-            );
+            match set {
+                Some(set) => raw.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    layout.raw(),
+                    0,
+                    &[set],
+                    &[],
+                ),
+                None => pushes.cmd_push_descriptor_set_with_template(
+                    cmd,
+                    template.raw,
+                    layout.raw(),
+                    0,
+                    infos.as_ptr().cast(),
+                ),
+            }
             raw.cmd_push_constants(cmd, layout.raw(), push_stages, 0, &params);
             set_dynamic_state(device, cmd, features, vertices.raw());
             raw.cmd_draw(cmd, 3, 1, 0, 0);
