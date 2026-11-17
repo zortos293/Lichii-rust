@@ -3,7 +3,7 @@ use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use ash::{ext, khr, nv, vk};
+use ash::{amd, ext, khr, nv, vk};
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 use gpu_allocator::{AllocationSizes, AllocatorDebugSettings};
 use lichii_common::settings::GraphicsSettings;
@@ -39,9 +39,11 @@ pub struct DeviceExtensions {
     pub provoking_vertex: bool,
     pub depth_clip_control: bool,
     pub depth_clip_enable: bool,
+    pub depth_bias_control: bool,
     pub index_type_uint8: bool,
     pub line_rasterization: bool,
     pub shader_stencil_export: bool,
+    pub geometry_shader_passthrough: bool,
 }
 
 type ExtensionFlag = fn(&mut DeviceExtensions) -> &mut bool;
@@ -71,10 +73,14 @@ const OPTIONAL_EXTENSIONS: &[(&CStr, ExtensionFlag)] = &[
     (ext::provoking_vertex::NAME, |e| &mut e.provoking_vertex),
     (ext::depth_clip_control::NAME, |e| &mut e.depth_clip_control),
     (ext::depth_clip_enable::NAME, |e| &mut e.depth_clip_enable),
+    (ext::depth_bias_control::NAME, |e| &mut e.depth_bias_control),
     (ext::index_type_uint8::NAME, |e| &mut e.index_type_uint8),
     (ext::line_rasterization::NAME, |e| &mut e.line_rasterization),
     (ext::shader_stencil_export::NAME, |e| {
         &mut e.shader_stencil_export
+    }),
+    (nv::geometry_shader_passthrough::NAME, |e| {
+        &mut e.geometry_shader_passthrough
     }),
 ];
 
@@ -121,6 +127,16 @@ pub struct DeviceFeatures {
     pub provoking_vertex_last: bool,
     pub index_type_uint8: bool,
     pub depth_clip_control: bool,
+    /// `vkCmdSetDepthBias2EXT`, which picks how the constant depth bias is represented.
+    pub depth_bias_control: bool,
+    /// The float depth bias representation: a constant in absolute depth units, whatever the
+    /// host depth format.
+    pub depth_bias_float: bool,
+    /// The force-unorm depth bias representation: a constant in units of a minimum resolvable
+    /// difference that stays the same over the whole depth range, even on a float attachment.
+    pub depth_bias_force_unorm: bool,
+    /// The driver applies the depth bias without scaling the minimum resolvable difference.
+    pub depth_bias_exact: bool,
     pub transform_feedback: bool,
     pub conditional_rendering: bool,
     /// `VK_EXT_mesh_shader` with both task and mesh stages.
@@ -346,6 +362,7 @@ impl Device {
         let mut provoking = vk::PhysicalDeviceProvokingVertexFeaturesEXT::default();
         let mut clip_control = vk::PhysicalDeviceDepthClipControlFeaturesEXT::default();
         let mut clip_enable = vk::PhysicalDeviceDepthClipEnableFeaturesEXT::default();
+        let mut bias_control = vk::PhysicalDeviceDepthBiasControlFeaturesEXT::default();
         let mut uint8 = vk::PhysicalDeviceIndexTypeUint8FeaturesKHR::default();
         let mut lines = vk::PhysicalDeviceLineRasterizationFeaturesKHR::default();
 
@@ -365,6 +382,7 @@ impl Device {
                 provoking.p_next = std::ptr::null_mut();
                 clip_control.p_next = std::ptr::null_mut();
                 clip_enable.p_next = std::ptr::null_mut();
+                bias_control.p_next = std::ptr::null_mut();
                 uint8.p_next = std::ptr::null_mut();
                 lines.p_next = std::ptr::null_mut();
                 let mut features = vk::PhysicalDeviceFeatures2::default()
@@ -404,6 +422,9 @@ impl Device {
                 if extensions.depth_clip_enable {
                     features = features.push_next(&mut clip_enable);
                 }
+                if extensions.depth_bias_control {
+                    features = features.push_next(&mut bias_control);
+                }
                 if extensions.index_type_uint8 {
                     features = features.push_next(&mut uint8);
                 }
@@ -436,6 +457,8 @@ impl Device {
         mesh.primitive_fragment_shading_rate_mesh_shader = vk::FALSE;
         mesh.mesh_shader_queries = vk::FALSE;
         let on = |b: vk::Bool32| b != vk::FALSE;
+        let depth_bias_control =
+            extensions.depth_bias_control && on(bias_control.depth_bias_control);
         let features = DeviceFeatures {
             extensions,
             sampler_anisotropy: on(core.sampler_anisotropy),
@@ -494,6 +517,11 @@ impl Device {
             index_type_uint8: extensions.index_type_uint8 && on(uint8.index_type_uint8),
             depth_clip_control: extensions.depth_clip_control
                 && on(clip_control.depth_clip_control),
+            depth_bias_control,
+            depth_bias_float: depth_bias_control && on(bias_control.float_representation),
+            depth_bias_force_unorm: depth_bias_control
+                && on(bias_control.least_representable_value_force_unorm_representation),
+            depth_bias_exact: depth_bias_control && on(bias_control.depth_bias_exact),
             transform_feedback: extensions.transform_feedback && on(xfb.transform_feedback),
             conditional_rendering: extensions.conditional_rendering
                 && on(conditional.conditional_rendering),
@@ -539,12 +567,21 @@ impl Device {
         if device_fault {
             names.push(ext::device_fault::NAME.as_ptr());
         }
+        let buffer_marker = fault_report && has(amd::buffer_marker::NAME);
+        if buffer_marker {
+            names.push(amd::buffer_marker::NAME.as_ptr());
+        }
+        let fault_support = crate::debug::fault::FaultSupport {
+            fault: device_fault.then_some(fault_features.device_fault_vendor_binary != vk::FALSE),
+            checkpoints: fault_report && checkpoints,
+            buffer_marker,
+        };
         if fault_report {
             tracing::info!(
                 device_fault,
-                vendor_binary =
-                    device_fault && fault_features.device_fault_vendor_binary != vk::FALSE,
+                vendor_binary = fault_support.fault == Some(true),
                 checkpoints,
+                buffer_marker,
                 "GPU fault report on"
             );
         }
@@ -670,15 +707,18 @@ impl Device {
         let labels = instance
             .labels
             .then(|| ext::debug_utils::Device::new(raw_instance, &raw));
-        let faults = (device_fault || (fault_report && checkpoints)).then(|| {
-            crate::debug::fault::Reporter::register(
-                raw_instance,
-                &raw,
-                queue,
-                device_fault.then_some(fault_features.device_fault_vendor_binary != vk::FALSE),
-                fault_report && checkpoints,
-            )
-        });
+        let faults = (fault_support.fault.is_some()
+            || fault_support.checkpoints
+            || fault_support.buffer_marker)
+            .then(|| {
+                crate::debug::fault::Reporter::register(
+                    raw_instance,
+                    &raw,
+                    &memory_properties,
+                    queue,
+                    fault_support,
+                )
+            });
         Ok(Arc::new(Self {
             instance,
             physical,
@@ -792,13 +832,13 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
-        if let Some(faults) = &self.faults {
-            faults.unregister();
-        }
         // SAFETY: every object created from the device holds an Arc to it and is gone; the
         // allocator frees its blocks before the device is destroyed.
         unsafe {
             let _ = self.raw.device_wait_idle();
+            if let Some(faults) = &self.faults {
+                faults.destroy(&self.raw);
+            }
             ManuallyDrop::drop(&mut self.allocator);
             self.raw.destroy_device(None);
         }

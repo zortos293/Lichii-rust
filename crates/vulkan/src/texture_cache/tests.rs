@@ -712,6 +712,7 @@ fn incompatible_overlaps_stay_live_and_new_images_take_newer_texels_on_the_gpu()
 
 const GREEN: [u8; 4] = [0, 255, 0, 255];
 const RED: [u8; 4] = [255, 0, 0, 255];
+const BLUE: [u8; 4] = [0, 0, 255, 255];
 
 fn guest_texels(f: &Fixture, offset: u64, len: usize) -> Vec<u8> {
     let mut guest = vec![0; len];
@@ -897,6 +898,73 @@ fn targets_drawn_into_take_newer_overlaps_on_their_texel_grid() {
 }
 
 #[test]
+fn depth_arrays_cleared_a_layer_at_a_time_join_into_one_image() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let format = PixelFormat::X8D24Unorm;
+    let array = ImageInfo {
+        format,
+        layers: 4,
+        layer_stride: surface(format, 64, 64, 1, 4, 2, GobLayout::Tegra).layer_stride(),
+        ..rt_info(64, 64, 2, GobLayout::Tegra)
+    };
+    let depths = [0.25, 0.5, 0.75, 1.0];
+    let mut last = None;
+    for (layer, depth) in (0u32..).zip(depths) {
+        let (mut tx, cache, gmmu) = f.tx();
+        let target = cache
+            .render_target(
+                &mut tx,
+                gmmu,
+                GPU_VA,
+                &array.with_layers(layer + 1),
+                layer == 0,
+            )
+            .unwrap()
+            .unwrap();
+        cache
+            .clear(
+                &mut tx,
+                target,
+                ClearValue::DepthStencil {
+                    depth: Some(depth),
+                    stencil: None,
+                    stencil_mask: 0xff,
+                },
+                Rect::ALL,
+                layer,
+                1,
+            )
+            .unwrap();
+        last = Some(target.id);
+    }
+    assert_eq!(f.cache.len(), 1, "each larger array joins the smaller one");
+    let traffic = f.cache.traffic();
+    for layers in 1..=4 {
+        let (mut tx, cache, gmmu) = f.tx();
+        let found = cache
+            .render_target(&mut tx, gmmu, GPU_VA, &array.with_layers(layers), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!((Some(found.id), found.layer), (last, 0));
+    }
+    assert_eq!(f.cache.traffic(), traffic, "binds sync nothing");
+    let (mut tx, cache, _) = f.tx();
+    cache.flush(&mut tx, DADDR, array.size_bytes()).unwrap();
+    let stride = array.layer_stride as usize;
+    let guest = guest_texels(&f, 0, stride * 4);
+    for (layer, depth) in depths.into_iter().enumerate() {
+        let expected = (f64::from(depth) * 16_777_215.0).round() as u32;
+        for &texel in guest[layer * stride..][..64 * 64 * 4].as_chunks::<4>().0 {
+            let d = u32::from_le_bytes(texel) & 0xff_ffff;
+            assert!(d.abs_diff(expected) <= 1, "layer {layer} depth {d:#x}");
+        }
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
 fn targets_drawn_into_take_newer_mip_chains_over_them() {
     let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
         return;
@@ -972,6 +1040,58 @@ fn sampled_images_still_take_newer_overlaps() {
     );
     assert_eq!(count_texels(&read[0], GREEN), 64 * 64 - 32 * 32);
     assert!(all_texels(&f.read_image(b.id)[0], RED));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn clears_of_a_whole_level_take_no_overlap_bytes_inside_it() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let (chain, _) = f.texture(&tic(0x08, GPU_VA, 64, 64, 1, 2, 3));
+    let level_zero = rt_info(64, 64, 3, GobLayout::Tegra);
+    let overlap = rt_info(128, 32, 2, GobLayout::Tegra);
+    assert_eq!(overlap.size_bytes(), level_zero.size_bytes());
+    clear_rt(&mut f, &overlap, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    let syncs = f.cache.traffic().gpu_syncs;
+    let level = clear_rt(&mut f, &level_zero, [0.0, 0.0, 1.0, 1.0], Rect::ALL);
+    assert_eq!((level.id, level.level), (chain, 0));
+    assert_eq!(
+        f.cache.traffic().gpu_syncs,
+        syncs,
+        "the overlap's bytes all lie in the cleared level"
+    );
+    assert!(all_texels(&f.read_image(chain)[0], BLUE));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn clears_of_a_whole_level_still_take_overlap_bytes_past_it() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let (chain, _) = f.texture(&tic(0x08, GPU_VA, 64, 64, 1, 2, 3));
+    clear_rt(
+        &mut f,
+        &rt_info(128, 64, 3, GobLayout::Tegra),
+        [1.0, 0.0, 0.0, 1.0],
+        Rect::ALL,
+    );
+    let syncs = f.cache.traffic().gpu_syncs;
+    let level = clear_rt(
+        &mut f,
+        &rt_info(64, 64, 3, GobLayout::Tegra),
+        [0.0, 0.0, 1.0, 1.0],
+        Rect::ALL,
+    );
+    assert_eq!((level.id, level.level), (chain, 0));
+    assert_eq!(f.cache.traffic().gpu_syncs, syncs + 1);
+    let read = f.read_image(chain);
+    assert!(all_texels(&read[0], BLUE));
+    assert!(
+        all_texels(&read[1], RED),
+        "level 1 takes the overlap's bytes"
+    );
     f.assert_no_validation_errors();
 }
 
@@ -5478,4 +5598,221 @@ fn sampled_mip_chains_that_run_out_of_memory_keep_the_levels_that_fit() {
     assert!(image.image.memory_size() < full_size);
     assert_eq!(f.read_image(id), want[1..]);
     f.assert_no_validation_errors();
+}
+
+#[test]
+fn padded_level_targets_match_only_depth_free_levels_below_the_base() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        let mut chain = ImageInfo {
+            levels: 2,
+            ..rt_info(16, 16, 0, gob)
+        };
+        chain.layer_stride = chain.surface().layer_stride();
+        let level_1 = chain.surface().level_offset(1);
+        let padded = rt_info(16, 8, 0, gob);
+        assert_eq!(chain.find_subresource(&padded, level_1), None, "{gob:?}");
+        assert_eq!(
+            chain.find_padded_level(&padded, level_1),
+            Some((1, 0)),
+            "{gob:?}"
+        );
+        assert_eq!(
+            rt_info(8, 8, 0, gob).find_padded_level(&padded, 0),
+            None,
+            "{gob:?}: a wider target over a base level keeps its own texels"
+        );
+        let GuestLayout::BlockLinear {
+            block_height_log2,
+            tile_width_spacing,
+            ..
+        } = padded.layout
+        else {
+            unreachable!()
+        };
+        let deep = ImageInfo {
+            layout: GuestLayout::BlockLinear {
+                block_height_log2,
+                block_depth_log2: 1,
+                tile_width_spacing,
+                gob,
+            },
+            ..padded
+        };
+        assert_eq!(
+            chain.find_padded_level(&deep, level_1),
+            None,
+            "{gob:?}: the target's block depth moves its GOBs"
+        );
+    }
+}
+
+/// Mario Kart World's light-probe cube arrays at their full 7 levels: levels 4 to 6 (8x8,
+/// 4x4, 2x2) are rendered as targets one GOB wide (16x8, 16x4, 16x2 at block height 1),
+/// which cover exactly the GOB each of those levels is stored in.
+#[test]
+fn mkw_cube_array_levels_narrower_than_a_gob_render_into_the_array() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        for sample_first in [true, false] {
+            let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+                return;
+            };
+            let levels = 7;
+            let mut header = tic(0x21, GPU_VA, 128, 128, 2, levels, 4);
+            header.0[0] = (header.0[0] & !(0xfff << 7)) | 7 << 7 | 7 << 10 | 7 << 13 | 7 << 16;
+            header.0[4] = (header.0[4] & !(0xf << 23)) | 8 << 23;
+            let array = ImageInfo::from_texture(&header.decode().unwrap(), gob).unwrap();
+            assert_eq!((array.layers, array.levels), (12, levels));
+            let pitch = (array.layer_stride / 4) as u32;
+            let target = |level: u32| {
+                let size = 128 >> level;
+                match level {
+                    0..4 => mkw_target(
+                        0xe0,
+                        size,
+                        size,
+                        array.surface().level_tiling(level).block_height_log2,
+                        pitch,
+                        gob,
+                    ),
+                    _ => mkw_target(0xe0, 16, size, 0, pitch, gob),
+                }
+            };
+            let early = sample_first.then(|| f.texture(&header).0);
+            let mut founds = Vec::new();
+            for level in 0..levels {
+                let info = target(level);
+                for layer in 0..12 {
+                    let value = (layer * levels + level + 1) as f32 / 128.0;
+                    let found = clear_rt_at(
+                        &mut f,
+                        GPU_VA + array.subresource_offset(level, layer),
+                        &info,
+                        [value, 0.25, 1.0 - value, 1.0],
+                        Rect::ALL,
+                    );
+                    founds.push((level, layer, found));
+                }
+            }
+            let (id, _) = f.texture(&header);
+            let case = format!("{gob:?} sample_first {sample_first}");
+            assert_eq!(early.unwrap_or(id), id, "{case}");
+            let strays: Vec<_> = founds
+                .iter()
+                .filter(|(_, _, t)| t.id != id && f.cache.state(t.id).is_some())
+                .collect();
+            assert!(
+                strays.is_empty(),
+                "{case}: targets left beside the array: {strays:?}"
+            );
+            let texels = f.read_image(id);
+            let mut seen = Vec::new();
+            for layer in 0..12 {
+                for level in 0..levels {
+                    let got = &texels[(layer * levels + level) as usize];
+                    let first = &got[..4];
+                    assert!(
+                        first.iter().any(|&b| b != 0)
+                            && got.chunks(4).all(|t| t == first)
+                            && !seen.contains(&first.to_vec()),
+                        "{case}: layer {layer} level {level} holds {first:?}"
+                    );
+                    seen.push(first.to_vec());
+                }
+            }
+            for level in 4..levels {
+                let t = clear_rt_at(
+                    &mut f,
+                    GPU_VA + array.subresource_offset(level, 7),
+                    &target(level),
+                    [0.5, 0.5, 0.5, 1.0],
+                    Rect::ALL,
+                );
+                assert_eq!(
+                    (t.id, t.level, t.layer),
+                    (id, level, 7),
+                    "{case} second frame"
+                );
+            }
+            f.assert_no_validation_errors();
+        }
+    }
+}
+
+#[test]
+fn cube_levels_take_newer_overlaps_in_one_gpu_sync() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+            return;
+        };
+        let levels = 8;
+        let mut header = tic(0x08, GPU_VA, 128, 128, 1, levels, 4);
+        header.0[4] = (header.0[4] & !(0xf << 23)) | 8 << 23;
+        let cube = ImageInfo::from_texture(&header.decode().unwrap(), gob).unwrap();
+        assert_eq!((cube.layers, cube.levels), (6, levels));
+        let own =
+            |level: u32, layer: u32| [(layer * levels + level + 1) as u8 * 4, 0x40, 0x80, 0xff];
+        for layer in 0..6 {
+            for level in 0..levels {
+                let bytes: Vec<u8> = own(level, layer)
+                    .into_iter()
+                    .cycle()
+                    .take(cube.level_size(level) as usize)
+                    .collect();
+                f.memory
+                    .write_bytes(DADDR + cube.subresource_offset(level, layer), &bytes)
+                    .unwrap();
+            }
+        }
+        let (id, _) = f.texture(&header);
+        let mut expected: Vec<[u8; 4]> = (0..6)
+            .flat_map(|layer| (0..levels).map(move |level| own(level, layer)))
+            .collect();
+        let mut paint = |f: &mut Fixture, overlaps: &[(u32, u32, u32, [u8; 4])]| {
+            for &(first, last, layer, color) in overlaps {
+                let start = cube.subresource_offset(first, layer);
+                let end = cube.subresource_offset(last, layer) + cube.level_size(last);
+                let target = clear_rt_at(
+                    f,
+                    GPU_VA + start,
+                    &rt_info(16, ((end - start) / 64) as u32, 0, gob),
+                    color.map(|c| f32::from(c) / 255.0),
+                    Rect::ALL,
+                );
+                assert_ne!(target.id, id, "{gob:?}: an incompatible overlap");
+                for level in first..=last {
+                    expected[(layer * levels + level) as usize] = color;
+                }
+            }
+            let syncs = f.cache.traffic().gpu_syncs;
+            let (again, _) = f.texture(&header);
+            assert_eq!(again, id, "{gob:?}");
+            assert_eq!(f.cache.traffic().gpu_syncs, syncs + 1, "{gob:?}");
+        };
+        paint(
+            &mut f,
+            &[
+                (0, 0, 0, [255, 0, 0, 255]),
+                (1, 1, 2, [0, 255, 0, 255]),
+                (4, 7, 3, [0, 0, 255, 255]),
+                (0, 0, 5, [255, 255, 0, 255]),
+            ],
+        );
+        paint(
+            &mut f,
+            &[(2, 3, 1, [0, 255, 255, 255]), (5, 6, 4, [255, 0, 255, 255])],
+        );
+        let texels = f.read_image(id);
+        for layer in 0..6 {
+            for level in 0..levels {
+                let i = (layer * levels + level) as usize;
+                assert!(
+                    texels[i].chunks(4).all(|t| t == expected[i]),
+                    "{gob:?}: layer {layer} level {level} holds {:?}, not {:?}",
+                    &texels[i][..4],
+                    expected[i]
+                );
+            }
+        }
+        f.assert_no_validation_errors();
+    }
 }
