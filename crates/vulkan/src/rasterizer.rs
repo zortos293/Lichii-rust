@@ -828,12 +828,31 @@ impl VulkanRasterizer {
             buffer_stream_bytes = buffers.streamed_bytes - a.buffers.streamed_bytes,
             cached_images = self.texture_cache.len(),
             created_buffers = buffers.created_buffers,
-            oversized_stream_mib = self.buffer_cache.oversized_stream_bytes() >> 20,
-            oversized_staging_mib = self.staging.oversized_bytes() >> 20,
             vram_used_mib = memory.used >> 20,
             vram_slack_mib = memory.slack >> 20,
             vram_budget_mib = memory.budget >> 20,
             "GPU thread"
+        );
+        let counts = self.device.memory_counts();
+        let (stream, staging) = (
+            self.buffer_cache.oversized_stream(),
+            self.staging.oversized(),
+        );
+        tracing::debug!(
+            target: ACTIVITY_TARGET,
+            gpu_only_mib = counts.gpu_only.bytes >> 20,
+            gpu_only_allocations = counts.gpu_only.count,
+            cpu_to_gpu_mib = counts.cpu_to_gpu.bytes >> 20,
+            cpu_to_gpu_allocations = counts.cpu_to_gpu.count,
+            gpu_to_cpu_mib = counts.gpu_to_cpu.bytes >> 20,
+            gpu_to_cpu_allocations = counts.gpu_to_cpu.count,
+            oversized_stream_mib = stream.bytes >> 20,
+            oversized_stream_buffers = stream.count,
+            oversized_staging_mib = staging.bytes >> 20,
+            oversized_staging_buffers = staging.count,
+            pipelines = self.device.pipelines(),
+            descriptor_pools = self.device.descriptor_pools(),
+            "GPU memory"
         );
         *a = Activity {
             since: Some(now),

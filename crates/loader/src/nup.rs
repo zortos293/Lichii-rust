@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use lichii_common::ConsoleGeneration;
 use lichii_crypto::{Sha256, Sha256Hash, sha256};
@@ -32,7 +33,7 @@ use crate::exefs::load_exefs;
 use crate::patch::Mods;
 use crate::program::{AddOnContent, ProgramImage};
 use crate::title::{LoadOptions, TitleFormat, TitleInfo};
-use crate::zstd::{FrameStream, Input, Variant, ZstdError};
+use crate::zstd::{BLOCK_SIZE_MAX, FrameStream, Input, Variant, ZstdError};
 
 /// The first four bytes of every NUP container.
 pub const MAGIC: [u8; 4] = *b"NUP\x01";
@@ -72,14 +73,19 @@ pub const META_LOCALIZED_TITLES: u16 = 0x0009;
 /// JPEG in place of each title.
 pub const META_LOCALIZED_ICONS: u16 = 0x000a;
 
-/// Decoded zstd files a container keeps in memory at once; the least recently read go first.
-const DECODE_BUDGET: u64 = 512 << 20;
+/// Decoded zstd files a container keeps once they have gone unread for [`RECENT`]; the least
+/// recently read go first.
+const DECODE_BUDGET: u64 = 64 << 20;
+/// Files read within [`RECENT`] stay decoded until the cache passes this, so a file a title
+/// streams in pieces between reads of other files is not decoded again from its start each time.
+const DECODE_LIMIT: u64 = 256 << 20;
+const RECENT: Duration = Duration::from_secs(2);
 /// What a partly decoded file holds besides its output: the decoder's literals buffer and
 /// entropy tables, and the compressed input buffer. Charged until the file is decoded.
 const STREAM_CHARGE: u64 = 512 << 10;
 /// Zstd files larger than this are refused. The reference packer stores every file above
 /// 256 MiB raw.
-const MAX_ZSTD_FILE: u64 = DECODE_BUDGET / 2;
+const MAX_ZSTD_FILE: u64 = 256 << 20;
 /// A read ending at most this far past a file's decoded prefix decodes only up to its end; one
 /// further in decodes the whole file, so a random reader waits once per file.
 pub(crate) const NEAR_DECODE: u64 = 1 << 20;
@@ -961,10 +967,17 @@ impl ZstdFile {
                         "the frame's content size is not the file size",
                     ));
                 }
-                member.data = vec![0; self.size as usize];
                 frame
             }
         };
+        let room = (target + BLOCK_SIZE_MAX).min(self.size as usize);
+        if room > member.data.capacity() {
+            let capacity = room.max((2 * member.data.capacity()).min(self.size as usize));
+            member.data.reserve_exact(capacity - member.data.len());
+        }
+        if room > member.data.len() {
+            member.data.resize(room, 0);
+        }
         member.decoded = frame.decode_to(&mut member.data, target)?;
         if !frame.is_finished() {
             member.stream = Some(frame);
@@ -997,7 +1010,7 @@ impl File for ZstdFile {
         }
         let len = buf.len().min((self.size - offset) as usize);
         let end = offset + len as u64;
-        let shared = self.cache.member(self.index, self.size);
+        let shared = self.cache.member(self.index, Instant::now());
         let mut member = shared.lock().unwrap_or_else(PoisonError::into_inner);
         let decoded = member.decoded as u64;
         if decoded < end {
@@ -1011,9 +1024,14 @@ impl File for ZstdFile {
                 member.failed = true;
                 member.stream = None;
             }
-            if member.stream.is_none() {
-                self.cache.release_stream(self.index, &shared);
-            }
+            let charge = member.data.capacity() as u64
+                + if member.stream.is_some() {
+                    STREAM_CHARGE
+                } else {
+                    0
+                };
+            self.cache
+                .settle(self.index, &shared, charge, Instant::now());
             if let Err(error) = result {
                 tracing::error!("NUP: decoding {} failed: {error}", self.name);
                 return Err(io::Error::new(
@@ -1036,9 +1054,10 @@ struct Member {
     failed: bool,
 }
 
-/// The zstd files of one container that were read recently, charged their full size, plus
-/// `STREAM_CHARGE` while partly decoded, against `DECODE_BUDGET`. An evicted file stays alive
-/// while a read holds it and decodes again on its next read.
+/// The zstd files of one container that were read recently, each charged the memory of its
+/// decoded prefix plus `STREAM_CHARGE` while partly decoded. Past [`DECODE_BUDGET`] the least
+/// recently read go, except files read within [`RECENT`], which go only past [`DECODE_LIMIT`].
+/// An evicted file stays alive while a read holds it and decodes again on its next read.
 #[derive(Default)]
 struct DecodeCache {
     state: Mutex<CacheState>,
@@ -1056,55 +1075,72 @@ struct Cached {
     member: Arc<Mutex<Member>>,
     charge: u64,
     used: u64,
-    streaming: bool,
+    read_at: Instant,
 }
 
 impl DecodeCache {
-    fn member(&self, index: usize, size: u64) -> Arc<Mutex<Member>> {
+    fn member(&self, index: usize, now: Instant) -> Arc<Mutex<Member>> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let state = &mut *state;
         state.clock += 1;
         let clock = state.clock;
-        if let Some(cached) = state.members.get_mut(&index) {
-            state.by_use.remove(&cached.used);
-            cached.used = clock;
-            state.by_use.insert(clock, index);
-            return cached.member.clone();
-        }
-        while state.bytes + size + STREAM_CHARGE > DECODE_BUDGET
-            && let Some((_, victim)) = state.by_use.pop_first()
-        {
-            if let Some(evicted) = state.members.remove(&victim) {
-                state.bytes -= evicted.charge;
-            }
-        }
-        let member = Arc::<Mutex<Member>>::default();
-        let charge = size + STREAM_CHARGE;
-        state.bytes += charge;
         state.by_use.insert(clock, index);
-        state.members.insert(
-            index,
-            Cached {
-                member: member.clone(),
-                charge,
-                used: clock,
-                streaming: true,
-            },
-        );
+        let cached = state.members.entry(index).or_insert_with(|| Cached {
+            member: Arc::default(),
+            charge: 0,
+            used: clock,
+            read_at: now,
+        });
+        if cached.used != clock {
+            state.by_use.remove(&cached.used);
+        }
+        cached.used = clock;
+        cached.read_at = now;
+        let member = cached.member.clone();
+        state.evict(index, now);
         member
     }
 
-    /// Stops charging a file's decoder once it is decoded or has failed. A file evicted and
-    /// cached again since is charged separately and left alone.
-    fn release_stream(&self, index: usize, member: &Arc<Mutex<Member>>) {
+    /// Charges a file what its decoding left it holding, then evicts other files to fit. A file
+    /// evicted and cached again since is charged separately and left alone.
+    fn settle(&self, index: usize, member: &Arc<Mutex<Member>>, charge: u64, now: Instant) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let state = &mut *state;
         if let Some(cached) = state.members.get_mut(&index)
             && Arc::ptr_eq(&cached.member, member)
-            && std::mem::take(&mut cached.streaming)
         {
-            cached.charge -= STREAM_CHARGE;
-            state.bytes -= STREAM_CHARGE;
+            state.bytes = state.bytes - cached.charge + charge;
+            cached.charge = charge;
+        }
+        state.evict(index, now);
+    }
+}
+
+impl CacheState {
+    /// Evicts files other than `keep`, least recently read first, until the cache is within
+    /// [`DECODE_BUDGET`], sparing files read within [`RECENT`] while it is within [`DECODE_LIMIT`].
+    fn evict(&mut self, keep: usize, now: Instant) {
+        let mut evict = Vec::new();
+        let mut bytes = self.bytes;
+        let mut victims = self.by_use.iter();
+        while bytes > DECODE_BUDGET
+            && let Some((&used, &victim)) = victims.next()
+        {
+            if victim == keep {
+                continue;
+            }
+            let cached = &self.members[&victim];
+            if now.duration_since(cached.read_at) < RECENT && bytes <= DECODE_LIMIT {
+                break;
+            }
+            bytes -= cached.charge;
+            evict.push((used, victim));
+        }
+        for (used, victim) in evict {
+            self.by_use.remove(&used);
+            if let Some(evicted) = self.members.remove(&victim) {
+                self.bytes -= evicted.charge;
+            }
         }
     }
 }
@@ -1392,7 +1428,11 @@ mod tests {
             "a short read decodes one block"
         );
         let charged = || nup.cache.state.lock().unwrap().bytes;
-        assert_eq!(charged(), zipped.len() as u64 + STREAM_CHARGE);
+        assert_eq!(
+            charged(),
+            (10 + BLOCK_SIZE_MAX) as u64 + STREAM_CHARGE,
+            "a short read charges only the prefix it decoded"
+        );
         check(&file, &zipped, BLOCK - 3, 2 * ZSTD_TEST_BLOCK);
         assert_eq!(decoded(&nup, "z.bin"), 3 * ZSTD_TEST_BLOCK);
         check(&file, &zipped, 30 * BLOCK - 1, 2);
@@ -1644,5 +1684,55 @@ mod tests {
             crate::load(&no_program, &LoadOptions::default()),
             Err(LoaderError::MissingNupProgram(_))
         ));
+    }
+    #[test]
+    fn decode_cache_keeps_recent_files_up_to_the_limit_and_idle_ones_up_to_the_budget() {
+        const MIB: u64 = 1 << 20;
+        let cache = DecodeCache::default();
+        let start = Instant::now();
+        let fill = |index: usize, charge: u64, at: Instant| {
+            let member = cache.member(index, at);
+            cache.settle(index, &member, charge, at);
+        };
+        let cached = || {
+            let state = cache.state.lock().unwrap();
+            let mut files: Vec<usize> = state.members.keys().copied().collect();
+            files.sort_unstable();
+            (files, state.bytes / MIB)
+        };
+
+        for index in 0..3 {
+            fill(index, 40 * MIB, start);
+        }
+        assert_eq!(
+            cached(),
+            (vec![0, 1, 2], 120),
+            "recent files stay past the budget"
+        );
+
+        let later = start + RECENT + Duration::from_secs(1);
+        cache.member(2, later);
+        assert_eq!(
+            cached(),
+            (vec![2], 40),
+            "a cached read evicts idle files too"
+        );
+        fill(3, 10 * MIB, later);
+        assert_eq!(cached(), (vec![2, 3], 50), "idle files go, oldest first");
+
+        for index in 4..10 {
+            fill(index, 40 * MIB, later);
+        }
+        let (files, bytes) = cached();
+        assert!(bytes <= DECODE_LIMIT / MIB, "{bytes} MiB");
+        assert!(files.contains(&9), "the file just read stays");
+        assert!(!files.contains(&2), "past the limit even recent files go");
+
+        fill(10, 300 * MIB, later + RECENT * 2);
+        assert_eq!(
+            cached(),
+            (vec![10], 300),
+            "one file larger than the limit stays alone"
+        );
     }
 }

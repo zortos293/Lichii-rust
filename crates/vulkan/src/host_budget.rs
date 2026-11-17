@@ -10,7 +10,7 @@ use gpu_allocator::MemoryLocation;
 
 use crate::device::Device;
 use crate::error::Result;
-use crate::memory::Buffer;
+use crate::memory::{Buffer, LiveMemory};
 use crate::scheduler::Scheduler;
 
 /// Host-visible bytes one rasterizer holds at most above its rings' sizes and its readbacks'
@@ -112,9 +112,12 @@ impl Oversized {
                 >= self.cap / 2
     }
 
-    /// Bytes of the buffers not freed yet.
-    pub(crate) fn bytes(&self) -> u64 {
-        self.bytes
+    /// Bytes and count of the buffers not freed yet.
+    pub(crate) fn live(&self) -> LiveMemory {
+        LiveMemory {
+            bytes: self.bytes,
+            count: self.buffers.len() as u64,
+        }
     }
 }
 
@@ -368,7 +371,7 @@ mod tests {
             last = gate.submit(&mut scheduler);
         }
         assert!(!scheduler.is_complete(last), "the gate holds the GPU back");
-        assert_eq!(oversized.bytes(), 3 * MIB);
+        assert_eq!(oversized.live().bytes, 3 * MIB);
         gate.start();
         oversized
             .alloc(&device, &mut scheduler, 6 * MIB, usage, "test")
@@ -377,12 +380,12 @@ mod tests {
             scheduler.is_complete(last),
             "it waited for every submission"
         );
-        assert_eq!(oversized.bytes(), 6 * MIB, "it alone is in flight");
+        assert_eq!(oversized.live().bytes, 6 * MIB, "it alone is in flight");
         gate.submit(&mut scheduler);
         gate.open();
         scheduler.finish().unwrap();
         oversized.reclaim(&mut scheduler);
-        assert_eq!(oversized.bytes(), 0);
+        assert_eq!(oversized.live().bytes, 0);
     }
 
     #[test]
@@ -402,12 +405,12 @@ mod tests {
             tick,
             "nothing was submitted under the operation"
         );
-        assert_eq!(oversized.bytes(), 6 * MIB);
+        assert_eq!(oversized.live().bytes, 6 * MIB);
         assert!(oversized.should_submit(tick));
         scheduler.finish().unwrap();
         oversized.reclaim(&mut scheduler);
         assert!(!oversized.should_submit(scheduler.tick()));
-        assert_eq!(oversized.bytes(), 0);
+        assert_eq!(oversized.live().bytes, 0);
     }
 
     #[test]

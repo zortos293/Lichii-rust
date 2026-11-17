@@ -7,7 +7,7 @@ use gpu_allocator::MemoryLocation;
 use crate::device::Device;
 use crate::error::Result;
 use crate::host_budget::Oversized;
-use crate::memory::Buffer;
+use crate::memory::{Buffer, LiveMemory};
 use crate::scheduler::Scheduler;
 
 /// Host-visible upload memory handed out for one transfer.
@@ -53,6 +53,11 @@ impl StagingRing {
             regions: VecDeque::new(),
             oversized: Oversized::new(oversized_cap),
         })
+    }
+
+    /// The oversized buffers not freed yet.
+    pub fn oversized(&self) -> LiveMemory {
+        self.oversized.live()
     }
 
     /// `size` bytes aligned to `align` (a power of two), valid until the work recorded in
@@ -129,11 +134,6 @@ impl StagingRing {
         self.oversized.reclaim(scheduler);
     }
 
-    /// Bytes of oversized buffers not freed yet.
-    pub fn oversized_bytes(&self) -> u64 {
-        self.oversized.bytes()
-    }
-
     /// Whether the work being recorded at `tick` holds half the oversized cap or more
     /// ([`Oversized::should_submit`]).
     pub(crate) fn should_submit(&self, tick: u64) -> bool {
@@ -161,7 +161,7 @@ mod tests {
                 let slice = ring.alloc(scheduler, SIZE, 16).unwrap();
                 assert_eq!(slice.data.len() as u64, SIZE);
             },
-            StagingRing::oversized_bytes,
+            |ring| ring.oversized().bytes,
             StagingRing::should_submit,
         );
         assert!(

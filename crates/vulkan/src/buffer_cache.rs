@@ -30,7 +30,7 @@ use crate::commands::transfer_to_all_barrier;
 use crate::device::Device;
 use crate::error::Result;
 use crate::host_budget::{Oversized, RING_OVERSIZED_CAP, Readback};
-use crate::memory::{Buffer, BufferView};
+use crate::memory::{Buffer, BufferView, LiveMemory};
 use crate::scheduler::Scheduler;
 use crate::staging::{StagingRing, StagingSlice};
 
@@ -828,11 +828,6 @@ impl BufferCache {
         self.stats
     }
 
-    /// Bytes of oversized stream buffers not freed yet.
-    pub fn oversized_stream_bytes(&self) -> u64 {
-        self.stream.oversized.bytes()
-    }
-
     /// Whether the work being recorded at `tick` holds half the stream ring's oversized cap or
     /// more ([`Oversized::should_submit`]).
     pub(crate) fn should_submit(&self, tick: u64) -> bool {
@@ -844,6 +839,11 @@ impl BufferCache {
     pub fn is_gpu_written(&self, daddr: DAddr, size: u64) -> bool {
         self.gpu_written
             .intersects(daddr, daddr.saturating_add(size))
+    }
+
+    /// The oversized stream buffers not freed yet.
+    pub fn oversized_stream(&self) -> LiveMemory {
+        self.stream.oversized.live()
     }
 
     /// The alignment storage bindings start at: [`BufferCache::storage_buffer`] rounds the
@@ -2295,7 +2295,7 @@ mod tests {
                 let slice = ring.alloc(scheduler, SIZE, 4).unwrap();
                 assert_eq!(slice.data.len() as u64, SIZE);
             },
-            |ring| ring.oversized.bytes(),
+            |ring| ring.oversized.live().bytes,
             |ring, tick| ring.oversized.should_submit(tick),
         );
         assert!(
