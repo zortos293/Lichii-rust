@@ -318,12 +318,24 @@ impl Gmmu {
     pub fn read<T: bytemuck::Pod>(&self, gpu_va: GpuVAddr) -> Result<T, GpuFault> {
         let (pte, page) = self.lookup(gpu_va);
         let offset = gpu_va & (page - 1);
+        let daddr = pte.daddr() + offset;
+        let size = size_of::<T>() as u64;
         if pte.state() == MAPPED
-            && offset + size_of::<T>() as u64 <= page
-            && let Ok(value) = self.device.read(pte.daddr() + offset)
+            && offset + size <= page
+            && (daddr & PAGE_MASK) + size <= PAGE_SIZE
+            && let Some(ptr) = self.device.translate(daddr)
         {
-            return Ok(value);
+            // SAFETY: `translate` points into the mapped device page holding `daddr`, and the
+            // value ends inside that page.
+            return Ok(unsafe { ptr.cast::<T>().read_unaligned() });
         }
+        self.read_slow(gpu_va)
+    }
+
+    /// [`Gmmu::read`] of a value its fast path cannot read: across pages, or not plainly mapped.
+    #[cold]
+    #[inline(never)]
+    fn read_slow<T: bytemuck::Pod>(&self, gpu_va: GpuVAddr) -> Result<T, GpuFault> {
         let mut value = T::zeroed();
         self.read_block(gpu_va, bytemuck::bytes_of_mut(&mut value))?;
         Ok(value)
@@ -1042,5 +1054,38 @@ mod tests {
         }
         stop.store(true, Ordering::Relaxed);
         reader.join().unwrap();
+    }
+    /// Texture-header reads through [`Gmmu::read`], the draw path's hot read. Not run by default:
+    /// `cargo test -p lichii-gpu --release --lib gmmu::tests::bench_header_reads -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_header_reads() {
+        const HEADERS: u64 = 4096;
+        const READS: u64 = 50_000_000;
+        let f = fixture();
+        let gmmu = f.gmmu(BigPageSize::Size64K);
+        gmmu.map(0x100_0000, f.daddr, 0x2_0000, PTE_KIND_PITCH, true)
+            .unwrap();
+        for index in 0..HEADERS {
+            f.space
+                .write(CPU_VA + index * 32, [index as u32; 8])
+                .unwrap();
+        }
+        let start = std::time::Instant::now();
+        let mut sum = 0u64;
+        for read in 0..READS {
+            let index = read.wrapping_mul(2_654_435_761) % HEADERS;
+            let Ok(header) = std::hint::black_box(&gmmu).read::<[u32; 8]>(0x100_0000 + index * 32)
+            else {
+                continue;
+            };
+            let header = std::hint::black_box(header);
+            sum = sum.wrapping_add(u64::from(header[0].wrapping_add(header[7])));
+        }
+        let elapsed = start.elapsed();
+        println!(
+            "texture header reads: {:.2} ns/read (sum {sum})",
+            elapsed.as_nanos() as f64 / READS as f64
+        );
     }
 }

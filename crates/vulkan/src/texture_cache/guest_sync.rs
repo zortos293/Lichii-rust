@@ -779,12 +779,15 @@ impl TextureCache {
     /// last upload is uploaded first, so the pass moves the CPU's bytes along with the GPU's.
     /// Returns false, having recorded nothing, when the pass can't move one of the images, an
     /// overlap the CPU wrote is stale itself, or removed overlaps left their texels only in
-    /// guest memory.
+    /// guest memory. Offsets of `id` in `overwritten`, which a clear is about to overwrite, are
+    /// left out where they end the shared bytes, and a pass left with nothing to move only
+    /// marks `id` current.
     pub(super) fn sync_on_gpu(
         &mut self,
         tx: &mut Transfer<'_>,
         id: ImageId,
         newer: &mut [ImageId],
+        overwritten: (u64, u64),
     ) -> Result<bool> {
         let image = self.get(id).expect("a live image id");
         let movable = |o: &CachedImage| {
@@ -830,6 +833,17 @@ impl TextureCache {
         }
         if window.0 >= window.1 {
             return Ok(false);
+        }
+        let (lo, hi) = overwritten;
+        if lo <= window.0 && window.0 < hi {
+            window.0 = hi;
+        }
+        if lo < window.1 && window.1 <= hi {
+            window.1 = lo;
+        }
+        if window.0 >= window.1 {
+            self.image(id).current = self.tick;
+            return Ok(true);
         }
         let mut linear = 4;
         let mut stencil = 4;

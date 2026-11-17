@@ -54,6 +54,7 @@ use super::environment::{EnvRead, ProgramEnv, TextureAnswers};
 use super::shader_disk::ShaderDisk;
 use super::shader_workers::{Job, Workers};
 use super::{FxBuildHasher, FxHasher};
+use crate::debug::shader_dump;
 
 /// Counts since the cache was created.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -418,12 +419,19 @@ impl ShaderCache {
             if found.is_none() {
                 forget_reads();
             }
-            found.map(|entry| (entry.module().clone(), entry.bindings_after()))
+            found.map(|entry| {
+                (
+                    entry.module().clone(),
+                    entry.bindings_after(),
+                    entry.code_ranges(),
+                )
+            })
         });
         let module = match stored {
-            Some((module, after)) => {
+            Some((module, after, ranges)) => {
                 self.stats.disk_hits += 1;
                 *bindings = after;
+                dump(&module, a, env, ranges);
                 Some(module)
             }
             None if may_skip && self.workers.is_some() && env.stage() != ShaderStage::Compute => {
@@ -453,7 +461,10 @@ impl ShaderCache {
                 self.stats.translated += 1;
                 self.stalled += start.elapsed();
                 match result {
-                    Ok(module) => Some(module),
+                    Ok(module) => {
+                        dump(&module, a, env, translated_ranges(a, env));
+                        Some(module)
+                    }
                     Err(error) => {
                         self.stats.failed += 1;
                         *bindings = first;
@@ -703,6 +714,43 @@ pub(super) fn hash_program(gmmu: &Gmmu, start: GpuVAddr, len: u64, bytes: &mut V
     bytes.resize(len as usize, 0);
     let _ = gmmu.read_block(start, bytes);
     hash_code(bytes)
+}
+
+/// With `dump_shaders` on, dumps `module` with the guest code it came from: `ranges` holds the
+/// bytes of VertexA `a` and of `env` as offsets from each program's first instruction and
+/// lengths, as [`lichii_shader::cache::CacheEntry::code_ranges`] gives them.
+fn dump(
+    module: &ShaderModule,
+    a: Option<&ProgramEnv<'_>>,
+    env: &ProgramEnv<'_>,
+    ranges: [(i64, u64); 2],
+) {
+    if !shader_dump::enabled() {
+        return;
+    }
+    let read = |env: &ProgramEnv<'_>, (offset, len): (i64, u64)| {
+        let mut bytes = vec![0; len as usize];
+        let _ = env
+            .gmmu()
+            .read_block(env.start_address().wrapping_add_signed(offset), &mut bytes);
+        bytes
+    };
+    let vertex_a = a.map(|a| read(a, ranges[0]));
+    shader_dump::write(
+        module.hash,
+        &module.spirv,
+        &read(env, ranges[1]),
+        vertex_a.as_deref(),
+    );
+}
+
+/// The ranges [`dump`] takes for programs just translated in place: what translation read.
+fn translated_ranges(a: Option<&ProgramEnv<'_>>, env: &ProgramEnv<'_>) -> [(i64, u64); 2] {
+    let range = |env: &ProgramEnv<'_>| {
+        let (start, len) = env.code_range();
+        (start.wrapping_sub(env.start_address()) as i64, len)
+    };
+    [a.map_or((0, 0), range), range(env)]
 }
 
 fn hash_code(bytes: &[u8]) -> u64 {
@@ -993,5 +1041,72 @@ mod tests {
                 }
             },
         );
+    }
+
+    #[test]
+    fn dump_shaders_writes_a_translated_program_with_its_guest_code_once() {
+        use lichii_gpu::backend::{ChannelId, ComputeContext, ConstBufferBinding, QmdVersion};
+        use lichii_gpu::gmmu::BigPageSize;
+        use lichii_memory::{DeviceAddressSpace, PhysicalMemory};
+
+        const SIZE: u64 = 1 << 16;
+        const GPU_VA: GpuVAddr = 0x4_0000_0000;
+        const EXIT: [u64; 2] = [0x0000_0000_0000_794d, 0x000f_ea00_0380_0000];
+        let physical = Arc::new(PhysicalMemory::new(SIZE).unwrap());
+        physical.commit(0, SIZE).unwrap();
+        let memory = Arc::new(DeviceAddressSpace::new(physical, 36));
+        memory.map(0x1_0000_0000, 0, SIZE);
+        let gmmu = Arc::new(Gmmu::new(memory, BigPageSize::Size64K));
+        gmmu.map(GPU_VA, 0x1_0000_0000, SIZE, 0, false).unwrap();
+        gmmu.write(GPU_VA, EXIT).unwrap();
+        let dir = std::env::temp_dir().join(format!("lichii-dump-shaders-{}", std::process::id()));
+        shader_dump::init(dir.clone());
+        let const_buffers = [ConstBufferBinding::default(); 8];
+        let qmd = [0u32; 64];
+        let ctx = ComputeContext {
+            channel: ChannelId(0),
+            memory: &gmmu,
+            program: GPU_VA,
+            grid: [1; 3],
+            block: [1; 3],
+            shared_memory_size: 0,
+            local_memory_size: 0,
+            const_buffers: &const_buffers,
+            texture_headers: 0,
+            texture_header_limit: 0,
+            samplers: 0,
+            sampler_limit: 0,
+            linked_samplers: false,
+            qmd_version: QmdVersion::V3,
+            qmd: &qmd,
+            indirect_grid: None,
+            indirect: None,
+        };
+        let mut cache = ShaderCache::new(Profile::default(), HostTranslateInfo::default());
+        let env = ProgramEnv::compute(&ctx);
+        let (_, module) = cache
+            .module(
+                None,
+                &env,
+                0,
+                RuntimeInfo::default,
+                &mut Bindings::default(),
+                false,
+            )
+            .expect("EXIT translates");
+        let read = |suffix: &str| std::fs::read(dir.join(format!("{:016x}.{suffix}", module.hash)));
+        let code = read("b.bin").unwrap();
+        assert_eq!(code[..8], EXIT[0].to_le_bytes());
+        assert_eq!(code[8..16], EXIT[1].to_le_bytes());
+        let spirv: Vec<u8> = module
+            .spirv
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        assert_eq!(read("spv").unwrap(), spirv);
+        assert!(read("a.bin").is_err(), "a compute program has no VertexA");
+        std::fs::write(dir.join(format!("{:016x}.b.bin", module.hash)), b"kept").unwrap();
+        dump(&module, None, &env, translated_ranges(None, &env));
+        assert_eq!(read("b.bin").unwrap(), b"kept", "a module is written once");
     }
 }

@@ -1389,7 +1389,21 @@ impl TextureCache {
             }
             self.take_from_aliases(tx.scheduler, found.id)?;
         } else {
-            self.refresh(tx, found.id)?;
+            let image = &self.image(found.id).info;
+            let overwritten = if discard
+                && !whole
+                && image.kind == ImageKind::D2
+                && (image.levels == 1 || info.layers == 1)
+            {
+                let last = found.layer + info.layers - 1;
+                (
+                    image.subresource_offset(found.level, found.layer),
+                    image.subresource_offset(found.level, last) + image.level_size(found.level),
+                )
+            } else {
+                (0, 0)
+            };
+            self.refresh_except(tx, found.id, overwritten)?;
         }
         let target = if self.can_rescale(found.id) {
             self.scale
@@ -2845,6 +2859,17 @@ impl TextureCache {
     /// Uploads guest memory into the image when the guest CPU or a later overlap wrote it since
     /// the last upload, then copies in what its aliases' GPU work wrote since.
     fn refresh(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
+        self.refresh_except(tx, id, (0, 0))
+    }
+
+    /// [`TextureCache::refresh`] for an image a clear is about to overwrite at the offsets
+    /// `overwritten`: syncs on the GPU take no overlap bytes there.
+    fn refresh_except(
+        &mut self,
+        tx: &mut Transfer<'_>,
+        id: ImageId,
+        overwritten: (u64, u64),
+    ) -> Result<()> {
         if self.image(id).image.is_sparse() {
             if self.image(id).cpu_dirty {
                 self.flush_buffered(tx, id)?;
@@ -2855,7 +2880,7 @@ impl TextureCache {
             image.current = tick;
             return self.take_from_aliases(tx.scheduler, id);
         }
-        self.take_from_overlaps(tx, id)?;
+        self.take_from_overlaps(tx, id, overwritten)?;
         if self.image(id).cpu_dirty {
             self.take_cpu_writes(tx, id)?;
             self.image(id).current = self.tick;
@@ -2880,7 +2905,12 @@ impl TextureCache {
     /// Readies an upload of what overlaps modified after the image last held their bytes:
     /// writes back the GPU-modified ones, and its own texels around theirs unless they cover
     /// all of it, then marks the subresources under the overlaps for upload.
-    fn take_from_overlaps(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
+    fn take_from_overlaps(
+        &mut self,
+        tx: &mut Transfer<'_>,
+        id: ImageId,
+        overwritten: (u64, u64),
+    ) -> Result<()> {
         let image = self.get(id).expect("a live image id");
         let current = image.current;
         if image.overlaps_newest <= current {
@@ -2900,7 +2930,7 @@ impl TextureCache {
             })
         }));
         self.image(id).overlaps_newest = newest;
-        if newer.is_empty() || self.sync_on_gpu(tx, id, &mut newer)? {
+        if newer.is_empty() || self.sync_on_gpu(tx, id, &mut newer, overwritten)? {
             self.overlap_scratch = newer;
             return Ok(());
         }

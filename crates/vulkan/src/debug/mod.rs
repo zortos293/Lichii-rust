@@ -1,6 +1,6 @@
 //! Graphics debugging tools, all off by default and free when off: RenderDoc frame captures
-//! ([`renderdoc`]), Nsight Aftermath GPU crash dumps, GPU fault reports and Vulkan debug names
-//! and labels.
+//! ([`renderdoc`]), Nsight Aftermath GPU crash dumps, GPU fault reports, shader dumps and Vulkan
+//! debug names and labels.
 //! [`init`] sets them up once from the settings, before the first [`crate::Instance`].
 
 pub(crate) mod aftermath;
@@ -8,6 +8,7 @@ pub(crate) mod fault;
 mod labels;
 mod library;
 pub mod renderdoc;
+pub(crate) mod shader_dump;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,7 +24,8 @@ static DEVICE_LOST: AtomicBool = AtomicBool::new(false);
 /// Sets up the tools `settings` turns on: loads RenderDoc (also when
 /// `LICHII_RENDERDOC_CAPTURE_FRAME` asks for captures), enables Aftermath crash dumps into a new
 /// folder under `crash_dumps`, asks the next devices for fault reports (vendor binaries go to
-/// `crash_dumps`) and the next instance and devices for debug labels.
+/// `crash_dumps`), dumps translated shaders next to the fault reports and asks the next
+/// instance and devices for debug labels.
 ///
 /// # Safety
 ///
@@ -32,7 +34,10 @@ static DEVICE_LOST: AtomicBool = AtomicBool::new(false);
 pub unsafe fn init(settings: &DebugSettings, crash_dumps: &Path) {
     LABELS.store(settings.vulkan_labels, Ordering::Relaxed);
     FAULT_REPORT.store(settings.gpu_fault_report, Ordering::Relaxed);
-    fault::init(crash_dumps);
+    let reports = fault::init(crash_dumps);
+    if settings.dump_shaders {
+        shader_dump::init(reports.join("shaders"));
+    }
     // SAFETY: the caller guarantees no other thread runs.
     unsafe { renderdoc::init(settings.renderdoc_hotkey) };
     if settings.nsight_aftermath {
