@@ -441,6 +441,7 @@ impl Back {
     /// Lets the engine that ran the last method finish what it holds back.
     #[inline]
     fn flush_engine(&mut self) {
+        crate::diag427::cbuf_break();
         if let Some((index, engine)) = self.last.take() {
             self.with_engine_of(index, engine, |engine, ctx| engine.flush(ctx));
         }

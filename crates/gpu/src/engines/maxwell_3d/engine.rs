@@ -30,6 +30,7 @@ const WAIT_FOR_IDLE: u32 = reg_index!(Regs, wait_for_idle);
 const FALCON4: u32 = reg_index!(Regs, falcon) + 4;
 const CB_DATA_FIRST: u32 = reg_index!(Regs, const_buffer.buffer);
 const CB_DATA_LAST: u32 = CB_DATA_FIRST + 15;
+const CB_SELECTOR_FIRST: u32 = reg_index!(Regs, const_buffer.size);
 const BIND_GROUP_STRIDE: u32 = (size_of::<BindGroup>() / 4) as u32;
 const BIND_GROUP_FIRST: u32 = reg_index!(Regs, bind_groups) + 4;
 const BIND_GROUP_LAST: u32 = BIND_GROUP_FIRST + (MAX_SHADER_STAGE as u32 - 1) * BIND_GROUP_STRIDE;
@@ -101,6 +102,9 @@ impl Maxwell3d {
         if method >= MACRO_REGISTERS_START {
             return;
         }
+        if !(CB_SELECTOR_FIRST..=CB_DATA_LAST).contains(&method) {
+            crate::diag427::cbuf_break();
+        }
         if self.draw.pending.is_some()
             && !draw::is_loop_method(method)
             && self.state.would_change(method, argument)
@@ -129,6 +133,9 @@ impl Maxwell3d {
                     | draw::INLINE_INDEX_2X16
                     | draw::INLINE_INDEX_4X8
         );
+        if !(CB_SELECTOR_FIRST..=CB_DATA_LAST).contains(&method) {
+            crate::diag427::cbuf_break();
+        }
         if !block || self.state.shadow_ram_control() == ShadowRamControl::REPLAY {
             for &argument in arguments {
                 self.call_method(ctx, method, argument);
@@ -367,6 +374,7 @@ impl Maxwell3d {
     }
 
     fn render(&mut self, ctx: &mut EngineContext<'_>, draw: &DrawParams<'_>) {
+        crate::diag427::cbuf_break();
         if let Some(condition) = self.draw_condition() {
             ctx.rasterizer.set_render_condition(condition);
             let start = ctx.activity.begin_call(RendererCall::Draw);

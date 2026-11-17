@@ -17,6 +17,7 @@ pub(super) fn upload(cb: &mut ConstantBuffer, ctx: &mut EngineContext<'_>, words
     if !written.is_empty() {
         let address = cb.address() + u64::from(offset);
         let bytes: &[u8] = bytemuck::cast_slice(written);
+        crate::diag427::cbuf_upload(address, bytes.len() as u64);
         if let Err(fault) = ctx.memory.write_block(address, bytes) {
             tracing::warn!(?fault, "constant buffer upload to unmapped GPU memory");
         }
