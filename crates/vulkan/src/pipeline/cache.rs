@@ -22,7 +22,7 @@ use lichii_common::settings::GraphicsSettings;
 use lichii_shader::{DescriptorKind, ShaderModule, ShaderStage};
 use parking_lot::{Condvar, Mutex};
 
-use super::disk::{self, Contents, DeviceIdentity};
+use super::disk::{self, Aged, Contents, DeviceIdentity};
 use super::fixed_state::{
     DEPTH_BOUNDS, DEPTH_TEST, DEPTH_WRITE, EDS2_DEPTH_BIAS, EDS2_PRIMITIVE_RESTART,
     EDS2_RASTERIZER_DISCARD, GROUP_BLEND, GROUP_EDS2, GROUP_STRIDES, GROUP_VERTEX,
@@ -902,6 +902,9 @@ pub struct PipelineCache {
     identity: DeviceIdentity,
     loaded_blob_bytes: usize,
     stored: Contents,
+    /// Per slot, the runs since a lookup last asked for its pipeline: 0 once this run looked it
+    /// up, the stored age for a prebuilt pipeline nothing drew yet. [`Self::save`] writes it.
+    ages: Vec<u16>,
     layouts: HashMap<LayoutDesc, Arc<PipelineLayout>>,
     graphics: HashMap<GraphicsPipelineKey, usize, FxBuildHasher>,
     compute: HashMap<ComputePipelineKey, usize, FxBuildHasher>,
@@ -933,6 +936,57 @@ const SAVE_FAILED: u8 = 2;
 /// How often [`PipelineCache::autosave`] writes the disk cache while its pipelines change.
 const AUTOSAVE_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Most pipeline worker threads, and so most driver pipeline compiles running at once, each
+/// holding its own driver scratch memory. The library builds fast linking needs jump the queue,
+/// so more workers mostly shorten a cold start, while competing for host threads with the guest
+/// cores, the GPU threads and the shader translation workers (also at most 4).
+const MAX_PIPELINE_WORKERS: usize = 4;
+/// Runs whose pipelines the boot prebuild builds: the last two, so one short run (a boot to the
+/// menu, a crash) does not drop the run before it.
+const PREBUILD_RUNS: u16 = 2;
+/// Most pipelines the boot prebuild queues. The rest build on first use like any miss, from the
+/// driver cache when it holds them.
+const PREBUILD_LIMIT: usize = 256;
+/// Runs in a row, the saving one included, a stored key may go unused before a save drops it.
+const KEEP_RUNS: u16 = 8;
+
+/// Pipeline workers for a host with `available` hardware threads: all but one, for the GPU
+/// thread, and between 1 and [`MAX_PIPELINE_WORKERS`].
+fn worker_count(available: usize) -> usize {
+    available.saturating_sub(1).clamp(1, MAX_PIPELINE_WORKERS)
+}
+
+/// A stored key [`PipelineCache::prebuild`] queues, by its index in [`Contents`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoredKey {
+    Graphics(usize),
+    Compute(usize),
+}
+
+/// The stored keys the boot prebuild queues: those used within the last [`PREBUILD_RUNS`]
+/// runs, most recent first, at most [`PREBUILD_LIMIT`].
+fn prebuild_selection(stored: &Contents) -> Vec<StoredKey> {
+    let graphics = stored
+        .graphics
+        .iter()
+        .map(|key| key.age)
+        .enumerate()
+        .map(|(index, age)| (age, StoredKey::Graphics(index)));
+    let compute = stored
+        .compute
+        .iter()
+        .map(|key| key.age)
+        .enumerate()
+        .map(|(index, age)| (age, StoredKey::Compute(index)));
+    let mut selected: Vec<_> = graphics
+        .chain(compute)
+        .filter(|&(age, _)| age <= PREBUILD_RUNS)
+        .collect();
+    selected.sort_by_key(|&(age, _)| age);
+    selected.truncate(PREBUILD_LIMIT);
+    selected.into_iter().map(|(_, key)| key).collect()
+}
+
 fn identity(device: &Device) -> DeviceIdentity {
     // SAFETY: `physical` belongs to this instance.
     let properties = unsafe {
@@ -949,9 +1003,10 @@ fn identity(device: &Device) -> DeviceIdentity {
     }
 }
 
-/// The disk cache at `path`, empty when it is missing, unreadable or from another device.
+/// The disk cache at `path`, empty when it is missing, unreadable or from another device, with
+/// every key one run older: this run has not used it yet.
 fn load(path: &Path, identity: &DeviceIdentity) -> Contents {
-    let stored = match std::fs::read(path) {
+    let mut stored = match std::fs::read(path) {
         Ok(bytes) => disk::decode(&bytes, identity),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => {
@@ -960,6 +1015,14 @@ fn load(path: &Path, identity: &DeviceIdentity) -> Contents {
         }
     }
     .unwrap_or_default();
+    let ages = stored
+        .graphics
+        .iter_mut()
+        .map(|key| &mut key.age)
+        .chain(stored.compute.iter_mut().map(|key| &mut key.age));
+    for age in ages {
+        *age = age.saturating_add(1);
+    }
     if !stored.graphics.is_empty() || !stored.compute.is_empty() {
         tracing::info!(
             "pipeline cache: {} graphics and {} compute pipelines, {} KiB of driver cache",
@@ -1002,9 +1065,6 @@ impl PipelineCache {
             .map(|path| load(path, &identity))
             .unwrap_or_default();
         let vk_cache = create_vk_cache(device, &stored.blob)?;
-        let worker_count = std::thread::available_parallelism()
-            .map_or(1, |n| n.get().saturating_sub(1))
-            .max(1);
         Ok(Self {
             ctx: Arc::new(Context {
                 device: device.clone(),
@@ -1026,7 +1086,7 @@ impl PipelineCache {
                 gate: parking_lot::RwLock::new(()),
             }),
             async_compile: settings.async_shader_compilation,
-            worker_count,
+            worker_count: worker_count(std::thread::available_parallelism().map_or(1, |n| n.get())),
             workers: None,
             path,
             identity,
@@ -1035,6 +1095,7 @@ impl PipelineCache {
                 blob: Vec::new(),
                 ..stored
             },
+            ages: Vec::new(),
             layouts: HashMap::new(),
             graphics: HashMap::default(),
             compute: HashMap::default(),
@@ -1085,6 +1146,7 @@ impl PipelineCache {
             Some(&index) => index,
             None => self.timed_insert(key, shaders),
         };
+        self.ages[index] = 0;
         if self.async_compile && self.slots[index].get().is_none() {
             if self.ctx.features.fast_link && self.fast_linked(index, key, shaders).is_some() {
                 return match self.linking.get(&index) {
@@ -1110,6 +1172,7 @@ impl PipelineCache {
             Some(&index) => index,
             None => self.timed_insert(key, shaders),
         };
+        self.ages[index] = 0;
         if self.async_compile && self.slots[index].get().is_none() {
             self.blocked += 1;
             #[cfg(test)]
@@ -1296,6 +1359,7 @@ impl PipelineCache {
             Some(&index) => index,
             None => self.insert_compute(key, shader),
         };
+        self.ages[index] = 0;
         self.ready(index)
     }
 
@@ -1377,6 +1441,7 @@ impl PipelineCache {
     fn queue(&mut self, build: Option<Build>) {
         let slot = Arc::new(Slot::new());
         self.slots.push(slot.clone());
+        self.ages.push(0);
         let Some(build) = build else {
             self.ctx.shared.failed.fetch_add(1, Ordering::Relaxed);
             let _ = slot.set(None);
@@ -1469,40 +1534,51 @@ impl PipelineCache {
         self.stored.graphics.len() + self.stored.compute.len()
     }
 
-    /// Queues every pipeline the disk cache named whose shaders `resolve` returns, asynchronously
-    /// when asynchronous compilation is on; returns how many were queued.
+    /// Queues the pipelines the disk cache names from the last [`PREBUILD_RUNS`] runs, most
+    /// recent first and at most [`PREBUILD_LIMIT`], whose shaders `resolve` returns,
+    /// asynchronously when asynchronous compilation is on; returns how many were queued. The
+    /// others build on first use.
     pub fn prebuild(&mut self, mut resolve: impl FnMut(u64) -> Option<Arc<ShaderModule>>) -> usize {
         let stored = std::mem::take(&mut self.stored);
         let mut queued = 0;
-        for key in &stored.graphics {
-            if self.graphics.contains_key(key) {
-                continue;
-            }
-            let mut shaders = GraphicsShaders::default();
-            let resolved = key.shaders.iter().zip(&mut shaders).all(|(&hash, slot)| {
-                *slot = (hash != 0).then(|| resolve(hash)).flatten();
-                hash == 0 || slot.is_some()
-            });
-            if resolved {
-                self.insert_graphics(key, &shaders, false);
-                queued += 1;
-            }
-        }
-        for key in &stored.compute {
-            if self.compute.contains_key(key) {
-                continue;
-            }
-            if let Some(shader) = resolve(key.shader) {
-                self.insert_compute(key, &shader);
-                queued += 1;
-            }
+        for selected in prebuild_selection(&stored) {
+            let (index, age) = match selected {
+                StoredKey::Graphics(i) => {
+                    let Aged { key, age } = &stored.graphics[i];
+                    if self.graphics.contains_key(key) {
+                        continue;
+                    }
+                    let mut shaders = GraphicsShaders::default();
+                    let resolved = key.shaders.iter().zip(&mut shaders).all(|(&hash, slot)| {
+                        *slot = (hash != 0).then(|| resolve(hash)).flatten();
+                        hash == 0 || slot.is_some()
+                    });
+                    if !resolved {
+                        continue;
+                    }
+                    (self.insert_graphics(key, &shaders, false), *age)
+                }
+                StoredKey::Compute(i) => {
+                    let Aged { key, age } = &stored.compute[i];
+                    if self.compute.contains_key(key) {
+                        continue;
+                    }
+                    let Some(shader) = resolve(key.shader) else {
+                        continue;
+                    };
+                    (self.insert_compute(key, &shader), *age)
+                }
+            };
+            self.ages[index] = age;
+            queued += 1;
         }
         self.stored = stored;
         queued
     }
 
     /// Writes the driver cache and the keys of every pipeline that did not fail (this run's
-    /// and those the file named before) to the disk cache. Does nothing when it is off.
+    /// and those the file named before, less those unused for [`KEEP_RUNS`] runs) to the disk
+    /// cache. Does nothing when it is off.
     pub fn save(&self) -> io::Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
@@ -1556,33 +1632,43 @@ impl PipelineCache {
         self.next_save = Some(now + AUTOSAVE_INTERVAL);
     }
 
-    /// The pipeline keys [`Self::save`] writes, without the driver cache.
+    /// The pipeline keys [`Self::save`] writes, with their ages, without the driver cache.
     fn keys(&self) -> Contents {
         let failed = |index: usize| matches!(self.slots[index].get(), Some(None));
-        let mut graphics: Vec<_> = self
+        let graphics = self
             .graphics
             .iter()
             .filter(|&(_, &index)| !failed(index))
-            .map(|(key, _)| *key)
+            .map(|(&key, &index)| Aged {
+                key,
+                age: self.ages[index],
+            })
+            .chain(
+                self.stored
+                    .graphics
+                    .iter()
+                    .copied()
+                    .filter(|stored| !self.graphics.contains_key(&stored.key)),
+            )
+            .filter(|key| key.age < KEEP_RUNS)
             .collect();
-        graphics.extend(
-            self.stored
-                .graphics
-                .iter()
-                .filter(|key| !self.graphics.contains_key(*key)),
-        );
-        let mut compute: Vec<_> = self
+        let compute = self
             .compute
             .iter()
             .filter(|&(_, &index)| !failed(index))
-            .map(|(key, _)| *key)
+            .map(|(&key, &index)| Aged {
+                key,
+                age: self.ages[index],
+            })
+            .chain(
+                self.stored
+                    .compute
+                    .iter()
+                    .copied()
+                    .filter(|stored| !self.compute.contains_key(&stored.key)),
+            )
+            .filter(|key| key.age < KEEP_RUNS)
             .collect();
-        compute.extend(
-            self.stored
-                .compute
-                .iter()
-                .filter(|key| !self.compute.contains_key(*key)),
-        );
         Contents {
             graphics,
             compute,
@@ -2449,7 +2535,10 @@ mod tests {
         let stored = disk::decode(&std::fs::read(&path).unwrap(), &identity(&device))
             .expect("this device's file");
         assert_eq!(stored.graphics.len(), keys.len());
-        assert!(keys.iter().all(|key| stored.graphics.contains(key)));
+        assert!(
+            keys.iter()
+                .all(|&key| stored.graphics.contains(&Aged { key, age: 0 }))
+        );
         assert!(stored.blob.len() >= 32, "the driver cache is written too");
         std::fs::remove_file(&path).unwrap();
         cache.autosave(start + AUTOSAVE_INTERVAL * 4);
@@ -2538,8 +2627,17 @@ mod tests {
         let file = std::fs::read(&path).unwrap();
         let stored = disk::decode(&file, &identity(&device)).expect("this device's file");
         assert_eq!(stored.graphics.len(), keys.len());
-        assert!(keys.iter().all(|key| stored.graphics.contains(key)));
-        assert_eq!(stored.compute, [compute_key()]);
+        assert!(
+            keys.iter()
+                .all(|&key| stored.graphics.contains(&Aged { key, age: 0 }))
+        );
+        assert_eq!(
+            stored.compute,
+            [Aged {
+                key: compute_key(),
+                age: 0
+            }]
+        );
         let blob = &stored.blob;
         assert!(
             blob.len() >= 32,
@@ -2619,6 +2717,129 @@ mod tests {
         assert_eq!(
             rewritten[28], file[28],
             "the next save writes the current driver's header"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(device.instance().validation_errors(), 0);
+    }
+
+    #[test]
+    fn worker_count_leaves_a_thread_and_stays_within_the_cap() {
+        assert_eq!(
+            [0, 1, 2, 3, 5, 12, 24, 128].map(worker_count),
+            [1, 1, 1, 2, 4, 4, 4, 4]
+        );
+    }
+
+    #[test]
+    fn prebuild_selects_recent_keys_most_recent_first_up_to_the_limit() {
+        use StoredKey::{Compute, Graphics};
+        let contents = |graphics: &[u16], compute: &[u16]| Contents {
+            graphics: graphics
+                .iter()
+                .map(|&age| Aged {
+                    key: bytemuck::Zeroable::zeroed(),
+                    age,
+                })
+                .collect(),
+            compute: compute
+                .iter()
+                .map(|&age| Aged {
+                    key: compute_key(),
+                    age,
+                })
+                .collect(),
+            blob: Vec::new(),
+        };
+        assert_eq!(
+            prebuild_selection(&contents(
+                &[3, 1, disk::UNRECORDED_AGE, 2, 1],
+                &[2, 1, KEEP_RUNS]
+            )),
+            [
+                Graphics(1),
+                Graphics(4),
+                Compute(1),
+                Graphics(3),
+                Compute(0)
+            ],
+            "keys from the last two runs, the last run's first"
+        );
+        let selected = prebuild_selection(&contents(&[2; PREBUILD_LIMIT], &[1; 10]));
+        assert_eq!(
+            selected,
+            (0..10)
+                .map(Compute)
+                .chain((0..PREBUILD_LIMIT - 10).map(Graphics))
+                .collect::<Vec<_>>(),
+            "the cap keeps the most recent keys"
+        );
+    }
+
+    #[test]
+    fn saves_age_unused_keys_and_drop_stale_ones() {
+        let Some(device) = device() else { return };
+        let dir = temp_dir("pipeline-ages");
+        let shaders = present_shaders();
+        let cache = PipelineCache::new(&device, &settings(false), None, None).unwrap();
+        let keys: Vec<_> = variants(3)
+            .iter()
+            .map(|regs| key(&cache, regs, &shaders))
+            .collect();
+        drop(cache);
+        let [drawn, prebuilt, unrecorded] = keys[..] else {
+            unreachable!()
+        };
+        let stale = |shader: u64| {
+            let mut key = drawn;
+            key.shaders[0] = shader;
+            key
+        };
+        let aged = |key, age| Aged { key, age };
+        let stored = Contents {
+            graphics: vec![
+                aged(drawn, 4),
+                aged(prebuilt, 0),
+                aged(unrecorded, disk::UNRECORDED_AGE),
+                aged(stale(0xa), KEEP_RUNS - 2),
+                aged(stale(0xb), KEEP_RUNS - 1),
+            ],
+            compute: vec![Aged {
+                key: compute_key(),
+                age: disk::UNRECORDED_AGE,
+            }],
+            blob: Vec::new(),
+        };
+        let path = dir.join(FILE_NAME);
+        disk::write_atomic(&path, &disk::encode(&identity(&device), &stored)).unwrap();
+        {
+            let mut cache =
+                PipelineCache::new(&device, &settings(false), Some(&dir), None).unwrap();
+            assert_eq!(cache.stored_pipelines(), 6);
+            assert_eq!(
+                cache.prebuild(resolve),
+                1,
+                "only the key the last run used; unrecorded ages count as old"
+            );
+            assert!(cache.graphics(&drawn, &shaders).is_some());
+            assert!(cache.compute(&compute_key(), &compute_shader()).is_some());
+            assert_eq!(cache.stats().built, 3, "the others build on first use");
+        }
+        let saved = disk::decode(&std::fs::read(&path).unwrap(), &identity(&device))
+            .expect("this device's file");
+        let ages: HashMap<_, _> = saved.graphics.iter().map(|k| (k.key, k.age)).collect();
+        assert_eq!(
+            ages,
+            HashMap::from([(drawn, 0), (prebuilt, 1), (stale(0xa), KEEP_RUNS - 1)]),
+            "a lookup makes a key new, an undrawn prebuild ages, a key unused for KEEP_RUNS \
+             runs and an unrecorded one nobody drew are dropped"
+        );
+        assert_eq!(
+            saved.compute,
+            [Aged {
+                key: compute_key(),
+                age: 0
+            }],
+            "a drawn key of a version 1 file is kept"
         );
         std::fs::remove_dir_all(dir).unwrap();
         assert_eq!(device.instance().validation_errors(), 0);
