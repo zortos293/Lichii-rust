@@ -724,4 +724,23 @@ mod tests {
         assert!(scheduler.record_rendering(key(8), &info(8)).unwrap().1);
         scheduler.finish().unwrap();
     }
+
+    #[test]
+    fn barriers_with_nothing_recorded_open_the_next_command_buffer() {
+        let Some(device) = device() else { return };
+        let mut scheduler = Scheduler::new(&device).unwrap();
+        assert!(!scheduler.barrier().unwrap(), "nothing is being recorded");
+        assert!(scheduler.barrier);
+        assert_eq!(scheduler.submitted_tick(), Some(0));
+        let cmd = scheduler.record().unwrap();
+        assert!(!scheduler.barrier, "the new command buffer starts with it");
+        assert!(
+            scheduler.barrier().unwrap(),
+            "recorded at once while recording"
+        );
+        assert!(!scheduler.barrier);
+        assert_eq!(scheduler.record().unwrap(), cmd);
+        scheduler.finish().unwrap();
+        assert_eq!(device.instance().validation_errors(), 0);
+    }
 }
