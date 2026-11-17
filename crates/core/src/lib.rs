@@ -127,7 +127,7 @@ impl System {
     /// Boots an already loaded title.
     pub fn from_image(
         settings: Arc<Settings>,
-        image: ProgramImage,
+        mut image: ProgramImage,
         host: Host,
     ) -> Result<Self, SystemError> {
         let Host {
@@ -135,23 +135,22 @@ impl System {
             npad,
             perf,
         } = host;
-        let program = Arc::new(image);
-        let console = match program.generation {
+        let console = match image.generation {
             ConsoleGeneration::Switch2 => ConsoleGeneration::Switch2,
             ConsoleGeneration::Switch1 => settings.system.preferred_console,
         };
-        let dram_size = settings.system.memory_layout.dram_size(console);
+        let dram_size = settings.system.memory_layout.dram_size(image.generation);
         tracing::info!(
-            program_id = format_args!("{:016x}", program.program_id),
-            name = %program.name,
-            title = ?program.generation,
+            program_id = format_args!("{:016x}", image.program_id),
+            name = %image.name,
+            title = ?image.generation,
             ?console,
             dram_gib = dram_size >> 30,
-            modules = program.modules.len(),
+            modules = image.modules.len(),
             "booting"
         );
 
-        let timing = Arc::new(CoreTiming::new(program.generation));
+        let timing = Arc::new(CoreTiming::new(image.generation));
         let exit = Arc::new(ExitSignal::default());
         let backend = settings.cpu.backend;
         let kernel = Kernel::new(KernelConfig {
@@ -172,8 +171,12 @@ impl System {
 
         let boot = |stage| move |code| SystemError::Boot { stage, code };
         let process = kernel
-            .create_process(&program)
+            .create_process(&image)
             .map_err(boot("creating the process"))?;
+        for module in &mut image.modules {
+            module.image = Vec::new();
+        }
+        let program = Arc::new(image);
         tracing::info!(
             process = process.name(),
             entry = format_args!("{:#x}", process.entry()),

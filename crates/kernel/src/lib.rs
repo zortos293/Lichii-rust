@@ -430,6 +430,8 @@ const STALLED_AFTER: Duration = Duration::from_secs(2);
 const TRACE_LOG_PERIOD: Duration = Duration::from_secs(5);
 /// How often the watchdog trims DRAM: pages free for a whole period give their host memory back.
 const TRIM_PERIOD: Duration = Duration::from_secs(1);
+/// How often the watchdog logs the host memory the process uses next to the guest's.
+const MEMORY_LOG_PERIOD: Duration = Duration::from_secs(10);
 /// How many consecutive block boundaries the watchdog samples on each core running guest code.
 const LIVE_PC_SAMPLES: usize = 16;
 /// How long the watchdog waits for a core to reach a block boundary.
@@ -582,22 +584,45 @@ impl KernelInner {
         }
     }
 
+    /// Logs the process's private and resident host memory beside the host memory backing guest
+    /// DRAM and what each pool has handed out, so a log shows whether growth is the guest's or
+    /// the emulator's own.
+    fn log_memory(&self) {
+        let used = |pool| (self.memory.size(pool) - self.memory.free_size(pool)) >> 20;
+        let process = lichii_memory::process_memory().unwrap_or_default();
+        tracing::info!(
+            target: "memory",
+            private_mib = process.private >> 20,
+            resident_mib = process.resident >> 20,
+            guest_backing_mib = self.physical.host_bytes() >> 20,
+            application_mib = used(Pool::Application),
+            system_mib = used(Pool::Applet) + used(Pool::System) + used(Pool::SystemNonSecure),
+            "memory"
+        );
+    }
+
     /// The kernel watchdog: logs every thread once when a core has kept running a thread that its
     /// best queued thread outranks (or idled with a queued thread) for [`STALLED_AFTER`], and
     /// every [`TRACE_LOG_PERIOD`] under `debug.svc_trace` or `LICHII_LIVE_PC`. Each look is
     /// one uncontended `try_lock` per core; the cores' own paths do no watchdog work. Every
-    /// [`TRIM_PERIOD`] it also trims DRAM ([`MemoryManager::trim`]), off the guest's threads.
+    /// [`TRIM_PERIOD`] it also trims DRAM ([`MemoryManager::trim`]), off the guest's threads, and
+    /// every [`MEMORY_LOG_PERIOD`] it logs memory use ([`Self::log_memory`]).
     fn watch(&self) {
         let mut stalled_since: Vec<Option<Instant>> = vec![None; self.scheduler.core_count()];
         let mut warned = false;
         let mut logged = Instant::now();
         let mut trimmed = Instant::now();
+        let mut memory_logged = Instant::now();
         while !self.scheduler.is_shut_down() {
             std::thread::park_timeout(WATCH_PERIOD);
             let now = Instant::now();
             if now.duration_since(trimmed) >= TRIM_PERIOD {
                 trimmed = now;
                 self.memory.trim();
+            }
+            if now.duration_since(memory_logged) >= MEMORY_LOG_PERIOD {
+                memory_logged = now;
+                self.log_memory();
             }
             let outranked = if self.scheduler.is_paused() {
                 0
