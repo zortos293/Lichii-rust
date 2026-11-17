@@ -905,6 +905,9 @@ pub struct PipelineCache {
     /// Per slot, the runs since a lookup last asked for its pipeline: 0 once this run looked it
     /// up, the stored age for a prebuilt pipeline nothing drew yet. [`Self::save`] writes it.
     ages: Vec<u16>,
+    /// Lookups that made an older pipeline new again in [`Self::ages`], so [`Self::autosave`]
+    /// writes the change.
+    renewed: u64,
     layouts: HashMap<LayoutDesc, Arc<PipelineLayout>>,
     graphics: HashMap<GraphicsPipelineKey, usize, FxBuildHasher>,
     compute: HashMap<ComputePipelineKey, usize, FxBuildHasher>,
@@ -921,9 +924,9 @@ pub struct PipelineCache {
     /// Run by tests when a [`Self::graphics_waiting`] lookup is about to wait.
     #[cfg(test)]
     on_block: Option<Box<dyn FnOnce() + Send>>,
-    /// Pipeline count and driver compilations at the last [`Self::autosave`] write, or
-    /// `None` when that write failed.
-    saved: Option<(usize, u64)>,
+    /// Pipeline count, driver compilations and [`Self::renewed`] at the last
+    /// [`Self::autosave`] write, or `None` when that write failed.
+    saved: Option<(usize, u64, u64)>,
     next_save: Option<Instant>,
     /// [`SAVE_IDLE`], [`SAVE_RUNNING`] or [`SAVE_FAILED`]: the last [`Self::autosave`] write.
     save: Arc<AtomicU8>,
@@ -1096,6 +1099,7 @@ impl PipelineCache {
                 ..stored
             },
             ages: Vec::new(),
+            renewed: 0,
             layouts: HashMap::new(),
             graphics: HashMap::default(),
             compute: HashMap::default(),
@@ -1107,7 +1111,7 @@ impl PipelineCache {
             stalled: Duration::ZERO,
             #[cfg(test)]
             on_block: None,
-            saved: Some((0, 0)),
+            saved: Some((0, 0, 0)),
             next_save: None,
             save: Arc::new(AtomicU8::new(SAVE_IDLE)),
         })
@@ -1146,7 +1150,7 @@ impl PipelineCache {
             Some(&index) => index,
             None => self.timed_insert(key, shaders),
         };
-        self.ages[index] = 0;
+        self.renew(index);
         if self.async_compile && self.slots[index].get().is_none() {
             if self.ctx.features.fast_link && self.fast_linked(index, key, shaders).is_some() {
                 return match self.linking.get(&index) {
@@ -1172,7 +1176,7 @@ impl PipelineCache {
             Some(&index) => index,
             None => self.timed_insert(key, shaders),
         };
-        self.ages[index] = 0;
+        self.renew(index);
         if self.async_compile && self.slots[index].get().is_none() {
             self.blocked += 1;
             #[cfg(test)]
@@ -1359,8 +1363,16 @@ impl PipelineCache {
             Some(&index) => index,
             None => self.insert_compute(key, shader),
         };
-        self.ages[index] = 0;
+        self.renew(index);
         self.ready(index)
+    }
+
+    /// Marks the pipeline in slot `index` as used by this run.
+    fn renew(&mut self, index: usize) {
+        if self.ages[index] != 0 {
+            self.ages[index] = 0;
+            self.renewed += 1;
+        }
     }
 
     fn ready(&self, index: usize) -> Option<&Pipeline> {
@@ -1587,8 +1599,9 @@ impl PipelineCache {
     }
 
     /// Writes the disk cache on a pipeline worker once [`AUTOSAVE_INTERVAL`] passed since the
-    /// last write and pipelines were added or compiled since, so a run that never drops the
-    /// cache (a killed process) keeps what it built. Call it once a frame with the time.
+    /// last write and pipelines were added, compiled or used again since, so a run that never
+    /// drops the cache (a killed process) keeps what it built and used. Call it once a frame with
+    /// the time.
     pub fn autosave(&mut self, now: Instant) {
         let Some(path) = &self.path else {
             return;
@@ -1608,6 +1621,7 @@ impl PipelineCache {
         let state = Some((
             self.graphics.len() + self.compute.len(),
             self.ctx.shared.compiled.load(Ordering::Relaxed),
+            self.renewed,
         ));
         let (false, Some(workers)) = (state == self.saved, &self.workers) else {
             return;
@@ -2546,6 +2560,50 @@ mod tests {
             cache.save.load(Ordering::Acquire) == SAVE_IDLE && !path.exists(),
             "an unchanged cache is not written again"
         );
+    }
+
+    #[test]
+    fn autosave_writes_a_prebuilt_pipeline_drawn_after_the_last_write() {
+        let Some(device) = device() else { return };
+        let dir = temp_dir("pipeline-autosave-renew");
+        let shaders = present_shaders();
+        let cache = PipelineCache::new(&device, &settings(true), None, None).unwrap();
+        let key = key(&cache, &Regs::with_defaults(), &shaders);
+        drop(cache);
+        let path = dir.join(FILE_NAME);
+        let stored = Contents {
+            graphics: vec![Aged { key, age: 0 }],
+            ..Contents::default()
+        };
+        disk::write_atomic(&path, &disk::encode(&identity(&device), &stored)).unwrap();
+        let mut cache = PipelineCache::new(&device, &settings(true), Some(&dir), None).unwrap();
+        assert_eq!(cache.prebuild(resolve), 1);
+        cache.wait_for_builds();
+        let saved_age = |cache: &mut PipelineCache, at: Instant| {
+            cache.autosave(at);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while cache.save.load(Ordering::Acquire) == SAVE_RUNNING && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let saved = disk::decode(&std::fs::read(&path).unwrap(), &identity(&device)).unwrap();
+            saved.graphics[0].age
+        };
+        let start = Instant::now();
+        cache.autosave(start);
+        assert_eq!(
+            saved_age(&mut cache, start + AUTOSAVE_INTERVAL),
+            1,
+            "prebuilt, not drawn"
+        );
+        assert!(cache.graphics(&key, &shaders).is_some());
+        assert_eq!(
+            saved_age(&mut cache, start + AUTOSAVE_INTERVAL * 2),
+            0,
+            "a draw of a pipeline already built is written too"
+        );
+        drop(cache);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(device.instance().validation_errors(), 0);
     }
 
     #[test]
