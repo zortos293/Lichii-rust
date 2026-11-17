@@ -1275,6 +1275,9 @@ impl TextureCache {
 
     /// The image a render target or depth target writes, at the scale the rules allow.
     /// `discard` skips uploading guest data the caller overwrites entirely (a full clear).
+    /// An image the GPU wrote before keeps its own texels where overlaps that lay the shared
+    /// bytes out on another texel grid wrote them since, as the C++ cache does with bad
+    /// overlaps: only reads of it take them.
     pub fn render_target(
         &mut self,
         tx: &mut Transfer<'_>,
@@ -1313,7 +1316,20 @@ impl TextureCache {
             image.cpu_dirty = false;
             image.current = tick;
         }
-        self.refresh(tx, found.id)?;
+        let keep_own = usage == Usage::Target
+            && {
+                let image = self.image(found.id);
+                image.modified != 0 && !image.image.is_sparse()
+            }
+            && self.newer_overlaps_reinterpret(found.id);
+        if keep_own {
+            if self.image(found.id).cpu_dirty {
+                self.take_cpu_writes(tx, found.id)?;
+            }
+            self.take_from_aliases(tx.scheduler, found.id)?;
+        } else {
+            self.refresh(tx, found.id)?;
+        }
         let target = if self.can_rescale(found.id) {
             self.scale
         } else {
@@ -2834,6 +2850,37 @@ impl TextureCache {
             .overlaps
             .iter()
             .any(|&o| self.get(o).expect("overlaps are live").modified > image.current)
+    }
+
+    /// Whether every overlap modified since `id` last held the shared bytes lays its texels out
+    /// on another grid (row width, block or tiling), so its bytes are no texels of `id`. Like
+    /// the C++ cache's bad overlaps, only single-level images qualify: a smaller image can be a
+    /// level of a mip chain at another grid.
+    fn newer_overlaps_reinterpret(&self, id: ImageId) -> bool {
+        let image = self.get(id).expect("a live image id");
+        if image.info.levels != 1 {
+            return false;
+        }
+        if image.overlaps_newest <= image.current {
+            return true;
+        }
+        let grid = |info: &ImageInfo| {
+            let format = info.format;
+            (
+                info.layout,
+                info.width,
+                format.bytes_per_block(),
+                format.block_width(),
+                format.block_height(),
+            )
+        };
+        let own = grid(&image.info);
+        image.overlaps.iter().all(|&o| {
+            let o = self.get(o).expect("overlaps are live");
+            o.image.is_sparse()
+                || o.modified <= image.current
+                || (o.info.levels == 1 && grid(&o.info) != own)
+        })
     }
 
     /// Whether the segments of the `newer` images cover every byte of `id`.
