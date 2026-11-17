@@ -1,5 +1,5 @@
-//! 2D engine blits on the GPU: one scaled `vkCmdBlitImage` between two cached images, for formats
-//! the host blits as they are, or a gather of raw texels at the engine's own nearest sample
+//! 2D engine blits on the GPU: one scaled `vkCmdBlitImage` between two cached images, nearest or
+//! bilinear filtered, for formats the host blits as they are, or a gather of raw texels at the engine's own nearest sample
 //! positions, which `vkCmdBlitImage` can't reproduce.
 
 use ash::vk;
@@ -8,7 +8,10 @@ use lichii_gpu::gmmu::{Gmmu, RangeTarget};
 use lichii_texture::{Numeric, PixelFormat};
 
 use super::guest_sync::{barrier, ensure};
-use super::{Found, ImageInfo, ImageKind, ResolutionScale, Segment, TextureCache, Transfer, Usage};
+use super::{
+    CachedImage, Found, ImageInfo, ImageKind, ResolutionScale, Segment, TextureCache, Transfer,
+    Usage,
+};
 use crate::commands::ImageAccess;
 use crate::descriptors::DescriptorAllocator;
 use crate::device::Device;
@@ -41,6 +44,15 @@ pub struct NearestSampling {
     pub width: u32,
     pub height: u32,
 }
+
+/// Transfer reads and writes of two subresources of one image, which share its layout.
+const TRANSFER_GENERAL: ImageAccess = ImageAccess {
+    layout: vk::ImageLayout::GENERAL,
+    stage: vk::PipelineStageFlags2::ALL_TRANSFER,
+    access: vk::AccessFlags2::from_raw(
+        vk::AccessFlags2::TRANSFER_READ.as_raw() | vk::AccessFlags2::TRANSFER_WRITE.as_raw(),
+    ),
+};
 
 /// The workgroup size of `blit_gather.comp`.
 const GATHER_GROUP: u32 = 8;
@@ -100,27 +112,34 @@ fn words(value: i64) -> [u32; 2] {
 }
 
 impl TextureCache {
-    /// Blits `src.rect` over `dst.rect` on the GPU, sampling the nearest texel.
+    /// Blits `src.rect` over `dst.rect` on the GPU with `filter`, mapping destination texel
+    /// centres onto the source rectangle as the host sampler does.
     /// `Ok(false)` when the cache cannot, and the caller blits in software: a format the host
-    /// does not blit as it is, a source no GPU work wrote (guest memory holds its texels, which
-    /// the software blit reads without an upload), an image the lookup resolves to another
-    /// format, a rectangle outside its image, or one image on both sides.
+    /// does not blit as it is, a linear filter over a source that is not a filterable float or
+    /// normalized colour format, guest data into memory no cached image covers (see
+    /// [`TextureCache::blit_images`]), an image the lookup resolves to another format, a
+    /// rectangle outside its image, or one subresource on both sides. Two levels or layers of one
+    /// image blit in the GENERAL layout, as a mip chain's downscales do.
     pub fn blit(
         &mut self,
         tx: &mut Transfer<'_>,
         gmmu: &Gmmu,
         src: &BlitSide,
         dst: &BlitSide,
+        filter: vk::Filter,
     ) -> Result<bool> {
         let src_host = self.host(src.info.format);
         let dst_host = self.host(dst.info.format);
         if src.info.kind != ImageKind::D2
             || dst.info.kind != ImageKind::D2
             || !self.blittable(src.info.format, src_host, dst.info.format, dst_host)
+            || (filter == vk::Filter::LINEAR && !self.filterable(src.info.format, src_host))
         {
             return Ok(false);
         }
-        let Some((source, target)) = self.blit_images(tx, gmmu, src.gpu_va, &src.info, dst)? else {
+        let Some((source, target)) =
+            self.blit_images(tx, gmmu, src.gpu_va, &src.info, dst, true)?
+        else {
             return Ok(false);
         };
         let (Some(src_offsets), Some(dst_offsets)) = (
@@ -131,8 +150,13 @@ impl TextureCache {
         };
         let device = self.device.clone();
         let cmd = tx.scheduler.record()?;
-        let src_image = self.prepare_live(cmd, source.id, ImageAccess::TRANSFER_SRC);
-        let dst_image = self.prepare_live(cmd, target.id, ImageAccess::TRANSFER_DST);
+        let (src_access, dst_access) = if source.id == target.id {
+            (TRANSFER_GENERAL, TRANSFER_GENERAL)
+        } else {
+            (ImageAccess::TRANSFER_SRC, ImageAccess::TRANSFER_DST)
+        };
+        let src_image = self.prepare_live(cmd, source.id, src_access);
+        let dst_image = self.prepare_live(cmd, target.id, dst_access);
         let layers = |found: Found, format: vk::Format| vk::ImageSubresourceLayers {
             aspect_mask: aspect_of(format),
             mip_level: found.level,
@@ -145,17 +169,18 @@ impl TextureCache {
             dst_subresource: layers(target, dst_host.format),
             dst_offsets,
         };
-        // SAFETY: the source is in TRANSFER_SRC and the target in TRANSFER_DST layout, they are
-        // different images, and both offset pairs lie inside their subresources.
+        // SAFETY: the source and target are in the layouts given, both GENERAL when they are
+        // different subresources of one image, and both offset pairs lie inside their
+        // subresources.
         unsafe {
             device.raw.cmd_blit_image(
                 cmd,
                 src_image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                src_access.layout,
                 dst_image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                dst_access.layout,
                 &[region],
-                vk::Filter::NEAREST,
+                filter,
             );
         }
         self.mark_modified(target.id);
@@ -205,7 +230,7 @@ impl TextureCache {
         ) else {
             return Ok(false);
         };
-        let Some((source, target)) = self.blit_images(tx, gmmu, src_va, src, dst)? else {
+        let Some((source, target)) = self.blit_images(tx, gmmu, src_va, src, dst, false)? else {
             return Ok(false);
         };
         let holds = |found: Found, width: u32, height: u32| {
@@ -347,9 +372,13 @@ impl TextureCache {
         Ok(true)
     }
 
-    /// The source and target of a blit into `dst`: `None` when no GPU work wrote the source,
-    /// either lookup fails, or one image is on both sides. The target is readied as a render
-    /// target, discarding its contents when the blit covers all of it.
+    /// The source and target of a blit into `dst`: `None` when the source is guest data (no GPU
+    /// work wrote it) and no cached image covers the destination, so the software blit keeps it
+    /// all in guest memory without an upload; when either lookup fails; or when one image is on
+    /// both sides, unless `share` lets two subresources of one image pass. Guest data into a
+    /// cached image blits on the GPU, uploading the source once instead of swizzling the target
+    /// in software and uploading it again for the GPU that reads it. The target is readied as a
+    /// render target, discarding its contents when the blit covers all of it.
     fn blit_images(
         &mut self,
         tx: &mut Transfer<'_>,
@@ -357,8 +386,11 @@ impl TextureCache {
         src_va: GpuVAddr,
         src: &ImageInfo,
         dst: &BlitSide,
+        share: bool,
     ) -> Result<Option<(Found, Found)>> {
-        if !self.gpu_holds(gmmu, src_va, src.size_bytes()) {
+        if !self.cached_over(gmmu, src_va, src.size_bytes(), |image| image.gpu_modified)
+            && !self.cached_over(gmmu, dst.gpu_va, dst.info.size_bytes(), |_| true)
+        {
             return Ok(None);
         }
         let Some(source) = self.find(tx, gmmu, src_va, src)? else {
@@ -369,7 +401,9 @@ impl TextureCache {
         else {
             return Ok(None);
         };
-        if source.id == target.id {
+        if source.id == target.id
+            && (!share || (source.level, source.layer) == (target.level, target.layer))
+        {
             return Ok(None);
         }
         let whole = dst.rect == [0, 0, dst.info.width as i32, dst.info.height as i32];
@@ -378,9 +412,14 @@ impl TextureCache {
             .map(|target| (source, target)))
     }
 
-    /// Whether a GPU-modified image overlaps the `size` bytes at `gpu_va`, so texels there are
-    /// newer on the GPU than in guest memory.
-    fn gpu_holds(&mut self, gmmu: &Gmmu, gpu_va: GpuVAddr, size: u64) -> bool {
+    /// Whether a cached image for which `pick` holds overlaps the `size` bytes at `gpu_va`.
+    fn cached_over(
+        &mut self,
+        gmmu: &Gmmu,
+        gpu_va: GpuVAddr,
+        size: u64,
+        pick: impl Fn(&CachedImage) -> bool,
+    ) -> bool {
         let mut ranges = std::mem::take(&mut self.segments);
         ranges.clear();
         gmmu.for_each_range(gpu_va, size, |range| {
@@ -394,9 +433,7 @@ impl TextureCache {
         });
         self.collect_overlaps(&ranges);
         self.segments = ranges;
-        self.ids
-            .iter()
-            .any(|&id| self.get(id).is_some_and(|image| image.gpu_modified))
+        self.ids.iter().any(|&id| self.get(id).is_some_and(&pick))
     }
 
     /// Whether `vkCmdBlitImage` turns `src` texels into `dst` ones as the guest does: host
@@ -431,6 +468,17 @@ impl TextureCache {
             && plain(&dst_host)
             && self.can_blit(src_host.format)
             && self.can_blit(dst_host.format)
+    }
+
+    /// Whether `vkCmdBlitImage` may filter `format` texels linearly: a colour format that is
+    /// neither integer class and whose host format supports linear filtering.
+    fn filterable(&self, format: PixelFormat, host: HostFormat) -> bool {
+        format.is_color()
+            && !matches!(format.numeric(), Numeric::Uint | Numeric::Sint)
+            && self
+                .device
+                .format_features(host.format)
+                .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR)
     }
 
     /// `rect` of the found image's subresource in host texels, at the image's scale; `None`

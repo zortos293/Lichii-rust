@@ -1361,6 +1361,10 @@ pub struct DebugSettings {
     /// Writes Nsight Aftermath GPU crash dumps when the Vulkan device is lost (NVIDIA only).
     /// Applies at the next start.
     pub nsight_aftermath: bool,
+    /// When the Vulkan device is lost, logs the fault `VK_EXT_device_fault` reports (and writes
+    /// the vendor's binary dump next to the crash dumps) and, with NVIDIA checkpoints, the last
+    /// draw or dispatch each pipeline stage passed. Applies at the next start.
+    pub gpu_fault_report: bool,
     /// Names Vulkan images, buffers, shaders and pipelines and labels draws and dispatches, so
     /// RenderDoc and Nsight captures are readable. Applies at the next start.
     pub vulkan_labels: bool,
@@ -1377,6 +1381,7 @@ impl Default for DebugSettings {
             dump_shaders: false,
             renderdoc_hotkey: false,
             nsight_aftermath: false,
+            gpu_fault_report: false,
             vulkan_labels: false,
         }
     }

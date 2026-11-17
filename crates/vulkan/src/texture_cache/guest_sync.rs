@@ -506,15 +506,6 @@ impl TextureCache {
         if window.0 >= window.1 {
             return Ok(false);
         }
-        for &o in newer.iter() {
-            if self.image(o).cpu_dirty {
-                self.refresh(tx, o)?;
-            }
-        }
-        if self.image(id).cpu_dirty {
-            self.take_cpu_writes(tx, id)?;
-        }
-        newer.sort_by_key(|&o| self.get(o).map_or(0, |o| o.modified));
         let mut linear = 4;
         let mut stencil = 4;
         for &o in newer.iter().chain(std::iter::once(&id)) {
@@ -524,6 +515,22 @@ impl TextureCache {
             linear = linear.max(u64::from(row) * u64::from(h) * u64::from(d));
             stencil = stencil.max((u64::from(w) * u64::from(h)).next_multiple_of(4));
         }
+        let range = u64::from(self.device.properties.limits.max_storage_buffer_range);
+        if [window.1 - window.0, linear, stencil]
+            .iter()
+            .any(|&size| size > range)
+        {
+            return Ok(false);
+        }
+        for &o in newer.iter() {
+            if self.image(o).cpu_dirty {
+                self.refresh(tx, o)?;
+            }
+        }
+        if self.image(id).cpu_dirty {
+            self.take_cpu_writes(tx, id)?;
+        }
+        newer.sort_by_key(|&o| self.get(o).map_or(0, |o| o.modified));
         let device = self.device.clone();
         let sync = self.guest_sync.as_mut().expect("just created");
         let storage = vk::BufferUsageFlags::STORAGE_BUFFER
@@ -636,15 +643,23 @@ impl TextureCache {
             // the barrier above orders this write after the last pass that read the buffer.
             unsafe { device.raw.cmd_update_buffer(cmd, runs_buffer, at, chunk) };
         }
-        let guest = sync.guest.as_ref().expect("ensured").raw();
-        let linear = sync.linear.as_ref().expect("ensured").raw();
-        let stencil = sync.stencil.as_ref().expect("ensured").raw();
-        let buffers =
-            [guest, linear, stencil, runs_buffer].map(|buffer| vk::DescriptorBufferInfo {
-                buffer,
+        let limit = u64::from(device.properties.limits.max_storage_buffer_range);
+        let bound = |buffer: &Option<Buffer>| {
+            let buffer = buffer.as_ref().expect("ensured");
+            vk::DescriptorBufferInfo {
+                buffer: buffer.raw(),
                 offset: 0,
-                range: vk::WHOLE_SIZE,
-            });
+                range: buffer.size().min(limit),
+            }
+        };
+        let buffers = [
+            bound(&sync.guest),
+            bound(&sync.linear),
+            bound(&sync.stencil),
+            bound(&sync.runs),
+        ];
+        let linear = buffers[1].buffer;
+        let stencil = buffers[2].buffer;
         let all = (
             vk::PipelineStageFlags2::ALL_COMMANDS,
             vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,

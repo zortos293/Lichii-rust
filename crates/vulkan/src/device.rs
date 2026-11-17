@@ -3,7 +3,7 @@ use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use ash::{ext, khr, nv, vk};
+use ash::{amd, ext, khr, nv, vk};
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 use gpu_allocator::{AllocationSizes, AllocatorDebugSettings};
 use lichii_common::settings::GraphicsSettings;
@@ -44,6 +44,7 @@ pub struct DeviceExtensions {
     pub shader_stencil_export: bool,
     /// `VK_KHR_cooperative_matrix`, enabled only when the guest's HMMA can use it.
     pub cooperative_matrix: bool,
+    pub geometry_shader_passthrough: bool,
 }
 
 type ExtensionFlag = fn(&mut DeviceExtensions) -> &mut bool;
@@ -77,6 +78,9 @@ const OPTIONAL_EXTENSIONS: &[(&CStr, ExtensionFlag)] = &[
     (ext::line_rasterization::NAME, |e| &mut e.line_rasterization),
     (ext::shader_stencil_export::NAME, |e| {
         &mut e.shader_stencil_export
+    }),
+    (nv::geometry_shader_passthrough::NAME, |e| {
+        &mut e.geometry_shader_passthrough
     }),
 ];
 
@@ -182,6 +186,8 @@ pub struct Device {
     pub shader_host: HostTranslateInfo,
     /// Debug names and labels, with `debug.vulkan_labels`.
     pub(crate) labels: Option<ext::debug_utils::Device>,
+    /// Checkpoints and fault queries for the device-lost report, with `debug.gpu_fault_report`.
+    pub(crate) faults: Option<Arc<crate::debug::fault::Reporter>>,
 }
 
 struct Candidate {
@@ -618,10 +624,42 @@ impl Device {
             };
         if aftermath {
             names.push(nv::device_diagnostics_config::NAME.as_ptr());
-            if has(nv::device_diagnostic_checkpoints::NAME) {
-                names.push(nv::device_diagnostic_checkpoints::NAME.as_ptr());
-            }
             tracing::info!("Nsight Aftermath: device diagnostics on");
+        }
+        let fault_report = crate::debug::fault_report_requested();
+        let checkpoints =
+            (aftermath || fault_report) && has(nv::device_diagnostic_checkpoints::NAME);
+        if checkpoints {
+            names.push(nv::device_diagnostic_checkpoints::NAME.as_ptr());
+        }
+        let mut fault_features = vk::PhysicalDeviceFaultFeaturesEXT::default();
+        if fault_report && has(ext::device_fault::NAME) {
+            let mut query = vk::PhysicalDeviceFeatures2::default().push_next(&mut fault_features);
+            // SAFETY: the device reports the extension the struct belongs to.
+            unsafe { raw_instance.get_physical_device_features2(physical, &mut query) };
+            fault_features.p_next = std::ptr::null_mut();
+        }
+        let device_fault = fault_features.device_fault != vk::FALSE;
+        if device_fault {
+            names.push(ext::device_fault::NAME.as_ptr());
+        }
+        let buffer_marker = fault_report && has(amd::buffer_marker::NAME);
+        if buffer_marker {
+            names.push(amd::buffer_marker::NAME.as_ptr());
+        }
+        let fault_support = crate::debug::fault::FaultSupport {
+            fault: device_fault.then_some(fault_features.device_fault_vendor_binary != vk::FALSE),
+            checkpoints: fault_report && checkpoints,
+            buffer_marker,
+        };
+        if fault_report {
+            tracing::info!(
+                device_fault,
+                vendor_binary = fault_support.fault == Some(true),
+                checkpoints,
+                buffer_marker,
+                "GPU fault report on"
+            );
         }
         let mut diagnostics_features =
             vk::PhysicalDeviceDiagnosticsConfigFeaturesNV::default().diagnostics_config(true);
@@ -644,6 +682,9 @@ impl Device {
             info = info
                 .push_next(&mut diagnostics_features)
                 .push_next(&mut diagnostics);
+        }
+        if device_fault {
+            info = info.push_next(&mut fault_features);
         }
         // SAFETY: the extensions and features requested were all reported by the device.
         let raw = unsafe {
@@ -752,6 +793,18 @@ impl Device {
         let labels = instance
             .labels
             .then(|| ext::debug_utils::Device::new(raw_instance, &raw));
+        let faults = (fault_support.fault.is_some()
+            || fault_support.checkpoints
+            || fault_support.buffer_marker)
+            .then(|| {
+                crate::debug::fault::Reporter::register(
+                    raw_instance,
+                    &raw,
+                    &memory_properties,
+                    queue,
+                    fault_support,
+                )
+            });
         Ok(Arc::new(Self {
             instance,
             physical,
@@ -766,6 +819,7 @@ impl Device {
             shader_profile,
             shader_host,
             labels,
+            faults,
         }))
     }
 
@@ -834,8 +888,8 @@ impl Device {
     pub fn wait_idle(&self) {
         let _queue = self.queue.lock();
         // SAFETY: holding the queue lock keeps other threads from submitting meanwhile.
-        if let Err(error) = unsafe { self.raw.device_wait_idle() } {
-            tracing::error!("vkDeviceWaitIdle: {error}");
+        if let Err(error) = unsafe { self.raw.device_wait_idle() }.call("vkDeviceWaitIdle") {
+            tracing::error!("{error}");
         }
     }
 
@@ -868,6 +922,9 @@ impl Drop for Device {
         // allocator frees its blocks before the device is destroyed.
         unsafe {
             let _ = self.raw.device_wait_idle();
+            if let Some(faults) = &self.faults {
+                faults.destroy(&self.raw);
+            }
             ManuallyDrop::drop(&mut self.allocator);
             self.raw.destroy_device(None);
         }

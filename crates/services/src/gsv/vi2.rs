@@ -1,8 +1,9 @@
 //! `nn::vi2` (gsv 305): the Switch 2 display session. Titles present their frames with 229, which
 //! shows a native image, waits for the GPU and paces the title to its swap interval, and start
-//! frames on native events (31/32) that fire with the 60 Hz vblank.
+//! frames on native events (31/32) that fire with the vblank, at the refresh rate of the title's
+//! latest present (60 Hz until the first, up to the panel's 120 Hz and the 240 Hz the word allows).
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -22,7 +23,8 @@ use super::{UNKNOWN, Words, handshake, push_readable};
 use crate::{Service, ServiceContext};
 
 const NATIVE_EVENTS: usize = 8;
-const VBLANK: Duration = Duration::from_nanos(1_000_000_000 / 60);
+/// The refresh rate before the first present.
+const DEFAULT_REFRESH_HZ: u32 = 60;
 /// Buffer slots 228/229/212 report the client may use: all 15.
 const AVAILABLE_SLOTS: u64 = 0x7fff;
 /// "default", the display every query names.
@@ -42,13 +44,28 @@ pub(super) struct Vi2 {
 
 /// The session's native event slots. A host thread fires the ones bound to vsync every vblank
 /// for as long as the session lives.
-#[derive(Default)]
 struct NativeEvents {
     slots: Mutex<[Option<Arc<Event>>; NATIVE_EVENTS]>,
     vsync: AtomicU8,
+    /// The refresh rate of the latest present, which sets the vblank period.
+    refresh_hz: AtomicU32,
+}
+
+impl Default for NativeEvents {
+    fn default() -> Self {
+        Self {
+            slots: Mutex::default(),
+            vsync: AtomicU8::default(),
+            refresh_hz: AtomicU32::new(DEFAULT_REFRESH_HZ),
+        }
+    }
 }
 
 impl NativeEvents {
+    fn vblank_period(&self) -> Duration {
+        Duration::from_nanos(1_000_000_000 / u64::from(self.refresh_hz.load(Ordering::Relaxed)))
+    }
+
     fn vblank(&self) {
         let vsync = self.vsync.load(Ordering::Acquire);
         let slots = self.slots.lock();
@@ -76,14 +93,16 @@ fn spawn_vsync(native: &Arc<NativeEvents>) {
         .name("nx2:vi2 vsync".into())
         .spawn(move || {
             let mut next = Instant::now();
+            let mut period = Duration::from_nanos(1_000_000_000 / u64::from(DEFAULT_REFRESH_HZ));
             loop {
-                next += VBLANK;
+                next += period;
                 match next.checked_duration_since(Instant::now()) {
                     Some(wait) => std::thread::sleep(wait),
                     None => next = Instant::now(),
                 }
                 let Some(native) = weak.upgrade() else { return };
                 native.vblank();
+                period = native.vblank_period();
             }
         });
     if let Err(err) = spawned {
@@ -211,6 +230,9 @@ impl Vi2 {
         let words = Words::command(ctx);
         let (image, drawn, timing) = (words.u32(5), words.u32(7), Timing::of(words.u32(12)));
         let fence = (!words.u32(22), words.u32(24));
+        self.native
+            .refresh_hz
+            .store(timing.refresh_hz, Ordering::Relaxed);
         let mut presents = self.presents.lock();
         presents.count += 1;
         if presents.count <= 4 || presents.count.is_multiple_of(600) {
@@ -397,5 +419,30 @@ impl Service for Vi2 {
             }
             _ => return None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_vblank_follows_the_refresh_rate_of_the_latest_present() {
+        let native = NativeEvents::default();
+        assert_eq!(native.vblank_period(), Duration::from_nanos(16_666_666));
+        for (word, period) in [
+            (1 << 16 | 120, 8_333_333),
+            (2 << 16 | 60, 16_666_666),
+            (1 << 16 | 1000, 16_666_666),
+        ] {
+            native
+                .refresh_hz
+                .store(Timing::of(word).refresh_hz, Ordering::Relaxed);
+            assert_eq!(
+                native.vblank_period(),
+                Duration::from_nanos(period),
+                "{word:#x}"
+            );
+        }
     }
 }
