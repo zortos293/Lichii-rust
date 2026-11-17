@@ -750,16 +750,24 @@ impl Device {
     }
 
     /// Submits to the universal queue. The queue lock is held only for the call, so the
-    /// rasterizer and the presenter can submit from their own threads.
+    /// rasterizer and the presenter can submit from their own threads. Submits nothing once the
+    /// device is lost.
     pub fn submit(&self, submits: &[vk::SubmitInfo2<'_>], fence: vk::Fence) -> Result<()> {
+        if crate::debug::device_is_lost() {
+            return Err(Error::DeviceLost);
+        }
         let queue = self.queue.lock();
         // SAFETY: the queue is externally synchronised by the lock; the caller keeps every
         // referenced object alive until the submission completes.
         unsafe { self.raw.queue_submit2(*queue, submits, fence) }.call("vkQueueSubmit2")
     }
 
-    /// Binds sparse memory on the universal queue, under the same lock as submissions.
+    /// Binds sparse memory on the universal queue, under the same lock as submissions. Binds
+    /// nothing once the device is lost.
     pub fn bind_sparse(&self, infos: &[vk::BindSparseInfo<'_>]) -> Result<()> {
+        if crate::debug::device_is_lost() {
+            return Err(Error::DeviceLost);
+        }
         let queue = self.queue.lock();
         // SAFETY: the queue is externally synchronised by the lock; the caller keeps the images
         // and memory alive until the binding completes.
