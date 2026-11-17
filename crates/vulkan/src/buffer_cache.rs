@@ -1526,6 +1526,36 @@ impl BufferCache {
     ) -> Result<BufferBinding> {
         self.segments.clear();
         gmmu.for_each_range(gpu_va, size, |range| self.segments.push(range));
+        if size >= 1 << 20 {
+            static SEEN: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().unwrap();
+            if seen.len() < 64 && !seen.contains(&(gpu_va, size)) {
+                seen.push((gpu_va, size));
+                let mut bytes = [0u64; 4];
+                for s in &self.segments {
+                    let k = match s.target {
+                        RangeTarget::Device(_) => 0,
+                        RangeTarget::Sparse => 1,
+                        RangeTarget::Unmapped => 2,
+                        RangeTarget::SyncpointShim => 3,
+                    };
+                    bytes[k] += s.size;
+                }
+                let first: Vec<String> = self
+                    .segments
+                    .iter()
+                    .take(12)
+                    .map(|s| match s.target {
+                        RangeTarget::Device(d) => format!("+{:#x}:{:#x}=D{:#x}", s.gpu_va - gpu_va, s.size, d),
+                        t => format!("+{:#x}:{:#x}={:?}", s.gpu_va - gpu_va, s.size, t),
+                    })
+                    .collect();
+                tracing::warn!(
+                    "DIAG428 gather gpu_va={gpu_va:#x} size={size:#x} align={align} segments={} device={:#x} sparse={:#x} unmapped={:#x} shim={:#x} first={}",
+                    self.segments.len(), bytes[0], bytes[1], bytes[2], bytes[3], first.join(",")
+                );
+            }
+        }
         let padded = size.next_multiple_of(4);
         let slice = self.stream.alloc(scheduler, padded, align.max(4))?;
         let (dst, dst_offset) = (slice.buffer, slice.offset);
