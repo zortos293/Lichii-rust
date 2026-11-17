@@ -121,15 +121,18 @@ impl Oversized {
 /// A `GpuToCpu` buffer downloads reuse. It grows to the next power of two of the largest
 /// download up to [`READBACK_LIMIT`]; a larger download gets a buffer of its exact size, freed
 /// by [`Readback::release`]. After [`READBACK_DECAY_DOWNLOADS`] downloads in a row that fit in
-/// [`READBACK_BASE`], a larger buffer is retired and the next one sized for the download.
+/// [`READBACK_BASE`], a larger buffer is freed and the next one sized for the download.
 #[derive(Default)]
 pub(crate) struct Readback {
     buffer: Option<Buffer>,
     fitting: u32,
+    /// The GPU finished every download into the buffer ([`Readback::release`]), so it can be
+    /// freed at once instead of retired against the tick being recorded.
+    idle: bool,
 }
 
 impl Readback {
-    /// A buffer of at least `size` bytes for the next download, retiring a buffer that is too
+    /// A buffer of at least `size` bytes for the next download, replacing one that is too
     /// small, above the limit or decayed.
     pub(crate) fn ensure(
         &mut self,
@@ -146,9 +149,11 @@ impl Readback {
         let decayed = self.fitting >= READBACK_DECAY_DOWNLOADS;
         if let Some(old) = self.buffer.take_if(|b| {
             b.size() < size || b.size() > READBACK_LIMIT || decayed && b.size() > READBACK_BASE
-        }) {
+        }) && !self.idle
+        {
             scheduler.retire(old);
         }
+        self.idle = false;
         if self.buffer.is_none() {
             let capacity = if size > READBACK_LIMIT {
                 size
@@ -166,8 +171,10 @@ impl Readback {
         Ok(self.buffer.as_ref().expect("just ensured"))
     }
 
-    /// Frees a buffer above [`READBACK_LIMIT`] once the GPU finished its download.
+    /// Marks the buffer idle once the GPU finished its download, freeing it when it is above
+    /// [`READBACK_LIMIT`].
     pub(crate) fn release(&mut self) {
+        self.idle = true;
         if self
             .buffer
             .as_ref()
@@ -217,8 +224,9 @@ pub(crate) mod testing {
         }
     }
 
-    /// A timeline semaphore another thread raises by one every 2 ms, so submissions waiting on
-    /// its values complete slowly and in order, as when the GPU lags behind.
+    /// A timeline semaphore submissions wait on. It holds them all back until started, then
+    /// another thread raises it by one every 2 ms, so they complete slowly and in order, as
+    /// when the GPU lags behind.
     pub(crate) struct Gate {
         device: Arc<Device>,
         semaphore: vk::Semaphore,
@@ -235,26 +243,28 @@ pub(crate) mod testing {
             let info = vk::SemaphoreCreateInfo::default().push_next(&mut kind);
             // SAFETY: valid create info on a live device.
             let semaphore = unsafe { device.raw.create_semaphore(&info, None) }.unwrap();
-            let done = Arc::new(AtomicBool::new(false));
-            let thread = std::thread::spawn({
-                let (device, done) = (device.clone(), done.clone());
-                move || {
-                    let mut value = 0;
-                    while !done.load(Ordering::Relaxed) {
-                        std::thread::sleep(Duration::from_millis(2));
-                        value += 1;
-                        signal(&device, semaphore, value);
-                    }
-                    signal(&device, semaphore, u64::MAX >> 1);
-                }
-            });
             Self {
                 device: device.clone(),
                 semaphore,
-                done,
-                thread: Some(thread),
+                done: Arc::new(AtomicBool::new(false)),
+                thread: None,
                 next: 0,
             }
+        }
+
+        /// Starts letting one submission through every 2 ms; until then the gate holds every
+        /// submission back.
+        pub(crate) fn start(&mut self) {
+            let (device, done, semaphore) =
+                (self.device.clone(), self.done.clone(), self.semaphore);
+            self.thread = Some(std::thread::spawn(move || {
+                let mut value = 0;
+                while !done.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(2));
+                    value += 1;
+                    signal(&device, semaphore, value);
+                }
+            }));
         }
 
         /// Submits the work recorded in `scheduler`, held back until the gate's next value.
@@ -270,10 +280,13 @@ pub(crate) mod testing {
 
         /// Lets every submission through.
         pub(crate) fn open(&mut self) {
-            self.done.store(true, Ordering::Relaxed);
+            if self.done.swap(true, Ordering::Relaxed) {
+                return;
+            }
             if let Some(thread) = self.thread.take() {
                 thread.join().unwrap();
             }
+            signal(&self.device, self.semaphore, u64::MAX >> 1);
         }
     }
 
@@ -314,6 +327,7 @@ pub(crate) mod testing {
     ) -> Flood {
         let mut scheduler = Scheduler::new(device).unwrap();
         let mut gate = Gate::new(device);
+        gate.start();
         let mut flood = Flood { peak: 0, lagged: 0 };
         for _ in 0..ops {
             if should_submit(ring, scheduler.tick()) {
@@ -355,6 +369,7 @@ mod tests {
         }
         assert!(!scheduler.is_complete(last), "the gate holds the GPU back");
         assert_eq!(oversized.bytes(), 3 * MIB);
+        gate.start();
         oversized
             .alloc(&device, &mut scheduler, 6 * MIB, usage, "test")
             .unwrap();

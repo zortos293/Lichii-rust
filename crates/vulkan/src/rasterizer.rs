@@ -1119,6 +1119,7 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn clear(&mut self, ctx: &mut GraphicsContext<'_>, layer_count: u32) {
+        self.bound_oversized();
         self.activity.clears += 1;
         if let Err(error) = self.clear_targets(ctx, layer_count) {
             tracing::error!(%error, "clearing render targets failed");
