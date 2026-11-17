@@ -1192,6 +1192,7 @@ impl VulkanRasterizer {
             if let Some(index) = index {
                 raw.cmd_bind_index_buffer(cmd, index.buffer, index.offset, index.index_type);
             }
+            let conditional = self.conditions.as_ref().and_then(|c| c.begin(cmd));
             match (call, indirect, index) {
                 (DrawCall::Direct(_), _, _) if mesh => {
                     draw.mesh.cmd_draw_mesh_tasks(cmd, mesh_groups, 1, 1)
@@ -1273,6 +1274,9 @@ impl VulkanRasterizer {
                     }
                 }
                 (DrawCall::Indirect(_), None, _) => {}
+            }
+            if let Some(conditions) = conditional {
+                conditions.end(cmd);
             }
             if let Some(slot) = query {
                 self.samples.end(&self.device, cmd, slot);

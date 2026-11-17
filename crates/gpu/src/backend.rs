@@ -83,6 +83,18 @@ pub struct GraphicsContext<'a> {
     pub root_tables: &'a RootTables,
 }
 
+/// A value the renderer computes on the host GPU, for draws to test there
+/// ([`Rasterizer::samples_predicate`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuPredicate(pub u32);
+
+/// Draws run only while `predicate` is nonzero, or only while it is zero when `inverted`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenderCondition {
+    pub predicate: GpuPredicate,
+    pub inverted: bool,
+}
+
 /// Index data a draw carries inline instead of reading from an index buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InlineIndices<'a> {
@@ -620,6 +632,25 @@ pub trait Rasterizer: Send {
     ) -> bool {
         false
     }
+
+    /// A predicate on the SamplesPassed report that is the last write still waiting in the
+    /// renderer's fences for `addr`: nonzero exactly when the count the report writes there is.
+    /// It stays valid while it is `channel`'s latest predicate. None when no such report is
+    /// pending at `addr` or the renderer cannot evaluate predicates; the caller then reads the
+    /// count.
+    fn samples_predicate(&mut self, _channel: ChannelId, _addr: DAddr) -> Option<GpuPredicate> {
+        None
+    }
+
+    /// Whether `predicate`, which this renderer made, is nonzero, waiting for the host GPU to
+    /// compute it. Renderers that make no predicates are never asked.
+    fn predicate_value(&mut self, _predicate: GpuPredicate) -> bool {
+        true
+    }
+
+    /// Draws and indirect draws recorded from now on run only while `condition` holds; None runs
+    /// them all. Clears and texture draws never test it.
+    fn set_render_condition(&mut self, _condition: Option<RenderCondition>) {}
 
     /// Device memory `[addr, addr + size)` is no longer mapped in some GPU address space.
     fn unmap_region(&mut self, addr: DAddr, size: u64) {

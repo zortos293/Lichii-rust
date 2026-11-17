@@ -12,7 +12,7 @@
 
 use super::const_buffers::{self, RootTableState};
 use super::draw::{self, DrawState};
-use super::queries;
+use super::queries::{self, RenderEnable};
 use super::regs::{BindGroup, LaunchDmaLayout, MAX_SHADER_STAGE, Regs, ShadowRamControl};
 use super::state::{
     MACRO_REGISTERS_START, ROOT_TABLE_LOAD, ROOT_TABLE_SELECT, RegisterState, dirty,
@@ -20,6 +20,7 @@ use super::state::{
 use crate::activity::RendererCall;
 use crate::backend::{
     DrawParams, FenceAction, GraphicsConstBuffers, GraphicsContext, IndirectDraw, InlineIndices,
+    RenderCondition,
 };
 use crate::engines::upload::Upload;
 use crate::engines::{EngineContext, EngineKind};
@@ -34,7 +35,8 @@ const BIND_GROUP_FIRST: u32 = reg_index!(Regs, bind_groups) + 4;
 const BIND_GROUP_LAST: u32 = BIND_GROUP_FIRST + (MAX_SHADER_STAGE as u32 - 1) * BIND_GROUP_STRIDE;
 const CLEAR_SURFACE: u32 = reg_index!(Regs, clear_surface);
 const REPORT_SEMAPHORE_QUERY: u32 = reg_index!(Regs, report_semaphore.query);
-const RENDER_ENABLE_MODE: u32 = reg_index!(Regs, render_enable.mode);
+/// The RENDER_ENABLE mode method, which macros the back runs may turn into a GPU condition.
+pub const RENDER_ENABLE_MODE: u32 = reg_index!(Regs, render_enable.mode);
 const CLEAR_REPORT_VALUE: u32 = reg_index!(Regs, clear_report_value);
 const SYNC_INFO: u32 = reg_index!(Regs, sync_info);
 const LAUNCH_DMA: u32 = reg_index!(Regs, launch_dma);
@@ -71,7 +73,7 @@ pub struct Maxwell3d {
     draw: DrawState,
     upload: Upload,
     /// RENDER_ENABLE as evaluated when its mode was last written.
-    render_enable: bool,
+    render_enable: RenderEnable,
 }
 
 impl Maxwell3d {
@@ -84,7 +86,7 @@ impl Maxwell3d {
             root_tables: RootTableState::new(),
             draw: DrawState::new(),
             upload: Upload::default(),
-            render_enable: true,
+            render_enable: RenderEnable::Host(true),
         }
     }
 
@@ -161,7 +163,8 @@ impl Maxwell3d {
     /// Draws with parameters in GPU memory, with the current state.
     pub fn draw_indirect(&mut self, ctx: &mut EngineContext<'_>, draw: &IndirectDraw) {
         self.flush(ctx);
-        if self.renders() {
+        if let Some(condition) = self.draw_condition() {
+            ctx.rasterizer.set_render_condition(condition);
             let draw = IndirectDraw {
                 topology: draw::topology(&self.state.regs, draw.topology),
                 ..*draw
@@ -205,15 +208,15 @@ impl Maxwell3d {
             ROOT_TABLE_SELECT => self.root_tables.select(value),
             ROOT_TABLE_LOAD => self.load_root_table(&[value]),
             CLEAR_SURFACE => {
-                if self.renders() {
+                if self.renders_on_host(ctx) {
                     let start = ctx.activity.begin_call(RendererCall::Clear);
                     ctx.rasterizer.clear(&mut graphics!(self, ctx), 1);
                     ctx.activity.renderer_call(RendererCall::Clear, start);
                 }
             }
             draw::DRAW_TEXTURE => {
-                if self.renders() {
-                    let texture = draw::texture(regs);
+                if self.renders_on_host(ctx) {
+                    let texture = draw::texture(&self.state.regs);
                     let start = ctx.activity.begin_call(RendererCall::Draw);
                     ctx.rasterizer
                         .draw_texture(&mut graphics!(self, ctx), &texture);
@@ -230,7 +233,9 @@ impl Maxwell3d {
                     ctx.rasterizer.reset_counter(kind);
                 }
             }
-            RENDER_ENABLE_MODE => self.render_enable = queries::render_enable(regs, ctx),
+            RENDER_ENABLE_MODE => {
+                self.render_enable = RenderEnable::Host(queries::render_enable(regs, ctx));
+            }
             SYNC_INFO => {
                 let id = regs.sync_info.sync_point();
                 if ctx.syncpoints.host().increment(id).is_err() {
@@ -264,7 +269,8 @@ impl Maxwell3d {
         let base_vertex = regs.global_base_vertex_index as i32;
         if !self.draw.inline_indices.is_empty() {
             self.flush(ctx);
-            if self.renders() {
+            if let Some(condition) = self.draw_condition() {
+                ctx.rasterizer.set_render_condition(condition);
                 let params = DrawParams {
                     topology,
                     indexed: true,
@@ -358,7 +364,8 @@ impl Maxwell3d {
     }
 
     fn render(&mut self, ctx: &mut EngineContext<'_>, draw: &DrawParams<'_>) {
-        if self.renders() {
+        if let Some(condition) = self.draw_condition() {
+            ctx.rasterizer.set_render_condition(condition);
             let start = ctx.activity.begin_call(RendererCall::Draw);
             ctx.rasterizer.draw(&mut graphics!(self, ctx), draw);
             ctx.activity.renderer_call(RendererCall::Draw, start);
@@ -371,9 +378,37 @@ impl Maxwell3d {
         }
     }
 
+    /// Whether draws run, and under which condition the renderer tests.
     #[inline]
-    fn renders(&self) -> bool {
+    fn draw_condition(&self) -> Option<Option<RenderCondition>> {
         queries::renders(&self.state.regs, self.render_enable)
+    }
+
+    /// Whether clears and texture draws run, which the renderer never tests a condition for: a
+    /// GPU condition is evaluated here, waiting for the host GPU, and kept as the result.
+    fn renders_on_host(&mut self, ctx: &mut EngineContext<'_>) -> bool {
+        match self.draw_condition() {
+            None => false,
+            Some(None) => true,
+            Some(Some(condition)) => {
+                let renders = queries::host_condition(ctx, condition);
+                self.render_enable = RenderEnable::Host(renders);
+                renders
+            }
+        }
+    }
+
+    /// A macro the back ran wrote RENDER_ENABLE_MODE as `mode`, which holds only where
+    /// `condition` does on the host GPU.
+    pub fn set_render_condition(
+        &mut self,
+        ctx: &mut EngineContext<'_>,
+        mode: u32,
+        condition: RenderCondition,
+    ) {
+        self.flush(ctx);
+        self.state.write(RENDER_ENABLE_MODE, mode);
+        self.render_enable = RenderEnable::Gpu(condition);
     }
 }
 

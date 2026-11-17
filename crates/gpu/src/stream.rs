@@ -48,6 +48,10 @@ pub(crate) mod tag {
     pub const SYNCHRONIZE_FETCH: u8 = 15;
     /// Then the GPU address the engine's next DATA_UPLOAD word comes from.
     pub const UPLOAD_SOURCE: u8 = 16;
+    /// A macro call the back runs with the code
+    /// [`SideCommand::MacroCode`](crate::back::SideCommand::MacroCode) gave the channel. Method:
+    /// its start address; argument: parameter count; the parameters follow, two per slot.
+    pub const MACRO: u8 = 17;
 }
 
 /// How far the fetch of a GPFIFO entry waits for the work before it.
@@ -94,6 +98,9 @@ pub(crate) struct FetchSyncs {
     front: Arc<Inbox>,
     /// What pending semaphore releases write over the read [`Stream::synchronize_read`] last sent.
     pub(crate) read_overlay: ReadOverlay,
+    /// The 3D registers [`Stream::fetch_registers`] asks for, each with its value and shadow RAM
+    /// copy; the back fills them in.
+    pub(crate) registers: Mutex<Vec<(u32, (u32, u32))>>,
 }
 
 impl FetchSyncs {
@@ -102,6 +109,7 @@ impl FetchSyncs {
             completed: AtomicU64::new(0),
             front,
             read_overlay: ReadOverlay::default(),
+            registers: Mutex::new(Vec::new()),
         }
     }
 
@@ -141,6 +149,13 @@ impl ReadOverlay {
                 *slot = word;
             }
         }
+    }
+}
+
+fn push_pairs(producer: &mut Producer, words: &[u32]) {
+    for pair in words.chunks(2) {
+        let high = pair.get(1).copied().unwrap_or(0);
+        producer.push(u64::from(pair[0]) | u64::from(high) << 32);
     }
 }
 
@@ -215,13 +230,24 @@ impl Stream {
             self.reserve(1 + count.div_ceil(2));
             self.producer
                 .push(header(tag::MULTI, engine, method, count as u32));
-            for pair in self.words.chunks(2) {
-                let high = pair.get(1).copied().unwrap_or(0);
-                self.producer
-                    .push(u64::from(pair[0]) | u64::from(high) << 32);
-            }
+            push_pairs(&mut self.producer, &self.words);
         }
         self.words.clear();
+        self.maybe_publish();
+    }
+
+    /// Has the back run the macro at instruction `start` with `parameters` (at most
+    /// [`MULTI_MAX_WORDS`]), its writes going to `engine`, at this point of the stream.
+    pub(crate) fn macro_call(&mut self, engine: EngineKind, start: u32, parameters: &[u32]) {
+        self.flush_pending();
+        self.reserve(1 + parameters.len().div_ceil(2));
+        self.producer.push(header(
+            tag::MACRO,
+            engine.index() as u8,
+            start,
+            parameters.len() as u32,
+        ));
+        push_pairs(&mut self.producer, parameters);
         self.maybe_publish();
     }
 
@@ -322,6 +348,23 @@ impl Stream {
     pub(crate) fn synchronize_read(&mut self, address: GpuVAddr, size: u64) {
         self.record(&[header(tag::SYNCHRONIZE_READ, 0, 0, 0), address, size]);
         self.drain();
+    }
+
+    /// Waits until the back executed everything sent so far, and returns the current channel's 3D
+    /// registers `request` adds, each with the back's word (the front's word stays when the back
+    /// has no 3D engine).
+    pub(crate) fn fetch_registers(
+        &mut self,
+        request: impl FnOnce(&mut Vec<(u32, (u32, u32))>),
+    ) -> parking_lot::MutexGuard<'_, Vec<(u32, (u32, u32))>> {
+        {
+            let mut registers = self.fetch_syncs.registers.lock();
+            registers.clear();
+            request(&mut registers);
+        }
+        self.side(SideCommand::Registers);
+        self.drain();
+        self.fetch_syncs.registers.lock()
     }
 
     /// Puts what semaphore releases still on their way to the host GPU write over `out`, the

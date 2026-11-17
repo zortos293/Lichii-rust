@@ -233,7 +233,8 @@ pub enum Op {
         pc: u64,
     },
     /// LSE `LD<op>`/`SWP` of `1 << size` bytes: the zero-extended old value. Faults with
-    /// `CpuFault::Alignment` unless `addr` is aligned to the size.
+    /// `CpuFault::Alignment` when the access crosses a 16-byte granule.
+    /// Inside one granule, an access that isn't naturally aligned still runs atomically.
     AtomicRmw {
         op: AtomicOp,
         size: u8,
@@ -242,7 +243,8 @@ pub enum Op {
         pc: u64,
     },
     /// `LDXR` and `LDXP` of `1 << size` bytes: the zero-extended value, with a reservation for it
-    /// in this core's `ExclusiveMonitor` slot. Aligned like `AtomicRmw`. A 16-byte load gives the low
+    /// in this core's `ExclusiveMonitor` slot. Faults with `CpuFault::Alignment` unless `addr` is
+    /// aligned to the size. A 16-byte load gives the low
     /// half and leaves the high half for `High`.
     LoadExclusive {
         size: u8,
@@ -266,7 +268,7 @@ pub enum Op {
         pc: u64,
     },
     /// The 64-bit `CASP`: the low half of the old `high:low` value, leaving the high half for `High`.
-    /// Aligned like `AtomicRmw`.
+    /// Faults with `CpuFault::Alignment` unless `addr` is 16-byte aligned.
     Cas128 {
         addr: Value,
         expected_low: Value,

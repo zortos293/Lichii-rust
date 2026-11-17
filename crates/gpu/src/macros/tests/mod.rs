@@ -8,7 +8,8 @@ mod mme64;
 use std::collections::HashMap;
 
 use super::{
-    LOAD_MME_INSTRUCTION_RAM, LOAD_MME_INSTRUCTION_RAM_POINTER, LOAD_MME_START_ADDRESS_RAM,
+    CONDITION_MISS_LIMIT, CONDITION_RETRY, LOAD_MME_INSTRUCTION_RAM,
+    LOAD_MME_INSTRUCTION_RAM_POINTER, LOAD_MME_START_ADDRESS_RAM,
     LOAD_MME_START_ADDRESS_RAM_POINTER, MacroEngine, MacroHost, MacroIsa,
 };
 
@@ -20,6 +21,10 @@ struct TestHost {
     register_reads: u32,
     memory: HashMap<u64, u32>,
     dma_reads: Vec<(u64, usize)>,
+    /// Methods a shadow run wrote with values from its DMA reads.
+    unknown: Vec<u32>,
+    /// Words a tracked run's DMA reads know without waiting.
+    known: HashMap<u64, u32>,
 }
 
 impl MacroHost for TestHost {
@@ -42,6 +47,22 @@ impl MacroHost for TestHost {
                 .copied()
                 .unwrap_or(0);
         }
+    }
+
+    fn write_unknown(&mut self, method: u32) -> bool {
+        self.unknown.push(method);
+        true
+    }
+
+    fn dma_peek(&mut self, gpu_va: u64, out: &mut [u32]) -> u64 {
+        let mut known = 0;
+        for (i, word) in out.iter_mut().enumerate().take(64) {
+            if let Some(&value) = self.known.get(&(gpu_va + 4 * i as u64)) {
+                *word = value;
+                known |= 1 << i;
+            }
+        }
+        known
     }
 }
 
@@ -309,4 +330,43 @@ mod masm {
     pub fn assemble(program: &[Inst]) -> Vec<u32> {
         program.iter().flat_map(Inst::encode).collect()
     }
+}
+
+/// After @CONDITION_MISS_LIMIT@ calls in a row at a start address lacked the shape of a
+/// condition, only one call in @CONDITION_RETRY@ there makes condition runs; a call with the
+/// shape lets every call make them again, and so does changed code.
+#[test]
+fn condition_runs_back_off_where_calls_lack_the_shape() {
+    let mut engine = engine_with(MacroIsa::Mme64, &[0, 0, 0]);
+    let miss_streak = |engine: &mut MacroEngine| {
+        for _ in 0..CONDITION_MISS_LIMIT {
+            assert!(engine.may_run_as_condition(0));
+            engine.note_condition_shape(0, false);
+        }
+    };
+    miss_streak(&mut engine);
+    for round in 0..2 {
+        for _ in 1..CONDITION_RETRY {
+            assert!(!engine.may_run_as_condition(0), "round {round}");
+        }
+        assert!(engine.may_run_as_condition(0), "round {round} retries");
+        engine.note_condition_shape(0, false);
+    }
+    for _ in 1..CONDITION_RETRY {
+        assert!(!engine.may_run_as_condition(0));
+    }
+    assert!(engine.may_run_as_condition(0));
+    engine.note_condition_shape(0, true);
+    assert!(
+        engine.may_run_as_condition(0),
+        "a call with the shape ends the backoff"
+    );
+    miss_streak(&mut engine);
+    assert!(!engine.may_run_as_condition(0));
+    assert!(
+        engine.may_run_as_condition(3),
+        "other start addresses keep running"
+    );
+    upload(&mut engine, 0, &[1]);
+    assert!(engine.may_run_as_condition(0), "changed code runs again");
 }

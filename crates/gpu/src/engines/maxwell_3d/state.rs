@@ -284,6 +284,21 @@ impl MethodSet {
         self.0[m >> 6] |= 1 << (m & 63);
     }
 
+    pub fn remove(&mut self, method: u32) {
+        let m = method as usize;
+        self.0[m >> 6] &= !(1 << (m & 63));
+    }
+
+    /// Empties the set, passing its methods to `f` in order.
+    pub fn drain(&mut self, mut f: impl FnMut(u32)) {
+        for (index, word) in self.0.iter_mut().enumerate() {
+            while *word != 0 {
+                f((index * 64) as u32 + word.trailing_zeros());
+                *word &= *word - 1;
+            }
+        }
+    }
+
     pub fn insert_range(&mut self, first: u32, count: u32) {
         for m in first..first + count {
             self.insert(m);
@@ -399,6 +414,19 @@ impl RegisterState {
     #[inline]
     pub fn shadow(&self, method: u32) -> u32 {
         self.shadow.words()[method as usize]
+    }
+
+    /// Register `method` and its shadow RAM copy.
+    #[inline]
+    pub fn word(&self, method: u32) -> (u32, u32) {
+        (self.regs.words()[method as usize], self.shadow(method))
+    }
+
+    /// Sets register `method` and its shadow RAM copy to `word`, as [`RegisterState::word`]
+    /// returned them, without dirty flags or actions.
+    pub fn restore(&mut self, method: u32, (value, shadow): (u32, u32)) {
+        self.regs.words_mut()[method as usize] = value;
+        self.shadow.words_mut()[method as usize] = shadow;
     }
 
     /// Whether [`RegisterState::write`] of `argument` to `method` would change a register value

@@ -4846,3 +4846,104 @@ fn depth_bias_constants_count_d32f_units_at_the_primitive_exponent() {
         &words[..4]
     );
 }
+
+/// Draws under a render condition run only where the SamplesPassed report its predicate was made
+/// from counts samples (or, inverted, counts none), the queries summed on the host GPU. Each
+/// channel's latest predicate outlives any number of other channels' predicates.
+#[test]
+fn render_conditions_test_occlusion_reports_on_the_host_gpu() {
+    const REPORT: u64 = 0x40_0000;
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    if f.rasterizer.conditions.is_none() {
+        eprintln!("skipping: the device has no conditional rendering");
+        return;
+    }
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    write(&f, FRAGMENT_CBUF + 0x100, &f32_bytes(&[0.0, 1.0, 0.0, 1.0]));
+    let mut green = const_buffers();
+    green[4][0].address += 0x100;
+    let mut regs = draw_regs();
+    let report = |f: &mut Fixture, offset: u64, kind: QueryKind| {
+        f.rasterizer.query(
+            ChannelId(0),
+            &gmmu,
+            &Query {
+                address: GPU_VA + REPORT + offset,
+                kind,
+                payload: 0,
+                size: ReleaseSize::Sixteen,
+                after_work: true,
+            },
+        );
+    };
+    regs.zpass_pixel_count_enable = 1;
+    f.rasterizer.reset_counter(QueryKind::SamplesPassed);
+    draw(&mut f, &gmmu, &regs);
+    draw(&mut f, &gmmu, &regs);
+    report(&mut f, 0, QueryKind::SamplesPassed);
+    f.rasterizer.reset_counter(QueryKind::SamplesPassed);
+    report(&mut f, 0x10, QueryKind::SamplesPassed);
+    report(&mut f, 0x20, QueryKind::SamplesPassed);
+    report(&mut f, 0x20, QueryKind::Payload);
+    regs.zpass_pixel_count_enable = 0;
+    let counted = f
+        .rasterizer
+        .samples_predicate(ChannelId(0), DADDR + REPORT)
+        .unwrap();
+    let empty = f
+        .rasterizer
+        .samples_predicate(ChannelId(1), DADDR + REPORT + 0x10)
+        .unwrap();
+    assert_eq!(
+        f.rasterizer
+            .samples_predicate(ChannelId(2), DADDR + REPORT + 0x20),
+        None,
+        "a later release overwrites the report"
+    );
+    assert_eq!(
+        f.rasterizer
+            .samples_predicate(ChannelId(2), DADDR + REPORT + 0x30),
+        None
+    );
+    for i in 0..2100 {
+        let offset = if i % 2 == 0 { 0x10 } else { 0 };
+        f.rasterizer
+            .samples_predicate(ChannelId(2), DADDR + REPORT + offset)
+            .unwrap();
+    }
+    assert!(f.rasterizer.predicate_value(counted));
+    assert!(!f.rasterizer.predicate_value(empty));
+    for (predicate, inverted, drawn) in [
+        (empty, false, false),
+        (empty, true, true),
+        (counted, false, true),
+        (counted, true, false),
+    ] {
+        f.rasterizer.set_render_condition(None);
+        draw(&mut f, &gmmu, &regs);
+        f.rasterizer
+            .set_render_condition(Some(lichii_gpu::backend::RenderCondition {
+                predicate,
+                inverted,
+            }));
+        draw_with(&mut f, &gmmu, &regs, &green);
+        f.rasterizer.set_render_condition(None);
+        let expected = match drawn {
+            true => [0, 255, 0, 255],
+            false => [255, 128, 0, 255],
+        };
+        let texels = target(&mut f);
+        assert!(
+            texels.iter().all(|&t| unorm8_eq(t, expected)),
+            "{predicate:?} inverted {inverted}: {:?}",
+            &texels[..2]
+        );
+    }
+    f.assert_no_validation_errors();
+}

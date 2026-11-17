@@ -5,8 +5,8 @@ use lichii_memory::DeviceAddressSpace;
 
 use super::*;
 use crate::backend::{
-    ChannelId, ComputeContext, ConstBufferBinding, DrawTexture, FramebufferConfig, Query,
-    QueryKind, Rasterizer, ReleaseSize, RootTables,
+    ChannelId, ComputeContext, ConstBufferBinding, DrawTexture, FramebufferConfig, GpuPredicate,
+    Query, QueryKind, Rasterizer, ReleaseSize, RootTables,
 };
 use crate::engines::maxwell_3d::DirtyState;
 use crate::engines::maxwell_3d::regs::{
@@ -59,6 +59,10 @@ struct Renderer {
     events: Vec<Event>,
     device: Option<Arc<DeviceAddressSpace>>,
     staged: Vec<Staged>,
+    /// The render condition of each draw.
+    conditions: Vec<Option<RenderCondition>>,
+    /// What every predicate evaluates to.
+    predicate_value: bool,
 }
 
 impl Renderer {
@@ -114,6 +118,12 @@ impl Rasterizer for Renderer {
         self.events.push(Event::DrawTexture(*draw));
     }
     fn dispatch_compute(&mut self, _ctx: &ComputeContext<'_>) {}
+    fn set_render_condition(&mut self, condition: Option<RenderCondition>) {
+        self.conditions.push(condition);
+    }
+    fn predicate_value(&mut self, _predicate: GpuPredicate) -> bool {
+        self.predicate_value
+    }
     fn inline_written(&mut self, _: ChannelId, _: &Gmmu, address: GpuVAddr, size: u64) {
         self.events.push(Event::InlineWrite(address, size));
     }
@@ -756,4 +766,54 @@ fn inline_to_memory_upload() {
         [0x1111_1111, 0x2222_2222]
     );
     assert_eq!(b.take(), [Event::InlineWrite(0x5000, 8)]);
+}
+
+#[test]
+fn gpu_render_conditions_reach_draws_and_clears_evaluate_them_on_the_host() {
+    let mut b = Bench::new();
+    let condition = RenderCondition {
+        predicate: GpuPredicate(3),
+        inverted: false,
+    };
+    b.run(|engine, ctx| engine.set_render_condition(ctx, 1, condition));
+    b.call(draw::VERTEX_BUFFER_COUNT, 3);
+    b.begin(PrimitiveTopology::TRIANGLES, false);
+    b.end();
+    b.flush();
+    assert_eq!(b.draws(), [arrays(0, 3, 0, 1)]);
+    assert_eq!(b.renderer.conditions, [Some(condition)]);
+
+    b.call(CLEAR_SURFACE, 0x3f);
+    assert!(b.take().is_empty(), "the predicate is zero");
+    b.begin(PrimitiveTopology::TRIANGLES, false);
+    b.end();
+    b.flush();
+    assert!(b.draws().is_empty(), "draws keep the host's result");
+
+    b.renderer.conditions.clear();
+    b.run(|engine, ctx| engine.set_render_condition(ctx, 1, condition));
+    b.call(
+        reg_index!(Regs, render_enable_override),
+        RenderEnableOverride::ALWAYS_RENDER.0,
+    );
+    b.begin(PrimitiveTopology::TRIANGLES, false);
+    b.end();
+    b.flush();
+    assert_eq!(b.draws(), [arrays(0, 3, 0, 1)]);
+    assert_eq!(b.renderer.conditions, [None], "the override wins");
+}
+
+#[test]
+fn gpu_render_conditions_draw_the_pending_draw_first() {
+    let mut b = Bench::new();
+    b.call(draw::VERTEX_BUFFER_COUNT, 3);
+    b.begin(PrimitiveTopology::TRIANGLES, false);
+    b.end();
+    let condition = RenderCondition {
+        predicate: GpuPredicate(4),
+        inverted: true,
+    };
+    b.run(|engine, ctx| engine.set_render_condition(ctx, 0, condition));
+    assert_eq!(b.draws(), [arrays(0, 3, 0, 1)]);
+    assert_eq!(b.renderer.conditions, [None]);
 }

@@ -31,7 +31,7 @@ use self::profile::{Flush, Profile};
 use self::translate::{Step, Translator};
 use self::x64::{EXIT_FAULT, EXIT_INTERRUPT, SPILL_SLOTS, Target};
 use crate::decoder::{AtomicOp, decode};
-use crate::interpreter::{Exit, Interpreter, atomic_cas, atomic_rmw, cas128};
+use crate::interpreter::{Exit, Interpreter, Lse, LseFault, cas128, lse_atomic};
 use crate::{
     CpuConfig, CpuCore, CpuFault, GuestClock, HaltReason, InterruptHandle, ThreadContext, TscScale,
 };
@@ -157,37 +157,47 @@ const ATOMIC_OPS: [AtomicOp; 9] = [
 /// and the operation above it; the operands are in `scratch` and `scratch2`.
 extern "sysv64" fn atomic_slow(state: &mut JitState, addr: u64, pc: u64, info: u32) -> bool {
     let size = info as u8;
-    if addr & ((1 << size) - 1) != 0 {
-        state.fault = Some(CpuFault::Alignment { pc, addr });
-        return true;
-    }
     let (scratch, scratch2) = (state.scratch, state.scratch2);
-    let op = (info >> 8) as i32;
     // SAFETY: called from a slow path.
     let memory = unsafe { state.memory() };
-    let result = memory.write_with(addr, MemoryPermission::READ_WRITE, |ptr| {
-        if size == 4 {
-            // SAFETY: the pair is 16-byte aligned, so it lies in the one page of `ptr`.
-            return unsafe { cas128(ptr, scratch, scratch2) };
+    let result = if size == 4 {
+        if addr & 15 != 0 {
+            Err(LseFault::Alignment)
+        } else {
+            memory
+                .write_with(addr, MemoryPermission::READ_WRITE, |ptr| {
+                    // SAFETY: the pair is 16-byte aligned, so it lies in the one page of `ptr`.
+                    unsafe { cas128(ptr, scratch, scratch2) }
+                })
+                .map_err(|_| LseFault::Data)
         }
+    } else {
         let (operand, second) = (scratch as u64, scratch2 as u64);
-        // SAFETY: the access is naturally aligned, so it stays inside the one mapped guest page
-        // of `ptr`.
-        u128::from(unsafe {
-            if op == x64::ATOMIC_CAS {
-                atomic_cas(ptr, size, operand, second)
-            } else {
-                atomic_rmw(ptr, size, ATOMIC_OPS[op as usize], operand)
+        let op = (info >> 8) as i32;
+        let access = if op == x64::ATOMIC_CAS {
+            Lse::Cas {
+                expected: operand,
+                new: second,
             }
-        })
-    });
-    let Ok(old) = result else {
-        state.fault = Some(CpuFault::Data {
-            pc,
-            addr,
-            write: true,
-        });
-        return true;
+        } else {
+            Lse::Rmw(ATOMIC_OPS[op as usize], operand)
+        };
+        lse_atomic(memory, addr, size, access).map(u128::from)
+    };
+    let old = match result {
+        Ok(old) => old,
+        Err(LseFault::Alignment) => {
+            state.fault = Some(CpuFault::Alignment { pc, addr });
+            return true;
+        }
+        Err(LseFault::Data) => {
+            state.fault = Some(CpuFault::Data {
+                pc,
+                addr,
+                write: true,
+            });
+            return true;
+        }
     };
     state.scratch = old;
     if size == 4 {

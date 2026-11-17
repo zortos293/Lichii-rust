@@ -16,7 +16,7 @@ use lichii_common::GpuVAddr;
 use lichii_texture::block_linear::GobLayout;
 
 use crate::activity::Activity;
-use crate::backend::{ChannelId, GpuWrittenPages, Rasterizer};
+use crate::backend::{ChannelId, GpuWrittenPages, Rasterizer, RenderCondition};
 use crate::gmmu::Gmmu;
 use crate::host1x::Syncpoints;
 
@@ -92,6 +92,21 @@ pub trait Engine: Send {
     /// word after it comes from the next address. The front sends it for compute on Switch 1, and
     /// again wherever the words stop being contiguous.
     fn upload_source(&mut self, _address: GpuVAddr) {}
+
+    /// The 3D engine's registers, which macros the back runs read.
+    fn graphics_state(&self) -> Option<&maxwell_3d::RegisterState> {
+        None
+    }
+
+    /// A macro the back ran wrote the 3D engine's RENDER_ENABLE_MODE as `mode`, which holds only
+    /// where `condition` does on the host GPU. Other engines ignore it.
+    fn set_render_condition(
+        &mut self,
+        _ctx: &mut EngineContext<'_>,
+        _mode: u32,
+        _condition: RenderCondition,
+    ) {
+    }
 }
 
 impl Engine for kepler_memory::KeplerMemory {
@@ -125,8 +140,21 @@ impl Engine for maxwell_3d::Maxwell3d {
         maxwell_3d::Maxwell3d::call_multi(self, ctx, method, arguments);
     }
 
+    fn set_render_condition(
+        &mut self,
+        ctx: &mut EngineContext<'_>,
+        mode: u32,
+        condition: RenderCondition,
+    ) {
+        maxwell_3d::Maxwell3d::set_render_condition(self, ctx, mode, condition);
+    }
+
     fn flush(&mut self, ctx: &mut EngineContext<'_>) {
         maxwell_3d::Maxwell3d::flush(self, ctx);
+    }
+
+    fn graphics_state(&self) -> Option<&maxwell_3d::RegisterState> {
+        Some(&self.state)
     }
 }
 
