@@ -36,6 +36,7 @@ mod guest_sync;
 mod info;
 #[cfg(test)]
 mod tests;
+mod unswizzle;
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
@@ -205,6 +206,8 @@ pub struct Traffic {
     pub download_bytes: u64,
     /// Overlap syncs done on the GPU instead of through guest memory.
     pub gpu_syncs: u64,
+    /// Block-linear subresources that uploads untiled on the GPU instead of the CPU.
+    pub gpu_untiled: u64,
     /// Downloads served from a copy taken when the work writing the image was submitted.
     pub captured_downloads: u64,
 }
@@ -634,6 +637,7 @@ struct Scratch {
     convert: Vec<u8>,
     regions: Vec<vk::BufferImageCopy>,
     astc_levels: Vec<astc::AstcLevel>,
+    unswizzles: Vec<unswizzle::UnswizzleLevel>,
 }
 
 /// Host images for guest images. Owned by the rasterizer on the GPU thread.
@@ -650,6 +654,10 @@ pub struct TextureCache {
     astc: Option<astc::AstcDecoder>,
     /// Device memory the decoder's scratch buffer takes at most: [`astc::SCRATCH_BYTES`].
     astc_scratch: u64,
+    /// Whether block-linear uploads untile on the GPU; false keeps them on the CPU.
+    unswizzle_on_gpu: bool,
+    /// The GPU untiler, created by the first upload.
+    untiler: Option<unswizzle::Unswizzler>,
     scale: ResolutionScale,
     slots: Vec<Slot>,
     free: Vec<u32>,
@@ -850,8 +858,9 @@ fn pitch_overlap(
     })
 }
 
-/// Reads guest bytes `[offset, offset + out.len())` of an image; unmapped pages read zero, and
-/// are only reported outside lazy device ranges, whose pages without memory are zero.
+/// Reads guest bytes `[offset, offset + out.len())` of an image from its `segments` (in offset
+/// order), writing each byte of `out` once; unmapped pages read zero, and are only reported
+/// outside lazy device ranges, whose pages without memory are zero.
 fn read_guest(
     memory: &DeviceAddressSpace,
     lazy: &LazyDeviceRanges,
@@ -859,13 +868,17 @@ fn read_guest(
     offset: u64,
     out: &mut [u8],
 ) {
-    out.fill(0);
     let end = offset + out.len() as u64;
+    let mut filled = offset;
     for s in segments {
         let (start, stop) = (s.offset.max(offset), (s.offset + s.size).min(end));
         if start >= stop {
             continue;
         }
+        if start > filled {
+            out[(filled - offset) as usize..(start - offset) as usize].fill(0);
+        }
+        filled = filled.max(stop);
         let chunk = &mut out[(start - offset) as usize..(stop - offset) as usize];
         let daddr = s.daddr + (start - s.offset);
         if memory.read_bytes(daddr, chunk).is_ok() {
@@ -889,6 +902,7 @@ fn read_guest(
             tracing::warn!(daddr, "texture reads unmapped device memory");
         }
     }
+    out[(filled - offset) as usize..].fill(0);
 }
 
 /// An ASTC void-extent block of transparent black: unmapped sparse pages of an ASTC image
@@ -1051,6 +1065,8 @@ impl TextureCache {
             astc_decode: AstcDecode::default(),
             astc: None,
             astc_scratch: astc::SCRATCH_BYTES,
+            unswizzle_on_gpu: true,
+            untiler: None,
             scale: ResolutionScale::X1,
             slots: Vec::new(),
             free: Vec::new(),
@@ -3269,12 +3285,22 @@ impl TextureCache {
         let device = self.device.clone();
         let gpu_decode = self.astc_decode == AstcDecode::Gpu;
         let astc_scratch = self.astc_scratch;
+        if self.unswizzle_on_gpu && self.untiler.is_none() {
+            match unswizzle::Unswizzler::new(&device) {
+                Ok(untiler) => self.untiler = Some(untiler),
+                Err(error) => {
+                    tracing::warn!(%error, "no GPU untiling; block-linear uploads untile on the CPU");
+                    self.unswizzle_on_gpu = false;
+                }
+            }
+        }
         let Self {
             slots,
             scratch,
             traffic,
             lazy,
             astc,
+            untiler,
             ..
         } = self;
         let image = slots[id.index as usize]
@@ -3300,7 +3326,22 @@ impl TextureCache {
         };
         let levels = image.trim..image.trim + image.image.desc().mip_levels;
         let align = alignment(&host, format);
+        let direct = gpu_astc
+            || host.conversion == Conversion::None && convert::depth_planes(host.format).is_none();
+        let untiled_on_gpu = |level: u32| -> Option<Tiling> {
+            let untiler = untiler.as_ref()?;
+            let GuestLayout::BlockLinear { .. } = info.layout else {
+                return None;
+            };
+            let tiling = info.surface().level_tiling(level);
+            (direct
+                && untiler.takes(&tiling)
+                && staged(info.level_extent(level)) == tiling.linear_size_bytes())
+            .then_some(tiling)
+        };
+        let tiled_align = align.max(device.properties.limits.min_storage_buffer_offset_alignment);
         let mut total = 0u64;
+        let mut tiled_total = 0u64;
         for layer in 0..info.layers {
             for level in levels
                 .clone()
@@ -3308,6 +3349,9 @@ impl TextureCache {
             {
                 total = total.next_multiple_of(align) + staged(info.level_extent(level)) as u64;
                 total = total.next_multiple_of(align);
+                if let Some(tiling) = untiled_on_gpu(level) {
+                    tiled_total += (tiling.size_bytes() as u64).next_multiple_of(tiled_align);
+                }
             }
         }
         if total == 0 {
@@ -3315,14 +3359,18 @@ impl TextureCache {
         }
         traffic.uploads += 1;
         traffic.upload_bytes += total;
-        let slice = tx.staging.alloc(tx.scheduler, total, align)?;
+        let tiled_base = total.next_multiple_of(tiled_align);
+        let slice = tx
+            .staging
+            .alloc(tx.scheduler, tiled_base + tiled_total, align)?;
         let (buffer, base_offset) = (slice.buffer, slice.offset);
+        let (linear_data, tiled_data) = slice.data.split_at_mut(tiled_base as usize);
         scratch.regions.clear();
         scratch.astc_levels.clear();
+        scratch.unswizzles.clear();
         let mut offset = 0usize;
+        let mut tiled_offset = 0usize;
         let [main_aspect, stencil_aspect] = aspects_of(host.format);
-        let direct = gpu_astc
-            || host.conversion == Conversion::None && convert::depth_planes(host.format).is_none();
         for layer in 0..info.layers {
             for level in levels
                 .clone()
@@ -3332,10 +3380,30 @@ impl TextureCache {
                 let layout = convert::host_layout(format, &host, extent);
                 let size = staged(extent);
                 offset = offset.next_multiple_of(align as usize);
-                let out = &mut slice.data[offset..offset + size];
+                let out = &mut linear_data[offset..offset + size];
                 let guest_offset = info.subresource_offset(level, layer);
                 let linear_len = convert::guest_level_bytes(format, extent);
                 match info.layout {
+                    GuestLayout::BlockLinear { .. } if let Some(tiling) = untiled_on_gpu(level) => {
+                        let tiled =
+                            &mut tiled_data[tiled_offset..tiled_offset + tiling.size_bytes()];
+                        read_guest(tx.memory, lazy, &image.segments, guest_offset, tiled);
+                        if image.sparse_va.is_some() && format.is_astc() {
+                            fill_unmapped(
+                                &image.segments,
+                                guest_offset,
+                                tiled,
+                                &ASTC_TRANSPARENT_BLACK,
+                            );
+                        }
+                        traffic.gpu_untiled += 1;
+                        scratch.unswizzles.push(unswizzle::UnswizzleLevel {
+                            tiling,
+                            tiled: base_offset + tiled_base + tiled_offset as u64,
+                            linear: base_offset + offset as u64,
+                        });
+                        tiled_offset += tiling.size_bytes().next_multiple_of(tiled_align as usize);
+                    }
                     GuestLayout::BlockLinear { .. } => {
                         let tiling = info.surface().level_tiling(level);
                         scratch.tiled.resize(tiling.size_bytes(), 0);
@@ -3433,6 +3501,11 @@ impl TextureCache {
             }
         }
         let cmd = tx.scheduler.record()?;
+        if let Some(untiler) = untiler.as_mut()
+            && !scratch.unswizzles.is_empty()
+        {
+            untiler.record(tx.scheduler, cmd, buffer, &scratch.unswizzles)?;
+        }
         if image.dirty_whole {
             image.access.layout = vk::ImageLayout::UNDEFINED;
         }
