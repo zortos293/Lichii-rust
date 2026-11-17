@@ -5,6 +5,7 @@
 //! interrupt request) and reports it as a [`HaltReason`].
 
 pub mod decoder;
+pub mod diag_trace;
 mod interpreter;
 #[cfg(target_arch = "x86_64")]
 mod jit;

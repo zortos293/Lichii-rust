@@ -224,4 +224,43 @@ fn log_fault_state(thread: &Thread, ctx: &ThreadContext) {
         code_from = format_args!("{start:#x}"),
         "guest fault state: code {code}; {registers}"
     );
+    let memory = thread.process().memory();
+    let window = ctx.pc.wrapping_sub(0x200) & !3;
+    for i in 0..0x90u64 {
+        let at = window + i * 4;
+        if let Ok(word) = memory.read::<u32>(at) {
+            tracing::error!(
+                "guest fault code {at:#x}: {word:08x} {:?}",
+                lichii_cpu::decoder::decode(word)
+            );
+        }
+    }
+    for (name, value) in ctx
+        .x
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| (format!("x{i}"), x))
+        .chain([("sp".to_owned(), ctx.sp)])
+    {
+        let base = value.wrapping_sub(0x40) & !7;
+        let mut bytes = [0u8; 0xc0];
+        if memory.read_bytes(base, &mut bytes).is_ok() {
+            let words = bytes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|&w| format!("{:x}", u64::from_le_bytes(w)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::error!("guest fault mem {name} {base:#x}: {words}");
+        }
+    }
+    let trace = lichii_cpu::diag_trace::recent();
+    tracing::error!("guest fault trace: {} entries on this core", trace.len());
+    for [pc, x0, x19, x20, x30, tls] in trace {
+        let mark = if tls == ctx.tpidrro_el0 { "*" } else { " " };
+        tracing::error!(
+            "guest fault trace{mark} pc={pc:#x} x0={x0:#x} x19={x19:#x} x20={x20:#x} x30={x30:#x} tls={tls:#x}"
+        );
+    }
 }

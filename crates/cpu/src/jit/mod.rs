@@ -550,8 +550,12 @@ impl Jit {
     /// runs mapped.
     fn run_blocks(&mut self, ctx: &mut ThreadContext) -> HaltReason {
         let _fp = simd::HostFp::enter();
+        let trace = crate::diag_trace::enabled();
         loop {
             let link = std::mem::take(&mut self.state.link);
+            if trace {
+                crate::diag_trace::record(ctx);
+            }
             if self.interrupt.is_signaled() && self.interrupt.take() {
                 return HaltReason::Interrupted;
             }
@@ -576,10 +580,12 @@ impl Jit {
                     continue;
                 }
             };
-            if link != 0 && self.cache.generation() == generation {
-                self.cache.link(link, ctx.pc, code);
+            if !trace {
+                if link != 0 && self.cache.generation() == generation {
+                    self.cache.link(link, ctx.pc, code);
+                }
+                self.cache.publish(ctx.pc, code);
             }
-            self.cache.publish(ctx.pc, code);
             self.state.materialize = self.cache.materialize();
             let enter = self.cache.trampoline();
             // SAFETY: `code` is a compiled block in this core's code memory; it only touches
