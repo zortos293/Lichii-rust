@@ -19,6 +19,8 @@ pub enum Codec {
     H264,
     Vp8,
     Vp9,
+    /// AV1 temporal units of low-overhead OBUs, decoded by dav1d through FFmpeg.
+    Av1,
 }
 
 impl Codec {
@@ -29,6 +31,8 @@ impl Codec {
             Some(Self::Vp9)
         } else if mime.contains("vp8") {
             Some(Self::Vp8)
+        } else if mime.contains("av01") || mime.contains("av1") {
+            Some(Self::Av1)
         } else if mime.contains("avc") || mime.contains("264") {
             Some(Self::H264)
         } else {
@@ -36,11 +40,14 @@ impl Codec {
         }
     }
 
-    fn decoder_name(self) -> &'static CStr {
+    /// FFmpeg decoders for the codec, best first. FFmpeg's own `av1` decoder is left out: it
+    /// only decodes through a GPU hwaccel.
+    fn decoder_names(self) -> &'static [&'static CStr] {
         match self {
-            Self::H264 => c"h264",
-            Self::Vp8 => c"vp8",
-            Self::Vp9 => c"vp9",
+            Self::H264 => &[c"h264"],
+            Self::Vp8 => &[c"vp8"],
+            Self::Vp9 => &[c"vp9"],
+            Self::Av1 => &[c"libdav1d", c"libaom-av1"],
         }
     }
 }
@@ -107,10 +114,14 @@ impl Decoder {
         // SAFETY: plain FFmpeg allocation calls; every pointer is checked before use and owned by
         // the returned decoder, whose Drop frees it.
         unsafe {
-            let found = (api.avcodec_find_decoder_by_name)(codec.decoder_name().as_ptr());
-            if found.is_null() {
+            let Some(found) = codec
+                .decoder_names()
+                .iter()
+                .map(|name| (api.avcodec_find_decoder_by_name)(name.as_ptr()))
+                .find(|found| !found.is_null())
+            else {
                 return Err(VideoError::NoDecoder(codec));
-            }
+            };
             let decoder = Self {
                 api,
                 codec,
@@ -413,6 +424,8 @@ mod tests {
         assert_eq!(Codec::from_mime("video/x-vnd.on2.vp8"), Some(Codec::Vp8));
         assert_eq!(Codec::from_mime("video/avc"), Some(Codec::H264));
         assert_eq!(Codec::from_mime("video/H264"), Some(Codec::H264));
+        assert_eq!(Codec::from_mime("video/av01"), Some(Codec::Av1));
+        assert_eq!(Codec::from_mime("video/AV1"), Some(Codec::Av1));
         assert_eq!(Codec::from_mime("video/hevc"), None);
     }
 }
