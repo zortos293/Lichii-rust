@@ -256,6 +256,26 @@ fn log_fault_state(thread: &Thread, ctx: &ThreadContext) {
         }
     }
     let trace = lichii_cpu::diag_trace::recent();
+    let mut blocks: Vec<u64> = trace
+        .iter()
+        .rev()
+        .filter(|e| e[5] == ctx.tpidrro_el0)
+        .take(400)
+        .map(|e| e[0])
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    for start in blocks {
+        for i in 0..24u64 {
+            let at = start + i * 4;
+            if let Ok(word) = memory.read::<u32>(at) {
+                tracing::error!(
+                    "guest fault block {start:#x} {at:#x}: {word:08x} {:?}",
+                    lichii_cpu::decoder::decode(word)
+                );
+            }
+        }
+    }
     tracing::error!("guest fault trace: {} entries on this core", trace.len());
     for [pc, x0, x19, x20, x30, tls] in trace {
         let mark = if tls == ctx.tpidrro_el0 { "*" } else { " " };
