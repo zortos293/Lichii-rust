@@ -11,7 +11,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lichii_cpu::InterruptHandle;
 use parking_lot::{Condvar, Mutex};
@@ -81,6 +81,11 @@ impl RunQueue {
 struct Core {
     queue: Mutex<RunQueue>,
     notified: Mutex<bool>,
+    /// Set by [`Scheduler::unpark`] before it notifies, so an idle core polling for work sees
+    /// the wake without the host waking a parked thread.
+    woken: AtomicBool,
+    /// How long this core polls before it parks, adapted after every idle period.
+    poll_ns: AtomicU64,
     wakeup: Condvar,
     interrupt: Mutex<Option<InterruptHandle>>,
     running_priority: AtomicU32,
@@ -109,6 +114,8 @@ pub(crate) enum Preempt {
 
 pub struct Scheduler {
     cores: Box<[Core]>,
+    /// The longest an idle core polls for work before it parks; zero parks at once.
+    idle_poll_limit_ns: u64,
     idle: AtomicU64,
     shutdown: AtomicBool,
     paused: AtomicBool,
@@ -118,12 +125,19 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    pub(crate) fn new(core_count: usize) -> Self {
+    /// `idle_poll` bounds how long an idle core waits for work in a poll before it parks.
+    /// Guest job systems hand work between cores many times a frame, and a parked core adds the
+    /// host's thread wake-up latency to every handoff.
+    pub(crate) fn new(core_count: usize, idle_poll: Duration) -> Self {
+        let idle_poll_limit_ns = idle_poll.as_nanos().min(u128::from(u64::MAX)) as u64;
         Self {
+            idle_poll_limit_ns,
             cores: (0..core_count)
                 .map(|_| Core {
                     queue: Mutex::new(RunQueue::new()),
                     notified: Mutex::new(false),
+                    woken: AtomicBool::new(false),
+                    poll_ns: AtomicU64::new(idle_poll_limit_ns),
                     wakeup: Condvar::new(),
                     interrupt: Mutex::new(None),
                     running_priority: AtomicU32::new(IDLE_PRIORITY),
@@ -179,6 +193,7 @@ impl Scheduler {
 
     fn unpark(&self, core: usize) {
         let c = &self.cores[core];
+        c.woken.store(true, Ordering::Release);
         *c.notified.lock() = true;
         c.wakeup.notify_one();
     }
@@ -264,12 +279,25 @@ impl Scheduler {
                 return Some(picked);
             }
             let c = &self.cores[core];
+            let start = Instant::now();
+            let poll = c.poll_ns.load(Ordering::Relaxed);
+            let polled = poll != 0
+                && !self.paused.load(Ordering::Acquire)
+                && poll_for_wake(c, start + Duration::from_nanos(poll));
             let mut notified = c.notified.lock();
-            if !*notified && !self.shutdown.load(Ordering::Acquire) {
+            if !polled && !*notified && !self.shutdown.load(Ordering::Acquire) {
                 c.wakeup.wait_for(&mut notified, PARK_TIMEOUT);
             }
             *notified = false;
+            c.woken.store(false, Ordering::Relaxed);
             drop(notified);
+            if self.idle_poll_limit_ns != 0 {
+                let waited = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+                c.poll_ns.store(
+                    next_poll_window(poll, waited, self.idle_poll_limit_ns),
+                    Ordering::Relaxed,
+                );
+            }
             self.idle.fetch_and(!(1 << core), Ordering::SeqCst);
         }
     }
@@ -518,4 +546,58 @@ enum Take {
     Found(Picked),
     Contended,
     Empty,
+}
+
+/// Waits for [`Scheduler::unpark`] on `core` until `deadline`: pauses between reads of the flag,
+/// and yields the host core now and then so an idle guest core never starves a host thread.
+fn poll_for_wake(core: &Core, deadline: Instant) -> bool {
+    let mut spins = 0u32;
+    loop {
+        if core.woken.load(Ordering::Acquire) {
+            return true;
+        }
+        spins = spins.wrapping_add(1);
+        if !spins.is_multiple_of(32) {
+            std::hint::spin_loop();
+            continue;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// The next poll window after an idle period of `waited` ns, as Linux's cpuidle-haltpoll and the
+/// reference's `NextPollWindow` adapt it: an idle period the poll caught keeps the window, one a
+/// longer poll would have caught doubles it up to `limit`, and one past the limit halves it, down
+/// to an eighth of the limit.
+fn next_poll_window(poll: u64, waited: u64, limit: u64) -> u64 {
+    if waited <= poll {
+        poll
+    } else if waited <= limit {
+        (poll * 2).clamp(limit / 8, limit)
+    } else {
+        (poll / 2).max(limit / 8)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_poll_window;
+
+    #[test]
+    fn the_poll_window_adapts_like_haltpoll() {
+        let limit = 100_000;
+        assert_eq!(next_poll_window(limit, 30_000, limit), limit);
+        assert_eq!(next_poll_window(25_000, 60_000, limit), 50_000);
+        assert_eq!(next_poll_window(60_000, 90_000, limit), limit);
+        assert_eq!(next_poll_window(limit, 5_000_000, limit), 50_000);
+        let mut poll = limit;
+        for _ in 0..10 {
+            poll = next_poll_window(poll, 10_000_000, limit);
+        }
+        assert_eq!(poll, limit / 8);
+        assert_eq!(next_poll_window(poll, 20_000, limit), 25_000);
+    }
 }

@@ -430,6 +430,36 @@ impl Rig {
         completion: Completion,
         engines: Engines,
     ) -> Self {
+        Self::configured(
+            console,
+            threading,
+            ring_slots,
+            completion,
+            engines,
+            crate::gpu::MIN_POLL,
+        )
+    }
+
+    /// A rig whose front first sleeps `semaphore_poll` between looks at semaphores.
+    fn polling(threading: Threading, semaphore_poll: std::time::Duration) -> Self {
+        Self::configured(
+            Console::Switch1,
+            threading,
+            crate::gpu::DEFAULT_RING_SLOTS,
+            Completion::Immediate,
+            Engines::Recording,
+            semaphore_poll,
+        )
+    }
+
+    fn configured(
+        console: Console,
+        threading: Threading,
+        ring_slots: usize,
+        completion: Completion,
+        engines: Engines,
+        semaphore_poll: std::time::Duration,
+    ) -> Self {
         let physical = Arc::new(PhysicalMemory::new(1 << 24).unwrap());
         let space = Arc::new(AddressSpace::new(physical.clone(), 39));
         space.map(CPU_VA, 0x10_0000, MAPPED, MemoryPermission::READ_WRITE);
@@ -463,6 +493,7 @@ impl Rig {
                         state: RegisterState::new(),
                     })),
                 }),
+                semaphore_poll,
                 ..GpuConfig::new(console)
             },
             |handles| {
@@ -1005,6 +1036,103 @@ fn acquire_released_by_the_cpu_resumes() {
         assert_eq!(rig.read(SEMAPHORE), 9);
         assert_eq!(rig.read(SEMAPHORE + 4), 0);
     });
+}
+
+/// Words that write `argument` to 0x700, acquire `semaphore` == 7 and write `argument` to
+/// 0x701.
+fn gated(semaphore: u64, argument: u32) -> Pushbuffer {
+    Pushbuffer::default()
+        .inc(0, 0x700, &[argument])
+        .host(host::SEMAPHORE_A, (semaphore >> 32) as u32)
+        .host(host::SEMAPHORE_B, semaphore as u32)
+        .host(host::SEMAPHORE_C, 7)
+        .host(host::SEMAPHORE_D, 1)
+        .inc(0, 0x701, &[argument])
+}
+
+fn ran(log: &Log, method: u32, value: u32) -> bool {
+    log.lock().iter().any(|event| {
+        matches!(*event, Event::Method { method: m, argument, .. } if m == method && argument == value)
+    })
+}
+
+/// A semaphore the guest CPU writes right after a channel suspends on it resumes the channel
+/// without waiting for the front's next look, however long the front sleeps between looks.
+/// Each attempt writes once the back ran the work before the acquire; one of five landing in
+/// the front's spin is enough, and a ten-second poll fails them all.
+#[test]
+fn a_cpu_release_after_the_acquire_does_not_wait_for_the_poll() {
+    use std::time::{Duration, Instant};
+
+    each_mode(|threading| {
+        let mut rig = Rig::polling(threading, Duration::from_secs(10));
+        let channel = rig.channel(HostClass::Maxwell);
+        rig.submit(channel, &Pushbuffer::default().bind(0, MAXWELL_3D).0);
+        let log = rig.log.clone();
+        let caught = (1..=5).any(|attempt| {
+            let semaphore = SEMAPHORE + u64::from(attempt) * 0x10;
+            rig.submit(channel, &gated(semaphore, attempt).0);
+            while !ran(&log, 0x700, attempt) {
+                std::hint::spin_loop();
+            }
+            rig.memory.write(semaphore, 7u32).unwrap();
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(50) {
+                if ran(&log, 0x701, attempt) {
+                    return true;
+                }
+                std::thread::yield_now();
+            }
+            rig.gpu.wake();
+            while !ran(&log, 0x701, attempt) {
+                std::thread::yield_now();
+            }
+            false
+        });
+        assert!(caught, "{threading:?}: every release waited for the poll");
+    });
+}
+
+/// The time from a guest CPU write that releases a suspended channel to the channel's next
+/// method, at the default poll:
+/// `cargo test --release -p lichii-gpu --lib cpu_release_latency -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn cpu_release_latency_of_a_suspended_channel() {
+    use std::time::{Duration, Instant};
+
+    let mut rig = Rig::new(Threading::Split);
+    let channel = rig.channel(HostClass::Maxwell);
+    rig.submit(channel, &Pushbuffer::default().bind(0, MAXWELL_3D).0);
+    let log = rig.log.clone();
+    let mut latencies = Vec::new();
+    for attempt in 1..=400u32 {
+        let semaphore = SEMAPHORE + u64::from(attempt % 64) * 0x10;
+        rig.memory.write(semaphore, 0u32).unwrap();
+        rig.submit(channel, &gated(semaphore, attempt).0);
+        while !ran(&log, 0x700, attempt) {
+            std::hint::spin_loop();
+        }
+        let delay = Duration::from_micros(u64::from(attempt % 5) * 20);
+        let start = Instant::now();
+        while start.elapsed() < delay {
+            std::hint::spin_loop();
+        }
+        rig.memory.write(semaphore, 7u32).unwrap();
+        let written = Instant::now();
+        while !ran(&log, 0x701, attempt) {
+            std::hint::spin_loop();
+        }
+        latencies.push(written.elapsed());
+        log.lock().clear();
+    }
+    latencies.sort();
+    eprintln!(
+        "CPU release to the next method, writes 0-80 us after the acquire: median {:?}, p90 {:?}, max {:?}",
+        latencies[latencies.len() / 2],
+        latencies[latencies.len() * 9 / 10],
+        latencies[latencies.len() - 1]
+    );
 }
 
 fn increments(events: &[Event]) -> Vec<Event> {

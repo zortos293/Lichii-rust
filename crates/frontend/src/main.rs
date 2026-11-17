@@ -13,6 +13,7 @@ mod install;
 mod per_game;
 mod session;
 mod setup;
+mod timer_resolution;
 mod ui;
 
 use std::path::Path;
@@ -84,6 +85,7 @@ fn main() -> ExitCode {
     // SAFETY: no other thread has started and no Vulkan instance exists yet.
     unsafe { lichii_vulkan::debug::init(&settings.debug, &paths.data_dir.join("gpucrash")) };
 
+    let _timer_resolution = timer_resolution::TimerResolution::raise();
     let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
         Ok(event_loop) => event_loop,
         Err(e) => {
