@@ -925,11 +925,10 @@ pub(crate) fn load(path: &Path, options: &LoadOptions) -> LoaderResult<ProgramIm
     let meta = nup.metadata(&selection);
     let nacp = build_nacp(&meta, program.title_id, &nup.display_version(&selection));
     let romfs = mods.layer_romfs(nup.merged_romfs(&selection)?)?;
-    let mut image = ProgramImage::new(npdm, modules, romfs, nacp);
+    let mut image = ProgramImage::new(npdm, modules, romfs, nacp, present_interval);
     image.icon = icon(&meta, options.language);
     image.version = nup.packages[selection.update.unwrap_or(selection.program)].version;
     image.add_ons = nup.add_ons();
-    image.present_interval = present_interval;
     Ok(image)
 }
 

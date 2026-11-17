@@ -119,6 +119,8 @@ mod tests {
     use crate::nso::HashCheck;
     use crate::nso::tests::{Compression, build_nso, segments};
     use crate::patch::{ModOptions, Mods};
+    use crate::title::tests::TempDir;
+    use crate::title::{LoadOptions, load};
     use lichii_fs::MemDir;
 
     const MODE: usize = 0x400;
@@ -134,9 +136,9 @@ mod tests {
             .collect()
     }
 
-    /// A `main` whose .text holds the three sites as the game has them: a `b.ne` past the mode
-    /// load, the frame cost load into x21, and a `b.lo` 6 words on past the vblank wait.
-    fn fake_main(extra: &[(usize, u32)]) -> Module {
+    /// A `main` NSO whose .text holds the three sites as the game has them: a `b.ne` past the
+    /// mode load, the frame cost load into x21, and a `b.lo` 6 words on past the vblank wait.
+    fn fake_main_nso(extra: &[(usize, u32)]) -> Vec<u8> {
         let [_, rodata, data] = segments(1);
         let mut text = vec![0u8; TEXT_WORDS * 4];
         let sites = [
@@ -161,9 +163,12 @@ mod tests {
         for (index, word) in sites.into_iter().flatten() {
             text[index * 4..][..4].copy_from_slice(&word.to_le_bytes());
         }
-        let nso = build_nso(&[text, rodata, data], Compression::None, 0, false);
+        build_nso(&[text, rodata, data], Compression::None, 0, false)
+    }
+
+    fn fake_main(extra: &[(usize, u32)]) -> Module {
         let exefs = MemDir::new()
-            .with_bytes("main", nso)
+            .with_bytes("main", fake_main_nso(extra))
             .with_bytes("main.npdm", build_npdm(&NpdmSpec::default()));
         let (_, mut modules) = load_exefs(&exefs, HashCheck::Skip).unwrap();
         modules.remove(0)
@@ -199,6 +204,29 @@ mod tests {
             .filter(|&i| word(&patched, i) != word(&module, i))
             .collect();
         assert_eq!(changed, [MODE, FRAME_COST, VBLANK + 2]);
+    }
+
+    #[test]
+    fn an_extracted_title_carries_the_present_interval() {
+        let temp = TempDir::new("mkw-loose");
+        let exefs = temp.0.join("exefs");
+        std::fs::create_dir_all(&exefs).unwrap();
+        std::fs::write(exefs.join("main.npdm"), build_npdm(&NpdmSpec::default())).unwrap();
+        std::fs::write(exefs.join("main"), fake_main_nso(&[])).unwrap();
+        let options = |mkw_dynamic_fps| LoadOptions {
+            hashes: HashCheck::Skip,
+            mods: ModOptions {
+                mkw_dynamic_fps,
+                ..ModOptions::default()
+            },
+            ..LoadOptions::default()
+        };
+        let main = exefs.join("main");
+        assert_eq!(
+            load(&main, &options(true)).unwrap().present_interval,
+            Some(DYNAMIC_FPS_PRESENT_INTERVAL)
+        );
+        assert_eq!(load(&main, &options(false)).unwrap().present_interval, None);
     }
 
     #[test]

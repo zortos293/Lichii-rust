@@ -113,11 +113,10 @@ pub(crate) fn load(
     let present_interval = mods.patch_modules(&mut modules)?;
     let romfs = mods.layer_romfs(selected.romfs()?)?;
     let control = selected.control(options.language);
-    let mut image = ProgramImage::new(npdm, modules, romfs, control.nacp);
+    let mut image = ProgramImage::new(npdm, modules, romfs, control.nacp, present_interval);
     image.icon = control.icon;
     image.version = selected.version;
     image.add_ons = add_ons(&contents.index, selected.application_id);
-    image.present_interval = present_interval;
     Ok(image)
 }
 

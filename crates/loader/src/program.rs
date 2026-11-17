@@ -183,11 +183,13 @@ pub struct ProgramImage {
 }
 
 impl ProgramImage {
+    /// `present_interval` is what [`crate::Mods::patch_modules`] returned for `modules`.
     pub(crate) fn new(
         npdm: Npdm,
         mut modules: Vec<Module>,
         romfs: Option<FileRef>,
         nacp: Option<Nacp>,
+        present_interval: Option<u32>,
     ) -> Self {
         let mut offset = 0;
         for module in &mut modules {
@@ -223,7 +225,7 @@ impl ProgramImage {
             version: 0,
             pseudo_device_seed,
             add_ons: Vec::new(),
-            present_interval: None,
+            present_interval,
         }
     }
 
