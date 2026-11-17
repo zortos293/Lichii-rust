@@ -8,8 +8,9 @@ mod mme64;
 use std::collections::HashMap;
 
 use super::{
-    LOAD_MME_INSTRUCTION_RAM, LOAD_MME_INSTRUCTION_RAM_POINTER, LOAD_MME_START_ADDRESS_RAM,
-    LOAD_MME_START_ADDRESS_RAM_POINTER, MacroEngine, MacroHost, MacroIsa,
+    CONDITION_MISS_LIMIT, LOAD_MME_INSTRUCTION_RAM, LOAD_MME_INSTRUCTION_RAM_POINTER,
+    LOAD_MME_START_ADDRESS_RAM, LOAD_MME_START_ADDRESS_RAM_POINTER, MacroEngine, MacroHost,
+    MacroIsa,
 };
 
 /// A register mirror that records every method write and serves DMA reads from a word map.
@@ -329,4 +330,28 @@ mod masm {
     pub fn assemble(program: &[Inst]) -> Vec<u32> {
         program.iter().flat_map(Inst::encode).collect()
     }
+}
+
+/// Condition runs stop at a start address after `CONDITION_MISS_LIMIT` calls in a row there
+/// lacked the shape of a condition; a call with the shape resets the count, and changed code
+/// forgets it.
+#[test]
+fn condition_runs_stop_where_calls_never_have_the_shape() {
+    let mut engine = engine_with(MacroIsa::Mme64, &[0, 0, 0]);
+    for _ in 1..CONDITION_MISS_LIMIT {
+        engine.note_condition_shape(0, false);
+    }
+    assert!(engine.may_run_as_condition(0));
+    engine.note_condition_shape(0, true);
+    for _ in 0..CONDITION_MISS_LIMIT {
+        assert!(engine.may_run_as_condition(0));
+        engine.note_condition_shape(0, false);
+    }
+    assert!(!engine.may_run_as_condition(0));
+    assert!(
+        engine.may_run_as_condition(3),
+        "other start addresses keep running"
+    );
+    upload(&mut engine, 0, &[1]);
+    assert!(engine.may_run_as_condition(0), "changed code runs again");
 }

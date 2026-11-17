@@ -735,60 +735,16 @@ fn run_as_condition(
     parameters: &[u32],
     writes: &mut [Vec<(u32, u32)>; 2],
 ) -> bool {
-    engine.flush(ctx);
-    let mut count = None;
-    for (differs, writes) in writes.iter_mut().enumerate() {
-        writes.clear();
-        let mut condition = ReadCondition::new(differs == 1);
-        let mut host = ConditionHost {
-            engine: &*engine,
-            ctx: &mut *ctx,
-            writes,
-        };
-        if code
-            .condition_execute(start, parameters, data_ram, &mut host, &mut condition)
-            .is_err()
-        {
-            return false;
-        }
-        let Some(tested) = condition.tested() else {
-            return false;
-        };
-        let mut words = [None; 2];
-        for (address, expected) in tested {
-            let first = *words[0].get_or_insert(address);
-            let slot = match address.wrapping_sub(first) {
-                0 => 0,
-                4 => 1,
-                _ => return false,
-            };
-            if expected != 0 {
-                return false;
-            }
-            words[slot] = Some(address);
-        }
-        count = words[0];
+    if !code.may_run_as_condition(start) {
+        return false;
     }
-    let Some(count) = count else {
+    engine.flush(ctx);
+    let shape = condition_shape(code, data_ram, engine, ctx, start, parameters, writes);
+    code.note_condition_shape(start, shape.is_some());
+    let Some((count, tests)) = shape else {
         return false;
     };
     let [zero, nonzero] = &*writes;
-    if zero.len() != nonzero.len() {
-        return false;
-    }
-    let mut tests = false;
-    for (&(method, a), &(other, b)) in zero.iter().zip(nonzero) {
-        if method != other {
-            return false;
-        }
-        if a == b {
-            continue;
-        }
-        if method != RENDER_ENABLE_MODE || !matches!((a, b), (0, 1) | (1, 0)) {
-            return false;
-        }
-        tests = true;
-    }
     let predicate = match tests {
         false => None,
         true => {
@@ -822,6 +778,74 @@ fn run_as_condition(
         }
     }
     true
+}
+
+/// The two condition runs of [`run_as_condition`] into `writes`: the count address they test
+/// and whether their writes differ in RENDER_ENABLE_MODE alone. None when the call does not have
+/// that shape.
+fn condition_shape(
+    code: &mut MacroEngine,
+    data_ram: &mut MacroDataRam,
+    engine: &dyn Engine,
+    ctx: &mut EngineContext<'_>,
+    start: u32,
+    parameters: &[u32],
+    writes: &mut [Vec<(u32, u32)>; 2],
+) -> Option<(u64, bool)> {
+    let mut count = None;
+    for (differs, writes) in writes.iter_mut().enumerate() {
+        writes.clear();
+        let mut condition = ReadCondition::new(differs == 1);
+        let mut host = ConditionHost {
+            engine: &*engine,
+            ctx: &mut *ctx,
+            writes,
+        };
+        if code
+            .condition_execute(start, parameters, data_ram, &mut host, &mut condition)
+            .is_err()
+        {
+            return None;
+        }
+        let Some(tested) = condition.tested() else {
+            return None;
+        };
+        let mut words = [None; 2];
+        for (address, expected) in tested {
+            let first = *words[0].get_or_insert(address);
+            let slot = match address.wrapping_sub(first) {
+                0 => 0,
+                4 => 1,
+                _ => return None,
+            };
+            if expected != 0 {
+                return None;
+            }
+            words[slot] = Some(address);
+        }
+        count = words[0];
+    }
+    let Some(count) = count else {
+        return None;
+    };
+    let [zero, nonzero] = &*writes;
+    if zero.len() != nonzero.len() {
+        return None;
+    }
+    let mut tests = false;
+    for (&(method, a), &(other, b)) in zero.iter().zip(nonzero) {
+        if method != other {
+            return None;
+        }
+        if a == b {
+            continue;
+        }
+        if method != RENDER_ENABLE_MODE || !matches!((a, b), (0, 1) | (1, 0)) {
+            return None;
+        }
+        tests = true;
+    }
+    Some((count, tests))
 }
 
 /// What a macro's condition run on the back ([`run_as_condition`]) runs against: the engine's
