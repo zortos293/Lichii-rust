@@ -43,12 +43,6 @@ const STREAM_LEAP_THRESHOLD: u32 = 16;
 const STREAM_LEAP_BYTES: u64 = 128 * CACHING_PAGE_SIZE;
 /// Scattered reads at least this large bind their first contiguous run instead of a gathered copy.
 const MAX_GATHER_SIZE: u64 = 64 << 20;
-/// Scattered read-only storage ranges at least this large bind the device range under their
-/// first page instead of a gathered copy, as Lichii binds an NVN storage buffer.
-const MAX_STORAGE_GATHER_SIZE: u64 = 1 << 20;
-/// The most a read-only storage binding reaches when its size word passes the end of its mapping
-/// (Lichii's cap for a bare pointer).
-const BARE_STORAGE_SIZE: u64 = 8 << 20;
 
 const CACHED_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
     vk::BufferUsageFlags::VERTEX_BUFFER.as_raw()
@@ -1709,9 +1703,7 @@ impl BufferCache {
     /// A storage buffer binding for `[gpu_va, +size)`, starting at `gpu_va` rounded down to
     /// [`BufferCache::storage_alignment`]. With `written`, the range is marked GPU-written; a
     /// written range over scattered memory binds only its first contiguous run (as Lichii does
-    /// without sparse binding). A read-only range of at least [`MAX_STORAGE_GATHER_SIZE`] over
-    /// scattered memory binds the device range under its first page, as Lichii does: all of it
-    /// while the mapping reaches that far, else up to [`BARE_STORAGE_SIZE`] of it.
+    /// without sparse binding).
     pub fn storage_buffer(
         &mut self,
         scheduler: &mut Scheduler,
@@ -1727,32 +1719,6 @@ impl BufferCache {
         let align = self.storage_alignment();
         let start = gpu_va & !(align - 1);
         let size = size + (gpu_va - start);
-        if !written && size >= MAX_STORAGE_GATHER_SIZE {
-            let mut first = None;
-            let mut mapped = 0;
-            gmmu.for_each_range(start, size, |range| {
-                first.get_or_insert(range);
-                if mapped == range.gpu_va - start && range.target != RangeTarget::Unmapped {
-                    mapped += range.size;
-                }
-            });
-            let Some(GpuRange {
-                target: RangeTarget::Device(daddr),
-                ..
-            }) = first
-            else {
-                return Ok(None);
-            };
-            let size = if size <= mapped {
-                size
-            } else {
-                mapped.min(BARE_STORAGE_SIZE)
-            };
-            let binding = self.acquire(scheduler, staging, daddr, size)?;
-            if binding.offset % align == 0 {
-                return Ok(Some(binding));
-            }
-        }
         if !written {
             return self
                 .read_range(scheduler, staging, gmmu, start, size, align)
@@ -3087,59 +3053,6 @@ mod tests {
             f.read_binding(gathered) == expected,
             "adjacent sparse and unmapped pages read zero as one hole"
         );
-        f.assert_no_validation_errors();
-    }
-
-    #[test]
-    fn large_scattered_storage_reads_bind_the_device_range_under_their_first_page() {
-        let Some(mut f) = fixture() else { return };
-        let size = MAX_STORAGE_GATHER_SIZE;
-        let base = DADDR + 0x40_0000;
-        let data = pattern(2 * size as usize, 7);
-        f.memory.write_bytes(base, &data).unwrap();
-        f.gmmu.map(GPU_VA, base, size / 2, 0, false).unwrap();
-        f.gmmu
-            .map(GPU_VA + size / 2, DADDR + 0x10_0000, size / 2, 0, false)
-            .unwrap();
-        let binding = f
-            .cache
-            .storage_buffer(
-                &mut f.scheduler,
-                &mut f.staging,
-                &f.gmmu,
-                GPU_VA,
-                size,
-                false,
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(binding.size, size);
-        assert!(
-            f.read_binding(binding) == data[..size as usize],
-            "the binding reads device memory on from the first page"
-        );
-        assert_eq!(f.cache.stats().streamed_bytes, 0, "nothing is gathered");
-
-        let holed = GPU_VA + 4 * size;
-        f.gmmu.map(holed, base, size / 2, 0, false).unwrap();
-        let binding = f
-            .cache
-            .storage_buffer(
-                &mut f.scheduler,
-                &mut f.staging,
-                &f.gmmu,
-                holed,
-                size,
-                false,
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            binding.size,
-            size / 2,
-            "a size word past the mapping stops at its end"
-        );
-        assert!(f.read_binding(binding) == data[..size as usize / 2]);
         f.assert_no_validation_errors();
     }
 
