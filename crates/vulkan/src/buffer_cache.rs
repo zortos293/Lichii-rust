@@ -2309,7 +2309,7 @@ mod tests {
         cache: BufferCache,
         device: Arc<Device>,
         memory: Arc<DeviceAddressSpace>,
-        gmmu: Gmmu,
+        gmmu: Arc<Gmmu>,
     }
 
     fn fixture() -> Option<Fixture> {
@@ -2341,7 +2341,7 @@ mod tests {
                 Arc::new(LazyDeviceRanges::new(memory.clone())),
             )
             .unwrap(),
-            gmmu: Gmmu::new(memory.clone(), BigPageSize::Size64K),
+            gmmu: Arc::new(Gmmu::new(memory.clone(), BigPageSize::Size64K)),
             device,
             memory,
         })
@@ -3942,6 +3942,89 @@ mod tests {
             full_s * 1e6 / full as f64,
             (full * 0x10000) as f64 / full_s / f64::from(1 << 20),
         );
+        f.assert_no_validation_errors();
+    }
+
+    /// Binds of a typical Mario Kart World draw: two scene uniforms at fixed addresses, three
+    /// per-object uniforms and a per-object storage read that move with the object, and one
+    /// fixed storage read, in a frame where GPU work wrote other buffers. Over big pages and over
+    /// a table split into scattered 16 KiB runs:
+    /// `cargo test --release -p lichii-vulkan --lib bind_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing"]
+    fn bind_cost() {
+        const OBJECTS: u64 = 400;
+        const FRAMES: u64 = 200;
+        const REGION: u64 = 4 << 20;
+        let Some(mut f) = fixture() else { return };
+        let big = GPU_VA;
+        f.gmmu.map(big, DADDR, REGION, 0, true).unwrap();
+        let small = GPU_VA + REGION;
+        const CHUNK: u64 = 4 * PAGE_SIZE;
+        for chunk in 0..REGION / CHUNK {
+            let daddr = DADDR + REGION + (REGION / CHUNK - 1 - chunk) * CHUNK;
+            f.gmmu
+                .map(small + chunk * CHUNK, daddr, CHUNK, 0, false)
+                .unwrap();
+        }
+        f.acquire(DADDR, 2 * REGION);
+        f.cache
+            .mark_gpu_written(f.scheduler.tick(), DADDR + REGION - 0x1000, 0x1000);
+        f.scheduler.finish().unwrap();
+        for (name, base) in [("big pages", big), ("scattered 16 KiB runs", small)] {
+            let mut uniform_ns = Vec::new();
+            let mut storage_ns = Vec::new();
+            for frame in 0..=FRAMES {
+                let start = Instant::now();
+                for object in 0..OBJECTS {
+                    let per_object = base + 0x10_0000 + object * 0x800;
+                    for (gpu_va, size) in [
+                        (base, 0x200),
+                        (base + 0x1000, 0x100),
+                        (per_object, 0x100),
+                        (per_object + 0x100, 0x300),
+                        (per_object + 0x400, 0x200),
+                    ] {
+                        f.cache
+                            .uniform_buffer(&mut f.scheduler, &mut f.staging, &f.gmmu, gpu_va, size)
+                            .unwrap()
+                            .unwrap();
+                    }
+                }
+                let uniforms = start.elapsed().as_nanos() as f64 / OBJECTS as f64;
+                let start = Instant::now();
+                for object in 0..OBJECTS {
+                    let per_object = base + 0x20_0000 + object * 0x1000;
+                    for (gpu_va, size) in [(per_object, 0x800), (base + 0x30_0000, 0x4000)] {
+                        f.cache
+                            .storage_buffer(
+                                &mut f.scheduler,
+                                &mut f.staging,
+                                &f.gmmu,
+                                gpu_va,
+                                size,
+                                false,
+                            )
+                            .unwrap()
+                            .unwrap();
+                    }
+                }
+                let storage = start.elapsed().as_nanos() as f64 / OBJECTS as f64;
+                f.scheduler.finish().unwrap();
+                if frame > 0 {
+                    uniform_ns.push(uniforms);
+                    storage_ns.push(storage);
+                }
+            }
+            uniform_ns.sort_by(f64::total_cmp);
+            storage_ns.sort_by(f64::total_cmp);
+            let half = uniform_ns.len() / 2;
+            eprintln!(
+                "{name}: per draw (best / median frame), 5 uniform binds {:.0} / {:.0} ns, \
+                 2 storage binds {:.0} / {:.0} ns",
+                uniform_ns[0], uniform_ns[half], storage_ns[0], storage_ns[half],
+            );
+        }
         f.assert_no_validation_errors();
     }
 }
