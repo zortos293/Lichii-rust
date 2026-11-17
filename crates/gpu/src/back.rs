@@ -232,14 +232,17 @@ impl Back {
         }
     }
 
-    /// The stream is empty: submits the recorded host GPU work and runs the actions of fences
-    /// whose work finished, so that a syncpoint or semaphore the guest CPU waits on lands without
-    /// more GPU work behind it. Whether fences are still pending, and the back should look again.
+    /// The stream is empty: submits the recorded host GPU work a fence waits for and runs the
+    /// actions of fences whose work finished, so that a syncpoint or semaphore the guest CPU waits
+    /// on lands without more GPU work behind it. Whether fences are still pending, and the back
+    /// should look again.
     pub(crate) fn poll_fences(&mut self) -> bool {
         if !self.rasterizer.has_pending_fences() {
             return false;
         }
-        self.rasterizer.flush_commands();
+        if self.rasterizer.has_unsubmitted_fences() {
+            self.rasterizer.flush_commands();
+        }
         self.rasterizer.release_fences(false);
         self.rasterizer.has_pending_fences()
     }
@@ -951,3 +954,6 @@ impl MacroHost for BackMacroHost<'_, '_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

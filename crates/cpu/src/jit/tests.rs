@@ -1523,6 +1523,90 @@ fn unaligned_atomics_inside_a_granule_match_the_interpreter() {
     );
 }
 
+/// A guest loop shaped like DKB's and MKW's hottest worker blocks: pointer-chasing loads, an FCMP
+/// with a conditional branch, a store, integer ALU work, a compare and select, and a counted
+/// backward branch. Prints host nanoseconds per iteration; run with
+/// `cargo test -p lichii-cpu --release jit_throughput -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn jit_throughput() {
+    throughput("hot loop", 1, 20_000_000);
+    throughput("wide", 4000, 5_000);
+}
+
+/// Runs `copies` back-to-back copies of a 17-instruction loop body, closed by one backward
+/// branch, `iterations` times, and prints the best time per copy. One copy fits the host's
+/// instruction cache; thousands do not, like a game's flat profile.
+fn throughput(name: &str, copies: usize, iterations: u64) {
+    const BODY: [u32; 17] = [
+        0xf940_1729,
+        0xaa1c_03e8,
+        0x9100_079c,
+        0x9240_1f9c,
+        0xf87c_792a,
+        0xf868_7938,
+        0xbd40_0300,
+        0x1e20_2100,
+        0x5400_0064,
+        0x9100_0400,
+        0xf900_1b20,
+        0xb940_070b,
+        0x0b0b_018c,
+        0xca0c_09ad,
+        0xeb0e_01bf,
+        0x9a8e_b1af,
+        0xf100_0421,
+    ];
+    let mut code: Vec<u32> = BODY.iter().copied().cycle().take(17 * copies).collect();
+    let back = -(code.len() as i32) & 0x7_ffff;
+    code.extend([0x5400_0001 | (back as u32) << 5, BRK]);
+    let code_size = (code.len() as u64 * 4).next_multiple_of(0x1000);
+    let physical = Arc::new(PhysicalMemory::new(code_size + DATA_SIZE).unwrap());
+    let mem = Arc::new(AddressSpace::with_fastmem(physical, 39).unwrap());
+    mem.map(CODE, 0, code_size, MemoryPermission::READ_EXECUTE);
+    mem.map(DATA, code_size, DATA_SIZE, MemoryPermission::READ_WRITE);
+    let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+    mem.write_bytes(CODE, &bytes).unwrap();
+    let mut data = vec![0u8; DATA_SIZE as usize];
+    data[0x28..0x30].copy_from_slice(&(DATA + 0x1000).to_le_bytes());
+    for i in 0..256 {
+        let at = 0x1000 + 8 * i;
+        data[at..at + 8].copy_from_slice(&(DATA + 0x2000 + 8 * (i as u64 % 4)).to_le_bytes());
+    }
+    for i in 0..4 {
+        let at = 0x2000 + 8 * i;
+        data[at..at + 4].copy_from_slice(&(i as f32 - 1.5).to_le_bytes());
+    }
+    mem.write_bytes(DATA, &data).unwrap();
+    let mut core = Jit::new(CpuConfig {
+        memory: mem,
+        monitor: Arc::new(ExclusiveMonitor::new(1)),
+        clock: Arc::new(Clock::default()),
+        core_index: 0,
+        ctr_el0: CpuConfig::DEFAULT_CTR_EL0,
+        dczid_el0: CpuConfig::DEFAULT_DCZID_EL0,
+        accuracy: CpuAccuracy::Auto,
+    })
+    .unwrap();
+    let mut best = f64::MAX;
+    for _ in 0..6 {
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            ..Default::default()
+        };
+        ctx.x[25] = DATA;
+        ctx.x[1] = iterations * copies as u64;
+        ctx.x[14] = 0x1234_5678;
+        ctx.v[8] = 0.25f32.to_bits() as u128;
+        let start = std::time::Instant::now();
+        assert_eq!(core.run(&mut ctx), HaltReason::Breakpoint(0));
+        let elapsed = start.elapsed();
+        assert_eq!(ctx.x[1], 0);
+        best = best.min(elapsed.as_nanos() as f64 / (iterations * copies as u64) as f64);
+    }
+    println!("jit_throughput {name}: {best:.2} ns per 17 guest instructions");
+}
+
 /// Keeps a value live in the first allocatable register (`rbx`) until `ADD_X10_X22_1`, so the
 /// address of a `cmpxchg16b` between them lands elsewhere.
 const MOV_X9_X22: u32 = 0xaa16_03e9;

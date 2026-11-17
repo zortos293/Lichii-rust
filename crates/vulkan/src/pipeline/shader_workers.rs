@@ -22,7 +22,7 @@ use lichii_shader::{
 use parking_lot::{Condvar, Mutex};
 
 use super::environment::{EnvRead, EnvSnapshot, ProgramEnv};
-use super::shader_cache::{hash_program, warn_failed};
+use super::shader_cache::{hash_program, keep_failure_questions, warn_failed};
 use crate::debug::shader_dump;
 
 /// Presents a queued job may go unrequested before workers drop it.
@@ -251,7 +251,7 @@ fn translate(job: &Job, profile: &Profile, host: &HostTranslateInfo) -> Option<T
             warn_failed(&env, &error);
             bindings = job.bindings;
             if !error.depends_on_textures() {
-                reads = Default::default();
+                keep_failure_questions(&mut reads);
             }
             (Err(error), None)
         }

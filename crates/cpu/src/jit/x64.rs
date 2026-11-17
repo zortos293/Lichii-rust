@@ -126,8 +126,22 @@ struct Stub {
     borrowed: [Option<u8>; 2],
 }
 
+/// `r15` points this far past the start of the `ThreadContext`, so every general register and
+/// `sp` sits within a one-byte displacement of it.
+pub(super) const CTX_BIAS: i32 = 0x80;
+
 const fn ctx(offset: usize) -> i32 {
+    offset as i32 - CTX_BIAS
+}
+
+const fn st(offset: usize) -> i32 {
     offset as i32
+}
+
+/// A `JitState` field that translated code reaches with a one-byte displacement.
+const fn st8(offset: usize) -> i8 {
+    assert!(offset < 0x80);
+    offset as i8
 }
 
 const CTX_X: i32 = ctx(offset_of!(ThreadContext, x));
@@ -139,31 +153,32 @@ pub(super) const CTX_FPSR: i32 = ctx(offset_of!(ThreadContext, fpsr));
 const CTX_V: i32 = ctx(offset_of!(ThreadContext, v));
 const CTX_TPIDR: i32 = ctx(offset_of!(ThreadContext, tpidr_el0));
 const CTX_TPIDRRO: i32 = ctx(offset_of!(ThreadContext, tpidrro_el0));
-pub(super) const ST_SCRATCH: i32 = ctx(offset_of!(JitState, scratch));
-pub(super) const ST_SCRATCH2: i32 = ctx(offset_of!(JitState, scratch2));
-const ST_SAVE_GPR: i32 = ctx(offset_of!(JitState, save_gpr));
+pub(super) const ST_SCRATCH: i32 = st(offset_of!(JitState, scratch));
+pub(super) const ST_SCRATCH2: i32 = st(offset_of!(JitState, scratch2));
+const ST_SAVE_GPR: i32 = st(offset_of!(JitState, save_gpr));
 const TSC_MUL: i32 = offset_of!(TscScale, mul) as i32;
 const TSC_SHIFT: i32 = offset_of!(TscScale, shift) as i32;
 const TSC_OFFSET: i32 = offset_of!(TscScale, offset) as i32;
-const ST_HIGH: i32 = ctx(offset_of!(JitState, high));
-const ST_COUNTER_FLOOR: i32 = ctx(offset_of!(JitState, counter_floor));
-const ST_TSC_SCALE: i32 = ctx(offset_of!(JitState, tsc_scale));
-const ST_CX16_SAVE: i32 = ctx(offset_of!(JitState, cx16_save));
-const ST_SAVE_XMM: i32 = ctx(offset_of!(JitState, save_xmm));
-const ST_SPILL: i32 = ctx(offset_of!(JitState, spill));
-const ST_LINK: i32 = ctx(offset_of!(JitState, link));
-const ST_TABLE: i32 = ctx(offset_of!(JitState, table));
-const ST_RESERVATION: i32 = ctx(offset_of!(JitState, reservation));
+const ST_HIGH: i32 = st(offset_of!(JitState, high));
+const ST_COUNTER_FLOOR: i32 = st(offset_of!(JitState, counter_floor));
+const ST_TSC_SCALE: i32 = st(offset_of!(JitState, tsc_scale));
+const ST_CX16_SAVE: i32 = st(offset_of!(JitState, cx16_save));
+const ST_SAVE_XMM: i32 = st(offset_of!(JitState, save_xmm));
+const ST_SPILL: i32 = st(offset_of!(JitState, spill));
+const ST_LINK: i8 = st8(offset_of!(JitState, link));
+const ST_TABLE: i32 = st(offset_of!(JitState, table));
+const ST_RESERVATION: i32 = st(offset_of!(JitState, reservation));
 const RES_VALUE_LO: i32 = offset_of!(ReservationSlot, value_lo) as i32;
 const RES_VALUE_HI: i32 = offset_of!(ReservationSlot, value_hi) as i32;
 const RES_ADDR: i32 = offset_of!(ReservationSlot, addr) as i32;
 const RES_SIZE: i32 = offset_of!(ReservationSlot, size) as i32;
-const ST_INTERRUPT: i32 = ctx(offset_of!(JitState, interrupt));
-const ST_LAZY_NZCV: i32 = ctx(offset_of!(JitState, lazy_nzcv));
-const ST_LAZY_A: i32 = ctx(offset_of!(JitState, lazy_a));
-const ST_LAZY_B: i32 = ctx(offset_of!(JitState, lazy_b));
-const ST_MATERIALIZE: i32 = ctx(offset_of!(JitState, materialize));
-const ST_MATERIALIZED: i32 = ctx(offset_of!(JitState, materialized));
+const ST_INTERRUPT: i8 = st8(offset_of!(JitState, interrupt));
+const ST_LAZY_NZCV: i8 = st8(offset_of!(JitState, lazy_nzcv));
+const ST_LAZY_A: i8 = st8(offset_of!(JitState, lazy_a));
+const ST_LAZY_B: i8 = st8(offset_of!(JitState, lazy_b));
+const ST_MATERIALIZE: i8 = st8(offset_of!(JitState, materialize));
+const ST_FASTMEM_LIMIT: i8 = st8(offset_of!(JitState, fastmem_limit) + 8 * 6);
+const ST_MATERIALIZED: i32 = st(offset_of!(JitState, materialized));
 /// Entries in the direct-mapped `guest pc -> host code` table indirect branches probe.
 pub(super) const TABLE_BITS: u32 = 16;
 
@@ -227,6 +242,12 @@ macro_rules! alu {
         match ($w, $src) {
             (W::W32, Src::Reg(s)) => dynasm!($a ; .arch x64 ; $op Rd($d), Rd(s)),
             (W::W64, Src::Reg(s)) => dynasm!($a ; .arch x64 ; $op Rq($d), Rq(s)),
+            (W::W32, Src::Imm(i)) if i8::try_from(i).is_ok() => {
+                dynasm!($a ; .arch x64 ; $op Rd($d), BYTE i as i8)
+            }
+            (W::W64, Src::Imm(i)) if i8::try_from(i).is_ok() => {
+                dynasm!($a ; .arch x64 ; $op Rq($d), BYTE i as i8)
+            }
             (W::W32, Src::Imm(i)) => dynasm!($a ; .arch x64 ; $op Rd($d), i),
             (W::W64, Src::Imm(i)) => dynasm!($a ; .arch x64 ; $op Rq($d), i),
         }
@@ -250,6 +271,16 @@ fn mov(a: &mut Asm, w: W, d: u8, src: Src) {
         (W::W64, Src::Reg(s)) => dynasm!(a ; .arch x64 ; mov Rq(d), Rq(s)),
         (W::W32, Src::Imm(i)) => dynasm!(a ; .arch x64 ; mov Rd(d), i),
         (W::W64, Src::Imm(i)) => dynasm!(a ; .arch x64 ; mov Rq(d), i),
+    }
+}
+
+/// `d = r + i` in one instruction that leaves the host flags alone.
+fn lea(a: &mut Asm, w: W, d: u8, r: u8, i: i32) {
+    match (w, i8::try_from(i).is_ok()) {
+        (W::W32, true) => dynasm!(a ; .arch x64 ; lea Rd(d), [BYTE Rq(r) + i as i8]),
+        (W::W64, true) => dynasm!(a ; .arch x64 ; lea Rq(d), [BYTE Rq(r) + i as i8]),
+        (W::W32, false) => dynasm!(a ; .arch x64 ; lea Rd(d), [Rq(r) + i]),
+        (W::W64, false) => dynasm!(a ; .arch x64 ; lea Rq(d), [Rq(r) + i]),
     }
 }
 
@@ -413,9 +444,9 @@ impl Emitter<'_> {
         let done = self.asm.new_dynamic_label();
         dynasm!(self.asm
             ; .arch x64
-            ; cmp DWORD [r13 + ST_LAZY_NZCV], 0
+            ; cmp DWORD [BYTE r13 + ST_LAZY_NZCV], 0
             ; je =>done
-            ; call QWORD [r13 + ST_MATERIALIZE]
+            ; call QWORD [BYTE r13 + ST_MATERIALIZE]
             ; =>done
         );
     }
@@ -480,8 +511,24 @@ impl Emitter<'_> {
                 mov(&mut self.asm, w, 0, Src::Reg(x));
                 alu!(self.asm, add, w, 0, y);
             }
-            Cmp::Sub => alu!(self.asm, cmp, w, x, y),
-            Cmp::Test => alu!(self.asm, test, w, x, y),
+            Cmp::Sub => match (w, y) {
+                (W::W32, Src::Reg(s)) => dynasm!(self.asm ; .arch x64 ; cmp Rd(x), Rd(s)),
+                (W::W64, Src::Reg(s)) => dynasm!(self.asm ; .arch x64 ; cmp Rq(x), Rq(s)),
+                (W::W32, Src::Imm(i)) if i8::try_from(i).is_ok() => {
+                    dynasm!(self.asm ; .arch x64 ; cmp Rd(x), BYTE i)
+                }
+                (W::W64, Src::Imm(i)) if i8::try_from(i).is_ok() => {
+                    dynasm!(self.asm ; .arch x64 ; cmp Rq(x), BYTE i)
+                }
+                (W::W32, Src::Imm(i)) => dynasm!(self.asm ; .arch x64 ; cmp Rd(x), i),
+                (W::W64, Src::Imm(i)) => dynasm!(self.asm ; .arch x64 ; cmp Rq(x), i),
+            },
+            Cmp::Test => match (w, y) {
+                (W::W32, Src::Reg(s)) => dynasm!(self.asm ; .arch x64 ; test Rd(x), Rd(s)),
+                (W::W64, Src::Reg(s)) => dynasm!(self.asm ; .arch x64 ; test Rq(x), Rq(s)),
+                (W::W32, Src::Imm(i)) => dynasm!(self.asm ; .arch x64 ; test Rd(x), i),
+                (W::W64, Src::Imm(i)) => dynasm!(self.asm ; .arch x64 ; test Rq(x), i),
+            },
         }
         host_cc(kind, cond)
     }
@@ -505,6 +552,38 @@ impl Emitter<'_> {
         let op = self.block.ops[i];
         match op {
             Op::Nop | Op::Const(_) => return,
+            Op::Lsl(..) if self.fused[i] => return,
+            Op::Add(w, a, b) if self.fused[a.index()] || self.fused[b.index()] => {
+                let (base, shifted) = if self.fused[b.index()] {
+                    (a, b)
+                } else {
+                    (b, a)
+                };
+                let (x, k) = scaled_index(self.block, w, shifted).expect("a fused scaled index");
+                let base = self.reg(base);
+                let x = self.reg(x);
+                let d = self.def(v);
+                match (w, k) {
+                    (W::W32, 1) => {
+                        dynasm!(self.asm ; .arch x64 ; lea Rd(d), [Rq(base) + Rq(x) * 2])
+                    }
+                    (W::W32, 2) => {
+                        dynasm!(self.asm ; .arch x64 ; lea Rd(d), [Rq(base) + Rq(x) * 4])
+                    }
+                    (W::W32, _) => {
+                        dynasm!(self.asm ; .arch x64 ; lea Rd(d), [Rq(base) + Rq(x) * 8])
+                    }
+                    (W::W64, 1) => {
+                        dynasm!(self.asm ; .arch x64 ; lea Rq(d), [Rq(base) + Rq(x) * 2])
+                    }
+                    (W::W64, 2) => {
+                        dynasm!(self.asm ; .arch x64 ; lea Rq(d), [Rq(base) + Rq(x) * 4])
+                    }
+                    (W::W64, _) => {
+                        dynasm!(self.asm ; .arch x64 ; lea Rq(d), [Rq(base) + Rq(x) * 8])
+                    }
+                }
+            }
             Op::Get(loc) => {
                 if loc == Loc::Nzcv {
                     self.materialize_nzcv();
@@ -521,21 +600,26 @@ impl Emitter<'_> {
                     Loc::Fpcr | Loc::Fpsr => {
                         dynasm!(self.asm ; .arch x64 ; mov Rd(d), DWORD [r15 + offset])
                     }
-                    _ => dynasm!(self.asm ; .arch x64 ; mov Rq(d), QWORD [r15 + offset]),
+                    _ => match i8::try_from(offset) {
+                        Ok(o) => dynasm!(self.asm ; .arch x64 ; mov Rq(d), QWORD [BYTE r15 + o]),
+                        Err(_) => dynasm!(self.asm ; .arch x64 ; mov Rq(d), QWORD [r15 + offset]),
+                    },
                 }
             }
             Op::Set(loc, x) => self.set(loc, x),
             Op::SetLazyNzcv(kind, w, a, b) => {
                 for (x, offset) in [(a, ST_LAZY_A), (b, ST_LAZY_B)] {
                     match self.src(x, W::W64) {
-                        Src::Imm(i) => dynasm!(self.asm ; .arch x64 ; mov QWORD [r13 + offset], i),
+                        Src::Imm(i) => {
+                            dynasm!(self.asm ; .arch x64 ; mov QWORD [BYTE r13 + offset], i)
+                        }
                         Src::Reg(r) => {
-                            dynasm!(self.asm ; .arch x64 ; mov QWORD [r13 + offset], Rq(r))
+                            dynasm!(self.asm ; .arch x64 ; mov QWORD [BYTE r13 + offset], Rq(r))
                         }
                     }
                 }
                 let code = kind.lazy_code(w) as i32;
-                dynasm!(self.asm ; .arch x64 ; mov DWORD [r13 + ST_LAZY_NZCV], code);
+                dynasm!(self.asm ; .arch x64 ; mov DWORD [BYTE r13 + ST_LAZY_NZCV], code);
             }
             Op::Add(w, a, b)
             | Op::Sub(w, a, b)
@@ -545,13 +629,42 @@ impl Emitter<'_> {
                 let b = self.src(b, w);
                 let a = self.src(a, w);
                 let d = self.def(v);
-                mov(&mut self.asm, w, d, a);
-                match op {
-                    Op::Add(..) => alu!(self.asm, add, w, d, b),
-                    Op::Sub(..) => alu!(self.asm, sub, w, d, b),
-                    Op::And(..) => alu!(self.asm, and, w, d, b),
-                    Op::Or(..) => alu!(self.asm, or, w, d, b),
-                    _ => alu!(self.asm, xor, w, d, b),
+                let (a, b) = match (a, b) {
+                    (Src::Imm(_), Src::Reg(_)) if !matches!(op, Op::Sub(..)) => (b, a),
+                    _ => (a, b),
+                };
+                let identity = match op {
+                    Op::And(..) => -1,
+                    _ => 0,
+                };
+                match (op, a, b) {
+                    (_, _, Src::Imm(i)) if i == identity => mov(&mut self.asm, w, d, a),
+                    (Op::Add(..) | Op::Sub(..), Src::Reg(r), Src::Imm(i))
+                        if r != d && i != i32::MIN =>
+                    {
+                        let i = if matches!(op, Op::Sub(..)) { -i } else { i };
+                        lea(&mut self.asm, w, d, r, i);
+                    }
+                    (Op::Add(..), Src::Reg(r), Src::Reg(s)) if r != d && s != d => match w {
+                        W::W32 => dynasm!(self.asm ; .arch x64 ; lea Rd(d), [Rq(r) + Rq(s)]),
+                        W::W64 => dynasm!(self.asm ; .arch x64 ; lea Rq(d), [Rq(r) + Rq(s)]),
+                    },
+                    (Op::And(..), Src::Reg(r), Src::Imm(0xff)) => {
+                        dynasm!(self.asm ; .arch x64 ; movzx Rd(d), Rb(r))
+                    }
+                    (Op::And(..), Src::Reg(r), Src::Imm(0xffff)) => {
+                        dynasm!(self.asm ; .arch x64 ; movzx Rd(d), Rw(r))
+                    }
+                    _ => {
+                        mov(&mut self.asm, w, d, a);
+                        match op {
+                            Op::Add(..) => alu!(self.asm, add, w, d, b),
+                            Op::Sub(..) => alu!(self.asm, sub, w, d, b),
+                            Op::And(..) => alu!(self.asm, and, w, d, b),
+                            Op::Or(..) => alu!(self.asm, or, w, d, b),
+                            _ => alu!(self.asm, xor, w, d, b),
+                        }
+                    }
                 }
             }
             Op::Adc(w, a, b, f) | Op::Sbc(w, a, b, f) => {
@@ -603,7 +716,10 @@ impl Emitter<'_> {
                 let a = self.reg(a);
                 let d = self.def(v);
                 dynasm!(self.asm ; .arch x64 ; xor eax, eax ; xor ecx, ecx);
-                alu!(self.asm, test, w, a, Src::Reg(a));
+                match w {
+                    W::W32 => dynasm!(self.asm ; .arch x64 ; test Rd(a), Rd(a)),
+                    W::W64 => dynasm!(self.asm ; .arch x64 ; test Rq(a), Rq(a)),
+                }
                 dynasm!(self.asm
                     ; .arch x64
                     ; setz cl
@@ -688,7 +804,10 @@ impl Emitter<'_> {
                 let d = self.def(v);
                 let (zero, done) = (self.asm.new_dynamic_label(), self.asm.new_dynamic_label());
                 mov(&mut self.asm, w, 0, a);
-                alu!(self.asm, test, w, b, Src::Reg(b));
+                match w {
+                    W::W32 => dynasm!(self.asm ; .arch x64 ; test Rd(b), Rd(b)),
+                    W::W64 => dynasm!(self.asm ; .arch x64 ; test Rq(b), Rq(b)),
+                }
                 dynasm!(self.asm ; .arch x64 ; jz =>zero);
                 match (op, w) {
                     (Op::UDiv(..), W::W32) => {
@@ -892,7 +1011,10 @@ impl Emitter<'_> {
                 let a = self.reg(a);
                 let d = self.def(v);
                 dynasm!(self.asm ; .arch x64 ; xor eax, eax);
-                alu!(self.asm, test, w, a, Src::Reg(a));
+                match w {
+                    W::W32 => dynasm!(self.asm ; .arch x64 ; test Rd(a), Rd(a)),
+                    W::W64 => dynasm!(self.asm ; .arch x64 ; test Rq(a), Rq(a)),
+                }
                 dynasm!(self.asm ; .arch x64 ; setz al ; mov Rd(d), eax);
             }
             Op::TestBit(a, bit) => {
@@ -971,16 +1093,24 @@ impl Emitter<'_> {
                 dynasm!(self.asm
                     ; .arch x64
                     ; mov DWORD [r15 + offset], eax
-                    ; mov DWORD [r13 + ST_LAZY_NZCV], 0
+                    ; mov DWORD [BYTE r13 + ST_LAZY_NZCV], 0
                 );
             }
             Loc::Fpcr | Loc::Fpsr => match self.src(x, W::W32) {
                 Src::Imm(i) => dynasm!(self.asm ; .arch x64 ; mov DWORD [r15 + offset], i),
                 Src::Reg(r) => dynasm!(self.asm ; .arch x64 ; mov DWORD [r15 + offset], Rd(r)),
             },
-            _ => match self.src(x, W::W64) {
-                Src::Imm(i) => dynasm!(self.asm ; .arch x64 ; mov QWORD [r15 + offset], i),
-                Src::Reg(r) => dynasm!(self.asm ; .arch x64 ; mov QWORD [r15 + offset], Rq(r)),
+            _ => match (self.src(x, W::W64), i8::try_from(offset)) {
+                (Src::Imm(i), Ok(o)) => dynasm!(self.asm ; .arch x64 ; mov QWORD [BYTE r15 + o], i),
+                (Src::Imm(i), Err(_)) => {
+                    dynasm!(self.asm ; .arch x64 ; mov QWORD [r15 + offset], i)
+                }
+                (Src::Reg(r), Ok(o)) => {
+                    dynasm!(self.asm ; .arch x64 ; mov QWORD [BYTE r15 + o], Rq(r))
+                }
+                (Src::Reg(r), Err(_)) => {
+                    dynasm!(self.asm ; .arch x64 ; mov QWORD [r15 + offset], Rq(r))
+                }
             },
         }
     }
@@ -1053,7 +1183,7 @@ impl Emitter<'_> {
         self.save(saved);
         dynasm!(self.asm
             ; .arch x64
-            ; mov rdi, r15
+            ; lea rdi, [r15 - CTX_BIAS]
             ; mov esi, word as i32
             ; mov rdx, r13
             ; mov rcx, QWORD pc as i64
@@ -1118,7 +1248,7 @@ impl Emitter<'_> {
         let label = self.asm.new_dynamic_label();
         let resume = self.asm.new_dynamic_label();
         let sites = match self.target.arena_size {
-            Some(arena) => {
+            Some(_) => {
                 let aligned = matches!(
                     op,
                     Op::AtomicRmw { .. }
@@ -1132,11 +1262,10 @@ impl Emitter<'_> {
                     let misaligned = (1i32 << size) - 1;
                     dynasm!(self.asm ; .arch x64 ; test Rd(a), misaligned ; jnz =>label);
                 }
-                let limit = (arena - (1u64 << size)) as i64;
+                let limit = ST_FASTMEM_LIMIT - 8 * (6 - size as i8);
                 dynasm!(self.asm
                     ; .arch x64
-                    ; mov rax, QWORD limit
-                    ; cmp Rq(a), rax
+                    ; cmp Rq(a), QWORD [BYTE r13 + limit]
                     ; ja =>label
                 );
                 self.access(op, a, dst, values, borrowed)
@@ -1632,7 +1761,7 @@ impl Emitter<'_> {
             ; .arch x64
             ; mov QWORD [r15 + CTX_PC], rax
             ; lea rcx, [=>site]
-            ; mov QWORD [r13 + ST_LINK], rcx
+            ; mov QWORD [BYTE r13 + ST_LINK], rcx
             ; xor eax, eax
             ; ret
         );
@@ -1692,6 +1821,18 @@ impl Emitter<'_> {
     }
 }
 
+/// The shifted operand and shift of `x` when it is a left shift of width `w` by 1 to 3, which an
+/// `lea` can scale.
+fn scaled_index(block: &Block, w: W, x: Value) -> Option<(Value, u8)> {
+    match block.ops[x.index()] {
+        Op::Lsl(sw, v, k) if sw == w => match block.constant(k)? {
+            k @ 1..=3 => Some((v, k as u8)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Compiles a block that the passes have already run on and that starts at guest `start`.
 /// Every block first checks the interrupt flag, so linked blocks that loop still stop.
 pub(super) fn compile(block: &Block, start: u64, target: &Target) -> Compiled {
@@ -1724,6 +1865,19 @@ pub(super) fn compile(block: &Block, start: u64, target: &Target) -> Compiled {
         _ => None,
     };
     let mut fused = vec![false; n];
+    for (i, op) in block.ops.iter().enumerate() {
+        if let Op::Add(w, a, b) = *op
+            && let Some(x) = [b, a]
+                .into_iter()
+                .find(|&x| uses[x.index()] == 1 && scaled_index(block, w, x).is_some())
+            && block.constant(if x == b { a } else { b }).is_none()
+        {
+            fused[x.index()] = true;
+            for v in block.ops[x.index()].args() {
+                last_use[v.index()] = last_use[v.index()].max(i as u32);
+            }
+        }
+    }
     for (c, user) in users.chain(branch) {
         if uses[c.index()] == 1 && matches!(block.ops[c.index()], Op::Compare(..)) {
             fused[c.index()] = true;
@@ -1753,7 +1907,7 @@ pub(super) fn compile(block: &Block, start: u64, target: &Target) -> Compiled {
     let interrupted = e.asm.new_dynamic_label();
     dynasm!(e.asm
         ; .arch x64
-        ; mov rax, QWORD [r13 + ST_INTERRUPT]
+        ; mov rax, QWORD [BYTE r13 + ST_INTERRUPT]
         ; cmp BYTE [rax], 0
         ; jne =>interrupted
     );
@@ -1801,10 +1955,10 @@ pub(super) fn materialize_stub(profile: bool) -> Vec<u8> {
     let labels: Vec<DynamicLabel> = ops.iter().map(|_| asm.new_dynamic_label()).collect();
     dynasm!(asm
         ; .arch x64
-        ; mov eax, DWORD [r13 + ST_LAZY_NZCV]
-        ; mov rcx, QWORD [r13 + ST_LAZY_A]
-        ; mov rdx, QWORD [r13 + ST_LAZY_B]
-        ; mov DWORD [r13 + ST_LAZY_NZCV], 0
+        ; mov eax, DWORD [BYTE r13 + ST_LAZY_NZCV]
+        ; mov rcx, QWORD [BYTE r13 + ST_LAZY_A]
+        ; mov rdx, QWORD [BYTE r13 + ST_LAZY_B]
+        ; mov DWORD [BYTE r13 + ST_LAZY_NZCV], 0
     );
     for (&(kind, w), &label) in ops.iter().zip(&labels) {
         let code = kind.lazy_code(w) as i32;
@@ -1878,7 +2032,7 @@ pub(super) fn trampoline() -> Vec<u8> {
         ; push r14
         ; push r15
         ; sub rsp, 8
-        ; mov r15, rdi
+        ; lea r15, [rdi + CTX_BIAS]
         ; mov r13, rsi
         ; mov r14, rdx
         ; call rcx
