@@ -1585,13 +1585,37 @@ impl VulkanRasterizer {
                                 .copied()
                                 .unwrap_or_default();
                             let index = (desc.index + i) as usize;
+                            let used = info.constant_buffer_used_sizes[index];
+                            if cbuf.enabled && index == 5 && cbuf.size == 4608 && used == 512 && std::env::var_os("LIRU14_CB5").is_some() {
+                                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let mut daddr = 0;
+                                src.gmmu.for_each_range(cbuf.address, 4608, |r| {
+                                    if let lichii_gpu::gmmu::RangeTarget::Device(d) = r.target && daddr == 0 {
+                                        daddr = d;
+                                    }
+                                });
+                                if daddr != 0 {
+                                    crate::buffer_cache::LIRU14_WATCH.store(daddr, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                if n < 20 || n.is_multiple_of(400) {
+                                    let mut words = [0f32; 28];
+                                    let _ = src.gmmu.read_block(cbuf.address + 400, bytemuck::cast_slice_mut(&mut words));
+                                    let nz = words.iter().filter(|w| **w != 0.0).count();
+                                    eprintln!(
+                                        "LIRU14 cb5 #{n} hash={:016x} va={:#x} daddr={daddr:#x} nz={nz} w100..103={:?} state: {}",
+                                        module.hash, cbuf.address, &words[..4], self.buffer_cache.liru14_state(daddr, 4608)
+                                    );
+                                }
+                            }
+                            let cb_size = if std::env::var_os("LIRU14_UBO_USED").is_some() { cbuf.size.min(used) } else { cbuf.size };
                             let binding = match src.root_table {
                                 _ if cbuf.enabled => self.buffer_cache.uniform_buffer(
                                     &mut self.scheduler,
                                     &mut self.staging,
                                     src.gmmu,
                                     cbuf.address,
-                                    u64::from(cbuf.size),
+                                    u64::from(cb_size),
                                 )?,
                                 Some(table) if index == ROOT_TABLE_SLOT => {
                                     Some(self.buffer_cache.stream_uniform(

@@ -35,6 +35,20 @@ use crate::staging::{StagingRing, StagingSlice};
 
 const CACHING_PAGE_BITS: u32 = 16;
 const CACHING_PAGE_SIZE: u64 = 1 << CACHING_PAGE_BITS;
+pub static LIRU14_WATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LIRU14_WATCH_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn liru14_watch_hit(what: &str, daddr: DAddr, size: u64) {
+    let w = LIRU14_WATCH.load(std::sync::atomic::Ordering::Relaxed);
+    if w == 0 || daddr >= w + 4608 || daddr + size <= w {
+        return;
+    }
+    let n = LIRU14_WATCH_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n < 200 || n.is_multiple_of(500) {
+        eprintln!("LIRU14 watch #{n} {what} daddr={daddr:#x} size={size:#x} t={:?}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0));
+    }
+}
+
 /// Uniform buffers up to this size are streamed instead of cached (Lichii's skip-cache size).
 pub const UNIFORM_STREAM_MAX: u64 = 4 << 10;
 const STREAM_RING_SIZE: u64 = 16 << 20;
@@ -862,9 +876,28 @@ impl BufferCache {
         (entry != 0).then(|| entry as usize - 1)
     }
 
+    pub fn liru14_state(&self, daddr: DAddr, size: u64) -> String {
+        let end = daddr + size;
+        let mut cpu = 0;
+        self.memory.for_each_cpu_written_page(daddr, size, |_| cpu += 1);
+        let Some(id) = Self::lookup(&self.page_table, daddr) else {
+            return format!("no-buffer gpu_written={} cpu_pending={cpu}", self.gpu_written.intersects(daddr, end));
+        };
+        let b = self.buffer(id);
+        let first = ((daddr - b.daddr) >> PAGE_BITS) as usize;
+        let last = (end - b.daddr).div_ceil(PAGE_SIZE) as usize;
+        let dirty: String = (first..last).map(|p| if b.dirty[p / 64] & (1 << (p % 64)) != 0 { 'D' } else { '.' }).collect();
+        let tracked: Vec<_> = b.tracked.iter().filter(|t| t.0 < end && t.1 > daddr).map(|t| format!("{:#x}-{:#x}", t.0, t.1)).collect();
+        format!(
+            "buf={id} [{:#x},{:#x}) dirty={dirty} dirty_pages={} tracked={tracked:?} gpu_written={} cpu_pending={cpu} written_tick={}",
+            b.daddr, b.end(), b.dirty_pages, self.gpu_written.intersects(daddr, end), b.written_tick
+        )
+    }
+
     /// The guest wrote `[daddr, +size)`: its pages upload again before their next use, and its
     /// bytes are no longer GPU-written.
     pub fn invalidate(&mut self, daddr: DAddr, size: u64) {
+        liru14_watch_hit("invalidate", daddr, size);
         let end = daddr.saturating_add(size).min(self.limit);
         if daddr >= end {
             return;
@@ -880,6 +913,7 @@ impl BufferCache {
     /// again before their next use, except bytes GPU work wrote. Those may lie beside the
     /// CPU's bytes on a page, so they stay until [`BufferCache::flush`] downloads them.
     pub fn cpu_written(&mut self, daddr: DAddr, size: u64) {
+        liru14_watch_hit("cpu_written", daddr, size);
         let end = daddr.saturating_add(size).min(self.limit);
         if daddr >= end {
             return;
@@ -904,6 +938,7 @@ impl BufferCache {
     /// the writing work is recorded, with the tick it completes at ([`Scheduler::tick`]), which
     /// the buffers holding the range note for [`BufferCache::flush`].
     pub fn mark_gpu_written(&mut self, tick: u64, daddr: DAddr, size: u64) {
+        liru14_watch_hit("mark_gpu_written", daddr, size);
         if let Some(end) = self.track_gpu_write(daddr, size) {
             self.stamp_writer(tick, daddr, end);
         }
@@ -923,6 +958,7 @@ impl BufferCache {
     }
 
     fn bind_gpu_write(&mut self, daddr: DAddr, size: u64) {
+        liru14_watch_hit("bind_gpu_write", daddr, size);
         if let Some(end) = self.track_gpu_write(daddr, size) {
             self.pending_writes.push((daddr, end));
         }
