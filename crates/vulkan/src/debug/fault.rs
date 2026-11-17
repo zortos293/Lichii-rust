@@ -236,22 +236,23 @@ impl Reporter {
         let ring = self.ring.lock();
         let mut passed = Vec::new();
         if let Some(checkpoints) = &self.checkpoints {
-            for (stage, marker) in self.queue_checkpoints(checkpoints) {
-                passed.push((format!("checkpoint {stage}"), marker as usize as u64));
+            for (stage, marker, top) in self.queue_checkpoints(checkpoints) {
+                passed.push((format!("checkpoint {stage}"), marker as usize as u64, top));
             }
         }
         if let Some(markers) = &self.markers {
-            for (stage, offset) in [
-                ("top of pipe", TOP_MARKER),
-                ("bottom of pipe", BOTTOM_MARKER),
+            for (stage, offset, top) in [
+                ("top of pipe", TOP_MARKER, true),
+                ("bottom of pipe", BOTTOM_MARKER, false),
             ] {
                 passed.push((
                     format!("buffer marker {stage}"),
                     ring.widen(markers.read(offset)),
+                    top,
                 ));
             }
         }
-        for (source, seq) in &passed {
+        for (source, seq, _) in &passed {
             tracing::error!(
                 source = source.as_str(),
                 checkpoint = seq,
@@ -259,8 +260,8 @@ impl Reporter {
                 "GPU fault: last checkpoint passed"
             );
         }
-        let seqs: Vec<u64> = passed.iter().map(|&(_, seq)| seq).collect();
-        let Some((first, last)) = in_flight(&seqs) else {
+        let seqs: Vec<(u64, bool)> = passed.iter().map(|&(_, seq, top)| (seq, top)).collect();
+        let Some((first, last)) = in_flight(&seqs, ring.last()) else {
             tracing::error!(
                 recorded = ring.last(),
                 "GPU fault: no checkpoint was reached"
@@ -272,7 +273,7 @@ impl Reporter {
             last,
             recorded = ring.last(),
             listed = (last - first + 1).min(IN_FLIGHT_LISTED),
-            "GPU fault: work from the oldest to the newest checkpoint passed, which holds the fault"
+            "GPU fault: work from the oldest checkpoint passed to the newest one the top of the pipe passed (or the newest recorded), which holds the fault"
         );
         for seq in first..=last.min(first + IN_FLIGHT_LISTED - 1) {
             tracing::error!(
@@ -288,7 +289,7 @@ impl Reporter {
     fn queue_checkpoints(
         &self,
         checkpoints: &nv::device_diagnostic_checkpoints::Device,
-    ) -> Vec<(String, *mut c_void)> {
+    ) -> Vec<(String, *mut c_void, bool)> {
         let fp = checkpoints.fp();
         let mut count = 0;
         if let Some(get) = self.checkpoints2 {
@@ -301,7 +302,10 @@ impl Reporter {
                 data.truncate(count as usize);
                 return data
                     .iter()
-                    .map(|d| (format!("{:?}", d.stage), d.p_checkpoint_marker))
+                    .map(|d| {
+                        let top = d.stage == vk::PipelineStageFlags2::TOP_OF_PIPE;
+                        (format!("{:?}", d.stage), d.p_checkpoint_marker, top)
+                    })
                     .collect();
             }
         }
@@ -312,7 +316,10 @@ impl Reporter {
         unsafe { (fp.get_queue_checkpoint_data_nv)(self.queue, &mut count, data.as_mut_ptr()) };
         data.truncate(count as usize);
         data.iter()
-            .map(|d| (format!("{:?}", d.stage), d.p_checkpoint_marker))
+            .map(|d| {
+                let top = d.stage == vk::PipelineStageFlags::TOP_OF_PIPE;
+                (format!("{:?}", d.stage), d.p_checkpoint_marker, top)
+            })
             .collect()
     }
 }
@@ -422,12 +429,23 @@ fn address_range(reported: u64, precision: u64) -> (u64, u64) {
     (reported & !mask, reported | mask)
 }
 
-/// The checkpoints from the oldest to the newest one a stage passed: the work that started and
-/// may not have finished. `None` when no stage passed any.
-fn in_flight(passed: &[u64]) -> Option<(u64, u64)> {
-    let mut reached = passed.iter().copied().filter(|&seq| seq != 0);
-    let first = reached.next()?;
-    Some(reached.fold((first, first), |(lo, hi), seq| (lo.min(seq), hi.max(seq))))
+/// The work that may not have finished: from the oldest checkpoint any stage passed to the
+/// newest one the top of the pipe passed, or to the newest `recorded` when no top-of-pipe
+/// checkpoint bounds it. `passed` holds each stage's checkpoint and whether it is the top of
+/// the pipe. `None` when no stage passed any.
+fn in_flight(passed: &[(u64, bool)], recorded: u64) -> Option<(u64, u64)> {
+    let first = passed
+        .iter()
+        .map(|&(seq, _)| seq)
+        .filter(|&seq| seq != 0)
+        .min()?;
+    let last = passed
+        .iter()
+        .filter(|&&(seq, top)| top && seq != 0)
+        .map(|&(seq, _)| seq)
+        .max()
+        .unwrap_or(recorded);
+    Some((first, last.max(first)))
 }
 
 struct Slot {
@@ -517,11 +535,14 @@ mod tests {
     }
 
     #[test]
-    fn in_flight_spans_the_oldest_to_the_newest_checkpoint_passed() {
-        assert_eq!(in_flight(&[90, 75]), Some((75, 90)));
-        assert_eq!(in_flight(&[0, 40, 0]), Some((40, 40)));
-        assert_eq!(in_flight(&[0, 0]), None);
-        assert_eq!(in_flight(&[]), None);
+    fn in_flight_ends_at_the_top_of_pipe_or_else_the_newest_recorded() {
+        assert_eq!(in_flight(&[(90, true), (75, false)], 120), Some((75, 90)));
+        assert_eq!(in_flight(&[(40, true), (40, false)], 120), Some((40, 40)));
+        assert_eq!(in_flight(&[(75, false)], 120), Some((75, 120)));
+        assert_eq!(in_flight(&[(0, true), (75, false)], 120), Some((75, 120)));
+        assert_eq!(in_flight(&[(40, false)], 0), Some((40, 40)));
+        assert_eq!(in_flight(&[(0, true), (0, false)], 120), None);
+        assert_eq!(in_flight(&[], 120), None);
     }
 
     #[test]
