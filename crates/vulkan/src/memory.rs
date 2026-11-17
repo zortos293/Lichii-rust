@@ -30,6 +30,7 @@ fn allocate(
     requirements: vk::MemoryRequirements,
     location: MemoryLocation,
     linear: bool,
+    allocation_scheme: AllocationScheme,
 ) -> Result<Allocation> {
     let mut allocator = device.allocator.lock();
     let result = allocator.allocate(&AllocationCreateDesc {
@@ -37,7 +38,7 @@ fn allocate(
         requirements,
         location,
         linear,
-        allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        allocation_scheme,
     });
     if let Err(error) = &result {
         let report = allocator.generate_report();
@@ -189,7 +190,14 @@ impl Buffer {
         };
         // SAFETY: `raw` was just created on this device.
         let requirements = unsafe { device.raw.get_buffer_memory_requirements(raw) };
-        let allocation = match allocate(device, name, requirements, location, true) {
+        let allocation = match allocate(
+            device,
+            name,
+            requirements,
+            location,
+            true,
+            AllocationScheme::GpuAllocatorManaged,
+        ) {
             Ok(allocation) => allocation,
             Err(error) => {
                 // SAFETY: the buffer is unused.
@@ -344,8 +352,23 @@ impl Image {
         let raw = unsafe { device.raw.create_image(&info, None).call("vkCreateImage")? };
         // SAFETY: `raw` was just created on this device.
         let requirements = unsafe { device.raw.get_image_memory_requirements(raw) };
-        let allocation = match allocate(device, name, requirements, MemoryLocation::GpuOnly, false)
-        {
+        let dedicated_from = std::env::var("LICHII_DEDICATED_KIB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(u64::MAX, |kib| kib << 10);
+        let scheme = if requirements.size >= dedicated_from {
+            AllocationScheme::DedicatedImage(raw)
+        } else {
+            AllocationScheme::GpuAllocatorManaged
+        };
+        let allocation = match allocate(
+            device,
+            name,
+            requirements,
+            MemoryLocation::GpuOnly,
+            false,
+            scheme,
+        ) {
             Ok(allocation) => allocation,
             Err(error) => {
                 // SAFETY: the image is unused.
@@ -502,6 +525,7 @@ impl Image {
                     },
                     MemoryLocation::GpuOnly,
                     false,
+                    AllocationScheme::GpuAllocatorManaged,
                 )?;
                 image_binds.push(
                     vk::SparseImageMemoryBind::default()
@@ -527,6 +551,7 @@ impl Image {
                     },
                     MemoryLocation::GpuOnly,
                     false,
+                    AllocationScheme::GpuAllocatorManaged,
                 )?;
                 opaque_binds.push(
                     vk::SparseMemoryBind::default()
