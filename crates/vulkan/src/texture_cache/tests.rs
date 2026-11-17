@@ -1020,7 +1020,7 @@ fn new_targets_take_newer_overlaps_before_they_are_drawn_into() {
 }
 
 #[test]
-fn sampled_images_still_take_newer_overlaps() {
+fn sampled_images_keep_their_own_texels_over_newer_overlaps_on_another_grid() {
     let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
         return;
     };
@@ -1031,15 +1031,30 @@ fn sampled_images_still_take_newer_overlaps() {
     let syncs = f.cache.traffic().gpu_syncs;
     let (id, _) = f.texture(&tic(0x08, GPU_VA, 64, 64, 1, 1, 3));
     assert_eq!(id, a.id);
-    assert_eq!(f.cache.traffic().gpu_syncs, syncs + 1);
+    assert_eq!(f.cache.traffic().gpu_syncs, syncs);
+    assert!(all_texels(&f.read_image(a.id)[0], GREEN));
+    assert!(all_texels(&f.read_image(b.id)[0], RED));
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn sampled_images_take_newer_overlaps_on_their_texel_grid() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let big = rt_info(64, 64, 3, GobLayout::Tegra);
+    let half = rt_info(64, 32, 3, GobLayout::Tegra);
+    let a = clear_rt(&mut f, &big, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
+    clear_rt(&mut f, &half, [1.0, 0.0, 0.0, 1.0], Rect::ALL);
+    let (id, _) = f.texture(&tic(0x08, GPU_VA, 64, 64, 1, 1, 3));
+    assert_eq!(id, a.id);
     let read = f.read_image(a.id);
     assert_eq!(
         count_texels(&read[0], RED),
-        32 * 32,
-        "the small target's texels"
+        64 * 32,
+        "the newer half's texels"
     );
-    assert_eq!(count_texels(&read[0], GREEN), 64 * 64 - 32 * 32);
-    assert!(all_texels(&f.read_image(b.id)[0], RED));
+    assert_eq!(count_texels(&read[0], GREEN), 64 * 32);
     f.assert_no_validation_errors();
 }
 

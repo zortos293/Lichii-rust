@@ -1294,7 +1294,11 @@ impl TextureCache {
     ) -> Result<Option<Found>> {
         let found = self.lookup_or_create(tx, gmmu, gpu_va, info, usage)?;
         if let Some(found) = found {
-            self.refresh(tx, found.id)?;
+            if usage == Usage::Sample && self.keeps_own(found.id) {
+                self.take_own(tx, found.id)?;
+            } else {
+                self.refresh(tx, found.id)?;
+            }
         }
         Ok(found)
     }
@@ -1338,7 +1342,7 @@ impl TextureCache {
     /// `discard` skips uploading guest data the caller overwrites entirely (a full clear).
     /// An image the GPU wrote before keeps its own texels where overlaps that lay the shared
     /// bytes out on another texel grid wrote them since, as the C++ cache does with bad
-    /// overlaps: only reads of it take them.
+    /// overlaps. Samples of it keep them too; only transfers and storage binds take them.
     pub fn render_target(
         &mut self,
         tx: &mut Transfer<'_>,
@@ -1377,17 +1381,8 @@ impl TextureCache {
             image.cpu_dirty = false;
             image.current = tick;
         }
-        let keep_own = usage == Usage::Target
-            && {
-                let image = self.image(found.id);
-                image.modified != 0 && !image.image.is_sparse()
-            }
-            && self.newer_overlaps_reinterpret(found.id);
-        if keep_own {
-            if self.image(found.id).cpu_dirty {
-                self.take_cpu_writes(tx, found.id)?;
-            }
-            self.take_from_aliases(tx.scheduler, found.id)?;
+        if usage == Usage::Target && self.keeps_own(found.id) {
+            self.take_own(tx, found.id)?;
         } else {
             let image = &self.image(found.id).info;
             let overwritten = if discard
@@ -2966,6 +2961,22 @@ impl TextureCache {
             .overlaps
             .iter()
             .any(|&o| self.get(o).expect("overlaps are live").modified > image.current)
+    }
+
+    /// Whether a target bind or a sample of `id`, which the GPU wrote before, keeps its own
+    /// texels where newer overlaps on another grid wrote the shared bytes, as the C++ cache
+    /// does with bad overlaps: it never copies their bytes in.
+    fn keeps_own(&self, id: ImageId) -> bool {
+        let image = self.get(id).expect("a live image id");
+        image.modified != 0 && !image.image.is_sparse() && self.newer_overlaps_reinterpret(id)
+    }
+
+    /// Readies `id` without its overlaps: what the guest CPU wrote, then its aliases.
+    fn take_own(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
+        if self.image(id).cpu_dirty {
+            self.take_cpu_writes(tx, id)?;
+        }
+        self.take_from_aliases(tx.scheduler, id)
     }
 
     /// Whether every overlap modified since `id` last held the shared bytes lays its texels out
