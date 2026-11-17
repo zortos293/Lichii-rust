@@ -376,8 +376,13 @@ impl SoftwareBlitter {
         self.ir_out.resize(to.0 as usize * 4, 0.0);
         for (y, dst_row) in self.dst.chunks_exact_mut(dst_pitch).enumerate() {
             let (y0, y1, wy) = bilinear_axis(sampling.y0, sampling.dv_dy, y, from.1);
-            let wanted = if filter { [y0, y1] } else { [y0, y0] };
-            if self.ir_row_ids[1] == wanted[0] && self.ir_row_ids[0] != wanted[0] {
+            let pair = [y0, y1];
+            let wanted = if filter && y1 != y0 {
+                &pair[..]
+            } else {
+                &pair[..1]
+            };
+            if self.ir_row_ids[1] == y0 && self.ir_row_ids[0] != y0 {
                 self.ir_rows.swap(0, 1);
                 self.ir_row_ids.swap(0, 1);
             }
@@ -388,7 +393,8 @@ impl SoftwareBlitter {
                     self.ir_row_ids[slot] = source;
                 }
             }
-            let [top, bottom] = &self.ir_rows;
+            let top = &self.ir_rows[0];
+            let bottom = &self.ir_rows[wanted.len() - 1];
             if filter {
                 bilinear_row(top, bottom, wy, &mut self.ir_out, from.0, sampling);
             } else {
@@ -804,6 +810,11 @@ mod tests {
                 .all(|row| row.capacity() < 2 * row_floats)
         );
         assert!(blitter.ir_out.capacity() < 2 * row_floats);
+        assert_eq!(
+            blitter.ir_row_ids[1],
+            usize::MAX,
+            "a nearest conversion decodes each source row once"
+        );
     }
 
     #[test]
