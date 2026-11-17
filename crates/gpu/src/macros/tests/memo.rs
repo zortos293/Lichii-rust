@@ -144,27 +144,19 @@ fn small_memo_compacts_and_stays_correct() {
 }
 
 #[test]
-fn memo_memory_follows_what_it_remembers() {
-    let fresh = MacroEngine::new(MacroIsa::Mme64).memo_bytes();
-    assert!(fresh <= 256 << 10, "a fresh engine holds {fresh} bytes");
+fn code_copies_hold_no_memo() {
     let memo = differential(MacroIsa::Mme64, None);
-    assert!(memo.memo_bytes() > fresh);
     assert!(
-        memo.memo_bytes() < 4 << 20,
-        "{} bytes for a few hundred distinct calls",
-        memo.memo_bytes()
+        memo.memo_bytes() > 16 << 20,
+        "the engine keeps its preallocated memo"
     );
-    let small = differential(MacroIsa::Mme64, Some(256));
+    let copy = memo.code_copy().unwrap();
     assert!(
-        small.memo_bytes() <= fresh + (16 << 10),
-        "a 256-word memo holds {} bytes",
-        small.memo_bytes()
+        copy.memo_bytes() < 16 << 10,
+        "a code copy holds {} bytes of memo and call record",
+        copy.memo_bytes()
     );
-    assert_eq!(
-        memo.code_copy().unwrap().memo_bytes(),
-        0,
-        "code copies never remember calls"
-    );
+    assert!(!copy.memo_enabled());
 }
 
 #[test]

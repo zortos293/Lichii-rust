@@ -28,7 +28,7 @@ pub const START_ADDRESS_SLOTS: usize = 0x80;
 pub const DATA_RAM_WORDS: usize = 0xC00;
 /// Instructions a call may run before it fails with [`MacroErrorKind::StepLimit`].
 pub const DEFAULT_STEP_LIMIT: u32 = 1_000_000;
-/// Default bound of the memo arena, in words (16 MiB). The arena grows to it as calls are stored.
+/// Default bound of the memo arena, in words (16 MiB).
 pub const DEFAULT_MEMO_WORDS: usize = 1 << 22;
 
 /// `LOAD_MME_INSTRUCTION_RAM_POINTER`: where the next uploaded code word goes.

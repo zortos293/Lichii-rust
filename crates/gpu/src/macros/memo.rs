@@ -4,8 +4,8 @@
 //! words it read (no register reads, no DMA reads) is recorded: its data RAM writes and its
 //! method writes. A later call with the same start and parameters, whose recorded data RAM reads
 //! still hold, replays those writes instead of being interpreted. Records live in one bounded
-//! arena of words. The arena and the map grow as calls are stored, never past their bounds, so
-//! an engine that remembers little holds little; replaying and compacting never allocate.
+//! arena of words. The arena and the map are allocated at their bounds up front, so neither
+//! replaying nor storing nor compacting allocates.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -91,8 +91,8 @@ impl MacroMemo {
     pub(super) fn new(max_words: usize) -> Self {
         let max_entries = (max_words / WORDS_PER_ENTRY).max(MIN_ENTRIES);
         Self {
-            entries: HashMap::default(),
-            arena: Vec::new(),
+            entries: HashMap::with_capacity_and_hasher(max_entries, BuildHasherDefault::default()),
+            arena: Vec::with_capacity(max_words),
             max_entries,
             last: Box::new([(0, NO_RECORD); LAST_SLOTS]),
             generation: 0,
@@ -229,11 +229,6 @@ impl MacroMemo {
         }
         if self.arena.len() + words > self.max_words {
             self.compact(words);
-        }
-        let needed = self.arena.len() + words;
-        if needed > self.arena.capacity() {
-            let grown = (self.arena.capacity() * 2).clamp(needed, self.max_words.max(needed));
-            self.arena.reserve_exact(grown - self.arena.len());
         }
         let offset = self.arena.len() as u32;
         self.arena.push(start);
