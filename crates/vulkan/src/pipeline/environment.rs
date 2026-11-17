@@ -70,7 +70,18 @@ impl EnvRead {
             EnvRead::PixelFormat(_, format) | EnvRead::PixelFormatOf(_, format) => format as u32,
             EnvRead::Integer(_, integer) | EnvRead::IntegerOf(_, integer) => u32::from(integer),
             EnvRead::Cbuf { value, .. } => value,
+            EnvRead::StoragePointer { mapped, .. }
+            | EnvRead::IndirectStoragePointer { mapped, .. } => u32::from(mapped),
         }
+    }
+
+    /// Whether it asks if a storage pointer is mapped: the questions a failure keeps, since a
+    /// pointer that was null when the program failed to translate may route once it is mapped.
+    pub fn is_storage_pointer(&self) -> bool {
+        matches!(
+            self,
+            EnvRead::StoragePointer { .. } | EnvRead::IndirectStoragePointer { .. }
+        )
     }
 
     /// Whether both ask the same question, whatever their answers.
@@ -95,6 +106,32 @@ impl EnvRead {
                     ..
                 },
             ) => (a, x) == (b, y),
+            (
+                StoragePointer {
+                    index: a,
+                    offset: x,
+                    ..
+                },
+                StoragePointer {
+                    index: b,
+                    offset: y,
+                    ..
+                },
+            ) => (a, x) == (b, y),
+            (
+                IndirectStoragePointer {
+                    index: a,
+                    offset: x,
+                    indirect: i,
+                    ..
+                },
+                IndirectStoragePointer {
+                    index: b,
+                    offset: y,
+                    indirect: j,
+                    ..
+                },
+            ) => (a, x, i) == (b, y, j),
             _ => false,
         }
     }
@@ -102,9 +139,12 @@ impl EnvRead {
 
 /// A query the translator made of guest state outside the program bytes, and the answer it
 /// got: texture header queries by the constant buffer words that hold the handle (`*Of`) or by
-/// raw handle, and constant buffer words read as values (indirect branch tables) by binding
-/// and offset. A query by words replays against the handle the words hold at the time, so a
-/// different handle that selects the same kind of texture still matches.
+/// raw handle, constant buffer words read as values (indirect branch tables) by binding and
+/// offset, and whether a Switch 2 program's constant buffer pointer (or the pointer table entry
+/// it points to) is mapped. A query by words replays against the handle the words hold at the
+/// time, so a different handle that selects the same kind of texture still matches. A pointer
+/// query replays whether the pointer is mapped, not its value, so a pool that moves keeps its
+/// translation while one that was null when translated gets a new one once it is mapped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnvRead {
     Type(u32, TextureType),
@@ -113,7 +153,22 @@ pub enum EnvRead {
     TypeOf(HandleSource, TextureType),
     PixelFormatOf(HandleSource, TexturePixelFormat),
     IntegerOf(HandleSource, bool),
-    Cbuf { index: u32, offset: u32, value: u32 },
+    Cbuf {
+        index: u32,
+        offset: u32,
+        value: u32,
+    },
+    StoragePointer {
+        index: u32,
+        offset: u32,
+        mapped: bool,
+    },
+    IndirectStoragePointer {
+        index: u32,
+        offset: u32,
+        indirect: u32,
+        mapped: bool,
+    },
 }
 
 /// The texture header pool texture handles index.
@@ -651,6 +706,15 @@ impl<'a> ProgramEnv<'a> {
             | EnvRead::PixelFormatOf(source, _)
             | EnvRead::IntegerOf(source, _) => TextureRef::Words(source),
             EnvRead::Cbuf { index, offset, .. } => return self.cbuf_word(index, offset),
+            EnvRead::StoragePointer { index, offset, .. } => {
+                return u32::from(self.mapped_pointer(index, offset).is_some());
+            }
+            EnvRead::IndirectStoragePointer {
+                index,
+                offset,
+                indirect,
+                ..
+            } => return u32::from(self.mapped_table_entry(index, offset, indirect)),
         };
         let known = textures.known[..textures.len]
             .iter()
@@ -709,6 +773,22 @@ impl<'a> ProgramEnv<'a> {
             }
             _ => 0,
         }
+    }
+
+    /// The address the 8-byte pointer at constant buffer `index`, `offset` holds, when it is
+    /// mapped.
+    fn mapped_pointer(&self, index: u32, offset: u32) -> Option<GpuVAddr> {
+        let low = u64::from(self.cbuf_word(index, offset));
+        let address = low | u64::from(self.cbuf_word(index, offset + 4)) << 32;
+        (address != 0 && self.gmmu.translate(address).is_some()).then_some(address)
+    }
+
+    /// Whether the pointer `indirect` bytes past the address the constant buffer pointer at
+    /// `index`, `offset` holds is mapped.
+    fn mapped_table_entry(&self, index: u32, offset: u32, indirect: u32) -> bool {
+        self.mapped_pointer(index, offset)
+            .and_then(|table| self.gmmu.read::<u64>(table + u64::from(indirect)).ok())
+            .is_some_and(|address| address != 0 && self.gmmu.translate(address).is_some())
     }
 
     /// The bytes `cbuf_word` can read from `cbuf`: its size and the word that starts at its
@@ -842,6 +922,36 @@ impl ShaderEnvironment for ProgramEnv<'_> {
 
     fn has_hle_macro_state(&self) -> bool {
         false
+    }
+
+    fn is_native_program(&self) -> bool {
+        self.arch == ShaderArch::Ampere
+    }
+
+    fn is_cbuf_storage_buffer_pointer(&self, index: u32, offset: u32) -> bool {
+        let mapped = self.mapped_pointer(index, offset).is_some();
+        self.record(EnvRead::StoragePointer {
+            index,
+            offset,
+            mapped,
+        });
+        mapped
+    }
+
+    fn is_cbuf_indirect_storage_buffer_pointer(
+        &self,
+        index: u32,
+        offset: u32,
+        indirect: u32,
+    ) -> bool {
+        let mapped = self.mapped_table_entry(index, offset, indirect);
+        self.record(EnvRead::IndirectStoragePointer {
+            index,
+            offset,
+            indirect,
+            mapped,
+        });
+        mapped
     }
 }
 
@@ -1082,5 +1192,80 @@ mod tests {
         assert_eq!(env.answer(&read, &mut textures), 0, "kept until cleared");
         textures.clear();
         assert_eq!(env.answer(&read, &mut textures), 1);
+    }
+
+    #[test]
+    fn switch2_programs_classify_pointers_by_mapping_and_replay_it() {
+        let physical = Arc::new(PhysicalMemory::new(SIZE).unwrap());
+        physical.commit(0, SIZE).unwrap();
+        let memory = Arc::new(DeviceAddressSpace::new(physical, 36));
+        memory.map(DADDR, 0, SIZE);
+        let gmmu = Arc::new(Gmmu::new(memory, BigPageSize::Size64K));
+        gmmu.map(GPU_VA, DADDR, SIZE, 0, false).unwrap();
+        let table = GPU_VA + 0x2000;
+        let unmapped: GpuVAddr = 0x9_0000_0000;
+        gmmu.write(CBUF + 0x10, table).unwrap();
+        gmmu.write(CBUF + 0x20, unmapped).unwrap();
+        gmmu.write(table + 8, GPU_VA + 0x3000).unwrap();
+        gmmu.write(table + 0x10, unmapped).unwrap();
+        let const_buffers = [ConstBufferBinding {
+            address: CBUF,
+            size: 0x100,
+            enabled: true,
+        }];
+        let pool = TexturePool {
+            address: 0,
+            limit: 0,
+            via_header_index: false,
+            switch2: true,
+        };
+        let mut env = env(&gmmu, &const_buffers, pool);
+        assert!(!env.is_native_program());
+        env.arch = ShaderArch::Ampere;
+        assert!(env.is_native_program());
+
+        assert!(env.is_cbuf_storage_buffer_pointer(0, 0x10));
+        assert!(!env.is_cbuf_storage_buffer_pointer(0, 0x18), "null");
+        assert!(!env.is_cbuf_storage_buffer_pointer(0, 0x20), "unmapped");
+        assert!(env.is_cbuf_indirect_storage_buffer_pointer(0, 0x10, 8));
+        assert!(!env.is_cbuf_indirect_storage_buffer_pointer(0, 0x10, 0x10));
+        assert!(!env.is_cbuf_indirect_storage_buffer_pointer(0, 0x18, 8));
+        let reads = env.take_reads();
+        assert_eq!(reads.len(), 6, "{reads:?}");
+        assert!(
+            !reads.iter().any(|r| matches!(r, EnvRead::Cbuf { .. })),
+            "pointer values are not variant questions"
+        );
+
+        let mut textures = TextureAnswers::default();
+        let replay = |env: &ProgramEnv<'_>, textures: &mut TextureAnswers| {
+            reads
+                .iter()
+                .map(|read| env.answer(read, textures))
+                .collect::<Vec<_>>()
+        };
+        let recorded = reads.iter().map(EnvRead::answer).collect::<Vec<_>>();
+        assert_eq!(replay(&env, &mut textures), recorded);
+
+        gmmu.write(CBUF + 0x10, GPU_VA + 0x4000).unwrap();
+        gmmu.write(GPU_VA + 0x4008, GPU_VA + 0x5000).unwrap();
+        assert_eq!(
+            replay(&env, &mut textures),
+            recorded,
+            "a pool that moves keeps its translation"
+        );
+
+        gmmu.write(CBUF + 0x18, GPU_VA + 0x6000).unwrap();
+        let null_read = EnvRead::StoragePointer {
+            index: 0,
+            offset: 0x18,
+            mapped: false,
+        };
+        assert!(reads.contains(&null_read));
+        assert_eq!(
+            env.answer(&null_read, &mut textures),
+            1,
+            "a pointer that was null at translation asks for a new one once mapped"
+        );
     }
 }

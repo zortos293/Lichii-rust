@@ -75,6 +75,14 @@ pub trait Engine: Send {
     /// One method write (`method` is at or above the host class's 0x40).
     fn call_method(&mut self, ctx: &mut EngineContext<'_>, method: u32, argument: u32);
 
+    /// Writes of `(method, argument)` in stream order, one call for a run the stream holds back
+    /// to back.
+    fn call_methods(&mut self, ctx: &mut EngineContext<'_>, methods: &[(u32, u32)]) {
+        for &(method, argument) in methods {
+            self.call_method(ctx, method, argument);
+        }
+    }
+
     /// Several words for the same method in a row (a non-incrementing run, such as inline or
     /// constant buffer data), copied out of the command stream.
     fn call_multi(&mut self, ctx: &mut EngineContext<'_>, method: u32, arguments: &[u32]) {

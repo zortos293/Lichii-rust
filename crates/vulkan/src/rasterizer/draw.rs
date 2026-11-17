@@ -274,10 +274,12 @@ struct BoundTexture {
     rescaled: bool,
 }
 
-/// Sampled textures by header while the texture cache's images and the address space stay the
-/// same.
+/// Sampled textures by header while the texture cache's host images and lookups and the address
+/// space stay the same.
 #[derive(Default)]
 struct TextureMemo {
+    /// The [`crate::texture_cache::TextureCache::texture_generation`] the entries were found
+    /// under.
     cache: u64,
     /// The address space the headers were read from. Holding it keeps its allocation, so no
     /// later address space can take its place.
@@ -2091,10 +2093,10 @@ impl VulkanRasterizer {
             });
         let memory = src.gmmu.generation();
         let memo = &mut self.draw.bound_textures;
-        if memo.cache != self.texture_cache.generation()
+        if memo.cache != self.texture_cache.texture_generation()
             || memo.gmmu.as_ptr() != Arc::as_ptr(src.gmmu)
         {
-            memo.cache = self.texture_cache.generation();
+            memo.cache = self.texture_cache.texture_generation();
             memo.gmmu = Arc::downgrade(src.gmmu);
             memo.bound.clear();
         }
@@ -2124,8 +2126,10 @@ impl VulkanRasterizer {
                 .is_some_and(|s| s.scale != ResolutionScale::X1),
         };
         let memo = &mut self.draw.bound_textures;
-        if memo.cache != self.texture_cache.generation() || memo.bound.len() >= MAX_BOUND_TEXTURES {
-            memo.cache = self.texture_cache.generation();
+        if memo.cache != self.texture_cache.texture_generation()
+            || memo.bound.len() >= MAX_BOUND_TEXTURES
+        {
+            memo.cache = self.texture_cache.texture_generation();
             memo.bound.clear();
         }
         if let Some(key) = key {
@@ -2216,7 +2220,7 @@ impl VulkanRasterizer {
     }
 
     /// Binds every vertex stream an enabled attribute reads, into the draw's vertex lists.
-    fn vertex_buffers(&mut self, gmmu: &lichii_gpu::gmmu::Gmmu, regs: &Regs) -> Result<()> {
+    fn vertex_buffers(&mut self, gmmu: &Arc<lichii_gpu::gmmu::Gmmu>, regs: &Regs) -> Result<()> {
         let used = regs
             .vertex_attrib_format
             .iter()
@@ -2255,7 +2259,7 @@ impl VulkanRasterizer {
     /// Assembled draws read the guest indices in their assembly pass instead.
     fn indirect_index_buffer(
         &mut self,
-        gmmu: &lichii_gpu::gmmu::Gmmu,
+        gmmu: &Arc<lichii_gpu::gmmu::Gmmu>,
         regs: &Regs,
         draw: &IndirectDraw,
     ) -> Result<Option<IndexBinding>> {
@@ -2286,7 +2290,7 @@ impl VulkanRasterizer {
     /// The buffers an indirect draw (a task/mesh one with `mesh`) reads. `None` skips the draw.
     fn indirect_buffers(
         &mut self,
-        gmmu: &lichii_gpu::gmmu::Gmmu,
+        gmmu: &Arc<lichii_gpu::gmmu::Gmmu>,
         regs: &Regs,
         draw: &IndirectDraw,
         mesh: bool,

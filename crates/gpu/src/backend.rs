@@ -577,14 +577,24 @@ pub trait Rasterizer: Send {
     /// Called once, before any other call. The default ignores it.
     fn set_fence_wake(&mut self, _wake: Box<dyn Fn() + Send + Sync>) {}
 
-    /// Whether fences signalled earlier may still wait for their host GPU work, or recorded work
-    /// is not submitted yet. While this holds, an idle GPU calls
-    /// [`flush_commands`](Self::flush_commands) and then
-    /// [`release_fences(false)`](Self::release_fences) about every millisecond, and whenever the
-    /// [`set_fence_wake`](Self::set_fence_wake) wake fires, so recorded work reaches the host GPU
-    /// and a syncpoint or semaphore the guest CPU waits on lands without more GPU work behind it. The default, true, suits any renderer that defers work; a renderer that
-    /// knows it has nothing recorded or queued can return false and idle without polling.
+    /// Whether fences signalled earlier may still wait for their host GPU work. While this holds,
+    /// an idle GPU calls [`release_fences(false)`](Self::release_fences) about every millisecond,
+    /// and whenever the [`set_fence_wake`](Self::set_fence_wake) wake fires, after
+    /// [`flush_commands`](Self::flush_commands) when
+    /// [`has_unsubmitted_fences`](Self::has_unsubmitted_fences) holds, so a syncpoint or semaphore
+    /// the guest CPU waits on lands without more GPU work behind it. The default, true, suits any
+    /// renderer that defers work; a renderer that knows nothing is queued can return false and
+    /// idle without polling.
     fn has_pending_fences(&self) -> bool {
+        true
+    }
+
+    /// Whether a fence waits for recorded work not submitted to the host GPU yet. Only then does
+    /// an idle GPU call [`flush_commands`](Self::flush_commands), so the work recorded between
+    /// fences reaches the host GPU in one submission rather than one per idle gap. Work no fence
+    /// waits for is submitted at the end of a GPFIFO submission, a present, or a CPU read. The
+    /// default, true, submits at every idle poll.
+    fn has_unsubmitted_fences(&self) -> bool {
         true
     }
 

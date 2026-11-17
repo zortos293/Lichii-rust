@@ -312,6 +312,12 @@ impl Consumer {
         self.read != self.end
     }
 
+    /// Published slots left to read.
+    #[inline]
+    pub(crate) fn available(&self) -> usize {
+        (self.end - self.read) as usize
+    }
+
     /// Slot `index` of the record at the read position.
     #[inline]
     pub(crate) fn slot(&self, index: usize) -> u64 {
