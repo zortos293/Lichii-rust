@@ -594,8 +594,41 @@ struct LookupKey {
     usage: Usage,
 }
 
-pub(crate) fn diag_window() -> bool { static T: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new(); let e = T.get_or_init(std::time::Instant::now).elapsed().as_secs_f32(); (150.0..151.5).contains(&e) }
+pub(crate) fn diag_window() -> bool {
+    static T: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let e = T
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs_f32();
+    (150.0..151.5).contains(&e)
+}
 thread_local! { pub(super) static SYNC_CTX: std::cell::Cell<&'static str> = const { std::cell::Cell::new("?") }; }
+thread_local! { static DL_CTX: std::cell::Cell<&'static str> = const { std::cell::Cell::new("?") }; }
+
+static DL_DIAG: std::sync::Mutex<
+    Option<(
+        std::time::Instant,
+        std::collections::HashMap<String, (u64, u64)>,
+    )>,
+> = std::sync::Mutex::new(None);
+
+fn dl_diag(key: String, bytes: u64) {
+    let mut g = DL_DIAG.lock().unwrap();
+    let (since, map) =
+        g.get_or_insert_with(|| (std::time::Instant::now(), std::collections::HashMap::new()));
+    let e = map.entry(key).or_default();
+    e.0 += 1;
+    e.1 += bytes;
+    if since.elapsed().as_secs() >= 5 {
+        let mut all: Vec<_> = map.drain().collect();
+        all.sort_by(|a, b| b.1.1.cmp(&a.1.1).then(b.1.0.cmp(&a.1.0)));
+        tracing::warn!("dldiag batch keys={}", all.len());
+        for (k, (n, b)) in all.iter().take(14) {
+            tracing::warn!("dldiag {n} {}MB {k}", b >> 20);
+        }
+        *since = std::time::Instant::now();
+    }
+}
 
 /// What a lookup is for, which decides what an image may stand in for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1297,8 +1330,45 @@ impl TextureCache {
     ) -> Result<Option<Found>> {
         let found = self.lookup_or_create(tx, gmmu, gpu_va, info, usage)?;
         if let Some(found) = found {
-            SYNC_CTX.with(|c| c.set(match usage { Usage::Sample => "find sample", Usage::Storage => "find storage", Usage::Target => "find target", Usage::Transfer => "find transfer" }));
-            if usage == Usage::Sample && self.keeps_own(found.id) {
+            SYNC_CTX.with(|c| {
+                c.set(match usage {
+                    Usage::Sample => "find sample",
+                    Usage::Storage => "find storage",
+                    Usage::Target => "find target",
+                    Usage::Transfer => "find transfer",
+                })
+            });
+            static NO_B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if usage == Usage::Sample
+                && !*NO_B.get_or_init(|| std::env::var_os("LICHII_DIAG_NO_B").is_some())
+                && self.keeps_own(found.id)
+            {
+                {
+                    let image = self.get(found.id).expect("a live image id");
+                    let current = image.current;
+                    let desc = |i: &ImageInfo| {
+                        format!(
+                            "{}x{}x{} l{} {:?}",
+                            i.width, i.height, i.layers, i.levels, i.format
+                        )
+                    };
+                    let newer: Vec<String> = image
+                        .overlaps
+                        .iter()
+                        .filter_map(|&o| self.get(o))
+                        .filter(|o| o.modified > current)
+                        .map(|o| desc(&o.info))
+                        .take(3)
+                        .collect();
+                    dl_diag(
+                        format!(
+                            "keep sample {} newer=[{}]",
+                            desc(&image.info),
+                            newer.join(" ; ")
+                        ),
+                        0,
+                    );
+                }
                 self.take_own(tx, found.id)?;
             } else {
                 self.refresh(tx, found.id)?;
@@ -1385,7 +1455,15 @@ impl TextureCache {
             image.cpu_dirty = false;
             image.current = tick;
         }
-        SYNC_CTX.with(|c| c.set(if discard && whole { "target discard" } else if discard { "target discard-not-whole" } else { "target keep" }));
+        SYNC_CTX.with(|c| {
+            c.set(if discard && whole {
+                "target discard"
+            } else if discard {
+                "target discard-not-whole"
+            } else {
+                "target keep"
+            })
+        });
         if usage == Usage::Target && self.keeps_own(found.id) {
             self.take_own(tx, found.id)?;
         } else {
@@ -1655,6 +1733,7 @@ impl TextureCache {
         let mut result = Ok(());
         for &id in &ids {
             if self.image(id).gpu_modified {
+                DL_CTX.with(|c| c.set("invalidate"));
                 let written_back =
                     self.download(tx, &[id], Some((daddr, daddr.saturating_add(size))));
                 result = result.and(written_back);
@@ -1696,6 +1775,7 @@ impl TextureCache {
         }]);
         let mut modified = std::mem::take(&mut self.ids);
         modified.retain(|&id| self.get(id).is_some_and(|i| i.gpu_modified));
+        DL_CTX.with(|c| c.set("flush"));
         let result = self.download(tx, &modified, None);
         modified.clear();
         self.ids = modified;
@@ -2947,6 +3027,7 @@ impl TextureCache {
         if own {
             newer.push(id);
         }
+        DL_CTX.with(|c| c.set("overlaps"));
         let result = self.download(tx, &newer, None);
         self.overlap_scratch = newer;
         if result.is_ok() {
@@ -3428,6 +3509,30 @@ impl TextureCache {
         let submitted = tx.scheduler.tick();
         let mut newest = 0;
         for &id in ids {
+            {
+                let image = self.get(id).expect("a live image id");
+                let i = &image.info;
+                let overlaps_gpu = image
+                    .overlaps
+                    .iter()
+                    .filter_map(|&o| self.get(o))
+                    .filter(|o| o.gpu_modified)
+                    .count();
+                dl_diag(
+                    format!(
+                        "dl {} {}x{}x{} l{} {:?} stale={} gpu_overlaps={}",
+                        DL_CTX.with(|c| c.get()),
+                        i.width,
+                        i.height,
+                        i.layers,
+                        i.levels,
+                        i.format,
+                        image.overlaps_newest > image.current,
+                        overlaps_gpu
+                    ),
+                    image.readback_size().0,
+                );
+            }
             let image = self.image(id);
             if !image.downloadable() {
                 image.gpu_modified = false;

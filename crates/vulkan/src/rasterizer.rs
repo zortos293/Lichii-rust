@@ -523,7 +523,20 @@ impl VulkanRasterizer {
                     && covers(rect, base_layer, layer_count, &info);
                 if matches!((info.width, info.height), (2560, 1440) | (1280, 720)) {
                     if crate::texture_cache::diag_window() {
-                        tracing::info!("tgtdiag clear {}x{} {:?} rt={} written={:?} rect={:?} layers={}+{} discard={} scissor_use={} clear_rect_use={}", info.width, info.height, info.format, index, written, rect, base_layer, layer_count, discard, regs.clear_control.use_scissor(), regs.clear_control.use_clear_rect());
+                        tracing::info!(
+                            "tgtdiag clear {}x{} {:?} rt={} written={:?} rect={:?} layers={}+{} discard={} scissor_use={} clear_rect_use={}",
+                            info.width,
+                            info.height,
+                            info.format,
+                            index,
+                            written,
+                            rect,
+                            base_layer,
+                            layer_count,
+                            discard,
+                            regs.clear_control.use_scissor(),
+                            regs.clear_control.use_clear_rect()
+                        );
                     }
                 }
                 let mut tx = Transfer {

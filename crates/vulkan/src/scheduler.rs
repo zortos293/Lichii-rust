@@ -138,7 +138,9 @@ impl Scheduler {
         let loc = std::panic::Location::caller();
         let cmd = self.command_buffer()?;
         self.end_rendering(cmd);
-        if let Some(gt) = self.gt.as_mut() { gt.locate(&self.device, cmd, loc); }
+        if let Some(gt) = self.gt.as_mut() {
+            gt.locate(&self.device, cmd, loc);
+        }
         Ok(cmd)
     }
 
@@ -151,13 +153,29 @@ impl Scheduler {
     ) -> Result<(vk::CommandBuffer, bool)> {
         let cmd = self.command_buffer()?;
         if self.rendering == Some(key) {
-            if let Some(gt) = self.gt.as_mut() { gt.draw(); }
+            if let Some(gt) = self.gt.as_mut() {
+                gt.draw();
+            }
             return Ok((cmd, false));
         }
         self.end_rendering(cmd);
         if let Some(gt) = self.gt.as_mut() {
-            let colors = key.colors.iter().filter(|v| **v != vk::ImageView::null()).count();
-            gt.mark(&self.device, cmd, format!("R {}x{} c{} d{}", key.extent.width, key.extent.height, colors, u8::from(key.depth != vk::ImageView::null())));
+            let colors = key
+                .colors
+                .iter()
+                .filter(|v| **v != vk::ImageView::null())
+                .count();
+            gt.mark(
+                &self.device,
+                cmd,
+                format!(
+                    "R {}x{} c{} d{}",
+                    key.extent.width,
+                    key.extent.height,
+                    colors,
+                    u8::from(key.depth != vk::ImageView::null())
+                ),
+            );
             gt.draw();
         }
         // SAFETY: `cmd` is recording outside any rendering, and the caller built `info` from
@@ -182,7 +200,9 @@ impl Scheduler {
         if self.rendering.take().is_some() {
             // SAFETY: `cmd` is recording inside the rendering `record_rendering` began.
             unsafe { self.device.raw.cmd_end_rendering(cmd) };
-            if let Some(gt) = self.gt.as_mut() { gt.mark(&self.device, cmd, String::from("O")); }
+            if let Some(gt) = self.gt.as_mut() {
+                gt.mark(&self.device, cmd, String::from("O"));
+            }
         }
     }
 
@@ -219,7 +239,9 @@ impl Scheduler {
         self.device
             .checkpoint(cmd, format_args!("commands of tick {}", self.tick));
         self.current = Some(cmd);
-        if let Some(gt) = self.gt.as_mut() { gt.begin(&self.device, cmd); }
+        if let Some(gt) = self.gt.as_mut() {
+            gt.begin(&self.device, cmd);
+        }
         Ok(cmd)
     }
 
@@ -245,7 +267,9 @@ impl Scheduler {
             self.end_rendering(cmd);
         }
         let cmd = self.current.take();
-        if let (Some(c), Some(gt)) = (cmd, self.gt.as_mut()) { gt.end(&self.device, c, tick); }
+        if let (Some(c), Some(gt)) = (cmd, self.gt.as_mut()) {
+            gt.end(&self.device, c, tick);
+        }
         if let Some(cmd) = cmd {
             // SAFETY: `cmd` is in the recording state.
             unsafe {
@@ -379,7 +403,9 @@ impl Scheduler {
             };
         }
         self.completed = self.completed.max(tick);
-        if let Some(gt) = self.gt.as_mut() { gt.waited(loc, t0.elapsed()); }
+        if let Some(gt) = self.gt.as_mut() {
+            gt.waited(loc, t0.elapsed());
+        }
         self.collect();
         Ok(())
     }
@@ -483,7 +509,9 @@ impl Scheduler {
         {
             self.garbage.pop_front();
         }
-        if let Some(gt) = self.gt.as_mut() { gt.collect(&self.device, completed); }
+        if let Some(gt) = self.gt.as_mut() {
+            gt.collect(&self.device, completed);
+        }
         completed
     }
 }
@@ -651,13 +679,19 @@ mod gputime {
                 waits: HashMap::new(),
                 since: Instant::now(),
                 period: f64::from(device.properties.timestamp_period),
-                mask: if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 },
+                mask: if bits >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << bits) - 1
+                },
                 submits: 0,
             })
         }
 
         fn write(&mut self, device: &Device, cmd: vk::CommandBuffer) -> bool {
-            let Some(cur) = self.cur.as_mut() else { return false };
+            let Some(cur) = self.cur.as_mut() else {
+                return false;
+            };
             if cur.used >= BLOCK {
                 return false;
             }
@@ -680,8 +714,19 @@ mod gputime {
                 return;
             };
             // SAFETY: diag; outside any rendering.
-            unsafe { device.raw.cmd_reset_query_pool(cmd, self.pool, block * BLOCK, BLOCK) };
-            self.cur = Some(Cur { block, used: 0, labels: Vec::new(), label: "O start".into(), draws: 0, located: false });
+            unsafe {
+                device
+                    .raw
+                    .cmd_reset_query_pool(cmd, self.pool, block * BLOCK, BLOCK)
+            };
+            self.cur = Some(Cur {
+                block,
+                used: 0,
+                labels: Vec::new(),
+                label: "O start".into(),
+                draws: 0,
+                located: false,
+            });
             self.write(device, cmd);
         }
 
@@ -699,8 +744,17 @@ mod gputime {
             }
         }
 
-        pub(super) fn locate(&mut self, device: &Device, cmd: vk::CommandBuffer, loc: &'static Location<'static>) {
-            let label = format!("O {}:{}", loc.file().rsplit(['/', '\\']).next().unwrap_or(""), loc.line());
+        pub(super) fn locate(
+            &mut self,
+            device: &Device,
+            cmd: vk::CommandBuffer,
+            loc: &'static Location<'static>,
+        ) {
+            let label = format!(
+                "O {}:{}",
+                loc.file().rsplit(['/', '\\']).next().unwrap_or(""),
+                loc.line()
+            );
             let Some(cur) = self.cur.as_mut() else { return };
             if !cur.label.starts_with('O') || cur.label == label {
                 return;
@@ -736,7 +790,11 @@ mod gputime {
         }
 
         pub(super) fn waited(&mut self, loc: &'static Location<'static>, d: Duration) {
-            let key = format!("{}:{}", loc.file().rsplit(['/', '\\']).next().unwrap_or(""), loc.line());
+            let key = format!(
+                "{}:{}",
+                loc.file().rsplit(['/', '\\']).next().unwrap_or(""),
+                loc.line()
+            );
             let e = self.waits.entry(key).or_default();
             e.0 += d;
             e.1 += 1;
@@ -749,7 +807,12 @@ mod gputime {
                 let mut data = vec![0u64; n];
                 // SAFETY: diag; the submission completed.
                 let ok = unsafe {
-                    device.raw.get_query_pool_results(self.pool, block * BLOCK, &mut data, vk::QueryResultFlags::TYPE_64)
+                    device.raw.get_query_pool_results(
+                        self.pool,
+                        block * BLOCK,
+                        &mut data,
+                        vk::QueryResultFlags::TYPE_64,
+                    )
                 }
                 .is_ok();
                 if ok {
@@ -769,10 +832,27 @@ mod gputime {
                 let mut all: Vec<_> = self.stats.drain().collect();
                 all.sort_by(|a, b| b.1.0.cmp(&a.1.0));
                 let total: u64 = all.iter().map(|a| a.1.0).sum();
-                let render: u64 = all.iter().filter(|a| a.0.starts_with('R')).map(|a| a.1.0).sum();
-                tracing::warn!("gputime batch {:.1}s gpu_busy_ms={:.1} render_ms={:.1} keys={} submits={}", secs, total as f64 / 1e6, render as f64 / 1e6, all.len(), self.submits);
+                let render: u64 = all
+                    .iter()
+                    .filter(|a| a.0.starts_with('R'))
+                    .map(|a| a.1.0)
+                    .sum();
+                tracing::warn!(
+                    "gputime batch {:.1}s gpu_busy_ms={:.1} render_ms={:.1} keys={} submits={}",
+                    secs,
+                    total as f64 / 1e6,
+                    render as f64 / 1e6,
+                    all.len(),
+                    self.submits
+                );
                 for (label, (ns, segs, draws)) in all.iter().take(18) {
-                    tracing::warn!("gputime {:8.1}ms segs={:6} draws={:7} {}", *ns as f64 / 1e6, segs, draws, label);
+                    tracing::warn!(
+                        "gputime {:8.1}ms segs={:6} draws={:7} {}",
+                        *ns as f64 / 1e6,
+                        segs,
+                        draws,
+                        label
+                    );
                 }
                 let mut w: Vec<_> = self.waits.drain().collect();
                 w.sort_by(|a, b| b.1.0.cmp(&a.1.0));
