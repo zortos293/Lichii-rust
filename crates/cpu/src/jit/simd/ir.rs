@@ -2,7 +2,7 @@
 
 use super::super::ir::{Ty, Value};
 use super::fp_vector::Lanes;
-use super::vector::{Arrangement, VecOp};
+use super::vector::{Arrangement, SatShl, VecOp};
 
 /// Scalar floating-point element size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,6 +172,17 @@ pub enum SimdOp {
         acc: Option<(Value, bool)>,
         word: u32,
     },
+    /// `SQSHL`, `UQSHL` or `SQSHLU` by immediate: each lane of `a` shifted left by `shift` with
+    /// saturation, setting FPSR.QC when a lane saturates. With `scalar`, only lane 0 counts and
+    /// the rest of the result is zero.
+    SatShiftLeft {
+        kind: SatShl,
+        arrangement: Arrangement,
+        scalar: bool,
+        shift: u8,
+        a: Value,
+        word: u32,
+    },
     /// Advanced SIMD integer and element-move ops.
     Vec(VecOp),
     /// Advanced SIMD FP arithmetic on S or D lanes, checked like the scalar ops.
@@ -208,7 +219,8 @@ impl SimdOp {
             | SimdOp::SatNarrow { word, .. }
             | SimdOp::SatArith { word, .. }
             | SimdOp::SatMulHigh { word, .. }
-            | SimdOp::SatMulLong { word, .. } => Some(word),
+            | SimdOp::SatMulLong { word, .. }
+            | SimdOp::SatShiftLeft { word, .. } => Some(word),
             SimdOp::Lanes(lanes) => Some(lanes.word),
             _ => None,
         }
@@ -268,6 +280,7 @@ impl SimdOp {
                 f(n);
                 f(m);
             }
+            SimdOp::SatShiftLeft { a, .. } => f(a),
             SimdOp::Vec(op) => op.for_each_arg(f),
             SimdOp::Lanes(lanes) => lanes.for_each_arg(f),
         }

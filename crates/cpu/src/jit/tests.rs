@@ -781,6 +781,41 @@ fn byte_and_double_shifts_at_the_lane_width_match_the_interpreter() {
 }
 
 #[test]
+fn saturating_left_shifts_at_the_lane_edges_match_the_interpreter() {
+    const DUP_V0_X0: u32 = 0x4e08_0c00;
+    const DUP_V1_X1: u32 = 0x4e08_0c21;
+    const VALUES: [u64; 8] = [
+        0,
+        1,
+        u64::MAX,
+        1 << 63,
+        u64::MAX >> 1,
+        0x3f40_7f80_c0ff_0001,
+        0x4000_3fff_c000_bfff,
+        0x0001_0080_ff7f_8100,
+    ];
+    let ops = [
+        0x4f00_7420,
+        0x6f00_7420,
+        0x6f00_6420,
+        0x5f00_7420,
+        0x7f00_7420,
+        0x7f00_6420,
+    ];
+    for op in ops {
+        for size in 0..4 {
+            let esize = 8u32 << size;
+            for shift in [0, 1, esize / 2, esize - 1] {
+                let word = op | (esize + shift) << 16;
+                for a in VALUES {
+                    directed(&[DUP_V0_X0, DUP_V1_X1, word], &[(0, !a), (1, a)]);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn fused_conditions_match_the_interpreter() {
     const VALUES: [u64; 5] = [0, 1, 0x8000_0000, 1 << 63, u64::MAX];
     let setters = [0xeb01_001f, 0xab01_001f, 0xea01_001f];

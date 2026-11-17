@@ -157,6 +157,17 @@ pub enum Long {
     Mul,
 }
 
+/// The saturating left shifts by immediate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SatShl {
+    /// `SQSHL`: signed in and out.
+    Signed,
+    /// `UQSHL`: unsigned in and out.
+    Unsigned,
+    /// `SQSHLU`: signed in, unsigned out.
+    SignedToUnsigned,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shift {
     Shl,
@@ -789,14 +800,21 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         t.set(Loc::V(rd), r);
         return true;
     }
-    let scalar = word & 0xdf80_0400 == 0x5f00_0400;
+    let scalar = word & 0xdf80_0400 == 0x5f00_0400 && field(word, 19, 4) != 0;
+    let saturating = match (field(word, 11, 5), u) {
+        (0b01110, false) => Some(SatShl::Signed),
+        (0b01110, true) => Some(SatShl::Unsigned),
+        (0b01100, true) => Some(SatShl::SignedToUnsigned),
+        _ => None,
+    };
     if word & 0x9f80_0400 == 0x0f00_0400
         || (scalar
-            && word & 0x0040_0000 != 0
-            && matches!(
-                field(word, 11, 5),
-                0b00000 | 0b00010 | 0b00100 | 0b00110 | 0b01000 | 0b01010
-            ))
+            && (saturating.is_some()
+                || (word & 0x0040_0000 != 0
+                    && matches!(
+                        field(word, 11, 5),
+                        0b00000 | 0b00010 | 0b00100 | 0b00110 | 0b01000 | 0b01010
+                    ))))
     {
         let q = q && !scalar;
         let size = 7 - field(word, 19, 4).leading_zeros() as u8;
@@ -805,6 +823,22 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         }
         let esize = 8u8 << size;
         let immhb = field(word, 16, 7);
+        if let Some(kind) = saturating {
+            if size == 3 && !t.sse41 {
+                return false;
+            }
+            let a = vec(t, rn);
+            let r = t.op(Op::Simd(SimdOp::SatShiftLeft {
+                kind,
+                arrangement: Arrangement { size, q },
+                scalar,
+                shift: immhb - esize,
+                a,
+                word,
+            }));
+            t.set(Loc::V(rd), r);
+            return true;
+        }
         if field(word, 11, 5) == 0b10100 && size < 3 {
             let a = vec(t, rn);
             let r = emit(
@@ -1802,6 +1836,83 @@ impl Emitter<'_> {
         );
         if !q {
             dynasm!(self.asm ; .arch x64 ; movq Rx(d), Rx(d));
+        }
+    }
+
+    /// `SQSHL`, `UQSHL` or `SQSHLU` by immediate (see `SimdOp::SatShiftLeft`). A lane fits when
+    /// shifting the result back gives the input; the ones that don't saturate, and `SQSHLU` also
+    /// turns negative inputs into zero.
+    pub(super) fn sat_shift_left(
+        &mut self,
+        i: usize,
+        kind: SatShl,
+        arrangement: Arrangement,
+        scalar: bool,
+        shift: u8,
+        a: Value,
+    ) {
+        let Arrangement { size, q } = arrangement;
+        let a = self.reg(a);
+        let d = self.def(Value(i as u32));
+        let (t, bad) = (self.temp(), self.temp());
+        let top = (8 << size) - 1;
+        self.copy(d, a);
+        self.shift_imm(Shift::Shl, size, d, shift);
+        self.copy(t, d);
+        let back = if kind == SatShl::Signed {
+            Shift::Sshr
+        } else {
+            Shift::Ushr
+        };
+        self.shift_imm(back, size, t, shift);
+        self.sse(Sse::Eq, size, t, a);
+        dynasm!(self.asm ; .arch x64 ; pcmpeqd Rx(bad), Rx(bad));
+        self.sse(Sse::Xor, size, bad, t);
+        match kind {
+            SatShl::Unsigned => self.sse(Sse::Or, size, d, bad),
+            SatShl::Signed => {
+                self.copy(t, a);
+                self.shift_imm(Shift::Sshr, size, t, top);
+                dynasm!(self.asm ; .arch x64 ; pcmpeqd Rx(SCRATCH), Rx(SCRATCH));
+                self.shift_imm(Shift::Ushr, size, SCRATCH, 1);
+                self.sse(Sse::Xor, size, t, SCRATCH);
+                self.sse(Sse::Xor, size, t, d);
+                self.sse(Sse::And, size, t, bad);
+                self.sse(Sse::Xor, size, d, t);
+            }
+            SatShl::SignedToUnsigned => {
+                self.sse(Sse::Or, size, d, bad);
+                self.copy(t, a);
+                self.shift_imm(Shift::Sshr, size, t, top);
+                self.sse(Sse::Or, size, bad, t);
+                self.sse(Sse::AndNot, size, t, d);
+                self.copy(d, t);
+            }
+        }
+        let active = match (scalar, q) {
+            (true, _) => (1 << (1 << size)) - 1,
+            (false, true) => 0xffff,
+            (false, false) => 0xff,
+        };
+        let exact = self.asm.new_dynamic_label();
+        dynasm!(self.asm
+            ; .arch x64
+            ; pmovmskb eax, Rx(bad)
+            ; and eax, active
+            ; jz =>exact
+            ; or DWORD [r15 + CTX_FPSR], QC
+            ; =>exact
+        );
+        match (scalar, size) {
+            (true, 0) => {
+                dynasm!(self.asm ; .arch x64 ; movd eax, Rx(d) ; movzx eax, al ; movd Rx(d), eax)
+            }
+            (true, 1) => {
+                dynasm!(self.asm ; .arch x64 ; movd eax, Rx(d) ; movzx eax, ax ; movd Rx(d), eax)
+            }
+            (true, 2) => dynasm!(self.asm ; .arch x64 ; movd eax, Rx(d) ; movd Rx(d), eax),
+            _ if !q => dynasm!(self.asm ; .arch x64 ; movq Rx(d), Rx(d)),
+            _ => {}
         }
     }
 
