@@ -1,16 +1,56 @@
 //! Constant buffer uploads and binds, and the NVN2 root tables.
 //!
 //! Uploads write guest memory at once (the address is the buffer's GPU address plus its running
-//! offset) and tell the renderer which range changed; binds update the per-stage table the
-//! renderer borrows at each draw.
+//! offset) and collect the changed range; the renderer hears of it once per run of uploads, before
+//! the next method that is not a constant buffer write (as the reference's FlushCaching does).
+//! Binds update the per-stage table the renderer borrows at each draw.
 
 use super::regs::{BindGroupRawConfig, ConstantBuffer, MAX_CONST_BUFFERS};
 use crate::backend::{ConstBufferBinding, GraphicsConstBuffers, RootTables};
 use crate::engines::EngineContext;
+use lichii_common::GpuVAddr;
+
+/// Constant buffer bytes written since the renderer last heard of them: one range, grown while
+/// uploads touch it.
+#[derive(Default)]
+pub(super) struct Written(Option<(GpuVAddr, GpuVAddr)>);
+
+impl Written {
+    #[inline]
+    pub fn is_pending(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// Tells the renderer about the collected range.
+    pub fn flush(&mut self, ctx: &mut EngineContext<'_>) {
+        if let Some((start, end)) = self.0.take() {
+            ctx.rasterizer
+                .inline_written(ctx.channel, ctx.memory, start, end - start);
+        }
+    }
+
+    fn add(&mut self, ctx: &mut EngineContext<'_>, start: GpuVAddr, end: GpuVAddr) {
+        match &mut self.0 {
+            Some((from, to)) if start <= *to && end >= *from => {
+                *from = (*from).min(start);
+                *to = (*to).max(end);
+            }
+            _ => {
+                self.flush(ctx);
+                self.0 = Some((start, end));
+            }
+        }
+    }
+}
 
 /// Writes `words` at the bound buffer's offset and advances the offset by 4 per word. Words past
 /// the buffer's size are dropped, but still advance the offset, as on hardware.
-pub(super) fn upload(cb: &mut ConstantBuffer, ctx: &mut EngineContext<'_>, words: &[u32]) {
+pub(super) fn upload(
+    cb: &mut ConstantBuffer,
+    written_ranges: &mut Written,
+    ctx: &mut EngineContext<'_>,
+    words: &[u32],
+) {
     let offset = cb.offset;
     let room = cb.size.saturating_sub(offset) as usize / 4;
     let written = &words[..words.len().min(room)];
@@ -20,8 +60,7 @@ pub(super) fn upload(cb: &mut ConstantBuffer, ctx: &mut EngineContext<'_>, words
         if let Err(fault) = ctx.memory.write_block(address, bytes) {
             tracing::warn!(?fault, "constant buffer upload to unmapped GPU memory");
         }
-        ctx.rasterizer
-            .inline_written(ctx.channel, ctx.memory, address, bytes.len() as u64);
+        written_ranges.add(ctx, address, address + bytes.len() as u64);
     }
     if written.len() != words.len() {
         tracing::debug!(

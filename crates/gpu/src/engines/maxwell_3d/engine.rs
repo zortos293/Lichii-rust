@@ -30,6 +30,13 @@ const WAIT_FOR_IDLE: u32 = reg_index!(Regs, wait_for_idle);
 const FALCON4: u32 = reg_index!(Regs, falcon) + 4;
 const CB_DATA_FIRST: u32 = reg_index!(Regs, const_buffer.buffer);
 const CB_DATA_LAST: u32 = CB_DATA_FIRST + 15;
+const CB_SELECT_FIRST: u32 = reg_index!(Regs, const_buffer.size);
+
+/// Constant buffer data and the selector registers between its runs, which touch no cache.
+#[inline]
+fn is_const_buffer_write(method: u32) -> bool {
+    (CB_SELECT_FIRST..=CB_DATA_LAST).contains(&method)
+}
 const BIND_GROUP_STRIDE: u32 = (size_of::<BindGroup>() / 4) as u32;
 const BIND_GROUP_FIRST: u32 = reg_index!(Regs, bind_groups) + 4;
 const BIND_GROUP_LAST: u32 = BIND_GROUP_FIRST + (MAX_SHADER_STAGE as u32 - 1) * BIND_GROUP_STRIDE;
@@ -69,6 +76,7 @@ pub struct Maxwell3d {
     /// Registers, shadow RAM and dirty flags.
     pub state: RegisterState,
     const_buffers: GraphicsConstBuffers,
+    const_buffer_writes: const_buffers::Written,
     root_tables: RootTableState,
     draw: DrawState,
     upload: Upload,
@@ -83,6 +91,7 @@ impl Maxwell3d {
         Self {
             state: RegisterState::new(),
             const_buffers: GraphicsConstBuffers::default(),
+            const_buffer_writes: const_buffers::Written::default(),
             root_tables: RootTableState::new(),
             draw: DrawState::new(),
             upload: Upload::default(),
@@ -100,6 +109,9 @@ impl Maxwell3d {
         );
         if method >= MACRO_REGISTERS_START {
             return;
+        }
+        if self.const_buffer_writes.is_pending() && !is_const_buffer_write(method) {
+            self.const_buffer_writes.flush(ctx);
         }
         if self.draw.pending.is_some()
             && !draw::is_loop_method(method)
@@ -129,19 +141,27 @@ impl Maxwell3d {
                     | draw::INLINE_INDEX_2X16
                     | draw::INLINE_INDEX_4X8
         );
+        if self.const_buffer_writes.is_pending() && !is_const_buffer_write(method) {
+            self.const_buffer_writes.flush(ctx);
+        }
         if !block || self.state.shadow_ram_control() == ShadowRamControl::REPLAY {
             for &argument in arguments {
                 self.call_method(ctx, method, argument);
             }
             return;
         }
-        if !draw::is_loop_method(method) {
+        if !draw::is_loop_method(method) && self.draw.pending.is_some() {
             self.flush(ctx);
         }
         self.state.write(method, last);
         match method {
             CB_DATA_FIRST..=CB_DATA_LAST => {
-                const_buffers::upload(&mut self.state.regs.const_buffer, ctx, arguments);
+                const_buffers::upload(
+                    &mut self.state.regs.const_buffer,
+                    &mut self.const_buffer_writes,
+                    ctx,
+                    arguments,
+                );
             }
             INLINE_DATA => {
                 for &word in arguments {
@@ -153,8 +173,10 @@ impl Maxwell3d {
         }
     }
 
-    /// Draws the held-back draw, if any.
+    /// Tells the renderer about constant buffer writes not announced yet, then draws the held-back
+    /// draw, if any.
     pub fn flush(&mut self, ctx: &mut EngineContext<'_>) {
+        self.const_buffer_writes.flush(ctx);
         if let Some(pending) = self.draw.pending.take() {
             self.render(ctx, &pending);
         }
@@ -194,7 +216,12 @@ impl Maxwell3d {
                 self.draw.push_inline(method, &[value]);
             }
             CB_DATA_FIRST..=CB_DATA_LAST => {
-                const_buffers::upload(&mut self.state.regs.const_buffer, ctx, &[value]);
+                const_buffers::upload(
+                    &mut self.state.regs.const_buffer,
+                    &mut self.const_buffer_writes,
+                    ctx,
+                    &[value],
+                );
             }
             BIND_GROUP_FIRST..=BIND_GROUP_LAST
                 if (method - BIND_GROUP_FIRST).is_multiple_of(BIND_GROUP_STRIDE) =>
