@@ -143,10 +143,13 @@ impl Fermi2d {
                 _ => BlitOperation::SrcCopy,
             },
         };
-        if ctx
+        let t0 = std::time::Instant::now();
+        let accel = ctx
             .rasterizer
-            .accelerate_blit(ctx.channel, ctx.memory, &blit)
-        {
+            .accelerate_blit(ctx.channel, ctx.memory, &blit);
+        let t1 = std::time::Instant::now();
+        if accel {
+            blit_time::record(true, &blit, t1 - t0, std::time::Duration::ZERO);
             return;
         }
         self.blitter.blit(
@@ -167,6 +170,7 @@ impl Fermi2d {
                 linear_filter,
             },
         );
+        blit_time::record(false, &blit, t1 - t0, t1.elapsed());
     }
 }
 
@@ -859,6 +863,42 @@ mod tests {
                 continue;
             };
             assert_eq!(layout.bytes as u32, pixel.bytes_per_block(), "{format:?}");
+        }
+    }
+}
+
+mod blit_time {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    use crate::backend::Blit;
+
+    type Stats = HashMap<String, (u64, Duration, Duration)>;
+    static STATE: Mutex<Option<(Instant, Stats)>> = Mutex::new(None);
+
+    pub(super) fn record(gpu: bool, blit: &Blit, accel: Duration, sw: Duration) {
+        let key = format!(
+            "gpu={gpu} {:?}->{:?} dst={}x{}x{} blk={:?} p={} rect={}x{} src={}x{} blk={:?} p={}",
+            blit.src_format, blit.dst_format, blit.dst.width, blit.dst.height, blit.dst.depth,
+            blit.dst.block, blit.dst.pitch, blit.dst_width, blit.dst_height,
+            blit.src.width, blit.src.height, blit.src.block, blit.src.pitch,
+        );
+        let mut state = STATE.lock().unwrap();
+        let (since, stats) = state.get_or_insert_with(|| (Instant::now(), HashMap::new()));
+        let e = stats.entry(key).or_insert((0, Duration::ZERO, Duration::ZERO));
+        e.0 += 1;
+        e.1 += accel;
+        e.2 += sw;
+        if since.elapsed().as_secs() >= 5 {
+            let mut all: Vec<_> = stats.drain().collect();
+            all.sort_by(|a, b| (b.1.1 + b.1.2).cmp(&(a.1.1 + a.1.2)));
+            let (n, a, w) = all.iter().fold((0, Duration::ZERO, Duration::ZERO), |t, k| (t.0 + k.1.0, t.1 + k.1.1, t.2 + k.1.2));
+            tracing::warn!("blit time batch n={n} accel_ms={:.1} sw_ms={:.1}", a.as_secs_f64() * 1e3, w.as_secs_f64() * 1e3);
+            for (key, (n, a, w)) in all.iter().take(8) {
+                tracing::warn!("blit time {n} accel_ms={:.1} sw_ms={:.1} {key}", a.as_secs_f64() * 1e3, w.as_secs_f64() * 1e3);
+            }
+            *since = Instant::now();
         }
     }
 }
