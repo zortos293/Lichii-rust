@@ -39,6 +39,7 @@ pub struct DeviceExtensions {
     pub provoking_vertex: bool,
     pub depth_clip_control: bool,
     pub depth_clip_enable: bool,
+    pub depth_bias_control: bool,
     pub index_type_uint8: bool,
     pub line_rasterization: bool,
     pub shader_stencil_export: bool,
@@ -72,6 +73,7 @@ const OPTIONAL_EXTENSIONS: &[(&CStr, ExtensionFlag)] = &[
     (ext::provoking_vertex::NAME, |e| &mut e.provoking_vertex),
     (ext::depth_clip_control::NAME, |e| &mut e.depth_clip_control),
     (ext::depth_clip_enable::NAME, |e| &mut e.depth_clip_enable),
+    (ext::depth_bias_control::NAME, |e| &mut e.depth_bias_control),
     (ext::index_type_uint8::NAME, |e| &mut e.index_type_uint8),
     (ext::line_rasterization::NAME, |e| &mut e.line_rasterization),
     (ext::shader_stencil_export::NAME, |e| {
@@ -125,6 +127,11 @@ pub struct DeviceFeatures {
     pub provoking_vertex_last: bool,
     pub index_type_uint8: bool,
     pub depth_clip_control: bool,
+    /// `vkCmdSetDepthBias2EXT` with a float depth bias representation, so a bias can be given
+    /// in absolute depth units whatever the host depth format.
+    pub depth_bias_float: bool,
+    /// The driver applies the depth bias without scaling the minimum resolvable difference.
+    pub depth_bias_exact: bool,
     pub transform_feedback: bool,
     pub conditional_rendering: bool,
     /// `VK_EXT_mesh_shader` with both task and mesh stages.
@@ -350,6 +357,7 @@ impl Device {
         let mut provoking = vk::PhysicalDeviceProvokingVertexFeaturesEXT::default();
         let mut clip_control = vk::PhysicalDeviceDepthClipControlFeaturesEXT::default();
         let mut clip_enable = vk::PhysicalDeviceDepthClipEnableFeaturesEXT::default();
+        let mut bias_control = vk::PhysicalDeviceDepthBiasControlFeaturesEXT::default();
         let mut uint8 = vk::PhysicalDeviceIndexTypeUint8FeaturesKHR::default();
         let mut lines = vk::PhysicalDeviceLineRasterizationFeaturesKHR::default();
 
@@ -369,6 +377,7 @@ impl Device {
                 provoking.p_next = std::ptr::null_mut();
                 clip_control.p_next = std::ptr::null_mut();
                 clip_enable.p_next = std::ptr::null_mut();
+                bias_control.p_next = std::ptr::null_mut();
                 uint8.p_next = std::ptr::null_mut();
                 lines.p_next = std::ptr::null_mut();
                 let mut features = vk::PhysicalDeviceFeatures2::default()
@@ -408,6 +417,9 @@ impl Device {
                 if extensions.depth_clip_enable {
                     features = features.push_next(&mut clip_enable);
                 }
+                if extensions.depth_bias_control {
+                    features = features.push_next(&mut bias_control);
+                }
                 if extensions.index_type_uint8 {
                     features = features.push_next(&mut uint8);
                 }
@@ -439,6 +451,7 @@ impl Device {
         mesh.multiview_mesh_shader &= v11.multiview;
         mesh.primitive_fragment_shading_rate_mesh_shader = vk::FALSE;
         mesh.mesh_shader_queries = vk::FALSE;
+        bias_control.least_representable_value_force_unorm_representation = vk::FALSE;
         let on = |b: vk::Bool32| b != vk::FALSE;
         let features = DeviceFeatures {
             extensions,
@@ -498,6 +511,12 @@ impl Device {
             index_type_uint8: extensions.index_type_uint8 && on(uint8.index_type_uint8),
             depth_clip_control: extensions.depth_clip_control
                 && on(clip_control.depth_clip_control),
+            depth_bias_float: extensions.depth_bias_control
+                && on(bias_control.depth_bias_control)
+                && on(bias_control.float_representation),
+            depth_bias_exact: extensions.depth_bias_control
+                && on(bias_control.depth_bias_control)
+                && on(bias_control.depth_bias_exact),
             transform_feedback: extensions.transform_feedback && on(xfb.transform_feedback),
             conditional_rendering: extensions.conditional_rendering
                 && on(conditional.conditional_rendering),
