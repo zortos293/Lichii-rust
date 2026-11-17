@@ -93,8 +93,12 @@ pub trait MacroHost {
 const READ_WORDS: usize = 64;
 
 /// Calls in a row at one start address without the shape of a condition after which
-/// [`MacroEngine::may_run_as_condition`] stops condition runs there until the code changes.
+/// [`MacroEngine::may_run_as_condition`] lets only one call in [`CONDITION_RETRY`] there make
+/// condition runs.
 pub const CONDITION_MISS_LIMIT: u32 = 32;
+
+/// One call in this many makes condition runs at a start address past [`CONDITION_MISS_LIMIT`].
+pub const CONDITION_RETRY: u32 = 64;
 
 /// A condition run ([`MacroEngine::condition_execute`]): the call's FIFOed read words are known
 /// where [`MacroHost::dma_peek`] knows them, and the run may test the others once, for whether
@@ -383,8 +387,8 @@ pub struct MacroEngine {
     /// Start addresses whose calls read guest memory since the code last changed.
     memory_readers: std::collections::HashSet<u32>,
     /// Calls at each start address in a row, since the code last changed, that did not have the
-    /// shape of a condition.
-    condition_misses: std::collections::HashMap<u32, u32>,
+    /// shape of a condition, and the calls skipped since the last retry past the limit.
+    condition_misses: std::collections::HashMap<u32, (u32, u32)>,
 }
 
 enum Code {
@@ -676,22 +680,31 @@ impl MacroEngine {
         })
     }
 
-    /// Whether calls at `start` are still worth condition runs: false after
-    /// [`CONDITION_MISS_LIMIT`] calls in a row there did not have the shape of a condition.
-    pub fn may_run_as_condition(&self, start: u32) -> bool {
-        self.condition_misses
-            .get(&start)
-            .is_none_or(|&misses| misses < CONDITION_MISS_LIMIT)
+    /// Whether the call at `start` about to run makes condition runs: after
+    /// [`CONDITION_MISS_LIMIT`] calls in a row there did not have the shape of a condition, only
+    /// one call in [`CONDITION_RETRY`] does, until one has the shape or the code changes.
+    pub fn may_run_as_condition(&mut self, start: u32) -> bool {
+        let Some((misses, skipped)) = self.condition_misses.get_mut(&start) else {
+            return true;
+        };
+        if *misses < CONDITION_MISS_LIMIT {
+            return true;
+        }
+        *skipped += 1;
+        if *skipped < CONDITION_RETRY {
+            return false;
+        }
+        *skipped = 0;
+        true
     }
 
-    /// Records whether a call at `start` had the shape of a condition.
+    /// Records whether a call at `start` that made condition runs had the shape of a condition.
     pub fn note_condition_shape(&mut self, start: u32, shaped: bool) {
         if shaped {
-            if let Some(misses) = self.condition_misses.get_mut(&start) {
-                *misses = 0;
-            }
+            self.condition_misses.remove(&start);
         } else {
-            *self.condition_misses.entry(start).or_insert(0) += 1;
+            let (misses, _) = self.condition_misses.entry(start).or_insert((0, 0));
+            *misses = misses.saturating_add(1);
         }
     }
 

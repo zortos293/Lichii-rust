@@ -8,9 +8,9 @@ mod mme64;
 use std::collections::HashMap;
 
 use super::{
-    CONDITION_MISS_LIMIT, LOAD_MME_INSTRUCTION_RAM, LOAD_MME_INSTRUCTION_RAM_POINTER,
-    LOAD_MME_START_ADDRESS_RAM, LOAD_MME_START_ADDRESS_RAM_POINTER, MacroEngine, MacroHost,
-    MacroIsa,
+    CONDITION_MISS_LIMIT, CONDITION_RETRY, LOAD_MME_INSTRUCTION_RAM,
+    LOAD_MME_INSTRUCTION_RAM_POINTER, LOAD_MME_START_ADDRESS_RAM,
+    LOAD_MME_START_ADDRESS_RAM_POINTER, MacroEngine, MacroHost, MacroIsa,
 };
 
 /// A register mirror that records every method write and serves DMA reads from a word map.
@@ -332,21 +332,36 @@ mod masm {
     }
 }
 
-/// Condition runs stop at a start address after `CONDITION_MISS_LIMIT` calls in a row there
-/// lacked the shape of a condition; a call with the shape resets the count, and changed code
-/// forgets it.
+/// After @CONDITION_MISS_LIMIT@ calls in a row at a start address lacked the shape of a
+/// condition, only one call in @CONDITION_RETRY@ there makes condition runs; a call with the
+/// shape lets every call make them again, and so does changed code.
 #[test]
-fn condition_runs_stop_where_calls_never_have_the_shape() {
+fn condition_runs_back_off_where_calls_lack_the_shape() {
     let mut engine = engine_with(MacroIsa::Mme64, &[0, 0, 0]);
-    for _ in 1..CONDITION_MISS_LIMIT {
+    let miss_streak = |engine: &mut MacroEngine| {
+        for _ in 0..CONDITION_MISS_LIMIT {
+            assert!(engine.may_run_as_condition(0));
+            engine.note_condition_shape(0, false);
+        }
+    };
+    miss_streak(&mut engine);
+    for round in 0..2 {
+        for _ in 1..CONDITION_RETRY {
+            assert!(!engine.may_run_as_condition(0), "round {round}");
+        }
+        assert!(engine.may_run_as_condition(0), "round {round} retries");
         engine.note_condition_shape(0, false);
+    }
+    for _ in 1..CONDITION_RETRY {
+        assert!(!engine.may_run_as_condition(0));
     }
     assert!(engine.may_run_as_condition(0));
     engine.note_condition_shape(0, true);
-    for _ in 0..CONDITION_MISS_LIMIT {
-        assert!(engine.may_run_as_condition(0));
-        engine.note_condition_shape(0, false);
-    }
+    assert!(
+        engine.may_run_as_condition(0),
+        "a call with the shape ends the backoff"
+    );
+    miss_streak(&mut engine);
     assert!(!engine.may_run_as_condition(0));
     assert!(
         engine.may_run_as_condition(3),
