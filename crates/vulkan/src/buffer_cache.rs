@@ -39,6 +39,9 @@ const CACHING_PAGE_SIZE: u64 = 1 << CACHING_PAGE_BITS;
 /// Uniform buffers up to this size are streamed instead of cached (Lichii's skip-cache size).
 pub const UNIFORM_STREAM_MAX: u64 = 4 << 10;
 const STREAM_RING_SIZE: u64 = 16 << 20;
+
+/// Bytes of each of the two [`SyncSlices`].
+const SYNC_SLICE: u64 = 8 << 20;
 /// Joins of joins past this score mark a stream buffer, which then grows ahead of its writes.
 const STREAM_LEAP_THRESHOLD: u32 = 16;
 const STREAM_LEAP_BYTES: u64 = 128 * CACHING_PAGE_SIZE;
@@ -190,6 +193,18 @@ struct CachedBuffer {
     /// and when GPU work writing it is recorded. Epochs only grow, so the newest of a gather's
     /// sources changes whenever any source does.
     modified: u64,
+}
+
+/// Host-visible memory for uploads too large to share the staging ring: two slices of
+/// [`SYNC_SLICE`] bytes, made on first use and kept, filled in turn. The copies out of a slice
+/// are submitted as soon as they are recorded ([`Scheduler::submit_part`]) and the slice is
+/// filled again once that part finished, so the host fills one slice while the GPU copies out of
+/// the other, and uploads of any size hold `2 * SYNC_SLICE` bytes of it at most.
+struct SyncSlices {
+    buffer: Buffer,
+    /// The part each slice's last copies were submitted in.
+    parts: [u64; 2],
+    next: usize,
 }
 
 /// A large scattered storage range gathered into a buffer of its own, reused while
@@ -803,6 +818,7 @@ pub struct BufferCache {
     /// ([`lichii_gpu::gpu::flush_traps_enabled`]).
     flush_traps: bool,
     stream: StreamRing,
+    sync_slices: Option<SyncSlices>,
     readback: Readback,
     captures: Captures,
     luts: [QuadLut; 2],
@@ -852,6 +868,7 @@ impl BufferCache {
             gpu_written: RangeSet::default(),
             flush_traps: lichii_gpu::gpu::flush_traps_enabled(),
             stream: StreamRing::new(device, STREAM_RING_SIZE, RING_OVERSIZED_CAP)?,
+            sync_slices: None,
             readback: Readback::default(),
             captures: Captures::default(),
             luts: Default::default(),
@@ -1377,6 +1394,13 @@ impl BufferCache {
         })
     }
 
+    /// Uploads the dirty pages of `[daddr, +size)` of buffer `id` that no GPU work wrote. An
+    /// upload that shares the staging ring takes one slice of it; a larger one goes through the
+    /// two [`SyncSlices`] in pieces of at most [`SYNC_SLICE`] bytes, each submitted as a part of
+    /// the tick. So whatever the upload's size, it holds at most `2 * SYNC_SLICE` (16 MiB) of
+    /// host-visible memory beside the ring and takes nothing from the [`Oversized`] budget.
+    /// The parts never end the tick: what the operation being set up allocated before stays
+    /// valid, and its commands keep their order.
     fn synchronize(
         &mut self,
         scheduler: &mut Scheduler,
@@ -1422,28 +1446,71 @@ impl BufferCache {
         buffer.modified = *write_epoch;
         let dst = buffer.buffer.raw();
         let total = uploads.iter().map(|&(_, len)| len).sum();
-        let slice = staging.alloc(scheduler, total, 16)?;
-        copies.clear();
-        let mut offset = 0;
-        for &(addr, len) in uploads.iter() {
-            read_guest(
-                &self.memory,
-                addr,
-                &mut slice.data[offset as usize..(offset + len) as usize],
-            );
-            copies.push(vk::BufferCopy {
-                src_offset: slice.offset + offset,
-                dst_offset: addr - base,
-                size: len,
-            });
-            offset += len;
-        }
-        let src = slice.buffer;
-        let cmd = scheduler.record()?;
-        before_transfer(&self.device, cmd);
-        copy_buffer(&self.device, cmd, src, dst, copies);
-        transfer_to_all_barrier(&self.device, cmd);
         self.stats.uploaded_bytes += total;
+        let shared = staging.shares_ring(total);
+        if !shared && self.sync_slices.is_none() {
+            self.sync_slices = Some(SyncSlices {
+                buffer: Buffer::new(
+                    &self.device,
+                    2 * SYNC_SLICE,
+                    vk::BufferUsageFlags::TRANSFER_SRC,
+                    MemoryLocation::CpuToGpu,
+                    "upload slices",
+                )?,
+                parts: [0; 2],
+                next: 0,
+            });
+        }
+        let (mut run, mut done) = (0, 0);
+        while run < uploads.len() {
+            let (slice, part) = match &mut self.sync_slices {
+                Some(slices) if !shared => {
+                    let index = slices.next;
+                    slices.next ^= 1;
+                    scheduler.wait_part(slices.parts[index])?;
+                    let start = index as u64 * SYNC_SLICE;
+                    let slice = StagingSlice {
+                        buffer: slices.buffer.raw(),
+                        offset: start,
+                        data: &mut slices
+                            .buffer
+                            .mapped_mut()
+                            .expect("upload slices are mapped")
+                            [start as usize..(start + SYNC_SLICE) as usize],
+                    };
+                    (slice, Some(&mut slices.parts[index]))
+                }
+                _ => (staging.alloc(scheduler, total, 16)?, None),
+            };
+            copies.clear();
+            let mut used = 0;
+            while run < uploads.len() && used < slice.data.len() as u64 {
+                let (addr, len) = uploads[run];
+                let piece = (len - done).min(slice.data.len() as u64 - used);
+                read_guest(
+                    &self.memory,
+                    addr + done,
+                    &mut slice.data[used as usize..(used + piece) as usize],
+                );
+                copies.push(vk::BufferCopy {
+                    src_offset: slice.offset + used,
+                    dst_offset: addr + done - base,
+                    size: piece,
+                });
+                used += piece;
+                done += piece;
+                if done == len {
+                    (run, done) = (run + 1, 0);
+                }
+            }
+            let cmd = scheduler.record()?;
+            before_transfer(&self.device, cmd);
+            copy_buffer(&self.device, cmd, slice.buffer, dst, copies);
+            transfer_to_all_barrier(&self.device, cmd);
+            if let Some(part) = part {
+                *part = scheduler.submit_part()?;
+            }
+        }
         Ok(())
     }
 
@@ -2313,6 +2380,11 @@ mod tests {
     }
 
     fn fixture() -> Option<Fixture> {
+        fixture_with(DRAM)
+    }
+
+    /// A fixture whose `dram` bytes of guest memory are mapped from [`DADDR`].
+    fn fixture_with(dram: u64) -> Option<Fixture> {
         let instance = match Instance::new(true, SurfaceSupport::None) {
             Ok(instance) => Arc::new(instance),
             Err(error) => {
@@ -2327,10 +2399,10 @@ mod tests {
                 return None;
             }
         };
-        let physical = Arc::new(PhysicalMemory::new(DRAM).unwrap());
-        physical.commit(0, DRAM).unwrap();
+        let physical = Arc::new(PhysicalMemory::new(dram).unwrap());
+        physical.commit(0, dram).unwrap();
         let memory = Arc::new(DeviceAddressSpace::new(physical, 36));
-        memory.map(DADDR, 0, DRAM);
+        memory.map(DADDR, 0, dram);
         Some(Fixture {
             scheduler: Scheduler::new(&device).unwrap(),
             staging: StagingRing::new(&device, 8 << 20, RING_OVERSIZED_CAP).unwrap(),
@@ -2560,6 +2632,67 @@ mod tests {
             "{} in flight passed the cap",
             result.peak
         );
+    }
+
+    #[test]
+    fn cold_pools_synchronized_in_one_operation_stay_within_the_host_cap() {
+        const POOL: u64 = 256 << 20;
+        let Some(mut f) = fixture_with(3 * POOL) else {
+            return;
+        };
+        let slices = POOL / SYNC_SLICE;
+        let samples: Vec<u64> = (0..slices)
+            .flat_map(|k| [k * SYNC_SLICE + 0x3000, k * SYNC_SLICE + SYNC_SLICE / 2])
+            .chain((1..slices).map(|k| k * SYNC_SLICE - PAGE_SIZE / 2))
+            .chain([POOL - PAGE_SIZE])
+            .collect();
+        for pool in 0..3 {
+            for (i, &offset) in samples.iter().enumerate().step_by(2) {
+                let seed = (pool * samples.len() + i) as u32;
+                f.memory
+                    .write_bytes(
+                        DADDR + pool as u64 * POOL + offset,
+                        &pattern(PAGE_SIZE as usize, seed),
+                    )
+                    .unwrap();
+            }
+        }
+        let tick = f.scheduler.tick();
+        let host_before = f.device.memory_counts().cpu_to_gpu.bytes;
+        let mut bindings = Vec::new();
+        for pool in 0..3 {
+            bindings.push(f.acquire(DADDR + pool * POOL, POOL));
+            let held = f.device.memory_counts().cpu_to_gpu.bytes - host_before;
+            assert!(
+                held <= RING_OVERSIZED_CAP,
+                "{held} host-visible upload bytes in flight after {} pools passed the cap",
+                pool + 1
+            );
+            assert!(
+                held <= 2 * SYNC_SLICE,
+                "{held} bytes held: more than the slices"
+            );
+        }
+        assert_eq!(f.staging.oversized().bytes, 0, "no oversized staging");
+        assert_eq!(
+            f.scheduler.tick(),
+            tick,
+            "one operation: the tick never ended"
+        );
+        let stats = f.cache.stats();
+        assert_eq!(stats.uploaded_bytes, 3 * POOL);
+        assert_eq!(stats.merged_buffers, 0, "three buffers of their own");
+        for (pool, binding) in bindings.into_iter().enumerate() {
+            for &offset in &samples {
+                let daddr = DADDR + pool as u64 * POOL + offset;
+                assert_eq!(
+                    f.read_back(binding.buffer, binding.offset + offset, PAGE_SIZE),
+                    f.guest(daddr, PAGE_SIZE as usize),
+                    "pool {pool} at {offset:#x}"
+                );
+            }
+        }
+        f.assert_no_validation_errors();
     }
 
     #[test]
