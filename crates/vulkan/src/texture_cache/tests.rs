@@ -5816,3 +5816,253 @@ fn cube_levels_take_newer_overlaps_in_one_gpu_sync() {
         f.assert_no_validation_errors();
     }
 }
+
+/// Donkey Kong Bananza's B10G11R11 128x128 cube: 6 faces 0x16000 apart, 8 levels at block
+/// height 16. Each level of each face is rendered as its own single-level target, the mip tail
+/// levels 4 to 7 as targets one GOB wide (16x8, 16x4, 16x2 and 16x1 at block height 1).
+fn dkb_cube(gob: GobLayout) -> (TicEntry, ImageInfo) {
+    let mut header = tic(0x21, GPU_VA, 128, 128, 1, 8, 4);
+    header.0[0] = (header.0[0] & !(0xfff << 7)) | 7 << 7 | 7 << 10 | 7 << 13 | 7 << 16;
+    header.0[4] = (header.0[4] & !(0xf << 23)) | 3 << 23;
+    let cube = ImageInfo::from_texture(&header.decode().unwrap(), gob).unwrap();
+    assert_eq!((cube.layers, cube.levels), (6, 8));
+    assert_eq!(cube.layer_stride, 0x16000, "{gob:?}");
+    assert_eq!(cube.subresource_offset(6, 4), 0x6d800, "{gob:?}");
+    (header, cube)
+}
+
+fn dkb_target(cube: &ImageInfo, level: u32, gob: GobLayout) -> ImageInfo {
+    let size = 128 >> level;
+    let pitch = (cube.layer_stride / 4) as u32;
+    match level {
+        0..4 => {
+            let bh = cube.surface().level_tiling(level).block_height_log2;
+            mkw_target(0xe0, size, size, bh, pitch, gob)
+        }
+        _ => mkw_target(0xe0, 16, size, 0, pitch, gob),
+    }
+}
+
+/// A 2D header over one tail level of one face, the shape its target has.
+fn dkb_tail_tic(cube: &ImageInfo, level: u32, layer: u32) -> TicEntry {
+    let address = GPU_VA + cube.subresource_offset(level, layer);
+    let mut header = tic(0x21, address, 16, 128 >> level, 1, 1, 0);
+    header.0[0] = (header.0[0] & !(0xfff << 7)) | 7 << 7 | 7 << 10 | 7 << 13 | 7 << 16;
+    header
+}
+
+fn dkb_color(layer: u32, level: u32, frame: u32) -> [f32; 4] {
+    [
+        (layer + 1) as f32 / 8.0,
+        (level + 1) as f32 / 16.0,
+        (frame + 1) as f32 / 16.0,
+        1.0,
+    ]
+}
+
+/// The B10G11R11 texel of a colour whose channels the format holds exactly.
+fn b10g11r11(color: [f32; 4]) -> [u8; 4] {
+    let small = |v: f32, mantissa: u32| {
+        let bits = v.to_bits();
+        let exponent = ((bits >> 23) & 0xff) + 15 - 127;
+        exponent << mantissa | (bits & 0x7f_ffff) >> (23 - mantissa)
+    };
+    (small(color[0], 6) | small(color[1], 6) << 11 | small(color[2], 5) << 22).to_le_bytes()
+}
+
+/// A draw over all of a target: rendered into without a discard, then cleared whole.
+fn draw_rt_at(f: &mut Fixture, gpu_va: GpuVAddr, info: &ImageInfo, color: [f32; 4]) -> Found {
+    let (mut tx, cache, gmmu) = f.tx();
+    let target = cache
+        .render_target(&mut tx, gmmu, gpu_va, info, false)
+        .unwrap()
+        .unwrap();
+    cache
+        .clear(
+            &mut tx,
+            target,
+            ClearValue::Color {
+                value: vk::ClearColorValue { float32: color },
+                mask: vk::ColorComponentFlags::RGBA,
+            },
+            Rect::ALL,
+            0,
+            1,
+        )
+        .unwrap();
+    target
+}
+
+/// The cube's tail levels were sampled as 2D textures before they were first drawn, so older
+/// single-level images lie over them. Drawing the tail targets resolves into the cube and
+/// retires those images, instead of drawing into them and syncing them with the cube both ways
+/// every frame; the tail addresses still sample as 2D textures afterwards.
+#[test]
+fn cube_tail_targets_over_older_single_level_images_draw_into_the_cube() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+            return;
+        };
+        let (header, cube) = dkb_cube(gob);
+        let (id, _) = f.texture(&header);
+        for level in 4..8 {
+            for layer in 0..6 {
+                let (tail, _) = f.texture(&dkb_tail_tic(&cube, level, layer));
+                assert_ne!(tail, id, "{gob:?}");
+            }
+        }
+        let frames = 4;
+        let mut syncs = Vec::new();
+        let mut strays = Vec::new();
+        for frame in 0..frames {
+            let before = f.cache.traffic().gpu_syncs;
+            for level in 0..8 {
+                for layer in 0..6 {
+                    let found = draw_rt_at(
+                        &mut f,
+                        GPU_VA + cube.subresource_offset(level, layer),
+                        &dkb_target(&cube, level, gob),
+                        dkb_color(layer, level, frame),
+                    );
+                    if (found.id, found.level, found.layer) != (id, level, layer) {
+                        strays.push((frame, level, layer));
+                    }
+                }
+            }
+            assert_eq!(f.texture(&header).0, id, "{gob:?}");
+            syncs.push(f.cache.traffic().gpu_syncs - before);
+            f.tick(1 << 40);
+        }
+        assert_eq!(syncs, [0; 4], "{gob:?}: GPU syncs per frame");
+        assert!(
+            strays.is_empty(),
+            "{gob:?}: targets beside the cube {strays:?}"
+        );
+        let last = frames - 1;
+        let texels = f.read_image(id);
+        for layer in 0..6 {
+            for level in 0..8 {
+                let want = b10g11r11(dkb_color(layer, level, last));
+                let got = &texels[(layer * 8 + level) as usize];
+                assert!(
+                    got.chunks(4).all(|t| t == want),
+                    "{gob:?}: face {layer} level {level} holds {:?}, not {want:?}",
+                    &got[..4]
+                );
+            }
+        }
+        for level in 4..8 {
+            let (tail, _) = f.texture(&dkb_tail_tic(&cube, level, 4));
+            assert_ne!(tail, id, "{gob:?}");
+            let texels = &f.read_image(tail)[0];
+            let want = b10g11r11(dkb_color(4, level, last));
+            let side = (128 >> level) as usize;
+            for (y, row) in texels.chunks(16 * 4).take(side).enumerate() {
+                assert!(
+                    row[..side * 4].chunks(4).all(|t| t == want),
+                    "{gob:?}: level {level} sampled as 2D holds {:?} in row {y}, not {want:?}",
+                    &row[..4]
+                );
+            }
+        }
+        assert_eq!(f.texture(&header).0, id, "{gob:?}");
+        f.assert_no_validation_errors();
+    }
+}
+
+/// The same with the older images drawn by copies, which never resolve into a padded level,
+/// and the tail targets looked up again after the lookups were forgotten: the cube took the
+/// copies' texels when it was drawn next, so retiring them loses none.
+#[test]
+fn cube_tail_targets_retire_drawn_single_level_images_the_cube_took_texels_from() {
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+            return;
+        };
+        let (header, cube) = dkb_cube(gob);
+        let (id, _) = f.texture(&header);
+        for level in 0..8 {
+            for layer in 0..6 {
+                draw_rt_at(
+                    &mut f,
+                    GPU_VA + cube.subresource_offset(level, layer),
+                    &dkb_target(&cube, level, gob),
+                    dkb_color(layer, level, 0),
+                );
+            }
+        }
+        let mut copied = Vec::new();
+        for level in 4..8 {
+            let address = GPU_VA + cube.subresource_offset(level, 3);
+            let desc = dkb_tail_tic(&cube, level, 3).decode().unwrap();
+            let info = ImageInfo::from_texture(&desc, gob).unwrap();
+            let (mut tx, cache, gmmu) = f.tx();
+            let tail = cache
+                .prepare_target(&mut tx, gmmu, address, &info, true, Usage::Transfer)
+                .unwrap()
+                .unwrap();
+            assert_ne!(tail.id, id, "{gob:?}");
+            cache
+                .clear(
+                    &mut tx,
+                    tail,
+                    ClearValue::Color {
+                        value: vk::ClearColorValue {
+                            float32: dkb_color(3, level, 1),
+                        },
+                        mask: vk::ColorComponentFlags::RGBA,
+                    },
+                    Rect::ALL,
+                    0,
+                    1,
+                )
+                .unwrap();
+            copied.push(tail.id);
+        }
+        draw_rt_at(
+            &mut f,
+            GPU_VA,
+            &dkb_target(&cube, 0, gob),
+            dkb_color(0, 0, 0),
+        );
+        f.cache.invalidate_lookups();
+        let syncs = f.cache.traffic().gpu_syncs;
+        for level in 4..8 {
+            let (mut tx, cache, gmmu) = f.tx();
+            let found = cache
+                .render_target(
+                    &mut tx,
+                    gmmu,
+                    GPU_VA + cube.subresource_offset(level, 3),
+                    &dkb_target(&cube, level, gob),
+                    false,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (found.id, found.level, found.layer),
+                (id, level, 3),
+                "{gob:?}"
+            );
+        }
+        assert_eq!(f.cache.traffic().gpu_syncs, syncs, "{gob:?}");
+        assert!(
+            copied.iter().all(|&t| f.cache.state(t).is_none()),
+            "{gob:?}"
+        );
+        let texels = f.read_image(id);
+        for layer in 0..6 {
+            for level in 0..8 {
+                let frame = u32::from(layer == 3 && level >= 4);
+                let want = b10g11r11(dkb_color(layer, level, frame));
+                let got = &texels[(layer * 8 + level) as usize];
+                assert!(
+                    got.chunks(4).all(|t| t == want),
+                    "{gob:?}: face {layer} level {level} holds {:?}, not {want:?}",
+                    &got[..4]
+                );
+            }
+        }
+        f.assert_no_validation_errors();
+    }
+}

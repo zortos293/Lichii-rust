@@ -2433,6 +2433,12 @@ impl TextureCache {
             if let Some((level, layer)) = candidate
                 && self.view_compatible(id, info.format)
             {
+                if usage == Usage::Target
+                    && (level, layer) == (0, 0)
+                    && let Some(found) = self.retire_into_container(tx.scheduler, id, info, base)
+                {
+                    return Ok(Some(found));
+                }
                 if moved {
                     self.remap(id);
                 }
@@ -2537,6 +2543,64 @@ impl TextureCache {
             level: 0,
             layer: 0,
         }))
+    }
+
+    /// Resolves a target lookup of `info` at `base`, which found the single-level image `id`
+    /// first, into a live multi-level image of the overlaps (`self.ids`) that holds `id` as
+    /// one of its subresources or padded levels, and removes `id`, so the target stops drawing
+    /// into an image of its own that it and the container sync with every frame. The overlaps
+    /// run oldest first and an earlier container would have matched, so the container was
+    /// modified after `id` and already took the texels `id` drew. `None` when no such
+    /// container is live.
+    fn retire_into_container(
+        &mut self,
+        scheduler: &mut Scheduler,
+        id: ImageId,
+        info: &ImageInfo,
+        base: DAddr,
+    ) -> Option<Found> {
+        let image = self.get(id).expect("a live image id");
+        if (image.info.levels, image.info.layers) != (1, 1)
+            || image.image.is_sparse()
+            || !image.contiguous()
+            || image.base() != base
+        {
+            return None;
+        }
+        let (own, drawn) = (image.info, image.gpu_modified.then_some(image.modified));
+        for i in 0..self.ids.len() {
+            let container = self.ids[i];
+            let other = self.get(container).expect("a live image id");
+            if other.info.levels == 1
+                || other.trim > 0
+                || other.image.is_sparse()
+                || !other.contiguous()
+                || other.base() > base
+            {
+                continue;
+            }
+            let offset = base - other.base();
+            let holds = |i: &ImageInfo| {
+                other
+                    .info
+                    .find_subresource(i, offset)
+                    .or_else(|| other.info.find_padded_level(i, offset))
+            };
+            let Some((level, layer)) = holds(&own).and(holds(info)) else {
+                continue;
+            };
+            if !self.view_compatible(container, info.format) {
+                continue;
+            }
+            debug_assert!(drawn.is_none_or(|modified| modified <= self.image(container).current));
+            self.remove(scheduler, id);
+            return Some(Found {
+                id: container,
+                level,
+                layer,
+            });
+        }
+        None
     }
 
     /// Copies the GPU-modified images in `self.joins` into `id`, which holds each of them as
