@@ -489,6 +489,11 @@ impl FrontChannel {
         self.wait.is_some()
     }
 
+    /// Whether the channel waits on a semaphore acquire.
+    pub(crate) fn waits_on_semaphore(&self) -> bool {
+        matches!(self.wait, Some(Wait::Semaphore { .. }))
+    }
+
     /// Whether the channel is parked until the back synchronised an entry's fetch.
     pub(crate) fn waits_for_fetch(&self) -> bool {
         matches!(self.wait, Some(Wait::Fetch(_)))
