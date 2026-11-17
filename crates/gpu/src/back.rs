@@ -735,14 +735,70 @@ fn run_as_condition(
     parameters: &[u32],
     writes: &mut [Vec<(u32, u32)>; 2],
 ) -> bool {
+    let began = std::time::Instant::now();
+    let outcome = run_as_condition_inner(code, data_ram, engine, ctx, start, parameters, writes);
+    liru6diag::record(outcome, began.elapsed().as_nanos() as u64);
+    outcome >= 4
+}
+
+mod liru6diag {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+    static COUNTS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+    static NANOS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    pub fn disabled() -> bool {
+        static D: OnceLock<bool> = OnceLock::new();
+        *D.get_or_init(|| std::env::var_os("LICHII_DIAG_NO_CONDRUNS").is_some())
+    }
+    pub fn record(outcome: u8, nanos: u64) {
+        COUNTS[outcome as usize].fetch_add(1, Ordering::Relaxed);
+        NANOS[outcome as usize].fetch_add(nanos, Ordering::Relaxed);
+        let now = EPOCH.get_or_init(Instant::now).elapsed().as_secs();
+        let last = LAST.load(Ordering::Relaxed);
+        if now >= last + 5
+            && LAST
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let c: Vec<u64> = COUNTS
+                .iter()
+                .map(|a| a.swap(0, Ordering::Relaxed))
+                .collect();
+            let n: Vec<u64> = NANOS
+                .iter()
+                .map(|a| a.swap(0, Ordering::Relaxed) / 1_000_000)
+                .collect();
+            tracing::info!(
+                "LIRU6DIAG condruns [disabled, gated, shape_none, no_predicate, notest, gpu, -] n={c:?} ms={n:?}"
+            );
+        }
+    }
+}
+
+/// Diag: 0 disabled, 1 gated, 2 shape none, 3 no predicate, 4 shape without test (applied), 5 GPU condition.
+fn run_as_condition_inner(
+    code: &mut MacroEngine,
+    data_ram: &mut MacroDataRam,
+    engine: &mut dyn Engine,
+    ctx: &mut EngineContext<'_>,
+    start: u32,
+    parameters: &[u32],
+    writes: &mut [Vec<(u32, u32)>; 2],
+) -> u8 {
+    if liru6diag::disabled() {
+        return 0;
+    }
     if !code.may_run_as_condition(start) {
-        return false;
+        return 1;
     }
     engine.flush(ctx);
     let shape = condition_shape(code, data_ram, engine, ctx, start, parameters, writes);
     code.note_condition_shape(start, shape.is_some());
     let Some((count, tests)) = shape else {
-        return false;
+        return 2;
     };
     let [zero, nonzero] = &*writes;
     let predicate = match tests {
@@ -753,7 +809,7 @@ fn run_as_condition(
                 .translate(count)
                 .and_then(|daddr| ctx.rasterizer.samples_predicate(ctx.channel, daddr))
             else {
-                return false;
+                return 3;
             };
             Some(predicate)
         }
@@ -777,7 +833,7 @@ fn run_as_condition(
             _ => engine.call_method(ctx, method, value),
         }
     }
-    true
+    if predicate.is_some() { 5 } else { 4 }
 }
 
 /// The two condition runs of [`run_as_condition`] into `writes`: the count address they test
