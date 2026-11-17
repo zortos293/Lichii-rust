@@ -11,17 +11,18 @@ use lichii_texture::block_linear::GobLayout;
 
 use crate::activity::{Activity, RendererCall, Wait};
 use crate::backend::{
-    ChannelId, FenceAction, FramebufferConfig, GpuHandles, GpuWrittenPages, Rasterizer, ReleaseSize,
+    ChannelId, FenceAction, FramebufferConfig, GpuHandles, GpuWrittenPages, Rasterizer,
+    ReleaseSize, RenderCondition,
 };
 use crate::clock::GpuTimestamp;
 use crate::cpu_reads::CpuReads;
 use crate::engines::kepler_compute::pcas::QmdScheduler;
-use crate::engines::maxwell_3d::MACRO_REGISTERS_START;
+use crate::engines::maxwell_3d::{MACRO_REGISTERS_START, RENDER_ENABLE_MODE};
 use crate::engines::{Engine, EngineContext, EngineFactory, EngineKind};
 use crate::gmmu::{Gmmu, RangeTarget};
 use crate::gpu::{MAX_POLL, MIN_POLL};
 use crate::host1x::Syncpoints;
-use crate::macros::{MacroDataRam, MacroEngine, MacroHost, is_load_mme};
+use crate::macros::{MacroDataRam, MacroEngine, MacroHost, ReadCondition, is_load_mme};
 use crate::ring::{Consumer, WRAP};
 use crate::stream::{
     FetchSync, FetchSyncs, MULTI_MAX_WORDS, OVERLAY_WORDS, REDUCTIONS, RELEASE_SIZES, tag,
@@ -96,6 +97,9 @@ pub(crate) struct Back {
     cpu_read_ranges: Vec<(DAddr, u64)>,
     /// The data RAM of macros the back runs: the front sends only calls that never use it.
     data_ram: MacroDataRam,
+    /// The writes of a macro's two condition runs ([`run_as_condition`]), kept for their
+    /// capacity.
+    condition_writes: [Vec<(u32, u32)>; 2],
 }
 
 impl Drop for Back {
@@ -135,6 +139,7 @@ impl Back {
             cpu_reads,
             cpu_read_ranges: Vec::new(),
             data_ram: MacroDataRam::new(),
+            condition_writes: [Vec::new(), Vec::new()],
         }
     }
 
@@ -411,6 +416,17 @@ impl Back {
             written_pages: &self.written_pages,
             activity: &self.activity,
         };
+        if run_as_condition(
+            code,
+            &mut self.data_ram,
+            instance,
+            &mut ctx,
+            start,
+            parameters,
+            &mut self.condition_writes,
+        ) {
+            return;
+        }
         let mut host = BackMacroHost {
             engine: instance,
             ctx: &mut ctx,
@@ -703,6 +719,166 @@ fn pending_words(
         });
     });
     (known && words.iter().any(Option::is_some)).then_some(words)
+}
+
+/// Runs the macro at `start` without waiting for the SamplesPassed report it reads, when the
+/// only use it makes of the report is whether its count is zero, to write RENDER_ENABLE_MODE:
+/// its two condition runs, one for a zero and one for a nonzero count, write the same but for
+/// that mode, which becomes a condition the renderer tests on the host GPU. False when the call
+/// must run as usual.
+fn run_as_condition(
+    code: &mut MacroEngine,
+    data_ram: &mut MacroDataRam,
+    engine: &mut dyn Engine,
+    ctx: &mut EngineContext<'_>,
+    start: u32,
+    parameters: &[u32],
+    writes: &mut [Vec<(u32, u32)>; 2],
+) -> bool {
+    engine.flush(ctx);
+    let mut count = None;
+    for (differs, writes) in writes.iter_mut().enumerate() {
+        writes.clear();
+        let mut condition = ReadCondition::new(differs == 1);
+        let mut host = ConditionHost {
+            engine: &*engine,
+            ctx: &mut *ctx,
+            writes,
+        };
+        if code
+            .condition_execute(start, parameters, data_ram, &mut host, &mut condition)
+            .is_err()
+        {
+            return false;
+        }
+        let Some(tested) = condition.tested() else {
+            return false;
+        };
+        let mut words = [None; 2];
+        for (address, expected) in tested {
+            let first = *words[0].get_or_insert(address);
+            let slot = match address.wrapping_sub(first) {
+                0 => 0,
+                4 => 1,
+                _ => return false,
+            };
+            if expected != 0 {
+                return false;
+            }
+            words[slot] = Some(address);
+        }
+        count = words[0];
+    }
+    let Some(count) = count else {
+        return false;
+    };
+    let [zero, nonzero] = &*writes;
+    if zero.len() != nonzero.len() {
+        return false;
+    }
+    let mut modes = None;
+    for (&(method, a), &(other, b)) in zero.iter().zip(nonzero) {
+        if method != other {
+            return false;
+        }
+        if a == b {
+            continue;
+        }
+        if method != RENDER_ENABLE_MODE || !matches!((a, b), (0, 1) | (1, 0)) {
+            return false;
+        }
+        modes = Some((a, b));
+    }
+    let condition = match modes {
+        None => None,
+        Some((zero_mode, _)) => {
+            let Some(predicate) = ctx
+                .memory
+                .translate(count)
+                .and_then(|daddr| ctx.rasterizer.samples_predicate(daddr))
+            else {
+                return false;
+            };
+            Some(RenderCondition {
+                predicate,
+                inverted: zero_mode == 1,
+            })
+        }
+    };
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if condition.is_some() && !LOGGED.swap(true, Ordering::Relaxed) {
+        tracing::info!(start, "3D macro's occlusion test runs on the host GPU");
+    }
+    for (&(method, value), &(_, nonzero_value)) in zero.iter().zip(nonzero) {
+        if is_load_mme(method) || method >= MACRO_REGISTERS_START {
+            continue;
+        }
+        match condition {
+            Some(condition) if method == RENDER_ENABLE_MODE && value != nonzero_value => {
+                engine.set_render_condition(ctx, nonzero_value, condition, count);
+            }
+            _ => engine.call_method(ctx, method, value),
+        }
+    }
+    true
+}
+
+/// What a macro's condition run on the back ([`run_as_condition`]) runs against: the engine's
+/// registers under the run's own writes, which it records instead of executing.
+struct ConditionHost<'a, 'c> {
+    engine: &'a dyn Engine,
+    ctx: &'a mut EngineContext<'c>,
+    writes: &'a mut Vec<(u32, u32)>,
+}
+
+impl MacroHost for ConditionHost<'_, '_> {
+    fn read_register(&mut self, method: u32) -> u32 {
+        if let Some(&(_, value)) = self.writes.iter().rev().find(|&&(m, _)| m == method) {
+            return value;
+        }
+        self.engine
+            .graphics_state()
+            .and_then(|state| state.regs.words().get(method as usize).copied())
+            .unwrap_or(0)
+    }
+
+    fn write_method(&mut self, method: u32, argument: u32) {
+        self.writes.push((method, argument));
+    }
+
+    fn dma_read(&mut self, _gpu_va: u64, out: &mut [u32]) {
+        out.fill(0);
+    }
+
+    /// The words no GPU work wrote and no pending write of the renderer other than a semaphore
+    /// release reaches: guest memory under those releases' values.
+    fn dma_peek(&mut self, gpu_va: u64, out: &mut [u32]) -> u64 {
+        let memory = self.ctx.memory;
+        let mut known = 0;
+        for (index, word) in out.iter_mut().enumerate().take(64) {
+            let address = gpu_va + 4 * index as u64;
+            let Some(daddr) = memory.translate(address) else {
+                continue;
+            };
+            if self.ctx.written_pages.may_be_written(daddr, 4) {
+                continue;
+            }
+            let mut released = None;
+            if !self
+                .ctx
+                .rasterizer
+                .pending_semaphore_words(daddr, 4, &mut |_, value| released = Some(value))
+            {
+                continue;
+            }
+            let Some(value) = released.or_else(|| memory.read::<u32>(address).ok()) else {
+                continue;
+            };
+            *word = value;
+            known |= 1 << index;
+        }
+        known
+    }
 }
 
 /// What a macro the back runs (`tag::MACRO`) runs against: the channel's engine itself.

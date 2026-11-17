@@ -16,7 +16,7 @@ use lichii_common::GpuVAddr;
 use lichii_texture::block_linear::GobLayout;
 
 use crate::activity::Activity;
-use crate::backend::{ChannelId, GpuWrittenPages, Rasterizer};
+use crate::backend::{ChannelId, GpuWrittenPages, Rasterizer, RenderCondition};
 use crate::gmmu::Gmmu;
 use crate::host1x::Syncpoints;
 
@@ -97,6 +97,18 @@ pub trait Engine: Send {
     fn graphics_state(&self) -> Option<&maxwell_3d::RegisterState> {
         None
     }
+
+    /// A macro the back ran wrote the 3D engine's RENDER_ENABLE_MODE as `mode`, which holds only
+    /// where `condition` does on the host GPU: on the SamplesPassed count at GPU address
+    /// `count`. Other engines ignore it.
+    fn set_render_condition(
+        &mut self,
+        _ctx: &mut EngineContext<'_>,
+        _mode: u32,
+        _condition: RenderCondition,
+        _count: u64,
+    ) {
+    }
 }
 
 impl Engine for kepler_memory::KeplerMemory {
@@ -128,6 +140,16 @@ impl Engine for maxwell_3d::Maxwell3d {
 
     fn call_multi(&mut self, ctx: &mut EngineContext<'_>, method: u32, arguments: &[u32]) {
         maxwell_3d::Maxwell3d::call_multi(self, ctx, method, arguments);
+    }
+
+    fn set_render_condition(
+        &mut self,
+        ctx: &mut EngineContext<'_>,
+        mode: u32,
+        condition: RenderCondition,
+        count: u64,
+    ) {
+        maxwell_3d::Maxwell3d::set_render_condition(self, ctx, mode, condition, count);
     }
 
     fn flush(&mut self, ctx: &mut EngineContext<'_>) {
