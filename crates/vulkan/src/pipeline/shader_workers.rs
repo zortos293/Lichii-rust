@@ -11,6 +11,7 @@ use std::thread::JoinHandle;
 
 use lichii_common::GpuVAddr;
 use lichii_common::settings::ResolutionScale;
+use lichii_common::thread::{ThreadPriority, set_current_thread_priority};
 use lichii_gpu::gmmu::Gmmu;
 use lichii_shader::backend::Bindings;
 use lichii_shader::cache::{self, CacheEntry};
@@ -120,7 +121,10 @@ impl Workers {
                 let (profile, host) = (profile.clone(), host.clone());
                 std::thread::Builder::new()
                     .name(format!("shader worker {i}"))
-                    .spawn(move || work(&shared, &sender, &profile, &host))
+                    .spawn(move || {
+                        set_current_thread_priority(ThreadPriority::BelowNormal);
+                        work(&shared, &sender, &profile, &host)
+                    })
                     .expect("spawning a shader worker")
             })
             .collect();

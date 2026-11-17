@@ -4,6 +4,7 @@ pub mod paths;
 pub mod perf;
 pub mod result;
 pub mod settings;
+pub mod thread;
 
 pub use result::{HleResult, ResultCode};
 
