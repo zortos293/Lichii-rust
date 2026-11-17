@@ -236,6 +236,7 @@ impl Page {
     /// Watches for the increment after `value`, the value the wait was checked against, so an
     /// increment since then runs the action at once.
     fn watch(self: &Arc<Self>, id: u32, value: u32) {
+        lichii_gpu::diag427::guest_wait(id, value.wrapping_add(1));
         let guest = self.syncpoints.guest();
         let this = Arc::downgrade(self);
         let registered = guest.register_action(id, value.wrapping_add(1), move || {
@@ -321,6 +322,7 @@ impl SyncptSession {
             event.signal();
             return ResultCode::SUCCESS;
         }
+        lichii_gpu::diag427::guest_wait(id, threshold);
         let slots = Arc::downgrade(&self.slots);
         let signal = event.clone();
         let registered = guest.register_action(id, threshold, move || {
