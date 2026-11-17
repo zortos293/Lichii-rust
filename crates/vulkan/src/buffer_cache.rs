@@ -1513,7 +1513,8 @@ impl BufferCache {
     }
 
     /// Copies a GPU range that is not one device range into stream memory: device runs from
-    /// their cached buffers, everything else as zero.
+    /// their cached buffers, everything else as zero. The GPU writes the zeros, so a gather
+    /// costs the host nothing per byte.
     fn gather(
         &mut self,
         scheduler: &mut Scheduler,
@@ -1525,10 +1526,33 @@ impl BufferCache {
     ) -> Result<BufferBinding> {
         self.segments.clear();
         gmmu.for_each_range(gpu_va, size, |range| self.segments.push(range));
-        let slice = self.stream.alloc(scheduler, size, align)?;
-        slice.data.fill(0);
+        let padded = size.next_multiple_of(4);
+        let slice = self.stream.alloc(scheduler, padded, align.max(4))?;
         let (dst, dst_offset) = (slice.buffer, slice.offset);
-        before_transfer(&self.device, scheduler.record()?);
+        let cmd = scheduler.record()?;
+        before_transfer(&self.device, cmd);
+        let mut holes = false;
+        let device = |range: &GpuRange| matches!(range.target, RangeTarget::Device(_));
+        for run in self.segments.chunk_by(|a, b| device(a) == device(b)) {
+            if device(&run[0]) {
+                continue;
+            }
+            let last = run[run.len() - 1];
+            let start = (run[0].gpu_va - gpu_va) & !3;
+            let end = (last.gpu_va + last.size - gpu_va).next_multiple_of(4);
+            // SAFETY: `cmd` is recording and `[start, end)` lies inside the padded slice, at
+            // 4-byte aligned offsets. Runs between holes are whole GMMU pages, so no two widened
+            // holes overlap.
+            unsafe {
+                self.device
+                    .raw
+                    .cmd_fill_buffer(cmd, dst, dst_offset + start, end - start, 0)
+            };
+            holes = true;
+        }
+        if holes {
+            before_transfer(&self.device, cmd);
+        }
         for i in 0..self.segments.len() {
             let segment = self.segments[i];
             let RangeTarget::Device(daddr) = segment.target else {
@@ -2941,6 +2965,94 @@ mod tests {
             "a later CPU write wins"
         );
         assert_eq!(f.cache.stats().downloaded_bytes, 0x100);
+        f.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn gathered_holes_read_zero_over_reused_stream_memory() {
+        let Some(mut f) = fixture() else { return };
+        let mut contents = Vec::new();
+        for (page, daddr) in [(0, 0x40000), (1, 0x10000), (2, 0x80000)] {
+            f.gmmu
+                .map(
+                    GPU_VA + page * PAGE_SIZE,
+                    DADDR + daddr,
+                    PAGE_SIZE,
+                    0,
+                    false,
+                )
+                .unwrap();
+            let data = pattern(PAGE_SIZE as usize, page as u32 + 20);
+            f.memory.write_bytes(DADDR + daddr, &data).unwrap();
+            contents.push(data);
+        }
+        let holed = GPU_VA + 8 * PAGE_SIZE;
+        for (page, daddr) in [(0, 0x40000), (2, 0x80000)] {
+            f.gmmu
+                .map(holed + page * PAGE_SIZE, DADDR + daddr, PAGE_SIZE, 0, false)
+                .unwrap();
+        }
+
+        let dirty = f
+            .cache
+            .vertex_buffer(
+                &mut f.scheduler,
+                &mut f.staging,
+                &f.gmmu,
+                GPU_VA,
+                3 * PAGE_SIZE,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(f.read_binding(dirty), contents.concat());
+
+        let gathered = f
+            .cache
+            .vertex_buffer(
+                &mut f.scheduler,
+                &mut f.staging,
+                &f.gmmu,
+                holed + 0x802,
+                2 * PAGE_SIZE,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (gathered.buffer, gathered.offset),
+            (dirty.buffer, dirty.offset),
+            "the second gather reuses the stream memory the first one filled"
+        );
+        let mut expected = contents[0][0x802..].to_vec();
+        expected.extend_from_slice(&[0; PAGE_SIZE as usize]);
+        expected.extend_from_slice(&contents[2][..0x802]);
+        assert!(
+            f.read_binding(gathered) == expected,
+            "the hole reads zero and the unaligned edges keep their device bytes"
+        );
+
+        let mixed = GPU_VA + 16 * PAGE_SIZE;
+        f.gmmu.map_sparse(mixed, PAGE_SIZE, false).unwrap();
+        f.gmmu
+            .map(mixed + 2 * PAGE_SIZE, DADDR + 0x80000, PAGE_SIZE, 0, false)
+            .unwrap();
+        let gathered = f
+            .cache
+            .vertex_buffer(
+                &mut f.scheduler,
+                &mut f.staging,
+                &f.gmmu,
+                mixed + 2,
+                2 * PAGE_SIZE,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(gathered.offset, dirty.offset);
+        let mut expected = vec![0; 2 * PAGE_SIZE as usize - 2];
+        expected.extend_from_slice(&contents[2][..2]);
+        assert!(
+            f.read_binding(gathered) == expected,
+            "adjacent sparse and unmapped pages read zero as one hole"
+        );
         f.assert_no_validation_errors();
     }
 
