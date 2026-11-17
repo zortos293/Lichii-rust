@@ -71,6 +71,8 @@ struct Params {
     stencil_pitch: u32,
     depth_float: u32,
     z_base: u32,
+    linear_base: u32,
+    stencil_base: u32,
 }
 
 /// The pass and its buffers, grown to the largest image synced.
@@ -82,6 +84,7 @@ pub(super) struct GuestSync {
     stencil: Option<Buffer>,
     runs: Option<Buffer>,
     scratch: RunScratch,
+    batch: Batch,
 }
 
 impl GuestSync {
@@ -99,6 +102,7 @@ impl GuestSync {
             stencil: None,
             runs: None,
             scratch: RunScratch::default(),
+            batch: Batch::default(),
         })
     }
 }
@@ -409,6 +413,295 @@ fn run_words(
     );
 }
 
+/// Bytes of the linear or stencil buffer one batch of moves fills at most, unless a single
+/// move needs more.
+const BATCH_BYTES: u64 = 256 << 20;
+
+/// Pipeline stages and the accesses in them that a barrier orders.
+type Scope = (vk::PipelineStageFlags2, vk::AccessFlags2);
+
+/// Copies between the images and the buffers, and `vkCmdUpdateBuffer` of the runs.
+const COPIES: Scope = (
+    vk::PipelineStageFlags2::ALL_TRANSFER,
+    vk::AccessFlags2::from_raw(
+        vk::AccessFlags2::TRANSFER_READ.as_raw() | vk::AccessFlags2::TRANSFER_WRITE.as_raw(),
+    ),
+);
+
+/// The dispatches of `guest_bytes.comp`.
+const DISPATCHES: Scope = (
+    vk::PipelineStageFlags2::COMPUTE_SHADER,
+    vk::AccessFlags2::from_raw(
+        vk::AccessFlags2::SHADER_STORAGE_READ.as_raw()
+            | vk::AccessFlags2::SHADER_STORAGE_WRITE.as_raw(),
+    ),
+);
+
+/// Every pass of a sync.
+const PASSES: Scope = (
+    vk::PipelineStageFlags2::from_raw(COPIES.0.as_raw() | DISPATCHES.0.as_raw()),
+    vk::AccessFlags2::from_raw(COPIES.1.as_raw() | DISPATCHES.1.as_raw()),
+);
+
+/// Whatever uses an image after a sync wrote it.
+const LATER: Scope = (
+    vk::PipelineStageFlags2::ALL_COMMANDS,
+    vk::AccessFlags2::from_raw(
+        vk::AccessFlags2::MEMORY_READ.as_raw() | vk::AccessFlags2::MEMORY_WRITE.as_raw(),
+    ),
+);
+
+fn memory_barrier(device: &Device, cmd: vk::CommandBuffer, src: Scope, dst: Scope) {
+    let barrier = vk::MemoryBarrier2::default()
+        .src_stage_mask(src.0)
+        .src_access_mask(src.1)
+        .dst_stage_mask(dst.0)
+        .dst_access_mask(dst.1);
+    // SAFETY: `cmd` is recording outside any rendering.
+    unsafe {
+        device.raw.cmd_pipeline_barrier2(
+            cmd,
+            &vk::DependencyInfo::default().memory_barriers(&[barrier]),
+        );
+    }
+}
+
+/// One subresource's move: its copies between the image and its own regions of the linear and
+/// stencil buffers, whether the image's texels go to the buffers first, and its dispatch.
+struct Move {
+    main: vk::BufferImageCopy,
+    stencil: Option<vk::BufferImageCopy>,
+    keep: bool,
+    params: Params,
+    groups: [u32; 3],
+}
+
+/// The moves of one image in a batch.
+struct Painted {
+    image: vk::Image,
+    layout: vk::ImageLayout,
+    direction: Direction,
+    moves: std::ops::Range<usize>,
+}
+
+/// Moves that [`GuestSync::flush`] records as one sequence. Moves to the guest of several
+/// images share a batch only while they write disjoint guest words, so where they overlap, a
+/// later image's bytes still land after an earlier one's; a move to an image has a batch of
+/// its own, after every move to the guest.
+#[derive(Default)]
+struct Batch {
+    /// The runs of every image in the batch, as `guest_bytes.comp` reads them.
+    words: Vec<[u32; 4]>,
+    /// The guest bytes the moves to the guest write, whole words, sorted and disjoint.
+    written: Vec<(u64, u64)>,
+    painted: Vec<Painted>,
+    moves: Vec<Move>,
+    /// The copy regions of one call being gathered.
+    regions: Vec<vk::BufferImageCopy>,
+    /// Bytes of the linear and stencil buffers the moves fill.
+    linear: u64,
+    stencil: u64,
+}
+
+/// The guest words `run` lands on, as bytes.
+fn guest_words(run: &Run) -> (u64, u64) {
+    (run.at & !3, (run.at + run.size).next_multiple_of(4))
+}
+
+impl Batch {
+    /// Whether a move to the guest over `runs` writes a guest word that the batch writes.
+    fn clashes(&self, runs: &[Run]) -> bool {
+        runs.iter().any(|r| {
+            let (lo, hi) = guest_words(r);
+            let next = self.written.partition_point(|w| w.1 <= lo);
+            self.written.get(next).is_some_and(|w| w.0 < hi)
+        })
+    }
+
+    /// Adds an image whose runs `scratch` holds, before its moves. Returns the index its runs
+    /// start at.
+    fn begin(
+        &mut self,
+        image: vk::Image,
+        layout: vk::ImageLayout,
+        direction: Direction,
+        scratch: &RunScratch,
+    ) -> u32 {
+        let base = self.words.len() as u32;
+        self.words.extend_from_slice(&scratch.words);
+        if direction == Direction::ToGuest {
+            self.written.extend(scratch.runs.iter().map(guest_words));
+            self.written.sort_unstable();
+            self.written.dedup_by(|next, last| {
+                let joins = next.0 <= last.1;
+                if joins {
+                    last.1 = last.1.max(next.1);
+                }
+                joins
+            });
+        }
+        let at = self.moves.len();
+        self.painted.push(Painted {
+            image,
+            layout,
+            direction,
+            moves: at..at,
+        });
+        base
+    }
+
+    fn clear(&mut self) {
+        self.words.clear();
+        self.written.clear();
+        self.painted.clear();
+        self.moves.clear();
+        self.linear = 0;
+        self.stencil = 0;
+    }
+}
+
+impl GuestSync {
+    /// Records the batch and empties it: a barrier after earlier passes over the buffers and
+    /// the layout transitions of the batch's images, every copy into the linear and stencil
+    /// buffers, one barrier, every dispatch and, for a move to an image, one barrier, every
+    /// copy back and a barrier before whatever uses the image next.
+    fn flush(
+        &mut self,
+        device: &std::sync::Arc<Device>,
+        tx: &mut Transfer<'_>,
+        cmd: vk::CommandBuffer,
+    ) -> Result<()> {
+        let Self {
+            compute,
+            descriptors,
+            guest,
+            linear: linear_slot,
+            stencil: stencil_slot,
+            runs: runs_slot,
+            batch,
+            ..
+        } = self;
+        if batch.moves.is_empty() {
+            batch.clear();
+            return Ok(());
+        }
+        let storage = vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_SRC
+            | vk::BufferUsageFlags::TRANSFER_DST;
+        let linear = ensure(
+            device,
+            tx,
+            linear_slot,
+            batch.linear,
+            storage,
+            "guest sync texels",
+        )?;
+        let stencil = ensure(
+            device,
+            tx,
+            stencil_slot,
+            batch.stencil.max(4),
+            storage,
+            "guest sync stencil",
+        )?;
+        let run_bytes: &[u8] = bytemuck::cast_slice(&batch.words);
+        let runs = ensure(
+            device,
+            tx,
+            runs_slot,
+            run_bytes.len() as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            "guest sync runs",
+        )?;
+        memory_barrier(device, cmd, PASSES, PASSES);
+        let Batch {
+            painted,
+            moves,
+            regions,
+            ..
+        } = batch;
+        // SAFETY: `cmd` is recording outside any rendering; every image is in its layout, which
+        // copies both ways allow, the runs buffer holds `run_bytes` and the linear and stencil
+        // buffers every move's regions.
+        unsafe {
+            for (at, chunk) in (0u64..).step_by(65536).zip(run_bytes.chunks(65536)) {
+                device.raw.cmd_update_buffer(cmd, runs, at, chunk);
+            }
+            for p in painted.iter() {
+                let moves = &moves[p.moves.clone()];
+                regions.clear();
+                regions.extend(moves.iter().filter(|m| m.keep).map(|m| m.main));
+                if !regions.is_empty() {
+                    device
+                        .raw
+                        .cmd_copy_image_to_buffer(cmd, p.image, p.layout, linear, regions);
+                }
+                regions.clear();
+                regions.extend(moves.iter().filter(|m| m.keep).filter_map(|m| m.stencil));
+                if !regions.is_empty() {
+                    device
+                        .raw
+                        .cmd_copy_image_to_buffer(cmd, p.image, p.layout, stencil, regions);
+                }
+            }
+        }
+        memory_barrier(device, cmd, COPIES, DISPATCHES);
+        let set = descriptors.allocate(tx.scheduler, compute.set_layout)?;
+        let limit = u64::from(device.properties.limits.max_storage_buffer_range);
+        let bound = |buffer: &Option<Buffer>| {
+            let buffer = buffer.as_ref().expect("ensured");
+            vk::DescriptorBufferInfo {
+                buffer: buffer.raw(),
+                offset: 0,
+                range: buffer.size().min(limit),
+            }
+        };
+        compute.write_set(
+            set,
+            &[
+                bound(guest),
+                bound(linear_slot),
+                bound(stencil_slot),
+                bound(runs_slot),
+            ],
+        );
+        compute.bind(cmd, set);
+        for m in moves.iter() {
+            compute.dispatch_bound(cmd, bytemuck::bytes_of(&m.params), m.groups);
+        }
+        if painted.iter().any(|p| p.direction == Direction::FromGuest) {
+            memory_barrier(device, cmd, DISPATCHES, COPIES);
+            for p in painted
+                .iter()
+                .filter(|p| p.direction == Direction::FromGuest)
+            {
+                let moves = &moves[p.moves.clone()];
+                regions.clear();
+                regions.extend(moves.iter().map(|m| m.main));
+                // SAFETY: as above.
+                unsafe {
+                    device
+                        .raw
+                        .cmd_copy_buffer_to_image(cmd, linear, p.image, p.layout, regions);
+                }
+                regions.clear();
+                regions.extend(moves.iter().filter_map(|m| m.stencil));
+                if !regions.is_empty() {
+                    // SAFETY: as above.
+                    unsafe {
+                        device
+                            .raw
+                            .cmd_copy_buffer_to_image(cmd, stencil, p.image, p.layout, regions);
+                    }
+                }
+            }
+            memory_barrier(device, cmd, COPIES, LATER);
+        }
+        batch.clear();
+        Ok(())
+    }
+}
+
 pub(super) fn barrier(device: &Device, cmd: vk::CommandBuffer) {
     let barrier = vk::MemoryBarrier2::default()
         .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
@@ -544,22 +837,6 @@ impl TextureCache {
             storage,
             "guest bytes",
         )?;
-        ensure(
-            &device,
-            tx,
-            &mut sync.linear,
-            linear,
-            storage,
-            "guest sync texels",
-        )?;
-        ensure(
-            &device,
-            tx,
-            &mut sync.stencil,
-            stencil,
-            storage,
-            "guest sync stencil",
-        )?;
         let cmd = tx.scheduler.record()?;
         self.paint(tx, cmd, id, id, window, Direction::ToGuest)?;
         for &o in newer.iter() {
@@ -578,8 +855,9 @@ impl TextureCache {
         Ok(true)
     }
 
-    /// Records the move of the subresources of `id` that share bytes with the guest bytes
-    /// buffer, which holds the offsets `window` of `target`, between the image and the buffer.
+    /// Plans the move of the subresources of `id` that share bytes with the guest bytes buffer,
+    /// which holds the offsets `window` of `target`, between the image and the buffer, into the
+    /// batch of moves that [`GuestSync::flush`] records. A move to the image records at once.
     /// Texels outside the buffer keep the image's own values.
     fn paint(
         &mut self,
@@ -595,19 +873,37 @@ impl TextureCache {
             Direction::ToGuest => ImageAccess::TRANSFER_SRC,
             Direction::FromGuest => ImageAccess::STORAGE_WRITE,
         };
-        self.get_mut(id)
-            .expect("a live image id")
-            .transition(&device, cmd, access);
-        barrier(&device, cmd);
         let layout = access.layout;
         let Self {
             slots, guest_sync, ..
         } = self;
-        let image = slots[id.index as usize]
+        let sync = guest_sync.as_mut().expect("created by sync_on_gpu");
+        {
+            let image = slots[id.index as usize]
+                .image
+                .as_ref()
+                .expect("a live image id");
+            let target = slots[target.index as usize]
+                .image
+                .as_ref()
+                .expect("a live image id");
+            let info = image.info;
+            let levels = info.levels.min(image.image.desc().mip_levels);
+            let placed = shared_runs(image, target, window, &mut sync.scratch);
+            debug_assert!(placed, "checked by sync_on_gpu");
+            run_words(&mut sync.scratch, direction, |lo, hi, out| {
+                moved_bytes(&info, levels, lo, hi, out)
+            });
+        }
+        if direction == Direction::FromGuest || sync.batch.clashes(&sync.scratch.runs) {
+            sync.flush(&device, tx, cmd)?;
+        }
+        slots[id.index as usize]
             .image
-            .as_ref()
-            .expect("a live image id");
-        let target = slots[target.index as usize]
+            .as_mut()
+            .expect("a live image id")
+            .transition(&device, cmd, access);
+        let image = slots[id.index as usize]
             .image
             .as_ref()
             .expect("a live image id");
@@ -621,49 +917,15 @@ impl TextureCache {
         } else {
             vk::ImageAspectFlags::DEPTH
         };
-        let sync = guest_sync.as_mut().expect("created by sync_on_gpu");
-        let placed = shared_runs(image, target, window, &mut sync.scratch);
-        debug_assert!(placed, "checked by sync_on_gpu");
-        let scratch = &mut sync.scratch;
-        run_words(scratch, direction, |lo, hi, out| {
-            moved_bytes(&info, levels, lo, hi, out)
-        });
-        let run_bytes: &[u8] = bytemuck::cast_slice(&scratch.words);
-        ensure(
-            &device,
-            tx,
-            &mut sync.runs,
-            run_bytes.len() as u64,
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            "guest sync runs",
-        )?;
-        let runs_buffer = sync.runs.as_ref().expect("ensured").raw();
-        for (at, chunk) in (0u64..).step_by(65536).zip(run_bytes.chunks(65536)) {
-            // SAFETY: `cmd` is recording outside any rendering, the buffer holds `run_bytes`, and
-            // the barrier above orders this write after the last pass that read the buffer.
-            unsafe { device.raw.cmd_update_buffer(cmd, runs_buffer, at, chunk) };
-        }
-        let limit = u64::from(device.properties.limits.max_storage_buffer_range);
-        let bound = |buffer: &Option<Buffer>| {
-            let buffer = buffer.as_ref().expect("ensured");
-            vk::DescriptorBufferInfo {
-                buffer: buffer.raw(),
-                offset: 0,
-                range: buffer.size().min(limit),
-            }
-        };
-        let buffers = [
-            bound(&sync.guest),
-            bound(&sync.linear),
-            bound(&sync.stencil),
-            bound(&sync.runs),
-        ];
-        let linear = buffers[1].buffer;
-        let stencil = buffers[2].buffer;
-        let all = (
-            vk::PipelineStageFlags2::ALL_COMMANDS,
-            vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+        let depth_float = u32::from(
+            packing != Packing::Plain
+                && matches!(
+                    host,
+                    vk::Format::D32_SFLOAT | vk::Format::D32_SFLOAT_S8_UINT
+                ),
         );
+        let cap = u64::from(device.properties.limits.max_storage_buffer_range).min(BATCH_BYTES);
+        let mut base = sync.batch.begin(raw, layout, direction, &sync.scratch);
         for layer in 0..info.layers {
             for level in 0..levels {
                 let start = info.subresource_offset(level, layer);
@@ -712,8 +974,33 @@ impl TextureCache {
                 if y0 >= y1 || z0 >= z1 {
                     continue;
                 }
-                let region = |aspect_mask, row_texels: u32, texel_bytes: u32| vk::BufferImageCopy {
-                    buffer_offset: u64::from(z0 * h + y0) * u64::from(row_texels * texel_bytes),
+                let keep = direction == Direction::ToGuest
+                    || !shared
+                        .iter()
+                        .any(|r| r.from <= band.0 && band.1 <= r.from + r.size);
+                let rows = u64::from(z1 - z0) * u64::from(y1 - y0);
+                let texel_bytes = u64::from(tiling.bytes_per_block);
+                let align = (texel_bytes * 16) >> texel_bytes.trailing_zeros().min(4);
+                let linear_bytes = rows * u64::from(row_words) * 4;
+                let stencil_bytes = if packing.stencil() {
+                    (rows * u64::from(w)).next_multiple_of(16)
+                } else {
+                    0
+                };
+                let batch = &mut sync.batch;
+                if !batch.moves.is_empty()
+                    && (batch.linear.next_multiple_of(align) + linear_bytes > cap
+                        || batch.stencil + stencil_bytes > cap)
+                {
+                    sync.flush(&device, tx, cmd)?;
+                    base = sync.batch.begin(raw, layout, direction, &sync.scratch);
+                }
+                let batch = &mut sync.batch;
+                let (linear_at, stencil_at) = (batch.linear.next_multiple_of(align), batch.stencil);
+                batch.linear = linear_at + linear_bytes;
+                batch.stencil += stencil_bytes;
+                let region = |aspect_mask, offset, row_texels: u32| vk::BufferImageCopy {
+                    buffer_offset: offset,
                     buffer_row_length: row_texels,
                     buffer_image_height: h,
                     image_subresource: vk::ImageSubresourceLayers {
@@ -733,43 +1020,18 @@ impl TextureCache {
                         depth: z1 - z0,
                     },
                 };
-                let main = region(
-                    main_aspect,
-                    row_words * 4 / tiling.bytes_per_block,
-                    tiling.bytes_per_block,
-                );
-                let stencil_region = region(vk::ImageAspectFlags::STENCIL, w, 1);
-                let groups = [
-                    row_words.div_ceil(GROUP[0]),
-                    (y1 - y0).div_ceil(GROUP[1]),
-                    z1 - z0,
-                ];
-                let keep = direction == Direction::ToGuest
-                    || !shared
-                        .iter()
-                        .any(|r| r.from <= band.0 && band.1 <= r.from + r.size);
-                // SAFETY: `cmd` is recording outside any rendering; the image is in `layout`,
-                // which copies both ways allow, and every buffer holds the subresource's texels.
-                unsafe {
-                    if keep {
-                        device
-                            .raw
-                            .cmd_copy_image_to_buffer(cmd, raw, layout, linear, &[main]);
-                        if packing.stencil() {
-                            device.raw.cmd_copy_image_to_buffer(
-                                cmd,
-                                raw,
-                                layout,
-                                stencil,
-                                &[stencil_region],
-                            );
-                        }
-                    }
-                    barrier(&device, cmd);
-                    let set = sync
-                        .descriptors
-                        .allocate(tx.scheduler, sync.compute.set_layout)?;
-                    let params = Params {
+                let first_row = z0 * h + y0;
+                batch.moves.push(Move {
+                    main: region(
+                        main_aspect,
+                        linear_at,
+                        row_words * 4 / tiling.bytes_per_block,
+                    ),
+                    stencil: packing
+                        .stencil()
+                        .then(|| region(vk::ImageAspectFlags::STENCIL, stencil_at, w)),
+                    keep,
+                    params: Params {
                         z_base: z0,
                         row_words,
                         row_bytes,
@@ -779,46 +1041,27 @@ impl TextureCache {
                         block_depth_log2: tiling.block_depth_log2,
                         switch2_layout: u32::from(tiling.layout == GobLayout::Switch2),
                         subresource: start as u32,
-                        run_first: first as u32,
+                        run_first: base + first as u32,
                         run_count: count as u32,
                         y_base: y0,
                         direction: direction as u32,
                         packing: packing as u32,
                         stencil_pitch: w,
-                        depth_float: u32::from(
-                            packing != Packing::Plain
-                                && matches!(
-                                    host,
-                                    vk::Format::D32_SFLOAT | vk::Format::D32_SFLOAT_S8_UINT
-                                ),
-                        ),
-                    };
-                    sync.compute.dispatch(
-                        cmd,
-                        set,
-                        &buffers,
-                        bytemuck::bytes_of(&params),
-                        groups,
-                        all,
-                    );
-                    barrier(&device, cmd);
-                    if direction == Direction::FromGuest {
-                        device
-                            .raw
-                            .cmd_copy_buffer_to_image(cmd, linear, raw, layout, &[main]);
-                        if packing.stencil() {
-                            device.raw.cmd_copy_buffer_to_image(
-                                cmd,
-                                stencil,
-                                raw,
-                                layout,
-                                &[stencil_region],
-                            );
-                        }
-                        barrier(&device, cmd);
-                    }
-                }
+                        depth_float,
+                        linear_base: ((linear_at / 4) as u32).wrapping_sub(first_row * row_words),
+                        stencil_base: (stencil_at as u32).wrapping_sub(first_row * w),
+                    },
+                    groups: [
+                        row_words.div_ceil(GROUP[0]),
+                        (y1 - y0).div_ceil(GROUP[1]),
+                        z1 - z0,
+                    ],
+                });
+                batch.painted.last_mut().expect("begun").moves.end = batch.moves.len();
             }
+        }
+        if direction == Direction::FromGuest {
+            sync.flush(&device, tx, cmd)?;
         }
         Ok(())
     }

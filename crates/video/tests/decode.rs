@@ -44,10 +44,11 @@ fn ivf_frames(bytes: &[u8]) -> Vec<&[u8]> {
     frames
 }
 
-/// Splits an Annex B stream into access units at its access unit delimiters.
-fn access_units(bytes: &[u8]) -> Vec<&[u8]> {
+/// Splits an Annex B stream into access units at its access unit delimiters, which
+/// `is_delimiter` recognises from the byte after the start code.
+fn access_units(bytes: &[u8], is_delimiter: fn(u8) -> bool) -> Vec<&[u8]> {
     let starts: Vec<usize> = (0..bytes.len().saturating_sub(4))
-        .filter(|&i| bytes[i..i + 3] == [0, 0, 1] && bytes[i + 3] & 0x1f == 9)
+        .filter(|&i| bytes[i..i + 3] == [0, 0, 1] && is_delimiter(bytes[i + 3]))
         .map(|i| if i > 0 && bytes[i - 1] == 0 { i - 1 } else { i })
         .collect();
     starts
@@ -61,7 +62,11 @@ fn stream(codec: Codec) -> Vec<&'static [u8]> {
     match codec {
         Codec::Vp9 => ivf_frames(include_bytes!("data/quadrants.vp9.ivf")),
         Codec::Vp8 => ivf_frames(include_bytes!("data/quadrants.vp8.ivf")),
-        Codec::H264 => access_units(include_bytes!("data/quadrants.h264")),
+        Codec::Av1 => ivf_frames(include_bytes!("data/quadrants.av1.ivf")),
+        Codec::H264 => access_units(include_bytes!("data/quadrants.h264"), |nal| nal & 0x1f == 9),
+        Codec::Hevc => access_units(include_bytes!("data/quadrants.hevc"), |nal| {
+            nal >> 1 & 0x3f == 35
+        }),
     }
 }
 
@@ -140,6 +145,22 @@ fn vp9_decodes_losslessly_in_order() {
 }
 
 #[test]
+fn av1_decodes_losslessly_in_order() {
+    if ffmpeg() {
+        assert_quadrants(Codec::Av1, &decode(Codec::Av1, Latency::Immediate), 0);
+        assert_quadrants(Codec::Av1, &decode(Codec::Av1, Latency::Buffered), 0);
+    }
+}
+
+#[test]
+fn hevc_decodes_losslessly_in_order() {
+    if ffmpeg() {
+        assert_quadrants(Codec::Hevc, &decode(Codec::Hevc, Latency::Immediate), 0);
+        assert_quadrants(Codec::Hevc, &decode(Codec::Hevc, Latency::Buffered), 0);
+    }
+}
+
+#[test]
 fn vp8_decodes_in_order() {
     if ffmpeg() {
         assert_quadrants(Codec::Vp8, &decode(Codec::Vp8, Latency::Immediate), 3);
@@ -156,20 +177,22 @@ fn h264_with_b_frames_comes_out_in_display_order() {
 }
 
 #[test]
-fn immediate_vp9_pictures_leave_the_packet_that_completes_them() {
+fn immediate_pictures_leave_the_packet_that_completes_them() {
     if !ffmpeg() {
         return;
     }
-    let mut decoder = Decoder::new(Codec::Vp9, Latency::Immediate).unwrap();
-    let mut frame = Frame::new().unwrap();
-    for (pts, data) in stream(Codec::Vp9).into_iter().enumerate() {
-        decoder.send(data, pts as i64).unwrap();
-        assert!(
-            decoder.receive(&mut frame).unwrap(),
-            "packet {pts} completes a picture"
-        );
-        assert_eq!(frame.picture().unwrap().pts, pts as i64);
-        assert!(!decoder.receive(&mut frame).unwrap());
+    for codec in [Codec::Vp9, Codec::Av1] {
+        let mut decoder = Decoder::new(codec, Latency::Immediate).unwrap();
+        let mut frame = Frame::new().unwrap();
+        for (pts, data) in stream(codec).into_iter().enumerate() {
+            decoder.send(data, pts as i64).unwrap();
+            assert!(
+                decoder.receive(&mut frame).unwrap(),
+                "{codec:?} packet {pts} completes a picture"
+            );
+            assert_eq!(frame.picture().unwrap().pts, pts as i64);
+            assert!(!decoder.receive(&mut frame).unwrap());
+        }
     }
 }
 
