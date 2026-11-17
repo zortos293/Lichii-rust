@@ -14,7 +14,7 @@ fn main() {
     let code = &bytes[GRAPHICS_HEADER_SIZE as usize..];
     let mut histogram = BTreeMap::<&str, u32>::new();
     let mut unknown = 0;
-    for (index, chunk) in code.chunks_exact(INSTRUCTION_SIZE as usize).enumerate() {
+    for (index, chunk) in code.as_chunks::<16>().0.iter().enumerate() {
         let pc = index as u64 * u64::from(INSTRUCTION_SIZE);
         let low = u64::from_le_bytes(chunk[..8].try_into().unwrap());
         let high = u64::from_le_bytes(chunk[8..].try_into().unwrap());
