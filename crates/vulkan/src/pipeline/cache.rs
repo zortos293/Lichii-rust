@@ -2883,6 +2883,7 @@ mod tests {
         };
         let path = dir.join(FILE_NAME);
         disk::write_atomic(&path, &disk::encode(&identity(&device), &stored)).unwrap();
+        let live = device.pipelines();
         {
             let mut cache =
                 PipelineCache::new(&device, &settings(false), Some(&dir), None).unwrap();
@@ -2892,10 +2893,25 @@ mod tests {
                 1,
                 "only the key the last run used; unrecorded ages count as old"
             );
+            assert_eq!(
+                device.pipelines(),
+                live + 1,
+                "the prebuild creates only the pipeline it builds"
+            );
             assert!(cache.graphics(&drawn, &shaders).is_some());
             assert!(cache.compute(&compute_key(), &compute_shader()).is_some());
             assert_eq!(cache.stats().built, 3, "the others build on first use");
+            assert_eq!(
+                device.pipelines(),
+                live + 3,
+                "lazy builds count once built; the unrecorded key, pruned below, never builds"
+            );
         }
+        assert_eq!(
+            device.pipelines(),
+            live,
+            "dropping the cache destroys them all"
+        );
         let saved = disk::decode(&std::fs::read(&path).unwrap(), &identity(&device))
             .expect("this device's file");
         let ages: HashMap<_, _> = saved.graphics.iter().map(|k| (k.key, k.age)).collect();
