@@ -2416,6 +2416,34 @@ impl TextureCache {
             } else {
                 None
             };
+            if usage == Usage::Target && info.levels == 1 && image.info.levels > 1 && base >= image.base() {
+                let offset = base - image.base();
+                let key = (image.info.width, image.info.height, image.info.layers, image.info.levels, info.width, info.height, offset);
+                static SEEN: std::sync::Mutex<Vec<(u32, u32, u32, u32, u32, u32, u64)>> = std::sync::Mutex::new(Vec::new());
+                let mut seen = SEEN.lock().unwrap();
+                if seen.len() < 400 && !seen.contains(&key) {
+                    seen.push(key);
+                    let surface = image.info.surface();
+                    let layer_stride = image.info.layer_stride.max(1);
+                    let in_layer = offset % layer_stride;
+                    let level = (0..image.info.levels).find(|&l| surface.level_offset(l) == in_layer);
+                    let lt = level.map(|l| surface.level_tiling(l));
+                    let own = info.surface().level_tiling(0);
+                    tracing::info!(
+                        "DIAG395B candidate={candidate:?} trim={} contiguous={}/{} same_segments={} image={}x{}x{} l{} {:?} {:?} stride={:#x} offset={offset:#x} level={level:?} level_tiling={lt:?} target={}x{} {:?} {:?} own={own:?}",
+                        image.trim,
+                        contiguous,
+                        image.contiguous(),
+                        image.segments == self.segments,
+                        image.info.width, image.info.height, image.info.layers, image.info.levels,
+                        image.info.format, image.info.layout, image.info.layer_stride,
+                        info.width, info.height, info.format, info.layout,
+                    );
+                }
+            }
+            if candidate.is_some() && usage == Usage::Target && !self.view_compatible(id, info.format) {
+                tracing::info!("DIAG395B view incompatible: {:?} target {:?}", self.image(id).info.format, info.format);
+            }
             if let Some((level, layer)) = candidate
                 && self.view_compatible(id, info.format)
             {
