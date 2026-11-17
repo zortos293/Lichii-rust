@@ -679,8 +679,8 @@ pub(crate) mod tests {
         let options = |disabled: &[&str]| LoadOptions {
             mods: ModOptions {
                 load_root: Some(temp.0.join("mods")),
-                sdmc_root: None,
                 disabled: disabled.iter().map(|s| s.to_string()).collect(),
+                ..ModOptions::default()
             },
             ..LoadOptions::default()
         };

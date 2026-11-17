@@ -244,6 +244,12 @@ impl ConfigWindow {
                     row(ui, "Network", |ui| {
                         ui.checkbox(&mut d.system.network_enabled, "Allow titles to go online")
                     });
+                    row(ui, "Game patches", |ui| {
+                        ui.checkbox(
+                            &mut d.system.builtin_game_patches,
+                            "Apply Lichii's patches for known game builds",
+                        )
+                    });
                 });
                 note(
                     ui,

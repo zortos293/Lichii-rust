@@ -4,8 +4,10 @@
 //! Switch 2 ACID layouts, loose ExeFS directories with their sibling `romfs/`, NSP, XCI and
 //! standalone NCA titles with their updates and DLC, NUP containers ([`nup`]), and the title metadata (program id, name,
 //! icon, version) the game list shows. [`patch`] applies mods: ExeFS replacement and
-//! IPS/IPSwitch patches, and LayeredFS RomFS replacement.
+//! IPS/IPSwitch patches, LayeredFS RomFS replacement, and the
+//! patches Lichii carries for known game builds.
 
+mod builtin;
 mod error;
 pub mod exefs;
 pub mod npdm;

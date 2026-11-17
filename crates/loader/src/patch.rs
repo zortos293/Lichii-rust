@@ -12,13 +12,14 @@ use lichii_fs::ips::{IpSwitch, Ips, parse_build_id};
 use lichii_fs::romfs::{RomfsExt, build_romfs, open_romfs};
 use lichii_fs::{DirRef, Directory, DirectoryExt, EntryKind, FileExt, FileRef, LayeredDir};
 
+use crate::builtin;
 use crate::error::LoaderResult;
 use crate::program::Module;
 
 const NSO_HEADER_SIZE: usize = 0x100;
 
 /// Where mods are installed and which ones the user turned off.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModOptions {
     /// `<mods>`: one directory per title id, one directory per mod inside.
     pub load_root: Option<PathBuf>,
@@ -26,6 +27,19 @@ pub struct ModOptions {
     pub sdmc_root: Option<PathBuf>,
     /// Mod directory names to skip, `SDMC` included.
     pub disabled: Vec<String>,
+    /// Apply the patches Lichii carries for known game builds (on by default).
+    pub builtin_patches: bool,
+}
+
+impl Default for ModOptions {
+    fn default() -> Self {
+        Self {
+            load_root: None,
+            sdmc_root: None,
+            disabled: Vec::new(),
+            builtin_patches: true,
+        }
+    }
 }
 
 enum ExefsPatch {
@@ -41,6 +55,8 @@ struct ModDir {
 /// The enabled mods for one title, in the order they apply.
 pub struct Mods {
     mods: Vec<ModDir>,
+    program_id: u64,
+    builtin_patches: bool,
 }
 
 impl Mods {
@@ -87,6 +103,8 @@ impl Mods {
                 .map(|(_, m)| m)
                 .filter(|m| !options.disabled.contains(&m.name))
                 .collect(),
+            program_id,
+            builtin_patches: options.builtin_patches,
         })
     }
 
@@ -119,7 +137,7 @@ impl Mods {
     /// `@nsobid` matches it, from every mod's `exefs/`. Offsets count the 0x100-byte NSO
     /// header, as mods are written against the NSO file, and reach into .bss: a patched module's
     /// image then covers its whole size. A patch that fails to parse or apply is logged and
-    /// skipped.
+    /// skipped. The built-in patches for the module's build then apply over them.
     pub fn patch_modules(&self, modules: &mut [Module]) -> LoaderResult<()> {
         let mut patches: Vec<(String, [u8; 32], ExefsPatch)> = Vec::new();
         for exefs in self.subdirs("exefs")? {
@@ -168,9 +186,12 @@ impl Mods {
                     ExefsPatch::IpSwitch(patch) => patch.apply(target),
                 }
             }
-            if let Some(mut target) = target {
+            let original = target.map(|mut target| {
                 target.drain(..NSO_HEADER_SIZE);
-                module.image = target;
+                std::mem::replace(&mut module.image, target)
+            });
+            if self.builtin_patches {
+                builtin::apply(self.program_id, module, original.as_deref());
             }
         }
         Ok(())
@@ -266,6 +287,7 @@ mod tests {
             load_root: Some(temp.0.join("mods")),
             sdmc_root: Some(temp.0.join("sdmc")),
             disabled: disabled.iter().map(|s| s.to_string()).collect(),
+            ..ModOptions::default()
         }
     }
 
