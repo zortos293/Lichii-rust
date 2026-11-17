@@ -73,6 +73,10 @@ struct BackChannel {
 /// write-back covers the entries after it until GPU work writes the block again.
 const FETCH_SYNC_WINDOW: u64 = 64 * 1024;
 
+/// The most consecutive [`tag::METHOD`] records to one engine that run as one call. Guest CPU
+/// reads are served between runs, so this bounds how long one waits.
+const METHOD_RUN_MAX: usize = 256;
+
 /// Executes the stream.
 pub(crate) struct Back {
     rasterizer: Box<dyn Rasterizer>,
@@ -86,6 +90,8 @@ pub(crate) struct Back {
     /// The engine the last method went to (channel index, kind index), until it is flushed.
     last: Option<(usize, u8)>,
     words: Vec<u32>,
+    /// Scratch for a run of [`tag::METHOD`] records to one engine.
+    methods: Vec<(u32, u32)>,
     qmd_scheduler: QmdScheduler,
     fetch_syncs: Arc<FetchSyncs>,
     written_pages: Arc<GpuWrittenPages>,
@@ -131,6 +137,7 @@ impl Back {
             current: None,
             last: None,
             words: Vec::with_capacity(MULTI_MAX_WORDS + 1),
+            methods: Vec::with_capacity(METHOD_RUN_MAX),
             qmd_scheduler: QmdScheduler::new(),
             fetch_syncs,
             written_pages: handles.written_pages.clone(),
@@ -144,7 +151,7 @@ impl Back {
     }
 
     /// Executes everything published, until the ring is empty. Guest CPU reads are served first
-    /// and between records.
+    /// and between records (or runs of single-method records to one engine).
     pub(crate) fn run(&mut self, consumer: &mut Consumer) {
         self.serve_cpu_reads();
         while consumer.refill() {
@@ -232,14 +239,17 @@ impl Back {
         }
     }
 
-    /// The stream is empty: submits the recorded host GPU work and runs the actions of fences
-    /// whose work finished, so that a syncpoint or semaphore the guest CPU waits on lands without
-    /// more GPU work behind it. Whether fences are still pending, and the back should look again.
+    /// The stream is empty: submits the recorded host GPU work a fence waits for and runs the
+    /// actions of fences whose work finished, so that a syncpoint or semaphore the guest CPU waits
+    /// on lands without more GPU work behind it. Whether fences are still pending, and the back
+    /// should look again.
     pub(crate) fn poll_fences(&mut self) -> bool {
         if !self.rasterizer.has_pending_fences() {
             return false;
         }
-        self.rasterizer.flush_commands();
+        if self.rasterizer.has_unsubmitted_fences() {
+            self.rasterizer.flush_commands();
+        }
         self.rasterizer.release_fences(false);
         self.rasterizer.has_pending_fences()
     }
@@ -265,10 +275,19 @@ impl Back {
         }
         match record {
             tag::METHOD => {
-                self.with_engine(engine, |engine, ctx| {
-                    engine.call_method(ctx, method, argument)
-                });
-                1
+                let run = consumer.available().min(METHOD_RUN_MAX);
+                let len = (1..run)
+                    .find(|&index| consumer.slot(index) & 0xffff != header & 0xffff)
+                    .unwrap_or(run);
+                let mut methods = std::mem::take(&mut self.methods);
+                methods.clear();
+                methods.extend((0..len).map(|index| {
+                    let slot = consumer.slot(index);
+                    ((slot >> 16) as u32 & 0xffff, (slot >> 32) as u32)
+                }));
+                self.with_engine(engine, |engine, ctx| engine.call_methods(ctx, &methods));
+                self.methods = methods;
+                len
             }
             tag::MULTI => {
                 let slots = self.collect_words(argument as usize, consumer);
@@ -951,3 +970,6 @@ impl MacroHost for BackMacroHost<'_, '_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -15,7 +15,7 @@ use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 
 use super::super::ir::{Loc, Ty, Value};
 use super::super::x64::{
-    CTX_FPCR, CTX_FPSR, CTX_PSTATE, Emitter, ST_SCRATCH, ST_SCRATCH2, loc_offset,
+    CTX_BIAS, CTX_FPCR, CTX_FPSR, CTX_PSTATE, Emitter, ST_SCRATCH, ST_SCRATCH2, loc_offset,
 };
 use super::ir::{Arith, Fp, Fused, SimdOp};
 
@@ -288,7 +288,7 @@ impl Emitter<'_> {
     }
 
     /// The NZCV of an ordered compare of `xmm a` with `xmm b` in `d`; unordered jumps to `slow`.
-    /// Clobbers `rax`, `rcx` and `rdx`.
+    /// Clobbers `rax` and `rcx`.
     fn compare_flags(&mut self, fp: Fp, a: u8, b: u8, d: u8, slow: DynamicLabel) {
         match fp {
             Fp::S => dynasm!(self.asm ; .arch x64 ; ucomiss Rx(a), Rx(b)),
@@ -297,14 +297,12 @@ impl Emitter<'_> {
         dynasm!(self.asm
             ; .arch x64
             ; jp =>slow
-            ; setb al
             ; setz cl
-            ; movzx eax, al
+            ; sbb eax, eax
             ; movzx ecx, cl
-            ; lea edx, [rax * 8]
-            ; lea edx, [rdx + rcx * 4]
-            ; xor eax, 1
-            ; lea Rd(d), [rdx + rax * 2]
+            ; and eax, 6
+            ; add eax, 2
+            ; lea Rd(d), [rax + rcx * 4]
         );
     }
 
@@ -962,7 +960,7 @@ impl Emitter<'_> {
             self.save(slow.saved);
             dynasm!(self.asm
                 ; .arch x64
-                ; mov rdi, r15
+                ; lea rdi, [r15 - CTX_BIAS]
                 ; mov esi, slow.word as i32
                 ; mov rdx, r13
                 ; xor ecx, ecx

@@ -92,7 +92,7 @@ impl VulkanRasterizer {
     /// The guest index buffer of an assembled indexed draw; `None` skips the draw.
     pub(super) fn guest_indices(
         &mut self,
-        gmmu: &Gmmu,
+        gmmu: &Arc<Gmmu>,
         regs: &Regs,
     ) -> Result<Option<GuestIndices>> {
         let buffer = &regs.index_buffer;

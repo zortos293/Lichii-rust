@@ -13,7 +13,7 @@
 //! all its buffers before it begins rendering.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use ash::vk;
 use gpu_allocator::MemoryLocation;
@@ -21,7 +21,7 @@ use lichii_common::{DAddr, GpuVAddr, PAGE_BITS, PAGE_SIZE};
 use lichii_gpu::backend::{DrawParams, GpuWrittenPages, InlineIndices};
 use lichii_gpu::engines::maxwell_3d::Regs;
 use lichii_gpu::engines::maxwell_3d::regs::{IndexBuffer, IndexFormat, PrimitiveTopology};
-use lichii_gpu::gmmu::{Gmmu, GpuRange, RangeTarget};
+use lichii_gpu::gmmu::{GPU_VA_SIZE, Gmmu, GpuRange, RangeTarget};
 use lichii_gpu::lazy::LazyDeviceRanges;
 use lichii_memory::{CachedPages, DeviceAddressSpace};
 use lichii_shader::ShaderArch;
@@ -39,6 +39,9 @@ const CACHING_PAGE_SIZE: u64 = 1 << CACHING_PAGE_BITS;
 /// Uniform buffers up to this size are streamed instead of cached (Lichii's skip-cache size).
 pub const UNIFORM_STREAM_MAX: u64 = 4 << 10;
 const STREAM_RING_SIZE: u64 = 16 << 20;
+
+/// Bytes of each of the two [`SyncSlices`].
+const SYNC_SLICE: u64 = 8 << 20;
 /// Joins of joins past this score mark a stream buffer, which then grows ahead of its writes.
 const STREAM_LEAP_THRESHOLD: u32 = 16;
 const STREAM_LEAP_BYTES: u64 = 128 * CACHING_PAGE_SIZE;
@@ -53,6 +56,8 @@ const GATHER_CACHE_ENTRIES: usize = 64;
 /// The device-local bytes cached gathers may own, evicted ones the GPU may still read included.
 /// A range larger than this gathers into stream memory on every bind instead.
 const GATHER_CACHE_BYTES: u64 = 256 << 20;
+/// Pages [`TranslationMemo`] keeps a translation for.
+const TRANSLATION_ENTRIES: usize = 1024;
 
 const CACHED_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
     vk::BufferUsageFlags::VERTEX_BUFFER.as_raw()
@@ -190,6 +195,18 @@ struct CachedBuffer {
     /// and when GPU work writing it is recorded. Epochs only grow, so the newest of a gather's
     /// sources changes whenever any source does.
     modified: u64,
+}
+
+/// Host-visible memory for uploads too large to share the staging ring: two slices of
+/// [`SYNC_SLICE`] bytes, made on first use and kept, filled in turn. The copies out of a slice
+/// are submitted as soon as they are recorded ([`Scheduler::submit_part`]) and the slice is
+/// filled again once that part finished, so the host fills one slice while the GPU copies out of
+/// the other, and uploads of any size hold `2 * SYNC_SLICE` bytes of it at most.
+struct SyncSlices {
+    buffer: Buffer,
+    /// The part each slice's last copies were submitted in.
+    parts: [u64; 2],
+    next: usize,
 }
 
 /// A large scattered storage range gathered into a buffer of its own, reused while
@@ -716,18 +733,102 @@ fn sub_indices(indices: InlineIndices<'_>, first: u32, count: u32) -> InlineIndi
     }
 }
 
-/// The device address `[gpu_va, +size)` maps to when it is one contiguous device range.
-fn contiguous(gmmu: &Gmmu, gpu_va: GpuVAddr, size: u64) -> Option<DAddr> {
-    let mut runs = 0;
-    let mut daddr = None;
-    gmmu.for_each_range(gpu_va, size, |range| {
-        runs += 1;
-        daddr = match range.target {
-            RangeTarget::Device(daddr) => Some(daddr),
-            _ => None,
-        };
-    });
-    if runs == 1 { daddr } else { None }
+/// [`Translation::daddr`] of a run that is not device memory.
+const NOT_DEVICE: DAddr = DAddr::MAX;
+
+/// A run of GPU addresses with one target, as [`Gmmu::for_each_range`] reports it.
+#[derive(Clone, Copy, Default)]
+struct Translation {
+    start: GpuVAddr,
+    end: GpuVAddr,
+    /// Device address of `start`, or [`NOT_DEVICE`].
+    daddr: DAddr,
+    epoch: u32,
+    /// Whether the run ends at `end`; otherwise the walk that found it stopped there.
+    closed: bool,
+}
+
+/// Which GPU ranges are one contiguous device range, kept while the address space and its
+/// [`Gmmu::generation`] stay the same so binds skip the page-table walk. Direct-mapped by the
+/// 4 KiB page a range starts in. Each entry holds the run around the start of the range that
+/// last missed there, walked over the pages that range touches, so a miss costs what the walk
+/// it replaces cost and every later range inside the run hits.
+struct TranslationMemo {
+    /// The address space the entries describe. Holding it keeps its allocation, so no later
+    /// address space can take its place.
+    gmmu: Weak<Gmmu>,
+    generation: u64,
+    /// Entries of another epoch are stale; no entry is valid in epoch 0.
+    epoch: u32,
+    entries: Box<[Translation; TRANSLATION_ENTRIES]>,
+}
+
+impl Default for TranslationMemo {
+    fn default() -> Self {
+        Self {
+            gmmu: Weak::new(),
+            generation: 0,
+            epoch: 0,
+            entries: Box::new([Translation::default(); TRANSLATION_ENTRIES]),
+        }
+    }
+}
+
+impl TranslationMemo {
+    /// The device address `[gpu_va, +size)` maps to when it is one contiguous device range.
+    #[inline]
+    fn contiguous(&mut self, gmmu: &Arc<Gmmu>, gpu_va: GpuVAddr, size: u64) -> Option<DAddr> {
+        let end = gpu_va
+            .checked_add(size)
+            .filter(|&end| size != 0 && end <= GPU_VA_SIZE)?;
+        let generation = gmmu.generation();
+        if generation != self.generation || !std::ptr::eq(self.gmmu.as_ptr(), Arc::as_ptr(gmmu)) {
+            self.gmmu = Arc::downgrade(gmmu);
+            self.generation = generation;
+            self.epoch = self.epoch.wrapping_add(1);
+            if self.epoch == 0 {
+                self.entries.fill(Translation::default());
+                self.epoch = 1;
+            }
+        }
+        let slot = ((gpu_va >> PAGE_BITS).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            >> (64 - TRANSLATION_ENTRIES.trailing_zeros())) as usize;
+        let mut entry = self.entries[slot];
+        if entry.epoch != self.epoch
+            || !(entry.start..entry.end).contains(&gpu_va)
+            || (end > entry.end && entry.daddr != NOT_DEVICE && !entry.closed)
+        {
+            entry = Self::walk(gmmu, gpu_va, end, self.epoch);
+            self.entries[slot] = entry;
+        }
+        (entry.daddr != NOT_DEVICE && end <= entry.end)
+            .then(|| entry.daddr + (gpu_va - entry.start))
+    }
+
+    /// The run holding `gpu_va` within the pages `[gpu_va, end)` touches.
+    #[cold]
+    #[inline(never)]
+    fn walk(gmmu: &Gmmu, gpu_va: GpuVAddr, end: GpuVAddr, epoch: u32) -> Translation {
+        let start = gpu_va & !(PAGE_SIZE - 1);
+        let stop = end.next_multiple_of(PAGE_SIZE);
+        let mut found = Translation::default();
+        gmmu.for_each_range(start, stop - start, |range| {
+            let range_end = range.gpu_va + range.size;
+            if (range.gpu_va..range_end).contains(&gpu_va) {
+                found = Translation {
+                    start: range.gpu_va,
+                    end: range_end,
+                    daddr: match range.target {
+                        RangeTarget::Device(daddr) => daddr,
+                        _ => NOT_DEVICE,
+                    },
+                    epoch,
+                    closed: range_end < stop,
+                };
+            }
+        });
+        found
+    }
 }
 
 /// Copies guest memory; unmapped pages read zero.
@@ -803,6 +904,7 @@ pub struct BufferCache {
     /// ([`lichii_gpu::gpu::flush_traps_enabled`]).
     flush_traps: bool,
     stream: StreamRing,
+    sync_slices: Option<SyncSlices>,
     readback: Readback,
     captures: Captures,
     luts: [QuadLut; 2],
@@ -829,6 +931,7 @@ pub struct BufferCache {
     /// Evicted gather buffers, with the tick after which the GPU no longer reads them.
     gather_retired: VecDeque<(u64, Buffer)>,
     gather_retired_bytes: u64,
+    translations: TranslationMemo,
 }
 
 impl BufferCache {
@@ -852,6 +955,7 @@ impl BufferCache {
             gpu_written: RangeSet::default(),
             flush_traps: lichii_gpu::gpu::flush_traps_enabled(),
             stream: StreamRing::new(device, STREAM_RING_SIZE, RING_OVERSIZED_CAP)?,
+            sync_slices: None,
             readback: Readback::default(),
             captures: Captures::default(),
             luts: Default::default(),
@@ -872,6 +976,7 @@ impl BufferCache {
             gather_held: 0,
             gather_retired: VecDeque::new(),
             gather_retired_bytes: 0,
+            translations: TranslationMemo::default(),
         })
     }
 
@@ -1377,6 +1482,13 @@ impl BufferCache {
         })
     }
 
+    /// Uploads the dirty pages of `[daddr, +size)` of buffer `id` that no GPU work wrote. An
+    /// upload that shares the staging ring takes one slice of it; a larger one goes through the
+    /// two [`SyncSlices`] in pieces of at most [`SYNC_SLICE`] bytes, each submitted as a part of
+    /// the tick. So whatever the upload's size, it holds at most `2 * SYNC_SLICE` (16 MiB) of
+    /// host-visible memory beside the ring and takes nothing from the [`Oversized`] budget.
+    /// The parts never end the tick: what the operation being set up allocated before stays
+    /// valid, and its commands keep their order.
     fn synchronize(
         &mut self,
         scheduler: &mut Scheduler,
@@ -1422,28 +1534,71 @@ impl BufferCache {
         buffer.modified = *write_epoch;
         let dst = buffer.buffer.raw();
         let total = uploads.iter().map(|&(_, len)| len).sum();
-        let slice = staging.alloc(scheduler, total, 16)?;
-        copies.clear();
-        let mut offset = 0;
-        for &(addr, len) in uploads.iter() {
-            read_guest(
-                &self.memory,
-                addr,
-                &mut slice.data[offset as usize..(offset + len) as usize],
-            );
-            copies.push(vk::BufferCopy {
-                src_offset: slice.offset + offset,
-                dst_offset: addr - base,
-                size: len,
-            });
-            offset += len;
-        }
-        let src = slice.buffer;
-        let cmd = scheduler.record()?;
-        before_transfer(&self.device, cmd);
-        copy_buffer(&self.device, cmd, src, dst, copies);
-        transfer_to_all_barrier(&self.device, cmd);
         self.stats.uploaded_bytes += total;
+        let shared = staging.shares_ring(total);
+        if !shared && self.sync_slices.is_none() {
+            self.sync_slices = Some(SyncSlices {
+                buffer: Buffer::new(
+                    &self.device,
+                    2 * SYNC_SLICE,
+                    vk::BufferUsageFlags::TRANSFER_SRC,
+                    MemoryLocation::CpuToGpu,
+                    "upload slices",
+                )?,
+                parts: [0; 2],
+                next: 0,
+            });
+        }
+        let (mut run, mut done) = (0, 0);
+        while run < uploads.len() {
+            let (slice, part) = match &mut self.sync_slices {
+                Some(slices) if !shared => {
+                    let index = slices.next;
+                    slices.next ^= 1;
+                    scheduler.wait_part(slices.parts[index])?;
+                    let start = index as u64 * SYNC_SLICE;
+                    let slice = StagingSlice {
+                        buffer: slices.buffer.raw(),
+                        offset: start,
+                        data: &mut slices
+                            .buffer
+                            .mapped_mut()
+                            .expect("upload slices are mapped")
+                            [start as usize..(start + SYNC_SLICE) as usize],
+                    };
+                    (slice, Some(&mut slices.parts[index]))
+                }
+                _ => (staging.alloc(scheduler, total, 16)?, None),
+            };
+            copies.clear();
+            let mut used = 0;
+            while run < uploads.len() && used < slice.data.len() as u64 {
+                let (addr, len) = uploads[run];
+                let piece = (len - done).min(slice.data.len() as u64 - used);
+                read_guest(
+                    &self.memory,
+                    addr + done,
+                    &mut slice.data[used as usize..(used + piece) as usize],
+                );
+                copies.push(vk::BufferCopy {
+                    src_offset: slice.offset + used,
+                    dst_offset: addr + done - base,
+                    size: piece,
+                });
+                used += piece;
+                done += piece;
+                if done == len {
+                    (run, done) = (run + 1, 0);
+                }
+            }
+            let cmd = scheduler.record()?;
+            before_transfer(&self.device, cmd);
+            copy_buffer(&self.device, cmd, slice.buffer, dst, copies);
+            transfer_to_all_barrier(&self.device, cmd);
+            if let Some(part) = part {
+                *part = scheduler.submit_part()?;
+            }
+        }
         Ok(())
     }
 
@@ -1780,12 +1935,12 @@ impl BufferCache {
         &mut self,
         scheduler: &mut Scheduler,
         staging: &mut StagingRing,
-        gmmu: &Gmmu,
+        gmmu: &Arc<Gmmu>,
         gpu_va: GpuVAddr,
         size: u64,
         align: u64,
     ) -> Result<BufferBinding> {
-        if let Some(daddr) = contiguous(gmmu, gpu_va, size) {
+        if let Some(daddr) = self.translations.contiguous(gmmu, gpu_va, size) {
             let binding = self.acquire(scheduler, staging, daddr, size)?;
             if binding.offset % align == 0 {
                 return Ok(binding);
@@ -1826,14 +1981,14 @@ impl BufferCache {
         &mut self,
         scheduler: &mut Scheduler,
         staging: &mut StagingRing,
-        gmmu: &Gmmu,
+        gmmu: &Arc<Gmmu>,
         gpu_va: GpuVAddr,
         size: u64,
     ) -> Result<Option<BufferBinding>> {
         if gpu_va == 0 || size == 0 {
             return Ok(None);
         }
-        if let Some(daddr) = contiguous(gmmu, gpu_va, size) {
+        if let Some(daddr) = self.translations.contiguous(gmmu, gpu_va, size) {
             return self.acquire(scheduler, staging, daddr, size).map(Some);
         }
         if size >= MAX_GATHER_SIZE {
@@ -1851,7 +2006,7 @@ impl BufferCache {
         &mut self,
         scheduler: &mut Scheduler,
         staging: &mut StagingRing,
-        gmmu: &Gmmu,
+        gmmu: &Arc<Gmmu>,
         gpu_va: GpuVAddr,
         size: u64,
     ) -> Result<Option<BufferBinding>> {
@@ -1861,9 +2016,20 @@ impl BufferCache {
         if gpu_va == 0 || size == 0 {
             return Ok(None);
         }
-        if size <= UNIFORM_STREAM_MAX && !self.gpu_written_in(gmmu, gpu_va, size) {
+        let run = self.translations.contiguous(gmmu, gpu_va, size);
+        let streamed = size <= UNIFORM_STREAM_MAX
+            && match run {
+                Some(daddr) => !self.gpu_written.intersects(daddr, daddr + size),
+                None => !self.gpu_written_in(gmmu, gpu_va, size),
+            };
+        if streamed {
             let slice = self.stream.alloc(scheduler, size, align)?;
-            let _ = gmmu.read_block(gpu_va, slice.data);
+            match run {
+                Some(daddr) => read_guest(gmmu.device(), daddr, slice.data),
+                None => {
+                    let _ = gmmu.read_block(gpu_va, slice.data);
+                }
+            }
             let binding = BufferBinding {
                 buffer: slice.buffer,
                 offset: slice.offset,
@@ -1909,7 +2075,7 @@ impl BufferCache {
         &mut self,
         scheduler: &mut Scheduler,
         staging: &mut StagingRing,
-        gmmu: &Gmmu,
+        gmmu: &Arc<Gmmu>,
         gpu_va: GpuVAddr,
         size: u64,
         written: bool,
@@ -1926,7 +2092,7 @@ impl BufferCache {
                 .map(Some);
         }
         if !written {
-            if let Some(daddr) = contiguous(gmmu, start, size) {
+            if let Some(daddr) = self.translations.contiguous(gmmu, start, size) {
                 let binding = self.acquire(scheduler, staging, daddr, size)?;
                 if binding.offset % align == 0 {
                     return Ok(Some(binding));
@@ -1936,7 +2102,7 @@ impl BufferCache {
                 .cached_gather(scheduler, staging, gmmu, start, size)
                 .map(Some);
         }
-        if let Some(daddr) = contiguous(gmmu, start, size) {
+        if let Some(daddr) = self.translations.contiguous(gmmu, start, size) {
             let binding = self.acquire(scheduler, staging, daddr, size)?;
             self.prepare_gpu_write(scheduler, staging, daddr, size)?;
             self.bind_gpu_write(daddr, size);
@@ -2017,7 +2183,7 @@ impl BufferCache {
         &mut self,
         scheduler: &mut Scheduler,
         staging: &mut StagingRing,
-        gmmu: &Gmmu,
+        gmmu: &Arc<Gmmu>,
         regs: &Regs,
         draw: &DrawParams<'_>,
     ) -> Result<Option<IndexBinding>> {
@@ -2309,10 +2475,15 @@ mod tests {
         cache: BufferCache,
         device: Arc<Device>,
         memory: Arc<DeviceAddressSpace>,
-        gmmu: Gmmu,
+        gmmu: Arc<Gmmu>,
     }
 
     fn fixture() -> Option<Fixture> {
+        fixture_with(DRAM)
+    }
+
+    /// A fixture whose `dram` bytes of guest memory are mapped from [`DADDR`].
+    fn fixture_with(dram: u64) -> Option<Fixture> {
         let instance = match Instance::new(true, SurfaceSupport::None) {
             Ok(instance) => Arc::new(instance),
             Err(error) => {
@@ -2327,10 +2498,10 @@ mod tests {
                 return None;
             }
         };
-        let physical = Arc::new(PhysicalMemory::new(DRAM).unwrap());
-        physical.commit(0, DRAM).unwrap();
+        let physical = Arc::new(PhysicalMemory::new(dram).unwrap());
+        physical.commit(0, dram).unwrap();
         let memory = Arc::new(DeviceAddressSpace::new(physical, 36));
-        memory.map(DADDR, 0, DRAM);
+        memory.map(DADDR, 0, dram);
         Some(Fixture {
             scheduler: Scheduler::new(&device).unwrap(),
             staging: StagingRing::new(&device, 8 << 20, RING_OVERSIZED_CAP).unwrap(),
@@ -2341,7 +2512,7 @@ mod tests {
                 Arc::new(LazyDeviceRanges::new(memory.clone())),
             )
             .unwrap(),
-            gmmu: Gmmu::new(memory.clone(), BigPageSize::Size64K),
+            gmmu: Arc::new(Gmmu::new(memory.clone(), BigPageSize::Size64K)),
             device,
             memory,
         })
@@ -2560,6 +2731,67 @@ mod tests {
             "{} in flight passed the cap",
             result.peak
         );
+    }
+
+    #[test]
+    fn cold_pools_synchronized_in_one_operation_stay_within_the_host_cap() {
+        const POOL: u64 = 256 << 20;
+        let Some(mut f) = fixture_with(3 * POOL) else {
+            return;
+        };
+        let slices = POOL / SYNC_SLICE;
+        let samples: Vec<u64> = (0..slices)
+            .flat_map(|k| [k * SYNC_SLICE + 0x3000, k * SYNC_SLICE + SYNC_SLICE / 2])
+            .chain((1..slices).map(|k| k * SYNC_SLICE - PAGE_SIZE / 2))
+            .chain([POOL - PAGE_SIZE])
+            .collect();
+        for pool in 0..3 {
+            for (i, &offset) in samples.iter().enumerate().step_by(2) {
+                let seed = (pool * samples.len() + i) as u32;
+                f.memory
+                    .write_bytes(
+                        DADDR + pool as u64 * POOL + offset,
+                        &pattern(PAGE_SIZE as usize, seed),
+                    )
+                    .unwrap();
+            }
+        }
+        let tick = f.scheduler.tick();
+        let host_before = f.device.memory_counts().cpu_to_gpu.bytes;
+        let mut bindings = Vec::new();
+        for pool in 0..3 {
+            bindings.push(f.acquire(DADDR + pool * POOL, POOL));
+            let held = f.device.memory_counts().cpu_to_gpu.bytes - host_before;
+            assert!(
+                held <= RING_OVERSIZED_CAP,
+                "{held} host-visible upload bytes in flight after {} pools passed the cap",
+                pool + 1
+            );
+            assert!(
+                held <= 2 * SYNC_SLICE,
+                "{held} bytes held: more than the slices"
+            );
+        }
+        assert_eq!(f.staging.oversized().bytes, 0, "no oversized staging");
+        assert_eq!(
+            f.scheduler.tick(),
+            tick,
+            "one operation: the tick never ended"
+        );
+        let stats = f.cache.stats();
+        assert_eq!(stats.uploaded_bytes, 3 * POOL);
+        assert_eq!(stats.merged_buffers, 0, "three buffers of their own");
+        for (pool, binding) in bindings.into_iter().enumerate() {
+            for &offset in &samples {
+                let daddr = DADDR + pool as u64 * POOL + offset;
+                assert_eq!(
+                    f.read_back(binding.buffer, binding.offset + offset, PAGE_SIZE),
+                    f.guest(daddr, PAGE_SIZE as usize),
+                    "pool {pool} at {offset:#x}"
+                );
+            }
+        }
+        f.assert_no_validation_errors();
     }
 
     #[test]
@@ -3885,6 +4117,228 @@ mod tests {
         assert_eq!(bound_index_capacity(&f.gmmu, &regs.index_buffer, 2), 6);
     }
 
+    fn address_space() -> Arc<Gmmu> {
+        let physical = Arc::new(PhysicalMemory::new(DRAM).unwrap());
+        physical.commit(0, DRAM).unwrap();
+        let memory = Arc::new(DeviceAddressSpace::new(physical, 36));
+        memory.map(DADDR, 0, DRAM);
+        Arc::new(Gmmu::new(memory, BigPageSize::Size64K))
+    }
+
+    /// The device address of `[gpu_va, +size)` by a fresh page-table walk.
+    fn walked(gmmu: &Gmmu, gpu_va: GpuVAddr, size: u64) -> Option<DAddr> {
+        gmmu.is_continuous(gpu_va, size)
+            .then(|| gmmu.translate(gpu_va))
+            .flatten()
+    }
+
+    /// Big pages, small pages that continue a big page, sparse and unmapped holes, small pages
+    /// mapped backwards, and a run of big pages across windows.
+    fn map_mixed(gmmu: &Gmmu) {
+        gmmu.map(GPU_VA, DADDR, 0x10000, 0, true).unwrap();
+        for page in 0..8 {
+            let va = GPU_VA + 0x10000 + page * PAGE_SIZE;
+            gmmu.map(va, DADDR + 0x10000 + page * PAGE_SIZE, PAGE_SIZE, 0, false)
+                .unwrap();
+        }
+        gmmu.map_sparse(GPU_VA + 0x18000, 0x4000, false).unwrap();
+        for page in 0..4 {
+            let va = GPU_VA + 0x1c000 + page * PAGE_SIZE;
+            gmmu.map(
+                va,
+                DADDR + 0x20_0000 - page * PAGE_SIZE,
+                PAGE_SIZE,
+                0,
+                false,
+            )
+            .unwrap();
+        }
+        gmmu.map(GPU_VA + 0x30000, DADDR + 0x30_0000, 0x30000, 0, true)
+            .unwrap();
+    }
+
+    #[test]
+    fn translations_match_the_page_table_walk() {
+        let gmmu = address_space();
+        map_mixed(&gmmu);
+        let mut memo = TranslationMemo::default();
+        let sizes = [
+            1, 4, 0x100, 0xfff, 0x1000, 0x1001, 0x4000, 0x10000, 0x18000, 0x30000,
+        ];
+        let mut seed = 0x1234_5678_u64;
+        let mut queries = Vec::new();
+        for _ in 0..20_000 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let gpu_va = GPU_VA - 0x10000 + (seed >> 33) % 0x70000;
+            let size = sizes[(seed >> 20) as usize % sizes.len()];
+            queries.push((gpu_va, size));
+        }
+        for &(gpu_va, size) in queries.iter().chain(&queries) {
+            assert_eq!(
+                memo.contiguous(&gmmu, gpu_va, size),
+                walked(&gmmu, gpu_va, size),
+                "{gpu_va:#x}+{size:#x}"
+            );
+        }
+        for (gpu_va, size) in [
+            (GPU_VA, 0),
+            (GPU_VA_SIZE - 0x1000, 0x2000),
+            (GPU_VA_SIZE, 0x10),
+            (u64::MAX - 0x10, 0x100),
+        ] {
+            assert_eq!(memo.contiguous(&gmmu, gpu_va, size), None);
+        }
+
+        let before = allocations();
+        for &(gpu_va, size) in &queries[..1000] {
+            memo.contiguous(&gmmu, gpu_va, size);
+        }
+        assert_eq!(allocations() - before, 0, "translations allocated");
+    }
+
+    #[test]
+    fn remaps_and_unmaps_invalidate_translations() {
+        let gmmu = address_space();
+        let mut memo = TranslationMemo::default();
+        gmmu.map(GPU_VA, DADDR, 0x20000, 0, true).unwrap();
+        assert_eq!(
+            memo.contiguous(&gmmu, GPU_VA + 0x100, 0x200),
+            Some(DADDR + 0x100)
+        );
+        assert_eq!(
+            memo.contiguous(&gmmu, GPU_VA + 0xff00, 0x200),
+            Some(DADDR + 0xff00)
+        );
+
+        gmmu.unmap(GPU_VA, 0x10000).unwrap();
+        assert_eq!(memo.contiguous(&gmmu, GPU_VA + 0x100, 0x200), None);
+        assert_eq!(memo.contiguous(&gmmu, GPU_VA + 0xff00, 0x200), None);
+
+        gmmu.map(GPU_VA, DADDR + 0x40000, 0x10000, 0, true).unwrap();
+        assert_eq!(
+            memo.contiguous(&gmmu, GPU_VA + 0x100, 0x200),
+            Some(DADDR + 0x40100)
+        );
+
+        gmmu.map(GPU_VA + 0x1000, DADDR + 0x80000, PAGE_SIZE, 0, false)
+            .unwrap();
+        assert_eq!(memo.contiguous(&gmmu, GPU_VA + 0x100, 0x2000), None);
+        assert_eq!(
+            memo.contiguous(&gmmu, GPU_VA + 0x1100, 0x200),
+            Some(DADDR + 0x80100)
+        );
+        assert_eq!(
+            memo.contiguous(&gmmu, GPU_VA + 0x10100, 0x200),
+            Some(DADDR + 0x10100)
+        );
+    }
+
+    #[test]
+    fn address_spaces_do_not_share_translations() {
+        let a = address_space();
+        let b = address_space();
+        a.map(GPU_VA, DADDR, 0x10000, 0, true).unwrap();
+        b.map(GPU_VA, DADDR + 0x40000, 0x10000, 0, true).unwrap();
+        assert_eq!(a.generation(), b.generation());
+        let mut memo = TranslationMemo::default();
+        for _ in 0..2 {
+            assert_eq!(
+                memo.contiguous(&a, GPU_VA + 0x10, 0x100),
+                Some(DADDR + 0x10)
+            );
+            assert_eq!(
+                memo.contiguous(&b, GPU_VA + 0x10, 0x100),
+                Some(DADDR + 0x40010)
+            );
+        }
+
+        drop((a, b));
+        let c = address_space();
+        c.map(GPU_VA, DADDR + 0x80000, 0x10000, 0, true).unwrap();
+        assert_eq!(
+            memo.contiguous(&c, GPU_VA + 0x10, 0x100),
+            Some(DADDR + 0x80010)
+        );
+    }
+
+    #[test]
+    fn memoized_binds_match_the_page_table_walk() {
+        let Some(mut f) = fixture() else { return };
+        map_mixed(&f.gmmu);
+        let data = pattern(0x40_0000, 7);
+        f.memory.write_bytes(DADDR, &data).unwrap();
+        assert!(f.cache.storage_alignment() <= 0x100);
+        let ranges = [
+            (GPU_VA + 0x100, 0x200),
+            (GPU_VA + 0xff00, 0x200),
+            (GPU_VA + 0x17f00, 0x200),
+            (GPU_VA + 0x1c100, 0x200),
+            (GPU_VA + 0x3ff00, 0x200),
+            (GPU_VA + 0x30000, 0x20000),
+            (GPU_VA + 0x8000, 0x10000),
+        ];
+        for _ in 0..2 {
+            for (gpu_va, size) in ranges {
+                let daddr = walked(&f.gmmu, gpu_va, size);
+                let vertex = f
+                    .cache
+                    .vertex_buffer(&mut f.scheduler, &mut f.staging, &f.gmmu, gpu_va, size)
+                    .unwrap()
+                    .unwrap();
+                let storage = f
+                    .cache
+                    .storage_buffer(
+                        &mut f.scheduler,
+                        &mut f.staging,
+                        &f.gmmu,
+                        gpu_va,
+                        size,
+                        false,
+                    )
+                    .unwrap()
+                    .unwrap();
+                if let Some(daddr) = daddr {
+                    let expected = f.acquire(daddr, size);
+                    assert_eq!(vertex, expected, "{gpu_va:#x}+{size:#x}");
+                    if expected.offset % f.cache.storage_alignment() == 0 {
+                        assert_eq!(storage, expected, "{gpu_va:#x}+{size:#x}");
+                    }
+                }
+                let mut expected = vec![0; size as usize];
+                let _ = f.gmmu.read_block(gpu_va, &mut expected);
+                assert!(f.read_binding(vertex) == expected, "{gpu_va:#x}+{size:#x}");
+                if size <= UNIFORM_STREAM_MAX {
+                    let uniform = f
+                        .cache
+                        .uniform_buffer(&mut f.scheduler, &mut f.staging, &f.gmmu, gpu_va, size)
+                        .unwrap()
+                        .unwrap();
+                    assert!(f.read_binding(uniform) == expected, "{gpu_va:#x}+{size:#x}");
+                }
+            }
+        }
+
+        f.gmmu.unmap(GPU_VA, 0x10000).unwrap();
+        f.gmmu
+            .map(GPU_VA, DADDR + 0x38_0000, 0x10000, 0, true)
+            .unwrap();
+        let vertex = f
+            .cache
+            .vertex_buffer(
+                &mut f.scheduler,
+                &mut f.staging,
+                &f.gmmu,
+                GPU_VA + 0x100,
+                0x200,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(vertex, f.acquire(DADDR + 0x38_0100, 0x200));
+        f.assert_no_validation_errors();
+    }
+
     #[test]
     fn clean_acquires_do_not_allocate() {
         let Some(mut f) = fixture() else { return };
@@ -3942,6 +4396,89 @@ mod tests {
             full_s * 1e6 / full as f64,
             (full * 0x10000) as f64 / full_s / f64::from(1 << 20),
         );
+        f.assert_no_validation_errors();
+    }
+
+    /// Binds of a typical Mario Kart World draw: two scene uniforms at fixed addresses, three
+    /// per-object uniforms and a per-object storage read that move with the object, and one
+    /// fixed storage read, in a frame where GPU work wrote other buffers. Over big pages and over
+    /// a table split into scattered 16 KiB runs:
+    /// `cargo test --release -p lichii-vulkan --lib bind_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing"]
+    fn bind_cost() {
+        const OBJECTS: u64 = 400;
+        const FRAMES: u64 = 200;
+        const REGION: u64 = 4 << 20;
+        let Some(mut f) = fixture() else { return };
+        let big = GPU_VA;
+        f.gmmu.map(big, DADDR, REGION, 0, true).unwrap();
+        let small = GPU_VA + REGION;
+        const CHUNK: u64 = 4 * PAGE_SIZE;
+        for chunk in 0..REGION / CHUNK {
+            let daddr = DADDR + REGION + (REGION / CHUNK - 1 - chunk) * CHUNK;
+            f.gmmu
+                .map(small + chunk * CHUNK, daddr, CHUNK, 0, false)
+                .unwrap();
+        }
+        f.acquire(DADDR, 2 * REGION);
+        f.cache
+            .mark_gpu_written(f.scheduler.tick(), DADDR + REGION - 0x1000, 0x1000);
+        f.scheduler.finish().unwrap();
+        for (name, base) in [("big pages", big), ("scattered 16 KiB runs", small)] {
+            let mut uniform_ns = Vec::new();
+            let mut storage_ns = Vec::new();
+            for frame in 0..=FRAMES {
+                let start = Instant::now();
+                for object in 0..OBJECTS {
+                    let per_object = base + 0x10_0000 + object * 0x800;
+                    for (gpu_va, size) in [
+                        (base, 0x200),
+                        (base + 0x1000, 0x100),
+                        (per_object, 0x100),
+                        (per_object + 0x100, 0x300),
+                        (per_object + 0x400, 0x200),
+                    ] {
+                        f.cache
+                            .uniform_buffer(&mut f.scheduler, &mut f.staging, &f.gmmu, gpu_va, size)
+                            .unwrap()
+                            .unwrap();
+                    }
+                }
+                let uniforms = start.elapsed().as_nanos() as f64 / OBJECTS as f64;
+                let start = Instant::now();
+                for object in 0..OBJECTS {
+                    let per_object = base + 0x20_0000 + object * 0x1000;
+                    for (gpu_va, size) in [(per_object, 0x800), (base + 0x30_0000, 0x4000)] {
+                        f.cache
+                            .storage_buffer(
+                                &mut f.scheduler,
+                                &mut f.staging,
+                                &f.gmmu,
+                                gpu_va,
+                                size,
+                                false,
+                            )
+                            .unwrap()
+                            .unwrap();
+                    }
+                }
+                let storage = start.elapsed().as_nanos() as f64 / OBJECTS as f64;
+                f.scheduler.finish().unwrap();
+                if frame > 0 {
+                    uniform_ns.push(uniforms);
+                    storage_ns.push(storage);
+                }
+            }
+            uniform_ns.sort_by(f64::total_cmp);
+            storage_ns.sort_by(f64::total_cmp);
+            let half = uniform_ns.len() / 2;
+            eprintln!(
+                "{name}: per draw (best / median frame), 5 uniform binds {:.0} / {:.0} ns, \
+                 2 storage binds {:.0} / {:.0} ns",
+                uniform_ns[0], uniform_ns[half], storage_ns[0], storage_ns[half],
+            );
+        }
         f.assert_no_validation_errors();
     }
 }

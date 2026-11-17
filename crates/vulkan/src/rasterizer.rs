@@ -1365,7 +1365,13 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn has_pending_fences(&self) -> bool {
-        self.unflushed || !self.fences.is_empty()
+        !self.fences.is_empty()
+    }
+
+    fn has_unsubmitted_fences(&self) -> bool {
+        self.fences
+            .back()
+            .is_some_and(|&(tick, _)| tick >= self.scheduler.tick())
     }
 
     fn synchronize_region(&mut self, addr: DAddr, size: u64) {
@@ -2297,7 +2303,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_work_follows_the_fence_queue_and_unsubmitted_commands() {
+    fn pending_work_follows_the_fence_queue_and_unsubmitted_fences() {
         let Some(mut f) = fixture(GobLayout::Tegra) else {
             return;
         };
@@ -2305,15 +2311,18 @@ mod tests {
         assert!(!f.rasterizer.has_pending_fences());
         f.rasterizer.barrier();
         assert!(
-            f.rasterizer.has_pending_fences(),
-            "recorded work is not submitted yet"
+            !f.rasterizer.has_pending_fences() && !f.rasterizer.has_unsubmitted_fences(),
+            "recorded work no fence waits for keeps the GPU from polling"
         );
-        f.rasterizer.flush_commands();
-        assert!(!f.rasterizer.has_pending_fences());
         f.rasterizer
             .signal_fence(FenceAction::IncrementSyncpoint(4));
         assert!(f.rasterizer.has_pending_fences());
+        assert!(
+            f.rasterizer.has_unsubmitted_fences(),
+            "the fence waits for recorded work"
+        );
         f.rasterizer.flush_commands();
+        assert!(!f.rasterizer.has_unsubmitted_fences());
         f.rasterizer.release_fences(true);
         assert!(!f.rasterizer.has_pending_fences());
         assert_eq!(f.syncpoints.guest().value(4).unwrap(), 1);

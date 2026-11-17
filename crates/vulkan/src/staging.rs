@@ -68,7 +68,7 @@ impl StagingRing {
         size: u64,
         align: u64,
     ) -> Result<StagingSlice<'_>> {
-        if size > self.capacity / 4 {
+        if !self.shares_ring(size) {
             self.reclaim(scheduler);
             let buffer = self.oversized.alloc(
                 &self.device,
@@ -114,6 +114,12 @@ impl StagingRing {
             offset: start,
             data,
         })
+    }
+
+    /// Whether a request of `size` bytes shares the ring instead of getting an [`Oversized`]
+    /// buffer of its own.
+    pub(crate) fn shares_ring(&self, size: u64) -> bool {
+        size <= self.capacity / 4
     }
 
     fn fits(&self, start: u64, size: u64) -> bool {
