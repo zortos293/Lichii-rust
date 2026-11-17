@@ -2430,7 +2430,9 @@ impl TextureCache {
                     let lt = level.map(|l| surface.level_tiling(l));
                     let own = info.surface().level_tiling(0);
                     tracing::info!(
-                        "DIAG395B candidate={candidate:?} trim={} contiguous={}/{} same_segments={} image={}x{}x{} l{} {:?} {:?} stride={:#x} offset={offset:#x} level={level:?} level_tiling={lt:?} target={}x{} {:?} {:?} own={own:?}",
+                        "DIAG395B base={:#x} id={} at={i} candidate={candidate:?} trim={} contiguous={}/{} same_segments={} image={}x{}x{} l{} {:?} {:?} stride={:#x} offset={offset:#x} level={level:?} level_tiling={lt:?} target={}x{} {:?} {:?} own={own:?}",
+                        image.base(),
+                        id.index,
                         image.trim,
                         contiguous,
                         image.contiguous(),

@@ -766,6 +766,32 @@ impl TextureCache {
         {
             return Ok(false);
         }
+        {
+            let describe = |o: ImageId| {
+                let i = self.get(o).expect("a live image id");
+                format!("{}x{}x{}l{}@{:#x}", i.info.width, i.info.height, i.info.layers, i.info.levels, i.base())
+            };
+            let mut others: Vec<String> = newer.iter().map(|&o| describe(o)).collect();
+            others.sort();
+            let key = format!("{} <- [{}]", describe(id), others.join(", "));
+            static COUNTS: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> = std::sync::Mutex::new(None);
+            static TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let mut counts = COUNTS.lock().unwrap();
+            let counts = counts.get_or_insert_with(Default::default);
+            let fresh = !counts.contains_key(&key);
+            *counts.entry(key.clone()).or_default() += 1;
+            if fresh && counts.len() <= 300 {
+                tracing::info!("DIAG395C new sync {key}");
+            }
+            let total = TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if total % 5000 == 0 {
+                let mut top: Vec<_> = counts.iter().collect();
+                top.sort_by(|a, b| b.1.cmp(a.1));
+                for (k, c) in top.into_iter().take(15) {
+                    tracing::info!("DIAG395C top total={total} count={c} {k}");
+                }
+            }
+        }
         if self.guest_sync.is_none() {
             self.guest_sync = Some(GuestSync::new(&self.device)?);
         }
