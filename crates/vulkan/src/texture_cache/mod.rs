@@ -204,6 +204,8 @@ pub struct Traffic {
     pub download_bytes: u64,
     /// Overlap syncs done on the GPU instead of through guest memory.
     pub gpu_syncs: u64,
+    /// Downloads served from a copy taken when the work writing the image was submitted.
+    pub captured_downloads: u64,
 }
 
 /// What the collector did since the cache was created.
@@ -252,6 +254,41 @@ struct Download {
     id: ImageId,
     offset: u64,
     modified: u64,
+}
+
+/// The ticks that change when an image's texels do: its own GPU writes (`written`), what it took
+/// from aliases (`modified`), and what it took from overlaps (`current`).
+type Version = (u64, u64, u64);
+
+/// Size of the ring [`TextureCache::capture`] copies read-back images into.
+const CAPTURE_RING_SIZE: u64 = 8 << 20;
+/// The largest readback of an image a download marks for capture.
+const CAPTURE_MAX: u64 = CAPTURE_RING_SIZE / 8;
+/// The most images captured at once: a newly hot image replaces the oldest.
+const CAPTURE_HOT_MAX: usize = 16;
+
+/// A copy of image `id`'s texels at `offset` in the capture ring, taken at the end of the work
+/// completing at `tick`, when the image's `version` was this.
+#[derive(Clone, Copy)]
+struct Capture {
+    id: ImageId,
+    version: Version,
+    offset: u64,
+    end: u64,
+    tick: u64,
+}
+
+/// Images guest CPU reads come back to, copied to host memory at the end of the work that
+/// writes them. A read of a captured image waits at most for that work, instead of recording a
+/// download behind everything queued since and waiting for all of it.
+#[derive(Default)]
+struct Captures {
+    ring: Option<Buffer>,
+    head: u64,
+    /// Images downloads wrote back: their later GPU writes are captured.
+    hot: Vec<ImageId>,
+    /// Copies of the images' current texels.
+    live: Vec<Capture>,
 }
 
 /// The collector's readback of GPU-modified images, submitted at `tick` in frame `frame`,
@@ -351,6 +388,10 @@ struct Alias {
 type Texel = (u32, u32);
 
 impl CachedImage {
+    fn version(&self) -> Version {
+        (self.written, self.modified, self.current)
+    }
+
     fn base(&self) -> DAddr {
         self.segments[0].daddr
     }
@@ -624,6 +665,9 @@ pub struct TextureCache {
     /// Host images replaced by a rescale, and resolution scale changes, so far.
     replacements: u64,
     ids: Vec<ImageId>,
+    /// The overlaps [`TextureCache::rearm`] collects, apart from `ids`, which its callers may
+    /// be holding.
+    rearm_ids: Vec<ImageId>,
     joins: Vec<(ImageId, u32, u32)>,
     new_aliases: Vec<Alias>,
     alias_scratch: Vec<Alias>,
@@ -646,6 +690,12 @@ pub struct TextureCache {
     scratch: Scratch,
     readback: Option<Buffer>,
     downloads: Vec<Download>,
+    /// Downloads served from captures.
+    captured: Vec<Download>,
+    captures: Captures,
+    /// Guest CPU accesses to the pages of GPU-modified images trap until they are written back
+    /// ([`TextureCache::set_flush_traps`]); `None` without flush traps.
+    flush_traps: Option<Arc<DeviceAddressSpace>>,
     clear_pipelines: Option<ClearPipelines>,
     guest_sync: Option<guest_sync::GuestSync>,
     gather: Option<blit::Gather>,
@@ -1011,6 +1061,7 @@ impl TextureCache {
             creations: 0,
             replacements: 0,
             ids: Vec::new(),
+            rearm_ids: Vec::new(),
             joins: Vec::new(),
             new_aliases: Vec::new(),
             alias_scratch: Vec::new(),
@@ -1030,6 +1081,9 @@ impl TextureCache {
             scratch: Scratch::default(),
             readback: None,
             downloads: Vec::new(),
+            captured: Vec::new(),
+            captures: Captures::default(),
+            flush_traps: None,
             clear_pipelines: None,
             guest_sync: None,
             gather: None,
@@ -1084,6 +1138,13 @@ impl TextureCache {
 
     pub fn traffic(&self) -> Traffic {
         self.traffic
+    }
+
+    /// Arms flush traps over the pages of images when the GPU modifies them, so a guest CPU
+    /// access to one waits for [`TextureCache::flush`] to write its texels back
+    /// ([`DeviceAddressSpace::arm_flush_traps`]). Off until called.
+    pub fn set_flush_traps(&mut self, memory: Arc<DeviceAddressSpace>) {
+        self.flush_traps = Some(memory);
     }
 
     /// The host format of a guest format, queried from the device once.
@@ -1524,8 +1585,15 @@ impl TextureCache {
     /// bitmap. Called when the writing work is recorded.
     pub fn mark_modified(&mut self, id: ImageId) {
         if let Some(image) = self.get(id) {
+            let arm = self
+                .flush_traps
+                .as_ref()
+                .filter(|_| !image.gpu_modified && image.downloadable());
             for s in &image.segments {
                 self.written_pages.mark(s.daddr, s.size);
+                if let Some(memory) = arm {
+                    memory.arm_flush_traps(s.daddr, s.size);
+                }
             }
         }
         self.tick += 1;
@@ -1976,13 +2044,17 @@ impl TextureCache {
             && own.compression() == format.compression()
     }
 
-    /// Whether `image` can be copied into a new image of `format` on the GPU.
+    /// Whether `image` can be copied into a new image of `format` on the GPU. Depth images of
+    /// one guest format share their host fallback's texels too, as X8D24 kept in D32 does where
+    /// the host has no X8D24 attachment (RADV).
     fn copy_compatible(image: &CachedImage, host: HostFormat, format: PixelFormat) -> bool {
         let own = image.info.format;
         let aspects_match = own.is_color() == format.is_color()
             && (own.is_color() || image.host.format == host.format);
-        image.host.conversion == Conversion::None
-            && host.conversion == Conversion::None
+        let unconverted =
+            image.host.conversion == Conversion::None && host.conversion == Conversion::None;
+        let converted_alike = !own.is_color() && own == format;
+        (unconverted || converted_alike)
             && aspects_match
             && own.bytes_per_block() == format.bytes_per_block()
             && own.block_width() == format.block_width()
@@ -3073,10 +3145,13 @@ impl TextureCache {
 
     /// Lands the bytes GPU work wrote to buffers over `id` in guest memory, so the image's own
     /// texels, uploaded now or written back later, are the newer ones.
-    fn flush_buffered(&self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
-        for segment in &self.get(id).expect("a live image id").segments {
-            tx.buffers
-                .flush(tx.scheduler, segment.daddr, segment.size)?;
+    fn flush_buffered(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
+        for i in 0..self.image(id).segments.len() {
+            let Segment { daddr, size, .. } = self.image(id).segments[i];
+            if tx.buffers.is_gpu_written(daddr, size) {
+                tx.buffers.flush(tx.scheduler, daddr, size)?;
+                self.rearm(daddr, daddr + size);
+            }
         }
         Ok(())
     }
@@ -3301,51 +3376,224 @@ impl TextureCache {
         }
         let mut downloads = std::mem::take(&mut self.downloads);
         downloads.clear();
+        let mut captured = std::mem::take(&mut self.captured);
+        captured.clear();
+        let submitted = tx.scheduler.tick();
+        let mut newest = 0;
         for &id in ids {
             let image = self.image(id);
-            if image.downloadable() {
-                downloads.push(Download {
-                    id,
-                    offset: 0,
-                    modified: image.modified,
-                });
-            } else {
+            if !image.downloadable() {
                 image.gpu_modified = false;
                 image.track(tx.memory);
+                continue;
+            }
+            let version = image.version();
+            let download = Download {
+                id,
+                offset: 0,
+                modified: image.modified,
+            };
+            let capture = self
+                .captures
+                .live
+                .iter()
+                .find(|c| c.id == id && c.version == version && c.tick < submitted);
+            match capture {
+                Some(capture) => {
+                    newest = newest.max(capture.tick);
+                    captured.push(Download {
+                        offset: capture.offset,
+                        ..download
+                    });
+                }
+                None => downloads.push(download),
             }
         }
-        let mut readback = self.readback.take();
-        let result = if downloads.is_empty() {
-            Ok(())
-        } else {
-            self.record_downloads(tx, &mut downloads, &mut readback)
-                .and_then(|()| tx.scheduler.finish())
-        };
-        if result.is_ok()
-            && let Some(data) = readback.as_ref().and_then(Buffer::mapped)
-        {
-            let mut ranges = std::mem::take(&mut self.keep);
-            for download in &downloads {
-                ranges.clear();
-                ranges.extend(keep);
-                self.keep_newer(download.id, &mut ranges);
-                self.write_back(
-                    tx.memory,
-                    download.id,
-                    &data[download.offset as usize..],
-                    &ranges,
-                );
-                let image = self.image(download.id);
-                image.gpu_modified = false;
-                let bytes = image.info.size_bytes();
-                self.traffic.downloads += 1;
-                self.traffic.download_bytes += bytes;
-                self.hand_off(tx.scheduler, download.id);
+        let mut result = Ok(());
+        if !captured.is_empty() {
+            result = tx.scheduler.wait(newest);
+            let ring = self.captures.ring.take();
+            if result.is_ok()
+                && let Some(data) = ring.as_ref().and_then(Buffer::mapped)
+            {
+                for download in &captured {
+                    self.finish_download(tx, download.id, &data[download.offset as usize..], keep);
+                }
+                self.traffic.captured_downloads += captured.len() as u64;
             }
-            self.keep = ranges;
+            self.captures.ring = ring;
+        }
+        let mut readback = self.readback.take();
+        if result.is_ok() && !downloads.is_empty() {
+            result = self
+                .record_downloads(tx, &mut downloads, &mut readback)
+                .and_then(|()| tx.scheduler.finish());
+            if result.is_ok()
+                && let Some(data) = readback.as_ref().and_then(Buffer::mapped)
+            {
+                for download in &downloads {
+                    self.finish_download(tx, download.id, &data[download.offset as usize..], keep);
+                }
+            }
         }
         self.readback = readback;
         self.downloads = downloads;
+        self.captured = captured;
+        result
+    }
+
+    /// Writes image `id`'s texels from its readback `data` to guest memory, except over `keep`
+    /// and the bytes of overlaps modified after it, ends the flush traps of the pages it alone
+    /// held, and has [`TextureCache::capture`] copy its later GPU writes.
+    fn finish_download(
+        &mut self,
+        tx: &mut Transfer<'_>,
+        id: ImageId,
+        data: &[u8],
+        keep: Option<(DAddr, DAddr)>,
+    ) {
+        let mut ranges = std::mem::take(&mut self.keep);
+        ranges.clear();
+        ranges.extend(keep);
+        self.keep_newer(id, &mut ranges);
+        self.write_back(tx.memory, id, data, &ranges);
+        self.keep = ranges;
+        let image = self.image(id);
+        image.gpu_modified = false;
+        let bytes = image.info.size_bytes();
+        let capturable = image.readback_size().0 <= CAPTURE_MAX;
+        self.traffic.downloads += 1;
+        self.traffic.download_bytes += bytes;
+        self.hand_off(tx.scheduler, id);
+        self.disarm(tx, id);
+        let hot = &mut self.captures.hot;
+        if capturable && !hot.contains(&id) {
+            if hot.len() == CAPTURE_HOT_MAX {
+                hot.remove(0);
+            }
+            hot.push(id);
+        }
+    }
+
+    /// Arms flush traps again over the GPU-modified images on the pages of `[daddr, end)`: a
+    /// buffer write-back there ends the traps of the pages it shares with them.
+    pub fn rearm(&mut self, daddr: DAddr, end: DAddr) {
+        if self.flush_traps.is_none() || daddr >= end {
+            return;
+        }
+        let start = daddr & !(PAGE_SIZE - 1);
+        std::mem::swap(&mut self.ids, &mut self.rearm_ids);
+        self.collect_overlaps(&[Segment {
+            offset: 0,
+            daddr: start,
+            size: end.next_multiple_of(PAGE_SIZE) - start,
+        }]);
+        let memory = self.flush_traps.as_ref().expect("checked above");
+        for &id in &self.ids {
+            let image = self.get(id).expect("overlaps are live");
+            if image.gpu_modified && image.downloadable() {
+                for s in &image.segments {
+                    memory.arm_flush_traps(s.daddr, s.size);
+                }
+            }
+        }
+        std::mem::swap(&mut self.ids, &mut self.rearm_ids);
+    }
+
+    /// Ends the flush traps of the whole pages image `id`, just written back, covers, unless a
+    /// GPU-modified image over the same bytes still needs them. Pages GPU-written buffer bytes
+    /// share keep theirs, and the pages at the image's ends trap once more at most.
+    fn disarm(&self, tx: &mut Transfer<'_>, id: ImageId) {
+        if self.flush_traps.is_none() {
+            return;
+        }
+        let image = self.get(id).expect("a live image id");
+        let shared = image
+            .overlaps
+            .iter()
+            .chain(image.aliases.iter().map(|a| &a.id))
+            .any(|&o| self.get(o).is_some_and(|o| o.gpu_modified));
+        if shared {
+            return;
+        }
+        for s in &image.segments {
+            let start = s.daddr.next_multiple_of(PAGE_SIZE);
+            let end = (s.daddr + s.size) & !(PAGE_SIZE - 1);
+            if start < end {
+                tx.buffers.disarm_written_back(start, end);
+            }
+        }
+    }
+
+    /// Copies the texels of hot images the work being recorded wrote into the capture ring, at
+    /// the end of that work, so a guest CPU read of one once it completes needs no GPU work of
+    /// its own. Call right before the recorded work is submitted.
+    pub fn capture(&mut self, tx: &mut Transfer<'_>) -> Result<()> {
+        if self.captures.hot.is_empty() {
+            return Ok(());
+        }
+        if self.captures.ring.is_none() {
+            self.captures.ring = Some(Buffer::new(
+                &self.device,
+                CAPTURE_RING_SIZE,
+                vk::BufferUsageFlags::TRANSFER_DST,
+                MemoryLocation::GpuToCpu,
+                "texture capture ring",
+            )?);
+        }
+        let ring = self.captures.ring.as_ref().expect("just ensured").raw();
+        let mut hot = std::mem::take(&mut self.captures.hot);
+        hot.retain(|&id| self.get(id).is_some());
+        let tick = tx.scheduler.tick();
+        let mut recorded = None;
+        let mut result = Ok(());
+        for &id in &hot {
+            let image = self.get(id).expect("hot images are live");
+            let version = image.version();
+            let current = self
+                .captures
+                .live
+                .iter()
+                .any(|c| c.id == id && c.version == version);
+            if !image.gpu_modified || image.aliases_newest > image.written || current {
+                continue;
+            }
+            let (size, align) = image.readback_size();
+            let cmd = match recorded {
+                Some(cmd) => cmd,
+                None => match tx.scheduler.record() {
+                    Ok(cmd) => *recorded.insert(cmd),
+                    Err(error) => {
+                        result = Err(error);
+                        break;
+                    }
+                },
+            };
+            let mut offset = self.captures.head.next_multiple_of(align);
+            if offset + size > CAPTURE_RING_SIZE {
+                offset = 0;
+                transfer_to_all_barrier(&self.device, cmd);
+            }
+            self.captures
+                .live
+                .retain(|c| c.id != id && (c.end <= offset || offset + size <= c.offset));
+            result = self.record_download(tx, cmd, id, ring, offset);
+            if result.is_err() {
+                break;
+            }
+            self.captures.live.push(Capture {
+                id,
+                version,
+                offset,
+                end: offset + size,
+                tick,
+            });
+            self.captures.head = offset + size;
+        }
+        if let Some(cmd) = recorded {
+            transfer_to_all_barrier(&self.device, cmd);
+        }
+        self.captures.hot = hot;
         result
     }
 

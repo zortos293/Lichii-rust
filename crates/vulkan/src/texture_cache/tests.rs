@@ -897,6 +897,73 @@ fn targets_drawn_into_take_newer_overlaps_on_their_texel_grid() {
 }
 
 #[test]
+fn depth_arrays_cleared_a_layer_at_a_time_join_into_one_image() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let format = PixelFormat::X8D24Unorm;
+    let array = ImageInfo {
+        format,
+        layers: 4,
+        layer_stride: surface(format, 64, 64, 1, 4, 2, GobLayout::Tegra).layer_stride(),
+        ..rt_info(64, 64, 2, GobLayout::Tegra)
+    };
+    let depths = [0.25, 0.5, 0.75, 1.0];
+    let mut last = None;
+    for (layer, depth) in (0u32..).zip(depths) {
+        let (mut tx, cache, gmmu) = f.tx();
+        let target = cache
+            .render_target(
+                &mut tx,
+                gmmu,
+                GPU_VA,
+                &array.with_layers(layer + 1),
+                layer == 0,
+            )
+            .unwrap()
+            .unwrap();
+        cache
+            .clear(
+                &mut tx,
+                target,
+                ClearValue::DepthStencil {
+                    depth: Some(depth),
+                    stencil: None,
+                    stencil_mask: 0xff,
+                },
+                Rect::ALL,
+                layer,
+                1,
+            )
+            .unwrap();
+        last = Some(target.id);
+    }
+    assert_eq!(f.cache.len(), 1, "each larger array joins the smaller one");
+    let traffic = f.cache.traffic();
+    for layers in 1..=4 {
+        let (mut tx, cache, gmmu) = f.tx();
+        let found = cache
+            .render_target(&mut tx, gmmu, GPU_VA, &array.with_layers(layers), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!((Some(found.id), found.layer), (last, 0));
+    }
+    assert_eq!(f.cache.traffic(), traffic, "binds sync nothing");
+    let (mut tx, cache, _) = f.tx();
+    cache.flush(&mut tx, DADDR, array.size_bytes()).unwrap();
+    let stride = array.layer_stride as usize;
+    let guest = guest_texels(&f, 0, stride * 4);
+    for (layer, depth) in depths.into_iter().enumerate() {
+        let expected = (f64::from(depth) * 16_777_215.0).round() as u32;
+        for &texel in guest[layer * stride..][..64 * 64 * 4].as_chunks::<4>().0 {
+            let d = u32::from_le_bytes(texel) & 0xff_ffff;
+            assert!(d.abs_diff(expected) <= 1, "layer {layer} depth {d:#x}");
+        }
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
 fn targets_drawn_into_take_newer_mip_chains_over_them() {
     let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
         return;
