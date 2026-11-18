@@ -5454,3 +5454,112 @@ fn dispatches_through_unbounded_pointers_record_their_barrier_at_once() {
     assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
     f.assert_no_validation_errors();
 }
+
+/// Runs `set_dynamic_state` over a synthetic Mario Kart World-like stream on lavapipe: two
+/// colour attachments and three vertex streams, a new rendering every 40 draws, and 0 to 3
+/// dynamic-state registers toggled between two values per draw. Reports ns per draw.
+#[test]
+#[ignore = "benchmark"]
+fn measures_dynamic_state_cost() {
+    use std::mem::offset_of;
+    use std::time::{Duration, Instant};
+
+    use lichii_gpu::engines::maxwell_3d::RegisterState;
+
+    let Some(mut f) = fixture_with(GobLayout::Tegra, true) else {
+        return;
+    };
+    let r = &mut f.rasterizer;
+    let mut state = RegisterState::new();
+    let word = |offset: usize| (offset / 4) as u32;
+    for (i, attribute) in [0x12 << 21, 0x12 << 21 | 12 << 7, 0x9 << 21 | 1 << 0]
+        .into_iter()
+        .enumerate()
+    {
+        let method = word(offset_of!(Regs, vertex_attrib_format)) + i as u32;
+        state.write(method, attribute | 0x7 << 27);
+    }
+    let null = r.draw.null_buffer.raw();
+    for stride in [24, 24, 8] {
+        r.draw.vertex_buffers.push(null);
+        r.draw.vertex_offsets.push(0);
+        r.draw.vertex_strides.push(stride);
+    }
+    r.draw
+        .attachments
+        .extend([vk::RenderingAttachmentInfo::default(); 2]);
+    let features = *r.draw.pipelines.features();
+    let toggles: Vec<(u32, [u32; 2])> = vec![
+        (word(offset_of!(Regs, depth_write_enabled)), [0, 1]),
+        (word(offset_of!(Regs, depth_test_enable)), [1, 0]),
+        (word(offset_of!(Regs, depth_test_func)), [0x203, 0x207]),
+        (word(offset_of!(Regs, blend.enable)), [0, 1]),
+        (word(offset_of!(Regs, blend.color_source)), [0x4302, 0x4304]),
+        (word(offset_of!(Regs, color_mask)), [0x1111, 0x0111]),
+        (word(offset_of!(Regs, gl_cull_test_enabled)), [1, 0]),
+        (word(offset_of!(Regs, polygon_offset_fill_enable)), [0, 1]),
+        (word(offset_of!(Regs, depth_bias)), [0, 4f32.to_bits()]),
+        (word(offset_of!(Regs, stencil_front_ref)), [0, 0x80]),
+        (word(offset_of!(Regs, blend_color.r)), [0, 1f32.to_bits()]),
+        (
+            word(offset_of!(Regs, scissor_test)) + 1,
+            [1280 << 16, 640 << 16],
+        ),
+        (
+            word(offset_of!(Regs, viewport_transform)) + 3,
+            [640f32.to_bits(), 320f32.to_bits()],
+        ),
+    ];
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    const DRAWS: usize = 4096;
+    let stream: Vec<Vec<(u32, u32)>> = (0..DRAWS)
+        .map(|_| {
+            let changes = match next() % 20 {
+                0..10 => 0,
+                10..15 => 1,
+                15..18 => 2,
+                _ => 3,
+            };
+            (0..changes)
+                .map(|_| {
+                    let (method, values) = toggles[next() as usize % toggles.len()];
+                    (method, values[next() as usize % 2])
+                })
+                .collect()
+        })
+        .collect();
+    let extent = vk::Extent2D {
+        width: 1280,
+        height: 720,
+    };
+    let topology = vk::PrimitiveTopology::TRIANGLE_LIST;
+    let scale = ResolutionScale::X1;
+    let mut elapsed = Duration::ZERO;
+    let rounds = 200;
+    for round in 0..=rounds {
+        let cmd = r.scheduler.record().unwrap();
+        let start = Instant::now();
+        for (i, writes) in stream.iter().enumerate() {
+            for &(method, value) in writes {
+                state.write(method, value);
+            }
+            r.draw.dynamic.begin(i % 40 == 0, false);
+            r.set_dynamic_state(cmd, &state.regs, &features, topology, extent, scale);
+        }
+        if round > 0 {
+            elapsed += start.elapsed();
+        }
+        r.scheduler.finish().unwrap();
+    }
+    let draws = (rounds * DRAWS) as f64;
+    eprintln!(
+        "dynamic state: {:.1} ns per draw over {draws} draws",
+        elapsed.as_secs_f64() * 1e9 / draws
+    );
+}
