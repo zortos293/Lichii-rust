@@ -528,6 +528,17 @@ impl ClientSession {
         }
     }
 
+    /// Name of the service behind the session; a domain is named after its first object.
+    pub(crate) fn service_name(&self) -> String {
+        match &*self.session.server.target.lock() {
+            Target::Single(handler) => handler.name().into(),
+            Target::Domain(objects) => match objects.iter().flatten().next() {
+                Some(handler) => format!("{} (domain)", handler.name()),
+                None => "domain".into(),
+            },
+        }
+    }
+
     /// Queues a request whose message is at `message` (`size` bytes) in `thread`'s process.
     /// The thread must be in the wait `token`; the service thread wakes it with the result.
     pub(crate) fn send(&self, thread: Arc<Thread>, token: u64, message: VAddr, size: usize) {

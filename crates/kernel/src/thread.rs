@@ -10,6 +10,7 @@ use parking_lot::{Mutex, MutexGuard};
 use crate::process::Process;
 use crate::scheduler::Scheduler;
 use crate::sync::SyncState;
+use crate::wait_stats::WaitProbe;
 
 pub type ThreadId = u64;
 
@@ -90,6 +91,8 @@ pub(crate) struct Sched {
     /// Pinned to its core by an interrupt that found preemption disabled; it keeps the core until
     /// `svcSynchronizePreemptionState`.
     pub pinned: bool,
+    /// The blocked wait in progress, timed only while the `waits` log target is enabled.
+    pub wait_probe: Option<WaitProbe>,
 }
 
 /// Held while a process changes its mutex ownership links (`lock_waiters`, `lock_owner`) and the
@@ -178,6 +181,7 @@ impl Thread {
                 cancel_pending: false,
                 terminate_requested: false,
                 pinned: false,
+                wait_probe: None,
             }),
             wait_token: AtomicU64::new(0),
             refs: AtomicUsize::new(0),
@@ -545,6 +549,9 @@ impl Thread {
         s.wait = 0;
         s.wake = wake;
         self.wait_token.store(0, Ordering::Release);
+        if let Some(probe) = &mut s.wait_probe {
+            probe.wake();
+        }
         if s.state == ThreadState::Waiting {
             if s.pause_requested {
                 s.state = ThreadState::Suspended;

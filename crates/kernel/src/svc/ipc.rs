@@ -7,6 +7,7 @@ use crate::ipc::ClientSession;
 use crate::object::KObject;
 use crate::result;
 use crate::thread::{Resume, TLS_SIZE};
+use crate::wait_stats::WaitSite;
 
 /// Size of the IPC message at the start of a thread's TLS.
 use crate::ipc::TLS_MESSAGE_SIZE;
@@ -78,5 +79,5 @@ fn send(svc: &mut SvcContext, handle: u32, message: VAddr, size: usize) -> Flow 
         Err(code) => return svc.finish(Err(code)),
     };
     session.send(svc.thread.clone(), token, message, size);
-    svc.block(token, None, false)
+    svc.block(token, None, false, || WaitSite::ipc(&session))
 }
