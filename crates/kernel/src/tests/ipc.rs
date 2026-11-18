@@ -725,3 +725,61 @@ fn shutdown_leaves_a_service_thread_stuck_in_a_request() {
         std::thread::sleep(Duration::from_millis(1));
     }
 }
+
+/// One guest thread sends 5000 `SendSyncRequest`s back to back to an HLE service, the pattern
+/// of a title's per-frame nvdrv, vi2 and hid calls. Each round trip hands the request to the
+/// service thread and the reply back to the guest core.
+#[test]
+fn sync_requests_round_trip_to_a_service_thread() {
+    const ROUNDS: u64 = 5000;
+    let test = TestKernel::new(ConsoleGeneration::Switch2);
+    let heap = heap_base(&test);
+    register_test_service(&test, Arc::new(Event::new()));
+    let replies = Replies::default();
+    let mut s = connect_sm(Script::new(), heap + 0x3000);
+    s = call(
+        s,
+        &replies,
+        19,
+        Msg {
+            pid: true,
+            ..Msg::cmif(0, &[0, 0])
+        },
+        None,
+    );
+    s = call(s, &replies, 19, Msg::cmif(1, &name("test:u")), Some(20));
+    let request = Msg::cmif(1, &[5, 0, 7, 1]).encode();
+    let sums = Arc::new(AtomicU32::new(0));
+    let counted = sums.clone();
+    let looped = s.len();
+    let main = test.program(
+        s.then(move |ctx, env| {
+            env.memory
+                .write_bytes(ctx.tpidrro_el0, bytemuck::cast_slice(&request))
+                .unwrap()
+        })
+        .svc(0x21, |ctx, _| ctx.x[0] = ctx.x[20])
+        .then(move |ctx, env| {
+            let sum = env.memory.read::<u64>(ctx.tpidrro_el0 + 0x20).unwrap();
+            if ctx.x[0] == 0 && sum == (1 << 32) + 12 {
+                counted.fetch_add(1, Ordering::Relaxed);
+            }
+            ctx.x[21] += 1;
+        })
+        .jump_if(looped, |ctx, _| ctx.x[21] < ROUNDS)
+        .exit(),
+    );
+    test.start(test.image(), main);
+    let started = Instant::now();
+    test.run_until_exit(Duration::from_secs(30));
+    eprintln!("{ROUNDS} service round trips in {:?}", started.elapsed());
+    assert_eq!(
+        replies
+            .lock()
+            .iter()
+            .map(|(result, _)| *result)
+            .collect::<Vec<_>>(),
+        [0, 0]
+    );
+    assert_eq!(u64::from(sums.load(Ordering::Relaxed)), ROUNDS);
+}

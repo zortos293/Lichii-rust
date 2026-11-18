@@ -558,6 +558,7 @@ impl App {
             installed: self.installed_content(),
             mods: ModOptions {
                 builtin_patches: self.settings.system.builtin_game_patches,
+                mkw_dynamic_fps: self.settings.system.mkw_dynamic_fps,
                 ..ModOptions::default()
             },
             ..LoadOptions::default()

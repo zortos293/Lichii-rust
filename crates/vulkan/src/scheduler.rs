@@ -60,6 +60,11 @@ pub struct Scheduler {
     /// Reused submit infos, so a submission allocates nothing.
     wait_infos: Vec<vk::SemaphoreSubmitInfo<'static>>,
     signal_infos: Vec<vk::SemaphoreSubmitInfo<'static>>,
+    /// The dispatches recorded since the last compute barrier still owe one, which orders their
+    /// shader accesses before later commands; [`Scheduler::record`] records it.
+    compute_barrier_owed: bool,
+    /// Compute barriers recorded so far.
+    compute_barriers: u64,
 }
 
 /// The attachments and area of a dynamic rendering. Draws whose key matches the open
@@ -130,6 +135,8 @@ impl Scheduler {
             submits: 0,
             wait_infos: Vec::new(),
             signal_infos: Vec::new(),
+            compute_barrier_owed: false,
+            compute_barriers: 0,
         })
     }
 
@@ -173,7 +180,8 @@ impl Scheduler {
 
     /// A full memory barrier: later commands may read anything earlier ones wrote. With no
     /// command buffer being recorded it is recorded at the start of the next one, so a barrier
-    /// alone gives a submission nothing to carry. `true` when it was recorded now.
+    /// alone gives a submission nothing to carry. It orders everything an owed compute barrier
+    /// would, which it pays. `true` when it was recorded now.
     pub fn barrier(&mut self) -> Result<bool> {
         let Some(cmd) = self.current else {
             self.barrier = true;
@@ -184,7 +192,8 @@ impl Scheduler {
         Ok(true)
     }
 
-    fn record_barrier(&self, cmd: vk::CommandBuffer) {
+    fn record_barrier(&mut self, cmd: vk::CommandBuffer) {
+        self.compute_barrier_owed = false;
         let barrier = vk::MemoryBarrier2::default()
             .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
             .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
@@ -204,7 +213,51 @@ impl Scheduler {
     pub fn record(&mut self) -> Result<vk::CommandBuffer> {
         let cmd = self.command_buffer()?;
         self.end_rendering(cmd);
+        self.record_compute_barrier(cmd);
         Ok(cmd)
+    }
+
+    /// The command buffer being recorded, outside any rendering, for a dispatch that touches
+    /// nothing the dispatches since the last compute barrier wrote, and writes nothing they
+    /// accessed: the owed barrier stays owed.
+    pub fn record_beside_dispatches(&mut self) -> Result<vk::CommandBuffer> {
+        let cmd = self.command_buffer()?;
+        self.end_rendering(cmd);
+        Ok(cmd)
+    }
+
+    /// Owes the barrier that orders the dispatches recorded so far before later commands.
+    pub fn owe_compute_barrier(&mut self) {
+        self.compute_barrier_owed = true;
+    }
+
+    /// Whether the dispatches recorded since the last compute barrier still owe one.
+    pub fn compute_barrier_owed(&self) -> bool {
+        self.compute_barrier_owed
+    }
+
+    /// Compute barriers recorded so far.
+    pub fn compute_barriers(&self) -> u64 {
+        self.compute_barriers
+    }
+
+    fn record_compute_barrier(&mut self, cmd: vk::CommandBuffer) {
+        if !std::mem::take(&mut self.compute_barrier_owed) {
+            return;
+        }
+        let barrier = vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+            .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE);
+        // SAFETY: `cmd` is recording outside any rendering.
+        unsafe {
+            self.device.raw.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().memory_barriers(&[barrier]),
+            )
+        };
+        self.compute_barriers += 1;
     }
 
     /// The command buffer being recorded, inside a dynamic rendering of `key`: the open one when
@@ -219,6 +272,7 @@ impl Scheduler {
             return Ok((cmd, false));
         }
         self.end_rendering(cmd);
+        self.record_compute_barrier(cmd);
         // SAFETY: `cmd` is recording outside any rendering, and the caller built `info` from
         // live attachment views in their attachment layouts.
         unsafe { self.device.raw.cmd_begin_rendering(cmd, info) };
@@ -382,6 +436,7 @@ impl Scheduler {
         }
         if let Some(cmd) = self.current {
             self.end_rendering(cmd);
+            self.record_compute_barrier(cmd);
         }
         let cmd = self.current.take();
         if let Some(cmd) = cmd {
@@ -740,6 +795,55 @@ mod tests {
         );
         assert!(!scheduler.barrier);
         assert_eq!(scheduler.record().unwrap(), cmd);
+        scheduler.finish().unwrap();
+        assert_eq!(device.instance().validation_errors(), 0);
+    }
+
+    #[test]
+    fn held_guest_barriers_and_owed_compute_barriers_are_both_paid() {
+        let Some(device) = device() else { return };
+        let mut scheduler = Scheduler::new(&device).unwrap();
+        let barriers = scheduler.compute_barriers();
+        scheduler.record().unwrap();
+        scheduler.owe_compute_barrier();
+        scheduler.flush().unwrap();
+        assert!(!scheduler.compute_barrier_owed());
+        assert_eq!(
+            scheduler.compute_barriers(),
+            barriers + 1,
+            "a submission ends with the owed compute barrier"
+        );
+
+        let submits = scheduler.submits();
+        assert!(!scheduler.barrier().unwrap());
+        scheduler.owe_compute_barrier();
+        assert!(
+            scheduler.submitted_tick().is_some(),
+            "neither barrier opens a command buffer"
+        );
+        assert_eq!(scheduler.submits(), submits);
+        scheduler.record().unwrap();
+        assert!(
+            !scheduler.barrier,
+            "the guest barrier opens the next command buffer"
+        );
+        assert!(
+            !scheduler.compute_barrier_owed(),
+            "the guest barrier orders the dispatches too"
+        );
+        assert_eq!(scheduler.compute_barriers(), barriers + 1);
+
+        scheduler.owe_compute_barrier();
+        assert!(scheduler.barrier().unwrap());
+        assert!(!scheduler.compute_barrier_owed());
+        scheduler.owe_compute_barrier();
+        scheduler.submit_part().unwrap();
+        assert!(!scheduler.compute_barrier_owed());
+        assert_eq!(
+            scheduler.compute_barriers(),
+            barriers + 2,
+            "a part submission ends with the owed compute barrier"
+        );
         scheduler.finish().unwrap();
         assert_eq!(device.instance().validation_errors(), 0);
     }

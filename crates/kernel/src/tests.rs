@@ -311,6 +311,7 @@ impl TestKernel {
             icon: None,
             version: 0,
             add_ons: Vec::new(),
+            present_interval: None,
         }
     }
 

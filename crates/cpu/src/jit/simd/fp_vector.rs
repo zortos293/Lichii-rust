@@ -39,9 +39,10 @@ pub enum LaneOp {
     RecipStep,
     /// `FRSQRTS`: fused `(3 - n * m) / 2`.
     RsqrtStep,
-    /// `SCVTF` (vector) on 32-bit lanes of `n`.
+    /// `SCVTF` (vector) on 32-bit lanes of `n`; the fixed-point form when the instruction is a
+    /// shift by immediate, which scales the result by `2^-fbits`.
     FromInt,
-    /// `UCVTF` (vector) on 32-bit lanes of `n`.
+    /// `UCVTF` (vector) on 32-bit lanes of `n`, fixed-point like `FromInt`.
     FromUint,
     /// `FCVTZS` (or `FCVTZU` when `unsigned`) on S lanes of `n`; the fixed-point form when the
     /// instruction is a shift by immediate, which scales `n` by its `2^fbits` first.
@@ -246,6 +247,13 @@ const fn field(word: u32, low: u32, bits: u32) -> u8 {
 /// returns false.
 pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
     let fp = if word >> 22 & 1 != 0 { Fp::D } else { Fp::S };
+    let fixed_point = |masked: u32| match masked {
+        0x0f20_e400 => Some(LaneOp::FromInt),
+        0x2f20_e400 => Some(LaneOp::FromUint),
+        0x0f20_fc00 => Some(LaneOp::ToInt { unsigned: false }),
+        0x2f20_fc00 => Some(LaneOp::ToInt { unsigned: true }),
+        _ => None,
+    };
     let vector_lanes = match (fp, word >> 30 & 1 != 0) {
         (Fp::S, true) => 4,
         (Fp::S, false) | (Fp::D, true) => 2,
@@ -321,9 +329,10 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         .filter(|&op| !matches!(op, LaneOp::FromInt | LaneOp::FromUint))
     {
         (op, false, 1)
-    } else if matches!(word & 0xbfe0_fc00, 0x0f20_fc00 | 0x2f20_fc00) {
-        let unsigned = word >> 29 & 1 != 0;
-        (LaneOp::ToInt { unsigned }, false, vector_lanes)
+    } else if let Some(op) = fixed_point(word & 0xbfe0_fc00) {
+        (op, false, vector_lanes)
+    } else if let Some(op) = fixed_point(word & 0xffe0_fc00 ^ 0x5000_0000) {
+        (op, false, 1)
     } else if let Some(op) = three_same {
         (op, false, vector_lanes)
     } else if word & 0xffa0_fc00 == 0x7ea0_d400 {
@@ -608,6 +617,16 @@ impl Emitter<'_> {
                 dynasm!(self.asm ; .arch x64 ; vfnmadd231ps Rx(d), Rx(n), Rx(b))
             }
             (LaneOp::Mls, Fp::D) => self.fma231pd(0xbc, d, n, b),
+        }
+        if matches!(op, LaneOp::FromInt | LaneOp::FromUint) && word >> 24 & 1 != 0 {
+            let fbits = 64 - (word >> 16 & 0x7f) as i32;
+            dynasm!(self.asm
+                ; .arch x64
+                ; mov eax, (127 - fbits) << 23
+                ; movd xmm15, eax
+                ; pshufd xmm15, xmm15, 0
+                ; mulps Rx(d), xmm15
+            );
         }
         let converts = matches!(
             op,

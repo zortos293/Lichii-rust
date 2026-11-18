@@ -1,8 +1,9 @@
 //! Guest time for one session: the CPU's system counter, frozen while the session is paused.
 
 use std::cell::Cell;
+use std::sync::Barrier;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering, fence};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use std::time::{Duration, Instant};
 
 use lichii_common::ConsoleGeneration;
@@ -54,48 +55,194 @@ fn scaled(tsc: u64, mul: u64) -> u64 {
     ((u128::from(tsc) * u128::from(mul)) >> SHIFT) as u64
 }
 
-/// The host TSC frequency, measured once per process; `None` unless the TSC is invariant, `rdtscp`
-/// can read it, and the OS itself keeps time with it, which is its guarantee that the TSC agrees
-/// across cores.
+/// The host TSC frequency, measured once per process; `None` unless the TSC is invariant,
+/// `rdtscp` can read it, the OS does not keep time with another clock, and the startup calibration
+/// passes. Without it, every counter read calls [`GuestClock::ticks`].
 fn trusted_tsc_hz() -> Option<u64> {
     static HZ: OnceLock<Option<u64>> = OnceLock::new();
-    *HZ.get_or_init(|| {
-        if tsc_is_usable() && os_clock_is_tsc() {
-            measure_tsc_hz()
-        } else {
-            None
-        }
-    })
+    *HZ.get_or_init(|| accepted_tsc_hz(tsc_is_usable() && os_clock_may_be_tsc(), calibrate_tsc))
 }
 
+/// What the startup calibration measured: the TSC rate against [`Instant`] over two back-to-back
+/// 10 ms windows, and whether [`tsc_is_synchronized`] confirmed every processor agrees.
+struct Calibration {
+    rates: [u64; 2],
+    synchronized: bool,
+}
+
+/// The TSC frequency to count guest time with, or `None` to fall back to [`Instant`]. The TSC
+/// has to be invariant, keep one rate across both windows (within 0.1%) and be confirmed
+/// synchronized across processors; `calibrate` runs only for an invariant TSC.
+fn accepted_tsc_hz(
+    invariant: bool,
+    calibrate: impl FnOnce() -> Option<Calibration>,
+) -> Option<u64> {
+    if !invariant {
+        return None;
+    }
+    let Calibration {
+        rates: [first, second],
+        synchronized,
+    } = calibrate()?;
+    (synchronized && first.abs_diff(second) <= first / 1000).then_some(first / 2 + second / 2)
+}
+
+/// Linux names the clocksource it keeps time with, and switches away from the TSC when its own
+/// checks find it unsynchronized across cores.
 #[cfg(target_os = "linux")]
-fn os_clock_is_tsc() -> bool {
+fn os_clock_may_be_tsc() -> bool {
     std::fs::read_to_string("/sys/devices/system/clocksource/clocksource0/current_clocksource")
         .is_ok_and(|source| source.trim() == "tsc")
 }
 
-#[cfg(not(target_os = "linux"))]
-fn os_clock_is_tsc() -> bool {
+/// Windows doesn't say which clock it keeps time with, so the calibration alone decides.
+#[cfg(windows)]
+fn os_clock_may_be_tsc() -> bool {
+    true
+}
+
+/// Elsewhere there is no way to probe every processor, so guest time stays on [`Instant`].
+#[cfg(not(any(target_os = "linux", windows)))]
+fn os_clock_may_be_tsc() -> bool {
     false
 }
 
-/// The TSC frequency against [`Instant`] over 20 ms. Each endpoint is an `Instant` read between
-/// two TSC reads at most 100 000 cycles apart, so a preempted sample is retried instead of skewing
-/// the rate.
-fn measure_tsc_hz() -> Option<u64> {
+/// Each sample is an `Instant` read between two TSC reads at most 10 000 cycles apart, so a
+/// preempted sample is retried instead of skewing a rate.
+fn calibrate_tsc() -> Option<Calibration> {
     let sample = || {
         (0..100).find_map(|_| {
             let before = read_tsc()?;
             let now = Instant::now();
             let after = read_tsc()?;
-            (after - before < 100_000).then(|| (now, before + (after - before) / 2))
+            (after - before < 10_000).then(|| (now, before + (after - before) / 2))
         })
     };
-    let (start, start_tsc) = sample()?;
-    std::thread::sleep(Duration::from_millis(20));
-    let (end, end_tsc) = sample()?;
-    let ns = end.duration_since(start).as_nanos();
-    u64::try_from(u128::from(end_tsc - start_tsc) * 1_000_000_000 / ns).ok()
+    let rate = |(start, start_tsc): (Instant, u64), (end, end_tsc): (Instant, u64)| {
+        let ns = end.duration_since(start).as_nanos();
+        u64::try_from(u128::from(end_tsc - start_tsc) * 1_000_000_000 / ns).ok()
+    };
+    let first = sample()?;
+    std::thread::sleep(Duration::from_millis(10));
+    let middle = sample()?;
+    std::thread::sleep(Duration::from_millis(10));
+    let last = sample()?;
+    Some(Calibration {
+        rates: [rate(first, middle)?, rate(middle, last)?],
+        synchronized: tsc_is_synchronized(),
+    })
+}
+
+/// Whether the TSCs of every processor guest threads may run on agree, tested the way Linux's
+/// `check_tsc_warp` does. One thread per processor, pinned to it where [`probe_processors`]
+/// names one, starts behind a barrier; the threads take turns in ticket order to read the TSC,
+/// and a read below the one before it means its processor's TSC lags another's. Each thread
+/// takes turns for at least 10 ms and until it has had 10, for at most 50 ms. `false` too when a
+/// thread could not be pinned or had fewer than 10 turns, since then its processor went
+/// unchecked.
+fn tsc_is_synchronized() -> bool {
+    let Some(processors) = probe_processors() else {
+        return false;
+    };
+    let (next, serving) = (AtomicU64::new(0), AtomicU64::new(0));
+    let last = AtomicU64::new(0);
+    let warped = AtomicBool::new(false);
+    let start = Barrier::new(processors.len());
+    std::thread::scope(|scope| {
+        let probes: Vec<_> = processors
+            .iter()
+            .map(|&processor| {
+                let (next, serving, last, warped, start) =
+                    (&next, &serving, &last, &warped, &start);
+                scope.spawn(move || {
+                    let pinned = processor.is_none_or(pin_current_thread);
+                    start.wait();
+                    if !pinned {
+                        return 0;
+                    }
+                    let begun = Instant::now();
+                    let mut turns = 0;
+                    while !warped.load(Ordering::Relaxed) {
+                        let elapsed = begun.elapsed();
+                        if elapsed >= Duration::from_millis(50)
+                            || (elapsed >= Duration::from_millis(10) && turns >= 10)
+                        {
+                            break;
+                        }
+                        let ticket = next.fetch_add(1, Ordering::Relaxed);
+                        while serving.load(Ordering::Acquire) != ticket {
+                            std::hint::spin_loop();
+                        }
+                        let now = read_tsc().unwrap_or(0);
+                        if now < last.load(Ordering::Relaxed) {
+                            warped.store(true, Ordering::Relaxed);
+                        }
+                        last.store(now, Ordering::Relaxed);
+                        serving.store(ticket + 1, Ordering::Release);
+                        turns += 1;
+                    }
+                    turns
+                })
+            })
+            .collect();
+        let turns: Vec<u32> = probes
+            .into_iter()
+            .map(|probe| probe.join().unwrap_or(0))
+            .collect();
+        !warped.load(Ordering::Relaxed) && turns.iter().all(|&turns| turns >= 10)
+    })
+}
+
+/// The processors to probe: on Linux, as many unpinned threads as it schedules this process on,
+/// since its own checks already cover every processor; on Windows, each processor in the
+/// process's affinity mask. `None` on a Windows host with several processor groups, where
+/// threads can leave the mask's group.
+#[cfg(target_os = "linux")]
+fn probe_processors() -> Option<Vec<Option<usize>>> {
+    let count = std::thread::available_parallelism().map_or(2, |n| n.get().max(2));
+    Some(vec![None; count])
+}
+
+#[cfg(windows)]
+fn probe_processors() -> Option<Vec<Option<usize>>> {
+    use windows_sys::Win32::System::Threading::{
+        GetActiveProcessorGroupCount, GetCurrentProcess, GetProcessAffinityMask,
+    };
+    let (mut process, mut system) = (0usize, 0usize);
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle valid for this process, and the
+    // masks are written only into the two locals.
+    let read = unsafe {
+        GetActiveProcessorGroupCount() == 1
+            && GetProcessAffinityMask(GetCurrentProcess(), &mut process, &mut system) != 0
+    };
+    let processors: Vec<_> = (0..usize::BITS as usize)
+        .filter(|&bit| process & (1 << bit) != 0)
+        .map(Some)
+        .collect();
+    (read && !processors.is_empty()).then_some(processors)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn probe_processors() -> Option<Vec<Option<usize>>> {
+    None
+}
+
+#[cfg(windows)]
+fn pin_current_thread(processor: usize) -> bool {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
+    // SAFETY: `GetCurrentThread` returns a pseudo-handle valid for the calling thread, a probe
+    // that exits when the check ends, so its affinity changes nothing else.
+    unsafe { SetThreadAffinityMask(GetCurrentThread(), 1 << processor) != 0 }
+}
+
+#[cfg(not(windows))]
+fn pin_current_thread(_processor: usize) -> bool {
+    false
+}
+
+#[cfg(test)]
+fn measure_tsc_hz() -> Option<u64> {
+    calibrate_tsc().map(|calibration| calibration.rates[0])
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -305,6 +452,35 @@ mod tests {
     thread_local! {
         /// Cycles this thread's TSC reads run ahead, standing in for a core whose TSC is skewed.
         pub(super) static SKEW: Cell<u64> = const { Cell::new(0) };
+    }
+
+    #[test]
+    fn the_tsc_is_trusted_only_when_invariant_and_calibrated() {
+        let calibration = |rates, synchronized| {
+            move || {
+                Some(Calibration {
+                    rates,
+                    synchronized,
+                })
+            }
+        };
+        let hz = 3_000_000_000;
+        assert_eq!(
+            accepted_tsc_hz(false, || panic!("calibrated a variant TSC")),
+            None
+        );
+        assert_eq!(accepted_tsc_hz(true, || None), None);
+        assert_eq!(accepted_tsc_hz(true, calibration([hz, hz], false)), None);
+        assert_eq!(
+            accepted_tsc_hz(true, calibration([hz, hz + hz / 999], true)),
+            None
+        );
+        assert_eq!(
+            accepted_tsc_hz(true, calibration([hz, hz + 2_000], true)),
+            Some(hz + 1_000)
+        );
+        let timing = CoreTiming::with_tsc_hz(ConsoleGeneration::Switch2, None);
+        assert!(timing.host_tsc_scale().is_none());
     }
 
     #[test]

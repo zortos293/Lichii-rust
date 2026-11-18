@@ -250,6 +250,12 @@ impl ConfigWindow {
                             "Apply Lichii's patches for known game builds",
                         )
                     });
+                    row(ui, "Mario Kart World", |ui| {
+                        ui.checkbox(
+                            &mut d.system.mkw_dynamic_fps,
+                            "Dynamic FPS: full game speed when frames run slow",
+                        )
+                    });
                 });
                 note(
                     ui,

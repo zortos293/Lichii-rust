@@ -124,6 +124,7 @@ fn mme64_memo_matches_interpreter() {
     let stats = differential(MacroIsa::Mme64, None).stats();
     assert!(stats.replayed > 4_000, "{stats:?}");
     assert!(stats.memo.slot_hits > 0, "{stats:?}");
+    assert!(stats.memo.hot_hits > 0, "{stats:?}");
     assert!(stats.memo.guard_failures > 0, "{stats:?}");
     assert_eq!(stats.failed, 0);
 }

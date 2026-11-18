@@ -4,15 +4,17 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use lichii_common::{ResultCode, VAddr};
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use super::message::{DomainCommand, HANDLES_OFFSET, ReplyKind, encode_reply};
 use super::{CommandType, HleRequestContext, SessionHandler, UNKNOWN_COMMAND_ID};
 use crate::handle_table::{CURRENT_PROCESS, CURRENT_THREAD};
 use crate::object::KObject;
 use crate::result;
+use crate::scheduler::{next_poll_window, poll_flag};
 use crate::thread::{Thread, WakeResult};
 
 /// Largest message read from a user buffer (`SendSyncRequestWithUserBuffer`).
@@ -50,6 +52,10 @@ struct Shared {
     name: String,
     queue: Mutex<Queue>,
     ready: Condvar,
+    /// Set under the queue lock when a request arrives or the thread stops, so an idle thread can
+    /// poll for one without the lock.
+    queued: AtomicBool,
+    poll_limit_ns: u64,
 }
 
 /// A host thread that serves HLE sessions one request at a time. Every session belongs to one
@@ -58,7 +64,8 @@ struct Shared {
 pub struct ServiceThread(Arc<Shared>);
 
 impl ServiceThread {
-    pub(crate) fn new(name: &str) -> Self {
+    /// `poll` bounds how long the thread, once idle, polls for its next request before it parks.
+    pub(crate) fn new(name: &str, poll: Duration) -> Self {
         Self(Arc::new(Shared {
             name: name.into(),
             queue: Mutex::new(Queue {
@@ -66,6 +73,8 @@ impl ServiceThread {
                 stopped: false,
             }),
             ready: Condvar::new(),
+            queued: AtomicBool::new(false),
+            poll_limit_ns: poll.as_nanos().min(u128::from(u64::MAX)) as u64,
         }))
     }
 
@@ -97,6 +106,7 @@ impl ServiceThread {
         let dropped = {
             let mut queue = self.0.queue.lock();
             queue.stopped = true;
+            self.0.queued.store(true, Ordering::Release);
             std::mem::take(&mut queue.requests)
         };
         self.0.ready.notify_all();
@@ -109,26 +119,47 @@ impl ServiceThread {
             return;
         }
         queue.requests.push_back(pending);
+        self.0.queued.store(true, Ordering::Release);
         drop(queue);
         self.0.ready.notify_one();
     }
 
     fn run(&self) {
         let mut ctx = HleRequestContext::new();
-        loop {
-            let pending = {
-                let mut queue = self.0.queue.lock();
-                loop {
-                    if queue.stopped {
-                        return;
-                    }
-                    if let Some(pending) = queue.requests.pop_front() {
-                        break pending;
-                    }
-                    self.0.ready.wait(&mut queue);
-                }
-            };
+        let mut poll = self.0.poll_limit_ns;
+        while let Some(pending) = self.next(&mut poll) {
             self.serve(&mut ctx, pending);
+        }
+    }
+
+    /// The next request, or `None` once the thread stops. With nothing queued, the thread polls
+    /// for a request for up to `poll` ns before it parks, and adapts `poll` to how long it waited
+    /// as idle cores do.
+    fn next(&self, poll: &mut u64) -> Option<Pending> {
+        let limit = self.0.poll_limit_ns;
+        let mut queue = self.0.queue.lock();
+        let mut idle_since: Option<Instant> = None;
+        let mut polled = false;
+        loop {
+            if queue.stopped {
+                return None;
+            }
+            if let Some(pending) = queue.requests.pop_front() {
+                if let Some(start) = idle_since {
+                    let waited = start.elapsed().as_nanos().min(u128::from(u64::MAX));
+                    *poll = next_poll_window(*poll, waited as u64, limit);
+                }
+                return Some(pending);
+            }
+            let start = *idle_since.get_or_insert_with(Instant::now);
+            if limit != 0 && !polled {
+                polled = true;
+                self.0.queued.store(false, Ordering::Relaxed);
+                let deadline = start + Duration::from_nanos(*poll);
+                MutexGuard::unlocked(&mut queue, || poll_flag(&self.0.queued, deadline));
+                continue;
+            }
+            self.0.ready.wait(&mut queue);
         }
     }
 

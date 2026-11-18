@@ -12,9 +12,9 @@ use lichii_fs::ips::{IpSwitch, Ips, parse_build_id};
 use lichii_fs::romfs::{RomfsExt, build_romfs, open_romfs};
 use lichii_fs::{DirRef, Directory, DirectoryExt, EntryKind, FileExt, FileRef, LayeredDir};
 
-use crate::builtin;
 use crate::error::LoaderResult;
 use crate::program::Module;
+use crate::{builtin, mkw};
 
 const NSO_HEADER_SIZE: usize = 0x100;
 
@@ -29,6 +29,8 @@ pub struct ModOptions {
     pub disabled: Vec<String>,
     /// Apply the patches Lichii carries for known game builds (on by default).
     pub builtin_patches: bool,
+    /// Put Mario Kart World in its dynamic FPS mode ([`crate::mkw`]; off by default).
+    pub mkw_dynamic_fps: bool,
 }
 
 impl Default for ModOptions {
@@ -38,6 +40,7 @@ impl Default for ModOptions {
             sdmc_root: None,
             disabled: Vec::new(),
             builtin_patches: true,
+            mkw_dynamic_fps: false,
         }
     }
 }
@@ -57,6 +60,7 @@ pub struct Mods {
     mods: Vec<ModDir>,
     program_id: u64,
     builtin_patches: bool,
+    mkw_dynamic_fps: bool,
 }
 
 impl Mods {
@@ -105,6 +109,7 @@ impl Mods {
                 .collect(),
             program_id,
             builtin_patches: options.builtin_patches,
+            mkw_dynamic_fps: options.mkw_dynamic_fps,
         })
     }
 
@@ -137,8 +142,10 @@ impl Mods {
     /// `@nsobid` matches it, from every mod's `exefs/`. Offsets count the 0x100-byte NSO
     /// header, as mods are written against the NSO file, and reach into .bss: a patched module's
     /// image then covers its whole size. A patch that fails to parse or apply is logged and
-    /// skipped. The built-in patches for the module's build then apply over them.
-    pub fn patch_modules(&self, modules: &mut [Module]) -> LoaderResult<()> {
+    /// skipped. The built-in patches for the module's build then apply over them, and then an
+    /// opt-in mode such as Mario Kart World's dynamic FPS. Returns the swap interval such a mode
+    /// makes the title's presents follow, overriding the one each present names.
+    pub fn patch_modules(&self, modules: &mut [Module]) -> LoaderResult<Option<u32>> {
         let mut patches: Vec<(String, [u8; 32], ExefsPatch)> = Vec::new();
         for exefs in self.subdirs("exefs")? {
             let mut entries = exefs.entries()?;
@@ -168,7 +175,7 @@ impl Mods {
                 }
             }
         }
-        for module in modules {
+        for module in modules.iter_mut() {
             let mut target: Option<Vec<u8>> = None;
             for (name, _, patch) in patches.iter().filter(|p| p.1 == module.build_id) {
                 tracing::info!("{}: applying {name}", module.name);
@@ -194,7 +201,13 @@ impl Mods {
                 builtin::apply(self.program_id, module, original.as_deref());
             }
         }
-        Ok(())
+        let dynamic_fps = self.mkw_dynamic_fps
+            && self.program_id == mkw::MARIO_KART_WORLD
+            && modules
+                .iter_mut()
+                .find(|module| module.name == "main")
+                .is_some_and(mkw::apply_dynamic_fps);
+        Ok(dynamic_fps.then_some(mkw::DYNAMIC_FPS_PRESENT_INTERVAL))
     }
 
     /// LayeredFS: rebuilds the RomFS with every mod's `romfs/` and `romfslite/` over the
