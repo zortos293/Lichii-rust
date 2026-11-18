@@ -923,6 +923,13 @@ impl VulkanRasterizer {
             flushed_images = collector.flushed - since.collector.flushed,
             evicted_buffers = buffers.evicted_buffers - since.buffers.evicted_buffers,
             evicted_buffer_mib = (buffers.evicted_bytes - since.buffers.evicted_bytes) >> 20,
+            create_evicted_images = collector.create_evicted - since.collector.create_evicted,
+            create_evicted_image_mib =
+                (collector.create_evicted_bytes - since.collector.create_evicted_bytes) >> 20,
+            create_evicted_buffers =
+                buffers.create_evicted_buffers - since.buffers.create_evicted_buffers,
+            create_evicted_buffer_mib =
+                (buffers.create_evicted_bytes - since.buffers.create_evicted_bytes) >> 20,
             "GPU memory"
         );
         self.activity = Activity {

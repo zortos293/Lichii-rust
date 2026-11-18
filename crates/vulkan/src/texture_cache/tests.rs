@@ -1847,6 +1847,7 @@ fn collector_evicts_least_recently_used_images_first() {
             evicted: 2,
             evicted_bytes: 2 * size,
             flushed: 0,
+            ..CollectorStats::default()
         }
     );
     let live =
@@ -1908,6 +1909,7 @@ fn collector_flushes_gpu_modified_images_before_evicting_them() {
             evicted: 1,
             evicted_bytes: f.cache.stats.evicted_bytes,
             flushed: 1,
+            ..CollectorStats::default()
         }
     );
     assert!(f.cache.collector_stats().evicted_bytes >= size);
@@ -2240,6 +2242,438 @@ fn collector_keeps_entries_work_in_flight_uses() {
     f.tick_budget(2, true);
     assert!(f.cache.get(recent).is_none() && !f.buffers.is_cached(BUFFER));
     f.assert_no_validation_errors();
+}
+
+/// The caches' images and cached buffers together.
+fn cached(f: &Fixture) -> u64 {
+    f.image_bytes() + f.buffers.cached().bytes
+}
+
+/// A 128x128 RGBA8 texture at slot \`i\` of the region \`region\` MiB into the guest memory.
+fn tic_at(region: u64, i: u64) -> TicEntry {
+    tic(
+        0x08,
+        GPU_VA + (region << 20) + i * 0x1_0000,
+        128,
+        128,
+        1,
+        1,
+        2,
+    )
+}
+
+/// Ages everything cached for RECENT_AGE frames under the cache budget of \`device_local\`
+/// bytes of heaps, with the caches under its expected line so the collector does nothing.
+fn age(f: &mut Fixture, device_local: u64) {
+    for _ in 0..=RECENT_AGE {
+        f.tick_budget(device_local, true);
+    }
+    assert_eq!(
+        f.cache.collector_stats().evicted,
+        0,
+        "under the expected line"
+    );
+}
+
+/// A scene transition past the cache budget: the old scene's 8 buffers and 22 images stay
+/// cached unused, then 32 new images arrive within one frame, before the collector runs again.
+/// Each creation past the critical line first evicts the least recently used old entries,
+/// buffers included, so the caches never end a creation past the line, where without it they
+/// end the burst 22 entries past it.
+#[test]
+fn evict_before_create_holds_a_scene_transition_burst_to_the_critical_line() {
+    const BUFFERS: DAddr = DADDR + (32 << 20);
+    let Some(mut f) = fixture(GobLayout::Switch2, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    for i in 0..8 {
+        f.buffer(BUFFERS + i * 0x1_0000, 0x1_0000);
+    }
+    f.tick_budget(HUGE_BUDGET, true);
+    let old: Vec<_> = (0..22).map(|i| f.texture(&tic_at(0, i)).0).collect();
+    let size = f.cache.get(old[0]).unwrap().image.memory_size();
+    assert_eq!(size, 0x1_0000, "an image holds as much as a buffer");
+    let device_local = 64 * size;
+    age(&mut f, device_local);
+    let critical = f.cache.budget().critical;
+    assert_eq!(critical, 40 * size);
+
+    let mut peak = 0;
+    let new: Vec<_> = (0..32)
+        .map(|i| {
+            let id = f.texture(&tic_at(8, i)).0;
+            peak = peak.max(cached(&f));
+            id
+        })
+        .collect();
+    assert_eq!(
+        peak,
+        critical,
+        "the caches went {} entries past the critical line",
+        peak.saturating_sub(critical) / size
+    );
+    let stats = f.cache.collector_stats();
+    assert_eq!(
+        (stats.create_evicted, stats.create_evicted_bytes),
+        (14, 14 * size)
+    );
+    let buffers = f.buffers.stats();
+    assert_eq!(
+        (buffers.create_evicted_buffers, buffers.create_evicted_bytes),
+        (8, 8 * size),
+        "the older buffers went first"
+    );
+    assert_eq!(buffers.evicted_buffers, 8);
+    assert_eq!(stats.evicted, 14);
+    let live = |ids: &[ImageId]| ids.iter().filter(|&&id| f.cache.get(id).is_some()).count();
+    assert!(old[..14].iter().all(|&id| f.cache.get(id).is_none()));
+    assert_eq!(live(&old), 8, "the 8 more recently used old images stayed");
+    assert_eq!(live(&new), 32, "every new image stayed");
+    f.tick_budget(device_local, true);
+    f.assert_no_validation_errors();
+}
+
+/// What the current frame bound stays however far past the critical line the caches get: a
+/// texture and a buffer used earlier in the frame, and the images created after them in it.
+/// Only the old entries go, and with none left the new images are created anyway.
+#[test]
+fn evict_before_create_never_takes_what_this_frame_bound() {
+    const BUFFERS: DAddr = DADDR + (32 << 20);
+    let Some(mut f) = fixture(GobLayout::Switch2, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    for i in 0..2 {
+        f.buffer(BUFFERS + i * 0x1_0000, 0x1_0000);
+    }
+    f.tick_budget(HUGE_BUDGET, true);
+    let old: Vec<_> = (0..5).map(|i| f.texture(&tic_at(0, i)).0).collect();
+    let size = f.cache.get(old[0]).unwrap().image.memory_size();
+    let device_local = 16 * size;
+    age(&mut f, device_local);
+    assert_eq!(f.cache.budget().critical, 10 * size);
+
+    f.buffer(BUFFERS, 0x1_0000);
+    assert_eq!(
+        f.texture(&tic_at(0, 0)).0,
+        old[0],
+        "bound earlier in the frame"
+    );
+    let new: Vec<_> = (0..12).map(|i| f.texture(&tic_at(8, i)).0).collect();
+    assert!(f.buffers.is_cached(BUFFERS), "the bound buffer stayed");
+    assert!(
+        !f.buffers.is_cached(BUFFERS + 0x1_0000),
+        "the unused one went"
+    );
+    assert!(f.cache.get(old[0]).is_some(), "the bound texture stayed");
+    assert!(old[1..].iter().all(|&id| f.cache.get(id).is_none()));
+    assert!(
+        new.iter().all(|&id| f.cache.get(id).is_some()),
+        "no image created this frame took another"
+    );
+    assert_eq!(f.cache.collector_stats().create_evicted, 4);
+    assert_eq!(f.buffers.stats().create_evicted_buffers, 1);
+    assert_eq!(
+        cached(&f),
+        14 * size,
+        "past the line with nothing left to evict"
+    );
+    f.tick_budget(device_local, true);
+    f.assert_no_validation_errors();
+}
+
+/// A GPU-modified image past the critical line is not dropped by a creation: it stays until
+/// the collector read it back, and its texels reach guest memory before it goes.
+#[test]
+fn evict_before_create_leaves_gpu_modified_images_to_the_read_back() {
+    let gob = GobLayout::Switch2;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let info = rt_info(128, 128, 2, gob);
+    let target = clear_rt_at(&mut f, GPU_VA, &info, [0.0, 1.0, 0.0, 1.0], Rect::ALL).id;
+    let old: Vec<_> = (0..4).map(|i| f.texture(&tic_at(1, i)).0).collect();
+    let size = f.cache.get(old[0]).unwrap().image.memory_size();
+    assert_eq!(f.cache.get(target).unwrap().image.memory_size(), size);
+    let device_local = 16 * size;
+    age(&mut f, device_local);
+    let new: Vec<_> = (0..10).map(|i| f.texture(&tic_at(8, i)).0).collect();
+    assert!(
+        old.iter().all(|&id| f.cache.get(id).is_none()),
+        "the clean ones went"
+    );
+    assert!(f.cache.get(target).is_some(), "the render target stayed");
+    assert!(new.iter().all(|&id| f.cache.get(id).is_some()));
+    assert_eq!(f.cache.collector_stats().create_evicted, 4);
+    assert_eq!(f.cache.collector_stats().flushed, 0);
+    let tiling = Tiling::new(128, 128, 1, 4, 2, 0, gob);
+    let guest = |f: &Fixture| {
+        let mut tiled = vec![0; tiling.size_bytes()];
+        f.memory.read_bytes(DADDR, &mut tiled).unwrap();
+        tiled
+    };
+    assert!(guest(&f).iter().all(|&b| b == 0), "not written back yet");
+
+    for _ in 0..3 {
+        f.tick_budget(device_local, true);
+    }
+    assert!(f.cache.get(target).is_none(), "the collector took it");
+    assert_eq!(f.cache.collector_stats().flushed, 1, "after its read-back");
+    assert!(
+        guest(&f)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|t| *t == [0, 255, 0, 255]),
+        "its texels reached guest memory"
+    );
+    f.assert_no_validation_errors();
+}
+
+/// Buffer creations past the critical line evict the least recently used old buffers first,
+/// never one acquired this frame.
+#[test]
+fn evict_before_create_holds_buffer_creations_to_the_critical_line() {
+    const BUFFERS: DAddr = DADDR + (32 << 20);
+    let Some(mut f) = fixture(GobLayout::Switch2, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let at = |i: u64| BUFFERS + i * 0x2_0000;
+    for i in 0..6 {
+        f.buffer(at(i), 0x1_0000);
+    }
+    let device_local = 16 * 0x1_0000;
+    age(&mut f, device_local);
+    assert_eq!(f.cache.budget().critical, 10 * 0x1_0000);
+
+    f.buffer(at(0), 0x1_0000);
+    let mut peak = 0;
+    for i in 6..16 {
+        f.buffer(at(i), 0x1_0000);
+        peak = peak.max(cached(&f));
+    }
+    let stats = f.buffers.stats();
+    assert_eq!(
+        (stats.create_evicted_buffers, stats.create_evicted_bytes),
+        (5, 5 * 0x1_0000)
+    );
+    assert!(
+        f.buffers.is_cached(at(0)),
+        "the buffer acquired this frame stayed"
+    );
+    assert!((1..6).all(|i| !f.buffers.is_cached(at(i))));
+    assert!((6..16).all(|i| f.buffers.is_cached(at(i))));
+    assert_eq!(
+        peak,
+        11 * 0x1_0000,
+        "past the line only once nothing was left"
+    );
+    f.tick_budget(device_local, true);
+    f.assert_no_validation_errors();
+}
+
+/// Under the critical line creations evict nothing: on a mixed workload of textures, render
+/// targets and buffers that holds the caches between the expected and critical lines, the
+/// collector evicts exactly what it did before evict-before-create (main d3bf254).
+#[test]
+fn evict_before_create_changes_nothing_under_the_critical_line() {
+    const BUFFERS: DAddr = DADDR + (32 << 20);
+    let gob = GobLayout::Switch2;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let size = 0x1_0000;
+    let device_local = 64 * size;
+    let info = rt_info(128, 128, 2, gob);
+    let mut peak = 0;
+    for frame in 0..160u64 {
+        let n = frame / 2;
+        match (frame % 2, n % 4) {
+            (1, _) => {}
+            (_, 1) => {
+                f.buffer(BUFFERS + n * 0x2_0000, 0x1_0000);
+            }
+            (_, 3) if n % 8 == 3 => {
+                let va = GPU_VA + (16 << 20) + n * 0x1_0000;
+                clear_rt_at(&mut f, va, &info, [1.0; 4], Rect::ALL);
+            }
+            _ => {
+                f.texture(&tic_at(0, n));
+            }
+        }
+        for back in 1..6 {
+            if let Some(earlier) = n.checked_sub(back * 4) {
+                f.texture(&tic_at(0, earlier - earlier % 2));
+            }
+        }
+        peak = peak.max(cached(&f));
+        f.tick_budget(device_local, true);
+    }
+    let budget = f.cache.budget();
+    assert!(peak > budget.expected && peak < budget.critical);
+    let (stats, buffers) = (f.cache.collector_stats(), f.buffers.stats());
+    assert_eq!(
+        (stats.create_evicted, buffers.create_evicted_buffers),
+        (0, 0)
+    );
+    assert_eq!(
+        (
+            stats.evicted,
+            stats.evicted_bytes,
+            stats.flushed,
+            buffers.evicted_buffers,
+            buffers.evicted_bytes
+        ),
+        (30, 30 * size, 0, 16, 16 * size),
+        "what the collector evicts on main"
+    );
+    f.assert_no_validation_errors();
+}
+
+/// A render target marks its device pages in the written-pages bitmap on its first GPU write
+/// only, and again once a remap backs the sparse page of its window: that page is marked too.
+#[test]
+fn gpu_writes_mark_the_pages_of_each_mapping_of_a_target() {
+    const HOLE: u64 = 1;
+    const BACKED: DAddr = DADDR + 0x90_0000;
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    f.gmmu.map_sparse(REMAP_VA, 4 * 0x1000, false).unwrap();
+    for page in (0..4).filter(|&p| p != HOLE) {
+        f.gmmu
+            .map(
+                REMAP_VA + page * 0x1000,
+                REMAP_DADDR + page * 0x1000,
+                0x1000,
+                0,
+                false,
+            )
+            .unwrap();
+    }
+    let info = rt_info(64, 64, 2, GobLayout::Tegra);
+    let target = |f: &mut Fixture| {
+        let (mut tx, cache, gmmu) = f.tx();
+        cache
+            .render_target(&mut tx, gmmu, REMAP_VA, &info, true)
+            .unwrap()
+            .unwrap()
+            .id
+    };
+    let id = target(&mut f);
+    assert!(!f.cache.written_pages.may_be_written(REMAP_DADDR, 0x4000));
+    f.cache.mark_modified(id);
+    assert!(f.cache.written_pages.may_be_written(REMAP_DADDR, 0x1000));
+    assert!(
+        f.cache
+            .written_pages
+            .may_be_written(REMAP_DADDR + 0x3000, 0x1000)
+    );
+    let image = f.cache.get(id).unwrap();
+    assert_eq!(image.marked, image.serial);
+    f.cache.mark_modified(id);
+    f.gmmu
+        .map(REMAP_VA + HOLE * 0x1000, BACKED, 0x1000, 0, false)
+        .unwrap();
+    f.cache.invalidate_lookups();
+    assert_eq!(target(&mut f), id, "the remap keeps the image");
+    assert!(
+        f.cache
+            .get(id)
+            .unwrap()
+            .segments
+            .iter()
+            .any(|s| s.daddr == BACKED)
+    );
+    assert!(!f.cache.written_pages.may_be_written(BACKED, 0x1000));
+    f.cache.mark_modified(id);
+    assert!(
+        f.cache.written_pages.may_be_written(BACKED, 0x1000),
+        "the newly backed page is marked"
+    );
+    f.assert_no_validation_errors();
+}
+
+/// The cost of marking a drawn 1920x1088 A8B8G8R8 render target GPU-modified again, as every
+/// draw into it does: `cargo test --release -p lichii-vulkan --lib mark_modified_cost -- --ignored --nocapture`.
+#[test]
+#[ignore = "timing"]
+fn mark_modified_cost() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let info = rt_info(1920, 1088, 4, GobLayout::Tegra);
+    let id = {
+        let (mut tx, cache, gmmu) = f.tx();
+        cache
+            .render_target(&mut tx, gmmu, GPU_VA, &info, true)
+            .unwrap()
+            .unwrap()
+            .id
+    };
+    f.cache.mark_modified(id);
+    const CALLS: u32 = 2000;
+    let mut times = Vec::new();
+    for _ in 0..101 {
+        let start = Instant::now();
+        for _ in 0..CALLS {
+            f.cache.mark_modified(std::hint::black_box(id));
+        }
+        times.push(start.elapsed() / CALLS);
+    }
+    times.sort();
+    println!(
+        "mark_modified, 1920x1088 target: median {:?}, min {:?}",
+        times[times.len() / 2],
+        times[0]
+    );
+}
+
+/// The cost of one texture creation under the critical line, and past it with the least
+/// recently used entries old enough that each creation evicts one first, over 2000 cached
+/// images: \`cargo test -p lichii-vulkan --lib create_cost -- --ignored --nocapture\`.
+#[test]
+#[ignore = "timing"]
+fn create_cost() {
+    const OLD: u64 = 2000;
+    const NEW: u64 = 1000;
+    let Some(mut f) =
+        fixture_with_dram(GobLayout::Tegra, AstcRecompression::Uncompressed, 256 << 20)
+    else {
+        return;
+    };
+    let small = |i: u64| tic(0x08, GPU_VA + i * 0x1000, 16, 16, 1, 1, 0);
+    let median = |f: &mut Fixture, first: u64| {
+        let mut times: Vec<f64> = (first..first + NEW)
+            .map(|i| {
+                let tic = small(i);
+                let start = Instant::now();
+                f.texture(&tic);
+                start.elapsed().as_nanos() as f64
+            })
+            .collect();
+        f.scheduler.finish().unwrap();
+        times.sort_by(f64::total_cmp);
+        times[times.len() / 2]
+    };
+    for i in 0..OLD {
+        f.texture(&small(i));
+    }
+    for _ in 0..=RECENT_AGE {
+        f.tick_budget(HUGE_BUDGET, true);
+    }
+    let under = median(&mut f, OLD);
+    f.tick_budget(HUGE_BUDGET, true);
+    let cached = f.image_bytes() + f.buffers.cached().bytes;
+    f.tick_budget(cached * 32 / 25, true);
+    let before = f.cache.len();
+    let past = median(&mut f, OLD + NEW);
+    println!(
+        "per creation: under the critical line {:.1} us, past it {:.1} us ({} images live before, {} after)",
+        under / 1e3,
+        past / 1e3,
+        before,
+        f.cache.len()
+    );
 }
 
 /// The collector's cost per call over 2000 images and 3000 buffers: under the budget, past it
