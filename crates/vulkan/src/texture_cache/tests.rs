@@ -1376,6 +1376,114 @@ fn measures_upload_and_lookup_cost() {
     f.assert_no_validation_errors();
 }
 
+/// A texture header of `format` whose components are all floats.
+fn float_tic(
+    format: u32,
+    gpu_va: GpuVAddr,
+    width: u32,
+    height: u32,
+    levels: u32,
+    block_height_log2: u32,
+) -> TicEntry {
+    let mut header = tic(format, gpu_va, width, height, 1, levels, block_height_log2);
+    header.0[0] = (header.0[0] & !(0xfff << 7)) | 7 << 7 | 7 << 10 | 7 << 13 | 7 << 16;
+    header
+}
+
+/// Median nanoseconds of the CPU work of sampling `header` right after the GPU wrote
+/// `target`, which shares its bytes on another grid or format: one GPU overlap sync each.
+fn median_sync_ns(f: &mut Fixture, target: ImageId, header: &TicEntry) -> f64 {
+    let (id, _) = f.texture(header);
+    assert_ne!(id, target);
+    f.scheduler.finish().unwrap();
+    let mut samples = Vec::with_capacity(512);
+    for round in 0..512 {
+        f.cache.mark_modified(target);
+        let syncs = f.cache.traffic().gpu_syncs;
+        let start = Instant::now();
+        let (same, _) = f.texture(header);
+        samples.push(start.elapsed().as_nanos() as f64);
+        assert_eq!(same, id);
+        assert_eq!(
+            f.cache.traffic().gpu_syncs,
+            syncs + 1,
+            "one GPU sync per sample"
+        );
+        if round % 16 == 15 {
+            f.scheduler.finish().unwrap();
+        }
+    }
+    f.scheduler.finish().unwrap();
+    samples.sort_by(f64::total_cmp);
+    samples[samples.len() / 2]
+}
+
+/// Times the CPU cost of one GPU overlap sync of a sampled texture from a render target of
+/// another format, as Mario Kart World re-reads its targets, and of a mip chain whose base
+/// level a target of another format wrote: `cargo test --release -p lichii-vulkan --lib
+/// overlap_sync_timing -- --ignored --nocapture`.
+#[test]
+#[ignore = "timing"]
+fn overlap_sync_timing() {
+    let gob = GobLayout::Switch2;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let swapped = GPU_VA + (1 << 30);
+    for page in 0..0x80u64 {
+        f.gmmu
+            .map(
+                swapped + page * 0x1_0000,
+                DADDR + 0x100_0000 + (page ^ 1) * 0x1_0000,
+                0x1_0000,
+                0,
+                false,
+            )
+            .unwrap();
+    }
+    let float_target = |w: u32, h: u32| {
+        let mut info = rt_info(w, h, 4, gob);
+        info.format = PixelFormat::R16G16B16A16Float;
+        info.layer_stride = surface(info.format, w, h, 1, 1, 4, gob).layer_stride();
+        info
+    };
+    let mut cases = Vec::new();
+    for (name, va) in [("contiguous", GPU_VA), ("64 KiB pages swapped", swapped)] {
+        let target = clear_rt_at(
+            &mut f,
+            va,
+            &rt_info(1280, 720, 4, gob),
+            [0.0, 1.0, 0.0, 1.0],
+            Rect::ALL,
+        );
+        let header = float_tic(0x03, va, 640, 720, 1, 4);
+        let segments = f.cache.get(target.id).unwrap().segments.len();
+        let ns = median_sync_ns(&mut f, target.id, &header);
+        cases.push(format!(
+            "1280x720 A8B8G8R8 target sampled as 640x720 R16G16B16A16Float, {name} \
+             ({segments} segments): {ns:.0} ns"
+        ));
+    }
+    let va = GPU_VA + 0x80_0000;
+    let target = clear_rt_at(
+        &mut f,
+        va,
+        &float_target(512, 512),
+        [0.0, 0.0, 1.0, 1.0],
+        Rect::ALL,
+    );
+    let header = tic(0x08, va, 1024, 512, 1, 11, 4);
+    let ns = median_sync_ns(&mut f, target.id, &header);
+    cases.push(format!(
+        "512x512 R16G16B16A16Float target at the base of a 1024x512 A8B8G8R8 chain of 11 \
+         levels: {ns:.0} ns"
+    ));
+    for case in cases {
+        println!("{case}");
+    }
+    f.assert_no_validation_errors();
+}
+
 const HUGE_BUDGET: u64 = 1 << 40;
 
 #[test]
