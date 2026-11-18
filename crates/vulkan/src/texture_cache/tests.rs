@@ -2529,6 +2529,41 @@ fn evict_before_create_changes_nothing_under_the_critical_line() {
     f.assert_no_validation_errors();
 }
 
+/// The cost of marking a drawn 1920x1088 A8B8G8R8 render target GPU-modified again, as every
+/// draw into it does: `cargo test --release -p lichii-vulkan --lib mark_modified_cost -- --ignored --nocapture`.
+#[test]
+#[ignore = "timing"]
+fn mark_modified_cost() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let info = rt_info(1920, 1088, 4, GobLayout::Tegra);
+    let id = {
+        let (mut tx, cache, gmmu) = f.tx();
+        cache
+            .render_target(&mut tx, gmmu, GPU_VA, &info, true)
+            .unwrap()
+            .unwrap()
+            .id
+    };
+    f.cache.mark_modified(id);
+    const CALLS: u32 = 2000;
+    let mut times = Vec::new();
+    for _ in 0..101 {
+        let start = Instant::now();
+        for _ in 0..CALLS {
+            f.cache.mark_modified(std::hint::black_box(id));
+        }
+        times.push(start.elapsed() / CALLS);
+    }
+    times.sort();
+    println!(
+        "mark_modified, 1920x1088 target: median {:?}, min {:?}",
+        times[times.len() / 2],
+        times[0]
+    );
+}
+
 /// The cost of one texture creation under the critical line, and past it with the least
 /// recently used entries old enough that each creation evicts one first, over 2000 cached
 /// images: \`cargo test -p lichii-vulkan --lib create_cost -- --ignored --nocapture\`.
