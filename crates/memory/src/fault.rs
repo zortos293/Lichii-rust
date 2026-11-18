@@ -20,10 +20,10 @@ use parking_lot::Mutex;
 /// allocate, lock, or unwind.
 pub type FaultHandler = fn(data: usize, guest_addr: u64, fault: &mut HostFault) -> bool;
 
-/// Runs first on a fault inside a registered range, with the faulting offset into it; returning
-/// `true` retries the access. It commits guest DRAM on first touch, under the same restrictions
-/// as [`FaultHandler`].
-pub(crate) type TouchHook = fn(data: usize, offset: u64) -> bool;
+/// Runs first on a fault inside a registered range, with the faulting offset into it and the
+/// faulting host address; returning `true` retries the access. It commits guest DRAM on first
+/// touch, under the same restrictions as [`FaultHandler`].
+pub(crate) type TouchHook = fn(data: usize, offset: u64, host_addr: usize) -> bool;
 
 /// The interrupted host thread's state at a fastmem fault.
 pub struct HostFault {
@@ -122,7 +122,7 @@ fn dispatch(addr: usize, ctx: *mut std::ffi::c_void) -> bool {
         }
         // SAFETY: touch and handler entries are leaked, never freed, so the pointers stay valid.
         if let Some(touch) = unsafe { entry.touch.load(Ordering::Acquire).as_ref() }
-            && (touch.hook)(touch.data, (addr - base) as u64)
+            && (touch.hook)(touch.data, (addr - base) as u64, addr)
         {
             return true;
         }

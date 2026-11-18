@@ -109,7 +109,7 @@ struct FastmemTouch {
     target: usize,
 }
 
-fn charge_fastmem(data: usize, guest_addr: u64) -> bool {
+fn charge_fastmem(data: usize, guest_addr: u64, host_addr: usize) -> bool {
     // SAFETY: data is a leaked FastmemTouch; its table and DRAM outlive the registration that
     // runs this hook, which the address space drops first.
     unsafe {
@@ -118,7 +118,7 @@ fn charge_fastmem(data: usize, guest_addr: u64) -> bool {
             .table
             .host(guest_addr)
             .and_then(|host| host.checked_sub(touch.dram))
-            .is_some_and(|offset| charge_touched(touch.target, offset))
+            .is_some_and(|offset| charge_touched(touch.target, offset, host_addr))
     }
 }
 

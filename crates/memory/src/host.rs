@@ -145,10 +145,11 @@ impl Drop for Backing {
     }
 }
 
-/// Commits the memory behind backing `offset` for a [`Backing::touch_target`] `target` on its
-/// first touch, from a fault hook. Returns whether the access can be retried.
-pub(crate) fn charge_touched(target: usize, offset: usize) -> bool {
-    sys::charge_touched(target, offset)
+/// Commits the memory behind backing `offset` for a [`Backing::touch_target`] `target` when the
+/// access at `host_addr`, a view of it, faulted because it was not committed yet. Called from a
+/// fault hook; returns whether the access can be retried.
+pub(crate) fn charge_touched(target: usize, offset: usize, host_addr: usize) -> bool {
+    sys::charge_touched(target, offset, host_addr)
 }
 
 /// A reserved host range that holds views of a [`Backing`].
@@ -490,7 +491,7 @@ mod sys {
         }
     }
 
-    pub fn charge_touched(_target: usize, _offset: usize) -> bool {
+    pub fn charge_touched(_target: usize, _offset: usize, _host_addr: usize) -> bool {
         false
     }
 
@@ -625,11 +626,11 @@ mod sys {
     use parking_lot::Mutex;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Memory::{
-        CreateFileMappingW, MEM_COMMIT, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
-        MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_MAPPED_VIEW_ADDRESS,
-        MapViewOfFile3, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE,
-        SEC_COMMIT, SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree,
-        VirtualProtect,
+        CreateFileMappingW, MEM_COMMIT, MEM_MAPPED, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
+        MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION,
+        MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS,
+        PAGE_READONLY, PAGE_READWRITE, SEC_COMMIT, SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc,
+        VirtualAlloc2, VirtualFree, VirtualProtect, VirtualQuery,
     };
     use windows_sys::Win32::System::ProcessStatus::{
         K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
@@ -727,15 +728,34 @@ mod sys {
     }
 
     /// The touch hook of the backing view: commits the chunk a host access faulted in.
-    fn charge_backing(data: usize, offset: u64) -> bool {
-        charge_touched(data, offset as usize)
+    fn charge_backing(data: usize, offset: u64, host_addr: usize) -> bool {
+        charge_touched(data, offset as usize, host_addr)
     }
 
-    /// Commits the chunk holding backing `offset` for the [`Backing::touch_target`] `target`.
-    pub fn charge_touched(target: usize, offset: usize) -> bool {
+    /// Commits the chunk holding backing `offset` for the [`Backing::touch_target`] `target`
+    /// when the view page at `host_addr` is not committed. A committed read-write page means
+    /// another thread committed it after this access faulted, so the access is retried too; any
+    /// other committed page faulted for its protection, which the fault handler owns.
+    pub fn charge_touched(target: usize, offset: usize, host_addr: usize) -> bool {
         // SAFETY: the target is a live backing's boxed chunk state (see touch_target).
         let chunks = unsafe { &*(target as *const Chunks) };
-        offset < chunks.size && chunks.charge(offset >> CHUNK_BITS)
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: queries our own address space into a local struct.
+        let queried = unsafe {
+            VirtualQuery(
+                host_addr as *const _,
+                &mut info,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if queried == 0 || info.Type != MEM_MAPPED || offset >= chunks.size {
+            return false;
+        }
+        match info.State {
+            MEM_RESERVE => chunks.charge(offset >> CHUNK_BITS),
+            MEM_COMMIT => info.Protect == PAGE_READWRITE,
+            _ => false,
+        }
     }
 
     /// Whether the host has `len` bytes of commit to spare beyond the headroom.
