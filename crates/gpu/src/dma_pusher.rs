@@ -83,7 +83,8 @@ pub(crate) struct FrontShared {
 pub(crate) enum Work {
     Entry(GpEntry),
     SyncpointWait(SyncpointFence),
-    Increment(SyncpointIncrement),
+    /// Increments, and the fence they reach.
+    Increment(SyncpointIncrement, Option<SyncpointFence>),
     /// The renderer submits what it recorded.
     EndOfSubmission,
     /// The channel's later work uses this GPU address space.
@@ -628,8 +629,13 @@ impl FrontChannel {
                         .side(SideCommand::BindAddressSpace(self.id, memory.clone()));
                     self.memory = memory;
                 }
-                Work::Increment(increment) => {
+                Work::Increment(increment, fence) => {
                     self.queue.pop_front();
+                    if let Some(fence) = fence
+                        && let Some(latency) = shared.syncpoints.fence_latency()
+                    {
+                        latency.front(fence);
+                    }
                     let mut dispatch = self.dispatch(shared);
                     if increment.wait_for_idle {
                         dispatch.wait_for_idle();
