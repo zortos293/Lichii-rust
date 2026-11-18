@@ -519,8 +519,8 @@ impl Back {
         }
     }
 
-    /// A semaphore release lands once the work before it completed; the fence action that writes
-    /// it also resumes the channels its value meets.
+    /// A semaphore release lands once the work before it completed; acquires see it now
+    /// ([`SemaphoreWaiters::executed`](crate::channel::SemaphoreWaiters::executed)).
     fn release(&mut self, address: u64, payload: u64, size: ReleaseSize) {
         let Some(index) = self.current else {
             return;
@@ -535,6 +535,12 @@ impl Back {
             }
             return;
         };
+        self.syncpoints.semaphore_waiters().executed(
+            self.syncpoints.semaphore_mirror(),
+            daddr,
+            Some(payload),
+            size,
+        );
         self.rasterizer.signal_fence(FenceAction::WriteSemaphore {
             address: daddr,
             value: payload,
@@ -606,6 +612,12 @@ impl Back {
             tracing::warn!(address, "semaphore reduction on unmapped GPU memory");
             return;
         };
+        self.syncpoints.semaphore_waiters().executed(
+            self.syncpoints.semaphore_mirror(),
+            daddr,
+            None,
+            ReleaseSize::Four,
+        );
         self.rasterizer.signal_fence(FenceAction::ReduceSemaphore {
             address: daddr,
             op,

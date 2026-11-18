@@ -16,7 +16,7 @@ use lichii_common::GpuVAddr;
 use lichii_texture::block_linear::GobLayout;
 
 use crate::activity::Activity;
-use crate::backend::{ChannelId, GpuWrittenPages, Rasterizer, RenderCondition};
+use crate::backend::{ChannelId, GpuWrittenPages, Query, QueryKind, Rasterizer, RenderCondition};
 use crate::gmmu::Gmmu;
 use crate::host1x::Syncpoints;
 
@@ -204,6 +204,23 @@ pub struct EngineContext<'a> {
     pub written_pages: &'a GpuWrittenPages,
     /// Counts the renderer calls engines make.
     pub activity: &'a Activity,
+}
+
+impl EngineContext<'_> {
+    /// Queues `query` on the renderer. Acquires see the value it releases at once, and any
+    /// other value it writes only once it lands
+    /// ([`SemaphoreWaiters::executed`](crate::channel::SemaphoreWaiters::executed)).
+    pub fn query(&mut self, query: &Query) {
+        if let Some(address) = self.memory.translate(query.address) {
+            self.syncpoints.semaphore_waiters().executed(
+                self.syncpoints.semaphore_mirror(),
+                address,
+                (query.kind == QueryKind::Payload).then_some(query.payload),
+                query.size,
+            );
+        }
+        self.rasterizer.query(self.channel, self.memory, query);
+    }
 }
 
 #[cfg(test)]

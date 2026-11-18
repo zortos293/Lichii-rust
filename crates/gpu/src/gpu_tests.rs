@@ -210,15 +210,12 @@ impl HostWork {
     fn run(&self, work: Pending) {
         match work {
             Pending::Fence(action) => action.execute(&self.handles),
-            Pending::Query(query) => {
-                let memory = &self.memory;
-                let result = match query.size {
-                    ReleaseSize::Four => memory.write(query.address, query.payload as u32),
-                    ReleaseSize::Eight => memory.write(query.address, query.payload),
-                    ReleaseSize::Sixteen => memory.write(query.address, [query.payload, 0]),
-                };
-                result.unwrap();
+            Pending::Query(query) => FenceAction::WriteSemaphore {
+                address: self.memory.translate(query.address).unwrap(),
+                value: query.payload,
+                size: query.size,
             }
+            .execute(&self.handles),
         }
     }
 }
@@ -860,6 +857,70 @@ fn methods_and_macro_calls_continue_across_entries() {
 }
 
 const SEMAPHORE: u64 = 0x30_0000;
+
+/// Time for two channels that take turns through two counters while the host GPU finishes its
+/// work only every millisecond:
+/// `cargo test --release -p lichii-gpu --lib gated_rounds_cost -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn gated_rounds_cost_with_a_slow_host_gpu() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    const ROUNDS: u32 = 100;
+    const ACK: u64 = SEMAPHORE + 0x100;
+    let mut rig = Rig::deferred(Threading::Split);
+    let producer = rig.channel(HostClass::Ampere);
+    let consumer = rig.channel(HostClass::Ampere);
+    let bound = |round: u32| match round {
+        1 => Pushbuffer::default().bind(0, AMPERE_3D),
+        _ => Pushbuffer::default(),
+    };
+    let mut entries = Vec::new();
+    for round in 1..=ROUNDS {
+        let produce = bound(round)
+            .semaphore(ACK, round - 1, 2)
+            .inc(0, 0x701, &[round])
+            .semaphore(SEMAPHORE, round, 1);
+        let consume = bound(round)
+            .semaphore(SEMAPHORE, round, 2)
+            .inc(0, 0x701, &[round])
+            .semaphore(ACK, round, 1);
+        entries.push((rig.entry(&produce.0), rig.entry(&consume.0)));
+    }
+    let done = Arc::new(AtomicBool::new(false));
+    let ticker = std::thread::spawn({
+        let (work, done) = (rig.work.clone(), done.clone());
+        move || {
+            while !done.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1));
+                work.run_finished(true);
+            }
+        }
+    });
+    let start = Instant::now();
+    for &(produce, consume) in &entries {
+        rig.gpu.submit(producer, Submission::new(&[produce]));
+        rig.gpu.submit(consumer, Submission::new(&[consume]));
+    }
+    let methods = || {
+        rig.log
+            .lock()
+            .iter()
+            .filter(|event| matches!(event, Event::Method { .. }))
+            .count()
+    };
+    while methods() < 2 * ROUNDS as usize {
+        assert!(start.elapsed() < Duration::from_secs(30), "rounds stalled");
+        std::thread::sleep(Duration::from_micros(50));
+    }
+    let elapsed = start.elapsed();
+    done.store(true, Ordering::Relaxed);
+    ticker.join().unwrap();
+    println!(
+        "{ROUNDS} turns with a 1 ms host GPU: {elapsed:?}, {:?} per round",
+        elapsed / ROUNDS
+    );
+}
 
 #[test]
 fn cross_channel_acquire_suspends_until_the_release() {
@@ -1859,8 +1920,11 @@ fn a_small_ring_wraps_and_keeps_order() {
 /// SEM_EXECUTE: the acquire or release compares or writes 64 bits.
 const WIDE: u32 = 1 << 24;
 
+/// The waiter's later work follows the release in the stream, so it runs once the back executed
+/// the release, while the host GPU still holds the work before it; memory holds the value only
+/// once that work finished.
 #[test]
-fn a_waiter_resumes_only_once_its_deferred_release_lands() {
+fn a_waiter_resumes_when_the_back_executes_its_release_before_it_lands() {
     each_mode(|threading| {
         let mut rig = Rig::deferred(threading);
         let waiter = rig.channel(HostClass::Ampere);
@@ -1870,19 +1934,19 @@ fn a_waiter_resumes_only_once_its_deferred_release_lands() {
             .semaphore(SEMAPHORE, 1, 0)
             .inc(0, 0x701, &[2]);
         rig.submit(waiter, &words.0);
+        assert!(rig.methods().is_empty(), "{threading:?}");
         rig.submit(
             releaser,
             &Pushbuffer::default().semaphore(SEMAPHORE, 1, 1).0,
         );
-        assert!(rig.methods().is_empty(), "{threading:?}");
-        assert_eq!(rig.read(SEMAPHORE), 0);
-        rig.complete();
         assert_eq!(
             rig.methods(),
             [(waiter.0, EngineKind::Maxwell3d, 0x701, 2)],
             "{threading:?}"
         );
-        assert_eq!(rig.read(SEMAPHORE), 1);
+        assert_eq!(rig.read(SEMAPHORE), 0, "{threading:?}");
+        rig.complete();
+        assert_eq!(rig.read(SEMAPHORE), 1, "{threading:?}");
     });
 }
 
@@ -1901,6 +1965,84 @@ fn deferred_releases_latch_a_value_overwritten_before_the_front_looks() {
             .semaphore(SEMAPHORE, 1, 1)
             .semaphore(SEMAPHORE, 2, 1);
         rig.submit(releaser, &words.0);
+        assert_eq!(
+            rig.methods(),
+            [(waiter.0, EngineKind::Maxwell3d, 0x701, 2)],
+            "{threading:?}"
+        );
+        rig.complete();
+        assert_eq!(rig.read(SEMAPHORE), 2);
+    });
+}
+
+/// An eight-byte release meets a narrow acquire of its high word once the back executes it.
+#[test]
+fn a_wide_release_meets_an_acquire_of_its_high_word_before_it_lands() {
+    each_mode(|threading| {
+        let mut rig = Rig::deferred(threading);
+        let waiter = rig.channel(HostClass::Ampere);
+        let releaser = rig.channel(HostClass::Ampere);
+        let words = Pushbuffer::default()
+            .bind(0, AMPERE_3D)
+            .semaphore(SEMAPHORE + 4, 7, 2)
+            .inc(0, 0x701, &[2]);
+        rig.submit(waiter, &words.0);
+        let words = Pushbuffer::default().inc(
+            0,
+            host::SEM_ADDR_LO,
+            &[SEMAPHORE as u32, (SEMAPHORE >> 32) as u32, 1, 7, 1 | WIDE],
+        );
+        rig.submit(releaser, &words.0);
+        assert_eq!(
+            rig.methods(),
+            [(waiter.0, EngineKind::Maxwell3d, 0x701, 2)],
+            "{threading:?}"
+        );
+        rig.complete();
+        assert_eq!(rig.memory.read::<u64>(SEMAPHORE).unwrap(), 7 << 32 | 1);
+    });
+}
+
+/// Once a release landed, memory is newer than it: acquires see a guest write after it.
+#[test]
+fn acquires_see_a_guest_write_after_a_landed_release() {
+    each_mode(|threading| {
+        let mut rig = Rig::deferred(threading);
+        let releaser = rig.channel(HostClass::Ampere);
+        let waiter = rig.channel(HostClass::Ampere);
+        rig.submit(
+            releaser,
+            &Pushbuffer::default().semaphore(SEMAPHORE, 5, 1).0,
+        );
+        rig.events();
+        rig.complete();
+        assert_eq!(rig.read(SEMAPHORE), 5, "{threading:?}");
+        rig.memory.write(SEMAPHORE, 0u32).unwrap();
+        let words = Pushbuffer::default()
+            .bind(0, AMPERE_3D)
+            .semaphore(SEMAPHORE, 5, 2)
+            .inc(0, 0x701, &[2]);
+        rig.submit(waiter, &words.0);
+        assert!(rig.methods().is_empty(), "{threading:?}");
+    });
+}
+
+/// A reduction's result is known only once it lands, so its waiter resumes then.
+#[test]
+fn a_reduction_meets_its_waiter_only_once_it_lands() {
+    each_mode(|threading| {
+        let mut rig = Rig::deferred(threading);
+        let waiter = rig.channel(HostClass::Ampere);
+        let releaser = rig.channel(HostClass::Ampere);
+        let words = Pushbuffer::default()
+            .bind(0, AMPERE_3D)
+            .semaphore(SEMAPHORE, 5, 2)
+            .inc(0, 0x701, &[2]);
+        rig.submit(waiter, &words.0);
+        rig.submit(
+            releaser,
+            &Pushbuffer::default().semaphore(SEMAPHORE, 5, 6 | 5 << 27).0,
+        );
         assert!(rig.methods().is_empty(), "{threading:?}");
         rig.complete();
         assert_eq!(
@@ -1908,7 +2050,43 @@ fn deferred_releases_latch_a_value_overwritten_before_the_front_looks() {
             [(waiter.0, EngineKind::Maxwell3d, 0x701, 2)],
             "{threading:?}"
         );
-        assert_eq!(rig.read(SEMAPHORE), 2);
+        assert_eq!(rig.read(SEMAPHORE), 5);
+    });
+}
+
+/// Two queues gating each other through a counter, as NVN2 queues do (NX2_NOTES row 70), run
+/// every round while the host GPU still holds all of their work: no acquire waits for it.
+#[test]
+fn gated_rounds_run_without_waiting_for_the_host_gpu() {
+    const ROUNDS: u32 = 3;
+    each_mode(|threading| {
+        let mut rig = Rig::deferred(threading);
+        let producer = rig.channel(HostClass::Ampere);
+        let consumer = rig.channel(HostClass::Ampere);
+        for round in 1..=ROUNDS {
+            let start = match round {
+                1 => Pushbuffer::default().bind(0, AMPERE_3D),
+                _ => Pushbuffer::default(),
+            };
+            let produce = start.inc(0, 0x701, &[round]).semaphore(SEMAPHORE, round, 1);
+            rig.submit(producer, &produce.0);
+            let start = match round {
+                1 => Pushbuffer::default().bind(0, AMPERE_3D),
+                _ => Pushbuffer::default(),
+            };
+            let consume = start.semaphore(SEMAPHORE, round, 2).inc(0, 0x701, &[round]);
+            rig.submit(consumer, &consume.0);
+        }
+        let consumed: Vec<_> = rig
+            .methods()
+            .into_iter()
+            .filter(|&(channel, ..)| channel == consumer.0)
+            .map(|(.., value)| value)
+            .collect();
+        assert_eq!(consumed, [1, 2, 3], "{threading:?}");
+        assert_eq!(rig.read(SEMAPHORE), 0, "{threading:?}");
+        rig.complete();
+        assert_eq!(rig.read(SEMAPHORE), ROUNDS, "{threading:?}");
     });
 }
 
@@ -2084,12 +2262,12 @@ fn switch_2_address_spaces_get_the_identity_mappings_until_destroyed() {
 /// A Switch 2 rig with a two-page queue semaphore memory mapped at [`REGION_VA`, +0x2000).
 const REGION_VA: u64 = 0x100_0000;
 
-fn rig_with_semaphore_region(threading: Threading) -> Rig {
+fn rig_with_semaphore_region(threading: Threading, completion: Completion) -> Rig {
     let rig = Rig::build_for(
         Console::Switch2,
         threading,
         crate::gpu::DEFAULT_RING_SLOTS,
-        Completion::Immediate,
+        completion,
         Engines::Recording,
     );
     let nx2 = rig.gpu.nx2_memory().expect("Switch 2 has the registry");
@@ -2104,7 +2282,7 @@ fn rig_with_semaphore_region(threading: Threading) -> Rig {
 #[test]
 fn switch_2_queue_semaphore_releases_reach_the_first_page() {
     each_mode(|threading| {
-        let mut rig = rig_with_semaphore_region(threading);
+        let mut rig = rig_with_semaphore_region(threading, Completion::Immediate);
         let channel = rig.channel(HostClass::Ampere);
         let words = Pushbuffer::default().semaphore(REGION_VA + 0x1010, 5, 1);
         rig.submit(channel, &words.0);
@@ -2115,10 +2293,35 @@ fn switch_2_queue_semaphore_releases_reach_the_first_page() {
     });
 }
 
+/// A queue's second-page release meets a first-page acquire once the back executes it.
+#[test]
+fn a_second_page_release_meets_a_first_page_acquire_before_it_lands() {
+    each_mode(|threading| {
+        let mut rig = rig_with_semaphore_region(threading, Completion::Deferred);
+        let waiter = rig.channel(HostClass::Ampere);
+        let releaser = rig.channel(HostClass::Ampere);
+        let words = Pushbuffer::default()
+            .bind(0, AMPERE_3D)
+            .semaphore(REGION_VA + 0x10, 5, 2)
+            .inc(0, 0x701, &[2]);
+        rig.submit(waiter, &words.0);
+        let words = Pushbuffer::default().semaphore(REGION_VA + 0x1010, 5, 1);
+        rig.submit(releaser, &words.0);
+        assert_eq!(
+            rig.methods(),
+            [(waiter.0, EngineKind::Maxwell3d, 0x701, 2)],
+            "{threading:?}"
+        );
+        assert_eq!(rig.read(REGION_VA + 0x10), 0, "{threading:?}");
+        rig.complete();
+        assert_eq!(rig.read(REGION_VA + 0x10), 5, "{threading:?}");
+    });
+}
+
 #[test]
 fn a_mirrored_value_stays_beside_a_word_with_releases_of_its_own() {
     each_mode(|threading| {
-        let mut rig = rig_with_semaphore_region(threading);
+        let mut rig = rig_with_semaphore_region(threading, Completion::Immediate);
         let releaser = rig.channel(HostClass::Ampere);
         let waiter = rig.channel(HostClass::Ampere);
         let words = Pushbuffer::default()

@@ -14,10 +14,12 @@ use lichii_texture::block_linear::GobLayout;
 use parking_lot::Mutex;
 
 pub use crate::backend::ChannelId;
+use crate::backend::ReleaseSize;
 use crate::gmmu::Gmmu;
 use crate::gpu::{Console, Inbox};
 use crate::host::{AcquireOp, HostClass};
 pub use crate::pushbuffer::GpEntry;
+use crate::semaphore_mirror::{self, SemaphoreMirror};
 
 /// How a channel is set up.
 #[derive(Clone)]
@@ -129,11 +131,73 @@ impl<'a> Submission<'a> {
 /// [`FenceAction`](crate::backend::FenceAction) performs is checked against them, once it landed
 /// in memory: the ones it meets are latched and the GPU's front looks at them again, so a waiter
 /// cannot miss a value that is overwritten before the front reads the word (NX2_NOTES row 70).
+///
+/// They also hold the releases the back executed that have not landed yet: acquires see those
+/// values at once, as syncpoint waits see the host bank, so a channel gated on another channel's
+/// release never waits for the host GPU to finish the work before it.
 #[derive(Default)]
 pub struct SemaphoreWaiters {
     count: AtomicUsize,
     list: Mutex<Vec<Waiter>>,
     front: OnceLock<Weak<Inbox>>,
+    in_flight: AtomicUsize,
+    executed: Mutex<Executed>,
+}
+
+const IN_FLIGHT: usize = 32;
+
+/// Executed releases on their way to memory, at most one per byte. A full table evicts, which
+/// only sends an acquire back to memory.
+#[derive(Default)]
+struct Executed {
+    entries: [Option<Release>; IN_FLIGHT],
+    next: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Release {
+    address: DAddr,
+    value: u64,
+    bytes: u64,
+}
+
+impl Executed {
+    fn record(&mut self, address: DAddr, value: Option<u64>, bytes: u64) {
+        for slot in &mut self.entries {
+            if slot.is_some_and(|e| e.address < address + bytes && address < e.address + e.bytes) {
+                *slot = None;
+            }
+        }
+        let Some(value) = value else {
+            return;
+        };
+        let index = self
+            .entries
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or_else(|| {
+                let index = self.next;
+                self.next = (index + 1) % IN_FLIGHT;
+                index
+            });
+        self.entries[index] = Some(Release {
+            address,
+            value,
+            bytes,
+        });
+    }
+
+    fn len(&self) -> usize {
+        self.entries.iter().flatten().count()
+    }
+}
+
+fn release_bytes(size: ReleaseSize) -> u64 {
+    match size {
+        ReleaseSize::Four => 4,
+        ReleaseSize::Eight => 8,
+        ReleaseSize::Sixteen => 16,
+    }
 }
 
 struct Waiter {
@@ -193,6 +257,109 @@ impl SemaphoreWaiters {
             .any(|w| w.channel == channel && w.latched)
     }
 
+    /// The back executed a write of `size` to `address` that lands once the host GPU finished
+    /// the work before it: a release of `value`, or, when `None`, a write whose value is known
+    /// only then (a reduction, a counter). Until it lands, acquires see the release's value and
+    /// the waiters it meets resume now: the GPU work a resumed channel queues next follows it on
+    /// the host GPU, as after a syncpoint wait. The guest CPU still sees it only once it lands. A
+    /// release into a Switch 2 queue semaphore's second page counts for its first page too.
+    pub(crate) fn executed(
+        &self,
+        mirror: &SemaphoreMirror,
+        address: DAddr,
+        value: Option<u64>,
+        size: ReleaseSize,
+    ) {
+        let bytes = release_bytes(size);
+        let first_page = mirror
+            .mirror_of(address)
+            .is_some()
+            .then(|| address - semaphore_mirror::PAGE);
+        {
+            let mut executed = self.executed.lock();
+            executed.record(address, value, bytes);
+            if let Some(first_page) = first_page {
+                executed.record(first_page, value, bytes);
+            }
+            self.in_flight.store(executed.len(), Ordering::Release);
+        }
+        if let Some(value) = value {
+            self.latch_released(address, value, size);
+            if let Some(first_page) = first_page {
+                self.latch_released(first_page, value, size);
+            }
+        }
+    }
+
+    /// A release of `value` to `address` landed: memory holds what acquires saw until now.
+    pub(crate) fn landed(&self, address: DAddr, value: u64) {
+        if self.in_flight.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let mut executed = self.executed.lock();
+        for slot in &mut executed.entries {
+            if slot.is_some_and(|e| e.address == address && e.value == value) {
+                *slot = None;
+            }
+        }
+        self.in_flight.store(executed.len(), Ordering::Release);
+    }
+
+    /// The value an acquire of the word (or with `wide`, the 64-bit word) at `address` sees from
+    /// an executed release that has not landed yet, if one wrote all of it.
+    pub(crate) fn in_flight(&self, address: DAddr, wide: bool) -> Option<u64> {
+        if self.in_flight.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let width = if wide { 8 } else { 4 };
+        let executed = self.executed.lock();
+        let release = executed
+            .entries
+            .iter()
+            .flatten()
+            .find(|e| e.address < address + width && address < e.address + e.bytes)?;
+        if release.address == address && (!wide || release.bytes >= 8) {
+            Some(if wide {
+                release.value
+            } else {
+                release.value & 0xffff_ffff
+            })
+        } else if !wide && release.address + 4 == address && release.bytes >= 8 {
+            Some(release.value >> 32)
+        } else {
+            None
+        }
+    }
+
+    fn latch_released(&self, address: DAddr, value: u64, size: ReleaseSize) {
+        if self.count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let wide_release = size != ReleaseSize::Four;
+        let mut latched = false;
+        for waiter in self.list.lock().iter_mut() {
+            let current = if waiter.wide {
+                (wide_release && waiter.address == address).then_some(value)
+            } else if waiter.address & !3 == address {
+                Some(value & 0xffff_ffff)
+            } else if wide_release && waiter.address & !3 == address + 4 {
+                Some(value >> 32)
+            } else {
+                None
+            };
+            if !waiter.latched
+                && current
+                    .is_some_and(|current| waiter.op.is_met(current, waiter.payload, waiter.wide))
+            {
+                waiter.latched = true;
+                latched = true;
+            }
+        }
+        if latched && let Some(front) = self.front.get().and_then(Weak::upgrade) {
+            front.wake();
+        }
+    }
+
     /// An acquire of the 32-bit word at `address` now sees `value`, which memory does not hold
     /// (a mirrored Switch 2 queue semaphore value kept aside). Latches the narrow waiters on that
     /// word it meets.
@@ -245,5 +412,52 @@ impl SemaphoreWaiters {
         if latched && let Some(front) = self.front.get().and_then(Weak::upgrade) {
             front.wake();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WORD: DAddr = 0x1000_0000;
+
+    #[test]
+    fn acquires_see_an_executed_release_until_it_lands_with_its_value() {
+        let waiters = SemaphoreWaiters::default();
+        let mirror = SemaphoreMirror::default();
+        waiters.executed(&mirror, WORD, Some(7 << 32 | 3), ReleaseSize::Eight);
+        assert_eq!(waiters.in_flight(WORD, false), Some(3));
+        assert_eq!(waiters.in_flight(WORD + 4, false), Some(7));
+        assert_eq!(waiters.in_flight(WORD, true), Some(7 << 32 | 3));
+        waiters.landed(WORD, 3);
+        assert_eq!(waiters.in_flight(WORD, true), Some(7 << 32 | 3));
+        waiters.landed(WORD, 7 << 32 | 3);
+        assert_eq!(waiters.in_flight(WORD, false), None);
+    }
+
+    #[test]
+    fn a_later_write_replaces_the_releases_it_overlaps() {
+        let waiters = SemaphoreWaiters::default();
+        let mirror = SemaphoreMirror::default();
+        waiters.executed(&mirror, WORD, Some(1), ReleaseSize::Eight);
+        waiters.executed(&mirror, WORD + 4, Some(2), ReleaseSize::Four);
+        assert_eq!(waiters.in_flight(WORD, true), None);
+        assert_eq!(waiters.in_flight(WORD, false), None);
+        assert_eq!(waiters.in_flight(WORD + 4, false), Some(2));
+        waiters.executed(&mirror, WORD + 4, None, ReleaseSize::Four);
+        assert_eq!(waiters.in_flight(WORD + 4, false), None);
+    }
+
+    #[test]
+    fn a_full_table_forgets_its_oldest_release() {
+        let waiters = SemaphoreWaiters::default();
+        let mirror = SemaphoreMirror::default();
+        for index in 0..=IN_FLIGHT as u64 {
+            waiters.executed(&mirror, WORD + 4 * index, Some(index), ReleaseSize::Four);
+        }
+        assert_eq!(waiters.in_flight(WORD, false), None);
+        assert_eq!(waiters.in_flight(WORD + 4, false), Some(1));
+        let last = IN_FLIGHT as u64;
+        assert_eq!(waiters.in_flight(WORD + 4 * last, false), Some(last));
     }
 }

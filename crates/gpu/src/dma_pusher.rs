@@ -521,6 +521,7 @@ impl FrontChannel {
                     || semaphore_met(
                         &self.memory,
                         shared.syncpoints.semaphore_mirror(),
+                        &shared.waiters,
                         address,
                         payload,
                         op,
@@ -562,6 +563,7 @@ impl FrontChannel {
                 let current = semaphore_value(
                     &self.memory,
                     shared.syncpoints.semaphore_mirror(),
+                    &shared.waiters,
                     address,
                     wide,
                 );
@@ -761,14 +763,19 @@ impl FrontChannel {
 fn semaphore_value(
     memory: &Gmmu,
     mirror: &SemaphoreMirror,
+    waiters: &SemaphoreWaiters,
     address: GpuVAddr,
     wide: bool,
 ) -> Result<u64, GpuFault> {
+    let device = memory.translate(address);
+    if let Some(value) = device.and_then(|device| waiters.in_flight(device, wide)) {
+        return Ok(value);
+    }
     if wide {
         return memory.read::<u64>(address);
     }
     let load = || memory.read::<u32>(address);
-    match memory.translate(address) {
+    match device {
         Some(device) => mirror.acquire_view(device, load),
         None => load(),
     }
@@ -779,12 +786,13 @@ fn semaphore_value(
 fn semaphore_met(
     memory: &Gmmu,
     mirror: &SemaphoreMirror,
+    waiters: &SemaphoreWaiters,
     address: GpuVAddr,
     payload: u64,
     op: AcquireOp,
     wide: bool,
 ) -> bool {
-    match semaphore_value(memory, mirror, address, wide) {
+    match semaphore_value(memory, mirror, waiters, address, wide) {
         Ok(current) => op.is_met(current, payload, wide),
         Err(fault) => {
             tracing::warn!(?fault, "semaphore acquire on unmapped GPU memory");
@@ -898,6 +906,7 @@ impl Dispatch<'_> {
         if semaphore_met(
             self.memory,
             self.shared.syncpoints.semaphore_mirror(),
+            &self.shared.waiters,
             address,
             payload,
             op,

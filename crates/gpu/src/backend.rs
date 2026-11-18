@@ -372,6 +372,10 @@ impl FenceAction {
                     ReleaseSize::Sixteen => 4,
                 }];
                 let bytes = 4 * words.len() as u64;
+                handles
+                    .syncpoints
+                    .semaphore_waiters()
+                    .landed(address, value);
                 let mirror = handles.syncpoints.semaphore_mirror();
                 let mut page = mirror.first_page(address);
                 let mirrored = mirror.mirror_of(address);
@@ -389,6 +393,10 @@ impl FenceAction {
                     .written(&handles.device, address, bytes);
                 if let Some(page) = mirrored {
                     mirror_release(handles, page, address - semaphore_mirror::PAGE, words);
+                    handles
+                        .syncpoints
+                        .semaphore_waiters()
+                        .landed(address - semaphore_mirror::PAGE, value);
                 }
             }
             Self::ReduceSemaphore {
