@@ -146,16 +146,20 @@ impl FenceLatency {
         {
             return;
         }
-        if front == 0 || back == 0 || !(submitted <= front && front <= back && back <= now) {
+        self.record(submitted, front, back, now);
+    }
+
+    fn record(&self, submitted: u64, front: u64, back: u64, done: u64) {
+        if front == 0 || back == 0 || !(submitted <= front && front <= back && back <= done) {
             self.totals.lock().partial += 1;
             return;
         }
-        let total = now - submitted;
+        let total = done - submitted;
         let mut totals = self.totals.lock();
         totals.fences += 1;
         totals.submit_to_front_ns += front - submitted;
         totals.front_to_back_ns += back - front;
-        totals.back_to_done_ns += now - back;
+        totals.back_to_done_ns += done - back;
         totals.total_ns += total;
         totals.longest_ns = totals.longest_ns.max(total);
     }
@@ -233,22 +237,18 @@ mod tests {
         let completer = {
             let latency = latency.clone();
             std::thread::spawn(move || {
-                for value in 1..=fences {
-                    let fence = SyncpointFence { id: 3, value };
-                    latency.submitted(fence);
-                    latency.front(fence);
-                    latency.reached(Stage::Back, fence.id, value);
-                    latency.reached(Stage::Done, fence.id, value);
+                for _ in 0..fences {
+                    latency.record(1, 3, 6, 11);
                 }
             })
         };
         let mut seen = FenceTotals::default();
         let mut check = |totals: FenceTotals| {
-            assert_eq!(
-                totals.submit_to_front_ns + totals.front_to_back_ns + totals.back_to_done_ns,
-                totals.total_ns
-            );
-            assert_eq!(totals.fences == 0, totals.total_ns == 0, "{totals:?}");
+            assert_eq!(totals.submit_to_front_ns, totals.fences * 2);
+            assert_eq!(totals.front_to_back_ns, totals.fences * 3);
+            assert_eq!(totals.back_to_done_ns, totals.fences * 5);
+            assert_eq!(totals.total_ns, totals.fences * 10);
+            assert_eq!(totals.longest_ns, u64::from(totals.fences != 0) * 10);
             seen.fences += totals.fences;
             seen.partial += totals.partial;
             seen.untracked += totals.untracked;
@@ -261,6 +261,19 @@ mod tests {
         assert_eq!(
             (seen.fences, seen.partial, seen.untracked),
             (u64::from(fences), 0, 0)
+        );
+    }
+
+    #[test]
+    fn equal_timestamps_count_as_one_completed_fence() {
+        let latency = FenceLatency::new();
+        latency.record(1, 1, 1, 1);
+        assert_eq!(
+            latency.take(),
+            FenceTotals {
+                fences: 1,
+                ..FenceTotals::default()
+            }
         );
     }
 
