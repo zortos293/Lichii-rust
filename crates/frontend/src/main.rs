@@ -1,5 +1,6 @@
 mod app;
 mod applets;
+mod bigalloc;
 mod choices;
 mod cli;
 mod config;
@@ -58,7 +59,11 @@ fn read_settings(path: &Path) -> (Settings, Vec<String>, bool) {
     }
 }
 
+#[global_allocator]
+static ALLOC: bigalloc::Tracking = bigalloc::Tracking;
+
 fn main() -> ExitCode {
+    bigalloc::start();
     let cli = match cli::parse(std::env::args_os().skip(1)) {
         Ok(Command::Run(cli)) => cli,
         Ok(Command::Help) => {

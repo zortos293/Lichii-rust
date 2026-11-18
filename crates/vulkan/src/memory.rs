@@ -170,17 +170,24 @@ fn allocate(
         linear: matches!(resource, Resource::Buffer(_)),
         allocation_scheme,
     })?;
-    if allocation.is_dedicated() {
+    let fresh = if allocation.is_dedicated() {
         counters.dedicated.fetch_add(1, Ordering::Relaxed);
+        true
     } else {
         // SAFETY: the handle only keys the block map.
         let memory = unsafe { allocation.memory() };
-        *pool.blocks.entry(memory).or_default() += 1;
+        let live = pool.blocks.entry(memory).or_default();
+        *live += 1;
+        let fresh = *live == 1;
         counters
             .blocks
             .store(pool.blocks.len() as u64, Ordering::Relaxed);
-    }
+        fresh
+    };
     drop(pool);
+    if fresh && let Some(ptr) = allocation.mapped_ptr() {
+        tracing::debug!(target: "lichii_vulkan::memmap", base = format_args!("{:#x}", ptr.as_ptr() as usize - allocation.offset() as usize), size_mib = allocation.size() >> 20, dedicated = allocation.is_dedicated(), location = ?location, name, "host block mapped");
+    }
     counters.add(location, allocation.size());
     Ok(allocation)
 }
@@ -190,8 +197,14 @@ fn free(device: &Device, allocation: Allocation, location: MemoryLocation) {
     counters.sub(location, allocation.size());
     let mut pool = device.allocator.lock();
     let pool = &mut *pool;
+    let base = allocation
+        .mapped_ptr()
+        .map(|ptr| ptr.as_ptr() as usize - allocation.offset() as usize);
     if allocation.is_dedicated() {
         counters.dedicated.fetch_sub(1, Ordering::Relaxed);
+        if let Some(base) = base {
+            tracing::debug!(target: "lichii_vulkan::memmap", base = format_args!("{base:#x}"), location = ?location, "host block freed");
+        }
         if let Err(error) = pool.allocator.free(allocation) {
             tracing::error!("freeing device memory: {error}");
         }
@@ -212,6 +225,9 @@ fn free(device: &Device, allocation: Allocation, location: MemoryLocation) {
         tracing::error!("freeing device memory: {error}");
     }
     if emptied && pool.allocator.capacity() < capacity {
+        if let Some(base) = base {
+            tracing::debug!(target: "lichii_vulkan::memmap", base = format_args!("{base:#x}"), location = ?location, "host block freed");
+        }
         pool.blocks.remove(&memory);
         counters
             .blocks

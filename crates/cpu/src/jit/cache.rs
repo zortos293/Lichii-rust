@@ -224,7 +224,8 @@ struct Table<T: Zeroable> {
 
 impl<T: Zeroable> Table<T> {
     fn new(len: usize) -> Option<Self> {
-        let ptr = sys::anonymous(len * size_of::<T>())?.cast();
+        let ptr: *mut T = sys::anonymous(len * size_of::<T>())?.cast();
+        tracing::debug!(target: "lichii_cpu::memmap", base = format_args!("{:#x}", ptr as usize), size_mib = (len * size_of::<T>()) >> 20, table = std::any::type_name::<T>(), "JIT table");
         Some(Self { ptr, len })
     }
 }
