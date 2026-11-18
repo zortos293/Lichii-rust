@@ -3233,8 +3233,9 @@ fn numeric_mismatch(
 /// bare Switch 2 pointer, or an entry of a pointer table the constant buffer points to) carries
 /// no size, so it reaches what the program provably accesses, or `None` when that is unknown:
 /// then [`BufferCache::unbounded_storage_buffer`](crate::buffer_cache::BufferCache::unbounded_storage_buffer)
-/// binds as far as it can in place. No size passes `limit`, the largest range the host binds
-/// after alignment.
+/// binds as far as it can in place. A provable reach ends on a whole word, since the host may
+/// lower byte and halfword accesses to word loads and compare-and-swap loops. No size passes
+/// `limit`, the largest range the host binds after alignment.
 fn storage_pointer(
     src: &StageSources<'_>,
     desc: &StorageBufferDescriptor,
@@ -3259,9 +3260,10 @@ fn storage_pointer(
     if desc.is_written {
         extent.merge(&desc.write_extent);
     }
-    let size = extent
-        .constant_end()
-        .map(|end| u64::from(end).max(4).min(limit));
+    let size = extent.constant_end().map(|end| {
+        let end = (address + u64::from(end).max(1)).next_multiple_of(4);
+        (end - address).min(limit)
+    });
     (address, size)
 }
 

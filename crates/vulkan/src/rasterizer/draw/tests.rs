@@ -5554,6 +5554,17 @@ fn storage_pointer_reach_follows_the_program_accesses() {
         (pool, Some(4)),
         "a pointer the program never reads"
     );
+    assert_eq!(
+        reach(true, desc(direct, extent(5, 0), None)),
+        (pool, Some(8)),
+        "a byte access reaches the end of its word"
+    );
+    cbuf(pool + 2, 0);
+    assert_eq!(
+        reach(true, desc(direct, extent(5, 0), None)),
+        (pool + 2, Some(6)),
+        "the word end counts from the aligned address"
+    );
 
     cbuf(table, 0);
     assert_eq!(
