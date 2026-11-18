@@ -55,13 +55,15 @@ struct EncodeParams {
     out_offset: u32,
 }
 
-/// One subresource whose ASTC blocks sit in staging: `depth` slices of tightly packed rows of
-/// blocks from byte `staging` of the staging buffer, for host `level` of `layer`.
+/// One subresource, or a band of one from texel row and slice `origin`, whose ASTC blocks sit
+/// in staging: `depth` slices of tightly packed rows of blocks from byte `staging` of the
+/// staging buffer, for host `level` of `layer`.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct AstcLevel {
     pub staging: u64,
     pub layer: u32,
     pub level: u32,
+    pub origin: (u32, u32),
     pub extent: (u32, u32, u32),
 }
 
@@ -176,9 +178,9 @@ impl AstcDecoder {
                         blocks_x,
                         blocks_y: band_blocks,
                         width: w,
-                        y,
+                        y: level.origin.0 + y,
                         rows: (band_blocks * bh).min(h - y),
-                        z,
+                        z: level.origin.1 + z,
                         layer: level.layer,
                         level: level.level,
                         ..Band::default()

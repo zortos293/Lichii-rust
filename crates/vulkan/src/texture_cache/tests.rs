@@ -9,7 +9,7 @@ use lichii_texture::tic::{TextureType, TicEntry};
 use lichii_texture::{Compression, astc, bcn, etc};
 
 use super::*;
-use crate::host_budget::RING_OVERSIZED_CAP;
+use crate::host_budget::{PART_SLICE, RING_OVERSIZED_CAP, STAGING_REQUEST_MAX};
 use crate::{Instance, SurfaceSupport};
 
 const DRAM: u64 = 64 << 20;
@@ -6522,4 +6522,315 @@ fn measures_untiling_cost_on_the_back() {
             );
         }
     }
+}
+
+impl Fixture {
+    /// One subresource of a colour image as tightly packed host texels.
+    fn read_subresource(&mut self, id: ImageId, layer: u32, level: u32) -> Vec<u8> {
+        let image = self.cache.get(id).unwrap();
+        let (format, host) = (image.info.format, image.host);
+        let extent = image.host_extent(level);
+        let size =
+            convert::host_layout(format, &host, (extent.width, extent.height, extent.depth)).main;
+        let buffer = Buffer::new(
+            &self.device,
+            size as u64,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            MemoryLocation::GpuToCpu,
+            "readback",
+        )
+        .unwrap();
+        let cmd = self.scheduler.record().unwrap();
+        let raw = self
+            .cache
+            .prepare(&mut self.scheduler, id, ImageAccess::TRANSFER_SRC)
+            .unwrap()
+            .expect("a live image");
+        let region = vk::BufferImageCopy {
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: level,
+                base_array_layer: layer,
+                layer_count: 1,
+            },
+            image_extent: extent,
+            ..Default::default()
+        };
+        // SAFETY: the image is in TRANSFER_SRC layout and the buffer holds the region.
+        unsafe {
+            self.device.raw.cmd_copy_image_to_buffer(
+                cmd,
+                raw,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                buffer.raw(),
+                &[region],
+            )
+        };
+        transfer_to_all_barrier(&self.device, cmd);
+        self.scheduler.finish().unwrap();
+        buffer.mapped().unwrap()[..size].to_vec()
+    }
+
+    /// Uploads \`header\` and checks what it held of host-visible memory: no oversized staging,
+    /// no request past [\`STAGING_REQUEST_MAX\`], and at most the two part slices beside the ring,
+    /// shrunk back once the upload's tick completed. Returns the largest request.
+    fn upload_bounded(&mut self, header: &TicEntry) -> (ImageId, u64) {
+        let before = self.device.memory_counts().cpu_to_gpu.bytes;
+        let tick = self.scheduler.tick();
+        let (id, _) = self.texture(header);
+        let held = self.device.memory_counts().cpu_to_gpu.bytes - before;
+        let request = self.staging.take_request_max();
+        assert_eq!(
+            self.scheduler.tick(),
+            tick,
+            "one operation: the tick never ended"
+        );
+        assert_eq!(self.staging.oversized().bytes, 0, "no oversized staging");
+        assert!(
+            request <= STAGING_REQUEST_MAX,
+            "a {request}-byte request passed the bound"
+        );
+        assert!(
+            held <= 2 * STAGING_REQUEST_MAX,
+            "{held} host-visible bytes held by one upload"
+        );
+        self.scheduler.finish().unwrap();
+        self.staging.reclaim_parts(&mut self.scheduler);
+        let after = self.device.memory_counts().cpu_to_gpu.bytes - before;
+        assert!(
+            after <= 2 * PART_SLICE,
+            "{after} host-visible bytes kept after the upload"
+        );
+        (id, request)
+    }
+}
+
+/// Writes each subresource of \`s\` swizzled, as [\`level_data\`] would make it, one at a time so
+/// the test never holds the whole surface twice.
+fn write_surface_by_subresource(
+    memory: &DeviceAddressSpace,
+    base: DAddr,
+    s: &SurfaceLayout,
+    seed: u32,
+) {
+    for layer in 0..s.layers {
+        for level in 0..s.levels {
+            let tiling = s.level_tiling(level);
+            let data = pattern(tiling.linear_size_bytes(), seed + layer * 97 + level * 13);
+            let mut tiled = vec![0; tiling.size_bytes()];
+            swizzle(&tiling, &data, &mut tiled);
+            memory
+                .write_bytes(base + s.subresource_offset(level, layer), &tiled)
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+fn uploads_past_the_request_bound_stage_through_bounded_parts() {
+    let s = surface(
+        PixelFormat::A8B8G8R8Unorm,
+        2048,
+        2048,
+        2,
+        13,
+        4,
+        GobLayout::Tegra,
+    );
+    assert!(s.size_bytes() > 4 * STAGING_REQUEST_MAX, "a 260 MiB array");
+    let Some(mut f) = fixture_with_dram(
+        GobLayout::Tegra,
+        AstcRecompression::Uncompressed,
+        s.size_bytes().next_multiple_of(1 << 20),
+    ) else {
+        return;
+    };
+    write_surface_by_subresource(&f.memory, DADDR, &s, 41);
+    let (id, request) = f.upload_bounded(&tic(0x08, GPU_VA, 2048, 2048, 13, 2, 4));
+    let level0 = s.level_tiling(0);
+    assert!(
+        request <= (level0.size_bytes() + level0.linear_size_bytes()) as u64 + (1 << 16),
+        "{request}: one subresource and its tiled bytes a part"
+    );
+    assert_eq!(
+        f.cache.traffic().gpu_untiled,
+        26,
+        "every subresource still untiles on the GPU"
+    );
+    for layer in 0..s.layers {
+        for level in 0..s.levels {
+            let want = pattern(
+                s.level_tiling(level).linear_size_bytes(),
+                41 + layer * 97 + level * 13,
+            );
+            assert!(
+                f.read_subresource(id, layer, level) == want,
+                "layer {layer} level {level} holds the guest texels"
+            );
+        }
+    }
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn subresources_past_the_request_bound_upload_in_bands() {
+    let cases = [
+        (
+            1,
+            (4352, 4352, 1),
+            "a 72 MiB 2D level in bands of block rows",
+        ),
+        (2, (512, 512, 72), "a 72 MiB 3D level in runs of slices"),
+    ];
+    for (texture_type, (w, h, d), case) in cases {
+        let s = UntileCase {
+            raw: 0x08,
+            format: PixelFormat::A8B8G8R8Unorm,
+            texture_type,
+            size: (w, h, d),
+            levels: 1,
+            block: (4, 0),
+            gob: GobLayout::Tegra,
+        }
+        .surface();
+        let bytes = s.level_tiling(0).linear_size_bytes() as u64;
+        assert!(bytes > STAGING_REQUEST_MAX, "{case}");
+        let Some(mut f) = fixture_with_dram(
+            GobLayout::Tegra,
+            AstcRecompression::Uncompressed,
+            s.size_bytes().next_multiple_of(1 << 20),
+        ) else {
+            return;
+        };
+        write_surface_by_subresource(&f.memory, DADDR, &s, 7);
+        let (id, request) = f.upload_bounded(&tic_typed(0x08, texture_type, w, h, d, 1, 4, 0));
+        assert!(request < bytes, "{case}: {request}-byte request");
+        assert_eq!(
+            f.cache.traffic().gpu_untiled,
+            0,
+            "{case}: untiled on the CPU"
+        );
+        assert!(
+            f.read_subresource(id, 0, 0) == pattern(bytes as usize, 7),
+            "{case}: the level holds the guest texels"
+        );
+        f.assert_no_validation_errors();
+    }
+}
+
+#[test]
+fn banded_uploads_match_whole_ones() {
+    let case = |raw, format, texture_type, size, levels, block| UntileCase {
+        raw,
+        format,
+        texture_type,
+        size,
+        levels,
+        block,
+        gob: GobLayout::Tegra,
+    };
+    let cases = [
+        case(0x08, PixelFormat::A8B8G8R8Unorm, 5, (70, 40, 3), 4, (2, 0)),
+        case(0x08, PixelFormat::A8B8G8R8Unorm, 2, (32, 16, 20), 3, (1, 2)),
+        case(0x24, PixelFormat::Bc1RgbaUnorm, 1, (256, 128, 1), 4, (3, 0)),
+        case(0x17, PixelFormat::Bc7Unorm, 1, (96, 64, 1), 3, (2, 0)),
+        case(0x44, PixelFormat::Astc8x8Unorm, 1, (256, 160, 1), 2, (1, 0)),
+        case(0x44, PixelFormat::Astc8x8Unorm, 5, (200, 136, 2), 2, (1, 0)),
+    ];
+    for c in &cases {
+        for decode in [AstcDecode::Gpu, AstcDecode::Cpu] {
+            let upload = |piece_max| {
+                let mut f = fixture(c.gob, AstcRecompression::Uncompressed)?;
+                f.cache.set_astc_decode(decode);
+                f.cache.piece_max = piece_max;
+                let s = c.surface();
+                write_surface(&f.memory, &s, &level_data(&s, c.raw));
+                let (w, h, d) = c.size;
+                let header = tic_typed(
+                    c.raw,
+                    c.texture_type,
+                    w,
+                    h,
+                    d,
+                    c.levels,
+                    c.block.0,
+                    c.block.1,
+                );
+                let (id, _) = f.texture(&header);
+                let texels = f.read_image(id);
+                f.assert_no_validation_errors();
+                Some((texels, f.cache.traffic().gpu_untiled))
+            };
+            let Some((whole, _)) = upload(STAGING_REQUEST_MAX) else {
+                return;
+            };
+            let (banded, _) = upload(4 << 10).expect("the device came up once");
+            assert_eq!(whole.len(), banded.len());
+            for (i, (got, want)) in banded.iter().zip(&whole).enumerate() {
+                assert!(
+                    got == want,
+                    "{:?} {:?} {decode:?}: subresource {i} differs in bands",
+                    c.format,
+                    c.size
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn large_uploads_in_one_tick_reuse_the_grown_part_slices() {
+    const TEXTURES: u64 = 6;
+    let s = surface(
+        PixelFormat::A8B8G8R8Unorm,
+        2048,
+        2048,
+        1,
+        1,
+        4,
+        GobLayout::Tegra,
+    );
+    let stride = s.size_bytes().next_multiple_of(1 << 20);
+    let Some(mut f) = fixture_with_dram(
+        GobLayout::Tegra,
+        AstcRecompression::Uncompressed,
+        TEXTURES * stride,
+    ) else {
+        return;
+    };
+    for k in 0..TEXTURES {
+        write_surface_by_subresource(&f.memory, DADDR + k * stride, &s, k as u32 * 5);
+    }
+    let piece = (s.level_tiling(0).size_bytes() + s.level_tiling(0).linear_size_bytes()) as u64;
+    let before = f.device.memory_counts().cpu_to_gpu.bytes;
+    let tick = f.scheduler.tick();
+    let ids: Vec<_> = (0..TEXTURES)
+        .map(|k| {
+            f.texture(&tic(0x08, GPU_VA + k * stride, 2048, 2048, 1, 1, 4))
+                .0
+        })
+        .collect();
+    let held = f.device.memory_counts().cpu_to_gpu.bytes - before;
+    assert_eq!(f.scheduler.tick(), tick, "one tick for every upload");
+    assert_eq!(f.staging.oversized().bytes, 0, "no oversized staging");
+    assert!(
+        held <= 2 * piece.next_power_of_two(),
+        "{held} host-visible bytes for {TEXTURES} uploads of {piece} staged bytes each"
+    );
+    assert_eq!(f.staging.part_bytes(), 2 * piece.next_power_of_two());
+    f.scheduler.finish().unwrap();
+    f.staging.reclaim_parts(&mut f.scheduler);
+    assert_eq!(
+        f.staging.part_bytes(),
+        0,
+        "the grown slices are freed once their tick completed"
+    );
+    for (k, id) in ids.into_iter().enumerate() {
+        let want = pattern(s.level_tiling(0).linear_size_bytes(), k as u32 * 5);
+        assert!(
+            f.read_subresource(id, 0, 0) == want,
+            "texture {k} holds its guest texels"
+        );
+    }
+    f.assert_no_validation_errors();
 }

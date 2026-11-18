@@ -45,7 +45,7 @@ use crate::device::Device;
 use crate::error::Result;
 use crate::format::{Conversion, host_format};
 use crate::host_budget::RING_OVERSIZED_CAP;
-use crate::memory::{Buffer, Image, ImageDesc};
+use crate::memory::{Buffer, Image, ImageDesc, LiveMemory, MemoryCounts, MemoryObjects};
 use crate::pipeline::PipelineCache;
 use crate::pipeline::shader_cache::ShaderCache;
 use crate::present::{FrameImage, FrameMailbox, GuestFrame};
@@ -58,6 +58,19 @@ use crate::texture_cache::{
 
 /// The tracing target of the GPU thread's and the presenter's activity lines.
 pub(crate) const ACTIVITY_TARGET: &str = "lichii_vulkan::activity";
+
+/// What the `GPU memory` activity line reports, in bytes.
+struct MemoryLine {
+    counts: MemoryCounts,
+    objects: MemoryObjects,
+    oversized_stream: LiveMemory,
+    oversized_staging: LiveMemory,
+    /// The buffer cache's device-local gathers and streamed ranges ([`BufferCache::large_stream`]).
+    large_stream: LiveMemory,
+    /// The largest single staging or stream request since the last line.
+    staging_request_max: u64,
+    staging_part_slices: u64,
+}
 
 /// What the GPU thread recorded since its last activity line. With
 /// `lichii_vulkan::activity=debug` it logs one line a second while it submits work, so a run
@@ -777,6 +790,8 @@ impl VulkanRasterizer {
         {
             return;
         }
+        self.buffer_cache.reclaim(&mut self.scheduler);
+        self.staging.reclaim_parts(&mut self.scheduler);
         if let Err(error) = self.capture() {
             tracing::error!(%error, "capturing GPU-written buffers and images failed");
         }
@@ -847,12 +862,15 @@ impl VulkanRasterizer {
             vram_budget_mib = memory.budget >> 20,
             "GPU thread"
         );
-        let counts = self.device.memory_counts();
-        let objects = self.device.memory_objects();
-        let (stream, staging) = (
-            self.buffer_cache.oversized_stream(),
-            self.staging.oversized(),
-        );
+        let MemoryLine {
+            counts,
+            objects,
+            oversized_stream,
+            oversized_staging,
+            large_stream,
+            staging_request_max,
+            staging_part_slices,
+        } = self.memory_line();
         tracing::debug!(
             target: ACTIVITY_TARGET,
             gpu_only_mib = counts.gpu_only.bytes >> 20,
@@ -863,15 +881,19 @@ impl VulkanRasterizer {
             gpu_to_cpu_allocations = counts.gpu_to_cpu.count,
             device_blocks = objects.blocks,
             dedicated_allocations = objects.dedicated,
-            oversized_stream_mib = stream.bytes >> 20,
-            oversized_stream_buffers = stream.count,
-            oversized_staging_mib = staging.bytes >> 20,
-            oversized_staging_buffers = staging.count,
+            oversized_stream_mib = oversized_stream.bytes >> 20,
+            oversized_stream_buffers = oversized_stream.count,
+            oversized_staging_mib = oversized_staging.bytes >> 20,
+            oversized_staging_buffers = oversized_staging.count,
+            staging_request_max_mib = staging_request_max.div_ceil(1 << 20),
+            staging_part_slices_mib = staging_part_slices >> 20,
+            large_stream_mib = large_stream.bytes >> 20,
+            large_stream_buffers = large_stream.count,
             pipelines = self.device.pipelines(),
             descriptor_pools = self.device.descriptor_pools(),
             "GPU memory"
         );
-        *a = Activity {
+        self.activity = Activity {
             since: Some(now),
             textures,
             buffers,
@@ -879,6 +901,22 @@ impl VulkanRasterizer {
             queue_submits: self.scheduler.submits(),
             ..Activity::default()
         };
+    }
+
+    /// What the `GPU memory` line reports, taking the largest requests since the last line.
+    fn memory_line(&mut self) -> MemoryLine {
+        MemoryLine {
+            counts: self.device.memory_counts(),
+            objects: self.device.memory_objects(),
+            oversized_stream: self.buffer_cache.oversized_stream(),
+            oversized_staging: self.staging.oversized(),
+            large_stream: self.buffer_cache.large_stream(),
+            staging_request_max: self
+                .staging
+                .take_request_max()
+                .max(self.buffer_cache.take_stream_request_max()),
+            staging_part_slices: self.staging.part_bytes(),
+        }
     }
 
     /// A free frame image of this size and format, or a new one.
@@ -1829,7 +1867,10 @@ mod tests {
     use lichii_texture::PixelFormat;
     use lichii_texture::block_linear::{swizzle, unswizzle};
 
+    use lichii_gpu::engines::maxwell_3d::regs::PrimitiveTopology;
+
     use super::*;
+    use crate::host_budget::{PART_SLICE, STAGING_REQUEST_MAX};
     use crate::memory::Buffer;
     use crate::{Instance, SurfaceSupport};
 
@@ -3165,5 +3206,55 @@ mod tests {
                 "invalidate_region of a 64-256 byte constant buffer write ({name}): best of 10 {best:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_gpu_memory_line_reads_the_large_stream_pool() {
+        let Some(mut f) = fixture(GobLayout::Tegra) else {
+            return;
+        };
+        let gmmu = Arc::new(Gmmu::new(f.memory.clone(), BigPageSize::Size64K));
+        let r = &mut f.rasterizer;
+        let line = r.memory_line();
+        assert_eq!(line.large_stream, LiveMemory::default());
+        let regs = bytemuck::zeroed_box::<Regs>();
+        let vertices = 20_000_000u32;
+        let draw = DrawParams {
+            topology: PrimitiveTopology::LINE_LOOP,
+            indexed: false,
+            first: 0,
+            count: vertices,
+            base_vertex: 0,
+            base_instance: 0,
+            instance_count: 1,
+            inline_indices: None,
+        };
+        r.buffer_cache
+            .index_buffer(&mut r.scheduler, &mut r.staging, &gmmu, &regs, &draw)
+            .unwrap();
+        let streamed = (u64::from(vertices) + 1) * 4;
+        let line = r.memory_line();
+        assert_eq!(
+            line.large_stream,
+            LiveMemory {
+                bytes: streamed,
+                count: 1
+            },
+            "large_stream_mib and large_stream_buffers read the pool"
+        );
+        assert_eq!(line.large_stream, r.buffer_cache.large_stream());
+        assert!(line.staging_request_max <= STAGING_REQUEST_MAX);
+        r.unflushed = true;
+        r.flush();
+        r.scheduler.finish().unwrap();
+        r.scheduler.record().unwrap();
+        r.unflushed = true;
+        r.flush();
+        assert_eq!(
+            r.memory_line().large_stream,
+            LiveMemory::default(),
+            "the next flush frees what a completed tick held"
+        );
+        assert_eq!(r.staging.part_bytes(), 2 * PART_SLICE);
     }
 }
