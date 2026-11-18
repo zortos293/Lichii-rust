@@ -2529,6 +2529,105 @@ fn evict_before_create_changes_nothing_under_the_critical_line() {
     f.assert_no_validation_errors();
 }
 
+/// A render target marks its device pages in the written-pages bitmap on its first GPU write
+/// only, and again once a remap backs the sparse page of its window: that page is marked too.
+#[test]
+fn gpu_writes_mark_the_pages_of_each_mapping_of_a_target() {
+    const HOLE: u64 = 1;
+    const BACKED: DAddr = DADDR + 0x90_0000;
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    f.gmmu.map_sparse(REMAP_VA, 4 * 0x1000, false).unwrap();
+    for page in (0..4).filter(|&p| p != HOLE) {
+        f.gmmu
+            .map(
+                REMAP_VA + page * 0x1000,
+                REMAP_DADDR + page * 0x1000,
+                0x1000,
+                0,
+                false,
+            )
+            .unwrap();
+    }
+    let info = rt_info(64, 64, 2, GobLayout::Tegra);
+    let target = |f: &mut Fixture| {
+        let (mut tx, cache, gmmu) = f.tx();
+        cache
+            .render_target(&mut tx, gmmu, REMAP_VA, &info, true)
+            .unwrap()
+            .unwrap()
+            .id
+    };
+    let id = target(&mut f);
+    assert!(!f.cache.written_pages.may_be_written(REMAP_DADDR, 0x4000));
+    f.cache.mark_modified(id);
+    assert!(f.cache.written_pages.may_be_written(REMAP_DADDR, 0x1000));
+    assert!(
+        f.cache
+            .written_pages
+            .may_be_written(REMAP_DADDR + 0x3000, 0x1000)
+    );
+    let image = f.cache.get(id).unwrap();
+    assert_eq!(image.marked, image.serial);
+    f.cache.mark_modified(id);
+    f.gmmu
+        .map(REMAP_VA + HOLE * 0x1000, BACKED, 0x1000, 0, false)
+        .unwrap();
+    f.cache.invalidate_lookups();
+    assert_eq!(target(&mut f), id, "the remap keeps the image");
+    assert!(
+        f.cache
+            .get(id)
+            .unwrap()
+            .segments
+            .iter()
+            .any(|s| s.daddr == BACKED)
+    );
+    assert!(!f.cache.written_pages.may_be_written(BACKED, 0x1000));
+    f.cache.mark_modified(id);
+    assert!(
+        f.cache.written_pages.may_be_written(BACKED, 0x1000),
+        "the newly backed page is marked"
+    );
+    f.assert_no_validation_errors();
+}
+
+/// The cost of marking a drawn 1920x1088 A8B8G8R8 render target GPU-modified again, as every
+/// draw into it does: `cargo test --release -p lichii-vulkan --lib mark_modified_cost -- --ignored --nocapture`.
+#[test]
+#[ignore = "timing"]
+fn mark_modified_cost() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let info = rt_info(1920, 1088, 4, GobLayout::Tegra);
+    let id = {
+        let (mut tx, cache, gmmu) = f.tx();
+        cache
+            .render_target(&mut tx, gmmu, GPU_VA, &info, true)
+            .unwrap()
+            .unwrap()
+            .id
+    };
+    f.cache.mark_modified(id);
+    const CALLS: u32 = 2000;
+    let mut times = Vec::new();
+    for _ in 0..101 {
+        let start = Instant::now();
+        for _ in 0..CALLS {
+            f.cache.mark_modified(std::hint::black_box(id));
+        }
+        times.push(start.elapsed() / CALLS);
+    }
+    times.sort();
+    println!(
+        "mark_modified, 1920x1088 target: median {:?}, min {:?}",
+        times[times.len() / 2],
+        times[0]
+    );
+}
+
 /// The cost of one texture creation under the critical line, and past it with the least
 /// recently used entries old enough that each creation evicts one first, over 2000 cached
 /// images: \`cargo test -p lichii-vulkan --lib create_cost -- --ignored --nocapture\`.

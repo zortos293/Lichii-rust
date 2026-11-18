@@ -439,6 +439,9 @@ struct CachedImage {
     /// Names the image and its segments: no other image or remap has it, so GPU overlap syncs
     /// replay run plans keyed by it.
     serial: u64,
+    /// The `serial` whose segments are set in the written-pages bitmap, whose marks stay for
+    /// the session: 0 before the first GPU write.
+    marked: u64,
 }
 
 /// A live image that shares a rectangle of texels with another, at level 0 of layer 0:
@@ -1960,14 +1963,19 @@ impl TextureCache {
     /// bitmap. Called when the writing work is recorded.
     pub fn mark_modified(&mut self, id: ImageId) {
         if let Some(image) = self.get(id) {
+            let mark = image.marked != image.serial;
             let arm = self
                 .flush_traps
                 .as_ref()
                 .filter(|_| !image.gpu_modified && image.downloadable());
-            for s in &image.segments {
-                self.written_pages.mark(s.daddr, s.size);
-                if let Some(memory) = arm {
-                    memory.arm_flush_traps(s.daddr, s.size);
+            if mark || arm.is_some() {
+                for s in &image.segments {
+                    if mark {
+                        self.written_pages.mark(s.daddr, s.size);
+                    }
+                    if let Some(memory) = arm {
+                        memory.arm_flush_traps(s.daddr, s.size);
+                    }
                 }
             }
         }
@@ -1976,6 +1984,7 @@ impl TextureCache {
         let Some(image) = self.get_mut(id) else {
             return;
         };
+        image.marked = image.serial;
         image.gpu_modified = true;
         image.cpu_dirty = false;
         image.written = tick;
@@ -3148,6 +3157,7 @@ impl TextureCache {
             trim,
             sparse_va,
             serial: self.next_serial(),
+            marked: 0,
         };
         let index = match self.free.pop() {
             Some(index) => index,
