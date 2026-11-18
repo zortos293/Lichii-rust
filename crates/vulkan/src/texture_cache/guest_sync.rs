@@ -85,6 +85,10 @@ pub(super) struct GuestSync {
     linear: Option<Buffer>,
     stencil: Option<Buffer>,
     runs: Option<Buffer>,
+    /// The set the last flush bound, the tick it was allocated in and the guest, linear,
+    /// stencil and runs buffers it binds. Later flushes of that tick over the same buffers
+    /// bind it again, as the allocator keeps it until the tick's work completes.
+    set: Option<(vk::DescriptorSet, u64, [vk::Buffer; 4])>,
     scratch: RunScratch,
     plans: Plans,
     batch: Batch,
@@ -104,6 +108,7 @@ impl GuestSync {
             linear: None,
             stencil: None,
             runs: None,
+            set: None,
             scratch: RunScratch::default(),
             plans: Plans::default(),
             batch: Batch::default(),
@@ -815,6 +820,7 @@ impl GuestSync {
             linear: linear_slot,
             stencil: stencil_slot,
             runs: runs_slot,
+            set: set_slot,
             batch,
             ..
         } = self;
@@ -883,7 +889,6 @@ impl GuestSync {
             }
         }
         memory_barrier(device, cmd, COPIES, DISPATCHES);
-        let set = descriptors.allocate(tx.scheduler, compute.set_layout)?;
         let limit = u64::from(device.properties.limits.max_storage_buffer_range);
         let bound = |buffer: &Option<Buffer>| {
             let buffer = buffer.as_ref().expect("ensured");
@@ -893,15 +898,22 @@ impl GuestSync {
                 range: buffer.size().min(limit),
             }
         };
-        compute.write_set(
-            set,
-            &[
-                bound(guest),
-                bound(linear_slot),
-                bound(stencil_slot),
-                bound(runs_slot),
-            ],
-        );
+        let buffers = [
+            bound(guest),
+            bound(linear_slot),
+            bound(stencil_slot),
+            bound(runs_slot),
+        ];
+        let tick = tx.scheduler.tick();
+        let set = match *set_slot {
+            Some((set, at, bound)) if at == tick && bound == buffers.map(|b| b.buffer) => set,
+            _ => {
+                let set = descriptors.allocate(tx.scheduler, compute.set_layout)?;
+                compute.write_set(set, &buffers);
+                *set_slot = Some((set, tick, buffers.map(|b| b.buffer)));
+                set
+            }
+        };
         compute.bind(cmd, set);
         for m in moves.iter() {
             compute.dispatch_bound(cmd, bytemuck::bytes_of(&m.params), m.groups);
