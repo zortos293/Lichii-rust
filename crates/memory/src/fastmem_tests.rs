@@ -765,3 +765,89 @@ mod placement {
         );
     }
 }
+
+#[test]
+fn touched_counts_pages_written_through_the_backing_or_fastmem() {
+    const MIB: u64 = 1 << 20;
+    const PAGE: u64 = 0x1000;
+    let physical = Arc::new(PhysicalMemory::new(16 * MIB).unwrap());
+    let space = match AddressSpace::with_fastmem(physical.clone(), 39) {
+        Ok(space) => space,
+        Err(FastmemError::NoFaultHandler | FastmemError::NoViews) => return,
+        Err(err) => panic!("{err}"),
+    };
+    space.map(0x8000_0000, 4 * MIB, 4 * MIB, MemoryPermission::READ_WRITE);
+    assert_eq!(physical.touched(&[&space]).pages, 0);
+
+    fill(&physical, 4 * MIB, 3 * PAGE, 1);
+    let base = space.fastmem().unwrap().base();
+    // SAFETY: the page is mapped read-write in the arena.
+    unsafe { std::ptr::write_volatile(base.add(0x8000_0000 + 2 * MIB as usize + 0x1000), 2u8) };
+
+    let touched = physical.touched(&[&space]);
+    assert!(touched.pages >= 4 * PAGE, "{touched:?}");
+    assert!(touched.granules >= touched.pages, "{touched:?}");
+    #[cfg(windows)]
+    assert_eq!(
+        touched,
+        crate::TouchedMemory {
+            pages: 4 * PAGE,
+            granules: 4 * MIB
+        }
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn dram_is_committed_on_first_touch_through_any_view() {
+    const MIB: u64 = 1 << 20;
+    let physical = Arc::new(PhysicalMemory::new(64 * MIB).unwrap());
+    let Ok(space) = AddressSpace::with_fastmem(physical.clone(), 39) else {
+        return;
+    };
+    physical.commit(0, 8 * MIB).unwrap();
+    assert_eq!(
+        physical.host_bytes(),
+        0,
+        "handing pages out commits nothing"
+    );
+
+    fill(&physical, 0x1000, 0x10, 0xaa);
+    assert_eq!(
+        physical.host_bytes(),
+        2 * MIB,
+        "a host write commits its chunk"
+    );
+
+    space.map(0x8000_0000, 2 * MIB, 4 * MIB, MemoryPermission::READ_WRITE);
+    assert_eq!(physical.host_bytes(), 2 * MIB, "mapping commits nothing");
+    let base = space.fastmem().unwrap().base();
+    // SAFETY: the page is mapped read-write in the arena.
+    unsafe { std::ptr::write_volatile(base.add(0x8000_1000), 0x55u8) };
+    assert_eq!(
+        physical.host_bytes(),
+        4 * MIB,
+        "a guest write commits its chunk"
+    );
+    assert_eq!(byte(&physical, 2 * MIB + 0x1000), 0x55);
+    assert_eq!(host_read::<u8>(&space, 0x8020_2000), 0);
+    assert_eq!(
+        physical.host_bytes(),
+        6 * MIB,
+        "a guest read commits its chunk"
+    );
+    assert_eq!(space.read::<u8>(0x8000_1000).unwrap(), 0x55);
+
+    space.map(0x9000_0000, 6 * MIB, 0x1000, MemoryPermission::READ);
+    assert_eq!(
+        physical.host_bytes(),
+        8 * MIB,
+        "protecting a view commits its chunk"
+    );
+    assert_eq!(host_read::<u8>(&space, 0x9000_0000), 0);
+
+    space.unmap(0x8000_0000, 4 * MIB);
+    space.unmap(0x9000_0000, 0x1000);
+    assert_eq!(physical.release(0, 8 * MIB), 0..8 * MIB);
+    assert_eq!(physical.host_bytes(), 0);
+}

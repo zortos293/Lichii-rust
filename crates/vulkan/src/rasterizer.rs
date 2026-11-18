@@ -45,7 +45,7 @@ use crate::device::Device;
 use crate::error::Result;
 use crate::format::{Conversion, host_format};
 use crate::host_budget::RING_OVERSIZED_CAP;
-use crate::memory::{Buffer, Image, ImageDesc, LiveMemory, MemoryCounts};
+use crate::memory::{Buffer, Image, ImageDesc, LiveMemory, MemoryCounts, MemoryObjects};
 use crate::pipeline::PipelineCache;
 use crate::pipeline::shader_cache::ShaderCache;
 use crate::present::{FrameImage, FrameMailbox, GuestFrame};
@@ -62,6 +62,7 @@ pub(crate) const ACTIVITY_TARGET: &str = "lichii_vulkan::activity";
 /// What the `GPU memory` activity line reports, in bytes.
 struct MemoryLine {
     counts: MemoryCounts,
+    objects: MemoryObjects,
     oversized_stream: LiveMemory,
     oversized_staging: LiveMemory,
     /// The buffer cache's device-local gathers and streamed ranges ([`BufferCache::large_stream`]).
@@ -863,6 +864,7 @@ impl VulkanRasterizer {
         );
         let MemoryLine {
             counts,
+            objects,
             oversized_stream,
             oversized_staging,
             large_stream,
@@ -877,6 +879,8 @@ impl VulkanRasterizer {
             cpu_to_gpu_allocations = counts.cpu_to_gpu.count,
             gpu_to_cpu_mib = counts.gpu_to_cpu.bytes >> 20,
             gpu_to_cpu_allocations = counts.gpu_to_cpu.count,
+            device_blocks = objects.blocks,
+            dedicated_allocations = objects.dedicated,
             oversized_stream_mib = oversized_stream.bytes >> 20,
             oversized_stream_buffers = oversized_stream.count,
             oversized_staging_mib = oversized_staging.bytes >> 20,
@@ -903,6 +907,7 @@ impl VulkanRasterizer {
     fn memory_line(&mut self) -> MemoryLine {
         MemoryLine {
             counts: self.device.memory_counts(),
+            objects: self.device.memory_objects(),
             oversized_stream: self.buffer_cache.oversized_stream(),
             oversized_staging: self.staging.oversized(),
             large_stream: self.buffer_cache.large_stream(),

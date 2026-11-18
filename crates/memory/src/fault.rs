@@ -20,6 +20,11 @@ use parking_lot::Mutex;
 /// allocate, lock, or unwind.
 pub type FaultHandler = fn(data: usize, guest_addr: u64, fault: &mut HostFault) -> bool;
 
+/// Runs first on a fault inside a registered range, with the faulting offset into it and the
+/// faulting host address; returning `true` retries the access. It commits guest DRAM on first
+/// touch, under the same restrictions as [`FaultHandler`].
+pub(crate) type TouchHook = fn(data: usize, offset: u64, host_addr: usize) -> bool;
+
 /// The interrupted host thread's state at a fastmem fault.
 pub struct HostFault {
     ctx: *mut std::ffi::c_void,
@@ -33,6 +38,11 @@ struct HandlerEntry {
     data: usize,
 }
 
+struct TouchEntry {
+    hook: TouchHook,
+    data: usize,
+}
+
 /// One registered arena. The handler and its data are published together as one immutable
 /// entry; replaced entries are leaked on purpose, because a fault on another thread may still be
 /// running the old one and a signal handler cannot take part in any reclamation protocol.
@@ -40,6 +50,7 @@ struct Slot {
     base: AtomicUsize,
     size: AtomicUsize,
     handler: AtomicPtr<HandlerEntry>,
+    touch: AtomicPtr<TouchEntry>,
 }
 
 static ARENAS: [Slot; SLOTS] = [const {
@@ -47,6 +58,7 @@ static ARENAS: [Slot; SLOTS] = [const {
         base: AtomicUsize::new(0),
         size: AtomicUsize::new(0),
         handler: AtomicPtr::new(std::ptr::null_mut()),
+        touch: AtomicPtr::new(std::ptr::null_mut()),
     }
 }; SLOTS];
 static REGISTRY: Mutex<()> = Mutex::new(());
@@ -71,6 +83,7 @@ impl Registration {
             .position(|s| s.base.load(Ordering::Acquire) == 0)?;
         let entry = &ARENAS[slot];
         entry.handler.store(std::ptr::null_mut(), Ordering::Release);
+        entry.touch.store(std::ptr::null_mut(), Ordering::Release);
         entry.size.store(size, Ordering::Release);
         entry.base.store(base, Ordering::Release);
         Some(Self { slot })
@@ -82,6 +95,12 @@ impl Registration {
         });
         ARENAS[self.slot].handler.store(entry, Ordering::Release);
     }
+
+    /// Sets the hook that runs before the handler. Like handlers, replaced entries are leaked.
+    pub(crate) fn set_touch(&self, hook: TouchHook, data: usize) {
+        let entry = Box::into_raw(Box::new(TouchEntry { hook, data }));
+        ARENAS[self.slot].touch.store(entry, Ordering::Release);
+    }
 }
 
 impl Drop for Registration {
@@ -90,6 +109,7 @@ impl Drop for Registration {
         let entry = &ARENAS[self.slot];
         entry.base.store(0, Ordering::Release);
         entry.handler.store(std::ptr::null_mut(), Ordering::Release);
+        entry.touch.store(std::ptr::null_mut(), Ordering::Release);
     }
 }
 
@@ -100,7 +120,13 @@ fn dispatch(addr: usize, ctx: *mut std::ffi::c_void) -> bool {
         if base == 0 || addr < base || addr - base >= entry.size.load(Ordering::Acquire) {
             continue;
         }
-        // SAFETY: handler entries are leaked, never freed, so the pointer stays valid.
+        // SAFETY: touch and handler entries are leaked, never freed, so the pointers stay valid.
+        if let Some(touch) = unsafe { entry.touch.load(Ordering::Acquire).as_ref() }
+            && (touch.hook)(touch.data, (addr - base) as u64, addr)
+        {
+            return true;
+        }
+        // SAFETY: as above.
         let Some(handler) = (unsafe { entry.handler.load(Ordering::Acquire).as_ref() }) else {
             return false;
         };

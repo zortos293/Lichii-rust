@@ -14,7 +14,7 @@ use lichii_shader::profile::HostTranslateInfo;
 
 use crate::error::{Error, Result, VkResultExt};
 use crate::instance::Instance;
-use crate::memory::MemoryCounters;
+use crate::memory::{MemoryCounters, MemoryPool};
 use crate::profile::{ShaderQueries, shader_profile};
 
 /// Device memory blocks are 64 MiB: with 256 MiB blocks ~38% of device memory sat empty in
@@ -189,7 +189,7 @@ pub struct Device {
     pub features: DeviceFeatures,
     pub(crate) queue_family: u32,
     queue: Mutex<vk::Queue>,
-    pub(crate) allocator: ManuallyDrop<Mutex<Allocator>>,
+    pub(crate) allocator: ManuallyDrop<Mutex<MemoryPool>>,
     /// Live allocations by memory location.
     pub(crate) memory_counters: MemoryCounters,
     /// Live [`crate::pipeline::cache::Pipeline`]s: built, libraries and fast-linked ones.
@@ -758,7 +758,7 @@ impl Device {
             features,
             queue_family: candidate.queue_family,
             queue: Mutex::new(queue),
-            allocator: ManuallyDrop::new(Mutex::new(allocator)),
+            allocator: ManuallyDrop::new(Mutex::new(MemoryPool::new(allocator))),
             memory_counters: MemoryCounters::default(),
             pipelines: AtomicU64::new(0),
             descriptor_pools: AtomicU64::new(0),
