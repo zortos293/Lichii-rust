@@ -624,11 +624,18 @@ impl KernelInner {
     fn log_memory(&self) {
         let used = |pool| (self.memory.size(pool) - self.memory.free_size(pool)) >> 20;
         let process = lichii_memory::process_memory().unwrap_or_default();
+        let processes = self.processes.lock().clone();
+        let spaces: Vec<&AddressSpace> = processes.iter().map(|p| p.memory().as_ref()).collect();
+        let started = Instant::now();
+        let touched = self.physical.touched(&spaces);
         tracing::info!(
             target: "memory",
             private_mib = process.private >> 20,
             resident_mib = process.resident >> 20,
             guest_backing_mib = self.physical.host_bytes() >> 20,
+            guest_touched_mib = touched.pages >> 20,
+            guest_touched_granules_mib = touched.granules >> 20,
+            touched_scan_ms = started.elapsed().as_millis() as u64,
             application_mib = used(Pool::Application),
             system_mib = used(Pool::Applet) + used(Pool::System) + used(Pool::SystemNonSecure),
             "memory"

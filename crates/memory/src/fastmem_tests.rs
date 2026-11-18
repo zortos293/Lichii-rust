@@ -765,3 +765,34 @@ mod placement {
         );
     }
 }
+
+#[test]
+fn touched_counts_pages_written_through_the_backing_or_fastmem() {
+    const MIB: u64 = 1 << 20;
+    const PAGE: u64 = 0x1000;
+    let physical = Arc::new(PhysicalMemory::new(16 * MIB).unwrap());
+    let space = match AddressSpace::with_fastmem(physical.clone(), 39) {
+        Ok(space) => space,
+        Err(FastmemError::NoFaultHandler | FastmemError::NoViews) => return,
+        Err(err) => panic!("{err}"),
+    };
+    space.map(0x8000_0000, 4 * MIB, 4 * MIB, MemoryPermission::READ_WRITE);
+    assert_eq!(physical.touched(&[&space]).pages, 0);
+
+    fill(&physical, 4 * MIB, 3 * PAGE, 1);
+    let base = space.fastmem().unwrap().base();
+    // SAFETY: the page is mapped read-write in the arena.
+    unsafe { std::ptr::write_volatile(base.add(0x8000_0000 + 2 * MIB as usize + 0x1000), 2u8) };
+
+    let touched = physical.touched(&[&space]);
+    assert!(touched.pages >= 4 * PAGE, "{touched:?}");
+    assert!(touched.granules >= touched.pages, "{touched:?}");
+    #[cfg(windows)]
+    assert_eq!(
+        touched,
+        crate::TouchedMemory {
+            pages: 4 * PAGE,
+            granules: 4 * MIB
+        }
+    );
+}

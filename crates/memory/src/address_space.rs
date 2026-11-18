@@ -80,7 +80,6 @@ pub struct Fastmem {
 }
 
 impl Fastmem {
-    #[cfg(all(test, windows))]
     pub(crate) fn arena(&self) -> &Arena {
         &self.arena
     }

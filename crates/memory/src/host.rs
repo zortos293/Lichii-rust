@@ -123,6 +123,14 @@ impl Backing {
     pub(crate) fn supports_views(&self) -> bool {
         self.sys.supports_views()
     }
+
+    /// The part of the backing the host has touched, through its own view or through views in
+    /// `arenas`, as (bytes of touched pages, bytes of the [`Self::release_granule`]s holding
+    /// one): resident pages on Windows, allocated pages on Unix.
+    pub(crate) fn touched(&self, arenas: &[&Arena]) -> (u64, u64) {
+        let arenas: Vec<(&sys::Arena, *mut u8)> = arenas.iter().map(|a| (&a.sys, a.base)).collect();
+        self.sys.touched(self.ptr, &arenas)
+    }
 }
 
 impl Drop for Backing {
@@ -429,6 +437,11 @@ mod sys {
             }
         }
 
+        pub fn touched(&self, _ptr: *mut u8, _arenas: &[(&Arena, *mut u8)]) -> (u64, u64) {
+            let bytes = self.host_bytes();
+            (bytes, bytes)
+        }
+
         pub fn release(&self, ptr: *mut u8, offset: usize, len: usize) -> Range<usize> {
             let released = if self.fd >= 0 {
                 punch_hole(self.fd, offset, len)
@@ -594,9 +607,12 @@ mod sys {
         PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE, SEC_COMMIT,
         UnmapViewOfFile2, VirtualAlloc2, VirtualFree, VirtualProtect,
     };
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
+    };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-    use super::{HostProtection, Restricted, protection_runs, restricted_runs};
+    use super::{HostProtection, PAGE, Restricted, protection_runs, restricted_runs};
 
     const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
     const MEM_SPLIT_PLACEHOLDER: u32 = 0x2;
@@ -804,6 +820,77 @@ mod sys {
                 self.committed_chunks.fetch_add(1, Ordering::Relaxed);
             }
             Ok(())
+        }
+
+        /// Marks the resident pages of the views in `views` (host address, backing offset,
+        /// length) in `seen`, one bit per backing page.
+        fn mark_resident(views: impl Iterator<Item = (usize, usize, usize)>, seen: &mut [u64]) {
+            const BATCH: usize = 512;
+            let mut entries = [PSAPI_WORKING_SET_EX_INFORMATION::default(); BATCH];
+            for (host, backing_offset, len) in views {
+                let mut at = 0;
+                while at < len {
+                    let n = ((len - at) / PAGE).min(BATCH);
+                    for (i, entry) in entries[..n].iter_mut().enumerate() {
+                        entry.VirtualAddress = (host + at + i * PAGE) as *mut _;
+                    }
+                    // SAFETY: queries our own process into a buffer of n entries.
+                    let ok = unsafe {
+                        K32QueryWorkingSetEx(
+                            GetCurrentProcess(),
+                            entries.as_mut_ptr().cast(),
+                            (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+                        )
+                    };
+                    if ok != 0 {
+                        for (i, entry) in entries[..n].iter().enumerate() {
+                            // SAFETY: every bit pattern is a valid usize.
+                            if unsafe { entry.VirtualAttributes.Flags } & 1 != 0 {
+                                let page = (backing_offset + at) / PAGE + i;
+                                seen[page / 64] |= 1 << (page % 64);
+                            }
+                        }
+                    }
+                    at += n * PAGE;
+                }
+            }
+        }
+
+        pub fn touched(&self, ptr: *mut u8, arenas: &[(&Arena, *mut u8)]) -> (u64, u64) {
+            let chunks = self.size.div_ceil(CHUNK);
+            let mut seen = vec![0u64; (self.size / PAGE).div_ceil(64)];
+            let own = (0..chunks)
+                .filter(|&chunk| self.is_committed(chunk))
+                .map(|chunk| {
+                    (
+                        ptr as usize + chunk * CHUNK,
+                        chunk * CHUNK,
+                        self.chunk_len(chunk),
+                    )
+                });
+            Self::mark_resident(own, &mut seen);
+            for &(arena, base) in arenas {
+                let views: Vec<(usize, usize, usize)> = arena
+                    .views
+                    .lock()
+                    .iter()
+                    .map(|(&offset, view)| (base as usize + offset, view.backing_offset, view.len))
+                    .collect();
+                Self::mark_resident(views.into_iter(), &mut seen);
+            }
+            let (mut pages, mut granules) = (0u64, 0u64);
+            for chunk in (0..chunks).filter(|&chunk| self.is_committed(chunk)) {
+                let len = self.chunk_len(chunk);
+                let first = chunk * CHUNK / PAGE;
+                let touched: u64 = (first..first + len / PAGE)
+                    .map(|page| (seen[page / 64] >> (page % 64)) & 1)
+                    .sum();
+                pages += touched;
+                if touched > 0 {
+                    granules += len as u64;
+                }
+            }
+            (pages * PAGE as u64, granules)
         }
 
         pub fn release(&self, ptr: *mut u8, offset: usize, len: usize) -> Range<usize> {
