@@ -6185,3 +6185,79 @@ fn measures_dynamic_state_cost() {
         elapsed.as_secs_f64() * 1e9 / draws
     );
 }
+
+/// A Switch 2 program that reports its storage reach is served from the disk cache in a later
+/// run like any other: no translation, and its pipeline is built from the stored modules before
+/// any draw.
+#[test]
+fn reach_feedback_programs_hit_the_disk_cache_of_an_earlier_run() {
+    let dir = cache_dir("disk-feedback");
+    let run = |dir: &std::path::Path| {
+        let mut f = fixture(GobLayout::Switch2)?;
+        f.rasterizer.draw.pipelines.set_async_compilation(false);
+        f.rasterizer
+            .open_disk_cache(dir, &GraphicsSettings::default())
+            .unwrap();
+        Some(f)
+    };
+    let Some(mut f) = run(&dir) else {
+        return;
+    };
+    if !f.rasterizer.device.shader_profile.support_reach_feedback {
+        eprintln!("skipping: the device has no per-pipeline storage robustness");
+        return;
+    }
+    let memory = gmmu(&f);
+    let mut fragment = load_at_cbuf_offset(0).to_vec();
+    fragment.extend([
+        ampere_mov(1, 0),
+        ampere_mov(2, 0),
+        ampere_mov(3, 1.0f32.to_bits()),
+        ampere_exit(),
+    ]);
+    let regs = switch2_fragment_draw(&f, &fragment);
+    let offset = 0x2_0000u32;
+    write(
+        &f,
+        SSBO + u64::from(offset),
+        &0.5f32.to_bits().to_le_bytes(),
+    );
+    let mut words = (GPU_VA + SSBO).to_le_bytes().to_vec();
+    words.extend_from_slice(&offset.to_le_bytes());
+    write(&f, FRAGMENT_CBUF + 0x110, &words);
+    draw(&mut f, &memory, &regs);
+    let stats = f.rasterizer.draw.shaders.stats();
+    assert_eq!((stats.translated, stats.disk_hits), (2, 0));
+    drop(f);
+
+    let mut f = run(&dir).unwrap();
+    f.rasterizer.draw.pipelines.wait_for_builds();
+    assert_eq!(
+        f.rasterizer.draw.pipelines.stats().built,
+        1,
+        "the pipeline is built from the stored modules before any draw"
+    );
+    let memory = gmmu(&f);
+    let regs = switch2_fragment_draw(&f, &fragment);
+    write(
+        &f,
+        SSBO + u64::from(offset),
+        &0.5f32.to_bits().to_le_bytes(),
+    );
+    write(&f, FRAGMENT_CBUF + 0x110, &words);
+    draw(&mut f, &memory, &regs);
+    let stats = f.rasterizer.draw.shaders.stats();
+    assert_eq!(
+        (stats.translated, stats.disk_hits),
+        (0, 2),
+        "both programs come from the disk cache"
+    );
+    assert_eq!(
+        f.rasterizer.draw.pipelines.stats().built,
+        1,
+        "the draw uses the prebuilt pipeline"
+    );
+    f.assert_no_validation_errors();
+    drop(f);
+    let _ = std::fs::remove_dir_all(&dir);
+}
