@@ -6401,10 +6401,6 @@ fn switch2_unknown_reach_grows_from_gpu_feedback() {
     let Some(mut f) = fixture(GobLayout::Switch2) else {
         return;
     };
-    if !f.rasterizer.device.shader_profile.support_reach_feedback {
-        eprintln!("skipping: the device has no per-pipeline storage robustness");
-        return;
-    }
     f.rasterizer.draw.pipelines.set_async_compilation(false);
     let gmmu = gmmu(&f);
     let mut fragment = load_at_cbuf_offset(0).to_vec();
@@ -6467,10 +6463,6 @@ fn switch2_dispatches_grow_unknown_reach_from_gpu_feedback() {
         let Some(mut f) = fixture_with(GobLayout::Switch2, push) else {
             return;
         };
-        if !f.rasterizer.device.shader_profile.support_reach_feedback {
-            eprintln!("skipping: the device has no per-pipeline storage robustness");
-            return;
-        }
         f.rasterizer.draw.pipelines.set_async_compilation(false);
         let gmmu = gmmu(&f);
         const COPY: u64 = 0x10_c000;
@@ -6506,6 +6498,111 @@ fn switch2_dispatches_grow_unknown_reach_from_gpu_feedback() {
         );
         dispatch(&mut f);
         assert_eq!(slot_word(&mut f, 0), 77, "push {push}: the grown binding");
+        assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
+        f.assert_no_validation_errors();
+    }
+}
+
+/// Reads `size` bytes of `buffer` at `offset` as the GPU holds them, after all recorded work.
+fn read_device_buffer(f: &mut Fixture, buffer: vk::Buffer, offset: u64, size: u64) -> Vec<u8> {
+    let r = &mut f.rasterizer;
+    let readback = crate::memory::Buffer::new(
+        &r.device,
+        size,
+        vk::BufferUsageFlags::TRANSFER_DST,
+        gpu_allocator::MemoryLocation::GpuToCpu,
+        "test readback",
+    )
+    .unwrap();
+    let cmd = r.scheduler.record().unwrap();
+    let barrier = [vk::MemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+        .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)];
+    let region = [vk::BufferCopy {
+        src_offset: offset,
+        dst_offset: 0,
+        size,
+    }];
+    // SAFETY: both buffers are live and the command buffer is recording.
+    unsafe {
+        r.device.raw.cmd_pipeline_barrier2(
+            cmd,
+            &vk::DependencyInfo::default().memory_barriers(&barrier),
+        );
+        r.device
+            .raw
+            .cmd_copy_buffer(cmd, buffer, readback.raw(), &region);
+    }
+    crate::commands::transfer_to_all_barrier(&r.device, cmd);
+    r.scheduler.finish().unwrap();
+    readback.invalidate(0, size).unwrap();
+    readback.mapped().unwrap().to_vec()
+}
+
+/// A Switch 2 dispatch stores through its bare pointer 192 KiB in, past the 64 KiB floor its
+/// binding starts at, in a buffer the GPU already holds those bytes in. Without pipeline
+/// robustness the shader drops the store itself, so the bytes keep their value. Once the GPU
+/// reported the reach, the next dispatch binds them and stores.
+#[test]
+fn switch2_dispatches_drop_stores_past_their_unknown_reach() {
+    for push in [true, false] {
+        let Some(mut f) = fixture_with(GobLayout::Switch2, push) else {
+            return;
+        };
+        f.rasterizer.draw.pipelines.set_async_compilation(false);
+        let gmmu = gmmu(&f);
+        const STORE: u64 = 0x10_c000;
+        let mut code = load_at_cbuf_offset(0)[..4].to_vec();
+        code.extend([
+            ampere(AmpereOpcode::Ldc, Form::Bound, RZ_A | 0x120 << 38 | 4 << 73),
+            ampere(AmpereOpcode::Stg, Form::Fixed, 4 << 24 | 1 << 72 | 4 << 73),
+            ampere_exit(),
+        ]);
+        let bytes: Vec<u8> = code.iter().flat_map(|insn| insn.to_le_bytes()).collect();
+        write(&f, STORE, &bytes);
+        let offset = 0x3_0000u32;
+        write(&f, SSBO + u64::from(offset), &77u32.to_le_bytes());
+        let mut words = (GPU_VA + SSBO).to_le_bytes().to_vec();
+        words.extend_from_slice(&offset.to_le_bytes());
+        words.extend_from_slice(&[0; 4]);
+        words.extend_from_slice(&55u32.to_le_bytes());
+        write(&f, COPY_CBUFS + 0x110, &words);
+        let target = DADDR + SSBO + u64::from(offset);
+        let r = &mut f.rasterizer;
+        r.buffer_cache
+            .acquire(
+                &mut r.scheduler,
+                &mut r.staging,
+                DADDR + SSBO,
+                u64::from(offset) + 4,
+            )
+            .unwrap();
+
+        let dispatch = |f: &mut Fixture| {
+            launch_qmd(f, &gmmu, STORE, COPY_CBUFS, [1; 3], None, QmdVersion::V3);
+        };
+        dispatch(&mut f);
+        let r = &mut f.rasterizer;
+        let held = r
+            .buffer_cache
+            .acquire(&mut r.scheduler, &mut r.staging, target, 4)
+            .unwrap();
+        assert_eq!(
+            read_device_buffer(&mut f, held.buffer, held.offset, 4),
+            77u32.to_le_bytes(),
+            "push {push}: the store past the binding is dropped"
+        );
+        dispatch(&mut f);
+        f.rasterizer.flush_region(target, 4);
+        let mut word = [0u8; 4];
+        f.memory.read_bytes(target, &mut word).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(word),
+            55,
+            "push {push}: the grown binding stores"
+        );
         assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
         f.assert_no_validation_errors();
     }
@@ -6637,10 +6734,6 @@ fn reach_feedback_programs_hit_the_disk_cache_of_an_earlier_run() {
     let Some(mut f) = run(&dir) else {
         return;
     };
-    if !f.rasterizer.device.shader_profile.support_reach_feedback {
-        eprintln!("skipping: the device has no per-pipeline storage robustness");
-        return;
-    }
     let memory = gmmu(&f);
     let mut fragment = load_at_cbuf_offset(0).to_vec();
     fragment.extend([

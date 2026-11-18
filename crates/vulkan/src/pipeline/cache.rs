@@ -328,6 +328,12 @@ pub struct PipelineStats {
     pub libraries: u64,
     /// Pipelines linked from libraries for draws whose pipeline was still building.
     pub fast_linked: u64,
+    /// Complete pipelines the driver compiled rather than found in its cache.
+    pub full_compiles: u64,
+    /// Worker time spent building the [`Self::full_compiles`].
+    pub compile_time: Duration,
+    /// Worker time spent building the [`Self::libraries`].
+    pub library_time: Duration,
 }
 
 /// `None` once set: the build failed and the draw is skipped from then on instead of being
@@ -342,6 +348,8 @@ struct Shared {
     built: AtomicU64,
     /// Builds the driver compiled rather than found in its cache.
     compiled: AtomicU64,
+    compile_nanos: AtomicU64,
+    library_nanos: AtomicU64,
     failed: AtomicU64,
     cache_hits: AtomicU64,
     libraries: AtomicU64,
@@ -435,6 +443,7 @@ enum Build {
 impl Context {
     fn build(&self, build: Build) -> Option<Pipeline> {
         let library = matches!(&build, Build::Graphics { part, .. } if part.is_library());
+        let start = Instant::now();
         let (result, layout) = match build {
             Build::Graphics {
                 key,
@@ -467,9 +476,13 @@ impl Context {
                 (result, layout)
             }
         };
+        let nanos = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
         match result {
             Ok((raw, _)) if library => {
                 self.shared.libraries.fetch_add(1, Ordering::Relaxed);
+                self.shared
+                    .library_nanos
+                    .fetch_add(nanos, Ordering::Relaxed);
                 Some(Pipeline::new(raw, layout))
             }
             Ok((raw, cache_hit)) => {
@@ -478,6 +491,9 @@ impl Context {
                     self.shared.cache_hits.fetch_add(1, Ordering::Relaxed);
                 } else {
                     self.shared.compiled.fetch_add(1, Ordering::Relaxed);
+                    self.shared
+                        .compile_nanos
+                        .fetch_add(nanos, Ordering::Relaxed);
                 }
                 Some(Pipeline::new(raw, layout))
             }
@@ -510,12 +526,9 @@ impl Context {
             }
             let guest_warp = self.device.shader_profile.runs_guest_warp(program.stage)
                 && program.info.uses_warp_size();
-            modules.stages.push(Stage {
-                flags: stage_flags(program.stage),
-                module,
-                guest_warp,
-                robust_storage: program.info.uses_reach_feedback(),
-            });
+            modules
+                .stages
+                .push((stage_flags(program.stage), module, guest_warp));
         }
         Ok(modules)
     }
@@ -560,8 +573,8 @@ impl Context {
             }
         }
         let modules = self.modules(programs.iter().flatten().map(|p| &**p))?;
-        let mut extras: Vec<_> = modules.stages.iter().map(|_| StageExtras::new()).collect();
-        let stages = modules.stage_infos(&mut extras);
+        let mut warp = vec![guest_warp_size(); modules.stages.len()];
+        let stages = modules.stage_infos(&mut warp);
 
         let limits = &self.device.properties.limits;
         let mut attributes = Vec::new();
@@ -819,8 +832,8 @@ impl Context {
             ));
         }
         let modules = self.modules([program])?;
-        let mut extras = [StageExtras::new()];
-        let stage = modules.stage_infos(&mut extras).remove(0);
+        let mut warp = [guest_warp_size()];
+        let stage = modules.stage_infos(&mut warp).remove(0);
         let mut feedback = vk::PipelineCreationFeedback::default();
         let mut stage_feedback = [vk::PipelineCreationFeedback::default()];
         let mut feedback_info = vk::PipelineCreationFeedbackCreateInfo::default()
@@ -852,67 +865,44 @@ fn cache_hit(feedback: &vk::PipelineCreationFeedback) -> bool {
 /// Shader modules of one build, destroyed once the pipeline is created.
 struct Modules<'a> {
     device: &'a Device,
-    stages: Vec<Stage>,
-}
-
-struct Stage {
-    flags: vk::ShaderStageFlags,
-    module: vk::ShaderModule,
-    /// The stage must run at the guest's 32-lane warp.
-    guest_warp: bool,
-    /// The stage binds storage buffers smaller than it may reach, so accesses past the end of a
-    /// binding must read 0 and drop writes.
-    robust_storage: bool,
-}
-
-/// Per-stage extension structs that [`Modules::stage_infos`] chains into its create infos.
-struct StageExtras {
-    warp: vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo<'static>,
-    robustness: vk::PipelineRobustnessCreateInfoEXT<'static>,
-}
-
-impl StageExtras {
-    fn new() -> Self {
-        Self {
-            warp: vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
-                .required_subgroup_size(32),
-            robustness: vk::PipelineRobustnessCreateInfoEXT::default()
-                .storage_buffers(vk::PipelineRobustnessBufferBehaviorEXT::ROBUST_BUFFER_ACCESS_2),
-        }
-    }
+    /// Each stage, its module, and whether it must run at the guest's 32-lane warp.
+    stages: Vec<(vk::ShaderStageFlags, vk::ShaderModule, bool)>,
 }
 
 impl Modules<'_> {
-    /// Stage create infos for the modules, chaining one entry of `extras` per stage.
+    /// Stage create infos for the modules; `warp` holds one subgroup size request per stage.
     fn stage_infos<'b>(
         &self,
-        extras: &'b mut [StageExtras],
+        warp: &'b mut [vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo<'static>],
     ) -> Vec<vk::PipelineShaderStageCreateInfo<'b>> {
         self.stages
             .iter()
-            .zip(extras)
-            .map(|(stage, extras)| {
-                let mut info = vk::PipelineShaderStageCreateInfo::default()
-                    .stage(stage.flags)
-                    .module(stage.module)
+            .zip(warp)
+            .map(|(&(stage, module, guest_warp), warp)| {
+                let info = vk::PipelineShaderStageCreateInfo::default()
+                    .stage(stage)
+                    .module(module)
                     .name(ENTRY);
-                if stage.guest_warp {
-                    info = info.push_next(&mut extras.warp);
+                if guest_warp {
+                    info.push_next(warp)
+                } else {
+                    info
                 }
-                if stage.robust_storage {
-                    info = info.push_next(&mut extras.robustness);
-                }
-                info
             })
             .collect()
     }
 }
 
+/// A request for the guest's 32-lane subgroups.
+fn guest_warp_size() -> vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo<'static> {
+    vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(32)
+}
+
 impl Drop for Modules<'_> {
     fn drop(&mut self) {
-        for stage in &self.stages {
+        for &(_, module, _) in &self.stages {
             // SAFETY: pipeline creation finished; modules are not needed afterwards.
-            unsafe { self.device.raw.destroy_shader_module(stage.module, None) };
+            unsafe { self.device.raw.destroy_shader_module(module, None) };
         }
     }
 }
@@ -1197,6 +1187,8 @@ impl PipelineCache {
                     shutdown: AtomicBool::new(false),
                     built: AtomicU64::new(0),
                     compiled: AtomicU64::new(0),
+                    compile_nanos: AtomicU64::new(0),
+                    library_nanos: AtomicU64::new(0),
                     failed: AtomicU64::new(0),
                     cache_hits: AtomicU64::new(0),
                     libraries: AtomicU64::new(0),
@@ -1624,6 +1616,9 @@ impl PipelineCache {
             loaded_bytes: self.loaded_blob_bytes,
             libraries: shared.libraries.load(Ordering::Relaxed),
             fast_linked: shared.fast_linked.load(Ordering::Relaxed),
+            full_compiles: shared.compiled.load(Ordering::Relaxed),
+            compile_time: Duration::from_nanos(shared.compile_nanos.load(Ordering::Relaxed)),
+            library_time: Duration::from_nanos(shared.library_nanos.load(Ordering::Relaxed)),
         }
     }
 
@@ -2832,6 +2827,10 @@ mod tests {
         assert_eq!(cache.replaced().count(), 1);
         assert_eq!(cache.stats().built, 2);
         let stats = cache.stats();
+        assert_eq!(stats.full_compiles, stats.built - stats.cache_hits);
+        assert!(stats.full_compiles > 0, "a cold cache compiles: {stats:?}");
+        assert!(stats.compile_time > Duration::ZERO, "{stats:?}");
+        assert!(stats.library_time > Duration::ZERO, "{stats:?}");
         assert_eq!(
             device.pipelines(),
             stats.built + stats.libraries,

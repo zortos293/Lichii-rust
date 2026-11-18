@@ -46,8 +46,8 @@ use crate::error::Result;
 use crate::format::{Conversion, host_format};
 use crate::host_budget::RING_OVERSIZED_CAP;
 use crate::memory::{Buffer, Image, ImageDesc, LiveMemory, MemoryCounts, MemoryObjects};
-use crate::pipeline::PipelineCache;
 use crate::pipeline::shader_cache::ShaderCache;
+use crate::pipeline::{PipelineCache, PipelineStats};
 use crate::present::{FrameImage, FrameMailbox, GuestFrame};
 use crate::scheduler::Scheduler;
 use crate::staging::StagingRing;
@@ -114,6 +114,8 @@ struct Stalls {
     waits_at: [u64; 4],
     /// Shader and pipeline render-thread compile time when the window started.
     stalled_at: [Duration; 2],
+    /// The pipeline cache's build counts when the window started.
+    pipelines_at: PipelineStats,
 }
 
 impl Stalls {
@@ -162,11 +164,36 @@ impl Stalls {
                 "draw stalls"
             );
         }
+        let built = pipelines.stats();
+        let at = self.pipelines_at;
+        if built != at {
+            let mean_ms =
+                |time: Duration, count: u64| time.as_secs_f32() * 1000.0 / count.max(1) as f32;
+            let full_compiles = built.full_compiles - at.full_compiles;
+            let libraries = built.libraries - at.libraries;
+            tracing::info!(
+                built = built.built - at.built,
+                libraries,
+                fast_linked = built.fast_linked - at.fast_linked,
+                cache_hits = built.cache_hits - at.cache_hits,
+                failed = built.failed - at.failed,
+                full_compiles,
+                compile_ms_mean = mean_ms(built.compile_time - at.compile_time, full_compiles),
+                library_ms_mean = mean_ms(built.library_time - at.library_time, libraries),
+                total_full_compiles = built.full_compiles,
+                total_compile_ms_mean = mean_ms(built.compile_time, built.full_compiles),
+                total_libraries = built.libraries,
+                total_fast_linked = built.fast_linked,
+                seconds = (now - since).as_secs_f32(),
+                "pipeline builds"
+            );
+        }
         *self = Self {
             since: Some(now),
             last_present: Some(now),
             waits_at: waits,
             stalled_at: stalled,
+            pipelines_at: built,
             ..Self::default()
         };
     }

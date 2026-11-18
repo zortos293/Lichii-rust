@@ -38,65 +38,71 @@ pub(super) fn storage_binding(ctx: &EmitContext<'_>, inst: InstId) -> EmitResult
         .ok_or(EmitError::Unsupported("dynamic storage buffer indexing"))
 }
 
-/// The `element` view of the storage buffer of a storage instruction and the element index
-/// its byte offset (argument 1) addresses.
+/// The `element` view of the storage buffer of a storage instruction, the element index its
+/// byte offset (argument 1) addresses, and the condition the access must be guarded with.
 pub(super) fn storage_base(
     ctx: &mut EmitContext<'_>,
     inst: InstId,
     element: StorageElement,
     element_size: u32,
-) -> EmitResult<(Word, Word)> {
+) -> EmitResult<(Word, Word, Option<Word>)> {
     let binding = storage_binding(ctx, inst)?;
     let ssbo = ctx.ssbo(binding, element);
     let offset = ctx.arg(inst, 1);
-    report_reach(ctx, binding, offset, element_size)?;
+    let in_range = report_reach(ctx, binding, offset, element_size)?;
     let index = storage_index(ctx, offset, element_size, 0)?;
-    Ok((ssbo, index))
+    Ok((ssbo, index, in_range))
 }
 
 /// Reports the end of an access of `bytes` bytes at byte offset `offset` of storage buffer slot
-/// `binding` when the slot reports its reach. The access itself relies on the pipeline's
-/// robustness past the end of the binding.
+/// `binding` when the slot reports its reach, and returns the condition under which the access
+/// lies inside the binding. Reporting slots run without pipeline robustness, so their accesses
+/// go through [`EmitContext::guarded_access`].
 fn report_reach(
     ctx: &mut EmitContext<'_>,
     binding: usize,
     offset: Value,
     bytes: u32,
-) -> EmitResult<()> {
+) -> EmitResult<Option<Word>> {
     if !ctx.ssbo_reports_reach(binding) {
-        return Ok(());
+        return Ok(None);
     }
     let u32_t = ctx.u32[1];
-    let end = match offset.imm_u32() {
-        Some(offset) => ctx.const_u32(offset.wrapping_add(bytes)),
+    let (offset, end) = match offset.imm_u32() {
+        Some(offset) => (
+            ctx.const_u32(offset),
+            ctx.const_u32(offset.wrapping_add(bytes)),
+        ),
         None => {
             let offset = ctx.def(offset)?;
             let bytes = ctx.const_u32(bytes);
-            ctx.b.i_add(u32_t, None, offset, bytes)?
+            (offset, ctx.b.i_add(u32_t, None, offset, bytes)?)
         }
     };
-    ctx.report_reach(binding, end)
+    ctx.report_reach(binding, offset, end)
 }
 
 /// Pointer to the element of the `element` view that a storage instruction addresses with its
-/// binding (argument 0) and byte offset (argument 1), plus `index_offset` elements.
+/// binding (argument 0) and byte offset (argument 1), plus `index_offset` elements, and the
+/// condition the access must be guarded with.
 pub(super) fn storage_pointer(
     ctx: &mut EmitContext<'_>,
     inst: InstId,
     element: StorageElement,
     element_size: u32,
     index_offset: u32,
-) -> EmitResult<Word> {
+) -> EmitResult<(Word, Option<Word>)> {
     let binding = storage_binding(ctx, inst)?;
     let ssbo = ctx.ssbo(binding, element);
     let offset = ctx.arg(inst, 1);
-    report_reach(ctx, binding, offset, element_size * (index_offset + 1))?;
+    let in_range = report_reach(ctx, binding, offset, element_size * (index_offset + 1))?;
     let index = storage_index(ctx, offset, element_size, index_offset)?;
     let pointer_type = ctx.storage_type(element).element;
     let zero = ctx.u32_zero_value;
-    Ok(ctx
+    let pointer = ctx
         .b
-        .access_chain(pointer_type, None, ssbo, [zero, index])?)
+        .access_chain(pointer_type, None, ssbo, [zero, index])?;
+    Ok((pointer, in_range))
 }
 
 fn load_storage(
@@ -107,8 +113,10 @@ fn load_storage(
     element_size: u32,
     index_offset: u32,
 ) -> EmitResult<Word> {
-    let pointer = storage_pointer(ctx, inst, element, element_size, index_offset)?;
-    Ok(ctx.b.load(ty, None, pointer, None, [])?)
+    let (pointer, in_range) = storage_pointer(ctx, inst, element, element_size, index_offset)?;
+    ctx.guarded_access(in_range, Some(ty), |ctx| {
+        Ok(ctx.b.load(ty, None, pointer, None, [])?)
+    })
 }
 
 fn load_word(ctx: &mut EmitContext<'_>, inst: InstId, index_offset: u32) -> EmitResult<Word> {
@@ -124,8 +132,12 @@ fn write_storage(
     element_size: u32,
     index_offset: u32,
 ) -> EmitResult<()> {
-    let pointer = storage_pointer(ctx, inst, element, element_size, index_offset)?;
-    Ok(ctx.b.store(pointer, value, None, [])?)
+    let (pointer, in_range) = storage_pointer(ctx, inst, element, element_size, index_offset)?;
+    ctx.guarded_access(in_range, None, |ctx| {
+        ctx.b.store(pointer, value, None, [])?;
+        Ok(0)
+    })?;
+    Ok(())
 }
 
 /// Whether the `size`-byte vector view addresses exactly the bytes at `offset`. Bindings are
@@ -201,7 +213,7 @@ fn write_storage_small(
     }
     let bit_offset = small_bit_offset(ctx, inst, bits)?;
     let count = ctx.const_u32(bits);
-    let pointer = storage_pointer(ctx, inst, StorageElement::U32, 4, 0)?;
+    let (pointer, in_range) = storage_pointer(ctx, inst, StorageElement::U32, 4, 0)?;
     let void = ctx.void_id;
     let func = ctx.write_storage_cas_loop_func;
     if func == 0 {
@@ -209,8 +221,11 @@ fn write_storage_small(
             "8 or 16-bit storage write in a program whose info declares no small integers".into(),
         ));
     }
-    ctx.b
-        .function_call(void, None, func, [pointer, value, bit_offset, count])?;
+    ctx.guarded_access(in_range, None, |ctx| {
+        Ok(ctx
+            .b
+            .function_call(void, None, func, [pointer, value, bit_offset, count])?)
+    })?;
     Ok(())
 }
 
