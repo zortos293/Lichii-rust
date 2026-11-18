@@ -2508,27 +2508,23 @@ fn evict_before_create_changes_nothing_under_the_critical_line() {
         peak = peak.max(cached(&f));
         f.tick_budget(device_local, true);
     }
-    eprintln!(
-        "peak {} expected {} critical {}",
-        peak / size,
-        f.cache.budget().expected / size,
-        f.cache.budget().critical / size
-    );
-    assert!(peak >= f.cache.budget().expected && peak <= f.cache.budget().critical);
+    let budget = f.cache.budget();
+    assert!(peak > budget.expected && peak < budget.critical);
     let (stats, buffers) = (f.cache.collector_stats(), f.buffers.stats());
     assert_eq!(
         (stats.create_evicted, buffers.create_evicted_buffers),
         (0, 0)
     );
-    eprintln!(
-        "counts {:?}",
+    assert_eq!(
         (
             stats.evicted,
             stats.evicted_bytes,
             stats.flushed,
             buffers.evicted_buffers,
             buffers.evicted_bytes
-        )
+        ),
+        (30, 30 * size, 0, 16, 16 * size),
+        "what the collector evicts on main"
     );
     f.assert_no_validation_errors();
 }
