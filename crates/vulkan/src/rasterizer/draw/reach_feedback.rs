@@ -89,17 +89,20 @@ impl ReachFeedback {
 
     /// The furthest byte from its binding's start that storage buffer slot `slot` of the module
     /// was seen reaching past the end of its binding; 0 before any such access completed.
-    pub(super) fn observed(&self, words: FeedbackWords, slot: u32) -> u64 {
+    pub(super) fn observed(&self, words: FeedbackWords, slot: u32) -> Result<u64> {
         if slot >= words.count {
-            return 0;
+            return Ok(0);
         }
-        let bytes = self.chunks[words.chunk as usize]
+        let chunk = &self.chunks[words.chunk as usize];
+        let offset = words.offset + u64::from(slot) * 4;
+        chunk.invalidate(offset, 4)?;
+        let bytes = chunk
             .mapped()
             .expect("reach feedback memory is host-visible");
-        let at = (words.offset + u64::from(slot) * 4) as usize;
+        let at = offset as usize;
         let word = bytes[at..at + 4].as_ptr().cast::<AtomicU32>();
         // SAFETY: `word` is 4-byte aligned (an aligned mapping, offsets in whole words) and lies
         // inside the live mapping; the GPU writes it only with atomics.
-        u64::from(unsafe { &*word }.load(Ordering::Relaxed))
+        Ok(u64::from(unsafe { &*word }.load(Ordering::Relaxed)))
     }
 }

@@ -1710,7 +1710,7 @@ impl VulkanRasterizer {
                             let reach = match feedback {
                                 Some(words) if desc.reach_feedback => {
                                     let feedback = &self.draw.reach_feedback;
-                                    feedback_reach(feedback.observed(words, first_slot + i))
+                                    feedback_reach(feedback.observed(words, first_slot + i)?)
                                 }
                                 _ => UNBOUNDED_STORAGE_REACH,
                             };
@@ -3274,8 +3274,9 @@ fn numeric_mismatch(
 /// no size, so it reaches what the program provably accesses (over the dispatch's ids, for a
 /// direct compute dispatch), or `None` when that is unknown:
 /// then [`BufferCache::unbounded_storage_buffer`](crate::buffer_cache::BufferCache::unbounded_storage_buffer)
-/// binds in place as far as the program reported reaching ([`feedback_reach`]), or as far as it
-/// can for a program that cannot report it. A provable reach ends on a whole word, since the host may
+/// binds in place as far as the program reported reaching ([`feedback_reach`]), or toward
+/// [`UNBOUNDED_STORAGE_REACH`] for a program that cannot report it; either way a bind grows past
+/// the cached buffer holding the pointer by the tick's growth budget at most. A provable reach ends on a whole word, since the host may
 /// lower byte and halfword accesses to word loads and compare-and-swap loops. No size passes
 /// `limit`, the largest range the host binds after alignment.
 fn storage_pointer(

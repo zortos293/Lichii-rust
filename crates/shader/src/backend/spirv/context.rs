@@ -1062,6 +1062,24 @@ impl<'a> EmitContext<'a> {
         self.ssbo_feedback[index]
     }
 
+    /// Reports `end`, the byte an access of storage buffer slot `slot` ends at, when the slot
+    /// reports its reach.
+    pub fn report_reach(&mut self, slot: usize, end: Word) -> EmitResult<()> {
+        if !self.ssbo_reports_reach(slot) {
+            return Ok(());
+        }
+        let u32_t = self.u32[1];
+        let words = self.ssbo(slot, StorageElement::U32);
+        let words = self.b.array_length(u32_t, None, words, 0)?;
+        let two = self.const_u32(2);
+        let length = self.b.shift_left_logical(u32_t, None, words, two)?;
+        let slot = self.const_u32(slot as u32);
+        let (void, func) = (self.void_id, self.reach_feedback_func);
+        self.b
+            .function_call(void, None, func, [slot, end, length])?;
+        Ok(())
+    }
+
     pub fn storage_type(&self, element: StorageElement) -> StorageTypeDefinition {
         self.storage_types[element as usize]
     }
@@ -3015,6 +3033,11 @@ impl<'a> EmitContext<'a> {
             let ssbo = ctx.ssbo(index, element);
             let distance = ctx.b.i_sub(u64_t, None, addr, base)?;
             let offset = ctx.b.u_convert(u32_t, None, distance)?;
+            if ctx.ssbo_reports_reach(index) {
+                let element_bytes = ctx.const_u32(1 << shift);
+                let end = ctx.b.i_add(u32_t, None, offset, element_bytes)?;
+                ctx.report_reach(index, end)?;
+            }
             let shift = ctx.const_u32(shift);
             let ssbo_index = ctx.b.shift_right_logical(u32_t, None, offset, shift)?;
             let zero = ctx.u32_zero_value;

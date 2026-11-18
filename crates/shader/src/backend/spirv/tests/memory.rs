@@ -284,6 +284,52 @@ fn global_loads_stores_and_atomics_call_the_routing_functions() {
     }
 }
 
+/// A native program's global accesses, routed to the nearest storage buffer below them, report
+/// their end when that buffer reports its reach.
+#[test]
+fn routed_global_accesses_report_the_reach_of_marked_buffers() {
+    let mut s = Synthetic::new();
+    let (b, _) = compute_block(&mut s);
+    let address = Value::U64(0x8000_1000);
+    let value = s.inst(b, Opcode::LoadGlobal32, &[address]);
+    s.inst(b, Opcode::WriteGlobal32, &[address, value]);
+    let info = ShaderInfo {
+        native_global_bounds: true,
+        ..global_memory_info(0x110)
+    };
+    let profile = Profile {
+        support_int64: true,
+        support_reach_feedback: true,
+        min_ssbo_alignment: 4,
+        ..Profile::default()
+    };
+    let plain = emit(
+        "routed_plain",
+        &profile,
+        &RuntimeInfo::default(),
+        &finish_compute(Synthetic { ir: s.ir.clone() }, b, info.clone()),
+    );
+    let mut marked = info;
+    marked.storage_buffers_descriptors[0].reach_feedback = true;
+    let module = emit(
+        "routed_feedback",
+        &profile,
+        &RuntimeInfo::default(),
+        &finish_compute(s, b, marked),
+    );
+    assert_eq!(count_ops(&plain, Op::AtomicUMax), 0);
+    assert_eq!(count_ops(&module, Op::AtomicUMax), 1);
+    assert_eq!(
+        count_ops(&module, Op::ArrayLength),
+        count_ops(&module, Op::FunctionCall) - count_ops(&plain, Op::FunctionCall),
+        "every report measures its binding"
+    );
+    assert!(
+        count_ops(&module, Op::FunctionCall) > count_ops(&plain, Op::FunctionCall),
+        "the routing functions report"
+    );
+}
+
 #[test]
 fn narrow_global_accesses_use_narrow_views_or_their_containing_word() {
     let mut s = Synthetic::new();

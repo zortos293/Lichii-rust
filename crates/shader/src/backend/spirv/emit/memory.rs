@@ -75,15 +75,7 @@ fn report_reach(
             ctx.b.i_add(u32_t, None, offset, bytes)?
         }
     };
-    let words = ctx.ssbo(binding, StorageElement::U32);
-    let words = ctx.b.array_length(u32_t, None, words, 0)?;
-    let two = ctx.const_u32(2);
-    let length = ctx.b.shift_left_logical(u32_t, None, words, two)?;
-    let slot = ctx.const_u32(binding as u32);
-    let void = ctx.void_id;
-    let func = ctx.reach_feedback_func;
-    ctx.b.function_call(void, None, func, [slot, end, length])?;
-    Ok(())
+    ctx.report_reach(binding, end)
 }
 
 /// Pointer to the element of the `element` view that a storage instruction addresses with its

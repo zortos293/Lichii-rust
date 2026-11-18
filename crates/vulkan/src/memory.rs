@@ -262,6 +262,35 @@ impl Buffer {
         Some(&slice[..self.size as usize])
     }
 
+    /// Makes device writes to the mapped bytes `[offset, +size)` visible to host reads; nothing to
+    /// do in host-coherent memory.
+    pub fn invalidate(&self, offset: u64, size: u64) -> Result<()> {
+        let Some(allocation) = &self.allocation else {
+            return Ok(());
+        };
+        if allocation
+            .memory_properties()
+            .contains(vk::MemoryPropertyFlags::HOST_COHERENT)
+        {
+            return Ok(());
+        }
+        let atom = self.device.properties.limits.non_coherent_atom_size.max(1);
+        let start = (allocation.offset() + offset) / atom * atom;
+        let end = (allocation.offset() + offset + size).next_multiple_of(atom);
+        let range = vk::MappedMemoryRange::default()
+            // SAFETY: the allocation's memory stays live while it is held.
+            .memory(unsafe { allocation.memory() })
+            .offset(start)
+            .size(end - start);
+        // SAFETY: the range lies in mapped host-visible memory, aligned to the atom size.
+        unsafe {
+            self.device
+                .raw
+                .invalidate_mapped_memory_ranges(&[range])
+                .call("vkInvalidateMappedMemoryRanges")
+        }
+    }
+
     pub fn mapped_mut(&mut self) -> Option<&mut [u8]> {
         let size = self.size as usize;
         let slice = self.allocation.as_mut()?.mapped_slice_mut()?;
