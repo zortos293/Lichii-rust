@@ -1747,6 +1747,137 @@ fn wide_uniform_draw_cost() {
     f.assert_no_validation_errors();
 }
 
+/// The back thread's cost of finding the host sampler of a sampled texture, over eight
+/// sampler headers the guest left untouched:
+/// `cargo test --release -p lichii-vulkan --lib sampler_lookup_cost -- --ignored --nocapture`.
+#[test]
+#[ignore = "benchmark"]
+fn sampler_lookup_cost() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    const SAMPLERS: u32 = 8;
+    const CALLS: u32 = 4000;
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    for index in 0..SAMPLERS {
+        let mut tsc = [0u32; 8];
+        tsc[1] = index & 3 | (index >> 2) << 4;
+        write(&f, TSC + u64::from(index) * 32, bytemuck::cast_slice(&tsc));
+    }
+    let cbufs = const_buffers();
+    let src = StageSources {
+        gmmu: &gmmu,
+        cbufs: &cbufs[4],
+        root_table: None,
+        pool: TexturePool {
+            address: GPU_VA + TIC,
+            limit: 0,
+            via_header_index: false,
+            switch2: false,
+        },
+        samplers: GPU_VA + TSC,
+        sampler_limit: SAMPLERS - 1,
+    };
+    let r = &mut f.rasterizer;
+    for index in 0..SAMPLERS {
+        r.sampler(&src, index).unwrap();
+    }
+    let mut times = Vec::new();
+    for _ in 0..101 {
+        let start = Instant::now();
+        for call in 0..CALLS {
+            black_box(r.sampler(black_box(&src), call % SAMPLERS).unwrap());
+        }
+        times.push(start.elapsed().as_secs_f64() * 1e9 / f64::from(CALLS));
+    }
+    times.sort_by(f64::total_cmp);
+    eprintln!(
+        "sampler lookup: median {:.2} ns per texture, min {:.2} ns",
+        times[times.len() / 2],
+        times[0]
+    );
+}
+
+/// The back thread's cost of an indexed draw redrawn with nothing changed, 200 draws per
+/// command buffer, for a fragment program that samples a texture and for one that fetches a
+/// texel at 2x resolution, which reads the rescaling push constants:
+/// `cargo test --release -p lichii-vulkan --lib redrawn_indexed_draw_cost -- --ignored --nocapture`.
+#[test]
+#[ignore = "benchmark"]
+fn redrawn_indexed_draw_cost() {
+    use std::time::Instant;
+
+    const DRAWS: u32 = 200;
+    for (what, code, rescaled) in [
+        ("sampling", sampling_program(), false),
+        ("fetching at 2x", fetch_program(0, 0), true),
+    ] {
+        let fixture = match rescaled {
+            true => rescaled_fixture(),
+            false => draw_fixture(),
+        };
+        let Some((mut f, gmmu)) = fixture else {
+            return;
+        };
+        write(&f, PROGRAMS + u64::from(FRAGMENT), &code);
+        uniform_texture(&f, 0, TEXTURE, [255, 0, 0, 255]);
+        let mut regs = sampling_regs();
+        write(&f, INDICES, bytemuck::cast_slice(&[0u16, 1, 2]));
+        let (start, limit) = (GPU_VA + INDICES, GPU_VA + INDICES + 5);
+        let buffer = &mut regs.index_buffer;
+        buffer.start_addr_high = (start >> 32) as u32;
+        buffer.start_addr_low = start as u32;
+        buffer.limit_addr_high = (limit >> 32) as u32;
+        buffer.limit_addr_low = limit as u32;
+        buffer.format = IndexFormat::UNSIGNED_SHORT;
+        let (const_buffers, root_tables) = (const_buffers(), [[0; 64]; 8]);
+        let mut dirty = DirtyState::new();
+        let mut redraw = |f: &mut Fixture| {
+            let mut ctx = GraphicsContext {
+                channel: ChannelId(0),
+                memory: &gmmu,
+                regs: &regs,
+                dirty: &mut dirty,
+                const_buffers: &const_buffers,
+                root_tables: &root_tables,
+            };
+            f.rasterizer.draw(
+                &mut ctx,
+                &DrawParams {
+                    topology: PrimitiveTopology::TRIANGLES,
+                    indexed: true,
+                    first: 0,
+                    count: 3,
+                    base_vertex: 0,
+                    base_instance: 0,
+                    instance_count: 1,
+                    inline_indices: None,
+                },
+            );
+        };
+        redraw(&mut f);
+        f.rasterizer.flush_commands();
+        let mut times = Vec::new();
+        for _ in 0..101 {
+            let start = Instant::now();
+            for _ in 0..DRAWS {
+                redraw(&mut f);
+            }
+            times.push(start.elapsed() / DRAWS);
+            f.rasterizer.flush_commands();
+        }
+        times.sort();
+        eprintln!(
+            "redrawn indexed {what} draw: median {:?} per draw, min {:?}",
+            times[times.len() / 2],
+            times[0]
+        );
+        f.assert_no_validation_errors();
+    }
+}
+
 /// A fragment program that loads its colour from the 16 bytes at `offset` of c[0].
 fn fragment_program_at(offset: u64) -> Vec<u8> {
     let mut header = header(2, ShaderType::PIXEL);
