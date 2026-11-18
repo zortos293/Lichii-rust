@@ -52,8 +52,8 @@ use crate::present::{FrameImage, FrameMailbox, GuestFrame};
 use crate::scheduler::Scheduler;
 use crate::staging::StagingRing;
 use crate::texture_cache::{
-    BlitSide, ClearValue, ImageId, ImageInfo, ImageKind, NearestSampling, Rect, TextureCache,
-    Traffic, Transfer,
+    BlitSide, ClearValue, CollectorStats, ImageId, ImageInfo, ImageKind, NearestSampling, Rect,
+    TextureCache, Traffic, Transfer,
 };
 
 /// The tracing target of the GPU thread's and the presenter's activity lines.
@@ -70,6 +70,10 @@ struct MemoryLine {
     /// The largest single staging or stream request since the last line.
     staging_request_max: u64,
     staging_part_slices: u64,
+    /// The texture cache's host scratch ([`TextureCache::scratch_bytes`]) and its largest
+    /// size since the last line.
+    texture_scratch: u64,
+    texture_scratch_peak: u64,
 }
 
 /// What the GPU thread recorded since its last activity line. With
@@ -88,6 +92,8 @@ struct Activity {
     queue_submits: u64,
     textures: Traffic,
     buffers: BufferCacheStats,
+    /// The texture cache's collector totals when the line's second started.
+    collector: CollectorStats,
     /// Dynamic renderings the scheduler had begun when the line's second started.
     renderings: u64,
 }
@@ -824,6 +830,7 @@ impl VulkanRasterizer {
             a.since = Some(now);
             a.textures = self.texture_cache.traffic();
             a.buffers = self.buffer_cache.stats();
+            a.collector = self.texture_cache.collector_stats();
             a.renderings = self.scheduler.renderings();
             a.queue_submits = self.scheduler.submits();
             return;
@@ -832,6 +839,14 @@ impl VulkanRasterizer {
             return;
         }
         let (textures, buffers) = (self.texture_cache.traffic(), self.buffer_cache.stats());
+        let (collector, budget) = (
+            self.texture_cache.collector_stats(),
+            self.texture_cache.budget(),
+        );
+        let (images, cached_buffers) = (
+            self.texture_cache.image_memory(),
+            self.buffer_cache.cached(),
+        );
         let memory = self.device.memory_usage();
         tracing::debug!(
             target: ACTIVITY_TARGET,
@@ -870,7 +885,10 @@ impl VulkanRasterizer {
             large_stream,
             staging_request_max,
             staging_part_slices,
+            texture_scratch,
+            texture_scratch_peak,
         } = self.memory_line();
+        let since = &self.activity;
         tracing::debug!(
             target: ACTIVITY_TARGET,
             gpu_only_mib = counts.gpu_only.bytes >> 20,
@@ -892,12 +910,26 @@ impl VulkanRasterizer {
             large_stream_buffers = large_stream.count,
             pipelines = self.device.pipelines(),
             descriptor_pools = self.device.descriptor_pools(),
+            cache_budget_mib = budget.expected >> 20,
+            cache_critical_mib = budget.critical >> 20,
+            cached_image_mib = images.bytes >> 20,
+            cached_images = images.count,
+            cached_buffer_mib = cached_buffers.bytes >> 20,
+            cached_buffers = cached_buffers.count,
+            texture_scratch_mib = texture_scratch.div_ceil(1 << 20),
+            texture_scratch_peak_mib = texture_scratch_peak.div_ceil(1 << 20),
+            evicted_images = collector.evicted - since.collector.evicted,
+            evicted_image_mib = (collector.evicted_bytes - since.collector.evicted_bytes) >> 20,
+            flushed_images = collector.flushed - since.collector.flushed,
+            evicted_buffers = buffers.evicted_buffers - since.buffers.evicted_buffers,
+            evicted_buffer_mib = (buffers.evicted_bytes - since.buffers.evicted_bytes) >> 20,
             "GPU memory"
         );
         self.activity = Activity {
             since: Some(now),
             textures,
             buffers,
+            collector,
             renderings: self.scheduler.renderings(),
             queue_submits: self.scheduler.submits(),
             ..Activity::default()
@@ -917,6 +949,8 @@ impl VulkanRasterizer {
                 .take_request_max()
                 .max(self.buffer_cache.take_stream_request_max()),
             staging_part_slices: self.staging.part_bytes(),
+            texture_scratch: self.texture_cache.scratch_bytes(),
+            texture_scratch_peak: self.texture_cache.take_scratch_peak(),
         }
     }
 

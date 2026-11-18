@@ -50,11 +50,48 @@ fn sub_word_bit(t: &mut Translator<'_>, offset: Value, mask: u32) -> Value {
     t.ir.bitwise_and(bits, Value::U32(mask))
 }
 
+/// Clamps a dynamic local memory word index to the last word, so no access leaves the array:
+/// local memory is private to the invocation, which robust buffer access does not cover.
+fn clamp_local_word(t: &mut Translator<'_>, word: Value, dynamic: bool, size: u32) -> Value {
+    if !dynamic {
+        return word;
+    }
+    t.ir.imin(word, Value::U32(size.div_ceil(4) - 1), false)
+}
+
 /// Loads a local memory word; reads past the end return zero.
-fn load_local(t: &mut Translator<'_>, word: Value, offset: Value, size: u32) -> Value {
+fn load_local(
+    t: &mut Translator<'_>,
+    word: Value,
+    offset: Value,
+    dynamic: bool,
+    size: u32,
+) -> Value {
     let in_bounds = t.ir.icompare(ICompare::ULessThan, offset, Value::U32(size));
+    let word = clamp_local_word(t, word, dynamic, size);
     let value = t.ir.inst(Opcode::LoadLocal, &[word]);
     t.ir.select(in_bounds, value, Value::U32(0))
+}
+
+/// Stores `value` to a local memory word. A dynamic store past the end writes the clamped
+/// word's own value back instead; `old` is that value when the caller already loaded it.
+fn write_local(
+    t: &mut Translator<'_>,
+    word: Value,
+    offset: Value,
+    value: Value,
+    old: Option<Value>,
+    dynamic: bool,
+    size: u32,
+) {
+    if !dynamic {
+        t.ir.inst(Opcode::WriteLocal, &[word, value]);
+        return;
+    }
+    let in_bounds = t.ir.icompare(ICompare::ULessThan, offset, Value::U32(size));
+    let old = old.unwrap_or_else(|| t.ir.inst(Opcode::LoadLocal, &[word]));
+    let value = t.ir.select(in_bounds, value, old);
+    t.ir.inst(Opcode::WriteLocal, &[word, value]);
 }
 
 pub(super) fn ldl(t: &mut Translator<'_>) -> TResult {
@@ -66,7 +103,8 @@ pub(super) fn ldl(t: &mut Translator<'_>) -> TResult {
         return Err(t.unsupported());
     }
     let (word, offset) = word_offset(t);
-    let value = load_local(t, word, offset, local_size);
+    let dynamic = !offset.is_immediate() && local_size > 0;
+    let value = load_local(t, word, offset, dynamic, local_size);
     if bits < 32 {
         let bit = sub_word_bit(t, offset, if bits == 8 { 24 } else { 16 });
         let field =
@@ -78,7 +116,7 @@ pub(super) fn ldl(t: &mut Translator<'_>) -> TResult {
     for i in 1..count {
         let sub_word = t.ir.iadd(word, Value::U32(u32::from(i)));
         let sub_offset = t.ir.iadd(offset, Value::U32(u32::from(i) * 4));
-        let value = load_local(t, sub_word, sub_offset, local_size);
+        let value = load_local(t, sub_word, sub_offset, dynamic, local_size);
         t.set_x(dest.offset(i), value);
     }
     Ok(())
@@ -92,25 +130,35 @@ pub(super) fn stl(t: &mut Translator<'_>) -> TResult {
         return Err(t.unsupported());
     }
     let (word, offset) = word_offset(t);
+    let local_size = local_memory_size(t)?;
     if let Value::U32(bytes) = offset
-        && bytes >= local_memory_size(t)?
+        && bytes >= local_size
     {
         return Ok(());
     }
+    let dynamic = !offset.is_immediate() && local_size > 0;
     let src = t.x(reg);
     if bits < 32 {
         let bit = sub_word_bit(t, offset, if bits == 8 { 24 } else { 16 });
+        let word = clamp_local_word(t, word, dynamic, local_size);
         let old = t.ir.inst(Opcode::LoadLocal, &[word]);
         let value =
             t.ir.bit_field_insert(old, src, bit, Value::U32(u32::from(bits)));
-        t.ir.inst(Opcode::WriteLocal, &[word, value]);
+        write_local(t, word, offset, value, Some(old), dynamic, local_size);
         return Ok(());
     }
-    t.ir.inst(Opcode::WriteLocal, &[word, src]);
+    let first = clamp_local_word(t, word, dynamic, local_size);
+    write_local(t, first, offset, src, None, dynamic, local_size);
     for i in 1..count {
         let sub_word = t.ir.iadd(word, Value::U32(u32::from(i)));
         let value = t.x(reg.offset(i));
-        t.ir.inst(Opcode::WriteLocal, &[sub_word, value]);
+        let sub_offset = if dynamic {
+            t.ir.iadd(offset, Value::U32(u32::from(i) * 4))
+        } else {
+            offset
+        };
+        let sub_word = clamp_local_word(t, sub_word, dynamic, local_size);
+        write_local(t, sub_word, sub_offset, value, None, dynamic, local_size);
     }
     Ok(())
 }
@@ -180,10 +228,15 @@ pub(super) fn sts(t: &mut Translator<'_>) -> TResult {
 mod tests {
     use super::super::exit_program::tests::translate_stage;
     use super::super::tests::{TestEnv, encode, translate};
+    use lichii_common::settings::ResolutionScale;
+
     use super::super::translate_block;
-    use crate::ShaderStage;
+    use crate::backend::Bindings;
     use crate::ir::Program;
     use crate::maxwell::opcode::Opcode;
+    use crate::profile::HostTranslateInfo;
+    use crate::translate::TranslateOptions;
+    use crate::{Profile, RuntimeInfo, ShaderStage};
 
     /// A vertex program header with `low` bytes of local memory and `crs` bytes of CRS stack.
     fn header(low: u32, crs: u32) -> [u32; 20] {
@@ -207,12 +260,13 @@ mod tests {
              \x20 %1 = IAdd32 %0, #0x2\n\
              \x20 %2 = ShiftRightArithmetic32 %1, #0x2\n\
              \x20 %3 = ULessThan %1, #0x40\n\
-             \x20 %4 = LoadLocal %2\n\
-             \x20 %5 = SelectU32 %3, %4, #0x0\n\
-             \x20 %6 = ShiftLeftLogical32 %1, #0x3\n\
-             \x20 %7 = BitwiseAnd32 %6, #0x18\n\
-             \x20 %8 = BitFieldUExtract %5, %7, #0x8\n\
-             \x20 SetRegister R1, %8\n"
+             \x20 %4 = UMin32 %2, #0xf\n\
+             \x20 %5 = LoadLocal %4\n\
+             \x20 %6 = SelectU32 %3, %5, #0x0\n\
+             \x20 %7 = ShiftLeftLogical32 %1, #0x3\n\
+             \x20 %8 = BitwiseAnd32 %7, #0x18\n\
+             \x20 %9 = BitFieldUExtract %6, %8, #0x8\n\
+             \x20 SetRegister R1, %9\n"
         );
     }
 
@@ -284,6 +338,104 @@ mod tests {
              \x20 %9 = GetRegister R11\n\
              \x20 WriteLocal %8, %9\n"
         );
+    }
+
+    /// Compiles a compute program with 0x40 bytes of local memory, validates its module and
+    /// returns it.
+    fn compile_local(name: &str, code: &[u64]) -> rspirv::dr::Module {
+        let mut env = TestEnv::new(code);
+        env.local_memory = 0x40;
+        let (profile, host) = (Profile::default(), HostTranslateInfo::default());
+        let options = TranslateOptions {
+            profile: &profile,
+            host: &host,
+            resolution_scale: ResolutionScale::X1,
+        };
+        let mut bindings = Bindings::default();
+        let module =
+            crate::module::compile(&env, options, &RuntimeInfo::default(), &mut bindings).unwrap();
+        crate::backend::spirv::tests::validate(name, &profile, &module.spirv);
+        rspirv::dr::load_words(&module.spirv).unwrap()
+    }
+
+    /// The local memory word index of every access chain into a private variable, as the
+    /// constant it is or the limit of the `UMin` that clamps it.
+    fn local_indexes(module: &rspirv::dr::Module) -> Vec<Result<u32, u32>> {
+        use rspirv::dr::Operand;
+        use rspirv::spirv::{GlslStd450Op, Op, StorageClass};
+        let globals = &module.types_global_values;
+        let constant = |id: u32| {
+            globals
+                .iter()
+                .find(|i| i.result_id == Some(id) && i.class.opcode == Op::Constant)
+                .map(|i| i.operands[0].unwrap_literal_bit32())
+        };
+        let private = |id: u32| {
+            globals.iter().any(|i| {
+                i.result_id == Some(id)
+                    && i.class.opcode == Op::Variable
+                    && i.operands[0] == Operand::StorageClass(StorageClass::Private)
+            })
+        };
+        let body: Vec<_> = module
+            .functions
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.instructions)
+            .collect();
+        let umin_limit = |id: u32| {
+            body.iter()
+                .find(|i| i.result_id == Some(id) && i.class.opcode == Op::ExtInst)
+                .filter(|i| {
+                    i.operands[1] == Operand::LiteralExtInstInteger(GlslStd450Op::UMin as u32)
+                })
+                .and_then(|i| constant(i.operands[3].unwrap_id_ref()))
+        };
+        body.iter()
+            .filter(|i| i.class.opcode == Op::AccessChain)
+            .filter(|i| private(i.operands[0].unwrap_id_ref()))
+            .map(|i| {
+                let index = i.operands[1].unwrap_id_ref();
+                constant(index).ok_or_else(|| umin_limit(index).expect("a clamped index"))
+            })
+            .collect()
+    }
+
+    /// The always-true predicate in an instruction's guard field.
+    const PT: u64 = 7 << 16;
+
+    /// LDL and STL (32-bit and 16-bit) at an offset from R3, which S2R loads with the thread id.
+    #[test]
+    fn dynamic_local_accesses_clamp_their_word_to_the_last_one() {
+        let code = [
+            encode(Opcode::S2r, PT | (0x21 << 20) | 3),
+            encode(Opcode::Ldl, PT | (4 << 48) | (4 << 20) | (3 << 8) | 1),
+            encode(Opcode::Stl, PT | (4 << 48) | (8 << 20) | (3 << 8) | 1),
+            encode(Opcode::Stl, PT | (2 << 48) | (2 << 20) | (3 << 8) | 1),
+            encode(Opcode::Exit, PT | 0xf),
+        ];
+        let module = compile_local("maxwell-local-dynamic", &code);
+        let indexes = local_indexes(&module);
+        assert!(!indexes.is_empty());
+        assert!(
+            indexes.iter().all(|&index| index == Err(0xf)),
+            "{indexes:?}"
+        );
+    }
+
+    #[test]
+    fn constant_local_accesses_index_with_their_constant() {
+        let code = [
+            encode(Opcode::Ldl, PT | (4 << 48) | (4 << 20) | (0xff << 8) | 1),
+            encode(Opcode::Stl, PT | (4 << 48) | (8 << 20) | (0xff << 8) | 1),
+            encode(Opcode::Stl, PT | (2 << 48) | (2 << 20) | (0xff << 8) | 1),
+            encode(Opcode::Exit, PT | 0xf),
+        ];
+        let module = compile_local("maxwell-local-constant", &code);
+        let mut indexes = local_indexes(&module);
+        indexes.sort();
+        indexes.dedup();
+        assert_eq!(indexes, [Ok(0), Ok(1), Ok(2)]);
     }
 
     #[test]
