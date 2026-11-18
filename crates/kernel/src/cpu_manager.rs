@@ -37,6 +37,11 @@ pub(crate) fn run_core(kernel: Arc<KernelInner>, index: usize) {
             core.kernel.exit_thread(index, &thread);
             continue;
         }
+        if let Some(waits) = &core.kernel.waits
+            && let Some(probe) = thread.sched.lock().wait_probe.take()
+        {
+            waits.record(index, probe, picked.wake.index);
+        }
         core.ctx.clone_from(&thread.context.lock());
         svc::apply_resume(&mut core.ctx, picked.resume, picked.wake);
         core.run_thread(&thread);

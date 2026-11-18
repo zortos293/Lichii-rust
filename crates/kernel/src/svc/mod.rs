@@ -27,6 +27,7 @@ use crate::object::{FromObject, KObject};
 use crate::process::Process;
 use crate::result;
 use crate::thread::{Resume, Thread, ThreadState, WakeResult};
+use crate::wait_stats::{WaitProbe, WaitSite};
 
 /// What the core does after a supervisor call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,6 +119,7 @@ impl SvcContext<'_> {
         token: u64,
         deadline: Option<Instant>,
         timeout_is_success: bool,
+        site: impl FnOnce() -> WaitSite,
     ) -> Flow {
         *self.thread.context.lock() = self.ctx.clone();
         let mut s = self.thread.sched.lock();
@@ -129,6 +131,9 @@ impl SvcContext<'_> {
             return Flow::Continue;
         }
         s.state = ThreadState::Waiting;
+        if self.kernel.waits.is_some() {
+            s.wait_probe = Some(WaitProbe::new(site()));
+        }
         if let Some(deadline) = deadline {
             if timeout_is_success {
                 self.kernel

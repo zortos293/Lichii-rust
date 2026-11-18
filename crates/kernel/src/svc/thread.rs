@@ -8,6 +8,7 @@ use crate::object::KObject;
 use crate::resource_limit::LimitableResource;
 use crate::result;
 use crate::thread::{LOWEST_PRIORITY, Resume, Thread, ThreadState};
+use crate::wait_stats::WaitSite;
 
 const IDEAL_CORE_DONT_CARE: i32 = -1;
 const IDEAL_CORE_USE_PROCESS_VALUE: i32 = -2;
@@ -82,7 +83,7 @@ pub(super) fn sleep_thread(svc: &mut SvcContext) -> Flow {
         Ok(token) => token,
         Err(_) => return Flow::Continue,
     };
-    svc.block(token, deadline(ns), true)
+    svc.block(token, deadline(ns), true, WaitSite::sleep)
 }
 
 /// `svcGetThreadPriority(handle w1)` -> `w1`.
