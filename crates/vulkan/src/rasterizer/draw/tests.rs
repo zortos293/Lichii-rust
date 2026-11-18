@@ -4207,6 +4207,88 @@ fn counted(f: &mut Fixture) -> [u32; 2] {
     words
 }
 
+const FETCHING: u64 = 0x10_a000;
+const FETCHED: u64 = 0x77_0000;
+const FETCH_CBUF: u64 = 0x76_2000;
+
+/// Fetches texel (`x`, `y`) of the texture c[0][0x40] and stores its four components as F32
+/// at c[0][0x110].
+fn fetching_compute_program(x: u32, y: u32) -> Vec<u8> {
+    let stg = |data: u64, offset: u64| {
+        sass(
+            Opcode::Stg,
+            (1 << 45) | (4 << 48) | (offset << 20) | (4 << 8) | data,
+        )
+    };
+    compute_code(&[
+        mov_cbuf(4, 0x110),
+        mov_cbuf(5, 0x114),
+        mov_u32(6, x),
+        mov_u32(7, y),
+        tlds(0x40, (6, 7), 0, 2, 4),
+        stg(0, 0),
+        stg(1, 4),
+        stg(2, 8),
+        stg(3, 12),
+        exit(),
+    ])
+}
+
+/// The texel `fetching_compute_program` stored, as unorm8 components.
+fn fetched(f: &mut Fixture) -> [u8; 4] {
+    f.rasterizer.flush_region(DADDR + FETCHED, 16);
+    let mut words = [0f32; 4];
+    f.memory
+        .read_bytes(DADDR + FETCHED, bytemuck::cast_slice_mut(&mut words))
+        .unwrap();
+    words.map(|c| (c * 255.0).round() as u8)
+}
+
+/// A dispatch at 2x pushes its rescaling constants in every command buffer, whatever it pushed
+/// in the last one.
+#[test]
+fn dispatches_push_their_constants_in_every_command_buffer() {
+    let Some((mut f, gmmu)) = rescaled_fixture() else {
+        return;
+    };
+    paint_source(&mut f, &gmmu);
+    write(&f, FETCHING, &fetching_compute_program(32, 160));
+    storage_binding(&f, FETCH_CBUF, FETCHED);
+    write(&f, FETCH_CBUF + 0x40, &0u32.to_le_bytes());
+    let mut const_buffers = [ConstBufferBinding::default(); 8];
+    const_buffers[0] = ConstBufferBinding {
+        address: GPU_VA + FETCH_CBUF,
+        size: 0x200,
+        enabled: true,
+    };
+    let qmd = [0u32; 64];
+    let ctx = ComputeContext {
+        channel: ChannelId(0),
+        memory: &gmmu,
+        program: GPU_VA + FETCHING,
+        grid: [1; 3],
+        block: [1; 3],
+        shared_memory_size: 0,
+        local_memory_size: 0,
+        const_buffers: &const_buffers,
+        texture_headers: GPU_VA + TIC,
+        texture_header_limit: 0,
+        samplers: GPU_VA + TSC,
+        sampler_limit: 0,
+        linked_samplers: false,
+        qmd_version: QmdVersion::V2,
+        qmd: &qmd,
+        indirect_grid: None,
+        indirect: None,
+    };
+    for round in 0..3 {
+        write(&f, FETCHED, &[0; 16]);
+        f.rasterizer.dispatch_compute(&ctx);
+        assert_eq!(fetched(&mut f), GREEN, "round {round}");
+    }
+    f.assert_no_validation_errors();
+}
+
 #[test]
 fn dispatches_bind_the_same_descriptors_pushed_or_written_to_sets() {
     for push in [true, false] {

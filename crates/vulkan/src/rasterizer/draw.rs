@@ -328,6 +328,18 @@ struct Bound {
     index: Option<(vk::Buffer, u64, vk::IndexType)>,
 }
 
+impl PushConstants {
+    fn record(&self, device: &Device, cmd: vk::CommandBuffer) {
+        let size = (self.size as usize).min(PUSH_BYTES);
+        // SAFETY: `stages` and `size` are the layout's one push constant range at offset 0.
+        unsafe {
+            device
+                .raw
+                .cmd_push_constants(cmd, self.layout, self.stages, 0, &self.bytes[..size]);
+        }
+    }
+}
+
 impl Bound {
     fn begin(&mut self, began: bool) {
         if began {
@@ -1244,7 +1256,11 @@ impl VulkanRasterizer {
             .flatten()
             .any(|m| m.info.uses_render_area)
             .then(|| guest_render_area(regs));
-        self.push_constants(cmd, layout_raw, push, render_area, scale);
+        if let Some(push) = self.push_constants(layout_raw, push, render_area, scale)
+            && rebinds(&mut self.draw.bound.push, Some(push))
+        {
+            push.record(&self.device, cmd);
+        }
         self.set_dynamic_state(cmd, regs, ctx.dirty, host_topology, extent, scale);
         let mesh_groups = match call {
             DrawCall::Direct(params) if mesh => {
@@ -2499,20 +2515,20 @@ impl VulkanRasterizer {
         Ok(Some(set))
     }
 
-    /// Pushes the one range every stage of `layout` shares (`push` is its stages and size): the
-    /// texture rescaling words of the bound textures at 0 (storage images are never bound, so
-    /// their words stay 0) with the down factor of `scale`, the targets' scale, at 24,
-    /// and the render area at `RENDER_AREA_LAYOUT_OFFSET` (32), so a 48-byte range holds both.
+    /// The push constants of the one range every stage of `layout` shares (`push` is its stages
+    /// and size), `None` when it has none: the texture rescaling words of the bound textures at 0
+    /// (storage images are never bound, so their words stay 0) with the down factor of `scale`,
+    /// the targets' scale, at 24, and the render area at `RENDER_AREA_LAYOUT_OFFSET` (32), so a
+    /// 48-byte range holds both.
     fn push_constants(
-        &mut self,
-        cmd: vk::CommandBuffer,
+        &self,
         layout: vk::PipelineLayout,
         (stages, size): (vk::ShaderStageFlags, u32),
         render_area: Option<(f32, f32)>,
         scale: ResolutionScale,
-    ) {
+    ) -> Option<PushConstants> {
         if size == 0 {
-            return;
+            return None;
         }
         let mut bytes = [0u8; PUSH_BYTES];
         let words: &[u8] = bytemuck::cast_slice(&self.draw.texture_scaling.words);
@@ -2530,25 +2546,12 @@ impl VulkanRasterizer {
             bytes[at..at + 4].copy_from_slice(&width.to_le_bytes());
             bytes[at + 4..at + 8].copy_from_slice(&height.to_le_bytes());
         }
-        let push = PushConstants {
+        Some(PushConstants {
             layout,
             stages,
             size,
             bytes,
-        };
-        if !rebinds(&mut self.draw.bound.push, Some(push)) {
-            return;
-        }
-        // SAFETY: `stages` and `size` are the layout's one push constant range at offset 0.
-        unsafe {
-            self.device.raw.cmd_push_constants(
-                cmd,
-                layout,
-                stages,
-                0,
-                &bytes[..(size as usize).min(bytes.len())],
-            );
-        }
+        })
     }
 
     /// Records the dynamic state the pipeline declares that changed since the open rendering
@@ -2840,7 +2843,9 @@ impl VulkanRasterizer {
                 (None, None) => {}
             }
         }
-        self.push_constants(cmd, layout_raw, push, None, ResolutionScale::X1);
+        if let Some(push) = self.push_constants(layout_raw, push, None, ResolutionScale::X1) {
+            push.record(&self.device, cmd);
+        }
         match grid {
             Some(_) => self
                 .device
