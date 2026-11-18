@@ -2361,9 +2361,10 @@ impl TextureCache {
             return Ok(true);
         }
         let before = image.image.memory_size();
-        let bound = image.image.bind(tx.scheduler, level, layers, cap)?;
+        let bound = image.image.bind(tx.scheduler, level, layers, cap);
         let grown = image.image.memory_size() - before;
         self.image_bytes += grown;
+        let bound = bound?;
         if !bound.complete && !self.sparse_capped {
             self.sparse_capped = true;
             tracing::warn!(
