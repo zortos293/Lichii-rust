@@ -1694,6 +1694,58 @@ fn stage_lookup_cost_of_a_redrawn_sampling_draw() {
     }
 }
 
+/// The back thread's cost of a redrawn draw whose fragment constant buffer is bound at 64 KiB
+/// while the shader reads its first 16 bytes, with the buffer untouched and with the guest CPU
+/// rewriting a word in its middle before every draw:
+/// `cargo test --release -p lichii-vulkan --lib wide_uniform_draw_cost -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn wide_uniform_draw_cost() {
+    use std::time::Instant;
+
+    const CPU_VA: u64 = 0x1000_0000;
+    const DRAWS: u32 = 200;
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let space = cpu_space(&f, &[(CPU_VA, FRAGMENT_CBUF)], 0x1_0000);
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    let regs = draw_regs();
+    let mut const_buffers = const_buffers();
+    const_buffers[4][0].size = 0x1_0000;
+    draw_with(&mut f, &gmmu, &regs, &const_buffers);
+    f.rasterizer.flush_commands();
+    for (what, rewritten) in [("untouched", false), ("rewritten", true)] {
+        let mut times = Vec::new();
+        for round in 0..51 {
+            let start = Instant::now();
+            for draw in 0..DRAWS {
+                if rewritten {
+                    let word = round * DRAWS + draw;
+                    space
+                        .write_bytes(CPU_VA + 0x8000, &word.to_le_bytes())
+                        .unwrap();
+                    drain_cpu_writes(&mut f);
+                }
+                draw_with(&mut f, &gmmu, &regs, &const_buffers);
+            }
+            times.push(start.elapsed() / DRAWS);
+            f.rasterizer.flush_commands();
+        }
+        times.sort();
+        eprintln!(
+            "64 KiB uniform, 16 bytes read, buffer {what}: median {:?} per draw, min {:?}",
+            times[times.len() / 2],
+            times[0]
+        );
+    }
+    f.assert_no_validation_errors();
+}
+
 /// The guest CPU rewrites a bound uniform buffer between draws: the next draw reads the new
 /// values, for a streamed buffer and for one over 4 KiB that binds the cached buffer through
 /// write tracking, the second rewrite too.
