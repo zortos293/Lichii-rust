@@ -66,6 +66,8 @@ const LARGE_STREAM_CAP: u64 = 256 << 20;
 const GATHER_CACHE_BYTES: u64 = 256 << 20;
 /// Pages [`TranslationMemo`] keeps a translation for.
 const TRANSLATION_ENTRIES: usize = 1024;
+/// No neighbour in the LRU list.
+const NIL: u32 = u32::MAX;
 
 const CACHED_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
     vk::BufferUsageFlags::VERTEX_BUFFER.as_raw()
@@ -146,6 +148,9 @@ pub struct BufferCacheStats {
     pub created_buffers: u64,
     /// Buffers absorbed into a grown one.
     pub merged_buffers: u64,
+    /// Buffers the collector evicted ([`BufferCache::evict`]), and their bytes.
+    pub evicted_buffers: u64,
+    pub evicted_bytes: u64,
 }
 
 /// The topology the host draws for a guest topology after the index conversion
@@ -203,6 +208,11 @@ struct CachedBuffer {
     /// and when GPU work writing it is recorded. Epochs only grow, so the newest of a gather's
     /// sources changes whenever any source does.
     modified: u64,
+    /// The collector frame ([`BufferCache::set_frame`]) it was last acquired in.
+    last_use: u64,
+    /// Neighbours in the LRU list, least recently acquired first.
+    prev: u32,
+    next: u32,
 }
 
 /// A large scattered storage range gathered into a buffer of its own, reused while
@@ -1297,6 +1307,12 @@ pub struct BufferCache {
     gather_retired: VecDeque<(u64, Buffer)>,
     gather_retired_bytes: u64,
     translations: TranslationMemo,
+    /// The collector frame acquires stamp on buffers.
+    frame: u64,
+    lru_head: u32,
+    lru_tail: u32,
+    /// Bytes of the live cached buffers.
+    cached_bytes: u64,
 }
 
 impl BufferCache {
@@ -1350,6 +1366,10 @@ impl BufferCache {
             gather_retired: VecDeque::new(),
             gather_retired_bytes: 0,
             translations: TranslationMemo::default(),
+            frame: 0,
+            lru_head: NIL,
+            lru_tail: NIL,
+            cached_bytes: 0,
         })
     }
 
@@ -2085,6 +2105,13 @@ impl BufferCache {
             Some(id) if self.buffer(id).contains(daddr, size.max(1)) => id,
             _ => self.create(scheduler, daddr, size.max(1))?,
         };
+        let frame = self.frame;
+        let buffer = self.buffers[id].as_mut().expect("live buffer");
+        if buffer.last_use != frame {
+            buffer.last_use = frame;
+            self.lru_unlink(id);
+            self.lru_push(id);
+        }
         if self.buffer(id).dirty_pages != 0 {
             self.synchronize(scheduler, staging, id, daddr, size)?;
         }
@@ -2251,13 +2278,18 @@ impl BufferCache {
             tracked: Vec::new(),
             written_tick: scheduler.tick(),
             modified: self.write_epoch,
+            last_use: self.frame,
+            prev: NIL,
+            next: NIL,
         };
         if !self.overlaps.is_empty() {
             let cmd = scheduler.record()?;
             before_transfer(&self.device, cmd);
             for i in 0..self.overlaps.len() {
                 let id = self.overlaps[i];
+                self.lru_unlink(id);
                 let mut old = self.buffers[id].take().expect("live buffer");
+                self.cached_bytes -= old.size;
                 new.tracked.append(&mut old.tracked);
                 self.free_slots.push(id);
                 let offset = old.daddr - begin;
@@ -2297,11 +2329,108 @@ impl BufferCache {
             }
         };
         self.buffers[id] = Some(new);
+        self.lru_push(id);
+        self.cached_bytes += size;
         let first = (begin >> CACHING_PAGE_BITS) as usize;
         let last = (end >> CACHING_PAGE_BITS) as usize;
         self.page_table[first..last].fill(id as u32 + 1);
         self.stats.created_buffers += 1;
         Ok(id)
+    }
+
+    /// Starts collector frame `frame`: acquires from now on mark buffers used in it.
+    pub(crate) fn set_frame(&mut self, frame: u64) {
+        self.frame = frame;
+    }
+
+    /// The live cached buffers and their bytes.
+    pub fn cached(&self) -> LiveMemory {
+        LiveMemory {
+            bytes: self.cached_bytes,
+            count: (self.buffers.len() - self.free_slots.len()) as u64,
+        }
+    }
+
+    /// The least recently acquired buffer: a cursor for [`BufferCache::lru_entry`].
+    pub(crate) fn lru_head(&self) -> u32 {
+        self.lru_head
+    }
+
+    /// The frame the buffer at `cursor` was last acquired in, and the cursor of the next
+    /// more recently acquired one; `None` past the most recent.
+    pub(crate) fn lru_entry(&self, cursor: u32) -> Option<(u64, u32)> {
+        let buffer = self.buffers.get(cursor as usize)?.as_ref()?;
+        Some((buffer.last_use, buffer.next))
+    }
+
+    /// Evicts the buffer at `cursor` unless it holds GPU-written bytes not downloaded yet, or
+    /// the draw being prepared binds it for writing; returns its bytes, `None` when it stays.
+    /// Its next acquire uploads it from guest memory again. The GPU work already recorded may
+    /// still read it: its memory goes once the current tick completes.
+    pub(crate) fn evict(&mut self, scheduler: &mut Scheduler, cursor: u32) -> Option<u64> {
+        let id = cursor as usize;
+        let buffer = self.buffer(id);
+        let (daddr, end) = (buffer.daddr, buffer.end());
+        if self.gpu_written.intersects(daddr, end)
+            || self
+                .pending_writes
+                .iter()
+                .any(|&(start, stop)| start < end && daddr < stop)
+        {
+            return None;
+        }
+        self.lru_unlink(id);
+        let buffer = self.buffers[id].take().expect("live buffer");
+        self.free_slots.push(id);
+        self.page_table[(daddr >> CACHING_PAGE_BITS) as usize..(end >> CACHING_PAGE_BITS) as usize]
+            .fill(0);
+        self.cached_bytes -= buffer.size;
+        self.stats.evicted_buffers += 1;
+        self.stats.evicted_bytes += buffer.size;
+        scheduler.retire((buffer.buffer, buffer.views));
+        Some(buffer.size)
+    }
+
+    fn lru_unlink(&mut self, id: usize) {
+        let buffer = self.buffers[id].as_mut().expect("listed buffers are live");
+        let (prev, next) = (buffer.prev, buffer.next);
+        buffer.prev = NIL;
+        buffer.next = NIL;
+        match prev {
+            NIL => self.lru_head = next,
+            prev => {
+                self.buffers[prev as usize]
+                    .as_mut()
+                    .expect("listed buffers are live")
+                    .next = next
+            }
+        }
+        match next {
+            NIL => self.lru_tail = prev,
+            next => {
+                self.buffers[next as usize]
+                    .as_mut()
+                    .expect("listed buffers are live")
+                    .prev = prev
+            }
+        }
+    }
+
+    fn lru_push(&mut self, id: usize) {
+        let tail = self.lru_tail;
+        let buffer = self.buffers[id].as_mut().expect("listed buffers are live");
+        buffer.prev = tail;
+        buffer.next = NIL;
+        match tail {
+            NIL => self.lru_head = id as u32,
+            tail => {
+                self.buffers[tail as usize]
+                    .as_mut()
+                    .expect("listed buffers are live")
+                    .next = id as u32
+            }
+        }
+        self.lru_tail = id as u32;
     }
 
     /// Whether any device memory behind `[gpu_va, +size)` holds GPU-written bytes.
