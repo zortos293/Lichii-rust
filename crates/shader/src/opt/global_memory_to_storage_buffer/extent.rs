@@ -1,4 +1,5 @@
-//! Proves where a program's stores to one storage buffer can land relative to its pointer word.
+//! Proves where a program's loads or stores to one storage buffer can land relative to its
+//! pointer word.
 //!
 //! Anything not provably affine in the invocation and workgroup ids with constant non-negative
 //! strides (a value loaded from memory or read from another constant buffer word, a
@@ -7,7 +8,7 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::track::{cbuf_word, track_low_address};
-use super::{BufferAddr, imm_u32, inst_of, store_size};
+use super::{BufferAddr, access_size, imm_u32, inst_of};
 use crate::info::StorageWriteExtent;
 use crate::ir::{InstId, Opcode, Program, Value};
 
@@ -142,8 +143,8 @@ fn shift_down(value: &IdBound, shift: u32) -> Option<IdBound> {
     Some(result)
 }
 
-/// Store extents of one storage buffer, widened by every store added.
-pub(super) struct StoreExtentAnalysis {
+/// Access extents of one storage buffer, widened by every access added.
+pub(super) struct ExtentAnalysis {
     buffer: BufferAddr,
     workgroup: [u32; 3],
     memo: FxHashMap<InstId, Option<IdBound>>,
@@ -152,9 +153,9 @@ pub(super) struct StoreExtentAnalysis {
     guard_failed: bool,
 }
 
-impl StoreExtentAnalysis {
-    pub(super) fn new(buffer: BufferAddr, workgroup: [u32; 3]) -> StoreExtentAnalysis {
-        StoreExtentAnalysis {
+impl ExtentAnalysis {
+    pub(super) fn new(buffer: BufferAddr, workgroup: [u32; 3]) -> ExtentAnalysis {
+        ExtentAnalysis {
             buffer,
             workgroup,
             memo: FxHashMap::default(),
@@ -164,27 +165,27 @@ impl StoreExtentAnalysis {
         }
     }
 
-    /// Merges the extent of one store or atomic into `extent`.
-    pub(super) fn add_store(
+    /// Merges the extent of one load, store or atomic into `extent`.
+    pub(super) fn add_access(
         &mut self,
         prog: &Program,
         inst: InstId,
         extent: &mut StorageWriteExtent,
     ) {
-        match self.store_extent(prog, inst) {
+        match self.access_extent(prog, inst) {
             Some(store) => extent.merge(&store),
             None => *extent = StorageWriteExtent::default(),
         }
     }
 
-    fn store_extent(&mut self, prog: &Program, inst: InstId) -> Option<StorageWriteExtent> {
+    fn access_extent(&mut self, prog: &Program, inst: InstId) -> Option<StorageWriteExtent> {
         let addr = track_low_address(prog, inst)?;
         let low = self.evaluate(prog, addr.value, 0)?;
         if low.base != 1 || self.guard_failed {
             return None;
         }
         let start = low.c + i64::from(addr.imm_offset);
-        let end = start + i64::from(store_size(prog.op(inst)));
+        let end = start + i64::from(access_size(prog.op(inst)));
         if start < 0 || end > i64::from(u32::MAX) {
             return None;
         }

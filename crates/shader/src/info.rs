@@ -98,6 +98,9 @@ pub struct StorageBufferDescriptor {
     pub indirect_offset: u32,
     /// How far the program's stores reach past the pointer; unbounded when unknown or unwritten.
     pub write_extent: StorageWriteExtent,
+    /// How far the program's loads reach past the pointer; bounded at 0 when it loads nothing,
+    /// unbounded when unknown.
+    pub read_extent: StorageWriteExtent,
 }
 
 impl StorageBufferDescriptor {
@@ -105,8 +108,8 @@ impl StorageBufferDescriptor {
     pub const DIRECT: u32 = u32::MAX;
 }
 
-/// How far a program's stores and atomics to one storage buffer can reach, in bytes past the
-/// pointer it reads from its constant buffer. Every store ends at or below
+/// How far a program's stores and atomics (or, as a read extent, its loads) to one storage buffer
+/// can reach, in bytes past the pointer it reads from its constant buffer. Every store ends at or below
 /// `const_end + sum(local_stride[i] * local_id[i]) + sum(group_stride[i] * group_id[i])` for every
 /// invocation. The bound only holds while each value the store offsets split into 16-bit halves
 /// stays below 2^16: `guard_*` bounds the largest of them in the same form.
@@ -140,6 +143,19 @@ pub struct StorageWriteExtent {
 }
 
 impl StorageWriteExtent {
+    /// The reach when it is the same for every invocation: bounded, with no invocation or
+    /// workgroup terms in the bound or its guard.
+    pub fn constant_end(&self) -> Option<u32> {
+        let varies = |strides: &[u32; 3]| strides.iter().any(|&s| s != 0);
+        let guard_varies =
+            self.guarded && (varies(&self.guard_local_stride) || varies(&self.guard_group_stride));
+        let fixed = self.bounded
+            && !varies(&self.local_stride)
+            && !varies(&self.group_stride)
+            && !guard_varies;
+        fixed.then_some(self.const_end)
+    }
+
     /// Widens this extent to also cover `other`; either one unbounded leaves it unbounded.
     pub fn merge(&mut self, other: &StorageWriteExtent) {
         if !self.bounded || !other.bounded {

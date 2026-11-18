@@ -30,7 +30,7 @@ use lichii_texture::block_linear::{GobLayout, Tiling, swizzle};
 use super::super::tests::{
     DADDR, Fixture, GPU_VA, fixture, fixture_with, gmmu, guest_linear, unorm8_eq,
 };
-use super::{StageSources, Warning};
+use super::{StageSources, Warning, storage_pointer};
 use crate::device::DeviceFeatures;
 use crate::pipeline::environment::TexturePool;
 use crate::pipeline::shader_cache::{ShaderCache, ShaderCacheStats};
@@ -5452,5 +5452,232 @@ fn dispatches_through_unbounded_pointers_record_their_barrier_at_once() {
         );
     }
     assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
+    f.assert_no_validation_errors();
+}
+
+/// Storage binding reach: an NVN descriptor takes its size word. A bare Switch 2 pointer or a
+/// pointer table entry reaches what its program provably accesses, whatever the word after the
+/// pointer holds, and is unbounded (`None`) when that is unknown or varies per invocation. No
+/// reach passes the host's range limit.
+#[test]
+fn storage_pointer_reach_follows_the_program_accesses() {
+    use lichii_memory::{DeviceAddressSpace, PhysicalMemory};
+    use lichii_shader::info::{StorageBufferDescriptor, StorageWriteExtent};
+
+    const MIB: u64 = 1 << 20;
+    let physical = Arc::new(PhysicalMemory::new(MIB).unwrap());
+    physical.commit(0, MIB).unwrap();
+    let memory = Arc::new(DeviceAddressSpace::new(physical, 36));
+    memory.map(DADDR, 0, MIB);
+    let gmmu = Arc::new(Gmmu::new(memory, lichii_gpu::gmmu::BigPageSize::Size64K));
+    gmmu.map(GPU_VA, DADDR, MIB, 0, false).unwrap();
+    let pool = GPU_VA + 0x8_0000;
+    let table = GPU_VA + 0x1000;
+    gmmu.write(table + 8, pool).unwrap();
+    let cbuf = |pointer: u64, next: u64| {
+        gmmu.write(GPU_VA, pointer).unwrap();
+        gmmu.write(GPU_VA + 8, next).unwrap();
+    };
+    let cbufs = [ConstBufferBinding {
+        address: GPU_VA,
+        size: 0x100,
+        enabled: true,
+    }];
+    let sources = |switch2: bool| StageSources {
+        gmmu: &gmmu,
+        cbufs: &cbufs,
+        root_table: None,
+        pool: TexturePool {
+            address: 0,
+            limit: 0,
+            via_header_index: false,
+            switch2,
+        },
+        samplers: 0,
+        sampler_limit: 0,
+    };
+    let unknown = StorageWriteExtent::default();
+    let extent = |end: u32, stride: u32| StorageWriteExtent {
+        bounded: true,
+        const_end: end,
+        local_stride: [stride, 0, 0],
+        ..StorageWriteExtent::default()
+    };
+    let desc = |indirect_offset: u32, read_extent, written: Option<StorageWriteExtent>| {
+        StorageBufferDescriptor {
+            cbuf_index: 0,
+            cbuf_offset: 0,
+            count: 1,
+            is_written: written.is_some(),
+            indirect_offset,
+            write_extent: written.unwrap_or_default(),
+            read_extent,
+        }
+    };
+    let direct = StorageBufferDescriptor::DIRECT;
+    let reach = |switch2: bool, desc: StorageBufferDescriptor| {
+        storage_pointer(&sources(switch2), &desc, 0, u64::MAX)
+    };
+
+    cbuf(pool, 0x300);
+    assert_eq!(
+        reach(false, desc(direct, extent(0x44, 0), None)),
+        (pool, Some(0x300)),
+        "an NVN descriptor's size word"
+    );
+    for next in [0x300, 200 * MIB, GPU_VA] {
+        cbuf(pool, next);
+        assert_eq!(
+            reach(true, desc(direct, extent(0x44, 0), None)),
+            (pool, Some(0x44)),
+            "a bare pointer reaches its reads, not the next word {next:#x}"
+        );
+    }
+    assert_eq!(reach(true, desc(direct, unknown, None)), (pool, None));
+    assert_eq!(
+        reach(true, desc(direct, extent(0x44, 16), None)),
+        (pool, None),
+        "reads that vary per invocation"
+    );
+    assert_eq!(
+        reach(true, desc(direct, extent(0x44, 0), Some(extent(0x80, 0)))),
+        (pool, Some(0x80)),
+        "a written pointer reaches its stores too"
+    );
+    assert_eq!(
+        reach(true, desc(direct, extent(0x44, 0), Some(unknown))),
+        (pool, None),
+        "stores of unknown reach"
+    );
+    assert_eq!(
+        reach(true, desc(direct, extent(0, 0), None)),
+        (pool, Some(4)),
+        "a pointer the program never reads"
+    );
+
+    cbuf(table, 0);
+    assert_eq!(
+        reach(true, desc(8, unknown, None)),
+        (pool, None),
+        "a pointer table entry of unknown reach"
+    );
+    assert_eq!(
+        reach(false, desc(8, extent(0x20, 0), None)),
+        (pool, Some(0x20))
+    );
+    assert_eq!(
+        storage_pointer(&sources(true), &desc(8, extent(0x44, 0), None), 0, 0x10),
+        (pool, Some(0x10)),
+        "no reach passes the host's storage buffer range"
+    );
+}
+
+/// A Switch 2 fragment program reading its bare storage pointer at a constant offset. Each draw
+/// moves the pointer, and the word after it holds another pointer rather than a size, with the
+/// memory a megabyte past it scattered. The binding reaches just the bytes read, so the draws
+/// copy a few KiB each, the order they did before #454; #454's 8 MiB bare bindings gathered
+/// about 440 KiB a draw in Mario Kart World (ZOR-450).
+#[test]
+fn switch2_draws_bind_just_the_storage_bytes_they_read() {
+    const DRAWS: u64 = 72;
+    let Some(mut f) = fixture(GobLayout::Switch2) else {
+        return;
+    };
+    f.rasterizer.draw.pipelines.set_async_compilation(false);
+    let gmmu = gmmu(&f);
+    let attribute = |op, address: u128, count: u128, registers: u128| {
+        ampere(
+            op,
+            Form::Fixed,
+            address << 40 | (count - 1) << 74 | registers,
+        )
+    };
+    let mut vertex = header(1, ShaderType::VERTEX_B);
+    vertex[6] = 0xf;
+    vertex[13] |= 0xf0 << 8;
+    let vertex = ampere_program(
+        vertex,
+        &[
+            attribute(AmpereOpcode::Ald, 0x80, 4, RZ_A | 0xff << 32),
+            attribute(AmpereOpcode::Ast, 0x70, 4, RZ_A | 0xff << 64),
+            ampere_exit(),
+        ],
+    );
+    let mut fragment = header(2, ShaderType::PIXEL);
+    fragment[18] = 0xf;
+    let fragment = ampere_program(
+        fragment,
+        &[
+            ampere(
+                AmpereOpcode::Ldc,
+                Form::Bound,
+                4 << 16 | RZ_A | 0x110 << 38 | 5 << 73,
+            ),
+            ampere(
+                AmpereOpcode::Ldg,
+                Form::Fixed,
+                4 << 24 | 0x40 << 40 | 1 << 72 | 4 << 73,
+            ),
+            ampere_mov(1, 0),
+            ampere_mov(2, 0),
+            ampere_mov(3, 1.0f32.to_bits()),
+            ampere_exit(),
+        ],
+    );
+    let fragment_offset = 0x1000;
+    write(&f, PROGRAMS, &vertex);
+    write(&f, PROGRAMS + fragment_offset, &fragment);
+    write(
+        &f,
+        VERTICES,
+        &f32_bytes(&[
+            -1.0, -1.0, 0.0, 1.0, 3.0, -1.0, 0.0, 1.0, -1.0, 3.0, 0.0, 1.0,
+        ]),
+    );
+    let mut regs = draw_regs();
+    bind_program(&mut regs, 1, ShaderType::VERTEX_B, PROGRAMS);
+    bind_program(&mut regs, 5, ShaderType::PIXEL, PROGRAMS + fragment_offset);
+    regs.vertex_attrib_format[0] = VertexAttribute(0x1 << 21 | 0x7 << 27);
+    regs.vertex_streams[0].bits = VertexStreamBits(16 | 1 << 12);
+    regs.words_mut()[0x600 / 4 + 1] = 3 * 16;
+    let stride = 0x100;
+    for i in 0..DRAWS {
+        write(
+            &f,
+            SSBO + i * stride + 0x40,
+            &0.5f32.to_bits().to_le_bytes(),
+        );
+    }
+    let scattered = GPU_VA + SSBO + (1 << 20);
+    gmmu.unmap(scattered, 0x1_0000).unwrap();
+    gmmu.map(scattered, DADDR + 0xf0_0000, 0x1_0000, 0, false)
+        .unwrap();
+    let bind = |f: &Fixture, i: u64| {
+        let mut words = (GPU_VA + SSBO + i * stride).to_le_bytes().to_vec();
+        words.extend_from_slice(&(GPU_VA + VERTICES).to_le_bytes());
+        write(f, FRAGMENT_CBUF + 0x110, &words);
+    };
+    bind(&f, 0);
+    draw(&mut f, &gmmu, &regs);
+    let before = f.rasterizer.buffer_cache.stats();
+    for i in 1..DRAWS {
+        bind(&f, i);
+        draw(&mut f, &gmmu, &regs);
+    }
+    let after = f.rasterizer.buffer_cache.stats();
+    assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
+    let copied =
+        after.streamed_bytes - before.streamed_bytes + after.gathered_bytes - before.gathered_bytes;
+    let per_draw = copied / (DRAWS - 1);
+    assert!(
+        per_draw <= 8 << 10,
+        "each draw copied {per_draw} bytes, more than the pre-#454 order"
+    );
+    let texels = switch2_target(&mut f);
+    assert!(
+        texels.iter().all(|&t| unorm8_eq(t, [128, 0, 0, 255])),
+        "every texel takes the word the pointer reaches: {:?}",
+        &texels[..4]
+    );
     f.assert_no_validation_errors();
 }

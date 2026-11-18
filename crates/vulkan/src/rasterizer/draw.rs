@@ -1682,14 +1682,24 @@ impl VulkanRasterizer {
                         for i in 0..b.count {
                             let limit = storage_range_limit(self);
                             let (address, size) = storage_pointer(src, &desc, i, limit);
-                            let binding = self.buffer_cache.storage_buffer(
-                                &mut self.scheduler,
-                                &mut self.staging,
-                                src.gmmu,
-                                address,
-                                size,
-                                desc.is_written,
-                            )?;
+                            let binding = match size {
+                                Some(size) => self.buffer_cache.storage_buffer(
+                                    &mut self.scheduler,
+                                    &mut self.staging,
+                                    src.gmmu,
+                                    address,
+                                    size,
+                                    desc.is_written,
+                                )?,
+                                None => self.buffer_cache.unbounded_storage_buffer(
+                                    &mut self.scheduler,
+                                    &mut self.staging,
+                                    src.gmmu,
+                                    address,
+                                    limit,
+                                    desc.is_written,
+                                )?,
+                            };
                             self.push_buffer(binding, desc.is_written);
                         }
                     }
@@ -3175,6 +3185,7 @@ impl VulkanRasterizer {
                     return 0;
                 };
                 let (address, size) = storage_pointer(src, desc, element, limit);
+                let size = size.unwrap_or(limit);
                 let base = address & !(align - 1);
                 let word = base + u64::from(offset);
                 if address == 0 || word + 4 > address + size {
@@ -3217,26 +3228,41 @@ fn numeric_mismatch(
         && src.pool.header(src.gmmu, raw).format.is_integer() != is_integer
 }
 
-/// The GPU address and size of storage buffer `element` of `desc`: 16-byte NVN descriptors in
-/// the constant buffer, or (indirect) a pointer table the constant buffer points to. No size
-/// passes `limit`, the largest range the host binds after alignment.
+/// The GPU address of storage buffer `element` of `desc` and the bytes its binding reaches
+/// past it. An NVN descriptor in the constant buffer gives its size word. Any other pointer (a
+/// bare Switch 2 pointer, or an entry of a pointer table the constant buffer points to) carries
+/// no size, so it reaches what the program provably accesses, or `None` when that is unknown:
+/// then [`BufferCache::unbounded_storage_buffer`](crate::buffer_cache::BufferCache::unbounded_storage_buffer)
+/// binds as far as it can in place. No size passes `limit`, the largest range the host binds
+/// after alignment.
 fn storage_pointer(
     src: &StageSources<'_>,
     desc: &StorageBufferDescriptor,
     element: u32,
     limit: u64,
-) -> (GpuVAddr, u64) {
+) -> (GpuVAddr, Option<u64>) {
     let offset = desc.cbuf_offset + element * 16;
     let pointer: u64 = read_cbuf(src.gmmu, src.cbufs, desc.cbuf_index, offset);
-    if desc.indirect_offset == StorageBufferDescriptor::DIRECT {
+    let direct = desc.indirect_offset == StorageBufferDescriptor::DIRECT;
+    if direct && !src.pool.switch2 {
         let size: u32 = read_cbuf(src.gmmu, src.cbufs, desc.cbuf_index, offset + 8);
-        return (pointer, u64::from(size).min(limit));
+        return (pointer, Some(u64::from(size).min(limit)));
     }
-    let address = src
-        .gmmu
-        .read::<u64>(pointer + u64::from(desc.indirect_offset))
-        .unwrap_or(0);
-    (address, (64 << 10u64).min(limit))
+    let address = match direct {
+        true => pointer,
+        false => src
+            .gmmu
+            .read::<u64>(pointer + u64::from(desc.indirect_offset))
+            .unwrap_or(0),
+    };
+    let mut extent = desc.read_extent;
+    if desc.is_written {
+        extent.merge(&desc.write_extent);
+    }
+    let size = extent
+        .constant_end()
+        .map(|end| u64::from(end).max(4).min(limit));
+    (address, size)
 }
 
 /// The largest storage buffer range a binding may ask for: the host's limit, less the bytes

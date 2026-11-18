@@ -475,6 +475,7 @@ fn add_nvn_storage_buffers(info: &mut ShaderInfo, profile: &Profile) -> Result<(
             .find(|d| d.cbuf_index == 0 && d.cbuf_offset == offset)
         {
             desc.is_written |= stores;
+            desc.read_extent = StorageWriteExtent::default();
             if stores {
                 desc.write_extent = StorageWriteExtent::default();
             }
@@ -493,6 +494,7 @@ fn add_nvn_storage_buffers(info: &mut ShaderInfo, profile: &Profile) -> Result<(
             is_written: stores,
             indirect_offset: StorageBufferDescriptor::DIRECT,
             write_extent: StorageWriteExtent::default(),
+            read_extent: StorageWriteExtent::default(),
         });
     }
     Ok(())

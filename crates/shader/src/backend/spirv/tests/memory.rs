@@ -25,6 +25,7 @@ fn storage_descriptor(cbuf_offset: u32) -> StorageBufferDescriptor {
         is_written: true,
         indirect_offset: StorageBufferDescriptor::DIRECT,
         write_extent: Default::default(),
+        read_extent: Default::default(),
     }
 }
 

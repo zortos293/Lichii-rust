@@ -119,6 +119,26 @@ fn descriptor(index: u32, offset: u32, is_written: bool) -> StorageBufferDescrip
         is_written,
         indirect_offset: StorageBufferDescriptor::DIRECT,
         write_extent: StorageWriteExtent::default(),
+        read_extent: StorageWriteExtent::default(),
+    }
+}
+
+/// `descriptor` with loads that reach `end` bytes, plus `stride` bytes per local invocation x.
+fn read_descriptor(
+    index: u32,
+    offset: u32,
+    is_written: bool,
+    end: u32,
+    stride: u32,
+) -> StorageBufferDescriptor {
+    StorageBufferDescriptor {
+        read_extent: StorageWriteExtent {
+            bounded: true,
+            const_end: end,
+            local_stride: [stride, 0, 0],
+            ..StorageWriteExtent::default()
+        },
+        ..descriptor(index, offset, is_written)
     }
 }
 
@@ -165,7 +185,7 @@ fn paired_pointer_load_becomes_a_storage_load() {
 
     assert_eq!(
         info.storage_buffers_descriptors,
-        vec![descriptor(0, 0x110, false)]
+        vec![read_descriptor(0, 0x110, false, 12, 0)]
     );
     let storage = forwarded(&b.prog, load);
     assert_eq!(b.prog.op(storage), Opcode::LoadStorage32);
@@ -191,7 +211,7 @@ fn zero_extended_offset_plus_paired_pointer_becomes_a_storage_load() {
 
     assert_eq!(
         info.storage_buffers_descriptors,
-        vec![descriptor(0, 0x110, false)]
+        vec![read_descriptor(0, 0x110, false, 12, 64)]
     );
     let storage = forwarded(&b.prog, load);
     assert_eq!(b.prog.op(storage), Opcode::LoadStorage32);
@@ -228,7 +248,7 @@ fn paired_pointer_plus_zero_extended_offset_store_records_its_extent() {
         .unwrap();
     let info = b.run(&Env::default(), &profile()).unwrap();
 
-    let mut expected = descriptor(0, 0x140, true);
+    let mut expected = read_descriptor(0, 0x140, true, 0, 0);
     expected.write_extent = StorageWriteExtent {
         bounded: true,
         const_end: 20,
@@ -252,7 +272,10 @@ fn bindings_follow_constant_buffer_order() {
 
     assert_eq!(
         info.storage_buffers_descriptors,
-        vec![descriptor(0, 0x120, false), descriptor(0, 0x200, false)]
+        vec![
+            read_descriptor(0, 0x120, false, 8, 0),
+            read_descriptor(0, 0x200, false, 4, 0)
+        ]
     );
     let early_storage = forwarded(&b.prog, early_load);
     assert_eq!(b.prog.op(early_storage), Opcode::LoadStorage64);
@@ -275,7 +298,7 @@ fn store_is_replaced_and_records_its_extent() {
         .unwrap();
     let info = b.run(&Env::default(), &profile()).unwrap();
 
-    let mut expected = descriptor(0, 0x140, true);
+    let mut expected = read_descriptor(0, 0x140, true, 0, 0);
     expected.write_extent = StorageWriteExtent {
         bounded: true,
         const_end: 20,
@@ -305,7 +328,31 @@ fn store_through_a_loaded_index_has_an_unknown_extent() {
 
     assert_eq!(
         info.storage_buffers_descriptors,
-        vec![descriptor(0, 0x140, true), descriptor(0, 0x150, false)]
+        vec![
+            read_descriptor(0, 0x140, true, 0, 0),
+            read_descriptor(0, 0x150, false, 4, 0)
+        ]
+    );
+}
+
+#[test]
+fn load_through_a_loaded_index_has_an_unknown_extent() {
+    let mut b = Builder::new();
+    let index_address = b.pair_address(0, 0x150, 0);
+    let index = b.inst(Opcode::LoadGlobal32, &[index_address]);
+    let pointer = b.cbuf(0, 0x140);
+    let high = b.cbuf(0, 0x144);
+    let low = b.inst(Opcode::IAdd32, &[pointer, index]);
+    let address = b.address(low, high, 0);
+    b.inst(Opcode::LoadGlobal32, &[address]);
+    let info = b.run(&Env::default(), &profile()).unwrap();
+
+    assert_eq!(
+        info.storage_buffers_descriptors,
+        vec![
+            descriptor(0, 0x140, false),
+            read_descriptor(0, 0x150, false, 4, 0)
+        ]
     );
 }
 

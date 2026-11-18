@@ -419,6 +419,7 @@ fn emulated_mesh_program_with_and_without_a_task() {
             is_written: true,
             indirect_offset: StorageBufferDescriptor::DIRECT,
             write_extent: Default::default(),
+            read_extent: Default::default(),
         }];
         let module = emit(name, &emulation_profile(), &runtime, &program);
         assert_eq!(

@@ -279,6 +279,7 @@ mod tests {
                 is_written: true,
                 indirect_offset: StorageBufferDescriptor::DIRECT,
                 write_extent: Default::default(),
+                read_extent: Default::default(),
             }],
             texture_descriptors: vec![TextureDescriptor {
                 ty: crate::ir::TextureType::Color2D,

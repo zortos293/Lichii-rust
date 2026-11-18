@@ -712,6 +712,7 @@ fn global_memory_routing_and_storage_cas_loops() {
         is_written: true,
         indirect_offset,
         write_extent: Default::default(),
+        read_extent: Default::default(),
     };
     let info = ShaderInfo {
         uses_global_memory: true,
@@ -779,6 +780,7 @@ fn binding_decorations_match_the_resource_layout() {
         is_written: false,
         indirect_offset: StorageBufferDescriptor::DIRECT,
         write_extent: Default::default(),
+        read_extent: Default::default(),
     };
     let info = ShaderInfo {
         used_constant_buffer_types: Type::U32 | Type::F32,
