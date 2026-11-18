@@ -2351,6 +2351,12 @@ impl BufferCache {
         }
     }
 
+    /// Whether a cached buffer holds `daddr`.
+    #[cfg(test)]
+    pub(crate) fn is_cached(&self, daddr: DAddr) -> bool {
+        Self::lookup(&self.page_table, daddr).is_some()
+    }
+
     /// The least recently acquired buffer: a cursor for [`BufferCache::lru_entry`].
     pub(crate) fn lru_head(&self) -> u32 {
         self.lru_head
@@ -2364,9 +2370,10 @@ impl BufferCache {
     }
 
     /// Evicts the buffer at `cursor` unless it holds GPU-written bytes not downloaded yet, or
-    /// the draw being prepared binds it for writing; returns its bytes, `None` when it stays.
-    /// Its next acquire uploads it from guest memory again. The GPU work already recorded may
-    /// still read it: its memory goes once the current tick completes.
+    /// the draw being prepared binds it for writing; returns its bytes. One that stays (`None`)
+    /// counts as used this frame, so it does not hold back the buffers behind it. An evicted
+    /// buffer's next acquire uploads it from guest memory again. The GPU work already recorded
+    /// may still read it: its memory goes once the current tick completes.
     pub(crate) fn evict(&mut self, scheduler: &mut Scheduler, cursor: u32) -> Option<u64> {
         let id = cursor as usize;
         let buffer = self.buffer(id);
@@ -2377,6 +2384,9 @@ impl BufferCache {
                 .iter()
                 .any(|&(start, stop)| start < end && daddr < stop)
         {
+            self.buffers[id].as_mut().expect("live buffer").last_use = self.frame;
+            self.lru_unlink(id);
+            self.lru_push(id);
             return None;
         }
         self.lru_unlink(id);
@@ -5212,6 +5222,100 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(uniform, f.acquire(DADDR + 0x38_0100, 0x2000));
+        f.assert_no_validation_errors();
+    }
+
+    /// An evicted buffer stops tracking guest writes and comes back with the bytes guest memory
+    /// holds when it is next acquired, uploaded whole.
+    #[test]
+    fn evicted_buffers_upload_their_guest_bytes_again() {
+        let Some(mut f) = fixture() else { return };
+        f.memory.write_bytes(DADDR, &pattern(0x2_0000, 1)).unwrap();
+        let binding = f.acquire(DADDR, 0x2_0000);
+        assert!(f.read_binding(binding) == pattern(0x2_0000, 1));
+        assert_eq!(f.cache.cached().bytes, 0x2_0000);
+        let head = f.cache.lru_head();
+        assert_eq!(f.cache.evict(&mut f.scheduler, head), Some(0x2_0000));
+        assert_eq!(f.cache.cached(), LiveMemory::default());
+        assert_eq!(f.cache.lru_entry(f.cache.lru_head()), None);
+        assert_eq!(
+            (
+                f.cache.stats().evicted_buffers,
+                f.cache.stats().evicted_bytes
+            ),
+            (1, 0x2_0000)
+        );
+
+        let newer = pattern(0x2_0000, 2);
+        f.memory.write_bytes(DADDR, &newer).unwrap();
+        let uploaded = f.cache.stats().uploaded_bytes;
+        let binding = f.acquire(DADDR, 0x2_0000);
+        assert_eq!(f.cache.stats().uploaded_bytes - uploaded, 0x2_0000);
+        assert!(
+            f.read_binding(binding) == newer,
+            "the guest's bytes upload again"
+        );
+        f.assert_no_validation_errors();
+    }
+
+    /// A buffer holding GPU-written bytes stays until they are downloaded, and keeps them.
+    #[test]
+    fn gpu_written_buffers_are_not_evicted() {
+        let Some(mut f) = fixture() else { return };
+        let binding = f.acquire(DADDR, 0x1_0000);
+        f.gpu_fill(binding, 0x80, 0x100, 0xcafe_f00d);
+        f.cache
+            .mark_gpu_written(f.scheduler.tick(), DADDR + 0x80, 0x100);
+        let head = f.cache.lru_head();
+        f.cache.set_frame(5);
+        assert_eq!(f.cache.evict(&mut f.scheduler, head), None);
+        assert!(f.cache.is_cached(DADDR));
+        assert_eq!(
+            f.cache.lru_entry(head),
+            Some((5, NIL)),
+            "it counts as used this frame"
+        );
+        f.cache.flush(&mut f.scheduler, DADDR, 0x1_0000).unwrap();
+        assert_eq!(
+            f.guest(DADDR + 0x80, 0x100),
+            0xcafe_f00d_u32.to_le_bytes().repeat(0x40)
+        );
+        assert_eq!(f.cache.evict(&mut f.scheduler, head), Some(0x1_0000));
+        f.assert_no_validation_errors();
+    }
+
+    /// Acquires move buffers to the recent end of the LRU list once per frame, and a grown
+    /// buffer replaces the ones it absorbed there.
+    #[test]
+    fn acquires_keep_buffers_in_lru_order() {
+        let Some(mut f) = fixture() else { return };
+        let order = |f: &Fixture| {
+            let mut out = Vec::new();
+            let mut cursor = f.cache.lru_head();
+            while let Some((last_use, next)) = f.cache.lru_entry(cursor) {
+                out.push((f.cache.buffer(cursor as usize).daddr, last_use));
+                cursor = next;
+            }
+            out
+        };
+        for i in 0..3 {
+            f.acquire(DADDR + i * 0x10_0000, 0x1000);
+        }
+        f.cache.set_frame(1);
+        f.acquire(DADDR, 0x1000);
+        assert_eq!(
+            order(&f),
+            [(DADDR + 0x10_0000, 0), (DADDR + 0x20_0000, 0), (DADDR, 1)]
+        );
+        f.cache.set_frame(2);
+        f.acquire(DADDR + 0x10_0000, 0x10_1000);
+        assert_eq!(
+            order(&f),
+            [(DADDR, 1), (DADDR + 0x10_0000, 2)],
+            "the grown buffer replaces both it absorbed"
+        );
+        assert_eq!(f.cache.cached().count, 2);
+        assert_eq!(f.cache.cached().bytes, CACHING_PAGE_SIZE + 0x11_0000);
         f.assert_no_validation_errors();
     }
 
