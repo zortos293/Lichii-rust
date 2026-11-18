@@ -2046,6 +2046,27 @@ mod tests {
             }
             calls
         }
+
+        /// Plans every paint of the sync through `plans`, the image as serial 1 and the newer
+        /// images as serials 2 on.
+        fn replay(&self, plans: &mut Plans, scratch: &mut RunScratch) {
+            let target = planned(&self.image, 1);
+            for (k, (image, direction)) in self.paints().enumerate() {
+                let serial = if std::ptr::eq(image, &self.image) {
+                    1
+                } else {
+                    k as u64 + 1
+                };
+                plans.paint(
+                    scratch,
+                    planned(image, serial),
+                    target,
+                    self.window,
+                    direction,
+                );
+                std::hint::black_box(&scratch.words);
+            }
+        }
     }
 
     /// A 128x128 B10G11R11Float cube or cube array of 8 levels in Switch 2 GOBs, block height
@@ -2397,9 +2418,12 @@ mod tests {
             let current = median_ns(200, || {
                 sync.plan::<Current>(&mut scratch);
             });
+            let mut plans = Plans::default();
+            let replayed = median_ns(2000, || sync.replay(&mut plans, &mut scratch));
             println!(
                 "{name}: window {:#x}..{:#x}, runs per paint {runs:?}, \
-                     moved_bytes calls {} -> {}, per sync {reference:.0} ns -> {current:.0} ns",
+                     moved_bytes calls {} -> {}, per sync {reference:.0} ns -> {current:.0} ns, \
+                     replayed {replayed:.0} ns",
                 sync.window.0, sync.window.1, calls.0, calls.1
             );
         }
