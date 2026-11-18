@@ -296,7 +296,7 @@ fn simd(rng: &mut Rng) -> u32 {
     }
 }
 
-const VECTOR: [&str; 28] = [
+const VECTOR: [&str; 31] = [
     "0xx01110xx1xxxxx0110x1xxxxxxxxxx",
     "0xx01110xx1xxxxx000x01xxxxxxxxxx",
     "0xx01110xx1xxxxx00x011xxxxxxxxxx",
@@ -325,6 +325,9 @@ const VECTOR: [&str; 28] = [
     "0x00111000100000010110xxxxxxxxxx",
     "0xx011110xxxxxxx111xx1xxxxxxxxxx",
     "01x111110xxxxxxx111xx1xxxxxxxxxx",
+    "01x111110xxxxxxx100xx1xxxxxxxxxx",
+    "0xx01110xx100001001010xxxxxxxxxx",
+    "01x11110xx10000101x010xxxxxxxxxx",
 ];
 
 /// An Advanced SIMD integer three-same (halving, saturating, absolute-difference and pairwise max/min forms
@@ -813,6 +816,51 @@ fn saturating_left_shifts_at_the_lane_edges_match_the_interpreter() {
                     directed(&[DUP_V0_X0, DUP_V1_X1, word], &[(0, !a), (1, a)]);
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn saturating_narrows_at_the_lane_edges_match_the_interpreter() {
+    const DUP_V0_X0: u32 = 0x4e08_0c00;
+    const DUP_V1_X1: u32 = 0x4e08_0c21;
+    const VALUES: [u64; 8] = [
+        0,
+        1,
+        u64::MAX,
+        1 << 63,
+        u64::MAX >> 1,
+        0x0000_0001_7fff_ffff,
+        0x8000_ffff_007f_0080,
+        0xff7f_0100_80ff_7fff,
+    ];
+    let shifts = [
+        0x0f00_9420,
+        0x0f00_9c20,
+        0x2f00_9420,
+        0x2f00_9c20,
+        0x2f00_8420,
+        0x2f00_8c20,
+    ];
+    let mut ops = Vec::new();
+    for op in shifts {
+        for size in 0..3 {
+            let esize = 8u32 << size;
+            for shift in [1, esize / 2, esize] {
+                let word = op | (2 * esize - shift) << 16;
+                ops.extend([word, word | 1 << 30, word | 0x5000_0000]);
+            }
+        }
+    }
+    for op in [0x0e21_4820, 0x2e21_4820, 0x2e21_2820] {
+        for size in 0..3 {
+            let word = op | size << 22;
+            ops.extend([word, word | 1 << 30, word | 0x5000_0000]);
+        }
+    }
+    for word in ops {
+        for a in VALUES {
+            directed(&[DUP_V0_X0, DUP_V1_X1, word], &[(0, !a), (1, a)]);
         }
     }
 }
