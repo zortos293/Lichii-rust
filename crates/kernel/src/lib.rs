@@ -26,6 +26,7 @@ mod sync;
 pub mod thread;
 mod timer;
 mod util;
+mod wait_stats;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -60,6 +61,7 @@ use crate::sm::ServiceManager;
 use crate::thread::{LOWEST_PRIORITY, NewThread, Thread, ThreadId, ThreadState};
 use crate::timer::Timer;
 use crate::util::Rng;
+use crate::wait_stats::WaitStats;
 
 pub use crate::event::Event;
 pub use crate::memory::Pool;
@@ -136,6 +138,8 @@ pub(crate) struct KernelInner {
     /// Add the cores' live guest pcs to every watchdog thread log (`LICHII_LIVE_PC`).
     live_pc_log: bool,
     live_pcs: LivePcs,
+    /// Guest threads' blocked time by wait reason, when the `waits` target logs at debug.
+    waits: Option<WaitStats>,
     events: Arc<dyn KernelEvents>,
     rng: Mutex<Rng>,
     next_process_id: AtomicU64,
@@ -203,6 +207,7 @@ impl Kernel {
             svc_trace: config.svc_trace,
             live_pc_log: std::env::var_os("LICHII_LIVE_PC").is_some(),
             live_pcs: LivePcs::new(cores),
+            waits: WaitStats::if_enabled(cores),
             events: config.events.unwrap_or_else(|| Arc::new(LogEvents)),
             rng: Mutex::new(Rng::new(config.rng_seed)),
             next_process_id: AtomicU64::new(0x51),
@@ -647,6 +652,7 @@ impl KernelInner {
         let mut logged = Instant::now();
         let mut trimmed = Instant::now();
         let mut memory_logged = Instant::now();
+        let mut waits_logged = Instant::now();
         while !self.scheduler.is_shut_down() {
             std::thread::park_timeout(WATCH_PERIOD);
             let now = Instant::now();
@@ -657,6 +663,15 @@ impl KernelInner {
             if now.duration_since(memory_logged) >= MEMORY_LOG_PERIOD {
                 memory_logged = now;
                 self.log_memory();
+            }
+            if let Some(waits) = &self.waits
+                && now.duration_since(waits_logged) >= wait_stats::REPORT_PERIOD
+                && tracing::enabled!(target: "waits", tracing::Level::DEBUG)
+            {
+                let period = now.duration_since(waits_logged);
+                waits_logged = now;
+                let report = waits.report(&self.processes.lock().clone());
+                tracing::debug!(target: "waits", period_ms = period.as_millis() as u64, "{report}");
             }
             let outranked = if self.scheduler.is_paused() {
                 0

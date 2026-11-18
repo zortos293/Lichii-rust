@@ -13,6 +13,7 @@ use crate::arbiter::{HANDLE_WAIT_MASK, SignalType};
 use crate::event::Event;
 use crate::object::KObject;
 use crate::result;
+use crate::wait_stats::{WaitObject, WaitReason};
 
 #[test]
 fn event_signal_wakes_a_waiting_thread() {
@@ -1014,4 +1015,145 @@ fn a_condvar_waiter_flags_the_key_before_it_releases_the_mutex() {
         test.program(spawn_and_join_entries(heap, vec![w, s], vec![(44, 1), (44, 2)]).exit());
     test.start(test.image(), main);
     test.run_until_exit(Duration::from_secs(20));
+}
+
+/// Enables the `waits` target on the thread that holds it, and only there, so the watchdog
+/// thread of a test kernel never drains the wait tables the test reads. Two must be registered:
+/// with a single dispatcher, tracing caches a callsite's interest from whichever thread first
+/// reaches it, which a parallel test with no subscriber can win.
+struct WaitsOnly;
+
+impl tracing::Subscriber for WaitsOnly {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == "waits"
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, _: &tracing::Event<'_>) {}
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// With the `waits` target on, a thread blocked on an event lands in the event bucket for as
+/// long as it was blocked, and the event heads the waited-on objects under its origin; a sleep
+/// lands in its own bucket. With the target off the kernel keeps no wait tables.
+#[test]
+fn a_blocked_event_wait_lands_in_the_event_bucket() {
+    assert!(
+        TestKernel::new(ConsoleGeneration::Switch2)
+            .kernel
+            .0
+            .waits
+            .is_none()
+    );
+    let waits_only = tracing::Dispatch::new(WaitsOnly);
+    let _second = tracing::Dispatch::new(WaitsOnly);
+    let test = tracing::dispatcher::with_default(&waits_only, || {
+        TestKernel::new(ConsoleGeneration::Switch2)
+    });
+    let waits = test
+        .kernel
+        .0
+        .waits
+        .as_ref()
+        .expect("the waits target is on");
+    let heap = heap_base(&test);
+    let list = heap + 0x2000;
+    let event = Arc::new(Event::new());
+    event.note_origin(|| "vi:u command 5202".into());
+    let handle = Arc::new(AtomicU64::new(0));
+    let resumed = Arc::new(AtomicU32::new(0));
+    let release = Arc::new(AtomicU32::new(0));
+    let (h, done, go) = (handle.clone(), resumed.clone(), release.clone());
+    let main = test.program(
+        Script::new()
+            .svc(0x0b, |ctx, _| ctx.x[0] = 2_000_000)
+            .then(move |_, env| {
+                env.memory
+                    .write(list, h.load(Ordering::SeqCst) as u32)
+                    .unwrap()
+            })
+            .svc(0x18, move |ctx, _| {
+                ctx.x[1] = list;
+                ctx.x[2] = 1;
+                ctx.x[3] = u64::MAX;
+            })
+            .then(move |_, _| done.store(1, Ordering::SeqCst))
+            .spin_until(move |_, _| go.load(Ordering::SeqCst) == 1)
+            .exit(),
+    );
+    let process = test.start(test.image(), main);
+    handle.store(
+        process
+            .handles()
+            .write()
+            .add(KObject::ReadableEvent(event.clone()))
+            .unwrap() as u64,
+        Ordering::SeqCst,
+    );
+    test.kernel.run().unwrap();
+    let thread = process.threads()[0].clone();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !test
+        .kernel
+        .0
+        .wait_descriptions(std::slice::from_ref(&process))
+        .get(&thread.id())
+        .is_some_and(|waits_on| waits_on.contains("vi:u command 5202"))
+        || thread.sched.lock().wait_probe.is_none()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the thread never waited on the event"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::thread::sleep(Duration::from_millis(30));
+    event.signal();
+    while resumed.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "the thread never resumed");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let report = waits.report(std::slice::from_ref(&process));
+    let blocked = report.reason(WaitReason::Event);
+    assert_eq!(blocked.count, 1);
+    assert!(blocked.ns >= 30_000_000, "blocked {}ns", blocked.ns);
+    assert_eq!(report.reason(WaitReason::Sleep).count, 1);
+    for reason in WaitReason::ALL {
+        if reason != WaitReason::Event && reason != WaitReason::Sleep {
+            assert_eq!(report.reason(reason).count, 0, "{reason:?}");
+        }
+    }
+    assert_eq!(report.objects.len(), 1);
+    let top = &report.objects[0];
+    assert_eq!(top.reason, WaitReason::Event);
+    assert_eq!(top.object, WaitObject::Event(event.serial()));
+    assert_eq!(top.name, "vi:u command 5202");
+    assert_eq!(top.total, blocked);
+    let line = report.to_string();
+    assert!(
+        line.contains("events by origin: vi:u command 5202")
+            && line.contains("top: event event [vi:u command 5202]"),
+        "{line}"
+    );
+
+    release.store(1, Ordering::SeqCst);
+    test.wait_for_exit(Duration::from_secs(5));
 }
