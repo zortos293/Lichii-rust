@@ -1215,7 +1215,6 @@ fn upload_bytes(
         transfer_to_all_barrier(device, cmd);
         offset += piece.len() as u64;
     }
-    staging.end_parts(scheduler);
     Ok(())
 }
 
@@ -1380,6 +1379,13 @@ impl BufferCache {
     /// yet ([`BufferCache::large`]).
     pub fn large_stream(&self) -> LiveMemory {
         self.large.live()
+    }
+
+    /// Frees the device-local gathers and streamed ranges ([`BufferCache::large`]) whose work
+    /// completed. The rasterizer calls it once per tick, so none outlives its tick by more than
+    /// one.
+    pub(crate) fn reclaim(&mut self, scheduler: &mut Scheduler) {
+        self.large.reclaim(scheduler);
     }
 
     /// The largest single stream request since the last call ([`StagingRing::take_request_max`]).
@@ -2177,9 +2183,6 @@ impl BufferCache {
             before_transfer(&self.device, cmd);
             copy_buffer(&self.device, cmd, slice.buffer, dst, copies);
             transfer_to_all_barrier(&self.device, cmd);
-        }
-        if !shared {
-            staging.end_parts(scheduler);
         }
         Ok(())
     }
@@ -5898,6 +5901,72 @@ mod tests {
             let got = read(&mut f, quads, quad * 6);
             assert_eq!(got, [base, base + 1, base + 2, base], "quad {quad}");
         }
+        f.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn large_ranges_are_freed_once_their_tick_completes() {
+        let Some(mut f) = fixture_with(16 << 20) else {
+            return;
+        };
+        let regs = bytemuck::zeroed_box::<Regs>();
+        let (size, _) = f.map_scattered(GPU_VA);
+        for _ in 0..4 {
+            f.storage_read(GPU_VA, size);
+            f.index_buffer(&regs, &draw(PrimitiveTopology::LINE_LOOP, false, 0, 1000))
+                .unwrap();
+        }
+        f.scheduler.finish().unwrap();
+        f.cache.reclaim(&mut f.scheduler);
+        assert_eq!(
+            f.cache.large_stream(),
+            LiveMemory::default(),
+            "ranges that share the stream ring never allocate from the large pool"
+        );
+        const GATHER: u64 = 8 << 20;
+        for k in 0..GATHER / CACHING_PAGE_SIZE {
+            let va = GPU_VA + (1 << 30) + k * CACHING_PAGE_SIZE;
+            let daddr = DADDR + (GATHER / CACHING_PAGE_SIZE - 1 - k) * CACHING_PAGE_SIZE;
+            f.gmmu.map(va, daddr, CACHING_PAGE_SIZE, 0, false).unwrap();
+        }
+        f.cache
+            .gather(
+                &mut f.scheduler,
+                &mut f.staging,
+                &f.gmmu,
+                GPU_VA + (1 << 30),
+                GATHER,
+                16,
+            )
+            .unwrap();
+        let vertices = 20_000_000u32;
+        f.index_buffer(
+            &regs,
+            &draw(PrimitiveTopology::LINE_LOOP, false, 0, vertices),
+        )
+        .unwrap();
+        let streamed = (u64::from(vertices) + 1) * 4;
+        assert!(streamed > STAGING_REQUEST_MAX);
+        assert_eq!(
+            f.cache.large_stream(),
+            LiveMemory {
+                bytes: GATHER + streamed,
+                count: 2
+            }
+        );
+        f.cache.reclaim(&mut f.scheduler);
+        assert_eq!(
+            f.cache.large_stream().count,
+            2,
+            "nothing is freed while its tick is being recorded"
+        );
+        f.scheduler.finish().unwrap();
+        f.cache.reclaim(&mut f.scheduler);
+        assert_eq!(
+            f.cache.large_stream(),
+            LiveMemory::default(),
+            "both are freed once their tick completed"
+        );
         f.assert_no_validation_errors();
     }
 }

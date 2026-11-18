@@ -6595,6 +6595,7 @@ impl Fixture {
             "{held} host-visible bytes held by one upload"
         );
         self.scheduler.finish().unwrap();
+        self.staging.reclaim_parts(&mut self.scheduler);
         let after = self.device.memory_counts().cpu_to_gpu.bytes - before;
         assert!(
             after <= 2 * PART_SLICE,
@@ -6606,7 +6607,12 @@ impl Fixture {
 
 /// Writes each subresource of \`s\` swizzled, as [\`level_data\`] would make it, one at a time so
 /// the test never holds the whole surface twice.
-fn write_surface_by_subresource(memory: &DeviceAddressSpace, s: &SurfaceLayout, seed: u32) {
+fn write_surface_by_subresource(
+    memory: &DeviceAddressSpace,
+    base: DAddr,
+    s: &SurfaceLayout,
+    seed: u32,
+) {
     for layer in 0..s.layers {
         for level in 0..s.levels {
             let tiling = s.level_tiling(level);
@@ -6614,7 +6620,7 @@ fn write_surface_by_subresource(memory: &DeviceAddressSpace, s: &SurfaceLayout, 
             let mut tiled = vec![0; tiling.size_bytes()];
             swizzle(&tiling, &data, &mut tiled);
             memory
-                .write_bytes(DADDR + s.subresource_offset(level, layer), &tiled)
+                .write_bytes(base + s.subresource_offset(level, layer), &tiled)
                 .unwrap();
         }
     }
@@ -6639,7 +6645,7 @@ fn uploads_past_the_request_bound_stage_through_bounded_parts() {
     ) else {
         return;
     };
-    write_surface_by_subresource(&f.memory, &s, 41);
+    write_surface_by_subresource(&f.memory, DADDR, &s, 41);
     let (id, request) = f.upload_bounded(&tic(0x08, GPU_VA, 2048, 2048, 13, 2, 4));
     let level0 = s.level_tiling(0);
     assert!(
@@ -6696,7 +6702,7 @@ fn subresources_past_the_request_bound_upload_in_bands() {
         ) else {
             return;
         };
-        write_surface_by_subresource(&f.memory, &s, 7);
+        write_surface_by_subresource(&f.memory, DADDR, &s, 7);
         let (id, request) = f.upload_bounded(&tic_typed(0x08, texture_type, w, h, d, 1, 4, 0));
         assert!(request < bytes, "{case}: {request}-byte request");
         assert_eq!(
@@ -6770,4 +6776,61 @@ fn banded_uploads_match_whole_ones() {
             }
         }
     }
+}
+
+#[test]
+fn large_uploads_in_one_tick_reuse_the_grown_part_slices() {
+    const TEXTURES: u64 = 6;
+    let s = surface(
+        PixelFormat::A8B8G8R8Unorm,
+        2048,
+        2048,
+        1,
+        1,
+        4,
+        GobLayout::Tegra,
+    );
+    let stride = s.size_bytes().next_multiple_of(1 << 20);
+    let Some(mut f) = fixture_with_dram(
+        GobLayout::Tegra,
+        AstcRecompression::Uncompressed,
+        TEXTURES * stride,
+    ) else {
+        return;
+    };
+    for k in 0..TEXTURES {
+        write_surface_by_subresource(&f.memory, DADDR + k * stride, &s, k as u32 * 5);
+    }
+    let piece = (s.level_tiling(0).size_bytes() + s.level_tiling(0).linear_size_bytes()) as u64;
+    let before = f.device.memory_counts().cpu_to_gpu.bytes;
+    let tick = f.scheduler.tick();
+    let ids: Vec<_> = (0..TEXTURES)
+        .map(|k| {
+            f.texture(&tic(0x08, GPU_VA + k * stride, 2048, 2048, 1, 1, 4))
+                .0
+        })
+        .collect();
+    let held = f.device.memory_counts().cpu_to_gpu.bytes - before;
+    assert_eq!(f.scheduler.tick(), tick, "one tick for every upload");
+    assert_eq!(f.staging.oversized().bytes, 0, "no oversized staging");
+    assert!(
+        held <= 2 * piece.next_power_of_two(),
+        "{held} host-visible bytes for {TEXTURES} uploads of {piece} staged bytes each"
+    );
+    assert_eq!(f.staging.part_bytes(), 2 * piece.next_power_of_two());
+    f.scheduler.finish().unwrap();
+    f.staging.reclaim_parts(&mut f.scheduler);
+    assert_eq!(
+        f.staging.part_bytes(),
+        0,
+        "the grown slices are freed once their tick completed"
+    );
+    for (k, id) in ids.into_iter().enumerate() {
+        let want = pattern(s.level_tiling(0).linear_size_bytes(), k as u32 * 5);
+        assert!(
+            f.read_subresource(id, 0, 0) == want,
+            "texture {k} holds its guest texels"
+        );
+    }
+    f.assert_no_validation_errors();
 }

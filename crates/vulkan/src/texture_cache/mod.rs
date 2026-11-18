@@ -3418,9 +3418,10 @@ impl TextureCache {
     /// decoded and copied before the next is staged, so each GPU untile or decode reads only its
     /// own chunk. A subresource that stages more than [`STAGING_REQUEST_MAX`] untiled on the GPU is
     /// untiled on the CPU instead, and one that stages more even then is cut into bands of slices
-    /// or block rows. So an upload of any size holds at most the two part slices of host-visible
-    /// memory: 16 MiB for subresources up to [`PART_SLICE`], `2 * STAGING_REQUEST_MAX` (128 MiB) at
-    /// worst, freed down to 16 MiB when it ends.
+    /// or block rows. So any number of uploads of any size hold at most the two part slices of
+    /// host-visible memory: 16 MiB for subresources up to [`PART_SLICE`],
+    /// `2 * STAGING_REQUEST_MAX` (128 MiB) at worst, back to 16 MiB once the tick that last used
+    /// them completed.
     fn upload(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
         self.flush_buffered(tx, id)?;
         let device = self.device.clone();
@@ -3731,9 +3732,6 @@ impl TextureCache {
                 };
             }
             first = end;
-        }
-        if !single {
-            tx.staging.end_parts(tx.scheduler);
         }
         Ok(())
     }

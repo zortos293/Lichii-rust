@@ -48,7 +48,8 @@ pub const STAGING_REQUEST_MAX: u64 = 64 << 20;
 
 /// Bytes each of a ring's two part slices keeps between operations
 /// ([`StagingRing::part`](crate::staging::StagingRing::part)): a slice grown for a larger
-/// piece, up to [`STAGING_REQUEST_MAX`], shrinks back once its operation ends.
+/// piece, up to [`STAGING_REQUEST_MAX`], is reused as it is and shrinks back once the tick that
+/// last used it completed.
 pub const PART_SLICE: u64 = 8 << 20;
 
 /// Buffers of their own for ring requests too large to share the ring, each freed once the

@@ -37,7 +37,8 @@ const STAGING_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
 ///
 /// Host-visible memory it holds: the ring's `capacity`, at most `oversized_cap` in flight, and
 /// the part slices: `2 * PART_SLICE` (16 MiB) once used, up to `2 * STAGING_REQUEST_MAX`
-/// (128 MiB) while an operation stages pieces that large.
+/// (128 MiB) from an operation that stages pieces that large until the tick that last used them
+/// completed.
 ///
 /// The ring asks the GPU which ticks completed once per scheduler tick, and again only when an
 /// allocation does not fit. A tick's newest region stays until the tick completes, so within one
@@ -69,11 +70,13 @@ pub struct StagingRing {
     uses_recorded: bool,
 }
 
-/// One of a ring's two part slices, and the part that last used it.
+/// One of a ring's two part slices, the part that last used it, and the tick it was last handed
+/// out in.
 #[derive(Default)]
 struct PartSlot {
     buffer: Option<Buffer>,
     part: u64,
+    tick: u64,
 }
 
 impl StagingRing {
@@ -138,9 +141,11 @@ impl StagingRing {
     /// the host fills one slice while the GPU reads the other, the tick never ends under the
     /// operation, and allocations it made earlier stay valid.
     ///
-    /// The caller records every use of the slice before it asks for the next part, and calls
-    /// [`StagingRing::end_parts`] once the operation staged everything. A slice grows to the
-    /// next power of two of the piece, from [`PART_SLICE`] up to [`STAGING_REQUEST_MAX`].
+    /// The caller records every use of the slice before it asks for the next part. A slice
+    /// grows to the next power of two of the piece, from [`PART_SLICE`] up to
+    /// [`STAGING_REQUEST_MAX`], and later operations reuse it as it is, so however many large
+    /// uploads a tick makes, the two slices hold `2 * STAGING_REQUEST_MAX` at most. A grown slice
+    /// shrinks back once the tick that last used it completed ([`StagingRing::reclaim_parts`]).
     pub fn part(&mut self, scheduler: &mut Scheduler, size: u64) -> Result<StagingSlice<'_>> {
         debug_assert!(
             size <= STAGING_REQUEST_MAX,
@@ -165,6 +170,7 @@ impl StagingRing {
                 self.oversized_name,
             )?);
         }
+        slot.tick = scheduler.tick();
         self.unsubmitted = Some(index);
         let buffer = slot.buffer.as_mut().expect("just ensured");
         Ok(StagingSlice {
@@ -174,12 +180,14 @@ impl StagingRing {
         })
     }
 
-    /// Ends an operation that staged through [`StagingRing::part`]: slices grown past
-    /// [`PART_SLICE`] are freed once the work recorded so far completes.
-    pub fn end_parts(&mut self, scheduler: &mut Scheduler) {
+    /// Frees the part slices grown past [`PART_SLICE`] whose last tick completed, so they hold
+    /// `2 * PART_SLICE` again. The rasterizer calls it once per tick.
+    pub fn reclaim_parts(&mut self, scheduler: &mut Scheduler) {
         for slot in &mut self.parts {
-            if let Some(buffer) = slot.buffer.take_if(|b| b.size() > PART_SLICE) {
-                scheduler.retire(buffer);
+            if slot.buffer.as_ref().is_some_and(|b| b.size() > PART_SLICE)
+                && scheduler.is_complete(slot.tick)
+            {
+                slot.buffer = None;
             }
         }
     }
@@ -289,6 +297,7 @@ impl StagingRing {
             self.head = 0;
         }
         self.oversized.reclaim(scheduler);
+        self.reclaim_parts(scheduler);
     }
 
     /// Whether the work being recorded at `tick` holds half the oversized cap or more
