@@ -97,7 +97,7 @@ fn a_lost_device_stops_gpu_work_and_flush_traps() {
         .unwrap();
     cache.mark_gpu_written(scheduler.tick(), DADDR + 0x8000, 0x100);
     let (_, read) = cache
-        .begin_cpu_read(&mut scheduler, DADDR + 0x8000, 0x1000)
+        .begin_cpu_read(&mut scheduler, DADDR + 0x8000, 0x1000, None)
         .unwrap();
     let CpuReadDone::Pending(ticket) = read else {
         panic!("the read was served synchronously");
@@ -149,7 +149,7 @@ fn a_lost_device_stops_gpu_work_and_flush_traps() {
         "a CPU read after the loss must end its trap instead of rearming it: {stats:?}"
     );
     assert_eq!(
-        rasterizer.begin_cpu_read(DADDR, 0x2000),
+        rasterizer.begin_cpu_read(DADDR, 0x2000, None),
         CpuReadDone::Home,
         "a read after the loss is never left pending"
     );

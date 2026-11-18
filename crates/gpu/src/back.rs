@@ -15,7 +15,7 @@ use crate::backend::{
     ReleaseSize, RenderCondition,
 };
 use crate::clock::GpuTimestamp;
-use crate::cpu_reads::CpuReads;
+use crate::cpu_reads::{CpuReads, QueuedRead};
 use crate::engines::kepler_compute::pcas::QmdScheduler;
 use crate::engines::maxwell_3d::{MACRO_REGISTERS_START, RENDER_ENABLE_MODE};
 use crate::engines::{Engine, EngineContext, EngineFactory, EngineKind};
@@ -100,7 +100,7 @@ pub(crate) struct Back {
     stopping: Arc<AtomicBool>,
     cpu_reads: Arc<CpuReads>,
     /// Scratch for [`CpuReads::serve`].
-    cpu_read_ranges: Vec<(DAddr, u64)>,
+    cpu_read_ranges: Vec<QueuedRead>,
     /// The data RAM of macros the back runs: the front sends only calls that never use it.
     data_ram: MacroDataRam,
     /// The writes of a macro's two condition runs ([`run_as_condition`]), kept for their

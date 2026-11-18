@@ -3,7 +3,8 @@
 //! back at its next record boundary, or as soon as it idles, from the work it already executed;
 //! a read never waits for queued submissions to be parsed or executed. A renderer may instead
 //! start the copy and hand the read back pending ([`CpuReadDone::Pending`]): the waiting thread
-//! then waits for the host GPU and writes the bytes itself, and the back carries on.
+//! then waits for the host GPU itself and asks again, and the back writes the copied bytes back
+//! in order with everything else it does to guest memory.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -13,8 +14,12 @@ use lichii_common::DAddr;
 use lichii_memory::FlushTrapHandler;
 use parking_lot::{Condvar, Mutex};
 
-use crate::backend::{CpuReadCompleter, CpuReadDone, Rasterizer};
+use crate::backend::{CpuReadCompleter, CpuReadDone, CpuReadTicket, Rasterizer};
 use crate::throttle::Throttle;
+
+/// A range a guest CPU thread waits for, with the ticket of the read the back left pending for
+/// it once the thread saw that read's copy finish.
+pub(crate) type QueuedRead = (DAddr, u64, Option<CpuReadTicket>);
 
 /// Device ranges guest CPU threads wait for the back to write back. Every queue holds at most
 /// one entry per waiting thread.
@@ -24,13 +29,13 @@ pub(crate) struct CpuReads {
     served: Condvar,
     /// Gets the thread that runs the back to look at the queue.
     wake: Box<dyn Fn() + Send + Sync>,
-    /// What finishes pending reads, taken from the renderer at its first one.
+    /// What waits for the copies of pending reads, taken from the renderer at its first one.
     completer: OnceLock<Option<Arc<dyn CpuReadCompleter>>>,
 }
 
 #[derive(Default)]
 struct State {
-    ranges: Vec<(DAddr, u64)>,
+    ranges: Vec<QueuedRead>,
     /// Served reads left pending, by request ticket, until their threads take them.
     results: Vec<(u64, CpuReadDone)>,
     requested: u64,
@@ -50,31 +55,37 @@ impl CpuReads {
     }
 
     /// Queues `[daddr, daddr + size)` and returns once its bytes are in guest memory, or the GPU
-    /// stopped. A read the back left pending is finished here, on the waiting thread.
+    /// stopped. For a read the back left pending, this thread waits for the host GPU copy and
+    /// queues the range again with its ticket, which the back serves without leaving it pending.
     fn request(&self, daddr: DAddr, size: u64) {
-        let ticket = {
-            let mut state = self.state.lock();
-            if state.closed {
+        let mut after = None;
+        loop {
+            let ticket = {
+                let mut state = self.state.lock();
+                if state.closed {
+                    return;
+                }
+                state.ranges.push((daddr, size, after));
+                state.requested += 1;
+                self.pending.store(true, Ordering::Relaxed);
+                state.requested
+            };
+            (self.wake)();
+            let done = {
+                let mut state = self.state.lock();
+                while state.served < ticket && !state.closed {
+                    self.served.wait(&mut state);
+                }
+                let index = state.results.iter().position(|&(t, _)| t == ticket);
+                index.map(|index| state.results.swap_remove(index).1)
+            };
+            let Some(CpuReadDone::Pending(read)) = done else {
                 return;
+            };
+            if let Some(Some(completer)) = self.completer.get() {
+                completer.complete(read);
             }
-            state.ranges.push((daddr, size));
-            state.requested += 1;
-            self.pending.store(true, Ordering::Relaxed);
-            state.requested
-        };
-        (self.wake)();
-        let done = {
-            let mut state = self.state.lock();
-            while state.served < ticket && !state.closed {
-                self.served.wait(&mut state);
-            }
-            let index = state.results.iter().position(|&(t, _)| t == ticket);
-            index.map(|index| state.results.swap_remove(index).1)
-        };
-        if let Some(CpuReadDone::Pending(read)) = done
-            && let Some(Some(completer)) = self.completer.get()
-        {
-            completer.complete(read);
+            after = Some(read);
         }
     }
 
@@ -86,7 +97,7 @@ impl CpuReads {
 
     /// Passes every waiting range to `rasterizer`, then releases its readers. `scratch` is an
     /// empty buffer the caller keeps, so serving allocates nothing once warm.
-    pub(crate) fn serve(&self, scratch: &mut Vec<(DAddr, u64)>, rasterizer: &mut dyn Rasterizer) {
+    pub(crate) fn serve(&self, scratch: &mut Vec<QueuedRead>, rasterizer: &mut dyn Rasterizer) {
         let requested = {
             let mut state = self.state.lock();
             self.pending.store(false, Ordering::Relaxed);
@@ -94,8 +105,8 @@ impl CpuReads {
             state.requested
         };
         let first = requested + 1 - scratch.len() as u64;
-        for (ticket, &(daddr, size)) in (first..).zip(scratch.iter()) {
-            let done = rasterizer.begin_cpu_read(daddr, size);
+        for (ticket, &(daddr, size, after)) in (first..).zip(scratch.iter()) {
+            let done = rasterizer.begin_cpu_read(daddr, size, after);
             if done != CpuReadDone::Home {
                 self.completer
                     .get_or_init(|| rasterizer.cpu_read_completer());
@@ -161,6 +172,7 @@ mod tests {
     #[derive(Debug, PartialEq, Eq)]
     enum Event {
         Begin(u64),
+        Again(u64),
         End,
         Complete(u32),
     }
@@ -180,7 +192,7 @@ mod tests {
         }
     }
 
-    /// Leaves reads of odd addresses pending, in a slot named by the address.
+    /// Leaves first reads of odd addresses pending, in a slot named by the address.
     struct Renderer(Arc<Log>);
 
     impl Rasterizer for Renderer {
@@ -196,7 +208,21 @@ mod tests {
         fn wait_for_idle(&mut self) {}
         fn present(&mut self, _framebuffer: &FramebufferConfig) {}
 
-        fn begin_cpu_read(&mut self, addr: u64, _size: u64) -> CpuReadDone {
+        fn begin_cpu_read(
+            &mut self,
+            addr: u64,
+            _size: u64,
+            after: Option<CpuReadTicket>,
+        ) -> CpuReadDone {
+            if let Some(ticket) = after {
+                assert_eq!(
+                    u64::from(ticket.slot),
+                    addr,
+                    "asked again with its own ticket"
+                );
+                self.0.events.lock().push(Event::Again(addr));
+                return CpuReadDone::Home;
+            }
             self.0.events.lock().push(Event::Begin(addr));
             if addr.is_multiple_of(2) {
                 return CpuReadDone::Home;
@@ -218,7 +244,8 @@ mod tests {
     }
 
     /// Reads served in one batch: the back begins each and submits them once, then releases
-    /// the waiting threads, and each thread whose read was left pending finishes it itself.
+    /// the waiting threads. Each thread whose read was left pending waits for its copy itself and
+    /// asks again with its ticket, and the back's second batch ends those reads.
     #[test]
     fn pending_reads_finish_on_their_waiting_threads() {
         let log = Arc::new(Log {
@@ -239,6 +266,10 @@ mod tests {
         let mut renderer = Renderer(log.clone());
         let mut scratch = Vec::new();
         reads.serve(&mut scratch, &mut renderer);
+        while reads.state.lock().ranges.len() < 2 {
+            std::thread::yield_now();
+        }
+        reads.serve(&mut scratch, &mut renderer);
         for thread in threads {
             thread.join().unwrap();
         }
@@ -251,12 +282,23 @@ mod tests {
             3
         );
         assert_eq!(events[3], Event::End, "one submission after every begin");
-        let mut completed: Vec<_> = events[4..].iter().collect();
+        let mut completed: Vec<_> = events[4..6].iter().collect();
         completed.sort_by_key(|e| match e {
             Event::Complete(slot) => *slot,
             _ => u32::MAX,
         });
         assert_eq!(completed, [&Event::Complete(1), &Event::Complete(3)]);
+        let mut again: Vec<_> = events[6..8].iter().collect();
+        again.sort_by_key(|e| match e {
+            Event::Again(addr) => *addr,
+            _ => u64::MAX,
+        });
+        assert_eq!(again, [&Event::Again(1), &Event::Again(3)]);
+        assert_eq!(
+            events[8..],
+            [Event::End],
+            "the second batch is submitted once too"
+        );
         assert!(
             reads.state.lock().results.is_empty(),
             "every result was taken"

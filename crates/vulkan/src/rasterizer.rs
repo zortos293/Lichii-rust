@@ -27,9 +27,9 @@ use lichii_common::DAddr;
 use lichii_common::settings::{AstcRecompression, GraphicsSettings, ResolutionScale};
 use lichii_gpu::backend::ChannelId;
 use lichii_gpu::backend::{
-    Blit, BlitOperation, ComputeContext, CpuReadCompleter, CpuReadDone, DrawParams, DrawTexture,
-    FenceAction, FramebufferConfig, GpuHandles, GpuPredicate, GraphicsContext, ImageCopy,
-    IndirectDraw, Query, QueryKind, Rasterizer, ReleaseSize, RenderCondition,
+    Blit, BlitOperation, ComputeContext, CpuReadCompleter, CpuReadDone, CpuReadTicket, DrawParams,
+    DrawTexture, FenceAction, FramebufferConfig, GpuHandles, GpuPredicate, GraphicsContext,
+    ImageCopy, IndirectDraw, Query, QueryKind, Rasterizer, ReleaseSize, RenderCondition,
 };
 use lichii_gpu::engines::maxwell_3d::Regs;
 use lichii_gpu::engines::maxwell_3d::regs::NUM_RENDER_TARGETS;
@@ -1606,25 +1606,28 @@ impl Rasterizer for VulkanRasterizer {
         self.texture_cache.rearm(addr, addr.saturating_add(size));
     }
 
-    fn begin_cpu_read(&mut self, addr: DAddr, size: u64) -> CpuReadDone {
+    fn begin_cpu_read(
+        &mut self,
+        addr: DAddr,
+        size: u64,
+        after: Option<CpuReadTicket>,
+    ) -> CpuReadDone {
         if crate::debug::device_is_lost() {
             self.handles.device.disarm_flush_traps(addr, size);
             return CpuReadDone::Home;
         }
-        let texture_cache = &mut self.texture_cache;
-        self.buffer_cache
-            .reclaim_cpu_reads(|start, end| texture_cache.rearm(start, end));
         let end = addr.saturating_add(size);
-        let (area, done) = match self
-            .buffer_cache
-            .begin_cpu_read(&mut self.scheduler, addr, size)
-        {
-            Ok(begun) => begun,
-            Err(error) => {
-                tracing::error!(%error, "flushing GPU-written buffers for a CPU read failed");
-                ((addr, end), CpuReadDone::Home)
-            }
-        };
+        let (area, done) =
+            match self
+                .buffer_cache
+                .begin_cpu_read(&mut self.scheduler, addr, size, after)
+            {
+                Ok(begun) => begun,
+                Err(error) => {
+                    tracing::error!(%error, "flushing GPU-written buffers for a CPU read failed");
+                    ((addr, end), CpuReadDone::Home)
+                }
+            };
         let mut tx = Transfer {
             scheduler: &mut self.scheduler,
             staging: &mut self.staging,
