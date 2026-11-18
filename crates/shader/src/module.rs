@@ -123,6 +123,14 @@ pub enum DescriptorKind {
     CombinedImageSampler,
     /// `VK_DESCRIPTOR_TYPE_STORAGE_IMAGE`.
     StorageImage,
+    /// The module's reach feedback words (`VK_DESCRIPTOR_TYPE_STORAGE_BUFFER`), one u32 per
+    /// storage buffer binding, last in the layout: each access of a
+    /// [`StorageBufferDescriptor::reach_feedback`] buffer past the end of its binding raises
+    /// the buffer's word to the end of the access. The renderer binds host-visible words it reads
+    /// back to size those bindings.
+    ///
+    /// [`StorageBufferDescriptor::reach_feedback`]: crate::info::StorageBufferDescriptor::reach_feedback
+    ReachFeedback,
 }
 
 /// Bytes of the rescaling push constants: four words of texture scaling bits at offset 0, two
@@ -136,7 +144,8 @@ impl ResourceLayout {
     /// The layout of a module translated with `info`, in descriptor set 0 from `first_binding`
     /// (stages of one pipeline share set 0, each starting after the previous stage's bindings).
     /// Binding order is uniform buffers, storage buffers, texel buffers, image texel buffers,
-    /// textures, images; a buffer descriptor of count n takes n binding numbers.
+    /// textures, images, then the reach feedback buffer; a buffer descriptor of count n takes n
+    /// binding numbers.
     pub fn for_module(info: &ShaderInfo, first_binding: u32) -> ResourceLayout {
         let mut binding = first_binding;
         let mut bindings = Vec::new();
@@ -166,6 +175,9 @@ impl ResourceLayout {
         }
         for (i, d) in info.image_descriptors.iter().enumerate() {
             push(DescriptorKind::StorageImage, d.count, i, 1);
+        }
+        if info.uses_reach_feedback() {
+            push(DescriptorKind::ReachFeedback, 1, 0, 1);
         }
         let push_constant_size = if info.uses_render_area {
             RENDER_AREA_PUSH_CONSTANT_SIZE
@@ -280,6 +292,7 @@ mod tests {
                 indirect_offset: StorageBufferDescriptor::DIRECT,
                 write_extent: Default::default(),
                 read_extent: Default::default(),
+                reach_feedback: false,
             }],
             texture_descriptors: vec![TextureDescriptor {
                 ty: crate::ir::TextureType::Color2D,

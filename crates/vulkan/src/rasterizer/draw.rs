@@ -45,7 +45,10 @@ use lichii_texture::{Numeric, PixelFormat};
 use super::Release;
 use super::VulkanRasterizer;
 use super::samples::SampleCounter;
-use crate::buffer_cache::{BufferBinding, IndexBinding, assembled_topology, vertex_stream_range};
+use crate::buffer_cache::{
+    BufferBinding, IndexBinding, MIN_UNBOUNDED_REACH, UNBOUNDED_STORAGE_REACH, assembled_topology,
+    vertex_stream_range,
+};
 use crate::commands::ImageAccess;
 use crate::debug::{Program, Programs};
 use crate::descriptors::{DescriptorAllocator, DescriptorInfo};
@@ -318,6 +321,7 @@ pub(super) struct DrawState {
     depth_bias_control: ash::ext::depth_bias_control::Device,
     push_descriptor: ash::khr::push_descriptor::Device,
     null_buffer: Buffer,
+    reach_feedback: reach_feedback::ReachFeedback,
     null_images: null::NullImages,
     arch: ShaderArch,
     channel: Option<ChannelId>,
@@ -464,6 +468,7 @@ impl DrawState {
                 &device.raw,
             ),
             null_buffer,
+            reach_feedback: reach_feedback::ReachFeedback::new(device),
             null_images: null::NullImages::default(),
             arch: if gob_layout == GobLayout::Switch2 {
                 ShaderArch::Ampere
@@ -1640,13 +1645,24 @@ impl VulkanRasterizer {
     /// Appends `module`'s descriptors to the current draw's writes. `false` skips the draw.
     fn bind_resources(&mut self, module: &ShaderModule, src: &StageSources<'_>) -> Result<bool> {
         let info = &module.info;
+        let feedback = match info.uses_reach_feedback() {
+            true => {
+                let slots = info
+                    .storage_buffers_descriptors
+                    .iter()
+                    .map(|d| d.count)
+                    .sum();
+                Some(self.draw.reach_feedback.words(module.hash, slots)?)
+            }
+            false => None,
+        };
         for set in &module.resources.sets {
             for b in &set.bindings {
                 let descriptor = b.descriptor as usize;
                 let first = match b.kind {
-                    DescriptorKind::UniformBuffer | DescriptorKind::StorageBuffer => {
-                        self.draw.buffer_infos.len()
-                    }
+                    DescriptorKind::UniformBuffer
+                    | DescriptorKind::StorageBuffer
+                    | DescriptorKind::ReachFeedback => self.draw.buffer_infos.len(),
                     DescriptorKind::UniformTexelBuffer | DescriptorKind::StorageTexelBuffer => {
                         self.draw.texel_views.len()
                     }
@@ -1684,9 +1700,20 @@ impl VulkanRasterizer {
                     }
                     DescriptorKind::StorageBuffer => {
                         let desc = info.storage_buffers_descriptors[descriptor];
+                        let first_slot: u32 = info.storage_buffers_descriptors[..descriptor]
+                            .iter()
+                            .map(|d| d.count)
+                            .sum();
                         for i in 0..b.count {
                             let limit = storage_range_limit(self);
                             let (address, size) = storage_pointer(src, &desc, i, limit);
+                            let reach = match feedback {
+                                Some(words) if desc.reach_feedback => {
+                                    let feedback = &self.draw.reach_feedback;
+                                    feedback_reach(feedback.observed(words, first_slot + i))
+                                }
+                                _ => UNBOUNDED_STORAGE_REACH,
+                            };
                             let binding = match size {
                                 Some(size) => self.buffer_cache.storage_buffer(
                                     &mut self.scheduler,
@@ -1701,12 +1728,17 @@ impl VulkanRasterizer {
                                     &mut self.staging,
                                     src.gmmu,
                                     address,
-                                    limit,
+                                    reach.min(limit),
                                     desc.is_written,
                                 )?,
                             };
                             self.push_buffer(binding, desc.is_written);
                         }
+                    }
+                    DescriptorKind::ReachFeedback => {
+                        let words = feedback.expect("a module with a feedback binding reports");
+                        let binding = self.draw.reach_feedback.binding(words);
+                        self.push_buffer(Some(binding), false);
                     }
                     DescriptorKind::CombinedImageSampler => {
                         let desc = info.texture_descriptors[descriptor];
@@ -2402,7 +2434,9 @@ impl VulkanRasterizer {
             last = Some(write.binding);
             let infos = &mut draw.descriptor_infos;
             match write.kind {
-                DescriptorKind::UniformBuffer | DescriptorKind::StorageBuffer => infos.extend(
+                DescriptorKind::UniformBuffer
+                | DescriptorKind::StorageBuffer
+                | DescriptorKind::ReachFeedback => infos.extend(
                     draw.buffer_infos[range]
                         .iter()
                         .map(|&buffer| DescriptorInfo { buffer }),
@@ -3240,7 +3274,8 @@ fn numeric_mismatch(
 /// no size, so it reaches what the program provably accesses (over the dispatch's ids, for a
 /// direct compute dispatch), or `None` when that is unknown:
 /// then [`BufferCache::unbounded_storage_buffer`](crate::buffer_cache::BufferCache::unbounded_storage_buffer)
-/// binds as far as it can in place. A provable reach ends on a whole word, since the host may
+/// binds in place as far as the program reported reaching ([`feedback_reach`]), or as far as it
+/// can for a program that cannot report it. A provable reach ends on a whole word, since the host may
 /// lower byte and halfword accesses to word loads and compare-and-swap loops. No size passes
 /// `limit`, the largest range the host binds after alignment.
 fn storage_pointer(
@@ -3281,6 +3316,14 @@ fn storage_pointer(
     (address, size)
 }
 
+/// The reach to bind behind a pointer whose program reports how far past its binding it reached:
+/// [`MIN_UNBOUNDED_REACH`], or the furthest `observed` byte rounded up to a multiple of it.
+fn feedback_reach(observed: u64) -> u64 {
+    observed
+        .next_multiple_of(MIN_UNBOUNDED_REACH)
+        .max(MIN_UNBOUNDED_REACH)
+}
+
 /// The largest storage buffer range a binding may ask for: the host's limit, less the bytes
 /// [`BufferCache::storage_buffer`](crate::buffer_cache::BufferCache::storage_buffer) adds when it
 /// aligns the start down.
@@ -3296,6 +3339,7 @@ mod dynamic;
 mod frame_decode;
 mod mesh_indirect;
 mod null;
+mod reach_feedback;
 mod texture;
 
 #[cfg(test)]

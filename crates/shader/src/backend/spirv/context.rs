@@ -281,6 +281,11 @@ pub(crate) struct EmitContext<'a> {
 
     cbufs: [[Word; 8]; ShaderInfo::MAX_CBUFS],
     ssbos: Vec<[Word; 9]>,
+    /// Per storage buffer slot, whether its accesses report their reach.
+    ssbo_feedback: Vec<bool>,
+    /// `void(slot, end, length)`: raises reach feedback word `slot` to `end` when `end` passes
+    /// `length`, the binding's bytes. 0 when no storage buffer reports its reach.
+    pub reach_feedback_func: Word,
     pub texture_buffers: Vec<TextureBufferDefinition>,
     pub image_buffers: Vec<ImageBufferDefinition>,
     pub textures: Vec<TextureDefinition>,
@@ -580,6 +585,8 @@ impl<'a> EmitContext<'a> {
             image_u32: 0,
             cbufs: [[0; 8]; ShaderInfo::MAX_CBUFS],
             ssbos: Vec::new(),
+            ssbo_feedback: Vec::new(),
+            reach_feedback_func: 0,
             texture_buffers: Vec::new(),
             image_buffers: Vec::new(),
             textures: Vec::new(),
@@ -712,6 +719,7 @@ impl<'a> EmitContext<'a> {
         let mut image_scaling = 0;
         ctx.define_images(image_binding, &mut image_scaling)?;
         bindings.image_scaling_index += image_scaling;
+        ctx.define_reach_feedback(binding_slot(bindings, unified, BindingKind::Storage))?;
         ctx.define_attribute_mem_access()?;
         ctx.define_write_storage_cas_loop_function()?;
         ctx.define_global_memory_functions()?;
@@ -1047,6 +1055,11 @@ impl<'a> EmitContext<'a> {
     /// The storage buffer view of `element` type for storage buffer descriptor slot `index`.
     pub fn ssbo(&self, index: usize, element: StorageElement) -> Word {
         self.ssbos[index][element as usize]
+    }
+
+    /// Whether the accesses of storage buffer slot `index` report their reach.
+    pub fn ssbo_reports_reach(&self, index: usize) -> bool {
+        self.ssbo_feedback[index]
     }
 
     pub fn storage_type(&self, element: StorageElement) -> StorageTypeDefinition {
@@ -2248,6 +2261,11 @@ impl<'a> EmitContext<'a> {
             .map(|d| d.count)
             .sum();
         self.ssbos = vec![[0; 9]; slots as usize];
+        self.ssbo_feedback = info
+            .storage_buffers_descriptors
+            .iter()
+            .flat_map(|d| std::iter::repeat_n(d.reach_feedback, d.count as usize))
+            .collect();
         self.add_extension("SPV_KHR_storage_buffer_storage_class");
         let mut used = if profile.support_descriptor_aliasing {
             info.used_storage_buffer_types
@@ -2793,6 +2811,58 @@ impl<'a> EmitContext<'a> {
         self.b.unreachable()?;
         self.b.end_function()?;
         Ok(func)
+    }
+
+    /// The reach feedback buffer, after every other binding, and the function raising its words.
+    fn define_reach_feedback(&mut self, binding: &mut u32) -> EmitResult<()> {
+        if !self.info.uses_reach_feedback() {
+            return Ok(());
+        }
+        let u32_t = self.u32[1];
+        let StorageTypeDefinition {
+            array: block_pointer,
+            element: word_pointer,
+        } = self.storage_type(StorageElement::U32);
+        let words = self.global_variable(block_pointer, StorageClass::StorageBuffer, None);
+        self.decorate(words, Decoration::Binding, &[*binding]);
+        self.decorate(words, Decoration::DescriptorSet, &[0]);
+        self.b.name(words, "reach_feedback");
+        self.add_interface(words, StorageClass::StorageBuffer);
+        *binding += 1;
+
+        let func_type = self.b.type_function(self.void_id, [u32_t, u32_t, u32_t]);
+        let func = self
+            .b
+            .begin_function(self.void_id, None, FunctionControl::NONE, func_type)?;
+        let slot = self.b.function_parameter(u32_t)?;
+        let end = self.b.function_parameter(u32_t)?;
+        let length = self.b.function_parameter(u32_t)?;
+        self.b.begin_block(None)?;
+        let past = self.b.u_less_than(self.u1, None, length, end)?;
+        let limit = self.const_u32(1 << 31);
+        let forward = self.b.u_less_than(self.u1, None, end, limit)?;
+        let report = self.b.logical_and(self.u1, None, past, forward)?;
+        let then_label = self.b.id();
+        let merge_label = self.b.id();
+        self.b
+            .selection_merge(merge_label, SelectionControl::NONE)?;
+        self.b
+            .branch_conditional(report, then_label, merge_label, [])?;
+        self.begin_label(then_label)?;
+        let zero = self.u32_zero_value;
+        let word = self
+            .b
+            .access_chain(word_pointer, None, words, [zero, slot])?;
+        let scope_device = self.const_u32(Scope::Device as u32);
+        let relaxed = self.u32_zero_value;
+        self.b
+            .atomic_u_max(u32_t, None, word, scope_device, relaxed, end)?;
+        self.b.branch(merge_label)?;
+        self.begin_label(merge_label)?;
+        self.b.ret()?;
+        self.b.end_function()?;
+        self.reach_feedback_func = func;
+        Ok(())
     }
 
     fn define_write_storage_cas_loop_function(&mut self) -> EmitResult<()> {

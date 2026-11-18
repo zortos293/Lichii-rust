@@ -3711,6 +3711,18 @@ fn launch(
     grid: [u32; 3],
     indirect: Option<(u64, QmdVersion)>,
 ) {
+    launch_qmd(f, gmmu, program, cbuf, grid, indirect, QmdVersion::V2);
+}
+
+fn launch_qmd(
+    f: &mut Fixture,
+    gmmu: &Arc<Gmmu>,
+    program: u64,
+    cbuf: u64,
+    grid: [u32; 3],
+    indirect: Option<(u64, QmdVersion)>,
+    qmd_version: QmdVersion,
+) {
     let mut const_buffers = [ConstBufferBinding::default(); 8];
     const_buffers[0] = ConstBufferBinding {
         address: GPU_VA + cbuf,
@@ -3732,7 +3744,7 @@ fn launch(
         samplers: 0,
         sampler_limit: 0,
         linked_samplers: false,
-        qmd_version: QmdVersion::V2,
+        qmd_version,
         qmd: &qmd,
         indirect_grid: indirect
             .filter(|&(_, layout)| layout == QmdVersion::V2)
@@ -5515,6 +5527,7 @@ fn storage_pointer_reach_follows_the_program_accesses() {
             indirect_offset,
             write_extent: written.unwrap_or_default(),
             read_extent,
+            reach_feedback: false,
         }
     };
     let direct = StorageBufferDescriptor::DIRECT;
@@ -5750,4 +5763,211 @@ fn switch2_draws_bind_just_the_storage_bytes_they_read() {
         &texels[..4]
     );
     f.assert_no_validation_errors();
+}
+
+/// The vertex program and draw registers of a Switch 2 full-screen triangle whose fragment
+/// program, at `PROGRAMS + 0x1000`, runs `fragment` and outputs R0..R3.
+fn switch2_fragment_draw(f: &Fixture, fragment: &[u128]) -> Box<Regs> {
+    let attribute = |op, address: u128, count: u128, registers: u128| {
+        ampere(
+            op,
+            Form::Fixed,
+            address << 40 | (count - 1) << 74 | registers,
+        )
+    };
+    let mut vertex = header(1, ShaderType::VERTEX_B);
+    vertex[6] = 0xf;
+    vertex[13] |= 0xf0 << 8;
+    let vertex = ampere_program(
+        vertex,
+        &[
+            attribute(AmpereOpcode::Ald, 0x80, 4, RZ_A | 0xff << 32),
+            attribute(AmpereOpcode::Ast, 0x70, 4, RZ_A | 0xff << 64),
+            ampere_exit(),
+        ],
+    );
+    let mut header = header(2, ShaderType::PIXEL);
+    header[18] = 0xf;
+    let fragment_offset = 0x1000;
+    write(f, PROGRAMS, &vertex);
+    write(
+        f,
+        PROGRAMS + fragment_offset,
+        &ampere_program(header, fragment),
+    );
+    write(
+        f,
+        VERTICES,
+        &f32_bytes(&[
+            -1.0, -1.0, 0.0, 1.0, 3.0, -1.0, 0.0, 1.0, -1.0, 3.0, 0.0, 1.0,
+        ]),
+    );
+    let mut regs = draw_regs();
+    bind_program(&mut regs, 1, ShaderType::VERTEX_B, PROGRAMS);
+    bind_program(&mut regs, 5, ShaderType::PIXEL, PROGRAMS + fragment_offset);
+    regs.vertex_attrib_format[0] = VertexAttribute(0x1 << 21 | 0x7 << 27);
+    regs.vertex_streams[0].bits = VertexStreamBits(16 | 1 << 12);
+    regs.words_mut()[0x600 / 4 + 1] = 3 * 16;
+    regs
+}
+
+/// Loads the word at the 64-bit pointer c[0][0x110] plus the offset c[0][0x118] into R`dest`: a
+/// reach no analysis bounds, so a Switch 2 program reports it.
+fn load_at_cbuf_offset(dest: u128) -> [u128; 5] {
+    const RZ: u128 = 0xff;
+    let no_carry_ins = 7 << 87 | 1 << 90 | 7 << 77 | 1 << 80;
+    [
+        ampere(
+            AmpereOpcode::Ldc,
+            Form::Bound,
+            4 << 16 | RZ_A | 0x110 << 38 | 5 << 73,
+        ),
+        ampere(
+            AmpereOpcode::Ldc,
+            Form::Bound,
+            6 << 16 | RZ_A | 0x118 << 38 | 4 << 73,
+        ),
+        ampere(
+            AmpereOpcode::Iadd3,
+            Form::RegReg,
+            4 << 16 | 4 << 24 | 6 << 32 | RZ << 64 | 7 << 84 | no_carry_ins,
+        ),
+        ampere(
+            AmpereOpcode::Iadd3,
+            Form::RegReg,
+            5 << 16
+                | 5 << 24
+                | RZ << 32
+                | RZ << 64
+                | 1 << 74
+                | 7 << 81
+                | 7 << 84
+                | 7 << 77
+                | 1 << 80,
+        ),
+        ampere(
+            AmpereOpcode::Ldg,
+            Form::Fixed,
+            dest << 16 | 4 << 24 | 1 << 72 | 4 << 73,
+        ),
+    ]
+}
+
+/// A Switch 2 fragment program reads its bare pointer at an offset it loads from a constant
+/// buffer, 128 KiB in. Its binding starts at the 64 KiB floor, and the program reads 0 past it
+/// without faulting, also on a second draw recorded before the GPU ran the first, which sees no
+/// feedback yet. Once the GPU reported the reach, the next draw binds and reads the word.
+#[test]
+fn switch2_unknown_reach_grows_from_gpu_feedback() {
+    let Some(mut f) = fixture(GobLayout::Switch2) else {
+        return;
+    };
+    if !f.rasterizer.device.shader_profile.support_reach_feedback {
+        eprintln!("skipping: the device has no per-pipeline storage robustness");
+        return;
+    }
+    f.rasterizer.draw.pipelines.set_async_compilation(false);
+    let gmmu = gmmu(&f);
+    let mut fragment = load_at_cbuf_offset(0).to_vec();
+    fragment.extend([
+        ampere_mov(1, 0),
+        ampere_mov(2, 0),
+        ampere_mov(3, 1.0f32.to_bits()),
+        ampere_exit(),
+    ]);
+    let regs = switch2_fragment_draw(&f, &fragment);
+    let offset = 0x2_0000u32;
+    write(
+        &f,
+        SSBO + u64::from(offset),
+        &0.5f32.to_bits().to_le_bytes(),
+    );
+    let mut words = (GPU_VA + SSBO).to_le_bytes().to_vec();
+    words.extend_from_slice(&offset.to_le_bytes());
+    write(&f, FRAGMENT_CBUF + 0x110, &words);
+
+    draw(&mut f, &gmmu, &regs);
+    draw(&mut f, &gmmu, &regs);
+    let texels = switch2_target(&mut f);
+    assert!(
+        texels.iter().all(|&t| unorm8_eq(t, [0, 0, 0, 255])),
+        "past the binding reads 0: {:?}",
+        &texels[..4]
+    );
+    let grown = f
+        .rasterizer
+        .buffer_cache
+        .stats()
+        .unbounded_reach_grown_bytes;
+    draw(&mut f, &gmmu, &regs);
+    let texels = switch2_target(&mut f);
+    assert!(
+        texels.iter().all(|&t| unorm8_eq(t, [128, 0, 0, 255])),
+        "the grown binding reads the word: {:?}",
+        &texels[..4]
+    );
+    assert!(
+        f.rasterizer
+            .buffer_cache
+            .stats()
+            .unbounded_reach_grown_bytes
+            - grown
+            <= 4 << 20,
+        "one tick grows the binding by the budget at most"
+    );
+    assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
+    f.assert_no_validation_errors();
+}
+
+/// A Switch 2 compute program copying the word at c[0][0x110] plus c[0][0x118] to the pointer
+/// c[0][0x120], dispatched with descriptors pushed or written to sets: the first dispatch binds
+/// the 64 KiB floor and copies 0, the next one the reach the first reported.
+#[test]
+fn switch2_dispatches_grow_unknown_reach_from_gpu_feedback() {
+    for push in [true, false] {
+        let Some(mut f) = fixture_with(GobLayout::Switch2, push) else {
+            return;
+        };
+        if !f.rasterizer.device.shader_profile.support_reach_feedback {
+            eprintln!("skipping: the device has no per-pipeline storage robustness");
+            return;
+        }
+        f.rasterizer.draw.pipelines.set_async_compilation(false);
+        let gmmu = gmmu(&f);
+        const COPY: u64 = 0x10_c000;
+        let mut code = load_at_cbuf_offset(0).to_vec();
+        code.extend([
+            ampere(
+                AmpereOpcode::Ldc,
+                Form::Bound,
+                8 << 16 | RZ_A | 0x120 << 38 | 5 << 73,
+            ),
+            ampere(AmpereOpcode::Stg, Form::Fixed, 8 << 24 | 1 << 72 | 4 << 73),
+            ampere_exit(),
+        ]);
+        let bytes: Vec<u8> = code.iter().flat_map(|insn| insn.to_le_bytes()).collect();
+        write(&f, COPY, &bytes);
+        let offset = 0x3_0000u32;
+        write(&f, SSBO + u64::from(offset), &77u32.to_le_bytes());
+        write(&f, slot(0), &[0xff; 4]);
+        let mut words = (GPU_VA + SSBO).to_le_bytes().to_vec();
+        words.extend_from_slice(&offset.to_le_bytes());
+        words.extend_from_slice(&[0; 4]);
+        words.extend_from_slice(&(GPU_VA + slot(0)).to_le_bytes());
+        write(&f, COPY_CBUFS + 0x110, &words);
+
+        let dispatch = |f: &mut Fixture| {
+            launch_qmd(f, &gmmu, COPY, COPY_CBUFS, [1; 3], None, QmdVersion::V3);
+        };
+        dispatch(&mut f);
+        assert_eq!(
+            slot_word(&mut f, 0),
+            0,
+            "push {push}: past the binding reads 0"
+        );
+        dispatch(&mut f);
+        assert_eq!(slot_word(&mut f, 0), 77, "push {push}: the grown binding");
+        assert_eq!(f.rasterizer.draw.shaders.stats().failed, 0);
+        f.assert_no_validation_errors();
+    }
 }

@@ -713,6 +713,7 @@ fn global_memory_routing_and_storage_cas_loops() {
         indirect_offset,
         write_extent: Default::default(),
         read_extent: Default::default(),
+        reach_feedback: false,
     };
     let info = ShaderInfo {
         uses_global_memory: true,
@@ -769,6 +770,12 @@ fn global_memory_routing_and_storage_cas_loops() {
 
 #[test]
 fn binding_decorations_match_the_resource_layout() {
+    for reach_feedback in [false, true] {
+        binding_decorations_match_the_layout(reach_feedback);
+    }
+}
+
+fn binding_decorations_match_the_layout(reach_feedback: bool) {
     let mut s = Synthetic::new();
     let b = s.block();
     s.inst(b, Opcode::GetCbufU32, &[Value::U32(0), Value::U32(4)]);
@@ -781,6 +788,7 @@ fn binding_decorations_match_the_resource_layout() {
         indirect_offset: StorageBufferDescriptor::DIRECT,
         write_extent: Default::default(),
         read_extent: Default::default(),
+        reach_feedback: false,
     };
     let info = ShaderInfo {
         used_constant_buffer_types: Type::U32 | Type::F32,
@@ -789,7 +797,13 @@ fn binding_decorations_match_the_resource_layout() {
             ConstantBufferDescriptor { index: 0, count: 1 },
             ConstantBufferDescriptor { index: 3, count: 2 },
         ],
-        storage_buffers_descriptors: vec![storage(0x110), storage(0x120)],
+        storage_buffers_descriptors: vec![
+            storage(0x110),
+            StorageBufferDescriptor {
+                reach_feedback,
+                ..storage(0x120)
+            },
+        ],
         ..ShaderInfo::default()
     };
     let program = s.finish(
@@ -840,9 +854,16 @@ fn binding_decorations_match_the_resource_layout() {
     let expected: Vec<(u32, DescriptorKind)> = layout.sets[0]
         .bindings
         .iter()
-        .map(|b| (b.binding, b.kind))
+        .map(|b| match b.kind {
+            DescriptorKind::ReachFeedback => (b.binding, DescriptorKind::StorageBuffer),
+            kind => (b.binding, kind),
+        })
         .collect();
     assert_eq!(emitted, expected);
+    assert_eq!(
+        layout.sets[0].bindings.last().map(|b| b.kind) == Some(DescriptorKind::ReachFeedback),
+        reach_feedback
+    );
     assert_eq!(bindings.unified, layout.next_binding(first_binding));
 }
 

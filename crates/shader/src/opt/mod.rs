@@ -29,8 +29,8 @@ pub use constant_propagation::constant_propagation;
 pub use dual_vertex::{vertex_a_transform, vertex_b_transform};
 pub use geometry_compaction::geometry_compaction;
 pub use global_memory_to_storage_buffer::{
-    global_memory_to_storage_buffer, join_storage_info, remap_storage_bindings,
-    storage_buffer_limit,
+    global_memory_to_storage_buffer, join_storage_info, mark_reach_feedback,
+    remap_storage_bindings, storage_buffer_limit,
 };
 pub use layer::layer;
 pub use lower_fp16_to_fp32::lower_fp16_to_fp32;

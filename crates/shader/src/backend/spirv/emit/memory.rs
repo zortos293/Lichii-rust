@@ -46,10 +46,44 @@ pub(super) fn storage_base(
     element: StorageElement,
     element_size: u32,
 ) -> EmitResult<(Word, Word)> {
-    let ssbo = ctx.ssbo(storage_binding(ctx, inst)?, element);
+    let binding = storage_binding(ctx, inst)?;
+    let ssbo = ctx.ssbo(binding, element);
     let offset = ctx.arg(inst, 1);
+    report_reach(ctx, binding, offset, element_size)?;
     let index = storage_index(ctx, offset, element_size, 0)?;
     Ok((ssbo, index))
+}
+
+/// Reports the end of an access of `bytes` bytes at byte offset `offset` of storage buffer slot
+/// `binding` when the slot reports its reach. The access itself relies on the pipeline's
+/// robustness past the end of the binding.
+fn report_reach(
+    ctx: &mut EmitContext<'_>,
+    binding: usize,
+    offset: Value,
+    bytes: u32,
+) -> EmitResult<()> {
+    if !ctx.ssbo_reports_reach(binding) {
+        return Ok(());
+    }
+    let u32_t = ctx.u32[1];
+    let end = match offset.imm_u32() {
+        Some(offset) => ctx.const_u32(offset.wrapping_add(bytes)),
+        None => {
+            let offset = ctx.def(offset)?;
+            let bytes = ctx.const_u32(bytes);
+            ctx.b.i_add(u32_t, None, offset, bytes)?
+        }
+    };
+    let words = ctx.ssbo(binding, StorageElement::U32);
+    let words = ctx.b.array_length(u32_t, None, words, 0)?;
+    let two = ctx.const_u32(2);
+    let length = ctx.b.shift_left_logical(u32_t, None, words, two)?;
+    let slot = ctx.const_u32(binding as u32);
+    let void = ctx.void_id;
+    let func = ctx.reach_feedback_func;
+    ctx.b.function_call(void, None, func, [slot, end, length])?;
+    Ok(())
 }
 
 /// Pointer to the element of the `element` view that a storage instruction addresses with its
@@ -61,8 +95,10 @@ pub(super) fn storage_pointer(
     element_size: u32,
     index_offset: u32,
 ) -> EmitResult<Word> {
-    let ssbo = ctx.ssbo(storage_binding(ctx, inst)?, element);
+    let binding = storage_binding(ctx, inst)?;
+    let ssbo = ctx.ssbo(binding, element);
     let offset = ctx.arg(inst, 1);
+    report_reach(ctx, binding, offset, element_size * (index_offset + 1))?;
     let index = storage_index(ctx, offset, element_size, index_offset)?;
     let pointer_type = ctx.storage_type(element).element;
     let zero = ctx.u32_zero_value;

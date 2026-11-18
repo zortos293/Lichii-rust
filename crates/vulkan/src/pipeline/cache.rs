@@ -510,9 +510,12 @@ impl Context {
             }
             let guest_warp = self.device.shader_profile.runs_guest_warp(program.stage)
                 && program.info.uses_warp_size();
-            modules
-                .stages
-                .push((stage_flags(program.stage), module, guest_warp));
+            modules.stages.push(Stage {
+                flags: stage_flags(program.stage),
+                module,
+                guest_warp,
+                robust_storage: program.info.uses_reach_feedback(),
+            });
         }
         Ok(modules)
     }
@@ -557,8 +560,8 @@ impl Context {
             }
         }
         let modules = self.modules(programs.iter().flatten().map(|p| &**p))?;
-        let mut warp = vec![guest_warp_size(); modules.stages.len()];
-        let stages = modules.stage_infos(&mut warp);
+        let mut extras: Vec<_> = modules.stages.iter().map(|_| StageExtras::new()).collect();
+        let stages = modules.stage_infos(&mut extras);
 
         let limits = &self.device.properties.limits;
         let mut attributes = Vec::new();
@@ -816,8 +819,8 @@ impl Context {
             ));
         }
         let modules = self.modules([program])?;
-        let mut warp = [guest_warp_size()];
-        let stage = modules.stage_infos(&mut warp).remove(0);
+        let mut extras = [StageExtras::new()];
+        let stage = modules.stage_infos(&mut extras).remove(0);
         let mut feedback = vk::PipelineCreationFeedback::default();
         let mut stage_feedback = [vk::PipelineCreationFeedback::default()];
         let mut feedback_info = vk::PipelineCreationFeedbackCreateInfo::default()
@@ -849,44 +852,67 @@ fn cache_hit(feedback: &vk::PipelineCreationFeedback) -> bool {
 /// Shader modules of one build, destroyed once the pipeline is created.
 struct Modules<'a> {
     device: &'a Device,
-    /// Each stage, its module, and whether it must run at the guest's 32-lane warp.
-    stages: Vec<(vk::ShaderStageFlags, vk::ShaderModule, bool)>,
+    stages: Vec<Stage>,
+}
+
+struct Stage {
+    flags: vk::ShaderStageFlags,
+    module: vk::ShaderModule,
+    /// The stage must run at the guest's 32-lane warp.
+    guest_warp: bool,
+    /// The stage binds storage buffers smaller than it may reach, so accesses past the end of a
+    /// binding must read 0 and drop writes.
+    robust_storage: bool,
+}
+
+/// Per-stage extension structs that [`Modules::stage_infos`] chains into its create infos.
+struct StageExtras {
+    warp: vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo<'static>,
+    robustness: vk::PipelineRobustnessCreateInfoEXT<'static>,
+}
+
+impl StageExtras {
+    fn new() -> Self {
+        Self {
+            warp: vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
+                .required_subgroup_size(32),
+            robustness: vk::PipelineRobustnessCreateInfoEXT::default()
+                .storage_buffers(vk::PipelineRobustnessBufferBehaviorEXT::ROBUST_BUFFER_ACCESS_2),
+        }
+    }
 }
 
 impl Modules<'_> {
-    /// Stage create infos for the modules; `warp` holds one subgroup size request per stage.
+    /// Stage create infos for the modules, chaining one entry of `extras` per stage.
     fn stage_infos<'b>(
         &self,
-        warp: &'b mut [vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo<'static>],
+        extras: &'b mut [StageExtras],
     ) -> Vec<vk::PipelineShaderStageCreateInfo<'b>> {
         self.stages
             .iter()
-            .zip(warp)
-            .map(|(&(stage, module, guest_warp), warp)| {
-                let info = vk::PipelineShaderStageCreateInfo::default()
-                    .stage(stage)
-                    .module(module)
+            .zip(extras)
+            .map(|(stage, extras)| {
+                let mut info = vk::PipelineShaderStageCreateInfo::default()
+                    .stage(stage.flags)
+                    .module(stage.module)
                     .name(ENTRY);
-                if guest_warp {
-                    info.push_next(warp)
-                } else {
-                    info
+                if stage.guest_warp {
+                    info = info.push_next(&mut extras.warp);
                 }
+                if stage.robust_storage {
+                    info = info.push_next(&mut extras.robustness);
+                }
+                info
             })
             .collect()
     }
 }
 
-/// A request for the guest's 32-lane subgroups.
-fn guest_warp_size() -> vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo<'static> {
-    vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(32)
-}
-
 impl Drop for Modules<'_> {
     fn drop(&mut self) {
-        for &(_, module, _) in &self.stages {
+        for stage in &self.stages {
             // SAFETY: pipeline creation finished; modules are not needed afterwards.
-            unsafe { self.device.raw.destroy_shader_module(module, None) };
+            unsafe { self.device.raw.destroy_shader_module(stage.module, None) };
         }
     }
 }

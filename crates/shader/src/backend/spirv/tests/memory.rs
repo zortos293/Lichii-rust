@@ -26,6 +26,7 @@ fn storage_descriptor(cbuf_offset: u32) -> StorageBufferDescriptor {
         indirect_offset: StorageBufferDescriptor::DIRECT,
         write_extent: Default::default(),
         read_extent: Default::default(),
+        reach_feedback: false,
     }
 }
 
@@ -77,6 +78,68 @@ fn storage_memory_program() -> TranslatedProgram {
         ..ShaderInfo::default()
     };
     finish_compute(s, b, info)
+}
+
+fn emit_words(profile: &Profile, program: &TranslatedProgram) -> Vec<u32> {
+    emit_spirv(
+        profile,
+        &RuntimeInfo::default(),
+        program,
+        &mut Bindings::default(),
+    )
+    .expect("emit")
+}
+
+/// A storage buffer that reports its reach declares the feedback buffer after every other
+/// binding and passes each access's end to the one function raising its word. A module with no
+/// such buffer emits the same words whether the host supports reach feedback or not.
+#[test]
+fn storage_reach_feedback_reports_every_access_of_marked_buffers() {
+    let program = storage_memory_program();
+    let feedback_host = Profile {
+        support_reach_feedback: true,
+        ..Profile::default()
+    };
+    assert_eq!(
+        emit_words(&feedback_host, &program),
+        emit_words(&Profile::default(), &program),
+        "unmarked buffers emit what they did before"
+    );
+    let plain = emit(
+        "storage_plain",
+        &feedback_host,
+        &RuntimeInfo::default(),
+        &program,
+    );
+    assert_eq!(count_ops(&plain, Op::AtomicUMax), 0);
+
+    let mut marked = program;
+    marked.info.storage_buffers_descriptors[0].reach_feedback = true;
+    let module = emit(
+        "storage_feedback",
+        &feedback_host,
+        &RuntimeInfo::default(),
+        &marked,
+    );
+    assert_eq!(
+        count_ops(&module, Op::AtomicUMax),
+        1,
+        "one raising function"
+    );
+    assert_eq!(
+        count_ops(&module, Op::ArrayLength),
+        count_entry_ops(&module, Op::ArrayLength)
+    );
+    assert!(
+        count_entry_ops(&module, Op::FunctionCall) > count_entry_ops(&plain, Op::FunctionCall),
+        "accesses report their end"
+    );
+    let accesses = count_entry_ops(&module, Op::ArrayLength);
+    assert!(accesses >= 42, "every load and store reports: {accesses}");
+    let named = module.debug_names.iter().any(|i| {
+        matches!(i.operands.get(1), Some(Operand::LiteralString(name)) if name == "reach_feedback")
+    });
+    assert!(named, "the feedback buffer is declared");
 }
 
 #[test]

@@ -34,6 +34,7 @@ pub struct DeviceExtensions {
     pub vertex_input_dynamic_state: bool,
     pub custom_border_color: bool,
     pub robustness2: bool,
+    pub pipeline_robustness: bool,
     pub transform_feedback: bool,
     pub conditional_rendering: bool,
     pub mesh_shader: bool,
@@ -64,6 +65,9 @@ const OPTIONAL_EXTENSIONS: &[(&CStr, ExtensionFlag)] = &[
         &mut e.custom_border_color
     }),
     (ext::robustness2::NAME, |e| &mut e.robustness2),
+    (ext::pipeline_robustness::NAME, |e| {
+        &mut e.pipeline_robustness
+    }),
     (ext::transform_feedback::NAME, |e| &mut e.transform_feedback),
     (ext::conditional_rendering::NAME, |e| {
         &mut e.conditional_rendering
@@ -123,6 +127,9 @@ pub struct DeviceFeatures {
     pub storage_texel_buffer_array_non_uniform_indexing: bool,
     pub maintenance4: bool,
     pub null_descriptor: bool,
+    /// Pipelines can opt single shader stages into `robustBufferAccess2` for storage buffers:
+    /// accesses past the end of a binding read 0 and drop writes.
+    pub storage_buffer_robustness: bool,
     /// Sparse binding and 2D sparse residency, on the universal queue.
     pub sparse_residency: bool,
     pub custom_border_color_without_format: bool,
@@ -368,6 +375,7 @@ impl Device {
         let mut vertex_input = vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT::default();
         let mut border = vk::PhysicalDeviceCustomBorderColorFeaturesEXT::default();
         let mut robustness2 = vk::PhysicalDeviceRobustness2FeaturesEXT::default();
+        let mut pipeline_robustness = vk::PhysicalDevicePipelineRobustnessFeaturesEXT::default();
         let mut xfb = vk::PhysicalDeviceTransformFeedbackFeaturesEXT::default();
         let mut conditional = vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default();
         let mut mesh = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
@@ -388,6 +396,7 @@ impl Device {
                 vertex_input.p_next = std::ptr::null_mut();
                 border.p_next = std::ptr::null_mut();
                 robustness2.p_next = std::ptr::null_mut();
+                pipeline_robustness.p_next = std::ptr::null_mut();
                 xfb.p_next = std::ptr::null_mut();
                 conditional.p_next = std::ptr::null_mut();
                 mesh.p_next = std::ptr::null_mut();
@@ -413,6 +422,9 @@ impl Device {
                 }
                 if extensions.robustness2 {
                     features = features.push_next(&mut robustness2);
+                }
+                if extensions.pipeline_robustness {
+                    features = features.push_next(&mut pipeline_robustness);
                 }
                 if extensions.transform_feedback {
                     features = features.push_next(&mut xfb);
@@ -466,6 +478,10 @@ impl Device {
         v12.descriptor_binding_storage_buffer_update_after_bind = vk::FALSE;
         v12.descriptor_binding_uniform_texel_buffer_update_after_bind = vk::FALSE;
         v12.descriptor_binding_storage_texel_buffer_update_after_bind = vk::FALSE;
+        let storage_buffer_robustness = extensions.robustness2
+            && extensions.pipeline_robustness
+            && robustness2.robust_buffer_access2 != vk::FALSE
+            && pipeline_robustness.pipeline_robustness != vk::FALSE;
         robustness2.robust_buffer_access2 = vk::FALSE;
         robustness2.robust_image_access2 = vk::FALSE;
         mesh.multiview_mesh_shader &= v11.multiview;
@@ -515,6 +531,7 @@ impl Device {
             ),
             maintenance4: on(v13.maintenance4),
             null_descriptor: extensions.robustness2 && on(robustness2.null_descriptor),
+            storage_buffer_robustness,
             sparse_residency: on(core.sparse_binding)
                 && on(core.sparse_residency_image2_d)
                 // SAFETY: valid physical device.

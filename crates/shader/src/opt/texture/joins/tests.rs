@@ -211,6 +211,7 @@ fn joined_storage_bindings_and_texture_indices_remap_together() {
         indirect_offset: StorageBufferDescriptor::DIRECT,
         write_extent: Default::default(),
         read_extent: Default::default(),
+        reach_feedback: false,
     };
     let mut base = ShaderInfo {
         storage_buffers_descriptors: vec![storage(0x110)],

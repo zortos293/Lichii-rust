@@ -317,6 +317,7 @@ pub fn global_memory_to_storage_buffer(
                 indirect_offset: buffer.indirect,
                 write_extent,
                 read_extent: reads.get(buffer).copied().unwrap_or_default(),
+                reach_feedback: false,
             });
     }
     let alignment = profile.min_ssbo_alignment.clamp(1, 1 << 31) as u32;
@@ -504,6 +505,29 @@ fn replace(prog: &mut Program, inst: InstId, binding: Value, offset: Value) {
         prog.insert_before(inst, storage_op, &[binding, offset, data], 0)
     };
     prog.replace_uses_with(inst, Value::Inst(atomic));
+}
+
+/// Marks the storage buffers whose program reports its reach
+/// ([`StorageBufferDescriptor::reach_feedback`]): pointers that carry no size (any pointer of a
+/// `native` program, and pointer table entries) whose reach is not the same for every
+/// invocation. None is marked without host support, or when the feedback buffer would pass the
+/// stage's storage buffer limit.
+pub fn mark_reach_feedback(info: &mut ShaderInfo, profile: &Profile, native: bool) {
+    let descriptors = &mut info.storage_buffers_descriptors;
+    let bindings: u32 = descriptors.iter().map(|d| d.count).sum();
+    let fits = match profile.max_per_stage_storage_buffers {
+        0 => true,
+        limit => bindings < limit,
+    };
+    for desc in descriptors {
+        let sized = !native && desc.indirect_offset == StorageBufferDescriptor::DIRECT;
+        let mut extent = desc.read_extent;
+        if desc.is_written {
+            extent.merge(&desc.write_extent);
+        }
+        desc.reach_feedback =
+            profile.support_reach_feedback && fits && !sized && extent.constant_end().is_none();
+    }
 }
 
 /// The most storage buffers one stage can bind on this host.

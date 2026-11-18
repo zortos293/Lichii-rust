@@ -59,7 +59,9 @@ pub fn stage_flags(stage: ShaderStage) -> vk::ShaderStageFlags {
 pub fn descriptor_type(kind: DescriptorKind) -> vk::DescriptorType {
     match kind {
         DescriptorKind::UniformBuffer => vk::DescriptorType::UNIFORM_BUFFER,
-        DescriptorKind::StorageBuffer => vk::DescriptorType::STORAGE_BUFFER,
+        DescriptorKind::StorageBuffer | DescriptorKind::ReachFeedback => {
+            vk::DescriptorType::STORAGE_BUFFER
+        }
         DescriptorKind::UniformTexelBuffer => vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
         DescriptorKind::StorageTexelBuffer => vk::DescriptorType::STORAGE_TEXEL_BUFFER,
         DescriptorKind::CombinedImageSampler => vk::DescriptorType::COMBINED_IMAGE_SAMPLER,

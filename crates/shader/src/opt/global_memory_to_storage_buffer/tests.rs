@@ -120,6 +120,7 @@ fn descriptor(index: u32, offset: u32, is_written: bool) -> StorageBufferDescrip
         indirect_offset: StorageBufferDescriptor::DIRECT,
         write_extent: StorageWriteExtent::default(),
         read_extent: StorageWriteExtent::default(),
+        reach_feedback: false,
     }
 }
 
@@ -140,6 +141,47 @@ fn read_descriptor(
         },
         ..descriptor(index, offset, is_written)
     }
+}
+
+/// Only pointers that carry no size and whose reach is unknown or differs between invocations
+/// report their reach, and only on hosts that support it with a storage buffer to spare.
+#[test]
+fn reach_feedback_marks_unsized_pointers_of_unknown_reach() {
+    let host = Profile {
+        support_reach_feedback: true,
+        ..profile()
+    };
+    let marks = |profile: &Profile, native: bool, descs: &[StorageBufferDescriptor]| {
+        let mut info = ShaderInfo {
+            storage_buffers_descriptors: descs.to_vec(),
+            ..ShaderInfo::default()
+        };
+        mark_reach_feedback(&mut info, profile, native);
+        let marked: Vec<bool> = info
+            .storage_buffers_descriptors
+            .iter()
+            .map(|d| d.reach_feedback)
+            .collect();
+        marked
+    };
+    let unknown = descriptor(0, 0x10, false);
+    let constant = read_descriptor(0, 0x20, false, 64, 0);
+    let varying = read_descriptor(0, 0x30, false, 64, 4);
+    let indirect = StorageBufferDescriptor {
+        indirect_offset: 8,
+        ..unknown
+    };
+    assert_eq!(
+        marks(&host, true, &[unknown, constant, varying]),
+        [true, false, true]
+    );
+    assert_eq!(marks(&host, false, &[unknown, indirect]), [false, true]);
+    assert_eq!(marks(&profile(), true, &[unknown]), [false]);
+    let full = Profile {
+        max_per_stage_storage_buffers: 2,
+        ..host
+    };
+    assert_eq!(marks(&full, true, &[unknown, varying]), [false, false]);
 }
 
 /// The storage instruction a rewritten access forwards to.

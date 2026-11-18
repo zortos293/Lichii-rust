@@ -27,7 +27,7 @@ use crate::translate::{TranslateOptions, header_size};
 use crate::{RuntimeInfo, ShaderEnvironment, ShaderModule, ShaderStage, TranslateError};
 
 /// Bump on any change to the header or record layout.
-pub const FORMAT_VERSION: u32 = 5;
+pub const FORMAT_VERSION: u32 = 6;
 /// Bytes of [`header`], the start of every cache file.
 pub const HEADER_LEN: usize = 32;
 const MAGIC: [u8; 8] = *b"LICHISHC";

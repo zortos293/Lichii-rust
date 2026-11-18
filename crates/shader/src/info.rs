@@ -101,6 +101,13 @@ pub struct StorageBufferDescriptor {
     /// How far the program's loads reach past the pointer; bounded at 0 when it loads nothing,
     /// unbounded when unknown.
     pub read_extent: StorageWriteExtent,
+    /// The pointer carries no size and the program's reach past it is not the same for every
+    /// invocation, so the program reports it: each access past the end of the binding raises
+    /// this buffer's word of the module's [`DescriptorKind::ReachFeedback`] buffer to the end
+    /// of the access, in bytes from the binding's start.
+    ///
+    /// [`DescriptorKind::ReachFeedback`]: crate::DescriptorKind::ReachFeedback
+    pub reach_feedback: bool,
 }
 
 impl StorageBufferDescriptor {
@@ -466,6 +473,14 @@ impl ShaderInfo {
     pub const MAX_CBUFS: usize = 18;
     pub const MAX_INDIRECT_CBUFS: usize = 14;
     pub const MAX_SSBOS: usize = 64;
+
+    /// Whether any storage buffer reports its reach, so the module declares a
+    /// [`DescriptorKind::ReachFeedback`](crate::DescriptorKind::ReachFeedback) binding.
+    pub fn uses_reach_feedback(&self) -> bool {
+        self.storage_buffers_descriptors
+            .iter()
+            .any(|d| d.reach_feedback)
+    }
 
     /// The program observes the 32-lane guest warp: votes, ballots, shuffles, lane ids, or a
     /// divergent barrier whose removal relies on the warp running in step.
