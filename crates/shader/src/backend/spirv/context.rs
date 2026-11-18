@@ -3011,13 +3011,15 @@ impl<'a> EmitContext<'a> {
     /// Opens the routing body of a global memory function: for every storage buffer that may
     /// hold `addr`, a selection whose then-block calls `access` with the element pointer, the
     /// buffer view and the element index. Leaves the block after the last selection open for
-    /// the caller's fallback.
+    /// the caller's fallback. `access_bytes` is how far the access reaches from `addr`, which
+    /// a buffer that reports its reach reports.
     fn route_global(
         &mut self,
         element: StorageElement,
         addr: Word,
         element_pointer: Word,
         shift: u32,
+        access_bytes: u32,
         access: &mut dyn FnMut(&mut Self, Word, Word, Word) -> EmitResult<()>,
     ) -> EmitResult<()> {
         let info = self.info;
@@ -3034,8 +3036,8 @@ impl<'a> EmitContext<'a> {
             let distance = ctx.b.i_sub(u64_t, None, addr, base)?;
             let offset = ctx.b.u_convert(u32_t, None, distance)?;
             if ctx.ssbo_reports_reach(index) {
-                let element_bytes = ctx.const_u32(1 << shift);
-                let end = ctx.b.i_add(u32_t, None, offset, element_bytes)?;
+                let access_bytes = ctx.const_u32(access_bytes);
+                let end = ctx.b.i_add(u32_t, None, offset, access_bytes)?;
                 ctx.report_reach(index, end)?;
             }
             let shift = ctx.const_u32(shift);
@@ -3132,6 +3134,7 @@ impl<'a> EmitContext<'a> {
                 addr,
                 u32_element,
                 2,
+                count * 4,
                 &mut |ctx, _, ssbo, word_index| {
                     let mut words = SmallVec::<[Word; 4]>::new();
                     let u32_t = ctx.u32[1];
@@ -3156,6 +3159,7 @@ impl<'a> EmitContext<'a> {
                 addr,
                 element_pointer,
                 shift,
+                1 << shift,
                 &mut |ctx, pointer, _, _| {
                     let value = ctx.b.load(ty, None, pointer, None, [])?;
                     Ok(ctx.b.ret_value(value)?)
@@ -3204,6 +3208,7 @@ impl<'a> EmitContext<'a> {
                 addr,
                 u32_element,
                 2,
+                count * 4,
                 &mut |ctx, _, ssbo, word_index| {
                     let u32_t = ctx.u32[1];
                     let zero = ctx.u32_zero_value;
@@ -3227,6 +3232,7 @@ impl<'a> EmitContext<'a> {
                 addr,
                 element_pointer,
                 shift,
+                1 << shift,
                 &mut |ctx, pointer, _, _| {
                     ctx.b.store(pointer, data, None, [])?;
                     Ok(ctx.b.ret()?)
@@ -3253,6 +3259,7 @@ impl<'a> EmitContext<'a> {
                 addr,
                 element_pointer,
                 shift,
+                1 << shift,
                 &mut |ctx, pointer, _, _| {
                     let value = ctx.b.load(ty, None, pointer, None, [])?;
                     let wide = if signed {
@@ -3270,6 +3277,7 @@ impl<'a> EmitContext<'a> {
                 addr,
                 u32_element,
                 2,
+                1 << 2,
                 &mut |ctx, pointer, _, _| {
                     let word = ctx.b.load(u32_t, None, pointer, None, [])?;
                     let bit_offset = ctx.global_bit_offset(addr, bits)?;
@@ -3308,6 +3316,7 @@ impl<'a> EmitContext<'a> {
                 addr,
                 element_pointer,
                 bits / 16,
+                1 << (bits / 16),
                 &mut |ctx, pointer, _, _| {
                     let narrow = ctx.b.u_convert(ty, None, value)?;
                     ctx.b.store(pointer, narrow, None, [])?;
@@ -3322,6 +3331,7 @@ impl<'a> EmitContext<'a> {
                 addr,
                 u32_element,
                 2,
+                1 << 2,
                 &mut |ctx, pointer, _, _| {
                     let bit_offset = ctx.global_bit_offset(addr, bits)?;
                     let count = ctx.const_u32(bits);
@@ -3414,6 +3424,7 @@ impl<'a> EmitContext<'a> {
             addr,
             element,
             2,
+            1 << 2,
             &mut |ctx, pointer, ssbo, word| {
                 let u32_t = ctx.u32[1];
                 let zero = ctx.u32_zero_value;
@@ -3477,6 +3488,7 @@ impl<'a> EmitContext<'a> {
             address,
             element,
             2,
+            4,
             &mut |ctx, pointer, _, _| {
                 let zero = ctx.u32_zero_value;
                 let result = ctx.b.atomic_compare_exchange(

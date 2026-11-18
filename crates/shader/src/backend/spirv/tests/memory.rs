@@ -291,8 +291,13 @@ fn routed_global_accesses_report_the_reach_of_marked_buffers() {
     let mut s = Synthetic::new();
     let (b, _) = compute_block(&mut s);
     let address = Value::U64(0x8000_1000);
-    let value = s.inst(b, Opcode::LoadGlobal32, &[address]);
-    s.inst(b, Opcode::WriteGlobal32, &[address, value]);
+    for (load, write) in [
+        (Opcode::LoadGlobal32, Opcode::WriteGlobal32),
+        (Opcode::LoadGlobal64, Opcode::WriteGlobal64),
+    ] {
+        let value = s.inst(b, load, &[address]);
+        s.inst(b, write, &[address, value]);
+    }
     let info = ShaderInfo {
         native_global_bounds: true,
         ..global_memory_info(0x110)
@@ -327,6 +332,32 @@ fn routed_global_accesses_report_the_reach_of_marked_buffers() {
     assert!(
         count_ops(&module, Op::FunctionCall) > count_ops(&plain, Op::FunctionCall),
         "the routing functions report"
+    );
+    let adds_of = |module: &dr::Module, bytes: u32| {
+        let constant = module.types_global_values.iter().find_map(|i| {
+            (i.class.opcode == Op::Constant
+                && i.operands == [Operand::LiteralBit32(bytes)]
+                && module.types_global_values.iter().any(|t| {
+                    t.result_id == i.result_type
+                        && t.operands == [Operand::LiteralBit32(32), Operand::LiteralBit32(0)]
+                }))
+            .then_some(i.result_id)
+            .flatten()
+        });
+        module
+            .functions
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.instructions)
+            .filter(|i| {
+                i.class.opcode == Op::IAdd
+                    && constant.is_some_and(|c| i.operands.contains(&Operand::IdRef(c)))
+            })
+            .count()
+    };
+    assert!(
+        adds_of(&module, 8) > adds_of(&plain, 8),
+        "a 64-bit routed access reports its whole width"
     );
 }
 
