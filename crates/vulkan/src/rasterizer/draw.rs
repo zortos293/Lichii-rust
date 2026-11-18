@@ -3272,7 +3272,10 @@ fn storage_pointer(
         None => extent.constant_end().map(u64::from),
     };
     let size = reach.map(|end| {
-        let end = address.saturating_add(end.max(1)).next_multiple_of(4);
+        let end = address
+            .saturating_add(end.max(1))
+            .min(u64::MAX - 3)
+            .next_multiple_of(4);
         (end - address).min(limit)
     });
     (address, size)

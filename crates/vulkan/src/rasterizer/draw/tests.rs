@@ -5627,6 +5627,19 @@ fn storage_pointer_reach_follows_the_program_accesses() {
         (pool, None),
         "a guard the dispatch breaks"
     );
+    let wide = StorageWriteExtent {
+        local_stride: [u32::MAX; 3],
+        group_stride: [u32::MAX; 3],
+        ..extent(0x10, 0)
+    };
+    assert_eq!(
+        dispatched(
+            Some(([u32::MAX; 3], [u32::MAX; 3])),
+            desc(direct, wide, None)
+        ),
+        (pool, Some(u64::MAX - 3 - pool)),
+        "a reach past the address space saturates"
+    );
 }
 
 /// A Switch 2 fragment program reading its bare storage pointer at a constant offset. Each draw
