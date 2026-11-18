@@ -49,6 +49,17 @@ pub struct Scheduler {
     /// A timeline semaphore each [`Scheduler::submit_part`] signals the next value of.
     parts: vk::Semaphore,
     part: u64,
+    /// Whether a command buffer of the current tick was begun since the last flush, so the
+    /// tick's submission carries recorded work.
+    recorded: bool,
+    /// A guest barrier asked for while nothing was being recorded, recorded at the start of the
+    /// next command buffer instead.
+    barrier: bool,
+    /// Queue submissions and sparse bindings made so far.
+    submits: u64,
+    /// Reused submit infos, so a submission allocates nothing.
+    wait_infos: Vec<vk::SemaphoreSubmitInfo<'static>>,
+    signal_infos: Vec<vk::SemaphoreSubmitInfo<'static>>,
     /// The dispatches recorded since the last compute barrier still owe one, which orders their
     /// shader accesses before later commands; [`Scheduler::record`] records it.
     compute_barrier_owed: bool,
@@ -119,6 +130,11 @@ impl Scheduler {
             aside: None,
             parts,
             part: 0,
+            recorded: false,
+            barrier: false,
+            submits: 0,
+            wait_infos: Vec::new(),
+            signal_infos: Vec::new(),
             compute_barrier_owed: false,
             compute_barriers: 0,
         })
@@ -148,6 +164,48 @@ impl Scheduler {
     /// The value the next [`Scheduler::flush`] signals; work recorded now completes at it.
     pub fn tick(&self) -> u64 {
         self.tick
+    }
+
+    /// The tick everything recorded so far completes at, when it was all submitted already:
+    /// nothing was recorded since the last flush. A fence signalled now can wait for it instead
+    /// of for a submission of its own.
+    pub fn submitted_tick(&self) -> Option<u64> {
+        (!self.recorded).then(|| self.tick - 1)
+    }
+
+    /// Queue submissions and sparse bindings made so far, [`Scheduler::run_aside`]'s included.
+    pub fn submits(&self) -> u64 {
+        self.submits
+    }
+
+    /// A full memory barrier: later commands may read anything earlier ones wrote. With no
+    /// command buffer being recorded it is recorded at the start of the next one, so a barrier
+    /// alone gives a submission nothing to carry. It orders everything an owed compute barrier
+    /// would, which it pays. `true` when it was recorded now.
+    pub fn barrier(&mut self) -> Result<bool> {
+        let Some(cmd) = self.current else {
+            self.barrier = true;
+            return Ok(false);
+        };
+        self.end_rendering(cmd);
+        self.record_barrier(cmd);
+        Ok(true)
+    }
+
+    fn record_barrier(&mut self, cmd: vk::CommandBuffer) {
+        self.compute_barrier_owed = false;
+        let barrier = vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE);
+        // SAFETY: `cmd` is recording outside any rendering.
+        unsafe {
+            self.device.raw.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().memory_barriers(&[barrier]),
+            );
+        }
     }
 
     /// The command buffer being recorded, begun on first use after a flush, outside any
@@ -275,7 +333,11 @@ impl Scheduler {
         };
         self.device
             .checkpoint(cmd, format_args!("commands of tick {}", self.tick));
+        if std::mem::take(&mut self.barrier) {
+            self.record_barrier(cmd);
+        }
         self.current = Some(cmd);
+        self.recorded = true;
         Ok(cmd)
     }
 
@@ -297,20 +359,25 @@ impl Scheduler {
         signals: &[vk::Semaphore],
     ) -> Result<u64> {
         let tick = self.tick;
-        let mut signal_infos = vec![
+        let mut signal_infos = std::mem::take(&mut self.signal_infos);
+        signal_infos.clear();
+        signal_infos.push(
             vk::SemaphoreSubmitInfo::default()
                 .semaphore(self.timeline.raw)
                 .value(tick)
                 .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
-        ];
+        );
         signal_infos.extend(signals.iter().map(|&s| {
             vk::SemaphoreSubmitInfo::default()
                 .semaphore(s)
                 .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
         }));
         let bound = self.bound.take();
-        self.submit(waits, bound, &signal_infos)?;
+        let result = self.submit(waits, bound, &signal_infos);
+        self.signal_infos = signal_infos;
+        result?;
         self.tick += 1;
+        self.recorded = false;
         Ok(tick)
     }
 
@@ -386,24 +453,20 @@ impl Scheduler {
             value,
             stage: vk::PipelineStageFlags2::ALL_COMMANDS,
         });
-        let wait_infos: Vec<_> = waits
-            .iter()
-            .chain(bound.iter())
-            .map(|w| {
+        self.wait_infos.clear();
+        self.wait_infos
+            .extend(waits.iter().chain(bound.iter()).map(|w| {
                 vk::SemaphoreSubmitInfo::default()
                     .semaphore(w.semaphore)
                     .value(w.value)
                     .stage_mask(w.stage)
-            })
-            .collect();
-        let cmd_infos: Vec<_> = cmd
-            .iter()
-            .map(|&c| vk::CommandBufferSubmitInfo::default().command_buffer(c))
-            .collect();
+            }));
+        let cmd_info = cmd.map(|c| vk::CommandBufferSubmitInfo::default().command_buffer(c));
         let submit = vk::SubmitInfo2::default()
-            .wait_semaphore_infos(&wait_infos)
-            .command_buffer_infos(&cmd_infos)
+            .wait_semaphore_infos(&self.wait_infos)
+            .command_buffer_infos(cmd_info.as_slice())
             .signal_semaphore_infos(signals);
+        self.submits += 1;
         self.device.submit(&[submit], vk::Fence::null())?;
         if let Some(cmd) = cmd {
             self.in_flight.push_back((self.tick, cmd));
@@ -412,14 +475,18 @@ impl Scheduler {
     }
 
     /// Binds sparse memory to `image` after the work recorded so far and before any recorded
-    /// later. The binding takes a tick of its own, which the next submission waits for.
+    /// later. The binding takes a tick of its own, which the next submission waits for; it
+    /// submits the recorded work first only when there is some.
     pub fn bind_sparse(
         &mut self,
         image: vk::Image,
         binds: &[vk::SparseImageMemoryBind],
         opaque: &[vk::SparseMemoryBind],
     ) -> Result<()> {
-        let after = self.flush()?;
+        let after = match self.submitted_tick() {
+            Some(tick) => tick,
+            None => self.flush()?,
+        };
         let tick = self.tick;
         let image_info = [vk::SparseImageMemoryBindInfo::default()
             .image(image)
@@ -442,6 +509,7 @@ impl Scheduler {
         if !opaque.is_empty() {
             info = info.image_opaque_binds(&opaque_info);
         }
+        self.submits += 1;
         self.device.bind_sparse(&[info])?;
         self.bound = Some(tick);
         self.tick += 1;
@@ -555,6 +623,7 @@ impl Scheduler {
         };
         let cmd_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
         let submit = vk::SubmitInfo2::default().command_buffer_infos(&cmd_infos);
+        self.submits += 1;
         self.device.submit(&[submit], fence)?;
         let _waiting = self.activity.as_deref().map(|a| a.waiting(Wait::HostGpu));
         // SAFETY: the fence belongs to this scheduler and was just submitted.
@@ -709,5 +778,73 @@ mod tests {
         assert_eq!(scheduler.renderings(), 3);
         assert!(scheduler.record_rendering(key(8), &info(8)).unwrap().1);
         scheduler.finish().unwrap();
+    }
+
+    #[test]
+    fn barriers_with_nothing_recorded_open_the_next_command_buffer() {
+        let Some(device) = device() else { return };
+        let mut scheduler = Scheduler::new(&device).unwrap();
+        assert!(!scheduler.barrier().unwrap(), "nothing is being recorded");
+        assert!(scheduler.barrier);
+        assert_eq!(scheduler.submitted_tick(), Some(0));
+        let cmd = scheduler.record().unwrap();
+        assert!(!scheduler.barrier, "the new command buffer starts with it");
+        assert!(
+            scheduler.barrier().unwrap(),
+            "recorded at once while recording"
+        );
+        assert!(!scheduler.barrier);
+        assert_eq!(scheduler.record().unwrap(), cmd);
+        scheduler.finish().unwrap();
+        assert_eq!(device.instance().validation_errors(), 0);
+    }
+
+    #[test]
+    fn held_guest_barriers_and_owed_compute_barriers_are_both_paid() {
+        let Some(device) = device() else { return };
+        let mut scheduler = Scheduler::new(&device).unwrap();
+        let barriers = scheduler.compute_barriers();
+        scheduler.record().unwrap();
+        scheduler.owe_compute_barrier();
+        scheduler.flush().unwrap();
+        assert!(!scheduler.compute_barrier_owed());
+        assert_eq!(
+            scheduler.compute_barriers(),
+            barriers + 1,
+            "a submission ends with the owed compute barrier"
+        );
+
+        let submits = scheduler.submits();
+        assert!(!scheduler.barrier().unwrap());
+        scheduler.owe_compute_barrier();
+        assert!(
+            scheduler.submitted_tick().is_some(),
+            "neither barrier opens a command buffer"
+        );
+        assert_eq!(scheduler.submits(), submits);
+        scheduler.record().unwrap();
+        assert!(
+            !scheduler.barrier,
+            "the guest barrier opens the next command buffer"
+        );
+        assert!(
+            !scheduler.compute_barrier_owed(),
+            "the guest barrier orders the dispatches too"
+        );
+        assert_eq!(scheduler.compute_barriers(), barriers + 1);
+
+        scheduler.owe_compute_barrier();
+        assert!(scheduler.barrier().unwrap());
+        assert!(!scheduler.compute_barrier_owed());
+        scheduler.owe_compute_barrier();
+        scheduler.submit_part().unwrap();
+        assert!(!scheduler.compute_barrier_owed());
+        assert_eq!(
+            scheduler.compute_barriers(),
+            barriers + 2,
+            "a part submission ends with the owed compute barrier"
+        );
+        scheduler.finish().unwrap();
+        assert_eq!(device.instance().validation_errors(), 0);
     }
 }
