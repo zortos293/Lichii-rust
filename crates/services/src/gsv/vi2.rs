@@ -142,10 +142,12 @@ struct Timing {
 }
 
 impl Timing {
-    fn of(word: u32) -> Self {
+    /// `forced` replaces the word's swap interval: the title's
+    /// [`ProgramImage::present_interval`](lichii_loader::ProgramImage::present_interval).
+    fn of(word: u32, forced: Option<u32>) -> Self {
         let refresh = word & 0xffff;
         Self {
-            swap_interval: (word >> 16).clamp(1, 4),
+            swap_interval: forced.unwrap_or(word >> 16).clamp(1, 4),
             refresh_hz: if (30..=240).contains(&refresh) {
                 refresh
             } else {
@@ -228,7 +230,8 @@ impl Vi2 {
     /// semaphore its CPU releases only after the present returns.
     fn present(&self, ctx: &mut HleRequestContext) -> ResultCode {
         let words = Words::command(ctx);
-        let (image, drawn, timing) = (words.u32(5), words.u32(7), Timing::of(words.u32(12)));
+        let timing = Timing::of(words.u32(12), self.context.program.present_interval);
+        let (image, drawn) = (words.u32(5), words.u32(7));
         let fence = (!words.u32(22), words.u32(24));
         self.native
             .refresh_hz
@@ -437,12 +440,29 @@ mod tests {
         ] {
             native
                 .refresh_hz
-                .store(Timing::of(word).refresh_hz, Ordering::Relaxed);
+                .store(Timing::of(word, None).refresh_hz, Ordering::Relaxed);
             assert_eq!(
                 native.vblank_period(),
                 Duration::from_nanos(period),
                 "{word:#x}"
             );
         }
+    }
+
+    #[test]
+    fn a_patched_present_interval_replaces_the_titles() {
+        let word = 2 << 16 | 60;
+        let full_speed = Some(100);
+        assert_eq!(
+            Timing::of(word, None).interval(full_speed),
+            Some(Duration::from_nanos(33_333_333))
+        );
+        let forced = Timing::of(word, Some(1));
+        assert_eq!(forced.swap_interval, 1);
+        assert_eq!(
+            forced.interval(full_speed),
+            Some(Duration::from_nanos(16_666_666))
+        );
+        assert_eq!(forced.target_hz(), 60.0);
     }
 }

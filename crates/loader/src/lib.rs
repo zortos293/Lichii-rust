@@ -10,6 +10,7 @@
 mod builtin;
 mod error;
 pub mod exefs;
+mod mkw;
 pub mod npdm;
 pub mod nro;
 pub mod nso;

@@ -128,6 +128,7 @@ fn bench() {
     let looped = assemble(&loop_macro());
     let words = |count: usize| move |rng: &mut Rng| (0..count).map(|_| rng.next()).collect();
     let state_calls = stream(CALLS, 32, 96, &mut rng, words(2));
+    let mid_calls = stream(CALLS, 2048, 96, &mut rng, words(2));
     let wide_calls = stream(CALLS, 65536, 96, &mut rng, words(2));
     let loop_calls = stream(CALLS / 4, 32, 96, &mut rng, |rng| {
         let mut call = words(17)(rng);
@@ -136,6 +137,7 @@ fn bench() {
     });
     for (name, code, calls) in [
         ("state, 7 instructions", &state, &state_calls),
+        ("state, 2k recent calls", &state, &mid_calls),
         ("state, 64k recent calls", &state, &wide_calls),
         ("loop, 16 words", &looped, &loop_calls),
     ] {
