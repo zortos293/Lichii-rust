@@ -1108,14 +1108,15 @@ fn a_blocked_event_wait_lands_in_the_event_bucket() {
         Ordering::SeqCst,
     );
     test.kernel.run().unwrap();
-    let thread = process.threads()[0].id();
+    let thread = process.threads()[0].clone();
     let deadline = Instant::now() + Duration::from_secs(5);
     while !test
         .kernel
         .0
         .wait_descriptions(std::slice::from_ref(&process))
-        .get(&thread)
+        .get(&thread.id())
         .is_some_and(|waits_on| waits_on.contains("vi:u command 5202"))
+        || thread.sched.lock().wait_probe.is_none()
     {
         assert!(
             Instant::now() < deadline,
@@ -1143,7 +1144,7 @@ fn a_blocked_event_wait_lands_in_the_event_bucket() {
     assert_eq!(report.objects.len(), 1);
     let top = &report.objects[0];
     assert_eq!(top.reason, WaitReason::Event);
-    assert_eq!(top.object, WaitObject::Event(Arc::as_ptr(&event) as usize));
+    assert_eq!(top.object, WaitObject::Event(event.serial()));
     assert_eq!(top.name, "vi:u command 5202");
     assert_eq!(top.total, blocked);
     let line = report.to_string();

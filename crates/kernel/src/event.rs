@@ -5,15 +5,28 @@ use std::sync::OnceLock;
 use crate::resource_limit::Reservation;
 use crate::sync::SyncState;
 use crate::thread::ThreadId;
+use crate::wait_stats;
 
 /// An event. Services hold an `Arc<Event>` and signal it from any host thread; the guest waits
 /// on its readable end.
-#[derive(Default)]
 pub struct Event {
     sync: SyncState,
     origin: OnceLock<Box<str>>,
     observer: Option<Box<dyn Fn() + Send + Sync>>,
     _reservation: Option<Reservation>,
+    serial: u64,
+}
+
+impl Default for Event {
+    fn default() -> Self {
+        Self {
+            sync: SyncState::default(),
+            origin: OnceLock::new(),
+            observer: None,
+            _reservation: None,
+            serial: wait_stats::serial(),
+        }
+    }
 }
 
 impl Event {
@@ -66,6 +79,11 @@ impl Event {
 
     pub fn is_signaled(&self) -> bool {
         self.sync.is_signaled()
+    }
+
+    /// Unique for the life of the host process, unlike the event's address.
+    pub(crate) fn serial(&self) -> u64 {
+        self.serial
     }
 
     pub(crate) fn sync_state(&self) -> &SyncState {

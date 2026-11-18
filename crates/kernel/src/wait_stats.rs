@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -26,6 +27,13 @@ const MAX_PROBE: usize = 16;
 /// Objects, and event origins and services, the log line names.
 const TOP_OBJECTS: usize = 5;
 const TOP_NAMES: usize = 3;
+
+/// A new id for an event or session, so a wait key never matches a later object that reuses
+/// the address of one that was closed.
+pub(crate) fn serial() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Why a guest thread blocked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -78,23 +86,24 @@ impl WaitReason {
     }
 }
 
-/// What a thread waits on: a kernel object by address, or a guest address the arbiter keys.
+/// What a thread waits on: an event or session by serial, a thread or process by id, or a guest
+/// address the arbiter keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum WaitObject {
-    Event(usize),
-    Thread(usize),
-    Process(usize),
-    Session(usize),
+    Event(u64),
+    Thread(u64),
+    Process(u64),
+    Session(u64),
     Address(u64),
 }
 
 impl WaitObject {
     fn of(object: &KObject) -> Option<Self> {
         Some(match object {
-            KObject::ReadableEvent(event) => Self::Event(Arc::as_ptr(event) as usize),
-            KObject::Thread(thread) => Self::Thread(Arc::as_ptr(thread) as usize),
-            KObject::Process(process) => Self::Process(Arc::as_ptr(process) as usize),
-            KObject::ClientSession(session) => Self::Session(Arc::as_ptr(session) as usize),
+            KObject::ReadableEvent(event) => Self::Event(event.serial()),
+            KObject::Thread(thread) => Self::Thread(thread.id()),
+            KObject::Process(process) => Self::Process(process.id()),
+            KObject::ClientSession(session) => Self::Session(session.serial()),
             _ => return None,
         })
     }
@@ -111,11 +120,11 @@ impl WaitObject {
 
     fn slot(self) -> usize {
         let (kind, value) = match self {
-            Self::Event(p) => (1, p as u64),
-            Self::Thread(p) => (2, p as u64),
-            Self::Process(p) => (3, p as u64),
-            Self::Session(p) => (4, p as u64),
-            Self::Address(a) => (5, a),
+            Self::Event(serial) => (1, serial),
+            Self::Thread(id) => (2, id),
+            Self::Process(id) => (3, id),
+            Self::Session(serial) => (4, serial),
+            Self::Address(address) => (5, address),
         };
         ((value ^ kind).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56) as usize % TABLE_SIZE
     }
@@ -156,10 +165,7 @@ impl WaitSite {
 
     /// `SendSyncRequest` on `session`.
     pub(crate) fn ipc(session: &Arc<ClientSession>) -> Self {
-        Self::one(
-            WaitReason::Ipc,
-            WaitObject::Session(Arc::as_ptr(session) as usize),
-        )
+        Self::one(WaitReason::Ipc, WaitObject::Session(session.serial()))
     }
 
     /// An arbiter wait (`Lock`, `Condvar` or `Address`) keyed by the guest address `address`.
@@ -493,7 +499,7 @@ mod tests {
         }
     }
 
-    fn event(id: usize) -> WaitSite {
+    fn event(id: u64) -> WaitSite {
         WaitSite::one(WaitReason::Event, WaitObject::Event(id))
     }
 
