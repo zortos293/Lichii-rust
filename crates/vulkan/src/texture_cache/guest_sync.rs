@@ -9,8 +9,10 @@ use gpu_allocator::MemoryLocation;
 use lichii_texture::PixelFormat;
 use lichii_texture::block_linear::GobLayout;
 
+use std::collections::HashMap;
+
 use super::{
-    CachedImage, GuestLayout, ImageId, ImageInfo, ImageKind, ResolutionScale, Segment,
+    CachedImage, FxBuild, GuestLayout, ImageId, ImageInfo, ImageKind, ResolutionScale, Segment,
     TextureCache, Transfer,
 };
 use crate::commands::ImageAccess;
@@ -45,7 +47,7 @@ impl Packing {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Direction {
     ToGuest = 0,
     FromGuest = 1,
@@ -83,7 +85,12 @@ pub(super) struct GuestSync {
     linear: Option<Buffer>,
     stencil: Option<Buffer>,
     runs: Option<Buffer>,
+    /// The set the last flush bound, the tick it was allocated in and the guest, linear,
+    /// stencil and runs buffers it binds. Later flushes of that tick over the same buffers
+    /// bind it again, as the allocator keeps it until the tick's work completes.
+    set: Option<(vk::DescriptorSet, u64, [vk::Buffer; 4])>,
     scratch: RunScratch,
+    plans: Plans,
     batch: Batch,
 }
 
@@ -101,9 +108,17 @@ impl GuestSync {
             linear: None,
             stencil: None,
             runs: None,
+            set: None,
             scratch: RunScratch::default(),
+            plans: Plans::default(),
             batch: Batch::default(),
         })
+    }
+
+    /// Spans and paints replayed from plans so far.
+    #[cfg(test)]
+    pub(super) fn plan_replays(&self) -> u64 {
+        self.plans.replays
     }
 }
 
@@ -436,6 +451,10 @@ fn run_words(
     if direction == Direction::ToGuest {
         trim_aliases(scratch, moved);
     }
+    fill_words(scratch);
+}
+
+fn fill_words(scratch: &mut RunScratch) {
     scratch.words.clear();
     scratch.words.extend(
         scratch
@@ -443,6 +462,197 @@ fn run_words(
             .iter()
             .map(|r| [r.from as u32, r.size as u32, r.at as u32, 0]),
     );
+}
+
+/// Plans [`Plans`] holds at most.
+const MAX_PLANS: usize = 256;
+
+/// Runs [`Plans`] holds at most; a paint of more than a quarter of them is planned every time.
+const MAX_PLANNED_RUNS: usize = 16384;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum PlanKind {
+    /// The guest bytes an image's runs land on, as [`TextureCache::sync_on_gpu`] bounds its
+    /// window with them.
+    Span,
+    /// The runs of a paint, as [`run_words`] leaves them.
+    Paint(Direction),
+}
+
+/// What a plan is computed from besides the window: the [`CachedImage::serial`]s of the image
+/// and the target, which name their info and segments, and the levels the image moves.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct PlanKey {
+    image: u64,
+    target: u64,
+    levels: u32,
+    window: (u64, u64),
+    kind: PlanKind,
+}
+
+#[derive(Clone, Copy)]
+enum Plan {
+    /// Two of the target's segments share device memory: [`shared_runs`] can't place the image.
+    Unplaced,
+    /// The guest bytes the runs land on, `(u64::MAX, 0)` when there are none.
+    Span(u64, u64),
+    /// The paint's runs, `Plans::runs[start..end]`.
+    Runs(u32, u32),
+}
+
+/// What a plan reads of an image: its serial, info, segments and the levels it moves.
+#[derive(Clone, Copy)]
+struct Planned<'a> {
+    serial: u64,
+    info: &'a ImageInfo,
+    levels: u32,
+    segments: &'a [Segment],
+}
+
+impl<'a> Planned<'a> {
+    fn of(image: &'a CachedImage) -> Self {
+        Self {
+            serial: image.serial,
+            info: &image.info,
+            levels: image.info.levels.min(image.image.desc().mip_levels),
+            segments: &image.segments,
+        }
+    }
+}
+
+/// Spans and paint runs of GPU overlap syncs, replayed while the images they were planned
+/// between keep their serials. Holds at most [`MAX_PLANS`] plans and [`MAX_PLANNED_RUNS`] runs
+/// of 12 bytes and forgets them all when either fills: 192 KiB of runs and a map of 512
+/// buckets of 64 bytes, about 225 KiB, reserved by the first plan.
+#[derive(Default)]
+struct Plans {
+    plans: HashMap<PlanKey, Plan, FxBuild>,
+    runs: Vec<[u32; 3]>,
+    #[cfg(test)]
+    off: bool,
+    #[cfg(test)]
+    replays: u64,
+}
+
+impl Plans {
+    /// Where the bytes of `image` land among the offsets `window` of `target`, as the span
+    /// of the runs [`shared_runs`] finds; `None` when it can't place them.
+    fn span(
+        &mut self,
+        scratch: &mut RunScratch,
+        image: Planned<'_>,
+        target: Planned<'_>,
+        window: (u64, u64),
+    ) -> Option<(u64, u64)> {
+        let key = PlanKey {
+            image: image.serial,
+            target: target.serial,
+            levels: 0,
+            window,
+            kind: PlanKind::Span,
+        };
+        let plan = match self.plans.get(&key) {
+            Some(&plan) => {
+                #[cfg(test)]
+                {
+                    self.replays += 1;
+                }
+                plan
+            }
+            None => {
+                let plan = if shared_runs(image.segments, target.segments, window, scratch) {
+                    let (lo, hi) = scratch.runs.iter().fold((u64::MAX, 0), |(lo, hi), r| {
+                        (lo.min(r.at), hi.max(r.at + r.size))
+                    });
+                    Plan::Span(lo, hi)
+                } else {
+                    Plan::Unplaced
+                };
+                if self.make_room(0) {
+                    self.plans.insert(key, plan);
+                }
+                plan
+            }
+        };
+        match plan {
+            Plan::Span(lo, hi) => Some((lo, hi)),
+            _ => None,
+        }
+    }
+
+    /// Fills `scratch.runs` and `scratch.words` for a paint of `image` in `direction`
+    /// through the guest bytes buffer holding the offsets `window` of `target`, as
+    /// [`shared_runs`] and [`run_words`] do.
+    fn paint(
+        &mut self,
+        scratch: &mut RunScratch,
+        image: Planned<'_>,
+        target: Planned<'_>,
+        window: (u64, u64),
+        direction: Direction,
+    ) {
+        let key = PlanKey {
+            image: image.serial,
+            target: target.serial,
+            levels: image.levels,
+            window,
+            kind: PlanKind::Paint(direction),
+        };
+        if let Some(&Plan::Runs(start, end)) = self.plans.get(&key) {
+            #[cfg(test)]
+            {
+                self.replays += 1;
+            }
+            scratch.runs.clear();
+            scratch
+                .runs
+                .extend(
+                    self.runs[start as usize..end as usize]
+                        .iter()
+                        .map(|&[from, size, at]| Run {
+                            from: from.into(),
+                            size: size.into(),
+                            at: at.into(),
+                        }),
+                );
+            fill_words(scratch);
+            return;
+        }
+        let placed = shared_runs(image.segments, target.segments, window, scratch);
+        debug_assert!(placed, "checked by sync_on_gpu");
+        run_words(scratch, direction, |lo, hi, out| {
+            moved_bytes(image.info, image.levels, lo, hi, out)
+        });
+        let runs = &scratch.runs;
+        if runs.len() > MAX_PLANNED_RUNS / 4 || !self.make_room(runs.len()) {
+            return;
+        }
+        let start = self.runs.len() as u32;
+        self.runs.extend(
+            runs.iter()
+                .map(|r| [r.from as u32, r.size as u32, r.at as u32]),
+        );
+        self.plans
+            .insert(key, Plan::Runs(start, self.runs.len() as u32));
+    }
+
+    /// Readies room for a plan of `runs` runs, forgetting every plan when the plans or the
+    /// runs are full. False when plans aren't kept.
+    fn make_room(&mut self, runs: usize) -> bool {
+        #[cfg(test)]
+        if self.off {
+            return false;
+        }
+        if self.runs.capacity() == 0 {
+            self.plans.reserve(MAX_PLANS);
+            self.runs.reserve_exact(MAX_PLANNED_RUNS);
+        }
+        if self.plans.len() == MAX_PLANS || self.runs.len() + runs > MAX_PLANNED_RUNS {
+            self.plans.clear();
+            self.runs.clear();
+        }
+        true
+    }
 }
 
 /// Bytes of the linear or stencil buffer one batch of moves fills at most, unless a single
@@ -610,6 +820,7 @@ impl GuestSync {
             linear: linear_slot,
             stencil: stencil_slot,
             runs: runs_slot,
+            set: set_slot,
             batch,
             ..
         } = self;
@@ -678,7 +889,6 @@ impl GuestSync {
             }
         }
         memory_barrier(device, cmd, COPIES, DISPATCHES);
-        let set = descriptors.allocate(tx.scheduler, compute.set_layout)?;
         let limit = u64::from(device.properties.limits.max_storage_buffer_range);
         let bound = |buffer: &Option<Buffer>| {
             let buffer = buffer.as_ref().expect("ensured");
@@ -688,15 +898,22 @@ impl GuestSync {
                 range: buffer.size().min(limit),
             }
         };
-        compute.write_set(
-            set,
-            &[
-                bound(guest),
-                bound(linear_slot),
-                bound(stencil_slot),
-                bound(runs_slot),
-            ],
-        );
+        let buffers = [
+            bound(guest),
+            bound(linear_slot),
+            bound(stencil_slot),
+            bound(runs_slot),
+        ];
+        let tick = tx.scheduler.tick();
+        let set = match *set_slot {
+            Some((set, at, bound)) if at == tick && bound == buffers.map(|b| b.buffer) => set,
+            _ => {
+                let set = descriptors.allocate(tx.scheduler, compute.set_layout)?;
+                compute.write_set(set, &buffers);
+                *set_slot = Some((set, tick, buffers.map(|b| b.buffer)));
+                set
+            }
+        };
         compute.bind(cmd, set);
         for m in moves.iter() {
             compute.dispatch_bound(cmd, bytemuck::bytes_of(&m.params), m.groups);
@@ -804,6 +1021,10 @@ impl TextureCache {
         if self.guest_sync.is_none() {
             self.guest_sync = Some(GuestSync::new(&self.device)?);
         }
+        #[cfg(test)]
+        {
+            self.guest_sync.as_mut().expect("just created").plans.off = !self.replay_plans;
+        }
         let Self {
             slots, guest_sync, ..
         } = self;
@@ -813,22 +1034,25 @@ impl TextureCache {
                 .as_ref()
                 .expect("a live image id")
         };
-        let scratch = &mut guest_sync.as_mut().expect("just created").scratch;
+        let GuestSync { scratch, plans, .. } = guest_sync.as_mut().expect("just created");
         let image = live(id);
         let whole = (0, image.info.size_bytes());
-        if !shared_runs(&image.segments, &image.segments, whole, scratch) {
+        if plans
+            .span(scratch, Planned::of(image), Planned::of(image), whole)
+            .is_none()
+        {
             return Ok(false);
         }
         let mut window = whole;
         if packing(image).is_some_and(|p| !p.stencil()) {
             window = (u64::MAX, 0);
             for &o in newer.iter() {
-                if !shared_runs(&live(o).segments, &image.segments, whole, scratch) {
+                let Some(span) =
+                    plans.span(scratch, Planned::of(live(o)), Planned::of(image), whole)
+                else {
                     return Ok(false);
-                }
-                for r in &scratch.runs {
-                    window = (window.0.min(r.at), window.1.max(r.at + r.size));
-                }
+                };
+                window = (window.0.min(span.0), window.1.max(span.1));
             }
         }
         if window.0 >= window.1 {
@@ -933,13 +1157,13 @@ impl TextureCache {
                 .image
                 .as_ref()
                 .expect("a live image id");
-            let info = image.info;
-            let levels = info.levels.min(image.image.desc().mip_levels);
-            let placed = shared_runs(&image.segments, &target.segments, window, &mut sync.scratch);
-            debug_assert!(placed, "checked by sync_on_gpu");
-            run_words(&mut sync.scratch, direction, |lo, hi, out| {
-                moved_bytes(&info, levels, lo, hi, out)
-            });
+            sync.plans.paint(
+                &mut sync.scratch,
+                Planned::of(image),
+                Planned::of(target),
+                window,
+                direction,
+            );
         }
         if direction == Direction::FromGuest || sync.batch.clashes(&sync.scratch.runs) {
             sync.flush(&device, tx, cmd)?;
@@ -1822,6 +2046,27 @@ mod tests {
             }
             calls
         }
+
+        /// Plans every paint of the sync through `plans`, the image as serial 1 and the newer
+        /// images as serials 2 on.
+        fn replay(&self, plans: &mut Plans, scratch: &mut RunScratch) {
+            let target = planned(&self.image, 1);
+            for (k, (image, direction)) in self.paints().enumerate() {
+                let serial = if std::ptr::eq(image, &self.image) {
+                    1
+                } else {
+                    k as u64 + 1
+                };
+                plans.paint(
+                    scratch,
+                    planned(image, serial),
+                    target,
+                    self.window,
+                    direction,
+                );
+                std::hint::black_box(&scratch.words);
+            }
+        }
     }
 
     /// A 128x128 B10G11R11Float cube or cube array of 8 levels in Switch 2 GOBs, block height
@@ -2005,6 +2250,103 @@ mod tests {
         assert!(trimmed > 0, "some paint trims aliased runs");
     }
 
+    fn planned(layout: &Layout, serial: u64) -> Planned<'_> {
+        Planned {
+            serial,
+            info: &layout.info,
+            levels: layout.info.levels,
+            segments: &layout.segments,
+        }
+    }
+
+    #[test]
+    fn replayed_plans_match_planning_and_stay_bounded() {
+        let syncs = odd_syncs();
+        let mut plans = Plans::default();
+        let (mut ours, mut theirs) = (RunScratch::default(), RunScratch::default());
+        for round in 0..2 {
+            let replays = plans.replays;
+            let mut lookups = 0;
+            for (i, sync) in syncs.iter().enumerate() {
+                let serial = |k: usize| (i * 16 + k + 1) as u64;
+                let target = planned(&sync.image, serial(0));
+                let whole = (0, sync.image.info.size_bytes());
+                for (k, o) in sync.newer.iter().enumerate() {
+                    let span = plans.span(&mut ours, planned(o, serial(k + 1)), target, whole);
+                    assert!(reference::shared_runs(
+                        &o.segments,
+                        &sync.image.segments,
+                        whole,
+                        &mut theirs
+                    ));
+                    let expected = theirs.runs.iter().fold((u64::MAX, 0), |(lo, hi), r| {
+                        (lo.min(r.at), hi.max(r.at + r.size))
+                    });
+                    assert_eq!(span, Some(expected), "sync {i} round {round}");
+                    lookups += 1;
+                }
+                let paints = std::iter::once((&sync.image, serial(0), Direction::ToGuest))
+                    .chain(
+                        sync.newer
+                            .iter()
+                            .enumerate()
+                            .map(|(k, o)| (o, serial(k + 1), Direction::ToGuest)),
+                    )
+                    .chain(std::iter::once((
+                        &sync.image,
+                        serial(0),
+                        Direction::FromGuest,
+                    )));
+                for (image, serial, direction) in paints {
+                    plans.paint(
+                        &mut ours,
+                        planned(image, serial),
+                        target,
+                        sync.window,
+                        direction,
+                    );
+                    assert!(Reference::plan(
+                        image,
+                        &sync.image,
+                        sync.window,
+                        direction,
+                        &mut theirs,
+                        &mut 0
+                    ));
+                    assert_eq!(ours.runs, theirs.runs, "sync {i} round {round}");
+                    assert_eq!(ours.words, theirs.words, "sync {i} round {round}");
+                    lookups += 1;
+                }
+            }
+            let replayed = plans.replays - replays;
+            assert_eq!(replayed, if round == 0 { 0 } else { lookups });
+        }
+        let capacity = (plans.plans.capacity(), plans.runs.capacity());
+        assert_eq!(capacity.1, MAX_PLANNED_RUNS);
+        let sync = &syncs[2];
+        for serial in 1000..1000 + 4 * MAX_PLANS as u64 {
+            let image = &sync.newer[serial as usize % sync.newer.len()];
+            plans.paint(
+                &mut ours,
+                planned(image, serial),
+                planned(&sync.image, 1),
+                sync.window,
+                Direction::ToGuest,
+            );
+            assert!(plans.plans.len() <= MAX_PLANS && plans.runs.len() <= MAX_PLANNED_RUNS);
+        }
+        assert_eq!(
+            (plans.plans.capacity(), plans.runs.capacity()),
+            capacity,
+            "full plans are forgotten, not grown"
+        );
+        assert_eq!(
+            size_of::<(PlanKey, Plan)>(),
+            64,
+            "the bucket size Plans counts"
+        );
+    }
+
     /// Median nanoseconds of `batch` calls of `f` over 101 samples.
     fn median_ns(batch: u32, mut f: impl FnMut()) -> f64 {
         let mut samples: Vec<f64> = (0..101)
@@ -2076,9 +2418,12 @@ mod tests {
             let current = median_ns(200, || {
                 sync.plan::<Current>(&mut scratch);
             });
+            let mut plans = Plans::default();
+            let replayed = median_ns(2000, || sync.replay(&mut plans, &mut scratch));
             println!(
                 "{name}: window {:#x}..{:#x}, runs per paint {runs:?}, \
-                     moved_bytes calls {} -> {}, per sync {reference:.0} ns -> {current:.0} ns",
+                     moved_bytes calls {} -> {}, per sync {reference:.0} ns -> {current:.0} ns, \
+                     replayed {replayed:.0} ns",
                 sync.window.0, sync.window.1, calls.0, calls.1
             );
         }

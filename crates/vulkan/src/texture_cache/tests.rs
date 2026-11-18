@@ -49,23 +49,37 @@ fn fixture_with_dram(
             return None;
         }
     };
-    let physical = Arc::new(PhysicalMemory::new(dram).unwrap());
-    physical.commit(0, dram).unwrap();
-    let memory = Arc::new(DeviceAddressSpace::new(physical, 36));
-    memory.map(DADDR, 0, dram);
-    let gmmu = Gmmu::new(memory.clone(), BigPageSize::Size64K);
-    gmmu.map(GPU_VA, DADDR, dram, 0, false).unwrap();
-    let written = Arc::new(GpuWrittenPages::new(36));
-    let lazy = Arc::new(lichii_gpu::lazy::LazyDeviceRanges::new(memory.clone()));
-    Some(Fixture {
-        scheduler: Scheduler::new(&device).unwrap(),
-        staging: StagingRing::new(&device, 32 << 20, RING_OVERSIZED_CAP).unwrap(),
-        buffers: BufferCache::new(&device, memory.clone(), written.clone(), lazy.clone()).unwrap(),
-        cache: TextureCache::new(&device, written, lazy, gob, recompression),
-        device,
-        memory,
-        gmmu,
-    })
+    Some(Fixture::on(device, gob, recompression, dram))
+}
+
+impl Fixture {
+    /// A fixture of its own guest memory and caches on `device`, beside others on it: a
+    /// process holds one instance at a time.
+    fn on(
+        device: Arc<Device>,
+        gob: GobLayout,
+        recompression: AstcRecompression,
+        dram: u64,
+    ) -> Self {
+        let physical = Arc::new(PhysicalMemory::new(dram).unwrap());
+        physical.commit(0, dram).unwrap();
+        let memory = Arc::new(DeviceAddressSpace::new(physical, 36));
+        memory.map(DADDR, 0, dram);
+        let gmmu = Gmmu::new(memory.clone(), BigPageSize::Size64K);
+        gmmu.map(GPU_VA, DADDR, dram, 0, false).unwrap();
+        let written = Arc::new(GpuWrittenPages::new(36));
+        let lazy = Arc::new(lichii_gpu::lazy::LazyDeviceRanges::new(memory.clone()));
+        Fixture {
+            scheduler: Scheduler::new(&device).unwrap(),
+            staging: StagingRing::new(&device, 32 << 20, RING_OVERSIZED_CAP).unwrap(),
+            buffers: BufferCache::new(&device, memory.clone(), written.clone(), lazy.clone())
+                .unwrap(),
+            cache: TextureCache::new(&device, written, lazy, gob, recompression),
+            device,
+            memory,
+            gmmu,
+        }
+    }
 }
 
 impl Fixture {
@@ -1374,6 +1388,376 @@ fn measures_upload_and_lookup_cost() {
     );
     assert!(f.read_image(id)[0] == data[0]);
     f.assert_no_validation_errors();
+}
+
+/// A texture header of `format` whose components are all floats.
+fn float_tic(
+    format: u32,
+    gpu_va: GpuVAddr,
+    width: u32,
+    height: u32,
+    levels: u32,
+    block_height_log2: u32,
+) -> TicEntry {
+    let mut header = tic(format, gpu_va, width, height, 1, levels, block_height_log2);
+    header.0[0] = (header.0[0] & !(0xfff << 7)) | 7 << 7 | 7 << 10 | 7 << 13 | 7 << 16;
+    header
+}
+
+/// Median nanoseconds of the CPU work of sampling `header` right after the GPU wrote
+/// `target`, which shares its bytes on another grid or format: one GPU overlap sync each.
+fn median_sync_ns(f: &mut Fixture, target: ImageId, header: &TicEntry) -> f64 {
+    let (id, _) = f.texture(header);
+    assert_ne!(id, target);
+    f.scheduler.finish().unwrap();
+    let mut samples = Vec::with_capacity(512);
+    for round in 0..512 {
+        f.cache.mark_modified(target);
+        let syncs = f.cache.traffic().gpu_syncs;
+        let start = Instant::now();
+        let (same, _) = f.texture(header);
+        samples.push(start.elapsed().as_nanos() as f64);
+        assert_eq!(same, id);
+        assert_eq!(
+            f.cache.traffic().gpu_syncs,
+            syncs + 1,
+            "one GPU sync per sample"
+        );
+        if round % 16 == 15 {
+            f.scheduler.finish().unwrap();
+        }
+    }
+    f.scheduler.finish().unwrap();
+    samples.sort_by(f64::total_cmp);
+    samples[samples.len() / 2]
+}
+
+/// Times the CPU cost of one GPU overlap sync of a sampled texture from a render target of
+/// another format, as Mario Kart World re-reads its targets, and of a mip chain whose base
+/// level a target of another format wrote: `cargo test --release -p lichii-vulkan --lib
+/// overlap_sync_timing -- --ignored --nocapture`.
+#[test]
+#[ignore = "timing"]
+fn overlap_sync_timing() {
+    let gob = GobLayout::Switch2;
+    let Some(mut f) = fixture(gob, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let swapped = GPU_VA + (1 << 30);
+    for page in 0..0x80u64 {
+        f.gmmu
+            .map(
+                swapped + page * 0x1_0000,
+                DADDR + 0x100_0000 + (page ^ 1) * 0x1_0000,
+                0x1_0000,
+                0,
+                false,
+            )
+            .unwrap();
+    }
+    let float_target = |w: u32, h: u32| {
+        let mut info = rt_info(w, h, 4, gob);
+        info.format = PixelFormat::R16G16B16A16Float;
+        info.layer_stride = surface(info.format, w, h, 1, 1, 4, gob).layer_stride();
+        info
+    };
+    let mut cases = Vec::new();
+    for (name, va) in [("contiguous", GPU_VA), ("64 KiB pages swapped", swapped)] {
+        let target = clear_rt_at(
+            &mut f,
+            va,
+            &rt_info(1280, 720, 4, gob),
+            [0.0, 1.0, 0.0, 1.0],
+            Rect::ALL,
+        );
+        let header = float_tic(0x03, va, 640, 720, 1, 4);
+        let segments = f.cache.get(target.id).unwrap().segments.len();
+        let ns = median_sync_ns(&mut f, target.id, &header);
+        cases.push(format!(
+            "1280x720 A8B8G8R8 target sampled as 640x720 R16G16B16A16Float, {name} \
+             ({segments} segments): {ns:.0} ns"
+        ));
+    }
+    let va = GPU_VA + 0x80_0000;
+    let target = clear_rt_at(
+        &mut f,
+        va,
+        &float_target(512, 512),
+        [0.0, 0.0, 1.0, 1.0],
+        Rect::ALL,
+    );
+    let header = tic(0x08, va, 1024, 512, 1, 11, 4);
+    let ns = median_sync_ns(&mut f, target.id, &header);
+    cases.push(format!(
+        "512x512 R16G16B16A16Float target at the base of a 1024x512 A8B8G8R8 chain of 11 \
+         levels: {ns:.0} ns"
+    ));
+    for case in cases {
+        println!("{case}");
+    }
+    f.assert_no_validation_errors();
+}
+
+/// The state of a live image that GPU overlap syncs read or change, as text.
+fn sync_state(cache: &TextureCache, id: ImageId) -> String {
+    let i = cache.get(id).unwrap();
+    format!(
+        "{:?} {:?} {:?} {:?} gpu_modified {} cpu_dirty {} whole {} {:?} modified {} written {} \
+         current {} newest {} {} keep_out {:?} overlaps {:?} aliases {:?} segments {:?}",
+        i.info,
+        i.host.format,
+        i.scale,
+        i.access,
+        i.gpu_modified,
+        i.cpu_dirty,
+        i.dirty_whole,
+        i.dirty_subresources,
+        i.modified,
+        i.written,
+        i.current,
+        i.overlaps_newest,
+        i.aliases_newest,
+        i.keep_out,
+        i.overlaps,
+        i.aliases,
+        i.segments,
+    )
+}
+
+fn live_ids(cache: &TextureCache) -> Vec<ImageId> {
+    (0..cache.slots.len() as u32)
+        .filter_map(|index| {
+            let slot = &cache.slots[index as usize];
+            slot.image.as_ref().map(|_| ImageId {
+                index,
+                generation: slot.generation,
+            })
+        })
+        .collect()
+}
+
+/// A render target or texture header some GPU overlap syncs move texels between.
+#[derive(Clone, Copy)]
+enum SyncSpec {
+    Target(GpuVAddr, ImageInfo),
+    Texture(TicEntry),
+}
+
+/// One step of [`replayed_sync_plans_match_planning_every_sync`], applied to one fixture.
+#[derive(Clone, Copy, Debug)]
+enum SyncStep {
+    Use(usize),
+    Draw(usize, [f32; 4], Rect),
+    CpuWrite(DAddr, u8),
+    Remove(usize),
+    Remap(u64, DAddr, usize),
+}
+
+/// Pages of the window whose images can move to other pages: 4 KiB pages at
+/// `REMAP_VA`, page `REMAP_HOLE` sparse until a remap backs it.
+const REMAP_VA: GpuVAddr = GPU_VA + (1 << 30);
+const REMAP_DADDR: DAddr = DADDR + 0x80_0000;
+const REMAP_PAGES: u64 = 32;
+const REMAP_HOLE: u64 = 5;
+
+fn sync_specs(gob: GobLayout) -> Vec<SyncSpec> {
+    let target = |va, format, w, h, bh| {
+        let mut info = rt_info(w, h, bh, gob);
+        info.format = format;
+        info.layer_stride = surface(format, w, h, 1, 1, bh, gob).layer_stride();
+        SyncSpec::Target(va, info)
+    };
+    let mut specs = Vec::new();
+    for va in [GPU_VA, REMAP_VA] {
+        specs.extend([
+            target(va, PixelFormat::A8B8G8R8Unorm, 128, 64, 3),
+            target(va, PixelFormat::R16G16B16A16Float, 64, 64, 3),
+            target(va + 0x4000, PixelFormat::A8B8G8R8Unorm, 64, 32, 2),
+            target(va + 0x2000, PixelFormat::R32Float, 128, 32, 2),
+            SyncSpec::Texture(tic(0x08, va, 128, 64, 1, 1, 3)),
+            SyncSpec::Texture(tic(0x08, va, 64, 64, 1, 3, 3)),
+            SyncSpec::Texture(float_tic(0x03, va + 0x4000, 64, 32, 1, 2)),
+            SyncSpec::Texture(float_tic(0x0f, va, 256, 64, 1, 3)),
+            SyncSpec::Texture(tic(0x08, va + 0x2000, 64, 64, 2, 1, 3)),
+            SyncSpec::Texture(float_tic(0x21, va, 128, 128, 2, 4)),
+        ]);
+    }
+    specs
+}
+
+impl Fixture {
+    fn sync_step(&mut self, specs: &[SyncSpec], step: SyncStep) {
+        let use_spec = |f: &mut Fixture, spec: SyncSpec, rect: Rect, color: [f32; 4]| {
+            let (mut tx, cache, gmmu) = f.tx();
+            match spec {
+                SyncSpec::Texture(header) => {
+                    let desc = header.decode().unwrap();
+                    cache.texture(&mut tx, gmmu, &desc, Usage::Sample).unwrap();
+                }
+                SyncSpec::Target(va, info) => {
+                    let Some(target) = cache
+                        .render_target(&mut tx, gmmu, va, &info, rect == Rect::ALL)
+                        .unwrap()
+                    else {
+                        return;
+                    };
+                    let value = ClearValue::Color {
+                        value: vk::ClearColorValue { float32: color },
+                        mask: vk::ColorComponentFlags::RGBA,
+                    };
+                    cache.clear(&mut tx, target, value, rect, 0, 1).unwrap();
+                }
+            }
+        };
+        match step {
+            SyncStep::Use(i) => use_spec(self, specs[i], Rect::ALL, [0.0; 4]),
+            SyncStep::Draw(i, color, rect) => use_spec(self, specs[i], rect, color),
+            SyncStep::CpuWrite(daddr, byte) => {
+                self.memory.write_bytes(daddr, &[byte; 64]).unwrap();
+                let (mut tx, cache, _) = self.tx();
+                cache.invalidate(&mut tx, daddr, 64).unwrap();
+            }
+            SyncStep::Remove(pick) => {
+                let ids = live_ids(&self.cache);
+                if !ids.is_empty() {
+                    let (tx, cache, _) = self.tx();
+                    cache.remove(tx.scheduler, ids[pick % ids.len()]);
+                }
+            }
+            SyncStep::Remap(page, daddr, i) => {
+                self.gmmu
+                    .map(REMAP_VA + page * 0x1000, daddr, 0x1000, 0, false)
+                    .unwrap();
+                self.cache.invalidate_lookups();
+                use_spec(self, specs[i], Rect::ALL, [0.0; 4]);
+            }
+        }
+    }
+}
+
+/// Drives seeded sequences of creates, draws, samples, CPU writes, removals and remaps over
+/// aliasing images of several formats, grids, levels and layers through a cache that replays
+/// GPU overlap sync plans and one that plans every sync, and checks after every step that
+/// both hold the same guest bytes, texels, image state and traffic.
+#[test]
+fn replayed_sync_plans_match_planning_every_sync() {
+    let mut replays = 0;
+    for seed in 1..=8u64 {
+        let gob = if seed % 2 == 0 {
+            GobLayout::Tegra
+        } else {
+            GobLayout::Switch2
+        };
+        let Some(mut replayed) = fixture(gob, AstcRecompression::Uncompressed) else {
+            return;
+        };
+        let mut planned = Fixture::on(
+            replayed.device.clone(),
+            gob,
+            AstcRecompression::Uncompressed,
+            DRAM,
+        );
+        planned.cache.replay_plans = false;
+        let specs = sync_specs(gob);
+        let seeded: Vec<u8> = pattern(0x20_000, seed as u32);
+        for f in [&mut replayed, &mut planned] {
+            f.memory.write_bytes(DADDR, &seeded).unwrap();
+            f.memory.write_bytes(REMAP_DADDR, &seeded).unwrap();
+            f.gmmu
+                .map_sparse(REMAP_VA, REMAP_PAGES * 0x1000, false)
+                .unwrap();
+            for page in (0..REMAP_PAGES).filter(|&p| p != REMAP_HOLE) {
+                f.gmmu
+                    .map(
+                        REMAP_VA + page * 0x1000,
+                        REMAP_DADDR + page * 0x1000,
+                        0x1000,
+                        0,
+                        false,
+                    )
+                    .unwrap();
+            }
+        }
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        let remap_specs: Vec<usize> = (0..specs.len())
+            .filter(|&i| match specs[i] {
+                SyncSpec::Target(va, _) => va == REMAP_VA,
+                SyncSpec::Texture(header) => header.decode().unwrap().address == REMAP_VA,
+            })
+            .collect();
+        for round in 0..300 {
+            let step = match next(100) {
+                0..40 => SyncStep::Use(next(specs.len() as u64) as usize),
+                40..70 => {
+                    let i = next(specs.len() as u64) as usize;
+                    let color = [next(256), next(256), next(256)].map(|c| c as f32 / 255.0);
+                    let rect = match (next(2), specs[i]) {
+                        (1, SyncSpec::Target(_, info)) => Rect {
+                            x: next(u64::from(info.width / 2)) as u32,
+                            y: next(u64::from(info.height / 2)) as u32,
+                            width: info.width / 2,
+                            height: info.height / 2,
+                        },
+                        _ => Rect::ALL,
+                    };
+                    SyncStep::Draw(i, [color[0], color[1], color[2], 1.0], rect)
+                }
+                70..78 => {
+                    let base = if next(2) == 0 { DADDR } else { REMAP_DADDR };
+                    SyncStep::CpuWrite(base + next(0x1_0000) / 4 * 4, next(256) as u8)
+                }
+                78..86 => SyncStep::Remove(next(64) as usize),
+                _ => SyncStep::Remap(
+                    next(REMAP_PAGES / 2),
+                    REMAP_DADDR + next(REMAP_PAGES) * 0x1000,
+                    remap_specs[next(remap_specs.len() as u64) as usize],
+                ),
+            };
+            replayed.sync_step(&specs, step);
+            planned.sync_step(&specs, step);
+            let context = format!("seed {seed} round {round} after {step:?}");
+            let ids = live_ids(&replayed.cache);
+            assert_eq!(ids, live_ids(&planned.cache), "{context}");
+            assert_eq!(
+                replayed.cache.traffic(),
+                planned.cache.traffic(),
+                "{context}"
+            );
+            for &id in &ids {
+                assert_eq!(
+                    sync_state(&replayed.cache, id),
+                    sync_state(&planned.cache, id),
+                    "{context}: {id:?}"
+                );
+                assert!(
+                    replayed.read_image(id) == planned.read_image(id),
+                    "{context}: texels of {id:?}"
+                );
+            }
+            for base in [DADDR, REMAP_DADDR] {
+                let (mut a, mut b) = (vec![0; 0x2_0000], vec![0; 0x2_0000]);
+                replayed.memory.read_bytes(base, &mut a).unwrap();
+                planned.memory.read_bytes(base, &mut b).unwrap();
+                assert!(a == b, "{context}: guest bytes at {base:#x}");
+            }
+        }
+        let plans = |f: &Fixture| f.cache.guest_sync.as_ref().map_or(0, |s| s.plan_replays());
+        assert_eq!(plans(&planned), 0);
+        replays += plans(&replayed);
+        assert!(
+            planned.cache.traffic().gpu_syncs > 0,
+            "seed {seed} syncs on the GPU"
+        );
+        replayed.assert_no_validation_errors();
+        planned.assert_no_validation_errors();
+    }
+    assert!(replays > 0, "some syncs replayed their plans");
 }
 
 const HUGE_BUDGET: u64 = 1 << 40;

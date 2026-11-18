@@ -375,6 +375,9 @@ struct CachedImage {
     /// The GPU address of an image over sparse pages, which a later mapping may back: a lookup
     /// there takes this image and its new pages.
     sparse_va: Option<GpuVAddr>,
+    /// Names the image and its segments: no other image or remap has it, so GPU overlap syncs
+    /// replay run plans keyed by it.
+    serial: u64,
 }
 
 /// A live image that shares a rectangle of texels with another, at level 0 of layer 0:
@@ -733,6 +736,11 @@ pub struct TextureCache {
     removals: u64,
     /// Images created so far; a cached miss is only good until the next one.
     creations: u64,
+    /// Serials handed to images so far, at creation and remap.
+    serials: u64,
+    /// Whether GPU overlap syncs replay their run plans; false plans every sync afresh.
+    #[cfg(test)]
+    replay_plans: bool,
     /// Host images replaced by a rescale, and resolution scale changes, so far.
     replacements: u64,
     /// Times the address lookups were forgotten so far.
@@ -1206,6 +1214,9 @@ impl TextureCache {
                 .clamp(TRIM_TO_MIN, TRIM_TO_MAX),
             #[cfg(test)]
             allocation_cap: u64::MAX,
+            serials: 0,
+            #[cfg(test)]
+            replay_plans: true,
             keep: Vec::new(),
             segments: Vec::new(),
             scratch: Scratch::default(),
@@ -2918,6 +2929,7 @@ impl TextureCache {
             keep_out: Vec::new(),
             trim,
             sparse_va,
+            serial: self.next_serial(),
         };
         let index = match self.free.pop() {
             Some(index) => index,
@@ -2958,11 +2970,17 @@ impl TextureCache {
         let segments = self.segments.clone();
         let old = std::mem::replace(&mut self.image(id).segments, segments.clone());
         self.image(id).self_aliased = self_aliased(&segments);
+        self.image(id).serial = self.next_serial();
         self.unindex_pages(id, &old);
         self.index_pages(id, &segments);
         let image = self.image(id);
         image.tracked.clear();
         remapped_bytes(&old, &segments, |lo, hi| image.mark_bytes_dirty(lo, hi));
+    }
+
+    fn next_serial(&mut self) -> u64 {
+        self.serials += 1;
+        self.serials
     }
 
     fn remove(&mut self, scheduler: &mut Scheduler, id: ImageId) {
