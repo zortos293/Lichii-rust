@@ -53,7 +53,9 @@ use lichii_gpu::gmmu::{Gmmu, RangeTarget};
 use lichii_gpu::lazy::LazyDeviceRanges;
 use lichii_memory::{CachedPages, DeviceAddressSpace};
 use lichii_texture::PixelFormat;
-use lichii_texture::block_linear::{GobLayout, Tiling, swizzle, unswizzle};
+use lichii_texture::block_linear::{
+    GOB_HEIGHT, GOB_SIZE, GOB_WIDTH, GobLayout, Tiling, swizzle, unswizzle,
+};
 use lichii_texture::tic::{SwizzleSource, TextureDescriptor};
 
 pub use blit::{BlitSide, NearestSampling};
@@ -677,7 +679,21 @@ struct Slot {
     next: u32,
 }
 
-/// Scratch memory kept between calls, so steady-state uploads and downloads allocate nothing.
+/// The most bytes each of [`Scratch`]'s three host copies of texels (`tiled`, `linear` and
+/// `convert`) holds: 4 MiB, so 12 MiB together at most.
+const SCRATCH_MAX: u64 = 4 << 20;
+
+/// Scratch memory kept between calls, so steady-state uploads and write-backs allocate nothing.
+///
+/// Its host copies of texels never pass [`SCRATCH_MAX`] (4 MiB) each, 12 MiB together, and a
+/// subresource untiled on the CPU without a conversion takes only `tiled`. Uploads and
+/// write-backs cut every subresource they untile, tile or convert on the CPU into bands
+/// ([`push_bands`]) whose guest GOBs (`tiled`, [`read_band`]), deswizzled texels (`linear`,
+/// for conversions only) and intermediate texels (`convert`: conversion texels on upload,
+/// depth and stencil planes on write-back) each fit it, so neither the subresource's size nor
+/// the staging bound sizes them. Should one GOB row of a band still need more (only ASTC with
+/// blocks 10 or 12 rows tall recompressed to BC from past 10922 texels wide could), that copy is
+/// freed after the call ([`Scratch::trim`]).
 #[derive(Default)]
 struct Scratch {
     tiled: Vec<u8>,
@@ -687,11 +703,47 @@ struct Scratch {
     astc_levels: Vec<astc::AstcLevel>,
     unswizzles: Vec<unswizzle::UnswizzleLevel>,
     pieces: Vec<UploadPiece>,
+    /// The most bytes held at the end of a call since [`TextureCache::take_scratch_peak`].
+    peak: u64,
+}
+
+impl Scratch {
+    /// Host bytes the Vecs hold.
+    fn bytes(&self) -> u64 {
+        let bytes = |len: usize, size: usize| (len * size) as u64;
+        bytes(self.tiled.capacity(), 1)
+            + bytes(self.linear.capacity(), 1)
+            + bytes(self.convert.capacity(), 1)
+            + bytes(self.regions.capacity(), size_of::<vk::BufferImageCopy>())
+            + bytes(self.astc_levels.capacity(), size_of::<astc::AstcLevel>())
+            + bytes(
+                self.unswizzles.capacity(),
+                size_of::<unswizzle::UnswizzleLevel>(),
+            )
+            + bytes(self.pieces.capacity(), size_of::<UploadPiece>())
+    }
+
+    /// Records the bytes held in `peak`, then frees each host copy of texels larger than `max`.
+    fn trim(&mut self, max: u64) {
+        self.peak = self.peak.max(self.bytes());
+        for copy in [&mut self.tiled, &mut self.linear, &mut self.convert] {
+            if copy.capacity() as u64 > max {
+                *copy = Vec::new();
+            }
+        }
+    }
+}
+
+/// Resizes `bytes` to `len`, growing its capacity to exactly `len` when it is short, so the
+/// scratch holds what its bands need rather than twice that.
+fn resize_exact(bytes: &mut Vec<u8>, len: usize) {
+    bytes.reserve_exact(len.saturating_sub(bytes.len()));
+    bytes.resize(len, 0);
 }
 
 /// One piece of an upload: a whole subresource, or a band of slices or block rows of one too
-/// large for a part slice ([`push_bands`]), with the bytes it stages and, for GPU untiling, the
-/// tiling its tiled bytes follow.
+/// large for a part slice or the scratch ([`push_bands`]), with the bytes it stages and, for GPU
+/// untiling, the tiling its tiled bytes follow. Write-backs cut their bands into these too.
 #[derive(Clone, Copy)]
 struct UploadPiece {
     layer: u32,
@@ -703,15 +755,18 @@ struct UploadPiece {
     tiling: Option<Tiling>,
 }
 
-/// Pushes bands of the subresource `piece`, untiled on the CPU, each staging at most `limit`
-/// bytes (`staged` of its extent): runs of whole slices when one slice fits, else runs of block
-/// rows of each slice, a multiple of four rows and of the guest block height so no guest or
-/// compressed host block straddles two bands.
+/// Pushes bands of the subresource `piece`, untiled or tiled on the CPU, as large as `fits` (of a
+/// band's origin and extent) allows: runs of whole slices when one slice fits, else runs of
+/// rows of each slice, down to one row of GOBs (`tiling`, for block-linear levels) or of four
+/// rows and the guest block height (pitch levels) even if that does not fit. Block-linear runs
+/// start on a block, slab or GOB boundary of their own size, as [`band_tiling`] needs, and no
+/// guest or compressed host block straddles two bands.
 fn push_bands(
     pieces: &mut Vec<UploadPiece>,
     piece: UploadPiece,
     format: PixelFormat,
-    limit: u64,
+    tiling: Option<Tiling>,
+    fits: impl Fn((u32, u32), (u32, u32, u32)) -> bool,
     staged: impl Fn((u32, u32, u32)) -> u64,
 ) {
     let (w, h, d) = piece.extent;
@@ -724,25 +779,131 @@ fn push_bands(
             ..piece
         })
     };
-    let slice = staged((w, h, 1)).max(1);
-    if slice <= limit {
-        let run = (limit / slice) as u32;
+    let (bh_log2, bd_log2) = tiling.map_or((0, 0), |t| (t.block_height_log2, t.block_depth_log2));
+    let slab = 1 << bd_log2;
+    let slab_runs = (1..=d.div_ceil(slab)).rev().map(|n| n * slab);
+    let short_runs = (0..bd_log2).rev().map(|k| 1 << k);
+    if let Some(run) = slab_runs
+        .chain(short_runs)
+        .find(|&run| fits((0, 0), (w, h, run.min(d))))
+    {
         for z in (0..d).step_by(run as usize) {
             push((0, z), (w, h, run.min(d - z)));
         }
         return;
     }
     let bh = format.block_height();
-    let granule = (1..=4)
-        .map(|k| k * bh)
-        .find(|r| r % 4 == 0)
-        .expect("4 * bh is one");
-    let rows = (limit / staged((w, granule, 1)).max(1)).max(1) as u32 * granule;
+    let row = match tiling {
+        Some(_) => GOB_HEIGHT * bh,
+        None => (1..=4)
+            .map(|k| k * bh)
+            .find(|r| r % 4 == 0)
+            .expect("4 * bh is one"),
+    };
+    let block = row << bh_log2;
+    let rows = (1..=h.div_ceil(block))
+        .rev()
+        .map(|n| n * block)
+        .chain((0..bh_log2).rev().map(|k| row << k))
+        .find(|&rows| fits((0, 0), (w, rows.min(h), 1)))
+        .unwrap_or(row);
     for z in 0..d {
         for y in (0..h).step_by(rows as usize) {
             push((y, z), (w, rows.min(h - y), 1));
         }
     }
+}
+
+/// The tiling [`read_band`] packs the GOBs of a band of `level` into: `rows` block rows and
+/// `slices` slices from block row `y` (a multiple of [`GOB_HEIGHT`]) and slice `z` on. The whole
+/// level keeps its own tiling. A band keeps blocks as tall and deep as the level's when its start
+/// and length allow, else blocks as tall (one slice deep) or as deep as its alignment, so each of
+/// its blocks is one run of the level's tiled bytes: whole level blocks, the slices of one level
+/// block, or the GOB rows of one slice of it.
+fn band_tiling(level: &Tiling, (y, z): (u32, u32), (rows, slices): (u32, u32)) -> Tiling {
+    let fit = |log2: u32, start: u32, len: u32, whole: u32| {
+        if start == 0 && len >= whole {
+            log2
+        } else {
+            log2.min(start.trailing_zeros()).min(len.ilog2())
+        }
+    };
+    let block_height_log2 = fit(
+        level.block_height_log2,
+        y / GOB_HEIGHT,
+        rows.div_ceil(GOB_HEIGHT),
+        level.height.div_ceil(GOB_HEIGHT),
+    );
+    let block_depth_log2 = if block_height_log2 < level.block_height_log2 {
+        0
+    } else {
+        fit(level.block_depth_log2, z, slices, level.depth)
+    };
+    Tiling {
+        height: rows,
+        depth: slices,
+        block_height_log2,
+        block_depth_log2,
+        ..*level
+    }
+}
+
+/// Calls `run` with every run of blocks of `band` ([`band_tiling`]), from block row `y` and
+/// slice `z` of `level`, that follow each other in both layouts: its offset in the level's
+/// tiled bytes, its offset in the band's and its length.
+fn band_runs(
+    level: &Tiling,
+    (y, z): (u32, u32),
+    band: &Tiling,
+    mut run: impl FnMut(usize, usize, usize),
+) {
+    let block = (GOB_SIZE as usize) << (band.block_height_log2 + band.block_depth_log2);
+    let mut pending = None;
+    for dz in (0..band.depth).step_by(1 << band.block_depth_log2) {
+        for gob_row in (0..band.height.div_ceil(GOB_HEIGHT)).step_by(1 << band.block_height_log2) {
+            let dy = gob_row * GOB_HEIGHT;
+            for x in (0..band.row_gobs).map(|gob| gob * GOB_WIDTH) {
+                let (src, dst) = (level.offset(x, y + dy, z + dz), band.offset(x, dy, dz));
+                pending = match pending {
+                    Some((s, d, len)) if s + len == src && d + len == dst => {
+                        Some((s, d, len + block))
+                    }
+                    Some((s, d, len)) => {
+                        run(s, d, len);
+                        Some((src, dst, block))
+                    }
+                    None => Some((src, dst, block)),
+                };
+            }
+        }
+    }
+    if let Some((s, d, len)) = pending {
+        run(s, d, len);
+    }
+}
+
+/// Reads the GOBs of `band` ([`band_tiling`]), from block row `y` and slice `z` of `level`, of
+/// subresource bytes `offset` on of `image` from guest memory into `tiled`, one read per run
+/// ([`band_runs`]).
+fn read_band(
+    memory: &DeviceAddressSpace,
+    lazy: &LazyDeviceRanges,
+    image: &CachedImage,
+    offset: u64,
+    (level, at): (&Tiling, (u32, u32)),
+    band: &Tiling,
+    tiled: &mut Vec<u8>,
+) {
+    resize_exact(tiled, band.size_bytes());
+    let sparse_astc = image.sparse_va.is_some() && image.info.format.is_astc();
+    band_runs(level, at, band, |src, dst, len| {
+        let out = &mut tiled[dst..dst + len];
+        let at = offset + src as u64;
+        read_guest(memory, lazy, &image.segments, at, out);
+        if sparse_astc {
+            fill_unmapped(&image.segments, at, out, &ASTC_TRANSPARENT_BLACK);
+        }
+    });
 }
 
 /// Host images for guest images. Owned by the rasterizer on the GPU thread.
@@ -763,6 +924,8 @@ pub struct TextureCache {
     piece_max: u64,
     /// Whether block-linear uploads untile on the GPU; false keeps them on the CPU.
     unswizzle_on_gpu: bool,
+    /// The most bytes [`Scratch`]'s host copies of texels hold: [`SCRATCH_MAX`].
+    scratch_max: u64,
     /// The GPU untiler, created by the first upload.
     untiler: Option<unswizzle::Unswizzler>,
     scale: ResolutionScale,
@@ -1025,52 +1188,6 @@ fn read_guest(
     out[(filled - offset) as usize..].fill(0);
 }
 
-/// Reads subresource `(layer, level)` of `image` from guest memory into `linear`, deswizzled
-/// (its [`convert::guest_level_bytes`]), through `tiled`.
-fn read_level(
-    memory: &DeviceAddressSpace,
-    lazy: &LazyDeviceRanges,
-    image: &CachedImage,
-    (layer, level): (u32, u32),
-    tiled: &mut Vec<u8>,
-    linear: &mut Vec<u8>,
-) {
-    let info = image.info;
-    let format = info.format;
-    let extent = info.level_extent(level);
-    let guest_offset = info.subresource_offset(level, layer);
-    let linear_len = convert::guest_level_bytes(format, extent);
-    linear.resize(linear_len, 0);
-    match info.layout {
-        GuestLayout::BlockLinear { .. } => {
-            let tiling = info.surface().level_tiling(level);
-            tiled.resize(tiling.size_bytes(), 0);
-            read_guest(memory, lazy, &image.segments, guest_offset, tiled);
-            if image.sparse_va.is_some() && format.is_astc() {
-                fill_unmapped(
-                    &image.segments,
-                    guest_offset,
-                    tiled,
-                    &ASTC_TRANSPARENT_BLACK,
-                );
-            }
-            unswizzle(&tiling, tiled, linear);
-        }
-        GuestLayout::Pitch { pitch } => {
-            let rows = extent.1.div_ceil(format.block_height()) as usize;
-            let row = linear_len / rows.max(1);
-            tiled.resize(pitch as usize * rows, 0);
-            read_guest(memory, lazy, &image.segments, guest_offset, tiled);
-            for (dst, src) in linear
-                .chunks_exact_mut(row)
-                .zip(tiled.chunks(pitch as usize))
-            {
-                dst.copy_from_slice(&src[..row]);
-            }
-        }
-    }
-}
-
 /// An ASTC void-extent block of transparent black: unmapped sparse pages of an ASTC image
 /// sample as zero, which all-zero bytes would decode as the error colour instead.
 const ASTC_TRANSPARENT_BLACK: [u8; 16] = [
@@ -1233,6 +1350,7 @@ impl TextureCache {
             astc_scratch: astc::SCRATCH_BYTES,
             piece_max: STAGING_REQUEST_MAX,
             unswizzle_on_gpu: true,
+            scratch_max: SCRATCH_MAX,
             untiler: None,
             scale: ResolutionScale::X1,
             slots: Vec::new(),
@@ -1341,6 +1459,19 @@ impl TextureCache {
             bytes: self.image_bytes,
             count: (self.slots.len() - self.free.len()) as u64,
         }
+    }
+
+    /// Host memory the upload and write-back scratch holds between calls ([`SCRATCH_MAX`] at
+    /// most for texels, plus small lists of copy regions and pieces).
+    pub fn scratch_bytes(&self) -> u64 {
+        self.scratch.bytes()
+    }
+
+    /// The most host memory the scratch held at the end of an upload or write-back since the
+    /// last call, then starts over from what it holds now.
+    pub fn take_scratch_peak(&mut self) -> u64 {
+        let held = self.scratch.bytes();
+        std::mem::replace(&mut self.scratch.peak, held)
     }
 
     pub fn traffic(&self) -> Traffic {
@@ -3509,9 +3640,10 @@ impl TextureCache {
     /// ([`StagingRing::part`]) in chunks of whole subresources up to [`PART_SLICE`], each untiled,
     /// decoded and copied before the next is staged, so each GPU untile or decode reads only its
     /// own chunk. A subresource that stages more than [`STAGING_REQUEST_MAX`] untiled on the GPU is
-    /// untiled on the CPU instead, and one that stages more even then is cut into bands of slices
-    /// or block rows. So any number of uploads of any size hold at most the two part slices of
-    /// host-visible memory: 16 MiB for subresources up to [`PART_SLICE`],
+    /// untiled on the CPU instead, and one untiled or converted on the CPU that stages more even
+    /// then, or whose host copies would pass [`SCRATCH_MAX`] ([`Scratch`]), is cut into bands
+    /// of slices or block rows. So any number of uploads of any size hold at most the two part
+    /// slices of host-visible memory: 16 MiB for subresources up to [`PART_SLICE`],
     /// `2 * STAGING_REQUEST_MAX` (128 MiB) at worst, back to 16 MiB once the tick that last used
     /// them completed.
     fn upload(&mut self, tx: &mut Transfer<'_>, id: ImageId) -> Result<()> {
@@ -3520,6 +3652,7 @@ impl TextureCache {
         let gpu_decode = self.astc_decode == AstcDecode::Gpu;
         let astc_scratch = self.astc_scratch;
         let piece_max = self.piece_max;
+        let scratch_max = self.scratch_max;
         if self.unswizzle_on_gpu && self.untiler.is_none() {
             match unswizzle::Unswizzler::new(&device) {
                 Ok(untiler) => self.untiler = Some(untiler),
@@ -3581,6 +3714,28 @@ impl TextureCache {
                 .tiling
                 .map_or(0, |t| (t.size_bytes() as u64).next_multiple_of(tiled_align))
         };
+        let level_tiling = |level| match info.layout {
+            GuestLayout::BlockLinear { .. } => Some(info.surface().level_tiling(level)),
+            GuestLayout::Pitch { .. } => None,
+        };
+        let bh = format.block_height();
+        let largest_copy = |tiling: Option<Tiling>, (y, z): (u32, u32), extent: (u32, u32, u32)| {
+            let rows = extent.1.div_ceil(bh);
+            let tiled = match (tiling, info.layout) {
+                (Some(level), _) => band_tiling(&level, (y / bh, z), (rows, extent.2)).size_bytes(),
+                (None, GuestLayout::Pitch { pitch }) => pitch as usize * rows as usize,
+                (None, GuestLayout::BlockLinear { .. }) => unreachable!("a level tiling"),
+            };
+            let (linear, converted) = match direct {
+                true => (0, 0),
+                false => (
+                    convert::guest_level_bytes(format, extent),
+                    convert::scratch_bytes(format, &host, extent),
+                ),
+            };
+            tiled.max(linear).max(converted) as u64
+        };
+        let band_max = piece_max - 2 * tiled_align;
         let pieces = &mut scratch.pieces;
         pieces.clear();
         for layer in 0..info.layers {
@@ -3598,16 +3753,26 @@ impl TextureCache {
                     tiling: untiled_on_gpu(level),
                 };
                 let whole = piece.size.next_multiple_of(align);
-                if need(whole, tiled_bytes(&piece)) <= piece_max {
+                if piece.tiling.is_some() && need(whole, tiled_bytes(&piece)) <= piece_max {
                     pieces.push(piece);
-                } else if need(whole, 0) <= piece_max {
-                    pieces.push(UploadPiece {
-                        tiling: None,
-                        ..piece
-                    });
-                } else {
-                    push_bands(pieces, piece, format, piece_max - 2 * tiled_align, staged);
+                    continue;
                 }
+                let piece = UploadPiece {
+                    tiling: None,
+                    ..piece
+                };
+                let tiling = level_tiling(level);
+                if need(whole, 0) <= piece_max
+                    && largest_copy(tiling, (0, 0), extent) <= scratch_max
+                {
+                    pieces.push(piece);
+                    continue;
+                }
+                let fits = |origin, extent| {
+                    staged(extent) <= band_max
+                        && largest_copy(tiling, origin, extent) <= scratch_max
+                };
+                push_bands(pieces, piece, format, tiling, fits, staged);
             }
         }
         if pieces.is_empty() {
@@ -3623,7 +3788,6 @@ impl TextureCache {
         traffic.upload_bytes += total;
         let single = tx.staging.shares_ring(need(total, tiled_total));
         let [main_aspect, stencil_aspect] = aspects_of(host.format);
-        let mut deswizzled = None;
         let mut first = 0;
         while first < scratch.pieces.len() {
             let (mut end, mut linear_total, mut tiled_total) = (first, 0, 0);
@@ -3657,8 +3821,6 @@ impl TextureCache {
                     extent,
                     ..
                 } = piece;
-                let level_extent = info.level_extent(level);
-                let banded = extent != level_extent;
                 let layout = convert::host_layout(format, &host, extent);
                 let size = piece.size as usize;
                 offset = offset.next_multiple_of(align as usize);
@@ -3685,58 +3847,59 @@ impl TextureCache {
                         });
                         tiled_offset += tiling.size_bytes().next_multiple_of(tiled_align as usize);
                     }
-                    GuestLayout::BlockLinear { .. } if direct && !banded => {
-                        let tiling = info.surface().level_tiling(level);
-                        scratch.tiled.resize(tiling.size_bytes(), 0);
-                        read_guest(
-                            tx.memory,
-                            lazy,
-                            &image.segments,
-                            guest_offset,
-                            &mut scratch.tiled,
-                        );
-                        if image.sparse_va.is_some() && format.is_astc() {
-                            fill_unmapped(
-                                &image.segments,
-                                guest_offset,
-                                &mut scratch.tiled,
-                                &ASTC_TRANSPARENT_BLACK,
-                            );
-                        }
-                        unswizzle(&tiling, &scratch.tiled, out);
-                    }
                     _ => {
-                        if deswizzled != Some((layer, level)) {
-                            read_level(
-                                tx.memory,
-                                lazy,
-                                image,
-                                (layer, level),
-                                &mut scratch.tiled,
-                                &mut scratch.linear,
-                            );
-                            deswizzled = Some((layer, level));
+                        let guest_len = convert::guest_level_bytes(format, extent);
+                        if !direct {
+                            resize_exact(&mut scratch.linear, guest_len);
                         }
-                        let slice_bytes =
-                            convert::guest_level_bytes(format, (level_extent.0, level_extent.1, 1));
-                        let row_bytes = convert::guest_level_bytes(
-                            format,
-                            (level_extent.0, format.block_height(), 1),
-                        );
-                        let start = z as usize * slice_bytes
-                            + (y / format.block_height()) as usize * row_bytes;
-                        let guest = &scratch.linear
-                            [start..start + convert::guest_level_bytes(format, extent)];
-                        if direct {
-                            out.copy_from_slice(&guest[..out.len()]);
-                        } else if let Err(error) = convert::to_host(
-                            format,
-                            &host,
-                            extent,
-                            guest,
-                            out,
-                            &mut scratch.convert,
-                        ) {
+                        let guest = match direct {
+                            true => &mut out[..guest_len],
+                            false => &mut scratch.linear[..],
+                        };
+                        let (y, rows) = (y / bh, extent.1.div_ceil(bh));
+                        match info.layout {
+                            GuestLayout::BlockLinear { .. } => {
+                                let level = info.surface().level_tiling(level);
+                                let band = band_tiling(&level, (y, z), (rows, extent.2));
+                                read_band(
+                                    tx.memory,
+                                    lazy,
+                                    image,
+                                    guest_offset,
+                                    (&level, (y, z)),
+                                    &band,
+                                    &mut scratch.tiled,
+                                );
+                                unswizzle(&band, &scratch.tiled, guest);
+                            }
+                            GuestLayout::Pitch { pitch } => {
+                                let pitch = pitch as usize;
+                                resize_exact(&mut scratch.tiled, pitch * rows as usize);
+                                read_guest(
+                                    tx.memory,
+                                    lazy,
+                                    &image.segments,
+                                    guest_offset + (y as usize * pitch) as u64,
+                                    &mut scratch.tiled,
+                                );
+                                let row = guest_len / rows.max(1) as usize;
+                                for (dst, src) in
+                                    guest.chunks_exact_mut(row).zip(scratch.tiled.chunks(pitch))
+                                {
+                                    dst.copy_from_slice(&src[..row]);
+                                }
+                            }
+                        }
+                        if !direct
+                            && let Err(error) = convert::to_host(
+                                format,
+                                &host,
+                                extent,
+                                &scratch.linear,
+                                out,
+                                &mut scratch.convert,
+                            )
+                        {
                             tracing::warn!(%error, "texture upload conversion failed");
                         }
                     }
@@ -3825,6 +3988,7 @@ impl TextureCache {
             }
             first = end;
         }
+        scratch.trim(scratch_max);
         Ok(())
     }
 
@@ -4207,9 +4371,11 @@ impl TextureCache {
         let Self {
             slots,
             scratch,
+            scratch_max,
             lazy,
             ..
         } = self;
+        let scratch_max = *scratch_max;
         let image = slots[id.index as usize]
             .image
             .as_mut()
@@ -4220,54 +4386,146 @@ impl TextureCache {
         let format = info.format;
         let levels = image.image.desc().mip_levels;
         let align = alignment(&host, format);
+        let planes = convert::depth_planes(host.format);
+        let direct = host.conversion == Conversion::None && planes.is_none();
+        let bh = format.block_height();
         let mut offset = 0usize;
         for layer in 0..info.layers {
-            for level in 0..levels {
+            'level: for level in 0..levels {
                 let extent = info.level_extent(level);
                 let layout = convert::host_layout(format, &host, extent);
                 offset = offset.next_multiple_of(align as usize);
-                let host_bytes = &data[offset..offset + layout.total()];
+                let host_level = &data[offset..offset + layout.total()];
                 offset += layout.total();
-                scratch
-                    .linear
-                    .resize(convert::guest_level_bytes(format, extent), 0);
-                if let Err(error) =
-                    convert::to_guest(format, &host, extent, host_bytes, &mut scratch.linear)
-                {
-                    tracing::warn!(%error, "texture download conversion failed");
-                    continue;
-                }
                 let guest_offset = info.subresource_offset(level, layer);
-                match info.layout {
-                    GuestLayout::BlockLinear { .. } => {
-                        let tiling = info.surface().level_tiling(level);
-                        scratch.tiled.resize(tiling.size_bytes(), 0);
-                        read_guest(
-                            memory,
-                            lazy,
-                            &image.segments,
-                            guest_offset,
-                            &mut scratch.tiled,
-                        );
-                        swizzle(&tiling, &scratch.linear, &mut scratch.tiled);
-                        write_guest(lazy, &image.segments, guest_offset, &scratch.tiled, keep);
-                    }
-                    GuestLayout::Pitch { pitch } => {
-                        let rows = extent.1.div_ceil(format.block_height()).max(1) as usize;
-                        let row = scratch.linear.len() / rows;
-                        for (y, line) in scratch.linear.chunks_exact(row).enumerate() {
-                            write_guest(
-                                lazy,
-                                &image.segments,
-                                guest_offset + y as u64 * u64::from(pitch),
-                                line,
-                                keep,
-                            );
+                let tiling = match info.layout {
+                    GuestLayout::BlockLinear { .. } => Some(info.surface().level_tiling(level)),
+                    GuestLayout::Pitch { .. } => None,
+                };
+                let largest_copy = |(y, z): (u32, u32), band: (u32, u32, u32)| {
+                    let tiled = tiling.map_or(0, |level| {
+                        band_tiling(&level, (y / bh, z), (band.1.div_ceil(bh), band.2)).size_bytes()
+                    });
+                    let linear = if direct {
+                        0
+                    } else {
+                        convert::guest_level_bytes(format, band)
+                    };
+                    let host_planes = match planes {
+                        Some(_) => convert::host_layout(format, &host, band).total(),
+                        None => 0,
+                    };
+                    tiled.max(linear).max(host_planes) as u64
+                };
+                scratch.pieces.clear();
+                push_bands(
+                    &mut scratch.pieces,
+                    UploadPiece {
+                        layer,
+                        level,
+                        origin: (0, 0),
+                        extent,
+                        size: 0,
+                        tiling: None,
+                    },
+                    format,
+                    tiling,
+                    |origin, band| largest_copy(origin, band) <= scratch_max,
+                    |_| 0,
+                );
+                for i in 0..scratch.pieces.len() {
+                    let UploadPiece {
+                        origin: (y, z),
+                        extent: band,
+                        ..
+                    } = scratch.pieces[i];
+                    let (y, rows) = (y / bh, band.1.div_ceil(bh));
+                    let first_row = (z * extent.1.div_ceil(bh) + y) as usize;
+                    let host_band = match planes {
+                        None => {
+                            let row =
+                                convert::host_layout(format, &host, (extent.0, bh, 1)).total();
+                            let len = row * rows as usize * band.2 as usize;
+                            &host_level[first_row * row..first_row * row + len]
                         }
+                        Some((depth, stencil)) => {
+                            let (first, texels) = (
+                                first_row * extent.0 as usize,
+                                band.0 as usize * rows as usize * band.2 as usize,
+                            );
+                            let main = texels * depth;
+                            let planes = &mut scratch.convert;
+                            resize_exact(planes, main + if stencil { texels } else { 0 });
+                            planes[..main].copy_from_slice(
+                                &host_level[first * depth..(first + texels) * depth],
+                            );
+                            if stencil {
+                                let stencil = layout.main + first;
+                                planes[main..]
+                                    .copy_from_slice(&host_level[stencil..stencil + texels]);
+                            }
+                            &scratch.convert[..]
+                        }
+                    };
+                    let guest_len = convert::guest_level_bytes(format, band);
+                    let guest = match direct {
+                        true => &host_band[..guest_len],
+                        false => {
+                            resize_exact(&mut scratch.linear, guest_len);
+                            if let Err(error) = convert::to_guest(
+                                format,
+                                &host,
+                                band,
+                                host_band,
+                                &mut scratch.linear,
+                            ) {
+                                tracing::warn!(%error, "texture download conversion failed");
+                                continue 'level;
+                            }
+                            &scratch.linear[..]
+                        }
+                    };
+                    match (tiling, info.layout) {
+                        (Some(level), _) => {
+                            let band = band_tiling(&level, (y, z), (rows, band.2));
+                            read_band(
+                                memory,
+                                lazy,
+                                image,
+                                guest_offset,
+                                (&level, (y, z)),
+                                &band,
+                                &mut scratch.tiled,
+                            );
+                            swizzle(&band, guest, &mut scratch.tiled);
+                            band_runs(&level, (y, z), &band, |src, dst, len| {
+                                write_guest(
+                                    lazy,
+                                    &image.segments,
+                                    guest_offset + src as u64,
+                                    &scratch.tiled[dst..dst + len],
+                                    keep,
+                                )
+                            });
+                        }
+                        (None, GuestLayout::Pitch { pitch }) => {
+                            let row = guest_len / rows.max(1) as usize;
+                            for (r, line) in guest.chunks_exact(row).enumerate() {
+                                write_guest(
+                                    lazy,
+                                    &image.segments,
+                                    guest_offset + (y as u64 + r as u64) * u64::from(pitch),
+                                    line,
+                                    keep,
+                                );
+                            }
+                        }
+                        (None, GuestLayout::BlockLinear { .. }) => unreachable!("a level tiling"),
                     }
                 }
             }
         }
+        scratch.trim(scratch_max);
     }
 
     /// Runs the collector, once per presented frame. `usage` reads device memory use; it is

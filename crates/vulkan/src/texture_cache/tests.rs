@@ -7584,3 +7584,623 @@ fn large_uploads_in_one_tick_reuse_the_grown_part_slices() {
     }
     f.assert_no_validation_errors();
 }
+
+/// Where a [`ScratchCase`] keeps its guest texels.
+enum ScratchGuest {
+    Surface(SurfaceLayout),
+    /// A pitch-linear level of this many bytes whose pitch is its row.
+    Pitch(usize),
+}
+
+/// A large upload the CPU untiles, decodes or recompresses.
+struct ScratchCase {
+    name: &'static str,
+    header: TicEntry,
+    guest: ScratchGuest,
+    recompression: AstcRecompression,
+    decode: AstcDecode,
+    on_gpu: bool,
+    /// The tightly packed A8B8G8R8 texels it uploads, when its format is that.
+    texels: Option<usize>,
+}
+
+const SCRATCH_SEED: u32 = 11;
+
+fn scratch_cases() -> Vec<ScratchCase> {
+    #[allow(clippy::too_many_arguments)]
+    let bl = |name,
+              raw,
+              format,
+              texture_type,
+              size: (u32, u32, u32),
+              block: (u32, u32),
+              recompression,
+              on_gpu| {
+        let surface = UntileCase {
+            raw,
+            format,
+            texture_type,
+            size,
+            levels: 1,
+            block,
+            gob: GobLayout::Tegra,
+        }
+        .surface();
+        let rgba8 = format == PixelFormat::A8B8G8R8Unorm;
+        ScratchCase {
+            name,
+            header: tic_typed(
+                raw,
+                texture_type,
+                size.0,
+                size.1,
+                size.2,
+                1,
+                block.0,
+                block.1,
+            ),
+            texels: rgba8.then(|| surface.level_tiling(0).linear_size_bytes()),
+            guest: ScratchGuest::Surface(surface),
+            recompression,
+            decode: AstcDecode::Cpu,
+            on_gpu,
+        }
+    };
+    let rgba8 = PixelFormat::A8B8G8R8Unorm;
+    let astc = PixelFormat::Astc4x4Unorm;
+    let none = AstcRecompression::Uncompressed;
+    vec![
+        bl(
+            "4352x4352 RGBA8 2D, past the request bound",
+            0x08,
+            rgba8,
+            1,
+            (4352, 4352, 1),
+            (4, 0),
+            none,
+            true,
+        ),
+        bl(
+            "512x512x72 RGBA8 3D in blocks 8 slices deep, past the request bound",
+            0x08,
+            rgba8,
+            2,
+            (512, 512, 72),
+            (4, 3),
+            none,
+            true,
+        ),
+        bl(
+            "4096x4096 RGBA8 2D untiled on the CPU",
+            0x08,
+            rgba8,
+            1,
+            (4096, 4096, 1),
+            (4, 0),
+            none,
+            false,
+        ),
+        bl(
+            "4096x4096 ASTC 4x4 decoded on the CPU",
+            0x40,
+            astc,
+            1,
+            (4096, 4096, 1),
+            (4, 0),
+            none,
+            true,
+        ),
+        bl(
+            "4096x4096 ASTC 4x4 recompressed to BC3",
+            0x40,
+            astc,
+            1,
+            (4096, 4096, 1),
+            (4, 0),
+            AstcRecompression::Bc3,
+            true,
+        ),
+        bl(
+            "1024x1024 RGBA8 2D untiled on the CPU",
+            0x08,
+            rgba8,
+            1,
+            (1024, 1024, 1),
+            (4, 0),
+            none,
+            false,
+        ),
+        bl(
+            "1024x1024 ASTC 4x4 recompressed to BC3",
+            0x40,
+            astc,
+            1,
+            (1024, 1024, 1),
+            (4, 0),
+            AstcRecompression::Bc3,
+            true,
+        ),
+        ScratchCase {
+            name: "4352x4352 RGBA8 pitch, past the request bound",
+            header: pitch_tic(GPU_VA, 4352, 4352, 4352 * 4),
+            guest: ScratchGuest::Pitch(4352 * 4352 * 4),
+            recompression: none,
+            decode: AstcDecode::Cpu,
+            on_gpu: true,
+            texels: Some(4352 * 4352 * 4),
+        },
+    ]
+}
+
+impl ScratchCase {
+    fn fixture(&self) -> Option<Fixture> {
+        let bytes = match &self.guest {
+            ScratchGuest::Surface(s) => s.size_bytes(),
+            ScratchGuest::Pitch(bytes) => *bytes as u64,
+        };
+        let mut f = fixture_with_dram(
+            GobLayout::Tegra,
+            self.recompression,
+            bytes.next_multiple_of(1 << 20),
+        )?;
+        f.cache.set_astc_decode(self.decode);
+        f.cache.unswizzle_on_gpu = self.on_gpu;
+        match &self.guest {
+            ScratchGuest::Surface(s) => {
+                write_surface_by_subresource(&f.memory, DADDR, s, SCRATCH_SEED)
+            }
+            ScratchGuest::Pitch(bytes) => {
+                f.memory
+                    .write_bytes(DADDR, &pattern(*bytes, SCRATCH_SEED))
+                    .unwrap();
+            }
+        }
+        Some(f)
+    }
+}
+
+/// The address and capacity of every scratch copy of texels: equal ones mean nothing was
+/// allocated.
+type ScratchShape = [(usize, usize); 3];
+
+fn scratch_shape(s: &Scratch) -> ScratchShape {
+    [&s.tiled, &s.linear, &s.convert].map(|v| (v.as_ptr() as usize, v.capacity()))
+}
+
+#[test]
+fn large_cpu_uploads_keep_their_scratch_within_its_bound() {
+    for case in scratch_cases() {
+        let Some(mut f) = case.fixture() else {
+            return;
+        };
+        let (id, _) = f.texture(&case.header);
+        let conversion = f.cache.get(id).unwrap().host.conversion;
+        let peak = f.cache.scratch.peak;
+        eprintln!(
+            "{}: {conversion:?}, scratch high water {:.2} MiB",
+            case.name,
+            peak as f64 / f64::from(1 << 20)
+        );
+        let copies = if conversion == Conversion::None { 1 } else { 3 };
+        assert!(
+            peak <= copies * SCRATCH_MAX + (64 << 10),
+            "{}: {peak} scratch bytes, past {copies} copies of {SCRATCH_MAX} bytes and the lists",
+            case.name
+        );
+        if let Some(len) = case.texels {
+            assert!(
+                f.read_subresource(id, 0, 0) == pattern(len, SCRATCH_SEED),
+                "{}: the level holds the guest texels",
+                case.name
+            );
+        }
+        let banded = f.read_image(id);
+        f.assert_no_validation_errors();
+        drop(f);
+        let mut f = case.fixture().expect("the device came up once");
+        f.cache.scratch_max = u64::MAX;
+        let (id, _) = f.texture(&case.header);
+        eprintln!(
+            "{}: unbounded, scratch high water {:.2} MiB",
+            case.name,
+            f.cache.scratch.peak as f64 / f64::from(1 << 20)
+        );
+        assert!(f.cache.scratch.peak >= peak, "{}: unbounded", case.name);
+        assert!(
+            f.read_image(id) == banded,
+            "{}: banded texels differ from unbounded ones",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn repeated_cpu_uploads_reuse_their_scratch() {
+    for case in scratch_cases() {
+        let Some(mut f) = case.fixture() else {
+            return;
+        };
+        f.texture(&case.header);
+        let shape = scratch_shape(&f.cache.scratch);
+        for round in 0..3 {
+            {
+                let (mut tx, cache, _) = f.tx();
+                cache.invalidate(&mut tx, DADDR, 4).unwrap();
+            }
+            f.texture(&case.header);
+            assert_eq!(
+                scratch_shape(&f.cache.scratch),
+                shape,
+                "{}: upload {round} again allocated scratch",
+                case.name
+            );
+            f.scheduler.finish().unwrap();
+        }
+    }
+}
+
+/// One case of [`scratch_bands_match_unbounded_uploads`]: an upload and how it decodes.
+struct BandCase {
+    untile: UntileCase,
+    recompression: AstcRecompression,
+    decode: AstcDecode,
+}
+
+#[test]
+fn scratch_bands_match_unbounded_uploads() {
+    use PixelFormat::*;
+    let case = |raw, format, texture_type, size, levels, block, gob| UntileCase {
+        raw,
+        format,
+        texture_type,
+        size,
+        levels,
+        block,
+        gob,
+    };
+    let mut cases = Vec::new();
+    for gob in [GobLayout::Tegra, GobLayout::Switch2] {
+        for untile in [
+            case(0x08, A8B8G8R8Unorm, 5, (70, 40, 3), 4, (2, 0), gob),
+            case(0x08, A8B8G8R8Unorm, 1, (300, 257, 1), 3, (4, 0), gob),
+            case(0x1d, R8Unorm, 1, (131, 77, 1), 3, (3, 0), gob),
+            case(0x03, R16G16B16A16Unorm, 5, (45, 70, 2), 2, (1, 0), gob),
+            case(0x08, A8B8G8R8Unorm, 2, (32, 16, 20), 3, (1, 2), gob),
+            case(0x08, A8B8G8R8Unorm, 2, (33, 17, 9), 2, (0, 3), gob),
+            case(0x08, A8B8G8R8Unorm, 2, (64, 40, 7), 1, (2, 1), gob),
+            case(0x24, Bc1RgbaUnorm, 1, (256, 128, 1), 4, (3, 0), gob),
+            case(0x17, Bc7Unorm, 1, (96, 64, 1), 3, (2, 0), gob),
+            case(0x15, B5G6R5Unorm, 1, (90, 70, 1), 2, (2, 0), gob),
+        ] {
+            cases.push(BandCase {
+                untile,
+                recompression: AstcRecompression::Uncompressed,
+                decode: AstcDecode::Gpu,
+            });
+        }
+        for decode in [AstcDecode::Gpu, AstcDecode::Cpu] {
+            for untile in [
+                case(0x44, Astc8x8Unorm, 1, (256, 160, 1), 2, (1, 0), gob),
+                case(0x44, Astc8x8Unorm, 5, (200, 136, 2), 2, (1, 0), gob),
+            ] {
+                cases.push(BandCase {
+                    untile,
+                    recompression: AstcRecompression::Uncompressed,
+                    decode,
+                });
+            }
+        }
+        for recompression in [AstcRecompression::Bc1, AstcRecompression::Bc3] {
+            cases.push(BandCase {
+                untile: case(0x40, Astc4x4Unorm, 1, (100, 76, 1), 2, (2, 0), gob),
+                recompression,
+                decode: AstcDecode::Cpu,
+            });
+        }
+    }
+    for c in &cases {
+        let u = &c.untile;
+        let upload = |scratch_max| {
+            let mut f = fixture(u.gob, c.recompression)?;
+            f.cache.set_astc_decode(c.decode);
+            f.cache.unswizzle_on_gpu = false;
+            f.cache.scratch_max = scratch_max;
+            let s = u.surface();
+            write_surface(&f.memory, &s, &level_data(&s, u.raw));
+            let (w, h, d) = u.size;
+            let header = tic_typed(
+                u.raw,
+                u.texture_type,
+                w,
+                h,
+                d,
+                u.levels,
+                u.block.0,
+                u.block.1,
+            );
+            let (id, _) = f.texture(&header);
+            let pieces = f.cache.scratch.pieces.len();
+            let texels = f.read_image(id);
+            f.assert_no_validation_errors();
+            Some((texels, pieces))
+        };
+        let Some((whole, subresources)) = upload(u64::MAX) else {
+            return;
+        };
+        for scratch_max in [1 << 10, 5000, 40 << 10] {
+            let (banded, pieces) = upload(scratch_max).expect("the device came up once");
+            assert!(
+                pieces > subresources || scratch_max > 5000,
+                "{:?} {:?}: {pieces} pieces in {scratch_max}-byte bands",
+                u.format,
+                u.size
+            );
+            for (i, (got, want)) in banded.iter().zip(&whole).enumerate() {
+                assert!(
+                    got == want,
+                    "{:?} {:?} {:?} {:?} {:?}: subresource {i} differs in {scratch_max}-byte bands",
+                    u.format,
+                    u.size,
+                    u.gob,
+                    c.decode,
+                    c.recompression
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn pitch_bands_match_unbounded_uploads() {
+    let (w, h, pitch) = (70, 45, 320);
+    let upload = |scratch_max| {
+        let mut f = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed)?;
+        f.cache.scratch_max = scratch_max;
+        f.memory
+            .write_bytes(DADDR, &pattern(pitch as usize * h as usize, 5))
+            .unwrap();
+        let (id, _) = f.texture(&pitch_tic(GPU_VA, w, h, pitch));
+        let pieces = f.cache.scratch.pieces.len();
+        let texels = f.read_image(id);
+        f.assert_no_validation_errors();
+        Some((texels, pieces))
+    };
+    let Some((whole, _)) = upload(u64::MAX) else {
+        return;
+    };
+    let rows: Vec<u8> = pattern(pitch as usize * h as usize, 5)
+        .chunks(pitch as usize)
+        .flat_map(|row| row[..w as usize * 4].to_vec())
+        .collect();
+    assert!(
+        whole[0] == rows,
+        "unbounded pitch upload holds the guest rows"
+    );
+    for scratch_max in [1 << 10, 3000, 7 << 10] {
+        let (banded, pieces) = upload(scratch_max).expect("the device came up once");
+        assert!(pieces > 1, "{pieces} pieces in {scratch_max}-byte bands");
+        assert!(banded == whole, "{scratch_max}-byte bands differ");
+    }
+}
+
+#[test]
+#[ignore = "microbenchmark: run with --ignored --nocapture, pinned to one core"]
+fn measures_cpu_upload_cost() {
+    const ROUNDS: usize = 9;
+    for case in scratch_cases() {
+        let Some(mut f) = case.fixture() else {
+            return;
+        };
+        f.texture(&case.header);
+        f.scheduler.finish().unwrap();
+        let mut times = Vec::with_capacity(ROUNDS);
+        for _ in 0..ROUNDS {
+            {
+                let (mut tx, cache, _) = f.tx();
+                cache.invalidate(&mut tx, DADDR, 4).unwrap();
+            }
+            let start = Instant::now();
+            f.texture(&case.header);
+            times.push(start.elapsed().as_secs_f64());
+            f.scheduler.finish().unwrap();
+            f.staging.reclaim_parts(&mut f.scheduler);
+        }
+        times.sort_by(f64::total_cmp);
+        eprintln!(
+            "bench\t{}\t{:.3} ms median of {ROUNDS} uploads",
+            case.name,
+            times[ROUNDS / 2] * 1e3
+        );
+    }
+}
+
+/// Clears a rectangle of `info` over patterned guest bytes and flushes it `rounds` times
+/// with scratch bands of `scratch_max` bytes: the guest bytes, the scratch high water and the
+/// scratch shapes after the first flush and the last.
+fn write_back_in_bands(
+    info: &ImageInfo,
+    scratch_max: u64,
+    rounds: u32,
+) -> Option<(Vec<u8>, u64, [ScratchShape; 2])> {
+    let gob = match info.layout {
+        GuestLayout::BlockLinear { gob, .. } => gob,
+        GuestLayout::Pitch { .. } => GobLayout::Tegra,
+    };
+    let bytes = info.size_bytes();
+    let mut f = fixture_with_dram(
+        gob,
+        AstcRecompression::Uncompressed,
+        (bytes + (1 << 20)).next_multiple_of(1 << 20).max(DRAM),
+    )?;
+    f.cache.scratch_max = scratch_max;
+    f.memory
+        .write_bytes(DADDR, &pattern(bytes as usize, 9))
+        .unwrap();
+    let rect = Rect {
+        x: 3,
+        y: 5,
+        width: info.width / 2,
+        height: info.height / 2,
+    };
+    let mut shapes = [[(0, 0); 3]; 2];
+    for round in 0..rounds {
+        let (mut tx, cache, gmmu) = f.tx();
+        let target = cache
+            .render_target(&mut tx, gmmu, GPU_VA, info, false)
+            .unwrap()
+            .unwrap();
+        let value = match info.format {
+            PixelFormat::S8UintD24Unorm | PixelFormat::D32Float => ClearValue::DepthStencil {
+                depth: Some(0.25 + 0.125 * round as f32),
+                stencil: Some(0x5a),
+                stencil_mask: 0xff,
+            },
+            _ => ClearValue::Color {
+                value: vk::ClearColorValue {
+                    float32: [0.5, 0.25, round as f32 / 4.0, 1.0],
+                },
+                mask: vk::ColorComponentFlags::RGBA,
+            },
+        };
+        cache.clear(&mut tx, target, value, rect, 0, 1).unwrap();
+        cache.flush(&mut tx, DADDR, bytes).unwrap();
+        shapes[(round > 0) as usize] = scratch_shape(&f.cache.scratch);
+    }
+    let mut guest = vec![0; bytes as usize];
+    f.memory.read_bytes(DADDR, &mut guest).unwrap();
+    f.assert_no_validation_errors();
+    Some((guest, f.cache.scratch.peak, shapes))
+}
+
+#[test]
+fn write_backs_in_scratch_bands_match_unbounded_ones() {
+    let with = |format, mut info: ImageInfo| {
+        info.format = format;
+        info
+    };
+    let small = [
+        rt_info(70, 45, 2, GobLayout::Tegra),
+        rt_info(70, 45, 2, GobLayout::Switch2),
+        rt_info(300, 129, 4, GobLayout::Tegra),
+        with(
+            PixelFormat::S8UintD24Unorm,
+            rt_info(90, 70, 3, GobLayout::Tegra),
+        ),
+        with(
+            PixelFormat::D32Float,
+            rt_info(33, 40, 1, GobLayout::Switch2),
+        ),
+        with(
+            PixelFormat::B5G6R5Unorm,
+            rt_info(64, 50, 2, GobLayout::Tegra),
+        ),
+        pitch_target(320, 45),
+    ];
+    for info in &small {
+        let Some((whole, _, _)) = write_back_in_bands(info, u64::MAX, 1) else {
+            return;
+        };
+        for scratch_max in [1 << 10, 5000, 40 << 10] {
+            let (banded, _, _) =
+                write_back_in_bands(info, scratch_max, 1).expect("the device came up once");
+            assert!(
+                banded == whole,
+                "{:?} {}x{}: guest bytes differ after {scratch_max}-byte bands",
+                info.format,
+                info.width,
+                info.height
+            );
+        }
+    }
+    for info in [
+        rt_info(2048, 2048, 4, GobLayout::Tegra),
+        with(
+            PixelFormat::S8UintD24Unorm,
+            rt_info(2048, 2048, 4, GobLayout::Switch2),
+        ),
+    ] {
+        let Some((whole, unbounded, _)) = write_back_in_bands(&info, u64::MAX, 4) else {
+            return;
+        };
+        let (banded, peak, [first, last]) =
+            write_back_in_bands(&info, SCRATCH_MAX, 4).expect("the device came up once");
+        eprintln!(
+            "{:?} 2048x2048 write-back: scratch high water {:.2} MiB, unbounded {:.2} MiB",
+            info.format,
+            peak as f64 / f64::from(1 << 20),
+            unbounded as f64 / f64::from(1 << 20)
+        );
+        assert!(unbounded > SCRATCH_MAX, "{:?}: unbounded", info.format);
+        let copies = if info.format == PixelFormat::A8B8G8R8Unorm {
+            1
+        } else {
+            3
+        };
+        assert!(
+            peak <= copies * SCRATCH_MAX + (64 << 10),
+            "{:?}: {peak} scratch bytes",
+            info.format
+        );
+        assert_eq!(
+            first, last,
+            "{:?}: repeated write-backs allocated",
+            info.format
+        );
+        assert!(
+            banded == whole,
+            "{:?}: banded guest bytes differ",
+            info.format
+        );
+    }
+}
+
+#[test]
+#[ignore = "microbenchmark: run with --ignored --nocapture, pinned to one core"]
+fn measures_write_back_cost() {
+    const ROUNDS: u32 = 9;
+    for format in [PixelFormat::A8B8G8R8Unorm, PixelFormat::S8UintD24Unorm] {
+        let mut info = rt_info(2048, 2048, 4, GobLayout::Tegra);
+        info.format = format;
+        for (name, scratch_max) in [("whole levels", u64::MAX), ("scratch bands", SCRATCH_MAX)] {
+            let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+                return;
+            };
+            f.cache.scratch_max = scratch_max;
+            let mut times = Vec::new();
+            for round in 0..=ROUNDS {
+                let (mut tx, cache, gmmu) = f.tx();
+                let target = cache
+                    .render_target(&mut tx, gmmu, GPU_VA, &info, true)
+                    .unwrap()
+                    .unwrap();
+                let value = match format {
+                    PixelFormat::A8B8G8R8Unorm => ClearValue::Color {
+                        value: vk::ClearColorValue {
+                            float32: [0.5, 0.25, round as f32 / 16.0, 1.0],
+                        },
+                        mask: vk::ColorComponentFlags::RGBA,
+                    },
+                    _ => ClearValue::DepthStencil {
+                        depth: Some(round as f32 / 16.0),
+                        stencil: Some(0x5a),
+                        stencil_mask: 0xff,
+                    },
+                };
+                cache
+                    .clear(&mut tx, target, value, Rect::ALL, 0, 1)
+                    .unwrap();
+                tx.scheduler.finish().unwrap();
+                let start = Instant::now();
+                cache.flush(&mut tx, DADDR, info.size_bytes()).unwrap();
+                if round > 0 {
+                    times.push(start.elapsed().as_secs_f64());
+                }
+            }
+            times.sort_by(f64::total_cmp);
+            eprintln!(
+                "bench\t2048x2048 {format:?} write-back, {name}\t{:.3} ms median of {ROUNDS} flushes",
+                times[ROUNDS as usize / 2] * 1e3
+            );
+        }
+    }
+}

@@ -70,6 +70,10 @@ struct MemoryLine {
     /// The largest single staging or stream request since the last line.
     staging_request_max: u64,
     staging_part_slices: u64,
+    /// The texture cache's host scratch ([`TextureCache::scratch_bytes`]) and its largest
+    /// size since the last line.
+    texture_scratch: u64,
+    texture_scratch_peak: u64,
 }
 
 /// What the GPU thread recorded since its last activity line. With
@@ -881,6 +885,8 @@ impl VulkanRasterizer {
             large_stream,
             staging_request_max,
             staging_part_slices,
+            texture_scratch,
+            texture_scratch_peak,
         } = self.memory_line();
         let since = &self.activity;
         tracing::debug!(
@@ -909,6 +915,8 @@ impl VulkanRasterizer {
             cached_images = images.count,
             cached_buffer_mib = cached_buffers.bytes >> 20,
             cached_buffers = cached_buffers.count,
+            texture_scratch_mib = texture_scratch.div_ceil(1 << 20),
+            texture_scratch_peak_mib = texture_scratch_peak.div_ceil(1 << 20),
             evicted_images = collector.evicted - since.collector.evicted,
             evicted_image_mib = (collector.evicted_bytes - since.collector.evicted_bytes) >> 20,
             flushed_images = collector.flushed - since.collector.flushed,
@@ -940,6 +948,8 @@ impl VulkanRasterizer {
                 .take_request_max()
                 .max(self.buffer_cache.take_stream_request_max()),
             staging_part_slices: self.staging.part_bytes(),
+            texture_scratch: self.texture_cache.scratch_bytes(),
+            texture_scratch_peak: self.texture_cache.take_scratch_peak(),
         }
     }
 

@@ -340,8 +340,29 @@ pub(super) enum ConvertError {
     },
 }
 
+/// Bytes of intermediate texels [`to_host`] puts in its `scratch` to convert `extent`.
+pub(super) fn scratch_bytes(
+    format: PixelFormat,
+    host: &HostFormat,
+    extent: (u32, u32, u32),
+) -> usize {
+    use PixelFormat::*;
+    let (w, h, d) = extent;
+    if depth_planes(host.format).is_some() {
+        return 0;
+    }
+    match (host.conversion, format) {
+        (Conversion::DecodeToBc(_), _) => w as usize * h as usize * d as usize * 4,
+        (Conversion::Decode, EacR11Unorm | EacR11Snorm | EacR11G11Unorm | EacR11G11Snorm) => {
+            host_layout(format, host, extent).total() * 2
+        }
+        _ => 0,
+    }
+}
+
 /// Converts one deswizzled guest level into the host buffer layout (`host_layout` bytes in
-/// `out`). `scratch` holds intermediate texels and keeps its capacity between calls.
+/// `out`). `scratch` holds intermediate texels ([`scratch_bytes`]) and keeps its capacity
+/// between calls.
 pub(super) fn to_host(
     format: PixelFormat,
     host: &HostFormat,
@@ -413,7 +434,7 @@ pub(super) fn to_host(
             if !format.is_astc() {
                 return Err(unsupported);
             }
-            scratch.resize(texels * 4, 0);
+            super::resize_exact(scratch, texels * 4);
             astc::decode_rgba8(
                 guest,
                 w,
@@ -551,7 +572,7 @@ fn decode(
         return Ok(());
     }
     let mut eac = |decoder: ImageDecoder, signed: bool| -> Result<(), ConvertError> {
-        scratch.resize(out.len() * 2, 0);
+        super::resize_exact(scratch, out.len() * 2);
         decoder(guest, w, h, d, scratch)?;
         narrow16(scratch, out, signed);
         Ok(())
