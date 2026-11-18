@@ -107,11 +107,15 @@ const CACHE_EXPECTED_MAX: u64 = 4 << 30;
 /// [`VISITS_PER_EVICTION`] times as many at most.
 const NORMAL_EVICTIONS: u32 = 20;
 const AGGRESSIVE_EVICTIONS: u32 = 40;
+/// Entries an image or buffer creation evicts at most while the caches are past their
+/// budget's critical line ([`TextureCache::evict_before_create`]); it looks at
+/// [`VISITS_PER_EVICTION`] times as many at most.
+pub(crate) const CREATE_EVICTIONS: u32 = 16;
 /// Bytes of images unused this frame an image allocation that ran out of device memory frees
 /// before it retries: a course load in Mario Kart World creates ~1800 textures in a few frames,
 /// faster than the per-frame collector evicts.
 const RECLAIM_ON_OOM: u64 = 512 << 20;
-const VISITS_PER_EVICTION: u32 = 8;
+pub(crate) const VISITS_PER_EVICTION: u32 = 8;
 /// Readback bytes of GPU-modified images the collector starts flushing per frame (always at
 /// least one image).
 const MAX_FLUSH_BYTES: u64 = 16 << 20;
@@ -228,6 +232,17 @@ pub struct CollectorStats {
     pub evicted_bytes: u64,
     /// Evicted images that were GPU-modified and written back to guest memory first.
     pub flushed: u64,
+    /// Of [`CollectorStats::evicted`], images an image creation evicted first while the caches
+    /// were past their budget's critical line, and their device memory.
+    pub create_evicted: u64,
+    pub create_evicted_bytes: u64,
+}
+
+/// The least recently used entry of the shared image and buffer LRU order, with the cursor
+/// past it in its own list.
+enum Lru {
+    Image { id: ImageId, next: u32 },
+    Buffer { cursor: u32, next: u32 },
 }
 
 /// Device memory use past which the collector runs (`expected`), turns aggressive
@@ -2765,6 +2780,8 @@ impl TextureCache {
             self.refresh(tx, id)?;
             self.join(tx, id)?;
         }
+        let bytes = self.image(id).image.memory_size();
+        self.evict_before_create(tx, bytes);
         Ok(Some(Found {
             id,
             level: 0,
@@ -4304,6 +4321,7 @@ impl TextureCache {
         let result = self.collect_garbage(tx, usage());
         self.frame += 1;
         tx.buffers.set_frame(self.frame);
+        self.hand_buffers_their_limit(tx.buffers, self.unused_before(RECENT_AGE));
         result
     }
 
@@ -4377,11 +4395,7 @@ impl TextureCache {
         } else {
             OLD_AGE
         };
-        let in_flight = self
-            .frame_ends
-            .front()
-            .map_or(self.frame + 1, |&(frame, _)| frame);
-        let unused_before = (self.frame + 1).saturating_sub(age).min(in_flight);
+        let unused_before = self.unused_before(age);
         let mut evictions = if aggressive {
             AGGRESSIVE_EVICTIONS
         } else {
@@ -4391,63 +4405,44 @@ impl TextureCache {
         let (mut flush_bytes, mut queued_bytes) = (0, 0);
         let (mut cursor, mut buffer) = (self.lru_head, tx.buffers.lru_head());
         while evictions > 0 && visits > 0 {
-            let image_use = (cursor != NIL).then(|| {
-                let slot = &self.slots[cursor as usize];
-                slot.image
-                    .as_ref()
-                    .expect("listed slots hold images")
-                    .last_use
-            });
-            let buffer_entry = tx.buffers.lru_entry(buffer);
-            let last_use = match (image_use, buffer_entry) {
-                (None, None) => break,
-                (image, buffer) => image
-                    .unwrap_or(u64::MAX)
-                    .min(buffer.map_or(u64::MAX, |(last_use, _)| last_use)),
-            };
-            if last_use >= unused_before {
+            let Some(oldest) = self.lru_oldest(tx.buffers, cursor, buffer, unused_before) else {
                 break;
-            }
+            };
             visits -= 1;
-            let bytes = if let Some((buffer_use, next)) = buffer_entry
-                && image_use.is_none_or(|image_use| buffer_use < image_use)
-            {
-                let evicted = tx.buffers.evict(tx.scheduler, buffer);
-                buffer = next;
-                let Some(bytes) = evicted else {
-                    continue;
-                };
-                bytes
-            } else {
-                let slot = &self.slots[cursor as usize];
-                let id = ImageId {
-                    index: cursor,
-                    generation: slot.generation,
-                };
-                cursor = slot.next;
-                let image = slot.image.as_ref().expect("listed slots hold images");
-                let bytes = image.image.memory_size();
-                if image.gpu_modified && image.downloadable() {
-                    let (size, _) = image.readback_size();
-                    if !aggressive
-                        || !can_flush
-                        || (flush_bytes > 0 && flush_bytes + size > MAX_FLUSH_BYTES)
-                    {
+            let bytes = match oldest {
+                Lru::Buffer { cursor: at, next } => {
+                    buffer = next;
+                    let Some(bytes) = tx.buffers.evict(tx.scheduler, at) else {
                         continue;
-                    }
-                    flush_bytes += size;
-                    queued_bytes += bytes;
-                    self.pending_downloads.push(Download {
-                        id,
-                        offset: 0,
-                        modified: image.modified,
-                    });
-                } else if image.gpu_modified && used < limits.critical {
-                    continue;
-                } else {
-                    self.evict(tx.scheduler, id);
+                    };
+                    bytes
                 }
-                bytes
+                Lru::Image { id, next } => {
+                    cursor = next;
+                    let image = self.get(id).expect("listed slots hold images");
+                    let bytes = image.image.memory_size();
+                    if image.gpu_modified && image.downloadable() {
+                        let (size, _) = image.readback_size();
+                        if !aggressive
+                            || !can_flush
+                            || (flush_bytes > 0 && flush_bytes + size > MAX_FLUSH_BYTES)
+                        {
+                            continue;
+                        }
+                        flush_bytes += size;
+                        queued_bytes += bytes;
+                        self.pending_downloads.push(Download {
+                            id,
+                            offset: 0,
+                            modified: image.modified,
+                        });
+                    } else if image.gpu_modified && used < limits.critical {
+                        continue;
+                    } else {
+                        self.evict(tx.scheduler, id);
+                    }
+                    bytes
+                }
             };
             used = used.saturating_sub(bytes);
             cached = cached.saturating_sub(bytes);
@@ -4476,6 +4471,115 @@ impl TextureCache {
             bytes: queued_bytes,
         });
         Ok(())
+    }
+
+    /// The first frame whose entries the collector keeps when it evicts entries unused for
+    /// `age` frames: also every frame whose work has not completed.
+    fn unused_before(&self, age: u64) -> u64 {
+        let in_flight = self
+            .frame_ends
+            .front()
+            .map_or(self.frame + 1, |&(frame, _)| frame);
+        (self.frame + 1).saturating_sub(age).min(in_flight)
+    }
+
+    /// The least recently used of the image at LRU cursor `image` and the buffer at `buffer`,
+    /// a buffer only if it was used strictly longer ago; `None` when both lists are past their
+    /// end or the entry was used in frame `unused_before` or later.
+    fn lru_oldest(
+        &self,
+        buffers: &BufferCache,
+        image: u32,
+        buffer: u32,
+        unused_before: u64,
+    ) -> Option<Lru> {
+        let image = (image != NIL).then(|| {
+            let slot = &self.slots[image as usize];
+            let id = ImageId {
+                index: image,
+                generation: slot.generation,
+            };
+            let image = slot.image.as_ref().expect("listed slots hold images");
+            (image.last_use, id, slot.next)
+        });
+        let oldest = match (image, buffers.lru_entry(buffer)) {
+            (None, None) => return None,
+            (Some((image_use, id, next)), Some((buffer_use, _))) if image_use <= buffer_use => {
+                (image_use, Lru::Image { id, next })
+            }
+            (Some((image_use, id, next)), None) => (image_use, Lru::Image { id, next }),
+            (_, Some((buffer_use, next))) => (
+                buffer_use,
+                Lru::Buffer {
+                    cursor: buffer,
+                    next,
+                },
+            ),
+        };
+        (oldest.0 < unused_before).then_some(oldest.1)
+    }
+
+    /// Evict-before-create, run after the lookup that created an image of `bytes` linked it in:
+    /// while the images and cached buffers hold more than the budget's critical line
+    /// ([`CacheBudget`]), it evicts entries in the collector's LRU order and by its rule past
+    /// that line (unused for [`RECENT_AGE`] frames and by any frame whose work has not
+    /// completed, so nothing this frame bound or binds goes), until it freed `bytes` or brought
+    /// the caches back to the line. It skips GPU-modified images, which reach guest memory
+    /// through the collector's read-back, and the images the lookup overlapped. Bound: at most
+    /// [`CREATE_EVICTIONS`] evictions and [`VISITS_PER_EVICTION`] times as many LRU visits per
+    /// creation, no allocation and no wait; with too few clean entries the image stays anyway.
+    /// Under the line it only hands the buffer cache its share of the line, for its own
+    /// creations ([`BufferCache::set_create_limit`]).
+    fn evict_before_create(&mut self, tx: &mut Transfer<'_>, bytes: u64) {
+        let pending_bytes = self.pending.map_or(0, |p| p.bytes);
+        let cached = (self.image_bytes + tx.buffers.cached().bytes).saturating_sub(pending_bytes);
+        let critical = self.budget.critical;
+        let unused_before = self.unused_before(RECENT_AGE);
+        if cached > critical {
+            let target = (cached - critical).min(bytes);
+            let (mut freed, mut evictions) = (0, CREATE_EVICTIONS);
+            let mut visits = CREATE_EVICTIONS * VISITS_PER_EVICTION;
+            let (mut cursor, mut buffer) = (self.lru_head, tx.buffers.lru_head());
+            while freed < target && evictions > 0 && visits > 0 {
+                let Some(oldest) = self.lru_oldest(tx.buffers, cursor, buffer, unused_before)
+                else {
+                    break;
+                };
+                visits -= 1;
+                match oldest {
+                    Lru::Buffer { cursor: at, next } => {
+                        buffer = next;
+                        let Some(size) = tx.buffers.evict_for_create(tx.scheduler, at) else {
+                            continue;
+                        };
+                        freed += size;
+                    }
+                    Lru::Image { id, next } => {
+                        cursor = next;
+                        let image = self.get(id).expect("listed slots hold images");
+                        if image.gpu_modified || image.visit == self.visit {
+                            continue;
+                        }
+                        let size = image.image.memory_size();
+                        self.evict(tx.scheduler, id);
+                        self.stats.create_evicted += 1;
+                        self.stats.create_evicted_bytes += size;
+                        freed += size;
+                    }
+                }
+                evictions -= 1;
+            }
+        }
+        self.hand_buffers_their_limit(tx.buffers, unused_before);
+    }
+
+    /// Tells the buffer cache how many bytes its buffers may hold before both caches pass the
+    /// budget's critical line, as the images stand now.
+    fn hand_buffers_their_limit(&self, buffers: &mut BufferCache, unused_before: u64) {
+        let images = self
+            .image_bytes
+            .saturating_sub(self.pending.map_or(0, |p| p.bytes));
+        buffers.set_create_limit(self.budget.critical.saturating_sub(images), unused_before);
     }
 
     /// Evicts images no work of this frame used and the GPU did not modify, least recently used

@@ -39,6 +39,7 @@ use crate::host_budget::{
 use crate::memory::{Buffer, BufferView, LiveMemory};
 use crate::scheduler::{Scheduler, Timeline};
 use crate::staging::StagingRing;
+use crate::texture_cache::{CREATE_EVICTIONS, VISITS_PER_EVICTION};
 
 const CACHING_PAGE_BITS: u32 = 16;
 const CACHING_PAGE_SIZE: u64 = 1 << CACHING_PAGE_BITS;
@@ -151,6 +152,10 @@ pub struct BufferCacheStats {
     /// Buffers the collector evicted ([`BufferCache::evict`]), and their bytes.
     pub evicted_buffers: u64,
     pub evicted_bytes: u64,
+    /// Of those, buffers an image or buffer creation evicted first while the caches were past
+    /// their budget's critical line ([`BufferCache::evict_for_create`]), and their bytes.
+    pub create_evicted_buffers: u64,
+    pub create_evicted_bytes: u64,
 }
 
 /// The topology the host draws for a guest topology after the index conversion
@@ -1313,6 +1318,9 @@ pub struct BufferCache {
     lru_tail: u32,
     /// Bytes of the live cached buffers.
     cached_bytes: u64,
+    /// What evict-before-create holds new buffers to ([`BufferCache::set_create_limit`]).
+    create_limit: u64,
+    create_unused_before: u64,
 }
 
 impl BufferCache {
@@ -1370,6 +1378,8 @@ impl BufferCache {
             lru_head: NIL,
             lru_tail: NIL,
             cached_bytes: 0,
+            create_limit: u64::MAX,
+            create_unused_before: 0,
         })
     }
 
@@ -2250,6 +2260,16 @@ impl BufferCache {
             }
         }
         let size = end - begin;
+        if self.cached_bytes + size > self.create_limit {
+            let absorbed: u64 = self.overlaps.iter().map(|&id| self.buffer(id).size).sum();
+            let after = self.cached_bytes - absorbed + size;
+            if after > self.create_limit {
+                self.evict_before_create(
+                    scheduler,
+                    (after - self.create_limit).min(size - absorbed),
+                );
+            }
+        }
         let pages = (size / PAGE_SIZE) as usize;
         let mut dirty = vec![u64::MAX; pages.div_ceil(64)];
         if !pages.is_multiple_of(64) {
@@ -2336,6 +2356,58 @@ impl BufferCache {
         self.page_table[first..last].fill(id as u32 + 1);
         self.stats.created_buffers += 1;
         Ok(id)
+    }
+
+    /// Evict-before-create for a buffer that adds `bytes` past the create limit: evicts cached
+    /// buffers least recently used first, by the collector's rule past the critical line (used
+    /// before frame `create_unused_before`, so nothing this frame acquired or work in flight
+    /// uses goes, nor what [`BufferCache::evict`] keeps), never one the new buffer absorbs,
+    /// until `bytes` went. Bound: at most [`CREATE_EVICTIONS`] evictions and
+    /// [`VISITS_PER_EVICTION`] times as many LRU visits, no allocation; with too few old
+    /// buffers the new one is created anyway.
+    fn evict_before_create(&mut self, scheduler: &mut Scheduler, bytes: u64) {
+        let (mut freed, mut evictions) = (0, CREATE_EVICTIONS);
+        let mut visits = CREATE_EVICTIONS * VISITS_PER_EVICTION;
+        let mut cursor = self.lru_head;
+        while freed < bytes && evictions > 0 && visits > 0 {
+            let Some((last_use, next)) = self.lru_entry(cursor) else {
+                break;
+            };
+            if last_use >= self.create_unused_before {
+                break;
+            }
+            visits -= 1;
+            let at = cursor;
+            cursor = next;
+            if self.overlaps.contains(&(at as usize)) {
+                continue;
+            }
+            let Some(size) = self.evict_for_create(scheduler, at) else {
+                continue;
+            };
+            freed += size;
+            evictions -= 1;
+        }
+    }
+
+    /// Sets what evict-before-create holds new buffers to: the bytes cached buffers may hold
+    /// before both caches pass their budget's critical line, and the first frame whose buffers
+    /// it keeps.
+    pub(crate) fn set_create_limit(&mut self, limit: u64, unused_before: u64) {
+        self.create_limit = limit;
+        self.create_unused_before = unused_before;
+    }
+
+    /// [`BufferCache::evict`] for evict-before-create, counted as such.
+    pub(crate) fn evict_for_create(
+        &mut self,
+        scheduler: &mut Scheduler,
+        cursor: u32,
+    ) -> Option<u64> {
+        let bytes = self.evict(scheduler, cursor)?;
+        self.stats.create_evicted_buffers += 1;
+        self.stats.create_evicted_bytes += bytes;
+        Some(bytes)
     }
 
     /// Starts collector frame `frame`: acquires from now on mark buffers used in it.
