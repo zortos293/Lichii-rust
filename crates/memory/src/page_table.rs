@@ -21,6 +21,33 @@ pub(crate) fn no_trap(_addr: u64) {}
 
 type L2Table = [AtomicUsize; L2_ENTRIES];
 
+/// A [`PageTable`]'s first level by address. Lookups are lock-free and allocate nothing.
+#[derive(Clone, Copy)]
+pub(crate) struct RawPageTable {
+    l1: *const AtomicPtr<L2Table>,
+    len: usize,
+}
+
+impl RawPageTable {
+    /// The host address `addr` maps to.
+    ///
+    /// # Safety
+    /// The page table must still live.
+    pub(crate) unsafe fn host(&self, addr: u64) -> Option<usize> {
+        let page = (addr >> PAGE_BITS) as usize;
+        if page >> L2_BITS >= self.len {
+            return None;
+        }
+        // SAFETY: the index is inside l1, which lives as long as the table; L2 tables are never
+        // freed while it lives.
+        let raw = unsafe {
+            let table = (*self.l1.add(page >> L2_BITS)).load(Ordering::Acquire);
+            table.as_ref()?[page & (L2_ENTRIES - 1)].load(Ordering::Acquire)
+        };
+        (raw != 0).then(|| (raw & !PERM_MASK) + (addr & PAGE_MASK) as usize)
+    }
+}
+
 /// Two-level table from page number to `host pointer | permission`.
 ///
 /// Lookups are lock-free atomic loads, so any thread can translate while another maps or unmaps:
@@ -48,6 +75,14 @@ impl PageTable {
 
     pub(crate) fn bits(&self) -> u32 {
         self.bits
+    }
+
+    /// The first level, for lookups from a fault hook, which cannot hold a reference.
+    pub(crate) fn raw(&self) -> RawPageTable {
+        RawPageTable {
+            l1: self.l1.as_ptr(),
+            len: self.l1.len(),
+        }
     }
 
     /// Maps `addr` to `host` with `perm` and the [`TRACKED`] and [`FLUSH_TRAP`] bits of `flags`.

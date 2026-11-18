@@ -6,8 +6,8 @@ use parking_lot::{Mutex, MutexGuard, RwLock};
 
 use crate::PhysicalMemory;
 use crate::fault::{FaultHandler, Registration};
-use crate::host::{Arena, HostProtection};
-use crate::page_table::{FLUSH_TRAP, PageTable, TRACKED};
+use crate::host::{Arena, HostProtection, charge_touched};
+use crate::page_table::{FLUSH_TRAP, PageTable, RawPageTable, TRACKED};
 use crate::tracking::{DirtyPages, PageFlags, ReverseMap};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -80,7 +80,6 @@ pub struct Fastmem {
 }
 
 impl Fastmem {
-    #[cfg(all(test, windows))]
     pub(crate) fn arena(&self) -> &Arena {
         &self.arena
     }
@@ -101,6 +100,28 @@ impl Fastmem {
     }
 }
 
+/// What a fastmem arena's touch hook needs to commit the DRAM behind a guest page on its first
+/// touch. Leaked like the fault handler entries, since a fault may still read it after the arena
+/// is gone.
+struct FastmemTouch {
+    table: RawPageTable,
+    dram: usize,
+    target: usize,
+}
+
+fn charge_fastmem(data: usize, guest_addr: u64, host_addr: usize) -> bool {
+    // SAFETY: data is a leaked FastmemTouch; its table and DRAM outlive the registration that
+    // runs this hook, which the address space drops first.
+    unsafe {
+        let touch = &*(data as *const FastmemTouch);
+        touch
+            .table
+            .host(guest_addr)
+            .and_then(|host| host.checked_sub(touch.dram))
+            .is_some_and(|offset| charge_touched(touch.target, offset, host_addr))
+    }
+}
+
 /// Called on a flush trap with the physical page it hit; returns whether it settled the trap
 /// (wrote the page back and disarmed it unless the GPU still holds data for it). On false the
 /// trap disarms itself.
@@ -115,9 +136,10 @@ pub(crate) type FlushSink = Arc<dyn Fn(PAddr) -> bool + Send + Sync>;
 /// through a pointer from [`AddressSpace::translate`] calls [`AddressSpace::flush_gpu_writes`]
 /// first.
 pub struct AddressSpace {
+    /// Declared first so its fault hooks go before the table and DRAM they read.
+    fastmem: Option<Fastmem>,
     table: PageTable,
     physical: Arc<PhysicalMemory>,
-    fastmem: Option<Fastmem>,
     update: Mutex<Tracking>,
     /// Physical pages a cache holds that no CPU write untracked since: the flag writes check.
     tracked: PageFlags,
@@ -201,8 +223,17 @@ impl AddressSpace {
         let arena = Arena::reserve(1usize << address_space_bits).map_err(FastmemError::Reserve)?;
         let registration = Registration::new(arena.base() as usize, arena.size())
             .ok_or(FastmemError::NoFaultHandler)?;
+        let table = PageTable::new(address_space_bits);
+        if let Some(target) = physical.backing().touch_target() {
+            let touch = Box::leak(Box::new(FastmemTouch {
+                table: table.raw(),
+                dram: physical.backing().ptr() as usize,
+                target,
+            }));
+            registration.set_touch(charge_fastmem, touch as *const FastmemTouch as usize);
+        }
         Ok(Self {
-            table: PageTable::new(address_space_bits),
+            table,
             update: Mutex::new(Tracking::new(physical.size())),
             tracked: PageFlags::new(physical.size()),
             trapped: PageFlags::new(physical.size()),
@@ -431,7 +462,13 @@ impl AddressSpace {
                 protects += 1;
                 fastmem
                     .arena
-                    .restrict(va as usize, size as usize, perm.host(), cap)
+                    .restrict(
+                        self.physical.backing(),
+                        va as usize,
+                        size as usize,
+                        perm.host(),
+                        cap,
+                    )
                     .unwrap_or_else(|err| panic!("fastmem tracking {va:#x}+{size:#x}: {err}"));
             }
         };
