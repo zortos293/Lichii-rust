@@ -10,6 +10,7 @@ use crate::resource_limit::LimitableResource;
 use crate::result;
 use crate::sync::Waiter;
 use crate::thread::{Resume, Thread};
+use crate::wait_stats::{WaitReason, WaitSite};
 
 const MAX_WAIT_OBJECTS: usize = 64;
 
@@ -147,7 +148,7 @@ pub(super) fn wait_synchronization(svc: &mut SvcContext) -> Flow {
             return svc.finish(Ok(()));
         }
     }
-    svc.block(token, deadline(timeout), false)
+    svc.block(token, deadline(timeout), false, || WaitSite::sync(objects))
 }
 
 /// `svcCancelSynchronization(thread handle w0)`.
@@ -158,13 +159,21 @@ pub(super) fn cancel_synchronization(svc: &mut SvcContext) -> Flow {
     svc.finish(result)
 }
 
-fn after_wait(svc: &mut SvcContext, outcome: HleResult<WaitOutcome>, timeout: i64) -> Flow {
+fn after_wait(
+    svc: &mut SvcContext,
+    outcome: HleResult<WaitOutcome>,
+    timeout: i64,
+    reason: WaitReason,
+    address: u64,
+) -> Flow {
     match outcome {
         Ok(WaitOutcome::Done(code)) => {
             svc.set_result(code);
             Flow::Continue
         }
-        Ok(WaitOutcome::Block(token)) => svc.block(token, deadline(timeout), false),
+        Ok(WaitOutcome::Block(token)) => svc.block(token, deadline(timeout), false, || {
+            WaitSite::address(reason, address)
+        }),
         Err(code) => svc.finish(Err(code)),
     }
 }
@@ -175,7 +184,8 @@ pub(super) fn arbitrate_lock(svc: &mut SvcContext) -> Flow {
         svc.kernel
             .arbiter
             .arbitrate_lock(svc.thread, svc.arg32(0), svc.arg(1), svc.arg32(2));
-    after_wait(svc, outcome, -1)
+    let address = svc.arg(1);
+    after_wait(svc, outcome, -1, WaitReason::Lock, address)
 }
 
 /// `svcArbitrateUnlock(addr x0)`.
@@ -194,7 +204,8 @@ pub(super) fn wait_process_wide_key_atomic(svc: &mut SvcContext) -> Flow {
         svc.arg32(2),
         timeout == 0,
     );
-    after_wait(svc, outcome, timeout)
+    let key = svc.arg(1);
+    after_wait(svc, outcome, timeout, WaitReason::Condvar, key)
 }
 
 /// `svcSignalProcessWideKey(key x0, count w1)`.
@@ -218,7 +229,8 @@ pub(super) fn wait_for_address(svc: &mut SvcContext) -> Flow {
             .arbiter
             .wait_for_address(svc.thread, svc.arg(0), kind, value, timeout == 0)
     });
-    after_wait(svc, outcome, timeout)
+    let address = svc.arg(0);
+    after_wait(svc, outcome, timeout, WaitReason::Address, address)
 }
 
 /// `svcSignalToAddress(addr x0, type w1, value w2, count w3)`.

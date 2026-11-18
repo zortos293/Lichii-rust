@@ -6,7 +6,7 @@ use gpu_allocator::MemoryLocation;
 
 use crate::device::Device;
 use crate::error::Result;
-use crate::host_budget::Oversized;
+use crate::host_budget::{Oversized, PART_SLICE, STAGING_REQUEST_MAX};
 use crate::memory::{Buffer, LiveMemory};
 use crate::scheduler::Scheduler;
 
@@ -25,7 +25,20 @@ const STAGING_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
 /// A ring of host-visible memory for uploads. Each allocation is tagged with the scheduler tick
 /// that consumes it and reused once that tick completed, so steady-state uploads allocate
 /// nothing. Requests larger than a quarter of the ring get a buffer of their own, freed the same
-/// way, at most `oversized_cap` bytes of them in flight ([`Oversized`]).
+/// way, at most `oversized_cap` bytes of them in flight ([`Oversized`]), and none larger than
+/// [`STAGING_REQUEST_MAX`]. An operation that stages more goes through two part slices instead
+/// ([`StagingRing::part`]).
+///
+/// A ring made by [`StagingRing::new`] holds uploads whose callers record every use before
+/// they allocate again (staging for transfers). When it is full of the tick being recorded, it
+/// submits that work as a part ([`Scheduler::submit_part`]) and waits for it, so it never ends
+/// the tick under an operation. A stream ring ([`StagingRing::with_usage`]) hands out bindings
+/// read by commands recorded later, so it waits for the tick instead.
+///
+/// Host-visible memory it holds: the ring's `capacity`, at most `oversized_cap` in flight, and
+/// the part slices: `2 * PART_SLICE` (16 MiB) once used, up to `2 * STAGING_REQUEST_MAX`
+/// (128 MiB) from an operation that stages pieces that large until the tick that last used them
+/// completed.
 ///
 /// The ring asks the GPU which ticks completed once per scheduler tick, and again only when an
 /// allocation does not fit. A tick's newest region stays until the tick completes, so within one
@@ -45,18 +58,41 @@ pub struct StagingRing {
     usage: vk::BufferUsageFlags,
     oversized_name: &'static str,
     oversized: Oversized,
+    parts: [PartSlot; 2],
+    /// The slot [`StagingRing::part`] hands out next.
+    next_part: usize,
+    /// The slot handed out last, until a part submits the work that uses it.
+    unsubmitted: Option<usize>,
+    /// The largest request since [`StagingRing::take_request_max`].
+    request_max: u64,
+    /// Every use of an allocation is recorded before the next allocation, so a part that
+    /// submitted the tick so far frees all of its regions.
+    uses_recorded: bool,
+}
+
+/// One of a ring's two part slices, the part that last used it, and the tick it was last handed
+/// out in.
+#[derive(Default)]
+struct PartSlot {
+    buffer: Option<Buffer>,
+    part: u64,
+    tick: u64,
 }
 
 impl StagingRing {
     pub fn new(device: &Arc<Device>, capacity: u64, oversized_cap: u64) -> Result<Self> {
-        Self::with_usage(
+        let ring = Self::with_usage(
             device,
             capacity,
             oversized_cap,
             STAGING_USAGE,
             "staging ring",
             "staging (oversized)",
-        )
+        )?;
+        Ok(Self {
+            uses_recorded: true,
+            ..ring
+        })
     }
 
     /// A ring of buffers made for `usage`, named `name` and `oversized_name`.
@@ -78,13 +114,91 @@ impl StagingRing {
             polled: u64::MAX,
             usage,
             oversized_name,
-            oversized: Oversized::new(oversized_cap),
+            oversized: Oversized::new(oversized_cap, MemoryLocation::CpuToGpu),
+            parts: Default::default(),
+            next_part: 0,
+            unsubmitted: None,
+            request_max: 0,
+            uses_recorded: false,
         })
     }
 
     /// The oversized buffers not freed yet.
     pub fn oversized(&self) -> LiveMemory {
         self.oversized.live()
+    }
+
+    /// The largest single request (an allocation or a part) since the last call.
+    pub fn take_request_max(&mut self) -> u64 {
+        std::mem::take(&mut self.request_max)
+    }
+
+    /// A part slice of at least `size` bytes (at most [`STAGING_REQUEST_MAX`]) at offset 0, for
+    /// one piece of an operation that stages more than shares the ring. The two slices are
+    /// handed out in turn: asking for one first submits the work recorded so far as a part of
+    /// the tick ([`Scheduler::submit_part`]), which holds the copies out of the slice handed out
+    /// before, then waits for the part that last used this slice ([`Scheduler::wait_part`]). So
+    /// the host fills one slice while the GPU reads the other, the tick never ends under the
+    /// operation, and allocations it made earlier stay valid.
+    ///
+    /// The caller records every use of the slice before it asks for the next part. A slice
+    /// grows to the next power of two of the piece, from [`PART_SLICE`] up to
+    /// [`STAGING_REQUEST_MAX`], and later operations reuse it as it is, so however many large
+    /// uploads a tick makes, the two slices hold `2 * STAGING_REQUEST_MAX` at most. A grown slice
+    /// shrinks back once the tick that last used it completed ([`StagingRing::reclaim_parts`]).
+    pub fn part(&mut self, scheduler: &mut Scheduler, size: u64) -> Result<StagingSlice<'_>> {
+        debug_assert!(
+            size <= STAGING_REQUEST_MAX,
+            "a {size}-byte part passed STAGING_REQUEST_MAX"
+        );
+        self.request_max = self.request_max.max(size);
+        if let Some(index) = self.unsubmitted.take() {
+            self.parts[index].part = scheduler.submit_part()?;
+        }
+        let index = self.next_part;
+        self.next_part ^= 1;
+        let slot = &mut self.parts[index];
+        scheduler.wait_part(slot.part)?;
+        if slot.buffer.as_ref().is_none_or(|b| b.size() < size) {
+            let capacity = size.next_power_of_two().max(PART_SLICE);
+            slot.buffer = None;
+            slot.buffer = Some(Buffer::new(
+                &self.device,
+                capacity,
+                self.usage,
+                MemoryLocation::CpuToGpu,
+                self.oversized_name,
+            )?);
+        }
+        slot.tick = scheduler.tick();
+        self.unsubmitted = Some(index);
+        let buffer = slot.buffer.as_mut().expect("just ensured");
+        Ok(StagingSlice {
+            buffer: buffer.raw(),
+            offset: 0,
+            data: buffer.mapped_mut().expect("staging memory is host visible"),
+        })
+    }
+
+    /// Frees the part slices grown past [`PART_SLICE`] whose last tick completed, so they hold
+    /// `2 * PART_SLICE` again. The rasterizer calls it once per tick.
+    pub fn reclaim_parts(&mut self, scheduler: &mut Scheduler) {
+        for slot in &mut self.parts {
+            if slot.buffer.as_ref().is_some_and(|b| b.size() > PART_SLICE)
+                && scheduler.is_complete(slot.tick)
+            {
+                slot.buffer = None;
+            }
+        }
+    }
+
+    /// Host-visible bytes the part slices hold.
+    pub fn part_bytes(&self) -> u64 {
+        self.parts
+            .iter()
+            .filter_map(|slot| slot.buffer.as_ref())
+            .map(Buffer::size)
+            .sum()
     }
 
     /// `size` bytes aligned to `align` (a power of two), valid until the work recorded in
@@ -95,6 +209,7 @@ impl StagingRing {
         size: u64,
         align: u64,
     ) -> Result<StagingSlice<'_>> {
+        self.request_max = self.request_max.max(size);
         if !self.shares_ring(size) {
             self.reclaim(scheduler);
             let buffer = self.oversized.alloc(
@@ -127,7 +242,17 @@ impl StagingRing {
             }
             if stale {
                 let (_, _, oldest) = *self.regions.front().expect("a full ring has regions");
-                scheduler.wait(oldest)?;
+                if self.uses_recorded && oldest == scheduler.tick() {
+                    let part = scheduler.submit_part()?;
+                    if let Some(index) = self.unsubmitted.take() {
+                        self.parts[index].part = part;
+                    }
+                    scheduler.wait_part(part)?;
+                    self.regions.clear();
+                    self.head = 0;
+                } else {
+                    scheduler.wait(oldest)?;
+                }
             }
             stale = true;
         };
@@ -172,6 +297,7 @@ impl StagingRing {
             self.head = 0;
         }
         self.oversized.reclaim(scheduler);
+        self.reclaim_parts(scheduler);
     }
 
     /// Whether the work being recorded at `tick` holds half the oversized cap or more

@@ -33,10 +33,12 @@ use crate::chunk_mask::ChunkMask;
 use crate::commands::transfer_to_all_barrier;
 use crate::device::Device;
 use crate::error::{Result, VkResultExt};
-use crate::host_budget::{RING_OVERSIZED_CAP, Readback};
+use crate::host_budget::{
+    Oversized, PART_SLICE, RING_OVERSIZED_CAP, Readback, STAGING_REQUEST_MAX,
+};
 use crate::memory::{Buffer, BufferView, LiveMemory};
 use crate::scheduler::{Scheduler, Timeline};
-use crate::staging::{StagingRing, StagingSlice};
+use crate::staging::StagingRing;
 
 const CACHING_PAGE_BITS: u32 = 16;
 const CACHING_PAGE_SIZE: u64 = 1 << CACHING_PAGE_BITS;
@@ -44,8 +46,6 @@ const CACHING_PAGE_SIZE: u64 = 1 << CACHING_PAGE_BITS;
 pub const UNIFORM_STREAM_MAX: u64 = 4 << 10;
 const STREAM_RING_SIZE: u64 = 16 << 20;
 
-/// Bytes of each of the two [`SyncSlices`].
-const SYNC_SLICE: u64 = 8 << 20;
 /// Joins of joins past this score mark a stream buffer, which then grows ahead of its writes.
 const STREAM_LEAP_THRESHOLD: u32 = 16;
 const STREAM_LEAP_BYTES: u64 = 128 * CACHING_PAGE_SIZE;
@@ -57,6 +57,10 @@ const MAX_GATHER_SIZE: u64 = 64 << 20;
 const GATHER_CACHE_MIN: u64 = CACHING_PAGE_SIZE;
 /// The most cached gathers kept: the least recently bound go first.
 const GATHER_CACHE_ENTRIES: usize = 64;
+/// In-flight device-local bytes of [`BufferCache::large`]: gathers too large for the stream
+/// ring and streamed ranges past [`STAGING_REQUEST_MAX`]. One larger range alone still gets its
+/// buffer, once nothing submitted holds the pool.
+const LARGE_STREAM_CAP: u64 = 256 << 20;
 /// The device-local bytes cached gathers may own, evicted ones the GPU may still read included.
 /// A range larger than this gathers into stream memory on every bind instead.
 const GATHER_CACHE_BYTES: u64 = 256 << 20;
@@ -199,18 +203,6 @@ struct CachedBuffer {
     /// and when GPU work writing it is recorded. Epochs only grow, so the newest of a gather's
     /// sources changes whenever any source does.
     modified: u64,
-}
-
-/// Host-visible memory for uploads too large to share the staging ring: two slices of
-/// [`SYNC_SLICE`] bytes, made on first use and kept, filled in turn. The copies out of a slice
-/// are submitted as soon as they are recorded ([`Scheduler::submit_part`]) and the slice is
-/// filled again once that part finished, so the host fills one slice while the GPU copies out of
-/// the other, and uploads of any size hold `2 * SYNC_SLICE` bytes of it at most.
-struct SyncSlices {
-    buffer: Buffer,
-    /// The part each slice's last copies were submitted in.
-    parts: [u64; 2],
-    next: usize,
 }
 
 /// A large scattered storage range gathered into a buffer of its own, reused while
@@ -1179,6 +1171,53 @@ fn before_transfer(device: &Device, cmd: vk::CommandBuffer) {
     unsafe { device.raw.cmd_pipeline_barrier2(cmd, &dependency) };
 }
 
+/// Records the copy of the `size` bytes `fill` writes into `dst` from offset 0: through one
+/// staging allocation up to [`STAGING_REQUEST_MAX`], else from a host copy through the staging
+/// ring's part slices ([`StagingRing::part`]), a slice at a time.
+fn upload_bytes(
+    device: &Device,
+    scheduler: &mut Scheduler,
+    staging: &mut StagingRing,
+    dst: vk::Buffer,
+    size: u64,
+    fill: impl FnOnce(&mut [u8]),
+) -> Result<()> {
+    if size <= STAGING_REQUEST_MAX {
+        let slice = staging.alloc(scheduler, size, 16)?;
+        fill(slice.data);
+        let region = [vk::BufferCopy {
+            src_offset: slice.offset,
+            dst_offset: 0,
+            size,
+        }];
+        let src = slice.buffer;
+        let cmd = scheduler.record()?;
+        before_transfer(device, cmd);
+        copy_buffer(device, cmd, src, dst, &region);
+        transfer_to_all_barrier(device, cmd);
+        return Ok(());
+    }
+    let mut bytes = vec![0; size as usize];
+    fill(&mut bytes);
+    let mut offset = 0;
+    for piece in bytes.chunks(PART_SLICE as usize) {
+        let slice = staging.part(scheduler, piece.len() as u64)?;
+        slice.data[..piece.len()].copy_from_slice(piece);
+        let region = [vk::BufferCopy {
+            src_offset: 0,
+            dst_offset: offset,
+            size: piece.len() as u64,
+        }];
+        let src = slice.buffer;
+        let cmd = scheduler.record()?;
+        before_transfer(device, cmd);
+        copy_buffer(device, cmd, src, dst, &region);
+        transfer_to_all_barrier(device, cmd);
+        offset += piece.len() as u64;
+    }
+    Ok(())
+}
+
 fn copy_buffer(
     device: &Device,
     cmd: vk::CommandBuffer,
@@ -1225,7 +1264,11 @@ pub struct BufferCache {
     /// Host-visible memory the GPU reads directly: streamed uniforms, gathered ranges and
     /// converted indices.
     stream: StagingRing,
-    sync_slices: Option<SyncSlices>,
+    /// Device-local buffers of their own for what does not share the stream ring but the GPU
+    /// reads as one binding: gathers (written by GPU copies, so they need no host-visible
+    /// memory) and streamed ranges past [`STAGING_REQUEST_MAX`] (filled through the staging
+    /// ring's part slices). At most [`LARGE_STREAM_CAP`] in flight, freed with their tick.
+    large: Oversized,
     readback: Readback,
     captures: Captures,
     pending_reads: Option<PendingReads>,
@@ -1284,7 +1327,7 @@ impl BufferCache {
                 "buffer cache stream",
                 "buffer cache stream (oversized)",
             )?,
-            sync_slices: None,
+            large: Oversized::new(LARGE_STREAM_CAP, MemoryLocation::GpuOnly),
             readback: Readback::default(),
             captures: Captures::default(),
             pending_reads: None,
@@ -1315,9 +1358,9 @@ impl BufferCache {
     }
 
     /// Whether the work being recorded at `tick` holds half the stream ring's oversized cap or
-    /// more ([`StagingRing::should_submit`]).
+    /// half [`LARGE_STREAM_CAP`], or more ([`StagingRing::should_submit`]).
     pub(crate) fn should_submit(&self, tick: u64) -> bool {
-        self.stream.should_submit(tick)
+        self.stream.should_submit(tick) || self.large.should_submit(tick)
     }
 
     /// Whether GPU work wrote bytes of `[daddr, +size)` that [`BufferCache::flush`] has not
@@ -1330,6 +1373,24 @@ impl BufferCache {
     /// The oversized stream buffers not freed yet.
     pub fn oversized_stream(&self) -> LiveMemory {
         self.stream.oversized()
+    }
+
+    /// The device-local gathers and streamed ranges too large for the stream ring not freed
+    /// yet ([`BufferCache::large`]).
+    pub fn large_stream(&self) -> LiveMemory {
+        self.large.live()
+    }
+
+    /// Frees the device-local gathers and streamed ranges ([`BufferCache::large`]) whose work
+    /// completed. The rasterizer calls it once per tick, so none outlives its tick by more than
+    /// one.
+    pub(crate) fn reclaim(&mut self, scheduler: &mut Scheduler) {
+        self.large.reclaim(scheduler);
+    }
+
+    /// The largest single stream request since the last call ([`StagingRing::take_request_max`]).
+    pub fn take_stream_request_max(&mut self) -> u64 {
+        self.stream.take_request_max()
     }
 
     /// The alignment storage bindings start at: [`BufferCache::storage_buffer`] rounds the
@@ -2037,10 +2098,10 @@ impl BufferCache {
 
     /// Uploads the dirty pages of `[daddr, +size)` of buffer `id` that no GPU work wrote. An
     /// upload that shares the staging ring takes one slice of it; a larger one goes through the
-    /// two [`SyncSlices`] in pieces of at most [`SYNC_SLICE`] bytes, each submitted as a part of
-    /// the tick. So whatever the upload's size, it holds at most `2 * SYNC_SLICE` (16 MiB) of
-    /// host-visible memory beside the ring and takes nothing from the
-    /// [`Oversized`](crate::host_budget::Oversized) budget.
+    /// ring's part slices ([`StagingRing::part`]) in pieces of at most a slice, each submitted
+    /// as a part of the tick. So whatever the upload's size, it holds at most the two part slices
+    /// (16 MiB unless an operation grew them) of host-visible memory beside the ring and takes
+    /// nothing from the [`Oversized`](crate::host_budget::Oversized) budget.
     /// The parts never end the tick: what the operation being set up allocated before stays
     /// valid, and its commands keep their order.
     fn synchronize(
@@ -2090,39 +2151,11 @@ impl BufferCache {
         let total = uploads.iter().map(|&(_, len)| len).sum();
         self.stats.uploaded_bytes += total;
         let shared = staging.shares_ring(total);
-        if !shared && self.sync_slices.is_none() {
-            self.sync_slices = Some(SyncSlices {
-                buffer: Buffer::new(
-                    &self.device,
-                    2 * SYNC_SLICE,
-                    vk::BufferUsageFlags::TRANSFER_SRC,
-                    MemoryLocation::CpuToGpu,
-                    "upload slices",
-                )?,
-                parts: [0; 2],
-                next: 0,
-            });
-        }
-        let (mut run, mut done) = (0, 0);
+        let (mut run, mut done, mut staged) = (0, 0, 0);
         while run < uploads.len() {
-            let (slice, part) = match &mut self.sync_slices {
-                Some(slices) if !shared => {
-                    let index = slices.next;
-                    slices.next ^= 1;
-                    scheduler.wait_part(slices.parts[index])?;
-                    let start = index as u64 * SYNC_SLICE;
-                    let slice = StagingSlice {
-                        buffer: slices.buffer.raw(),
-                        offset: start,
-                        data: &mut slices
-                            .buffer
-                            .mapped_mut()
-                            .expect("upload slices are mapped")
-                            [start as usize..(start + SYNC_SLICE) as usize],
-                    };
-                    (slice, Some(&mut slices.parts[index]))
-                }
-                _ => (staging.alloc(scheduler, total, 16)?, None),
+            let slice = match shared {
+                true => staging.alloc(scheduler, total, 16)?,
+                false => staging.part(scheduler, (total - staged).min(PART_SLICE))?,
             };
             copies.clear();
             let mut used = 0;
@@ -2141,6 +2174,7 @@ impl BufferCache {
                 });
                 used += piece;
                 done += piece;
+                staged += piece;
                 if done == len {
                     (run, done) = (run + 1, 0);
                 }
@@ -2149,9 +2183,6 @@ impl BufferCache {
             before_transfer(&self.device, cmd);
             copy_buffer(&self.device, cmd, slice.buffer, dst, copies);
             transfer_to_all_barrier(&self.device, cmd);
-            if let Some(part) = part {
-                *part = scheduler.submit_part()?;
-            }
         }
         Ok(())
     }
@@ -2288,7 +2319,8 @@ impl BufferCache {
     }
 
     /// Copies a GPU range that is not one device range into stream memory (see
-    /// [`BufferCache::record_gather`]).
+    /// [`BufferCache::record_gather`]), or into a device-local buffer of its own
+    /// ([`BufferCache::large`]) when it does not share the stream ring.
     fn gather(
         &mut self,
         scheduler: &mut Scheduler,
@@ -2300,10 +2332,20 @@ impl BufferCache {
     ) -> Result<BufferBinding> {
         self.segments.clear();
         gmmu.for_each_range(gpu_va, size, |range| self.segments.push(range));
-        let slice = self
-            .stream
-            .alloc(scheduler, size.next_multiple_of(4), align.max(4))?;
-        let (dst, dst_offset) = (slice.buffer, slice.offset);
+        let padded = size.next_multiple_of(4);
+        let (dst, dst_offset) = if self.stream.shares_ring(padded) {
+            let slice = self.stream.alloc(scheduler, padded, align.max(4))?;
+            (slice.buffer, slice.offset)
+        } else {
+            let buffer = self.large.alloc(
+                &self.device,
+                scheduler,
+                padded,
+                STREAM_USAGE,
+                "gathered range (oversized)",
+            )?;
+            (buffer.raw(), 0)
+        };
         self.record_gather(scheduler, staging, gpu_va, dst, dst_offset)?;
         self.stats.streamed_bytes += size;
         Ok(BufferBinding {
@@ -2750,13 +2792,20 @@ impl BufferCache {
         if let Some(inline) = draw.inline_indices {
             let indices = sub_indices(inline, draw.first, draw.count);
             return self
-                .assemble_indices(scheduler, assembly, indices, restart, draw.base_vertex)
+                .assemble_indices(
+                    scheduler,
+                    staging,
+                    assembly,
+                    indices,
+                    restart,
+                    draw.base_vertex,
+                )
                 .map(Some);
         }
         if !draw.indexed {
             return match assembly {
                 Assembly::Direct => Ok(None),
-                Assembly::LineLoop => self.line_loop(scheduler, draw).map(Some),
+                Assembly::LineLoop => self.line_loop(scheduler, staging, draw).map(Some),
                 quads => self.quad_lut(scheduler, staging, quads, draw).map(Some),
             };
         }
@@ -2811,8 +2860,14 @@ impl BufferCache {
             2 => InlineIndices::U16(&bytemuck::cast_slice(&scratch)[..count]),
             _ => InlineIndices::U32(&scratch[..count]),
         };
-        let binding =
-            self.assemble_indices(scheduler, assembly, indices, restart, draw.base_vertex);
+        let binding = self.assemble_indices(
+            scheduler,
+            staging,
+            assembly,
+            indices,
+            restart,
+            draw.base_vertex,
+        );
         self.scratch = scratch;
         binding.map(Some)
     }
@@ -2820,6 +2875,7 @@ impl BufferCache {
     fn assemble_indices(
         &mut self,
         scheduler: &mut Scheduler,
+        staging: &mut StagingRing,
         assembly: Assembly,
         indices: InlineIndices<'_>,
         restart: bool,
@@ -2838,11 +2894,12 @@ impl BufferCache {
             return Ok(IndexBinding::EMPTY);
         }
         let size = u64::from(index_count) * index_size(index_type) as u64;
-        let slice = self.stream.alloc(scheduler, size, 4)?;
-        assemble(assembly, count, index, restart, index_type, slice.data);
+        let (buffer, offset) = self.stream_filled(scheduler, staging, size, |data| {
+            assemble(assembly, count, index, restart, index_type, data)
+        })?;
         let binding = IndexBinding {
-            buffer: slice.buffer,
-            offset: slice.offset,
+            buffer,
+            offset,
             index_type,
             first_index: 0,
             index_count,
@@ -2852,9 +2909,40 @@ impl BufferCache {
         Ok(binding)
     }
 
+    /// Stream memory of `size` bytes that `fill` writes, read by the work being recorded: the
+    /// stream ring up to [`STAGING_REQUEST_MAX`], else a device-local buffer of its own
+    /// ([`BufferCache::large`]) filled through the staging ring's part slices, so no
+    /// host-visible request passes the bound.
+    fn stream_filled(
+        &mut self,
+        scheduler: &mut Scheduler,
+        staging: &mut StagingRing,
+        size: u64,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> Result<(vk::Buffer, u64)> {
+        if size <= STAGING_REQUEST_MAX {
+            let slice = self.stream.alloc(scheduler, size, 4)?;
+            fill(slice.data);
+            return Ok((slice.buffer, slice.offset));
+        }
+        let dst = self
+            .large
+            .alloc(
+                &self.device,
+                scheduler,
+                size,
+                STREAM_USAGE,
+                "streamed range (oversized)",
+            )?
+            .raw();
+        upload_bytes(&self.device, scheduler, staging, dst, size, fill)?;
+        Ok((dst, 0))
+    }
+
     fn line_loop(
         &mut self,
         scheduler: &mut Scheduler,
+        staging: &mut StagingRing,
         draw: &DrawParams<'_>,
     ) -> Result<IndexBinding> {
         let index_count = Assembly::LineLoop.output_count(draw.count);
@@ -2862,18 +2950,20 @@ impl BufferCache {
             return Ok(IndexBinding::EMPTY);
         }
         let size = u64::from(index_count) * 4;
-        let slice = self.stream.alloc(scheduler, size, 4)?;
-        assemble(
-            Assembly::LineLoop,
-            draw.count as usize,
-            |i| i as u32,
-            false,
-            vk::IndexType::UINT32,
-            slice.data,
-        );
+        let vertices = draw.count as usize;
+        let (buffer, offset) = self.stream_filled(scheduler, staging, size, |data| {
+            assemble(
+                Assembly::LineLoop,
+                vertices,
+                |i| i as u32,
+                false,
+                vk::IndexType::UINT32,
+                data,
+            )
+        })?;
         let binding = IndexBinding {
-            buffer: slice.buffer,
-            offset: slice.offset,
+            buffer,
+            offset,
             index_type: vk::IndexType::UINT32,
             first_index: 0,
             index_count,
@@ -2914,25 +3004,23 @@ impl BufferCache {
                 Assembly::Quads => quads * 4,
                 _ => quads * 2 + 2,
             };
-            let slice = staging.alloc(scheduler, size, 16)?;
-            assemble(
-                assembly,
-                vertices as usize,
-                |i| i as u32,
-                false,
-                vk::IndexType::UINT32,
-                slice.data,
-            );
-            let region = [vk::BufferCopy {
-                src_offset: slice.offset,
-                dst_offset: 0,
+            upload_bytes(
+                &self.device,
+                scheduler,
+                staging,
+                buffer.raw(),
                 size,
-            }];
-            let src = slice.buffer;
-            let cmd = scheduler.record()?;
-            before_transfer(&self.device, cmd);
-            copy_buffer(&self.device, cmd, src, buffer.raw(), &region);
-            transfer_to_all_barrier(&self.device, cmd);
+                |data| {
+                    assemble(
+                        assembly,
+                        vertices as usize,
+                        |i| i as u32,
+                        false,
+                        vk::IndexType::UINT32,
+                        data,
+                    )
+                },
+            )?;
             if let Some(old) = lut.buffer.replace(buffer) {
                 scheduler.retire(old);
             }
@@ -3371,10 +3459,10 @@ mod tests {
         let Some(mut f) = fixture_with(3 * POOL) else {
             return;
         };
-        let slices = POOL / SYNC_SLICE;
+        let slices = POOL / PART_SLICE;
         let samples: Vec<u64> = (0..slices)
-            .flat_map(|k| [k * SYNC_SLICE + 0x3000, k * SYNC_SLICE + SYNC_SLICE / 2])
-            .chain((1..slices).map(|k| k * SYNC_SLICE - PAGE_SIZE / 2))
+            .flat_map(|k| [k * PART_SLICE + 0x3000, k * PART_SLICE + PART_SLICE / 2])
+            .chain((1..slices).map(|k| k * PART_SLICE - PAGE_SIZE / 2))
             .chain([POOL - PAGE_SIZE])
             .collect();
         for pool in 0..3 {
@@ -3400,7 +3488,7 @@ mod tests {
                 pool + 1
             );
             assert!(
-                held <= 2 * SYNC_SLICE,
+                held <= 2 * PART_SLICE,
                 "{held} bytes held: more than the slices"
             );
         }
@@ -5680,6 +5768,205 @@ mod tests {
             }
             eprintln!("{line}");
         }
+        f.assert_no_validation_errors();
+    }
+    /// Host-visible bytes allocated since \`before\`, and the largest staging and stream requests
+    /// since the last call.
+    fn bounded_host(f: &mut Fixture, before: u64) -> (u64, u64) {
+        let held = f.device.memory_counts().cpu_to_gpu.bytes - before;
+        let request = f
+            .staging
+            .take_request_max()
+            .max(f.cache.take_stream_request_max());
+        (held, request)
+    }
+
+    #[test]
+    fn gathers_too_large_for_the_stream_ring_fill_device_memory_through_bounded_parts() {
+        const SIZE: u64 = 128 << 20;
+        const CHUNK: u64 = 1 << 20;
+        let Some(mut f) = fixture_with(SIZE + CHUNK) else {
+            return;
+        };
+        let chunks = SIZE / CHUNK;
+        for k in 0..chunks {
+            let daddr = DADDR + (chunks - 1 - k) * CHUNK;
+            f.memory
+                .write_bytes(daddr, &pattern(CHUNK as usize, k as u32 * 31 + 5))
+                .unwrap();
+            f.gmmu
+                .map(GPU_VA + k * CHUNK, daddr, CHUNK, 0, false)
+                .unwrap();
+        }
+        let before = f.device.memory_counts().cpu_to_gpu.bytes;
+        let tick = f.scheduler.tick();
+        let binding = f
+            .cache
+            .gather(&mut f.scheduler, &mut f.staging, &f.gmmu, GPU_VA, SIZE, 16)
+            .unwrap();
+        let (held, request) = bounded_host(&mut f, before);
+        assert_eq!(
+            f.scheduler.tick(),
+            tick,
+            "one operation: the tick never ended"
+        );
+        assert_eq!((binding.offset, binding.size), (0, SIZE));
+        assert_eq!(
+            f.cache.large_stream().bytes,
+            SIZE,
+            "a device-local destination"
+        );
+        assert_eq!(f.cache.oversized_stream().bytes, 0, "no oversized stream");
+        assert_eq!(f.staging.oversized().bytes, 0, "no oversized staging");
+        assert!(
+            request <= PART_SLICE,
+            "a {request}-byte request: the sources upload in part slices"
+        );
+        assert!(
+            held <= 2 * PART_SLICE,
+            "{held} host-visible bytes for a {SIZE}-byte gather"
+        );
+        for k in [0, 1, chunks / 2, chunks - 1] {
+            for at in [0, CHUNK / 2 + 0x123, CHUNK - PAGE_SIZE] {
+                let got = f.read_back(binding.buffer, k * CHUNK + at, PAGE_SIZE);
+                let want = pattern(CHUNK as usize, k as u32 * 31 + 5);
+                assert!(
+                    got[..] == want[at as usize..(at + PAGE_SIZE) as usize],
+                    "chunk {k} at {at:#x} reads its own device bytes"
+                );
+            }
+        }
+        f.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn generated_indices_past_the_request_bound_fill_device_memory_through_bounded_parts() {
+        let Some(mut f) = fixture() else { return };
+        let regs = bytemuck::zeroed_box::<Regs>();
+        let vertices = 20_000_000u32;
+        let before = f.device.memory_counts().cpu_to_gpu.bytes;
+        let tick = f.scheduler.tick();
+        let line_loop = f
+            .index_buffer(
+                &regs,
+                &draw(PrimitiveTopology::LINE_LOOP, false, 0, vertices),
+            )
+            .unwrap();
+        let quad_vertices = 12_000_000u32;
+        let quads = f
+            .index_buffer(
+                &regs,
+                &draw(PrimitiveTopology::QUADS, false, 0, quad_vertices),
+            )
+            .unwrap();
+        let (held, request) = bounded_host(&mut f, before);
+        assert_eq!(
+            f.scheduler.tick(),
+            tick,
+            "one operation: the tick never ended"
+        );
+        assert_eq!(line_loop.index_count, vertices + 1);
+        assert!(u64::from(line_loop.index_count) * 4 > STAGING_REQUEST_MAX);
+        assert_eq!(quads.index_count, quad_vertices / 4 * 6);
+        assert!(u64::from(quads.index_count) * 4 > STAGING_REQUEST_MAX);
+        assert_eq!(
+            f.cache.large_stream().bytes,
+            u64::from(line_loop.index_count) * 4,
+            "the loop's indices are device-local"
+        );
+        assert_eq!(f.cache.oversized_stream().bytes, 0, "no oversized stream");
+        assert_eq!(f.staging.oversized().bytes, 0, "no oversized staging");
+        assert!(request <= PART_SLICE, "a {request}-byte request");
+        assert!(
+            held <= 2 * PART_SLICE,
+            "{held} host-visible bytes for {} MiB of generated indices",
+            (u64::from(line_loop.index_count + quads.index_count) * 4) >> 20
+        );
+        let read = |f: &mut Fixture, binding: IndexBinding, first: u32| -> Vec<u32> {
+            let bytes = f.read_back(binding.buffer, binding.offset + u64::from(first) * 4, 16);
+            bytemuck::pod_collect_to_vec(&bytes)
+        };
+        for first in [0, 2_097_150, vertices / 2, vertices - 3] {
+            let want: Vec<u32> = (first..first + 4)
+                .map(|i| if i == vertices { 0 } else { i })
+                .collect();
+            assert_eq!(
+                read(&mut f, line_loop, first),
+                want,
+                "loop indices from {first}"
+            );
+        }
+        for quad in [0, 349_525, 1_000_000, quad_vertices / 4 - 1] {
+            let base = quad * 4;
+            let got = read(&mut f, quads, quad * 6);
+            assert_eq!(got, [base, base + 1, base + 2, base], "quad {quad}");
+        }
+        f.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn large_ranges_are_freed_once_their_tick_completes() {
+        let Some(mut f) = fixture_with(16 << 20) else {
+            return;
+        };
+        let regs = bytemuck::zeroed_box::<Regs>();
+        let (size, _) = f.map_scattered(GPU_VA);
+        for _ in 0..4 {
+            f.storage_read(GPU_VA, size);
+            f.index_buffer(&regs, &draw(PrimitiveTopology::LINE_LOOP, false, 0, 1000))
+                .unwrap();
+        }
+        f.scheduler.finish().unwrap();
+        f.cache.reclaim(&mut f.scheduler);
+        assert_eq!(
+            f.cache.large_stream(),
+            LiveMemory::default(),
+            "ranges that share the stream ring never allocate from the large pool"
+        );
+        const GATHER: u64 = 8 << 20;
+        for k in 0..GATHER / CACHING_PAGE_SIZE {
+            let va = GPU_VA + (1 << 30) + k * CACHING_PAGE_SIZE;
+            let daddr = DADDR + (GATHER / CACHING_PAGE_SIZE - 1 - k) * CACHING_PAGE_SIZE;
+            f.gmmu.map(va, daddr, CACHING_PAGE_SIZE, 0, false).unwrap();
+        }
+        f.cache
+            .gather(
+                &mut f.scheduler,
+                &mut f.staging,
+                &f.gmmu,
+                GPU_VA + (1 << 30),
+                GATHER,
+                16,
+            )
+            .unwrap();
+        let vertices = 20_000_000u32;
+        f.index_buffer(
+            &regs,
+            &draw(PrimitiveTopology::LINE_LOOP, false, 0, vertices),
+        )
+        .unwrap();
+        let streamed = (u64::from(vertices) + 1) * 4;
+        assert!(streamed > STAGING_REQUEST_MAX);
+        assert_eq!(
+            f.cache.large_stream(),
+            LiveMemory {
+                bytes: GATHER + streamed,
+                count: 2
+            }
+        );
+        f.cache.reclaim(&mut f.scheduler);
+        assert_eq!(
+            f.cache.large_stream().count,
+            2,
+            "nothing is freed while its tick is being recorded"
+        );
+        f.scheduler.finish().unwrap();
+        f.cache.reclaim(&mut f.scheduler);
+        assert_eq!(
+            f.cache.large_stream(),
+            LiveMemory::default(),
+            "both are freed once their tick completed"
+        );
         f.assert_no_validation_errors();
     }
 }
