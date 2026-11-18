@@ -17,11 +17,11 @@ use lichii_gpu::backend::{
 };
 use lichii_gpu::engines::maxwell_3d::regs::{
     AttributePointSize, Blend, BlendPerTarget, ComparisonOp, DepthMode, IndexFormat, Pipeline,
-    PrimitiveTopology, ProgramRegion, ProvokingVertex, RtLayerControl, SamplerBinding, StencilOp,
-    TexHeader, VertexAttribute, VertexAttributeType, WindowOrigin, WindowOriginMode,
+    PrimitiveTopology, ProgramRegion, RtLayerControl, SamplerBinding, TexHeader, VertexAttribute,
+    VertexAttributeType, WindowOrigin, WindowOriginMode,
 };
 use lichii_gpu::engines::maxwell_3d::regs::{MESH_CONTROL, MESH_SHADER_A};
-use lichii_gpu::engines::maxwell_3d::{Regs, dirty};
+use lichii_gpu::engines::maxwell_3d::{DirtyState, Regs, dirty};
 use lichii_shader::backend::Bindings;
 use lichii_shader::backend::spirv::{
     NUM_IMAGE_SCALING_WORDS, NUM_TEXTURE_SCALING_WORDS, RENDER_AREA_LAYOUT_OFFSET,
@@ -69,7 +69,7 @@ use crate::texture_cache::{
     DEPTH_ATTACHMENT, ImageId, ImageInfo, ImageKind, Transfer, Usage, ViewInfo,
 };
 use compute_batch::ComputeBatch;
-use dynamic::{DynamicShadow, Slot};
+use dynamic::{Command, DynamicInputs, DynamicShadow};
 
 const NULL_BUFFER_SIZE: u64 = 64 << 10;
 /// The constant buffer slot NVN2 graphics programs read root table 0 from (their slot 24).
@@ -364,15 +364,10 @@ pub(super) struct DrawState {
     vertex_buffers: Vec<vk::Buffer>,
     vertex_offsets: Vec<u64>,
     vertex_strides: Vec<u64>,
-    vertex_bindings: Vec<vk::VertexInputBindingDescription2EXT<'static>>,
-    vertex_attributes: Vec<vk::VertexInputAttributeDescription2EXT<'static>>,
     attachments: Vec<vk::RenderingAttachmentInfo<'static>>,
     /// The graphics pipeline the open rendering last bound.
     bound_pipeline: vk::Pipeline,
     dynamic: DynamicShadow,
-    blend_enables: Vec<vk::Bool32>,
-    blend_equations: Vec<vk::ColorBlendEquationEXT>,
-    write_masks: Vec<vk::ColorComponentFlags>,
     texture_pipelines: Option<texture::TexturePipelines>,
     assembly: Option<assembly::AssemblyPass>,
     grid: Option<dispatch_grid::GridPass>,
@@ -497,14 +492,9 @@ impl DrawState {
             vertex_buffers: Vec::new(),
             vertex_offsets: Vec::new(),
             vertex_strides: Vec::new(),
-            vertex_bindings: Vec::new(),
-            vertex_attributes: Vec::new(),
             attachments: Vec::new(),
             bound_pipeline: vk::Pipeline::null(),
             dynamic: DynamicShadow::default(),
-            blend_enables: Vec::new(),
-            blend_equations: Vec::new(),
-            write_masks: Vec::new(),
             texture_pipelines: None,
             assembly: None,
             grid: None,
@@ -885,6 +875,7 @@ impl VulkanRasterizer {
         if ctx.dirty.flags_for(first_method)[0] != flags::VERTEX_INPUT {
             FixedStateTracker::register_dirty_flags(ctx.dirty);
         }
+        DynamicShadow::register_dirty_flags(ctx.dirty);
         let regs = ctx.regs;
         let mesh = is_mesh_draw(regs, self.draw.arch);
         let host_topology = match mesh {
@@ -931,7 +922,6 @@ impl VulkanRasterizer {
         let layout_raw = layout.raw();
         let push = layout.push_constants();
         let template = layout.set_template();
-        let features = *draw.pipelines.features();
 
         let gmmu = ctx.memory;
         let mut removals = self.texture_cache.removals();
@@ -1200,7 +1190,7 @@ impl VulkanRasterizer {
             .any(|m| m.info.uses_render_area)
             .then(|| guest_render_area(regs));
         self.push_constants(cmd, layout_raw, push, render_area, scale);
-        self.set_dynamic_state(cmd, regs, &features, host_topology, extent, scale);
+        self.set_dynamic_state(cmd, regs, ctx.dirty, host_topology, extent, scale);
         let mesh_groups = match call {
             DrawCall::Direct(params) if mesh => {
                 if params.count > mesh_limit {
@@ -2471,463 +2461,154 @@ impl VulkanRasterizer {
         }
     }
 
-    /// Sets every dynamic state `features` declares from the registers.
+    /// Records the dynamic state the pipeline declares that changed since the open rendering
+    /// last set it.
     fn set_dynamic_state(
         &mut self,
         cmd: vk::CommandBuffer,
         regs: &Regs,
-        features: &PipelineFeatures,
+        dirty: &mut DirtyState,
         topology: vk::PrimitiveTopology,
         extent: vk::Extent2D,
         scale: ResolutionScale,
     ) {
-        let mesh = is_mesh_draw(regs, self.draw.arch);
-        let raw = &self.device.raw;
+        let device = &self.device;
+        let raw = &device.raw;
         let draw = &mut self.draw;
-        let factor = {
-            let (num, den) = scale.ratio();
-            num as f32 / den as f32
-        };
-        let src = &regs.viewport_transform[0];
-        let mut x = (src.translate_x - src.scale_x) * factor;
-        let mut width = src.scale_x * 2.0 * factor;
-        if width < 0.0 {
-            x += width;
-            width = -width;
-        }
-        let mut y = (src.translate_y - src.scale_y) * factor;
-        let mut height = src.scale_y * 2.0 * factor;
-        if regs.window_origin.mode() != WindowOriginMode::UPPER_LEFT {
-            y += regs.surface_clip.bits1.height() as f32 * factor;
-            height = -height;
-        }
-        let reduce_z = if regs.depth_mode == DepthMode::MINUS_ONE_TO_ONE {
-            1.0
-        } else {
-            0.0
-        };
-        let viewport = vk::Viewport {
-            x,
-            y,
-            width: if width == 0.0 { 1.0 } else { width },
-            height: if height == 0.0 { 1.0 } else { height },
-            min_depth: (src.translate_z - src.scale_z * reduce_z).clamp(0.0, 1.0),
-            max_depth: (src.translate_z + src.scale_z).clamp(0.0, 1.0),
-        };
-        let full = vk::Rect2D {
-            offset: vk::Offset2D::default(),
+        let features = *draw.pipelines.features();
+        let inputs = DynamicInputs {
+            features,
+            device: &device.features,
+            mesh: is_mesh_draw(regs, draw.arch),
+            topology,
             extent,
+            scale,
+            vertex_buffers: &draw.vertex_buffers,
+            vertex_offsets: &draw.vertex_offsets,
+            vertex_strides: &draw.vertex_strides,
+            colors: draw.colors.map(|t| t.map(|t| t.format)),
+            attachments: draw.attachments.len(),
+            outputs: fragment_output_components(&draw.stages),
         };
-        let scissor_regs = &regs.scissor_test[0];
-        let scissor = if scissor_regs.enable != 0 {
-            let s = |v: u32| (v as f32 * factor) as u32;
-            let (x0, x1) = (s(scissor_regs.min_x()), s(scissor_regs.max_x()));
-            let (y0, y1) = (s(scissor_regs.min_y()), s(scissor_regs.max_y()));
-            vk::Rect2D {
-                offset: vk::Offset2D {
-                    x: x0.min(i32::MAX as u32) as i32,
-                    y: y0.min(i32::MAX as u32) as i32,
-                },
-                extent: vk::Extent2D {
-                    width: x1.saturating_sub(x0),
-                    height: y1.saturating_sub(y0),
-                },
-            }
-        } else {
-            full
+        let blendable = |format| {
+            device
+                .format_features(format)
+                .contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND)
         };
-        let two_sided = regs.stencil_two_side_enable != 0;
-        let (back_ref, back_write, back_func) = if two_sided {
-            (
-                regs.stencil_back_ref,
-                regs.stencil_back_mask,
-                regs.stencil_back_func_mask,
-            )
-        } else {
-            (
-                regs.stencil_front_ref,
-                regs.stencil_front_mask,
-                regs.stencil_front_func_mask,
-            )
-        };
-        use vk::StencilFaceFlags as F;
-        let line_width = if self.device.features.wide_lines {
-            regs.line_width_aliased.max(1.0)
-        } else {
-            1.0
-        };
-        let color = &regs.blend_color;
-        let (min_bound, max_bound) = (
-            regs.depth_bounds[0].clamp(0.0, 1.0),
-            regs.depth_bounds[1].clamp(0.0, 1.0),
-        );
-        let shadow = &mut draw.dynamic;
-        // SAFETY: `cmd` is recording inside a dynamic rendering with a pipeline that declares
-        // these dynamic states; extension commands run only when their feature is on.
-        unsafe {
-            shadow.set(Slot::LineWidth, line_width, || {
-                raw.cmd_set_line_width(cmd, line_width)
-            });
-            let device_features = &self.device.features;
-            let bias = depth_bias(regs, device_features);
-            shadow.set(Slot::DepthBias, bias, || {
-                let (constant, clamp, slope, representation) = bias;
-                if !device_features.depth_bias_control {
-                    return raw.cmd_set_depth_bias(cmd, constant, clamp, slope);
-                }
-                let mut representation = vk::DepthBiasRepresentationInfoEXT::default()
-                    .depth_bias_representation(representation)
-                    .depth_bias_exact(device_features.depth_bias_exact);
-                let info = vk::DepthBiasInfoEXT::default()
-                    .depth_bias_constant_factor(constant)
-                    .depth_bias_clamp(clamp)
-                    .depth_bias_slope_factor(slope)
-                    .push_next(&mut representation);
-                (draw.depth_bias_control.fp().cmd_set_depth_bias2_ext)(cmd, &info)
-            });
-            let constants = [color.r, color.g, color.b, color.a];
-            shadow.set(Slot::BlendConstants, constants, || {
-                raw.cmd_set_blend_constants(cmd, &constants)
-            });
-            let bounds = (min_bound, max_bound.max(min_bound));
-            shadow.set(Slot::DepthBounds, bounds, || {
-                raw.cmd_set_depth_bounds(cmd, bounds.0, bounds.1)
-            });
-            let compare = (regs.stencil_front_func_mask, back_func);
-            shadow.set(Slot::StencilCompareMask, compare, || {
-                raw.cmd_set_stencil_compare_mask(cmd, F::FRONT, compare.0);
-                raw.cmd_set_stencil_compare_mask(cmd, F::BACK, compare.1);
-            });
-            let write = (regs.stencil_front_mask, back_write);
-            shadow.set(Slot::StencilWriteMask, write, || {
-                raw.cmd_set_stencil_write_mask(cmd, F::FRONT, write.0);
-                raw.cmd_set_stencil_write_mask(cmd, F::BACK, write.1);
-            });
-            let reference = (regs.stencil_front_ref, back_ref);
-            shadow.set(Slot::StencilReference, reference, || {
-                raw.cmd_set_stencil_reference(cmd, F::FRONT, reference.0);
-                raw.cmd_set_stencil_reference(cmd, F::BACK, reference.1);
-            });
-            if features.extended_dynamic_state {
-                shadow.set(Slot::Viewport, viewport, || {
-                    raw.cmd_set_viewport_with_count(cmd, &[viewport])
-                });
-                shadow.set(Slot::Scissor, scissor, || {
-                    raw.cmd_set_scissor_with_count(cmd, &[scissor])
-                });
-                let cull = if regs.gl_cull_test_enabled != 0 {
-                    mvk::cull_mode(regs.gl_cull_face).unwrap_or(vk::CullModeFlags::BACK)
-                } else {
-                    vk::CullModeFlags::NONE
-                };
-                shadow.set(Slot::CullMode, cull, || raw.cmd_set_cull_mode(cmd, cull));
-                let mut face =
-                    mvk::front_face(regs.gl_front_face).unwrap_or(vk::FrontFace::COUNTER_CLOCKWISE);
-                if regs.window_origin.flip_y() != 0 {
-                    face = if face == vk::FrontFace::CLOCKWISE {
-                        vk::FrontFace::COUNTER_CLOCKWISE
-                    } else {
-                        vk::FrontFace::CLOCKWISE
-                    };
-                }
-                shadow.set(Slot::FrontFace, face, || raw.cmd_set_front_face(cmd, face));
-                if !mesh {
-                    shadow.set(Slot::PrimitiveTopology, topology, || {
-                        raw.cmd_set_primitive_topology(cmd, topology)
-                    });
-                }
-                let depth_test = regs.depth_test_enable != 0;
-                shadow.set(Slot::DepthTestEnable, depth_test, || {
-                    raw.cmd_set_depth_test_enable(cmd, depth_test)
-                });
-                let depth_write = regs.depth_write_enabled != 0;
-                shadow.set(Slot::DepthWriteEnable, depth_write, || {
-                    raw.cmd_set_depth_write_enable(cmd, depth_write)
-                });
-                let depth_op =
-                    mvk::comparison_op(regs.depth_test_func).unwrap_or(vk::CompareOp::ALWAYS);
-                shadow.set(Slot::DepthCompareOp, depth_op, || {
-                    raw.cmd_set_depth_compare_op(cmd, depth_op)
-                });
-                let bounds_test = features.depth_bounds && regs.depth_bounds_enable != 0;
-                shadow.set(Slot::DepthBoundsTestEnable, bounds_test, || {
-                    raw.cmd_set_depth_bounds_test_enable(cmd, bounds_test)
-                });
-                let stencil_test = regs.stencil_enable != 0;
-                shadow.set(Slot::StencilTestEnable, stencil_test, || {
-                    raw.cmd_set_stencil_test_enable(cmd, stencil_test)
-                });
-                let op = |o: &StencilOp| {
-                    let s = |op| mvk::stencil_op(op).unwrap_or(vk::StencilOp::KEEP);
-                    (
-                        s(o.fail),
-                        s(o.zpass),
-                        s(o.zfail),
-                        mvk::comparison_op(o.func).unwrap_or(vk::CompareOp::ALWAYS),
-                    )
-                };
-                let front = op(&regs.stencil_front_op);
-                let back = if two_sided {
-                    op(&regs.stencil_back_op)
-                } else {
-                    front
-                };
-                shadow.set(Slot::StencilOp, (front, back), || {
-                    raw.cmd_set_stencil_op(cmd, F::FRONT, front.0, front.1, front.2, front.3);
-                    raw.cmd_set_stencil_op(cmd, F::BACK, back.0, back.1, back.2, back.3);
-                });
-            } else {
-                shadow.set(Slot::Viewport, viewport, || {
-                    raw.cmd_set_viewport(cmd, 0, &[viewport])
-                });
-                shadow.set(Slot::Scissor, scissor, || {
-                    raw.cmd_set_scissor(cmd, 0, &[scissor])
-                });
-            }
-            if features.extended_dynamic_state2 {
-                use vk::PrimitiveTopology as T;
-                let discard = regs.rasterize_enable == 0;
-                shadow.set(Slot::RasterizerDiscardEnable, discard, || {
-                    raw.cmd_set_rasterizer_discard_enable(cmd, discard)
-                });
-                let offset = match topology {
-                    T::POINT_LIST => regs.polygon_offset_point_enable,
-                    T::LINE_LIST
-                    | T::LINE_STRIP
-                    | T::LINE_LIST_WITH_ADJACENCY
-                    | T::LINE_STRIP_WITH_ADJACENCY => regs.polygon_offset_line_enable,
-                    _ => regs.polygon_offset_fill_enable,
-                } != 0;
-                shadow.set(Slot::DepthBiasEnable, offset, || {
-                    raw.cmd_set_depth_bias_enable(cmd, offset)
-                });
-                if !mesh {
-                    let restartable = matches!(
-                        topology,
-                        T::LINE_STRIP
-                            | T::TRIANGLE_STRIP
-                            | T::TRIANGLE_FAN
-                            | T::LINE_STRIP_WITH_ADJACENCY
-                            | T::TRIANGLE_STRIP_WITH_ADJACENCY
-                    );
-                    let restart = restartable && regs.primitive_restart.enabled != 0;
-                    shadow.set(Slot::PrimitiveRestartEnable, restart, || {
-                        raw.cmd_set_primitive_restart_enable(cmd, restart)
-                    });
-                }
-            }
-            if !draw.vertex_buffers.is_empty() {
-                let buffers = (
-                    draw.vertex_buffers.as_slice(),
-                    draw.vertex_offsets.as_slice(),
-                    draw.vertex_strides.as_slice(),
-                );
-                shadow.set(Slot::VertexBuffers, buffers, || {
-                    if features.extended_dynamic_state && !features.dynamic_vertex_input {
-                        raw.cmd_bind_vertex_buffers2(
-                            cmd,
-                            0,
-                            &draw.vertex_buffers,
-                            &draw.vertex_offsets,
-                            None,
-                            Some(&draw.vertex_strides),
-                        );
-                    } else {
-                        raw.cmd_bind_vertex_buffers(
-                            cmd,
-                            0,
-                            &draw.vertex_buffers,
-                            &draw.vertex_offsets,
-                        );
-                    }
-                });
-            }
-            if features.dynamic_vertex_input && !mesh {
-                draw.vertex_bindings.clear();
-                draw.vertex_attributes.clear();
-                for (location, a) in regs.vertex_attrib_format.iter().enumerate() {
-                    let Some(format) = (a.constant() == 0)
-                        .then(|| mvk::vertex_format(a.type_(), a.size()))
-                        .flatten()
-                    else {
-                        continue;
-                    };
-                    draw.vertex_attributes.push(
-                        vk::VertexInputAttributeDescription2EXT::default()
-                            .location(location as u32)
-                            .binding(a.buffer())
-                            .format(format)
-                            .offset(a.offset()),
-                    );
-                }
-                for (binding, &stride) in draw.vertex_strides.iter().enumerate() {
-                    let instanced = regs.vertex_stream_instances.is_instanced[binding] != 0;
-                    draw.vertex_bindings.push(
-                        vk::VertexInputBindingDescription2EXT::default()
-                            .binding(binding as u32)
-                            .stride(stride as u32)
-                            .input_rate(if instanced {
-                                vk::VertexInputRate::INSTANCE
-                            } else {
-                                vk::VertexInputRate::VERTEX
-                            })
-                            .divisor(1),
-                    );
-                }
-                let input = (
-                    draw.vertex_bindings.as_slice(),
-                    draw.vertex_attributes.as_slice(),
-                );
-                shadow.set(Slot::VertexInput, input, || {
-                    draw.vertex_input.cmd_set_vertex_input(
-                        cmd,
-                        &draw.vertex_bindings,
-                        &draw.vertex_attributes,
-                    )
-                });
-            }
-            let attachments = draw.attachments.len() as u32;
-            if features.dynamic_blend && attachments > 0 {
-                draw.blend_enables.clear();
-                draw.blend_equations.clear();
-                draw.write_masks.clear();
-                let common = regs.color_mask_common != 0;
-                let outputs = fragment_output_components(&draw.stages);
-                for index in 0..attachments as usize {
-                    let mask = regs.color_mask[if common { 0 } else { index }];
-                    draw.write_masks.push(vk::ColorComponentFlags::from_raw(
-                        (mask.r() | mask.g() << 1 | mask.b() << 2 | mask.a() << 3)
-                            & u32::from(outputs[index]),
-                    ));
-                    let b = &regs.blend;
-                    let t = &regs.blend_per_target[index];
-                    let per_target = regs.blend_per_target_enabled != 0;
-                    let (color_op, src_color, dst_color, alpha_op, src_alpha, dst_alpha) =
-                        if per_target {
-                            (
-                                t.color_op,
-                                t.color_source,
-                                t.color_dest,
-                                t.alpha_op,
-                                t.alpha_source,
-                                t.alpha_dest,
-                            )
-                        } else {
-                            (
-                                b.color_op,
-                                b.color_source,
-                                b.color_dest,
-                                b.alpha_op,
-                                b.alpha_source,
-                                b.alpha_dest,
-                            )
-                        };
-                    let factor = |f| {
-                        let host = mvk::blend_factor(f).unwrap_or(vk::BlendFactor::ONE);
-                        if features.dual_src_blend {
-                            host
-                        } else {
-                            mvk::single_source(host)
+        let (eds3, vertex_input, bias_control) =
+            (&draw.eds3, &draw.vertex_input, &draw.depth_bias_control);
+        let device_features = &device.features;
+        let mut record = |command: &Command<'_>| {
+            use vk::StencilFaceFlags as F;
+            // SAFETY: `cmd` is recording inside a dynamic rendering with a pipeline that
+            // declares these dynamic states; extension commands run only when their feature is
+            // on.
+            unsafe {
+                match *command {
+                    Command::LineWidth(width) => raw.cmd_set_line_width(cmd, width),
+                    Command::DepthBias((constant, clamp, slope, representation)) => {
+                        if !device_features.depth_bias_control {
+                            return raw.cmd_set_depth_bias(cmd, constant, clamp, slope);
                         }
-                    };
-                    let op = |o| mvk::blend_equation(o).unwrap_or(vk::BlendOp::ADD);
-                    let blendable = draw.colors[index].is_some_and(|t| {
-                        self.device
-                            .format_features(t.format)
-                            .contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND)
-                    });
-                    draw.blend_enables
-                        .push(vk::Bool32::from(regs.blend.enable[index] != 0 && blendable));
-                    draw.blend_equations.push(vk::ColorBlendEquationEXT {
-                        src_color_blend_factor: factor(src_color),
-                        dst_color_blend_factor: factor(dst_color),
-                        color_blend_op: op(color_op),
-                        src_alpha_blend_factor: factor(src_alpha),
-                        dst_alpha_blend_factor: factor(dst_alpha),
-                        alpha_blend_op: op(alpha_op),
-                    });
+                        let mut representation = vk::DepthBiasRepresentationInfoEXT::default()
+                            .depth_bias_representation(representation)
+                            .depth_bias_exact(device_features.depth_bias_exact);
+                        let info = vk::DepthBiasInfoEXT::default()
+                            .depth_bias_constant_factor(constant)
+                            .depth_bias_clamp(clamp)
+                            .depth_bias_slope_factor(slope)
+                            .push_next(&mut representation);
+                        (bias_control.fp().cmd_set_depth_bias2_ext)(cmd, &info)
+                    }
+                    Command::BlendConstants(constants) => {
+                        raw.cmd_set_blend_constants(cmd, &constants)
+                    }
+                    Command::DepthBounds((min, max)) => raw.cmd_set_depth_bounds(cmd, min, max),
+                    Command::StencilCompareMask((front, back)) => {
+                        raw.cmd_set_stencil_compare_mask(cmd, F::FRONT, front);
+                        raw.cmd_set_stencil_compare_mask(cmd, F::BACK, back);
+                    }
+                    Command::StencilWriteMask((front, back)) => {
+                        raw.cmd_set_stencil_write_mask(cmd, F::FRONT, front);
+                        raw.cmd_set_stencil_write_mask(cmd, F::BACK, back);
+                    }
+                    Command::StencilReference((front, back)) => {
+                        raw.cmd_set_stencil_reference(cmd, F::FRONT, front);
+                        raw.cmd_set_stencil_reference(cmd, F::BACK, back);
+                    }
+                    Command::Viewport(viewport) if features.extended_dynamic_state => {
+                        raw.cmd_set_viewport_with_count(cmd, &[viewport])
+                    }
+                    Command::Viewport(viewport) => raw.cmd_set_viewport(cmd, 0, &[viewport]),
+                    Command::Scissor(scissor) if features.extended_dynamic_state => {
+                        raw.cmd_set_scissor_with_count(cmd, &[scissor])
+                    }
+                    Command::Scissor(scissor) => raw.cmd_set_scissor(cmd, 0, &[scissor]),
+                    Command::CullMode(cull) => raw.cmd_set_cull_mode(cmd, cull),
+                    Command::FrontFace(face) => raw.cmd_set_front_face(cmd, face),
+                    Command::PrimitiveTopology(topology) => {
+                        raw.cmd_set_primitive_topology(cmd, topology)
+                    }
+                    Command::DepthTestEnable(on) => raw.cmd_set_depth_test_enable(cmd, on),
+                    Command::DepthWriteEnable(on) => raw.cmd_set_depth_write_enable(cmd, on),
+                    Command::DepthCompareOp(op) => raw.cmd_set_depth_compare_op(cmd, op),
+                    Command::DepthBoundsTestEnable(on) => {
+                        raw.cmd_set_depth_bounds_test_enable(cmd, on)
+                    }
+                    Command::StencilTestEnable(on) => raw.cmd_set_stencil_test_enable(cmd, on),
+                    Command::StencilOp((front, back)) => {
+                        raw.cmd_set_stencil_op(cmd, F::FRONT, front.0, front.1, front.2, front.3);
+                        raw.cmd_set_stencil_op(cmd, F::BACK, back.0, back.1, back.2, back.3);
+                    }
+                    Command::RasterizerDiscardEnable(on) => {
+                        raw.cmd_set_rasterizer_discard_enable(cmd, on)
+                    }
+                    Command::DepthBiasEnable(on) => raw.cmd_set_depth_bias_enable(cmd, on),
+                    Command::PrimitiveRestartEnable(on) => {
+                        raw.cmd_set_primitive_restart_enable(cmd, on)
+                    }
+                    Command::VertexBuffers((buffers, offsets, strides)) => {
+                        if features.extended_dynamic_state && !features.dynamic_vertex_input {
+                            raw.cmd_bind_vertex_buffers2(
+                                cmd,
+                                0,
+                                buffers,
+                                offsets,
+                                None,
+                                Some(strides),
+                            );
+                        } else {
+                            raw.cmd_bind_vertex_buffers(cmd, 0, buffers, offsets);
+                        }
+                    }
+                    Command::VertexInput((bindings, attributes)) => {
+                        vertex_input.cmd_set_vertex_input(cmd, bindings, attributes)
+                    }
+                    Command::ColorBlendEnable(enables) => {
+                        eds3.cmd_set_color_blend_enable(cmd, 0, enables)
+                    }
+                    Command::ColorBlendEquation(equations) => {
+                        eds3.cmd_set_color_blend_equation(cmd, 0, equations)
+                    }
+                    Command::ColorWriteMask(masks) => eds3.cmd_set_color_write_mask(cmd, 0, masks),
+                    Command::DepthClampEnable(on) => eds3.cmd_set_depth_clamp_enable(cmd, on),
+                    Command::LogicOpEnable(on) => eds3.cmd_set_logic_op_enable(cmd, on),
+                    Command::AlphaToCoverageEnable(on) => {
+                        eds3.cmd_set_alpha_to_coverage_enable(cmd, on)
+                    }
+                    Command::AlphaToOneEnable(on) => eds3.cmd_set_alpha_to_one_enable(cmd, on),
+                    Command::PolygonMode(mode) => eds3.cmd_set_polygon_mode(cmd, mode),
+                    Command::DepthClipNegativeOneToOne(on) => {
+                        eds3.cmd_set_depth_clip_negative_one_to_one(cmd, on)
+                    }
+                    Command::ProvokingVertexMode(mode) => {
+                        eds3.cmd_set_provoking_vertex_mode(cmd, mode)
+                    }
                 }
-                shadow.set(
-                    Slot::ColorBlendEnable,
-                    draw.blend_enables.as_slice(),
-                    || {
-                        draw.eds3
-                            .cmd_set_color_blend_enable(cmd, 0, &draw.blend_enables)
-                    },
-                );
-                shadow.set(
-                    Slot::ColorBlendEquation,
-                    draw.blend_equations.as_slice(),
-                    || {
-                        draw.eds3
-                            .cmd_set_color_blend_equation(cmd, 0, &draw.blend_equations)
-                    },
-                );
-                shadow.set(Slot::ColorWriteMask, draw.write_masks.as_slice(), || {
-                    draw.eds3
-                        .cmd_set_color_write_mask(cmd, 0, &draw.write_masks)
-                });
             }
-            let alpha = regs.anti_alias_alpha_control;
-            if features.dynamic_depth_clamp {
-                use lichii_gpu::engines::maxwell_3d::regs::ViewportClipControlGeometryClip as G;
-                let clamps = !matches!(
-                    regs.viewport_clip_control.geometry_clip(),
-                    G::PASSTHROUGH | G::FRUSTUM_XYZ | G::FRUSTUM_Z
-                );
-                let clamp = features.depth_clamp && clamps;
-                shadow.set(Slot::DepthClampEnable, clamp, || {
-                    draw.eds3.cmd_set_depth_clamp_enable(cmd, clamp)
-                });
-            }
-            if features.dynamic_logic_op_enable {
-                let logic = features.logic_op && regs.logic_op.enable != 0;
-                shadow.set(Slot::LogicOpEnable, logic, || {
-                    draw.eds3.cmd_set_logic_op_enable(cmd, logic)
-                });
-            }
-            if features.dynamic_alpha_to_coverage {
-                let coverage = alpha.alpha_to_coverage() != 0;
-                shadow.set(Slot::AlphaToCoverageEnable, coverage, || {
-                    draw.eds3.cmd_set_alpha_to_coverage_enable(cmd, coverage)
-                });
-            }
-            if features.dynamic_alpha_to_one {
-                let one = features.alpha_to_one && alpha.alpha_to_one() != 0;
-                shadow.set(Slot::AlphaToOneEnable, one, || {
-                    draw.eds3.cmd_set_alpha_to_one_enable(cmd, one)
-                });
-            }
-            if features.dynamic_polygon_mode {
-                let mode = if features.fill_mode_non_solid {
-                    mvk::polygon_mode(regs.polygon_mode_front).unwrap_or(vk::PolygonMode::FILL)
-                } else {
-                    vk::PolygonMode::FILL
-                };
-                shadow.set(Slot::PolygonMode, mode, || {
-                    draw.eds3.cmd_set_polygon_mode(cmd, mode)
-                });
-            }
-            if features.dynamic_depth_clip_negative_one_to_one {
-                let negative = regs.depth_mode == DepthMode::MINUS_ONE_TO_ONE;
-                shadow.set(Slot::DepthClipNegativeOneToOne, negative, || {
-                    draw.eds3
-                        .cmd_set_depth_clip_negative_one_to_one(cmd, negative)
-                });
-            }
-            if features.dynamic_provoking_vertex {
-                let provoking = if regs.provoking_vertex == ProvokingVertex::LAST
-                    && features.provoking_vertex_last
-                {
-                    vk::ProvokingVertexModeEXT::LAST_VERTEX
-                } else {
-                    vk::ProvokingVertexModeEXT::FIRST_VERTEX
-                };
-                shadow.set(Slot::ProvokingVertexMode, provoking, || {
-                    draw.eds3.cmd_set_provoking_vertex_mode(cmd, provoking)
-                });
-            }
-        }
+        };
+        draw.dynamic
+            .apply(&inputs, regs, dirty, blendable, &mut record);
     }
 
     pub(super) fn dispatch(&mut self, ctx: &ComputeContext<'_>) -> Result<()> {

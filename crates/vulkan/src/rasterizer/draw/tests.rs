@@ -5471,6 +5471,7 @@ fn measures_dynamic_state_cost() {
     };
     let r = &mut f.rasterizer;
     let mut state = RegisterState::new();
+    super::DynamicShadow::register_dirty_flags(&mut state.dirty);
     let word = |offset: usize| (offset / 4) as u32;
     for (i, attribute) in [0x12 << 21, 0x12 << 21 | 12 << 7, 0x9 << 21 | 1 << 0]
         .into_iter()
@@ -5488,7 +5489,6 @@ fn measures_dynamic_state_cost() {
     r.draw
         .attachments
         .extend([vk::RenderingAttachmentInfo::default(); 2]);
-    let features = *r.draw.pipelines.features();
     let toggles: Vec<(u32, [u32; 2])> = vec![
         (word(offset_of!(Regs, depth_write_enabled)), [0, 1]),
         (word(offset_of!(Regs, depth_test_enable)), [1, 0]),
@@ -5550,7 +5550,7 @@ fn measures_dynamic_state_cost() {
                 state.write(method, value);
             }
             r.draw.dynamic.begin(i % 40 == 0, false);
-            r.set_dynamic_state(cmd, &state.regs, &features, topology, extent, scale);
+            r.set_dynamic_state(cmd, &state.regs, &mut state.dirty, topology, extent, scale);
         }
         if round > 0 {
             elapsed += start.elapsed();
