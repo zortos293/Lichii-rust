@@ -117,6 +117,8 @@ struct QueuedSubmission {
     entries: Vec<GpEntry>,
     wait: Option<SyncpointFence>,
     increment: Option<SyncpointIncrement>,
+    /// The value the increments reach.
+    fence: Option<SyncpointFence>,
 }
 
 /// Entry buffers the inbox keeps for later submissions; more are dropped once the front is done
@@ -344,6 +346,7 @@ impl Front {
                     entries,
                     wait,
                     increment,
+                    fence,
                 } = submission;
                 let Some(channel) = self
                     .channels
@@ -362,7 +365,7 @@ impl Front {
                 }
                 self.shared.inbox.recycle(entries);
                 if let Some(increment) = increment {
-                    channel.push(Work::Increment(increment));
+                    channel.push(Work::Increment(increment, fence));
                 }
                 channel.push(Work::EndOfSubmission);
                 channel.run(&mut self.shared);
@@ -685,10 +688,16 @@ impl Gpu {
                     .syncpoints
                     .increase_max(increment.id, increment.count)
                 {
-                    Ok(value) => Some(SyncpointFence {
-                        id: increment.id,
-                        value,
-                    }),
+                    Ok(value) => {
+                        let fence = SyncpointFence {
+                            id: increment.id,
+                            value,
+                        };
+                        if let Some(latency) = self.host1x.syncpoints.fence_latency() {
+                            latency.submitted(fence);
+                        }
+                        Some(fence)
+                    }
                     Err(error) => {
                         tracing::warn!(%error, "submission increments an invalid syncpoint");
                         None
@@ -703,6 +712,7 @@ impl Gpu {
                     entries,
                     wait: submission.wait,
                     increment: submission.increment,
+                    fence,
                 },
             ))
         });

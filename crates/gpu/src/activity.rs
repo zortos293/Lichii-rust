@@ -212,6 +212,9 @@ impl Activity {
                 let elapsed = since.elapsed();
                 since = Instant::now();
                 self.report(elapsed, threaded, device.take_flush_trap_stats());
+                if let Some(latency) = syncpoints.fence_latency() {
+                    latency.report(elapsed);
+                }
             }
         }
     }

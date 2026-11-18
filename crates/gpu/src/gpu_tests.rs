@@ -3123,3 +3123,80 @@ fn occlusion_tests_against_a_nonzero_count_read_the_report() {
         render_enables(&rig)
     );
 }
+
+/// Enables `lichii_gpu::activity` at debug level on the thread that holds it, and only there, so
+/// the GPU's own reporter thread never takes the totals a test reads. Two must be registered:
+/// with a single dispatcher, tracing caches a callsite's interest from whichever thread first
+/// reaches it, which a parallel test with no subscriber can win.
+struct ActivityDebug;
+
+impl tracing::Subscriber for ActivityDebug {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == "lichii_gpu::activity"
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, _: &tracing::Event<'_>) {}
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// A submission's fence is timed from the submit through the front and the back to the host GPU
+/// finishing its work, and the three parts add up to the total; without the debug target the
+/// syncpoints keep no tracker.
+#[test]
+fn a_fence_latency_splits_into_parts_that_add_up_to_its_total() {
+    assert!(Syncpoints::new().fence_latency().is_none());
+    let debug = tracing::Dispatch::new(ActivityDebug);
+    let _second = tracing::Dispatch::new(ActivityDebug);
+    let mut rig = tracing::dispatcher::with_default(&debug, || Rig::deferred(Threading::Split));
+    let channel = rig.channel(HostClass::Maxwell);
+    let id = 8;
+    let entry = rig.entry(&Pushbuffer::default().host(host::SYNCPOINT_A, 0).0);
+    let fence = rig
+        .gpu
+        .submit(
+            channel,
+            Submission {
+                entries: &[entry],
+                wait: None,
+                increment: Some(SyncpointIncrement::fence_increment(id, true)),
+            },
+        )
+        .expect("the submission has a fence");
+    rig.events();
+    assert_eq!(rig.syncpoints.host().value(id), Ok(fence.value));
+    assert_eq!(rig.syncpoints.guest().value(id), Ok(0));
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    rig.complete();
+    assert_eq!(rig.syncpoints.guest().value(id), Ok(fence.value));
+
+    let totals = rig
+        .syncpoints
+        .fence_latency()
+        .expect("the debug target is on")
+        .take();
+    assert_eq!((totals.fences, totals.partial, totals.untracked), (1, 0, 0));
+    assert_eq!(
+        totals.submit_to_front_ns + totals.front_to_back_ns + totals.back_to_done_ns,
+        totals.total_ns
+    );
+    assert!(totals.back_to_done_ns >= 5_000_000, "{totals:?}");
+    assert_eq!(totals.longest_ns, totals.total_ns);
+}
