@@ -311,6 +311,92 @@ pub enum ReleaseSize {
     Sixteen,
 }
 
+impl ReleaseSize {
+    const fn bytes(self) -> u64 {
+        match self {
+            Self::Four => 4,
+            Self::Eight => 8,
+            Self::Sixteen => 16,
+        }
+    }
+}
+
+/// The last queued write overlapping an acquire, identified by its renderer queue position.
+/// A missing value requires the acquire to wait for publication up to that exact entry.
+pub struct PendingSemaphore {
+    pub fence: u64,
+    pub value: Option<u64>,
+}
+
+/// A pending GPU semaphore write, with a known payload for plain releases only.
+#[derive(Clone, Copy)]
+pub struct SemaphoreWrite {
+    address: DAddr,
+    size: ReleaseSize,
+    payload: Option<u64>,
+}
+
+impl SemaphoreWrite {
+    /// A pending counter result whose payload isn't known until the host work completes.
+    pub fn counter(address: DAddr, size: ReleaseSize) -> Self {
+        Self {
+            address,
+            size,
+            payload: None,
+        }
+    }
+
+    /// Describes the write's overlap with an acquire. `Some(None)` means the write overlaps
+    /// but cannot supply the entire acquire value. CPU and wide acquires don't see diverted
+    /// mirror words; we don't predict a wide mirrored value.
+    pub fn observe(self, handles: &GpuHandles, address: DAddr, wide: bool) -> Option<Option<u64>> {
+        let width = if wide { 8 } else { 4 };
+        let bytes = self.size.bytes();
+        let end = address + width;
+        let overlaps = |at, len| at < end && address < at + len;
+        let mirror = handles.syncpoints.semaphore_mirror();
+        let (start, mirrored) = if overlaps(self.address, bytes) {
+            (self.address, false)
+        } else {
+            let at = mirror.mirror_address(self.address)?;
+            let clipped = bytes.min(semaphore_mirror::PAGE - at % semaphore_mirror::PAGE);
+            if !overlaps(at, clipped) {
+                return None;
+            }
+            (at, true)
+        };
+        let value = self.payload.filter(|_| {
+            let known_bytes = bytes.min(8);
+            self.address.is_multiple_of(4)
+                && address.is_multiple_of(4)
+                && address >= start
+                && end <= start + known_bytes
+                && (!mirrored || (!wide && end <= (start | (semaphore_mirror::PAGE - 1)) + 1))
+                && !handles.written_pages.may_be_written(address, width)
+                && handles.device.translate(self.address).is_some()
+                && handles.device.translate(self.address + bytes - 1).is_some()
+                && handles.device.translate(address).is_some()
+                && handles.device.translate(end - 1).is_some()
+        });
+        Some(value.map(|value| {
+            if wide {
+                value
+            } else {
+                u64::from((value >> ((address - start) * 8)) as u32)
+            }
+        }))
+    }
+
+    /// Notifies suspended acquires when this write enters the ordered queue. The renderer
+    /// must use the same queue position when executing the write.
+    pub fn queued(self, handles: &GpuHandles, fence: u64) {
+        handles
+            .syncpoints
+            .semaphore_waiters()
+            .queued(fence, |address, wide| self.observe(handles, address, wide));
+    }
+}
+
 /// A query result or semaphore release to write to GPU memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Query {
@@ -346,10 +432,41 @@ pub enum FenceAction {
 }
 
 impl FenceAction {
+    /// The device memory write this action will make, if any.
+    pub fn semaphore_write(self) -> Option<SemaphoreWrite> {
+        let write = match self {
+            Self::WriteSemaphore {
+                address,
+                value,
+                size,
+            } => SemaphoreWrite {
+                address,
+                size,
+                payload: Some(value),
+            },
+            Self::ReduceSemaphore { address, .. } => {
+                SemaphoreWrite::counter(address, ReleaseSize::Four)
+            }
+            Self::IncrementSyncpoint(_) => return None,
+        };
+        Some(write)
+    }
+
     /// Performs the action. The renderer calls this from whichever thread notices completion;
     /// 16-byte releases take their timestamp from [`GpuHandles::timestamp`]. A semaphore write
     /// resumes the channels waiting for its value ([`Syncpoints::semaphore_waiters`](crate::host1x::Syncpoints::semaphore_waiters)).
     pub fn execute(self, handles: &GpuHandles) {
+        self.execute_inner(handles, 0);
+    }
+
+    /// Executes an entry of a renderer's FIFO and publishes its identity after every memory
+    /// write, including the mirror. Positions are nonzero and increase in execution order.
+    pub fn execute_ordered(self, handles: &GpuHandles, fence: u64) {
+        self.execute_inner(handles, fence);
+        handles.syncpoints.semaphore_waiters().publish(fence);
+    }
+
+    fn execute_inner(self, handles: &GpuHandles, fence: u64) {
         match self {
             Self::WriteSemaphore {
                 address,
@@ -372,10 +489,6 @@ impl FenceAction {
                     ReleaseSize::Sixteen => 4,
                 }];
                 let bytes = 4 * words.len() as u64;
-                handles
-                    .syncpoints
-                    .semaphore_waiters()
-                    .landed(address, value);
                 let mirror = handles.syncpoints.semaphore_mirror();
                 let mut page = mirror.first_page(address);
                 let mirrored = mirror.mirror_of(address);
@@ -387,16 +500,20 @@ impl FenceAction {
                     page.note_direct(address, bytes);
                 }
                 drop(page);
-                handles
-                    .syncpoints
-                    .semaphore_waiters()
-                    .written(&handles.device, address, bytes);
+                handles.syncpoints.semaphore_waiters().written(
+                    &handles.device,
+                    address,
+                    bytes,
+                    fence,
+                );
                 if let Some(page) = mirrored {
-                    mirror_release(handles, page, address - semaphore_mirror::PAGE, words);
-                    handles
-                        .syncpoints
-                        .semaphore_waiters()
-                        .landed(address - semaphore_mirror::PAGE, value);
+                    mirror_release(
+                        handles,
+                        page,
+                        address - semaphore_mirror::PAGE,
+                        words,
+                        fence,
+                    );
                 }
             }
             Self::ReduceSemaphore {
@@ -434,12 +551,18 @@ impl FenceAction {
                 drop(page);
                 let waiters = handles.syncpoints.semaphore_waiters();
                 if seen == after {
-                    waiters.written(&handles.device, address, 4);
+                    waiters.written(&handles.device, address, 4, fence);
                 } else {
-                    waiters.met_by(address, seen);
+                    waiters.met_by(address, seen, fence);
                 }
                 if let Some(page) = mirrored {
-                    mirror_release(handles, page, address - semaphore_mirror::PAGE, &[after]);
+                    mirror_release(
+                        handles,
+                        page,
+                        address - semaphore_mirror::PAGE,
+                        &[after],
+                        fence,
+                    );
                 }
             }
             Self::IncrementSyncpoint(id) => {
@@ -511,6 +634,22 @@ pub trait CpuReadCompleter: Send + Sync {
 /// Methods with a default body are optional: the defaults do the work in software (copies) or
 /// nothing (hints).
 pub trait Rasterizer: Send {
+    /// Whether acquires should be routed through this renderer's ordered fence queue. The
+    /// default keeps the front's existing guest-memory acquire path.
+    fn ordered_semaphore_acquires(&self) -> bool {
+        false
+    }
+
+    /// Inspect the newest overlapping pending write, without waiting or reading guest RAM.
+    /// An ordered renderer enqueues and publishes each write with the same fence identity.
+    fn pending_semaphore(&self, _address: DAddr, _wide: bool) -> Option<PendingSemaphore> {
+        None
+    }
+
+    /// Offers newly queued writes to suspended acquires once per back-stream batch, before
+    /// publishing the batch's progress. The default renderer has no queued acquire values.
+    fn poll_semaphore_acquires(&mut self) {}
+
     /// A channel was created.
     fn bind_channel(&mut self, _channel: ChannelId) {}
 
@@ -821,7 +960,13 @@ impl Rasterizer for NullRasterizer {
 /// Writes the `words` of a release that landed in a second page to `target` in the region's
 /// first `page`. A word with releases of its own keeps its value in memory, and acquires see the
 /// mirrored one beside it.
-fn mirror_release(handles: &GpuHandles, mut page: FirstPage<'_>, target: DAddr, words: &[u32]) {
+fn mirror_release(
+    handles: &GpuHandles,
+    mut page: FirstPage<'_>,
+    target: DAddr,
+    words: &[u32],
+    fence: u64,
+) {
     let mut kept = [None; 4];
     let mut written = 0;
     for (index, &word) in words.iter().enumerate() {
@@ -845,10 +990,10 @@ fn mirror_release(handles: &GpuHandles, mut page: FirstPage<'_>, target: DAddr, 
     }
     drop(page);
     let waiters = handles.syncpoints.semaphore_waiters();
-    waiters.written(&handles.device, target, written);
+    waiters.written(&handles.device, target, written, fence);
     for (index, value) in kept.into_iter().enumerate() {
         if let Some(value) = value {
-            waiters.met_by(target + 4 * index as u64, value);
+            waiters.met_by(target + 4 * index as u64, value, fence);
         }
     }
 }

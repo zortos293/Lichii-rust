@@ -52,6 +52,10 @@ pub(crate) mod tag {
     /// [`SideCommand::MacroCode`](crate::back::SideCommand::MacroCode) gave the channel. Method:
     /// its start address; argument: parameter count; the parameters follow, two per slot.
     pub const MACRO: u8 = 17;
+    /// Checks a semaphore acquire on the back without blocking other channels.
+    pub const ACQUIRE: u8 = 18;
+    /// The following work depends on a release that hasn't reached guest memory yet.
+    pub const SEMAPHORE_DEPENDENCY: u8 = 19;
 }
 
 /// How far the fetch of a GPFIFO entry waits for the work before it.
@@ -282,6 +286,15 @@ impl Stream {
     pub(crate) fn release(&mut self, address: GpuVAddr, payload: u64, size: ReleaseSize) {
         let code = RELEASE_SIZES.iter().position(|&s| s == size).unwrap_or(0) as u32;
         self.record(&[header(tag::RELEASE, 0, code, 0), address, payload]);
+    }
+
+    pub(crate) fn acquire(&mut self, address: GpuVAddr, wide: bool) {
+        self.record(&[header(tag::ACQUIRE, 0, 0, u32::from(wide)), address]);
+        self.producer.publish();
+    }
+
+    pub(crate) fn semaphore_dependency(&mut self, fence: u64) {
+        self.record(&[header(tag::SEMAPHORE_DEPENDENCY, 0, 0, 0), fence]);
     }
 
     pub(crate) fn reduce(&mut self, address: GpuVAddr, payload: u32, op: Reduction, signed: bool) {

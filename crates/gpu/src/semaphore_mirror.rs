@@ -155,6 +155,11 @@ impl SemaphoreMirror {
         self.first_page(address.checked_sub(PAGE)?)
     }
 
+    pub(crate) fn mirror_address(&self, address: DAddr) -> Option<DAddr> {
+        let target = address.checked_sub(PAGE)?;
+        self.slot(target & !(PAGE - 1)).map(|_| target)
+    }
+
     /// What a GPU acquire of the 32-bit word at `address` sees: guest memory, as `load` reads
     /// it, unless the word holds a mirrored value kept out of memory.
     pub(crate) fn acquire_view<E>(

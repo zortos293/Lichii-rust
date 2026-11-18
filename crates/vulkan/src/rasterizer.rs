@@ -29,7 +29,8 @@ use lichii_gpu::backend::ChannelId;
 use lichii_gpu::backend::{
     Blit, BlitOperation, ComputeContext, CpuReadCompleter, CpuReadDone, CpuReadTicket, DrawParams,
     DrawTexture, FenceAction, FramebufferConfig, GpuHandles, GpuPredicate, GraphicsContext,
-    ImageCopy, IndirectDraw, Query, QueryKind, Rasterizer, ReleaseSize, RenderCondition,
+    ImageCopy, IndirectDraw, PendingSemaphore, Query, QueryKind, Rasterizer, ReleaseSize,
+    RenderCondition, SemaphoreWrite,
 };
 use lichii_gpu::engines::maxwell_3d::Regs;
 use lichii_gpu::engines::maxwell_3d::regs::NUM_RENDER_TARGETS;
@@ -213,6 +214,8 @@ pub struct VulkanRasterizer {
     gob_layout: GobLayout,
     frames: Vec<Arc<FrameImage>>,
     fences: VecDeque<(u64, Release)>,
+    fences_retired: u64,
+    fences_offered: u64,
     fence_waiter: Option<fence_waiter::FenceWaiter>,
     samples: samples::SampleCounter,
     /// Render conditions the host GPU tests; None when the device cannot.
@@ -258,6 +261,16 @@ enum Release {
     /// Reads the Z-pass queries of `range` into the running count, freeing their slots while the
     /// guest counts without reporting.
     SamplesFold(samples::SampleRange),
+}
+
+impl Release {
+    fn semaphore_write(self) -> Option<SemaphoreWrite> {
+        match self {
+            Self::Action(action) => action.semaphore_write(),
+            Self::Samples { address, size, .. } => Some(SemaphoreWrite::counter(address, size)),
+            Self::SamplesReset(_) | Self::SamplesFold(_) => None,
+        }
+    }
 }
 
 /// The part of `fb` the display shows, as left, top, right and bottom in texels: its crop
@@ -439,6 +452,8 @@ impl VulkanRasterizer {
             gob_layout,
             frames: Vec::new(),
             fences: VecDeque::new(),
+            fences_retired: 0,
+            fences_offered: 0,
             fence_waiter: None,
             samples,
             conditions,
@@ -1355,6 +1370,36 @@ impl Rasterizer for VulkanRasterizer {
         }
     }
 
+    fn ordered_semaphore_acquires(&self) -> bool {
+        true
+    }
+
+    fn pending_semaphore(&self, address: DAddr, wide: bool) -> Option<PendingSemaphore> {
+        self.fences
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(position, &(_, release))| {
+                let value = release
+                    .semaphore_write()?
+                    .observe(&self.handles, address, wide)?;
+                Some(PendingSemaphore {
+                    fence: self.fences_retired + position as u64 + 1,
+                    value,
+                })
+            })
+    }
+
+    fn poll_semaphore_acquires(&mut self) {
+        let first = self.fences_offered.saturating_sub(self.fences_retired) as usize;
+        for (position, &(_, release)) in self.fences.iter().enumerate().skip(first) {
+            if let Some(write) = release.semaphore_write() {
+                write.queued(&self.handles, self.fences_retired + position as u64 + 1);
+            }
+        }
+        self.fences_offered = self.fences_retired + self.fences.len() as u64;
+    }
+
     fn query(&mut self, _channel: ChannelId, memory: &Gmmu, query: &Query) {
         let Some(address) = memory.translate(query.address) else {
             static UNMAPPED: Throttle = Throttle::new();
@@ -1389,7 +1434,13 @@ impl Rasterizer for VulkanRasterizer {
             value,
             size: query.size,
         };
-        if query.after_work {
+        if query.after_work
+            || self
+                .handles
+                .syncpoints
+                .semaphore_waiters()
+                .has_unpublished_dependency()
+        {
             self.signal_fence(action);
         } else {
             action.execute(&self.handles);
@@ -1417,6 +1468,7 @@ impl Rasterizer for VulkanRasterizer {
     }
 
     fn release_fences(&mut self, wait: bool) {
+        self.poll_semaphore_acquires();
         if wait && let Some(&(tick, _)) = self.fences.back() {
             if tick >= self.scheduler.tick() {
                 self.flush();
@@ -1430,9 +1482,9 @@ impl Rasterizer for VulkanRasterizer {
             if tick > completed {
                 break;
             }
-            self.fences.pop_front();
+            let fence = self.fences_retired + 1;
             match action {
-                Release::Action(action) => action.execute(&self.handles),
+                Release::Action(action) => action.execute_ordered(&self.handles, fence),
                 Release::Samples {
                     address,
                     size,
@@ -1442,12 +1494,14 @@ impl Rasterizer for VulkanRasterizer {
                     value: self.samples.resolve(&self.device, range),
                     size,
                 }
-                .execute(&self.handles),
+                .execute_ordered(&self.handles, fence),
                 Release::SamplesReset(reset_at) => self.samples.retire(reset_at),
                 Release::SamplesFold(range) => {
                     self.samples.resolve(&self.device, range);
                 }
             }
+            self.fences.pop_front();
+            self.fences_retired = fence;
         }
         if let Some(waiter) = &mut self.fence_waiter
             && let Some(&(tick, _)) = self.fences.front()
@@ -3030,6 +3084,36 @@ mod tests {
                 .pending_semaphore_words(semaphore, 0x18, &mut |_, _| put = true)
         );
         assert!(!put, "nothing is pending once the fences ran");
+        f.assert_no_validation_errors();
+    }
+
+    #[test]
+    fn acquire_probes_use_fifo_positions_and_do_not_predict_partial_writes() {
+        let Some(mut f) = fixture(GobLayout::Tegra) else {
+            return;
+        };
+        let address = DADDR + 0x80_0000;
+        f.rasterizer.barrier();
+        f.rasterizer.signal_fence(FenceAction::WriteSemaphore {
+            address,
+            value: 1,
+            size: ReleaseSize::Eight,
+        });
+        let old = f.rasterizer.pending_semaphore(address, true).unwrap();
+        assert_eq!(old.value, Some(1));
+        f.rasterizer.signal_fence(FenceAction::WriteSemaphore {
+            address: address + 4,
+            value: 7,
+            size: ReleaseSize::Four,
+        });
+        assert_eq!(f.rasterizer.fences[0].0, f.rasterizer.fences[1].0);
+        let partial = f.rasterizer.pending_semaphore(address, true).unwrap();
+        assert!(partial.fence > old.fence);
+        assert_eq!(partial.value, None);
+        assert_eq!(f.memory.read::<u64>(address).unwrap(), 0);
+        f.rasterizer.release_fences(true);
+        assert!(f.rasterizer.pending_semaphore(address, true).is_none());
+        assert_eq!(f.memory.read::<u64>(address).unwrap(), 7 << 32 | 1);
         f.assert_no_validation_errors();
     }
 

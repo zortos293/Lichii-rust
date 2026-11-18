@@ -149,6 +149,7 @@ impl Fermi2d {
         {
             return;
         }
+        ctx.finish_semaphore_dependency();
         self.blitter.blit(
             ctx,
             &Job {

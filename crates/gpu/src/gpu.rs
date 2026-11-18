@@ -485,6 +485,7 @@ impl Gpu {
             )
         });
         let mut rasterizer = renderer(handles.clone());
+        let ordered_semaphore_acquires = rasterizer.ordered_semaphore_acquires();
         let inbox = Arc::new(Inbox::new());
         handles.syncpoints.semaphore_waiters().attach(&inbox);
         let (producer, consumer) = ring::ring(config.ring_slots, MIN_RING_SLOTS);
@@ -537,6 +538,7 @@ impl Gpu {
                 compute_macros: None,
                 words: Vec::new(),
                 waiters: handles.syncpoints.semaphore_waiters().clone(),
+                ordered_semaphore_acquires,
                 inbox: inbox.clone(),
                 syncpoints: handles.syncpoints.clone(),
                 written_pages: (config.console == Console::Switch2)

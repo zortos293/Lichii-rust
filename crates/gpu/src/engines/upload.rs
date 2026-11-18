@@ -106,6 +106,7 @@ impl Upload {
     }
 
     fn write_chunk(&mut self, ctx: &mut EngineContext<'_>) {
+        ctx.finish_semaphore_dependency();
         match self.target {
             Target::Linear { pitch } => {
                 let address = self.address + u64::from(self.line) * pitch + self.column as u64;

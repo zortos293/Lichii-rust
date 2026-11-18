@@ -430,6 +430,7 @@ fn copy_elements(
     {
         return;
     }
+    ctx.finish_semaphore_dependency();
     let step = (CHUNK as u64 / src_bytes.max(dst_bytes)).max(1);
     let chunks = elements.div_ceil(step);
     let backwards = remap.is_none() && dst > src && dst - src < elements;
@@ -578,6 +579,7 @@ pub(super) fn copy_lines(
             return;
         }
     }
+    ctx.finish_semaphore_dependency();
     let (src_bytes, dst_bytes) = remap.map_or((1, 1), |r| (r.src_bytes(), r.dst_bytes()));
     let reads_source = remap.is_none_or(|r| r.reads_source());
     let row_bytes = line_length as usize * src_bytes.max(dst_bytes) as usize;

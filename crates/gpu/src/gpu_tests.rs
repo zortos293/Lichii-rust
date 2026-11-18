@@ -12,8 +12,8 @@ use parking_lot::{Condvar, Mutex};
 use crate::activity::Wait;
 use crate::backend::{
     ChannelId, ComputeContext, DrawParams, FenceAction, FramebufferConfig, GpuHandles,
-    GpuPredicate, GraphicsContext, IndirectDraw, Query, QueryKind, Rasterizer, ReleaseSize,
-    RenderCondition,
+    GpuPredicate, GraphicsContext, IndirectDraw, PendingSemaphore, Query, QueryKind, Rasterizer,
+    ReleaseSize, RenderCondition,
 };
 use crate::channel::{ChannelConfig, GpEntry, Submission, SyncpointFence, SyncpointIncrement};
 use crate::clock::{GpuClockSpeed, GuestTime};
@@ -172,8 +172,7 @@ struct HostWork {
     completion: Completion,
     handles: GpuHandles,
     memory: Arc<Gmmu>,
-    /// The pending work, and how much of it from the front finished.
-    pending: Mutex<(Vec<Pending>, usize)>,
+    pending: Mutex<HostFences>,
     /// How often the GPU asked whether fences are pending.
     fence_polls: AtomicUsize,
     /// The device address of a SamplesPassed report the host GPU has yet to write, which the
@@ -181,41 +180,56 @@ struct HostWork {
     samples: Mutex<Option<u64>>,
 }
 
+#[derive(Default)]
+struct HostFences {
+    pending: std::collections::VecDeque<Pending>,
+    finished: usize,
+    retired: u64,
+    offered: u64,
+}
+
 impl HostWork {
     fn submit(&self, work: Pending) {
         match self.completion {
-            Completion::Immediate => self.run(work),
-            Completion::Deferred => self.pending.lock().0.push(work),
+            Completion::Immediate => self.action(work).execute(&self.handles),
+            Completion::Deferred => self.pending.lock().pending.push_back(work),
         }
     }
 
     fn finish_all(&self) {
         let mut pending = self.pending.lock();
-        pending.1 = pending.0.len();
+        pending.finished = pending.pending.len();
     }
 
     /// Runs the finished work, or all of it.
     fn run_finished(&self, all: bool) {
-        let finished: Vec<Pending> = {
-            let mut pending = self.pending.lock();
-            let count = if all { pending.0.len() } else { pending.1 };
-            pending.1 = 0;
-            pending.0.drain(..count).collect()
+        let mut fences = self.pending.lock();
+        let count = if all {
+            fences.pending.len()
+        } else {
+            fences.finished
         };
-        for work in finished {
-            self.run(work);
+        fences.finished = 0;
+        for _ in 0..count {
+            self.retire_next(&mut fences);
         }
     }
 
-    fn run(&self, work: Pending) {
+    fn retire_next(&self, fences: &mut HostFences) {
+        let work = fences.pending.pop_front().unwrap();
+        fences.retired += 1;
+        self.action(work)
+            .execute_ordered(&self.handles, fences.retired);
+    }
+
+    fn action(&self, work: Pending) -> FenceAction {
         match work {
-            Pending::Fence(action) => action.execute(&self.handles),
+            Pending::Fence(action) => action,
             Pending::Query(query) => FenceAction::WriteSemaphore {
                 address: self.memory.translate(query.address).unwrap(),
                 value: query.payload,
                 size: query.size,
-            }
-            .execute(&self.handles),
+            },
         }
     }
 }
@@ -300,6 +314,38 @@ impl Rasterizer for Recorder {
     fn release_fences(&mut self, wait: bool) {
         self.work.run_finished(wait);
     }
+    fn ordered_semaphore_acquires(&self) -> bool {
+        self.work.completion == Completion::Deferred
+    }
+    fn poll_semaphore_acquires(&mut self) {
+        let mut fences = self.work.pending.lock();
+        let first = fences.offered.saturating_sub(fences.retired) as usize;
+        for (index, &work) in fences.pending.iter().enumerate().skip(first) {
+            if let Some(write) = self.work.action(work).semaphore_write() {
+                write.queued(&self.work.handles, fences.retired + index as u64 + 1);
+            }
+        }
+        fences.offered = fences.retired + fences.pending.len() as u64;
+    }
+    fn pending_semaphore(&self, address: u64, wide: bool) -> Option<PendingSemaphore> {
+        let fences = self.work.pending.lock();
+        fences
+            .pending
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, &work)| {
+                let value = self.work.action(work).semaphore_write()?.observe(
+                    &self.work.handles,
+                    address,
+                    wide,
+                )?;
+                Some(PendingSemaphore {
+                    fence: fences.retired + index as u64 + 1,
+                    value,
+                })
+            })
+    }
     fn pending_semaphore_words(
         &mut self,
         addr: u64,
@@ -315,7 +361,7 @@ impl Rasterizer for Recorder {
             return false;
         }
         let timestamp = self.work.handles.timestamp.now();
-        for work in &self.work.pending.lock().0 {
+        for work in &self.work.pending.lock().pending {
             match *work {
                 Pending::Fence(FenceAction::WriteSemaphore {
                     address,
@@ -351,7 +397,7 @@ impl Rasterizer for Recorder {
     }
     fn has_pending_fences(&self) -> bool {
         self.work.fence_polls.fetch_add(1, Ordering::Relaxed);
-        !self.work.pending.lock().0.is_empty()
+        !self.work.pending.lock().pending.is_empty()
     }
     fn invalidate_region(&mut self, addr: u64, size: u64) {
         self.log.lock().push(Event::Invalidate(addr, size));
@@ -2051,6 +2097,119 @@ fn a_reduction_meets_its_waiter_only_once_it_lands() {
             "{threading:?}"
         );
         assert_eq!(rig.read(SEMAPHORE), 5);
+    });
+}
+
+#[test]
+fn a_pending_reduction_does_not_expose_the_pre_release_value() {
+    each_mode(|threading| {
+        let mut rig = Rig::deferred(threading);
+        let producer = rig.channel(HostClass::Ampere);
+        let consumer = rig.channel(HostClass::Ampere);
+        rig.submit(
+            producer,
+            &Pushbuffer::default().semaphore(SEMAPHORE, 1, 1).0,
+        );
+        let words = Pushbuffer::default()
+            .bind(0, AMPERE_3D)
+            .semaphore(SEMAPHORE, 1, 0)
+            .inc(0, 0x701, &[1])
+            .semaphore(SEMAPHORE, 0, 0)
+            .inc(0, 0x701, &[2]);
+        rig.submit(consumer, &words.0);
+        assert_eq!(
+            rig.methods(),
+            [(consumer.0, EngineKind::Maxwell3d, 0x701, 1)]
+        );
+        rig.submit(
+            producer,
+            &Pushbuffer::default().semaphore(SEMAPHORE, 1, 6 | 5 << 27).0,
+        );
+        assert_eq!(
+            rig.methods(),
+            [(consumer.0, EngineKind::Maxwell3d, 0x701, 1)]
+        );
+        rig.complete();
+        assert_eq!(rig.read(SEMAPHORE), 2);
+        assert_eq!(
+            rig.methods(),
+            [(consumer.0, EngineKind::Maxwell3d, 0x701, 1)]
+        );
+    });
+}
+
+#[test]
+fn an_older_completion_does_not_meet_an_acquire_after_a_newer_release() {
+    each_mode(|threading| {
+        let mut rig = Rig::deferred(threading);
+        let producer = rig.channel(HostClass::Ampere);
+        let consumer = rig.channel(HostClass::Ampere);
+        let releases = Pushbuffer::default()
+            .semaphore(SEMAPHORE, 0, 1)
+            .semaphore(SEMAPHORE, 1, 1);
+        rig.submit(producer, &releases.0);
+        let words = Pushbuffer::default()
+            .bind(0, AMPERE_3D)
+            .semaphore(SEMAPHORE, 1, 0)
+            .inc(0, 0x701, &[1])
+            .semaphore(SEMAPHORE, 0, 0)
+            .inc(0, 0x701, &[2]);
+        rig.submit(consumer, &words.0);
+        let first = [(consumer.0, EngineKind::Maxwell3d, 0x701, 1)];
+        assert_eq!(rig.methods(), first);
+        rig.work.retire_next(&mut rig.work.pending.lock());
+        rig.gpu.wake();
+        assert_eq!(rig.read(SEMAPHORE), 0);
+        assert_eq!(rig.methods(), first);
+        rig.complete();
+        assert_eq!(rig.read(SEMAPHORE), 1);
+        assert_eq!(rig.methods(), first);
+        rig.submit(
+            producer,
+            &Pushbuffer::default().semaphore(SEMAPHORE, 0, 1).0,
+        );
+        assert_eq!(rig.methods().len(), 2);
+    });
+}
+
+#[test]
+fn a_partial_write_does_not_allow_a_wide_acquire_to_read_old_ram() {
+    each_mode(|threading| {
+        let mut rig = Rig::deferred(threading);
+        let producer = rig.channel(HostClass::Ampere);
+        let consumer = rig.channel(HostClass::Ampere);
+        let release = Pushbuffer::default().semaphore(SEMAPHORE + 4, 7, 1);
+        rig.submit(producer, &release.0);
+        let words = Pushbuffer::default()
+            .bind(0, AMPERE_3D)
+            .semaphore(SEMAPHORE, 0, WIDE)
+            .inc(0, 0x701, &[2]);
+        rig.submit(consumer, &words.0);
+        assert!(rig.methods().is_empty(), "{threading:?}");
+        assert_eq!(rig.memory.read::<u64>(SEMAPHORE).unwrap(), 0);
+        rig.complete();
+        assert_eq!(rig.memory.read::<u64>(SEMAPHORE).unwrap(), 7 << 32);
+        assert!(rig.methods().is_empty(), "{threading:?}");
+    });
+}
+
+#[test]
+fn a_cpu_visible_reference_finishes_its_semaphore_dependency() {
+    each_mode(|threading| {
+        let mut rig = Rig::deferred(threading);
+        let producer = rig.channel(HostClass::Ampere);
+        let consumer = rig.channel(HostClass::Ampere);
+        rig.submit(
+            producer,
+            &Pushbuffer::default().semaphore(SEMAPHORE, 1, 1).0,
+        );
+        let words = Pushbuffer::default()
+            .semaphore(SEMAPHORE, 1, 0)
+            .host(host::SET_REFERENCE, 7);
+        rig.submit(consumer, &words.0);
+        rig.events();
+        assert_eq!(rig.gpu.reference_count(consumer), Some(7));
+        assert_eq!(rig.read(SEMAPHORE), 1);
     });
 }
 

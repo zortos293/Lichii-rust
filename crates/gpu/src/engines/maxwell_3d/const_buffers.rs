@@ -33,6 +33,7 @@ impl Written {
     /// before the write: announcing lets the renderer write GPU-modified images back over memory
     /// outside the announced bytes.
     fn write(&mut self, ctx: &mut EngineContext<'_>, start: GpuVAddr, bytes: &[u8]) {
+        ctx.finish_semaphore_dependency();
         let end = start + bytes.len() as u64;
         if self.0.is_some_and(|(from, to)| start > to || end < from) {
             self.flush(ctx);

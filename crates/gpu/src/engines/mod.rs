@@ -16,7 +16,7 @@ use lichii_common::GpuVAddr;
 use lichii_texture::block_linear::GobLayout;
 
 use crate::activity::Activity;
-use crate::backend::{ChannelId, GpuWrittenPages, Query, QueryKind, Rasterizer, RenderCondition};
+use crate::backend::{ChannelId, GpuWrittenPages, Rasterizer, RenderCondition};
 use crate::gmmu::Gmmu;
 use crate::host1x::Syncpoints;
 
@@ -207,19 +207,17 @@ pub struct EngineContext<'a> {
 }
 
 impl EngineContext<'_> {
-    /// Queues `query` on the renderer. Acquires see the value it releases at once, and any
-    /// other value it writes only once it lands
-    /// ([`SemaphoreWaiters::executed`](crate::channel::SemaphoreWaiters::executed)).
-    pub fn query(&mut self, query: &Query) {
-        if let Some(address) = self.memory.translate(query.address) {
-            self.syncpoints.semaphore_waiters().executed(
-                self.syncpoints.semaphore_mirror(),
-                address,
-                (query.kind == QueryKind::Payload).then_some(query.payload),
-                query.size,
-            );
+    /// Software memory accesses don't run on the GPU queue. Finish any dependency an acquire
+    /// observed there before touching guest RAM directly.
+    pub(crate) fn finish_semaphore_dependency(&mut self) {
+        if self
+            .syncpoints
+            .semaphore_waiters()
+            .has_unpublished_dependency()
+        {
+            let _waiting = self.activity.waiting(crate::activity::Wait::HostGpu);
+            self.rasterizer.release_fences(true);
         }
-        self.rasterizer.query(self.channel, self.memory, query);
     }
 }
 

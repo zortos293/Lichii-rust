@@ -118,12 +118,16 @@ impl MaxwellDma {
             }
         };
         let semaphore = &self.regs.semaphore;
-        ctx.query(&Query {
-            address: semaphore.address.address(),
-            kind: QueryKind::Payload,
-            payload: u64::from(semaphore.payload),
-            size,
-            after_work: true,
-        });
+        ctx.rasterizer.query(
+            ctx.channel,
+            ctx.memory,
+            &Query {
+                address: semaphore.address.address(),
+                kind: QueryKind::Payload,
+                payload: u64::from(semaphore.payload),
+                size,
+                after_work: true,
+            },
+        );
     }
 }

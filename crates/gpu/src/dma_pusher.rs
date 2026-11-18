@@ -28,7 +28,10 @@ use lichii_common::GpuVAddr;
 
 use crate::back::{BackChannelSetup, SideCommand};
 use crate::backend::{ChannelId, GpuWrittenPages, ReleaseSize};
-use crate::channel::{ChannelConfig, SemaphoreWaiters, SyncpointFence, SyncpointIncrement};
+use crate::channel::{
+    ChannelConfig, SemaphoreAddress, SemaphoreStatus, SemaphoreWaiters, SyncpointFence,
+    SyncpointIncrement,
+};
 use crate::engines::EngineKind;
 use crate::engines::kepler_compute::Regs as ComputeRegs;
 use crate::engines::maxwell_3d::regs::{NUM_REGS, ShadowRamControl};
@@ -72,6 +75,7 @@ pub(crate) struct FrontShared {
     /// The words of the entry being parsed.
     pub words: Vec<u32>,
     pub waiters: Arc<SemaphoreWaiters>,
+    pub ordered_semaphore_acquires: bool,
     pub inbox: Arc<Inbox>,
     pub syncpoints: Arc<Syncpoints>,
     /// Switch 2: the device pages GPU work may have written. An entry on one is fetched after the
@@ -504,11 +508,11 @@ impl FrontChannel {
     pub(crate) fn is_runnable(&self, shared: &FrontShared) -> bool {
         match self.wait {
             None => !self.queue.is_empty(),
-            Some(wait) => self.wait_met(wait, shared),
+            Some(wait) => self.wait_dependency(wait, shared).is_some(),
         }
     }
 
-    fn wait_met(&self, wait: Wait, shared: &FrontShared) -> bool {
+    fn wait_dependency(&self, wait: Wait, shared: &FrontShared) -> Option<u64> {
         match wait {
             Wait::Semaphore {
                 address,
@@ -516,24 +520,26 @@ impl FrontChannel {
                 op,
                 wide,
                 ..
-            } => {
-                shared.waiters.latched(self.id)
-                    || semaphore_met(
-                        &self.memory,
-                        shared.syncpoints.semaphore_mirror(),
-                        &shared.waiters,
-                        address,
-                        payload,
-                        op,
-                        wide,
-                    )
-            }
+            } => match shared.waiters.status(self.id) {
+                SemaphoreStatus::Met { dependency } => Some(dependency),
+                SemaphoreStatus::Waiting => None,
+                SemaphoreStatus::Memory => semaphore_met(
+                    &self.memory,
+                    shared.syncpoints.semaphore_mirror(),
+                    address,
+                    payload,
+                    op,
+                    wide,
+                )
+                .then_some(0),
+            },
             Wait::Syncpoint(fence) => shared
                 .syncpoints
                 .host()
                 .is_reached(fence.id, fence.value)
-                .unwrap_or(true),
-            Wait::Fetch(ticket) => shared.stream.fetch_synced(ticket),
+                .unwrap_or(true)
+                .then_some(0),
+            Wait::Fetch(ticket) => shared.stream.fetch_synced(ticket).then_some(0),
         }
     }
 
@@ -563,7 +569,6 @@ impl FrontChannel {
                 let current = semaphore_value(
                     &self.memory,
                     shared.syncpoints.semaphore_mirror(),
-                    &shared.waiters,
                     address,
                     wide,
                 );
@@ -576,7 +581,7 @@ impl FrontChannel {
                     payload = format_args!("{payload:#x}"),
                     wide,
                     current = %hex(current.ok()),
-                    latched = shared.waiters.latched(self.id),
+                    latched = matches!(shared.waiters.status(self.id), SemaphoreStatus::Met { .. }),
                     "GPU channel has waited 2 s on a semaphore acquire"
                 );
             }
@@ -603,13 +608,17 @@ impl FrontChannel {
     /// Runs the channel until its queue is empty or it waits again.
     pub(crate) fn run(&mut self, shared: &mut FrontShared) {
         if let Some(wait) = self.wait {
-            if !self.wait_met(wait, shared) {
+            let Some(dependency) = self.wait_dependency(wait, shared) else {
                 return;
-            }
+            };
             self.wait = None;
             self.waiting_since = None;
             self.wait_reported = false;
             shared.waiters.remove(self.id);
+            if dependency != 0 {
+                shared.stream.select(self.id);
+                shared.stream.semaphore_dependency(dependency);
+            }
         }
         if self.queue.is_empty() {
             return;
@@ -666,10 +675,10 @@ impl FrontChannel {
             self.offset = 0;
             return;
         }
-        if start == 0 && !self.fetch_synced {
+        if !self.fetch_synced {
             let sync = if self.on_written_pages(entry, shared) {
                 Some(FetchSync::Host)
-            } else if entry.sync() {
+            } else if start == 0 && entry.sync() {
                 Some(if shared.written_pages.is_some() {
                     FetchSync::HostIfWritten
                 } else {
@@ -763,19 +772,14 @@ impl FrontChannel {
 fn semaphore_value(
     memory: &Gmmu,
     mirror: &SemaphoreMirror,
-    waiters: &SemaphoreWaiters,
     address: GpuVAddr,
     wide: bool,
 ) -> Result<u64, GpuFault> {
-    let device = memory.translate(address);
-    if let Some(value) = device.and_then(|device| waiters.in_flight(device, wide)) {
-        return Ok(value);
-    }
     if wide {
         return memory.read::<u64>(address);
     }
     let load = || memory.read::<u32>(address);
-    match device {
+    match memory.translate(address) {
         Some(device) => mirror.acquire_view(device, load),
         None => load(),
     }
@@ -786,13 +790,12 @@ fn semaphore_value(
 fn semaphore_met(
     memory: &Gmmu,
     mirror: &SemaphoreMirror,
-    waiters: &SemaphoreWaiters,
     address: GpuVAddr,
     payload: u64,
     op: AcquireOp,
     wide: bool,
 ) -> bool {
-    match semaphore_value(memory, mirror, waiters, address, wide) {
+    match semaphore_value(memory, mirror, address, wide) {
         Ok(current) => op.is_met(current, payload, wide),
         Err(fault) => {
             tracing::warn!(?fault, "semaphore acquire on unmapped GPU memory");
@@ -900,13 +903,22 @@ impl Dispatch<'_> {
         op: AcquireOp,
         wide: bool,
     ) -> Flow {
-        if let Some(device) = self.memory.translate(address) {
-            self.shared.waiters.add(self.id, device, payload, op, wide);
+        let ordered =
+            self.shared.ordered_semaphore_acquires && self.state.host.class() == HostClass::Ampere;
+        let device = SemaphoreAddress {
+            low: self.memory.translate(address),
+            high: wide.then(|| self.memory.translate(address + 4)).flatten(),
+        };
+        if ordered || device.low.is_some() {
+            self.shared
+                .waiters
+                .add(self.id, device, payload, op, wide, ordered);
         }
-        if semaphore_met(
+        if ordered {
+            self.shared.stream.acquire(address, wide);
+        } else if semaphore_met(
             self.memory,
             self.shared.syncpoints.semaphore_mirror(),
-            &self.shared.waiters,
             address,
             payload,
             op,
@@ -914,8 +926,9 @@ impl Dispatch<'_> {
         ) {
             self.shared.waiters.remove(self.id);
             return Flow::Continue;
+        } else {
+            self.shared.stream.release_fences();
         }
-        self.shared.stream.release_fences();
         *self.wait = Some(Wait::Semaphore {
             method,
             address,
@@ -1265,6 +1278,7 @@ mod tests {
             compute_macros: None,
             words: Vec::new(),
             waiters: Arc::default(),
+            ordered_semaphore_acquires: false,
             inbox,
             syncpoints,
             written_pages: None,

@@ -11,9 +11,10 @@ use lichii_texture::block_linear::GobLayout;
 
 use crate::activity::{Activity, RendererCall, Wait};
 use crate::backend::{
-    ChannelId, FenceAction, FramebufferConfig, GpuHandles, GpuWrittenPages, Rasterizer,
-    ReleaseSize, RenderCondition,
+    ChannelId, FenceAction, FramebufferConfig, GpuHandles, GpuWrittenPages, PendingSemaphore,
+    Rasterizer, ReleaseSize, RenderCondition,
 };
+use crate::channel::SemaphoreAddress;
 use crate::clock::GpuTimestamp;
 use crate::cpu_reads::{CpuReads, QueuedRead};
 use crate::engines::kepler_compute::pcas::QmdScheduler;
@@ -65,6 +66,7 @@ struct BackChannel {
     setup: BackChannelSetup,
     engines: [Option<Box<dyn Engine>>; EngineKind::COUNT],
     macros: Option<Box<MacroEngine>>,
+    semaphore_dependency: u64,
 }
 
 /// How much of the device memory around a GPFIFO entry one fetch sync writes back. Switch 2
@@ -171,9 +173,11 @@ impl Back {
                 let len = self.execute(header, consumer);
                 consumer.advance(len);
                 if consumer.unreleased() >= RELEASE_SLOTS {
+                    self.rasterizer.poll_semaphore_acquires();
                     consumer.release();
                 }
             }
+            self.rasterizer.poll_semaphore_acquires();
             consumer.release();
         }
     }
@@ -311,6 +315,12 @@ impl Back {
                     .get(index)
                     .is_some_and(Option::is_some)
                     .then_some(index);
+                let dependency = self.current.map_or(0, |index| {
+                    self.channels[index].as_ref().unwrap().semaphore_dependency
+                });
+                self.syncpoints
+                    .semaphore_waiters()
+                    .select_dependency(dependency);
                 1
             }
             tag::BIND => {
@@ -346,6 +356,14 @@ impl Back {
                 1
             }
             tag::SET_REFERENCE => {
+                if self
+                    .syncpoints
+                    .semaphore_waiters()
+                    .has_unpublished_dependency()
+                {
+                    let _waiting = self.activity.waiting(Wait::HostGpu);
+                    self.rasterizer.release_fences(true);
+                }
                 if let Some(channel) = self.channel() {
                     channel.setup.reference.store(argument, Ordering::Release);
                 }
@@ -383,6 +401,20 @@ impl Back {
                 }
                 self.fetch_syncs.complete();
                 3
+            }
+            tag::ACQUIRE => {
+                self.acquire(consumer.slot(1), argument != 0);
+                2
+            }
+            tag::SEMAPHORE_DEPENDENCY => {
+                if let Some(channel) = self.channel() {
+                    let dependency = channel.semaphore_dependency.max(consumer.slot(1));
+                    channel.semaphore_dependency = dependency;
+                    self.syncpoints
+                        .semaphore_waiters()
+                        .select_dependency(dependency);
+                }
+                2
             }
             tag::SIDE => {
                 match self.side.try_recv() {
@@ -519,8 +551,37 @@ impl Back {
         }
     }
 
-    /// A semaphore release lands once the work before it completed; acquires see it now
-    /// ([`SemaphoreWaiters::executed`](crate::channel::SemaphoreWaiters::executed)).
+    fn acquire(&mut self, address: u64, wide: bool) {
+        let Some(channel) = self.current.and_then(|index| self.channels[index].as_ref()) else {
+            return;
+        };
+        let memory = &channel.setup.memory;
+        let at = SemaphoreAddress {
+            low: memory.translate(address),
+            high: wide.then(|| memory.translate(address + 4)).flatten(),
+        };
+        let pending = if let Some(address) = at.contiguous(wide) {
+            self.rasterizer.pending_semaphore(address, wide)
+        } else {
+            [at.low, at.high]
+                .into_iter()
+                .flatten()
+                .filter_map(|address| self.rasterizer.pending_semaphore(address, false))
+                .map(|write| write.fence)
+                .max()
+                .map(|fence| PendingSemaphore { fence, value: None })
+        };
+        let PendingSemaphore { fence, value } = pending.unwrap_or(PendingSemaphore {
+            fence: 0,
+            value: None,
+        });
+        self.syncpoints
+            .semaphore_waiters()
+            .arm(channel.setup.id, fence, value);
+    }
+
+    /// A semaphore release lands once the work before it completed; the fence action that writes
+    /// it also resumes the channels its value meets.
     fn release(&mut self, address: u64, payload: u64, size: ReleaseSize) {
         let Some(index) = self.current else {
             return;
@@ -535,12 +596,6 @@ impl Back {
             }
             return;
         };
-        self.syncpoints.semaphore_waiters().executed(
-            self.syncpoints.semaphore_mirror(),
-            daddr,
-            Some(payload),
-            size,
-        );
         self.rasterizer.signal_fence(FenceAction::WriteSemaphore {
             address: daddr,
             value: payload,
@@ -612,12 +667,6 @@ impl Back {
             tracing::warn!(address, "semaphore reduction on unmapped GPU memory");
             return;
         };
-        self.syncpoints.semaphore_waiters().executed(
-            self.syncpoints.semaphore_mirror(),
-            daddr,
-            None,
-            ReleaseSize::Four,
-        );
         self.rasterizer.signal_fence(FenceAction::ReduceSemaphore {
             address: daddr,
             op,
@@ -638,6 +687,7 @@ impl Back {
                     setup,
                     engines: Default::default(),
                     macros: None,
+                    semaphore_dependency: 0,
                 });
             }
             SideCommand::DestroyChannel(id) => {
@@ -652,6 +702,7 @@ impl Back {
                 }
                 if self.current == Some(index) {
                     self.current = None;
+                    self.syncpoints.semaphore_waiters().select_dependency(0);
                 }
             }
             SideCommand::BindAddressSpace(id, memory) => {

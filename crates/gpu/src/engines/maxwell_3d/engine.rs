@@ -252,7 +252,7 @@ impl Maxwell3d {
             }
             REPORT_SEMAPHORE_QUERY => {
                 if let Some(query) = queries::report(regs, ctx.memory) {
-                    ctx.query(&query);
+                    ctx.rasterizer.query(ctx.channel, ctx.memory, &query);
                 }
             }
             CLEAR_REPORT_VALUE => {
