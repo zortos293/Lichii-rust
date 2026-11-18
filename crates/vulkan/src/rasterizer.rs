@@ -59,9 +59,6 @@ use crate::texture_cache::{
 /// The tracing target of the GPU thread's and the presenter's activity lines.
 pub(crate) const ACTIVITY_TARGET: &str = "lichii_vulkan::activity";
 
-/// What the GPU thread recorded since its last activity line. With
-/// `lichii_vulkan::activity=debug` it logs one line a second while it submits work, so a run
-/// shows which work keeps the host GPU busy.
 /// What the `GPU memory` activity line reports, in bytes.
 struct MemoryLine {
     counts: MemoryCounts,
@@ -74,6 +71,9 @@ struct MemoryLine {
     staging_part_slices: u64,
 }
 
+/// What the GPU thread recorded since its last activity line. With
+/// `lichii_vulkan::activity=debug` it logs one line a second while it submits work, so a run
+/// shows which work keeps the host GPU busy.
 #[derive(Default)]
 struct Activity {
     since: Option<Instant>,
