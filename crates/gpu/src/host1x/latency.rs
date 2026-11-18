@@ -8,6 +8,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
+
 use crate::channel::SyncpointFence;
 
 const SLOTS: usize = 256;
@@ -47,19 +49,13 @@ pub(crate) struct FenceTotals {
     pub longest_ns: u64,
 }
 
-/// Open-addressed fences in flight keyed by syncpoint id and value, and atomic totals, so each
-/// stamp is a few atomic operations and allocates nothing.
+/// Open-addressed fences in flight keyed by syncpoint id and value, so each stamp is a few
+/// atomic operations and allocates nothing. A fence that completes adds to `totals` in one
+/// step, so a report never splits it across periods.
 pub(crate) struct FenceLatency {
     base: Instant,
     pending: Box<[Pending]>,
-    fences: AtomicU64,
-    partial: AtomicU64,
-    untracked: AtomicU64,
-    submit_to_front: AtomicU64,
-    front_to_back: AtomicU64,
-    back_to_done: AtomicU64,
-    total: AtomicU64,
-    longest: AtomicU64,
+    totals: Mutex<FenceTotals>,
 }
 
 fn key(id: u32, value: u32) -> u64 {
@@ -87,14 +83,7 @@ impl FenceLatency {
                     back: AtomicU64::new(0),
                 })
                 .collect(),
-            fences: AtomicU64::new(0),
-            partial: AtomicU64::new(0),
-            untracked: AtomicU64::new(0),
-            submit_to_front: AtomicU64::new(0),
-            front_to_back: AtomicU64::new(0),
-            back_to_done: AtomicU64::new(0),
-            total: AtomicU64::new(0),
-            longest: AtomicU64::new(0),
+            totals: Mutex::default(),
         }
     }
 
@@ -126,7 +115,7 @@ impl FenceLatency {
                 return;
             }
         }
-        self.untracked.fetch_add(1, Ordering::Relaxed);
+        self.totals.lock().untracked += 1;
     }
 
     /// The front reached the increments of `fence`.
@@ -158,33 +147,22 @@ impl FenceLatency {
             return;
         }
         if front == 0 || back == 0 || !(submitted <= front && front <= back && back <= now) {
-            self.partial.fetch_add(1, Ordering::Relaxed);
+            self.totals.lock().partial += 1;
             return;
         }
         let total = now - submitted;
-        self.fences.fetch_add(1, Ordering::Relaxed);
-        self.submit_to_front
-            .fetch_add(front - submitted, Ordering::Relaxed);
-        self.front_to_back
-            .fetch_add(back - front, Ordering::Relaxed);
-        self.back_to_done.fetch_add(now - back, Ordering::Relaxed);
-        self.total.fetch_add(total, Ordering::Relaxed);
-        self.longest.fetch_max(total, Ordering::Relaxed);
+        let mut totals = self.totals.lock();
+        totals.fences += 1;
+        totals.submit_to_front_ns += front - submitted;
+        totals.front_to_back_ns += back - front;
+        totals.back_to_done_ns += now - back;
+        totals.total_ns += total;
+        totals.longest_ns = totals.longest_ns.max(total);
     }
 
     /// Takes the totals since the last call.
     pub(crate) fn take(&self) -> FenceTotals {
-        let take = |counter: &AtomicU64| counter.swap(0, Ordering::Relaxed);
-        FenceTotals {
-            fences: take(&self.fences),
-            partial: take(&self.partial),
-            untracked: take(&self.untracked),
-            submit_to_front_ns: take(&self.submit_to_front),
-            front_to_back_ns: take(&self.front_to_back),
-            back_to_done_ns: take(&self.back_to_done),
-            total_ns: take(&self.total),
-            longest_ns: take(&self.longest),
-        }
+        std::mem::take(&mut *self.totals.lock())
     }
 
     /// Logs the averages per fence since the last report.
@@ -246,6 +224,44 @@ mod tests {
         }
         assert_eq!(totals.longest_ns, totals.total_ns);
         assert_eq!(latency.take(), FenceTotals::default());
+    }
+
+    #[test]
+    fn a_report_during_completions_never_splits_a_fence() {
+        let latency = std::sync::Arc::new(FenceLatency::new());
+        let fences = 20_000u32;
+        let completer = {
+            let latency = latency.clone();
+            std::thread::spawn(move || {
+                for value in 1..=fences {
+                    let fence = SyncpointFence { id: 3, value };
+                    latency.submitted(fence);
+                    latency.front(fence);
+                    latency.reached(Stage::Back, fence.id, value);
+                    latency.reached(Stage::Done, fence.id, value);
+                }
+            })
+        };
+        let mut seen = FenceTotals::default();
+        let mut check = |totals: FenceTotals| {
+            assert_eq!(
+                totals.submit_to_front_ns + totals.front_to_back_ns + totals.back_to_done_ns,
+                totals.total_ns
+            );
+            assert_eq!(totals.fences == 0, totals.total_ns == 0, "{totals:?}");
+            seen.fences += totals.fences;
+            seen.partial += totals.partial;
+            seen.untracked += totals.untracked;
+        };
+        while !completer.is_finished() {
+            check(latency.take());
+        }
+        completer.join().unwrap();
+        check(latency.take());
+        assert_eq!(
+            (seen.fences, seen.partial, seen.untracked),
+            (u64::from(fences), 0, 0)
+        );
     }
 
     #[test]
