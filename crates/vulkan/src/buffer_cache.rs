@@ -13,26 +13,30 @@
 //! all its buffers before it begins rendering.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use ash::vk;
 use gpu_allocator::MemoryLocation;
 use lichii_common::{DAddr, GpuVAddr, PAGE_BITS, PAGE_SIZE};
-use lichii_gpu::backend::{DrawParams, GpuWrittenPages, InlineIndices};
+use lichii_gpu::backend::{
+    CpuReadCompleter, CpuReadDone, CpuReadTicket, DrawParams, GpuWrittenPages, InlineIndices,
+};
 use lichii_gpu::engines::maxwell_3d::Regs;
 use lichii_gpu::engines::maxwell_3d::regs::{IndexBuffer, IndexFormat, PrimitiveTopology};
 use lichii_gpu::gmmu::{GPU_VA_SIZE, Gmmu, GpuRange, RangeTarget};
 use lichii_gpu::lazy::LazyDeviceRanges;
 use lichii_memory::{CachedPages, DeviceAddressSpace};
 use lichii_shader::ShaderArch;
+use parking_lot::Mutex;
 
 use crate::chunk_mask::ChunkMask;
 use crate::commands::transfer_to_all_barrier;
 use crate::device::Device;
-use crate::error::Result;
+use crate::error::{Result, VkResultExt};
 use crate::host_budget::{RING_OVERSIZED_CAP, Readback};
 use crate::memory::{Buffer, BufferView, LiveMemory};
-use crate::scheduler::Scheduler;
+use crate::scheduler::{Scheduler, Timeline};
 use crate::staging::{StagingRing, StagingSlice};
 
 const CACHING_PAGE_BITS: u32 = 16;
@@ -501,6 +505,392 @@ impl Captures {
     }
 }
 
+/// Size of the host-visible ring [`BufferCache::begin_cpu_read`] copies GPU-written bytes into
+/// for the guest threads waiting on them to write back themselves.
+const READ_RING_SIZE: u64 = 4 << 20;
+/// The longest read the ring takes; longer ones download synchronously.
+const READ_MAX: u64 = READ_RING_SIZE / 2;
+/// Reads pending at once. A guest thread holds at most one, so this bounds the waiting threads
+/// served without a host GPU wait on the back.
+const READ_SLOTS: usize = 16;
+/// Copies one pending read makes at most; a read made of more pieces downloads synchronously.
+const READ_SEGMENTS: usize = 32;
+/// Command buffers pending reads are recorded into, one per submitted batch still running.
+const READ_BATCHES: usize = 4;
+/// How long a guest thread waits for a copy before it checks for a lost device again.
+const READ_WAIT_SLICE_NS: u64 = 100_000_000;
+/// [`ReadSlot::state`]: the guest thread wrote the bytes back, or gave up.
+const READ_DONE: u32 = 1;
+/// [`ReadSlot::state`]: newer bytes reached guest memory, so the copy must not be written.
+const READ_CANCELLED: u32 = 2;
+/// [`ReadSlot::value`]: the copy runs in the scheduler's work of this tick, behind the writes
+/// still being recorded, rather than in a batch of its own.
+const READ_IN_TICK: u64 = 1 << 63;
+
+/// A pending read as the guest thread finishing it sees it.
+struct ReadSlot {
+    generation: AtomicU32,
+    state: AtomicU32,
+    /// The value of [`ReadSlots::timeline`] its copies are done at, or with [`READ_IN_TICK`] the
+    /// scheduler tick they are recorded in.
+    value: AtomicU64,
+    /// Its copies: device address, ring offset and length. Held while the bytes are written
+    /// back, so a cancel waits for a write already under way.
+    segments: Mutex<Vec<(DAddr, u64, u64)>>,
+}
+
+/// What guest threads finish pending reads with: the ring the GPU copies their bytes into, the
+/// timelines those copies signal, and a slot per read. Memory: the 4 MiB host-visible ring, and
+/// 16 slots of 32 segments, about 13 KiB.
+struct ReadSlots {
+    device: Arc<Device>,
+    lazy: Arc<LazyDeviceRanges>,
+    ring: Buffer,
+    timeline: vk::Semaphore,
+    scheduler: Arc<Timeline>,
+    slots: [ReadSlot; READ_SLOTS],
+}
+
+impl ReadSlots {
+    /// Waits until the copies a [`ReadSlot::value`] names finished; false once the device is
+    /// lost.
+    fn wait(&self, value: u64) -> bool {
+        let semaphores = [if value & READ_IN_TICK != 0 {
+            self.scheduler.raw()
+        } else {
+            self.timeline
+        }];
+        let values = [value & !READ_IN_TICK];
+        let info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+        loop {
+            if crate::debug::device_is_lost() {
+                return false;
+            }
+            // SAFETY: the semaphore lives as long as `self`, and `value` was submitted.
+            match unsafe { self.device.raw.wait_semaphores(&info, READ_WAIT_SLICE_NS) } {
+                Ok(()) => return true,
+                Err(vk::Result::TIMEOUT) => {}
+                failed => {
+                    if let Err(error) = failed.call("vkWaitSemaphores") {
+                        tracing::error!(%error, "waiting for a CPU read's copy failed");
+                    }
+                    return false;
+                }
+            }
+        }
+    }
+}
+
+impl CpuReadCompleter for ReadSlots {
+    fn complete(&self, ticket: CpuReadTicket) {
+        let slot = &self.slots[ticket.slot as usize];
+        let current = || {
+            slot.generation.load(Ordering::Acquire) == ticket.generation
+                && slot.state.load(Ordering::Acquire) & READ_DONE == 0
+        };
+        if !current() {
+            return;
+        }
+        let copied = self.wait(slot.value.load(Ordering::Acquire));
+        let segments = slot.segments.lock();
+        if !current() {
+            return;
+        }
+        if copied && slot.state.load(Ordering::Acquire) & READ_CANCELLED == 0 {
+            let data = self
+                .ring
+                .mapped()
+                .expect("read ring memory is host visible");
+            for &(daddr, offset, len) in segments.iter() {
+                let bytes = &data[offset as usize..(offset + len) as usize];
+                if let Err(fault) = self.lazy.write(daddr, bytes) {
+                    tracing::warn!(
+                        ?fault,
+                        daddr,
+                        "GPU-written buffer data over unmapped memory"
+                    );
+                }
+            }
+        }
+        slot.state.fetch_or(READ_DONE, Ordering::Release);
+    }
+}
+
+impl Drop for ReadSlots {
+    fn drop(&mut self) {
+        // SAFETY: [`PendingReads`] waited for every submission signalling it.
+        unsafe { self.device.raw.destroy_semaphore(self.timeline, None) };
+    }
+}
+
+/// A pending read as the back sees it: the GPU-written range it writes back and its ring span.
+#[derive(Clone, Copy)]
+struct InFlight {
+    start: DAddr,
+    end: DAddr,
+    offset: u64,
+    len: u64,
+    /// GPU work recorded since writes the range: its bytes stay GPU-written once the read ends.
+    superseded: bool,
+}
+
+/// Guest CPU reads whose bytes the GPU copies into [`ReadSlots::ring`] while the back carries
+/// on; the waiting threads write them back ([`CpuReadCompleter`]). Made at the first such read.
+/// Memory: [`ReadSlots`], 4 command buffers and 16 in-flight entries.
+struct PendingReads {
+    shared: Arc<ReadSlots>,
+    pool: vk::CommandPool,
+    /// Command buffers with the value their last submission signals.
+    batches: [(vk::CommandBuffer, u64); READ_BATCHES],
+    /// The batch being recorded, and a bit per slot it copies.
+    open: Option<(usize, u32)>,
+    /// Reads whose copies are recorded in the scheduler's work being recorded, as a bit per slot:
+    /// that work is submitted before their threads wait.
+    in_tick: u32,
+    submitted: u64,
+    in_flight: [Option<InFlight>; READ_SLOTS],
+    live: usize,
+    head: u64,
+}
+
+impl PendingReads {
+    fn new(
+        device: &Arc<Device>,
+        lazy: &Arc<LazyDeviceRanges>,
+        scheduler: Arc<Timeline>,
+    ) -> Result<Self> {
+        let ring = Buffer::new(
+            device,
+            READ_RING_SIZE,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            MemoryLocation::GpuToCpu,
+            "buffer cache read ring",
+        )?;
+        let mut timeline_info = vk::SemaphoreTypeCreateInfo::default()
+            .semaphore_type(vk::SemaphoreType::TIMELINE)
+            .initial_value(0);
+        let semaphore_info = vk::SemaphoreCreateInfo::default().push_next(&mut timeline_info);
+        // SAFETY: valid create info on a live device.
+        let timeline = unsafe {
+            device
+                .raw
+                .create_semaphore(&semaphore_info, None)
+                .call("vkCreateSemaphore")?
+        };
+        let shared = Arc::new(ReadSlots {
+            device: device.clone(),
+            lazy: lazy.clone(),
+            ring,
+            timeline,
+            scheduler,
+            slots: std::array::from_fn(|_| ReadSlot {
+                generation: AtomicU32::new(0),
+                state: AtomicU32::new(READ_DONE),
+                value: AtomicU64::new(0),
+                segments: Mutex::new(Vec::with_capacity(READ_SEGMENTS)),
+            }),
+        });
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(device.queue_family)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        // SAFETY: valid create info on a live device.
+        let pool = unsafe {
+            device
+                .raw
+                .create_command_pool(&pool_info, None)
+                .call("vkCreateCommandPool")?
+        };
+        let info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(READ_BATCHES as u32);
+        // SAFETY: the pool was just made on this device.
+        let cmds = match unsafe { device.raw.allocate_command_buffers(&info) }
+            .call("vkAllocateCommandBuffers")
+        {
+            Ok(cmds) => cmds,
+            Err(error) => {
+                // SAFETY: nothing uses the pool yet.
+                unsafe { device.raw.destroy_command_pool(pool, None) };
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            shared,
+            pool,
+            batches: std::array::from_fn(|i| (cmds[i], 0)),
+            open: None,
+            in_tick: 0,
+            submitted: 0,
+            in_flight: [None; READ_SLOTS],
+            live: 0,
+            head: 0,
+        })
+    }
+
+    /// The in-flight read overlapping `[start, end)`.
+    fn overlapping(&self, start: DAddr, end: DAddr) -> Option<usize> {
+        if self.live == 0 {
+            return None;
+        }
+        self.in_flight
+            .iter()
+            .position(|read| read.is_some_and(|read| read.start < end && start < read.end))
+    }
+
+    fn ticket(&self, index: usize) -> CpuReadTicket {
+        CpuReadTicket {
+            slot: index as u32,
+            generation: self.shared.slots[index].generation.load(Ordering::Acquire),
+        }
+    }
+
+    /// GPU work writing `[start, end)` is being recorded: in-flight reads there no longer end
+    /// the range's GPU-written state.
+    fn supersede(&mut self, start: DAddr, end: DAddr) {
+        if self.live == 0 {
+            return;
+        }
+        for read in self.in_flight.iter_mut().flatten() {
+            if read.start < end && start < read.end {
+                read.superseded = true;
+            }
+        }
+    }
+
+    /// Newer bytes of `[start, end)` are about to reach guest memory: in-flight reads there must
+    /// not write theirs over them. Waits for a write already under way.
+    fn cancel(&self, start: DAddr, end: DAddr) {
+        if self.live == 0 {
+            return;
+        }
+        for (index, read) in self.in_flight.iter().enumerate() {
+            if read.is_some_and(|read| read.start < end && start < read.end) {
+                let slot = &self.shared.slots[index];
+                let _writing = slot.segments.lock();
+                slot.state.fetch_or(READ_CANCELLED, Ordering::AcqRel);
+            }
+        }
+    }
+
+    /// A free span of `len` bytes in the ring, after the last one handed out or from its start.
+    fn alloc(&mut self, len: u64) -> Option<u64> {
+        let free = |offset: u64| {
+            offset + len <= READ_RING_SIZE
+                && self
+                    .in_flight
+                    .iter()
+                    .flatten()
+                    .all(|read| read.offset + read.len <= offset || offset + len <= read.offset)
+        };
+        let offset = [self.head.next_multiple_of(16), 0]
+            .into_iter()
+            .find(|&offset| free(offset))?;
+        self.head = offset + len;
+        Some(offset)
+    }
+
+    /// The command buffer of the open batch, opening one in a command buffer whose last batch
+    /// finished; `None` while every one still runs.
+    fn batch(&mut self, device: &Device) -> Result<Option<vk::CommandBuffer>> {
+        if let Some((index, _)) = self.open {
+            return Ok(Some(self.batches[index].0));
+        }
+        // SAFETY: the semaphore belongs to these reads.
+        let completed = unsafe { device.raw.get_semaphore_counter_value(self.shared.timeline) }
+            .call("vkGetSemaphoreCounterValue")?;
+        let Some(index) = self
+            .batches
+            .iter()
+            .position(|&(_, value)| value <= completed)
+        else {
+            return Ok(None);
+        };
+        let cmd = self.batches[index].0;
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        // SAFETY: the command buffer's last submission finished.
+        unsafe {
+            device
+                .raw
+                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+                .call("vkResetCommandBuffer")?;
+            device
+                .raw
+                .begin_command_buffer(cmd, &begin)
+                .call("vkBeginCommandBuffer")?;
+        }
+        before_transfer(device, cmd);
+        self.open = Some((index, 0));
+        Ok(Some(cmd))
+    }
+
+    /// Submits the open batch after the work submitted so far; its reads' tickets wait for it.
+    /// Reads recorded in a scheduler tick not submitted by now (`unsubmitted` and later) give up,
+    /// so their threads never wait for work that may not come.
+    fn submit(&mut self, device: &Device, unsubmitted: u64) -> Result<()> {
+        let in_tick = std::mem::take(&mut self.in_tick);
+        for (i, slot) in self.shared.slots.iter().enumerate() {
+            if in_tick & (1 << i) != 0
+                && slot.value.load(Ordering::Acquire) & !READ_IN_TICK >= unsubmitted
+            {
+                slot.state
+                    .fetch_or(READ_DONE | READ_CANCELLED, Ordering::AcqRel);
+            }
+        }
+        let Some((index, slots)) = self.open.take() else {
+            return Ok(());
+        };
+        let cmd = self.batches[index].0;
+        let value = self.submitted + 1;
+        transfer_to_all_barrier(device, cmd);
+        // SAFETY: `cmd` is recording.
+        let ended = unsafe { device.raw.end_command_buffer(cmd) }.call("vkEndCommandBuffer");
+        let submitted = ended.and_then(|()| {
+            let cmds = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
+            let signals = [vk::SemaphoreSubmitInfo::default()
+                .semaphore(self.shared.timeline)
+                .value(value)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+            let submit = vk::SubmitInfo2::default()
+                .command_buffer_infos(&cmds)
+                .signal_semaphore_infos(&signals);
+            device.submit(&[submit], vk::Fence::null())
+        });
+        let (state, value) = match submitted {
+            Ok(()) => {
+                self.submitted = value;
+                self.batches[index].1 = value;
+                (0, value)
+            }
+            Err(_) => (READ_DONE | READ_CANCELLED, 0),
+        };
+        for (i, slot) in self.shared.slots.iter().enumerate() {
+            if slots & (1 << i) != 0 {
+                slot.value.store(value, Ordering::Release);
+                slot.state.fetch_or(state, Ordering::AcqRel);
+            }
+        }
+        submitted
+    }
+}
+
+impl Drop for PendingReads {
+    fn drop(&mut self) {
+        let device = self.shared.device.clone();
+        if self.open.is_some() {
+            let _ = self.submit(&device, u64::MAX);
+        }
+        if self.submitted > 0 && !self.shared.wait(self.submitted) {
+            device.wait_idle();
+        }
+        // SAFETY: every submission of the pool's command buffers finished.
+        unsafe { device.raw.destroy_command_pool(self.pool, None) };
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Assembly {
     Direct,
@@ -857,6 +1247,7 @@ pub struct BufferCache {
     sync_slices: Option<SyncSlices>,
     readback: Readback,
     captures: Captures,
+    pending_reads: Option<PendingReads>,
     luts: [QuadLut; 2],
     widen_u8: bool,
     warned_scattered_write: bool,
@@ -915,6 +1306,7 @@ impl BufferCache {
             sync_slices: None,
             readback: Readback::default(),
             captures: Captures::default(),
+            pending_reads: None,
             luts: Default::default(),
             widen_u8: !device.features.index_type_uint8,
             warned_scattered_write: false,
@@ -986,6 +1378,9 @@ impl BufferCache {
         if daddr >= end {
             return;
         }
+        if let Some(reads) = &self.pending_reads {
+            reads.cancel(daddr, end);
+        }
         if self.gpu_written.intersects(daddr, end) {
             self.gpu_written.subtract(daddr, end);
             self.disarm_written_back(daddr, end);
@@ -1052,6 +1447,9 @@ impl BufferCache {
         }
         self.written_pages.mark(daddr, end - daddr);
         self.captures.drop_overlapping(daddr, end);
+        if let Some(reads) = &mut self.pending_reads {
+            reads.supersede(daddr, end);
+        }
         if self.flush_traps && !self.gpu_written.covers(daddr, end) {
             self.memory.arm_flush_traps(daddr, end - daddr);
         }
@@ -1166,12 +1564,193 @@ impl BufferCache {
         Ok((start, end))
     }
 
+    /// A guest CPU thread waits on a flush trap in `[daddr, +size)`, as in
+    /// [`BufferCache::flush_for_cpu_read`], and can finish the read itself: the GPU copies the
+    /// GPU-written range around it into the read ring, behind the work submitted so far, and the
+    /// ticket the thread finishes it with is returned without waiting. The range stays
+    /// GPU-written and its pages trapped until [`BufferCache::reclaim_cpu_reads`] finds the read
+    /// done. A read overlapping one still in flight gets that read's ticket. A read the ring
+    /// cannot take (over [`READ_MAX`], over [`READ_SEGMENTS`] pieces, no free slot, span or
+    /// command buffer) downloads synchronously. Submit the started copies with
+    /// [`BufferCache::end_cpu_reads`]. Returns the range too.
+    pub fn begin_cpu_read(
+        &mut self,
+        scheduler: &mut Scheduler,
+        daddr: DAddr,
+        size: u64,
+    ) -> Result<((DAddr, DAddr), CpuReadDone)> {
+        let (start, end) = self.gpu_written.area(daddr, daddr.saturating_add(size));
+        let end = end.min(self.limit);
+        if let Some(reads) = &self.pending_reads
+            && let Some(index) =
+                reads.overlapping(start.min(daddr), end.max(daddr.saturating_add(size)))
+        {
+            return Ok(((start, end), CpuReadDone::Pending(reads.ticket(index))));
+        }
+        if !self.gpu_written.intersects(start, end) || self.read_captured(scheduler, start, end)? {
+            return Ok(((start, end), CpuReadDone::Home));
+        }
+        let (total, newest) = self.collect_downloads(start, end);
+        if let Some(ticket) = self.start_pending_read(scheduler, start, end, total, newest)? {
+            return Ok(((start, end), CpuReadDone::Pending(ticket)));
+        }
+        self.download(scheduler, start, end, total, newest)?;
+        Ok(((start, end), CpuReadDone::Home))
+    }
+
+    /// Records the copies [`BufferCache::collect_downloads`] listed for `[start, end)` into the
+    /// open batch of pending reads; `None` when the ring cannot take them.
+    fn start_pending_read(
+        &mut self,
+        scheduler: &mut Scheduler,
+        start: DAddr,
+        end: DAddr,
+        total: u64,
+        newest: u64,
+    ) -> Result<Option<CpuReadTicket>> {
+        if total > READ_MAX || self.downloads.len() > READ_SEGMENTS {
+            return Ok(None);
+        }
+        if self.pending_reads.is_none() {
+            self.pending_reads = Some(PendingReads::new(
+                &self.device,
+                &self.lazy,
+                scheduler.shared_timeline(),
+            )?);
+        }
+        let reads = self.pending_reads.as_mut().expect("just made");
+        let Some(index) = reads.in_flight.iter().position(Option::is_none) else {
+            return Ok(None);
+        };
+        let Some(offset) = reads.alloc(total) else {
+            return Ok(None);
+        };
+        let in_tick = newest >= scheduler.tick();
+        let cmd = if in_tick {
+            let cmd = scheduler.record()?;
+            before_transfer(&self.device, cmd);
+            cmd
+        } else {
+            match reads.batch(&self.device)? {
+                Some(cmd) => cmd,
+                None => return Ok(None),
+            }
+        };
+        let slot = &reads.shared.slots[index];
+        let mut segments = slot.segments.lock();
+        segments.clear();
+        let ring = reads.shared.ring.raw();
+        let mut at = offset;
+        for &(src, src_offset, daddr, len) in &self.downloads {
+            let region = [vk::BufferCopy {
+                src_offset,
+                dst_offset: at,
+                size: len,
+            }];
+            copy_buffer(&self.device, cmd, src, ring, &region);
+            segments.push((daddr, at, len));
+            at += len;
+        }
+        if in_tick {
+            transfer_to_all_barrier(&self.device, cmd);
+        }
+        let generation = slot
+            .generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let value = if in_tick {
+            READ_IN_TICK | scheduler.tick()
+        } else {
+            0
+        };
+        slot.value.store(value, Ordering::Release);
+        slot.state.store(0, Ordering::Release);
+        drop(segments);
+        reads.in_flight[index] = Some(InFlight {
+            start,
+            end,
+            offset,
+            len: total,
+            superseded: false,
+        });
+        reads.live += 1;
+        if in_tick {
+            reads.in_tick |= 1 << index;
+        } else if let Some((_, slots)) = &mut reads.open {
+            *slots |= 1 << index;
+        }
+        self.stats.downloaded_bytes += total;
+        Ok(Some(CpuReadTicket {
+            slot: index as u32,
+            generation,
+        }))
+    }
+
+    /// Whether a read [`BufferCache::begin_cpu_read`] started copies bytes that work still
+    /// being recorded writes, so its copy went into that work: submit it before
+    /// [`BufferCache::end_cpu_reads`].
+    pub fn cpu_reads_wait_for_recording(&self) -> bool {
+        self.pending_reads
+            .as_ref()
+            .is_some_and(|reads| reads.in_tick != 0)
+    }
+
+    /// Submits the copies [`BufferCache::begin_cpu_read`] started since the last call, after
+    /// the work submitted so far, without waiting for them.
+    pub fn end_cpu_reads(&mut self, scheduler: &Scheduler) -> Result<()> {
+        match &mut self.pending_reads {
+            Some(reads) => reads.submit(&self.device, scheduler.tick()),
+            None => Ok(()),
+        }
+    }
+
+    /// Ends the pending reads their guest threads finished. A read no GPU write superseded and
+    /// nothing cancelled leaves its range no longer GPU-written: its pages stop trapping, and
+    /// `rearm` gets the range so images over it trap again.
+    pub fn reclaim_cpu_reads(&mut self, mut rearm: impl FnMut(DAddr, DAddr)) {
+        for index in 0..READ_SLOTS {
+            let Some(reads) = self.pending_reads.as_mut().filter(|reads| reads.live != 0) else {
+                return;
+            };
+            let Some(read) = reads.in_flight[index] else {
+                continue;
+            };
+            let state = reads.shared.slots[index].state.load(Ordering::Acquire);
+            if state & READ_DONE == 0 {
+                continue;
+            }
+            reads.in_flight[index] = None;
+            reads.live -= 1;
+            if read.superseded || state & READ_CANCELLED != 0 {
+                continue;
+            }
+            self.gpu_written.subtract(read.start, read.end);
+            self.disarm_written_back(read.start, read.end);
+            rearm(read.start, read.end);
+        }
+    }
+
+    /// What guest threads finish the reads [`BufferCache::begin_cpu_read`] left pending with.
+    pub fn cpu_read_completer(&self) -> Option<Arc<dyn CpuReadCompleter>> {
+        self.pending_reads
+            .as_ref()
+            .map(|reads| reads.shared.clone() as Arc<dyn CpuReadCompleter>)
+    }
+
     /// Copies the GPU-written bytes of `[daddr, +size)` back to guest memory, waiting for the GPU.
     pub fn flush(&mut self, scheduler: &mut Scheduler, daddr: DAddr, size: u64) -> Result<()> {
         let end = daddr.saturating_add(size).min(self.limit);
         if !self.gpu_written.intersects(daddr, end) || self.read_captured(scheduler, daddr, end)? {
             return Ok(());
         }
+        let (total, newest) = self.collect_downloads(daddr, end);
+        self.download(scheduler, daddr, end, total, newest)
+    }
+
+    /// Lists the copies of the GPU-written bytes of `[daddr, end)` in
+    /// [`BufferCache::downloads`] and marks the ranges hot for captures. Returns their total
+    /// length and the newest tick writing them.
+    fn collect_downloads(&mut self, daddr: DAddr, end: DAddr) -> (u64, u64) {
         let Self {
             page_table,
             buffers,
@@ -1195,12 +1774,25 @@ impl BufferCache {
                 downloads.push((buffer.buffer.raw(), addr - buffer.daddr, addr, len));
                 newest = newest.max(buffer.written_tick);
                 total += len;
-                if len <= CAPTURE_MAX {
+                if len <= CAPTURE_MAX && !captures.hot.covers(addr, addr + len) {
                     captures.hot.insert(addr, addr + len);
                 }
                 addr += len;
             }
         });
+        (total, newest)
+    }
+
+    /// Runs the copies [`BufferCache::collect_downloads`] listed for `[daddr, end)`, waits for
+    /// them and writes the bytes to guest memory.
+    fn download(
+        &mut self,
+        scheduler: &mut Scheduler,
+        daddr: DAddr,
+        end: DAddr,
+        total: u64,
+        newest: u64,
+    ) -> Result<()> {
         let readback = self
             .readback
             .ensure(
@@ -1235,6 +1827,9 @@ impl BufferCache {
             .buffer()
             .and_then(Buffer::mapped)
             .expect("readback memory is host visible");
+        if let Some(reads) = &self.pending_reads {
+            reads.cancel(daddr, end);
+        }
         let mut offset = 0;
         for &(_, _, daddr, len) in &self.downloads {
             let bytes = &data[offset as usize..(offset + len) as usize];
@@ -1267,6 +1862,7 @@ impl BufferCache {
             gpu_written,
             captures,
             lazy,
+            pending_reads,
             ..
         } = self;
         let Some(ring) = captures.ring.as_ref().filter(|_| !captures.live.is_empty()) else {
@@ -1290,6 +1886,9 @@ impl BufferCache {
             return Ok(false);
         }
         scheduler.wait(newest)?;
+        if let Some(reads) = pending_reads {
+            reads.cancel(daddr, end);
+        }
         let data = ring.mapped().expect("capture memory is host visible");
         let mut total = 0;
         gpu_written.for_each_in(daddr, end, |start, end| {
@@ -4567,10 +5166,330 @@ mod tests {
         f.assert_no_validation_errors();
     }
 
-    /// Back-thread time of one CPU-read download of 4 KiB of GPU-written bytes whose writer
-    /// already finished: copied aside behind an idle queue, copied aside behind 32 MiB of later
-    /// unrelated work, and served from a capture with the same work queued. Each read checks it
-    /// got the writer's bytes:
+    impl Fixture {
+        /// Starts a pending read of each of `ranges` and submits their copies, as the back does
+        /// for one batch of trapped reads.
+        fn begin_reads(&mut self, ranges: &[(DAddr, u64)]) -> Vec<CpuReadDone> {
+            let done = ranges
+                .iter()
+                .map(|&(daddr, size)| {
+                    self.cache
+                        .begin_cpu_read(&mut self.scheduler, daddr, size)
+                        .unwrap()
+                        .1
+                })
+                .collect();
+            if self.cache.cpu_reads_wait_for_recording() {
+                self.submit();
+            }
+            self.cache.end_cpu_reads(&self.scheduler).unwrap();
+            done
+        }
+
+        fn complete(&self, done: CpuReadDone) {
+            if let CpuReadDone::Pending(ticket) = done {
+                self.cache.cpu_read_completer().unwrap().complete(ticket);
+            }
+        }
+
+        fn reclaim(&mut self) {
+            self.cache.reclaim_cpu_reads(|_, _| {});
+        }
+
+        /// GPU work writes `value` over `[daddr, +size)` of `binding`, acquired at `base`,
+        /// recorded now.
+        fn gpu_write(
+            &mut self,
+            (binding, base): (BufferBinding, DAddr),
+            daddr: DAddr,
+            size: u64,
+            value: u32,
+        ) {
+            self.gpu_fill(binding, daddr - base, size, value);
+            self.cache
+                .mark_gpu_written(self.scheduler.tick(), daddr, size);
+        }
+    }
+
+    fn pending(done: CpuReadDone) -> CpuReadTicket {
+        match done {
+            CpuReadDone::Pending(ticket) => ticket,
+            CpuReadDone::Home => panic!("the read was served synchronously"),
+        }
+    }
+
+    /// Reads of several GPU-written ranges in flight at once, one of them written by work still
+    /// being recorded, and a GPU write over one of them recorded before the reads complete: each
+    /// read's thread gets the bytes the synchronous download gives at the same point, the
+    /// rewritten range stays GPU-written, and its next download gets the later write.
+    #[test]
+    fn pending_reads_return_the_bytes_of_synchronous_downloads() {
+        const READS: [(u64, u64, u32); 4] = [
+            (0, 0x100, 0x1111_1111),
+            (0x2000, 0x200, 0x2222_2222),
+            (0x4000, 0x1000, 0x3333_3333),
+            (0x6000, 0x100, 0x4444_4444),
+        ];
+        let run = |handed_off: bool| {
+            let mut f = fixture()?;
+            let binding = (f.acquire(DADDR, 0x8000), DADDR);
+            for &(offset, size, value) in &READS[..3] {
+                f.gpu_write(binding, DADDR + offset, size, value);
+            }
+            f.submit();
+            let (offset, size, value) = READS[3];
+            f.gpu_write(binding, DADDR + offset, size, value);
+            let pages: Vec<_> = READS
+                .iter()
+                .map(|&(offset, _, _)| (DADDR + offset, PAGE_SIZE))
+                .collect();
+            let done = if handed_off {
+                f.begin_reads(&pages)
+            } else {
+                for &(daddr, size) in &pages {
+                    f.cache
+                        .flush_for_cpu_read(&mut f.scheduler, daddr, size)
+                        .unwrap();
+                }
+                Vec::new()
+            };
+            f.gpu_write(binding, DADDR + 0x2000, 0x200, 0x5555_5555);
+            if handed_off {
+                let tickets: Vec<_> = done.iter().copied().map(pending).collect();
+                let slots: std::collections::HashSet<_> = tickets.iter().map(|t| t.slot).collect();
+                assert_eq!(slots.len(), READS.len(), "every read has a slot of its own");
+                let completer = f.cache.cpu_read_completer().unwrap();
+                std::thread::scope(|scope| {
+                    for ticket in tickets {
+                        let completer = &completer;
+                        scope.spawn(move || completer.complete(ticket));
+                    }
+                });
+            }
+            let read = f.guest(DADDR, 0x8000);
+            f.reclaim();
+            let still_written: Vec<_> = READS
+                .iter()
+                .map(|&(offset, size, _)| f.cache.is_gpu_written(DADDR + offset, size))
+                .collect();
+            f.submit();
+            f.cache
+                .flush(&mut f.scheduler, DADDR + 0x2000, 0x200)
+                .unwrap();
+            let later = f.guest(DADDR + 0x2000, 0x200);
+            f.assert_no_validation_errors();
+            Some((read, still_written, later))
+        };
+        let Some((read, still_written, later)) = run(true) else {
+            return;
+        };
+        let (sync_read, sync_written, sync_later) = run(false).unwrap();
+        for &(offset, size, value) in &READS {
+            let offset = offset as usize;
+            assert_eq!(
+                read[offset..offset + size as usize],
+                words(value, size as usize)
+            );
+        }
+        assert_eq!(read, sync_read, "the bytes of the synchronous download");
+        assert_eq!(still_written, [false, true, false, false]);
+        assert_eq!(sync_written, still_written);
+        assert_eq!(later, words(0x5555_5555, 0x200));
+        assert_eq!(sync_later, later);
+    }
+
+    /// The pages of a pending read stay trapped until the back finds the read done; then a range
+    /// no GPU work wrote meanwhile stops trapping, and one a GPU write was recorded over keeps its
+    /// trap and its GPU-written state. Fails if the later write is ignored.
+    #[test]
+    fn a_gpu_write_recorded_while_a_read_is_pending_keeps_its_range_trapped() {
+        const CPU_VA: u64 = 0x1000_0000;
+        let Some(mut f) = fixture() else { return };
+        f.cache.flush_traps = true;
+        let space = Arc::new(AddressSpace::new(f.memory.physical().clone(), 39));
+        space.map(CPU_VA, 0, 0x10000, MemoryPermission::READ_WRITE);
+        f.memory.attach_process(space.clone());
+        let binding = (f.acquire(DADDR, 0x4000), DADDR);
+        f.gpu_write(binding, DADDR, 0x100, 0x1111_1111);
+        f.gpu_write(binding, DADDR + 0x2000, 0x100, 0x2222_2222);
+        f.submit();
+        f.memory.take_flush_trap_stats();
+        let done = f.begin_reads(&[(DADDR, PAGE_SIZE), (DADDR + 0x2000, PAGE_SIZE)]);
+        f.gpu_write(binding, DADDR + 0x2000, 0x100, 0x3333_3333);
+        for &done in &done {
+            f.complete(done);
+        }
+        assert_eq!(
+            f.memory.take_flush_trap_stats().disarms,
+            0,
+            "the traps stay until the back finds the reads done"
+        );
+        assert_eq!(f.guest(DADDR, 0x100), words(0x1111_1111, 0x100));
+        assert_eq!(f.guest(DADDR + 0x2000, 0x100), words(0x2222_2222, 0x100));
+        f.reclaim();
+        assert_eq!(
+            f.memory.take_flush_trap_stats().disarms,
+            1,
+            "only the range nothing wrote since stops trapping"
+        );
+        assert!(!f.cache.is_gpu_written(DADDR, 0x100));
+        assert!(
+            f.cache.is_gpu_written(DADDR + 0x2000, 0x100),
+            "the later write keeps the range GPU-written"
+        );
+        f.submit();
+        let done = f.begin_reads(&[(DADDR + 0x2000, PAGE_SIZE)]);
+        f.complete(done[0]);
+        assert_eq!(f.guest(DADDR + 0x2000, 0x100), words(0x3333_3333, 0x100));
+        f.reclaim();
+        assert!(!f.cache.is_gpu_written(DADDR + 0x2000, 0x100));
+        assert_eq!(f.memory.take_flush_trap_stats().disarms, 1);
+        f.assert_no_validation_errors();
+    }
+
+    /// Reads the ring cannot take download synchronously and still return their bytes: one over
+    /// half the ring, one with every slot taken, and one with no ring span left. Finishing the
+    /// pending reads frees their slots and spans for the next.
+    #[test]
+    fn reads_the_ring_cannot_take_download_synchronously() {
+        let Some(mut f) = fixture() else { return };
+        let big = (
+            f.acquire(DADDR + (8 << 20), READ_MAX + 0x1000),
+            DADDR + (8 << 20),
+        );
+        f.gpu_write(big, DADDR + (8 << 20), READ_MAX + 0x1000, 0x0b0b_0b0b);
+        f.submit();
+        let done = f.begin_reads(&[(DADDR + (8 << 20), PAGE_SIZE)]);
+        assert_eq!(done, [CpuReadDone::Home], "over half the ring");
+        assert_eq!(
+            f.guest(DADDR + (8 << 20), (READ_MAX + 0x1000) as usize),
+            words(0x0b0b_0b0b, (READ_MAX + 0x1000) as usize)
+        );
+
+        let small = (f.acquire(DADDR, 0x2000 * (READ_SLOTS as u64 + 2)), DADDR);
+        let at = |i: usize| DADDR + 0x2000 * i as u64;
+        for i in 0..=READ_SLOTS {
+            f.gpu_write(small, at(i), 0x100, 0x0100_0000 + i as u32);
+        }
+        f.submit();
+        let ranges: Vec<_> = (0..=READ_SLOTS).map(|i| (at(i), PAGE_SIZE)).collect();
+        let done = f.begin_reads(&ranges);
+        assert!(done[..READ_SLOTS].iter().all(|d| *d != CpuReadDone::Home));
+        assert_eq!(done[READ_SLOTS], CpuReadDone::Home, "every slot taken");
+        assert_eq!(
+            f.guest(at(READ_SLOTS), 0x100),
+            words(0x0100_0000 + READ_SLOTS as u32, 0x100)
+        );
+        for &done in &done {
+            f.complete(done);
+        }
+        for i in 0..READ_SLOTS {
+            assert_eq!(f.guest(at(i), 0x100), words(0x0100_0000 + i as u32, 0x100));
+        }
+        f.reclaim();
+        f.gpu_write(small, at(READ_SLOTS + 1), 0x100, 0x0202_0202);
+        f.submit();
+        let done = f.begin_reads(&[(at(READ_SLOTS + 1), PAGE_SIZE)]);
+        pending(done[0]);
+        f.complete(done[0]);
+        f.reclaim();
+
+        const SPAN: u64 = READ_RING_SIZE * 3 / 8;
+        let base = DADDR + (2 << 20);
+        let wide = (f.acquire(base, 4 * SPAN), base);
+        let starts = [base, base + SPAN + 0x1000, base + 2 * SPAN + 0x2000];
+        for (i, &start) in starts.iter().enumerate() {
+            f.gpu_write(wide, start, SPAN, 0x0c0c_0c00 + i as u32);
+        }
+        f.submit();
+        let ranges: Vec<_> = starts.iter().map(|&start| (start, PAGE_SIZE)).collect();
+        let done = f.begin_reads(&ranges);
+        pending(done[0]);
+        pending(done[1]);
+        assert_eq!(done[2], CpuReadDone::Home, "no ring span left");
+        for &done in &done {
+            f.complete(done);
+        }
+        for (i, &start) in starts.iter().enumerate() {
+            assert_eq!(
+                f.guest(start, SPAN as usize),
+                words(0x0c0c_0c00 + i as u32, SPAN as usize)
+            );
+        }
+        f.assert_no_validation_errors();
+    }
+
+    /// A read overlapping one still pending gets its ticket, and either thread finishing it
+    /// writes the bytes once. A guest write the cache is told of while a read is pending cancels
+    /// the read's write, so the guest's bytes survive.
+    #[test]
+    fn overlapping_reads_share_a_ticket_and_invalidated_reads_write_nothing() {
+        let Some(mut f) = fixture() else { return };
+        let binding = (f.acquire(DADDR, 0x4000), DADDR);
+        f.gpu_write(binding, DADDR, 0x2000, 0x1111_1111);
+        f.gpu_write(binding, DADDR + 0x3000, 0x100, 0x2222_2222);
+        f.submit();
+        let done = f.begin_reads(&[(DADDR, PAGE_SIZE), (DADDR + PAGE_SIZE, PAGE_SIZE)]);
+        assert_eq!(
+            done[0], done[1],
+            "the second page lies in the first read's range"
+        );
+        let ticket = pending(done[0]);
+        let completer = f.cache.cpu_read_completer().unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| completer.complete(ticket));
+            }
+        });
+        assert_eq!(f.guest(DADDR, 0x2000), words(0x1111_1111, 0x2000));
+
+        let done = f.begin_reads(&[(DADDR + 0x3000, PAGE_SIZE)]);
+        pending(done[0]);
+        let guest = [0x5a; 0x100];
+        f.memory.write_bytes(DADDR + 0x3000, &guest).unwrap();
+        f.cache.invalidate(DADDR + 0x3000, 0x100);
+        f.complete(done[0]);
+        assert_eq!(
+            f.guest(DADDR + 0x3000, 0x100),
+            guest,
+            "the guest's write survives"
+        );
+        f.reclaim();
+        assert!(!f.cache.is_gpu_written(DADDR, 0x4000));
+        f.assert_no_validation_errors();
+    }
+
+    /// Starting and submitting a pending read allocates nothing once the cache is warm.
+    #[test]
+    fn pending_reads_allocate_nothing_on_the_back() {
+        let Some(mut f) = fixture() else { return };
+        let binding = (f.acquire(DADDR, 0x1000), DADDR);
+        let mut done = CpuReadDone::Home;
+        for round in 0..4 {
+            f.gpu_write(binding, DADDR, 0x100, round);
+            f.scheduler.flush().unwrap();
+            f.reclaim();
+            let before = allocations();
+            done = f
+                .cache
+                .begin_cpu_read(&mut f.scheduler, DADDR, PAGE_SIZE)
+                .unwrap()
+                .1;
+            f.cache.end_cpu_reads(&f.scheduler).unwrap();
+            if round > 0 {
+                assert_eq!(allocations(), before, "round {round} allocated");
+            }
+            f.complete(done);
+        }
+        pending(done);
+        assert_eq!(f.guest(DADDR, 0x100), words(3, 0x100));
+        f.assert_no_validation_errors();
+    }
+
+    /// Time per CPU read of 4 KiB of GPU-written bytes whose writer already finished, behind an
+    /// idle queue or 32 MiB of later unrelated work: on the back for a synchronous aside copy, a
+    /// capture, and a pending read (start and submit), and on the guest thread for finishing
+    /// the pending read. Each read checks it got the writer's bytes:
     /// `cargo test --release -p lichii-vulkan --lib cpu_read_cost -- --ignored --nocapture`.
     #[test]
     #[ignore = "timing"]
@@ -4584,14 +5503,36 @@ mod tests {
         let read = f.acquire(DADDR, 0x10000);
         let later = f.acquire(DADDR + (16 << 20), LATER);
         f.scheduler.finish().unwrap();
-        for (name, captured, queued) in [
-            ("aside copy, idle queue", false, false),
-            ("aside copy, 32 MiB of later work queued", false, true),
-            ("capture, 32 MiB of later work queued", true, true),
+        #[derive(Clone, Copy, PartialEq)]
+        enum Path {
+            Aside,
+            Capture,
+            Pending,
+        }
+        let summary = |us: &mut Vec<f64>| {
+            us.sort_by(f64::total_cmp);
+            format!(
+                "{:.0} / {:.0} / {:.0} us",
+                us[0],
+                us[us.len() / 2],
+                us[us.len() - 1]
+            )
+        };
+        for (name, path, queued) in [
+            ("aside copy, idle queue", Path::Aside, false),
+            ("aside copy, 32 MiB of later work queued", Path::Aside, true),
+            ("capture, 32 MiB of later work queued", Path::Capture, true),
+            ("pending read, idle queue", Path::Pending, false),
+            (
+                "pending read, 32 MiB of later work queued",
+                Path::Pending,
+                true,
+            ),
         ] {
-            let mut us = Vec::new();
+            let mut back = Vec::new();
+            let mut guest = Vec::new();
             for i in 0..=READS {
-                if !captured {
+                if path != Path::Capture {
                     f.cache.captures.hot = RangeSet::default();
                 }
                 let value = 0x0101_0101 * (i % 0xff + 1);
@@ -4605,21 +5546,33 @@ mod tests {
                     f.submit();
                 }
                 let start = Instant::now();
-                f.cache.flush(&mut f.scheduler, DADDR, SIZE as u64).unwrap();
-                let elapsed = start.elapsed().as_secs_f64() * 1e6;
+                let done = if path == Path::Pending {
+                    f.begin_reads(&[(DADDR, PAGE_SIZE)])[0]
+                } else {
+                    f.cache.flush(&mut f.scheduler, DADDR, SIZE as u64).unwrap();
+                    CpuReadDone::Home
+                };
+                let started = start.elapsed().as_secs_f64() * 1e6;
+                let start = Instant::now();
+                f.complete(done);
+                let finished = start.elapsed().as_secs_f64() * 1e6;
+                assert_eq!(path == Path::Pending, done != CpuReadDone::Home);
                 assert_eq!(f.guest(DADDR, SIZE), words(value, SIZE));
+                f.reclaim();
                 f.scheduler.finish().unwrap();
                 if i > 0 {
-                    us.push(elapsed);
+                    back.push(started);
+                    guest.push(finished);
                 }
             }
-            us.sort_by(f64::total_cmp);
-            eprintln!(
-                "{name}: per read (best / median / worst) {:.0} / {:.0} / {:.0} us",
-                us[0],
-                us[us.len() / 2],
-                us[us.len() - 1],
+            let mut line = format!(
+                "{name}: per read (best / median / worst) back {}",
+                summary(&mut back)
             );
+            if path == Path::Pending {
+                line += &format!(", guest thread {}", summary(&mut guest));
+            }
+            eprintln!("{line}");
         }
         f.assert_no_validation_errors();
     }

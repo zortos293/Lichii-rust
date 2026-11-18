@@ -198,12 +198,8 @@ impl Back {
     #[cold]
     fn serve_cpu_reads_now(&mut self) {
         self.flush_engine();
-        let _waiting = self.activity.waiting(Wait::HostGpu);
-        let rasterizer = &mut *self.rasterizer;
         self.cpu_reads
-            .serve(&mut self.cpu_read_ranges, |daddr, size| {
-                rasterizer.flush_for_cpu_read(daddr, size)
-            });
+            .serve(&mut self.cpu_read_ranges, &mut *self.rasterizer);
     }
 
     /// Drops the renderer's copies of device memory the guest CPU wrote while a cache held it.
