@@ -597,7 +597,7 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         t.set(Loc::V(rd), r);
         return true;
     }
-    let narrow = match word & 0xbf3f_fc00 {
+    let narrow = match word & 0xaf3f_fc00 {
         0x0e21_4800 => Some(Saturation::Signed),
         0x2e21_4800 => Some(Saturation::Unsigned),
         0x2e21_2800 => Some(Saturation::SignedToUnsigned),
