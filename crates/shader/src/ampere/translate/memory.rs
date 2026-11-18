@@ -399,11 +399,48 @@ fn local_word(t: &mut Translator<'_>, offset: Value) -> Value {
     }
 }
 
+/// Clamps a dynamic local memory word index to the last word, so no access leaves the array:
+/// local memory is private to the invocation, which robust buffer access does not cover.
+fn clamp_local_word(t: &mut Translator<'_>, word: Value, dynamic: bool, size: u32) -> Value {
+    if !dynamic {
+        return word;
+    }
+    t.ir.imin(word, Value::U32(size.div_ceil(4) - 1), false)
+}
+
 /// Loads a local memory word; reads past the end return zero.
-fn load_local(t: &mut Translator<'_>, word: Value, offset: Value, size: u32) -> Value {
+fn load_local(
+    t: &mut Translator<'_>,
+    word: Value,
+    offset: Value,
+    dynamic: bool,
+    size: u32,
+) -> Value {
     let in_bounds = t.ir.icompare(ICompare::ULessThan, offset, Value::U32(size));
+    let word = clamp_local_word(t, word, dynamic, size);
     let value = t.ir.inst(Op::LoadLocal, &[word]);
     t.ir.select(in_bounds, value, Value::U32(0))
+}
+
+/// Stores `value` to a local memory word. A dynamic store past the end writes the clamped
+/// word's own value back instead; `old` is that value when the caller already loaded it.
+fn write_local(
+    t: &mut Translator<'_>,
+    word: Value,
+    offset: Value,
+    value: Value,
+    old: Option<Value>,
+    dynamic: bool,
+    size: u32,
+) {
+    if !dynamic {
+        t.ir.inst(Op::WriteLocal, &[word, value]);
+        return;
+    }
+    let in_bounds = t.ir.icompare(ICompare::ULessThan, offset, Value::U32(size));
+    let old = old.unwrap_or_else(|| t.ir.inst(Op::LoadLocal, &[word]));
+    let value = t.ir.select(in_bounds, value, old);
+    t.ir.inst(Op::WriteLocal, &[word, value]);
 }
 
 /// `LDL Rd, [Ra + URb + imm]`.
@@ -416,7 +453,8 @@ fn ldl(t: &mut Translator<'_>) -> TResult {
     let offset = byte_address(t, ureg, false);
     let word = local_word(t, offset);
     let size = t.env.local_memory_size();
-    let value = load_local(t, word, offset, size);
+    let dynamic = !offset.is_immediate() && size > 0;
+    let value = load_local(t, word, offset, dynamic, size);
     if ty.bits() < 32 {
         let bit = sub_word_bit(t, offset, if ty.bits() == 8 { 24 } else { 16 });
         let field =
@@ -428,7 +466,7 @@ fn ldl(t: &mut Translator<'_>) -> TResult {
     for i in 1..count {
         let sub_word = t.ir.iadd(word, Value::U32(u32::from(i)));
         let sub_offset = t.ir.iadd(offset, Value::U32(u32::from(i) * 4));
-        let value = load_local(t, sub_word, sub_offset, size);
+        let value = load_local(t, sub_word, sub_offset, dynamic, size);
         t.set_x(dest.offset(i), value);
     }
     Ok(())
@@ -442,25 +480,35 @@ fn stl(t: &mut Translator<'_>) -> TResult {
     check_aligned(t, data, count)?;
     let ureg = address_ureg(t, 64);
     let offset = byte_address(t, ureg, false);
+    let size = t.env.local_memory_size();
     if let Value::U32(bytes) = offset
-        && bytes >= t.env.local_memory_size()
+        && bytes >= size
     {
         return Ok(());
     }
+    let dynamic = !offset.is_immediate() && size > 0;
     let word = local_word(t, offset);
     let src = t.x(data);
     if ty.bits() < 32 {
         let bit = sub_word_bit(t, offset, if ty.bits() == 8 { 24 } else { 16 });
+        let word = clamp_local_word(t, word, dynamic, size);
         let old = t.ir.inst(Op::LoadLocal, &[word]);
         let value = t.ir.bit_field_insert(old, src, bit, Value::U32(ty.bits()));
-        t.ir.inst(Op::WriteLocal, &[word, value]);
+        write_local(t, word, offset, value, Some(old), dynamic, size);
         return Ok(());
     }
-    t.ir.inst(Op::WriteLocal, &[word, src]);
+    let first = clamp_local_word(t, word, dynamic, size);
+    write_local(t, first, offset, src, None, dynamic, size);
     for i in 1..count {
         let sub_word = t.ir.iadd(word, Value::U32(u32::from(i)));
         let value = t.x(data.offset(i));
-        t.ir.inst(Op::WriteLocal, &[sub_word, value]);
+        let sub_offset = if dynamic {
+            t.ir.iadd(offset, Value::U32(u32::from(i) * 4))
+        } else {
+            offset
+        };
+        let sub_word = clamp_local_word(t, sub_word, dynamic, size);
+        write_local(t, sub_word, sub_offset, value, None, dynamic, size);
     }
     Ok(())
 }
@@ -1901,12 +1949,13 @@ mod tests {
              \x20 %1 = IAdd32 %0, #0x2\n\
              \x20 %2 = ShiftRightArithmetic32 %1, #0x2\n\
              \x20 %3 = ULessThan %1, #0x40\n\
-             \x20 %4 = LoadLocal %2\n\
-             \x20 %5 = SelectU32 %3, %4, #0x0\n\
-             \x20 %6 = ShiftLeftLogical32 %1, #0x3\n\
-             \x20 %7 = BitwiseAnd32 %6, #0x18\n\
-             \x20 %8 = BitFieldSExtract %5, %7, #0x8\n\
-             \x20 SetRegister R1, %8\n"
+             \x20 %4 = UMin32 %2, #0xf\n\
+             \x20 %5 = LoadLocal %4\n\
+             \x20 %6 = SelectU32 %3, %5, #0x0\n\
+             \x20 %7 = ShiftLeftLogical32 %1, #0x3\n\
+             \x20 %8 = BitwiseAnd32 %7, #0x18\n\
+             \x20 %9 = BitFieldSExtract %6, %8, #0x8\n\
+             \x20 SetRegister R1, %9\n"
         );
     }
 
@@ -1924,15 +1973,17 @@ mod tests {
              \x20 %1 = IAdd32 %0, #0x8\n\
              \x20 %2 = ShiftRightArithmetic32 %1, #0x2\n\
              \x20 %3 = ULessThan %1, #0x40\n\
-             \x20 %4 = LoadLocal %2\n\
-             \x20 %5 = SelectU32 %3, %4, #0x0\n\
-             \x20 SetRegister R4, %5\n\
-             \x20 %6 = IAdd32 %2, #0x1\n\
-             \x20 %7 = IAdd32 %1, #0x4\n\
-             \x20 %8 = ULessThan %7, #0x40\n\
-             \x20 %9 = LoadLocal %6\n\
-             \x20 %10 = SelectU32 %8, %9, #0x0\n\
-             \x20 SetRegister R5, %10\n"
+             \x20 %4 = UMin32 %2, #0xf\n\
+             \x20 %5 = LoadLocal %4\n\
+             \x20 %6 = SelectU32 %3, %5, #0x0\n\
+             \x20 SetRegister R4, %6\n\
+             \x20 %7 = IAdd32 %2, #0x1\n\
+             \x20 %8 = IAdd32 %1, #0x4\n\
+             \x20 %9 = ULessThan %8, #0x40\n\
+             \x20 %10 = UMin32 %7, #0xf\n\
+             \x20 %11 = LoadLocal %10\n\
+             \x20 %12 = SelectU32 %9, %11, #0x0\n\
+             \x20 SetRegister R5, %12\n"
         );
     }
 
@@ -1970,16 +2021,35 @@ mod tests {
              \x20 %2 = IAdd32 %0, %1\n\
              \x20 %3 = ShiftRightArithmetic32 %2, #0x2\n\
              \x20 %4 = GetRegister R8\n\
-             \x20 WriteLocal %3, %4\n\
-             \x20 %5 = IAdd32 %3, #0x1\n\
-             \x20 %6 = GetRegister R9\n\
-             \x20 WriteLocal %5, %6\n\
-             \x20 %7 = IAdd32 %3, #0x2\n\
-             \x20 %8 = GetRegister R10\n\
-             \x20 WriteLocal %7, %8\n\
-             \x20 %9 = IAdd32 %3, #0x3\n\
-             \x20 %10 = GetRegister R11\n\
-             \x20 WriteLocal %9, %10\n"
+             \x20 %5 = UMin32 %3, #0xf\n\
+             \x20 %6 = ULessThan %2, #0x40\n\
+             \x20 %7 = LoadLocal %5\n\
+             \x20 %8 = SelectU32 %6, %4, %7\n\
+             \x20 WriteLocal %5, %8\n\
+             \x20 %9 = IAdd32 %3, #0x1\n\
+             \x20 %10 = GetRegister R9\n\
+             \x20 %11 = IAdd32 %2, #0x4\n\
+             \x20 %12 = UMin32 %9, #0xf\n\
+             \x20 %13 = ULessThan %11, #0x40\n\
+             \x20 %14 = LoadLocal %12\n\
+             \x20 %15 = SelectU32 %13, %10, %14\n\
+             \x20 WriteLocal %12, %15\n\
+             \x20 %16 = IAdd32 %3, #0x2\n\
+             \x20 %17 = GetRegister R10\n\
+             \x20 %18 = IAdd32 %2, #0x8\n\
+             \x20 %19 = UMin32 %16, #0xf\n\
+             \x20 %20 = ULessThan %18, #0x40\n\
+             \x20 %21 = LoadLocal %19\n\
+             \x20 %22 = SelectU32 %20, %17, %21\n\
+             \x20 WriteLocal %19, %22\n\
+             \x20 %23 = IAdd32 %3, #0x3\n\
+             \x20 %24 = GetRegister R11\n\
+             \x20 %25 = IAdd32 %2, #0xc\n\
+             \x20 %26 = UMin32 %23, #0xf\n\
+             \x20 %27 = ULessThan %25, #0x40\n\
+             \x20 %28 = LoadLocal %26\n\
+             \x20 %29 = SelectU32 %27, %24, %28\n\
+             \x20 WriteLocal %26, %29\n"
         );
     }
 
@@ -1991,6 +2061,129 @@ mod tests {
             f(24, 255) | f(32, 2) | f(40, 0x40) | f(73, 4),
         );
         assert_eq!(with_local_memory(&[insn], 0x40), "{0}:\n");
+    }
+
+    /// Compiles a compute program with 0x40 bytes of local memory, validates its module and
+    /// returns it.
+    fn compile_local(name: &str, code: &[Instruction]) -> rspirv::dr::Module {
+        let mut env = TestEnv::new(code);
+        env.local_memory = 0x40;
+        let (profile, host) = (Profile::default(), HostTranslateInfo::default());
+        let options = TranslateOptions {
+            profile: &profile,
+            host: &host,
+            resolution_scale: ResolutionScale::X1,
+        };
+        let mut bindings = Bindings::default();
+        let module =
+            crate::module::compile(&env, options, &RuntimeInfo::default(), &mut bindings).unwrap();
+        crate::backend::spirv::tests::validate(name, &profile, &module.spirv);
+        rspirv::dr::load_words(&module.spirv).unwrap()
+    }
+
+    /// The local memory word index of every access chain into a private variable, as the
+    /// constant it is or the limit of the `UMin` that clamps it.
+    fn local_indexes(module: &rspirv::dr::Module) -> Vec<Result<u32, u32>> {
+        use rspirv::dr::Operand;
+        use rspirv::spirv::{GlslStd450Op, Op, StorageClass};
+        let globals = &module.types_global_values;
+        let constant = |id: u32| {
+            globals
+                .iter()
+                .find(|i| i.result_id == Some(id) && i.class.opcode == Op::Constant)
+                .map(|i| i.operands[0].unwrap_literal_bit32())
+        };
+        let private = |id: u32| {
+            globals.iter().any(|i| {
+                i.result_id == Some(id)
+                    && i.class.opcode == Op::Variable
+                    && i.operands[0] == Operand::StorageClass(StorageClass::Private)
+            })
+        };
+        let body: Vec<_> = module
+            .functions
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.instructions)
+            .collect();
+        let umin_limit = |id: u32| {
+            body.iter()
+                .find(|i| i.result_id == Some(id) && i.class.opcode == Op::ExtInst)
+                .filter(|i| {
+                    i.operands[1] == Operand::LiteralExtInstInteger(GlslStd450Op::UMin as u32)
+                })
+                .and_then(|i| constant(i.operands[3].unwrap_id_ref()))
+        };
+        body.iter()
+            .filter(|i| i.class.opcode == Op::AccessChain)
+            .filter(|i| private(i.operands[0].unwrap_id_ref()))
+            .map(|i| {
+                let index = i.operands[1].unwrap_id_ref();
+                constant(index).ok_or_else(|| umin_limit(index).expect("a clamped index"))
+            })
+            .collect()
+    }
+
+    /// LDL and STL (32-bit and 16-bit) at an offset from R3, which LDC loads from c[0][0x10].
+    #[test]
+    fn dynamic_local_accesses_clamp_their_word_to_the_last_one() {
+        let code = [
+            encode(
+                Opcode::Ldc,
+                Form::Bound,
+                f(16, 3) | f(24, 255) | f(38, 0x10) | f(73, 4),
+            ),
+            encode(
+                Opcode::Ldl,
+                Form::UniformAddress,
+                f(16, 1) | f(24, 3) | f(40, 4) | f(73, 4),
+            ),
+            encode(
+                Opcode::Stl,
+                Form::UniformAddress,
+                f(24, 3) | f(32, 1) | f(40, 8) | f(73, 4),
+            ),
+            encode(
+                Opcode::Stl,
+                Form::UniformAddress,
+                f(24, 3) | f(32, 1) | f(40, 2) | f(73, 3),
+            ),
+            encode(Opcode::Exit, Form::Fixed, f(87, 7)),
+        ];
+        let module = compile_local("local-dynamic", &code);
+        let indexes = local_indexes(&module);
+        assert!(!indexes.is_empty());
+        assert!(
+            indexes.iter().all(|&index| index == Err(0xf)),
+            "{indexes:?}"
+        );
+    }
+
+    #[test]
+    fn constant_local_accesses_index_with_their_constant() {
+        let code = [
+            encode(
+                Opcode::Ldl,
+                Form::UniformAddress,
+                f(16, 1) | f(24, 255) | f(40, 4) | f(73, 4),
+            ),
+            encode(
+                Opcode::Stl,
+                Form::Fixed,
+                f(24, 255) | f(32, 1) | f(40, 8) | f(73, 4),
+            ),
+            encode(
+                Opcode::Stl,
+                Form::Fixed,
+                f(24, 255) | f(32, 1) | f(40, 2) | f(73, 3),
+            ),
+            encode(Opcode::Exit, Form::Fixed, f(87, 7)),
+        ];
+        let module = compile_local("local-constant", &code);
+        let mut indexes = local_indexes(&module);
+        indexes.sort();
+        indexes.dedup();
+        assert_eq!(indexes, [Ok(0), Ok(1), Ok(2)]);
     }
 
     #[test]

@@ -31,6 +31,7 @@ use super::super::tests::{
     DADDR, Fixture, GPU_VA, fixture, fixture_with, gmmu, guest_linear, unorm8_eq,
 };
 use super::{StageSources, Warning};
+use crate::buffer_cache::UNIFORM_STREAM_MAX;
 use crate::device::DeviceFeatures;
 use crate::pipeline::environment::TexturePool;
 use crate::pipeline::shader_cache::{ShaderCache, ShaderCacheStats};
@@ -1694,35 +1695,101 @@ fn stage_lookup_cost_of_a_redrawn_sampling_draw() {
     }
 }
 
+/// The back thread's cost of a redrawn draw whose fragment constant buffer is bound at 64 KiB
+/// while the shader reads its first 16 bytes, with the buffer untouched and with the guest CPU
+/// rewriting a word in its middle before every draw:
+/// `cargo test --release -p lichii-vulkan --lib wide_uniform_draw_cost -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn wide_uniform_draw_cost() {
+    use std::time::Instant;
+
+    const CPU_VA: u64 = 0x1000_0000;
+    const DRAWS: u32 = 200;
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let space = cpu_space(&f, &[(CPU_VA, FRAGMENT_CBUF)], 0x1_0000);
+    write(
+        &f,
+        PROGRAMS + u64::from(FRAGMENT),
+        &fragment_program([0, 4]),
+    );
+    let regs = draw_regs();
+    let mut const_buffers = const_buffers();
+    const_buffers[4][0].size = 0x1_0000;
+    draw_with(&mut f, &gmmu, &regs, &const_buffers);
+    f.rasterizer.flush_commands();
+    for (what, rewritten) in [("untouched", false), ("rewritten", true)] {
+        let mut times = Vec::new();
+        for round in 0..51 {
+            let start = Instant::now();
+            for draw in 0..DRAWS {
+                if rewritten {
+                    let word = round * DRAWS + draw;
+                    space
+                        .write_bytes(CPU_VA + 0x8000, &word.to_le_bytes())
+                        .unwrap();
+                    drain_cpu_writes(&mut f);
+                }
+                draw_with(&mut f, &gmmu, &regs, &const_buffers);
+            }
+            times.push(start.elapsed() / DRAWS);
+            f.rasterizer.flush_commands();
+        }
+        times.sort();
+        eprintln!(
+            "64 KiB uniform, 16 bytes read, buffer {what}: median {:?} per draw, min {:?}",
+            times[times.len() / 2],
+            times[0]
+        );
+    }
+    f.assert_no_validation_errors();
+}
+
+/// A fragment program that loads its colour from the 16 bytes at `offset` of c[0].
+fn fragment_program_at(offset: u64) -> Vec<u8> {
+    let mut header = header(2, ShaderType::PIXEL);
+    header[18] = 0xf;
+    program(
+        header,
+        &[
+            mov_cbuf(0, offset),
+            mov_cbuf(1, offset + 4),
+            mov_cbuf(2, offset + 8),
+            mov_cbuf(3, offset + 12),
+            exit(),
+        ],
+    )
+}
+
 /// The guest CPU rewrites a bound uniform buffer between draws: the next draw reads the new
-/// values, for a streamed buffer and for one over 4 KiB that binds the cached buffer through
-/// write tracking, the second rewrite too.
+/// values, for a streamed buffer and for one whose program reads past 4 KiB, which binds the
+/// cached buffer through write tracking, the second rewrite too.
 #[test]
 fn draws_read_uniform_buffers_the_cpu_rewrote() {
     const CPU_VA: u64 = 0x1000_0000;
-    for size in [0x200, 0x2000] {
+    for (size, at) in [(0x200, 0), (0x2000, 0x1ff0)] {
         let Some((mut f, gmmu)) = draw_fixture() else {
             return;
         };
         let space = cpu_space(&f, &[(CPU_VA, FRAGMENT_CBUF)], 0x2000);
+        write(&f, FRAGMENT_CBUF + at, &f32_bytes(&[1.0, 0.5, 0.0, 1.0]));
         let mut const_buffers = const_buffers();
         const_buffers[4][0].size = size;
-        write(
-            &f,
-            PROGRAMS + u64::from(FRAGMENT),
-            &fragment_program([0, 4]),
-        );
+        write(&f, PROGRAMS + u64::from(FRAGMENT), &fragment_program_at(at));
         let regs = draw_regs();
         draw_with(&mut f, &gmmu, &regs, &const_buffers);
         assert!(
             target(&mut f).iter().all(|&t| unorm8_eq(t, ORANGE)),
             "{size:#x}"
         );
+        let uploaded = f.rasterizer.buffer_cache.stats().uploaded_bytes;
         for (values, colour) in [
             ([0.0, 1.0, 1.0, 1.0], [0, 255, 255, 255]),
             ([1.0, 0.0, 1.0, 1.0], [255, 0, 255, 255]),
         ] {
-            space.write_bytes(CPU_VA, &f32_bytes(&values)).unwrap();
+            space.write_bytes(CPU_VA + at, &f32_bytes(&values)).unwrap();
             drain_cpu_writes(&mut f);
             draw_with(&mut f, &gmmu, &regs, &const_buffers);
             assert!(
@@ -1730,8 +1797,46 @@ fn draws_read_uniform_buffers_the_cpu_rewrote() {
                 "{size:#x} {values:?}"
             );
         }
+        assert_eq!(
+            f.rasterizer.buffer_cache.stats().uploaded_bytes > uploaded,
+            size > UNIFORM_STREAM_MAX as u32,
+            "{size:#x}: only the cached buffer uploads the rewrites"
+        );
         f.assert_no_validation_errors();
     }
+}
+
+/// A uniform buffer bound at 64 KiB whose program reads its first 16 bytes binds only those:
+/// they stream like a small buffer, nothing uploads into a cached buffer, and a guest CPU
+/// write elsewhere in the binding changes nothing the draw reads.
+#[test]
+fn draws_bind_only_the_uniform_bytes_their_program_reads() {
+    const CPU_VA: u64 = 0x1000_0000;
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let space = cpu_space(&f, &[(CPU_VA, FRAGMENT_CBUF)], 0x1_0000);
+    write(&f, PROGRAMS + u64::from(FRAGMENT), &fragment_program_at(0));
+    let regs = draw_regs();
+    let narrow = const_buffers();
+    let mut wide = const_buffers();
+    wide[4][0].size = 0x1_0000;
+    draw_with(&mut f, &gmmu, &regs, &narrow);
+    let streamed_by = |f: &mut Fixture, const_buffers: &GraphicsConstBuffers| {
+        let before = f.rasterizer.buffer_cache.stats();
+        draw_with(f, &gmmu, &regs, const_buffers);
+        let after = f.rasterizer.buffer_cache.stats();
+        assert_eq!(after.uploaded_bytes, before.uploaded_bytes);
+        assert_eq!(after.created_buffers, before.created_buffers);
+        after.streamed_bytes - before.streamed_bytes
+    };
+    let narrow_bytes = streamed_by(&mut f, &narrow);
+    assert_eq!(streamed_by(&mut f, &wide), narrow_bytes);
+    space.write_bytes(CPU_VA + 0x8000, &[7; 4]).unwrap();
+    drain_cpu_writes(&mut f);
+    assert_eq!(streamed_by(&mut f, &wide), narrow_bytes);
+    assert!(target(&mut f).iter().all(|&t| unorm8_eq(t, ORANGE)));
+    f.assert_no_validation_errors();
 }
 
 /// The guest CPU rewrites a texture after a draw sampled it, through two virtual aliases of its

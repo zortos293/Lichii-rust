@@ -1647,13 +1647,17 @@ impl VulkanRasterizer {
                                 .copied()
                                 .unwrap_or_default();
                             let index = (desc.index + i) as usize;
+                            let size = info
+                                .constant_buffer_used_sizes
+                                .get(index)
+                                .map_or(cbuf.size, |&used| cbuf.size.min(used));
                             let binding = match src.root_table {
                                 _ if cbuf.enabled => self.buffer_cache.uniform_buffer(
                                     &mut self.scheduler,
                                     &mut self.staging,
                                     src.gmmu,
                                     cbuf.address,
-                                    u64::from(cbuf.size),
+                                    u64::from(size),
                                 )?,
                                 Some(table) if index == ROOT_TABLE_SLOT => {
                                     Some(self.buffer_cache.stream_uniform(

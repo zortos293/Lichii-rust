@@ -2,7 +2,7 @@
 //! and the module validated with spirv-val.
 
 use rspirv::dr::{self, Operand};
-use rspirv::spirv::{Capability, Decoration, Op};
+use rspirv::spirv::{Capability, Decoration, GlslStd450Op, Op, StorageClass};
 
 use super::{Synthetic, count_ops, emit, validate};
 use crate::backend::Bindings;
@@ -1048,6 +1048,104 @@ fn descriptor_arrays_index_their_elements_and_mark_non_uniform_indices() {
         }
         assert_eq!(module.extensions.is_empty(), supported_spirv >= 0x0001_0500);
     }
+}
+
+/// The element index of every access chain into a descriptor array, as the constant it is or
+/// the limit of the `UMin` that clamps it.
+fn descriptor_indexes(module: &dr::Module) -> Vec<Result<u32, u32>> {
+    let globals = &module.types_global_values;
+    let constant = |id: u32| {
+        globals
+            .iter()
+            .find(|i| i.result_id == Some(id) && i.class.opcode == Op::Constant)
+            .map(|i| i.operands[0].unwrap_literal_bit32())
+    };
+    let descriptor_array = |id: u32| {
+        globals.iter().any(|i| {
+            i.result_id == Some(id)
+                && i.class.opcode == Op::Variable
+                && i.operands[0] == Operand::StorageClass(StorageClass::UniformConstant)
+        })
+    };
+    let body: Vec<_> = module
+        .functions
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.instructions)
+        .collect();
+    let umin_limit = |id: u32| {
+        body.iter()
+            .find(|i| i.result_id == Some(id) && i.class.opcode == Op::ExtInst)
+            .filter(|i| i.operands[1] == Operand::LiteralExtInstInteger(GlslStd450Op::UMin as u32))
+            .and_then(|i| constant(i.operands[3].unwrap_id_ref()))
+    };
+    body.iter()
+        .filter(|i| i.class.opcode == Op::AccessChain)
+        .filter(|i| descriptor_array(i.operands[0].unwrap_id_ref()))
+        .map(|i| {
+            let index = i.operands[1].unwrap_id_ref();
+            constant(index).ok_or_else(|| umin_limit(index).expect("a clamped index"))
+        })
+        .collect()
+}
+
+#[test]
+fn dynamic_descriptor_array_indexes_clamp_to_the_last_element() {
+    let module = emit(
+        "image_arrays_clamped",
+        &Profile::default(),
+        &RuntimeInfo::default(),
+        &descriptor_array_program(),
+    );
+    let mut indexes = descriptor_indexes(&module);
+    indexes.sort();
+    assert_eq!(
+        indexes,
+        [
+            Ok(3),
+            Err(1),
+            Err(1),
+            Err(1),
+            Err(1),
+            Err(2),
+            Err(3),
+            Err(3)
+        ],
+        "textures 4, texel buffers 2, images 2, image buffers 3"
+    );
+}
+
+#[test]
+fn constant_descriptor_array_indexes_are_not_clamped() {
+    let mut s = Synthetic::new();
+    let b = s.block();
+    let coords = f32x2(&mut s, b, 0.5, 0.25);
+    let color2d = flags(0, TextureType::Color2D).to_flags();
+    for index in [0, 3] {
+        s.inst_flags(
+            b,
+            Opcode::ImageSampleExplicitLod,
+            &[Value::U32(index), coords, Value::F32(0.0), Value::Void],
+            color2d,
+        );
+    }
+    let info = ShaderInfo {
+        texture_descriptors: vec![TextureDescriptor {
+            count: 4,
+            is_descriptor_array: true,
+            ..texture(TextureType::Color2D)
+        }],
+        ..compute_info()
+    };
+    let program = finish(s, b, ShaderStage::Compute, info);
+    let module = emit(
+        "image_arrays_constant",
+        &Profile::default(),
+        &RuntimeInfo::default(),
+        &program,
+    );
+    assert_eq!(descriptor_indexes(&module), [Ok(0), Ok(3)]);
+    assert_eq!(count_ops(&module, Op::ExtInst), 0);
 }
 
 /// A fragment program sampling descriptor arrays with implicit lods at one index: the lane
