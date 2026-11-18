@@ -1680,7 +1680,8 @@ impl VulkanRasterizer {
                     DescriptorKind::StorageBuffer => {
                         let desc = info.storage_buffers_descriptors[descriptor];
                         for i in 0..b.count {
-                            let (address, size) = storage_pointer(src, &desc, i);
+                            let limit = storage_range_limit(self);
+                            let (address, size) = storage_pointer(src, &desc, i, limit);
                             let binding = self.buffer_cache.storage_buffer(
                                 &mut self.scheduler,
                                 &mut self.staging,
@@ -3160,6 +3161,7 @@ impl VulkanRasterizer {
         element: u32,
     ) -> Result<u32> {
         let align = self.buffer_cache.storage_alignment();
+        let limit = storage_range_limit(self);
         loop {
             let cache = &self.buffer_cache;
             let mut stale = None;
@@ -3172,7 +3174,7 @@ impl VulkanRasterizer {
                 }) else {
                     return 0;
                 };
-                let (address, size) = storage_pointer(src, desc, element);
+                let (address, size) = storage_pointer(src, desc, element, limit);
                 let base = address & !(align - 1);
                 let word = base + u64::from(offset);
                 if address == 0 || word + 4 > address + size {
@@ -3216,23 +3218,33 @@ fn numeric_mismatch(
 }
 
 /// The GPU address and size of storage buffer `element` of `desc`: 16-byte NVN descriptors in
-/// the constant buffer, or (indirect) a pointer table the constant buffer points to.
+/// the constant buffer, or (indirect) a pointer table the constant buffer points to. No size
+/// passes `limit`, the largest range the host binds after alignment.
 fn storage_pointer(
     src: &StageSources<'_>,
     desc: &StorageBufferDescriptor,
     element: u32,
+    limit: u64,
 ) -> (GpuVAddr, u64) {
     let offset = desc.cbuf_offset + element * 16;
     let pointer: u64 = read_cbuf(src.gmmu, src.cbufs, desc.cbuf_index, offset);
     if desc.indirect_offset == StorageBufferDescriptor::DIRECT {
         let size: u32 = read_cbuf(src.gmmu, src.cbufs, desc.cbuf_index, offset + 8);
-        return (pointer, u64::from(size));
+        return (pointer, u64::from(size).min(limit));
     }
     let address = src
         .gmmu
         .read::<u64>(pointer + u64::from(desc.indirect_offset))
         .unwrap_or(0);
-    (address, 64 << 10)
+    (address, (64 << 10u64).min(limit))
+}
+
+/// The largest storage buffer range a binding may ask for: the host's limit, less the bytes
+/// [`BufferCache::storage_buffer`](crate::buffer_cache::BufferCache::storage_buffer) adds when it
+/// aligns the start down.
+fn storage_range_limit(rasterizer: &VulkanRasterizer) -> u64 {
+    let range = u64::from(rasterizer.device.properties.limits.max_storage_buffer_range);
+    range.saturating_sub(rasterizer.buffer_cache.storage_alignment())
 }
 
 mod assembly;
