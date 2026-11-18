@@ -292,6 +292,56 @@ struct TextureMemo {
 /// Textures [`TextureMemo`] keeps before it starts over.
 const MAX_BOUND_TEXTURES: usize = 4096;
 
+/// The host sampler last found for a sampler index, with the header words and anisotropy
+/// setting it was created for.
+#[derive(Clone, Copy, Default)]
+struct MemoSampler {
+    words: [u32; 8],
+    anisotropy: u8,
+    sampler: vk::Sampler,
+}
+
+/// Slots of [`DrawState::sampler_memo`], by sampler index modulo the count: 48 bytes each,
+/// 12 KiB in all.
+const SAMPLER_MEMO: usize = 256;
+
+/// The bytes [`VulkanRasterizer::push_constants`] fills: the rescaling words and the render
+/// area after them.
+const PUSH_BYTES: usize = RENDER_AREA_LAYOUT_OFFSET as usize + 16;
+
+/// A draw's push constants: the layout and its one range's stages and size, and the bytes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PushConstants {
+    layout: vk::PipelineLayout,
+    stages: vk::ShaderStageFlags,
+    size: u32,
+    bytes: [u8; PUSH_BYTES],
+}
+
+/// What the draws of the open rendering bound, so a draw records only the binds that changed.
+/// Everything else that binds graphics state (clears, texture draws, presents, dispatches) and
+/// a new command buffer records outside a rendering, so a draw that begins one forgets it all.
+#[derive(Default)]
+struct Bound {
+    pipeline: vk::Pipeline,
+    push: Option<PushConstants>,
+    index: Option<(vk::Buffer, u64, vk::IndexType)>,
+}
+
+impl Bound {
+    fn begin(&mut self, began: bool) {
+        if began {
+            *self = Self::default();
+        }
+    }
+}
+
+/// Holds `value` in `bound`; `true` when it differs from what `bound` held, so it must be
+/// recorded.
+fn rebinds<T: Copy + PartialEq>(bound: &mut T, value: T) -> bool {
+    std::mem::replace(bound, value) != value
+}
+
 /// One bound render target of the current draw.
 #[derive(Clone, Copy)]
 struct Target {
@@ -310,6 +360,9 @@ pub(super) struct DrawState {
     descriptors: DescriptorAllocator,
     /// By sampler header words and the anisotropy setting they were created with.
     samplers: HashMap<([u32; 8], u8), vk::Sampler, FxBuildHasher>,
+    /// The sampler last found for each sampler index, checked against the header words read
+    /// for every lookup, so `samplers` is probed only when they changed.
+    sampler_memo: Box<[MemoSampler; SAMPLER_MEMO]>,
     sampler_caps: SamplerCaps,
     anisotropy: Anisotropy,
     eds3: ash::ext::extended_dynamic_state3::Device,
@@ -365,8 +418,8 @@ pub(super) struct DrawState {
     vertex_offsets: Vec<u64>,
     vertex_strides: Vec<u64>,
     attachments: Vec<vk::RenderingAttachmentInfo<'static>>,
-    /// The graphics pipeline the open rendering last bound.
-    bound_pipeline: vk::Pipeline,
+    /// What the open rendering's draws last bound.
+    bound: Bound,
     dynamic: DynamicShadow,
     texture_pipelines: Option<texture::TexturePipelines>,
     assembly: Option<assembly::AssemblyPass>,
@@ -442,6 +495,7 @@ impl DrawState {
             shaders: ShaderCache::new(device.shader_profile.clone(), device.shader_host.clone()),
             descriptors: DescriptorAllocator::new(device)?,
             samplers: HashMap::default(),
+            sampler_memo: Box::new([MemoSampler::default(); SAMPLER_MEMO]),
             sampler_caps: SamplerCaps::from_device(device),
             anisotropy: Anisotropy::Auto,
             eds3: ash::ext::extended_dynamic_state3::Device::new(&device.instance.raw, &device.raw),
@@ -493,7 +547,7 @@ impl DrawState {
             vertex_offsets: Vec::new(),
             vertex_strides: Vec::new(),
             attachments: Vec::new(),
-            bound_pipeline: vk::Pipeline::null(),
+            bound: Bound::default(),
             dynamic: DynamicShadow::default(),
             texture_pipelines: None,
             assembly: None,
@@ -515,6 +569,7 @@ impl DrawState {
     }
 
     pub(super) fn destroy(&mut self, device: &Device) {
+        self.sampler_memo.fill(MemoSampler::default());
         for (_, sampler) in self.samplers.drain() {
             // SAFETY: the device is idle; no recorded work uses the sampler any more.
             unsafe { device.raw.destroy_sampler(sampler, None) };
@@ -1157,9 +1212,9 @@ impl VulkanRasterizer {
                 self.samples.begin(&self.device, cmd, slot);
             }
             draw.dynamic.begin(began, mesh);
-            if began || draw.bound_pipeline != pipeline_raw {
+            draw.bound.begin(began);
+            if rebinds(&mut draw.bound.pipeline, pipeline_raw) {
                 raw.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline_raw);
-                draw.bound_pipeline = pipeline_raw;
             }
             match (set, template) {
                 (Some(set), _) => raw.cmd_bind_descriptor_sets(
@@ -1203,11 +1258,17 @@ impl VulkanRasterizer {
             }
             _ => 0,
         };
+        let bind_index = index.filter(|i| {
+            rebinds(
+                &mut self.draw.bound.index,
+                Some((i.buffer, i.offset, i.index_type)),
+            )
+        });
         let raw = &self.device.raw;
         let draw = &self.draw;
         // SAFETY: as above; the pipeline's dynamic state is all set.
         unsafe {
-            if let Some(index) = index {
+            if let Some(index) = bind_index {
                 raw.cmd_bind_index_buffer(cmd, index.buffer, index.offset, index.index_type);
             }
             let conditional = self.conditions.as_ref().and_then(|c| c.begin(cmd));
@@ -2215,13 +2276,29 @@ impl VulkanRasterizer {
         } else {
             [0; 8]
         };
-        let key = (words, self.draw.anisotropy as u8);
-        if let Some(&sampler) = self.draw.samplers.get(&key) {
-            return Ok(sampler);
+        let anisotropy = self.draw.anisotropy as u8;
+        let slot = &mut self.draw.sampler_memo[index as usize % SAMPLER_MEMO];
+        if slot.words == words
+            && slot.anisotropy == anisotropy
+            && slot.sampler != vk::Sampler::null()
+        {
+            return Ok(slot.sampler);
         }
-        let params = SamplerParams::new(&Tsc(words), self.draw.anisotropy, &self.draw.sampler_caps);
-        let sampler = params.create(&self.device)?;
-        self.draw.samplers.insert(key, sampler);
+        let sampler = match self.draw.samplers.get(&(words, anisotropy)) {
+            Some(&sampler) => sampler,
+            None => {
+                let params =
+                    SamplerParams::new(&Tsc(words), self.draw.anisotropy, &self.draw.sampler_caps);
+                let sampler = params.create(&self.device)?;
+                self.draw.samplers.insert((words, anisotropy), sampler);
+                sampler
+            }
+        };
+        self.draw.sampler_memo[index as usize % SAMPLER_MEMO] = MemoSampler {
+            words,
+            anisotropy,
+            sampler,
+        };
         Ok(sampler)
     }
 
@@ -2437,7 +2514,7 @@ impl VulkanRasterizer {
         if size == 0 {
             return;
         }
-        let mut bytes = [0u8; RENDER_AREA_LAYOUT_OFFSET as usize + 16];
+        let mut bytes = [0u8; PUSH_BYTES];
         let words: &[u8] = bytemuck::cast_slice(&self.draw.texture_scaling.words);
         let at = RESCALING_LAYOUT_TEXTURES_OFFSET as usize;
         bytes[at..at + words.len()].copy_from_slice(words);
@@ -2452,6 +2529,15 @@ impl VulkanRasterizer {
             let at = RENDER_AREA_LAYOUT_OFFSET as usize;
             bytes[at..at + 4].copy_from_slice(&width.to_le_bytes());
             bytes[at + 4..at + 8].copy_from_slice(&height.to_le_bytes());
+        }
+        let push = PushConstants {
+            layout,
+            stages,
+            size,
+            bytes,
+        };
+        if !rebinds(&mut self.draw.bound.push, Some(push)) {
+            return;
         }
         // SAFETY: `stages` and `size` are the layout's one push constant range at offset 0.
         unsafe {

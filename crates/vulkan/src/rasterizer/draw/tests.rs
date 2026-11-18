@@ -2361,6 +2361,225 @@ fn cached_samplers_follow_the_anisotropy_setting() {
     f.assert_no_validation_errors();
 }
 
+/// The sampler for `words` under the current anisotropy setting, as the sampler map holds it.
+fn mapped_sampler(f: &Fixture, words: [u32; 8]) -> Option<vk::Sampler> {
+    let draw = &f.rasterizer.draw;
+    draw.samplers.get(&(words, draw.anisotropy as u8)).copied()
+}
+
+#[test]
+fn sampler_lookups_follow_rewritten_moved_and_aliased_headers() {
+    let Some((mut f, gmmu)) = draw_fixture() else {
+        return;
+    };
+    let tsc = |filter: u32| {
+        let mut words = [0u32; 8];
+        words[1] = filter;
+        words
+    };
+    let (a, b) = (tsc(2 | 2 << 4), tsc(1 | 1 << 4));
+    let aliased = super::SAMPLER_MEMO as u32;
+    let cbufs = const_buffers();
+    let src = StageSources {
+        gmmu: &gmmu,
+        cbufs: &cbufs[4],
+        root_table: None,
+        pool: TexturePool {
+            address: GPU_VA + TIC,
+            limit: 0,
+            via_header_index: false,
+            switch2: false,
+        },
+        samplers: GPU_VA + TSC,
+        sampler_limit: aliased,
+    };
+    let moved = StageSources {
+        samplers: GPU_VA + TSC + 0x3000,
+        ..src
+    };
+
+    let unbound = f.rasterizer.sampler(&src, aliased + 1).unwrap();
+    assert_ne!(unbound, vk::Sampler::null(), "an empty slot never hits");
+    assert_eq!(Some(unbound), mapped_sampler(&f, [0; 8]));
+
+    write(&f, TSC, bytemuck::cast_slice(&a));
+    let first = f.rasterizer.sampler(&src, 0).unwrap();
+    assert_eq!(Some(first), mapped_sampler(&f, a));
+    write(&f, TSC, bytemuck::cast_slice(&b));
+    let rewritten = f.rasterizer.sampler(&src, 0).unwrap();
+    assert_eq!(
+        Some(rewritten),
+        mapped_sampler(&f, b),
+        "a guest rewrite yields the new sampler"
+    );
+    assert_ne!(rewritten, first);
+
+    write(&f, TSC + 32, bytemuck::cast_slice(&b));
+    write(&f, TSC + u64::from(aliased) * 32, bytemuck::cast_slice(&a));
+    assert_eq!(f.rasterizer.sampler(&src, 1).unwrap(), rewritten);
+    assert_eq!(
+        f.rasterizer.sampler(&src, aliased).unwrap(),
+        first,
+        "the index sharing slot 0 gets its own header's sampler"
+    );
+    assert_eq!(f.rasterizer.sampler(&src, 0).unwrap(), rewritten);
+
+    write(&f, TSC + 0x3000, bytemuck::cast_slice(&a));
+    assert_eq!(
+        f.rasterizer.sampler(&moved, 0).unwrap(),
+        first,
+        "index 0 of another pool reads that pool"
+    );
+    assert_eq!(f.rasterizer.sampler(&src, 0).unwrap(), rewritten);
+
+    f.rasterizer.draw.set_anisotropy(Anisotropy::X16);
+    let x16 = f.rasterizer.sampler(&src, 0).unwrap();
+    assert_eq!(Some(x16), mapped_sampler(&f, b));
+    assert_ne!(
+        x16, rewritten,
+        "a new anisotropy setting gets its own sampler"
+    );
+    f.rasterizer.draw.set_anisotropy(Anisotropy::Auto);
+    assert_eq!(f.rasterizer.sampler(&src, 0).unwrap(), rewritten);
+    assert_eq!(f.rasterizer.draw.samplers.len(), 4);
+    f.assert_no_validation_errors();
+}
+
+/// What a command buffer holds at the graphics bind point for the draws' pipeline, push
+/// constants and index buffer; `None` is undefined.
+#[derive(Clone, Copy, PartialEq, Default)]
+struct Held {
+    pipeline: Option<vk::Pipeline>,
+    push: Option<super::PushConstants>,
+    index: Option<(vk::Buffer, u64, vk::IndexType)>,
+}
+
+/// Records a seeded random stream of draws through [`super::Bound`] and through binds that
+/// always record, with new command buffers, renderings, pipeline layouts, dispatches and other
+/// passes between them, and checks every draw sees the same pipeline, push constants and
+/// index buffer both ways. Returns how many pushes and index binds the tracked path skipped.
+fn tracked_binds_match_always_recording(seed: u64, rounds: usize) -> (usize, usize) {
+    use super::{Bound, PUSH_BYTES, PushConstants, rebinds};
+    use ash::vk::Handle;
+
+    let mut state = seed;
+    let mut next = |n: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % n
+    };
+    let layouts = [
+        (1, vk::ShaderStageFlags::FRAGMENT, 32),
+        (
+            2,
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            48,
+        ),
+        (3, vk::ShaderStageFlags::FRAGMENT, 0),
+    ];
+    let indices = [
+        (vk::Buffer::from_raw(1), 0, vk::IndexType::UINT16),
+        (vk::Buffer::from_raw(1), 256, vk::IndexType::UINT16),
+        (vk::Buffer::from_raw(1), 0, vk::IndexType::UINT32),
+        (vk::Buffer::from_raw(2), 0, vk::IndexType::UINT16),
+    ];
+    let foreign = PushConstants {
+        layout: vk::PipelineLayout::from_raw(9),
+        stages: vk::ShaderStageFlags::COMPUTE,
+        size: 16,
+        bytes: [0xff; PUSH_BYTES],
+    };
+    let mut bound = Bound::default();
+    let (mut tracked, mut reference) = (Held::default(), Held::default());
+    let mut began = true;
+    let (mut pushes, mut binds) = (0, 0);
+    for round in 0..rounds {
+        match next(100) {
+            0..3 => {
+                tracked = Held::default();
+                reference = Held::default();
+                began = true;
+            }
+            3..8 => began = true,
+            8..13 => {
+                tracked.push = Some(foreign);
+                reference.push = Some(foreign);
+                began = true;
+            }
+            13..16 => {
+                let other = Held {
+                    pipeline: Some(vk::Pipeline::from_raw(9)),
+                    push: Some(foreign),
+                    index: Some((vk::Buffer::from_raw(9), 0, vk::IndexType::UINT32)),
+                };
+                tracked = other;
+                reference = other;
+                began = true;
+            }
+            _ => {}
+        }
+        let (layout, stages, size) = layouts[next(3) as usize];
+        let pipeline = vk::Pipeline::from_raw(layout * 2 + next(2));
+        let mut bytes = [0; PUSH_BYTES];
+        bytes[next(3) as usize * 16] = next(2) as u8;
+        let push = PushConstants {
+            layout: vk::PipelineLayout::from_raw(layout),
+            stages,
+            size,
+            bytes,
+        };
+        let index = (next(10) < 7).then(|| indices[next(4) as usize]);
+
+        bound.begin(std::mem::take(&mut began));
+        reference.pipeline = Some(pipeline);
+        if rebinds(&mut bound.pipeline, pipeline) {
+            tracked.pipeline = Some(pipeline);
+        }
+        if size > 0 {
+            reference.push = Some(push);
+            match rebinds(&mut bound.push, Some(push)) {
+                true => tracked.push = Some(push),
+                false => pushes += 1,
+            }
+        }
+        if let Some(index) = index {
+            reference.index = Some(index);
+            match rebinds(&mut bound.index, Some(index)) {
+                true => tracked.index = Some(index),
+                false => binds += 1,
+            }
+        }
+        let used = |held: &Held| {
+            (
+                held.pipeline,
+                held.push.filter(|_| size > 0),
+                held.index.filter(|_| index.is_some()),
+            )
+        };
+        assert!(
+            used(&tracked) == used(&reference),
+            "seed {seed:#x}, round {round}"
+        );
+    }
+    (pushes, binds)
+}
+
+#[test]
+fn tracked_binds_record_what_always_recording_records() {
+    let (mut pushes, mut binds) = (0, 0);
+    for seed in 1..=24u64 {
+        let (p, b) =
+            tracked_binds_match_always_recording(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15), 4000);
+        pushes += p;
+        binds += b;
+    }
+    assert!(
+        pushes > 1000 && binds > 1000,
+        "the stream skips both kinds: {pushes} pushes, {binds} index binds"
+    );
+}
+
 #[test]
 fn writes_to_any_page_of_a_scattered_program_translate_it_again() {
     let Some((mut f, gmmu)) = draw_fixture() else {
