@@ -61,8 +61,10 @@ fn definition<T: Copy>(defs: &[T], info: TextureInstInfo) -> EmitResult<T> {
 }
 
 /// The pointer to the descriptor `inst` accesses: the variable itself, or the element of a
-/// descriptor array its argument 0 selects. The flag says whether the index is non-uniform, in
-/// which case the pointer is decorated and every object loaded from it must be too.
+/// descriptor array its argument 0 selects, a dynamic index clamped to the last element (an
+/// index past the array is not covered by robustness). The flag says whether the index is
+/// non-uniform, in which case the pointer is decorated and every object loaded from it must be
+/// too.
 fn descriptor_pointer(
     ctx: &mut EmitContext<'_>,
     inst: InstId,
@@ -77,6 +79,11 @@ fn descriptor_pointer(
     let index = ctx.arg(inst, 0);
     let index_id = match index {
         Value::Void => ctx.u32_zero_value,
+        Value::Inst(_) => {
+            let dynamic = ctx.def(index)?;
+            let last = ctx.const_u32(count - 1);
+            ctx.glsl_inst(ctx.u32[1], GlslStd450Op::UMin, &[dynamic, last])?
+        }
         index => ctx.def(index)?,
     };
     let non_uniform = matches!(index, Value::Inst(_)) && non_uniform_supported(ctx.profile, kind);
