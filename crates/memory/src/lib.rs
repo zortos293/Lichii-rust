@@ -23,7 +23,7 @@ pub use address_space::{
 pub use device::DeviceAddressSpace;
 pub use exclusive::{ExclusiveMonitor, ReservationSlot};
 pub use fault::{FaultHandler, HostFault};
-pub use physical::{PhysicalMemory, PhysicalMemoryError};
+pub use physical::{PhysicalMemory, PhysicalMemoryError, TouchedMemory};
 pub use tracking::{CachedPages, FlushTrapHandler};
 pub use usage::{ProcessMemory, process_memory};
 

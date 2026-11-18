@@ -39,8 +39,23 @@ pub const RING_OVERSIZED_CAP: u64 =
 /// In-flight [`Oversized`] bytes the presenter's staging ring may hold.
 pub const PRESENT_OVERSIZED_CAP: u64 = 64 << 20;
 
-/// Host-visible buffers of their own for ring requests too large to share the ring, each freed
-/// once the tick that uses it completed.
+/// The most bytes one staging or stream request takes (ZOR-432), so no host-visible buffer of
+/// a ring is larger. Uploads that stage more go through [`StagingRing::part`] in pieces of at
+/// most this size, and gathers too large for a ring go to device-local memory.
+///
+/// [`StagingRing::part`]: crate::staging::StagingRing::part
+pub const STAGING_REQUEST_MAX: u64 = 64 << 20;
+
+/// Bytes each of a ring's two part slices keeps between operations
+/// ([`StagingRing::part`](crate::staging::StagingRing::part)): a slice grown for a larger
+/// piece, up to [`STAGING_REQUEST_MAX`], is reused as it is and shrinks back once the tick that
+/// last used it completed.
+pub const PART_SLICE: u64 = 8 << 20;
+
+/// Buffers of their own for ring requests too large to share the ring, each freed once the
+/// tick that uses it completed. Host-visible ones (`CpuToGpu`) are never larger than
+/// [`STAGING_REQUEST_MAX`]: callers with more to stage split it into parts, so a request past it
+/// is a bug, asserted in debug builds.
 ///
 /// An allocation that would take the in-flight total past `cap` first waits for submitted
 /// buffers, oldest first, until it fits or none is left, so one larger than `cap` waits until
@@ -51,21 +66,23 @@ pub const PRESENT_OVERSIZED_CAP: u64 = 64 << 20;
 /// total stays within `cap` while one operation allocates at most half of it.
 pub(crate) struct Oversized {
     cap: u64,
+    location: MemoryLocation,
     bytes: u64,
     buffers: VecDeque<(u64, Buffer)>,
 }
 
 impl Oversized {
-    pub(crate) fn new(cap: u64) -> Self {
+    pub(crate) fn new(cap: u64, location: MemoryLocation) -> Self {
         Self {
             cap,
+            location,
             bytes: 0,
             buffers: VecDeque::new(),
         }
     }
 
-    /// A `CpuToGpu` buffer of `size` bytes, valid until the work recorded in `scheduler` right
-    /// now completes.
+    /// A buffer of `size` bytes in the pool's memory location, valid until the work recorded in
+    /// `scheduler` right now completes.
     pub(crate) fn alloc(
         &mut self,
         device: &Arc<Device>,
@@ -74,6 +91,10 @@ impl Oversized {
         usage: vk::BufferUsageFlags,
         name: &str,
     ) -> Result<&mut Buffer> {
+        debug_assert!(
+            self.location != MemoryLocation::CpuToGpu || size <= STAGING_REQUEST_MAX,
+            "{name}: a {size}-byte host-visible request passed STAGING_REQUEST_MAX"
+        );
         self.reclaim(scheduler);
         while self.bytes + size > self.cap
             && let Some(&(oldest, _)) = self.buffers.front()
@@ -82,7 +103,7 @@ impl Oversized {
             scheduler.wait(oldest)?;
             self.reclaim(scheduler);
         }
-        let buffer = Buffer::new(device, size, usage, MemoryLocation::CpuToGpu, name)?;
+        let buffer = Buffer::new(device, size, usage, self.location, name)?;
         self.bytes += buffer.size();
         self.buffers.push_back((scheduler.tick(), buffer));
         Ok(&mut self.buffers.back_mut().expect("just pushed").1)
@@ -361,7 +382,7 @@ mod tests {
         let Some(device) = device() else { return };
         let mut scheduler = Scheduler::new(&device).unwrap();
         let mut gate = Gate::new(&device);
-        let mut oversized = Oversized::new(4 * MIB);
+        let mut oversized = Oversized::new(4 * MIB, MemoryLocation::CpuToGpu);
         let usage = vk::BufferUsageFlags::TRANSFER_SRC;
         let mut last = 0;
         for _ in 0..3 {
@@ -392,7 +413,7 @@ mod tests {
     fn allocations_never_wait_for_the_work_being_recorded() {
         let Some(device) = device() else { return };
         let mut scheduler = Scheduler::new(&device).unwrap();
-        let mut oversized = Oversized::new(4 * MIB);
+        let mut oversized = Oversized::new(4 * MIB, MemoryLocation::CpuToGpu);
         let usage = vk::BufferUsageFlags::TRANSFER_SRC;
         let tick = scheduler.tick();
         for _ in 0..3 {
@@ -411,6 +432,40 @@ mod tests {
         oversized.reclaim(&mut scheduler);
         assert!(!oversized.should_submit(scheduler.tick()));
         assert_eq!(oversized.live().bytes, 0);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "passed STAGING_REQUEST_MAX")]
+    fn host_visible_requests_past_the_request_bound_are_refused() {
+        let Some(device) = device() else {
+            panic!("no device: passed STAGING_REQUEST_MAX unchecked");
+        };
+        let mut scheduler = Scheduler::new(&device).unwrap();
+        let mut oversized = Oversized::new(RING_OVERSIZED_CAP, MemoryLocation::CpuToGpu);
+        let usage = vk::BufferUsageFlags::TRANSFER_SRC;
+        oversized
+            .alloc(&device, &mut scheduler, STAGING_REQUEST_MAX, usage, "test")
+            .unwrap();
+        let mut device_local = Oversized::new(RING_OVERSIZED_CAP, MemoryLocation::GpuOnly);
+        device_local
+            .alloc(
+                &device,
+                &mut scheduler,
+                STAGING_REQUEST_MAX + MIB,
+                usage,
+                "test",
+            )
+            .unwrap();
+        oversized
+            .alloc(
+                &device,
+                &mut scheduler,
+                STAGING_REQUEST_MAX + 1,
+                usage,
+                "test",
+            )
+            .unwrap();
     }
 
     #[test]

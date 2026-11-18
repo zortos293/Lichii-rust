@@ -91,6 +91,7 @@ impl ServiceThread {
         });
         Arc::new(ClientSession {
             session: HleSession::new(server),
+            serial: crate::wait_stats::serial(),
         })
     }
 
@@ -289,6 +290,7 @@ fn control(ctx: &mut HleRequestContext, session: &Arc<HleSession>) -> ResultCode
         2 | 4 => {
             let clone = Arc::new(ClientSession {
                 session: HleSession::new(session.server.clone()),
+                serial: crate::wait_stats::serial(),
             });
             ctx.push_move_object(KObject::ClientSession(clone));
             ResultCode::SUCCESS
@@ -512,9 +514,15 @@ impl HleSession {
 /// `CloneCurrentObject` share the server end.
 pub struct ClientSession {
     session: Arc<HleSession>,
+    serial: u64,
 }
 
 impl ClientSession {
+    /// Unique for the life of the host process, unlike the session's address.
+    pub(crate) fn serial(&self) -> u64 {
+        self.serial
+    }
+
     /// The HLE handler behind a session that is not a domain.
     pub(crate) fn handler(&self) -> Option<Arc<dyn SessionHandler>> {
         self.session.server.handler()
@@ -525,6 +533,17 @@ impl ClientSession {
         match &*self.session.server.target.lock() {
             Target::Single(handler) => handler.name().into(),
             Target::Domain(_) => "domain".into(),
+        }
+    }
+
+    /// Name of the service behind the session; a domain is named after its first object.
+    pub(crate) fn service_name(&self) -> String {
+        match &*self.session.server.target.lock() {
+            Target::Single(handler) => handler.name().into(),
+            Target::Domain(objects) => match objects.iter().flatten().next() {
+                Some(handler) => format!("{} (domain)", handler.name()),
+                None => "domain".into(),
+            },
         }
     }
 

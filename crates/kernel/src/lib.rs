@@ -26,6 +26,7 @@ mod sync;
 pub mod thread;
 mod timer;
 mod util;
+mod wait_stats;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -44,6 +45,7 @@ use lichii_cpu::{CpuConfig, CpuCore};
 use lichii_loader::program::ProgramImage;
 use lichii_memory::{
     AddressSpace, ExclusiveMonitor, MemoryPermission, PhysicalMemory, PhysicalMemoryError,
+    TouchedMemory,
 };
 use parking_lot::Mutex;
 
@@ -60,6 +62,7 @@ use crate::sm::ServiceManager;
 use crate::thread::{LOWEST_PRIORITY, NewThread, Thread, ThreadId, ThreadState};
 use crate::timer::Timer;
 use crate::util::Rng;
+use crate::wait_stats::WaitStats;
 
 pub use crate::event::Event;
 pub use crate::memory::Pool;
@@ -136,6 +139,8 @@ pub(crate) struct KernelInner {
     /// Add the cores' live guest pcs to every watchdog thread log (`LICHII_LIVE_PC`).
     live_pc_log: bool,
     live_pcs: LivePcs,
+    /// Guest threads' blocked time by wait reason, when the `waits` target logs at debug.
+    waits: Option<WaitStats>,
     events: Arc<dyn KernelEvents>,
     rng: Mutex<Rng>,
     next_process_id: AtomicU64,
@@ -203,6 +208,7 @@ impl Kernel {
             svc_trace: config.svc_trace,
             live_pc_log: std::env::var_os("LICHII_LIVE_PC").is_some(),
             live_pcs: LivePcs::new(cores),
+            waits: WaitStats::if_enabled(cores),
             events: config.events.unwrap_or_else(|| Arc::new(LogEvents)),
             rng: Mutex::new(Rng::new(config.rng_seed)),
             next_process_id: AtomicU64::new(0x51),
@@ -436,6 +442,10 @@ const TRACE_LOG_PERIOD: Duration = Duration::from_secs(5);
 const TRIM_PERIOD: Duration = Duration::from_secs(1);
 /// How often the watchdog logs the host memory the process uses next to the guest's.
 const MEMORY_LOG_PERIOD: Duration = Duration::from_secs(10);
+/// How often the watchdog scans which guest DRAM the host has touched. The scan walks every
+/// committed page (about half a second for 9 GiB), so the memory line repeats the last result
+/// in between.
+const TOUCHED_SCAN_PERIOD: Duration = Duration::from_secs(60);
 /// How many consecutive block boundaries the watchdog samples on each core running guest code.
 const LIVE_PC_SAMPLES: usize = 16;
 /// How long the watchdog waits for a core to reach a block boundary.
@@ -621,7 +631,7 @@ impl KernelInner {
     /// Logs the process's private and resident host memory beside the host memory backing guest
     /// DRAM and what each pool has handed out, so a log shows whether growth is the guest's or
     /// the emulator's own.
-    fn log_memory(&self) {
+    fn log_memory(&self, touched: TouchedMemory, scan: Duration) {
         let used = |pool| (self.memory.size(pool) - self.memory.free_size(pool)) >> 20;
         let process = lichii_memory::process_memory().unwrap_or_default();
         tracing::info!(
@@ -629,10 +639,23 @@ impl KernelInner {
             private_mib = process.private >> 20,
             resident_mib = process.resident >> 20,
             guest_backing_mib = self.physical.host_bytes() >> 20,
+            guest_touched_mib = touched.pages >> 20,
+            guest_touched_granules_mib = touched.granules >> 20,
+            touched_scan_ms = scan.as_millis() as u64,
             application_mib = used(Pool::Application),
             system_mib = used(Pool::Applet) + used(Pool::System) + used(Pool::SystemNonSecure),
             "memory"
         );
+    }
+
+    /// The guest DRAM the host has touched, through the backing or any process's fastmem, and
+    /// how long finding out took.
+    fn scan_touched(&self) -> (TouchedMemory, Duration) {
+        let processes = self.processes.lock().clone();
+        let spaces: Vec<&AddressSpace> = processes.iter().map(|p| p.memory().as_ref()).collect();
+        let started = Instant::now();
+        let touched = self.physical.touched(&spaces);
+        (touched, started.elapsed())
     }
 
     /// The kernel watchdog: logs every thread once when a core has kept running a thread that its
@@ -647,6 +670,9 @@ impl KernelInner {
         let mut logged = Instant::now();
         let mut trimmed = Instant::now();
         let mut memory_logged = Instant::now();
+        let mut touched_scanned: Option<Instant> = None;
+        let mut touched = (TouchedMemory::default(), Duration::ZERO);
+        let mut waits_logged = Instant::now();
         while !self.scheduler.is_shut_down() {
             std::thread::park_timeout(WATCH_PERIOD);
             let now = Instant::now();
@@ -656,7 +682,20 @@ impl KernelInner {
             }
             if now.duration_since(memory_logged) >= MEMORY_LOG_PERIOD {
                 memory_logged = now;
-                self.log_memory();
+                if touched_scanned.is_none_or(|at| now.duration_since(at) >= TOUCHED_SCAN_PERIOD) {
+                    touched_scanned = Some(now);
+                    touched = self.scan_touched();
+                }
+                self.log_memory(touched.0, touched.1);
+            }
+            if let Some(waits) = &self.waits
+                && now.duration_since(waits_logged) >= wait_stats::REPORT_PERIOD
+                && tracing::enabled!(target: "waits", tracing::Level::DEBUG)
+            {
+                let period = now.duration_since(waits_logged);
+                waits_logged = now;
+                let report = waits.report(&self.processes.lock().clone());
+                tracing::debug!(target: "waits", period_ms = period.as_millis() as u64, "{report}");
             }
             let outranked = if self.scheduler.is_paused() {
                 0

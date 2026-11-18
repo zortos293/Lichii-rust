@@ -8,15 +8,18 @@ use std::time::Instant;
 use ash::vk;
 use lichii_common::settings::GraphicsSettings;
 use lichii_gpu::activity::Activity;
-use lichii_gpu::backend::{GpuHandles, GpuWrittenPages, Rasterizer};
+use lichii_gpu::backend::{CpuReadDone, GpuHandles, GpuWrittenPages, Rasterizer};
 use lichii_gpu::clock::{GpuTimestamp, GuestTime};
 use lichii_gpu::host1x::Syncpoints;
 use lichii_gpu::lazy::LazyDeviceRanges;
 use lichii_memory::{AddressSpace, DeviceAddressSpace, MemoryPermission, PhysicalMemory};
 use lichii_texture::block_linear::GobLayout;
+use lichii_vulkan::buffer_cache::BufferCache;
+use lichii_vulkan::host_budget::RING_OVERSIZED_CAP;
 use lichii_vulkan::present::FrameMailbox;
 use lichii_vulkan::rasterizer::VulkanRasterizer;
 use lichii_vulkan::scheduler::Scheduler;
+use lichii_vulkan::staging::StagingRing;
 use lichii_vulkan::{Device, Error, Instance, SurfaceSupport};
 
 const DRAM: u64 = 16 << 20;
@@ -81,9 +84,44 @@ fn a_lost_device_stops_gpu_work_and_flush_traps() {
     memory.take_flush_trap_stats();
     assert!(!lichii_vulkan::debug::device_lost());
 
+    let mut staging = StagingRing::new(&device, 8 << 20, RING_OVERSIZED_CAP).unwrap();
+    let mut cache = BufferCache::new(
+        &device,
+        memory.clone(),
+        Arc::new(GpuWrittenPages::new(36)),
+        Arc::new(LazyDeviceRanges::new(memory.clone())),
+    )
+    .unwrap();
+    cache
+        .acquire(&mut scheduler, &mut staging, DADDR + 0x8000, 0x1000)
+        .unwrap();
+    cache.mark_gpu_written(scheduler.tick(), DADDR + 0x8000, 0x100);
+    let (_, read) = cache
+        .begin_cpu_read(&mut scheduler, DADDR + 0x8000, 0x1000, None)
+        .unwrap();
+    let CpuReadDone::Pending(ticket) = read else {
+        panic!("the read was served synchronously");
+    };
+    let completer = cache.cpu_read_completer().unwrap();
+    let (finished, waiter) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        completer.complete(ticket);
+        finished.send(()).unwrap();
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(
+        waiter.try_recv().is_err(),
+        "the read's copy is recorded in work not submitted yet"
+    );
+    memory.take_flush_trap_stats();
+
     scheduler.record().unwrap();
     lichii_vulkan::debug::inject_device_lost();
     assert!(lichii_vulkan::debug::device_lost());
+    waiter
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("a thread waiting for a CPU read's copy returns once the device is lost");
+    cache.end_cpu_reads(&scheduler).unwrap();
 
     let pending = scheduler.tick();
     assert!(matches!(scheduler.record(), Err(Error::DeviceLost)));
@@ -110,4 +148,10 @@ fn a_lost_device_stops_gpu_work_and_flush_traps() {
         (0, 1),
         "a CPU read after the loss must end its trap instead of rearming it: {stats:?}"
     );
+    assert_eq!(
+        rasterizer.begin_cpu_read(DADDR, 0x2000, None),
+        CpuReadDone::Home,
+        "a read after the loss is never left pending"
+    );
+    drop(cache);
 }

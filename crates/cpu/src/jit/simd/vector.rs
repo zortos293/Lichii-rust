@@ -157,15 +157,71 @@ pub enum Long {
     Mul,
 }
 
-/// The saturating left shifts by immediate.
+/// How a saturating op reads and clamps its lanes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SatShl {
-    /// `SQSHL`: signed in and out.
+pub enum Saturation {
+    /// Signed in and out (`SQSHL`, `SQXTN`).
     Signed,
-    /// `UQSHL`: unsigned in and out.
+    /// Unsigned in and out (`UQSHL`, `UQXTN`).
     Unsigned,
-    /// `SQSHLU`: signed in, unsigned out.
+    /// Signed in, unsigned out (`SQSHLU`, `SQXTUN`).
     SignedToUnsigned,
+}
+
+/// `SQXTN`, `UQXTN` or `SQXTUN` (by `kind`) of the lanes of `a` of `16 << size` bits, in the low
+/// 64 bits over zeros or, given `low`, above its low 64 bits; with `scalar`, only lane 0 with zero
+/// above. Takes the pack instructions where x86 has the saturating one.
+fn saturating_narrow(
+    t: &mut Translator,
+    kind: Saturation,
+    size: u8,
+    scalar: bool,
+    a: Value,
+    low: Option<Value>,
+    word: u32,
+) -> Value {
+    let packs = !scalar
+        && match kind {
+            Saturation::Signed => size < 2,
+            Saturation::SignedToUnsigned => size == 0 || (size == 1 && t.sse41),
+            Saturation::Unsigned => false,
+        };
+    if packs {
+        return t.op(Op::Simd(SimdOp::SatNarrow {
+            size,
+            n: a,
+            low,
+            word,
+        }));
+    }
+    let clamped = t.op(Op::Simd(SimdOp::SatClamp {
+        kind,
+        size,
+        scalar,
+        a,
+        word,
+    }));
+    let emit = |t: &mut Translator, op: VecOp| t.op(Op::Simd(SimdOp::Vec(op)));
+    let r = emit(
+        t,
+        VecOp::Narrow {
+            size,
+            a: clamped,
+            low,
+        },
+    );
+    if scalar {
+        emit(
+            t,
+            VecOp::ScalarDup {
+                size,
+                index: 0,
+                vector: r,
+            },
+        )
+    } else {
+        r
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -541,12 +597,21 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         t.set(Loc::V(rd), r);
         return true;
     }
-    if word & 0xbf3f_fc00 == 0x2e21_2800 && (size == 0 || (size == 1 && t.sse41)) {
-        let n = vec(t, rn);
-        let low = q.then(|| vec(t, rd));
-        let r = t.op(Op::Simd(SimdOp::SatNarrow { size, n, low, word }));
-        t.set(Loc::V(rd), r);
-        return true;
+    let narrow = match word & 0xaf3f_fc00 {
+        0x0e21_4800 => Some(Saturation::Signed),
+        0x2e21_4800 => Some(Saturation::Unsigned),
+        0x2e21_2800 => Some(Saturation::SignedToUnsigned),
+        _ => None,
+    };
+    if let Some(kind) = narrow.filter(|_| size < 2 || (size == 2 && t.sse41)) {
+        let scalar = word & 0x5000_0000 == 0x5000_0000;
+        if scalar || word & 0x1000_0000 == 0 {
+            let a = vec(t, rn);
+            let low = (q && !scalar).then(|| vec(t, rd));
+            let r = saturating_narrow(t, kind, size, scalar, a, low, word);
+            t.set(Loc::V(rd), r);
+            return true;
+        }
     }
     if word & 0xbf3f_fc00 == 0x0e20_0800 && matches!(size, 1 | 2) {
         let a = vec(t, rn);
@@ -802,14 +867,18 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
     }
     let scalar = word & 0xdf80_0400 == 0x5f00_0400 && field(word, 19, 4) != 0;
     let saturating = match (field(word, 11, 5), u) {
-        (0b01110, false) => Some(SatShl::Signed),
-        (0b01110, true) => Some(SatShl::Unsigned),
-        (0b01100, true) => Some(SatShl::SignedToUnsigned),
+        (0b01110, false) => Some(Saturation::Signed),
+        (0b01110, true) => Some(Saturation::Unsigned),
+        (0b01100, true) => Some(Saturation::SignedToUnsigned),
         _ => None,
     };
     if word & 0x9f80_0400 == 0x0f00_0400
         || (scalar
             && (saturating.is_some()
+                || matches!(
+                    (field(word, 11, 5), u),
+                    (0b10010 | 0b10011, _) | (0b10000 | 0b10001, true)
+                )
                 || (word & 0x0040_0000 != 0
                     && matches!(
                         field(word, 11, 5),
@@ -909,10 +978,15 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         }
         if opcode & 0b11100 == 0b10000 && size < 3 {
             let (round, saturate) = (opcode & 1 != 0, opcode & 0b10 != 0 || u);
-            let sat_narrow = !u || size == 0 || (size == 1 && t.sse41);
-            if (opcode & 0b10 != 0 && u) || (saturate && (size == 2 || !sat_narrow)) {
+            let kind = match (u, opcode & 0b10 != 0) {
+                (false, _) => Saturation::Signed,
+                (true, false) => Saturation::SignedToUnsigned,
+                (true, true) => Saturation::Unsigned,
+            };
+            if saturate && size == 2 && !t.sse41 {
                 return false;
             }
+            let signed = saturate && kind != Saturation::Unsigned;
             let wide = Arrangement {
                 size: size + 1,
                 q: true,
@@ -922,7 +996,7 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
                 emit(
                     t,
                     VecOp::RoundShift {
-                        signed: saturate,
+                        signed,
                         arrangement: wide,
                         shift: right,
                         acc: None,
@@ -930,17 +1004,12 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
                     },
                 )
             } else {
-                let op = if saturate { Shift::Sshr } else { Shift::Ushr };
+                let op = if signed { Shift::Sshr } else { Shift::Ushr };
                 emit(t, VecOp::Shift(op, wide, right, a))
             };
             let low = q.then(|| vec(t, rd));
             let r = if saturate {
-                t.op(Op::Simd(SimdOp::SatNarrow {
-                    size,
-                    n: shifted,
-                    low,
-                    word,
-                }))
+                saturating_narrow(t, kind, size, scalar, shifted, low, word)
             } else {
                 emit(
                     t,
@@ -994,13 +1063,6 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         }
         let (n, m) = (vec(t, rn), vec(t, rm));
         let r = emit(t, VecOp::Ext { q, index, n, m });
-        t.set(Loc::V(rd), r);
-        return true;
-    }
-    if word & 0xbf3f_fc00 == 0x0e21_4800 && size < 2 {
-        let n = vec(t, rn);
-        let low = q.then(|| vec(t, rd));
-        let r = t.op(Op::Simd(SimdOp::SatNarrow { size, n, low, word }));
         t.set(Loc::V(rd), r);
         return true;
     }
@@ -1845,7 +1907,7 @@ impl Emitter<'_> {
     pub(super) fn sat_shift_left(
         &mut self,
         i: usize,
-        kind: SatShl,
+        kind: Saturation,
         arrangement: Arrangement,
         scalar: bool,
         shift: u8,
@@ -1859,7 +1921,7 @@ impl Emitter<'_> {
         self.copy(d, a);
         self.shift_imm(Shift::Shl, size, d, shift);
         self.copy(t, d);
-        let back = if kind == SatShl::Signed {
+        let back = if kind == Saturation::Signed {
             Shift::Sshr
         } else {
             Shift::Ushr
@@ -1869,8 +1931,8 @@ impl Emitter<'_> {
         dynasm!(self.asm ; .arch x64 ; pcmpeqd Rx(bad), Rx(bad));
         self.sse(Sse::Xor, size, bad, t);
         match kind {
-            SatShl::Unsigned => self.sse(Sse::Or, size, d, bad),
-            SatShl::Signed => {
+            Saturation::Unsigned => self.sse(Sse::Or, size, d, bad),
+            Saturation::Signed => {
                 self.copy(t, a);
                 self.shift_imm(Shift::Sshr, size, t, top);
                 dynasm!(self.asm ; .arch x64 ; pcmpeqd Rx(SCRATCH), Rx(SCRATCH));
@@ -1880,7 +1942,7 @@ impl Emitter<'_> {
                 self.sse(Sse::And, size, t, bad);
                 self.sse(Sse::Xor, size, d, t);
             }
-            SatShl::SignedToUnsigned => {
+            Saturation::SignedToUnsigned => {
                 self.sse(Sse::Or, size, d, bad);
                 self.copy(t, a);
                 self.shift_imm(Shift::Sshr, size, t, top);
@@ -1914,6 +1976,70 @@ impl Emitter<'_> {
             _ if !q => dynasm!(self.asm ; .arch x64 ; movq Rx(d), Rx(d)),
             _ => {}
         }
+    }
+
+    /// `SimdOp::SatClamp`. A lane fits when the narrow half, sign-extended for a signed input
+    /// (zero-extended otherwise), gives the lane back; the others become the limit on their side,
+    /// and an unsigned result also turns negative lanes into zero.
+    pub(super) fn sat_clamp(
+        &mut self,
+        i: usize,
+        kind: Saturation,
+        size: u8,
+        scalar: bool,
+        a: Value,
+    ) {
+        let (wide, esize) = (size + 1, 8u8 << size);
+        let a = self.reg(a);
+        let d = self.def(Value(i as u32));
+        let (t, bad) = (self.temp(), self.temp());
+        self.copy(t, a);
+        if kind == Saturation::Signed {
+            self.shift_imm(Shift::Shl, wide, t, esize);
+            self.shift_imm(Shift::Sshr, wide, t, esize);
+            self.sse(Sse::Eq, wide, t, a);
+        } else {
+            self.shift_imm(Shift::Ushr, wide, t, esize);
+            dynasm!(self.asm ; .arch x64 ; pxor Rx(bad), Rx(bad));
+            self.sse(Sse::Eq, wide, t, bad);
+        }
+        dynasm!(self.asm ; .arch x64 ; pcmpeqd Rx(bad), Rx(bad));
+        self.sse(Sse::Xor, wide, bad, t);
+        self.copy(d, a);
+        match kind {
+            Saturation::Unsigned => self.sse(Sse::Or, wide, d, bad),
+            Saturation::Signed => {
+                self.copy(t, a);
+                self.shift_imm(Shift::Sshr, wide, t, 2 * esize - 1);
+                dynasm!(self.asm ; .arch x64 ; pcmpeqd Rx(SCRATCH), Rx(SCRATCH));
+                self.shift_imm(Shift::Ushr, wide, SCRATCH, esize + 1);
+                self.sse(Sse::Xor, wide, t, SCRATCH);
+                self.sse(Sse::Xor, wide, t, d);
+                self.sse(Sse::And, wide, t, bad);
+                self.sse(Sse::Xor, wide, d, t);
+            }
+            Saturation::SignedToUnsigned => {
+                self.sse(Sse::Or, wide, d, bad);
+                self.copy(t, a);
+                self.shift_imm(Shift::Sshr, wide, t, 2 * esize - 1);
+                self.sse(Sse::AndNot, wide, t, d);
+                self.copy(d, t);
+            }
+        }
+        let active = if scalar {
+            (1 << (2 << size)) - 1
+        } else {
+            0xffff
+        };
+        let exact = self.asm.new_dynamic_label();
+        dynasm!(self.asm
+            ; .arch x64
+            ; pmovmskb eax, Rx(bad)
+            ; and eax, active
+            ; jz =>exact
+            ; or DWORD [r15 + CTX_FPSR], QC
+            ; =>exact
+        );
     }
 
     /// Sets FPSR.QC when any byte of `mask` is nonzero.

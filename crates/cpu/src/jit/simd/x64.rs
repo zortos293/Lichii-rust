@@ -796,6 +796,13 @@ impl Emitter<'_> {
                 a,
                 ..
             } => self.sat_shift_left(i, kind, arrangement, scalar, shift, a),
+            SimdOp::SatClamp {
+                kind,
+                size,
+                scalar,
+                a,
+                ..
+            } => self.sat_clamp(i, kind, size, scalar, a),
             SimdOp::Vec(op) => self.vector(i, op),
             SimdOp::Lanes(lanes) => self.lanes(i, lanes),
         }

@@ -470,6 +470,34 @@ pub struct CropRect {
     pub bottom: u32,
 }
 
+/// A CPU read whose bytes the host GPU is still copying out: the renderer's slot for it and that
+/// slot's generation, so a ticket for a slot reused since is told apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuReadTicket {
+    pub slot: u32,
+    pub generation: u32,
+}
+
+/// How a CPU read the back served with [`Rasterizer::begin_cpu_read`] ends for the guest thread
+/// waiting on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CpuReadDone {
+    /// The GPU-written bytes are in guest memory already.
+    Home,
+    /// The waiting thread waits for the copy with [`CpuReadCompleter::complete`], then asks the
+    /// back again with the ticket.
+    Pending(CpuReadTicket),
+}
+
+/// Waits for the host GPU copies of [`CpuReadDone::Pending`] reads on the guest CPU threads
+/// waiting for them, so the back never waits for the host GPU itself.
+pub trait CpuReadCompleter: Send + Sync {
+    /// Waits for the host GPU copy of `ticket`. It writes nothing: the thread then asks the back
+    /// again with `ticket`, and the back writes the bytes in order with everything else it does
+    /// to guest memory. Returns at once for a slot reused since, and once the device is lost.
+    fn complete(&self, ticket: CpuReadTicket);
+}
+
 /// Implemented by the renderer; called from the GPU's back thread only.
 ///
 /// Methods with a default body are optional: the defaults do the work in software (copies) or
@@ -618,6 +646,36 @@ pub trait Rasterizer: Send {
     /// buffer traps once. The default writes back the range.
     fn flush_for_cpu_read(&mut self, addr: DAddr, size: u64) {
         self.flush_region(addr, size);
+    }
+
+    /// [`flush_for_cpu_read`](Self::flush_for_cpu_read) for a guest thread that can finish the
+    /// host GPU wait itself: the renderer may start the copy of the bytes and return
+    /// [`CpuReadDone::Pending`] instead of waiting for the host GPU. The thread then asks again
+    /// with that ticket as `after`, and the renderer writes the bytes back, or flushes
+    /// synchronously when they went stale; a call with `after` never returns
+    /// [`CpuReadDone::Pending`]. A batch of these calls ends with
+    /// [`end_cpu_reads`](Self::end_cpu_reads) before any waiting thread is released. The
+    /// default flushes synchronously.
+    fn begin_cpu_read(
+        &mut self,
+        addr: DAddr,
+        size: u64,
+        after: Option<CpuReadTicket>,
+    ) -> CpuReadDone {
+        let _ = after;
+        self.flush_for_cpu_read(addr, size);
+        CpuReadDone::Home
+    }
+
+    /// Ends a batch of [`begin_cpu_read`](Self::begin_cpu_read) calls: submits the copies they
+    /// started, so their tickets complete without more work from the back.
+    fn end_cpu_reads(&mut self) {}
+
+    /// What waits for the copies of the reads [`begin_cpu_read`](Self::begin_cpu_read) leaves
+    /// pending; `None`
+    /// for a renderer that never does.
+    fn cpu_read_completer(&self) -> Option<Arc<dyn CpuReadCompleter>> {
+        None
     }
 
     /// The front is about to read `[addr, addr + size)`: every GPU writer of the range lands in

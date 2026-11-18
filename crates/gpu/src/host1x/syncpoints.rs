@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
+use super::latency::{FenceLatency, Stage};
 use crate::channel::SemaphoreWaiters;
 use crate::semaphore_mirror::SemaphoreMirror;
 
@@ -50,17 +51,30 @@ pub struct Syncpoints {
     max: Box<[AtomicU32]>,
     semaphores: Arc<SemaphoreWaiters>,
     mirror: Arc<SemaphoreMirror>,
+    latency: Option<Arc<FenceLatency>>,
 }
 
 impl Syncpoints {
     pub fn new() -> Self {
+        Self::with_latency(FenceLatency::if_enabled())
+    }
+
+    pub(crate) fn with_latency(latency: Option<FenceLatency>) -> Self {
+        let latency = latency.map(Arc::new);
+        let bank = |stage| SyncpointBank::new(latency.clone().map(|latency| (latency, stage)));
         Self {
-            guest: SyncpointBank::new(),
-            host: SyncpointBank::new(),
+            guest: bank(Stage::Done),
+            host: bank(Stage::Back),
             max: (0..SYNCPOINT_COUNT).map(|_| AtomicU32::new(0)).collect(),
             semaphores: Arc::default(),
             mirror: Arc::default(),
+            latency,
         }
+    }
+
+    /// How long submission fences take, while `lichii_gpu::activity` logs at debug level.
+    pub(crate) fn fence_latency(&self) -> Option<&FenceLatency> {
+        self.latency.as_deref()
     }
 
     /// The value `id` reaches once every increment reserved so far ran.
@@ -119,6 +133,7 @@ impl Default for Syncpoints {
 pub struct SyncpointBank {
     slots: Box<[Slot]>,
     next_serial: AtomicU64,
+    latency: Option<(Arc<FenceLatency>, Stage)>,
 }
 
 struct Slot {
@@ -142,7 +157,7 @@ pub const fn is_reached(value: u32, threshold: u32) -> bool {
 }
 
 impl SyncpointBank {
-    fn new() -> Self {
+    fn new(latency: Option<(Arc<FenceLatency>, Stage)>) -> Self {
         Self {
             slots: (0..SYNCPOINT_COUNT)
                 .map(|_| Slot {
@@ -154,6 +169,7 @@ impl SyncpointBank {
                 })
                 .collect(),
             next_serial: AtomicU64::new(0),
+            latency,
         }
     }
 
@@ -172,6 +188,9 @@ impl SyncpointBank {
     pub fn increment(&self, id: u32) -> Result<u32, InvalidSyncpoint> {
         let slot = self.slot(id)?;
         let value = slot.value.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+        if let Some((latency, stage)) = &self.latency {
+            latency.reached(*stage, id, value);
+        }
         if slot.interest.load(Ordering::SeqCst) != 0 {
             slot.wake(id, value);
         }

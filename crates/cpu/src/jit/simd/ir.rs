@@ -2,7 +2,7 @@
 
 use super::super::ir::{Ty, Value};
 use super::fp_vector::Lanes;
-use super::vector::{Arrangement, SatShl, VecOp};
+use super::vector::{Arrangement, Saturation, VecOp};
 
 /// Scalar floating-point element size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,10 +176,20 @@ pub enum SimdOp {
     /// saturation, setting FPSR.QC when a lane saturates. With `scalar`, only lane 0 counts and
     /// the rest of the result is zero.
     SatShiftLeft {
-        kind: SatShl,
+        kind: Saturation,
         arrangement: Arrangement,
         scalar: bool,
         shift: u8,
+        a: Value,
+        word: u32,
+    },
+    /// The saturating half of `SQXTN`, `UQXTN`, `SQXTUN` and the narrowing shifts that saturate:
+    /// each lane of `a` (`16 << size` bits) clamped to the range of a lane half as wide, setting
+    /// FPSR.QC when a lane saturates (only lane 0 counts when `scalar`). The lanes stay wide.
+    SatClamp {
+        kind: Saturation,
+        size: u8,
+        scalar: bool,
         a: Value,
         word: u32,
     },
@@ -220,7 +230,8 @@ impl SimdOp {
             | SimdOp::SatArith { word, .. }
             | SimdOp::SatMulHigh { word, .. }
             | SimdOp::SatMulLong { word, .. }
-            | SimdOp::SatShiftLeft { word, .. } => Some(word),
+            | SimdOp::SatShiftLeft { word, .. }
+            | SimdOp::SatClamp { word, .. } => Some(word),
             SimdOp::Lanes(lanes) => Some(lanes.word),
             _ => None,
         }
@@ -280,7 +291,7 @@ impl SimdOp {
                 f(n);
                 f(m);
             }
-            SimdOp::SatShiftLeft { a, .. } => f(a),
+            SimdOp::SatShiftLeft { a, .. } | SimdOp::SatClamp { a, .. } => f(a),
             SimdOp::Vec(op) => op.for_each_arg(f),
             SimdOp::Lanes(lanes) => lanes.for_each_arg(f),
         }

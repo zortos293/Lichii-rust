@@ -3,6 +3,7 @@
 
 mod channel;
 mod frames;
+mod latency;
 mod nvdec;
 mod syncpoints;
 mod vic;
