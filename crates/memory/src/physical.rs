@@ -3,7 +3,8 @@ use std::ops::Range;
 
 use lichii_common::PAddr;
 
-use crate::host::Backing;
+use crate::AddressSpace;
+use crate::host::{Arena, Backing};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PhysicalMemoryError {
@@ -84,6 +85,18 @@ impl PhysicalMemory {
         self.backing.host_bytes()
     }
 
+    /// The DRAM the host has touched so far, through the backing or the fastmem arenas of
+    /// `spaces`. Walks every committed page, so it is meant for periodic logging only.
+    pub fn touched(&self, spaces: &[&AddressSpace]) -> TouchedMemory {
+        let arenas: Vec<&Arena> = spaces
+            .iter()
+            .filter_map(|space| space.fastmem())
+            .map(|fastmem| fastmem.arena())
+            .collect();
+        let (pages, granules) = self.backing.touched(&arenas);
+        TouchedMemory { pages, granules }
+    }
+
     /// Whether pages can also be mapped as views elsewhere (fastmem).
     pub fn supports_views(&self) -> bool {
         self.backing.supports_views()
@@ -92,4 +105,14 @@ impl PhysicalMemory {
     pub(crate) fn backing(&self) -> &Backing {
         &self.backing
     }
+}
+
+/// What [`PhysicalMemory::touched`] found, in bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TouchedMemory {
+    /// Pages the host touched: resident on Windows, allocated on Unix.
+    pub pages: u64,
+    /// The [`PhysicalMemory::release_granule`]s holding a touched page: what committing on
+    /// first touch would commit.
+    pub granules: u64,
 }

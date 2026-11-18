@@ -123,12 +123,33 @@ impl Backing {
     pub(crate) fn supports_views(&self) -> bool {
         self.sys.supports_views()
     }
+
+    /// The data [`charge_touched`] takes to commit this backing's memory on first touch, or
+    /// None when it needs no touch hook. Valid while the backing lives.
+    pub(crate) fn touch_target(&self) -> Option<usize> {
+        self.sys.touch_target()
+    }
+
+    /// The part of the backing the host has touched, through its own view or through views in
+    /// `arenas`, as (bytes of touched pages, bytes of the [`Self::release_granule`]s holding
+    /// one): resident pages on Windows, allocated pages on Unix.
+    pub(crate) fn touched(&self, arenas: &[&Arena]) -> (u64, u64) {
+        let arenas: Vec<(&sys::Arena, *mut u8)> = arenas.iter().map(|a| (&a.sys, a.base)).collect();
+        self.sys.touched(self.ptr, &arenas)
+    }
 }
 
 impl Drop for Backing {
     fn drop(&mut self) {
         self.sys.destroy(self.ptr, self.size);
     }
+}
+
+/// Commits the memory behind backing `offset` for a [`Backing::touch_target`] `target` when the
+/// access at `host_addr`, a view of it, faulted because it was not committed yet. Called from a
+/// fault hook; returns whether the access can be retried.
+pub(crate) fn charge_touched(target: usize, offset: usize, host_addr: usize) -> bool {
+    sys::charge_touched(target, offset, host_addr)
 }
 
 /// A reserved host range that holds views of a [`Backing`].
@@ -230,6 +251,7 @@ impl Arena {
     /// `prot`, at `cap`, or gives them `prot` back with `None`.
     pub(crate) fn restrict(
         &self,
+        backing: &Backing,
         offset: usize,
         len: usize,
         prot: HostProtection,
@@ -243,7 +265,8 @@ impl Arena {
                 None => restricted.remove(&page),
             };
         }
-        self.sys.restrict(self.base, offset, len, prot, cap)
+        self.sys
+            .restrict(self.base, &backing.sys, offset, len, prot, cap)
     }
 
     /// Whether a new view is accessible for a moment before its caps apply.
@@ -429,6 +452,15 @@ mod sys {
             }
         }
 
+        pub fn touch_target(&self) -> Option<usize> {
+            None
+        }
+
+        pub fn touched(&self, _ptr: *mut u8, _arenas: &[(&Arena, *mut u8)]) -> (u64, u64) {
+            let bytes = self.host_bytes();
+            (bytes, bytes)
+        }
+
         pub fn release(&self, ptr: *mut u8, offset: usize, len: usize) -> Range<usize> {
             let released = if self.fd >= 0 {
                 punch_hole(self.fd, offset, len)
@@ -457,6 +489,10 @@ mod sys {
                 }
             }
         }
+    }
+
+    pub fn charge_touched(_target: usize, _offset: usize, _host_addr: usize) -> bool {
+        false
     }
 
     pub struct Arena;
@@ -559,6 +595,7 @@ mod sys {
         pub fn restrict(
             &self,
             base: *mut u8,
+            _backing: &Backing,
             offset: usize,
             len: usize,
             prot: HostProtection,
@@ -589,14 +626,20 @@ mod sys {
     use parking_lot::Mutex;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Memory::{
-        CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER,
-        MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
-        PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE, SEC_COMMIT,
-        UnmapViewOfFile2, VirtualAlloc2, VirtualFree, VirtualProtect,
+        CreateFileMappingW, MEM_COMMIT, MEM_MAPPED, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
+        MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION,
+        MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS,
+        PAGE_READONLY, PAGE_READWRITE, SEC_COMMIT, SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc,
+        VirtualAlloc2, VirtualFree, VirtualProtect, VirtualQuery,
     };
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
+    };
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, Sleep};
 
-    use super::{HostProtection, Restricted, protection_runs, restricted_runs};
+    use super::{HostProtection, PAGE, Restricted, protection_runs, restricted_runs};
+    use crate::fault::Registration;
 
     const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
     const MEM_SPLIT_PLACEHOLDER: u32 = 0x2;
@@ -627,26 +670,142 @@ mod sys {
         Scratch,
     }
 
-    /// DRAM as one pagefile-backed section per chunk, each mapped into its slot of one reserved
-    /// range when the kernel first hands out its pages. A chunk the kernel frees whole closes its
-    /// section, which gives its commit and RAM back, and maps the shared scratch section in its
-    /// place, so a late host access to freed memory lands somewhere harmless instead of faulting.
-    pub struct Backing {
+    /// Which chunks have a section (created) and which have their pages committed (charged).
+    /// Boxed so a fault hook can keep its address; it locks and allocates nothing.
+    struct Chunks {
+        ptr: usize,
         size: usize,
-        committed: Box<[AtomicU64]>,
-        committed_chunks: AtomicUsize,
-        slots: Mutex<Box<[Slot]>>,
-        scratch: HANDLE,
+        created: Box<[AtomicU64]>,
+        charged: Box<[AtomicU64]>,
+        charged_chunks: AtomicUsize,
     }
 
-    fn create_section(len: usize) -> io::Result<HANDLE> {
+    fn bit(map: &[AtomicU64], chunk: usize) -> bool {
+        map[chunk / 64].load(Ordering::Acquire) & (1 << (chunk % 64)) != 0
+    }
+
+    impl Chunks {
+        fn len(&self, chunk: usize) -> usize {
+            CHUNK.min(self.size - chunk * CHUNK)
+        }
+
+        fn mark_charged(&self, chunk: usize) {
+            let old = self.charged[chunk / 64].fetch_or(1 << (chunk % 64), Ordering::Release);
+            if old & (1 << (chunk % 64)) == 0 {
+                self.charged_chunks.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        /// Commits a created chunk's pages through the backing view, which commits them in
+        /// every view of its section. Retries for a while when the host has no commit left, since
+        /// the pagefile may still grow. Returns false for a chunk without a section.
+        fn charge(&self, chunk: usize) -> bool {
+            if bit(&self.charged, chunk) {
+                return true;
+            }
+            if !bit(&self.created, chunk) {
+                return false;
+            }
+            for _ in 0..CHARGE_RETRIES {
+                // SAFETY: the range is the chunk's view of its reserved section.
+                let at = unsafe {
+                    VirtualAlloc(
+                        (self.ptr + chunk * CHUNK) as *const _,
+                        self.len(chunk),
+                        MEM_COMMIT,
+                        PAGE_READWRITE,
+                    )
+                };
+                if !at.is_null() {
+                    self.mark_charged(chunk);
+                    return true;
+                }
+                // SAFETY: plain sleep.
+                unsafe { Sleep(CHARGE_RETRY_MS) };
+            }
+            false
+        }
+    }
+
+    /// The touch hook of the backing view: commits the chunk a host access faulted in.
+    fn charge_backing(data: usize, offset: u64, host_addr: usize) -> bool {
+        charge_touched(data, offset as usize, host_addr)
+    }
+
+    /// Commits the chunk holding backing `offset` for the [`Backing::touch_target`] `target`
+    /// when the view page at `host_addr` is not committed. A committed read-write page means
+    /// another thread committed it after this access faulted, so the access is retried too; any
+    /// other committed page faulted for its protection, which the fault handler owns.
+    pub fn charge_touched(target: usize, offset: usize, host_addr: usize) -> bool {
+        // SAFETY: the target is a live backing's boxed chunk state (see touch_target).
+        let chunks = unsafe { &*(target as *const Chunks) };
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: queries our own address space into a local struct.
+        let queried = unsafe {
+            VirtualQuery(
+                host_addr as *const _,
+                &mut info,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if queried == 0 || info.Type != MEM_MAPPED || offset >= chunks.size {
+            return false;
+        }
+        match info.State {
+            MEM_RESERVE => chunks.charge(offset >> CHUNK_BITS),
+            MEM_COMMIT => info.Protect == PAGE_READWRITE,
+            _ => false,
+        }
+    }
+
+    /// Whether the host has `len` bytes of commit to spare beyond the headroom.
+    fn commit_available(len: usize) -> bool {
+        let mut status = MEMORYSTATUSEX {
+            dwLength: size_of::<MEMORYSTATUSEX>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: fills our own struct, whose length field is set.
+        if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+            return true;
+        }
+        status.ullAvailPageFile >= len as u64 + COMMIT_HEADROOM
+    }
+
+    /// DRAM as one pagefile-backed section per chunk, each mapped into its slot of one reserved
+    /// range when the kernel first hands out its pages. Sections are only reserved: a chunk's
+    /// pages are committed when the host or the guest first touches it, through a fault hook on
+    /// the backing view and on every fastmem arena, so the commit a title costs follows what it
+    /// uses rather than what it was handed. A chunk the kernel frees whole closes its section,
+    /// which gives its commit and RAM back, and maps the shared scratch section in its place, so
+    /// a late host access to freed memory lands somewhere harmless instead of faulting.
+    pub struct Backing {
+        size: usize,
+        chunks: Box<Chunks>,
+        slots: Mutex<Box<[Slot]>>,
+        scratch: HANDLE,
+        /// The backing view's touch hook. None when no fault slot was free: sections are then
+        /// committed whole as they are created.
+        touch: Option<Registration>,
+    }
+
+    /// Commit a new chunk must leave free on the host, so a title runs out of memory as a guest
+    /// error instead of failing to commit a page it already holds.
+    const COMMIT_HEADROOM: u64 = 512 << 20;
+    /// How long a first touch retries a commit the host refused, while the pagefile grows.
+    const CHARGE_RETRIES: u32 = 50;
+    const CHARGE_RETRY_MS: u32 = 20;
+
+    /// A pagefile-backed section of `len` bytes: committed whole, or only reserved, so its pages
+    /// are committed through a view as they are first touched.
+    fn create_section(len: usize, reserve: bool) -> io::Result<HANDLE> {
         let len = len as u64;
+        let commit = if reserve { SEC_RESERVE } else { SEC_COMMIT };
         // SAFETY: creates an unnamed pagefile-backed section; the caller owns the handle.
         let section = unsafe {
             CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
                 std::ptr::null(),
-                PAGE_READWRITE | SEC_COMMIT,
+                PAGE_READWRITE | commit,
                 (len >> 32) as u32,
                 len as u32,
                 std::ptr::null(),
@@ -700,7 +859,7 @@ mod sys {
 
     impl Backing {
         pub fn create(size: usize) -> io::Result<(Self, *mut u8)> {
-            let scratch = create_section(CHUNK)?;
+            let scratch = create_section(CHUNK, false)?;
             // SAFETY: reserves one placeholder covering all of DRAM; chunks are split out of it
             // as they are committed.
             let base = unsafe {
@@ -720,19 +879,51 @@ mod sys {
                 unsafe { CloseHandle(scratch) };
                 return Err(err);
             }
-            let chunks = size.div_ceil(CHUNK);
+            let count = size.div_ceil(CHUNK);
+            let bitmap = || (0..count.div_ceil(64)).map(|_| AtomicU64::new(0)).collect();
+            let chunks = Box::new(Chunks {
+                ptr: base as usize,
+                size,
+                created: bitmap(),
+                charged: bitmap(),
+                charged_chunks: AtomicUsize::new(0),
+            });
+            let touch = Registration::new(base as usize, size);
+            if let Some(touch) = &touch {
+                touch.set_touch(charge_backing, &*chunks as *const Chunks as usize);
+            }
             Ok((
                 Self {
                     size,
-                    committed: (0..chunks.div_ceil(64))
-                        .map(|_| AtomicU64::new(0))
-                        .collect(),
-                    committed_chunks: AtomicUsize::new(0),
-                    slots: Mutex::new((0..chunks).map(|_| Slot::Reserved).collect()),
+                    chunks,
+                    slots: Mutex::new((0..count).map(|_| Slot::Reserved).collect()),
                     scratch,
+                    touch,
                 },
                 base.cast(),
             ))
+        }
+
+        /// The data [`charge_touched`] takes to commit this backing's chunks on first touch, or
+        /// None when they are committed as they are created. Valid while the backing lives.
+        pub fn touch_target(&self) -> Option<usize> {
+            self.touch
+                .as_ref()
+                .map(|_| &*self.chunks as *const Chunks as usize)
+        }
+
+        /// Commits the chunks under `[offset, offset + len)` that have a section, before their
+        /// views are protected: protection applies only to committed pages.
+        pub fn charge_range(&self, offset: usize, len: usize) -> io::Result<()> {
+            if len == 0 {
+                return Ok(());
+            }
+            for chunk in offset >> CHUNK_BITS..=(offset + len - 1) >> CHUNK_BITS {
+                if bit(&self.chunks.created, chunk) && !self.chunks.charge(chunk) {
+                    return Err(io::Error::from(io::ErrorKind::OutOfMemory));
+                }
+            }
+            Ok(())
         }
 
         pub fn supports_views(&self) -> bool {
@@ -740,7 +931,7 @@ mod sys {
         }
 
         pub fn host_bytes(&self) -> u64 {
-            (self.committed_chunks.load(Ordering::Relaxed) * CHUNK) as u64
+            (self.chunks.charged_chunks.load(Ordering::Relaxed) * CHUNK) as u64
         }
 
         pub fn release_granule(&self) -> usize {
@@ -748,7 +939,7 @@ mod sys {
         }
 
         fn is_committed(&self, chunk: usize) -> bool {
-            self.committed[chunk / 64].load(Ordering::Acquire) & (1 << (chunk % 64)) != 0
+            bit(&self.chunks.created, chunk)
         }
 
         fn chunk_len(&self, chunk: usize) -> usize {
@@ -778,7 +969,11 @@ mod sys {
                     continue;
                 }
                 let (len, at) = (self.chunk_len(chunk), ptr.wrapping_add(chunk * CHUNK));
-                let section = create_section(len)?;
+                let lazy = self.touch.is_some();
+                if lazy && !commit_available(len) {
+                    return Err(io::Error::from(io::ErrorKind::OutOfMemory));
+                }
+                let section = create_section(len, lazy)?;
                 // SAFETY: the slot holds the scratch view, which unmapping turns back into the
                 // chunk's own placeholder, or lies in the reserved range, from which the split
                 // carves it out (and fails harmlessly once it is split). Either way [at, at + len)
@@ -800,10 +995,83 @@ mod sys {
                     return Err(err);
                 }
                 slots[chunk] = Slot::Committed(section);
-                self.committed[chunk / 64].fetch_or(1 << (chunk % 64), Ordering::Release);
-                self.committed_chunks.fetch_add(1, Ordering::Relaxed);
+                self.chunks.created[chunk / 64].fetch_or(1 << (chunk % 64), Ordering::Release);
+                if !lazy {
+                    self.chunks.mark_charged(chunk);
+                }
             }
             Ok(())
+        }
+
+        /// Marks the resident pages of the views in `views` (host address, backing offset,
+        /// length) in `seen`, one bit per backing page.
+        fn mark_resident(views: impl Iterator<Item = (usize, usize, usize)>, seen: &mut [u64]) {
+            const BATCH: usize = 512;
+            let mut entries = [PSAPI_WORKING_SET_EX_INFORMATION::default(); BATCH];
+            for (host, backing_offset, len) in views {
+                let mut at = 0;
+                while at < len {
+                    let n = ((len - at) / PAGE).min(BATCH);
+                    for (i, entry) in entries[..n].iter_mut().enumerate() {
+                        entry.VirtualAddress = (host + at + i * PAGE) as *mut _;
+                    }
+                    // SAFETY: queries our own process into a buffer of n entries.
+                    let ok = unsafe {
+                        K32QueryWorkingSetEx(
+                            GetCurrentProcess(),
+                            entries.as_mut_ptr().cast(),
+                            (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+                        )
+                    };
+                    if ok != 0 {
+                        for (i, entry) in entries[..n].iter().enumerate() {
+                            // SAFETY: every bit pattern is a valid usize.
+                            if unsafe { entry.VirtualAttributes.Flags } & 1 != 0 {
+                                let page = (backing_offset + at) / PAGE + i;
+                                seen[page / 64] |= 1 << (page % 64);
+                            }
+                        }
+                    }
+                    at += n * PAGE;
+                }
+            }
+        }
+
+        pub fn touched(&self, ptr: *mut u8, arenas: &[(&Arena, *mut u8)]) -> (u64, u64) {
+            let chunks = self.size.div_ceil(CHUNK);
+            let mut seen = vec![0u64; (self.size / PAGE).div_ceil(64)];
+            let own = (0..chunks)
+                .filter(|&chunk| self.is_committed(chunk))
+                .map(|chunk| {
+                    (
+                        ptr as usize + chunk * CHUNK,
+                        chunk * CHUNK,
+                        self.chunk_len(chunk),
+                    )
+                });
+            Self::mark_resident(own, &mut seen);
+            for &(arena, base) in arenas {
+                let views: Vec<(usize, usize, usize)> = arena
+                    .views
+                    .lock()
+                    .iter()
+                    .map(|(&offset, view)| (base as usize + offset, view.backing_offset, view.len))
+                    .collect();
+                Self::mark_resident(views.into_iter(), &mut seen);
+            }
+            let (mut pages, mut granules) = (0u64, 0u64);
+            for chunk in (0..chunks).filter(|&chunk| self.is_committed(chunk)) {
+                let len = self.chunk_len(chunk);
+                let first = chunk * CHUNK / PAGE;
+                let touched: u64 = (first..first + len / PAGE)
+                    .map(|page| (seen[page / 64] >> (page % 64)) & 1)
+                    .sum();
+                pages += touched;
+                if touched > 0 {
+                    granules += len as u64;
+                }
+            }
+            (pages * PAGE as u64, granules)
         }
 
         pub fn release(&self, ptr: *mut u8, offset: usize, len: usize) -> Range<usize> {
@@ -819,8 +1087,12 @@ mod sys {
                 if unsafe { unmap_view(at) }.is_err() {
                     return offset..offset;
                 }
-                self.committed[chunk / 64].fetch_and(!(1 << (chunk % 64)), Ordering::Release);
-                self.committed_chunks.fetch_sub(1, Ordering::Relaxed);
+                self.chunks.created[chunk / 64].fetch_and(!(1 << (chunk % 64)), Ordering::Release);
+                let charged = self.chunks.charged[chunk / 64]
+                    .fetch_and(!(1 << (chunk % 64)), Ordering::Release);
+                if charged & (1 << (chunk % 64)) != 0 {
+                    self.chunks.charged_chunks.fetch_sub(1, Ordering::Relaxed);
+                }
                 // SAFETY: the section is ours; views elsewhere keep it alive until they are
                 // unmapped too. [at, at + len) is the free placeholder the unmap left.
                 slots[chunk] = unsafe {
@@ -839,8 +1111,9 @@ mod sys {
             while done < len {
                 let at = offset + done;
                 let step = (CHUNK - at % CHUNK).min(len - done);
-                if self.is_committed(at >> CHUNK_BITS) {
-                    // SAFETY: the range is committed and inside the backing view.
+                if bit(&self.chunks.charged, at >> CHUNK_BITS) {
+                    // SAFETY: the range is committed and inside the backing view; a chunk not
+                    // committed yet reads as zero once it is.
                     unsafe { std::ptr::write_bytes(ptr.add(at), 0, step) };
                 }
                 done += step;
@@ -848,6 +1121,7 @@ mod sys {
         }
 
         pub fn destroy(&mut self, ptr: *mut u8, size: usize) {
+            self.touch = None;
             for (chunk, slot) in self.slots.get_mut().iter().enumerate() {
                 let at = ptr.wrapping_add(chunk * CHUNK);
                 // SAFETY: committed and scratch slots hold our views; unmapping keeps their
@@ -1037,6 +1311,15 @@ mod sys {
                     ..view
                 },
             );
+            let reduced_runs: Vec<(usize, usize, HostProtection)> =
+                restricted_runs(restricted, offset, offset + view.len);
+            if view.prot != HostProtection::ReadWrite
+                || reduced_runs
+                    .iter()
+                    .any(|&(_, _, cap)| view.prot.min(cap) != view.prot)
+            {
+                backing.charge_range(view.backing_offset, view.len)?;
+            }
             if view.prot != HostProtection::ReadWrite {
                 let mut old = 0;
                 // SAFETY: [offset, offset + len) is the view just mapped.
@@ -1051,7 +1334,7 @@ mod sys {
                 views.insert(offset, view);
             }
             let mut exposed = self.exposed.lock();
-            for (start, len, cap) in restricted_runs(restricted, offset, offset + view.len) {
+            for (start, len, cap) in reduced_runs {
                 let reduced = view.prot.min(cap);
                 if reduced != view.prot {
                     let mut old = 0;
@@ -1201,6 +1484,7 @@ mod sys {
                 let a = start.max(offset);
                 let b = (start + view.len).min(end);
                 if a == start && b == start + view.len {
+                    backing.charge_range(view.backing_offset, view.len)?;
                     for (run, len, prot) in protection_runs(restricted, a, b, prot) {
                         let mut old = 0;
                         // SAFETY: [run, run + len) lies inside the view at start.
@@ -1225,6 +1509,7 @@ mod sys {
         pub fn restrict(
             &self,
             base: *mut u8,
+            backing: &Backing,
             offset: usize,
             len: usize,
             _prot: HostProtection,
@@ -1239,6 +1524,7 @@ mod sys {
             {
                 let (a, b) = (start.max(offset), (start + view.len).min(end));
                 let prot = cap.map_or(view.prot, |cap| view.prot.min(cap));
+                backing.charge_range(view.backing_offset + (a - start), b - a)?;
                 let mut old = 0;
                 // SAFETY: [a, b) lies inside one of our views.
                 check(unsafe {

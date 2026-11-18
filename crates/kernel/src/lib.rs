@@ -45,6 +45,7 @@ use lichii_cpu::{CpuConfig, CpuCore};
 use lichii_loader::program::ProgramImage;
 use lichii_memory::{
     AddressSpace, ExclusiveMonitor, MemoryPermission, PhysicalMemory, PhysicalMemoryError,
+    TouchedMemory,
 };
 use parking_lot::Mutex;
 
@@ -441,6 +442,10 @@ const TRACE_LOG_PERIOD: Duration = Duration::from_secs(5);
 const TRIM_PERIOD: Duration = Duration::from_secs(1);
 /// How often the watchdog logs the host memory the process uses next to the guest's.
 const MEMORY_LOG_PERIOD: Duration = Duration::from_secs(10);
+/// How often the watchdog scans which guest DRAM the host has touched. The scan walks every
+/// committed page (about half a second for 9 GiB), so the memory line repeats the last result
+/// in between.
+const TOUCHED_SCAN_PERIOD: Duration = Duration::from_secs(60);
 /// How many consecutive block boundaries the watchdog samples on each core running guest code.
 const LIVE_PC_SAMPLES: usize = 16;
 /// How long the watchdog waits for a core to reach a block boundary.
@@ -626,7 +631,7 @@ impl KernelInner {
     /// Logs the process's private and resident host memory beside the host memory backing guest
     /// DRAM and what each pool has handed out, so a log shows whether growth is the guest's or
     /// the emulator's own.
-    fn log_memory(&self) {
+    fn log_memory(&self, touched: TouchedMemory, scan: Duration) {
         let used = |pool| (self.memory.size(pool) - self.memory.free_size(pool)) >> 20;
         let process = lichii_memory::process_memory().unwrap_or_default();
         tracing::info!(
@@ -634,10 +639,23 @@ impl KernelInner {
             private_mib = process.private >> 20,
             resident_mib = process.resident >> 20,
             guest_backing_mib = self.physical.host_bytes() >> 20,
+            guest_touched_mib = touched.pages >> 20,
+            guest_touched_granules_mib = touched.granules >> 20,
+            touched_scan_ms = scan.as_millis() as u64,
             application_mib = used(Pool::Application),
             system_mib = used(Pool::Applet) + used(Pool::System) + used(Pool::SystemNonSecure),
             "memory"
         );
+    }
+
+    /// The guest DRAM the host has touched, through the backing or any process's fastmem, and
+    /// how long finding out took.
+    fn scan_touched(&self) -> (TouchedMemory, Duration) {
+        let processes = self.processes.lock().clone();
+        let spaces: Vec<&AddressSpace> = processes.iter().map(|p| p.memory().as_ref()).collect();
+        let started = Instant::now();
+        let touched = self.physical.touched(&spaces);
+        (touched, started.elapsed())
     }
 
     /// The kernel watchdog: logs every thread once when a core has kept running a thread that its
@@ -652,6 +670,8 @@ impl KernelInner {
         let mut logged = Instant::now();
         let mut trimmed = Instant::now();
         let mut memory_logged = Instant::now();
+        let mut touched_scanned: Option<Instant> = None;
+        let mut touched = (TouchedMemory::default(), Duration::ZERO);
         let mut waits_logged = Instant::now();
         while !self.scheduler.is_shut_down() {
             std::thread::park_timeout(WATCH_PERIOD);
@@ -662,7 +682,11 @@ impl KernelInner {
             }
             if now.duration_since(memory_logged) >= MEMORY_LOG_PERIOD {
                 memory_logged = now;
-                self.log_memory();
+                if touched_scanned.is_none_or(|at| now.duration_since(at) >= TOUCHED_SCAN_PERIOD) {
+                    touched_scanned = Some(now);
+                    touched = self.scan_touched();
+                }
+                self.log_memory(touched.0, touched.1);
             }
             if let Some(waits) = &self.waits
                 && now.duration_since(waits_logged) >= wait_stats::REPORT_PERIOD
